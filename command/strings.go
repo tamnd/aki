@@ -62,6 +62,21 @@ func stringCommands() []*CmdDesc {
 		{Name: "substr", Group: GroupString, Since: "1.0.0",
 			Arity: 4, Flags: FlagReadOnly, FirstKey: 1, LastKey: 1, Step: 1,
 			Handler: handleGetRange},
+		{Name: "incr", Group: GroupString, Since: "1.0.0",
+			Arity: 2, Flags: FlagWrite | FlagDenyOOM | FlagFast, FirstKey: 1, LastKey: 1, Step: 1,
+			Handler: handleIncr},
+		{Name: "decr", Group: GroupString, Since: "1.0.0",
+			Arity: 2, Flags: FlagWrite | FlagDenyOOM | FlagFast, FirstKey: 1, LastKey: 1, Step: 1,
+			Handler: handleDecr},
+		{Name: "incrby", Group: GroupString, Since: "1.0.0",
+			Arity: 3, Flags: FlagWrite | FlagDenyOOM | FlagFast, FirstKey: 1, LastKey: 1, Step: 1,
+			Handler: handleIncrBy},
+		{Name: "decrby", Group: GroupString, Since: "1.0.0",
+			Arity: 3, Flags: FlagWrite | FlagDenyOOM | FlagFast, FirstKey: 1, LastKey: 1, Step: 1,
+			Handler: handleDecrBy},
+		{Name: "incrbyfloat", Group: GroupString, Since: "2.6.0",
+			Arity: 3, Flags: FlagWrite | FlagDenyOOM | FlagFast, FirstKey: 1, LastKey: 1, Step: 1,
+			Handler: handleIncrByFloat},
 	}
 }
 
