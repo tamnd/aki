@@ -21,6 +21,10 @@ var (
 	ReplyFalse3     = []byte("#f\r\n")
 	ReplyTrue3      = []byte("#t\r\n")
 	ReplyReset      = []byte("+RESET\r\n")
+
+	// ReplyMaxClients is written to a connection that is accepted only to be
+	// rejected because the server is at its maxclients limit (doc 19 §1.4).
+	ReplyMaxClients = []byte("-ERR max number of clients reached\r\n")
 )
 
 // The integer pool pre-renders the small integers that dominate real traffic
