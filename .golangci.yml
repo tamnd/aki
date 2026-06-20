@@ -1,0 +1,14 @@
+# golangci-lint configuration. The default linter set (errcheck, govet,
+# staticcheck, ineffassign, unused) is the quality gate for the production
+# packages. Test files get one carve-out: errcheck is not run there, so a
+# setup or teardown call like `defer f.Close()` or `w.CommitTxn(...)` reads
+# the way test code is meant to read, without `_ =` noise on every line whose
+# error a failing assertion would already surface.
+version: "2"
+
+linters:
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
