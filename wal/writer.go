@@ -51,7 +51,7 @@ func Create(fsys vfs.VFS, name string, pageSize uint32, opts Options) (*WAL, err
 		return nil, err
 	}
 	if err := f.Truncate(0); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	s1, s2 := opts.Salt1, opts.Salt2
@@ -65,11 +65,11 @@ func Create(fsys vfs.VFS, name string, pageSize uint32, opts Options) (*WAL, err
 	buf := make([]byte, HeaderSize)
 	marshalHeader(buf, h)
 	if _, err := f.WriteAt(buf, 0); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	return &WAL{

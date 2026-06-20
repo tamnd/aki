@@ -20,16 +20,16 @@ func Open(fsys vfs.VFS, name string, pageSize uint32) (*WAL, error) {
 	}
 	hbuf := make([]byte, HeaderSize)
 	if _, err := f.ReadAt(hbuf, 0); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	h, err := parseHeader(hbuf)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	if h.pageSize != pageSize {
-		f.Close()
+		_ = f.Close()
 		return nil, ErrPageSize
 	}
 

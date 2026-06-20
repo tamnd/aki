@@ -20,7 +20,7 @@ func cmdCheck(args []string) error {
 	if err != nil {
 		return fmt.Errorf("open %s: %w", name, err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	h := p.Header()
 	m := p.Meta()

@@ -121,16 +121,16 @@ func Open(fsys vfs.VFS, name string, opts Options) (*Pager, error) {
 	// minimum page (4096) which always covers the 128-byte header.
 	probe := make([]byte, format.MinPageSize)
 	if _, err := f.ReadAt(probe, 0); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	hdr, err := format.ParseFileHeader(probe)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	if !format.ValidPageSize(hdr.PageSize) {
-		f.Close()
+		_ = f.Close()
 		return nil, format.ErrBadPageSize
 	}
 	p := &Pager{
@@ -142,11 +142,11 @@ func Open(fsys vfs.VFS, name string, opts Options) (*Pager, error) {
 		pool:     newFrameTable(cacheCap(opts.CachePages)),
 	}
 	if err := p.loadMeta(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	if err := p.loadFreelist(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	return p, nil
