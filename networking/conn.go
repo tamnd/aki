@@ -64,6 +64,11 @@ type Conn struct {
 	db   int
 	name string
 
+	// session is an opaque slot the command layer attaches its own per-connection
+	// state to (auth, MULTI, subscriptions). The networking layer never inspects
+	// it, so transport stays free of command semantics.
+	session any
+
 	// Lifetime counters.
 	totNetIn  uint64
 	totNetOut uint64
@@ -93,6 +98,12 @@ func (c *Conn) DB() int { return c.db }
 
 // SetDB selects a logical database index, as SELECT does.
 func (c *Conn) SetDB(db int) { c.db = db }
+
+// Session returns the command-layer session object, or nil if none is attached.
+func (c *Conn) Session() any { return c.session }
+
+// SetSession attaches the command-layer session object.
+func (c *Conn) SetSession(s any) { c.session = s }
 
 // Name returns the connection name set by CLIENT SETNAME.
 func (c *Conn) Name() string { return c.name }

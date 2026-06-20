@@ -32,6 +32,8 @@ func run(args []string) error {
 	case "version", "-v", "--version":
 		fmt.Printf("aki %s (commit %s, built %s)\n", Version, Commit, Date)
 		return nil
+	case "server":
+		return cmdServer(args[1:])
 	case "check":
 		return cmdCheck(args[1:])
 	case "help", "-h", "--help":
@@ -49,11 +51,12 @@ Usage:
   aki <command> [arguments]
 
 Commands:
+  server         Start the aki server (Redis wire protocol)
   check <file>   Inspect an .aki file's header and meta pages
   version        Print version information
   help           Show this help
 
-More commands (server, cli, dump, import, bench) arrive as the engine is built.
+More commands (cli, dump, import, bench) arrive as the engine is built.
 See the specification under notes/Spec/2064.
 `)
 }
