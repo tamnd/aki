@@ -77,6 +77,9 @@ func stringCommands() []*CmdDesc {
 		{Name: "incrbyfloat", Group: GroupString, Since: "2.6.0",
 			Arity: 3, Flags: FlagWrite | FlagDenyOOM | FlagFast, FirstKey: 1, LastKey: 1, Step: 1,
 			Handler: handleIncrByFloat},
+		{Name: "lcs", Group: GroupString, Since: "7.0.0",
+			Arity: -3, Flags: FlagReadOnly, FirstKey: 1, LastKey: 2, Step: 1,
+			Handler: handleLCS},
 	}
 }
 
