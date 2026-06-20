@@ -72,11 +72,14 @@ func TestSetOverwrite(t *testing.T) {
 	}
 }
 
-func TestSetExtraArgIsSyntaxError(t *testing.T) {
+func TestSetUnknownOptionIsSyntaxError(t *testing.T) {
 	r, c := startData(t)
-	// SET options are not implemented yet; the form must be rejected, not ignored.
-	if got := sendLine(t, r, c, "SET k v EX 10"); got != "-ERR syntax error" {
-		t.Fatalf("SET with option = %q", got)
+	// A real option word is accepted; an unknown one is a syntax error.
+	if got := sendLine(t, r, c, "SET k v EX 10"); got != "+OK" {
+		t.Fatalf("SET k v EX 10 = %q want +OK", got)
+	}
+	if got := sendLine(t, r, c, "SET k v BOGUS"); got != "-ERR syntax error" {
+		t.Fatalf("SET k v BOGUS = %q want syntax error", got)
 	}
 }
 
