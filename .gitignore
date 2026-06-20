@@ -1,0 +1,12 @@
+/dist/
+/bin/
+*.out
+*.test
+*.aki
+*.aki-wal
+*.aki-shm
+.DS_Store
+
+# committed golden fixtures are the .aki files we do track
+!format/testdata/*.aki
+!pager/testdata/*.aki
