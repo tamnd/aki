@@ -17,16 +17,20 @@ type Config struct {
 	Version string
 	// Mode is reported by HELLO: "standalone", "sentinel", or "cluster".
 	Mode string
+	// Engine is the keyspace the data commands operate on. It may be nil for a
+	// connection-only server (the connection-group commands need no keyspace).
+	Engine *Engine
 }
 
 // Dispatcher routes parsed commands to their handlers. It satisfies
 // networking.Handler.
 type Dispatcher struct {
-	table *Table
-	cfg   Config
+	table  *Table
+	cfg    Config
+	engine *Engine
 }
 
-// New builds a Dispatcher with the connection-group command table.
+// New builds a Dispatcher with the connection-group and data-type commands.
 func New(cfg Config) *Dispatcher {
 	if cfg.Databases <= 0 {
 		cfg.Databases = 16
@@ -37,7 +41,10 @@ func New(cfg Config) *Dispatcher {
 	if cfg.Mode == "" {
 		cfg.Mode = "standalone"
 	}
-	return &Dispatcher{table: NewTable(connectionCommands()), cfg: cfg}
+	cmds := connectionCommands()
+	cmds = append(cmds, stringCommands()...)
+	cmds = append(cmds, genericCommands()...)
+	return &Dispatcher{table: NewTable(cmds), cfg: cfg, engine: cfg.Engine}
 }
 
 // Ctx carries everything a handler needs: the connection it replies on, the
