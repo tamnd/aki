@@ -44,6 +44,7 @@ func New(cfg Config) *Dispatcher {
 	cmds := connectionCommands()
 	cmds = append(cmds, stringCommands()...)
 	cmds = append(cmds, bitmapCommands()...)
+	cmds = append(cmds, bitfieldCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	return &Dispatcher{table: NewTable(cmds), cfg: cfg, engine: cfg.Engine}
 }
