@@ -20,7 +20,7 @@ import (
 
 // On-disk constants (doc 04 §2).
 const (
-	// Magic is "AWL1" — aki WAL version 1.
+	// Magic is "AWL1", the aki WAL version 1 marker.
 	Magic uint32 = 0x41574C31
 	// FormatVersion is the WAL format version.
 	FormatVersion uint16 = 1
