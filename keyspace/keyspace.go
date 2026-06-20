@@ -35,6 +35,11 @@ var ErrDBRange = errors.New("aki/keyspace: database index out of range")
 // variable so tests can pin time and exercise TTL expiry deterministically.
 var nowMillis = func() int64 { return time.Now().UnixMilli() }
 
+// NowMillis returns the keyspace clock in Unix epoch milliseconds. The command
+// layer uses it to turn a relative TTL like EX seconds into the absolute
+// millisecond deadline that Set stores, so both layers read the same clock.
+func NowMillis() int64 { return nowMillis() }
+
 // Keyspace owns every logical database in one .aki file.
 type Keyspace struct {
 	pgr     *pager.Pager
