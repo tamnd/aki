@@ -81,6 +81,7 @@ const (
 	PageTypeWALIdx    uint8 = 0x08
 	PageTypeStreamSeg uint8 = 0x09
 	PageTypeHLLBlob   uint8 = 0x0A
+	PageTypeCatalog   uint8 = 0x0B
 	PageTypeFree      uint8 = 0xFF
 )
 
