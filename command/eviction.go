@@ -74,9 +74,9 @@ func (d *Dispatcher) freeMemoryIfNeeded() bool {
 }
 
 // chooseVictim picks which sampled candidate to evict for the given policy. The
-// random policies take any sample, volatile-ttl takes the soonest to expire, and
-// the lru and lfu policies take the lowest LRU/LFU word, which orders by least
-// recently used and least frequently used once that bookkeeping is wired in.
+// random policies take any sample, volatile-ttl takes the soonest to expire, the
+// lru policies take the key idle the longest, and the lfu policies take the key
+// with the lowest access frequency.
 func chooseVictim(policy string, cands []keyspace.EvictionCandidate) keyspace.EvictionCandidate {
 	switch {
 	case strings.HasSuffix(policy, "-random"):
@@ -89,10 +89,18 @@ func chooseVictim(policy string, cands []keyspace.EvictionCandidate) keyspace.Ev
 			}
 		}
 		return best
-	default: // allkeys-lru, allkeys-lfu, volatile-lru, volatile-lfu
+	case strings.HasSuffix(policy, "-lfu"):
 		best := cands[0]
 		for _, c := range cands[1:] {
-			if c.LRULFU < best.LRULFU {
+			if c.Freq < best.Freq {
+				best = c
+			}
+		}
+		return best
+	default: // allkeys-lru, volatile-lru
+		best := cands[0]
+		for _, c := range cands[1:] {
+			if c.Atime < best.Atime {
 				best = c
 			}
 		}

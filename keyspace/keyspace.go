@@ -78,14 +78,15 @@ type Keyspace struct {
 func (ks *Keyspace) UsedMemory() int64 { return ks.dataBytes }
 
 // EvictionCandidate is a key the eviction loop may remove, carrying the fields the
-// policies sort on: the expiry for volatile-ttl and the LRU/LFU word for the
-// recency and frequency policies.
+// policies sort on: the expiry for volatile-ttl, the last-access time for the lru
+// policies, and the decayed frequency for the lfu policies.
 type EvictionCandidate struct {
 	DB     int
 	Key    []byte
 	TTLms  int64
 	HasTTL bool
-	LRULFU uint32
+	Atime  uint32 // unix seconds of last access; smaller is older, evicted first by LRU
+	Freq   uint8  // decayed LFU counter; smaller is colder, evicted first by LFU
 }
 
 // SampleForEviction reservoir-samples up to n eviction candidates across every
@@ -105,12 +106,15 @@ func (ks *Keyspace) SampleForEviction(n int, volatileOnly bool) []EvictionCandid
 			if volatileOnly && !h.HasTTL() {
 				return nil
 			}
+			raw := copyRaw(ck)
+			atime, freq := db.accessMetrics(raw)
 			cand := EvictionCandidate{
 				DB:     db.index,
-				Key:    copyRaw(ck),
+				Key:    raw,
 				TTLms:  h.TTLms,
 				HasTTL: h.HasTTL(),
-				LRULFU: h.LRULFU,
+				Atime:  atime,
+				Freq:   freq,
 			}
 			if len(out) < n {
 				out = append(out, cand)
@@ -146,6 +150,11 @@ type DB struct {
 	keyCount    uint64
 	expireCount uint64
 	avgTTL      uint32
+
+	// access holds the in-memory LRU and LFU bookkeeping per key, keyed by the raw
+	// key name. It is built up as keys are read and written and is not persisted,
+	// matching how Redis treats approximate eviction state across a restart.
+	access map[string]keyAccess
 }
 
 // Open binds a Keyspace to a pager and loads the catalog. The number of
@@ -311,13 +320,27 @@ func (db *DB) Set(key, body []byte, typ, enc uint8, ttlMs int64) error {
 	} else if !h.HasTTL() && hadTTL {
 		db.expireCount--
 	}
+	db.recordAccess(key, isNew)
 	return nil
 }
 
-// Get returns the body and header for key. found is false when the key is
-// absent or has expired; an expired key is deleted as a side effect (lazy
-// expiry).
+// Get returns the body and header for key and records an LRU and LFU access. It
+// is the read path data commands use. found is false when the key is absent or
+// has expired; an expired key is deleted as a side effect (lazy expiry).
 func (db *DB) Get(key []byte) (body []byte, hdr ValueHeader, found bool, err error) {
+	return db.get(key, true)
+}
+
+// Peek is Get without recording an access, the read path introspection commands
+// use so OBJECT, EXISTS and friends do not reset a key's idle time or bump its
+// frequency.
+func (db *DB) Peek(key []byte) (body []byte, hdr ValueHeader, found bool, err error) {
+	return db.get(key, false)
+}
+
+// get is the shared read path. When touch is set it records an access for the
+// eviction bookkeeping; lazy expiry runs either way.
+func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found bool, err error) {
 	t := db.loadTree()
 	if t == nil {
 		return nil, ValueHeader{}, false, nil
@@ -337,6 +360,9 @@ func (db *DB) Get(key []byte) (body []byte, hdr ValueHeader, found bool, err err
 		}
 		return nil, ValueHeader{}, false, err
 	}
+	if touch {
+		db.recordAccess(key, false)
+	}
 	if h.Flags&FlagInlineBody == 0 {
 		body, err := db.ks.readOverflow(uint32(h.BodyRef), int(h.BodyLen))
 		if err != nil {
@@ -349,9 +375,10 @@ func (db *DB) Get(key []byte) (body []byte, hdr ValueHeader, found bool, err err
 	return out, h, true, nil
 }
 
-// Exists reports whether key is present and unexpired. An expired key is deleted.
+// Exists reports whether key is present and unexpired without recording an
+// access. An expired key is deleted.
 func (db *DB) Exists(key []byte) (bool, error) {
-	_, _, found, err := db.Get(key)
+	_, _, found, err := db.Peek(key)
 	return found, err
 }
 
@@ -374,6 +401,7 @@ func (db *DB) Delete(key []byte) (bool, error) {
 		db.rootPage = t.Root()
 		db.keyCount--
 		db.ks.dataBytes -= int64(len(key)) + int64(prev.BodyLen) + entryOverhead
+		db.dropAccess(key)
 		if prev.HasTTL() {
 			db.expireCount--
 		}

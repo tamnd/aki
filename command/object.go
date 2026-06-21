@@ -1,6 +1,8 @@
 package command
 
 import (
+	"strings"
+
 	"github.com/tamnd/aki/keyspace"
 )
 
@@ -44,7 +46,7 @@ func handleObjectEncoding(ctx *Ctx) {
 	var name string
 	var found bool
 	if !ctx.view(func(db *keyspace.DB) error {
-		_, hdr, ok, err := db.Get(key)
+		_, hdr, ok, err := db.Peek(key)
 		if err != nil {
 			return err
 		}
@@ -84,15 +86,26 @@ func handleObjectRefcount(ctx *Ctx) {
 }
 
 // handleObjectIdletime returns the whole seconds since the key was last accessed.
-// aki does not track per-key access time yet, so the answer is 0 for any live
-// key. No LFU policy is configured, so this never errors with the LFU message.
+// It reads without touching the key, so asking for the idle time does not reset
+// it. Redis rejects this under an LFU policy, where access time is not tracked.
 func handleObjectIdletime(ctx *Ctx) {
+	if strings.HasSuffix(ctx.confStr("maxmemory-policy", "noeviction"), "-lfu") {
+		ctx.enc().WriteError("ERR An LFU maxmemory policy is selected, idle time not tracked. Please note that when switching between maxmemory policies at runtime LFU and LRU data will take some time to adjust.")
+		return
+	}
 	key := ctx.Argv[2]
 	var found bool
+	var idle uint32
 	if !ctx.view(func(db *keyspace.DB) error {
 		ok, err := db.Exists(key)
+		if err != nil {
+			return err
+		}
 		found = ok
-		return err
+		if ok {
+			idle = db.Idle(key)
+		}
+		return nil
 	}) {
 		return
 	}
@@ -100,14 +113,37 @@ func handleObjectIdletime(ctx *Ctx) {
 		ctx.enc().WriteError(noSuchKeyError)
 		return
 	}
-	ctx.enc().WriteInteger(0)
+	ctx.enc().WriteInteger(int64(idle))
 }
 
-// handleObjectFreq returns the LFU access frequency counter. aki has no LFU
-// maxmemory-policy configured at this milestone, so the command always reports
-// the same error Redis gives when the policy is not LFU.
+// handleObjectFreq returns the LFU access frequency counter. It is only valid
+// under an LFU policy, matching Redis, which tracks frequency only then.
 func handleObjectFreq(ctx *Ctx) {
-	ctx.enc().WriteError("ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between maxmemory policies at runtime LFU and LRU data will take some time to adjust.")
+	if !strings.HasSuffix(ctx.confStr("maxmemory-policy", "noeviction"), "-lfu") {
+		ctx.enc().WriteError("ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between maxmemory policies at runtime LFU and LRU data will take some time to adjust.")
+		return
+	}
+	key := ctx.Argv[2]
+	var found bool
+	var freq uint8
+	if !ctx.view(func(db *keyspace.DB) error {
+		ok, err := db.Exists(key)
+		if err != nil {
+			return err
+		}
+		found = ok
+		if ok {
+			freq = db.Freq(key)
+		}
+		return nil
+	}) {
+		return
+	}
+	if !found {
+		ctx.enc().WriteError(noSuchKeyError)
+		return
+	}
+	ctx.enc().WriteInteger(int64(freq))
 }
 
 // handleObjectHelp prints the subcommand summary, matching the shape of the
