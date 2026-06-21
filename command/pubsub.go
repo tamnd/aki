@@ -255,43 +255,8 @@ func unsubscribe(ctx *Ctx, reg map[string]map[uint64]*networking.Conn, held map[
 // pattern subscriber whose pattern matches, then returns the total delivery
 // count. A client subscribed both ways is counted once per delivery.
 func handlePublish(ctx *Ctx) {
-	channel := ctx.Argv[1]
-	msg := ctx.Argv[2]
-
-	type target struct {
-		conn    *networking.Conn
-		pattern []byte
-	}
-	var targets []target
-
-	ctx.d.ps.mu.RLock()
-	for _, conn := range ctx.d.ps.channels[string(channel)] {
-		targets = append(targets, target{conn: conn})
-	}
-	for pat, conns := range ctx.d.ps.patterns {
-		if !stringMatch([]byte(pat), channel, false) {
-			continue
-		}
-		pb := []byte(pat)
-		for _, conn := range conns {
-			targets = append(targets, target{conn: conn, pattern: pb})
-		}
-	}
-	ctx.d.ps.mu.RUnlock()
-
-	var count int64
-	for _, t := range targets {
-		var frame []byte
-		if t.pattern != nil {
-			frame = framePMessage(t.conn.Proto(), t.pattern, channel, msg)
-		} else {
-			frame = frameMessage(t.conn.Proto(), "message", channel, msg)
-		}
-		if err := t.conn.Deliver(frame); err == nil {
-			count++
-		}
-	}
-	ctx.enc().WriteInteger(count)
+	n := ctx.d.publishTo(string(ctx.Argv[1]), string(ctx.Argv[2]))
+	ctx.enc().WriteInteger(int64(n))
 }
 
 // handleSPublish delivers a message only to shard-channel subscribers and returns

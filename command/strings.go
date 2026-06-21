@@ -245,6 +245,9 @@ func handleSet(ctx *Ctx) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
+	if !aborted {
+		ctx.notify(notifyString, "set", key)
+	}
 	// With GET the reply is always the old value (or null); without GET it is
 	// OK on a real write and null when a condition blocked the write.
 	if opts.get {
@@ -274,6 +277,9 @@ func handleSetNX(ctx *Ctx) {
 		stored = true
 		return db.Set(key, val, keyspace.TypeString, stringEncoding(val), -1)
 	}) {
+		if stored {
+			ctx.notify(notifyString, "set", key)
+		}
 		ctx.enc().WriteInteger(boolToInt(stored))
 	}
 }
@@ -307,6 +313,7 @@ func setWithExpire(ctx *Ctx, mode uint8, name string) {
 		ttl := absoluteTTL(mode, v, keyspace.ValueHeader{}, false)
 		return db.Set(key, val, keyspace.TypeString, stringEncoding(val), ttl)
 	}) {
+		ctx.notify(notifyString, "set", key)
 		ctx.Conn.WriteRaw(resp.ReplyOK)
 	}
 }
@@ -370,6 +377,7 @@ func handleGetSet(ctx *Ctx) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
+	ctx.notify(notifyString, "set", key)
 	writeStringOrNull(ctx, oldBody, oldFound)
 }
 
@@ -404,6 +412,9 @@ func handleGetDel(ctx *Ctx) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
+	if found {
+		ctx.notify(notifyGeneric, "del", key)
+	}
 	writeStringOrNull(ctx, body, found)
 }
 
@@ -418,9 +429,11 @@ func handleGetEX(ctx *Ctx) {
 		return
 	}
 	var (
-		wrongTyp bool
-		body     []byte
-		found    bool
+		wrongTyp   bool
+		body       []byte
+		found      bool
+		didExpire  bool
+		didPersist bool
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
 		b, hdr, f, err := db.Get(key)
@@ -438,6 +451,11 @@ func handleGetEX(ctx *Ctx) {
 		if mode == ttlPersist && !hdr.HasTTL() {
 			return nil
 		}
+		if mode == ttlPersist {
+			didPersist = true
+		} else {
+			didExpire = true
+		}
 		ttl := absoluteTTL(mode, value, hdr, found)
 		return db.Set(key, b, keyspace.TypeString, hdr.Encoding, ttl)
 	})
@@ -447,6 +465,12 @@ func handleGetEX(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	switch {
+	case didExpire:
+		ctx.notify(notifyGeneric, "expire", key)
+	case didPersist:
+		ctx.notify(notifyGeneric, "persist", key)
 	}
 	writeStringOrNull(ctx, body, found)
 }
