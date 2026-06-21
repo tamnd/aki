@@ -31,7 +31,13 @@ type Dispatcher struct {
 	engine *Engine
 	ps     *pubsubRegistry
 	conf   *configStore
+	srv    *networking.Server
 }
+
+// SetServer gives the dispatcher a handle to the network server so CLIENT and
+// INFO can enumerate live connections. The wiring happens after both are built,
+// since the server takes the dispatcher as its handler.
+func (d *Dispatcher) SetServer(s *networking.Server) { d.srv = s }
 
 // New builds a Dispatcher with the connection-group and data-type commands.
 func New(cfg Config) *Dispatcher {
@@ -74,6 +80,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, transactionCommands()...)
 	cmds = append(cmds, pubsubCommands()...)
 	cmds = append(cmds, configCommands()...)
+	cmds = append(cmds, clientCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	conf := newConfigStore()
 	conf.set("databases", strconv.Itoa(cfg.Databases))
@@ -113,6 +120,15 @@ type session struct {
 	subChannels map[string]bool
 	subPatterns map[string]bool
 	subShards   map[string]bool
+
+	// CLIENT introspection state. lastCmd is the most recent command name (with
+	// its subcommand for container commands), libName and libVer come from CLIENT
+	// SETINFO, and noEvict and noTouch hold the per-connection CLIENT toggles.
+	lastCmd string
+	libName string
+	libVer  string
+	noEvict bool
+	noTouch bool
 }
 
 // subCount is the running number of subscriptions across channels, patterns and
@@ -148,6 +164,11 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	if err != nil {
 		c.Enc().WriteError(err.Error())
 		return
+	}
+	if cmd.SubName != "" {
+		sess.lastCmd = cmd.SubName
+	} else {
+		sess.lastCmd = name
 	}
 	if !checkArity(cmd, len(argv)) {
 		c.Enc().WriteError(arityError(cmd))

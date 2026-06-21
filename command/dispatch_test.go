@@ -18,6 +18,7 @@ func start(t *testing.T, cfg Config) (*bufio.Reader, net.Conn) {
 	d := New(cfg)
 	ncfg := networking.Config{Addr: "127.0.0.1:0"}
 	srv := networking.New(ncfg, d)
+	d.SetServer(srv)
 	go func() { _ = srv.ListenAndServe(ncfg) }()
 	t.Cleanup(func() { _ = srv.Close() })
 
