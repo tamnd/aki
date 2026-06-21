@@ -17,7 +17,17 @@ const (
 	errStreamCountPos    = "ERR value is not an integer or out of range"
 	errStreamTimeoutNeg  = "ERR timeout is negative"
 	errStreamReadCountER = "ERR COUNT must be a positive integer"
+	errStreamNoSuchKey   = "ERR no such key"
+	errStreamMaxLenArg   = "ERR invalid MAXLEN argument"
+	errStreamMinIDArg    = "ERR invalid MINID argument"
+	errStreamLimitZero   = "ERR The ~ prefix is not valid for MINID or MAXLEN when LIMIT is specified with value 0"
+	errStreamSetIDSmall  = "ERR The ID specified in XSETID is smaller than current stream's last ID"
 )
+
+// streamNodeEntries is the assumed listpack-node capacity used to report the
+// radix-tree node counts in XINFO. The flat store has no real rax, so these
+// counts are an approximation derived from the live entry count.
+const streamNodeEntries = 100
 
 // streamCommands returns the core stream entry-log commands. Trimming, XSETID,
 // XINFO, consumer groups, and blocking reads land in later slices.
@@ -41,7 +51,126 @@ func streamCommands() []*CmdDesc {
 		{Name: "xread", Group: GroupStream, Since: "5.0.0",
 			Arity: -4, Flags: FlagReadOnly | FlagBlocking, FirstKey: 0, LastKey: 0, Step: 0,
 			Handler: handleXRead},
+		{Name: "xtrim", Group: GroupStream, Since: "5.0.0",
+			Arity: -4, Flags: FlagWrite | FlagFast, FirstKey: 1, LastKey: 1, Step: 1,
+			Handler: handleXTrim},
+		{Name: "xsetid", Group: GroupStream, Since: "5.0.0",
+			Arity: -3, Flags: FlagWrite | FlagFast, FirstKey: 1, LastKey: 1, Step: 1,
+			Handler: handleXSetID},
+		{Name: "xinfo", Group: GroupStream, Since: "5.0.0",
+			Arity: -2, Flags: FlagReadOnly, FirstKey: 2, LastKey: 2, Step: 1,
+			Handler: handleXInfo},
 	}
+}
+
+// trimKind selects between the two trim strategies.
+type trimKind int
+
+const (
+	trimNone trimKind = iota
+	trimMaxLen
+	trimMinID
+)
+
+// trimSpec is a parsed MAXLEN or MINID trim clause shared by XADD and XTRIM.
+type trimSpec struct {
+	kind     trimKind
+	maxLen   int64
+	minID    streamID
+	approx   bool
+	limit    int64
+	hasLimit bool
+}
+
+// parseTrim parses MAXLEN|MINID [=|~] threshold [LIMIT count] starting at the
+// strategy keyword. It returns the spec, the number of args consumed, and an
+// error string. The flat store trims exactly, so the ~ form keeps no more than
+// the threshold, which still satisfies the approximate contract.
+func parseTrim(args [][]byte) (trimSpec, int, string) {
+	var ts trimSpec
+	i := 0
+	switch strings.ToUpper(string(args[i])) {
+	case "MAXLEN":
+		ts.kind = trimMaxLen
+	case "MINID":
+		ts.kind = trimMinID
+	default:
+		return ts, 0, "ERR syntax error"
+	}
+	i++
+	if i >= len(args) {
+		return ts, 0, "ERR syntax error"
+	}
+	switch string(args[i]) {
+	case "~":
+		ts.approx = true
+		i++
+	case "=":
+		i++
+	}
+	if i >= len(args) {
+		return ts, 0, "ERR syntax error"
+	}
+	if ts.kind == trimMaxLen {
+		n, ok := parseInteger(args[i])
+		if !ok || n < 0 {
+			return ts, 0, errStreamMaxLenArg
+		}
+		ts.maxLen = n
+	} else {
+		id, ok := parseStreamID(string(args[i]), 0)
+		if !ok {
+			return ts, 0, errStreamMinIDArg
+		}
+		ts.minID = id
+	}
+	i++
+	if i < len(args) && strings.EqualFold(string(args[i]), "LIMIT") {
+		if !ts.approx {
+			return ts, 0, "ERR syntax error"
+		}
+		if i+1 >= len(args) {
+			return ts, 0, "ERR syntax error"
+		}
+		n, ok := parseInteger(args[i+1])
+		if !ok || n < 0 {
+			return ts, 0, "ERR syntax error"
+		}
+		if n == 0 {
+			return ts, 0, errStreamLimitZero
+		}
+		ts.limit = n
+		ts.hasLimit = true
+		i += 2
+	}
+	return ts, i, ""
+}
+
+// applyTrim removes entries from the low end of s per ts and returns the count
+// removed. max-deleted-id is not advanced by trimming, matching Redis, since
+// last_id already records the high-water mark.
+func applyTrim(s *stream, ts trimSpec) int64 {
+	drop := 0
+	switch ts.kind {
+	case trimMaxLen:
+		if int64(len(s.entries)) > ts.maxLen {
+			drop = len(s.entries) - int(ts.maxLen)
+		}
+	case trimMinID:
+		for drop < len(s.entries) && s.entries[drop].id.less(ts.minID) {
+			drop++
+		}
+	default:
+		return 0
+	}
+	if ts.hasLimit && int64(drop) > ts.limit {
+		drop = int(ts.limit)
+	}
+	if drop <= 0 {
+		return 0
+	}
+	s.entries = append([]streamEntry(nil), s.entries[drop:]...)
+	return int64(drop)
 }
 
 // autoID generates the next ID for the * form from the clock and the stream's
@@ -110,12 +239,17 @@ func handleXAdd(ctx *Ctx) {
 		noMkStream = true
 		i++
 	}
-	// Trimming clauses are not handled in this slice.
+	var trim trimSpec
 	if i < len(argv) {
 		switch strings.ToUpper(string(argv[i])) {
 		case "MAXLEN", "MINID":
-			ctx.enc().WriteError("ERR syntax error")
-			return
+			ts, n, errStr := parseTrim(argv[i:])
+			if errStr != "" {
+				ctx.enc().WriteError(errStr)
+				return
+			}
+			trim = ts
+			i += n
 		}
 	}
 	if i >= len(argv) {
@@ -168,6 +302,9 @@ func handleXAdd(ctx *Ctx) {
 		s.lastID = id
 		s.entriesAdded++
 		newID = id
+		if trim.kind != trimNone {
+			applyTrim(s, trim)
+		}
 		ttl := int64(-1)
 		if found {
 			ttl = keepTTL(hdr, found)
@@ -532,4 +669,306 @@ func handleXReadStreams(ctx *Ctx, rest [][]byte, count int64) {
 		enc.WriteBulkString(r.key)
 		writeEntries(enc, r.entries)
 	}
+}
+
+// handleXTrim implements XTRIM key MAXLEN|MINID [=|~] threshold [LIMIT count].
+func handleXTrim(ctx *Ctx) {
+	argv := ctx.Argv
+	ts, n, errStr := parseTrim(argv[2:])
+	if errStr != "" {
+		ctx.enc().WriteError(errStr)
+		return
+	}
+	if 2+n != len(argv) {
+		ctx.enc().WriteError("ERR syntax error")
+		return
+	}
+
+	var (
+		removed  int64
+		wrongTyp bool
+	)
+	if !ctx.update(func(db *keyspace.DB) error {
+		s, hdr, found, err := getStream(db, argv[1])
+		if err != nil {
+			return err
+		}
+		if found && hdr.Type != keyspace.TypeStream {
+			wrongTyp = true
+			return nil
+		}
+		if !found {
+			return nil
+		}
+		removed = applyTrim(s, ts)
+		if removed == 0 {
+			return nil
+		}
+		return storeStream(db, argv[1], s, keepTTL(hdr, found))
+	}) {
+		return
+	}
+	if wrongTyp {
+		ctx.enc().WriteError(wrongTypeError)
+		return
+	}
+	ctx.enc().WriteInteger(removed)
+}
+
+// handleXSetID implements XSETID key last-id [ENTRIESADDED n] [MAXDELETEDID id].
+func handleXSetID(ctx *Ctx) {
+	argv := ctx.Argv
+	newLast, ok := parseStreamID(string(argv[2]), 0)
+	if !ok {
+		ctx.enc().WriteError(errStreamInvalidID)
+		return
+	}
+
+	var (
+		setEntriesAdded bool
+		entriesAdded    uint64
+		setMaxDeleted   bool
+		maxDeleted      streamID
+	)
+	i := 3
+	for i < len(argv) {
+		switch strings.ToUpper(string(argv[i])) {
+		case "ENTRIESADDED":
+			if i+1 >= len(argv) {
+				ctx.enc().WriteError("ERR syntax error")
+				return
+			}
+			v, okv := parseInteger(argv[i+1])
+			if !okv || v < 0 {
+				ctx.enc().WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			entriesAdded = uint64(v)
+			setEntriesAdded = true
+			i += 2
+		case "MAXDELETEDID":
+			if i+1 >= len(argv) {
+				ctx.enc().WriteError("ERR syntax error")
+				return
+			}
+			id, okid := parseStreamID(string(argv[i+1]), 0)
+			if !okid {
+				ctx.enc().WriteError(errStreamInvalidID)
+				return
+			}
+			maxDeleted = id
+			setMaxDeleted = true
+			i += 2
+		default:
+			ctx.enc().WriteError("ERR syntax error")
+			return
+		}
+	}
+
+	var (
+		wrongTyp bool
+		noKey    bool
+		tooSmall bool
+	)
+	if !ctx.update(func(db *keyspace.DB) error {
+		s, hdr, found, err := getStream(db, argv[1])
+		if err != nil {
+			return err
+		}
+		if found && hdr.Type != keyspace.TypeStream {
+			wrongTyp = true
+			return nil
+		}
+		if !found {
+			noKey = true
+			return nil
+		}
+		// The new last ID cannot drop below the highest entry actually present.
+		if len(s.entries) > 0 && newLast.less(s.entries[len(s.entries)-1].id) {
+			tooSmall = true
+			return nil
+		}
+		s.lastID = newLast
+		if setEntriesAdded {
+			s.entriesAdded = entriesAdded
+		}
+		if setMaxDeleted {
+			s.maxDeletedID = maxDeleted
+		}
+		return storeStream(db, argv[1], s, keepTTL(hdr, found))
+	}) {
+		return
+	}
+	switch {
+	case wrongTyp:
+		ctx.enc().WriteError(wrongTypeError)
+	case noKey:
+		ctx.enc().WriteError(errStreamNoSuchKey)
+	case tooSmall:
+		ctx.enc().WriteError(errStreamSetIDSmall)
+	default:
+		ctx.enc().WriteStatus("OK")
+	}
+}
+
+// handleXInfo implements XINFO STREAM key [FULL [COUNT count]]. The GROUPS and
+// CONSUMERS subcommands arrive with consumer groups in a later slice.
+func handleXInfo(ctx *Ctx) {
+	argv := ctx.Argv
+	if len(argv) < 3 {
+		ctx.enc().WriteError("ERR wrong number of arguments for 'xinfo' command")
+		return
+	}
+	if !strings.EqualFold(string(argv[1]), "STREAM") {
+		ctx.enc().WriteError("ERR Unknown XINFO subcommand or wrong number of arguments for '" + string(argv[1]) + "'")
+		return
+	}
+	key := argv[2]
+
+	full := false
+	count := int64(10)
+	if len(argv) > 3 {
+		if !strings.EqualFold(string(argv[3]), "FULL") {
+			ctx.enc().WriteError("ERR syntax error")
+			return
+		}
+		full = true
+		if len(argv) > 4 {
+			if len(argv) != 6 || !strings.EqualFold(string(argv[4]), "COUNT") {
+				ctx.enc().WriteError("ERR syntax error")
+				return
+			}
+			c, okc := parseInteger(argv[5])
+			if !okc || c < 0 {
+				ctx.enc().WriteError(errStreamCountPos)
+				return
+			}
+			count = c
+		}
+	}
+
+	var (
+		snap     *stream
+		wrongTyp bool
+		noKey    bool
+	)
+	if !ctx.view(func(db *keyspace.DB) error {
+		s, hdr, found, err := getStream(db, key)
+		if err != nil {
+			return err
+		}
+		if found && hdr.Type != keyspace.TypeStream {
+			wrongTyp = true
+			return nil
+		}
+		if !found {
+			noKey = true
+			return nil
+		}
+		snap = s
+		return nil
+	}) {
+		return
+	}
+	switch {
+	case wrongTyp:
+		ctx.enc().WriteError(wrongTypeError)
+	case noKey:
+		ctx.enc().WriteError(errStreamNoSuchKey)
+	case full:
+		writeStreamInfoFull(ctx.enc(), snap, count)
+	default:
+		writeStreamInfoSummary(ctx.enc(), snap)
+	}
+}
+
+// firstID returns the lowest present entry ID, or 0-0 for an empty stream.
+func (s *stream) firstID() streamID {
+	if len(s.entries) == 0 {
+		return streamID{}
+	}
+	return s.entries[0].id
+}
+
+// raxKeys approximates the listpack-node count from the live entry count.
+func (s *stream) raxKeys() int64 {
+	if len(s.entries) == 0 {
+		return 0
+	}
+	return int64((len(s.entries) + streamNodeEntries - 1) / streamNodeEntries)
+}
+
+// writeStreamInfoSummary writes the XINFO STREAM summary reply.
+func writeStreamInfoSummary(enc *resp.Encoder, s *stream) {
+	keys := s.raxKeys()
+	pairs := func() {
+		enc.WriteBulkStringStr("length")
+		enc.WriteInteger(int64(len(s.entries)))
+		enc.WriteBulkStringStr("radix-tree-keys")
+		enc.WriteInteger(keys)
+		enc.WriteBulkStringStr("radix-tree-nodes")
+		enc.WriteInteger(keys + 1)
+		enc.WriteBulkStringStr("last-generated-id")
+		enc.WriteBulkStringStr(s.lastID.String())
+		enc.WriteBulkStringStr("max-deleted-entry-id")
+		enc.WriteBulkStringStr(s.maxDeletedID.String())
+		enc.WriteBulkStringStr("entries-added")
+		enc.WriteInteger(int64(s.entriesAdded))
+		enc.WriteBulkStringStr("recorded-first-entry-id")
+		enc.WriteBulkStringStr(s.firstID().String())
+		enc.WriteBulkStringStr("groups")
+		enc.WriteInteger(0)
+		enc.WriteBulkStringStr("first-entry")
+		writeInfoEntry(enc, s, 0)
+		enc.WriteBulkStringStr("last-entry")
+		writeInfoEntry(enc, s, len(s.entries)-1)
+	}
+	if enc.Proto() >= 3 {
+		enc.WriteMapLen(10)
+	} else {
+		enc.WriteArrayLen(20)
+	}
+	pairs()
+}
+
+// writeStreamInfoFull writes the XINFO STREAM FULL reply. The groups array is
+// empty until consumer groups land.
+func writeStreamInfoFull(enc *resp.Encoder, s *stream, count int64) {
+	if enc.Proto() >= 3 {
+		enc.WriteMapLen(9)
+	} else {
+		enc.WriteArrayLen(18)
+	}
+	enc.WriteBulkStringStr("length")
+	enc.WriteInteger(int64(len(s.entries)))
+	enc.WriteBulkStringStr("radix-tree-keys")
+	enc.WriteInteger(s.raxKeys())
+	enc.WriteBulkStringStr("radix-tree-nodes")
+	enc.WriteInteger(s.raxKeys() + 1)
+	enc.WriteBulkStringStr("last-generated-id")
+	enc.WriteBulkStringStr(s.lastID.String())
+	enc.WriteBulkStringStr("max-deleted-entry-id")
+	enc.WriteBulkStringStr(s.maxDeletedID.String())
+	enc.WriteBulkStringStr("entries-added")
+	enc.WriteInteger(int64(s.entriesAdded))
+	enc.WriteBulkStringStr("recorded-first-entry-id")
+	enc.WriteBulkStringStr(s.firstID().String())
+	enc.WriteBulkStringStr("entries")
+	n := len(s.entries)
+	if count > 0 && int64(n) > count {
+		n = int(count)
+	}
+	writeEntries(enc, s.entries[:n])
+	enc.WriteBulkStringStr("groups")
+	enc.WriteArrayLen(0)
+}
+
+// writeInfoEntry writes the entry at idx in [id, [f, v, ...]] form, or null when
+// the index is out of range (an empty stream).
+func writeInfoEntry(enc *resp.Encoder, s *stream, idx int) {
+	if idx < 0 || idx >= len(s.entries) {
+		enc.WriteNullArray()
+		return
+	}
+	writeEntry(enc, s.entries[idx])
 }
