@@ -137,6 +137,7 @@ func handleLSet(ctx *Ctx) {
 	case oob:
 		ctx.enc().WriteError("ERR index out of range")
 	default:
+		ctx.notify(notifyList, "lset", key)
 		ctx.enc().WriteStatus("OK")
 	}
 }
@@ -204,6 +205,9 @@ func handleLInsert(ctx *Ctx) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
+	if result > 0 {
+		ctx.notify(notifyList, "linsert", key)
+	}
 	ctx.enc().WriteInteger(result)
 }
 
@@ -219,6 +223,7 @@ func handleLRem(ctx *Ctx) {
 	target := ctx.Argv[3]
 	var (
 		wrongTyp bool
+		emptied  bool
 		removed  int64
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
@@ -243,6 +248,7 @@ func handleLRem(ctx *Ctx) {
 			return nil
 		}
 		if len(rest) == 0 {
+			emptied = true
 			_, err := db.Delete(key)
 			return err
 		}
@@ -254,6 +260,12 @@ func handleLRem(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if removed > 0 {
+		ctx.notify(notifyList, "lrem", key)
+		if emptied {
+			ctx.notify(notifyGeneric, "del", key)
+		}
 	}
 	ctx.enc().WriteInteger(removed)
 }
@@ -318,7 +330,11 @@ func handleLTrim(ctx *Ctx) {
 		ctx.enc().WriteError("ERR value is not an integer or out of range")
 		return
 	}
-	var wrongTyp bool
+	var (
+		wrongTyp bool
+		trimmed  bool
+		emptied  bool
+	)
 	done := ctx.update(func(db *keyspace.DB) error {
 		body, hdr, found, err := db.Get(key)
 		if err != nil {
@@ -337,12 +353,15 @@ func handleLTrim(ctx *Ctx) {
 		}
 		kept := listSlice(elems, start, stop)
 		if len(kept) == 0 {
+			trimmed = true
+			emptied = true
 			_, err := db.Delete(key)
 			return err
 		}
 		if len(kept) == len(elems) {
 			return nil
 		}
+		trimmed = true
 		return db.Set(key, listEncode(kept), keyspace.TypeList, listEncoding(kept, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
@@ -351,6 +370,12 @@ func handleLTrim(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if trimmed {
+		ctx.notify(notifyList, "ltrim", key)
+		if emptied {
+			ctx.notify(notifyGeneric, "del", key)
+		}
 	}
 	ctx.enc().WriteStatus("OK")
 }

@@ -56,9 +56,10 @@ func parseLeftRight(arg []byte) (left bool, ok bool) {
 // WRONGTYPE when either key holds a non-list. src and dst may be the same key.
 func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 	var (
-		wrongTyp bool
-		absent   bool
-		moved    []byte
+		wrongTyp   bool
+		absent     bool
+		srcEmptied bool
+		moved      []byte
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
 		srcBody, srcHdr, srcFound, err := db.Get(src)
@@ -108,6 +109,7 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 		}
 
 		if len(srcElems) == 0 {
+			srcEmptied = true
 			if _, err := db.Delete(src); err != nil {
 				return err
 			}
@@ -138,6 +140,19 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 	if absent {
 		ctx.enc().WriteNull()
 		return
+	}
+	fromEvent := "rpop"
+	if fromLeft {
+		fromEvent = "lpop"
+	}
+	toEvent := "rpush"
+	if toLeft {
+		toEvent = "lpush"
+	}
+	ctx.notify(notifyList, fromEvent, src)
+	ctx.notify(notifyList, toEvent, dst)
+	if srcEmptied {
+		ctx.notify(notifyGeneric, "del", src)
 	}
 	ctx.enc().WriteBulkString(moved)
 }
@@ -360,6 +375,7 @@ func handleLMPop(ctx *Ctx) {
 
 	var (
 		wrongTyp  bool
+		emptied   bool
 		poppedKey []byte
 		popped    [][]byte
 	)
@@ -398,6 +414,7 @@ func handleLMPop(ctx *Ctx) {
 			}
 			poppedKey = key
 			if len(leftover) == 0 {
+				emptied = true
 				_, err := db.Delete(key)
 				return err
 			}
@@ -412,6 +429,16 @@ func handleLMPop(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if poppedKey != nil {
+		event := "rpop"
+		if fromLeft {
+			event = "lpop"
+		}
+		ctx.notify(notifyList, event, poppedKey)
+		if emptied {
+			ctx.notify(notifyGeneric, "del", poppedKey)
+		}
 	}
 	enc := ctx.enc()
 	if poppedKey == nil {

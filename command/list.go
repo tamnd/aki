@@ -93,6 +93,11 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 		ctx.enc().WriteInteger(0)
 		return
 	}
+	event := "rpush"
+	if head {
+		event = "lpush"
+	}
+	ctx.notify(notifyList, event, key)
 	ctx.enc().WriteInteger(newLen)
 }
 
@@ -122,6 +127,7 @@ func popList(ctx *Ctx, head bool) {
 	var (
 		wrongTyp bool
 		absent   bool
+		emptied  bool
 		popped   [][]byte
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
@@ -161,6 +167,7 @@ func popList(ctx *Ctx, head bool) {
 			rest = elems[:len(elems)-n]
 		}
 		if len(rest) == 0 {
+			emptied = true
 			_, err := db.Delete(key)
 			return err
 		}
@@ -172,6 +179,16 @@ func popList(ctx *Ctx, head bool) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if len(popped) > 0 {
+		event := "rpop"
+		if head {
+			event = "lpop"
+		}
+		ctx.notify(notifyList, event, key)
+		if emptied {
+			ctx.notify(notifyGeneric, "del", key)
+		}
 	}
 	enc := ctx.enc()
 	if absent {
