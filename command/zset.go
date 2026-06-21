@@ -166,6 +166,13 @@ parsed:
 		ctx.enc().WriteError("ERR resulting score is not a number (NaN)")
 		return
 	}
+	if added > 0 || changed > 0 {
+		if incr {
+			ctx.notify(notifyZset, "zincr", ctx.Argv[1])
+		} else {
+			ctx.notify(notifyZset, "zadd", ctx.Argv[1])
+		}
+	}
 	if incr {
 		if incrBlocked {
 			ctx.enc().WriteNull()
@@ -234,6 +241,7 @@ func handleZIncrBy(ctx *Ctx) {
 		ctx.enc().WriteError("ERR resulting score is not a number (NaN)")
 		return
 	}
+	ctx.notify(notifyZset, "zincr", ctx.Argv[1])
 	ctx.enc().WriteDouble(result)
 }
 
@@ -349,6 +357,7 @@ func handleZRem(ctx *Ctx) {
 	targets := ctx.Argv[2:]
 	var (
 		wrongTyp bool
+		emptied  bool
 		removed  int64
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
@@ -379,6 +388,7 @@ func handleZRem(ctx *Ctx) {
 			return nil
 		}
 		if len(kept) == 0 {
+			emptied = true
 			_, err := db.Delete(ctx.Argv[1])
 			return err
 		}
@@ -390,6 +400,12 @@ func handleZRem(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if removed > 0 {
+		ctx.notify(notifyZset, "zrem", ctx.Argv[1])
+		if emptied {
+			ctx.notify(notifyGeneric, "del", ctx.Argv[1])
+		}
 	}
 	ctx.enc().WriteInteger(removed)
 }

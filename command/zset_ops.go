@@ -334,8 +334,9 @@ func zSetOpStore(ctx *Ctx, op zsetOp) {
 		return
 	}
 	var (
-		wrongTyp bool
-		n        int64
+		wrongTyp   bool
+		dstDeleted bool
+		n          int64
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
 		// The destination is overwritten, but a non-zset destination is still a
@@ -359,6 +360,7 @@ func zSetOpStore(ctx *Ctx, op zsetOp) {
 		result := computeZSetOp(op, sets, weights, agg)
 		n = int64(len(result))
 		if len(result) == 0 {
+			dstDeleted = dstFound
 			_, err := db.Delete(dst)
 			return err
 		}
@@ -371,7 +373,24 @@ func zSetOpStore(ctx *Ctx, op zsetOp) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
+	if n > 0 {
+		ctx.notify(notifyZset, zSetStoreEvent(op), dst)
+	} else if dstDeleted {
+		ctx.notify(notifyGeneric, "del", dst)
+	}
 	ctx.enc().WriteInteger(n)
+}
+
+// zSetStoreEvent maps a store operation to its keyspace event name.
+func zSetStoreEvent(op zsetOp) string {
+	switch op {
+	case zopInter:
+		return "zinterstore"
+	case zopDiff:
+		return "zdiffstore"
+	default:
+		return "zunionstore"
+	}
 }
 
 // handleZInterCard implements ZINTERCARD numkeys key [key ...] [LIMIT limit].
@@ -525,6 +544,7 @@ func handleZMPop(ctx *Ctx) {
 		poppedKey []byte
 		popped    []zmember
 		wrongTyp  bool
+		emptied   bool
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
 		for _, key := range keys {
@@ -553,6 +573,7 @@ func handleZMPop(ctx *Ctx) {
 			}
 			poppedKey = key
 			if len(kept) == 0 {
+				emptied = true
 				_, err := db.Delete(key)
 				return err
 			}
@@ -566,6 +587,16 @@ func handleZMPop(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if poppedKey != nil {
+		event := "zpopmin"
+		if fromMax {
+			event = "zpopmax"
+		}
+		ctx.notify(notifyZset, event, poppedKey)
+		if emptied {
+			ctx.notify(notifyGeneric, "del", poppedKey)
+		}
 	}
 	enc := ctx.enc()
 	if poppedKey == nil {
