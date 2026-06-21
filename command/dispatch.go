@@ -61,6 +61,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, streamCommands()...)
 	cmds = append(cmds, claimCommands()...)
 	cmds = append(cmds, expireCommands()...)
+	cmds = append(cmds, scanCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	return &Dispatcher{table: NewTable(cmds), cfg: cfg, engine: cfg.Engine}
 }
