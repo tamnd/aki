@@ -108,21 +108,7 @@ func (e *Engine) takeExpired() []keyspace.ExpiredKey {
 func (e *Engine) snapshotAll() (rdb.Snapshot, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	snap := rdb.Snapshot{}
-	for i := range e.ks.DBCount() {
-		db, err := e.ks.DB(i)
-		if err != nil {
-			return rdb.Snapshot{}, err
-		}
-		entries, err := reloadEntries(db)
-		if err != nil {
-			return rdb.Snapshot{}, err
-		}
-		if len(entries) > 0 {
-			snap.DBs = append(snap.DBs, rdb.DBData{Index: i, Entries: entries})
-		}
-	}
-	return snap, nil
+	return SnapshotKeyspace(e.ks)
 }
 
 // usedMemory returns the live-data estimate the maxmemory check compares against.
