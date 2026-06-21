@@ -28,6 +28,14 @@ func newPubsubRegistry() *pubsubRegistry {
 	}
 }
 
+// counts reports the number of active channels, patterns and shard channels.
+// INFO's stats section reads them.
+func (r *pubsubRegistry) counts() (channels, patterns, shards int) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.channels), len(r.patterns), len(r.shards)
+}
+
 // add registers conn under name in m. It is idempotent: a second add for the
 // same connection leaves the set unchanged.
 func psAdd(m map[string]map[uint64]*networking.Conn, name string, conn *networking.Conn) {
