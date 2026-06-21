@@ -96,6 +96,7 @@ func handleHSet(ctx *Ctx, asHMSet bool) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
+	ctx.notify(notifyHash, "hset", key)
 	if asHMSet {
 		ctx.enc().WriteStatus("OK")
 		return
@@ -138,6 +139,7 @@ func handleHSetNX(ctx *Ctx) {
 		return
 	}
 	if set {
+		ctx.notify(notifyHash, "hset", key)
 		ctx.enc().WriteInteger(1)
 	} else {
 		ctx.enc().WriteInteger(0)
@@ -275,6 +277,7 @@ func handleHDel(ctx *Ctx) {
 	targets := ctx.Argv[2:]
 	var (
 		wrongTyp bool
+		emptied  bool
 		removed  int64
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
@@ -299,6 +302,7 @@ func handleHDel(ctx *Ctx) {
 			return nil
 		}
 		if len(fields) == 0 {
+			emptied = true
 			_, err := db.Delete(key)
 			return err
 		}
@@ -310,6 +314,12 @@ func handleHDel(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if removed > 0 {
+		ctx.notify(notifyHash, "hdel", key)
+		if emptied {
+			ctx.notify(notifyGeneric, "del", key)
+		}
 	}
 	ctx.enc().WriteInteger(removed)
 }

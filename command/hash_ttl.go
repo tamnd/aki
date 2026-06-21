@@ -1,6 +1,7 @@
 package command
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/tamnd/aki/keyspace"
@@ -107,7 +108,7 @@ func handleHExpire(ctx *Ctx, hcmd, mode string) {
 	}
 
 	codes := make([]int64, len(fields))
-	var wrongTyp, noKey bool
+	var wrongTyp, noKey, emptied bool
 	if !ctx.update(func(db *keyspace.DB) error {
 		hf, hdr, found, err := getHash(db, key)
 		if err != nil {
@@ -154,6 +155,7 @@ func handleHExpire(ctx *Ctx, hcmd, mode string) {
 			changed = true
 		}
 		if changed {
+			emptied = len(hf) == 0
 			return storeHash(db, key, hf, hdr)
 		}
 		return nil
@@ -167,6 +169,15 @@ func handleHExpire(ctx *Ctx, hcmd, mode string) {
 	if noKey {
 		writeIntArray(ctx, fillInt(len(fields), -2))
 		return
+	}
+	if slices.Contains(codes, int64(1)) {
+		ctx.notify(notifyHash, "hexpire", key)
+	}
+	if slices.Contains(codes, int64(2)) {
+		ctx.notify(notifyHash, "hdel", key)
+	}
+	if emptied {
+		ctx.notify(notifyGeneric, "del", key)
 	}
 	writeIntArray(ctx, codes)
 }
@@ -224,6 +235,9 @@ func handleHPersist(ctx *Ctx) {
 	if noKey {
 		writeIntArray(ctx, fillInt(len(fields), -2))
 		return
+	}
+	if slices.Contains(codes, int64(1)) {
+		ctx.notify(notifyHash, "hpersist", key)
 	}
 	writeIntArray(ctx, codes)
 }
