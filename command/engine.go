@@ -76,6 +76,22 @@ func (e *Engine) view(index int, fn func(*keyspace.DB) error) error {
 	return fn(db)
 }
 
+// activeExpireCycle runs one background expiry pass over every database, deleting
+// volatile keys whose TTL has passed and committing the removals so they are
+// durable. The expired keys land in the log for the caller to notify on.
+func (e *Engine) activeExpireCycle() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	n, err := e.ks.ActiveExpireCycle()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
+	}
+	return e.ks.Commit()
+}
+
 // takeExpired drains the keys lazy expiry removed since the last call. It holds
 // the engine lock so it does not race a concurrent access appending to the log.
 func (e *Engine) takeExpired() []keyspace.ExpiredKey {
