@@ -224,6 +224,14 @@ func (s *Server) onAccept(nc net.Conn) {
 	}()
 }
 
+// DisconnectHandler is an optional interface a Handler may implement to learn
+// when a connection's read loop has exited, so it can drop any per-connection
+// state it holds (pub/sub subscriptions, for one). It is called once per
+// connection, from that connection's own goroutine.
+type DisconnectHandler interface {
+	OnDisconnect(c *Conn)
+}
+
 // removeConn unregisters a connection when its read loop exits.
 func (s *Server) removeConn(c *Conn) {
 	s.mu.Lock()
@@ -232,6 +240,9 @@ func (s *Server) removeConn(c *Conn) {
 		s.clientCount--
 	}
 	s.mu.Unlock()
+	if dh, ok := s.handler.(DisconnectHandler); ok {
+		dh.OnDisconnect(c)
+	}
 }
 
 // CountClients returns the number of currently connected clients.

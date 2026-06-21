@@ -66,6 +66,12 @@ func (d *Dispatcher) queueCommand(c *networking.Conn, sess *session, name string
 		c.Enc().WriteError(arityError(cmd))
 		return
 	}
+	// The subscribe family cannot run inside a transaction, matching Redis.
+	if cmd.Flags.Has(FlagPubSub) {
+		sess.dirtyExec = true
+		c.Enc().WriteError("ERR " + cmd.Name + " is not allowed in transactions")
+		return
+	}
 	sess.queue = append(sess.queue, queuedCmd{cmd: cmd, argv: argv})
 	c.WriteRaw(resp.ReplyQueued)
 }
