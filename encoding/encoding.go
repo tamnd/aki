@@ -89,6 +89,15 @@ func AppendU16(dst []byte, v uint16) []byte { return binary.LittleEndian.AppendU
 func AppendU32(dst []byte, v uint32) []byte { return binary.LittleEndian.AppendUint32(dst, v) }
 func AppendU64(dst []byte, v uint64) []byte { return binary.LittleEndian.AppendUint64(dst, v) }
 
+// AppendU32BE, AppendU64BE append fixed-width big-endian integers. RDB length
+// fields use big-endian for their 32-bit and 64-bit forms (spec 2064 doc 17).
+func AppendU32BE(dst []byte, v uint32) []byte { return binary.BigEndian.AppendUint32(dst, v) }
+func AppendU64BE(dst []byte, v uint64) []byte { return binary.BigEndian.AppendUint64(dst, v) }
+
+// U32BE, U64BE read fixed-width big-endian integers from b.
+func U32BE(b []byte) uint32 { return binary.BigEndian.Uint32(b) }
+func U64BE(b []byte) uint64 { return binary.BigEndian.Uint64(b) }
+
 // AppendF64 appends a float64 as little-endian IEEE-754 bits, used by sorted-set
 // scores and the geo commands (spec 2064 doc 11, doc 13).
 func AppendF64(dst []byte, v float64) []byte { return AppendU64(dst, math.Float64bits(v)) }
