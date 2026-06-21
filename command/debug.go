@@ -31,11 +31,13 @@ func handleDebug(ctx *Ctx) {
 		debugObject(ctx)
 	case "SLEEP":
 		debugSleep(ctx)
-	case "SET-ACTIVE-EXPIRE", "QUICKLIST-PACKED-THRESHOLD", "CHANGE-REPL-ID", "JMAP", "RELOAD":
-		// Accepted no-ops. SET-ACTIVE-EXPIRE and QUICKLIST-PACKED-THRESHOLD tune
-		// machinery aki does not have yet, CHANGE-REPL-ID and RELOAD have nothing
-		// to do because the data is already durable in the WAL, and JMAP is a
-		// jemalloc hook with no Go equivalent worth wiring here.
+	case "SET-ACTIVE-EXPIRE":
+		debugSetActiveExpire(ctx)
+	case "QUICKLIST-PACKED-THRESHOLD", "CHANGE-REPL-ID", "JMAP", "RELOAD":
+		// Accepted no-ops. QUICKLIST-PACKED-THRESHOLD tunes machinery aki does not
+		// have yet, CHANGE-REPL-ID and RELOAD have nothing to do because the data
+		// is already durable in the WAL, and JMAP is a jemalloc hook with no Go
+		// equivalent worth wiring here.
 		ctx.enc().WriteStatus("OK")
 	case "STRINGMATCH-LEN":
 		debugStringmatchLen(ctx)
@@ -115,6 +117,23 @@ func debugSleep(ctx *Ctx) {
 	}
 	secs = min(secs, debugMaxSleepSeconds)
 	time.Sleep(time.Duration(secs * float64(time.Second)))
+	ctx.enc().WriteStatus("OK")
+}
+
+// debugSetActiveExpire turns the background expiry cycle on or off. Tests use the
+// 0 form to freeze a key with a past TTL in place so they can observe lazy expiry
+// in isolation. A non-zero value re-enables the cycle.
+func debugSetActiveExpire(ctx *Ctx) {
+	if len(ctx.Argv) != 3 {
+		ctx.enc().WriteError("ERR wrong number of arguments for 'debug|set-active-expire' command")
+		return
+	}
+	v, ok := parseInteger(ctx.Argv[2])
+	if !ok {
+		ctx.enc().WriteError("ERR value is not an integer or out of range")
+		return
+	}
+	ctx.d.activeExpire.Store(v != 0)
 	ctx.enc().WriteStatus("OK")
 }
 

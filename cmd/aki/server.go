@@ -49,6 +49,8 @@ func cmdServer(args []string) error {
 	}
 	srv := networking.New(cfg, d)
 	d.SetServer(srv)
+	d.StartBackground()
+	defer d.StopBackground()
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe(cfg) }()
