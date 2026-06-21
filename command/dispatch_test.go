@@ -41,6 +41,10 @@ func start(t *testing.T, cfg Config) (*bufio.Reader, net.Conn) {
 // send writes an inline command and reads one reply line.
 func sendLine(t *testing.T, r *bufio.Reader, c net.Conn, cmd string) string {
 	t.Helper()
+	// Refresh the deadline per command so a test that issues thousands of round
+	// trips (the HLL accuracy tests) is not bounded by the one-shot deadline set
+	// at connection time, which the -race build would otherwise blow through.
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := c.Write([]byte(cmd + "\r\n")); err != nil {
 		t.Fatal(err)
 	}
