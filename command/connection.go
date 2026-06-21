@@ -87,6 +87,7 @@ func handleReset(ctx *Ctx) {
 	ctx.Conn.SetDB(0)
 	ctx.Conn.SetName("")
 	ctx.sess.authenticated = ctx.d.cfg.RequirePass == ""
+	ctx.sess.clearMulti()
 	ctx.Conn.WriteRaw(resp.ReplyReset)
 }
 
