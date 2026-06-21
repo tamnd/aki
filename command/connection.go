@@ -42,16 +42,30 @@ func connectionCommands() []*CmdDesc {
 }
 
 // handlePing answers PONG, or echoes its single argument. PING carries arity -1
-// so the table accepts it, but more than one argument is an error.
+// so the table accepts it, but more than one argument is an error. A RESP2 client
+// in subscriber mode gets the two-element ["pong", message] push array instead,
+// matching Redis.
 func handlePing(ctx *Ctx) {
-	switch len(ctx.Argv) {
-	case 1:
-		ctx.Conn.WriteRaw(resp.ReplyPong)
-	case 2:
-		ctx.enc().WriteBulkString(ctx.Argv[1])
-	default:
+	if len(ctx.Argv) > 2 {
 		ctx.enc().WriteError(arityError(&CmdDesc{Name: "ping"}))
+		return
 	}
+	if ctx.Conn.Proto() == 2 && ctx.sess.subCount() > 0 {
+		enc := ctx.enc()
+		enc.WriteArrayLen(2)
+		enc.WriteBulkStringStr("pong")
+		if len(ctx.Argv) == 2 {
+			enc.WriteBulkString(ctx.Argv[1])
+		} else {
+			enc.WriteBulkStringStr("")
+		}
+		return
+	}
+	if len(ctx.Argv) == 2 {
+		ctx.enc().WriteBulkString(ctx.Argv[1])
+		return
+	}
+	ctx.Conn.WriteRaw(resp.ReplyPong)
 }
 
 // handleEcho returns its argument unchanged.

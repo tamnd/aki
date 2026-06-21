@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -59,6 +60,11 @@ type Conn struct {
 	// flush per pipeline batch sends it to the socket.
 	outBuf *bytes.Buffer
 	enc    *resp.Encoder
+
+	// writeMu serializes raw socket writes. The read loop's flush holds it, and
+	// so does Deliver, which another goroutine calls to push a pub/sub message.
+	// That keeps two writers from interleaving bytes on the wire.
+	writeMu sync.Mutex
 
 	// Connection state visible to handlers and to CLIENT introspection later.
 	db   int
@@ -127,6 +133,24 @@ func (c *Conn) Enc() *resp.Encoder { return c.enc }
 // pooled static replies in package resp. The bytes must be a complete, correctly
 // framed RESP value.
 func (c *Conn) WriteRaw(p []byte) { c.outBuf.Write(p) }
+
+// Deliver writes a complete, pre-framed RESP value straight to the socket from
+// another goroutine, the path a PUBLISH on one connection uses to push a message
+// to a subscriber on another. It holds the write lock so it cannot interleave
+// with the subscriber's own reply flush. A write to a closed socket returns an
+// error the caller can ignore: the connection is going away anyway.
+func (c *Conn) Deliver(p []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	n, err := c.raw.Write(p)
+	if n > 0 {
+		c.totNetOut += uint64(n)
+	}
+	return err
+}
 
 // Quit asks the loop to flush the current output and then close the connection,
 // the behaviour of the QUIT command. The reply already written stands.
@@ -244,10 +268,12 @@ func (c *Conn) flush() error {
 	if c.outBuf.Len() == 0 {
 		return nil
 	}
+	c.writeMu.Lock()
 	n, err := c.raw.Write(c.outBuf.Bytes())
 	if n > 0 {
 		c.totNetOut += uint64(n)
 	}
+	c.writeMu.Unlock()
 	c.outBuf.Reset()
 	return err
 }
