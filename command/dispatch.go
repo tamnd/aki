@@ -273,7 +273,7 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		return
 	}
 
-	cmd.Handler(&Ctx{Conn: c, Argv: argv, d: d, sess: sess})
+	d.runCommand(&Ctx{Conn: c, Argv: argv, d: d, sess: sess}, cmd)
 }
 
 // sessionFor returns the connection's session, creating it on first use. A new
