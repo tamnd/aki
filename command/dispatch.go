@@ -39,6 +39,11 @@ type Dispatcher struct {
 	// run_id and reused as the replication id.
 	startTime time.Time
 	runID     string
+
+	// notifyFlags is the parsed notify-keyspace-events bitmask. The write path
+	// reads it with an atomic load so a server with notifications off pays almost
+	// nothing; CONFIG SET updates it with an atomic store.
+	notifyFlags uint32
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -99,7 +104,7 @@ func New(cfg Config) *Dispatcher {
 	if cfg.RequirePass != "" {
 		conf.set("requirepass", cfg.RequirePass)
 	}
-	return &Dispatcher{
+	d := &Dispatcher{
 		table:     NewTable(cmds),
 		cfg:       cfg,
 		engine:    cfg.Engine,
@@ -108,6 +113,12 @@ func New(cfg Config) *Dispatcher {
 		startTime: time.Now(),
 		runID:     newRunID(),
 	}
+	if v, ok := conf.get("notify-keyspace-events"); ok {
+		if flags, ok := parseNotifyFlags(v); ok {
+			d.notifyFlags = flags
+		}
+	}
+	return d
 }
 
 // Ctx carries everything a handler needs: the connection it replies on, the
