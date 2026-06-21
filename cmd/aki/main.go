@@ -36,6 +36,10 @@ func run(args []string) error {
 		return cmdServer(args[1:])
 	case "check":
 		return cmdCheck(args[1:])
+	case "import":
+		return cmdImport(args[1:])
+	case "dump":
+		return cmdDump(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -52,11 +56,13 @@ Usage:
 
 Commands:
   server         Start the aki server (Redis wire protocol)
-  check <file>   Inspect an .aki file's header and meta pages
+  check <file>   Inspect an .aki file, or validate an RDB with --rdb <file>
+  import <file>  Import a Redis dump.rdb into an .aki file
+  dump --file f  Export an .aki file to a Redis dump.rdb
   version        Print version information
   help           Show this help
 
-More commands (cli, dump, import, bench) arrive as the engine is built.
+More commands (cli, bench) arrive as the engine is built.
 See the specification under notes/Spec/2064.
 `)
 }

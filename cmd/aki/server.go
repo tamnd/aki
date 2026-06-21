@@ -11,6 +11,7 @@ import (
 	"github.com/tamnd/aki/keyspace"
 	"github.com/tamnd/aki/networking"
 	"github.com/tamnd/aki/pager"
+	"github.com/tamnd/aki/rdb"
 	"github.com/tamnd/aki/vfs"
 )
 
@@ -25,8 +26,15 @@ func cmdServer(args []string) error {
 	databases := fs.Int("databases", 16, "number of logical databases")
 	requirePass := fs.String("requirepass", "", "password required for the default user")
 	dbfile := fs.String("dbfile", "aki.db", "path to the .aki data file")
+	loadRDB := fs.String("load-rdb", "", "import this dump.rdb on first open (only when the .aki file does not exist)")
+	rdbDB := fs.Int("rdb-db", -1, "with --load-rdb, import only this source database")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	fresh := !vfs.NewOS().Exists(*dbfile)
+	if *loadRDB != "" && !fresh {
+		return fmt.Errorf("--load-rdb only applies on first open; %s already exists", *dbfile)
 	}
 
 	ks, closeKS, err := openKeyspace(*dbfile, *databases)
@@ -34,6 +42,14 @@ func cmdServer(args []string) error {
 		return err
 	}
 	defer closeKS()
+
+	if *loadRDB != "" && fresh {
+		n, err := importRDBInto(ks, *loadRDB, *rdbDB)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("loaded %d keys from %s\n", n, *loadRDB)
+	}
 
 	d := command.New(command.Config{
 		Databases:   *databases,
@@ -69,6 +85,30 @@ func cmdServer(args []string) error {
 		fmt.Println("\naki shutting down")
 		return srv.Close()
 	}
+}
+
+// importRDBInto reads a dump.rdb and loads it into the fresh keyspace, committing
+// the result. It is the startup half of --load-rdb.
+func importRDBInto(ks *keyspace.Keyspace, path string, onlyDB int) (int, error) {
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("read %s: %w", path, err)
+	}
+	if len(blob) < 5 || string(blob[:5]) != "REDIS" {
+		return 0, fmt.Errorf("not an RDB file: %s", path)
+	}
+	snap, err := rdb.UnmarshalFile(blob)
+	if err != nil {
+		return 0, fmt.Errorf("parse RDB %s: %w", path, err)
+	}
+	n, err := command.LoadSnapshot(ks, snap, onlyDB, true)
+	if err != nil {
+		return 0, fmt.Errorf("load RDB %s: %w", path, err)
+	}
+	if err := ks.Commit(); err != nil {
+		return 0, fmt.Errorf("commit after load: %w", err)
+	}
+	return n, nil
 }
 
 // openKeyspace opens the data file at path, creating it on first run, and
