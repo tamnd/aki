@@ -41,13 +41,40 @@ type streamEntry struct {
 	fields [][]byte
 }
 
+// pelEntry is one Pending Entries List record: an entry delivered to a consumer
+// in a group but not yet acknowledged.
+type pelEntry struct {
+	id            streamID
+	consumer      string
+	deliveryTime  int64
+	deliveryCount uint64
+}
+
+// consumer is one named reader inside a group.
+type consumer struct {
+	name       string
+	seenTime   int64
+	activeTime int64
+}
+
+// group is a consumer group on a stream. The global PEL is kept sorted by entry
+// ID; the per-consumer PEL is the subset whose consumer field matches.
+type group struct {
+	name        string
+	lastID      streamID
+	entriesRead uint64
+	pel         []pelEntry
+	consumers   []*consumer
+}
+
 // stream is the in-memory form of a stream value. Entries are kept sorted by ID
-// in ascending order.
+// in ascending order, and groups by name.
 type stream struct {
 	lastID       streamID
 	maxDeletedID streamID
 	entriesAdded uint64
 	entries      []streamEntry
+	groups       []*group
 }
 
 // streamDecode unpacks a stored stream body. The body is the header (last ID,
@@ -111,9 +138,83 @@ func streamDecode(body []byte) (*stream, error) {
 		}
 		s.entries = append(s.entries, e)
 	}
-	// Group count, currently always zero; reserved for consumer groups.
-	if _, err = read(); err != nil {
+	groupCount, err := read()
+	if err != nil {
 		return nil, err
+	}
+	s.groups = make([]*group, 0, groupCount)
+	for range groupCount {
+		g := &group{}
+		nameChunk, m, err := readChunk(body, off)
+		if err != nil {
+			return nil, err
+		}
+		off = m
+		g.name = string(nameChunk)
+		if g.lastID.ms, err = read(); err != nil {
+			return nil, err
+		}
+		if g.lastID.seq, err = read(); err != nil {
+			return nil, err
+		}
+		if g.entriesRead, err = read(); err != nil {
+			return nil, err
+		}
+		consumerCount, err := read()
+		if err != nil {
+			return nil, err
+		}
+		g.consumers = make([]*consumer, 0, consumerCount)
+		for range consumerCount {
+			cn, m, err := readChunk(body, off)
+			if err != nil {
+				return nil, err
+			}
+			off = m
+			seen, err := read()
+			if err != nil {
+				return nil, err
+			}
+			active, err := read()
+			if err != nil {
+				return nil, err
+			}
+			g.consumers = append(g.consumers, &consumer{
+				name:       string(cn),
+				seenTime:   int64(seen),
+				activeTime: int64(active),
+			})
+		}
+		pelCount, err := read()
+		if err != nil {
+			return nil, err
+		}
+		g.pel = make([]pelEntry, 0, pelCount)
+		for range pelCount {
+			var pe pelEntry
+			if pe.id.ms, err = read(); err != nil {
+				return nil, err
+			}
+			if pe.id.seq, err = read(); err != nil {
+				return nil, err
+			}
+			cn, m, err := readChunk(body, off)
+			if err != nil {
+				return nil, err
+			}
+			off = m
+			pe.consumer = string(cn)
+			dt, err := read()
+			if err != nil {
+				return nil, err
+			}
+			pe.deliveryTime = int64(dt)
+			if pe.deliveryCount, err = read(); err != nil {
+				return nil, err
+			}
+			g.pel = append(g.pel, pe)
+		}
+		s.groups = append(s.groups, g)
 	}
 	return s, nil
 }
@@ -135,8 +236,30 @@ func streamEncode(s *stream) []byte {
 			body = append(body, chunk...)
 		}
 	}
-	// Group count placeholder.
-	body = encoding.AppendUvarint(body, 0)
+	body = encoding.AppendUvarint(body, uint64(len(s.groups)))
+	for _, g := range s.groups {
+		body = encoding.AppendUvarint(body, uint64(len(g.name)))
+		body = append(body, g.name...)
+		body = encoding.AppendUvarint(body, g.lastID.ms)
+		body = encoding.AppendUvarint(body, g.lastID.seq)
+		body = encoding.AppendUvarint(body, g.entriesRead)
+		body = encoding.AppendUvarint(body, uint64(len(g.consumers)))
+		for _, c := range g.consumers {
+			body = encoding.AppendUvarint(body, uint64(len(c.name)))
+			body = append(body, c.name...)
+			body = encoding.AppendUvarint(body, uint64(c.seenTime))
+			body = encoding.AppendUvarint(body, uint64(c.activeTime))
+		}
+		body = encoding.AppendUvarint(body, uint64(len(g.pel)))
+		for _, pe := range g.pel {
+			body = encoding.AppendUvarint(body, pe.id.ms)
+			body = encoding.AppendUvarint(body, pe.id.seq)
+			body = encoding.AppendUvarint(body, uint64(len(pe.consumer)))
+			body = append(body, pe.consumer...)
+			body = encoding.AppendUvarint(body, uint64(pe.deliveryTime))
+			body = encoding.AppendUvarint(body, pe.deliveryCount)
+		}
+	}
 	return body
 }
 
