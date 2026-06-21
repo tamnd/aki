@@ -36,7 +36,7 @@ func handleHGetDel(ctx *Ctx) {
 		return
 	}
 	out := make([]fieldValue, len(fields))
-	var wrongTyp bool
+	var wrongTyp, deleted, emptied bool
 	if !ctx.update(func(db *keyspace.DB) error {
 		hf, hdr, found, err := getHash(db, key)
 		if err != nil {
@@ -60,6 +60,8 @@ func handleHGetDel(ctx *Ctx) {
 			changed = true
 		}
 		if changed {
+			deleted = true
+			emptied = len(hf) == 0
 			return storeHash(db, key, hf, hdr)
 		}
 		return nil
@@ -69,6 +71,12 @@ func handleHGetDel(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if deleted {
+		ctx.notify(notifyHash, "hdel", key)
+		if emptied {
+			ctx.notify(notifyGeneric, "del", key)
+		}
 	}
 	writeFieldValues(ctx, out)
 }
@@ -114,7 +122,7 @@ func handleHGetEx(ctx *Ctx) {
 	}
 
 	out := make([]fieldValue, len(fields))
-	var wrongTyp bool
+	var wrongTyp, setTTL, delField, persisted, emptied bool
 	if !ctx.update(func(db *keyspace.DB) error {
 		hf, hdr, found, err := getHash(db, key)
 		if err != nil {
@@ -138,18 +146,22 @@ func handleHGetEx(ctx *Ctx) {
 			case "set":
 				if when <= now {
 					hf = append(hf[:idx], hf[idx+1:]...)
+					delField = true
 				} else {
 					hf[idx].ttl = when
+					setTTL = true
 				}
 				changed = true
 			case "persist":
 				if hf[idx].ttl != 0 {
 					hf[idx].ttl = 0
+					persisted = true
 					changed = true
 				}
 			}
 		}
 		if changed {
+			emptied = len(hf) == 0
 			return storeHash(db, key, hf, hdr)
 		}
 		return nil
@@ -159,6 +171,18 @@ func handleHGetEx(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if setTTL {
+		ctx.notify(notifyHash, "hexpire", key)
+	}
+	if delField {
+		ctx.notify(notifyHash, "hdel", key)
+	}
+	if persisted {
+		ctx.notify(notifyHash, "hpersist", key)
+	}
+	if emptied {
+		ctx.notify(notifyGeneric, "del", key)
 	}
 	writeFieldValues(ctx, out)
 }

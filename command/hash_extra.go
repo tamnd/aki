@@ -89,6 +89,7 @@ func handleHIncrBy(ctx *Ctx) {
 	case overflow:
 		ctx.enc().WriteError("ERR increment or decrement would overflow")
 	default:
+		ctx.notify(notifyHash, "hincrby", key)
 		ctx.enc().WriteInteger(result)
 	}
 }
@@ -156,6 +157,7 @@ func handleHIncrByFloat(ctx *Ctx) {
 	case nanInf:
 		ctx.enc().WriteError("ERR increment would produce NaN or Infinity")
 	default:
+		ctx.notify(notifyHash, "hincrbyfloat", key)
 		ctx.enc().WriteBulkStringStr(result)
 	}
 }
