@@ -54,6 +54,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, setAlgebraCommands()...)
 	cmds = append(cmds, zsetCommands()...)
 	cmds = append(cmds, zsetRankCommands()...)
+	cmds = append(cmds, zsetRangeCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	return &Dispatcher{table: NewTable(cmds), cfg: cfg, engine: cfg.Engine}
 }
