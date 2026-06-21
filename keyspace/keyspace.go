@@ -319,6 +319,60 @@ func (db *DB) Delete(key []byte) (bool, error) {
 	return ok, nil
 }
 
+// ActiveExpireCycle walks every database for volatile keys whose TTL has passed,
+// deletes them, and records each in the expired log so the command layer can fire
+// the "expired" event. It returns the number of keys removed. A database with no
+// volatile keys is skipped on the cheap expireCount guard.
+func (ks *Keyspace) ActiveExpireCycle() (int, error) {
+	now := nowMillis()
+	total := 0
+	for _, db := range ks.dbs {
+		if db.expireCount == 0 {
+			continue
+		}
+		keys, err := db.expiredVolatileKeys(now)
+		if err != nil {
+			return total, err
+		}
+		for _, k := range keys {
+			ok, err := db.Delete(k)
+			if err != nil {
+				return total, err
+			}
+			if ok {
+				ks.expiredLog = append(ks.expiredLog, ExpiredKey{DB: db.index, Key: k})
+				total++
+			}
+		}
+	}
+	return total, nil
+}
+
+// expiredVolatileKeys returns the raw names of every key in the DB whose absolute
+// TTL is at or before now. It collects the names in one pass rather than deleting
+// during the walk, since deleting under the cursor would disturb the iteration.
+func (db *DB) expiredVolatileKeys(now int64) ([][]byte, error) {
+	t := db.loadTree()
+	if t == nil {
+		return nil, nil
+	}
+	var out [][]byte
+	c := t.Cursor()
+	if err := c.First(); err != nil {
+		return nil, err
+	}
+	for c.Valid() {
+		h, _, ok := parseHeader(c.Value())
+		if ok && h.HasTTL() && h.TTLms <= now {
+			out = append(out, copyRaw(c.Key()))
+		}
+		if err := c.Next(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 // read fetches the raw cell for a composite key and splits off its header.
 func (db *DB) read(t *btree.Tree, ck []byte) (ValueHeader, []byte, bool, error) {
 	cell, ok, err := t.Get(ck)

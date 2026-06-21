@@ -3,6 +3,7 @@ package command
 import (
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/tamnd/aki/networking"
@@ -44,6 +45,15 @@ type Dispatcher struct {
 	// reads it with an atomic load so a server with notifications off pays almost
 	// nothing; CONFIG SET updates it with an atomic store.
 	notifyFlags uint32
+
+	// hz is the background tick rate, the number of active expiry cycles per
+	// second. activeExpire gates that cycle: DEBUG SET-ACTIVE-EXPIRE 0 clears it
+	// so only lazy expiry runs, which tests rely on. bgStop and bgDone manage the
+	// background goroutine started by StartBackground.
+	hz           int
+	activeExpire atomic.Bool
+	bgStop       chan struct{}
+	bgDone       chan struct{}
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -112,13 +122,66 @@ func New(cfg Config) *Dispatcher {
 		conf:      conf,
 		startTime: time.Now(),
 		runID:     newRunID(),
+		hz:        10,
 	}
+	d.activeExpire.Store(true)
 	if v, ok := conf.get("notify-keyspace-events"); ok {
 		if flags, ok := parseNotifyFlags(v); ok {
 			d.notifyFlags = flags
 		}
 	}
 	return d
+}
+
+// StartBackground launches the server cron, a goroutine that runs the active
+// expiry cycle hz times a second. The network server calls it once at startup.
+// Tests that drive expiry directly do not start it; they call runActiveExpire
+// instead so the timing is deterministic.
+func (d *Dispatcher) StartBackground() {
+	if d.bgStop != nil {
+		return
+	}
+	d.bgStop = make(chan struct{})
+	d.bgDone = make(chan struct{})
+	interval := time.Second / time.Duration(d.hz)
+	go func() {
+		defer close(d.bgDone)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-d.bgStop:
+				return
+			case <-t.C:
+				d.runActiveExpire()
+			}
+		}
+	}()
+}
+
+// StopBackground stops the cron goroutine and waits for it to exit. It is safe to
+// call when the cron was never started.
+func (d *Dispatcher) StopBackground() {
+	if d.bgStop == nil {
+		return
+	}
+	close(d.bgStop)
+	<-d.bgDone
+	d.bgStop = nil
+	d.bgDone = nil
+}
+
+// runActiveExpire runs one active expiry pass and fires the expired event for
+// every key it removed. It is a no-op when active expiry is disabled or no
+// keyspace is attached. The cron loop and the tests both call it.
+func (d *Dispatcher) runActiveExpire() {
+	if d.engine == nil || !d.activeExpire.Load() {
+		return
+	}
+	if err := d.engine.activeExpireCycle(); err != nil {
+		return
+	}
+	d.drainExpired()
 }
 
 // Ctx carries everything a handler needs: the connection it replies on, the
