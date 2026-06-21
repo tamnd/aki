@@ -33,6 +33,17 @@ func (e *Engine) update(index int, fn func(*keyspace.DB) error) error {
 	return e.ks.Commit()
 }
 
+// updateKeyspace runs fn with access to every database under the engine lock and
+// commits on success. Cross-database writes like MOVE and COPY go through here.
+func (e *Engine) updateKeyspace(fn func(*keyspace.Keyspace) error) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := fn(e.ks); err != nil {
+		return err
+	}
+	return e.ks.Commit()
+}
+
 // view runs fn against database index under the engine lock without committing.
 // A read command goes through here. Lazy expiry inside a read may delete a key;
 // that deletion is left in the buffer pool and folds into the next commit.
@@ -54,6 +65,20 @@ func (ctx *Ctx) update(fn func(*keyspace.DB) error) bool {
 		return false
 	}
 	if err := ctx.d.engine.update(ctx.Conn.DB(), fn); err != nil {
+		ctx.enc().WriteError("ERR " + err.Error())
+		return false
+	}
+	return true
+}
+
+// updateKeyspace routes a multi-database write through the engine, mirroring
+// update. It reports false and writes an error reply when no engine is set.
+func (ctx *Ctx) updateKeyspace(fn func(*keyspace.Keyspace) error) bool {
+	if ctx.d.engine == nil {
+		ctx.enc().WriteError("ERR this server has no keyspace")
+		return false
+	}
+	if err := ctx.d.engine.updateKeyspace(fn); err != nil {
 		ctx.enc().WriteError("ERR " + err.Error())
 		return false
 	}
