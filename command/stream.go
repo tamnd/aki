@@ -60,6 +60,15 @@ func streamCommands() []*CmdDesc {
 		{Name: "xinfo", Group: GroupStream, Since: "5.0.0",
 			Arity: -2, Flags: FlagReadOnly, FirstKey: 2, LastKey: 2, Step: 1,
 			Handler: handleXInfo},
+		{Name: "xgroup", Group: GroupStream, Since: "5.0.0",
+			Arity: -2, Flags: FlagWrite | FlagDenyOOM, FirstKey: 2, LastKey: 2, Step: 1,
+			Handler: handleXGroup},
+		{Name: "xreadgroup", Group: GroupStream, Since: "5.0.0",
+			Arity: -7, Flags: FlagWrite | FlagBlocking, FirstKey: 0, LastKey: 0, Step: 0,
+			Handler: handleXReadGroup},
+		{Name: "xack", Group: GroupStream, Since: "5.0.0",
+			Arity: -4, Flags: FlagWrite | FlagFast, FirstKey: 1, LastKey: 1, Step: 1,
+			Handler: handleXAck},
 	}
 }
 
@@ -819,7 +828,15 @@ func handleXInfo(ctx *Ctx) {
 		ctx.enc().WriteError("ERR wrong number of arguments for 'xinfo' command")
 		return
 	}
-	if !strings.EqualFold(string(argv[1]), "STREAM") {
+	switch strings.ToUpper(string(argv[1])) {
+	case "STREAM":
+	case "GROUPS":
+		handleXInfoGroups(ctx)
+		return
+	case "CONSUMERS":
+		handleXInfoConsumers(ctx)
+		return
+	default:
 		ctx.enc().WriteError("ERR Unknown XINFO subcommand or wrong number of arguments for '" + string(argv[1]) + "'")
 		return
 	}
@@ -960,7 +977,7 @@ func writeStreamInfoFull(enc *resp.Encoder, s *stream, count int64) {
 	}
 	writeEntries(enc, s.entries[:n])
 	enc.WriteBulkStringStr("groups")
-	enc.WriteArrayLen(0)
+	writeFullGroups(enc, s)
 }
 
 // writeInfoEntry writes the entry at idx in [id, [f, v, ...]] form, or null when
