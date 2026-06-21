@@ -202,19 +202,58 @@ func infoMemory(ctx *Ctx, b *strings.Builder) {
 }
 
 func infoPersistence(ctx *Ctx, b *strings.Builder) {
+	p := &ctx.d.persist
+	p.mu.Lock()
+	dirty := p.dirty
+	inProgress := p.inProgress
+	lastSave := p.lastSaveUnix
+	status := p.lastStatus
+	lastTimeSec := p.lastTimeSec
+	curStart := p.curStartUnix
+	saves := p.saves
+	p.mu.Unlock()
+
+	if lastSave == 0 {
+		lastSave = ctx.d.startTime.Unix()
+	}
+	if status == "" {
+		status = "ok"
+	}
+	lastTime := "-1"
+	if saves > 0 {
+		lastTime = strconv.FormatFloat(lastTimeSec, 'f', -1, 64)
+	}
+	curTime := int64(-1)
+	if curStart != 0 {
+		curTime = time.Now().Unix() - curStart
+	}
+
 	line(b, "loading", "0")
 	line(b, "async_loading", "0")
-	line(b, "rdb_changes_since_last_save", "0")
-	line(b, "rdb_bgsave_in_progress", "0")
-	lineInt(b, "rdb_last_save_time", ctx.d.startTime.Unix())
-	line(b, "rdb_last_bgsave_status", "ok")
-	line(b, "rdb_last_bgsave_time_sec", "-1")
-	line(b, "rdb_current_bgsave_time_sec", "-1")
-	line(b, "rdb_saves", "0")
+	line(b, "current_cow_size", "0")
+	line(b, "current_fork_perc", "0.00")
+	line(b, "current_save_keys_processed", "0")
+	line(b, "current_save_keys_total", "0")
+	lineInt(b, "rdb_changes_since_last_save", dirty)
+	line(b, "rdb_bgsave_in_progress", boolField(inProgress))
+	lineInt(b, "rdb_last_save_time", lastSave)
+	line(b, "rdb_last_bgsave_status", status)
+	line(b, "rdb_last_bgsave_time_sec", lastTime)
+	lineInt(b, "rdb_current_bgsave_time_sec", curTime)
+	lineInt(b, "rdb_saves", saves)
+	line(b, "rdb_last_cow_size", "0")
 	line(b, "aof_enabled", "0")
 	line(b, "aof_rewrite_in_progress", "0")
 	line(b, "aof_last_bgrewrite_status", "ok")
 	line(b, "aof_last_write_status", "ok")
+}
+
+// boolField renders a flag as the "1" or "0" INFO uses.
+func boolField(v bool) string {
+	if v {
+		return "1"
+	}
+	return "0"
 }
 
 func infoStats(ctx *Ctx, b *strings.Builder) {

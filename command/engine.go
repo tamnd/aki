@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/tamnd/aki/keyspace"
+	"github.com/tamnd/aki/rdb"
 )
 
 // Engine is the command layer's handle on the keyspace. It serializes every
@@ -100,6 +101,30 @@ func (e *Engine) takeExpired() []keyspace.ExpiredKey {
 	return e.ks.TakeExpired()
 }
 
+// snapshotAll copies every live key in every database into an rdb.Snapshot under
+// the engine lock. The copy is taken in memory so the lock is held only for the
+// scan, not for the disk write that follows: BGSAVE writes the returned snapshot
+// from a background goroutine while new writes proceed.
+func (e *Engine) snapshotAll() (rdb.Snapshot, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	snap := rdb.Snapshot{}
+	for i := range e.ks.DBCount() {
+		db, err := e.ks.DB(i)
+		if err != nil {
+			return rdb.Snapshot{}, err
+		}
+		entries, err := reloadEntries(db)
+		if err != nil {
+			return rdb.Snapshot{}, err
+		}
+		if len(entries) > 0 {
+			snap.DBs = append(snap.DBs, rdb.DBData{Index: i, Entries: entries})
+		}
+	}
+	return snap, nil
+}
+
 // usedMemory returns the live-data estimate the maxmemory check compares against.
 func (e *Engine) usedMemory() int64 {
 	e.mu.Lock()
@@ -159,6 +184,7 @@ func (ctx *Ctx) update(fn func(*keyspace.DB) error) bool {
 		ctx.enc().WriteError("ERR " + err.Error())
 		return false
 	}
+	ctx.d.persist.markDirty()
 	ctx.fireExpired()
 	return true
 }
@@ -174,6 +200,7 @@ func (ctx *Ctx) updateKeyspace(fn func(*keyspace.Keyspace) error) bool {
 		ctx.enc().WriteError("ERR " + err.Error())
 		return false
 	}
+	ctx.d.persist.markDirty()
 	ctx.fireExpired()
 	return true
 }
