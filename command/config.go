@@ -66,6 +66,15 @@ func (cs *configStore) set(name, val string) {
 	cs.mu.Unlock()
 }
 
+// get returns the current value of a directive. The second result is false when
+// the directive is unknown. INFO reads a few directives through it.
+func (cs *configStore) get(name string) (string, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	v, ok := cs.vals[name]
+	return v, ok
+}
+
 // configDirectives is the directive table. It is a representative cut of the
 // redis.conf surface: the network, memory, persistence, data-type-limit,
 // notification and housekeeping directives clients actually read and write.

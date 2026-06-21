@@ -3,6 +3,7 @@ package command
 import (
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tamnd/aki/networking"
 	"github.com/tamnd/aki/resp"
@@ -32,6 +33,12 @@ type Dispatcher struct {
 	ps     *pubsubRegistry
 	conf   *configStore
 	srv    *networking.Server
+
+	// startTime is when the dispatcher was built, used for INFO uptime. runID is
+	// a 40-hex random identifier generated once at startup, reported by INFO as
+	// run_id and reused as the replication id.
+	startTime time.Time
+	runID     string
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -81,13 +88,22 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, pubsubCommands()...)
 	cmds = append(cmds, configCommands()...)
 	cmds = append(cmds, clientCommands()...)
+	cmds = append(cmds, infoCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	conf := newConfigStore()
 	conf.set("databases", strconv.Itoa(cfg.Databases))
 	if cfg.RequirePass != "" {
 		conf.set("requirepass", cfg.RequirePass)
 	}
-	return &Dispatcher{table: NewTable(cmds), cfg: cfg, engine: cfg.Engine, ps: newPubsubRegistry(), conf: conf}
+	return &Dispatcher{
+		table:     NewTable(cmds),
+		cfg:       cfg,
+		engine:    cfg.Engine,
+		ps:        newPubsubRegistry(),
+		conf:      conf,
+		startTime: time.Now(),
+		runID:     newRunID(),
+	}
 }
 
 // Ctx carries everything a handler needs: the connection it replies on, the
