@@ -59,6 +59,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, zsetRankCommands()...)
 	cmds = append(cmds, zsetRangeCommands()...)
 	cmds = append(cmds, zsetOpCommands()...)
+	cmds = append(cmds, hllCommands()...)
 	cmds = append(cmds, streamCommands()...)
 	cmds = append(cmds, claimCommands()...)
 	cmds = append(cmds, expireCommands()...)
