@@ -135,6 +135,7 @@ func handleExpire(ctx *Ctx, mode string) {
 	}
 
 	var res int64
+	var deleted bool
 	if ctx.update(func(db *keyspace.DB) error {
 		body, hdr, found, err := db.Get(key)
 		if err != nil {
@@ -160,6 +161,7 @@ func handleExpire(ctx *Ctx, mode string) {
 				return err
 			}
 			res = 1
+			deleted = true
 			return nil
 		}
 		if err := db.Set(key, body, hdr.Type, hdr.Encoding, when); err != nil {
@@ -168,6 +170,13 @@ func handleExpire(ctx *Ctx, mode string) {
 		res = 1
 		return nil
 	}) {
+		if res == 1 {
+			if deleted {
+				ctx.notify(notifyGeneric, "del", key)
+			} else {
+				ctx.notify(notifyGeneric, "expire", key)
+			}
+		}
 		ctx.enc().WriteInteger(res)
 	}
 }
@@ -247,6 +256,9 @@ func handlePersist(ctx *Ctx) {
 		res = 1
 		return nil
 	}) {
+		if res == 1 {
+			ctx.notify(notifyGeneric, "persist", key)
+		}
 		ctx.enc().WriteInteger(res)
 	}
 }

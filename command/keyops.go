@@ -38,7 +38,7 @@ func keyopsCommands() []*CmdDesc {
 // no-op that still replies OK.
 func handleRename(ctx *Ctx) {
 	src, dst := ctx.Argv[1], ctx.Argv[2]
-	var noKey bool
+	var noKey, renamed bool
 	if !ctx.update(func(db *keyspace.DB) error {
 		body, hdr, found, err := db.Get(src)
 		if err != nil {
@@ -54,14 +54,21 @@ func handleRename(ctx *Ctx) {
 		if err := db.Set(dst, body, hdr.Type, hdr.Encoding, keepTTL(hdr, true)); err != nil {
 			return err
 		}
-		_, err = db.Delete(src)
-		return err
+		if _, err := db.Delete(src); err != nil {
+			return err
+		}
+		renamed = true
+		return nil
 	}) {
 		return
 	}
 	if noKey {
 		ctx.enc().WriteError("ERR no such key")
 		return
+	}
+	if renamed {
+		ctx.notify(notifyGeneric, "rename_from", src)
+		ctx.notify(notifyGeneric, "rename_to", dst)
 	}
 	ctx.enc().WriteStatus("OK")
 }
@@ -102,6 +109,10 @@ func handleRenameNX(ctx *Ctx) {
 	if noKey {
 		ctx.enc().WriteError("ERR no such key")
 		return
+	}
+	if res == 1 {
+		ctx.notify(notifyGeneric, "rename_from", src)
+		ctx.notify(notifyGeneric, "rename_to", dst)
 	}
 	ctx.enc().WriteInteger(res)
 }
@@ -185,6 +196,10 @@ func handleMove(ctx *Ctx) {
 	if errStr != "" {
 		ctx.enc().WriteError(errStr)
 		return
+	}
+	if res == 1 {
+		ctx.d.notifyKeyspaceEvent(cur, notifyGeneric, "move_from", string(key))
+		ctx.d.notifyKeyspaceEvent(int(dbid), notifyGeneric, "move_to", string(key))
 	}
 	ctx.enc().WriteInteger(res)
 }
@@ -271,6 +286,9 @@ func handleCopy(ctx *Ctx) {
 	if errStr != "" {
 		ctx.enc().WriteError(errStr)
 		return
+	}
+	if res == 1 {
+		ctx.d.notifyKeyspaceEvent(destDB, notifyGeneric, "copy_to", string(dst))
 	}
 	ctx.enc().WriteInteger(res)
 }
