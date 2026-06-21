@@ -76,6 +76,23 @@ func (e *Engine) view(index int, fn func(*keyspace.DB) error) error {
 	return fn(db)
 }
 
+// dbSizes returns the key count of every database, indexed by database number.
+// INFO's keyspace section reads it. The read takes the engine lock so it does
+// not race a concurrent write.
+func (e *Engine) dbSizes() []uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	n := e.ks.DBCount()
+	out := make([]uint64, n)
+	for i := range n {
+		db, err := e.ks.DB(i)
+		if err == nil {
+			out[i] = db.Len()
+		}
+	}
+	return out
+}
+
 // update routes a write to the current connection's database. It reports false
 // and writes an error reply when no engine is configured.
 func (ctx *Ctx) update(fn func(*keyspace.DB) error) bool {
