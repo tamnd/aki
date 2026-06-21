@@ -175,7 +175,6 @@ func (db *DB) Set(key, body []byte, typ, enc uint8, ttlMs int64) error {
 	h := ValueHeader{
 		Type:     typ,
 		Encoding: enc,
-		Flags:    FlagInlineBody,
 		TTLms:    -1,
 		Version:  db.ks.version,
 		BodyLen:  uint32(len(body)),
@@ -186,12 +185,32 @@ func (db *DB) Set(key, body []byte, typ, enc uint8, ttlMs int64) error {
 		h.TTLms = ttlMs
 	}
 
-	cell := h.AppendTo(make([]byte, 0, HeaderSize+len(body)))
-	cell = append(cell, body...)
+	// A body up to maxInlineBody rides in the leaf cell; a larger one goes to an
+	// overflow chain and the cell carries only the header with BodyRef set.
+	var cell []byte
+	if len(body) <= maxInlineBody {
+		h.Flags |= FlagInlineBody
+		cell = h.AppendTo(make([]byte, 0, HeaderSize+len(body)))
+		cell = append(cell, body...)
+	} else {
+		head, werr := db.ks.writeOverflow(body)
+		if werr != nil {
+			return werr
+		}
+		h.BodyRef = uint64(head)
+		cell = h.AppendTo(make([]byte, 0, HeaderSize))
+	}
 	if err := t.Put(ck, cell); err != nil {
 		return err
 	}
 	db.rootPage = t.Root()
+
+	// The previous value's overflow pages are now unreferenced.
+	if existed && prev.Flags&FlagInlineBody == 0 && prev.BodyRef != 0 {
+		if err := db.ks.freeOverflow(uint32(prev.BodyRef)); err != nil {
+			return err
+		}
+	}
 
 	if isNew {
 		db.keyCount++
@@ -220,6 +239,13 @@ func (db *DB) Get(key []byte) (body []byte, hdr ValueHeader, found bool, err err
 	if db.expired(h) {
 		_, err := db.Delete(key)
 		return nil, ValueHeader{}, false, err
+	}
+	if h.Flags&FlagInlineBody == 0 {
+		body, err := db.ks.readOverflow(uint32(h.BodyRef), int(h.BodyLen))
+		if err != nil {
+			return nil, ValueHeader{}, false, err
+		}
+		return body, h, true, nil
 	}
 	out := make([]byte, len(cell))
 	copy(out, cell)
@@ -252,6 +278,11 @@ func (db *DB) Delete(key []byte) (bool, error) {
 		db.keyCount--
 		if prev.HasTTL() {
 			db.expireCount--
+		}
+		if prev.Flags&FlagInlineBody == 0 && prev.BodyRef != 0 {
+			if err := db.ks.freeOverflow(uint32(prev.BodyRef)); err != nil {
+				return ok, err
+			}
 		}
 	}
 	return ok, nil
