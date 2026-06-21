@@ -40,12 +40,37 @@ var nowMillis = func() int64 { return time.Now().UnixMilli() }
 // millisecond deadline that Set stores, so both layers read the same clock.
 func NowMillis() int64 { return nowMillis() }
 
+// ExpiredKey names a key that lazy expiry removed, tagged with the database it
+// lived in. The command layer drains these after a keyspace access to fire the
+// "expired" notification, which the keyspace layer cannot fire on its own.
+type ExpiredKey struct {
+	DB  int
+	Key []byte
+}
+
 // Keyspace owns every logical database in one .aki file.
 type Keyspace struct {
 	pgr     *pager.Pager
 	dbs     []*DB
 	catRoot uint32 // catalog page number, NullPage until first persisted
 	version uint64 // monotonic write version assigned to each write
+
+	// expiredLog collects keys deleted by lazy expiry since the last drain. The
+	// command layer empties it with TakeExpired after each access to fire the
+	// "expired" keyspace event. Access is serialized by the command engine lock.
+	expiredLog []ExpiredKey
+}
+
+// TakeExpired returns the keys lazily expired since the last call and clears the
+// log. The command engine calls it under its own lock so there is no concurrent
+// appender.
+func (ks *Keyspace) TakeExpired() []ExpiredKey {
+	if len(ks.expiredLog) == 0 {
+		return nil
+	}
+	out := ks.expiredLog
+	ks.expiredLog = nil
+	return out
 }
 
 // DB is one logical database: a B-tree of keys plus its catalog counters.
@@ -238,6 +263,12 @@ func (db *DB) Get(key []byte) (body []byte, hdr ValueHeader, found bool, err err
 	}
 	if db.expired(h) {
 		_, err := db.Delete(key)
+		if err == nil {
+			db.ks.expiredLog = append(db.ks.expiredLog, ExpiredKey{
+				DB:  db.index,
+				Key: append([]byte(nil), key...),
+			})
+		}
 		return nil, ValueHeader{}, false, err
 	}
 	if h.Flags&FlagInlineBody == 0 {

@@ -183,6 +183,7 @@ func (d *Dispatcher) keyVersion(db int, key []byte) (uint64, error) {
 		return 0, nil
 	}
 	ver, found, err := d.engine.version(db, key)
+	d.drainExpired()
 	if err != nil {
 		return 0, err
 	}
