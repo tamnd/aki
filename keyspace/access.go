@@ -114,6 +114,42 @@ func (db *DB) Freq(key []byte) uint8 {
 	return lfuDecay(a).freq
 }
 
+// SetIdle seeds a key's last-access time to idle seconds in the past, which is how
+// RESTORE IDLETIME reconstructs the LRU clock of a dumped key.
+func (db *DB) SetIdle(key []byte, idle uint32) {
+	if db.access == nil {
+		db.access = make(map[string]keyAccess)
+	}
+	now := nowSeconds()
+	at := uint32(0)
+	if idle < now {
+		at = now - idle
+	}
+	k := string(key)
+	a := db.access[k]
+	a.atime = at
+	if a.decr == 0 {
+		a.decr = nowMinutes()
+	}
+	db.access[k] = a
+}
+
+// SetFreq seeds a key's LFU counter, which is how RESTORE FREQ reconstructs the
+// frequency of a dumped key.
+func (db *DB) SetFreq(key []byte, freq uint8) {
+	if db.access == nil {
+		db.access = make(map[string]keyAccess)
+	}
+	k := string(key)
+	a := db.access[k]
+	a.freq = freq
+	a.decr = nowMinutes()
+	if a.atime == 0 {
+		a.atime = nowSeconds()
+	}
+	db.access[k] = a
+}
+
 // accessMetrics returns the recency timestamp and the decayed frequency the
 // eviction sampler sorts on. A key with no record yet looks maximally idle and
 // minimally frequent, so an un-accessed key is evicted before a tracked one.
