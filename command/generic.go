@@ -32,18 +32,25 @@ func genericCommands() []*CmdDesc {
 func handleDel(ctx *Ctx) {
 	keys := ctx.Argv[1:]
 	var removed int64
+	gone := make([]bool, len(keys))
 	if ctx.update(func(db *keyspace.DB) error {
-		for _, k := range keys {
+		for i, k := range keys {
 			ok, err := db.Delete(k)
 			if err != nil {
 				return err
 			}
 			if ok {
 				removed++
+				gone[i] = true
 			}
 		}
 		return nil
 	}) {
+		for i, k := range keys {
+			if gone[i] {
+				ctx.notify(notifyGeneric, "del", k)
+			}
+		}
 		ctx.enc().WriteInteger(removed)
 	}
 }
