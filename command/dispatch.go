@@ -89,6 +89,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, configCommands()...)
 	cmds = append(cmds, clientCommands()...)
 	cmds = append(cmds, infoCommands()...)
+	cmds = append(cmds, debugCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	conf := newConfigStore()
 	conf.set("databases", strconv.Itoa(cfg.Databases))
