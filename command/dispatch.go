@@ -54,6 +54,10 @@ type Dispatcher struct {
 	activeExpire atomic.Bool
 	bgStop       chan struct{}
 	bgDone       chan struct{}
+
+	// persist holds the RDB save bookkeeping that SAVE, BGSAVE, LASTSAVE, the
+	// automatic save points, and INFO persistence all read and write.
+	persist persistState
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -99,6 +103,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, keyopsCommands()...)
 	cmds = append(cmds, sortCommands()...)
 	cmds = append(cmds, dumpCommands()...)
+	cmds = append(cmds, persistenceCommands()...)
 	cmds = append(cmds, adminCommands()...)
 	cmds = append(cmds, objectCommands()...)
 	cmds = append(cmds, transactionCommands()...)
@@ -156,6 +161,7 @@ func (d *Dispatcher) StartBackground() {
 				return
 			case <-t.C:
 				d.runActiveExpire()
+				d.checkSavePoints()
 			}
 		}
 	}()

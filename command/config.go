@@ -120,7 +120,7 @@ func configDirectives() []*directive {
 		{name: "rdbcompression", kind: dirBool, def: "yes", mutable: true},
 		{name: "rdbchecksum", kind: dirBool, def: "yes", mutable: true},
 		{name: "dbfilename", kind: dirString, def: "dump.rdb", mutable: true},
-		{name: "dir", kind: dirString, def: "."},
+		{name: "dir", kind: dirString, def: ".", mutable: true},
 		{name: "appendonly", kind: dirBool, def: "no", mutable: true},
 		{name: "appendfilename", kind: dirString, def: "appendonly.aof"},
 		{name: "appendfsync", kind: dirEnum, def: "everysec", mutable: true,
