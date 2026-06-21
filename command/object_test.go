@@ -64,6 +64,8 @@ func TestObjectRefcount(t *testing.T) {
 	}
 }
 
+// TestObjectIdletime checks that IDLETIME answers for a live key, is zero right
+// after access, and is rejected under an LFU policy where it is not tracked.
 func TestObjectIdletime(t *testing.T) {
 	r, c := startData(t)
 	_ = sendLine(t, r, c, "SET k v")
@@ -73,14 +75,27 @@ func TestObjectIdletime(t *testing.T) {
 	if got := sendLine(t, r, c, "OBJECT IDLETIME nope"); got != "-"+noSuchKeyError {
 		t.Fatalf("OBJECT IDLETIME missing = %q", got)
 	}
+	_ = sendLine(t, r, c, "CONFIG SET maxmemory-policy allkeys-lfu")
+	if got := sendLine(t, r, c, "OBJECT IDLETIME k"); !strings.HasPrefix(got, "-ERR An LFU") {
+		t.Fatalf("OBJECT IDLETIME under LFU = %q want LFU error", got)
+	}
 }
 
+// TestObjectFreq checks that FREQ is rejected unless an LFU policy is set and
+// returns the seeded counter once it is.
 func TestObjectFreq(t *testing.T) {
 	r, c := startData(t)
 	_ = sendLine(t, r, c, "SET k v")
 	got := sendLine(t, r, c, "OBJECT FREQ k")
 	if !strings.HasPrefix(got, "-ERR An LFU maxmemory policy is not selected") {
 		t.Fatalf("OBJECT FREQ = %q", got)
+	}
+	_ = sendLine(t, r, c, "CONFIG SET maxmemory-policy allkeys-lfu")
+	if got := sendLine(t, r, c, "OBJECT FREQ k"); got != ":5" {
+		t.Fatalf("OBJECT FREQ seeded = %q want :5", got)
+	}
+	if got := sendLine(t, r, c, "OBJECT FREQ missing"); got != "-"+noSuchKeyError {
+		t.Fatalf("OBJECT FREQ missing = %q", got)
 	}
 }
 
