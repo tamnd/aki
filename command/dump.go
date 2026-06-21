@@ -120,6 +120,120 @@ func readDumpValue(db *keyspace.DB, key []byte) (rdb.Value, bool, error) {
 	}
 }
 
+// debugReload serializes the whole dataset to an in-memory RDB file, reads it back,
+// and replaces the live keyspace with the result. This is the no-fork equivalent of
+// what Redis does for DEBUG RELOAD: it proves the snapshot codec round-trips and
+// leaves the data observably identical, with encodings re-derived from the reloaded
+// values. A value type the codec cannot serialize yet aborts the reload before any
+// key is touched, so nothing is lost.
+func debugReload(ctx *Ctx) {
+	var unsupp bool
+	ok := ctx.updateKeyspace(func(ks *keyspace.Keyspace) error {
+		snap := rdb.Snapshot{}
+		for i := range ks.DBCount() {
+			db, err := ks.DB(i)
+			if err != nil {
+				return err
+			}
+			entries, derr := reloadEntries(db)
+			if derr != nil {
+				if derr == errDumpUnsupported {
+					unsupp = true
+					return nil
+				}
+				return derr
+			}
+			if len(entries) > 0 {
+				snap.DBs = append(snap.DBs, rdb.DBData{Index: i, Entries: entries})
+			}
+		}
+		if unsupp {
+			return nil
+		}
+
+		blob, merr := rdb.MarshalFile(snap)
+		if merr != nil {
+			return merr
+		}
+		loaded, uerr := rdb.UnmarshalFile(blob)
+		if uerr != nil {
+			return uerr
+		}
+
+		for i := range ks.DBCount() {
+			db, err := ks.DB(i)
+			if err != nil {
+				return err
+			}
+			db.Flush()
+		}
+		for _, dbData := range loaded.DBs {
+			db, err := ks.DB(dbData.Index)
+			if err != nil {
+				return err
+			}
+			for _, e := range dbData.Entries {
+				if serr := storeRestored(db, e.Key, e.Value, e.ExpireMS); serr != nil {
+					return serr
+				}
+				if e.HasIdle {
+					db.SetIdle(e.Key, e.Idle)
+				}
+				if e.HasFreq {
+					db.SetFreq(e.Key, e.Freq)
+				}
+			}
+		}
+		return nil
+	})
+	if !ok {
+		return
+	}
+	if unsupp {
+		ctx.enc().WriteError("ERR DEBUG RELOAD of a value type that is not supported yet")
+		return
+	}
+	ctx.enc().WriteStatus("OK")
+}
+
+// reloadEntries reads every live key in a database into snapshot entries, capturing
+// the absolute TTL and the LRU and LFU access state so a reload preserves them.
+func reloadEntries(db *keyspace.DB) ([]rdb.Entry, error) {
+	keys, err := db.Keys()
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]rdb.Entry, 0, len(keys))
+	for _, k := range keys {
+		_, hdr, found, perr := db.Peek(k.Key)
+		if perr != nil {
+			return nil, perr
+		}
+		if !found {
+			continue
+		}
+		idle := db.Idle(k.Key)
+		freq := db.Freq(k.Key)
+		v, ok, verr := readDumpValue(db, k.Key)
+		if verr != nil {
+			return nil, verr
+		}
+		if !ok {
+			continue
+		}
+		entries = append(entries, rdb.Entry{
+			Key:      k.Key,
+			Value:    v,
+			ExpireMS: hdr.TTLms,
+			Idle:     idle,
+			HasIdle:  true,
+			Freq:     freq,
+			HasFreq:  true,
+		})
+	}
+	return entries, nil
+}
+
 // restoreOpts holds the parsed RESTORE flags after the payload.
 type restoreOpts struct {
 	replace bool

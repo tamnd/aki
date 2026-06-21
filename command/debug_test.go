@@ -56,11 +56,18 @@ func TestDebugNoOps(t *testing.T) {
 		"DEBUG QUICKLIST-PACKED-THRESHOLD 100",
 		"DEBUG CHANGE-REPL-ID",
 		"DEBUG JMAP",
-		"DEBUG RELOAD",
 	} {
 		if got := sendLine(t, r, c, cmd); got != "+OK" {
 			t.Fatalf("%q = %q", cmd, got)
 		}
+	}
+}
+
+// TestDebugReloadEmpty checks DEBUG RELOAD returns OK on an empty keyspace.
+func TestDebugReloadEmpty(t *testing.T) {
+	r, c := startData(t)
+	if got := sendLine(t, r, c, "DEBUG RELOAD"); got != "+OK" {
+		t.Fatalf("DEBUG RELOAD = %q", got)
 	}
 }
 

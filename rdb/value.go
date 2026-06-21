@@ -86,71 +86,70 @@ var ErrUnsupported = errors.New("rdb: unsupported value type")
 // 2-byte little-endian version, then an 8-byte little-endian CRC-64 over all the
 // preceding bytes.
 func Marshal(v Value) ([]byte, error) {
-	out, err := appendValue(nil, v)
+	typeByte, body, err := encodeBody(v)
 	if err != nil {
 		return nil, err
 	}
+	out := append([]byte{typeByte}, body...)
 	out = encoding.AppendU16(out, Version)
 	out = appendCRC64(out, out)
 	return out, nil
 }
 
-// appendValue writes the type byte and per-type value bytes.
-func appendValue(dst []byte, v Value) ([]byte, error) {
+// encodeBody returns the RDB type byte and the value body for v, the two pieces a
+// DUMP payload concatenates and a file record separates with the key. The body
+// uses the smallest form for the value the way Redis does.
+func encodeBody(v Value) (byte, []byte, error) {
 	switch v.Kind {
 	case KindString:
-		dst = append(dst, typeString)
-		return appendString(dst, v.Str), nil
+		return typeString, appendString(nil, v.Str), nil
 	case KindList:
-		return appendList(dst, v.List), nil
+		return encodeList(v.List)
 	case KindSet:
-		return appendSet(dst, v.Set), nil
+		return encodeSet(v.Set)
 	case KindHash:
-		return appendHash(dst, v.Hash), nil
+		return encodeHash(v.Hash)
 	case KindZSet:
-		return appendZSet(dst, v.ZSet), nil
+		return encodeZSet(v.ZSet)
 	default:
-		return nil, ErrUnsupported
+		return 0, nil, ErrUnsupported
 	}
 }
 
-// appendList writes a list as a quicklist v2 with a single packed listpack node,
+// encodeList writes a list as a quicklist v2 with a single packed listpack node,
 // which is the form Redis uses for any list that fits one node.
-func appendList(dst []byte, elems [][]byte) []byte {
-	dst = append(dst, typeListQuicklist2)
-	dst = appendLength(dst, 1) // one node
-	dst = appendLength(dst, 2) // container PACKED
+func encodeList(elems [][]byte) (byte, []byte, error) {
+	var body []byte
+	body = appendLength(body, 1) // one node
+	body = appendLength(body, 2) // container PACKED
 	blob := listpackEncode(elems)
-	dst = appendLength(dst, uint64(len(blob)))
-	return append(dst, blob...)
+	body = appendLength(body, uint64(len(blob)))
+	return typeListQuicklist2, append(body, blob...), nil
 }
 
-// appendSet writes the smallest set form: intset when every member is an integer
+// encodeSet writes the smallest set form: intset when every member is an integer
 // and the count is small, listpack when small and short, otherwise a plain
 // hashtable list of strings.
-func appendSet(dst []byte, members [][]byte) []byte {
+func encodeSet(members [][]byte) (byte, []byte, error) {
 	if vals, ok := intsetEncodable(members); ok && len(members) <= maxIntsetEntries {
-		dst = append(dst, typeSetIntset)
 		blob := intsetEncode(vals)
-		dst = appendLength(dst, uint64(len(blob)))
-		return append(dst, blob...)
+		body := appendLength(nil, uint64(len(blob)))
+		return typeSetIntset, append(body, blob...), nil
 	}
 	if len(members) <= maxListpackEntries && allShort(members) {
-		dst = append(dst, typeSetListpack)
 		blob := listpackEncode(members)
-		dst = appendLength(dst, uint64(len(blob)))
-		return append(dst, blob...)
+		body := appendLength(nil, uint64(len(blob)))
+		return typeSetListpack, append(body, blob...), nil
 	}
-	dst = append(dst, typeSet)
-	dst = appendLength(dst, uint64(len(members)))
+	body := appendLength(nil, uint64(len(members)))
 	for _, m := range members {
-		dst = appendString(dst, m)
+		body = appendString(body, m)
 	}
-	return dst
+	return typeSet, body, nil
 }
 
-// appendHash writes a listpack hash when small, otherwise a plain hashtable hash.
-func appendHash(dst []byte, fields []Field) []byte {
+// encodeHash writes a listpack hash when small, otherwise a plain hashtable hash.
+func encodeHash(fields []Field) (byte, []byte, error) {
 	small := len(fields) <= maxListpackEntries
 	if small {
 		for _, f := range fields {
@@ -165,23 +164,21 @@ func appendHash(dst []byte, fields []Field) []byte {
 		for _, f := range fields {
 			flat = append(flat, f.Field, f.Value)
 		}
-		dst = append(dst, typeHashListpack)
 		blob := listpackEncode(flat)
-		dst = appendLength(dst, uint64(len(blob)))
-		return append(dst, blob...)
+		body := appendLength(nil, uint64(len(blob)))
+		return typeHashListpack, append(body, blob...), nil
 	}
-	dst = append(dst, typeHash)
-	dst = appendLength(dst, uint64(len(fields)))
+	body := appendLength(nil, uint64(len(fields)))
 	for _, f := range fields {
-		dst = appendString(dst, f.Field)
-		dst = appendString(dst, f.Value)
+		body = appendString(body, f.Field)
+		body = appendString(body, f.Value)
 	}
-	return dst
+	return typeHash, body, nil
 }
 
-// appendZSet writes a listpack sorted set when small, otherwise the binary-double
+// encodeZSet writes a listpack sorted set when small, otherwise the binary-double
 // ZSET_2 form. The listpack interleaves each member with its score as text.
-func appendZSet(dst []byte, members []Member) []byte {
+func encodeZSet(members []Member) (byte, []byte, error) {
 	small := len(members) <= maxListpackEntries
 	if small {
 		for _, m := range members {
@@ -196,18 +193,16 @@ func appendZSet(dst []byte, members []Member) []byte {
 		for _, m := range members {
 			flat = append(flat, m.Member, scoreText(m.Score))
 		}
-		dst = append(dst, typeZSetListpack)
 		blob := listpackEncode(flat)
-		dst = appendLength(dst, uint64(len(blob)))
-		return append(dst, blob...)
+		body := appendLength(nil, uint64(len(blob)))
+		return typeZSetListpack, append(body, blob...), nil
 	}
-	dst = append(dst, typeZSet2)
-	dst = appendLength(dst, uint64(len(members)))
+	body := appendLength(nil, uint64(len(members)))
 	for _, m := range members {
-		dst = appendString(dst, m.Member)
-		dst = encoding.AppendF64(dst, m.Score)
+		body = appendString(body, m.Member)
+		body = encoding.AppendF64(body, m.Score)
 	}
-	return dst
+	return typeZSet2, body, nil
 }
 
 // Unmarshal validates a DUMP payload and decodes its value. It checks the CRC-64

@@ -33,11 +33,13 @@ func handleDebug(ctx *Ctx) {
 		debugSleep(ctx)
 	case "SET-ACTIVE-EXPIRE":
 		debugSetActiveExpire(ctx)
-	case "QUICKLIST-PACKED-THRESHOLD", "CHANGE-REPL-ID", "JMAP", "RELOAD":
+	case "RELOAD":
+		debugReload(ctx)
+	case "QUICKLIST-PACKED-THRESHOLD", "CHANGE-REPL-ID", "JMAP":
 		// Accepted no-ops. QUICKLIST-PACKED-THRESHOLD tunes machinery aki does not
-		// have yet, CHANGE-REPL-ID and RELOAD have nothing to do because the data
-		// is already durable in the WAL, and JMAP is a jemalloc hook with no Go
-		// equivalent worth wiring here.
+		// have yet, CHANGE-REPL-ID has nothing to do because aki tracks one
+		// replication id, and JMAP is a jemalloc hook with no Go equivalent worth
+		// wiring here.
 		ctx.enc().WriteStatus("OK")
 	case "STRINGMATCH-LEN":
 		debugStringmatchLen(ctx)
