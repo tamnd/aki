@@ -252,6 +252,26 @@ func (s *Server) CountClients() int {
 	return s.clientCount
 }
 
+// Snapshot returns the live connections at the moment of the call. The slice is
+// a copy, so the caller can iterate without holding the registry lock, which is
+// what CLIENT LIST needs.
+func (s *Server) Snapshot() []*Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*Conn, 0, len(s.conns))
+	for _, c := range s.conns {
+		out = append(out, c)
+	}
+	return out
+}
+
+// ConnByID returns the connection with the given id, or nil if none is live.
+func (s *Server) ConnByID(id uint64) *Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conns[id]
+}
+
 // Close stops accepting, force-closes every live connection so their read loops
 // return, waits for them to finish, and removes the Unix socket file. It is safe
 // to call once; a second call is a no-op.

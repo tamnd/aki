@@ -48,6 +48,7 @@ func cmdServer(args []string) error {
 		MaxClients: *maxClients,
 	}
 	srv := networking.New(cfg, d)
+	d.SetServer(srv)
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe(cfg) }()

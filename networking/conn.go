@@ -117,6 +117,21 @@ func (c *Conn) Name() string { return c.name }
 // SetName sets the connection name.
 func (c *Conn) SetName(name string) { c.name = name }
 
+// Created returns the time the connection was accepted.
+func (c *Conn) Created() time.Time { return c.created }
+
+// LastInteraction returns the time of the most recent command on the connection.
+func (c *Conn) LastInteraction() time.Time { return c.lastInteraction }
+
+// TotCmds returns the number of commands processed on the connection.
+func (c *Conn) TotCmds() uint64 { return c.totCmds }
+
+// TotNetIn returns the total bytes read from the connection.
+func (c *Conn) TotNetIn() uint64 { return c.totNetIn }
+
+// TotNetOut returns the total bytes written to the connection.
+func (c *Conn) TotNetOut() uint64 { return c.totNetOut }
+
 // Proto reports the negotiated RESP version (2 or 3).
 func (c *Conn) Proto() int { return c.enc.Proto() }
 
