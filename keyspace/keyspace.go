@@ -13,6 +13,7 @@ package keyspace
 
 import (
 	"errors"
+	"math/rand/v2"
 	"time"
 
 	"github.com/tamnd/aki/btree"
@@ -48,6 +49,11 @@ type ExpiredKey struct {
 	Key []byte
 }
 
+// entryOverhead is the fixed per-key cost folded into the live-data estimate on
+// top of the key name and the body. It stands in for the value header and the
+// B-tree cell bookkeeping so used memory tracks roughly with what a key occupies.
+const entryOverhead = 64
+
 // Keyspace owns every logical database in one .aki file.
 type Keyspace struct {
 	pgr     *pager.Pager
@@ -59,6 +65,63 @@ type Keyspace struct {
 	// command layer empties it with TakeExpired after each access to fire the
 	// "expired" keyspace event. Access is serialized by the command engine lock.
 	expiredLog []ExpiredKey
+
+	// dataBytes is the running estimate of live key and value bytes, the figure
+	// INFO reports as used_memory and the maxmemory eviction loop compares against
+	// the limit. Set and Delete keep it current.
+	dataBytes int64
+}
+
+// UsedMemory returns the live-data estimate in bytes, the value compared against
+// maxmemory. It is the sum of key name, body and per-key overhead across every
+// live key, which shrinks as keys are deleted or evicted.
+func (ks *Keyspace) UsedMemory() int64 { return ks.dataBytes }
+
+// EvictionCandidate is a key the eviction loop may remove, carrying the fields the
+// policies sort on: the expiry for volatile-ttl and the LRU/LFU word for the
+// recency and frequency policies.
+type EvictionCandidate struct {
+	DB     int
+	Key    []byte
+	TTLms  int64
+	HasTTL bool
+	LRULFU uint32
+}
+
+// SampleForEviction reservoir-samples up to n eviction candidates across every
+// database. When volatileOnly is set it considers only keys that carry a TTL,
+// which is what the volatile-* policies evict from.
+func (ks *Keyspace) SampleForEviction(n int, volatileOnly bool) []EvictionCandidate {
+	if n <= 0 {
+		n = 1
+	}
+	out := make([]EvictionCandidate, 0, n)
+	seen := 0
+	for _, db := range ks.dbs {
+		if volatileOnly && db.expireCount == 0 {
+			continue
+		}
+		_ = db.forEachLive(func(ck []byte, h ValueHeader) error {
+			if volatileOnly && !h.HasTTL() {
+				return nil
+			}
+			cand := EvictionCandidate{
+				DB:     db.index,
+				Key:    copyRaw(ck),
+				TTLms:  h.TTLms,
+				HasTTL: h.HasTTL(),
+				LRULFU: h.LRULFU,
+			}
+			if len(out) < n {
+				out = append(out, cand)
+			} else if j := rand.IntN(seen + 1); j < n {
+				out[j] = cand
+			}
+			seen++
+			return nil
+		})
+	}
+	return out
 }
 
 // TakeExpired returns the keys lazily expired since the last call and clears the
@@ -239,7 +302,10 @@ func (db *DB) Set(key, body []byte, typ, enc uint8, ttlMs int64) error {
 
 	if isNew {
 		db.keyCount++
+	} else {
+		db.ks.dataBytes -= int64(len(key)) + int64(prev.BodyLen) + entryOverhead
 	}
+	db.ks.dataBytes += int64(len(key)) + int64(len(body)) + entryOverhead
 	if h.HasTTL() && !hadTTL {
 		db.expireCount++
 	} else if !h.HasTTL() && hadTTL {
@@ -307,6 +373,7 @@ func (db *DB) Delete(key []byte) (bool, error) {
 	if ok {
 		db.rootPage = t.Root()
 		db.keyCount--
+		db.ks.dataBytes -= int64(len(key)) + int64(prev.BodyLen) + entryOverhead
 		if prev.HasTTL() {
 			db.expireCount--
 		}

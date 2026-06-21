@@ -125,7 +125,7 @@ func handleExec(ctx *Ctx) {
 	enc := ctx.enc()
 	enc.WriteArrayLen(len(queue))
 	for _, q := range queue {
-		q.cmd.Handler(&Ctx{Conn: ctx.Conn, Argv: q.argv, d: ctx.d, sess: sess})
+		ctx.d.runCommand(&Ctx{Conn: ctx.Conn, Argv: q.argv, d: ctx.d, sess: sess}, q.cmd)
 	}
 }
 
