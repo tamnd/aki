@@ -50,6 +50,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, listMultiCommands()...)
 	cmds = append(cmds, hashCommands()...)
 	cmds = append(cmds, hashExtraCommands()...)
+	cmds = append(cmds, hashTTLCommands()...)
 	cmds = append(cmds, setCommands()...)
 	cmds = append(cmds, setAlgebraCommands()...)
 	cmds = append(cmds, zsetCommands()...)

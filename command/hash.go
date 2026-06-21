@@ -469,5 +469,29 @@ func getHash(db *keyspace.DB, key []byte) ([]hashField, keyspace.ValueHeader, bo
 	if err != nil {
 		return nil, hdr, true, err
 	}
-	return fields, hdr, true, nil
+	return dropExpiredFields(fields), hdr, true, nil
+}
+
+// dropExpiredFields removes fields whose per-field TTL has passed. It returns the
+// input slice when nothing expired so the common no-TTL case allocates nothing.
+func dropExpiredFields(fields []hashField) []hashField {
+	now := keyspace.NowMillis()
+	any := false
+	for _, f := range fields {
+		if f.ttl != 0 && f.ttl <= now {
+			any = true
+			break
+		}
+	}
+	if !any {
+		return fields
+	}
+	live := make([]hashField, 0, len(fields))
+	for _, f := range fields {
+		if f.ttl != 0 && f.ttl <= now {
+			continue
+		}
+		live = append(live, f)
+	}
+	return live
 }
