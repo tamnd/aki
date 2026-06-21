@@ -89,6 +89,7 @@ func incrBy(ctx *Ctx, delta int64) {
 	case overflow:
 		ctx.enc().WriteError("ERR increment or decrement would overflow")
 	default:
+		ctx.notify(notifyString, "incrby", key)
 		ctx.enc().WriteInteger(result)
 	}
 }
@@ -148,6 +149,7 @@ func handleIncrByFloat(ctx *Ctx) {
 	case nanInf:
 		ctx.enc().WriteError("ERR increment would produce NaN or Infinity")
 	default:
+		ctx.notify(notifyString, "incrbyfloat", key)
 		ctx.enc().WriteBulkStringStr(result)
 	}
 }

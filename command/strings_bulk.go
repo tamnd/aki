@@ -28,6 +28,9 @@ func handleMSet(ctx *Ctx) {
 		}
 		return nil
 	}) {
+		for i := 0; i < len(pairs); i += 2 {
+			ctx.notify(notifyString, "set", pairs[i])
+		}
 		ctx.Conn.WriteRaw(resp.ReplyOK)
 	}
 }
@@ -61,6 +64,11 @@ func handleMSetNX(ctx *Ctx) {
 		}
 		return nil
 	}) {
+		if allSet {
+			for i := 0; i < len(pairs); i += 2 {
+				ctx.notify(notifyString, "set", pairs[i])
+			}
+		}
 		ctx.enc().WriteInteger(boolToInt(allSet))
 	}
 }
@@ -138,6 +146,7 @@ func handleAppend(ctx *Ctx) {
 		ctx.enc().WriteError("ERR string exceeds maximum allowed size (proto-max-bulk-len)")
 		return
 	}
+	ctx.notify(notifyString, "append", key)
 	ctx.enc().WriteInteger(int64(newLen))
 }
 
@@ -186,6 +195,7 @@ func handleSetRange(ctx *Ctx) {
 	}
 	var (
 		wrongTyp bool
+		wrote    bool
 		newLen   int
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
@@ -208,6 +218,7 @@ func handleSetRange(ctx *Ctx) {
 		copy(body, old)
 		copy(body[offset:], val)
 		newLen = len(body)
+		wrote = true
 		ttl := keepTTL(hdr, found)
 		return db.Set(key, body, keyspace.TypeString, keyspace.EncRaw, ttl)
 	})
@@ -217,6 +228,9 @@ func handleSetRange(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if wrote {
+		ctx.notify(notifyString, "setrange", key)
 	}
 	ctx.enc().WriteInteger(int64(newLen))
 }

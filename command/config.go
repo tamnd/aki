@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // This file implements the runtime configuration store and the CONFIG command
@@ -23,6 +24,7 @@ const (
 	dirMemory
 	dirEnum
 	dirSave
+	dirNotify
 )
 
 // directive describes one configuration setting.
@@ -142,7 +144,7 @@ func configDirectives() []*directive {
 		{name: "proto-max-bulk-len", kind: dirMemory, def: "536870912", mutable: true},
 
 		// Notifications, slowlog, housekeeping.
-		{name: "notify-keyspace-events", kind: dirString, def: "", mutable: true},
+		{name: "notify-keyspace-events", kind: dirNotify, def: "", mutable: true},
 		{name: "slowlog-log-slower-than", kind: dirInt, def: "10000", mutable: true},
 		{name: "slowlog-max-len", kind: dirInt, def: "128", mutable: true},
 		{name: "latency-monitor-threshold", kind: dirInt, def: "0", mutable: true},
@@ -181,6 +183,12 @@ func validateValue(d *directive, raw string) (string, bool) {
 		return "", false
 	case dirSave:
 		return canonicalizeSave(raw)
+	case dirNotify:
+		flags, ok := parseNotifyFlags(raw)
+		if !ok {
+			return "", false
+		}
+		return canonicalNotifyFlags(flags), true
 	default:
 		return raw, true
 	}
@@ -334,6 +342,15 @@ func handleConfigSet(ctx *Ctx) {
 		cs.vals[c.name] = c.val
 	}
 	cs.mu.Unlock()
+	// The notification write path reads the flags atomically, so mirror any change
+	// to notify-keyspace-events into the dispatcher's atomic copy.
+	for _, c := range changes {
+		if c.name == "notify-keyspace-events" {
+			if flags, ok := parseNotifyFlags(c.val); ok {
+				atomic.StoreUint32(&ctx.d.notifyFlags, flags)
+			}
+		}
+	}
 	ctx.enc().WriteStatus("OK")
 }
 
