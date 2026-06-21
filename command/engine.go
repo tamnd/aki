@@ -44,6 +44,25 @@ func (e *Engine) updateKeyspace(fn func(*keyspace.Keyspace) error) error {
 	return e.ks.Commit()
 }
 
+// version returns the write version of a key in database index, and whether the
+// key is live. A missing or expired key reports version 0 and exists false. WATCH
+// and EXEC use this to detect a change to a watched key. The read goes through the
+// lock and may delete an expired key as a side effect, the same lazy expiry any
+// read does.
+func (e *Engine) version(index int, key []byte) (uint64, bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	db, err := e.ks.DB(index)
+	if err != nil {
+		return 0, false, err
+	}
+	_, hdr, found, err := db.Get(key)
+	if err != nil || !found {
+		return 0, false, err
+	}
+	return hdr.Version, true, nil
+}
+
 // view runs fn against database index under the engine lock without committing.
 // A read command goes through here. Lazy expiry inside a read may delete a key;
 // that deletion is left in the buffer pool and folds into the next commit.

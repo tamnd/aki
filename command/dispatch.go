@@ -66,6 +66,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, keyopsCommands()...)
 	cmds = append(cmds, adminCommands()...)
 	cmds = append(cmds, objectCommands()...)
+	cmds = append(cmds, transactionCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	return &Dispatcher{table: NewTable(cmds), cfg: cfg, engine: cfg.Engine}
 }
@@ -84,6 +85,16 @@ type Ctx struct {
 // on networking.Conn.
 type session struct {
 	authenticated bool
+
+	// inMulti is true between MULTI and EXEC/DISCARD: commands are queued instead
+	// of run. queue holds them in order, and dirtyExec records a queue-time error
+	// (unknown command or bad arity) that makes EXEC abort.
+	inMulti   bool
+	queue     []queuedCmd
+	dirtyExec bool
+	// watched holds the keys registered by WATCH with their version at WATCH time.
+	// EXEC compares against the current versions to decide whether to run.
+	watched []watchEntry
 }
 
 // enc returns the connection's reply encoder.
@@ -94,6 +105,13 @@ func (ctx *Ctx) enc() *resp.Encoder { return ctx.Conn.Enc() }
 func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	sess := d.sessionFor(c)
 	name := strings.ToLower(string(argv[0]))
+
+	// Inside a transaction every command except the control verbs is queued
+	// rather than run. EXEC drains the queue later.
+	if sess.inMulti && !isMultiControl(name) {
+		d.queueCommand(c, sess, name, argv)
+		return
+	}
 
 	cmd, err := d.table.lookup(name, argv)
 	if err != nil {
