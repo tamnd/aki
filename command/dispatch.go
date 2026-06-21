@@ -65,6 +65,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, aggScanCommands()...)
 	cmds = append(cmds, keyopsCommands()...)
 	cmds = append(cmds, adminCommands()...)
+	cmds = append(cmds, objectCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	return &Dispatcher{table: NewTable(cmds), cfg: cfg, engine: cfg.Engine}
 }
