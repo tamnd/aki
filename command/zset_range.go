@@ -497,25 +497,26 @@ func (ctx *Ctx) runRangeCount(key, minArg, maxArg []byte, spec rangeSpec) {
 
 // handleZRemRangeByRank implements ZREMRANGEBYRANK key start stop.
 func handleZRemRangeByRank(ctx *Ctx) {
-	ctx.runRangeRemove(rangeSpec{})
+	ctx.runRangeRemove(rangeSpec{}, "zremrangebyrank")
 }
 
 // handleZRemRangeByScore implements ZREMRANGEBYSCORE key min max.
 func handleZRemRangeByScore(ctx *Ctx) {
-	ctx.runRangeRemove(rangeSpec{byScore: true})
+	ctx.runRangeRemove(rangeSpec{byScore: true}, "zremrangebyscore")
 }
 
 // handleZRemRangeByLex implements ZREMRANGEBYLEX key min max.
 func handleZRemRangeByLex(ctx *Ctx) {
-	ctx.runRangeRemove(rangeSpec{byLex: true})
+	ctx.runRangeRemove(rangeSpec{byLex: true}, "zremrangebylex")
 }
 
 // runRangeRemove computes the matching members and removes them, replying the
 // removed count and deleting the key when it empties.
-func (ctx *Ctx) runRangeRemove(spec rangeSpec) {
+func (ctx *Ctx) runRangeRemove(spec rangeSpec, event string) {
 	key, minArg, maxArg := ctx.Argv[1], ctx.Argv[2], ctx.Argv[3]
 	var (
 		wrongTyp bool
+		emptied  bool
 		removed  int64
 		errStr   string
 	)
@@ -552,6 +553,7 @@ func (ctx *Ctx) runRangeRemove(spec rangeSpec) {
 		}
 		removed = int64(len(matched))
 		if len(kept) == 0 {
+			emptied = true
 			_, err := db.Delete(key)
 			return err
 		}
@@ -568,6 +570,12 @@ func (ctx *Ctx) runRangeRemove(spec rangeSpec) {
 		ctx.enc().WriteError(errStr)
 		return
 	}
+	if removed > 0 {
+		ctx.notify(notifyZset, event, key)
+		if emptied {
+			ctx.notify(notifyGeneric, "del", key)
+		}
+	}
 	ctx.enc().WriteInteger(removed)
 }
 
@@ -581,9 +589,10 @@ func handleZRangeStore(ctx *Ctx) {
 	}
 	dst, src, minArg, maxArg := ctx.Argv[1], ctx.Argv[2], ctx.Argv[3], ctx.Argv[4]
 	var (
-		wrongTyp bool
-		n        int64
-		rangeErr string
+		wrongTyp   bool
+		dstDeleted bool
+		n          int64
+		rangeErr   string
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
 		// The destination is overwritten, but a non-zset destination is still a
@@ -611,6 +620,7 @@ func handleZRangeStore(ctx *Ctx) {
 		}
 		n = int64(len(result))
 		if len(result) == 0 {
+			dstDeleted = dstFound
 			_, err := db.Delete(dst)
 			return err
 		}
@@ -629,6 +639,11 @@ func handleZRangeStore(ctx *Ctx) {
 	if rangeErr != "" {
 		ctx.enc().WriteError(rangeErr)
 		return
+	}
+	if n > 0 {
+		ctx.notify(notifyZset, "zrangestore", dst)
+	} else if dstDeleted {
+		ctx.notify(notifyGeneric, "del", dst)
 	}
 	ctx.enc().WriteInteger(n)
 }
