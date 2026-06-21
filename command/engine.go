@@ -76,6 +76,14 @@ func (e *Engine) view(index int, fn func(*keyspace.DB) error) error {
 	return fn(db)
 }
 
+// takeExpired drains the keys lazy expiry removed since the last call. It holds
+// the engine lock so it does not race a concurrent access appending to the log.
+func (e *Engine) takeExpired() []keyspace.ExpiredKey {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.ks.TakeExpired()
+}
+
 // dbSizes returns the key count of every database, indexed by database number.
 // INFO's keyspace section reads it. The read takes the engine lock so it does
 // not race a concurrent write.
@@ -104,6 +112,7 @@ func (ctx *Ctx) update(fn func(*keyspace.DB) error) bool {
 		ctx.enc().WriteError("ERR " + err.Error())
 		return false
 	}
+	ctx.fireExpired()
 	return true
 }
 
@@ -118,6 +127,7 @@ func (ctx *Ctx) updateKeyspace(fn func(*keyspace.Keyspace) error) bool {
 		ctx.enc().WriteError("ERR " + err.Error())
 		return false
 	}
+	ctx.fireExpired()
 	return true
 }
 
@@ -131,5 +141,24 @@ func (ctx *Ctx) view(fn func(*keyspace.DB) error) bool {
 		ctx.enc().WriteError("ERR " + err.Error())
 		return false
 	}
+	ctx.fireExpired()
 	return true
+}
+
+// fireExpired drains the keys lazy expiry removed during the access just made and
+// fires the "expired" keyspace event for each. It runs after the engine call
+// returns, so the event fires outside the keyspace lock, the same ordering the
+// type-event notifications use.
+func (ctx *Ctx) fireExpired() { ctx.d.drainExpired() }
+
+// drainExpired empties the lazy-expiry log and fires the "expired" keyspace event
+// for each key, on the database the key lived in. Both the command wrappers and
+// the WATCH version check call it after touching the keyspace.
+func (d *Dispatcher) drainExpired() {
+	if d.engine == nil {
+		return
+	}
+	for _, ek := range d.engine.takeExpired() {
+		d.notifyKeyspaceEvent(ek.DB, notifyExpired, "expired", string(ek.Key))
+	}
 }
