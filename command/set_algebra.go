@@ -82,8 +82,9 @@ func handleSetOpStore(ctx *Ctx, op setOp) {
 	dst := ctx.Argv[1]
 	keys := ctx.Argv[2:]
 	var (
-		wrongTyp bool
-		n        int64
+		wrongTyp   bool
+		dstDeleted bool
+		n          int64
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
 		// The destination is overwritten, but a non-set destination is still a
@@ -107,6 +108,7 @@ func handleSetOpStore(ctx *Ctx, op setOp) {
 		result := computeSetOp(op, sets)
 		n = int64(len(result))
 		if len(result) == 0 {
+			dstDeleted = dstFound
 			_, err := db.Delete(dst)
 			return err
 		}
@@ -119,7 +121,25 @@ func handleSetOpStore(ctx *Ctx, op setOp) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
+	if n > 0 {
+		ctx.notify(notifySet, setStoreEvent(op), dst)
+	} else if dstDeleted {
+		ctx.notify(notifyGeneric, "del", dst)
+	}
 	ctx.enc().WriteInteger(n)
+}
+
+// setStoreEvent names the keyspace event for the STORE form of each set algebra
+// operation.
+func setStoreEvent(op setOp) string {
+	switch op {
+	case opInter:
+		return "sinterstore"
+	case opUnion:
+		return "sunionstore"
+	default:
+		return "sdiffstore"
+	}
 }
 
 // handleSInterCard implements SINTERCARD numkeys key [key ...] [LIMIT limit]: the
