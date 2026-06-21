@@ -100,6 +100,37 @@ func (e *Engine) takeExpired() []keyspace.ExpiredKey {
 	return e.ks.TakeExpired()
 }
 
+// usedMemory returns the live-data estimate the maxmemory check compares against.
+func (e *Engine) usedMemory() int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.ks.UsedMemory()
+}
+
+// sampleForEviction returns up to n eviction candidates, restricted to volatile
+// keys when volatileOnly is set.
+func (e *Engine) sampleForEviction(n int, volatileOnly bool) []keyspace.EvictionCandidate {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.ks.SampleForEviction(n, volatileOnly)
+}
+
+// evict deletes one key for the eviction loop and commits so the removal is
+// durable. It reports whether a key was actually removed.
+func (e *Engine) evict(dbIndex int, key []byte) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	db, err := e.ks.DB(dbIndex)
+	if err != nil {
+		return false, err
+	}
+	ok, err := db.Delete(key)
+	if err != nil || !ok {
+		return false, err
+	}
+	return true, e.ks.Commit()
+}
+
 // dbSizes returns the key count of every database, indexed by database number.
 // INFO's keyspace section reads it. The read takes the engine lock so it does
 // not race a concurrent write.

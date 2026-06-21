@@ -176,6 +176,11 @@ func infoMemory(ctx *Ctx, b *strings.Builder) {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 	used := int64(ms.HeapAlloc)
+	if ctx.d.engine != nil {
+		// The live-data estimate is the figure maxmemory eviction compares against,
+		// so used_memory reports the same number rather than the Go heap size.
+		used = ctx.d.engine.usedMemory()
+	}
 	rss := int64(ms.Sys)
 	peak := int64(ms.HeapSys)
 	lineInt(b, "used_memory", used)
