@@ -362,6 +362,9 @@ func handleXClaim(ctx *Ctx) {
 		ctx.enc().WriteError(nogroupError(groupName, string(key)))
 		return
 	}
+	if len(claimed) > 0 || len(justIDs) > 0 {
+		ctx.notify(notifyStream, "xclaim", key)
+	}
 	if opts.justID {
 		ctx.enc().WriteArrayLen(len(justIDs))
 		for _, id := range justIDs {
@@ -551,6 +554,9 @@ func handleXAutoClaim(ctx *Ctx) {
 	if noGroup {
 		ctx.enc().WriteError(nogroupError(groupName, string(key)))
 		return
+	}
+	if len(claimed) > 0 || len(justIDs) > 0 {
+		ctx.notify(notifyStream, "xautoclaim", key)
 	}
 
 	enc := ctx.enc()

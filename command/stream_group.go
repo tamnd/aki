@@ -238,6 +238,7 @@ func handleXGroupCreate(ctx *Ctx) {
 	case badID:
 		ctx.enc().WriteError(errStreamInvalidID)
 	default:
+		ctx.notify(notifyStream, "xgroup-create", key)
 		ctx.enc().WriteStatus("OK")
 	}
 }
@@ -313,6 +314,7 @@ func handleXGroupSetID(ctx *Ctx) {
 	case badID:
 		ctx.enc().WriteError(errStreamInvalidID)
 	default:
+		ctx.notify(notifyStream, "xgroup-setid", key)
 		ctx.enc().WriteStatus("OK")
 	}
 }
@@ -367,7 +369,13 @@ func handleXGroupConsumer(ctx *Ctx, create bool) {
 		ctx.enc().WriteError(wrongTypeError)
 	case noGroup:
 		ctx.enc().WriteError(nogroupError(groupName, string(key)))
+	case create:
+		if result == 1 {
+			ctx.notify(notifyStream, "xgroup-createconsumer", key)
+		}
+		ctx.enc().WriteInteger(result)
 	default:
+		ctx.notify(notifyStream, "xgroup-delconsumer", key)
 		ctx.enc().WriteInteger(result)
 	}
 }
@@ -429,6 +437,9 @@ func handleXGroupDestroy(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if result == 1 {
+		ctx.notify(notifyStream, "xgroup-destroy", key)
 	}
 	ctx.enc().WriteInteger(result)
 }

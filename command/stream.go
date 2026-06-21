@@ -279,6 +279,7 @@ func handleXAdd(ctx *Ctx) {
 		mkMissed bool
 		wrongTyp bool
 		replyErr string
+		trimmed  bool
 	)
 	if !ctx.update(func(db *keyspace.DB) error {
 		s, hdr, found, err := getStream(db, key)
@@ -312,7 +313,7 @@ func handleXAdd(ctx *Ctx) {
 		s.entriesAdded++
 		newID = id
 		if trim.kind != trimNone {
-			applyTrim(s, trim)
+			trimmed = applyTrim(s, trim) > 0
 		}
 		ttl := int64(-1)
 		if found {
@@ -330,6 +331,10 @@ func handleXAdd(ctx *Ctx) {
 	case mkMissed:
 		ctx.enc().WriteNull()
 	default:
+		ctx.notify(notifyStream, "xadd", key)
+		if trimmed {
+			ctx.notify(notifyStream, "xtrim", key)
+		}
 		ctx.enc().WriteBulkStringStr(newID.String())
 	}
 }
@@ -539,6 +544,9 @@ func handleXDel(ctx *Ctx) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
+	if deleted > 0 {
+		ctx.notify(notifyStream, "xdel", argv[1])
+	}
 	ctx.enc().WriteInteger(deleted)
 }
 
@@ -721,6 +729,9 @@ func handleXTrim(ctx *Ctx) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
+	if removed > 0 {
+		ctx.notify(notifyStream, "xtrim", argv[1])
+	}
 	ctx.enc().WriteInteger(removed)
 }
 
@@ -816,6 +827,7 @@ func handleXSetID(ctx *Ctx) {
 	case tooSmall:
 		ctx.enc().WriteError(errStreamSetIDSmall)
 	default:
+		ctx.notify(notifyStream, "xsetid", argv[1])
 		ctx.enc().WriteStatus("OK")
 	}
 }
