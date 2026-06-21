@@ -1,6 +1,7 @@
 package command
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/tamnd/aki/networking"
@@ -29,6 +30,7 @@ type Dispatcher struct {
 	cfg    Config
 	engine *Engine
 	ps     *pubsubRegistry
+	conf   *configStore
 }
 
 // New builds a Dispatcher with the connection-group and data-type commands.
@@ -71,8 +73,14 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, objectCommands()...)
 	cmds = append(cmds, transactionCommands()...)
 	cmds = append(cmds, pubsubCommands()...)
+	cmds = append(cmds, configCommands()...)
 	cmds = append(cmds, genericCommands()...)
-	return &Dispatcher{table: NewTable(cmds), cfg: cfg, engine: cfg.Engine, ps: newPubsubRegistry()}
+	conf := newConfigStore()
+	conf.set("databases", strconv.Itoa(cfg.Databases))
+	if cfg.RequirePass != "" {
+		conf.set("requirepass", cfg.RequirePass)
+	}
+	return &Dispatcher{table: NewTable(cmds), cfg: cfg, engine: cfg.Engine, ps: newPubsubRegistry(), conf: conf}
 }
 
 // Ctx carries everything a handler needs: the connection it replies on, the
