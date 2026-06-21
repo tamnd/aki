@@ -81,6 +81,9 @@ func handleSAdd(ctx *Ctx) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
+	if added > 0 {
+		ctx.notify(notifySet, "sadd", key)
+	}
 	ctx.enc().WriteInteger(added)
 }
 
@@ -91,6 +94,7 @@ func handleSRem(ctx *Ctx) {
 	toRemove := ctx.Argv[2:]
 	var (
 		wrongTyp bool
+		emptied  bool
 		removed  int64
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
@@ -115,6 +119,7 @@ func handleSRem(ctx *Ctx) {
 			return nil
 		}
 		if len(members) == 0 {
+			emptied = true
 			_, err := db.Delete(key)
 			return err
 		}
@@ -126,6 +131,12 @@ func handleSRem(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if removed > 0 {
+		ctx.notify(notifySet, "srem", key)
+		if emptied {
+			ctx.notify(notifyGeneric, "del", key)
+		}
 	}
 	ctx.enc().WriteInteger(removed)
 }
@@ -227,6 +238,7 @@ func handleSPop(ctx *Ctx) {
 	var (
 		wrongTyp bool
 		absent   bool
+		emptied  bool
 		popped   [][]byte
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
@@ -262,6 +274,7 @@ func handleSPop(ctx *Ctx) {
 			}
 		}
 		if len(rest) == 0 {
+			emptied = true
 			_, err := db.Delete(key)
 			return err
 		}
@@ -273,6 +286,12 @@ func handleSPop(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if len(popped) > 0 {
+		ctx.notify(notifySet, "spop", key)
+		if emptied {
+			ctx.notify(notifyGeneric, "del", key)
+		}
 	}
 	enc := ctx.enc()
 	if !hasCount {
@@ -351,8 +370,9 @@ func handleSRandMember(ctx *Ctx) {
 func handleSMove(ctx *Ctx) {
 	src, dst, member := ctx.Argv[1], ctx.Argv[2], ctx.Argv[3]
 	var (
-		wrongTyp bool
-		moved    bool
+		wrongTyp   bool
+		moved      bool
+		srcEmptied bool
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
 		srcMembers, srcHdr, srcFound, err := getSet(db, src)
@@ -381,6 +401,7 @@ func handleSMove(ctx *Ctx) {
 		}
 		srcMembers = append(srcMembers[:idx], srcMembers[idx+1:]...)
 		if len(srcMembers) == 0 {
+			srcEmptied = true
 			if _, err := db.Delete(src); err != nil {
 				return err
 			}
@@ -404,6 +425,13 @@ func handleSMove(ctx *Ctx) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if moved && string(src) != string(dst) {
+		ctx.notify(notifySet, "srem", src)
+		ctx.notify(notifySet, "sadd", dst)
+		if srcEmptied {
+			ctx.notify(notifyGeneric, "del", src)
+		}
 	}
 	if moved {
 		ctx.enc().WriteInteger(1)
