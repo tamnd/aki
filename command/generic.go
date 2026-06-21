@@ -9,8 +9,8 @@ import (
 const wrongTypeError = "WRONGTYPE Operation against a key holding the wrong kind of value"
 
 // genericCommands returns the generic key-group command table for this slice:
-// the commands that work on any key regardless of its value type. SCAN, KEYS,
-// RENAME, EXPIRE and friends land in later slices.
+// the commands that work on any key regardless of its value type. KEYS, SCAN and
+// RANDOMKEY live in scan.go; RENAME and friends land in later slices.
 func genericCommands() []*CmdDesc {
 	return []*CmdDesc{
 		{Name: "del", Group: GroupGeneric, Since: "1.0.0",
