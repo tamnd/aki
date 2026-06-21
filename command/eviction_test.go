@@ -7,7 +7,29 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/tamnd/aki/keyspace"
 )
+
+// TestChooseVictimByPolicy checks that each policy picks the candidate it should:
+// the oldest access for lru, the lowest frequency for lfu, and the soonest expiry
+// for volatile-ttl.
+func TestChooseVictimByPolicy(t *testing.T) {
+	cands := []keyspace.EvictionCandidate{
+		{Key: []byte("a"), Atime: 300, Freq: 9, TTLms: 5000, HasTTL: true},
+		{Key: []byte("b"), Atime: 100, Freq: 7, TTLms: 9000, HasTTL: true},
+		{Key: []byte("c"), Atime: 200, Freq: 2, TTLms: 1000, HasTTL: true},
+	}
+	if v := chooseVictim("allkeys-lru", cands); string(v.Key) != "b" {
+		t.Fatalf("lru victim = %q want b (oldest atime)", v.Key)
+	}
+	if v := chooseVictim("allkeys-lfu", cands); string(v.Key) != "c" {
+		t.Fatalf("lfu victim = %q want c (lowest freq)", v.Key)
+	}
+	if v := chooseVictim("volatile-ttl", cands); string(v.Key) != "c" {
+		t.Fatalf("ttl victim = %q want c (soonest expiry)", v.Key)
+	}
+}
 
 // infoUsedMemory reads INFO memory and returns the used_memory figure.
 func infoUsedMemory(t *testing.T, r *bufio.Reader, c net.Conn) int64 {
