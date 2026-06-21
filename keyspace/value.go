@@ -16,15 +16,16 @@ const (
 // Encoding codes reported by OBJECT ENCODING (doc 05 §3.3). They label the
 // logical Redis structure, not aki's physical paging.
 const (
-	EncInt       uint8 = 0
-	EncEmbStr    uint8 = 1
-	EncRaw       uint8 = 2
-	EncListpack  uint8 = 3
-	EncQuicklist uint8 = 4
-	EncHashtable uint8 = 6
-	EncIntset    uint8 = 7
-	EncSkiplist  uint8 = 8
-	EncStream    uint8 = 9
+	EncInt        uint8 = 0
+	EncEmbStr     uint8 = 1
+	EncRaw        uint8 = 2
+	EncListpack   uint8 = 3
+	EncQuicklist  uint8 = 4
+	EncHashtable  uint8 = 6
+	EncIntset     uint8 = 7
+	EncSkiplist   uint8 = 8
+	EncStream     uint8 = 9
+	EncListpackex uint8 = 11
 )
 
 // Flag bits in ValueHeader.Flags (doc 05 §3.1).
