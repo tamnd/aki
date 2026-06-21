@@ -141,6 +141,7 @@ func handleZPop(ctx *Ctx, fromMax bool) {
 
 	var (
 		wrongTyp bool
+		emptied  bool
 		popped   []zmember
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
@@ -172,6 +173,7 @@ func handleZPop(ctx *Ctx, fromMax bool) {
 			kept = members[n:]
 		}
 		if len(kept) == 0 {
+			emptied = true
 			_, err := db.Delete(ctx.Argv[1])
 			return err
 		}
@@ -183,6 +185,16 @@ func handleZPop(ctx *Ctx, fromMax bool) {
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
+	}
+	if len(popped) > 0 {
+		event := "zpopmin"
+		if fromMax {
+			event = "zpopmax"
+		}
+		ctx.notify(notifyZset, event, ctx.Argv[1])
+		if emptied {
+			ctx.notify(notifyGeneric, "del", ctx.Argv[1])
+		}
 	}
 	enc := ctx.enc()
 	if !hasCount {
