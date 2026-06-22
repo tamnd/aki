@@ -528,6 +528,13 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		d.statError(msg)
 		return
 	}
+	if cmd.Flags.Has(FlagWrite) && !sess.fromMaster && d.writesBlockedByBgsaveError() {
+		msg := "MISCONF Redis is configured to save RDB snapshots, but it's currently unable to persist to disk. Commands that may modify the data set are disabled, because this instance is configured to report errors during writes if RDB snapshotting fails (stop-writes-on-bgsave-error option). Please check the Redis logs for details about the RDB error."
+		c.Enc().WriteError(msg)
+		d.statReject(cmd)
+		d.statError(msg)
+		return
+	}
 	if msg := d.crossSlotError(name, cmd, argv); msg != "" {
 		c.Enc().WriteError(msg)
 		d.statReject(cmd)
