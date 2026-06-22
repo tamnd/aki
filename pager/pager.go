@@ -2,6 +2,7 @@ package pager
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -195,6 +196,34 @@ type Stats struct {
 	DirtyPages    int
 	CacheHits     uint64
 	CacheMisses   uint64
+}
+
+// CheckFreelist walks the on-disk freelist chain from the meta head, following
+// the next-link in each free page. It detects a cycle and an out-of-range link,
+// which a plain load cannot since it would loop or read garbage. It returns the
+// number of free pages on a healthy chain. The integrity checker calls it.
+func (p *Pager) CheckFreelist() (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	seen := make(map[uint32]struct{})
+	head := p.meta.FreelistHead
+	count := 0
+	for head != format.NullPage {
+		if head < 3 || head >= p.meta.PageCount {
+			return count, fmt.Errorf("freelist link %d out of range (page count %d)", head, p.meta.PageCount)
+		}
+		if _, dup := seen[head]; dup {
+			return count, fmt.Errorf("freelist cycle at page %d", head)
+		}
+		seen[head] = struct{}{}
+		buf, err := p.readRaw(head)
+		if err != nil {
+			return count, err
+		}
+		count++
+		head = encoding.U32(buf[16:])
+	}
+	return count, nil
 }
 
 // Stats returns the current pager counters. FileBytes is the on-disk size the
