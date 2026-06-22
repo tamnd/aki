@@ -152,6 +152,7 @@ func handleFunctionLoad(ctx *Ctx) {
 	fr.libs[name] = lib
 	fr.mu.Unlock()
 	ctx.MarkPropagate()
+	ctx.d.persistFunctions()
 	ctx.enc().WriteBulkStringStr(name)
 }
 
@@ -172,6 +173,7 @@ func handleFunctionDelete(ctx *Ctx) {
 	delete(fr.libs, name)
 	fr.mu.Unlock()
 	ctx.MarkPropagate()
+	ctx.d.persistFunctions()
 	ctx.Conn.WriteRaw(resp.ReplyOK)
 }
 
@@ -195,6 +197,7 @@ func handleFunctionFlush(ctx *Ctx) {
 	fr.fnIndex = map[string]string{}
 	fr.mu.Unlock()
 	ctx.MarkPropagate()
+	ctx.d.persistFunctions()
 	ctx.Conn.WriteRaw(resp.ReplyOK)
 }
 
@@ -431,7 +434,6 @@ func handleFunctionRestore(ctx *Ctx) {
 
 	fr := &ctx.d.functions
 	fr.mu.Lock()
-	defer fr.mu.Unlock()
 	fr.ensure()
 	if policy == "FLUSH" {
 		fr.libs = map[string]*funcLib{}
@@ -440,11 +442,13 @@ func handleFunctionRestore(ctx *Ctx) {
 	if policy == "APPEND" {
 		for _, lib := range built {
 			if _, exists := fr.libs[lib.name]; exists {
+				fr.mu.Unlock()
 				ctx.enc().WriteError("ERR Library '" + lib.name + "' already exists")
 				return
 			}
 			for _, m := range lib.funcs {
 				if owner, taken := fr.fnIndex[m.name]; taken && owner != lib.name {
+					fr.mu.Unlock()
 					ctx.enc().WriteError("ERR Function '" + m.name + "' already exists")
 					return
 				}
@@ -462,7 +466,9 @@ func handleFunctionRestore(ctx *Ctx) {
 			fr.fnIndex[m.name] = lib.name
 		}
 	}
+	fr.mu.Unlock()
 	ctx.MarkPropagate()
+	ctx.d.persistFunctions()
 	ctx.Conn.WriteRaw(resp.ReplyOK)
 }
 
