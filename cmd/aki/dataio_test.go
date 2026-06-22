@@ -85,7 +85,7 @@ func TestImportRDBIntoFreshKeyspace(t *testing.T) {
 	}
 	defer closeKS()
 
-	n, err := importRDBInto(ks, src, -1)
+	n, _, err := importRDBInto(ks, src, -1)
 	if err != nil {
 		t.Fatalf("importRDBInto: %v", err)
 	}

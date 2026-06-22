@@ -110,6 +110,37 @@ func TestFileAux(t *testing.T) {
 	}
 }
 
+// TestFileFunctions checks function library sources round-trip through the
+// FUNCTION2 opcode and stay in order, alongside the keyspace.
+func TestFileFunctions(t *testing.T) {
+	snap := Snapshot{
+		Functions: []string{
+			"#!lua name=liba\nredis.register_function('a', function() end)",
+			"#!lua name=libb\nredis.register_function('b', function() end)",
+		},
+		DBs: []DBData{{Index: 0, Entries: []Entry{
+			{Key: []byte("k"), Value: Value{Kind: KindString, Str: []byte("v")}, ExpireMS: -1},
+		}}},
+	}
+	blob, err := MarshalFile(snap)
+	if err != nil {
+		t.Fatalf("MarshalFile: %v", err)
+	}
+	out, err := UnmarshalFile(blob)
+	if err != nil {
+		t.Fatalf("UnmarshalFile: %v", err)
+	}
+	if len(out.Functions) != 2 {
+		t.Fatalf("functions = %v want two", out.Functions)
+	}
+	if out.Functions[0] != snap.Functions[0] || out.Functions[1] != snap.Functions[1] {
+		t.Fatalf("functions out of order or altered: %v", out.Functions)
+	}
+	if len(findDB(t, out, 0)) != 1 {
+		t.Fatalf("db0 should still have its key")
+	}
+}
+
 // TestFileEmptyDBSkipped checks a database with no keys writes no selector and so
 // does not appear on read.
 func TestFileEmptyDBSkipped(t *testing.T) {

@@ -163,7 +163,7 @@ func (d *Dispatcher) startBgsave() bool {
 	if !started {
 		return false
 	}
-	snap, err := d.engine.snapshotAll()
+	snap, err := d.snapshotForRDB()
 	if err != nil {
 		d.persist.finishSave(false, dirtyAtStart, 0)
 		return true
@@ -178,9 +178,22 @@ func (d *Dispatcher) startBgsave() bool {
 	return true
 }
 
+// snapshotForRDB takes a keyspace snapshot and attaches the current function
+// library sources, so SAVE, BGSAVE, the AOF base, and a full sync all carry the
+// functions in the RDB as FUNCTION2 records. Functions live on the dispatcher, not
+// in the keyspace, so they are stitched in here rather than in snapshotAll.
+func (d *Dispatcher) snapshotForRDB() (rdb.Snapshot, error) {
+	snap, err := d.engine.snapshotAll()
+	if err != nil {
+		return rdb.Snapshot{}, err
+	}
+	snap.Functions = d.functions.librarySources()
+	return snap, nil
+}
+
 // writeRDB builds the snapshot and writes the dump.rdb inline. SAVE uses it.
 func (d *Dispatcher) writeRDB() error {
-	snap, err := d.engine.snapshotAll()
+	snap, err := d.snapshotForRDB()
 	if err != nil {
 		return err
 	}
