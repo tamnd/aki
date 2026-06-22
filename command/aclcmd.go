@@ -92,6 +92,12 @@ func handleACLSetUser(ctx *Ctx) {
 		u = &clone
 	} else {
 		u = &aclUser{name: name, created: time.Now()}
+		// A brand new user starts from acl-pubsub-default. With allchannels it gets a
+		// &* rule; with resetchannels (the Redis 7 default) it starts with no channel
+		// access. Channel tokens in this same call still apply on top.
+		if confValue(ctx.d.conf, "acl-pubsub-default", "resetchannels") == "allchannels" {
+			u.chanRules = []aclChanRule{{pattern: "*"}}
+		}
 	}
 	if err := applyACLRules(u, tokens); err != nil {
 		a.mu.Unlock()
