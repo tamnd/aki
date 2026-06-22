@@ -15,18 +15,10 @@ import (
 // which means the value record is damaged.
 var errCorruptZSet = errors.New("corrupt zset value")
 
-// Sorted-set thresholds for the reported OBJECT ENCODING. aki stores its own
-// physical form (a length-prefixed pair sequence in score order), so these only
-// decide which Redis encoding name the key reports, matching the t_zset.c
-// constants.
-const (
-	// zsetMaxListpackEntries is zset-max-listpack-entries: the pair count at or
-	// below which a sorted set reports listpack.
-	zsetMaxListpackEntries = 128
-	// zsetMaxListpackValue is zset-max-listpack-value: the per-member byte cap
-	// for listpack.
-	zsetMaxListpackValue = 64
-)
+// Sorted-set OBJECT ENCODING thresholds live in encLimits (enc_limits.go), read
+// from zset-max-listpack-entries and zset-max-listpack-value. aki stores its own
+// physical form (a length-prefixed pair sequence in score order), so they only
+// decide which Redis encoding name the key reports, matching the t_zset.c rule.
 
 // zmember is one (member, score) pair of a sorted set.
 type zmember struct {
@@ -80,15 +72,15 @@ func zsetEncode(members []zmember) []byte {
 
 // zsetEncoding picks the reported encoding for a sorted set. A sorted set never
 // downgrades, so prev pins the floor: once skiplist it stays skiplist.
-func zsetEncoding(members []zmember, prev uint8) uint8 {
+func zsetEncoding(lim encLimits, members []zmember, prev uint8) uint8 {
 	if prev == keyspace.EncSkiplist {
 		return keyspace.EncSkiplist
 	}
-	if len(members) > zsetMaxListpackEntries {
+	if int64(len(members)) > lim.zsetEntries {
 		return keyspace.EncSkiplist
 	}
 	for _, zm := range members {
-		if len(zm.member) > zsetMaxListpackValue {
+		if int64(len(zm.member)) > lim.zsetValue {
 			return keyspace.EncSkiplist
 		}
 	}

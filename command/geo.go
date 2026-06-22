@@ -268,7 +268,7 @@ parsed:
 			return nil
 		}
 		zsetSort(members)
-		return db.Set(ctx.Argv[1], zsetEncode(members), keyspace.TypeZSet, zsetEncoding(members, floor), keepTTL(hdr, found))
+		return db.Set(ctx.Argv[1], zsetEncode(members), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), members, floor), keepTTL(hdr, found))
 	})
 	if !done {
 		return

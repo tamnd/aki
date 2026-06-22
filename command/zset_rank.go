@@ -177,7 +177,7 @@ func handleZPop(ctx *Ctx, fromMax bool) {
 			_, err := db.Delete(ctx.Argv[1])
 			return err
 		}
-		return db.Set(ctx.Argv[1], zsetEncode(kept), keyspace.TypeZSet, zsetEncoding(kept, hdr.Encoding), keepTTL(hdr, found))
+		return db.Set(ctx.Argv[1], zsetEncode(kept), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), kept, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
 		return

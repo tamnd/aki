@@ -62,7 +62,7 @@ func handleHGetDel(ctx *Ctx) {
 		if changed {
 			deleted = true
 			emptied = len(hf) == 0
-			return storeHash(db, key, hf, hdr)
+			return storeHash(ctx.encLimits(), db, key, hf, hdr)
 		}
 		return nil
 	}) {
@@ -162,7 +162,7 @@ func handleHGetEx(ctx *Ctx) {
 		}
 		if changed {
 			emptied = len(hf) == 0
-			return storeHash(db, key, hf, hdr)
+			return storeHash(ctx.encLimits(), db, key, hf, hdr)
 		}
 		return nil
 	}) {
