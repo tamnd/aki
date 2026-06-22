@@ -38,6 +38,9 @@ type aofState struct {
 	incrFile       *os.File // open handle on the incr file for appends
 	lastSelectedDB int      // database last written into the incr file, -1 if none
 
+	pendingSync bool      // bytes written since the last fsync, drives everysec
+	lastSync    time.Time // time of the last incr-file fsync
+
 	loading bool // true while replaying the AOF, suppresses re-propagation
 }
 
@@ -286,6 +289,57 @@ func (d *Dispatcher) appendAOF(db int, argv [][]byte) {
 	}
 	d.aof.incrSize += int64(n)
 	d.aof.lastWriteStatus = "ok"
+	d.aof.pendingSync = true
+	// The always policy makes every write durable before the reply, so fsync the
+	// incr file inline. The everysec policy defers to syncAOFCron and the no policy
+	// leaves it to the OS, so both only mark the write pending here.
+	if d.aofFsyncPolicy() == "always" && !d.aofSyncBlockedByRewrite() {
+		if err := d.aof.incrFile.Sync(); err != nil {
+			d.aof.lastWriteStatus = "err"
+			return
+		}
+		d.aof.pendingSync = false
+		d.aof.lastSync = time.Now()
+	}
+}
+
+// aofFsyncPolicy returns the configured appendfsync policy, one of "always",
+// "everysec", or "no".
+func (d *Dispatcher) aofFsyncPolicy() string {
+	return confValue(d.conf, "appendfsync", "everysec")
+}
+
+// aofSyncBlockedByRewrite reports whether a background fsync should be held off
+// because a rewrite is running and no-appendfsync-on-rewrite is set, which is how
+// Redis avoids blocking on a fsync while the rewrite is also doing disk IO. The
+// caller must hold d.aof.mu.
+func (d *Dispatcher) aofSyncBlockedByRewrite() bool {
+	return d.aof.rewriteInProgress && d.confBool("no-appendfsync-on-rewrite", false)
+}
+
+// syncAOFCron runs from the background cron. Under the everysec policy it fsyncs
+// the incr file when there are unsynced writes and a second has passed since the
+// last fsync. The always policy syncs inline in appendAOF and the no policy leaves
+// syncing to the OS, so both make this a no-op.
+func (d *Dispatcher) syncAOFCron() {
+	if d.aofFsyncPolicy() != "everysec" {
+		return
+	}
+	d.aof.mu.Lock()
+	defer d.aof.mu.Unlock()
+	if d.aof.incrFile == nil || !d.aof.pendingSync || d.aofSyncBlockedByRewrite() {
+		return
+	}
+	now := time.Now()
+	if !d.aof.lastSync.IsZero() && now.Sub(d.aof.lastSync) < time.Second {
+		return
+	}
+	if err := d.aof.incrFile.Sync(); err != nil {
+		d.aof.lastWriteStatus = "err"
+		return
+	}
+	d.aof.pendingSync = false
+	d.aof.lastSync = now
 }
 
 // appendRESPCommand encodes one command as a RESP array of bulk strings.
@@ -484,6 +538,8 @@ func (d *Dispatcher) forceSyncAOF() bool {
 		d.aof.lastWriteStatus = "err"
 		return false
 	}
+	d.aof.pendingSync = false
+	d.aof.lastSync = time.Now()
 	return true
 }
 
