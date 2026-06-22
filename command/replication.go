@@ -900,6 +900,45 @@ func (d *Dispatcher) countReplicasAtOffset(target int64) int {
 	return n
 }
 
+// isReplica reports whether this instance is following a master.
+func (d *Dispatcher) isReplica() bool {
+	d.repl.mu.Lock()
+	defer d.repl.mu.Unlock()
+	return d.repl.role == "slave"
+}
+
+// goodReplicaCount returns how many connected replicas acked within maxLag, the
+// "good replica" notion min-replicas-to-write counts against. A replica that has
+// gone quiet longer than maxLag does not count.
+func (d *Dispatcher) goodReplicaCount(maxLag time.Duration) int {
+	now := time.Now()
+	d.repl.mu.Lock()
+	defer d.repl.mu.Unlock()
+	n := 0
+	for _, h := range d.repl.replicas {
+		if now.Sub(h.ackTime) <= maxLag {
+			n++
+		}
+	}
+	return n
+}
+
+// enoughGoodReplicas reports whether a write may proceed under
+// min-replicas-to-write and min-replicas-max-lag. The gate is off unless both
+// are positive, matching Redis, and a replica never applies it since its master
+// already enforced the rule before sending the write.
+func (d *Dispatcher) enoughGoodReplicas() bool {
+	minReplicas := int(d.confInt("min-replicas-to-write", 0))
+	maxLag := int(d.confInt("min-replicas-max-lag", 10))
+	if minReplicas <= 0 || maxLag <= 0 {
+		return true
+	}
+	if d.isReplica() {
+		return true
+	}
+	return d.goodReplicaCount(time.Duration(maxLag)*time.Second) >= minReplicas
+}
+
 // broadcastGetAck asks every replica to send a REPLCONF ACK now, so WAIT sees
 // fresh offsets rather than waiting for the one-second ACK tick.
 func (d *Dispatcher) broadcastGetAck() {
