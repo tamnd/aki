@@ -2,6 +2,7 @@ package command
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/tamnd/aki/keyspace"
@@ -605,9 +606,19 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 		starts[j] = id
 	}
 
+	// A consumer group read with > changes durable group state (the group last id,
+	// the entries-read count, and the consumer PEL) without the keyspace dirty
+	// counter driving propagation, because XREADGROUP is a blocking command and
+	// runCommand skips the default propagation for those. So the new entries it
+	// delivers are turned into the same effect commands real Redis propagates: one
+	// XCLAIM per entry to recreate the PEL record on the replica, then an XGROUP
+	// SETID to advance the group last id and entries-read. NOACK reads skip the
+	// XCLAIM since they keep no PEL.
+	propOn := ctx.d.aofEnabled() || ctx.d.replActive()
 	attempt := func() bool {
 		var (
 			results  []readGroupResult
+			propCmds [][][]byte
 			wrongTyp bool
 			noGroup  bool
 			nogKey   string
@@ -654,6 +665,9 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 					if err := storeStream(db, keys[j], s, keepTTL(hdr, found)); err != nil {
 						return err
 					}
+					if propOn {
+						propCmds = append(propCmds, groupDeliveryProp(keys[j], groupName, consumerName, es, g, now, noAck)...)
+					}
 					results = append(results, readGroupResult{key: keys[j], rows: rows})
 				} else {
 					rows := collectConsumerPEL(s, g, consumerName, starts[j], count)
@@ -682,6 +696,12 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 		if len(results) == 0 && !anyExplicit {
 			return false
 		}
+		if len(propCmds) > 0 {
+			db := ctx.Conn.DB()
+			for _, cmd := range propCmds {
+				ctx.d.propagateBlocking(db, cmd)
+			}
+		}
 		writeReadGroupResults(ctx, results)
 		return true
 	}
@@ -693,6 +713,34 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 		return
 	}
 	ctx.d.blockDrive(ctx, keys, float64(blockMs)/1000, attempt, func() { ctx.enc().WriteNullArray() })
+}
+
+// groupDeliveryProp builds the commands that replay a > delivery onto the AOF and
+// any replica. Each delivered entry becomes an XCLAIM that recreates its PEL
+// record (FORCE so the replica creates it even though it was never delivered
+// there, JUSTID so no entry body is needed), and one XGROUP SETID advances the
+// group last id and entries-read so a promoted replica does not redeliver. A
+// NOACK delivery keeps no PEL, so it only advances the group id.
+func groupDeliveryProp(key []byte, groupName, consumerName string, es []streamEntry, g *group, now int64, noAck bool) [][][]byte {
+	cmds := make([][][]byte, 0, len(es)+1)
+	if !noAck {
+		nowStr := []byte(strconv.FormatInt(now, 10))
+		for _, e := range es {
+			cmds = append(cmds, [][]byte{
+				[]byte("XCLAIM"), key, []byte(groupName), []byte(consumerName),
+				[]byte("0"), []byte(e.id.String()),
+				[]byte("TIME"), nowStr,
+				[]byte("RETRYCOUNT"), []byte("1"),
+				[]byte("FORCE"), []byte("JUSTID"),
+			})
+		}
+	}
+	cmds = append(cmds, [][]byte{
+		[]byte("XGROUP"), []byte("SETID"), key, []byte(groupName),
+		[]byte(g.lastID.String()),
+		[]byte("ENTRIESREAD"), []byte(strconv.FormatInt(int64(g.entriesRead), 10)),
+	})
+	return cmds
 }
 
 // readEntry is one row of an XREADGROUP reply: an entry, or a tombstone with a
