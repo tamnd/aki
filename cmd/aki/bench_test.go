@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/tamnd/aki/bench"
+	"github.com/tamnd/aki/respclient"
 )
 
 // TestBenchSetWorkload runs a small SET load against an in-process server and
@@ -48,14 +49,14 @@ func TestBenchSetWorkload(t *testing.T) {
 // TestBenchGetWorkload checks the GET path against pre-seeded keys.
 func TestBenchGetWorkload(t *testing.T) {
 	addr := startServer(t)
-	cl, err := dialServer(addr, 0)
+	cl, err := respclient.Dial(addr, 0)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	for i := 0; i < 100; i++ {
 		mustCall(t, cl, "SET", "key:"+itoa(i), "v")
 	}
-	cl.close()
+	cl.Close()
 
 	cfg := benchConfig{
 		addr:     addr,
