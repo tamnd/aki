@@ -412,7 +412,7 @@ func configDirectives() []*directive {
 		{name: "io-uring", kind: dirBool, def: "no"},
 		{name: "o-direct", kind: dirBool, def: "no"},
 		{name: "rdb-compat", kind: dirBool, def: "yes", mutable: true},
-		{name: "max-io-latency-warn", kind: dirInt, def: "0", mutable: true},
+		{name: "max-io-latency-warn", kind: dirInt, def: "5", mutable: true},
 	}
 }
 

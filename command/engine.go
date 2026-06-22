@@ -2,6 +2,7 @@ package command
 
 import (
 	"sync"
+	"time"
 
 	"github.com/tamnd/aki/keyspace"
 	"github.com/tamnd/aki/pager"
@@ -15,6 +16,9 @@ import (
 type Engine struct {
 	mu sync.Mutex
 	ks *keyspace.Keyspace
+	// onCommit, when set, is called with the duration of each checkpoint commit so
+	// the dispatcher can flag slow I/O. The dispatcher installs it at startup.
+	onCommit func(op string, dur time.Duration)
 }
 
 // NewEngine wraps a keyspace for use by the dispatcher.
@@ -32,7 +36,18 @@ func (e *Engine) update(index int, fn func(*keyspace.DB) error) error {
 	if err := fn(db); err != nil {
 		return err
 	}
-	return e.ks.Commit()
+	return e.commit()
+}
+
+// commit checkpoints the keyspace and reports how long the commit took to the
+// latency hook when one is installed. Every write path commits through here.
+func (e *Engine) commit() error {
+	start := time.Now()
+	err := e.ks.Commit()
+	if e.onCommit != nil {
+		e.onCommit("checkpoint", time.Since(start))
+	}
+	return err
 }
 
 // updateKeyspace runs fn with access to every database under the engine lock and
@@ -43,7 +58,7 @@ func (e *Engine) updateKeyspace(fn func(*keyspace.Keyspace) error) error {
 	if err := fn(e.ks); err != nil {
 		return err
 	}
-	return e.ks.Commit()
+	return e.commit()
 }
 
 // version returns the write version of a key in database index, and whether the

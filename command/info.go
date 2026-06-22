@@ -456,6 +456,7 @@ func infoStats(ctx *Ctx, b *strings.Builder) {
 	lineInt(b, "pubsub_shardchannels", int64(shard))
 	line(b, "latest_fork_usec", "0")
 	line(b, "total_forks", "0")
+	lineInt(b, "io_slowops_total", int64(ctx.d.ioSlowOps.Load()))
 }
 
 func infoReplication(ctx *Ctx, b *strings.Builder) {
