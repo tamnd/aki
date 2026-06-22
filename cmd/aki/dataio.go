@@ -4,17 +4,21 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/tamnd/aki/command"
 	"github.com/tamnd/aki/rdb"
 )
 
-// cmdImport ingests a Redis dump.rdb into an aki database file. AOF input is not
-// handled yet; the format is detected from the leading magic bytes.
+// cmdImport ingests a Redis dump.rdb into an aki database file, or ships it to a
+// running instance with --addr. AOF input is not handled yet; the format is
+// detected from the leading magic bytes.
 func cmdImport(args []string) error {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
 	format := fs.String("format", "detect", "input format: rdb or detect")
 	target := fs.String("target", "aki.aki", "path to the .aki file to write")
+	addr := fs.String("addr", "", "ship the keys to this running instance instead of a file")
+	auth := fs.String("auth", "", "password to send to the --addr instance")
 	db := fs.Int("db", -1, "import only this source database (default all)")
 	replace := fs.Bool("replace", false, "overwrite keys that already exist")
 	dryRun := fs.Bool("dry-run", false, "parse and count without writing")
@@ -23,7 +27,7 @@ func cmdImport(args []string) error {
 		return err
 	}
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: aki import <file> [--target path] [--db N] [--replace] [--dry-run]")
+		return fmt.Errorf("usage: aki import <file> [--target path | --addr host:port] [--db N] [--replace] [--dry-run]")
 	}
 	src := pos[0]
 
@@ -45,6 +49,15 @@ func cmdImport(args []string) error {
 		return nil
 	}
 
+	if *addr != "" {
+		n, ierr := importToServer(*addr, *auth, snap, *db, *replace, 30*time.Second)
+		if ierr != nil {
+			return fmt.Errorf("import into %s: %w", *addr, ierr)
+		}
+		fmt.Printf("imported %d keys from %s into %s\n", n, src, *addr)
+		return nil
+	}
+
 	ks, closeKS, err := openKeyspace(*target, snapshotDBCount(snap))
 	if err != nil {
 		return err
@@ -62,41 +75,44 @@ func cmdImport(args []string) error {
 	return nil
 }
 
-// cmdDump exports an aki database file to a Redis dump.rdb. Only the offline
-// --file mode is implemented; reading from a running server over the wire is a
-// later slice.
+// cmdDump exports a keyspace to a Redis dump.rdb. It reads from an offline .aki
+// file with --file, or from a running instance over the wire with --addr.
 func cmdDump(args []string) error {
 	fs := flag.NewFlagSet("dump", flag.ContinueOnError)
 	format := fs.String("format", "rdb", "output format: rdb")
 	output := fs.String("output", "dump.rdb", "output file path")
 	db := fs.Int("db", -1, "export only this database (default all)")
 	file := fs.String("file", "", "read directly from this .aki file (offline)")
-	addr := fs.String("addr", "", "connect to a running instance (not implemented)")
+	addr := fs.String("addr", "", "connect to a running instance over the wire")
+	auth := fs.String("auth", "", "password to send to the --addr instance")
+	databases := fs.Int("databases", 16, "with --addr, number of databases to scan")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *format != "rdb" {
 		return fmt.Errorf("only --format rdb is supported")
 	}
-	if *file == "" {
-		if *addr != "" {
-			return fmt.Errorf("networked dump is not implemented yet; use --file <.aki>")
-		}
-		return fmt.Errorf("usage: aki dump --file <.aki> [--output path] [--db N]")
+	if *file == "" && *addr == "" {
+		return fmt.Errorf("usage: aki dump (--file <.aki> | --addr host:port) [--output path] [--db N]")
+	}
+	if *file != "" && *addr != "" {
+		return fmt.Errorf("use either --file or --addr, not both")
 	}
 
-	ks, closeKS, err := openKeyspace(*file, 16)
+	var (
+		snap   rdb.Snapshot
+		source string
+		err    error
+	)
+	if *addr != "" {
+		snap, err = dumpFromServer(*addr, *auth, *databases, *db, 30*time.Second)
+		source = *addr
+	} else {
+		snap, err = dumpFromFile(*file, *db)
+		source = *file
+	}
 	if err != nil {
 		return err
-	}
-	defer closeKS()
-
-	snap, err := command.SnapshotKeyspace(ks)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", *file, err)
-	}
-	if *db >= 0 {
-		snap = filterDB(snap, *db)
 	}
 
 	blob, err := rdb.MarshalFile(snap)
@@ -106,8 +122,27 @@ func cmdDump(args []string) error {
 	if err := os.WriteFile(*output, blob, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", *output, err)
 	}
-	fmt.Printf("dumped %d keys from %s to %s\n", command.CountSnapshot(snap, -1), *file, *output)
+	fmt.Printf("dumped %d keys from %s to %s\n", command.CountSnapshot(snap, -1), source, *output)
 	return nil
+}
+
+// dumpFromFile reads a snapshot out of an offline .aki file, optionally limited
+// to one database.
+func dumpFromFile(file string, db int) (rdb.Snapshot, error) {
+	ks, closeKS, err := openKeyspace(file, 16)
+	if err != nil {
+		return rdb.Snapshot{}, err
+	}
+	defer closeKS()
+
+	snap, err := command.SnapshotKeyspace(ks)
+	if err != nil {
+		return rdb.Snapshot{}, fmt.Errorf("read %s: %w", file, err)
+	}
+	if db >= 0 {
+		snap = filterDB(snap, db)
+	}
+	return snap, nil
 }
 
 // parseInterspersed parses a flag set that allows positional arguments to appear
