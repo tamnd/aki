@@ -112,6 +112,11 @@ func cmdServer(args []string) error {
 	}
 	defer d.StopProfiler()
 
+	if err := d.StartAdmin(); err != nil {
+		return fmt.Errorf("start admin endpoint: %w", err)
+	}
+	defer d.StopAdmin()
+
 	d.LogNotice("Server started", "aki_version", Version, "addr", *addr)
 
 	errc := make(chan error, 1)
