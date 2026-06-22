@@ -16,6 +16,9 @@ type Config struct {
 	Databases int
 	// RequirePass is the default user password. Empty means no auth is required.
 	RequirePass string
+	// AclFile is the path to an external ACL file. Empty disables ACL LOAD/SAVE
+	// and keeps users in memory only.
+	AclFile string
 	// Version is reported by HELLO.
 	Version string
 	// Mode is reported by HELLO: "standalone", "sentinel", or "cluster".
@@ -33,6 +36,7 @@ type Dispatcher struct {
 	engine *Engine
 	ps     *pubsubRegistry
 	conf   *configStore
+	acl    *aclRegistry
 	srv    *networking.Server
 
 	// startTime is when the dispatcher was built, used for INFO uptime. runID is
@@ -115,6 +119,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, transactionCommands()...)
 	cmds = append(cmds, pubsubCommands()...)
 	cmds = append(cmds, configCommands()...)
+	cmds = append(cmds, aclCommands()...)
 	cmds = append(cmds, clientCommands()...)
 	cmds = append(cmds, infoCommands()...)
 	cmds = append(cmds, debugCommands()...)
@@ -127,17 +132,25 @@ func New(cfg Config) *Dispatcher {
 	if cfg.RequirePass != "" {
 		conf.set("requirepass", cfg.RequirePass)
 	}
+	acl := newACLRegistry(cfg.RequirePass)
+	acl.aclFile = cfg.AclFile
 	d := &Dispatcher{
 		table:     NewTable(cmds),
 		cfg:       cfg,
 		engine:    cfg.Engine,
 		ps:        newPubsubRegistry(),
 		conf:      conf,
+		acl:       acl,
 		startTime: time.Now(),
 		runID:     newRunID(),
 		hz:        10,
 	}
 	d.activeExpire.Store(true)
+	if cfg.AclFile != "" {
+		// A missing or unreadable file at startup is not fatal: the in-memory
+		// default user stays in place until ACL LOAD or ACL SAVE is run.
+		_ = acl.loadFile()
+	}
 	if v, ok := conf.get("notify-keyspace-events"); ok {
 		if flags, ok := parseNotifyFlags(v); ok {
 			d.notifyFlags = flags
@@ -216,6 +229,11 @@ type Ctx struct {
 type session struct {
 	authenticated bool
 
+	// user is the ACL user this connection runs as, and username is its name.
+	// A fresh connection starts as the default user; AUTH changes both.
+	user     *aclUser
+	username string
+
 	// inMulti is true between MULTI and EXEC/DISCARD: commands are queued instead
 	// of run. queue holds them in order, and dirtyExec records a queue-time error
 	// (unknown command or bad arity) that makes EXEC abort.
@@ -285,8 +303,8 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		c.Enc().WriteError(arityError(cmd))
 		return
 	}
-	if d.cfg.RequirePass != "" && !sess.authenticated && !cmd.Flags.Has(FlagNoAuth) {
-		c.Enc().WriteError("NOAUTH Authentication required.")
+	if msg := d.aclEnforce(c, sess, cmd, argv); msg != "" {
+		c.Enc().WriteError(msg)
 		return
 	}
 
@@ -299,7 +317,12 @@ func (d *Dispatcher) sessionFor(c *networking.Conn) *session {
 	if s, ok := c.Session().(*session); ok {
 		return s
 	}
-	s := &session{authenticated: d.cfg.RequirePass == ""}
+	def := d.acl.get("default")
+	s := &session{
+		authenticated: def != nil && def.nopass,
+		user:          def,
+		username:      "default",
+	}
 	c.SetSession(s)
 	return s
 }
