@@ -918,6 +918,7 @@ func handleXInfo(ctx *Ctx) {
 		}
 	}
 
+	nodeEntries := int(ctx.d.confInt("stream-node-max-entries", streamNodeEntries))
 	var (
 		snap     *stream
 		wrongTyp bool
@@ -947,9 +948,9 @@ func handleXInfo(ctx *Ctx) {
 	case noKey:
 		ctx.enc().WriteError(errStreamNoSuchKey)
 	case full:
-		writeStreamInfoFull(ctx.enc(), snap, count)
+		writeStreamInfoFull(ctx.enc(), snap, count, nodeEntries)
 	default:
-		writeStreamInfoSummary(ctx.enc(), snap)
+		writeStreamInfoSummary(ctx.enc(), snap, nodeEntries)
 	}
 }
 
@@ -961,17 +962,22 @@ func (s *stream) firstID() streamID {
 	return s.entries[0].id
 }
 
-// raxKeys approximates the listpack-node count from the live entry count.
-func (s *stream) raxKeys() int64 {
+// raxKeys approximates the listpack-node count from the live entry count, packing
+// up to nodeEntries entries per node. A nodeEntries of zero or less means Redis
+// puts no entry-count cap on a node, so the whole stream collapses to one node.
+func (s *stream) raxKeys(nodeEntries int) int64 {
 	if len(s.entries) == 0 {
 		return 0
 	}
-	return int64((len(s.entries) + streamNodeEntries - 1) / streamNodeEntries)
+	if nodeEntries <= 0 {
+		return 1
+	}
+	return int64((len(s.entries) + nodeEntries - 1) / nodeEntries)
 }
 
 // writeStreamInfoSummary writes the XINFO STREAM summary reply.
-func writeStreamInfoSummary(enc *resp.Encoder, s *stream) {
-	keys := s.raxKeys()
+func writeStreamInfoSummary(enc *resp.Encoder, s *stream, nodeEntries int) {
+	keys := s.raxKeys(nodeEntries)
 	pairs := func() {
 		enc.WriteBulkStringStr("length")
 		enc.WriteInteger(int64(len(s.entries)))
@@ -1004,7 +1010,8 @@ func writeStreamInfoSummary(enc *resp.Encoder, s *stream) {
 
 // writeStreamInfoFull writes the XINFO STREAM FULL reply. The groups array is
 // empty until consumer groups land.
-func writeStreamInfoFull(enc *resp.Encoder, s *stream, count int64) {
+func writeStreamInfoFull(enc *resp.Encoder, s *stream, count int64, nodeEntries int) {
+	keys := s.raxKeys(nodeEntries)
 	if enc.Proto() >= 3 {
 		enc.WriteMapLen(9)
 	} else {
@@ -1013,9 +1020,9 @@ func writeStreamInfoFull(enc *resp.Encoder, s *stream, count int64) {
 	enc.WriteBulkStringStr("length")
 	enc.WriteInteger(int64(len(s.entries)))
 	enc.WriteBulkStringStr("radix-tree-keys")
-	enc.WriteInteger(s.raxKeys())
+	enc.WriteInteger(keys)
 	enc.WriteBulkStringStr("radix-tree-nodes")
-	enc.WriteInteger(s.raxKeys() + 1)
+	enc.WriteInteger(keys + 1)
 	enc.WriteBulkStringStr("last-generated-id")
 	enc.WriteBulkStringStr(s.lastID.String())
 	enc.WriteBulkStringStr("max-deleted-entry-id")
