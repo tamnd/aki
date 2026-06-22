@@ -113,6 +113,11 @@ func handleReset(ctx *Ctx) {
 	ctx.sess.user = def
 	ctx.sess.username = "default"
 	ctx.sess.clearMulti()
+	if ctx.sess.trackingOn {
+		ctx.d.trackingDisable(ctx.Conn.ID(), ctx.sess)
+	}
+	ctx.sess.cachingYes = false
+	ctx.sess.cachingNo = false
 	ctx.Conn.WriteRaw(resp.ReplyReset)
 }
 

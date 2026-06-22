@@ -38,6 +38,12 @@ func clientCommands() []*CmdDesc {
 				Arity: 3, Flags: FlagLoading | FlagStale, Handler: handleClientNoTouch},
 			{Name: "getredir", SubName: "client|getredir", Group: GroupConnection, Since: "6.0.0",
 				Arity: 2, Flags: FlagLoading | FlagStale | FlagFast, Handler: handleClientGetRedir},
+			{Name: "tracking", SubName: "client|tracking", Group: GroupConnection, Since: "6.0.0",
+				Arity: -3, Flags: FlagLoading | FlagStale, Handler: handleClientTracking},
+			{Name: "trackinginfo", SubName: "client|trackinginfo", Group: GroupConnection, Since: "6.2.0",
+				Arity: 2, Flags: FlagLoading | FlagStale, Handler: handleClientTrackingInfo},
+			{Name: "caching", SubName: "client|caching", Group: GroupConnection, Since: "6.0.0",
+				Arity: 3, Flags: FlagLoading | FlagStale, Handler: handleClientCaching},
 			{Name: "kill", SubName: "client|kill", Group: GroupConnection, Since: "2.4.0",
 				Arity: -3, Flags: FlagLoading | FlagStale | FlagAdmin, Handler: handleClientKill},
 			{Name: "unpause", SubName: "client|unpause", Group: GroupConnection, Since: "6.2.0",
@@ -174,10 +180,196 @@ func handleClientNoTouch(ctx *Ctx) {
 	ctx.enc().WriteStatus("OK")
 }
 
-// handleClientGetRedir reports the client tracking redirection target. aki does
-// not implement client-side caching, so there is never a redirection.
+// handleClientGetRedir reports the client tracking redirection target: the client
+// id RESP2 invalidations are forwarded to, or -1 when there is no redirect.
 func handleClientGetRedir(ctx *Ctx) {
+	if ctx.sess.trackingRedir != 0 {
+		ctx.enc().WriteInteger(int64(ctx.sess.trackingRedir))
+		return
+	}
 	ctx.enc().WriteInteger(-1)
+}
+
+// handleClientTracking turns client-side caching on or off for this connection
+// and validates the option combination before applying it.
+func handleClientTracking(ctx *Ctx) {
+	mode := strings.ToUpper(string(ctx.Argv[2]))
+	if mode != "ON" && mode != "OFF" {
+		ctx.enc().WriteError("ERR syntax error")
+		return
+	}
+
+	var (
+		redir          uint64
+		bcast          bool
+		optIn          bool
+		optOut         bool
+		noLoop         bool
+		prefixes       []string
+		havePrefix     bool
+		haveRedirToken bool
+	)
+	args := ctx.Argv[3:]
+	for i := 0; i < len(args); i++ {
+		switch strings.ToUpper(string(args[i])) {
+		case "REDIRECT":
+			if i+1 >= len(args) {
+				ctx.enc().WriteError("ERR syntax error")
+				return
+			}
+			n, err := strconv.ParseUint(string(args[i+1]), 10, 64)
+			if err != nil {
+				ctx.enc().WriteError("ERR Invalid client ID")
+				return
+			}
+			redir = n
+			haveRedirToken = true
+			i++
+		case "BCAST":
+			bcast = true
+		case "PREFIX":
+			if i+1 >= len(args) {
+				ctx.enc().WriteError("ERR syntax error")
+				return
+			}
+			prefixes = append(prefixes, string(args[i+1]))
+			havePrefix = true
+			i++
+		case "OPTIN":
+			optIn = true
+		case "OPTOUT":
+			optOut = true
+		case "NOLOOP":
+			noLoop = true
+		default:
+			ctx.enc().WriteError("ERR syntax error")
+			return
+		}
+	}
+
+	if mode == "OFF" {
+		if ctx.sess.trackingOn {
+			ctx.d.trackingDisable(ctx.Conn.ID(), ctx.sess)
+		}
+		ctx.enc().WriteStatus("OK")
+		return
+	}
+
+	if optIn && optOut {
+		ctx.enc().WriteError("ERR You can't specify both OPTIN and OPTOUT")
+		return
+	}
+	if havePrefix && !bcast {
+		ctx.enc().WriteError("ERR PREFIX option requires BCAST mode to be enabled")
+		return
+	}
+	if (optIn || optOut) && bcast {
+		ctx.enc().WriteError("ERR OPTIN and OPTOUT are not compatible with BCAST")
+		return
+	}
+	// A non-redirect tracking client must speak RESP3 to take the inline push. A
+	// redirect forwards to another client, so the tracking client's own protocol
+	// does not matter in that case.
+	if redir == 0 && ctx.Conn.Proto() != 3 {
+		ctx.enc().WriteError("ERR Client tracking can be enabled only in RESP3 mode or when a redirection client is specified via the 'REDIRECT' option")
+		return
+	}
+	if haveRedirToken && redir != 0 {
+		if ctx.d.srv == nil || ctx.d.srv.ConnByID(redir) == nil {
+			ctx.enc().WriteError("ERR The client ID you want redirect to does not exist")
+			return
+		}
+	}
+
+	ctx.sess.trackingBcast = bcast
+	ctx.sess.trackingOptIn = optIn
+	ctx.sess.trackingOptOut = optOut
+	ctx.sess.trackingNoLoop = noLoop
+	ctx.sess.trackingPrefixes = prefixes
+	ctx.sess.trackingRedir = redir
+	ctx.d.trackingEnable(ctx.Conn.ID(), ctx.sess)
+	ctx.enc().WriteStatus("OK")
+}
+
+// handleClientTrackingInfo reports the current tracking configuration as a map:
+// the active flags, the redirect target, and the BCAST prefixes.
+func handleClientTrackingInfo(ctx *Ctx) {
+	enc := ctx.enc()
+	s := ctx.sess
+
+	var flags []string
+	if s.trackingOn {
+		flags = append(flags, "on")
+	} else {
+		flags = append(flags, "off")
+	}
+	if s.trackingBcast {
+		flags = append(flags, "bcast")
+	}
+	if s.trackingOptIn {
+		flags = append(flags, "optin")
+	}
+	if s.trackingOptOut {
+		flags = append(flags, "optout")
+	}
+	if s.cachingYes {
+		flags = append(flags, "caching-yes")
+	}
+	if s.cachingNo {
+		flags = append(flags, "caching-no")
+	}
+	if s.trackingNoLoop {
+		flags = append(flags, "noloop")
+	}
+	if s.trackingOn && s.trackingRedir != 0 &&
+		(ctx.d.srv == nil || ctx.d.srv.ConnByID(s.trackingRedir) == nil) {
+		flags = append(flags, "broken_redirect")
+	}
+
+	redir := int64(-1)
+	if s.trackingRedir != 0 {
+		redir = int64(s.trackingRedir)
+	}
+
+	enc.WriteMapLen(3)
+	enc.WriteBulkStringStr("flags")
+	enc.WriteArrayLen(len(flags))
+	for _, f := range flags {
+		enc.WriteBulkStringStr(f)
+	}
+	enc.WriteBulkStringStr("redirect")
+	enc.WriteInteger(redir)
+	enc.WriteBulkStringStr("prefixes")
+	enc.WriteArrayLen(len(s.trackingPrefixes))
+	for _, p := range s.trackingPrefixes {
+		enc.WriteBulkStringStr(p)
+	}
+}
+
+// handleClientCaching records a one-shot tracking decision for the next command.
+// It is only meaningful in OPTIN or OPTOUT mode; YES is for OPTIN, NO for OPTOUT.
+func handleClientCaching(ctx *Ctx) {
+	yes, ok := parseYesNo(strings.ToLower(string(ctx.Argv[2])))
+	if !ok {
+		ctx.enc().WriteError("ERR syntax error")
+		return
+	}
+	s := ctx.sess
+	if !s.trackingOn || (!s.trackingOptIn && !s.trackingOptOut) {
+		ctx.enc().WriteError("ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled")
+		return
+	}
+	if yes && s.trackingOptOut {
+		ctx.enc().WriteError("ERR CLIENT CACHING YES is only valid when tracking is enabled in OPTIN mode.")
+		return
+	}
+	if !yes && s.trackingOptIn {
+		ctx.enc().WriteError("ERR CLIENT CACHING NO is only valid when tracking is enabled in OPTOUT mode.")
+		return
+	}
+	s.cachingYes = yes
+	s.cachingNo = !yes
+	ctx.enc().WriteStatus("OK")
 }
 
 func handleClientUnpause(ctx *Ctx) {
@@ -315,6 +507,14 @@ func handleClientHelp(ctx *Ctx) {
 		"    Set client eviction mode for the current connection.",
 		"NO-TOUCH (ON|OFF)",
 		"    Stop the current command touching the LRU/LFU of keys it reads.",
+		"GETREDIR",
+		"    Return the client ID tracking invalidations are redirected to.",
+		"TRACKING (ON|OFF) [REDIRECT <id>] [BCAST] [PREFIX <prefix> ...] [OPTIN] [OPTOUT] [NOLOOP]",
+		"    Enable or disable server-assisted client-side caching.",
+		"TRACKINGINFO",
+		"    Return the tracking status for the current connection.",
+		"CACHING (YES|NO)",
+		"    Enable or disable tracking of the next command in OPTIN/OPTOUT mode.",
 		"HELP",
 		"    Print this help.",
 	}
@@ -331,6 +531,8 @@ func handleClientHelp(ctx *Ctx) {
 func buildClientLine(c *networking.Conn, now time.Time) string {
 	sub, psub, ssub, multi, watch := 0, 0, 0, -1, 0
 	libName, libVer := "", ""
+	flags := "N"
+	redir := int64(-1)
 	if s, ok := c.Session().(*session); ok {
 		sub = len(s.subChannels)
 		psub = len(s.subPatterns)
@@ -340,6 +542,12 @@ func buildClientLine(c *networking.Conn, now time.Time) string {
 			multi = len(s.queue)
 		}
 		libName, libVer = s.libName, s.libVer
+		if s.trackingOn {
+			flags = "t"
+		}
+		if s.trackingRedir != 0 {
+			redir = int64(s.trackingRedir)
+		}
 	}
 	cmd := "NULL"
 	user := "default"
@@ -362,7 +570,7 @@ func buildClientLine(c *networking.Conn, now time.Time) string {
 	b.WriteString(" name=" + c.Name())
 	b.WriteString(" age=" + strconv.FormatInt(age, 10))
 	b.WriteString(" idle=" + strconv.FormatInt(idle, 10))
-	b.WriteString(" flags=N")
+	b.WriteString(" flags=" + flags)
 	b.WriteString(" db=" + strconv.Itoa(c.DB()))
 	b.WriteString(" sub=" + strconv.Itoa(sub))
 	b.WriteString(" psub=" + strconv.Itoa(psub))
@@ -376,7 +584,7 @@ func buildClientLine(c *networking.Conn, now time.Time) string {
 	b.WriteString(" events=r")
 	b.WriteString(" cmd=" + cmd)
 	b.WriteString(" user=" + user)
-	b.WriteString(" redir=-1")
+	b.WriteString(" redir=" + strconv.FormatInt(redir, 10))
 	b.WriteString(" resp=" + strconv.Itoa(c.Proto()))
 	b.WriteString(" lib-name=" + libName)
 	b.WriteString(" lib-ver=" + libVer)
