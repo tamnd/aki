@@ -66,6 +66,10 @@ type Dispatcher struct {
 	// aof holds the append-only-file emulation state that BGREWRITEAOF, the
 	// auto-rewrite trigger, and INFO persistence read and write.
 	aof aofState
+
+	// scripts is the EVAL/EVALSHA script cache, keyed by lowercase SHA1 hex of the
+	// body. SCRIPT LOAD fills it, EVALSHA reads it, SCRIPT FLUSH clears it.
+	scripts scriptCache
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -126,6 +130,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, slowlogCommands()...)
 	cmds = append(cmds, latencyCommands()...)
 	cmds = append(cmds, memoryCommands()...)
+	cmds = append(cmds, scriptCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	conf := newConfigStore()
 	conf.set("databases", strconv.Itoa(cfg.Databases))

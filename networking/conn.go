@@ -159,6 +159,15 @@ func (c *Conn) Enc() *resp.Encoder { return c.enc }
 // framed RESP value.
 func (c *Conn) WriteRaw(p []byte) { c.outBuf.Write(p) }
 
+// OutBytes returns the bytes accumulated in the output buffer. It is used by an
+// offline connection (NewOfflineConn) to read back a command's reply, for
+// example when a script's redis.call runs a command and needs its RESP reply.
+func (c *Conn) OutBytes() []byte { return c.outBuf.Bytes() }
+
+// ResetOut clears the output buffer. An offline connection reused across several
+// commands calls this between them so each reply starts clean.
+func (c *Conn) ResetOut() { c.outBuf.Reset() }
+
 // Deliver writes a complete, pre-framed RESP value straight to the socket from
 // another goroutine, the path a PUBLISH on one connection uses to push a message
 // to a subscriber on another. It holds the write lock so it cannot interleave
