@@ -112,7 +112,7 @@ func handleSetOpStore(ctx *Ctx, op setOp) {
 			_, err := db.Delete(dst)
 			return err
 		}
-		return db.Set(dst, setEncode(result), keyspace.TypeSet, setEncoding(result, keyspace.EncIntset), -1)
+		return db.Set(dst, setEncode(result), keyspace.TypeSet, setEncoding(ctx.encLimits(), result, keyspace.EncIntset), -1)
 	})
 	if !done {
 		return

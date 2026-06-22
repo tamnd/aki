@@ -96,7 +96,7 @@ func runSort(ctx *Ctx, readonly bool) {
 			}
 			stored = len(vals)
 			return db.Set(opts.store, listEncode(vals), keyspace.TypeList,
-				listEncoding(vals, keyspace.EncListpack), -1)
+				listEncoding(ctx.encLimits(), vals, keyspace.EncListpack), -1)
 		}
 		return nil
 	}

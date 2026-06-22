@@ -11,21 +11,11 @@ import (
 // means the value record is damaged.
 var errCorruptSet = errors.New("corrupt set value")
 
-// Set thresholds for the reported OBJECT ENCODING. aki stores its own physical
-// set form (a length-prefixed member sequence in insertion order), so these only
-// decide which Redis encoding name the key reports, matching the t_set.c
-// constants.
-const (
-	// setMaxIntsetEntries is set-max-intset-entries: the all-integer member
-	// count at or below which a set reports intset.
-	setMaxIntsetEntries = 512
-	// setMaxListpackEntries is set-max-listpack-entries: the member count at or
-	// below which a non-integer set reports listpack.
-	setMaxListpackEntries = 128
-	// setMaxListpackValue is set-max-listpack-value: the per-member byte cap for
-	// listpack.
-	setMaxListpackValue = 64
-)
+// Set OBJECT ENCODING thresholds live in encLimits (enc_limits.go), read from
+// set-max-intset-entries, set-max-listpack-entries and set-max-listpack-value.
+// aki stores its own physical set form (a length-prefixed member sequence in
+// insertion order), so they only decide which Redis encoding name the key
+// reports, matching the t_set.c rule.
 
 // setDecode unpacks a stored set body into its members in insertion order. The
 // body is a uvarint member count followed by each member as a uvarint length and
@@ -69,7 +59,7 @@ func setEncode(members [][]byte) []byte {
 // setEncoding picks the reported encoding for a set. A set never downgrades, so
 // prev pins the floor: once listpack it cannot report intset again, and once
 // hashtable it stays hashtable.
-func setEncoding(members [][]byte, prev uint8) uint8 {
+func setEncoding(lim encLimits, members [][]byte, prev uint8) uint8 {
 	if prev == keyspace.EncHashtable {
 		return keyspace.EncHashtable
 	}
@@ -83,11 +73,11 @@ func setEncoding(members [][]byte, prev uint8) uint8 {
 			maxLen = len(m)
 		}
 	}
-	n := len(members)
-	if allInt && n <= setMaxIntsetEntries && prev != keyspace.EncListpack {
+	n := int64(len(members))
+	if allInt && n <= lim.setIntset && prev != keyspace.EncListpack {
 		return keyspace.EncIntset
 	}
-	if n <= setMaxListpackEntries && maxLen <= setMaxListpackValue {
+	if n <= lim.setEntries && int64(maxLen) <= lim.setValue {
 		return keyspace.EncListpack
 	}
 	return keyspace.EncHashtable

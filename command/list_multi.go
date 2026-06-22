@@ -105,7 +105,7 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 		if sameKey {
 			srcElems = pushEnd(srcElems, elem, toLeft)
 			return db.Set(src, listEncode(srcElems), keyspace.TypeList,
-				listEncoding(srcElems, srcHdr.Encoding), keepTTL(srcHdr, srcFound))
+				listEncoding(ctx.encLimits(), srcElems, srcHdr.Encoding), keepTTL(srcHdr, srcFound))
 		}
 
 		if len(srcElems) == 0 {
@@ -114,7 +114,7 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 				return err
 			}
 		} else if err := db.Set(src, listEncode(srcElems), keyspace.TypeList,
-			listEncoding(srcElems, srcHdr.Encoding), keepTTL(srcHdr, srcFound)); err != nil {
+			listEncoding(ctx.encLimits(), srcElems, srcHdr.Encoding), keepTTL(srcHdr, srcFound)); err != nil {
 			return err
 		}
 
@@ -128,7 +128,7 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 			dstPrev = dstHdr.Encoding
 		}
 		return db.Set(dst, listEncode(dstElems), keyspace.TypeList,
-			listEncoding(dstElems, dstPrev), keepTTL(dstHdr, dstFound))
+			listEncoding(ctx.encLimits(), dstElems, dstPrev), keepTTL(dstHdr, dstFound))
 	})
 	if !done {
 		return
@@ -420,7 +420,7 @@ func handleLMPop(ctx *Ctx) {
 				return err
 			}
 			return db.Set(key, listEncode(leftover), keyspace.TypeList,
-				listEncoding(leftover, hdr.Encoding), keepTTL(hdr, found))
+				listEncoding(ctx.encLimits(), leftover, hdr.Encoding), keepTTL(hdr, found))
 		}
 		return nil
 	})

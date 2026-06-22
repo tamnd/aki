@@ -557,7 +557,7 @@ func (ctx *Ctx) runRangeRemove(spec rangeSpec, event string) {
 			_, err := db.Delete(key)
 			return err
 		}
-		return db.Set(key, zsetEncode(kept), keyspace.TypeZSet, zsetEncoding(kept, hdr.Encoding), keepTTL(hdr, found))
+		return db.Set(key, zsetEncode(kept), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), kept, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -627,7 +627,7 @@ func handleZRangeStore(ctx *Ctx) {
 		stored := make([]zmember, len(result))
 		copy(stored, result)
 		zsetSort(stored)
-		return db.Set(dst, zsetEncode(stored), keyspace.TypeZSet, zsetEncoding(stored, keyspace.EncListpack), -1)
+		return db.Set(dst, zsetEncode(stored), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), stored, keyspace.EncListpack), -1)
 	})
 	if !done {
 		return

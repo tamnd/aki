@@ -314,7 +314,7 @@ func blockPop(ctx *Ctx, head bool) {
 					return err
 				}
 				return d.Set(key, listEncode(elems), keyspace.TypeList,
-					listEncoding(elems, hdr.Encoding), keepTTL(hdr, found))
+					listEncoding(ctx.encLimits(), elems, hdr.Encoding), keepTTL(hdr, found))
 			}
 			return nil
 		})
@@ -434,7 +434,7 @@ func blockMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool, timeout float64
 			if sameKey {
 				srcElems = pushEnd(srcElems, elem, toLeft)
 				return d.Set(src, listEncode(srcElems), keyspace.TypeList,
-					listEncoding(srcElems, srcHdr.Encoding), keepTTL(srcHdr, srcFound))
+					listEncoding(ctx.encLimits(), srcElems, srcHdr.Encoding), keepTTL(srcHdr, srcFound))
 			}
 
 			if len(srcElems) == 0 {
@@ -443,7 +443,7 @@ func blockMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool, timeout float64
 					return err
 				}
 			} else if err := d.Set(src, listEncode(srcElems), keyspace.TypeList,
-				listEncoding(srcElems, srcHdr.Encoding), keepTTL(srcHdr, srcFound)); err != nil {
+				listEncoding(ctx.encLimits(), srcElems, srcHdr.Encoding), keepTTL(srcHdr, srcFound)); err != nil {
 				return err
 			}
 
@@ -457,7 +457,7 @@ func blockMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool, timeout float64
 				dstPrev = dstHdr.Encoding
 			}
 			return d.Set(dst, listEncode(dstElems), keyspace.TypeList,
-				listEncoding(dstElems, dstPrev), keepTTL(dstHdr, dstFound))
+				listEncoding(ctx.encLimits(), dstElems, dstPrev), keepTTL(dstHdr, dstFound))
 		})
 		if !done {
 			return true
@@ -601,7 +601,7 @@ func handleBLMPop(ctx *Ctx) {
 					return err
 				}
 				return d.Set(key, listEncode(leftover), keyspace.TypeList,
-					listEncoding(leftover, hdr.Encoding), keepTTL(hdr, found))
+					listEncoding(ctx.encLimits(), leftover, hdr.Encoding), keepTTL(hdr, found))
 			}
 			return nil
 		})

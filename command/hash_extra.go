@@ -76,7 +76,7 @@ func handleHIncrBy(ctx *Ctx) {
 		if found {
 			prev = hdr.Encoding
 		}
-		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(fields, prev), keepTTL(hdr, found))
+		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(ctx.encLimits(), fields, prev), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -144,7 +144,7 @@ func handleHIncrByFloat(ctx *Ctx) {
 		if found {
 			prev = hdr.Encoding
 		}
-		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(fields, prev), keepTTL(hdr, found))
+		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(ctx.encLimits(), fields, prev), keepTTL(hdr, found))
 	})
 	if !done {
 		return

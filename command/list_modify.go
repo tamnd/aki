@@ -124,7 +124,7 @@ func handleLSet(ctx *Ctx) {
 			return nil
 		}
 		elems[i] = val
-		return db.Set(key, listEncode(elems), keyspace.TypeList, listEncoding(elems, hdr.Encoding), keepTTL(hdr, found))
+		return db.Set(key, listEncode(elems), keyspace.TypeList, listEncoding(ctx.encLimits(), elems, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -196,7 +196,7 @@ func handleLInsert(ctx *Ctx) {
 		}
 		elems = slices.Insert(elems, pos, val)
 		result = int64(len(elems))
-		return db.Set(key, listEncode(elems), keyspace.TypeList, listEncoding(elems, hdr.Encoding), keepTTL(hdr, found))
+		return db.Set(key, listEncode(elems), keyspace.TypeList, listEncoding(ctx.encLimits(), elems, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -252,7 +252,7 @@ func handleLRem(ctx *Ctx) {
 			_, err := db.Delete(key)
 			return err
 		}
-		return db.Set(key, listEncode(rest), keyspace.TypeList, listEncoding(rest, hdr.Encoding), keepTTL(hdr, found))
+		return db.Set(key, listEncode(rest), keyspace.TypeList, listEncoding(ctx.encLimits(), rest, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -362,7 +362,7 @@ func handleLTrim(ctx *Ctx) {
 			return nil
 		}
 		trimmed = true
-		return db.Set(key, listEncode(kept), keyspace.TypeList, listEncoding(kept, hdr.Encoding), keepTTL(hdr, found))
+		return db.Set(key, listEncode(kept), keyspace.TypeList, listEncoding(ctx.encLimits(), kept, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
 		return

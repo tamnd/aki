@@ -156,7 +156,7 @@ func handleHExpire(ctx *Ctx, hcmd, mode string) {
 		}
 		if changed {
 			emptied = len(hf) == 0
-			return storeHash(db, key, hf, hdr)
+			return storeHash(ctx.encLimits(), db, key, hf, hdr)
 		}
 		return nil
 	}) {
@@ -222,7 +222,7 @@ func handleHPersist(ctx *Ctx) {
 			}
 		}
 		if changed {
-			return storeHash(db, key, hf, hdr)
+			return storeHash(ctx.encLimits(), db, key, hf, hdr)
 		}
 		return nil
 	}) {
@@ -308,12 +308,12 @@ func handleHTTL(ctx *Ctx, mode string) {
 // storeHash persists a modified hash, deleting the key when no fields remain. It
 // keeps the key-level TTL and lets the encoding settle to listpackex or back to
 // listpack as field TTLs come and go.
-func storeHash(db *keyspace.DB, key []byte, fields []hashField, hdr keyspace.ValueHeader) error {
+func storeHash(lim encLimits, db *keyspace.DB, key []byte, fields []hashField, hdr keyspace.ValueHeader) error {
 	if len(fields) == 0 {
 		_, err := db.Delete(key)
 		return err
 	}
-	return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(fields, hdr.Encoding), keepTTL(hdr, true))
+	return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(lim, fields, hdr.Encoding), keepTTL(hdr, true))
 }
 
 // writeIntArray replies an array of integers.

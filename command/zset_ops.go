@@ -364,7 +364,7 @@ func zSetOpStore(ctx *Ctx, op zsetOp) {
 			_, err := db.Delete(dst)
 			return err
 		}
-		return db.Set(dst, zsetEncode(result), keyspace.TypeZSet, zsetEncoding(result, keyspace.EncListpack), -1)
+		return db.Set(dst, zsetEncode(result), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), result, keyspace.EncListpack), -1)
 	})
 	if !done {
 		return
@@ -578,7 +578,7 @@ func handleZMPop(ctx *Ctx) {
 				_, err := db.Delete(key)
 				return err
 			}
-			return db.Set(key, zsetEncode(kept), keyspace.TypeZSet, zsetEncoding(kept, hdr.Encoding), keepTTL(hdr, found))
+			return db.Set(key, zsetEncode(kept), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), kept, hdr.Encoding), keepTTL(hdr, found))
 		}
 		return nil
 	})

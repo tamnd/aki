@@ -87,7 +87,7 @@ func handleHSet(ctx *Ctx, asHMSet bool) {
 		if found {
 			prev = hdr.Encoding
 		}
-		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(fields, prev), keepTTL(hdr, found))
+		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(ctx.encLimits(), fields, prev), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -129,7 +129,7 @@ func handleHSetNX(ctx *Ctx) {
 		if found {
 			prev = hdr.Encoding
 		}
-		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(fields, prev), keepTTL(hdr, found))
+		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(ctx.encLimits(), fields, prev), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -306,7 +306,7 @@ func handleHDel(ctx *Ctx) {
 			_, err := db.Delete(key)
 			return err
 		}
-		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(fields, hdr.Encoding), keepTTL(hdr, found))
+		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(ctx.encLimits(), fields, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
 		return
