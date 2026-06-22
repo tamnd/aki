@@ -69,6 +69,7 @@ func infoSections() []infoSection {
 		{"Errorstats", true, infoErrorstats},
 		{"Cluster", true, infoCluster},
 		{"Keyspace", true, infoKeyspace},
+		{"go_runtime", false, infoGoRuntime},
 	}
 }
 
