@@ -183,6 +183,8 @@ func configDirectives() []*directive {
 		{name: "slowlog-log-slower-than", kind: dirInt, def: "10000", mutable: true},
 		{name: "slowlog-max-len", kind: dirInt, def: "128", mutable: true},
 		{name: "latency-monitor-threshold", kind: dirInt, def: "0", mutable: true},
+		{name: "latency-tracking", kind: dirBool, def: "yes", mutable: true},
+		{name: "latency-tracking-info-percentiles", kind: dirString, def: "50 99 99.9", mutable: true},
 		{name: "hz", kind: dirInt, def: "10", mutable: true},
 		{name: "activerehashing", kind: dirBool, def: "yes", mutable: true},
 		{name: "lazyfree-lazy-eviction", kind: dirBool, def: "no", mutable: true},
@@ -389,9 +391,10 @@ func handleConfigSet(ctx *Ctx) {
 	ctx.enc().WriteStatus("OK")
 }
 
-// handleConfigResetStat clears server statistics. aki keeps no command stats yet,
-// so this is an acknowledged no-op.
+// handleConfigResetStat clears the per-command call, latency, and error counters
+// behind the INFO commandstats, latencystats, and errorstats sections.
 func handleConfigResetStat(ctx *Ctx) {
+	ctx.d.statResetAll()
 	ctx.enc().WriteStatus("OK")
 }
 

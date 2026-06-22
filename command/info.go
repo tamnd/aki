@@ -7,8 +7,10 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -394,14 +396,98 @@ func infoCPU(_ *Ctx, b *strings.Builder) {
 	line(b, "used_cpu_user_children", "0.000000")
 }
 
-// infoCommandstats and infoLatencystats are header-only for now: aki does not
-// track per-command call counts or latency histograms yet.
-func infoCommandstats(_ *Ctx, _ *strings.Builder) {}
+// infoCommandstats writes one cmdstat line per command that has run, in name
+// order so the output is stable. usec_per_call is the mean execution time, zero
+// when a command has only ever been rejected.
+func infoCommandstats(ctx *Ctx, b *strings.Builder) {
+	for _, name := range ctx.d.statNames() {
+		cs := ctx.d.cmdStatFor(name)
+		calls := cs.calls.Load()
+		usec := cs.usec.Load()
+		perCall := 0.0
+		if calls > 0 {
+			perCall = float64(usec) / float64(calls)
+		}
+		line(b, "cmdstat_"+name, "calls="+strconv.FormatUint(calls, 10)+
+			",usec="+strconv.FormatUint(usec, 10)+
+			",usec_per_call="+fmtUsec(perCall)+
+			",rejected_calls="+strconv.FormatUint(cs.rejected.Load(), 10)+
+			",failed_calls="+strconv.FormatUint(cs.failed.Load(), 10))
+	}
+}
 
-func infoLatencystats(_ *Ctx, _ *strings.Builder) {}
+// infoLatencystats writes one latency_percentiles_usec line per command that has
+// run, but only when latency-tracking is on. The percentiles reported come from
+// latency-tracking-info-percentiles.
+func infoLatencystats(ctx *Ctx, b *strings.Builder) {
+	if !strings.EqualFold(ctx.confStr("latency-tracking", "yes"), "yes") {
+		return
+	}
+	pcts := parsePercentiles(ctx.confStr("latency-tracking-info-percentiles", "50 99 99.9"))
+	for _, name := range ctx.d.statNames() {
+		cs := ctx.d.cmdStatFor(name)
+		if cs.calls.Load() == 0 {
+			continue
+		}
+		var parts []string
+		for _, p := range pcts {
+			parts = append(parts, "p"+trimPct(p)+"="+fmtUsec(float64(cs.hist.percentile(p))))
+		}
+		line(b, "latency_percentiles_usec_"+name, strings.Join(parts, ","))
+	}
+}
 
-// infoErrorstats is header-only: aki does not track per-error counts yet.
-func infoErrorstats(_ *Ctx, _ *strings.Builder) {}
+// infoErrorstats writes one errorstat line per error code seen, in code order.
+func infoErrorstats(ctx *Ctx, b *strings.Builder) {
+	var codes []string
+	ctx.d.stats.errs.Range(func(k, _ any) bool {
+		codes = append(codes, k.(string))
+		return true
+	})
+	sort.Strings(codes)
+	for _, code := range codes {
+		v, ok := ctx.d.stats.errs.Load(code)
+		if !ok {
+			continue
+		}
+		line(b, "errorstat_"+code, "count="+strconv.FormatUint(v.(*atomic.Uint64).Load(), 10))
+	}
+}
+
+// statNames returns the recorded command names sorted, so commandstats and
+// latencystats emit in a stable order.
+func (d *Dispatcher) statNames() []string {
+	d.stats.mu.RLock()
+	names := make([]string, 0, len(d.stats.cmds))
+	for name := range d.stats.cmds {
+		names = append(names, name)
+	}
+	d.stats.mu.RUnlock()
+	sort.Strings(names)
+	return names
+}
+
+// parsePercentiles reads the space-separated percentile list from the
+// latency-tracking-info-percentiles config into floats, skipping junk.
+func parsePercentiles(s string) []float64 {
+	var out []float64
+	for _, f := range strings.Fields(s) {
+		if v, err := strconv.ParseFloat(f, 64); err == nil {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		out = []float64{50, 99, 99.9}
+	}
+	return out
+}
+
+// trimPct formats a percentile for the field label, dropping a trailing ".0" so
+// 50 stays "50" while 99.9 stays "99.9".
+func trimPct(p float64) string {
+	s := strconv.FormatFloat(p, 'f', -1, 64)
+	return s
+}
 
 func infoCluster(_ *Ctx, b *strings.Builder) {
 	line(b, "cluster_enabled", "0")
