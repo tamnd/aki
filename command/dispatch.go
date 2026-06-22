@@ -114,6 +114,10 @@ type Dispatcher struct {
 	// set once the server is accepting clients. The HTTP health endpoints read both.
 	loading atomic.Bool
 	ready   atomic.Bool
+
+	// shutdownFn is the callback SHUTDOWN fires to begin a graceful stop. The server
+	// command installs it; it is nil in tests and offline use.
+	shutdownFn func()
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -173,6 +177,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, debugCommands()...)
 	cmds = append(cmds, slowlogCommands()...)
 	cmds = append(cmds, latencyCommands()...)
+	cmds = append(cmds, shutdownCommands()...)
 	cmds = append(cmds, memoryCommands()...)
 	cmds = append(cmds, scriptCommands()...)
 	cmds = append(cmds, functionCommands()...)
