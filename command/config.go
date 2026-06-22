@@ -109,6 +109,7 @@ func configDirectives() []*directive {
 		{name: "syslog-facility", kind: dirString, def: "local0"},
 		{name: "crash-log-enabled", kind: dirBool, def: "yes", mutable: true},
 		{name: "crash-memlog-enabled", kind: dirBool, def: "yes", mutable: true},
+		{name: "shutdown-timeout", kind: dirInt, def: "10", mutable: true},
 		{name: "requirepass", kind: dirString, def: "", mutable: true},
 
 		// Metrics export.

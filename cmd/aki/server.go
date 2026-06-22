@@ -98,6 +98,17 @@ func cmdServer(args []string) error {
 	go func() { errc <- srv.ListenAndServe(cfg) }()
 	d.SetReady(true)
 
+	// The SHUTDOWN command signals on this channel. The handler has already run its
+	// save policy, so the main loop only has to stop the server and let the deferred
+	// cleanup close the data file.
+	shutdownC := make(chan struct{}, 1)
+	d.SetShutdown(func() {
+		select {
+		case shutdownC <- struct{}{}:
+		default:
+		}
+	})
+
 	fmt.Printf("aki %s listening on %s\n", Version, *addr)
 	if *unixSocket != "" {
 		fmt.Printf("aki also listening on unix:%s\n", *unixSocket)
@@ -112,6 +123,9 @@ func cmdServer(args []string) error {
 		select {
 		case err := <-errc:
 			return err
+		case <-shutdownC:
+			fmt.Println("\naki shutting down")
+			return srv.Close()
 		case s := <-sig:
 			if s == syscall.SIGHUP {
 				// logrotate renames the file then sends SIGHUP; reopen so aki
