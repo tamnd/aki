@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -13,6 +14,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/tamnd/aki/format"
 )
 
 // This file implements the server introspection commands from doc 20: INFO with
@@ -152,7 +155,38 @@ func infoServer(ctx *Ctx, b *strings.Builder) {
 	line(b, "config_file", "")
 	line(b, "io_threads_active", "1")
 	line(b, "aki_version", ctx.d.cfg.Version)
+	// Storage facts about the .aki file (doc 20 section 1.2). The format string is
+	// the header's format version rendered the way the magic carries it, fmt001.
+	// Page size comes from the open file, and the shard count from config.
+	line(b, "aki_storage_format", fmt.Sprintf("fmt%03d", format.FormatVersion))
+	if ctx.d.engine != nil {
+		lineInt(b, "aki_page_size", int64(ctx.d.engine.fileStats().PageSize))
+	} else {
+		lineInt(b, "aki_page_size", 0)
+	}
+	lineInt(b, "aki_shard_count", ctx.confInt("shards", 1))
+	line(b, "aki_file", akiFilePath(ctx))
+	// The WAL sidecar is not wired into the pager yet, so there is no WAL file to
+	// name. This stays empty until that lands, matching aki_wal_bytes.
+	line(b, "aki_wal_file", "")
+	lineInt(b, "aki_in_memory", boolToInt(ctx.d.confBool("in-memory", false)))
 	line(b, "aki_build_go_version", runtime.Version())
+}
+
+// akiFilePath returns the absolute path of the .aki file for INFO, or empty when
+// the server runs in memory with no file behind it.
+func akiFilePath(ctx *Ctx) string {
+	if ctx.d.engine == nil {
+		return ""
+	}
+	name := ctx.d.engine.filePath()
+	if name == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(name); err == nil {
+		return abs
+	}
+	return name
 }
 
 func infoClients(ctx *Ctx, b *strings.Builder) {
