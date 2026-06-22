@@ -183,7 +183,9 @@ func debugFlushAll(ctx *Ctx) {
 			if err != nil {
 				return err
 			}
-			db.Flush()
+			if err := db.Flush(); err != nil {
+				return err
+			}
 		}
 		return nil
 	}) {
