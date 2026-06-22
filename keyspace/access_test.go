@@ -64,6 +64,42 @@ func TestFreqSeedAndDecay(t *testing.T) {
 	}
 }
 
+// TestLFUDecayDisabled checks that lfu-decay-time 0, set through SetLFUParams,
+// turns decay off so the counter holds across a long idle stretch instead of
+// falling to zero. It also exercises the divide-by-zero guard.
+func TestLFUDecayDisabled(t *testing.T) {
+	ks, _, _ := newKS(t)
+	ks.SetLFUParams(10, 0)
+	db := mustDB(t, ks, 0)
+
+	clock := int64(60_000) // minute 1
+	old := nowMillis
+	nowMillis = func() int64 { return clock }
+	defer func() { nowMillis = old }()
+
+	if err := db.Set([]byte("k"), []byte("v"), TypeString, EncRaw, -1); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.Freq([]byte("k")); got != lfuInitVal {
+		t.Fatalf("fresh key freq = %d want %d", got, lfuInitVal)
+	}
+	// A long idle stretch that would decay the counter to zero under the default.
+	clock += int64(60_000) * (lfuInitVal + 10)
+	if got := db.Freq([]byte("k")); got != lfuInitVal {
+		t.Fatalf("freq with decay off = %d want %d", got, lfuInitVal)
+	}
+}
+
+// TestLFUParamsClamp checks SetLFUParams clamps negative inputs to zero so a bad
+// config value cannot make the counter math go wrong.
+func TestLFUParamsClamp(t *testing.T) {
+	ks, _, _ := newKS(t)
+	ks.SetLFUParams(-3, -7)
+	if ks.lfuLogFactor != 0 || ks.lfuDecayTime != 0 {
+		t.Fatalf("clamped params = %d / %d want 0 / 0", ks.lfuLogFactor, ks.lfuDecayTime)
+	}
+}
+
 // TestSampleMetrics checks that the eviction sample carries each key's access
 // time and frequency so the lru and lfu policies have something to sort on.
 func TestSampleMetrics(t *testing.T) {

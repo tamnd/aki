@@ -127,6 +127,14 @@ func (e *Engine) snapshotAll() (rdb.Snapshot, error) {
 	return SnapshotKeyspace(e.ks)
 }
 
+// setLFUParams pushes the lfu-log-factor and lfu-decay-time knobs down to the
+// keyspace, which the eviction sampler reads when it scores LFU candidates.
+func (e *Engine) setLFUParams(logFactor, decayTime int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ks.SetLFUParams(logFactor, decayTime)
+}
+
 // usedMemory returns the live-data estimate the maxmemory check compares against.
 func (e *Engine) usedMemory() int64 {
 	e.mu.Lock()

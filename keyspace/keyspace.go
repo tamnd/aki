@@ -72,6 +72,28 @@ type Keyspace struct {
 	// INFO reports as used_memory and the maxmemory eviction loop compares against
 	// the limit. Set and Delete keep it current.
 	dataBytes int64
+
+	// lfuLogFactor and lfuDecayTime back the lfu-log-factor and lfu-decay-time
+	// config knobs. Open seeds them with the Redis defaults; the command layer
+	// overrides them through SetLFUParams. lfuDecayTime in minutes, 0 disables
+	// decay.
+	lfuLogFactor int
+	lfuDecayTime int
+}
+
+// SetLFUParams sets the LFU counter tuning the eviction sampler uses, from the
+// lfu-log-factor and lfu-decay-time config knobs. A log factor below zero clamps
+// to zero, which makes the counter climb on every access. A decay time of zero or
+// below disables decay, so a counter never falls on its own.
+func (k *Keyspace) SetLFUParams(logFactor, decayTime int) {
+	if logFactor < 0 {
+		logFactor = 0
+	}
+	if decayTime < 0 {
+		decayTime = 0
+	}
+	k.lfuLogFactor = logFactor
+	k.lfuDecayTime = decayTime
 }
 
 // UsedMemory returns the live-data estimate in bytes, the value compared against
@@ -168,10 +190,12 @@ func Open(pgr *pager.Pager) (*Keyspace, error) {
 		dbCount = int(format.DefaultDBCount)
 	}
 	ks := &Keyspace{
-		pgr:     pgr,
-		dbs:     make([]*DB, dbCount),
-		catRoot: pgr.Meta().CatalogRoot,
-		sysRoot: normalizeRoot(pgr.Meta().SystemRoot),
+		pgr:          pgr,
+		dbs:          make([]*DB, dbCount),
+		catRoot:      pgr.Meta().CatalogRoot,
+		sysRoot:      normalizeRoot(pgr.Meta().SystemRoot),
+		lfuLogFactor: lfuLogFactor,
+		lfuDecayTime: lfuDecayTime,
 	}
 	for i := range ks.dbs {
 		ks.dbs[i] = &DB{ks: ks, index: i, rootPage: format.NullPage}
