@@ -26,6 +26,8 @@ func cmdServer(args []string) error {
 	databases := fs.Int("databases", 16, "number of logical databases")
 	requirePass := fs.String("requirepass", "", "password required for the default user")
 	aclFile := fs.String("aclfile", "", "path to an external ACL file loaded at startup and written by ACL SAVE")
+	logfile := fs.String("logfile", "", "path to the log file (empty logs to stderr)")
+	loglevel := fs.String("loglevel", "", "minimum log level: debug, verbose, notice, warning")
 	dbfile := fs.String("dbfile", "aki.db", "path to the .aki data file")
 	loadRDB := fs.String("load-rdb", "", "import this dump.rdb on first open (only when the .aki file does not exist)")
 	rdbDB := fs.Int("rdb-db", -1, "with --load-rdb, import only this source database")
@@ -65,6 +67,21 @@ func cmdServer(args []string) error {
 		UnixSocket: *unixSocket,
 		MaxClients: *maxClients,
 	}
+	if *logfile != "" {
+		if err := d.SetConfig("logfile", *logfile); err != nil {
+			return fmt.Errorf("set logfile: %w", err)
+		}
+	}
+	if *loglevel != "" {
+		if err := d.SetConfig("loglevel", *loglevel); err != nil {
+			return fmt.Errorf("set loglevel: %w", err)
+		}
+	}
+	if err := d.LogStart(); err != nil {
+		return fmt.Errorf("open log: %w", err)
+	}
+	defer d.LogClose()
+
 	srv := networking.New(cfg, d)
 	d.SetServer(srv)
 	d.StartBackground()
@@ -74,6 +91,8 @@ func cmdServer(args []string) error {
 		return fmt.Errorf("start metrics endpoint: %w", err)
 	}
 	defer d.StopMetrics()
+
+	d.LogNotice("Server started", "aki_version", Version, "addr", *addr)
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe(cfg) }()
@@ -87,13 +106,24 @@ func cmdServer(args []string) error {
 	}
 
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	select {
-	case err := <-errc:
-		return err
-	case <-sig:
-		fmt.Println("\naki shutting down")
-		return srv.Close()
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	for {
+		select {
+		case err := <-errc:
+			return err
+		case s := <-sig:
+			if s == syscall.SIGHUP {
+				// logrotate renames the file then sends SIGHUP; reopen so aki
+				// continues in the fresh file.
+				if err := d.ReopenLog(); err != nil {
+					fmt.Fprintf(os.Stderr, "aki: reopen log on SIGHUP: %v\n", err)
+				}
+				continue
+			}
+			fmt.Println("\naki shutting down")
+			d.LogNotice("Server shutting down")
+			return srv.Close()
+		}
 	}
 }
 

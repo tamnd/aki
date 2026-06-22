@@ -121,6 +121,7 @@ func (d *Dispatcher) replInit() {
 	d.repl.secondOffset = -1
 	d.repl.lastDB = -1
 	d.repl.role = "master"
+	d.roleMaster.Store(true)
 	d.repl.link = "connect"
 	d.repl.replicas = map[uint64]*replicaHandle{}
 }
@@ -366,6 +367,7 @@ func (d *Dispatcher) handleReplicaOf(ctx *Ctx) {
 	}
 	d.stopReplicaLocked()
 	d.repl.role = "slave"
+	d.roleMaster.Store(false)
 	d.repl.masterHost = host
 	d.repl.masterPort = port
 	d.repl.link = "connect"
@@ -392,6 +394,7 @@ func (d *Dispatcher) promoteToMaster() {
 		d.repl.replid = newRunID()
 	}
 	d.repl.role = "master"
+	d.roleMaster.Store(true)
 	d.repl.masterHost = ""
 	d.repl.masterPort = 0
 	d.repl.link = "connect"
