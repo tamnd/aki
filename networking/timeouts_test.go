@@ -67,3 +67,30 @@ func TestServerMaxBulkLenAccessor(t *testing.T) {
 		t.Fatalf("zero config MaxBulkLen = %d want %d", got, resp.DefaultMaxBulkLen)
 	}
 }
+
+// TestServerQueryBufLimitAccessor checks that New seeds the query buffer cap from
+// Config, the setter changes it live, and a negative value clears it, which is what
+// CONFIG SET client-query-buffer-limit relies on.
+func TestServerQueryBufLimitAccessor(t *testing.T) {
+	s := New(Config{QueryBufLimit: 4096}, nil)
+	if got := s.QueryBufLimit(); got != 4096 {
+		t.Fatalf("QueryBufLimit = %d want 4096", got)
+	}
+
+	s.SetQueryBufLimit(128)
+	if got := s.QueryBufLimit(); got != 128 {
+		t.Fatalf("QueryBufLimit after set = %d want 128", got)
+	}
+
+	// A negative value clears the limit.
+	s.SetQueryBufLimit(-1)
+	if got := s.QueryBufLimit(); got != 0 {
+		t.Fatalf("QueryBufLimit after set -1 = %d want 0", got)
+	}
+
+	// The zero Config leaves the limit off.
+	z := New(Config{}, nil)
+	if got := z.QueryBufLimit(); got != 0 {
+		t.Fatalf("zero config QueryBufLimit = %d want 0", got)
+	}
+}

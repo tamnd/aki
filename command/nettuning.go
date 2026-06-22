@@ -14,6 +14,20 @@ func (d *Dispatcher) ApplyNetworkConfig() {
 	d.applyIdleTimeout()
 	d.applyTCPKeepAlive()
 	d.applyMaxBulkLen()
+	d.applyQueryBufLimit()
+}
+
+// defQueryBufLimit is the Redis default for client-query-buffer-limit, 1 GB.
+const defQueryBufLimit = 1 << 30
+
+// applyQueryBufLimit sets the per-connection query buffer cap. It takes effect on
+// the next read on each connection, so CONFIG SET client-query-buffer-limit
+// applies without a restart.
+func (d *Dispatcher) applyQueryBufLimit() {
+	if d.srv == nil {
+		return
+	}
+	d.srv.SetQueryBufLimit(d.confInt("client-query-buffer-limit", defQueryBufLimit))
 }
 
 // applyMaxBulkLen sets the largest single bulk argument the parser accepts. It
