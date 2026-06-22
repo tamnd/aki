@@ -59,6 +59,8 @@ type Keyspace struct {
 	pgr     *pager.Pager
 	dbs     []*DB
 	catRoot uint32 // catalog page number, NullPage until first persisted
+	sysRoot uint32 // system table B-tree root, NullPage until first SystemPut
+	sysTree *btree.Tree
 	version uint64 // monotonic write version assigned to each write
 
 	// expiredLog collects keys deleted by lazy expiry since the last drain. The
@@ -169,6 +171,7 @@ func Open(pgr *pager.Pager) (*Keyspace, error) {
 		pgr:     pgr,
 		dbs:     make([]*DB, dbCount),
 		catRoot: pgr.Meta().CatalogRoot,
+		sysRoot: normalizeRoot(pgr.Meta().SystemRoot),
 	}
 	for i := range ks.dbs {
 		ks.dbs[i] = &DB{ks: ks, index: i, rootPage: format.NullPage}
@@ -535,6 +538,8 @@ func (ks *Keyspace) Commit() error {
 	if err := ks.pgr.Commit(pager.CommitInfo{
 		CatalogRoot:    ks.catRoot,
 		SetCatalogRoot: true,
+		SystemRoot:     ks.sysRoot,
+		SetSystemRoot:  true,
 	}); err != nil {
 		return err
 	}
