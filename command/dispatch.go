@@ -92,6 +92,13 @@ type Dispatcher struct {
 	// stats holds the per-command call, time, and error counters behind the INFO
 	// commandstats, latencystats, and errorstats sections and CONFIG RESETSTAT.
 	stats statsState
+
+	// slowlog holds the ring of recent slow commands behind the SLOWLOG command.
+	slowlog slowlogState
+
+	// latency holds the per-event latency spike histories behind the LATENCY
+	// command. It is separate from the per-command histograms in stats.
+	latency latencyState
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -181,6 +188,7 @@ func New(cfg Config) *Dispatcher {
 	d.clusterInit()
 	d.trackingInit()
 	d.statsInit()
+	d.latencyInit()
 	if cfg.AclFile != "" {
 		// A missing or unreadable file at startup is not fatal: the in-memory
 		// default user stays in place until ACL LOAD or ACL SAVE is run.

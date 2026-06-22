@@ -168,6 +168,13 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 		}
 	}
 	d.statCall(cmd, usec, failed)
+	// The slow log and the latency monitor both feed off the same measured cost.
+	// The slow log records the command verbatim when it crosses its microsecond
+	// threshold; the latency monitor records a "command" spike when it crosses its
+	// millisecond threshold.
+	usecI := int64(usec)
+	d.slowlogMaybeAdd(ctx.Conn, ctx.Argv, usecI)
+	d.latencyAddSample(latencyEventFor(cmd), usecI/1000)
 	dirtied := d.persist.dirtyCount() > before
 	if propagate && dirtied {
 		args := rewriteForAOF(cmd.Name, ctx.Argv)
