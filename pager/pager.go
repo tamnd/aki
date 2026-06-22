@@ -171,6 +171,10 @@ func cacheCap(n int) int {
 // PageSize returns the file's page size.
 func (p *Pager) PageSize() uint32 { return p.pageSize }
 
+// Name returns the file path this pager was opened with. It is empty for an
+// in-memory backing.
+func (p *Pager) Name() string { return p.name }
+
 // PageCount returns the current total page count.
 func (p *Pager) PageCount() uint32 {
 	p.mu.Lock()
