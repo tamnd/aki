@@ -111,7 +111,7 @@ func checkAki(name string, fix, verbose bool, w io.Writer) int {
 		return res.code
 	}
 
-	var entries, live, expires, badHeaders, orderErrors, stale, future, dbsWithKeys int
+	var entries, live, expires, badHeaders, orderErrors, stale, future, dbsWithKeys, structErrs int
 	for _, c := range checks {
 		entries += c.Entries
 		live += c.Live
@@ -123,6 +123,14 @@ func checkAki(name string, fix, verbose bool, w io.Writer) int {
 		if c.Live > 0 {
 			dbsWithKeys++
 		}
+		if c.StructErr != nil {
+			structErrs++
+			res.err("db%d B-tree structure: %v", c.Index, c.StructErr)
+		}
+	}
+
+	if structErrs == 0 {
+		res.ok("B-tree structure (%d databases)", len(checks))
 	}
 
 	if orderErrors > 0 {

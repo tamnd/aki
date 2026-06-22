@@ -107,6 +107,14 @@ func (t *Tree) Get(key []byte) ([]byte, bool, error) {
 // Put inserts or replaces the value stored under key. It may split pages and
 // grow the tree, in which case Root changes.
 func (t *Tree) Put(key, val []byte) error {
+	if err := t.put(key, val); err != nil {
+		return err
+	}
+	assertInvariants(t)
+	return nil
+}
+
+func (t *Tree) put(key, val []byte) error {
 	sp, err := t.insert(t.root, key, val)
 	if err != nil {
 		return err
@@ -190,7 +198,12 @@ func (t *Tree) writeOrSplit(pgno uint32, n *node) (*splitResult, error) {
 // Delete removes key and reports whether it was present. Underfull pages are
 // left in place; the tree shrinks in page count only on a full rewrite.
 func (t *Tree) Delete(key []byte) (bool, error) {
-	return t.del(t.root, key)
+	removed, err := t.del(t.root, key)
+	if err != nil {
+		return removed, err
+	}
+	assertInvariants(t)
+	return removed, nil
 }
 
 func (t *Tree) del(pgno uint32, key []byte) (bool, error) {
