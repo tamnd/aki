@@ -99,6 +99,10 @@ type Dispatcher struct {
 	// latency holds the per-event latency spike histories behind the LATENCY
 	// command. It is separate from the per-command histograms in stats.
 	latency latencyState
+
+	// metrics holds the running Prometheus endpoint, started when metrics-port is
+	// set and shut down on server stop.
+	metrics metricsServer
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and

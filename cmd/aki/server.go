@@ -70,12 +70,20 @@ func cmdServer(args []string) error {
 	d.StartBackground()
 	defer d.StopBackground()
 
+	if err := d.StartMetrics(); err != nil {
+		return fmt.Errorf("start metrics endpoint: %w", err)
+	}
+	defer d.StopMetrics()
+
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe(cfg) }()
 
 	fmt.Printf("aki %s listening on %s\n", Version, *addr)
 	if *unixSocket != "" {
 		fmt.Printf("aki also listening on unix:%s\n", *unixSocket)
+	}
+	if maddr := d.MetricsAddr(); maddr != "" {
+		fmt.Printf("aki metrics on http://%s/metrics\n", maddr)
 	}
 
 	sig := make(chan os.Signal, 1)
