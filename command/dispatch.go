@@ -77,6 +77,11 @@ type Dispatcher struct {
 	// repl holds the replication state: the master-side backlog and replica list,
 	// and the replica-side link to a master.
 	repl replState
+
+	// cluster holds the cluster topology: this node's id, epoch, and the slots it
+	// owns. aki runs single-node by default, so this stays mostly empty unless
+	// cluster-enabled is on and slots are assigned.
+	cluster clusterState
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -140,6 +145,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, scriptCommands()...)
 	cmds = append(cmds, functionCommands()...)
 	cmds = append(cmds, replicationCommands()...)
+	cmds = append(cmds, clusterCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	conf := newConfigStore()
 	conf.set("databases", strconv.Itoa(cfg.Databases))
@@ -161,6 +167,7 @@ func New(cfg Config) *Dispatcher {
 	}
 	d.activeExpire.Store(true)
 	d.replInit()
+	d.clusterInit()
 	if cfg.AclFile != "" {
 		// A missing or unreadable file at startup is not fatal: the in-memory
 		// default user stays in place until ACL LOAD or ACL SAVE is run.
