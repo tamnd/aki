@@ -598,6 +598,11 @@ func handleConfigSet(ctx *Ctx) {
 				ctx.enc().WriteError("ERR Changing directory: " + err.Error())
 				return
 			}
+		case "acllog-max-len":
+			// Resize the ACL denial log right away, trimming if it shrank.
+			if n, ok := parseInteger([]byte(c.val)); ok && ctx.d.acl != nil {
+				ctx.d.acl.setLogMax(int(n))
+			}
 		}
 	}
 	ctx.enc().WriteStatus("OK")

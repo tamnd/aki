@@ -197,6 +197,21 @@ func newACLRegistry(requirePass string) *aclRegistry {
 	}
 }
 
+// setLogMax updates the denial-log cap and trims the log to it at once. A cap of
+// zero or less disables the log, matching the acllog-max-len directive.
+func (a *aclRegistry) setLogMax(n int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.logMax = n
+	if n <= 0 {
+		a.log = nil
+		return
+	}
+	if len(a.log) > n {
+		a.log = a.log[:n]
+	}
+}
+
 // get returns the user with the given name, or nil.
 func (a *aclRegistry) get(name string) *aclUser {
 	a.mu.RLock()
