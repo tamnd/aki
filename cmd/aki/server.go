@@ -97,6 +97,10 @@ func cmdServer(args []string) error {
 	}
 	defer d.LogClose()
 
+	// Apply the Go GC knobs before serving so go-gogc and go-memlimit take hold
+	// from the first request.
+	d.ApplyGCTuning()
+
 	srv := networking.New(cfg, d)
 	d.SetServer(srv)
 	d.StartBackground()
