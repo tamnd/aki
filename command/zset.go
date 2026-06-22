@@ -173,6 +173,9 @@ parsed:
 			ctx.notify(notifyZset, "zadd", ctx.Argv[1])
 		}
 	}
+	if added > 0 {
+		ctx.signalReady(ctx.Argv[1])
+	}
 	if incr {
 		if incrBlocked {
 			ctx.enc().WriteNull()
@@ -242,6 +245,7 @@ func handleZIncrBy(ctx *Ctx) {
 		return
 	}
 	ctx.notify(notifyZset, "zincr", ctx.Argv[1])
+	ctx.signalReady(ctx.Argv[1])
 	ctx.enc().WriteDouble(result)
 }
 
