@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,15 @@ type HandlerFunc func(c *Conn, argv [][]byte)
 
 // Handle calls f(c, argv).
 func (f HandlerFunc) Handle(c *Conn, argv [][]byte) { f(c, argv) }
+
+// PanicHandler is an optional capability a Handler can implement to turn a panic
+// in a command goroutine into a crash report. The serve loop recovers a panic,
+// calls OnPanic with the cause and the goroutine stack, and the handler is
+// expected to write the report and stop the process. If the handler is missing
+// or returns, the serve loop re-panics so the crash stays fatal.
+type PanicHandler interface {
+	OnPanic(cause any, stack []byte)
+}
 
 // readChunk is the size of a single socket read appended to the query buffer.
 const readChunk = 16 * 1024
@@ -225,6 +235,16 @@ func (c *Conn) CloseASAP() {
 func (c *Conn) serve() {
 	defer c.server.removeConn(c)
 	defer func() { _ = c.raw.Close() }()
+	defer func() {
+		if r := recover(); r != nil {
+			if ph, ok := c.server.handler.(PanicHandler); ok {
+				ph.OnPanic(r, debug.Stack())
+			}
+			// No handler took over, or it returned without exiting. A panic
+			// means inconsistent state, so keep the crash fatal.
+			panic(r)
+		}
+	}()
 
 	for {
 		if c.drain() {

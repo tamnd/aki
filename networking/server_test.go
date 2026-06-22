@@ -3,7 +3,9 @@ package networking
 import (
 	"bufio"
 	"net"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -273,4 +275,67 @@ func readLineFrom(t *testing.T, r *bufio.Reader) string {
 		t.Fatalf("read line: %v", err)
 	}
 	return strings.TrimRight(line, "\r\n")
+}
+
+// panicHandler is a Handler that panics on a BOOM command and implements
+// PanicHandler so the serve loop reports the crash. OnPanic records the cause
+// and then ends the goroutine with runtime.Goexit, standing in for the real
+// handler which exits the process and never returns.
+type panicHandler struct {
+	got  chan any
+	once sync.Once
+}
+
+func (h *panicHandler) Handle(c *Conn, argv [][]byte) {
+	if strings.EqualFold(string(argv[0]), "BOOM") {
+		panic("kaboom")
+	}
+	c.WriteRaw(resp.ReplyPong)
+}
+
+func (h *panicHandler) OnPanic(cause any, stack []byte) {
+	h.once.Do(func() { h.got <- cause })
+	// Mimic the production handler, which exits the process and never returns,
+	// so the serve loop does not re-panic and crash the test binary.
+	runtime.Goexit()
+}
+
+// TestServePanicHookFires checks that a panic in a command handler routes
+// through the PanicHandler with the cause and a non-empty stack.
+func TestServePanicHookFires(t *testing.T) {
+	h := &panicHandler{got: make(chan any, 1)}
+	srv := New(Config{Addr: "127.0.0.1:0"}, h)
+	ready := make(chan struct{})
+	go func() {
+		close(ready)
+		_ = srv.ListenAndServe(Config{Addr: "127.0.0.1:0"})
+	}()
+	<-ready
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.Addr() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("server did not bind in time")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("*1\r\n$4\r\nBOOM\r\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case cause := <-h.got:
+		if cause != "kaboom" {
+			t.Fatalf("OnPanic cause = %v want kaboom", cause)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("panic hook did not fire")
+	}
 }
