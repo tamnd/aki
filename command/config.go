@@ -101,7 +101,14 @@ func configDirectives() []*directive {
 		{name: "databases", kind: dirInt, def: "16"},
 		{name: "loglevel", kind: dirEnum, def: "notice", mutable: true,
 			enum: []string{"nothing", "warning", "notice", "verbose", "debug"}},
-		{name: "logfile", kind: dirString, def: ""},
+		{name: "logfile", kind: dirString, def: "", mutable: true},
+		{name: "log-format", kind: dirEnum, def: "redis", mutable: true,
+			enum: []string{"redis", "json"}},
+		{name: "syslog-enabled", kind: dirBool, def: "no"},
+		{name: "syslog-ident", kind: dirString, def: "aki"},
+		{name: "syslog-facility", kind: dirString, def: "local0"},
+		{name: "crash-log-enabled", kind: dirBool, def: "yes", mutable: true},
+		{name: "crash-memlog-enabled", kind: dirBool, def: "yes", mutable: true},
 		{name: "requirepass", kind: dirString, def: "", mutable: true},
 
 		// Metrics export.
@@ -387,9 +394,18 @@ func handleConfigSet(ctx *Ctx) {
 	// The notification write path reads the flags atomically, so mirror any change
 	// to notify-keyspace-events into the dispatcher's atomic copy.
 	for _, c := range changes {
-		if c.name == "notify-keyspace-events" {
+		switch c.name {
+		case "notify-keyspace-events":
 			if flags, ok := parseNotifyFlags(c.val); ok {
 				atomic.StoreUint32(&ctx.d.notifyFlags, flags)
+			}
+		case "loglevel", "log-format":
+			ctx.d.logApplyConfig()
+		case "logfile":
+			// Reopen so the change takes effect at once, the same as Redis.
+			if err := ctx.d.logReopen(); err != nil {
+				ctx.enc().WriteError("ERR Changing directory: " + err.Error())
+				return
 			}
 		}
 	}

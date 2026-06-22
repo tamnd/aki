@@ -103,6 +103,12 @@ type Dispatcher struct {
 	// metrics holds the running Prometheus endpoint, started when metrics-port is
 	// set and shut down on server stop.
 	metrics metricsServer
+
+	// log holds the structured logging state: the stream sink, the optional syslog
+	// sink, and the cached level and format. roleMaster mirrors the replication role
+	// so a log line can stamp M or S without taking repl.mu.
+	log        logger
+	roleMaster atomic.Bool
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -193,6 +199,7 @@ func New(cfg Config) *Dispatcher {
 	d.trackingInit()
 	d.statsInit()
 	d.latencyInit()
+	d.logInit()
 	if cfg.AclFile != "" {
 		// A missing or unreadable file at startup is not fatal: the in-memory
 		// default user stays in place until ACL LOAD or ACL SAVE is run.
