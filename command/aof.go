@@ -155,7 +155,7 @@ func (d *Dispatcher) rewriteAOF() error {
 		return nil
 	}
 
-	snap, err := d.engine.snapshotAll()
+	snap, err := d.snapshotForRDB()
 	if err != nil {
 		d.finishRewrite(false, start)
 		return err
@@ -189,20 +189,8 @@ func (d *Dispatcher) rewriteAOF() error {
 		return ferr
 	}
 
-	// The base RDB carries the keyspace but not the function libraries, so replay
-	// them into the head of the fresh incr file as FUNCTION LOAD REPLACE. A reload
-	// reads the base first and then this preamble, which restores every library.
-	var incrInit int64
-	if buf := functionPreamble(d.functions.librarySources()); len(buf) > 0 {
-		n, werr := incrFile.Write(buf)
-		if werr != nil {
-			_ = incrFile.Close()
-			d.finishRewrite(false, start)
-			return werr
-		}
-		incrInit = int64(n)
-	}
-
+	// The base RDB carries the function libraries in its FUNCTION2 records, so the
+	// fresh incr file starts empty. Later FUNCTION writes stream into it on their own.
 	if merr := d.writeManifest(dir, baseName, incrName, newSeq); merr != nil {
 		_ = incrFile.Close()
 		d.finishRewrite(false, start)
@@ -213,7 +201,7 @@ func (d *Dispatcher) rewriteAOF() error {
 	d.aof.mu.Lock()
 	d.aof.seq = newSeq
 	d.aof.baseSize = baseSize
-	d.aof.incrSize = incrInit
+	d.aof.incrSize = 0
 	d.aof.incrPath = incrPath
 	d.aof.incrFile = incrFile
 	d.aof.lastSelectedDB = -1
@@ -313,19 +301,6 @@ func appendRESPCommand(b []byte, argv [][]byte) []byte {
 		b = append(b, '\r', '\n')
 	}
 	return b
-}
-
-// functionPreamble encodes one FUNCTION LOAD REPLACE command per library source,
-// the block the AOF rewrite writes ahead of the live command stream so a reload
-// restores the function libraries.
-func functionPreamble(sources []string) []byte {
-	var buf []byte
-	for _, src := range sources {
-		buf = appendRESPCommand(buf, [][]byte{
-			[]byte("FUNCTION"), []byte("LOAD"), []byte("REPLACE"), []byte(src),
-		})
-	}
-	return buf
 }
 
 // rewriteForAOF returns the command to write to the AOF for a given write

@@ -27,26 +27,28 @@ func TestAOFFunctionLoadPropagates(t *testing.T) {
 	}
 }
 
-// TestAOFFunctionRewritePreamble checks a rewrite folds the loaded libraries into
-// the head of the fresh incr file so a reload restores them. The reload clears the
-// in-memory registry first, so the function only comes back if the preamble is
-// present.
-func TestAOFFunctionRewritePreamble(t *testing.T) {
+// TestAOFFunctionRewriteBaseRDB checks a rewrite folds the loaded libraries into
+// the base RDB as FUNCTION2 records, so a reload restores them even though the
+// fresh incr file is empty. The reload clears the in-memory registry first, so the
+// function only comes back if the base carried it.
+func TestAOFFunctionRewriteBaseRDB(t *testing.T) {
 	r, c := startData(t)
 	dir := enableAOF(t, r, c)
 
 	if got := sendArgs(t, r, c, "FUNCTION", "LOAD", libGetSet); got != "mylib" {
 		t.Fatalf("FUNCTION LOAD = %v", got)
 	}
-	// The rewrite must capture the library even though it was loaded before the
-	// rewrite ran and the base RDB carries no functions.
+	// The rewrite must capture the library into the base even though it was loaded
+	// before the rewrite ran.
 	if got := sendLine(t, r, c, "BGREWRITEAOF"); got != "+Background append only file rewriting started" {
 		t.Fatalf("BGREWRITEAOF = %q", got)
 	}
 
+	// The fresh incr file is empty: the function lives in the base RDB now, not in a
+	// command preamble.
 	incr := readIncrFile(t, filepath.Join(dir, "appendonlydir"))
-	if !strings.Contains(incr, "FUNCTION") || !strings.Contains(incr, "REPLACE") {
-		t.Fatalf("rewrite preamble missing FUNCTION LOAD REPLACE: %q", incr)
+	if strings.Contains(incr, "FUNCTION") {
+		t.Fatalf("incr should not carry a FUNCTION preamble: %q", incr)
 	}
 
 	if got := sendLine(t, r, c, "DEBUG LOADAOF"); got != "+OK" {
@@ -60,6 +62,36 @@ func TestAOFFunctionRewritePreamble(t *testing.T) {
 	if got := sendArgs(t, r, c, "FCALL", "myget", "1", "k"); got != "hello" {
 		t.Fatalf("FCALL myget after reload = %v", got)
 	}
+}
+
+// TestReplicaFullSyncCarriesFunctions checks a replica that attaches AFTER the
+// master loaded a function gets it through the full sync RDB, not just over the
+// live command stream. The function comes in the snapshot's FUNCTION2 records.
+func TestReplicaFullSyncCarriesFunctions(t *testing.T) {
+	mr, mc, mHost, mPort := startDataAddr(t)
+	rr, rc, _, _ := startDataAddr(t)
+
+	// Load the function on the master first, then attach the replica. A full sync
+	// has to carry the function for the replica to call it.
+	if got := sendArgs(t, mr, mc, "FUNCTION", "LOAD", libGetSet); got != "mylib" {
+		t.Fatalf("master FUNCTION LOAD = %v", got)
+	}
+	if got := sendLine(t, rr, rc, "REPLICAOF "+mHost+" "+mPort); got != "+OK" {
+		t.Fatalf("REPLICAOF = %q", got)
+	}
+
+	// The replica reports the library through FUNCTION LIST once the full sync RDB
+	// has been applied and its functions registered.
+	deadline := time.Now().Add(3 * time.Second)
+	var last any
+	for time.Now().Before(deadline) {
+		last = sendArgs(t, rr, rc, "FUNCTION", "LIST")
+		if arr, ok := last.([]any); ok && len(arr) == 1 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("replica FUNCTION LIST = %v want one library", last)
 }
 
 // TestReplicationStreamsFunctionLoad checks a FUNCTION LOAD on the master reaches

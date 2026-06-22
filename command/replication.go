@@ -235,7 +235,7 @@ func (d *Dispatcher) tryPartialResync(ctx *Ctx, reqReplid string, reqOff int64) 
 // fullResync sends a full snapshot: +FULLRESYNC (for PSYNC), the RDB payload, and
 // registers the connection so later writes stream to it.
 func (d *Dispatcher) fullResync(ctx *Ctx, psync bool) {
-	snap, err := d.engine.snapshotAll()
+	snap, err := d.snapshotForRDB()
 	if err != nil {
 		ctx.enc().WriteError("ERR Failed to produce snapshot for SYNC")
 		return
@@ -613,10 +613,20 @@ func (d *Dispatcher) replLoadRDB(br *bufio.Reader) error {
 	if err := d.flushAllDatabases(); err != nil {
 		return err
 	}
-	return d.engine.updateKeyspace(func(ks *keyspace.Keyspace) error {
+	if err := d.engine.updateKeyspace(func(ks *keyspace.Keyspace) error {
 		_, lerr := LoadSnapshot(ks, snap, -1, true)
 		return lerr
-	})
+	}); err != nil {
+		return err
+	}
+	// The master's snapshot carries its function libraries in FUNCTION2 records.
+	// Replace whatever this replica had so the two nodes agree on the functions.
+	d.functions.mu.Lock()
+	d.functions.libs = map[string]*funcLib{}
+	d.functions.fnIndex = map[string]string{}
+	d.functions.mu.Unlock()
+	d.loadFunctionLibraries(snap.Functions)
+	return nil
 }
 
 // replApplyLoop reads the command stream from the master, applies each command,
