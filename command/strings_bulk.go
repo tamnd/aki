@@ -5,10 +5,16 @@ import (
 	"github.com/tamnd/aki/resp"
 )
 
-// protoMaxBulkLen is the largest string value aki stores, matching Redis's
-// default proto-max-bulk-len of 512 MiB. APPEND and SETRANGE refuse to grow a
-// value past it.
-const protoMaxBulkLen = 512 << 20
+// defProtoMaxBulkLen is the default largest string value aki stores, matching
+// Redis's default proto-max-bulk-len of 512 MiB.
+const defProtoMaxBulkLen = 512 << 20
+
+// protoMaxBulkLen returns the current proto-max-bulk-len, the size cap APPEND,
+// SETRANGE, SETBIT, and BITFIELD enforce when growing a value. It tracks the
+// config directive so CONFIG SET proto-max-bulk-len changes it without a restart.
+func (d *Dispatcher) protoMaxBulkLen() int64 {
+	return d.confInt("proto-max-bulk-len", defProtoMaxBulkLen)
+}
 
 // handleMSet implements MSET key value [key value ...]: set every pair, always
 // returning OK. It needs an even number of key/value arguments; an odd count is
@@ -124,7 +130,7 @@ func handleAppend(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		if len(old)+len(val) > protoMaxBulkLen {
+		if int64(len(old)+len(val)) > ctx.d.protoMaxBulkLen() {
 			tooBig = true
 			return nil
 		}
@@ -189,7 +195,7 @@ func handleSetRange(ctx *Ctx) {
 		ctx.enc().WriteError("ERR offset is not an integer or out of range")
 		return
 	}
-	if offset+int64(len(val)) > protoMaxBulkLen {
+	if offset+int64(len(val)) > ctx.d.protoMaxBulkLen() {
 		ctx.enc().WriteError("ERR string exceeds maximum allowed size (proto-max-bulk-len)")
 		return
 	}

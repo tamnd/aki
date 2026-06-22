@@ -42,7 +42,7 @@ func bitfieldCommands() []*CmdDesc {
 // INCRBY sub-commands, with OVERFLOW directives that affect the SET and INCRBY
 // that follow them.
 func handleBitField(ctx *Ctx) {
-	ops, errMsg := parseBitfield(ctx.Argv[2:], false)
+	ops, errMsg := parseBitfield(ctx.Argv[2:], false, ctx.d.protoMaxBulkLen())
 	if errMsg != "" {
 		ctx.enc().WriteError(errMsg)
 		return
@@ -52,7 +52,7 @@ func handleBitField(ctx *Ctx) {
 
 // handleBitFieldRO implements BITFIELD_RO, which only accepts GET sub-commands.
 func handleBitFieldRO(ctx *Ctx) {
-	ops, errMsg := parseBitfield(ctx.Argv[2:], true)
+	ops, errMsg := parseBitfield(ctx.Argv[2:], true, ctx.d.protoMaxBulkLen())
 	if errMsg != "" {
 		ctx.enc().WriteError(errMsg)
 		return
@@ -74,7 +74,7 @@ func hasWrite(ops []bitfieldOp) bool {
 // parseBitfield turns the argument vector after the key into a list of ops. When
 // readOnly is set, any sub-command other than GET is rejected. It returns a
 // non-empty error string on a malformed command.
-func parseBitfield(args [][]byte, readOnly bool) ([]bitfieldOp, string) {
+func parseBitfield(args [][]byte, readOnly bool, maxBulk int64) ([]bitfieldOp, string) {
 	var ops []bitfieldOp
 	ovMode := byte('w')
 	i := 0
@@ -89,7 +89,7 @@ func parseBitfield(args [][]byte, readOnly bool) ([]bitfieldOp, string) {
 			if !ok {
 				return nil, bitfieldTypeError
 			}
-			offset, ok := parseBitfieldOffset(args[i+2], bits)
+			offset, ok := parseBitfieldOffset(args[i+2], bits, maxBulk)
 			if !ok {
 				return nil, bitOffsetError
 			}
@@ -106,7 +106,7 @@ func parseBitfield(args [][]byte, readOnly bool) ([]bitfieldOp, string) {
 			if !ok {
 				return nil, bitfieldTypeError
 			}
-			offset, ok := parseBitfieldOffset(args[i+2], bits)
+			offset, ok := parseBitfieldOffset(args[i+2], bits, maxBulk)
 			if !ok {
 				return nil, bitOffsetError
 			}
@@ -261,7 +261,7 @@ func parseBitfieldType(arg []byte) (signed bool, bits int, ok bool) {
 // parseBitfieldOffset reads an offset specifier. A leading # multiplies by the
 // type width for array-like access; a bare integer is an exact bit offset. The
 // offset must be non-negative and keep the field within the string size limit.
-func parseBitfieldOffset(arg []byte, width int) (int64, bool) {
+func parseBitfieldOffset(arg []byte, width int, maxBulk int64) (int64, bool) {
 	mult := false
 	body := arg
 	if len(arg) > 0 && arg[0] == '#' {
@@ -276,7 +276,7 @@ func parseBitfieldOffset(arg []byte, width int) (int64, bool) {
 		n *= int64(width)
 	}
 	need := (n + int64(width) + 7) / 8
-	if need > protoMaxBulkLen {
+	if need > maxBulk {
 		return 0, false
 	}
 	return n, true
