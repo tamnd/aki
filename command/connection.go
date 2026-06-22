@@ -126,6 +126,8 @@ func handleReset(ctx *Ctx) {
 	}
 	ctx.sess.cachingYes = false
 	ctx.sess.cachingNo = false
+	ctx.sess.asking = false
+	ctx.sess.clusterReadonly = false
 	ctx.Conn.WriteRaw(resp.ReplyReset)
 }
 
