@@ -114,7 +114,7 @@ func TestDebugSetActiveExpireDisables(t *testing.T) {
 // touching it.
 func TestStartBackgroundExpiresKeys(t *testing.T) {
 	r1, c1, _, _, d := startActiveExpiry(t)
-	d.hz = 100
+	d.conf.set("hz", "100")
 	d.StartBackground()
 	t.Cleanup(d.StopBackground)
 	if got := sendLine(t, r1, c1, "SET k v PX 1"); got != "+OK" {
