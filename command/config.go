@@ -628,6 +628,9 @@ func handleConfigSet(ctx *Ctx) {
 			// Re-tune the Go GC so the new percentage or memory limit takes hold
 			// without a restart.
 			ctx.d.ApplyGCTuning()
+		case "lfu-log-factor", "lfu-decay-time":
+			// Push the new LFU tuning to the keyspace so the eviction counter uses it.
+			ctx.d.applyLFUConfig()
 		case "timeout":
 			// Push the new idle timeout to the server so it applies on the next read.
 			ctx.d.applyIdleTimeout()

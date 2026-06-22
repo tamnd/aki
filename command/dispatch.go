@@ -243,6 +243,7 @@ func New(cfg Config) *Dispatcher {
 	}
 	if d.engine != nil {
 		d.engine.onCommit = d.recordIOLatency
+		d.applyLFUConfig()
 	}
 	d.activeExpire.Store(true)
 	d.blockingInit()

@@ -29,6 +29,16 @@ func (d *Dispatcher) evictionRounds() int {
 	return 1 + int(tenacity)
 }
 
+// applyLFUConfig pushes lfu-log-factor and lfu-decay-time to the keyspace so the
+// LFU eviction counter uses the configured tuning. The server command calls it at
+// startup and CONFIG SET calls it when either knob changes.
+func (d *Dispatcher) applyLFUConfig() {
+	if d.engine == nil {
+		return
+	}
+	d.engine.setLFUParams(int(d.confInt("lfu-log-factor", 10)), int(d.confInt("lfu-decay-time", 1)))
+}
+
 // confValue reads a config directive from the dispatcher's store, returning def
 // when it is unset. The eviction loop runs off the dispatcher, not a Ctx, so it
 // reads config here rather than through the Ctx helpers.
