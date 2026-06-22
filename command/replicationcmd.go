@@ -24,5 +24,8 @@ func replicationCommands() []*CmdDesc {
 		{Name: "wait", Group: GroupConnection, Since: "3.0.0",
 			Arity: 3, Flags: FlagNoScript,
 			Handler: func(ctx *Ctx) { ctx.d.handleWait(ctx) }},
+		{Name: "waitaof", Group: GroupConnection, Since: "7.2.0",
+			Arity: 4, Flags: FlagNoScript,
+			Handler: func(ctx *Ctx) { ctx.d.handleWaitAOF(ctx) }},
 	}
 }
