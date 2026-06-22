@@ -645,7 +645,7 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 					nogKey = string(keys[j])
 					return nil
 				}
-				c, _ := g.getOrCreateConsumer(consumerName, now)
+				c, created := g.getOrCreateConsumer(consumerName, now)
 				c.seenTime = now
 				if newDelivery[j] {
 					es := collectRange(s, rangeBound{id: g.lastID, excl: true}, rangeBound{id: maxStreamID}, count)
@@ -674,6 +674,16 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 					// Creating the consumer above may need persisting.
 					if err := storeStream(db, keys[j], s, keepTTL(hdr, found)); err != nil {
 						return err
+					}
+					// An explicit-ID read delivers nothing new, so the > path's
+					// XCLAIM FORCE never runs to recreate the consumer on a replica.
+					// When this read created the consumer, propagate the same XGROUP
+					// CREATECONSUMER real Redis emits so the replica grows it too.
+					if created && propOn {
+						propCmds = append(propCmds, [][]byte{
+							[]byte("XGROUP"), []byte("CREATECONSUMER"),
+							keys[j], []byte(groupName), []byte(consumerName),
+						})
 					}
 					results = append(results, readGroupResult{key: keys[j], rows: rows, explicit: true})
 				}

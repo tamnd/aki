@@ -62,6 +62,34 @@ func TestXReadGroupNoAckAdvancesAOF(t *testing.T) {
 	}
 }
 
+// TestXReadGroupExplicitIDCreatesConsumerAOF checks that an explicit-ID read which
+// creates a new consumer propagates XGROUP CREATECONSUMER, so the consumer survives
+// a reload even though the read delivered nothing and emitted no XCLAIM.
+func TestXReadGroupExplicitIDCreatesConsumerAOF(t *testing.T) {
+	r, c := startData(t)
+	dir := enableAOF(t, r, c)
+	_ = sendLine(t, r, c, "BGREWRITEAOF")
+
+	_ = sendArgs(t, r, c, "XADD", "s", "1-1", "f", "v")
+	_ = sendArgs(t, r, c, "XGROUP", "CREATE", "s", "g", "0")
+	// A brand new consumer reads its own PEL with an explicit ID. It owns nothing,
+	// so the reply is empty, but the consumer is now created.
+	_ = sendArgs(t, r, c, "XREADGROUP", "GROUP", "g", "bob", "STREAMS", "s", "0")
+
+	incr := readIncrFile(t, filepath.Join(dir, "appendonlydir"))
+	if !strings.Contains(incr, "CREATECONSUMER") || !strings.Contains(incr, "bob") {
+		t.Fatalf("incr missing XGROUP CREATECONSUMER for bob: %q", incr)
+	}
+
+	if got := sendLine(t, r, c, "DEBUG LOADAOF"); got != "+OK" {
+		t.Fatalf("DEBUG LOADAOF = %q", got)
+	}
+	cons := flatCmd(t, r, c, "XINFO CONSUMERS s g")
+	if !contains(cons, "bob") {
+		t.Fatalf("consumer bob missing after reload: %v", cons)
+	}
+}
+
 // TestReplicationStreamsXReadGroup checks a > delivery on the master reaches a
 // replica so the replica reports the same pending entry.
 func TestReplicationStreamsXReadGroup(t *testing.T) {
