@@ -512,7 +512,9 @@ func handleXAck(ctx *Ctx) {
 }
 
 // handleXReadGroup implements XREADGROUP GROUP g c [COUNT n] [BLOCK ms] [NOACK]
-// STREAMS key [key ...] id [id ...]. BLOCK is parsed but reads non-blocking.
+// STREAMS key [key ...] id [id ...]. With BLOCK and only > IDs that have no new
+// entries the connection parks until an XADD on one of the keys, the timeout
+// elapses, or the client is unblocked. An explicit ID never parks.
 func handleXReadGroup(ctx *Ctx) {
 	argv := ctx.Argv
 	if len(argv) < 7 || !strings.EqualFold(string(argv[1]), "GROUP") {
@@ -523,6 +525,7 @@ func handleXReadGroup(ctx *Ctx) {
 	consumerName := string(argv[3])
 	i := 4
 	count := int64(-1)
+	blockMs := int64(-1) // -1 means no BLOCK option
 	noAck := false
 	for i < len(argv) {
 		switch strings.ToUpper(string(argv[i])) {
@@ -552,13 +555,14 @@ func handleXReadGroup(ctx *Ctx) {
 				ctx.enc().WriteError(errStreamTimeoutNeg)
 				return
 			}
+			blockMs = ms
 			i += 2
 		case "NOACK":
 			noAck = true
 			i++
 		case "STREAMS":
 			i++
-			handleXReadGroupStreams(ctx, groupName, consumerName, argv[i:], count, noAck)
+			handleXReadGroupStreams(ctx, groupName, consumerName, argv[i:], count, blockMs, noAck)
 			return
 		default:
 			ctx.enc().WriteError("ERR syntax error")
@@ -568,8 +572,9 @@ func handleXReadGroup(ctx *Ctx) {
 	ctx.enc().WriteError("ERR syntax error")
 }
 
-// handleXReadGroupStreams reads the STREAMS clause and delivers per stream.
-func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]byte, count int64, noAck bool) {
+// handleXReadGroupStreams reads the STREAMS clause and delivers per stream. When
+// blockMs is not -1 and only > IDs are given with no new entries, it parks.
+func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]byte, count, blockMs int64, noAck bool) {
 	if len(rest) == 0 || len(rest)%2 != 0 {
 		ctx.enc().WriteError(errStreamUnbalanced)
 		return
@@ -580,12 +585,14 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 
 	newDelivery := make([]bool, n)
 	starts := make([]streamID, n)
+	anyExplicit := false
 	for j := range n {
 		raw := string(idArgs[j])
 		if raw == ">" {
 			newDelivery[j] = true
 			continue
 		}
+		anyExplicit = true
 		if noAck {
 			ctx.enc().WriteError("ERR The NOACK option is not valid for XREADGROUP with an explicit ID")
 			return
@@ -597,78 +604,95 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 		}
 		starts[j] = id
 	}
-	now := keyspace.NowMillis()
 
-	var (
-		results  []readGroupResult
-		wrongTyp bool
-		noGroup  bool
-		nogKey   string
-	)
-	if !ctx.update(func(db *keyspace.DB) error {
-		for j := range n {
-			s, hdr, found, err := getStream(db, keys[j])
-			if err != nil {
-				return err
-			}
-			if found && hdr.Type != keyspace.TypeStream {
-				wrongTyp = true
-				return nil
-			}
-			if !found {
-				noGroup = true
-				nogKey = string(keys[j])
-				return nil
-			}
-			g := s.findGroup(groupName)
-			if g == nil {
-				noGroup = true
-				nogKey = string(keys[j])
-				return nil
-			}
-			c, _ := g.getOrCreateConsumer(consumerName, now)
-			c.seenTime = now
-			if newDelivery[j] {
-				es := collectRange(s, rangeBound{id: g.lastID, excl: true}, rangeBound{id: maxStreamID}, count)
-				if len(es) == 0 {
-					continue
+	attempt := func() bool {
+		var (
+			results  []readGroupResult
+			wrongTyp bool
+			noGroup  bool
+			nogKey   string
+		)
+		now := keyspace.NowMillis()
+		if !ctx.update(func(db *keyspace.DB) error {
+			for j := range n {
+				s, hdr, found, err := getStream(db, keys[j])
+				if err != nil {
+					return err
 				}
-				c.activeTime = now
-				rows := make([]readEntry, 0, len(es))
-				for _, e := range es {
-					g.lastID = e.id
-					g.entriesRead++
-					if !noAck {
-						g.pelInsert(pelEntry{id: e.id, consumer: consumerName, deliveryTime: now, deliveryCount: 1})
+				if found && hdr.Type != keyspace.TypeStream {
+					wrongTyp = true
+					return nil
+				}
+				if !found {
+					noGroup = true
+					nogKey = string(keys[j])
+					return nil
+				}
+				g := s.findGroup(groupName)
+				if g == nil {
+					noGroup = true
+					nogKey = string(keys[j])
+					return nil
+				}
+				c, _ := g.getOrCreateConsumer(consumerName, now)
+				c.seenTime = now
+				if newDelivery[j] {
+					es := collectRange(s, rangeBound{id: g.lastID, excl: true}, rangeBound{id: maxStreamID}, count)
+					if len(es) == 0 {
+						continue
 					}
-					rows = append(rows, readEntry{id: e.id, fields: e.fields})
+					c.activeTime = now
+					rows := make([]readEntry, 0, len(es))
+					for _, e := range es {
+						g.lastID = e.id
+						g.entriesRead++
+						if !noAck {
+							g.pelInsert(pelEntry{id: e.id, consumer: consumerName, deliveryTime: now, deliveryCount: 1})
+						}
+						rows = append(rows, readEntry{id: e.id, fields: e.fields})
+					}
+					if err := storeStream(db, keys[j], s, keepTTL(hdr, found)); err != nil {
+						return err
+					}
+					results = append(results, readGroupResult{key: keys[j], rows: rows})
+				} else {
+					rows := collectConsumerPEL(s, g, consumerName, starts[j], count)
+					// Creating the consumer above may need persisting.
+					if err := storeStream(db, keys[j], s, keepTTL(hdr, found)); err != nil {
+						return err
+					}
+					results = append(results, readGroupResult{key: keys[j], rows: rows, explicit: true})
 				}
-				if err := storeStream(db, keys[j], s, keepTTL(hdr, found)); err != nil {
-					return err
-				}
-				results = append(results, readGroupResult{key: keys[j], rows: rows})
-			} else {
-				rows := collectConsumerPEL(s, g, consumerName, starts[j], count)
-				// Creating the consumer above may need persisting.
-				if err := storeStream(db, keys[j], s, keepTTL(hdr, found)); err != nil {
-					return err
-				}
-				results = append(results, readGroupResult{key: keys[j], rows: rows, explicit: true})
 			}
+			return nil
+		}) {
+			return true
 		}
-		return nil
-	}) {
+		if wrongTyp {
+			ctx.enc().WriteError(wrongTypeError)
+			return true
+		}
+		if noGroup {
+			ctx.enc().WriteError(nogroupError(groupName, nogKey))
+			return true
+		}
+		// An explicit ID always yields a per-stream list, even an empty one, so a
+		// read with any explicit ID resolves at once. A > read with nothing new
+		// returns no results and parks when blocking.
+		if len(results) == 0 && !anyExplicit {
+			return false
+		}
+		writeReadGroupResults(ctx, results)
+		return true
+	}
+
+	if blockMs < 0 {
+		if !attempt() {
+			ctx.enc().WriteNullArray()
+		}
 		return
 	}
-	if wrongTyp {
-		ctx.enc().WriteError(wrongTypeError)
-		return
-	}
-	if noGroup {
-		ctx.enc().WriteError(nogroupError(groupName, nogKey))
-		return
-	}
-	writeReadGroupResults(ctx, results)
+	ctx.d.blockDrive(ctx, keys, float64(blockMs)/1000, attempt, func() { ctx.enc().WriteNullArray() })
 }
 
 // readEntry is one row of an XREADGROUP reply: an entry, or a tombstone with a

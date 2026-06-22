@@ -126,6 +126,25 @@ func (d *Dispatcher) serveReady(db int, key []byte, skipID uint64) {
 	}
 }
 
+// serveReadyAll wakes every waiter parked on key, skipping the client with
+// skipID. A stream XADD makes one entry visible to every blocked XREAD on the
+// key at once (a fan-out read, not a hand-off), so the whole waiter list is
+// signaled rather than just the oldest one.
+func (d *Dispatcher) serveReadyAll(db int, key []byte, skipID uint64) {
+	b := &d.blocking
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, w := range b.waiters[blockKey{db: db, key: string(key)}] {
+		if w.id == skipID {
+			continue
+		}
+		select {
+		case w.ready <- struct{}{}:
+		default:
+		}
+	}
+}
+
 // unblockClient signals a parked client to stop waiting. errReply asks for the
 // CLIENT UNBLOCK ERROR reply; otherwise the command returns as if it timed out.
 // It reports whether a client was actually blocked.

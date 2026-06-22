@@ -335,6 +335,9 @@ func handleXAdd(ctx *Ctx) {
 		if trimmed {
 			ctx.notify(notifyStream, "xtrim", key)
 		}
+		// A new entry is visible to every client blocked on this stream, both
+		// XREAD waiters (fan-out) and XREADGROUP > waiters, so wake them all.
+		ctx.signalReadyAll(key)
 		ctx.enc().WriteBulkStringStr(newID.String())
 	}
 }
@@ -550,13 +553,14 @@ func handleXDel(ctx *Ctx) {
 	ctx.enc().WriteInteger(deleted)
 }
 
-// handleXRead implements XREAD [COUNT n] STREAMS key [key ...] id [id ...]. The
-// BLOCK option is parsed but always reads non-blocking for now, returning null
-// when nothing is available, which is the correct non-blocking result.
+// handleXRead implements XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...]
+// id [id ...]. With BLOCK and no entries available the connection parks until an
+// XADD on one of the keys, the timeout elapses, or the client is unblocked.
 func handleXRead(ctx *Ctx) {
 	argv := ctx.Argv
 	i := 1
 	count := int64(-1)
+	blockMs := int64(-1) // -1 means no BLOCK option
 	for i < len(argv) {
 		switch strings.ToUpper(string(argv[i])) {
 		case "COUNT":
@@ -585,10 +589,11 @@ func handleXRead(ctx *Ctx) {
 				ctx.enc().WriteError(errStreamTimeoutNeg)
 				return
 			}
+			blockMs = ms
 			i += 2
 		case "STREAMS":
 			i++
-			handleXReadStreams(ctx, argv[i:], count)
+			handleXReadStreams(ctx, argv[i:], count, blockMs)
 			return
 		default:
 			ctx.enc().WriteError("ERR syntax error")
@@ -599,8 +604,9 @@ func handleXRead(ctx *Ctx) {
 }
 
 // handleXReadStreams reads the key-then-id half of the STREAMS clause and
-// replies the per-stream entries that follow each given ID.
-func handleXReadStreams(ctx *Ctx, rest [][]byte, count int64) {
+// replies the per-stream entries that follow each given ID. When blockMs is not
+// -1 and no entry is available it parks until one arrives or the timeout fires.
+func handleXReadStreams(ctx *Ctx, rest [][]byte, count, blockMs int64) {
 	if len(rest) == 0 || len(rest)%2 != 0 {
 		ctx.enc().WriteError(errStreamUnbalanced)
 		return
@@ -610,15 +616,13 @@ func handleXReadStreams(ctx *Ctx, rest [][]byte, count int64) {
 	idArgs := rest[n:]
 
 	starts := make([]streamID, n)
+	dollar := make([]bool, n)
 	for j := range n {
 		raw := string(idArgs[j])
-		if raw == "$" {
-			// $ means deliver entries after the current last ID. Without a
-			// stored stream the last ID is 0-0; it is resolved per key below.
-			starts[j] = maxStreamID
-			continue
-		}
-		if raw == "+" {
+		if raw == "$" || raw == "+" {
+			// $ and + both mean "entries after the current last ID". The last ID
+			// is resolved once below so a blocking read keeps a fixed cursor.
+			dollar[j] = true
 			starts[j] = maxStreamID
 			continue
 		}
@@ -630,14 +634,14 @@ func handleXReadStreams(ctx *Ctx, rest [][]byte, count int64) {
 		starts[j] = id
 	}
 
-	type result struct {
-		key     []byte
-		entries []streamEntry
-	}
-	var results []result
+	// Resolve $ and + to each stream's current last ID before any wait so the
+	// cursor stays fixed while parked. A wrong-type key is reported here too.
 	var wrongTyp bool
 	if !ctx.view(func(db *keyspace.DB) error {
 		for j := range n {
+			if !dollar[j] {
+				continue
+			}
 			s, hdr, found, err := getStream(db, keys[j])
 			if err != nil {
 				return err
@@ -646,16 +650,10 @@ func handleXReadStreams(ctx *Ctx, rest [][]byte, count int64) {
 				wrongTyp = true
 				return nil
 			}
-			if !found {
-				continue
-			}
-			start := starts[j]
-			if string(idArgs[j]) == "$" {
-				start = s.lastID
-			}
-			es := collectRange(s, rangeBound{id: start, excl: true}, rangeBound{id: maxStreamID}, count)
-			if len(es) > 0 {
-				results = append(results, result{key: keys[j], entries: es})
+			if found {
+				starts[j] = s.lastID
+			} else {
+				starts[j] = streamID{}
 			}
 		}
 		return nil
@@ -667,25 +665,69 @@ func handleXReadStreams(ctx *Ctx, rest [][]byte, count int64) {
 		return
 	}
 
-	enc := ctx.enc()
-	if len(results) == 0 {
-		enc.WriteNullArray()
-		return
+	type result struct {
+		key     []byte
+		entries []streamEntry
 	}
-	if enc.Proto() >= 3 {
-		enc.WriteMapLen(len(results))
-		for _, r := range results {
-			enc.WriteBulkString(r.key)
-			writeEntries(enc, r.entries)
+	attempt := func() bool {
+		var (
+			results  []result
+			wrongTyp bool
+		)
+		if !ctx.view(func(db *keyspace.DB) error {
+			for j := range n {
+				s, hdr, found, err := getStream(db, keys[j])
+				if err != nil {
+					return err
+				}
+				if found && hdr.Type != keyspace.TypeStream {
+					wrongTyp = true
+					return nil
+				}
+				if !found {
+					continue
+				}
+				es := collectRange(s, rangeBound{id: starts[j], excl: true}, rangeBound{id: maxStreamID}, count)
+				if len(es) > 0 {
+					results = append(results, result{key: keys[j], entries: es})
+				}
+			}
+			return nil
+		}) {
+			return true
+		}
+		if wrongTyp {
+			ctx.enc().WriteError(wrongTypeError)
+			return true
+		}
+		if len(results) == 0 {
+			return false
+		}
+		enc := ctx.enc()
+		if enc.Proto() >= 3 {
+			enc.WriteMapLen(len(results))
+			for _, r := range results {
+				enc.WriteBulkString(r.key)
+				writeEntries(enc, r.entries)
+			}
+		} else {
+			enc.WriteArrayLen(len(results))
+			for _, r := range results {
+				enc.WriteArrayLen(2)
+				enc.WriteBulkString(r.key)
+				writeEntries(enc, r.entries)
+			}
+		}
+		return true
+	}
+
+	if blockMs < 0 {
+		if !attempt() {
+			ctx.enc().WriteNullArray()
 		}
 		return
 	}
-	enc.WriteArrayLen(len(results))
-	for _, r := range results {
-		enc.WriteArrayLen(2)
-		enc.WriteBulkString(r.key)
-		writeEntries(enc, r.entries)
-	}
+	ctx.d.blockDrive(ctx, keys, float64(blockMs)/1000, attempt, func() { ctx.enc().WriteNullArray() })
 }
 
 // handleXTrim implements XTRIM key MAXLEN|MINID [=|~] threshold [LIMIT count].

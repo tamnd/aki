@@ -211,6 +211,9 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 	for _, k := range ctx.readyKeys {
 		d.serveReady(ctx.Conn.DB(), k, ctx.Conn.ID())
 	}
+	for _, k := range ctx.readyKeysAll {
+		d.serveReadyAll(ctx.Conn.DB(), k, ctx.Conn.ID())
+	}
 }
 
 // invalidateForWrite pushes tracking invalidations for a write that changed the
