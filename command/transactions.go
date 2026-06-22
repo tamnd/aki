@@ -80,6 +80,14 @@ func (d *Dispatcher) queueCommand(c *networking.Conn, sess *session, name string
 		c.Enc().WriteError(msg)
 		return
 	}
+	// A command landing on a slot this node does not serve, or queued while the
+	// cluster state is down, is refused at queue time and aborts the EXEC, the
+	// same as on the direct path.
+	if msg := d.clusterDownError(name, cmd, argv); msg != "" {
+		sess.dirtyExec = true
+		c.Enc().WriteError(msg)
+		return
+	}
 	sess.queue = append(sess.queue, queuedCmd{cmd: cmd, argv: argv})
 	c.WriteRaw(resp.ReplyQueued)
 }
