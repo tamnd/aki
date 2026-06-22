@@ -317,8 +317,8 @@ func (c *Conn) fill() error {
 	if c.closed.Load() {
 		return net.ErrClosed
 	}
-	if c.server.idleTimeout > 0 {
-		_ = c.raw.SetReadDeadline(c.server.now().Add(c.server.idleTimeout))
+	if to := c.server.IdleTimeout(); to > 0 {
+		_ = c.raw.SetReadDeadline(c.server.now().Add(to))
 	}
 	start := len(c.qbuf)
 	if cap(c.qbuf)-start < readChunk {

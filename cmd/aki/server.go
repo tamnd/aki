@@ -103,6 +103,9 @@ func cmdServer(args []string) error {
 
 	srv := networking.New(cfg, d)
 	d.SetServer(srv)
+	// Apply the network idle knobs now that the server is attached so timeout and
+	// tcp-keepalive take hold from the first connection.
+	d.ApplyNetworkConfig()
 	d.StartBackground()
 	defer d.StopBackground()
 
