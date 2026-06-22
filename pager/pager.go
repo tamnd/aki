@@ -3,6 +3,7 @@ package pager
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tamnd/aki/encoding"
 	"github.com/tamnd/aki/format"
@@ -48,6 +49,13 @@ type Pager struct {
 	// is an intrusive linked list through the free pages (doc 03 §6).
 	freelist      []uint32
 	freelistDirty bool
+
+	// cacheHits and cacheMisses count buffer-pool lookups served from memory
+	// versus those that had to read the page off disk. They drive the
+	// aki_page_cache_hit_ratio growth field. Updated on the read path so they use
+	// atomics rather than the pager mutex.
+	cacheHits   atomic.Uint64
+	cacheMisses atomic.Uint64
 
 	closed bool
 }
@@ -176,6 +184,37 @@ func (p *Pager) Meta() format.MetaPage {
 	return p.meta
 }
 
+// Stats is a point-in-time snapshot of pager and buffer-pool counters. The
+// server reads it for the file-growth INFO fields in doc 20 section 9.8.
+type Stats struct {
+	PageSize      uint32
+	PageCount     uint32
+	FreeCount     int
+	FileBytes     int64
+	ResidentPages int
+	DirtyPages    int
+	CacheHits     uint64
+	CacheMisses   uint64
+}
+
+// Stats returns the current pager counters. FileBytes is the on-disk size the
+// page count implies, which is what the dataset-file growth field reports.
+func (p *Pager) Stats() Stats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	resident, dirty := p.pool.counts()
+	return Stats{
+		PageSize:      p.pageSize,
+		PageCount:     p.meta.PageCount,
+		FreeCount:     len(p.freelist),
+		FileBytes:     int64(p.meta.PageCount) * int64(p.pageSize),
+		ResidentPages: resident,
+		DirtyPages:    dirty,
+		CacheHits:     p.cacheHits.Load(),
+		CacheMisses:   p.cacheMisses.Load(),
+	}
+}
+
 // Header returns a copy of the file header.
 func (p *Pager) Header() format.FileHeader {
 	p.mu.Lock()
@@ -236,9 +275,11 @@ func (p *Pager) getLocked(pgno uint32) (*Page, error) {
 	if pg := p.pool.get(pgno); pg != nil {
 		pg.pins++
 		p.pool.mu.Unlock()
+		p.cacheHits.Add(1)
 		return pg, nil
 	}
 	p.pool.mu.Unlock()
+	p.cacheMisses.Add(1)
 
 	buf, err := p.readRaw(pgno)
 	if err != nil {

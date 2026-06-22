@@ -181,6 +181,10 @@ func Open(pgr *pager.Pager) (*Keyspace, error) {
 	return ks, nil
 }
 
+// PagerStats returns the underlying pager's counters for the file-growth INFO
+// fields. It is a passthrough so the command layer does not reach into the pager.
+func (k *Keyspace) PagerStats() pager.Stats { return k.pgr.Stats() }
+
 // DBCount returns the number of logical databases.
 func (ks *Keyspace) DBCount() int { return len(ks.dbs) }
 

@@ -59,6 +59,20 @@ func newFrameTable(capacity int) *frameTable {
 	}
 }
 
+// counts returns the number of resident frames and how many of them are dirty.
+// The pager calls it for the buffer-pool growth fields.
+func (ft *frameTable) counts() (resident, dirty int) {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	resident = len(ft.frames)
+	for _, p := range ft.frames {
+		if p.dirty {
+			dirty++
+		}
+	}
+	return resident, dirty
+}
+
 // get returns the cached frame for pgno, or nil.
 func (ft *frameTable) get(pgno uint32) *Page {
 	p := ft.frames[pgno]

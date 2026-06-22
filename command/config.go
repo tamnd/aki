@@ -144,6 +144,13 @@ func configDirectives() []*directive {
 		{name: "auto-aof-rewrite-percentage", kind: dirInt, def: "100", mutable: true},
 		{name: "auto-aof-rewrite-min-size", kind: dirMemory, def: "67108864", mutable: true},
 
+		// Checkpoint triggers (doc 20 section 9.8). aki has no separate WAL
+		// checkpointer yet, so these are accepted and reported for compatibility
+		// and take effect when that work lands.
+		{name: "aki-checkpoint-interval", kind: dirInt, def: "300", mutable: true},
+		{name: "aki-checkpoint-wal-frames", kind: dirInt, def: "1000", mutable: true},
+		{name: "aki-checkpoint-dirty-pages", kind: dirInt, def: "500", mutable: true},
+
 		// Replication.
 		{name: "replica-read-only", kind: dirBool, def: "yes", mutable: true},
 		{name: "masterauth", kind: dirString, def: "", mutable: true},

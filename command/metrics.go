@@ -138,6 +138,13 @@ var scalarMetrics = []infoFieldMap{
 	{"aki_uptime_in_seconds", "gauge", "uptime_in_seconds", "redis_uptime_in_seconds"},
 	{"aki_used_cpu_sys_total", "counter", "used_cpu_sys", ""},
 	{"aki_used_cpu_user_total", "counter", "used_cpu_user", ""},
+	{"aki_dataset_file_bytes", "gauge", "aki_dataset_file_bytes", ""},
+	{"aki_wal_bytes", "gauge", "aki_wal_bytes", ""},
+	{"aki_wal_frame_count", "gauge", "aki_wal_frame_count", ""},
+	{"aki_dirty_pages", "gauge", "aki_dirty_pages", ""},
+	{"aki_buffer_pool_pages", "gauge", "aki_buffer_pool_pages", ""},
+	{"aki_page_cache_hit_ratio", "gauge", "aki_page_cache_hit_ratio", ""},
+	{"aki_on_disk_vs_ram_ratio", "gauge", "aki_on_disk_vs_ram_ratio", ""},
 }
 
 // latencyBuckets are the upper bounds for the per-command latency histogram in
