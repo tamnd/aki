@@ -1,6 +1,7 @@
 package command
 
 import (
+	"sort"
 	"strings"
 	"sync"
 
@@ -137,6 +138,25 @@ func (fr *functionRegistry) ensure() {
 		fr.libs = map[string]*funcLib{}
 		fr.fnIndex = map[string]string{}
 	}
+}
+
+// librarySources returns the source of every loaded library, sorted by library
+// name so the order is stable across rewrites. The AOF rewrite replays these as
+// FUNCTION LOAD REPLACE so a reload restores the functions that the base RDB does
+// not carry.
+func (fr *functionRegistry) librarySources() []string {
+	fr.mu.RLock()
+	defer fr.mu.RUnlock()
+	names := make([]string, 0, len(fr.libs))
+	for name := range fr.libs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		out = append(out, fr.libs[name].source)
+	}
+	return out
 }
 
 // parseShebang reads the "#!lua name=<libname>" first line of a library source.
