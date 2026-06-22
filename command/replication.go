@@ -109,6 +109,7 @@ type replState struct {
 	slaveOff     int64
 	masterReplid string
 	stop         chan struct{}
+	loopDone     chan struct{} // closed when the replica client goroutine exits
 	gen          int
 
 	lastPing time.Time
@@ -375,9 +376,11 @@ func (d *Dispatcher) handleReplicaOf(ctx *Ctx) {
 	gen := d.repl.gen
 	d.repl.stop = make(chan struct{})
 	stop := d.repl.stop
+	d.repl.loopDone = make(chan struct{})
+	loopDone := d.repl.loopDone
 	d.repl.mu.Unlock()
 
-	go d.replicaClientLoop(gen, stop, host, port)
+	go d.replicaClientLoop(gen, stop, loopDone, host, port)
 	ctx.Conn.WriteRaw(resp.ReplyOK)
 }
 
@@ -407,6 +410,28 @@ func (d *Dispatcher) stopReplicaLocked() {
 		close(d.repl.stop)
 		d.repl.stop = nil
 	}
+	// The exiting goroutine owns closing loopDone, so just drop our reference.
+	// Anyone who needs to join captured the channel before unlocking.
+	d.repl.loopDone = nil
+}
+
+// StopReplication signals the replica client goroutine to exit and waits for it
+// to return. It must run before the keyspace and pager close on shutdown, so the
+// apply loop never touches a closed pager. Safe to call on a master: it returns
+// at once when no replica link is active.
+func (d *Dispatcher) StopReplication() {
+	d.repl.mu.Lock()
+	loopDone := d.repl.loopDone
+	if d.repl.stop != nil {
+		close(d.repl.stop)
+		d.repl.stop = nil
+	}
+	d.repl.loopDone = nil
+	d.repl.mu.Unlock()
+
+	if loopDone != nil {
+		<-loopDone
+	}
 }
 
 // isReadonlyReplica reports whether external writes must be refused because this
@@ -424,7 +449,8 @@ func (d *Dispatcher) isReadonlyReplica() bool {
 // replicaClientLoop is the replica-side driver. It connects to the master, runs
 // the handshake, loads the RDB, and applies the command stream, retrying on
 // failure until REPLICAOF changes the target or the server stops.
-func (d *Dispatcher) replicaClientLoop(gen int, stop chan struct{}, host string, port int) {
+func (d *Dispatcher) replicaClientLoop(gen int, stop, loopDone chan struct{}, host string, port int) {
+	defer close(loopDone)
 	for {
 		select {
 		case <-stop:
