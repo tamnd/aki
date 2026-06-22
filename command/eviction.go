@@ -206,6 +206,11 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 		ctx.sess.cachingYes = false
 		ctx.sess.cachingNo = false
 	}
+	// The ASKING flag is one-shot the same way: it applies to the next command and
+	// is cleared once that command has run.
+	if ctx.sess.asking && cmd.Name != "asking" {
+		ctx.sess.asking = false
+	}
 	// Wake any clients blocked on keys this command made ready, now that the write
 	// is applied and propagated.
 	for _, k := range ctx.readyKeys {
