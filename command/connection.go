@@ -26,6 +26,8 @@ func connectionCommands() []*CmdDesc {
 				Arity: -3, Flags: FlagLoading | FlagStale, Handler: handleCommandGetKeys},
 			{Name: "getkeysandflags", SubName: "command|getkeysandflags", Group: GroupServer, Since: "7.0.0",
 				Arity: -3, Flags: FlagLoading | FlagStale, Handler: handleCommandGetKeysAndFlags},
+			{Name: "docs", SubName: "command|docs", Group: GroupServer, Since: "7.0.0",
+				Arity: -2, Flags: FlagLoading | FlagStale, Handler: handleCommandDocs},
 		},
 	}
 	return []*CmdDesc{
