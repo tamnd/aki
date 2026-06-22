@@ -4,6 +4,7 @@ import (
 	"math/rand/v2"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tamnd/aki/keyspace"
 )
@@ -128,6 +129,8 @@ func (d *Dispatcher) confInt(name string, def int64) int64 {
 func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 	if cmd.Flags.Has(FlagDenyOOM) && !d.freeMemoryIfNeeded() {
 		ctx.enc().WriteError(oomError)
+		d.statReject(cmd)
+		d.statError(oomError)
 		return
 	}
 	// Capture the dirty counter around a write so the AOF and the replication
@@ -149,7 +152,22 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 	if propagate || trackWrites {
 		before = d.persist.dirtyCount()
 	}
+	// Time the handler and inspect the reply it writes so the stats table can
+	// record the call, its latency, and whether it ended in an error. The reply
+	// segment is whatever the handler appended to the output buffer; an error reply
+	// starts with '-', which is also how the error code is tallied.
+	outStart := len(ctx.Conn.OutBytes())
+	start := time.Now()
 	cmd.Handler(ctx)
+	usec := uint64(time.Since(start).Microseconds())
+	failed := false
+	if reply := ctx.Conn.OutBytes(); outStart <= len(reply) {
+		if code, isErr := errPrefix(reply[outStart:]); isErr {
+			failed = true
+			d.statError(code)
+		}
+	}
+	d.statCall(cmd, usec, failed)
 	dirtied := d.persist.dirtyCount() > before
 	if propagate && dirtied {
 		args := rewriteForAOF(cmd.Name, ctx.Argv)
