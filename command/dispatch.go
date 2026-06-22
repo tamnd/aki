@@ -50,11 +50,10 @@ type Dispatcher struct {
 	// nothing; CONFIG SET updates it with an atomic store.
 	notifyFlags uint32
 
-	// hz is the background tick rate, the number of active expiry cycles per
-	// second. activeExpire gates that cycle: DEBUG SET-ACTIVE-EXPIRE 0 clears it
-	// so only lazy expiry runs, which tests rely on. bgStop and bgDone manage the
-	// background goroutine started by StartBackground.
-	hz           int
+	// activeExpire gates the background cycle: DEBUG SET-ACTIVE-EXPIRE 0 clears it
+	// so only lazy expiry runs, which tests rely on. The tick rate itself comes
+	// from effectiveHz, driven by the hz and dynamic-hz directives. bgStop and
+	// bgDone manage the background goroutine started by StartBackground.
 	activeExpire atomic.Bool
 	bgStop       chan struct{}
 	bgDone       chan struct{}
@@ -239,7 +238,6 @@ func New(cfg Config) *Dispatcher {
 		acl:       acl,
 		startTime: time.Now(),
 		runID:     newRunID(),
-		hz:        10,
 	}
 	if d.engine != nil {
 		d.engine.onCommit = d.recordIOLatency
@@ -277,10 +275,12 @@ func (d *Dispatcher) StartBackground() {
 	d.initAOF()
 	d.bgStop = make(chan struct{})
 	d.bgDone = make(chan struct{})
-	interval := time.Second / time.Duration(d.hz)
 	go func() {
 		defer close(d.bgDone)
-		t := time.NewTicker(interval)
+		// A fresh timer each pass reads effectiveHz again, so CONFIG SET hz and the
+		// dynamic-hz client scaling both take hold on the next tick without a
+		// restart, the way Redis recomputes its rate every cron cycle.
+		t := time.NewTimer(time.Second / time.Duration(d.effectiveHz()))
 		defer t.Stop()
 		for {
 			select {
@@ -291,6 +291,7 @@ func (d *Dispatcher) StartBackground() {
 				d.checkSavePoints()
 				d.checkAOFRewrite()
 				d.replPingReplicas()
+				t.Reset(time.Second / time.Duration(d.effectiveHz()))
 			}
 		}
 	}()
