@@ -4,7 +4,9 @@ import "math/rand/v2"
 
 // LFU tuning constants, matching the Redis defaults. The counter is 8 bits and
 // climbs slowly so it can span a wide range of access rates, and it decays over
-// time so a key that was hot once does not stay hot forever.
+// time so a key that was hot once does not stay hot forever. The log factor and
+// decay time are the defaults Open seeds onto the keyspace; lfu-log-factor and
+// lfu-decay-time override them through SetLFUParams.
 const (
 	lfuInitVal   = 5  // counter a brand new key starts at
 	lfuLogFactor = 10 // higher slows the climb, so 255 means very hot
@@ -43,7 +45,7 @@ func (db *DB) recordAccess(key []byte, isNew bool) {
 		a = keyAccess{freq: lfuInitVal, decr: nowMinutes()}
 	}
 	a.atime = nowSeconds()
-	a = lfuIncr(lfuDecay(a))
+	a = db.lfuIncr(db.lfuDecay(a))
 	db.access[k] = a
 }
 
@@ -56,11 +58,13 @@ func (db *DB) dropAccess(key []byte) {
 
 // lfuDecay lowers the counter by one for every decay period that passed since the
 // last step, then stamps the current time. A key untouched for a long time loses
-// frequency, so an old burst does not protect it forever.
-func lfuDecay(a keyAccess) keyAccess {
+// frequency, so an old burst does not protect it forever. A decay time of zero
+// turns decay off, the lfu-decay-time 0 case, so the counter holds its value.
+func (db *DB) lfuDecay(a keyAccess) keyAccess {
 	now := nowMinutes()
-	if a.decr != 0 && now > a.decr {
-		periods := (now - a.decr) / lfuDecayTime
+	decayTime := db.ks.lfuDecayTime
+	if decayTime > 0 && a.decr != 0 && now > a.decr {
+		periods := (now - a.decr) / uint32(decayTime)
 		if periods > uint32(a.freq) {
 			a.freq = 0
 		} else {
@@ -73,8 +77,9 @@ func lfuDecay(a keyAccess) keyAccess {
 
 // lfuIncr raises the counter probabilistically. The chance of a bump shrinks as
 // the counter grows, so common keys saturate slowly and the 8-bit field still
-// separates a key hit thousands of times from one hit a handful.
-func lfuIncr(a keyAccess) keyAccess {
+// separates a key hit thousands of times from one hit a handful. A log factor of
+// zero makes the chance one, so the counter climbs on every access.
+func (db *DB) lfuIncr(a keyAccess) keyAccess {
 	if a.freq == 255 {
 		return a
 	}
@@ -82,7 +87,7 @@ func lfuIncr(a keyAccess) keyAccess {
 	if a.freq > lfuInitVal {
 		base = float64(a.freq - lfuInitVal)
 	}
-	p := 1.0 / (base*lfuLogFactor + 1.0)
+	p := 1.0 / (base*float64(db.ks.lfuLogFactor) + 1.0)
 	if rand.Float64() < p {
 		a.freq++
 	}
@@ -111,7 +116,7 @@ func (db *DB) Freq(key []byte) uint8 {
 	if !ok {
 		return 0
 	}
-	return lfuDecay(a).freq
+	return db.lfuDecay(a).freq
 }
 
 // SetIdle seeds a key's last-access time to idle seconds in the past, which is how
@@ -158,5 +163,5 @@ func (db *DB) accessMetrics(key []byte) (atime uint32, freq uint8) {
 	if !ok {
 		return 0, 0
 	}
-	return a.atime, lfuDecay(a).freq
+	return a.atime, db.lfuDecay(a).freq
 }
