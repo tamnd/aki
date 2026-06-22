@@ -263,18 +263,6 @@ func (d *Dispatcher) writeManifest(dir, base, incr string, seq int) error {
 	return os.Rename(tmpName, target)
 }
 
-// propagateAOF appends the command that just modified the dataset to the incr
-// file. It runs after a write handler when appendonly is on and the dataset
-// actually changed. Relative-expire commands are rewritten to PEXPIREAT with an
-// absolute timestamp so a later replay does not drift.
-func (d *Dispatcher) propagateAOF(ctx *Ctx, name string) {
-	args := rewriteForAOF(name, ctx.Argv)
-	if args == nil {
-		return
-	}
-	d.appendAOF(ctx.Conn.DB(), args)
-}
-
 // appendAOF writes one command (preceded by a SELECT when the database changed)
 // to the current incr file.
 func (d *Dispatcher) appendAOF(db int, argv [][]byte) {

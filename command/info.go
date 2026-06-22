@@ -330,17 +330,60 @@ func infoStats(ctx *Ctx, b *strings.Builder) {
 }
 
 func infoReplication(ctx *Ctx, b *strings.Builder) {
-	line(b, "role", "master")
-	line(b, "connected_slaves", "0")
+	d := ctx.d
+	d.repl.mu.Lock()
+	defer d.repl.mu.Unlock()
+
+	line(b, "role", d.repl.role)
+	if d.repl.role == "slave" {
+		line(b, "master_host", d.repl.masterHost)
+		lineInt(b, "master_port", int64(d.repl.masterPort))
+		status := "down"
+		if d.repl.link == "connected" {
+			status = "up"
+		}
+		line(b, "master_link_status", status)
+		line(b, "master_last_io_seconds_ago", "0")
+		sync := "0"
+		if d.repl.link == "sync" {
+			sync = "1"
+		}
+		line(b, "master_sync_in_progress", sync)
+		lineInt(b, "slave_read_repl_offset", d.repl.slaveOff)
+		lineInt(b, "slave_repl_offset", d.repl.slaveOff)
+		line(b, "slave_priority", "100")
+		ro := "1"
+		if strings.EqualFold(d.confValue("replica-read-only", "yes"), "no") {
+			ro = "0"
+		}
+		line(b, "slave_read_only", ro)
+		line(b, "replica_announced", "1")
+	}
+	lineInt(b, "connected_slaves", int64(len(d.repl.replicas)))
+	i := 0
+	for _, h := range d.repl.replicas {
+		line(b, "slave"+strconv.Itoa(i),
+			"ip="+h.addr+",port="+strconv.Itoa(h.port)+",state="+h.state+
+				",offset="+strconv.FormatInt(h.ackOffset, 10)+",lag=0")
+		i++
+	}
 	line(b, "master_failover_state", "no-failover")
-	line(b, "master_replid", ctx.d.runID)
-	line(b, "master_replid2", strings.Repeat("0", 40))
-	line(b, "master_repl_offset", "0")
-	line(b, "second_repl_offset", "-1")
-	line(b, "repl_backlog_active", "0")
+	line(b, "master_replid", d.repl.replid)
+	line(b, "master_replid2", d.repl.replid2)
+	lineInt(b, "master_repl_offset", d.repl.offset)
+	lineInt(b, "second_repl_offset", d.repl.secondOffset)
+	active := "0"
+	first := int64(0)
+	histlen := int64(0)
+	if d.repl.backlog != nil {
+		active = "1"
+		first = d.repl.backlog.off
+		histlen = d.repl.backlog.histlen
+	}
+	line(b, "repl_backlog_active", active)
 	lineInt(b, "repl_backlog_size", ctx.confMemory("repl-backlog-size", 1048576))
-	line(b, "repl_backlog_first_byte_offset", "0")
-	line(b, "repl_backlog_histlen", "0")
+	lineInt(b, "repl_backlog_first_byte_offset", first)
+	lineInt(b, "repl_backlog_histlen", histlen)
 }
 
 func infoCPU(_ *Ctx, b *strings.Builder) {
