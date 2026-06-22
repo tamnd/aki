@@ -154,6 +154,7 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 	if srcEmptied {
 		ctx.notify(notifyGeneric, "del", src)
 	}
+	ctx.signalReady(dst)
 	ctx.enc().WriteBulkString(moved)
 }
 

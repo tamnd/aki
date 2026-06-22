@@ -46,6 +46,8 @@ func clientCommands() []*CmdDesc {
 				Arity: 3, Flags: FlagLoading | FlagStale, Handler: handleClientCaching},
 			{Name: "kill", SubName: "client|kill", Group: GroupConnection, Since: "2.4.0",
 				Arity: -3, Flags: FlagLoading | FlagStale | FlagAdmin, Handler: handleClientKill},
+			{Name: "unblock", SubName: "client|unblock", Group: GroupConnection, Since: "5.0.0",
+				Arity: -3, Flags: FlagLoading | FlagStale | FlagAdmin, Handler: handleClientUnblock},
 			{Name: "unpause", SubName: "client|unpause", Group: GroupConnection, Since: "6.2.0",
 				Arity: 2, Flags: FlagLoading | FlagStale | FlagAdmin, Handler: handleClientUnpause},
 			{Name: "pause", SubName: "client|pause", Group: GroupConnection, Since: "3.0.0",
@@ -372,6 +374,35 @@ func handleClientCaching(ctx *Ctx) {
 	ctx.enc().WriteStatus("OK")
 }
 
+// handleClientUnblock wakes a client blocked on a blocking command. The default
+// (or the TIMEOUT modifier) makes that command return as if it timed out; ERROR
+// makes it return an UNBLOCKED error. It replies 1 when a client was unblocked
+// and 0 when the target was not blocking.
+func handleClientUnblock(ctx *Ctx) {
+	id, err := strconv.ParseUint(string(ctx.Argv[2]), 10, 64)
+	if err != nil {
+		ctx.enc().WriteError("ERR value is not an integer or out of range")
+		return
+	}
+	errReply := false
+	if len(ctx.Argv) > 3 {
+		switch strings.ToUpper(string(ctx.Argv[3])) {
+		case "TIMEOUT":
+			errReply = false
+		case "ERROR":
+			errReply = true
+		default:
+			ctx.enc().WriteError("ERR CLIENT UNBLOCK reason should be TIMEOUT or ERROR")
+			return
+		}
+	}
+	if ctx.d.unblockClient(id, errReply) {
+		ctx.enc().WriteInteger(1)
+		return
+	}
+	ctx.enc().WriteInteger(0)
+}
+
 func handleClientUnpause(ctx *Ctx) {
 	ctx.enc().WriteStatus("OK")
 }
@@ -503,6 +534,8 @@ func handleClientHelp(ctx *Ctx) {
 		"    Return information about client connections.",
 		"KILL <ip:port> | <filter> ...",
 		"    Kill connections by address or by filter.",
+		"UNBLOCK <id> [TIMEOUT|ERROR]",
+		"    Unblock the connection blocked on a blocking command.",
 		"NO-EVICT (ON|OFF)",
 		"    Set client eviction mode for the current connection.",
 		"NO-TOUCH (ON|OFF)",

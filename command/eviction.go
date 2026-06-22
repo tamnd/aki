@@ -139,15 +139,20 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 	// is sequenced through the replication lock so the backlog and every replica
 	// see effects in commit order.
 	isWrite := cmd.Flags.Has(FlagWrite)
-	replActive := isWrite && d.replActive() && !ctx.sess.fromMaster
+	// A blocking command parks the goroutine until a key is ready, so it must not
+	// hold the replication lock while it waits, and the command on the wire (BLPOP)
+	// is not the one that changes the dataset. Its handler does its own
+	// propagation, notification, and tracking invalidation through serveReady.
+	blocking := cmd.Flags.Has(FlagBlocking)
+	replActive := isWrite && !blocking && d.replActive() && !ctx.sess.fromMaster
 	if replActive {
 		d.repl.mu.Lock()
 		defer d.repl.mu.Unlock()
 	}
-	propagate := isWrite && (d.aofEnabled() || replActive)
+	propagate := isWrite && !blocking && (d.aofEnabled() || replActive)
 	// A write also needs its dirty delta when a tracking client is connected, so
 	// the invalidation only fires for writes that actually changed the dataset.
-	trackWrites := isWrite && d.trackingActive()
+	trackWrites := isWrite && !blocking && d.trackingActive()
 	var before int64
 	if propagate || trackWrites {
 		before = d.persist.dirtyCount()
@@ -200,6 +205,11 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 	if !isClientCaching(ctx.Argv) {
 		ctx.sess.cachingYes = false
 		ctx.sess.cachingNo = false
+	}
+	// Wake any clients blocked on keys this command made ready, now that the write
+	// is applied and propagated.
+	for _, k := range ctx.readyKeys {
+		d.serveReady(ctx.Conn.DB(), k, ctx.Conn.ID())
 	}
 }
 
