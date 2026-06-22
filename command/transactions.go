@@ -124,9 +124,13 @@ func handleExec(ctx *Ctx) {
 
 	enc := ctx.enc()
 	enc.WriteArrayLen(len(queue))
+	// A blocking command queued in a transaction runs as its non-blocking form, so
+	// EXEC never parks. The flag is cleared once the queue drains.
+	sess.noBlock = true
 	for _, q := range queue {
 		ctx.d.runCommand(&Ctx{Conn: ctx.Conn, Argv: q.argv, d: ctx.d, sess: sess}, q.cmd)
 	}
+	sess.noBlock = false
 }
 
 // handleWatch registers keys for optimistic locking, recording each key's current

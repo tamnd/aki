@@ -211,6 +211,7 @@ func (s *Server) onAccept(nc net.Conn) {
 		outBuf:          new(bytes.Buffer),
 		created:         now,
 		lastInteraction: now,
+		closedCh:        make(chan struct{}),
 	}
 	c.enc = resp.NewEncoder(c.outBuf, 2)
 	s.conns[id] = c

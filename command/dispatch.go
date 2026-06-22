@@ -118,6 +118,11 @@ type Dispatcher struct {
 	// shutdownFn is the callback SHUTDOWN fires to begin a graceful stop. The server
 	// command installs it; it is nil in tests and offline use.
 	shutdownFn func()
+
+	// blocking holds the registry of clients parked on a blocking command (BLPOP
+	// and friends), keyed by the keys they wait on. A push that adds elements
+	// signals the oldest waiter on the key.
+	blocking blockState
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -143,6 +148,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, listCommands()...)
 	cmds = append(cmds, listModifyCommands()...)
 	cmds = append(cmds, listMultiCommands()...)
+	cmds = append(cmds, blockingListCommands()...)
 	cmds = append(cmds, hashCommands()...)
 	cmds = append(cmds, hashExtraCommands()...)
 	cmds = append(cmds, hashTTLCommands()...)
@@ -204,6 +210,7 @@ func New(cfg Config) *Dispatcher {
 		hz:        10,
 	}
 	d.activeExpire.Store(true)
+	d.blockingInit()
 	d.replInit()
 	d.clusterInit()
 	d.trackingInit()
@@ -287,7 +294,28 @@ type Ctx struct {
 	Argv [][]byte
 	d    *Dispatcher
 	sess *session
+
+	// readyKeys collects keys a handler made ready for blocked clients (a list
+	// that gained elements). runCommand wakes the waiters after the command has
+	// been applied and propagated, so a woken client sees the element and its own
+	// propagation follows in order.
+	readyKeys [][]byte
 }
+
+// signalReady marks a key as having gained elements so a client blocked on it
+// (BLPOP and friends) is woken once the current command finishes. The wake is
+// deferred to the end of runCommand so propagation stays in order.
+func (ctx *Ctx) signalReady(key []byte) {
+	if ctx.d.blocking.active.Load() == 0 {
+		return
+	}
+	ctx.readyKeys = append(ctx.readyKeys, append([]byte(nil), key...))
+}
+
+// noBlock reports whether a blocking command must run as its non-blocking
+// equivalent rather than parking the goroutine: true on an offline connection (a
+// script's redis.call or the AOF replay) and inside EXEC.
+func (ctx *Ctx) noBlock() bool { return ctx.Conn.IsOffline() || ctx.sess.noBlock }
 
 // session is the command-layer per-connection state stored in the opaque slot
 // on networking.Conn.
@@ -305,6 +333,10 @@ type session struct {
 	inMulti   bool
 	queue     []queuedCmd
 	dirtyExec bool
+	// noBlock is set while EXEC drains its queue so a blocking command (BLPOP and
+	// friends) runs as its non-blocking equivalent instead of parking, the way
+	// Redis runs blocking commands inside a transaction.
+	noBlock bool
 	// watched holds the keys registered by WATCH with their version at WATCH time.
 	// EXEC compares against the current versions to decide whether to run.
 	watched []watchEntry

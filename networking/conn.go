@@ -88,6 +88,13 @@ type Conn struct {
 	// server flips on shutdown or CLIENT KILL.
 	closeAfterReply bool
 	closed          atomic.Bool
+
+	// closedCh is closed once, by CloseASAP, so a goroutine parked on this
+	// connection (a client blocked in BLPOP and friends) wakes when the server
+	// force-closes the socket on shutdown or CLIENT KILL. closeOnce guards the
+	// single close.
+	closedCh  chan struct{}
+	closeOnce sync.Once
 }
 
 // NewOfflineConn builds a connection that is not backed by a socket. The command
@@ -95,10 +102,21 @@ type Conn struct {
 // AOF at startup, where the replies are not sent anywhere. Output is encoded into
 // an in-memory buffer the caller never reads.
 func NewOfflineConn() *Conn {
-	c := &Conn{outBuf: new(bytes.Buffer)}
+	c := &Conn{outBuf: new(bytes.Buffer), closedCh: make(chan struct{})}
 	c.enc = resp.NewEncoder(c.outBuf, 2)
 	return c
 }
+
+// IsOffline reports whether the connection has no backing socket. The command
+// layer uses it to know a command cannot truly block: a blocking command on an
+// offline connection (a script's redis.call, the AOF replay) runs as its
+// non-blocking equivalent instead of parking the goroutine forever.
+func (c *Conn) IsOffline() bool { return c.raw == nil }
+
+// Closed returns a channel that is closed when the connection is force-closed
+// from another goroutine (server shutdown or CLIENT KILL). A blocking command
+// selects on it so a parked client wakes instead of leaking its goroutine.
+func (c *Conn) Closed() <-chan struct{} { return c.closedCh }
 
 // ID returns the globally unique, never-reused connection id.
 func (c *Conn) ID() uint64 { return c.id }
@@ -195,6 +213,7 @@ func (c *Conn) Quit() { c.closeAfterReply = true }
 // observes the close and tears down.
 func (c *Conn) CloseASAP() {
 	if c.closed.CompareAndSwap(false, true) {
+		c.closeOnce.Do(func() { close(c.closedCh) })
 		_ = c.raw.Close()
 	}
 }
