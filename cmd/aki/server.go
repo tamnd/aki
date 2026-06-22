@@ -73,6 +73,9 @@ func cmdServer(args []string) error {
 	if err := d.LoadACLFromKeyspace(); err != nil {
 		return fmt.Errorf("load ACL from data file: %w", err)
 	}
+	if err := d.LoadScriptsFromKeyspace(); err != nil {
+		return fmt.Errorf("load scripts from data file: %w", err)
+	}
 
 	cfg := networking.Config{
 		Addr:       *addr,
