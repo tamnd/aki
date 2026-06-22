@@ -300,6 +300,25 @@ func (d *Dispatcher) checkSavePoints() {
 	}
 }
 
+// writesBlockedByBgsaveError reports whether writes must be refused because the
+// last RDB save failed. Redis disables writes after a failed background save when
+// stop-writes-on-bgsave-error is on and at least one save point is configured, so
+// a broken disk does not let the dataset drift away from the last good snapshot.
+// The gate clears on its own once a later save succeeds and flips lastStatus back
+// to "ok". A replica never applies it, since the master already enforced the rule.
+func (d *Dispatcher) writesBlockedByBgsaveError() bool {
+	if !d.confBool("stop-writes-on-bgsave-error", true) {
+		return false
+	}
+	if len(parseSavePoints(confValue(d.conf, "save", ""))) == 0 {
+		return false
+	}
+	d.persist.mu.Lock()
+	status := d.persist.lastStatus
+	d.persist.mu.Unlock()
+	return status == "err"
+}
+
 // savePoint is one "save <seconds> <changes>" rule.
 type savePoint struct {
 	seconds int64
