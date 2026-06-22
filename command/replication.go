@@ -54,6 +54,28 @@ func (b *replBacklog) feed(data []byte) {
 	}
 }
 
+// copyFrom returns the backlog bytes from startOff to the current end, used to
+// serve a partial resync. The bool is false when startOff falls outside the
+// window the backlog still holds, in which case the master must fall back to a
+// full resync. startOff is in the same offset space as master_repl_offset: it is
+// the offset of the first byte the replica still needs. The caller holds repl.mu.
+func (b *replBacklog) copyFrom(startOff int64) ([]byte, bool) {
+	if startOff < b.off || startOff > b.off+b.histlen {
+		return nil, false
+	}
+	n := int64(len(b.buf))
+	rel := startOff - b.off
+	length := b.histlen - rel
+	out := make([]byte, length)
+	// The oldest retained byte sits at writeCur-histlen in the running write
+	// counter, so the byte at startOff is rel positions further along.
+	start := b.writeCur - b.histlen + rel
+	for i := int64(0); i < length; i++ {
+		out[i] = b.buf[(start+i)%n]
+	}
+	return out, true
+}
+
 // replicaHandle is the master's record of one connected replica.
 type replicaHandle struct {
 	conn      *networking.Conn
@@ -147,15 +169,71 @@ func (d *Dispatcher) ensureBacklog() {
 	d.repl.on.Store(true)
 }
 
-// handlePsync serves PSYNC and SYNC. It performs a full resync: it replies
-// +FULLRESYNC, sends the current dataset as an RDB payload, and registers the
-// connection as a replica so future writes stream to it. Partial resync is not
-// offered yet, so a reconnecting replica gets a fresh snapshot.
+// handlePsync serves PSYNC and SYNC. A PSYNC carrying a known replid and an
+// offset still inside the backlog window is answered with +CONTINUE and the
+// missing bytes (a partial resync). Otherwise it falls back to a full resync:
+// +FULLRESYNC, the current dataset as an RDB payload, and registration as a
+// replica so future writes stream to it. SYNC is always a full resync.
 func (d *Dispatcher) handlePsync(ctx *Ctx, psync bool) {
 	if d.engine == nil {
 		ctx.enc().WriteError("ERR This instance has no keyspace to replicate")
 		return
 	}
+	if psync && len(ctx.Argv) >= 3 {
+		reqReplid := string(ctx.Argv[1])
+		reqOff, ok := parseInteger(ctx.Argv[2])
+		if ok && reqReplid != "?" && reqOff >= 0 && d.tryPartialResync(ctx, reqReplid, reqOff) {
+			return
+		}
+	}
+	d.fullResync(ctx, psync)
+}
+
+// tryPartialResync attempts a +CONTINUE resume from reqOff. It succeeds only when
+// a backlog exists, the replica's replid matches the current replid (or the
+// previous replid within its failover window), and reqOff still falls inside the
+// backlog. On success it writes +CONTINUE, the backlog tail, and registers the
+// replica. It reports whether it handled the request.
+func (d *Dispatcher) tryPartialResync(ctx *Ctx, reqReplid string, reqOff int64) bool {
+	d.repl.mu.Lock()
+	defer d.repl.mu.Unlock()
+	if d.repl.backlog == nil {
+		return false
+	}
+	// The replid in +CONTINUE is always the current replid. A replica that was
+	// following the old master before a failover presents replid2; we bridge it as
+	// long as its offset is within the second-replid window.
+	switch {
+	case reqReplid == d.repl.replid:
+	case reqReplid == d.repl.replid2 && d.repl.secondOffset >= 0 && reqOff <= d.repl.secondOffset:
+	default:
+		return false
+	}
+	data, ok := d.repl.backlog.copyFrom(reqOff)
+	if !ok {
+		return false
+	}
+	hdr := append([]byte("+CONTINUE "+d.repl.replid+"\r\n"), data...)
+	if err := ctx.Conn.Deliver(hdr); err != nil {
+		return false
+	}
+	d.repl.replicas[ctx.Conn.ID()] = &replicaHandle{
+		conn:      ctx.Conn,
+		addr:      replicaIP(ctx.Conn.RemoteAddr()),
+		port:      ctx.replPort(),
+		ackOffset: reqOff + int64(len(data)),
+		ackTime:   time.Now(),
+		state:     "online",
+	}
+	if sess, ok := ctx.Conn.Session().(*session); ok {
+		sess.isReplica = true
+	}
+	return true
+}
+
+// fullResync sends a full snapshot: +FULLRESYNC (for PSYNC), the RDB payload, and
+// registers the connection so later writes stream to it.
+func (d *Dispatcher) fullResync(ctx *Ctx, psync bool) {
 	snap, err := d.engine.snapshotAll()
 	if err != nil {
 		ctx.enc().WriteError("ERR Failed to produce snapshot for SYNC")
@@ -405,17 +483,19 @@ func (d *Dispatcher) replicaSession(gen int, stop chan struct{}, host string, po
 		return err
 	}
 	d.setLink(gen, "sync")
-	startOff, err := d.replReadFullresync(conn, br)
+	continued, startOff, err := d.replSendPsync(conn, br)
 	if err != nil {
 		return err
 	}
-	if err := d.replLoadRDB(br); err != nil {
-		return err
+	if !continued {
+		if err := d.replLoadRDB(br); err != nil {
+			return err
+		}
+		d.repl.mu.Lock()
+		d.repl.slaveOff = startOff
+		d.repl.offset = startOff
+		d.repl.mu.Unlock()
 	}
-	d.repl.mu.Lock()
-	d.repl.slaveOff = startOff
-	d.repl.offset = startOff
-	d.repl.mu.Unlock()
 	d.setLink(gen, "connected")
 
 	return d.replApplyLoop(gen, conn, br)
@@ -446,27 +526,53 @@ func (d *Dispatcher) replHandshake(conn net.Conn, br *bufio.Reader) error {
 	return nil
 }
 
-// replReadFullresync sends PSYNC ? -1 and parses the +FULLRESYNC reply, learning
-// the master's replid and the offset the stream starts at.
-func (d *Dispatcher) replReadFullresync(conn net.Conn, br *bufio.Reader) (int64, error) {
-	if err := writeRESPCommand(conn, "PSYNC", "?", "-1"); err != nil {
-		return 0, err
+// replSendPsync sends PSYNC and parses the master's decision. On the first
+// connect, or when no usable cached replid is held, it sends PSYNC ? -1 and a
+// +FULLRESYNC follows. On reconnect it presents the cached replid and the next
+// offset it needs; the master answers +CONTINUE to resume from the backlog or
+// +FULLRESYNC to start over. continued is true for the +CONTINUE case, in which
+// the caller skips the RDB load and keeps its current offset.
+func (d *Dispatcher) replSendPsync(conn net.Conn, br *bufio.Reader) (continued bool, startOff int64, err error) {
+	d.repl.mu.Lock()
+	cachedReplid := d.repl.masterReplid
+	cachedOff := d.repl.slaveOff
+	d.repl.mu.Unlock()
+
+	replid, off := "?", "-1"
+	if cachedReplid != "" && cachedReplid != strings.Repeat("0", 40) {
+		// slaveOff is the offset just past the last byte applied, which is exactly
+		// the first byte still needed, so it goes on the wire as-is.
+		replid, off = cachedReplid, strconv.FormatInt(cachedOff, 10)
+	}
+	if err := writeRESPCommand(conn, "PSYNC", replid, off); err != nil {
+		return false, 0, err
 	}
 	line, err := readLine(br)
 	if err != nil {
-		return 0, err
+		return false, 0, err
 	}
-	// +FULLRESYNC <replid> <offset>
 	fields := strings.Fields(strings.TrimPrefix(line, "+"))
-	if len(fields) >= 3 && strings.EqualFold(fields[0], "FULLRESYNC") {
+	if len(fields) == 0 {
+		return false, 0, errString("unexpected PSYNC reply: " + line)
+	}
+	switch {
+	case strings.EqualFold(fields[0], "CONTINUE"):
+		if len(fields) >= 2 {
+			d.repl.mu.Lock()
+			d.repl.masterReplid = fields[1]
+			d.repl.replid = fields[1]
+			d.repl.mu.Unlock()
+		}
+		return true, 0, nil
+	case strings.EqualFold(fields[0], "FULLRESYNC") && len(fields) >= 3:
 		d.repl.mu.Lock()
 		d.repl.masterReplid = fields[1]
 		d.repl.replid = fields[1]
 		d.repl.mu.Unlock()
-		off, _ := strconv.ParseInt(fields[2], 10, 64)
-		return off, nil
+		startOff, _ = strconv.ParseInt(fields[2], 10, 64)
+		return false, startOff, nil
 	}
-	return 0, errString("unexpected PSYNC reply: " + line)
+	return false, 0, errString("unexpected PSYNC reply: " + line)
 }
 
 // replLoadRDB reads the RDB bulk payload that follows +FULLRESYNC and loads it

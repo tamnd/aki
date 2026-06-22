@@ -2,7 +2,10 @@ package command
 
 import (
 	"bufio"
+	"io"
 	"net"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -140,6 +143,132 @@ func TestWaitReturnsReplicaCount(t *testing.T) {
 	got := sendArgs(t, mr, mc, "WAIT", "1", "3000")
 	if got != int64(1) {
 		t.Fatalf("WAIT 1 = %v want 1", got)
+	}
+}
+
+// TestReplBacklogCopyFrom checks the ring buffer returns the right tail for a
+// resume offset, both before and after the buffer wraps and overwrites old bytes.
+func TestReplBacklogCopyFrom(t *testing.T) {
+	b := newReplBacklog(8, 0)
+	b.feed([]byte("abcd"))
+	// Offset 0 is the start, so the whole content comes back.
+	if got, ok := b.copyFrom(0); !ok || string(got) != "abcd" {
+		t.Fatalf("copyFrom(0) = %q %v want abcd true", got, ok)
+	}
+	// A mid-stream offset returns only the tail.
+	if got, ok := b.copyFrom(2); !ok || string(got) != "cd" {
+		t.Fatalf("copyFrom(2) = %q %v want cd true", got, ok)
+	}
+	// The end offset returns an empty slice, which is a valid resume with nothing
+	// buffered yet.
+	if got, ok := b.copyFrom(4); !ok || len(got) != 0 {
+		t.Fatalf("copyFrom(4) = %q %v want empty true", got, ok)
+	}
+	// An offset past the end is out of range.
+	if _, ok := b.copyFrom(5); ok {
+		t.Fatalf("copyFrom(5) should be out of range")
+	}
+
+	// Overflow the 8-byte ring so the base offset advances and old bytes are gone.
+	b.feed([]byte("efghij")) // total fed 10 bytes, ring holds the last 8 (offsets 2..9)
+	if b.off != 2 {
+		t.Fatalf("base offset = %d want 2 after overflow", b.off)
+	}
+	if _, ok := b.copyFrom(1); ok {
+		t.Fatalf("copyFrom(1) should be out of range after overwrite")
+	}
+	if got, ok := b.copyFrom(2); !ok || string(got) != "cdefghij" {
+		t.Fatalf("copyFrom(2) = %q %v want cdefghij true", got, ok)
+	}
+	if got, ok := b.copyFrom(6); !ok || string(got) != "ghij" {
+		t.Fatalf("copyFrom(6) = %q %v want ghij true", got, ok)
+	}
+}
+
+// rawCmd writes a RESP array of bulk strings to conn, the wire form a replica
+// sends during the replication handshake.
+func rawCmd(t *testing.T, conn net.Conn, parts ...string) {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("*" + strconv.Itoa(len(parts)) + "\r\n")
+	for _, p := range parts {
+		b.WriteString("$" + strconv.Itoa(len(p)) + "\r\n" + p + "\r\n")
+	}
+	if _, err := conn.Write([]byte(b.String())); err != nil {
+		t.Fatalf("rawCmd write: %v", err)
+	}
+}
+
+// readAvailable reads from br for up to d, returning everything it saw. It is for
+// draining the replication stream, which has no single framed reply to parse.
+func readAvailable(conn net.Conn, br *bufio.Reader, d time.Duration) string {
+	var sb strings.Builder
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		n, err := br.Read(buf)
+		if n > 0 {
+			sb.Write(buf[:n])
+		}
+		if err != nil {
+			continue
+		}
+	}
+	return sb.String()
+}
+
+// TestPartialResyncContinue drives the master side of partial resync over a raw
+// socket. A fake replica does a full resync to learn the replid and offset, then
+// disconnects. After the master takes more writes a fresh connection presents the
+// cached replid and offset and the master answers +CONTINUE and streams the bytes
+// the replica missed rather than a whole new snapshot.
+func TestPartialResyncContinue(t *testing.T) {
+	mr, mc, mHost, mPort := startDataAddr(t)
+	_ = mr
+
+	// First attach: full resync to capture the replid and the stream offset.
+	rb, rc := dial(t, mHost+":"+mPort)
+	rawCmd(t, rc, "REPLCONF", "listening-port", "0")
+	if _, err := rb.ReadString('\n'); err != nil { // +OK
+		t.Fatalf("REPLCONF reply: %v", err)
+	}
+	rawCmd(t, rc, "PSYNC", "?", "-1")
+	line, err := rb.ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, "+FULLRESYNC ") {
+		t.Fatalf("PSYNC reply = %q err %v want +FULLRESYNC", line, err)
+	}
+	fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "+")))
+	replid := fields[1]
+	offset := fields[2]
+	// Consume the RDB bulk so the socket is clean, then drop the connection.
+	blobLine, err := rb.ReadString('\n')
+	if err != nil || !strings.HasPrefix(blobLine, "$") {
+		t.Fatalf("RDB bulk header = %q err %v", blobLine, err)
+	}
+	blobLen, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(blobLine, "$")))
+	if _, err := io.ReadFull(rb, make([]byte, blobLen)); err != nil {
+		t.Fatalf("read RDB blob: %v", err)
+	}
+	_ = rc.Close()
+
+	// The master takes writes while the replica is away. These land in the backlog.
+	if got := sendLine(t, mr, mc, "SET pa 1"); got != "+OK" {
+		t.Fatalf("SET pa = %q", got)
+	}
+	if got := sendLine(t, mr, mc, "SET pb 2"); got != "+OK" {
+		t.Fatalf("SET pb = %q", got)
+	}
+
+	// Reconnect and present the cached replid and offset. The master should resume.
+	rb2, rc2 := dial(t, mHost+":"+mPort)
+	rawCmd(t, rc2, "PSYNC", replid, offset)
+	stream := readAvailable(rc2, rb2, 1500*time.Millisecond)
+	if !strings.Contains(stream, "+CONTINUE") {
+		t.Fatalf("partial resync reply did not start with +CONTINUE:\n%q", stream)
+	}
+	if !strings.Contains(stream, "pa") || !strings.Contains(stream, "pb") {
+		t.Fatalf("partial resync stream missing the missed writes:\n%q", stream)
 	}
 }
 
