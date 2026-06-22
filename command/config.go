@@ -141,6 +141,12 @@ func configDirectives() []*directive {
 		{name: "metrics-bind", kind: dirString, def: "127.0.0.1"},
 		{name: "metrics-tls", kind: dirBool, def: "no"},
 
+		// Admin endpoint (doc 21 section 10.1). Serves Go's net/http/pprof
+		// handlers, plus /metrics and the health probes, on its own port.
+		// Bound to loopback by default. Set admin-port to 0 to turn it off.
+		{name: "admin-port", kind: dirInt, def: "6399"},
+		{name: "admin-bind", kind: dirString, def: "127.0.0.1"},
+
 		// Continuous profiling (doc 21 section 10.2). When on, a background
 		// goroutine writes cpu, heap, and mutex pprof snapshots to profiling-dir
 		// every profiling-interval seconds and keeps the newest profiling-keep.
