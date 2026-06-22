@@ -1,6 +1,7 @@
 package command
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -54,12 +55,59 @@ func TestDebugNoOps(t *testing.T) {
 		"DEBUG SET-ACTIVE-EXPIRE 0",
 		"DEBUG SET-ACTIVE-EXPIRE 1",
 		"DEBUG QUICKLIST-PACKED-THRESHOLD 100",
-		"DEBUG CHANGE-REPL-ID",
-		"DEBUG JMAP",
 	} {
 		if got := sendLine(t, r, c, cmd); got != "+OK" {
 			t.Fatalf("%q = %q", cmd, got)
 		}
+	}
+}
+
+// TestDebugChangeReplID checks the replid actually rolls and the old one is
+// preserved as master_replid2, the way a promotion records it.
+func TestDebugChangeReplID(t *testing.T) {
+	r, c := start(t, Config{})
+	before := infoField(t, r, c, "replication", "master_replid")
+	if got := sendLine(t, r, c, "DEBUG CHANGE-REPL-ID"); got != "+OK" {
+		t.Fatalf("DEBUG CHANGE-REPL-ID = %q", got)
+	}
+	after := infoField(t, r, c, "replication", "master_replid")
+	if after == before {
+		t.Fatalf("master_replid did not change: still %q", after)
+	}
+	if second := infoField(t, r, c, "replication", "master_replid2"); second != before {
+		t.Fatalf("master_replid2 = %q want old replid %q", second, before)
+	}
+}
+
+// TestDebugJMAP runs DEBUG JMAP in a temp working directory and checks it drops
+// a heap profile file there.
+func TestDebugJMAP(t *testing.T) {
+	dir := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	r, c := start(t, Config{})
+	if got := sendLine(t, r, c, "DEBUG JMAP"); got != "+OK" {
+		t.Fatalf("DEBUG JMAP = %q", got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "aki-heap-") && strings.HasSuffix(e.Name(), ".prof") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("DEBUG JMAP wrote no heap profile, dir has %v", entries)
 	}
 }
 
