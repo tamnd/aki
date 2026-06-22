@@ -104,6 +104,7 @@ func TestMetaPageRoundTrip(t *testing.T) {
 	m := NewMetaPage(h, 1)
 	m.TxnID = 99
 	m.CatalogRoot = 5
+	m.SystemRoot = 11
 	m.DBRootPages[0] = 7
 	b := make([]byte, DefaultPageSize)
 	if err := m.MarshalTo(b, DefaultPageSize); err != nil {
@@ -113,7 +114,7 @@ func TestMetaPageRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.MetaSeq != 1 || got.TxnID != 99 || got.CatalogRoot != 5 {
+	if got.MetaSeq != 1 || got.TxnID != 99 || got.CatalogRoot != 5 || got.SystemRoot != 11 {
 		t.Errorf("meta fields lost: %+v", got)
 	}
 	if got.DBRootPages[0] != 7 || got.DBRootPages[1] != NullPage {

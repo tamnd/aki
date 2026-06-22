@@ -8,6 +8,7 @@ import "github.com/tamnd/aki/format"
 // inherit the current live meta.
 type CommitInfo struct {
 	CatalogRoot   uint32
+	SystemRoot    uint32
 	DBRootPages   [8]uint32
 	WALCommitLSN  uint64
 	SchemaVersion uint32
@@ -16,6 +17,8 @@ type CommitInfo struct {
 	SetDBRoots bool
 	// SetCatalogRoot, when true, replaces the catalog root.
 	SetCatalogRoot bool
+	// SetSystemRoot, when true, replaces the system table root.
+	SetSystemRoot bool
 }
 
 // Commit makes the current set of dirty pages durable and atomically advances
@@ -65,6 +68,9 @@ func (p *Pager) Commit(info CommitInfo) error {
 	next.FreelistCount = p.meta.FreelistCount
 	if info.SetCatalogRoot {
 		next.CatalogRoot = info.CatalogRoot
+	}
+	if info.SetSystemRoot {
+		next.SystemRoot = info.SystemRoot
 	}
 	if info.SetDBRoots {
 		next.DBRootPages = info.DBRootPages

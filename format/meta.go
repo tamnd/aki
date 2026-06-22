@@ -20,6 +20,7 @@ type MetaPage struct {
 	DBCount       uint32    // offset 64
 	SchemaVersion uint32    // offset 68
 	DBRootPages   [8]uint32 // offset 72 (32 bytes)
+	SystemRoot    uint32    // offset 104, root of the system table B-tree
 	// MetaChecksum at offset 120 is CRC-32C of bytes 0..119; computed by
 	// MarshalTo and verified by ParseMetaPage.
 	MetaChecksum uint32
@@ -55,7 +56,8 @@ func (m MetaPage) MarshalTo(b []byte, pageSize uint32) error {
 	for i := range 8 {
 		encoding.PutU32(b[72+i*4:], m.DBRootPages[i])
 	}
-	// bytes 104..119 reserved, already zeroed.
+	encoding.PutU32(b[104:], m.SystemRoot)
+	// bytes 108..119 reserved, already zeroed.
 	sum := crc32c(b[0:120])
 	encoding.PutU32(b[120:], sum)
 	return nil
@@ -90,6 +92,7 @@ func ParseMetaPage(b []byte) (MetaPage, error) {
 	for i := range 8 {
 		m.DBRootPages[i] = encoding.U32(b[72+i*4:])
 	}
+	m.SystemRoot = encoding.U32(b[104:])
 	m.MetaChecksum = stored
 	return m, nil
 }
@@ -114,6 +117,7 @@ func NewMetaPage(h FileHeader, metaSeq uint64) MetaPage {
 		DBCount:       h.DBCount,
 		SchemaVersion: h.SchemaVersion,
 		DBRootPages:   roots,
+		SystemRoot:    NullPage,
 	}
 }
 
