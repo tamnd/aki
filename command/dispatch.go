@@ -159,6 +159,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, zsetRankCommands()...)
 	cmds = append(cmds, zsetRangeCommands()...)
 	cmds = append(cmds, zsetOpCommands()...)
+	cmds = append(cmds, blockingZSetCommands()...)
 	cmds = append(cmds, hllCommands()...)
 	cmds = append(cmds, geoCommands()...)
 	cmds = append(cmds, streamCommands()...)

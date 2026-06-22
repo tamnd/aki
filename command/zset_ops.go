@@ -375,6 +375,7 @@ func zSetOpStore(ctx *Ctx, op zsetOp) {
 	}
 	if n > 0 {
 		ctx.notify(notifyZset, zSetStoreEvent(op), dst)
+		ctx.signalReady(dst)
 	} else if dstDeleted {
 		ctx.notify(notifyGeneric, "del", dst)
 	}
