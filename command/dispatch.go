@@ -58,6 +58,10 @@ type Dispatcher struct {
 	// persist holds the RDB save bookkeeping that SAVE, BGSAVE, LASTSAVE, the
 	// automatic save points, and INFO persistence all read and write.
 	persist persistState
+
+	// aof holds the append-only-file emulation state that BGREWRITEAOF, the
+	// auto-rewrite trigger, and INFO persistence read and write.
+	aof aofState
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -105,6 +109,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, dumpCommands()...)
 	cmds = append(cmds, migrateCommands()...)
 	cmds = append(cmds, persistenceCommands()...)
+	cmds = append(cmds, aofCommands()...)
 	cmds = append(cmds, adminCommands()...)
 	cmds = append(cmds, objectCommands()...)
 	cmds = append(cmds, transactionCommands()...)
@@ -149,6 +154,7 @@ func (d *Dispatcher) StartBackground() {
 	if d.bgStop != nil {
 		return
 	}
+	d.initAOF()
 	d.bgStop = make(chan struct{})
 	d.bgDone = make(chan struct{})
 	interval := time.Second / time.Duration(d.hz)
@@ -163,6 +169,7 @@ func (d *Dispatcher) StartBackground() {
 			case <-t.C:
 				d.runActiveExpire()
 				d.checkSavePoints()
+				d.checkAOFRewrite()
 			}
 		}
 	}()
@@ -178,6 +185,7 @@ func (d *Dispatcher) StopBackground() {
 	<-d.bgDone
 	d.bgStop = nil
 	d.bgDone = nil
+	d.closeAOF()
 }
 
 // runActiveExpire runs one active expiry pass and fires the expired event for
