@@ -80,7 +80,6 @@ func handleACLSetUser(ctx *Ctx) {
 	}
 	a := ctx.d.acl
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	existing := a.users[name]
 	var u *aclUser
 	if existing != nil {
@@ -95,10 +94,13 @@ func handleACLSetUser(ctx *Ctx) {
 		u = &aclUser{name: name, created: time.Now()}
 	}
 	if err := applyACLRules(u, tokens); err != nil {
+		a.mu.Unlock()
 		ctx.enc().WriteError("ERR " + err.Error())
 		return
 	}
 	a.users[name] = u
+	a.mu.Unlock()
+	ctx.d.persistACL()
 	ctx.Conn.WriteRaw(resp.ReplyOK)
 }
 
@@ -200,6 +202,9 @@ func handleACLDelUser(ctx *Ctx) {
 		if ctx.d.acl.del(string(a)) {
 			n++
 		}
+	}
+	if n > 0 {
+		ctx.d.persistACL()
 	}
 	ctx.enc().WriteInteger(int64(n))
 }
