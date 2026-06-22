@@ -514,6 +514,13 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		d.statError(msg)
 		return
 	}
+	if !sess.fromMaster && d.denyStaleData(cmd) {
+		msg := "MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'."
+		c.Enc().WriteError(msg)
+		d.statReject(cmd)
+		d.statError(msg)
+		return
+	}
 	if cmd.Flags.Has(FlagWrite) && !sess.fromMaster && d.isReadonlyReplica() {
 		msg := "READONLY You can't write against a read only replica."
 		c.Enc().WriteError(msg)
