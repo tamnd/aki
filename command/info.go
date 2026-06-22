@@ -253,13 +253,25 @@ func infoMemory(ctx *Ctx, b *strings.Builder) {
 	line(b, "used_memory_rss_human", humanBytes(rss))
 	lineInt(b, "used_memory_peak", peak)
 	line(b, "used_memory_peak_human", humanBytes(peak))
+	line(b, "used_memory_peak_perc", fmtPercent(used, peak))
+	// aki does not meter bookkeeping apart from the dataset, so overhead and
+	// startup are 0 and the whole of used_memory is the dataset. MEMORY STATS
+	// reports the same split.
+	lineInt(b, "used_memory_overhead", 0)
+	lineInt(b, "used_memory_startup", 0)
+	lineInt(b, "used_memory_dataset", used)
+	line(b, "used_memory_dataset_perc", fmtPercent(used, peak))
+	sysmem := systemMemoryBytes()
+	lineInt(b, "total_system_memory", sysmem)
+	line(b, "total_system_memory_human", humanBytes(sysmem))
 	// Go allocator view of the heap. allocated is live bytes, active is the heap
 	// in use, resident is what the runtime holds from the OS.
 	allocated := int64(ms.HeapAlloc)
 	active := int64(ms.HeapInuse)
+	resident := int64(ms.HeapSys)
 	lineInt(b, "allocator_allocated", allocated)
 	lineInt(b, "allocator_active", active)
-	lineInt(b, "allocator_resident", int64(ms.HeapSys))
+	lineInt(b, "allocator_resident", resident)
 	// Scripting memory. aki does not meter the Lua VM in bytes, so the byte fields
 	// stay 0 and only the counts carry real values. The vm and scripts totals keep
 	// the sums the spec defines so a client that reads them sees consistent math.
@@ -283,8 +295,23 @@ func infoMemory(ctx *Ctx, b *strings.Builder) {
 	line(b, "maxmemory_policy", ctx.confStr("maxmemory-policy", "noeviction"))
 	line(b, "allocator_frag_ratio", fmtRatio(active, allocated))
 	lineInt(b, "allocator_frag_bytes", active-allocated)
+	line(b, "allocator_rss_ratio", fmtRatio(resident, active))
+	lineInt(b, "allocator_rss_bytes", resident-active)
+	line(b, "rss_overhead_ratio", fmtRatio(rss, resident))
+	lineInt(b, "rss_overhead_bytes", rss-resident)
 	line(b, "mem_allocator", "go-runtime")
 	line(b, "mem_fragmentation_ratio", fmtRatio(rss, used))
+	lineInt(b, "mem_fragmentation_bytes", rss-used)
+	// aki does not meter client output buffers, the replication backlog, cluster
+	// links, or an AOF buffer in bytes, so these report 0. They exist so a client
+	// that reads them finds the field rather than a gap.
+	lineInt(b, "mem_not_counted_for_evict", 0)
+	lineInt(b, "mem_replication_backlog", 0)
+	lineInt(b, "mem_total_replication_buffers", 0)
+	lineInt(b, "mem_clients_slaves", 0)
+	lineInt(b, "mem_clients_normal", 0)
+	lineInt(b, "mem_cluster_links", 0)
+	lineInt(b, "mem_aof_buffer", 0)
 	lineInt(b, "active_defrag_running", 0)
 	lineInt(b, "lazyfree_pending_objects", 0)
 	lineInt(b, "lazyfreed_objects", 0)
@@ -404,6 +431,16 @@ func fmtCacheRatio(hits, misses uint64) string {
 		return "0.0000"
 	}
 	return strconv.FormatFloat(float64(hits)/float64(total), 'f', 4, 64)
+}
+
+// fmtPercent renders part over whole as the "50.00%" string the memory section
+// uses. It reports "0.00%" when whole is not positive so an empty server does not
+// divide by zero.
+func fmtPercent(part, whole int64) string {
+	if whole <= 0 {
+		return "0.00%"
+	}
+	return strconv.FormatFloat(float64(part)/float64(whole)*100, 'f', 2, 64) + "%"
 }
 
 // fmtDiskRamRatio renders the dataset-file size over total system memory. It
