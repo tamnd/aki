@@ -114,6 +114,8 @@ func latencyCommands() []*CmdDesc {
 				Arity: 2, Flags: FlagLoading | FlagAdmin, Handler: handleLatencyDoctor},
 			{Name: "graph", SubName: "latency|graph", Group: GroupServer, Since: "2.8.13",
 				Arity: 3, Flags: FlagLoading | FlagAdmin, Handler: handleLatencyGraph},
+			{Name: "histogram", SubName: "latency|histogram", Group: GroupServer, Since: "7.0.0",
+				Arity: -2, Flags: FlagLoading | FlagAdmin | FlagFast, Handler: handleLatencyHistogram},
 			{Name: "help", SubName: "latency|help", Group: GroupServer, Since: "6.2.0",
 				Arity: 2, Flags: FlagLoading | FlagStale, Handler: handleLatencyHelp},
 		},
@@ -261,6 +263,35 @@ func minInt64(vals []int64) int64 {
 	return m
 }
 
+// handleLatencyHistogram reports a per-command latency histogram in microseconds.
+// With no arguments it covers every command that has run; with arguments it
+// covers only the named commands. The reply is a map keyed by command name, each
+// value a map of calls and a cumulative histogram_usec, the same shape real
+// Redis returns. The spec named an external HDR library and a different reply
+// layout, but aki carries no dependencies and wire compatibility wins, so this
+// reads the per-command histograms already kept for INFO latencystats.
+func handleLatencyHistogram(ctx *Ctx) {
+	names := make([]string, 0, len(ctx.Argv)-2)
+	for _, a := range ctx.Argv[2:] {
+		names = append(names, strings.ToLower(string(a)))
+	}
+	entries := ctx.d.commandHistograms(names)
+	enc := ctx.enc()
+	enc.WriteMapLen(len(entries))
+	for _, e := range entries {
+		enc.WriteBulkStringStr(e.name)
+		enc.WriteMapLen(2)
+		enc.WriteBulkStringStr("calls")
+		enc.WriteInteger(int64(e.calls))
+		enc.WriteBulkStringStr("histogram_usec")
+		enc.WriteMapLen(len(e.points))
+		for _, p := range e.points {
+			enc.WriteInteger(int64(p.bound))
+			enc.WriteInteger(int64(p.count))
+		}
+	}
+}
+
 func handleLatencyHelp(ctx *Ctx) {
 	writeHelp(ctx, []string{
 		"LATENCY <subcommand> [<arg> ...]. Subcommands are:",
@@ -274,6 +305,8 @@ func handleLatencyHelp(ctx *Ctx) {
 		"    Return a human readable latency analysis report.",
 		"GRAPH <event>",
 		"    Return a latency graph for the <event> class.",
+		"HISTOGRAM [<command> ...]",
+		"    Return a cumulative latency histogram by command (default: all commands).",
 		"HELP",
 		"    Print this help.",
 	})
