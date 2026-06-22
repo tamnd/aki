@@ -133,6 +133,12 @@ func checkAki(name string, fix, verbose bool, w io.Writer) int {
 		res.ok("B-tree structure (%d databases)", len(checks))
 	}
 
+	if err := ks.CheckPageAccounting(); err != nil {
+		res.err("page accounting: %v", err)
+	} else {
+		res.ok("page accounting (no leaks, no double-free)")
+	}
+
 	if orderErrors > 0 {
 		res.err("B-tree key ordering (%d out-of-order entries)", orderErrors)
 	} else {

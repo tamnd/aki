@@ -140,3 +140,35 @@ func (c *checker) verifyLeafChain() error {
 // maxDepth bounds the walk so a corrupt child pointer that forms a cycle is
 // reported instead of recursing without end.
 const maxDepth = 64
+
+// Pages returns every page number the tree occupies: the root, every interior
+// node, and every leaf. The page-accounting check uses it to learn which pages a
+// tree holds live, so it can prove no live page also sits on the freelist. The
+// order is the structural walk order, not key order.
+func Pages(t *Tree) ([]uint32, error) {
+	var out []uint32
+	if err := collectPages(t, t.root, 0, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func collectPages(t *Tree, pgno uint32, depth int, out *[]uint32) error {
+	if depth > maxDepth {
+		return fmt.Errorf("btree: tree deeper than %d levels, likely a cycle", maxDepth)
+	}
+	*out = append(*out, pgno)
+	n, err := t.readNode(pgno)
+	if err != nil {
+		return fmt.Errorf("btree: read page %d: %w", pgno, err)
+	}
+	if n.leaf {
+		return nil
+	}
+	for _, child := range n.children {
+		if err := collectPages(t, child, depth+1, out); err != nil {
+			return err
+		}
+	}
+	return nil
+}

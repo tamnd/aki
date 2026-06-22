@@ -532,8 +532,12 @@ func (ks *Keyspace) Commit() error {
 	}
 	ks.pgr.Unpin(pg, true)
 
-	return ks.pgr.Commit(pager.CommitInfo{
+	if err := ks.pgr.Commit(pager.CommitInfo{
 		CatalogRoot:    ks.catRoot,
 		SetCatalogRoot: true,
-	})
+	}); err != nil {
+		return err
+	}
+	ks.assertConsistent()
+	return nil
 }
