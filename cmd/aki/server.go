@@ -25,6 +25,7 @@ func cmdServer(args []string) error {
 	maxClients := fs.Int("maxclients", 10000, "maximum number of connected clients")
 	databases := fs.Int("databases", 16, "number of logical databases")
 	requirePass := fs.String("requirepass", "", "password required for the default user")
+	aclFile := fs.String("aclfile", "", "path to an external ACL file loaded at startup and written by ACL SAVE")
 	dbfile := fs.String("dbfile", "aki.db", "path to the .aki data file")
 	loadRDB := fs.String("load-rdb", "", "import this dump.rdb on first open (only when the .aki file does not exist)")
 	rdbDB := fs.Int("rdb-db", -1, "with --load-rdb, import only this source database")
@@ -54,6 +55,7 @@ func cmdServer(args []string) error {
 	d := command.New(command.Config{
 		Databases:   *databases,
 		RequirePass: *requirePass,
+		AclFile:     *aclFile,
 		Version:     fmt.Sprintf("7.2.0-aki-%s", Version),
 		Engine:      command.NewEngine(ks),
 	})

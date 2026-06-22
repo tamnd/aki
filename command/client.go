@@ -342,8 +342,14 @@ func buildClientLine(c *networking.Conn, now time.Time) string {
 		libName, libVer = s.libName, s.libVer
 	}
 	cmd := "NULL"
-	if s, ok := c.Session().(*session); ok && s.lastCmd != "" {
-		cmd = s.lastCmd
+	user := "default"
+	if s, ok := c.Session().(*session); ok {
+		if s.lastCmd != "" {
+			cmd = s.lastCmd
+		}
+		if s.username != "" {
+			user = s.username
+		}
 	}
 	age := int64(now.Sub(c.Created()).Seconds())
 	idle := max(int64(now.Sub(c.LastInteraction()).Seconds()), 0)
@@ -369,7 +375,7 @@ func buildClientLine(c *networking.Conn, now time.Time) string {
 	b.WriteString(" rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0")
 	b.WriteString(" events=r")
 	b.WriteString(" cmd=" + cmd)
-	b.WriteString(" user=default")
+	b.WriteString(" user=" + user)
 	b.WriteString(" redir=-1")
 	b.WriteString(" resp=" + strconv.Itoa(c.Proto()))
 	b.WriteString(" lib-name=" + libName)
