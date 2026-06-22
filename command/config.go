@@ -43,6 +43,7 @@ type configStore struct {
 	defs  map[string]*directive
 	order []string // directive names in registration order
 	vals  map[string]string
+	alias map[string]string // each alias name to its twin, both directions
 }
 
 // newConfigStore builds the store seeded with defaults. The dispatcher overrides
@@ -50,15 +51,38 @@ type configStore struct {
 // server.
 func newConfigStore() *configStore {
 	cs := &configStore{
-		defs: make(map[string]*directive),
-		vals: make(map[string]string),
+		defs:  make(map[string]*directive),
+		vals:  make(map[string]string),
+		alias: make(map[string]string),
 	}
 	for _, d := range configDirectives() {
 		cs.defs[d.name] = d
 		cs.order = append(cs.order, d.name)
 		cs.vals[d.name] = d.def
 	}
+	for _, p := range configAliasPairs() {
+		cs.alias[p[0]] = p[1]
+		cs.alias[p[1]] = p[0]
+	}
 	return cs
+}
+
+// configAliasPairs lists the directive names Redis keeps as aliases of each
+// other. The slave-era names alias the replica-era names, and the ziplist-era
+// names alias the listpack-era names. CONFIG GET returns both, and a CONFIG SET
+// to either name updates both so a client reading the other name sees the change.
+func configAliasPairs() [][2]string {
+	return [][2]string{
+		{"list-max-listpack-size", "list-max-ziplist-size"},
+		{"hash-max-listpack-entries", "hash-max-ziplist-entries"},
+		{"hash-max-listpack-value", "hash-max-ziplist-value"},
+		{"zset-max-listpack-entries", "zset-max-ziplist-entries"},
+		{"zset-max-listpack-value", "zset-max-ziplist-value"},
+		{"lua-time-limit", "busy-reply-threshold"},
+		{"min-replicas-to-write", "min-slaves-to-write"},
+		{"min-replicas-max-lag", "min-slaves-max-lag"},
+		{"cluster-replica-no-failover", "cluster-slave-no-failover"},
+	}
 }
 
 // set writes a value already known to be valid and canonical.
@@ -212,6 +236,162 @@ func configDirectives() []*directive {
 		{name: "lazyfree-lazy-server-del", kind: dirBool, def: "no", mutable: true},
 		{name: "lazyfree-lazy-user-del", kind: dirBool, def: "no", mutable: true},
 		{name: "lazyfree-lazy-user-flush", kind: dirBool, def: "no", mutable: true},
+
+		// The rest of the canonical CONFIG name surface from doc 24 A.24. aki
+		// reports and round-trips these so a redis.conf and a CONFIG GET * look
+		// complete to a client and to migration tooling. Many are accepted-and-
+		// reported only today, the same way real Redis reports configs that are
+		// no-ops on a given platform. The data-type-limit names here are not yet
+		// wired to the encoding codecs (those read compile-time thresholds), so
+		// setting them changes only what CONFIG GET reports, not the encoding.
+
+		// More network directives (A.5).
+		{name: "bind-source-addr", kind: dirString, def: "", mutable: true},
+		{name: "socket-mark-id", kind: dirInt, def: "0"},
+		{name: "unixsocketperm", kind: dirInt, def: "0"},
+		{name: "enable-protected-configs", kind: dirEnum, def: "no",
+			enum: []string{"no", "yes", "local"}},
+
+		// More process directives (A.6).
+		{name: "daemonize", kind: dirBool, def: "no"},
+		{name: "pidfile", kind: dirString, def: ""},
+		{name: "supervised", kind: dirEnum, def: "no",
+			enum: []string{"no", "upstart", "systemd", "auto"}},
+		{name: "proc-title-template", kind: dirString, def: "{title} {listen-addr} {server-mode}", mutable: true},
+		{name: "set-proc-title", kind: dirBool, def: "yes", mutable: true},
+		{name: "locale-collate", kind: dirString, def: "", mutable: true},
+
+		// More persistence directives (A.7).
+		{name: "rdb-del-sync-files", kind: dirBool, def: "no", mutable: true},
+		{name: "sanitize-dump-payload", kind: dirEnum, def: "no", mutable: true,
+			enum: []string{"no", "yes", "clients"}},
+
+		// More AOF directives (A.12).
+		{name: "aof-load-truncated", kind: dirBool, def: "yes", mutable: true},
+		{name: "aof-rewrite-incremental-fsync", kind: dirBool, def: "yes", mutable: true},
+		{name: "aof-timestamp-enabled", kind: dirBool, def: "no", mutable: true},
+		{name: "aof-use-rdb-preamble", kind: dirBool, def: "yes", mutable: true},
+		{name: "rdb-save-incremental-fsync", kind: dirBool, def: "yes", mutable: true},
+
+		// More replication directives (A.8).
+		{name: "repl-backlog-ttl", kind: dirInt, def: "3600", mutable: true},
+		{name: "repl-disable-tcp-nodelay", kind: dirBool, def: "no", mutable: true},
+		{name: "repl-diskless-sync", kind: dirBool, def: "yes", mutable: true},
+		{name: "repl-diskless-sync-delay", kind: dirInt, def: "5", mutable: true},
+		{name: "repl-diskless-sync-max-replicas", kind: dirInt, def: "0", mutable: true},
+		{name: "repl-diskless-load", kind: dirEnum, def: "disabled", mutable: true,
+			enum: []string{"disabled", "on-empty-db", "swapdb"}},
+		{name: "replica-serve-stale-data", kind: dirBool, def: "yes", mutable: true},
+		{name: "replica-announce-ip", kind: dirString, def: "", mutable: true},
+		{name: "replica-announce-port", kind: dirInt, def: "0", mutable: true},
+		{name: "replica-announced", kind: dirBool, def: "yes", mutable: true},
+		{name: "min-replicas-to-write", kind: dirInt, def: "0", mutable: true},
+		{name: "min-slaves-to-write", kind: dirInt, def: "0", mutable: true},
+		{name: "min-replicas-max-lag", kind: dirInt, def: "10", mutable: true},
+		{name: "min-slaves-max-lag", kind: dirInt, def: "10", mutable: true},
+		{name: "propagation-error-behavior", kind: dirEnum, def: "ignore",
+			enum: []string{"ignore", "panic", "panic-on-replicas"}},
+
+		// More memory and lazy-free directives (A.9, A.10).
+		{name: "replica-ignore-maxmemory", kind: dirBool, def: "yes", mutable: true},
+		{name: "replica-lazy-flush", kind: dirBool, def: "no", mutable: true},
+
+		// Threading directives (A.11). aki runs one serial writer, so the io-thread
+		// knobs are reported for compatibility and do not change execution.
+		{name: "io-threads", kind: dirInt, def: "1"},
+		{name: "io-threads-do-reads", kind: dirBool, def: "no"},
+		{name: "dynamic-hz", kind: dirBool, def: "yes", mutable: true},
+
+		// More data-type-limit directives (A.13).
+		{name: "hash-max-ziplist-entries", kind: dirInt, def: "128", mutable: true},
+		{name: "hash-max-ziplist-value", kind: dirInt, def: "64", mutable: true},
+		{name: "zset-max-ziplist-entries", kind: dirInt, def: "128", mutable: true},
+		{name: "zset-max-ziplist-value", kind: dirInt, def: "64", mutable: true},
+		{name: "list-compress-depth", kind: dirInt, def: "0", mutable: true},
+		{name: "stream-node-max-bytes", kind: dirMemory, def: "4096", mutable: true},
+		{name: "stream-node-max-entries", kind: dirInt, def: "100", mutable: true},
+		{name: "hll-sparse-max-bytes", kind: dirMemory, def: "3000", mutable: true},
+
+		// Scripting directives (A.14). busy-reply-threshold is the modern alias of
+		// lua-time-limit.
+		{name: "lua-time-limit", kind: dirInt, def: "5000", mutable: true},
+		{name: "busy-reply-threshold", kind: dirInt, def: "5000", mutable: true},
+
+		// Client and output-buffer directives (A.17).
+		{name: "client-output-buffer-limit", kind: dirString,
+			def: "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60", mutable: true},
+		{name: "client-query-buffer-limit", kind: dirMemory, def: "1073741824", mutable: true},
+		{name: "close-on-oom-score-adj-error", kind: dirBool, def: "no", mutable: true},
+
+		// More ACL directives (A.20).
+		{name: "acl-pubsub-default", kind: dirEnum, def: "resetchannels", mutable: true,
+			enum: []string{"resetchannels", "allchannels"}},
+		{name: "aclfile", kind: dirString, def: ""},
+		{name: "acllog-max-len", kind: dirInt, def: "128", mutable: true},
+		{name: "acllog-max-entry-bytes", kind: dirInt, def: "0", mutable: true},
+
+		// Active-rehashing and active-defrag directives (A.21).
+		{name: "activedefrag", kind: dirBool, def: "no", mutable: true},
+		{name: "active-defrag-cycle-max", kind: dirInt, def: "25", mutable: true},
+		{name: "active-defrag-cycle-min", kind: dirInt, def: "1", mutable: true},
+		{name: "active-defrag-ignore-bytes", kind: dirMemory, def: "104857600", mutable: true},
+		{name: "active-defrag-max-scan-fields", kind: dirInt, def: "1000", mutable: true},
+		{name: "active-defrag-threshold-lower", kind: dirInt, def: "10", mutable: true},
+		{name: "active-defrag-threshold-upper", kind: dirInt, def: "100", mutable: true},
+
+		// More cluster directives (A.18).
+		{name: "cluster-slave-no-failover", kind: dirBool, def: "no", mutable: true},
+		{name: "cluster-allow-nodelay", kind: dirBool, def: "no", mutable: true},
+		{name: "cluster-announce-human-nodename", kind: dirString, def: "", mutable: true},
+		{name: "cluster-preferred-endpoint-type", kind: dirEnum, def: "ip", mutable: true,
+			enum: []string{"ip", "hostname", "unknown-endpoint"}},
+
+		// TLS directives (A.19). aki uses crypto/tls; these are accepted and
+		// reported so a TLS-aware deployment config loads cleanly.
+		{name: "tls-port", kind: dirInt, def: "0"},
+		{name: "tls-cert-file", kind: dirString, def: "", mutable: true},
+		{name: "tls-key-file", kind: dirString, def: "", mutable: true},
+		{name: "tls-key-file-pass", kind: dirString, def: "", mutable: true},
+		{name: "tls-client-cert-file", kind: dirString, def: "", mutable: true},
+		{name: "tls-client-key-file", kind: dirString, def: "", mutable: true},
+		{name: "tls-dh-params-file", kind: dirString, def: "", mutable: true},
+		{name: "tls-ca-cert-file", kind: dirString, def: "", mutable: true},
+		{name: "tls-ca-cert-dir", kind: dirString, def: "", mutable: true},
+		{name: "tls-auth-clients", kind: dirEnum, def: "yes", mutable: true,
+			enum: []string{"no", "yes", "optional"}},
+		{name: "tls-protocols", kind: dirString, def: "", mutable: true},
+		{name: "tls-ciphers", kind: dirString, def: "", mutable: true},
+		{name: "tls-ciphersuites", kind: dirString, def: "", mutable: true},
+		{name: "tls-prefer-server-ciphers", kind: dirBool, def: "no", mutable: true},
+		{name: "tls-session-caching", kind: dirBool, def: "yes", mutable: true},
+		{name: "tls-session-cache-size", kind: dirInt, def: "20480", mutable: true},
+		{name: "tls-session-cache-timeout", kind: dirInt, def: "300", mutable: true},
+		{name: "tls-cluster", kind: dirBool, def: "no", mutable: true},
+		{name: "tls-replication", kind: dirBool, def: "no", mutable: true},
+
+		// aki-specific extensions (A.22). The storage knobs are fixed at file
+		// creation or wait on the WAL and compression milestones, so most are
+		// reported for completeness and a few are mutable.
+		{name: "in-memory", kind: dirBool, def: "no"},
+		{name: "page-size", kind: dirInt, def: "16384"},
+		{name: "shards", kind: dirInt, def: "1"},
+		{name: "aki-filename", kind: dirString, def: "aki.aki"},
+		{name: "buffer-pool-size", kind: dirMemory, def: "134217728", mutable: true},
+		{name: "buffer-pool-max", kind: dirMemory, def: "0", mutable: true},
+		{name: "wal-autocheckpoint", kind: dirInt, def: "1000", mutable: true},
+		{name: "wal-size-limit", kind: dirMemory, def: "0", mutable: true},
+		{name: "synchronous", kind: dirEnum, def: "normal", mutable: true,
+			enum: []string{"off", "normal", "full", "extra"}},
+		{name: "compression", kind: dirEnum, def: "none", mutable: true,
+			enum: []string{"none", "lz4", "zstd"}},
+		{name: "compression-level", kind: dirInt, def: "0", mutable: true},
+		{name: "encryption", kind: dirBool, def: "no"},
+		{name: "encryption-key", kind: dirString, def: ""},
+		{name: "encryption-key-file", kind: dirString, def: ""},
+		{name: "io-uring", kind: dirBool, def: "no"},
+		{name: "o-direct", kind: dirBool, def: "no"},
+		{name: "rdb-compat", kind: dirBool, def: "yes", mutable: true},
+		{name: "max-io-latency-warn", kind: dirInt, def: "0", mutable: true},
 	}
 }
 
@@ -397,6 +577,9 @@ func handleConfigSet(ctx *Ctx) {
 	cs.mu.Lock()
 	for _, c := range changes {
 		cs.vals[c.name] = c.val
+		if twin, ok := cs.alias[c.name]; ok {
+			cs.vals[twin] = c.val
+		}
 	}
 	cs.mu.Unlock()
 	// The notification write path reads the flags atomically, so mirror any change
