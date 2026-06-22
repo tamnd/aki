@@ -129,5 +129,16 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 		ctx.enc().WriteError(oomError)
 		return
 	}
+	// Capture the dirty counter around a write so the AOF only records commands
+	// that actually changed the dataset, the same rule Redis uses to decide
+	// whether to propagate.
+	propagate := cmd.Flags.Has(FlagWrite) && d.aofEnabled()
+	var before int64
+	if propagate {
+		before = d.persist.dirtyCount()
+	}
 	cmd.Handler(ctx)
+	if propagate && d.persist.dirtyCount() > before {
+		d.propagateAOF(ctx, cmd.Name)
+	}
 }

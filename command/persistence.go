@@ -45,6 +45,14 @@ func (p *persistState) markDirty() {
 	p.mu.Unlock()
 }
 
+// dirtyCount reads the current dirty counter. The AOF propagation hook compares
+// it before and after a write to tell whether the dataset actually changed.
+func (p *persistState) dirtyCount() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dirty
+}
+
 // beginSave marks a save as started and returns false if one is already running.
 // dirtyAtStart is the dirty count captured so it can be subtracted on success, so
 // writes that land during the save are not lost from the next save's trigger.
