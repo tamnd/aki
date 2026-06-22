@@ -476,6 +476,12 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		d.statError(msg)
 		return
 	}
+	if msg := d.crossSlotError(name, cmd, argv); msg != "" {
+		c.Enc().WriteError(msg)
+		d.statReject(cmd)
+		d.statError(msg)
+		return
+	}
 	// While the dataset is loading from the AOF at startup, only commands flagged
 	// loading-safe may run. The replay itself goes through runCommand directly, so
 	// this gate only blocks external clients.

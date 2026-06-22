@@ -10,11 +10,12 @@ import (
 
 // This file implements the CLUSTER command family (spec 2064 doc 18 sections 20
 // through 28). aki runs single-node by default (cluster-enabled no), where all
-// 16384 slots are served implicitly, no MOVED or ASK redirects are emitted, and
-// CROSSSLOT is not enforced. The reporting subcommands work in any mode; the
-// slot-management subcommands need cluster-enabled yes. The gossip bus, MOVED and
-// ASK redirection across nodes, and automatic failover are not part of this
-// slice, so MEET, FORGET, REPLICATE and FAILOVER report that they need a peer.
+// 16384 slots are served implicitly and no MOVED or ASK redirects are emitted.
+// With cluster-enabled yes the CROSSSLOT constraint is enforced and SELECT is
+// limited to db 0 (doc 18 §28.2, §28.3). The reporting subcommands work in any
+// mode; the slot-management subcommands need cluster-enabled yes. The gossip bus,
+// MOVED and ASK redirection across nodes, and automatic failover are not part of
+// this slice, so MEET, FORGET, REPLICATE and FAILOVER report that they need a peer.
 
 // clusterDisabledErr is the reply a state-changing CLUSTER subcommand gets when
 // cluster mode is off, matching real Redis byte for byte.
@@ -44,6 +45,28 @@ func (d *Dispatcher) clusterInit() {
 // clusterEnabled reports whether cluster mode is on.
 func (d *Dispatcher) clusterEnabled() bool {
 	return strings.EqualFold(d.confValue("cluster-enabled", "no"), "yes")
+}
+
+// crossSlotError enforces the Redis Cluster rule that a multi-key command must
+// reference keys that all hash to one slot (doc 18 §24.5). It returns the RESP
+// error string when the keys span more than one slot, or "" when the command is
+// fine, cluster mode is off, or the command touches fewer than two keys. The hash
+// tag rule applies through hashSlot, so {user1}:a and {user1}:b share a slot.
+func (d *Dispatcher) crossSlotError(name string, cmd *CmdDesc, argv [][]byte) string {
+	if !d.clusterEnabled() {
+		return ""
+	}
+	keys, ok := extractKeys(name, cmd, argv)
+	if !ok || len(keys) < 2 {
+		return ""
+	}
+	slot := hashSlot(keys[0])
+	for _, k := range keys[1:] {
+		if hashSlot(k) != slot {
+			return "CROSSSLOT Keys in request don't hash to the same slot"
+		}
+	}
+	return ""
 }
 
 // announceIP is the address aki reports for itself in CLUSTER NODES, SLOTS and
