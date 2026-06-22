@@ -104,6 +104,10 @@ type Dispatcher struct {
 	// set and shut down on server stop.
 	metrics metricsServer
 
+	// admin holds the running pprof admin endpoint, started when admin-port is set
+	// and shut down on server stop.
+	admin adminServer
+
 	// profiler holds the continuous-profiling goroutine, started when
 	// continuous-profiling is on and shut down on server stop.
 	profiler profilerState
