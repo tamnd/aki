@@ -185,6 +185,24 @@ func (h *latencyHist) total() uint64 {
 	return n
 }
 
+// countLE returns the number of samples at or below le microseconds, the value a
+// Prometheus histogram bucket reports. It sums every bucket whose low edge is at
+// or below le, which lines up exactly with the power-of-two bucket bounds the
+// metrics endpoint uses.
+func (h *latencyHist) countLE(le uint64) uint64 {
+	var n uint64
+	for i := range h.counts {
+		c := h.counts[i].Load()
+		if c == 0 {
+			continue
+		}
+		if histLow(i) <= le {
+			n += c
+		}
+	}
+	return n
+}
+
 // percentile returns the latency at the given percentile in microseconds, or 0
 // when no samples exist. p is in the range 0 to 100.
 func (h *latencyHist) percentile(p float64) uint64 {
