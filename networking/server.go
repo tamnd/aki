@@ -46,7 +46,10 @@ type Config struct {
 type Server struct {
 	handler    Handler
 	maxClients int
-	maxBulkLen int64
+	// maxBulkLen caps a single bulk argument. It is held atomically so CONFIG SET
+	// proto-max-bulk-len can change it while the server runs; the parser reads it
+	// per request.
+	maxBulkLen atomic.Int64
 	// idleTimeout and keepAlive are nanosecond durations held atomically so
 	// CONFIG SET timeout and CONFIG SET tcp-keepalive can change them while the
 	// server runs. The read path loads them per use.
@@ -78,10 +81,10 @@ func New(cfg Config, handler Handler) *Server {
 	s := &Server{
 		handler:    handler,
 		maxClients: cfg.MaxClients,
-		maxBulkLen: maxBulk,
 		conns:      make(map[uint64]*Conn),
 		nowFn:      time.Now,
 	}
+	s.maxBulkLen.Store(maxBulk)
 	s.idleTimeout.Store(int64(cfg.IdleTimeout))
 	s.keepAlive.Store(int64(cfg.TCPKeepAlive))
 	return s
@@ -100,6 +103,19 @@ func (s *Server) TCPKeepAlive() time.Duration { return time.Duration(s.keepAlive
 // SetTCPKeepAlive changes the keepalive period. It applies to connections
 // accepted after the change, the same as Redis.
 func (s *Server) SetTCPKeepAlive(d time.Duration) { s.keepAlive.Store(int64(d)) }
+
+// MaxBulkLen reports the current single-argument bulk cap.
+func (s *Server) MaxBulkLen() int64 { return s.maxBulkLen.Load() }
+
+// SetMaxBulkLen changes the bulk cap. A zero or negative value resets it to the
+// default, and the next parsed request uses the new limit, so CONFIG SET
+// proto-max-bulk-len applies without a restart.
+func (s *Server) SetMaxBulkLen(n int64) {
+	if n <= 0 {
+		n = resp.DefaultMaxBulkLen
+	}
+	s.maxBulkLen.Store(n)
+}
 
 func (s *Server) now() time.Time { return s.nowFn() }
 

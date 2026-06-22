@@ -265,7 +265,7 @@ func (c *Conn) serve() {
 // reported, or QUIT asked to close).
 func (c *Conn) drain() bool {
 	for {
-		argv, n, err := resp.ParseRequest(c.qbuf, c.pos, c.server.maxBulkLen)
+		argv, n, err := resp.ParseRequest(c.qbuf, c.pos, c.server.MaxBulkLen())
 		if errors.Is(err, resp.ErrNeedMore) {
 			return false
 		}

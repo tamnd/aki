@@ -638,6 +638,10 @@ func handleConfigSet(ctx *Ctx) {
 			// Push the new keepalive period to the server for connections accepted
 			// after this point.
 			ctx.d.applyTCPKeepAlive()
+		case "proto-max-bulk-len":
+			// Push the new bulk cap to the server so the parser uses it on the next
+			// request.
+			ctx.d.applyMaxBulkLen()
 		}
 	}
 	ctx.enc().WriteStatus("OK")

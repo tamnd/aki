@@ -2,16 +2,28 @@ package command
 
 import "time"
 
-// This file wires the network idle knobs from doc 24 section A.5, timeout and
-// tcp-keepalive, into the running server. The networking server holds both as
-// live values, so a change through CONFIG SET takes effect without a restart.
+// This file wires the network knobs from doc 24 section A.5, timeout,
+// tcp-keepalive, and proto-max-bulk-len, into the running server. The networking
+// server holds them as live values, so a change through CONFIG SET takes effect
+// without a restart.
 
-// ApplyNetworkConfig pushes timeout and tcp-keepalive to the server. The server
-// command calls it once at startup after the server is attached, and CONFIG SET
-// calls the per-knob setters when either value changes.
+// ApplyNetworkConfig pushes timeout, tcp-keepalive, and proto-max-bulk-len to the
+// server. The server command calls it once at startup after the server is
+// attached, and CONFIG SET calls the per-knob setters when a value changes.
 func (d *Dispatcher) ApplyNetworkConfig() {
 	d.applyIdleTimeout()
 	d.applyTCPKeepAlive()
+	d.applyMaxBulkLen()
+}
+
+// applyMaxBulkLen sets the largest single bulk argument the parser accepts. It
+// takes effect on the next request, so CONFIG SET proto-max-bulk-len applies
+// without a restart.
+func (d *Dispatcher) applyMaxBulkLen() {
+	if d.srv == nil {
+		return
+	}
+	d.srv.SetMaxBulkLen(d.protoMaxBulkLen())
 }
 
 // applyIdleTimeout sets the idle client timeout. The directive is in seconds and
