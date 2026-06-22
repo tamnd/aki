@@ -66,6 +66,9 @@ func cmdServer(args []string) error {
 	if len(importedFuncs) > 0 {
 		d.LoadFunctions(importedFuncs)
 	}
+	if err := d.LoadACLFromKeyspace(); err != nil {
+		return fmt.Errorf("load ACL from data file: %w", err)
+	}
 
 	cfg := networking.Config{
 		Addr:       *addr,
