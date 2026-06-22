@@ -45,15 +45,16 @@ func sha1hex(body string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// evalScript compiles and runs a script body with the given keys and args and
-// writes the result to the client. readonly rejects write commands inside the
-// script. It is the shared core of EVAL, EVALSHA, and their _RO forms.
-func (d *Dispatcher) evalScript(ctx *Ctx, body string, keys, args [][]byte, readonly bool) {
+// newScriptInterp builds a fresh interpreter wired with the redis table, the
+// script context, and the runaway-script deadline hook. freg is non-nil only on
+// FUNCTION LOAD and FCALL, where redis.register_function captures into it; for an
+// EVAL script it is nil and register_function is absent. Each call gets a clean
+// interpreter so one script never sees another's globals.
+func (d *Dispatcher) newScriptInterp(ctx *Ctx, readonly bool, freg *funcReg) (*lua.Interp, *scriptCtx) {
 	i := lua.New()
 	sc := &scriptCtx{d: d, sess: ctx.sess, db: ctx.Conn.DB(), readonly: readonly, resp: 2}
 	i.Registry["script"] = sc
 
-	// A deadline hook keeps a runaway script from hanging the server forever.
 	limit := d.luaTimeLimit()
 	if limit > 0 {
 		deadline := time.Now().Add(limit)
@@ -64,8 +65,15 @@ func (d *Dispatcher) evalScript(ctx *Ctx, body string, keys, args [][]byte, read
 			return nil
 		})
 	}
+	installRedis(i, sc, freg)
+	return i, sc
+}
 
-	installRedis(i, sc)
+// evalScript compiles and runs a script body with the given keys and args and
+// writes the result to the client. readonly rejects write commands inside the
+// script. It is the shared core of EVAL, EVALSHA, and their _RO forms.
+func (d *Dispatcher) evalScript(ctx *Ctx, body string, keys, args [][]byte, readonly bool) {
+	i, sc := d.newScriptInterp(ctx, readonly, nil)
 	i.Globals().Set(lua.String("KEYS"), bytesToTable(keys))
 	i.Globals().Set(lua.String("ARGV"), bytesToTable(args))
 
@@ -125,11 +133,18 @@ func bytesToTable(items [][]byte) *lua.Table {
 	return t
 }
 
-// installRedis builds the redis.* table and installs it as a global.
-func installRedis(i *lua.Interp, sc *scriptCtx) {
+// installRedis builds the redis.* table and installs it as a global. When freg
+// is non-nil it also installs redis.register_function, which a function library's
+// top-level code calls to register its callbacks.
+func installRedis(i *lua.Interp, sc *scriptCtx, freg *funcReg) {
 	r := lua.NewTable()
 	set := func(name string, fn lua.GoFunc) {
 		r.Set(lua.String(name), lua.NewGoFunc(name, fn))
+	}
+	if freg != nil {
+		set("register_function", func(_ *lua.Interp, args []lua.Value) ([]lua.Value, error) {
+			return freg.register(args)
+		})
 	}
 	set("call", func(in *lua.Interp, args []lua.Value) ([]lua.Value, error) {
 		return redisCall(in, sc, args, true)
