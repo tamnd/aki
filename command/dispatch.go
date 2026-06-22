@@ -123,6 +123,10 @@ type Dispatcher struct {
 	loading atomic.Bool
 	ready   atomic.Bool
 
+	// ioSlowOps counts checkpoint commits that ran longer than max-io-latency-warn.
+	// INFO stats reports it as io_slowops_total.
+	ioSlowOps atomic.Uint64
+
 	// shutdownFn is the callback SHUTDOWN fires to begin a graceful stop. The server
 	// command installs it; it is nil in tests and offline use.
 	shutdownFn func()
@@ -137,6 +141,24 @@ type Dispatcher struct {
 // INFO can enumerate live connections. The wiring happens after both are built,
 // since the server takes the dispatcher as its handler.
 func (d *Dispatcher) SetServer(s *networking.Server) { d.srv = s }
+
+// recordIOLatency is the engine's commit hook. When max-io-latency-warn is set
+// and a checkpoint commit runs longer than that many milliseconds, it counts the
+// operation in io_slowops_total and writes a WARNING log line. A zero or negative
+// threshold turns the check off, which is the no-op default cost.
+func (d *Dispatcher) recordIOLatency(op string, dur time.Duration) {
+	warnMs := d.confInt("max-io-latency-warn", 0)
+	if warnMs <= 0 {
+		return
+	}
+	if dur <= time.Duration(warnMs)*time.Millisecond {
+		return
+	}
+	d.ioSlowOps.Add(1)
+	d.logWarning("slow I/O operation",
+		logField{"op", op},
+		logField{"ms", strconv.FormatInt(dur.Milliseconds(), 10)})
+}
 
 // New builds a Dispatcher with the connection-group and data-type commands.
 func New(cfg Config) *Dispatcher {
@@ -218,6 +240,9 @@ func New(cfg Config) *Dispatcher {
 		startTime: time.Now(),
 		runID:     newRunID(),
 		hz:        10,
+	}
+	if d.engine != nil {
+		d.engine.onCommit = d.recordIOLatency
 	}
 	d.activeExpire.Store(true)
 	d.blockingInit()
