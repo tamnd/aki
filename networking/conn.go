@@ -251,6 +251,13 @@ func (c *Conn) serve() {
 			return
 		}
 		c.compact()
+		if c.overQueryBufLimit() {
+			// The buffered, not yet parseable input passed
+			// client-query-buffer-limit. Redis closes the connection without a
+			// reply in this case, so flush whatever is pending and return.
+			_ = c.flush()
+			return
+		}
 		if err := c.flush(); err != nil {
 			return
 		}
@@ -258,6 +265,13 @@ func (c *Conn) serve() {
 			return
 		}
 	}
+}
+
+// overQueryBufLimit reports whether the unparsed query buffer has grown past
+// client-query-buffer-limit. A zero limit disables the check.
+func (c *Conn) overQueryBufLimit() bool {
+	limit := c.server.QueryBufLimit()
+	return limit > 0 && int64(len(c.qbuf)) > limit
 }
 
 // drain parses and dispatches every complete command currently in the query

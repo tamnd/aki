@@ -33,6 +33,10 @@ type Config struct {
 	// MaxBulkLen caps a single bulk argument (proto-max-bulk-len). 0 selects
 	// resp.DefaultMaxBulkLen.
 	MaxBulkLen int64
+	// QueryBufLimit caps the per-connection query buffer (client-query-buffer-limit).
+	// 0 means no limit. A connection whose buffered, not yet parsed input grows past
+	// it is closed.
+	QueryBufLimit int64
 	// IdleTimeout closes a connection after this much inactivity; 0 disables it.
 	IdleTimeout time.Duration
 	// TCPKeepAlive is the SetKeepAlivePeriod applied to accepted TCP sockets; 0
@@ -55,6 +59,10 @@ type Server struct {
 	// server runs. The read path loads them per use.
 	idleTimeout atomic.Int64
 	keepAlive   atomic.Int64
+	// queryBufLimit caps the per-connection query buffer. It is held atomically so
+	// CONFIG SET client-query-buffer-limit can change it while the server runs; the
+	// read loop loads it per connection. 0 means no limit.
+	queryBufLimit atomic.Int64
 
 	nextID atomic.Uint64
 
@@ -87,6 +95,7 @@ func New(cfg Config, handler Handler) *Server {
 	s.maxBulkLen.Store(maxBulk)
 	s.idleTimeout.Store(int64(cfg.IdleTimeout))
 	s.keepAlive.Store(int64(cfg.TCPKeepAlive))
+	s.queryBufLimit.Store(cfg.QueryBufLimit)
 	return s
 }
 
@@ -115,6 +124,20 @@ func (s *Server) SetMaxBulkLen(n int64) {
 		n = resp.DefaultMaxBulkLen
 	}
 	s.maxBulkLen.Store(n)
+}
+
+// QueryBufLimit reports the current per-connection query buffer cap. 0 means no
+// limit.
+func (s *Server) QueryBufLimit() int64 { return s.queryBufLimit.Load() }
+
+// SetQueryBufLimit changes the query buffer cap. A zero or negative value clears
+// it, and the next read on each connection uses the new value, so CONFIG SET
+// client-query-buffer-limit applies without a restart.
+func (s *Server) SetQueryBufLimit(n int64) {
+	if n < 0 {
+		n = 0
+	}
+	s.queryBufLimit.Store(n)
 }
 
 func (s *Server) now() time.Time { return s.nowFn() }
