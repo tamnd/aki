@@ -36,6 +36,26 @@ func (r *pubsubRegistry) counts() (channels, patterns, shards int) {
 	return len(r.channels), len(r.patterns), len(r.shards)
 }
 
+// clientCount reports how many distinct connections hold at least one channel or
+// pattern subscription. INFO's clients section reads it for pubsub_clients. Shard
+// subscriptions are not counted here, matching what the field means in Redis.
+func (r *pubsubRegistry) clientCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ids := map[uint64]struct{}{}
+	for _, set := range r.channels {
+		for id := range set {
+			ids[id] = struct{}{}
+		}
+	}
+	for _, set := range r.patterns {
+		for id := range set {
+			ids[id] = struct{}{}
+		}
+	}
+	return len(ids)
+}
+
 // add registers conn under name in m. It is idempotent: a second add for the
 // same connection leaves the set unchanged.
 func psAdd(m map[string]map[uint64]*networking.Conn, name string, conn *networking.Conn) {

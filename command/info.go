@@ -202,11 +202,38 @@ func infoClients(ctx *Ctx, b *strings.Builder) {
 	line(b, "client_recent_max_output_buffer", "0")
 	line(b, "blocked_clients", "0")
 	line(b, "tracking_clients", "0")
+	pubsubClients := 0
+	if ctx.d.ps != nil {
+		pubsubClients = ctx.d.ps.clientCount()
+	}
+	lineInt(b, "pubsub_clients", int64(pubsubClients))
+	watchingClients, watchedKeys := watchStats(ctx)
+	lineInt(b, "watching_clients", int64(watchingClients))
 	line(b, "clients_in_timeout_table", "0")
-	line(b, "total_watched_keys", "0")
+	lineInt(b, "total_watched_keys", int64(watchedKeys))
 	line(b, "total_blocking_keys", "0")
 	line(b, "total_blocking_keys_on_nokey", "0")
 	lineInt(b, "aki_io_goroutines", int64(connected))
+}
+
+// watchStats counts the clients that hold at least one WATCH and the total number
+// of watched keys across all connections. INFO's clients section reads both for
+// watching_clients and total_watched_keys.
+func watchStats(ctx *Ctx) (clients, keys int) {
+	if ctx.d.srv == nil {
+		return 0, 0
+	}
+	for _, c := range ctx.d.srv.Snapshot() {
+		s, ok := c.Session().(*session)
+		if !ok {
+			continue
+		}
+		if n := len(s.watched); n > 0 {
+			clients++
+			keys += n
+		}
+	}
+	return clients, keys
 }
 
 func infoMemory(ctx *Ctx, b *strings.Builder) {
