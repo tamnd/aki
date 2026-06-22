@@ -219,8 +219,13 @@ func (h *latencyHist) record(v uint64) {
 // histHigh returns the upper edge of a bucket in microseconds: the largest value
 // that still falls in it. LATENCY HISTOGRAM reports cumulative counts against
 // this upper bound so a point reads as "this many calls at or below this
-// latency".
+// latency". Buckets below histSub are the linear region where each bucket holds
+// exactly one value, so the upper edge equals the index; taking histLow(idx+1)
+// there would cross into the log region and shift by a negative amount.
 func histHigh(idx int) uint64 {
+	if idx < histSub {
+		return uint64(idx)
+	}
 	if idx >= histBuckets-1 {
 		return histLow(idx)
 	}

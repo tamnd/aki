@@ -45,6 +45,36 @@ func TestLatencyHistogram(t *testing.T) {
 	}
 }
 
+// TestLatencyHistCumulative records a sample for every value across the linear
+// and log regions and checks cumulative does not panic and stays monotonic. The
+// value 7 lands in the last linear bucket, whose upper edge once crossed into the
+// log region and shifted by a negative amount.
+func TestLatencyHistCumulative(t *testing.T) {
+	var h latencyHist
+	for v := uint64(0); v < 4096; v++ {
+		h.record(v)
+	}
+	points := h.cumulative()
+	if len(points) == 0 {
+		t.Fatal("cumulative returned no points")
+	}
+	var lastBound, lastCount uint64
+	first := true
+	for _, p := range points {
+		if !first && p.bound <= lastBound {
+			t.Fatalf("bound %d not increasing after %d", p.bound, lastBound)
+		}
+		if p.count < lastCount {
+			t.Fatalf("count %d dropped below %d", p.count, lastCount)
+		}
+		lastBound, lastCount = p.bound, p.count
+		first = false
+	}
+	if lastCount != 4096 {
+		t.Fatalf("final cumulative count %d want 4096", lastCount)
+	}
+}
+
 // checkHistogramEntry verifies one command entry: calls is positive, the
 // histogram has points, the cumulative counts only grow, and the final count
 // equals the call total.
