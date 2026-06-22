@@ -98,6 +98,7 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 		event = "lpush"
 	}
 	ctx.notify(notifyList, event, key)
+	ctx.signalReady(key)
 	ctx.enc().WriteInteger(newLen)
 }
 
