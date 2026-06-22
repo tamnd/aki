@@ -1,6 +1,10 @@
 package keyspace
 
-import "bytes"
+import (
+	"bytes"
+
+	"github.com/tamnd/aki/btree"
+)
 
 // farFutureMs is the cutoff past which a TTL is treated as impossible. A key set
 // to expire more than a century from now almost certainly carries a corrupt
@@ -18,6 +22,10 @@ type DBCheck struct {
 	FutureTTL   int // entries with an impossibly far-future TTL
 	BadHeaders  int // entries whose value header failed to parse
 	OrderErrors int // entries out of composite-key order
+	// StructErr is set when the B-tree itself is malformed (bad child counts,
+	// keys outside their range, a broken leaf chain). It is independent of the
+	// per-entry counts above, which assume a walkable tree.
+	StructErr error
 }
 
 // Check walks every database B-tree in order and reports the per-database
@@ -44,6 +52,7 @@ func (db *DB) check(now int64) (DBCheck, error) {
 	if t == nil {
 		return res, nil
 	}
+	res.StructErr = btree.CheckInvariants(t)
 	c := t.Cursor()
 	if err := c.First(); err != nil {
 		return res, err
