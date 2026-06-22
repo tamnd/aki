@@ -168,6 +168,14 @@ func (e *Engine) fileStats() pager.Stats {
 	return e.ks.PagerStats()
 }
 
+// filePath returns the path of the .aki file backing the engine, empty for an
+// in-memory backing.
+func (e *Engine) filePath() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.ks.PagerName()
+}
+
 // update routes a write to the current connection's database. It reports false
 // and writes an error reply when no engine is configured.
 func (ctx *Ctx) update(fn func(*keyspace.DB) error) bool {

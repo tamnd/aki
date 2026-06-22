@@ -188,6 +188,10 @@ func Open(pgr *pager.Pager) (*Keyspace, error) {
 // fields. It is a passthrough so the command layer does not reach into the pager.
 func (k *Keyspace) PagerStats() pager.Stats { return k.pgr.Stats() }
 
+// PagerName returns the file path the underlying pager was opened with, empty
+// for an in-memory backing.
+func (k *Keyspace) PagerName() string { return k.pgr.Name() }
+
 // DBCount returns the number of logical databases.
 func (ks *Keyspace) DBCount() int { return len(ks.dbs) }
 
