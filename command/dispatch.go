@@ -521,6 +521,13 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		d.statError(msg)
 		return
 	}
+	if cmd.Flags.Has(FlagWrite) && !sess.fromMaster && !d.enoughGoodReplicas() {
+		msg := "NOREPLICAS Not enough good replicas to write."
+		c.Enc().WriteError(msg)
+		d.statReject(cmd)
+		d.statError(msg)
+		return
+	}
 	if msg := d.crossSlotError(name, cmd, argv); msg != "" {
 		c.Enc().WriteError(msg)
 		d.statReject(cmd)
