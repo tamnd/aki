@@ -18,6 +18,14 @@ func connectionCommands() []*CmdDesc {
 		SubCmds: []*CmdDesc{
 			{Name: "count", SubName: "command|count", Group: GroupServer, Since: "2.8.13",
 				Arity: 2, Flags: FlagLoading | FlagStale, Handler: handleCommandCount},
+			{Name: "info", SubName: "command|info", Group: GroupServer, Since: "2.8.13",
+				Arity: -2, Flags: FlagLoading | FlagStale, Handler: handleCommandInfo},
+			{Name: "list", SubName: "command|list", Group: GroupServer, Since: "7.0.0",
+				Arity: -2, Flags: FlagLoading | FlagStale, Handler: handleCommandList},
+			{Name: "getkeys", SubName: "command|getkeys", Group: GroupServer, Since: "2.8.13",
+				Arity: -3, Flags: FlagLoading | FlagStale, Handler: handleCommandGetKeys},
+			{Name: "getkeysandflags", SubName: "command|getkeysandflags", Group: GroupServer, Since: "7.0.0",
+				Arity: -3, Flags: FlagLoading | FlagStale, Handler: handleCommandGetKeysAndFlags},
 		},
 	}
 	return []*CmdDesc{
@@ -231,11 +239,15 @@ func handleTime(ctx *Ctx) {
 	e.WriteBulkStringStr(strconv.FormatInt(int64(now.Nanosecond()/1000), 10))
 }
 
-// handleCommand with no subcommand is a stub for now: the full COMMAND
-// introspection reply lands once the data-type commands populate the table.
-// Bare COMMAND returns an empty array.
+// handleCommand with no subcommand returns the info array for every command, the
+// same shape as COMMAND INFO with all names. The implementation lives in
+// command.go alongside the other introspection subcommands.
 func handleCommand(ctx *Ctx) {
-	ctx.enc().WriteArrayLen(0)
+	cmds := ctx.d.table.commands()
+	ctx.enc().WriteArrayLen(len(cmds))
+	for _, c := range cmds {
+		writeCommandInfo(ctx.enc(), c)
+	}
 }
 
 // handleCommandCount returns the number of commands registered in the table.
