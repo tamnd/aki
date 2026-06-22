@@ -15,7 +15,7 @@ import (
 // detected from the leading magic bytes.
 func cmdImport(args []string) error {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
-	format := fs.String("format", "detect", "input format: rdb or detect")
+	format := fs.String("format", "detect", "input format: rdb, jsonl, or detect")
 	target := fs.String("target", "aki.aki", "path to the .aki file to write")
 	addr := fs.String("addr", "", "ship the keys to this running instance instead of a file")
 	auth := fs.String("auth", "", "password to send to the --addr instance")
@@ -35,13 +35,9 @@ func cmdImport(args []string) error {
 	if err != nil {
 		return fmt.Errorf("read %s: %w", src, err)
 	}
-	if err := requireRDB(*format, blob); err != nil {
-		return err
-	}
-
-	snap, err := rdb.UnmarshalFile(blob)
+	snap, err := decodeInput(*format, blob, src)
 	if err != nil {
-		return fmt.Errorf("parse RDB %s: %w", src, err)
+		return err
 	}
 
 	if *dryRun {
@@ -79,7 +75,7 @@ func cmdImport(args []string) error {
 // file with --file, or from a running instance over the wire with --addr.
 func cmdDump(args []string) error {
 	fs := flag.NewFlagSet("dump", flag.ContinueOnError)
-	format := fs.String("format", "rdb", "output format: rdb")
+	format := fs.String("format", "rdb", "output format: rdb or jsonl")
 	output := fs.String("output", "dump.rdb", "output file path")
 	db := fs.Int("db", -1, "export only this database (default all)")
 	file := fs.String("file", "", "read directly from this .aki file (offline)")
@@ -89,8 +85,8 @@ func cmdDump(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *format != "rdb" {
-		return fmt.Errorf("only --format rdb is supported")
+	if *format != "rdb" && *format != "jsonl" {
+		return fmt.Errorf("only --format rdb or jsonl is supported")
 	}
 	if *file == "" && *addr == "" {
 		return fmt.Errorf("usage: aki dump (--file <.aki> | --addr host:port) [--output path] [--db N]")
@@ -113,6 +109,22 @@ func cmdDump(args []string) error {
 	}
 	if err != nil {
 		return err
+	}
+
+	if *format == "jsonl" {
+		out, err := os.Create(*output)
+		if err != nil {
+			return fmt.Errorf("write %s: %w", *output, err)
+		}
+		n, derr := dumpJSONL(snap, out)
+		if cerr := out.Close(); cerr != nil && derr == nil {
+			derr = cerr
+		}
+		if derr != nil {
+			return fmt.Errorf("write %s: %w", *output, derr)
+		}
+		fmt.Printf("dumped %d keys from %s to %s\n", n, source, *output)
+		return nil
 	}
 
 	blob, err := rdb.MarshalFile(snap)
@@ -165,23 +177,70 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 	return positional, nil
 }
 
-// requireRDB checks the input is an RDB file. The detect form looks at the magic;
-// an explicit rdb still verifies the magic so a mislabeled file fails clearly.
-func requireRDB(format string, blob []byte) error {
+// decodeInput parses an import blob into a snapshot. With detect it picks the
+// format from the leading bytes: the REDIS magic means RDB, a leading '{' means
+// JSONL. An explicit format is honored and still checked so a mislabeled file
+// fails with a clear message.
+func decodeInput(format string, blob []byte, src string) (rdb.Snapshot, error) {
 	switch format {
-	case "rdb", "detect":
-		if len(blob) < 5 || string(blob[:5]) != "REDIS" {
-			if format == "detect" {
-				return fmt.Errorf("cannot detect format: not an RDB file (AOF import is not supported yet)")
-			}
-			return fmt.Errorf("not an RDB file: missing REDIS magic")
+	case "rdb":
+		if !looksRDB(blob) {
+			return rdb.Snapshot{}, fmt.Errorf("not an RDB file: missing REDIS magic")
 		}
-		return nil
+		snap, err := rdb.UnmarshalFile(blob)
+		if err != nil {
+			return rdb.Snapshot{}, fmt.Errorf("parse RDB %s: %w", src, err)
+		}
+		return snap, nil
+	case "jsonl":
+		snap, err := importJSONL(blob)
+		if err != nil {
+			return rdb.Snapshot{}, fmt.Errorf("parse JSONL %s: %w", src, err)
+		}
+		return snap, nil
+	case "detect":
+		switch {
+		case looksRDB(blob):
+			snap, err := rdb.UnmarshalFile(blob)
+			if err != nil {
+				return rdb.Snapshot{}, fmt.Errorf("parse RDB %s: %w", src, err)
+			}
+			return snap, nil
+		case looksJSONL(blob):
+			snap, err := importJSONL(blob)
+			if err != nil {
+				return rdb.Snapshot{}, fmt.Errorf("parse JSONL %s: %w", src, err)
+			}
+			return snap, nil
+		default:
+			return rdb.Snapshot{}, fmt.Errorf("cannot detect format: not RDB or JSONL (AOF import is not supported yet)")
+		}
 	case "aof":
-		return fmt.Errorf("AOF import is not supported yet")
+		return rdb.Snapshot{}, fmt.Errorf("AOF import is not supported yet")
 	default:
-		return fmt.Errorf("unknown format %q", format)
+		return rdb.Snapshot{}, fmt.Errorf("unknown format %q", format)
 	}
+}
+
+// looksRDB reports whether the blob starts with the REDIS magic.
+func looksRDB(blob []byte) bool {
+	return len(blob) >= 5 && string(blob[:5]) == "REDIS"
+}
+
+// looksJSONL reports whether the first non-space byte is '{', the start of a JSONL
+// record.
+func looksJSONL(blob []byte) bool {
+	for _, b := range blob {
+		switch b {
+		case ' ', '\t', '\r', '\n':
+			continue
+		case '{':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // snapshotDBCount returns a database count large enough to hold every index in the
