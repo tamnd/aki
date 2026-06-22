@@ -2,6 +2,7 @@ package command
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"strconv"
 	"strings"
@@ -37,17 +38,49 @@ func slowlogCommands() []*CmdDesc {
 	return []*CmdDesc{slowlog}
 }
 
-// handleSlowlogGet returns the recent slow commands, newest first. aki does not
-// record them yet, so the list is always empty.
+// handleSlowlogGet returns the recent slow commands, newest first. The optional
+// count defaults to 10 and -1 returns every entry.
 func handleSlowlogGet(ctx *Ctx) {
-	ctx.enc().WriteArrayLen(0)
+	if len(ctx.Argv) > 3 {
+		ctx.enc().WriteError("ERR wrong number of arguments for 'slowlog|get' command")
+		return
+	}
+	count := 10
+	if len(ctx.Argv) == 3 {
+		n, err := strconv.ParseInt(string(ctx.Argv[2]), 10, 64)
+		if err != nil {
+			ctx.enc().WriteError("ERR value is not an integer or out of range")
+			return
+		}
+		if n < -1 {
+			ctx.enc().WriteError("ERR count should be greater than or equal to -1")
+			return
+		}
+		count = int(n)
+	}
+	entries := ctx.d.slowlogGet(count)
+	enc := ctx.enc()
+	enc.WriteArrayLen(len(entries))
+	for _, e := range entries {
+		enc.WriteArrayLen(6)
+		enc.WriteInteger(e.id)
+		enc.WriteInteger(e.ts)
+		enc.WriteInteger(e.durUs)
+		enc.WriteArrayLen(len(e.args))
+		for _, a := range e.args {
+			enc.WriteBulkStringStr(a)
+		}
+		enc.WriteBulkStringStr(e.addr)
+		enc.WriteBulkStringStr(e.name)
+	}
 }
 
 func handleSlowlogLen(ctx *Ctx) {
-	ctx.enc().WriteInteger(0)
+	ctx.enc().WriteInteger(int64(ctx.d.slowlogLen()))
 }
 
 func handleSlowlogReset(ctx *Ctx) {
+	ctx.d.slowlogReset()
 	ctx.enc().WriteStatus("OK")
 }
 
@@ -88,27 +121,144 @@ func latencyCommands() []*CmdDesc {
 	return []*CmdDesc{latency}
 }
 
-// handleLatencyHistory returns the latency samples for an event. aki tracks no
-// samples yet, so the answer is an empty array for any event.
+// handleLatencyHistory returns the recorded spikes for an event as [timestamp,
+// latency_ms] pairs, oldest first, or an empty array for an unknown event.
 func handleLatencyHistory(ctx *Ctx) {
-	ctx.enc().WriteArrayLen(0)
+	samples := ctx.d.latencyHistoryOf(string(ctx.Argv[2]))
+	enc := ctx.enc()
+	enc.WriteArrayLen(len(samples))
+	for _, s := range samples {
+		enc.WriteArrayLen(2)
+		enc.WriteInteger(s.ts)
+		enc.WriteInteger(s.ms)
+	}
 }
 
+// handleLatencyLatest returns one [event, latest_timestamp, latest_ms, max_ms]
+// row per event that has samples.
 func handleLatencyLatest(ctx *Ctx) {
-	ctx.enc().WriteArrayLen(0)
+	rows := ctx.d.latencyLatest()
+	enc := ctx.enc()
+	enc.WriteArrayLen(len(rows))
+	for _, r := range rows {
+		enc.WriteArrayLen(4)
+		enc.WriteBulkStringStr(r.event)
+		enc.WriteInteger(r.latestTS)
+		enc.WriteInteger(r.latestMs)
+		enc.WriteInteger(r.maxMs)
+	}
 }
 
+// handleLatencyReset clears the named events, or every event when none are named,
+// and returns how many histories were dropped.
 func handleLatencyReset(ctx *Ctx) {
-	ctx.enc().WriteInteger(0)
+	names := make([]string, 0, len(ctx.Argv)-2)
+	for _, a := range ctx.Argv[2:] {
+		names = append(names, string(a))
+	}
+	ctx.enc().WriteInteger(int64(ctx.d.latencyReset(names)))
 }
 
+// handleLatencyDoctor returns a plain-English report. With no spikes recorded it
+// gives the all-clear; otherwise it lists each event with a recommendation.
 func handleLatencyDoctor(ctx *Ctx) {
-	ctx.enc().WriteBulkStringStr("Dave, I have observed the system, no worrying latency spikes. Everything seems fine.")
+	rows := ctx.d.latencyLatest()
+	if len(rows) == 0 {
+		ctx.enc().WriteBulkStringStr("Dave, I have observed the system, no worrying latency spikes. Everything seems fine.")
+		return
+	}
+	var b strings.Builder
+	b.WriteString("I detected latency issues in the following event classes:\n\n")
+	for _, r := range rows {
+		n := len(ctx.d.latencyHistoryOf(r.event))
+		fmt.Fprintf(&b, "%s: %d latency spikes (latest: %d ms, max: %d ms).\n",
+			r.event, n, r.latestMs, r.maxMs)
+		b.WriteString(latencyAdvice(r.event) + "\n\n")
+	}
+	ctx.enc().WriteBulkStringStr(strings.TrimRight(b.String(), "\n"))
 }
 
-// handleLatencyGraph errors because there are never samples for an event yet.
+// latencyAdvice returns the recommendation line LATENCY DOCTOR prints for an
+// event class.
+func latencyAdvice(event string) string {
+	switch event {
+	case "command":
+		return "Recommendation: check whether long-running commands (KEYS, SORT, large LRANGE) are in use."
+	case "fast-command":
+		return "Recommendation: O(1) commands are spiking, which usually points to CPU pressure or contention."
+	case "wal-fsync", "aof-write":
+		return "Recommendation: check disk I/O latency; consider moving the .aki file to a faster volume."
+	case "checkpoint":
+		return "Recommendation: checkpoints are slow; check disk throughput and the WAL size."
+	default:
+		return "Recommendation: inspect the workload driving this event class."
+	}
+}
+
+// handleLatencyGraph returns an ASCII sparkline of an event's recent spikes, or an
+// error when the event has no samples.
 func handleLatencyGraph(ctx *Ctx) {
-	ctx.enc().WriteError("ERR No samples for event '" + string(ctx.Argv[2]) + "'")
+	event := string(ctx.Argv[2])
+	samples := ctx.d.latencyHistoryOf(event)
+	if len(samples) == 0 {
+		ctx.enc().WriteError("ERR No samples for event '" + event + "'")
+		return
+	}
+	ms := make([]int64, len(samples))
+	for i, s := range samples {
+		ms[i] = s.ms
+	}
+	ctx.enc().WriteBulkStringStr(event + " - high " +
+		strconv.FormatInt(maxInt64(ms), 10) + " ms, low " +
+		strconv.FormatInt(minInt64(ms), 10) + " ms\n" + sparkline(ms))
+}
+
+// sparkline renders a series as a row of Unicode block elements, log-scaled so a
+// wide latency range still shows detail.
+func sparkline(vals []int64) string {
+	const blocks = "▁▂▃▄▅▆▇█"
+	levels := []rune(blocks)
+	lo, hi := minInt64(vals), maxInt64(vals)
+	llo, lhi := math.Log1p(float64(lo)), math.Log1p(float64(hi))
+	span := lhi - llo
+	var b strings.Builder
+	for _, v := range vals {
+		idx := 0
+		if span > 0 {
+			frac := (math.Log1p(float64(v)) - llo) / span
+			idx = int(frac * float64(len(levels)-1))
+			if idx < 0 {
+				idx = 0
+			}
+			if idx >= len(levels) {
+				idx = len(levels) - 1
+			}
+		}
+		b.WriteRune(levels[idx])
+	}
+	return b.String()
+}
+
+// maxInt64 and minInt64 return the largest and smallest value in a non-empty
+// slice.
+func maxInt64(vals []int64) int64 {
+	m := vals[0]
+	for _, v := range vals[1:] {
+		if v > m {
+			m = v
+		}
+	}
+	return m
+}
+
+func minInt64(vals []int64) int64 {
+	m := vals[0]
+	for _, v := range vals[1:] {
+		if v < m {
+			m = v
+		}
+	}
+	return m
 }
 
 func handleLatencyHelp(ctx *Ctx) {
