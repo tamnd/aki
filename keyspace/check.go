@@ -128,6 +128,18 @@ func (ks *Keyspace) CheckPageAccounting() error {
 		}
 	}
 
+	if t := ks.systemTree(); t != nil {
+		pages, err := btree.Pages(t)
+		if err != nil {
+			return fmt.Errorf("system table: %w", err)
+		}
+		for _, pgno := range pages {
+			if err := mark(pgno, "system table"); err != nil {
+				return err
+			}
+		}
+	}
+
 	for _, db := range ks.dbs {
 		t := db.loadTree()
 		if t == nil {
