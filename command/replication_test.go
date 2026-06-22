@@ -124,7 +124,15 @@ func TestWaitReturnsReplicaCount(t *testing.T) {
 	if got := sendLine(t, rr, rc, "REPLICAOF "+mHost+" "+mPort); got != "+OK" {
 		t.Fatalf("REPLICAOF = %q", got)
 	}
-	waitForBulk(t, rr, rc, "__sentinel__", "<nil>") // let the link settle via a read
+	// Wait until the master sees the replica attach before issuing WAIT.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		info, _ := sendArgs(t, mr, mc, "INFO", "replication").(string)
+		if containsLine(info, "connected_slaves:1") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	if got := sendLine(t, mr, mc, "SET k v"); got != "+OK" {
 		t.Fatalf("master SET = %q", got)

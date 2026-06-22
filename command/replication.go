@@ -621,8 +621,8 @@ func (d *Dispatcher) applyFromMaster(ctx *Ctx, sess *session, val resp.RESPValue
 // handleWait serves WAIT numreplicas timeout. It blocks until at least
 // numreplicas replicas have acknowledged the master offset reached at call time,
 // or the timeout elapses, then replies with the number that did. A timeout of 0
-// means wait forever. It returns immediately when enough replicas are already
-// caught up or when this instance has no replicas to wait on.
+// means wait forever. Like real Redis it keeps waiting for the whole timeout even
+// when fewer replicas are connected, since a replica may attach during the wait.
 func (d *Dispatcher) handleWait(ctx *Ctx) {
 	numReplicas, ok := parseInteger(ctx.Argv[1])
 	if !ok {
@@ -637,23 +637,22 @@ func (d *Dispatcher) handleWait(ctx *Ctx) {
 
 	d.repl.mu.Lock()
 	target := d.repl.offset
-	have := len(d.repl.replicas)
 	d.repl.mu.Unlock()
 
-	if int64(have) < numReplicas {
-		// Not enough replicas connected at all, but report how many are caught up
-		// rather than blocking forever on links that cannot arrive.
-		ctx.enc().WriteInteger(int64(d.countReplicasAtOffset(target)))
-		return
-	}
 	if int64(d.countReplicasAtOffset(target)) >= numReplicas {
 		ctx.enc().WriteInteger(int64(d.countReplicasAtOffset(target)))
 		return
 	}
 
-	d.broadcastGetAck()
 	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	lastAck := time.Time{}
 	for {
+		// Nudge replicas to report their offset, but not on every spin.
+		now := time.Now()
+		if now.Sub(lastAck) >= 100*time.Millisecond {
+			d.broadcastGetAck()
+			lastAck = now
+		}
 		n := d.countReplicasAtOffset(target)
 		if int64(n) >= numReplicas {
 			ctx.enc().WriteInteger(int64(n))
