@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/tamnd/aki/keyspace"
+	"github.com/tamnd/aki/pager"
 	"github.com/tamnd/aki/rdb"
 )
 
@@ -157,6 +158,14 @@ func (e *Engine) dbSizes() []uint64 {
 		}
 	}
 	return out
+}
+
+// fileStats returns the pager counters for the file-growth INFO fields. It takes
+// the engine lock so the read does not race a commit changing the page count.
+func (e *Engine) fileStats() pager.Stats {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.ks.PagerStats()
 }
 
 // update routes a write to the current connection's database. It reports false
