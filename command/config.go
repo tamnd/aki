@@ -147,6 +147,13 @@ func configDirectives() []*directive {
 		{name: "admin-port", kind: dirInt, def: "6399"},
 		{name: "admin-bind", kind: dirString, def: "127.0.0.1"},
 
+		// Go GC knobs (doc 21 section 10.3). go-gogc drives debug.SetGCPercent
+		// (100 is the runtime default, 0 turns the GC off) and go-memlimit drives
+		// debug.SetMemoryLimit (0 means no soft limit). Both apply at startup and
+		// take effect live through CONFIG SET.
+		{name: "go-gogc", kind: dirInt, def: "100", mutable: true},
+		{name: "go-memlimit", kind: dirMemory, def: "0", mutable: true},
+
 		// Continuous profiling (doc 21 section 10.2). When on, a background
 		// goroutine writes cpu, heap, and mutex pprof snapshots to profiling-dir
 		// every profiling-interval seconds and keeps the newest profiling-keep.
@@ -617,6 +624,10 @@ func handleConfigSet(ctx *Ctx) {
 			if n, ok := parseInteger([]byte(c.val)); ok && ctx.d.acl != nil {
 				ctx.d.acl.setLogMax(int(n))
 			}
+		case "go-gogc", "go-memlimit":
+			// Re-tune the Go GC so the new percentage or memory limit takes hold
+			// without a restart.
+			ctx.d.ApplyGCTuning()
 		}
 	}
 	ctx.enc().WriteStatus("OK")
