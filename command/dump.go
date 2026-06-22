@@ -64,8 +64,9 @@ func handleDump(ctx *Ctx) {
 	ctx.enc().WriteBulkString(payload)
 }
 
-// errDumpUnsupported marks a value type DUMP cannot serialize yet, currently only
-// streams.
+// errDumpUnsupported marks a value type DUMP cannot serialize yet. Every keyspace
+// type aki stores has an encoder now, so this only guards against a future type
+// byte the codec does not know.
 var errDumpUnsupported = errStr("rdb: dump unsupported type")
 
 // errStr is a tiny error type so the dump path can compare against a sentinel
@@ -115,6 +116,12 @@ func readDumpValue(db *keyspace.DB, key []byte) (rdb.Value, bool, error) {
 			out[i] = rdb.Member{Member: m.member, Score: m.score}
 		}
 		return rdb.Value{Kind: rdb.KindZSet, ZSet: out}, true, nil
+	case keyspace.TypeStream:
+		s, _, _, gerr := getStream(db, key)
+		if gerr != nil {
+			return rdb.Value{}, true, gerr
+		}
+		return streamToRDB(s), true, nil
 	default:
 		return rdb.Value{}, true, errDumpUnsupported
 	}
@@ -344,6 +351,8 @@ func storeRestored(lim encLimits, db *keyspace.DB, key []byte, v rdb.Value, ttlM
 		}
 		return db.Set(key, zsetEncode(members), keyspace.TypeZSet,
 			zsetEncoding(lim, members, keyspace.EncListpack), ttlMs)
+	case rdb.KindStream:
+		return storeStream(db, key, rdbToStream(v.Stream), ttlMs)
 	default:
 		return errDumpUnsupported
 	}
