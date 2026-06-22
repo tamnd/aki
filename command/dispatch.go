@@ -146,6 +146,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, functionCommands()...)
 	cmds = append(cmds, replicationCommands()...)
 	cmds = append(cmds, clusterCommands()...)
+	cmds = append(cmds, sentinelCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	conf := newConfigStore()
 	conf.set("databases", strconv.Itoa(cfg.Databases))

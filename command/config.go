@@ -137,6 +137,14 @@ func configDirectives() []*directive {
 		{name: "repl-backlog-size", kind: dirMemory, def: "1048576", mutable: true},
 		{name: "repl-ping-replica-period", kind: dirInt, def: "10", mutable: true},
 		{name: "repl-timeout", kind: dirInt, def: "60", mutable: true},
+		{name: "replica-priority", kind: dirInt, def: "100", mutable: true},
+
+		// Sentinel compatibility. aki is not a Sentinel, but it answers the SENTINEL
+		// command family so discovery clients can resolve the master address.
+		{name: "sentinel-compat-mode", kind: dirBool, def: "yes", mutable: true},
+		{name: "sentinel-monitor-name", kind: dirString, def: "mymaster", mutable: true},
+		{name: "sentinel-down-after-milliseconds", kind: dirInt, def: "30000", mutable: true},
+		{name: "sentinel-failover-timeout", kind: dirInt, def: "180000", mutable: true},
 
 		// Cluster. cluster-enabled is immutable in real Redis (it needs a restart);
 		// aki lets it be toggled at runtime so a single-node cluster can be brought
