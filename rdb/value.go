@@ -27,6 +27,7 @@ const (
 	typeSetListpack    = 15
 	typeZSetListpack   = 16
 	typeHashListpack   = 17
+	typeStream         = 19
 	typeSetIntset      = 21
 
 	typeListLegacy  = 1
@@ -52,6 +53,7 @@ const (
 	KindSet
 	KindHash
 	KindZSet
+	KindStream
 )
 
 // Field is one hash entry.
@@ -70,16 +72,17 @@ type Member struct {
 // byte form. The command layer fills the field matching Kind and hands it to
 // Marshal, or reads it back from Unmarshal.
 type Value struct {
-	Kind Kind
-	Str  []byte
-	List [][]byte
-	Set  [][]byte
-	Hash []Field
-	ZSet []Member
+	Kind   Kind
+	Str    []byte
+	List   [][]byte
+	Set    [][]byte
+	Hash   []Field
+	ZSet   []Member
+	Stream *StreamData
 }
 
 // ErrUnsupported means the payload used a type aki does not deserialize yet, such
-// as a stream. RESTORE maps it to the generic bad-payload reply.
+// as a module value. RESTORE maps it to the generic bad-payload reply.
 var ErrUnsupported = errors.New("rdb: unsupported value type")
 
 // Marshal serializes v into a DUMP payload: the type byte and value bytes, then a
@@ -111,6 +114,8 @@ func encodeBody(v Value) (byte, []byte, error) {
 		return encodeHash(v.Hash)
 	case KindZSet:
 		return encodeZSet(v.ZSet)
+	case KindStream:
+		return encodeStream(v)
 	default:
 		return 0, nil, ErrUnsupported
 	}
@@ -291,6 +296,8 @@ func decodeValue(r *reader, typeByte byte) (Value, error) {
 		}
 		m, err := pairsToMembers(flat)
 		return Value{Kind: KindZSet, ZSet: m}, err
+	case typeStream:
+		return decodeStream(r)
 	default:
 		return Value{}, ErrUnsupported
 	}
