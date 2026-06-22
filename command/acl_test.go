@@ -189,6 +189,38 @@ func TestACLLog(t *testing.T) {
 	}
 }
 
+func TestACLLogMaxLen(t *testing.T) {
+	r, c := startData(t)
+	sendLine(t, r, c, "ACL SETUSER lm on >pw ~* +@read +select +auth +acl +config")
+	sendLine(t, r, c, "AUTH lm pw")
+
+	// Four distinct denials, different objects so they do not coalesce.
+	for _, cmd := range []string{"SET k v", "LPUSH l v", "HSET h f v", "SADD s m"} {
+		if got := sendLine(t, r, c, cmd); !strings.HasPrefix(got, "-NOPERM") {
+			t.Fatalf("%s = %q want NOPERM", cmd, got)
+		}
+	}
+	if n := len(asArray(t, sendReply(t, r, c, "ACL LOG"))); n != 4 {
+		t.Fatalf("ACL LOG has %d entries want 4", n)
+	}
+
+	// Shrinking the cap trims the log right away.
+	if got := sendLine(t, r, c, "CONFIG SET acllog-max-len 2"); got != "+OK" {
+		t.Fatalf("CONFIG SET acllog-max-len = %q", got)
+	}
+	if n := len(asArray(t, sendReply(t, r, c, "ACL LOG"))); n != 2 {
+		t.Fatalf("after shrink ACL LOG has %d entries want 2", n)
+	}
+
+	// New denials still respect the cap.
+	for _, cmd := range []string{"SET k2 v", "LPUSH l2 v", "HSET h2 f v"} {
+		sendLine(t, r, c, cmd)
+	}
+	if n := len(asArray(t, sendReply(t, r, c, "ACL LOG"))); n != 2 {
+		t.Fatalf("ACL LOG grew past cap to %d want 2", n)
+	}
+}
+
 func TestACLAuthThenWhoami(t *testing.T) {
 	r, c := startData(t)
 	sendLine(t, r, c, "ACL SETUSER who on >pw ~* +@all")
