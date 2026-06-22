@@ -744,19 +744,68 @@ func (d *Dispatcher) handleWait(ctx *Ctx) {
 		return
 	}
 
+	ctx.enc().WriteInteger(int64(d.waitReplicas(numReplicas, timeoutMs)))
+}
+
+// handleWaitAOF implements WAITAOF numlocal numreplicas timeout (Redis 7.2). It
+// waits until the local copy is durable (numlocal, the WAL/AOF fsynced) and until
+// numreplicas replicas have acknowledged, then replies with a two-element array
+// [local_acked, replicas_acked]. aki has a single local copy, so numlocal is 0 or
+// 1.
+func (d *Dispatcher) handleWaitAOF(ctx *Ctx) {
+	numLocal, ok := parseInteger(ctx.Argv[1])
+	if !ok || numLocal < 0 || numLocal > 1 {
+		ctx.enc().WriteError("ERR WAITAOF numlocal must be 0 or 1.")
+		return
+	}
+	numReplicas, ok := parseInteger(ctx.Argv[2])
+	if !ok || numReplicas < 0 {
+		ctx.enc().WriteError("ERR value is out of range, must be positive")
+		return
+	}
+	timeoutMs, ok := parseInteger(ctx.Argv[3])
+	if !ok || timeoutMs < 0 {
+		ctx.enc().WriteError("ERR timeout is not an integer or out of range")
+		return
+	}
+
+	if !d.aofEnabled() && numLocal != 0 {
+		ctx.enc().WriteError("ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.")
+		return
+	}
+
+	localAcked := 0
+	if numLocal >= 1 {
+		if d.forceSyncAOF() {
+			localAcked = 1
+		}
+	}
+
+	replicasAcked := 0
+	if numReplicas > 0 {
+		replicasAcked = d.waitReplicas(int64(numReplicas), timeoutMs)
+	}
+
+	ctx.enc().WriteArrayLen(2)
+	ctx.enc().WriteInteger(int64(localAcked))
+	ctx.enc().WriteInteger(int64(replicasAcked))
+}
+
+// waitReplicas blocks until at least numReplicas replicas acknowledge the current
+// offset or the timeout passes, and returns the count reached. It is the shared
+// core behind WAIT and the replica leg of WAITAOF.
+func (d *Dispatcher) waitReplicas(numReplicas, timeoutMs int64) int {
 	d.repl.mu.Lock()
 	target := d.repl.offset
 	d.repl.mu.Unlock()
 
-	if int64(d.countReplicasAtOffset(target)) >= numReplicas {
-		ctx.enc().WriteInteger(int64(d.countReplicasAtOffset(target)))
-		return
+	if n := d.countReplicasAtOffset(target); int64(n) >= numReplicas {
+		return n
 	}
 
 	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	lastAck := time.Time{}
 	for {
-		// Nudge replicas to report their offset, but not on every spin.
 		now := time.Now()
 		if now.Sub(lastAck) >= 100*time.Millisecond {
 			d.broadcastGetAck()
@@ -764,12 +813,10 @@ func (d *Dispatcher) handleWait(ctx *Ctx) {
 		}
 		n := d.countReplicasAtOffset(target)
 		if int64(n) >= numReplicas {
-			ctx.enc().WriteInteger(int64(n))
-			return
+			return n
 		}
 		if timeoutMs > 0 && time.Now().After(deadline) {
-			ctx.enc().WriteInteger(int64(n))
-			return
+			return n
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
