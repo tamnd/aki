@@ -33,8 +33,10 @@ const (
 	hllDense  = 0
 	hllSparse = 1
 
-	// hllSparseMaxBytes is the body size past which a SPARSE HLL is promoted to
-	// DENSE. It matches Redis's hll-sparse-max-bytes default.
+	// hllSparseMaxBytes is the default body size past which a SPARSE HLL is
+	// promoted to DENSE. It matches Redis's hll-sparse-max-bytes default. The live
+	// value comes from the hll-sparse-max-bytes directive at PFADD time; this is
+	// the fallback when there is no dispatcher to read it from.
 	hllSparseMaxBytes = 3000
 
 	// hllSparseValMax is the largest register value a VAL opcode can hold. A run
@@ -229,7 +231,7 @@ func hllDenseFromRegisters(regs *[hllRegisters]byte) []byte {
 // It reports ok=false when the result cannot be SPARSE: a register value above
 // the VAL ceiling, or a body past the size threshold. The caller falls back to
 // DENSE in that case.
-func hllSparseFromRegisters(regs *[hllRegisters]byte) ([]byte, bool) {
+func hllSparseFromRegisters(regs *[hllRegisters]byte, maxBytes int) ([]byte, bool) {
 	var body []byte
 	i := 0
 	for i < hllRegisters {
@@ -267,7 +269,7 @@ func hllSparseFromRegisters(regs *[hllRegisters]byte) ([]byte, bool) {
 		}
 		i = j
 	}
-	if len(body) > hllSparseMaxBytes {
+	if len(body) > maxBytes {
 		return nil, false
 	}
 	blob := make([]byte, hllHdrSize+len(body))
@@ -280,9 +282,9 @@ func hllSparseFromRegisters(regs *[hllRegisters]byte) ([]byte, bool) {
 
 // hllEncode re-encodes a register array, staying SPARSE when asked and able,
 // otherwise DENSE.
-func hllEncode(regs *[hllRegisters]byte, preferSparse bool) []byte {
+func hllEncode(regs *[hllRegisters]byte, preferSparse bool, maxBytes int) []byte {
 	if preferSparse {
-		if blob, ok := hllSparseFromRegisters(regs); ok {
+		if blob, ok := hllSparseFromRegisters(regs, maxBytes); ok {
 			return blob
 		}
 	}
@@ -355,6 +357,7 @@ func hllCount(regs *[hllRegisters]byte) uint64 {
 func handlePFAdd(ctx *Ctx) {
 	key := ctx.Argv[1]
 	elements := ctx.Argv[2:]
+	maxBytes := int(ctx.d.confInt("hll-sparse-max-bytes", hllSparseMaxBytes))
 	var (
 		wrongTyp bool
 		notHLL   bool
@@ -397,7 +400,7 @@ func handlePFAdd(ctx *Ctx) {
 		if !changed {
 			return nil
 		}
-		blob := hllEncode(regs, preferSparse)
+		blob := hllEncode(regs, preferSparse, maxBytes)
 		ret = 1
 		return db.Set(key, blob, keyspace.TypeString, keyspace.EncRaw, keepTTL(hdr, found))
 	})
@@ -792,7 +795,7 @@ func hllSelfTest() error {
 	regs[5] = 3
 	regs[10] = 7
 	regs[20000%hllRegisters] = 12
-	blob, ok := hllSparseFromRegisters(&regs)
+	blob, ok := hllSparseFromRegisters(&regs, hllSparseMaxBytes)
 	if !ok {
 		return errors.New("sparse encode failed")
 	}
