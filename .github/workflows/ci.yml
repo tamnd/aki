@@ -47,6 +47,43 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: go tool cover -func=coverage.out | tail -1
 
+  # Keep the no-cgo, zero-dependency stance honest. The whole point of aki is a
+  # single static binary you can scp anywhere, so a stray import "C" or a go.sum
+  # creeping in should fail the build, not get noticed at release time.
+  purego:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: no cgo imports
+        run: |
+          # Match a cgo import line (import "C" or a bare "C" inside an import
+          # block) without tripping on ordinary string literals like "C".
+          hits=$(grep -rlnE --include='*.go' '^[[:space:]]*(import[[:space:]]+)?"C"[[:space:]]*(//.*)?$' . || true)
+          if [ -n "$hits" ]; then
+            echo "cgo is not allowed, these files import \"C\":"
+            echo "$hits"
+            exit 1
+          fi
+      - name: no external dependencies
+        run: |
+          if [ -f go.sum ]; then
+            echo "go.sum exists, aki must stay on the standard library only"
+            exit 1
+          fi
+          if grep -q '^require' go.mod; then
+            echo "go.mod has a require block, aki must stay on the standard library only"
+            exit 1
+          fi
+      - name: builds with cgo disabled
+        env:
+          CGO_ENABLED: 0
+        run: go build ./...
+
   # golangci-lint bundles staticcheck, govet, ineffassign, errcheck, unused and
   # more, so it is the main quality gate.
   lint:
