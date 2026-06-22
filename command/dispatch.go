@@ -73,6 +73,10 @@ type Dispatcher struct {
 
 	// functions holds the FUNCTION LOAD libraries and FCALL targets.
 	functions functionRegistry
+
+	// repl holds the replication state: the master-side backlog and replica list,
+	// and the replica-side link to a master.
+	repl replState
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -135,6 +139,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, memoryCommands()...)
 	cmds = append(cmds, scriptCommands()...)
 	cmds = append(cmds, functionCommands()...)
+	cmds = append(cmds, replicationCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	conf := newConfigStore()
 	conf.set("databases", strconv.Itoa(cfg.Databases))
@@ -155,6 +160,7 @@ func New(cfg Config) *Dispatcher {
 		hz:        10,
 	}
 	d.activeExpire.Store(true)
+	d.replInit()
 	if cfg.AclFile != "" {
 		// A missing or unreadable file at startup is not fatal: the in-memory
 		// default user stays in place until ACL LOAD or ACL SAVE is run.
@@ -192,6 +198,7 @@ func (d *Dispatcher) StartBackground() {
 				d.runActiveExpire()
 				d.checkSavePoints()
 				d.checkAOFRewrite()
+				d.replPingReplicas()
 			}
 		}
 	}()
@@ -267,6 +274,14 @@ type session struct {
 	libVer  string
 	noEvict bool
 	noTouch bool
+
+	// Replication. isReplica marks a connection that issued PSYNC/SYNC and is now
+	// a downstream replica. replListenPort is the port it announced with REPLCONF
+	// listening-port. fromMaster marks the internal connection the replica apply
+	// loop uses, so its writes bypass the read-only guard and are not re-propagated.
+	isReplica      bool
+	replListenPort int
+	fromMaster     bool
 }
 
 // subCount is the running number of subscriptions across channels, patterns and
@@ -316,6 +331,10 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		c.Enc().WriteError(msg)
 		return
 	}
+	if cmd.Flags.Has(FlagWrite) && !sess.fromMaster && d.isReadonlyReplica() {
+		c.Enc().WriteError("READONLY You can't write against a read only replica.")
+		return
+	}
 
 	d.runCommand(&Ctx{Conn: c, Argv: argv, d: d, sess: sess}, cmd)
 }
@@ -343,6 +362,9 @@ func (d *Dispatcher) OnDisconnect(c *networking.Conn) {
 	sess, ok := c.Session().(*session)
 	if !ok {
 		return
+	}
+	if sess.isReplica {
+		d.dropReplica(c.ID())
 	}
 	d.ps.dropClient(c.ID(), sess)
 }

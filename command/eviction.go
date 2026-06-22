@@ -129,16 +129,32 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 		ctx.enc().WriteError(oomError)
 		return
 	}
-	// Capture the dirty counter around a write so the AOF only records commands
-	// that actually changed the dataset, the same rule Redis uses to decide
-	// whether to propagate.
-	propagate := cmd.Flags.Has(FlagWrite) && d.aofEnabled()
+	// Capture the dirty counter around a write so the AOF and the replication
+	// stream only record commands that actually changed the dataset, the same rule
+	// Redis uses to decide whether to propagate. When replication is active a write
+	// is sequenced through the replication lock so the backlog and every replica
+	// see effects in commit order.
+	isWrite := cmd.Flags.Has(FlagWrite)
+	replActive := isWrite && d.replActive() && !ctx.sess.fromMaster
+	if replActive {
+		d.repl.mu.Lock()
+		defer d.repl.mu.Unlock()
+	}
+	propagate := isWrite && (d.aofEnabled() || replActive)
 	var before int64
 	if propagate {
 		before = d.persist.dirtyCount()
 	}
 	cmd.Handler(ctx)
 	if propagate && d.persist.dirtyCount() > before {
-		d.propagateAOF(ctx, cmd.Name)
+		args := rewriteForAOF(cmd.Name, ctx.Argv)
+		if args != nil {
+			if d.aofEnabled() {
+				d.appendAOF(ctx.Conn.DB(), args)
+			}
+			if replActive {
+				d.propagateRepl(ctx.Conn.DB(), args)
+			}
+		}
 	}
 }
