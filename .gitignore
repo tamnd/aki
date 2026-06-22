@@ -7,6 +7,9 @@
 *.aki-shm
 .DS_Store
 
+# pprof snapshots DEBUG JMAP writes to the working directory
+aki-heap-*.prof
+
 # committed golden fixtures are the .aki files we do track
 !format/testdata/*.aki
 !pager/testdata/*.aki
