@@ -181,6 +181,14 @@ func (d *Dispatcher) replayAOF(ctx *Ctx, data []byte) error {
 		val, next, err := resp.Decode(data, pos)
 		if err != nil {
 			if errors.Is(err, resp.ErrNeedMore) {
+				// A truncated command at the very end is a partial write left by a
+				// crash. aof-load-truncated (default yes) tolerates it: load
+				// everything up to the truncation and stop. With it off, refuse to
+				// load so the truncation is not silently swallowed. A real protocol
+				// error is not a truncated tail, so it always aborts the load.
+				if d.confBool("aof-load-truncated", true) {
+					return nil
+				}
 				return fmt.Errorf("truncated AOF command at offset %d", pos)
 			}
 			return err
