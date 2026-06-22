@@ -363,6 +363,22 @@ func (d *Dispatcher) checkAOFRewrite() {
 	}
 }
 
+// forceSyncAOF fsyncs the current incr file so the data written so far is durable
+// on the local disk. WAITAOF uses it to satisfy a numlocal of 1 regardless of the
+// configured appendfsync policy. It returns true when a fsync succeeded.
+func (d *Dispatcher) forceSyncAOF() bool {
+	d.aof.mu.Lock()
+	defer d.aof.mu.Unlock()
+	if d.aof.incrFile == nil {
+		return false
+	}
+	if err := d.aof.incrFile.Sync(); err != nil {
+		d.aof.lastWriteStatus = "err"
+		return false
+	}
+	return true
+}
+
 // closeAOF closes the incr file handle. The server calls it on shutdown.
 func (d *Dispatcher) closeAOF() {
 	d.aof.mu.Lock()
