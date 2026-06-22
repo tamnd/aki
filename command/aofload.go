@@ -1,6 +1,7 @@
 package command
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -178,6 +179,20 @@ func (d *Dispatcher) flushAllDatabases() error {
 func (d *Dispatcher) replayAOF(ctx *Ctx, data []byte) error {
 	pos := 0
 	for pos < len(data) {
+		if data[pos] == '#' {
+			// A comment line, written by aof-timestamp-enabled. Skip to the next
+			// line. A comment with no terminating newline is a truncated tail, so it
+			// follows the same aof-load-truncated rule as a truncated command.
+			nl := bytes.IndexByte(data[pos:], '\n')
+			if nl < 0 {
+				if d.confBool("aof-load-truncated", true) {
+					return nil
+				}
+				return fmt.Errorf("truncated AOF annotation at offset %d", pos)
+			}
+			pos += nl + 1
+			continue
+		}
 		val, next, err := resp.Decode(data, pos)
 		if err != nil {
 			if errors.Is(err, resp.ErrNeedMore) {
