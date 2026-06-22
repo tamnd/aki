@@ -133,7 +133,29 @@ func configDirectives() []*directive {
 		// Replication.
 		{name: "replica-read-only", kind: dirBool, def: "yes", mutable: true},
 		{name: "masterauth", kind: dirString, def: "", mutable: true},
+		{name: "masteruser", kind: dirString, def: "", mutable: true},
 		{name: "repl-backlog-size", kind: dirMemory, def: "1048576", mutable: true},
+		{name: "repl-ping-replica-period", kind: dirInt, def: "10", mutable: true},
+		{name: "repl-timeout", kind: dirInt, def: "60", mutable: true},
+
+		// Cluster. cluster-enabled is immutable in real Redis (it needs a restart);
+		// aki lets it be toggled at runtime so a single-node cluster can be brought
+		// up without relaunching, which a wire-compatible client never depends on.
+		{name: "cluster-enabled", kind: dirBool, def: "no", mutable: true},
+		{name: "cluster-config-file", kind: dirString, def: "nodes.conf"},
+		{name: "cluster-node-timeout", kind: dirInt, def: "15000", mutable: true},
+		{name: "cluster-announce-ip", kind: dirString, def: "", mutable: true},
+		{name: "cluster-announce-port", kind: dirInt, def: "0", mutable: true},
+		{name: "cluster-announce-tls-port", kind: dirInt, def: "0", mutable: true},
+		{name: "cluster-announce-bus-port", kind: dirInt, def: "0", mutable: true},
+		{name: "cluster-announce-hostname", kind: dirString, def: "", mutable: true},
+		{name: "cluster-migration-barrier", kind: dirInt, def: "1", mutable: true},
+		{name: "cluster-require-full-coverage", kind: dirBool, def: "yes", mutable: true},
+		{name: "cluster-replica-no-failover", kind: dirBool, def: "no", mutable: true},
+		{name: "cluster-allow-reads-when-down", kind: dirBool, def: "no", mutable: true},
+		{name: "cluster-allow-pubsubshard-when-down", kind: dirBool, def: "yes", mutable: true},
+		{name: "cluster-link-sendbuf-limit", kind: dirMemory, def: "0", mutable: true},
+		{name: "cluster-replica-validity-factor", kind: dirInt, def: "10", mutable: true},
 
 		// Data-type limits.
 		{name: "list-max-listpack-size", kind: dirInt, def: "128", mutable: true},
