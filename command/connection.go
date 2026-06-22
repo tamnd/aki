@@ -108,7 +108,10 @@ func handleReset(ctx *Ctx) {
 	ctx.Conn.SetProto(2)
 	ctx.Conn.SetDB(0)
 	ctx.Conn.SetName("")
-	ctx.sess.authenticated = ctx.d.cfg.RequirePass == ""
+	def := ctx.d.acl.get("default")
+	ctx.sess.authenticated = def != nil && def.nopass
+	ctx.sess.user = def
+	ctx.sess.username = "default"
 	ctx.sess.clearMulti()
 	ctx.Conn.WriteRaw(resp.ReplyReset)
 }
@@ -127,15 +130,9 @@ func handleAuth(ctx *Ctx) {
 		ctx.enc().WriteError(arityError(&CmdDesc{Name: "auth"}))
 		return
 	}
-	if ctx.d.cfg.RequirePass == "" {
-		ctx.enc().WriteError("ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?")
+	if !ctx.authWith(user, pass) {
 		return
 	}
-	if user != "default" || pass != ctx.d.cfg.RequirePass {
-		ctx.enc().WriteError("WRONGPASS invalid username-password pair or user is disabled.")
-		return
-	}
-	ctx.sess.authenticated = true
 	ctx.Conn.WriteRaw(resp.ReplyOK)
 }
 
@@ -196,15 +193,23 @@ func handleHello(ctx *Ctx) {
 // authWith performs the AUTH check used by both AUTH and HELLO ... AUTH. It
 // writes the error reply itself and reports whether authentication succeeded.
 func (ctx *Ctx) authWith(user, pass string) bool {
-	if ctx.d.cfg.RequirePass == "" {
-		ctx.enc().WriteError("ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?")
-		return false
+	// The one-argument AUTH form maps to the default user. If that user needs no
+	// password, the legacy form has nothing to check, so report it the way Redis
+	// does rather than silently succeeding.
+	if user == "default" {
+		if def := ctx.d.acl.get("default"); def != nil && def.nopass {
+			ctx.enc().WriteError("ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?")
+			return false
+		}
 	}
-	if user != "default" || pass != ctx.d.cfg.RequirePass {
+	u, ok := ctx.d.acl.authenticate(user, pass)
+	if !ok {
 		ctx.enc().WriteError("WRONGPASS invalid username-password pair or user is disabled.")
 		return false
 	}
 	ctx.sess.authenticated = true
+	ctx.sess.user = u
+	ctx.sess.username = user
 	return true
 }
 
