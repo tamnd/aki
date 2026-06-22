@@ -11,8 +11,9 @@ import (
 // This file implements the CLUSTER command family (spec 2064 doc 18 sections 20
 // through 28). aki runs single-node by default (cluster-enabled no), where all
 // 16384 slots are served implicitly and no MOVED or ASK redirects are emitted.
-// With cluster-enabled yes the CROSSSLOT constraint is enforced and SELECT is
-// limited to db 0 (doc 18 §28.2, §28.3). The reporting subcommands work in any
+// With cluster-enabled yes the CROSSSLOT constraint is enforced, key commands are
+// gated on slot coverage with CLUSTERDOWN, and SELECT is limited to db 0 (doc 18
+// §28.2, §28.3). The reporting subcommands work in any
 // mode; the slot-management subcommands need cluster-enabled yes. The gossip bus,
 // MOVED and ASK redirection across nodes, and automatic failover are not part of
 // this slice, so MEET, FORGET, REPLICATE and FAILOVER report that they need a peer.
@@ -64,6 +65,46 @@ func (d *Dispatcher) crossSlotError(name string, cmd *CmdDesc, argv [][]byte) st
 	for _, k := range keys[1:] {
 		if hashSlot(k) != slot {
 			return "CROSSSLOT Keys in request don't hash to the same slot"
+		}
+	}
+	return ""
+}
+
+// clusterDownError gates a key-touching command on slot coverage when cluster
+// mode is on, the way real Redis does. With cluster-require-full-coverage on
+// (the default) and some slots unassigned the cluster state is fail, so a command
+// that touches a key is refused with "CLUSTERDOWN The cluster is down", unless
+// cluster-allow-reads-when-down is on and the command only reads, in which case a
+// read is served and a write gets the read-only variant. When the state is ok a
+// command whose key maps to a slot this node does not serve gets "Hash slot not
+// served". It returns "" when cluster mode is off, the command carries no keys,
+// or coverage is fine. CROSSSLOT is checked before this, so it wins.
+func (d *Dispatcher) clusterDownError(name string, cmd *CmdDesc, argv [][]byte) string {
+	if !d.clusterEnabled() {
+		return ""
+	}
+	keys, ok := extractKeys(name, cmd, argv)
+	if !ok || len(keys) == 0 {
+		return ""
+	}
+	d.cluster.mu.Lock()
+	assigned := d.countOwnedSlots()
+	d.cluster.mu.Unlock()
+	fullCoverage := strings.EqualFold(d.confValue("cluster-require-full-coverage", "yes"), "yes")
+	if fullCoverage && assigned < numSlots {
+		if !strings.EqualFold(d.confValue("cluster-allow-reads-when-down", "no"), "yes") {
+			return "CLUSTERDOWN The cluster is down"
+		}
+		if cmd.Flags.Has(FlagWrite) {
+			return "CLUSTERDOWN The cluster is down and only accepts read commands"
+		}
+		return ""
+	}
+	d.cluster.mu.Lock()
+	defer d.cluster.mu.Unlock()
+	for _, k := range keys {
+		if !d.cluster.slots[hashSlot(k)] {
+			return "CLUSTERDOWN Hash slot not served"
 		}
 	}
 	return ""

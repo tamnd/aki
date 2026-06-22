@@ -17,6 +17,8 @@ func TestClusterCrossSlot(t *testing.T) {
 	}
 
 	sendArgs(t, r, c, "CONFIG", "SET", "cluster-enabled", "yes")
+	// Cover all slots so key commands are not refused with CLUSTERDOWN.
+	sendArgs(t, r, c, "CLUSTER", "ADDSLOTSRANGE", "0", "16383")
 
 	// a and b hash to different slots, so MGET is rejected.
 	got := sendArgs(t, r, c, "MGET", "a", "b")
@@ -45,6 +47,8 @@ func TestClusterCrossSlot(t *testing.T) {
 func TestClusterTxnCrossSlot(t *testing.T) {
 	r, c := startData(t)
 	sendArgs(t, r, c, "CONFIG", "SET", "cluster-enabled", "yes")
+	// Cover all slots so key commands are not refused with CLUSTERDOWN.
+	sendArgs(t, r, c, "CLUSTER", "ADDSLOTSRANGE", "0", "16383")
 
 	// Two single-key writes to different slots queue fine, but EXEC rejects the
 	// whole transaction with CROSSSLOT.
