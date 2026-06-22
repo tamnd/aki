@@ -1,7 +1,6 @@
 package command
 
 import (
-	"errors"
 	"net"
 	"strconv"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	"github.com/tamnd/aki/keyspace"
 	"github.com/tamnd/aki/rdb"
 	"github.com/tamnd/aki/resp"
+	"github.com/tamnd/aki/respclient"
 )
 
 // migrateCommands returns MIGRATE, which moves one or more keys from this
@@ -105,15 +105,15 @@ func handleMigrate(ctx *Ctx) {
 
 	// Talk to the target. The whole exchange shares one socket deadline derived
 	// from the millisecond timeout argument.
-	cl, err := dialRemote(net.JoinHostPort(ma.host, ma.port), ma.timeout)
+	cl, err := respclient.Dial(net.JoinHostPort(ma.host, ma.port), ma.timeout)
 	if err != nil {
 		ctx.enc().WriteError("IOERR error or timeout connecting to target instance")
 		return
 	}
-	defer cl.close()
+	defer cl.Close()
 
 	if ma.auth != nil {
-		reply, aerr := cl.call(ma.auth...)
+		reply, aerr := cl.Call(ma.auth...)
 		if aerr != nil {
 			ctx.enc().WriteError("IOERR error or timeout writing to target instance")
 			return
@@ -125,7 +125,7 @@ func handleMigrate(ctx *Ctx) {
 	}
 
 	selectReq := [][]byte{[]byte("SELECT"), []byte(strconv.Itoa(ma.destDB))}
-	if reply, serr := cl.call(selectReq...); serr != nil {
+	if reply, serr := cl.Call(selectReq...); serr != nil {
 		ctx.enc().WriteError("IOERR error or timeout writing to target instance")
 		return
 	} else if reply.Type == resp.TypeError {
@@ -133,7 +133,7 @@ func handleMigrate(ctx *Ctx) {
 		return
 	}
 
-	if _, errMsg := cl.restoreAll(items2restore(items, ma.replace)); errMsg != "" {
+	if _, errMsg := restoreAll(cl, items2restore(items, ma.replace)); errMsg != "" {
 		ctx.enc().WriteError(errMsg)
 		return
 	}
@@ -270,62 +270,18 @@ func parseMigrateArgs(argv [][]byte) (migrateArgs, string) {
 	return ma, ""
 }
 
-// remoteClient is a minimal blocking RESP client used by MIGRATE. It writes
-// commands as RESP arrays and parses replies with the shared decoder, holding a
-// single read buffer across calls. The socket deadline set at dial time bounds
-// the whole conversation, which is how MIGRATE's timeout is enforced.
-type remoteClient struct {
-	conn net.Conn
-	buf  []byte
-}
-
-// dialRemote connects to addr and arms the deadline for the entire exchange. A
-// zero timeout means no deadline, matching Redis where MIGRATE timeout 0 blocks.
-func dialRemote(addr string, timeout time.Duration) (*remoteClient, error) {
-	var (
-		conn net.Conn
-		err  error
-	)
-	if timeout > 0 {
-		conn, err = net.DialTimeout("tcp", addr, timeout)
-	} else {
-		conn, err = net.Dial("tcp", addr)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if timeout > 0 {
-		if derr := conn.SetDeadline(time.Now().Add(timeout)); derr != nil {
-			_ = conn.Close()
-			return nil, derr
-		}
-	}
-	return &remoteClient{conn: conn}, nil
-}
-
-// close shuts the connection.
-func (c *remoteClient) close() { _ = c.conn.Close() }
-
-// call writes one command as a RESP array and reads a single reply.
-func (c *remoteClient) call(args ...[]byte) (resp.RESPValue, error) {
-	if err := c.send(args); err != nil {
-		return resp.RESPValue{}, err
-	}
-	return c.readReply()
-}
-
 // restoreAll pipelines every RESTORE then reads the replies in order, the single
 // round trip Redis uses for MIGRATE with KEYS. It returns busy true with the
 // -BUSYKEY message when the target rejects an existing key without REPLACE, or a
 // generic error message for any other failure.
-func (c *remoteClient) restoreAll(reqs []restoreReq) (busy bool, errMsg string) {
+func restoreAll(cl *respclient.Client, reqs []restoreReq) (busy bool, errMsg string) {
 	for _, r := range reqs {
-		if err := c.send(r); err != nil {
+		if err := cl.Send(r); err != nil {
 			return false, "IOERR error or timeout writing to target instance"
 		}
 	}
 	for range reqs {
-		reply, err := c.readReply()
+		reply, err := cl.ReadReply()
 		if err != nil {
 			return false, "IOERR error or timeout reading from target instance"
 		}
@@ -337,44 +293,4 @@ func (c *remoteClient) restoreAll(reqs []restoreReq) (busy bool, errMsg string) 
 		}
 	}
 	return false, ""
-}
-
-// send writes a command as a RESP array of bulk strings.
-func (c *remoteClient) send(args [][]byte) error {
-	var b []byte
-	b = append(b, '*')
-	b = strconv.AppendInt(b, int64(len(args)), 10)
-	b = append(b, '\r', '\n')
-	for _, a := range args {
-		b = append(b, '$')
-		b = strconv.AppendInt(b, int64(len(a)), 10)
-		b = append(b, '\r', '\n')
-		b = append(b, a...)
-		b = append(b, '\r', '\n')
-	}
-	_, err := c.conn.Write(b)
-	return err
-}
-
-// readReply decodes the next complete value from the connection, reading more
-// bytes whenever the buffer holds only a partial value.
-func (c *remoteClient) readReply() (resp.RESPValue, error) {
-	tmp := make([]byte, 4096)
-	for {
-		v, n, err := resp.Decode(c.buf, 0)
-		if err == nil {
-			c.buf = c.buf[n:]
-			return v, nil
-		}
-		if !errors.Is(err, resp.ErrNeedMore) {
-			return resp.RESPValue{}, err
-		}
-		m, rerr := c.conn.Read(tmp)
-		if m > 0 {
-			c.buf = append(c.buf, tmp[:m]...)
-		}
-		if rerr != nil {
-			return resp.RESPValue{}, rerr
-		}
-	}
 }

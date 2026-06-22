@@ -11,6 +11,7 @@ import (
 	"github.com/tamnd/aki/networking"
 	"github.com/tamnd/aki/pager"
 	"github.com/tamnd/aki/rdb"
+	"github.com/tamnd/aki/respclient"
 	"github.com/tamnd/aki/vfs"
 )
 
@@ -48,9 +49,9 @@ func startServer(t *testing.T) string {
 
 // mustCall runs a command on the server and fails the test on a transport error
 // or an error reply.
-func mustCall(t *testing.T, cl *netClient, args ...string) {
+func mustCall(t *testing.T, cl *respclient.Client, args ...string) {
 	t.Helper()
-	reply, err := cl.call(args...)
+	reply, err := cl.CallStr(args...)
 	if err != nil {
 		t.Fatalf("%v: %v", args, err)
 	}
@@ -63,11 +64,11 @@ func mustCall(t *testing.T, cl *netClient, args ...string) {
 // checks the keys land in the output file.
 func TestDumpFromServer(t *testing.T) {
 	addr := startServer(t)
-	cl, err := dialServer(addr, 5*time.Second)
+	cl, err := respclient.Dial(addr, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer cl.close()
+	defer cl.Close()
 
 	mustCall(t, cl, "SET", "s", "hello")
 	mustCall(t, cl, "RPUSH", "l", "a", "b", "c")
@@ -100,11 +101,11 @@ func TestDumpFromServer(t *testing.T) {
 // TestDumpFromServerSingleDB limits the wire dump to one database.
 func TestDumpFromServerSingleDB(t *testing.T) {
 	addr := startServer(t)
-	cl, err := dialServer(addr, 5*time.Second)
+	cl, err := respclient.Dial(addr, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer cl.close()
+	defer cl.Close()
 
 	mustCall(t, cl, "SET", "a", "1")
 	mustCall(t, cl, "SELECT", "3")
@@ -149,13 +150,13 @@ func TestImportToServer(t *testing.T) {
 		t.Fatalf("import --addr: %v", err)
 	}
 
-	cl, err := dialServer(addr, 5*time.Second)
+	cl, err := respclient.Dial(addr, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer cl.close()
+	defer cl.Close()
 	for k, want := range map[string]string{"x": "11", "y": "22"} {
-		reply, gerr := cl.call("GET", k)
+		reply, gerr := cl.CallStr("GET", k)
 		if gerr != nil {
 			t.Fatalf("GET %s: %v", k, gerr)
 		}
@@ -171,11 +172,11 @@ func TestDumpImportRoundTripOverWire(t *testing.T) {
 	srcAddr := startServer(t)
 	dstAddr := startServer(t)
 
-	sc, err := dialServer(srcAddr, 5*time.Second)
+	sc, err := respclient.Dial(srcAddr, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial src: %v", err)
 	}
-	defer sc.close()
+	defer sc.Close()
 	mustCall(t, sc, "SET", "k1", "v1")
 	mustCall(t, sc, "SET", "k2", "v2")
 
@@ -187,12 +188,12 @@ func TestDumpImportRoundTripOverWire(t *testing.T) {
 		t.Fatalf("import dst: %v", err)
 	}
 
-	dc, err := dialServer(dstAddr, 5*time.Second)
+	dc, err := respclient.Dial(dstAddr, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial dst: %v", err)
 	}
-	defer dc.close()
-	reply, _ := dc.call("GET", "k1")
+	defer dc.Close()
+	reply, _ := dc.CallStr("GET", "k1")
 	if string(reply.Str) != "v1" {
 		t.Fatalf("dst GET k1 = %q want v1", reply.Str)
 	}

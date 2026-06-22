@@ -7,6 +7,7 @@ import (
 
 	"github.com/tamnd/aki/rdb"
 	"github.com/tamnd/aki/resp"
+	"github.com/tamnd/aki/respclient"
 )
 
 // dumpFromServer reads every key from a running instance into an rdb.Snapshot.
@@ -15,14 +16,14 @@ import (
 // snapshot shape the offline reader produces. When onlyDB is zero or greater
 // only that database is read. auth, when set, is sent before anything else.
 func dumpFromServer(addr, auth string, databases, onlyDB int, timeout time.Duration) (rdb.Snapshot, error) {
-	cl, err := dialServer(addr, timeout)
+	cl, err := respclient.Dial(addr, timeout)
 	if err != nil {
 		return rdb.Snapshot{}, fmt.Errorf("connect %s: %w", addr, err)
 	}
-	defer cl.close()
+	defer cl.Close()
 
 	if auth != "" {
-		if reply, aerr := cl.call("AUTH", auth); aerr != nil {
+		if reply, aerr := cl.CallStr("AUTH", auth); aerr != nil {
 			return rdb.Snapshot{}, fmt.Errorf("auth: %w", aerr)
 		} else if reply.Type == resp.TypeError {
 			return rdb.Snapshot{}, fmt.Errorf("auth: %s", reply.Err)
@@ -35,7 +36,7 @@ func dumpFromServer(addr, auth string, databases, onlyDB int, timeout time.Durat
 		if onlyDB >= 0 && db != onlyDB {
 			continue
 		}
-		if reply, serr := cl.call("SELECT", strconv.Itoa(db)); serr != nil {
+		if reply, serr := cl.CallStr("SELECT", strconv.Itoa(db)); serr != nil {
 			return rdb.Snapshot{}, fmt.Errorf("select %d: %w", db, serr)
 		} else if reply.Type == resp.TypeError {
 			return rdb.Snapshot{}, fmt.Errorf("select %d: %s", db, reply.Err)
@@ -60,11 +61,11 @@ func dumpFromServer(addr, auth string, databases, onlyDB int, timeout time.Durat
 // every key it finds. A key that disappears between SCAN and DUMP is skipped, and
 // a value type DUMP cannot serialize on the remote is reported and skipped so one
 // odd key does not abort the whole export.
-func scanDatabase(cl *netClient, nowMs int64) ([]rdb.Entry, error) {
+func scanDatabase(cl *respclient.Client, nowMs int64) ([]rdb.Entry, error) {
 	var entries []rdb.Entry
 	cursor := "0"
 	for {
-		reply, err := cl.call("SCAN", cursor, "COUNT", "512")
+		reply, err := cl.CallStr("SCAN", cursor, "COUNT", "512")
 		if err != nil {
 			return nil, err
 		}
@@ -93,8 +94,8 @@ func scanDatabase(cl *netClient, nowMs int64) ([]rdb.Entry, error) {
 
 // dumpOneKey serializes a single key from the remote. ok is false when the key is
 // gone or its type cannot be serialized.
-func dumpOneKey(cl *netClient, key []byte, nowMs int64) (rdb.Entry, bool, error) {
-	dump, err := cl.callRaw([][]byte{[]byte("DUMP"), key})
+func dumpOneKey(cl *respclient.Client, key []byte, nowMs int64) (rdb.Entry, bool, error) {
+	dump, err := cl.Call([]byte("DUMP"), key)
 	if err != nil {
 		return rdb.Entry{}, false, err
 	}
@@ -111,7 +112,7 @@ func dumpOneKey(cl *netClient, key []byte, nowMs int64) (rdb.Entry, bool, error)
 		return rdb.Entry{}, false, nil
 	}
 
-	pttl, perr := cl.call("PTTL", string(key))
+	pttl, perr := cl.CallStr("PTTL", string(key))
 	if perr != nil {
 		return rdb.Entry{}, false, perr
 	}
@@ -127,14 +128,14 @@ func dumpOneKey(cl *netClient, key []byte, nowMs int64) (rdb.Entry, bool, error)
 // TTL in milliseconds, and adds REPLACE when asked so an existing key is
 // overwritten instead of rejected. It returns the number of keys written.
 func importToServer(addr, auth string, snap rdb.Snapshot, onlyDB int, replace bool, timeout time.Duration) (int, error) {
-	cl, err := dialServer(addr, timeout)
+	cl, err := respclient.Dial(addr, timeout)
 	if err != nil {
 		return 0, fmt.Errorf("connect %s: %w", addr, err)
 	}
-	defer cl.close()
+	defer cl.Close()
 
 	if auth != "" {
-		if reply, aerr := cl.call("AUTH", auth); aerr != nil {
+		if reply, aerr := cl.CallStr("AUTH", auth); aerr != nil {
 			return 0, fmt.Errorf("auth: %w", aerr)
 		} else if reply.Type == resp.TypeError {
 			return 0, fmt.Errorf("auth: %s", reply.Err)
@@ -147,7 +148,7 @@ func importToServer(addr, auth string, snap rdb.Snapshot, onlyDB int, replace bo
 		if onlyDB >= 0 && dbData.Index != onlyDB {
 			continue
 		}
-		if reply, serr := cl.call("SELECT", strconv.Itoa(dbData.Index)); serr != nil {
+		if reply, serr := cl.CallStr("SELECT", strconv.Itoa(dbData.Index)); serr != nil {
 			return written, fmt.Errorf("select %d: %w", dbData.Index, serr)
 		} else if reply.Type == resp.TypeError {
 			return written, fmt.Errorf("select %d: %s", dbData.Index, reply.Err)
@@ -165,7 +166,7 @@ func importToServer(addr, auth string, snap rdb.Snapshot, onlyDB int, replace bo
 
 // restoreOneKey sends one RESTORE to the remote. It returns 1 when the key was
 // written and 0 when it was skipped because it already existed without REPLACE.
-func restoreOneKey(cl *netClient, e rdb.Entry, nowMs int64, replace bool) (int, error) {
+func restoreOneKey(cl *respclient.Client, e rdb.Entry, nowMs int64, replace bool) (int, error) {
 	blob, merr := rdb.Marshal(e.Value)
 	if merr != nil {
 		fmt.Printf("skip %s: %v\n", e.Key, merr)
@@ -182,7 +183,7 @@ func restoreOneKey(cl *netClient, e rdb.Entry, nowMs int64, replace bool) (int, 
 	if replace {
 		args = append(args, []byte("REPLACE"))
 	}
-	reply, err := cl.callRaw(args)
+	reply, err := cl.Call(args...)
 	if err != nil {
 		return 0, err
 	}
