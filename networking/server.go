@@ -44,11 +44,14 @@ type Config struct {
 // connection. It owns the client registry and the graceful-shutdown path; it
 // delegates every command to its Handler.
 type Server struct {
-	handler     Handler
-	maxClients  int
-	maxBulkLen  int64
-	idleTimeout time.Duration
-	keepAlive   time.Duration
+	handler    Handler
+	maxClients int
+	maxBulkLen int64
+	// idleTimeout and keepAlive are nanosecond durations held atomically so
+	// CONFIG SET timeout and CONFIG SET tcp-keepalive can change them while the
+	// server runs. The read path loads them per use.
+	idleTimeout atomic.Int64
+	keepAlive   atomic.Int64
 
 	nextID atomic.Uint64
 
@@ -72,16 +75,31 @@ func New(cfg Config, handler Handler) *Server {
 	if maxBulk <= 0 {
 		maxBulk = resp.DefaultMaxBulkLen
 	}
-	return &Server{
-		handler:     handler,
-		maxClients:  cfg.MaxClients,
-		maxBulkLen:  maxBulk,
-		idleTimeout: cfg.IdleTimeout,
-		keepAlive:   cfg.TCPKeepAlive,
-		conns:       make(map[uint64]*Conn),
-		nowFn:       time.Now,
+	s := &Server{
+		handler:    handler,
+		maxClients: cfg.MaxClients,
+		maxBulkLen: maxBulk,
+		conns:      make(map[uint64]*Conn),
+		nowFn:      time.Now,
 	}
+	s.idleTimeout.Store(int64(cfg.IdleTimeout))
+	s.keepAlive.Store(int64(cfg.TCPKeepAlive))
+	return s
 }
+
+// IdleTimeout reports the current idle timeout. 0 means no timeout.
+func (s *Server) IdleTimeout() time.Duration { return time.Duration(s.idleTimeout.Load()) }
+
+// SetIdleTimeout changes the idle timeout. It takes effect on the next read on
+// each connection, so CONFIG SET timeout applies without a restart.
+func (s *Server) SetIdleTimeout(d time.Duration) { s.idleTimeout.Store(int64(d)) }
+
+// TCPKeepAlive reports the current keepalive period. 0 leaves the OS default.
+func (s *Server) TCPKeepAlive() time.Duration { return time.Duration(s.keepAlive.Load()) }
+
+// SetTCPKeepAlive changes the keepalive period. It applies to connections
+// accepted after the change, the same as Redis.
+func (s *Server) SetTCPKeepAlive(d time.Duration) { s.keepAlive.Store(int64(d)) }
 
 func (s *Server) now() time.Time { return s.nowFn() }
 
@@ -181,9 +199,9 @@ func (s *Server) acceptLoop(ln net.Listener) {
 func (s *Server) onAccept(nc net.Conn) {
 	if tcp, ok := nc.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
-		if s.keepAlive > 0 {
+		if ka := s.TCPKeepAlive(); ka > 0 {
 			_ = tcp.SetKeepAlive(true)
-			_ = tcp.SetKeepAlivePeriod(s.keepAlive)
+			_ = tcp.SetKeepAlivePeriod(ka)
 		}
 	}
 

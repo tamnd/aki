@@ -628,6 +628,13 @@ func handleConfigSet(ctx *Ctx) {
 			// Re-tune the Go GC so the new percentage or memory limit takes hold
 			// without a restart.
 			ctx.d.ApplyGCTuning()
+		case "timeout":
+			// Push the new idle timeout to the server so it applies on the next read.
+			ctx.d.applyIdleTimeout()
+		case "tcp-keepalive":
+			// Push the new keepalive period to the server for connections accepted
+			// after this point.
+			ctx.d.applyTCPKeepAlive()
 		}
 	}
 	ctx.enc().WriteStatus("OK")
