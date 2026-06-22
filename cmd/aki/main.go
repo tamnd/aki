@@ -40,6 +40,8 @@ func run(args []string) error {
 		return cmdImport(args[1:])
 	case "dump":
 		return cmdDump(args[1:])
+	case "bench":
+		return cmdBench(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -59,10 +61,11 @@ Commands:
   check <file>   Inspect an .aki file, or validate an RDB with --rdb <file>
   import <file>  Import a Redis dump.rdb into an .aki file
   dump --file f  Export an .aki file to a Redis dump.rdb
+  bench run      Run a load test against a server and report latency
   version        Print version information
   help           Show this help
 
-More commands (cli, bench) arrive as the engine is built.
+More commands (cli) arrive as the engine is built.
 See the specification under notes/Spec/2064.
 `)
 }
