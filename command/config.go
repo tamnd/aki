@@ -141,6 +141,14 @@ func configDirectives() []*directive {
 		{name: "metrics-bind", kind: dirString, def: "127.0.0.1"},
 		{name: "metrics-tls", kind: dirBool, def: "no"},
 
+		// Continuous profiling (doc 21 section 10.2). When on, a background
+		// goroutine writes cpu, heap, and mutex pprof snapshots to profiling-dir
+		// every profiling-interval seconds and keeps the newest profiling-keep.
+		{name: "continuous-profiling", kind: dirBool, def: "no"},
+		{name: "profiling-dir", kind: dirString, def: "./profiles"},
+		{name: "profiling-interval", kind: dirInt, def: "60"},
+		{name: "profiling-keep", kind: dirInt, def: "10"},
+
 		// Memory and eviction.
 		{name: "maxmemory", kind: dirMemory, def: "0", mutable: true},
 		{name: "maxmemory-policy", kind: dirEnum, def: "noeviction", mutable: true, enum: memPolicies},
