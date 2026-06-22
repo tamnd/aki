@@ -301,6 +301,11 @@ type Ctx struct {
 	// been applied and propagated, so a woken client sees the element and its own
 	// propagation follows in order.
 	readyKeys [][]byte
+
+	// readyKeysAll collects keys that should wake every blocked client at once,
+	// not just the oldest. A stream XADD fans one entry out to every blocked
+	// XREAD on the key, so those keys go here instead of readyKeys.
+	readyKeysAll [][]byte
 }
 
 // signalReady marks a key as having gained elements so a client blocked on it
@@ -311,6 +316,17 @@ func (ctx *Ctx) signalReady(key []byte) {
 		return
 	}
 	ctx.readyKeys = append(ctx.readyKeys, append([]byte(nil), key...))
+}
+
+// signalReadyAll marks a key whose readiness must wake every blocked client, not
+// just the oldest. XADD uses it so a new stream entry reaches every blocked
+// XREAD on the key. The wake is deferred to the end of runCommand like
+// signalReady so propagation stays in order.
+func (ctx *Ctx) signalReadyAll(key []byte) {
+	if ctx.d.blocking.active.Load() == 0 {
+		return
+	}
+	ctx.readyKeysAll = append(ctx.readyKeysAll, append([]byte(nil), key...))
 }
 
 // noBlock reports whether a blocking command must run as its non-blocking
