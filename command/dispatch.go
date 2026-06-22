@@ -290,6 +290,7 @@ func (d *Dispatcher) StartBackground() {
 				d.runActiveExpire()
 				d.checkSavePoints()
 				d.checkAOFRewrite()
+				d.syncAOFCron()
 				d.replPingReplicas()
 				t.Reset(time.Second / time.Duration(d.effectiveHz()))
 			}
