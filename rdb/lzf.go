@@ -12,7 +12,9 @@ var errBadLZF = errors.New("rdb: corrupt LZF stream")
 // plus one bytes, anything else is a back reference whose top three bits hold the
 // match length and whose low bits plus the next byte hold the distance.
 func lzfDecompress(in []byte, outLen int) ([]byte, error) {
-	out := make([]byte, 0, outLen)
+	// outLen is read from the payload, so cap the preallocation hint. The final
+	// len(out) != outLen check below still enforces the real length.
+	out := make([]byte, 0, sliceHint(uint64(outLen)))
 	i := 0
 	for i < len(in) {
 		ctrl := int(in[i])
