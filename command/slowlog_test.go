@@ -10,9 +10,12 @@ import (
 func TestSlowlogRecords(t *testing.T) {
 	r, c := startData(t)
 
-	// Log anything slower than 10 ms. DEBUG SLEEP for 50 ms clears it; SET does not.
-	sendArgs(t, r, c, "CONFIG", "SET", "slowlog-log-slower-than", "10000")
-	sendArgs(t, r, c, "DEBUG", "SLEEP", "0.05")
+	// Log anything slower than 30 ms. DEBUG SLEEP for 100 ms clears it; SET does
+	// not. Reset right after the CONFIG SET so only the two commands under test are
+	// in the window, and use a wide margin so a contended runner does not log SET.
+	sendArgs(t, r, c, "CONFIG", "SET", "slowlog-log-slower-than", "30000")
+	sendArgs(t, r, c, "SLOWLOG", "RESET")
+	sendArgs(t, r, c, "DEBUG", "SLEEP", "0.1")
 	sendArgs(t, r, c, "SET", "foo", "bar")
 
 	if n := sendArgs(t, r, c, "SLOWLOG", "LEN"); n != int64(1) {
@@ -33,8 +36,8 @@ func TestSlowlogRecords(t *testing.T) {
 		t.Fatalf("duration = %v want >= 10000", row[2])
 	}
 	args := asArray(t, row[3])
-	if len(args) != 3 || args[0] != "DEBUG" || args[1] != "SLEEP" || args[2] != "0.05" {
-		t.Fatalf("logged args = %v want [DEBUG SLEEP 0.05]", args)
+	if len(args) != 3 || args[0] != "DEBUG" || args[1] != "SLEEP" || args[2] != "0.1" {
+		t.Fatalf("logged args = %v want [DEBUG SLEEP 0.1]", args)
 	}
 }
 
