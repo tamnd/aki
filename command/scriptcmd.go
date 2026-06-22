@@ -164,6 +164,7 @@ func handleScriptLoad(ctx *Ctx) {
 		return
 	}
 	sum := ctx.d.scripts.put(body)
+	ctx.d.persistScript(sum, body)
 	ctx.enc().WriteBulkStringStr(sum)
 }
 
@@ -195,6 +196,7 @@ func handleScriptFlush(ctx *Ctx) {
 		}
 	}
 	ctx.d.scripts.flush()
+	ctx.d.clearPersistedScripts()
 	ctx.Conn.WriteRaw(resp.ReplyOK)
 }
 

@@ -31,6 +31,15 @@ func (e *Engine) systemEntries(prefix string) (map[string]string, error) {
 	return out, nil
 }
 
+// systemSet stores one entry under prefix+name and commits. It is the add-one
+// path for a tenant that grows entry by entry, like the script cache, where
+// rewriting the whole prefix on each addition would be wasteful.
+func (e *Engine) systemSet(prefix, name, val string) error {
+	return e.updateKeyspace(func(ks *keyspace.Keyspace) error {
+		return ks.SystemPut(prefix+name, []byte(val))
+	})
+}
+
 // systemReplace makes the entries under prefix exactly match entries and commits.
 // Names present in the table but absent from entries are deleted, so dropping an
 // item leaves no stale entry behind. The keys of entries are the suffixes after
