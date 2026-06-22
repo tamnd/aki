@@ -82,6 +82,12 @@ type Dispatcher struct {
 	// owns. aki runs single-node by default, so this stays mostly empty unless
 	// cluster-enabled is on and slots are assigned.
 	cluster clusterState
+
+	// tracking holds the client-side caching state: the per-key invalidation table
+	// for default-mode tracking and the prefix table for BCAST mode. It carries its
+	// own lock and an atomic client counter so the write path can skip all tracking
+	// work with a single load when no client is tracking.
+	tracking trackingState
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -169,6 +175,7 @@ func New(cfg Config) *Dispatcher {
 	d.activeExpire.Store(true)
 	d.replInit()
 	d.clusterInit()
+	d.trackingInit()
 	if cfg.AclFile != "" {
 		// A missing or unreadable file at startup is not fatal: the in-memory
 		// default user stays in place until ACL LOAD or ACL SAVE is run.
@@ -290,6 +297,24 @@ type session struct {
 	isReplica      bool
 	replListenPort int
 	fromMaster     bool
+
+	// Client-side caching (CLIENT TRACKING). trackingOn marks a connection that
+	// asked the server to record the keys it reads and push invalidations when
+	// they change. The mode flags are mutually exclusive in the ways CLIENT
+	// TRACKING enforces: bcast tracks by prefix instead of by read key, optIn and
+	// optOut flip whether a command is tracked by default. trackingPrefixes holds
+	// the BCAST prefixes, trackingRedir is the client id RESP2 invalidations are
+	// forwarded to (0 when the client takes them inline over RESP3). cachingYes and
+	// cachingNo carry a one-shot CLIENT CACHING decision for the very next command.
+	trackingOn       bool
+	trackingBcast    bool
+	trackingOptIn    bool
+	trackingOptOut   bool
+	trackingNoLoop   bool
+	trackingPrefixes []string
+	trackingRedir    uint64
+	cachingYes       bool
+	cachingNo        bool
 }
 
 // subCount is the running number of subscriptions across channels, patterns and
@@ -373,6 +398,9 @@ func (d *Dispatcher) OnDisconnect(c *networking.Conn) {
 	}
 	if sess.isReplica {
 		d.dropReplica(c.ID())
+	}
+	if sess.trackingOn {
+		d.trackingDropClient(c.ID(), sess)
 	}
 	d.ps.dropClient(c.ID(), sess)
 }

@@ -95,6 +95,7 @@ func configDirectives() []*directive {
 		{name: "protected-mode", kind: dirBool, def: "yes", mutable: true},
 		{name: "maxclients", kind: dirInt, def: "10000", mutable: true},
 		{name: "unixsocket", kind: dirString, def: ""},
+		{name: "tracking-table-max-keys", kind: dirInt, def: "1000000", mutable: true},
 
 		// General.
 		{name: "databases", kind: dirInt, def: "16"},

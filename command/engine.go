@@ -220,5 +220,6 @@ func (d *Dispatcher) drainExpired() {
 	}
 	for _, ek := range d.engine.takeExpired() {
 		d.notifyKeyspaceEvent(ek.DB, notifyExpired, "expired", string(ek.Key))
+		d.trackingInvalidateKey(ek.Key, 0)
 	}
 }

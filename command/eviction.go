@@ -69,6 +69,7 @@ func (d *Dispatcher) freeMemoryIfNeeded() bool {
 			return false
 		}
 		d.notifyKeyspaceEvent(victim.DB, notifyEvicted, "evicted", string(victim.Key))
+		d.trackingInvalidateKey(victim.Key, 0)
 	}
 	return d.engine.usedMemory() < limit
 }
@@ -141,12 +142,16 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 		defer d.repl.mu.Unlock()
 	}
 	propagate := isWrite && (d.aofEnabled() || replActive)
+	// A write also needs its dirty delta when a tracking client is connected, so
+	// the invalidation only fires for writes that actually changed the dataset.
+	trackWrites := isWrite && d.trackingActive()
 	var before int64
-	if propagate {
+	if propagate || trackWrites {
 		before = d.persist.dirtyCount()
 	}
 	cmd.Handler(ctx)
-	if propagate && d.persist.dirtyCount() > before {
+	dirtied := d.persist.dirtyCount() > before
+	if propagate && dirtied {
 		args := rewriteForAOF(cmd.Name, ctx.Argv)
 		if args != nil {
 			if d.aofEnabled() {
@@ -157,4 +162,44 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 			}
 		}
 	}
+	if trackWrites && dirtied {
+		d.invalidateForWrite(ctx, cmd)
+	}
+	if ctx.sess.trackingOn && cmd.Flags.Has(FlagReadOnly) {
+		if keys, ok := extractKeys(cmd.Name, cmd, ctx.Argv); ok {
+			d.trackingRecordRead(ctx.Conn.ID(), ctx.sess, keys)
+		}
+	}
+	// A CLIENT CACHING decision is one-shot: it applies to the command right after
+	// it and is cleared once that command has run.
+	if !isClientCaching(ctx.Argv) {
+		ctx.sess.cachingYes = false
+		ctx.sess.cachingNo = false
+	}
+}
+
+// invalidateForWrite pushes tracking invalidations for a write that changed the
+// dataset. FLUSHDB and FLUSHALL invalidate every cached key at once; any other
+// write invalidates the keys it names.
+func (d *Dispatcher) invalidateForWrite(ctx *Ctx, cmd *CmdDesc) {
+	writer := ctx.Conn.ID()
+	if cmd.Name == "flushdb" || cmd.Name == "flushall" {
+		d.trackingFlushAll(writer)
+		return
+	}
+	keys, ok := extractKeys(cmd.Name, cmd, ctx.Argv)
+	if !ok {
+		return
+	}
+	for _, k := range keys {
+		d.trackingInvalidateKey(k, writer)
+	}
+}
+
+// isClientCaching reports whether argv is a CLIENT CACHING command, the one
+// command that must not clear the pending caching decision it just set.
+func isClientCaching(argv [][]byte) bool {
+	return len(argv) >= 2 &&
+		strings.EqualFold(string(argv[0]), "client") &&
+		strings.EqualFold(string(argv[1]), "caching")
 }
