@@ -198,6 +198,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, functionCommands()...)
 	cmds = append(cmds, replicationCommands()...)
 	cmds = append(cmds, clusterCommands()...)
+	cmds = append(cmds, clusterConnCommands()...)
 	cmds = append(cmds, sentinelCommands()...)
 	cmds = append(cmds, genericCommands()...)
 	conf := newConfigStore()
@@ -420,6 +421,15 @@ type session struct {
 	trackingRedir    uint64
 	cachingYes       bool
 	cachingNo        bool
+
+	// Cluster connection state (doc 18 section 24). asking is the one-shot flag
+	// ASKING sets so the next command may touch a slot being imported; it is
+	// cleared after that command runs. clusterReadonly tracks READONLY/READWRITE,
+	// which let a client read from a replica in cluster mode. aki serves every
+	// slot from one node, so these change no routing, but the commands are
+	// recognized and the flags tracked for wire compatibility.
+	asking          bool
+	clusterReadonly bool
 }
 
 // subCount is the running number of subscriptions across channels, patterns and
