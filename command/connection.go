@@ -244,7 +244,13 @@ func (ctx *Ctx) writeHelloMap(proto int) {
 	e.WriteBulkStringStr("mode")
 	e.WriteBulkStringStr(ctx.d.cfg.Mode)
 	e.WriteBulkStringStr("role")
-	e.WriteBulkStringStr("master")
+	// HELLO reports the replication role of this node. A replica reports
+	// "replica" here, not "slave", matching what Redis returns.
+	if ctx.d.roleMaster.Load() {
+		e.WriteBulkStringStr("master")
+	} else {
+		e.WriteBulkStringStr("replica")
+	}
 	e.WriteBulkStringStr("modules")
 	e.WriteArrayLen(0)
 }
