@@ -287,6 +287,42 @@ func infoPersistence(ctx *Ctx, b *strings.Builder) {
 		lineInt(b, "aof_pending_bio_fsync", 0)
 		lineInt(b, "aof_delayed_fsync", 0)
 	}
+
+	// aki file-growth fields (doc 20 section 9.8). These are aki extensions that
+	// monitoring scrapes to watch the .aki file and the buffer pool.
+	if ctx.d.engine != nil {
+		st := ctx.d.engine.fileStats()
+		lineInt(b, "aki_dataset_file_bytes", st.FileBytes)
+		// The WAL sidecar is not wired into the pager yet, so there are no
+		// unmerged frames to report. These stay 0 until that lands.
+		lineInt(b, "aki_wal_bytes", 0)
+		lineInt(b, "aki_wal_frame_count", 0)
+		lineInt(b, "aki_dirty_pages", int64(st.DirtyPages))
+		lineInt(b, "aki_buffer_pool_pages", int64(st.ResidentPages))
+		line(b, "aki_page_cache_hit_ratio", fmtCacheRatio(st.CacheHits, st.CacheMisses))
+		line(b, "aki_on_disk_vs_ram_ratio", fmtDiskRamRatio(st.FileBytes))
+	}
+}
+
+// fmtCacheRatio renders the buffer-pool hit ratio with four decimals. It reports
+// 0 when nothing has been read yet so an idle server does not look like a perfect
+// cache.
+func fmtCacheRatio(hits, misses uint64) string {
+	total := hits + misses
+	if total == 0 {
+		return "0.0000"
+	}
+	return strconv.FormatFloat(float64(hits)/float64(total), 'f', 4, 64)
+}
+
+// fmtDiskRamRatio renders the dataset-file size over total system memory. It
+// reports 0 when the total cannot be read.
+func fmtDiskRamRatio(fileBytes int64) string {
+	ram := systemMemoryBytes()
+	if ram <= 0 {
+		return "0.0000"
+	}
+	return strconv.FormatFloat(float64(fileBytes)/float64(ram), 'f', 4, 64)
 }
 
 // boolField renders a flag as the "1" or "0" INFO uses.
