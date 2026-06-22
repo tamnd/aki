@@ -47,6 +47,23 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: go tool cover -func=coverage.out | tail -1
 
+  # Run the suite with the debug build tag so the after-every-commit invariants in
+  # assert_debug.go are exercised in CI: no page left pinned, and page accounting
+  # balanced (no leak, no double reference, no live page on the freelist). These
+  # checks are compiled out of release builds, so without this job they would only
+  # ever run on a developer's machine.
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: test with debug assertions
+        run: go test -tags debug -race -count=1 ./...
+
   # Keep the no-cgo, zero-dependency stance honest. The whole point of aki is a
   # single static binary you can scp anywhere, so a stray import "C" or a go.sum
   # creeping in should fail the build, not get noticed at release time.

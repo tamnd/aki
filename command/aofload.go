@@ -152,7 +152,9 @@ func (d *Dispatcher) flushAllDatabases() error {
 			if err != nil {
 				return err
 			}
-			db.Flush()
+			if err := db.Flush(); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

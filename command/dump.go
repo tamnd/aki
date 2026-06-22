@@ -165,7 +165,9 @@ func debugReload(ctx *Ctx) {
 			if err != nil {
 				return err
 			}
-			db.Flush()
+			if err := db.Flush(); err != nil {
+				return err
+			}
 		}
 		for _, dbData := range loaded.DBs {
 			db, err := ks.DB(dbData.Index)
