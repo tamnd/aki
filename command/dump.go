@@ -175,7 +175,7 @@ func debugReload(ctx *Ctx) {
 				return err
 			}
 			for _, e := range dbData.Entries {
-				if serr := storeRestored(db, e.Key, e.Value, e.ExpireMS); serr != nil {
+				if serr := storeRestored(ctx.encLimits(), db, e.Key, e.Value, e.ExpireMS); serr != nil {
 					return serr
 				}
 				if e.HasIdle {
@@ -294,7 +294,7 @@ func handleRestore(ctx *Ctx) {
 				ttlMs = keyspace.NowMillis() + ttl
 			}
 		}
-		if serr := storeRestored(db, key, val, ttlMs); serr != nil {
+		if serr := storeRestored(ctx.encLimits(), db, key, val, ttlMs); serr != nil {
 			return serr
 		}
 		if opts.hasIdle {
@@ -319,23 +319,23 @@ func handleRestore(ctx *Ctx) {
 // storeRestored writes a decoded value into the keyspace using the same body
 // encoders the data commands use, so a restored key is indistinguishable from one
 // built command by command.
-func storeRestored(db *keyspace.DB, key []byte, v rdb.Value, ttlMs int64) error {
+func storeRestored(lim encLimits, db *keyspace.DB, key []byte, v rdb.Value, ttlMs int64) error {
 	switch v.Kind {
 	case rdb.KindString:
 		return db.Set(key, v.Str, keyspace.TypeString, stringEncoding(v.Str), ttlMs)
 	case rdb.KindList:
 		return db.Set(key, listEncode(v.List), keyspace.TypeList,
-			listEncoding(v.List, keyspace.EncListpack), ttlMs)
+			listEncoding(lim, v.List, keyspace.EncListpack), ttlMs)
 	case rdb.KindSet:
 		return db.Set(key, setEncode(v.Set), keyspace.TypeSet,
-			setEncoding(v.Set, keyspace.EncListpack), ttlMs)
+			setEncoding(lim, v.Set, keyspace.EncListpack), ttlMs)
 	case rdb.KindHash:
 		fields := make([]hashField, len(v.Hash))
 		for i, f := range v.Hash {
 			fields[i] = hashField{field: f.Field, value: f.Value}
 		}
 		return db.Set(key, hashEncode(fields), keyspace.TypeHash,
-			hashEncoding(fields, keyspace.EncListpack), ttlMs)
+			hashEncoding(lim, fields, keyspace.EncListpack), ttlMs)
 	case rdb.KindZSet:
 		rdb.SortMembers(v.ZSet)
 		members := make([]zmember, len(v.ZSet))
@@ -343,7 +343,7 @@ func storeRestored(db *keyspace.DB, key []byte, v rdb.Value, ttlMs int64) error 
 			members[i] = zmember{member: m.Member, score: m.Score}
 		}
 		return db.Set(key, zsetEncode(members), keyspace.TypeZSet,
-			zsetEncoding(members, keyspace.EncListpack), ttlMs)
+			zsetEncoding(lim, members, keyspace.EncListpack), ttlMs)
 	default:
 		return errDumpUnsupported
 	}

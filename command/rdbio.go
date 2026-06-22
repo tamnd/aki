@@ -57,7 +57,7 @@ func LoadSnapshot(ks *keyspace.Keyspace, snap rdb.Snapshot, onlyDB int, replace 
 					continue
 				}
 			}
-			if serr := storeRestored(db, e.Key, e.Value, e.ExpireMS); serr != nil {
+			if serr := storeRestored(defaultEncLimits(), db, e.Key, e.Value, e.ExpireMS); serr != nil {
 				return written, serr
 			}
 			if e.HasIdle {

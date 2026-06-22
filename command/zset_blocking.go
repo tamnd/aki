@@ -74,7 +74,7 @@ func blockZPop(ctx *Ctx, fromMin bool) {
 					return err
 				}
 				return d.Set(key, zsetEncode(kept), keyspace.TypeZSet,
-					zsetEncoding(kept, hdr.Encoding), keepTTL(hdr, found))
+					zsetEncoding(ctx.encLimits(), kept, hdr.Encoding), keepTTL(hdr, found))
 			}
 			return nil
 		})
@@ -211,7 +211,7 @@ func handleBZMPop(ctx *Ctx) {
 					return err
 				}
 				return d.Set(key, zsetEncode(kept), keyspace.TypeZSet,
-					zsetEncoding(kept, hdr.Encoding), keepTTL(hdr, found))
+					zsetEncoding(ctx.encLimits(), kept, hdr.Encoding), keepTTL(hdr, found))
 			}
 			return nil
 		})

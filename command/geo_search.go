@@ -248,7 +248,7 @@ func writeGeoReply(ctx *Ctx, q *geoQuery, hits []geoHit) {
 // storeGeoResult writes the hits to the destination key as a sorted set and
 // returns the count. STOREDIST stores the distance as the score, otherwise the
 // geohash score is kept.
-func storeGeoResult(db *keyspace.DB, dest []byte, q *geoQuery, hits []geoHit) error {
+func storeGeoResult(lim encLimits, db *keyspace.DB, dest []byte, q *geoQuery, hits []geoHit) error {
 	if len(hits) == 0 {
 		_, err := db.Delete(dest)
 		return err
@@ -262,7 +262,7 @@ func storeGeoResult(db *keyspace.DB, dest []byte, q *geoQuery, hits []geoHit) er
 		out = append(out, zmember{member: h.member, score: score})
 	}
 	zsetSort(out)
-	return db.Set(dest, zsetEncode(out), keyspace.TypeZSet, zsetEncoding(out, keyspace.EncListpack), -1)
+	return db.Set(dest, zsetEncode(out), keyspace.TypeZSet, zsetEncoding(lim, out, keyspace.EncListpack), -1)
 }
 
 // handleGeoSearch implements the read-only GEOSEARCH.
@@ -336,7 +336,7 @@ func handleGeoSearchStore(ctx *Ctx) {
 		}
 		hits := runGeoSearch(set, q)
 		stored = len(hits)
-		return storeGeoResult(db, dest, q, hits)
+		return storeGeoResult(ctx.encLimits(), db, dest, q, hits)
 	})
 	if !done {
 		return
@@ -471,7 +471,7 @@ func runGeoRadius(ctx *Ctx, args [][]byte, byMember, allowStore bool) {
 		hits = runGeoSearch(set, q)
 		stored = len(hits)
 		if q.store != nil {
-			return storeGeoResult(db, q.store, q, hits)
+			return storeGeoResult(ctx.encLimits(), db, q.store, q, hits)
 		}
 		return nil
 	}

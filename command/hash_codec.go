@@ -11,17 +11,10 @@ import (
 // means the value record is damaged.
 var errCorruptHash = errors.New("corrupt hash value")
 
-// Hash thresholds for the reported OBJECT ENCODING. aki stores its own physical
-// hash form (a length-prefixed field/value sequence), so these only decide which
-// Redis encoding name the key reports, matching the t_hash.c constants.
-const (
-	// hashMaxListpackEntries is hash-max-listpack-entries: the field-pair count
-	// at or below which a hash reports listpack.
-	hashMaxListpackEntries = 128
-	// hashMaxListpackValue is hash-max-listpack-value: the per-field and
-	// per-value byte cap for listpack.
-	hashMaxListpackValue = 64
-)
+// Hash OBJECT ENCODING thresholds live in encLimits (enc_limits.go), read from
+// hash-max-listpack-entries and hash-max-listpack-value. aki stores its own
+// physical hash form (a length-prefixed field/value sequence), so they only
+// decide which Redis encoding name the key reports, matching the t_hash.c rule.
 
 // hashField is one field/value pair in insertion order. ttl is the absolute
 // Unix-ms expiry of this field, or 0 when the field never expires.
@@ -122,16 +115,16 @@ func hashEncode(fields []hashField) []byte {
 // it never goes back to listpack, so prev pins the floor. A hash that fits the
 // listpack thresholds reports listpackex while any field has a TTL, and reverts
 // to listpack once every field TTL is cleared.
-func hashEncoding(fields []hashField, prev uint8) uint8 {
+func hashEncoding(lim encLimits, fields []hashField, prev uint8) uint8 {
 	if prev == keyspace.EncHashtable {
 		return keyspace.EncHashtable
 	}
-	if len(fields) > hashMaxListpackEntries {
+	if int64(len(fields)) > lim.hashEntries {
 		return keyspace.EncHashtable
 	}
 	hasTTL := false
 	for _, f := range fields {
-		if len(f.field) > hashMaxListpackValue || len(f.value) > hashMaxListpackValue {
+		if int64(len(f.field)) > lim.hashValue || int64(len(f.value)) > lim.hashValue {
 			return keyspace.EncHashtable
 		}
 		if f.ttl != 0 {

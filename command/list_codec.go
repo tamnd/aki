@@ -11,20 +11,10 @@ import (
 // means the value record is damaged.
 var errCorruptList = errors.New("corrupt list value")
 
-// List thresholds for the reported OBJECT ENCODING. aki stores its own physical
-// list form (a length-prefixed element sequence), so these only decide which
-// Redis encoding name the key reports, matching the t_list.c constants.
-const (
-	// listMaxListpackBytes is abs(list-max-listpack-size) for the default -2.
-	listMaxListpackBytes = 8192
-	// listMaxListpackEntries is the hard 128-element cap for listpack.
-	listMaxListpackEntries = 128
-	// listMaxListpackElemBytes is the per-element 64-byte cap for listpack.
-	listMaxListpackElemBytes = 64
-	// listEntryOverhead approximates a listpack entry's header and backlen when
-	// estimating the total blob size against the byte cap.
-	listEntryOverhead = 11
-)
+// List OBJECT ENCODING thresholds live in encLimits (enc_limits.go), read from
+// list-max-listpack-size. aki stores its own physical list form (a
+// length-prefixed element sequence), so they only decide which Redis encoding
+// name the key reports, matching the t_list.c rule.
 
 // listDecode unpacks a stored list body into its elements. The body is a
 // uvarint element count followed by each element as a uvarint length and bytes.
@@ -65,12 +55,14 @@ func listEncode(elems [][]byte) []byte {
 }
 
 // listEncoding picks the reported encoding for a list. Once a key is a
-// quicklist it never goes back to listpack, so prev pins the floor.
-func listEncoding(elems [][]byte, prev uint8) uint8 {
+// quicklist it never goes back to listpack, so prev pins the floor. The entry
+// and byte caps come from list-max-listpack-size via lim.
+func listEncoding(lim encLimits, elems [][]byte, prev uint8) uint8 {
 	if prev == keyspace.EncQuicklist {
 		return keyspace.EncQuicklist
 	}
-	if len(elems) > listMaxListpackEntries {
+	maxEntries, maxBytes := lim.listLimits()
+	if len(elems) > maxEntries {
 		return keyspace.EncQuicklist
 	}
 	total := listEntryOverhead
@@ -79,7 +71,7 @@ func listEncoding(elems [][]byte, prev uint8) uint8 {
 			return keyspace.EncQuicklist
 		}
 		total += len(e) + listEntryOverhead
-		if total > listMaxListpackBytes {
+		if total > maxBytes {
 			return keyspace.EncQuicklist
 		}
 	}

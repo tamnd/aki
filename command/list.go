@@ -80,7 +80,7 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 		if found {
 			prev = hdr.Encoding
 		}
-		return db.Set(key, listEncode(elems), keyspace.TypeList, listEncoding(elems, prev), keepTTL(hdr, found))
+		return db.Set(key, listEncode(elems), keyspace.TypeList, listEncoding(ctx.encLimits(), elems, prev), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -172,7 +172,7 @@ func popList(ctx *Ctx, head bool) {
 			_, err := db.Delete(key)
 			return err
 		}
-		return db.Set(key, listEncode(rest), keyspace.TypeList, listEncoding(rest, hdr.Encoding), keepTTL(hdr, found))
+		return db.Set(key, listEncode(rest), keyspace.TypeList, listEncoding(ctx.encLimits(), rest, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
 		return

@@ -72,7 +72,7 @@ func handleSAdd(ctx *Ctx) {
 		if found {
 			prev = hdr.Encoding
 		}
-		return db.Set(key, setEncode(members), keyspace.TypeSet, setEncoding(members, prev), keepTTL(hdr, found))
+		return db.Set(key, setEncode(members), keyspace.TypeSet, setEncoding(ctx.encLimits(), members, prev), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -123,7 +123,7 @@ func handleSRem(ctx *Ctx) {
 			_, err := db.Delete(key)
 			return err
 		}
-		return db.Set(key, setEncode(members), keyspace.TypeSet, setEncoding(members, hdr.Encoding), keepTTL(hdr, found))
+		return db.Set(key, setEncode(members), keyspace.TypeSet, setEncoding(ctx.encLimits(), members, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -278,7 +278,7 @@ func handleSPop(ctx *Ctx) {
 			_, err := db.Delete(key)
 			return err
 		}
-		return db.Set(key, setEncode(rest), keyspace.TypeSet, setEncoding(rest, hdr.Encoding), keepTTL(hdr, found))
+		return db.Set(key, setEncode(rest), keyspace.TypeSet, setEncoding(ctx.encLimits(), rest, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -406,7 +406,7 @@ func handleSMove(ctx *Ctx) {
 				return err
 			}
 		} else if err := db.Set(src, setEncode(srcMembers), keyspace.TypeSet,
-			setEncoding(srcMembers, srcHdr.Encoding), keepTTL(srcHdr, srcFound)); err != nil {
+			setEncoding(ctx.encLimits(), srcMembers, srcHdr.Encoding), keepTTL(srcHdr, srcFound)); err != nil {
 			return err
 		}
 		if setFind(dstMembers, member) < 0 {
@@ -417,7 +417,7 @@ func handleSMove(ctx *Ctx) {
 			dstPrev = dstHdr.Encoding
 		}
 		return db.Set(dst, setEncode(dstMembers), keyspace.TypeSet,
-			setEncoding(dstMembers, dstPrev), keepTTL(dstHdr, dstFound))
+			setEncoding(ctx.encLimits(), dstMembers, dstPrev), keepTTL(dstHdr, dstFound))
 	})
 	if !done {
 		return

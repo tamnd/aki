@@ -153,7 +153,7 @@ parsed:
 			return nil
 		}
 		zsetSort(members)
-		return db.Set(ctx.Argv[1], zsetEncode(members), keyspace.TypeZSet, zsetEncoding(members, floor), keepTTL(hdr, found))
+		return db.Set(ctx.Argv[1], zsetEncode(members), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), members, floor), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -231,7 +231,7 @@ func handleZIncrBy(ctx *Ctx) {
 			members = append(members, zmember{member: member, score: inc})
 		}
 		zsetSort(members)
-		return db.Set(ctx.Argv[1], zsetEncode(members), keyspace.TypeZSet, zsetEncoding(members, floor), keepTTL(hdr, found))
+		return db.Set(ctx.Argv[1], zsetEncode(members), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), members, floor), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -396,7 +396,7 @@ func handleZRem(ctx *Ctx) {
 			_, err := db.Delete(ctx.Argv[1])
 			return err
 		}
-		return db.Set(ctx.Argv[1], zsetEncode(kept), keyspace.TypeZSet, zsetEncoding(kept, hdr.Encoding), keepTTL(hdr, found))
+		return db.Set(ctx.Argv[1], zsetEncode(kept), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), kept, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
 		return
