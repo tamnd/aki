@@ -264,6 +264,9 @@ func (d *Dispatcher) StartBackground() {
 // StopBackground stops the cron goroutine and waits for it to exit. It is safe to
 // call when the cron was never started.
 func (d *Dispatcher) StopBackground() {
+	// Join the replica apply goroutine first so it cannot touch the keyspace or
+	// pager after they close. This runs even when the cron was never started.
+	d.StopReplication()
 	if d.bgStop == nil {
 		return
 	}
