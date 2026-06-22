@@ -144,6 +144,80 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+// TestHealthEndpoint checks /health reports ok when operational and loading when
+// the AOF is replaying.
+func TestHealthEndpoint(t *testing.T) {
+	d := newMetricsDispatcher(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	d.serveMetricsOn(ln)
+	defer d.StopMetrics()
+	base := "http://" + d.MetricsAddr()
+
+	resp, err := http.Get(base + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/health status = %d", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), `"status":"ok"`) || !strings.Contains(string(body), `"loading":0`) {
+		t.Fatalf("/health body = %s", body)
+	}
+
+	d.loading.Store(true)
+	resp, err = http.Get(base + "/health")
+	if err != nil {
+		t.Fatalf("GET /health loading: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/health loading status = %d want 503", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), `"loading":1`) {
+		t.Fatalf("/health loading body = %s", body)
+	}
+}
+
+// TestReadyEndpoint checks /ready flips from 503 to 200 once the server marks
+// itself ready.
+func TestReadyEndpoint(t *testing.T) {
+	d := newMetricsDispatcher(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	d.serveMetricsOn(ln)
+	defer d.StopMetrics()
+	base := "http://" + d.MetricsAddr()
+
+	resp, err := http.Get(base + "/ready")
+	if err != nil {
+		t.Fatalf("GET /ready: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/ready before SetReady = %d want 503", resp.StatusCode)
+	}
+
+	d.SetReady(true)
+	resp, err = http.Get(base + "/ready")
+	if err != nil {
+		t.Fatalf("GET /ready after ready: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/ready after SetReady = %d want 200", resp.StatusCode)
+	}
+}
+
 // TestStartMetricsDisabled checks StartMetrics is a no-op when metrics-port is 0.
 func TestStartMetricsDisabled(t *testing.T) {
 	d := newMetricsDispatcher(t)
