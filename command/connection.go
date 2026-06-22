@@ -90,6 +90,12 @@ func handleSelect(ctx *Ctx) {
 		ctx.enc().WriteError("ERR value is not an integer or out of range")
 		return
 	}
+	// Cluster mode uses db 0 only (doc 18 §28.2), so any non-zero SELECT is
+	// rejected before the range check.
+	if n != 0 && ctx.d.clusterEnabled() {
+		ctx.enc().WriteError("ERR SELECT is not allowed in cluster mode")
+		return
+	}
 	if n < 0 || n >= ctx.d.cfg.Databases {
 		ctx.enc().WriteError("ERR DB index is out of range")
 		return
