@@ -182,6 +182,8 @@ func installRedis(i *lua.Interp, sc *scriptCtx, freg *funcReg) {
 
 	i.Globals().Set(lua.String("redis"), r)
 	i.Globals().Set(lua.String("server"), r)
+
+	lua.OpenRedisLibs(i)
 }
 
 // redisCall runs a Redis command from a script. raise selects redis.call
