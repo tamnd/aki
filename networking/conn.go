@@ -90,6 +90,16 @@ type Conn struct {
 	closed          atomic.Bool
 }
 
+// NewOfflineConn builds a connection that is not backed by a socket. The command
+// layer uses it to replay commands internally, such as loading a dataset from the
+// AOF at startup, where the replies are not sent anywhere. Output is encoded into
+// an in-memory buffer the caller never reads.
+func NewOfflineConn() *Conn {
+	c := &Conn{outBuf: new(bytes.Buffer)}
+	c.enc = resp.NewEncoder(c.outBuf, 2)
+	return c
+}
+
 // ID returns the globally unique, never-reused connection id.
 func (c *Conn) ID() uint64 { return c.id }
 

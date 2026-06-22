@@ -46,11 +46,7 @@ func handleDebug(ctx *Ctx) {
 	case "FLUSHALL":
 		debugFlushAll(ctx)
 	case "LOADAOF":
-		if ctx.confStr("appendonly", "no") != "yes" {
-			ctx.enc().WriteError("ERR AOF not enabled")
-			return
-		}
-		ctx.enc().WriteStatus("OK")
+		debugLoadAOF(ctx)
 	case "SEGFAULT", "PANIC", "OOM":
 		ctx.enc().WriteError("ERR DEBUG " + sub + " is disabled in aki")
 	case "AOFSTATS", "DISABLE-REPLICATION-CACHING", "GETANDPROPAG", "SFLAGS", "SETOBJ":
@@ -153,6 +149,29 @@ func debugStringmatchLen(ctx *Ctx) {
 		return
 	}
 	ctx.enc().WriteInteger(0)
+}
+
+// debugLoadAOF reloads the dataset from the appendonlydir: it flushes the
+// in-memory data, loads the base RDB, and replays the incremental files. It is the
+// AOF counterpart to DEBUG RELOAD and needs appendonly to be on.
+func debugLoadAOF(ctx *Ctx) {
+	if ctx.confStr("appendonly", "no") != "yes" {
+		ctx.enc().WriteError("ERR AOF not enabled")
+		return
+	}
+	if ctx.d.engine == nil {
+		ctx.enc().WriteError("ERR this server has no keyspace")
+		return
+	}
+	if !ctx.d.aofManifestExists() {
+		ctx.enc().WriteError("ERR No AOF directory found")
+		return
+	}
+	if err := ctx.d.loadAOF(); err != nil {
+		ctx.enc().WriteError("ERR Error trying to load the AOF: " + err.Error())
+		return
+	}
+	ctx.enc().WriteStatus("OK")
 }
 
 // debugFlushAll empties every database synchronously, the reset the test suite

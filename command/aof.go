@@ -37,6 +37,8 @@ type aofState struct {
 
 	incrFile       *os.File // open handle on the incr file for appends
 	lastSelectedDB int      // database last written into the incr file, -1 if none
+
+	loading bool // true while replaying the AOF, suppresses re-propagation
 }
 
 // aofCommands registers BGREWRITEAOF.
@@ -99,9 +101,11 @@ func (d *Dispatcher) aofBasename() string {
 	return confValue(d.conf, "appendfilename", "appendonly.aof")
 }
 
-// initAOF builds the appendonlydir on startup when appendonly is on and the
-// directory has not been created yet. It is a fresh rewrite: a base RDB plus an
-// empty incr file plus the manifest.
+// initAOF sets up the AOF on startup when appendonly is on. If an appendonlydir
+// with a manifest already exists, it loads the base RDB, replays the incremental
+// files, and reopens the incr file for appends so new writes continue the log.
+// Otherwise it does a fresh rewrite: a base RDB plus an empty incr file plus the
+// manifest.
 func (d *Dispatcher) initAOF() {
 	if d.engine == nil || !d.aofEnabled() {
 		return
@@ -111,6 +115,13 @@ func (d *Dispatcher) initAOF() {
 	d.aof.mu.Unlock()
 	if already {
 		return
+	}
+	if d.aofManifestExists() {
+		if err := d.loadAOF(); err == nil {
+			return
+		}
+		// A load that fails leaves the keyspace as it is; fall through to a fresh
+		// rewrite so the server still comes up with a consistent AOF directory.
 	}
 	_ = d.rewriteAOF()
 }
@@ -269,7 +280,7 @@ func (d *Dispatcher) propagateAOF(ctx *Ctx, name string) {
 func (d *Dispatcher) appendAOF(db int, argv [][]byte) {
 	d.aof.mu.Lock()
 	defer d.aof.mu.Unlock()
-	if d.aof.incrFile == nil {
+	if d.aof.incrFile == nil || d.aof.loading {
 		return
 	}
 	var buf []byte
