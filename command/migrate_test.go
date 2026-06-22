@@ -28,6 +28,9 @@ func startDataAddr(t *testing.T) (*bufio.Reader, net.Conn, string, string) {
 	}
 
 	d := New(Config{Engine: NewEngine(ks)})
+	// Join the replica goroutine before the pager closes. Registered after the
+	// pager cleanup so LIFO runs it first.
+	t.Cleanup(d.StopReplication)
 	ncfg := networking.Config{Addr: "127.0.0.1:0"}
 	srv := networking.New(ncfg, d)
 	d.SetServer(srv)
