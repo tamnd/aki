@@ -31,6 +31,33 @@ func TestChooseVictimByPolicy(t *testing.T) {
 	}
 }
 
+// TestEvictionRoundsTenacity checks the eviction step cap tracks
+// maxmemory-eviction-tenacity: the default 10 gives 11 steps, and the value
+// clamps to the 0..100 range from doc 16 section 17.4.
+func TestEvictionRoundsTenacity(t *testing.T) {
+	d := New(Config{})
+
+	// The registered default is 10, so 1 + 10 = 11 steps.
+	if got := d.evictionRounds(); got != 11 {
+		t.Fatalf("default rounds = %d want 11", got)
+	}
+
+	for _, c := range []struct {
+		set  string
+		want int
+	}{
+		{"0", 1},     // minimize latency: one step
+		{"100", 101}, // maximize throughput: 101 steps
+		{"-5", 1},    // negative clamps to 0
+		{"250", 101}, // over the range clamps to 100
+	} {
+		d.conf.set("maxmemory-eviction-tenacity", c.set)
+		if got := d.evictionRounds(); got != c.want {
+			t.Fatalf("tenacity %s rounds = %d want %d", c.set, got, c.want)
+		}
+	}
+}
+
 // infoUsedMemory reads INFO memory and returns the used_memory figure.
 func infoUsedMemory(t *testing.T, r *bufio.Reader, c net.Conn) int64 {
 	t.Helper()
