@@ -907,6 +907,24 @@ func (d *Dispatcher) isReplica() bool {
 	return d.repl.role == "slave"
 }
 
+// denyStaleData reports whether a command must be refused because this replica
+// has lost its master link and replica-serve-stale-data is off. Redis turns away
+// every command except the ones flagged stale-safe (INFO, CONFIG, the connection
+// and pub/sub commands) so a client cannot read data that may have drifted from
+// the master. The default is yes, which serves the stale data, so the gate is off
+// unless the operator turned it off. A master is never affected.
+func (d *Dispatcher) denyStaleData(cmd *CmdDesc) bool {
+	if cmd.Flags.Has(FlagStale) {
+		return false
+	}
+	if d.confBool("replica-serve-stale-data", true) {
+		return false
+	}
+	d.repl.mu.Lock()
+	defer d.repl.mu.Unlock()
+	return d.repl.role == "slave" && d.repl.link != "connected"
+}
+
 // goodReplicaCount returns how many connected replicas acked within maxLag, the
 // "good replica" notion min-replicas-to-write counts against. A replica that has
 // gone quiet longer than maxLag does not count.
