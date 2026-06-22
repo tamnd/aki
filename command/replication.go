@@ -112,6 +112,11 @@ type replState struct {
 	loopDone     chan struct{} // closed when the replica client goroutine exits
 	gen          int
 
+	// Manual failover (the FAILOVER command). foActive is true while a coordinated
+	// handoff runs; foStop cancels it when FAILOVER ABORT is issued.
+	foActive bool
+	foStop   chan struct{}
+
 	lastPing time.Time
 }
 
@@ -366,6 +371,17 @@ func (d *Dispatcher) handleReplicaOf(ctx *Ctx) {
 		ctx.Conn.WriteRaw(resp.ReplyOK)
 		return
 	}
+	d.repl.mu.Unlock()
+
+	d.startFollowing(host, port)
+	ctx.Conn.WriteRaw(resp.ReplyOK)
+}
+
+// startFollowing tears down any current replica link and starts following the
+// named master, spawning the replica client goroutine. It is the shared core of
+// REPLICAOF host port and the demotion leg of a manual failover.
+func (d *Dispatcher) startFollowing(host string, port int) {
+	d.repl.mu.Lock()
 	d.stopReplicaLocked()
 	d.repl.role = "slave"
 	d.roleMaster.Store(false)
@@ -381,7 +397,6 @@ func (d *Dispatcher) handleReplicaOf(ctx *Ctx) {
 	d.repl.mu.Unlock()
 
 	go d.replicaClientLoop(gen, stop, loopDone, host, port)
-	ctx.Conn.WriteRaw(resp.ReplyOK)
 }
 
 // promoteToMaster stops following any master and becomes a fresh replication
