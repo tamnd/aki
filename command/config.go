@@ -104,6 +104,11 @@ func configDirectives() []*directive {
 		{name: "logfile", kind: dirString, def: ""},
 		{name: "requirepass", kind: dirString, def: "", mutable: true},
 
+		// Metrics export.
+		{name: "metrics-port", kind: dirInt, def: "0"},
+		{name: "metrics-bind", kind: dirString, def: "127.0.0.1"},
+		{name: "metrics-tls", kind: dirBool, def: "no"},
+
 		// Memory and eviction.
 		{name: "maxmemory", kind: dirMemory, def: "0", mutable: true},
 		{name: "maxmemory-policy", kind: dirEnum, def: "noeviction", mutable: true, enum: memPolicies},
