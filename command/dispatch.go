@@ -103,6 +103,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, keyopsCommands()...)
 	cmds = append(cmds, sortCommands()...)
 	cmds = append(cmds, dumpCommands()...)
+	cmds = append(cmds, migrateCommands()...)
 	cmds = append(cmds, persistenceCommands()...)
 	cmds = append(cmds, adminCommands()...)
 	cmds = append(cmds, objectCommands()...)
