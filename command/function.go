@@ -141,6 +141,14 @@ func (fr *functionRegistry) ensure() {
 	}
 }
 
+// counts reports the number of loaded libraries and functions. INFO's memory
+// section reads them for number_of_libraries and number_of_functions.
+func (fr *functionRegistry) counts() (libs, funcs int) {
+	fr.mu.RLock()
+	defer fr.mu.RUnlock()
+	return len(fr.libs), len(fr.fnIndex)
+}
+
 // librarySources returns the source of every loaded library, sorted by library
 // name so the order is stable across snapshots. SAVE, the AOF base, and a full
 // sync write these into the RDB as FUNCTION2 records so a reload or a fresh replica

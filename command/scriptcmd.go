@@ -49,6 +49,14 @@ func (s *scriptCache) flush() {
 	s.mu.Unlock()
 }
 
+// count reports how many scripts are cached. INFO's memory section reads it for
+// number_of_cached_scripts.
+func (s *scriptCache) count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.m)
+}
+
 // scriptCommands registers EVAL, EVALSHA, their _RO forms and the SCRIPT
 // container command.
 func scriptCommands() []*CmdDesc {
