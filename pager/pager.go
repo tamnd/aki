@@ -407,6 +407,34 @@ func (p *Pager) FreeCount() int {
 	return len(p.freelist)
 }
 
+// FreePages returns a copy of the in-memory freelist. The page-accounting check
+// uses it to prove no live page is also free, and to find leaked pages that are
+// neither live nor free.
+func (p *Pager) FreePages() []uint32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]uint32, len(p.freelist))
+	copy(out, p.freelist)
+	return out
+}
+
+// PinnedPages returns the page numbers currently held with a non-zero pin count.
+// After a command finishes every page should be unpinned, so a debug build calls
+// this to catch a Get that was never matched by an Unpin (doc 23 section 9.4).
+func (p *Pager) PinnedPages() []uint32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pool.mu.Lock()
+	defer p.pool.mu.Unlock()
+	var out []uint32
+	for pgno, pg := range p.pool.frames {
+		if pg.pins > 0 {
+			out = append(out, pgno)
+		}
+	}
+	return out
+}
+
 // loadFreelist walks the persistent intrusive free-page chain into memory.
 func (p *Pager) loadFreelist() error {
 	head := p.meta.FreelistHead

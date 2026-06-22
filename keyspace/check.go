@@ -2,8 +2,11 @@ package keyspace
 
 import (
 	"bytes"
+	"fmt"
 
 	"github.com/tamnd/aki/btree"
+	"github.com/tamnd/aki/encoding"
+	"github.com/tamnd/aki/format"
 )
 
 // farFutureMs is the cutoff past which a TTL is treated as impossible. A key set
@@ -89,6 +92,116 @@ func (db *DB) check(now int64) (DBCheck, error) {
 		}
 	}
 	return res, nil
+}
+
+// CheckPageAccounting proves every page in the file is accounted for exactly
+// once: either live (reachable from the catalog, a database B-tree, or a value's
+// overflow chain) or free (on the freelist), never both and never neither. It is
+// the page-level form of doc 23 section 9.3, run on demand by the integrity
+// checker and after every commit in debug builds.
+//
+// The three faults it catches are a page that is reachable and also on the
+// freelist (a use-after-free waiting to happen), a page that two structures both
+// claim as live (a double reference), and a page that is neither reachable nor
+// free (a leak). The freelist's own no-duplicate rule is checked here too.
+func (ks *Keyspace) CheckPageAccounting() error {
+	pageCount := ks.pgr.PageCount()
+	live := make(map[uint32]bool, pageCount)
+
+	// Pages 0, 1 and 2 are the header and the two meta slots. They are always in
+	// use and never appear in either the tree or the freelist.
+	live[0] = true
+	live[format.MetaPageA] = true
+	live[format.MetaPageB] = true
+
+	mark := func(pgno uint32, what string) error {
+		if live[pgno] {
+			return fmt.Errorf("page %d claimed live by two structures (%s)", pgno, what)
+		}
+		live[pgno] = true
+		return nil
+	}
+
+	if ks.catRoot != format.NullPage {
+		if err := mark(ks.catRoot, "catalog"); err != nil {
+			return err
+		}
+	}
+
+	for _, db := range ks.dbs {
+		t := db.loadTree()
+		if t == nil {
+			continue
+		}
+		pages, err := btree.Pages(t)
+		if err != nil {
+			return fmt.Errorf("db%d: %w", db.index, err)
+		}
+		for _, pgno := range pages {
+			if err := mark(pgno, fmt.Sprintf("db%d tree", db.index)); err != nil {
+				return err
+			}
+		}
+		c := t.Cursor()
+		if err := c.First(); err != nil {
+			return fmt.Errorf("db%d cursor: %w", db.index, err)
+		}
+		for c.Valid() {
+			h, _, ok := parseHeader(c.Value())
+			if ok && h.Flags&FlagInlineBody == 0 && h.BodyRef != 0 {
+				if err := ks.markOverflowChain(uint32(h.BodyRef), pageCount, mark); err != nil {
+					return fmt.Errorf("db%d overflow: %w", db.index, err)
+				}
+			}
+			if err := c.Next(); err != nil {
+				return fmt.Errorf("db%d cursor: %w", db.index, err)
+			}
+		}
+	}
+
+	free := make(map[uint32]bool, ks.pgr.FreeCount())
+	for _, pgno := range ks.pgr.FreePages() {
+		if free[pgno] {
+			return fmt.Errorf("page %d appears twice on the freelist", pgno)
+		}
+		free[pgno] = true
+		if live[pgno] {
+			return fmt.Errorf("page %d is live and on the freelist", pgno)
+		}
+	}
+
+	for pgno := uint32(0); pgno < pageCount; pgno++ {
+		if !live[pgno] && !free[pgno] {
+			return fmt.Errorf("page %d is leaked: neither reachable nor free", pgno)
+		}
+	}
+	return nil
+}
+
+// markOverflowChain walks a value's overflow chain from head and marks each page
+// live. It bounds the walk by the file's page count so a corrupt next-pointer
+// that forms a cycle is reported rather than looped on forever.
+func (ks *Keyspace) markOverflowChain(head, pageCount uint32, mark func(uint32, string) error) error {
+	pgno := head
+	for steps := uint32(0); pgno != format.NullPage; steps++ {
+		if steps > pageCount {
+			return fmt.Errorf("overflow chain from %d is longer than the file, likely a cycle", head)
+		}
+		if pgno >= pageCount {
+			return fmt.Errorf("overflow page %d is out of range (page count %d)", pgno, pageCount)
+		}
+		if err := mark(pgno, "overflow"); err != nil {
+			return err
+		}
+		pg, err := ks.pgr.Get(pgno)
+		if err != nil {
+			return err
+		}
+		next := encoding.U32(pg.Data[ovNextOffset:])
+		ks.pgr.Unpin(pg, false)
+		pgno = next
+	}
+	return nil
 }
 
 // FixFutureTTLs clears TTLs that are impossibly far in the future, rewriting
