@@ -352,6 +352,13 @@ func extractKeys(name string, cmd *CmdDesc, args [][]byte) ([][]byte, bool) {
 			return nil, false
 		}
 		return cloneKeys(args[3 : 3+n]), true
+	case "eval", "evalsha", "eval_ro", "evalsha_ro", "fcall", "fcall_ro":
+		// script-or-name numkeys key [key ...] arg [arg ...]
+		n, ok := numAt(args, 2)
+		if !ok || 3+n > len(args) {
+			return nil, false
+		}
+		return cloneKeys(args[3 : 3+n]), true
 	case "sort", "sort_ro":
 		keys := [][]byte{args[1]}
 		for i := 2; i < len(args); i++ {
