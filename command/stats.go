@@ -2,6 +2,7 @@ package command
 
 import (
 	"math/bits"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,6 +116,45 @@ func (d *Dispatcher) statResetAll() {
 	})
 }
 
+// cmdHistogram is one command's latency histogram for LATENCY HISTOGRAM: its
+// stat name, total call count, and the cumulative histogram points.
+type cmdHistogram struct {
+	name   string
+	calls  uint64
+	points []histPoint
+}
+
+// commandHistograms gathers per-command latency histograms for LATENCY
+// HISTOGRAM. With names empty it returns every command that has run; otherwise
+// it returns only the named commands that have run. Commands with no calls are
+// left out, matching Redis, and the result is sorted by name for a stable reply.
+func (d *Dispatcher) commandHistograms(names []string) []cmdHistogram {
+	d.stats.mu.RLock()
+	defer d.stats.mu.RUnlock()
+	var out []cmdHistogram
+	add := func(name string, cs *cmdStat) {
+		if cs == nil {
+			return
+		}
+		calls := cs.calls.Load()
+		if calls == 0 {
+			return
+		}
+		out = append(out, cmdHistogram{name: name, calls: calls, points: cs.hist.cumulative()})
+	}
+	if len(names) > 0 {
+		for _, n := range names {
+			add(n, d.stats.cmds[n])
+		}
+	} else {
+		for n, cs := range d.stats.cmds {
+			add(n, cs)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
+}
+
 // errPrefix reports whether a reply segment is an error and returns its code. The
 // segment is the raw bytes a handler wrote, so an error starts with '-'.
 func errPrefix(reply []byte) (string, bool) {
@@ -174,6 +214,42 @@ func histLow(idx int) uint64 {
 
 func (h *latencyHist) record(v uint64) {
 	h.counts[histBucket(v)].Add(1)
+}
+
+// histHigh returns the upper edge of a bucket in microseconds: the largest value
+// that still falls in it. LATENCY HISTOGRAM reports cumulative counts against
+// this upper bound so a point reads as "this many calls at or below this
+// latency".
+func histHigh(idx int) uint64 {
+	if idx >= histBuckets-1 {
+		return histLow(idx)
+	}
+	return histLow(idx+1) - 1
+}
+
+// histPoint is one cumulative point of a latency histogram: the upper-bound
+// latency in microseconds and the number of calls at or below it.
+type histPoint struct {
+	bound uint64
+	count uint64
+}
+
+// cumulative returns the non-empty buckets as cumulative (upper-bound, count)
+// points in increasing order, the shape LATENCY HISTOGRAM puts in
+// histogram_usec. Empty buckets are skipped, matching how Redis only reports
+// boundaries where the running count grows.
+func (h *latencyHist) cumulative() []histPoint {
+	var out []histPoint
+	var cum uint64
+	for i := range h.counts {
+		c := h.counts[i].Load()
+		if c == 0 {
+			continue
+		}
+		cum += c
+		out = append(out, histPoint{bound: histHigh(i), count: cum})
+	}
+	return out
 }
 
 // total returns the number of samples recorded.
