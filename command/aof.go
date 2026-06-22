@@ -302,8 +302,10 @@ func appendRESPCommand(b []byte, argv [][]byte) []byte {
 }
 
 // rewriteForAOF returns the command to write to the AOF for a given write
-// command. Most commands are propagated verbatim. The relative-expire family is
-// rewritten to PEXPIREAT with an absolute millisecond timestamp.
+// command. Most commands are propagated verbatim. The commands that carry a
+// relative expiry are rewritten so the expiry is an absolute millisecond
+// timestamp, otherwise a delayed replay would set a different expiry than the
+// master did. This is what real Redis does for AOF and replication.
 func rewriteForAOF(name string, argv [][]byte) [][]byte {
 	switch strings.ToLower(name) {
 	case "expire", "pexpire", "expireat":
@@ -324,9 +326,88 @@ func rewriteForAOF(name string, argv [][]byte) [][]byte {
 			absMs = n * 1000
 		}
 		return [][]byte{[]byte("PEXPIREAT"), argv[1], []byte(strconv.FormatInt(absMs, 10))}
+	case "setex", "psetex":
+		// SETEX key seconds value and PSETEX key milliseconds value both become
+		// SET key value PXAT <absolute-ms>, the same shape real Redis propagates.
+		if len(argv) < 4 {
+			return argv
+		}
+		n, ok := parseInteger(argv[2])
+		if !ok {
+			return argv
+		}
+		absMs := time.Now().UnixMilli() + n*1000
+		if strings.ToLower(name) == "psetex" {
+			absMs = time.Now().UnixMilli() + n
+		}
+		return setPxat(argv[1], argv[3], absMs)
+	case "set":
+		// A SET that carries EX, PX, EXAT or PXAT is rewritten to
+		// SET key value PXAT <absolute-ms>. The NX, XX and GET flags are dropped:
+		// the master already decided the write happened, and replaying the
+		// condition could behave differently. A SET without an expiry, including
+		// one with KEEPTTL, is propagated verbatim.
+		if len(argv) < 3 {
+			return argv
+		}
+		absMs, ok := setAbsExpiry(argv[3:])
+		if !ok {
+			return argv
+		}
+		return setPxat(argv[1], argv[2], absMs)
+	case "getex":
+		// GETEX with an expiry option propagates as PEXPIREAT, with PERSIST as
+		// PERSIST. GETEX with no option does not change anything so it never
+		// reaches this path.
+		if len(argv) < 3 {
+			return argv
+		}
+		if strings.EqualFold(string(argv[2]), "persist") {
+			return [][]byte{[]byte("PERSIST"), argv[1]}
+		}
+		absMs, ok := setAbsExpiry(argv[2:])
+		if !ok {
+			return argv
+		}
+		return [][]byte{[]byte("PEXPIREAT"), argv[1], []byte(strconv.FormatInt(absMs, 10))}
 	default:
 		return argv
 	}
+}
+
+// setPxat builds SET key value PXAT ms.
+func setPxat(key, value []byte, absMs int64) [][]byte {
+	return [][]byte{[]byte("SET"), key, value, []byte("PXAT"), []byte(strconv.FormatInt(absMs, 10))}
+}
+
+// setAbsExpiry scans SET-style options for an expiry token and returns its
+// absolute millisecond timestamp. The second result is false when there is no
+// expiry option, which means the command should be propagated verbatim.
+func setAbsExpiry(opts [][]byte) (int64, bool) {
+	for i := 0; i < len(opts); i++ {
+		opt := strings.ToLower(string(opts[i]))
+		switch opt {
+		case "ex", "px", "exat", "pxat":
+			if i+1 >= len(opts) {
+				return 0, false
+			}
+			n, ok := parseInteger(opts[i+1])
+			if !ok {
+				return 0, false
+			}
+			switch opt {
+			case "ex":
+				return time.Now().UnixMilli() + n*1000, true
+			case "px":
+				return time.Now().UnixMilli() + n, true
+			case "exat":
+				return n * 1000, true
+			case "pxat":
+				return n, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // checkAOFRewrite runs from the background cron. It starts an automatic rewrite
