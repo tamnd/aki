@@ -642,6 +642,10 @@ func handleConfigSet(ctx *Ctx) {
 			// Push the new bulk cap to the server so the parser uses it on the next
 			// request.
 			ctx.d.applyMaxBulkLen()
+		case "client-query-buffer-limit":
+			// Push the new query buffer cap to the server so the read loop uses it on
+			// the next read.
+			ctx.d.applyQueryBufLimit()
 		}
 	}
 	ctx.enc().WriteStatus("OK")
