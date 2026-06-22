@@ -277,6 +277,13 @@ func (d *Dispatcher) appendAOF(db int, argv [][]byte) {
 		return
 	}
 	var buf []byte
+	// aof-timestamp-enabled prefixes each record with a #TS:<unix_ms> comment line.
+	// The loader skips comment lines, so the annotation does not change the replay.
+	if d.confBool("aof-timestamp-enabled", false) {
+		buf = append(buf, "#TS:"...)
+		buf = strconv.AppendInt(buf, time.Now().UnixMilli(), 10)
+		buf = append(buf, '\r', '\n')
+	}
 	if db != d.aof.lastSelectedDB {
 		buf = appendRESPCommand(buf, [][]byte{[]byte("SELECT"), []byte(strconv.Itoa(db))})
 		d.aof.lastSelectedDB = db
