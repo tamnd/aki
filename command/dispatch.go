@@ -109,6 +109,11 @@ type Dispatcher struct {
 	// so a log line can stamp M or S without taking repl.mu.
 	log        logger
 	roleMaster atomic.Bool
+
+	// loading is true while the server is replaying the AOF at startup, and ready is
+	// set once the server is accepting clients. The HTTP health endpoints read both.
+	loading atomic.Bool
+	ready   atomic.Bool
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
