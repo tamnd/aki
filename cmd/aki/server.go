@@ -46,11 +46,13 @@ func cmdServer(args []string) error {
 	}
 	defer closeKS()
 
+	var importedFuncs []string
 	if *loadRDB != "" && fresh {
-		n, err := importRDBInto(ks, *loadRDB, *rdbDB)
+		n, funcs, err := importRDBInto(ks, *loadRDB, *rdbDB)
 		if err != nil {
 			return err
 		}
+		importedFuncs = funcs
 		fmt.Printf("loaded %d keys from %s\n", n, *loadRDB)
 	}
 
@@ -61,6 +63,9 @@ func cmdServer(args []string) error {
 		Version:     fmt.Sprintf("7.2.0-aki-%s", Version),
 		Engine:      command.NewEngine(ks),
 	})
+	if len(importedFuncs) > 0 {
+		d.LoadFunctions(importedFuncs)
+	}
 
 	cfg := networking.Config{
 		Addr:       *addr,
@@ -143,27 +148,29 @@ func cmdServer(args []string) error {
 }
 
 // importRDBInto reads a dump.rdb and loads it into the fresh keyspace, committing
-// the result. It is the startup half of --load-rdb.
-func importRDBInto(ks *keyspace.Keyspace, path string, onlyDB int) (int, error) {
+// the result. It returns the key count and the function library sources the file
+// carried so the caller can register them once the dispatcher exists. It is the
+// startup half of --load-rdb.
+func importRDBInto(ks *keyspace.Keyspace, path string, onlyDB int) (int, []string, error) {
 	blob, err := os.ReadFile(path)
 	if err != nil {
-		return 0, fmt.Errorf("read %s: %w", path, err)
+		return 0, nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	if len(blob) < 5 || string(blob[:5]) != "REDIS" {
-		return 0, fmt.Errorf("not an RDB file: %s", path)
+		return 0, nil, fmt.Errorf("not an RDB file: %s", path)
 	}
 	snap, err := rdb.UnmarshalFile(blob)
 	if err != nil {
-		return 0, fmt.Errorf("parse RDB %s: %w", path, err)
+		return 0, nil, fmt.Errorf("parse RDB %s: %w", path, err)
 	}
 	n, err := command.LoadSnapshot(ks, snap, onlyDB, true)
 	if err != nil {
-		return 0, fmt.Errorf("load RDB %s: %w", path, err)
+		return 0, nil, fmt.Errorf("load RDB %s: %w", path, err)
 	}
 	if err := ks.Commit(); err != nil {
-		return 0, fmt.Errorf("commit after load: %w", err)
+		return 0, nil, fmt.Errorf("commit after load: %w", err)
 	}
-	return n, nil
+	return n, snap.Functions, nil
 }
 
 // openKeyspace opens the data file at path, creating it on first run, and

@@ -48,8 +48,9 @@ type DBData struct {
 // Snapshot is a whole dataset across its databases, the unit SAVE writes and load
 // reads.
 type Snapshot struct {
-	DBs []DBData
-	Aux map[string]string // auxiliary header fields such as redis-ver
+	DBs       []DBData
+	Aux       map[string]string // auxiliary header fields such as redis-ver
+	Functions []string          // function library sources, one per library
 }
 
 // MarshalFile serializes a snapshot to a complete RDB file: the REDIS header, the
@@ -61,6 +62,13 @@ func MarshalFile(snap Snapshot) ([]byte, error) {
 	out = appendAux(out, "redis-bits", "64")
 	for k, v := range snap.Aux {
 		out = appendAux(out, k, v)
+	}
+	// Function libraries sit after the aux records and before the first database,
+	// the spot Redis writes RDB_OPCODE_FUNCTION2. The payload is the raw library
+	// source; load re-evaluates it to rebuild the functions.
+	for _, src := range snap.Functions {
+		out = append(out, opFunction2)
+		out = appendString(out, []byte(src))
 	}
 	for _, db := range snap.DBs {
 		if len(db.Entries) == 0 {
@@ -199,7 +207,13 @@ func UnmarshalFile(data []byte) (Snapshot, error) {
 			pendIdle, pendHasIdle = uint32(n), true
 		case opFreq:
 			pendFreq, pendHasFreq = r.readByte(), true
-		case opModuleAux, opFunction, opFunction2, opSlotInfo:
+		case opFunction2:
+			src := r.readString()
+			if r.err != nil {
+				return Snapshot{}, r.err
+			}
+			snap.Functions = append(snap.Functions, string(src))
+		case opModuleAux, opFunction, opSlotInfo:
 			return Snapshot{}, fmt.Errorf("rdb: opcode 0x%02x not supported", op)
 		default:
 			// Anything else is a value type byte introducing a key record.

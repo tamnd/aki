@@ -90,8 +90,8 @@ func (d *Dispatcher) loadAOF() error {
 
 	// Start from an empty dataset so the AOF is the authoritative source for this
 	// load, the same effect a crash recovery from the AOF would have. The function
-	// libraries are cleared too: the rewrite writes a FUNCTION LOAD REPLACE preamble
-	// into the incr file, so the replay below restores them from the log.
+	// libraries are cleared too: the base RDB carries them in its FUNCTION2 records,
+	// so loadAOFBase restores them and the incr replay applies any later changes.
 	if err := d.flushAllDatabases(); err != nil {
 		return err
 	}
@@ -144,10 +144,16 @@ func (d *Dispatcher) loadAOFBase(path string) error {
 	if err != nil {
 		return err
 	}
-	return d.engine.updateKeyspace(func(ks *keyspace.Keyspace) error {
+	if err := d.engine.updateKeyspace(func(ks *keyspace.Keyspace) error {
 		_, lerr := LoadSnapshot(ks, snap, -1, true)
 		return lerr
-	})
+	}); err != nil {
+		return err
+	}
+	// The base carries the function libraries in its FUNCTION2 records. Rebuild them
+	// before the incr replay so any later FUNCTION command in the log applies on top.
+	d.loadFunctionLibraries(snap.Functions)
+	return nil
 }
 
 // flushAllDatabases empties every database under the engine lock.

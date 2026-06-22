@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/tamnd/aki/lua"
+	"github.com/tamnd/aki/networking"
 )
 
 // This file implements the function library model behind FUNCTION LOAD, FCALL and
@@ -141,9 +142,9 @@ func (fr *functionRegistry) ensure() {
 }
 
 // librarySources returns the source of every loaded library, sorted by library
-// name so the order is stable across rewrites. The AOF rewrite replays these as
-// FUNCTION LOAD REPLACE so a reload restores the functions that the base RDB does
-// not carry.
+// name so the order is stable across snapshots. SAVE, the AOF base, and a full
+// sync write these into the RDB as FUNCTION2 records so a reload or a fresh replica
+// gets the functions back.
 func (fr *functionRegistry) librarySources() []string {
 	fr.mu.RLock()
 	defer fr.mu.RUnlock()
@@ -157,6 +158,52 @@ func (fr *functionRegistry) librarySources() []string {
 		out = append(out, fr.libs[name].source)
 	}
 	return out
+}
+
+// LoadFunctions rebuilds the function registry from a set of library sources. The
+// startup --load-rdb import uses it to bring over the functions an imported
+// dump.rdb carried in its FUNCTION2 records.
+func (d *Dispatcher) LoadFunctions(sources []string) {
+	d.loadFunctionLibraries(sources)
+}
+
+// loadFunctionLibraries rebuilds the function registry from a set of library
+// sources, the form FUNCTION2 records carry in an RDB. The caller has already
+// cleared the registry, so each source is built and registered fresh. A source
+// that fails to build is skipped rather than aborting the whole load, the same
+// lenient stance the AOF replay takes for an unknown command.
+func (d *Dispatcher) loadFunctionLibraries(sources []string) {
+	if len(sources) == 0 {
+		return
+	}
+	conn := networking.NewOfflineConn()
+	sess := &session{authenticated: true}
+	conn.SetSession(sess)
+	ctx := &Ctx{Conn: conn, d: d, sess: sess}
+	for _, src := range sources {
+		name, freg, errMsg := d.buildLibrary(ctx, src)
+		if errMsg != "" {
+			continue
+		}
+		fr := &d.functions
+		fr.mu.Lock()
+		fr.ensure()
+		if old, exists := fr.libs[name]; exists {
+			for _, m := range old.funcs {
+				delete(fr.fnIndex, m.name)
+			}
+		}
+		lib := &funcLib{name: name, engine: "LUA", source: src}
+		for _, fname := range freg.order {
+			rf := freg.funcs[fname]
+			lib.funcs = append(lib.funcs, &funcMeta{
+				name: rf.name, description: rf.description, flags: rf.flags, noWrites: rf.noWrites,
+			})
+			fr.fnIndex[fname] = name
+		}
+		fr.libs[name] = lib
+		fr.mu.Unlock()
+	}
 }
 
 // parseShebang reads the "#!lua name=<libname>" first line of a library source.
