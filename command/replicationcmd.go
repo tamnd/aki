@@ -1,8 +1,9 @@
 package command
 
 // This file registers the replication command surface: REPLICAOF and its alias
-// SLAVEOF, the REPLCONF handshake command, and PSYNC/SYNC on the master side
-// (spec 2064 doc 18 sections 2, 3 and 10). The mechanics live in replication.go.
+// SLAVEOF, the REPLCONF handshake command, PSYNC/SYNC on the master side, WAIT and
+// WAITAOF, and the manual FAILOVER command (spec 2064 doc 18 sections 2, 3, 10 and
+// 12). The mechanics live in replication.go and failover.go.
 
 func replicationCommands() []*CmdDesc {
 	return []*CmdDesc{
@@ -27,5 +28,8 @@ func replicationCommands() []*CmdDesc {
 		{Name: "waitaof", Group: GroupConnection, Since: "7.2.0",
 			Arity: 4, Flags: FlagNoScript,
 			Handler: func(ctx *Ctx) { ctx.d.handleWaitAOF(ctx) }},
+		{Name: "failover", Group: GroupServer, Since: "6.2.0",
+			Arity: -1, Flags: FlagAdmin | FlagNoScript | FlagStale,
+			Handler: func(ctx *Ctx) { ctx.d.handleFailover(ctx) }},
 	}
 }
