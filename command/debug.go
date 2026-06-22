@@ -2,6 +2,9 @@ package command
 
 import (
 	"fmt"
+	"os"
+	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
@@ -35,12 +38,14 @@ func handleDebug(ctx *Ctx) {
 		debugSetActiveExpire(ctx)
 	case "RELOAD":
 		debugReload(ctx)
-	case "QUICKLIST-PACKED-THRESHOLD", "CHANGE-REPL-ID", "JMAP":
-		// Accepted no-ops. QUICKLIST-PACKED-THRESHOLD tunes machinery aki does not
-		// have yet, CHANGE-REPL-ID has nothing to do because aki tracks one
-		// replication id, and JMAP is a jemalloc hook with no Go equivalent worth
-		// wiring here.
+	case "QUICKLIST-PACKED-THRESHOLD":
+		// Accepted no-op. This tunes the listpack-to-plain quicklist threshold,
+		// machinery aki's paged storage does not expose at runtime.
 		ctx.enc().WriteStatus("OK")
+	case "CHANGE-REPL-ID":
+		debugChangeReplID(ctx)
+	case "JMAP":
+		debugJMAP(ctx)
 	case "STRINGMATCH-LEN":
 		debugStringmatchLen(ctx)
 	case "FLUSHALL":
@@ -191,4 +196,40 @@ func debugFlushAll(ctx *Ctx) {
 	}) {
 		ctx.enc().WriteStatus("OK")
 	}
+}
+
+// debugChangeReplID rolls the replication id the way a promotion does: the
+// current replid moves to replid2 with its second-offset window, and a fresh
+// replid takes its place. A replica that reconnects after this presents the old
+// replid, which no longer matches, so the next PSYNC falls back to a full
+// resync. The test suites use this to simulate a failover without dropping the
+// link.
+func debugChangeReplID(ctx *Ctx) {
+	d := ctx.d
+	d.repl.mu.Lock()
+	d.repl.replid2 = d.repl.replid
+	d.repl.secondOffset = d.repl.offset + 1
+	d.repl.replid = newRunID()
+	d.repl.mu.Unlock()
+	ctx.enc().WriteStatus("OK")
+}
+
+// debugJMAP writes a Go heap profile to aki-heap-<unix>.prof in the working
+// directory. This stands in for Redis's jemalloc JMAP hook, which has no Go
+// equivalent. A GC runs first so the profile reflects live memory rather than
+// not-yet-collected garbage.
+func debugJMAP(ctx *Ctx) {
+	runtime.GC()
+	name := "aki-heap-" + strconv.FormatInt(time.Now().Unix(), 10) + ".prof"
+	f, err := os.Create(name)
+	if err != nil {
+		ctx.enc().WriteError("ERR " + err.Error())
+		return
+	}
+	defer func() { _ = f.Close() }()
+	if err := pprof.WriteHeapProfile(f); err != nil {
+		ctx.enc().WriteError("ERR " + err.Error())
+		return
+	}
+	ctx.enc().WriteStatus("OK")
 }
