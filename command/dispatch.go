@@ -104,6 +104,10 @@ type Dispatcher struct {
 	// set and shut down on server stop.
 	metrics metricsServer
 
+	// profiler holds the continuous-profiling goroutine, started when
+	// continuous-profiling is on and shut down on server stop.
+	profiler profilerState
+
 	// log holds the structured logging state: the stream sink, the optional syslog
 	// sink, and the cached level and format. roleMaster mirrors the replication role
 	// so a log line can stamp M or S without taking repl.mu.

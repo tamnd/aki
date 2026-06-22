@@ -107,6 +107,11 @@ func cmdServer(args []string) error {
 	}
 	defer d.StopMetrics()
 
+	if err := d.StartProfiler(); err != nil {
+		return fmt.Errorf("start profiler: %w", err)
+	}
+	defer d.StopProfiler()
+
 	d.LogNotice("Server started", "aki_version", Version, "addr", *addr)
 
 	errc := make(chan error, 1)
