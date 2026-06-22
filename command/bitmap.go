@@ -51,7 +51,7 @@ func handleSetBit(ctx *Ctx) {
 	}
 	byteIdx := offset / 8
 	bitPos := uint(7 - offset%8)
-	if byteIdx+1 > protoMaxBulkLen {
+	if byteIdx+1 > ctx.d.protoMaxBulkLen() {
 		ctx.enc().WriteError("ERR string exceeds maximum allowed size (proto-max-bulk-len)")
 		return
 	}
