@@ -88,6 +88,10 @@ type Dispatcher struct {
 	// own lock and an atomic client counter so the write path can skip all tracking
 	// work with a single load when no client is tracking.
 	tracking trackingState
+
+	// stats holds the per-command call, time, and error counters behind the INFO
+	// commandstats, latencystats, and errorstats sections and CONFIG RESETSTAT.
+	stats statsState
 }
 
 // SetServer gives the dispatcher a handle to the network server so CLIENT and
@@ -176,6 +180,7 @@ func New(cfg Config) *Dispatcher {
 	d.replInit()
 	d.clusterInit()
 	d.trackingInit()
+	d.statsInit()
 	if cfg.AclFile != "" {
 		// A missing or unreadable file at startup is not fatal: the in-memory
 		// default user stays in place until ACL LOAD or ACL SAVE is run.
@@ -335,7 +340,9 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	// A RESP2 client with active subscriptions is in subscriber mode and may run
 	// only the subscribe family plus PING, QUIT and RESET. RESP3 lifts this.
 	if c.Proto() == 2 && sess.subCount() > 0 && !allowedInSubMode(name) {
-		c.Enc().WriteError("ERR Command not allowed inside a subscription context. Please use RESET.")
+		msg := "ERR Command not allowed inside a subscription context. Please use RESET."
+		c.Enc().WriteError(msg)
+		d.statError(msg)
 		return
 	}
 
@@ -349,6 +356,7 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	cmd, err := d.table.lookup(name, argv)
 	if err != nil {
 		c.Enc().WriteError(err.Error())
+		d.statError(err.Error())
 		return
 	}
 	if cmd.SubName != "" {
@@ -357,15 +365,23 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		sess.lastCmd = name
 	}
 	if !checkArity(cmd, len(argv)) {
-		c.Enc().WriteError(arityError(cmd))
+		msg := arityError(cmd)
+		c.Enc().WriteError(msg)
+		d.statReject(cmd)
+		d.statError(msg)
 		return
 	}
 	if msg := d.aclEnforce(c, sess, cmd, argv); msg != "" {
 		c.Enc().WriteError(msg)
+		d.statReject(cmd)
+		d.statError(msg)
 		return
 	}
 	if cmd.Flags.Has(FlagWrite) && !sess.fromMaster && d.isReadonlyReplica() {
-		c.Enc().WriteError("READONLY You can't write against a read only replica.")
+		msg := "READONLY You can't write against a read only replica."
+		c.Enc().WriteError(msg)
+		d.statReject(cmd)
+		d.statError(msg)
 		return
 	}
 
