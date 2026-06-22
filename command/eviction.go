@@ -181,7 +181,7 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 	d.slowlogMaybeAdd(ctx.Conn, ctx.Argv, usecI)
 	d.latencyAddSample(latencyEventFor(cmd), usecI/1000)
 	dirtied := d.persist.dirtyCount() > before
-	if propagate && dirtied {
+	if propagate && (dirtied || ctx.forceProp) {
 		args := rewriteForAOF(cmd.Name, ctx.Argv)
 		if args != nil {
 			if d.aofEnabled() {

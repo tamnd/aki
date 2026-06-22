@@ -306,7 +306,18 @@ type Ctx struct {
 	// not just the oldest. A stream XADD fans one entry out to every blocked
 	// XREAD on the key, so those keys go here instead of readyKeys.
 	readyKeysAll [][]byte
+
+	// forceProp asks runCommand to propagate this command to the AOF and the
+	// replicas even when it did not change the keyspace dirty counter. The
+	// FUNCTION admin commands use it: they replicate verbatim like real Redis but
+	// touch no keys, so the dirty-delta rule alone would never propagate them.
+	forceProp bool
 }
+
+// MarkPropagate makes the running command propagate to the AOF and replicas
+// regardless of the keyspace dirty counter. A handler calls it after a change
+// that must replicate but does not live in the keyspace, such as FUNCTION LOAD.
+func (ctx *Ctx) MarkPropagate() { ctx.forceProp = true }
 
 // signalReady marks a key as having gained elements so a client blocked on it
 // (BLPOP and friends) is woken once the current command finishes. The wake is

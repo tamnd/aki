@@ -189,6 +189,20 @@ func (d *Dispatcher) rewriteAOF() error {
 		return ferr
 	}
 
+	// The base RDB carries the keyspace but not the function libraries, so replay
+	// them into the head of the fresh incr file as FUNCTION LOAD REPLACE. A reload
+	// reads the base first and then this preamble, which restores every library.
+	var incrInit int64
+	if buf := functionPreamble(d.functions.librarySources()); len(buf) > 0 {
+		n, werr := incrFile.Write(buf)
+		if werr != nil {
+			_ = incrFile.Close()
+			d.finishRewrite(false, start)
+			return werr
+		}
+		incrInit = int64(n)
+	}
+
 	if merr := d.writeManifest(dir, baseName, incrName, newSeq); merr != nil {
 		_ = incrFile.Close()
 		d.finishRewrite(false, start)
@@ -199,7 +213,7 @@ func (d *Dispatcher) rewriteAOF() error {
 	d.aof.mu.Lock()
 	d.aof.seq = newSeq
 	d.aof.baseSize = baseSize
-	d.aof.incrSize = 0
+	d.aof.incrSize = incrInit
 	d.aof.incrPath = incrPath
 	d.aof.incrFile = incrFile
 	d.aof.lastSelectedDB = -1
@@ -301,12 +315,32 @@ func appendRESPCommand(b []byte, argv [][]byte) []byte {
 	return b
 }
 
+// functionPreamble encodes one FUNCTION LOAD REPLACE command per library source,
+// the block the AOF rewrite writes ahead of the live command stream so a reload
+// restores the function libraries.
+func functionPreamble(sources []string) []byte {
+	var buf []byte
+	for _, src := range sources {
+		buf = appendRESPCommand(buf, [][]byte{
+			[]byte("FUNCTION"), []byte("LOAD"), []byte("REPLACE"), []byte(src),
+		})
+	}
+	return buf
+}
+
 // rewriteForAOF returns the command to write to the AOF for a given write
 // command. Most commands are propagated verbatim. The commands that carry a
 // relative expiry are rewritten so the expiry is an absolute millisecond
 // timestamp, otherwise a delayed replay would set a different expiry than the
 // master did. This is what real Redis does for AOF and replication.
 func rewriteForAOF(name string, argv [][]byte) [][]byte {
+	// FUNCTION LOAD/DELETE/FLUSH/RESTORE propagate as themselves, except LOAD gets
+	// the REPLACE flag so a replay over an existing library does not error. The
+	// command verb sits in argv[0]; the dispatched subcommand name is just the bare
+	// word ("load"), which is too generic to switch on here.
+	if len(argv) >= 2 && strings.EqualFold(string(argv[0]), "function") {
+		return rewriteFunctionForAOF(argv)
+	}
 	switch strings.ToLower(name) {
 	case "expire", "pexpire", "expireat":
 		if len(argv) < 3 {
@@ -373,6 +407,24 @@ func rewriteForAOF(name string, argv [][]byte) [][]byte {
 	default:
 		return argv
 	}
+}
+
+// rewriteFunctionForAOF rewrites a FUNCTION admin command for the AOF and the
+// replication stream. FUNCTION LOAD <src> becomes FUNCTION LOAD REPLACE <src> so
+// a replay over a library that already exists overwrites it instead of failing.
+// A LOAD that already carries REPLACE, and every other FUNCTION write, is
+// propagated verbatim.
+func rewriteFunctionForAOF(argv [][]byte) [][]byte {
+	if len(argv) >= 3 && strings.EqualFold(string(argv[1]), "load") {
+		if strings.EqualFold(string(argv[2]), "replace") {
+			return argv
+		}
+		out := make([][]byte, 0, len(argv)+1)
+		out = append(out, argv[0], argv[1], []byte("REPLACE"))
+		out = append(out, argv[2:]...)
+		return out
+	}
+	return argv
 }
 
 // setPxat builds SET key value PXAT ms.
