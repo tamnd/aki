@@ -321,12 +321,28 @@ func decodeQuicklist(r *reader) ([][]byte, error) {
 	return out, nil
 }
 
+// sliceHint caps a count read from untrusted bytes before it sizes a slice. A
+// corrupt length prefix can decode to a huge count, and make() panics with "cap
+// out of range" if that count exceeds the max slice cap. The decode loop still
+// appends every real element; this only bounds the preallocation.
+func sliceHint(n uint64) int {
+	const max = 1 << 16
+	if n > max {
+		return max
+	}
+	return int(n)
+}
+
 // decodeStringSet reads a plain hashtable set: a count then that many strings.
 func decodeStringSet(r *reader) (Value, error) {
 	n, _, _ := r.readLength()
-	out := make([][]byte, 0, n)
+	out := make([][]byte, 0, sliceHint(n))
 	for range n {
-		out = append(out, r.readString())
+		s := r.readString()
+		if r.err != nil {
+			return Value{}, r.err
+		}
+		out = append(out, s)
 	}
 	return Value{Kind: KindSet, Set: out}, r.err
 }
@@ -334,10 +350,13 @@ func decodeStringSet(r *reader) (Value, error) {
 // decodeStringHash reads a plain hashtable hash: a count then field/value strings.
 func decodeStringHash(r *reader) (Value, error) {
 	n, _, _ := r.readLength()
-	out := make([]Field, 0, n)
+	out := make([]Field, 0, sliceHint(n))
 	for range n {
 		f := r.readString()
 		v := r.readString()
+		if r.err != nil {
+			return Value{}, r.err
+		}
 		out = append(out, Field{Field: f, Value: v})
 	}
 	return Value{Kind: KindHash, Hash: out}, r.err
@@ -347,7 +366,7 @@ func decodeStringHash(r *reader) (Value, error) {
 // 8-byte little-endian score per entry.
 func decodeZSet2(r *reader) (Value, error) {
 	n, _, _ := r.readLength()
-	out := make([]Member, 0, n)
+	out := make([]Member, 0, sliceHint(n))
 	for range n {
 		m := r.readString()
 		b := r.readBytes(8)
@@ -363,7 +382,7 @@ func decodeZSet2(r *reader) (Value, error) {
 // ASCII double rather than binary.
 func decodeZSetLegacy(r *reader) (Value, error) {
 	n, _, _ := r.readLength()
-	out := make([]Member, 0, n)
+	out := make([]Member, 0, sliceHint(n))
 	for range n {
 		m := r.readString()
 		sb := r.readString()
