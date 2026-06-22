@@ -42,8 +42,7 @@ func handleFlushDB(ctx *Ctx) {
 		return
 	}
 	if ctx.update(func(db *keyspace.DB) error {
-		db.Flush()
-		return nil
+		return db.Flush()
 	}) {
 		ctx.enc().WriteStatus("OK")
 	}
@@ -61,7 +60,9 @@ func handleFlushAll(ctx *Ctx) {
 			if err != nil {
 				return err
 			}
-			db.Flush()
+			if err := db.Flush(); err != nil {
+				return err
+			}
 		}
 		return nil
 	}) {
