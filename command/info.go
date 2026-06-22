@@ -230,7 +230,11 @@ func infoPersistence(ctx *Ctx, b *strings.Builder) {
 		curTime = time.Now().Unix() - curStart
 	}
 
-	line(b, "loading", "0")
+	loadingFlag := "0"
+	if ctx.d.loading.Load() {
+		loadingFlag = "1"
+	}
+	line(b, "loading", loadingFlag)
 	line(b, "async_loading", "0")
 	line(b, "current_cow_size", "0")
 	line(b, "current_fork_perc", "0.00")
