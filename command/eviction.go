@@ -13,10 +13,21 @@ import (
 // and eviction cannot make room. It matches Redis byte for byte.
 const oomError = "OOM command not allowed when used memory > 'maxmemory'"
 
-// maxEvictionRounds caps how many keys one freeMemoryIfNeeded call will remove, a
-// backstop so a bad estimate cannot spin the loop forever. Real work stops as
-// soon as used memory drops under the limit.
-const maxEvictionRounds = 16
+// evictionRounds caps how many keys one freeMemoryIfNeeded call will remove. The
+// cap comes from the maxmemory-eviction-tenacity knob: doc 16 §17.4 sets it at
+// 1 + tenacity steps, so the default 10 gives 11 and the loop runs harder as the
+// knob climbs toward 100. Real work stops as soon as used memory drops under the
+// limit, so this only bounds the per-command latency spike.
+func (d *Dispatcher) evictionRounds() int {
+	tenacity := d.confInt("maxmemory-eviction-tenacity", 10)
+	if tenacity < 0 {
+		tenacity = 0
+	}
+	if tenacity > 100 {
+		tenacity = 100
+	}
+	return 1 + int(tenacity)
+}
 
 // confValue reads a config directive from the dispatcher's store, returning def
 // when it is unset. The eviction loop runs off the dispatcher, not a Ctx, so it
@@ -54,7 +65,7 @@ func (d *Dispatcher) freeMemoryIfNeeded() bool {
 	samples := int(d.confInt("maxmemory-samples", 5))
 	volatileOnly := strings.HasPrefix(policy, "volatile-")
 
-	for range maxEvictionRounds {
+	for range d.evictionRounds() {
 		if d.engine.usedMemory() < limit {
 			return true
 		}
