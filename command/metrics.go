@@ -47,11 +47,42 @@ func (d *Dispatcher) serveMetricsOn(ln net.Listener) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = w.Write([]byte(d.renderMetrics()))
 	})
+	mux.HandleFunc("/health", d.handleHealth)
+	mux.HandleFunc("/ready", d.handleReady)
 	srv := &http.Server{Handler: mux}
 	d.metrics.srv = srv
 	d.metrics.ln = ln
 	go func() { _ = srv.Serve(ln) }()
 }
+
+// handleHealth answers GET /health from doc 20 section 9.5. It returns 200 with an
+// ok body when the server is operational and 503 while the AOF is still replaying.
+func (d *Dispatcher) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if d.loading.Load() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"loading","loading":1}` + "\n"))
+		return
+	}
+	_, _ = w.Write([]byte(`{"status":"ok","version":"` + d.cfg.Version + `","loading":0}` + "\n"))
+}
+
+// handleReady answers GET /ready. It returns 200 only when the server is accepting
+// clients and not loading, and 503 otherwise. A load balancer uses it to decide
+// when to send traffic.
+func (d *Dispatcher) handleReady(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if d.ready.Load() && !d.loading.Load() {
+		_, _ = w.Write([]byte(`{"status":"ready"}` + "\n"))
+		return
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte(`{"status":"not ready"}` + "\n"))
+}
+
+// SetReady marks the server as accepting clients. The server command calls it once
+// the listener is up. The HTTP /ready endpoint reads it.
+func (d *Dispatcher) SetReady(v bool) { d.ready.Store(v) }
 
 // StopMetrics shuts the endpoint down. It is safe to call when the endpoint was
 // never started.

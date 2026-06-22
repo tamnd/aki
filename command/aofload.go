@@ -80,10 +80,12 @@ func (d *Dispatcher) loadAOF() error {
 	d.aof.mu.Lock()
 	d.aof.loading = true
 	d.aof.mu.Unlock()
+	d.loading.Store(true)
 	defer func() {
 		d.aof.mu.Lock()
 		d.aof.loading = false
 		d.aof.mu.Unlock()
+		d.loading.Store(false)
 	}()
 
 	// Start from an empty dataset so the AOF is the authoritative source for this

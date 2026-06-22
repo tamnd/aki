@@ -96,6 +96,7 @@ func cmdServer(args []string) error {
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe(cfg) }()
+	d.SetReady(true)
 
 	fmt.Printf("aki %s listening on %s\n", Version, *addr)
 	if *unixSocket != "" {
