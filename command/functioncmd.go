@@ -151,6 +151,7 @@ func handleFunctionLoad(ctx *Ctx) {
 	}
 	fr.libs[name] = lib
 	fr.mu.Unlock()
+	ctx.MarkPropagate()
 	ctx.enc().WriteBulkStringStr(name)
 }
 
@@ -170,6 +171,7 @@ func handleFunctionDelete(ctx *Ctx) {
 	}
 	delete(fr.libs, name)
 	fr.mu.Unlock()
+	ctx.MarkPropagate()
 	ctx.Conn.WriteRaw(resp.ReplyOK)
 }
 
@@ -192,6 +194,7 @@ func handleFunctionFlush(ctx *Ctx) {
 	fr.libs = map[string]*funcLib{}
 	fr.fnIndex = map[string]string{}
 	fr.mu.Unlock()
+	ctx.MarkPropagate()
 	ctx.Conn.WriteRaw(resp.ReplyOK)
 }
 
@@ -459,6 +462,7 @@ func handleFunctionRestore(ctx *Ctx) {
 			fr.fnIndex[m.name] = lib.name
 		}
 	}
+	ctx.MarkPropagate()
 	ctx.Conn.WriteRaw(resp.ReplyOK)
 }
 

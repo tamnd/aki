@@ -89,10 +89,16 @@ func (d *Dispatcher) loadAOF() error {
 	}()
 
 	// Start from an empty dataset so the AOF is the authoritative source for this
-	// load, the same effect a crash recovery from the AOF would have.
+	// load, the same effect a crash recovery from the AOF would have. The function
+	// libraries are cleared too: the rewrite writes a FUNCTION LOAD REPLACE preamble
+	// into the incr file, so the replay below restores them from the log.
 	if err := d.flushAllDatabases(); err != nil {
 		return err
 	}
+	d.functions.mu.Lock()
+	d.functions.libs = map[string]*funcLib{}
+	d.functions.fnIndex = map[string]string{}
+	d.functions.mu.Unlock()
 
 	for _, e := range entries {
 		if e.typ != "b" {
