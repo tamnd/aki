@@ -69,6 +69,34 @@ func (d *Dispatcher) crossSlotError(name string, cmd *CmdDesc, argv [][]byte) st
 	return ""
 }
 
+// queueCrossSlot reports the CROSSSLOT error when the commands queued in an open
+// MULTI reference keys in more than one hash slot. Real Redis checks a whole
+// transaction at EXEC time even when each queued command stays within one slot on
+// its own, so two single-key commands in different slots still abort the EXEC. It
+// returns "" when cluster mode is off or every queued key lands in one slot. The
+// hash tag rule applies through hashSlot.
+func (d *Dispatcher) queueCrossSlot(queue []queuedCmd) string {
+	if !d.clusterEnabled() {
+		return ""
+	}
+	slot := -1
+	for _, q := range queue {
+		keys, ok := extractKeys(q.cmd.Name, q.cmd, q.argv)
+		if !ok {
+			continue
+		}
+		for _, k := range keys {
+			s := int(hashSlot(k))
+			if slot == -1 {
+				slot = s
+			} else if s != slot {
+				return "CROSSSLOT Keys in request don't hash to the same slot"
+			}
+		}
+	}
+	return ""
+}
+
 // announceIP is the address aki reports for itself in CLUSTER NODES, SLOTS and
 // SHARDS. It prefers cluster-announce-ip, then the bound address, then loopback.
 func (d *Dispatcher) announceIP() string {

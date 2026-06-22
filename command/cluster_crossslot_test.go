@@ -38,6 +38,58 @@ func TestClusterCrossSlot(t *testing.T) {
 	}
 }
 
+// TestClusterTxnCrossSlot checks that a MULTI/EXEC spanning two slots is rejected
+// at EXEC even when each queued command is single-key, that a command whose own
+// keys span slots is rejected at queue time and aborts the EXEC, and that a
+// hash-tagged transaction runs.
+func TestClusterTxnCrossSlot(t *testing.T) {
+	r, c := startData(t)
+	sendArgs(t, r, c, "CONFIG", "SET", "cluster-enabled", "yes")
+
+	// Two single-key writes to different slots queue fine, but EXEC rejects the
+	// whole transaction with CROSSSLOT.
+	if got := sendArgs(t, r, c, "MULTI"); got != "OK" {
+		t.Fatalf("MULTI = %v", got)
+	}
+	if got := sendArgs(t, r, c, "SET", "a", "1"); got != "QUEUED" {
+		t.Fatalf("queue SET a = %v", got)
+	}
+	if got := sendArgs(t, r, c, "SET", "b", "2"); got != "QUEUED" {
+		t.Fatalf("queue SET b = %v", got)
+	}
+	got := sendArgs(t, r, c, "EXEC")
+	e, ok := got.(cmdErr)
+	if !ok || !strings.HasPrefix(string(e), "CROSSSLOT") {
+		t.Fatalf("cross-slot EXEC = %v want CROSSSLOT", got)
+	}
+
+	// A command whose own keys span slots is rejected when queued and the EXEC
+	// aborts with EXECABORT, since the bad command never entered the queue.
+	if got := sendArgs(t, r, c, "MULTI"); got != "OK" {
+		t.Fatalf("MULTI = %v", got)
+	}
+	got = sendArgs(t, r, c, "MSET", "a", "1", "b", "2")
+	if e, ok := got.(cmdErr); !ok || !strings.HasPrefix(string(e), "CROSSSLOT") {
+		t.Fatalf("queue cross-slot MSET = %v want CROSSSLOT", got)
+	}
+	got = sendArgs(t, r, c, "EXEC")
+	if e, ok := got.(cmdErr); !ok || !strings.HasPrefix(string(e), "EXECABORT") {
+		t.Fatalf("EXEC after queue error = %v want EXECABORT", got)
+	}
+
+	// A hash-tagged transaction keeps every key in one slot and runs.
+	if got := sendArgs(t, r, c, "MULTI"); got != "OK" {
+		t.Fatalf("MULTI = %v", got)
+	}
+	sendArgs(t, r, c, "SET", "{u}:a", "1")
+	sendArgs(t, r, c, "SET", "{u}:b", "2")
+	got = sendArgs(t, r, c, "EXEC")
+	arr, ok := got.([]any)
+	if !ok || len(arr) != 2 {
+		t.Fatalf("tagged EXEC = %v want two replies", got)
+	}
+}
+
 // TestClusterSelectRestricted checks SELECT to a non-zero db is rejected in
 // cluster mode and allowed in standalone mode.
 func TestClusterSelectRestricted(t *testing.T) {

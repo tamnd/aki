@@ -72,6 +72,14 @@ func (d *Dispatcher) queueCommand(c *networking.Conn, sess *session, name string
 		c.Enc().WriteError("ERR " + cmd.Name + " is not allowed in transactions")
 		return
 	}
+	// In cluster mode a single command whose own keys span slots is rejected at
+	// queue time and marks the transaction so EXEC aborts, the same as outside a
+	// transaction. The cross-command check happens later in handleExec.
+	if msg := d.crossSlotError(name, cmd, argv); msg != "" {
+		sess.dirtyExec = true
+		c.Enc().WriteError(msg)
+		return
+	}
 	sess.queue = append(sess.queue, queuedCmd{cmd: cmd, argv: argv})
 	c.WriteRaw(resp.ReplyQueued)
 }
@@ -113,6 +121,14 @@ func handleExec(ctx *Ctx) {
 	watched := sess.watched
 	sess.clearMulti()
 
+	// In cluster mode the whole transaction must stay within one slot, even when
+	// each queued command is single-key on its own. Real Redis runs this check
+	// before the command body, so it takes precedence over the queue-time error
+	// that would otherwise give EXECABORT.
+	if msg := ctx.d.queueCrossSlot(queue); msg != "" {
+		ctx.enc().WriteError(msg)
+		return
+	}
 	if dirtyExec {
 		ctx.enc().WriteError("EXECABORT Transaction discarded because of previous errors.")
 		return
