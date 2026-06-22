@@ -255,6 +255,11 @@ func (i *Interp) execIf(n *ifStmt, s *scope) (control, error) {
 
 func (i *Interp) execWhile(n *whileStmt, s *scope) (control, error) {
 	for {
+		// Tick per iteration so the deadline hook fires even when the body has no
+		// statements of its own, as in `while true do end`.
+		if err := i.tick(); err != nil {
+			return normalControl, asError(err)
+		}
 		v, err := i.evalExpr(n.cond, s)
 		if err != nil {
 			return normalControl, err
@@ -277,6 +282,9 @@ func (i *Interp) execWhile(n *whileStmt, s *scope) (control, error) {
 
 func (i *Interp) execRepeat(n *repeatStmt, s *scope) (control, error) {
 	for {
+		if err := i.tick(); err != nil {
+			return normalControl, asError(err)
+		}
 		// The until condition can see the body's locals, so run the body and the
 		// test in the same scope.
 		inner := newScope(s)
@@ -320,6 +328,9 @@ func (i *Interp) execNumFor(n *numForStmt, s *scope) (control, error) {
 		return normalControl, runtimeErr("'for' step is zero")
 	}
 	for v := start; (step > 0 && v <= stop) || (step < 0 && v >= stop); v += step {
+		if err := i.tick(); err != nil {
+			return normalControl, asError(err)
+		}
 		inner := newScope(s)
 		inner.define(n.name, Number(v))
 		ctrl, err := i.execStmts(n.body, inner)
@@ -345,6 +356,9 @@ func (i *Interp) execGenFor(n *genForStmt, s *scope) (control, error) {
 	state := nth(init, 1)
 	ctrlVar := nth(init, 2)
 	for {
+		if err := i.tick(); err != nil {
+			return normalControl, asError(err)
+		}
 		rets, err := i.call(iter, []Value{state, ctrlVar}, 0)
 		if err != nil {
 			return normalControl, err
