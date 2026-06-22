@@ -168,6 +168,11 @@ func normalizeKey(key Value) Value {
 // iterArray exposes the array part for ipairs-style iteration.
 func (t *Table) iterArray() []Value { return t.arr }
 
+// Keys returns every key of the table in deterministic order, the array part
+// first then the hash part sorted. Host code uses it to walk a script-built map
+// or set table in a stable order.
+func (t *Table) Keys() []Value { return t.iterOrder() }
+
 // hashKeys returns the hash-part keys in a stable order so that traversal and
 // serialization are deterministic.
 func (t *Table) hashKeys() []Value {
@@ -224,6 +229,12 @@ type Function struct {
 	env   *scope    // captured environment for closures
 	name  string    // best-effort name for diagnostics
 	gofn  GoFunc    // set for Go builtins
+}
+
+// NewGoFunc wraps a Go function as a callable Lua value. Host code outside the
+// lua package uses it to install builtins, for example the redis.* table.
+func NewGoFunc(name string, fn GoFunc) *Function {
+	return &Function{gofn: fn, name: name}
 }
 
 // Error is a Lua error carrying an arbitrary Lua value (usually a string). It
