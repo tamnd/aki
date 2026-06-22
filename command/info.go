@@ -242,10 +242,49 @@ func infoPersistence(ctx *Ctx, b *strings.Builder) {
 	lineInt(b, "rdb_current_bgsave_time_sec", curTime)
 	lineInt(b, "rdb_saves", saves)
 	line(b, "rdb_last_cow_size", "0")
-	line(b, "aof_enabled", "0")
-	line(b, "aof_rewrite_in_progress", "0")
-	line(b, "aof_last_bgrewrite_status", "ok")
-	line(b, "aof_last_write_status", "ok")
+
+	a := &ctx.d.aof
+	a.mu.Lock()
+	aofEnabled := ctx.d.aofEnabled()
+	aofRewriting := a.rewriteInProgress
+	aofScheduled := a.scheduled
+	aofStatus := a.lastStatus
+	aofWriteStatus := a.lastWriteStatus
+	aofTimeSec := a.lastTimeSec
+	aofCurStart := a.curStartUnix
+	aofRewrites := a.seq
+	aofBaseSize := a.baseSize
+	aofIncrSize := a.incrSize
+	a.mu.Unlock()
+	if aofStatus == "" {
+		aofStatus = "ok"
+	}
+	if aofWriteStatus == "" {
+		aofWriteStatus = "ok"
+	}
+	aofRewriteTime := "-1"
+	if aofRewrites > 0 {
+		aofRewriteTime = strconv.FormatFloat(aofTimeSec, 'f', -1, 64)
+	}
+	aofCurTime := int64(-1)
+	if aofCurStart != 0 {
+		aofCurTime = time.Now().Unix() - aofCurStart
+	}
+
+	line(b, "aof_enabled", boolField(aofEnabled))
+	line(b, "aof_rewrite_in_progress", boolField(aofRewriting))
+	line(b, "aof_rewrite_scheduled", boolField(aofScheduled))
+	line(b, "aof_last_rewrite_time_sec", aofRewriteTime)
+	lineInt(b, "aof_current_rewrite_time_sec", aofCurTime)
+	line(b, "aof_last_bgrewrite_status", aofStatus)
+	line(b, "aof_last_write_status", aofWriteStatus)
+	line(b, "aof_pending_rewrite", boolField(aofScheduled))
+	if aofEnabled {
+		lineInt(b, "aof_current_size", aofBaseSize+aofIncrSize)
+		lineInt(b, "aof_base_size", aofBaseSize)
+		lineInt(b, "aof_pending_bio_fsync", 0)
+		lineInt(b, "aof_delayed_fsync", 0)
+	}
 }
 
 // boolField renders a flag as the "1" or "0" INFO uses.

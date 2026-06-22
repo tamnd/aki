@@ -123,8 +123,12 @@ func configDirectives() []*directive {
 		{name: "dir", kind: dirString, def: ".", mutable: true},
 		{name: "appendonly", kind: dirBool, def: "no", mutable: true},
 		{name: "appendfilename", kind: dirString, def: "appendonly.aof"},
+		{name: "appenddirname", kind: dirString, def: "appendonlydir"},
 		{name: "appendfsync", kind: dirEnum, def: "everysec", mutable: true,
 			enum: []string{"always", "everysec", "no"}},
+		{name: "no-appendfsync-on-rewrite", kind: dirBool, def: "no", mutable: true},
+		{name: "auto-aof-rewrite-percentage", kind: dirInt, def: "100", mutable: true},
+		{name: "auto-aof-rewrite-min-size", kind: dirMemory, def: "67108864", mutable: true},
 
 		// Replication.
 		{name: "replica-read-only", kind: dirBool, def: "yes", mutable: true},
