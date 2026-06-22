@@ -63,8 +63,12 @@ func cmdServer(args []string) error {
 		Version:     fmt.Sprintf("7.2.0-aki-%s", Version),
 		Engine:      command.NewEngine(ks),
 	})
+	if err := d.LoadFunctionsFromKeyspace(); err != nil {
+		return fmt.Errorf("load functions from data file: %w", err)
+	}
 	if len(importedFuncs) > 0 {
 		d.LoadFunctions(importedFuncs)
+		d.PersistFunctions()
 	}
 	if err := d.LoadACLFromKeyspace(); err != nil {
 		return fmt.Errorf("load ACL from data file: %w", err)

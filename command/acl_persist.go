@@ -4,66 +4,12 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/tamnd/aki/keyspace"
 )
 
 // aclEntryPrefix namespaces ACL users in the .aki system table. Each user is one
 // entry, keyed aclEntryPrefix+name, valued with its full "user ... " line. The
 // prefix keeps ACL entries apart from other system table tenants like functions.
 const aclEntryPrefix = "acl:"
-
-// aclLoad reads every persisted ACL user line from the .aki system table and
-// returns them keyed by username. An empty result means the table has no ACL
-// entries, which is the normal first-boot state.
-func (e *Engine) aclLoad() (map[string]string, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	keys, err := e.ks.SystemList(aclEntryPrefix)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]string, len(keys))
-	for _, k := range keys {
-		v, ok, err := e.ks.SystemGet(k)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			out[k[len(aclEntryPrefix):]] = string(v)
-		}
-	}
-	return out, nil
-}
-
-// aclStore replaces the ACL entries in the system table with lines and commits.
-// Entries present in the table but absent from lines are deleted, so dropping a
-// user with ACL DELUSER removes it from the file too.
-func (e *Engine) aclStore(lines map[string]string) error {
-	return e.updateKeyspace(func(ks *keyspace.Keyspace) error {
-		existing, err := ks.SystemList(aclEntryPrefix)
-		if err != nil {
-			return err
-		}
-		keep := make(map[string]bool, len(lines))
-		for name := range lines {
-			keep[aclEntryPrefix+name] = true
-		}
-		for _, k := range existing {
-			if !keep[k] {
-				if _, err := ks.SystemDelete(k); err != nil {
-					return err
-				}
-			}
-		}
-		for name, line := range lines {
-			if err := ks.SystemPut(aclEntryPrefix+name, []byte(line)); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
 
 // lines renders the current users as a map of username to ACL line. The caller
 // uses it to mirror the registry into the .aki system table.
@@ -117,7 +63,7 @@ func (d *Dispatcher) persistACL() {
 	if d.engine == nil || d.acl == nil || d.acl.aclFile != "" {
 		return
 	}
-	if err := d.engine.aclStore(d.acl.lines()); err != nil {
+	if err := d.engine.systemReplace(aclEntryPrefix, d.acl.lines()); err != nil {
 		d.logWarning("failed to persist ACL to the data file", logField{"err", err.Error()})
 	}
 }
@@ -129,7 +75,7 @@ func (d *Dispatcher) LoadACLFromKeyspace() error {
 	if d.engine == nil || d.acl == nil || d.acl.aclFile != "" {
 		return nil
 	}
-	lines, err := d.engine.aclLoad()
+	lines, err := d.engine.systemEntries(aclEntryPrefix)
 	if err != nil {
 		return err
 	}

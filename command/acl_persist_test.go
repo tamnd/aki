@@ -124,9 +124,9 @@ func TestACLPersistSkippedWithAclFile(t *testing.T) {
 	d.acl.mu.Unlock()
 	d.persistACL()
 
-	lines, err := d.engine.aclLoad()
+	lines, err := d.engine.systemEntries(aclEntryPrefix)
 	if err != nil {
-		t.Fatalf("aclLoad: %v", err)
+		t.Fatalf("systemEntries: %v", err)
 	}
 	if len(lines) != 0 {
 		t.Fatalf("system table has %d ACL entries, want 0 when aclfile is set", len(lines))
