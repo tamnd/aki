@@ -84,4 +84,8 @@ type CmdDesc struct {
 
 	// SubCmds holds the subcommands of a container command (COMMAND, CONFIG, ...).
 	SubCmds []*CmdDesc
+
+	// subByKey is the hash-keyed lookup table for SubCmds, populated by NewTable.
+	// keyed by cmdKey of the lowercase subcommand name.
+	subByKey map[uint64]*CmdDesc
 }

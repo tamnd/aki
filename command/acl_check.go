@@ -16,9 +16,8 @@ import (
 
 // aclEnforce runs the full ACL check for a command about to execute. It returns
 // the error string to send the client, or "" when the command is allowed. It
-// logs any denial against the connection. name must be the lowercased command
-// name already computed by the dispatch path.
-func (d *Dispatcher) aclEnforce(c *networking.Conn, sess *session, cmd *CmdDesc, name string, argv [][]byte) string {
+// logs any denial against the connection.
+func (d *Dispatcher) aclEnforce(c *networking.Conn, sess *session, cmd *CmdDesc, argv [][]byte) string {
 	// An unauthenticated connection may only run no-auth commands.
 	if !sess.authenticated {
 		if cmd.Flags.Has(FlagNoAuth) {
@@ -31,11 +30,11 @@ func (d *Dispatcher) aclEnforce(c *networking.Conn, sess *session, cmd *CmdDesc,
 	if u == nil {
 		return ""
 	}
-	if msg := aclCheckUser(d, u, cmd, name, argv); msg != "" {
+	if msg := aclCheckUser(d, u, cmd, argv); msg != "" {
 		reason := aclReasonFromMsg(msg)
 		object := cmd.Name
 		if reason == "key" || reason == "channel" {
-			object = aclDeniedObject(reason, cmd, name, argv)
+			object = aclDeniedObject(reason, cmd, argv)
 		}
 		d.acl.addLog(c, sess, reason, "toplevel", object)
 		return msg
@@ -46,9 +45,9 @@ func (d *Dispatcher) aclEnforce(c *networking.Conn, sess *session, cmd *CmdDesc,
 // aclCheckUser checks command, key and channel permissions for a user and
 // returns the NOPERM string on the first failure, or "" when allowed. It does
 // not log; callers that need a log entry do so from the returned reason.
-func aclCheckUser(d *Dispatcher, u *aclUser, cmd *CmdDesc, name string, argv [][]byte) string {
+func aclCheckUser(d *Dispatcher, u *aclUser, cmd *CmdDesc, argv [][]byte) string {
 	if !aclCommandAllowed(u, cmd) {
-		full := name
+		full := cmd.Name
 		if cmd.SubName != "" {
 			full = cmd.SubName
 		}
@@ -63,7 +62,7 @@ func aclCheckUser(d *Dispatcher, u *aclUser, cmd *CmdDesc, name string, argv [][
 	// is the common case for the default user and avoids the extractKeys alloc
 	// on the hot dispatch path.
 	if !u.allKeys() {
-		if keys, ok := extractKeys(name, cmd, argv); ok {
+		if keys, ok := extractKeys(cmd.Name, cmd, argv); ok {
 			for _, k := range keys {
 				if !aclKeyAllowed(u, string(k), access) {
 					return "NOPERM No permissions to access a key"
@@ -74,7 +73,7 @@ func aclCheckUser(d *Dispatcher, u *aclUser, cmd *CmdDesc, name string, argv [][
 
 	// Channel checks key off the command name, not FlagPubSub, because PUBLISH and
 	// SPUBLISH deliberately do not carry that flag (so they queue inside MULTI).
-	for _, ch := range extractChannels(name, argv) {
+	for _, ch := range extractChannels(cmd.Name, argv) {
 		if !aclChannelAllowed(u, ch) {
 			return "NOPERM No permissions to access a channel"
 		}
@@ -96,15 +95,15 @@ func aclReasonFromMsg(msg string) string {
 
 // aclDeniedObject returns the first key or channel the user could not access, for
 // the ACL log object field.
-func aclDeniedObject(reason string, cmd *CmdDesc, name string, argv [][]byte) string {
+func aclDeniedObject(reason string, cmd *CmdDesc, argv [][]byte) string {
 	if reason == "channel" {
-		chans := extractChannels(name, argv)
+		chans := extractChannels(cmd.Name, argv)
 		if len(chans) > 0 {
 			return chans[0]
 		}
 		return ""
 	}
-	keys, _ := extractKeys(name, cmd, argv)
+	keys, _ := extractKeys(cmd.Name, cmd, argv)
 	if len(keys) > 0 {
 		return string(keys[0])
 	}
