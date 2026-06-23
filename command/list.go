@@ -47,7 +47,7 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 		absent   bool
 		newLen   int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		body, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
@@ -131,7 +131,7 @@ func popList(ctx *Ctx, head bool) {
 		emptied  bool
 		popped   [][]byte
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		body, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
