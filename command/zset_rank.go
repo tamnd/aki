@@ -50,6 +50,18 @@ func writeScoredPairs(enc *resp.Encoder, pairs []zmember) {
 	}
 }
 
+// writeNestedScoredPairs writes member/score pairs as an array of two-element
+// arrays on both RESP2 and RESP3. ZMPOP and BZMPOP use this shape (each element
+// is its own [member, score] array), unlike ZPOPMIN/MAX which use a flat list.
+func writeNestedScoredPairs(enc *resp.Encoder, pairs []zmember) {
+	enc.WriteArrayLen(len(pairs))
+	for _, p := range pairs {
+		enc.WriteArrayLen(2)
+		enc.WriteBulkString(p.member)
+		enc.WriteDouble(p.score)
+	}
+}
+
 // handleZRank implements ZRANK and ZREVRANK with the optional WITHSCORE flag.
 // The rank is the member's 0-based position in ascending order, or descending
 // order for ZREVRANK.
