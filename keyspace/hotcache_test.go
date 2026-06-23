@@ -74,28 +74,36 @@ func TestHotCacheFlushClears(t *testing.T) {
 }
 
 // TestHotCachePeekDoesNotPopulate confirms that Peek (touch=false) does not
-// populate the cache. A subsequent Get on the same key must still miss the
-// cache and hit the B-tree.
+// populate the cache. Set populates it for inline values; after evicting the
+// entry manually, a Peek must leave the cache cold while Get warms it again.
 func TestHotCachePeekDoesNotPopulate(t *testing.T) {
 	ks, _, _ := newKS(t)
 	db := mustDB(t, ks, 0)
 
 	_ = db.Set([]byte("k"), []byte("v"), TypeString, EncRaw, -1)
-	// Peek should not populate the cache.
-	_, _, _, _ = db.Peek([]byte("k"))
-	// Check that the shard has nothing for "k".
-	_, _, ok := db.hc.cget("k")
-	if ok {
+	// Set populates the hot cache for inline values.
+	if _, _, ok := db.hc.cget("k"); !ok {
+		t.Fatal("Set must populate the hot cache for inline values")
+	}
+
+	// Evict the entry to test Peek's non-populating property in isolation.
+	db.hc.cinvalidate("k")
+
+	// Peek should not re-populate the cache.
+	b, _, found, _ := db.Peek([]byte("k"))
+	if !found || string(b) != "v" {
+		t.Fatalf("Peek = %q found=%v", b, found)
+	}
+	if _, _, ok := db.hc.cget("k"); ok {
 		t.Fatal("Peek must not populate the hot cache")
 	}
-	// A Get should still return the correct value (from B-tree, then populate).
-	b, _, found, _ := db.Get([]byte("k"))
+
+	// Get re-warms the cache.
+	b, _, found, _ = db.Get([]byte("k"))
 	if !found || string(b) != "v" {
 		t.Fatalf("Get after Peek = %q found=%v", b, found)
 	}
-	// Now the cache should be warm.
-	_, _, ok = db.hc.cget("k")
-	if !ok {
+	if _, _, ok := db.hc.cget("k"); !ok {
 		t.Fatal("Get must populate the hot cache")
 	}
 }
