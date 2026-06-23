@@ -19,4 +19,7 @@ aki-heap-*.prof
 # committed golden fixtures are the .aki files we do track
 !format/testdata/*.aki
 !pager/testdata/*.aki
-aki
+
+# the built server binary at the repo root, anchored so it does not also
+# ignore the cmd/aki source directory
+/aki

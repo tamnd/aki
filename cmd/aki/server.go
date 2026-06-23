@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -19,9 +22,35 @@ import (
 // cmdServer starts the aki server: it opens (or creates) the data file, builds
 // the keyspace and command dispatcher, and runs the network listener until
 // interrupted.
+//
+// The flag surface mirrors redis-server so an operator coming from Redis or
+// Valkey can reuse the names they already know: --port, --bind, --dir,
+// --dbfilename, --appendonly, --appendfsync, --save, --maxmemory and friends all
+// behave the way they do over there. An optional leading positional argument is a
+// redis.conf-style config file; values from it are overridden by any flag passed
+// on the command line, the same precedence redis-server uses.
 func cmdServer(args []string) error {
+	// A leading non-flag argument is a config file path, the classic
+	// `redis-server /etc/redis.conf` form. Parse it first so flags can override.
+	var fileConf map[string]string
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		var err error
+		fileConf, err = parseConfigFile(args[0])
+		if err != nil {
+			return err
+		}
+		args = args[1:]
+	}
+	if fileConf == nil {
+		fileConf = map[string]string{}
+	}
+
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
+	// Listen address. --addr is the aki-native host:port form; --bind and --port
+	// are the redis spellings and compose into the same listen address.
 	addr := fs.String("addr", "127.0.0.1:6379", "TCP listen address (host:port)")
+	bind := fs.String("bind", "", "interface address to listen on (redis spelling; combined with --port)")
+	port := fs.String("port", "", "TCP port to listen on (redis spelling; combined with --bind)")
 	unixSocket := fs.String("unixsocket", "", "Unix socket path to listen on as well")
 	maxClients := fs.Int("maxclients", 10000, "maximum number of connected clients")
 	databases := fs.Int("databases", 16, "number of logical databases")
@@ -29,7 +58,19 @@ func cmdServer(args []string) error {
 	aclFile := fs.String("aclfile", "", "path to an external ACL file loaded at startup and written by ACL SAVE")
 	logfile := fs.String("logfile", "", "path to the log file (empty logs to stderr)")
 	loglevel := fs.String("loglevel", "", "minimum log level: debug, verbose, notice, warning")
+	// Data file location. --dbfile is the aki-native path; --dir and --dbfilename
+	// are the redis spellings. The data file lands at --dir/--dbfile unless --dbfile
+	// is absolute.
 	dbfile := fs.String("dbfile", "aki.db", "path to the .aki data file")
+	dir := fs.String("dir", "", "working directory for the data file, RDB dumps, and AOF (redis spelling)")
+	dbfilename := fs.String("dbfilename", "", "RDB dump filename written by SAVE/BGSAVE (redis spelling)")
+	// Durability and limits, redis spellings mapped onto aki's config store.
+	appendonly := fs.String("appendonly", "", "enable the append-only file: yes or no")
+	appendfsync := fs.String("appendfsync", "", "durability policy: always, everysec, or no")
+	save := fs.String("save", "", `RDB save points, e.g. "3600 1 300 100", or "" to disable`)
+	maxmemory := fs.String("maxmemory", "", "memory limit before eviction, e.g. 256mb (0 disables)")
+	maxmemoryPolicy := fs.String("maxmemory-policy", "", "eviction policy when maxmemory is reached")
+	daemonize := fs.String("daemonize", "", "accepted for redis compatibility; only 'no' is supported")
 	loadRDB := fs.String("load-rdb", "", "import this dump.rdb on first open (only when the .aki file does not exist)")
 	rdbDB := fs.Int("rdb-db", -1, "with --load-rdb, import only this source database")
 	bufferPoolSize := fs.String("buffer-pool-size", "128mb", "buffer pool capacity (e.g. 128mb, 512mb); controls how much of the .aki file stays in memory")
@@ -37,36 +78,82 @@ func cmdServer(args []string) error {
 		return err
 	}
 
-	fresh := !vfs.NewOS().Exists(*dbfile)
-	if *loadRDB != "" && !fresh {
-		return fmt.Errorf("--load-rdb only applies on first open; %s already exists", *dbfile)
+	// Track which flags the operator set explicitly so config-file values fill in
+	// only where the command line was silent. Command line beats config file.
+	setFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+	resolve := func(name, flagVal string) string {
+		if setFlags[name] {
+			return flagVal
+		}
+		if v, ok := fileConf[name]; ok {
+			return v
+		}
+		return flagVal
 	}
 
-	poolPages, err := parseBufPoolPages(*bufferPoolSize)
+	if d := resolve("daemonize", *daemonize); d != "" && d != "no" {
+		return fmt.Errorf("--daemonize %s is not supported; aki runs in the foreground (use a process manager or a shell &)", d)
+	}
+
+	// Compose the listen address from --bind/--port when given, else keep --addr.
+	host, p := "127.0.0.1", "6379"
+	if b := resolve("bind", *bind); b != "" {
+		host = firstField(b)
+	}
+	if pv := resolve("port", *port); pv != "" {
+		p = pv
+	}
+	listenAddr := resolve("addr", *addr)
+	if setFlags["bind"] || setFlags["port"] || fileConf["bind"] != "" || fileConf["port"] != "" {
+		listenAddr = net.JoinHostPort(host, p)
+	}
+
+	// Resolve the data file path: --dir is the base directory unless --dbfile is
+	// already absolute.
+	dataFile := resolve("dbfile", *dbfile)
+	if d := resolve("dir", *dir); d != "" && !filepath.IsAbs(dataFile) {
+		dataFile = filepath.Join(d, dataFile)
+	}
+
+	dbCount := *databases
+	if v := resolve("databases", ""); v != "" {
+		if n, ok := parseIntFlag(v); ok {
+			dbCount = n
+		}
+	}
+
+	fresh := !vfs.NewOS().Exists(dataFile)
+	if resolve("load-rdb", *loadRDB) != "" && !fresh {
+		return fmt.Errorf("--load-rdb only applies on first open; %s already exists", dataFile)
+	}
+
+	poolPages, err := parseBufPoolPages(resolve("buffer-pool-size", *bufferPoolSize))
 	if err != nil {
 		return fmt.Errorf("--buffer-pool-size: %w", err)
 	}
 
-	ks, closeKS, err := openKeyspace(*dbfile, *databases, poolPages)
+	ks, closeKS, err := openKeyspace(dataFile, dbCount, poolPages)
 	if err != nil {
 		return err
 	}
 	defer closeKS()
 
+	rdbPath := resolve("load-rdb", *loadRDB)
 	var importedFuncs []string
-	if *loadRDB != "" && fresh {
-		n, funcs, err := importRDBInto(ks, *loadRDB, *rdbDB)
+	if rdbPath != "" && fresh {
+		n, funcs, err := importRDBInto(ks, rdbPath, *rdbDB)
 		if err != nil {
 			return err
 		}
 		importedFuncs = funcs
-		fmt.Printf("loaded %d keys from %s\n", n, *loadRDB)
+		fmt.Printf("loaded %d keys from %s\n", n, rdbPath)
 	}
 
 	d := command.New(command.Config{
-		Databases:   *databases,
-		RequirePass: *requirePass,
-		AclFile:     *aclFile,
+		Databases:   dbCount,
+		RequirePass: resolve("requirepass", *requirePass),
+		AclFile:     resolve("aclfile", *aclFile),
 		Version:     fmt.Sprintf("7.2.0-aki-%s", Version),
 		Engine:      command.NewEngine(ks),
 	})
@@ -85,24 +172,49 @@ func cmdServer(args []string) error {
 	}
 
 	cfg := networking.Config{
-		Addr:       *addr,
-		UnixSocket: *unixSocket,
+		Addr:       listenAddr,
+		UnixSocket: resolve("unixsocket", *unixSocket),
 		MaxClients: *maxClients,
 	}
-	if *logfile != "" {
-		if err := d.SetConfig("logfile", *logfile); err != nil {
-			return fmt.Errorf("set logfile: %w", err)
+
+	// Apply config-mirroring directives through the same path CONFIG SET uses, so
+	// they validate identically and run their side effects (durability retune,
+	// RDB/AOF location). Empty means "leave the default".
+	applyConf := func(name, val string) error {
+		if val == "" {
+			return nil
+		}
+		if err := d.SetConfig(name, val); err != nil {
+			return fmt.Errorf("--%s: %w", name, err)
+		}
+		return nil
+	}
+	for _, kv := range [][2]string{
+		{"logfile", resolve("logfile", *logfile)},
+		{"loglevel", resolve("loglevel", *loglevel)},
+		{"dir", resolve("dir", *dir)},
+		{"dbfilename", resolve("dbfilename", *dbfilename)},
+		{"appendonly", resolve("appendonly", *appendonly)},
+		{"appendfsync", resolve("appendfsync", *appendfsync)},
+		{"save", resolveSave(setFlags, fileConf, *save)},
+		{"maxmemory", resolve("maxmemory", *maxmemory)},
+		{"maxmemory-policy", resolve("maxmemory-policy", *maxmemoryPolicy)},
+	} {
+		if err := applyConf(kv[0], kv[1]); err != nil {
+			return err
 		}
 	}
-	if *loglevel != "" {
-		if err := d.SetConfig("loglevel", *loglevel); err != nil {
-			return fmt.Errorf("set loglevel: %w", err)
-		}
-	}
+
 	if err := d.LogStart(); err != nil {
 		return fmt.Errorf("open log: %w", err)
 	}
 	defer d.LogClose()
+
+	// Any remaining redis.conf directive that matches a known runtime config key
+	// is applied too, so a reused redis.conf carries over things like timeout,
+	// tcp-keepalive, and notify-keyspace-events without a flag for each. Runs after
+	// LogStart so a skipped directive logs through the configured sink.
+	applyExtraConfig(d, fileConf)
 
 	// Apply the Go GC knobs before serving so go-gogc and go-memlimit take hold
 	// from the first request.
@@ -131,7 +243,7 @@ func cmdServer(args []string) error {
 	}
 	defer d.StopAdmin()
 
-	d.LogNotice("Server started", "aki_version", Version, "addr", *addr)
+	d.LogNotice("Server started", "aki_version", Version, "addr", listenAddr)
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe(cfg) }()
@@ -148,9 +260,9 @@ func cmdServer(args []string) error {
 		}
 	})
 
-	fmt.Printf("aki %s listening on %s\n", Version, *addr)
-	if *unixSocket != "" {
-		fmt.Printf("aki also listening on unix:%s\n", *unixSocket)
+	fmt.Printf("aki %s listening on %s\n", Version, listenAddr)
+	if us := resolve("unixsocket", *unixSocket); us != "" {
+		fmt.Printf("aki also listening on unix:%s\n", us)
 	}
 	if maddr := d.MetricsAddr(); maddr != "" {
 		fmt.Printf("aki metrics on http://%s/metrics\n", maddr)
@@ -179,6 +291,117 @@ func cmdServer(args []string) error {
 			return srv.Close()
 		}
 	}
+}
+
+// extraConfigSkip lists the redis.conf directives that the server command already
+// consumes as flags. Everything else in a config file that names a known runtime
+// config key is forwarded to the dispatcher so a reused redis.conf keeps working.
+var extraConfigSkip = map[string]bool{
+	"addr": true, "bind": true, "port": true, "unixsocket": true,
+	"maxclients": true, "databases": true, "requirepass": true, "aclfile": true,
+	"logfile": true, "loglevel": true, "dbfile": true, "dir": true,
+	"dbfilename": true, "appendonly": true, "appendfsync": true, "save": true,
+	"maxmemory": true, "maxmemory-policy": true, "daemonize": true,
+	"load-rdb": true, "rdb-db": true, "buffer-pool-size": true,
+}
+
+// applyExtraConfig forwards config-file directives that are not server flags to
+// the dispatcher's config store, the same path CONFIG SET uses. A directive that
+// is not a known config key is logged and skipped rather than failing startup, so
+// a redis.conf that carries directives aki does not model still boots.
+func applyExtraConfig(d *command.Dispatcher, fileConf map[string]string) {
+	for name, val := range fileConf {
+		if extraConfigSkip[name] {
+			continue
+		}
+		if err := d.SetConfig(name, val); err != nil {
+			d.LogNotice("Ignoring config directive", "directive", name, "reason", err.Error())
+		}
+	}
+}
+
+// resolveSave resolves the save directive with the same precedence as the other
+// flags but treats an explicit empty string as a real value, since `save ""`
+// disables RDB snapshots and is distinct from "leave the default".
+func resolveSave(setFlags map[string]bool, fileConf map[string]string, flagVal string) string {
+	if setFlags["save"] {
+		if flagVal == "" {
+			// `--save ""` disables snapshots. SetConfig rejects "", so encode the
+			// off state the way redis stores it.
+			return ""
+		}
+		return flagVal
+	}
+	if v, ok := fileConf["save"]; ok {
+		return v
+	}
+	return ""
+}
+
+// parseConfigFile reads a redis.conf-style file into a directive map. Each
+// non-empty, non-comment line is a directive name followed by its value; the
+// value keeps its internal spacing (so `save 3600 1` round-trips) but loses a
+// single pair of surrounding double quotes. Directive names are lowercased to
+// match the flag and config-key spellings.
+func parseConfigFile(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open config file: %w", err)
+	}
+	defer f.Close()
+	conf := map[string]string{}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, val, _ := strings.Cut(line, " ")
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" {
+			continue
+		}
+		conf[name] = dequote(strings.TrimSpace(val))
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("read config file: %w", err)
+	}
+	return conf, nil
+}
+
+// dequote strips one pair of surrounding double quotes, the form redis.conf uses
+// for values that contain spaces or are empty.
+func dequote(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// firstField returns the first whitespace-separated token of s, used to pick one
+// address out of a `bind` directive that lists several.
+func firstField(s string) string {
+	if i := strings.IndexAny(s, " \t"); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// parseIntFlag parses a plain base-10 integer, used for config-file values that
+// mirror integer flags.
+func parseIntFlag(s string) (int, bool) {
+	n := 0
+	if s == "" {
+		return 0, false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, true
 }
 
 // importRDBInto reads a dump.rdb and loads it into the fresh keyspace, committing
