@@ -1,6 +1,31 @@
 package resp
 
-import "strconv"
+
+// parseDecimal parses a signed decimal integer from a byte slice without
+// converting to string, avoiding the allocation that strconv.ParseInt(string(b), 10, 64) would make.
+func parseDecimal(b []byte) (int64, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	neg := b[0] == '-'
+	if neg {
+		b = b[1:]
+		if len(b) == 0 {
+			return 0, false
+		}
+	}
+	var n int64
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int64(c-'0')
+	}
+	if neg {
+		return -n, true
+	}
+	return n, true
+}
 
 // ParseRequest extracts one client command from a query buffer. Client commands
 // arrive either as a multibulk frame (every real client library) or as an inline
@@ -18,7 +43,13 @@ import "strconv"
 //
 // maxBulkLen caps a single bulk argument (proto-max-bulk-len); pass
 // DefaultMaxBulkLen for the default 512 MiB.
-func ParseRequest(buf []byte, pos int, maxBulkLen int64) ([][]byte, int, error) {
+//
+// dst is an optional pre-allocated backing slice for the argument vector.
+// When the command's argument count fits in cap(dst), ParseRequest uses dst
+// as the backing array and avoids a heap allocation. Pass nil to always
+// allocate. The networking layer passes a per-connection buffer here to
+// eliminate the argv allocation on the common path.
+func ParseRequest(buf []byte, pos int, maxBulkLen int64, dst [][]byte) ([][]byte, int, error) {
 	if pos >= len(buf) {
 		return nil, pos, ErrNeedMore
 	}
@@ -36,7 +67,7 @@ func ParseRequest(buf []byte, pos int, maxBulkLen int64) ([][]byte, int, error) 
 		}
 		return nil, pos + 1, nil
 	case '*':
-		return parseMultibulk(buf, pos, maxBulkLen)
+		return parseMultibulk(buf, pos, maxBulkLen, dst)
 	default:
 		return ParseInline(buf, pos)
 	}
@@ -45,14 +76,18 @@ func ParseRequest(buf []byte, pos int, maxBulkLen int64) ([][]byte, int, error) 
 // parseMultibulk parses a "*<argc>\r\n" header followed by argc "$<len>\r\n<data>\r\n"
 // bulk elements. Every element must be a bulk string; any other leading byte is
 // the "expected '$', got 'X'" fatal error.
-func parseMultibulk(buf []byte, pos int, maxBulkLen int64) ([][]byte, int, error) {
+//
+// dst is an optional pre-allocated backing slice; the returned args uses it when
+// argc ≤ cap(dst), avoiding a heap allocation for the common case. Pass nil to
+// always allocate.
+func parseMultibulk(buf []byte, pos int, maxBulkLen int64, dst [][]byte) ([][]byte, int, error) {
 	start := pos
 	line, p, err := readLine(buf, pos+1) // skip '*'
 	if err != nil {
 		return nil, start, err
 	}
-	argc, perr := strconv.ParseInt(string(line), 10, 64)
-	if perr != nil || argc < -1 {
+	argc, ok := parseDecimal(line)
+	if !ok || argc < -1 {
 		return nil, start, ErrProtocol("invalid multibulk length")
 	}
 	if argc <= 0 {
@@ -62,7 +97,13 @@ func parseMultibulk(buf []byte, pos int, maxBulkLen int64) ([][]byte, int, error
 	if argc > MaxMultibulkLen {
 		return nil, start, ErrProtocol("invalid multibulk length")
 	}
-	args := make([][]byte, 0, argc)
+	// Use the caller-supplied backing slice when it fits; otherwise allocate.
+	var args [][]byte
+	if int(argc) <= cap(dst) {
+		args = dst[:0]
+	} else {
+		args = make([][]byte, 0, argc)
+	}
 	for range argc {
 		if p >= len(buf) {
 			return nil, start, ErrNeedMore
@@ -74,8 +115,8 @@ func parseMultibulk(buf []byte, pos int, maxBulkLen int64) ([][]byte, int, error
 		if err != nil {
 			return nil, start, err
 		}
-		blen, lerr := strconv.ParseInt(string(lenLine), 10, 64)
-		if lerr != nil || blen < 0 {
+		blen, ok := parseDecimal(lenLine)
+		if !ok || blen < 0 {
 			return nil, start, ErrProtocol("invalid bulk length")
 		}
 		if blen > maxBulkLen {
@@ -87,7 +128,7 @@ func parseMultibulk(buf []byte, pos int, maxBulkLen int64) ([][]byte, int, error
 		if buf[dataPos+int(blen)] != '\r' || buf[dataPos+int(blen)+1] != '\n' {
 			return nil, start, ErrProtocol("invalid bulk string CRLF")
 		}
-		args = append(args, cloneBytes(buf[dataPos:dataPos+int(blen)]))
+		args = append(args, buf[dataPos:dataPos+int(blen)])
 		p = dataPos + int(blen) + 2
 	}
 	return args, p, nil

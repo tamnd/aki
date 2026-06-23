@@ -1,7 +1,6 @@
 package networking
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"net"
@@ -261,7 +260,6 @@ func (s *Server) onAccept(nc net.Conn) {
 	c := &Conn{
 		server:          s,
 		raw:             nc,
-		br:              bufio.NewReaderSize(nc, readChunk),
 		id:              id,
 		addr:            addrString(nc.RemoteAddr()),
 		laddr:           addrString(nc.LocalAddr()),
