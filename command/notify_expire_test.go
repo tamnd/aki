@@ -19,10 +19,12 @@ func TestNotifyExpiredLazyGet(t *testing.T) {
 	if got := sendLine(t, r1, c1, "CONFIG SET notify-keyspace-events KEA"); got != "+OK" {
 		t.Fatalf("CONFIG SET = %q", got)
 	}
-	if got := sendLine(t, r1, c1, "SET k v PX 1"); got != "+OK" {
+	// Use PX 200 so the key outlives any reasonable command-path latency on slow
+	// CI runners (a PX 1 TTL can expire before db.set runs the B-tree write).
+	if got := sendLine(t, r1, c1, "SET k v PX 200"); got != "+OK" {
 		t.Fatalf("SET = %q", got)
 	}
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 
 	// GET returns nil for the expired key.
 	if got := sendLine(t, r1, c1, "GET k"); got != "$-1" {
@@ -46,12 +48,14 @@ func TestNotifyExpiredKeyspaceForm(t *testing.T) {
 	if got := sendLine(t, r1, c1, "CONFIG SET notify-keyspace-events KEA"); got != "+OK" {
 		t.Fatalf("CONFIG SET = %q", got)
 	}
-	if got := sendLine(t, r1, c1, "SET k v PX 1"); got != "+OK" {
+	// Use PX 200 so the key outlives any reasonable command-path latency on slow
+	// CI runners (a PX 1 TTL can expire before db.set runs the B-tree write).
+	if got := sendLine(t, r1, c1, "SET k v PX 200"); got != "+OK" {
 		t.Fatalf("SET = %q", got)
 	}
 	// Drain the keyspace event from the SET itself.
 	_ = readResp(t, r2)
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 
 	if got := sendLine(t, r1, c1, "EXISTS k"); got != ":0" {
 		t.Fatalf("EXISTS = %q want :0", got)
