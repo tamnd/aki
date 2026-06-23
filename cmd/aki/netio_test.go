@@ -16,7 +16,10 @@ import (
 )
 
 // startServer brings up an in-memory aki server and returns the address it bound
-// to. It is the harness for the networked dump and import tests.
+// to. It is the harness for the networked dump, import, and benchmark tests.
+// Cleanup order matches the production shutdown sequence: background worker stops
+// first so pending writes drain, then the network closes, then the pager closes.
+// t.Cleanup runs in LIFO order, so we register in the reverse of that sequence.
 func startServer(t testing.TB) string {
 	t.Helper()
 	fs := vfs.NewMem()
@@ -24,7 +27,7 @@ func startServer(t testing.TB) string {
 	if err != nil {
 		t.Fatalf("create pager: %v", err)
 	}
-	t.Cleanup(func() { _ = p.Close() })
+	t.Cleanup(func() { _ = p.Close() }) // runs last
 	ks, err := keyspace.Open(p)
 	if err != nil {
 		t.Fatalf("open keyspace: %v", err)
@@ -35,7 +38,9 @@ func startServer(t testing.TB) string {
 	srv := networking.New(ncfg, d)
 	d.SetServer(srv)
 	go func() { _ = srv.ListenAndServe(ncfg) }()
-	t.Cleanup(func() { _ = srv.Close() })
+	t.Cleanup(func() { _ = srv.Close() }) // runs second-to-last
+	d.StartBackground()
+	t.Cleanup(d.StopBackground) // runs first: drains write worker + force-commits
 
 	deadline := time.Now().Add(2 * time.Second)
 	for srv.Addr() == nil {
