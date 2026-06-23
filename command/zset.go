@@ -251,6 +251,15 @@ func handleZIncrBy(ctx *Ctx) {
 
 // handleZScore implements ZSCORE key member.
 func handleZScore(ctx *Ctx) {
+	if members, ok := hotGetZSet(ctx, ctx.Argv[1]); ok {
+		if idx := zsetFind(members, ctx.Argv[2]); idx >= 0 {
+			ctx.enc().WriteDouble(members[idx].score)
+		} else {
+			ctx.enc().WriteNull()
+		}
+		return
+	}
+
 	var (
 		wrongTyp bool
 		score    float64
@@ -287,6 +296,20 @@ func handleZScore(ctx *Ctx) {
 // handleZMScore implements ZMSCORE key member [member ...].
 func handleZMScore(ctx *Ctx) {
 	queries := ctx.Argv[2:]
+
+	if members, ok := hotGetZSet(ctx, ctx.Argv[1]); ok {
+		enc := ctx.enc()
+		enc.WriteArrayLen(len(queries))
+		for _, q := range queries {
+			if idx := zsetFind(members, q); idx >= 0 {
+				enc.WriteDouble(members[idx].score)
+			} else {
+				enc.WriteNull()
+			}
+		}
+		return
+	}
+
 	var (
 		wrongTyp bool
 		scores   []float64
@@ -330,6 +353,11 @@ func handleZMScore(ctx *Ctx) {
 
 // handleZCard implements ZCARD key.
 func handleZCard(ctx *Ctx) {
+	if members, ok := hotGetZSet(ctx, ctx.Argv[1]); ok {
+		ctx.enc().WriteInteger(int64(len(members)))
+		return
+	}
+
 	var (
 		wrongTyp bool
 		n        int64

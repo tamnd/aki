@@ -444,6 +444,9 @@ func handleSMove(ctx *Ctx) {
 // members, whether the key held a non-set, and whether the view succeeded. A
 // missing key yields no members and no wrong-type flag.
 func readSet(ctx *Ctx, key []byte) (members [][]byte, wrongTyp bool, ok bool) {
+	if ms, hit := hotGetSet(ctx, key); hit {
+		return ms, false, true
+	}
 	ok = ctx.view(func(db *keyspace.DB) error {
 		ms, hdr, found, err := getSet(db, key)
 		if err != nil {
