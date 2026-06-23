@@ -154,6 +154,12 @@ func (d *Dispatcher) LogNotice(msg string, kv ...any) {
 	d.logNotice(msg, pairFields(kv)...)
 }
 
+// LogWarn writes a warning line, taking alternating key value pairs like
+// LogNotice. The background commit paths use it to surface a failed checkpoint.
+func (d *Dispatcher) LogWarn(msg string, kv ...any) {
+	d.logWarning(msg, pairFields(kv)...)
+}
+
 // SetConfig validates and applies one directive the same way CONFIG SET does, then
 // runs its side effects. The server command uses it to apply command-line flags
 // like logfile and loglevel before logging starts.
