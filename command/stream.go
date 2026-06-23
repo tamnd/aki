@@ -281,7 +281,7 @@ func handleXAdd(ctx *Ctx) {
 		replyErr string
 		trimmed  bool
 	)
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(key, func(db *keyspace.DB) error {
 		s, hdr, found, err := getStream(db, key)
 		if err != nil {
 			return err
@@ -513,7 +513,7 @@ func handleXDel(ctx *Ctx) {
 		deleted  int64
 		wrongTyp bool
 	)
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(argv[1], func(db *keyspace.DB) error {
 		s, hdr, found, err := getStream(db, argv[1])
 		if err != nil {
 			return err
@@ -747,7 +747,7 @@ func handleXTrim(ctx *Ctx) {
 		removed  int64
 		wrongTyp bool
 	)
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(argv[1], func(db *keyspace.DB) error {
 		s, hdr, found, err := getStream(db, argv[1])
 		if err != nil {
 			return err
@@ -832,7 +832,7 @@ func handleXSetID(ctx *Ctx) {
 		noKey    bool
 		tooSmall bool
 	)
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(argv[1], func(db *keyspace.DB) error {
 		s, hdr, found, err := getStream(db, argv[1])
 		if err != nil {
 			return err
