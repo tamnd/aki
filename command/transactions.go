@@ -88,7 +88,14 @@ func (d *Dispatcher) queueCommand(c *networking.Conn, sess *session, name string
 		c.Enc().WriteError(msg)
 		return
 	}
-	sess.queue = append(sess.queue, queuedCmd{cmd: cmd, argv: argv})
+	// argv slices into the connection's query buffer, which is compacted after
+	// the current drain loop. Copy every element so the stored argv is stable
+	// across subsequent reads.
+	saved := make([][]byte, len(argv))
+	for i, a := range argv {
+		saved[i] = bytes.Clone(a)
+	}
+	sess.queue = append(sess.queue, queuedCmd{cmd: cmd, argv: saved})
 	c.WriteRaw(resp.ReplyQueued)
 }
 

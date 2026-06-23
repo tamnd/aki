@@ -6,7 +6,6 @@
 package networking
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"net"
@@ -53,7 +52,6 @@ const readChunk = 16 * 1024
 type Conn struct {
 	server *Server
 	raw    net.Conn
-	br     *bufio.Reader
 
 	id    uint64
 	addr  string
@@ -63,8 +61,9 @@ type Conn struct {
 	// parse offset within it. Consumed bytes are compacted off the front before
 	// each socket read so the buffer does not grow without bound across a long
 	// pipeline.
-	qbuf []byte
-	pos  int
+	qbuf    []byte
+	pos     int
+	argvBuf [8][]byte // pre-allocated backing for the common ≤8-argument command
 
 	// Output buffer and the encoder that writes framed replies into it. One
 	// flush per pipeline batch sends it to the socket.
@@ -98,6 +97,13 @@ type Conn struct {
 	// server flips on shutdown or CLIENT KILL.
 	closeAfterReply bool
 	closed          atomic.Bool
+
+	// armedDeadline is the last read deadline we set on the socket. When
+	// idle-timeout is enabled, fill() compares the next desired deadline
+	// against this value and skips the setsockopt syscall when the clock
+	// has moved by less than a quarter of the idle period, keeping steady
+	// traffic cheap without meaningfully relaxing the timeout precision.
+	armedDeadline time.Time
 
 	// closedCh is closed once, by CloseASAP, so a goroutine parked on this
 	// connection (a client blocked in BLPOP and friends) wakes when the server
@@ -279,7 +285,7 @@ func (c *Conn) overQueryBufLimit() bool {
 // reported, or QUIT asked to close).
 func (c *Conn) drain() bool {
 	for {
-		argv, n, err := resp.ParseRequest(c.qbuf, c.pos, c.server.MaxBulkLen())
+		argv, n, err := resp.ParseRequest(c.qbuf, c.pos, c.server.MaxBulkLen(), c.argvBuf[:])
 		if errors.Is(err, resp.ErrNeedMore) {
 			return false
 		}
@@ -309,17 +315,34 @@ func (c *Conn) drain() bool {
 }
 
 // compact drops the consumed prefix of the query buffer so a long pipeline does
-// not leave already-parsed bytes pinned in memory.
+// not leave already-parsed bytes pinned in memory. It also shrinks a large
+// buffer that most of its capacity idle: a connection that processed one huge
+// pipeline and now sits quiet would otherwise hold megabytes in reserve forever.
 func (c *Conn) compact() {
 	if c.pos == 0 {
 		return
 	}
 	remaining := len(c.qbuf) - c.pos
 	if remaining == 0 {
-		c.qbuf = c.qbuf[:0]
+		// Shrink an oversized buffer back to readChunk so a bursty connection
+		// does not permanently occupy several times the default capacity.
+		if cap(c.qbuf) > 64*1024 {
+			c.qbuf = make([]byte, 0, readChunk)
+		} else {
+			c.qbuf = c.qbuf[:0]
+		}
 	} else {
-		copy(c.qbuf, c.qbuf[c.pos:])
-		c.qbuf = c.qbuf[:remaining]
+		if cap(c.qbuf) > 64*1024 && remaining < cap(c.qbuf)/4 {
+			// Most of the buffer is consumed and the live tail is small; copy
+			// it into a fresh readChunk-sized buffer rather than keeping the
+			// big allocation around.
+			fresh := make([]byte, remaining, readChunk)
+			copy(fresh, c.qbuf[c.pos:])
+			c.qbuf = fresh
+		} else {
+			copy(c.qbuf, c.qbuf[c.pos:])
+			c.qbuf = c.qbuf[:remaining]
+		}
 	}
 	c.pos = 0
 }
@@ -332,7 +355,13 @@ func (c *Conn) fill() error {
 		return net.ErrClosed
 	}
 	if to := c.server.IdleTimeout(); to > 0 {
-		_ = c.raw.SetReadDeadline(c.server.now().Add(to))
+		dl := c.server.now().Add(to)
+		// Only re-arm the deadline if it has moved by more than a quarter of
+		// the idle period, so steady traffic does not pay a setsockopt per read.
+		if dl.Sub(c.armedDeadline) > to/4 {
+			_ = c.raw.SetReadDeadline(dl)
+			c.armedDeadline = dl
+		}
 	}
 	start := len(c.qbuf)
 	if cap(c.qbuf)-start < readChunk {
@@ -341,7 +370,7 @@ func (c *Conn) fill() error {
 		c.qbuf = grown
 	}
 	c.qbuf = c.qbuf[:start+readChunk]
-	nr, err := c.br.Read(c.qbuf[start:])
+	nr, err := c.raw.Read(c.qbuf[start:])
 	c.qbuf = c.qbuf[:start+nr]
 	if nr > 0 {
 		c.totNetIn += uint64(nr)
