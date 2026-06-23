@@ -340,3 +340,27 @@ func BenchmarkE2ESet(b *testing.B) {
 	}
 	b.ReportMetric(run.throughput(), "ops/s")
 }
+
+// BenchmarkE2ESetPipelined measures pipelined SET throughput at concurrency=50
+// and pipeline depth=16. Pipelining amortizes the TCP round trip cost over 16
+// commands, which should show how much network overhead limits non-pipelined SET.
+func BenchmarkE2ESetPipelined(b *testing.B) {
+	addr := startServer(b)
+	cfg := benchConfig{
+		addr:     addr,
+		clients:  50,
+		requests: b.N,
+		pipeline: 16,
+		keyspace: 1000,
+		dataSize: 8,
+		workload: "set",
+		access:   "uniform",
+		warmup:   0,
+		format:   "text",
+	}
+	run, err := runBench(cfg)
+	if err != nil {
+		b.Fatalf("runBench: %v", err)
+	}
+	b.ReportMetric(run.throughput(), "ops/s")
+}

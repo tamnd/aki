@@ -542,9 +542,19 @@ func (e *Engine) filePath() string {
 // qbuf may be reused before the async B-tree write runs. len(body) must be at
 // most keyspace.MaxInlineBody; the caller must verify this before calling.
 //
-// updateWriteBehind assigns the write version atomically under the engine read
-// lock and stores it in the hot-value cache and the write-behind pending table
-// so any subsequent read sees the new value immediately, even on a cache miss.
+// updateWriteBehind stages the write in the hot-value cache and the
+// write-behind pending table, then fires the B-tree write to the write worker
+// without taking the engine lock. The lock is not needed here because:
+//
+//   - ks.DB() reads from a slice that is set once at Open and never resized.
+//   - ks.NextVersion() is an atomic increment.
+//   - PrepareWriteBehind uses its own shard and wbMu mutexes.
+//
+// The write worker still holds e.mu.Lock during batch processing, so
+// dropping the RLock from this path removes the lock-contention bottleneck
+// that previously blocked connection goroutines whenever the write worker was
+// active.
+//
 // If the write worker channel is full or the policy is commitAlways, it falls
 // back to the synchronous update path to preserve durability and apply
 // back-pressure. The caller must have confirmed e.isDeferred() before calling.
@@ -554,33 +564,25 @@ func (ctx *Ctx) updateWriteBehind(key, body []byte, typ, enc uint8, ttlMs int64)
 		return false
 	}
 	e := ctx.d.engine
-	var version uint64
-	var err error
-	e.mu.RLock()
 	db, dbErr := e.ks.DB(ctx.Conn.DB())
-	if dbErr == nil {
-		version = e.ks.NextVersion()
-		hdr := keyspace.ValueHeader{
-			Type:     typ,
-			Encoding: enc,
-			TTLms:    ttlMs,
-			Version:  version,
-			BodyLen:  uint32(len(body)),
-			RefCount: 1,
-			Flags:    keyspace.FlagInlineBody,
-		}
-		if ttlMs >= 0 {
-			hdr.Flags |= keyspace.FlagHasTTL
-		}
-		db.PrepareWriteBehind(key, body, hdr)
-	} else {
-		err = dbErr
-	}
-	e.mu.RUnlock()
-	if err != nil {
-		ctx.enc().WriteError("ERR " + err.Error())
+	if dbErr != nil {
+		ctx.enc().WriteError("ERR " + dbErr.Error())
 		return false
 	}
+	version := e.ks.NextVersion()
+	hdr := keyspace.ValueHeader{
+		Type:     typ,
+		Encoding: enc,
+		TTLms:    ttlMs,
+		Version:  version,
+		BodyLen:  uint32(len(body)),
+		RefCount: 1,
+		Flags:    keyspace.FlagInlineBody,
+	}
+	if ttlMs >= 0 {
+		hdr.Flags |= keyspace.FlagHasTTL
+	}
+	db.PrepareWriteBehind(key, body, hdr)
 	// Capture copies so the closure is safe after qbuf is compacted.
 	k, v, t, en, ttl, ver := key, body, typ, enc, ttlMs, version
 	if asyncErr := e.updateAsync(ctx.Conn.DB(), func(db *keyspace.DB) error {
