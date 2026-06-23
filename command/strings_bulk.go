@@ -25,6 +25,37 @@ func handleMSet(ctx *Ctx) {
 		ctx.enc().WriteError("ERR wrong number of arguments for 'mset' command")
 		return
 	}
+
+	// Write-behind fast path: dispatch each pair to its shard channel so all
+	// shards write in parallel. Only applies when the policy is deferred and
+	// every value fits inline (same constraint as the single-key SET fast path).
+	if ctx.d.engine != nil && ctx.d.engine.isDeferred() {
+		allInline := true
+		for i := 1; i < len(pairs); i += 2 {
+			if len(pairs[i]) > keyspace.MaxInlineBody {
+				allInline = false
+				break
+			}
+		}
+		if allInline {
+			for i := 0; i < len(pairs); i += 2 {
+				// Copy key and val: the request buffer is reused before the
+				// async B-tree write runs.
+				key := append([]byte(nil), pairs[i]...)
+				val := append([]byte(nil), pairs[i+1]...)
+				enc := stringEncoding(val)
+				if !ctx.updateWriteBehind(key, val, keyspace.TypeString, enc, -1) {
+					return
+				}
+			}
+			for i := 0; i < len(pairs); i += 2 {
+				ctx.notify(notifyString, "set", pairs[i])
+			}
+			ctx.Conn.WriteRaw(resp.ReplyOK)
+			return
+		}
+	}
+
 	if ctx.update(func(db *keyspace.DB) error {
 		for i := 0; i < len(pairs); i += 2 {
 			key, val := pairs[i], pairs[i+1]
