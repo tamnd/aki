@@ -51,7 +51,7 @@ func incrBy(ctx *Ctx, delta int64) {
 		overflow bool
 		result   int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		b, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
@@ -111,7 +111,7 @@ func handleIncrByFloat(ctx *Ctx) {
 		nanInf   bool
 		result   string
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		b, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err

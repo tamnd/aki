@@ -41,7 +41,7 @@ func handleHIncrBy(ctx *Ctx) {
 		overflow bool
 		result   int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		fields, hdr, found, err := getHash(db, key)
 		if err != nil {
 			return err
@@ -109,7 +109,7 @@ func handleHIncrByFloat(ctx *Ctx) {
 		nanInf   bool
 		result   string
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		fields, hdr, found, err := getHash(db, key)
 		if err != nil {
 			return err

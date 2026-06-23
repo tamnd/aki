@@ -50,7 +50,7 @@ func handleSAdd(ctx *Ctx) {
 		wrongTyp bool
 		added    int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		members, hdr, found, err := getSet(db, key)
 		if err != nil {
 			return err
@@ -97,7 +97,7 @@ func handleSRem(ctx *Ctx) {
 		emptied  bool
 		removed  int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		members, hdr, found, err := getSet(db, key)
 		if err != nil {
 			return err
@@ -241,7 +241,7 @@ func handleSPop(ctx *Ctx) {
 		emptied  bool
 		popped   [][]byte
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		members, hdr, found, err := getSet(db, key)
 		if err != nil {
 			return err
