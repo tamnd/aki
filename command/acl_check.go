@@ -16,8 +16,9 @@ import (
 
 // aclEnforce runs the full ACL check for a command about to execute. It returns
 // the error string to send the client, or "" when the command is allowed. It
-// logs any denial against the connection.
-func (d *Dispatcher) aclEnforce(c *networking.Conn, sess *session, cmd *CmdDesc, argv [][]byte) string {
+// logs any denial against the connection. name must be the lowercased command
+// name already computed by the dispatch path.
+func (d *Dispatcher) aclEnforce(c *networking.Conn, sess *session, cmd *CmdDesc, name string, argv [][]byte) string {
 	// An unauthenticated connection may only run no-auth commands.
 	if !sess.authenticated {
 		if cmd.Flags.Has(FlagNoAuth) {
@@ -30,7 +31,6 @@ func (d *Dispatcher) aclEnforce(c *networking.Conn, sess *session, cmd *CmdDesc,
 	if u == nil {
 		return ""
 	}
-	name := strings.ToLower(string(argv[0]))
 	if msg := aclCheckUser(d, u, cmd, name, argv); msg != "" {
 		reason := aclReasonFromMsg(msg)
 		object := cmd.Name
@@ -59,10 +59,15 @@ func aclCheckUser(d *Dispatcher, u *aclUser, cmd *CmdDesc, name string, argv [][
 	if cmd.Flags.Has(FlagWrite) {
 		access = aclWrite
 	}
-	if keys, ok := extractKeys(name, cmd, argv); ok {
-		for _, k := range keys {
-			if !aclKeyAllowed(u, string(k), access) {
-				return "NOPERM No permissions to access a key"
+	// Skip key extraction when the user has unrestricted key access (~*). This
+	// is the common case for the default user and avoids the extractKeys alloc
+	// on the hot dispatch path.
+	if !u.allKeys() {
+		if keys, ok := extractKeys(name, cmd, argv); ok {
+			for _, k := range keys {
+				if !aclKeyAllowed(u, string(k), access) {
+					return "NOPERM No permissions to access a key"
+				}
 			}
 		}
 	}
