@@ -123,7 +123,9 @@ func TestStartBackgroundExpiresKeys(t *testing.T) {
 		t.Fatalf("SET = %q", got)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	// 10 s covers the -race overhead in CI (race detection slows goroutine
+	// scheduling enough that the default 2 s is too tight).
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if got := sendLine(t, r1, c1, "DBSIZE"); got == ":0" {
 			break
