@@ -218,10 +218,36 @@ func (t *Tree) Put(key, val []byte) error {
 	return nil
 }
 
+// Upsert inserts or replaces key/val and returns the previous value stored
+// under key, or nil if key was not present. A single traversal finds the leaf
+// and captures the old value there, saving one Get traversal compared to a
+// separate lookup followed by Put.
+func (t *Tree) Upsert(key, val []byte) ([]byte, error) {
+	ar := nodeArenaPool.Get().(*nodeArena)
+	defer func() { ar.reset(); nodeArenaPool.Put(ar) }()
+	oldVal, sp, err := t.insertAr(t.root, key, val, ar)
+	if err != nil {
+		return nil, err
+	}
+	if sp != nil {
+		newRoot, err := t.writeNewNodeAr(&node{
+			leaf:     false,
+			keys:     [][]byte{sp.sepKey},
+			children: []uint32{t.root, sp.right},
+		}, ar)
+		if err != nil {
+			return nil, err
+		}
+		t.root = newRoot
+	}
+	assertInvariants(t)
+	return oldVal, nil
+}
+
 func (t *Tree) put(key, val []byte) error {
 	ar := nodeArenaPool.Get().(*nodeArena)
 	defer func() { ar.reset(); nodeArenaPool.Put(ar) }()
-	sp, err := t.insertAr(t.root, key, val, ar)
+	_, sp, err := t.insertAr(t.root, key, val, ar)
 	if err != nil {
 		return err
 	}
@@ -249,31 +275,36 @@ type splitResult struct {
 	right  uint32
 }
 
-// insertAr traverses the tree from pgno and inserts key/val, using ar to avoid per-cell heap allocations.
-func (t *Tree) insertAr(pgno uint32, key, val []byte, ar *nodeArena) (*splitResult, error) {
+// insertAr traverses the tree from pgno and inserts key/val, using ar to avoid
+// per-cell heap allocations. It returns the previous value stored under key
+// (or nil if key was absent) so callers can inspect or free the old value in
+// a single traversal without a separate Get.
+func (t *Tree) insertAr(pgno uint32, key, val []byte, ar *nodeArena) (oldVal []byte, sp *splitResult, err error) {
 	n, err := t.readNodeAr(pgno, ar)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if n.leaf {
-		n.upsertAr(key, val, ar)
-		return t.writeOrSplitAr(pgno, n, ar)
+		oldVal = n.upsertAr(key, val, ar)
+		sp, err = t.writeOrSplitAr(pgno, n, ar)
+		return
 	}
 
 	ci := n.childIndex(key)
-	sp, err := t.insertAr(n.children[ci], key, val, ar)
+	oldVal, sp, err = t.insertAr(n.children[ci], key, val, ar)
 	if err != nil {
-		return nil, err
+		return
 	}
 	if sp == nil {
-		return nil, nil
+		return
 	}
 	// Insert the new separator and child pointer at position ci.
 	// sepKey is already in the arena so no extra copy needed here.
 	n.keys = insertBytes(n.keys, ci, sp.sepKey)
 	n.children = insertU32(n.children, ci+1, sp.right)
-	return t.writeOrSplitAr(pgno, n, ar)
+	sp, err = t.writeOrSplitAr(pgno, n, ar)
+	return
 }
 
 // writeOrSplitAr writes n back to pgno if it fits, otherwise splits it. It uses ar for encoding and split
@@ -356,17 +387,21 @@ func (n *node) childIndex(key []byte) int {
 	return len(n.keys)
 }
 
-// upsertAr inserts key/val into a leaf in sorted order (or replaces the value if key is present),
-// copying key and val into ar instead of to the heap.
-func (n *node) upsertAr(key, val []byte, ar *nodeArena) {
+// upsertAr inserts key/val into a leaf in sorted order (or replaces the value
+// if key is present), copying key and val into ar. It returns the previous
+// value for key, or nil if the key was not present. The returned slice is a
+// heap-owned copy safe to use after ar is reset.
+func (n *node) upsertAr(key, val []byte, ar *nodeArena) (oldVal []byte) {
 	i, ok := n.find(key)
 	v := ar.copy(val)
 	if ok {
+		oldVal = bytes.Clone(n.vals[i])
 		n.vals[i] = v
 		return
 	}
 	n.keys = insertBytes(n.keys, i, ar.copy(key))
 	n.vals = insertBytes(n.vals, i, v)
+	return nil
 }
 
 // splitAr divides a full node into a lower and upper half. Keys are already in ar.buf so no copy is needed;
