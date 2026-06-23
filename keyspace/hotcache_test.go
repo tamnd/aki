@@ -82,19 +82,19 @@ func TestHotCachePeekDoesNotPopulate(t *testing.T) {
 
 	_ = db.Set([]byte("k"), []byte("v"), TypeString, EncRaw, -1)
 	// Set populates the hot cache for inline values.
-	if _, _, ok := db.hc.Load().cget("k"); !ok {
+	if _, _, ok := db.hc.Load().cget([]byte("k")); !ok {
 		t.Fatal("Set must populate the hot cache for inline values")
 	}
 
 	// Evict the entry to test Peek's non-populating property in isolation.
-	db.hc.Load().cinvalidate("k")
+	db.hc.Load().cinvalidate([]byte("k"))
 
 	// Peek should not re-populate the cache.
 	b, _, found, _ := db.Peek([]byte("k"))
 	if !found || string(b) != "v" {
 		t.Fatalf("Peek = %q found=%v", b, found)
 	}
-	if _, _, ok := db.hc.Load().cget("k"); ok {
+	if _, _, ok := db.hc.Load().cget([]byte("k")); ok {
 		t.Fatal("Peek must not populate the hot cache")
 	}
 
@@ -103,7 +103,7 @@ func TestHotCachePeekDoesNotPopulate(t *testing.T) {
 	if !found || string(b) != "v" {
 		t.Fatalf("Get after Peek = %q found=%v", b, found)
 	}
-	if _, _, ok := db.hc.Load().cget("k"); !ok {
+	if _, _, ok := db.hc.Load().cget([]byte("k")); !ok {
 		t.Fatal("Get must populate the hot cache")
 	}
 }

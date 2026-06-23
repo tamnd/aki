@@ -187,7 +187,7 @@ type DB struct {
 	// accessMu guards access independently of the engine lock so concurrent reads
 	// can update eviction bookkeeping without serializing on the write lock.
 	accessMu sync.Mutex
-	access   map[string]keyAccess
+	access   map[string]*keyAccess
 
 	// hc is the hot-value cache for this database. A Get on a cached key returns
 	// the body and header without walking the B-tree. Set and Delete invalidate
@@ -431,7 +431,7 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 	if h.Flags&FlagInlineBody != 0 {
 		db.hc.Load().cput(sk, cell[HeaderSize:], h)
 	} else {
-		db.hc.Load().cinvalidate(sk)
+		db.hc.Load().cinvalidate(key)
 	}
 	if preVersion > 0 {
 		db.removeWBPending(sk, preVersion)
@@ -499,8 +499,11 @@ func (db *DB) getWBPending(key string) ([]byte, ValueHeader, bool) {
 // are valid under Redis's linearizability model — the operation simply resolves
 // before or after the flush/swap.
 func (db *DB) HotGet(key []byte) (body []byte, hdr ValueHeader, found bool) {
-	sk := string(key)
-	b, h, ok := db.hc.Load().cget(sk)
+	// cget takes []byte and uses string(key) directly for the map lookup, which
+	// the Go compiler optimizes to a temporary — zero allocations. cget also
+	// updates the entry's atime atomically so the eviction sampler sees a fresh
+	// timestamp without us taking any lock here.
+	b, h, ok := db.hc.Load().cget(key)
 	if !ok {
 		return nil, ValueHeader{}, false
 	}
@@ -508,9 +511,12 @@ func (db *DB) HotGet(key []byte) (body []byte, hdr ValueHeader, found bool) {
 		// Entry expired after we cached it; invalidate so the next active
 		// expiry cycle handles the B-tree deletion. Return not-found rather than
 		// clearing it here — we do not have the write lock.
-		db.hc.Load().cinvalidate(sk)
+		db.hc.Load().cinvalidate(key)
 		return nil, ValueHeader{}, false
 	}
+	// cget already updated the hot-cache entry's atime atomically. recordAccess
+	// is still called to keep the LFU frequency counter current so OBJECT FREQ
+	// and LFU eviction remain accurate for hot-cache hits.
 	db.recordAccess(key, false)
 	return b, h, true
 }
@@ -539,19 +545,24 @@ func (db *DB) Peek(key []byte) (body []byte, hdr ValueHeader, found bool, err er
 // a hit is always fresh. Peek skips the cache so introspection commands (OBJECT,
 // EXISTS) do not promote keys or produce stale TTL observations.
 func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found bool, err error) {
-	sk := string(key)
+	// Hot-cache check comes before the string conversion: cget and cinvalidate
+	// take []byte and do the map op with string(key) as a compiler-elided
+	// temporary, so a hot hit returns without any heap allocation.
 	if touch {
-		if b, h, ok := db.hc.Load().cget(sk); ok {
+		if b, h, ok := db.hc.Load().cget(key); ok {
 			if db.expired(h) {
 				// The entry expired after we cached it. Invalidate so the next
 				// active expiry cycle handles the B-tree deletion.
-				db.hc.Load().cinvalidate(sk)
+				db.hc.Load().cinvalidate(key)
 				return nil, ValueHeader{}, false, nil
 			}
 			db.recordAccess(key, false)
 			return b, h, true, nil
 		}
 	}
+	// String conversion deferred to here: on a hot-cache hit the allocation
+	// never happens. The wbPending map and B-tree paths need the string key.
+	sk := string(key)
 	// Check the write-behind pending table before falling through to the B-tree.
 	// The async write worker may not have applied the B-tree write yet, so the
 	// B-tree could still hold the old value. wbPending always has the latest.
@@ -594,7 +605,7 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 		copy(out, cell)
 	}
 	if touch {
-		db.hc.Load().cput(string(key), out, h)
+		db.hc.Load().cput(sk, out, h)
 	}
 	return out, h, true, nil
 }
@@ -626,7 +637,7 @@ func (db *DB) Delete(key []byte) (bool, error) {
 		db.keyCount--
 		db.ks.dataBytes -= int64(len(key)) + int64(prev.BodyLen) + entryOverhead
 		db.dropAccess(key)
-		db.hc.Load().cinvalidate(string(key))
+		db.hc.Load().cinvalidate(key)
 		if prev.HasTTL() {
 			db.expireCount--
 		}

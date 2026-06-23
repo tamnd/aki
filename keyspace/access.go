@@ -33,24 +33,36 @@ func nowMinutes() uint32 { return uint32(nowMillis() / 60000) }
 // a fresh key is not the instant eviction victim.
 // accessMu guards the access map so concurrent reads can update eviction
 // bookkeeping without blocking on the engine write lock.
+//
+// db.access stores *keyAccess so updates to existing entries can go through the
+// pointer without a map assignment. This keeps the steady-state hot-key path
+// at zero heap allocations: string(key) is used as a temporary for map lookup
+// (compiler optimization, no alloc), and the value is updated via the returned
+// pointer without touching the map again.
 func (db *DB) recordAccess(key []byte, isNew bool) {
 	db.accessMu.Lock()
 	defer db.accessMu.Unlock()
 	if db.access == nil {
-		db.access = make(map[string]keyAccess)
+		db.access = make(map[string]*keyAccess)
 	}
-	k := string(key)
 	if isNew {
-		db.access[k] = keyAccess{atime: nowSeconds(), freq: lfuInitVal, decr: nowMinutes()}
+		k := string(key)
+		db.access[k] = &keyAccess{atime: nowSeconds(), freq: lfuInitVal, decr: nowMinutes()}
 		return
 	}
-	a, ok := db.access[k]
-	if !ok {
-		a = keyAccess{freq: lfuInitVal, decr: nowMinutes()}
+	// map index with string([]byte) is a compiler-optimized temporary: 0 alloc.
+	a := db.access[string(key)]
+	if a == nil {
+		// First read of a key that was never written to this DB (e.g., a key that
+		// arrived via replication without a local write). Seed the entry.
+		k := string(key)
+		a = &keyAccess{freq: lfuInitVal, decr: nowMinutes()}
+		db.access[k] = a
 	}
+	// Update through the pointer: no map assignment, no string allocation.
 	a.atime = nowSeconds()
-	a = db.lfuIncr(db.lfuDecay(a))
-	db.access[k] = a
+	decayed := db.lfuDecay(*a)
+	*a = db.lfuIncr(decayed)
 }
 
 // dropAccess forgets a key's bookkeeping when it is deleted or evicted.
@@ -103,8 +115,8 @@ func (db *DB) lfuIncr(a keyAccess) keyAccess {
 // Idle returns whole seconds since the key was last accessed, the OBJECT IDLETIME
 // answer. A key with no recorded access yet reports zero.
 func (db *DB) Idle(key []byte) uint32 {
-	a, ok := db.access[string(key)]
-	if !ok {
+	a := db.access[string(key)]
+	if a == nil {
 		return 0
 	}
 	now := nowSeconds()
@@ -118,31 +130,34 @@ func (db *DB) Idle(key []byte) uint32 {
 // computed for the read but not stored, since reading frequency is not itself an
 // access.
 func (db *DB) Freq(key []byte) uint8 {
-	a, ok := db.access[string(key)]
-	if !ok {
+	a := db.access[string(key)]
+	if a == nil {
 		return 0
 	}
-	return db.lfuDecay(a).freq
+	return db.lfuDecay(*a).freq
 }
 
 // SetIdle seeds a key's last-access time to idle seconds in the past, which is how
 // RESTORE IDLETIME reconstructs the LRU clock of a dumped key.
 func (db *DB) SetIdle(key []byte, idle uint32) {
 	if db.access == nil {
-		db.access = make(map[string]keyAccess)
+		db.access = make(map[string]*keyAccess)
 	}
 	now := nowSeconds()
 	at := uint32(0)
 	if idle < now {
 		at = now - idle
 	}
-	k := string(key)
-	a := db.access[k]
+	a := db.access[string(key)]
+	if a == nil {
+		k := string(key)
+		a = &keyAccess{decr: nowMinutes()}
+		db.access[k] = a
+	}
 	a.atime = at
 	if a.decr == 0 {
 		a.decr = nowMinutes()
 	}
-	db.access[k] = a
 }
 
 // SetFreq seeds a key's LFU counter, which is how RESTORE FREQ reconstructs the
@@ -151,27 +166,41 @@ func (db *DB) SetFreq(key []byte, freq uint8) {
 	db.accessMu.Lock()
 	defer db.accessMu.Unlock()
 	if db.access == nil {
-		db.access = make(map[string]keyAccess)
+		db.access = make(map[string]*keyAccess)
 	}
-	k := string(key)
-	a := db.access[k]
+	a := db.access[string(key)]
+	if a == nil {
+		k := string(key)
+		a = &keyAccess{}
+		db.access[k] = a
+	}
 	a.freq = freq
 	a.decr = nowMinutes()
 	if a.atime == 0 {
 		a.atime = nowSeconds()
 	}
-	db.access[k] = a
 }
 
 // accessMetrics returns the recency timestamp and the decayed frequency the
 // eviction sampler sorts on. A key with no record yet looks maximally idle and
 // minimally frequent, so an un-accessed key is evicted before a tracked one.
+//
+// HotGet updates the hot-cache entry's atime atomically on each hit without
+// calling recordAccess, so we check both the hot cache and the access map and
+// take the more recent atime. LFU frequency still comes from the access map.
 func (db *DB) accessMetrics(key []byte) (atime uint32, freq uint8) {
+	hotAtime, inCache := db.hc.Load().cgetAtime(key)
+
 	db.accessMu.Lock()
-	a, ok := db.access[string(key)]
+	a := db.access[string(key)]
 	db.accessMu.Unlock()
-	if !ok {
-		return 0, 0
+
+	if a == nil {
+		return hotAtime, 0
 	}
-	return a.atime, db.lfuDecay(a).freq
+	at := a.atime
+	if inCache && hotAtime > at {
+		at = hotAtime
+	}
+	return at, db.lfuDecay(*a).freq
 }
