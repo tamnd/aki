@@ -273,6 +273,9 @@ func (d *Dispatcher) StartBackground() {
 	if d.bgStop != nil {
 		return
 	}
+	if d.engine != nil {
+		d.engine.StartWorker()
+	}
 	d.initAOF()
 	d.bgStop = make(chan struct{})
 	d.bgDone = make(chan struct{})
@@ -306,6 +309,11 @@ func (d *Dispatcher) StopBackground() {
 	// Join the replica apply goroutine first so it cannot touch the keyspace or
 	// pager after they close. This runs even when the cron was never started.
 	d.StopReplication()
+	// Stop the write worker before flushing. The worker must drain its queue
+	// before we call ForceCommit so the commit sees all acknowledged writes.
+	if d.engine != nil {
+		d.engine.StopWorker()
+	}
 	// Flush any writes a deferred commit policy left pending so a clean shutdown
 	// never drops an acknowledged write. Harmless when nothing is pending.
 	if d.engine != nil {
