@@ -6,10 +6,12 @@ import (
 	"time"
 )
 
-// TestNotifyExpiredLazyGet checks that a read which trips lazy expiry fires the
-// expired keyevent for the key it removed.
+// TestNotifyExpiredLazyGet checks that a GET on an expired key returns nil and
+// that the active expiry cycle fires the expired event.
+// The expired event is now deferred to the active expiry cycle rather than
+// fired inline on the GET, so the test drives the cycle directly.
 func TestNotifyExpiredLazyGet(t *testing.T) {
-	r1, c1, r2, c2 := startDataTwo(t)
+	r1, c1, r2, c2, d := startActiveExpiry(t)
 	if _, err := c2.Write([]byte("PSUBSCRIBE __keyevent@0__:expired\r\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -22,10 +24,12 @@ func TestNotifyExpiredLazyGet(t *testing.T) {
 	}
 	time.Sleep(20 * time.Millisecond)
 
-	// GET trips lazy expiry, returns nil, and fires the expired event.
+	// GET returns nil for the expired key.
 	if got := sendLine(t, r1, c1, "GET k"); got != "$-1" {
 		t.Fatalf("GET = %q want $-1", got)
 	}
+	// Active expiry deletes the B-tree entry and fires the expired event.
+	d.runActiveExpire()
 	if msg := readResp(t, r2); !slices.Contains(msg, "__keyevent@0__:expired") || !slices.Contains(msg, "k") {
 		t.Fatalf("expired push = %v", msg)
 	}
@@ -34,7 +38,7 @@ func TestNotifyExpiredLazyGet(t *testing.T) {
 // TestNotifyExpiredKeyspaceForm checks the keyspace-channel form of the expired
 // event, where the channel names the key and the payload is the event name.
 func TestNotifyExpiredKeyspaceForm(t *testing.T) {
-	r1, c1, r2, c2 := startDataTwo(t)
+	r1, c1, r2, c2, d := startActiveExpiry(t)
 	if _, err := c2.Write([]byte("PSUBSCRIBE __keyspace@0__:*\r\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -52,6 +56,8 @@ func TestNotifyExpiredKeyspaceForm(t *testing.T) {
 	if got := sendLine(t, r1, c1, "EXISTS k"); got != ":0" {
 		t.Fatalf("EXISTS = %q want :0", got)
 	}
+	// Active expiry deletes the B-tree entry and fires the expired event.
+	d.runActiveExpire()
 	if msg := readResp(t, r2); !slices.Contains(msg, "__keyspace@0__:k") || !slices.Contains(msg, "expired") {
 		t.Fatalf("expired keyspace push = %v", msg)
 	}

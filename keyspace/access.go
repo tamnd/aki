@@ -31,7 +31,11 @@ func nowMinutes() uint32 { return uint32(nowMillis() / 60000) }
 // recordAccess updates a key's recency and frequency after it is read or written.
 // isNew marks the first write of a key, which seeds the LFU counter above zero so
 // a fresh key is not the instant eviction victim.
+// accessMu guards the access map so concurrent reads can update eviction
+// bookkeeping without blocking on the engine write lock.
 func (db *DB) recordAccess(key []byte, isNew bool) {
+	db.accessMu.Lock()
+	defer db.accessMu.Unlock()
 	if db.access == nil {
 		db.access = make(map[string]keyAccess)
 	}
@@ -51,9 +55,11 @@ func (db *DB) recordAccess(key []byte, isNew bool) {
 
 // dropAccess forgets a key's bookkeeping when it is deleted or evicted.
 func (db *DB) dropAccess(key []byte) {
+	db.accessMu.Lock()
 	if db.access != nil {
 		delete(db.access, string(key))
 	}
+	db.accessMu.Unlock()
 }
 
 // lfuDecay lowers the counter by one for every decay period that passed since the
@@ -142,6 +148,8 @@ func (db *DB) SetIdle(key []byte, idle uint32) {
 // SetFreq seeds a key's LFU counter, which is how RESTORE FREQ reconstructs the
 // frequency of a dumped key.
 func (db *DB) SetFreq(key []byte, freq uint8) {
+	db.accessMu.Lock()
+	defer db.accessMu.Unlock()
 	if db.access == nil {
 		db.access = make(map[string]keyAccess)
 	}
@@ -159,7 +167,9 @@ func (db *DB) SetFreq(key []byte, freq uint8) {
 // eviction sampler sorts on. A key with no record yet looks maximally idle and
 // minimally frequent, so an un-accessed key is evicted before a tracked one.
 func (db *DB) accessMetrics(key []byte) (atime uint32, freq uint8) {
+	db.accessMu.Lock()
 	a, ok := db.access[string(key)]
+	db.accessMu.Unlock()
 	if !ok {
 		return 0, 0
 	}

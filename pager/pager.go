@@ -39,7 +39,7 @@ type Pager struct {
 	vfs  vfs.VFS
 	name string
 
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	file     vfs.File
 	pageSize uint32
 	header   format.FileHeader
@@ -177,15 +177,15 @@ func (p *Pager) Name() string { return p.name }
 
 // PageCount returns the current total page count.
 func (p *Pager) PageCount() uint32 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.meta.PageCount
 }
 
 // Meta returns a copy of the live meta snapshot.
 func (p *Pager) Meta() format.MetaPage {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.meta
 }
 
@@ -207,8 +207,8 @@ type Stats struct {
 // which a plain load cannot since it would loop or read garbage. It returns the
 // number of free pages on a healthy chain. The integrity checker calls it.
 func (p *Pager) CheckFreelist() (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	seen := make(map[uint32]struct{})
 	head := p.meta.FreelistHead
 	count := 0
@@ -233,8 +233,8 @@ func (p *Pager) CheckFreelist() (int, error) {
 // Stats returns the current pager counters. FileBytes is the on-disk size the
 // page count implies, which is what the dataset-file growth field reports.
 func (p *Pager) Stats() Stats {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	resident, dirty := p.pool.counts()
 	return Stats{
 		PageSize:      p.pageSize,
@@ -250,8 +250,8 @@ func (p *Pager) Stats() Stats {
 
 // Header returns a copy of the file header.
 func (p *Pager) Header() format.FileHeader {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.header
 }
 
@@ -291,9 +291,13 @@ func (p *Pager) readRaw(pgno uint32) ([]byte, error) {
 
 // Get pins and returns the page numbered pgno, faulting it in from disk if it is
 // not resident. The caller must Unpin it when done.
+// Multiple goroutines may call Get concurrently; the outer RLock guards the
+// closed flag and the page-count bound, and the inner pool.mu guards the frame
+// table. A cache miss reads the page outside either lock so the file read runs
+// in parallel with other Get calls and with the pool.mu critical section.
 func (p *Pager) Get(pgno uint32) (*Page, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.closed {
 		return nil, ErrClosed
 	}

@@ -143,11 +143,16 @@ func TestLazyExpiry(t *testing.T) {
 	if _, _, found, _ := db.Get([]byte("k")); found {
 		t.Fatal("key should be expired")
 	}
+	// Get returns not-found immediately; the B-tree entry is cleaned up by
+	// the next active expiry cycle to keep Get free of write operations.
+	if _, err := ks.ActiveExpireCycle(); err != nil {
+		t.Fatalf("expire cycle: %v", err)
+	}
 	if db.Len() != 0 {
-		t.Fatalf("Len = %d want 0 after lazy expiry", db.Len())
+		t.Fatalf("Len = %d want 0 after expiry cycle", db.Len())
 	}
 	if db.expireCount != 0 {
-		t.Fatalf("expireCount = %d want 0 after expiry", db.expireCount)
+		t.Fatalf("expireCount = %d want 0 after expiry cycle", db.expireCount)
 	}
 }
 
