@@ -242,6 +242,7 @@ func New(cfg Config) *Dispatcher {
 	if d.engine != nil {
 		d.engine.onCommit = d.recordIOLatency
 		d.applyLFUConfig()
+		d.applyCommitPolicy()
 	}
 	d.activeExpire.Store(true)
 	d.blockingInit()
@@ -288,6 +289,7 @@ func (d *Dispatcher) StartBackground() {
 				return
 			case <-t.C:
 				d.runActiveExpire()
+				d.runCommitCron()
 				d.checkSavePoints()
 				d.checkAOFRewrite()
 				d.syncAOFCron()
@@ -304,6 +306,13 @@ func (d *Dispatcher) StopBackground() {
 	// Join the replica apply goroutine first so it cannot touch the keyspace or
 	// pager after they close. This runs even when the cron was never started.
 	d.StopReplication()
+	// Flush any writes a deferred commit policy left pending so a clean shutdown
+	// never drops an acknowledged write. Harmless when nothing is pending.
+	if d.engine != nil {
+		if err := d.engine.ForceCommit(); err != nil {
+			d.LogWarn("Final commit on shutdown failed", "err", err.Error())
+		}
+	}
 	if d.bgStop == nil {
 		return
 	}
@@ -312,6 +321,40 @@ func (d *Dispatcher) StopBackground() {
 	d.bgStop = nil
 	d.bgDone = nil
 	d.closeAOF()
+}
+
+// runCommitCron flushes any writes the everysec commit policy left pending once
+// the one-second interval has elapsed. It is a no-op with no keyspace, under the
+// always policy (nothing is ever pending), and under the no policy (which flushes
+// only on SAVE, shutdown, or the dirty-page bound).
+func (d *Dispatcher) runCommitCron() {
+	if d.engine == nil {
+		return
+	}
+	if err := d.engine.commitCron(time.Now()); err != nil {
+		d.LogWarn("Background commit failed", "err", err.Error())
+	}
+}
+
+// applyCommitPolicy maps the appendfsync directive onto the engine commit policy
+// so the pager checkpoint cadence tracks the configured durability. The
+// dispatcher calls it at startup and on CONFIG SET appendfsync.
+func (d *Dispatcher) applyCommitPolicy() {
+	if d.engine == nil {
+		return
+	}
+	var p commitPolicy
+	switch d.aofFsyncPolicy() {
+	case "always":
+		p = commitAlways
+	case "no":
+		p = commitNo
+	default:
+		p = commitEverySec
+	}
+	if err := d.engine.setCommitPolicy(p); err != nil {
+		d.LogWarn("Commit policy change failed", "err", err.Error())
+	}
 }
 
 // runActiveExpire runs one active expiry pass and fires the expired event for

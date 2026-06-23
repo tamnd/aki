@@ -35,7 +35,7 @@ func (e *Engine) systemEntries(prefix string) (map[string]string, error) {
 // path for a tenant that grows entry by entry, like the script cache, where
 // rewriting the whole prefix on each addition would be wasteful.
 func (e *Engine) systemSet(prefix, name, val string) error {
-	return e.updateKeyspace(func(ks *keyspace.Keyspace) error {
+	return e.updateKeyspaceDurable(func(ks *keyspace.Keyspace) error {
 		return ks.SystemPut(prefix+name, []byte(val))
 	})
 }
@@ -45,7 +45,7 @@ func (e *Engine) systemSet(prefix, name, val string) error {
 // item leaves no stale entry behind. The keys of entries are the suffixes after
 // the prefix.
 func (e *Engine) systemReplace(prefix string, entries map[string]string) error {
-	return e.updateKeyspace(func(ks *keyspace.Keyspace) error {
+	return e.updateKeyspaceDurable(func(ks *keyspace.Keyspace) error {
 		existing, err := ks.SystemList(prefix)
 		if err != nil {
 			return err

@@ -631,6 +631,10 @@ func handleConfigSet(ctx *Ctx) {
 		case "lfu-log-factor", "lfu-decay-time":
 			// Push the new LFU tuning to the keyspace so the eviction counter uses it.
 			ctx.d.applyLFUConfig()
+		case "appendfsync":
+			// Retune the pager checkpoint cadence so the durability contract tracks
+			// the new policy. Tightening to always flushes any pending writes now.
+			ctx.d.applyCommitPolicy()
 		case "timeout":
 			// Push the new idle timeout to the server so it applies on the next read.
 			ctx.d.applyIdleTimeout()
