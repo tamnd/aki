@@ -185,8 +185,10 @@ type dbShard struct {
 	mu          sync.RWMutex
 	rootPage    uint32 // btree root page, NullPage when this shard has no keys
 	tree        *btree.Tree
-	keyCount    uint64
-	expireCount uint64
+	// keyCount and expireCount are updated atomically so Len() and
+	// totalExpireCount() can read them without holding the shard mutex.
+	keyCount    atomic.Uint64
+	expireCount atomic.Uint64
 }
 
 // ShardOf returns the shard index for key, which is the low bits of its hash
@@ -326,11 +328,11 @@ func (ks *Keyspace) loadCatalog() error {
 		expPerShard := expireCount / uint64(NumShards)
 		expRemainder := expireCount % uint64(NumShards)
 		for s := range NumShards {
-			db.shards[s].keyCount = perShard
-			db.shards[s].expireCount = expPerShard
+			db.shards[s].keyCount.Store(perShard)
+			db.shards[s].expireCount.Store(expPerShard)
 		}
-		db.shards[0].keyCount += remainder
-		db.shards[0].expireCount += expRemainder
+		db.shards[0].keyCount.Add(remainder)
+		db.shards[0].expireCount.Add(expRemainder)
 	}
 	return nil
 }
@@ -342,7 +344,7 @@ func (db *DB) Index() int { return db.index }
 func (db *DB) Len() uint64 {
 	var total uint64
 	for s := range NumShards {
-		total += db.shards[s].keyCount
+		total += db.shards[s].keyCount.Load()
 	}
 	return total
 }
@@ -351,7 +353,7 @@ func (db *DB) Len() uint64 {
 func (db *DB) totalExpireCount() uint64 {
 	var total uint64
 	for s := range NumShards {
-		total += db.shards[s].expireCount
+		total += db.shards[s].expireCount.Load()
 	}
 	return total
 }
@@ -484,15 +486,15 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 	}
 
 	if isNew {
-		db.shards[s].keyCount++
+		db.shards[s].keyCount.Add(1)
 	} else {
 		db.ks.dataBytes.Add(-(int64(len(key)) + int64(prev.BodyLen) + entryOverhead))
 	}
 	db.ks.dataBytes.Add(int64(len(key)) + int64(len(body)) + entryOverhead)
 	if h.HasTTL() && !hadTTL {
-		db.shards[s].expireCount++
+		db.shards[s].expireCount.Add(1)
 	} else if !h.HasTTL() && hadTTL {
-		db.shards[s].expireCount--
+		db.shards[s].expireCount.Add(^uint64(0))
 	}
 	db.recordAccess(key, isNew)
 
@@ -714,12 +716,12 @@ func (db *DB) Delete(key []byte) (bool, error) {
 	}
 	if ok {
 		db.shards[s].rootPage = t.Root()
-		db.shards[s].keyCount--
+		db.shards[s].keyCount.Add(^uint64(0))
 		db.ks.dataBytes.Add(-(int64(len(key)) + int64(prev.BodyLen) + entryOverhead))
 		db.dropAccess(key)
 		db.hc.Load().cinvalidate(key)
 		if prev.HasTTL() {
-			db.shards[s].expireCount--
+			db.shards[s].expireCount.Add(^uint64(0))
 		}
 		if prev.Flags&FlagInlineBody == 0 && prev.BodyRef != 0 {
 			if err := db.ks.freeOverflow(uint32(prev.BodyRef)); err != nil {
@@ -767,7 +769,7 @@ func (ks *Keyspace) ActiveExpireCycle() (int, error) {
 func (db *DB) expiredVolatileKeys(now int64) ([][]byte, error) {
 	var out [][]byte
 	for s := range NumShards {
-		if db.shards[s].expireCount == 0 {
+		if db.shards[s].expireCount.Load() == 0 {
 			continue
 		}
 		db.shards[s].mu.RLock()
@@ -855,8 +857,8 @@ func (ks *Keyspace) Commit() error {
 		for s := range NumShards {
 			db.shards[s].mu.RLock()
 			encoding.PutU32(rec[s*4:], db.shards[s].rootPage)
-			keyCount += db.shards[s].keyCount
-			expireCount += db.shards[s].expireCount
+			keyCount += db.shards[s].keyCount.Load()
+			expireCount += db.shards[s].expireCount.Load()
 			db.shards[s].mu.RUnlock()
 		}
 		base := NumShards * 4

@@ -59,8 +59,8 @@ func (db *DB) flushShard(s int) error {
 	}
 	db.shards[s].rootPage = format.NullPage
 	db.shards[s].tree = nil
-	db.shards[s].keyCount = 0
-	db.shards[s].expireCount = 0
+	db.shards[s].keyCount.Store(0)
+	db.shards[s].expireCount.Store(0)
 	return nil
 }
 
@@ -102,8 +102,12 @@ func (ks *Keyspace) Swap(i, j int) error {
 	for s := range NumShards {
 		a.shards[s].rootPage, b.shards[s].rootPage = b.shards[s].rootPage, a.shards[s].rootPage
 		a.shards[s].tree, b.shards[s].tree = b.shards[s].tree, a.shards[s].tree
-		a.shards[s].keyCount, b.shards[s].keyCount = b.shards[s].keyCount, a.shards[s].keyCount
-		a.shards[s].expireCount, b.shards[s].expireCount = b.shards[s].expireCount, a.shards[s].expireCount
+		ak, bk := a.shards[s].keyCount.Load(), b.shards[s].keyCount.Load()
+		a.shards[s].keyCount.Store(bk)
+		b.shards[s].keyCount.Store(ak)
+		ae, be := a.shards[s].expireCount.Load(), b.shards[s].expireCount.Load()
+		a.shards[s].expireCount.Store(be)
+		b.shards[s].expireCount.Store(ae)
 	}
 	a.avgTTL, b.avgTTL = b.avgTTL, a.avgTTL
 	// Exchange the hot-cache pointers atomically so lock-free hot-GET readers
