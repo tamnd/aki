@@ -1,6 +1,11 @@
 package command
 
-import "testing"
+import (
+	"bufio"
+	"fmt"
+	"net"
+	"testing"
+)
 
 func TestZUnion(t *testing.T) {
 	r, c := startData(t)
@@ -135,17 +140,37 @@ func TestZInterCard(t *testing.T) {
 	}
 }
 
+// readNestedPairs reads the elements section of a ZMPOP/BZMPOP reply:
+// *N on RESP2 followed by N × (*2, member, score).
+func readNestedPairs(t *testing.T, r *bufio.Reader, c net.Conn) []string {
+	t.Helper()
+	hdr := sendLineRead(t, r)
+	var n int
+	if _, err := fmt.Sscanf(hdr, "*%d", &n); err != nil {
+		t.Fatalf("expected nested pairs header, got %q", hdr)
+	}
+	var out []string
+	for range n {
+		ph := sendLineRead(t, r)
+		if ph != "*2" {
+			t.Fatalf("expected *2 pair header, got %q", ph)
+		}
+		out = append(out, bulk(t, r, c, ""), bulk(t, r, c, ""))
+	}
+	return out
+}
+
 func TestZMPop(t *testing.T) {
 	r, c := startData(t)
 	_ = sendLine(t, r, c, "ZADD z 1 a 2 b 3 c")
-	// MIN with no count pops the lowest pair.
+	// MIN with no count pops the lowest pair nested as [[member, score], ...].
 	if got := sendLine(t, r, c, "ZMPOP 1 z MIN"); got != "*2" {
 		t.Fatalf("ZMPOP header = %q want *2", got)
 	}
 	if got := bulk(t, r, c, ""); got != "z" {
 		t.Fatalf("ZMPOP key = %q want z", got)
 	}
-	got := array(t, r, c, "")
+	got := readNestedPairs(t, r, c)
 	if !equalSlice(got, []string{"a", "1"}) {
 		t.Fatalf("ZMPOP pair = %v want [a 1]", got)
 	}
@@ -154,7 +179,7 @@ func TestZMPop(t *testing.T) {
 		t.Fatalf("ZMPOP MAX header = %q", got)
 	}
 	_ = bulk(t, r, c, "")
-	got = array(t, r, c, "")
+	got = readNestedPairs(t, r, c)
 	if !equalSlice(got, []string{"c", "3", "b", "2"}) {
 		t.Fatalf("ZMPOP MAX COUNT = %v", got)
 	}
@@ -174,7 +199,7 @@ func TestZMPopFirstNonEmpty(t *testing.T) {
 	if got := bulk(t, r, c, ""); got != "second" {
 		t.Fatalf("ZMPOP key = %q want second", got)
 	}
-	_ = array(t, r, c, "")
+	_ = readNestedPairs(t, r, c)
 	// All keys empty replies a null array.
 	if got := sendLine(t, r, c, "ZMPOP 2 first second MIN"); got != "*-1" {
 		t.Fatalf("ZMPOP all empty = %q want *-1", got)
