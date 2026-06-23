@@ -121,6 +121,7 @@ scoops:
       owner: tamnd
       name: scoop-bucket
       token: '{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}'
+    directory: bucket
     homepage: https://github.com/tamnd/aki
     description: A Redis-compatible database in a single file
     license: BSD-3-Clause
