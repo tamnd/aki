@@ -1,6 +1,5 @@
 package resp
 
-
 // parseDecimal parses a signed decimal integer from a byte slice without
 // converting to string, avoiding the allocation that strconv.ParseInt(string(b), 10, 64) would make.
 func parseDecimal(b []byte) (int64, bool) {
