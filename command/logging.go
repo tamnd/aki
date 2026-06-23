@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/syslog"
 	"os"
 	"strconv"
 	"strings"
@@ -84,68 +83,9 @@ type logField struct {
 // lf builds a log field.
 func lf(key string, val any) logField { return logField{key, val} }
 
-// syslogSink wraps the optional syslog destination and routes each level to the
-// matching syslog priority. aki targets unix, the same as the rest of the server,
-// so log/syslog is always available.
-type syslogSink struct {
-	w *syslog.Writer
-}
-
-// newSyslogSink connects to the local syslog daemon with the given program ident
-// and facility. An unknown facility name falls back to LOG_LOCAL0, the spec
-// default.
-func newSyslogSink(ident, facility string) (*syslogSink, error) {
-	w, err := syslog.New(syslogFacility(facility), ident)
-	if err != nil {
-		return nil, err
-	}
-	return &syslogSink{w: w}, nil
-}
-
-// write sends the message at the syslog priority that matches the aki level.
-func (s *syslogSink) write(level int, msg string) {
-	switch level {
-	case logDebug:
-		_ = s.w.Debug(msg)
-	case logVerbose:
-		_ = s.w.Info(msg)
-	case logWarning:
-		_ = s.w.Warning(msg)
-	default:
-		_ = s.w.Notice(msg)
-	}
-}
-
-// Close closes the syslog connection.
-func (s *syslogSink) Close() error { return s.w.Close() }
-
-// syslogFacility maps a facility name to its log/syslog priority bits.
-func syslogFacility(name string) syslog.Priority {
-	switch strings.ToLower(name) {
-	case "user":
-		return syslog.LOG_USER
-	case "daemon":
-		return syslog.LOG_DAEMON
-	case "local0":
-		return syslog.LOG_LOCAL0
-	case "local1":
-		return syslog.LOG_LOCAL1
-	case "local2":
-		return syslog.LOG_LOCAL2
-	case "local3":
-		return syslog.LOG_LOCAL3
-	case "local4":
-		return syslog.LOG_LOCAL4
-	case "local5":
-		return syslog.LOG_LOCAL5
-	case "local6":
-		return syslog.LOG_LOCAL6
-	case "local7":
-		return syslog.LOG_LOCAL7
-	default:
-		return syslog.LOG_LOCAL0
-	}
-}
+// The syslog sink lives in logging_syslog.go (unix) and logging_nosyslog.go
+// (windows), because log/syslog is a unix-only package. Both files define the
+// syslogSink type and newSyslogSink so this file stays platform neutral.
 
 // logger holds the logging state. The stream sink (stderr or an open file) and the
 // optional syslog sink are guarded by the mutex so a CONFIG SET that reopens the
