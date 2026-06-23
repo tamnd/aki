@@ -226,8 +226,7 @@ func (d *Dispatcher) replayAOF(ctx *Ctx, data []byte) error {
 // stance Redis takes when its own AOF holds a command an older build does not
 // know.
 func (d *Dispatcher) replayOne(ctx *Ctx, argv [][]byte) {
-	name := strings.ToLower(string(argv[0]))
-	cmd, err := d.table.lookup(name, argv)
+	cmd, err := d.table.lookup(argv)
 	if err != nil {
 		return
 	}

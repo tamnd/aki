@@ -218,8 +218,7 @@ func redisCall(_ *lua.Interp, sc *scriptCtx, args []lua.Value, raise bool) ([]lu
 		}
 	}
 
-	name := strings.ToLower(string(argv[0]))
-	cmd, lookupErr := sc.d.table.lookup(name, argv)
+	cmd, lookupErr := sc.d.table.lookup(argv)
 	if lookupErr != nil {
 		return fail("Unknown Redis command called from script")
 	}
@@ -240,7 +239,7 @@ func redisCall(_ *lua.Interp, sc *scriptCtx, args []lua.Value, raise bool) ([]lu
 	conn.SetSession(csess)
 	cctx := &Ctx{Conn: conn, Argv: argv, d: sc.d, sess: csess}
 
-	if msg := sc.d.aclEnforce(conn, csess, cmd, strings.ToLower(string(argv[0])), argv); msg != "" {
+	if msg := sc.d.aclEnforce(conn, csess, cmd, argv); msg != "" {
 		return fail(msg)
 	}
 	sc.d.runCommand(cctx, cmd)

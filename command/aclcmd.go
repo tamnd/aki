@@ -316,14 +316,13 @@ func handleACLDryRun(ctx *Ctx) {
 		ctx.enc().WriteError("ERR User '" + name + "' not found")
 		return
 	}
-	cmdName := strings.ToLower(string(ctx.Argv[3]))
 	target := ctx.Argv[3:]
-	cmd, err := ctx.d.table.lookup(cmdName, target)
+	cmd, err := ctx.d.table.lookup(target)
 	if err != nil {
 		ctx.enc().WriteError(err.Error())
 		return
 	}
-	if msg := aclCheckUser(ctx.d, u, cmd, cmdName, target); msg != "" {
+	if msg := aclCheckUser(ctx.d, u, cmd, target); msg != "" {
 		ctx.enc().WriteError(msg)
 		return
 	}

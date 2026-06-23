@@ -302,15 +302,14 @@ func keyAccessFlags(cmd *CmdDesc) []string {
 // getKeysForGetKeys resolves the key arguments of the command invocation in args
 // (args[0] is the command name). It returns a RESP error string on failure.
 func (d *Dispatcher) getKeysForGetKeys(args [][]byte) ([][]byte, string) {
-	name := strings.ToLower(string(args[0]))
-	cmd := d.table.get(name)
+	cmd := d.table.get(strings.ToLower(string(args[0])))
 	if cmd == nil {
 		return nil, "ERR Invalid command specified"
 	}
 	if !checkArity(cmd, len(args)) {
 		return nil, "ERR Invalid number of arguments specified for command"
 	}
-	keys, ok := extractKeys(name, cmd, args)
+	keys, ok := extractKeys(cmd.Name, cmd, args)
 	if !ok {
 		return nil, "ERR Invalid arguments specified for command"
 	}

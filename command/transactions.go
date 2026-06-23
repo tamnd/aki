@@ -54,8 +54,8 @@ func isMultiControl(name string) bool {
 // queueCommand appends a command to the open transaction. It resolves the
 // descriptor and checks arity now, the same as normal dispatch, so a bad command
 // is reported at queue time and marks the transaction so EXEC aborts.
-func (d *Dispatcher) queueCommand(c *networking.Conn, sess *session, name string, argv [][]byte) {
-	cmd, err := d.table.lookup(name, argv)
+func (d *Dispatcher) queueCommand(c *networking.Conn, sess *session, argv [][]byte) {
+	cmd, err := d.table.lookup(argv)
 	if err != nil {
 		sess.dirtyExec = true
 		c.Enc().WriteError(err.Error())
@@ -75,7 +75,7 @@ func (d *Dispatcher) queueCommand(c *networking.Conn, sess *session, name string
 	// In cluster mode a single command whose own keys span slots is rejected at
 	// queue time and marks the transaction so EXEC aborts, the same as outside a
 	// transaction. The cross-command check happens later in handleExec.
-	if msg := d.crossSlotError(name, cmd, argv); msg != "" {
+	if msg := d.crossSlotError(cmd, argv); msg != "" {
 		sess.dirtyExec = true
 		c.Enc().WriteError(msg)
 		return
@@ -83,7 +83,7 @@ func (d *Dispatcher) queueCommand(c *networking.Conn, sess *session, name string
 	// A command landing on a slot this node does not serve, or queued while the
 	// cluster state is down, is refused at queue time and aborts the EXEC, the
 	// same as on the direct path.
-	if msg := d.clusterDownError(name, cmd, argv); msg != "" {
+	if msg := d.clusterDownError(cmd, argv); msg != "" {
 		sess.dirtyExec = true
 		c.Enc().WriteError(msg)
 		return

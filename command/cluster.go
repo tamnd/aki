@@ -53,11 +53,11 @@ func (d *Dispatcher) clusterEnabled() bool {
 // error string when the keys span more than one slot, or "" when the command is
 // fine, cluster mode is off, or the command touches fewer than two keys. The hash
 // tag rule applies through hashSlot, so {user1}:a and {user1}:b share a slot.
-func (d *Dispatcher) crossSlotError(name string, cmd *CmdDesc, argv [][]byte) string {
+func (d *Dispatcher) crossSlotError(cmd *CmdDesc, argv [][]byte) string {
 	if !d.clusterEnabled() {
 		return ""
 	}
-	keys, ok := extractKeys(name, cmd, argv)
+	keys, ok := extractKeys(cmd.Name, cmd, argv)
 	if !ok || len(keys) < 2 {
 		return ""
 	}
@@ -79,11 +79,11 @@ func (d *Dispatcher) crossSlotError(name string, cmd *CmdDesc, argv [][]byte) st
 // command whose key maps to a slot this node does not serve gets "Hash slot not
 // served". It returns "" when cluster mode is off, the command carries no keys,
 // or coverage is fine. CROSSSLOT is checked before this, so it wins.
-func (d *Dispatcher) clusterDownError(name string, cmd *CmdDesc, argv [][]byte) string {
+func (d *Dispatcher) clusterDownError(cmd *CmdDesc, argv [][]byte) string {
 	if !d.clusterEnabled() {
 		return ""
 	}
-	keys, ok := extractKeys(name, cmd, argv)
+	keys, ok := extractKeys(cmd.Name, cmd, argv)
 	if !ok || len(keys) == 0 {
 		return ""
 	}

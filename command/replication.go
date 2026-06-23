@@ -770,7 +770,7 @@ func (d *Dispatcher) applyFromMaster(ctx *Ctx, sess *session, val resp.RESPValue
 		}
 		return
 	}
-	cmd, err := d.table.lookup(name, argv)
+	cmd, err := d.table.lookup(argv)
 	if err != nil || !checkArity(cmd, len(argv)) {
 		return
 	}
