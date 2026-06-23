@@ -555,16 +555,15 @@ func (ctx *Ctx) enc() *resp.Encoder { return ctx.Conn.Enc() }
 // the command, check arity, check auth, then call the handler.
 func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	sess := d.sessionFor(c)
-	// getCtx early so ctx.ar can back the name scratch, avoiding a heap
-	// allocation for strings.ToLower(string(argv[0])). defer putCtx covers
-	// every early return.
+	// getCtx early so ctx.ar backs the name scratch for the pre-lookup checks
+	// below (allowedInSubMode, isMultiControl). defer putCtx covers every early
+	// return and resets the arena after the function exits.
 	ctx := getCtx(c, argv, d, sess)
 	defer putCtx(ctx)
 	nameScratch := ctx.ar.bytes(len(argv[0]))
 	nameScratch = lowerASCII(nameScratch, argv[0])
-	// unsafe.String avoids a heap allocation: nameScratch is arena memory that
-	// outlives all uses of name within this function. The arena is reset only
-	// after Handle returns (via defer putCtx), so name is valid throughout.
+	// unsafe.String avoids a heap allocation: the arena outlives all uses of
+	// name within Handle (putCtx via defer, never mid-function).
 	name := unsafe.String(unsafe.SliceData(nameScratch), len(nameScratch))
 
 	// A RESP2 client with active subscriptions is in subscriber mode and may run
@@ -579,11 +578,11 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	// Inside a transaction every command except the control verbs is queued
 	// rather than run. EXEC drains the queue later.
 	if sess.inMulti && !isMultiControl(name) {
-		d.queueCommand(c, sess, name, argv)
+		d.queueCommand(c, sess, argv)
 		return
 	}
 
-	cmd, err := d.table.lookup(name, argv)
+	cmd, err := d.table.lookup(argv)
 	if err != nil {
 		c.Enc().WriteError(err.Error())
 		d.statError(err.Error())
@@ -601,7 +600,7 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		d.statError(msg)
 		return
 	}
-	if msg := d.aclEnforce(c, sess, cmd, name, argv); msg != "" {
+	if msg := d.aclEnforce(c, sess, cmd, argv); msg != "" {
 		c.Enc().WriteError(msg)
 		d.statReject(cmd)
 		d.statError(msg)
@@ -635,13 +634,13 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		d.statError(msg)
 		return
 	}
-	if msg := d.crossSlotError(name, cmd, argv); msg != "" {
+	if msg := d.crossSlotError(cmd, argv); msg != "" {
 		c.Enc().WriteError(msg)
 		d.statReject(cmd)
 		d.statError(msg)
 		return
 	}
-	if msg := d.clusterDownError(name, cmd, argv); msg != "" {
+	if msg := d.clusterDownError(cmd, argv); msg != "" {
 		c.Enc().WriteError(msg)
 		d.statReject(cmd)
 		d.statError(msg)

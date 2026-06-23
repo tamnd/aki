@@ -227,7 +227,7 @@ func applyAOFWrite(d *Dispatcher, args ...string) {
 	for i, a := range args {
 		argv[i] = []byte(a)
 	}
-	cmd, err := d.table.lookup(strings.ToLower(args[0]), argv)
+	cmd, err := d.table.lookup(argv)
 	if err != nil {
 		return
 	}
