@@ -279,7 +279,7 @@ func handleRestore(ctx *Ctx) {
 	}
 
 	var busy bool
-	stored := ctx.update(func(db *keyspace.DB) error {
+	stored := ctx.updateShard(key, func(db *keyspace.DB) error {
 		exists, eerr := db.Exists(key)
 		if eerr != nil {
 			return eerr

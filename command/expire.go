@@ -136,7 +136,7 @@ func handleExpire(ctx *Ctx, mode string) {
 
 	var res int64
 	var deleted bool
-	if ctx.update(func(db *keyspace.DB) error {
+	if ctx.updateShard(key, func(db *keyspace.DB) error {
 		body, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
@@ -262,7 +262,7 @@ func handleTTL(ctx *Ctx, ms bool) {
 func handlePersist(ctx *Ctx) {
 	key := ctx.Argv[1]
 	var res int64
-	if ctx.update(func(db *keyspace.DB) error {
+	if ctx.updateShard(key, func(db *keyspace.DB) error {
 		body, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err

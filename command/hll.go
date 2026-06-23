@@ -363,7 +363,7 @@ func handlePFAdd(ctx *Ctx) {
 		notHLL   bool
 		ret      int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		body, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
