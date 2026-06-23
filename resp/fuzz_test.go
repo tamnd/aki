@@ -51,7 +51,7 @@ func FuzzParseRequest(f *testing.F) {
 		f.Add([]byte(s))
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
-		argv, pos, err := ParseRequest(data, 0, DefaultMaxBulkLen)
+		argv, pos, err := ParseRequest(data, 0, DefaultMaxBulkLen, nil)
 		if pos < 0 || pos > len(data) {
 			t.Fatalf("out-of-range pos=%d for len=%d", pos, len(data))
 		}

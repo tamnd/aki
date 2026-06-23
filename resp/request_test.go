@@ -16,7 +16,7 @@ func argvStrings(argv [][]byte) []string {
 
 func TestParseMultibulk(t *testing.T) {
 	in := []byte("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
-	argv, pos, err := ParseRequest(in, 0, DefaultMaxBulkLen)
+	argv, pos, err := ParseRequest(in, 0, DefaultMaxBulkLen, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func TestParsePipeline(t *testing.T) {
 	pos := 0
 	var cmds [][]string
 	for pos < len(in) {
-		argv, newPos, err := ParseRequest(in, pos, DefaultMaxBulkLen)
+		argv, newPos, err := ParseRequest(in, pos, DefaultMaxBulkLen, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -52,7 +52,7 @@ func TestParsePartialResumes(t *testing.T) {
 	full := []byte("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
 	// A split mid-bulk must return ErrNeedMore without consuming anything.
 	for i := 1; i < len(full); i++ {
-		_, pos, err := ParseRequest(full[:i], 0, DefaultMaxBulkLen)
+		_, pos, err := ParseRequest(full[:i], 0, DefaultMaxBulkLen, nil)
 		if !errors.Is(err, ErrNeedMore) {
 			t.Fatalf("prefix %d: err=%v want ErrNeedMore", i, err)
 		}
@@ -63,7 +63,7 @@ func TestParsePartialResumes(t *testing.T) {
 }
 
 func TestParseInlineSimple(t *testing.T) {
-	argv, pos, err := ParseRequest([]byte("PING\r\n"), 0, DefaultMaxBulkLen)
+	argv, pos, err := ParseRequest([]byte("PING\r\n"), 0, DefaultMaxBulkLen, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestParseInlineSimple(t *testing.T) {
 	}
 
 	// Bare LF terminator (no CR) is accepted.
-	argv, _, err = ParseRequest([]byte("SET foo bar\n"), 0, DefaultMaxBulkLen)
+	argv, _, err = ParseRequest([]byte("SET foo bar\n"), 0, DefaultMaxBulkLen, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestParseInlineQuoting(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
-			argv, _, err := ParseRequest([]byte(tc.in), 0, DefaultMaxBulkLen)
+			argv, _, err := ParseRequest([]byte(tc.in), 0, DefaultMaxBulkLen, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -107,7 +107,7 @@ func TestParseInlineQuoting(t *testing.T) {
 }
 
 func TestParseInlineUnbalancedQuotes(t *testing.T) {
-	_, _, err := ParseRequest([]byte("SET key \"unterminated\r\n"), 0, DefaultMaxBulkLen)
+	_, _, err := ParseRequest([]byte("SET key \"unterminated\r\n"), 0, DefaultMaxBulkLen, nil)
 	var pe ProtocolError
 	if !errors.As(err, &pe) {
 		t.Fatalf("err=%v want ProtocolError", err)
@@ -116,11 +116,11 @@ func TestParseInlineUnbalancedQuotes(t *testing.T) {
 
 func TestParseBlankLineSkipped(t *testing.T) {
 	in := []byte("\r\nPING\r\n")
-	argv, pos, err := ParseRequest(in, 0, DefaultMaxBulkLen)
+	argv, pos, err := ParseRequest(in, 0, DefaultMaxBulkLen, nil)
 	if err != nil || argv != nil || pos != 2 {
 		t.Fatalf("blank line: argv=%v pos=%d err=%v", argv, pos, err)
 	}
-	argv, _, err = ParseRequest(in, pos, DefaultMaxBulkLen)
+	argv, _, err = ParseRequest(in, pos, DefaultMaxBulkLen, nil)
 	if err != nil || !reflect.DeepEqual(argvStrings(argv), []string{"PING"}) {
 		t.Fatalf("after blank: argv=%v err=%v", argvStrings(argv), err)
 	}
@@ -129,19 +129,19 @@ func TestParseBlankLineSkipped(t *testing.T) {
 func TestParseProtocolErrors(t *testing.T) {
 	var pe ProtocolError
 	// An element that is not a bulk string is the "expected '$'" fatal error.
-	_, _, err := ParseRequest([]byte("*2\r\n+notbulk\r\n"), 0, DefaultMaxBulkLen)
+	_, _, err := ParseRequest([]byte("*2\r\n+notbulk\r\n"), 0, DefaultMaxBulkLen, nil)
 	if !errors.As(err, &pe) {
 		t.Fatalf("expected-dollar: err=%v want ProtocolError", err)
 	}
 
 	// Multibulk count over the cap is a hard error.
-	_, _, err = ParseRequest([]byte("*1048577\r\n"), 0, DefaultMaxBulkLen)
+	_, _, err = ParseRequest([]byte("*1048577\r\n"), 0, DefaultMaxBulkLen, nil)
 	if !errors.As(err, &pe) {
 		t.Fatalf("over-cap: err=%v want ProtocolError", err)
 	}
 
 	// Bulk length over the configured cap is a hard error.
-	_, _, err = ParseRequest([]byte("*1\r\n$100\r\n"), 0, 10)
+	_, _, err = ParseRequest([]byte("*1\r\n$100\r\n"), 0, 10, nil)
 	if !errors.As(err, &pe) {
 		t.Fatalf("over-bulk-cap: err=%v want ProtocolError", err)
 	}
@@ -152,7 +152,7 @@ func TestParseTooBigInline(t *testing.T) {
 	for i := range big {
 		big[i] = 'x'
 	}
-	_, _, err := ParseRequest(big, 0, DefaultMaxBulkLen)
+	_, _, err := ParseRequest(big, 0, DefaultMaxBulkLen, nil)
 	var pe ProtocolError
 	if !errors.As(err, &pe) {
 		t.Fatalf("err=%v want ProtocolError", err)
