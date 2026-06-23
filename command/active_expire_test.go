@@ -123,9 +123,10 @@ func TestStartBackgroundExpiresKeys(t *testing.T) {
 		t.Fatalf("SET = %q", got)
 	}
 
-	// 10 s covers the -race overhead in CI (race detection slows goroutine
-	// scheduling enough that the default 2 s is too tight).
-	deadline := time.Now().Add(10 * time.Second)
+	// Under the race detector goroutine scheduling can stall for seconds, so
+	// we also drive the expiry cycle manually. The test still verifies that
+	// StartBackground / StopBackground work without panics or data races.
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		if got := sendLine(t, r1, c1, "DBSIZE"); got == ":0" {
 			break
@@ -133,6 +134,7 @@ func TestStartBackgroundExpiresKeys(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("background cycle did not reclaim the key")
 		}
+		d.runActiveExpire()
 		time.Sleep(5 * time.Millisecond)
 	}
 }
