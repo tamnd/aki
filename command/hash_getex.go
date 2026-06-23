@@ -37,7 +37,7 @@ func handleHGetDel(ctx *Ctx) {
 	}
 	out := make([]fieldValue, len(fields))
 	var wrongTyp, deleted, emptied bool
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(key, func(db *keyspace.DB) error {
 		hf, hdr, found, err := getHash(db, key)
 		if err != nil {
 			return err
@@ -123,7 +123,7 @@ func handleHGetEx(ctx *Ctx) {
 
 	out := make([]fieldValue, len(fields))
 	var wrongTyp, setTTL, delField, persisted, emptied bool
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(key, func(db *keyspace.DB) error {
 		hf, hdr, found, err := getHash(db, key)
 		if err != nil {
 			return err

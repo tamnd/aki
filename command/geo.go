@@ -233,7 +233,7 @@ parsed:
 		added    int64
 		changed  int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(ctx.Argv[1], func(db *keyspace.DB) error {
 		members, hdr, found, err := getZSet(db, ctx.Argv[1])
 		if err != nil {
 			return err

@@ -109,7 +109,7 @@ func handleHExpire(ctx *Ctx, hcmd, mode string) {
 
 	codes := make([]int64, len(fields))
 	var wrongTyp, noKey, emptied bool
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(key, func(db *keyspace.DB) error {
 		hf, hdr, found, err := getHash(db, key)
 		if err != nil {
 			return err
@@ -194,7 +194,7 @@ func handleHPersist(ctx *Ctx) {
 	}
 	codes := make([]int64, len(fields))
 	var wrongTyp, noKey bool
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(key, func(db *keyspace.DB) error {
 		hf, hdr, found, err := getHash(db, key)
 		if err != nil {
 			return err
