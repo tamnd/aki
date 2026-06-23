@@ -47,7 +47,8 @@ func startActiveExpiry(t *testing.T) (*bufio.Reader, net.Conn, *bufio.Reader, ne
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = conn.Close() })
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		// 30 s covers the race-detector overhead on slow CI runners.
+		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		return bufio.NewReader(conn), conn
 	}
 	r1, c1 := dial()
@@ -117,6 +118,10 @@ func TestDebugSetActiveExpireDisables(t *testing.T) {
 func TestStartBackgroundExpiresKeys(t *testing.T) {
 	r1, c1, _, _, d := startActiveExpiry(t)
 	d.conf.set("hz", "100")
+	// Use appendfsync always so SET writes directly to the B-tree without
+	// going through write-behind. This keeps the test from depending on
+	// shard-worker scheduling speed under the race detector.
+	d.conf.set("appendfsync", "always")
 	d.StartBackground()
 	t.Cleanup(d.StopBackground)
 	if got := sendLine(t, r1, c1, "SET k v PX 1"); got != "+OK" {
