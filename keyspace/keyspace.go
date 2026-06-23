@@ -607,8 +607,9 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 			return nil, ValueHeader{}, false, err
 		}
 	} else {
-		out = make([]byte, len(cell))
-		copy(out, cell)
+		// cell is already an owned copy (bytes.Clone in btree.Get); use it
+		// directly to avoid a second allocation on the inline-body path.
+		out = cell
 	}
 	if touch {
 		db.hc.Load().cput(sk, out, h)
