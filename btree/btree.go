@@ -29,6 +29,27 @@ import (
 	"github.com/tamnd/aki/pager"
 )
 
+// arenaNodeCap is the maximum number of node structs that can be pre-allocated
+// in one nodeArena without falling back to the heap. A Get traverses at most
+// one node per tree level; Put/Delete traverse and may rewrite one per level.
+// A 4-level tree covering billions of keys still fits in 4 entries.
+const arenaNodeCap = 8
+
+// arenaNodeKeyCap is the maximum number of cells per page that the pre-allocated
+// backing arrays cover without heap fallback. Pages hold at most 255 cells with
+// the default 4096-byte page size.
+const arenaNodeKeyCap = 256
+
+// arenaNodeEntry holds one pre-allocated node struct and its backing arrays.
+// Embedding the arrays directly in the struct keeps them on the same cache line
+// group as the node header, which matters for sequential key scans.
+type arenaNodeEntry struct {
+	n        node
+	keysBuf  [arenaNodeKeyCap][]byte
+	valsBuf  [arenaNodeKeyCap][]byte
+	childBuf [arenaNodeKeyCap + 1]uint32
+}
+
 // nodeArena is a per-operation scratch buffer that holds the decoded key and
 // value bytes for all B-tree nodes visited during one Get, Put, or Delete call.
 // All bytes.Clone calls in the hot path are replaced by arena copies, which
@@ -37,14 +58,20 @@ import (
 // reset (its length set back to zero) and returned to the pool. The backing
 // slice is reused on the next operation that gets this arena from the pool.
 //
+// entries pre-allocates arenaNodeCap node structs along with their keys/vals
+// backing arrays. decodeNodeAr calls allocNode instead of &node{} + make(),
+// eliminating 3 heap allocations per page decode.
+//
 // tmp is a separate scratch buffer for building encoded cells in encodeNode.
 // It is also reset between cells and reset at the start of each writeNode call.
 // Because both buf and tmp are only used within the single-threaded hot path
 // (one goroutine holds e.mu for writes; reads take RLock but each gets its own
 // arena from the pool), there are no concurrency hazards.
 type nodeArena struct {
-	buf []byte
-	tmp []byte
+	buf     []byte
+	tmp     []byte
+	entries [arenaNodeCap]arenaNodeEntry
+	entryN  int
 }
 
 var nodeArenaPool = sync.Pool{
@@ -62,9 +89,41 @@ func (a *nodeArena) copy(src []byte) []byte {
 	return a.buf[start:]
 }
 
+// allocNode returns a node backed by pre-allocated arrays from the arena when
+// possible, falling back to heap allocation for deep trees or oversized pages.
+func (a *nodeArena) allocNode(leaf bool, count int) *node {
+	if a.entryN < arenaNodeCap && count <= arenaNodeKeyCap {
+		e := &a.entries[a.entryN]
+		a.entryN++
+		n := &e.n
+		n.leaf = leaf
+		n.rightSibling = 0
+		if leaf {
+			n.keys = e.keysBuf[:count]
+			n.vals = e.valsBuf[:count]
+			n.children = nil
+		} else {
+			n.keys = e.keysBuf[:count]
+			n.vals = nil
+			n.children = e.childBuf[:count+1]
+		}
+		return n
+	}
+	n := &node{leaf: leaf}
+	if leaf {
+		n.keys = make([][]byte, count)
+		n.vals = make([][]byte, count)
+	} else {
+		n.keys = make([][]byte, count)
+		n.children = make([]uint32, count+1)
+	}
+	return n
+}
+
 func (a *nodeArena) reset() {
 	a.buf = a.buf[:0]
 	a.tmp = a.tmp[:0]
+	a.entryN = 0
 }
 
 // slotsStart is the byte offset where the slot array begins on both leaf and
@@ -190,32 +249,7 @@ type splitResult struct {
 	right  uint32
 }
 
-func (t *Tree) insert(pgno uint32, key, val []byte) (*splitResult, error) {
-	n, err := t.readNode(pgno)
-	if err != nil {
-		return nil, err
-	}
-
-	if n.leaf {
-		n.upsert(key, val)
-		return t.writeOrSplit(pgno, n)
-	}
-
-	ci := n.childIndex(key)
-	sp, err := t.insert(n.children[ci], key, val)
-	if err != nil {
-		return nil, err
-	}
-	if sp == nil {
-		return nil, nil
-	}
-	// Insert the new separator and child pointer at position ci.
-	n.keys = insertBytes(n.keys, ci, sp.sepKey)
-	n.children = insertU32(n.children, ci+1, sp.right)
-	return t.writeOrSplit(pgno, n)
-}
-
-// insertAr is like insert but uses ar to avoid per-cell heap allocations.
+// insertAr traverses the tree from pgno and inserts key/val, using ar to avoid per-cell heap allocations.
 func (t *Tree) insertAr(pgno uint32, key, val []byte, ar *nodeArena) (*splitResult, error) {
 	n, err := t.readNodeAr(pgno, ar)
 	if err != nil {
@@ -242,34 +276,7 @@ func (t *Tree) insertAr(pgno uint32, key, val []byte, ar *nodeArena) (*splitResu
 	return t.writeOrSplitAr(pgno, n, ar)
 }
 
-// writeOrSplit writes n back to pgno if it fits, otherwise splits it, writes the
-// lower half back to pgno and the upper half to a fresh page, and returns the
-// separator for the parent.
-func (t *Tree) writeOrSplit(pgno uint32, n *node) (*splitResult, error) {
-	if n.size() <= t.usable() {
-		return nil, t.writeNode(pgno, n)
-	}
-	if len(n.keys) < 2 {
-		return nil, ErrCellTooLarge
-	}
-	left, right, sep := n.split()
-	if left.size() > t.usable() || right.size() > t.usable() {
-		return nil, ErrCellTooLarge
-	}
-	rightNo, err := t.writeNewNode(right)
-	if err != nil {
-		return nil, err
-	}
-	if n.leaf {
-		left.rightSibling = rightNo
-	}
-	if err := t.writeNode(pgno, left); err != nil {
-		return nil, err
-	}
-	return &splitResult{sepKey: sep, right: rightNo}, nil
-}
-
-// writeOrSplitAr is like writeOrSplit but uses ar for encoding and split
+// writeOrSplitAr writes n back to pgno if it fits, otherwise splits it. It uses ar for encoding and split
 // separator allocation, eliminating per-cell and per-key heap allocations.
 func (t *Tree) writeOrSplitAr(pgno uint32, n *node, ar *nodeArena) (*splitResult, error) {
 	if n.size() <= t.usable() {
@@ -349,21 +356,8 @@ func (n *node) childIndex(key []byte) int {
 	return len(n.keys)
 }
 
-// upsert inserts key/val into a leaf in sorted order, or replaces the value if
-// key is already present.
-func (n *node) upsert(key, val []byte) {
-	i, ok := n.find(key)
-	v := bytes.Clone(val)
-	if ok {
-		n.vals[i] = v
-		return
-	}
-	n.keys = insertBytes(n.keys, i, bytes.Clone(key))
-	n.vals = insertBytes(n.vals, i, v)
-}
-
-// upsertAr is like upsert but copies key and val into ar instead of to the
-// heap, keeping all per-operation bytes in the arena.
+// upsertAr inserts key/val into a leaf in sorted order (or replaces the value if key is present),
+// copying key and val into ar instead of to the heap.
 func (n *node) upsertAr(key, val []byte, ar *nodeArena) {
 	i, ok := n.find(key)
 	v := ar.copy(val)
@@ -375,26 +369,8 @@ func (n *node) upsertAr(key, val []byte, ar *nodeArena) {
 	n.vals = insertBytes(n.vals, i, v)
 }
 
-// split divides a full node into a lower and upper half and returns the
-// separator key that routes between them. For a leaf the separator is the first
-// key of the upper half (which stays in the upper half). For an interior node
-// the middle key is promoted and removed from both halves.
-func (n *node) split() (left, right *node, sep []byte) {
-	mid := len(n.keys) / 2
-	if n.leaf {
-		left = &node{leaf: true, keys: n.keys[:mid], vals: n.vals[:mid]}
-		right = &node{leaf: true, keys: n.keys[mid:], vals: n.vals[mid:], rightSibling: n.rightSibling}
-		return left, right, bytes.Clone(right.keys[0])
-	}
-	sep = bytes.Clone(n.keys[mid])
-	left = &node{keys: n.keys[:mid], children: n.children[:mid+1]}
-	right = &node{keys: n.keys[mid+1:], children: n.children[mid+1:]}
-	return left, right, sep
-}
-
-// splitAr is like split but skips the bytes.Clone calls: all keys are already
-// in the arena, so slices of them are stable until the arena is reset at the
-// end of the enclosing Put.
+// splitAr divides a full node into a lower and upper half. Keys are already in ar.buf so no copy is needed;
+// slices are stable until the arena resets at the end of the enclosing Put.
 func (n *node) splitAr(ar *nodeArena) (left, right *node, sep []byte) {
 	_ = ar // keys already live in ar.buf; just slice, no copy needed
 	mid := len(n.keys) / 2
@@ -521,13 +497,11 @@ func decodeNodeAr(b []byte, ar *nodeArena) (*node, error) {
 	if !leaf && h.Type != format.PageTypeBTreeInt {
 		return nil, fmt.Errorf("aki/btree: not a b-tree node (page type 0x%02x)", h.Type)
 	}
-	n := &node{leaf: leaf}
 	count := int(h.CellCount)
+	n := ar.allocNode(leaf, count)
 
 	if leaf {
 		n.rightSibling = encoding.U32(b[16:])
-		n.keys = make([][]byte, count)
-		n.vals = make([][]byte, count)
 		for i := range count {
 			off := int(encoding.U16(b[slotsStart+2*i:]))
 			kl, m, err := encoding.Uvarint(b[off:])
@@ -548,8 +522,6 @@ func decodeNodeAr(b []byte, ar *nodeArena) (*node, error) {
 	}
 
 	rightmost := encoding.U32(b[16:])
-	n.keys = make([][]byte, count)
-	n.children = make([]uint32, count+1)
 	for i := range count {
 		off := int(encoding.U16(b[slotsStart+2*i:]))
 		n.children[i] = encoding.U32(b[off:])
