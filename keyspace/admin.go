@@ -49,6 +49,7 @@ func (db *DB) Flush() error {
 	db.keyCount = 0
 	db.expireCount = 0
 	db.avgTTL = 0
+	db.hc.cclear()
 	return nil
 }
 
@@ -72,5 +73,6 @@ func (ks *Keyspace) Swap(i, j int) error {
 	a.keyCount, b.keyCount = b.keyCount, a.keyCount
 	a.expireCount, b.expireCount = b.expireCount, a.expireCount
 	a.avgTTL, b.avgTTL = b.avgTTL, a.avgTTL
+	a.hc, b.hc = b.hc, a.hc
 	return nil
 }
