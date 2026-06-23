@@ -201,7 +201,7 @@ type DB struct {
 	// hot cache but not yet applied to the B-tree. The read path consults it on
 	// a hot-cache miss so a GET that follows an async SET always sees the new
 	// value, even if the hot cache has since evicted the entry.
-	wbMu     sync.RWMutex
+	wbMu      sync.RWMutex
 	wbPending map[string]wbPendingEntry
 }
 
@@ -209,8 +209,8 @@ type DB struct {
 // the same fields PrepareWriteBehind stored in the hot cache so the read path
 // can serve the value without touching the B-tree.
 type wbPendingEntry struct {
-	body    []byte
-	hdr     ValueHeader
+	body []byte
+	hdr  ValueHeader
 }
 
 // Open binds a Keyspace to a pager and loads the catalog. The number of
