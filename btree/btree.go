@@ -29,6 +29,27 @@ import (
 	"github.com/tamnd/aki/pager"
 )
 
+// arenaNodeCap is the maximum number of node structs that can be pre-allocated
+// in one nodeArena without falling back to the heap. A Get traverses at most
+// one node per tree level; Put/Delete traverse and may rewrite one per level.
+// A 4-level tree covering billions of keys still fits in 4 entries.
+const arenaNodeCap = 8
+
+// arenaNodeKeyCap is the maximum number of cells per page that the pre-allocated
+// backing arrays cover without heap fallback. Pages hold at most 255 cells with
+// the default 4096-byte page size.
+const arenaNodeKeyCap = 256
+
+// arenaNodeEntry holds one pre-allocated node struct and its backing arrays.
+// Embedding the arrays directly in the struct keeps them on the same cache line
+// group as the node header, which matters for sequential key scans.
+type arenaNodeEntry struct {
+	n        node
+	keysBuf  [arenaNodeKeyCap][]byte
+	valsBuf  [arenaNodeKeyCap][]byte
+	childBuf [arenaNodeKeyCap + 1]uint32
+}
+
 // nodeArena is a per-operation scratch buffer that holds the decoded key and
 // value bytes for all B-tree nodes visited during one Get, Put, or Delete call.
 // All bytes.Clone calls in the hot path are replaced by arena copies, which
@@ -37,14 +58,20 @@ import (
 // reset (its length set back to zero) and returned to the pool. The backing
 // slice is reused on the next operation that gets this arena from the pool.
 //
+// entries pre-allocates arenaNodeCap node structs along with their keys/vals
+// backing arrays. decodeNodeAr calls allocNode instead of &node{} + make(),
+// eliminating 3 heap allocations per page decode.
+//
 // tmp is a separate scratch buffer for building encoded cells in encodeNode.
 // It is also reset between cells and reset at the start of each writeNode call.
 // Because both buf and tmp are only used within the single-threaded hot path
 // (one goroutine holds e.mu for writes; reads take RLock but each gets its own
 // arena from the pool), there are no concurrency hazards.
 type nodeArena struct {
-	buf []byte
-	tmp []byte
+	buf     []byte
+	tmp     []byte
+	entries [arenaNodeCap]arenaNodeEntry
+	entryN  int
 }
 
 var nodeArenaPool = sync.Pool{
@@ -62,9 +89,41 @@ func (a *nodeArena) copy(src []byte) []byte {
 	return a.buf[start:]
 }
 
+// allocNode returns a node backed by pre-allocated arrays from the arena when
+// possible, falling back to heap allocation for deep trees or oversized pages.
+func (a *nodeArena) allocNode(leaf bool, count int) *node {
+	if a.entryN < arenaNodeCap && count <= arenaNodeKeyCap {
+		e := &a.entries[a.entryN]
+		a.entryN++
+		n := &e.n
+		n.leaf = leaf
+		n.rightSibling = 0
+		if leaf {
+			n.keys = e.keysBuf[:count]
+			n.vals = e.valsBuf[:count]
+			n.children = nil
+		} else {
+			n.keys = e.keysBuf[:count]
+			n.vals = nil
+			n.children = e.childBuf[:count+1]
+		}
+		return n
+	}
+	n := &node{leaf: leaf}
+	if leaf {
+		n.keys = make([][]byte, count)
+		n.vals = make([][]byte, count)
+	} else {
+		n.keys = make([][]byte, count)
+		n.children = make([]uint32, count+1)
+	}
+	return n
+}
+
 func (a *nodeArena) reset() {
 	a.buf = a.buf[:0]
 	a.tmp = a.tmp[:0]
+	a.entryN = 0
 }
 
 // slotsStart is the byte offset where the slot array begins on both leaf and
@@ -521,13 +580,11 @@ func decodeNodeAr(b []byte, ar *nodeArena) (*node, error) {
 	if !leaf && h.Type != format.PageTypeBTreeInt {
 		return nil, fmt.Errorf("aki/btree: not a b-tree node (page type 0x%02x)", h.Type)
 	}
-	n := &node{leaf: leaf}
 	count := int(h.CellCount)
+	n := ar.allocNode(leaf, count)
 
 	if leaf {
 		n.rightSibling = encoding.U32(b[16:])
-		n.keys = make([][]byte, count)
-		n.vals = make([][]byte, count)
 		for i := range count {
 			off := int(encoding.U16(b[slotsStart+2*i:]))
 			kl, m, err := encoding.Uvarint(b[off:])
@@ -548,8 +605,6 @@ func decodeNodeAr(b []byte, ar *nodeArena) (*node, error) {
 	}
 
 	rightmost := encoding.U32(b[16:])
-	n.keys = make([][]byte, count)
-	n.children = make([]uint32, count+1)
 	for i := range count {
 		off := int(encoding.U16(b[slotsStart+2*i:]))
 		n.children[i] = encoding.U32(b[off:])
