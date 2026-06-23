@@ -212,6 +212,24 @@ func handleSet(ctx *Ctx) {
 		return
 	}
 
+	// Write-behind fast path: simple SET with no conditional or read-back
+	// options, a body that fits inline, and a deferred commit policy. The hot
+	// cache is updated synchronously so the next GET on this connection returns
+	// the new value immediately. The B-tree write is fire-and-forget.
+	if !opts.nx && !opts.xx && !opts.get && opts.ttlMode != ttlKeep &&
+		len(val) <= keyspace.MaxInlineBody && ctx.d.engine != nil && ctx.d.engine.isDeferred() {
+		ttl := absoluteTTL(opts.ttlMode, opts.ttlValue, keyspace.ValueHeader{}, false)
+		enc := stringEncoding(val)
+		// Copy key and val: qbuf may be reused before the async write runs.
+		keyCopy := append([]byte(nil), key...)
+		valCopy := append([]byte(nil), val...)
+		if ctx.updateWriteBehind(keyCopy, valCopy, keyspace.TypeString, enc, ttl) {
+			ctx.notify(notifyString, "set", key)
+			ctx.Conn.WriteRaw(resp.ReplyOK)
+		}
+		return
+	}
+
 	var (
 		wrongTyp bool
 		aborted  bool // a condition (NX or XX) was not met
