@@ -33,6 +33,30 @@ func handleDel(ctx *Ctx) {
 	keys := ctx.Argv[1:]
 	var removed int64
 	gone := make([]bool, len(keys))
+
+	// Single-key fast path: route to the key's shard channel so it can run
+	// in parallel with writes to other shards. Multi-key DEL stays on the
+	// global path to keep deletion of a key set atomic.
+	if len(keys) == 1 {
+		if ctx.updateShard(keys[0], func(db *keyspace.DB) error {
+			ok, err := db.Delete(keys[0])
+			if err != nil {
+				return err
+			}
+			if ok {
+				removed++
+				gone[0] = true
+			}
+			return nil
+		}) {
+			if gone[0] {
+				ctx.notify(notifyGeneric, "del", keys[0])
+			}
+			ctx.enc().WriteInteger(removed)
+		}
+		return
+	}
+
 	if ctx.update(func(db *keyspace.DB) error {
 		for i, k := range keys {
 			ok, err := db.Delete(k)
