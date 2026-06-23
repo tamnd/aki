@@ -739,16 +739,10 @@ func fmtRatio(a, b int64) string {
 	return strconv.FormatFloat(float64(a)/float64(b), 'f', 2, 64)
 }
 
-// cpuSeconds returns the process system and user CPU time in seconds.
-func cpuSeconds() (sys, user float64) {
-	var ru syscall.Rusage
-	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
-		return 0, 0
-	}
-	user = float64(ru.Utime.Sec) + float64(ru.Utime.Usec)/1e6
-	sys = float64(ru.Stime.Sec) + float64(ru.Stime.Usec)/1e6
-	return sys, user
-}
+// cpuSeconds returns the process system and user CPU time in seconds. The unix
+// and windows builds read it from different system calls (getrusage versus
+// GetProcessTimes), so the implementation lives in info_rusage.go and
+// info_windows.go.
 
 // executablePath returns the running binary path, or "" when it cannot be found.
 func executablePath() string {
