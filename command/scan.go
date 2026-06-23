@@ -22,9 +22,19 @@ func scanCommands() []*CmdDesc {
 	}
 }
 
+// flushForScan drains all pending write-behind writes before a full-keyspace
+// read. KEYS, SCAN, and RANDOMKEY must call this so they never miss a key that
+// received "+OK" but whose B-tree entry has not yet been applied.
+func flushForScan(ctx *Ctx) {
+	if ctx.d.engine != nil {
+		ctx.d.engine.FlushShardWrites()
+	}
+}
+
 // handleKeys replies with every key matching the glob pattern. The order is the
 // keyspace walk order, which Redis leaves unspecified.
 func handleKeys(ctx *Ctx) {
+	flushForScan(ctx)
 	pattern := ctx.Argv[1]
 	var matched [][]byte
 	if !ctx.view(func(db *keyspace.DB) error {
@@ -51,6 +61,7 @@ func handleKeys(ctx *Ctx) {
 // handleRandomKey replies with one key picked uniformly at random, or a null
 // when the database is empty.
 func handleRandomKey(ctx *Ctx) {
+	flushForScan(ctx)
 	var chosen []byte
 	var found bool
 	if !ctx.view(func(db *keyspace.DB) error {
@@ -77,6 +88,7 @@ func handleRandomKey(ctx *Ctx) {
 // handleScan replies with the next cursor and a batch of keys. It accepts the
 // MATCH, COUNT and TYPE options in any order.
 func handleScan(ctx *Ctx) {
+	flushForScan(ctx)
 	cursor, err := strconv.ParseUint(string(ctx.Argv[1]), 10, 64)
 	if err != nil {
 		ctx.enc().WriteError("ERR invalid cursor")
