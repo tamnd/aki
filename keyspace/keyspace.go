@@ -187,6 +187,11 @@ type DB struct {
 	// can update eviction bookkeeping without serializing on the write lock.
 	accessMu sync.Mutex
 	access   map[string]keyAccess
+
+	// hc is the hot-value cache for this database. A Get on a cached key returns
+	// the body and header without walking the B-tree. Set and Delete invalidate
+	// the entry so the next read always sees fresh data.
+	hc *dbCache
 }
 
 // Open binds a Keyspace to a pager and loads the catalog. The number of
@@ -206,7 +211,7 @@ func Open(pgr *pager.Pager) (*Keyspace, error) {
 		lfuDecayTime: lfuDecayTime,
 	}
 	for i := range ks.dbs {
-		ks.dbs[i] = &DB{ks: ks, index: i, rootPage: format.NullPage}
+		ks.dbs[i] = &DB{ks: ks, index: i, rootPage: format.NullPage, hc: newDBCache()}
 	}
 	if ks.catRoot != format.NullPage {
 		if err := ks.loadCatalog(); err != nil {
@@ -364,6 +369,9 @@ func (db *DB) Set(key, body []byte, typ, enc uint8, ttlMs int64) error {
 		db.expireCount--
 	}
 	db.recordAccess(key, isNew)
+	// Invalidate any cached value so the next Get reads the new body from the
+	// B-tree rather than returning a stale entry.
+	db.hc.cinvalidate(string(key))
 	return nil
 }
 
@@ -385,7 +393,24 @@ func (db *DB) Peek(key []byte) (body []byte, hdr ValueHeader, found bool, err er
 // eviction bookkeeping. An expired key is returned as not-found immediately;
 // its B-tree deletion is deferred to the next active expiry cycle so this
 // function is safe to call under the engine read lock from concurrent goroutines.
+//
+// Cache check: a hot key returns from hc without touching the B-tree. The
+// cache is populated on the first B-tree read and invalidated on any write, so
+// a hit is always fresh. Peek skips the cache so introspection commands (OBJECT,
+// EXISTS) do not promote keys or produce stale TTL observations.
 func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found bool, err error) {
+	if touch {
+		if b, h, ok := db.hc.cget(string(key)); ok {
+			if db.expired(h) {
+				// The entry expired after we cached it. Invalidate so the next
+				// active expiry cycle handles the B-tree deletion.
+				db.hc.cinvalidate(string(key))
+				return nil, ValueHeader{}, false, nil
+			}
+			db.recordAccess(key, false)
+			return b, h, true, nil
+		}
+	}
 	t := db.loadTree()
 	if t == nil {
 		return nil, ValueHeader{}, false, nil
@@ -404,15 +429,19 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 	if touch {
 		db.recordAccess(key, false)
 	}
+	var out []byte
 	if h.Flags&FlagInlineBody == 0 {
-		body, err := db.ks.readOverflow(uint32(h.BodyRef), int(h.BodyLen))
+		out, err = db.ks.readOverflow(uint32(h.BodyRef), int(h.BodyLen))
 		if err != nil {
 			return nil, ValueHeader{}, false, err
 		}
-		return body, h, true, nil
+	} else {
+		out = make([]byte, len(cell))
+		copy(out, cell)
 	}
-	out := make([]byte, len(cell))
-	copy(out, cell)
+	if touch {
+		db.hc.cput(string(key), out, h)
+	}
 	return out, h, true, nil
 }
 
@@ -443,6 +472,7 @@ func (db *DB) Delete(key []byte) (bool, error) {
 		db.keyCount--
 		db.ks.dataBytes -= int64(len(key)) + int64(prev.BodyLen) + entryOverhead
 		db.dropAccess(key)
+		db.hc.cinvalidate(string(key))
 		if prev.HasTTL() {
 			db.expireCount--
 		}
