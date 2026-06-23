@@ -1,0 +1,10 @@
+title       = "aki"
+baseURL     = "https://aki.tamnd.com/"
+description = "A Redis-compatible database in a single file. aki speaks RESP2 and RESP3 on the wire and stores everything in one .aki file with a write-ahead log, MVCC snapshots, and crash-safe commits, the way SQLite does."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/aki"
