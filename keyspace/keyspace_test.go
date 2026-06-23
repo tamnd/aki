@@ -135,8 +135,8 @@ func TestLazyExpiry(t *testing.T) {
 	if _, _, found, _ := db.Get([]byte("k")); !found {
 		t.Fatal("key should be live before expiry")
 	}
-	if db.expireCount != 1 {
-		t.Fatalf("expireCount = %d want 1", db.expireCount)
+	if db.totalExpireCount() != 1 {
+		t.Fatalf("expireCount = %d want 1", db.totalExpireCount())
 	}
 
 	clock = 2000 // now at/after expiry
@@ -151,8 +151,8 @@ func TestLazyExpiry(t *testing.T) {
 	if db.Len() != 0 {
 		t.Fatalf("Len = %d want 0 after expiry cycle", db.Len())
 	}
-	if db.expireCount != 0 {
-		t.Fatalf("expireCount = %d want 0 after expiry cycle", db.expireCount)
+	if db.totalExpireCount() != 0 {
+		t.Fatalf("expireCount = %d want 0 after expiry cycle", db.totalExpireCount())
 	}
 }
 

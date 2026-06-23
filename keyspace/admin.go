@@ -5,14 +5,27 @@ import (
 	"github.com/tamnd/aki/format"
 )
 
-// Flush empties the database. It walks the tree once to free every overflow
-// chain and to drop the freed keys from the used-memory estimate, returns the
-// tree's own pages to the freelist, then drops the root and zeroes the counters
-// so the next write starts a fresh tree. Before page reclamation this path
-// orphaned the whole tree, the one place page accounting could not hold; now the
-// pages go back on the freelist like an UNLINK frees its overflow chain.
+// Flush empties the database. For each shard it walks the shard tree to free
+// overflow chains and update the used-memory estimate, returns the tree pages
+// to the freelist, then zeroes the shard so the next write starts fresh. The
+// hot-value cache is cleared after all shards are flushed.
 func (db *DB) Flush() error {
-	if t := db.loadTree(); t != nil {
+	for s := range NumShards {
+		db.shards[s].mu.Lock()
+		if err := db.flushShard(s); err != nil {
+			db.shards[s].mu.Unlock()
+			return err
+		}
+		db.shards[s].mu.Unlock()
+	}
+	db.hc.Load().cclear()
+	return nil
+}
+
+// flushShard drains one shard. Caller holds shards[s].mu.Lock().
+func (db *DB) flushShard(s int) error {
+	t := db.loadShardTree(s)
+	if t != nil {
 		var overflow []uint32
 		c := t.Cursor()
 		if err := c.First(); err != nil {
@@ -23,7 +36,7 @@ func (db *DB) Flush() error {
 				if h.Flags&FlagInlineBody == 0 && h.BodyRef != 0 {
 					overflow = append(overflow, uint32(h.BodyRef))
 				}
-				db.ks.dataBytes -= int64(len(rawKey(c.Key()))) + int64(h.BodyLen) + entryOverhead
+				db.ks.dataBytes.Add(-(int64(len(rawKey(c.Key()))) + int64(h.BodyLen) + entryOverhead))
 			}
 			if err := c.Next(); err != nil {
 				return err
@@ -44,12 +57,10 @@ func (db *DB) Flush() error {
 			}
 		}
 	}
-	db.rootPage = format.NullPage
-	db.tree = nil
-	db.keyCount = 0
-	db.expireCount = 0
-	db.avgTTL = 0
-	db.hc.Load().cclear()
+	db.shards[s].rootPage = format.NullPage
+	db.shards[s].tree = nil
+	db.shards[s].keyCount = 0
+	db.shards[s].expireCount = 0
 	return nil
 }
 
@@ -68,10 +79,26 @@ func (ks *Keyspace) Swap(i, j int) error {
 	if a == b {
 		return nil
 	}
-	a.rootPage, b.rootPage = b.rootPage, a.rootPage
-	a.tree, b.tree = b.tree, a.tree
-	a.keyCount, b.keyCount = b.keyCount, a.keyCount
-	a.expireCount, b.expireCount = b.expireCount, a.expireCount
+	// Lock all shards of both DBs in a consistent order (lower DB index first,
+	// then shard index) to avoid deadlock when two Swaps race.
+	first, second := a, b
+	if i > j {
+		first, second = b, a
+	}
+	for s := range NumShards {
+		first.shards[s].mu.Lock()
+		second.shards[s].mu.Lock()
+	}
+	defer func() {
+		for s := range NumShards {
+			second.shards[s].mu.Unlock()
+			first.shards[s].mu.Unlock()
+		}
+	}()
+
+	for s := range NumShards {
+		a.shards[s], b.shards[s] = b.shards[s], a.shards[s]
+	}
 	a.avgTTL, b.avgTTL = b.avgTTL, a.avgTTL
 	// Exchange the hot-cache pointers atomically so lock-free hot-GET readers
 	// always see a valid (if transiently stale) cache pointer during the swap.

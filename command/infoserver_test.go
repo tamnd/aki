@@ -12,8 +12,8 @@ import (
 func TestInfoServerStorageFields(t *testing.T) {
 	r, c := startData(t)
 
-	if got := infoField(t, r, c, "server", "aki_storage_format"); got != "fmt001" {
-		t.Fatalf("aki_storage_format = %q want fmt001", got)
+	if got := infoField(t, r, c, "server", "aki_storage_format"); got != "fmt002" {
+		t.Fatalf("aki_storage_format = %q want fmt002", got)
 	}
 	// startData opens the pager with a 4096 byte page.
 	if got := infoField(t, r, c, "server", "aki_page_size"); got != "4096" {

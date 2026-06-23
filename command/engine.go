@@ -94,24 +94,29 @@ type Engine struct {
 	// atomic. setCommitPolicy writes it from CONFIG SET and at startup.
 	policy atomic.Int32
 
-	// pendingDirty is true when at least one write has mutated the buffer pool
-	// since the last checkpoint. pendingWrites counts those writes for the
-	// dirty-page sampler. lastCommit stamps the previous checkpoint so the cron
-	// can hold the everysec interval. All three are guarded by mu.
-	pendingDirty  bool
-	pendingWrites int
-	lastCommit    time.Time
+	// pendingDirty is set atomically by shard workers when a deferred write lands
+	// and cleared under e.mu.Lock by commit. Atomic because N shard workers set
+	// it concurrently while holding only e.mu.RLock.
+	pendingDirty atomic.Bool
+	// pendingWrites counts mutations since the last checkpoint for the dirty-page
+	// sampler. Add'd atomically by workers; sampled and reset under e.mu.Lock.
+	pendingWrites atomic.Int64
+	// lastCommit stamps the previous checkpoint; read and written under e.mu.
+	lastCommit time.Time
 
 	// dirtyPageLimit is the early-commit bound described above. Guarded by mu.
 	dirtyPageLimit int
 
-	// writeCh is the input queue for the write worker. nil when the worker is not
-	// running; update() falls back to a direct lock acquire in that case.
+	// writeCh is the shared input queue for the N shard write workers. nil when
+	// the workers are not running; update() falls back to a direct Lock acquire.
 	writeCh chan *writeReq
-	// workerStop is closed by StopWorker to signal the write goroutine to drain
-	// and exit. workerDone is closed by the goroutine once it has exited.
+	// workerStop is closed by StopWorker to signal all write goroutines to drain
+	// and exit. workerDone is closed once every goroutine has exited.
 	workerStop chan struct{}
 	workerDone chan struct{}
+	// wg tracks the N shard worker goroutines so workerDone can be closed once
+	// every one of them has returned.
+	wg sync.WaitGroup
 }
 
 // NewEngine wraps a keyspace for use by the dispatcher. It defaults to the
@@ -133,16 +138,16 @@ func (e *Engine) setCommitPolicy(p commitPolicy) error {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if !e.pendingDirty {
+	if !e.pendingDirty.Load() {
 		return nil
 	}
 	return e.commit()
 }
 
-// StartWorker starts the single-goroutine write worker. All calls to update()
-// after this point route through a buffered channel to the worker instead of
-// acquiring the write lock directly, eliminating contention between connection
-// goroutines. The caller must eventually call StopWorker to clean up.
+// StartWorker starts the per-shard write workers. Each goroutine reads from the
+// shared writeCh and holds e.mu.RLock during the write batch, allowing multiple
+// shard writes to proceed concurrently. The caller must eventually call
+// StopWorker to clean up.
 func (e *Engine) StartWorker() {
 	if e.writeCh != nil {
 		return // already running
@@ -150,12 +155,20 @@ func (e *Engine) StartWorker() {
 	e.writeCh = make(chan *writeReq, 4096)
 	e.workerStop = make(chan struct{})
 	e.workerDone = make(chan struct{})
-	go e.runWriteWorker()
+	n := keyspace.NumShards
+	e.wg.Add(n)
+	for range n {
+		go e.runWriteWorker()
+	}
+	go func() {
+		e.wg.Wait()
+		close(e.workerDone)
+	}()
 }
 
-// StopWorker signals the write worker to drain any pending requests and exit,
-// then waits until it has. After this returns, update() falls back to the
-// direct lock path. Safe to call when StartWorker was never called.
+// StopWorker signals all write workers to drain any pending requests and exit,
+// then waits until every goroutine has returned. After this, update() falls
+// back to the direct lock path. Safe to call when StartWorker was never called.
 func (e *Engine) StopWorker() {
 	if e.writeCh == nil {
 		return
@@ -165,14 +178,13 @@ func (e *Engine) StopWorker() {
 	e.writeCh = nil
 }
 
-// runWriteWorker is the write worker goroutine body. It drains write requests
-// from writeCh, applies them in batches under a single lock acquisition, and
-// signals each sync requester via its done channel. Fire-and-forget requests
-// (done == nil) are returned to asyncReqPool after processing. On workerStop
-// it drains any remaining requests before exiting so no sync caller blocks
-// forever on its done channel.
+// runWriteWorker is one write worker goroutine. Multiple copies run concurrently
+// on the shared writeCh — they each hold e.mu.RLock during a batch, which lets
+// different shards be written in parallel while commits (which take e.mu.Lock)
+// are still fully exclusive. On workerStop each worker drains any remaining
+// requests before exiting so no sync caller blocks forever on its done channel.
 func (e *Engine) runWriteWorker() {
-	defer close(e.workerDone)
+	defer e.wg.Done()
 	for {
 		select {
 		case req := <-e.writeCh:
@@ -190,23 +202,65 @@ func (e *Engine) runWriteWorker() {
 	}
 }
 
-// drainBatch applies the first request and then greedily drains any additional
-// requests already sitting in writeCh, up to writeBatchMax, under one lock hold.
-// Holding the lock across a batch keeps the B-tree pages warm in the CPU cache
-// of the worker's core and amortises the lock acquire/release cost.
+// drainBatch applies the first request and then greedily drains additional
+// requests from writeCh, up to writeBatchMax, under one lock hold.
+//
+// Under commitAlways, it takes e.mu.Lock so each write can checkpoint inside
+// applyWriteReq. Under deferred policies (commitEverySec, commitNo) it takes
+// e.mu.RLock, which lets concurrent workers apply writes to different shards in
+// parallel while still blocking commits (which take e.mu.Lock) from running
+// mid-batch. Dirty state is recorded atomically; the commit cron flushes it.
 func (e *Engine) drainBatch(first *writeReq) {
-	e.mu.Lock()
-	e.applyWriteReq(first)
+	if commitPolicy(e.policy.Load()) == commitAlways {
+		e.mu.Lock()
+		e.applyWriteReq(first)
+		for i := 1; i < writeBatchMax; i++ {
+			select {
+			case req := <-e.writeCh:
+				e.applyWriteReq(req)
+			default:
+				e.mu.Unlock()
+				return
+			}
+		}
+		e.mu.Unlock()
+		return
+	}
+	// Deferred policy: RLock allows concurrent shard writers.
+	e.mu.RLock()
+	e.applyWriteReqDeferred(first)
 	for i := 1; i < writeBatchMax; i++ {
 		select {
 		case req := <-e.writeCh:
-			e.applyWriteReq(req)
+			e.applyWriteReqDeferred(req)
 		default:
-			e.mu.Unlock()
+			e.mu.RUnlock()
 			return
 		}
 	}
-	e.mu.Unlock()
+	e.mu.RUnlock()
+}
+
+// applyWriteReqDeferred executes one write without committing. It records the
+// mutation as pending so the commit cron can flush it on the next tick. Caller
+// holds e.mu.RLock, which allows other shard workers to run concurrently.
+// Unlike commitWrite(), this does not check the dirty-page limit because calling
+// commit() under RLock would deadlock.
+func (e *Engine) applyWriteReqDeferred(req *writeReq) {
+	db, err := e.ks.DB(req.index)
+	if err == nil {
+		err = req.fn(db)
+	}
+	if err == nil {
+		e.pendingDirty.Store(true)
+		e.pendingWrites.Add(1)
+	}
+	if req.done != nil {
+		req.done <- err
+	} else {
+		req.fn = nil
+		asyncReqPool.Put(req)
+	}
 }
 
 // applyWriteReq executes one write request under the already-held write lock.
@@ -294,17 +348,19 @@ func (e *Engine) update(index int, fn func(*keyspace.DB) error) error {
 	return e.commitWrite()
 }
 
-// commitWrite applies the active policy to a write that has already mutated the
-// buffer pool. Under commitAlways it checkpoints now. Under a deferred policy it
-// marks the work pending and only checkpoints when the dirty-page bound is hit,
-// leaving the cron to flush on its timer. Caller holds e.mu.
+// commitWrite applies the active policy after a write has mutated the buffer
+// pool. Under commitAlways it checkpoints immediately. Under deferred policies
+// it marks the write pending; if the dirty-page limit is crossed it commits
+// early to bound memory use. Caller holds e.mu.Lock (direct path or commitAlways
+// worker batch). Do NOT call this under e.mu.RLock — use applyWriteReqDeferred
+// for the concurrent shard worker path instead.
 func (e *Engine) commitWrite() error {
 	if commitPolicy(e.policy.Load()) == commitAlways {
 		return e.commit()
 	}
-	e.pendingDirty = true
-	e.pendingWrites++
-	if e.dirtyPageLimit > 0 && e.pendingWrites%dirtyCheckStride == 0 {
+	e.pendingDirty.Store(true)
+	n := e.pendingWrites.Add(1)
+	if e.dirtyPageLimit > 0 && n%dirtyCheckStride == 0 {
 		if e.ks.PagerStats().DirtyPages >= e.dirtyPageLimit {
 			return e.commit()
 		}
@@ -314,13 +370,13 @@ func (e *Engine) commitWrite() error {
 
 // commit checkpoints the keyspace and reports how long the commit took to the
 // latency hook when one is installed. It clears the pending-write bookkeeping so
-// the deferred path starts a fresh interval. Caller holds e.mu.
+// the deferred path starts a fresh interval. Caller holds e.mu.Lock.
 func (e *Engine) commit() error {
 	start := time.Now()
 	err := e.ks.Commit()
 	if err == nil {
-		e.pendingDirty = false
-		e.pendingWrites = 0
+		e.pendingDirty.Store(false)
+		e.pendingWrites.Store(0)
 		e.lastCommit = start
 	}
 	if e.onCommit != nil {
@@ -333,13 +389,21 @@ func (e *Engine) commit() error {
 // server cron calls it once per tick. It is a no-op under commitAlways (nothing
 // is ever pending) and under commitNo (which flushes only on SAVE, shutdown, or
 // the dirty-page bound).
+//
+// It does a lock-free pre-check on pendingDirty to avoid acquiring the engine
+// write lock (which would briefly stall all shard workers) when there is nothing
+// to flush.
 func (e *Engine) commitCron(now time.Time) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if !e.pendingDirty {
+	if !e.pendingDirty.Load() {
 		return nil
 	}
 	if commitPolicy(e.policy.Load()) != commitEverySec {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// Re-check under the lock; a concurrent worker may have already committed.
+	if !e.pendingDirty.Load() {
 		return nil
 	}
 	if now.Sub(e.lastCommit) < time.Second {
@@ -355,7 +419,7 @@ func (e *Engine) commitCron(now time.Time) error {
 func (e *Engine) ForceCommit() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if !e.pendingDirty {
+	if !e.pendingDirty.Load() {
 		return nil
 	}
 	return e.commit()
