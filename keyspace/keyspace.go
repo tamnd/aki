@@ -224,7 +224,6 @@ type DB struct {
 	// hot-GET callers can load the cache without the engine read lock, and SwapDB
 	// can exchange the cache pointer while readers are active.
 	hc atomic.Pointer[dbCache]
-
 }
 
 // wbPendingEntry is one entry in the write-behind pending table. It carries

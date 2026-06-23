@@ -349,36 +349,13 @@ func (e *Engine) isDeferred() bool {
 	return e.writeCh != nil && commitPolicy(e.policy.Load()) != commitAlways
 }
 
-// updateAsync enqueues a fire-and-forget write on the global write channel.
-// Use updateShardAsync when the target shard is known; it avoids channel
-// contention by routing to a shard-owned channel.
-//
-// If the channel is full or the policy is commitAlways, it falls back to the
-// synchronous update path to apply back-pressure.
-func (e *Engine) updateAsync(index int, fn func(*keyspace.DB) error) error {
-	if e.writeCh != nil && commitPolicy(e.policy.Load()) != commitAlways {
-		req := asyncReqPool.Get().(*writeReq)
-		req.index = index
-		req.shard = -1
-		req.fn = fn
-		req.done = nil
-		select {
-		case e.writeCh <- req:
-			return nil
-		default:
-			asyncReqPool.Put(req)
-		}
-	}
-	return e.update(index, fn)
-}
-
 // updateShardAsync enqueues a fire-and-forget write on the dedicated channel
 // for shard s. Because only one goroutine drains writeChs[s], there is no
 // channel contention, and the shard goroutine processes it without competing
 // with other shards for the B-tree lock. fn must capture heap-owned copies of
 // all data it uses from the connection read buffer.
 //
-// Falls back to updateAsync (global channel) when workers are not running or
+// Falls back to the synchronous update path when workers are not running or
 // the policy is commitAlways.
 func (e *Engine) updateShardAsync(index, shard int, fn func(*keyspace.DB) error) error {
 	if e.writeChs[shard] != nil && commitPolicy(e.policy.Load()) != commitAlways {
