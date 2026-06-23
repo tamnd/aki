@@ -213,6 +213,12 @@ func popList(ctx *Ctx, head bool) {
 // handleLLen implements LLEN: the element count, or 0 when the key is absent.
 func handleLLen(ctx *Ctx) {
 	key := ctx.Argv[1]
+
+	if elems, ok := hotGetList(ctx, key); ok {
+		ctx.enc().WriteInteger(int64(len(elems)))
+		return
+	}
+
 	var (
 		wrongTyp bool
 		n        int64
@@ -255,6 +261,17 @@ func handleLRange(ctx *Ctx) {
 		ctx.enc().WriteError("ERR value is not an integer or out of range")
 		return
 	}
+
+	if elems, ok := hotGetList(ctx, key); ok {
+		out := listSlice(elems, start, stop)
+		enc := ctx.enc()
+		enc.WriteArrayLen(len(out))
+		for _, e := range out {
+			enc.WriteBulkString(e)
+		}
+		return
+	}
+
 	var (
 		wrongTyp bool
 		out      [][]byte

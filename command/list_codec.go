@@ -77,3 +77,24 @@ func listEncoding(lim encLimits, elems [][]byte, prev uint8) uint8 {
 	}
 	return keyspace.EncListpack
 }
+
+// hotGetList tries to decode the list at key from the lock-free hot cache.
+// Returns (elems, true) on a hit and (nil, false) on a miss.
+func hotGetList(ctx *Ctx, key []byte) ([][]byte, bool) {
+	e := ctx.d.engine
+	if e == nil {
+		return nil, false
+	}
+	body, hdr, ok := e.viewHotGet(ctx.Conn.DB(), key)
+	if !ok {
+		return nil, false
+	}
+	if hdr.Type != keyspace.TypeList {
+		return nil, false
+	}
+	elems, err := listDecode(body)
+	if err != nil {
+		return nil, false
+	}
+	return elems, true
+}

@@ -110,3 +110,24 @@ func getSet(db *keyspace.DB, key []byte) ([][]byte, keyspace.ValueHeader, bool, 
 	}
 	return members, hdr, true, nil
 }
+
+// hotGetSet tries to decode the set at key from the lock-free hot cache.
+// Returns (members, true) on a hit and (nil, false) on a miss.
+func hotGetSet(ctx *Ctx, key []byte) ([][]byte, bool) {
+	e := ctx.d.engine
+	if e == nil {
+		return nil, false
+	}
+	body, hdr, ok := e.viewHotGet(ctx.Conn.DB(), key)
+	if !ok {
+		return nil, false
+	}
+	if hdr.Type != keyspace.TypeSet {
+		return nil, false
+	}
+	members, err := setDecode(body)
+	if err != nil {
+		return nil, false
+	}
+	return members, true
+}
