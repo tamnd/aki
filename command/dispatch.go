@@ -2,10 +2,10 @@ package command
 
 import (
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/tamnd/aki/networking"
 	"github.com/tamnd/aki/resp"
@@ -28,6 +28,7 @@ func putCtx(ctx *Ctx) {
 	ctx.Argv = nil
 	ctx.d = nil
 	ctx.sess = nil
+	ctx.ar.reset()
 	ctx.readyKeys = ctx.readyKeys[:0]
 	ctx.readyKeysAll = ctx.readyKeysAll[:0]
 	ctx.forceProp = false
@@ -411,6 +412,12 @@ type Ctx struct {
 	d    *Dispatcher
 	sess *session
 
+	// ar is a bump allocator for per-command scratch (perf/05 §4.2). It lives on
+	// the pooled Ctx so its slab is reused across commands without re-allocating.
+	// Handlers use ar.bytes(n) to get scratch and must not retain slices past the
+	// end of the handler; putCtx resets the arena so the slab is ready for reuse.
+	ar cmdArena
+
 	// readyKeys collects keys a handler made ready for blocked clients (a list
 	// that gained elements). runCommand wakes the waiters after the command has
 	// been applied and propagated, so a woken client sees the element and its own
@@ -548,7 +555,17 @@ func (ctx *Ctx) enc() *resp.Encoder { return ctx.Conn.Enc() }
 // the command, check arity, check auth, then call the handler.
 func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	sess := d.sessionFor(c)
-	name := strings.ToLower(string(argv[0]))
+	// getCtx early so ctx.ar can back the name scratch, avoiding a heap
+	// allocation for strings.ToLower(string(argv[0])). defer putCtx covers
+	// every early return.
+	ctx := getCtx(c, argv, d, sess)
+	defer putCtx(ctx)
+	nameScratch := ctx.ar.bytes(len(argv[0]))
+	nameScratch = lowerASCII(nameScratch, argv[0])
+	// unsafe.String avoids a heap allocation: nameScratch is arena memory that
+	// outlives all uses of name within this function. The arena is reset only
+	// after Handle returns (via defer putCtx), so name is valid throughout.
+	name := unsafe.String(unsafe.SliceData(nameScratch), len(nameScratch))
 
 	// A RESP2 client with active subscriptions is in subscriber mode and may run
 	// only the subscribe family plus PING, QUIT and RESET. RESP3 lifts this.
@@ -575,7 +592,7 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	if cmd.SubName != "" {
 		sess.lastCmd = cmd.SubName
 	} else {
-		sess.lastCmd = name
+		sess.lastCmd = cmd.Name
 	}
 	if !checkArity(cmd, len(argv)) {
 		msg := arityError(cmd)
@@ -641,9 +658,7 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		return
 	}
 
-	ctx := getCtx(c, argv, d, sess)
 	d.runCommand(ctx, cmd)
-	putCtx(ctx)
 }
 
 // sessionFor returns the connection's session, creating it on first use. A new
