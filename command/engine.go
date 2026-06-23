@@ -41,12 +41,11 @@ const defaultDirtyPageLimit = 2048
 // to the hot path, so we sample once per stride writes instead.
 const dirtyCheckStride = 256
 
-// Engine is the command layer's handle on the keyspace. It serializes every
-// access with a single mutex, which is the one-writer assumption the keyspace
-// makes at this milestone. The sharded writer model from doc 05 §7 replaces this
-// global lock in a later slice.
+// Engine is the command layer's handle on the keyspace. Writes take the write
+// lock; reads take the read lock so multiple reads run in parallel. The sharded
+// writer model from doc 05 §7 replaces this lock entirely in a later slice.
 type Engine struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 	ks *keyspace.Keyspace
 	// onCommit, when set, is called with the duration of each checkpoint commit so
 	// the dispatcher can flag slow I/O. The dispatcher installs it at startup.
@@ -203,12 +202,10 @@ func (e *Engine) updateKeyspaceDurable(fn func(*keyspace.Keyspace) error) error 
 
 // version returns the write version of a key in database index, and whether the
 // key is live. A missing or expired key reports version 0 and exists false. WATCH
-// and EXEC use this to detect a change to a watched key. The read goes through the
-// lock and may delete an expired key as a side effect, the same lazy expiry any
-// read does.
+// and EXEC use this to detect a change to a watched key.
 func (e *Engine) version(index int, key []byte) (uint64, bool, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	db, err := e.ks.DB(index)
 	if err != nil {
 		return 0, false, err
@@ -220,12 +217,13 @@ func (e *Engine) version(index int, key []byte) (uint64, bool, error) {
 	return hdr.Version, true, nil
 }
 
-// view runs fn against database index under the engine lock without committing.
-// A read command goes through here. Lazy expiry inside a read may delete a key;
-// that deletion is left in the buffer pool and folds into the next commit.
+// view runs fn against database index under the engine read lock without
+// committing. Multiple reads run concurrently; writes take the write lock and
+// exclude reads. Lazy expiry is deferred to the next active expiry cycle so the
+// read path is free of B-tree writes.
 func (e *Engine) view(index int, fn func(*keyspace.DB) error) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	db, err := e.ks.DB(index)
 	if err != nil {
 		return err
@@ -249,21 +247,18 @@ func (e *Engine) activeExpireCycle() error {
 	return e.commitWrite()
 }
 
-// takeExpired drains the keys lazy expiry removed since the last call. It holds
-// the engine lock so it does not race a concurrent access appending to the log.
+// takeExpired drains the keys the active expiry cycle removed since the last
+// call. TakeExpired holds expiredMu internally, so no engine lock is needed.
 func (e *Engine) takeExpired() []keyspace.ExpiredKey {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	return e.ks.TakeExpired()
 }
 
 // snapshotAll copies every live key in every database into an rdb.Snapshot under
-// the engine lock. The copy is taken in memory so the lock is held only for the
-// scan, not for the disk write that follows: BGSAVE writes the returned snapshot
-// from a background goroutine while new writes proceed.
+// the engine read lock. The copy is taken in memory; BGSAVE writes it from a
+// background goroutine while new writes proceed.
 func (e *Engine) snapshotAll() (rdb.Snapshot, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return SnapshotKeyspace(e.ks)
 }
 
@@ -277,16 +272,16 @@ func (e *Engine) setLFUParams(logFactor, decayTime int) {
 
 // usedMemory returns the live-data estimate the maxmemory check compares against.
 func (e *Engine) usedMemory() int64 {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.ks.UsedMemory()
 }
 
 // sampleForEviction returns up to n eviction candidates, restricted to volatile
 // keys when volatileOnly is set.
 func (e *Engine) sampleForEviction(n int, volatileOnly bool) []keyspace.EvictionCandidate {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.ks.SampleForEviction(n, volatileOnly)
 }
 
@@ -307,11 +302,10 @@ func (e *Engine) evict(dbIndex int, key []byte) (bool, error) {
 }
 
 // dbSizes returns the key count of every database, indexed by database number.
-// INFO's keyspace section reads it. The read takes the engine lock so it does
-// not race a concurrent write.
+// INFO's keyspace section reads it.
 func (e *Engine) dbSizes() []uint64 {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	n := e.ks.DBCount()
 	out := make([]uint64, n)
 	for i := range n {
@@ -323,19 +317,18 @@ func (e *Engine) dbSizes() []uint64 {
 	return out
 }
 
-// fileStats returns the pager counters for the file-growth INFO fields. It takes
-// the engine lock so the read does not race a commit changing the page count.
+// fileStats returns the pager counters for the file-growth INFO fields.
 func (e *Engine) fileStats() pager.Stats {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.ks.PagerStats()
 }
 
 // filePath returns the path of the .aki file backing the engine, empty for an
 // in-memory backing.
 func (e *Engine) filePath() string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.ks.PagerName()
 }
 

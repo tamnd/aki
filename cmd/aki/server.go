@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/tamnd/aki/command"
@@ -31,6 +32,7 @@ func cmdServer(args []string) error {
 	dbfile := fs.String("dbfile", "aki.db", "path to the .aki data file")
 	loadRDB := fs.String("load-rdb", "", "import this dump.rdb on first open (only when the .aki file does not exist)")
 	rdbDB := fs.Int("rdb-db", -1, "with --load-rdb, import only this source database")
+	bufferPoolSize := fs.String("buffer-pool-size", "128mb", "buffer pool capacity (e.g. 128mb, 512mb); controls how much of the .aki file stays in memory")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -40,7 +42,12 @@ func cmdServer(args []string) error {
 		return fmt.Errorf("--load-rdb only applies on first open; %s already exists", *dbfile)
 	}
 
-	ks, closeKS, err := openKeyspace(*dbfile, *databases)
+	poolPages, err := parseBufPoolPages(*bufferPoolSize)
+	if err != nil {
+		return fmt.Errorf("--buffer-pool-size: %w", err)
+	}
+
+	ks, closeKS, err := openKeyspace(*dbfile, *databases, poolPages)
 	if err != nil {
 		return err
 	}
@@ -203,16 +210,19 @@ func importRDBInto(ks *keyspace.Keyspace, path string, onlyDB int) (int, []strin
 // openKeyspace opens the data file at path, creating it on first run, and
 // returns the keyspace over it plus a close function. The pager picks the file
 // format up from its header on reopen, so databases is used only at create time.
-func openKeyspace(path string, databases int) (*keyspace.Keyspace, func(), error) {
+// poolPages is the buffer-pool capacity in frames; zero uses the pager default.
+func openKeyspace(path string, databases, poolPages int) (*keyspace.Keyspace, func(), error) {
 	osfs := vfs.NewOS()
+	opts := pager.Options{CachePages: poolPages}
 	var (
 		pgr *pager.Pager
 		err error
 	)
 	if osfs.Exists(path) {
-		pgr, err = pager.Open(osfs, path, pager.Options{})
+		pgr, err = pager.Open(osfs, path, opts)
 	} else {
-		pgr, err = pager.Create(osfs, path, pager.Options{DBCount: uint32(databases)})
+		opts.DBCount = uint32(databases)
+		pgr, err = pager.Create(osfs, path, opts)
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("open data file %s: %w", path, err)
@@ -223,4 +233,53 @@ func openKeyspace(path string, databases int) (*keyspace.Keyspace, func(), error
 		return nil, nil, fmt.Errorf("open keyspace: %w", err)
 	}
 	return ks, func() { _ = pgr.Close() }, nil
+}
+
+// parseBufPoolPages converts a human-readable size string (128mb, 512MiB, 65536)
+// to a page count. It understands k/m/g suffixes (case-insensitive, with or
+// without the trailing 'b' or 'ib'). A plain integer is treated as a byte count.
+// The page size is fixed at the pager's default (16 KiB) for the conversion.
+func parseBufPoolPages(s string) (int, error) {
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	val, unit, _ := splitSuffix(s)
+	if val <= 0 {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	switch unit {
+	case "k", "kb", "kib":
+		val *= 1024
+	case "m", "mb", "mib":
+		val *= 1024 * 1024
+	case "g", "gb", "gib":
+		val *= 1024 * 1024 * 1024
+	case "", "b":
+		// already bytes
+	default:
+		return 0, fmt.Errorf("unknown unit in %q", s)
+	}
+	const defaultPageBytes = 16384
+	pages := val / defaultPageBytes
+	if pages < 64 {
+		pages = 64
+	}
+	return pages, nil
+}
+
+// splitSuffix splits a string like "128mb" into (128, "mb"). The suffix is
+// lowercased; the numeric part must be a non-negative integer.
+func splitSuffix(s string) (int, string, bool) {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return 0, "", false
+	}
+	n := 0
+	for _, c := range s[:i] {
+		n = n*10 + int(c-'0')
+	}
+	return n, strings.ToLower(s[i:]), true
 }
