@@ -189,6 +189,12 @@ type dbShard struct {
 	// totalExpireCount() can read them without holding the shard mutex.
 	keyCount    atomic.Uint64
 	expireCount atomic.Uint64
+
+	// wbMu guards wbPending for this shard. Keeping write-behind state per
+	// shard means concurrent writers on different key ranges do not compete
+	// on a single lock, reducing contention 1/NumShards.
+	wbMu      sync.RWMutex
+	wbPending map[string]wbPendingEntry
 }
 
 // ShardOf returns the shard index for key, which is the low bits of its hash
@@ -218,14 +224,6 @@ type DB struct {
 	// hot-GET callers can load the cache without the engine read lock, and SwapDB
 	// can exchange the cache pointer while readers are active.
 	hc atomic.Pointer[dbCache]
-
-	// wbMu guards wbPending, the in-flight write-behind table. wbPending maps
-	// a key name to the value that the write-behind path has made visible in the
-	// hot cache but not yet applied to the B-tree. The read path consults it on
-	// a hot-cache miss so a GET that follows an async SET always sees the new
-	// value, even if the hot cache has since evicted the entry.
-	wbMu      sync.RWMutex
-	wbPending map[string]wbPendingEntry
 }
 
 // wbPendingEntry is one entry in the write-behind pending table. It carries
@@ -528,33 +526,36 @@ const MaxInlineBody = maxInlineBody
 // counter advances before the entry is visible to readers.
 func (db *DB) PrepareWriteBehind(key, body []byte, hdr ValueHeader) {
 	sk := string(key)
+	s := ShardOf(key)
 	db.hc.Load().cput(sk, body, hdr)
-	db.wbMu.Lock()
-	if db.wbPending == nil {
-		db.wbPending = make(map[string]wbPendingEntry, 16)
+	db.shards[s].wbMu.Lock()
+	if db.shards[s].wbPending == nil {
+		db.shards[s].wbPending = make(map[string]wbPendingEntry, 16)
 	}
-	db.wbPending[sk] = wbPendingEntry{body: body, hdr: hdr}
-	db.wbMu.Unlock()
+	db.shards[s].wbPending[sk] = wbPendingEntry{body: body, hdr: hdr}
+	db.shards[s].wbMu.Unlock()
 }
 
 // removeWBPending removes the write-behind pending entry for key if its version
 // matches. Mismatched version means a newer write was already staged, so the
 // older entry should not be removed.
 func (db *DB) removeWBPending(key string, version uint64) {
-	db.wbMu.Lock()
-	if e, ok := db.wbPending[key]; ok && e.hdr.Version == version {
-		delete(db.wbPending, key)
+	s := ShardOf([]byte(key))
+	db.shards[s].wbMu.Lock()
+	if e, ok := db.shards[s].wbPending[key]; ok && e.hdr.Version == version {
+		delete(db.shards[s].wbPending, key)
 	}
-	db.wbMu.Unlock()
+	db.shards[s].wbMu.Unlock()
 }
 
 // getWBPending returns the pending write-behind value for key, if any. The read
 // path calls this on a hot-cache miss to avoid serving a stale B-tree value
 // when the write worker has not yet applied the write.
 func (db *DB) getWBPending(key string) ([]byte, ValueHeader, bool) {
-	db.wbMu.RLock()
-	e, ok := db.wbPending[key]
-	db.wbMu.RUnlock()
+	s := ShardOf([]byte(key))
+	db.shards[s].wbMu.RLock()
+	e, ok := db.shards[s].wbPending[key]
+	db.shards[s].wbMu.RUnlock()
 	if !ok {
 		return nil, ValueHeader{}, false
 	}

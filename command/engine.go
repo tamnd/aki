@@ -15,8 +15,12 @@ import (
 // caller waits for that signal before continuing. When done is nil the req is
 // fire-and-forget: the caller returns immediately and the worker puts the req
 // back in the async pool itself.
+//
+// shard >= 0 when the write targets a specific keyspace shard and was routed
+// to writeChs[shard]. shard == -1 means global (routed to writeCh).
 type writeReq struct {
 	index int
+	shard int
 	fn    func(*keyspace.DB) error
 	done  chan error // nil for fire-and-forget requests
 }
@@ -107,15 +111,20 @@ type Engine struct {
 	// dirtyPageLimit is the early-commit bound described above. Guarded by mu.
 	dirtyPageLimit int
 
-	// writeCh is the shared input queue for the N shard write workers. nil when
-	// the workers are not running; update() falls back to a direct Lock acquire.
+	// writeCh is the global input queue for the single global write worker. It
+	// handles cross-shard writes, commitAlways writes, and writes where the caller
+	// cannot determine the shard. nil when workers are not running.
 	writeCh chan *writeReq
+	// writeChs are the per-shard input queues. writeChs[s] is served exclusively
+	// by one goroutine, so there is zero channel contention between shards.
+	// Deferred single-key writes route here by ShardOf(key).
+	writeChs [keyspace.NumShards]chan *writeReq
 	// workerStop is closed by StopWorker to signal all write goroutines to drain
 	// and exit. workerDone is closed once every goroutine has exited.
 	workerStop chan struct{}
 	workerDone chan struct{}
-	// wg tracks the N shard worker goroutines so workerDone can be closed once
-	// every one of them has returned.
+	// wg tracks all worker goroutines so workerDone can be closed once every
+	// one of them has returned.
 	wg sync.WaitGroup
 }
 
@@ -144,21 +153,25 @@ func (e *Engine) setCommitPolicy(p commitPolicy) error {
 	return e.commit()
 }
 
-// StartWorker starts the per-shard write workers. Each goroutine reads from the
-// shared writeCh and holds e.mu.RLock during the write batch, allowing multiple
-// shard writes to proceed concurrently. The caller must eventually call
-// StopWorker to clean up.
+// StartWorker starts all write workers: one global worker for cross-shard and
+// commitAlways writes, and one dedicated worker per shard for deferred
+// single-key writes. The per-shard workers each own their channel exclusively —
+// no contention — and hold e.mu.RLock so different shards write in parallel.
+// The caller must eventually call StopWorker to clean up.
 func (e *Engine) StartWorker() {
 	if e.writeCh != nil {
 		return // already running
 	}
 	e.writeCh = make(chan *writeReq, 4096)
+	for s := range keyspace.NumShards {
+		e.writeChs[s] = make(chan *writeReq, 4096)
+	}
 	e.workerStop = make(chan struct{})
 	e.workerDone = make(chan struct{})
-	n := keyspace.NumShards
-	e.wg.Add(n)
-	for range n {
-		go e.runWriteWorker()
+	e.wg.Add(1 + keyspace.NumShards)
+	go e.runWriteWorker()
+	for s := range keyspace.NumShards {
+		go e.runShardWorker(s)
 	}
 	go func() {
 		e.wg.Wait()
@@ -166,7 +179,7 @@ func (e *Engine) StartWorker() {
 	}()
 }
 
-// StopWorker signals all write workers to drain any pending requests and exit,
+// StopWorker signals all write workers to drain pending requests and exit,
 // then waits until every goroutine has returned. After this, update() falls
 // back to the direct lock path. Safe to call when StartWorker was never called.
 func (e *Engine) StopWorker() {
@@ -176,13 +189,14 @@ func (e *Engine) StopWorker() {
 	close(e.workerStop)
 	<-e.workerDone
 	e.writeCh = nil
+	for s := range keyspace.NumShards {
+		e.writeChs[s] = nil
+	}
 }
 
-// runWriteWorker is one write worker goroutine. Multiple copies run concurrently
-// on the shared writeCh — they each hold e.mu.RLock during a batch, which lets
-// different shards be written in parallel while commits (which take e.mu.Lock)
-// are still fully exclusive. On workerStop each worker drains any remaining
-// requests before exiting so no sync caller blocks forever on its done channel.
+// runWriteWorker is the global write worker goroutine. It handles cross-shard
+// writes and commitAlways writes via drainBatch, which holds e.mu.Lock or
+// e.mu.RLock depending on the active policy.
 func (e *Engine) runWriteWorker() {
 	defer e.wg.Done()
 	for {
@@ -200,6 +214,49 @@ func (e *Engine) runWriteWorker() {
 			}
 		}
 	}
+}
+
+// runShardWorker is a dedicated goroutine for shard s. It reads exclusively
+// from writeChs[s] — no other goroutine ever reads that channel — so there is
+// zero channel-lock contention between shards. It holds e.mu.RLock during a
+// batch so the shard runs in parallel with other shard workers while commits
+// (which take e.mu.Lock) remain fully exclusive.
+func (e *Engine) runShardWorker(s int) {
+	defer e.wg.Done()
+	for {
+		select {
+		case req := <-e.writeChs[s]:
+			e.drainShardBatch(s, req)
+		case <-e.workerStop:
+			for {
+				select {
+				case req := <-e.writeChs[s]:
+					e.drainShardBatch(s, req)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// drainShardBatch processes a batch from writeChs[s] under e.mu.RLock.
+// Because only one goroutine reads writeChs[s], and keyspace shard s is also
+// written exclusively by this goroutine, both the channel and the B-tree are
+// uncontended. Batching amortises the RLock acquire/release cost.
+func (e *Engine) drainShardBatch(s int, first *writeReq) {
+	e.mu.RLock()
+	e.applyWriteReqDeferred(first)
+	for i := 1; i < writeBatchMax; i++ {
+		select {
+		case req := <-e.writeChs[s]:
+			e.applyWriteReqDeferred(req)
+		default:
+			e.mu.RUnlock()
+			return
+		}
+	}
+	e.mu.RUnlock()
 }
 
 // drainBatch applies the first request and then greedily drains additional
@@ -292,26 +349,25 @@ func (e *Engine) isDeferred() bool {
 	return e.writeCh != nil && commitPolicy(e.policy.Load()) != commitAlways
 }
 
-// updateAsync enqueues a fire-and-forget write when the write worker is running
-// and the commit policy is deferred. The caller returns nil immediately; the
-// write worker applies fn to the B-tree in the background without signaling the
-// caller. fn must capture only heap-owned copies of any data derived from the
-// connection read buffer (qbuf), because qbuf may be reused before fn runs.
+// updateShardAsync enqueues a fire-and-forget write on the dedicated channel
+// for shard s. Because only one goroutine drains writeChs[s], there is no
+// channel contention, and the shard goroutine processes it without competing
+// with other shards for the B-tree lock. fn must capture heap-owned copies of
+// all data it uses from the connection read buffer.
 //
-// If the worker channel is full or the policy is commitAlways, updateAsync
-// falls back to the synchronous update path to apply back-pressure and preserve
-// the durability contract.
-func (e *Engine) updateAsync(index int, fn func(*keyspace.DB) error) error {
-	if e.writeCh != nil && commitPolicy(e.policy.Load()) != commitAlways {
+// Falls back to the synchronous update path when workers are not running or
+// the policy is commitAlways.
+func (e *Engine) updateShardAsync(index, shard int, fn func(*keyspace.DB) error) error {
+	if e.writeChs[shard] != nil && commitPolicy(e.policy.Load()) != commitAlways {
 		req := asyncReqPool.Get().(*writeReq)
 		req.index = index
+		req.shard = shard
 		req.fn = fn
 		req.done = nil
 		select {
-		case e.writeCh <- req:
+		case e.writeChs[shard] <- req:
 			return nil
 		default:
-			// Channel full: fall back to sync to apply back-pressure.
 			asyncReqPool.Put(req)
 		}
 	}
@@ -329,6 +385,7 @@ func (e *Engine) update(index int, fn func(*keyspace.DB) error) error {
 	if e.writeCh != nil {
 		req := writeReqPool.Get().(*writeReq)
 		req.index = index
+		req.shard = -1
 		req.fn = fn
 		e.writeCh <- req
 		err := <-req.done
@@ -647,9 +704,12 @@ func (ctx *Ctx) updateWriteBehind(key, body []byte, typ, enc uint8, ttlMs int64)
 		hdr.Flags |= keyspace.FlagHasTTL
 	}
 	db.PrepareWriteBehind(key, body, hdr)
-	// Capture copies so the closure is safe after qbuf is compacted.
+	// Route the async B-tree write to the shard that owns this key so the
+	// shard goroutine can process it without channel contention from other
+	// shards. Capture copies so the closure is safe after qbuf is compacted.
+	shard := keyspace.ShardOf(key)
 	k, v, t, en, ttl, ver := key, body, typ, enc, ttlMs, version
-	if asyncErr := e.updateAsync(ctx.Conn.DB(), func(db *keyspace.DB) error {
+	if asyncErr := e.updateShardAsync(ctx.Conn.DB(), shard, func(db *keyspace.DB) error {
 		return db.SetWithVersion(k, v, t, en, ttl, ver)
 	}); asyncErr != nil {
 		ctx.enc().WriteError("ERR " + asyncErr.Error())
