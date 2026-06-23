@@ -185,6 +185,33 @@ func TestZRem(t *testing.T) {
 	}
 }
 
+// TestZAddNoOpKeepsState checks that a ZADD blocked entirely by NX/XX/GT/LT does
+// not change anything: a fully blocked add returns :0 and leaves the existing
+// scores untouched, and XX against a missing key creates nothing.
+func TestZAddNoOpKeepsState(t *testing.T) {
+	r, c := startData(t)
+	if got := sendLine(t, r, c, "ZADD z 1 a 2 b"); got != ":2" {
+		t.Fatalf("ZADD = %q want :2", got)
+	}
+	// NX on an existing member is blocked: nothing added, score stays 1.
+	if got := sendLine(t, r, c, "ZADD z NX 9 a"); got != ":0" {
+		t.Fatalf("ZADD NX existing = %q want :0", got)
+	}
+	if got := sendLine(t, r, c, "ZSCORE z a"); got != "$1" {
+		t.Fatalf("ZSCORE header = %q want $1", got)
+	}
+	if got := sendLine(t, r, c, ""); got != "1" {
+		t.Fatalf("ZSCORE a = %q want 1 (unchanged)", got)
+	}
+	// XX against a missing key creates nothing.
+	if got := sendLine(t, r, c, "ZADD missing XX 1 a"); got != ":0" {
+		t.Fatalf("ZADD XX missing = %q want :0", got)
+	}
+	if got := sendLine(t, r, c, "EXISTS missing"); got != ":0" {
+		t.Fatalf("EXISTS missing = %q want :0", got)
+	}
+}
+
 func TestZSetWrongType(t *testing.T) {
 	r, c := startData(t)
 	_ = sendLine(t, r, c, "SET s hello")

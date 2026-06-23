@@ -154,6 +154,32 @@ func TestSMoveDeletesEmptiedSource(t *testing.T) {
 	}
 }
 
+// TestSAddSRemLargeBatch exercises the map-based dedup path that kicks in at
+// setDedupMapThreshold members, making sure it counts and stores the same as the
+// linear path. The batch is deliberately above the threshold and includes
+// duplicate members, which must be folded to one.
+func TestSAddSRemLargeBatch(t *testing.T) {
+	r, c := startData(t)
+	// 12 distinct members plus a repeat of "m0" => 12 added, not 13.
+	if got := sendLine(t, r, c, "SADD big m0 m1 m2 m3 m4 m5 m6 m7 m8 m9 m10 m11 m0"); got != ":12" {
+		t.Fatalf("SADD big = %q want :12", got)
+	}
+	if got := sendLine(t, r, c, "SCARD big"); got != ":12" {
+		t.Fatalf("SCARD = %q want :12", got)
+	}
+	// Re-adding existing members adds nothing.
+	if got := sendLine(t, r, c, "SADD big m0 m1 m2 m3 m4 m5 m6 m7 m8"); got != ":0" {
+		t.Fatalf("SADD existing = %q want :0", got)
+	}
+	// Remove a large batch that names a missing member and a duplicate.
+	if got := sendLine(t, r, c, "SREM big m0 m1 m2 m3 m4 m5 m6 m7 nope m0"); got != ":8" {
+		t.Fatalf("SREM big = %q want :8", got)
+	}
+	if got := sendLine(t, r, c, "SCARD big"); got != ":4" {
+		t.Fatalf("SCARD after SREM = %q want :4", got)
+	}
+}
+
 func TestSetWrongType(t *testing.T) {
 	r, c := startData(t)
 	_ = sendLine(t, r, c, "SET s hello")

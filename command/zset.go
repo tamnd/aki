@@ -149,7 +149,11 @@ parsed:
 			added++
 			incrResult = p.score
 		}
-		if len(members) == 0 {
+		if added == 0 && changed == 0 {
+			// A fully blocked ZADD (every pair stopped by NX/XX/GT/LT, or an
+			// XX against a missing key) changed nothing. Skip the re-encode and
+			// write so the key version is not bumped and no spurious record hits
+			// the WAL, matching Redis's dirty-counter guard.
 			return nil
 		}
 		zsetSort(members)
