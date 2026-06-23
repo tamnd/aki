@@ -3,12 +3,36 @@ package command
 import (
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/tamnd/aki/networking"
 	"github.com/tamnd/aki/resp"
 )
+
+var ctxPool = sync.Pool{New: func() any { return new(Ctx) }}
+
+func getCtx(c *networking.Conn, argv [][]byte, d *Dispatcher, sess *session) *Ctx {
+	ctx := ctxPool.Get().(*Ctx)
+	ctx.Conn = c
+	ctx.Argv = argv
+	ctx.d = d
+	ctx.sess = sess
+	ctx.forceProp = false
+	return ctx
+}
+
+func putCtx(ctx *Ctx) {
+	ctx.Conn = nil
+	ctx.Argv = nil
+	ctx.d = nil
+	ctx.sess = nil
+	ctx.readyKeys = ctx.readyKeys[:0]
+	ctx.readyKeysAll = ctx.readyKeysAll[:0]
+	ctx.forceProp = false
+	ctxPool.Put(ctx)
+}
 
 // Config holds the server settings the dispatcher needs.
 type Config struct {
@@ -617,7 +641,9 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		return
 	}
 
-	d.runCommand(&Ctx{Conn: c, Argv: argv, d: d, sess: sess}, cmd)
+	ctx := getCtx(c, argv, d, sess)
+	d.runCommand(ctx, cmd)
+	putCtx(ctx)
 }
 
 // sessionFor returns the connection's session, creating it on first use. A new
