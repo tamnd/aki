@@ -1,13 +1,42 @@
 package bench_test
 
 import (
+	"fmt"
 	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/tamnd/aki/keyspace"
 	"github.com/tamnd/aki/pager"
 	"github.com/tamnd/aki/vfs"
 )
+
+// g5Tags are hash-tagged key prefixes that each route to a distinct keyspace
+// shard, verified by TestG5TagsDistinct. Using {tag} syntax forces all keys
+// with the same tag to the same shard regardless of the suffix.
+var g5Tags = [keyspace.NumShards]string{
+	"{g6}", // shard 0
+	"{g7}", // shard 1
+	"{g4}", // shard 2
+	"{g5}", // shard 3
+	"{g2}", // shard 4
+	"{g3}", // shard 5
+	"{g0}", // shard 6
+	"{g1}", // shard 7
+}
+
+// TestG5TagsDistinct verifies every g5Tags entry maps to a unique shard.
+func TestG5TagsDistinct(t *testing.T) {
+	seen := make(map[int]string, keyspace.NumShards)
+	for i, tag := range g5Tags {
+		k := []byte(tag + ":key:000000")
+		s := keyspace.ShardOf(k)
+		if prev, dup := seen[s]; dup {
+			t.Fatalf("g5Tags[%d]=%q and g5Tags (prev %q) both map to shard %d", i, tag, prev, s)
+		}
+		seen[s] = tag
+	}
+}
 
 // newBenchDB opens an in-memory keyspace and returns database 0, the storage
 // path behind GET/SET. aki keeps keys in a paged B-tree rather than an in-RAM
@@ -136,4 +165,41 @@ func BenchmarkDictGetParallel(b *testing.B) {
 			i++
 		}
 	})
+}
+
+// BenchmarkDictSetParallelDisjoint is the G5 multi-core scaling benchmark
+// (spec doc 00 §G5). It runs NumShards goroutines concurrently, each writing
+// to keys that all route to a different shard, so the shard mutexes are fully
+// independent. The aggregate throughput divided by a single-goroutine run
+// should reach at least 4x on an 8-core machine.
+func BenchmarkDictSetParallelDisjoint(b *testing.B) {
+	db := newBenchDB(b)
+	val := []byte("value")
+	b.ReportAllocs()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	total := 0
+	b.RunParallel(func(pb *testing.PB) {
+		// Each parallel goroutine picks one of the NumShards tag slots.
+		// Go's testing framework may use more goroutines than NumShards;
+		// mod ensures no out-of-bounds access and reuse is fine for the
+		// scaling measurement.
+		var myID int
+		mu.Lock()
+		myID = total % keyspace.NumShards
+		total++
+		mu.Unlock()
+		tag := g5Tags[myID]
+		wg.Add(1)
+		defer wg.Done()
+		i := 0
+		for pb.Next() {
+			k := []byte(fmt.Sprintf("%s:key:%08d", tag, i))
+			if err := db.Set(k, val, 0, 0, -1); err != nil {
+				b.Fatalf("set: %v", err)
+			}
+			i++
+		}
+	})
+	wg.Wait()
 }
