@@ -54,7 +54,7 @@ func cmdImport(args []string) error {
 		return nil
 	}
 
-	ks, closeKS, err := openKeyspace(*target, snapshotDBCount(snap))
+	ks, closeKS, err := openKeyspace(*target, snapshotDBCount(snap), 0)
 	if err != nil {
 		return err
 	}
@@ -141,7 +141,7 @@ func cmdDump(args []string) error {
 // dumpFromFile reads a snapshot out of an offline .aki file, optionally limited
 // to one database.
 func dumpFromFile(file string, db int) (rdb.Snapshot, error) {
-	ks, closeKS, err := openKeyspace(file, 16)
+	ks, closeKS, err := openKeyspace(file, 16, 0)
 	if err != nil {
 		return rdb.Snapshot{}, err
 	}

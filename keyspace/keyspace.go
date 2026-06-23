@@ -14,6 +14,7 @@ package keyspace
 import (
 	"errors"
 	"math/rand/v2"
+	"sync"
 	"time"
 
 	"github.com/tamnd/aki/btree"
@@ -65,7 +66,9 @@ type Keyspace struct {
 
 	// expiredLog collects keys deleted by lazy expiry since the last drain. The
 	// command layer empties it with TakeExpired after each access to fire the
-	// "expired" keyspace event. Access is serialized by the command engine lock.
+	// "expired" keyspace event. expiredMu guards it so concurrent reads can log
+	// expired keys without holding the engine write lock.
+	expiredMu  sync.Mutex
 	expiredLog []ExpiredKey
 
 	// dataBytes is the running estimate of live key and value bytes, the figure
@@ -153,9 +156,11 @@ func (ks *Keyspace) SampleForEviction(n int, volatileOnly bool) []EvictionCandid
 }
 
 // TakeExpired returns the keys lazily expired since the last call and clears the
-// log. The command engine calls it under its own lock so there is no concurrent
-// appender.
+// log. Guarded by expiredMu so concurrent reads on different goroutines can
+// append without data-racing the slice.
 func (ks *Keyspace) TakeExpired() []ExpiredKey {
+	ks.expiredMu.Lock()
+	defer ks.expiredMu.Unlock()
 	if len(ks.expiredLog) == 0 {
 		return nil
 	}
@@ -178,7 +183,10 @@ type DB struct {
 	// access holds the in-memory LRU and LFU bookkeeping per key, keyed by the raw
 	// key name. It is built up as keys are read and written and is not persisted,
 	// matching how Redis treats approximate eviction state across a restart.
-	access map[string]keyAccess
+	// accessMu guards access independently of the engine lock so concurrent reads
+	// can update eviction bookkeeping without serializing on the write lock.
+	accessMu sync.Mutex
+	access   map[string]keyAccess
 }
 
 // Open binds a Keyspace to a pager and loads the catalog. The number of
@@ -374,7 +382,9 @@ func (db *DB) Peek(key []byte) (body []byte, hdr ValueHeader, found bool, err er
 }
 
 // get is the shared read path. When touch is set it records an access for the
-// eviction bookkeeping; lazy expiry runs either way.
+// eviction bookkeeping. An expired key is returned as not-found immediately;
+// its B-tree deletion is deferred to the next active expiry cycle so this
+// function is safe to call under the engine read lock from concurrent goroutines.
 func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found bool, err error) {
 	t := db.loadTree()
 	if t == nil {
@@ -386,14 +396,10 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 		return nil, ValueHeader{}, false, err
 	}
 	if db.expired(h) {
-		_, err := db.Delete(key)
-		if err == nil {
-			db.ks.expiredLog = append(db.ks.expiredLog, ExpiredKey{
-				DB:  db.index,
-				Key: append([]byte(nil), key...),
-			})
-		}
-		return nil, ValueHeader{}, false, err
+		// Return not-found immediately. The B-tree entry stays until the active
+		// expiry cycle deletes it (and fires the expired event there). Deleting
+		// here under a potential read lock would race with concurrent writers.
+		return nil, ValueHeader{}, false, nil
 	}
 	if touch {
 		db.recordAccess(key, false)
@@ -470,7 +476,9 @@ func (ks *Keyspace) ActiveExpireCycle() (int, error) {
 				return total, err
 			}
 			if ok {
+				ks.expiredMu.Lock()
 				ks.expiredLog = append(ks.expiredLog, ExpiredKey{DB: db.index, Key: k})
+				ks.expiredMu.Unlock()
 				total++
 			}
 		}
