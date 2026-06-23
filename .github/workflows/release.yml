@@ -27,14 +27,15 @@ jobs:
     if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+          check-latest: true
           cache: true
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7.2.2
         with:
           distribution: goreleaser
           version: "~> v2"
@@ -48,29 +49,38 @@ jobs:
       contents: write # create the GitHub release
       packages: write # push the image to ghcr.io
       id-token: write # keyless cosign signing
+    env:
+      LINUX_REPO_DISPATCH_TOKEN: ${{ secrets.LINUX_REPO_DISPATCH_TOKEN }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+          check-latest: true
           cache: true
 
       # Build and ship the linux/arm64 image from the amd64 runner.
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@v4.1.0
+      - uses: docker/setup-buildx-action@v4.1.0
+      - uses: docker/login-action@v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Tools GoReleaser shells out to for signing and SBOMs.
-      - uses: sigstore/cosign-installer@v3
+      # Pin cosign to the 2.x line. cosign 3.x makes the new bundle format the
+      # default, which ignores the --output-signature/--output-certificate flags
+      # the signs block uses and aborts. Pinning keeps the .sig/.pem outputs and
+      # stops the release tool from floating to a breaking latest.
+      - uses: sigstore/cosign-installer@v4.1.2
+        with:
+          cosign-release: "v2.6.3"
       - uses: anchore/sbom-action/download-syft@v0.24.0
 
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7.2.2
         with:
           distribution: goreleaser
           version: "~> v2"
@@ -83,3 +93,20 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
           SCOOP_BUCKET_GITHUB_TOKEN: ${{ secrets.SCOOP_BUCKET_GITHUB_TOKEN }}
+
+      # Rebuild the Linux apt/dnf repository with the packages just released.
+      # Skipped when the dispatch token is unset, so the release never depends
+      # on it being configured.
+      - name: Refresh the Linux package repository
+        if: env.LINUX_REPO_DISPATCH_TOKEN != ''
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $LINUX_REPO_DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/tamnd/linux-repo/dispatches \
+            -d '{"event_type":"package-released"}' || true)
+          if [ "$code" = "204" ]; then
+            echo "Linux repo refresh triggered"
+          else
+            echo "Linux repo refresh not accepted (HTTP $code); skipping"
+          fi
