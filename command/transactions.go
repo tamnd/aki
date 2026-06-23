@@ -159,7 +159,9 @@ func handleExec(ctx *Ctx) {
 	// EXEC never parks. The flag is cleared once the queue drains.
 	sess.noBlock = true
 	for _, q := range queue {
-		ctx.d.runCommand(&Ctx{Conn: ctx.Conn, Argv: q.argv, d: ctx.d, sess: sess}, q.cmd)
+		txCtx := getCtx(ctx.Conn, q.argv, ctx.d, sess)
+		ctx.d.runCommand(txCtx, q.cmd)
+		putCtx(txCtx)
 	}
 	sess.noBlock = false
 }
