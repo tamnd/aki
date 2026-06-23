@@ -292,7 +292,7 @@ func handleXClaim(ctx *Ctx) {
 		claimed  []streamEntry
 		justIDs  []streamID
 	)
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(key, func(db *keyspace.DB) error {
 		s, hdr, found, err := getStream(db, key)
 		if err != nil {
 			return err
@@ -486,7 +486,7 @@ func handleXAutoClaim(ctx *Ctx) {
 		deleted  []streamID
 		cursor   = streamID{}
 	)
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(key, func(db *keyspace.DB) error {
 		s, hdr, found, err := getStream(db, key)
 		if err != nil {
 			return err

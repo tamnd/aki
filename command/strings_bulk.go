@@ -152,7 +152,7 @@ func handleAppend(ctx *Ctx) {
 		tooBig   bool
 		newLen   int
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		old, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
@@ -235,7 +235,7 @@ func handleSetRange(ctx *Ctx) {
 		wrote    bool
 		newLen   int
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		old, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
