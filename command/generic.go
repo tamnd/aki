@@ -59,6 +59,16 @@ func handleDel(ctx *Ctx) {
 // once is counted each time, matching Redis.
 func handleExists(ctx *Ctx) {
 	keys := ctx.Argv[1:]
+
+	// Fast path for single-key EXISTS: a hot-cache hit confirms the key exists.
+	// A miss still falls through to the B-tree because the key may be cold.
+	if len(keys) == 1 && ctx.d.engine != nil {
+		if _, _, ok := ctx.d.engine.viewHotGet(ctx.Conn.DB(), keys[0]); ok {
+			ctx.enc().WriteInteger(1)
+			return
+		}
+	}
+
 	var count int64
 	if ctx.view(func(db *keyspace.DB) error {
 		for _, k := range keys {
@@ -80,9 +90,19 @@ func handleExists(ctx *Ctx) {
 // the key does not exist.
 func handleType(ctx *Ctx) {
 	key := ctx.Argv[1]
+
+	// Fast path: hot-cache hit provides the type without the engine read lock.
+	// A miss falls through to the normal Peek path which reads from the B-tree.
+	if ctx.d.engine != nil {
+		if _, h, ok := ctx.d.engine.viewHotGet(ctx.Conn.DB(), key); ok {
+			ctx.enc().WriteStatus(typeName(h.Type))
+			return
+		}
+	}
+
 	name := "none"
 	if ctx.view(func(db *keyspace.DB) error {
-		_, hdr, found, err := db.Get(key)
+		_, hdr, found, err := db.Peek(key)
 		if err != nil {
 			return err
 		}
