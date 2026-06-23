@@ -240,7 +240,7 @@ func redisCall(_ *lua.Interp, sc *scriptCtx, args []lua.Value, raise bool) ([]lu
 	conn.SetSession(csess)
 	cctx := &Ctx{Conn: conn, Argv: argv, d: sc.d, sess: csess}
 
-	if msg := sc.d.aclEnforce(conn, csess, cmd, argv); msg != "" {
+	if msg := sc.d.aclEnforce(conn, csess, cmd, strings.ToLower(string(argv[0])), argv); msg != "" {
 		return fail(msg)
 	}
 	sc.d.runCommand(cctx, cmd)

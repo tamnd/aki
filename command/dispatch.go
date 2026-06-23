@@ -584,7 +584,7 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 		d.statError(msg)
 		return
 	}
-	if msg := d.aclEnforce(c, sess, cmd, argv); msg != "" {
+	if msg := d.aclEnforce(c, sess, cmd, name, argv); msg != "" {
 		c.Enc().WriteError(msg)
 		d.statReject(cmd)
 		d.statError(msg)
