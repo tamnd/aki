@@ -225,7 +225,8 @@ func handleTTL(ctx *Ctx, ms bool) {
 				if ms {
 					ctx.enc().WriteInteger(remaining)
 				} else {
-					ctx.enc().WriteInteger(remaining / 1000)
+					// Round to the nearest second, matching Redis ttlGenericCommand.
+					ctx.enc().WriteInteger((remaining + 500) / 1000)
 				}
 			}
 			return
@@ -248,7 +249,8 @@ func handleTTL(ctx *Ctx, ms bool) {
 			if ms {
 				res = remaining
 			} else {
-				res = remaining / 1000
+				// Round to the nearest second, matching Redis ttlGenericCommand.
+				res = (remaining + 500) / 1000
 			}
 		}
 		return nil
