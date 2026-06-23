@@ -315,7 +315,19 @@ func (e *Engine) drainBatch(first *writeReq) {
 // holds e.mu.RLock, which allows other shard workers to run concurrently.
 // Unlike commitWrite(), this does not check the dirty-page limit because calling
 // commit() under RLock would deadlock.
+//
+// If both req.fn and req.setKey are nil, the request is a fence: it carries no
+// write work and signals req.done without marking the engine dirty. Fences are
+// used by FlushShardWrites to wait until all previously queued async writes for
+// the shard have been applied.
 func (e *Engine) applyWriteReqDeferred(req *writeReq) {
+	if req.fn == nil && req.setKey == nil {
+		// Fence: no-op, just signal the waiter.
+		if req.done != nil {
+			req.done <- nil
+		}
+		return
+	}
 	db, err := e.ks.DB(req.index)
 	if err == nil {
 		if req.setKey != nil {
@@ -335,6 +347,35 @@ func (e *Engine) applyWriteReqDeferred(req *writeReq) {
 		req.setBody = nil
 		req.fn = nil
 		asyncReqPool.Put(req)
+	}
+}
+
+// FlushShardWrites drains all pending async writes from every shard channel by
+// sending a synchronous fence request to each shard worker and waiting for it
+// to complete. When this returns, every SET that received "+OK" before this call
+// has been applied to its shard's B-tree. Commands that read the full keyspace
+// (KEYS, SCAN, RANDOMKEY) call this so they never miss a write-behind key.
+//
+// FlushShardWrites is a no-op when the engine workers are not running.
+func (e *Engine) FlushShardWrites() {
+	if e.writeCh == nil {
+		return
+	}
+	reqs := make([]*writeReq, keyspace.NumShards)
+	for s := range keyspace.NumShards {
+		req := writeReqPool.Get().(*writeReq)
+		req.index = 0
+		req.shard = s
+		req.fn = nil    // nil fn + nil setKey = fence signal in applyWriteReqDeferred
+		req.setKey = nil
+		reqs[s] = req
+		e.writeChs[s] <- req // may block briefly if channel is at capacity
+	}
+	for s := range keyspace.NumShards {
+		<-reqs[s].done
+		req := reqs[s]
+		req.fn = nil
+		writeReqPool.Put(req)
 	}
 }
 
