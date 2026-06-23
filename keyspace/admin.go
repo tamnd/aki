@@ -96,8 +96,14 @@ func (ks *Keyspace) Swap(i, j int) error {
 		}
 	}()
 
+	// Swap shard data fields individually — copying the dbShard struct would
+	// copy the embedded sync.RWMutex, which is not allowed. The mutexes stay
+	// with their respective DB slots and continue to protect them after the swap.
 	for s := range NumShards {
-		a.shards[s], b.shards[s] = b.shards[s], a.shards[s]
+		a.shards[s].rootPage, b.shards[s].rootPage = b.shards[s].rootPage, a.shards[s].rootPage
+		a.shards[s].tree, b.shards[s].tree = b.shards[s].tree, a.shards[s].tree
+		a.shards[s].keyCount, b.shards[s].keyCount = b.shards[s].keyCount, a.shards[s].keyCount
+		a.shards[s].expireCount, b.shards[s].expireCount = b.shards[s].expireCount, a.shards[s].expireCount
 	}
 	a.avgTTL, b.avgTTL = b.avgTTL, a.avgTTL
 	// Exchange the hot-cache pointers atomically so lock-free hot-GET readers
