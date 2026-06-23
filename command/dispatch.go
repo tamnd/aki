@@ -334,8 +334,16 @@ func (d *Dispatcher) StopBackground() {
 	// Join the replica apply goroutine first so it cannot touch the keyspace or
 	// pager after they close. This runs even when the cron was never started.
 	d.StopReplication()
-	// Stop the write worker before flushing. The worker must drain its queue
-	// before we call ForceCommit so the commit sees all acknowledged writes.
+	// Stop the cron goroutine first. The cron calls FlushShardWrites inside
+	// runActiveExpire; stopping it before StopWorker ensures FlushShardWrites
+	// never races with StopWorker clearing writeChs.
+	if d.bgStop != nil {
+		close(d.bgStop)
+		<-d.bgDone
+		d.bgStop = nil
+		d.bgDone = nil
+	}
+	// Now it is safe to stop the engine write worker.
 	if d.engine != nil {
 		d.engine.StopWorker()
 	}
@@ -346,13 +354,6 @@ func (d *Dispatcher) StopBackground() {
 			d.LogWarn("Final commit on shutdown failed", "err", err.Error())
 		}
 	}
-	if d.bgStop == nil {
-		return
-	}
-	close(d.bgStop)
-	<-d.bgDone
-	d.bgStop = nil
-	d.bgDone = nil
 	d.closeAOF()
 }
 
