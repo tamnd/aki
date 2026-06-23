@@ -212,9 +212,29 @@ func handleExpireTime(ctx *Ctx, ms bool) {
 func handleTTL(ctx *Ctx, ms bool) {
 	key := ctx.Argv[1]
 	now := keyspace.NowMillis()
+
+	// Fast path: hot-cache header has the TTL without the engine read lock.
+	// A miss falls through to the B-tree path; a hit means the key exists and
+	// is not expired (HotGet filters expired entries).
+	if ctx.d.engine != nil {
+		if _, h, ok := ctx.d.engine.viewHotGet(ctx.Conn.DB(), key); ok {
+			if !h.HasTTL() {
+				ctx.enc().WriteInteger(-1)
+			} else {
+				remaining := h.TTLms - now
+				if ms {
+					ctx.enc().WriteInteger(remaining)
+				} else {
+					ctx.enc().WriteInteger(remaining / 1000)
+				}
+			}
+			return
+		}
+	}
+
 	var res int64
 	if ctx.view(func(db *keyspace.DB) error {
-		_, hdr, found, err := db.Get(key)
+		_, hdr, found, err := db.Peek(key)
 		if err != nil {
 			return err
 		}

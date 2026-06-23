@@ -279,3 +279,64 @@ func itoa(i int) string {
 	}
 	return string(b[pos:])
 }
+
+// BenchmarkE2EGet measures end-to-end GET throughput at concurrency=50 against
+// an in-process server with all keys pre-warmed in the hot cache. The hot-GET
+// bypass means these reads bypass e.mu.RLock entirely once the cache is warm.
+func BenchmarkE2EGet(b *testing.B) {
+	addr := startServer(b)
+	warmCl, err := respclient.Dial(addr, 0)
+	if err != nil {
+		b.Fatalf("dial: %v", err)
+	}
+	for i := 0; i < 1000; i++ {
+		if _, wErr := warmCl.CallStr("SET", "k:"+itoa(i), "val"); wErr != nil {
+			b.Fatalf("warmup set: %v", wErr)
+		}
+		if _, wErr := warmCl.CallStr("GET", "k:"+itoa(i)); wErr != nil {
+			b.Fatalf("warmup get: %v", wErr)
+		}
+	}
+	warmCl.Close()
+
+	cfg := benchConfig{
+		addr:     addr,
+		clients:  50,
+		requests: b.N,
+		pipeline: 1,
+		keyspace: 1000,
+		dataSize: 8,
+		workload: "get",
+		access:   "uniform",
+		warmup:   0,
+		format:   "text",
+	}
+	run, err := runBench(cfg)
+	if err != nil {
+		b.Fatalf("runBench: %v", err)
+	}
+	b.ReportMetric(run.throughput(), "ops/s")
+}
+
+// BenchmarkE2ESet measures end-to-end SET throughput at concurrency=50 to give
+// a comparison baseline alongside BenchmarkE2EGet.
+func BenchmarkE2ESet(b *testing.B) {
+	addr := startServer(b)
+	cfg := benchConfig{
+		addr:     addr,
+		clients:  50,
+		requests: b.N,
+		pipeline: 1,
+		keyspace: 1000,
+		dataSize: 8,
+		workload: "set",
+		access:   "uniform",
+		warmup:   0,
+		format:   "text",
+	}
+	run, err := runBench(cfg)
+	if err != nil {
+		b.Fatalf("runBench: %v", err)
+	}
+	b.ReportMetric(run.throughput(), "ops/s")
+}
