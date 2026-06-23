@@ -1,18 +1,14 @@
 // Package keyspace is aki's logical key dictionary (spec 2064 doc 05). It maps
-// N independent logical databases onto one .aki file. Each database is an ordered
-// map from a binary key to a ValueHeader plus its inline body, stored in a
-// per-DB B-tree keyed by a composite (hash slot, key length, key) tuple. The
-// package tracks a per-DB catalog (root page, key count, expire count, average
-// TTL) on a dedicated catalog page referenced from the meta page, and it applies
-// lazy TTL expiry on read.
-//
-// This slice is the storage layer the command dispatch layer sits on. It assumes
-// a single writer at a time; the sharded writer model and MVCC snapshot
-// filtering from doc 05 §7 and §12 come in later slices.
+// N independent logical databases onto one .aki file. Each database is split
+// into NumShards independent B-trees, each owned by a dedicated write-worker
+// goroutine, so concurrent writes on different hash-slot ranges proceed without
+// contention. Keys route to shards by HashSlot(key) & (NumShards - 1). Reads
+// and cross-shard writes use the per-shard RWMutex on dbShard for isolation.
 package keyspace
 
 import (
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -24,8 +20,18 @@ import (
 	"github.com/tamnd/aki/pager"
 )
 
+// NumShards is the number of independent B-tree shards per logical database.
+// It must be a power of 2; keys route to shards by HashSlot(key) & shardMask.
+// Changing this value requires a format migration (FormatVersion bump).
+const NumShards = 8
+
+// shardMask is the bitmask applied to a hash slot to get the shard index.
+const shardMask = NumShards - 1
+
 // recordSize is the on-disk size of one per-DB catalog record (doc 05 §2.2).
-const recordSize = 32
+// Format v2: NumShards × 4-byte roots + keyCount(8) + expireCount(8) +
+// avgTTL(4) + numShards(4) + padding(8) = NumShards*4 + 32 bytes.
+const recordSize = NumShards*4 + 32
 
 // catalogDataStart is the byte offset of the first catalog record on the catalog
 // page, just past the common 16-byte page header.
@@ -74,8 +80,9 @@ type Keyspace struct {
 
 	// dataBytes is the running estimate of live key and value bytes, the figure
 	// INFO reports as used_memory and the maxmemory eviction loop compares against
-	// the limit. Set and Delete keep it current.
-	dataBytes int64
+	// the limit. Set and Delete keep it current via atomic Add so concurrent shard
+	// writers can update it without holding the global write lock.
+	dataBytes atomic.Int64
 
 	// lfuLogFactor and lfuDecayTime back the lfu-log-factor and lfu-decay-time
 	// config knobs. Open seeds them with the Redis defaults; the command layer
@@ -103,7 +110,7 @@ func (k *Keyspace) SetLFUParams(logFactor, decayTime int) {
 // UsedMemory returns the live-data estimate in bytes, the value compared against
 // maxmemory. It is the sum of key name, body and per-key overhead across every
 // live key, which shrinks as keys are deleted or evicted.
-func (ks *Keyspace) UsedMemory() int64 { return ks.dataBytes }
+func (ks *Keyspace) UsedMemory() int64 { return ks.dataBytes.Load() }
 
 // EvictionCandidate is a key the eviction loop may remove, carrying the fields the
 // policies sort on: the expiry for volatile-ttl, the last-access time for the lru
@@ -127,7 +134,7 @@ func (ks *Keyspace) SampleForEviction(n int, volatileOnly bool) []EvictionCandid
 	out := make([]EvictionCandidate, 0, n)
 	seen := 0
 	for _, db := range ks.dbs {
-		if volatileOnly && db.expireCount == 0 {
+		if volatileOnly && db.totalExpireCount() == 0 {
 			continue
 		}
 		_ = db.forEachLive(func(ck []byte, h ValueHeader) error {
@@ -170,16 +177,32 @@ func (ks *Keyspace) TakeExpired() []ExpiredKey {
 	return out
 }
 
-// DB is one logical database: a B-tree of keys plus its catalog counters.
-type DB struct {
-	ks       *Keyspace
-	index    int
-	rootPage uint32 // btree root page, NullPage when the DB has no keys yet
+// dbShard is one of the NumShards independent B-trees that back a logical DB.
+// Writes within one shard serialise on mu.Lock; reads on the same shard take
+// mu.RLock so they are excluded from concurrent writes. Shards on different
+// key ranges run fully in parallel.
+type dbShard struct {
+	mu       sync.RWMutex
+	rootPage uint32 // btree root page, NullPage when this shard has no keys
 	tree     *btree.Tree
+	// keyCount and expireCount are updated atomically so Len() and
+	// totalExpireCount() can read them without holding the shard mutex.
+	keyCount    atomic.Uint64
+	expireCount atomic.Uint64
+}
 
-	keyCount    uint64
-	expireCount uint64
-	avgTTL      uint32
+// ShardOf returns the shard index for key, which is the low bits of its hash
+// slot. Callers that want to route a write or a lock-free read to a single
+// shard use this instead of recomputing the slot themselves.
+func ShardOf(key []byte) int { return int(HashSlot(key)) & shardMask }
+
+// DB is one logical database: NumShards B-trees plus shared metadata.
+type DB struct {
+	ks    *Keyspace
+	index int
+
+	shards [NumShards]dbShard
+	avgTTL uint32
 
 	// access holds the in-memory LRU and LFU bookkeeping per key, keyed by the raw
 	// key name. It is built up as keys are read and written and is not persisted,
@@ -215,9 +238,15 @@ type wbPendingEntry struct {
 
 // Open binds a Keyspace to a pager and loads the catalog. The number of
 // databases comes from the file header; a fresh file with no catalog page yields
-// empty databases that materialize their B-trees on first write.
+// empty databases that materialise their B-trees on first write. Files written
+// by format version 1 (single-tree catalog) are rejected; recreate the file.
 func Open(pgr *pager.Pager) (*Keyspace, error) {
-	dbCount := int(pgr.Header().DBCount)
+	hdr := pgr.Header()
+	if hdr.FormatVersion != 0 && hdr.FormatVersion < format.FormatVersion {
+		return nil, fmt.Errorf("aki/keyspace: file format v%d is too old (need v%d); recreate the file",
+			hdr.FormatVersion, format.FormatVersion)
+	}
+	dbCount := int(hdr.DBCount)
 	if dbCount <= 0 {
 		dbCount = int(format.DefaultDBCount)
 	}
@@ -230,7 +259,10 @@ func Open(pgr *pager.Pager) (*Keyspace, error) {
 		lfuDecayTime: lfuDecayTime,
 	}
 	for i := range ks.dbs {
-		db := &DB{ks: ks, index: i, rootPage: format.NullPage}
+		db := &DB{ks: ks, index: i}
+		for s := range NumShards {
+			db.shards[s].rootPage = format.NullPage
+		}
 		db.hc.Store(newDBCache())
 		ks.dbs[i] = db
 	}
@@ -267,7 +299,7 @@ func (ks *Keyspace) DB(index int) (*DB, error) {
 	return ks.dbs[index], nil
 }
 
-// loadCatalog reads the catalog page and fills each DB's counters and root.
+// loadCatalog reads the catalog page and fills each DB's shard roots and counters.
 func (ks *Keyspace) loadCatalog() error {
 	pg, err := ks.pgr.Get(ks.catRoot)
 	if err != nil {
@@ -280,10 +312,27 @@ func (ks *Keyspace) loadCatalog() error {
 			break
 		}
 		rec := pg.Data[off:]
-		db.rootPage = uint32(encoding.U64(rec[0:]))
-		db.keyCount = encoding.U64(rec[8:])
-		db.expireCount = encoding.U64(rec[16:])
-		db.avgTTL = encoding.U32(rec[24:])
+		// Bytes 0..NumShards*4-1: shard root pages (uint32 each)
+		for s := range NumShards {
+			db.shards[s].rootPage = encoding.U32(rec[s*4:])
+		}
+		base := NumShards * 4
+		keyCount := encoding.U64(rec[base:])
+		expireCount := encoding.U64(rec[base+8:])
+		db.avgTTL = encoding.U32(rec[base+16:])
+		// Distribute the persisted totals evenly across shards (they are
+		// re-counted in-memory as keys are accessed, so the split only needs
+		// to be roughly right to keep the expireCount == 0 fast-path working).
+		perShard := keyCount / uint64(NumShards)
+		remainder := keyCount % uint64(NumShards)
+		expPerShard := expireCount / uint64(NumShards)
+		expRemainder := expireCount % uint64(NumShards)
+		for s := range NumShards {
+			db.shards[s].keyCount.Store(perShard)
+			db.shards[s].expireCount.Store(expPerShard)
+		}
+		db.shards[0].keyCount.Add(remainder)
+		db.shards[0].expireCount.Add(expRemainder)
 	}
 	return nil
 }
@@ -291,33 +340,50 @@ func (ks *Keyspace) loadCatalog() error {
 // Index returns the database's index.
 func (db *DB) Index() int { return db.index }
 
-// Len returns the number of live keys, the value DBSIZE reports.
-func (db *DB) Len() uint64 { return db.keyCount }
-
-// loadTree returns the DB's B-tree, opening it from the stored root. It returns
-// nil when the DB has never been written.
-func (db *DB) loadTree() *btree.Tree {
-	if db.tree != nil {
-		return db.tree
+// Len returns the total number of live keys across all shards, the value DBSIZE reports.
+func (db *DB) Len() uint64 {
+	var total uint64
+	for s := range NumShards {
+		total += db.shards[s].keyCount.Load()
 	}
-	if db.rootPage == format.NullPage {
-		return nil
-	}
-	db.tree = btree.Open(db.ks.pgr, db.rootPage)
-	return db.tree
+	return total
 }
 
-// ensureTree returns the DB's B-tree, creating one if the DB is empty.
-func (db *DB) ensureTree() (*btree.Tree, error) {
-	if t := db.loadTree(); t != nil {
+// totalExpireCount returns the sum of expireCount across all shards.
+func (db *DB) totalExpireCount() uint64 {
+	var total uint64
+	for s := range NumShards {
+		total += db.shards[s].expireCount.Load()
+	}
+	return total
+}
+
+// loadShardTree returns the B-tree for shard s, opening it from the stored root.
+// Returns nil when the shard has never been written. Caller holds shard mu.
+func (db *DB) loadShardTree(s int) *btree.Tree {
+	sh := &db.shards[s]
+	if sh.tree != nil {
+		return sh.tree
+	}
+	if sh.rootPage == format.NullPage {
+		return nil
+	}
+	sh.tree = btree.Open(db.ks.pgr, sh.rootPage)
+	return sh.tree
+}
+
+// ensureShardTree returns the B-tree for shard s, creating one if the shard is
+// empty. Caller holds shard mu.Lock().
+func (db *DB) ensureShardTree(s int) (*btree.Tree, error) {
+	if t := db.loadShardTree(s); t != nil {
 		return t, nil
 	}
 	t, err := btree.Create(db.ks.pgr)
 	if err != nil {
 		return nil, err
 	}
-	db.tree = t
-	db.rootPage = t.Root()
+	db.shards[s].tree = t
+	db.shards[s].rootPage = t.Root()
 	return t, nil
 }
 
@@ -340,12 +406,19 @@ func (db *DB) SetWithVersion(key, body []byte, typ, enc uint8, ttlMs int64, preV
 // set is the shared implementation of Set and SetWithVersion. When preVersion
 // is zero it atomically increments the global write counter; otherwise it uses
 // preVersion directly (the counter was already advanced by NextVersion).
+// The caller must NOT hold any shard lock; set acquires the shard write lock
+// internally and releases it before returning.
 func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint64) error {
 	if ttlMs >= 0 && ttlMs <= nowMillis() {
 		_, err := db.Delete(key)
 		return err
 	}
-	t, err := db.ensureTree()
+
+	s := ShardOf(key)
+	db.shards[s].mu.Lock()
+	defer db.shards[s].mu.Unlock()
+
+	t, err := db.ensureShardTree(s)
 	if err != nil {
 		return err
 	}
@@ -395,7 +468,7 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 	if err != nil {
 		return err
 	}
-	db.rootPage = t.Root()
+	db.shards[s].rootPage = t.Root()
 
 	var prev ValueHeader
 	existed := prevCell != nil
@@ -413,28 +486,21 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 	}
 
 	if isNew {
-		db.keyCount++
+		db.shards[s].keyCount.Add(1)
 	} else {
-		db.ks.dataBytes -= int64(len(key)) + int64(prev.BodyLen) + entryOverhead
+		db.ks.dataBytes.Add(-(int64(len(key)) + int64(prev.BodyLen) + entryOverhead))
 	}
-	db.ks.dataBytes += int64(len(key)) + int64(len(body)) + entryOverhead
+	db.ks.dataBytes.Add(int64(len(key)) + int64(len(body)) + entryOverhead)
 	if h.HasTTL() && !hadTTL {
-		db.expireCount++
+		db.shards[s].expireCount.Add(1)
 	} else if !h.HasTTL() && hadTTL {
-		db.expireCount--
+		db.shards[s].expireCount.Add(^uint64(0))
 	}
 	db.recordAccess(key, isNew)
 
 	// For inline values, populate the hot-value cache with the new body so the
 	// next Get returns it from cache without a B-tree walk. For overflow values,
 	// invalidate so the next Get re-reads through the page chain.
-	//
-	// cell[HeaderSize:] is the inline body portion of the heap-allocated cell
-	// slice, which is always a safe copy regardless of where the caller's body
-	// argument came from (a qbuf slice, a heap copy, or anything else).
-	//
-	// The write-behind path also removes the pending-write entry for this key
-	// now that the B-tree holds the authoritative data.
 	sk := string(key)
 	if h.Flags&FlagInlineBody != 0 {
 		db.hc.Load().cput(sk, cell[HeaderSize:], h)
@@ -546,12 +612,7 @@ func (db *DB) Peek(key []byte) (body []byte, hdr ValueHeader, found bool, err er
 // get is the shared read path. When touch is set it records an access for the
 // eviction bookkeeping. An expired key is returned as not-found immediately;
 // its B-tree deletion is deferred to the next active expiry cycle so this
-// function is safe to call under the engine read lock from concurrent goroutines.
-//
-// Cache check: a hot key returns from hc without touching the B-tree. The
-// cache is populated on the first B-tree read and invalidated on any write, so
-// a hit is always fresh. Peek skips the cache so introspection commands (OBJECT,
-// EXISTS) do not promote keys or produce stale TTL observations.
+// function is safe to call concurrently with writes on other shards.
 func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found bool, err error) {
 	// Hot-cache check comes before the string conversion: cget and cinvalidate
 	// take []byte and do the map op with string(key) as a compiler-elided
@@ -559,8 +620,6 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 	if touch {
 		if b, h, ok := db.hc.Load().cget(key); ok {
 			if db.expired(h) {
-				// The entry expired after we cached it. Invalidate so the next
-				// active expiry cycle handles the B-tree deletion.
 				db.hc.Load().cinvalidate(key)
 				return nil, ValueHeader{}, false, nil
 			}
@@ -572,34 +631,37 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 	// never happens. The wbPending map and B-tree paths need the string key.
 	sk := string(key)
 	// Check the write-behind pending table before falling through to the B-tree.
-	// The async write worker may not have applied the B-tree write yet, so the
-	// B-tree could still hold the old value. wbPending always has the latest.
 	if b, h, ok := db.getWBPending(sk); ok {
 		if db.expired(h) {
 			return nil, ValueHeader{}, false, nil
 		}
 		if touch {
 			db.recordAccess(key, false)
-			db.hc.Load().cput(sk, b, h) // re-warm the hot cache from the pending entry
+			db.hc.Load().cput(sk, b, h)
 		}
 		return b, h, true, nil
 	}
-	t := db.loadTree()
+
+	// B-tree read: take the shard read lock so concurrent shard writes are
+	// excluded from the same page range.
+	s := ShardOf(key)
+	db.shards[s].mu.RLock()
+	t := db.loadShardTree(s)
 	if t == nil {
+		db.shards[s].mu.RUnlock()
 		return nil, ValueHeader{}, false, nil
 	}
 	ckp := ckPool.Get().(*[]byte)
 	*ckp = appendCompositeKey(*ckp, key)
 	ck := *ckp
-	h, cell, ok, err := db.read(t, ck)
+	h, cell, ok, readErr := db.read(t, ck)
 	ckPool.Put(ckp)
-	if err != nil || !ok {
-		return nil, ValueHeader{}, false, err
+	db.shards[s].mu.RUnlock()
+
+	if readErr != nil || !ok {
+		return nil, ValueHeader{}, false, readErr
 	}
 	if db.expired(h) {
-		// Return not-found immediately. The B-tree entry stays until the active
-		// expiry cycle deletes it (and fires the expired event there). Deleting
-		// here under a potential read lock would race with concurrent writers.
 		return nil, ValueHeader{}, false, nil
 	}
 	if touch {
@@ -612,8 +674,6 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 			return nil, ValueHeader{}, false, err
 		}
 	} else {
-		// cell is already an owned copy (bytes.Clone in btree.Get); use it
-		// directly to avoid a second allocation on the inline-body path.
 		out = cell
 	}
 	if touch {
@@ -630,8 +690,14 @@ func (db *DB) Exists(key []byte) (bool, error) {
 }
 
 // Delete removes key. It returns whether a key was present.
+// The caller must NOT hold any shard lock; Delete acquires the shard write lock
+// internally and releases it before returning.
 func (db *DB) Delete(key []byte) (bool, error) {
-	t := db.loadTree()
+	s := ShardOf(key)
+	db.shards[s].mu.Lock()
+	defer db.shards[s].mu.Unlock()
+
+	t := db.loadShardTree(s)
 	if t == nil {
 		return false, nil
 	}
@@ -649,13 +715,13 @@ func (db *DB) Delete(key []byte) (bool, error) {
 		return false, err
 	}
 	if ok {
-		db.rootPage = t.Root()
-		db.keyCount--
-		db.ks.dataBytes -= int64(len(key)) + int64(prev.BodyLen) + entryOverhead
+		db.shards[s].rootPage = t.Root()
+		db.shards[s].keyCount.Add(^uint64(0))
+		db.ks.dataBytes.Add(-(int64(len(key)) + int64(prev.BodyLen) + entryOverhead))
 		db.dropAccess(key)
 		db.hc.Load().cinvalidate(key)
 		if prev.HasTTL() {
-			db.expireCount--
+			db.shards[s].expireCount.Add(^uint64(0))
 		}
 		if prev.Flags&FlagInlineBody == 0 && prev.BodyRef != 0 {
 			if err := db.ks.freeOverflow(uint32(prev.BodyRef)); err != nil {
@@ -674,7 +740,7 @@ func (ks *Keyspace) ActiveExpireCycle() (int, error) {
 	now := nowMillis()
 	total := 0
 	for _, db := range ks.dbs {
-		if db.expireCount == 0 {
+		if db.totalExpireCount() == 0 {
 			continue
 		}
 		keys, err := db.expiredVolatileKeys(now)
@@ -698,26 +764,36 @@ func (ks *Keyspace) ActiveExpireCycle() (int, error) {
 }
 
 // expiredVolatileKeys returns the raw names of every key in the DB whose absolute
-// TTL is at or before now. It collects the names in one pass rather than deleting
-// during the walk, since deleting under the cursor would disturb the iteration.
+// TTL is at or before now. It scans each shard under a read lock, collecting
+// names into a flat slice rather than deleting during the walk.
 func (db *DB) expiredVolatileKeys(now int64) ([][]byte, error) {
-	t := db.loadTree()
-	if t == nil {
-		return nil, nil
-	}
 	var out [][]byte
-	c := t.Cursor()
-	if err := c.First(); err != nil {
-		return nil, err
-	}
-	for c.Valid() {
-		h, _, ok := parseHeader(c.Value())
-		if ok && h.HasTTL() && h.TTLms <= now {
-			out = append(out, copyRaw(c.Key()))
+	for s := range NumShards {
+		if db.shards[s].expireCount.Load() == 0 {
+			continue
 		}
-		if err := c.Next(); err != nil {
+		db.shards[s].mu.RLock()
+		t := db.loadShardTree(s)
+		if t == nil {
+			db.shards[s].mu.RUnlock()
+			continue
+		}
+		c := t.Cursor()
+		if err := c.First(); err != nil {
+			db.shards[s].mu.RUnlock()
 			return nil, err
 		}
+		for c.Valid() {
+			h, _, ok := parseHeader(c.Value())
+			if ok && h.HasTTL() && h.TTLms <= now {
+				out = append(out, copyRaw(c.Key()))
+			}
+			if err := c.Next(); err != nil {
+				db.shards[s].mu.RUnlock()
+				return nil, err
+			}
+		}
+		db.shards[s].mu.RUnlock()
 	}
 	return out, nil
 }
@@ -746,8 +822,10 @@ func (db *DB) expired(h ValueHeader) bool {
 	return h.HasTTL() && h.TTLms <= nowMillis()
 }
 
-// Commit persists the catalog and every DB root, then commits the pager. The
-// catalog page is allocated on first commit that has data to record.
+// Commit persists the catalog and every DB's shard roots, then commits the
+// pager. The catalog page is allocated on first commit that has data to record.
+// Each shard's read lock is held briefly while we snapshot its root and
+// counters, so shard writers always see a consistent view at commit time.
 func (ks *Keyspace) Commit() error {
 	if ks.catRoot == format.NullPage {
 		pg, err := ks.pgr.Allocate()
@@ -775,10 +853,19 @@ func (ks *Keyspace) Commit() error {
 			break
 		}
 		rec := pg.Data[off:]
-		encoding.PutU64(rec[0:], uint64(db.rootPage))
-		encoding.PutU64(rec[8:], db.keyCount)
-		encoding.PutU64(rec[16:], db.expireCount)
-		encoding.PutU32(rec[24:], db.avgTTL)
+		var keyCount, expireCount uint64
+		for s := range NumShards {
+			db.shards[s].mu.RLock()
+			encoding.PutU32(rec[s*4:], db.shards[s].rootPage)
+			keyCount += db.shards[s].keyCount.Load()
+			expireCount += db.shards[s].expireCount.Load()
+			db.shards[s].mu.RUnlock()
+		}
+		base := NumShards * 4
+		encoding.PutU64(rec[base:], keyCount)
+		encoding.PutU64(rec[base+8:], expireCount)
+		encoding.PutU32(rec[base+16:], db.avgTTL)
+		encoding.PutU32(rec[base+20:], uint32(NumShards))
 	}
 	ks.pgr.Unpin(pg, true)
 

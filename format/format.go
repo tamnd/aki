@@ -27,7 +27,8 @@ var Magic = [16]byte{
 // Format and size constants (doc 02 §1, §4, §6).
 const (
 	// FormatVersion is the current file format version, carried in the header.
-	FormatVersion uint16 = 1
+	// Version 2 introduced per-shard B-tree roots in the catalog record.
+	FormatVersion uint16 = 2
 
 	// DefaultPageSize is the page size used when a file is created without an
 	// explicit override.

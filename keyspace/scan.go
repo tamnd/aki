@@ -92,27 +92,37 @@ func (db *DB) Scan(cursor uint64, count int) (uint64, []ScanEntry, error) {
 	return cands[take-1].hash + 1, out, nil
 }
 
-// forEachLive calls fn for every unexpired key in B-tree order. The composite
-// key passed to fn is owned by the cursor and is only valid until fn returns.
+// forEachLive calls fn for every unexpired key across all shards. Within each
+// shard the composite key passed to fn is in B-tree (slot-ascending) order.
+// The shards are iterated in index order (shard 0, 1, ...), which corresponds
+// to hash-slot order since shard s owns slots [s*2048, (s+1)*2048).
 func (db *DB) forEachLive(fn func(ck []byte, h ValueHeader) error) error {
-	t := db.loadTree()
-	if t == nil {
-		return nil
-	}
-	c := t.Cursor()
-	if err := c.First(); err != nil {
-		return err
-	}
-	for c.Valid() {
-		h, _, ok := parseHeader(c.Value())
-		if ok && !db.expired(h) {
-			if err := fn(c.Key(), h); err != nil {
+	for s := range NumShards {
+		db.shards[s].mu.RLock()
+		t := db.loadShardTree(s)
+		if t == nil {
+			db.shards[s].mu.RUnlock()
+			continue
+		}
+		c := t.Cursor()
+		if err := c.First(); err != nil {
+			db.shards[s].mu.RUnlock()
+			return err
+		}
+		for c.Valid() {
+			h, _, ok := parseHeader(c.Value())
+			if ok && !db.expired(h) {
+				if err := fn(c.Key(), h); err != nil {
+					db.shards[s].mu.RUnlock()
+					return err
+				}
+			}
+			if err := c.Next(); err != nil {
+				db.shards[s].mu.RUnlock()
 				return err
 			}
 		}
-		if err := c.Next(); err != nil {
-			return err
-		}
+		db.shards[s].mu.RUnlock()
 	}
 	return nil
 }

@@ -183,10 +183,7 @@ func TestDirtyPageBoundForcesCommit(t *testing.T) {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
-	d.engine.mu.Lock()
-	pending := d.engine.pendingDirty
-	d.engine.mu.Unlock()
-	if pending {
+	if d.engine.pendingDirty.Load() {
 		t.Fatal("dirty-page bound did not force a checkpoint under the no policy")
 	}
 }
