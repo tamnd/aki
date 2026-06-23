@@ -117,6 +117,41 @@ func handleMGet(ctx *Ctx) {
 	keys := ctx.Argv[1:]
 	values := make([][]byte, len(keys))
 	present := make([]bool, len(keys))
+
+	// Hot-cache fast path: try to satisfy all keys from the lock-free hot
+	// cache. If every key hits, skip the engine read lock entirely.
+	if e := ctx.d.engine; e != nil {
+		idx := ctx.Conn.DB()
+		all := true
+		for i, k := range keys {
+			b, h, ok := e.viewHotGet(idx, k)
+			if !ok {
+				all = false
+				break
+			}
+			if h.Type == keyspace.TypeString {
+				values[i], present[i] = b, true
+			}
+		}
+		if all {
+			enc := ctx.enc()
+			enc.WriteArrayLen(len(keys))
+			for i := range keys {
+				if present[i] {
+					enc.WriteBulkString(values[i])
+				} else {
+					enc.WriteNull()
+				}
+			}
+			return
+		}
+		// Reset for the full view() path below.
+		for i := range values {
+			values[i] = nil
+			present[i] = false
+		}
+	}
+
 	if !ctx.view(func(db *keyspace.DB) error {
 		for i, k := range keys {
 			b, hdr, found, err := db.Get(k)
@@ -191,6 +226,18 @@ func handleAppend(ctx *Ctx) {
 // a missing key, WRONGTYPE for a non-string key.
 func handleStrlen(ctx *Ctx) {
 	key := ctx.Argv[1]
+
+	if e := ctx.d.engine; e != nil {
+		if b, h, ok := e.viewHotGet(ctx.Conn.DB(), key); ok {
+			if h.Type != keyspace.TypeString {
+				ctx.enc().WriteError(wrongTypeError)
+				return
+			}
+			ctx.enc().WriteInteger(int64(len(b)))
+			return
+		}
+	}
+
 	var (
 		wrongTyp bool
 		n        int
