@@ -2,6 +2,12 @@
 /bin/
 *.out
 *.test
+
+# Built docs site (tago output) and its cache
+/docs/public/
+/docs/public-pages/
+/docs/public-cf/
+
 *.aki
 *.aki-wal
 *.aki-shm
