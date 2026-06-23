@@ -1,6 +1,16 @@
 package keyspace
 
-import "github.com/tamnd/aki/encoding"
+import (
+	"sync"
+
+	"github.com/tamnd/aki/encoding"
+)
+
+// ckPool recycles composite key buffers so compositeKey does not allocate on
+// every B-tree operation. The buffer is safe to reuse because btree.Get,
+// btree.Put, and btree.Delete never retain a reference to their key argument
+// past the call boundary — they copy into the node arena or compare in-place.
+var ckPool = sync.Pool{New: func() any { b := make([]byte, 0, 64); return &b }}
 
 // Type codes for the value stored under a key (doc 05 §3.2). TYPE reports the
 // name in the comment; bitmaps, bitfields and HLL all live under TypeString.
@@ -98,10 +108,16 @@ func parseHeader(b []byte) (ValueHeader, int, bool) {
 // removes the prefix ambiguity of a bare concatenation.
 func compositeKey(key []byte) []byte {
 	out := make([]byte, 0, 6+len(key))
-	out = encoding.AppendU16(out, HashSlot(key))
-	out = encoding.AppendU32(out, uint32(len(key)))
-	out = append(out, key...)
-	return out
+	return appendCompositeKey(out, key)
+}
+
+// appendCompositeKey appends the composite key encoding of key to dst and
+// returns the result. dst is reset to length 0 first.
+func appendCompositeKey(dst, key []byte) []byte {
+	dst = dst[:0]
+	dst = encoding.AppendU16(dst, HashSlot(key))
+	dst = encoding.AppendU32(dst, uint32(len(key)))
+	return append(dst, key...)
 }
 
 // rawKey extracts the original key bytes from a composite key.
