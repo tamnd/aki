@@ -191,8 +191,10 @@ type DB struct {
 
 	// hc is the hot-value cache for this database. A Get on a cached key returns
 	// the body and header without walking the B-tree. Set and Delete invalidate
-	// the entry so the next read always sees fresh data.
-	hc *dbCache
+	// the entry so the next read always sees fresh data. Using atomic.Pointer so
+	// hot-GET callers can load the cache without the engine read lock, and SwapDB
+	// can exchange the cache pointer while readers are active.
+	hc atomic.Pointer[dbCache]
 
 	// wbMu guards wbPending, the in-flight write-behind table. wbPending maps
 	// a key name to the value that the write-behind path has made visible in the
@@ -228,7 +230,9 @@ func Open(pgr *pager.Pager) (*Keyspace, error) {
 		lfuDecayTime: lfuDecayTime,
 	}
 	for i := range ks.dbs {
-		ks.dbs[i] = &DB{ks: ks, index: i, rootPage: format.NullPage, hc: newDBCache()}
+		db := &DB{ks: ks, index: i, rootPage: format.NullPage}
+		db.hc.Store(newDBCache())
+		ks.dbs[i] = db
 	}
 	if ks.catRoot != format.NullPage {
 		if err := ks.loadCatalog(); err != nil {
@@ -425,9 +429,9 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 	// now that the B-tree holds the authoritative data.
 	sk := string(key)
 	if h.Flags&FlagInlineBody != 0 {
-		db.hc.cput(sk, cell[HeaderSize:], h)
+		db.hc.Load().cput(sk, cell[HeaderSize:], h)
 	} else {
-		db.hc.cinvalidate(sk)
+		db.hc.Load().cinvalidate(sk)
 	}
 	if preVersion > 0 {
 		db.removeWBPending(sk, preVersion)
@@ -450,7 +454,7 @@ const MaxInlineBody = maxInlineBody
 // counter advances before the entry is visible to readers.
 func (db *DB) PrepareWriteBehind(key, body []byte, hdr ValueHeader) {
 	sk := string(key)
-	db.hc.cput(sk, body, hdr)
+	db.hc.Load().cput(sk, body, hdr)
 	db.wbMu.Lock()
 	if db.wbPending == nil {
 		db.wbPending = make(map[string]wbPendingEntry, 16)
@@ -483,6 +487,34 @@ func (db *DB) getWBPending(key string) ([]byte, ValueHeader, bool) {
 	return e.body, e.hdr, true
 }
 
+// HotGet is a lock-free best-effort read that only consults the hot-value cache.
+// It returns (body, hdr, true) on a cache hit and (nil, _, false) on a miss.
+// The caller must fall back to Get on a miss; HotGet never touches the B-tree.
+//
+// HotGet may be called without the engine read lock because the hot-cache shards
+// each carry their own mutex, and the cache pointer itself is stored as an
+// atomic.Pointer so SwapDB's exchange is race-safe. The trade-off: a HotGet
+// during a concurrent FlushDB or SwapDB may observe either the pre- or
+// post-operation state depending on the shard lock interleaving. Both outcomes
+// are valid under Redis's linearizability model — the operation simply resolves
+// before or after the flush/swap.
+func (db *DB) HotGet(key []byte) (body []byte, hdr ValueHeader, found bool) {
+	sk := string(key)
+	b, h, ok := db.hc.Load().cget(sk)
+	if !ok {
+		return nil, ValueHeader{}, false
+	}
+	if db.expired(h) {
+		// Entry expired after we cached it; invalidate so the next active
+		// expiry cycle handles the B-tree deletion. Return not-found rather than
+		// clearing it here — we do not have the write lock.
+		db.hc.Load().cinvalidate(sk)
+		return nil, ValueHeader{}, false
+	}
+	db.recordAccess(key, false)
+	return b, h, true
+}
+
 // Get returns the body and header for key and records an LRU and LFU access. It
 // is the read path data commands use. found is false when the key is absent or
 // has expired; an expired key is deleted as a side effect (lazy expiry).
@@ -509,11 +541,11 @@ func (db *DB) Peek(key []byte) (body []byte, hdr ValueHeader, found bool, err er
 func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found bool, err error) {
 	sk := string(key)
 	if touch {
-		if b, h, ok := db.hc.cget(sk); ok {
+		if b, h, ok := db.hc.Load().cget(sk); ok {
 			if db.expired(h) {
 				// The entry expired after we cached it. Invalidate so the next
 				// active expiry cycle handles the B-tree deletion.
-				db.hc.cinvalidate(sk)
+				db.hc.Load().cinvalidate(sk)
 				return nil, ValueHeader{}, false, nil
 			}
 			db.recordAccess(key, false)
@@ -529,7 +561,7 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 		}
 		if touch {
 			db.recordAccess(key, false)
-			db.hc.cput(sk, b, h) // re-warm the hot cache from the pending entry
+			db.hc.Load().cput(sk, b, h) // re-warm the hot cache from the pending entry
 		}
 		return b, h, true, nil
 	}
@@ -562,7 +594,7 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 		copy(out, cell)
 	}
 	if touch {
-		db.hc.cput(string(key), out, h)
+		db.hc.Load().cput(string(key), out, h)
 	}
 	return out, h, true, nil
 }
@@ -594,7 +626,7 @@ func (db *DB) Delete(key []byte) (bool, error) {
 		db.keyCount--
 		db.ks.dataBytes -= int64(len(key)) + int64(prev.BodyLen) + entryOverhead
 		db.dropAccess(key)
-		db.hc.cinvalidate(string(key))
+		db.hc.Load().cinvalidate(string(key))
 		if prev.HasTTL() {
 			db.expireCount--
 		}

@@ -109,3 +109,31 @@ func BenchmarkDictDelete(b *testing.B) {
 		i++
 	}
 }
+
+// BenchmarkDictGetParallel measures concurrent hot-cache reads. This is the
+// primary target of the lock-free hot-GET bypass: under high read concurrency
+// the old e.mu.RLock() became a bottleneck; HotGet bypasses it entirely.
+func BenchmarkDictGetParallel(b *testing.B) {
+	db := newBenchDB(b)
+	keys := seedKeys(b, db, 10000)
+	// Warm the hot cache by reading each key once.
+	for _, k := range keys {
+		if _, _, found, err := db.Get(k); err != nil || !found {
+			b.Fatalf("warm get %s: found=%v err=%v", k, found, err)
+		}
+	}
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			k := keys[i%len(keys)]
+			if _, _, ok := db.HotGet(k); !ok {
+				// Miss is fine on a race with eviction; fall back.
+				if _, _, found, err := db.Get(k); err != nil || !found {
+					b.Fatalf("get %s: found=%v err=%v", k, found, err)
+				}
+			}
+			i++
+		}
+	})
+}
