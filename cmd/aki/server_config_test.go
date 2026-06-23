@@ -51,10 +51,10 @@ func TestParseConfigFileMissing(t *testing.T) {
 
 func TestDequote(t *testing.T) {
 	cases := map[string]string{
-		`"3600 1"`: "3600 1",
-		`""`:       "",
-		`plain`:    "plain",
-		`"`:        `"`, // a lone quote is not a matched pair
+		`"3600 1"`:      "3600 1",
+		`""`:            "",
+		`plain`:         "plain",
+		`"`:             `"`, // a lone quote is not a matched pair
 		`"unterminated`: `"unterminated`,
 	}
 	for in, want := range cases {
