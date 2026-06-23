@@ -65,7 +65,7 @@ func handleHSet(ctx *Ctx, asHMSet bool) {
 		wrongTyp bool
 		added    int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		fields, hdr, found, err := getHash(db, key)
 		if err != nil {
 			return err
@@ -111,7 +111,7 @@ func handleHSetNX(ctx *Ctx) {
 		wrongTyp bool
 		set      bool
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		fields, hdr, found, err := getHash(db, key)
 		if err != nil {
 			return err
@@ -280,7 +280,7 @@ func handleHDel(ctx *Ctx) {
 		emptied  bool
 		removed  int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		fields, hdr, found, err := getHash(db, key)
 		if err != nil {
 			return err

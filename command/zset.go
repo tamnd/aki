@@ -97,7 +97,7 @@ parsed:
 		incrResult  float64
 		incrBlocked bool
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(ctx.Argv[1], func(db *keyspace.DB) error {
 		members, hdr, found, err := getZSet(db, ctx.Argv[1])
 		if err != nil {
 			return err
@@ -205,7 +205,7 @@ func handleZIncrBy(ctx *Ctx) {
 		nanResult bool
 		result    float64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(ctx.Argv[1], func(db *keyspace.DB) error {
 		members, hdr, found, err := getZSet(db, ctx.Argv[1])
 		if err != nil {
 			return err
@@ -364,7 +364,7 @@ func handleZRem(ctx *Ctx) {
 		emptied  bool
 		removed  int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(ctx.Argv[1], func(db *keyspace.DB) error {
 		members, hdr, found, err := getZSet(db, ctx.Argv[1])
 		if err != nil {
 			return err

@@ -446,6 +446,25 @@ func (e *Engine) sendSetAsync(index, shard int, key, body []byte, typ, enc uint8
 	})
 }
 
+// updateShard routes a single-key write to the key's owning shard channel,
+// so it can run in parallel with writes to other shards. Falls back to the
+// global serial path under commitAlways or when workers are not running.
+func (e *Engine) updateShard(index int, key []byte, fn func(*keyspace.DB) error) error {
+	if e.writeCh != nil && commitPolicy(e.policy.Load()) != commitAlways {
+		s := keyspace.ShardOf(key)
+		req := writeReqPool.Get().(*writeReq)
+		req.index = index
+		req.shard = s
+		req.fn = fn
+		e.writeChs[s] <- req
+		err := <-req.done
+		req.fn = nil
+		writeReqPool.Put(req)
+		return err
+	}
+	return e.update(index, fn)
+}
+
 // update runs fn against database index under the engine lock and, on success,
 // records the change under the active commit policy. A write command goes
 // through here.
@@ -777,6 +796,24 @@ func (ctx *Ctx) updateWriteBehind(key, body []byte, typ, enc uint8, ttlMs int64)
 		return false
 	}
 	ctx.d.persist.markDirty()
+	return true
+}
+
+// updateShard routes a single-key write for key to the key's owning shard
+// channel. Under a deferred commit policy this lets it run in parallel with
+// writes to other shards. Under commitAlways or when workers are not running
+// it falls back to the global serial path via update().
+func (ctx *Ctx) updateShard(key []byte, fn func(*keyspace.DB) error) bool {
+	if ctx.d.engine == nil {
+		ctx.enc().WriteError("ERR this server has no keyspace")
+		return false
+	}
+	if err := ctx.d.engine.updateShard(ctx.Conn.DB(), key, fn); err != nil {
+		ctx.enc().WriteError("ERR " + err.Error())
+		return false
+	}
+	ctx.d.persist.markDirty()
+	ctx.fireExpired()
 	return true
 }
 
