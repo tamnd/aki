@@ -10,6 +10,28 @@ import (
 	"github.com/tamnd/aki/rdb"
 )
 
+// writeReq carries one write operation to the write worker.
+// done receives the error (nil on success) after the write is applied.
+// The done channel is buffered-1 so the worker can send without blocking.
+type writeReq struct {
+	index int
+	fn    func(*keyspace.DB) error
+	done  chan error
+}
+
+// writeReqPool amortises writeReq allocations. Each entry already carries a
+// preallocated done channel so the hot path never allocates a new one.
+var writeReqPool = sync.Pool{
+	New: func() any {
+		return &writeReq{done: make(chan error, 1)}
+	},
+}
+
+// writeBatchMax is the most requests the write worker drains in a single lock
+// hold. A finite bound lets readers and the commit cron interleave with the
+// writer rather than starving while the worker works through a deep queue.
+const writeBatchMax = 256
+
 // commitPolicy decides when a write makes the .aki file durable. It mirrors the
 // Redis appendfsync directive, but it governs the pager checkpoint (aki's real
 // durability mechanism) rather than an append log.
@@ -44,6 +66,13 @@ const dirtyCheckStride = 256
 // Engine is the command layer's handle on the keyspace. Writes take the write
 // lock; reads take the read lock so multiple reads run in parallel. The sharded
 // writer model from doc 05 §7 replaces this lock entirely in a later slice.
+//
+// When the write worker is active (StartWorker has been called), all writes are
+// routed through a buffered channel to a single dedicated goroutine, which is
+// the only goroutine that ever acquires mu for writing. This eliminates mutex
+// contention between the many connection goroutines that would otherwise compete
+// for the write lock, and keeps the B-tree pages warm in the CPU cache of the
+// worker's core. Reads still use mu.RLock and are not affected.
 type Engine struct {
 	mu sync.RWMutex
 	ks *keyspace.Keyspace
@@ -65,6 +94,14 @@ type Engine struct {
 
 	// dirtyPageLimit is the early-commit bound described above. Guarded by mu.
 	dirtyPageLimit int
+
+	// writeCh is the input queue for the write worker. nil when the worker is not
+	// running; update() falls back to a direct lock acquire in that case.
+	writeCh chan *writeReq
+	// workerStop is closed by StopWorker to signal the write goroutine to drain
+	// and exit. workerDone is closed by the goroutine once it has exited.
+	workerStop chan struct{}
+	workerDone chan struct{}
 }
 
 // NewEngine wraps a keyspace for use by the dispatcher. It defaults to the
@@ -92,10 +129,107 @@ func (e *Engine) setCommitPolicy(p commitPolicy) error {
 	return e.commit()
 }
 
+// StartWorker starts the single-goroutine write worker. All calls to update()
+// after this point route through a buffered channel to the worker instead of
+// acquiring the write lock directly, eliminating contention between connection
+// goroutines. The caller must eventually call StopWorker to clean up.
+func (e *Engine) StartWorker() {
+	if e.writeCh != nil {
+		return // already running
+	}
+	e.writeCh = make(chan *writeReq, 4096)
+	e.workerStop = make(chan struct{})
+	e.workerDone = make(chan struct{})
+	go e.runWriteWorker()
+}
+
+// StopWorker signals the write worker to drain any pending requests and exit,
+// then waits until it has. After this returns, update() falls back to the
+// direct lock path. Safe to call when StartWorker was never called.
+func (e *Engine) StopWorker() {
+	if e.writeCh == nil {
+		return
+	}
+	close(e.workerStop)
+	<-e.workerDone
+	e.writeCh = nil
+}
+
+// runWriteWorker is the write worker goroutine body. It drains write requests
+// from writeCh, applies them in batches under a single lock acquisition, and
+// signals each requester via its done channel. On workerStop it drains any
+// remaining requests in the channel before exiting.
+func (e *Engine) runWriteWorker() {
+	defer close(e.workerDone)
+	for {
+		select {
+		case req := <-e.writeCh:
+			e.drainBatch(req)
+		case <-e.workerStop:
+			// Drain whatever is left in the queue so no connection goroutine
+			// blocks forever waiting on its done channel.
+			for {
+				select {
+				case req := <-e.writeCh:
+					e.drainBatch(req)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// drainBatch applies the first request and then greedily drains any additional
+// requests already sitting in writeCh, up to writeBatchMax, under one lock hold.
+// Holding the lock across a batch keeps the B-tree pages warm in the CPU cache
+// of the worker's core and amortises the lock acquire/release cost.
+func (e *Engine) drainBatch(first *writeReq) {
+	e.mu.Lock()
+	e.applyWriteReq(first)
+	for i := 1; i < writeBatchMax; i++ {
+		select {
+		case req := <-e.writeCh:
+			e.applyWriteReq(req)
+		default:
+			e.mu.Unlock()
+			return
+		}
+	}
+	e.mu.Unlock()
+}
+
+// applyWriteReq executes one write request under the already-held write lock and
+// signals the requester. Caller holds e.mu.
+func (e *Engine) applyWriteReq(req *writeReq) {
+	db, err := e.ks.DB(req.index)
+	if err == nil {
+		err = req.fn(db)
+	}
+	if err == nil {
+		err = e.commitWrite()
+	}
+	req.done <- err
+}
+
 // update runs fn against database index under the engine lock and, on success,
 // records the change under the active commit policy. A write command goes
 // through here.
+//
+// When the write worker is running, the request is sent to its channel and the
+// caller blocks on the reply. When the worker is not running (tests, startup
+// before StartWorker), the write lock is acquired directly.
 func (e *Engine) update(index int, fn func(*keyspace.DB) error) error {
+	if e.writeCh != nil {
+		req := writeReqPool.Get().(*writeReq)
+		req.index = index
+		req.fn = fn
+		e.writeCh <- req
+		err := <-req.done
+		req.fn = nil // don't hold a reference to the closure in the pool
+		writeReqPool.Put(req)
+		return err
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	db, err := e.ks.DB(index)
