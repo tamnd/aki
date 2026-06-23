@@ -236,7 +236,7 @@ func handleSet(ctx *Ctx) {
 		oldBody  []byte
 		oldFound bool
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		prevBody, prevHdr, found, err := db.Get(key)
 		if err != nil {
 			return err
@@ -284,7 +284,7 @@ func handleSet(ctx *Ctx) {
 func handleSetNX(ctx *Ctx) {
 	key, val := ctx.Argv[1], ctx.Argv[2]
 	var stored bool
-	if ctx.update(func(db *keyspace.DB) error {
+	if ctx.updateShard(key, func(db *keyspace.DB) error {
 		exists, err := db.Exists(key)
 		if err != nil {
 			return err
@@ -327,7 +327,7 @@ func setWithExpire(ctx *Ctx, mode uint8, name string) {
 		ctx.enc().WriteError("ERR invalid expire time in '" + name + "' command")
 		return
 	}
-	if ctx.update(func(db *keyspace.DB) error {
+	if ctx.updateShard(key, func(db *keyspace.DB) error {
 		ttl := absoluteTTL(mode, v, keyspace.ValueHeader{}, false)
 		return db.Set(key, val, keyspace.TypeString, stringEncoding(val), ttl)
 	}) {
@@ -393,7 +393,7 @@ func handleGetSet(ctx *Ctx) {
 		oldBody  []byte
 		oldFound bool
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		prevBody, prevHdr, found, err := db.Get(key)
 		if err != nil {
 			return err
@@ -425,7 +425,7 @@ func handleGetDel(ctx *Ctx) {
 		body     []byte
 		found    bool
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		b, hdr, f, err := db.Get(key)
 		if err != nil {
 			return err
@@ -470,7 +470,7 @@ func handleGetEX(ctx *Ctx) {
 		didExpire  bool
 		didPersist bool
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		b, hdr, f, err := db.Get(key)
 		if err != nil {
 			return err

@@ -520,7 +520,7 @@ func (ctx *Ctx) runRangeRemove(spec rangeSpec, event string) {
 		removed  int64
 		errStr   string
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		members, hdr, found, err := getZSet(db, key)
 		if err != nil {
 			return err

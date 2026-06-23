@@ -194,7 +194,7 @@ func handleXGroupCreate(ctx *Ctx) {
 		busy     bool
 		badID    bool
 	)
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(key, func(db *keyspace.DB) error {
 		s, hdr, found, err := getStream(db, key)
 		if err != nil {
 			return err
@@ -276,7 +276,7 @@ func handleXGroupSetID(ctx *Ctx) {
 		noGroup  bool
 		badID    bool
 	)
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(key, func(db *keyspace.DB) error {
 		s, hdr, found, err := getStream(db, key)
 		if err != nil {
 			return err
@@ -335,7 +335,7 @@ func handleXGroupConsumer(ctx *Ctx, create bool) {
 		noGroup  bool
 		result   int64
 	)
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(key, func(db *keyspace.DB) error {
 		s, hdr, found, err := getStream(db, key)
 		if err != nil {
 			return err
@@ -416,7 +416,7 @@ func handleXGroupDestroy(ctx *Ctx) {
 		wrongTyp bool
 		result   int64
 	)
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(key, func(db *keyspace.DB) error {
 		s, hdr, found, err := getStream(db, key)
 		if err != nil {
 			return err
@@ -465,7 +465,7 @@ func handleXAck(ctx *Ctx) {
 		noGroup  bool
 		acked    int64
 	)
-	if !ctx.update(func(db *keyspace.DB) error {
+	if !ctx.updateShard(key, func(db *keyspace.DB) error {
 		s, hdr, found, err := getStream(db, key)
 		if err != nil {
 			return err

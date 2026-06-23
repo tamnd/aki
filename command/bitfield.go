@@ -200,7 +200,7 @@ func execBitField(ctx *Ctx, key []byte, ops []bitfieldOp, write bool) {
 
 	var ok bool
 	if write {
-		ok = ctx.update(run)
+		ok = ctx.updateShard(key, run)
 	} else {
 		ok = ctx.view(run)
 	}
