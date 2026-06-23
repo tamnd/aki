@@ -18,11 +18,23 @@ import (
 //
 // shard >= 0 when the write targets a specific keyspace shard and was routed
 // to writeChs[shard]. shard == -1 means global (routed to writeCh).
+//
+// Inline SET fast path: when setKey is non-nil the worker calls SetWithVersion
+// directly instead of invoking fn, avoiding a heap-allocated closure per write.
 type writeReq struct {
 	index int
 	shard int
 	fn    func(*keyspace.DB) error
 	done  chan error // nil for fire-and-forget requests
+	// Inline fields for the SET write-behind fast path. When setKey is non-nil,
+	// fn is unused and the worker calls db.SetWithVersion with these fields.
+	// This lets the hot path avoid a heap-allocated closure per SET.
+	setKey  []byte
+	setBody []byte
+	setTyp  uint8
+	setEnc  uint8
+	setTTL  int64
+	setVer  uint64
 }
 
 // writeReqPool amortises writeReq allocations. Each entry already carries a
@@ -306,7 +318,11 @@ func (e *Engine) drainBatch(first *writeReq) {
 func (e *Engine) applyWriteReqDeferred(req *writeReq) {
 	db, err := e.ks.DB(req.index)
 	if err == nil {
-		err = req.fn(db)
+		if req.setKey != nil {
+			err = db.SetWithVersion(req.setKey, req.setBody, req.setTyp, req.setEnc, req.setTTL, req.setVer)
+		} else {
+			err = req.fn(db)
+		}
 	}
 	if err == nil {
 		e.pendingDirty.Store(true)
@@ -315,6 +331,8 @@ func (e *Engine) applyWriteReqDeferred(req *writeReq) {
 	if req.done != nil {
 		req.done <- err
 	} else {
+		req.setKey = nil
+		req.setBody = nil
 		req.fn = nil
 		asyncReqPool.Put(req)
 	}
@@ -329,7 +347,11 @@ func (e *Engine) applyWriteReqDeferred(req *writeReq) {
 func (e *Engine) applyWriteReq(req *writeReq) {
 	db, err := e.ks.DB(req.index)
 	if err == nil {
-		err = req.fn(db)
+		if req.setKey != nil {
+			err = db.SetWithVersion(req.setKey, req.setBody, req.setTyp, req.setEnc, req.setTTL, req.setVer)
+		} else {
+			err = req.fn(db)
+		}
 	}
 	if err == nil {
 		err = e.commitWrite()
@@ -337,6 +359,8 @@ func (e *Engine) applyWriteReq(req *writeReq) {
 	if req.done != nil {
 		req.done <- err
 	} else {
+		req.setKey = nil
+		req.setBody = nil
 		req.fn = nil
 		asyncReqPool.Put(req)
 	}
@@ -372,6 +396,38 @@ func (e *Engine) updateShardAsync(index, shard int, fn func(*keyspace.DB) error)
 		}
 	}
 	return e.update(index, fn)
+}
+
+// sendSetAsync enqueues an inline SET write on writeChs[shard] without
+// allocating a closure. It stores the SET arguments directly in the writeReq
+// struct (pool-allocated) so the shard worker can call SetWithVersion without
+// a heap allocation on the hot path.
+//
+// Falls back to the synchronous update path when workers are not running or
+// the policy is commitAlways.
+func (e *Engine) sendSetAsync(index, shard int, key, body []byte, typ, enc uint8, ttl int64, ver uint64) error {
+	if e.writeChs[shard] != nil && commitPolicy(e.policy.Load()) != commitAlways {
+		req := asyncReqPool.Get().(*writeReq)
+		req.index = index
+		req.shard = shard
+		req.fn = nil
+		req.done = nil
+		req.setKey = key
+		req.setBody = body
+		req.setTyp = typ
+		req.setEnc = enc
+		req.setTTL = ttl
+		req.setVer = ver
+		select {
+		case e.writeChs[shard] <- req:
+			return nil
+		default:
+			asyncReqPool.Put(req)
+		}
+	}
+	return e.update(index, func(db *keyspace.DB) error {
+		return db.SetWithVersion(key, body, typ, enc, ttl, ver)
+	})
 }
 
 // update runs fn against database index under the engine lock and, on success,
@@ -655,30 +711,22 @@ func (e *Engine) filePath() string {
 // updateWriteBehind stages an inline SET write in the hot-value cache and the
 // write-behind pending table synchronously, then fires the B-tree write to the
 // write worker without blocking. The connection goroutine never waits for the
-// B-tree write to complete, so it can send the reply and read the next command
-// while the write worker applies the change in the background.
+// B-tree write to complete, so it can reply and read the next command while the
+// write worker applies the change in the background.
 //
 // key and body must be heap-owned copies of the command arguments; the caller
 // must not pass slices that alias the connection read buffer (qbuf), because
 // qbuf may be reused before the async B-tree write runs. len(body) must be at
 // most keyspace.MaxInlineBody; the caller must verify this before calling.
 //
-// updateWriteBehind stages the write in the hot-value cache and the
-// write-behind pending table, then fires the B-tree write to the write worker
-// without taking the engine lock. The lock is not needed here because:
+// This function does not take the engine lock: ks.DB() reads an immutable
+// slice, NextVersion() is an atomic increment, and PrepareWriteBehind uses its
+// own per-shard mutexes. The async B-tree write is queued with sendSetAsync,
+// which stores the arguments directly in a pooled writeReq (no closure
+// allocation) and routes the request to the shard-owned channel.
 //
-//   - ks.DB() reads from a slice that is set once at Open and never resized.
-//   - ks.NextVersion() is an atomic increment.
-//   - PrepareWriteBehind uses its own shard and wbMu mutexes.
-//
-// The write worker still holds e.mu.Lock during batch processing, so
-// dropping the RLock from this path removes the lock-contention bottleneck
-// that previously blocked connection goroutines whenever the write worker was
-// active.
-//
-// If the write worker channel is full or the policy is commitAlways, it falls
-// back to the synchronous update path to preserve durability and apply
-// back-pressure. The caller must have confirmed e.isDeferred() before calling.
+// If the channel is full or the policy is commitAlways, it falls back to the
+// synchronous update path. The caller must have confirmed e.isDeferred().
 func (ctx *Ctx) updateWriteBehind(key, body []byte, typ, enc uint8, ttlMs int64) bool {
 	if ctx.d.engine == nil {
 		ctx.enc().WriteError("ERR this server has no keyspace")
@@ -704,14 +752,11 @@ func (ctx *Ctx) updateWriteBehind(key, body []byte, typ, enc uint8, ttlMs int64)
 		hdr.Flags |= keyspace.FlagHasTTL
 	}
 	db.PrepareWriteBehind(key, body, hdr)
-	// Route the async B-tree write to the shard that owns this key so the
-	// shard goroutine can process it without channel contention from other
-	// shards. Capture copies so the closure is safe after qbuf is compacted.
+	// Route the async B-tree write directly to the shard channel using the
+	// inline SET fast path. sendSetAsync stores the arguments in the pooled
+	// writeReq struct so no closure allocation is needed on this hot path.
 	shard := keyspace.ShardOf(key)
-	k, v, t, en, ttl, ver := key, body, typ, enc, ttlMs, version
-	if asyncErr := e.updateShardAsync(ctx.Conn.DB(), shard, func(db *keyspace.DB) error {
-		return db.SetWithVersion(k, v, t, en, ttl, ver)
-	}); asyncErr != nil {
+	if asyncErr := e.sendSetAsync(ctx.Conn.DB(), shard, key, body, typ, enc, ttlMs, version); asyncErr != nil {
 		ctx.enc().WriteError("ERR " + asyncErr.Error())
 		return false
 	}
