@@ -373,31 +373,6 @@ func (e *Engine) isDeferred() bool {
 	return e.writeCh != nil && commitPolicy(e.policy.Load()) != commitAlways
 }
 
-// updateShardAsync enqueues a fire-and-forget write on the dedicated channel
-// for shard s. Because only one goroutine drains writeChs[s], there is no
-// channel contention, and the shard goroutine processes it without competing
-// with other shards for the B-tree lock. fn must capture heap-owned copies of
-// all data it uses from the connection read buffer.
-//
-// Falls back to the synchronous update path when workers are not running or
-// the policy is commitAlways.
-func (e *Engine) updateShardAsync(index, shard int, fn func(*keyspace.DB) error) error {
-	if e.writeChs[shard] != nil && commitPolicy(e.policy.Load()) != commitAlways {
-		req := asyncReqPool.Get().(*writeReq)
-		req.index = index
-		req.shard = shard
-		req.fn = fn
-		req.done = nil
-		select {
-		case e.writeChs[shard] <- req:
-			return nil
-		default:
-			asyncReqPool.Put(req)
-		}
-	}
-	return e.update(index, fn)
-}
-
 // sendSetAsync enqueues an inline SET write on writeChs[shard] without
 // allocating a closure. It stores the SET arguments directly in the writeReq
 // struct (pool-allocated) so the shard worker can call SetWithVersion without
