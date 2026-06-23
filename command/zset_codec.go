@@ -2,9 +2,10 @@ package command
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 
 	"github.com/tamnd/aki/encoding"
@@ -87,18 +88,19 @@ func zsetEncoding(lim encLimits, members []zmember, prev uint8) uint8 {
 	return keyspace.EncListpack
 }
 
-// zless reports whether pair a sorts before pair b in the (score ascending,
-// member bytewise ascending) total order Redis uses.
-func zless(a, b zmember) bool {
+// zcmp orders pair a against b in the (score ascending, member bytewise
+// ascending) total order Redis uses, returning -1, 0 or +1.
+func zcmp(a, b zmember) int {
 	if a.score != b.score {
-		return a.score < b.score
+		return cmp.Compare(a.score, b.score)
 	}
-	return bytes.Compare(a.member, b.member) < 0
+	return bytes.Compare(a.member, b.member)
 }
 
-// zsetSort orders the pairs by the sorted-set total order.
+// zsetSort orders the pairs by the sorted-set total order. slices.SortFunc avoids
+// the reflection-based element swaps that sort.Slice incurs.
 func zsetSort(members []zmember) {
-	sort.Slice(members, func(i, j int) bool { return zless(members[i], members[j]) })
+	slices.SortFunc(members, zcmp)
 }
 
 // zsetFind returns the index of a member, or -1 when it is absent. The lookup is

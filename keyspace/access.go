@@ -115,31 +115,41 @@ func (db *DB) lfuIncr(a keyAccess) keyAccess {
 // Idle returns whole seconds since the key was last accessed, the OBJECT IDLETIME
 // answer. A key with no recorded access yet reports zero.
 func (db *DB) Idle(key []byte) uint32 {
+	db.accessMu.Lock()
 	a := db.access[string(key)]
 	if a == nil {
+		db.accessMu.Unlock()
 		return 0
 	}
+	atime := a.atime
+	db.accessMu.Unlock()
 	now := nowSeconds()
-	if now < a.atime {
+	if now < atime {
 		return 0
 	}
-	return now - a.atime
+	return now - atime
 }
 
 // Freq returns the decayed LFU counter, the OBJECT FREQ answer. The decay is
 // computed for the read but not stored, since reading frequency is not itself an
 // access.
 func (db *DB) Freq(key []byte) uint8 {
+	db.accessMu.Lock()
 	a := db.access[string(key)]
 	if a == nil {
+		db.accessMu.Unlock()
 		return 0
 	}
-	return db.lfuDecay(*a).freq
+	cp := *a
+	db.accessMu.Unlock()
+	return db.lfuDecay(cp).freq
 }
 
 // SetIdle seeds a key's last-access time to idle seconds in the past, which is how
 // RESTORE IDLETIME reconstructs the LRU clock of a dumped key.
 func (db *DB) SetIdle(key []byte, idle uint32) {
+	db.accessMu.Lock()
+	defer db.accessMu.Unlock()
 	if db.access == nil {
 		db.access = make(map[string]*keyAccess)
 	}

@@ -178,6 +178,10 @@ func (d *Dispatcher) SetConfig(name, value string) error {
 		d.logApplyConfig()
 	case "logfile":
 		return d.logReopen()
+	case "appendfsync":
+		// Retune the pager checkpoint cadence so a startup --appendfsync flag has
+		// the same effect as CONFIG SET appendfsync.
+		d.applyCommitPolicy()
 	}
 	return nil
 }

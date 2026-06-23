@@ -1,7 +1,15 @@
 package resp
 
+import "math"
+
 // parseDecimal parses a signed decimal integer from a byte slice without
 // converting to string, avoiding the allocation that strconv.ParseInt(string(b), 10, 64) would make.
+//
+// An out-of-range value returns ok=false rather than silently wrapping. A
+// wrapped multibulk or bulk length that landed in a valid-looking range would
+// otherwise make the parser wait forever for bytes that can never arrive; Redis
+// rejects such a frame with a fatal protocol error, which is what the false here
+// makes the caller do.
 func parseDecimal(b []byte) (int64, bool) {
 	if len(b) == 0 {
 		return 0, false
@@ -18,7 +26,11 @@ func parseDecimal(b []byte) (int64, bool) {
 		if c < '0' || c > '9' {
 			return 0, false
 		}
-		n = n*10 + int64(c-'0')
+		d := int64(c - '0')
+		if n > (math.MaxInt64-d)/10 {
+			return 0, false // would overflow int64
+		}
+		n = n*10 + d
 	}
 	if neg {
 		return -n, true

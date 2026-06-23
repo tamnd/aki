@@ -758,10 +758,21 @@ func (db *DB) Delete(key []byte) (bool, error) {
 	return ok, nil
 }
 
+// activeExpireBudget caps how many expired keys one ActiveExpireCycle deletes.
+// The cycle runs under the engine write lock, so an unbounded pass over a
+// keyspace with millions of volatile keys would stall every other command for
+// the length of the walk plus a delete-and-WAL per key. Bounding the work per
+// tick keeps that stall short; any keys left over are reclaimed on the next
+// cron tick, and a read of an expired key still removes it lazily, so nothing
+// stays visible past its TTL.
+const activeExpireBudget = 1 << 14
+
 // ActiveExpireCycle walks every database for volatile keys whose TTL has passed,
 // deletes them, and records each in the expired log so the command layer can fire
 // the "expired" event. It returns the number of keys removed. A database with no
-// volatile keys is skipped on the cheap expireCount guard.
+// volatile keys is skipped on the cheap expireCount guard. At most
+// activeExpireBudget keys are removed per call so the cycle never holds the
+// engine lock for an unbounded scan.
 func (ks *Keyspace) ActiveExpireCycle() (int, error) {
 	now := nowMillis()
 	total := 0
@@ -769,7 +780,7 @@ func (ks *Keyspace) ActiveExpireCycle() (int, error) {
 		if db.totalExpireCount() == 0 {
 			continue
 		}
-		keys, err := db.expiredVolatileKeys(now)
+		keys, err := db.expiredVolatileKeys(now, activeExpireBudget-total)
 		if err != nil {
 			return total, err
 		}
@@ -785,15 +796,23 @@ func (ks *Keyspace) ActiveExpireCycle() (int, error) {
 				total++
 			}
 		}
+		if total >= activeExpireBudget {
+			break
+		}
 	}
 	return total, nil
 }
 
-// expiredVolatileKeys returns the raw names of every key in the DB whose absolute
-// TTL is at or before now. It scans each shard under a read lock, collecting
-// names into a flat slice rather than deleting during the walk.
-func (db *DB) expiredVolatileKeys(now int64) ([][]byte, error) {
+// expiredVolatileKeys returns the raw names of keys in the DB whose absolute TTL
+// is at or before now, up to limit names. It scans each shard under a read lock,
+// collecting names into a flat slice rather than deleting during the walk, and
+// stops as soon as limit candidates are gathered so the caller can bound the work
+// it does under the engine lock.
+func (db *DB) expiredVolatileKeys(now int64, limit int) ([][]byte, error) {
 	var out [][]byte
+	if limit <= 0 {
+		return out, nil
+	}
 	for s := range NumShards {
 		if db.shards[s].expireCount.Load() == 0 {
 			continue
@@ -813,6 +832,10 @@ func (db *DB) expiredVolatileKeys(now int64) ([][]byte, error) {
 			h, _, ok := parseHeader(c.Value())
 			if ok && h.HasTTL() && h.TTLms <= now {
 				out = append(out, copyRaw(c.Key()))
+				if len(out) >= limit {
+					db.shards[s].mu.RUnlock()
+					return out, nil
+				}
 			}
 			if err := c.Next(); err != nil {
 				db.shards[s].mu.RUnlock()
