@@ -60,7 +60,7 @@ func handleSetBit(ctx *Ctx) {
 		wrongTyp bool
 		old      int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		cur, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err

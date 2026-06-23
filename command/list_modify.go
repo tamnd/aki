@@ -98,7 +98,7 @@ func handleLSet(ctx *Ctx) {
 		noKey    bool
 		oob      bool
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		body, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
@@ -162,7 +162,7 @@ func handleLInsert(ctx *Ctx) {
 		wrongTyp bool
 		result   int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		body, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
@@ -226,7 +226,7 @@ func handleLRem(ctx *Ctx) {
 		emptied  bool
 		removed  int64
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		body, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
@@ -335,7 +335,7 @@ func handleLTrim(ctx *Ctx) {
 		trimmed  bool
 		emptied  bool
 	)
-	done := ctx.update(func(db *keyspace.DB) error {
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
 		body, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
