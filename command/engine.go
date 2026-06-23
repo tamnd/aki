@@ -11,12 +11,14 @@ import (
 )
 
 // writeReq carries one write operation to the write worker.
-// done receives the error (nil on success) after the write is applied.
-// The done channel is buffered-1 so the worker can send without blocking.
+// When done is non-nil, the worker signals it after applying the write and the
+// caller waits for that signal before continuing. When done is nil the req is
+// fire-and-forget: the caller returns immediately and the worker puts the req
+// back in the async pool itself.
 type writeReq struct {
 	index int
 	fn    func(*keyspace.DB) error
-	done  chan error
+	done  chan error // nil for fire-and-forget requests
 }
 
 // writeReqPool amortises writeReq allocations. Each entry already carries a
@@ -24,6 +26,14 @@ type writeReq struct {
 var writeReqPool = sync.Pool{
 	New: func() any {
 		return &writeReq{done: make(chan error, 1)}
+	},
+}
+
+// asyncReqPool holds writeReq structs for fire-and-forget writes. They have no
+// done channel, so the worker returns them to this pool after processing.
+var asyncReqPool = sync.Pool{
+	New: func() any {
+		return &writeReq{}
 	},
 }
 
@@ -157,8 +167,10 @@ func (e *Engine) StopWorker() {
 
 // runWriteWorker is the write worker goroutine body. It drains write requests
 // from writeCh, applies them in batches under a single lock acquisition, and
-// signals each requester via its done channel. On workerStop it drains any
-// remaining requests in the channel before exiting.
+// signals each sync requester via its done channel. Fire-and-forget requests
+// (done == nil) are returned to asyncReqPool after processing. On workerStop
+// it drains any remaining requests before exiting so no sync caller blocks
+// forever on its done channel.
 func (e *Engine) runWriteWorker() {
 	defer close(e.workerDone)
 	for {
@@ -166,8 +178,6 @@ func (e *Engine) runWriteWorker() {
 		case req := <-e.writeCh:
 			e.drainBatch(req)
 		case <-e.workerStop:
-			// Drain whatever is left in the queue so no connection goroutine
-			// blocks forever waiting on its done channel.
 			for {
 				select {
 				case req := <-e.writeCh:
@@ -199,8 +209,12 @@ func (e *Engine) drainBatch(first *writeReq) {
 	e.mu.Unlock()
 }
 
-// applyWriteReq executes one write request under the already-held write lock and
-// signals the requester. Caller holds e.mu.
+// applyWriteReq executes one write request under the already-held write lock.
+// For sync requests (done != nil) it signals the caller via the done channel;
+// the caller is responsible for returning the req to writeReqPool afterward.
+// For fire-and-forget requests (done == nil) it returns the req to asyncReqPool
+// itself because the caller already returned without waiting for a signal.
+// Caller holds e.mu.
 func (e *Engine) applyWriteReq(req *writeReq) {
 	db, err := e.ks.DB(req.index)
 	if err == nil {
@@ -209,7 +223,45 @@ func (e *Engine) applyWriteReq(req *writeReq) {
 	if err == nil {
 		err = e.commitWrite()
 	}
-	req.done <- err
+	if req.done != nil {
+		req.done <- err
+	} else {
+		req.fn = nil
+		asyncReqPool.Put(req)
+	}
+}
+
+// isDeferred reports whether the active commit policy defers checkpoints, which
+// is the precondition for the write-behind fast path. Under commitAlways every
+// write must wait for the checkpoint before the reply goes out.
+func (e *Engine) isDeferred() bool {
+	return e.writeCh != nil && commitPolicy(e.policy.Load()) != commitAlways
+}
+
+// updateAsync enqueues a fire-and-forget write when the write worker is running
+// and the commit policy is deferred. The caller returns nil immediately; the
+// write worker applies fn to the B-tree in the background without signaling the
+// caller. fn must capture only heap-owned copies of any data derived from the
+// connection read buffer (qbuf), because qbuf may be reused before fn runs.
+//
+// If the worker channel is full or the policy is commitAlways, updateAsync
+// falls back to the synchronous update path to apply back-pressure and preserve
+// the durability contract.
+func (e *Engine) updateAsync(index int, fn func(*keyspace.DB) error) error {
+	if e.writeCh != nil && commitPolicy(e.policy.Load()) != commitAlways {
+		req := asyncReqPool.Get().(*writeReq)
+		req.index = index
+		req.fn = fn
+		req.done = nil
+		select {
+		case e.writeCh <- req:
+			return nil
+		default:
+			// Channel full: fall back to sync to apply back-pressure.
+			asyncReqPool.Put(req)
+		}
+	}
+	return e.update(index, fn)
 }
 
 // update runs fn against database index under the engine lock and, on success,
@@ -464,6 +516,68 @@ func (e *Engine) filePath() string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.ks.PagerName()
+}
+
+// updateWriteBehind stages an inline SET write in the hot-value cache and the
+// write-behind pending table synchronously, then fires the B-tree write to the
+// write worker without blocking. The connection goroutine never waits for the
+// B-tree write to complete, so it can send the reply and read the next command
+// while the write worker applies the change in the background.
+//
+// key and body must be heap-owned copies of the command arguments; the caller
+// must not pass slices that alias the connection read buffer (qbuf), because
+// qbuf may be reused before the async B-tree write runs. len(body) must be at
+// most keyspace.MaxInlineBody; the caller must verify this before calling.
+//
+// updateWriteBehind assigns the write version atomically under the engine read
+// lock and stores it in the hot-value cache and the write-behind pending table
+// so any subsequent read sees the new value immediately, even on a cache miss.
+// If the write worker channel is full or the policy is commitAlways, it falls
+// back to the synchronous update path to preserve durability and apply
+// back-pressure. The caller must have confirmed e.isDeferred() before calling.
+func (ctx *Ctx) updateWriteBehind(key, body []byte, typ, enc uint8, ttlMs int64) bool {
+	if ctx.d.engine == nil {
+		ctx.enc().WriteError("ERR this server has no keyspace")
+		return false
+	}
+	e := ctx.d.engine
+	var version uint64
+	var err error
+	e.mu.RLock()
+	db, dbErr := e.ks.DB(ctx.Conn.DB())
+	if dbErr == nil {
+		version = e.ks.NextVersion()
+		hdr := keyspace.ValueHeader{
+			Type:     typ,
+			Encoding: enc,
+			TTLms:    ttlMs,
+			Version:  version,
+			BodyLen:  uint32(len(body)),
+			RefCount: 1,
+			Flags:    keyspace.FlagInlineBody,
+		}
+		if ttlMs >= 0 {
+			hdr.Flags |= keyspace.FlagHasTTL
+		}
+		db.PrepareWriteBehind(key, body, hdr)
+	} else {
+		err = dbErr
+	}
+	e.mu.RUnlock()
+	if err != nil {
+		ctx.enc().WriteError("ERR " + err.Error())
+		return false
+	}
+	// Capture copies so the closure is safe after qbuf is compacted.
+	k, v, t, en, ttl, ver := key, body, typ, enc, ttlMs, version
+	if asyncErr := e.updateAsync(ctx.Conn.DB(), func(db *keyspace.DB) error {
+		return db.SetWithVersion(k, v, t, en, ttl, ver)
+	}); asyncErr != nil {
+		ctx.enc().WriteError("ERR " + asyncErr.Error())
+		return false
+	}
+	ctx.d.persist.markDirty()
+	return true
 }
 
 // update routes a write to the current connection's database. It reports false

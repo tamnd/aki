@@ -15,6 +15,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tamnd/aki/btree"
@@ -62,7 +63,7 @@ type Keyspace struct {
 	catRoot uint32 // catalog page number, NullPage until first persisted
 	sysRoot uint32 // system table B-tree root, NullPage until first SystemPut
 	sysTree *btree.Tree
-	version uint64 // monotonic write version assigned to each write
+	version atomic.Uint64 // monotonic write version; use NextVersion to advance
 
 	// expiredLog collects keys deleted by lazy expiry since the last drain. The
 	// command layer empties it with TakeExpired after each access to fire the
@@ -192,6 +193,22 @@ type DB struct {
 	// the body and header without walking the B-tree. Set and Delete invalidate
 	// the entry so the next read always sees fresh data.
 	hc *dbCache
+
+	// wbMu guards wbPending, the in-flight write-behind table. wbPending maps
+	// a key name to the value that the write-behind path has made visible in the
+	// hot cache but not yet applied to the B-tree. The read path consults it on
+	// a hot-cache miss so a GET that follows an async SET always sees the new
+	// value, even if the hot cache has since evicted the entry.
+	wbMu     sync.RWMutex
+	wbPending map[string]wbPendingEntry
+}
+
+// wbPendingEntry is one entry in the write-behind pending table. It carries
+// the same fields PrepareWriteBehind stored in the hot cache so the read path
+// can serve the value without touching the B-tree.
+type wbPendingEntry struct {
+	body    []byte
+	hdr     ValueHeader
 }
 
 // Open binds a Keyspace to a pager and loads the catalog. The number of
@@ -220,6 +237,12 @@ func Open(pgr *pager.Pager) (*Keyspace, error) {
 	}
 	return ks, nil
 }
+
+// NextVersion atomically increments the keyspace write counter and returns the
+// new version. The write-behind path calls this under the engine read lock to
+// assign a stable version before the B-tree write is queued, so WATCH and the
+// hot-value cache always see a consistent, monotonically increasing value.
+func (ks *Keyspace) NextVersion() uint64 { return ks.version.Add(1) }
 
 // PagerStats returns the underlying pager's counters for the file-growth INFO
 // fields. It is a passthrough so the command layer does not reach into the pager.
@@ -299,6 +322,21 @@ func (db *DB) ensureTree() (*btree.Tree, error) {
 // A key whose absolute TTL is already in the past is not written and any
 // existing key under that name is removed, matching Redis's write-time expiry.
 func (db *DB) Set(key, body []byte, typ, enc uint8, ttlMs int64) error {
+	return db.set(key, body, typ, enc, ttlMs, 0)
+}
+
+// SetWithVersion is like Set but uses the pre-assigned version number instead
+// of advancing the global write counter. The write-behind path calls this from
+// the write worker to apply the B-tree write after PrepareWriteBehind has
+// already made the value visible in the hot-value cache and wbPending table.
+func (db *DB) SetWithVersion(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint64) error {
+	return db.set(key, body, typ, enc, ttlMs, preVersion)
+}
+
+// set is the shared implementation of Set and SetWithVersion. When preVersion
+// is zero it atomically increments the global write counter; otherwise it uses
+// preVersion directly (the counter was already advanced by NextVersion).
+func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint64) error {
 	if ttlMs >= 0 && ttlMs <= nowMillis() {
 		_, err := db.Delete(key)
 		return err
@@ -316,12 +354,17 @@ func (db *DB) Set(key, body []byte, typ, enc uint8, ttlMs int64) error {
 	isNew := !existed
 	hadTTL := existed && prev.HasTTL()
 
-	db.ks.version++
+	var version uint64
+	if preVersion > 0 {
+		version = preVersion
+	} else {
+		version = db.ks.version.Add(1)
+	}
 	h := ValueHeader{
 		Type:     typ,
 		Encoding: enc,
 		TTLms:    -1,
-		Version:  db.ks.version,
+		Version:  version,
 		BodyLen:  uint32(len(body)),
 		RefCount: 1,
 	}
@@ -369,10 +412,75 @@ func (db *DB) Set(key, body []byte, typ, enc uint8, ttlMs int64) error {
 		db.expireCount--
 	}
 	db.recordAccess(key, isNew)
-	// Invalidate any cached value so the next Get reads the new body from the
-	// B-tree rather than returning a stale entry.
-	db.hc.cinvalidate(string(key))
+
+	// For inline values, populate the hot-value cache with the new body so the
+	// next Get returns it from cache without a B-tree walk. For overflow values,
+	// invalidate so the next Get re-reads through the page chain.
+	//
+	// cell[HeaderSize:] is the inline body portion of the heap-allocated cell
+	// slice, which is always a safe copy regardless of where the caller's body
+	// argument came from (a qbuf slice, a heap copy, or anything else).
+	//
+	// The write-behind path also removes the pending-write entry for this key
+	// now that the B-tree holds the authoritative data.
+	sk := string(key)
+	if h.Flags&FlagInlineBody != 0 {
+		db.hc.cput(sk, cell[HeaderSize:], h)
+	} else {
+		db.hc.cinvalidate(sk)
+	}
+	if preVersion > 0 {
+		db.removeWBPending(sk, preVersion)
+	}
 	return nil
+}
+
+// MaxInlineBody is the largest value body stored in the B-tree leaf cell. The
+// write-behind fast path only handles bodies at or below this size; larger
+// values require overflow page management that cannot be pre-staged.
+const MaxInlineBody = maxInlineBody
+
+// PrepareWriteBehind records a pending inline write in both the hot-value cache
+// and the write-behind pending table. It is called synchronously by the
+// write-behind path (under the engine read lock) before the async B-tree write
+// is queued. After this returns, any Get for key sees body and hdr immediately,
+// even before the write worker applies the B-tree write.
+//
+// The caller must have used ks.NextVersion to assign hdr.Version so the version
+// counter advances before the entry is visible to readers.
+func (db *DB) PrepareWriteBehind(key, body []byte, hdr ValueHeader) {
+	sk := string(key)
+	db.hc.cput(sk, body, hdr)
+	db.wbMu.Lock()
+	if db.wbPending == nil {
+		db.wbPending = make(map[string]wbPendingEntry, 16)
+	}
+	db.wbPending[sk] = wbPendingEntry{body: body, hdr: hdr}
+	db.wbMu.Unlock()
+}
+
+// removeWBPending removes the write-behind pending entry for key if its version
+// matches. Mismatched version means a newer write was already staged, so the
+// older entry should not be removed.
+func (db *DB) removeWBPending(key string, version uint64) {
+	db.wbMu.Lock()
+	if e, ok := db.wbPending[key]; ok && e.hdr.Version == version {
+		delete(db.wbPending, key)
+	}
+	db.wbMu.Unlock()
+}
+
+// getWBPending returns the pending write-behind value for key, if any. The read
+// path calls this on a hot-cache miss to avoid serving a stale B-tree value
+// when the write worker has not yet applied the write.
+func (db *DB) getWBPending(key string) ([]byte, ValueHeader, bool) {
+	db.wbMu.RLock()
+	e, ok := db.wbPending[key]
+	db.wbMu.RUnlock()
+	if !ok {
+		return nil, ValueHeader{}, false
+	}
+	return e.body, e.hdr, true
 }
 
 // Get returns the body and header for key and records an LRU and LFU access. It
@@ -399,17 +507,31 @@ func (db *DB) Peek(key []byte) (body []byte, hdr ValueHeader, found bool, err er
 // a hit is always fresh. Peek skips the cache so introspection commands (OBJECT,
 // EXISTS) do not promote keys or produce stale TTL observations.
 func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found bool, err error) {
+	sk := string(key)
 	if touch {
-		if b, h, ok := db.hc.cget(string(key)); ok {
+		if b, h, ok := db.hc.cget(sk); ok {
 			if db.expired(h) {
 				// The entry expired after we cached it. Invalidate so the next
 				// active expiry cycle handles the B-tree deletion.
-				db.hc.cinvalidate(string(key))
+				db.hc.cinvalidate(sk)
 				return nil, ValueHeader{}, false, nil
 			}
 			db.recordAccess(key, false)
 			return b, h, true, nil
 		}
+	}
+	// Check the write-behind pending table before falling through to the B-tree.
+	// The async write worker may not have applied the B-tree write yet, so the
+	// B-tree could still hold the old value. wbPending always has the latest.
+	if b, h, ok := db.getWBPending(sk); ok {
+		if db.expired(h) {
+			return nil, ValueHeader{}, false, nil
+		}
+		if touch {
+			db.recordAccess(key, false)
+			db.hc.cput(sk, b, h) // re-warm the hot cache from the pending entry
+		}
+		return b, h, true, nil
 	}
 	t := db.loadTree()
 	if t == nil {
