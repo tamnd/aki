@@ -366,7 +366,7 @@ func (e *Engine) FlushShardWrites() {
 		req := writeReqPool.Get().(*writeReq)
 		req.index = 0
 		req.shard = s
-		req.fn = nil    // nil fn + nil setKey = fence signal in applyWriteReqDeferred
+		req.fn = nil // nil fn + nil setKey = fence signal in applyWriteReqDeferred
 		req.setKey = nil
 		reqs[s] = req
 		e.writeChs[s] <- req // may block briefly if channel is at capacity
