@@ -148,8 +148,41 @@ func handleHSetNX(ctx *Ctx) {
 
 // handleHGet implements HGET: the value of one field, or nil when the field or
 // the key is absent.
+// hotGetHash tries to decode the hash stored at key from the lock-free hot
+// cache. It returns (fields, true) on a hit and (nil, false) on a miss. A
+// WRONGTYPE key in the hot cache is treated as a miss so the caller falls back
+// to view() which produces the proper WRONGTYPE error.
+func hotGetHash(ctx *Ctx, key []byte) ([]hashField, bool) {
+	e := ctx.d.engine
+	if e == nil {
+		return nil, false
+	}
+	body, hdr, ok := e.viewHotGet(ctx.Conn.DB(), key)
+	if !ok {
+		return nil, false
+	}
+	if hdr.Type != keyspace.TypeHash {
+		return nil, false
+	}
+	fields, err := hashDecode(body)
+	if err != nil {
+		return nil, false
+	}
+	return dropExpiredFields(fields), true
+}
+
 func handleHGet(ctx *Ctx) {
 	key, field := ctx.Argv[1], ctx.Argv[2]
+
+	if fields, ok := hotGetHash(ctx, key); ok {
+		if idx := hashFind(fields, field); idx >= 0 {
+			ctx.enc().WriteBulkString(fields[idx].value)
+		} else {
+			ctx.enc().WriteNull()
+		}
+		return
+	}
+
 	var (
 		wrongTyp bool
 		found    bool
@@ -191,6 +224,20 @@ func handleHGet(ctx *Ctx) {
 func handleHMGet(ctx *Ctx) {
 	key := ctx.Argv[1]
 	want := ctx.Argv[2:]
+
+	if fields, ok := hotGetHash(ctx, key); ok {
+		enc := ctx.enc()
+		enc.WriteArrayLen(len(want))
+		for _, f := range want {
+			if idx := hashFind(fields, f); idx >= 0 {
+				enc.WriteBulkString(fields[idx].value)
+			} else {
+				enc.WriteNull()
+			}
+		}
+		return
+	}
+
 	var (
 		wrongTyp bool
 		values   = make([][]byte, len(want))
@@ -237,6 +284,17 @@ func handleHMGet(ctx *Ctx) {
 // RESP2 replies a flat field/value array.
 func handleHGetAll(ctx *Ctx) {
 	key := ctx.Argv[1]
+
+	if fields, ok := hotGetHash(ctx, key); ok {
+		enc := ctx.enc()
+		enc.WriteMapLen(len(fields))
+		for _, f := range fields {
+			enc.WriteBulkString(f.field)
+			enc.WriteBulkString(f.value)
+		}
+		return
+	}
+
 	var (
 		wrongTyp bool
 		fields   []hashField
@@ -327,6 +385,12 @@ func handleHDel(ctx *Ctx) {
 // handleHLen implements HLEN: the field count, or 0 when the key is absent.
 func handleHLen(ctx *Ctx) {
 	key := ctx.Argv[1]
+
+	if fields, ok := hotGetHash(ctx, key); ok {
+		ctx.enc().WriteInteger(int64(len(fields)))
+		return
+	}
+
 	var (
 		wrongTyp bool
 		n        int64
@@ -358,6 +422,16 @@ func handleHLen(ctx *Ctx) {
 // handleHExists implements HEXISTS: 1 when the field is present, else 0.
 func handleHExists(ctx *Ctx) {
 	key, field := ctx.Argv[1], ctx.Argv[2]
+
+	if fields, ok := hotGetHash(ctx, key); ok {
+		if hashFind(fields, field) >= 0 {
+			ctx.enc().WriteInteger(1)
+		} else {
+			ctx.enc().WriteInteger(0)
+		}
+		return
+	}
+
 	var (
 		wrongTyp bool
 		exists   bool
@@ -394,6 +468,20 @@ func handleHExists(ctx *Ctx) {
 // in insertion order.
 func handleHFields(ctx *Ctx, keys, vals bool) {
 	key := ctx.Argv[1]
+
+	if fields, ok := hotGetHash(ctx, key); ok {
+		enc := ctx.enc()
+		enc.WriteArrayLen(len(fields))
+		for _, f := range fields {
+			if keys {
+				enc.WriteBulkString(f.field)
+			} else {
+				enc.WriteBulkString(f.value)
+			}
+		}
+		return
+	}
+
 	var (
 		wrongTyp bool
 		fields   []hashField
@@ -434,6 +522,16 @@ func handleHFields(ctx *Ctx, keys, vals bool) {
 // when the field or the key is absent.
 func handleHStrLen(ctx *Ctx) {
 	key, field := ctx.Argv[1], ctx.Argv[2]
+
+	if fields, ok := hotGetHash(ctx, key); ok {
+		var n int64
+		if idx := hashFind(fields, field); idx >= 0 {
+			n = int64(len(fields[idx].value))
+		}
+		ctx.enc().WriteInteger(n)
+		return
+	}
+
 	var (
 		wrongTyp bool
 		n        int64
