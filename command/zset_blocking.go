@@ -244,7 +244,7 @@ func handleBZMPop(ctx *Ctx) {
 		enc := ctx.enc()
 		enc.WriteArrayLen(2)
 		enc.WriteBulkString(poppedKey)
-		writeScoredPairs(enc, popped)
+		writeNestedScoredPairs(enc, popped)
 		return true
 	}
 	ctx.d.blockDrive(ctx, keys, timeout, attempt, func() { ctx.enc().WriteNullArray() })

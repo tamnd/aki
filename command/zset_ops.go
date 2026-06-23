@@ -606,5 +606,5 @@ func handleZMPop(ctx *Ctx) {
 	}
 	enc.WriteArrayLen(2)
 	enc.WriteBulkString(poppedKey)
-	writeScoredPairs(enc, popped)
+	writeNestedScoredPairs(enc, popped)
 }

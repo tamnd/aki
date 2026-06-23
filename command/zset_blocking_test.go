@@ -106,13 +106,21 @@ func TestBzmpopServedByZadd(t *testing.T) {
 	if got := readLineWait(t, ra, ca); got != "z2" {
 		t.Fatalf("BZMPOP key = %q want z2", got)
 	}
-	if got := readLineWait(t, ra, ca); got != "*6" {
-		t.Fatalf("BZMPOP pairs header = %q want *6 (RESP2 flat)", got)
+	// Elements are nested: *3 (3 pairs), each as *2 [member, score].
+	if got := readLineWait(t, ra, ca); got != "*3" {
+		t.Fatalf("BZMPOP pairs header = %q want *3", got)
 	}
-	for _, want := range []string{"a", "1", "b", "2", "c", "3"} {
-		_ = readLineWait(t, ra, ca) // bulk header
-		if got := readLineWait(t, ra, ca); got != want {
-			t.Fatalf("BZMPOP elem = %q want %q", got, want)
+	for _, want := range [][]string{{"a", "1"}, {"b", "2"}, {"c", "3"}} {
+		if got := readLineWait(t, ra, ca); got != "*2" {
+			t.Fatalf("BZMPOP pair header = %q want *2", got)
+		}
+		_ = readLineWait(t, ra, ca) // member bulk header
+		if got := readLineWait(t, ra, ca); got != want[0] {
+			t.Fatalf("BZMPOP member = %q want %q", got, want[0])
+		}
+		_ = readLineWait(t, ra, ca) // score bulk header
+		if got := readLineWait(t, ra, ca); got != want[1] {
+			t.Fatalf("BZMPOP score = %q want %q", got, want[1])
 		}
 	}
 }
@@ -120,7 +128,7 @@ func TestBzmpopServedByZadd(t *testing.T) {
 func TestBzmpopMaxImmediate(t *testing.T) {
 	r, c := startData(t)
 	_ = sendLine(t, r, c, "ZADD z 1 a 2 b 3 c")
-	// RESP2 reply is [key, flat pairs]: *2, z, then *4 with c 3 b 2.
+	// RESP2 reply is [key, nested pairs]: *2, z, then *2 pairs each as *2 [member, score].
 	writeCmd(t, c, "BZMPOP 0 1 z MAX COUNT 2")
 	if got := readLineWait(t, r, c); got != "*2" {
 		t.Fatalf("BZMPOP MAX header = %q want *2", got)
@@ -129,13 +137,20 @@ func TestBzmpopMaxImmediate(t *testing.T) {
 	if got := readLineWait(t, r, c); got != "z" {
 		t.Fatalf("BZMPOP MAX key = %q want z", got)
 	}
-	if got := readLineWait(t, r, c); got != "*4" {
-		t.Fatalf("BZMPOP MAX pairs header = %q want *4", got)
+	if got := readLineWait(t, r, c); got != "*2" {
+		t.Fatalf("BZMPOP MAX pairs header = %q want *2 (2 nested pairs)", got)
 	}
-	for _, want := range []string{"c", "3", "b", "2"} {
-		_ = readLineWait(t, r, c) // bulk header
-		if got := readLineWait(t, r, c); got != want {
-			t.Fatalf("BZMPOP MAX elem = %q want %q", got, want)
+	for _, want := range [][]string{{"c", "3"}, {"b", "2"}} {
+		if got := readLineWait(t, r, c); got != "*2" {
+			t.Fatalf("BZMPOP MAX pair header = %q want *2", got)
+		}
+		_ = readLineWait(t, r, c) // member bulk header
+		if got := readLineWait(t, r, c); got != want[0] {
+			t.Fatalf("BZMPOP MAX member = %q want %q", got, want[0])
+		}
+		_ = readLineWait(t, r, c) // score bulk header
+		if got := readLineWait(t, r, c); got != want[1] {
+			t.Fatalf("BZMPOP MAX score = %q want %q", got, want[1])
 		}
 	}
 }
