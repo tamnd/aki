@@ -62,6 +62,7 @@ func (db *DB) flushShard(s int) error {
 	db.shards[s].keyCount.Store(0)
 	db.shards[s].expireCount.Store(0)
 	db.shards[s].wbPending = nil
+	db.shards[s].pendingUncertain.Store(0)
 	return nil
 }
 
@@ -110,6 +111,9 @@ func (ks *Keyspace) Swap(i, j int) error {
 		a.shards[s].expireCount.Store(be)
 		b.shards[s].expireCount.Store(ae)
 		a.shards[s].wbPending, b.shards[s].wbPending = b.shards[s].wbPending, a.shards[s].wbPending
+		au, bu := a.shards[s].pendingUncertain.Load(), b.shards[s].pendingUncertain.Load()
+		a.shards[s].pendingUncertain.Store(bu)
+		b.shards[s].pendingUncertain.Store(au)
 	}
 	a.avgTTL, b.avgTTL = b.avgTTL, a.avgTTL
 	// Exchange the hot-cache pointers atomically so lock-free hot-GET readers
