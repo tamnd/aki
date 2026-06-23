@@ -182,9 +182,9 @@ func (ks *Keyspace) TakeExpired() []ExpiredKey {
 // mu.RLock so they are excluded from concurrent writes. Shards on different
 // key ranges run fully in parallel.
 type dbShard struct {
-	mu          sync.RWMutex
-	rootPage    uint32 // btree root page, NullPage when this shard has no keys
-	tree        *btree.Tree
+	mu       sync.RWMutex
+	rootPage uint32 // btree root page, NullPage when this shard has no keys
+	tree     *btree.Tree
 	// keyCount and expireCount are updated atomically so Len() and
 	// totalExpireCount() can read them without holding the shard mutex.
 	keyCount    atomic.Uint64
