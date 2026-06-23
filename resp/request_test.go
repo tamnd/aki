@@ -147,6 +147,33 @@ func TestParseProtocolErrors(t *testing.T) {
 	}
 }
 
+func TestParseOverflowLength(t *testing.T) {
+	var pe ProtocolError
+	// A multibulk count that overflows int64 must be a fatal protocol error, not a
+	// silent wrap that leaves the read loop waiting for bytes that never come.
+	_, _, err := ParseRequest([]byte("*99999999999999999999\r\n"), 0, DefaultMaxBulkLen, nil)
+	if !errors.As(err, &pe) {
+		t.Fatalf("overflow multibulk: err=%v want ProtocolError", err)
+	}
+	// Same for a bulk length that overflows int64.
+	_, _, err = ParseRequest([]byte("*1\r\n$99999999999999999999\r\n"), 0, DefaultMaxBulkLen, nil)
+	if !errors.As(err, &pe) {
+		t.Fatalf("overflow bulk length: err=%v want ProtocolError", err)
+	}
+}
+
+func TestParseDecimalBounds(t *testing.T) {
+	if _, ok := parseDecimal([]byte("9223372036854775807")); !ok {
+		t.Error("max int64 should parse")
+	}
+	if _, ok := parseDecimal([]byte("9223372036854775808")); ok {
+		t.Error("max int64 + 1 should overflow")
+	}
+	if _, ok := parseDecimal([]byte("99999999999999999999")); ok {
+		t.Error("20-digit value should overflow")
+	}
+}
+
 func TestParseTooBigInline(t *testing.T) {
 	big := make([]byte, MaxInlineLen+10)
 	for i := range big {

@@ -3,7 +3,6 @@ package keyspace
 import (
 	"bytes"
 	"cmp"
-	"hash/fnv"
 	"slices"
 )
 
@@ -134,9 +133,18 @@ func copyRaw(ck []byte) []byte {
 }
 
 // fnv48 is the 48-bit truncation of FNV-1a over a composite key, used as the
-// SCAN cursor hint.
+// SCAN cursor hint. The mixing is inlined rather than going through
+// fnv.New64a(), which heap-allocates a hasher on every call; SCAN hashes every
+// live key per call, so the allocation showed up as O(n) garbage per scan.
 func fnv48(b []byte) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write(b)
-	return h.Sum64() & 0xFFFFFFFFFFFF
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for _, c := range b {
+		h ^= uint64(c)
+		h *= prime64
+	}
+	return h & 0xFFFFFFFFFFFF
 }

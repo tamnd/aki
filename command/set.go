@@ -6,6 +6,12 @@ import (
 	"github.com/tamnd/aki/keyspace"
 )
 
+// setDedupMapThreshold is the member count at or above which SADD/SREM build a
+// membership map (O(N+M)) instead of repeated linear scans (O(N*M)). Below it the
+// linear path wins because it avoids the map allocation, which would otherwise
+// dominate the common single-member call.
+const setDedupMapThreshold = 8
+
 // setCommands returns the core set commands: add, remove, membership and the
 // random pop family (doc 10 §9). The set algebra commands are a separate slice,
 // and SSCAN waits for the generic SCAN cursor machinery.
@@ -59,10 +65,28 @@ func handleSAdd(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		for _, m := range toAdd {
-			if setFind(members, m) < 0 {
-				members = append(members, m)
-				added++
+		if len(toAdd) >= setDedupMapThreshold {
+			// Many members at once: a one-pass membership map makes dedup O(N+M)
+			// instead of the O(N*M) repeated linear scan below.
+			seen := make(map[string]struct{}, len(members)+len(toAdd))
+			for _, m := range members {
+				seen[string(m)] = struct{}{}
+			}
+			for _, m := range toAdd {
+				if _, ok := seen[string(m)]; !ok {
+					seen[string(m)] = struct{}{}
+					members = append(members, m)
+					added++
+				}
+			}
+		} else {
+			// Few members: the linear scan avoids the map allocation, which would
+			// otherwise dominate the common single-member SADD.
+			for _, m := range toAdd {
+				if setFind(members, m) < 0 {
+					members = append(members, m)
+					added++
+				}
 			}
 		}
 		if added == 0 {
@@ -109,10 +133,28 @@ func handleSRem(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		for _, m := range toRemove {
-			if idx := setFind(members, m); idx >= 0 {
-				members = append(members[:idx], members[idx+1:]...)
-				removed++
+		if len(toRemove) >= setDedupMapThreshold {
+			// Many members at once: filter in one O(N+M) pass against a set of the
+			// members to drop, instead of an O(N*M) sequence of slice splices.
+			rm := make(map[string]struct{}, len(toRemove))
+			for _, m := range toRemove {
+				rm[string(m)] = struct{}{}
+			}
+			kept := members[:0]
+			for _, m := range members {
+				if _, drop := rm[string(m)]; drop {
+					removed++
+				} else {
+					kept = append(kept, m)
+				}
+			}
+			members = kept
+		} else {
+			for _, m := range toRemove {
+				if idx := setFind(members, m); idx >= 0 {
+					members = append(members[:idx], members[idx+1:]...)
+					removed++
+				}
 			}
 		}
 		if removed == 0 {

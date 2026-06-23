@@ -109,6 +109,43 @@ func TestDatabasesAreSeparate(t *testing.T) {
 	}
 }
 
+func TestExpiredVolatileKeysRespectsLimit(t *testing.T) {
+	ks, _, _ := newKS(t)
+	db := mustDB(t, ks, 0)
+
+	clock := int64(1000)
+	old := nowMillis
+	nowMillis = func() int64 { return clock }
+	defer func() { nowMillis = old }()
+
+	// Ten keys that all expire at t=2000.
+	for i := range 10 {
+		k := []byte{'k', byte('0' + i)}
+		if err := db.Set(k, []byte("v"), TypeString, EncRaw, 2000); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clock = 2000 // all expired now
+
+	// A limit caps the candidates returned even though more have expired, so the
+	// active cycle bounds the work it does under the engine lock per tick.
+	got, err := db.expiredVolatileKeys(clock, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expiredVolatileKeys limit 3 returned %d want 3", len(got))
+	}
+	// A zero limit collects nothing.
+	got, err = db.expiredVolatileKeys(clock, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expiredVolatileKeys limit 0 returned %d want 0", len(got))
+	}
+}
+
 func TestDBRange(t *testing.T) {
 	ks, _, _ := newKS(t)
 	if _, err := ks.DB(16); err == nil {

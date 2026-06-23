@@ -37,6 +37,20 @@ func TestExpireBasic(t *testing.T) {
 	}
 }
 
+func TestTTLRoundsToNearestSecond(t *testing.T) {
+	// Redis ttlGenericCommand returns (ttl+500)/1000 for the seconds form, so a
+	// key with ~1700ms left reports TTL 2, not the floored 1.
+	r, c := startData(t)
+	_ = sendLine(t, r, c, "SET k v")
+	_ = sendLine(t, r, c, "PEXPIRE k 1700")
+	if n := intReply(t, sendLine(t, r, c, "TTL k")); n != 2 {
+		t.Fatalf("TTL k = %d want 2 (rounded), floor would give 1", n)
+	}
+	if n := intReply(t, sendLine(t, r, c, "PTTL k")); n <= 1000 || n > 1700 {
+		t.Fatalf("PTTL k = %d want 1001..1700", n)
+	}
+}
+
 func TestExpireMissingKey(t *testing.T) {
 	r, c := startData(t)
 	if got := sendLine(t, r, c, "EXPIRE nope 10"); got != ":0" {
