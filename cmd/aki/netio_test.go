@@ -17,7 +17,7 @@ import (
 
 // startServer brings up an in-memory aki server and returns the address it bound
 // to. It is the harness for the networked dump and import tests.
-func startServer(t *testing.T) string {
+func startServer(t testing.TB) string {
 	t.Helper()
 	fs := vfs.NewMem()
 	p, err := pager.Create(fs, "data.aki", pager.Options{PageSize: 4096, DBCount: 16})

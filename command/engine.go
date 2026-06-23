@@ -417,6 +417,19 @@ func (e *Engine) view(index int, fn func(*keyspace.DB) error) error {
 	return fn(db)
 }
 
+// viewHotGet is a lock-free fast path for GET-like commands. It checks the
+// hot-value cache for index/key without acquiring the engine read lock. On a
+// hit it returns (body, hdr, true); on a miss it returns (nil, _, false) and
+// the caller must fall back to view(). The ks.DB lookup is safe without the
+// engine lock because the dbs slice is immutable after Open.
+func (e *Engine) viewHotGet(index int, key []byte) ([]byte, keyspace.ValueHeader, bool) {
+	db, err := e.ks.DB(index)
+	if err != nil {
+		return nil, keyspace.ValueHeader{}, false
+	}
+	return db.HotGet(key)
+}
+
 // activeExpireCycle runs one background expiry pass over every database, deleting
 // volatile keys whose TTL has passed and committing the removals so they are
 // durable. The expired keys land in the log for the caller to notify on.

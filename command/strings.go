@@ -340,6 +340,23 @@ func setWithExpire(ctx *Ctx, mode uint8, name string) {
 // the key is absent, and WRONGTYPE when the key holds a non-string value.
 func handleGet(ctx *Ctx) {
 	key := ctx.Argv[1]
+
+	// Fast path: hot-value cache, no engine lock. This runs concurrently with
+	// writes because the cache shards carry their own mutexes and the cache
+	// pointer is atomic. An expired-key invalidation is deferred to the next
+	// active expiry cycle. On a cache miss we fall through to the normal view()
+	// path, which takes e.mu.RLock and can read the B-tree.
+	if ctx.d.engine != nil {
+		if b, h, ok := ctx.d.engine.viewHotGet(ctx.Conn.DB(), key); ok {
+			if h.Type != keyspace.TypeString {
+				ctx.enc().WriteError(wrongTypeError)
+				return
+			}
+			writeStringOrNull(ctx, b, true)
+			return
+		}
+	}
+
 	var (
 		body     []byte
 		found    bool
