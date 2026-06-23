@@ -99,3 +99,53 @@ func benchPipeline(b *testing.B, n int) {
 		}
 	}
 }
+
+// BenchmarkParseRequestGet measures resp.ParseRequest -- the actual server parse
+// hot path -- rather than resp.Decode. ParseRequest returns slices that alias
+// the input buffer (zero-copy) and uses a caller-supplied argv backing slice
+// to avoid heap allocation for the common case.
+func BenchmarkParseRequestGet(b *testing.B) {
+	buf := multibulk("GET", "hello")
+	dst := make([][]byte, 8)
+	b.ReportAllocs()
+	for b.Loop() {
+		argv, _, err := resp.ParseRequest(buf, 0, resp.DefaultMaxBulkLen, dst)
+		if err != nil || len(argv) != 2 {
+			b.Fatalf("ParseRequest: %v %d args", err, len(argv))
+		}
+	}
+}
+
+// BenchmarkParseRequestSet64 measures ParseRequest for a SET with 64-byte value.
+func BenchmarkParseRequestSet64(b *testing.B) {
+	buf := multibulk("SET", "key", string(make([]byte, 64)))
+	dst := make([][]byte, 8)
+	b.ReportAllocs()
+	for b.Loop() {
+		argv, _, err := resp.ParseRequest(buf, 0, resp.DefaultMaxBulkLen, dst)
+		if err != nil || len(argv) != 3 {
+			b.Fatalf("ParseRequest: %v %d args", err, len(argv))
+		}
+	}
+}
+
+// BenchmarkParseRequestPipeline16 measures parsing 16 GET commands in one buffer.
+func BenchmarkParseRequestPipeline16(b *testing.B) {
+	one := multibulk("GET", "hello")
+	var buf []byte
+	for range 16 {
+		buf = append(buf, one...)
+	}
+	dst := make([][]byte, 8)
+	b.ReportAllocs()
+	for b.Loop() {
+		pos := 0
+		for pos < len(buf) {
+			_, next, err := resp.ParseRequest(buf, pos, resp.DefaultMaxBulkLen, dst)
+			if err != nil {
+				b.Fatal(err)
+			}
+			pos = next
+		}
+	}
+}
