@@ -195,6 +195,20 @@ type dbShard struct {
 	// on a single lock, reducing contention 1/NumShards.
 	wbMu      sync.RWMutex
 	wbPending map[string]wbPendingEntry
+
+	// pendingUncertain counts write-behind keys that entered wbPending but
+	// have not yet been applied to the B-tree. A key is counted once when it
+	// first enters wbPending (not yet present there) and removed once the shard
+	// worker's removeWBPending call actually deletes it (version matched). This
+	// lets Len() include acknowledged-but-not-yet-committed keys so DBSIZE is
+	// accurate even while async B-tree writes are in flight.
+	//
+	// The count can transiently overcount by 1 for keys that were already in
+	// the B-tree and are being updated: from the moment the B-tree write
+	// completes (keyCount unchanged) until removeWBPending decrements the
+	// counter, both keyCount and pendingUncertain count the same key. The
+	// window is bounded by the shard worker's batch latency (~10–100 µs).
+	pendingUncertain atomic.Int64
 }
 
 // ShardOf returns the shard index for key, which is the low bits of its hash
@@ -343,6 +357,9 @@ func (db *DB) Len() uint64 {
 	var total uint64
 	for s := range NumShards {
 		total += db.shards[s].keyCount.Load()
+		if p := db.shards[s].pendingUncertain.Load(); p > 0 {
+			total += uint64(p)
+		}
 	}
 	return total
 }
@@ -532,7 +549,14 @@ func (db *DB) PrepareWriteBehind(key, body []byte, hdr ValueHeader) {
 	if db.shards[s].wbPending == nil {
 		db.shards[s].wbPending = make(map[string]wbPendingEntry, 16)
 	}
+	_, alreadyPending := db.shards[s].wbPending[sk]
 	db.shards[s].wbPending[sk] = wbPendingEntry{body: body, hdr: hdr}
+	if !alreadyPending {
+		// Key newly entered wbPending. We don't yet know if it is a new key
+		// (not in the B-tree) or an update. Count it provisionally so Len()
+		// includes it. removeWBPending decrements when the B-tree write lands.
+		db.shards[s].pendingUncertain.Add(1)
+	}
 	db.shards[s].wbMu.Unlock()
 }
 
@@ -544,6 +568,7 @@ func (db *DB) removeWBPending(key string, version uint64) {
 	db.shards[s].wbMu.Lock()
 	if e, ok := db.shards[s].wbPending[key]; ok && e.hdr.Version == version {
 		delete(db.shards[s].wbPending, key)
+		db.shards[s].pendingUncertain.Add(-1)
 	}
 	db.shards[s].wbMu.Unlock()
 }
