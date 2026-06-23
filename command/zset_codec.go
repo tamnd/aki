@@ -144,3 +144,25 @@ func parseScore(b []byte) (float64, bool) {
 	}
 	return f, true
 }
+
+// hotGetZSet tries to decode the sorted set at key from the lock-free hot
+// cache. Returns (members, true) on a hit and (nil, false) on a miss.
+// A miss includes wrong-type keys so callers can fall back to view().
+func hotGetZSet(ctx *Ctx, key []byte) ([]zmember, bool) {
+	e := ctx.d.engine
+	if e == nil {
+		return nil, false
+	}
+	body, hdr, ok := e.viewHotGet(ctx.Conn.DB(), key)
+	if !ok {
+		return nil, false
+	}
+	if hdr.Type != keyspace.TypeZSet {
+		return nil, false
+	}
+	members, err := zsetDecode(body)
+	if err != nil {
+		return nil, false
+	}
+	return members, true
+}
