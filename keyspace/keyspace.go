@@ -349,7 +349,10 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 	if err != nil {
 		return err
 	}
-	ck := compositeKey(key)
+	ckp := ckPool.Get().(*[]byte)
+	*ckp = appendCompositeKey(*ckp, key)
+	ck := *ckp
+	defer ckPool.Put(ckp)
 
 	prev, existed, err := db.lookup(t, ck)
 	if err != nil {
@@ -580,8 +583,11 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 	if t == nil {
 		return nil, ValueHeader{}, false, nil
 	}
-	ck := compositeKey(key)
+	ckp := ckPool.Get().(*[]byte)
+	*ckp = appendCompositeKey(*ckp, key)
+	ck := *ckp
 	h, cell, ok, err := db.read(t, ck)
+	ckPool.Put(ckp)
 	if err != nil || !ok {
 		return nil, ValueHeader{}, false, err
 	}
@@ -623,7 +629,11 @@ func (db *DB) Delete(key []byte) (bool, error) {
 	if t == nil {
 		return false, nil
 	}
-	ck := compositeKey(key)
+	ckp := ckPool.Get().(*[]byte)
+	*ckp = appendCompositeKey(*ckp, key)
+	ck := *ckp
+	defer ckPool.Put(ckp)
+
 	prev, existed, err := db.lookup(t, ck)
 	if err != nil || !existed {
 		return false, err
