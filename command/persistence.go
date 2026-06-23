@@ -192,7 +192,12 @@ func (d *Dispatcher) snapshotForRDB() (rdb.Snapshot, error) {
 }
 
 // writeRDB builds the snapshot and writes the dump.rdb inline. SAVE uses it.
+// It first flushes any writes a deferred commit policy left pending so the .aki
+// file is durable through the same point the dump captures.
 func (d *Dispatcher) writeRDB() error {
+	if err := d.engine.ForceCommit(); err != nil {
+		return err
+	}
 	snap, err := d.snapshotForRDB()
 	if err != nil {
 		return err

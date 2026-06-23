@@ -88,10 +88,12 @@ func TestDebugSetActiveExpireDisables(t *testing.T) {
 	if got := sendLine(t, r1, c1, "DEBUG SET-ACTIVE-EXPIRE 0"); got != "+OK" {
 		t.Fatalf("DEBUG SET-ACTIVE-EXPIRE 0 = %q", got)
 	}
-	if got := sendLine(t, r1, c1, "SET k v PX 1"); got != "+OK" {
+	// Use PX 200 so the key outlives any reasonable command-path latency on slow
+	// CI runners (a PX 1 TTL can expire before db.set runs the B-tree write).
+	if got := sendLine(t, r1, c1, "SET k v PX 200"); got != "+OK" {
 		t.Fatalf("SET = %q", got)
 	}
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 
 	// With the cycle off the expired key stays counted in the keyspace.
 	d.runActiveExpire()
