@@ -397,6 +397,11 @@ func (d *Dispatcher) runActiveExpire() {
 	if d.engine == nil || !d.activeExpire.Load() {
 		return
 	}
+	// Flush any write-behind shard writes before scanning so the B-tree
+	// contains keys that were SET but whose async B-tree write has not yet run.
+	// Without this flush, a key written under the deferred policy could stay
+	// only in wbPending and never be seen by the expiry cycle.
+	d.engine.FlushShardWrites()
 	if err := d.engine.activeExpireCycle(); err != nil {
 		return
 	}
