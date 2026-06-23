@@ -47,49 +47,58 @@ func (ks *Keyspace) Check() ([]DBCheck, error) {
 	return out, nil
 }
 
-// check walks one database's B-tree, verifying key ordering and value headers and
-// tallying TTL state.
+// check walks all shards of one database, verifying key ordering and value
+// headers and tallying TTL state. Each shard is checked under its read lock.
 func (db *DB) check(now int64) (DBCheck, error) {
 	res := DBCheck{Index: db.index}
-	t := db.loadTree()
-	if t == nil {
-		return res, nil
-	}
-	res.StructErr = btree.CheckInvariants(t)
-	c := t.Cursor()
-	if err := c.First(); err != nil {
-		return res, err
-	}
-	var prev []byte
-	for c.Valid() {
-		ck := c.Key()
-		if prev != nil && bytes.Compare(ck, prev) <= 0 {
-			res.OrderErrors++
+	for s := range NumShards {
+		db.shards[s].mu.RLock()
+		t := db.loadShardTree(s)
+		if t == nil {
+			db.shards[s].mu.RUnlock()
+			continue
 		}
-		prev = bytes.Clone(ck)
-		res.Entries++
-
-		h, _, ok := parseHeader(c.Value())
-		if !ok {
-			res.BadHeaders++
-		} else if h.HasTTL() {
-			res.Expires++
-			switch {
-			case h.TTLms <= now:
-				res.StaleTTL++
-			case h.TTLms > now+farFutureMs:
-				res.FutureTTL++
-				res.Live++
-			default:
-				res.Live++
-			}
-		} else {
-			res.Live++
+		if err := btree.CheckInvariants(t); err != nil {
+			res.StructErr = err
 		}
-
-		if err := c.Next(); err != nil {
+		c := t.Cursor()
+		if err := c.First(); err != nil {
+			db.shards[s].mu.RUnlock()
 			return res, err
 		}
+		var prev []byte
+		for c.Valid() {
+			ck := c.Key()
+			if prev != nil && bytes.Compare(ck, prev) <= 0 {
+				res.OrderErrors++
+			}
+			prev = bytes.Clone(ck)
+			res.Entries++
+
+			h, _, ok := parseHeader(c.Value())
+			if !ok {
+				res.BadHeaders++
+			} else if h.HasTTL() {
+				res.Expires++
+				switch {
+				case h.TTLms <= now:
+					res.StaleTTL++
+				case h.TTLms > now+farFutureMs:
+					res.FutureTTL++
+					res.Live++
+				default:
+					res.Live++
+				}
+			} else {
+				res.Live++
+			}
+
+			if err := c.Next(); err != nil {
+				db.shards[s].mu.RUnlock()
+				return res, err
+			}
+		}
+		db.shards[s].mu.RUnlock()
 	}
 	return res, nil
 }
@@ -141,33 +150,43 @@ func (ks *Keyspace) CheckPageAccounting() error {
 	}
 
 	for _, db := range ks.dbs {
-		t := db.loadTree()
-		if t == nil {
-			continue
-		}
-		pages, err := btree.Pages(t)
-		if err != nil {
-			return fmt.Errorf("db%d: %w", db.index, err)
-		}
-		for _, pgno := range pages {
-			if err := mark(pgno, fmt.Sprintf("db%d tree", db.index)); err != nil {
-				return err
+		for s := range NumShards {
+			db.shards[s].mu.RLock()
+			t := db.loadShardTree(s)
+			if t == nil {
+				db.shards[s].mu.RUnlock()
+				continue
 			}
-		}
-		c := t.Cursor()
-		if err := c.First(); err != nil {
-			return fmt.Errorf("db%d cursor: %w", db.index, err)
-		}
-		for c.Valid() {
-			h, _, ok := parseHeader(c.Value())
-			if ok && h.Flags&FlagInlineBody == 0 && h.BodyRef != 0 {
-				if err := ks.markOverflowChain(uint32(h.BodyRef), pageCount, mark); err != nil {
-					return fmt.Errorf("db%d overflow: %w", db.index, err)
+			pages, err := btree.Pages(t)
+			if err != nil {
+				db.shards[s].mu.RUnlock()
+				return fmt.Errorf("db%d shard%d: %w", db.index, s, err)
+			}
+			for _, pgno := range pages {
+				if err := mark(pgno, fmt.Sprintf("db%d shard%d tree", db.index, s)); err != nil {
+					db.shards[s].mu.RUnlock()
+					return err
 				}
 			}
-			if err := c.Next(); err != nil {
-				return fmt.Errorf("db%d cursor: %w", db.index, err)
+			c := t.Cursor()
+			if err := c.First(); err != nil {
+				db.shards[s].mu.RUnlock()
+				return fmt.Errorf("db%d shard%d cursor: %w", db.index, s, err)
 			}
+			for c.Valid() {
+				h, _, ok := parseHeader(c.Value())
+				if ok && h.Flags&FlagInlineBody == 0 && h.BodyRef != 0 {
+					if err := ks.markOverflowChain(uint32(h.BodyRef), pageCount, mark); err != nil {
+						db.shards[s].mu.RUnlock()
+						return fmt.Errorf("db%d shard%d overflow: %w", db.index, s, err)
+					}
+				}
+				if err := c.Next(); err != nil {
+					db.shards[s].mu.RUnlock()
+					return fmt.Errorf("db%d shard%d cursor: %w", db.index, s, err)
+				}
+			}
+			db.shards[s].mu.RUnlock()
 		}
 	}
 
@@ -224,23 +243,30 @@ func (ks *Keyspace) FixFutureTTLs() (int, error) {
 	now := nowMillis()
 	fixed := 0
 	for _, db := range ks.dbs {
-		t := db.loadTree()
-		if t == nil {
-			continue
-		}
 		var keys [][]byte
-		c := t.Cursor()
-		if err := c.First(); err != nil {
-			return fixed, err
-		}
-		for c.Valid() {
-			h, _, ok := parseHeader(c.Value())
-			if ok && h.HasTTL() && h.TTLms > now+farFutureMs {
-				keys = append(keys, copyRaw(c.Key()))
+		for s := range NumShards {
+			db.shards[s].mu.RLock()
+			t := db.loadShardTree(s)
+			if t == nil {
+				db.shards[s].mu.RUnlock()
+				continue
 			}
-			if err := c.Next(); err != nil {
+			c := t.Cursor()
+			if err := c.First(); err != nil {
+				db.shards[s].mu.RUnlock()
 				return fixed, err
 			}
+			for c.Valid() {
+				h, _, ok := parseHeader(c.Value())
+				if ok && h.HasTTL() && h.TTLms > now+farFutureMs {
+					keys = append(keys, copyRaw(c.Key()))
+				}
+				if err := c.Next(); err != nil {
+					db.shards[s].mu.RUnlock()
+					return fixed, err
+				}
+			}
+			db.shards[s].mu.RUnlock()
 		}
 		for _, key := range keys {
 			body, h, found, err := db.Peek(key)
