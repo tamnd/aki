@@ -40,7 +40,12 @@ type cachedValue struct {
 
 type cacheEntry struct {
 	key string
-	val *cachedValue // pointer so atime can be updated through a shard read lock
+	// val is an atomic pointer so cput can swap in a new cachedValue for an
+	// existing key without allocating a new cacheEntry. Concurrent cget calls
+	// that captured the cacheEntry pointer before the swap read the old value
+	// safely — the atomic.Pointer.Store makes the new value visible without a
+	// lock, and the old cachedValue stays live until GC collects it.
+	val atomic.Pointer[cachedValue]
 }
 
 type cacheShard struct {
@@ -99,11 +104,15 @@ func (c *dbCache) cget(key []byte) ([]byte, ValueHeader, bool) {
 	if !ok {
 		return nil, ValueHeader{}, false
 	}
-	// Update atime atomically without holding any lock. Even if the entry is
-	// evicted from the map between RUnlock and this Store, the pointer e is
-	// still live (Go GC is precise) and the write is harmless.
-	e.val.atime.Store(nowSeconds())
-	return e.val.body, e.val.hdr, true
+	// Load the value atomically. cput may swap e.val at any time after we
+	// released RLock, but atomic.Pointer.Load gives us a consistent snapshot
+	// of whichever cachedValue was current at the moment of this load.
+	cv := e.val.Load()
+	// Update atime atomically without holding any lock. Even if cput replaces
+	// cv between our Load and this Store, the write is to a still-live object
+	// and is harmless (the new cv will get its own atime stamp on the next hit).
+	cv.atime.Store(nowSeconds())
+	return cv.body, cv.hdr, true
 }
 
 // cgetAtime returns the last-access time for key as recorded in the hot cache.
@@ -117,32 +126,44 @@ func (c *dbCache) cgetAtime(key []byte) (uint32, bool) {
 	if !ok {
 		return 0, false
 	}
-	return e.val.atime.Load(), true
+	return e.val.Load().atime.Load(), true
 }
 
 // cput stores body and header under key, evicting the LRU entry when the shard
 // is full. key is a string because cput is only called from write paths where
 // the string is already available (set path, wbPending warm-up).
+//
+// For an existing key, cput swaps in a new cachedValue atomically into the
+// existing cacheEntry without allocating a new entry. For a new key, it
+// allocates both a cacheEntry and a cachedValue.
 func (c *dbCache) cput(key string, body []byte, hdr ValueHeader) {
 	sh := &c.shards[c.shardIdxStr(key)]
+	cv := &cachedValue{body: body, hdr: hdr}
+	cv.atime.Store(nowSeconds())
 	sh.mu.Lock()
-	if _, exists := sh.entries[key]; !exists {
-		sh.lru = append(sh.lru, key)
-		if len(sh.entries) >= dbCachePerShard {
-			// Evict the oldest entry whose key still exists in the map.
-			for len(sh.lru) > 0 {
-				victim := sh.lru[0]
-				sh.lru = sh.lru[1:]
-				if _, present := sh.entries[victim]; present {
-					delete(sh.entries, victim)
-					break
-				}
+	if e, exists := sh.entries[key]; exists {
+		// Key already in cache: swap the value pointer in-place. No new
+		// cacheEntry allocation, saving one heap object per update write.
+		e.val.Store(cv)
+		sh.mu.Unlock()
+		return
+	}
+	// New key: allocate a cacheEntry and evict the LRU victim if at capacity.
+	sh.lru = append(sh.lru, key)
+	if len(sh.entries) >= dbCachePerShard {
+		// Evict the oldest entry whose key still exists in the map.
+		for len(sh.lru) > 0 {
+			victim := sh.lru[0]
+			sh.lru = sh.lru[1:]
+			if _, present := sh.entries[victim]; present {
+				delete(sh.entries, victim)
+				break
 			}
 		}
 	}
-	cv := &cachedValue{body: body, hdr: hdr}
-	cv.atime.Store(nowSeconds())
-	sh.entries[key] = &cacheEntry{key: key, val: cv}
+	e := &cacheEntry{key: key}
+	e.val.Store(cv)
+	sh.entries[key] = e
 	sh.mu.Unlock()
 }
 
