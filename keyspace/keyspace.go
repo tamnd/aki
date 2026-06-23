@@ -354,13 +354,6 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 	ck := *ckp
 	defer ckPool.Put(ckp)
 
-	prev, existed, err := db.lookup(t, ck)
-	if err != nil {
-		return err
-	}
-	isNew := !existed
-	hadTTL := existed && prev.HasTTL()
-
 	var version uint64
 	if preVersion > 0 {
 		version = preVersion
@@ -395,10 +388,22 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 		h.BodyRef = uint64(head)
 		cell = h.AppendTo(make([]byte, 0, HeaderSize))
 	}
-	if err := t.Put(ck, cell); err != nil {
+
+	// Upsert writes the new cell and returns the previous cell in a single
+	// traversal, replacing the separate lookup + Put pair.
+	prevCell, err := t.Upsert(ck, cell)
+	if err != nil {
 		return err
 	}
 	db.rootPage = t.Root()
+
+	var prev ValueHeader
+	existed := prevCell != nil
+	if existed {
+		prev, _, _ = parseHeader(prevCell)
+	}
+	isNew := !existed
+	hadTTL := existed && prev.HasTTL()
 
 	// The previous value's overflow pages are now unreferenced.
 	if existed && prev.Flags&FlagInlineBody == 0 && prev.BodyRef != 0 {
