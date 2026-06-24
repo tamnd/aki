@@ -295,6 +295,77 @@ func TestConfigHotMirror(t *testing.T) {
 	}
 }
 
+// TestConfigHotMirrorRest checks the per-command directives E11 added to the
+// atomic mirror track their defaults and later set() writes, including the
+// slave-era spelling of the min-replicas pair.
+func TestConfigHotMirrorRest(t *testing.T) {
+	cs := newConfigStore()
+	// Defaults, as declared in the directive table.
+	if cs.clusterEnabled() {
+		t.Fatalf("default clusterEnabled = true want false")
+	}
+	if cs.slowlogThreshold() != 10000 {
+		t.Fatalf("default slowlogThreshold = %d want 10000", cs.slowlogThreshold())
+	}
+	if cs.latencyThreshold() != 0 {
+		t.Fatalf("default latencyThreshold = %d want 0", cs.latencyThreshold())
+	}
+	if !cs.serveStaleData() {
+		t.Fatalf("default serveStaleData = false want true")
+	}
+	if !cs.stopWritesOnBgsaveError() {
+		t.Fatalf("default stopWritesOnBgsaveError = false want true")
+	}
+	if cs.minReplicasToWrite() != 0 {
+		t.Fatalf("default minReplicasToWrite = %d want 0", cs.minReplicasToWrite())
+	}
+	if cs.minReplicasMaxLag() != 10 {
+		t.Fatalf("default minReplicasMaxLag = %d want 10", cs.minReplicasMaxLag())
+	}
+	if cs.aofTimestampEnabled() {
+		t.Fatalf("default aofTimestampEnabled = true want false")
+	}
+	// Writes through set().
+	cs.set("cluster-enabled", "yes")
+	cs.set("slowlog-log-slower-than", "5000")
+	cs.set("latency-monitor-threshold", "25")
+	cs.set("replica-serve-stale-data", "no")
+	cs.set("stop-writes-on-bgsave-error", "no")
+	cs.set("min-replicas-to-write", "2")
+	cs.set("min-replicas-max-lag", "7")
+	cs.set("aof-timestamp-enabled", "yes")
+	if !cs.clusterEnabled() {
+		t.Fatalf("clusterEnabled after set = false want true")
+	}
+	if cs.slowlogThreshold() != 5000 {
+		t.Fatalf("slowlogThreshold after set = %d want 5000", cs.slowlogThreshold())
+	}
+	if cs.latencyThreshold() != 25 {
+		t.Fatalf("latencyThreshold after set = %d want 25", cs.latencyThreshold())
+	}
+	if cs.serveStaleData() {
+		t.Fatalf("serveStaleData after set = true want false")
+	}
+	if cs.stopWritesOnBgsaveError() {
+		t.Fatalf("stopWritesOnBgsaveError after set = true want false")
+	}
+	if cs.minReplicasToWrite() != 2 {
+		t.Fatalf("minReplicasToWrite after set = %d want 2", cs.minReplicasToWrite())
+	}
+	if cs.minReplicasMaxLag() != 7 {
+		t.Fatalf("minReplicasMaxLag after set = %d want 7", cs.minReplicasMaxLag())
+	}
+	if !cs.aofTimestampEnabled() {
+		t.Fatalf("aofTimestampEnabled after set = false want true")
+	}
+	// The slave-era spelling carries the set too, since handleConfigSet calls
+	// mirror with whichever name the client used.
+	cs.set("min-slaves-to-write", "4")
+	if cs.minReplicasToWrite() != 4 {
+		t.Fatalf("minReplicasToWrite after min-slaves set = %d want 4", cs.minReplicasToWrite())
+	}
+}
+
 // TestConfigSetMaxmemoryMirror checks that the maxmemory mirror tracks a CONFIG
 // SET through the live command path, the value the eviction guard reads.
 func TestConfigSetMaxmemoryMirror(t *testing.T) {

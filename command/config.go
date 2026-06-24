@@ -39,12 +39,13 @@ type directive struct {
 // configStore holds the live value of every known directive. It is shared across
 // connection goroutines, so every access takes the lock.
 //
-// A handful of directives are read on the per-command hot path (appendonly and
-// appendfsync, on every write). Taking the RWMutex for those reads showed up as
-// the top contended atomic in the post-E6 profile, so the store mirrors them into
-// atomics that set() keeps current. The hot readers load the atomic and never
-// touch the map lock; the map stays the source of truth for CONFIG GET and the
-// cold directives.
+// A handful of directives are read on the per-command hot path (appendonly,
+// appendfsync, maxmemory, cluster-enabled, the slowlog and latency thresholds,
+// and the per-write replica and bgsave guards). Taking the RWMutex for those
+// reads showed up as the top contended atomic in the post-E6 profile, so the
+// store mirrors them into atomics that set() keeps current. The hot readers load
+// the atomic and never touch the map lock; the map stays the source of truth for
+// CONFIG GET and the cold directives.
 type configStore struct {
 	mu    sync.RWMutex
 	defs  map[string]*directive
@@ -55,6 +56,18 @@ type configStore struct {
 	aofOn    atomic.Bool  // mirrors appendonly == "yes"
 	aofFsync atomic.Int32 // mirrors appendfsync, one of the fsync* codes
 	maxmem   atomic.Int64 // mirrors maxmemory in bytes, read on every denyoom write
+
+	// The directives below are each read once per command (the cluster, slowlog,
+	// and latency checks fire on reads too; the rest fire per write). They mirror
+	// the same way so the per-command path never takes the config lock.
+	clusterOn        atomic.Bool  // mirrors cluster-enabled == "yes"
+	slowlogThresh    atomic.Int64 // mirrors slowlog-log-slower-than
+	latencyThresh    atomic.Int64 // mirrors latency-monitor-threshold
+	serveStale       atomic.Bool  // mirrors replica-serve-stale-data == "yes"
+	stopWritesBgsave atomic.Bool  // mirrors stop-writes-on-bgsave-error == "yes"
+	minReplWrite     atomic.Int64 // mirrors min-replicas-to-write
+	minReplMaxLag    atomic.Int64 // mirrors min-replicas-max-lag
+	aofTimestamp     atomic.Bool  // mirrors aof-timestamp-enabled == "yes"
 }
 
 // fsync policy codes mirror the appendfsync directive. everysec is zero so the
@@ -96,10 +109,8 @@ func newConfigStore() *configStore {
 		cs.alias[p[0]] = p[1]
 		cs.alias[p[1]] = p[0]
 	}
-	cs.aofOn.Store(cs.vals["appendonly"] == "yes")
-	cs.aofFsync.Store(fsyncCode(cs.vals["appendfsync"]))
-	if n, err := strconv.ParseInt(cs.vals["maxmemory"], 10, 64); err == nil {
-		cs.maxmem.Store(n)
+	for _, name := range mirroredDirectives {
+		cs.mirror(name, cs.vals[name])
 	}
 	return cs
 }
@@ -132,9 +143,30 @@ func (cs *configStore) set(name, val string) {
 	cs.mirror(name, val)
 }
 
+// mirroredDirectives lists every directive whose value is also kept in an atomic
+// for the per-command path. newConfigStore seeds the atomics by replaying these
+// through mirror, and the alias twins appear so a CONFIG SET to the slave-era
+// name updates the mirror too.
+var mirroredDirectives = []string{
+	"appendonly",
+	"appendfsync",
+	"maxmemory",
+	"cluster-enabled",
+	"slowlog-log-slower-than",
+	"latency-monitor-threshold",
+	"replica-serve-stale-data",
+	"stop-writes-on-bgsave-error",
+	"min-replicas-to-write",
+	"min-slaves-to-write",
+	"min-replicas-max-lag",
+	"min-slaves-max-lag",
+	"aof-timestamp-enabled",
+}
+
 // mirror refreshes the atomic copy of a hot-path directive after its map value
 // changes. It is a no-op for every directive that is not mirrored. CONFIG SET
-// writes the map directly, so it calls this too.
+// writes the map directly, so it calls this too. The min-replicas pair lists both
+// the replica-era and slave-era spellings because either name can carry the set.
 func (cs *configStore) mirror(name, val string) {
 	switch name {
 	case "appendonly":
@@ -142,16 +174,46 @@ func (cs *configStore) mirror(name, val string) {
 	case "appendfsync":
 		cs.aofFsync.Store(fsyncCode(val))
 	case "maxmemory":
-		if n, err := strconv.ParseInt(val, 10, 64); err == nil {
-			cs.maxmem.Store(n)
-		}
+		cs.storeInt(&cs.maxmem, val)
+	case "cluster-enabled":
+		cs.clusterOn.Store(val == "yes")
+	case "slowlog-log-slower-than":
+		cs.storeInt(&cs.slowlogThresh, val)
+	case "latency-monitor-threshold":
+		cs.storeInt(&cs.latencyThresh, val)
+	case "replica-serve-stale-data":
+		cs.serveStale.Store(val == "yes")
+	case "stop-writes-on-bgsave-error":
+		cs.stopWritesBgsave.Store(val == "yes")
+	case "min-replicas-to-write", "min-slaves-to-write":
+		cs.storeInt(&cs.minReplWrite, val)
+	case "min-replicas-max-lag", "min-slaves-max-lag":
+		cs.storeInt(&cs.minReplMaxLag, val)
+	case "aof-timestamp-enabled":
+		cs.aofTimestamp.Store(val == "yes")
 	}
 }
 
-// maxMemory returns the configured maxmemory limit in bytes from the atomic
-// mirror, 0 when no limit is set. The eviction guard reads it on every denyoom
-// write, so it stays lock-free.
-func (cs *configStore) maxMemory() int64 { return cs.maxmem.Load() }
+// storeInt parses a canonical integer directive value and stores it in dst,
+// leaving dst unchanged when the value does not parse.
+func (cs *configStore) storeInt(dst *atomic.Int64, val string) {
+	if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+		dst.Store(n)
+	}
+}
+
+// The accessors below read the atomic mirror so the per-command path stays
+// lock-free. Each mirrors one directive and matches the default its directive
+// declares.
+func (cs *configStore) maxMemory() int64              { return cs.maxmem.Load() }
+func (cs *configStore) clusterEnabled() bool          { return cs.clusterOn.Load() }
+func (cs *configStore) slowlogThreshold() int64       { return cs.slowlogThresh.Load() }
+func (cs *configStore) latencyThreshold() int64       { return cs.latencyThresh.Load() }
+func (cs *configStore) serveStaleData() bool          { return cs.serveStale.Load() }
+func (cs *configStore) stopWritesOnBgsaveError() bool { return cs.stopWritesBgsave.Load() }
+func (cs *configStore) minReplicasToWrite() int64     { return cs.minReplWrite.Load() }
+func (cs *configStore) minReplicasMaxLag() int64      { return cs.minReplMaxLag.Load() }
+func (cs *configStore) aofTimestampEnabled() bool     { return cs.aofTimestamp.Load() }
 
 // appendOnly reports whether appendonly is on, reading the atomic mirror so the
 // per-command write path never takes the config lock.

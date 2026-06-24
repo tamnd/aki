@@ -56,7 +56,10 @@ func latencyEventFor(cmd *CmdDesc) string {
 // latency-monitor-threshold. A threshold of 0 disables the monitor. ms is the
 // event duration in milliseconds.
 func (d *Dispatcher) latencyAddSample(event string, ms int64) {
-	threshold := d.confInt("latency-monitor-threshold", 0)
+	threshold := int64(0)
+	if d.conf != nil {
+		threshold = d.conf.latencyThreshold()
+	}
 	if threshold <= 0 || ms < threshold {
 		return
 	}

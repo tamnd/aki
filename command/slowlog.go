@@ -44,7 +44,10 @@ type slowlogState struct {
 // or above slowlog-log-slower-than. A threshold of -1 disables the log and 0
 // records every command. argv is the command as the client sent it.
 func (d *Dispatcher) slowlogMaybeAdd(c connInfo, argv [][]byte, durUs int64) {
-	threshold := d.confInt("slowlog-log-slower-than", 10000)
+	threshold := int64(10000)
+	if d.conf != nil {
+		threshold = d.conf.slowlogThreshold()
+	}
 	if threshold < 0 || durUs < threshold {
 		return
 	}
