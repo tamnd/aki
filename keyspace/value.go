@@ -45,6 +45,12 @@ const (
 	FlagLFUMode    uint8 = 1 << 2
 	FlagNoEvict    uint8 = 1 << 3
 	FlagNoTouch    uint8 = 1 << 4
+	// FlagCollTree marks a btree-backed collection: BodyRef is the root of a
+	// per-key element sub-tree (not an overflow chain) and the inline body holds
+	// the collection metadata (element count and, for lists, the index window).
+	// Large hash/set/zset/list keys use this so a single-element op is O(log N)
+	// instead of a whole-blob rewrite. Small collections keep the inline blob form.
+	FlagCollTree uint8 = 1 << 5
 )
 
 // HeaderSize is the on-disk size of a serialized ValueHeader (doc 05 §3.1).
@@ -69,6 +75,10 @@ type ValueHeader struct {
 
 // HasTTL reports whether the header carries an expiry.
 func (h ValueHeader) HasTTL() bool { return h.Flags&FlagHasTTL != 0 }
+
+// IsColl reports whether the header is a btree-backed collection, in which case
+// BodyRef is an element sub-tree root and the body is collection metadata.
+func (h ValueHeader) IsColl() bool { return h.Flags&FlagCollTree != 0 }
 
 // AppendTo appends the 40-byte little-endian encoding of h to dst.
 func (h ValueHeader) AppendTo(dst []byte) []byte {

@@ -65,8 +65,9 @@ func handleHSet(ctx *Ctx, asHMSet bool) {
 		wrongTyp bool
 		added    int64
 	)
+	lim := ctx.encLimits()
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		fields, hdr, found, err := getHash(db, key)
+		hdr, found, err := hashHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -74,6 +75,31 @@ func handleHSet(ctx *Ctx, asHMSet bool) {
 			wrongTyp = true
 			return nil
 		}
+		// A hash already in the btree-backed form takes the point-write path: one
+		// sub-tree row per pair, no whole-blob rewrite.
+		if found && hdr.IsColl() {
+			added = 0
+			return db.CollUpdate(key, keyspace.TypeHash, keyspace.EncHashtable, func(w *keyspace.CollWriter) error {
+				for i := 0; i < len(pairs); i += 2 {
+					created, e := w.Put(pairs[i], hashRowEncode(0, pairs[i+1]))
+					if e != nil {
+						return e
+					}
+					if created {
+						w.SetCount(w.Count() + 1)
+						added++
+					}
+				}
+				return nil
+			})
+		}
+		// Blob path: decode, apply, then either rewrite the blob or, if the result
+		// crosses the hashtable threshold, promote to a fresh sub-tree.
+		fields, _, _, err := getHash(db, key)
+		if err != nil {
+			return err
+		}
+		added = 0
 		for i := 0; i < len(pairs); i += 2 {
 			f, v := pairs[i], pairs[i+1]
 			if idx := hashFind(fields, f); idx >= 0 {
@@ -87,7 +113,10 @@ func handleHSet(ctx *Ctx, asHMSet bool) {
 		if found {
 			prev = hdr.Encoding
 		}
-		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(ctx.encLimits(), fields, prev), keepTTL(hdr, found))
+		if hashWantsTree(lim, fields, prev) {
+			return hashPromote(db, key, fields)
+		}
+		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(lim, fields, prev), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -111,8 +140,9 @@ func handleHSetNX(ctx *Ctx) {
 		wrongTyp bool
 		set      bool
 	)
+	lim := ctx.encLimits()
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		fields, hdr, found, err := getHash(db, key)
+		hdr, found, err := hashHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -120,7 +150,27 @@ func handleHSetNX(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
+		if found && hdr.IsColl() {
+			set = false
+			return db.CollUpdate(key, keyspace.TypeHash, keyspace.EncHashtable, func(w *keyspace.CollWriter) error {
+				_, present, e := w.Get(field)
+				if e != nil || present {
+					return e
+				}
+				if _, e := w.Put(field, hashRowEncode(0, val)); e != nil {
+					return e
+				}
+				w.SetCount(w.Count() + 1)
+				set = true
+				return nil
+			})
+		}
+		fields, _, _, err := getHash(db, key)
+		if err != nil {
+			return err
+		}
 		if hashFind(fields, field) >= 0 {
+			set = false
 			return nil
 		}
 		fields = append(fields, hashField{field: field, value: val})
@@ -129,7 +179,10 @@ func handleHSetNX(ctx *Ctx) {
 		if found {
 			prev = hdr.Encoding
 		}
-		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(ctx.encLimits(), fields, prev), keepTTL(hdr, found))
+		if hashWantsTree(lim, fields, prev) {
+			return hashPromote(db, key, fields)
+		}
+		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(lim, fields, prev), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -189,21 +242,15 @@ func handleHGet(ctx *Ctx) {
 		value    []byte
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		fields, hdr, ok, err := getHash(db, key)
+		v, fieldFound, hdr, keyFound, err := hashGetField(db, key, field)
 		if err != nil {
 			return err
 		}
-		if !ok {
-			return nil
-		}
-		if hdr.Type != keyspace.TypeHash {
+		if keyFound && hdr.Type != keyspace.TypeHash {
 			wrongTyp = true
 			return nil
 		}
-		if idx := hashFind(fields, field); idx >= 0 {
-			value = fields[idx].value
-			found = true
-		}
+		value, found = v, fieldFound
 		return nil
 	}) {
 		return
@@ -244,17 +291,43 @@ func handleHMGet(ctx *Ctx) {
 		present  = make([]bool, len(want))
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		fields, hdr, ok, err := getHash(db, key)
-		if err != nil {
+		body, hdr, keyFound, err := db.Get(key)
+		if err != nil || !keyFound {
 			return err
-		}
-		if !ok {
-			return nil
 		}
 		if hdr.Type != keyspace.TypeHash {
 			wrongTyp = true
 			return nil
 		}
+		if hdr.IsColl() {
+			_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+				for i, f := range want {
+					row, p, e := r.Get(f)
+					if e != nil {
+						return e
+					}
+					if !p {
+						continue
+					}
+					ttl, val, de := hashRowDecode(row)
+					if de != nil {
+						return de
+					}
+					if hashRowExpired(ttl) {
+						continue
+					}
+					values[i] = append([]byte(nil), val...)
+					present[i] = true
+				}
+				return nil
+			})
+			return err
+		}
+		fields, de := hashDecode(body)
+		if de != nil {
+			return de
+		}
+		fields = dropExpiredFields(fields)
 		for i, f := range want {
 			if idx := hashFind(fields, f); idx >= 0 {
 				values[i] = fields[idx].value
@@ -300,7 +373,7 @@ func handleHGetAll(ctx *Ctx) {
 		fields   []hashField
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		fs, hdr, ok, err := getHash(db, key)
+		fs, hdr, ok, err := hashMaterialize(db, key)
 		if err != nil {
 			return err
 		}
@@ -338,8 +411,9 @@ func handleHDel(ctx *Ctx) {
 		emptied  bool
 		removed  int64
 	)
+	lim := ctx.encLimits()
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		fields, hdr, found, err := getHash(db, key)
+		hdr, found, err := hashHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -349,6 +423,28 @@ func handleHDel(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeHash {
 			wrongTyp = true
 			return nil
+		}
+		if hdr.IsColl() {
+			removed = 0
+			err := db.CollUpdate(key, keyspace.TypeHash, keyspace.EncHashtable, func(w *keyspace.CollWriter) error {
+				for _, t := range targets {
+					existed, e := w.Delete(t)
+					if e != nil {
+						return e
+					}
+					if existed {
+						w.SetCount(w.Count() - 1)
+						removed++
+					}
+				}
+				emptied = w.Count() == 0
+				return nil
+			})
+			return err
+		}
+		fields, _, _, err := getHash(db, key)
+		if err != nil {
+			return err
 		}
 		for _, t := range targets {
 			if idx := hashFind(fields, t); idx >= 0 {
@@ -364,7 +460,7 @@ func handleHDel(ctx *Ctx) {
 			_, err := db.Delete(key)
 			return err
 		}
-		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(ctx.encLimits(), fields, hdr.Encoding), keepTTL(hdr, found))
+		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(lim, fields, hdr.Encoding), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -396,7 +492,7 @@ func handleHLen(ctx *Ctx) {
 		n        int64
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		fields, hdr, found, err := getHash(db, key)
+		count, hdr, found, err := hashLen(db, key)
 		if err != nil {
 			return err
 		}
@@ -407,7 +503,7 @@ func handleHLen(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		n = int64(len(fields))
+		n = count
 		return nil
 	}) {
 		return
@@ -437,18 +533,15 @@ func handleHExists(ctx *Ctx) {
 		exists   bool
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		fields, hdr, found, err := getHash(db, key)
+		_, fieldFound, hdr, keyFound, err := hashGetField(db, key, field)
 		if err != nil {
 			return err
 		}
-		if !found {
-			return nil
-		}
-		if hdr.Type != keyspace.TypeHash {
+		if keyFound && hdr.Type != keyspace.TypeHash {
 			wrongTyp = true
 			return nil
 		}
-		exists = hashFind(fields, field) >= 0
+		exists = fieldFound
 		return nil
 	}) {
 		return
@@ -487,7 +580,7 @@ func handleHFields(ctx *Ctx, keys, vals bool) {
 		fields   []hashField
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		fs, hdr, found, err := getHash(db, key)
+		fs, hdr, found, err := hashMaterialize(db, key)
 		if err != nil {
 			return err
 		}
@@ -537,19 +630,16 @@ func handleHStrLen(ctx *Ctx) {
 		n        int64
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		fields, hdr, found, err := getHash(db, key)
+		v, fieldFound, hdr, keyFound, err := hashGetField(db, key, field)
 		if err != nil {
 			return err
 		}
-		if !found {
-			return nil
-		}
-		if hdr.Type != keyspace.TypeHash {
+		if keyFound && hdr.Type != keyspace.TypeHash {
 			wrongTyp = true
 			return nil
 		}
-		if idx := hashFind(fields, field); idx >= 0 {
-			n = int64(len(fields[idx].value))
+		if fieldFound {
+			n = int64(len(v))
 		}
 		return nil
 	}) {
