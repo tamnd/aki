@@ -343,7 +343,7 @@ func (d *Dispatcher) StopBackground() {
 	d.StopReplication()
 	// Stop the cron goroutine first. The cron calls FlushShardWrites inside
 	// runActiveExpire; stopping it before StopWorker ensures FlushShardWrites
-	// never races with StopWorker clearing writeChs.
+	// never races with StopWorker tearing down the shard queues.
 	if d.bgStop != nil {
 		close(d.bgStop)
 		<-d.bgDone
