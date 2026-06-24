@@ -328,15 +328,18 @@ func (d *Dispatcher) checkSavePoints() {
 // The gate clears on its own once a later save succeeds and flips lastStatus back
 // to "ok". A replica never applies it, since the master already enforced the rule.
 func (d *Dispatcher) writesBlockedByBgsaveError() bool {
+	// The gate is an AND of three conditions, so the cheapest and most selective one
+	// goes first. A failed save is the rare case, and its mirror is a single
+	// lock-free atomic load, so checking it first short-circuits the whole gate on
+	// every healthy write before the config read and the save-point parse, which
+	// allocates, ever run.
+	if !d.persist.lastSaveErr.Load() {
+		return false
+	}
 	if d.conf == nil || !d.conf.stopWritesOnBgsaveError() {
 		return false
 	}
-	if len(parseSavePoints(confValue(d.conf, "save", ""))) == 0 {
-		return false
-	}
-	// Runs on every write, so it reads the atomic mirror of lastStatus rather than
-	// taking the persist lock.
-	return d.persist.lastSaveErr.Load()
+	return len(parseSavePoints(confValue(d.conf, "save", ""))) > 0
 }
 
 // savePoint is one "save <seconds> <changes>" rule.
