@@ -258,3 +258,51 @@ func TestConfigAliasMirror(t *testing.T) {
 		t.Fatalf("cluster-replica-no-failover = %q want yes", got)
 	}
 }
+
+// TestConfigHotMirror checks that the atomic mirror of the per-command hot-path
+// directives tracks both the seeded defaults and later set() writes, so the
+// lock-free readers never see a value that disagrees with the map.
+func TestConfigHotMirror(t *testing.T) {
+	cs := newConfigStore()
+	if cs.appendOnly() {
+		t.Fatalf("default appendOnly = true want false")
+	}
+	if cs.fsyncPolicy() != "everysec" {
+		t.Fatalf("default fsyncPolicy = %q want everysec", cs.fsyncPolicy())
+	}
+	if cs.maxMemory() != 0 {
+		t.Fatalf("default maxMemory = %d want 0", cs.maxMemory())
+	}
+	cs.set("appendonly", "yes")
+	cs.set("appendfsync", "always")
+	cs.set("maxmemory", "104857600")
+	if !cs.appendOnly() {
+		t.Fatalf("appendOnly after set = false want true")
+	}
+	if cs.fsyncPolicy() != "always" {
+		t.Fatalf("fsyncPolicy after set = %q want always", cs.fsyncPolicy())
+	}
+	if cs.maxMemory() != 104857600 {
+		t.Fatalf("maxMemory after set = %d want 104857600", cs.maxMemory())
+	}
+	cs.set("appendonly", "no")
+	cs.set("appendfsync", "no")
+	if cs.appendOnly() {
+		t.Fatalf("appendOnly after reset = true want false")
+	}
+	if cs.fsyncPolicy() != "no" {
+		t.Fatalf("fsyncPolicy after reset = %q want no", cs.fsyncPolicy())
+	}
+}
+
+// TestConfigSetMaxmemoryMirror checks that the maxmemory mirror tracks a CONFIG
+// SET through the live command path, the value the eviction guard reads.
+func TestConfigSetMaxmemoryMirror(t *testing.T) {
+	r, c := startData(t)
+	if got := sendLine(t, r, c, "CONFIG SET maxmemory 50mb"); got != "+OK" {
+		t.Fatalf("SET maxmemory = %q", got)
+	}
+	if got := configGet(t, r, c, "maxmemory"); got != "52428800" {
+		t.Fatalf("maxmemory = %q want 52428800", got)
+	}
+}

@@ -60,8 +60,11 @@ func (d *Dispatcher) freeMemoryIfNeeded() bool {
 	if d.engine == nil {
 		return true
 	}
-	limit, err := strconv.ParseInt(d.confValue("maxmemory", "0"), 10, 64)
-	if err != nil || limit <= 0 {
+	limit := int64(0)
+	if d.conf != nil {
+		limit = d.conf.maxMemory()
+	}
+	if limit <= 0 {
 		return true // no limit configured
 	}
 	if d.engine.usedMemory() < limit {
