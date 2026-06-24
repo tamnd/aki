@@ -45,7 +45,7 @@ func handleLIndex(ctx *Ctx) {
 		elem     []byte
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		body, hdr, ok, err := db.Get(key)
+		hdr, ok, err := listHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -56,7 +56,13 @@ func handleLIndex(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		elems, err := listDecode(body)
+		// A btree-backed list resolves the index to a position and does a point row
+		// lookup rather than materializing the whole list.
+		if hdr.IsColl() {
+			elem, found, err = listTreeIndex(db, key, idx)
+			return err
+		}
+		elems, _, _, err := getList(db, key)
 		if err != nil {
 			return err
 		}
@@ -99,7 +105,7 @@ func handleLSet(ctx *Ctx) {
 		oob      bool
 	)
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		body, hdr, found, err := db.Get(key)
+		hdr, found, err := listHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -111,7 +117,13 @@ func handleLSet(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		elems, err := listDecode(body)
+		// A btree-backed list resolves the index to a position and writes that one
+		// row rather than rewriting the whole blob.
+		if hdr.IsColl() {
+			oob, err = listTreeSet(db, key, val, idx)
+			return err
+		}
+		elems, _, _, err := getList(db, key)
 		if err != nil {
 			return err
 		}
@@ -163,7 +175,7 @@ func handleLInsert(ctx *Ctx) {
 		result   int64
 	)
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		body, hdr, found, err := db.Get(key)
+		elems, hdr, found, err := getList(db, key)
 		if err != nil {
 			return err
 		}
@@ -174,10 +186,6 @@ func handleLInsert(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeList {
 			wrongTyp = true
 			return nil
-		}
-		elems, err := listDecode(body)
-		if err != nil {
-			return err
 		}
 		idx := -1
 		for i, e := range elems {
@@ -227,7 +235,7 @@ func handleLRem(ctx *Ctx) {
 		removed  int64
 	)
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		body, hdr, found, err := db.Get(key)
+		elems, hdr, found, err := getList(db, key)
 		if err != nil {
 			return err
 		}
@@ -237,10 +245,6 @@ func handleLRem(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeList {
 			wrongTyp = true
 			return nil
-		}
-		elems, err := listDecode(body)
-		if err != nil {
-			return err
 		}
 		rest, n := listRemove(elems, target, count)
 		removed = int64(n)
@@ -336,7 +340,7 @@ func handleLTrim(ctx *Ctx) {
 		emptied  bool
 	)
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		body, hdr, found, err := db.Get(key)
+		elems, hdr, found, err := getList(db, key)
 		if err != nil {
 			return err
 		}
@@ -346,10 +350,6 @@ func handleLTrim(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeList {
 			wrongTyp = true
 			return nil
-		}
-		elems, err := listDecode(body)
-		if err != nil {
-			return err
 		}
 		kept := listSlice(elems, start, stop)
 		if len(kept) == 0 {

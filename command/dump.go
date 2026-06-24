@@ -87,12 +87,8 @@ func readDumpValue(db *keyspace.DB, key []byte) (rdb.Value, bool, error) {
 		body, _, _, gerr := db.Get(key)
 		return rdb.Value{Kind: rdb.KindString, Str: body}, true, gerr
 	case keyspace.TypeList:
-		body, _, _, gerr := db.Get(key)
-		if gerr != nil {
-			return rdb.Value{}, true, gerr
-		}
-		elems, derr := listDecode(body)
-		return rdb.Value{Kind: rdb.KindList, List: elems}, true, derr
+		elems, _, _, gerr := getList(db, key)
+		return rdb.Value{Kind: rdb.KindList, List: elems}, true, gerr
 	case keyspace.TypeSet:
 		ms, _, _, gerr := getSet(db, key)
 		return rdb.Value{Kind: rdb.KindSet, Set: ms}, true, gerr
@@ -331,6 +327,16 @@ func storeRestored(lim encLimits, db *keyspace.DB, key []byte, v rdb.Value, ttlM
 	case rdb.KindString:
 		return db.Set(key, v.Str, keyspace.TypeString, stringEncoding(v.Str), ttlMs)
 	case rdb.KindList:
+		// A restored list large enough to report quicklist lands in the btree-backed
+		// form, the same as one built push by push. Promotion needs the key's TTL
+		// stamped first, since listPromote preserves the existing header's TTL rather
+		// than taking one as an argument.
+		if listWantsTree(lim, v.List, keyspace.EncListpack) {
+			if err := db.Set(key, nil, keyspace.TypeList, keyspace.EncQuicklist, ttlMs); err != nil {
+				return err
+			}
+			return listPromote(db, key, v.List)
+		}
 		return db.Set(key, listEncode(v.List), keyspace.TypeList,
 			listEncoding(lim, v.List, keyspace.EncListpack), ttlMs)
 	case rdb.KindSet:

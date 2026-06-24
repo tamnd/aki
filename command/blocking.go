@@ -282,7 +282,7 @@ func blockPop(ctx *Ctx, head bool) {
 		)
 		done := ctx.update(func(d *keyspace.DB) error {
 			for _, key := range keys {
-				body, hdr, found, err := d.Get(key)
+				elems, hdr, found, err := getList(d, key)
 				if err != nil {
 					return err
 				}
@@ -292,10 +292,6 @@ func blockPop(ctx *Ctx, head bool) {
 				if hdr.Type != keyspace.TypeList {
 					wrongTyp = true
 					return nil
-				}
-				elems, err := listDecode(body)
-				if err != nil {
-					return err
 				}
 				if len(elems) == 0 {
 					continue
@@ -395,7 +391,7 @@ func blockMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool, timeout float64
 			ok         bool
 		)
 		done := ctx.update(func(d *keyspace.DB) error {
-			srcBody, srcHdr, srcFound, err := d.Get(src)
+			srcElems, srcHdr, srcFound, err := getList(d, src)
 			if err != nil {
 				return err
 			}
@@ -405,12 +401,12 @@ func blockMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool, timeout float64
 			}
 			sameKey := bytes.Equal(src, dst)
 			var (
-				dstBody  []byte
+				dstElems [][]byte
 				dstHdr   keyspace.ValueHeader
 				dstFound bool
 			)
 			if !sameKey {
-				dstBody, dstHdr, dstFound, err = d.Get(dst)
+				dstElems, dstHdr, dstFound, err = getList(d, dst)
 				if err != nil {
 					return err
 				}
@@ -418,10 +414,6 @@ func blockMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool, timeout float64
 					wrongTyp = true
 					return nil
 				}
-			}
-			srcElems, err := listDecode(srcBody)
-			if err != nil {
-				return err
 			}
 			if len(srcElems) == 0 {
 				return nil
@@ -447,10 +439,6 @@ func blockMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool, timeout float64
 				return err
 			}
 
-			dstElems, err := listDecode(dstBody)
-			if err != nil {
-				return err
-			}
 			dstElems = pushEnd(dstElems, elem, toLeft)
 			dstPrev := uint8(keyspace.EncListpack)
 			if dstFound {
@@ -563,7 +551,7 @@ func handleBLMPop(ctx *Ctx) {
 		)
 		done := ctx.update(func(d *keyspace.DB) error {
 			for _, key := range keys {
-				body, hdr, found, err := d.Get(key)
+				elems, hdr, found, err := getList(d, key)
 				if err != nil {
 					return err
 				}
@@ -573,10 +561,6 @@ func handleBLMPop(ctx *Ctx) {
 				if hdr.Type != keyspace.TypeList {
 					wrongTyp = true
 					return nil
-				}
-				elems, err := listDecode(body)
-				if err != nil {
-					return err
 				}
 				if len(elems) == 0 {
 					continue
