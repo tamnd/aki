@@ -320,7 +320,7 @@ func infoMemory(ctx *Ctx, b *strings.Builder) {
 func infoPersistence(ctx *Ctx, b *strings.Builder) {
 	p := &ctx.d.persist
 	p.mu.Lock()
-	dirty := p.dirty
+	dirty := p.dirty.Load()
 	inProgress := p.inProgress
 	lastSave := p.lastSaveUnix
 	status := p.lastStatus

@@ -452,10 +452,9 @@ func (d *Dispatcher) StopReplication() {
 // isReadonlyReplica reports whether external writes must be refused because this
 // instance is a read-only replica.
 func (d *Dispatcher) isReadonlyReplica() bool {
-	d.repl.mu.Lock()
-	slave := d.repl.role == "slave"
-	d.repl.mu.Unlock()
-	if !slave {
+	// Runs on every write command, so it reads the roleMaster atomic (kept in step
+	// with repl.role at every role change) rather than taking the replication lock.
+	if d.roleMaster.Load() {
 		return false
 	}
 	return !strings.EqualFold(d.confValue("replica-read-only", "yes"), "no")
