@@ -425,6 +425,15 @@ func (db *DB) SetWithVersion(key, body []byte, typ, enc uint8, ttlMs int64, preV
 // internally and releases it before returning.
 func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint64) error {
 	if ttlMs >= 0 && ttlMs <= nowMillis() {
+		// The write-behind worker can reach this branch when a key set with a very
+		// short TTL (SET k v PX 1) expires between PrepareWriteBehind staging it and
+		// the async B-tree apply. The key never lands in the B-tree, but its
+		// wbPending entry and the pendingUncertain increment from PrepareWriteBehind
+		// are still live. Clear them here, otherwise pendingUncertain stays stuck at
+		// 1 and DBSIZE over-reports the gone key forever.
+		if preVersion > 0 {
+			db.removeWBPending(string(key), preVersion)
+		}
 		_, err := db.Delete(key)
 		return err
 	}
