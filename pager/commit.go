@@ -129,13 +129,13 @@ func (p *Pager) flushDirtyLocked() error {
 	p.pool.mu.Lock()
 	defer p.pool.mu.Unlock()
 	for pgno, pg := range p.pool.frames {
-		if !pg.dirty {
+		if !pg.dirty.Load() {
 			continue
 		}
 		if err := p.writeRaw(pgno, pg.Data); err != nil {
 			return err
 		}
-		pg.dirty = false
+		pg.dirty.Store(false)
 	}
 	return nil
 }
@@ -150,7 +150,7 @@ func (p *Pager) Close() error {
 	}
 	p.pool.mu.Lock()
 	for _, pg := range p.pool.frames {
-		if pg.pins > 0 {
+		if pg.pins.Load() > 0 {
 			p.pool.mu.Unlock()
 			return ErrPinned
 		}
