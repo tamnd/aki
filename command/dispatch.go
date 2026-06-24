@@ -378,10 +378,20 @@ func (d *Dispatcher) applyCommitPolicy() {
 		return
 	}
 	var p commitPolicy
-	switch d.aofFsyncPolicy() {
-	case "always":
+	switch {
+	case d.aofEnabled() && d.aofFsyncPolicy() == "always":
+		// With the AOF on, the AOF is the durability contract: every acked write is
+		// group-committed into the incr file, and on restart initAOF flushes the
+		// pager and replays the AOF authoritatively over it. So a per-write pager
+		// checkpoint here is a second, redundant fsync on the hot path. Defer the
+		// pager to the everysec cadence and let the AOF carry the always guarantee.
+		// This is what lets appendfsync=always reach competitive throughput: one
+		// group-committed AOF fsync per batch instead of an AOF fsync plus a full
+		// pager checkpoint per write.
+		p = commitEverySec
+	case d.aofFsyncPolicy() == "always":
 		p = commitAlways
-	case "no":
+	case d.aofFsyncPolicy() == "no":
 		p = commitNo
 	default:
 		p = commitEverySec
