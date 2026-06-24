@@ -17,7 +17,7 @@ import (
 // back in the async pool itself.
 //
 // shard >= 0 when the write targets a specific keyspace shard and was routed
-// to writeChs[shard]. shard == -1 means global (routed to writeCh).
+// to shardQ[shard]. shard == -1 means global (routed to writeCh).
 //
 // Inline SET fast path: when setKey is non-nil the worker calls SetWithVersion
 // directly instead of invoking fn, avoiding a heap-allocated closure per write.
@@ -35,6 +35,11 @@ type writeReq struct {
 	setEnc  uint8
 	setTTL  int64
 	setVer  uint64
+	// next is the intrusive link for the per-shard lock-free hand-off queue
+	// (shardQueue). Producers store it under the Treiber compare-and-swap; the
+	// single consumer reuses it to hold the reversed first-in-first-out list. It
+	// is meaningful only while the req is in a shard queue.
+	next atomic.Pointer[writeReq]
 }
 
 // writeReqPool amortises writeReq allocations. Each entry already carries a
@@ -147,10 +152,17 @@ type Engine struct {
 	// handles cross-shard writes, commitAlways writes, and writes where the caller
 	// cannot determine the shard. nil when workers are not running.
 	writeCh chan *writeReq
-	// writeChs are the per-shard input queues. writeChs[s] is served exclusively
-	// by one goroutine, so there is zero channel contention between shards.
-	// Deferred single-key writes route here by ShardOf(key).
-	writeChs [keyspace.NumShards]chan *writeReq
+	// shardQ are the per-shard input queues. shardQ[s] is served exclusively by
+	// one goroutine, so there is zero contention between shards, and it is
+	// lock-free on the producer side so the connection goroutines do not
+	// serialize on a shared mutex when they all write the same shard. Deferred
+	// single-key writes route here by ShardOf(key).
+	shardQ [keyspace.NumShards]shardQueue
+	// shardsRunning gates the per-shard fast path. It is set true in StartWorker
+	// before the workers launch and false at the start of StopWorker, so a
+	// producer that sees it false sheds to the synchronous global path instead of
+	// pushing to a queue whose worker is draining to exit.
+	shardsRunning atomic.Bool
 	// rmwLocks serialize write-behind read-modify-write ops per shard. A blind
 	// SET can stage and fire its durable write without reading, but an RMW
 	// (INCR, LPUSH, SADD, HSET, ZADD) computes its reply from the current value,
@@ -204,11 +216,12 @@ func (e *Engine) StartWorker() {
 	}
 	e.writeCh = make(chan *writeReq, 4096)
 	for s := range keyspace.NumShards {
-		e.writeChs[s] = make(chan *writeReq, 4096)
+		e.shardQ[s].init()
 	}
 	e.workerStop = make(chan struct{})
 	e.workerDone = make(chan struct{})
 	e.wg.Add(1 + keyspace.NumShards)
+	e.shardsRunning.Store(true)
 	go e.runWriteWorker()
 	for s := range keyspace.NumShards {
 		go e.runShardWorker(s)
@@ -226,12 +239,13 @@ func (e *Engine) StopWorker() {
 	if e.writeCh == nil {
 		return
 	}
+	// Stop new producers from using the shard queues before signalling the
+	// workers to drain, so the queues only hold writes staged before shutdown.
+	// Closing workerStop wakes any parked shard worker through its park select.
+	e.shardsRunning.Store(false)
 	close(e.workerStop)
 	<-e.workerDone
 	e.writeCh = nil
-	for s := range keyspace.NumShards {
-		e.writeChs[s] = nil
-	}
 }
 
 // runWriteWorker is the global write worker goroutine. It handles cross-shard
@@ -256,66 +270,95 @@ func (e *Engine) runWriteWorker() {
 	}
 }
 
-// runShardWorker is a dedicated goroutine for shard s. It reads exclusively
-// from writeChs[s] — no other goroutine ever reads that channel — so there is
-// zero channel-lock contention between shards. It holds e.mu.RLock during a
-// batch so the shard runs in parallel with other shard workers while commits
-// (which take e.mu.Lock) remain fully exclusive.
+// runShardWorker is the dedicated goroutine for shard s and the single consumer
+// of shardQ[s]. No other goroutine ever drains that queue, so the queue and the
+// B-tree for shard s are both uncontended on the consumer side. It drains the
+// queue in one swap, applies the batch under e.mu.RLock so the shard runs in
+// parallel with other shard workers while commits (which take e.mu.Lock) stay
+// exclusive, and parks on the queue's doorbell when there is nothing to do.
+//
+// The park is gated and backstopped: it stores stateParked, re-checks the queue
+// once to close the window where a producer enqueued while the worker was still
+// running and so skipped the doorbell, then blocks on the doorbell, the stop
+// signal, or a short backstop timer. The backstop means a missed wakeup costs at
+// most one timer interval of latency, never a hang and never lost work, so
+// correctness rests on the queue and the re-check rather than on a perfect
+// wakeup.
 func (e *Engine) runShardWorker(s int) {
 	defer e.wg.Done()
 	sc := newDrainScratch()
+	q := &e.shardQ[s]
+	timer := time.NewTimer(shardParkBackstop)
+	timer.Stop()
 	for {
+		if batch := q.popAll(); batch != nil {
+			e.drainShardList(s, batch, sc)
+			continue
+		}
+		q.state.Store(stateParked)
+		// Re-check: a producer that pushed while we were still running skipped the
+		// doorbell, so we must look once more before blocking on it.
+		if batch := q.popAll(); batch != nil {
+			q.state.Store(stateRunning)
+			e.drainShardList(s, batch, sc)
+			continue
+		}
+		timer.Reset(shardParkBackstop)
 		select {
-		case req := <-e.writeChs[s]:
-			e.drainShardBatch(s, req, sc)
 		case <-e.workerStop:
+			stopTimer(timer)
+			q.state.Store(stateRunning)
+			// Drain everything staged before shutdown, then exit.
 			for {
-				select {
-				case req := <-e.writeChs[s]:
-					e.drainShardBatch(s, req, sc)
-				default:
+				batch := q.popAll()
+				if batch == nil {
 					return
 				}
+				e.drainShardList(s, batch, sc)
 			}
+		case <-q.wake:
+			stopTimer(timer)
+			q.state.Store(stateRunning)
+		case <-timer.C:
+			q.state.Store(stateRunning)
 		}
 	}
 }
 
-// drainShardBatch processes a batch from writeChs[s] under e.mu.RLock.
-// Because only one goroutine reads writeChs[s], and keyspace shard s is also
-// written exclusively by this goroutine, both the channel and the B-tree are
-// uncontended. Batching amortises the RLock acquire/release cost.
+// drainShardList applies a first-in-first-out list popped from shardQ[s]. It
+// works through the list in chunks of at most writeBatchMax under one e.mu.RLock
+// each, so a deep queue does not starve readers or the commit cron, which take
+// e.mu between chunks. Because only this goroutine drains shard s and only this
+// goroutine writes shard s's B-tree, the apply is uncontended.
 //
-// Before applying, the batch is coalesced: when several SETs in it target the
+// Before applying, each chunk is coalesced: when several SETs in it target the
 // same key (the same-key contention the lockstep harness creates, where every
 // client overwrites one key each step), only the highest-version write needs to
 // reach the B-tree because the older versions are never committed and the
 // hot-value cache already serves the latest. coalesceSets marks the superseded
 // SETs so they are recycled instead of upserted, turning N redundant B-tree
 // writes into one.
-func (e *Engine) drainShardBatch(s int, first *writeReq, sc *drainScratch) {
-	reqs := sc.reqs[:0]
-	reqs = append(reqs, first)
-	for len(reqs) < writeBatchMax {
-		select {
-		case req := <-e.writeChs[s]:
-			reqs = append(reqs, req)
-			continue
-		default:
+func (e *Engine) drainShardList(s int, head *writeReq, sc *drainScratch) {
+	for head != nil {
+		reqs := sc.reqs[:0]
+		for head != nil && len(reqs) < writeBatchMax {
+			next := head.next.Load()
+			head.next.Store(nil) // do not carry a stale link into the pool
+			reqs = append(reqs, head)
+			head = next
 		}
-		break
-	}
-	sc.reqs = reqs
-	e.coalesceSets(sc)
-	e.mu.RLock()
-	for i, req := range reqs {
-		if sc.skip[i] {
-			e.recycleSuperseded(req)
-			continue
+		sc.reqs = reqs
+		e.coalesceSets(sc)
+		e.mu.RLock()
+		for i, req := range reqs {
+			if sc.skip[i] {
+				e.recycleSuperseded(req)
+				continue
+			}
+			e.applyWriteReqDeferred(req)
 		}
-		e.applyWriteReqDeferred(req)
+		e.mu.RUnlock()
 	}
-	e.mu.RUnlock()
 }
 
 // coalesceSets fills sc.skip: a SET is superseded (skip = true) when a later SET
@@ -546,7 +589,7 @@ func (e *Engine) applyWriteReqDeferred(req *writeReq) {
 //
 // FlushShardWrites is a no-op when the engine workers are not running.
 func (e *Engine) FlushShardWrites() {
-	if e.writeCh == nil {
+	if !e.shardsRunning.Load() {
 		return
 	}
 	reqs := make([]*writeReq, keyspace.NumShards)
@@ -557,7 +600,7 @@ func (e *Engine) FlushShardWrites() {
 		req.fn = nil // nil fn + nil setKey = fence signal in applyWriteReqDeferred
 		req.setKey = nil
 		reqs[s] = req
-		e.writeChs[s] <- req // may block briefly if channel is at capacity
+		e.shardQ[s].push(req)
 	}
 	for s := range keyspace.NumShards {
 		<-reqs[s].done
@@ -571,18 +614,21 @@ func (e *Engine) FlushShardWrites() {
 // is the precondition for the write-behind fast path. Under commitAlways every
 // write must wait for the checkpoint before the reply goes out.
 func (e *Engine) isDeferred() bool {
-	return e.writeCh != nil && commitPolicy(e.policy.Load()) != commitAlways
+	return e.shardsRunning.Load() && commitPolicy(e.policy.Load()) != commitAlways
 }
 
-// sendSetAsync enqueues an inline SET write on writeChs[shard] without
-// allocating a closure. It stores the SET arguments directly in the writeReq
-// struct (pool-allocated) so the shard worker can call SetWithVersion without
-// a heap allocation on the hot path.
+// sendSetAsync enqueues an inline SET write on shardQ[shard] without allocating
+// a closure. It stores the SET arguments directly in the writeReq struct
+// (pool-allocated) so the shard worker can call SetWithVersion without a heap
+// allocation on the hot path. The push is lock-free, so concurrent SETs to the
+// same shard do not serialize on a mutex.
 //
-// Falls back to the synchronous update path when workers are not running or
-// the policy is commitAlways.
+// Falls back to the synchronous update path when workers are not running, the
+// policy is commitAlways, or the shard queue is at its depth bound (the worker
+// is behind; the synchronous path then applies backpressure under the lock).
 func (e *Engine) sendSetAsync(index, shard int, key, body []byte, typ, enc uint8, ttl int64, ver uint64) error {
-	if e.writeChs[shard] != nil && commitPolicy(e.policy.Load()) != commitAlways {
+	if e.shardsRunning.Load() && commitPolicy(e.policy.Load()) != commitAlways &&
+		e.shardQ[shard].length.Load() < shardQueueCap {
 		req := asyncReqPool.Get().(*writeReq)
 		req.index = index
 		req.shard = shard
@@ -594,12 +640,8 @@ func (e *Engine) sendSetAsync(index, shard int, key, body []byte, typ, enc uint8
 		req.setEnc = enc
 		req.setTTL = ttl
 		req.setVer = ver
-		select {
-		case e.writeChs[shard] <- req:
-			return nil
-		default:
-			asyncReqPool.Put(req)
-		}
+		e.shardQ[shard].push(req)
+		return nil
 	}
 	return e.update(index, func(db *keyspace.DB) error {
 		return db.SetWithVersion(key, body, typ, enc, ttl, ver)
@@ -610,13 +652,14 @@ func (e *Engine) sendSetAsync(index, shard int, key, body []byte, typ, enc uint8
 // so it can run in parallel with writes to other shards. Falls back to the
 // global serial path under commitAlways or when workers are not running.
 func (e *Engine) updateShard(index int, key []byte, fn func(*keyspace.DB) error) error {
-	if e.writeCh != nil && commitPolicy(e.policy.Load()) != commitAlways {
+	if e.shardsRunning.Load() && commitPolicy(e.policy.Load()) != commitAlways {
 		s := keyspace.ShardOf(key)
 		req := writeReqPool.Get().(*writeReq)
 		req.index = index
 		req.shard = s
 		req.fn = fn
-		e.writeChs[s] <- req
+		req.setKey = nil
+		e.shardQ[s].push(req)
 		err := <-req.done
 		req.fn = nil
 		writeReqPool.Put(req)
@@ -1027,7 +1070,7 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 	// otherwise it rebuilds the write from compute, which is pure given the current
 	// value.
 	//
-	// It must route through updateShard (writeChs[ShardOf(key)]), not the global
+	// It must route through updateShard (shardQ[ShardOf(key)]), not the global
 	// update channel: the fast path stages and fires its durable write on that same
 	// per-shard channel, so a fallback for the same key has to queue behind those
 	// in-flight async writes on the same worker to see them. The global update

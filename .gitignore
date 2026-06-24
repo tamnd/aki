@@ -16,6 +16,9 @@
 # pprof snapshots DEBUG JMAP writes to the working directory
 aki-heap-*.prof
 
+# periodic CPU/heap profiles the running server writes under ./profiles/
+/profiles/
+
 # committed golden fixtures are the .aki files we do track
 !format/testdata/*.aki
 !pager/testdata/*.aki
