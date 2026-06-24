@@ -187,24 +187,25 @@ type node struct {
 // Intermediate node data is decoded into a pooled arena so that only one
 // allocation (the returned value copy) escapes per call.
 func (t *Tree) Get(key []byte) ([]byte, bool, error) {
-	ar := nodeArenaPool.Get().(*nodeArena)
-	defer func() { ar.reset(); nodeArenaPool.Put(ar) }()
 	pgno := t.root
 	for {
-		n, err := t.readNodeAr(pgno, ar)
+		pg, err := t.pgr.Get(pgno)
 		if err != nil {
 			return nil, false, err
 		}
-		if n.leaf {
-			i, ok := n.find(key)
-			if !ok {
-				return nil, false, nil
-			}
-			// Clone the matched value: it lives in the arena which is reset on
-			// return, so the caller needs an independently owned copy.
-			return bytes.Clone(n.vals[i]), true, nil
+		if pg.Data[0] == format.PageTypeBTreeLeaf {
+			// leafLookup returns a heap-owned copy, so the page can be unpinned
+			// right after. No arena is touched on the read path at all.
+			v, ok, err := leafLookup(pg.Data, key)
+			t.pgr.Unpin(pg, false)
+			return v, ok, err
 		}
-		pgno = n.children[n.childIndex(key)]
+		_, child, err := descendOnPage(pg.Data, key)
+		t.pgr.Unpin(pg, false)
+		if err != nil {
+			return nil, false, err
+		}
+		pgno = child
 	}
 }
 
@@ -280,27 +281,44 @@ type splitResult struct {
 // (or nil if key was absent) so callers can inspect or free the old value in
 // a single traversal without a separate Get.
 func (t *Tree) insertAr(pgno uint32, key, val []byte, ar *nodeArena) (oldVal []byte, sp *splitResult, err error) {
-	n, err := t.readNodeAr(pgno, ar)
+	// Peek the page type without decoding the whole node. A leaf is decoded and
+	// modified as before; an interior node is descended by searching its
+	// separators directly on the page, so the common no-split case never decodes
+	// the interior levels at all.
+	pg, err := t.pgr.Get(pgno)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	if n.leaf {
+	if pg.Data[0] == format.PageTypeBTreeLeaf {
+		n, derr := decodeNodeAr(pg.Data, ar)
+		t.pgr.Unpin(pg, false)
+		if derr != nil {
+			return nil, nil, derr
+		}
 		oldVal = n.upsertAr(key, val, ar)
 		sp, err = t.writeOrSplitAr(pgno, n, ar)
 		return
 	}
 
-	ci := n.childIndex(key)
-	oldVal, sp, err = t.insertAr(n.children[ci], key, val, ar)
-	if err != nil {
+	ci, child, derr := descendOnPage(pg.Data, key)
+	t.pgr.Unpin(pg, false)
+	if derr != nil {
+		return nil, nil, derr
+	}
+	oldVal, sp, err = t.insertAr(child, key, val, ar)
+	if err != nil || sp == nil {
 		return
 	}
-	if sp == nil {
-		return
+	// The child split. Only now decode this interior node so the new separator
+	// and child pointer can be inserted at slot ci (the same slot childIndex
+	// would have returned for key), then write it back or split it in turn.
+	// sepKey lives in ar.buf; appending to the arena during this decode may grow
+	// ar.buf into a new backing array, but sp.sepKey keeps pointing at the old
+	// one and stays valid.
+	n, derr := t.readNodeAr(pgno, ar)
+	if derr != nil {
+		return oldVal, nil, derr
 	}
-	// Insert the new separator and child pointer at position ci.
-	// sepKey is already in the arena so no extra copy needed here.
 	n.keys = insertBytes(n.keys, ci, sp.sepKey)
 	n.children = insertU32(n.children, ci+1, sp.right)
 	sp, err = t.writeOrSplitAr(pgno, n, ar)
@@ -347,20 +365,31 @@ func (t *Tree) Delete(key []byte) (bool, error) {
 }
 
 func (t *Tree) delAr(pgno uint32, key []byte, ar *nodeArena) (bool, error) {
-	n, err := t.readNodeAr(pgno, ar)
+	pg, err := t.pgr.Get(pgno)
 	if err != nil {
 		return false, err
 	}
-	if n.leaf {
-		i, ok := n.find(key)
-		if !ok {
-			return false, nil
+	if pg.Data[0] != format.PageTypeBTreeLeaf {
+		// Interior node: find the child to follow on the page, then descend.
+		_, child, derr := descendOnPage(pg.Data, key)
+		t.pgr.Unpin(pg, false)
+		if derr != nil {
+			return false, derr
 		}
-		n.keys = append(n.keys[:i], n.keys[i+1:]...)
-		n.vals = append(n.vals[:i], n.vals[i+1:]...)
-		return true, t.writeNodeAr(pgno, n, ar)
+		return t.delAr(child, key, ar)
 	}
-	return t.delAr(n.children[n.childIndex(key)], key, ar)
+	n, derr := decodeNodeAr(pg.Data, ar)
+	t.pgr.Unpin(pg, false)
+	if derr != nil {
+		return false, derr
+	}
+	i, ok := n.find(key)
+	if !ok {
+		return false, nil
+	}
+	n.keys = append(n.keys[:i], n.keys[i+1:]...)
+	n.vals = append(n.vals[:i], n.vals[i+1:]...)
+	return true, t.writeNodeAr(pgno, n, ar)
 }
 
 // find returns the index of key in a leaf and whether it is present.
@@ -385,6 +414,76 @@ func (n *node) childIndex(key []byte) int {
 		}
 	}
 	return len(n.keys)
+}
+
+// descendOnPage finds the child to follow for key on the interior page b, reading
+// each separator straight from the page buffer instead of decoding the whole node
+// into an arena. ci is the same slot index childIndex would return, so a caller
+// that later inserts a separator (after a child split) can reuse it; child is the
+// page number to descend into. A descent through an interior level this way copies
+// no key bytes and allocates nothing. The caller must hold a pin on the page for
+// the duration of the call, since the returned values are read out of b.
+func descendOnPage(b, key []byte) (ci int, child uint32, err error) {
+	h, err := format.ParsePageHeader(b)
+	if err != nil {
+		return 0, 0, err
+	}
+	if h.Type != format.PageTypeBTreeInt {
+		return 0, 0, fmt.Errorf("aki/btree: descend on non-interior page (type 0x%02x)", h.Type)
+	}
+	count := int(h.CellCount)
+	for i := range count {
+		off := int(encoding.U16(b[slotsStart+2*i:]))
+		c := encoding.U32(b[off:])
+		off += 4
+		kl, m, derr := encoding.Uvarint(b[off:])
+		if derr != nil {
+			return 0, 0, derr
+		}
+		off += m
+		if bytes.Compare(key, b[off:off+int(kl)]) < 0 {
+			return i, c, nil
+		}
+	}
+	return count, encoding.U32(b[16:]), nil
+}
+
+// leafLookup finds key on the leaf page b and returns a heap-owned copy of its
+// value, reading cells straight from the page rather than decoding every cell
+// into an arena. Leaf keys are stored sorted, so the scan stops as soon as it
+// passes where key would be. The caller must hold a pin on the page for the
+// duration of the call.
+func leafLookup(b, key []byte) ([]byte, bool, error) {
+	h, err := format.ParsePageHeader(b)
+	if err != nil {
+		return nil, false, err
+	}
+	if h.Type != format.PageTypeBTreeLeaf {
+		return nil, false, fmt.Errorf("aki/btree: leaf lookup on non-leaf page (type 0x%02x)", h.Type)
+	}
+	count := int(h.CellCount)
+	for i := range count {
+		off := int(encoding.U16(b[slotsStart+2*i:]))
+		kl, m, derr := encoding.Uvarint(b[off:])
+		if derr != nil {
+			return nil, false, derr
+		}
+		off += m
+		cmp := bytes.Compare(key, b[off:off+int(kl)])
+		if cmp < 0 {
+			return nil, false, nil
+		}
+		off += int(kl)
+		vl, m2, derr := encoding.Uvarint(b[off:])
+		if derr != nil {
+			return nil, false, derr
+		}
+		off += m2
+		if cmp == 0 {
+			return bytes.Clone(b[off : off+int(vl)]), true, nil
+		}
+	}
+	return nil, false, nil
 }
 
 // upsertAr inserts key/val into a leaf in sorted order (or replaces the value
