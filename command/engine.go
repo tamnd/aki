@@ -970,6 +970,12 @@ type rmwResult struct {
 	enc   uint8
 	ttlMs int64
 	write bool
+	// fallback asks the helper to run the synchronous path instead of staging an
+	// inline write-behind cell. A compute closure sets it when the new value is
+	// not a simple inline whole-body write: a btree-backed collection element
+	// update, a listpack to quicklist promotion, or any case its syncFn handles
+	// but the fast path cannot. write is ignored when fallback is set.
+	fallback bool
 }
 
 // rmwWriteBehind runs a whole-body read-modify-write for key with the durable
@@ -989,11 +995,20 @@ type rmwResult struct {
 // A compute that declines to write (write=false) still returns true; the caller
 // inspects its own captured state to write the reply.
 //
+// syncFn is the synchronous fallback closure. When it is nil the helper rebuilds
+// the write from compute (read, compute, db.Set), which is all a plain whole-body
+// RMW like INCR needs. A caller whose write is not a plain whole-body Set (a
+// collection that may be in or promote to the btree-backed element form) passes
+// its own full closure here and has compute return fallback=true for the cases
+// only that closure can handle.
+//
 // Fallbacks match the SET fast path: when the policy is not deferred (or no
-// workers run) the whole RMW runs synchronously under the global update lock,
-// and a body larger than keyspace.MaxInlineBody also falls back to synchronous,
-// because the inline write-behind path only handles inline-sized bodies.
-func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace.ValueHeader, found bool) rmwResult) bool {
+// workers run) the whole RMW runs synchronously under the global update lock, a
+// body larger than keyspace.MaxInlineBody falls back because the inline
+// write-behind cell cannot hold it, and a compute that returns fallback=true
+// runs syncFn under the shard RMW lock so no concurrent fast-path stage on the
+// same shard can interleave with it.
+func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace.ValueHeader, found bool) rmwResult, syncFn func(*keyspace.DB) error) bool {
 	if ctx.d.engine == nil {
 		ctx.enc().WriteError("ERR this server has no keyspace")
 		return false
@@ -1006,21 +1021,26 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 		return false
 	}
 
-	// runSync re-reads, recomputes and stores under the global update lock. It is
-	// the path for commitAlways, the no-workers case, and oversized bodies.
-	// compute is pure given the current value, so re-running it is safe.
+	// runSync runs the write under the global update lock. It is the path for
+	// commitAlways, the no-workers case, oversized bodies, and any compute that
+	// asked to fall back. With a syncFn it runs that closure verbatim; otherwise
+	// it rebuilds the write from compute, which is pure given the current value.
 	runSync := func() bool {
-		if err := e.update(index, func(db *keyspace.DB) error {
-			cur, hdr, found, err := db.Get(key)
-			if err != nil {
-				return err
+		fn := syncFn
+		if fn == nil {
+			fn = func(db *keyspace.DB) error {
+				cur, hdr, found, err := db.Get(key)
+				if err != nil {
+					return err
+				}
+				r := compute(cur, hdr, found)
+				if !r.write {
+					return nil
+				}
+				return db.Set(key, r.body, r.typ, r.enc, r.ttlMs)
 			}
-			r := compute(cur, hdr, found)
-			if !r.write {
-				return nil
-			}
-			return db.Set(key, r.body, r.typ, r.enc, r.ttlMs)
-		}); err != nil {
+		}
+		if err := e.update(index, fn); err != nil {
 			ctx.enc().WriteError("ERR " + err.Error())
 			return false
 		}
@@ -1042,6 +1062,14 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 		return false
 	}
 	r := compute(cur, hdr, found)
+	if r.fallback {
+		// compute hit a case the fast path cannot stage (a btree-backed collection
+		// or a promotion). Run the synchronous closure while still holding the shard
+		// RMW lock so a concurrent fast-path stage on this shard cannot interleave.
+		ok := runSync()
+		e.rmwLocks[shard].Unlock()
+		return ok
+	}
 	if !r.write {
 		e.rmwLocks[shard].Unlock()
 		return true
@@ -1049,8 +1077,9 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 	if len(r.body) > keyspace.MaxInlineBody {
 		// An inline write-behind cell cannot hold an over-size body; the durable
 		// write needs the overflow path, so drop to the synchronous route.
+		ok := runSync()
 		e.rmwLocks[shard].Unlock()
-		return runSync()
+		return ok
 	}
 	// The staged and async writes outlive this command, so the key must be a
 	// heap-owned copy rather than a slice of the connection read buffer. compute's
