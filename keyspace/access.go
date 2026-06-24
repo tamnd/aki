@@ -40,15 +40,32 @@ func nowMinutes() uint32 { return uint32(nowMillis() / 60000) }
 // (compiler optimization, no alloc), and the value is updated via the returned
 // pointer without touching the map again.
 func (db *DB) recordAccess(key []byte, isNew bool) {
-	db.accessMu.Lock()
+	if isNew {
+		// A brand-new key must be seeded or the eviction sampler treats it as
+		// maximally idle and evicts it first, so its first write always takes the
+		// lock. New keys are rare next to repeat writes, so this does not contend.
+		db.accessMu.Lock()
+		if db.access == nil {
+			db.access = make(map[string]*keyAccess)
+		}
+		db.access[string(key)] = &keyAccess{atime: nowSeconds(), freq: lfuInitVal, decr: nowMinutes()}
+		db.accessMu.Unlock()
+		return
+	}
+	// A repeat access only bumps recency and frequency, both of which are
+	// approximate. Under a write storm to one key, fifty goroutines all want this
+	// one entry, and blocking on the lock to nudge an approximate counter parks the
+	// write path for no real gain. So try the lock and drop the sample if it is
+	// held, the same way Redis's sampled LRU tolerates a missed bump. Recency is
+	// not lost on the write path even when the sample drops: the hot-value cache
+	// stamps the entry's atime atomically on every put, and accessMetrics reads the
+	// fresher of the two. Only the probabilistic LFU bump is skipped.
+	if !db.accessMu.TryLock() {
+		return
+	}
 	defer db.accessMu.Unlock()
 	if db.access == nil {
 		db.access = make(map[string]*keyAccess)
-	}
-	if isNew {
-		k := string(key)
-		db.access[k] = &keyAccess{atime: nowSeconds(), freq: lfuInitVal, decr: nowMinutes()}
-		return
 	}
 	// map index with string([]byte) is a compiler-optimized temporary: 0 alloc.
 	a := db.access[string(key)]
