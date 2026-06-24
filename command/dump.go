@@ -334,6 +334,16 @@ func storeRestored(lim encLimits, db *keyspace.DB, key []byte, v rdb.Value, ttlM
 		return db.Set(key, listEncode(v.List), keyspace.TypeList,
 			listEncoding(lim, v.List, keyspace.EncListpack), ttlMs)
 	case rdb.KindSet:
+		// A restored set large enough to report hashtable lands in the btree-backed
+		// form, the same as one built member by member. Promotion needs the key's TTL
+		// stamped first, since setPromote preserves the existing header's TTL rather
+		// than taking one as an argument.
+		if setWantsTree(lim, v.Set, keyspace.EncListpack) {
+			if err := db.Set(key, nil, keyspace.TypeSet, keyspace.EncHashtable, ttlMs); err != nil {
+				return err
+			}
+			return setPromote(db, key, v.Set)
+		}
 		return db.Set(key, setEncode(v.Set), keyspace.TypeSet,
 			setEncoding(lim, v.Set, keyspace.EncListpack), ttlMs)
 	case rdb.KindHash:

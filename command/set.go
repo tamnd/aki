@@ -56,14 +56,37 @@ func handleSAdd(ctx *Ctx) {
 		wrongTyp bool
 		added    int64
 	)
+	lim := ctx.encLimits()
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		members, hdr, found, err := getSet(db, key)
+		hdr, found, err := setHeader(db, key)
 		if err != nil {
 			return err
 		}
 		if found && hdr.Type != keyspace.TypeSet {
 			wrongTyp = true
 			return nil
+		}
+		// A set already in the btree-backed form takes the point-write path: one
+		// sub-tree row per member, no whole-blob rewrite.
+		if found && hdr.IsColl() {
+			added = 0
+			return db.CollUpdate(key, keyspace.TypeSet, keyspace.EncHashtable, func(w *keyspace.CollWriter) error {
+				for _, m := range toAdd {
+					created, e := w.Put(m, nil)
+					if e != nil {
+						return e
+					}
+					if created {
+						w.SetCount(w.Count() + 1)
+						added++
+					}
+				}
+				return nil
+			})
+		}
+		members, _, _, err := getSet(db, key)
+		if err != nil {
+			return err
 		}
 		if len(toAdd) >= setDedupMapThreshold {
 			// Many members at once: a one-pass membership map makes dedup O(N+M)
@@ -96,7 +119,10 @@ func handleSAdd(ctx *Ctx) {
 		if found {
 			prev = hdr.Encoding
 		}
-		return db.Set(key, setEncode(members), keyspace.TypeSet, setEncoding(ctx.encLimits(), members, prev), keepTTL(hdr, found))
+		if setWantsTree(lim, members, prev) {
+			return setPromote(db, key, members)
+		}
+		return db.Set(key, setEncode(members), keyspace.TypeSet, setEncoding(lim, members, prev), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -122,7 +148,7 @@ func handleSRem(ctx *Ctx) {
 		removed  int64
 	)
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		members, hdr, found, err := getSet(db, key)
+		hdr, found, err := setHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -132,6 +158,27 @@ func handleSRem(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeSet {
 			wrongTyp = true
 			return nil
+		}
+		if hdr.IsColl() {
+			removed = 0
+			return db.CollUpdate(key, keyspace.TypeSet, keyspace.EncHashtable, func(w *keyspace.CollWriter) error {
+				for _, m := range toRemove {
+					existed, e := w.Delete(m)
+					if e != nil {
+						return e
+					}
+					if existed {
+						w.SetCount(w.Count() - 1)
+						removed++
+					}
+				}
+				emptied = w.Count() == 0
+				return nil
+			})
+		}
+		members, _, _, err := getSet(db, key)
+		if err != nil {
+			return err
 		}
 		if len(toRemove) >= setDedupMapThreshold {
 			// Many members at once: filter in one O(N+M) pass against a set of the
@@ -243,9 +290,26 @@ func handleSMIsMember(ctx *Ctx) {
 }
 
 // handleSCard implements SCARD: the member count, or 0 when the key is absent.
+// For a btree-backed set the count comes from the metadata in O(1), so SCARD does
+// not walk the members.
 func handleSCard(ctx *Ctx) {
 	key := ctx.Argv[1]
-	members, wrongTyp, ok := readSet(ctx, key)
+	var (
+		n        int64
+		wrongTyp bool
+	)
+	ok := ctx.view(func(db *keyspace.DB) error {
+		card, hdr, found, err := setCard(db, key)
+		if err != nil || !found {
+			return err
+		}
+		if hdr.Type != keyspace.TypeSet {
+			wrongTyp = true
+			return nil
+		}
+		n = card
+		return nil
+	})
 	if !ok {
 		return
 	}
@@ -253,7 +317,7 @@ func handleSCard(ctx *Ctx) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
-	ctx.enc().WriteInteger(int64(len(members)))
+	ctx.enc().WriteInteger(n)
 }
 
 // handleSPop implements SPOP key [count]: remove and return random members.
@@ -284,7 +348,7 @@ func handleSPop(ctx *Ctx) {
 		popped   [][]byte
 	)
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		members, hdr, found, err := getSet(db, key)
+		hdr, found, err := setHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -295,6 +359,44 @@ func handleSPop(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeSet {
 			wrongTyp = true
 			return nil
+		}
+		// A btree-backed set pops by sampling its sub-tree rows and deleting the
+		// picks, instead of decoding and rewriting the whole blob.
+		if hdr.IsColl() {
+			return db.CollUpdate(key, keyspace.TypeSet, keyspace.EncHashtable, func(w *keyspace.CollWriter) error {
+				total := int(w.Count())
+				n := 1
+				if hasCount {
+					n = int(min(count, int64(total)))
+				}
+				if n == 0 {
+					return nil
+				}
+				all := make([][]byte, 0, total)
+				c := w.Cursor()
+				if e := c.First(); e != nil {
+					return e
+				}
+				for c.Valid() {
+					all = append(all, append([]byte(nil), c.Key()...))
+					if e := c.Next(); e != nil {
+						return e
+					}
+				}
+				for _, i := range rand.Perm(len(all))[:n] {
+					popped = append(popped, all[i])
+					if _, e := w.Delete(all[i]); e != nil {
+						return e
+					}
+				}
+				w.SetCount(w.Count() - uint64(n))
+				emptied = w.Count() == 0
+				return nil
+			})
+		}
+		members, _, _, err := getSet(db, key)
+		if err != nil {
+			return err
 		}
 		n := 1
 		if hasCount {
@@ -416,8 +518,9 @@ func handleSMove(ctx *Ctx) {
 		moved      bool
 		srcEmptied bool
 	)
+	lim := ctx.encLimits()
 	done := ctx.update(func(db *keyspace.DB) error {
-		srcMembers, srcHdr, srcFound, err := getSet(db, src)
+		srcHdr, srcFound, err := setHeader(db, src)
 		if err != nil {
 			return err
 		}
@@ -425,7 +528,7 @@ func handleSMove(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		dstMembers, dstHdr, dstFound, err := getSet(db, dst)
+		dstHdr, dstFound, err := setHeader(db, dst)
 		if err != nil {
 			return err
 		}
@@ -433,33 +536,25 @@ func handleSMove(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		idx := setFind(srcMembers, member)
-		if idx < 0 {
+		if !srcFound {
+			return nil
+		}
+		in, err := setMemberIn(db, src, member, srcHdr)
+		if err != nil {
+			return err
+		}
+		if !in {
 			return nil
 		}
 		moved = true
 		if string(src) == string(dst) {
 			return nil
 		}
-		srcMembers = append(srcMembers[:idx], srcMembers[idx+1:]...)
-		if len(srcMembers) == 0 {
-			srcEmptied = true
-			if _, err := db.Delete(src); err != nil {
-				return err
-			}
-		} else if err := db.Set(src, setEncode(srcMembers), keyspace.TypeSet,
-			setEncoding(ctx.encLimits(), srcMembers, srcHdr.Encoding), keepTTL(srcHdr, srcFound)); err != nil {
+		srcEmptied, err = setDelOne(lim, db, src, member, srcHdr)
+		if err != nil {
 			return err
 		}
-		if setFind(dstMembers, member) < 0 {
-			dstMembers = append(dstMembers, member)
-		}
-		dstPrev := uint8(keyspace.EncIntset)
-		if dstFound {
-			dstPrev = dstHdr.Encoding
-		}
-		return db.Set(dst, setEncode(dstMembers), keyspace.TypeSet,
-			setEncoding(ctx.encLimits(), dstMembers, dstPrev), keepTTL(dstHdr, dstFound))
+		return setAddOne(lim, db, dst, member, dstHdr, dstFound)
 	})
 	if !done {
 		return

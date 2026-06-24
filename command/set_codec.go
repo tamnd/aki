@@ -95,7 +95,11 @@ func setFind(members [][]byte, member []byte) int {
 
 // getSet reads the set at key and decodes it. The returned header carries the
 // type and encoding so callers can check for WRONGTYPE and keep the encoding
-// floor. A missing key returns found false with no error.
+// floor. A missing key returns found false with no error. A large set lives in
+// the btree-backed sub-tree form (set_tree.go); getSet materializes it so every
+// read caller (SMEMBERS, SSCAN, SORT, the set algebra, DUMP/RDB) works on either
+// form unchanged. The set write commands branch on hdr.IsColl() before getSet so
+// they never rewrite a whole blob for a btree-backed set.
 func getSet(db *keyspace.DB, key []byte) ([][]byte, keyspace.ValueHeader, bool, error) {
 	body, hdr, found, err := db.Get(key)
 	if err != nil || !found {
@@ -103,6 +107,10 @@ func getSet(db *keyspace.DB, key []byte) ([][]byte, keyspace.ValueHeader, bool, 
 	}
 	if hdr.Type != keyspace.TypeSet {
 		return nil, hdr, true, nil
+	}
+	if hdr.IsColl() {
+		members, e := collectSetMembers(db, key)
+		return members, hdr, true, e
 	}
 	members, err := setDecode(body)
 	if err != nil {
