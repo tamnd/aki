@@ -1,6 +1,9 @@
 package keyspace
 
-import "math/rand/v2"
+import (
+	"math/rand/v2"
+	"sync/atomic"
+)
 
 // LFU tuning constants, matching the Redis defaults. The counter is 8 bits and
 // climbs slowly so it can span a wide range of access rates, and it decays over
@@ -27,6 +30,42 @@ type keyAccess struct {
 // tests that stub nowMillis move the access clock too.
 func nowSeconds() uint32 { return uint32(nowMillis() / 1000) }
 func nowMinutes() uint32 { return uint32(nowMillis() / 60000) }
+
+// coarseMillis caches the wall clock in whole milliseconds. The server cron
+// refreshes it once per tick through RefreshClock, so the hot path can read a
+// recent timestamp from this atomic instead of paying a time.Now syscall on
+// every operation. This is the same trick Redis uses with server.unixtime, which
+// serverCron updates at the configured hz and the data commands read instead of
+// calling gettimeofday. A clock at most one cron tick stale (100ms at the default
+// hz of 10) is exact enough for the LRU and LFU bookkeeping it feeds, which
+// itself is approximate and second-granular.
+var coarseMillis atomic.Int64
+
+// coarseActive is set the first time RefreshClock runs, which only the cron does.
+// Until then (tests that drive the keyspace directly without StartBackground, and
+// the window before the first tick), coarseSeconds reads the real clock so a test
+// that stubs nowMillis still sees its overridden time. Once the cron is live the
+// hot path reads the cached atomic.
+var coarseActive atomic.Bool
+
+// RefreshClock samples the wall clock into the coarse cache. The server cron calls
+// it once per tick, and StartBackground calls it once before serving so the first
+// reads after startup are already warm.
+func RefreshClock() {
+	coarseMillis.Store(nowMillis())
+	coarseActive.Store(true)
+}
+
+// coarseSeconds returns the cached wall clock in whole seconds for the hot-cache
+// recency stamp. Before the cron is live it falls back to the real clock so test
+// stubs of nowMillis still take effect; this keeps the hot cache's atime behaviour
+// identical to nowSeconds outside a running server.
+func coarseSeconds() uint32 {
+	if coarseActive.Load() {
+		return uint32(coarseMillis.Load() / 1000)
+	}
+	return uint32(nowMillis() / 1000)
+}
 
 // recordAccess updates a key's recency and frequency after it is read or written.
 // isNew marks the first write of a key, which seeds the LFU counter above zero so

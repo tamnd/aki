@@ -7,6 +7,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/tamnd/aki/keyspace"
 	"github.com/tamnd/aki/networking"
 	"github.com/tamnd/aki/resp"
 )
@@ -302,6 +303,9 @@ func (d *Dispatcher) StartBackground() {
 		d.engine.StartWorker()
 	}
 	d.initAOF()
+	// Warm the coarse clock before serving so the first hot-path reads after
+	// startup get a recent timestamp; the cron keeps it fresh from here on.
+	keyspace.RefreshClock()
 	d.bgStop = make(chan struct{})
 	d.bgDone = make(chan struct{})
 	go func() {
@@ -316,6 +320,9 @@ func (d *Dispatcher) StartBackground() {
 			case <-d.bgStop:
 				return
 			case <-t.C:
+				// Refresh the coarse clock first so every hot-path read this tick
+				// sees a fresh timestamp.
+				keyspace.RefreshClock()
 				d.runActiveExpire()
 				d.runCommitCron()
 				d.checkSavePoints()
