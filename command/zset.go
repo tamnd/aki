@@ -97,9 +97,16 @@ parsed:
 		incrResult  float64
 		incrBlocked bool
 	)
+	key := ctx.Argv[1]
 	lim := ctx.encLimits()
-	done := ctx.updateShard(ctx.Argv[1], func(db *keyspace.DB) error {
-		hdr, found, err := zsetHeader(db, ctx.Argv[1])
+	// sync is the full synchronous closure: the btree-backed point write, the
+	// promotion to the skiplist form, and the plain blob rewrite. It stays the
+	// fallback for a coll-form zset, a promotion, an oversized body, or when no
+	// shard workers run. The counters are reset at the top so a fast-path attempt
+	// that mutated them and then fell back here is recounted cleanly.
+	sync := func(db *keyspace.DB) error {
+		added, changed, incrBlocked = 0, 0, false
+		hdr, found, err := zsetHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -189,11 +196,72 @@ parsed:
 		}
 		zsetSort(members)
 		if zsetWantsTree(lim, members, floor) {
-			return zsetPromote(db, ctx.Argv[1], members)
+			return zsetPromote(db, key, members)
 		}
-		return db.Set(ctx.Argv[1], zsetEncode(members), keyspace.TypeZSet, zsetEncoding(lim, members, floor), keepTTL(hdr, found))
-	})
-	if !done {
+		return db.Set(key, zsetEncode(members), keyspace.TypeZSet, zsetEncoding(lim, members, floor), keepTTL(hdr, found))
+	}
+	// compute is the write-behind fast path for a listpack-form zset (or a fresh
+	// key) whose new blob still fits inline: decode the current body, apply the
+	// pairs with the same NX/XX/GT/LT/INCR decision logic, and report the new blob
+	// to stage. It falls back to sync for the btree-backed form, a promotion to the
+	// skiplist, or a codec error. A nan result or a fully blocked ZADD stages
+	// nothing, matching the synchronous closure's no-write returns.
+	compute := func(cur []byte, hdr keyspace.ValueHeader, found bool) rmwResult {
+		if found && hdr.Type != keyspace.TypeZSet {
+			wrongTyp = true
+			return rmwResult{}
+		}
+		if found && hdr.IsColl() {
+			return rmwResult{fallback: true}
+		}
+		members, err := zsetDecode(cur)
+		if err != nil {
+			return rmwResult{fallback: true}
+		}
+		floor := keyspace.EncListpack
+		if found {
+			floor = hdr.Encoding
+		}
+		added, changed, incrBlocked = 0, 0, false
+		for _, p := range pairs {
+			idx := zsetFind(members, p.member)
+			mfound := idx >= 0
+			c := 0.0
+			if mfound {
+				c = members[idx].score
+			}
+			o := zaddDecide(p, c, mfound, nx, xx, gt, lt, incr)
+			if o.nan {
+				nanResult = true
+				return rmwResult{}
+			}
+			if o.blocked {
+				incrBlocked = true
+				continue
+			}
+			if o.haveIncr {
+				incrResult = o.incrVal
+			}
+			if o.write {
+				if o.add {
+					members = append(members, zmember{member: p.member, score: o.newScore})
+					added++
+				} else {
+					members[idx].score = o.newScore
+					changed++
+				}
+			}
+		}
+		if added == 0 && changed == 0 {
+			return rmwResult{}
+		}
+		zsetSort(members)
+		if zsetWantsTree(lim, members, floor) {
+			return rmwResult{fallback: true}
+		}
+		return rmwResult{body: zsetEncode(members), typ: keyspace.TypeZSet, enc: zsetEncoding(lim, members, floor), ttlMs: keepTTL(hdr, found), write: true}
+	}
+	if !ctx.rmwWriteBehind(key, compute, sync) {
 		return
 	}
 	if wrongTyp {
