@@ -80,12 +80,12 @@ func (w *CollWriter) Delete(sub []byte) (bool, error) { return w.tree.Delete(sub
 
 // Count, SetCount, Head, SetHead, Tail, SetTail read and write the metadata
 // counters the caller maintains.
-func (w *CollWriter) Count() uint64    { return w.meta.count }
+func (w *CollWriter) Count() uint64     { return w.meta.count }
 func (w *CollWriter) SetCount(n uint64) { w.meta.count = n }
-func (w *CollWriter) Head() int64      { return w.meta.head }
-func (w *CollWriter) SetHead(h int64)  { w.meta.head = h }
-func (w *CollWriter) Tail() int64      { return w.meta.tail }
-func (w *CollWriter) SetTail(t int64)  { w.meta.tail = t }
+func (w *CollWriter) Head() int64       { return w.meta.head }
+func (w *CollWriter) SetHead(h int64)   { w.meta.head = h }
+func (w *CollWriter) Tail() int64       { return w.meta.tail }
+func (w *CollWriter) SetTail(t int64)   { w.meta.tail = t }
 
 // Cursor returns an ordered cursor over the element rows for range reads done
 // inside a write (LPOP/RPOP/SPOP and similar). It reflects the sub-tree as of the
@@ -115,12 +115,12 @@ func (r *CollReader) Cursor() *CollCursor { return &CollCursor{c: r.tree.Cursor(
 // holds the shard lock.
 type CollCursor struct{ c *btree.Cursor }
 
-func (cc *CollCursor) First() error        { return cc.c.First() }
+func (cc *CollCursor) First() error          { return cc.c.First() }
 func (cc *CollCursor) Seek(sub []byte) error { return cc.c.Seek(sub) }
-func (cc *CollCursor) Valid() bool         { return cc.c.Valid() }
-func (cc *CollCursor) Next() error         { return cc.c.Next() }
-func (cc *CollCursor) Key() []byte         { return cc.c.Key() }
-func (cc *CollCursor) Value() []byte       { return cc.c.Value() }
+func (cc *CollCursor) Valid() bool           { return cc.c.Valid() }
+func (cc *CollCursor) Next() error           { return cc.c.Next() }
+func (cc *CollCursor) Key() []byte           { return cc.c.Key() }
+func (cc *CollCursor) Value() []byte         { return cc.c.Value() }
 
 // CollUpdate runs fn against the btree-backed collection at key under the shard
 // write lock, then writes the metadata row back. typ is the collection type byte
