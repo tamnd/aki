@@ -499,6 +499,15 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 			return err
 		}
 	}
+	// A previous btree-backed collection's element sub-tree is now unreferenced
+	// (this key is being overwritten with a plain value). Free its pages so they
+	// do not leak. A coll meta keeps FlagInlineBody set, so it never trips the
+	// overflow branch above; the two are mutually exclusive.
+	if existed && prev.IsColl() && prev.BodyRef != 0 {
+		if err := btree.DropTree(db.ks.pgr, uint32(prev.BodyRef)); err != nil {
+			return err
+		}
+	}
 
 	if isNew {
 		db.shards[s].keyCount.Add(1)
@@ -702,7 +711,12 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 	} else {
 		out = cell
 	}
-	if touch {
+	// A btree-backed collection's "body" is only the metadata counters, not a
+	// usable value, so it must never enter the hot-value cache (a HotGet would
+	// otherwise serve the meta bytes). The command layer reads coll keys through
+	// CollRead, not this path; this guard keeps a stray Get from poisoning the
+	// cache.
+	if touch && !h.IsColl() {
 		db.hc.Load().cput(sk, out, h)
 	}
 	return out, h, true, nil
@@ -751,6 +765,14 @@ func (db *DB) Delete(key []byte) (bool, error) {
 		}
 		if prev.Flags&FlagInlineBody == 0 && prev.BodyRef != 0 {
 			if err := db.ks.freeOverflow(uint32(prev.BodyRef)); err != nil {
+				return ok, err
+			}
+		}
+		// A btree-backed collection's element sub-tree must be torn down so its
+		// pages return to the freelist; aki has no compaction filter to reclaim
+		// them lazily.
+		if prev.IsColl() && prev.BodyRef != 0 {
+			if err := btree.DropTree(db.ks.pgr, uint32(prev.BodyRef)); err != nil {
 				return ok, err
 			}
 		}
