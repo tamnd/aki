@@ -67,6 +67,10 @@ func (d *Dispatcher) loadAOF() error {
 	if d.engine == nil {
 		return errors.New("this server has no keyspace")
 	}
+	// Flush any records still buffered in memory so the incr file on disk is the
+	// complete log before this reload reads and replays it. Without this a write
+	// pipelined right before DEBUG LOADAOF would be lost on reload.
+	d.FlushAOF()
 	dir := d.aofDir()
 	manifest := filepath.Join(dir, d.aofBasename()+".manifest")
 	data, err := os.ReadFile(manifest)

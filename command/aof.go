@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tamnd/aki/networking"
 )
 
 // This file implements the append-only-file emulation (spec 2064 doc 17 section
@@ -37,6 +39,14 @@ type aofState struct {
 
 	incrFile       *os.File // open handle on the incr file for appends
 	lastSelectedDB int      // database last written into the incr file, -1 if none
+
+	// incrBuf holds AOF records appended since the last flush to incrFile. Under
+	// the everysec and no policies a record is appended here and the buffer is
+	// written to the file in one syscall at the end of a connection's drain pass
+	// (aki's beforeSleep) and by the cron, so a pipeline of N writes costs one
+	// write() instead of N. The always policy flushes inline to stay durable
+	// before the reply. flushIncrLocked is the only place these bytes reach the OS.
+	incrBuf []byte
 
 	pendingSync bool      // bytes written since the last fsync, drives everysec
 	lastSync    time.Time // time of the last incr-file fsync
@@ -211,8 +221,15 @@ func (d *Dispatcher) rewriteAOF() error {
 		return merr
 	}
 
-	// Swap in the new files, then close and remove the old ones.
+	// Swap in the new files, then close and remove the old ones. Flush any
+	// records still buffered for the old incr file first: the new base RDB already
+	// captures the keyspace, but flushing keeps the old file consistent for the
+	// brief window before it is removed and matches the pre-buffering behaviour
+	// where each record was written to the old file as it arrived. The fresh incr
+	// file starts with an empty buffer.
 	d.aof.mu.Lock()
+	d.flushIncrLocked()
+	d.aof.incrBuf = d.aof.incrBuf[:0]
 	d.aof.seq = newSeq
 	d.aof.baseSize = baseSize
 	d.aof.incrSize = 0
@@ -279,47 +296,92 @@ func (d *Dispatcher) writeManifest(dir, base, incr string, seq int) error {
 	return os.Rename(tmpName, target)
 }
 
-// appendAOF writes one command (preceded by a SELECT when the database changed)
-// to the current incr file.
+// aofBufFlushThreshold bounds how many buffered AOF bytes accumulate before
+// appendAOF flushes them to the incr file mid-pipeline. A single huge pipeline
+// would otherwise pin the whole thing in memory until its drain pass ends.
+const aofBufFlushThreshold = 1 << 20 // 1 MiB
+
+// appendAOF records one command (preceded by a SELECT when the database changed)
+// for the current incr file. The record is appended to incrBuf; flushIncrLocked
+// later writes the buffer to the file. The always policy flushes and fsyncs
+// inline so the write is durable before its reply, matching Redis. The everysec
+// and no policies leave the record in the buffer for the drain-end flush and the
+// cron, which turns a pipeline of N writes into one write() syscall.
 func (d *Dispatcher) appendAOF(db int, argv [][]byte) {
 	d.aof.mu.Lock()
 	defer d.aof.mu.Unlock()
 	if d.aof.incrFile == nil || d.aof.loading {
 		return
 	}
-	var buf []byte
 	// aof-timestamp-enabled prefixes each record with a #TS:<unix_ms> comment line.
 	// The loader skips comment lines, so the annotation does not change the replay.
 	if d.confBool("aof-timestamp-enabled", false) {
-		buf = append(buf, "#TS:"...)
-		buf = strconv.AppendInt(buf, time.Now().UnixMilli(), 10)
-		buf = append(buf, '\r', '\n')
+		d.aof.incrBuf = append(d.aof.incrBuf, "#TS:"...)
+		d.aof.incrBuf = strconv.AppendInt(d.aof.incrBuf, time.Now().UnixMilli(), 10)
+		d.aof.incrBuf = append(d.aof.incrBuf, '\r', '\n')
 	}
 	if db != d.aof.lastSelectedDB {
-		buf = appendRESPCommand(buf, [][]byte{[]byte("SELECT"), []byte(strconv.Itoa(db))})
+		d.aof.incrBuf = appendRESPCommand(d.aof.incrBuf, [][]byte{[]byte("SELECT"), []byte(strconv.Itoa(db))})
 		d.aof.lastSelectedDB = db
 	}
-	buf = appendRESPCommand(buf, argv)
-	n, err := d.aof.incrFile.Write(buf)
-	if err != nil {
-		d.aof.lastWriteStatus = "err"
-		return
-	}
-	d.aof.incrSize += int64(n)
-	d.aof.lastWriteStatus = "ok"
+	d.aof.incrBuf = appendRESPCommand(d.aof.incrBuf, argv)
 	d.aof.pendingSync = true
 	d.aof.writeSeq++
 	mySeq := d.aof.writeSeq
-	// The always policy makes every write durable before the reply, so fsync the
-	// incr file before returning. Rather than one fsync per command, concurrent
-	// writers group-commit: a single fsync covers every record written before it
-	// began, so a burst of writers shares one fsync. The everysec policy defers to
-	// syncAOFCron and the no policy leaves it to the OS, so both only mark the
-	// write pending here.
+
 	if d.aofFsyncPolicy() == "always" && !d.aofSyncBlockedByRewrite() {
+		// Durable before the reply: write the buffered records and fsync now.
+		// Concurrent writers still share one fsync through groupSyncLocked, so a
+		// burst pays one fsync, not one each.
+		d.flushIncrLocked()
 		d.groupSyncLocked(mySeq)
+		return
+	}
+	// Bound the buffer so one enormous pipeline cannot hold unbounded memory.
+	if len(d.aof.incrBuf) >= aofBufFlushThreshold {
+		d.flushIncrLocked()
 	}
 }
+
+// flushIncrLocked writes the buffered AOF records to the incr file in a single
+// syscall and clears the buffer. The caller holds d.aof.mu. It is the only point
+// where buffered records reach the OS, so every fsync and close path calls it
+// first to keep "flush precedes sync" true. On a short or failed write it keeps
+// the unwritten tail so the next flush retries rather than dropping records.
+func (d *Dispatcher) flushIncrLocked() {
+	if len(d.aof.incrBuf) == 0 || d.aof.incrFile == nil {
+		return
+	}
+	n, err := d.aof.incrFile.Write(d.aof.incrBuf)
+	if n > 0 {
+		d.aof.incrSize += int64(n)
+	}
+	if err != nil {
+		d.aof.lastWriteStatus = "err"
+		d.aof.incrBuf = d.aof.incrBuf[:copy(d.aof.incrBuf, d.aof.incrBuf[n:])]
+		return
+	}
+	d.aof.lastWriteStatus = "ok"
+	d.aof.incrBuf = d.aof.incrBuf[:0]
+}
+
+// FlushAOF writes any buffered AOF records to the incr file. The networking serve
+// loop calls it once after draining each batch of pipelined commands, before the
+// connection blocks for more input, so a pipeline's records reach the file in one
+// write() syscall. It is aki's beforeSleep flush.
+func (d *Dispatcher) FlushAOF() {
+	d.aof.mu.Lock()
+	d.flushIncrLocked()
+	d.aof.mu.Unlock()
+}
+
+// OnBatchComplete satisfies networking.BatchHandler. It runs once per connection
+// after a pipeline batch is drained and flushes the AOF write buffer.
+func (d *Dispatcher) OnBatchComplete(_ *networking.Conn) { d.FlushAOF() }
+
+// The serve loop calls OnBatchComplete through this interface, so a mismatch must
+// fail the build rather than silently fall back to cron-only flushing.
+var _ networking.BatchHandler = (*Dispatcher)(nil)
 
 // groupSyncLocked blocks until the incr file has been fsynced through at least
 // seq, coalescing concurrent callers. While one goroutine performs the fsync with
@@ -391,6 +453,7 @@ func (d *Dispatcher) syncAOFCron() {
 	if !d.aof.lastSync.IsZero() && now.Sub(d.aof.lastSync) < time.Second {
 		return
 	}
+	d.flushIncrLocked()
 	if err := d.aof.incrFile.Sync(); err != nil {
 		d.aof.lastWriteStatus = "err"
 		return
@@ -592,6 +655,7 @@ func (d *Dispatcher) forceSyncAOF() bool {
 	if d.aof.incrFile == nil {
 		return false
 	}
+	d.flushIncrLocked()
 	if err := d.aof.incrFile.Sync(); err != nil {
 		d.aof.lastWriteStatus = "err"
 		return false
@@ -607,6 +671,7 @@ func (d *Dispatcher) closeAOF() {
 	d.aof.mu.Lock()
 	defer d.aof.mu.Unlock()
 	if d.aof.incrFile != nil {
+		d.flushIncrLocked()
 		_ = d.aof.incrFile.Close()
 		d.aof.incrFile = nil
 	}

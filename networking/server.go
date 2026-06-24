@@ -288,6 +288,16 @@ type DisconnectHandler interface {
 	OnDisconnect(c *Conn)
 }
 
+// BatchHandler is an optional interface a Handler may implement to learn when a
+// connection has finished draining the batch of pipelined commands currently
+// buffered, just before it blocks for more input. It is the seam where a handler
+// flushes work it batched across the pipeline, such as an append-only-file write
+// buffer, so a pipeline of N writes costs one syscall. It mirrors Redis's
+// beforeSleep and is called from the connection's own goroutine.
+type BatchHandler interface {
+	OnBatchComplete(c *Conn)
+}
+
 // removeConn unregisters a connection when its read loop exits.
 func (s *Server) removeConn(c *Conn) {
 	s.mu.Lock()
