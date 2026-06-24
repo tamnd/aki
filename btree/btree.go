@@ -290,6 +290,14 @@ func (t *Tree) insertAr(pgno uint32, key, val []byte, ar *nodeArena) (oldVal []b
 		return nil, nil, err
 	}
 	if pg.Data[0] == format.PageTypeBTreeLeaf {
+		// Fast path: mutate the leaf bytes in place when the change fits the page's
+		// free gap, so a single-key write does O(cell) work instead of decoding and
+		// re-encoding the whole page. It cannot split, so a full page falls through
+		// to the decode path below, which compacts dead cells and splits if needed.
+		if ov, done := leafUpsertInPlace(pg.Data, key, val); done {
+			t.pgr.Unpin(pg, true)
+			return ov, nil, nil
+		}
 		n, derr := decodeNodeAr(pg.Data, ar)
 		t.pgr.Unpin(pg, false)
 		if derr != nil {
@@ -501,6 +509,114 @@ func (n *node) upsertAr(key, val []byte, ar *nodeArena) (oldVal []byte) {
 	n.keys = insertBytes(n.keys, i, ar.copy(key))
 	n.vals = insertBytes(n.vals, i, v)
 	return nil
+}
+
+// leafUpsertInPlace inserts or replaces key/val directly in the leaf page bytes b
+// without decoding the whole page into a node and re-encoding it. It returns the
+// previous value (a heap copy) when key was present, and done=true when the
+// mutation was applied in place. done=false means the page lacks the contiguous
+// free space this change needs and the caller must fall back to the
+// decode/compact/split path; in that case b is left unmodified. The caller holds
+// a write pin on b.
+//
+// Three cases, cheapest first:
+//   - key present, value the same length: overwrite the value bytes where they
+//     sit. No slot, header, or free space changes. This is the hot path for a SET
+//     that rewrites an existing key with a same-size value.
+//   - key present, value a different length: write a fresh cell into the free gap
+//     and repoint the slot, abandoning the old cell as dead space that the next
+//     full re-encode reclaims (decode reads only the cells the slots name).
+//   - key absent: write a fresh cell and open a slot for it at the sorted
+//     position by shifting the slots above it up by one.
+//
+// The page format packs cells downward from the end and grows the slot array up
+// from slotsStart, so the free gap is the run of bytes from FreeStart to FreeEnd.
+// Every case that returns done=true keeps that gap accounting correct: FreeEnd
+// drops by the new cell's length and, for an insert, FreeStart rises by one slot.
+func leafUpsertInPlace(b, key, val []byte) (oldVal []byte, done bool) {
+	h, err := format.ParsePageHeader(b)
+	if err != nil || h.Type != format.PageTypeBTreeLeaf {
+		return nil, false
+	}
+	count := int(h.CellCount)
+	pos := count
+	matched := false
+	var matchVStart, matchVLen int
+	for i := range count {
+		off := int(encoding.U16(b[slotsStart+2*i:]))
+		kl, m, derr := encoding.Uvarint(b[off:])
+		if derr != nil {
+			return nil, false
+		}
+		ko := off + m
+		cmp := bytes.Compare(key, b[ko:ko+int(kl)])
+		if cmp < 0 {
+			pos = i
+			break
+		}
+		if cmp == 0 {
+			vo := ko + int(kl)
+			vl, m2, derr := encoding.Uvarint(b[vo:])
+			if derr != nil {
+				return nil, false
+			}
+			matchVStart = vo + m2
+			matchVLen = int(vl)
+			pos = i
+			matched = true
+			break
+		}
+	}
+
+	newCellLen := uvarintLen(uint64(len(key))) + len(key) + uvarintLen(uint64(len(val))) + len(val)
+	freeStart := int(h.FreeStart)
+	freeEnd := int(h.FreeEnd)
+
+	if matched {
+		oldVal = bytes.Clone(b[matchVStart : matchVStart+matchVLen])
+		if matchVLen == len(val) {
+			// Same length means the value-length varint is unchanged, so the value
+			// bytes can be overwritten where they already sit.
+			copy(b[matchVStart:], val)
+			return oldVal, true
+		}
+		if newCellLen > freeEnd-freeStart {
+			return oldVal, false
+		}
+		newOff := freeEnd - newCellLen
+		putLeafCell(b, newOff, key, val)
+		encoding.PutU16(b[slotsStart+2*pos:], uint16(newOff))
+		encoding.PutU16(b[6:], uint16(newOff)) // FreeEnd
+		return oldVal, true
+	}
+
+	// Insert a new key: the change needs the cell plus one 2-byte slot.
+	if newCellLen+2 > freeEnd-freeStart {
+		return nil, false
+	}
+	newOff := freeEnd - newCellLen
+	putLeafCell(b, newOff, key, val)
+	slotPos := slotsStart + 2*pos
+	slotsEnd := slotsStart + 2*count
+	copy(b[slotPos+2:slotsEnd+2], b[slotPos:slotsEnd])
+	encoding.PutU16(b[slotPos:], uint16(newOff))
+	encoding.PutU16(b[2:], uint16(count+1))    // CellCount
+	encoding.PutU16(b[4:], uint16(slotsEnd+2)) // FreeStart
+	encoding.PutU16(b[6:], uint16(newOff))     // FreeEnd
+	encoding.PutU16(b[20:], uint16(count+1))   // duplicated slot count in the per-type header
+	return nil, true
+}
+
+// putLeafCell writes a leaf cell (uvarint keylen, key, uvarint vallen, val) into b
+// starting at off. The caller has already checked the cell fits, so appending into
+// the zero-length slice b[off:off] writes straight into b without reallocating.
+func putLeafCell(b []byte, off int, key, val []byte) {
+	c := b[off:off]
+	c = encoding.AppendUvarint(c, uint64(len(key)))
+	c = append(c, key...)
+	c = encoding.AppendUvarint(c, uint64(len(val)))
+	c = append(c, val...)
+	_ = c
 }
 
 // splitAr divides a full node into a lower and upper half. Keys are already in ar.buf so no copy is needed;
