@@ -47,8 +47,9 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 		absent   bool
 		newLen   int64
 	)
+	lim := ctx.encLimits()
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		body, hdr, found, err := db.Get(key)
+		hdr, found, err := listHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -60,7 +61,16 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 			absent = true
 			return nil
 		}
-		elems, err := listDecode(body)
+		// A list already in the btree-backed form takes the window-write path: each
+		// value is one row at a new head or tail position, no whole-blob rewrite.
+		if found && hdr.IsColl() {
+			return db.CollUpdate(key, keyspace.TypeList, keyspace.EncQuicklist, func(w *keyspace.CollWriter) error {
+				n, e := listTreePush(w, vals, head)
+				newLen = n
+				return e
+			})
+		}
+		elems, _, _, err := getList(db, key)
 		if err != nil {
 			return err
 		}
@@ -80,7 +90,10 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 		if found {
 			prev = hdr.Encoding
 		}
-		return db.Set(key, listEncode(elems), keyspace.TypeList, listEncoding(ctx.encLimits(), elems, prev), keepTTL(hdr, found))
+		if listWantsTree(lim, elems, prev) {
+			return listPromote(db, key, elems)
+		}
+		return db.Set(key, listEncode(elems), keyspace.TypeList, listEncoding(lim, elems, prev), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -132,7 +145,7 @@ func popList(ctx *Ctx, head bool) {
 		popped   [][]byte
 	)
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		body, hdr, found, err := db.Get(key)
+		hdr, found, err := listHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -144,7 +157,28 @@ func popList(ctx *Ctx, head bool) {
 			wrongTyp = true
 			return nil
 		}
-		elems, err := listDecode(body)
+		// A btree-backed list pops from the window end in place: read and delete the
+		// boundary rows and move head or tail, no whole-blob rewrite. CollUpdate tears
+		// the key down when the last element goes.
+		if hdr.IsColl() {
+			before := int64(0)
+			err := db.CollUpdate(key, keyspace.TypeList, keyspace.EncQuicklist, func(w *keyspace.CollWriter) error {
+				before = int64(w.Count())
+				n := 1
+				if hasCount {
+					n = int(min(count, before))
+				}
+				p, e := listTreePop(w, n, head)
+				popped = p
+				return e
+			})
+			if err != nil {
+				return err
+			}
+			emptied = before > 0 && int64(len(popped)) == before
+			return nil
+		}
+		elems, _, _, err := getList(db, key)
 		if err != nil {
 			return err
 		}
@@ -224,7 +258,7 @@ func handleLLen(ctx *Ctx) {
 		n        int64
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		body, hdr, found, err := db.Get(key)
+		ln, hdr, found, err := listLen(db, key)
 		if err != nil {
 			return err
 		}
@@ -235,11 +269,7 @@ func handleLLen(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		elems, err := listDecode(body)
-		if err != nil {
-			return err
-		}
-		n = int64(len(elems))
+		n = ln
 		return nil
 	}) {
 		return
@@ -277,7 +307,7 @@ func handleLRange(ctx *Ctx) {
 		out      [][]byte
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		body, hdr, found, err := db.Get(key)
+		hdr, found, err := listHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -288,7 +318,13 @@ func handleLRange(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		elems, err := listDecode(body)
+		// A btree-backed list reads only the requested window by seeking the cursor;
+		// a blob decodes and slices.
+		if hdr.IsColl() {
+			out, err = listTreeRange(db, key, start, stop)
+			return err
+		}
+		elems, _, _, err := getList(db, key)
 		if err != nil {
 			return err
 		}
@@ -308,10 +344,10 @@ func handleLRange(ctx *Ctx) {
 	}
 }
 
-// listSlice resolves the LRANGE index rules: negative indices count from the
-// tail, the range is inclusive and clamped, and an empty range yields nil.
-func listSlice(elems [][]byte, start, stop int64) [][]byte {
-	n := int64(len(elems))
+// listRangeBounds resolves the LRANGE index rules to a clamped inclusive
+// [lo, hi]: negative indices count from the tail, lo floors at zero, and hi caps
+// at the last element. An empty range is reported by lo > hi at the call site.
+func listRangeBounds(start, stop, n int64) (lo, hi int64) {
 	if start < 0 {
 		start += n
 	}
@@ -324,8 +360,16 @@ func listSlice(elems [][]byte, start, stop int64) [][]byte {
 	if stop >= n {
 		stop = n - 1
 	}
-	if start > stop || n == 0 {
+	return start, stop
+}
+
+// listSlice resolves the LRANGE index rules: negative indices count from the
+// tail, the range is inclusive and clamped, and an empty range yields nil.
+func listSlice(elems [][]byte, start, stop int64) [][]byte {
+	n := int64(len(elems))
+	lo, hi := listRangeBounds(start, stop, n)
+	if lo > hi || n == 0 {
 		return nil
 	}
-	return elems[start : stop+1]
+	return elems[lo : hi+1]
 }

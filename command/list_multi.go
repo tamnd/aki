@@ -62,7 +62,7 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 		moved      []byte
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
-		srcBody, srcHdr, srcFound, err := db.Get(src)
+		srcElems, srcHdr, srcFound, err := getList(db, src)
 		if err != nil {
 			return err
 		}
@@ -76,12 +76,12 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 		}
 		sameKey := bytes.Equal(src, dst)
 		var (
-			dstBody  []byte
+			dstElems [][]byte
 			dstHdr   keyspace.ValueHeader
 			dstFound bool
 		)
 		if !sameKey {
-			dstBody, dstHdr, dstFound, err = db.Get(dst)
+			dstElems, dstHdr, dstFound, err = getList(db, dst)
 			if err != nil {
 				return err
 			}
@@ -89,10 +89,6 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 				wrongTyp = true
 				return nil
 			}
-		}
-		srcElems, err := listDecode(srcBody)
-		if err != nil {
-			return err
 		}
 		if len(srcElems) == 0 {
 			absent = true
@@ -118,10 +114,6 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 			return err
 		}
 
-		dstElems, err := listDecode(dstBody)
-		if err != nil {
-			return err
-		}
 		dstElems = pushEnd(dstElems, elem, toLeft)
 		dstPrev := uint8(keyspace.EncListpack)
 		if dstFound {
@@ -230,7 +222,7 @@ func handleLPos(ctx *Ctx) {
 		matches  []int64
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		body, hdr, found, err := db.Get(key)
+		elems, hdr, found, err := getList(db, key)
 		if err != nil {
 			return err
 		}
@@ -240,10 +232,6 @@ func handleLPos(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeList {
 			wrongTyp = true
 			return nil
-		}
-		elems, err := listDecode(body)
-		if err != nil {
-			return err
 		}
 		matches = lposScan(elems, element, rank, count, hasCount, maxlen)
 		return nil
@@ -382,7 +370,7 @@ func handleLMPop(ctx *Ctx) {
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
 		for _, key := range keys {
-			body, hdr, found, err := db.Get(key)
+			elems, hdr, found, err := getList(db, key)
 			if err != nil {
 				return err
 			}
@@ -392,10 +380,6 @@ func handleLMPop(ctx *Ctx) {
 			if hdr.Type != keyspace.TypeList {
 				wrongTyp = true
 				return nil
-			}
-			elems, err := listDecode(body)
-			if err != nil {
-				return err
 			}
 			if len(elems) == 0 {
 				continue
