@@ -9,7 +9,21 @@ import (
 // its header (doc 05 §3.4). A body of this size or smaller is inline; anything
 // larger is written to an overflow page chain and the leaf cell holds only the
 // 40-byte header with BodyRef pointing at the head page.
-const maxInlineBody = 128
+//
+// The threshold is MinPageSize/4 (4096/4 = 1024). An overflow body claims a
+// whole page chain of its own, so a mid-size value (a small collection blob, a
+// few-hundred-byte string) used to burn a >=4KB page each: 100k such keys make a
+// dirty set large enough to force a checkpoint every couple thousand writes, and
+// each overwrite first walks the old chain to free it. Keeping bodies up to a
+// quarter page inline packs many per leaf instead, which removes that page
+// explosion and the per-overwrite chain read. A quarter of the smallest legal
+// page still leaves at least three cells per leaf on a MinPageSize file, so the
+// tree stays splittable; on the 16KB default page a leaf holds about sixteen
+// max-size cells. The choice is per write and recorded in each cell's
+// FlagInlineBody, so raising it stays compatible with files written under the
+// old 128-byte threshold (their larger cells simply remain in overflow until
+// rewritten).
+const maxInlineBody = 1024
 
 // Overflow page layout. The 16-byte common header is followed by a 4-byte
 // little-endian next-page pointer (NullPage on the last page), then the body
