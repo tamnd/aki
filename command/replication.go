@@ -920,7 +920,7 @@ func (d *Dispatcher) denyStaleData(cmd *CmdDesc) bool {
 	if cmd.Flags.Has(FlagStale) {
 		return false
 	}
-	if d.confBool("replica-serve-stale-data", true) {
+	if d.conf == nil || d.conf.serveStaleData() {
 		return false
 	}
 	d.repl.mu.Lock()
@@ -949,8 +949,11 @@ func (d *Dispatcher) goodReplicaCount(maxLag time.Duration) int {
 // are positive, matching Redis, and a replica never applies it since its master
 // already enforced the rule before sending the write.
 func (d *Dispatcher) enoughGoodReplicas() bool {
-	minReplicas := int(d.confInt("min-replicas-to-write", 0))
-	maxLag := int(d.confInt("min-replicas-max-lag", 10))
+	if d.conf == nil {
+		return true
+	}
+	minReplicas := int(d.conf.minReplicasToWrite())
+	maxLag := int(d.conf.minReplicasMaxLag())
 	if minReplicas <= 0 || maxLag <= 0 {
 		return true
 	}

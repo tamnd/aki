@@ -43,9 +43,10 @@ func (d *Dispatcher) clusterInit() {
 	d.cluster.migrating = map[int]string{}
 }
 
-// clusterEnabled reports whether cluster mode is on.
+// clusterEnabled reports whether cluster mode is on. It reads the config store's
+// atomic mirror, so the cluster guard stays lock-free on the per-command path.
 func (d *Dispatcher) clusterEnabled() bool {
-	return strings.EqualFold(d.confValue("cluster-enabled", "no"), "yes")
+	return d.conf != nil && d.conf.clusterEnabled()
 }
 
 // crossSlotError enforces the Redis Cluster rule that a multi-key command must
