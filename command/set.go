@@ -57,7 +57,40 @@ func handleSAdd(ctx *Ctx) {
 		added    int64
 	)
 	lim := ctx.encLimits()
-	done := ctx.updateShard(key, func(db *keyspace.DB) error {
+	// applyAdd runs the dedup-and-append over a decoded member set, bumping added
+	// for each genuinely new member. It is shared by the sync and fast paths so the
+	// two stay byte-for-byte identical.
+	applyAdd := func(members [][]byte) [][]byte {
+		if len(toAdd) >= setDedupMapThreshold {
+			// Many members at once: a one-pass membership map makes dedup O(N+M)
+			// instead of the O(N*M) repeated linear scan below.
+			seen := make(map[string]struct{}, len(members)+len(toAdd))
+			for _, m := range members {
+				seen[string(m)] = struct{}{}
+			}
+			for _, m := range toAdd {
+				if _, ok := seen[string(m)]; !ok {
+					seen[string(m)] = struct{}{}
+					members = append(members, m)
+					added++
+				}
+			}
+		} else {
+			// Few members: the linear scan avoids the map allocation, which would
+			// otherwise dominate the common single-member SADD.
+			for _, m := range toAdd {
+				if setFind(members, m) < 0 {
+					members = append(members, m)
+					added++
+				}
+			}
+		}
+		return members
+	}
+	// sync is the full synchronous closure: the btree-backed point write, the
+	// promotion to the hashtable form, and the plain blob rewrite. It is the
+	// fallback for a coll-form set, a promotion, or when no workers run.
+	sync := func(db *keyspace.DB) error {
 		hdr, found, err := setHeader(db, key)
 		if err != nil {
 			return err
@@ -88,30 +121,8 @@ func handleSAdd(ctx *Ctx) {
 		if err != nil {
 			return err
 		}
-		if len(toAdd) >= setDedupMapThreshold {
-			// Many members at once: a one-pass membership map makes dedup O(N+M)
-			// instead of the O(N*M) repeated linear scan below.
-			seen := make(map[string]struct{}, len(members)+len(toAdd))
-			for _, m := range members {
-				seen[string(m)] = struct{}{}
-			}
-			for _, m := range toAdd {
-				if _, ok := seen[string(m)]; !ok {
-					seen[string(m)] = struct{}{}
-					members = append(members, m)
-					added++
-				}
-			}
-		} else {
-			// Few members: the linear scan avoids the map allocation, which would
-			// otherwise dominate the common single-member SADD.
-			for _, m := range toAdd {
-				if setFind(members, m) < 0 {
-					members = append(members, m)
-					added++
-				}
-			}
-		}
+		added = 0
+		members = applyAdd(members)
 		if added == 0 {
 			return nil
 		}
@@ -123,8 +134,38 @@ func handleSAdd(ctx *Ctx) {
 			return setPromote(db, key, members)
 		}
 		return db.Set(key, setEncode(members), keyspace.TypeSet, setEncoding(lim, members, prev), keepTTL(hdr, found))
-	})
-	if !done {
+	}
+	// compute is the write-behind fast path for an intset or listpack form set (or
+	// a fresh key) whose new blob still fits inline: decode the current body, add
+	// the members, and report the new blob to stage. It falls back to sync for the
+	// btree-backed form, a promotion to hashtable, or a codec error.
+	compute := func(cur []byte, hdr keyspace.ValueHeader, found bool) rmwResult {
+		if found && hdr.Type != keyspace.TypeSet {
+			wrongTyp = true
+			return rmwResult{}
+		}
+		if found && hdr.IsColl() {
+			return rmwResult{fallback: true}
+		}
+		members, err := setDecode(cur)
+		if err != nil {
+			return rmwResult{fallback: true}
+		}
+		added = 0
+		members = applyAdd(members)
+		if added == 0 {
+			return rmwResult{}
+		}
+		prev := uint8(keyspace.EncIntset)
+		if found {
+			prev = hdr.Encoding
+		}
+		if setWantsTree(lim, members, prev) {
+			return rmwResult{fallback: true}
+		}
+		return rmwResult{body: setEncode(members), typ: keyspace.TypeSet, enc: setEncoding(lim, members, prev), ttlMs: keepTTL(hdr, found), write: true}
+	}
+	if !ctx.rmwWriteBehind(key, compute, sync) {
 		return
 	}
 	if wrongTyp {
