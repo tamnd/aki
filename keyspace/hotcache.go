@@ -136,12 +136,27 @@ func (c *dbCache) cgetAtime(key []byte) (uint32, bool) {
 // For an existing key, cput swaps in a new cachedValue atomically into the
 // existing cacheEntry without allocating a new entry. For a new key, it
 // allocates both a cacheEntry and a cachedValue.
+//
+// cput is version-aware: it never overwrites a cached value whose version is
+// strictly newer than hdr.Version. Every write carries a unique increasing
+// version from the global counter, so this keeps the cache monotonic across the
+// concurrent paths that touch it. The async write-behind worker can apply an
+// older staged write to the B-tree after a newer read-modify-write has already
+// cached its result, and a read-path warm-up can land after a newer write
+// staged its value. Without this guard the older cput would clobber the newer
+// cache entry and the next read-modify-write would read a stale value and lose
+// an update.
 func (c *dbCache) cput(key string, body []byte, hdr ValueHeader) {
 	sh := &c.shards[c.shardIdxStr(key)]
 	cv := &cachedValue{body: body, hdr: hdr}
 	cv.atime.Store(nowSeconds())
 	sh.mu.Lock()
 	if e, exists := sh.entries[key]; exists {
+		if cur := e.val.Load(); cur != nil && cur.hdr.Version > hdr.Version {
+			// A strictly newer value is already cached; do not clobber it.
+			sh.mu.Unlock()
+			return
+		}
 		// Key already in cache: swap the value pointer in-place. No new
 		// cacheEntry allocation, saving one heap object per update write.
 		e.val.Store(cv)
