@@ -78,6 +78,34 @@ func listEncoding(lim encLimits, elems [][]byte, prev uint8) uint8 {
 	return keyspace.EncListpack
 }
 
+// getList reads the list at key and returns its elements head to tail. The header
+// carries the type and encoding so callers can check for WRONGTYPE and keep the
+// encoding floor. A missing key returns found false with no error. A large list
+// lives in the btree-backed sub-tree form (list_tree.go); getList materializes it
+// in list order so every read caller and the bulk rewrite commands (LINSERT,
+// LREM, LTRIM, LPOS, LMOVE, LMPOP, the blocking variants, DUMP/RDB) work on either
+// form unchanged. The push, pop, length, range, LINDEX and LSET commands branch on
+// hdr.IsColl() before getList so they never rewrite a whole blob for a btree-backed
+// list.
+func getList(db *keyspace.DB, key []byte) ([][]byte, keyspace.ValueHeader, bool, error) {
+	body, hdr, found, err := db.Get(key)
+	if err != nil || !found {
+		return nil, hdr, found, err
+	}
+	if hdr.Type != keyspace.TypeList {
+		return nil, hdr, true, nil
+	}
+	if hdr.IsColl() {
+		elems, e := collectListElems(db, key)
+		return elems, hdr, true, e
+	}
+	elems, err := listDecode(body)
+	if err != nil {
+		return nil, hdr, true, err
+	}
+	return elems, hdr, true, nil
+}
+
 // hotGetList tries to decode the list at key from the lock-free hot cache.
 // Returns (elems, true) on a hit and (nil, false) on a miss.
 func hotGetList(ctx *Ctx, key []byte) ([][]byte, bool) {
