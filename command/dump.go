@@ -97,7 +97,7 @@ func readDumpValue(db *keyspace.DB, key []byte) (rdb.Value, bool, error) {
 		ms, _, _, gerr := getSet(db, key)
 		return rdb.Value{Kind: rdb.KindSet, Set: ms}, true, gerr
 	case keyspace.TypeHash:
-		fields, _, _, gerr := getHash(db, key)
+		fields, _, _, gerr := hashMaterialize(db, key)
 		if gerr != nil {
 			return rdb.Value{}, true, gerr
 		}
@@ -340,6 +340,16 @@ func storeRestored(lim encLimits, db *keyspace.DB, key []byte, v rdb.Value, ttlM
 		fields := make([]hashField, len(v.Hash))
 		for i, f := range v.Hash {
 			fields[i] = hashField{field: f.Field, value: f.Value}
+		}
+		// A restored hash large enough to report hashtable lands in the
+		// btree-backed form, the same as one built field by field. Promotion needs
+		// the key's TTL stamped first, since hashPromote preserves the existing
+		// header's TTL rather than taking one as an argument.
+		if hashWantsTree(lim, fields, keyspace.EncListpack) {
+			if err := db.Set(key, nil, keyspace.TypeHash, keyspace.EncHashtable, ttlMs); err != nil {
+				return err
+			}
+			return hashPromote(db, key, fields)
 		}
 		return db.Set(key, hashEncode(fields), keyspace.TypeHash,
 			hashEncoding(lim, fields, keyspace.EncListpack), ttlMs)

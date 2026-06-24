@@ -175,7 +175,24 @@ func (ks *Keyspace) CheckPageAccounting() error {
 			}
 			for c.Valid() {
 				h, _, ok := parseHeader(c.Value())
-				if ok && h.Flags&FlagInlineBody == 0 && h.BodyRef != 0 {
+				if ok && h.IsColl() && h.BodyRef != 0 {
+					// A btree-backed collection's BodyRef is an element sub-tree
+					// root; mark every page it holds so the walk does not report
+					// them as leaked. A coll meta keeps FlagInlineBody set, so it
+					// never enters the overflow branch below.
+					sub := btree.Open(ks.pgr, uint32(h.BodyRef))
+					subPages, perr := btree.Pages(sub)
+					if perr != nil {
+						db.shards[s].mu.RUnlock()
+						return fmt.Errorf("db%d shard%d coll sub-tree: %w", db.index, s, perr)
+					}
+					for _, pgno := range subPages {
+						if err := mark(pgno, fmt.Sprintf("db%d shard%d coll sub-tree", db.index, s)); err != nil {
+							db.shards[s].mu.RUnlock()
+							return err
+						}
+					}
+				} else if ok && h.Flags&FlagInlineBody == 0 && h.BodyRef != 0 {
 					if err := ks.markOverflowChain(uint32(h.BodyRef), pageCount, mark); err != nil {
 						db.shards[s].mu.RUnlock()
 						return fmt.Errorf("db%d shard%d overflow: %w", db.index, s, err)
@@ -274,6 +291,17 @@ func (ks *Keyspace) FixFutureTTLs() (int, error) {
 				return fixed, err
 			}
 			if !found {
+				continue
+			}
+			if h.IsColl() {
+				// A btree-backed collection's body is metadata, not a value, so it
+				// cannot be rewritten through Set (that would drop the sub-tree).
+				// Clear the TTL on the meta record in place, keeping BodyRef and the
+				// collection flags intact.
+				if err := db.clearCollTTL(key); err != nil {
+					return fixed, err
+				}
+				fixed++
 				continue
 			}
 			if err := db.Set(key, body, h.Type, h.Encoding, -1); err != nil {

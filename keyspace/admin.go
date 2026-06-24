@@ -27,13 +27,19 @@ func (db *DB) flushShard(s int) error {
 	t := db.loadShardTree(s)
 	if t != nil {
 		var overflow []uint32
+		var collTrees []uint32
 		c := t.Cursor()
 		if err := c.First(); err != nil {
 			return err
 		}
 		for c.Valid() {
 			if h, _, ok := parseHeader(c.Value()); ok {
-				if h.Flags&FlagInlineBody == 0 && h.BodyRef != 0 {
+				if h.IsColl() && h.BodyRef != 0 {
+					// A btree-backed collection's element sub-tree must be dropped
+					// so its pages return to the freelist. The meta keeps
+					// FlagInlineBody set, so it never enters the overflow branch.
+					collTrees = append(collTrees, uint32(h.BodyRef))
+				} else if h.Flags&FlagInlineBody == 0 && h.BodyRef != 0 {
 					overflow = append(overflow, uint32(h.BodyRef))
 				}
 				db.ks.dataBytes.Add(-(int64(len(rawKey(c.Key()))) + int64(h.BodyLen) + entryOverhead))
@@ -44,6 +50,11 @@ func (db *DB) flushShard(s int) error {
 		}
 		for _, head := range overflow {
 			if err := db.ks.freeOverflow(head); err != nil {
+				return err
+			}
+		}
+		for _, root := range collTrees {
+			if err := btree.DropTree(db.ks.pgr, root); err != nil {
 				return err
 			}
 		}
