@@ -111,7 +111,9 @@ func (c *dbCache) cget(key []byte) ([]byte, ValueHeader, bool) {
 	// Update atime atomically without holding any lock. Even if cput replaces
 	// cv between our Load and this Store, the write is to a still-live object
 	// and is harmless (the new cv will get its own atime stamp on the next hit).
-	cv.atime.Store(nowSeconds())
+	// coarseSeconds reads the cron-cached clock so the GET hot path never pays a
+	// time.Now syscall per hit.
+	cv.atime.Store(coarseSeconds())
 	return cv.body, cv.hdr, true
 }
 
@@ -149,7 +151,7 @@ func (c *dbCache) cgetAtime(key []byte) (uint32, bool) {
 func (c *dbCache) cput(key string, body []byte, hdr ValueHeader) {
 	sh := &c.shards[c.shardIdxStr(key)]
 	cv := &cachedValue{body: body, hdr: hdr}
-	cv.atime.Store(nowSeconds())
+	cv.atime.Store(coarseSeconds())
 	sh.mu.Lock()
 	if e, exists := sh.entries[key]; exists {
 		if cur := e.val.Load(); cur != nil && cur.hdr.Version > hdr.Version {
