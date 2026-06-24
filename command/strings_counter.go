@@ -51,32 +51,28 @@ func incrBy(ctx *Ctx, delta int64) {
 		overflow bool
 		result   int64
 	)
-	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		b, hdr, found, err := db.Get(key)
-		if err != nil {
-			return err
-		}
+	done := ctx.rmwWriteBehind(key, func(b []byte, hdr keyspace.ValueHeader, found bool) rmwResult {
 		if found && hdr.Type != keyspace.TypeString {
 			wrongTyp = true
-			return nil
+			return rmwResult{}
 		}
 		var cur int64
 		if found {
 			v, ok := parseInteger(b)
 			if !ok {
 				notInt = true
-				return nil
+				return rmwResult{}
 			}
 			cur = v
 		}
 		sum, ok := addInt64(cur, delta)
 		if !ok {
 			overflow = true
-			return nil
+			return rmwResult{}
 		}
 		result = sum
 		body := strconv.AppendInt(nil, sum, 10)
-		return db.Set(key, body, keyspace.TypeString, keyspace.EncInt, keepTTL(hdr, found))
+		return rmwResult{body: body, typ: keyspace.TypeString, enc: keyspace.EncInt, ttlMs: keepTTL(hdr, found), write: true}
 	})
 	if !done {
 		return
@@ -111,32 +107,28 @@ func handleIncrByFloat(ctx *Ctx) {
 		nanInf   bool
 		result   string
 	)
-	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		b, hdr, found, err := db.Get(key)
-		if err != nil {
-			return err
-		}
+	done := ctx.rmwWriteBehind(key, func(b []byte, hdr keyspace.ValueHeader, found bool) rmwResult {
 		if found && hdr.Type != keyspace.TypeString {
 			wrongTyp = true
-			return nil
+			return rmwResult{}
 		}
 		var cur float64
 		if found {
 			v, ok := parseFloat(b)
 			if !ok {
 				notFloat = true
-				return nil
+				return rmwResult{}
 			}
 			cur = v
 		}
 		sum := cur + incr
 		if math.IsNaN(sum) || math.IsInf(sum, 0) {
 			nanInf = true
-			return nil
+			return rmwResult{}
 		}
 		result = formatFloat(sum)
 		body := []byte(result)
-		return db.Set(key, body, keyspace.TypeString, stringEncoding(body), keepTTL(hdr, found))
+		return rmwResult{body: body, typ: keyspace.TypeString, enc: stringEncoding(body), ttlMs: keepTTL(hdr, found), write: true}
 	})
 	if !done {
 		return
