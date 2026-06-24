@@ -225,7 +225,7 @@ func (db *DB) collWriteMetaLocked(s int, t *btree.Tree, ck, key []byte, w *CollW
 		db.ks.dataBytes.Add(-(int64(len(key)) + int64(prev.BodyLen) + entryOverhead))
 	}
 	db.ks.dataBytes.Add(int64(len(key)) + int64(len(body)) + entryOverhead)
-	if h.HasTTL() && !(prevExisted && prev.HasTTL()) {
+	if h.HasTTL() && (!prevExisted || !prev.HasTTL()) {
 		db.shards[s].expireCount.Add(1)
 	}
 	db.recordAccess(key, !prevExisted)
