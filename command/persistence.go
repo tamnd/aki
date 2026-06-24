@@ -312,7 +312,7 @@ func (d *Dispatcher) checkSavePoints() {
 // The gate clears on its own once a later save succeeds and flips lastStatus back
 // to "ok". A replica never applies it, since the master already enforced the rule.
 func (d *Dispatcher) writesBlockedByBgsaveError() bool {
-	if !d.confBool("stop-writes-on-bgsave-error", true) {
+	if d.conf == nil || !d.conf.stopWritesOnBgsaveError() {
 		return false
 	}
 	if len(parseSavePoints(confValue(d.conf, "save", ""))) == 0 {

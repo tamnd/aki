@@ -313,7 +313,7 @@ func (d *Dispatcher) appendAOF(db int, argv [][]byte) {
 	}
 	// aof-timestamp-enabled prefixes each record with a #TS:<unix_ms> comment line.
 	// The loader skips comment lines, so the annotation does not change the replay.
-	if d.confBool("aof-timestamp-enabled", false) {
+	if d.conf != nil && d.conf.aofTimestampEnabled() {
 		d.aof.incrBuf = append(d.aof.incrBuf, "#TS:"...)
 		d.aof.incrBuf = strconv.AppendInt(d.aof.incrBuf, time.Now().UnixMilli(), 10)
 		d.aof.incrBuf = append(d.aof.incrBuf, '\r', '\n')
@@ -360,7 +360,7 @@ func (d *Dispatcher) appendAOF(db int, argv [][]byte) {
 // flush happens in OnBatchComplete, which a script or replay connection never
 // reaches, and the always policy must stay durable before its reply.
 func (d *Dispatcher) bufferAOFRecord(sess *session, db int, argv [][]byte) {
-	if d.confBool("aof-timestamp-enabled", false) {
+	if d.conf != nil && d.conf.aofTimestampEnabled() {
 		sess.aofBuf = append(sess.aofBuf, "#TS:"...)
 		sess.aofBuf = strconv.AppendInt(sess.aofBuf, time.Now().UnixMilli(), 10)
 		sess.aofBuf = append(sess.aofBuf, '\r', '\n')
