@@ -58,6 +58,26 @@ var asyncReqPool = sync.Pool{
 // writer rather than starving while the worker works through a deep queue.
 const writeBatchMax = 256
 
+// drainScratch is per-shard-worker scratch reused across drains so the coalescing
+// pass allocates nothing in steady state. reqs gathers one batch, skip marks the
+// superseded SETs in it, and dedup maps a key to the batch slot currently holding
+// the highest version seen for it. The map is reused (cleared, not reallocated)
+// so its string keys are not re-allocated when the same hot keys repeat batch
+// after batch.
+type drainScratch struct {
+	reqs  []*writeReq
+	skip  []bool
+	dedup map[string]int
+}
+
+func newDrainScratch() *drainScratch {
+	return &drainScratch{
+		reqs:  make([]*writeReq, 0, writeBatchMax),
+		skip:  make([]bool, 0, writeBatchMax),
+		dedup: make(map[string]int, 64),
+	}
+}
+
 // commitPolicy decides when a write makes the .aki file durable. It mirrors the
 // Redis appendfsync directive, but it governs the pager checkpoint (aki's real
 // durability mechanism) rather than an append log.
@@ -235,15 +255,16 @@ func (e *Engine) runWriteWorker() {
 // (which take e.mu.Lock) remain fully exclusive.
 func (e *Engine) runShardWorker(s int) {
 	defer e.wg.Done()
+	sc := newDrainScratch()
 	for {
 		select {
 		case req := <-e.writeChs[s]:
-			e.drainShardBatch(s, req)
+			e.drainShardBatch(s, req, sc)
 		case <-e.workerStop:
 			for {
 				select {
 				case req := <-e.writeChs[s]:
-					e.drainShardBatch(s, req)
+					e.drainShardBatch(s, req, sc)
 				default:
 					return
 				}
@@ -256,19 +277,87 @@ func (e *Engine) runShardWorker(s int) {
 // Because only one goroutine reads writeChs[s], and keyspace shard s is also
 // written exclusively by this goroutine, both the channel and the B-tree are
 // uncontended. Batching amortises the RLock acquire/release cost.
-func (e *Engine) drainShardBatch(s int, first *writeReq) {
-	e.mu.RLock()
-	e.applyWriteReqDeferred(first)
-	for i := 1; i < writeBatchMax; i++ {
+//
+// Before applying, the batch is coalesced: when several SETs in it target the
+// same key (the same-key contention the lockstep harness creates, where every
+// client overwrites one key each step), only the highest-version write needs to
+// reach the B-tree because the older versions are never committed and the
+// hot-value cache already serves the latest. coalesceSets marks the superseded
+// SETs so they are recycled instead of upserted, turning N redundant B-tree
+// writes into one.
+func (e *Engine) drainShardBatch(s int, first *writeReq, sc *drainScratch) {
+	reqs := sc.reqs[:0]
+	reqs = append(reqs, first)
+	for len(reqs) < writeBatchMax {
 		select {
 		case req := <-e.writeChs[s]:
-			e.applyWriteReqDeferred(req)
+			reqs = append(reqs, req)
+			continue
 		default:
-			e.mu.RUnlock()
-			return
 		}
+		break
+	}
+	sc.reqs = reqs
+	e.coalesceSets(sc)
+	e.mu.RLock()
+	for i, req := range reqs {
+		if sc.skip[i] {
+			e.recycleSuperseded(req)
+			continue
+		}
+		e.applyWriteReqDeferred(req)
 	}
 	e.mu.RUnlock()
+}
+
+// coalesceSets fills sc.skip: a SET is superseded (skip = true) when a later SET
+// in the same fn-free run targets the same key with a higher version. fn requests
+// and fences (setKey == nil) are barriers: a read-modify-write closure may depend
+// on the B-tree state a preceding SET to the same key leaves, so coalescing never
+// crosses one, and the dedup map is reset at each barrier. The map is keyed by the
+// stored key and reused across drains, so the recurring hot keys are not
+// re-allocated. Versions decide the winner rather than batch position, because the
+// channel can deliver a higher-version write ahead of a lower-version one when the
+// producing goroutine is preempted between staging and the channel send.
+func (e *Engine) coalesceSets(sc *drainScratch) {
+	reqs := sc.reqs
+	if cap(sc.skip) < len(reqs) {
+		sc.skip = make([]bool, len(reqs))
+	}
+	sc.skip = sc.skip[:len(reqs)]
+	clear(sc.dedup)
+	for i, req := range reqs {
+		sc.skip[i] = false
+		if req.setKey == nil {
+			// fn request or fence: a barrier. Anything staged before it must land
+			// before it runs, so drop the dedup window.
+			clear(sc.dedup)
+			continue
+		}
+		k := string(req.setKey)
+		if j, ok := sc.dedup[k]; ok {
+			if reqs[j].setVer >= req.setVer {
+				// The kept write is newer or equal; this one is superseded.
+				sc.skip[i] = true
+				continue
+			}
+			// This write is newer; supersede the previously kept one.
+			sc.skip[j] = true
+		}
+		sc.dedup[k] = i
+	}
+}
+
+// recycleSuperseded returns a coalesced-away SET request to the async pool without
+// touching the B-tree. The winning write for the key advances the dirty state and
+// owns the write-behind entry, so a superseded request needs no bookkeeping; it is
+// always a fire-and-forget SET (done == nil), since only sendSetAsync produces the
+// setKey requests coalesceSets can skip.
+func (e *Engine) recycleSuperseded(req *writeReq) {
+	req.setKey = nil
+	req.setBody = nil
+	req.fn = nil
+	asyncReqPool.Put(req)
 }
 
 // drainBatch applies the first request and then greedily drains additional
