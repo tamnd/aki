@@ -493,6 +493,17 @@ type session struct {
 	user     *aclUser
 	username string
 
+	// aofBuf holds this connection's AOF records since its last drain flush, and
+	// aofBufDB is the database the most recent buffered record targets (-1 when the
+	// buffer is empty, so the next record always leads with a SELECT). Under a
+	// deferred appendfsync policy a write appends its RESP record here without the
+	// AOF lock, and OnBatchComplete splices the whole buffer into the shared incr
+	// buffer under one lock at the end of the drain. So a pipeline of N writes takes
+	// the AOF lock once, not N times. The always policy bypasses this and appends
+	// inline so a write stays durable before its reply.
+	aofBuf   []byte
+	aofBufDB int
+
 	// inMulti is true between MULTI and EXEC/DISCARD: commands are queued instead
 	// of run. queue holds them in order, and dirtyExec records a queue-time error
 	// (unknown command or bad arity) that makes EXEC abort.
@@ -687,6 +698,7 @@ func (d *Dispatcher) sessionFor(c *networking.Conn) *session {
 		authenticated: def != nil && def.nopass,
 		user:          def,
 		username:      "default",
+		aofBufDB:      -1,
 	}
 	c.SetSession(s)
 	return s

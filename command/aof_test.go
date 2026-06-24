@@ -289,3 +289,68 @@ func readIncrFile(t *testing.T, aofdir string) string {
 	t.Fatalf("no incr file in %s", aofdir)
 	return ""
 }
+
+// TestAOFPipelineBufferedReload sends a batch of writes in one pipelined TCP write,
+// so they share a single drain and take the buffered (session) AOF path, then
+// reloads from the AOF and checks every write replayed. This is the path
+// OnBatchComplete splices in one lock instead of one lock per command.
+func TestAOFPipelineBufferedReload(t *testing.T) {
+	r, c := startData(t)
+	_ = enableAOF(t, r, c)
+	if got := sendLine(t, r, c, "BGREWRITEAOF"); got != "+Background append only file rewriting started" {
+		t.Fatalf("BGREWRITEAOF = %q", got)
+	}
+
+	// One TCP write of several commands: the server drains them together, so they
+	// buffer in the session and flush as one batch.
+	pipe := "SET a 1\r\nSET b 2\r\nSET a 3\r\nINCR n\r\nINCR n\r\nRPUSH l x y z\r\n"
+	if _, err := c.Write([]byte(pipe)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		_ = sendLineRead(t, r) // drain the six replies (and any list payload lines below)
+	}
+
+	if got := sendLine(t, r, c, "DEBUG LOADAOF"); got != "+OK" {
+		t.Fatalf("DEBUG LOADAOF = %q", got)
+	}
+	if got := bulk(t, r, c, "GET a"); got != "3" {
+		t.Fatalf("GET a after reload = %q want 3", got)
+	}
+	if got := bulk(t, r, c, "GET b"); got != "2" {
+		t.Fatalf("GET b after reload = %q want 2", got)
+	}
+	if got := bulk(t, r, c, "GET n"); got != "2" {
+		t.Fatalf("GET n after reload = %q want 2", got)
+	}
+	if got := sendLine(t, r, c, "LLEN l"); got != ":3" {
+		t.Fatalf("LLEN l after reload = %q want :3", got)
+	}
+}
+
+// TestAOFMultiDBBufferedReload writes to two databases over one connection and
+// checks the buffered records carry the right SELECT so each key reloads into the
+// database it was written to. A buffered segment always leads with its own SELECT,
+// so this holds regardless of how drains interleave.
+func TestAOFMultiDBBufferedReload(t *testing.T) {
+	r, c := startData(t)
+	_ = enableAOF(t, r, c)
+	_ = sendLine(t, r, c, "BGREWRITEAOF")
+
+	_ = sendLine(t, r, c, "SELECT 0")
+	_ = sendLine(t, r, c, "SET k indb0")
+	_ = sendLine(t, r, c, "SELECT 1")
+	_ = sendLine(t, r, c, "SET k indb1")
+
+	if got := sendLine(t, r, c, "DEBUG LOADAOF"); got != "+OK" {
+		t.Fatalf("DEBUG LOADAOF = %q", got)
+	}
+	// The connection is on db 1 after the SELECTs above.
+	if got := bulk(t, r, c, "GET k"); got != "indb1" {
+		t.Fatalf("GET k in db1 after reload = %q want indb1", got)
+	}
+	_ = sendLine(t, r, c, "SELECT 0")
+	if got := bulk(t, r, c, "GET k"); got != "indb0" {
+		t.Fatalf("GET k in db0 after reload = %q want indb0", got)
+	}
+}
