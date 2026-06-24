@@ -252,8 +252,19 @@ func (c *Conn) serve() {
 		}
 	}()
 
+	// Resolve the optional batch-complete hook once: it fires after each drained
+	// pipeline so the handler can flush work it coalesced across the batch.
+	batchHandler, _ := c.server.handler.(BatchHandler)
+
 	for {
-		if c.drain() {
+		term := c.drain()
+		// Flush batched work after every drained pipeline, including the final one
+		// before a QUIT or error closes the connection, so no buffered write is
+		// left behind.
+		if batchHandler != nil {
+			batchHandler.OnBatchComplete(c)
+		}
+		if term {
 			return
 		}
 		c.compact()
