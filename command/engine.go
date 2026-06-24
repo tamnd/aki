@@ -1021,10 +1021,18 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 		return false
 	}
 
-	// runSync runs the write under the global update lock. It is the path for
-	// commitAlways, the no-workers case, oversized bodies, and any compute that
-	// asked to fall back. With a syncFn it runs that closure verbatim; otherwise
-	// it rebuilds the write from compute, which is pure given the current value.
+	// runSync runs the write synchronously through the key's own shard worker. It
+	// is the path for commitAlways, the no-workers case, oversized bodies, and any
+	// compute that asked to fall back. With a syncFn it runs that closure verbatim;
+	// otherwise it rebuilds the write from compute, which is pure given the current
+	// value.
+	//
+	// It must route through updateShard (writeChs[ShardOf(key)]), not the global
+	// update channel: the fast path stages and fires its durable write on that same
+	// per-shard channel, so a fallback for the same key has to queue behind those
+	// in-flight async writes on the same worker to see them. The global update
+	// channel is a separate goroutine with no ordering against the per-shard async
+	// writes, which would let a fallback read a stale body and drop a staged update.
 	runSync := func() bool {
 		fn := syncFn
 		if fn == nil {
@@ -1040,7 +1048,7 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 				return db.Set(key, r.body, r.typ, r.enc, r.ttlMs)
 			}
 		}
-		if err := e.update(index, fn); err != nil {
+		if err := e.updateShard(index, key, fn); err != nil {
 			ctx.enc().WriteError("ERR " + err.Error())
 			return false
 		}
