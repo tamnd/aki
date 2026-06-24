@@ -48,7 +48,11 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 		newLen   int64
 	)
 	lim := ctx.encLimits()
-	done := ctx.updateShard(key, func(db *keyspace.DB) error {
+	// sync is the full synchronous closure: it handles every form, the btree-backed
+	// element write, the listpack to quicklist promotion, and the plain blob set. It
+	// is the fallback the write-behind helper runs when the fast path below cannot
+	// stage the result, and the path under commitAlways or with no workers running.
+	sync := func(db *keyspace.DB) error {
 		hdr, found, err := listHeader(db, key)
 		if err != nil {
 			return err
@@ -105,8 +109,44 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 			return listPromote(db, key, elems)
 		}
 		return db.Set(key, newBody, keyspace.TypeList, enc, keepTTL(hdr, found))
-	})
-	if !done {
+	}
+	// compute is the write-behind fast path for the common case: a listpack-form
+	// list (or a fresh key) whose new blob still fits inline. It splices the body
+	// and reports the new value to stage, falling back to sync for the
+	// btree-backed form, a promotion, or a codec error.
+	compute := func(cur []byte, hdr keyspace.ValueHeader, found bool) rmwResult {
+		if found && hdr.Type != keyspace.TypeList {
+			wrongTyp = true
+			return rmwResult{}
+		}
+		if !found && mustExist {
+			absent = true
+			return rmwResult{}
+		}
+		if found && hdr.IsColl() {
+			return rmwResult{fallback: true}
+		}
+		newBody, newCount, err := listBlobPush(cur, vals, head)
+		if err != nil {
+			return rmwResult{fallback: true}
+		}
+		prev := uint8(keyspace.EncListpack)
+		if found {
+			prev = hdr.Encoding
+		}
+		enc, err := listBlobReportedEnc(lim, prev, newCount, vals, func() ([][]byte, error) {
+			return listDecode(newBody)
+		})
+		if err != nil {
+			return rmwResult{fallback: true}
+		}
+		if enc == keyspace.EncQuicklist {
+			return rmwResult{fallback: true}
+		}
+		newLen = int64(newCount)
+		return rmwResult{body: newBody, typ: keyspace.TypeList, enc: enc, ttlMs: keepTTL(hdr, found), write: true}
+	}
+	if !ctx.rmwWriteBehind(key, compute, sync) {
 		return
 	}
 	if wrongTyp {
