@@ -73,7 +73,7 @@ func incrBy(ctx *Ctx, delta int64) {
 		result = sum
 		body := strconv.AppendInt(nil, sum, 10)
 		return rmwResult{body: body, typ: keyspace.TypeString, enc: keyspace.EncInt, ttlMs: keepTTL(hdr, found), write: true}
-	})
+	}, nil)
 	if !done {
 		return
 	}
@@ -129,7 +129,7 @@ func handleIncrByFloat(ctx *Ctx) {
 		result = formatFloat(sum)
 		body := []byte(result)
 		return rmwResult{body: body, typ: keyspace.TypeString, enc: stringEncoding(body), ttlMs: keepTTL(hdr, found), write: true}
-	})
+	}, nil)
 	if !done {
 		return
 	}
