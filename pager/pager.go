@@ -308,26 +308,31 @@ func (p *Pager) Get(pgno uint32) (*Page, error) {
 }
 
 func (p *Pager) getLocked(pgno uint32) (*Page, error) {
-	p.pool.mu.Lock()
+	// Hit path under the read lock: many goroutines can pin resident pages at once,
+	// since get only reads the map and the pin is an atomic add. Eviction and frame
+	// inserts take the write lock, so a frame cannot be dropped while a hit pins it.
+	p.pool.mu.RLock()
 	if pg := p.pool.get(pgno); pg != nil {
-		pg.pins++
-		p.pool.mu.Unlock()
+		pg.pins.Add(1)
+		p.pool.mu.RUnlock()
 		p.cacheHits.Add(1)
 		return pg, nil
 	}
-	p.pool.mu.Unlock()
+	p.pool.mu.RUnlock()
 	p.cacheMisses.Add(1)
 
 	buf, err := p.readRaw(pgno)
 	if err != nil {
 		return nil, err
 	}
-	pg := &Page{No: pgno, Data: buf, ref: true, pins: 1}
+	pg := &Page{No: pgno, Data: buf}
+	pg.ref.Store(true)
+	pg.pins.Store(1)
 
 	p.pool.mu.Lock()
 	// Another goroutine may have loaded it meanwhile; prefer the existing frame.
 	if existing := p.pool.get(pgno); existing != nil {
-		existing.pins++
+		existing.pins.Add(1)
 		p.pool.mu.Unlock()
 		return existing, nil
 	}
@@ -351,13 +356,22 @@ func (p *Pager) maybeEvictLocked() {
 // Unpin releases a pin on pg. If dirty is true the page is marked for write-back
 // at the next Commit.
 func (p *Pager) Unpin(pg *Page, dirty bool) {
-	p.pool.mu.Lock()
-	defer p.pool.mu.Unlock()
+	// Release under the read lock: the dirty flag and the pin count are atomics, so
+	// concurrent Unpins do not need to serialize. The write-back flush and the
+	// eviction sweep both take the write lock, so neither overlaps this release.
+	p.pool.mu.RLock()
+	defer p.pool.mu.RUnlock()
 	if dirty {
-		pg.dirty = true
+		pg.dirty.Store(true)
 	}
-	if pg.pins > 0 {
-		pg.pins--
+	for {
+		n := pg.pins.Load()
+		if n <= 0 {
+			break
+		}
+		if pg.pins.CompareAndSwap(n, n-1) {
+			break
+		}
 	}
 }
 
@@ -379,7 +393,10 @@ func (p *Pager) Allocate() (*Page, error) {
 		pgno = p.meta.PageCount
 		p.meta.PageCount++
 	}
-	pg := &Page{No: pgno, Data: make([]byte, p.pageSize), ref: true, pins: 1, dirty: true}
+	pg := &Page{No: pgno, Data: make([]byte, p.pageSize)}
+	pg.ref.Store(true)
+	pg.pins.Store(1)
+	pg.dirty.Store(true)
 	p.pool.mu.Lock()
 	// A freed-then-reallocated page may still be cached; replace it.
 	if old := p.pool.get(pgno); old != nil {
@@ -401,7 +418,7 @@ func (p *Pager) Free(pgno uint32) error {
 	p.freelist = append(p.freelist, pgno)
 	p.freelistDirty = true
 	p.pool.mu.Lock()
-	if pg := p.pool.frames[pgno]; pg != nil && pg.pins == 0 {
+	if pg := p.pool.frames[pgno]; pg != nil && pg.pins.Load() == 0 {
 		p.pool.drop(pgno)
 	}
 	p.pool.mu.Unlock()
@@ -436,7 +453,7 @@ func (p *Pager) PinnedPages() []uint32 {
 	defer p.pool.mu.Unlock()
 	var out []uint32
 	for pgno, pg := range p.pool.frames {
-		if pg.pins > 0 {
+		if pg.pins.Load() > 0 {
 			out = append(out, pgno)
 		}
 	}
