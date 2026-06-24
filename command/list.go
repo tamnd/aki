@@ -70,30 +70,41 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 				return e
 			})
 		}
-		elems, _, _, err := getList(db, key)
+		// Blob form (or a fresh key): splice the pushed run into the raw body rather
+		// than decoding every element and rebuilding the whole list, so a push
+		// allocates once instead of once per existing element.
+		var body []byte
+		if found {
+			body, _, _, err = db.Get(key)
+			if err != nil {
+				return err
+			}
+		}
+		newBody, newCount, err := listBlobPush(body, vals, head)
 		if err != nil {
 			return err
 		}
-		if head {
-			// LPUSH k a b c leaves [c, b, a, ...]: each element ends up at the
-			// head, so the pushed run is the arguments reversed.
-			next := make([][]byte, 0, len(vals)+len(elems))
-			for i := len(vals) - 1; i >= 0; i-- {
-				next = append(next, vals[i])
-			}
-			elems = append(next, elems...)
-		} else {
-			elems = append(elems, vals...)
-		}
-		newLen = int64(len(elems))
+		newLen = int64(newCount)
 		prev := uint8(keyspace.EncListpack)
 		if found {
 			prev = hdr.Encoding
 		}
-		if listWantsTree(lim, elems, prev) {
+		enc, err := listBlobReportedEnc(lim, prev, newCount, vals, func() ([][]byte, error) {
+			return listDecode(newBody)
+		})
+		if err != nil {
+			return err
+		}
+		// A list that has grown past the listpack threshold moves to the
+		// btree-backed form, the same point Redis flips listpack -> quicklist.
+		if enc == keyspace.EncQuicklist {
+			elems, e := listDecode(newBody)
+			if e != nil {
+				return e
+			}
 			return listPromote(db, key, elems)
 		}
-		return db.Set(key, listEncode(elems), keyspace.TypeList, listEncoding(lim, elems, prev), keepTTL(hdr, found))
+		return db.Set(key, newBody, keyspace.TypeList, enc, keepTTL(hdr, found))
 	})
 	if !done {
 		return

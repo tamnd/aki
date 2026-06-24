@@ -30,6 +30,17 @@ func AppendUvarint(dst []byte, v uint64) []byte {
 	return append(dst, byte(v))
 }
 
+// UvarintLen returns the number of bytes AppendUvarint writes for v, so callers
+// can size a buffer without encoding into it first.
+func UvarintLen(v uint64) int {
+	n := 1
+	for v >= 0x80 {
+		v >>= 7
+		n++
+	}
+	return n
+}
+
 // Uvarint decodes an unsigned LEB128 value from the front of src and returns it
 // with the number of bytes consumed.
 func Uvarint(src []byte) (uint64, int, error) {
