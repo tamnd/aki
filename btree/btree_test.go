@@ -214,3 +214,87 @@ func TestCellTooLarge(t *testing.T) {
 		t.Fatal("expected ErrCellTooLarge for oversized value")
 	}
 }
+
+// TestInPlaceUpsertSameLength checks the cheapest in-place path: replacing a
+// value with one of the same length overwrites the bytes where they sit and
+// returns the old value, without disturbing any other key.
+func TestInPlaceUpsertSameLength(t *testing.T) {
+	tr, _ := newTree(t, 4096)
+	_ = tr.Put([]byte("a"), []byte("111"))
+	_ = tr.Put([]byte("b"), []byte("222"))
+	old, err := tr.Upsert([]byte("a"), []byte("999"))
+	if err != nil || string(old) != "111" {
+		t.Fatalf("Upsert a = old %q err %v want old 111", old, err)
+	}
+	if v, _, _ := tr.Get([]byte("a")); string(v) != "999" {
+		t.Fatalf("a after same-length upsert = %q want 999", v)
+	}
+	if v, _, _ := tr.Get([]byte("b")); string(v) != "222" {
+		t.Fatalf("neighbour b corrupted = %q want 222", v)
+	}
+}
+
+// TestInPlaceUpsertGrowShrink hammers one key with values that grow and shrink,
+// which forces the fresh-cell-in-the-gap path and accumulates dead space until
+// the page falls back to a full re-encode that compacts it. The value must read
+// back correctly the whole way through, and a neighbour key must stay intact.
+func TestInPlaceUpsertGrowShrink(t *testing.T) {
+	tr, _ := newTree(t, 4096)
+	_ = tr.Put([]byte("guard"), []byte("keepme"))
+	for i := range 4000 {
+		val := bytes.Repeat([]byte{byte('a' + i%26)}, 1+i%200)
+		old, err := tr.Upsert([]byte("k"), val)
+		if err != nil {
+			t.Fatalf("Upsert iter %d: %v", i, err)
+		}
+		_ = old
+		got, ok, err := tr.Get([]byte("k"))
+		if err != nil || !ok || !bytes.Equal(got, val) {
+			t.Fatalf("iter %d Get k = %q ok %v err %v want %q", i, got, ok, err, val)
+		}
+		if g, _, _ := tr.Get([]byte("guard")); string(g) != "keepme" {
+			t.Fatalf("iter %d guard corrupted = %q", i, g)
+		}
+	}
+	if err := CheckInvariants(tr); err != nil {
+		t.Fatalf("invariants after grow/shrink: %v", err)
+	}
+}
+
+// TestInPlaceUpsertAgainstOracle drives a mix of inserts and value-changing
+// updates with varied sizes against a Go map oracle. It exercises the new-key
+// insert path, both update paths, and the fallback split path, then checks every
+// key reads back its last written value and the tree stays well formed.
+func TestInPlaceUpsertAgainstOracle(t *testing.T) {
+	tr, _ := newTree(t, 4096)
+	oracle := map[string]string{}
+	// A small, deterministic LCG so the run is reproducible without a seed.
+	rng := uint32(2463534242)
+	next := func() uint32 { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng }
+	for i := range 20000 {
+		key := fmt.Sprintf("key:%04d", next()%1500)
+		val := bytes.Repeat([]byte{byte('A' + int(next())%26)}, int(next())%120)
+		old, err := tr.Upsert([]byte(key), val)
+		if err != nil {
+			t.Fatalf("Upsert iter %d key %q: %v", i, key, err)
+		}
+		prev, had := oracle[key]
+		if had {
+			if string(old) != prev {
+				t.Fatalf("iter %d key %q old = %q want %q", i, key, old, prev)
+			}
+		} else if old != nil {
+			t.Fatalf("iter %d key %q first write returned old %q", i, key, old)
+		}
+		oracle[key] = string(val)
+	}
+	for key, want := range oracle {
+		got, ok, err := tr.Get([]byte(key))
+		if err != nil || !ok || string(got) != want {
+			t.Fatalf("final Get %q = %q ok %v err %v want %q", key, got, ok, err, want)
+		}
+	}
+	if err := CheckInvariants(tr); err != nil {
+		t.Fatalf("invariants after oracle run: %v", err)
+	}
+}
