@@ -827,6 +827,9 @@ func (d *Dispatcher) handleWaitAOF(ctx *Ctx) {
 
 	localAcked := 0
 	if numLocal >= 1 {
+		// Make this connection's own pipelined writes part of what gets synced: they
+		// may still sit in its session buffer if WAITAOF shares a drain with them.
+		d.flushSessionAOF(ctx.sess)
 		if d.forceSyncAOF() {
 			localAcked = 1
 		}

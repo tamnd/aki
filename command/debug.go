@@ -172,6 +172,9 @@ func debugLoadAOF(ctx *Ctx) {
 		ctx.enc().WriteError("ERR No AOF directory found")
 		return
 	}
+	// A write pipelined before DEBUG LOADAOF in the same drain may still sit in this
+	// connection's session buffer; splice it into the incr file so the reload sees it.
+	ctx.d.flushSessionAOF(ctx.sess)
 	if err := ctx.d.loadAOF(); err != nil {
 		ctx.enc().WriteError("ERR Error trying to load the AOF: " + err.Error())
 		return
