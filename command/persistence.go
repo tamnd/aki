@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tamnd/aki/rdb"
@@ -22,35 +23,42 @@ import (
 // out the next number from here.
 const firstSyntheticPID = 10000
 
-// persistState holds the save bookkeeping. Every field is guarded by mu because
-// the background BGSAVE goroutine and the command handlers both touch it.
+// persistState holds the save bookkeeping. Most fields are guarded by mu because
+// the background BGSAVE goroutine and the command handlers both touch it. The two
+// fields read on the write hot path, dirty and lastSaveErr, are atomics so a write
+// does not take mu just to bump the dirty counter or check the save-error gate.
 type persistState struct {
 	mu sync.Mutex
 
-	dirty        int64  // writes since the last successful save
-	lastSaveUnix int64  // unix seconds of the last successful save, 0 if never
-	saves        int64  // total successful SAVE and BGSAVE operations
-	inProgress   bool   // a BGSAVE is running
-	lastStatus   string // "ok" or "err", empty before the first save
+	dirty        atomic.Int64 // writes since the last successful save
+	lastSaveUnix int64        // unix seconds of the last successful save, 0 if never
+	saves        int64        // total successful SAVE and BGSAVE operations
+	inProgress   bool         // a BGSAVE is running
+	lastStatus   string       // "ok" or "err", empty before the first save
+	lastSaveErr  atomic.Bool  // mirrors lastStatus == "err" for the write gate
 	lastTimeSec  float64
 	curStartUnix int64 // unix seconds the current BGSAVE began, 0 if none
 	nextPID      int
 }
 
 // markDirty records one write since the last save. The save-point check reads the
-// counter to decide whether an automatic BGSAVE is due.
+// counter to decide whether an automatic BGSAVE is due. It runs on every write, so
+// it bumps an atomic rather than taking mu.
 func (p *persistState) markDirty() {
-	p.mu.Lock()
-	p.dirty++
-	p.mu.Unlock()
+	p.dirty.Add(1)
 }
 
 // dirtyCount reads the current dirty counter. The AOF propagation hook compares
 // it before and after a write to tell whether the dataset actually changed.
 func (p *persistState) dirtyCount() int64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.dirty
+	return p.dirty.Load()
+}
+
+// setLastStatus records the last save outcome, keeping the lock-free error mirror
+// read by the write gate in step with the lastStatus string. Callers hold mu.
+func (p *persistState) setLastStatus(status string) {
+	p.lastStatus = status
+	p.lastSaveErr.Store(status == "err")
 }
 
 // beginSave marks a save as started and returns false if one is already running.
@@ -69,7 +77,7 @@ func (p *persistState) beginSave() (started bool, dirtyAtStart int64, pid int) {
 	}
 	pid = p.nextPID
 	p.nextPID++
-	return true, p.dirty, pid
+	return true, p.dirty.Load(), pid
 }
 
 // finishSave records the outcome of a save and clears the in-progress flag.
@@ -80,15 +88,23 @@ func (p *persistState) finishSave(ok bool, dirtyAtStart int64, elapsed time.Dura
 	p.curStartUnix = 0
 	p.lastTimeSec = elapsed.Seconds()
 	if ok {
-		p.lastStatus = "ok"
-		p.dirty -= dirtyAtStart
-		if p.dirty < 0 {
-			p.dirty = 0
+		p.setLastStatus("ok")
+		// Subtract atomically so a concurrent markDirty (which no longer takes mu)
+		// is not lost, and clamp at zero the way the old guarded subtract did.
+		for {
+			cur := p.dirty.Load()
+			next := cur - dirtyAtStart
+			if next < 0 {
+				next = 0
+			}
+			if p.dirty.CompareAndSwap(cur, next) {
+				break
+			}
 		}
 		p.lastSaveUnix = time.Now().Unix()
 		p.saves++
 	} else {
-		p.lastStatus = "err"
+		p.setLastStatus("err")
 	}
 }
 
@@ -283,7 +299,7 @@ func (d *Dispatcher) checkSavePoints() {
 		d.persist.mu.Unlock()
 		return
 	}
-	dirty := d.persist.dirty
+	dirty := d.persist.dirty.Load()
 	last := d.persist.lastSaveUnix
 	d.persist.mu.Unlock()
 
@@ -318,10 +334,9 @@ func (d *Dispatcher) writesBlockedByBgsaveError() bool {
 	if len(parseSavePoints(confValue(d.conf, "save", ""))) == 0 {
 		return false
 	}
-	d.persist.mu.Lock()
-	status := d.persist.lastStatus
-	d.persist.mu.Unlock()
-	return status == "err"
+	// Runs on every write, so it reads the atomic mirror of lastStatus rather than
+	// taking the persist lock.
+	return d.persist.lastSaveErr.Load()
 }
 
 // savePoint is one "save <seconds> <changes>" rule.
