@@ -499,6 +499,35 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 	if existed {
 		prev, _, _ = parseHeader(prevCell)
 	}
+
+	// Version guard: never let a reordered older write win in the B-tree. Two
+	// concurrent same-key blind SETs can reach the shard worker in version-
+	// reversed order, because the blind SET path takes no per-key lock between
+	// NextVersion and the async send. The hot cache (cput) and wbPending are
+	// version-guarded already; the B-tree is the last sink, and without this
+	// guard an older apply that lands after a newer one would leave a stale value
+	// that a read sees once the newer value is evicted from the hot cache. When
+	// the cell we just overwrote was strictly newer, restore it and undo this
+	// losing write's side effects. The previous version is already parsed above,
+	// so the common monotonic write pays only this comparison.
+	if existed && prev.Version > version {
+		restore := append([]byte(nil), prevCell...)
+		if _, rerr := t.Upsert(ck, restore); rerr != nil {
+			return rerr
+		}
+		db.shards[s].rootPage = t.Root()
+		// Free any overflow pages this losing write allocated for its own body.
+		if h.Flags&FlagInlineBody == 0 && h.BodyRef != 0 {
+			if ferr := db.ks.freeOverflow(uint32(h.BodyRef)); ferr != nil {
+				return ferr
+			}
+		}
+		if preVersion > 0 {
+			db.removeWBPending(string(key), preVersion)
+		}
+		return nil
+	}
+
 	isNew := !existed
 	hadTTL := existed && prev.HasTTL()
 
@@ -567,7 +596,17 @@ func (db *DB) PrepareWriteBehind(key, body []byte, hdr ValueHeader) {
 	if db.shards[s].wbPending == nil {
 		db.shards[s].wbPending = make(map[string]wbPendingEntry, 16)
 	}
-	_, alreadyPending := db.shards[s].wbPending[sk]
+	existing, alreadyPending := db.shards[s].wbPending[sk]
+	if alreadyPending && existing.hdr.Version > hdr.Version {
+		// A strictly newer write is already staged. This is a reordered older
+		// write (two concurrent same-key blind SETs can stage out of version
+		// order, since the blind SET path takes no per-key lock between
+		// NextVersion and staging). Dropping it keeps wbPending from regressing
+		// to the older value; cput above is already version-guarded, and the
+		// uncertain-count needs no change because the key is already pending.
+		db.shards[s].wbMu.Unlock()
+		return
+	}
 	db.shards[s].wbPending[sk] = wbPendingEntry{body: body, hdr: hdr}
 	if !alreadyPending {
 		// Key newly entered wbPending. We don't yet know if it is a new key
