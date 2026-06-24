@@ -24,7 +24,7 @@ func TestWritesBlockedByBgsaveError(t *testing.T) {
 	}
 
 	// A failed save with the default flag and save points closes the gate.
-	d.persist.lastStatus = "err"
+	d.persist.setLastStatus("err")
 	if !d.writesBlockedByBgsaveError() {
 		t.Fatal("gate should be closed after a failed save")
 	}
@@ -44,7 +44,7 @@ func TestWritesBlockedByBgsaveError(t *testing.T) {
 	d.conf.set("save", "3600 1")
 
 	// A later successful save flips the status back and reopens the gate.
-	d.persist.lastStatus = "ok"
+	d.persist.setLastStatus("ok")
 	if d.writesBlockedByBgsaveError() {
 		t.Fatal("gate should be open after a successful save")
 	}
@@ -101,7 +101,7 @@ func TestStopWritesOnBgsaveErrorGate(t *testing.T) {
 
 	// Simulate the state left by a failed background save.
 	d.persist.mu.Lock()
-	d.persist.lastStatus = "err"
+	d.persist.setLastStatus("err")
 	d.persist.mu.Unlock()
 
 	got := sendLine(t, r, c, "SET k v2")
@@ -117,7 +117,7 @@ func TestStopWritesOnBgsaveErrorGate(t *testing.T) {
 
 	// A later successful save clears the failure and writes resume.
 	d.persist.mu.Lock()
-	d.persist.lastStatus = "ok"
+	d.persist.setLastStatus("ok")
 	d.persist.mu.Unlock()
 	if got := sendLine(t, r, c, "SET k v3"); got != "+OK" {
 		t.Fatalf("SET after recovery = %q", got)
