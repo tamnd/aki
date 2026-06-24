@@ -15,6 +15,7 @@ func TestAOFTimestampAnnotated(t *testing.T) {
 	}
 
 	writeAOF(d)
+	d.FlushAOF() // records are buffered until flushed; the serve loop does this per drain
 
 	d.aof.mu.Lock()
 	path := d.aof.incrPath
@@ -41,6 +42,7 @@ func TestAOFTimestampOffByDefault(t *testing.T) {
 	d := aofDispatcherForFsync(t)
 
 	writeAOF(d)
+	d.FlushAOF() // records are buffered until flushed; the serve loop does this per drain
 
 	d.aof.mu.Lock()
 	path := d.aof.incrPath
@@ -48,6 +50,9 @@ func TestAOFTimestampOffByDefault(t *testing.T) {
 	blob, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read incr file: %v", err)
+	}
+	if !strings.Contains(string(blob), "SET") {
+		t.Fatalf("incr file is missing the command: %q", string(blob))
 	}
 	if strings.Contains(string(blob), "#TS:") {
 		t.Fatalf("annotation present with the directive off: %q", string(blob))
