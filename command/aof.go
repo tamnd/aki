@@ -343,6 +343,70 @@ func (d *Dispatcher) appendAOF(db int, argv [][]byte) {
 	}
 }
 
+// bufferAOFRecord appends one command's AOF record to the connection's own buffer
+// without taking the AOF lock. It mirrors appendAOF's encoding (an optional #TS
+// timestamp, a SELECT when the database changed, then the command) but writes into
+// sess.aofBuf instead of the shared incr buffer. spliceSessionAOFLocked later
+// moves the whole buffer into the shared buffer under one lock, so a pipeline of N
+// writes contends for the AOF lock once instead of N times.
+//
+// Each freshly emptied buffer starts with sess.aofBufDB == -1, so its first record
+// always leads with a SELECT. That makes every spliced segment self-describing:
+// it sets its own database regardless of what the previous connection's segment
+// left selected, which is what keeps interleaved multi-connection writes replaying
+// into the right databases. The cost is one redundant SELECT per drain, negligible
+// against a pipeline and absent from the common single-drain-per-command path only
+// in that it adds bytes, never wrong ones.
+//
+// Caller must use this only for online connections under a deferred policy: the
+// flush happens in OnBatchComplete, which a script or replay connection never
+// reaches, and the always policy must stay durable before its reply.
+func (d *Dispatcher) bufferAOFRecord(sess *session, db int, argv [][]byte) {
+	if d.confBool("aof-timestamp-enabled", false) {
+		sess.aofBuf = append(sess.aofBuf, "#TS:"...)
+		sess.aofBuf = strconv.AppendInt(sess.aofBuf, time.Now().UnixMilli(), 10)
+		sess.aofBuf = append(sess.aofBuf, '\r', '\n')
+	}
+	if db != sess.aofBufDB {
+		sess.aofBuf = appendRESPCommand(sess.aofBuf, [][]byte{[]byte("SELECT"), []byte(strconv.Itoa(db))})
+		sess.aofBufDB = db
+	}
+	sess.aofBuf = appendRESPCommand(sess.aofBuf, argv)
+}
+
+// spliceSessionAOFLocked moves a connection's buffered AOF records into the shared
+// incr buffer and resets the connection buffer. The caller holds d.aof.mu. It sets
+// the shared lastSelectedDB to the segment's final database, so a later inline
+// appendAOF on the same database skips a redundant SELECT, and advances writeSeq so
+// the everysec cron treats the spliced records as unsynced and fsyncs them.
+func (d *Dispatcher) spliceSessionAOFLocked(sess *session) {
+	if sess == nil || len(sess.aofBuf) == 0 || d.aof.incrFile == nil || d.aof.loading {
+		// Drop the buffer when there is no live incr file (AOF off or loading): the
+		// records have no destination and must not survive into a later session.
+		if sess != nil {
+			sess.aofBuf = sess.aofBuf[:0]
+			sess.aofBufDB = -1
+		}
+		return
+	}
+	d.aof.incrBuf = append(d.aof.incrBuf, sess.aofBuf...)
+	d.aof.lastSelectedDB = sess.aofBufDB
+	d.aof.pendingSync = true
+	d.aof.writeSeq++
+	sess.aofBuf = sess.aofBuf[:0]
+	sess.aofBufDB = -1
+}
+
+// flushSessionAOF splices a connection's buffered records into the shared buffer
+// and leaves the shared buffer ready for the next sync. Commands that must observe
+// their own connection's earlier pipelined writes as durable (WAITAOF, DEBUG
+// LOADAOF) call it before they read or sync the incr file. It takes the AOF lock.
+func (d *Dispatcher) flushSessionAOF(sess *session) {
+	d.aof.mu.Lock()
+	d.spliceSessionAOFLocked(sess)
+	d.aof.mu.Unlock()
+}
+
 // flushIncrLocked writes the buffered AOF records to the incr file in a single
 // syscall and clears the buffer. The caller holds d.aof.mu. It is the only point
 // where buffered records reach the OS, so every fsync and close path calls it
@@ -376,8 +440,17 @@ func (d *Dispatcher) FlushAOF() {
 }
 
 // OnBatchComplete satisfies networking.BatchHandler. It runs once per connection
-// after a pipeline batch is drained and flushes the AOF write buffer.
-func (d *Dispatcher) OnBatchComplete(_ *networking.Conn) { d.FlushAOF() }
+// after a pipeline batch is drained: it splices the connection's buffered AOF
+// records into the shared incr buffer and writes the buffer to the incr file, both
+// under a single AOF lock. So a pipeline of N writes pays one lock acquisition and
+// one write() syscall here instead of one per command.
+func (d *Dispatcher) OnBatchComplete(c *networking.Conn) {
+	sess, _ := c.Session().(*session)
+	d.aof.mu.Lock()
+	d.spliceSessionAOFLocked(sess)
+	d.flushIncrLocked()
+	d.aof.mu.Unlock()
+}
 
 // The serve loop calls OnBatchComplete through this interface, so a mismatch must
 // fail the build rather than silently fall back to cron-only flushing.
