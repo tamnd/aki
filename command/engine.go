@@ -151,6 +151,14 @@ type Engine struct {
 	// by one goroutine, so there is zero channel contention between shards.
 	// Deferred single-key writes route here by ShardOf(key).
 	writeChs [keyspace.NumShards]chan *writeReq
+	// rmwLocks serialize write-behind read-modify-write ops per shard. A blind
+	// SET can stage and fire its durable write without reading, but an RMW
+	// (INCR, LPUSH, SADD, HSET, ZADD) computes its reply from the current value,
+	// so two same-key RMW writers must serialize or one loses its update. The
+	// connection goroutine holds rmwLocks[ShardOf(key)] across the read, compute
+	// and stage, then fires the async B-tree write and releases it. The shard
+	// worker never takes this lock, so the async apply cannot deadlock against it.
+	rmwLocks [keyspace.NumShards]sync.Mutex
 	// workerStop is closed by StopWorker to signal all write goroutines to drain
 	// and exit. workerDone is closed once every goroutine has exited.
 	workerStop chan struct{}
@@ -944,6 +952,128 @@ func (ctx *Ctx) updateWriteBehind(key, body []byte, typ, enc uint8, ttlMs int64)
 	// writeReq struct so no closure allocation is needed on this hot path.
 	shard := keyspace.ShardOf(key)
 	if asyncErr := e.sendSetAsync(ctx.Conn.DB(), shard, key, body, typ, enc, ttlMs, version); asyncErr != nil {
+		ctx.enc().WriteError("ERR " + asyncErr.Error())
+		return false
+	}
+	ctx.d.persist.markDirty()
+	return true
+}
+
+// rmwResult is what an rmwWriteBehind compute closure produces: the new whole
+// body to store and its header fields, or write=false to leave the key
+// unchanged (the handler has already decided its own reply, for instance a wrong
+// type or overflow error). body must be heap-owned and must not alias the
+// connection read buffer, because the durable write runs asynchronously.
+type rmwResult struct {
+	body  []byte
+	typ   uint8
+	enc   uint8
+	ttlMs int64
+	write bool
+}
+
+// rmwWriteBehind runs a whole-body read-modify-write for key with the durable
+// B-tree write deferred to the async write-behind path, the read-modify-write
+// analogue of updateWriteBehind. It is the fast path for INCR, LPUSH, SADD,
+// HSET and ZADD in their small whole-body form: the reply depends on the current
+// value, so it cannot blind-write like SET, but it need not block the reply on
+// the B-tree either.
+//
+// compute receives the current body, header and presence (body is nil when the
+// key is absent) and returns the new value to store. It runs exactly once under
+// rmwLocks[ShardOf(key)], which serializes same-key RMW writers so no update is
+// lost. After compute the new body is staged in the hot cache with a fresh
+// version and the durable write is fired asynchronously, mirroring SET.
+//
+// Returns false only when an engine error has already been written to the wire.
+// A compute that declines to write (write=false) still returns true; the caller
+// inspects its own captured state to write the reply.
+//
+// Fallbacks match the SET fast path: when the policy is not deferred (or no
+// workers run) the whole RMW runs synchronously under the global update lock,
+// and a body larger than keyspace.MaxInlineBody also falls back to synchronous,
+// because the inline write-behind path only handles inline-sized bodies.
+func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace.ValueHeader, found bool) rmwResult) bool {
+	if ctx.d.engine == nil {
+		ctx.enc().WriteError("ERR this server has no keyspace")
+		return false
+	}
+	e := ctx.d.engine
+	index := ctx.Conn.DB()
+	db, dbErr := e.ks.DB(index)
+	if dbErr != nil {
+		ctx.enc().WriteError("ERR " + dbErr.Error())
+		return false
+	}
+
+	// runSync re-reads, recomputes and stores under the global update lock. It is
+	// the path for commitAlways, the no-workers case, and oversized bodies.
+	// compute is pure given the current value, so re-running it is safe.
+	runSync := func() bool {
+		if err := e.update(index, func(db *keyspace.DB) error {
+			cur, hdr, found, err := db.Get(key)
+			if err != nil {
+				return err
+			}
+			r := compute(cur, hdr, found)
+			if !r.write {
+				return nil
+			}
+			return db.Set(key, r.body, r.typ, r.enc, r.ttlMs)
+		}); err != nil {
+			ctx.enc().WriteError("ERR " + err.Error())
+			return false
+		}
+		ctx.d.persist.markDirty()
+		ctx.fireExpired()
+		return true
+	}
+
+	if !e.isDeferred() {
+		return runSync()
+	}
+
+	shard := keyspace.ShardOf(key)
+	e.rmwLocks[shard].Lock()
+	cur, hdr, found, err := db.Get(key)
+	if err != nil {
+		e.rmwLocks[shard].Unlock()
+		ctx.enc().WriteError("ERR " + err.Error())
+		return false
+	}
+	r := compute(cur, hdr, found)
+	if !r.write {
+		e.rmwLocks[shard].Unlock()
+		return true
+	}
+	if len(r.body) > keyspace.MaxInlineBody {
+		// An inline write-behind cell cannot hold an over-size body; the durable
+		// write needs the overflow path, so drop to the synchronous route.
+		e.rmwLocks[shard].Unlock()
+		return runSync()
+	}
+	// The staged and async writes outlive this command, so the key must be a
+	// heap-owned copy rather than a slice of the connection read buffer. compute's
+	// body is already a fresh allocation. Only this path allocates; the error and
+	// no-write paths above do not.
+	keyCopy := append([]byte(nil), key...)
+	version := e.ks.NextVersion()
+	nhdr := keyspace.ValueHeader{
+		Type:     r.typ,
+		Encoding: r.enc,
+		TTLms:    r.ttlMs,
+		Version:  version,
+		BodyLen:  uint32(len(r.body)),
+		RefCount: 1,
+		Flags:    keyspace.FlagInlineBody,
+	}
+	if r.ttlMs >= 0 {
+		nhdr.Flags |= keyspace.FlagHasTTL
+	}
+	db.PrepareWriteBehind(keyCopy, r.body, nhdr)
+	asyncErr := e.sendSetAsync(index, shard, keyCopy, r.body, r.typ, r.enc, r.ttlMs, version)
+	e.rmwLocks[shard].Unlock()
+	if asyncErr != nil {
 		ctx.enc().WriteError("ERR " + asyncErr.Error())
 		return false
 	}
