@@ -41,6 +41,17 @@ type aofState struct {
 	pendingSync bool      // bytes written since the last fsync, drives everysec
 	lastSync    time.Time // time of the last incr-file fsync
 
+	// Group-commit bookkeeping for the always policy. writeSeq is bumped under mu
+	// for every appended record; syncedSeq is the highest seq a completed fsync has
+	// made durable. While syncing is true one goroutine is inside fsync with mu
+	// released, and the others wait on syncCond. A single fsync makes every record
+	// written before it began durable, so N concurrent writers share one fsync
+	// instead of paying one each. syncCond is created lazily under mu.
+	writeSeq  uint64
+	syncedSeq uint64
+	syncing   bool
+	syncCond  *sync.Cond
+
 	loading bool // true while replaying the AOF, suppresses re-propagation
 }
 
@@ -297,16 +308,55 @@ func (d *Dispatcher) appendAOF(db int, argv [][]byte) {
 	d.aof.incrSize += int64(n)
 	d.aof.lastWriteStatus = "ok"
 	d.aof.pendingSync = true
+	d.aof.writeSeq++
+	mySeq := d.aof.writeSeq
 	// The always policy makes every write durable before the reply, so fsync the
-	// incr file inline. The everysec policy defers to syncAOFCron and the no policy
-	// leaves it to the OS, so both only mark the write pending here.
+	// incr file before returning. Rather than one fsync per command, concurrent
+	// writers group-commit: a single fsync covers every record written before it
+	// began, so a burst of writers shares one fsync. The everysec policy defers to
+	// syncAOFCron and the no policy leaves it to the OS, so both only mark the
+	// write pending here.
 	if d.aofFsyncPolicy() == "always" && !d.aofSyncBlockedByRewrite() {
-		if err := d.aof.incrFile.Sync(); err != nil {
+		d.groupSyncLocked(mySeq)
+	}
+}
+
+// groupSyncLocked blocks until the incr file has been fsynced through at least
+// seq, coalescing concurrent callers. While one goroutine performs the fsync with
+// the mutex released, the others wait on syncCond; the fsync makes every record
+// written before it began (writeSeq at its start) durable, so they all return
+// together. Caller holds d.aof.mu and it is still held on return.
+func (d *Dispatcher) groupSyncLocked(seq uint64) {
+	if d.aof.syncCond == nil {
+		d.aof.syncCond = sync.NewCond(&d.aof.mu)
+	}
+	for d.aof.syncedSeq < seq {
+		if d.aof.syncing {
+			d.aof.syncCond.Wait()
+			continue
+		}
+		// Become the syncer for everything written so far.
+		d.aof.syncing = true
+		target := d.aof.writeSeq
+		f := d.aof.incrFile
+		d.aof.mu.Unlock()
+		serr := f.Sync()
+		d.aof.mu.Lock()
+		d.aof.syncing = false
+		if serr != nil {
 			d.aof.lastWriteStatus = "err"
+			// A failed fsync did not advance durability. Wake the waiters so one of
+			// them retries as syncer rather than blocking forever, and give up this
+			// caller's wait: its write is not durable and lastWriteStatus records it.
+			d.aof.syncCond.Broadcast()
 			return
 		}
-		d.aof.pendingSync = false
+		if target > d.aof.syncedSeq {
+			d.aof.syncedSeq = target
+		}
+		d.aof.pendingSync = d.aof.writeSeq > d.aof.syncedSeq
 		d.aof.lastSync = time.Now()
+		d.aof.syncCond.Broadcast()
 	}
 }
 
@@ -346,6 +396,7 @@ func (d *Dispatcher) syncAOFCron() {
 		return
 	}
 	d.aof.pendingSync = false
+	d.aof.syncedSeq = d.aof.writeSeq
 	d.aof.lastSync = now
 }
 
@@ -546,6 +597,7 @@ func (d *Dispatcher) forceSyncAOF() bool {
 		return false
 	}
 	d.aof.pendingSync = false
+	d.aof.syncedSeq = d.aof.writeSeq
 	d.aof.lastSync = time.Now()
 	return true
 }
