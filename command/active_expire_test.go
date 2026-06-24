@@ -120,9 +120,15 @@ func TestStartBackgroundExpiresKeys(t *testing.T) {
 	d.conf.set("hz", "100")
 	// Use appendfsync always so SET writes directly to the B-tree without
 	// going through write-behind. This keeps the test from depending on
-	// shard-worker scheduling speed under the race detector.
+	// shard-worker scheduling speed under the race detector. Setting the
+	// directive is not enough on its own: the engine commit policy only tracks
+	// it through applyCommitPolicy, which the command path calls on CONFIG SET.
+	// Without this the engine stays on the everysec write-behind policy and the
+	// key sits in the pending table, which made the cycle reclaim it only after
+	// a worker flush and turned this test flaky on slow runners.
 	d.conf.set("appendfsync", "always")
 	d.StartBackground()
+	d.applyCommitPolicy()
 	t.Cleanup(d.StopBackground)
 	if got := sendLine(t, r1, c1, "SET k v PX 1"); got != "+OK" {
 		t.Fatalf("SET = %q", got)
