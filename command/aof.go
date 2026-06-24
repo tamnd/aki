@@ -98,12 +98,10 @@ func handleBgrewriteaof(ctx *Ctx) {
 	ctx.enc().WriteStatus("Background append only file rewriting started")
 }
 
-// aofEnabled reports whether appendonly is configured on.
+// aofEnabled reports whether appendonly is configured on. It reads the config
+// store's atomic mirror, so this stays lock-free on the per-command write path.
 func (d *Dispatcher) aofEnabled() bool {
-	if d.conf == nil {
-		return false
-	}
-	return confValue(d.conf, "appendonly", "no") == "yes"
+	return d.conf != nil && d.conf.appendOnly()
 }
 
 // aofDir returns the appendonlydir path under the data directory.
@@ -496,9 +494,13 @@ func (d *Dispatcher) groupSyncLocked(seq uint64) {
 }
 
 // aofFsyncPolicy returns the configured appendfsync policy, one of "always",
-// "everysec", or "no".
+// "everysec", or "no". It reads the config store's atomic mirror, so the
+// per-command write path that consults the policy stays lock-free.
 func (d *Dispatcher) aofFsyncPolicy() string {
-	return confValue(d.conf, "appendfsync", "everysec")
+	if d.conf == nil {
+		return "everysec"
+	}
+	return d.conf.fsyncPolicy()
 }
 
 // aofSyncBlockedByRewrite reports whether a background fsync should be held off

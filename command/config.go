@@ -38,12 +38,44 @@ type directive struct {
 
 // configStore holds the live value of every known directive. It is shared across
 // connection goroutines, so every access takes the lock.
+//
+// A handful of directives are read on the per-command hot path (appendonly and
+// appendfsync, on every write). Taking the RWMutex for those reads showed up as
+// the top contended atomic in the post-E6 profile, so the store mirrors them into
+// atomics that set() keeps current. The hot readers load the atomic and never
+// touch the map lock; the map stays the source of truth for CONFIG GET and the
+// cold directives.
 type configStore struct {
 	mu    sync.RWMutex
 	defs  map[string]*directive
 	order []string // directive names in registration order
 	vals  map[string]string
 	alias map[string]string // each alias name to its twin, both directions
+
+	aofOn    atomic.Bool  // mirrors appendonly == "yes"
+	aofFsync atomic.Int32 // mirrors appendfsync, one of the fsync* codes
+	maxmem   atomic.Int64 // mirrors maxmemory in bytes, read on every denyoom write
+}
+
+// fsync policy codes mirror the appendfsync directive. everysec is zero so the
+// store's zero value matches the directive default.
+const (
+	fsyncEverysec int32 = iota
+	fsyncAlways
+	fsyncNo
+)
+
+// fsyncCode maps a canonical appendfsync value to its code. An unrecognized value
+// falls back to everysec, the directive default.
+func fsyncCode(v string) int32 {
+	switch v {
+	case "always":
+		return fsyncAlways
+	case "no":
+		return fsyncNo
+	default:
+		return fsyncEverysec
+	}
 }
 
 // newConfigStore builds the store seeded with defaults. The dispatcher overrides
@@ -63,6 +95,11 @@ func newConfigStore() *configStore {
 	for _, p := range configAliasPairs() {
 		cs.alias[p[0]] = p[1]
 		cs.alias[p[1]] = p[0]
+	}
+	cs.aofOn.Store(cs.vals["appendonly"] == "yes")
+	cs.aofFsync.Store(fsyncCode(cs.vals["appendfsync"]))
+	if n, err := strconv.ParseInt(cs.vals["maxmemory"], 10, 64); err == nil {
+		cs.maxmem.Store(n)
 	}
 	return cs
 }
@@ -85,11 +122,51 @@ func configAliasPairs() [][2]string {
 	}
 }
 
-// set writes a value already known to be valid and canonical.
+// set writes a value already known to be valid and canonical. The two hot-path
+// directives also refresh their atomic mirror so the per-command readers stay
+// lock-free.
 func (cs *configStore) set(name, val string) {
 	cs.mu.Lock()
 	cs.vals[name] = val
 	cs.mu.Unlock()
+	cs.mirror(name, val)
+}
+
+// mirror refreshes the atomic copy of a hot-path directive after its map value
+// changes. It is a no-op for every directive that is not mirrored. CONFIG SET
+// writes the map directly, so it calls this too.
+func (cs *configStore) mirror(name, val string) {
+	switch name {
+	case "appendonly":
+		cs.aofOn.Store(val == "yes")
+	case "appendfsync":
+		cs.aofFsync.Store(fsyncCode(val))
+	case "maxmemory":
+		if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+			cs.maxmem.Store(n)
+		}
+	}
+}
+
+// maxMemory returns the configured maxmemory limit in bytes from the atomic
+// mirror, 0 when no limit is set. The eviction guard reads it on every denyoom
+// write, so it stays lock-free.
+func (cs *configStore) maxMemory() int64 { return cs.maxmem.Load() }
+
+// appendOnly reports whether appendonly is on, reading the atomic mirror so the
+// per-command write path never takes the config lock.
+func (cs *configStore) appendOnly() bool { return cs.aofOn.Load() }
+
+// fsyncPolicy returns the canonical appendfsync value from the atomic mirror.
+func (cs *configStore) fsyncPolicy() string {
+	switch cs.aofFsync.Load() {
+	case fsyncAlways:
+		return "always"
+	case fsyncNo:
+		return "no"
+	default:
+		return "everysec"
+	}
 }
 
 // get returns the current value of a directive. The second result is false when
@@ -603,6 +680,9 @@ func handleConfigSet(ctx *Ctx) {
 		}
 	}
 	cs.mu.Unlock()
+	for _, c := range changes {
+		cs.mirror(c.name, c.val)
+	}
 	// The notification write path reads the flags atomically, so mirror any change
 	// to notify-keyspace-events into the dispatcher's atomic copy.
 	for _, c := range changes {
