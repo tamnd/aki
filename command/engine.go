@@ -274,25 +274,21 @@ func (e *Engine) drainShardBatch(s int, first *writeReq) {
 // drainBatch applies the first request and then greedily drains additional
 // requests from writeCh, up to writeBatchMax, under one lock hold.
 //
-// Under commitAlways, it takes e.mu.Lock so each write can checkpoint inside
-// applyWriteReq. Under deferred policies (commitEverySec, commitNo) it takes
-// e.mu.RLock, which lets concurrent workers apply writes to different shards in
-// parallel while still blocking commits (which take e.mu.Lock) from running
-// mid-batch. Dirty state is recorded atomically; the commit cron flushes it.
+// Under commitAlways, it group-commits: it applies every request in the drained
+// batch and then checkpoints exactly once for the whole batch, so N queued writes
+// pay one fsync instead of N. The durability contract still holds because no
+// reply is signalled until that single commit has made every write in the batch
+// durable. Under load the batch fills on its own: while the worker is inside one
+// checkpoint, the other connections' writes queue, so the next drain pays one
+// fsync for all of them.
+//
+// Under deferred policies (commitEverySec, commitNo) it takes e.mu.RLock, which
+// lets concurrent workers apply writes to different shards in parallel while still
+// blocking commits (which take e.mu.Lock) from running mid-batch. Dirty state is
+// recorded atomically; the commit cron flushes it.
 func (e *Engine) drainBatch(first *writeReq) {
 	if commitPolicy(e.policy.Load()) == commitAlways {
-		e.mu.Lock()
-		e.applyWriteReq(first)
-		for i := 1; i < writeBatchMax; i++ {
-			select {
-			case req := <-e.writeCh:
-				e.applyWriteReq(req)
-			default:
-				e.mu.Unlock()
-				return
-			}
-		}
-		e.mu.Unlock()
+		e.drainBatchAlways(first)
 		return
 	}
 	// Deferred policy: RLock allows concurrent shard writers.
@@ -308,6 +304,101 @@ func (e *Engine) drainBatch(first *writeReq) {
 		}
 	}
 	e.mu.RUnlock()
+}
+
+// groupCommitWindow is how long the commitAlways worker waits, after draining
+// everything already queued, for more concurrent writers to join the group before
+// it pays a single checkpoint. A checkpoint is far heavier than this wait, so
+// coalescing N writers into one fsync is a large net win. The wait is lock-free
+// (the engine lock is taken only to apply and commit the gathered batch), so a
+// reader is never blocked by the window. Single-client latency rises by at most
+// this window, which is negligible against the checkpoint it amortises.
+const groupCommitWindow = 300 * time.Microsecond
+
+// drainBatchAlways group-commits a batch of commitAlways writes. It first gathers
+// requests without holding the engine lock: everything already queued, then any
+// that arrive within groupCommitWindow. It then takes e.mu.Lock once, applies the
+// whole batch, checkpoints exactly once, releases the lock, and finally signals
+// each request. So N concurrent writers pay one fsync, not N. The durability
+// contract holds because no reply is signalled until the single commit has made
+// every write in the batch durable. A request whose own apply failed reports that
+// error; the rest report the shared commit result.
+func (e *Engine) drainBatchAlways(first *writeReq) {
+	var reqs [writeBatchMax]*writeReq
+	reqs[0] = first
+	n := 1
+
+	// Immediate drain: take everything already in the queue.
+	drained := false
+	for n < writeBatchMax && !drained {
+		select {
+		case req := <-e.writeCh:
+			reqs[n] = req
+			n++
+		default:
+			drained = true
+		}
+	}
+	// Coalescing window: let stragglers from the just-woken connections rejoin
+	// the group before we commit. Lock-free so reads run unblocked meanwhile.
+	if n < writeBatchMax {
+		timer := time.NewTimer(groupCommitWindow)
+		expired := false
+		for n < writeBatchMax && !expired {
+			select {
+			case req := <-e.writeCh:
+				reqs[n] = req
+				n++
+			case <-timer.C:
+				expired = true
+			}
+		}
+		timer.Stop()
+	}
+
+	// Apply the whole batch and commit once, under a single lock hold.
+	var errs [writeBatchMax]error
+	e.mu.Lock()
+	for i := 0; i < n; i++ {
+		errs[i] = e.applyOnly(reqs[i])
+	}
+	cerr := e.commit()
+	e.mu.Unlock()
+
+	for i := 0; i < n; i++ {
+		req := reqs[i]
+		err := errs[i]
+		if err == nil {
+			err = cerr
+		}
+		if req.done != nil {
+			req.done <- err
+		} else {
+			req.setKey = nil
+			req.setBody = nil
+			req.fn = nil
+			asyncReqPool.Put(req)
+		}
+	}
+}
+
+// applyOnly executes one write request against its database without committing
+// and without signalling or recycling the request. drainBatchAlways uses it to
+// stage every write in a group-commit batch before the single shared checkpoint.
+// Caller holds e.mu.Lock. A request with neither fn nor setKey is a no-op (it
+// behaves as a fence) and returns nil.
+func (e *Engine) applyOnly(req *writeReq) error {
+	db, err := e.ks.DB(req.index)
+	if err != nil {
+		return err
+	}
+	if req.setKey != nil {
+		return db.SetWithVersion(req.setKey, req.setBody, req.setTyp, req.setEnc, req.setTTL, req.setVer)
+	}
+	if req.fn != nil {
+		return req.fn(db)
+	}
+	return nil
 }
 
 // applyWriteReqDeferred executes one write without committing. It records the
@@ -376,34 +467,6 @@ func (e *Engine) FlushShardWrites() {
 		req := reqs[s]
 		req.fn = nil
 		writeReqPool.Put(req)
-	}
-}
-
-// applyWriteReq executes one write request under the already-held write lock.
-// For sync requests (done != nil) it signals the caller via the done channel;
-// the caller is responsible for returning the req to writeReqPool afterward.
-// For fire-and-forget requests (done == nil) it returns the req to asyncReqPool
-// itself because the caller already returned without waiting for a signal.
-// Caller holds e.mu.
-func (e *Engine) applyWriteReq(req *writeReq) {
-	db, err := e.ks.DB(req.index)
-	if err == nil {
-		if req.setKey != nil {
-			err = db.SetWithVersion(req.setKey, req.setBody, req.setTyp, req.setEnc, req.setTTL, req.setVer)
-		} else {
-			err = req.fn(db)
-		}
-	}
-	if err == nil {
-		err = e.commitWrite()
-	}
-	if req.done != nil {
-		req.done <- err
-	} else {
-		req.setKey = nil
-		req.setBody = nil
-		req.fn = nil
-		asyncReqPool.Put(req)
 	}
 }
 
