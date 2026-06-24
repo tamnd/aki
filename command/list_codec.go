@@ -54,6 +54,85 @@ func listEncode(elems [][]byte) []byte {
 	return body
 }
 
+// listBlobPush splices vals onto the head or tail of a stored list body without
+// decoding the existing elements. The body is uvarint(count) followed by each
+// element as uvarint(len)+bytes, so the existing element bytes can be copied as
+// one block: a head push writes the pushed run (arguments reversed, the order
+// LPUSH leaves) in front of that block, a tail push appends it after. Only the
+// count prefix and the pushed elements are encoded, so a push allocates once
+// instead of decoding and re-allocating every element. A nil or empty body is a
+// fresh list. It returns the new body and element count.
+func listBlobPush(body []byte, vals [][]byte, head bool) ([]byte, int, error) {
+	var oldCount uint64
+	elems := body
+	if len(body) > 0 {
+		n, off, err := encoding.Uvarint(body)
+		if err != nil {
+			return nil, 0, err
+		}
+		oldCount = n
+		elems = body[off:]
+	}
+	newCount := oldCount + uint64(len(vals))
+
+	pushedLen := 0
+	for _, v := range vals {
+		pushedLen += encoding.UvarintLen(uint64(len(v))) + len(v)
+	}
+	out := make([]byte, 0, encoding.UvarintLen(newCount)+pushedLen+len(elems))
+	out = encoding.AppendUvarint(out, newCount)
+	if head {
+		// LPUSH k a b c leaves [c, b, a, ...]: the pushed run is reversed so the
+		// last argument ends up nearest the head.
+		for i := len(vals) - 1; i >= 0; i-- {
+			out = encoding.AppendUvarint(out, uint64(len(vals[i])))
+			out = append(out, vals[i]...)
+		}
+		out = append(out, elems...)
+	} else {
+		out = append(out, elems...)
+		for _, v := range vals {
+			out = encoding.AppendUvarint(out, uint64(len(v)))
+			out = append(out, v...)
+		}
+	}
+	return out, int(newCount), nil
+}
+
+// listBlobReportedEnc returns the OBJECT ENCODING a spliced list body should
+// report. It mirrors listEncoding but without decoding the whole list: the
+// previous encoding pins the floor (a quicklist never demotes), the entry cap and
+// the pushed elements' sizes are checked directly, and the listpack byte cap is
+// proved cheaply from the count when even max-size elements would fit. Only a list
+// near the byte boundary falls back to decoding for the exact check, which the
+// decode closure provides.
+func listBlobReportedEnc(lim encLimits, prevEnc uint8, newCount int, pushed [][]byte, decode func() ([][]byte, error)) (uint8, error) {
+	if prevEnc == keyspace.EncQuicklist {
+		return keyspace.EncQuicklist, nil
+	}
+	maxEntries, maxBytes := lim.listLimits()
+	if newCount > maxEntries {
+		return keyspace.EncQuicklist, nil
+	}
+	for _, v := range pushed {
+		if len(v) > listMaxListpackElemBytes {
+			return keyspace.EncQuicklist, nil
+		}
+	}
+	// Cheap proof: if the count times the largest a listpack element can be still
+	// fits the byte cap, the list is a listpack without inspecting any bytes.
+	if newCount*(listMaxListpackElemBytes+listEntryOverhead)+listEntryOverhead <= maxBytes {
+		return keyspace.EncListpack, nil
+	}
+	// Near the byte boundary the exact total matters, so decode and reuse the
+	// canonical rule. This only happens for lists already close to promotion.
+	elems, err := decode()
+	if err != nil {
+		return 0, err
+	}
+	return listEncoding(lim, elems, prevEnc), nil
+}
+
 // listEncoding picks the reported encoding for a list. Once a key is a
 // quicklist it never goes back to listpack, so prev pins the floor. The entry
 // and byte caps come from list-max-listpack-size via lim.
