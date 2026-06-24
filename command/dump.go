@@ -369,6 +369,16 @@ func storeRestored(lim encLimits, db *keyspace.DB, key []byte, v rdb.Value, ttlM
 		for i, m := range v.ZSet {
 			members[i] = zmember{member: m.Member, score: m.Score}
 		}
+		// A restored sorted set large enough to report skiplist lands in the
+		// btree-backed form, the same as one built member by member. Promotion needs
+		// the key's TTL stamped first, since zsetPromote preserves the existing
+		// header's TTL rather than taking one as an argument.
+		if zsetWantsTree(lim, members, keyspace.EncListpack) {
+			if err := db.Set(key, nil, keyspace.TypeZSet, keyspace.EncSkiplist, ttlMs); err != nil {
+				return err
+			}
+			return zsetPromote(db, key, members)
+		}
 		return db.Set(key, zsetEncode(members), keyspace.TypeZSet,
 			zsetEncoding(lim, members, keyspace.EncListpack), ttlMs)
 	case rdb.KindStream:

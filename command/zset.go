@@ -97,8 +97,9 @@ parsed:
 		incrResult  float64
 		incrBlocked bool
 	)
+	lim := ctx.encLimits()
 	done := ctx.updateShard(ctx.Argv[1], func(db *keyspace.DB) error {
-		members, hdr, found, err := getZSet(db, ctx.Argv[1])
+		hdr, found, err := zsetHeader(db, ctx.Argv[1])
 		if err != nil {
 			return err
 		}
@@ -106,48 +107,78 @@ parsed:
 			wrongTyp = true
 			return nil
 		}
+		// A sorted set already in the btree-backed form takes the point-write path:
+		// each pair reads the member's score row and updates both rows in place, no
+		// whole-blob decode and rewrite.
+		if found && hdr.IsColl() {
+			return db.CollUpdate(ctx.Argv[1], keyspace.TypeZSet, keyspace.EncSkiplist, func(w *keyspace.CollWriter) error {
+				for _, p := range pairs {
+					cur, mfound, e := zTreeScore(w, p.member)
+					if e != nil {
+						return e
+					}
+					o := zaddDecide(p, cur, mfound, nx, xx, gt, lt, incr)
+					if o.nan {
+						nanResult = true
+						return nil
+					}
+					if o.blocked {
+						incrBlocked = true
+						continue
+					}
+					if o.haveIncr {
+						incrResult = o.incrVal
+					}
+					if o.write {
+						if e := zTreeSet(w, p.member, o.newScore, mfound, cur); e != nil {
+							return e
+						}
+						if o.add {
+							added++
+						} else {
+							changed++
+						}
+					}
+				}
+				return nil
+			})
+		}
+		members, _, _, err := getZSet(db, ctx.Argv[1])
+		if err != nil {
+			return err
+		}
 		floor := keyspace.EncListpack
 		if found {
 			floor = hdr.Encoding
 		}
 		for _, p := range pairs {
 			idx := zsetFind(members, p.member)
-			if idx >= 0 {
-				cur := members[idx].score
-				newScore := p.score
-				if incr {
-					newScore = cur + p.score
-					if math.IsNaN(newScore) {
-						nanResult = true
-						return nil
-					}
-				}
-				if nx {
-					incrBlocked = true
-					continue
-				}
-				if gt && !(newScore > cur) {
-					incrBlocked = true
-					continue
-				}
-				if lt && !(newScore < cur) {
-					incrBlocked = true
-					continue
-				}
-				if newScore != cur {
-					members[idx].score = newScore
-					changed++
-				}
-				incrResult = newScore
-				continue
+			mfound := idx >= 0
+			cur := 0.0
+			if mfound {
+				cur = members[idx].score
 			}
-			if xx {
+			o := zaddDecide(p, cur, mfound, nx, xx, gt, lt, incr)
+			if o.nan {
+				nanResult = true
+				return nil
+			}
+			if o.blocked {
 				incrBlocked = true
 				continue
 			}
-			members = append(members, zmember{member: p.member, score: p.score})
-			added++
-			incrResult = p.score
+			if o.haveIncr {
+				incrResult = o.incrVal
+			}
+			if o.write {
+				if o.add {
+					members = append(members, zmember{member: p.member, score: o.newScore})
+					added++
+				} else {
+					members[idx].score = o.newScore
+					changed++
+				}
+			}
 		}
 		if added == 0 && changed == 0 {
 			// A fully blocked ZADD (every pair stopped by NX/XX/GT/LT, or an
@@ -157,7 +188,10 @@ parsed:
 			return nil
 		}
 		zsetSort(members)
-		return db.Set(ctx.Argv[1], zsetEncode(members), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), members, floor), keepTTL(hdr, found))
+		if zsetWantsTree(lim, members, floor) {
+			return zsetPromote(db, ctx.Argv[1], members)
+		}
+		return db.Set(ctx.Argv[1], zsetEncode(members), keyspace.TypeZSet, zsetEncoding(lim, members, floor), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -209,14 +243,39 @@ func handleZIncrBy(ctx *Ctx) {
 		nanResult bool
 		result    float64
 	)
+	lim := ctx.encLimits()
 	done := ctx.updateShard(ctx.Argv[1], func(db *keyspace.DB) error {
-		members, hdr, found, err := getZSet(db, ctx.Argv[1])
+		hdr, found, err := zsetHeader(db, ctx.Argv[1])
 		if err != nil {
 			return err
 		}
 		if found && hdr.Type != keyspace.TypeZSet {
 			wrongTyp = true
 			return nil
+		}
+		// A btree-backed sorted set increments the member in place: read its score
+		// row, add, and rewrite both rows, no whole-blob rewrite.
+		if found && hdr.IsColl() {
+			return db.CollUpdate(ctx.Argv[1], keyspace.TypeZSet, keyspace.EncSkiplist, func(w *keyspace.CollWriter) error {
+				cur, mfound, e := zTreeScore(w, member)
+				if e != nil {
+					return e
+				}
+				if mfound {
+					result = cur + inc
+					if math.IsNaN(result) {
+						nanResult = true
+						return nil
+					}
+				} else {
+					result = inc
+				}
+				return zTreeSet(w, member, result, mfound, cur)
+			})
+		}
+		members, _, _, err := getZSet(db, ctx.Argv[1])
+		if err != nil {
+			return err
 		}
 		floor := keyspace.EncListpack
 		if found {
@@ -235,7 +294,10 @@ func handleZIncrBy(ctx *Ctx) {
 			members = append(members, zmember{member: member, score: inc})
 		}
 		zsetSort(members)
-		return db.Set(ctx.Argv[1], zsetEncode(members), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), members, floor), keepTTL(hdr, found))
+		if zsetWantsTree(lim, members, floor) {
+			return zsetPromote(db, ctx.Argv[1], members)
+		}
+		return db.Set(ctx.Argv[1], zsetEncode(members), keyspace.TypeZSet, zsetEncoding(lim, members, floor), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -367,15 +429,15 @@ func handleZCard(ctx *Ctx) {
 		n        int64
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		members, hdr, ok, err := getZSet(db, ctx.Argv[1])
-		if err != nil {
+		card, hdr, found, err := zsetCard(db, ctx.Argv[1])
+		if err != nil || !found {
 			return err
 		}
-		if ok && hdr.Type != keyspace.TypeZSet {
+		if hdr.Type != keyspace.TypeZSet {
 			wrongTyp = true
 			return nil
 		}
-		n = int64(len(members))
+		n = card
 		return nil
 	}) {
 		return
@@ -397,7 +459,7 @@ func handleZRem(ctx *Ctx) {
 		removed  int64
 	)
 	done := ctx.updateShard(ctx.Argv[1], func(db *keyspace.DB) error {
-		members, hdr, found, err := getZSet(db, ctx.Argv[1])
+		hdr, found, err := zsetHeader(db, ctx.Argv[1])
 		if err != nil {
 			return err
 		}
@@ -407,6 +469,27 @@ func handleZRem(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeZSet {
 			wrongTyp = true
 			return nil
+		}
+		// A btree-backed sorted set removes members by point deletes of both their
+		// rows, keeping the coll form rather than rewriting a whole blob.
+		if hdr.IsColl() {
+			return db.CollUpdate(ctx.Argv[1], keyspace.TypeZSet, keyspace.EncSkiplist, func(w *keyspace.CollWriter) error {
+				for _, t := range targets {
+					existed, e := zTreeDel(w, t)
+					if e != nil {
+						return e
+					}
+					if existed {
+						removed++
+					}
+				}
+				emptied = w.Count() == 0
+				return nil
+			})
+		}
+		members, _, _, err := getZSet(db, ctx.Argv[1])
+		if err != nil {
+			return err
 		}
 		drop := make(map[string]struct{}, len(targets))
 		for _, t := range targets {

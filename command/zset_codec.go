@@ -116,7 +116,12 @@ func zsetFind(members []zmember, member []byte) int {
 
 // getZSet reads the sorted set at key and decodes it. The returned header
 // carries the type and encoding so callers can check for WRONGTYPE and keep the
-// encoding floor. A missing key returns found false with no error.
+// encoding floor. A missing key returns found false with no error. A large sorted
+// set lives in the btree-backed sub-tree form (zset_tree.go); getZSet materializes
+// it in (score, member) order so every read caller (ZRANGE, ZRANK, the set algebra,
+// ZSCORE, ZPOP, DUMP/RDB, SORT, GEO) works on either form unchanged. The ZADD,
+// ZINCRBY and ZREM write commands branch on hdr.IsColl() before getZSet so they
+// never rewrite a whole blob for a btree-backed set.
 func getZSet(db *keyspace.DB, key []byte) ([]zmember, keyspace.ValueHeader, bool, error) {
 	body, hdr, found, err := db.Get(key)
 	if err != nil || !found {
@@ -124,6 +129,10 @@ func getZSet(db *keyspace.DB, key []byte) ([]zmember, keyspace.ValueHeader, bool
 	}
 	if hdr.Type != keyspace.TypeZSet {
 		return nil, hdr, true, nil
+	}
+	if hdr.IsColl() {
+		members, e := collectZSetMembers(db, key)
+		return members, hdr, true, e
 	}
 	members, err := zsetDecode(body)
 	if err != nil {
