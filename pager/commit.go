@@ -37,7 +37,7 @@ type CommitInfo struct {
 func (p *Pager) Commit(info CommitInfo) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return ErrClosed
 	}
 
@@ -97,6 +97,7 @@ func (p *Pager) Commit(info CommitInfo) error {
 		return err
 	}
 	p.meta = next
+	p.pageCount.Store(next.PageCount)
 
 	// Best-effort header refresh; not required for correctness because recovery
 	// reads the meta pages, not these fields.
@@ -124,18 +125,24 @@ func deadMetaPage(seq uint64) uint32 {
 	return format.MetaPageB
 }
 
-// flushDirtyLocked writes back every dirty cached page. Caller holds p.mu.
+// flushDirtyLocked writes back every dirty cached page. Caller holds p.mu. Each
+// stripe is flushed under its own lock; commit already runs with the write path
+// quiesced, so no globally consistent snapshot across stripes is needed.
 func (p *Pager) flushDirtyLocked() error {
-	p.pool.mu.Lock()
-	defer p.pool.mu.Unlock()
-	for pgno, pg := range p.pool.frames {
-		if !pg.dirty.Load() {
-			continue
+	for i := range p.pool.stripes {
+		ft := &p.pool.stripes[i]
+		ft.mu.Lock()
+		for pgno, pg := range ft.frames {
+			if !pg.dirty.Load() {
+				continue
+			}
+			if err := p.writeRaw(pgno, pg.Data); err != nil {
+				ft.mu.Unlock()
+				return err
+			}
+			pg.dirty.Store(false)
 		}
-		if err := p.writeRaw(pgno, pg.Data); err != nil {
-			return err
-		}
-		pg.dirty.Store(false)
+		ft.mu.Unlock()
 	}
 	return nil
 }
@@ -145,17 +152,20 @@ func (p *Pager) flushDirtyLocked() error {
 func (p *Pager) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return nil
 	}
-	p.pool.mu.Lock()
-	for _, pg := range p.pool.frames {
-		if pg.pins.Load() > 0 {
-			p.pool.mu.Unlock()
-			return ErrPinned
+	for i := range p.pool.stripes {
+		ft := &p.pool.stripes[i]
+		ft.mu.Lock()
+		for _, pg := range ft.frames {
+			if pg.pins.Load() > 0 {
+				ft.mu.Unlock()
+				return ErrPinned
+			}
 		}
+		ft.mu.Unlock()
 	}
-	p.pool.mu.Unlock()
-	p.closed = true
+	p.closed.Store(true)
 	return p.file.Close()
 }

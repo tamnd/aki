@@ -44,7 +44,14 @@ type Pager struct {
 	pageSize uint32
 	header   format.FileHeader
 	meta     format.MetaPage
-	pool     *frameTable
+	pool     *bufferPool
+
+	// pageCount mirrors meta.PageCount as an atomic so the page-pin hot path can
+	// bound-check pgno without taking p.mu (note 204). meta.PageCount stays the
+	// source of truth under p.mu; every writer of it stores this mirror last, in
+	// the same critical section, so a lock-free reader that sees the new bound
+	// also sees a file already extended to cover it.
+	pageCount atomic.Uint32
 
 	// freelist is the in-memory stack of free page numbers; the persistent form
 	// is an intrusive linked list through the free pages (doc 03 §6).
@@ -58,7 +65,10 @@ type Pager struct {
 	cacheHits   atomic.Uint64
 	cacheMisses atomic.Uint64
 
-	closed bool
+	// closed is atomic so Get can check it on the hot path without p.mu. It is set
+	// only by Close, after Close has confirmed zero pinned pages and the engine
+	// has quiesced the write path, so a hit-path Get never races a real teardown.
+	closed atomic.Bool
 }
 
 // Create initialises a fresh .aki file: page 0 header, meta pages 1 and 2, and
@@ -86,7 +96,7 @@ func Create(fsys vfs.VFS, name string, opts Options) (*Pager, error) {
 		file:     f,
 		pageSize: pageSize,
 		header:   hdr,
-		pool:     newFrameTable(cacheCap(opts.CachePages)),
+		pool:     newBufferPool(cacheCap(opts.CachePages)),
 	}
 	// Write page 0 (header), then meta A (seq 1, live) and meta B (seq 0).
 	page0 := make([]byte, pageSize)
@@ -116,6 +126,7 @@ func Create(fsys vfs.VFS, name string, opts Options) (*Pager, error) {
 		return nil, err
 	}
 	p.meta = metaA
+	p.pageCount.Store(metaA.PageCount)
 	return p, nil
 }
 
@@ -148,12 +159,13 @@ func Open(fsys vfs.VFS, name string, opts Options) (*Pager, error) {
 		file:     f,
 		pageSize: hdr.PageSize,
 		header:   hdr,
-		pool:     newFrameTable(cacheCap(opts.CachePages)),
+		pool:     newBufferPool(cacheCap(opts.CachePages)),
 	}
 	if err := p.loadMeta(); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
+	p.pageCount.Store(p.meta.PageCount)
 	if err := p.loadFreelist(); err != nil {
 		_ = f.Close()
 		return nil, err
@@ -296,29 +308,34 @@ func (p *Pager) readRaw(pgno uint32) ([]byte, error) {
 // table. A cache miss reads the page outside either lock so the file read runs
 // in parallel with other Get calls and with the pool.mu critical section.
 func (p *Pager) Get(pgno uint32) (*Page, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
+	// The closed flag and the page-count bound are read atomically so the hit path
+	// takes no shared lock here; only the owning stripe's lock is taken below, in
+	// getLocked (note 204). The bound mirror is stored last by every writer that
+	// grows the count, so a page number that passes the check is backed by a file
+	// the writer already extended.
+	if p.closed.Load() {
 		return nil, ErrClosed
 	}
-	if pgno >= p.meta.PageCount {
+	if pgno >= p.pageCount.Load() {
 		return nil, ErrInvalidPage
 	}
 	return p.getLocked(pgno)
 }
 
 func (p *Pager) getLocked(pgno uint32) (*Page, error) {
-	// Hit path under the read lock: many goroutines can pin resident pages at once,
-	// since get only reads the map and the pin is an atomic add. Eviction and frame
-	// inserts take the write lock, so a frame cannot be dropped while a hit pins it.
-	p.pool.mu.RLock()
-	if pg := p.pool.get(pgno); pg != nil {
+	ft := p.pool.stripe(pgno)
+	// Hit path under the stripe read lock: many goroutines can pin resident pages
+	// at once, since get only reads the map and the pin is an atomic add. Eviction
+	// and frame inserts take the stripe write lock, so a frame cannot be dropped
+	// while a hit pins it.
+	ft.mu.RLock()
+	if pg := ft.get(pgno); pg != nil {
 		pg.pins.Add(1)
-		p.pool.mu.RUnlock()
+		ft.mu.RUnlock()
 		p.cacheHits.Add(1)
 		return pg, nil
 	}
-	p.pool.mu.RUnlock()
+	ft.mu.RUnlock()
 	p.cacheMisses.Add(1)
 
 	buf, err := p.readRaw(pgno)
@@ -329,38 +346,29 @@ func (p *Pager) getLocked(pgno uint32) (*Page, error) {
 	pg.ref.Store(true)
 	pg.pins.Store(1)
 
-	p.pool.mu.Lock()
+	ft.mu.Lock()
 	// Another goroutine may have loaded it meanwhile; prefer the existing frame.
-	if existing := p.pool.get(pgno); existing != nil {
+	if existing := ft.get(pgno); existing != nil {
 		existing.pins.Add(1)
-		p.pool.mu.Unlock()
+		ft.mu.Unlock()
 		return existing, nil
 	}
-	p.maybeEvictLocked()
-	p.pool.put(pg)
-	p.pool.mu.Unlock()
+	ft.maybeEvict()
+	ft.put(pg)
+	ft.mu.Unlock()
 	return pg, nil
-}
-
-// maybeEvictLocked drops one clean victim if the pool is at capacity. Caller
-// holds pool.mu.
-func (p *Pager) maybeEvictLocked() {
-	if len(p.pool.frames) < p.pool.cap {
-		return
-	}
-	if victim, ok := p.pool.evictable(); ok {
-		p.pool.drop(victim)
-	}
 }
 
 // Unpin releases a pin on pg. If dirty is true the page is marked for write-back
 // at the next Commit.
 func (p *Pager) Unpin(pg *Page, dirty bool) {
-	// Release under the read lock: the dirty flag and the pin count are atomics, so
-	// concurrent Unpins do not need to serialize. The write-back flush and the
-	// eviction sweep both take the write lock, so neither overlaps this release.
-	p.pool.mu.RLock()
-	defer p.pool.mu.RUnlock()
+	ft := p.pool.stripe(pg.No)
+	// Release under the stripe read lock: the dirty flag and the pin count are
+	// atomics, so concurrent Unpins do not need to serialize. The write-back flush
+	// and the eviction sweep both take the stripe write lock, so neither overlaps
+	// this release.
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
 	if dirty {
 		pg.dirty.Store(true)
 	}
@@ -381,7 +389,7 @@ func (p *Pager) Unpin(pg *Page, dirty bool) {
 func (p *Pager) Allocate() (*Page, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed.Load() {
 		return nil, ErrClosed
 	}
 	var pgno uint32
@@ -392,19 +400,23 @@ func (p *Pager) Allocate() (*Page, error) {
 	} else {
 		pgno = p.meta.PageCount
 		p.meta.PageCount++
+		// Publish the grown bound last so a lock-free Get that sees it also sees a
+		// page whose frame this call is about to install.
+		p.pageCount.Store(p.meta.PageCount)
 	}
 	pg := &Page{No: pgno, Data: make([]byte, p.pageSize)}
 	pg.ref.Store(true)
 	pg.pins.Store(1)
 	pg.dirty.Store(true)
-	p.pool.mu.Lock()
+	ft := p.pool.stripe(pgno)
+	ft.mu.Lock()
 	// A freed-then-reallocated page may still be cached; replace it.
-	if old := p.pool.get(pgno); old != nil {
-		p.pool.drop(pgno)
+	if old := ft.get(pgno); old != nil {
+		ft.drop(pgno)
 	}
-	p.maybeEvictLocked()
-	p.pool.put(pg)
-	p.pool.mu.Unlock()
+	ft.maybeEvict()
+	ft.put(pg)
+	ft.mu.Unlock()
 	return pg, nil
 }
 
@@ -417,11 +429,12 @@ func (p *Pager) Free(pgno uint32) error {
 	}
 	p.freelist = append(p.freelist, pgno)
 	p.freelistDirty = true
-	p.pool.mu.Lock()
-	if pg := p.pool.frames[pgno]; pg != nil && pg.pins.Load() == 0 {
-		p.pool.drop(pgno)
+	ft := p.pool.stripe(pgno)
+	ft.mu.Lock()
+	if pg := ft.frames[pgno]; pg != nil && pg.pins.Load() == 0 {
+		ft.drop(pgno)
 	}
-	p.pool.mu.Unlock()
+	ft.mu.Unlock()
 	return nil
 }
 
@@ -449,13 +462,16 @@ func (p *Pager) FreePages() []uint32 {
 func (p *Pager) PinnedPages() []uint32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.pool.mu.Lock()
-	defer p.pool.mu.Unlock()
 	var out []uint32
-	for pgno, pg := range p.pool.frames {
-		if pg.pins.Load() > 0 {
-			out = append(out, pgno)
+	for i := range p.pool.stripes {
+		ft := &p.pool.stripes[i]
+		ft.mu.Lock()
+		for pgno, pg := range ft.frames {
+			if pg.pins.Load() > 0 {
+				out = append(out, pgno)
+			}
 		}
+		ft.mu.Unlock()
 	}
 	return out
 }
