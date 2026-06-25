@@ -152,6 +152,36 @@ func (c *dbCache) cput(key string, body []byte, hdr ValueHeader) {
 	sh := &c.shards[c.shardIdxStr(key)]
 	cv := &cachedValue{body: body, hdr: hdr}
 	cv.atime.Store(coarseSeconds())
+
+	// Fast path: the key is already cached, which is the steady state under a
+	// stream of writes to the same key. The update is only an atomic pointer swap
+	// into the existing cacheEntry, so it needs no write lock; an RLock to find
+	// the entry plus a version-guarded compare-and-swap is enough. This turns the
+	// many connections that hammer one key in lockstep from serialized write-lock
+	// holders into concurrent readers. The map read still takes the shard RLock so
+	// it never races the slow path's map mutation.
+	sh.mu.RLock()
+	e, exists := sh.entries[key]
+	sh.mu.RUnlock()
+	if exists {
+		for {
+			cur := e.val.Load()
+			if cur != nil && cur.hdr.Version > hdr.Version {
+				// A strictly newer value is already cached; do not clobber it.
+				return
+			}
+			if e.val.CompareAndSwap(cur, cv) {
+				return
+			}
+			// Lost the swap to a concurrent cput; reload and re-check the version
+			// guard so monotonicity holds, then retry.
+		}
+	}
+
+	// Slow path: a new key needs the write lock to insert into the map, append to
+	// the LRU ring, and possibly evict. The key may have been inserted between the
+	// RLock above and this Lock, so the existing-key branch here repeats the
+	// version-guarded swap rather than assuming the key is absent.
 	sh.mu.Lock()
 	if e, exists := sh.entries[key]; exists {
 		if cur := e.val.Load(); cur != nil && cur.hdr.Version > hdr.Version {
@@ -178,9 +208,9 @@ func (c *dbCache) cput(key string, body []byte, hdr ValueHeader) {
 			}
 		}
 	}
-	e := &cacheEntry{key: key}
-	e.val.Store(cv)
-	sh.entries[key] = e
+	ne := &cacheEntry{key: key}
+	ne.val.Store(cv)
+	sh.entries[key] = ne
 	sh.mu.Unlock()
 }
 
