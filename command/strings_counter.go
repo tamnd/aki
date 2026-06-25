@@ -45,6 +45,21 @@ func handleDecrBy(ctx *Ctx) {
 // with the new value.
 func incrBy(ctx *Ctx, delta int64) {
 	key := ctx.Argv[1]
+	if ctx.deferIncr {
+		// Accumulate onto the connection's pending batch and return without a reply.
+		// flushIncrPending computes, persists, replies and propagates the whole batch
+		// in pipeline order at the end of the drain (or before the next non-deferrable
+		// command). The key and argv are copied because both outlive this command: the
+		// staged write reaches the B-tree after the drain, and the argv backs verbatim
+		// AOF propagation at flush time.
+		ctx.sess.incrPend = append(ctx.sess.incrPend, deferredIncr{
+			shard: keyspace.ShardOf(key),
+			key:   append([]byte(nil), key...),
+			argv:  copyArgv(ctx.Argv),
+			delta: delta,
+		})
+		return
+	}
 	var (
 		wrongTyp bool
 		notInt   bool

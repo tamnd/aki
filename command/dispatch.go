@@ -21,6 +21,7 @@ func getCtx(c *networking.Conn, argv [][]byte, d *Dispatcher, sess *session) *Ct
 	ctx.d = d
 	ctx.sess = sess
 	ctx.forceProp = false
+	ctx.deferIncr = false
 	return ctx
 }
 
@@ -33,6 +34,7 @@ func putCtx(ctx *Ctx) {
 	ctx.readyKeys = ctx.readyKeys[:0]
 	ctx.readyKeysAll = ctx.readyKeysAll[:0]
 	ctx.forceProp = false
+	ctx.deferIncr = false
 	ctxPool.Put(ctx)
 }
 
@@ -457,6 +459,13 @@ type Ctx struct {
 	// FUNCTION admin commands use it: they replicate verbatim like real Redis but
 	// touch no keys, so the dirty-delta rule alone would never propagate them.
 	forceProp bool
+
+	// deferIncr asks the increment handler to accumulate this command onto the
+	// connection's pending batch and return without a reply, instead of computing
+	// inline. Handle sets it only when the command is a clean increment in a state
+	// where batching is safe (see canBatchIncr); flushIncrPending applies the batch
+	// and writes the replies in pipeline order.
+	deferIncr bool
 }
 
 // MarkPropagate makes the running command propagate to the AOF and replicas
@@ -510,6 +519,13 @@ type session struct {
 	// inline so a write stays durable before its reply.
 	aofBuf   []byte
 	aofBufDB int
+
+	// incrPend accumulates this connection's deferred increments (INCR family)
+	// during a pipeline drain. flushIncrPending hands each shard its sub-batch,
+	// writes the replies in arrival order, and resets the slice. It is held by
+	// value so a deep pipeline grows one backing array rather than allocating a
+	// struct per command, and it is only ever touched on the connection goroutine.
+	incrPend []deferredIncr
 
 	// inMulti is true between MULTI and EXEC/DISCARD: commands are queued instead
 	// of run. queue holds them in order, and dirtyExec records a queue-time error
@@ -599,6 +615,17 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	// unsafe.String avoids a heap allocation: the arena outlives all uses of
 	// name within Handle (putCtx via defer, never mid-function).
 	name := unsafe.String(unsafe.SliceData(nameScratch), len(nameScratch))
+
+	// Batched increment hand-off. A clean increment in a batchable state is deferred
+	// onto the connection's pending list and applied as one per-shard sub-batch at
+	// the end of the drain. Anything else flushes the pending batch first so the
+	// deferred replies keep their place in the pipeline's output before this command
+	// writes anything (including an error reply from the gates below).
+	if structuralIncrOK(name, argv) && d.canBatchIncr(c, sess) {
+		ctx.deferIncr = true
+	} else if len(sess.incrPend) > 0 {
+		d.flushIncrPending(c, sess)
+	}
 
 	// A RESP2 client with active subscriptions is in subscriber mode and may run
 	// only the subscribe family plus PING, QUIT and RESET. RESP3 lifts this.

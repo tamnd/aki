@@ -444,6 +444,12 @@ func (d *Dispatcher) FlushAOF() {
 // one write() syscall here instead of one per command.
 func (d *Dispatcher) OnBatchComplete(c *networking.Conn) {
 	sess, _ := c.Session().(*session)
+	// Apply any increments deferred during this drain before the AOF splice, so their
+	// replies land at the tail of the pipeline and their propagation records are in
+	// the session buffer the splice below picks up.
+	if sess != nil && len(sess.incrPend) > 0 {
+		d.flushIncrPending(c, sess)
+	}
 	d.aof.mu.Lock()
 	d.spliceSessionAOFLocked(sess)
 	d.flushIncrLocked()
