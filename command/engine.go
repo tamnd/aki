@@ -1159,8 +1159,22 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 		nhdr.Flags |= keyspace.FlagHasTTL
 	}
 	db.PrepareWriteBehind(keyCopy, r.body, nhdr)
-	asyncErr := e.sendSetAsync(index, shard, keyCopy, r.body, r.typ, r.enc, r.ttlMs, version)
 	e.rmwLocks[shard].Unlock()
+	// The durable hand-off does not need the RMW lock. The lock's job is to make
+	// the read-modify-stage atomic so two pushes to one key cannot both read the
+	// old value and lose an update; once PrepareWriteBehind has staged this write
+	// under the lock, the staged value is the authoritative one every reader sees
+	// (hot cache, then wbPending), and the version is already assigned. The B-tree
+	// hand-off is version-guarded at every sink: the shard worker applies in
+	// version order and SetWithVersion rejects an older version, and removeWBPending
+	// only clears a pending entry whose version matches, so a send that reorders
+	// past a newer same-key send cannot clobber it. This is the same guarantee the
+	// blind SET path already relies on, which also sends with no per-key lock.
+	// Moving the send out lets the fifty connections that hit one shard in lockstep
+	// run the queue push concurrently instead of serializing it behind the lock,
+	// and the shorter critical section in turn cuts the contention on the lock
+	// itself, which the INCR-family profile showed as its largest single cost.
+	asyncErr := e.sendSetAsync(index, shard, keyCopy, r.body, r.typ, r.enc, r.ttlMs, version)
 	if asyncErr != nil {
 		ctx.enc().WriteError("ERR " + asyncErr.Error())
 		return false
