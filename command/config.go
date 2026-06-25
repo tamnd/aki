@@ -68,6 +68,20 @@ type configStore struct {
 	minReplWrite     atomic.Int64 // mirrors min-replicas-to-write
 	minReplMaxLag    atomic.Int64 // mirrors min-replicas-max-lag
 	aofTimestamp     atomic.Bool  // mirrors aof-timestamp-enabled == "yes"
+
+	// The OBJECT ENCODING thresholds are read together once per write, eight
+	// directives at a time, through encLimits. Taking the config RWMutex eight
+	// times per command made confInt the top reader-counter contention under a
+	// write storm (every connection on one shard incrementing the same RWMutex
+	// readerCount), so they mirror into atomics the same way the flags above do.
+	encListSize    atomic.Int64 // mirrors list-max-listpack-size
+	encHashEntries atomic.Int64 // mirrors hash-max-listpack-entries
+	encHashValue   atomic.Int64 // mirrors hash-max-listpack-value
+	encSetIntset   atomic.Int64 // mirrors set-max-intset-entries
+	encSetEntries  atomic.Int64 // mirrors set-max-listpack-entries
+	encSetValue    atomic.Int64 // mirrors set-max-listpack-value
+	encZsetEntries atomic.Int64 // mirrors zset-max-listpack-entries
+	encZsetValue   atomic.Int64 // mirrors zset-max-listpack-value
 }
 
 // fsync policy codes mirror the appendfsync directive. everysec is zero so the
@@ -161,6 +175,19 @@ var mirroredDirectives = []string{
 	"min-replicas-max-lag",
 	"min-slaves-max-lag",
 	"aof-timestamp-enabled",
+	"list-max-listpack-size",
+	"list-max-ziplist-size",
+	"hash-max-listpack-entries",
+	"hash-max-ziplist-entries",
+	"hash-max-listpack-value",
+	"hash-max-ziplist-value",
+	"set-max-intset-entries",
+	"set-max-listpack-entries",
+	"set-max-listpack-value",
+	"zset-max-listpack-entries",
+	"zset-max-ziplist-entries",
+	"zset-max-listpack-value",
+	"zset-max-ziplist-value",
 }
 
 // mirror refreshes the atomic copy of a hot-path directive after its map value
@@ -191,6 +218,39 @@ func (cs *configStore) mirror(name, val string) {
 		cs.storeInt(&cs.minReplMaxLag, val)
 	case "aof-timestamp-enabled":
 		cs.aofTimestamp.Store(val == "yes")
+	case "list-max-listpack-size", "list-max-ziplist-size":
+		cs.storeInt(&cs.encListSize, val)
+	case "hash-max-listpack-entries", "hash-max-ziplist-entries":
+		cs.storeInt(&cs.encHashEntries, val)
+	case "hash-max-listpack-value", "hash-max-ziplist-value":
+		cs.storeInt(&cs.encHashValue, val)
+	case "set-max-intset-entries":
+		cs.storeInt(&cs.encSetIntset, val)
+	case "set-max-listpack-entries":
+		cs.storeInt(&cs.encSetEntries, val)
+	case "set-max-listpack-value":
+		cs.storeInt(&cs.encSetValue, val)
+	case "zset-max-listpack-entries", "zset-max-ziplist-entries":
+		cs.storeInt(&cs.encZsetEntries, val)
+	case "zset-max-listpack-value", "zset-max-ziplist-value":
+		cs.storeInt(&cs.encZsetValue, val)
+	}
+}
+
+// encodingLimits snapshots the eight OBJECT ENCODING thresholds from their atomic
+// mirrors so the per-write encLimits read never takes the config lock. The values
+// are seeded from the directive defaults in newConfigStore and refreshed by every
+// CONFIG SET through mirror, so a load here matches what the map would return.
+func (cs *configStore) encodingLimits() encLimits {
+	return encLimits{
+		listSize:    cs.encListSize.Load(),
+		hashEntries: cs.encHashEntries.Load(),
+		hashValue:   cs.encHashValue.Load(),
+		setIntset:   cs.encSetIntset.Load(),
+		setEntries:  cs.encSetEntries.Load(),
+		setValue:    cs.encSetValue.Load(),
+		zsetEntries: cs.encZsetEntries.Load(),
+		zsetValue:   cs.encZsetValue.Load(),
 	}
 }
 
