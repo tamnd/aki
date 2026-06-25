@@ -46,8 +46,59 @@ func (p *Page) PutHeader(h format.PageHeader) error {
 	return h.MarshalTo(p.Data)
 }
 
-// frameTable is the buffer pool's frame index, guarded by its own mutex so the
-// pager's page-fault path is the only critical section on the hot read path.
+// poolStripes is the number of independent frame tables the buffer pool is split
+// into. A page lives in stripe pgno&poolStripeMask, so the reader-counter atomic
+// of each stripe's lock is a separate cache line and the shard workers stop
+// fighting over one shared counter on every page pin and unpin (note 204). The
+// count is a power of two so the routing is a mask, and sixteen against the eight
+// shard workers keeps the odds of two workers colliding in one stripe low.
+const (
+	poolStripes    = 16
+	poolStripeMask = poolStripes - 1
+)
+
+// bufferPool is the buffer pool: an array of independent frame-table stripes
+// routed by page number. Per-page work (lookup, pin, eviction) touches one
+// stripe; whole-pool work (counts, flush, close, the pinned-page walk) visits
+// every stripe in turn, each under its own lock, since none of those needs a
+// snapshot consistent across stripes.
+type bufferPool struct {
+	stripes [poolStripes]frameTable
+}
+
+func newBufferPool(capacity int) *bufferPool {
+	if capacity < 8 {
+		capacity = 8
+	}
+	per := capacity / poolStripes
+	if per < 8 {
+		per = 8
+	}
+	bp := &bufferPool{}
+	for i := range bp.stripes {
+		bp.stripes[i].init(per)
+	}
+	return bp
+}
+
+// stripe returns the frame table that owns pgno.
+func (bp *bufferPool) stripe(pgno uint32) *frameTable {
+	return &bp.stripes[pgno&poolStripeMask]
+}
+
+// counts sums resident and dirty frames across every stripe. The pager calls it
+// for the buffer-pool growth fields.
+func (bp *bufferPool) counts() (resident, dirty int) {
+	for i := range bp.stripes {
+		r, d := bp.stripes[i].counts()
+		resident += r
+		dirty += d
+	}
+	return resident, dirty
+}
+
+// frameTable is one buffer-pool stripe, guarded by its own mutex so the pager's
+// page-fault path is the only critical section on the hot read path.
 type frameTable struct {
 	mu     sync.RWMutex
 	frames map[uint32]*Page
@@ -57,18 +108,12 @@ type frameTable struct {
 	cap   int
 }
 
-func newFrameTable(capacity int) *frameTable {
-	if capacity < 8 {
-		capacity = 8
-	}
-	return &frameTable{
-		frames: make(map[uint32]*Page, capacity),
-		cap:    capacity,
-	}
+func (ft *frameTable) init(capacity int) {
+	ft.frames = make(map[uint32]*Page, capacity)
+	ft.cap = capacity
 }
 
 // counts returns the number of resident frames and how many of them are dirty.
-// The pager calls it for the buffer-pool growth fields.
 func (ft *frameTable) counts() (resident, dirty int) {
 	ft.mu.RLock()
 	defer ft.mu.RUnlock()
@@ -79,6 +124,17 @@ func (ft *frameTable) counts() (resident, dirty int) {
 		}
 	}
 	return resident, dirty
+}
+
+// maybeEvict drops one clean victim if the stripe is at capacity. Caller holds
+// ft.mu for writing.
+func (ft *frameTable) maybeEvict() {
+	if len(ft.frames) < ft.cap {
+		return
+	}
+	if victim, ok := ft.evictable(); ok {
+		ft.drop(victim)
+	}
 }
 
 // get returns the cached frame for pgno, or nil. It is called both under the read
