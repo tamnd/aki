@@ -56,21 +56,16 @@ func defaultEncLimits() encLimits {
 }
 
 // encLimits reads the current thresholds from the dispatcher's config store. A
-// nil dispatcher or store falls back to the defaults.
+// nil dispatcher or store falls back to the defaults. The store keeps the eight
+// thresholds in atomic mirrors that CONFIG SET refreshes, so this snapshot is
+// taken with eight atomic loads rather than eight RWMutex-guarded map lookups;
+// under a write storm those lock reads were the top reader-counter contention in
+// the profile.
 func (d *Dispatcher) encLimits() encLimits {
 	if d == nil || d.conf == nil {
 		return defaultEncLimits()
 	}
-	return encLimits{
-		listSize:    d.confInt("list-max-listpack-size", defListSize),
-		hashEntries: d.confInt("hash-max-listpack-entries", defHashEntries),
-		hashValue:   d.confInt("hash-max-listpack-value", defHashValue),
-		setIntset:   d.confInt("set-max-intset-entries", defSetIntset),
-		setEntries:  d.confInt("set-max-listpack-entries", defSetEntries),
-		setValue:    d.confInt("set-max-listpack-value", defSetValue),
-		zsetEntries: d.confInt("zset-max-listpack-entries", defZsetEntries),
-		zsetValue:   d.confInt("zset-max-listpack-value", defZsetValue),
-	}
+	return d.conf.encodingLimits()
 }
 
 // encLimits snapshots the thresholds for the command in flight.
