@@ -1125,19 +1125,27 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 		e.rmwLocks[shard].Unlock()
 		return true
 	}
-	if len(r.body) > keyspace.MaxInlineBody {
-		// An inline write-behind cell cannot hold an over-size body; the durable
-		// write needs the overflow path, so drop to the synchronous route.
-		ok := runSync()
-		e.rmwLocks[shard].Unlock()
-		return ok
-	}
 	// The staged and async writes outlive this command, so the key must be a
 	// heap-owned copy rather than a slice of the connection read buffer. compute's
 	// body is already a fresh allocation. Only this path allocates; the error and
 	// no-write paths above do not.
 	keyCopy := append([]byte(nil), key...)
 	version := e.ks.NextVersion()
+	// A body over MaxInlineBody rides the overflow chain in the B-tree, so the
+	// staged header must not claim FlagInlineBody for it. The staged copy in the
+	// hot cache and wbPending always carries the full body and the read paths
+	// return that body directly without consulting the flag (only the B-tree read
+	// follows FlagInlineBody/BodyRef, and the durable SetWithVersion re-derives the
+	// correct flag and writes the overflow chain there). So an over-size RMW write
+	// stages and fires asynchronously just like a small one, instead of dropping to
+	// the synchronous shard round-trip; this is the LPUSH and large-HSET fast path,
+	// where the list or hash blob grows past the inline cap after a handful of
+	// elements and every later element would otherwise block the reply on a worker
+	// round-trip.
+	flags := uint8(keyspace.FlagInlineBody)
+	if len(r.body) > keyspace.MaxInlineBody {
+		flags = 0
+	}
 	nhdr := keyspace.ValueHeader{
 		Type:     r.typ,
 		Encoding: r.enc,
@@ -1145,7 +1153,7 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 		Version:  version,
 		BodyLen:  uint32(len(r.body)),
 		RefCount: 1,
-		Flags:    keyspace.FlagInlineBody,
+		Flags:    flags,
 	}
 	if r.ttlMs >= 0 {
 		nhdr.Flags |= keyspace.FlagHasTTL
