@@ -203,6 +203,167 @@ func BenchmarkAbsorbVsCollUpdate(b *testing.B) {
 	})
 }
 
+// readAllColl collects every element row of a coll-form key into a map, going
+// through CollRead so it observes the resident copy when the key is in the overlay
+// and the element sub-tree otherwise. It is how the slice-1 tests below assert that
+// a resident, post-fold, and reopened key all return the same set.
+func readAllColl(t *testing.T, db *DB, key string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	ok, err := db.CollRead([]byte(key), func(r *CollReader) error {
+		cur := r.Cursor()
+		for err := cur.First(); cur.Valid(); err = cur.Next() {
+			if err != nil {
+				return err
+			}
+			out[string(cur.Key())] = string(cur.Value())
+		}
+		return nil
+	})
+	if err != nil || !ok {
+		t.Fatalf("readAllColl %s: ok=%v err=%v", key, ok, err)
+	}
+	return out
+}
+
+// TestOverlayResidentThenFoldEvict drives the residency cycle end to end at the
+// keyspace layer: with the gate on, writes to an existing coll-form hash engage the
+// overlay and the key goes resident; reads observe every absorbed write; disabling
+// the overlay folds the resident copy back into its sub-tree and drops the residency
+// map, after which the sub-tree alone returns the full set.
+func TestOverlayResidentThenFoldEvict(t *testing.T) {
+	ks, _, _ := newKS(t)
+	db := mustDB(t, ks, 0)
+	if _, err := ks.SetHashOverlay(true); err != nil {
+		t.Fatalf("enable overlay: %v", err)
+	}
+	// CollUpdate is always coll form at the keyspace layer, so the seed makes h
+	// btree-backed; the follow-up writes then see prevIsTree and engage the overlay.
+	putColl(t, db, "h", map[string]string{"f000": "v000"})
+	const n = 50
+	for i := 1; i < n; i++ {
+		putColl(t, db, "h", map[string]string{fmt.Sprintf("f%03d", i): fmt.Sprintf("v%03d", i)})
+	}
+	s := ShardOf([]byte("h"))
+	if db.shards[s].live["h"] == nil {
+		t.Fatalf("key not resident after absorbed writes")
+	}
+	if got := readAllColl(t, db, "h"); len(got) != n {
+		t.Fatalf("resident read len = %d want %d", len(got), n)
+	}
+
+	// Disabling folds every resident copy back into its sub-tree and drops the
+	// residency map, so no stale copy outlives the overlay.
+	if _, err := ks.SetHashOverlay(false); err != nil {
+		t.Fatalf("disable overlay: %v", err)
+	}
+	if db.shards[s].live != nil {
+		t.Fatalf("residency map survived disable: %v", db.shards[s].live)
+	}
+	got := readAllColl(t, db, "h")
+	if len(got) != n {
+		t.Fatalf("post-fold read len = %d want %d", len(got), n)
+	}
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("f%03d", i)
+		if got[k] != fmt.Sprintf("v%03d", i) {
+			t.Fatalf("%s = %q after fold", k, got[k])
+		}
+	}
+}
+
+// TestOverlayCrossesFoldThreshold absorbs enough writes to cross the inline fold
+// threshold more than once, proving the inline folds along the way never drop or
+// corrupt an element. A trailing fold-all leaves the copy resident and clean and the
+// read set is still complete.
+func TestOverlayCrossesFoldThreshold(t *testing.T) {
+	ks, _, _ := newKS(t)
+	db := mustDB(t, ks, 0)
+	if _, err := ks.SetHashOverlay(true); err != nil {
+		t.Fatalf("enable overlay: %v", err)
+	}
+	putColl(t, db, "h", map[string]string{"seed": "seed"})
+	const n = 600 // crosses the 256 fold threshold twice
+	for i := 0; i < n; i++ {
+		putColl(t, db, "h", map[string]string{fmt.Sprintf("f%04d", i): fmt.Sprintf("v%04d", i)})
+	}
+	if got := readAllColl(t, db, "h"); len(got) != n+1 {
+		t.Fatalf("resident read len = %d want %d", len(got), n+1)
+	}
+
+	if _, err := ks.FoldAllOverlay(); err != nil {
+		t.Fatalf("fold all: %v", err)
+	}
+	got := readAllColl(t, db, "h")
+	if len(got) != n+1 {
+		t.Fatalf("post fold-all read len = %d want %d", len(got), n+1)
+	}
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("f%04d", i)
+		if got[k] != fmt.Sprintf("v%04d", i) {
+			t.Fatalf("%s = %q after fold-all", k, got[k])
+		}
+	}
+}
+
+// TestOverlayFoldOnPersistReopen is the durability invariant: absorbed writes that
+// never reached the sub-tree on their own must survive a fold-all, a commit, and a
+// reopen. A copy left unfolded at the persist boundary would silently lose its
+// writes, so this is the test that gates the overlay's safety.
+func TestOverlayFoldOnPersistReopen(t *testing.T) {
+	fs := vfs.NewMem()
+	p, err := pager.Create(fs, "ov.aki", pager.Options{PageSize: 4096, DBCount: 16})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	ks, err := Open(p)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	db := mustDB(t, ks, 0)
+	if _, err := ks.SetHashOverlay(true); err != nil {
+		t.Fatalf("enable overlay: %v", err)
+	}
+	putColl(t, db, "h", map[string]string{"seed": "seed"})
+	const n = 300
+	for i := 0; i < n; i++ {
+		putColl(t, db, "h", map[string]string{fmt.Sprintf("f%04d", i): fmt.Sprintf("v%04d", i)})
+	}
+	// The persist boundary: fold every resident copy back into its sub-tree, then
+	// commit. FoldAllOverlay is what the command layer runs before SAVE/BGSAVE/an RDB
+	// snapshot/an AOF rewrite/a clean shutdown.
+	if _, err := ks.FoldAllOverlay(); err != nil {
+		t.Fatalf("fold all: %v", err)
+	}
+	if err := ks.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	p2, err := pager.Open(fs, "ov.aki", pager.Options{})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = p2.Close() }()
+	ks2, err := Open(p2)
+	if err != nil {
+		t.Fatalf("reopen keyspace: %v", err)
+	}
+	db2 := mustDB(t, ks2, 0)
+	got := readAllColl(t, db2, "h")
+	if len(got) != n+1 {
+		t.Fatalf("reopened read len = %d want %d", len(got), n+1)
+	}
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("f%04d", i)
+		if got[k] != fmt.Sprintf("v%04d", i) {
+			t.Fatalf("%s = %q after reopen", k, got[k])
+		}
+	}
+}
+
 // seedColl writes the initial element rows so both benchmark arms start from the
 // same populated collection.
 func seedColl(tb testing.TB, db *DB, key string, subs, vals [][]byte) {

@@ -71,6 +71,11 @@ type Keyspace struct {
 	sysTree *btree.Tree
 	version atomic.Uint64 // monotonic write version; use NextVersion to advance
 
+	// hashOverlay gates the in-memory hash write overlay. The command layer sets it
+	// through SetHashOverlay after weighing the commit policy; the keyspace hot path
+	// reads it with one atomic load. Off by default. See keyspace/overlay.go.
+	hashOverlay atomic.Bool
+
 	// expiredLog collects keys deleted by lazy expiry since the last drain. The
 	// command layer empties it with TakeExpired after each access to fire the
 	// "expired" keyspace event. expiredMu guards it so concurrent reads can log
@@ -195,6 +200,14 @@ type dbShard struct {
 	// on a single lock, reducing contention 1/NumShards.
 	wbMu      sync.RWMutex
 	wbPending map[string]wbPendingEntry
+
+	// live holds the resident in-memory copies of btree-backed collections that
+	// the hash write overlay is absorbing element writes for. It is guarded by mu
+	// (every read and write of a resident copy happens under the shard lock) and
+	// stays nil until the first key in this shard goes resident. A resident copy is
+	// authoritative while present; its element sub-tree is the stale, periodically
+	// folded backing. See keyspace/overlay.go.
+	live map[string]*liveColl
 
 	// pendingUncertain counts write-behind keys that entered wbPending but
 	// have not yet been applied to the B-tree. A key is counted once when it
@@ -571,6 +584,9 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 	// do not leak. A coll meta keeps FlagInlineBody set, so it never trips the
 	// overflow branch above; the two are mutually exclusive.
 	if existed && prev.IsColl() && prev.BodyRef != 0 {
+		// Drop any resident overlay copy first: the value is being replaced, so its
+		// in-memory copy must not survive to shadow the new value on a later read.
+		db.overlayEvictLocked(s, key)
 		if err := btree.DropTree(db.ks.pgr, uint32(prev.BodyRef)); err != nil {
 			return err
 		}
@@ -894,6 +910,9 @@ func (db *DB) Delete(key []byte) (bool, error) {
 		// pages return to the freelist; aki has no compaction filter to reclaim
 		// them lazily.
 		if prev.IsColl() && prev.BodyRef != 0 {
+			// Drop any resident overlay copy first: the key is going away, so its
+			// in-memory copy must not survive the sub-tree teardown.
+			db.overlayEvictLocked(s, key)
 			if err := btree.DropTree(db.ks.pgr, uint32(prev.BodyRef)); err != nil {
 				return ok, err
 			}
@@ -962,6 +981,9 @@ func (db *DB) DeleteWithVersion(key []byte, version uint64) (bool, error) {
 			}
 		}
 		if prev.IsColl() && prev.BodyRef != 0 {
+			// Drop any resident overlay copy first: the key is going away, so its
+			// in-memory copy must not survive the sub-tree teardown.
+			db.overlayEvictLocked(s, key)
 			if err := btree.DropTree(db.ks.pgr, uint32(prev.BodyRef)); err != nil {
 				db.removeWBPending(string(key), version)
 				return ok, err

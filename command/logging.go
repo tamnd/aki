@@ -178,10 +178,16 @@ func (d *Dispatcher) SetConfig(name, value string) error {
 		d.logApplyConfig()
 	case "logfile":
 		return d.logReopen()
-	case "appendfsync":
-		// Retune the pager checkpoint cadence so a startup --appendfsync flag has
-		// the same effect as CONFIG SET appendfsync.
+	case "appendonly", "appendfsync":
+		// Retune the pager checkpoint cadence so a startup --appendonly/--appendfsync
+		// flag has the same effect as the matching CONFIG SET. Toggling the AOF flips
+		// whether it carries the always guarantee, which changes the policy too. This
+		// also recomputes the hash overlay gate.
 		d.applyCommitPolicy()
+	case "aki-hash-overlay":
+		// Turn the in-memory hash write overlay on or off so a startup directive has
+		// the same effect as CONFIG SET aki-hash-overlay.
+		d.applyHashOverlay()
 	}
 	return nil
 }

@@ -74,6 +74,9 @@ func (db *DB) flushShard(s int) error {
 	db.shards[s].expireCount.Store(0)
 	db.shards[s].wbPending = nil
 	db.shards[s].pendingUncertain.Store(0)
+	// The data is gone, so the resident overlay copies are dropped without a fold;
+	// there is no sub-tree left to fold into.
+	db.shards[s].live = nil
 	return nil
 }
 
@@ -122,6 +125,7 @@ func (ks *Keyspace) Swap(i, j int) error {
 		a.shards[s].expireCount.Store(be)
 		b.shards[s].expireCount.Store(ae)
 		a.shards[s].wbPending, b.shards[s].wbPending = b.shards[s].wbPending, a.shards[s].wbPending
+		a.shards[s].live, b.shards[s].live = b.shards[s].live, a.shards[s].live
 		au, bu := a.shards[s].pendingUncertain.Load(), b.shards[s].pendingUncertain.Load()
 		a.shards[s].pendingUncertain.Store(bu)
 		b.shards[s].pendingUncertain.Store(au)
