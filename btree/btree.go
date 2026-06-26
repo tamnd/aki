@@ -400,28 +400,70 @@ func (t *Tree) delAr(pgno uint32, key []byte, ar *nodeArena) (bool, error) {
 	return true, t.writeNodeAr(pgno, n, ar)
 }
 
-// find returns the index of key in a leaf and whether it is present.
+// find returns the index of key in a leaf and whether it is present. n.keys is
+// sorted, so it lower-bounds key with a binary search rather than a linear scan.
 func (n *node) find(key []byte) (int, bool) {
-	for i, k := range n.keys {
-		c := bytes.Compare(key, k)
-		if c == 0 {
-			return i, true
-		}
-		if c < 0 {
-			return i, false
+	lo, hi := 0, len(n.keys)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if bytes.Compare(n.keys[mid], key) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
-	return len(n.keys), false
+	if lo < len(n.keys) && bytes.Equal(n.keys[lo], key) {
+		return lo, true
+	}
+	return lo, false
 }
 
 // childIndex returns the child slot to descend into for key on an interior node.
+// Separators are sorted, so this is the first one strictly greater than key.
 func (n *node) childIndex(key []byte) int {
-	for i, k := range n.keys {
-		if bytes.Compare(key, k) < 0 {
-			return i
+	lo, hi := 0, len(n.keys)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if bytes.Compare(n.keys[mid], key) <= 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
-	return len(n.keys)
+	return lo
+}
+
+// slotKeyAt returns the key bytes of the cell named by slot i on page b. keyPrefix
+// is the number of bytes a cell of this page kind carries before its key-length
+// varint: 0 for a leaf cell, 4 for an interior cell whose first four bytes are the
+// left-child pointer. The returned slice aliases b, so the caller must hold the pin.
+func slotKeyAt(b []byte, i, keyPrefix int) []byte {
+	off := int(encoding.U16(b[slotsStart+2*i:])) + keyPrefix
+	kl, m, _ := encoding.Uvarint(b[off:])
+	off += m
+	return b[off : off+int(kl)]
+}
+
+// searchSlots binary-searches the sorted slot array of page b for key. It returns
+// the lower-bound slot position (the first slot whose key is >= key, or count when
+// key is greater than every slot key) and whether that slot's key equals key.
+// Every insert path keeps the slot array in ascending key order, so a binary search
+// is correct and turns an append-heavy workload (where a linear scan walks every
+// cell only to fall off the end) from O(n) into O(log n) probes per page.
+func searchSlots(b []byte, count, keyPrefix int, key []byte) (pos int, found bool) {
+	lo, hi := 0, count
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if bytes.Compare(slotKeyAt(b, mid, keyPrefix), key) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo < count && bytes.Equal(slotKeyAt(b, lo, keyPrefix), key) {
+		return lo, true
+	}
+	return lo, false
 }
 
 // descendOnPage finds the child to follow for key on the interior page b, reading
@@ -440,20 +482,19 @@ func descendOnPage(b, key []byte) (ci int, child uint32, err error) {
 		return 0, 0, fmt.Errorf("aki/btree: descend on non-interior page (type 0x%02x)", h.Type)
 	}
 	count := int(h.CellCount)
-	for i := range count {
-		off := int(encoding.U16(b[slotsStart+2*i:]))
-		c := encoding.U32(b[off:])
-		off += 4
-		kl, m, derr := encoding.Uvarint(b[off:])
-		if derr != nil {
-			return 0, 0, derr
-		}
-		off += m
-		if bytes.Compare(key, b[off:off+int(kl)]) < 0 {
-			return i, c, nil
-		}
+	// Descend into the child left of the first separator strictly greater than key,
+	// or the rightmost child when key is past every separator. The lower bound is the
+	// first separator >= key; an exact hit must descend to the right of its separator,
+	// so step one past an equal slot to match the original strict-less-than scan.
+	pos, found := searchSlots(b, count, 4, key)
+	if found {
+		pos++
 	}
-	return count, encoding.U32(b[16:]), nil
+	if pos >= count {
+		return count, encoding.U32(b[16:]), nil
+	}
+	off := int(encoding.U16(b[slotsStart+2*pos:]))
+	return pos, encoding.U32(b[off:]), nil
 }
 
 // leafLookup finds key on the leaf page b and returns a heap-owned copy of its
@@ -470,28 +511,22 @@ func leafLookup(b, key []byte) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("aki/btree: leaf lookup on non-leaf page (type 0x%02x)", h.Type)
 	}
 	count := int(h.CellCount)
-	for i := range count {
-		off := int(encoding.U16(b[slotsStart+2*i:]))
-		kl, m, derr := encoding.Uvarint(b[off:])
-		if derr != nil {
-			return nil, false, derr
-		}
-		off += m
-		cmp := bytes.Compare(key, b[off:off+int(kl)])
-		if cmp < 0 {
-			return nil, false, nil
-		}
-		off += int(kl)
-		vl, m2, derr := encoding.Uvarint(b[off:])
-		if derr != nil {
-			return nil, false, derr
-		}
-		off += m2
-		if cmp == 0 {
-			return bytes.Clone(b[off : off+int(vl)]), true, nil
-		}
+	pos, found := searchSlots(b, count, 0, key)
+	if !found {
+		return nil, false, nil
 	}
-	return nil, false, nil
+	off := int(encoding.U16(b[slotsStart+2*pos:]))
+	kl, m, derr := encoding.Uvarint(b[off:])
+	if derr != nil {
+		return nil, false, derr
+	}
+	off += m + int(kl)
+	vl, m2, derr := encoding.Uvarint(b[off:])
+	if derr != nil {
+		return nil, false, derr
+	}
+	off += m2
+	return bytes.Clone(b[off : off+int(vl)]), true, nil
 }
 
 // upsertAr inserts key/val into a leaf in sorted order (or replaces the value
@@ -539,33 +574,21 @@ func leafUpsertInPlace(b, key, val []byte) (oldVal []byte, done bool) {
 		return nil, false
 	}
 	count := int(h.CellCount)
-	pos := count
-	matched := false
+	pos, matched := searchSlots(b, count, 0, key)
 	var matchVStart, matchVLen int
-	for i := range count {
-		off := int(encoding.U16(b[slotsStart+2*i:]))
+	if matched {
+		off := int(encoding.U16(b[slotsStart+2*pos:]))
 		kl, m, derr := encoding.Uvarint(b[off:])
 		if derr != nil {
 			return nil, false
 		}
-		ko := off + m
-		cmp := bytes.Compare(key, b[ko:ko+int(kl)])
-		if cmp < 0 {
-			pos = i
-			break
+		vo := off + m + int(kl)
+		vl, m2, derr := encoding.Uvarint(b[vo:])
+		if derr != nil {
+			return nil, false
 		}
-		if cmp == 0 {
-			vo := ko + int(kl)
-			vl, m2, derr := encoding.Uvarint(b[vo:])
-			if derr != nil {
-				return nil, false
-			}
-			matchVStart = vo + m2
-			matchVLen = int(vl)
-			pos = i
-			matched = true
-			break
-		}
+		matchVStart = vo + m2
+		matchVLen = int(vl)
 	}
 
 	newCellLen := uvarintLen(uint64(len(key))) + len(key) + uvarintLen(uint64(len(val))) + len(val)
