@@ -157,6 +157,11 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 		d.statError(oomError)
 		return
 	}
+	// Stream the command to any attached MONITOR before running it, the point
+	// Redis feeds its monitors. The gate keeps the no-monitor path free.
+	if d.monitors.active() {
+		d.feedMonitors(ctx, cmd)
+	}
 	// Capture the dirty counter around a write so the AOF and the replication
 	// stream only record commands that actually changed the dataset, the same rule
 	// Redis uses to decide whether to propagate. When replication is active a write
