@@ -38,16 +38,48 @@ func handleHGetDel(ctx *Ctx) {
 	out := make([]fieldValue, len(fields))
 	var wrongTyp, deleted, emptied bool
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		hf, hdr, found, err := getHash(db, key)
+		hdr, found, err := hashHeader(db, key)
 		if err != nil {
 			return err
 		}
-		if found && hdr.Type != keyspace.TypeHash {
+		if !found {
+			return nil
+		}
+		if hdr.Type != keyspace.TypeHash {
 			wrongTyp = true
 			return nil
 		}
-		if !found {
-			return nil
+		if hdr.IsColl() {
+			return db.CollUpdate(key, keyspace.TypeHash, keyspace.EncHashtable, func(w *keyspace.CollWriter) error {
+				for fi, fname := range fields {
+					row, present, e := w.Get(fname)
+					if e != nil {
+						return e
+					}
+					if !present {
+						continue
+					}
+					ttl, val, de := hashRowDecode(row)
+					if de != nil {
+						return de
+					}
+					if hashRowExpired(ttl) {
+						continue
+					}
+					out[fi] = fieldValue{val: append([]byte(nil), val...), present: true}
+					if _, e := w.Delete(fname); e != nil {
+						return e
+					}
+					w.SetCount(w.Count() - 1)
+					deleted = true
+				}
+				emptied = w.Count() == 0
+				return nil
+			})
+		}
+		hf, _, _, err := getHash(db, key)
+		if err != nil {
+			return err
 		}
 		changed := false
 		for fi, fname := range fields {
@@ -124,16 +156,65 @@ func handleHGetEx(ctx *Ctx) {
 	out := make([]fieldValue, len(fields))
 	var wrongTyp, setTTL, delField, persisted, emptied bool
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		hf, hdr, found, err := getHash(db, key)
+		hdr, found, err := hashHeader(db, key)
 		if err != nil {
 			return err
 		}
-		if found && hdr.Type != keyspace.TypeHash {
+		if !found {
+			return nil
+		}
+		if hdr.Type != keyspace.TypeHash {
 			wrongTyp = true
 			return nil
 		}
-		if !found {
-			return nil
+		if hdr.IsColl() {
+			return db.CollUpdate(key, keyspace.TypeHash, keyspace.EncHashtable, func(w *keyspace.CollWriter) error {
+				for fi, fname := range fields {
+					row, present, e := w.Get(fname)
+					if e != nil {
+						return e
+					}
+					if !present {
+						continue
+					}
+					ttl, val, de := hashRowDecode(row)
+					if de != nil {
+						return de
+					}
+					if hashRowExpired(ttl) {
+						continue
+					}
+					out[fi] = fieldValue{val: append([]byte(nil), val...), present: true}
+					switch mode {
+					case "set":
+						if when <= now {
+							if _, e := w.Delete(fname); e != nil {
+								return e
+							}
+							w.SetCount(w.Count() - 1)
+							delField = true
+						} else {
+							if _, e := w.Put(fname, hashRowEncode(when, val)); e != nil {
+								return e
+							}
+							setTTL = true
+						}
+					case "persist":
+						if ttl != 0 {
+							if _, e := w.Put(fname, hashRowEncode(0, val)); e != nil {
+								return e
+							}
+							persisted = true
+						}
+					}
+				}
+				emptied = w.Count() == 0
+				return nil
+			})
+		}
+		hf, _, _, err := getHash(db, key)
+		if err != nil {
+			return err
 		}
 		changed := false
 		for fi, fname := range fields {
