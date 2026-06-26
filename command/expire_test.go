@@ -20,8 +20,10 @@ func intReply(t *testing.T, line string) int64 {
 }
 
 // farFuture is an absolute Unix-ms expiry well past any real clock, so tests can
-// assert exact PEXPIRETIME values without pinning time.
-const farFuture = 99999999999999
+// assert exact PEXPIRETIME values without pinning time. It stays under the hash
+// field ebuckets ceiling (2^46-1 ms) so the same constant is valid for the hash
+// TTL setters, which cap there, as well as the uncapped string EXPIRE family.
+const farFuture = 9999999999999
 
 func TestExpireBasic(t *testing.T) {
 	r, c := startData(t)

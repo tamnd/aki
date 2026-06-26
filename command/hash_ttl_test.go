@@ -268,3 +268,33 @@ func TestHExpireErrors(t *testing.T) {
 		t.Fatalf("HEXPIRE wrongtype = %q", got)
 	}
 }
+
+// TestHExpireMaxBound checks the ebuckets 2^46-1 ms ceiling on hash field
+// expiries, the bound Redis 7.4 enforces. HEXPIREAT at exactly the last accepted
+// second (70368744177) is allowed, one second past it is rejected, and the
+// millisecond setters honour the same edge to the millisecond. The string-level
+// EXPIRE family is uncapped, so this is exercised only through the hash setters.
+func TestHExpireMaxBound(t *testing.T) {
+	r, c := startData(t)
+	_ = sendLine(t, r, c, "HSET h f v")
+
+	// 70368744177 s = 70368744177000 ms, under 2^46-1, accepted.
+	if got := codeArray(t, r, c, "HEXPIREAT h 70368744177 FIELDS 1 f"); len(got) != 1 || got[0] != "1" {
+		t.Fatalf("HEXPIREAT at last accepted second = %v want [1]", got)
+	}
+	// One second past: 70368744178000 ms > 2^46-1, rejected.
+	if got := sendLine(t, r, c, "HEXPIREAT h 70368744178 FIELDS 1 f"); got != "-ERR invalid expire time in 'hexpireat' command" {
+		t.Fatalf("HEXPIREAT past bound = %q", got)
+	}
+	// HPEXPIREAT to the millisecond edge: 2^46-1 accepted, 2^46 rejected.
+	if got := codeArray(t, r, c, "HPEXPIREAT h 70368744177663 FIELDS 1 f"); len(got) != 1 || got[0] != "1" {
+		t.Fatalf("HPEXPIREAT at 2^46-1 = %v want [1]", got)
+	}
+	if got := sendLine(t, r, c, "HPEXPIREAT h 70368744177664 FIELDS 1 f"); got != "-ERR invalid expire time in 'hpexpireat' command" {
+		t.Fatalf("HPEXPIREAT at 2^46 = %q", got)
+	}
+	// The same ceiling applies to HGETEX EXAT.
+	if got := sendLine(t, r, c, "HGETEX h EXAT 70368744178 FIELDS 1 f"); got != "-ERR invalid expire time in 'hgetex' command" {
+		t.Fatalf("HGETEX EXAT past bound = %q", got)
+	}
+}

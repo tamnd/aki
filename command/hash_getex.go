@@ -138,7 +138,7 @@ func handleHGetEx(ctx *Ctx) {
 		}
 		i += 2
 		w, ok := whenFor(getExMode(opt), now, val)
-		if !ok {
+		if !ok || w > maxHashFieldExpireMillis {
 			ctx.enc().WriteError("ERR invalid expire time in 'hgetex' command")
 			return
 		}
