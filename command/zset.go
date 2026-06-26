@@ -106,19 +106,29 @@ parsed:
 	// that mutated them and then fell back here is recounted cleanly.
 	sync := func(db *keyspace.DB) error {
 		added, changed, incrBlocked = 0, 0, false
-		hdr, found, err := zsetHeader(db, key)
-		if err != nil {
-			return err
-		}
-		if found && hdr.Type != keyspace.TypeZSet {
-			wrongTyp = true
-			return nil
-		}
-		// A sorted set already in the btree-backed form takes the point-write path:
-		// each pair reads the member's score row and updates both rows in place, no
-		// whole-blob decode and rewrite.
-		if found && hdr.IsColl() {
-			return db.CollUpdate(ctx.Argv[1], keyspace.TypeZSet, keyspace.EncSkiplist, func(w *keyspace.CollWriter) error {
+		// CollUpdateRouted reads the metadata row once under the write lock and routes
+		// from it, so a coll-form zset skips the separate zsetHeader (Peek) this path
+		// used to do before CollUpdate read the same row again.
+		var (
+			hdr   keyspace.ValueHeader
+			found bool
+		)
+		route, err := db.CollUpdateRouted(key, keyspace.TypeZSet, keyspace.EncSkiplist,
+			func(rFound bool, h keyspace.ValueHeader, _ []byte) keyspace.CollRoute {
+				hdr, found = h, rFound
+				if rFound && h.Type != keyspace.TypeZSet {
+					wrongTyp = true
+					return keyspace.CollRouteSkip
+				}
+				if rFound && h.IsColl() {
+					return keyspace.CollRouteColl
+				}
+				return keyspace.CollRouteBlob
+			},
+			// A sorted set already in the btree-backed form takes the point-write path:
+			// each pair reads the member's score row and updates both rows in place, no
+			// whole-blob decode and rewrite.
+			func(w *keyspace.CollWriter) error {
 				for _, p := range pairs {
 					cur, mfound, e := zTreeScore(w, p.member)
 					if e != nil {
@@ -149,6 +159,11 @@ parsed:
 				}
 				return nil
 			})
+		if err != nil {
+			return err
+		}
+		if route != keyspace.CollRouteBlob {
+			return nil
 		}
 		members, _, _, err := getZSet(db, ctx.Argv[1])
 		if err != nil {
