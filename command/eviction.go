@@ -209,12 +209,14 @@ func (d *Dispatcher) runCommand(ctx *Ctx, cmd *CmdDesc) {
 		args := rewriteForAOF(cmd.Name, ctx.Argv)
 		if args != nil {
 			if d.aofEnabled() {
-				// An online connection under a deferred policy buffers its record in
-				// its own session and OnBatchComplete flushes the whole drain under one
-				// AOF lock. The always policy and offline connections (scripts, replay)
-				// append inline: always must be durable before its reply, and an offline
-				// connection never reaches OnBatchComplete to flush its session buffer.
-				if ctx.sess != nil && !ctx.Conn.IsOffline() && d.aofFsyncPolicy() != "always" {
+				// An online connection buffers its record in its own session and
+				// OnBatchComplete flushes the whole drain under one AOF lock. Under the
+				// always policy OnBatchComplete also group-commits the batch with one
+				// fsync before serve() writes the replies, so the durability contract
+				// holds for the whole pipeline at the cost of a single fsync. Offline
+				// connections (scripts, replay) append inline because they never reach
+				// OnBatchComplete to flush their session buffer.
+				if ctx.sess != nil && !ctx.Conn.IsOffline() {
 					d.bufferAOFRecord(ctx.sess, ctx.Conn.DB(), args)
 				} else {
 					d.appendAOF(ctx.Conn.DB(), args)

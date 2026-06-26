@@ -224,7 +224,10 @@ func (d *Dispatcher) flushIncrPending(c *networking.Conn, sess *session) {
 
 	enc := c.Enc()
 	aofOn := d.aofEnabled()
-	bufferAOF := aofOn && !c.IsOffline() && d.aofFsyncPolicy() != "always"
+	// Online connections buffer per session regardless of policy; under always
+	// OnBatchComplete group-commits the drain with one fsync before the replies go
+	// out, so the buffered records are durable before this batch's replies.
+	bufferAOF := aofOn && !c.IsOffline()
 	tracking := d.trackingActive()
 	for i := range ops {
 		op := &ops[i]

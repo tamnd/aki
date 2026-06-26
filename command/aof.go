@@ -453,6 +453,16 @@ func (d *Dispatcher) OnBatchComplete(c *networking.Conn) {
 	d.aof.mu.Lock()
 	d.spliceSessionAOFLocked(sess)
 	d.flushIncrLocked()
+	// Under the always policy the batch must be durable before its replies leave
+	// the socket. serve() runs this hook before it flushes the reply buffer, so a
+	// single group-commit fsync here makes the whole drained pipeline durable at
+	// once. That matches Redis, which fsyncs the AOF once per event-loop iteration
+	// in beforeSleep and only then writes the replies, instead of paying one fsync
+	// per command. groupSyncLocked is a no-op when there is nothing new to sync, so
+	// a read-only batch costs one comparison.
+	if d.aofFsyncPolicy() == "always" && !d.aofSyncBlockedByRewrite() {
+		d.groupSyncLocked(d.aof.writeSeq)
+	}
 	d.aof.mu.Unlock()
 }
 
