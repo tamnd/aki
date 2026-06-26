@@ -17,6 +17,12 @@ func dumpCommands() []*CmdDesc {
 		{Name: "restore", Group: GroupGeneric, Since: "2.6.0",
 			Arity: -4, Flags: FlagWrite | FlagDenyOOM, FirstKey: 1, LastKey: 1, Step: 1,
 			Handler: handleRestore},
+		// RESTORE-ASKING is the cluster-migration variant of RESTORE: a node accepts
+		// it for a slot it is importing after an ASKING redirect. aki is standalone,
+		// so the ASKING gate is a no-op and the behaviour is exactly RESTORE.
+		{Name: "restore-asking", Group: GroupServer, Since: "3.0.0",
+			Arity: -4, Flags: FlagWrite | FlagDenyOOM, FirstKey: 1, LastKey: 1, Step: 1,
+			Handler: handleRestore},
 	}
 }
 

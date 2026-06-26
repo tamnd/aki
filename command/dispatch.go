@@ -245,6 +245,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, memoryCommands()...)
 	cmds = append(cmds, scriptCommands()...)
 	cmds = append(cmds, functionCommands()...)
+	cmds = append(cmds, moduleCommands()...)
 	cmds = append(cmds, replicationCommands()...)
 	cmds = append(cmds, clusterCommands()...)
 	cmds = append(cmds, clusterConnCommands()...)
