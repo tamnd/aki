@@ -35,6 +35,11 @@ type writeReq struct {
 	setEnc  uint8
 	setTTL  int64
 	setVer  uint64
+	// setDel turns the inline fast path into a delete: when true the worker calls
+	// db.DeleteWithVersion(setKey, setVer) instead of SetWithVersion. setKey is the
+	// key to remove and setBody is unused. It rides the same setKey-keyed coalescing
+	// as SET, so a tombstone and a later same-key SET resolve by version.
+	setDel bool
 	// next is the intrusive link for the per-shard lock-free hand-off queue
 	// (shardQueue). Producers store it under the Treiber compare-and-swap; the
 	// single consumer reuses it to hold the reversed first-in-first-out list. It
@@ -163,14 +168,25 @@ type Engine struct {
 	// producer that sees it false sheds to the synchronous global path instead of
 	// pushing to a queue whose worker is draining to exit.
 	shardsRunning atomic.Bool
-	// rmwLocks serialize write-behind read-modify-write ops per shard. A blind
-	// SET can stage and fire its durable write without reading, but an RMW
-	// (INCR, LPUSH, SADD, HSET, ZADD) computes its reply from the current value,
-	// so two same-key RMW writers must serialize or one loses its update. The
-	// connection goroutine holds rmwLocks[ShardOf(key)] across the read, compute
-	// and stage, then fires the async B-tree write and releases it. The shard
-	// worker never takes this lock, so the async apply cannot deadlock against it.
-	rmwLocks [keyspace.NumShards]sync.Mutex
+	// rmwLocks serialize write-behind read-modify-write ops. A blind SET can stage
+	// and fire its durable write without reading, but an RMW (INCR, LPUSH, SADD,
+	// HSET, ZADD) computes its reply from the current value, so two same-key RMW
+	// writers must serialize or one loses its update. The connection goroutine holds
+	// rmwLocks[rmwStripe(key)] across the read, compute and stage, then fires the
+	// async B-tree write and releases it. The shard worker never takes this lock, so
+	// the async apply cannot deadlock against it.
+	//
+	// The stripe is far finer than the eight shards. The lock's only job is per-key
+	// read-compute-stage atomicity; the per-key sinks (hot cache, wbPending, the
+	// B-tree shard) synchronize themselves, and the shard worker never touches this
+	// lock, so two different keys never need the same one. Striping per shard forced
+	// every key on a shard to serialize: under the queue and HSET workloads the
+	// profile put a third of all CPU in this one mutex (lock2 / semacquire /
+	// semrelease). Striping by a 1024-way key hash keeps same-key writers serialized
+	// (same key hashes to the same stripe) while letting independent keys run in
+	// parallel, which is the actual invariant. 1024 divides the 16384 hash-slot space
+	// evenly so the stripes fill uniformly.
+	rmwLocks [rmwStripes]sync.Mutex
 	// workerStop is closed by StopWorker to signal all write goroutines to drain
 	// and exit. workerDone is closed once every goroutine has exited.
 	workerStop chan struct{}
@@ -295,6 +311,19 @@ func (e *Engine) runShardWorker(s int) {
 			e.drainShardList(s, batch, sc)
 			continue
 		}
+		// Bounded spin before parking. A worker that spreads a pipeline across all
+		// shards (RPUSH+LPOP queue traffic, for example) drains each shard to empty
+		// between bursts, and parking on the doorbell every time pays a three-channel
+		// select plus a runtime-timer arm per cycle: under that workload the profile
+		// put a third of all CPU in runtime.lock2 (the select's sellock) and a quarter
+		// in selectgo. The next pipelined batch almost always lands within a few
+		// microseconds, so spin-poll for it first and only fall through to the park
+		// when the stream has genuinely gone quiet. This keeps a steadily fed worker
+		// off the timer heap and the select entirely.
+		if batch := spinForBatch(q); batch != nil {
+			e.drainShardList(s, batch, sc)
+			continue
+		}
 		q.state.Store(stateParked)
 		// Re-check: a producer that pushed while we were still running skipped the
 		// doorbell, so we must look once more before blocking on it.
@@ -323,6 +352,59 @@ func (e *Engine) runShardWorker(s int) {
 			q.state.Store(stateRunning)
 		}
 	}
+}
+
+// rmwStripes is the number of read-modify-write serialization stripes. It is a
+// power of two so the index is a mask, and a divisor of the 16384-slot hash space
+// so the stripes fill evenly. 1024 is far finer than the eight shards: it keeps
+// same-key RMW writers serialized while letting independent keys run in parallel,
+// which dropped the rmwLocks mutex from a third of CPU to noise on the write
+// workloads (see rmwLocks).
+const rmwStripes = 1024
+
+// rmwStripeMask selects the stripe bits from a key's hash slot.
+const rmwStripeMask = rmwStripes - 1
+
+// rmwStripe maps a key to its read-modify-write stripe. It reuses the keyspace
+// hash slot (the same value ShardOf derives the shard from), so a key always maps
+// to one stripe and hash-tagged keys ({tag}) stripe by their tag, consistently
+// with shard routing.
+func rmwStripe(key []byte) int {
+	return int(keyspace.HashSlot(key)) & rmwStripeMask
+}
+
+// shardSpinPolls bounds the spin a worker does before it parks: how many times it
+// peeks the queue head looking for the next pipelined batch. It is a pure busy
+// poll of cheap atomic loads with no runtime.Gosched, so it never touches the
+// global scheduler lock (an earlier Gosched-based spin moved the contention there
+// instead of removing it). The polls are cheap atomic loads, so even the full budget
+// is well under a microsecond and a genuinely idle worker still parks promptly rather
+// than burning a core.
+//
+// 512 is the measured knee. A pipelined producer staging a burst of writes leaves a
+// short gap between adjacent batches reaching one shard; a 64-poll budget was too thin
+// to bridge that gap, so the worker parked and paid a futex wake on the very next
+// write. The wake storm showed in the profile as runtime.usleep / runqgrab / semrelease
+// dominating CPU. Raising the budget to 512 lets the worker stay hot across the gap and
+// keep draining: on the durable queue workload (pipeline 128, 50 clients) throughput
+// rose from ~1.6M to ~2.8M ops/s, flat from 256 up, so 512 sits comfortably in the
+// plateau without spinning longer than the gap it needs to cover.
+const shardSpinPolls = 512
+
+// spinForBatch polls the queue head for a short bounded window and returns the
+// next batch as soon as one is staged, or nil if the stream stayed empty for the
+// whole window (the worker should then park). It peeks q.top with a plain load and
+// only swaps the stack out once it sees work, so an empty spin never writes the
+// contended head cache line that producers compare-and-swap on.
+func spinForBatch(q *shardQueue) *writeReq {
+	for i := 0; i < shardSpinPolls; i++ {
+		if q.top.Load() != nil {
+			if batch := q.popAll(); batch != nil {
+				return batch
+			}
+		}
+	}
+	return nil
 }
 
 // drainShardList applies a first-in-first-out list popped from shardQ[s]. It
@@ -399,14 +481,17 @@ func (e *Engine) coalesceSets(sc *drainScratch) {
 	}
 }
 
-// recycleSuperseded returns a coalesced-away SET request to the async pool without
-// touching the B-tree. The winning write for the key advances the dirty state and
-// owns the write-behind entry, so a superseded request needs no bookkeeping; it is
-// always a fire-and-forget SET (done == nil), since only sendSetAsync produces the
-// setKey requests coalesceSets can skip.
+// recycleSuperseded returns a coalesced-away SET or delete request to the async
+// pool without touching the B-tree. The winning write for the key advances the
+// dirty state and owns the write-behind entry, so a superseded request needs no
+// bookkeeping; it is always fire-and-forget (done == nil), since only sendSetAsync
+// and sendDeleteAsync produce the setKey requests coalesceSets can skip, and both
+// the staged value and the staged tombstone are owned by whichever same-key write
+// has the highest version.
 func (e *Engine) recycleSuperseded(req *writeReq) {
 	req.setKey = nil
 	req.setBody = nil
+	req.setDel = false
 	req.fn = nil
 	asyncReqPool.Put(req)
 }
@@ -562,7 +647,11 @@ func (e *Engine) applyWriteReqDeferred(req *writeReq) {
 	db, err := e.ks.DB(req.index)
 	if err == nil {
 		if req.setKey != nil {
-			err = db.SetWithVersion(req.setKey, req.setBody, req.setTyp, req.setEnc, req.setTTL, req.setVer)
+			if req.setDel {
+				_, err = db.DeleteWithVersion(req.setKey, req.setVer)
+			} else {
+				err = db.SetWithVersion(req.setKey, req.setBody, req.setTyp, req.setEnc, req.setTTL, req.setVer)
+			}
 		} else {
 			err = req.fn(db)
 		}
@@ -576,6 +665,7 @@ func (e *Engine) applyWriteReqDeferred(req *writeReq) {
 	} else {
 		req.setKey = nil
 		req.setBody = nil
+		req.setDel = false
 		req.fn = nil
 		asyncReqPool.Put(req)
 	}
@@ -636,6 +726,7 @@ func (e *Engine) sendSetAsync(index, shard int, key, body []byte, typ, enc uint8
 		req.done = nil
 		req.setKey = key
 		req.setBody = body
+		req.setDel = false
 		req.setTyp = typ
 		req.setEnc = enc
 		req.setTTL = ttl
@@ -645,6 +736,33 @@ func (e *Engine) sendSetAsync(index, shard int, key, body []byte, typ, enc uint8
 	}
 	return e.update(index, func(db *keyspace.DB) error {
 		return db.SetWithVersion(key, body, typ, enc, ttl, ver)
+	})
+}
+
+// sendDeleteAsync enqueues a write-behind delete on shardQ[shard], the delete
+// twin of sendSetAsync. The worker calls DeleteWithVersion with the pre-assigned
+// version, which version-guards the B-tree removal so a reordered older delete
+// cannot clobber a newer same-key write. It falls back to the synchronous shard
+// path under the same conditions as sendSetAsync (no workers, commitAlways, or the
+// shard queue at its depth bound).
+func (e *Engine) sendDeleteAsync(index, shard int, key []byte, ver uint64) error {
+	if e.shardsRunning.Load() && commitPolicy(e.policy.Load()) != commitAlways &&
+		e.shardQ[shard].length.Load() < shardQueueCap {
+		req := asyncReqPool.Get().(*writeReq)
+		req.index = index
+		req.shard = shard
+		req.fn = nil
+		req.done = nil
+		req.setKey = key
+		req.setBody = nil
+		req.setDel = true
+		req.setVer = ver
+		e.shardQ[shard].push(req)
+		return nil
+	}
+	return e.update(index, func(db *keyspace.DB) error {
+		_, err := db.DeleteWithVersion(key, ver)
+		return err
 	})
 }
 
@@ -1019,6 +1137,11 @@ type rmwResult struct {
 	// update, a listpack to quicklist promotion, or any case its syncFn handles
 	// but the fast path cannot. write is ignored when fallback is set.
 	fallback bool
+	// del asks the helper to stage a delete (tombstone) instead of a value write,
+	// for a read-modify-write whose result is to remove the key: an LPOP or RPOP
+	// that empties its list, for instance. body/typ/enc/ttl are ignored and write
+	// is treated as false. fallback takes precedence over del.
+	del bool
 }
 
 // rmwWriteBehind runs a whole-body read-modify-write for key with the durable
@@ -1105,24 +1228,42 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 	}
 
 	shard := keyspace.ShardOf(key)
-	e.rmwLocks[shard].Lock()
+	stripe := rmwStripe(key)
+	e.rmwLocks[stripe].Lock()
 	cur, hdr, found, err := db.Get(key)
 	if err != nil {
-		e.rmwLocks[shard].Unlock()
+		e.rmwLocks[stripe].Unlock()
 		ctx.enc().WriteError("ERR " + err.Error())
 		return false
 	}
 	r := compute(cur, hdr, found)
 	if r.fallback {
 		// compute hit a case the fast path cannot stage (a btree-backed collection
-		// or a promotion). Run the synchronous closure while still holding the shard
-		// RMW lock so a concurrent fast-path stage on this shard cannot interleave.
+		// or a promotion). Run the synchronous closure while still holding this key's
+		// RMW stripe so a concurrent fast-path stage on the same key cannot interleave.
 		ok := runSync()
-		e.rmwLocks[shard].Unlock()
+		e.rmwLocks[stripe].Unlock()
 		return ok
 	}
+	if r.del {
+		// The RMW removes the key (an LPOP/RPOP that emptied its list). Stage a
+		// tombstone under the lock so a concurrent same-key writer cannot read the
+		// old value, then fire the version-guarded delete asynchronously, mirroring
+		// the staged-SET path. The key copy outlives this command, so it must not
+		// alias the connection read buffer.
+		keyCopy := append([]byte(nil), key...)
+		version := e.ks.NextVersion()
+		db.PrepareDeleteBehind(keyCopy, version)
+		e.rmwLocks[stripe].Unlock()
+		if asyncErr := e.sendDeleteAsync(index, shard, keyCopy, version); asyncErr != nil {
+			ctx.enc().WriteError("ERR " + asyncErr.Error())
+			return false
+		}
+		ctx.d.persist.markDirty()
+		return true
+	}
 	if !r.write {
-		e.rmwLocks[shard].Unlock()
+		e.rmwLocks[stripe].Unlock()
 		return true
 	}
 	// The staged and async writes outlive this command, so the key must be a
@@ -1159,7 +1300,7 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 		nhdr.Flags |= keyspace.FlagHasTTL
 	}
 	db.PrepareWriteBehind(keyCopy, r.body, nhdr)
-	e.rmwLocks[shard].Unlock()
+	e.rmwLocks[stripe].Unlock()
 	// The durable hand-off does not need the RMW lock. The lock's job is to make
 	// the read-modify-stage atomic so two pushes to one key cannot both read the
 	// old value and lose an update; once PrepareWriteBehind has staged this write

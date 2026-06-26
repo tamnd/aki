@@ -120,7 +120,7 @@ func handleLSet(ctx *Ctx) {
 		// A btree-backed list resolves the index to a position and writes that one
 		// row rather than rewriting the whole blob.
 		if hdr.IsColl() {
-			oob, err = listTreeSet(db, key, val, idx)
+			oob, err = listTreeSet(db, ctx.encLimits(), key, val, idx, hdr.Encoding)
 			return err
 		}
 		elems, _, _, err := getList(db, key)

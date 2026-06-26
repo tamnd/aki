@@ -74,7 +74,7 @@ func TestPrepareWriteBehindVersionGuard(t *testing.T) {
 	db.PrepareWriteBehind(key, newer, mkHdr(newer, 2))
 	db.PrepareWriteBehind(key, older, mkHdr(older, 1))
 
-	b, _, ok := db.getWBPending(string(key))
+	b, _, ok, _ := db.getWBPending(string(key))
 	if !ok {
 		t.Fatal("wbPending entry missing")
 	}

@@ -195,6 +195,14 @@ func TestXInfoStreamFullGroups(t *testing.T) {
 	if !contains(toks, "g1") || !contains(toks, "c1") {
 		t.Fatalf("XINFO STREAM FULL groups = %v", toks)
 	}
+	// Redis 7.x emits lag per group and pel-count per consumer in STREAM FULL.
+	// Both were missing before; guard against the regression.
+	if !contains(toks, "lag") {
+		t.Fatalf("XINFO STREAM FULL missing group lag: %v", toks)
+	}
+	if !contains(toks, "pel-count") {
+		t.Fatalf("XINFO STREAM FULL missing pel-count: %v", toks)
+	}
 }
 
 func TestXGroupWrongType(t *testing.T) {

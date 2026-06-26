@@ -66,12 +66,18 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 			return nil
 		}
 		// A list already in the btree-backed form takes the window-write path: each
-		// value is one row at a new head or tail position, no whole-blob rewrite.
+		// value is one row at a new head or tail position, no whole-blob rewrite. The
+		// reported encoding is recomputed from the post-push count and byte total so a
+		// coll list that is still small keeps reporting listpack.
 		if found && hdr.IsColl() {
-			return db.CollUpdate(key, keyspace.TypeList, keyspace.EncQuicklist, func(w *keyspace.CollWriter) error {
+			return db.CollUpdate(key, keyspace.TypeList, hdr.Encoding, func(w *keyspace.CollWriter) error {
 				n, e := listTreePush(w, vals, head)
+				if e != nil {
+					return e
+				}
 				newLen = n
-				return e
+				w.SetEnc(listCollReportedEnc(lim, hdr.Encoding, int(n), w.Bytes(), vals))
+				return nil
 			})
 		}
 		// Blob form (or a fresh key): splice the pushed run into the raw body rather
@@ -99,14 +105,18 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 		if err != nil {
 			return err
 		}
-		// A list that has grown past the listpack threshold moves to the
-		// btree-backed form, the same point Redis flips listpack -> quicklist.
-		if enc == keyspace.EncQuicklist {
+		// The list moves to the btree-backed form either when it crosses the quicklist
+		// threshold (matching Redis listpack -> quicklist) or, earlier, once its blob
+		// would spill to overflow pages: past that point a blob push rewrites the whole
+		// body on every call (O(n) per push, O(n^2) per key), so element-per-row
+		// storage takes over while OBJECT ENCODING keeps reporting listpack until the
+		// real threshold.
+		if enc == keyspace.EncQuicklist || len(newBody) > keyspace.MaxInlineBody {
 			elems, e := listDecode(newBody)
 			if e != nil {
 				return e
 			}
-			return listPromote(db, key, elems)
+			return listPromote(db, key, elems, enc)
 		}
 		return db.Set(key, newBody, keyspace.TypeList, enc, keepTTL(hdr, found))
 	}
@@ -140,7 +150,10 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 		if err != nil {
 			return rmwResult{fallback: true}
 		}
-		if enc == keyspace.EncQuicklist {
+		// The same early-coll boundary as the sync path: a body that would spill to
+		// overflow cannot be staged as a blob without reintroducing the whole-blob
+		// rewrite, so fall back to the sync path, which moves it to coll form.
+		if enc == keyspace.EncQuicklist || len(newBody) > keyspace.MaxInlineBody {
 			return rmwResult{fallback: true}
 		}
 		newLen = int64(newCount)
@@ -195,7 +208,11 @@ func popList(ctx *Ctx, head bool) {
 		emptied  bool
 		popped   [][]byte
 	)
-	done := ctx.updateShard(key, func(db *keyspace.DB) error {
+	lim := ctx.encLimits()
+	// sync is the synchronous closure: the btree-backed collection form, the
+	// non-deferred policy, and the fast path's fallback all run through it. It pops
+	// in place for a coll list and rewrites or deletes the blob for a listpack list.
+	sync := func(db *keyspace.DB) error {
 		hdr, found, err := listHeader(db, key)
 		if err != nil {
 			return err
@@ -213,7 +230,7 @@ func popList(ctx *Ctx, head bool) {
 		// the key down when the last element goes.
 		if hdr.IsColl() {
 			before := int64(0)
-			err := db.CollUpdate(key, keyspace.TypeList, keyspace.EncQuicklist, func(w *keyspace.CollWriter) error {
+			err := db.CollUpdate(key, keyspace.TypeList, hdr.Encoding, func(w *keyspace.CollWriter) error {
 				before = int64(w.Count())
 				n := 1
 				if hasCount {
@@ -257,9 +274,61 @@ func popList(ctx *Ctx, head bool) {
 			_, err := db.Delete(key)
 			return err
 		}
-		return db.Set(key, listEncode(rest), keyspace.TypeList, listEncoding(ctx.encLimits(), rest, hdr.Encoding), keepTTL(hdr, found))
-	})
-	if !done {
+		return db.Set(key, listEncode(rest), keyspace.TypeList, listEncoding(lim, rest, hdr.Encoding), keepTTL(hdr, found))
+	}
+	// compute is the write-behind fast path for a listpack-form list: pop from the
+	// decoded body and either stage the shrunken blob or, when the list empties,
+	// stage a delete. It defers to sync for the btree-backed form and any codec
+	// surprise, so the slow path stays the single source of truth for those shapes.
+	compute := func(cur []byte, hdr keyspace.ValueHeader, found bool) rmwResult {
+		if !found {
+			absent = true
+			return rmwResult{}
+		}
+		if hdr.Type != keyspace.TypeList {
+			wrongTyp = true
+			return rmwResult{}
+		}
+		if hdr.IsColl() {
+			return rmwResult{fallback: true}
+		}
+		elems, err := listDecode(cur)
+		if err != nil {
+			return rmwResult{fallback: true}
+		}
+		n := 1
+		if hasCount {
+			n = int(min(count, int64(len(elems))))
+		}
+		if n == 0 {
+			return rmwResult{}
+		}
+		var rest [][]byte
+		if head {
+			popped = elems[:n]
+			rest = elems[n:]
+		} else {
+			tail := elems[len(elems)-n:]
+			popped = make([][]byte, n)
+			for i := range tail {
+				popped[i] = tail[n-1-i]
+			}
+			rest = elems[:len(elems)-n]
+		}
+		if len(rest) == 0 {
+			emptied = true
+			return rmwResult{del: true}
+		}
+		newBody := listEncode(rest)
+		enc := listEncoding(lim, rest, hdr.Encoding)
+		// A pop only shrinks the list, so this practically never trips, but keep the
+		// fast path's invariant that it stages only inline listpack blobs.
+		if enc == keyspace.EncQuicklist || len(newBody) > keyspace.MaxInlineBody {
+			return rmwResult{fallback: true}
+		}
+		return rmwResult{body: newBody, typ: keyspace.TypeList, enc: enc, ttlMs: keepTTL(hdr, found), write: true}
+	}
+	if !ctx.rmwWriteBehind(key, compute, sync) {
 		return
 	}
 	if wrongTyp {

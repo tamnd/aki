@@ -619,12 +619,18 @@ func infoErrorstats(ctx *Ctx, b *strings.Builder) {
 	}
 }
 
-// statNames returns the recorded command names sorted, so commandstats and
-// latencystats emit in a stable order.
+// statNames returns the command names that have seen activity, sorted, so
+// commandstats and latencystats emit in a stable order. statsInit now links a
+// counter block for every command up front, so the map holds blocks at calls=0
+// that have never run; Redis lists a command in commandstats only once it has
+// been called, rejected, or failed, so a block with no activity is skipped here.
 func (d *Dispatcher) statNames() []string {
 	d.stats.mu.RLock()
 	names := make([]string, 0, len(d.stats.cmds))
-	for name := range d.stats.cmds {
+	for name, cs := range d.stats.cmds {
+		if cs.calls.Load() == 0 && cs.rejected.Load() == 0 && cs.failed.Load() == 0 {
+			continue
+		}
 		names = append(names, name)
 	}
 	d.stats.mu.RUnlock()

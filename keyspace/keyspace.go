@@ -246,13 +246,42 @@ type DB struct {
 type wbPendingEntry struct {
 	body []byte
 	hdr  ValueHeader
+	// tomb marks a staged delete: the key is being removed and the read path must
+	// treat it as absent even though the B-tree still holds the old value until the
+	// async DeleteWithVersion lands. body is nil and only hdr.Version is meaningful
+	// (it version-guards the matching removeWBPending). A tomb entry occupies the
+	// pending table exactly like a value entry so its presence is honored ahead of
+	// the stale B-tree row.
+	tomb bool
+}
+
+// openOptions collects the tunables Open accepts through functional options. A
+// zero value means "use the defaults", which is what the offline check path and
+// the tests rely on when they call Open with no options.
+type openOptions struct {
+	valueCacheBytes int64
+}
+
+// Option configures Open. Options keep the common Open(pgr) call unchanged while
+// letting the server pass sizing derived from its config.
+type Option func(*openOptions)
+
+// WithValueCacheBytes sets the total byte budget for each database's value cache
+// (perf/03 section 13.2). The server derives this from buffer-pool-size times
+// value-cache-fraction; a non-positive value leaves the cache at its default.
+func WithValueCacheBytes(n int64) Option {
+	return func(o *openOptions) { o.valueCacheBytes = n }
 }
 
 // Open binds a Keyspace to a pager and loads the catalog. The number of
 // databases comes from the file header; a fresh file with no catalog page yields
 // empty databases that materialise their B-trees on first write. Files written
 // by format version 1 (single-tree catalog) are rejected; recreate the file.
-func Open(pgr *pager.Pager) (*Keyspace, error) {
+func Open(pgr *pager.Pager, opts ...Option) (*Keyspace, error) {
+	var o openOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	hdr := pgr.Header()
 	if hdr.FormatVersion != 0 && hdr.FormatVersion < format.FormatVersion {
 		return nil, fmt.Errorf("aki/keyspace: file format v%d is too old (need v%d); recreate the file",
@@ -275,7 +304,7 @@ func Open(pgr *pager.Pager) (*Keyspace, error) {
 		for s := range NumShards {
 			db.shards[s].rootPage = format.NullPage
 		}
-		db.hc.Store(newDBCache())
+		db.hc.Store(newDBCache(o.valueCacheBytes))
 		ks.dbs[i] = db
 	}
 	if ks.catRoot != format.NullPage {
@@ -617,6 +646,43 @@ func (db *DB) PrepareWriteBehind(key, body []byte, hdr ValueHeader) {
 	db.shards[s].wbMu.Unlock()
 }
 
+// PrepareDeleteBehind stages a delete in the hot cache and the write-behind
+// pending table, the delete analogue of PrepareWriteBehind. It is called under
+// the caller's RMW shard lock before the async DeleteWithVersion is queued. After
+// it returns, any Get for key sees the key as absent even though the B-tree row
+// still exists until the worker applies the delete.
+//
+// The caller must have used ks.NextVersion to assign version so the counter
+// advances before the tombstone is visible, matching the staged-SET protocol; the
+// same version then version-guards both the B-tree delete and removeWBPending.
+func (db *DB) PrepareDeleteBehind(key []byte, version uint64) {
+	sk := string(key)
+	s := ShardOf(key)
+	// Drop any cached value so a HotGet misses and falls through to the pending
+	// table, where the tombstone reports the key as absent.
+	db.hc.Load().cinvalidate(key)
+	db.shards[s].wbMu.Lock()
+	if db.shards[s].wbPending == nil {
+		db.shards[s].wbPending = make(map[string]wbPendingEntry, 16)
+	}
+	existing, alreadyPending := db.shards[s].wbPending[sk]
+	if alreadyPending && existing.hdr.Version > version {
+		// A strictly newer write or delete is already staged; do not regress to this
+		// older tombstone. The version guard mirrors PrepareWriteBehind.
+		db.shards[s].wbMu.Unlock()
+		return
+	}
+	db.shards[s].wbPending[sk] = wbPendingEntry{hdr: ValueHeader{Version: version}, tomb: true}
+	if !alreadyPending {
+		// The tombstone occupies the pending table like a staged value: count it so
+		// the read path's Len bookkeeping stays symmetric with removeWBPending, which
+		// decrements when the async delete lands. The transient effect on DBSIZE
+		// during the apply window matches the existing staged-update behavior.
+		db.shards[s].pendingUncertain.Add(1)
+	}
+	db.shards[s].wbMu.Unlock()
+}
+
 // removeWBPending removes the write-behind pending entry for key if its version
 // matches. Mismatched version means a newer write was already staged, so the
 // older entry should not be removed.
@@ -632,16 +698,18 @@ func (db *DB) removeWBPending(key string, version uint64) {
 
 // getWBPending returns the pending write-behind value for key, if any. The read
 // path calls this on a hot-cache miss to avoid serving a stale B-tree value
-// when the write worker has not yet applied the write.
-func (db *DB) getWBPending(key string) ([]byte, ValueHeader, bool) {
+// when the write worker has not yet applied the write. ok reports whether a
+// pending entry exists at all; tomb reports whether that entry is a staged delete,
+// in which case body and hdr are zero and the caller must treat the key as absent.
+func (db *DB) getWBPending(key string) (body []byte, hdr ValueHeader, ok, tomb bool) {
 	s := ShardOf([]byte(key))
 	db.shards[s].wbMu.RLock()
-	e, ok := db.shards[s].wbPending[key]
+	e, found := db.shards[s].wbPending[key]
 	db.shards[s].wbMu.RUnlock()
-	if !ok {
-		return nil, ValueHeader{}, false
+	if !found {
+		return nil, ValueHeader{}, false, false
 	}
-	return e.body, e.hdr, true
+	return e.body, e.hdr, true, e.tomb
 }
 
 // HotGet is a lock-free best-effort read that only consults the hot-value cache.
@@ -714,7 +782,13 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 	// never happens. The wbPending map and B-tree paths need the string key.
 	sk := string(key)
 	// Check the write-behind pending table before falling through to the B-tree.
-	if b, h, ok := db.getWBPending(sk); ok {
+	if b, h, ok, tomb := db.getWBPending(sk); ok {
+		if tomb {
+			// A staged delete: the key is gone even though the B-tree row still
+			// exists until the async DeleteWithVersion lands. Return absent and do
+			// not consult the stale row.
+			return nil, ValueHeader{}, false, nil
+		}
 		if db.expired(h) {
 			return nil, ValueHeader{}, false, nil
 		}
@@ -825,6 +899,76 @@ func (db *DB) Delete(key []byte) (bool, error) {
 			}
 		}
 	}
+	return ok, nil
+}
+
+// DeleteWithVersion is the write-behind delete sink: the worker calls it to apply
+// a delete that PrepareDeleteBehind already made visible in the hot cache and
+// pending table. It is version-guarded like SetWithVersion so a reordered older
+// delete cannot clobber a newer write that already landed: if the B-tree row's
+// version is strictly newer than this delete's version, the row is left in place
+// (a same-key write raced ahead and won) and only the staged tombstone is cleared.
+// It always clears the matching wbPending entry so the pending count and DBSIZE
+// settle once this returns.
+func (db *DB) DeleteWithVersion(key []byte, version uint64) (bool, error) {
+	s := ShardOf(key)
+	db.shards[s].mu.Lock()
+	defer db.shards[s].mu.Unlock()
+
+	t := db.loadShardTree(s)
+	if t == nil {
+		db.removeWBPending(string(key), version)
+		return false, nil
+	}
+	ckp := ckPool.Get().(*[]byte)
+	*ckp = appendCompositeKey(*ckp, key)
+	ck := *ckp
+	defer ckPool.Put(ckp)
+
+	prev, existed, err := db.lookup(t, ck)
+	if err != nil {
+		return false, err
+	}
+	if !existed {
+		// The key never reached the B-tree (the staged value's own SET has not
+		// landed, or it was already deleted). Clearing the tombstone is enough; the
+		// staged SET, if any, is older and its own apply will be version-guarded.
+		db.removeWBPending(string(key), version)
+		return false, nil
+	}
+	if prev.Version > version {
+		// A newer same-key write already won in the B-tree. Leave it and drop only
+		// our tombstone so the pending table stops shadowing the live value.
+		db.removeWBPending(string(key), version)
+		return false, nil
+	}
+	ok, err := t.Delete(ck)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		db.shards[s].rootPage = t.Root()
+		db.shards[s].keyCount.Add(^uint64(0))
+		db.ks.dataBytes.Add(-(int64(len(key)) + int64(prev.BodyLen) + entryOverhead))
+		db.dropAccess(key)
+		db.hc.Load().cinvalidate(key)
+		if prev.HasTTL() {
+			db.shards[s].expireCount.Add(^uint64(0))
+		}
+		if prev.Flags&FlagInlineBody == 0 && prev.BodyRef != 0 {
+			if err := db.ks.freeOverflow(uint32(prev.BodyRef)); err != nil {
+				db.removeWBPending(string(key), version)
+				return ok, err
+			}
+		}
+		if prev.IsColl() && prev.BodyRef != 0 {
+			if err := btree.DropTree(db.ks.pgr, uint32(prev.BodyRef)); err != nil {
+				db.removeWBPending(string(key), version)
+				return ok, err
+			}
+		}
+	}
+	db.removeWBPending(string(key), version)
 	return ok, nil
 }
 

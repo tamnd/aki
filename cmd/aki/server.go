@@ -74,6 +74,7 @@ func cmdServer(args []string) error {
 	loadRDB := fs.String("load-rdb", "", "import this dump.rdb on first open (only when the .aki file does not exist)")
 	rdbDB := fs.Int("rdb-db", -1, "with --load-rdb, import only this source database")
 	bufferPoolSize := fs.String("buffer-pool-size", "128mb", "buffer pool capacity (e.g. 128mb, 512mb); controls how much of the .aki file stays in memory")
+	valueCacheFraction := fs.Float64("value-cache-fraction", 0.10, "share of the buffer-pool budget held as a decoded value cache for GET (perf/03); 0 disables it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -133,7 +134,17 @@ func cmdServer(args []string) error {
 		return fmt.Errorf("--buffer-pool-size: %w", err)
 	}
 
-	ks, closeKS, err := openKeyspace(dataFile, dbCount, poolPages)
+	// The value cache holds value-cache-fraction of the buffer-pool budget as
+	// decoded GET results (perf/03 section 13.2). Sizing it from the same budget
+	// keeps the three in-memory consumers (pages, log, value cache) bounded
+	// together. A zero pool (unbounded) or a zero fraction leaves the cache at its
+	// built-in default.
+	valueCacheBytes := int64(0)
+	if frac := *valueCacheFraction; frac > 0 && poolPages > 0 {
+		valueCacheBytes = int64(float64(poolPages) * defaultPageBytes * frac)
+	}
+
+	ks, closeKS, err := openKeyspace(dataFile, dbCount, poolPages, valueCacheBytes)
 	if err != nil {
 		return err
 	}
@@ -303,6 +314,7 @@ var extraConfigSkip = map[string]bool{
 	"dbfilename": true, "appendonly": true, "appendfsync": true, "save": true,
 	"maxmemory": true, "maxmemory-policy": true, "daemonize": true,
 	"load-rdb": true, "rdb-db": true, "buffer-pool-size": true,
+	"value-cache-fraction": true,
 }
 
 // applyExtraConfig forwards config-file directives that are not server flags to
@@ -434,7 +446,7 @@ func importRDBInto(ks *keyspace.Keyspace, path string, onlyDB int) (int, []strin
 // returns the keyspace over it plus a close function. The pager picks the file
 // format up from its header on reopen, so databases is used only at create time.
 // poolPages is the buffer-pool capacity in frames; zero uses the pager default.
-func openKeyspace(path string, databases, poolPages int) (*keyspace.Keyspace, func(), error) {
+func openKeyspace(path string, databases, poolPages int, valueCacheBytes int64) (*keyspace.Keyspace, func(), error) {
 	osfs := vfs.NewOS()
 	opts := pager.Options{CachePages: poolPages}
 	var (
@@ -450,13 +462,17 @@ func openKeyspace(path string, databases, poolPages int) (*keyspace.Keyspace, fu
 	if err != nil {
 		return nil, nil, fmt.Errorf("open data file %s: %w", path, err)
 	}
-	ks, err := keyspace.Open(pgr)
+	ks, err := keyspace.Open(pgr, keyspace.WithValueCacheBytes(valueCacheBytes))
 	if err != nil {
 		_ = pgr.Close()
 		return nil, nil, fmt.Errorf("open keyspace: %w", err)
 	}
 	return ks, func() { _ = pgr.Close() }, nil
 }
+
+// defaultPageBytes is the pager's fixed page size, used to convert a page count
+// to bytes when sizing the buffer pool and the value cache.
+const defaultPageBytes = 16384
 
 // parseBufPoolPages converts a human-readable size string (128mb, 512MiB, 65536)
 // to a page count. It understands k/m/g suffixes (case-insensitive, with or
@@ -482,7 +498,6 @@ func parseBufPoolPages(s string) (int, error) {
 	default:
 		return 0, fmt.Errorf("unknown unit in %q", s)
 	}
-	const defaultPageBytes = 16384
 	pages := val / defaultPageBytes
 	if pages < 64 {
 		pages = 64

@@ -133,6 +133,34 @@ func listBlobReportedEnc(lim encLimits, prevEnc uint8, newCount int, pushed [][]
 	return listEncoding(lim, elems, prevEnc), nil
 }
 
+// listCollReportedEnc returns the OBJECT ENCODING a coll-form list should report,
+// computed from its maintained metadata so a push never walks the rows. It mirrors
+// listEncoding: prevEnc pins the floor (a quicklist never demotes), the count caps
+// the entry limit, any pushed element over the per-element cap forces quicklist,
+// and the listpack byte estimate is listEntryOverhead per element plus one added to
+// byteSum (the running sum of raw element lengths), matching listEncoding's total.
+// pushed carries the elements added by this op so their size cap is checked without
+// a walk; for a pop or set pass nil.
+func listCollReportedEnc(lim encLimits, prevEnc uint8, count int, byteSum uint64, pushed [][]byte) uint8 {
+	if prevEnc == keyspace.EncQuicklist {
+		return keyspace.EncQuicklist
+	}
+	maxEntries, maxBytes := lim.listLimits()
+	if count > maxEntries {
+		return keyspace.EncQuicklist
+	}
+	for _, v := range pushed {
+		if len(v) > listMaxListpackElemBytes {
+			return keyspace.EncQuicklist
+		}
+	}
+	total := int64(byteSum) + int64(count+1)*int64(listEntryOverhead)
+	if total > int64(maxBytes) {
+		return keyspace.EncQuicklist
+	}
+	return keyspace.EncListpack
+}
+
 // listEncoding picks the reported encoding for a list. Once a key is a
 // quicklist it never goes back to listpack, so prev pins the floor. The entry
 // and byte caps come from list-max-listpack-size via lim.
