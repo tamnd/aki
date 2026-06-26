@@ -1,6 +1,10 @@
 package command
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/tamnd/aki/networking"
+)
 
 // aofDispatcherForFsync builds a dispatcher with appendonly on and the AOF files
 // initialized so appendAOF has an open incr file to write into.
@@ -40,6 +44,53 @@ func TestAppendFsyncAlways(t *testing.T) {
 	}
 	if zero {
 		t.Fatal("always policy did not record a sync time")
+	}
+}
+
+// TestAppendFsyncAlwaysBatchSyncsOnBatchComplete checks that an online pipeline
+// under the always policy buffers its records per session and that OnBatchComplete
+// group-commits the whole batch with one fsync. serve() runs OnBatchComplete before
+// it flushes the replies, so this is what keeps the batch durable before its replies
+// leave the socket while paying one fsync instead of one per command.
+func TestAppendFsyncAlwaysBatchSyncsOnBatchComplete(t *testing.T) {
+	d := aofDispatcherForFsync(t)
+	if err := d.SetConfig("appendfsync", "always"); err != nil {
+		t.Fatalf("set appendfsync: %v", err)
+	}
+
+	conn := networking.NewOfflineConn()
+	sess := &session{authenticated: true, aofBufDB: -1}
+	conn.SetSession(sess)
+
+	// Two writes buffered into the session, the way an online pipeline batches them.
+	// Buffering alone must not sync: the records sit in the session buffer until the
+	// batch completes.
+	d.bufferAOFRecord(sess, 0, [][]byte{[]byte("SET"), []byte("a"), []byte("1")})
+	d.bufferAOFRecord(sess, 0, [][]byte{[]byte("SET"), []byte("b"), []byte("2")})
+
+	d.aof.mu.Lock()
+	syncedBefore := d.aof.syncedSeq
+	bufferedBytes := len(sess.aofBuf)
+	d.aof.mu.Unlock()
+	if bufferedBytes == 0 {
+		t.Fatal("records were not buffered into the session")
+	}
+
+	d.OnBatchComplete(conn)
+
+	d.aof.mu.Lock()
+	pending := d.aof.pendingSync
+	syncedThrough := d.aof.syncedSeq >= d.aof.writeSeq && d.aof.writeSeq > syncedBefore
+	leftover := len(sess.aofBuf)
+	d.aof.mu.Unlock()
+	if pending {
+		t.Fatal("always policy left the batch pending after OnBatchComplete")
+	}
+	if !syncedThrough {
+		t.Fatal("OnBatchComplete did not fsync the batch through under always")
+	}
+	if leftover != 0 {
+		t.Fatalf("session buffer not spliced, %d bytes left", leftover)
 	}
 }
 
