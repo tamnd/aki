@@ -7,6 +7,14 @@ import (
 	"github.com/tamnd/aki/keyspace"
 )
 
+// maxHashFieldExpireMillis is the largest absolute deadline a hash field may
+// carry, in Unix milliseconds. Redis stores hash field expiries in its ebuckets
+// structure, which packs the deadline into 46 bits, so anything past 2^46-1 ms
+// (Sat 25 Mar 4199 UTC) is rejected with "invalid expire time". The string-level
+// EXPIRE family has no such ceiling, so this cap is specific to the hash TTL and
+// HGETEX setters.
+const maxHashFieldExpireMillis = (int64(1) << 46) - 1
+
 // hashTTLCommands returns the per-field expiry commands for hashes (Redis 7.4).
 // Each field can carry its own absolute deadline, stored next to the field in the
 // hash body and reported through the listpackex encoding.
@@ -102,7 +110,7 @@ func handleHExpire(ctx *Ctx, hcmd, mode string) {
 	}
 	now := keyspace.NowMillis()
 	when, ok := whenFor(mode, now, tval)
-	if !ok {
+	if !ok || when > maxHashFieldExpireMillis {
 		ctx.enc().WriteError("ERR invalid expire time in '" + hcmd + "' command")
 		return
 	}
