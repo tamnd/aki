@@ -67,6 +67,7 @@ func cmdServer(args []string) error {
 	// Durability and limits, redis spellings mapped onto aki's config store.
 	appendonly := fs.String("appendonly", "", "enable the append-only file: yes or no")
 	appendfsync := fs.String("appendfsync", "", "durability policy: always, everysec, or no")
+	hashOverlay := fs.String("aki-hash-overlay", "", "in-memory hash write fast path: yes or no (default no)")
 	save := fs.String("save", "", `RDB save points, e.g. "3600 1 300 100", or "" to disable`)
 	maxmemory := fs.String("maxmemory", "", "memory limit before eviction, e.g. 256mb (0 disables)")
 	maxmemoryPolicy := fs.String("maxmemory-policy", "", "eviction policy when maxmemory is reached")
@@ -207,6 +208,7 @@ func cmdServer(args []string) error {
 		{"dbfilename", resolve("dbfilename", *dbfilename)},
 		{"appendonly", resolve("appendonly", *appendonly)},
 		{"appendfsync", resolve("appendfsync", *appendfsync)},
+		{"aki-hash-overlay", resolve("aki-hash-overlay", *hashOverlay)},
 		{"save", resolveSave(setFlags, fileConf, *save)},
 		{"maxmemory", resolve("maxmemory", *maxmemory)},
 		{"maxmemory-policy", resolve("maxmemory-policy", *maxmemoryPolicy)},

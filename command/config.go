@@ -395,6 +395,14 @@ func configDirectives() []*directive {
 		{name: "aki-checkpoint-wal-frames", kind: dirInt, def: "1000", mutable: true},
 		{name: "aki-checkpoint-dirty-pages", kind: dirInt, def: "500", mutable: true},
 
+		// aki-hash-overlay turns on the in-memory hash write fast path: a large
+		// btree-backed hash absorbs HSET/HDEL element writes into a resident map and
+		// folds them back into its sub-tree in batches, trading a per-op sub-tree
+		// descent for a map write. Off by default; it is forced off under
+		// appendfsync=always without the AOF, where there is no durable record of an
+		// unfolded write before its reply. See keyspace/overlay.go.
+		{name: "aki-hash-overlay", kind: dirBool, def: "no", mutable: true},
+
 		// Replication.
 		{name: "replica-read-only", kind: dirBool, def: "yes", mutable: true},
 		{name: "masterauth", kind: dirString, def: "", mutable: true},
@@ -833,10 +841,16 @@ func handleConfigSet(ctx *Ctx) {
 		case "lfu-log-factor", "lfu-decay-time":
 			// Push the new LFU tuning to the keyspace so the eviction counter uses it.
 			ctx.d.applyLFUConfig()
-		case "appendfsync":
+		case "appendonly", "appendfsync":
 			// Retune the pager checkpoint cadence so the durability contract tracks
 			// the new policy. Tightening to always flushes any pending writes now.
+			// Toggling appendonly flips whether the AOF carries the always guarantee,
+			// which changes the policy too, so both directives recompute it.
+			// applyCommitPolicy also recomputes the hash overlay gate.
 			ctx.d.applyCommitPolicy()
+		case "aki-hash-overlay":
+			// Turn the in-memory hash write overlay on or off to match the directive.
+			ctx.d.applyHashOverlay()
 		case "timeout":
 			// Push the new idle timeout to the server so it applies on the next read.
 			ctx.d.applyIdleTimeout()

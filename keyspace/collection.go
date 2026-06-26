@@ -74,16 +74,32 @@ type CollWriter struct {
 	meta   collMeta
 	enc    uint8
 	encSet bool
+
+	// live, when set, is the resident in-memory copy this writer absorbs element
+	// ops into instead of descending the sub-tree (the hash write overlay). Get,
+	// Put, and Delete route through it; the accumulated mutations fold back into
+	// tree later. tree still points at the (stale) sub-tree so its root is known for
+	// the metadata write. See keyspace/overlay.go.
+	live *liveColl
 }
 
 // Get returns the value stored under sub and whether it is present.
-func (w *CollWriter) Get(sub []byte) ([]byte, bool, error) { return w.tree.Get(sub) }
+func (w *CollWriter) Get(sub []byte) ([]byte, bool, error) {
+	if w.live != nil {
+		v, ok := w.live.get(sub)
+		return v, ok, nil
+	}
+	return w.tree.Get(sub)
+}
 
 // Put writes val under sub, replacing any existing value, and reports whether the
 // subkey is new. It does not touch the count; the caller maintains the count via
 // SetCount so types with more than one row per logical element (zset keeps a
 // member row and a score row) stay accurate.
 func (w *CollWriter) Put(sub, val []byte) (created bool, err error) {
+	if w.live != nil {
+		return w.live.put(sub, val), nil
+	}
 	prev, err := w.tree.Upsert(sub, val)
 	if err != nil {
 		return false, err
@@ -92,7 +108,12 @@ func (w *CollWriter) Put(sub, val []byte) (created bool, err error) {
 }
 
 // Delete removes sub and reports whether it was present.
-func (w *CollWriter) Delete(sub []byte) (bool, error) { return w.tree.Delete(sub) }
+func (w *CollWriter) Delete(sub []byte) (bool, error) {
+	if w.live != nil {
+		return w.live.del(sub), nil
+	}
+	return w.tree.Delete(sub)
+}
 
 // Count, SetCount, Head, SetHead, Tail, SetTail read and write the metadata
 // counters the caller maintains.
@@ -121,39 +142,108 @@ func (w *CollWriter) SetEnc(e uint8) {
 
 // Cursor returns an ordered cursor over the element rows for range reads done
 // inside a write (LPOP/RPOP/SPOP and similar). It reflects the sub-tree as of the
-// call and must not be used after further Put/Delete on this writer.
-func (w *CollWriter) Cursor() *CollCursor { return &CollCursor{c: w.tree.Cursor()} }
+// call and must not be used after further Put/Delete on this writer. On a
+// live-backed writer it iterates the resident copy in sorted subkey order, so the
+// view matches the sub-tree's byte ordering.
+func (w *CollWriter) Cursor() *CollCursor {
+	if w.live != nil {
+		return &CollCursor{live: newLiveCursor(w.live)}
+	}
+	return &CollCursor{c: w.tree.Cursor()}
+}
 
 // CollReader is the read handle, valid only inside the callback passed to
 // DB.CollRead. The shard read lock is held for the whole callback.
 type CollReader struct {
 	tree *btree.Tree
 	meta collMeta
+
+	// live, when set, is the resident in-memory copy this read serves from instead
+	// of the sub-tree (the hash write overlay). The resident copy is authoritative
+	// while present, so Get, Count, and Cursor consult it and the sub-tree is not
+	// opened. See keyspace/overlay.go.
+	live *liveColl
 }
 
 // Get returns the value stored under sub and whether it is present.
-func (r *CollReader) Get(sub []byte) ([]byte, bool, error) { return r.tree.Get(sub) }
+func (r *CollReader) Get(sub []byte) ([]byte, bool, error) {
+	if r.live != nil {
+		v, ok := r.live.get(sub)
+		return v, ok, nil
+	}
+	return r.tree.Get(sub)
+}
 
 // Count, Head, Tail, Bytes expose the metadata counters.
-func (r *CollReader) Count() uint64 { return r.meta.count }
+func (r *CollReader) Count() uint64 {
+	if r.live != nil {
+		return uint64(r.live.count())
+	}
+	return r.meta.count
+}
 func (r *CollReader) Head() int64   { return r.meta.head }
 func (r *CollReader) Tail() int64   { return r.meta.tail }
 func (r *CollReader) Bytes() uint64 { return r.meta.bytes }
 
-// Cursor returns an ordered cursor over the element rows.
-func (r *CollReader) Cursor() *CollCursor { return &CollCursor{c: r.tree.Cursor()} }
+// Cursor returns an ordered cursor over the element rows. On a resident read it
+// iterates the in-memory copy in sorted subkey order so the view matches the
+// sub-tree's byte ordering (HGETALL/HKEYS/HVALS order is stable across the
+// overlay).
+func (r *CollReader) Cursor() *CollCursor {
+	if r.live != nil {
+		return &CollCursor{live: newLiveCursor(r.live)}
+	}
+	return &CollCursor{c: r.tree.Cursor()}
+}
 
 // CollCursor is an ordered iterator over a collection's element rows. It wraps the
-// B-tree cursor and is valid only while the enclosing CollUpdate/CollRead callback
-// holds the shard lock.
-type CollCursor struct{ c *btree.Cursor }
+// B-tree cursor, or a sorted snapshot of a resident copy for an overlay read, and
+// is valid only while the enclosing CollUpdate/CollRead callback holds the shard
+// lock.
+type CollCursor struct {
+	c    *btree.Cursor
+	live *liveCursor
+}
 
-func (cc *CollCursor) First() error          { return cc.c.First() }
-func (cc *CollCursor) Seek(sub []byte) error { return cc.c.Seek(sub) }
-func (cc *CollCursor) Valid() bool           { return cc.c.Valid() }
-func (cc *CollCursor) Next() error           { return cc.c.Next() }
-func (cc *CollCursor) Key() []byte           { return cc.c.Key() }
-func (cc *CollCursor) Value() []byte         { return cc.c.Value() }
+func (cc *CollCursor) First() error {
+	if cc.live != nil {
+		cc.live.first()
+		return nil
+	}
+	return cc.c.First()
+}
+func (cc *CollCursor) Seek(sub []byte) error {
+	if cc.live != nil {
+		cc.live.seek(sub)
+		return nil
+	}
+	return cc.c.Seek(sub)
+}
+func (cc *CollCursor) Valid() bool {
+	if cc.live != nil {
+		return cc.live.valid()
+	}
+	return cc.c.Valid()
+}
+func (cc *CollCursor) Next() error {
+	if cc.live != nil {
+		cc.live.next()
+		return nil
+	}
+	return cc.c.Next()
+}
+func (cc *CollCursor) Key() []byte {
+	if cc.live != nil {
+		return cc.live.key()
+	}
+	return cc.c.Key()
+}
+func (cc *CollCursor) Value() []byte {
+	if cc.live != nil {
+		return cc.live.value()
+	}
+	return cc.c.Value()
+}
 
 // CollUpdate runs fn against the btree-backed collection at key under the shard
 // write lock, then writes the metadata row back. typ is the collection type byte
@@ -192,7 +282,18 @@ func (db *DB) CollUpdate(key []byte, typ, enc uint8, fn func(w *CollWriter) erro
 	prevIsTree := prevExisted && prev.IsColl()
 
 	w := &CollWriter{}
-	if prevIsTree {
+	var lc *liveColl
+	if db.overlayEngagesLocked(typ, prevIsTree) {
+		lc, err = db.overlayResidentLocked(s, key, prev, prevBody)
+		if err != nil {
+			return err
+		}
+		w.live = lc
+		w.meta.count = uint64(lc.count())
+		// Open the sub-tree without descending it so its root names the metadata
+		// write; element ops route through lc, not the tree.
+		w.tree = btree.Open(db.ks.pgr, lc.bodyRef)
+	} else if prevIsTree {
 		w.tree = btree.Open(db.ks.pgr, uint32(prev.BodyRef))
 		w.meta = decodeCollMeta(prevBody)
 	} else {
@@ -204,11 +305,16 @@ func (db *DB) CollUpdate(key []byte, typ, enc uint8, fn func(w *CollWriter) erro
 
 	if ferr := fn(w); ferr != nil {
 		// A fresh sub-tree we created for this call is now orphaned; free it so the
-		// failed op leaks nothing. An existing tree is left as it was.
+		// failed op leaks nothing. An existing tree (or a resident copy's stale
+		// sub-tree) is left as it was.
 		if !prevIsTree {
 			_ = btree.DropTree(db.ks.pgr, w.tree.Root())
 		}
 		return ferr
+	}
+
+	if lc != nil {
+		return db.collFinishOverlayLocked(s, t, ck, key, w, lc, typ, enc, prev, prevExisted)
 	}
 
 	if w.meta.count == 0 {
@@ -289,7 +395,16 @@ func (db *DB) CollUpdateRouted(key []byte, typ, enc uint8, route func(found bool
 
 	prevIsTree := found && prev.IsColl()
 	w := &CollWriter{}
-	if prevIsTree {
+	var lc *liveColl
+	if db.overlayEngagesLocked(typ, prevIsTree) {
+		lc, err = db.overlayResidentLocked(s, key, prev, prevBody)
+		if err != nil {
+			return CollRouteColl, err
+		}
+		w.live = lc
+		w.meta.count = uint64(lc.count())
+		w.tree = btree.Open(db.ks.pgr, lc.bodyRef)
+	} else if prevIsTree {
 		w.tree = btree.Open(db.ks.pgr, uint32(prev.BodyRef))
 		w.meta = decodeCollMeta(prevBody)
 	} else {
@@ -304,6 +419,10 @@ func (db *DB) CollUpdateRouted(key []byte, typ, enc uint8, route func(found bool
 			_ = btree.DropTree(db.ks.pgr, w.tree.Root())
 		}
 		return CollRouteColl, ferr
+	}
+
+	if lc != nil {
+		return CollRouteColl, db.collFinishOverlayLocked(s, t, ck, key, w, lc, typ, enc, prev, prevExisted)
 	}
 
 	// CollUpdate frees a previous blob's overflow chain when it replaces a blob with
@@ -421,9 +540,16 @@ func (db *DB) CollRead(key []byte, fn func(r *CollReader) error) (ok bool, err e
 	if rerr != nil || !found || !h.IsColl() || db.expired(h) {
 		return false, rerr
 	}
-	r := &CollReader{
-		tree: btree.Open(db.ks.pgr, uint32(h.BodyRef)),
-		meta: decodeCollMeta(body),
+	r := &CollReader{meta: decodeCollMeta(body)}
+	// A resident copy is authoritative; serve from it without opening the (stale)
+	// sub-tree. The shard read lock excludes the writer that mutates the residency
+	// map, so this lookup is safe. Only an already-resident key is served here; a
+	// not-yet-resident key reads the sub-tree as usual, since materializing needs
+	// the write lock.
+	if lc := db.shards[s].live[string(key)]; lc != nil {
+		r.live = lc
+	} else {
+		r.tree = btree.Open(db.ks.pgr, uint32(h.BodyRef))
 	}
 	return true, fn(r)
 }
@@ -482,6 +608,12 @@ func (db *DB) CollSetTTL(key []byte, ttlMs int64) (ok bool, err error) {
 	case !newHasTTL && prevHasTTL:
 		db.shards[s].expireCount.Add(^uint64(0))
 	}
+	// Keep a resident copy's TTL in step so a later fold rewrites the metadata with
+	// the current TTL rather than the one captured at materialization.
+	if lc := db.shards[s].live[string(key)]; lc != nil {
+		lc.hasTTL = ttlMs >= 0
+		lc.ttlMs = ttlMs
+	}
 	db.hc.Load().cinvalidate(key)
 	return true, nil
 }
@@ -532,17 +664,30 @@ func (db *DB) CollCopyTo(srcKey []byte, dst *DB, dstKey []byte) (ok bool, err er
 	}
 	type collRow struct{ k, v []byte }
 	var rows []collRow
-	sub := btree.Open(db.ks.pgr, uint32(sh.BodyRef))
-	cur := sub.Cursor()
-	for cerr := cur.First(); cur.Valid(); cerr = cur.Next() {
-		if cerr != nil {
-			db.shards[ss].mu.RUnlock()
-			return false, cerr
+	if lc := db.shards[ss].live[string(srcKey)]; lc != nil {
+		// The source is resident: its newest rows live in the overlay, and the
+		// sub-tree is stale. The resident copy is the complete authoritative set, so
+		// copy from it directly (no fold needed under this read lock). Order does not
+		// matter; the destination sub-tree is rebuilt by sorted Upsert.
+		for k, v := range lc.rows {
+			rows = append(rows, collRow{
+				k: []byte(k),
+				v: append([]byte(nil), v...),
+			})
 		}
-		rows = append(rows, collRow{
-			k: append([]byte(nil), cur.Key()...),
-			v: append([]byte(nil), cur.Value()...),
-		})
+	} else {
+		sub := btree.Open(db.ks.pgr, uint32(sh.BodyRef))
+		cur := sub.Cursor()
+		for cerr := cur.First(); cur.Valid(); cerr = cur.Next() {
+			if cerr != nil {
+				db.shards[ss].mu.RUnlock()
+				return false, cerr
+			}
+			rows = append(rows, collRow{
+				k: append([]byte(nil), cur.Key()...),
+				v: append([]byte(nil), cur.Value()...),
+			})
+		}
 	}
 	metaBody := append([]byte(nil), sbody...)
 	srcType, srcEnc, srcFlags, srcTTL := sh.Type, sh.Encoding, sh.Flags, sh.TTLms
