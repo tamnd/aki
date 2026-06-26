@@ -53,24 +53,37 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 	// is the fallback the write-behind helper runs when the fast path below cannot
 	// stage the result, and the path under commitAlways or with no workers running.
 	sync := func(db *keyspace.DB) error {
-		hdr, found, err := listHeader(db, key)
-		if err != nil {
-			return err
-		}
-		if found && hdr.Type != keyspace.TypeList {
-			wrongTyp = true
-			return nil
-		}
-		if !found && mustExist {
-			absent = true
-			return nil
-		}
-		// A list already in the btree-backed form takes the window-write path: each
-		// value is one row at a new head or tail position, no whole-blob rewrite. The
-		// reported encoding is recomputed from the post-push count and byte total so a
-		// coll list that is still small keeps reporting listpack.
-		if found && hdr.IsColl() {
-			return db.CollUpdate(key, keyspace.TypeList, hdr.Encoding, func(w *keyspace.CollWriter) error {
+		// CollUpdateRouted reads the metadata row once under the shard write lock and
+		// routes from that read, so a coll-form list skips the separate listHeader
+		// (Peek) this path used to do before CollUpdate read the same row again. The
+		// router records the wrong-type and must-exist-absent cases through the outer
+		// flags and hands the coll-form case to the window-write callback; a blob or
+		// fresh key falls through to the splice path below with the header it saw.
+		var (
+			hdr   keyspace.ValueHeader
+			found bool
+		)
+		route, err := db.CollUpdateRouted(key, keyspace.TypeList, keyspace.EncQuicklist,
+			func(rFound bool, h keyspace.ValueHeader, _ []byte) keyspace.CollRoute {
+				hdr, found = h, rFound
+				if rFound && h.Type != keyspace.TypeList {
+					wrongTyp = true
+					return keyspace.CollRouteSkip
+				}
+				if !rFound && mustExist {
+					absent = true
+					return keyspace.CollRouteSkip
+				}
+				if rFound && h.IsColl() {
+					return keyspace.CollRouteColl
+				}
+				return keyspace.CollRouteBlob
+			},
+			// A list already in the btree-backed form takes the window-write path: each
+			// value is one row at a new head or tail position, no whole-blob rewrite.
+			// The reported encoding is recomputed from the post-push count and byte
+			// total so a coll list that is still small keeps reporting listpack.
+			func(w *keyspace.CollWriter) error {
 				n, e := listTreePush(w, vals, head)
 				if e != nil {
 					return e
@@ -79,6 +92,13 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 				w.SetEnc(listCollReportedEnc(lim, hdr.Encoding, int(n), w.Bytes(), vals))
 				return nil
 			})
+		if err != nil {
+			return err
+		}
+		if route != keyspace.CollRouteBlob {
+			// Coll write done, or a skip (wrong type or must-exist on an absent key);
+			// the outer flags carry the reply.
+			return nil
 		}
 		// Blob form (or a fresh key): splice the pushed run into the raw body rather
 		// than decoding every element and rebuilding the whole list, so a push
