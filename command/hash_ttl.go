@@ -110,17 +110,72 @@ func handleHExpire(ctx *Ctx, hcmd, mode string) {
 	codes := make([]int64, len(fields))
 	var wrongTyp, noKey, emptied bool
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		hf, hdr, found, err := getHash(db, key)
+		hdr, found, err := hashHeader(db, key)
 		if err != nil {
 			return err
-		}
-		if found && hdr.Type != keyspace.TypeHash {
-			wrongTyp = true
-			return nil
 		}
 		if !found {
 			noKey = true
 			return nil
+		}
+		if hdr.Type != keyspace.TypeHash {
+			wrongTyp = true
+			return nil
+		}
+		if hdr.IsColl() {
+			return db.CollUpdate(key, keyspace.TypeHash, keyspace.EncHashtable, func(w *keyspace.CollWriter) error {
+				for fi, fname := range fields {
+					row, present, e := w.Get(fname)
+					if e != nil {
+						return e
+					}
+					if !present {
+						codes[fi] = -2
+						continue
+					}
+					cur, val, de := hashRowDecode(row)
+					if de != nil {
+						return de
+					}
+					if hashRowExpired(cur) {
+						codes[fi] = -2
+						continue
+					}
+					hasT := cur != 0
+					switch {
+					case cond.nx && hasT:
+						codes[fi] = 0
+						continue
+					case cond.xx && !hasT:
+						codes[fi] = 0
+						continue
+					case cond.gt && (!hasT || when <= cur):
+						codes[fi] = 0
+						continue
+					case cond.lt && hasT && when >= cur:
+						codes[fi] = 0
+						continue
+					}
+					if when <= now {
+						if _, e := w.Delete(fname); e != nil {
+							return e
+						}
+						w.SetCount(w.Count() - 1)
+						codes[fi] = 2
+					} else {
+						if _, e := w.Put(fname, hashRowEncode(when, val)); e != nil {
+							return e
+						}
+						codes[fi] = 1
+					}
+				}
+				emptied = w.Count() == 0
+				return nil
+			})
+		}
+		hf, _, _, err := getHash(db, key)
+		if err != nil {
+			return err
 		}
 		changed := false
 		for fi, fname := range fields {
@@ -183,8 +238,8 @@ func handleHExpire(ctx *Ctx, hcmd, mode string) {
 }
 
 // handleHPersist clears the TTL from the named fields. It replies 1 when a TTL
-// was removed, 0 when the field was already persistent, and -2 when the field is
-// gone, with an all -2 array for a missing key.
+// was removed, -1 when the field was already persistent, and -2 when the field
+// is gone, with an all -2 array for a missing key.
 func handleHPersist(ctx *Ctx) {
 	key := ctx.Argv[1]
 	fields, errStr, ok := parseHashFields(ctx.Argv, 2)
@@ -195,17 +250,52 @@ func handleHPersist(ctx *Ctx) {
 	codes := make([]int64, len(fields))
 	var wrongTyp, noKey bool
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		hf, hdr, found, err := getHash(db, key)
+		hdr, found, err := hashHeader(db, key)
 		if err != nil {
 			return err
-		}
-		if found && hdr.Type != keyspace.TypeHash {
-			wrongTyp = true
-			return nil
 		}
 		if !found {
 			noKey = true
 			return nil
+		}
+		if hdr.Type != keyspace.TypeHash {
+			wrongTyp = true
+			return nil
+		}
+		if hdr.IsColl() {
+			return db.CollUpdate(key, keyspace.TypeHash, keyspace.EncHashtable, func(w *keyspace.CollWriter) error {
+				for fi, fname := range fields {
+					row, present, e := w.Get(fname)
+					if e != nil {
+						return e
+					}
+					if !present {
+						codes[fi] = -2
+						continue
+					}
+					ttl, val, de := hashRowDecode(row)
+					if de != nil {
+						return de
+					}
+					if hashRowExpired(ttl) {
+						codes[fi] = -2
+						continue
+					}
+					if ttl == 0 {
+						codes[fi] = -1
+						continue
+					}
+					if _, e := w.Put(fname, hashRowEncode(0, val)); e != nil {
+						return e
+					}
+					codes[fi] = 1
+				}
+				return nil
+			})
+		}
+		hf, _, _, err := getHash(db, key)
+		if err != nil {
+			return err
 		}
 		changed := false
 		for fi, fname := range fields {
@@ -214,7 +304,7 @@ func handleHPersist(ctx *Ctx) {
 			case idx < 0:
 				codes[fi] = -2
 			case hf[idx].ttl == 0:
-				codes[fi] = 0
+				codes[fi] = -1
 			default:
 				hf[idx].ttl = 0
 				codes[fi] = 1
@@ -256,17 +346,50 @@ func handleHTTL(ctx *Ctx, mode string) {
 	res := make([]int64, len(fields))
 	var wrongTyp, noKey bool
 	if !ctx.view(func(db *keyspace.DB) error {
-		hf, hdr, found, err := getHash(db, key)
+		hdr, found, err := hashHeader(db, key)
 		if err != nil {
 			return err
-		}
-		if found && hdr.Type != keyspace.TypeHash {
-			wrongTyp = true
-			return nil
 		}
 		if !found {
 			noKey = true
 			return nil
+		}
+		if hdr.Type != keyspace.TypeHash {
+			wrongTyp = true
+			return nil
+		}
+		if hdr.IsColl() {
+			_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+				for fi, fname := range fields {
+					row, present, e := r.Get(fname)
+					if e != nil {
+						return e
+					}
+					if !present {
+						res[fi] = -2
+						continue
+					}
+					ttl, _, de := hashRowDecode(row)
+					if de != nil {
+						return de
+					}
+					if hashRowExpired(ttl) {
+						res[fi] = -2
+						continue
+					}
+					if ttl == 0 {
+						res[fi] = -1
+						continue
+					}
+					res[fi] = httlReply(mode, now, ttl)
+				}
+				return nil
+			})
+			return err
+		}
+		hf, _, _, err := getHash(db, key)
+		if err != nil {
+			return err
 		}
 		for fi, fname := range fields {
 			idx := hashFind(hf, fname)
@@ -279,16 +402,7 @@ func handleHTTL(ctx *Ctx, mode string) {
 				res[fi] = -1
 				continue
 			}
-			switch mode {
-			case "httl":
-				res[fi] = (ttl - now) / 1000
-			case "hpttl":
-				res[fi] = ttl - now
-			case "hexpiretime":
-				res[fi] = ttl / 1000
-			default: // hpexpiretime
-				res[fi] = ttl
-			}
+			res[fi] = httlReply(mode, now, ttl)
 		}
 		return nil
 	}) {
@@ -303,6 +417,22 @@ func handleHTTL(ctx *Ctx, mode string) {
 		return
 	}
 	writeIntArray(ctx, res)
+}
+
+// httlReply maps a field's absolute deadline to the value the HTTL family
+// reports: remaining seconds or millis for HTTL/HPTTL, or the absolute deadline
+// in seconds or millis for HEXPIRETIME/HPEXPIRETIME.
+func httlReply(mode string, now, ttl int64) int64 {
+	switch mode {
+	case "httl":
+		return (ttl - now) / 1000
+	case "hpttl":
+		return ttl - now
+	case "hexpiretime":
+		return ttl / 1000
+	default: // hpexpiretime
+		return ttl
+	}
 }
 
 // storeHash persists a modified hash, deleting the key when no fields remain. It
