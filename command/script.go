@@ -271,7 +271,13 @@ func redisErrorReply(_ *lua.Interp, args []lua.Value) ([]lua.Value, error) {
 	if v, ok := nthArg(args, 0).(lua.String); ok {
 		s = string(v)
 	}
-	if !hasErrorCode(s) {
+	// Redis treats the first space-delimited word as the error code. When the
+	// message has no space there is no code, so Redis prepends the generic ERR
+	// (Redis 7.4.5: error_reply('boom') -> "ERR boom", error_reply('') -> "ERR ",
+	// error_reply('my error') -> "my error"). A raw {err=...} table is different:
+	// it is always sent verbatim, so that rule lives only here, not in the table
+	// serializer.
+	if !strings.ContainsRune(s, ' ') {
 		s = "ERR " + s
 	}
 	return []lua.Value{errTable(s)}, nil
@@ -457,8 +463,11 @@ func luaToRESP(enc *resp.Encoder, v lua.Value, proto int) {
 func luaTableToRESP(enc *resp.Encoder, t *lua.Table, proto int) {
 	if e, ok := t.Get(lua.String("err")).(lua.String); ok {
 		msg := string(e)
-		if !hasErrorCode(msg) {
-			msg = "ERR " + msg
+		// Redis sends a script's {err=...} reply verbatim; only an empty message
+		// falls back to the generic ERR code (Redis 7.4.5: {err=''} replies -ERR ,
+		// {err='my error'} replies -my error).
+		if msg == "" {
+			msg = "ERR "
 		}
 		enc.WriteError(msg)
 		return

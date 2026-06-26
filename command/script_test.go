@@ -61,9 +61,11 @@ func TestEvalStatusAndErrorReply(t *testing.T) {
 	if got := sendArgs(t, r, c, "EVAL", "return redis.status_reply('TEST')", "0"); got != "TEST" {
 		t.Fatalf("status_reply = %v", got)
 	}
+	// Redis sends the error_reply message verbatim, with no ERR code added (Redis
+	// 7.4.5: redis.error_reply('my error') replies -my error).
 	got := sendArgs(t, r, c, "EVAL", "return redis.error_reply('my error')", "0")
 	e, ok := got.(cmdErr)
-	if !ok || string(e) != "ERR my error" {
+	if !ok || string(e) != "my error" {
 		t.Fatalf("error_reply = %v (%T)", got, got)
 	}
 }

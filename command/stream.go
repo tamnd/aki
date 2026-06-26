@@ -21,7 +21,7 @@ const (
 	errStreamMaxLenArg   = "ERR invalid MAXLEN argument"
 	errStreamMinIDArg    = "ERR invalid MINID argument"
 	errStreamLimitZero   = "ERR The ~ prefix is not valid for MINID or MAXLEN when LIMIT is specified with value 0"
-	errStreamSetIDSmall  = "ERR The ID specified in XSETID is smaller than current stream's last ID"
+	errStreamSetIDSmall  = "ERR The ID specified in XSETID is smaller than the target stream top item"
 )
 
 // streamNodeEntries is the assumed listpack-node capacity used to report the
@@ -994,7 +994,7 @@ func writeStreamInfoSummary(enc *resp.Encoder, s *stream, nodeEntries int) {
 		enc.WriteBulkStringStr("recorded-first-entry-id")
 		enc.WriteBulkStringStr(s.firstID().String())
 		enc.WriteBulkStringStr("groups")
-		enc.WriteInteger(0)
+		enc.WriteInteger(int64(len(s.groups)))
 		enc.WriteBulkStringStr("first-entry")
 		writeInfoEntry(enc, s, 0)
 		enc.WriteBulkStringStr("last-entry")
