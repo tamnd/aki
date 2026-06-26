@@ -303,17 +303,20 @@ func (db *DB) CollMetaHeader(key []byte) (ValueHeader, bool, error) {
 	return h, found, err
 }
 
-// clearCollTTL removes the key-level TTL from a btree-backed collection's
-// metadata record in place, leaving its element sub-tree untouched. The TTL
-// repair path uses it because a coll key cannot be rewritten through Set (that
-// would tear the sub-tree down). Caller must NOT hold any shard lock.
-func (db *DB) clearCollTTL(key []byte) error {
+// CollSetTTL sets (ttlMs >= 0) or clears (ttlMs < 0) the key-level TTL on a
+// btree-backed collection's metadata record in place, leaving its element
+// sub-tree untouched. A coll key's body is only the metadata counters, so it
+// cannot be rewritten through Set (that tears the sub-tree down); EXPIRE family,
+// PERSIST, and the TTL repair path route here instead. ok is false when the key
+// is absent or not in coll form, so the caller can fall back to its blob path.
+// Caller must NOT hold any shard lock.
+func (db *DB) CollSetTTL(key []byte, ttlMs int64) (ok bool, err error) {
 	s := ShardOf(key)
 	db.shards[s].mu.Lock()
 	defer db.shards[s].mu.Unlock()
 	t := db.loadShardTree(s)
 	if t == nil {
-		return nil
+		return false, nil
 	}
 	ckp := ckPool.Get().(*[]byte)
 	*ckp = appendCompositeKey(*ckp, key)
@@ -322,20 +325,176 @@ func (db *DB) clearCollTTL(key []byte) error {
 
 	h, body, found, err := db.read(t, ck)
 	if err != nil || !found || !h.IsColl() {
-		return err
+		return false, err
 	}
-	if !h.HasTTL() {
-		return nil
+	prevHasTTL := h.HasTTL()
+	if ttlMs >= 0 {
+		h.Flags |= FlagHasTTL
+		h.TTLms = ttlMs
+	} else {
+		h.Flags &^= FlagHasTTL
+		h.TTLms = -1
 	}
-	h.Flags &^= FlagHasTTL
-	h.TTLms = -1
+	h.Version = db.ks.version.Add(1)
 	cell := h.AppendTo(make([]byte, 0, HeaderSize+len(body)))
 	cell = append(cell, body...)
 	if _, err := t.Upsert(ck, cell); err != nil {
-		return err
+		return true, err
 	}
 	db.shards[s].rootPage = t.Root()
-	db.shards[s].expireCount.Add(^uint64(0))
+	switch newHasTTL := ttlMs >= 0; {
+	case newHasTTL && !prevHasTTL:
+		db.shards[s].expireCount.Add(1)
+	case !newHasTTL && prevHasTTL:
+		db.shards[s].expireCount.Add(^uint64(0))
+	}
 	db.hc.Load().cinvalidate(key)
-	return nil
+	return true, nil
+}
+
+// clearCollTTL removes the key-level TTL from a btree-backed collection's
+// metadata record in place. The active-expiry repair path uses it; new callers
+// should use CollSetTTL directly.
+func (db *DB) clearCollTTL(key []byte) error {
+	_, err := db.CollSetTTL(key, -1)
+	return err
+}
+
+// CollCopyTo deep-copies the btree-backed collection at srcKey in db into dstKey
+// in dst, preserving the source's type, encoding, TTL, and element rows. dst may
+// be the same DB (RENAME) or another database (MOVE/COPY across the SELECT
+// index); both share one pager, so the fresh sub-tree lives in the same file. Any
+// value already at dstKey is replaced (its sub-tree dropped or overflow chain
+// freed). ok is false when srcKey is absent or not in coll form, so the caller
+// falls back to its blob copy path. Caller must NOT hold any shard lock.
+//
+// A coll key cannot be carried by reading its 32-byte metadata body and writing
+// it through Set: that body is only counters, and Set would leave dst pointing at
+// the source's sub-tree (a shared BodyRef that a later write to either key would
+// corrupt). Copying the rows into a fresh sub-tree keeps the two keys
+// independent.
+func (db *DB) CollCopyTo(srcKey []byte, dst *DB, dstKey []byte) (ok bool, err error) {
+	// Snapshot the source rows and metadata under the source shard read lock, then
+	// release it before taking the destination write lock. The command write
+	// closures run serialized through a single writer, so no concurrent op can
+	// mutate srcKey between the snapshot and the destination write, and holding the
+	// two locks in sequence (never nested) sidesteps any lock-ordering hazard when
+	// src and dst land on the same shard.
+	ss := ShardOf(srcKey)
+	db.shards[ss].mu.RLock()
+	st := db.loadShardTree(ss)
+	if st == nil {
+		db.shards[ss].mu.RUnlock()
+		return false, nil
+	}
+	sckp := ckPool.Get().(*[]byte)
+	*sckp = appendCompositeKey(*sckp, srcKey)
+	sck := *sckp
+	sh, sbody, sfound, rerr := db.read(st, sck)
+	ckPool.Put(sckp)
+	if rerr != nil || !sfound || !sh.IsColl() {
+		db.shards[ss].mu.RUnlock()
+		return false, rerr
+	}
+	type collRow struct{ k, v []byte }
+	var rows []collRow
+	sub := btree.Open(db.ks.pgr, uint32(sh.BodyRef))
+	cur := sub.Cursor()
+	for cerr := cur.First(); cur.Valid(); cerr = cur.Next() {
+		if cerr != nil {
+			db.shards[ss].mu.RUnlock()
+			return false, cerr
+		}
+		rows = append(rows, collRow{
+			k: append([]byte(nil), cur.Key()...),
+			v: append([]byte(nil), cur.Value()...),
+		})
+	}
+	metaBody := append([]byte(nil), sbody...)
+	srcType, srcEnc, srcFlags, srcTTL := sh.Type, sh.Encoding, sh.Flags, sh.TTLms
+	db.shards[ss].mu.RUnlock()
+
+	// Build the fresh sub-tree and install the metadata row under the destination
+	// shard write lock.
+	ds := ShardOf(dstKey)
+	dst.shards[ds].mu.Lock()
+	defer dst.shards[ds].mu.Unlock()
+	dt, err := dst.ensureShardTree(ds)
+	if err != nil {
+		return false, err
+	}
+	dckp := ckPool.Get().(*[]byte)
+	*dckp = appendCompositeKey(*dckp, dstKey)
+	dck := *dckp
+	defer ckPool.Put(dckp)
+
+	prevH, _, prevExisted, err := dst.read(dt, dck)
+	if err != nil {
+		return false, err
+	}
+
+	nt, err := btree.Create(dst.ks.pgr)
+	if err != nil {
+		return false, err
+	}
+	for _, row := range rows {
+		if _, uerr := nt.Upsert(row.k, row.v); uerr != nil {
+			_ = btree.DropTree(dst.ks.pgr, nt.Root())
+			return false, uerr
+		}
+	}
+
+	// Tear down whatever dst held: a coll sub-tree is dropped, a non-inline blob's
+	// overflow chain is freed. An inline blob needs neither.
+	if prevExisted {
+		if prevH.IsColl() {
+			if derr := btree.DropTree(dst.ks.pgr, uint32(prevH.BodyRef)); derr != nil {
+				_ = btree.DropTree(dst.ks.pgr, nt.Root())
+				return false, derr
+			}
+		} else if prevH.Flags&FlagInlineBody == 0 && prevH.BodyRef != 0 {
+			if ferr := dst.ks.freeOverflow(uint32(prevH.BodyRef)); ferr != nil {
+				_ = btree.DropTree(dst.ks.pgr, nt.Root())
+				return false, ferr
+			}
+		}
+	}
+
+	h := ValueHeader{
+		Type:     srcType,
+		Encoding: srcEnc,
+		Flags:    FlagInlineBody | FlagCollTree,
+		TTLms:    -1,
+		Version:  dst.ks.version.Add(1),
+		BodyRef:  uint64(nt.Root()),
+		BodyLen:  uint32(len(metaBody)),
+		RefCount: 1,
+	}
+	if srcFlags&FlagHasTTL != 0 {
+		h.Flags |= FlagHasTTL
+		h.TTLms = srcTTL
+	}
+	cell := h.AppendTo(make([]byte, 0, HeaderSize+len(metaBody)))
+	cell = append(cell, metaBody...)
+	if _, err := dt.Upsert(dck, cell); err != nil {
+		_ = btree.DropTree(dst.ks.pgr, nt.Root())
+		return false, err
+	}
+	dst.shards[ds].rootPage = dt.Root()
+
+	if !prevExisted {
+		dst.shards[ds].keyCount.Add(1)
+	} else {
+		dst.ks.dataBytes.Add(-(int64(len(dstKey)) + int64(prevH.BodyLen) + entryOverhead))
+		if prevH.HasTTL() {
+			dst.shards[ds].expireCount.Add(^uint64(0))
+		}
+	}
+	dst.ks.dataBytes.Add(int64(len(dstKey)) + int64(len(metaBody)) + entryOverhead)
+	if h.HasTTL() {
+		dst.shards[ds].expireCount.Add(1)
+	}
+	dst.recordAccess(dstKey, !prevExisted)
+	dst.hc.Load().cinvalidate(dstKey)
+	return true, nil
 }
