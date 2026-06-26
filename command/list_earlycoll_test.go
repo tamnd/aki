@@ -124,6 +124,13 @@ func TestEarlyCollStaysBlobWhenSmall(t *testing.T) {
 func TestEarlyCollBoundaryCrossings(t *testing.T) {
 	r, c, eng := startDataEng(t)
 
+	// Pin a positive entry cap so the listpack -> quicklist flip is driven by the
+	// 128-entry count, the transition this test walks. Under the default -2 byte
+	// tier there is no entry cap and 40-byte elements never reach the 8KB budget.
+	if got := sendLine(t, r, c, "CONFIG SET list-max-listpack-size 128"); got != "+OK" {
+		t.Fatalf("CONFIG SET = %q", got)
+	}
+
 	// Small: inline blob, listpack.
 	_ = sendLine(t, r, c, "RPUSH l a b c")
 	if listIsColl(t, eng, "l") {
@@ -161,54 +168,69 @@ func TestEarlyCollBoundaryCrossings(t *testing.T) {
 // is decided by the maintained byte total, not the entry count.
 func TestEarlyCollByteCapPromotes(t *testing.T) {
 	r, c, _ := startDataEng(t)
-	// 64-byte elements: the listpack estimate is 75 bytes each, so the 8KB cap is
-	// crossed near 110 elements, before the 128-entry cap. Push 120 to be safely
-	// past the byte cap but under the entry cap.
-	for i := 0; i < 120; i++ {
+	// Under the default -2 tier the only cap is the 8KB listpack byte budget, with
+	// no entry cap and no per-element cap. A 64-byte element costs 67 listpack bytes
+	// (2+64 encoding, 1 backlen), so the 7-byte header plus 67*n crosses 8192 at
+	// n=123. Push 140 to land safely past the byte budget.
+	for i := 0; i < 140; i++ {
 		_ = sendLine(t, r, c, "RPUSH l "+elem(i, 64))
 	}
-	if got := sendLine(t, r, c, "LLEN l"); got != ":120" {
-		t.Fatalf("LLEN = %q want :120", got)
+	if got := sendLine(t, r, c, "LLEN l"); got != ":140" {
+		t.Fatalf("LLEN = %q want :140", got)
 	}
 	if got := bulk(t, r, c, "OBJECT ENCODING l"); got != "quicklist" {
-		t.Fatalf("encoding = %q want quicklist (byte cap), count is under 128", got)
+		t.Fatalf("encoding = %q want quicklist (byte budget crossed)", got)
 	}
 }
 
-// TestEarlyCollBigElementPromotes checks that pushing a single element over the
-// 64-byte per-element cap onto an otherwise-listpack coll list flips it to
-// quicklist, matching Redis's per-element rule.
+// TestEarlyCollBigElementPromotes checks that pushing a single element large
+// enough to carry the listpack total past the 8KB byte budget flips an
+// otherwise-listpack coll list to quicklist. Redis lists have no per-element cap,
+// so a big element promotes only by crossing the byte budget, not on its own size.
 func TestEarlyCollBigElementPromotes(t *testing.T) {
 	r, c, _ := startDataEng(t)
+	// Drop the byte budget to the 4KB tier so a single page-safe element can carry
+	// the listpack total past it. A list element is stored one-per-row, so it must
+	// fit a 4KB btree page, which rules out a single element bigger than the budget.
+	if got := sendLine(t, r, c, "CONFIG SET list-max-listpack-size -1"); got != "+OK" {
+		t.Fatalf("CONFIG SET = %q", got)
+	}
 	for i := 0; i < 40; i++ {
 		_ = sendLine(t, r, c, "RPUSH l "+elem(i, 40))
 	}
 	if got := bulk(t, r, c, "OBJECT ENCODING l"); got != "listpack" {
 		t.Fatalf("pre encoding = %q want listpack", got)
 	}
-	if got := sendLine(t, r, c, "RPUSH l "+elem(99, 100)); got != ":41" {
+	// The 40 short elements cost ~1.7KB of listpack; a 3000-byte element adds ~3KB
+	// and carries the total past the 4KB budget.
+	if got := sendLine(t, r, c, "RPUSH l "+elem(99, 3000)); got != ":41" {
 		t.Fatalf("RPUSH big = %q", got)
 	}
 	if got := bulk(t, r, c, "OBJECT ENCODING l"); got != "quicklist" {
-		t.Fatalf("encoding after 100-byte element = %q want quicklist", got)
+		t.Fatalf("encoding after 3000-byte element = %q want quicklist", got)
 	}
 }
 
 // TestEarlyCollLSetPromotes checks that LSET replacing a small element with one
-// over the per-element cap flips a listpack coll list to quicklist, exercising the
-// byte-total adjustment and re-derived encoding in listTreeSet.
+// large enough to carry the listpack total past the 8KB byte budget flips a
+// listpack coll list to quicklist, exercising the byte-total adjustment and
+// re-derived encoding in listTreeSet. Redis lists have no per-element cap.
 func TestEarlyCollLSetPromotes(t *testing.T) {
 	r, c, eng := startDataEng(t)
+	// Drop the byte budget to the 4KB tier so a single page-safe element crosses it.
+	if got := sendLine(t, r, c, "CONFIG SET list-max-listpack-size -1"); got != "+OK" {
+		t.Fatalf("CONFIG SET = %q", got)
+	}
 	for i := 0; i < 40; i++ {
 		_ = sendLine(t, r, c, "RPUSH l "+elem(i, 40))
 	}
 	if !listIsColl(t, eng, "l") || bulk(t, r, c, "OBJECT ENCODING l") != "listpack" {
 		t.Fatal("setup: want coll listpack list")
 	}
-	if got := sendLine(t, r, c, "LSET l 10 "+elem(7, 100)); got != "+OK" {
+	if got := sendLine(t, r, c, "LSET l 10 "+elem(7, 3000)); got != "+OK" {
 		t.Fatalf("LSET = %q", got)
 	}
-	if got := bulk(t, r, c, "LINDEX l 10"); got != elem(7, 100) {
+	if got := bulk(t, r, c, "LINDEX l 10"); got != elem(7, 3000) {
 		t.Fatalf("LINDEX 10 = %q", got)
 	}
 	if got := bulk(t, r, c, "OBJECT ENCODING l"); got != "quicklist" {
@@ -307,6 +329,11 @@ func TestEarlyCollDumpRestore(t *testing.T) {
 // coll metadata (with the byte total) round-trips through the on-disk format.
 func TestEarlyCollDebugReload(t *testing.T) {
 	r, c, eng := startDataEng(t)
+	// Drop the byte budget to the 4KB tier so a single page-safe element crosses it
+	// after reload. The server config survives a reload, only the data is re-read.
+	if got := sendLine(t, r, c, "CONFIG SET list-max-listpack-size -1"); got != "+OK" {
+		t.Fatalf("CONFIG SET = %q", got)
+	}
 	for i := 0; i < 40; i++ {
 		_ = sendLine(t, r, c, "RPUSH l "+elem(i, 40))
 	}
@@ -322,8 +349,9 @@ func TestEarlyCollDebugReload(t *testing.T) {
 	if !listIsColl(t, eng, "l") {
 		t.Fatal("reloaded early-coll list should be stored coll")
 	}
-	// After reload the byte total is still tracked, so a big element still promotes.
-	if got := sendLine(t, r, c, "RPUSH l "+elem(99, 100)); got != ":41" {
+	// After reload the byte total is still tracked, so an element that carries the
+	// listpack total past the 4KB budget still promotes.
+	if got := sendLine(t, r, c, "RPUSH l "+elem(99, 3000)); got != ":41" {
 		t.Fatalf("RPUSH big after reload = %q", got)
 	}
 	if got := bulk(t, r, c, "OBJECT ENCODING l"); got != "quicklist" {

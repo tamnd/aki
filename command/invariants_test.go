@@ -32,9 +32,7 @@ const (
 	thHashSetZsetEntries = 128  // hash/set/zset listpack entry cap
 	thListpackValue      = 64   // per-element byte cap for listpack/intset members
 	thIntsetEntries      = 512  // all-integer set stays intset up to here
-	thListEntries        = 128  // list listpack entry cap
-	thListBytes          = 8192 // list listpack total byte cap
-	thListOverhead       = 11   // per-entry overhead the list codec budgets
+	thListBytes          = 8192 // list listpack byte budget at the default -2 tier
 )
 
 func isInt(s string) bool {
@@ -95,22 +93,41 @@ func wantZsetEncoding(members []string) string {
 	return "listpack"
 }
 
-// wantListEncoding mirrors the list threshold rules for a fresh key.
+// wantListEncoding mirrors the list threshold rule for a fresh key at the default
+// list-max-listpack-size -2: an 8KB listpack byte budget, no entry-count cap and
+// no per-element cap. The size is the 6-byte listpack header, a 1-byte terminator
+// and each element's encoding plus its backlen, matching lpBytes.
 func wantListEncoding(elems []string) string {
-	if len(elems) > thListEntries {
+	total := 7
+	for _, e := range elems {
+		total += lpStrEntrySize(len(e))
+	}
+	if total > thListBytes {
 		return "quicklist"
 	}
-	total := thListOverhead
-	for _, e := range elems {
-		if len(e) > thListpackValue {
-			return "quicklist"
-		}
-		total += len(e) + thListOverhead
-		if total > thListBytes {
-			return "quicklist"
-		}
-	}
 	return "listpack"
+}
+
+// lpStrEntrySize returns the listpack bytes a string element of length n takes:
+// the length-prefixed string encoding plus the backlen field.
+func lpStrEntrySize(n int) int {
+	var enc int
+	switch {
+	case n < 64:
+		enc = 1 + n
+	case n < 4096:
+		enc = 2 + n
+	default:
+		enc = 5 + n
+	}
+	switch {
+	case enc <= 127:
+		return enc + 1
+	case enc < 16384:
+		return enc + 2
+	default:
+		return enc + 3
+	}
 }
 
 func TestEncodingThresholdInvariants(t *testing.T) {
@@ -131,9 +148,13 @@ func TestEncodingThresholdInvariants(t *testing.T) {
 	for i := range manyInts {
 		manyInts[i] = strconv.Itoa(i)
 	}
-	manyShort := make([]string, 200) // over the 128 listpack entry cap
+	manyShort := make([]string, 200) // 200 short elements, still under the 8KB budget
 	for i := range manyShort {
 		manyShort[i] = "m" + strconv.Itoa(i)
+	}
+	overBudget := make([]string, 1000) // 1000 ten-byte elements cross the 8KB budget
+	for i := range overBudget {
+		overBudget[i] = "0123456789"
 	}
 
 	// Sets.
@@ -209,7 +230,7 @@ func TestEncodingThresholdInvariants(t *testing.T) {
 	}
 
 	// Lists.
-	listCases := [][]string{short, {"a", big}, manyShort}
+	listCases := [][]string{short, {"a", big}, manyShort, overBudget}
 	for i, elems := range listCases {
 		key := "list" + strconv.Itoa(i)
 		argv := append([]string{"RPUSH", key}, elems...)
