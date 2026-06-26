@@ -27,6 +27,16 @@ type cmdStat struct {
 	hist     latencyHist
 }
 
+// reset zeroes every counter and the latency histogram in place. CONFIG RESETSTAT
+// uses it so the blocks stay at the addresses cmd.stat already points at.
+func (cs *cmdStat) reset() {
+	cs.calls.Store(0)
+	cs.usec.Store(0)
+	cs.rejected.Store(0)
+	cs.failed.Store(0)
+	cs.hist.reset()
+}
+
 // statsState holds the whole stats table. cmds maps a command name (with its
 // subcommand, separated by "|") to its counters. A read-write lock guards the map
 // shape; the per-entry counters are atomic so only inserts need the write lock.
@@ -37,9 +47,29 @@ type statsState struct {
 	errs sync.Map // string -> *atomic.Uint64
 }
 
-// statsInit allocates the stats table. New calls it once at startup.
+// statsInit allocates the stats table and links every command descriptor to its
+// counter block. New calls it once at startup, after the table is built. Linking
+// up front lets statCall and statReject reach the block through cmd.stat with a
+// plain atomic bump, instead of taking the stats RWMutex and looking the name up
+// in the map on every command. The map keeps the same pointers so INFO,
+// LATENCY HISTOGRAM, and the metrics endpoint read the same counters.
 func (d *Dispatcher) statsInit() {
 	d.stats.cmds = make(map[string]*cmdStat)
+	link := func(cmd *CmdDesc) {
+		name := statName(cmd)
+		cs := d.stats.cmds[name]
+		if cs == nil {
+			cs = &cmdStat{}
+			d.stats.cmds[name] = cs
+		}
+		cmd.stat = cs
+	}
+	for _, cmd := range d.table.commands() {
+		link(cmd)
+		for _, sub := range cmd.SubCmds {
+			link(sub)
+		}
+	}
 }
 
 // statName is the name a command is recorded under: the subcommand-qualified name
@@ -69,9 +99,15 @@ func (d *Dispatcher) cmdStatFor(name string) *cmdStat {
 }
 
 // statCall records one successful execution: the call, its microseconds, a
-// latency sample, and a failed_calls bump when it returned an error.
+// latency sample, and a failed_calls bump when it returned an error. The counter
+// block is reached through cmd.stat, linked once by statsInit, so the hot path
+// takes no lock; cmdStatFor is a fallback for the rare descriptor that statsInit
+// did not see (none in the built-in table).
 func (d *Dispatcher) statCall(cmd *CmdDesc, usec uint64, failed bool) {
-	cs := d.cmdStatFor(statName(cmd))
+	cs := cmd.stat
+	if cs == nil {
+		cs = d.cmdStatFor(statName(cmd))
+	}
 	cs.calls.Add(1)
 	cs.usec.Add(usec)
 	cs.hist.record(usec)
@@ -83,7 +119,11 @@ func (d *Dispatcher) statCall(cmd *CmdDesc, usec uint64, failed bool) {
 // statReject records one command rejected before it ran, by ACL, arity, the
 // read-only replica guard, or an out-of-memory refusal.
 func (d *Dispatcher) statReject(cmd *CmdDesc) {
-	d.cmdStatFor(statName(cmd)).rejected.Add(1)
+	cs := cmd.stat
+	if cs == nil {
+		cs = d.cmdStatFor(statName(cmd))
+	}
+	cs.rejected.Add(1)
 }
 
 // statError tallies an error reply by its leading code, the first token of the
@@ -105,11 +145,16 @@ func (d *Dispatcher) statError(msg string) {
 }
 
 // statResetAll clears every command counter, latency histogram, and error tally.
-// CONFIG RESETSTAT calls it.
+// CONFIG RESETSTAT calls it. The counter blocks are zeroed in place rather than
+// replaced, so the cmd.stat pointers linked by statsInit keep pointing at the
+// live blocks; a fresh map would orphan them and the hot path would keep writing
+// to the old, now-invisible counters.
 func (d *Dispatcher) statResetAll() {
-	d.stats.mu.Lock()
-	d.stats.cmds = make(map[string]*cmdStat)
-	d.stats.mu.Unlock()
+	d.stats.mu.RLock()
+	for _, cs := range d.stats.cmds {
+		cs.reset()
+	}
+	d.stats.mu.RUnlock()
 	d.stats.errs.Range(func(k, _ any) bool {
 		d.stats.errs.Delete(k)
 		return true
@@ -183,6 +228,13 @@ const (
 
 type latencyHist struct {
 	counts [histBuckets]atomic.Uint64
+}
+
+// reset zeroes every bucket. CONFIG RESETSTAT calls it through cmdStat.reset.
+func (h *latencyHist) reset() {
+	for i := range h.counts {
+		h.counts[i].Store(0)
+	}
 }
 
 // histBucket maps a value to its bucket. Values below histSub land in a linear

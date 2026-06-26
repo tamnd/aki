@@ -1,8 +1,97 @@
 package keyspace
 
 import (
+	"fmt"
 	"testing"
 )
+
+// TestValueCacheByteBudget checks that the cache evicts by bytes and keeps each
+// shard within its budget. It builds a cache whose per-shard budget holds only a
+// few entries, fills one shard well past that, and verifies the shard's accounted
+// bytes stay at or under the budget while the newest keys survive and the oldest
+// were evicted. This is the property that makes the cache hold a working set sized
+// to the configured memory rather than a fixed entry count.
+func TestValueCacheByteBudget(t *testing.T) {
+	// minShardBytes (4 KiB) is the per-shard floor. With ~128-byte bodies each
+	// entry costs body + key + entryOverhead, so a 4 KiB shard holds a handful.
+	c := newDBCache(minShardBytes * dbCacheShards)
+	body := make([]byte, 128)
+
+	// Drive 500 distinct keys into one shard by hashing the key to a fixed shard.
+	// Picking the shard for each key keeps the test independent of the hash.
+	const target = 7
+	put := 0
+	var lastKeys []string
+	for i := 0; put < 300; i++ {
+		key := fmt.Sprintf("budget-key-%d", i)
+		if c.shardIdxStr(key) != target {
+			continue
+		}
+		c.cput(key, body, ValueHeader{Version: uint64(i)})
+		lastKeys = append(lastKeys, key)
+		put++
+	}
+
+	sh := &c.shards[target]
+	sh.mu.RLock()
+	used := sh.used.Load()
+	live := len(sh.entries)
+	sh.mu.RUnlock()
+
+	if used > sh.budget {
+		t.Fatalf("shard used %d exceeds budget %d", used, sh.budget)
+	}
+	if live == 0 || live >= put {
+		t.Fatalf("expected eviction: live=%d of %d put", live, put)
+	}
+	// The most recently inserted key must still be present; an early one must be gone.
+	if _, _, ok := c.cget([]byte(lastKeys[len(lastKeys)-1])); !ok {
+		t.Fatal("most recent key was evicted; LRU order is wrong")
+	}
+	if _, _, ok := c.cget([]byte(lastKeys[0])); ok {
+		t.Fatal("oldest key survived past the byte budget; eviction did not run")
+	}
+
+	// Accounting must return to zero once every live key is invalidated.
+	sh.mu.RLock()
+	keys := make([]string, 0, len(sh.entries))
+	for k := range sh.entries {
+		keys = append(keys, k)
+	}
+	sh.mu.RUnlock()
+	for _, k := range keys {
+		c.cinvalidate([]byte(k))
+	}
+	if got := sh.used.Load(); got != 0 {
+		t.Fatalf("after invalidating every entry, shard used = %d want 0", got)
+	}
+}
+
+// TestValueCacheUpdateAccounting checks that overwriting a key with a larger or
+// smaller body adjusts the shard's accounted bytes by the body delta, so a stream
+// of in-place updates does not drift the byte total.
+func TestValueCacheUpdateAccounting(t *testing.T) {
+	c := newDBCache(defaultValueCacheBytes)
+	key := "acct"
+	sh := &c.shards[c.shardIdxStr(key)]
+
+	c.cput(key, make([]byte, 100), ValueHeader{Version: 1})
+	base := sh.used.Load()
+	want := entryBytes(len(key), 100)
+	if base != want {
+		t.Fatalf("after first put, used = %d want %d", base, want)
+	}
+	// Grow the body: used must rise by exactly the body delta.
+	c.cput(key, make([]byte, 300), ValueHeader{Version: 2})
+	if got := sh.used.Load(); got != want+200 {
+		t.Fatalf("after grow, used = %d want %d", got, want+200)
+	}
+	// Shrink the body: used must fall back.
+	c.cput(key, make([]byte, 50), ValueHeader{Version: 3})
+	if got := sh.used.Load(); got != want-50 {
+		t.Fatalf("after shrink, used = %d want %d", got, want-50)
+	}
+}
 
 // TestHotCacheHitSkipsBTree confirms that a second Get on the same key is
 // served from the hot cache without walking the B-tree. We verify this

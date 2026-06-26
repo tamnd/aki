@@ -327,18 +327,20 @@ func storeRestored(lim encLimits, db *keyspace.DB, key []byte, v rdb.Value, ttlM
 	case rdb.KindString:
 		return db.Set(key, v.Str, keyspace.TypeString, stringEncoding(v.Str), ttlMs)
 	case rdb.KindList:
-		// A restored list large enough to report quicklist lands in the btree-backed
-		// form, the same as one built push by push. Promotion needs the key's TTL
-		// stamped first, since listPromote preserves the existing header's TTL rather
-		// than taking one as an argument.
-		if listWantsTree(lim, v.List, keyspace.EncListpack) {
-			if err := db.Set(key, nil, keyspace.TypeList, keyspace.EncQuicklist, ttlMs); err != nil {
+		// A restored list lands in the btree-backed form when it reports quicklist or,
+		// earlier, when its blob would spill to overflow, the same early-coll boundary
+		// the push path uses, while still reporting the encoding it computes. Promotion
+		// needs the key's TTL stamped first, since listPromote preserves the existing
+		// header's TTL rather than taking one as an argument.
+		enc := listEncoding(lim, v.List, keyspace.EncListpack)
+		body := listEncode(v.List)
+		if enc == keyspace.EncQuicklist || len(body) > keyspace.MaxInlineBody {
+			if err := db.Set(key, nil, keyspace.TypeList, enc, ttlMs); err != nil {
 				return err
 			}
-			return listPromote(db, key, v.List)
+			return listPromote(db, key, v.List, enc)
 		}
-		return db.Set(key, listEncode(v.List), keyspace.TypeList,
-			listEncoding(lim, v.List, keyspace.EncListpack), ttlMs)
+		return db.Set(key, body, keyspace.TypeList, enc, ttlMs)
 	case rdb.KindSet:
 		// A restored set large enough to report hashtable lands in the btree-backed
 		// form, the same as one built member by member. Promotion needs the key's TTL

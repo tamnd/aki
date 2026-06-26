@@ -21,33 +21,47 @@ import (
 // collMeta is the metadata-row body of a btree-backed collection. count drives
 // HLEN/SCARD/ZCARD/LLEN and the empty-key-deletes rule in O(1). head and tail are
 // the list index window (the lowest and one-past-highest live positions); they
-// stay zero for hash, set, and zset.
+// stay zero for hash, set, and zset. bytes is the running sum of the raw element
+// byte lengths, maintained for lists so the OBJECT ENCODING a coll list reports
+// (listpack until the byte cap, then quicklist) can be decided from the metadata
+// without walking the rows; it stays zero for the other types.
 type collMeta struct {
 	count uint64
 	head  int64
 	tail  int64
+	bytes uint64
 }
 
-// collMetaSize is the fixed encoded size: count, head, tail as 8 bytes each.
-const collMetaSize = 24
+// collMetaSize is the current encoded size: count, head, tail, bytes as 8 bytes
+// each. A legacy record written before the bytes field is 24 bytes; it decodes
+// with bytes zero, which is harmless because every legacy coll list reported
+// quicklist (it only reached coll form past the 128-entry threshold), and a
+// quicklist floor never consults the byte total.
+const collMetaSize = 32
+const collMetaSizeLegacy = 24
 
 func encodeCollMeta(m collMeta) []byte {
 	b := make([]byte, 0, collMetaSize)
 	b = encoding.AppendU64(b, m.count)
 	b = encoding.AppendU64(b, uint64(m.head))
 	b = encoding.AppendU64(b, uint64(m.tail))
+	b = encoding.AppendU64(b, m.bytes)
 	return b
 }
 
 func decodeCollMeta(b []byte) collMeta {
-	if len(b) < collMetaSize {
+	if len(b) < collMetaSizeLegacy {
 		return collMeta{}
 	}
-	return collMeta{
+	m := collMeta{
 		count: encoding.U64(b[0:]),
 		head:  int64(encoding.U64(b[8:])),
 		tail:  int64(encoding.U64(b[16:])),
 	}
+	if len(b) >= collMetaSize {
+		m.bytes = encoding.U64(b[24:])
+	}
+	return m
 }
 
 // CollWriter is the write handle to a btree-backed collection, valid only inside
@@ -56,8 +70,10 @@ func decodeCollMeta(b []byte) collMeta {
 // command layer owns subkey encoding and the element count; this handle just moves
 // opaque rows in and out of the sub-tree and carries the metadata counters.
 type CollWriter struct {
-	tree *btree.Tree
-	meta collMeta
+	tree   *btree.Tree
+	meta   collMeta
+	enc    uint8
+	encSet bool
 }
 
 // Get returns the value stored under sub and whether it is present.
@@ -87,6 +103,22 @@ func (w *CollWriter) SetHead(h int64)   { w.meta.head = h }
 func (w *CollWriter) Tail() int64       { return w.meta.tail }
 func (w *CollWriter) SetTail(t int64)   { w.meta.tail = t }
 
+// Bytes and SetBytes read and write the running element-byte-length total. A list
+// maintains it so its reported encoding can be decided from the metadata; the
+// other types leave it zero.
+func (w *CollWriter) Bytes() uint64     { return w.meta.bytes }
+func (w *CollWriter) SetBytes(n uint64) { w.meta.bytes = n }
+
+// SetEnc overrides the OBJECT ENCODING written for this collection, letting the
+// callback report an encoding it can only compute after mutating the rows (a list
+// reports listpack while small even though it is already stored in coll form, then
+// quicklist once it crosses the threshold). When the callback does not call it, the
+// enc passed to CollUpdate is used.
+func (w *CollWriter) SetEnc(e uint8) {
+	w.enc = e
+	w.encSet = true
+}
+
 // Cursor returns an ordered cursor over the element rows for range reads done
 // inside a write (LPOP/RPOP/SPOP and similar). It reflects the sub-tree as of the
 // call and must not be used after further Put/Delete on this writer.
@@ -102,10 +134,11 @@ type CollReader struct {
 // Get returns the value stored under sub and whether it is present.
 func (r *CollReader) Get(sub []byte) ([]byte, bool, error) { return r.tree.Get(sub) }
 
-// Count, Head, Tail expose the metadata counters.
+// Count, Head, Tail, Bytes expose the metadata counters.
 func (r *CollReader) Count() uint64 { return r.meta.count }
 func (r *CollReader) Head() int64   { return r.meta.head }
 func (r *CollReader) Tail() int64   { return r.meta.tail }
+func (r *CollReader) Bytes() uint64 { return r.meta.bytes }
 
 // Cursor returns an ordered cursor over the element rows.
 func (r *CollReader) Cursor() *CollCursor { return &CollCursor{c: r.tree.Cursor()} }
@@ -180,6 +213,12 @@ func (db *DB) CollUpdate(key []byte, typ, enc uint8, fn func(w *CollWriter) erro
 
 	if w.meta.count == 0 {
 		return db.collClearLocked(s, t, ck, key, w.tree.Root(), prev, prevExisted, prevIsTree)
+	}
+	// A callback may compute the reported encoding from the post-mutation counters
+	// (a list flips listpack -> quicklist by element count or byte total); that
+	// choice wins over the default passed by the caller.
+	if w.encSet {
+		enc = w.enc
 	}
 	return db.collWriteMetaLocked(s, t, ck, key, w, typ, enc, prev, prevExisted, prevIsTree)
 }

@@ -48,20 +48,25 @@ func listWantsTree(lim encLimits, elems [][]byte, prevEnc uint8) bool {
 }
 
 // listPromote moves a list from the blob form to the btree-backed form. It writes
-// one row per element at positions 0..n-1 and sets the head/tail window through
-// CollUpdate, which creates the fresh sub-tree, frees the old blob, and carries
-// over the key's TTL. Callers reach it when an applied push pushes the element
-// count past the quicklist threshold.
-func listPromote(db *keyspace.DB, key []byte, elems [][]byte) error {
-	return db.CollUpdate(key, keyspace.TypeList, keyspace.EncQuicklist, func(w *keyspace.CollWriter) error {
+// one row per element at positions 0..n-1, records the byte total, and sets the
+// head/tail window through CollUpdate, which creates the fresh sub-tree, frees the
+// old blob, and carries over the key's TTL. enc is the OBJECT ENCODING the moved
+// list reports: with early-coll a list moves to the sub-tree once its blob would
+// spill to overflow, well before the 128-entry threshold, so it can still report
+// listpack while stored in coll form. Callers compute enc from the post-push state.
+func listPromote(db *keyspace.DB, key []byte, elems [][]byte, enc uint8) error {
+	return db.CollUpdate(key, keyspace.TypeList, enc, func(w *keyspace.CollWriter) error {
+		var byteSum uint64
 		for i, e := range elems {
 			if _, err := w.Put(listPosRow(int64(i)), e); err != nil {
 				return err
 			}
+			byteSum += uint64(len(e))
 		}
 		w.SetHead(0)
 		w.SetTail(int64(len(elems)))
 		w.SetCount(uint64(len(elems)))
+		w.SetBytes(byteSum)
 		return nil
 	})
 }
@@ -125,6 +130,7 @@ func listLen(db *keyspace.DB, key []byte) (n int64, hdr keyspace.ValueHeader, ke
 // step. For a left push each value lands at a new lowest position, so the pushed
 // run ends up reversed, exactly as LPUSH leaves it. It returns the new length.
 func listTreePush(w *keyspace.CollWriter, vals [][]byte, head bool) (int64, error) {
+	var added uint64
 	if head {
 		h := w.Head()
 		for _, v := range vals {
@@ -132,6 +138,7 @@ func listTreePush(w *keyspace.CollWriter, vals [][]byte, head bool) (int64, erro
 			if _, e := w.Put(listPosRow(h), v); e != nil {
 				return 0, e
 			}
+			added += uint64(len(v))
 		}
 		w.SetHead(h)
 	} else {
@@ -140,10 +147,12 @@ func listTreePush(w *keyspace.CollWriter, vals [][]byte, head bool) (int64, erro
 			if _, e := w.Put(listPosRow(t), v); e != nil {
 				return 0, e
 			}
+			added += uint64(len(v))
 			t++
 		}
 		w.SetTail(t)
 	}
+	w.SetBytes(w.Bytes() + added)
 	n := w.Tail() - w.Head()
 	w.SetCount(uint64(n))
 	return n, nil
@@ -159,6 +168,7 @@ func listTreePop(w *keyspace.CollWriter, n int, head bool) ([][]byte, error) {
 		return nil, nil
 	}
 	popped := make([][]byte, 0, n)
+	var removed uint64
 	if head {
 		h := w.Head()
 		for i := 0; i < n; i++ {
@@ -171,6 +181,7 @@ func listTreePop(w *keyspace.CollWriter, n int, head bool) ([][]byte, error) {
 				break
 			}
 			popped = append(popped, append([]byte(nil), v...))
+			removed += uint64(len(v))
 			if _, e := w.Delete(row); e != nil {
 				return nil, e
 			}
@@ -191,11 +202,17 @@ func listTreePop(w *keyspace.CollWriter, n int, head bool) ([][]byte, error) {
 				break
 			}
 			popped = append(popped, append([]byte(nil), v...))
+			removed += uint64(len(v))
 			if _, e := w.Delete(row); e != nil {
 				return nil, e
 			}
 		}
 		w.SetTail(t)
+	}
+	if removed > w.Bytes() {
+		w.SetBytes(0)
+	} else {
+		w.SetBytes(w.Bytes() - removed)
 	}
 	w.SetCount(uint64(w.Tail() - w.Head()))
 	return popped, nil
@@ -229,9 +246,12 @@ func listTreeIndex(db *keyspace.DB, key []byte, i int64) (elem []byte, found boo
 
 // listTreeSet replaces the element at logical index i in a btree-backed list, a
 // point sub-tree write. A negative index counts from the tail. oob is true when
-// the index is out of range, in which case nothing is written.
-func listTreeSet(db *keyspace.DB, key, val []byte, i int64) (oob bool, err error) {
-	err = db.CollUpdate(key, keyspace.TypeList, keyspace.EncQuicklist, func(w *keyspace.CollWriter) error {
+// the index is out of range, in which case nothing is written. It reads the old
+// element to keep the byte total accurate and re-derives the reported encoding,
+// since replacing a small element with one past the per-element or byte cap flips
+// listpack to quicklist exactly as Redis does. prevEnc pins the encoding floor.
+func listTreeSet(db *keyspace.DB, lim encLimits, key, val []byte, i int64, prevEnc uint8) (oob bool, err error) {
+	err = db.CollUpdate(key, keyspace.TypeList, prevEnc, func(w *keyspace.CollWriter) error {
 		n := w.Tail() - w.Head()
 		pos := i
 		if pos < 0 {
@@ -241,8 +261,25 @@ func listTreeSet(db *keyspace.DB, key, val []byte, i int64) (oob bool, err error
 			oob = true
 			return nil
 		}
-		_, e := w.Put(listPosRow(w.Head()+pos), val)
-		return e
+		row := listPosRow(w.Head() + pos)
+		old, _, e := w.Get(row)
+		if e != nil {
+			return e
+		}
+		oldLen := uint64(len(old))
+		if _, e := w.Put(row, val); e != nil {
+			return e
+		}
+		nb := w.Bytes()
+		if oldLen > nb {
+			nb = 0
+		} else {
+			nb -= oldLen
+		}
+		nb += uint64(len(val))
+		w.SetBytes(nb)
+		w.SetEnc(listCollReportedEnc(lim, prevEnc, int(w.Count()), nb, [][]byte{val}))
+		return nil
 	})
 	return oob, err
 }
