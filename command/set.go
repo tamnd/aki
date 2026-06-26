@@ -91,19 +91,29 @@ func handleSAdd(ctx *Ctx) {
 	// promotion to the hashtable form, and the plain blob rewrite. It is the
 	// fallback for a coll-form set, a promotion, or when no workers run.
 	sync := func(db *keyspace.DB) error {
-		hdr, found, err := setHeader(db, key)
-		if err != nil {
-			return err
-		}
-		if found && hdr.Type != keyspace.TypeSet {
-			wrongTyp = true
-			return nil
-		}
-		// A set already in the btree-backed form takes the point-write path: one
-		// sub-tree row per member, no whole-blob rewrite.
-		if found && hdr.IsColl() {
-			added = 0
-			return db.CollUpdate(key, keyspace.TypeSet, keyspace.EncHashtable, func(w *keyspace.CollWriter) error {
+		// CollUpdateRouted reads the metadata row once under the write lock and routes
+		// from it, so a coll-form set skips the separate setHeader (Peek) this path
+		// used to do before CollUpdate read the same row again.
+		var (
+			hdr   keyspace.ValueHeader
+			found bool
+		)
+		route, err := db.CollUpdateRouted(key, keyspace.TypeSet, keyspace.EncHashtable,
+			func(rFound bool, h keyspace.ValueHeader, _ []byte) keyspace.CollRoute {
+				hdr, found = h, rFound
+				if rFound && h.Type != keyspace.TypeSet {
+					wrongTyp = true
+					return keyspace.CollRouteSkip
+				}
+				if rFound && h.IsColl() {
+					return keyspace.CollRouteColl
+				}
+				return keyspace.CollRouteBlob
+			},
+			// A set already in the btree-backed form takes the point-write path: one
+			// sub-tree row per member, no whole-blob rewrite.
+			func(w *keyspace.CollWriter) error {
+				added = 0
 				for _, m := range toAdd {
 					created, e := w.Put(m, nil)
 					if e != nil {
@@ -116,6 +126,11 @@ func handleSAdd(ctx *Ctx) {
 				}
 				return nil
 			})
+		if err != nil {
+			return err
+		}
+		if route != keyspace.CollRouteBlob {
+			return nil
 		}
 		members, _, _, err := getSet(db, key)
 		if err != nil {

@@ -71,19 +71,29 @@ func handleHSet(ctx *Ctx, asHMSet bool) {
 	// fallback the write-behind helper runs for a coll-form hash, a promotion, or
 	// when no workers run.
 	sync := func(db *keyspace.DB) error {
-		hdr, found, err := hashHeader(db, key)
-		if err != nil {
-			return err
-		}
-		if found && hdr.Type != keyspace.TypeHash {
-			wrongTyp = true
-			return nil
-		}
-		// A hash already in the btree-backed form takes the point-write path: one
-		// sub-tree row per pair, no whole-blob rewrite.
-		if found && hdr.IsColl() {
-			added = 0
-			return db.CollUpdate(key, keyspace.TypeHash, keyspace.EncHashtable, func(w *keyspace.CollWriter) error {
+		// CollUpdateRouted reads the metadata row once under the write lock and routes
+		// from it, so a coll-form hash skips the separate hashHeader (Peek) this path
+		// used to do before CollUpdate read the same row again.
+		var (
+			hdr   keyspace.ValueHeader
+			found bool
+		)
+		route, err := db.CollUpdateRouted(key, keyspace.TypeHash, keyspace.EncHashtable,
+			func(rFound bool, h keyspace.ValueHeader, _ []byte) keyspace.CollRoute {
+				hdr, found = h, rFound
+				if rFound && h.Type != keyspace.TypeHash {
+					wrongTyp = true
+					return keyspace.CollRouteSkip
+				}
+				if rFound && h.IsColl() {
+					return keyspace.CollRouteColl
+				}
+				return keyspace.CollRouteBlob
+			},
+			// A hash already in the btree-backed form takes the point-write path: one
+			// sub-tree row per pair, no whole-blob rewrite.
+			func(w *keyspace.CollWriter) error {
+				added = 0
 				for i := 0; i < len(pairs); i += 2 {
 					created, e := w.Put(pairs[i], hashRowEncode(0, pairs[i+1]))
 					if e != nil {
@@ -96,6 +106,11 @@ func handleHSet(ctx *Ctx, asHMSet bool) {
 				}
 				return nil
 			})
+		if err != nil {
+			return err
+		}
+		if route != keyspace.CollRouteBlob {
+			return nil
 		}
 		// Blob path: decode, apply, then either rewrite the blob or, if the result
 		// crosses the hashtable threshold, promote to a fresh sub-tree.

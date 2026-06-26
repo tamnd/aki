@@ -223,6 +223,101 @@ func (db *DB) CollUpdate(key []byte, typ, enc uint8, fn func(w *CollWriter) erro
 	return db.collWriteMetaLocked(s, t, ck, key, w, typ, enc, prev, prevExisted, prevIsTree)
 }
 
+// CollRoute is the decision a CollUpdateRouted router returns after seeing the
+// existing value at key under the shard write lock, classifying which write path
+// the command should take without a second read of the same metadata row.
+type CollRoute uint8
+
+const (
+	// CollRouteColl proceeds with the collection element write: fn runs against the
+	// existing sub-tree (or a fresh one when the key is absent), exactly as in
+	// CollUpdate.
+	CollRouteColl CollRoute = iota
+	// CollRouteSkip does nothing and returns. The router uses it for the error and
+	// no-op cases (a wrong-type key, or a must-exist command on an absent key) after
+	// recording why through its own captured state.
+	CollRouteSkip
+	// CollRouteBlob reports that the value is not in coll form (an inline blob or a
+	// fresh key the command keeps in blob form while small). No coll mutation runs;
+	// the caller takes its own blob path, which may read and write the key again. Any
+	// such follow-up is safe when the caller holds the key's RMW stripe across it, as
+	// the write-behind fallback does, so no concurrent same-key writer can interleave.
+	CollRouteBlob
+)
+
+// CollUpdateRouted is CollUpdate with the type and form routing folded in, so a
+// collection write reads the metadata row once under the shard write lock instead
+// of once for routing (a prior Peek/CollMetaHeader) and once more inside the
+// update. It reads key, then asks route to classify it: route sees whether the key
+// was found, its existing header, and, for a non-coll inline value, its blob body
+// (valid only for the call) so the caller's blob path can reuse it.
+//
+// When route returns CollRouteColl, fn runs and the metadata is written back
+// exactly as in CollUpdate (including the empty-collection teardown and the
+// SetEnc override). Otherwise no coll mutation happens and the route is returned so
+// the caller takes its skip or blob path. typ and enc carry the same meaning as in
+// CollUpdate. The caller must NOT hold any shard lock.
+func (db *DB) CollUpdateRouted(key []byte, typ, enc uint8, route func(found bool, h ValueHeader, blob []byte) CollRoute, fn func(w *CollWriter) error) (CollRoute, error) {
+	s := ShardOf(key)
+	db.shards[s].mu.Lock()
+	defer db.shards[s].mu.Unlock()
+
+	t, err := db.ensureShardTree(s)
+	if err != nil {
+		return CollRouteSkip, err
+	}
+	ckp := ckPool.Get().(*[]byte)
+	*ckp = appendCompositeKey(*ckp, key)
+	ck := *ckp
+	defer ckPool.Put(ckp)
+
+	prev, prevBody, prevExisted, err := db.read(t, ck)
+	if err != nil {
+		return CollRouteSkip, err
+	}
+	// An expired key routes as absent, matching the Peek-based routing this
+	// replaces (Peek treats an expired key as not found).
+	found := prevExisted && !db.expired(prev)
+	var blob []byte
+	if found && !prev.IsColl() {
+		blob = prevBody
+	}
+	r := route(found, prev, blob)
+	if r != CollRouteColl {
+		return r, nil
+	}
+
+	prevIsTree := found && prev.IsColl()
+	w := &CollWriter{}
+	if prevIsTree {
+		w.tree = btree.Open(db.ks.pgr, uint32(prev.BodyRef))
+		w.meta = decodeCollMeta(prevBody)
+	} else {
+		w.tree, err = btree.Create(db.ks.pgr)
+		if err != nil {
+			return CollRouteColl, err
+		}
+	}
+
+	if ferr := fn(w); ferr != nil {
+		if !prevIsTree {
+			_ = btree.DropTree(db.ks.pgr, w.tree.Root())
+		}
+		return CollRouteColl, ferr
+	}
+
+	// CollUpdate frees a previous blob's overflow chain when it replaces a blob with
+	// the coll form. The same applies here when route promoted a blob (found and not
+	// a tree), so pass prevIsTree through to the same bookkeeping.
+	if w.meta.count == 0 {
+		return CollRouteColl, db.collClearLocked(s, t, ck, key, w.tree.Root(), prev, prevExisted, prevIsTree)
+	}
+	if w.encSet {
+		enc = w.enc
+	}
+	return CollRouteColl, db.collWriteMetaLocked(s, t, ck, key, w, typ, enc, prev, prevExisted, prevIsTree)
+}
+
 // collWriteMetaLocked writes the metadata row for a non-empty collection and does
 // the bookkeeping for an insert or update. Caller holds shard mu.Lock.
 func (db *DB) collWriteMetaLocked(s int, t *btree.Tree, ck, key []byte, w *CollWriter, typ, enc uint8, prev ValueHeader, prevExisted, prevIsTree bool) error {
