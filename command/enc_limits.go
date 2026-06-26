@@ -20,7 +20,10 @@ type encLimits struct {
 // Stock redis.conf defaults, used when there is no config store (offline RDB
 // load, a few tests) so behavior matches a default server.
 const (
-	defListSize    = 128
+	// defListSize is the compiled-in default for list-max-listpack-size. Redis
+	// and Valkey ship -2, the 8KB byte tier, not a positive entry count, so a
+	// list of short elements stays a single listpack well past 128 entries.
+	defListSize    = -2
 	defHashEntries = 128
 	defHashValue   = 64
 	defSetIntset   = 512
@@ -29,16 +32,9 @@ const (
 	defZsetEntries = 128
 	defZsetValue   = 64
 
-	// listMaxListpackElemBytes is the per-element byte cap aki keeps for a list
-	// listpack. Redis has no list-max-listpack-value directive, so this stays a
-	// constant rather than a config value.
-	listMaxListpackElemBytes = 64
-	// listDefaultBytes is the listpack byte cap used when list-max-listpack-size
-	// is a positive entry count. The size tier only applies to negative values.
-	listDefaultBytes = 8192
-	// listEntryOverhead approximates a listpack entry's header and backlen when
-	// estimating the blob size against the byte cap.
-	listEntryOverhead = 11
+	// listSafetyBytes is SIZE_SAFETY_LIMIT, the 8KB listpack byte cap Redis
+	// applies even when list-max-listpack-size is a positive entry count.
+	listSafetyBytes = 8192
 )
 
 // defaultEncLimits returns the stock-redis.conf threshold set.
@@ -77,20 +73,22 @@ func (ctx *Ctx) encLimits() encLimits {
 }
 
 // listLimits resolves list-max-listpack-size into an entry-count cap and a byte
-// cap. A positive value is an entry count and leaves the byte cap at the default
-// safety size. A negative value -1..-5 selects a 4/8/16/32/64 KB byte cap and
-// leaves the entry count at the default. Zero falls back to the default.
+// cap, mirroring quicklistNodeLimit. A positive value is an entry count with the
+// 8KB safety byte cap on top. A negative value -1..-5 selects a 4/8/16/32/64 KB
+// byte cap and imposes no entry cap, so a list of short elements stays a listpack
+// until the bytes cross the tier. An entries value of 0 means no entry cap. Zero
+// is treated as a byte-only cap at the safety size.
 func (l encLimits) listLimits() (entries, bytes int) {
 	switch {
 	case l.listSize > 0:
-		return int(l.listSize), listDefaultBytes
+		return int(l.listSize), listSafetyBytes
 	case l.listSize < 0:
 		tier := -l.listSize
 		if tier > 5 {
 			tier = 5
 		}
-		return defListSize, 1 << (11 + tier)
+		return 0, 1 << (11 + tier)
 	default:
-		return defListSize, listDefaultBytes
+		return 0, listSafetyBytes
 	}
 }

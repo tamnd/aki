@@ -431,8 +431,8 @@ func configDirectives() []*directive {
 		{name: "cluster-replica-validity-factor", kind: dirInt, def: "10", mutable: true},
 
 		// Data-type limits.
-		{name: "list-max-listpack-size", kind: dirInt, def: "128", mutable: true},
-		{name: "list-max-ziplist-size", kind: dirInt, def: "128", mutable: true},
+		{name: "list-max-listpack-size", kind: dirInt, def: "-2", mutable: true},
+		{name: "list-max-ziplist-size", kind: dirInt, def: "-2", mutable: true},
 		{name: "hash-max-listpack-entries", kind: dirInt, def: "128", mutable: true},
 		{name: "hash-max-listpack-value", kind: dirInt, def: "64", mutable: true},
 		{name: "set-max-intset-entries", kind: dirInt, def: "512", mutable: true},

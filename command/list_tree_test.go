@@ -28,6 +28,10 @@ func rpushMany(t *testing.T, r *bufio.Reader, c net.Conn, key string, n int) {
 // flips to quicklist, the externally visible signal that it is btree-backed.
 func TestListPromotesToQuicklist(t *testing.T) {
 	r, c := startData(t)
+	// Force the quicklist label by entry count: at the default -2 byte budget a
+	// 200-element short list stays listpack, so use a positive fill to drive the
+	// listpack -> quicklist transition the same way Redis does under that config.
+	_ = sendLine(t, r, c, "CONFIG SET list-max-listpack-size 5")
 	_ = sendLine(t, r, c, "RPUSH small a b c")
 	if got := bulk(t, r, c, "OBJECT ENCODING small"); got != "listpack" {
 		t.Fatalf("small encoding = %q want listpack", got)
@@ -230,6 +234,7 @@ func TestListLargeOverwriteWithString(t *testing.T) {
 // checks the elements, order and encoding survive.
 func TestListLargeDumpRestore(t *testing.T) {
 	r, c := startData(t)
+	_ = sendLine(t, r, c, "CONFIG SET list-max-listpack-size 5")
 	rpushMany(t, r, c, "l", 200)
 	_ = dumpRestoreRoundTrip(t, r, c, "l")
 	if got := sendLine(t, r, c, "LLEN l"); got != ":200" {
@@ -246,6 +251,7 @@ func TestListLargeDumpRestore(t *testing.T) {
 // TestListLargeDebugReload checks a promoted list survives DEBUG RELOAD.
 func TestListLargeDebugReload(t *testing.T) {
 	r, c := startData(t)
+	_ = sendLine(t, r, c, "CONFIG SET list-max-listpack-size 5")
 	rpushMany(t, r, c, "l", 200)
 	if got := sendLine(t, r, c, "DEBUG RELOAD"); got != "+OK" {
 		t.Fatalf("DEBUG RELOAD = %q", got)

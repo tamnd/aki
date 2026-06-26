@@ -100,62 +100,44 @@ func listBlobPush(body []byte, vals [][]byte, head bool) ([]byte, int, error) {
 }
 
 // listBlobReportedEnc returns the OBJECT ENCODING a spliced list body should
-// report. It mirrors listEncoding but without decoding the whole list: the
-// previous encoding pins the floor (a quicklist never demotes), the entry cap and
-// the pushed elements' sizes are checked directly, and the listpack byte cap is
-// proved cheaply from the count when even max-size elements would fit. Only a list
-// near the byte boundary falls back to decoding for the exact check, which the
-// decode closure provides.
-func listBlobReportedEnc(lim encLimits, prevEnc uint8, newCount int, pushed [][]byte, decode func() ([][]byte, error)) (uint8, error) {
+// report, applying the Redis rule (quicklistNodeExceedsLimit) to the new body
+// without allocating a decoded element slice. The previous encoding pins the
+// floor (a quicklist never demotes). listBodyMetrics walks the body once for the
+// element count and the exact listpack byte size, which the entry cap (positive
+// fill only) and the byte cap are then checked against.
+func listBlobReportedEnc(lim encLimits, prevEnc uint8, body []byte) (uint8, error) {
 	if prevEnc == keyspace.EncQuicklist {
 		return keyspace.EncQuicklist, nil
 	}
 	maxEntries, maxBytes := lim.listLimits()
-	if newCount > maxEntries {
-		return keyspace.EncQuicklist, nil
-	}
-	for _, v := range pushed {
-		if len(v) > listMaxListpackElemBytes {
-			return keyspace.EncQuicklist, nil
-		}
-	}
-	// Cheap proof: if the count times the largest a listpack element can be still
-	// fits the byte cap, the list is a listpack without inspecting any bytes.
-	if newCount*(listMaxListpackElemBytes+listEntryOverhead)+listEntryOverhead <= maxBytes {
-		return keyspace.EncListpack, nil
-	}
-	// Near the byte boundary the exact total matters, so decode and reuse the
-	// canonical rule. This only happens for lists already close to promotion.
-	elems, err := decode()
+	count, lpBytes, err := listBodyMetrics(body)
 	if err != nil {
 		return 0, err
 	}
-	return listEncoding(lim, elems, prevEnc), nil
+	if maxEntries > 0 && count > maxEntries {
+		return keyspace.EncQuicklist, nil
+	}
+	if lpBytes > maxBytes {
+		return keyspace.EncQuicklist, nil
+	}
+	return keyspace.EncListpack, nil
 }
 
 // listCollReportedEnc returns the OBJECT ENCODING a coll-form list should report,
 // computed from its maintained metadata so a push never walks the rows. It mirrors
 // listEncoding: prevEnc pins the floor (a quicklist never demotes), the count caps
-// the entry limit, any pushed element over the per-element cap forces quicklist,
-// and the listpack byte estimate is listEntryOverhead per element plus one added to
-// byteSum (the running sum of raw element lengths), matching listEncoding's total.
-// pushed carries the elements added by this op so their size cap is checked without
-// a walk; for a pop or set pass nil.
-func listCollReportedEnc(lim encLimits, prevEnc uint8, count int, byteSum uint64, pushed [][]byte) uint8 {
+// the entry limit only when the fill is a positive entry count, and lpByteSum is
+// the running sum of each element's lpEntrySize, so adding the fixed listpack
+// header gives the same total listpackBytes would compute from the elements.
+func listCollReportedEnc(lim encLimits, prevEnc uint8, count int, lpByteSum uint64) uint8 {
 	if prevEnc == keyspace.EncQuicklist {
 		return keyspace.EncQuicklist
 	}
 	maxEntries, maxBytes := lim.listLimits()
-	if count > maxEntries {
+	if maxEntries > 0 && count > maxEntries {
 		return keyspace.EncQuicklist
 	}
-	for _, v := range pushed {
-		if len(v) > listMaxListpackElemBytes {
-			return keyspace.EncQuicklist
-		}
-	}
-	total := int64(byteSum) + int64(count+1)*int64(listEntryOverhead)
-	if total > int64(maxBytes) {
+	if int64(lpHeaderBytes)+int64(lpByteSum) > int64(maxBytes) {
 		return keyspace.EncQuicklist
 	}
 	return keyspace.EncListpack
@@ -163,24 +145,18 @@ func listCollReportedEnc(lim encLimits, prevEnc uint8, count int, byteSum uint64
 
 // listEncoding picks the reported encoding for a list. Once a key is a
 // quicklist it never goes back to listpack, so prev pins the floor. The entry
-// and byte caps come from list-max-listpack-size via lim.
+// cap (positive fill only) and the listpack byte cap come from
+// list-max-listpack-size via lim, matching quicklistNodeExceedsLimit.
 func listEncoding(lim encLimits, elems [][]byte, prev uint8) uint8 {
 	if prev == keyspace.EncQuicklist {
 		return keyspace.EncQuicklist
 	}
 	maxEntries, maxBytes := lim.listLimits()
-	if len(elems) > maxEntries {
+	if maxEntries > 0 && len(elems) > maxEntries {
 		return keyspace.EncQuicklist
 	}
-	total := listEntryOverhead
-	for _, e := range elems {
-		if len(e) > listMaxListpackElemBytes {
-			return keyspace.EncQuicklist
-		}
-		total += len(e) + listEntryOverhead
-		if total > maxBytes {
-			return keyspace.EncQuicklist
-		}
+	if listpackBytes(elems) > maxBytes {
+		return keyspace.EncQuicklist
 	}
 	return keyspace.EncListpack
 }
