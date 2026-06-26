@@ -105,6 +105,11 @@ type Dispatcher struct {
 	// and the replica-side link to a master.
 	repl replState
 
+	// monitors holds the connections in MONITOR mode. runCommand feeds them every
+	// processed command; an atomic count lets the hot path skip the feed entirely
+	// when no monitor is attached.
+	monitors *monitorRegistry
+
 	// cluster holds the cluster topology: this node's id, epoch, and the slots it
 	// owns. aki runs single-node by default, so this stays mostly empty unless
 	// cluster-enabled is on and slots are assigned.
@@ -247,6 +252,7 @@ func New(cfg Config) *Dispatcher {
 	cmds = append(cmds, functionCommands()...)
 	cmds = append(cmds, moduleCommands()...)
 	cmds = append(cmds, replicationCommands()...)
+	cmds = append(cmds, monitorCommands()...)
 	cmds = append(cmds, clusterCommands()...)
 	cmds = append(cmds, clusterConnCommands()...)
 	cmds = append(cmds, sentinelCommands()...)
@@ -263,6 +269,7 @@ func New(cfg Config) *Dispatcher {
 		cfg:       cfg,
 		engine:    cfg.Engine,
 		ps:        newPubsubRegistry(),
+		monitors:  newMonitorRegistry(),
 		conf:      conf,
 		acl:       acl,
 		startTime: time.Now(),
@@ -585,6 +592,11 @@ type session struct {
 	replListenPort int
 	fromMaster     bool
 
+	// isMonitor marks a connection that issued MONITOR and is now receiving the
+	// command feed. It no longer runs ordinary commands; the flag lets CLIENT INFO
+	// and the disconnect path recognize the mode.
+	isMonitor bool
+
 	// Client-side caching (CLIENT TRACKING). trackingOn marks a connection that
 	// asked the server to record the keys it reads and push invalidations when
 	// they change. The mode flags are mutually exclusive in the ways CLIENT
@@ -772,6 +784,9 @@ func (d *Dispatcher) OnDisconnect(c *networking.Conn) {
 	}
 	if sess.trackingOn {
 		d.trackingDropClient(c.ID(), sess)
+	}
+	if sess.isMonitor {
+		d.monitors.remove(c.ID())
 	}
 	d.ps.dropClient(c.ID(), sess)
 }
