@@ -221,6 +221,24 @@ func (e *Engine) setCommitPolicy(p commitPolicy) error {
 	return e.commit()
 }
 
+// setHashOverlay enables or disables the in-memory hash write overlay under the
+// engine write lock, which excludes every shard worker (they hold e.mu.RLock), so
+// no absorb or fold races the toggle. Disabling folds every resident copy back into
+// its sub-tree and drops the residency maps; that dirties pages, so a checkpoint
+// follows to make the folded state durable rather than waiting on the periodic one.
+func (e *Engine) setHashOverlay(on bool) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	folded, err := e.ks.SetHashOverlay(on)
+	if err != nil {
+		return err
+	}
+	if folded {
+		return e.commit()
+	}
+	return nil
+}
+
 // StartWorker starts all write workers: one global worker for cross-shard and
 // commitAlways writes, and one dedicated worker per shard for deferred
 // single-key writes. The per-shard workers each own their channel exclusively —
@@ -888,7 +906,15 @@ func (e *Engine) commitCron(now time.Time) error {
 func (e *Engine) ForceCommit() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if !e.pendingDirty.Load() {
+	// Fold any hash-overlay writes still resident in memory into their sub-trees so
+	// the checkpoint persists them; an unfolded write lives only in the residency
+	// map and in no page. The fold dirties pages, so commit when it wrote even if
+	// nothing else was pending.
+	folded, err := e.ks.FoldAllOverlay()
+	if err != nil {
+		return err
+	}
+	if !folded && !e.pendingDirty.Load() {
 		return nil
 	}
 	return e.commit()
@@ -989,8 +1015,16 @@ func (e *Engine) takeExpired() []keyspace.ExpiredKey {
 // the engine read lock. The copy is taken in memory; BGSAVE writes it from a
 // background goroutine while new writes proceed.
 func (e *Engine) snapshotAll() (rdb.Snapshot, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	// The write lock is taken rather than the read lock because the overlay fold
+	// below mutates sub-trees. A resident hash's newest elements live only in the
+	// residency map; without the fold the snapshot would walk a stale sub-tree and
+	// miss them. BGSAVE copies in memory under the lock, so the pause is bounded by
+	// the copy, not by writing the file.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, err := e.ks.FoldAllOverlay(); err != nil {
+		return rdb.Snapshot{}, err
+	}
 	return SnapshotKeyspace(e.ks)
 }
 

@@ -408,6 +408,26 @@ func (d *Dispatcher) applyCommitPolicy() {
 	if err := d.engine.setCommitPolicy(p); err != nil {
 		d.LogWarn("Commit policy change failed", "err", err.Error())
 	}
+	// The hash overlay gate depends on the commit policy, so recompute it whenever
+	// the policy is recomputed.
+	d.applyHashOverlay()
+}
+
+// applyHashOverlay turns the in-memory hash write overlay on or off to match the
+// aki-hash-overlay directive and the active commit policy. It is forced off under
+// commitAlways without the AOF, where an absorbed write has no durable record
+// before its reply, since the per-write B-tree durability contract is the whole
+// point of that policy. The dispatcher calls it at startup, on a commit-policy
+// change, and on CONFIG SET aki-hash-overlay.
+func (d *Dispatcher) applyHashOverlay() {
+	if d.engine == nil {
+		return
+	}
+	commitAlways := d.aofFsyncPolicy() == "always" && !d.aofEnabled()
+	want := d.confBool("aki-hash-overlay", false) && !commitAlways
+	if err := d.engine.setHashOverlay(want); err != nil {
+		d.LogWarn("Hash overlay change failed", "err", err.Error())
+	}
 }
 
 // runActiveExpire runs one active expiry pass and fires the expired event for

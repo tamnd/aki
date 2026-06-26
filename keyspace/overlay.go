@@ -1,5 +1,11 @@
 package keyspace
 
+import (
+	"sort"
+
+	"github.com/tamnd/aki/btree"
+)
+
 // This file is the keyspace-layer groundwork for the in-memory collection write
 // fast path (spec 2064 note 223). It defines liveColl, the in-memory
 // authoritative copy of a btree-backed collection while it is resident in the
@@ -41,8 +47,23 @@ type liveColl struct {
 	ttlMs  int64
 	hasTTL bool
 
+	// bodyRef is the element sub-tree root this resident copy folds back into. It
+	// is the BodyRef of the key's metadata row, captured when the copy is
+	// materialized and stable while the key stays resident (every mutator either
+	// routes through the overlay under the shard lock or evicts the copy first), so
+	// a fold can reopen the sub-tree without re-reading the metadata row.
+	bodyRef uint32
+
 	version uint64
 }
+
+// overlayFoldThreshold is the count of unfolded mutations a resident copy
+// accumulates before a write inline-folds it back into the sub-tree. A larger
+// value batches more element writes per fold (better locality, fewer metadata
+// touches) at the cost of more rows replayed from the append log after a crash;
+// 256 matches the write worker's drain-batch bound so a fold spans about one
+// batch of absorbed writes.
+const overlayFoldThreshold = 256
 
 // newLiveColl returns an empty resident collection of the given type, encoding,
 // and TTL. It is used when a collection is created directly in the overlay (a
@@ -116,12 +137,239 @@ func (lc *liveColl) get(sub []byte) ([]byte, bool) {
 	return v, ok
 }
 
+// liveCursor iterates a resident copy's rows in sorted subkey order, matching the
+// byte ordering of the element sub-tree it shadows so HGETALL/HKEYS/HVALS return
+// the same order whether or not a key is resident. It snapshots the subkeys at
+// construction, so it is stable against further mutation of the copy (the enclosing
+// callback holds the shard lock for its lifetime regardless).
+type liveCursor struct {
+	lc   *liveColl
+	keys []string
+	i    int
+}
+
+// newLiveCursor snapshots the resident copy's subkeys in sorted order.
+func newLiveCursor(lc *liveColl) *liveCursor {
+	keys := make([]string, 0, len(lc.rows))
+	for k := range lc.rows {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return &liveCursor{lc: lc, keys: keys}
+}
+
+func (lcur *liveCursor) first()        { lcur.i = 0 }
+func (lcur *liveCursor) valid() bool   { return lcur.i < len(lcur.keys) }
+func (lcur *liveCursor) next()         { lcur.i++ }
+func (lcur *liveCursor) key() []byte   { return []byte(lcur.keys[lcur.i]) }
+func (lcur *liveCursor) value() []byte { return lcur.lc.rows[lcur.keys[lcur.i]] }
+
+// seek positions the cursor at the first subkey greater than or equal to sub, the
+// same semantics as the B-tree cursor's Seek.
+func (lcur *liveCursor) seek(sub []byte) {
+	target := string(sub)
+	lcur.i = sort.SearchStrings(lcur.keys, target)
+}
+
 // count is the number of live elements, the value HLEN/SCARD report.
 func (lc *liveColl) count() int { return len(lc.rows) }
 
 // dirty reports whether the resident copy has unflushed mutations. A clean copy
 // can be evicted without a fold.
 func (lc *liveColl) dirty() bool { return len(lc.dirtyPut) != 0 || len(lc.dirtyDel) != 0 }
+
+// dirtyTotal is the count of unfolded mutations since the last fold, compared
+// against overlayFoldThreshold to decide when an absorbed write inline-folds.
+func (lc *liveColl) dirtyTotal() int { return len(lc.dirtyPut) + len(lc.dirtyDel) }
+
+// hashOverlayOn reports whether the in-memory hash write overlay is enabled. The
+// command layer toggles it through Keyspace.SetHashOverlay after weighing the
+// commit policy: it stays off under commitAlways, where an absorbed write would
+// have no durable record before its reply, and off entirely until a config
+// directive turns it on.
+func (db *DB) hashOverlayOn() bool { return db.ks.hashOverlay.Load() }
+
+// HashOverlayEnabled reports whether the in-memory hash write overlay is currently
+// engaged. The command layer owns the policy that drives it; this is a read-only
+// view for introspection and tests.
+func (ks *Keyspace) HashOverlayEnabled() bool { return ks.hashOverlay.Load() }
+
+// overlayEngagesLocked reports whether a coll write to a key of type typ should
+// route through the resident overlay. The overlay only continues an existing
+// btree-backed hash (prevIsTree): a fresh key or a blob being promoted takes the
+// normal path and becomes resident on its next write, which keeps the engage
+// decision a single bool test and avoids materializing a copy that a one-shot write
+// would never reuse. The caller holds the shard write lock.
+func (db *DB) overlayEngagesLocked(typ uint8, prevIsTree bool) bool {
+	return prevIsTree && typ == TypeHash && db.hashOverlayOn()
+}
+
+// collFinishOverlayLocked completes a coll write that absorbed its element ops into
+// the resident copy lc. When the hash emptied, the key and its sub-tree are torn
+// down. Otherwise the metadata row is rewritten every call (so the version advances
+// for WATCH and the count stays accurate) while the element writes stay in memory;
+// once the unfolded mutations cross the fold threshold they are folded back into the
+// sub-tree in one pass first. The caller holds the shard write lock. w carries the
+// closure-maintained counters; w.tree was opened at lc.bodyRef so its root names the
+// (unchanged) sub-tree for a deferred write.
+func (db *DB) collFinishOverlayLocked(s int, t *btree.Tree, ck, key []byte, w *CollWriter, lc *liveColl, typ, enc uint8, prev ValueHeader, prevExisted bool) error {
+	if w.meta.count == 0 {
+		// The last element was removed: drop the resident copy and tear the key down,
+		// freeing the sub-tree at lc.bodyRef. The deferred element writes never reached
+		// the sub-tree, but it is going away regardless.
+		db.overlayEvictLocked(s, key)
+		return db.collClearLocked(s, t, ck, key, lc.bodyRef, prev, prevExisted, true)
+	}
+	if w.encSet {
+		enc = w.enc
+	}
+	if lc.dirtyTotal() >= overlayFoldThreshold {
+		fw := &CollWriter{tree: btree.Open(db.ks.pgr, lc.bodyRef), meta: w.meta}
+		if err := lc.fold(fw); err != nil {
+			return err
+		}
+		lc.bodyRef = fw.tree.Root()
+		return db.collWriteMetaLocked(s, t, ck, key, fw, typ, enc, prev, prevExisted, true)
+	}
+	return db.collWriteMetaLocked(s, t, ck, key, w, typ, enc, prev, prevExisted, true)
+}
+
+// overlayResidentLocked returns the resident copy for key on shard s, materializing
+// it from the element sub-tree on first touch. The caller holds the shard write
+// lock and has confirmed key is a btree-backed collection with header prev and
+// metadata body prevBody. The copy is stored in the shard residency map so later
+// reads and writes find it.
+func (db *DB) overlayResidentLocked(s int, key []byte, prev ValueHeader, prevBody []byte) (*liveColl, error) {
+	sk := string(key)
+	if lc := db.shards[s].live[sk]; lc != nil {
+		return lc, nil
+	}
+	sub := btree.Open(db.ks.pgr, uint32(prev.BodyRef))
+	r := &CollReader{tree: sub, meta: decodeCollMeta(prevBody)}
+	lc, err := materializeLiveColl(r, prev.Type, prev.Encoding, prev.TTLms, prev.HasTTL())
+	if err != nil {
+		return nil, err
+	}
+	lc.bodyRef = uint32(prev.BodyRef)
+	if db.shards[s].live == nil {
+		db.shards[s].live = make(map[string]*liveColl)
+	}
+	db.shards[s].live[sk] = lc
+	return lc, nil
+}
+
+// overlayEvictLocked drops the resident copy for key without folding it, for when
+// the key's value is being removed or overwritten outside the overlay so the stale
+// copy must not survive. The caller holds the shard write lock. It is a no-op when
+// the key is not resident.
+func (db *DB) overlayEvictLocked(s int, key []byte) {
+	if db.shards[s].live == nil {
+		return
+	}
+	delete(db.shards[s].live, string(key))
+}
+
+// overlayFoldKeyLocked folds one resident copy's accumulated mutations back into
+// the element sub-tree and rewrites the metadata row, leaving the copy resident
+// and clean. It reports whether it wrote anything, so a persist boundary knows the
+// fold dirtied pages that a checkpoint must flush. The caller holds the shard write
+// lock. It is the standalone fold used at persist boundaries and on overlay
+// teardown; the absorb path folds inline against its own open writer instead. A
+// clean copy is left untouched.
+func (db *DB) overlayFoldKeyLocked(s int, key []byte, lc *liveColl) (bool, error) {
+	if !lc.dirty() {
+		return false, nil
+	}
+	t, err := db.ensureShardTree(s)
+	if err != nil {
+		return false, err
+	}
+	ckp := ckPool.Get().(*[]byte)
+	*ckp = appendCompositeKey(*ckp, key)
+	ck := *ckp
+	defer ckPool.Put(ckp)
+	prev, _, prevExisted, err := db.read(t, ck)
+	if err != nil {
+		return false, err
+	}
+	w := &CollWriter{tree: btree.Open(db.ks.pgr, lc.bodyRef)}
+	w.meta.count = uint64(lc.count())
+	if err := lc.fold(w); err != nil {
+		return false, err
+	}
+	lc.bodyRef = w.tree.Root()
+	if err := db.collWriteMetaLocked(s, t, ck, key, w, lc.typ, lc.enc, prev, prevExisted, prevExisted && prev.IsColl()); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// FoldAllOverlay folds every resident collection copy in every database back into
+// its sub-tree so a snapshot or a durable checkpoint sees the absorbed writes. The
+// copies stay resident and clean. It reports whether any fold wrote, so the caller
+// can decide whether a checkpoint is owed. The command layer calls it before SAVE,
+// BGSAVE, an RDB snapshot, an AOF rewrite, and a clean shutdown, so the persisted
+// file is never missing an unfolded write. It is safe to call when the overlay was
+// never used.
+func (ks *Keyspace) FoldAllOverlay() (bool, error) {
+	folded := false
+	for _, db := range ks.dbs {
+		for s := range db.shards {
+			db.shards[s].mu.Lock()
+			did, err := db.foldShardLocked(s, false)
+			db.shards[s].mu.Unlock()
+			folded = folded || did
+			if err != nil {
+				return folded, err
+			}
+		}
+	}
+	return folded, nil
+}
+
+// foldShardLocked folds every resident copy on shard s, reporting whether any fold
+// wrote. When evict is set the residency map is dropped afterward, returning the
+// shard to a no-overlay state. The caller holds the shard write lock.
+func (db *DB) foldShardLocked(s int, evict bool) (bool, error) {
+	folded := false
+	for sk, lc := range db.shards[s].live {
+		did, err := db.overlayFoldKeyLocked(s, []byte(sk), lc)
+		folded = folded || did
+		if err != nil {
+			return folded, err
+		}
+	}
+	if evict {
+		db.shards[s].live = nil
+	}
+	return folded, nil
+}
+
+// SetHashOverlay enables or disables the in-memory hash write overlay. Enabling
+// just sets the flag; new coll-form hash writes then route through the residency
+// map. Disabling folds every resident copy back into its sub-tree and drops them,
+// so no copy outlives the overlay while later writes bypass it. The command layer
+// serializes this against all writers (it holds the engine write lock), so no
+// absorb or fold races the teardown.
+func (ks *Keyspace) SetHashOverlay(on bool) (folded bool, err error) {
+	if on {
+		ks.hashOverlay.Store(true)
+		return false, nil
+	}
+	ks.hashOverlay.Store(false)
+	for _, db := range ks.dbs {
+		for s := range db.shards {
+			db.shards[s].mu.Lock()
+			did, ferr := db.foldShardLocked(s, true)
+			db.shards[s].mu.Unlock()
+			folded = folded || did
+			if ferr != nil {
+				return folded, ferr
+			}
+		}
+	}
+	return folded, nil
+}
 
 // fold writes the accumulated mutations into the element sub-tree through w and
 // updates the metadata count, then clears the dirty sets. Only the delta since
