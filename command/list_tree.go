@@ -39,14 +39,6 @@ func listPosRow(pos int64) []byte {
 	return encoding.AppendU64BE(make([]byte, 0, 8), uint64(pos)^(1<<63))
 }
 
-// listWantsTree reports whether a list with these elements should live in the
-// btree-backed form. The rule is the encoding rule: a list is tree-backed exactly
-// when it reports quicklist, so promotion happens at the listpack threshold and
-// the encoding name stays correct for free.
-func listWantsTree(lim encLimits, elems [][]byte, prevEnc uint8) bool {
-	return listEncoding(lim, elems, prevEnc) == keyspace.EncQuicklist
-}
-
 // listPromote moves a list from the blob form to the btree-backed form. It writes
 // one row per element at positions 0..n-1, records the byte total, and sets the
 // head/tail window through CollUpdate, which creates the fresh sub-tree, frees the
