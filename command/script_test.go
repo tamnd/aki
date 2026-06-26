@@ -61,10 +61,23 @@ func TestEvalStatusAndErrorReply(t *testing.T) {
 	if got := sendArgs(t, r, c, "EVAL", "return redis.status_reply('TEST')", "0"); got != "TEST" {
 		t.Fatalf("status_reply = %v", got)
 	}
+	// error_reply prepends ERR only when the message has no space-delimited
+	// code token, matching Redis luaPushErrorBuff. "my error" already has a
+	// leading word so it passes through verbatim, same as Redis 7.4 and Valkey.
 	got := sendArgs(t, r, c, "EVAL", "return redis.error_reply('my error')", "0")
 	e, ok := got.(cmdErr)
-	if !ok || string(e) != "ERR my error" {
+	if !ok || string(e) != "my error" {
 		t.Fatalf("error_reply = %v (%T)", got, got)
+	}
+	// A code-less message still gets the generic ERR code.
+	got = sendArgs(t, r, c, "EVAL", "return redis.error_reply('boom')", "0")
+	if e, ok := got.(cmdErr); !ok || string(e) != "ERR boom" {
+		t.Fatalf("error_reply code-less = %v (%T)", got, got)
+	}
+	// A returned {err=...} table is verbatim, no ERR even when code-less.
+	got = sendArgs(t, r, c, "EVAL", "return {err='oneword'}", "0")
+	if e, ok := got.(cmdErr); !ok || string(e) != "oneword" {
+		t.Fatalf("err table = %v (%T)", got, got)
 	}
 }
 

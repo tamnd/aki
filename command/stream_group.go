@@ -952,9 +952,9 @@ func writeFullGroups(enc *resp.Encoder, s *stream) {
 	enc.WriteArrayLen(len(s.groups))
 	for _, g := range s.groups {
 		if enc.Proto() >= 3 {
-			enc.WriteMapLen(6)
+			enc.WriteMapLen(7)
 		} else {
-			enc.WriteArrayLen(12)
+			enc.WriteArrayLen(14)
 		}
 		enc.WriteBulkStringStr("name")
 		enc.WriteBulkStringStr(g.name)
@@ -962,6 +962,10 @@ func writeFullGroups(enc *resp.Encoder, s *stream) {
 		enc.WriteBulkStringStr(g.lastID.String())
 		enc.WriteBulkStringStr("entries-read")
 		enc.WriteInteger(int64(g.entriesRead))
+		// lag mirrors the XINFO GROUPS field: entries added to the stream that
+		// this group has not yet read. Redis 7.0+ includes it in STREAM FULL too.
+		enc.WriteBulkStringStr("lag")
+		enc.WriteInteger(int64(s.entriesAdded - g.entriesRead))
 		enc.WriteBulkStringStr("pel-count")
 		enc.WriteInteger(int64(len(g.pel)))
 		enc.WriteBulkStringStr("pending")
@@ -989,9 +993,9 @@ func writeGroupConsumers(enc *resp.Encoder, g *group) {
 	enc.WriteArrayLen(len(g.consumers))
 	for _, c := range g.consumers {
 		if enc.Proto() >= 3 {
-			enc.WriteMapLen(4)
+			enc.WriteMapLen(5)
 		} else {
-			enc.WriteArrayLen(8)
+			enc.WriteArrayLen(10)
 		}
 		enc.WriteBulkStringStr("name")
 		enc.WriteBulkStringStr(c.name)
@@ -999,6 +1003,10 @@ func writeGroupConsumers(enc *resp.Encoder, g *group) {
 		enc.WriteInteger(c.seenTime)
 		enc.WriteBulkStringStr("active-time")
 		enc.WriteInteger(c.activeTime)
+		// pel-count is the size of this consumer's pending entries list. Redis
+		// emits it per consumer in XINFO STREAM FULL, just before pending.
+		enc.WriteBulkStringStr("pel-count")
+		enc.WriteInteger(int64(g.consumerPending(c.name)))
 		enc.WriteBulkStringStr("pending")
 		writeConsumerPEL(enc, g, c.name)
 	}
