@@ -158,10 +158,10 @@ func newLiveCursor(lc *liveColl) *liveCursor {
 	return &liveCursor{lc: lc, keys: keys}
 }
 
-func (lcur *liveCursor) first()       { lcur.i = 0 }
-func (lcur *liveCursor) valid() bool  { return lcur.i < len(lcur.keys) }
-func (lcur *liveCursor) next()        { lcur.i++ }
-func (lcur *liveCursor) key() []byte  { return []byte(lcur.keys[lcur.i]) }
+func (lcur *liveCursor) first()        { lcur.i = 0 }
+func (lcur *liveCursor) valid() bool   { return lcur.i < len(lcur.keys) }
+func (lcur *liveCursor) next()         { lcur.i++ }
+func (lcur *liveCursor) key() []byte   { return []byte(lcur.keys[lcur.i]) }
 func (lcur *liveCursor) value() []byte { return lcur.lc.rows[lcur.keys[lcur.i]] }
 
 // seek positions the cursor at the first subkey greater than or equal to sub, the
