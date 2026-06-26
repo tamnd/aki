@@ -2,8 +2,10 @@ package command
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -126,9 +128,9 @@ func TestHPersist(t *testing.T) {
 	_ = sendLine(t, r, c, "HSET h f1 v1 f2 v2")
 	_ = codeArray(t, r, c, "HEXPIRE h 100 FIELDS 1 f1")
 	toks := codeArray(t, r, c, "HPERSIST h FIELDS 3 f1 f2 nope")
-	// f1 had a TTL → 1, f2 persistent → 0, nope missing → -2.
-	if len(toks) != 3 || toks[0] != "1" || toks[1] != "0" || toks[2] != "-2" {
-		t.Fatalf("HPERSIST = %v want [1 0 -2]", toks)
+	// f1 had a TTL → 1, f2 persistent → -1, nope missing → -2.
+	if len(toks) != 3 || toks[0] != "1" || toks[1] != "-1" || toks[2] != "-2" {
+		t.Fatalf("HPERSIST = %v want [1 -1 -2]", toks)
 	}
 	if toks := codeArray(t, r, c, "HTTL h FIELDS 1 f1"); toks[0] != "-1" {
 		t.Fatalf("HTTL after persist = %v want [-1]", toks)
@@ -164,6 +166,86 @@ func TestHTTLMissingKey(t *testing.T) {
 	toks := codeArray(t, r, c, "HTTL nope FIELDS 1 f")
 	if len(toks) != 1 || toks[0] != "-2" {
 		t.Fatalf("HTTL missing key = %v want [-2]", toks)
+	}
+}
+
+// TestHashFieldTTLCollForm exercises the whole 7.4 hash-field expiry family on a
+// hash large enough to live in the btree-backed (hashtable) form, not the inline
+// blob. That form stores one TTL per element row, a separate code path, and it
+// once decoded the metadata cell as if it were an inline blob and failed every
+// command with a truncated-input error. The test builds a 200-field hash, asserts
+// it reports hashtable, then walks HEXPIREAT/HEXPIRETIME/HPERSIST/HGETEX/HGETDEL
+// and the past-deadline delete, all with absolute deadlines so the values are
+// exact rather than a live countdown.
+func TestHashFieldTTLCollForm(t *testing.T) {
+	r, c := startData(t)
+
+	var b strings.Builder
+	b.WriteString("HSET h")
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&b, " f%03d v%03d", i, i)
+	}
+	if got := sendLine(t, r, c, b.String()); got != ":200" {
+		t.Fatalf("HSET 200 fields = %q want :200", got)
+	}
+	if enc := readBulk(t, r, sendLine(t, r, c, "OBJECT ENCODING h")); enc != "hashtable" {
+		t.Fatalf("OBJECT ENCODING = %q want hashtable (test must hit the coll path)", enc)
+	}
+
+	// A seconds-granularity deadline reads back as that many seconds, and as
+	// seconds*1000 in millis.
+	atSec := farFuture / 1000
+	if toks := codeArray(t, r, c, "HEXPIREAT h "+strconv.Itoa(atSec)+" FIELDS 1 f100"); toks[0] != "1" {
+		t.Fatalf("HEXPIREAT = %v want [1]", toks)
+	}
+	if toks := codeArray(t, r, c, "HEXPIRETIME h FIELDS 1 f100"); toks[0] != strconv.Itoa(atSec) {
+		t.Fatalf("HEXPIRETIME = %v want %d", toks, atSec)
+	}
+	if toks := codeArray(t, r, c, "HPEXPIRETIME h FIELDS 1 f100"); toks[0] != strconv.Itoa(atSec*1000) {
+		t.Fatalf("HPEXPIRETIME = %v want %d", toks, atSec*1000)
+	}
+	// A field with no TTL reads -1, a missing field -2.
+	if toks := codeArray(t, r, c, "HEXPIRETIME h FIELDS 2 f101 nope"); toks[0] != "-1" || toks[1] != "-2" {
+		t.Fatalf("HEXPIRETIME no-ttl/missing = %v want [-1 -2]", toks)
+	}
+	// HPERSIST: 1 cleared, -1 already persistent, -2 missing.
+	if toks := codeArray(t, r, c, "HPERSIST h FIELDS 3 f100 f101 nope"); toks[0] != "1" || toks[1] != "-1" || toks[2] != "-2" {
+		t.Fatalf("HPERSIST = %v want [1 -1 -2]", toks)
+	}
+	if toks := codeArray(t, r, c, "HTTL h FIELDS 1 f100"); toks[0] != "-1" {
+		t.Fatalf("HTTL after persist = %v want [-1]", toks)
+	}
+	// HGETEX PERSIST reads the value and clears the TTL it just set.
+	_ = codeArray(t, r, c, "HEXPIREAT h "+strconv.Itoa(farFuture/1000)+" FIELDS 1 f102")
+	if got := sendLine(t, r, c, "HGETEX h PERSIST FIELDS 1 f102"); got != "*1" {
+		t.Fatalf("HGETEX header = %q want *1", got)
+	}
+	if v := readBulk(t, r, sendLineRead(t, r)); v != "v102" {
+		t.Fatalf("HGETEX value = %q want v102", v)
+	}
+	if toks := codeArray(t, r, c, "HTTL h FIELDS 1 f102"); toks[0] != "-1" {
+		t.Fatalf("HTTL after HGETEX PERSIST = %v want [-1]", toks)
+	}
+	// HGETDEL reads then removes a field.
+	if got := sendLine(t, r, c, "HGETDEL h FIELDS 1 f103"); got != "*1" {
+		t.Fatalf("HGETDEL header = %q want *1", got)
+	}
+	if v := readBulk(t, r, sendLineRead(t, r)); v != "v103" {
+		t.Fatalf("HGETDEL value = %q want v103", v)
+	}
+	if got := sendLine(t, r, c, "HEXISTS h f103"); got != ":0" {
+		t.Fatalf("HEXISTS after HGETDEL = %q want :0", got)
+	}
+	// A past deadline deletes the field and returns 2.
+	if toks := codeArray(t, r, c, "HEXPIREAT h 1 FIELDS 1 f104"); toks[0] != "2" {
+		t.Fatalf("HEXPIREAT past = %v want [2]", toks)
+	}
+	if got := sendLine(t, r, c, "HEXISTS h f104"); got != ":0" {
+		t.Fatalf("HEXISTS after past-deadline = %q want :0", got)
+	}
+	// Three fields gone (f103 HGETDEL, f104 past-delete... f100/f101/f102 persist).
+	if got := sendLine(t, r, c, "HLEN h"); got != ":198" {
+		t.Fatalf("HLEN = %q want :198", got)
 	}
 }
 
