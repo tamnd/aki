@@ -53,7 +53,7 @@ func listPromote(db *keyspace.DB, key []byte, elems [][]byte, enc uint8) error {
 			if _, err := w.Put(listPosRow(int64(i)), e); err != nil {
 				return err
 			}
-			byteSum += uint64(len(e))
+			byteSum += uint64(lpEntrySize(e))
 		}
 		w.SetHead(0)
 		w.SetTail(int64(len(elems)))
@@ -130,7 +130,7 @@ func listTreePush(w *keyspace.CollWriter, vals [][]byte, head bool) (int64, erro
 			if _, e := w.Put(listPosRow(h), v); e != nil {
 				return 0, e
 			}
-			added += uint64(len(v))
+			added += uint64(lpEntrySize(v))
 		}
 		w.SetHead(h)
 	} else {
@@ -139,7 +139,7 @@ func listTreePush(w *keyspace.CollWriter, vals [][]byte, head bool) (int64, erro
 			if _, e := w.Put(listPosRow(t), v); e != nil {
 				return 0, e
 			}
-			added += uint64(len(v))
+			added += uint64(lpEntrySize(v))
 			t++
 		}
 		w.SetTail(t)
@@ -173,7 +173,7 @@ func listTreePop(w *keyspace.CollWriter, n int, head bool) ([][]byte, error) {
 				break
 			}
 			popped = append(popped, append([]byte(nil), v...))
-			removed += uint64(len(v))
+			removed += uint64(lpEntrySize(v))
 			if _, e := w.Delete(row); e != nil {
 				return nil, e
 			}
@@ -194,7 +194,7 @@ func listTreePop(w *keyspace.CollWriter, n int, head bool) ([][]byte, error) {
 				break
 			}
 			popped = append(popped, append([]byte(nil), v...))
-			removed += uint64(len(v))
+			removed += uint64(lpEntrySize(v))
 			if _, e := w.Delete(row); e != nil {
 				return nil, e
 			}
@@ -258,7 +258,7 @@ func listTreeSet(db *keyspace.DB, lim encLimits, key, val []byte, i int64, prevE
 		if e != nil {
 			return e
 		}
-		oldLen := uint64(len(old))
+		oldLen := uint64(lpEntrySize(old))
 		if _, e := w.Put(row, val); e != nil {
 			return e
 		}
@@ -268,9 +268,9 @@ func listTreeSet(db *keyspace.DB, lim encLimits, key, val []byte, i int64, prevE
 		} else {
 			nb -= oldLen
 		}
-		nb += uint64(len(val))
+		nb += uint64(lpEntrySize(val))
 		w.SetBytes(nb)
-		w.SetEnc(listCollReportedEnc(lim, prevEnc, int(w.Count()), nb, [][]byte{val}))
+		w.SetEnc(listCollReportedEnc(lim, prevEnc, int(w.Count()), nb))
 		return nil
 	})
 	return oob, err

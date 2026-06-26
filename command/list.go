@@ -89,7 +89,7 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 					return e
 				}
 				newLen = n
-				w.SetEnc(listCollReportedEnc(lim, hdr.Encoding, int(n), w.Bytes(), vals))
+				w.SetEnc(listCollReportedEnc(lim, hdr.Encoding, int(n), w.Bytes()))
 				return nil
 			})
 		if err != nil {
@@ -119,9 +119,7 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 		if found {
 			prev = hdr.Encoding
 		}
-		enc, err := listBlobReportedEnc(lim, prev, newCount, vals, func() ([][]byte, error) {
-			return listDecode(newBody)
-		})
+		enc, err := listBlobReportedEnc(lim, prev, newBody)
 		if err != nil {
 			return err
 		}
@@ -164,9 +162,7 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 		if found {
 			prev = hdr.Encoding
 		}
-		enc, err := listBlobReportedEnc(lim, prev, newCount, vals, func() ([][]byte, error) {
-			return listDecode(newBody)
-		})
+		enc, err := listBlobReportedEnc(lim, prev, newBody)
 		if err != nil {
 			return rmwResult{fallback: true}
 		}

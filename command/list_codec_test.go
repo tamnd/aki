@@ -59,33 +59,39 @@ func TestListBlobPushMatchesReference(t *testing.T) {
 	}
 }
 
-// listBlobReportedEnc must report the same encoding as the canonical listEncoding
-// over the whole element set, both below and across the listpack threshold.
+// listBlobReportedEnc reads the body directly and must agree with the canonical
+// listEncoding over the decoded element set, under the default -2 byte budget and
+// under a positive entry-count fill.
 func TestListBlobReportedEncMatchesListEncoding(t *testing.T) {
-	lim := defaultEncLimits()
-	maxEntries, _ := lim.listLimits()
-
-	small := make([][]byte, maxEntries) // exactly the entry cap stays listpack
-	for i := range small {
-		small[i] = []byte("v")
+	rep := func(n int, s string) [][]byte {
+		out := make([][]byte, n)
+		for i := range out {
+			out[i] = []byte(s)
+		}
+		return out
 	}
-	bigElem := [][]byte{[]byte(strings.Repeat("a", listMaxListpackElemBytes+1))}
 
 	cases := []struct {
 		name string
+		lim  encLimits
 		all  [][]byte
-		push [][]byte
 	}{
-		{"at-cap", small, [][]byte{[]byte("v")}},
-		{"over-cap", append(append([][]byte(nil), small...), []byte("v")), [][]byte{[]byte("v")}},
-		{"big-element", bigElem, bigElem},
+		// Default -2: a short-element list stays listpack well past 128 entries.
+		{"default-200-short", defaultEncLimits(), rep(200, "v")},
+		// A single long element stays listpack: there is no per-element cap, only
+		// the 8KB byte budget.
+		{"default-long-element", defaultEncLimits(), [][]byte{[]byte(strings.Repeat("a", 200))}},
+		// Enough bytes to cross the 8KB tier flips to quicklist.
+		{"default-over-8kb", defaultEncLimits(), rep(1000, "0123456789")},
+		// Positive fill caps the entry count: 129 short elements exceed 128.
+		{"fill128-over-cap", encLimits{listSize: 128}, rep(129, "v")},
+		{"fill128-at-cap", encLimits{listSize: 128}, rep(128, "v")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			want := listEncoding(lim, tc.all, keyspace.EncListpack)
-			got, err := listBlobReportedEnc(lim, keyspace.EncListpack, len(tc.all), tc.push, func() ([][]byte, error) {
-				return tc.all, nil
-			})
+			body := listEncode(tc.all)
+			want := listEncoding(tc.lim, tc.all, keyspace.EncListpack)
+			got, err := listBlobReportedEnc(tc.lim, keyspace.EncListpack, body)
 			if err != nil {
 				t.Fatalf("listBlobReportedEnc: %v", err)
 			}
@@ -96,10 +102,7 @@ func TestListBlobReportedEncMatchesListEncoding(t *testing.T) {
 	}
 
 	// A quicklist never demotes regardless of the new size.
-	got, err := listBlobReportedEnc(lim, keyspace.EncQuicklist, 1, [][]byte{[]byte("v")}, func() ([][]byte, error) {
-		t.Fatal("decode must not be called for a sticky quicklist")
-		return nil, nil
-	})
+	got, err := listBlobReportedEnc(defaultEncLimits(), keyspace.EncQuicklist, listEncode(rep(1, "v")))
 	if err != nil {
 		t.Fatalf("listBlobReportedEnc sticky: %v", err)
 	}
