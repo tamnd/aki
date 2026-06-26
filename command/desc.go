@@ -88,4 +88,12 @@ type CmdDesc struct {
 	// subByKey is the hash-keyed lookup table for SubCmds, populated by NewTable.
 	// keyed by cmdKey of the lowercase subcommand name.
 	subByKey map[uint64]*CmdDesc
+
+	// stat points at this command's statistics block, resolved once by statsInit
+	// so the dispatch hot path records a call with a direct atomic bump instead of
+	// a per-command RWMutex RLock and map lookup. The block is shared with the
+	// d.stats.cmds map (same pointer), so INFO reads and CONFIG RESETSTAT see the
+	// same counters. CmdDesc instances are not shared across dispatchers (New
+	// builds a fresh table per Dispatcher), so this per-dispatcher pointer is safe.
+	stat *cmdStat
 }

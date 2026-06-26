@@ -3,9 +3,11 @@ package command
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/tamnd/aki/keyspace"
 	"github.com/tamnd/aki/networking"
 	"github.com/tamnd/aki/resp"
 )
@@ -118,6 +120,121 @@ func TestRPushWriteBehindNoLostUpdate(t *testing.T) {
 	for id := range clients {
 		for op := range opsPerCli {
 			val := fmt.Sprintf("c%d-%d", id, op)
+			if !seen[val] {
+				t.Fatalf("element %q missing from final list", val)
+			}
+		}
+	}
+}
+
+// TestRPushWriteBehindEarlyCollNoLostUpdate is the no-lost-update witness across
+// the early-coll boundary. Unlike the test above, the elements are large enough
+// that the shared list crosses MaxInlineBody after about two dozen pushes and is
+// moved to the element-per-row coll form mid-run, while staying under the 128-entry
+// quicklist threshold. So this concurrently exercises the blob fast path, the
+// fast-path-to-sync fallback that performs the promotion, and the coll-form push
+// path that follows, all under the shard workers. The returned lengths must still
+// walk exactly 1..N*M: a race in the promotion or the coll push would drop or
+// duplicate an element.
+func TestRPushWriteBehindEarlyCollNoLostUpdate(t *testing.T) {
+	const (
+		clients   = 8
+		opsPerCli = 12 // 8*12 = 96 < 128, so it never reaches quicklist
+		total     = clients * opsPerCli
+		key       = "wb-earlycoll"
+	)
+	// 48-byte values: ~96 of them is ~5KB of body, so the list crosses the 1KB
+	// overflow boundary early and lives in coll form for most of the run.
+	pad := strings.Repeat("p", 40)
+
+	d := newFuzzDispatcher(t)
+	d.engine.StartWorker()
+	t.Cleanup(d.engine.StopWorker)
+
+	lengths := make([][]int64, clients)
+	var wg sync.WaitGroup
+	for c := range clients {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			conn := networking.NewOfflineConn()
+			got := make([]int64, 0, opsPerCli)
+			for op := range opsPerCli {
+				val := []byte(fmt.Sprintf("c%d-%d-%s", id, op, pad))
+				argv := [][]byte{[]byte("RPUSH"), []byte(key), val}
+				conn.ResetOut()
+				d.Handle(conn, argv)
+				v, _, err := resp.Decode(conn.OutBytes(), 0)
+				if err != nil {
+					t.Errorf("client %d decode: %v", id, err)
+					return
+				}
+				if v.Type != resp.TypeInteger {
+					t.Errorf("client %d: RPUSH replied type %c not integer", id, byte(v.Type))
+					return
+				}
+				got = append(got, v.Integer)
+			}
+			lengths[id] = got
+		}(c)
+	}
+	wg.Wait()
+	if t.Failed() {
+		return
+	}
+
+	all := make([]int64, 0, total)
+	for _, r := range lengths {
+		all = append(all, r...)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+	if len(all) != total {
+		t.Fatalf("collected %d replies want %d", len(all), total)
+	}
+	for i, v := range all {
+		if v != int64(i+1) {
+			t.Fatalf("early-coll push lost or duplicated at position %d: got %d want %d", i, v, i+1)
+		}
+	}
+
+	// The final list is stored coll (it crossed the overflow boundary) yet still
+	// reports listpack (under 128 entries, each element under 64 bytes).
+	if err := d.engine.view(0, func(db *keyspace.DB) error {
+		hdr, found, err := listHeader(db, []byte(key))
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatalf("key %q absent after run", key)
+		}
+		if !hdr.IsColl() {
+			t.Fatalf("final list should be coll, header enc=%d flags=%d", hdr.Encoding, hdr.Flags)
+		}
+		if hdr.Encoding != keyspace.EncListpack {
+			t.Fatalf("final encoding = %d want listpack(%d)", hdr.Encoding, keyspace.EncListpack)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view: %v", err)
+	}
+
+	conn := networking.NewOfflineConn()
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("LRANGE"), []byte(key), []byte("0"), []byte("-1")})
+	arr2, _, err := resp.Decode(conn.OutBytes(), 0)
+	if err != nil {
+		t.Fatalf("final LRANGE decode: %v", err)
+	}
+	if arr2.Type != resp.TypeArray || len(arr2.Elems) != total {
+		t.Fatalf("LRANGE returned %d elements want %d", len(arr2.Elems), total)
+	}
+	seen := make(map[string]bool, total)
+	for _, el := range arr2.Elems {
+		seen[string(el.Str)] = true
+	}
+	for id := range clients {
+		for op := range opsPerCli {
+			val := fmt.Sprintf("c%d-%d-%s", id, op, pad)
 			if !seen[val] {
 				t.Fatalf("element %q missing from final list", val)
 			}

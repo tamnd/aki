@@ -109,19 +109,15 @@ func scriptError(err error) string {
 	return "ERR " + msg
 }
 
-// hasErrorCode reports whether a message starts with an uppercase error code
-// word followed by a space, the shape of a Redis error reply.
+// hasErrorCode reports whether a message already carries an error code. Redis
+// derives the code purely from the presence of a space-delimited first token,
+// not its letter case: luaPushErrorBuff prepends a generic "ERR" only when the
+// message has no space at all, and otherwise treats the leading word as the
+// code and keeps the string verbatim (so "my error" stays "my error", same as
+// "WRONGTYPE nope"). aki used to require the first word to be uppercase, which
+// wrongly wrapped lowercase multi-word messages like error_reply('my error').
 func hasErrorCode(msg string) bool {
-	i := strings.IndexByte(msg, ' ')
-	if i <= 0 {
-		return false
-	}
-	for _, c := range msg[:i] {
-		if c < 'A' || c > 'Z' {
-			return false
-		}
-	}
-	return true
+	return strings.IndexByte(msg, ' ') > 0
 }
 
 // bytesToTable builds a 1-based Lua array table from a slice of byte strings.
@@ -456,11 +452,11 @@ func luaToRESP(enc *resp.Encoder, v lua.Value, proto int) {
 // to ask for a specific reply shape, then falls back to a plain array.
 func luaTableToRESP(enc *resp.Encoder, t *lua.Table, proto int) {
 	if e, ok := t.Get(lua.String("err")).(lua.String); ok {
-		msg := string(e)
-		if !hasErrorCode(msg) {
-			msg = "ERR " + msg
-		}
-		enc.WriteError(msg)
+		// A returned {err=...} table is sent verbatim. Redis converts it with
+		// addReplyErrorFormatEx("-%s", msg) and never inserts a generic ERR
+		// code, so {err='oneword'} stays "oneword", unlike redis.error_reply
+		// which does prepend ERR for a code-less (space-less) message.
+		enc.WriteError(string(e))
 		return
 	}
 	if s, ok := t.Get(lua.String("ok")).(lua.String); ok {
