@@ -164,7 +164,13 @@ func handleExpire(ctx *Ctx, mode string) {
 			deleted = true
 			return nil
 		}
-		if err := db.Set(key, body, hdr.Type, hdr.Encoding, when); err != nil {
+		// A btree-backed collection's body is metadata, not a value, so the TTL
+		// must be set on the meta record in place; Set would drop the sub-tree.
+		if hdr.IsColl() {
+			if _, err := db.CollSetTTL(key, when); err != nil {
+				return err
+			}
+		} else if err := db.Set(key, body, hdr.Type, hdr.Encoding, when); err != nil {
 			return err
 		}
 		res = 1
@@ -272,7 +278,11 @@ func handlePersist(ctx *Ctx) {
 		if !found || !hdr.HasTTL() {
 			return nil
 		}
-		if err := db.Set(key, body, hdr.Type, hdr.Encoding, -1); err != nil {
+		if hdr.IsColl() {
+			if _, err := db.CollSetTTL(key, -1); err != nil {
+				return err
+			}
+		} else if err := db.Set(key, body, hdr.Type, hdr.Encoding, -1); err != nil {
 			return err
 		}
 		res = 1

@@ -33,6 +33,20 @@ func keyopsCommands() []*CmdDesc {
 	}
 }
 
+// copyValue carries a value from srcKey in srcDB to dstKey in dstDB, replacing
+// any value already at dstKey. A btree-backed collection is deep-copied through
+// CollCopyTo so its element sub-tree is reproduced and the two keys stay
+// independent; carrying its 32-byte metadata body through Set would instead
+// point dst at the source's sub-tree and corrupt both. Every other value is
+// written through Set with the source's type, encoding, and TTL.
+func copyValue(srcDB *keyspace.DB, srcKey []byte, dstDB *keyspace.DB, dstKey, body []byte, hdr keyspace.ValueHeader) error {
+	if hdr.IsColl() {
+		_, err := srcDB.CollCopyTo(srcKey, dstDB, dstKey)
+		return err
+	}
+	return dstDB.Set(dstKey, body, hdr.Type, hdr.Encoding, keepTTL(hdr, true))
+}
+
 // handleRename renames src to dst, overwriting dst if it exists. The new key
 // takes src's TTL. A missing src is an error; renaming a key to itself is a
 // no-op that still replies OK.
@@ -51,7 +65,7 @@ func handleRename(ctx *Ctx) {
 		if bytes.Equal(src, dst) {
 			return nil
 		}
-		if err := db.Set(dst, body, hdr.Type, hdr.Encoding, keepTTL(hdr, true)); err != nil {
+		if err := copyValue(db, src, db, dst, body, hdr); err != nil {
 			return err
 		}
 		if _, err := db.Delete(src); err != nil {
@@ -95,7 +109,7 @@ func handleRenameNX(ctx *Ctx) {
 		if exists {
 			return nil
 		}
-		if err := db.Set(dst, body, hdr.Type, hdr.Encoding, keepTTL(hdr, true)); err != nil {
+		if err := copyValue(db, src, db, dst, body, hdr); err != nil {
 			return err
 		}
 		if _, err := db.Delete(src); err != nil {
@@ -182,7 +196,7 @@ func handleMove(ctx *Ctx) {
 		if exists {
 			return nil
 		}
-		if err := dstDB.Set(key, body, hdr.Type, hdr.Encoding, keepTTL(hdr, true)); err != nil {
+		if err := copyValue(srcDB, key, dstDB, key, body, hdr); err != nil {
 			return err
 		}
 		if _, err := srcDB.Delete(key); err != nil {
@@ -271,11 +285,15 @@ func handleCopy(ctx *Ctx) {
 			if !replace {
 				return nil
 			}
-			if _, err := dstDBh.Delete(dst); err != nil {
-				return err
+			// copyValue replaces an existing coll dst in place; an explicit Delete is
+			// only needed for the blob path, which Set does not tear down itself.
+			if !hdr.IsColl() {
+				if _, err := dstDBh.Delete(dst); err != nil {
+					return err
+				}
 			}
 		}
-		if err := dstDBh.Set(dst, body, hdr.Type, hdr.Encoding, keepTTL(hdr, true)); err != nil {
+		if err := copyValue(srcDB, src, dstDBh, dst, body, hdr); err != nil {
 			return err
 		}
 		res = 1
