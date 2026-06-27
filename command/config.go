@@ -352,6 +352,10 @@ func configDirectives() []*directive {
 		// take effect live through CONFIG SET.
 		{name: "go-gogc", kind: dirInt, def: "100", mutable: true},
 		{name: "go-memlimit", kind: dirMemory, def: "0", mutable: true},
+		// go-maxprocs pins GOMAXPROCS. 0 leaves the runtime default of one P per
+		// CPU; a positive value caps the scheduler's parallelism to cut the futex
+		// wakeup churn the per-request goroutine hops cause on a many-core box.
+		{name: "go-maxprocs", kind: dirInt, def: "0", mutable: true},
 
 		// Continuous profiling (doc 21 section 10.2). When on, a background
 		// goroutine writes cpu, heap, and mutex pprof snapshots to profiling-dir
@@ -834,9 +838,9 @@ func handleConfigSet(ctx *Ctx) {
 			if n, ok := parseInteger([]byte(c.val)); ok && ctx.d.acl != nil {
 				ctx.d.acl.setLogMax(int(n))
 			}
-		case "go-gogc", "go-memlimit":
-			// Re-tune the Go GC so the new percentage or memory limit takes hold
-			// without a restart.
+		case "go-gogc", "go-memlimit", "go-maxprocs":
+			// Re-tune the Go runtime so the new GC percentage, memory limit, or
+			// GOMAXPROCS cap takes hold without a restart.
 			ctx.d.ApplyGCTuning()
 		case "lfu-log-factor", "lfu-decay-time":
 			// Push the new LFU tuning to the keyspace so the eviction counter uses it.
