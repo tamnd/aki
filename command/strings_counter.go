@@ -49,13 +49,19 @@ func incrBy(ctx *Ctx, delta int64) {
 		// Accumulate onto the connection's pending batch and return without a reply.
 		// flushIncrPending computes, persists, replies and propagates the whole batch
 		// in pipeline order at the end of the drain (or before the next non-deferrable
-		// command). The key and argv are copied because both outlive this command: the
-		// staged write reaches the B-tree after the drain, and the argv backs verbatim
-		// AOF propagation at flush time.
+		// command). The key is copied because the staged write reaches the B-tree after
+		// the drain. The argv is copied only to back verbatim AOF propagation at flush
+		// time, so when AOF is off it is never read and the copy is skipped: a CONFIG SET
+		// appendonly is not a deferrable increment, so it flushes this batch ahead of
+		// itself, which means the AOF state cannot flip between this defer and the flush.
+		var argv [][]byte
+		if ctx.d.aofEnabled() {
+			argv = copyArgv(ctx.Argv)
+		}
 		ctx.sess.incrPend = append(ctx.sess.incrPend, deferredIncr{
 			shard: keyspace.ShardOf(key),
 			key:   append([]byte(nil), key...),
-			argv:  copyArgv(ctx.Argv),
+			argv:  argv,
 			delta: delta,
 		})
 		return
