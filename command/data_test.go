@@ -3,12 +3,27 @@ package command
 import (
 	"bufio"
 	"net"
+	"os"
 	"testing"
 
 	"github.com/tamnd/aki/keyspace"
 	"github.com/tamnd/aki/pager"
+	"github.com/tamnd/aki/v2/store"
 	"github.com/tamnd/aki/vfs"
 )
+
+// hybridTestOpts returns the keyspace options the command tests open with. When
+// AKI_TEST_HYBRID is set, it routes the string point path through the v2
+// hybrid-log engine so the existing command suite doubles as the compat run on
+// the gated engine. Off by default so the normal suite still exercises B-tree.
+func hybridTestOpts() []keyspace.Option {
+	if os.Getenv("AKI_TEST_HYBRID") == "" {
+		return nil
+	}
+	return []keyspace.Option{keyspace.WithHybridLog(store.Tunables{
+		Shards: 256, PageSize: 1 << 20, ResidentPagesPerShard: 0, Dir: "",
+	})}
+}
 
 // startData brings up a server backed by an in-memory keyspace so the data
 // commands have somewhere to read and write. It returns the client reader and
@@ -21,7 +36,7 @@ func startData(t *testing.T) (*bufio.Reader, net.Conn) {
 		t.Fatalf("create pager: %v", err)
 	}
 	t.Cleanup(func() { _ = p.Close() })
-	ks, err := keyspace.Open(p)
+	ks, err := keyspace.Open(p, hybridTestOpts()...)
 	if err != nil {
 		t.Fatalf("open keyspace: %v", err)
 	}
