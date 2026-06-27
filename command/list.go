@@ -392,12 +392,7 @@ func handleLRange(ctx *Ctx) {
 	}
 
 	if elems, ok := hotGetList(ctx, key); ok {
-		out := listSlice(elems, start, stop)
-		enc := ctx.enc()
-		enc.WriteArrayLen(len(out))
-		for _, e := range out {
-			enc.WriteBulkString(e)
-		}
+		ctx.enc().WriteBulkArray(listSlice(elems, start, stop))
 		return
 	}
 
@@ -436,11 +431,7 @@ func handleLRange(ctx *Ctx) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
-	enc := ctx.enc()
-	enc.WriteArrayLen(len(out))
-	for _, e := range out {
-		enc.WriteBulkString(e)
-	}
+	ctx.enc().WriteBulkArray(out)
 }
 
 // listRangeBounds resolves the LRANGE index rules to a clamped inclusive
