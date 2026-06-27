@@ -87,16 +87,9 @@ func handleSetOpStore(ctx *Ctx, op setOp) {
 		n          int64
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
-		// The destination is overwritten, but a non-set destination is still a
-		// WRONGTYPE error, so check its type before computing.
-		_, dstHdr, dstFound, err := db.Get(dst)
-		if err != nil {
-			return err
-		}
-		if dstFound && dstHdr.Type != keyspace.TypeSet {
-			wrongTyp = true
-			return nil
-		}
+		// Only the source keys are type-checked. The destination is overwritten
+		// whatever it held, so a string or list at the destination is replaced
+		// rather than rejected, matching Redis.
 		sets, wt, err := loadSets(db, keys)
 		if err != nil {
 			return err
@@ -108,8 +101,8 @@ func handleSetOpStore(ctx *Ctx, op setOp) {
 		result := computeSetOp(op, sets)
 		n = int64(len(result))
 		if len(result) == 0 {
-			dstDeleted = dstFound
-			_, err := db.Delete(dst)
+			existed, err := db.Delete(dst)
+			dstDeleted = existed
 			return err
 		}
 		return db.Set(dst, setEncode(result), keyspace.TypeSet, setEncoding(ctx.encLimits(), result, keyspace.EncIntset), -1)
