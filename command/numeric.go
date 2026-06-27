@@ -78,21 +78,6 @@ func parseFloat(b []byte) (float64, bool) {
 	return f, true
 }
 
-// formatFloat renders a float64 the way INCRBYFLOAT reports it (doc 08 §2.3). It
-// uses the shortest decimal that round-trips, then drops a trailing ".0" and any
-// trailing zeros after the decimal point, so 10.0 prints as "10" and 3.50 prints
-// as "3.5". The doc's pseudocode pins 17 digits, but its own worked examples
-// (10.50 + 0.1 -> "10.6") only hold with the shortest form, so that is what aki
-// uses.
-func formatFloat(v float64) string {
-	s := strconv.FormatFloat(v, 'f', -1, 64)
-	if strings.Contains(s, ".") {
-		s = strings.TrimRight(s, "0")
-		s = strings.TrimRight(s, ".")
-	}
-	return s
-}
-
 // addFloatHuman adds an increment to a current value and renders the result the
 // way INCRBYFLOAT and HINCRBYFLOAT report it. Both byte strings must already be
 // validated as finite floats (parseFloat does this for the error reply); an empty
