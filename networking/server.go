@@ -3,6 +3,7 @@ package networking
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -279,6 +280,7 @@ func (s *Server) acceptLoop(ln net.Listener) {
 			if errors.As(err, &ne) && ne.Timeout() {
 				continue
 			}
+			fmt.Fprintf(os.Stderr, "aki: acceptLoop exiting on accept error: %v\n", err)
 			return
 		}
 		s.onAccept(nc)
