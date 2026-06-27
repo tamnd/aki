@@ -790,6 +790,45 @@ func (e *Engine) sendDeleteAsync(index, shard int, key []byte, ver uint64) error
 func (e *Engine) updateShard(index int, key []byte, fn func(*keyspace.DB) error) error {
 	if e.shardsRunning.Load() && commitPolicy(e.policy.Load()) != commitAlways {
 		s := keyspace.ShardOf(key)
+		// Inline fast path: when shard s's hand-off queue is empty, no earlier write
+		// is waiting on its worker, so this goroutine applies fn itself instead of
+		// handing it off and blocking on the reply. The synchronous round-trip the
+		// hand-off costs is two goroutine wakeups per op (producer->worker on the push,
+		// worker->producer on the done signal), and on a single hot key, which is
+		// exactly what the collection benchmarks drive (redis-benchmark RPUSH/HSET/
+		// SADD/ZADD all hammer one fixed key), that wakeup pair is the throughput cap:
+		// the profile showed the box only half busy with most of its cycles in
+		// pthread_cond_wait/signal and wakep, not in the data path.
+		//
+		// Correctness rests on the keyspace shard write mutex, not on the worker being
+		// the only writer. fn ends in db.set / CollUpdateRouted, both of which take
+		// db.shards[s].mu, the same mutex the worker takes, so an inline apply is
+		// serialized against the worker and against other inline appliers even though
+		// both sides hold only e.mu.RLock (which excludes a checkpoint, matching the
+		// worker's drain). The write sinks are version-guarded, so an apply that races
+		// a concurrent same-key write resolves by version regardless of order. The
+		// length==0 gate keeps an inline apply from jumping ahead of writes already
+		// queued for this shard, so a command that must observe an earlier queued write
+		// to the same key still hands off and serializes behind it on the worker.
+		//
+		// Under the single-key collection load every writer serializes on this one
+		// shard mutex, so nothing piles up behind a worker and the queue stays empty:
+		// the inline path is taken every time and the worker stays parked. Under spread
+		// writes the per-shard queues carry real depth, so the gate falls through to the
+		// hand-off and the worker keeps batching as before.
+		if e.shardQ[s].length.Load() == 0 {
+			e.mu.RLock()
+			db, err := e.ks.DB(index)
+			if err == nil {
+				err = fn(db)
+			}
+			if err == nil {
+				e.pendingDirty.Store(true)
+				e.pendingWrites.Add(1)
+			}
+			e.mu.RUnlock()
+			return err
+		}
 		req := writeReqPool.Get().(*writeReq)
 		req.index = index
 		req.shard = s
