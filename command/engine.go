@@ -1034,6 +1034,26 @@ func (e *Engine) viewHotGet(index int, key []byte) ([]byte, keyspace.ValueHeader
 	return db.HotGet(key)
 }
 
+// hybridLog reports whether the engine runs its string point path on the v2
+// hybrid-log store. GET reads it to pick the hybrid read fast path.
+func (e *Engine) hybridLog() bool { return e.ks.HybridLog() }
+
+// viewHybridGet reads a key straight off the hybrid-log store. It is the hybrid
+// analogue of viewHotGet: the hybrid engine never populates the hot-value cache,
+// so probing it is wasted work, and the store carries its own per-shard locks so
+// the read needs no engine-level read lock. The ks.DB lookup is safe lock-free
+// because the dbs slice is immutable after Open, and GetUncached routes to the
+// store, which loads its handle through an atomic pointer. So a hybrid GET costs
+// one DB lookup and the store read, with none of the per-command atomics the
+// general view path pays.
+func (e *Engine) viewHybridGet(index int, key []byte) ([]byte, keyspace.ValueHeader, bool, error) {
+	db, err := e.ks.DB(index)
+	if err != nil {
+		return nil, keyspace.ValueHeader{}, false, err
+	}
+	return db.GetUncached(key)
+}
+
 // activeExpireCycle runs one background expiry pass over every database, deleting
 // volatile keys whose TTL has passed and committing the removals so they are
 // durable. The expired keys land in the log for the caller to notify on.
