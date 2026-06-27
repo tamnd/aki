@@ -134,6 +134,7 @@ func handleIncrByFloat(ctx *Ctx) {
 			return rmwResult{}
 		}
 		var cur float64
+		var curBytes []byte
 		if found {
 			v, ok := parseFloat(b)
 			if !ok {
@@ -141,13 +142,16 @@ func handleIncrByFloat(ctx *Ctx) {
 				return rmwResult{}
 			}
 			cur = v
+			curBytes = b
 		}
 		sum := cur + incr
 		if math.IsNaN(sum) || math.IsInf(sum, 0) {
 			nanInf = true
 			return rmwResult{}
 		}
-		result = formatFloat(sum)
+		// The float64 sum above only gates the NaN/Infinity reply; the stored value
+		// is recomputed at long double width so it matches Redis to the last digit.
+		result = addFloatHuman(curBytes, ctx.Argv[2])
 		body := []byte(result)
 		return rmwResult{body: body, typ: keyspace.TypeString, enc: stringEncoding(body), ttlMs: keepTTL(hdr, found), write: true}
 	}, nil)
