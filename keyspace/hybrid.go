@@ -80,7 +80,36 @@ func (db *DB) hlSet(key, body []byte, typ, enc uint8, ttlMs int64) error {
 	}
 	cell := h.AppendTo(make([]byte, 0, HeaderSize+len(body)))
 	cell = append(cell, body...)
-	return s.Set(key, cell)
+	prevValLen, err := s.SetWithPrev(key, cell)
+	if err != nil {
+		return err
+	}
+	db.hlAccountStore(key, len(body), prevValLen)
+	return nil
+}
+
+// hlEntryBytes is the used_memory cost of one hybrid-log entry: the key bytes, the
+// body bytes, and the fixed per-entry overhead. It is the same formula the btree
+// path uses (keyspace.go set), so used_memory reads consistently whichever engine a
+// database runs on.
+func hlEntryBytes(keyLen, bodyLen int) int64 {
+	return int64(keyLen) + int64(bodyLen) + entryOverhead
+}
+
+// hlAccountStore folds a hybrid store into the used_memory total and the LFU
+// bookkeeping the command layer reads, mirroring the btree set's accounting.
+// prevValLen is the displaced record's value length from SetWithPrev, or negative
+// when the key is new. The stored record is HeaderSize+bodyLen bytes, so the
+// previous body length is prevValLen-HeaderSize. A new key seeds the LFU counter;
+// an overwrite swaps the old entry's byte cost for the new one's and bumps the
+// counter, exactly as db.set does on the btree engine.
+func (db *DB) hlAccountStore(key []byte, bodyLen, prevValLen int) {
+	isNew := prevValLen < 0
+	if !isNew {
+		db.ks.dataBytes.Add(-hlEntryBytes(len(key), prevValLen-HeaderSize))
+	}
+	db.ks.dataBytes.Add(hlEntryBytes(len(key), bodyLen))
+	db.recordAccess(key, isNew)
 }
 
 // hlGet reads a key's header and body back off the hybrid log. An expired key is
@@ -103,7 +132,10 @@ func (db *DB) hlGet(key []byte) (body []byte, hdr ValueHeader, found bool, err e
 		return nil, ValueHeader{}, false, nil
 	}
 	if db.expired(h) {
-		_, _ = s.Delete(key)
+		// Lazy expiry mirrors the btree read path. Route through hlDelete so the freed
+		// bytes leave used_memory and the key's LFU bookkeeping is dropped, rather than
+		// hitting the store directly and leaking the accounting.
+		_, _ = db.hlDelete(key)
 		return nil, ValueHeader{}, false, nil
 	}
 	return cell[HeaderSize:], h, true, nil
@@ -140,11 +172,20 @@ func (db *DB) hlForEachLive(fn func(ck []byte, h ValueHeader) error) error {
 	return walkErr
 }
 
-// hlDelete drops a key from the hybrid log, reporting whether it was present.
+// hlDelete drops a key from the hybrid log, reporting whether it was present. It
+// subtracts the removed entry's byte cost from used_memory and forgets its LFU
+// bookkeeping, mirroring the btree delete path, using the removed record's value
+// length that DeleteWithPrev surfaces at no extra probe.
 func (db *DB) hlDelete(key []byte) (bool, error) {
 	s := db.hl.Load()
 	if s == nil {
 		return false, nil
 	}
-	return s.Delete(key)
+	prevValLen, ok, err := s.DeleteWithPrev(key)
+	if err != nil || !ok {
+		return ok, err
+	}
+	db.ks.dataBytes.Add(-hlEntryBytes(len(key), prevValLen-HeaderSize))
+	db.dropAccess(key)
+	return true, nil
 }
