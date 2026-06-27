@@ -17,6 +17,7 @@ import (
 	"github.com/tamnd/aki/btree"
 	"github.com/tamnd/aki/encoding"
 	"github.com/tamnd/aki/format"
+	"github.com/tamnd/aki/hot"
 	"github.com/tamnd/aki/pager"
 	"github.com/tamnd/aki/store"
 )
@@ -260,16 +261,18 @@ type DB struct {
 	// can exchange the cache pointer while readers are active.
 	hc atomic.Pointer[dbCache]
 
-	// hlTun, when non-nil, routes the string point path (Set/Get/Delete) through
-	// the v2 hybrid-log store instead of the paged B-tree (spec 2064 rewrite, S1).
-	// This is the in-place engine swap, gated off by default: a fresh keyspace
-	// only takes this path when Open is given WithHybridLog. The store is built
-	// lazily on first write via hlOnce, so idle databases pay no resident pages.
-	// The path is non-durable and string-only in this slice; collections,
-	// overflow, and durability are later slices and are not reachable through it.
-	hlTun  *store.Tunables
+	// newHL, when non-nil, routes the string point path (Set/Get/Delete) through a
+	// resident hybrid-log engine instead of the paged B-tree (spec 2064 rewrite,
+	// S1). It is the in-place engine swap, gated off by default: a fresh keyspace
+	// only takes this path when Open is given WithHybridLog (the durable-spill
+	// store/ engine) or WithHotEngine (the clean lock-free hot/ engine). The engine
+	// is an hlEngine so either substrate plugs in behind the same four-method seam.
+	// It is built lazily on first write via hlOnce, so idle databases pay no
+	// resident pages. The path is non-durable and string-only in this slice;
+	// collections, overflow, and durability are later slices.
+	newHL  func() (hlEngine, error)
 	hlOnce sync.Once
-	hl     atomic.Pointer[store.Store]
+	hl     atomic.Pointer[hlBox]
 }
 
 // wbPendingEntry is one entry in the write-behind pending table. It carries
@@ -292,7 +295,7 @@ type wbPendingEntry struct {
 // the tests rely on when they call Open with no options.
 type openOptions struct {
 	valueCacheBytes int64
-	hlTun           *store.Tunables
+	newHL           func() (hlEngine, error)
 }
 
 // Option configures Open. Options keep the common Open(pgr) call unchanged while
@@ -313,7 +316,21 @@ func WithValueCacheBytes(n int64) Option {
 // write. This slice is non-durable and string-only: collections, overflow bodies,
 // and the durability journal are later slices and are not served through it.
 func WithHybridLog(t store.Tunables) Option {
-	return func(o *openOptions) { o.hlTun = &t }
+	return func(o *openOptions) {
+		o.newHL = func() (hlEngine, error) { return store.New(t) }
+	}
+}
+
+// WithHotEngine routes the string point path through the clean hot/ engine: a
+// lock-free-read, in-place-update resident table with no append-only leak (the F2
+// hot tier, spec 2064 rewrite). It is the alternative substrate behind the same
+// hlEngine seam as WithHybridLog and is likewise off by default and opt-in. Like
+// the store/ path it is non-durable in this slice; the cold tier and recovery are
+// later slices. Passing both options is last-one-wins, since both set newHL.
+func WithHotEngine(t hot.Tunables) Option {
+	return func(o *openOptions) {
+		o.newHL = func() (hlEngine, error) { return hot.New(t) }
+	}
 }
 
 // Open binds a Keyspace to a pager and loads the catalog. The number of
@@ -341,7 +358,7 @@ func Open(pgr *pager.Pager, opts ...Option) (*Keyspace, error) {
 		sysRoot:      normalizeRoot(pgr.Meta().SystemRoot),
 		lfuLogFactor: lfuLogFactor,
 		lfuDecayTime: lfuDecayTime,
-		hybrid:       o.hlTun != nil,
+		hybrid:       o.newHL != nil,
 	}
 	for i := range ks.dbs {
 		db := &DB{ks: ks, index: i}
@@ -349,7 +366,7 @@ func Open(pgr *pager.Pager, opts ...Option) (*Keyspace, error) {
 			db.shards[s].rootPage = format.NullPage
 		}
 		db.hc.Store(newDBCache(o.valueCacheBytes))
-		db.hlTun = o.hlTun
+		db.newHL = o.newHL
 		ks.dbs[i] = db
 	}
 	if ks.catRoot != format.NullPage {
@@ -428,9 +445,9 @@ func (db *DB) Index() int { return db.index }
 
 // Len returns the total number of live keys across all shards, the value DBSIZE reports.
 func (db *DB) Len() uint64 {
-	if db.hlTun != nil {
-		if s := db.hl.Load(); s != nil {
-			return uint64(s.Len())
+	if db.newHL != nil {
+		if b := db.hl.Load(); b != nil {
+			return uint64(b.e.Len())
 		}
 		return 0
 	}
@@ -487,7 +504,7 @@ func (db *DB) ensureShardTree(s int) (*btree.Tree, error) {
 // A key whose absolute TTL is already in the past is not written and any
 // existing key under that name is removed, matching Redis's write-time expiry.
 func (db *DB) Set(key, body []byte, typ, enc uint8, ttlMs int64) error {
-	if db.hlTun != nil {
+	if db.newHL != nil {
 		return db.hlSet(key, body, typ, enc, ttlMs)
 	}
 	return db.set(key, body, typ, enc, ttlMs, 0)
@@ -826,7 +843,7 @@ func (db *DB) Peek(key []byte) (body []byte, hdr ValueHeader, found bool, err er
 // the window between the viewHotGet probe and this call, which then reads the fresh
 // value from the overlay or B-tree instead, so it is never a correctness gap.
 func (db *DB) GetUncached(key []byte) (body []byte, hdr ValueHeader, found bool, err error) {
-	if db.hlTun != nil {
+	if db.newHL != nil {
 		body, hdr, found, err = db.hlGet(key)
 		if found {
 			// Mirror the btree read path's recordAccess so OBJECT FREQ and the LFU
@@ -843,7 +860,7 @@ func (db *DB) GetUncached(key []byte) (body []byte, hdr ValueHeader, found bool,
 // its B-tree deletion is deferred to the next active expiry cycle so this
 // function is safe to call concurrently with writes on other shards.
 func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found bool, err error) {
-	if db.hlTun != nil {
+	if db.newHL != nil {
 		body, hdr, found, err = db.hlGet(key)
 		if found && touch {
 			// Mirror getProbe's touch-time recordAccess so the hybrid read path feeds
@@ -952,7 +969,7 @@ func (db *DB) Exists(key []byte) (bool, error) {
 // The caller must NOT hold any shard lock; Delete acquires the shard write lock
 // internally and releases it before returning.
 func (db *DB) Delete(key []byte) (bool, error) {
-	if db.hlTun != nil {
+	if db.newHL != nil {
 		return db.hlDelete(key)
 	}
 	s := ShardOf(key)
