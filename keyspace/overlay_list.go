@@ -98,11 +98,6 @@ func (ll *liveList) byteTotal() uint64 { return ll.bytes }
 // can be evicted without a fold.
 func (ll *liveList) dirty() bool { return len(ll.pending) != 0 || len(ll.dels) != 0 }
 
-// dirtyTotal is the count of unfolded mutations since the last fold, compared
-// against overlayFoldThreshold to decide when an absorbed write inline-folds,
-// the same threshold liveColl uses.
-func (ll *liveList) dirtyTotal() int { return len(ll.pending) + len(ll.dels) }
-
 // pushRight appends vals onto the tail end, each at a new highest position, and
 // returns the new length. sizeOf gives each element's listpack byte cost so the
 // byte total stays accurate for the reported-encoding rule. It mirrors the tail
