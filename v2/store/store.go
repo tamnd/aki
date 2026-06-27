@@ -43,6 +43,7 @@ package store
 import (
 	"encoding/binary"
 	"errors"
+	"math/bits"
 	"os"
 	"sync"
 )
@@ -99,6 +100,9 @@ func New(t Tunables) (*Store, error) {
 	}
 	if t.PageSize <= 64 {
 		return nil, errors.New("store: PageSize too small")
+	}
+	if t.PageSize&(t.PageSize-1) != 0 {
+		return nil, errors.New("store: PageSize must be a power of two")
 	}
 	s := &Store{
 		shards: make([]*shard, t.Shards),
@@ -262,8 +266,10 @@ type shard struct {
 	spilledPages int
 
 	pageSize    int
-	residentCap int  // ResidentPagesPerShard; 0 means unbounded
-	evicts      bool // residentCap > 0 and a log file is open
+	pageShift   uint  // log2(pageSize); addr>>pageShift is the pageID
+	pageMask    int64 // pageSize-1; addr&pageMask is the in-page offset
+	residentCap int   // ResidentPagesPerShard; 0 means unbounded
+	evicts      bool  // residentCap > 0 and a log file is open
 	file        *os.File
 	fileEnd     int64 // next free byte offset in the log file
 }
@@ -283,6 +289,8 @@ func newShard(id int, t Tunables) (*shard, error) {
 		islotsMask:  n - 1,
 		maxLoad:     0.75,
 		pageSize:    t.PageSize,
+		pageShift:   uint(bits.TrailingZeros(uint(t.PageSize))),
+		pageMask:    int64(t.PageSize) - 1,
 		residentCap: t.ResidentPagesPerShard,
 	}
 	// Page 0 starts resident and empty. Reserve the first recHdr bytes so that a
@@ -393,8 +401,8 @@ func (sh *shard) get(key []byte) ([]byte, bool, error) {
 		sh.mu.RUnlock()
 		return nil, false, nil
 	}
-	pid := int64(addr) / int64(sh.pageSize)
-	off := int(int64(addr) % int64(sh.pageSize))
+	pid := int64(addr) >> sh.pageShift
+	off := int(int64(addr) & sh.pageMask)
 	if page := sh.pages[pid]; page != nil {
 		klen := int(binary.LittleEndian.Uint32(page[off:]))
 		vlen := int(binary.LittleEndian.Uint32(page[off+4:]))
@@ -448,8 +456,8 @@ func (sh *shard) del(key []byte) (bool, error) {
 // handling both resident pages (a slice, the hot path) and spilled pages (a disk
 // read, the cold compare path). Index probes call this to confirm a tag match.
 func (sh *shard) recordKeyAny(addr uint64) []byte {
-	pid := int64(addr) / int64(sh.pageSize)
-	off := int(int64(addr) % int64(sh.pageSize))
+	pid := int64(addr) >> sh.pageShift
+	off := int(int64(addr) & sh.pageMask)
 	if page := sh.pages[pid]; page != nil {
 		klen := int(binary.LittleEndian.Uint32(page[off:]))
 		return page[off+recHdr : off+recHdr+klen]
