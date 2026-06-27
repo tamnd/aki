@@ -391,9 +391,14 @@ func handleLRange(ctx *Ctx) {
 		return
 	}
 
-	if elems, ok := hotGetList(ctx, key); ok {
-		ctx.enc().WriteBulkArray(listSlice(elems, start, stop))
-		return
+	// Hot blob path: stream the requested window straight off the encoded body,
+	// skipping the per-element decode that dominates LRANGE on a hot list. A
+	// corrupt body returns false with nothing written, falling through to the cold
+	// path, which surfaces the decode error the same way.
+	if body, ok := hotGetListBody(ctx, key); ok {
+		if listBlobRangeReply(ctx.enc(), body, start, stop) {
+			return
+		}
 	}
 
 	var (
