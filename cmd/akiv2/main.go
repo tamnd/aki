@@ -8,8 +8,8 @@ import (
 	"log"
 	"runtime"
 
-	"github.com/tamnd/aki/v2/server"
-	"github.com/tamnd/aki/v2/store"
+	"github.com/tamnd/aki/server"
+	"github.com/tamnd/aki/store"
 )
 
 func main() {

@@ -18,7 +18,7 @@ import (
 	"github.com/tamnd/aki/encoding"
 	"github.com/tamnd/aki/format"
 	"github.com/tamnd/aki/pager"
-	"github.com/tamnd/aki/v2/store"
+	"github.com/tamnd/aki/store"
 )
 
 // NumShards is the number of independent B-tree shards per logical database.
