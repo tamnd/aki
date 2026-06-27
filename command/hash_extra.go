@@ -119,6 +119,7 @@ func handleHIncrByFloat(ctx *Ctx) {
 			return nil
 		}
 		var cur float64
+		var curBytes []byte
 		idx := hashFind(fields, field)
 		if idx >= 0 {
 			v, ok := parseFloat(fields[idx].value)
@@ -127,13 +128,16 @@ func handleHIncrByFloat(ctx *Ctx) {
 				return nil
 			}
 			cur = v
+			curBytes = fields[idx].value
 		}
 		sum := cur + incr
 		if math.IsNaN(sum) || math.IsInf(sum, 0) {
 			nanInf = true
 			return nil
 		}
-		result = formatFloat(sum)
+		// The float64 sum only gates the NaN/Infinity reply; recompute the stored
+		// result at long double width so it matches Redis HINCRBYFLOAT exactly.
+		result = addFloatHuman(curBytes, ctx.Argv[3])
 		body := []byte(result)
 		if idx >= 0 {
 			fields[idx].value = body
