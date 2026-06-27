@@ -23,6 +23,11 @@ const crashReportExitCode = 255
 // leaves engine state mid-mutation and aki cannot safely keep serving. The
 // network layer holds a PanicHandler reference to this method.
 func (d *Dispatcher) OnPanic(cause any, stack []byte) {
+	// Always surface the panic on stderr, unbuffered, before anything else. The
+	// configured log sink may be buffered or nil, and os.Exit below skips deferred
+	// flushes, so a crash that only went to that sink could vanish silently.
+	fmt.Fprintf(os.Stderr, "\naki: PANIC: %v\n%s\n", cause, stack)
+	_ = os.Stderr.Sync()
 	d.WriteCrashReport(cause, stack)
 	os.Exit(crashReportExitCode)
 }

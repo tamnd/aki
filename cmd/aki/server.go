@@ -78,6 +78,11 @@ func cmdServer(args []string) error {
 	loadRDB := fs.String("load-rdb", "", "import this dump.rdb on first open (only when the .aki file does not exist)")
 	rdbDB := fs.Int("rdb-db", -1, "with --load-rdb, import only this source database")
 	bufferPoolSize := fs.String("buffer-pool-size", "128mb", "buffer pool capacity (e.g. 128mb, 512mb); controls how much of the .aki file stays in memory")
+	// Diagnostic admin endpoint (pprof, /metrics, health, ready). It defaults to
+	// 127.0.0.1:6399; --admin-port 0 disables it so several instances can share one
+	// host without colliding on the port.
+	adminPort := fs.String("admin-port", "", "HTTP port for the diagnostic admin endpoint; 0 disables it (default 6399)")
+	adminBind := fs.String("admin-bind", "", "interface address for the admin endpoint (default 127.0.0.1)")
 	valueCacheFraction := fs.Float64("value-cache-fraction", 0.10, "share of the buffer-pool budget held as a decoded value cache for GET (perf/03); 0 disables it")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -232,6 +237,8 @@ func cmdServer(args []string) error {
 		{"save", resolveSave(setFlags, fileConf, *save)},
 		{"maxmemory", resolve("maxmemory", *maxmemory)},
 		{"maxmemory-policy", resolve("maxmemory-policy", *maxmemoryPolicy)},
+		{"admin-port", resolve("admin-port", *adminPort)},
+		{"admin-bind", resolve("admin-bind", *adminBind)},
 	} {
 		if err := applyConf(kv[0], kv[1]); err != nil {
 			return err
@@ -272,7 +279,11 @@ func cmdServer(args []string) error {
 	defer d.StopProfiler()
 
 	if err := d.StartAdmin(); err != nil {
-		return fmt.Errorf("start admin endpoint: %w", err)
+		// The admin endpoint (pprof, /metrics, health, ready) is an optional
+		// diagnostic surface, not part of serving data. A bind failure there, most
+		// often its port already held by another aki on the same host, must not stop
+		// the database from coming up, so log it and serve without the endpoint.
+		d.LogWarn("admin endpoint unavailable, continuing without it", "error", err.Error())
 	}
 	defer d.StopAdmin()
 
