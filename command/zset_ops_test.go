@@ -235,8 +235,12 @@ func TestZSetOpWrongType(t *testing.T) {
 			t.Fatalf("%s = %q want WRONGTYPE", cmd, got)
 		}
 	}
-	// A non-zset destination is also WRONGTYPE.
-	if got := sendLine(t, r, c, "ZUNIONSTORE s 1 z"); got != "-"+wrongTypeError {
-		t.Fatalf("ZUNIONSTORE into string = %q want WRONGTYPE", got)
+	// A non-zset destination is overwritten, not rejected: Redis only type-checks
+	// the source keys, so the string at s is replaced by the result.
+	if got := sendLine(t, r, c, "ZUNIONSTORE s 1 z"); got != ":1" {
+		t.Fatalf("ZUNIONSTORE over string dest = %q want :1", got)
+	}
+	if got := sendLine(t, r, c, "TYPE s"); got != "+zset" {
+		t.Fatalf("TYPE s after store = %q want zset", got)
 	}
 }
