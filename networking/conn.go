@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +46,9 @@ type PanicHandler interface {
 
 // readChunk is the size of a single socket read appended to the query buffer.
 const readChunk = 16 * 1024
+
+// crlfBytes is the RESP line terminator, shared by the zero-alloc reply writers.
+var crlfBytes = []byte("\r\n")
 
 // Conn is one client connection. Everything on it is touched by a single
 // goroutine (the read loop), so the per-connection state needs no locking; only
@@ -193,6 +197,23 @@ func (c *Conn) Enc() *resp.Encoder { return c.enc }
 // framed RESP value.
 func (c *Conn) WriteRaw(p []byte) { c.outBuf.Write(p) }
 
+// WriteBulk appends a RESP bulk string reply ($) straight to the output buffer
+// without the encoder's per-reply length-to-string allocation. The length header
+// is formed on the stack with strconv.AppendInt (an int64 length is at most 19
+// digits, which with the '$' and CRLF fits the 24-byte scratch, so no heap), and
+// the payload is written in place with no scratch copy. A bulk string is framed
+// identically in RESP2 and RESP3, so this is correct in both. It is the GET fast
+// path's reply writer; the general path keeps using the encoder.
+func (c *Conn) WriteBulk(data []byte) {
+	var hdr [24]byte
+	hdr[0] = '$'
+	h := strconv.AppendInt(hdr[:1], int64(len(data)), 10)
+	h = append(h, '\r', '\n')
+	c.outBuf.Write(h)
+	c.outBuf.Write(data)
+	c.outBuf.Write(crlfBytes)
+}
+
 // OutBytes returns the bytes accumulated in the output buffer. It is used by an
 // offline connection (NewOfflineConn) to read back a command's reply, for
 // example when a script's redis.call runs a command and needs its RESP reply.
@@ -294,7 +315,15 @@ func (c *Conn) overQueryBufLimit() bool {
 // drain parses and dispatches every complete command currently in the query
 // buffer. It returns true when the loop should terminate (a protocol error was
 // reported, or QUIT asked to close).
+//
+// The clock is read once per burst, not per command. A pipelined burst can carry
+// dozens of commands, so a per-command time.Now would add that many vDSO reads to
+// the hot loop; reading it once when the first command of the burst is handled and
+// reusing it leaves lastInteraction accurate to the burst, which is far finer than
+// the second-granularity idle field CLIENT LIST reports off it.
 func (c *Conn) drain() bool {
+	var now time.Time
+	var haveNow bool
 	for {
 		argv, n, err := resp.ParseRequest(c.qbuf, c.pos, c.server.MaxBulkLen(), c.argvBuf[:])
 		if errors.Is(err, resp.ErrNeedMore) {
@@ -315,7 +344,11 @@ func (c *Conn) drain() bool {
 			// Blank line (a telnet heartbeat); skip and keep parsing.
 			continue
 		}
-		c.lastInteraction = c.server.now()
+		if !haveNow {
+			now = c.server.now()
+			haveNow = true
+		}
+		c.lastInteraction = now
 		c.server.handler.Handle(c, argv)
 		c.totCmds++
 		if c.closeAfterReply {

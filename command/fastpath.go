@@ -73,7 +73,9 @@ func (d *Dispatcher) fastGet(c *networking.Conn, sess *session, key []byte) bool
 		return true
 	}
 	if ok {
-		c.Enc().WriteBulkString(b)
+		// WriteBulk skips the encoder's per-reply length allocation; the null reply
+		// is a pooled static slice the encoder already writes without allocating.
+		c.WriteBulk(b)
 	} else {
 		c.Enc().WriteNull()
 	}
