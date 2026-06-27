@@ -75,12 +75,12 @@ func (s *Server) serve() error {
 			return err
 		}
 		if tc, ok := c.(*net.TCPConn); ok {
-			tc.SetNoDelay(true)
+			_ = tc.SetNoDelay(true)
 		}
 		s.mu.Lock()
 		if s.closed {
 			s.mu.Unlock()
-			c.Close()
+			_ = c.Close()
 			return nil
 		}
 		s.conns[c] = struct{}{}
@@ -99,10 +99,10 @@ func (s *Server) Close() error {
 	}
 	s.closed = true
 	if s.ln != nil {
-		s.ln.Close()
+		_ = s.ln.Close()
 	}
 	for c := range s.conns {
-		c.Close()
+		_ = c.Close()
 	}
 	s.mu.Unlock()
 	s.wg.Wait()
@@ -120,7 +120,7 @@ func (s *Server) handle(c net.Conn) {
 		s.mu.Lock()
 		delete(s.conns, c)
 		s.mu.Unlock()
-		c.Close()
+		_ = c.Close()
 	}()
 
 	conn := &connState{

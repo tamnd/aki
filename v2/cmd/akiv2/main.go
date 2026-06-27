@@ -29,7 +29,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("akiv2: store: %v", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	srv := server.New(s)
 	log.Printf("akiv2 listening on %s (shards=%d page=%dKiB resident-pages=%d dir=%q GOMAXPROCS=%d)",

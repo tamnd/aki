@@ -103,7 +103,7 @@ func (db *DB) hlGet(key []byte) (body []byte, hdr ValueHeader, found bool, err e
 		return nil, ValueHeader{}, false, nil
 	}
 	if db.expired(h) {
-		s.Delete(key)
+		_, _ = s.Delete(key)
 		return nil, ValueHeader{}, false, nil
 	}
 	return cell[HeaderSize:], h, true, nil
