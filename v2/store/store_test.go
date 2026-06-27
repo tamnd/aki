@@ -128,6 +128,67 @@ func TestOverwriteAfterSpill(t *testing.T) {
 	}
 }
 
+// TestDelete checks the index drops a key (backward-shift deletion) while leaving
+// the rest of the shard's keys probeable, including after a grow has reshuffled
+// the table.
+func TestDelete(t *testing.T) {
+	s := mustStore(t, Tunables{Shards: 8, PageSize: 1 << 16, IndexHintPerShard: 64})
+	const n = 20000
+	for i := 0; i < n; i++ {
+		if err := s.Set([]byte(fmt.Sprintf("key:%d", i)), []byte("v")); err != nil {
+			t.Fatalf("Set %d: %v", i, err)
+		}
+	}
+	// delete the even keys.
+	for i := 0; i < n; i += 2 {
+		ok, err := s.Delete([]byte(fmt.Sprintf("key:%d", i)))
+		if err != nil || !ok {
+			t.Fatalf("Delete %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	if got := s.Len(); got != n/2 {
+		t.Fatalf("Len = %d, want %d after deleting half", got, n/2)
+	}
+	for i := 0; i < n; i++ {
+		_, found, _ := s.Get([]byte(fmt.Sprintf("key:%d", i)))
+		if i%2 == 0 && found {
+			t.Fatalf("deleted key %d still present", i)
+		}
+		if i%2 == 1 && !found {
+			t.Fatalf("surviving key %d missing after deletes", i)
+		}
+	}
+	if ok, _ := s.Delete([]byte("never-set")); ok {
+		t.Fatal("Delete of absent key returned true")
+	}
+}
+
+// TestIndexResidentBytes is the larger-than-memory headline made a guard: the
+// resident index is the []uint64 tables only, a small fixed cost per key that is
+// independent of key length, so a dataset whose log spills to disk keeps only this
+// in RAM. A map[string] would keep every key resident with nowhere to spill.
+func TestIndexResidentBytes(t *testing.T) {
+	const n = 500_000
+	// size the per-shard hint to the real per-shard load, the way the engine is
+	// configured from an expected key count; an over-large hint just rounds the
+	// power-of-two table up and inflates bytes/key without being a structural cost.
+	s := mustStore(t, Tunables{Shards: 64, PageSize: 1 << 16, IndexHintPerShard: n / 64})
+	for i := 0; i < n; i++ {
+		// long keys to show the index cost does not grow with key length.
+		k := []byte(fmt.Sprintf("user:session:token:%040d", i))
+		if err := s.Set(k, []byte("0123456789abcdef")); err != nil {
+			t.Fatalf("Set %d: %v", i, err)
+		}
+	}
+	perKey := float64(s.IndexBytes()) / float64(n)
+	t.Logf("index resident: %.1f bytes/key over %d keys (%d total table bytes)", perKey, n, s.IndexBytes())
+	// at a 0.75 target load with power-of-two rounding the table lands near
+	// 8-17 bytes/key regardless of the 58-byte keys.
+	if perKey > 24 {
+		t.Fatalf("index resident %.1f bytes/key too high (key-size leak?)", perKey)
+	}
+}
+
 func TestRejectOversizeRecord(t *testing.T) {
 	s := mustStore(t, Tunables{Shards: 1, PageSize: 128})
 	err := s.Set([]byte("k"), bytes.Repeat([]byte("v"), 200))
