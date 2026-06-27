@@ -18,6 +18,7 @@ import (
 	"github.com/tamnd/aki/encoding"
 	"github.com/tamnd/aki/format"
 	"github.com/tamnd/aki/pager"
+	"github.com/tamnd/aki/v2/store"
 )
 
 // NumShards is the number of independent B-tree shards per logical database.
@@ -251,6 +252,17 @@ type DB struct {
 	// hot-GET callers can load the cache without the engine read lock, and SwapDB
 	// can exchange the cache pointer while readers are active.
 	hc atomic.Pointer[dbCache]
+
+	// hlTun, when non-nil, routes the string point path (Set/Get/Delete) through
+	// the v2 hybrid-log store instead of the paged B-tree (spec 2064 rewrite, S1).
+	// This is the in-place engine swap, gated off by default: a fresh keyspace
+	// only takes this path when Open is given WithHybridLog. The store is built
+	// lazily on first write via hlOnce, so idle databases pay no resident pages.
+	// The path is non-durable and string-only in this slice; collections,
+	// overflow, and durability are later slices and are not reachable through it.
+	hlTun  *store.Tunables
+	hlOnce sync.Once
+	hl     atomic.Pointer[store.Store]
 }
 
 // wbPendingEntry is one entry in the write-behind pending table. It carries
@@ -273,6 +285,7 @@ type wbPendingEntry struct {
 // the tests rely on when they call Open with no options.
 type openOptions struct {
 	valueCacheBytes int64
+	hlTun           *store.Tunables
 }
 
 // Option configures Open. Options keep the common Open(pgr) call unchanged while
@@ -284,6 +297,16 @@ type Option func(*openOptions)
 // value-cache-fraction; a non-positive value leaves the cache at its default.
 func WithValueCacheBytes(n int64) Option {
 	return func(o *openOptions) { o.valueCacheBytes = n }
+}
+
+// WithHybridLog routes the string point path through the v2 hybrid-log store
+// instead of the paged B-tree (spec 2064 rewrite, S1, the in-place engine swap).
+// It is off by default; passing it opts a keyspace into the new engine for
+// GET/SET/DEL on string keys. The store is built lazily per database on first
+// write. This slice is non-durable and string-only: collections, overflow bodies,
+// and the durability journal are later slices and are not served through it.
+func WithHybridLog(t store.Tunables) Option {
+	return func(o *openOptions) { o.hlTun = &t }
 }
 
 // Open binds a Keyspace to a pager and loads the catalog. The number of
@@ -318,6 +341,7 @@ func Open(pgr *pager.Pager, opts ...Option) (*Keyspace, error) {
 			db.shards[s].rootPage = format.NullPage
 		}
 		db.hc.Store(newDBCache(o.valueCacheBytes))
+		db.hlTun = o.hlTun
 		ks.dbs[i] = db
 	}
 	if ks.catRoot != format.NullPage {
@@ -396,6 +420,12 @@ func (db *DB) Index() int { return db.index }
 
 // Len returns the total number of live keys across all shards, the value DBSIZE reports.
 func (db *DB) Len() uint64 {
+	if db.hlTun != nil {
+		if s := db.hl.Load(); s != nil {
+			return uint64(s.Len())
+		}
+		return 0
+	}
 	var total uint64
 	for s := range NumShards {
 		total += db.shards[s].keyCount.Load()
@@ -449,6 +479,9 @@ func (db *DB) ensureShardTree(s int) (*btree.Tree, error) {
 // A key whose absolute TTL is already in the past is not written and any
 // existing key under that name is removed, matching Redis's write-time expiry.
 func (db *DB) Set(key, body []byte, typ, enc uint8, ttlMs int64) error {
+	if db.hlTun != nil {
+		return db.hlSet(key, body, typ, enc, ttlMs)
+	}
 	return db.set(key, body, typ, enc, ttlMs, 0)
 }
 
@@ -781,6 +814,9 @@ func (db *DB) Peek(key []byte) (body []byte, hdr ValueHeader, found bool, err er
 // its B-tree deletion is deferred to the next active expiry cycle so this
 // function is safe to call concurrently with writes on other shards.
 func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found bool, err error) {
+	if db.hlTun != nil {
+		return db.hlGet(key)
+	}
 	// Hot-cache check comes before the string conversion: cget and cinvalidate
 	// take []byte and do the map op with string(key) as a compiler-elided
 	// temporary, so a hot hit returns without any heap allocation.
@@ -871,6 +907,9 @@ func (db *DB) Exists(key []byte) (bool, error) {
 // The caller must NOT hold any shard lock; Delete acquires the shard write lock
 // internally and releases it before returning.
 func (db *DB) Delete(key []byte) (bool, error) {
+	if db.hlTun != nil {
+		return db.hlDelete(key)
+	}
 	s := ShardOf(key)
 	db.shards[s].mu.Lock()
 	defer db.shards[s].mu.Unlock()
