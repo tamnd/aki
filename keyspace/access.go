@@ -26,11 +26,6 @@ type keyAccess struct {
 	decr  uint32 // unix minutes at the last LFU decay step
 }
 
-// nowSeconds and nowMinutes read the same clock the rest of the keyspace uses, so
-// tests that stub nowMillis move the access clock too.
-func nowSeconds() uint32 { return uint32(nowMillis() / 1000) }
-func nowMinutes() uint32 { return uint32(nowMillis() / 60000) }
-
 // coarseMillis caches the wall clock in whole milliseconds. The server cron
 // refreshes it once per tick through RefreshClock, so the hot path can read a
 // recent timestamp from this atomic instead of paying a time.Now syscall on
@@ -46,6 +41,14 @@ var coarseMillis atomic.Int64
 // the window before the first tick), coarseSeconds reads the real clock so a test
 // that stubs nowMillis still sees its overridden time. Once the cron is live the
 // hot path reads the cached atomic.
+//
+// All keyAccess bookkeeping (atime and the LFU decr/freq) reads this same coarse
+// clock: the hot path stamps it on every access, so the seeders and the
+// introspection readers (Idle, Freq, accessMetrics) must read the same clock or a
+// coarse-stamped field gets compared against the real clock. The two diverge
+// whenever the cron lags a tick across a minute boundary, and they diverge for the
+// whole run once a background server stops and freezes the cache, which would
+// fire a spurious decay or idle step on the next read.
 var coarseActive atomic.Bool
 
 // RefreshClock samples the wall clock into the coarse cache. The server cron calls
@@ -98,7 +101,7 @@ func (db *DB) recordAccess(key []byte, isNew bool) {
 		if db.access == nil {
 			db.access = make(map[string]*keyAccess)
 		}
-		db.access[string(key)] = &keyAccess{atime: nowSeconds(), freq: lfuInitVal, decr: nowMinutes()}
+		db.access[string(key)] = &keyAccess{atime: coarseSeconds(), freq: lfuInitVal, decr: coarseMinutes()}
 		db.accessMu.Unlock()
 		return
 	}
@@ -197,7 +200,7 @@ func (db *DB) Idle(key []byte) uint32 {
 	}
 	atime := a.atime
 	db.accessMu.Unlock()
-	now := nowSeconds()
+	now := coarseSeconds()
 	if now < atime {
 		return 0
 	}
@@ -216,7 +219,7 @@ func (db *DB) Freq(key []byte) uint8 {
 	}
 	cp := *a
 	db.accessMu.Unlock()
-	return db.lfuDecay(cp, nowMinutes()).freq
+	return db.lfuDecay(cp, coarseMinutes()).freq
 }
 
 // SetIdle seeds a key's last-access time to idle seconds in the past, which is how
@@ -227,7 +230,7 @@ func (db *DB) SetIdle(key []byte, idle uint32) {
 	if db.access == nil {
 		db.access = make(map[string]*keyAccess)
 	}
-	now := nowSeconds()
+	now := coarseSeconds()
 	at := uint32(0)
 	if idle < now {
 		at = now - idle
@@ -235,12 +238,12 @@ func (db *DB) SetIdle(key []byte, idle uint32) {
 	a := db.access[string(key)]
 	if a == nil {
 		k := string(key)
-		a = &keyAccess{decr: nowMinutes()}
+		a = &keyAccess{decr: coarseMinutes()}
 		db.access[k] = a
 	}
 	a.atime = at
 	if a.decr == 0 {
-		a.decr = nowMinutes()
+		a.decr = coarseMinutes()
 	}
 }
 
@@ -259,9 +262,9 @@ func (db *DB) SetFreq(key []byte, freq uint8) {
 		db.access[k] = a
 	}
 	a.freq = freq
-	a.decr = nowMinutes()
+	a.decr = coarseMinutes()
 	if a.atime == 0 {
-		a.atime = nowSeconds()
+		a.atime = coarseSeconds()
 	}
 }
 
@@ -286,5 +289,5 @@ func (db *DB) accessMetrics(key []byte) (atime uint32, freq uint8) {
 	if inCache && hotAtime > at {
 		at = hotAtime
 	}
-	return at, db.lfuDecay(*a, nowMinutes()).freq
+	return at, db.lfuDecay(*a, coarseMinutes()).freq
 }
