@@ -42,6 +42,37 @@ func listCommands() []*CmdDesc {
 func pushList(ctx *Ctx, head, mustExist bool) {
 	key := ctx.Argv[1]
 	vals := ctx.Argv[2:]
+	if ctx.deferPush {
+		// Coll-form push in a batchable state: accumulate it onto the connection's
+		// pending batch and reply nothing now. flushPushPending applies the batch on
+		// the shard owners and writes the replies in pipeline order at the end of the
+		// drain (or before the next non-deferrable command). Both the key and the
+		// values are copied because they outlive this command: the staged write reaches
+		// the shard after the drain. The whole argv is copied only when AOF is on, where
+		// it backs verbatim propagation, mirroring the increment batch's alloc gate.
+		var (
+			argv  [][]byte
+			dvals [][]byte
+		)
+		if ctx.d.aofEnabled() {
+			argv = copyArgv(ctx.Argv)
+			dvals = argv[2:]
+		} else {
+			dvals = make([][]byte, len(vals))
+			for i, v := range vals {
+				dvals[i] = append([]byte(nil), v...)
+			}
+		}
+		ctx.sess.pushPend = append(ctx.sess.pushPend, deferredPush{
+			shard:     keyspace.ShardOf(key),
+			key:       append([]byte(nil), key...),
+			vals:      dvals,
+			argv:      argv,
+			head:      head,
+			mustExist: mustExist,
+		})
+		return
+	}
 	var (
 		wrongTyp bool
 		absent   bool
@@ -52,91 +83,23 @@ func pushList(ctx *Ctx, head, mustExist bool) {
 	// element write, the listpack to quicklist promotion, and the plain blob set. It
 	// is the fallback the write-behind helper runs when the fast path below cannot
 	// stage the result, and the path under commitAlways or with no workers running.
+	// applyListPush is the shared core, also used by the batched push hand-off.
 	sync := func(db *keyspace.DB) error {
-		// CollUpdateRouted reads the metadata row once under the shard write lock and
-		// routes from that read, so a coll-form list skips the separate listHeader
-		// (Peek) this path used to do before CollUpdate read the same row again. The
-		// router records the wrong-type and must-exist-absent cases through the outer
-		// flags and hands the coll-form case to the window-write callback; a blob or
-		// fresh key falls through to the splice path below with the header it saw.
-		var (
-			hdr   keyspace.ValueHeader
-			found bool
-		)
-		route, err := db.CollUpdateRouted(key, keyspace.TypeList, keyspace.EncQuicklist,
-			func(rFound bool, h keyspace.ValueHeader, _ []byte) keyspace.CollRoute {
-				hdr, found = h, rFound
-				if rFound && h.Type != keyspace.TypeList {
-					wrongTyp = true
-					return keyspace.CollRouteSkip
-				}
-				if !rFound && mustExist {
-					absent = true
-					return keyspace.CollRouteSkip
-				}
-				if rFound && h.IsColl() {
-					return keyspace.CollRouteColl
-				}
-				return keyspace.CollRouteBlob
-			},
-			// A list already in the btree-backed form takes the window-write path: each
-			// value is one row at a new head or tail position, no whole-blob rewrite.
-			// The reported encoding is recomputed from the post-push count and byte
-			// total so a coll list that is still small keeps reporting listpack.
-			func(w *keyspace.CollWriter) error {
-				n, e := listTreePush(w, vals, head)
-				if e != nil {
-					return e
-				}
-				newLen = n
-				w.SetEnc(listCollReportedEnc(lim, hdr.Encoding, int(n), w.Bytes()))
-				return nil
-			})
+		r, err := applyListPush(db, key, vals, head, mustExist, lim)
 		if err != nil {
 			return err
 		}
-		if route != keyspace.CollRouteBlob {
-			// Coll write done, or a skip (wrong type or must-exist on an absent key);
-			// the outer flags carry the reply.
-			return nil
-		}
-		// Blob form (or a fresh key): splice the pushed run into the raw body rather
-		// than decoding every element and rebuilding the whole list, so a push
-		// allocates once instead of once per existing element.
-		var body []byte
-		if found {
-			body, _, _, err = db.Get(key)
-			if err != nil {
-				return err
+		switch r.res {
+		case pushResWrongType:
+			wrongTyp = true
+		default:
+			newLen = r.newLen
+			if !r.changed {
+				// X push on an absent key: reply 0, no notify or signal.
+				absent = true
 			}
 		}
-		newBody, newCount, err := listBlobPush(body, vals, head)
-		if err != nil {
-			return err
-		}
-		newLen = int64(newCount)
-		prev := uint8(keyspace.EncListpack)
-		if found {
-			prev = hdr.Encoding
-		}
-		enc, err := listBlobReportedEnc(lim, prev, newBody)
-		if err != nil {
-			return err
-		}
-		// The list moves to the btree-backed form either when it crosses the quicklist
-		// threshold (matching Redis listpack -> quicklist) or, earlier, once its blob
-		// would spill to overflow pages: past that point a blob push rewrites the whole
-		// body on every call (O(n) per push, O(n^2) per key), so element-per-row
-		// storage takes over while OBJECT ENCODING keeps reporting listpack until the
-		// real threshold.
-		if enc == keyspace.EncQuicklist || len(newBody) > keyspace.MaxInlineBody {
-			elems, e := listDecode(newBody)
-			if e != nil {
-				return e
-			}
-			return listPromote(db, key, elems, enc)
-		}
-		return db.Set(key, newBody, keyspace.TypeList, enc, keepTTL(hdr, found))
+		return nil
 	}
 	// compute is the write-behind fast path for the common case: a listpack-form
 	// list (or a fresh key) whose new blob still fits inline. It splices the body
