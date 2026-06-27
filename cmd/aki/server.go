@@ -16,6 +16,7 @@ import (
 	"github.com/tamnd/aki/networking"
 	"github.com/tamnd/aki/pager"
 	"github.com/tamnd/aki/rdb"
+	"github.com/tamnd/aki/v2/store"
 	"github.com/tamnd/aki/vfs"
 )
 
@@ -68,6 +69,7 @@ func cmdServer(args []string) error {
 	appendonly := fs.String("appendonly", "", "enable the append-only file: yes or no")
 	appendfsync := fs.String("appendfsync", "", "durability policy: always, everysec, or no")
 	hashOverlay := fs.String("aki-hash-overlay", "", "in-memory hash write fast path: yes or no (default no)")
+	engine := fs.String("aki-engine", "", "storage engine for the string point path: btree (default, durable, all types) or hybrid (experimental, in-memory, string-only; spec 2064 rewrite S1)")
 	save := fs.String("save", "", `RDB save points, e.g. "3600 1 300 100", or "" to disable`)
 	maxmemory := fs.String("maxmemory", "", "memory limit before eviction, e.g. 256mb (0 disables)")
 	maxmemoryPolicy := fs.String("maxmemory-policy", "", "eviction policy when maxmemory is reached")
@@ -145,7 +147,23 @@ func cmdServer(args []string) error {
 		valueCacheBytes = int64(float64(poolPages) * defaultPageBytes * frac)
 	}
 
-	ks, closeKS, err := openKeyspace(dataFile, dbCount, poolPages, valueCacheBytes)
+	// The hybrid-log engine (spec 2064 rewrite, S1) is opt-in and experimental: it
+	// serves the string point path from a resident open-addressed index over an
+	// in-memory log, the structure that clears 2x both rivals at saturation. It is
+	// string-only and non-durable in this slice, so it is gated behind a flag and
+	// never the default; the durable B-tree stays the engine for everything else.
+	var hlTun *store.Tunables
+	switch eng := resolve("aki-engine", *engine); eng {
+	case "", "btree":
+		// default durable engine
+	case "hybrid":
+		t := store.Tunables{Shards: 256, PageSize: 1 << 20, ResidentPagesPerShard: 0, Dir: ""}
+		hlTun = &t
+	default:
+		return fmt.Errorf("--aki-engine %s is not a known engine (use btree or hybrid)", eng)
+	}
+
+	ks, closeKS, err := openKeyspace(dataFile, dbCount, poolPages, valueCacheBytes, hlTun)
 	if err != nil {
 		return err
 	}
@@ -448,7 +466,7 @@ func importRDBInto(ks *keyspace.Keyspace, path string, onlyDB int) (int, []strin
 // returns the keyspace over it plus a close function. The pager picks the file
 // format up from its header on reopen, so databases is used only at create time.
 // poolPages is the buffer-pool capacity in frames; zero uses the pager default.
-func openKeyspace(path string, databases, poolPages int, valueCacheBytes int64) (*keyspace.Keyspace, func(), error) {
+func openKeyspace(path string, databases, poolPages int, valueCacheBytes int64, hlTun *store.Tunables) (*keyspace.Keyspace, func(), error) {
 	osfs := vfs.NewOS()
 	opts := pager.Options{CachePages: poolPages}
 	var (
@@ -464,7 +482,11 @@ func openKeyspace(path string, databases, poolPages int, valueCacheBytes int64) 
 	if err != nil {
 		return nil, nil, fmt.Errorf("open data file %s: %w", path, err)
 	}
-	ks, err := keyspace.Open(pgr, keyspace.WithValueCacheBytes(valueCacheBytes))
+	ksOpts := []keyspace.Option{keyspace.WithValueCacheBytes(valueCacheBytes)}
+	if hlTun != nil {
+		ksOpts = append(ksOpts, keyspace.WithHybridLog(*hlTun))
+	}
+	ks, err := keyspace.Open(pgr, ksOpts...)
 	if err != nil {
 		_ = pgr.Close()
 		return nil, nil, fmt.Errorf("open keyspace: %w", err)

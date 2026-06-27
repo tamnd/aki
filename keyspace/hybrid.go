@@ -22,6 +22,12 @@ import "github.com/tamnd/aki/v2/store"
 // capacity only, not as a recovery journal. The durability tiers (group-commit
 // fsync, index checkpoint, tail replay) are slice S2.
 
+// HybridLog reports whether this keyspace runs its string point path on the v2
+// hybrid-log store (opened WithHybridLog). The command layer reads it to route
+// writes through the synchronous db.Set path instead of the B-tree write-behind
+// machinery, which the hybrid engine does not use.
+func (ks *Keyspace) HybridLog() bool { return ks.hybrid }
+
 // ensureHL returns the database's hybrid-log store, building it on first use. The
 // store is created lazily so an idle database in a 16-database keyspace does not
 // allocate 256 resident tail pages up front. hlOnce makes the build race-free;
@@ -97,7 +103,7 @@ func (db *DB) hlGet(key []byte) (body []byte, hdr ValueHeader, found bool, err e
 		return nil, ValueHeader{}, false, nil
 	}
 	if db.expired(h) {
-		s.Delete(key)
+		_, _ = s.Delete(key)
 		return nil, ValueHeader{}, false, nil
 	}
 	return cell[HeaderSize:], h, true, nil
