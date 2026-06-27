@@ -109,6 +109,37 @@ func (db *DB) hlGet(key []byte) (body []byte, hdr ValueHeader, found bool, err e
 	return cell[HeaderSize:], h, true, nil
 }
 
+// hlForEachLive is the hybrid-engine implementation of forEachLive: it walks the
+// store's enumerate surface and calls fn for every unexpired key, handing fn a
+// composite key built from the raw key so the callers (Keys, Scan) see the same
+// shape they get from the B-tree cursor and rawKey/copyRaw keep working unchanged.
+// An expired key is skipped but not deleted here, matching the B-tree forEachLive,
+// which leaves lazy expiry to the read path rather than mutating mid-iteration.
+func (db *DB) hlForEachLive(fn func(ck []byte, h ValueHeader) error) error {
+	s := db.hl.Load()
+	if s == nil {
+		return nil
+	}
+	var ck []byte
+	var fnErr error
+	walkErr := s.Each(func(key, cell []byte) bool {
+		h, _, ok := parseHeader(cell)
+		if !ok || db.expired(h) {
+			return true
+		}
+		ck = appendCompositeKey(ck, key)
+		if err := fn(ck, h); err != nil {
+			fnErr = err
+			return false
+		}
+		return true
+	})
+	if fnErr != nil {
+		return fnErr
+	}
+	return walkErr
+}
+
 // hlDelete drops a key from the hybrid log, reporting whether it was present.
 func (db *DB) hlDelete(key []byte) (bool, error) {
 	s := db.hl.Load()
