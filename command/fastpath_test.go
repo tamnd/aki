@@ -66,6 +66,92 @@ func TestFastPathGetSet(t *testing.T) {
 	}
 }
 
+// TestFastPathIncr checks the INCR/INCRBY/DECR/DECRBY fast path produces the same
+// replies as the general increment path: a zero base for a missing key, the running
+// total back, TTL preserved across an increment, WRONGTYPE on a non-string, not-int
+// on a non-numeric value, and overflow at the int64 ceiling.
+func TestFastPathIncr(t *testing.T) {
+	r, c := startHybrid(t)
+
+	if got := sendArgs(t, r, c, "INCR", "n"); got != int64(1) {
+		t.Fatalf("INCR n = %v want 1", got)
+	}
+	if got := sendArgs(t, r, c, "INCRBY", "n", "10"); got != int64(11) {
+		t.Fatalf("INCRBY n 10 = %v want 11", got)
+	}
+	if got := sendArgs(t, r, c, "DECR", "n"); got != int64(10) {
+		t.Fatalf("DECR n = %v want 10", got)
+	}
+	if got := sendArgs(t, r, c, "DECRBY", "n", "4"); got != int64(6) {
+		t.Fatalf("DECRBY n 4 = %v want 6", got)
+	}
+	if got := sendArgs(t, r, c, "GET", "n"); got != "6" {
+		t.Fatalf("GET n = %v want 6", got)
+	}
+
+	// TTL must survive an increment.
+	if got := sendArgs(t, r, c, "SET", "t", "1", "EX", "1000"); got != "OK" {
+		t.Fatalf("SET t = %v", got)
+	}
+	if got := sendArgs(t, r, c, "INCR", "t"); got != int64(2) {
+		t.Fatalf("INCR t = %v want 2", got)
+	}
+	if got := sendArgs(t, r, c, "TTL", "t"); got == int64(-1) || got == int64(-2) {
+		t.Fatalf("TTL t = %v want a positive remaining TTL", got)
+	}
+
+	// WRONGTYPE on a list.
+	if got := sendArgs(t, r, c, "RPUSH", "lst", "a"); got != int64(1) {
+		t.Fatalf("RPUSH = %v", got)
+	}
+	if got := sendArgs(t, r, c, "INCR", "lst"); !isErrPrefix(got, "WRONGTYPE") {
+		t.Fatalf("INCR lst = %v want WRONGTYPE", got)
+	}
+
+	// Not an integer.
+	if got := sendArgs(t, r, c, "SET", "s", "abc"); got != "OK" {
+		t.Fatalf("SET s = %v", got)
+	}
+	if got := sendArgs(t, r, c, "INCR", "s"); !isErrPrefix(got, "ERR value is not an integer") {
+		t.Fatalf("INCR s = %v want not-integer error", got)
+	}
+
+	// Overflow at the int64 ceiling.
+	if got := sendArgs(t, r, c, "SET", "max", "9223372036854775807"); got != "OK" {
+		t.Fatalf("SET max = %v", got)
+	}
+	if got := sendArgs(t, r, c, "INCR", "max"); !isErrPrefix(got, "ERR increment or decrement would overflow") {
+		t.Fatalf("INCR max = %v want overflow error", got)
+	}
+}
+
+// isErrPrefix reports whether a reply is an error reply beginning with prefix.
+func isErrPrefix(got any, prefix string) bool {
+	e, ok := got.(cmdErr)
+	return ok && strings.HasPrefix(string(e), prefix)
+}
+
+// TestFastPathIncrStats confirms the increment fast path counts each verb against
+// its own commandstats entry, so INFO commandstats stays accurate.
+func TestFastPathIncrStats(t *testing.T) {
+	r, c := startHybrid(t)
+
+	for range 4 {
+		sendArgs(t, r, c, "INCR", "n")
+	}
+	for range 2 {
+		sendArgs(t, r, c, "DECR", "n")
+	}
+	incr := infoField(t, r, c, "commandstats", "cmdstat_incr")
+	if !strings.Contains(incr, "calls=4") {
+		t.Fatalf("cmdstat_incr = %q want calls=4", incr)
+	}
+	decr := infoField(t, r, c, "commandstats", "cmdstat_decr")
+	if !strings.Contains(decr, "calls=2") {
+		t.Fatalf("cmdstat_decr = %q want calls=2", decr)
+	}
+}
+
 // TestFastPathCommandStats confirms the fast path still counts GET and SET against
 // their commandstats entries, so INFO commandstats stays accurate when the bypass
 // serves the calls.

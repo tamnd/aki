@@ -84,10 +84,15 @@ type Dispatcher struct {
 	// the integrated GET/SET fast path in Handle. It is set once at construction
 	// because the engine never switches substrate at runtime. getCmd and setCmd are
 	// the GET and SET descriptors resolved once so the fast path can record their
-	// commandstats without a table lookup.
+	// commandstats without a table lookup; the four increment descriptors do the
+	// same for the INCR/INCRBY/DECR/DECRBY fast path.
 	hybridFast bool
 	getCmd     *CmdDesc
 	setCmd     *CmdDesc
+	incrCmd    *CmdDesc
+	incrbyCmd  *CmdDesc
+	decrCmd    *CmdDesc
+	decrbyCmd  *CmdDesc
 
 	// activeExpire gates the background cycle: DEBUG SET-ACTIVE-EXPIRE 0 clears it
 	// so only lazy expiry runs, which tests rely on. The tick rate itself comes
@@ -293,6 +298,10 @@ func New(cfg Config) *Dispatcher {
 		d.hybridFast = d.engine.hybridLog()
 		d.getCmd = d.table.get("get")
 		d.setCmd = d.table.get("set")
+		d.incrCmd = d.table.get("incr")
+		d.incrbyCmd = d.table.get("incrby")
+		d.decrCmd = d.table.get("decr")
+		d.decrbyCmd = d.table.get("decrby")
 	}
 	d.activeExpire.Store(true)
 	d.blockingInit()
