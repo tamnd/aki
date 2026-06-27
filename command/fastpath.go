@@ -1,6 +1,7 @@
 package command
 
 import (
+	"math"
 	"sync/atomic"
 
 	"github.com/tamnd/aki/keyspace"
@@ -35,21 +36,55 @@ import (
 func (d *Dispatcher) tryFastGetSet(c *networking.Conn, sess *session, argv [][]byte) bool {
 	switch len(argv) {
 	case 2:
-		if !nameIs(argv[0], 'g', 'e', 't') {
+		switch {
+		case nameIs(argv[0], 'g', 'e', 't'):
+			if !d.fastEnvOK() || !sess.fastPlain() {
+				return false
+			}
+			return d.fastGet(c, sess, argv[1])
+		case nameIsN(argv[0], "incr"):
+			if !d.fastEnvOK() || !sess.fastPlain() {
+				return false
+			}
+			return d.fastIncr(c, sess, argv[1], 1, d.incrCmd, "incr")
+		case nameIsN(argv[0], "decr"):
+			if !d.fastEnvOK() || !sess.fastPlain() {
+				return false
+			}
+			return d.fastIncr(c, sess, argv[1], -1, d.decrCmd, "decr")
+		default:
 			return false
 		}
-		if !d.fastEnvOK() || !sess.fastPlain() {
-			return false
-		}
-		return d.fastGet(c, sess, argv[1])
 	case 3:
-		if !nameIs(argv[0], 's', 'e', 't') {
+		switch {
+		case nameIs(argv[0], 's', 'e', 't'):
+			if !d.fastEnvOK() || !sess.fastPlain() {
+				return false
+			}
+			return d.fastSet(c, sess, argv[1], argv[2])
+		case nameIsN(argv[0], "incrby"):
+			n, ok := parseInteger(argv[2])
+			if !ok {
+				return false
+			}
+			if !d.fastEnvOK() || !sess.fastPlain() {
+				return false
+			}
+			return d.fastIncr(c, sess, argv[1], n, d.incrbyCmd, "incrby")
+		case nameIsN(argv[0], "decrby"):
+			n, ok := parseInteger(argv[2])
+			if !ok || n == math.MinInt64 {
+				// MinInt64 cannot be negated without overflow; let the full path render
+				// the same out-of-range error the general DECRBY produces.
+				return false
+			}
+			if !d.fastEnvOK() || !sess.fastPlain() {
+				return false
+			}
+			return d.fastIncr(c, sess, argv[1], -n, d.decrbyCmd, "decrby")
+		default:
 			return false
 		}
-		if !d.fastEnvOK() || !sess.fastPlain() {
-			return false
-		}
-		return d.fastSet(c, sess, argv[1], argv[2])
 	default:
 		return false
 	}
@@ -96,6 +131,49 @@ func (d *Dispatcher) fastSet(c *networking.Conn, sess *session, key, val []byte)
 	c.WriteRaw(resp.ReplyOK)
 	d.statCall(d.setCmd, 0, false)
 	sess.lastCmd = "set"
+	return true
+}
+
+// fastIncr applies an INCR/INCRBY/DECR/DECRBY straight on the hybrid-log store and
+// writes the reply, mirroring incrBy without the dispatch preamble. delta already
+// carries the sign (DECR/DECRBY pass a negative). cmd is the resolved descriptor so
+// commandstats stay accurate, and name backs sess.lastCmd. It returns true once it
+// has handled the command (including the error replies), or false on a store error
+// so the full path renders that exactly.
+//
+// This is the increment half of the bypass note 278 named: GET and SET shortcut the
+// preamble but INCR did not, so on the hybrid engine INCR ran at about half of SET
+// because it paid the whole Handle path (arena ctx, table lookup, ACL and replica
+// gates, runCommand propagation and monitor/slowlog/latency) plus a shard round
+// trip. The same gates (fastEnvOK, fastPlain) prove none of that skipped work would
+// change the result or a visible side effect; keyspace notifications being off means
+// no "incrby" event is owed.
+func (d *Dispatcher) fastIncr(c *networking.Conn, sess *session, key []byte, delta int64, cmd *CmdDesc, name string) bool {
+	result, code, err := d.engine.hybridIncr(c.DB(), key, delta)
+	if err != nil {
+		return false
+	}
+	sess.lastCmd = name
+	switch code {
+	case hybridIncrWrongType:
+		c.Enc().WriteError(wrongTypeError)
+		d.statError(wrongTypeError)
+		d.statCall(cmd, 0, true)
+	case hybridIncrNotInt:
+		const msg = "ERR value is not an integer or out of range"
+		c.Enc().WriteError(msg)
+		d.statError(msg)
+		d.statCall(cmd, 0, true)
+	case hybridIncrOverflow:
+		const msg = "ERR increment or decrement would overflow"
+		c.Enc().WriteError(msg)
+		d.statError(msg)
+		d.statCall(cmd, 0, true)
+	default:
+		d.persist.markDirty()
+		c.Enc().WriteInteger(result)
+		d.statCall(cmd, 0, false)
+	}
 	return true
 }
 
@@ -175,4 +253,19 @@ func nameIs(name []byte, a, b, c byte) bool {
 		name[0]|0x20 == a &&
 		name[1]|0x20 == b &&
 		name[2]|0x20 == c
+}
+
+// nameIsN folds ASCII case to compare a command token against a lowercase literal of
+// any length, the multi-letter analogue of nameIs for the four-and-six-letter
+// increment verbs (incr, decr, incrby, decrby). lit must already be lowercase.
+func nameIsN(name []byte, lit string) bool {
+	if len(name) != len(lit) {
+		return false
+	}
+	for i := 0; i < len(lit); i++ {
+		if name[i]|0x20 != lit[i] {
+			return false
+		}
+	}
+	return true
 }

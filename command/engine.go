@@ -1,6 +1,7 @@
 package command
 
 import (
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1060,6 +1061,70 @@ func (e *Engine) hybridSet(index int, key, body []byte) error {
 	e.pendingDirty.Store(true)
 	e.pendingWrites.Add(1)
 	return nil
+}
+
+// hybridIncrCode reports the outcome of a hybridIncr beyond the numeric result, so
+// the fast path can render the same reply the general increment path would: the OK
+// result, or one of the three error replies (wrong type, not an integer, overflow).
+type hybridIncrCode uint8
+
+const (
+	hybridIncrOK hybridIncrCode = iota
+	hybridIncrWrongType
+	hybridIncrNotInt
+	hybridIncrOverflow
+)
+
+// hybridIncr applies an INCR-family read-modify-write straight on the hybrid-log
+// store for the integrated fast path. It mirrors incrBy's compute closure: a
+// missing key counts as zero, a non-string value is a wrong-type error, an
+// unparseable value is a not-int error, an out-of-range sum overflows, and a
+// success stores the formatted result with the int encoding while preserving any
+// existing TTL.
+//
+// The read and the write must be one atomic step so two clients incrementing the
+// same key cannot both read the old value and lose an update, exactly the
+// invariant rmwWriteBehind keeps with rmwLocks. So this takes the key's RMW stripe
+// across the whole read-modify-write, the same lock and the same lock order
+// (stripe then engine read lock) the general path uses. The engine read lock is
+// held the way hybridSet holds it, to exclude a concurrent BGSAVE that walks the
+// store. Callers must have confirmed hybridLog().
+func (e *Engine) hybridIncr(index int, key []byte, delta int64) (int64, hybridIncrCode, error) {
+	stripe := rmwStripe(key)
+	e.rmwLocks[stripe].Lock()
+	defer e.rmwLocks[stripe].Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	db, err := e.ks.DB(index)
+	if err != nil {
+		return 0, hybridIncrOK, err
+	}
+	cur, hdr, found, err := db.GetUncached(key)
+	if err != nil {
+		return 0, hybridIncrOK, err
+	}
+	if found && hdr.Type != keyspace.TypeString {
+		return 0, hybridIncrWrongType, nil
+	}
+	var base int64
+	if found {
+		v, ok := parseInteger(cur)
+		if !ok {
+			return 0, hybridIncrNotInt, nil
+		}
+		base = v
+	}
+	sum, ok := addInt64(base, delta)
+	if !ok {
+		return 0, hybridIncrOverflow, nil
+	}
+	body := strconv.AppendInt(nil, sum, 10)
+	if err := db.Set(key, body, keyspace.TypeString, keyspace.EncInt, keepTTL(hdr, found)); err != nil {
+		return 0, hybridIncrOK, err
+	}
+	e.pendingDirty.Store(true)
+	e.pendingWrites.Add(1)
+	return sum, hybridIncrOK, nil
 }
 
 // viewHybridGet reads a key straight off the hybrid-log store. It is the hybrid
