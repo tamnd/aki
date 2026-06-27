@@ -77,6 +77,13 @@ type Keyspace struct {
 	// reads it with one atomic load. Off by default. See keyspace/overlay.go.
 	hashOverlay atomic.Bool
 
+	// hybrid is true when the keyspace was opened WithHybridLog, so its string point
+	// path runs on the v2 hybrid-log store. The command layer reads it to disable the
+	// write-behind fast path: that path stages into the B-tree's hot cache and async
+	// write worker, neither of which the hybrid engine has, so under hybrid every
+	// write takes the synchronous db.Set path that routes into the store.
+	hybrid bool
+
 	// expiredLog collects keys deleted by lazy expiry since the last drain. The
 	// command layer empties it with TakeExpired after each access to fire the
 	// "expired" keyspace event. expiredMu guards it so concurrent reads can log
@@ -334,6 +341,7 @@ func Open(pgr *pager.Pager, opts ...Option) (*Keyspace, error) {
 		sysRoot:      normalizeRoot(pgr.Meta().SystemRoot),
 		lfuLogFactor: lfuLogFactor,
 		lfuDecayTime: lfuDecayTime,
+		hybrid:       o.hlTun != nil,
 	}
 	for i := range ks.dbs {
 		db := &DB{ks: ks, index: i}

@@ -722,6 +722,12 @@ func (e *Engine) FlushShardWrites() {
 // is the precondition for the write-behind fast path. Under commitAlways every
 // write must wait for the checkpoint before the reply goes out.
 func (e *Engine) isDeferred() bool {
+	// The hybrid-log engine has no B-tree hot cache or async write worker, so its
+	// writes must take the synchronous db.Set path that routes into the store. Never
+	// defer under it.
+	if e.ks.HybridLog() {
+		return false
+	}
 	return e.shardsRunning.Load() && commitPolicy(e.policy.Load()) != commitAlways
 }
 
