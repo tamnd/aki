@@ -80,6 +80,15 @@ type Dispatcher struct {
 	// nothing; CONFIG SET updates it with an atomic store.
 	notifyFlags uint32
 
+	// hybridFast is true when the engine runs on the hybrid-log store, the gate for
+	// the integrated GET/SET fast path in Handle. It is set once at construction
+	// because the engine never switches substrate at runtime. getCmd and setCmd are
+	// the GET and SET descriptors resolved once so the fast path can record their
+	// commandstats without a table lookup.
+	hybridFast bool
+	getCmd     *CmdDesc
+	setCmd     *CmdDesc
+
 	// activeExpire gates the background cycle: DEBUG SET-ACTIVE-EXPIRE 0 clears it
 	// so only lazy expiry runs, which tests rely on. The tick rate itself comes
 	// from effectiveHz, driven by the hz and dynamic-hz directives. bgStop and
@@ -281,6 +290,9 @@ func New(cfg Config) *Dispatcher {
 		d.engine.onCommit = d.recordIOLatency
 		d.applyLFUConfig()
 		d.applyCommitPolicy()
+		d.hybridFast = d.engine.hybridLog()
+		d.getCmd = d.table.get("get")
+		d.setCmd = d.table.get("set")
 	}
 	d.activeExpire.Store(true)
 	d.blockingInit()
@@ -655,6 +667,15 @@ func (ctx *Ctx) enc() *resp.Encoder { return ctx.Conn.Enc() }
 // the command, check arity, check auth, then call the handler.
 func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	sess := d.sessionFor(c)
+	// Integrated GET/SET fast path. When the engine runs on the hybrid-log store and
+	// both the server-wide environment and this connection's session are in the plain
+	// state where none of the dispatch preamble or runCommand bookkeeping would have
+	// observed or altered the command, serve GET and SET straight off the store. This
+	// is the integrated analogue of the v2 standalone server's raw-buffer fast path,
+	// which clears 2x both rivals at saturation while the general dispatch path stalls.
+	if d.hybridFast && d.tryFastGetSet(c, sess, argv) {
+		return
+	}
 	// getCtx early so ctx.ar backs the name scratch for the pre-lookup checks
 	// below (allowedInSubMode, isMultiControl). defer putCtx covers every early
 	// return and resets the arena after the function exits.
