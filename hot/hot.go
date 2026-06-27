@@ -80,17 +80,37 @@ const (
 	entryOverhead = 56
 )
 
-// entry is one key/value record, immutable after it is published into a slot.
-// kv holds the key bytes followed by the value bytes in a single allocation, so
-// a record is one alloc and the value is returned with no copy.
+// inlineCap is the largest key+value byte count an entry holds in its inline
+// array, so a write of that size or smaller is a single allocation (the entry
+// struct) with no separate buffer. Sized to cover the common small-value case
+// (a redis value plus a short key); larger records fall back to a heap slice.
+const inlineCap = 80
+
+// entry is one key/value record, immutable after it is published into a slot. The
+// key bytes followed by the value bytes live either in the inline array (the
+// common small case, one allocation total) or, when they exceed inlineCap, in the
+// kv slice (two allocations). Either way the bytes are immutable after publish, so
+// a reader returns the value with no copy and an in-flight reader stays valid
+// while a writer installs a new entry.
 type entry struct {
-	hash uint64
-	klen uint32
-	kv   []byte
+	hash   uint64
+	klen   uint32
+	ilen   uint32 // bytes used in inline when kv is nil
+	inline [inlineCap]byte
+	kv     []byte // non-nil only when key+value exceeds inlineCap
 }
 
-func (e *entry) key() []byte { return e.kv[:e.klen] }
-func (e *entry) val() []byte { return e.kv[e.klen:] }
+// data returns the full key+value backing, from the inline array or the heap
+// slice. The returned slice aliases immutable storage and must not be mutated.
+func (e *entry) data() []byte {
+	if e.kv != nil {
+		return e.kv
+	}
+	return e.inline[:e.ilen]
+}
+
+func (e *entry) key() []byte { return e.data()[:e.klen] }
+func (e *entry) val() []byte { return e.data()[e.klen:] }
 
 // tombstone marks a slot whose key was deleted. Readers probe past it; an insert
 // reuses the first one it passes. It is cleared in bulk by a rehash.
@@ -262,7 +282,7 @@ func (sh *shard) set(key, value []byte, h uint64) int {
 				t.slots[i].e.Store(ne)
 			}
 			sh.count++
-			sh.bytes += len(ne.kv) + entryOverhead
+			sh.bytes += len(ne.data()) + entryOverhead
 			sh.mu.Unlock()
 			return -1
 		}
@@ -277,7 +297,7 @@ func (sh *shard) set(key, value []byte, h uint64) int {
 			ne := newEntry(h, key, value)
 			prev := len(e.val())
 			t.slots[i].e.Store(ne) // publish the new entry; the old one is now garbage
-			sh.bytes += len(ne.kv) - len(e.kv)
+			sh.bytes += len(ne.data()) - len(e.data())
 			sh.mu.Unlock()
 			return prev
 		}
@@ -320,7 +340,7 @@ func (sh *shard) del(key []byte, h uint64) (int, bool) {
 			t.slots[i].e.Store(tombstone)
 			sh.count--
 			sh.tomb++
-			sh.bytes -= len(e.kv) + entryOverhead
+			sh.bytes -= len(e.data()) + entryOverhead
 			if sh.tomb*2 >= len(t.slots) {
 				sh.grow() // clear tombstones; keeps probe length bounded under churn
 			}
@@ -360,13 +380,23 @@ func (sh *shard) grow() *htable {
 	return nt
 }
 
-// newEntry builds an immutable record holding the key followed by the value in a
-// single backing allocation.
+// newEntry builds an immutable record holding the key followed by the value. When
+// they fit in the inline array the entry is a single allocation; otherwise the
+// bytes go to a heap slice (two allocations).
 func newEntry(h uint64, key, val []byte) *entry {
-	kv := make([]byte, len(key)+len(val))
-	copy(kv, key)
-	copy(kv[len(key):], val)
-	return &entry{hash: h, klen: uint32(len(key)), kv: kv}
+	e := &entry{hash: h, klen: uint32(len(key))}
+	n := len(key) + len(val)
+	if n <= inlineCap {
+		copy(e.inline[:], key)
+		copy(e.inline[len(key):], val)
+		e.ilen = uint32(n)
+	} else {
+		kv := make([]byte, n)
+		copy(kv, key)
+		copy(kv[len(key):], val)
+		e.kv = kv
+	}
+	return e
 }
 
 // hash64 is FNV-1a over the key bytes. The full 64-bit value selects the shard

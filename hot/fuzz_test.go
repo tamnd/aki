@@ -39,7 +39,10 @@ func FuzzHotStoreModel(f *testing.F) {
 
 			switch op % 4 {
 			case 0: // Set
-				val := []byte{'v', arg, byte(i)}
+				// Vary the value length around inlineCap so both the inline and the
+				// heap-slice record paths get exercised by the corpus.
+				vlen := int(arg) % (inlineCap + 16)
+				val := bytes.Repeat([]byte{arg}, vlen)
 				prev, _ := s.SetWithPrev(key, val)
 				wantPrev := -1
 				if old, ok := model[ks]; ok {
