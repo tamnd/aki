@@ -3,6 +3,7 @@ package command
 import (
 	"bufio"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -13,10 +14,15 @@ import (
 // start brings up a real server with the command dispatcher behind it and
 // returns a connected client reader plus the raw connection. The whole pipeline
 // (socket, RESP parse, dispatch, reply encode) runs, so these are end-to-end.
+//
+// AKI_TEST_NETMODE selects the server's networking model, so the whole command
+// suite can be driven through the epoll reactor on Linux with
+// AKI_TEST_NETMODE=reactor. On a platform that does not support the reactor it
+// falls back to the goroutine path, so the variable is harmless elsewhere.
 func start(t *testing.T, cfg Config) (*bufio.Reader, net.Conn) {
 	t.Helper()
 	d := New(cfg)
-	ncfg := networking.Config{Addr: "127.0.0.1:0"}
+	ncfg := networking.Config{Addr: "127.0.0.1:0", NetMode: os.Getenv("AKI_TEST_NETMODE")}
 	srv := networking.New(ncfg, d)
 	d.SetServer(srv)
 	go func() { _ = srv.ListenAndServe(ncfg) }()
