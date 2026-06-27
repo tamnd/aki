@@ -146,6 +146,14 @@ const shardShift = 40
 // Set stores value under key, replacing any previous value. The value bytes are
 // copied into the log, so the caller may reuse the slice after Set returns.
 func (s *Store) Set(key, value []byte) error {
+	_, err := s.shardFor(key).set(key, value)
+	return err
+}
+
+// SetWithPrev is Set that also reports the displaced value's length, or -1 when the
+// key is new. The keyspace layer uses the delta to keep used_memory exact across an
+// overwrite without a read-before-write that would cost a second index probe.
+func (s *Store) SetWithPrev(key, value []byte) (prevValLen int, err error) {
 	return s.shardFor(key).set(key, value)
 }
 
@@ -158,6 +166,14 @@ func (s *Store) Get(key []byte) (value []byte, found bool, err error) {
 // Delete removes key, returning whether it was present. The log record is left in
 // place (it becomes garbage for compaction); only the index entry is dropped.
 func (s *Store) Delete(key []byte) (bool, error) {
+	_, ok, err := s.shardFor(key).del(key)
+	return ok, err
+}
+
+// DeleteWithPrev is Delete that also reports the removed value's length (-1 when the
+// key was absent), so the keyspace layer can subtract the freed bytes from
+// used_memory without re-reading the record it just dropped.
+func (s *Store) DeleteWithPrev(key []byte) (prevValLen int, ok bool, err error) {
 	return s.shardFor(key).del(key)
 }
 
@@ -333,10 +349,13 @@ const recHdr = 8
 // recordLen returns the encoded size of a key/value record.
 func recordLen(key, value []byte) int { return recHdr + len(key) + len(value) }
 
-func (sh *shard) set(key, value []byte) error {
+// set appends the record and repoints the index, returning the displaced record's
+// value length (-1 when the key is new). The plain Store.Set discards it; the
+// tracked Store.SetWithPrev surfaces it for used_memory accounting.
+func (sh *shard) set(key, value []byte) (prevValLen int, err error) {
 	rl := recordLen(key, value)
 	if rl > sh.pageSize {
-		return errors.New("store: record larger than page size")
+		return -1, errors.New("store: record larger than page size")
 	}
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -359,8 +378,7 @@ func (sh *shard) set(key, value []byte) error {
 	copy(page[off+recHdr:], key)
 	copy(page[off+recHdr+len(key):], value)
 	sh.tailPos += rl
-	sh.indexPut(key, uint64(recStart))
-	return nil
+	return sh.indexPut(key, uint64(recStart)), nil
 }
 
 // evictIfNeeded flushes resident pages to disk until the shard is back within its
@@ -445,11 +463,14 @@ func (sh *shard) get(key []byte) ([]byte, bool, error) {
 	return val[:nr], true, nil
 }
 
-func (sh *shard) del(key []byte) (bool, error) {
+// del drops the key from the index, returning the removed record's value length
+// and whether it was present. The plain Store.Delete discards the length; the
+// tracked Store.DeleteWithPrev surfaces it for used_memory accounting.
+func (sh *shard) del(key []byte) (prevValLen int, ok bool, err error) {
 	sh.mu.Lock()
-	ok := sh.indexDelete(key)
+	pl, ok := sh.indexDelete(key)
 	sh.mu.Unlock()
-	return ok, nil
+	return pl, ok, nil
 }
 
 // recordKeyAny returns the key bytes of the record at logical address addr,
@@ -478,6 +499,28 @@ func (sh *shard) recordKeyAny(addr uint64) []byte {
 	return key
 }
 
+// recordValLenAny returns the value length of the record at logical address addr,
+// for both resident pages (a slice read, the hot path) and spilled pages (a disk
+// read of the 8-byte header, the cold path). The index upsert and delete call this
+// to surface the displaced record's size so the keyspace layer can keep its
+// used_memory accounting exact without a separate read-before-write.
+func (sh *shard) recordValLenAny(addr uint64) int {
+	pid := int64(addr) >> sh.pageShift
+	off := int(int64(addr) & sh.pageMask)
+	if page := sh.pages[pid]; page != nil {
+		return int(binary.LittleEndian.Uint32(page[off+4:]))
+	}
+	dOff := sh.diskOff[pid]
+	if sh.file == nil {
+		return 0
+	}
+	var hdr [recHdr]byte
+	if _, err := sh.file.ReadAt(hdr[:], dOff+int64(off)); err != nil {
+		return 0
+	}
+	return int(binary.LittleEndian.Uint32(hdr[4:]))
+}
+
 // indexGet probes the open-addressed table for key and returns the record-start
 // address of its current value. Caller holds at least the read lock.
 func (sh *shard) indexGet(key []byte) (uint64, bool) {
@@ -501,8 +544,11 @@ func (sh *shard) indexGet(key []byte) (uint64, bool) {
 
 // indexPut inserts or repoints key at the record-start address addr. Caller holds
 // the write lock. On update it repoints the existing slot in place, so icount is
-// exact and the table never accumulates shadow entries.
-func (sh *shard) indexPut(key []byte, addr uint64) {
+// exact and the table never accumulates shadow entries. It returns the displaced
+// record's value length, or -1 when the key is new, so a tracking caller learns the
+// overwritten size at no extra probe (the slot and its record were already located
+// to confirm the key match).
+func (sh *shard) indexPut(key []byte, addr uint64) (prevValLen int) {
 	if float64(sh.icount+1) > sh.maxLoad*float64(len(sh.slots)) {
 		sh.indexGrow()
 	}
@@ -514,31 +560,35 @@ func (sh *shard) indexPut(key []byte, addr uint64) {
 		if e == 0 {
 			sh.slots[i] = makeEntry(tag, addr)
 			sh.icount++
-			return
+			return -1
 		}
 		if entryTag(e) == tag && bytesEqual(sh.recordKeyAny(entryAddr(e)), key) {
+			old := sh.recordValLenAny(entryAddr(e))
 			sh.slots[i] = makeEntry(tag, addr) // repoint in place
-			return
+			return old
 		}
 		i = (i + 1) & sh.islotsMask
 	}
 }
 
 // indexDelete removes key with backward-shift deletion (no tombstones, so the
-// stop-at-empty probe stays correct). Caller holds the write lock.
-func (sh *shard) indexDelete(key []byte) bool {
+// stop-at-empty probe stays correct). Caller holds the write lock. It returns the
+// removed record's value length and whether the key was present, so a tracking
+// caller learns the freed size without re-reading the record.
+func (sh *shard) indexDelete(key []byte) (prevValLen int, ok bool) {
 	h := hash64(key)
 	tag := tagOf(h)
 	i := h & sh.islotsMask
 	for {
 		e := sh.slots[i]
 		if e == 0 {
-			return false
+			return -1, false
 		}
 		if entryTag(e) == tag && bytesEqual(sh.recordKeyAny(entryAddr(e)), key) {
+			old := sh.recordValLenAny(entryAddr(e))
 			sh.indexBackshift(i)
 			sh.icount--
-			return true
+			return old, true
 		}
 		i = (i + 1) & sh.islotsMask
 	}
