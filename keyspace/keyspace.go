@@ -817,6 +817,21 @@ func (db *DB) Peek(key []byte) (body []byte, hdr ValueHeader, found bool, err er
 	return db.get(key, false)
 }
 
+// GetUncached is Get for callers that already probed the hot-value cache through
+// viewHotGet and missed (handleGet's fast path). It skips the redundant initial
+// cache probe and goes straight to the write-behind overlay and the B-tree, so a
+// GET that misses the cache takes one shard reader lock instead of two. It still
+// records the access and warms the cache on the way out, exactly as Get does. The
+// skipped probe can only differ from Get if a concurrent writer inserts the key in
+// the window between the viewHotGet probe and this call, which then reads the fresh
+// value from the overlay or B-tree instead, so it is never a correctness gap.
+func (db *DB) GetUncached(key []byte) (body []byte, hdr ValueHeader, found bool, err error) {
+	if db.hlTun != nil {
+		return db.hlGet(key)
+	}
+	return db.getProbe(key, true, false)
+}
+
 // get is the shared read path. When touch is set it records an access for the
 // eviction bookkeeping. An expired key is returned as not-found immediately;
 // its B-tree deletion is deferred to the next active expiry cycle so this
@@ -825,10 +840,17 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 	if db.hlTun != nil {
 		return db.hlGet(key)
 	}
+	return db.getProbe(key, touch, true)
+}
+
+// getProbe is get with an explicit toggle for the initial hot-cache probe. probe
+// is true on the normal path and false for GetUncached, whose caller already
+// probed the cache via viewHotGet. Everything after the probe is identical.
+func (db *DB) getProbe(key []byte, touch, probe bool) (body []byte, hdr ValueHeader, found bool, err error) {
 	// Hot-cache check comes before the string conversion: cget and cinvalidate
 	// take []byte and do the map op with string(key) as a compiler-elided
 	// temporary, so a hot hit returns without any heap allocation.
-	if touch {
+	if touch && probe {
 		if b, h, ok := db.hc.Load().cget(key); ok {
 			if db.expired(h) {
 				db.hc.Load().cinvalidate(key)
@@ -899,7 +921,10 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 	// CollRead, not this path; this guard keeps a stray Get from poisoning the
 	// cache.
 	if touch && !h.IsColl() {
-		db.hc.Load().cput(sk, out, h)
+		// Read-miss admission: gate this insert through the doorkeeper so a
+		// one-hit-wonder read does not thrash the cache (note 247). Write-path and
+		// write-behind warm-ups use cput and force-admit.
+		db.hc.Load().cputRead(sk, out, h)
 	}
 	return out, h, true, nil
 }

@@ -450,6 +450,9 @@ func (d *Dispatcher) OnBatchComplete(c *networking.Conn) {
 	if sess != nil && len(sess.incrPend) > 0 {
 		d.flushIncrPending(c, sess)
 	}
+	if sess != nil && len(sess.pushPend) > 0 {
+		d.flushPushPending(c, sess)
+	}
 	d.aof.mu.Lock()
 	d.spliceSessionAOFLocked(sess)
 	d.flushIncrLocked()

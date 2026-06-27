@@ -22,6 +22,7 @@ func getCtx(c *networking.Conn, argv [][]byte, d *Dispatcher, sess *session) *Ct
 	ctx.sess = sess
 	ctx.forceProp = false
 	ctx.deferIncr = false
+	ctx.deferPush = false
 	return ctx
 }
 
@@ -35,6 +36,7 @@ func putCtx(ctx *Ctx) {
 	ctx.readyKeysAll = ctx.readyKeysAll[:0]
 	ctx.forceProp = false
 	ctx.deferIncr = false
+	ctx.deferPush = false
 	ctxPool.Put(ctx)
 }
 
@@ -494,6 +496,13 @@ type Ctx struct {
 	// where batching is safe (see canBatchIncr); flushIncrPending applies the batch
 	// and writes the replies in pipeline order.
 	deferIncr bool
+
+	// deferPush is the list-push analogue of deferIncr: it asks the push handler to
+	// accumulate a coll-form LPUSH/RPUSH onto the connection's pending batch instead
+	// of paying a synchronous shard-owner round trip per command. Handle sets it only
+	// for a coll-form push in a batchable state (see canBatchPush and pushKeyIsColl);
+	// flushPushPending applies the batch and writes the replies in pipeline order.
+	deferPush bool
 }
 
 // MarkPropagate makes the running command propagate to the AOF and replicas
@@ -554,6 +563,14 @@ type session struct {
 	// value so a deep pipeline grows one backing array rather than allocating a
 	// struct per command, and it is only ever touched on the connection goroutine.
 	incrPend []deferredIncr
+
+	// pushPend accumulates this connection's deferred coll-form list pushes during a
+	// pipeline drain. flushPushPending hands each shard its sub-batch, writes the
+	// replies in arrival order, and resets the slice. Like incrPend it is held by
+	// value and only touched on the connection goroutine. At most one of incrPend and
+	// pushPend is ever non-empty: deferring a push flushes any pending increments and
+	// vice versa, so reply order across the two families stays correct.
+	pushPend []deferredPush
 
 	// inMulti is true between MULTI and EXEC/DISCARD: commands are queued instead
 	// of run. queue holds them in order, and dirtyExec records a queue-time error
@@ -649,15 +666,32 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	// name within Handle (putCtx via defer, never mid-function).
 	name := unsafe.String(unsafe.SliceData(nameScratch), len(nameScratch))
 
-	// Batched increment hand-off. A clean increment in a batchable state is deferred
-	// onto the connection's pending list and applied as one per-shard sub-batch at
-	// the end of the drain. Anything else flushes the pending batch first so the
-	// deferred replies keep their place in the pipeline's output before this command
-	// writes anything (including an error reply from the gates below).
-	if structuralIncrOK(name, argv) && d.canBatchIncr(c, sess) {
+	// Batched write hand-off. A clean increment or a coll-form list push in a
+	// batchable state is deferred onto the connection's pending list and applied as
+	// one per-shard sub-batch at the end of the drain, collapsing a pipeline's worth
+	// of per-command shard-owner round trips into one per shard. Anything else flushes
+	// the pending batch first so the deferred replies keep their place in the
+	// pipeline's output before this command writes anything (including an error reply
+	// from the gates below). At most one family batches at a time: deferring a push
+	// flushes any pending increments and vice versa, so replies stay in order.
+	switch {
+	case structuralIncrOK(name, argv) && d.canBatchIncr(c, sess):
+		if len(sess.pushPend) > 0 {
+			d.flushPushPending(c, sess)
+		}
 		ctx.deferIncr = true
-	} else if len(sess.incrPend) > 0 {
-		d.flushIncrPending(c, sess)
+	case structuralPushOK(name, argv) && d.canBatchPush(c, sess) && d.pushKeyIsColl(c, argv):
+		if len(sess.incrPend) > 0 {
+			d.flushIncrPending(c, sess)
+		}
+		ctx.deferPush = true
+	default:
+		if len(sess.incrPend) > 0 {
+			d.flushIncrPending(c, sess)
+		}
+		if len(sess.pushPend) > 0 {
+			d.flushPushPending(c, sess)
+		}
 	}
 
 	// A RESP2 client with active subscriptions is in subscriber mode and may run
