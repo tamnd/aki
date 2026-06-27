@@ -110,7 +110,7 @@ func New(t Tunables) (*Store, error) {
 		if err != nil {
 			// Best-effort close of the shards already opened.
 			for j := 0; j < i; j++ {
-				s.shards[j].close()
+				_ = s.shards[j].close()
 			}
 			return nil, err
 		}
