@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/tamnd/aki/pager"
-	"github.com/tamnd/aki/v2/store"
+	"github.com/tamnd/aki/store"
 	"github.com/tamnd/aki/vfs"
 )
 

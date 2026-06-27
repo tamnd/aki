@@ -5,7 +5,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/tamnd/aki/v2/store"
+	"github.com/tamnd/aki/store"
 )
 
 func dialServer(t *testing.T) (*Server, net.Conn) {
