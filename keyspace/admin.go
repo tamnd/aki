@@ -10,6 +10,18 @@ import (
 // to the freelist, then zeroes the shard so the next write starts fresh. The
 // hot-value cache is cleared after all shards are flushed.
 func (db *DB) Flush() error {
+	if db.hlTun != nil {
+		// In hybrid mode the keys live in the per-DB hybrid-log store, not the
+		// shard trees, so clearing the store is the whole flush. The hot cache is
+		// still dropped for parity with the B-tree path.
+		if s := db.hl.Load(); s != nil {
+			if err := s.Clear(); err != nil {
+				return err
+			}
+		}
+		db.hc.Load().cclear()
+		return nil
+	}
 	for s := range NumShards {
 		db.shards[s].mu.Lock()
 		if err := db.flushShard(s); err != nil {
@@ -93,6 +105,27 @@ func (ks *Keyspace) Swap(i, j int) error {
 		return err
 	}
 	if a == b {
+		return nil
+	}
+	// In hybrid mode the keys live in each DB's hybrid-log store, so the swap is
+	// just an exchange of the two store pointers. Build both stores first so
+	// neither hl pointer is left nil after the swap: a nil pointer paired with an
+	// already-fired hlOnce would never rebuild, and the next write would panic.
+	// Storing the pointers is atomic, so a concurrent point read on either DB sees
+	// a consistent store either side of the swap.
+	if a.hlTun != nil {
+		if _, err := a.ensureHL(); err != nil {
+			return err
+		}
+		if _, err := b.ensureHL(); err != nil {
+			return err
+		}
+		sa, sb := a.hl.Load(), b.hl.Load()
+		a.hl.Store(sb)
+		b.hl.Store(sa)
+		aHC, bHC := a.hc.Load(), b.hc.Load()
+		a.hc.Store(bHC)
+		b.hc.Store(aHC)
 		return nil
 	}
 	// Lock all shards of both DBs in a consistent order (lower DB index first,
