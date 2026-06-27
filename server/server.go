@@ -24,7 +24,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/tamnd/aki/v2/store"
+	"github.com/tamnd/aki/store"
 )
 
 // Server serves the v2 store over RESP on a TCP listener.

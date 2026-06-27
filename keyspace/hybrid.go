@@ -1,6 +1,6 @@
 package keyspace
 
-import "github.com/tamnd/aki/v2/store"
+import "github.com/tamnd/aki/store"
 
 // hybrid.go is the in-place engine swap, slice S1 (spec 2064 rewrite). When a
 // database is opened WithHybridLog its string point path (Set/Get/Delete) runs
