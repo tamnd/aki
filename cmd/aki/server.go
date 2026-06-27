@@ -70,6 +70,7 @@ func cmdServer(args []string) error {
 	appendfsync := fs.String("appendfsync", "", "durability policy: always, everysec, or no")
 	hashOverlay := fs.String("aki-hash-overlay", "", "in-memory hash write fast path: yes or no (default no)")
 	engine := fs.String("aki-engine", "", "storage engine for the string point path: btree (default, durable, all types) or hybrid (experimental, in-memory, string-only; spec 2064 rewrite S1)")
+	akiNet := fs.String("aki-net", "", "TCP networking model: goroutine (default, one read-loop goroutine per connection) or reactor (experimental epoll event loops, Linux+TCP only; spec 2064 reactor)")
 	save := fs.String("save", "", `RDB save points, e.g. "3600 1 300 100", or "" to disable`)
 	maxmemory := fs.String("maxmemory", "", "memory limit before eviction, e.g. 256mb (0 disables)")
 	maxmemoryPolicy := fs.String("maxmemory-policy", "", "eviction policy when maxmemory is reached")
@@ -205,6 +206,7 @@ func cmdServer(args []string) error {
 		Addr:       listenAddr,
 		UnixSocket: resolve("unixsocket", *unixSocket),
 		MaxClients: *maxClients,
+		NetMode:    resolve("aki-net", *akiNet),
 	}
 
 	// Apply config-mirroring directives through the same path CONFIG SET uses, so
