@@ -1038,6 +1038,30 @@ func (e *Engine) viewHotGet(index int, key []byte) ([]byte, keyspace.ValueHeader
 // hybrid-log store. GET reads it to pick the hybrid read fast path.
 func (e *Engine) hybridLog() bool { return e.ks.HybridLog() }
 
+// hybridSet applies a plain SET (string type, no TTL, no conditions) straight to
+// the hybrid-log store for the integrated GET/SET fast path. It is the write half
+// of handleSet's plain-SET case without the option parse or the old-value read: the
+// fast path never needs the prior value because it serves no NX/XX/GET option. The
+// engine read lock is held the same way updateShard's inline branch holds it, so a
+// concurrent BGSAVE (which takes the write lock and walks the store) is excluded and
+// sees a consistent point in time. db.Set routes into the store, which carries its
+// own per-shard locks, so writers to different keys do not serialize here. Callers
+// must have confirmed hybridLog().
+func (e *Engine) hybridSet(index int, key, body []byte) error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	db, err := e.ks.DB(index)
+	if err != nil {
+		return err
+	}
+	if err := db.Set(key, body, keyspace.TypeString, stringEncoding(body), -1); err != nil {
+		return err
+	}
+	e.pendingDirty.Store(true)
+	e.pendingWrites.Add(1)
+	return nil
+}
+
 // viewHybridGet reads a key straight off the hybrid-log store. It is the hybrid
 // analogue of viewHotGet: the hybrid engine never populates the hot-value cache,
 // so probing it is wasted work, and the store carries its own per-shard locks so
