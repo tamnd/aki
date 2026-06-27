@@ -259,7 +259,12 @@ func (db *DB) hlCollStoreLocked(key []byte, w *CollWriter, typ, enc uint8, prev 
 	}
 	cell := h.AppendTo(make([]byte, 0, HeaderSize+len(body)))
 	cell = append(cell, body...)
-	return st.Set(key, cell)
+	prevValLen, err := st.SetWithPrev(key, cell)
+	if err != nil {
+		return err
+	}
+	db.hlAccountStore(key, len(body), prevValLen)
+	return nil
 }
 
 // hlCollRead is the hybrid-engine CollRead: serve fn a reader over the cell's rows
@@ -344,5 +349,10 @@ func (db *DB) hlCollCopyTo(srcKey []byte, dst *DB, dstKey []byte) (bool, error) 
 	}
 	cell := h.AppendTo(make([]byte, 0, HeaderSize+len(bodyCopy)))
 	cell = append(cell, bodyCopy...)
-	return true, st.Set(dstKey, cell)
+	prevValLen, err := st.SetWithPrev(dstKey, cell)
+	if err != nil {
+		return false, err
+	}
+	dst.hlAccountStore(dstKey, len(bodyCopy), prevValLen)
+	return true, nil
 }
