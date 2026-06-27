@@ -175,7 +175,7 @@ func TestHLDisabledByDefault(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	db, _ := ks.DB(0)
-	if db.hlTun != nil {
+	if db.newHL != nil {
 		t.Fatal("hybrid log engaged without WithHybridLog")
 	}
 	if db.Set([]byte("k"), []byte("v"), TypeString, EncRaw, -1); db.hl.Load() != nil {

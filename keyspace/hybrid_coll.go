@@ -307,7 +307,7 @@ func (db *DB) hlCollSetTTL(key []byte, ttlMs int64) (bool, error) {
 	h.Version = db.ks.version.Add(1)
 	cell := h.AppendTo(make([]byte, 0, HeaderSize+len(body)))
 	cell = append(cell, body...)
-	st := db.hl.Load()
+	st := db.hl.Load().e
 	return true, st.Set(key, cell)
 }
 

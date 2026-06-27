@@ -315,7 +315,7 @@ func (cc *CollCursor) Value() []byte {
 // and BodyRef pointing at the (possibly new) sub-tree root. The key's existing TTL
 // is preserved.
 func (db *DB) CollUpdate(key []byte, typ, enc uint8, fn func(w *CollWriter) error) error {
-	if db.hlTun != nil {
+	if db.newHL != nil {
 		return db.hlCollUpdate(key, typ, enc, fn)
 	}
 	s := ShardOf(key)
@@ -420,7 +420,7 @@ const (
 // the caller takes its skip or blob path. typ and enc carry the same meaning as in
 // CollUpdate. The caller must NOT hold any shard lock.
 func (db *DB) CollUpdateRouted(key []byte, typ, enc uint8, route func(found bool, h ValueHeader, blob []byte) CollRoute, fn func(w *CollWriter) error) (CollRoute, error) {
-	if db.hlTun != nil {
+	if db.newHL != nil {
 		return db.hlCollUpdateRouted(key, typ, enc, route, fn)
 	}
 	s := ShardOf(key)
@@ -583,7 +583,7 @@ func (db *DB) collClearLocked(s int, t *btree.Tree, ck, key []byte, subRoot uint
 // which case the caller falls back to its blob path; fn is not called. An expired
 // key reads as absent. The caller must NOT hold any shard lock.
 func (db *DB) CollRead(key []byte, fn func(r *CollReader) error) (ok bool, err error) {
-	if db.hlTun != nil {
+	if db.newHL != nil {
 		return db.hlCollRead(key, fn)
 	}
 	s := ShardOf(key)
@@ -633,7 +633,7 @@ func (db *DB) CollMetaHeader(key []byte) (ValueHeader, bool, error) {
 // is absent or not in coll form, so the caller can fall back to its blob path.
 // Caller must NOT hold any shard lock.
 func (db *DB) CollSetTTL(key []byte, ttlMs int64) (ok bool, err error) {
-	if db.hlTun != nil {
+	if db.newHL != nil {
 		return db.hlCollSetTTL(key, ttlMs)
 	}
 	s := ShardOf(key)
@@ -705,7 +705,7 @@ func (db *DB) clearCollTTL(key []byte) error {
 // corrupt). Copying the rows into a fresh sub-tree keeps the two keys
 // independent.
 func (db *DB) CollCopyTo(srcKey []byte, dst *DB, dstKey []byte) (ok bool, err error) {
-	if db.hlTun != nil {
+	if db.newHL != nil {
 		return db.hlCollCopyTo(srcKey, dst, dstKey)
 	}
 	// Snapshot the source rows and metadata under the source shard read lock, then

@@ -96,7 +96,7 @@ func (db *DB) Scan(cursor uint64, count int) (uint64, []ScanEntry, error) {
 // The shards are iterated in index order (shard 0, 1, ...), which corresponds
 // to hash-slot order since shard s owns slots [s*2048, (s+1)*2048).
 func (db *DB) forEachLive(fn func(ck []byte, h ValueHeader) error) error {
-	if db.hlTun != nil {
+	if db.newHL != nil {
 		return db.hlForEachLive(fn)
 	}
 	for s := range NumShards {
