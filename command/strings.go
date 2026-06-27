@@ -362,8 +362,21 @@ func handleGet(ctx *Ctx) {
 		found    bool
 		wrongTyp bool
 	)
+	// probed is true when the viewHotGet fast path above already missed the hot
+	// cache, so the B-tree read below can skip the redundant second cache probe.
+	probed := ctx.d.engine != nil
 	ok := ctx.view(func(db *keyspace.DB) error {
-		b, hdr, f, err := db.Get(key)
+		var (
+			b   []byte
+			hdr keyspace.ValueHeader
+			f   bool
+			err error
+		)
+		if probed {
+			b, hdr, f, err = db.GetUncached(key)
+		} else {
+			b, hdr, f, err = db.Get(key)
+		}
 		if err != nil {
 			return err
 		}
