@@ -855,7 +855,10 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 	// CollRead, not this path; this guard keeps a stray Get from poisoning the
 	// cache.
 	if touch && !h.IsColl() {
-		db.hc.Load().cput(sk, out, h)
+		// Read-miss admission: gate this insert through the doorkeeper so a
+		// one-hit-wonder read does not thrash the cache (note 247). Write-path and
+		// write-behind warm-ups use cput and force-admit.
+		db.hc.Load().cputRead(sk, out, h)
 	}
 	return out, h, true, nil
 }

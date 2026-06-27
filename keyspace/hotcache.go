@@ -42,6 +42,22 @@ const (
 	// minShardBytes floors each shard's budget so a tiny configured cache still
 	// holds a few entries per shard rather than thrashing on every put.
 	minShardBytes = 4 << 10
+
+	// dkBits is the per-shard doorkeeper size in bits (8 KiB per shard, ~512 KiB
+	// across the 64 shards, lazily allocated). The doorkeeper is the admission
+	// filter from perf/03: a key read from the B-tree is only admitted to the
+	// decoded cache on its second sighting within an epoch, so a uniform-random
+	// scan over a working set larger than the cache stops paying a map insert and
+	// an eviction for one-hit-wonders it would evict before reuse (note 247).
+	dkBits  = 1 << 16
+	dkWords = dkBits / 64
+	dkMask  = dkBits - 1
+
+	// dkResetSets clears the doorkeeper after this many first-sightings so its
+	// fill ratio, and thus its false-positive rate, stays bounded. At ~1/8 of the
+	// bit count the filter sits near 12% full at reset, a few-percent false
+	// admit rate, which is the standard doorkeeper operating point.
+	dkResetSets = dkBits / 8
 )
 
 // cachedValue holds the cached body, header, and last-access time for one key.
@@ -90,6 +106,12 @@ type cacheShard struct {
 	// value. budget is the shard's byte cap, set once at construction.
 	used   atomic.Int64
 	budget int64
+	// dk is the admission doorkeeper, allocated on the first gated new-key insert.
+	// dkSets counts first-sightings since the last reset. Both are touched only
+	// under mu (the gated path runs in cput's new-key slow branch, which already
+	// holds the write lock), so they need no separate synchronization.
+	dk     []uint64
+	dkSets int
 }
 
 type dbCache struct {
@@ -196,6 +218,24 @@ func (c *dbCache) cgetAtime(key []byte) (uint32, bool) {
 // cache entry and the next read-modify-write would read a stale value and lose
 // an update.
 func (c *dbCache) cput(key string, body []byte, hdr ValueHeader) {
+	c.cputGated(key, body, hdr, false)
+}
+
+// cputRead is cput on the read-miss-from-B-tree path (keyspace.go). It runs the
+// value through the admission doorkeeper so a key seen only once is not inserted,
+// which is what keeps a uniform-random scan over a working set larger than the
+// cache from thrashing it (note 247). Write-path and write-behind warm-ups call
+// cput, which force-admits, because a freshly written key is known live and likely
+// to be read.
+func (c *dbCache) cputRead(key string, body []byte, hdr ValueHeader) {
+	c.cputGated(key, body, hdr, true)
+}
+
+// cputGated is the shared put core. When gated is set, a brand-new key is only
+// inserted on its second-or-later sighting within the doorkeeper epoch; updates to
+// an already-cached key are never gated, so the version-monotonicity guard and the
+// write-path warm-ups behave exactly as before.
+func (c *dbCache) cputGated(key string, body []byte, hdr ValueHeader, gated bool) {
 	sh := &c.shards[c.shardIdxStr(key)]
 	cv := &cachedValue{body: body, hdr: hdr}
 	cv.atime.Store(coarseSeconds())
@@ -251,6 +291,15 @@ func (c *dbCache) cput(key string, body []byte, hdr ValueHeader) {
 		sh.mu.Unlock()
 		return
 	}
+	// New key on a gated (read-miss) put: consult the doorkeeper. The first time a
+	// key is seen it is only recorded, not cached, so a one-hit-wonder never pays
+	// the map insert and the eviction it would trigger. The second sighting within
+	// the epoch admits it. Updates and write-path warm-ups are not gated, so this
+	// only filters keys arriving fresh from the B-tree read path.
+	if gated && !sh.doorkeeperAdmit(key) {
+		sh.mu.Unlock()
+		return
+	}
 	// New key: allocate a cacheEntry, record its cost, and evict the oldest
 	// entries until the shard is back under its byte budget.
 	ne := &cacheEntry{key: key}
@@ -298,6 +347,45 @@ func (sh *cacheShard) compactLRU() {
 	sh.head = 0
 }
 
+// doorkeeperAdmit reports whether key should be admitted to the cache on a gated
+// (read-miss) put. It returns true when the key has been seen before within the
+// current epoch, and otherwise records the sighting and returns false so the
+// caller skips the insert. The caller holds sh.mu, so the bit array and the
+// counter need no extra locking.
+//
+// The filter is a two-hash Bloom doorkeeper over dkBits bits. It is cleared once
+// dkResetSets first-sightings accumulate, which bounds its fill ratio and keeps
+// the false-admit rate at the low-single-digit operating point. A false admit
+// only caches a key one read early; it is never a correctness issue, since the
+// cached value still carries its version and is invalidated on the next write.
+func (sh *cacheShard) doorkeeperAdmit(key string) bool {
+	if sh.dk == nil {
+		sh.dk = make([]uint64, dkWords)
+	}
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= 1099511628211
+	}
+	i1 := h & dkMask
+	i2 := (h >> 32) & dkMask
+	w1, b1 := i1>>6, i1&63
+	w2, b2 := i2>>6, i2&63
+	if (sh.dk[w1]>>b1)&1 == 1 && (sh.dk[w2]>>b2)&1 == 1 {
+		return true
+	}
+	sh.dk[w1] |= 1 << b1
+	sh.dk[w2] |= 1 << b2
+	sh.dkSets++
+	if sh.dkSets >= dkResetSets {
+		for i := range sh.dk {
+			sh.dk[i] = 0
+		}
+		sh.dkSets = 0
+	}
+	return false
+}
+
 // cinvalidate removes key from the cache. Called after any write to that key.
 //
 // key is []byte so callers do not need to allocate a string on the hot write
@@ -324,6 +412,8 @@ func (c *dbCache) cclear() {
 		sh.lru = sh.lru[:0]
 		sh.head = 0
 		sh.used.Store(0)
+		sh.dk = nil
+		sh.dkSets = 0
 		sh.mu.Unlock()
 	}
 }
