@@ -6,17 +6,20 @@
 // SELECT). It is deliberately separate from the v1 networking stack so the v2
 // engine can be measured on its own.
 //
-// The hot path is shaped like a fast RESP server: one goroutine per connection,
-// a buffered reader and writer, and a flush deferred until the read buffer drains
-// so a pipelined burst becomes one writev. Command argument slices are reused
-// across commands on a connection, so steady-state GET/SET parsing does not
-// allocate.
+// The hot path is a raw-buffer loop, not a bufio reader. Each turn reads one
+// chunk straight off the socket, parses every complete command sitting in the
+// buffer in place, runs each one appending its reply to a single output buffer,
+// and writes that buffer back in one syscall. Command arguments are sub-slices of
+// the read buffer, so steady-state parsing copies nothing: a GET key is read in
+// place, and a SET value is copied once by the engine when it lands in the log.
+// This removes the per-argument scratch copy and the dozen bufio method calls a
+// command used to cost, which is where the GET saturation gap against Valkey
+// lived once the engine itself stopped being the bottleneck.
 package server
 
 import (
-	"bufio"
+	"bytes"
 	"errors"
-	"io"
 	"net"
 	"strconv"
 	"sync"
@@ -106,6 +109,11 @@ func (s *Server) Close() error {
 	return nil
 }
 
+const (
+	readChunk = 64 * 1024 // initial read buffer, grows for an oversize single command
+	writeCap  = 64 * 1024 // initial reply buffer, grows as a pipeline burst fills it
+)
+
 func (s *Server) handle(c net.Conn) {
 	defer s.wg.Done()
 	defer func() {
@@ -115,118 +123,148 @@ func (s *Server) handle(c net.Conn) {
 		c.Close()
 	}()
 
-	r := bufio.NewReaderSize(c, 64*1024)
-	w := bufio.NewWriterSize(c, 64*1024)
-	conn := &connState{r: r, w: w}
+	conn := &connState{
+		buf: make([]byte, readChunk),
+		out: make([]byte, 0, writeCap),
+	}
+	// start..end is the unparsed window inside buf.
+	start, end := 0, 0
 	for {
-		if err := s.handleOne(conn); err != nil {
-			return
-		}
-		// Flush only when the read buffer is drained, so a pipelined burst of N
-		// commands collapses into a single write back to the client.
-		if r.Buffered() == 0 {
-			if err := w.Flush(); err != nil {
+		// Drain every complete command currently in the buffer, appending replies
+		// to conn.out. Arguments point straight into buf, valid until the next read.
+		for {
+			args, n, ok, perr := parseCommand(conn.buf[start:end], conn)
+			if perr != nil {
 				return
 			}
+			if !ok {
+				break
+			}
+			start += n
+			if len(args) > 0 {
+				conn.out = s.dispatch(conn.out, args)
+			}
+		}
+		// One write back per drained burst.
+		if len(conn.out) > 0 {
+			if _, err := c.Write(conn.out); err != nil {
+				return
+			}
+			conn.out = conn.out[:0]
+		}
+		// Slide the leftover partial command to the front.
+		if start > 0 {
+			copy(conn.buf, conn.buf[start:end])
+			end -= start
+			start = 0
+		}
+		// A single command larger than the buffer: grow and keep reading it.
+		if end == len(conn.buf) {
+			nb := make([]byte, len(conn.buf)*2)
+			copy(nb, conn.buf[:end])
+			conn.buf = nb
+		}
+		n, err := c.Read(conn.buf[end:])
+		if n > 0 {
+			end += n
+		}
+		if err != nil {
+			return
 		}
 	}
 }
 
-// connState carries the per-connection reader, writer, and a reusable argument
-// scratch so steady-state command parsing does not allocate.
+// connState carries the per-connection read buffer, reply buffer, and a reusable
+// argument slice so steady-state command parsing does not allocate.
 type connState struct {
-	r       *bufio.Reader
-	w       *bufio.Writer
-	args    [][]byte
-	scratch []byte    // reusable backing store for one command's argument bytes
-	offs    []argSpan // per-argument spans into scratch, rebuilt each command
+	buf  []byte
+	out  []byte
+	args [][]byte
 }
 
 var errProtocol = errors.New("protocol error")
 
-func (s *Server) handleOne(conn *connState) error {
-	args, err := readCommand(conn)
-	if err != nil {
-		return err
+// parseCommand tries to parse one RESP multibulk command (or an inline command)
+// from the front of buf. On success it returns the argument slices (pointing into
+// buf), the number of bytes consumed, and ok=true. When buf holds only a partial
+// command it returns ok=false with no error, signalling the caller to read more.
+func parseCommand(buf []byte, conn *connState) (args [][]byte, consumed int, ok bool, err error) {
+	if len(buf) == 0 {
+		return nil, 0, false, nil
 	}
-	if len(args) == 0 {
-		return nil
+	if buf[0] != '*' {
+		// Inline command (redis-cli, a bare PING). redis-benchmark never uses it.
+		nl := bytes.IndexByte(buf, '\n')
+		if nl < 0 {
+			return nil, 0, false, nil
+		}
+		return splitInline(trimCR(buf[:nl]), conn), nl + 1, true, nil
 	}
-	return s.dispatch(conn.w, args)
+	nl := bytes.IndexByte(buf, '\n')
+	if nl < 0 {
+		return nil, 0, false, nil
+	}
+	n, okp := atoiBytes(trimCR(buf[1:nl]))
+	if !okp || n < 0 {
+		return nil, 0, false, errProtocol
+	}
+	pos := nl + 1
+	a := conn.args[:0]
+	for i := 0; i < n; i++ {
+		if pos >= len(buf) {
+			return nil, 0, false, nil
+		}
+		if buf[pos] != '$' {
+			return nil, 0, false, errProtocol
+		}
+		rel := bytes.IndexByte(buf[pos:], '\n')
+		if rel < 0 {
+			return nil, 0, false, nil
+		}
+		hdrEnd := pos + rel
+		blen, okb := atoiBytes(trimCR(buf[pos+1 : hdrEnd]))
+		if !okb || blen < 0 {
+			return nil, 0, false, errProtocol
+		}
+		dataStart := hdrEnd + 1
+		dataEnd := dataStart + blen
+		if dataEnd+2 > len(buf) { // value bytes plus trailing CRLF
+			return nil, 0, false, nil
+		}
+		a = append(a, buf[dataStart:dataEnd])
+		pos = dataEnd + 2
+	}
+	conn.args = a
+	return a, pos, true, nil
 }
 
-// readCommand parses one RESP multibulk command (or an inline command) into
-// conn.args, reusing the backing slices where possible.
-func readCommand(conn *connState) ([][]byte, error) {
-	r := conn.r
-	line, err := readLine(r)
-	if err != nil {
-		return nil, err
+// trimCR drops a single trailing carriage return, leaving the line content.
+func trimCR(b []byte) []byte {
+	if n := len(b); n > 0 && b[n-1] == '\r' {
+		return b[:n-1]
 	}
-	if len(line) == 0 {
-		return nil, nil
-	}
-	if line[0] != '*' {
-		// Inline command: split on spaces. redis-benchmark does not use this, but
-		// redis-cli and a bare PING do.
-		return splitInline(line, conn), nil
-	}
-	n, ok := atoiBytes(line[1:])
-	if !ok || n < 0 {
-		return nil, errProtocol
-	}
-	// Copy each argument into the connection's reusable scratch buffer rather than
-	// allocating one slice per argument. The arg slices are rebuilt to point into
-	// scratch only after every argument is read, so a mid-command buffer grow does
-	// not leave an earlier arg pointing at stale storage. Steady state allocates
-	// nothing: scratch settles at the largest command seen and is reused.
-	conn.scratch = conn.scratch[:0]
-	if cap(conn.offs) < n {
-		conn.offs = make([]argSpan, n)
-	}
-	conn.offs = conn.offs[:n]
-	for i := 0; i < n; i++ {
-		hdr, err := readLine(r)
-		if err != nil {
-			return nil, err
-		}
-		if len(hdr) == 0 || hdr[0] != '$' {
-			return nil, errProtocol
-		}
-		blen, ok := atoiBytes(hdr[1:])
-		if !ok || blen < 0 {
-			return nil, errProtocol
-		}
-		off := len(conn.scratch)
-		need := off + blen
-		if cap(conn.scratch) < need {
-			ns := make([]byte, need, need*2)
-			copy(ns, conn.scratch)
-			conn.scratch = ns
-		}
-		conn.scratch = conn.scratch[:need]
-		if _, err := io.ReadFull(r, conn.scratch[off:need]); err != nil {
-			return nil, err
-		}
-		// Discard trailing CRLF.
-		if _, err := r.Discard(2); err != nil {
-			return nil, err
-		}
-		conn.offs[i] = argSpan{off: off, len: blen}
-	}
-	if cap(conn.args) < n {
-		conn.args = make([][]byte, n)
-	}
-	conn.args = conn.args[:n]
-	for i := 0; i < n; i++ {
-		conn.args[i] = conn.scratch[conn.offs[i].off : conn.offs[i].off+conn.offs[i].len]
-	}
-	return conn.args, nil
+	return b
 }
 
-// argSpan records where one argument lives inside connState.scratch, so the arg
-// slices can be rebuilt after the scratch buffer has finished growing.
-type argSpan struct{ off, len int }
+func splitInline(line []byte, conn *connState) [][]byte {
+	a := conn.args[:0]
+	start := -1
+	for i := 0; i < len(line); i++ {
+		if line[i] == ' ' {
+			if start >= 0 {
+				a = append(a, line[start:i])
+				start = -1
+			}
+		} else if start < 0 {
+			start = i
+		}
+	}
+	if start >= 0 {
+		a = append(a, line[start:])
+	}
+	conn.args = a
+	return a
+}
 
 // atoiBytes parses a non-negative decimal integer from b with no allocation.
 // ok is false on an empty slice or a non-digit byte.
@@ -244,140 +282,100 @@ func atoiBytes(b []byte) (int, bool) {
 	return n, true
 }
 
-// readLine reads through the next CRLF and returns the line without it.
-func readLine(r *bufio.Reader) ([]byte, error) {
-	line, err := r.ReadSlice('\n')
-	if err != nil {
-		return nil, err
-	}
-	n := len(line)
-	if n >= 2 && line[n-2] == '\r' {
-		return line[:n-2], nil
-	}
-	return line[:n-1], nil
-}
-
-func splitInline(line []byte, conn *connState) [][]byte {
-	conn.args = conn.args[:0]
-	start := -1
-	for i := 0; i < len(line); i++ {
-		if line[i] == ' ' {
-			if start >= 0 {
-				conn.args = append(conn.args, line[start:i])
-				start = -1
-			}
-		} else if start < 0 {
-			start = i
-		}
-	}
-	if start >= 0 {
-		conn.args = append(conn.args, line[start:])
-	}
-	return conn.args
-}
-
 var (
 	respOK       = []byte("+OK\r\n")
 	respPong     = []byte("+PONG\r\n")
 	respNil      = []byte("$-1\r\n")
 	respEmptyArr = []byte("*0\r\n")
-	respZero     = []byte(":0\r\n")
+	respInfo     = []byte("# Server\r\nredis_version:7.4.0\r\n")
 )
 
-func (s *Server) dispatch(w *bufio.Writer, args [][]byte) error {
+// dispatch runs one command and appends its reply to out, returning the grown
+// buffer. It switches on command length first so the GET/SET hot paths reach
+// their compare quickly.
+func (s *Server) dispatch(out []byte, args [][]byte) []byte {
 	cmd := args[0]
 	switch len(cmd) {
 	case 3:
 		if eqFold(cmd, "get") {
-			return s.cmdGet(w, args)
+			return s.cmdGet(out, args)
 		}
 		if eqFold(cmd, "set") {
-			return s.cmdSet(w, args)
+			return s.cmdSet(out, args)
 		}
 	case 4:
 		if eqFold(cmd, "ping") {
-			_, err := w.Write(respPong)
-			return err
+			return append(out, respPong...)
 		}
 		if eqFold(cmd, "info") {
-			return writeBulk(w, []byte("# Server\r\nredis_version:7.4.0\r\n"))
+			return appendBulk(out, respInfo)
 		}
 	case 6:
 		if eqFold(cmd, "config") {
-			_, err := w.Write(respEmptyArr)
-			return err
+			return append(out, respEmptyArr...)
 		}
 		if eqFold(cmd, "dbsize") {
-			return writeInt(w, int64(s.store.Len()))
+			return appendInt(out, int64(s.store.Len()))
 		}
 		if eqFold(cmd, "select") {
-			_, err := w.Write(respOK)
-			return err
+			return append(out, respOK...)
 		}
 	case 7:
 		if eqFold(cmd, "command") {
-			_, err := w.Write(respEmptyArr)
-			return err
+			return append(out, respEmptyArr...)
 		}
 	case 8:
 		if eqFold(cmd, "flushall") {
-			_, err := w.Write(respOK)
-			return err
+			return append(out, respOK...)
 		}
 	}
 	// Unknown command: a benign OK keeps redis-benchmark moving for anything we
 	// did not special-case.
-	_, err := w.Write(respOK)
-	return err
+	return append(out, respOK...)
 }
 
-func (s *Server) cmdGet(w *bufio.Writer, args [][]byte) error {
+func (s *Server) cmdGet(out []byte, args [][]byte) []byte {
 	if len(args) != 2 {
-		return writeErr(w, "wrong number of arguments for 'get'")
+		return appendErr(out, "wrong number of arguments for 'get'")
 	}
 	val, found, err := s.store.Get(args[1])
 	if err != nil {
-		return writeErr(w, err.Error())
+		return appendErr(out, err.Error())
 	}
 	if !found {
-		_, werr := w.Write(respNil)
-		return werr
+		return append(out, respNil...)
 	}
-	return writeBulk(w, val)
+	return appendBulk(out, val)
 }
 
-func (s *Server) cmdSet(w *bufio.Writer, args [][]byte) error {
+func (s *Server) cmdSet(out []byte, args [][]byte) []byte {
 	if len(args) < 3 {
-		return writeErr(w, "wrong number of arguments for 'set'")
+		return appendErr(out, "wrong number of arguments for 'set'")
 	}
 	if err := s.store.Set(args[1], args[2]); err != nil {
-		return writeErr(w, err.Error())
+		return appendErr(out, err.Error())
 	}
-	_, err := w.Write(respOK)
-	return err
+	return append(out, respOK...)
 }
 
-func writeBulk(w *bufio.Writer, b []byte) error {
-	w.WriteByte('$')
-	w.Write(strconv.AppendInt(w.AvailableBuffer(), int64(len(b)), 10))
-	w.WriteString("\r\n")
-	w.Write(b)
-	_, err := w.WriteString("\r\n")
-	return err
+func appendBulk(out, b []byte) []byte {
+	out = append(out, '$')
+	out = strconv.AppendInt(out, int64(len(b)), 10)
+	out = append(out, '\r', '\n')
+	out = append(out, b...)
+	return append(out, '\r', '\n')
 }
 
-func writeInt(w *bufio.Writer, n int64) error {
-	w.WriteByte(':')
-	w.Write(strconv.AppendInt(w.AvailableBuffer(), n, 10))
-	_, err := w.WriteString("\r\n")
-	return err
+func appendInt(out []byte, n int64) []byte {
+	out = append(out, ':')
+	out = strconv.AppendInt(out, n, 10)
+	return append(out, '\r', '\n')
 }
 
-func writeErr(w *bufio.Writer, msg string) error {
-	w.WriteString("-ERR ")
-	w.WriteString(msg)
-	_, err := w.WriteString("\r\n")
-	return err
+func appendErr(out []byte, msg string) []byte {
+	out = append(out, "-ERR "...)
+	out = append(out, msg...)
+	return append(out, '\r', '\n')
 }
 
 // eqFold reports whether cmd equals the ASCII lowercase want, case-insensitively.
@@ -397,5 +395,3 @@ func eqFold(cmd []byte, want string) bool {
 	}
 	return true
 }
-
-var _ = respZero
