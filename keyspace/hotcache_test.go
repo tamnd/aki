@@ -232,6 +232,50 @@ func TestValueCacheAdmissionDoorkeeper(t *testing.T) {
 	}
 }
 
+// TestGetUncachedReadsWithoutInitialProbe checks that GetUncached, the variant
+// handleGet calls after a viewHotGet cache miss, returns the same value as Get and
+// still warms the cache on the way out. It must not depend on the initial cache
+// probe Get does, because its caller already probed and missed: GetUncached skips
+// that probe and reads the write-behind overlay and the B-tree directly. We verify
+// it reads a B-tree-backed key correctly, warms the cache, and reflects an
+// overwrite, matching Get's contract.
+func TestGetUncachedReadsWithoutInitialProbe(t *testing.T) {
+	ks, _, _ := newKS(t)
+	db := mustDB(t, ks, 0)
+
+	if err := db.Set([]byte("k"), []byte("v1"), TypeString, EncRaw, -1); err != nil {
+		t.Fatal(err)
+	}
+	// Drop the entry Set warmed so the read goes through the B-tree, the path that
+	// exercises the skipped-probe code rather than a cache hit.
+	db.hc.Load().cinvalidate([]byte("k"))
+
+	// GetUncached must read the B-tree value without the initial cache probe.
+	b, _, found, err := db.GetUncached([]byte("k"))
+	if err != nil || !found || string(b) != "v1" {
+		t.Fatalf("GetUncached = %q found=%v err=%v want v1", b, found, err)
+	}
+	// Read-miss warming runs through the admission doorkeeper, so a one-hit-wonder
+	// is not cached on its first sighting. A second GetUncached crosses the
+	// doorkeeper and warms the cache, matching Get's gated read-miss contract.
+	b, _, found, err = db.GetUncached([]byte("k"))
+	if err != nil || !found || string(b) != "v1" {
+		t.Fatalf("GetUncached (2nd) = %q found=%v err=%v want v1", b, found, err)
+	}
+	if _, _, ok := db.hc.Load().cget([]byte("k")); !ok {
+		t.Fatal("GetUncached did not warm the cache after the doorkeeper admitted it")
+	}
+
+	// After an overwrite, GetUncached must return the new value, not the cached one.
+	if err := db.Set([]byte("k"), []byte("v2"), TypeString, EncRaw, -1); err != nil {
+		t.Fatal(err)
+	}
+	b, _, found, _ = db.GetUncached([]byte("k"))
+	if !found || string(b) != "v2" {
+		t.Fatalf("GetUncached after overwrite = %q want v2", b)
+	}
+}
+
 // TestHotCacheSwap checks that after SWAPDB the hot caches move with the
 // data, so a Get on db0 returns what was in db1 and vice versa.
 func TestHotCacheSwap(t *testing.T) {
