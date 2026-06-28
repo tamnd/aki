@@ -210,6 +210,34 @@ func routeIndex(m *meta, member []byte) int {
 	return lo - 1
 }
 
+// routeRaw routes member to a segment over the packed metadata bytes, with no
+// decode and no allocation, the read-path twin of routeIndex. It returns the
+// segment number that owns member (the last boundary whose first member is <=
+// member, or the first segment if member is below every boundary). The boundary
+// array is short and flat for the set sizes that matter, so a forward scan that
+// stops at the first boundary past member is cheaper than decoding the array into
+// a slice and binary-searching it on every read. raw must be a valid metadata row
+// (len >= 16 with at least one boundary), which a non-empty set always has.
+func routeRaw(raw, member []byte) uint32 {
+	nb := int(binary.BigEndian.Uint32(raw[12:]))
+	off := 16
+	// The first boundary is index 0, always a valid route (a member below every
+	// boundary still belongs to the first segment).
+	fl := int(binary.BigEndian.Uint32(raw[off:]))
+	owner := binary.BigEndian.Uint32(raw[off+4+fl:])
+	for range nb {
+		fl = int(binary.BigEndian.Uint32(raw[off:]))
+		first := raw[off+4 : off+4+fl]
+		segno := binary.BigEndian.Uint32(raw[off+4+fl:])
+		if bytes.Compare(first, member) > 0 {
+			break
+		}
+		owner = segno
+		off += 4 + fl + 4
+	}
+	return owner
+}
+
 // The segment hot path works on the packed segment bytes directly: an Add or a
 // SISMEMBER scans the entries in place and an Add splices one new entry into a
 // single fresh buffer. The earlier form decoded a segment into a slice of member
@@ -368,19 +396,24 @@ func (s *Set) Add(member []byte) (added bool, err error) {
 	return true, s.kv.Set(s.metaKey(), encodeMeta(m))
 }
 
-// IsMember reports whether member is in the set: route to one segment, scan it in
-// place. One point Get on the metadata row and one on the segment, no decode.
+// IsMember reports whether member is in the set: route to one segment over the
+// packed metadata bytes, then scan that segment in place. Neither the metadata
+// row nor the segment is decoded, so a read on a present-or-absent member
+// allocates nothing beyond the two row keys.
 func (s *Set) IsMember(member []byte) (bool, error) {
-	m, err := s.loadMeta()
-	if err != nil || m == nil || len(m.bounds) == 0 {
-		return false, err
-	}
-	bi := routeIndex(m, member)
-	raw, found, err := s.kv.Get(s.segKey(m.bounds[bi].segno))
+	raw, found, err := s.kv.Get(s.metaKey())
 	if err != nil || !found {
 		return false, err
 	}
-	_, _, present := segLocate(raw, member)
+	if binary.BigEndian.Uint32(raw[12:]) == 0 {
+		return false, nil
+	}
+	segno := routeRaw(raw, member)
+	seg, found, err := s.kv.Get(s.segKey(segno))
+	if err != nil || !found {
+		return false, err
+	}
+	_, _, present := segLocate(seg, member)
 	return present, nil
 }
 
