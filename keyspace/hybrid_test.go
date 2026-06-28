@@ -147,7 +147,7 @@ func TestHLLazyExpiryOnRead(t *testing.T) {
 	}
 	// Build a cell whose header TTL is one ms in the past and write it straight to
 	// the store, the state a key reaches when its TTL lapses after it was stored.
-	h := ValueHeader{Type: TypeString, Encoding: EncRaw, Flags: FlagInlineBody | FlagHasTTL, TTLms: nowMillis() - 1, Version: db.ks.version.Add(1), BodyLen: 1, RefCount: 1}
+	h := ValueHeader{Type: TypeString, Encoding: EncRaw, Flags: FlagInlineBody | FlagHasTTL, TTLms: nowMillis() - 1, Version: db.ks.NextVersionForKey([]byte("x")), BodyLen: 1, RefCount: 1}
 	cell := append(h.AppendTo(nil), 'v')
 	if err := s.Set([]byte("x"), cell); err != nil {
 		t.Fatalf("store.Set: %v", err)

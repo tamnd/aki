@@ -249,7 +249,7 @@ func (db *DB) hlCollStoreLocked(key []byte, w *CollWriter, typ, enc uint8, prev 
 		Encoding: enc,
 		Flags:    FlagInlineBody | FlagCollTree,
 		TTLms:    -1,
-		Version:  db.ks.version.Add(1),
+		Version:  db.ks.version.next(key),
 		BodyLen:  uint32(len(body)),
 		RefCount: 1,
 	}
@@ -304,7 +304,7 @@ func (db *DB) hlCollSetTTL(key []byte, ttlMs int64) (bool, error) {
 		h.Flags &^= FlagHasTTL
 		h.TTLms = -1
 	}
-	h.Version = db.ks.version.Add(1)
+	h.Version = db.ks.version.next(key)
 	cell := h.AppendTo(make([]byte, 0, HeaderSize+len(body)))
 	cell = append(cell, body...)
 	st := db.hl.Load().e
@@ -339,7 +339,7 @@ func (db *DB) hlCollCopyTo(srcKey []byte, dst *DB, dstKey []byte) (bool, error) 
 		Encoding: srcEnc,
 		Flags:    FlagInlineBody | FlagCollTree,
 		TTLms:    -1,
-		Version:  dst.ks.version.Add(1),
+		Version:  dst.ks.version.next(dstKey),
 		BodyLen:  uint32(len(bodyCopy)),
 		RefCount: 1,
 	}

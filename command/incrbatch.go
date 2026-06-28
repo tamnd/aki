@@ -124,7 +124,7 @@ func incrShardFn(e *Engine, ops []*deferredIncr) func(*keyspace.DB) error {
 			op.result = sum
 			op.res = incrResOK
 			body := strconv.AppendInt(buf[:0], sum, 10)
-			ver := e.ks.NextVersion()
+			ver := e.ks.NextVersionForKey(op.key)
 			if werr := db.SetWithVersion(op.key, body, keyspace.TypeString, keyspace.EncInt, keepTTL(hdr, found), ver); werr != nil {
 				op.res = incrResErr
 			}
