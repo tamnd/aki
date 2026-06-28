@@ -114,7 +114,7 @@ func (d *Dispatcher) fastGet(c *networking.Conn, sess *session, key []byte) bool
 	} else {
 		c.Enc().WriteNull()
 	}
-	d.statCall(d.getCmd, 0, false)
+	d.statCallFast(d.getCmd)
 	sess.lastCmd = "get"
 	return true
 }
@@ -129,7 +129,7 @@ func (d *Dispatcher) fastSet(c *networking.Conn, sess *session, key, val []byte)
 	}
 	d.persist.markDirty()
 	c.WriteRaw(resp.ReplyOK)
-	d.statCall(d.setCmd, 0, false)
+	d.statCallFast(d.setCmd)
 	sess.lastCmd = "set"
 	return true
 }
@@ -172,7 +172,7 @@ func (d *Dispatcher) fastIncr(c *networking.Conn, sess *session, key []byte, del
 	default:
 		d.persist.markDirty()
 		c.Enc().WriteInteger(result)
-		d.statCall(cmd, 0, false)
+		d.statCallFast(cmd)
 	}
 	return true
 }

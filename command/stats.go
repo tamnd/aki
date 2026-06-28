@@ -116,6 +116,26 @@ func (d *Dispatcher) statCall(cmd *CmdDesc, usec uint64, failed bool) {
 	}
 }
 
+// statCallFast records one successful command on the integrated fast path, which
+// does not time its commands. statCall there is always handed usec 0, so its
+// cs.usec.Add(0) and cs.hist.record(0) only ever add nothing and drop a bogus
+// zero-microsecond sample into the latency histogram, yet both are writes to a
+// single shared counter and a single shared histogram bucket that every core
+// hammers on every command. Under a saturating GET/SET load those two shared
+// cachelines are the per-command cost that stops the fast path scaling cleanly
+// across cores, so this records only the call count, the one figure the fast
+// path can report honestly, and leaves usec and the histogram to the timed slow
+// path. total_commands_processed and commandstats calls stay exact; the only
+// change is that fast-path commands no longer log a fabricated 0us latency, which
+// the latency histogram is better off without.
+func (d *Dispatcher) statCallFast(cmd *CmdDesc) {
+	cs := cmd.stat
+	if cs == nil {
+		cs = d.cmdStatFor(statName(cmd))
+	}
+	cs.calls.Add(1)
+}
+
 // statReject records one command rejected before it ran, by ACL, arity, the
 // read-only replica guard, or an out-of-memory refusal.
 func (d *Dispatcher) statReject(cmd *CmdDesc) {
