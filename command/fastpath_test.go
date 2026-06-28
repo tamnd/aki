@@ -3,18 +3,22 @@ package command
 import (
 	"bufio"
 	"net"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/tamnd/aki/hot"
 	"github.com/tamnd/aki/keyspace"
 	"github.com/tamnd/aki/pager"
 	"github.com/tamnd/aki/store"
 	"github.com/tamnd/aki/vfs"
 )
 
-// startHybrid brings up a server whose string point path always runs on the
-// hybrid-log store, so the integrated GET/SET fast path is exercised regardless of
-// the AKI_TEST_HYBRID env toggle the rest of the suite reads.
+// startHybrid brings up a server whose string point path always runs on a
+// resident hybrid-log engine, so the integrated GET/SET fast path is exercised
+// regardless of the AKI_TEST_HYBRID env toggle the rest of the suite reads. When
+// AKI_TEST_HYBRID=hot it runs the clean lock-free hot/ engine; otherwise it runs
+// the durable-spill store/ engine, so the fast path is covered on both.
 func startHybrid(t *testing.T) (*bufio.Reader, net.Conn) {
 	t.Helper()
 	fs := vfs.NewMem()
@@ -23,9 +27,13 @@ func startHybrid(t *testing.T) (*bufio.Reader, net.Conn) {
 		t.Fatalf("create pager: %v", err)
 	}
 	t.Cleanup(func() { _ = p.Close() })
-	ks, err := keyspace.Open(p, keyspace.WithHybridLog(store.Tunables{
+	opt := keyspace.WithHybridLog(store.Tunables{
 		Shards: 256, PageSize: 1 << 20, ResidentPagesPerShard: 0, Dir: "",
-	}))
+	})
+	if os.Getenv("AKI_TEST_HYBRID") == "hot" {
+		opt = keyspace.WithHotEngine(hot.Tunables{Shards: 256, IndexHintPerShard: 256})
+	}
+	ks, err := keyspace.Open(p, opt)
 	if err != nil {
 		t.Fatalf("open keyspace: %v", err)
 	}
