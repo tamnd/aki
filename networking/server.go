@@ -43,10 +43,13 @@ type Config struct {
 	// leaves the OS default and does not enable keepalive.
 	TCPKeepAlive time.Duration
 	// NetMode selects how TCP connections are serviced: "goroutine" (the default,
-	// one read-loop goroutine per connection) or "reactor" (a small set of epoll
-	// event loops, each servicing a shard of connections). "reactor" applies to
-	// TCP on Linux only; on any other platform, and for Unix-socket connections,
-	// the goroutine path is used regardless. An empty value means "goroutine".
+	// one read-loop goroutine per connection), "reactor" (a small set of epoll event
+	// loops, each servicing a shard of connections), or "uring" (the reactor with a
+	// per-loop io_uring that batches a turn's writes into one io_uring_enter; spec
+	// 2064 note 300). "reactor" and "uring" apply to TCP on Linux only; on any other
+	// platform, and for Unix-socket connections, the goroutine path is used
+	// regardless, and "uring" on a kernel without io_uring falls back to the plain
+	// reactor path. An empty value means "goroutine".
 	NetMode string
 }
 
@@ -228,8 +231,8 @@ func (s *Server) ListenAndServe(cfg Config) error {
 	// In reactor net mode, start the epoll event loops before accepting. On a
 	// platform that does not support it newReactor returns (nil, false) and TCP
 	// connections fall back to the goroutine path, so the server still starts.
-	if s.netMode == "reactor" {
-		if r, ok := newReactor(s); ok {
+	if s.netMode == "reactor" || s.netMode == "uring" {
+		if r, ok := newReactor(s, s.netMode == "uring"); ok {
 			s.mu.Lock()
 			s.reactor = r
 			s.mu.Unlock()
