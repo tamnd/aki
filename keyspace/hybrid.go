@@ -14,6 +14,7 @@ import (
 type hlEngine interface {
 	Set(key, value []byte) error
 	SetWithPrev(key, value []byte) (prevValLen int, err error)
+	SetWithPrev2(key, v0, v1 []byte) (prevValLen int, err error)
 	Get(key []byte) (value []byte, found bool, err error)
 	DeleteWithPrev(key []byte) (prevValLen int, ok bool, err error)
 	Each(fn func(key, value []byte) bool) error
