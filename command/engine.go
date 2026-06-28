@@ -1118,7 +1118,16 @@ func (e *Engine) hybridIncr(index int, key []byte, delta int64) (int64, hybridIn
 	if !ok {
 		return 0, hybridIncrOverflow, nil
 	}
-	body := strconv.AppendInt(nil, sum, 10)
+	// Format the new value into a stack buffer rather than strconv.AppendInt(nil,
+	// ...), which heap-allocates a fresh slice on every INCR. A base-10 int64 is at
+	// most 20 bytes (19 digits plus a sign), so bodyBuf always holds it. This is
+	// safe because the hybrid Set copies the body into the log record synchronously
+	// (keyspace hlSet), so it never retains this slice past the call; hybridIncr is
+	// only reached on the hybrid engine, so that copy-on-write invariant always
+	// holds here. Killing this alloc takes the INCR family from two allocations per
+	// op to one (the remaining one is the header+body cell, removed separately).
+	var bodyBuf [20]byte
+	body := strconv.AppendInt(bodyBuf[:0], sum, 10)
 	if err := db.Set(key, body, keyspace.TypeString, keyspace.EncInt, keepTTL(hdr, found)); err != nil {
 		return 0, hybridIncrOK, err
 	}
