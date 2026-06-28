@@ -10,12 +10,12 @@ import (
 // to the freelist, then zeroes the shard so the next write starts fresh. The
 // hot-value cache is cleared after all shards are flushed.
 func (db *DB) Flush() error {
-	if db.hlTun != nil {
+	if db.newHL != nil {
 		// In hybrid mode the keys live in the per-DB hybrid-log store, not the
 		// shard trees, so clearing the store is the whole flush. The hot cache is
 		// still dropped for parity with the B-tree path.
-		if s := db.hl.Load(); s != nil {
-			if err := s.Clear(); err != nil {
+		if b := db.hl.Load(); b != nil {
+			if err := b.e.Clear(); err != nil {
 				return err
 			}
 		}
@@ -113,7 +113,7 @@ func (ks *Keyspace) Swap(i, j int) error {
 	// already-fired hlOnce would never rebuild, and the next write would panic.
 	// Storing the pointers is atomic, so a concurrent point read on either DB sees
 	// a consistent store either side of the swap.
-	if a.hlTun != nil {
+	if a.newHL != nil {
 		if _, err := a.ensureHL(); err != nil {
 			return err
 		}

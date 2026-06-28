@@ -1,6 +1,38 @@
 package keyspace
 
-import "github.com/tamnd/aki/store"
+import (
+	"github.com/tamnd/aki/hot"
+	"github.com/tamnd/aki/store"
+)
+
+// hlEngine is the four-method (plus Len/Clear) seam the keyspace string point path
+// depends on. The keyspace holds the engine as this interface rather than a
+// concrete type, so either substrate plugs in: the durable-spill store/ engine
+// (WithHybridLog) or the clean lock-free hot/ engine (WithHotEngine). Both already
+// implement every method with the exact signatures below, so the keyspace code
+// above this seam is identical on either engine.
+type hlEngine interface {
+	Set(key, value []byte) error
+	SetWithPrev(key, value []byte) (prevValLen int, err error)
+	Get(key []byte) (value []byte, found bool, err error)
+	DeleteWithPrev(key []byte) (prevValLen int, ok bool, err error)
+	Each(fn func(key, value []byte) bool) error
+	Clear() error
+	Len() int
+}
+
+// Compile-time proof that both engines satisfy the seam. If a method signature
+// drifts on either side, this fails to build instead of at the call site.
+var (
+	_ hlEngine = (*store.Store)(nil)
+	_ hlEngine = (*hot.Store)(nil)
+)
+
+// hlBox wraps the engine interface so it can live in an atomic.Pointer, which
+// needs a concrete element type. The keyspace swaps the box pointer atomically on
+// SwapDB and lazy build, so a concurrent point read always loads a consistent
+// engine either side of the swap.
+type hlBox struct{ e hlEngine }
 
 // hybrid.go is the in-place engine swap, slice S1 (spec 2064 rewrite). When a
 // database is opened WithHybridLog its string point path (Set/Get/Delete) runs
@@ -32,23 +64,23 @@ func (ks *Keyspace) HybridLog() bool { return ks.hybrid }
 // store is created lazily so an idle database in a 16-database keyspace does not
 // allocate 256 resident tail pages up front. hlOnce makes the build race-free;
 // the atomic pointer lets readers load it without a lock.
-func (db *DB) ensureHL() (*store.Store, error) {
-	if s := db.hl.Load(); s != nil {
-		return s, nil
+func (db *DB) ensureHL() (hlEngine, error) {
+	if b := db.hl.Load(); b != nil {
+		return b.e, nil
 	}
 	var buildErr error
 	db.hlOnce.Do(func() {
-		s, err := store.New(*db.hlTun)
+		e, err := db.newHL()
 		if err != nil {
 			buildErr = err
 			return
 		}
-		db.hl.Store(s)
+		db.hl.Store(&hlBox{e: e})
 	})
 	if buildErr != nil {
 		return nil, buildErr
 	}
-	return db.hl.Load(), nil
+	return db.hl.Load().e, nil
 }
 
 // hlSet stores body under key with its ValueHeader on the hybrid log. It mirrors
@@ -117,13 +149,13 @@ func (db *DB) hlAccountStore(key []byte, bodyLen, prevValLen int) {
 // The body is the cell past the header; the store returns a slice the caller reads
 // before issuing the next command, the same lifetime contract the B-tree cell had.
 func (db *DB) hlGet(key []byte) (body []byte, hdr ValueHeader, found bool, err error) {
-	s := db.hl.Load()
-	if s == nil {
+	b := db.hl.Load()
+	if b == nil {
 		// No write has happened yet, so the store is not built and the key cannot
 		// exist. Avoid building it on a pure-read workload.
 		return nil, ValueHeader{}, false, nil
 	}
-	cell, ok, err := s.Get(key)
+	cell, ok, err := b.e.Get(key)
 	if err != nil || !ok {
 		return nil, ValueHeader{}, false, err
 	}
@@ -148,13 +180,13 @@ func (db *DB) hlGet(key []byte) (body []byte, hdr ValueHeader, found bool, err e
 // An expired key is skipped but not deleted here, matching the B-tree forEachLive,
 // which leaves lazy expiry to the read path rather than mutating mid-iteration.
 func (db *DB) hlForEachLive(fn func(ck []byte, h ValueHeader) error) error {
-	s := db.hl.Load()
-	if s == nil {
+	b := db.hl.Load()
+	if b == nil {
 		return nil
 	}
 	var ck []byte
 	var fnErr error
-	walkErr := s.Each(func(key, cell []byte) bool {
+	walkErr := b.e.Each(func(key, cell []byte) bool {
 		h, _, ok := parseHeader(cell)
 		if !ok || db.expired(h) {
 			return true
@@ -177,11 +209,11 @@ func (db *DB) hlForEachLive(fn func(ck []byte, h ValueHeader) error) error {
 // bookkeeping, mirroring the btree delete path, using the removed record's value
 // length that DeleteWithPrev surfaces at no extra probe.
 func (db *DB) hlDelete(key []byte) (bool, error) {
-	s := db.hl.Load()
-	if s == nil {
+	b := db.hl.Load()
+	if b == nil {
 		return false, nil
 	}
-	prevValLen, ok, err := s.DeleteWithPrev(key)
+	prevValLen, ok, err := b.e.DeleteWithPrev(key)
 	if err != nil || !ok {
 		return ok, err
 	}

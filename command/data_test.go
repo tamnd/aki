@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/tamnd/aki/hot"
 	"github.com/tamnd/aki/keyspace"
 	"github.com/tamnd/aki/pager"
 	"github.com/tamnd/aki/store"
@@ -13,16 +14,24 @@ import (
 )
 
 // hybridTestOpts returns the keyspace options the command tests open with. When
-// AKI_TEST_HYBRID is set, it routes the string point path through the v2
+// AKI_TEST_HYBRID is set, it routes the string point path through a resident
 // hybrid-log engine so the existing command suite doubles as the compat run on
-// the gated engine. Off by default so the normal suite still exercises B-tree.
+// the gated engine. AKI_TEST_HYBRID=hot picks the clean lock-free hot/ engine;
+// any other non-empty value keeps the durable-spill store/ engine. Off by default
+// so the normal suite still exercises the B-tree.
 func hybridTestOpts() []keyspace.Option {
-	if os.Getenv("AKI_TEST_HYBRID") == "" {
+	switch os.Getenv("AKI_TEST_HYBRID") {
+	case "":
 		return nil
+	case "hot":
+		return []keyspace.Option{keyspace.WithHotEngine(hot.Tunables{
+			Shards: 256, IndexHintPerShard: 256,
+		})}
+	default:
+		return []keyspace.Option{keyspace.WithHybridLog(store.Tunables{
+			Shards: 256, PageSize: 1 << 20, ResidentPagesPerShard: 0, Dir: "",
+		})}
 	}
-	return []keyspace.Option{keyspace.WithHybridLog(store.Tunables{
-		Shards: 256, PageSize: 1 << 20, ResidentPagesPerShard: 0, Dir: "",
-	})}
 }
 
 // startData brings up a server backed by an in-memory keyspace so the data
