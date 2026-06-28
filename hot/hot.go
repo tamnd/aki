@@ -197,6 +197,19 @@ func (s *Store) SetWithPrev(key, value []byte) (prevValLen int, err error) {
 	return s.shardFor(h).set(key, value, h), nil
 }
 
+// SetWithPrev2 is SetWithPrev for a value supplied as two segments stored back to
+// back (value = v0 followed by v1). The store engine writes the two segments
+// straight into its log page without joining them, which is where the seam earns
+// its keep; the hot store holds each value in one contiguous entry, so it joins the
+// segments first. The method exists on both engines so either satisfies hlEngine.
+func (s *Store) SetWithPrev2(key, v0, v1 []byte) (prevValLen int, err error) {
+	buf := make([]byte, len(v0)+len(v1))
+	copy(buf, v0)
+	copy(buf[len(v0):], v1)
+	h := hash64(key)
+	return s.shardFor(h).set(key, buf, h), nil
+}
+
 // Get returns the value stored under key. found is false if the key is absent.
 // The returned slice aliases the immutable entry and must not be mutated by the
 // caller; it stays valid even if the key is later overwritten or deleted, because
