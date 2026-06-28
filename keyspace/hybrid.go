@@ -103,7 +103,7 @@ func (db *DB) hlSet(key, body []byte, typ, enc uint8, ttlMs int64) error {
 		Encoding: enc,
 		Flags:    FlagInlineBody,
 		TTLms:    -1,
-		Version:  db.ks.version.Add(1),
+		Version:  db.ks.version.next(key),
 		BodyLen:  uint32(len(body)),
 		RefCount: 1,
 	}

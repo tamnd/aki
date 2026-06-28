@@ -1264,7 +1264,7 @@ func (e *Engine) filePath() string {
 // most keyspace.MaxInlineBody; the caller must verify this before calling.
 //
 // This function does not take the engine lock: ks.DB() reads an immutable
-// slice, NextVersion() is an atomic increment, and PrepareWriteBehind uses its
+// slice, NextVersionForKey() is a per-key atomic increment, and PrepareWriteBehind uses its
 // own per-shard mutexes. The async B-tree write is queued with sendSetAsync,
 // which stores the arguments directly in a pooled writeReq (no closure
 // allocation) and routes the request to the shard-owned channel.
@@ -1282,7 +1282,7 @@ func (ctx *Ctx) updateWriteBehind(key, body []byte, typ, enc uint8, ttlMs int64)
 		ctx.enc().WriteError("ERR " + dbErr.Error())
 		return false
 	}
-	version := e.ks.NextVersion()
+	version := e.ks.NextVersionForKey(key)
 	hdr := keyspace.ValueHeader{
 		Type:     typ,
 		Encoding: enc,
@@ -1440,7 +1440,7 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 		// the staged-SET path. The key copy outlives this command, so it must not
 		// alias the connection read buffer.
 		keyCopy := append([]byte(nil), key...)
-		version := e.ks.NextVersion()
+		version := e.ks.NextVersionForKey(keyCopy)
 		db.PrepareDeleteBehind(keyCopy, version)
 		e.rmwLocks[stripe].Unlock()
 		if asyncErr := e.sendDeleteAsync(index, shard, keyCopy, version); asyncErr != nil {
@@ -1459,7 +1459,7 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 	// body is already a fresh allocation. Only this path allocates; the error and
 	// no-write paths above do not.
 	keyCopy := append([]byte(nil), key...)
-	version := e.ks.NextVersion()
+	version := e.ks.NextVersionForKey(keyCopy)
 	// A body over MaxInlineBody rides the overflow chain in the B-tree, so the
 	// staged header must not claim FlagInlineBody for it. The staged copy in the
 	// hot cache and wbPending always carries the full body and the read paths
