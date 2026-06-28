@@ -219,23 +219,54 @@ func routeIndex(m *meta, member []byte) int {
 // a slice and binary-searching it on every read. raw must be a valid metadata row
 // (len >= 16 with at least one boundary), which a non-empty set always has.
 func routeRaw(raw, member []byte) uint32 {
+	_, segno := routeRawIdx(raw, member)
+	return segno
+}
+
+// routeRawIdx is routeRaw plus the byte offset of the owning boundary in raw, so
+// a writer can splice that boundary's first member in place without decoding the
+// array. boff points at the boundary's leading length field.
+func routeRawIdx(raw, member []byte) (boff int, segno uint32) {
 	nb := int(binary.BigEndian.Uint32(raw[12:]))
 	off := 16
 	// The first boundary is index 0, always a valid route (a member below every
 	// boundary still belongs to the first segment).
 	fl := int(binary.BigEndian.Uint32(raw[off:]))
-	owner := binary.BigEndian.Uint32(raw[off+4+fl:])
+	boff = off
+	segno = binary.BigEndian.Uint32(raw[off+4+fl:])
 	for range nb {
 		fl = int(binary.BigEndian.Uint32(raw[off:]))
 		first := raw[off+4 : off+4+fl]
-		segno := binary.BigEndian.Uint32(raw[off+4+fl:])
 		if bytes.Compare(first, member) > 0 {
 			break
 		}
-		owner = segno
+		boff = off
+		segno = binary.BigEndian.Uint32(raw[off+4+fl:])
 		off += 4 + fl + 4
 	}
-	return owner
+	return boff, segno
+}
+
+// metaBumpCount adds delta to the cardinality stored in the first eight bytes of a
+// packed metadata row, in place. raw is an engine-owned copy, so the mutation is
+// free of allocation.
+func metaBumpCount(raw []byte, delta int64) {
+	binary.BigEndian.PutUint64(raw, uint64(int64(binary.BigEndian.Uint64(raw))+delta))
+}
+
+// metaSpliceFirst returns a metadata row with the first member of the boundary at
+// byte offset boff replaced by member, the rest of the row unchanged. It is used
+// when an insert or delete changes a segment's smallest member. One allocation,
+// the same shape as segInsert.
+func metaSpliceFirst(raw []byte, boff int, member []byte) []byte {
+	oldFl := int(binary.BigEndian.Uint32(raw[boff:]))
+	tail := boff + 4 + oldFl // start of the boundary's segno
+	out := make([]byte, len(raw)-oldFl+len(member))
+	copy(out, raw[:boff])
+	binary.BigEndian.PutUint32(out[boff:], uint32(len(member)))
+	copy(out[boff+4:], member)
+	copy(out[boff+4+len(member):], raw[tail:])
+	return out
 }
 
 // The segment hot path works on the packed segment bytes directly: an Add or a
@@ -333,21 +364,20 @@ func newSeg(member []byte) []byte {
 // present). It rewrites at most one segment, and splits that segment when it
 // overflows segCap, which is the only time the metadata boundary array changes.
 func (s *Set) Add(member []byte) (added bool, err error) {
-	m, err := s.loadMeta()
+	rawMeta, found, err := s.kv.Get(s.metaKey())
 	if err != nil {
 		return false, err
 	}
-	if m == nil {
+	if !found {
 		// First member: one segment holding it, one boundary.
-		m = &meta{count: 1, nextSeg: 1, bounds: []boundary{{first: append([]byte(nil), member...), segno: 0}}}
+		m := &meta{count: 1, nextSeg: 1, bounds: []boundary{{first: member, segno: 0}}}
 		if err := s.kv.Set(s.segKey(0), newSeg(member)); err != nil {
 			return false, err
 		}
 		return true, s.kv.Set(s.metaKey(), encodeMeta(m))
 	}
 
-	bi := routeIndex(m, member)
-	segno := m.bounds[bi].segno
+	boff, segno := routeRawIdx(rawMeta, member)
 	raw, found, err := s.kv.Get(s.segKey(segno))
 	if err != nil {
 		return false, err
@@ -365,16 +395,26 @@ func (s *Set) Add(member []byte) (added bool, err error) {
 		if err := s.kv.Set(s.segKey(segno), seg); err != nil {
 			return false, err
 		}
-		// The smallest member of the segment may have changed (insert at the head).
+		// The common path mutates only the count, in place over the engine-owned
+		// metadata bytes, no decode and no re-encode. A head insert also lowers the
+		// segment's smallest member, which is its routing boundary, so that one
+		// boundary is spliced (one allocation, still no full re-encode).
+		metaBumpCount(rawMeta, 1)
 		if off == 4 {
-			m.bounds[bi].first = append([]byte(nil), member...)
+			rawMeta = metaSpliceFirst(rawMeta, boff, member)
 		}
-		m.count++
-		return true, s.kv.Set(s.metaKey(), encodeMeta(m))
+		return true, s.kv.Set(s.metaKey(), rawMeta)
 	}
 
-	// Overflow: split the segment in half. The lower half keeps segno; the upper
-	// half gets a fresh segno so its key is stable and never aliases an old one.
+	// Overflow: split the segment in half. The boundary array grows by one, which
+	// is the rare case that decodes the metadata row and re-encodes it; the cost is
+	// amortized over a full segment of cheap in-place inserts. The lower half keeps
+	// segno; the upper half gets a fresh segno so its key never aliases an old one.
+	m, err := decodeMeta(rawMeta)
+	if err != nil {
+		return false, err
+	}
+	bi := routeIndex(m, member)
 	lower, upper := segSplit(seg)
 	newSegno := m.nextSeg
 	m.nextSeg++
