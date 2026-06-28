@@ -37,11 +37,12 @@ func (s *Store) Each(fn func(key, value []byte) bool) error {
 func (sh *shard) each(fn func(key, value []byte) bool) (cont bool, err error) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
-	for _, e := range sh.slots {
-		if e == 0 {
+	v := sh.view.Load()
+	for _, e := range v.slots {
+		if e == 0 || e == tombstone {
 			continue
 		}
-		key, val, derefErr := sh.recordKV(entryAddr(e))
+		key, val, derefErr := sh.recordKV(v, entryAddr(e))
 		if derefErr != nil {
 			return false, derefErr
 		}
@@ -57,10 +58,10 @@ func (sh *shard) each(fn func(key, value []byte) bool) (cont bool, err error) {
 // it reads the record off disk into fresh buffers. Caller holds at least the
 // shard read lock. It mirrors recordKeyAny but also recovers the value, which
 // enumeration needs and a key-only tag compare does not.
-func (sh *shard) recordKV(addr uint64) (key, value []byte, err error) {
+func (sh *shard) recordKV(v *view, addr uint64) (key, value []byte, err error) {
 	pid := int64(addr) >> sh.pageShift
 	off := int(int64(addr) & sh.pageMask)
-	if page := sh.pages[pid]; page != nil {
+	if page := v.pages[pid]; page != nil {
 		klen := int(binary.LittleEndian.Uint32(page[off:]))
 		vlen := int(binary.LittleEndian.Uint32(page[off+4:]))
 		kstart := off + recHdr
@@ -103,18 +104,22 @@ func (s *Store) Clear() error {
 func (sh *shard) clear() error {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	// Empty the index in place. Reusing the existing slots slice keeps the table
-	// at its grown size, which is the right call for a FLUSH that will be refilled.
-	for i := range sh.slots {
-		sh.slots[i] = 0
+	v := sh.view.Load()
+	// Publish a fresh empty view: a zeroed index of the same size (keeping the
+	// grown capacity for a FLUSH that will be refilled) and a single empty resident
+	// page with the first recHdr bytes reserved so address 0 stays the unambiguous
+	// empty marker. A new slots array, not an in-place wipe, so any lock-free reader
+	// still walking the old view sees a consistent snapshot.
+	nv := &view{
+		slots: make([]uint64, len(v.slots)),
+		mask:  v.mask,
+		pages: [][]byte{make([]byte, sh.pageSize)},
 	}
+	sh.view.Store(nv)
 	sh.icount = 0
-	// Reset the log to page 0, empty, the first recHdr bytes reserved so address 0
-	// stays the unambiguous empty marker.
-	sh.pages = sh.pages[:0]
+	sh.tombs = 0
 	sh.diskOff = sh.diskOff[:0]
 	sh.residentOrder = sh.residentOrder[:0]
-	sh.pages = append(sh.pages, make([]byte, sh.pageSize))
 	sh.diskOff = append(sh.diskOff, 0)
 	sh.residentOrder = append(sh.residentOrder, 0)
 	sh.tailPage = 0
