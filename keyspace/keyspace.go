@@ -94,9 +94,10 @@ type Keyspace struct {
 
 	// dataBytes is the running estimate of live key and value bytes, the figure
 	// INFO reports as used_memory and the maxmemory eviction loop compares against
-	// the limit. Set and Delete keep it current via atomic Add so concurrent shard
-	// writers can update it without holding the global write lock.
-	dataBytes atomic.Int64
+	// the limit. Set and Delete keep it current via Add so concurrent shard writers
+	// can update it without holding the global write lock. It is striped per-P so
+	// those writers do not serialise on one cache line; Load sums the stripes.
+	dataBytes stripedInt64
 
 	// lfuLogFactor and lfuDecayTime back the lfu-log-factor and lfu-decay-time
 	// config knobs. Open seeds them with the Redis defaults; the command layer
