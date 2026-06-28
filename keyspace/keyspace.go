@@ -71,7 +71,7 @@ type Keyspace struct {
 	catRoot uint32 // catalog page number, NullPage until first persisted
 	sysRoot uint32 // system table B-tree root, NullPage until first SystemPut
 	sysTree *btree.Tree
-	version atomic.Uint64 // monotonic write version; use NextVersion to advance
+	version versionCounter // per-key monotonic write version; use NextVersionForKey
 
 	// hashOverlay gates the in-memory hash write overlay. The command layer sets it
 	// through SetHashOverlay after weighing the commit policy; the keyspace hot path
@@ -379,10 +379,13 @@ func Open(pgr *pager.Pager, opts ...Option) (*Keyspace, error) {
 }
 
 // NextVersion atomically increments the keyspace write counter and returns the
-// new version. The write-behind path calls this under the engine read lock to
-// assign a stable version before the B-tree write is queued, so WATCH and the
-// hot-value cache always see a consistent, monotonically increasing value.
-func (ks *Keyspace) NextVersion() uint64 { return ks.version.Add(1) }
+// new version for key. The write-behind path calls this under the engine read
+// lock to assign a stable version before the B-tree write is queued, so WATCH and
+// the hot-value cache always see a version that increases monotonically for the
+// key. The counter is striped by key (see version.go), so the sequence is per key,
+// not global; every keyspace comparison is between two headers of the same key, so
+// per-key monotonicity is all the correctness the version needs.
+func (ks *Keyspace) NextVersionForKey(key []byte) uint64 { return ks.version.next(key) }
 
 // PagerStats returns the underlying pager's counters for the file-growth INFO
 // fields. It is a passthrough so the command layer does not reach into the pager.
@@ -556,7 +559,7 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 	if preVersion > 0 {
 		version = preVersion
 	} else {
-		version = db.ks.version.Add(1)
+		version = db.ks.version.next(key)
 	}
 	h := ValueHeader{
 		Type:     typ,

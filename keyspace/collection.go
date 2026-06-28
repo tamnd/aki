@@ -505,7 +505,7 @@ func (db *DB) collWriteMetaLocked(s int, t *btree.Tree, ck, key []byte, w *CollW
 		Encoding: enc,
 		Flags:    FlagInlineBody | FlagCollTree,
 		TTLms:    -1,
-		Version:  db.ks.version.Add(1),
+		Version:  db.ks.version.next(key),
 		BodyRef:  uint64(w.tree.Root()),
 		BodyLen:  uint32(len(body)),
 		RefCount: 1,
@@ -660,7 +660,7 @@ func (db *DB) CollSetTTL(key []byte, ttlMs int64) (ok bool, err error) {
 		h.Flags &^= FlagHasTTL
 		h.TTLms = -1
 	}
-	h.Version = db.ks.version.Add(1)
+	h.Version = db.ks.version.next(key)
 	cell := h.AppendTo(make([]byte, 0, HeaderSize+len(body)))
 	cell = append(cell, body...)
 	if _, err := t.Upsert(ck, cell); err != nil {
@@ -812,7 +812,7 @@ func (db *DB) CollCopyTo(srcKey []byte, dst *DB, dstKey []byte) (ok bool, err er
 		Encoding: srcEnc,
 		Flags:    FlagInlineBody | FlagCollTree,
 		TTLms:    -1,
-		Version:  dst.ks.version.Add(1),
+		Version:  dst.ks.version.next(dstKey),
 		BodyRef:  uint64(nt.Root()),
 		BodyLen:  uint32(len(metaBody)),
 		RefCount: 1,
