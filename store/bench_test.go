@@ -103,6 +103,57 @@ func BenchmarkMixed95Get5Set(b *testing.B) {
 	_ = setCount
 }
 
+// BenchmarkSetWithPrev and BenchmarkSetWithPrev2 measure the two value-write
+// shapes the keyspace layer can choose between. SetWithPrev takes one joined value
+// (the caller must concatenate header and body into a cell first); SetWithPrev2
+// takes the two segments and lays them into the page back to back, so the caller
+// skips the cell allocation and the copy that fills it. Both write the same bytes,
+// so the difference is exactly the cost the keyspace SET path avoids by handing the
+// header and body over unjoined. The split mirrors a real record: a 40-byte header
+// segment and a 64-byte body segment.
+func BenchmarkSetWithPrev(b *testing.B) {
+	s := benchStore(b, DefaultTunables())
+	keys := preload(b, s)
+	hdr := make([]byte, 40)
+	body := make([]byte, benchValLen)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var x uint32 = 2246822519
+		cell := make([]byte, 0, len(hdr)+len(body))
+		for pb.Next() {
+			x ^= x << 13
+			x ^= x >> 17
+			x ^= x << 5
+			cell = append(cell[:0], hdr...)
+			cell = append(cell, body...)
+			if _, err := s.SetWithPrev(keys[x%benchKeys], cell); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkSetWithPrev2(b *testing.B) {
+	s := benchStore(b, DefaultTunables())
+	keys := preload(b, s)
+	hdr := make([]byte, 40)
+	body := make([]byte, benchValLen)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var x uint32 = 2246822519
+		for pb.Next() {
+			x ^= x << 13
+			x ^= x >> 17
+			x ^= x << 5
+			if _, err := s.SetWithPrev2(keys[x%benchKeys], hdr, body); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 // BenchmarkGetSpilled measures the GET path when the resident budget is a
 // fraction of the working set, so most reads hit disk. It is the larger-than-
 // memory counterpart to BenchmarkGet and shows the cold-read floor.

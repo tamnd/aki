@@ -164,7 +164,7 @@ const shardShift = 40
 // Set stores value under key, replacing any previous value. The value bytes are
 // copied into the log, so the caller may reuse the slice after Set returns.
 func (s *Store) Set(key, value []byte) error {
-	_, err := s.shardFor(key).set(key, value)
+	_, err := s.shardFor(key).set(key, value, nil)
 	return err
 }
 
@@ -172,7 +172,15 @@ func (s *Store) Set(key, value []byte) error {
 // key is new. The keyspace layer uses the delta to keep used_memory exact across an
 // overwrite without a read-before-write that would cost a second index probe.
 func (s *Store) SetWithPrev(key, value []byte) (prevValLen int, err error) {
-	return s.shardFor(key).set(key, value)
+	return s.shardFor(key).set(key, value, nil)
+}
+
+// SetWithPrev2 is SetWithPrev for a value supplied as two segments stored back to
+// back (value = v0 followed by v1). The keyspace layer uses it to write a record's
+// header and body straight into the log page without first concatenating them into
+// one cell buffer, which removes a per-write allocation and the copy that fills it.
+func (s *Store) SetWithPrev2(key, v0, v1 []byte) (prevValLen int, err error) {
+	return s.shardFor(key).set(key, v0, v1)
 }
 
 // Get returns a copy of the value stored under key. found is false if the key is
@@ -382,8 +390,15 @@ func recordLen(key, value []byte) int { return recHdr + len(key) + len(value) }
 // set appends the record and repoints the index, returning the displaced record's
 // value length (-1 when the key is new). The plain Store.Set discards it; the
 // tracked Store.SetWithPrev surfaces it for used_memory accounting.
-func (sh *shard) set(key, value []byte) (prevValLen int, err error) {
-	rl := recordLen(key, value)
+//
+// The value may be supplied as two segments, val0 then val1, stored back to back
+// as one logical value. The keyspace layer uses this to lay a record's header and
+// body straight into the page without first joining them into a single cell, which
+// removes a per-write allocation and the copy that would fill it. A nil val1 is the
+// single-segment case.
+func (sh *shard) set(key, val0, val1 []byte) (prevValLen int, err error) {
+	valLen := len(val0) + len(val1)
+	rl := recHdr + len(key) + valLen
 	if rl > sh.pageSize {
 		return -1, errors.New("store: record larger than page size")
 	}
@@ -413,9 +428,11 @@ func (sh *shard) set(key, value []byte) (prevValLen int, err error) {
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
 	off := sh.tailPos
 	binary.LittleEndian.PutUint32(page[off:], uint32(len(key)))
-	binary.LittleEndian.PutUint32(page[off+4:], uint32(len(value)))
-	copy(page[off+recHdr:], key)
-	copy(page[off+recHdr+len(key):], value)
+	binary.LittleEndian.PutUint32(page[off+4:], uint32(valLen))
+	n := off + recHdr
+	n += copy(page[n:], key)
+	n += copy(page[n:], val0)
+	copy(page[n:], val1)
 	sh.tailPos += rl
 	return sh.indexPut(key, uint64(recStart)), nil
 }
