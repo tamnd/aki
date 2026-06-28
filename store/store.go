@@ -35,9 +35,26 @@
 //     points the index at it. When the tail page fills, it is sealed and a fresh
 //     page begins; when the resident budget is exceeded, the oldest page spills.
 //
-// This is the read path Valkey has (one probe to the value) without giving up the
-// larger-than-memory guarantee the durable B-tree gave aki: only the resident
-// page budget's worth of values, plus the small key index, has to fit in RAM.
+// Concurrency. The read path in full-resident mode (no spill) is lock-free: the
+// index table and page directory live behind a single atomic.Pointer to an
+// immutable view, so a GET loads the view once, reads the 8-byte index entry with
+// an atomic load, and dereferences the resident page with no mutex at all. This
+// is the rewrite/01 Slice-1 decision, confirmed by the /tmp/locktax microbenchmark
+// on the target box: a 256-shard atomic-load read runs 402 Mops/s against 151 for
+// the same shards behind an RWMutex.RLock, 2.66x, because an RWMutex's reader
+// counter is itself a contended atomic that stops scaling a few cores in. Writers
+// still serialize on the per-shard lock and publish each new record by storing its
+// index entry with an atomic store after the record bytes are written, so a
+// lock-free reader that observes the entry also observes a fully written record.
+// Deletes in this mode write a tombstone (an atomic store) rather than the
+// backward-shift compaction the locked path uses, because backshift reorders the
+// probe chain and a lock-free reader walking it could miss a live key; tombstones
+// are reclaimed by an in-place rehash when they crowd the table.
+//
+// When a resident page budget is set and a log file is open (the larger-than-
+// memory spill mode), a page can be pulled out from under a reader by eviction, so
+// that mode keeps the per-shard RWMutex on the read path: correctness over peak
+// throughput on the cold tier, full speed on the hot tier.
 package store
 
 import (
@@ -46,6 +63,7 @@ import (
 	"math/bits"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 // Tunables holds the knobs that shape a Store. The zero value is not valid; use
@@ -210,7 +228,7 @@ func (s *Store) IndexBytes() int {
 	n := 0
 	for _, sh := range s.shards {
 		sh.mu.RLock()
-		n += len(sh.slots) * 8
+		n += len(sh.view.Load().slots) * 8
 		sh.mu.RUnlock()
 	}
 	return n
@@ -220,17 +238,19 @@ func (s *Store) IndexBytes() int {
 //
 //	bits  0..47  log address (48 bits): byte offset of the RECORD START.
 //	bits 48..62  tag (15 bits): a high slice of the key hash, forced nonzero.
-//	bit     63   reserved for the latch-free insert; unused here.
+//	bit     63   set marks a tombstone (a deleted slot that the lock-free probe
+//	             walks past without stopping); never set on a live entry.
 //
 // A word of 0 means an empty slot. To keep 0 unambiguous as the empty marker,
 // each shard's log reserves its first recHdr bytes, so a real record start is
 // always >= recHdr > 0.
 const (
-	addrBits = 48
-	addrMask = (uint64(1) << addrBits) - 1
-	tagShift = addrBits
-	tagBits  = 15
-	tagMask  = (uint64(1) << tagBits) - 1
+	addrBits  = 48
+	addrMask  = (uint64(1) << addrBits) - 1
+	tagShift  = addrBits
+	tagBits   = 15
+	tagMask   = (uint64(1) << tagBits) - 1
+	tombstone = uint64(1) << 63
 )
 
 func makeEntry(tag uint16, addr uint64) uint64 {
@@ -251,25 +271,32 @@ func tagOf(h uint64) uint16 {
 	return t
 }
 
-// shard is one index+log partition. Everything on it is guarded by mu.
+// view is the immutable read snapshot of a shard's index and resident page
+// directory. The writer never mutates a published view's structure: a grow swaps
+// in a fresh slots array, a page roll swaps in a fresh pages directory, and both
+// publish a new *view with an atomic store. A live index entry inside slots is
+// updated with an atomic store in place, which is safe because the array identity
+// does not change for an in-place put. A lock-free reader loads the *view once and
+// then sees a consistent (slots, mask, pages) triple for the whole probe.
+type view struct {
+	slots []uint64
+	mask  uint64
+	pages [][]byte
+}
+
+// shard is one index+log partition. The published view (slots + resident page
+// directory) is read lock-free in full-resident mode; everything else, and every
+// write, is guarded by mu.
 type shard struct {
 	mu sync.RWMutex
 
-	// The open-addressed index: a flat []uint64 of 8-byte entries, pointer-free
-	// so the GC marks it in O(1). slots is a power-of-two length; islotsMask is
-	// len(slots)-1; icount is the live key count. An entry's address points at a
-	// record START in the page log; the key is confirmed by dereferencing the
-	// record, never stored in the table.
-	slots      []uint64
-	islotsMask uint64
-	icount     int
-	maxLoad    float64
+	view atomic.Pointer[view]
 
-	// pages holds the log pages indexed by pageID, which is dense and monotonic, so
-	// a slice beats a map and keeps GET to a single hash probe (the index lookup).
-	// An evicted (spilled) page is nil here and its file offset lives in diskOff at
-	// the same index.
-	pages   [][]byte
+	// Writer-side bookkeeping, mutated only under mu.Lock.
+	icount  int // live key count
+	tombs   int // tombstone slots awaiting reclamation
+	maxLoad float64
+
 	diskOff []int64 // pageID -> byte offset in file, valid where pages[pid] is nil
 
 	tailPage int64 // pageID currently being appended to
@@ -301,8 +328,6 @@ func newShard(id int, t Tunables) (*shard, error) {
 		n <<= 1
 	}
 	sh := &shard{
-		slots:       make([]uint64, n),
-		islotsMask:  n - 1,
 		maxLoad:     0.75,
 		pageSize:    t.PageSize,
 		pageShift:   uint(bits.TrailingZeros(uint(t.PageSize))),
@@ -312,7 +337,12 @@ func newShard(id int, t Tunables) (*shard, error) {
 	// Page 0 starts resident and empty. Reserve the first recHdr bytes so that a
 	// real record start is always >= recHdr, keeping address 0 unambiguous as the
 	// empty-slot marker.
-	sh.pages = append(sh.pages, make([]byte, t.PageSize))
+	v := &view{
+		slots: make([]uint64, n),
+		mask:  n - 1,
+		pages: [][]byte{make([]byte, t.PageSize)},
+	}
+	sh.view.Store(v)
 	sh.diskOff = append(sh.diskOff, 0)
 	sh.residentOrder = append(sh.residentOrder, 0)
 	sh.tailPos = recHdr
@@ -360,17 +390,26 @@ func (sh *shard) set(key, value []byte) (prevValLen int, err error) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
+	v := sh.view.Load()
 	// Roll to a fresh page when the record does not fit in the tail page. The
 	// sealed page becomes eligible for flushing once it leaves the resident cap.
 	if sh.tailPos+rl > sh.pageSize {
 		sh.tailPage++
 		sh.tailPos = 0
-		sh.pages = append(sh.pages, make([]byte, sh.pageSize))
+		newPages := make([][]byte, len(v.pages)+1)
+		copy(newPages, v.pages)
+		newPages[sh.tailPage] = make([]byte, sh.pageSize)
+		// Publish the new page directory before any index entry can point into the
+		// new page, so a lock-free reader that observes the entry also observes the
+		// page (the bounds-check-and-reload in get covers the ordering window).
+		nv := &view{slots: v.slots, mask: v.mask, pages: newPages}
+		sh.view.Store(nv)
+		v = nv
 		sh.diskOff = append(sh.diskOff, 0)
 		sh.residentOrder = append(sh.residentOrder, sh.tailPage)
-		sh.evictIfNeeded()
+		sh.evictIfNeeded(v)
 	}
-	page := sh.pages[sh.tailPage]
+	page := v.pages[sh.tailPage]
 	recStart := sh.tailPage*int64(sh.pageSize) + int64(sh.tailPos)
 	off := sh.tailPos
 	binary.LittleEndian.PutUint32(page[off:], uint32(len(key)))
@@ -383,8 +422,10 @@ func (sh *shard) set(key, value []byte) (prevValLen int, err error) {
 
 // evictIfNeeded flushes resident pages to disk until the shard is back within its
 // resident page budget. With no budget (residentCap == 0) or no log file
-// (memory-only), it does nothing and pages stay resident.
-func (sh *shard) evictIfNeeded() {
+// (memory-only), it does nothing and pages stay resident. It runs only under
+// mu.Lock and only in evicts mode, so it never races a lock-free reader (those
+// exist only when !evicts).
+func (sh *shard) evictIfNeeded(v *view) {
 	if sh.residentCap <= 0 || sh.file == nil {
 		return
 	}
@@ -393,7 +434,7 @@ func (sh *shard) evictIfNeeded() {
 	for len(sh.residentOrder) > sh.residentCap {
 		pid := sh.residentOrder[0]
 		sh.residentOrder = sh.residentOrder[1:]
-		page := sh.pages[pid]
+		page := v.pages[pid]
 		if page == nil {
 			continue
 		}
@@ -407,33 +448,73 @@ func (sh *shard) evictIfNeeded() {
 		}
 		sh.fileEnd += int64(len(page))
 		sh.diskOff[pid] = off
-		sh.pages[pid] = nil
+		v.pages[pid] = nil
 		sh.spilledPages++
 	}
 }
 
 func (sh *shard) get(key []byte) ([]byte, bool, error) {
+	if !sh.evicts {
+		return sh.getResident(key)
+	}
+	return sh.getEvicting(key)
+}
+
+// getResident is the lock-free full-resident read path. It loads the published
+// view once, probes the index with atomic entry loads, and slices the value out
+// of the resident page with no copy and no mutex. The returned slice aliases the
+// log page (which is never evicted or mutated in this mode) and the caller must
+// not mutate it. This is the rewrite/01 Slice-1 read path the locktax benchmark
+// backs.
+func (sh *shard) getResident(key []byte) ([]byte, bool, error) {
+	h := hash64(key)
+	tag := tagOf(h)
+	v := sh.view.Load()
+	i := h & v.mask
+	for {
+		e := atomic.LoadUint64(&v.slots[i])
+		if e == 0 {
+			return nil, false, nil
+		}
+		if e != tombstone && entryTag(e) == tag {
+			addr := entryAddr(e)
+			pid := int64(addr) >> sh.pageShift
+			// The entry may point into a page newer than this view snapshot. Because
+			// the writer publishes the page directory before the entry that
+			// references it, observing the entry guarantees a reload finds the page.
+			for pid >= int64(len(v.pages)) {
+				v = sh.view.Load()
+			}
+			off := int(int64(addr) & sh.pageMask)
+			page := v.pages[pid]
+			klen := int(binary.LittleEndian.Uint32(page[off:]))
+			if klen == len(key) && string(page[off+recHdr:off+recHdr+klen]) == string(key) {
+				vlen := int(binary.LittleEndian.Uint32(page[off+4:]))
+				vstart := off + recHdr + klen
+				return page[vstart : vstart+vlen], true, nil
+			}
+		}
+		i = (i + 1) & v.mask
+	}
+}
+
+// getEvicting is the spill-mode read path: a page can be pulled out from under a
+// reader by eviction, so it holds the per-shard read lock and copies the value out
+// (resident) or reads it back from the log file (spilled).
+func (sh *shard) getEvicting(key []byte) ([]byte, bool, error) {
 	sh.mu.RLock()
-	addr, ok := sh.indexGet(key)
+	v := sh.view.Load()
+	addr, ok := sh.indexGet(v, key)
 	if !ok {
 		sh.mu.RUnlock()
 		return nil, false, nil
 	}
 	pid := int64(addr) >> sh.pageShift
 	off := int(int64(addr) & sh.pageMask)
-	if page := sh.pages[pid]; page != nil {
+	if page := v.pages[pid]; page != nil {
 		klen := int(binary.LittleEndian.Uint32(page[off:]))
 		vlen := int(binary.LittleEndian.Uint32(page[off+4:]))
 		vstart := off + recHdr + klen
-		if !sh.evicts {
-			// Full-resident mode never evicts a page, so the value bytes outlive this
-			// call and can be returned with no copy: one slice, no decode loop,
-			// matching the resident-map fast path the memengine spike measured. The
-			// slice aliases the log page and the caller must not mutate it.
-			val := page[vstart : vstart+vlen]
-			sh.mu.RUnlock()
-			return val, true, nil
-		}
 		// Eviction is possible, so copy the value out while we still hold the read
 		// lock, before a concurrent flush can pull the page out from under us.
 		val := make([]byte, vlen)
@@ -468,7 +549,8 @@ func (sh *shard) get(key []byte) ([]byte, bool, error) {
 // tracked Store.DeleteWithPrev surfaces it for used_memory accounting.
 func (sh *shard) del(key []byte) (prevValLen int, ok bool, err error) {
 	sh.mu.Lock()
-	pl, ok := sh.indexDelete(key)
+	v := sh.view.Load()
+	pl, ok := sh.indexDelete(v, key)
 	sh.mu.Unlock()
 	return pl, ok, nil
 }
@@ -476,10 +558,10 @@ func (sh *shard) del(key []byte) (prevValLen int, ok bool, err error) {
 // recordKeyAny returns the key bytes of the record at logical address addr,
 // handling both resident pages (a slice, the hot path) and spilled pages (a disk
 // read, the cold compare path). Index probes call this to confirm a tag match.
-func (sh *shard) recordKeyAny(addr uint64) []byte {
+func (sh *shard) recordKeyAny(v *view, addr uint64) []byte {
 	pid := int64(addr) >> sh.pageShift
 	off := int(int64(addr) & sh.pageMask)
-	if page := sh.pages[pid]; page != nil {
+	if page := v.pages[pid]; page != nil {
 		klen := int(binary.LittleEndian.Uint32(page[off:]))
 		return page[off+recHdr : off+recHdr+klen]
 	}
@@ -504,10 +586,10 @@ func (sh *shard) recordKeyAny(addr uint64) []byte {
 // read of the 8-byte header, the cold path). The index upsert and delete call this
 // to surface the displaced record's size so the keyspace layer can keep its
 // used_memory accounting exact without a separate read-before-write.
-func (sh *shard) recordValLenAny(addr uint64) int {
+func (sh *shard) recordValLenAny(v *view, addr uint64) int {
 	pid := int64(addr) >> sh.pageShift
 	off := int(int64(addr) & sh.pageMask)
-	if page := sh.pages[pid]; page != nil {
+	if page := v.pages[pid]; page != nil {
 		return int(binary.LittleEndian.Uint32(page[off+4:]))
 	}
 	dOff := sh.diskOff[pid]
@@ -522,117 +604,145 @@ func (sh *shard) recordValLenAny(addr uint64) int {
 }
 
 // indexGet probes the open-addressed table for key and returns the record-start
-// address of its current value. Caller holds at least the read lock.
-func (sh *shard) indexGet(key []byte) (uint64, bool) {
+// address of its current value. Caller holds at least the read lock (or, on the
+// lock-free path, this is not used; see getResident).
+func (sh *shard) indexGet(v *view, key []byte) (uint64, bool) {
 	h := hash64(key)
 	tag := tagOf(h)
-	i := h & sh.islotsMask
+	i := h & v.mask
 	for {
-		e := sh.slots[i]
+		e := v.slots[i]
 		if e == 0 {
 			return 0, false
 		}
-		if entryTag(e) == tag {
+		if e != tombstone && entryTag(e) == tag {
 			addr := entryAddr(e)
-			if bytesEqual(sh.recordKeyAny(addr), key) {
+			if bytesEqual(sh.recordKeyAny(v, addr), key) {
 				return addr, true
 			}
 		}
-		i = (i + 1) & sh.islotsMask
+		i = (i + 1) & v.mask
 	}
 }
 
 // indexPut inserts or repoints key at the record-start address addr. Caller holds
-// the write lock. On update it repoints the existing slot in place, so icount is
-// exact and the table never accumulates shadow entries. It returns the displaced
-// record's value length, or -1 when the key is new, so a tracking caller learns the
-// overwritten size at no extra probe (the slot and its record were already located
-// to confirm the key match).
+// the write lock. On update it repoints the existing slot in place with an atomic
+// store so a lock-free reader sees the new address (and the new record bytes,
+// written before this call). A free slot may be an empty (0) or a tombstone slot;
+// reusing a tombstone keeps the table from growing under churn. It returns the
+// displaced record's value length, or -1 when the key is new.
 func (sh *shard) indexPut(key []byte, addr uint64) (prevValLen int) {
-	if float64(sh.icount+1) > sh.maxLoad*float64(len(sh.slots)) {
-		sh.indexGrow()
+	v := sh.view.Load()
+	if float64(sh.icount+sh.tombs+1) > sh.maxLoad*float64(len(v.slots)) {
+		v = sh.indexGrow(v)
 	}
 	h := hash64(key)
 	tag := tagOf(h)
-	i := h & sh.islotsMask
+	i := h & v.mask
+	firstTomb := int64(-1)
 	for {
-		e := sh.slots[i]
+		e := v.slots[i]
 		if e == 0 {
-			sh.slots[i] = makeEntry(tag, addr)
+			// Prefer an earlier tombstone slot so the chain does not lengthen.
+			if firstTomb >= 0 {
+				atomic.StoreUint64(&v.slots[firstTomb], makeEntry(tag, addr))
+				sh.tombs--
+			} else {
+				atomic.StoreUint64(&v.slots[i], makeEntry(tag, addr))
+			}
 			sh.icount++
 			return -1
 		}
-		if entryTag(e) == tag && bytesEqual(sh.recordKeyAny(entryAddr(e)), key) {
-			old := sh.recordValLenAny(entryAddr(e))
-			sh.slots[i] = makeEntry(tag, addr) // repoint in place
+		if e == tombstone {
+			if firstTomb < 0 {
+				firstTomb = int64(i)
+			}
+		} else if entryTag(e) == tag && bytesEqual(sh.recordKeyAny(v, entryAddr(e)), key) {
+			old := sh.recordValLenAny(v, entryAddr(e))
+			atomic.StoreUint64(&v.slots[i], makeEntry(tag, addr)) // repoint in place
 			return old
 		}
-		i = (i + 1) & sh.islotsMask
+		i = (i + 1) & v.mask
 	}
 }
 
-// indexDelete removes key with backward-shift deletion (no tombstones, so the
-// stop-at-empty probe stays correct). Caller holds the write lock. It returns the
-// removed record's value length and whether the key was present, so a tracking
-// caller learns the freed size without re-reading the record.
-func (sh *shard) indexDelete(key []byte) (prevValLen int, ok bool) {
+// indexDelete removes key. In full-resident mode it writes a tombstone with an
+// atomic store, keeping the probe chain intact for a concurrent lock-free reader;
+// in spill mode (readers hold the lock) it backward-shifts so no tombstone
+// accumulates. Caller holds the write lock. It returns the removed record's value
+// length and whether the key was present.
+func (sh *shard) indexDelete(v *view, key []byte) (prevValLen int, ok bool) {
 	h := hash64(key)
 	tag := tagOf(h)
-	i := h & sh.islotsMask
+	i := h & v.mask
 	for {
-		e := sh.slots[i]
+		e := v.slots[i]
 		if e == 0 {
 			return -1, false
 		}
-		if entryTag(e) == tag && bytesEqual(sh.recordKeyAny(entryAddr(e)), key) {
-			old := sh.recordValLenAny(entryAddr(e))
-			sh.indexBackshift(i)
+		if e != tombstone && entryTag(e) == tag && bytesEqual(sh.recordKeyAny(v, entryAddr(e)), key) {
+			old := sh.recordValLenAny(v, entryAddr(e))
+			if sh.evicts {
+				sh.indexBackshift(v, i)
+			} else {
+				atomic.StoreUint64(&v.slots[i], tombstone)
+				sh.tombs++
+			}
 			sh.icount--
 			return old, true
 		}
-		i = (i + 1) & sh.islotsMask
+		i = (i + 1) & v.mask
 	}
 }
 
-func (sh *shard) indexBackshift(hole uint64) {
-	sh.slots[hole] = 0
-	j := (hole + 1) & sh.islotsMask
+func (sh *shard) indexBackshift(v *view, hole uint64) {
+	v.slots[hole] = 0
+	j := (hole + 1) & v.mask
 	for {
-		e := sh.slots[j]
+		e := v.slots[j]
 		if e == 0 {
 			return
 		}
-		home := hash64(sh.recordKeyAny(entryAddr(e))) & sh.islotsMask
-		dj := (j - hole) & sh.islotsMask
-		dHome := (home - hole) & sh.islotsMask
+		home := hash64(sh.recordKeyAny(v, entryAddr(e))) & v.mask
+		dj := (j - hole) & v.mask
+		dHome := (home - hole) & v.mask
 		if dHome == 0 || dHome > dj {
-			sh.slots[hole] = e
-			sh.slots[j] = 0
+			v.slots[hole] = e
+			v.slots[j] = 0
 			hole = j
 		}
-		j = (j + 1) & sh.islotsMask
+		j = (j + 1) & v.mask
 	}
 }
 
-func (sh *shard) indexGrow() {
-	old := sh.slots
-	n := uint64(len(old)) << 1
-	sh.slots = make([]uint64, n)
-	sh.islotsMask = n - 1
-	for _, e := range old {
-		if e == 0 {
+// indexGrow rebuilds the table into a fresh slots array, dropping tombstones, and
+// publishes the new view. It doubles capacity when the live load demands it and
+// otherwise keeps the same size (a pure tombstone-reclaiming rehash). The old
+// slots array stays valid for any lock-free reader still probing it; the new view
+// only adds keys, never removes one a stale reader could still need.
+func (sh *shard) indexGrow(v *view) *view {
+	n := uint64(len(v.slots))
+	if float64(sh.icount+1) > sh.maxLoad*float64(n) {
+		n <<= 1
+	}
+	nv := &view{slots: make([]uint64, n), mask: n - 1, pages: v.pages}
+	for _, e := range v.slots {
+		if e == 0 || e == tombstone {
 			continue
 		}
-		// re-probe each live entry into the larger table. Keys live in the log, so
+		// re-probe each live entry into the fresh table. Keys live in the log, so
 		// the rehash needs no side table and never double-counts: this moves
 		// entries, it does not add keys.
 		tag := entryTag(e)
-		i := hash64(sh.recordKeyAny(entryAddr(e))) & sh.islotsMask
-		for sh.slots[i] != 0 {
-			i = (i + 1) & sh.islotsMask
+		i := hash64(sh.recordKeyAny(v, entryAddr(e))) & nv.mask
+		for nv.slots[i] != 0 {
+			i = (i + 1) & nv.mask
 		}
-		sh.slots[i] = makeEntry(tag, entryAddr(e))
+		nv.slots[i] = makeEntry(tag, entryAddr(e))
 	}
+	sh.tombs = 0
+	sh.view.Store(nv)
+	return nv
 }
 
 func bytesEqual(a, b []byte) bool {
