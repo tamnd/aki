@@ -5,8 +5,11 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/tamnd/aki/btree"
 	"github.com/tamnd/aki/collset"
+	"github.com/tamnd/aki/pager"
 	"github.com/tamnd/aki/store"
+	"github.com/tamnd/aki/vfs"
 )
 
 // These benchmarks run the segmented set against the real store and against the
@@ -207,3 +210,73 @@ func benchIsMemberCell(b *testing.B, n int) {
 }
 
 func BenchmarkIsMemberCell1000(b *testing.B) { benchIsMemberCell(b, 1000) }
+
+// --- btree coll form: the element-per-row form aki already promotes a large set
+// to (one member -> one empty-valued row in a btree sub-tree over the pager).
+//
+// This is the comparison that decides whether collset is worth wiring in: the
+// cell form above is only used for small sets, but a large set already lives in
+// this btree coll form, which is also element-per-row and also enumerable. The
+// two run on different substrates on purpose: collset's segments sit on the
+// hybrid log (the larger-than-memory single file), the btree sits on the paged
+// region, so this measures per-op CPU and allocation of each collection backbone,
+// not a substrate-controlled A/B. A 4 KB page keeps the btree several levels deep
+// at 1000 members, the realistic shape.
+
+func newBtree(b *testing.B) *btree.Tree {
+	b.Helper()
+	p, err := pager.Create(vfs.NewMem(), "bench.aki", pager.Options{PageSize: 4096})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = p.Close() })
+	tr, err := btree.Create(p)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return tr
+}
+
+func benchAddBtree(b *testing.B, n int) {
+	ms := members(n)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		p, err := pager.Create(vfs.NewMem(), "bench.aki", pager.Options{PageSize: 4096})
+		if err != nil {
+			b.Fatal(err)
+		}
+		tr, err := btree.Create(p)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for _, m := range ms {
+			if err := tr.Put(m, nil); err != nil {
+				b.Fatal(err)
+			}
+		}
+		p.Close()
+	}
+}
+
+func BenchmarkAddBtree1000(b *testing.B) { benchAddBtree(b, 1000) }
+
+func benchIsMemberBtree(b *testing.B, n int) {
+	tr := newBtree(b)
+	ms := members(n)
+	for _, m := range ms {
+		if err := tr.Put(m, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+	probe := ms[n/2]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, ok, _ := tr.Get(probe); !ok {
+			b.Fatal("missing member")
+		}
+	}
+}
+
+func BenchmarkIsMemberBtree1000(b *testing.B) { benchIsMemberBtree(b, 1000) }
