@@ -14,6 +14,7 @@ import (
 type hlEngine interface {
 	Set(key, value []byte) error
 	SetWithPrev(key, value []byte) (prevValLen int, err error)
+	SetWithPrev2(key, v0, v1 []byte) (prevValLen int, err error)
 	Get(key []byte) (value []byte, found bool, err error)
 	DeleteWithPrev(key []byte) (prevValLen int, ok bool, err error)
 	Each(fn func(key, value []byte) bool) error
@@ -110,9 +111,16 @@ func (db *DB) hlSet(key, body []byte, typ, enc uint8, ttlMs int64) error {
 		h.Flags |= FlagHasTTL
 		h.TTLms = ttlMs
 	}
-	cell := h.AppendTo(make([]byte, 0, HeaderSize+len(body)))
-	cell = append(cell, body...)
-	prevValLen, err := s.SetWithPrev(key, cell)
+	// Encode the fixed-size header into a stack array and hand the store the header
+	// and body as two segments, so it lays them back to back straight into the log
+	// page. Joining them into one cell here would cost a heap allocation for the cell
+	// and a copy to fill it, on top of the store's own copy into the page; this drops
+	// the allocation (and the scavenger pressure it was generating) and one of the two
+	// copies. hbuf has exactly HeaderSize capacity, so AppendTo never reallocates it
+	// and it does not escape.
+	var hbuf [HeaderSize]byte
+	hdr := h.AppendTo(hbuf[:0])
+	prevValLen, err := s.SetWithPrev2(key, hdr, body)
 	if err != nil {
 		return err
 	}
