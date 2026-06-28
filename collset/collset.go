@@ -501,14 +501,15 @@ func (s *Set) Remove(member []byte) (removed bool, err error) {
 	return true, s.kv.Set(s.metaKey(), encodeMeta(m))
 }
 
-// Card is the cardinality, read straight from the metadata row in O(1) with no
-// segment access.
+// Card is the cardinality, read straight from the first eight bytes of the
+// metadata row in O(1), with no segment access and no decode of the boundary
+// array.
 func (s *Set) Card() (int, error) {
-	m, err := s.loadMeta()
-	if err != nil || m == nil {
+	raw, found, err := s.kv.Get(s.metaKey())
+	if err != nil || !found {
 		return 0, err
 	}
-	return int(m.count), nil
+	return int(binary.BigEndian.Uint64(raw)), nil
 }
 
 // Members returns every member in sorted order by walking the segments in

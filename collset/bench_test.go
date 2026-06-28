@@ -77,6 +77,48 @@ func benchIsMemberSegmented(b *testing.B, n int) {
 
 func BenchmarkIsMemberSegmented1000(b *testing.B) { benchIsMemberSegmented(b, 1000) }
 
+// Members is the enumeration the design exists for: a bare hash index over the
+// members gives O(1) point ops but cannot list one set without scanning the whole
+// keyspace. The segmented set walks only its own segments, so SMEMBERS costs set
+// size. The benchmark records that number on the real store.
+func benchMembersSegmented(b *testing.B, n int) {
+	st := newStore(b)
+	defer st.Close()
+	set := collset.New(st, 1)
+	for _, m := range members(n) {
+		set.Add(m)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		out, err := set.Members()
+		if err != nil || len(out) != n {
+			b.Fatalf("Members len=%d err=%v", len(out), err)
+		}
+	}
+}
+
+func BenchmarkMembersSegmented1000(b *testing.B) { benchMembersSegmented(b, 1000) }
+
+// Card reads the cardinality straight from the metadata row, no segment touched.
+func benchCardSegmented(b *testing.B, n int) {
+	st := newStore(b)
+	defer st.Close()
+	set := collset.New(st, 1)
+	for _, m := range members(n) {
+		set.Add(m)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if c, _ := set.Card(); c != n {
+			b.Fatalf("Card=%d want %d", c, n)
+		}
+	}
+}
+
+func BenchmarkCardSegmented1000(b *testing.B) { benchCardSegmented(b, 1000) }
+
 // --- cell form: the whole set in one store value, the current hybrid path ---
 
 func cellKey() []byte {
