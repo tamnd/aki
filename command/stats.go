@@ -20,7 +20,13 @@ import (
 // dispatch path can update them without taking a lock, and INFO reads them with
 // plain atomic loads.
 type cmdStat struct {
-	calls    atomic.Uint64
+	// calls is striped per CPU because it is the only counter the integrated fast
+	// path still writes per command (statCallFast dropped usec and the histogram),
+	// so under a saturating single-command load it was the one shared cache line
+	// every core fought over. usec, rejected and failed stay plain atomics: they are
+	// written only off the timed slow path, never on the fast path, so they carry no
+	// saturation contention worth striping.
+	calls    stripedUint64
 	usec     atomic.Uint64
 	rejected atomic.Uint64
 	failed   atomic.Uint64
