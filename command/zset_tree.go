@@ -167,6 +167,57 @@ func zsetCard(db *keyspace.DB, key []byte) (n int64, hdr keyspace.ValueHeader, k
 	return int64(len(members)), hdr, true, nil
 }
 
+// zsetCollPop removes up to count members from the low end (fromMax false, ZPOPMIN)
+// or the high end (fromMax true, ZPOPMAX) of a coll-form sorted set and returns them
+// in pop order: lowest score first for ZPOPMIN, highest score first for ZPOPMAX. It
+// walks only the popped window of the score index, seeking straight to the end it
+// pops from, so taking a handful off a multi-million-member set is O(count log n).
+// The materialized path it replaces cloned every member onto the heap and rewrote
+// the whole set as a blob (demoting it), which OOM-killed under a tight memory cap.
+// The collected members are deleted after the walk so the cursor is never used past
+// a mutation. CollUpdate tears the key down when the last member goes.
+func zsetCollPop(db *keyspace.DB, key []byte, count int64, fromMax bool) (popped []zmember, err error) {
+	if count <= 0 {
+		return nil, nil
+	}
+	err = db.CollUpdate(key, keyspace.TypeZSet, keyspace.EncSkiplist, func(w *keyspace.CollWriter) error {
+		c := w.Cursor()
+		var step func() error
+		if fromMax {
+			// Score rows ('s' 0x73) sort after member rows ('m' 0x6d), so the last key
+			// in the sub-tree is the highest-scoring member.
+			if e := c.Last(); e != nil {
+				return e
+			}
+			step = c.Prev
+		} else {
+			if e := c.Seek([]byte{zRowScore}); e != nil {
+				return e
+			}
+			step = c.Next
+		}
+		for c.Valid() && int64(len(popped)) < count {
+			k := c.Key()
+			if len(k) == 0 || k[0] != zRowScore {
+				break
+			}
+			score := zScoreUnbits(encoding.U64BE(k[1:9]))
+			member := append([]byte(nil), k[9:]...)
+			popped = append(popped, zmember{member: member, score: score})
+			if e := step(); e != nil {
+				return e
+			}
+		}
+		for _, zm := range popped {
+			if _, e := zTreeDel(w, zm.member); e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	return popped, err
+}
+
 // zTreeScore reads a member's current score from the member-index row inside a
 // write callback. found is false when the member is absent.
 func zTreeScore(w *keyspace.CollWriter, member []byte) (score float64, found bool, err error) {
