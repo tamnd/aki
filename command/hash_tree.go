@@ -1,6 +1,8 @@
 package command
 
 import (
+	"math/rand/v2"
+
 	"github.com/tamnd/aki/encoding"
 	"github.com/tamnd/aki/keyspace"
 )
@@ -154,6 +156,102 @@ func hashMaterialize(db *keyspace.DB, key []byte) (fields []hashField, hdr keysp
 		return nil, hdr, true, err
 	}
 	return dropExpiredFields(fields), hdr, true, nil
+}
+
+// hashCollRandFields picks fields from a btree-backed hash for HRANDFIELD without
+// cloning the whole hash. A positive count gives that many distinct fields, capped
+// at the live field count; a negative count gives exactly its magnitude, with
+// repeats allowed. The pick is a single forward reservoir pass: memory stays
+// proportional to the requested count, never the hash size, so a HRANDFIELD with a
+// small count on a multi-million-field hash no longer materializes the whole hash
+// (the truncated-input crash and the OOM both came from routing through the blob
+// getter). The pass skips per-field-expired rows, so the sample matches the live
+// set the materialized path would return.
+//
+// Time is a single walk of the rows, O(n) cursor steps with no per-step allocation;
+// a true O(count) sample would need order-statistics counts in the btree, the same
+// upgrade the deep rank seeks want, and is held for that later slice. The bound that
+// matters here, no whole-hash clone, holds now.
+func hashCollRandFields(db *keyspace.DB, key []byte, count int64) (out []hashField, err error) {
+	if count == 0 {
+		return nil, nil
+	}
+	clone := func(c *keyspace.CollCursor, val []byte, ttl int64) hashField {
+		return hashField{
+			field: append([]byte(nil), c.Key()...),
+			value: append([]byte(nil), val...),
+			ttl:   ttl,
+		}
+	}
+	live := 0
+	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+		c := r.Cursor()
+		// The pick is a forward-only reservoir walk that clones each chosen field
+		// immediately, so the arena's reuse-until-next-move contract holds and the
+		// whole scan allocates a small constant instead of decoding each leaf onto
+		// the heap.
+		c.UseForwardArena()
+		if e := c.First(); e != nil {
+			return e
+		}
+		if count > 0 {
+			// Distinct sample: a size-k reservoir over the live fields. Each live
+			// field replaces a random slot with probability k/seen, so the result is
+			// a uniform sample of min(k, liveCount) distinct fields.
+			k := int(count)
+			for c.Valid() {
+				ttl, val, de := hashRowDecode(c.Value())
+				if de != nil {
+					return de
+				}
+				if !hashRowExpired(ttl) {
+					live++
+					if len(out) < k {
+						out = append(out, clone(c, val, ttl))
+					} else if j := rand.IntN(live); j < k {
+						out[j] = clone(c, val, ttl)
+					}
+				}
+				if e := c.Next(); e != nil {
+					return e
+				}
+			}
+			return nil
+		}
+		// Negative count: -count independent draws with repeats. Each slot keeps its
+		// own size-one reservoir over the same stream, so each ends as an independent
+		// uniform field and a field can land in more than one slot.
+		m := int(-count)
+		buf := make([]hashField, m)
+		for c.Valid() {
+			ttl, val, de := hashRowDecode(c.Value())
+			if de != nil {
+				return de
+			}
+			if !hashRowExpired(ttl) {
+				live++
+				var f hashField
+				built := false
+				for s := 0; s < m; s++ {
+					if rand.IntN(live) == 0 {
+						if !built {
+							f = clone(c, val, ttl)
+							built = true
+						}
+						buf[s] = f
+					}
+				}
+			}
+			if e := c.Next(); e != nil {
+				return e
+			}
+		}
+		if live > 0 {
+			out = buf
+		}
+		return nil
+	})
+	return out, err
 }
 
 // hashLen returns the field count in whichever form the hash is stored. For a

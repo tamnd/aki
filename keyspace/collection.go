@@ -205,6 +205,17 @@ type CollCursor struct {
 	live *liveCursor
 }
 
+// UseForwardArena turns on arena-backed leaf decoding for a forward-only walk on
+// the btree-backed form, so a full scan allocates a small constant instead of one
+// node's slices per leaf. It is a no-op for the in-memory overlay cursor, which
+// already iterates a resident snapshot without per-row decode. Call it before
+// First or Seek and never mix in Last or Prev on the same cursor.
+func (cc *CollCursor) UseForwardArena() {
+	if cc.c != nil {
+		cc.c.UseForwardArena()
+	}
+}
+
 func (cc *CollCursor) First() error {
 	if cc.live != nil {
 		cc.live.first()

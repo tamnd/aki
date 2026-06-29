@@ -17,6 +17,27 @@ type Cursor struct {
 	leaf *node
 	idx  int
 	path []frame
+	// arena, when set, decodes each leaf reached by a forward sibling step into a
+	// reused buffer instead of allocating fresh key/value slices per row. It is only
+	// safe for forward-only walks (First/Seek/Next), where a leaf step retires the
+	// previous leaf: the Key/Value bytes stay valid only until the next move, which
+	// is the cursor's standing contract. Backward motion keeps a path of live nodes
+	// and must not share the arena, so Last/Prev never touch it.
+	arena *nodeArena
+}
+
+// UseForwardArena turns on arena-backed leaf decoding for a forward-only scan, so a
+// full walk allocates a small constant rather than one node's worth of slices per
+// leaf crossed. Call it before First or Seek, and do not mix in Last/Prev on the
+// same cursor. The bytes from Key and Value remain owned by the cursor and valid
+// only until the next move, exactly as without the arena.
+func (c *Cursor) UseForwardArena() {
+	if c.arena == nil {
+		c.arena = &nodeArena{
+			buf: make([]byte, 0, 8192),
+			tmp: make([]byte, 0, 256),
+		}
+	}
 }
 
 // frame records an interior node and the child index a backward descent took
@@ -97,7 +118,16 @@ func (c *Cursor) advanceLeaf() error {
 			c.idx = 0
 			return nil
 		}
-		n, err := c.t.readNode(sib)
+		var (
+			n   *node
+			err error
+		)
+		if c.arena != nil {
+			c.arena.reset()
+			n, err = c.t.readNodeAr(sib, c.arena)
+		} else {
+			n, err = c.t.readNode(sib)
+		}
 		if err != nil {
 			return err
 		}
