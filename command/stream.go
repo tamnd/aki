@@ -282,7 +282,7 @@ func handleXAdd(ctx *Ctx) {
 		trimmed  bool
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, key)
+		hdr, found, err := streamHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -290,16 +290,8 @@ func handleXAdd(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		if !found {
-			if noMkStream {
-				mkMissed = true
-				return nil
-			}
-			s = &stream{}
-		}
-		id, errStr := resolveStreamID(s, rawID, now)
-		if errStr != "" {
-			replyErr = errStr
+		if !found && noMkStream {
+			mkMissed = true
 			return nil
 		}
 		fields := make([][]byte, len(rest))
@@ -307,6 +299,41 @@ func handleXAdd(ctx *Ctx) {
 			cp := make([]byte, len(b))
 			copy(cp, b)
 			fields[j] = cp
+		}
+		// A coll stream appends one entry row in place, resolving the ID against the
+		// last ID in the header row, so a multi-million-entry stream pays a point
+		// write per XADD, not a whole-blob decode and rewrite.
+		if found && hdr.IsColl() {
+			last, lerr := streamCollLastID(db, key)
+			if lerr != nil {
+				return lerr
+			}
+			id, errStr := resolveStreamID(&stream{lastID: last}, rawID, now)
+			if errStr != "" {
+				replyErr = errStr
+				return nil
+			}
+			dropped, aerr := streamCollAdd(db, key, id, fields, trim)
+			if aerr != nil {
+				return aerr
+			}
+			newID = id
+			trimmed = dropped > 0
+			return nil
+		}
+		// A small or new stream stays in the blob form. storeStream promotes it to
+		// the coll form once the entry count crosses the threshold.
+		s, _, _, err := getStream(db, key)
+		if err != nil {
+			return err
+		}
+		if s == nil {
+			s = &stream{}
+		}
+		id, errStr := resolveStreamID(s, rawID, now)
+		if errStr != "" {
+			replyErr = errStr
+			return nil
 		}
 		s.entries = append(s.entries, streamEntry{id: id, fields: fields})
 		s.lastID = id
@@ -349,7 +376,7 @@ func handleXLen(ctx *Ctx) {
 		wrongTyp bool
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, ctx.Argv[1])
+		hdr, found, err := streamHeader(db, ctx.Argv[1])
 		if err != nil {
 			return err
 		}
@@ -357,7 +384,20 @@ func handleXLen(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		if found {
+		if !found {
+			return nil
+		}
+		// A coll stream keeps the live count in its metadata, so XLEN reads it
+		// without materializing the entries.
+		if hdr.IsColl() {
+			n, err = streamCollLen(db, ctx.Argv[1])
+			return err
+		}
+		s, _, _, err := getStream(db, ctx.Argv[1])
+		if err != nil {
+			return err
+		}
+		if s != nil {
 			n = int64(len(s.entries))
 		}
 		return nil
@@ -407,9 +447,10 @@ func handleXRange(ctx *Ctx, rev bool) {
 	var (
 		out      []streamEntry
 		wrongTyp bool
+		coll     bool
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, argv[1])
+		hdr, found, err := streamHeader(db, argv[1])
 		if err != nil {
 			return err
 		}
@@ -417,15 +458,27 @@ func handleXRange(ctx *Ctx, rev bool) {
 			wrongTyp = true
 			return nil
 		}
-		if found {
-			// For reverse output the count caps the highest entries, so collect
-			// the full range and trim after reversing.
-			gather := count
-			if rev {
-				gather = -1
-			}
-			out = collectRange(s, start, end, gather)
+		if !found {
+			return nil
 		}
+		// A coll stream walks a bounded cursor window: for the reverse form it
+		// descends from the end bound so the count caps the work, not the range.
+		if hdr.IsColl() {
+			coll = true
+			out, err = streamCollRange(db, argv[1], start, end, count, rev)
+			return err
+		}
+		s, _, _, err := getStream(db, argv[1])
+		if err != nil {
+			return err
+		}
+		// For reverse output the count caps the highest entries, so collect
+		// the full range and trim after reversing.
+		gather := count
+		if rev {
+			gather = -1
+		}
+		out = collectRange(s, start, end, gather)
 		return nil
 	}) {
 		return
@@ -434,7 +487,9 @@ func handleXRange(ctx *Ctx, rev bool) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
-	if rev {
+	// The coll reverse walk already returns the highest entries first and capped;
+	// only the blob path gathered ascending and needs the flip-and-cap here.
+	if rev && !coll {
 		reverseEntries(out)
 		if count >= 0 && int64(len(out)) > count {
 			out = out[:count]
@@ -642,7 +697,7 @@ func handleXReadStreams(ctx *Ctx, rest [][]byte, count, blockMs int64) {
 			if !dollar[j] {
 				continue
 			}
-			s, hdr, found, err := getStream(db, keys[j])
+			hdr, found, err := streamHeader(db, keys[j])
 			if err != nil {
 				return err
 			}
@@ -650,11 +705,25 @@ func handleXReadStreams(ctx *Ctx, rest [][]byte, count, blockMs int64) {
 				wrongTyp = true
 				return nil
 			}
-			if found {
-				starts[j] = s.lastID
-			} else {
+			if !found {
 				starts[j] = streamID{}
+				continue
 			}
+			// A coll stream's last ID lives in its header row; read just that rather
+			// than materialize the whole stream to fix the $ cursor.
+			if hdr.IsColl() {
+				last, err := streamCollLastID(db, keys[j])
+				if err != nil {
+					return err
+				}
+				starts[j] = last
+				continue
+			}
+			s, _, _, err := getStream(db, keys[j])
+			if err != nil {
+				return err
+			}
+			starts[j] = s.lastID
 		}
 		return nil
 	}) {
@@ -676,7 +745,7 @@ func handleXReadStreams(ctx *Ctx, rest [][]byte, count, blockMs int64) {
 		)
 		if !ctx.view(func(db *keyspace.DB) error {
 			for j := range n {
-				s, hdr, found, err := getStream(db, keys[j])
+				hdr, found, err := streamHeader(db, keys[j])
 				if err != nil {
 					return err
 				}
@@ -687,7 +756,21 @@ func handleXReadStreams(ctx *Ctx, rest [][]byte, count, blockMs int64) {
 				if !found {
 					continue
 				}
-				es := collectRange(s, rangeBound{id: starts[j], excl: true}, rangeBound{id: maxStreamID}, count)
+				var es []streamEntry
+				// XREAD returns the entries after the given ID, which is the start bound
+				// taken exclusively up to the maximum.
+				if hdr.IsColl() {
+					es, err = streamCollRange(db, keys[j], rangeBound{id: starts[j], excl: true}, rangeBound{id: maxStreamID}, count, false)
+					if err != nil {
+						return err
+					}
+				} else {
+					s, _, _, err := getStream(db, keys[j])
+					if err != nil {
+						return err
+					}
+					es = collectRange(s, rangeBound{id: starts[j], excl: true}, rangeBound{id: maxStreamID}, count)
+				}
 				if len(es) > 0 {
 					results = append(results, result{key: keys[j], entries: es})
 				}
