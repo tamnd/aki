@@ -13,31 +13,11 @@ import "bytes"
 // climbs it to reach the previous subtree. The two directions do not interleave:
 // position with Last or SeekForPrev before walking with Prev.
 type Cursor struct {
-	t    *Tree
-	leaf *node
-	idx  int
-	path []frame
-	// arena, when set, decodes each leaf reached by a forward sibling step into a
-	// reused buffer instead of allocating fresh key/value slices per row. It is only
-	// safe for forward-only walks (First/Seek/Next), where a leaf step retires the
-	// previous leaf: the Key/Value bytes stay valid only until the next move, which
-	// is the cursor's standing contract. Backward motion keeps a path of live nodes
-	// and must not share the arena, so Last/Prev never touch it.
+	t     *Tree
+	leaf  *node
+	idx   int
+	path  []frame
 	arena *nodeArena
-}
-
-// UseForwardArena turns on arena-backed leaf decoding for a forward-only scan, so a
-// full walk allocates a small constant rather than one node's worth of slices per
-// leaf crossed. Call it before First or Seek, and do not mix in Last/Prev on the
-// same cursor. The bytes from Key and Value remain owned by the cursor and valid
-// only until the next move, exactly as without the arena.
-func (c *Cursor) UseForwardArena() {
-	if c.arena == nil {
-		c.arena = &nodeArena{
-			buf: make([]byte, 0, 8192),
-			tmp: make([]byte, 0, 256),
-		}
-	}
 }
 
 // frame records an interior node and the child index a backward descent took
@@ -50,22 +30,62 @@ type frame struct {
 // Cursor returns a new, unpositioned cursor. Call First or Seek before reading.
 func (t *Tree) Cursor() *Cursor { return &Cursor{t: t} }
 
+// UseArena makes the cursor decode each visited node into a single reused scratch
+// buffer instead of allocating fresh key and value slices per cell per leaf. It is
+// for a single-direction walk and the caller must copy any Key/Value it keeps, as
+// those bytes alias the arena.
+//
+// Forward (First/Seek then Next): each leaf step resets the arena and retires the
+// previous leaf, so the buffer stays small no matter how many leaves the scan
+// spans. Backward (Last/SeekForPrev then Prev): the arena is reset only at the
+// positioning call, then accumulates without reset because Prev keeps the
+// root-to-leaf path nodes live; the buffer therefore grows with the walk's node
+// count, which is a small constant for a bounded pop. Do not interleave the two
+// directions on one arena-backed cursor.
+func (c *Cursor) UseArena() {
+	if c.arena == nil {
+		c.arena = &nodeArena{buf: make([]byte, 0, 8192), tmp: make([]byte, 0, 256)}
+	}
+}
+
+// readNode reads a node honoring the forward arena when one is set. The arena is
+// reset by the caller at each descent/step boundary, not here, so a single
+// root-to-leaf descent shares one buffer.
+func (c *Cursor) readNode(pgno uint32) (*node, error) {
+	if c.arena != nil {
+		return c.t.readNodeAr(pgno, c.arena)
+	}
+	return c.t.readNode(pgno)
+}
+
 // First positions the cursor at the smallest key.
 func (c *Cursor) First() error {
-	n, err := c.t.leftmostLeaf()
-	if err != nil {
-		return err
+	if c.arena != nil {
+		c.arena.reset()
 	}
-	c.leaf = n
-	c.idx = 0
-	return nil
+	pgno := c.t.root
+	for {
+		n, err := c.readNode(pgno)
+		if err != nil {
+			return err
+		}
+		if n.leaf {
+			c.leaf = n
+			c.idx = 0
+			return nil
+		}
+		pgno = n.children[0]
+	}
 }
 
 // Seek positions the cursor at the first key greater than or equal to key.
 func (c *Cursor) Seek(key []byte) error {
+	if c.arena != nil {
+		c.arena.reset()
+	}
 	pgno := c.t.root
 	for {
-		n, err := c.t.readNode(pgno)
+		n, err := c.readNode(pgno)
 		if err != nil {
 			return err
 		}
@@ -118,16 +138,13 @@ func (c *Cursor) advanceLeaf() error {
 			c.idx = 0
 			return nil
 		}
-		var (
-			n   *node
-			err error
-		)
+		// Forward-only: stepping to the sibling retires the current leaf, so the
+		// arena can be reset and reused for it. A caller that needs bytes from the
+		// old leaf has already copied them out before calling Next.
 		if c.arena != nil {
 			c.arena.reset()
-			n, err = c.t.readNodeAr(sib, c.arena)
-		} else {
-			n, err = c.t.readNode(sib)
 		}
+		n, err := c.readNode(sib)
 		if err != nil {
 			return err
 		}
@@ -145,6 +162,9 @@ func (c *Cursor) advanceLeaf() error {
 // the predecessor.
 func (c *Cursor) Last() error {
 	c.path = c.path[:0]
+	if c.arena != nil {
+		c.arena.reset()
+	}
 	return c.descendLast(c.t.root)
 }
 
@@ -154,9 +174,12 @@ func (c *Cursor) Last() error {
 // upper bound.
 func (c *Cursor) SeekForPrev(key []byte) error {
 	c.path = c.path[:0]
+	if c.arena != nil {
+		c.arena.reset()
+	}
 	pgno := c.t.root
 	for {
-		n, err := c.t.readNode(pgno)
+		n, err := c.readNode(pgno)
 		if err != nil {
 			return err
 		}
@@ -197,7 +220,7 @@ func (c *Cursor) Prev() error {
 // bottom (a page emptied by deletes) sends it climbing for the predecessor.
 func (c *Cursor) descendLast(pgno uint32) error {
 	for {
-		n, err := c.t.readNode(pgno)
+		n, err := c.readNode(pgno)
 		if err != nil {
 			return err
 		}
@@ -249,7 +272,7 @@ func (c *Cursor) climbPrev() error {
 // to continue from the frames just pushed.
 func (c *Cursor) descendRightmost(pgno uint32) (empty bool, err error) {
 	for {
-		n, err := c.t.readNode(pgno)
+		n, err := c.readNode(pgno)
 		if err != nil {
 			return false, err
 		}
@@ -267,17 +290,3 @@ func (c *Cursor) descendRightmost(pgno uint32) (empty bool, err error) {
 	}
 }
 
-// leftmostLeaf descends to the first leaf in key order.
-func (t *Tree) leftmostLeaf() (*node, error) {
-	pgno := t.root
-	for {
-		n, err := t.readNode(pgno)
-		if err != nil {
-			return nil, err
-		}
-		if n.leaf {
-			return n, nil
-		}
-		pgno = n.children[0]
-	}
-}

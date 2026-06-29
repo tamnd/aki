@@ -190,7 +190,7 @@ func hashCollRandFields(db *keyspace.DB, key []byte, count int64) (out []hashFie
 		// immediately, so the arena's reuse-until-next-move contract holds and the
 		// whole scan allocates a small constant instead of decoding each leaf onto
 		// the heap.
-		c.UseForwardArena()
+		c.UseArena()
 		if e := c.First(); e != nil {
 			return e
 		}

@@ -79,7 +79,7 @@ func TestImportRDBIntoFreshKeyspace(t *testing.T) {
 		t.Fatalf("write src: %v", err)
 	}
 
-	ks, closeKS, err := openKeyspace(target, 16, 0, 0)
+	ks, closeKS, err := openKeyspace(target, 16, 0, 0, nil)
 	if err != nil {
 		t.Fatalf("openKeyspace: %v", err)
 	}

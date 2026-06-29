@@ -120,8 +120,12 @@ func TestSetAlgebraWrongType(t *testing.T) {
 			t.Fatalf("%s = %q want WRONGTYPE", cmd, got)
 		}
 	}
-	// A non-set destination is also WRONGTYPE.
-	if got := sendLine(t, r, c, "SINTERSTORE s a"); got != "-"+wrongTypeError {
-		t.Fatalf("SINTERSTORE non-set dest = %q", got)
+	// A non-set destination is overwritten, not rejected: Redis only type-checks
+	// the source keys, so the string at s is replaced by the result {x}.
+	if got := sendLine(t, r, c, "SINTERSTORE s a"); got != ":1" {
+		t.Fatalf("SINTERSTORE over string dest = %q want :1", got)
+	}
+	if got := sendLine(t, r, c, "TYPE s"); got != "+set" {
+		t.Fatalf("TYPE s after store = %q want set", got)
 	}
 }

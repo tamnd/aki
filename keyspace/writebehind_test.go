@@ -105,7 +105,7 @@ func TestWriteBehindExpiredApplyClearsPending(t *testing.T) {
 	body := []byte("v")
 	// Stage the write the way updateWriteBehind does: a fresh version, an inline
 	// header, and an absolute TTL that is already in the past at apply time.
-	version := ks.NextVersion()
+	version := ks.NextVersionForKey(key)
 	pastTTL := nowMillis() - 1
 	hdr := ValueHeader{
 		Type:     TypeString,
@@ -152,7 +152,7 @@ func TestWriteBehindNormalApplyClearsPending(t *testing.T) {
 
 	key := []byte("live")
 	body := []byte("v")
-	version := ks.NextVersion()
+	version := ks.NextVersionForKey(key)
 	hdr := ValueHeader{
 		Type:     TypeString,
 		Encoding: EncRaw,

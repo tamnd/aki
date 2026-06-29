@@ -90,6 +90,13 @@ func (e *Engine) applyIncrBatch(index int, ops []deferredIncr) {
 // writer and SetWithVersion updates the hot cache the next Get consults.
 func incrShardFn(e *Engine, ops []*deferredIncr) func(*keyspace.DB) error {
 	return func(db *keyspace.DB) error {
+		// One reusable buffer for the formatted result, refilled per op. SetWithVersion
+		// copies the body into the leaf cell and stores cell[HeaderSize:] (a slice of its
+		// own allocation) in the hot cache, so it never retains the caller's slice; reusing
+		// this across the sub-batch is safe and drops one heap allocation per increment,
+		// which the profile showed as the increment path's GC cost under a deep pipeline.
+		// An int64 in base ten is at most 20 bytes (-9223372036854775808).
+		var buf [20]byte
 		for _, op := range ops {
 			cur, hdr, found, err := db.Get(op.key)
 			if err != nil {
@@ -116,8 +123,8 @@ func incrShardFn(e *Engine, ops []*deferredIncr) func(*keyspace.DB) error {
 			}
 			op.result = sum
 			op.res = incrResOK
-			body := strconv.AppendInt(nil, sum, 10)
-			ver := e.ks.NextVersion()
+			body := strconv.AppendInt(buf[:0], sum, 10)
+			ver := e.ks.NextVersionForKey(op.key)
 			if werr := db.SetWithVersion(op.key, body, keyspace.TypeString, keyspace.EncInt, keepTTL(hdr, found), ver); werr != nil {
 				op.res = incrResErr
 			}
@@ -242,7 +249,7 @@ func (d *Dispatcher) flushIncrPending(c *networking.Conn, sess *session) {
 			enc.WriteError("ERR increment failed")
 		default:
 			enc.WriteInteger(op.result)
-			if aofOn {
+			if aofOn && op.argv != nil {
 				args := rewriteForAOF(string(op.argv[0]), op.argv)
 				if args != nil {
 					if bufferAOF {

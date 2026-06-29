@@ -75,6 +75,12 @@ type CollWriter struct {
 	enc    uint8
 	encSet bool
 
+	// hc, when set, is the in-memory row set this writer mutates on the hybrid-log
+	// engine, which has no btree sub-tree. Get, Put, Delete, and Cursor route
+	// through it; the whole set is serialized back into one store cell after the
+	// callback. See keyspace/hybrid_coll.go.
+	hc *hybridColl
+
 	// live, when set, is the resident in-memory copy this writer absorbs element
 	// ops into instead of descending the sub-tree (the hash write overlay). Get,
 	// Put, and Delete route through it; the accumulated mutations fold back into
@@ -85,6 +91,10 @@ type CollWriter struct {
 
 // Get returns the value stored under sub and whether it is present.
 func (w *CollWriter) Get(sub []byte) ([]byte, bool, error) {
+	if w.hc != nil {
+		v, ok := w.hc.get(sub)
+		return v, ok, nil
+	}
 	if w.live != nil {
 		v, ok := w.live.get(sub)
 		return v, ok, nil
@@ -97,6 +107,9 @@ func (w *CollWriter) Get(sub []byte) ([]byte, bool, error) {
 // SetCount so types with more than one row per logical element (zset keeps a
 // member row and a score row) stay accurate.
 func (w *CollWriter) Put(sub, val []byte) (created bool, err error) {
+	if w.hc != nil {
+		return w.hc.put(sub, val), nil
+	}
 	if w.live != nil {
 		return w.live.put(sub, val), nil
 	}
@@ -109,6 +122,9 @@ func (w *CollWriter) Put(sub, val []byte) (created bool, err error) {
 
 // Delete removes sub and reports whether it was present.
 func (w *CollWriter) Delete(sub []byte) (bool, error) {
+	if w.hc != nil {
+		return w.hc.del(sub), nil
+	}
 	if w.live != nil {
 		return w.live.del(sub), nil
 	}
@@ -146,6 +162,9 @@ func (w *CollWriter) SetEnc(e uint8) {
 // live-backed writer it iterates the resident copy in sorted subkey order, so the
 // view matches the sub-tree's byte ordering.
 func (w *CollWriter) Cursor() *CollCursor {
+	if w.hc != nil {
+		return &CollCursor{hc: &hybridCursor{hc: w.hc}}
+	}
 	if w.live != nil {
 		return &CollCursor{live: newLiveCursor(w.live)}
 	}
@@ -158,6 +177,11 @@ type CollReader struct {
 	tree *btree.Tree
 	meta collMeta
 
+	// hc, when set, is the in-memory row set this read serves from on the hybrid-log
+	// engine. Get and Cursor consult it; Count/Head/Tail/Bytes read meta, which is
+	// loaded from the same cell. See keyspace/hybrid_coll.go.
+	hc *hybridColl
+
 	// live, when set, is the resident in-memory copy this read serves from instead
 	// of the sub-tree (the hash write overlay). The resident copy is authoritative
 	// while present, so Get, Count, and Cursor consult it and the sub-tree is not
@@ -167,6 +191,10 @@ type CollReader struct {
 
 // Get returns the value stored under sub and whether it is present.
 func (r *CollReader) Get(sub []byte) ([]byte, bool, error) {
+	if r.hc != nil {
+		v, ok := r.hc.get(sub)
+		return v, ok, nil
+	}
 	if r.live != nil {
 		v, ok := r.live.get(sub)
 		return v, ok, nil
@@ -190,6 +218,9 @@ func (r *CollReader) Bytes() uint64 { return r.meta.bytes }
 // sub-tree's byte ordering (HGETALL/HKEYS/HVALS order is stable across the
 // overlay).
 func (r *CollReader) Cursor() *CollCursor {
+	if r.hc != nil {
+		return &CollCursor{hc: &hybridCursor{hc: r.hc}}
+	}
 	if r.live != nil {
 		return &CollCursor{live: newLiveCursor(r.live)}
 	}
@@ -203,20 +234,28 @@ func (r *CollReader) Cursor() *CollCursor {
 type CollCursor struct {
 	c    *btree.Cursor
 	live *liveCursor
+	hc   *hybridCursor
 }
 
-// UseForwardArena turns on arena-backed leaf decoding for a forward-only walk on
-// the btree-backed form, so a full scan allocates a small constant instead of one
-// node's slices per leaf. It is a no-op for the in-memory overlay cursor, which
-// already iterates a resident snapshot without per-row decode. Call it before
-// First or Seek and never mix in Last or Prev on the same cursor.
-func (cc *CollCursor) UseForwardArena() {
+// UseArena asks the underlying btree cursor to decode visited nodes into a reused
+// scratch buffer for a single-direction walk, so a bounded scan over a coll-form
+// collection allocates a small constant instead of O(n). It serves both a forward
+// walk (First/Seek then Next) and a backward one (Last/SeekForPrev then Prev). It
+// is a no-op for the in-memory overlay and hybrid cursors, which hold their
+// elements in memory and do not decode pages. Call it once, before positioning;
+// the caller must copy any Key/Value it keeps before advancing, as those bytes
+// alias the arena.
+func (cc *CollCursor) UseArena() {
 	if cc.c != nil {
-		cc.c.UseForwardArena()
+		cc.c.UseArena()
 	}
 }
 
 func (cc *CollCursor) First() error {
+	if cc.hc != nil {
+		cc.hc.first()
+		return nil
+	}
 	if cc.live != nil {
 		cc.live.first()
 		return nil
@@ -224,6 +263,10 @@ func (cc *CollCursor) First() error {
 	return cc.c.First()
 }
 func (cc *CollCursor) Seek(sub []byte) error {
+	if cc.hc != nil {
+		cc.hc.seek(sub)
+		return nil
+	}
 	if cc.live != nil {
 		cc.live.seek(sub)
 		return nil
@@ -262,12 +305,19 @@ func (cc *CollCursor) Prev() error {
 	return cc.c.Prev()
 }
 func (cc *CollCursor) Valid() bool {
+	if cc.hc != nil {
+		return cc.hc.valid()
+	}
 	if cc.live != nil {
 		return cc.live.valid()
 	}
 	return cc.c.Valid()
 }
 func (cc *CollCursor) Next() error {
+	if cc.hc != nil {
+		cc.hc.next()
+		return nil
+	}
 	if cc.live != nil {
 		cc.live.next()
 		return nil
@@ -275,12 +325,18 @@ func (cc *CollCursor) Next() error {
 	return cc.c.Next()
 }
 func (cc *CollCursor) Key() []byte {
+	if cc.hc != nil {
+		return cc.hc.key()
+	}
 	if cc.live != nil {
 		return cc.live.key()
 	}
 	return cc.c.Key()
 }
 func (cc *CollCursor) Value() []byte {
+	if cc.hc != nil {
+		return cc.hc.value()
+	}
 	if cc.live != nil {
 		return cc.live.value()
 	}
@@ -304,6 +360,9 @@ func (cc *CollCursor) Value() []byte {
 // and BodyRef pointing at the (possibly new) sub-tree root. The key's existing TTL
 // is preserved.
 func (db *DB) CollUpdate(key []byte, typ, enc uint8, fn func(w *CollWriter) error) error {
+	if db.newHL != nil {
+		return db.hlCollUpdate(key, typ, enc, fn)
+	}
 	s := ShardOf(key)
 	db.shards[s].mu.Lock()
 	defer db.shards[s].mu.Unlock()
@@ -406,6 +465,9 @@ const (
 // the caller takes its skip or blob path. typ and enc carry the same meaning as in
 // CollUpdate. The caller must NOT hold any shard lock.
 func (db *DB) CollUpdateRouted(key []byte, typ, enc uint8, route func(found bool, h ValueHeader, blob []byte) CollRoute, fn func(w *CollWriter) error) (CollRoute, error) {
+	if db.newHL != nil {
+		return db.hlCollUpdateRouted(key, typ, enc, route, fn)
+	}
 	s := ShardOf(key)
 	db.shards[s].mu.Lock()
 	defer db.shards[s].mu.Unlock()
@@ -488,7 +550,7 @@ func (db *DB) collWriteMetaLocked(s int, t *btree.Tree, ck, key []byte, w *CollW
 		Encoding: enc,
 		Flags:    FlagInlineBody | FlagCollTree,
 		TTLms:    -1,
-		Version:  db.ks.version.Add(1),
+		Version:  db.ks.version.next(key),
 		BodyRef:  uint64(w.tree.Root()),
 		BodyLen:  uint32(len(body)),
 		RefCount: 1,
@@ -566,6 +628,9 @@ func (db *DB) collClearLocked(s int, t *btree.Tree, ck, key []byte, subRoot uint
 // which case the caller falls back to its blob path; fn is not called. An expired
 // key reads as absent. The caller must NOT hold any shard lock.
 func (db *DB) CollRead(key []byte, fn func(r *CollReader) error) (ok bool, err error) {
+	if db.newHL != nil {
+		return db.hlCollRead(key, fn)
+	}
 	s := ShardOf(key)
 	db.shards[s].mu.RLock()
 	defer db.shards[s].mu.RUnlock()
@@ -613,6 +678,9 @@ func (db *DB) CollMetaHeader(key []byte) (ValueHeader, bool, error) {
 // is absent or not in coll form, so the caller can fall back to its blob path.
 // Caller must NOT hold any shard lock.
 func (db *DB) CollSetTTL(key []byte, ttlMs int64) (ok bool, err error) {
+	if db.newHL != nil {
+		return db.hlCollSetTTL(key, ttlMs)
+	}
 	s := ShardOf(key)
 	db.shards[s].mu.Lock()
 	defer db.shards[s].mu.Unlock()
@@ -637,7 +705,7 @@ func (db *DB) CollSetTTL(key []byte, ttlMs int64) (ok bool, err error) {
 		h.Flags &^= FlagHasTTL
 		h.TTLms = -1
 	}
-	h.Version = db.ks.version.Add(1)
+	h.Version = db.ks.version.next(key)
 	cell := h.AppendTo(make([]byte, 0, HeaderSize+len(body)))
 	cell = append(cell, body...)
 	if _, err := t.Upsert(ck, cell); err != nil {
@@ -682,6 +750,9 @@ func (db *DB) clearCollTTL(key []byte) error {
 // corrupt). Copying the rows into a fresh sub-tree keeps the two keys
 // independent.
 func (db *DB) CollCopyTo(srcKey []byte, dst *DB, dstKey []byte) (ok bool, err error) {
+	if db.newHL != nil {
+		return db.hlCollCopyTo(srcKey, dst, dstKey)
+	}
 	// Snapshot the source rows and metadata under the source shard read lock, then
 	// release it before taking the destination write lock. The command write
 	// closures run serialized through a single writer, so no concurrent op can
@@ -786,7 +857,7 @@ func (db *DB) CollCopyTo(srcKey []byte, dst *DB, dstKey []byte) (ok bool, err er
 		Encoding: srcEnc,
 		Flags:    FlagInlineBody | FlagCollTree,
 		TTLms:    -1,
-		Version:  dst.ks.version.Add(1),
+		Version:  dst.ks.version.next(dstKey),
 		BodyRef:  uint64(nt.Root()),
 		BodyLen:  uint32(len(metaBody)),
 		RefCount: 1,
