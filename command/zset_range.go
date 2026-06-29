@@ -435,23 +435,33 @@ func (ctx *Ctx) runRange(key, minArg, maxArg []byte, spec rangeSpec) {
 			wrongTyp = true
 			return nil
 		}
-		// A coll-form sorted set serves a forward score range by walking the
-		// score-index window directly, so the read stays bounded by the matching
-		// rows instead of cloning the whole set. The reverse direction needs a
-		// backward cursor and the lex and rank forms need a different seek, so those
-		// keep the materialize path for now.
-		if found && hdr.IsColl() && spec.byScore && !spec.rev {
-			loB, ok := parseScoreBound(minArg)
+		// A coll-form sorted set serves a score range by walking the score-index
+		// window directly, so the read stays bounded by the matching rows instead of
+		// cloning the whole set. Forward (ZRANGEBYSCORE) walks ascending from the low
+		// bound; reverse (ZREVRANGEBYSCORE, arg order key max min) walks descending
+		// from the high bound with the backward cursor. The lex and rank forms need a
+		// different seek, so those keep the materialize path for now.
+		if found && hdr.IsColl() && spec.byScore {
+			// In the reverse command minArg is the high bound and maxArg the low.
+			loArg, hiArg := minArg, maxArg
+			if spec.rev {
+				loArg, hiArg = maxArg, minArg
+			}
+			loB, ok := parseScoreBound(loArg)
 			if !ok {
 				errStr = "ERR min or max is not a float"
 				return nil
 			}
-			hiB, ok := parseScoreBound(maxArg)
+			hiB, ok := parseScoreBound(hiArg)
 			if !ok {
 				errStr = "ERR min or max is not a float"
 				return nil
 			}
-			result, _, err = zsetCollRangeByScore(db, key, loB, hiB, spec.limit, spec.offset, spec.count, false)
+			if spec.rev {
+				result, err = zsetCollRevRangeByScore(db, key, loB, hiB, spec.limit, spec.offset, spec.count)
+			} else {
+				result, _, err = zsetCollRangeByScore(db, key, loB, hiB, spec.limit, spec.offset, spec.count, false)
+			}
 			return err
 		}
 		members, _, _, err := getZSet(db, key)
