@@ -234,6 +234,54 @@ func zsetCard(db *keyspace.DB, key []byte) (n int64, hdr keyspace.ValueHeader, k
 	return int64(len(members)), hdr, true, nil
 }
 
+// zsetMemberScores reads the scores of a specific handful of members without
+// materializing the whole sorted set. For a coll-form sorted set each member is a
+// point lookup on its member-index row, so a GEODIST/GEOPOS/GEOHASH against a
+// multi-million-member geo set stays O(queries log n) and constant allocation
+// instead of cloning every member onto the heap, which under a tight memory cap is
+// the difference between serving and an OOM kill. For the blob form it decodes once
+// (bounded by the listpack threshold). present[i] reports whether members[i] was
+// found; scores[i] holds its score when present. keyFound is false for a missing
+// key, and a non-zset value leaves wrongType for the caller to surface via hdr.
+func zsetMemberScores(db *keyspace.DB, key []byte, members [][]byte) (scores []float64, present []bool, hdr keyspace.ValueHeader, keyFound bool, err error) {
+	scores = make([]float64, len(members))
+	present = make([]bool, len(members))
+	hdr, keyFound, err = zsetHeader(db, key)
+	if err != nil || !keyFound {
+		return scores, present, hdr, keyFound, err
+	}
+	if hdr.Type != keyspace.TypeZSet {
+		return scores, present, hdr, true, nil
+	}
+	if hdr.IsColl() {
+		_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+			for i, m := range members {
+				v, ok, e := r.Get(zMemberRow(m))
+				if e != nil {
+					return e
+				}
+				if ok {
+					scores[i] = zScoreUnbits(encoding.U64BE(v))
+					present[i] = true
+				}
+			}
+			return nil
+		})
+		return scores, present, hdr, true, err
+	}
+	set, _, _, e := getZSet(db, key)
+	if e != nil {
+		return scores, present, hdr, true, e
+	}
+	for i, m := range members {
+		if idx := zsetFind(set, m); idx >= 0 {
+			scores[i] = set[idx].score
+			present[i] = true
+		}
+	}
+	return scores, present, hdr, true, nil
+}
+
 // zTreeScore reads a member's current score from the member-index row inside a
 // write callback. found is false when the member is absent.
 func zTreeScore(w *keyspace.CollWriter, member []byte) (score float64, found bool, err error) {
