@@ -1311,6 +1311,130 @@ func TestStreamCollClaimBounded(t *testing.T) {
 	}
 }
 
+// TestStreamCollAutoClaimBounded is the slice-3e-5 witness: XAUTOCLAIM over a coll
+// stream with a large pending list costs only the claimed window, not the pending
+// total. Before this slice XAUTOCLAIM loaded the whole PEL through getStreamGroupsFull
+// and rewrote it, so one call on a million-entry group paid a million-element round
+// trip. Now it cursor-scans the group's 0x02 rows from the scan-start id, claiming up
+// to COUNT rows in place and refreshing the header alone. Each run re-claims the same
+// lowest pending id (min-idle 0, COUNT 1, start 0), so the work is one entry-row fetch
+// plus one header-row write regardless of pending size.
+func TestStreamCollAutoClaimBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
+	d := newFuzzDispatcher(t)
+	conn := networking.NewOfflineConn()
+
+	const n = 4000
+	pad := make([]byte, 240)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	for i := 1; i <= n; i++ {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XADD"), []byte("s"),
+			[]byte(strconv.Itoa(i) + "-0"), []byte("f"), append([]byte("v"), pad...)})
+	}
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XGROUP"), []byte("CREATE"), []byte("s"), []byte("g"), []byte("0")})
+	// Deliver every entry with no ack, so the group carries an n-entry pending list.
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("cons1"),
+		[]byte("COUNT"), []byte(strconv.Itoa(n)), []byte("STREAMS"), []byte("s"), []byte(">")})
+
+	// Each run claims the single lowest pending entry into cons2 with COUNT 1: a
+	// bounded cursor scan from start 0 plus a header-row write. The min-idle 0 makes
+	// the re-claim idempotent, so the pending list holds steady. A whole-PEL load
+	// would move about a megabyte per run.
+	allocs := testing.AllocsPerRun(200, func() {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XAUTOCLAIM"), []byte("s"), []byte("g"), []byte("cons2"),
+			[]byte("0"), []byte("0"), []byte("COUNT"), []byte("1")})
+	})
+	if allocs > 500 {
+		t.Fatalf("XAUTOCLAIM COUNT 1 on a %d-entry pending list allocated %.0f objects per run; "+
+			"a bounded claim should scan only the COUNT window, not the whole PEL", n, allocs)
+	}
+}
+
+// TestStreamCollInfoFullBounded is the slice-3e-5 witness: XINFO STREAM FULL with a
+// small COUNT over a coll stream whose group holds a large pending list loads only a
+// COUNT-bounded PEL window per group, not the whole list. The group and consumer
+// pel-counts still report the true totals from the header counters, while the pending
+// arrays carry only the loaded window. A whole-PEL load would move about a megabyte.
+func TestStreamCollInfoFullBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
+	d := newFuzzDispatcher(t)
+	conn := networking.NewOfflineConn()
+
+	const n = 4000
+	pad := make([]byte, 240)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	for i := 1; i <= n; i++ {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XADD"), []byte("s"),
+			[]byte(strconv.Itoa(i) + "-0"), []byte("f"), append([]byte("v"), pad...)})
+	}
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XGROUP"), []byte("CREATE"), []byte("s"), []byte("g"), []byte("0")})
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("cons"),
+		[]byte("COUNT"), []byte(strconv.Itoa(n)), []byte("STREAMS"), []byte("s"), []byte(">")})
+
+	// FULL COUNT 10 caps both the entries window and the per-group PEL window, so the
+	// read moves ten entry rows plus ten PEL rows, never the n-entry pending list.
+	allocs := testing.AllocsPerRun(200, func() {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XINFO"), []byte("STREAM"), []byte("s"),
+			[]byte("FULL"), []byte("COUNT"), []byte("10")})
+	})
+	if allocs > 1500 {
+		t.Fatalf("XINFO STREAM FULL COUNT 10 on a %d-entry pending list allocated %.0f objects per run; "+
+			"the PEL window should be COUNT-bounded, not a whole-PEL load", n, allocs)
+	}
+}
+
+// TestStreamCollReadGroupExplicitBounded is the slice-3e-5 witness: an explicit-ID
+// XREADGROUP re-read over a coll stream with a large pending list costs only the
+// returned window, not the whole PEL. The re-read seeks the consumer's pending rows
+// from the given id and point-fetches up to COUNT bodies, so reading one pending
+// entry back allocates a small constant regardless of how many sit pending.
+func TestStreamCollReadGroupExplicitBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
+	d := newFuzzDispatcher(t)
+	conn := networking.NewOfflineConn()
+
+	const n = 4000
+	pad := make([]byte, 240)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	for i := 1; i <= n; i++ {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XADD"), []byte("s"),
+			[]byte(strconv.Itoa(i) + "-0"), []byte("f"), append([]byte("v"), pad...)})
+	}
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XGROUP"), []byte("CREATE"), []byte("s"), []byte("g"), []byte("0")})
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("cons"),
+		[]byte("COUNT"), []byte(strconv.Itoa(n)), []byte("STREAMS"), []byte("s"), []byte(">")})
+
+	// Each run re-reads the first pending entry by explicit id 0 with COUNT 1: a
+	// consumer-filtered cursor scan from the start id plus one entry-row point fetch.
+	// A whole-PEL load would move about a megabyte per run.
+	allocs := testing.AllocsPerRun(200, func() {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("cons"),
+			[]byte("COUNT"), []byte("1"), []byte("STREAMS"), []byte("s"), []byte("0")})
+	})
+	if allocs > 500 {
+		t.Fatalf("explicit-ID XREADGROUP COUNT 1 on a %d-entry pending list allocated %.0f objects per run; "+
+			"the re-read should walk only the COUNT window, not the whole PEL", n, allocs)
+	}
+}
+
 // TestStreamCollGroupMetaBounded witnesses that the consumer-group metadata
 // commands on a large coll stream allocate a small constant, not O(entries). With
 // the groups in the header row and getStreamGroups/storeStreamGroups touching only

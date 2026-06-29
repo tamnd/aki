@@ -343,6 +343,44 @@ func loadGroupPELs(src pelCursorSource, groups []*group) error {
 	return nil
 }
 
+// streamCollLoadGroupPELWindow fills each group's pel slice with at most window rows
+// from its 0x02 sibling prefix, in entry-ID order. A window of -1 loads the whole
+// PEL (the caller asked for everything with COUNT 0). XINFO STREAM FULL uses it so
+// the introspection reply scans a bounded PEL window per group rather than cloning
+// the whole pending list; the true per-group and per-consumer totals come from the
+// header counters, not the loaded window length.
+func streamCollLoadGroupPELWindow(db *keyspace.DB, key []byte, groups []*group, window int64) error {
+	_, err := db.CollRead(key, func(r *keyspace.CollReader) error {
+		for _, g := range groups {
+			prefix := streamPELPrefix(g.name)
+			c := r.Cursor()
+			if err := c.Seek(prefix); err != nil {
+				return err
+			}
+			for c.Valid() {
+				if window >= 0 && int64(len(g.pel)) >= window {
+					break
+				}
+				k := c.Key()
+				if !bytes.HasPrefix(k, prefix) {
+					break
+				}
+				pe, err := streamPELFromValue(c.Value())
+				if err != nil {
+					return err
+				}
+				pe.id = streamPELRowID(k, len(prefix))
+				g.pel = append(g.pel, pe)
+				if err := c.Next(); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	return err
+}
+
 // streamClearPELRows deletes every 0x02 PEL row in the writer's sub-tree, gathering
 // the keys in one forward pass before deleting so the cursor is not mutated
 // mid-walk. storeStreamGroupsFull uses it to replace a stream's PELs wholesale.
