@@ -169,20 +169,29 @@ func readZSetSources(db *keyspace.DB, keys [][]byte) (srcs []zsetAlgebraSource, 
 	return srcs, false, nil
 }
 
-// zinterStream computes ZINTER without cloning a whole coll source. It drives the
-// smallest source in scored batches and folds every other source into each batch
-// member's score, blob sources by map lookup and coll sources by a batched point
-// probe, dropping any member absent from a source. The result holds only the
-// intersection, which is at most the smallest source and is what Redis returns too.
-func zinterStream(db *keyspace.DB, keys [][]byte, weights []float64, agg aggMode) (result []zmember, wrongTyp bool, err error) {
+// zinterEmit is the per-result-member callback the streamed algebra hands each
+// surviving (member, score) to, so a caller can collect them into a slice (the read
+// form) or write them straight into a destination (the STORE form) without the full
+// result ever held whole. The member bytes alias the driver batch the caller still
+// owns, so an emit that keeps a reference must copy first.
+type zsetEmit func(member []byte, score float64) error
+
+// zinterStreamInto computes ZINTER and hands each result member to emit as it is
+// produced. It drives the smallest source in scored batches and folds every other
+// source into each batch member's score, blob sources by map lookup and coll sources
+// by a batched point probe, dropping any member absent from a source. The result is
+// at most the smallest source, the same bound Redis has, and no coll source is cloned
+// whole. Each member's score is final by the time emit sees it, so emit need not
+// aggregate.
+func zinterStreamInto(db *keyspace.DB, keys [][]byte, weights []float64, agg aggMode, emit zsetEmit) (wrongTyp bool, err error) {
 	srcs, wt, err := readZSetSources(db, keys)
 	if err != nil || wt {
-		return nil, wt, err
+		return wt, err
 	}
 	smallest := -1
 	for i := range srcs {
 		if srcs[i].empty {
-			return nil, false, nil // an empty source makes the intersection empty
+			return false, nil // an empty source makes the intersection empty
 		}
 		if smallest < 0 || srcs[i].card < srcs[smallest].card {
 			smallest = i
@@ -211,28 +220,27 @@ func zinterStream(db *keyspace.DB, keys [][]byte, weights []float64, agg aggMode
 			members, vals = keepPresentScored(members, vals, weights[j], agg, scores, present)
 		}
 		for i, m := range members {
-			result = append(result, zmember{member: m, score: vals[i]})
+			if e := emit(m, vals[i]); e != nil {
+				return false, e
+			}
 		}
 		return false, nil
 	})
-	if err != nil {
-		return nil, false, err
-	}
-	zsetSort(result)
-	return result, false, nil
+	return false, err
 }
 
-// zdiffStream computes ZDIFF without cloning a whole coll source. It drives the
+// zdiffStreamInto computes ZDIFF and hands each result member to emit. It drives the
 // first source in scored batches and keeps each member absent from every other
 // source, blob sources by map lookup and coll sources by a batched point probe. The
-// result holds only members of the first source, with their first-source scores.
-func zdiffStream(db *keyspace.DB, keys [][]byte) (result []zmember, wrongTyp bool, err error) {
+// result is at most the first source, with its first-source scores, which are final
+// when emit sees them.
+func zdiffStreamInto(db *keyspace.DB, keys [][]byte, emit zsetEmit) (wrongTyp bool, err error) {
 	srcs, wt, err := readZSetSources(db, keys)
 	if err != nil || wt {
-		return nil, wt, err
+		return wt, err
 	}
 	if srcs[0].empty {
-		return nil, false, nil
+		return false, nil
 	}
 
 	err = zsetDriveScored(db, keys[0], srcs[0].hdr, func(batch []zsetScored) (bool, error) {
@@ -260,27 +268,26 @@ func zdiffStream(db *keyspace.DB, keys [][]byte) (result []zmember, wrongTyp boo
 			members, vals = keepAbsentScoredByFlag(members, vals, present)
 		}
 		for i, m := range members {
-			result = append(result, zmember{member: m, score: vals[i]})
+			if e := emit(m, vals[i]); e != nil {
+				return false, e
+			}
 		}
 		return false, nil
 	})
-	if err != nil {
-		return nil, false, err
-	}
-	zsetSort(result)
-	return result, false, nil
+	return false, err
 }
 
-// zunionStream computes ZUNION without holding every source at once. It streams
-// each source through scored batches and folds each member into one accumulator
-// map, the distinct union Redis materializes too; no source is cloned whole, only
-// one batch is live at a time on top of the result.
-func zunionStream(db *keyspace.DB, keys [][]byte, weights []float64, agg aggMode) (result []zmember, wrongTyp bool, err error) {
+// zunionStreamInto computes ZUNION and hands each source member's weighted score to
+// emit. A member can appear in more than one source, so the same member reaches emit
+// once per source it is in, each with that source's weighted score; the emit target
+// is responsible for aggregating repeats (the read form folds them into a map, the
+// STORE form folds them into the destination sub-tree). No source is cloned whole,
+// only one batch is live at a time.
+func zunionStreamInto(db *keyspace.DB, keys [][]byte, weights []float64, emit zsetEmit) (wrongTyp bool, err error) {
 	srcs, wt, err := readZSetSources(db, keys)
 	if err != nil || wt {
-		return nil, wt, err
+		return wt, err
 	}
-	acc := map[string]float64{}
 	for i := range keys {
 		if srcs[i].empty {
 			continue
@@ -288,18 +295,64 @@ func zunionStream(db *keyspace.DB, keys [][]byte, weights []float64, agg aggMode
 		w := weights[i]
 		e := zsetDriveScored(db, keys[i], srcs[i].hdr, func(batch []zsetScored) (bool, error) {
 			for _, zs := range batch {
-				val := weightedScore(w, zs.score)
-				if cur, ok := acc[string(zs.member)]; ok {
-					acc[string(zs.member)] = aggregate(cur, val, agg)
-				} else {
-					acc[string(zs.member)] = val
+				if er := emit(zs.member, weightedScore(w, zs.score)); er != nil {
+					return false, er
 				}
 			}
 			return false, nil
 		})
 		if e != nil {
-			return nil, false, e
+			return false, e
 		}
+	}
+	return false, nil
+}
+
+// zinterStream collects the streamed ZINTER into a sorted result slice for the read
+// form. The store form drives zinterStreamInto straight into a spilling sink instead.
+func zinterStream(db *keyspace.DB, keys [][]byte, weights []float64, agg aggMode) (result []zmember, wrongTyp bool, err error) {
+	// The member aliases a freshly allocated driver batch that outlives the walk, so
+	// the read form keeps it without a further copy, the same as before this refactor.
+	wt, err := zinterStreamInto(db, keys, weights, agg, func(m []byte, s float64) error {
+		result = append(result, zmember{member: m, score: s})
+		return nil
+	})
+	if err != nil || wt {
+		return nil, wt, err
+	}
+	zsetSort(result)
+	return result, false, nil
+}
+
+// zdiffStream collects the streamed ZDIFF into a sorted result slice for the read form.
+func zdiffStream(db *keyspace.DB, keys [][]byte) (result []zmember, wrongTyp bool, err error) {
+	wt, err := zdiffStreamInto(db, keys, func(m []byte, s float64) error {
+		result = append(result, zmember{member: m, score: s})
+		return nil
+	})
+	if err != nil || wt {
+		return nil, wt, err
+	}
+	zsetSort(result)
+	return result, false, nil
+}
+
+// zunionStream folds the streamed ZUNION into one accumulator map for the read form,
+// the distinct union Redis materializes too. The store form folds into the
+// destination sub-tree instead, so the union of huge sources never holds the whole
+// result in RAM.
+func zunionStream(db *keyspace.DB, keys [][]byte, weights []float64, agg aggMode) (result []zmember, wrongTyp bool, err error) {
+	acc := map[string]float64{}
+	wt, err := zunionStreamInto(db, keys, weights, func(m []byte, s float64) error {
+		if cur, ok := acc[string(m)]; ok {
+			acc[string(m)] = aggregate(cur, s, agg)
+		} else {
+			acc[string(m)] = s
+		}
+		return nil
+	})
+	if err != nil || wt {
+		return nil, wt, err
 	}
 	return mapToSorted(acc), false, nil
 }

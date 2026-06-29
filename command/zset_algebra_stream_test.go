@@ -10,10 +10,9 @@ import (
 	"github.com/tamnd/aki/networking"
 )
 
-// zrangeWithScores reads dest back as a flat [member, score, ...] slice, the oracle
-// the streamed read forms are checked against: ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE
-// still run the in-RAM materialize path, so storing and reading back gives an
-// independent result computed by the old code, formatted by the same range writer.
+// zrangeWithScores reads dest back as a flat [member, score, ...] slice, the form the
+// streamed read forms are checked against by storing and reading back through the
+// same range writer.
 func zrangeWithScores(t *testing.T, r *bufio.Reader, c net.Conn, key string) []string {
 	t.Helper()
 	return readArray(t, r, c, "ZRANGE "+key+" 0 -1 WITHSCORES")
