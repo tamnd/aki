@@ -46,52 +46,11 @@ const (
 // handleSetOp (SINTER, SUNION, SDIFF) lives in set_algebra_stream.go, where it
 // streams the result without materializing any whole coll source.
 
-// handleSetOpStore implements SINTERSTORE, SUNIONSTORE and SDIFFSTORE: compute
-// over the source keys, store the result at the destination, and reply the
-// result cardinality. An empty result deletes the destination.
-func handleSetOpStore(ctx *Ctx, op setOp) {
-	dst := ctx.Argv[1]
-	keys := ctx.Argv[2:]
-	var (
-		wrongTyp   bool
-		dstDeleted bool
-		n          int64
-	)
-	done := ctx.update(func(db *keyspace.DB) error {
-		// Only the source keys are type-checked. The destination is overwritten
-		// whatever it held, so a string or list at the destination is replaced
-		// rather than rejected, matching Redis.
-		sets, wt, err := loadSets(db, keys)
-		if err != nil {
-			return err
-		}
-		if wt {
-			wrongTyp = true
-			return nil
-		}
-		result := computeSetOp(op, sets)
-		n = int64(len(result))
-		if len(result) == 0 {
-			existed, err := db.Delete(dst)
-			dstDeleted = existed
-			return err
-		}
-		return db.Set(dst, setEncode(result), keyspace.TypeSet, setEncoding(ctx.encLimits(), result, keyspace.EncIntset), -1)
-	})
-	if !done {
-		return
-	}
-	if wrongTyp {
-		ctx.enc().WriteError(wrongTypeError)
-		return
-	}
-	if n > 0 {
-		ctx.notify(notifySet, setStoreEvent(op), dst)
-	} else if dstDeleted {
-		ctx.notify(notifyGeneric, "del", dst)
-	}
-	ctx.enc().WriteInteger(n)
-}
+// handleSetOpStore (SINTERSTORE, SUNIONSTORE, SDIFFSTORE) lives in
+// set_algebra_store_stream.go, where it streams the result into the destination
+// without materializing any whole source, falling back to the materialize compute
+// (storeSetOpMaterialize, which still uses loadSets/computeSetOp below) only when
+// the destination aliases a source.
 
 // setStoreEvent names the keyspace event for the STORE form of each set algebra
 // operation.
