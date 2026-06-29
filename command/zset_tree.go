@@ -167,6 +167,74 @@ func zsetCard(db *keyspace.DB, key []byte) (n int64, hdr keyspace.ValueHeader, k
 	return int64(len(members)), hdr, true, nil
 }
 
+// zScoreAboveHigh reports whether an ascending walk has passed the high score
+// bound and can stop. Rows come back in ascending score order, so once a score is
+// above the bound no later row can qualify.
+func zScoreAboveHigh(score float64, hi scoreBound) bool {
+	if hi.excl {
+		return score >= hi.value
+	}
+	return score > hi.value
+}
+
+// zsetCollRangeByScore walks a coll-form sorted set's score-index rows in ascending
+// order and returns the members whose score falls in [lo, hi], in score order. It
+// seeks straight to the low score, so the walk touches only the matching window plus
+// the rows it stops on, never the whole set: a ZRANGEBYSCORE or ZCOUNT over a narrow
+// band of a multi-million-member sorted set stays bounded instead of cloning every
+// member onto the heap and thrashing under a tight memory cap. When countOnly is set
+// it returns the match count without building the slice. limit applies the
+// ZRANGEBYSCORE LIMIT offset/count during the walk so a bounded query stops after it
+// has the rows it needs. The caller handles the reverse direction and the blob form.
+func zsetCollRangeByScore(db *keyspace.DB, key []byte, lo, hi scoreBound, limit bool, offset, count int64, countOnly bool) (out []zmember, n int64, err error) {
+	if limit && offset < 0 {
+		return nil, 0, nil
+	}
+	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+		c := r.Cursor()
+		seek := encoding.AppendU64BE([]byte{zRowScore}, zScoreBits(lo.value))
+		if e := c.Seek(seek); e != nil {
+			return e
+		}
+		skip := int64(0)
+		if limit {
+			skip = offset
+		}
+		for c.Valid() {
+			k := c.Key()
+			if len(k) == 0 || k[0] != zRowScore {
+				break
+			}
+			score := zScoreUnbits(encoding.U64BE(k[1:9]))
+			if zScoreAboveHigh(score, hi) {
+				break
+			}
+			if !scoreInRange(score, lo, hi) { // low-edge exclusive skip
+				if e := c.Next(); e != nil {
+					return e
+				}
+				continue
+			}
+			if countOnly {
+				n++
+			} else if skip > 0 {
+				skip--
+			} else {
+				member := append([]byte(nil), k[9:]...)
+				out = append(out, zmember{member: member, score: score})
+				if limit && count >= 0 && int64(len(out)) >= count {
+					break
+				}
+			}
+			if e := c.Next(); e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	return out, n, err
+}
+
 // zTreeScore reads a member's current score from the member-index row inside a
 // write callback. found is false when the member is absent.
 func zTreeScore(w *keyspace.CollWriter, member []byte) (score float64, found bool, err error) {
