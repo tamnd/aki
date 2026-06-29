@@ -222,7 +222,7 @@ func handleLPos(ctx *Ctx) {
 		matches  []int64
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		elems, hdr, found, err := getList(db, key)
+		hdr, found, err := listHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -232,6 +232,14 @@ func handleLPos(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeList {
 			wrongTyp = true
 			return nil
+		}
+		if hdr.IsColl() {
+			matches, err = listTreeLPos(db, key, element, rank, count, hasCount, maxlen)
+			return err
+		}
+		elems, _, _, err := getList(db, key)
+		if err != nil {
+			return err
 		}
 		matches = lposScan(elems, element, rank, count, hasCount, maxlen)
 		return nil
@@ -257,57 +265,79 @@ func handleLPos(ctx *Ctx) {
 	}
 }
 
-// lposScan returns the matching indices for LPOS. A positive rank scans head to
-// tail, a negative rank scans tail to head, and rankAbs selects which match to
-// start returning from. maxlen caps how many elements are compared. When
-// hasCount is false only the first match is returned; otherwise count limits the
-// result, with zero meaning all matches.
-func lposScan(elems [][]byte, element []byte, rank, count int64, hasCount bool, maxlen int64) []int64 {
+// lposMatcher carries the LPOS scan state so the blob slice and the coll-form
+// cursor share one decision. A positive rank scans head to tail, a negative rank
+// scans tail to head, rankAbs selects which match to start returning from, maxlen
+// caps how many elements are compared, and count limits the result with zero
+// meaning all matches. consider reports each element at its logical index in scan
+// order and returns false the moment the scan can stop, so the streaming caller
+// can break out of the cursor walk without reading the rest of the list.
+type lposMatcher struct {
+	element  []byte
+	rankAbs  int64
+	hasCount bool
+	count    int64
+	maxlen   int64
+	matched  int64
+	compared int64
+	matches  []int64
+}
+
+func newLposMatcher(element []byte, rank, count int64, hasCount bool, maxlen int64) (*lposMatcher, bool) {
 	rankAbs := rank
 	backward := false
 	if rank < 0 {
 		rankAbs = -rank
 		backward = true
 	}
+	return &lposMatcher{
+		element:  element,
+		rankAbs:  rankAbs,
+		hasCount: hasCount,
+		count:    count,
+		maxlen:   maxlen,
+	}, backward
+}
 
-	var matches []int64
-	matched := int64(0)
-	compared := int64(0)
-	scan := func(idx int) bool {
-		if maxlen > 0 && compared >= maxlen {
-			return false
-		}
-		compared++
-		if !bytes.Equal(elems[idx], element) {
-			return true
-		}
-		matched++
-		if matched < rankAbs {
-			return true
-		}
-		matches = append(matches, int64(idx))
-		if !hasCount {
-			return false
-		}
-		if count > 0 && int64(len(matches)) >= count {
-			return false
-		}
+func (m *lposMatcher) consider(idx int64, elem []byte) bool {
+	if m.maxlen > 0 && m.compared >= m.maxlen {
+		return false
+	}
+	m.compared++
+	if !bytes.Equal(elem, m.element) {
 		return true
 	}
+	m.matched++
+	if m.matched < m.rankAbs {
+		return true
+	}
+	m.matches = append(m.matches, idx)
+	if !m.hasCount {
+		return false
+	}
+	if m.count > 0 && int64(len(m.matches)) >= m.count {
+		return false
+	}
+	return true
+}
+
+// lposScan returns the matching indices for LPOS over a materialized blob list.
+func lposScan(elems [][]byte, element []byte, rank, count int64, hasCount bool, maxlen int64) []int64 {
+	m, backward := newLposMatcher(element, rank, count, hasCount, maxlen)
 	if backward {
 		for i := len(elems) - 1; i >= 0; i-- {
-			if !scan(i) {
+			if !m.consider(int64(i), elems[i]) {
 				break
 			}
 		}
 	} else {
 		for i := range elems {
-			if !scan(i) {
+			if !m.consider(int64(i), elems[i]) {
 				break
 			}
 		}
 	}
-	return matches
+	return m.matches
 }
 
 // handleLMPop implements LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count].
