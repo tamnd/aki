@@ -70,25 +70,33 @@ func geoInBox(centerLon, centerLat, lon, lat, width, height float64) (float64, b
 	return haversineMeters(centerLon, centerLat, lon, lat), true
 }
 
-// runGeoSearch scans every member of the source set and returns the matches. The
-// caller has already resolved the center coordinate.
-func runGeoSearch(members []zmember, q *geoQuery) []geoHit {
-	hits := make([]geoHit, 0)
-	for _, m := range members {
-		lon, lat := geoDecode(m.score)
-		var dist float64
-		var ok bool
-		if q.shape.byBox {
-			dist, ok = geoInBox(q.fromLon, q.fromLat, lon, lat, q.shape.width, q.shape.height)
-		} else {
-			dist, ok = geoInRadius(q.fromLon, q.fromLat, lon, lat, q.shape.radius)
-		}
-		if !ok {
-			continue
-		}
-		hits = append(hits, geoHit{member: m.member, score: m.score, dist: dist, lon: lon, lat: lat})
+// geoTestPoint tests one member against the query shape and returns its hit when
+// it falls inside. The member bytes are taken as given, so a streamed caller that
+// aliases a cursor arena must copy them before retaining the hit.
+func geoTestPoint(q *geoQuery, member []byte, score float64) (geoHit, bool) {
+	lon, lat := geoDecode(score)
+	var dist float64
+	var ok bool
+	if q.shape.byBox {
+		dist, ok = geoInBox(q.fromLon, q.fromLat, lon, lat, q.shape.width, q.shape.height)
+	} else {
+		dist, ok = geoInRadius(q.fromLon, q.fromLat, lon, lat, q.shape.radius)
 	}
+	if !ok {
+		return geoHit{}, false
+	}
+	return geoHit{member: member, score: score, dist: dist, lon: lon, lat: lat}, true
+}
 
+// geoCountEarlyExit reports whether collection can stop the moment it has COUNT
+// hits: only COUNT ANY skips the sort, so only it lets the walk terminate early.
+func geoCountEarlyExit(q *geoQuery) bool {
+	return q.hasCount && q.any
+}
+
+// finalizeGeoHits applies the order and the COUNT truncation to the collected
+// matches, the tail the old whole-set scan ended with.
+func finalizeGeoHits(hits []geoHit, q *geoQuery) []geoHit {
 	dir := q.sortDir
 	// COUNT without ANY and without an explicit order still sorts nearest first,
 	// so the truncation keeps the closest matches.
@@ -195,20 +203,6 @@ func parseGeoSearchOpts(q *geoQuery, args [][]byte) bool {
 	return true
 }
 
-// resolveCenter fills q.fromLon/q.fromLat when the center was given as a member.
-// It returns ok=false when that member is missing.
-func resolveCenter(members []zmember, q *geoQuery) bool {
-	if q.fromMember == nil {
-		return true
-	}
-	idx := zsetFind(members, q.fromMember)
-	if idx < 0 {
-		return false
-	}
-	q.fromLon, q.fromLat = geoDecode(members[idx].score)
-	return true
-}
-
 // writeGeoReply renders the GEOSEARCH/GEORADIUS reply for the given hits.
 func writeGeoReply(ctx *Ctx, q *geoQuery, hits []geoHit) {
 	enc := ctx.enc()
@@ -278,20 +272,9 @@ func handleGeoSearch(ctx *Ctx) {
 		hits     []geoHit
 	)
 	ok := ctx.view(func(db *keyspace.DB) error {
-		set, hdr, found, err := getZSet(db, ctx.Argv[1])
-		if err != nil {
-			return err
-		}
-		if found && hdr.Type != keyspace.TypeZSet {
-			wrongTyp = true
-			return nil
-		}
-		if !resolveCenter(set, q) {
-			noMember = true
-			return nil
-		}
-		hits = runGeoSearch(set, q)
-		return nil
+		h, wt, nm, err := geoSearchHits(db, ctx.Argv[1], q)
+		wrongTyp, noMember, hits = wt, nm, h
+		return err
 	})
 	if !ok {
 		return
@@ -304,7 +287,7 @@ func handleGeoSearch(ctx *Ctx) {
 		ctx.enc().WriteError("ERR could not decode requested zset member")
 		return
 	}
-	writeGeoReply(ctx, q, hits)
+	writeGeoReply(ctx, q, finalizeGeoHits(hits, q))
 }
 
 // handleGeoSearchStore implements GEOSEARCHSTORE dest src ...
@@ -322,19 +305,19 @@ func handleGeoSearchStore(ctx *Ctx) {
 		stored   int
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
-		set, hdr, found, err := getZSet(db, src)
+		hits, wt, nm, err := geoSearchHits(db, src, q)
 		if err != nil {
 			return err
 		}
-		if found && hdr.Type != keyspace.TypeZSet {
+		if wt {
 			wrongTyp = true
 			return nil
 		}
-		if !resolveCenter(set, q) {
+		if nm {
 			noMember = true
 			return nil
 		}
-		hits := runGeoSearch(set, q)
+		hits = finalizeGeoHits(hits, q)
 		stored = len(hits)
 		return storeGeoResult(ctx.encLimits(), db, dest, q, hits)
 	})
@@ -456,19 +439,19 @@ func runGeoRadius(ctx *Ctx, args [][]byte, byMember, allowStore bool) {
 		stored   int
 	)
 	run := func(db *keyspace.DB) error {
-		set, hdr, found, err := getZSet(db, ctx.Argv[1])
+		h, wt, nm, err := geoSearchHits(db, ctx.Argv[1], q)
 		if err != nil {
 			return err
 		}
-		if found && hdr.Type != keyspace.TypeZSet {
+		if wt {
 			wrongTyp = true
 			return nil
 		}
-		if !resolveCenter(set, q) {
+		if nm {
 			noMember = true
 			return nil
 		}
-		hits = runGeoSearch(set, q)
+		hits = finalizeGeoHits(h, q)
 		stored = len(hits)
 		if q.store != nil {
 			return storeGeoResult(ctx.encLimits(), db, q.store, q, hits)
