@@ -201,6 +201,108 @@ func sameEntries(a, b [][]string) bool {
 	return true
 }
 
+// TestStreamCollInfo drives XINFO STREAM and XINFO STREAM FULL over a coll-form
+// stream. The summary reports the metadata count as length and the boundary entry
+// rows as first-entry/last-entry without materializing the log; the full form
+// returns a COUNT-bounded forward window. The key must stay coll throughout.
+func TestStreamCollInfo(t *testing.T) {
+	r, c, eng := startDataEng(t)
+	const n = streamCollThreshold + 100
+	for i := 1; i <= n; i++ {
+		_ = bulk(t, r, c, fmt.Sprintf("XADD s %d-0 f v%d", i, i))
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("stream not coll after seeding %d", n)
+	}
+
+	// Summary: length from the metadata count, boundary entries from the first and
+	// last entry rows.
+	toks := xinfoReply(t, r, c, "XINFO STREAM s")
+	if got := valueAfter(t, toks, "length"); got != strconv.Itoa(n) {
+		t.Fatalf("XINFO STREAM length = %q want %d", got, n)
+	}
+	if got := valueAfter(t, toks, "last-generated-id"); got != fmt.Sprintf("%d-0", n) {
+		t.Fatalf("XINFO STREAM last-generated-id = %q want %d-0", got, n)
+	}
+	if got := valueAfter(t, toks, "recorded-first-entry-id"); got != "1-0" {
+		t.Fatalf("XINFO STREAM recorded-first-entry-id = %q want 1-0", got)
+	}
+	if got := valueAfter(t, toks, "groups"); got != "0" {
+		t.Fatalf("XINFO STREAM groups = %q want 0", got)
+	}
+	// first-entry/last-entry flatten to their id then fields; the id is the token
+	// right after the field name.
+	if got := valueAfter(t, toks, "first-entry"); got != "1-0" {
+		t.Fatalf("XINFO STREAM first-entry id = %q want 1-0", got)
+	}
+	if got := valueAfter(t, toks, "last-entry"); got != fmt.Sprintf("%d-0", n) {
+		t.Fatalf("XINFO STREAM last-entry id = %q want %d-0", got, n)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XINFO STREAM demoted to blob")
+	}
+
+	// FULL with COUNT 3: the entries window holds exactly the first three entries,
+	// so 3-0 is present and 4-0 is not, while length still reports the whole stream.
+	full := xinfoReply(t, r, c, "XINFO STREAM s FULL COUNT 3")
+	if got := valueAfter(t, full, "length"); got != strconv.Itoa(n) {
+		t.Fatalf("XINFO STREAM FULL length = %q want %d", got, n)
+	}
+	if got := valueAfter(t, full, "recorded-first-entry-id"); got != "1-0" {
+		t.Fatalf("XINFO STREAM FULL recorded-first-entry-id = %q want 1-0", got)
+	}
+	if !tokHas(full, "3-0") {
+		t.Fatalf("XINFO STREAM FULL COUNT 3 missing 3-0: %v", full)
+	}
+	if tokHas(full, "4-0") {
+		t.Fatalf("XINFO STREAM FULL COUNT 3 leaked 4-0 past the window: %v", full)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XINFO STREAM FULL demoted to blob")
+	}
+}
+
+// tokHas reports whether toks contains tok.
+func tokHas(toks []string, tok string) bool {
+	for _, t := range toks {
+		if t == tok {
+			return true
+		}
+	}
+	return false
+}
+
+// TestStreamCollInfoBounded witnesses that XINFO STREAM (summary) on a large coll
+// stream allocates a small constant, not O(entries). The summary reads the metadata
+// count plus the two boundary entry rows, never the whole log.
+func TestStreamCollInfoBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
+	d := newFuzzDispatcher(t)
+	conn := networking.NewOfflineConn()
+
+	const n = 4000
+	pad := make([]byte, 240)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	for i := 1; i <= n; i++ {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XADD"), []byte("s"),
+			[]byte(strconv.Itoa(i) + "-0"), []byte("f"), append([]byte("v"), pad...)})
+	}
+
+	// Each run reads the summary: metadata count plus two boundary entry rows. A
+	// whole-stream clone would move about a megabyte.
+	allocs := testing.AllocsPerRun(200, func() {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XINFO"), []byte("STREAM"), []byte("s")})
+	})
+	if allocs > 500 {
+		t.Fatalf("XINFO STREAM on a %d-entry stream allocated %.0f objects per run; "+
+			"a bounded summary should be a small constant, not O(n)", n, allocs)
+	}
+}
+
 // TestStreamCollMaterializePathStaysCorrect drives the commands slice 1 leaves on
 // the materialize-and-rebuild path (XDEL, XTRIM, XSETID) over a coll-form stream.
 // They are not yet bounded, but they must stay correct and must not demote the key
