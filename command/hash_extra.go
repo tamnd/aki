@@ -41,14 +41,71 @@ func handleHIncrBy(ctx *Ctx) {
 		overflow bool
 		result   int64
 	)
+	lim := ctx.encLimits()
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		fields, hdr, found, err := getHash(db, key)
+		// A btree-backed hash takes the point read-modify-write path: read the one
+		// field row, add, write it back. The whole hash is never materialized, so a
+		// HINCRBY against a multi-million-field hash stays O(log n) time and constant
+		// allocation instead of cloning every field onto the heap, which under a tight
+		// memory cap is the difference between serving and an OOM kill.
+		route, err := db.CollUpdateRouted(key, keyspace.TypeHash, keyspace.EncHashtable,
+			func(found bool, h keyspace.ValueHeader, _ []byte) keyspace.CollRoute {
+				if found && h.Type != keyspace.TypeHash {
+					wrongTyp = true
+					return keyspace.CollRouteSkip
+				}
+				if found && h.IsColl() {
+					return keyspace.CollRouteColl
+				}
+				return keyspace.CollRouteBlob
+			},
+			func(w *keyspace.CollWriter) error {
+				var cur, ttl int64
+				row, present, e := w.Get(field)
+				if e != nil {
+					return e
+				}
+				if present {
+					t, val, de := hashRowDecode(row)
+					if de != nil {
+						return de
+					}
+					// An expired field reads as 0 and loses its TTL, matching Redis.
+					if !hashRowExpired(t) {
+						v, vok := parseInteger(val)
+						if !vok {
+							notInt = true
+							return nil
+						}
+						cur, ttl = v, t
+					}
+				}
+				sum, sok := addInt64(cur, delta)
+				if !sok {
+					overflow = true
+					return nil
+				}
+				result = sum
+				created, e := w.Put(field, hashRowEncode(ttl, strconv.AppendInt(nil, sum, 10)))
+				if e != nil {
+					return e
+				}
+				if created {
+					w.SetCount(w.Count() + 1)
+				}
+				return nil
+			})
 		if err != nil {
 			return err
 		}
-		if found && hdr.Type != keyspace.TypeHash {
-			wrongTyp = true
+		if route != keyspace.CollRouteBlob {
 			return nil
+		}
+		// Blob path: a small hash decodes once (bounded by the listpack threshold),
+		// applies the increment, then rewrites the blob or promotes to the sub-tree.
+		fields, hdr, found, err := getHash(db, key)
+		if err != nil {
+			return err
 		}
 		var cur int64
 		idx := hashFind(fields, field)
@@ -76,7 +133,10 @@ func handleHIncrBy(ctx *Ctx) {
 		if found {
 			prev = hdr.Encoding
 		}
-		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(ctx.encLimits(), fields, prev), keepTTL(hdr, found))
+		if hashWantsTree(lim, fields, prev) {
+			return hashPromote(db, key, fields)
+		}
+		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(lim, fields, prev), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -109,14 +169,67 @@ func handleHIncrByFloat(ctx *Ctx) {
 		nanInf   bool
 		result   string
 	)
+	lim := ctx.encLimits()
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		fields, hdr, found, err := getHash(db, key)
+		// Same point read-modify-write as HINCRBY for the btree-backed form: the
+		// single field row is read and written, never the whole hash.
+		route, err := db.CollUpdateRouted(key, keyspace.TypeHash, keyspace.EncHashtable,
+			func(found bool, h keyspace.ValueHeader, _ []byte) keyspace.CollRoute {
+				if found && h.Type != keyspace.TypeHash {
+					wrongTyp = true
+					return keyspace.CollRouteSkip
+				}
+				if found && h.IsColl() {
+					return keyspace.CollRouteColl
+				}
+				return keyspace.CollRouteBlob
+			},
+			func(w *keyspace.CollWriter) error {
+				var cur float64
+				var ttl int64
+				row, present, e := w.Get(field)
+				if e != nil {
+					return e
+				}
+				if present {
+					t, val, de := hashRowDecode(row)
+					if de != nil {
+						return de
+					}
+					if !hashRowExpired(t) {
+						v, vok := parseFloat(val)
+						if !vok {
+							notFloat = true
+							return nil
+						}
+						cur, ttl = v, t
+					}
+				}
+				sum := cur + incr
+				if math.IsNaN(sum) || math.IsInf(sum, 0) {
+					nanInf = true
+					return nil
+				}
+				result = formatFloat(sum)
+				created, e := w.Put(field, hashRowEncode(ttl, []byte(result)))
+				if e != nil {
+					return e
+				}
+				if created {
+					w.SetCount(w.Count() + 1)
+				}
+				return nil
+			})
 		if err != nil {
 			return err
 		}
-		if found && hdr.Type != keyspace.TypeHash {
-			wrongTyp = true
+		if route != keyspace.CollRouteBlob {
 			return nil
+		}
+		// Blob path: bounded decode, apply, rewrite or promote.
+		fields, hdr, found, err := getHash(db, key)
+		if err != nil {
+			return err
 		}
 		var cur float64
 		var curBytes []byte
@@ -148,7 +261,10 @@ func handleHIncrByFloat(ctx *Ctx) {
 		if found {
 			prev = hdr.Encoding
 		}
-		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(ctx.encLimits(), fields, prev), keepTTL(hdr, found))
+		if hashWantsTree(lim, fields, prev) {
+			return hashPromote(db, key, fields)
+		}
+		return db.Set(key, hashEncode(fields), keyspace.TypeHash, hashEncoding(lim, fields, prev), keepTTL(hdr, found))
 	})
 	if !done {
 		return
