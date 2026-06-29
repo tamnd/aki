@@ -1067,14 +1067,11 @@ func handleXInfo(ctx *Ctx) {
 		wrongTyp bool
 		noKey    bool
 	)
-	// STREAM FULL embeds each group's PEL, so it loads them; the summary reports
-	// only the group count and stays on the header-only loader.
-	load := getStreamGroups
-	if full {
-		load = getStreamGroupsFull
-	}
+	// Both forms load the header alone (getStreamGroups). On a blob that already
+	// carries the inline PEL; on the coll form FULL loads a COUNT-bounded PEL window
+	// per group below, so it never clones the whole pending list.
 	if !ctx.view(func(db *keyspace.DB) error {
-		s, hdr, found, err := load(db, key)
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}
@@ -1125,6 +1122,13 @@ func handleXInfo(ctx *Ctx) {
 			}
 			if len(entries) > 0 {
 				recorded = entries[0].id
+			}
+			// FULL embeds each group's PEL: load a COUNT-bounded window per group from
+			// the 0x02 rows. The pel-count fields report the true totals from the header
+			// counters, so the bounded window only caps the listed records, matching how
+			// Redis caps XINFO STREAM FULL by COUNT.
+			if err := streamCollLoadGroupPELWindow(db, key, s.groups, window); err != nil {
+				return err
 			}
 			return nil
 		}

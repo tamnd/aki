@@ -710,7 +710,18 @@ func handleXAutoClaim(ctx *Ctx) {
 		cursor   = streamID{}
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStreamGroupsFull(db, key)
+		// A coll autoclaim reads the header alone and walks the group's 0x02 rows from
+		// the start id, so its cost is the COUNT-bounded scan window, never the whole
+		// pending list. A blob autoclaim works the small inline copy.
+		coll, err := streamHeaderIsColl(db, key)
+		if err != nil {
+			return err
+		}
+		load := getStreamGroups
+		if !coll {
+			load = getStreamGroupsFull
+		}
+		s, hdr, found, err := load(db, key)
 		if err != nil {
 			return err
 		}
@@ -728,64 +739,119 @@ func handleXAutoClaim(ctx *Ctx) {
 			return nil
 		}
 		c, _ := g.getOrCreateConsumer(consumerName, now)
-		var drop []streamID
-		// autoScan walks the PEL from start, fetching each entry's body through the
-		// supplied lookup. The scan is COUNT-bounded, so on the coll form it costs a
-		// COUNT-bounded set of point fetches, never a walk of the whole log.
-		autoScan := func(fields func(streamID) ([][]byte, bool, error)) error {
-			var scanned int64
-			for _, pe := range g.pel {
-				if pe.id.less(start) {
-					continue
+		if coll {
+			return db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
+				// Phase one: a COUNT-bounded cursor scan of the group's PEL rows from the
+				// start id, collecting only the records to consider. The cursor reads; the
+				// claims and deletes happen after so no row mutates mid-walk.
+				var cands []pelEntry
+				prefix := streamPELPrefix(groupName)
+				cur := w.Cursor()
+				if e := cur.Seek(streamPELRow(groupName, start)); e != nil {
+					return e
 				}
-				if scanned >= count {
-					cursor = pe.id
-					break
+				for cur.Valid() {
+					k := cur.Key()
+					if !bytes.HasPrefix(k, prefix) {
+						break
+					}
+					id := streamPELRowID(k, len(prefix))
+					if int64(len(cands)) >= count {
+						cursor = id
+						break
+					}
+					pe, e := streamPELFromValue(cur.Value())
+					if e != nil {
+						return e
+					}
+					pe.id = id
+					cands = append(cands, pe)
+					if e := cur.Next(); e != nil {
+						return e
+					}
 				}
-				scanned++
-				body, exists, err := fields(pe.id)
-				if err != nil {
-					return err
+				// Phase two: claim each candidate to this consumer, drop the ones whose
+				// entry was deleted, skip the ones still inside the min-idle window. The
+				// header pending counters move with each record so the bounded XPENDING
+				// summary and XINFO stay correct without a recount.
+				for _, pe := range cands {
+					body, exists, e := streamCollEntry(w, pe.id)
+					if e != nil {
+						return e
+					}
+					if !exists {
+						if _, e := streamPELDelete(w, groupName, pe.id); e != nil {
+							return e
+						}
+						if g.pending > 0 {
+							g.pending--
+						}
+						if oc := g.findConsumer(pe.consumer); oc != nil && oc.pending > 0 {
+							oc.pending--
+						}
+						deleted = append(deleted, pe.id)
+						continue
+					}
+					if elapsedSince(now, pe.deliveryTime) < minIdle {
+						continue
+					}
+					if pe.consumer != consumerName {
+						if oc := g.findConsumer(pe.consumer); oc != nil && oc.pending > 0 {
+							oc.pending--
+						}
+						c.pending++
+					}
+					if e := streamPELPut(w, groupName, pelEntry{
+						id:            pe.id,
+						consumer:      consumerName,
+						deliveryTime:  now,
+						deliveryCount: claimAutoCount(pe.deliveryCount, justID),
+					}); e != nil {
+						return e
+					}
+					if justID {
+						justIDs = append(justIDs, pe.id)
+					} else {
+						claimed = append(claimed, streamEntry{id: pe.id, fields: body})
+					}
 				}
-				if !exists {
-					deleted = append(deleted, pe.id)
-					drop = append(drop, pe.id)
-					continue
-				}
-				if elapsedSince(now, pe.deliveryTime) < minIdle {
-					continue
-				}
-				g.pelInsert(pelEntry{
-					id:            pe.id,
-					consumer:      consumerName,
-					deliveryTime:  now,
-					deliveryCount: claimAutoCount(pe.deliveryCount, justID),
-				})
-				if justID {
-					justIDs = append(justIDs, pe.id)
-				} else {
-					claimed = append(claimed, streamEntry{id: pe.id, fields: body})
-				}
-			}
-			return nil
+				c.seenTime = now
+				c.activeTime = now
+				_, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(s))
+				return e
+			})
 		}
-		if hdr.IsColl() {
-			if _, err := db.CollRead(key, func(r *keyspace.CollReader) error {
-				return autoScan(func(id streamID) ([][]byte, bool, error) {
-					return streamCollEntry(r, id)
-				})
-			}); err != nil {
-				return err
+		// Blob form: the whole small PEL is already in memory, so walk it in place.
+		var drop []streamID
+		var scanned int64
+		for _, pe := range g.pel {
+			if pe.id.less(start) {
+				continue
 			}
-		} else {
-			if err := autoScan(func(id streamID) ([][]byte, bool, error) {
-				idx := s.findEntry(id)
-				if idx < 0 {
-					return nil, false, nil
-				}
-				return s.entries[idx].fields, true, nil
-			}); err != nil {
-				return err
+			if scanned >= count {
+				cursor = pe.id
+				break
+			}
+			scanned++
+			idx := s.findEntry(pe.id)
+			if idx < 0 {
+				deleted = append(deleted, pe.id)
+				drop = append(drop, pe.id)
+				continue
+			}
+			if elapsedSince(now, pe.deliveryTime) < minIdle {
+				continue
+			}
+			g.pelInsert(pelEntry{
+				id:            pe.id,
+				consumer:      consumerName,
+				deliveryTime:  now,
+				deliveryCount: claimAutoCount(pe.deliveryCount, justID),
+			})
+			if justID {
+				justIDs = append(justIDs, pe.id)
+			} else {
+				claimed = append(claimed, streamEntry{id: pe.id, fields: s.entries[idx].fields})
 			}
 		}
 		for _, id := range drop {

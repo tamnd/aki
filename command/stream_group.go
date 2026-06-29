@@ -1,6 +1,7 @@
 package command
 
 import (
+	"bytes"
 	"sort"
 	"strconv"
 	"strings"
@@ -97,17 +98,6 @@ func (g *group) pelInsert(pe pelEntry) {
 	g.pel = append(g.pel, pelEntry{})
 	copy(g.pel[lo+1:], g.pel[lo:])
 	g.pel[lo] = pe
-}
-
-// consumerPending returns the number of PEL entries owned by a consumer.
-func (g *group) consumerPending(name string) int {
-	n := 0
-	for _, pe := range g.pel {
-		if pe.consumer == name {
-			n++
-		}
-	}
-	return n
 }
 
 // nogroupError formats the NOGROUP reply for a missing group on a key.
@@ -694,16 +684,12 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 		now := keyspace.NowMillis()
 		if !ctx.update(func(db *keyspace.DB) error {
 			for j := range n {
-				// A > delivery only advances the header and appends one PEL row per
-				// delivered entry, so it loads the header alone (getStreamGroups). An
-				// explicit-ID re-read walks the consumer's existing pending, so it loads
-				// the PEL rows too (getStreamGroupsFull). The blob fallback reads the
-				// whole small stream either way.
-				load := getStreamGroups
-				if !newDelivery[j] {
-					load = getStreamGroupsFull
-				}
-				s, hdr, found, err := load(db, keys[j])
+				// Both forms load the header alone (getStreamGroups). A > delivery only
+				// advances the header and appends one PEL row per delivered entry. An
+				// explicit-ID re-read walks the consumer's existing pending straight from
+				// the 0x02 rows on the coll form, so it never needs the whole PEL loaded;
+				// the blob fallback already carries the small inline PEL in getStreamGroups.
+				s, hdr, found, err := getStreamGroups(db, keys[j])
 				if err != nil {
 					return err
 				}
@@ -772,7 +758,7 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 				} else {
 					var rows []readEntry
 					if coll {
-						rows, err = collectConsumerPELColl(db, keys[j], g, consumerName, starts[j], count)
+						rows, err = collectConsumerPELCollScan(db, keys[j], groupName, consumerName, starts[j], count)
 						if err != nil {
 							return err
 						}
@@ -902,39 +888,65 @@ func collectConsumerPEL(s *stream, g *group, consumerName string, after streamID
 	return rows
 }
 
-// collectConsumerPELColl is the coll-form collectConsumerPEL: instead of reading an
-// in-memory entry slice it point-fetches each pending entry's body from the entry
-// rows, opening one reader for the whole bounded walk. The caller has already
-// loaded g.pel from the 0x02 sibling rows; the cost here is one btree point
-// lookup per returned row, bounded by count. Entries no longer in the stream become
-// null-field rows.
-func collectConsumerPELColl(db *keyspace.DB, key []byte, g *group, consumerName string, after streamID, count int64) ([]readEntry, error) {
+// collectConsumerPELCollScan is the coll-form explicit-ID re-read: it never loads the
+// whole PEL. It scans the group's 0x02 rows from the after id forward, keeps the rows
+// owned by this consumer, and point-fetches each one's body from the entry rows, all
+// under one reader. The rows are keyed by id, so the cursor seeks straight past the
+// after cursor and the walk costs the scanned window, bounded by count. Entries no
+// longer in the stream become null-field rows. The caller has confirmed the key is a
+// coll stream.
+func collectConsumerPELCollScan(db *keyspace.DB, key []byte, group, consumerName string, after streamID, count int64) ([]readEntry, error) {
 	var rows []readEntry
+	prefix := streamPELPrefix(group)
 	_, err := db.CollRead(key, func(r *keyspace.CollReader) error {
-		for _, pe := range g.pel {
-			if pe.consumer != consumerName {
-				continue
+		// Phase one: scan the group's 0x02 rows for this consumer's pending ids, in id
+		// order, capped at count. The cursor walk collects only ids so it never runs a
+		// point lookup mid-walk.
+		var ids []streamID
+		c := r.Cursor()
+		if e := c.Seek(streamPELRow(group, after)); e != nil {
+			return e
+		}
+		for c.Valid() {
+			k := c.Key()
+			if !bytes.HasPrefix(k, prefix) {
+				break
 			}
-			if !after.less(pe.id) {
-				continue
+			id := streamPELRowID(k, len(prefix))
+			// The seek can land on the after id itself; the re-read is exclusive.
+			if after.less(id) {
+				pe, e := streamPELFromValue(c.Value())
+				if e != nil {
+					return e
+				}
+				if pe.consumer == consumerName {
+					ids = append(ids, id)
+					if count > 0 && int64(len(ids)) >= count {
+						break
+					}
+				}
 			}
-			v, ok, e := r.Get(streamEntryRow(pe.id))
+			if e := c.Next(); e != nil {
+				return e
+			}
+		}
+		// Phase two: point-fetch each id's body. Entries no longer in the stream become
+		// null-field rows, matching the blob re-read.
+		for _, id := range ids {
+			v, ok, e := r.Get(streamEntryRow(id))
 			if e != nil {
 				return e
 			}
 			if !ok {
-				rows = append(rows, readEntry{id: pe.id, nilF: true})
-			} else {
-				fields, e := streamEntryFields(v)
-				if e != nil {
-					return e
-				}
-				// fields alias the page buffer, so copy before the reader closes.
-				rows = append(rows, readEntry{id: pe.id, fields: streamCopyEntry(streamEntry{fields: fields}).fields})
+				rows = append(rows, readEntry{id: id, nilF: true})
+				continue
 			}
-			if count > 0 && int64(len(rows)) >= count {
-				break
+			fields, e := streamEntryFields(v)
+			if e != nil {
+				return e
 			}
+			// fields alias the page buffer, so copy before the reader closes.
+			rows = append(rows, readEntry{id: id, fields: streamCopyEntry(streamEntry{fields: fields}).fields})
 		}
 		return nil
 	})
@@ -1118,8 +1130,11 @@ func writeFullGroups(enc *resp.Encoder, s *stream) {
 		// this group has not yet read. Redis 7.0+ includes it in STREAM FULL too.
 		enc.WriteBulkStringStr("lag")
 		enc.WriteInteger(int64(s.entriesAdded - g.entriesRead))
+		// pel-count is the true total from the header counter, so the coll form can
+		// report it without loading the whole PEL; the pending array below is the
+		// bounded window that was loaded. For a blob the counter equals len(g.pel).
 		enc.WriteBulkStringStr("pel-count")
-		enc.WriteInteger(int64(len(g.pel)))
+		enc.WriteInteger(int64(g.pending))
 		enc.WriteBulkStringStr("pending")
 		writeGroupPEL(enc, g)
 		enc.WriteBulkStringStr("consumers")
@@ -1155,10 +1170,11 @@ func writeGroupConsumers(enc *resp.Encoder, g *group) {
 		enc.WriteInteger(c.seenTime)
 		enc.WriteBulkStringStr("active-time")
 		enc.WriteInteger(c.activeTime)
-		// pel-count is the size of this consumer's pending entries list. Redis
-		// emits it per consumer in XINFO STREAM FULL, just before pending.
+		// pel-count is the size of this consumer's pending entries list, the true
+		// total from the consumer counter so the coll form reports it without the whole
+		// PEL. Redis emits it per consumer in XINFO STREAM FULL, just before pending.
 		enc.WriteBulkStringStr("pel-count")
-		enc.WriteInteger(int64(g.consumerPending(c.name)))
+		enc.WriteInteger(int64(c.pending))
 		enc.WriteBulkStringStr("pending")
 		writeConsumerPEL(enc, g, c.name)
 	}
