@@ -1059,11 +1059,16 @@ func handleXInfo(ctx *Ctx) {
 	nodeEntries := int(ctx.d.confInt("stream-node-max-entries", streamNodeEntries))
 	var (
 		snap     *stream
+		length   int64
+		recorded streamID
+		first    *streamEntry
+		last     *streamEntry
+		entries  []streamEntry
 		wrongTyp bool
 		noKey    bool
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, key)
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}
@@ -1076,6 +1081,62 @@ func handleXInfo(ctx *Ctx) {
 			return nil
 		}
 		snap = s
+		if !hdr.IsColl() {
+			// Blob form: s carries the whole entry log, index into it directly.
+			length = int64(len(s.entries))
+			recorded = s.firstID()
+			if len(s.entries) > 0 {
+				first = &s.entries[0]
+				last = &s.entries[len(s.entries)-1]
+			}
+			if full {
+				n := len(s.entries)
+				if count > 0 && int64(n) > count {
+					n = int(count)
+				}
+				entries = s.entries[:n]
+			}
+			return nil
+		}
+		// Coll form: the metadata count gives the length, and the first/last entry
+		// rows give the boundary entries, so nothing materializes the whole log. The
+		// FULL entry window is a COUNT-bounded forward cursor (COUNT 0 means all,
+		// which the caller asked for explicitly).
+		length, err = streamCollLen(db, key)
+		if err != nil {
+			return err
+		}
+		lo := rangeBound{id: streamID{}}
+		hi := rangeBound{id: maxStreamID}
+		if full {
+			window := count
+			if window == 0 {
+				window = -1
+			}
+			entries, err = streamCollRange(db, key, lo, hi, window, false)
+			if err != nil {
+				return err
+			}
+			if len(entries) > 0 {
+				recorded = entries[0].id
+			}
+			return nil
+		}
+		fwd, err := streamCollRange(db, key, lo, hi, 1, false)
+		if err != nil {
+			return err
+		}
+		if len(fwd) > 0 {
+			first = &fwd[0]
+			recorded = fwd[0].id
+		}
+		rev, err := streamCollRange(db, key, lo, hi, 1, true)
+		if err != nil {
+			return err
+		}
+		if len(rev) > 0 {
+			last = &rev[0]
+		}
 		return nil
 	}) {
 		return
@@ -1086,9 +1147,9 @@ func handleXInfo(ctx *Ctx) {
 	case noKey:
 		ctx.enc().WriteError(errStreamNoSuchKey)
 	case full:
-		writeStreamInfoFull(ctx.enc(), snap, count, nodeEntries)
+		writeStreamInfoFull(ctx.enc(), snap, length, recorded, entries, nodeEntries)
 	default:
-		writeStreamInfoSummary(ctx.enc(), snap, nodeEntries)
+		writeStreamInfoSummary(ctx.enc(), snap, length, recorded, first, last, nodeEntries)
 	}
 }
 
@@ -1100,25 +1161,30 @@ func (s *stream) firstID() streamID {
 	return s.entries[0].id
 }
 
-// raxKeys approximates the listpack-node count from the live entry count, packing
-// up to nodeEntries entries per node. A nodeEntries of zero or less means Redis
-// puts no entry-count cap on a node, so the whole stream collapses to one node.
-func (s *stream) raxKeys(nodeEntries int) int64 {
-	if len(s.entries) == 0 {
+// raxKeysFor approximates the listpack-node count from the live entry count,
+// packing up to nodeEntries entries per node. A nodeEntries of zero or less means
+// Redis puts no entry-count cap on a node, so the whole stream collapses to one
+// node. The count comes from the caller (the metadata count on coll, the slice
+// length on blob), never from a materialized entry slice.
+func raxKeysFor(length int64, nodeEntries int) int64 {
+	if length == 0 {
 		return 0
 	}
 	if nodeEntries <= 0 {
 		return 1
 	}
-	return int64((len(s.entries) + nodeEntries - 1) / nodeEntries)
+	return (length + int64(nodeEntries) - 1) / int64(nodeEntries)
 }
 
-// writeStreamInfoSummary writes the XINFO STREAM summary reply.
-func writeStreamInfoSummary(enc *resp.Encoder, s *stream, nodeEntries int) {
-	keys := s.raxKeys(nodeEntries)
+// writeStreamInfoSummary writes the XINFO STREAM summary reply. length is the live
+// entry count, recorded is the first present entry ID, and first/last are the
+// boundary entries (nil on an empty stream); on the coll form these come from the
+// metadata count and two boundary entry-row reads, not a materialized log.
+func writeStreamInfoSummary(enc *resp.Encoder, s *stream, length int64, recorded streamID, first, last *streamEntry, nodeEntries int) {
+	keys := raxKeysFor(length, nodeEntries)
 	pairs := func() {
 		enc.WriteBulkStringStr("length")
-		enc.WriteInteger(int64(len(s.entries)))
+		enc.WriteInteger(length)
 		enc.WriteBulkStringStr("radix-tree-keys")
 		enc.WriteInteger(keys)
 		enc.WriteBulkStringStr("radix-tree-nodes")
@@ -1130,13 +1196,13 @@ func writeStreamInfoSummary(enc *resp.Encoder, s *stream, nodeEntries int) {
 		enc.WriteBulkStringStr("entries-added")
 		enc.WriteInteger(int64(s.entriesAdded))
 		enc.WriteBulkStringStr("recorded-first-entry-id")
-		enc.WriteBulkStringStr(s.firstID().String())
+		enc.WriteBulkStringStr(recorded.String())
 		enc.WriteBulkStringStr("groups")
 		enc.WriteInteger(int64(len(s.groups)))
 		enc.WriteBulkStringStr("first-entry")
-		writeInfoEntry(enc, s, 0)
+		writeInfoEntry(enc, first)
 		enc.WriteBulkStringStr("last-entry")
-		writeInfoEntry(enc, s, len(s.entries)-1)
+		writeInfoEntry(enc, last)
 	}
 	if enc.Proto() >= 3 {
 		enc.WriteMapLen(10)
@@ -1146,17 +1212,19 @@ func writeStreamInfoSummary(enc *resp.Encoder, s *stream, nodeEntries int) {
 	pairs()
 }
 
-// writeStreamInfoFull writes the XINFO STREAM FULL reply. The groups array is
-// empty until consumer groups land.
-func writeStreamInfoFull(enc *resp.Encoder, s *stream, count int64, nodeEntries int) {
-	keys := s.raxKeys(nodeEntries)
+// writeStreamInfoFull writes the XINFO STREAM FULL reply. length is the live entry
+// count, recorded is the first present entry ID, and entries is the already
+// COUNT-bounded window the caller fetched (on the coll form a forward entry-row
+// cursor, never the whole log).
+func writeStreamInfoFull(enc *resp.Encoder, s *stream, length int64, recorded streamID, entries []streamEntry, nodeEntries int) {
+	keys := raxKeysFor(length, nodeEntries)
 	if enc.Proto() >= 3 {
 		enc.WriteMapLen(9)
 	} else {
 		enc.WriteArrayLen(18)
 	}
 	enc.WriteBulkStringStr("length")
-	enc.WriteInteger(int64(len(s.entries)))
+	enc.WriteInteger(length)
 	enc.WriteBulkStringStr("radix-tree-keys")
 	enc.WriteInteger(keys)
 	enc.WriteBulkStringStr("radix-tree-nodes")
@@ -1168,23 +1236,19 @@ func writeStreamInfoFull(enc *resp.Encoder, s *stream, count int64, nodeEntries 
 	enc.WriteBulkStringStr("entries-added")
 	enc.WriteInteger(int64(s.entriesAdded))
 	enc.WriteBulkStringStr("recorded-first-entry-id")
-	enc.WriteBulkStringStr(s.firstID().String())
+	enc.WriteBulkStringStr(recorded.String())
 	enc.WriteBulkStringStr("entries")
-	n := len(s.entries)
-	if count > 0 && int64(n) > count {
-		n = int(count)
-	}
-	writeEntries(enc, s.entries[:n])
+	writeEntries(enc, entries)
 	enc.WriteBulkStringStr("groups")
 	writeFullGroups(enc, s)
 }
 
-// writeInfoEntry writes the entry at idx in [id, [f, v, ...]] form, or null when
-// the index is out of range (an empty stream).
-func writeInfoEntry(enc *resp.Encoder, s *stream, idx int) {
-	if idx < 0 || idx >= len(s.entries) {
+// writeInfoEntry writes an entry in [id, [f, v, ...]] form, or null when it is nil
+// (an empty stream has no boundary entry).
+func writeInfoEntry(enc *resp.Encoder, e *streamEntry) {
+	if e == nil {
 		enc.WriteNullArray()
 		return
 	}
-	writeEntry(enc, s.entries[idx])
+	writeEntry(enc, *e)
 }
