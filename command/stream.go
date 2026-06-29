@@ -569,13 +569,31 @@ func handleXDel(ctx *Ctx) {
 		wrongTyp bool
 	)
 	if !ctx.updateShard(argv[1], func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, argv[1])
+		chdr, cfound, err := streamHeader(db, argv[1])
 		if err != nil {
 			return err
 		}
-		if found && hdr.Type != keyspace.TypeStream {
+		if cfound && chdr.Type != keyspace.TypeStream {
 			wrongTyp = true
 			return nil
+		}
+		if cfound && chdr.IsColl() {
+			// Bounded path: point delete each entry row, no whole-stream clone. An
+			// emptied stream must still exist, so recreate it as an empty blob.
+			d, emptied, meta, e := streamCollDel(db, argv[1], ids)
+			if e != nil {
+				return e
+			}
+			deleted = d
+			if emptied {
+				meta.entries = nil
+				return storeStream(db, argv[1], &meta, keepTTL(chdr, cfound))
+			}
+			return nil
+		}
+		s, hdr, found, err := getStream(db, argv[1])
+		if err != nil {
+			return err
 		}
 		if !found {
 			return nil
@@ -831,13 +849,32 @@ func handleXTrim(ctx *Ctx) {
 		wrongTyp bool
 	)
 	if !ctx.updateShard(argv[1], func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, argv[1])
+		chdr, cfound, err := streamHeader(db, argv[1])
 		if err != nil {
 			return err
 		}
-		if found && hdr.Type != keyspace.TypeStream {
+		if cfound && chdr.Type != keyspace.TypeStream {
 			wrongTyp = true
 			return nil
+		}
+		if cfound && chdr.IsColl() {
+			// Bounded path: delete only the trimmed low-end rows, no whole-stream
+			// clone. An emptied stream must still exist, so recreate it as an empty
+			// blob.
+			r, emptied, meta, e := streamCollTrimCmd(db, argv[1], ts)
+			if e != nil {
+				return e
+			}
+			removed = r
+			if emptied {
+				meta.entries = nil
+				return storeStream(db, argv[1], &meta, keepTTL(chdr, cfound))
+			}
+			return nil
+		}
+		s, hdr, found, err := getStream(db, argv[1])
+		if err != nil {
+			return err
 		}
 		if !found {
 			return nil
@@ -916,13 +953,31 @@ func handleXSetID(ctx *Ctx) {
 		tooSmall bool
 	)
 	if !ctx.updateShard(argv[1], func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, argv[1])
+		chdr, cfound, err := streamHeader(db, argv[1])
 		if err != nil {
 			return err
 		}
-		if found && hdr.Type != keyspace.TypeStream {
+		if cfound && chdr.Type != keyspace.TypeStream {
 			wrongTyp = true
 			return nil
+		}
+		if !cfound {
+			noKey = true
+			return nil
+		}
+		if chdr.IsColl() {
+			// Bounded path: edit only the header row; the highest present entry comes
+			// from the last entry row, not a full materialize.
+			small, e := streamCollSetID(db, argv[1], newLast, setEntriesAdded, entriesAdded, setMaxDeleted, maxDeleted)
+			if e != nil {
+				return e
+			}
+			tooSmall = small
+			return nil
+		}
+		s, hdr, found, err := getStream(db, argv[1])
+		if err != nil {
+			return err
 		}
 		if !found {
 			noKey = true

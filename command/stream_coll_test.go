@@ -259,6 +259,139 @@ func TestStreamCollMaterializePathStaysCorrect(t *testing.T) {
 	}
 }
 
+// TestStreamCollDelTrimSetID drives the slice-2 bounded write commands over a
+// coll-form stream: XDEL point-deletes entry rows, XTRIM range-deletes from the
+// low end, and XSETID edits the header. Each must stay correct, keep the key coll
+// (no demote), and an emptied stream must still exist with its last ID rather than
+// vanish.
+func TestStreamCollDelTrimSetID(t *testing.T) {
+	r, c, eng := startDataEng(t)
+	seed := func(n int) {
+		_ = sendLine(t, r, c, "DEL s")
+		for i := 1; i <= n; i++ {
+			_ = bulk(t, r, c, fmt.Sprintf("XADD s %d-0 f v%d", i, i))
+		}
+		if !streamIsColl(t, eng, "s") {
+			t.Fatalf("stream not coll after seeding %d", n)
+		}
+	}
+	const n = streamCollThreshold + 100
+
+	// XDEL removes named entries and keeps the key coll.
+	seed(n)
+	if got := sendLine(t, r, c, "XDEL s 10-0 20-0 999-0"); got != ":2" {
+		t.Fatalf("XDEL = %q want :2 (999-0 absent)", got)
+	}
+	if got := sendLine(t, r, c, "XLEN s"); got != fmt.Sprintf(":%d", n-2) {
+		t.Fatalf("XLEN after XDEL = %q want :%d", got, n-2)
+	}
+	if got := xentries(t, r, c, "XRANGE s 9-0 11-0"); !sameEntries(got, [][]string{{"9-0", "f", "v9"}, {"11-0", "f", "v11"}}) {
+		t.Fatalf("XRANGE around deleted 10-0 = %v", got)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XDEL demoted to blob")
+	}
+
+	// XTRIM MAXLEN keeps the highest entries; the key stays coll.
+	seed(n)
+	keep := streamCollThreshold + 10
+	if got := sendLine(t, r, c, fmt.Sprintf("XTRIM s MAXLEN %d", keep)); got != fmt.Sprintf(":%d", n-keep) {
+		t.Fatalf("XTRIM = %q want :%d", got, n-keep)
+	}
+	if got := sendLine(t, r, c, "XLEN s"); got != fmt.Sprintf(":%d", keep) {
+		t.Fatalf("XLEN after XTRIM = %q want :%d", got, keep)
+	}
+	// The lowest surviving entry is n-keep+1; everything below was trimmed.
+	low := n - keep + 1
+	if got := xentries(t, r, c, "XRANGE s - + COUNT 1"); !sameEntries(got, [][]string{{fmt.Sprintf("%d-0", low), "f", "v" + strconv.Itoa(low)}}) {
+		t.Fatalf("lowest entry after XTRIM = %v want %d-0", got, low)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XTRIM demoted to blob")
+	}
+
+	// XSETID rejects an ID below the highest present entry, accepts one above, and
+	// a following XADD * advances past it.
+	seed(n)
+	if got := sendLine(t, r, c, "XSETID s 5-0"); got != "-"+errStreamSetIDSmall {
+		t.Fatalf("XSETID below highest = %q want too-small error", got)
+	}
+	if got := sendLine(t, r, c, "XSETID s 1000000-0"); got != "+OK" {
+		t.Fatalf("XSETID above = %q", got)
+	}
+	id := bulk(t, r, c, "XADD s * f after")
+	if id < "1000000-1" {
+		t.Fatalf("XADD * after XSETID = %q want >= 1000000-1", id)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XSETID demoted to blob")
+	}
+
+	// Emptying a coll stream by XDEL leaves an existing 0-length stream that keeps
+	// its last ID, so the next XADD * advances past it.
+	seed(n)
+	for i := 1; i <= n; i++ {
+		_ = sendLine(t, r, c, fmt.Sprintf("XDEL s %d-0", i))
+	}
+	if got := sendLine(t, r, c, "XLEN s"); got != ":0" {
+		t.Fatalf("XLEN after deleting all = %q want :0", got)
+	}
+	if got := sendLine(t, r, c, "EXISTS s"); got != ":1" {
+		t.Fatalf("EXISTS after emptying by XDEL = %q want :1 (an empty stream still exists)", got)
+	}
+	// The last ID survives the empty, so a small explicit ID is still rejected as
+	// not greater than the highest ever seen (n-0).
+	if got := sendLine(t, r, c, "XADD s 50-0 f x"); got != "-"+errStreamIDSmaller {
+		t.Fatalf("XADD small ID after emptying by XDEL = %q want %q (last ID must persist)", got, errStreamIDSmaller)
+	}
+
+	// Emptying a coll stream by XTRIM MAXLEN 0 also keeps the key.
+	seed(n)
+	if got := sendLine(t, r, c, "XTRIM s MAXLEN 0"); got != fmt.Sprintf(":%d", n) {
+		t.Fatalf("XTRIM MAXLEN 0 = %q want :%d", got, n)
+	}
+	if got := sendLine(t, r, c, "EXISTS s"); got != ":1" {
+		t.Fatalf("EXISTS after XTRIM MAXLEN 0 = %q want :1", got)
+	}
+	if got := sendLine(t, r, c, "XLEN s"); got != ":0" {
+		t.Fatalf("XLEN after XTRIM MAXLEN 0 = %q want :0", got)
+	}
+}
+
+// TestStreamCollDelBounded witnesses that XDEL on a large coll stream allocates a
+// small constant, not O(entries): it point-deletes the named rows rather than
+// cloning the whole stream. We delete one entry and re-add it each run so the
+// stream size holds steady.
+func TestStreamCollDelBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
+	d := newFuzzDispatcher(t)
+	conn := networking.NewOfflineConn()
+
+	const n = 4000
+	pad := make([]byte, 240)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	add := func(i int) {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XADD"), []byte("s"),
+			[]byte(strconv.Itoa(i) + "-0"), []byte("f"), append([]byte("v"), pad...)})
+	}
+	for i := 1; i <= n; i++ {
+		add(i)
+	}
+
+	allocs := testing.AllocsPerRun(50, func() {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XDEL"), []byte("s"), []byte("1500-0")})
+		add(1500)
+	})
+	if allocs > 400 {
+		t.Fatalf("XDEL of one entry on a %d-entry stream allocated %.0f objects per run "+
+			"(re-add included); a point delete should be a small constant, not O(n)", n, allocs)
+	}
+}
+
 // TestStreamCollAddBounded witnesses that XADD on a large coll stream allocates a
 // small constant, not O(entries). The demote trap is that routing XADD through
 // getStream clones every entry onto the heap and storeStream(blob) rewrites the
