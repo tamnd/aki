@@ -196,6 +196,66 @@ func listPopOne(db *keyspace.DB, key []byte, hdr keyspace.ValueHeader, fromLeft 
 	return elem, false, nil
 }
 
+// listPopN removes up to count elements from the head (fromLeft) or tail of the
+// list at key and returns them in reply order, reporting whether the pop emptied
+// the list. A tail pop returns the elements tail first, matching LMPOP RIGHT. A
+// coll list deletes the boundary rows in place through listTreePop, so it touches
+// only the popped rows and never materializes a large list; a blob list (below the
+// coll threshold) decodes its small body. popped is nil when the list is empty or
+// absent. The caller has confirmed the key is a list and passes its header.
+func listPopN(db *keyspace.DB, key []byte, hdr keyspace.ValueHeader, count int64, fromLeft bool, lim encLimits) (popped [][]byte, emptied bool, err error) {
+	if hdr.IsColl() {
+		var before int64
+		err = db.CollUpdate(key, keyspace.TypeList, hdr.Encoding, func(w *keyspace.CollWriter) error {
+			before = w.Tail() - w.Head()
+			n := count
+			if n > before {
+				n = before
+			}
+			p, e := listTreePop(w, int(n), fromLeft)
+			popped = p
+			return e
+		})
+		if err != nil {
+			return nil, false, err
+		}
+		// listTreePop copies each row out, and an exhausting pop empties the key,
+		// in which case CollUpdate tore the sub-tree down.
+		return popped, before > 0 && int64(len(popped)) == before, nil
+	}
+	elems, ehdr, found, e := getList(db, key)
+	if e != nil {
+		return nil, false, e
+	}
+	if !found || len(elems) == 0 {
+		return nil, false, nil
+	}
+	n := int(min(count, int64(len(elems))))
+	var leftover [][]byte
+	if fromLeft {
+		popped = elems[:n]
+		leftover = elems[n:]
+	} else {
+		tail := elems[len(elems)-n:]
+		popped = make([][]byte, n)
+		for i := range tail {
+			popped[i] = tail[n-1-i]
+		}
+		leftover = elems[:len(elems)-n]
+	}
+	if len(leftover) == 0 {
+		if _, e := db.Delete(key); e != nil {
+			return nil, false, e
+		}
+		return popped, true, nil
+	}
+	if e := db.Set(key, listEncode(leftover), keyspace.TypeList,
+		listEncoding(lim, leftover, ehdr.Encoding), keepTTL(ehdr, found)); e != nil {
+		return nil, false, e
+	}
+	return popped, false, nil
+}
+
 // popEnd removes one element from the head (fromLeft) or tail of elems and
 // returns it with the remaining slice.
 func popEnd(elems [][]byte, fromLeft bool) (elem []byte, rest [][]byte) {
@@ -203,14 +263,6 @@ func popEnd(elems [][]byte, fromLeft bool) (elem []byte, rest [][]byte) {
 		return elems[0], elems[1:]
 	}
 	return elems[len(elems)-1], elems[:len(elems)-1]
-}
-
-// pushEnd adds elem to the head (toLeft) or tail of elems.
-func pushEnd(elems [][]byte, elem []byte, toLeft bool) [][]byte {
-	if toLeft {
-		return append([][]byte{elem}, elems...)
-	}
-	return append(elems, elem)
 }
 
 // handleLPos implements LPOS key element [RANK rank] [COUNT count] [MAXLEN n].
@@ -444,9 +496,10 @@ func handleLMPop(ctx *Ctx) {
 		poppedKey []byte
 		popped    [][]byte
 	)
+	lim := ctx.encLimits()
 	done := ctx.update(func(db *keyspace.DB) error {
 		for _, key := range keys {
-			elems, hdr, found, err := getList(db, key)
+			hdr, found, err := listHeader(db, key)
 			if err != nil {
 				return err
 			}
@@ -457,30 +510,19 @@ func handleLMPop(ctx *Ctx) {
 				wrongTyp = true
 				return nil
 			}
-			if len(elems) == 0 {
-				continue
-			}
-			n := int(min(count, int64(len(elems))))
-			var leftover [][]byte
-			if fromLeft {
-				popped = elems[:n]
-				leftover = elems[n:]
-			} else {
-				tail := elems[len(elems)-n:]
-				popped = make([][]byte, n)
-				for i := range tail {
-					popped[i] = tail[n-1-i]
-				}
-				leftover = elems[:len(elems)-n]
-			}
-			poppedKey = key
-			if len(leftover) == 0 {
-				emptied = true
-				_, err := db.Delete(key)
+			// Pop up to count elements from this key's end in place. A coll list
+			// deletes only the boundary rows, so the whole list is never cloned.
+			p, e, err := listPopN(db, key, hdr, count, fromLeft, lim)
+			if err != nil {
 				return err
 			}
-			return db.Set(key, listEncode(leftover), keyspace.TypeList,
-				listEncoding(ctx.encLimits(), leftover, hdr.Encoding), keepTTL(hdr, found))
+			if len(p) == 0 {
+				continue
+			}
+			popped = p
+			emptied = e
+			poppedKey = key
+			return nil
 		}
 		return nil
 	})
