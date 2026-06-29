@@ -286,16 +286,34 @@ func handleZRandMember(ctx *Ctx) {
 
 	var (
 		wrongTyp bool
+		isColl   bool
 		members  []zmember
+		picked   []zmember
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		ms, hdr, ok, err := getZSet(db, ctx.Argv[1])
+		hdr, found, err := zsetHeader(db, ctx.Argv[1])
 		if err != nil {
 			return err
 		}
-		if ok && hdr.Type != keyspace.TypeZSet {
+		if found && hdr.Type != keyspace.TypeZSet {
 			wrongTyp = true
 			return nil
+		}
+		// A coll-form sorted set samples through a bounded reservoir walk so it never
+		// clones every member to return a handful; a blob set keeps the materialized
+		// path that decodes once below the listpack threshold.
+		if found && hdr.IsColl() {
+			isColl = true
+			c := count
+			if !hasCount {
+				c = 1
+			}
+			picked, err = zsetCollRandMembers(db, ctx.Argv[1], c)
+			return err
+		}
+		ms, _, _, err := getZSet(db, ctx.Argv[1])
+		if err != nil {
+			return err
 		}
 		members = ms
 		return nil
@@ -307,6 +325,10 @@ func handleZRandMember(ctx *Ctx) {
 		return
 	}
 	enc := ctx.enc()
+	if isColl {
+		writeZRandReply(enc, picked, hasCount, count, withScores)
+		return
+	}
 	if !hasCount {
 		if len(members) == 0 {
 			enc.WriteNull()
@@ -326,6 +348,28 @@ func handleZRandMember(ctx *Ctx) {
 	}
 	enc.WriteArrayLen(len(chosen))
 	for _, zm := range chosen {
+		enc.WriteBulkString(zm.member)
+	}
+}
+
+// writeZRandReply emits the ZRANDMEMBER reply for an already-sampled coll-form
+// sorted set: a single bulk (or null) without a count, otherwise an array of members
+// or member/score pairs when WITHSCORES is set.
+func writeZRandReply(enc *resp.Encoder, picked []zmember, hasCount bool, count int64, withScores bool) {
+	if !hasCount {
+		if len(picked) == 0 {
+			enc.WriteNull()
+			return
+		}
+		enc.WriteBulkString(picked[0].member)
+		return
+	}
+	if withScores {
+		writeScoredPairs(enc, picked)
+		return
+	}
+	enc.WriteArrayLen(len(picked))
+	for _, zm := range picked {
 		enc.WriteBulkString(zm.member)
 	}
 }

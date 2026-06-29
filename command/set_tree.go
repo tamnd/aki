@@ -1,6 +1,8 @@
 package command
 
 import (
+	"math/rand/v2"
+
 	"github.com/tamnd/aki/keyspace"
 )
 
@@ -69,6 +71,74 @@ func collectSetMembers(db *keyspace.DB, key []byte) ([][]byte, error) {
 		return nil
 	})
 	return members, err
+}
+
+// setCollRandMembers picks members from a btree-backed set for SRANDMEMBER without
+// cloning the whole set. A positive count gives that many distinct members, capped
+// at the member count; a negative count gives exactly its magnitude, with repeats
+// allowed. The pick is a single forward reservoir pass over an arena-backed cursor,
+// so retained memory is the picks, never the set size: an SRANDMEMBER with a small
+// count on a multi-million-member set no longer materializes the whole set.
+//
+// Time is the full forward walk, O(n) cursor steps with no per-step allocation; a
+// true O(count) sample wants order-statistics counts in the btree, the same upgrade
+// the deep rank seeks want, held for that later slice. The bound that matters, no
+// whole-set clone, holds now.
+func setCollRandMembers(db *keyspace.DB, key []byte, count int64) (out [][]byte, err error) {
+	if count == 0 {
+		return nil, nil
+	}
+	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+		c := r.Cursor()
+		c.UseArena()
+		if e := c.First(); e != nil {
+			return e
+		}
+		if count > 0 {
+			// Distinct sample: a size-k reservoir over the members. Each member
+			// replaces a random slot with probability k/seen, a uniform sample of
+			// min(k, memberCount) distinct members.
+			k := int(count)
+			seen := 0
+			for c.Valid() {
+				seen++
+				if len(out) < k {
+					out = append(out, append([]byte(nil), c.Key()...))
+				} else if j := rand.IntN(seen); j < k {
+					out[j] = append([]byte(nil), c.Key()...)
+				}
+				if e := c.Next(); e != nil {
+					return e
+				}
+			}
+			return nil
+		}
+		// Negative count: -count independent draws with repeats. Each slot keeps its
+		// own size-one reservoir over the same stream.
+		m := int(-count)
+		buf := make([][]byte, m)
+		seen := 0
+		for c.Valid() {
+			seen++
+			var pick []byte
+			for s := 0; s < m; s++ {
+				if rand.IntN(seen) == 0 {
+					if pick == nil {
+						pick = append([]byte(nil), c.Key()...)
+					}
+					buf[s] = pick
+				}
+			}
+			if e := c.Next(); e != nil {
+				return e
+			}
+		}
+		if seen > 0 {
+			out = buf
+		}
+		return nil
+	})
+	return out, err
 }
 
 // setCard returns the member count in whichever form the set is stored. For a
