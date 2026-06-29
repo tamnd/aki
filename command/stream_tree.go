@@ -462,6 +462,151 @@ func streamCollRange(db *keyspace.DB, key []byte, start, end rangeBound, count i
 	return out, err
 }
 
+// streamCollDel deletes the listed entries from a coll stream in place, point
+// deleting each entry row that is present, advancing the max-deleted ID, and
+// decrementing the count. It rewrites only the small header row and the deleted
+// rows, never the whole stream. When the last entry is removed it reports
+// emptied=true and the surviving stream-level metadata: a stream with no entries
+// still exists in Redis (unlike the other collection types), but CollUpdate tears
+// the sub-tree down when the count reaches zero, so the caller recreates the empty
+// stream from the returned metadata.
+func streamCollDel(db *keyspace.DB, key []byte, ids []streamID) (deleted int64, emptied bool, meta stream, err error) {
+	err = db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
+		var s stream
+		hv, ok, e := w.Get([]byte{streamRowHeader})
+		if e != nil {
+			return e
+		}
+		if ok {
+			if e := streamReadHeader(&s, hv); e != nil {
+				return e
+			}
+		}
+		count := w.Count()
+		for _, id := range ids {
+			existed, e := w.Delete(streamEntryRow(id))
+			if e != nil {
+				return e
+			}
+			if !existed {
+				continue
+			}
+			deleted++
+			count--
+			if s.maxDeletedID.less(id) {
+				s.maxDeletedID = id
+			}
+		}
+		meta = s
+		if deleted == 0 {
+			return nil
+		}
+		if count == 0 {
+			// Let CollUpdate tear the now entry-less sub-tree down; the caller
+			// recreates the empty stream as a blob from meta.
+			emptied = true
+			w.SetCount(0)
+			return nil
+		}
+		w.SetCount(count)
+		if _, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(&s)); e != nil {
+			return e
+		}
+		return nil
+	})
+	return deleted, emptied, meta, err
+}
+
+// streamCollTrimCmd trims a coll stream from the low end per ts and returns the
+// number removed. It reuses streamCollTrim (the same low-end delete XADD uses) and
+// rewrites only the metadata count; the trim does not touch the header fields
+// (Redis does not advance max-deleted ID on a trim). As with streamCollDel, when
+// the trim empties the stream it reports emptied=true and the surviving metadata
+// so the caller recreates the empty stream rather than letting it tear down.
+func streamCollTrimCmd(db *keyspace.DB, key []byte, ts trimSpec) (removed int64, emptied bool, meta stream, err error) {
+	err = db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
+		var s stream
+		hv, ok, e := w.Get([]byte{streamRowHeader})
+		if e != nil {
+			return e
+		}
+		if ok {
+			if e := streamReadHeader(&s, hv); e != nil {
+				return e
+			}
+		}
+		meta = s
+		count := int64(w.Count())
+		dropped, e := streamCollTrim(w, ts, count)
+		if e != nil {
+			return e
+		}
+		removed = dropped
+		newCount := count - dropped
+		if newCount <= 0 && count > 0 {
+			emptied = true
+			w.SetCount(0)
+			return nil
+		}
+		w.SetCount(uint64(newCount))
+		return nil
+	})
+	return removed, emptied, meta, err
+}
+
+// streamCollSetID rewrites a coll stream's header fields in place for XSETID:
+// the last ID, and optionally the entries-added counter and max-deleted ID. It
+// reads the highest present entry through the writer's cursor to reject a last ID
+// below the log, touching only the header row. tooSmall reports that rejection.
+func streamCollSetID(db *keyspace.DB, key []byte, newLast streamID, setEntriesAdded bool, entriesAdded uint64, setMaxDeleted bool, maxDeleted streamID) (tooSmall bool, err error) {
+	err = db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
+		var s stream
+		hv, ok, e := w.Get([]byte{streamRowHeader})
+		if e != nil {
+			return e
+		}
+		if ok {
+			if e := streamReadHeader(&s, hv); e != nil {
+				return e
+			}
+		}
+		// The new last ID cannot drop below the highest entry still in the log. The
+		// last entry row is the highest present ID; the header sorts below it.
+		c := w.Cursor()
+		if e := c.Last(); e != nil {
+			return e
+		}
+		for c.Valid() {
+			k := c.Key()
+			if len(k) != 0 && k[0] == streamRowEntry {
+				if newLast.less(streamIDFromRow(k)) {
+					tooSmall = true
+					return nil
+				}
+				break
+			}
+			if len(k) != 0 && k[0] != streamRowEntry {
+				break
+			}
+			if e := c.Prev(); e != nil {
+				return e
+			}
+		}
+		s.lastID = newLast
+		if setEntriesAdded {
+			s.entriesAdded = entriesAdded
+		}
+		if setMaxDeleted {
+			s.maxDeletedID = maxDeleted
+		}
+		if _, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(&s)); e != nil {
+			return e
+		}
+		return nil
+	})
+	return tooSmall, err
+}
+
 // streamCopyEntry deep-copies an entry's field chunks, which alias the cursor's
 // arena buffer, so the returned entry stays valid after the cursor advances.
 func streamCopyEntry(e streamEntry) streamEntry {
