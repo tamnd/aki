@@ -42,39 +42,32 @@ func blockZPop(ctx *Ctx, fromMin bool) {
 	attempt := func() bool {
 		var (
 			poppedKey []byte
-			popped    zmember
+			popped    []zmember
 			emptied   bool
 			wrongTyp  bool
 		)
 		done := ctx.update(func(d *keyspace.DB) error {
 			for _, key := range keys {
-				members, hdr, found, err := getZSet(d, key)
+				hdr, found, err := zsetHeader(d, key)
 				if err != nil {
 					return err
 				}
-				if found && hdr.Type != keyspace.TypeZSet {
+				if !found {
+					continue
+				}
+				if hdr.Type != keyspace.TypeZSet {
 					wrongTyp = true
 					return nil
 				}
-				if !found || len(members) == 0 {
-					continue
-				}
-				var kept []zmember
-				if fromMin {
-					popped = members[0]
-					kept = members[1:]
-				} else {
-					popped = members[len(members)-1]
-					kept = members[:len(members)-1]
-				}
-				poppedKey = key
-				if len(kept) == 0 {
-					emptied = true
-					_, err := d.Delete(key)
+				popped, emptied, err = zsetPopN(d, key, hdr, 1, !fromMin, ctx.encLimits())
+				if err != nil {
 					return err
 				}
-				return d.Set(key, zsetEncode(kept), keyspace.TypeZSet,
-					zsetEncoding(ctx.encLimits(), kept, hdr.Encoding), keepTTL(hdr, found))
+				if len(popped) == 0 {
+					continue
+				}
+				poppedKey = key
+				return nil
 			}
 			return nil
 		})
@@ -106,8 +99,8 @@ func blockZPop(ctx *Ctx, fromMin bool) {
 		enc := ctx.enc()
 		enc.WriteArrayLen(3)
 		enc.WriteBulkString(poppedKey)
-		enc.WriteBulkString(popped.member)
-		enc.WriteDouble(popped.score)
+		enc.WriteBulkString(popped[0].member)
+		enc.WriteDouble(popped[0].score)
 		return true
 	}
 	ctx.d.blockDrive(ctx, keys, timeout, attempt, func() { ctx.enc().WriteNullArray() })
@@ -181,37 +174,26 @@ func handleBZMPop(ctx *Ctx) {
 		)
 		done := ctx.update(func(d *keyspace.DB) error {
 			for _, key := range keys {
-				members, hdr, found, err := getZSet(d, key)
+				hdr, found, err := zsetHeader(d, key)
 				if err != nil {
 					return err
 				}
-				if found && hdr.Type != keyspace.TypeZSet {
+				if !found {
+					continue
+				}
+				if hdr.Type != keyspace.TypeZSet {
 					wrongTyp = true
 					return nil
 				}
-				if !found || len(members) == 0 {
-					continue
-				}
-				n := int(min(count, int64(len(members))))
-				var kept []zmember
-				if fromMax {
-					popped = make([]zmember, n)
-					for i := range n {
-						popped[i] = members[len(members)-1-i]
-					}
-					kept = members[:len(members)-n]
-				} else {
-					popped = append(popped, members[:n]...)
-					kept = members[n:]
-				}
-				poppedKey = key
-				if len(kept) == 0 {
-					emptied = true
-					_, err := d.Delete(key)
+				popped, emptied, err = zsetPopN(d, key, hdr, count, fromMax, ctx.encLimits())
+				if err != nil {
 					return err
 				}
-				return d.Set(key, zsetEncode(kept), keyspace.TypeZSet,
-					zsetEncoding(ctx.encLimits(), kept, hdr.Encoding), keepTTL(hdr, found))
+				if len(popped) == 0 {
+					continue
+				}
+				poppedKey = key
+				return nil
 			}
 			return nil
 		})
