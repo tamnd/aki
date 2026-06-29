@@ -157,7 +157,7 @@ func handleZPop(ctx *Ctx, fromMax bool) {
 		popped   []zmember
 	)
 	done := ctx.updateShard(ctx.Argv[1], func(db *keyspace.DB) error {
-		members, hdr, found, err := getZSet(db, ctx.Argv[1])
+		hdr, found, err := zsetHeader(db, ctx.Argv[1])
 		if err != nil {
 			return err
 		}
@@ -167,6 +167,29 @@ func handleZPop(ctx *Ctx, fromMax bool) {
 		if hdr.Type != keyspace.TypeZSet {
 			wrongTyp = true
 			return nil
+		}
+		// A coll-form set pops a bounded window straight off the score index instead
+		// of cloning every member and rewriting the whole set as a blob.
+		if hdr.IsColl() {
+			popped, err = zsetCollPop(db, ctx.Argv[1], count, fromMax)
+			if err != nil {
+				return err
+			}
+			if len(popped) == 0 {
+				return nil
+			}
+			// CollUpdate removed the key when the pop emptied it; reflect that for the
+			// del notification.
+			_, stillThere, herr := zsetHeader(db, ctx.Argv[1])
+			if herr != nil {
+				return herr
+			}
+			emptied = !stillThere
+			return nil
+		}
+		members, _, _, err := getZSet(db, ctx.Argv[1])
+		if err != nil {
+			return err
 		}
 		n := int(min(count, int64(len(members))))
 		if n == 0 {
