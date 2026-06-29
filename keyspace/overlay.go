@@ -159,8 +159,10 @@ func newLiveCursor(lc *liveColl) *liveCursor {
 }
 
 func (lcur *liveCursor) first()        { lcur.i = 0 }
-func (lcur *liveCursor) valid() bool   { return lcur.i < len(lcur.keys) }
+func (lcur *liveCursor) valid() bool   { return lcur.i >= 0 && lcur.i < len(lcur.keys) }
 func (lcur *liveCursor) next()         { lcur.i++ }
+func (lcur *liveCursor) prev()         { lcur.i-- }
+func (lcur *liveCursor) last()         { lcur.i = len(lcur.keys) - 1 }
 func (lcur *liveCursor) key() []byte   { return []byte(lcur.keys[lcur.i]) }
 func (lcur *liveCursor) value() []byte { return lcur.lc.rows[lcur.keys[lcur.i]] }
 
@@ -169,6 +171,19 @@ func (lcur *liveCursor) value() []byte { return lcur.lc.rows[lcur.keys[lcur.i]] 
 func (lcur *liveCursor) seek(sub []byte) {
 	target := string(sub)
 	lcur.i = sort.SearchStrings(lcur.keys, target)
+}
+
+// seekForPrev positions the cursor at the largest subkey less than or equal to
+// sub, the same semantics as the B-tree cursor's SeekForPrev. It leaves the cursor
+// invalid (index -1) when every subkey is greater.
+func (lcur *liveCursor) seekForPrev(sub []byte) {
+	target := string(sub)
+	i := sort.SearchStrings(lcur.keys, target)
+	if i < len(lcur.keys) && lcur.keys[i] == target {
+		lcur.i = i
+		return
+	}
+	lcur.i = i - 1
 }
 
 // count is the number of live elements, the value HLEN/SCARD report.

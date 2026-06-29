@@ -237,15 +237,17 @@ type CollCursor struct {
 	hc   *hybridCursor
 }
 
-// UseForwardArena asks the underlying btree cursor to decode visited nodes into a
-// reused scratch buffer for a forward-only walk, so a bounded scan over a coll-form
-// collection allocates a small constant instead of O(n). It is a no-op for the
-// in-memory overlay and hybrid cursors, which hold their elements in memory and do
-// not decode pages. Call it once, before First or Seek; the caller must copy any
-// Key/Value it keeps before advancing, as those bytes alias the arena.
-func (cc *CollCursor) UseForwardArena() {
+// UseArena asks the underlying btree cursor to decode visited nodes into a reused
+// scratch buffer for a single-direction walk, so a bounded scan over a coll-form
+// collection allocates a small constant instead of O(n). It serves both a forward
+// walk (First/Seek then Next) and a backward one (Last/SeekForPrev then Prev). It
+// is a no-op for the in-memory overlay and hybrid cursors, which hold their
+// elements in memory and do not decode pages. Call it once, before positioning;
+// the caller must copy any Key/Value it keeps before advancing, as those bytes
+// alias the arena.
+func (cc *CollCursor) UseArena() {
 	if cc.c != nil {
-		cc.c.UseForwardArena()
+		cc.c.UseArena()
 	}
 }
 
@@ -270,6 +272,37 @@ func (cc *CollCursor) Seek(sub []byte) error {
 		return nil
 	}
 	return cc.c.Seek(sub)
+}
+
+// Last positions the cursor at the largest element row. Pair it with Prev for a
+// bounded reverse walk (ZPOPMAX, ZREVRANGE tail) that never materializes the
+// whole collection.
+func (cc *CollCursor) Last() error {
+	if cc.live != nil {
+		cc.live.last()
+		return nil
+	}
+	return cc.c.Last()
+}
+
+// SeekForPrev positions the cursor at the largest element row less than or equal
+// to sub, the start of a reverse range scan at its upper bound.
+func (cc *CollCursor) SeekForPrev(sub []byte) error {
+	if cc.live != nil {
+		cc.live.seekForPrev(sub)
+		return nil
+	}
+	return cc.c.SeekForPrev(sub)
+}
+
+// Prev steps to the previous element row in order. The cursor must have been
+// positioned by Last or SeekForPrev.
+func (cc *CollCursor) Prev() error {
+	if cc.live != nil {
+		cc.live.prev()
+		return nil
+	}
+	return cc.c.Prev()
 }
 func (cc *CollCursor) Valid() bool {
 	if cc.hc != nil {

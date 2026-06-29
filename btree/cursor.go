@@ -6,25 +6,43 @@ import "bytes"
 // the right-sibling links, so a full scan touches each leaf once. A cursor
 // reflects the tree as it was when each leaf was read; it is meant for a single
 // scan, not for holding open across concurrent writes.
+//
+// Forward motion (First/Seek/Next) follows the right-sibling links and ignores
+// path. Backward motion (Last/Prev/SeekForPrev) cannot use sibling links because
+// leaves carry no left link, so it records the root-to-leaf descent in path and
+// climbs it to reach the previous subtree. The two directions do not interleave:
+// position with Last or SeekForPrev before walking with Prev.
 type Cursor struct {
 	t     *Tree
 	leaf  *node
 	idx   int
+	path  []frame
 	arena *nodeArena
+}
+
+// frame records an interior node and the child index a backward descent took
+// through it, so Prev can climb back up and step into the previous subtree.
+type frame struct {
+	n   *node
+	idx int
 }
 
 // Cursor returns a new, unpositioned cursor. Call First or Seek before reading.
 func (t *Tree) Cursor() *Cursor { return &Cursor{t: t} }
 
-// UseForwardArena makes the cursor decode each visited node into a single reused
-// scratch buffer instead of allocating fresh key and value slices per cell per
-// leaf. It is safe ONLY for a forward-only walk (First/Seek then Next): each leaf
-// step resets the arena and retires the previous leaf, so a caller that copies
-// out the bytes it needs before advancing pays a small constant allocation for the
-// whole scan rather than O(n). Backward motion is not supported with the arena.
-// The caller copies any Key/Value it keeps, as those bytes alias the arena and are
-// overwritten on the next move.
-func (c *Cursor) UseForwardArena() {
+// UseArena makes the cursor decode each visited node into a single reused scratch
+// buffer instead of allocating fresh key and value slices per cell per leaf. It is
+// for a single-direction walk and the caller must copy any Key/Value it keeps, as
+// those bytes alias the arena.
+//
+// Forward (First/Seek then Next): each leaf step resets the arena and retires the
+// previous leaf, so the buffer stays small no matter how many leaves the scan
+// spans. Backward (Last/SeekForPrev then Prev): the arena is reset only at the
+// positioning call, then accumulates without reset because Prev keeps the
+// root-to-leaf path nodes live; the buffer therefore grows with the walk's node
+// count, which is a small constant for a bounded pop. Do not interleave the two
+// directions on one arena-backed cursor.
+func (c *Cursor) UseArena() {
 	if c.arena == nil {
 		c.arena = &nodeArena{buf: make([]byte, 0, 8192), tmp: make([]byte, 0, 256)}
 	}
@@ -138,17 +156,137 @@ func (c *Cursor) advanceLeaf() error {
 	}
 }
 
-// leftmostLeaf descends to the first leaf in key order.
-func (t *Tree) leftmostLeaf() (*node, error) {
-	pgno := t.root
+// Last positions the cursor at the largest key. It descends the rightmost child
+// at every level, recording the path so Prev can climb back up. A deleted-empty
+// rightmost leaf (deletes do not merge underfull pages) is handled by climbing to
+// the predecessor.
+func (c *Cursor) Last() error {
+	c.path = c.path[:0]
+	if c.arena != nil {
+		c.arena.reset()
+	}
+	return c.descendLast(c.t.root)
+}
+
+// SeekForPrev positions the cursor at the largest key less than or equal to key,
+// or marks it exhausted when every key is greater. It records the path so Prev
+// continues the backward walk, so use it to start a reverse range scan at the
+// upper bound.
+func (c *Cursor) SeekForPrev(key []byte) error {
+	c.path = c.path[:0]
+	if c.arena != nil {
+		c.arena.reset()
+	}
+	pgno := c.t.root
 	for {
-		n, err := t.readNode(pgno)
+		n, err := c.readNode(pgno)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if n.leaf {
-			return n, nil
+			c.leaf = n
+			c.idx = len(n.keys) - 1
+			for c.idx >= 0 && bytes.Compare(n.keys[c.idx], key) > 0 {
+				c.idx--
+			}
+			if c.idx >= 0 {
+				return nil
+			}
+			return c.climbPrev() // every key in this leaf exceeds key
 		}
-		pgno = n.children[0]
+		ci := n.childIndex(key)
+		c.path = append(c.path, frame{n, ci})
+		pgno = n.children[ci]
 	}
 }
+
+// Prev steps to the previous key in sorted order. Within a leaf it decrements the
+// index; at a leaf boundary it climbs the recorded path to the previous subtree
+// and descends that subtree's rightmost key. The cursor must have been positioned
+// by Last or SeekForPrev (the forward methods do not maintain the path).
+func (c *Cursor) Prev() error {
+	if c.leaf == nil {
+		return nil
+	}
+	if c.idx > 0 {
+		c.idx--
+		return nil
+	}
+	return c.climbPrev()
+}
+
+// descendLast walks from pgno down the rightmost children to the largest live key
+// at or below it, pushing each interior node onto the path. An empty leaf at the
+// bottom (a page emptied by deletes) sends it climbing for the predecessor.
+func (c *Cursor) descendLast(pgno uint32) error {
+	for {
+		n, err := c.readNode(pgno)
+		if err != nil {
+			return err
+		}
+		if n.leaf {
+			c.leaf = n
+			c.idx = len(n.keys) - 1
+			if c.idx >= 0 {
+				return nil
+			}
+			return c.climbPrev()
+		}
+		ci := len(n.children) - 1
+		c.path = append(c.path, frame{n, ci})
+		pgno = n.children[ci]
+	}
+}
+
+// climbPrev pops the path until it finds an interior node with an unvisited left
+// sibling subtree, then descends that subtree's rightmost key, skipping any empty
+// leaves it meets. It marks the cursor exhausted when the path runs out, which
+// means the current key was the smallest.
+func (c *Cursor) climbPrev() error {
+	for len(c.path) > 0 {
+		top := &c.path[len(c.path)-1]
+		if top.idx == 0 {
+			c.path = c.path[:len(c.path)-1]
+			continue
+		}
+		top.idx--
+		pgno := top.n.children[top.idx]
+		empty, err := c.descendRightmost(pgno)
+		if err != nil {
+			return err
+		}
+		if !empty {
+			return nil
+		}
+		// The whole subtree was empty leaves; descendRightmost left its frames on
+		// the path, so the loop climbs from the deepest of them and keeps going left.
+	}
+	c.leaf = nil
+	c.idx = 0
+	return nil
+}
+
+// descendRightmost descends pgno's rightmost children to a non-empty leaf, pushing
+// interior frames as it goes, and positions the cursor there. empty is true when
+// every leaf it reached was empty, in which case the cursor is left for climbPrev
+// to continue from the frames just pushed.
+func (c *Cursor) descendRightmost(pgno uint32) (empty bool, err error) {
+	for {
+		n, err := c.readNode(pgno)
+		if err != nil {
+			return false, err
+		}
+		if n.leaf {
+			if len(n.keys) == 0 {
+				return true, nil
+			}
+			c.leaf = n
+			c.idx = len(n.keys) - 1
+			return false, nil
+		}
+		ci := len(n.children) - 1
+		c.path = append(c.path, frame{n, ci})
+		pgno = n.children[ci]
+	}
+}
+
