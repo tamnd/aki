@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // readArray reads a RESP array header and returns its element lines as raw
@@ -23,6 +24,11 @@ func readArray(t *testing.T, r *bufio.Reader, c net.Conn, cmd string) []string {
 	}
 	out := make([]string, 0, n)
 	for range n {
+		// Refresh the deadline per element. A drain reply (ZPOPMAX over a whole
+		// coll-form zset returns thousands of bulk strings) reads far more than the
+		// one deadline sendLine set at command time would allow under the -race
+		// build on a loaded runner, where the server is also slow to produce them.
+		_ = c.SetReadDeadline(time.Now().Add(testReadDeadline))
 		out = append(out, readElem(t, r))
 	}
 	return out

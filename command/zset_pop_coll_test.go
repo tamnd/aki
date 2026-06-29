@@ -20,6 +20,7 @@ import (
 // threshold with padded members so a whole-set clone would move about a megabyte,
 // re-adding the popped members each run so the set size holds steady.
 func TestZPopCollIsBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
 	d := newFuzzDispatcher(t)
 	conn := networking.NewOfflineConn()
 

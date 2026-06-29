@@ -132,6 +132,7 @@ func TestAggScanCollMatch(t *testing.T) {
 // so a whole-set clone would move on the order of a megabyte, then assert one SSCAN
 // page allocates a small constant rather than scaling with the member count.
 func TestSScanCollPageIsBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
 	d := newFuzzDispatcher(t)
 	conn := networking.NewOfflineConn()
 

@@ -3,6 +3,7 @@ package command
 import (
 	"bytes"
 	"math"
+	"math/rand/v2"
 
 	"github.com/tamnd/aki/encoding"
 	"github.com/tamnd/aki/keyspace"
@@ -138,6 +139,98 @@ func collectZSetMembers(db *keyspace.DB, key []byte) ([]zmember, error) {
 			if e := c.Next(); e != nil {
 				return e
 			}
+		}
+		return nil
+	})
+	return out, err
+}
+
+// zsetCollRandMembers picks members from a btree-backed sorted set for ZRANDMEMBER
+// without cloning the whole set. A positive count gives that many distinct members,
+// capped at the member count; a negative count gives exactly its magnitude, with
+// repeats allowed. The pick is a single forward reservoir pass over the member-index
+// rows on an arena-backed cursor, so retained memory is the picks, never the set
+// size: a ZRANDMEMBER with a small count on a multi-million-member sorted set no
+// longer materializes the whole set the way the getZSet path did, which under a
+// tight memory cap was an OOM. Each pick carries its score, so WITHSCORES works off
+// the same walk. The member-index rows give an arbitrary (member-byte) order, which
+// matches the unspecified order ZRANDMEMBER is allowed to return.
+//
+// Time is the full forward walk, O(n) cursor steps with no per-step allocation; a
+// true O(count) sample wants order-statistics counts in the btree, the same upgrade
+// the deep rank seeks want, held for that later slice. The bound that matters, no
+// whole-set clone, holds now.
+func zsetCollRandMembers(db *keyspace.DB, key []byte, count int64) (out []zmember, err error) {
+	if count == 0 {
+		return nil, nil
+	}
+	clone := func(c *keyspace.CollCursor) zmember {
+		k := c.Key()
+		return zmember{
+			member: append([]byte(nil), k[1:]...),
+			score:  zScoreUnbits(encoding.U64BE(c.Value())),
+		}
+	}
+	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+		c := r.Cursor()
+		// Forward-only reservoir walk over the member-index rows. The pick clones the
+		// chosen member and score immediately, so the arena's reuse-until-next-move
+		// contract holds and the scan allocates a small constant, not the whole set.
+		c.UseArena()
+		if e := c.Seek([]byte{zRowMember}); e != nil {
+			return e
+		}
+		valid := func() bool {
+			if !c.Valid() {
+				return false
+			}
+			k := c.Key()
+			return len(k) > 0 && k[0] == zRowMember
+		}
+		if count > 0 {
+			// Distinct sample: a size-k reservoir over the members. Each member
+			// replaces a random slot with probability k/seen, a uniform sample of
+			// min(k, memberCount) distinct members.
+			k := int(count)
+			seen := 0
+			for valid() {
+				seen++
+				if len(out) < k {
+					out = append(out, clone(c))
+				} else if j := rand.IntN(seen); j < k {
+					out[j] = clone(c)
+				}
+				if e := c.Next(); e != nil {
+					return e
+				}
+			}
+			return nil
+		}
+		// Negative count: -count independent draws with repeats. Each slot keeps its
+		// own size-one reservoir over the same stream, so each ends an independent
+		// uniform member and a member can land in more than one slot.
+		m := int(-count)
+		buf := make([]zmember, m)
+		seen := 0
+		for valid() {
+			seen++
+			var zm zmember
+			built := false
+			for s := 0; s < m; s++ {
+				if rand.IntN(seen) == 0 {
+					if !built {
+						zm = clone(c)
+						built = true
+					}
+					buf[s] = zm
+				}
+			}
+			if e := c.Next(); e != nil {
+				return e
+			}
+		}
+		if seen > 0 {
+			out = buf
 		}
 		return nil
 	})

@@ -289,4 +289,3 @@ func (c *Cursor) descendRightmost(pgno uint32) (empty bool, err error) {
 		pgno = n.children[ci]
 	}
 }
-
