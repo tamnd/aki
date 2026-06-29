@@ -300,6 +300,16 @@ func zScoreAboveHigh(score float64, hi scoreBound) bool {
 	return score > hi.value
 }
 
+// zScoreBelowLow reports whether a descending walk has passed the low score bound
+// and can stop. Rows come back in descending score order on a reverse walk, so once
+// a score is below the bound no earlier row can qualify.
+func zScoreBelowLow(score float64, lo scoreBound) bool {
+	if lo.excl {
+		return score <= lo.value
+	}
+	return score < lo.value
+}
+
 // zsetCollRangeByScore walks a coll-form sorted set's score-index rows in ascending
 // order and returns the members whose score falls in [lo, hi], in score order. It
 // seeks straight to the low score, so the walk touches only the matching window plus
@@ -360,6 +370,69 @@ func zsetCollRangeByScore(db *keyspace.DB, key []byte, lo, hi scoreBound, limit 
 		return nil
 	})
 	return out, n, err
+}
+
+// zsetCollRevRangeByScore is the reverse of zsetCollRangeByScore: it returns the
+// members whose score falls in [lo, hi] in descending (score, member) order, the
+// ZREVRANGEBYSCORE shape. It seeks the score index to just past the high bound and
+// walks backward with the collection cursor's Prev, so a reverse band read over a
+// multi-million-member set stays bounded instead of cloning the whole set and
+// reversing it. LIMIT offset/count is applied during the walk. The caller has the
+// reversed (max, min) argument order already resolved into lo and hi.
+func zsetCollRevRangeByScore(db *keyspace.DB, key []byte, lo, hi scoreBound, limit bool, offset, count int64) (out []zmember, err error) {
+	if limit && offset < 0 {
+		return nil, nil
+	}
+	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+		c := r.Cursor()
+		// Backward score-index walk over one band: the arena holds the root-to-leaf
+		// path live and grows only by the few nodes this reverse band touches, so a
+		// narrow ZREVRANGEBYSCORE over a multi-million-member set stays bounded instead
+		// of allocating fresh key/value slices per cell across every leaf it spans.
+		c.UseArena()
+		// Seek to the start of the score group just above hi, then SeekForPrev lands
+		// on the largest row at or below hi. nextafter has no representable value
+		// between hi and itself, so no score in (hi, next) is skipped.
+		next := math.Nextafter(hi.value, math.Inf(1))
+		seek := encoding.AppendU64BE([]byte{zRowScore}, zScoreBits(next))
+		if e := c.SeekForPrev(seek); e != nil {
+			return e
+		}
+		skip := int64(0)
+		if limit {
+			skip = offset
+		}
+		for c.Valid() {
+			k := c.Key()
+			if len(k) == 0 || k[0] != zRowScore {
+				break
+			}
+			score := zScoreUnbits(encoding.U64BE(k[1:9]))
+			if zScoreBelowLow(score, lo) {
+				break
+			}
+			if !scoreInRange(score, lo, hi) { // high-edge exclusive skip
+				if e := c.Prev(); e != nil {
+					return e
+				}
+				continue
+			}
+			if skip > 0 {
+				skip--
+			} else {
+				member := append([]byte(nil), k[9:]...)
+				out = append(out, zmember{member: member, score: score})
+				if limit && count >= 0 && int64(len(out)) >= count {
+					break
+				}
+			}
+			if e := c.Prev(); e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	return out, err
 }
 
 // zsetMemberScores reads the scores of a specific handful of members without
