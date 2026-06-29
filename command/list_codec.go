@@ -5,6 +5,7 @@ import (
 
 	"github.com/tamnd/aki/encoding"
 	"github.com/tamnd/aki/keyspace"
+	"github.com/tamnd/aki/resp"
 )
 
 // errCorruptList is returned when a stored list body cannot be decoded, which
@@ -42,6 +43,62 @@ func listDecode(body []byte) ([][]byte, error) {
 		off += int(l)
 	}
 	return elems, nil
+}
+
+// listBlobRangeReply writes the inclusive [start, stop] window of the blob-form
+// list stored in body straight to enc, walking the encoded body in place. It
+// never materializes the whole [][]byte the way listDecode does, and that
+// materialization (one allocation and copy per element) is the bulk of an LRANGE's
+// cost on a hot list. The body is uvarint(count) then each element as
+// uvarint(len)+bytes, the shape listDecode reads. start and stop carry the LRANGE
+// index rules, resolved by listRangeBounds.
+//
+// It walks the body twice. The first pass validates every length and bound up to
+// the end of the window; the second writes the window. Validating first means a
+// corrupt body returns false with nothing written, so the caller falls back to the
+// cold path exactly as a decode error would there, instead of emitting a
+// half-formed array. Two index-only walks of a small body cost far less than the
+// per-element allocation listDecode pays, and the element bytes are written as
+// sub-slices of body with no copy of their own.
+func listBlobRangeReply(enc *resp.Encoder, body []byte, start, stop int64) bool {
+	if len(body) == 0 {
+		enc.WriteArrayLen(0)
+		return true
+	}
+	n, off0, err := encoding.Uvarint(body)
+	if err != nil {
+		return false
+	}
+	count := int64(n)
+	lo, hi := listRangeBounds(start, stop, count)
+	if lo > hi || count == 0 {
+		enc.WriteArrayLen(0)
+		return true
+	}
+	// Pass 1: validate lengths and bounds through element hi, writing nothing.
+	off := off0
+	for i := int64(0); i <= hi; i++ {
+		l, m, err := encoding.Uvarint(body[off:])
+		if err != nil {
+			return false
+		}
+		off += m + int(l)
+		if off > len(body) {
+			return false
+		}
+	}
+	// Pass 2: the window is known good, so write [lo, hi] straight off the body.
+	enc.WriteArrayLen(int(hi - lo + 1))
+	off = off0
+	for i := int64(0); i <= hi; i++ {
+		l, m, _ := encoding.Uvarint(body[off:])
+		off += m
+		if i >= lo {
+			enc.WriteBulkString(body[off : off+int(l)])
+		}
+		off += int(l)
+	}
+	return true
 }
 
 // listEncode packs elements back into the stored body form.
@@ -187,6 +244,26 @@ func getList(db *keyspace.DB, key []byte) ([][]byte, keyspace.ValueHeader, bool,
 		return nil, hdr, true, err
 	}
 	return elems, hdr, true, nil
+}
+
+// hotGetListBody returns the raw stored body of a blob-form list at key from the
+// lock-free hot cache, for callers that walk the body in place rather than
+// decoding it (LRANGE streams the requested window straight off it). It returns a
+// miss for a coll-form list, whose elements live in a sub-tree rather than the
+// value body, so the caller takes the cold path that reads the window from the
+// tree. The returned body aliases the cache entry and is only valid for the
+// duration of the call, which is all the streaming reply needs since the encoder
+// copies each element into the reply buffer as it goes.
+func hotGetListBody(ctx *Ctx, key []byte) ([]byte, bool) {
+	e := ctx.d.engine
+	if e == nil {
+		return nil, false
+	}
+	body, hdr, ok := e.viewHotGet(ctx.Conn.DB(), key)
+	if !ok || hdr.Type != keyspace.TypeList || hdr.IsColl() {
+		return nil, false
+	}
+	return body, true
 }
 
 // hotGetList tries to decode the list at key from the lock-free hot cache.

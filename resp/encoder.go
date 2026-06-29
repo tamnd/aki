@@ -1,6 +1,7 @@
 package resp
 
 import (
+	"bytes"
 	"math"
 	"math/big"
 	"strconv"
@@ -126,6 +127,47 @@ func (e *Encoder) WriteBulkString(data []byte) {
 	e.crlf()
 	_, _ = e.w.Write(data)
 	e.crlf()
+}
+
+// WriteBulkArray writes a complete array reply of bulk strings: the array header
+// followed by each element framed as a bulk string. It is the batched form of an
+// array header plus a WriteBulkString loop, which the large multi-bulk readers
+// (LRANGE, SMEMBERS, HVALS, and the like) all spell out by hand.
+//
+// On those replies the per-element cost is dominated by the five separate calls
+// WriteBulkString makes through the Writer interface. When the sink is the
+// connection's *bytes.Buffer, this method drops to that concrete type once,
+// pre-grows the buffer to the whole reply in a single allocation, and formats
+// each element header into a stack buffer, so each element costs three concrete
+// buffer writes instead of five dynamically dispatched ones. Any other Writer
+// falls back to the plain per-element path, so the wire bytes are identical
+// either way.
+func (e *Encoder) WriteBulkArray(items [][]byte) {
+	e.WriteArrayLen(len(items))
+	buf, ok := e.w.(*bytes.Buffer)
+	if !ok {
+		for _, it := range items {
+			e.WriteBulkString(it)
+		}
+		return
+	}
+	total := 0
+	for _, it := range items {
+		// $ + up to 20 length digits + CRLF + data + CRLF, rounded to 16 of fixed
+		// overhead, which covers every length that fits the small test elements and
+		// over-grows harmlessly for larger ones.
+		total += len(it) + 16
+	}
+	buf.Grow(total)
+	var hdr [24]byte
+	for _, it := range items {
+		hdr[0] = '$'
+		h := strconv.AppendInt(hdr[:1], int64(len(it)), 10)
+		h = append(h, '\r', '\n')
+		_, _ = buf.Write(h)
+		_, _ = buf.Write(it)
+		_, _ = buf.WriteString("\r\n")
+	}
 }
 
 // WriteBulkStringStr is WriteBulkString for a Go string, avoiding a []byte

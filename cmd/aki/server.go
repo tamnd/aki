@@ -12,10 +12,12 @@ import (
 	"syscall"
 
 	"github.com/tamnd/aki/command"
+	"github.com/tamnd/aki/hot"
 	"github.com/tamnd/aki/keyspace"
 	"github.com/tamnd/aki/networking"
 	"github.com/tamnd/aki/pager"
 	"github.com/tamnd/aki/rdb"
+	"github.com/tamnd/aki/store"
 	"github.com/tamnd/aki/vfs"
 )
 
@@ -68,6 +70,8 @@ func cmdServer(args []string) error {
 	appendonly := fs.String("appendonly", "", "enable the append-only file: yes or no")
 	appendfsync := fs.String("appendfsync", "", "durability policy: always, everysec, or no")
 	hashOverlay := fs.String("aki-hash-overlay", "", "in-memory hash write fast path: yes or no (default no)")
+	engine := fs.String("aki-engine", "", "storage engine for the string point path: btree (default, durable, all types), hybrid (experimental in-memory durable-spill store, string-only), or hot (experimental in-memory lock-free hot tier, string-only); spec 2064 rewrite")
+	akiNet := fs.String("aki-net", "", "TCP networking model: goroutine (default, one read-loop goroutine per connection), reactor (experimental epoll event loops, Linux+TCP only), or uring (experimental reactor that batches a turn's writes into one io_uring_enter, Linux+TCP only; spec 2064 reactor)")
 	save := fs.String("save", "", `RDB save points, e.g. "3600 1 300 100", or "" to disable`)
 	maxmemory := fs.String("maxmemory", "", "memory limit before eviction, e.g. 256mb (0 disables)")
 	maxmemoryPolicy := fs.String("maxmemory-policy", "", "eviction policy when maxmemory is reached")
@@ -75,6 +79,11 @@ func cmdServer(args []string) error {
 	loadRDB := fs.String("load-rdb", "", "import this dump.rdb on first open (only when the .aki file does not exist)")
 	rdbDB := fs.Int("rdb-db", -1, "with --load-rdb, import only this source database")
 	bufferPoolSize := fs.String("buffer-pool-size", "128mb", "buffer pool capacity (e.g. 128mb, 512mb); controls how much of the .aki file stays in memory")
+	// Diagnostic admin endpoint (pprof, /metrics, health, ready). It defaults to
+	// 127.0.0.1:6399; --admin-port 0 disables it so several instances can share one
+	// host without colliding on the port.
+	adminPort := fs.String("admin-port", "", "HTTP port for the diagnostic admin endpoint; 0 disables it (default 6399)")
+	adminBind := fs.String("admin-bind", "", "interface address for the admin endpoint (default 127.0.0.1)")
 	valueCacheFraction := fs.Float64("value-cache-fraction", 0.10, "share of the buffer-pool budget held as a decoded value cache for GET (perf/03); 0 disables it")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -145,7 +154,26 @@ func cmdServer(args []string) error {
 		valueCacheBytes = int64(float64(poolPages) * defaultPageBytes * frac)
 	}
 
-	ks, closeKS, err := openKeyspace(dataFile, dbCount, poolPages, valueCacheBytes)
+	// The resident hybrid-log engines (spec 2064 rewrite) are opt-in and
+	// experimental: they serve the string point path from a resident
+	// open-addressed index over an in-memory log instead of the durable B-tree.
+	// "hybrid" is the original durable-spill store/ engine; "hot" is the clean
+	// lock-free, in-place hot/ engine (the F2 hot tier). Both are string-only and
+	// non-durable in this slice, so they are gated behind the flag and never the
+	// default; the durable B-tree stays the engine for everything else.
+	var engineOpt keyspace.Option
+	switch eng := resolve("aki-engine", *engine); eng {
+	case "", "btree":
+		// default durable engine
+	case "hybrid":
+		engineOpt = keyspace.WithHybridLog(store.Tunables{Shards: 256, PageSize: 1 << 20, ResidentPagesPerShard: 0, Dir: ""})
+	case "hot":
+		engineOpt = keyspace.WithHotEngine(hot.Tunables{Shards: 256})
+	default:
+		return fmt.Errorf("--aki-engine %s is not a known engine (use btree, hybrid, or hot)", eng)
+	}
+
+	ks, closeKS, err := openKeyspace(dataFile, dbCount, poolPages, valueCacheBytes, engineOpt)
 	if err != nil {
 		return err
 	}
@@ -187,6 +215,7 @@ func cmdServer(args []string) error {
 		Addr:       listenAddr,
 		UnixSocket: resolve("unixsocket", *unixSocket),
 		MaxClients: *maxClients,
+		NetMode:    resolve("aki-net", *akiNet),
 	}
 
 	// Apply config-mirroring directives through the same path CONFIG SET uses, so
@@ -212,6 +241,8 @@ func cmdServer(args []string) error {
 		{"save", resolveSave(setFlags, fileConf, *save)},
 		{"maxmemory", resolve("maxmemory", *maxmemory)},
 		{"maxmemory-policy", resolve("maxmemory-policy", *maxmemoryPolicy)},
+		{"admin-port", resolve("admin-port", *adminPort)},
+		{"admin-bind", resolve("admin-bind", *adminBind)},
 	} {
 		if err := applyConf(kv[0], kv[1]); err != nil {
 			return err
@@ -252,7 +283,11 @@ func cmdServer(args []string) error {
 	defer d.StopProfiler()
 
 	if err := d.StartAdmin(); err != nil {
-		return fmt.Errorf("start admin endpoint: %w", err)
+		// The admin endpoint (pprof, /metrics, health, ready) is an optional
+		// diagnostic surface, not part of serving data. A bind failure there, most
+		// often its port already held by another aki on the same host, must not stop
+		// the database from coming up, so log it and serve without the endpoint.
+		d.LogWarn("admin endpoint unavailable, continuing without it", "error", err.Error())
 	}
 	defer d.StopAdmin()
 
@@ -448,7 +483,7 @@ func importRDBInto(ks *keyspace.Keyspace, path string, onlyDB int) (int, []strin
 // returns the keyspace over it plus a close function. The pager picks the file
 // format up from its header on reopen, so databases is used only at create time.
 // poolPages is the buffer-pool capacity in frames; zero uses the pager default.
-func openKeyspace(path string, databases, poolPages int, valueCacheBytes int64) (*keyspace.Keyspace, func(), error) {
+func openKeyspace(path string, databases, poolPages int, valueCacheBytes int64, engineOpt keyspace.Option) (*keyspace.Keyspace, func(), error) {
 	osfs := vfs.NewOS()
 	opts := pager.Options{CachePages: poolPages}
 	var (
@@ -464,7 +499,11 @@ func openKeyspace(path string, databases, poolPages int, valueCacheBytes int64) 
 	if err != nil {
 		return nil, nil, fmt.Errorf("open data file %s: %w", path, err)
 	}
-	ks, err := keyspace.Open(pgr, keyspace.WithValueCacheBytes(valueCacheBytes))
+	ksOpts := []keyspace.Option{keyspace.WithValueCacheBytes(valueCacheBytes)}
+	if engineOpt != nil {
+		ksOpts = append(ksOpts, engineOpt)
+	}
+	ks, err := keyspace.Open(pgr, ksOpts...)
 	if err != nil {
 		_ = pgr.Close()
 		return nil, nil, fmt.Errorf("open keyspace: %w", err)

@@ -639,16 +639,9 @@ func handleZRangeStore(ctx *Ctx) {
 		rangeErr   string
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
-		// The destination is overwritten, but a non-zset destination is still a
-		// WRONGTYPE error, so check its type before computing.
-		_, dstHdr, dstFound, err := db.Get(dst)
-		if err != nil {
-			return err
-		}
-		if dstFound && dstHdr.Type != keyspace.TypeZSet {
-			wrongTyp = true
-			return nil
-		}
+		// Only the source key is type-checked. The destination is overwritten
+		// whatever it held, so a string or list at the destination is replaced
+		// rather than rejected, matching Redis.
 		members, hdr, found, err := getZSet(db, src)
 		if err != nil {
 			return err
@@ -664,8 +657,8 @@ func handleZRangeStore(ctx *Ctx) {
 		}
 		n = int64(len(result))
 		if len(result) == 0 {
-			dstDeleted = dstFound
-			_, err := db.Delete(dst)
+			existed, err := db.Delete(dst)
+			dstDeleted = existed
 			return err
 		}
 		stored := make([]zmember, len(result))

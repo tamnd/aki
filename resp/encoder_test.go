@@ -154,3 +154,79 @@ func TestFormatDouble(t *testing.T) {
 		}
 	}
 }
+
+// sliceWriter is a Writer that is not a *bytes.Buffer, so WriteBulkArray takes
+// its per-element fallback path. It lets the test prove both paths produce the
+// same wire bytes.
+type sliceWriter struct{ b []byte }
+
+func (w *sliceWriter) WriteString(s string) (int, error) { w.b = append(w.b, s...); return len(s), nil }
+func (w *sliceWriter) WriteByte(c byte) error            { w.b = append(w.b, c); return nil }
+func (w *sliceWriter) Write(p []byte) (int, error)       { w.b = append(w.b, p...); return len(p), nil }
+
+func TestWriteBulkArray(t *testing.T) {
+	cases := [][][]byte{
+		nil,
+		{},
+		{[]byte("")},
+		{[]byte("a")},
+		{[]byte("alpha"), []byte("beta"), []byte("gamma")},
+		{[]byte("x"), nil, []byte("z")},
+		{bytes.Repeat([]byte("q"), 1234)},
+	}
+	for _, items := range cases {
+		// The hand-written array header plus per-element WriteBulkString loop is the
+		// reference shape every multi-bulk reader uses today.
+		var want bytes.Buffer
+		ref := NewEncoder(&want, 2)
+		ref.WriteArrayLen(len(items))
+		for _, it := range items {
+			ref.WriteBulkString(it)
+		}
+
+		// Fast path: the sink is a *bytes.Buffer.
+		var fast bytes.Buffer
+		NewEncoder(&fast, 2).WriteBulkArray(items)
+		if !bytes.Equal(fast.Bytes(), want.Bytes()) {
+			t.Fatalf("fast path mismatch for %d items: got %q want %q", len(items), fast.Bytes(), want.Bytes())
+		}
+
+		// Fallback path: a Writer that is not a *bytes.Buffer.
+		slow := &sliceWriter{}
+		NewEncoder(slow, 2).WriteBulkArray(items)
+		if !bytes.Equal(slow.b, want.Bytes()) {
+			t.Fatalf("fallback path mismatch for %d items: got %q want %q", len(items), slow.b, want.Bytes())
+		}
+	}
+}
+
+// BenchmarkBulkReply100 compares the batched WriteBulkArray against the manual
+// array-header-plus-loop on a 100-element reply of short values, the exact shape
+// redis-benchmark LRANGE_100 produces.
+func BenchmarkBulkReply100(b *testing.B) {
+	items := make([][]byte, 100)
+	for i := range items {
+		items[i] = []byte("xxx")
+	}
+	b.Run("loop", func(b *testing.B) {
+		var buf bytes.Buffer
+		e := NewEncoder(&buf, 2)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			buf.Reset()
+			e.WriteArrayLen(len(items))
+			for _, it := range items {
+				e.WriteBulkString(it)
+			}
+		}
+	})
+	b.Run("array", func(b *testing.B) {
+		var buf bytes.Buffer
+		e := NewEncoder(&buf, 2)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			buf.Reset()
+			e.WriteBulkArray(items)
+		}
+	})
+}

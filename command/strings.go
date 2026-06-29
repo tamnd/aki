@@ -341,6 +341,26 @@ func setWithExpire(ctx *Ctx, mode uint8, name string) {
 func handleGet(ctx *Ctx) {
 	key := ctx.Argv[1]
 
+	// Hybrid-log fast path: read straight off the v2 store, skipping the hot-value
+	// cache (which the hybrid engine never fills) and the engine read lock (the
+	// store is self-synchronized). This is the whole read for the hybrid engine,
+	// not a cache that can miss, so it answers GET here and returns. Lazy expiry
+	// is handled inside the store read, matching the hybrid engine's behavior; the
+	// hot-cache path below likewise defers expired-key invalidation.
+	if ctx.d.engine != nil && ctx.d.engine.hybridLog() {
+		b, h, ok, err := ctx.d.engine.viewHybridGet(ctx.Conn.DB(), key)
+		if err != nil {
+			ctx.enc().WriteError("ERR " + err.Error())
+			return
+		}
+		if ok && h.Type != keyspace.TypeString {
+			ctx.enc().WriteError(wrongTypeError)
+			return
+		}
+		writeStringOrNull(ctx, b, ok)
+		return
+	}
+
 	// Fast path: hot-value cache, no engine lock. This runs concurrently with
 	// writes because the cache shards carry their own mutexes and the cache
 	// pointer is atomic. An expired-key invalidation is deferred to the next
@@ -362,8 +382,21 @@ func handleGet(ctx *Ctx) {
 		found    bool
 		wrongTyp bool
 	)
+	// probed is true when the viewHotGet fast path above already missed the hot
+	// cache, so the B-tree read below can skip the redundant second cache probe.
+	probed := ctx.d.engine != nil
 	ok := ctx.view(func(db *keyspace.DB) error {
-		b, hdr, f, err := db.Get(key)
+		var (
+			b   []byte
+			hdr keyspace.ValueHeader
+			f   bool
+			err error
+		)
+		if probed {
+			b, hdr, f, err = db.GetUncached(key)
+		} else {
+			b, hdr, f, err = db.Get(key)
+		}
 		if err != nil {
 			return err
 		}
