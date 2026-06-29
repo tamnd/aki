@@ -1,6 +1,10 @@
 package btree
 
-import "bytes"
+import (
+	"bytes"
+
+	"github.com/tamnd/aki/format"
+)
 
 // Cursor iterates a tree's keys in sorted order. It walks the leaf level using
 // the right-sibling links, so a full scan touches each leaf once. A cursor
@@ -37,11 +41,13 @@ func (t *Tree) Cursor() *Cursor { return &Cursor{t: t} }
 //
 // Forward (First/Seek then Next): each leaf step resets the arena and retires the
 // previous leaf, so the buffer stays small no matter how many leaves the scan
-// spans. Backward (Last/SeekForPrev then Prev): the arena is reset only at the
-// positioning call, then accumulates without reset because Prev keeps the
-// root-to-leaf path nodes live; the buffer therefore grows with the walk's node
-// count, which is a small constant for a bounded pop. Do not interleave the two
-// directions on one arena-backed cursor.
+// spans. Backward (Last/SeekForPrev then Prev): the live leaf alone lives in the
+// arena and is reset on each leaf boundary, while the root-to-leaf path nodes Prev
+// keeps live are decoded children-only onto the heap so they survive those resets
+// (see readNav and readSeekBack). The arena therefore stays bounded in both
+// directions, so a whole-set reverse walk holds one leaf plus the O(height) path,
+// never O(visited-leaves). Do not interleave the two directions on one arena-backed
+// cursor.
 func (c *Cursor) UseArena() {
 	if c.arena == nil {
 		c.arena = &nodeArena{buf: make([]byte, 0, 8192), tmp: make([]byte, 0, 256)}
@@ -56,6 +62,67 @@ func (c *Cursor) readNode(pgno uint32) (*node, error) {
 		return c.t.readNodeAr(pgno, c.arena)
 	}
 	return c.t.readNode(pgno)
+}
+
+// readSeekBack reads a node during SeekForPrev's descent, where each interior step
+// must pick a child by comparing key against the separators. A leaf is decoded into
+// the arena (its keys are needed to position idx). An interior is searched on the
+// page with descendOnPage, which finds the descent index without cloning any
+// separator, and is decoded children-only so the frame still lets climbPrev step
+// left through the path. So a reverse seek positions in O(height) page reads with no
+// per-separator allocation, the same on-page descent the point read (Get) uses.
+// ci and child are meaningful only for an interior result.
+func (c *Cursor) readSeekBack(pgno uint32, key []byte) (n *node, ci int, child uint32, err error) {
+	if c.arena == nil {
+		n, err = c.t.readNode(pgno)
+		if err != nil || n.leaf {
+			return n, 0, 0, err
+		}
+		ci = n.childIndex(key)
+		return n, ci, n.children[ci], nil
+	}
+	pg, err := c.t.pgr.Get(pgno)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	defer c.t.pgr.Unpin(pg, false)
+	if pg.Data[0] == format.PageTypeBTreeLeaf {
+		c.arena.reset()
+		n, err = decodeNodeAr(pg.Data, c.arena)
+		return n, 0, 0, err
+	}
+	ci, child, err = descendOnPage(pg.Data, key)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	n, err = decodeInteriorChildren(pg.Data)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return n, ci, child, nil
+}
+
+// readNav reads a node for the backward navigation steps (descendLast,
+// descendRightmost) that need only child pointers, never a separator key. A leaf
+// is decoded into the arena after a reset, as readBack does; an interior is
+// decoded children-only, so the path frames carry no cloned separator bytes. That
+// keeps a whole-set reverse walk allocation-flat in the key count rather than
+// O(keys-visited), the clone that otherwise dominates a full reverse dump.
+// SeekForPrev keeps readBack because its descent picks the child by key.
+func (c *Cursor) readNav(pgno uint32) (*node, error) {
+	if c.arena == nil {
+		return c.t.readNode(pgno)
+	}
+	pg, err := c.t.pgr.Get(pgno)
+	if err != nil {
+		return nil, err
+	}
+	defer c.t.pgr.Unpin(pg, false)
+	if pg.Data[0] == format.PageTypeBTreeLeaf {
+		c.arena.reset()
+		return decodeNodeAr(pg.Data, c.arena)
+	}
+	return decodeInteriorChildren(pg.Data)
 }
 
 // First positions the cursor at the smallest key.
@@ -179,7 +246,7 @@ func (c *Cursor) SeekForPrev(key []byte) error {
 	}
 	pgno := c.t.root
 	for {
-		n, err := c.readNode(pgno)
+		n, ci, child, err := c.readSeekBack(pgno, key)
 		if err != nil {
 			return err
 		}
@@ -194,9 +261,8 @@ func (c *Cursor) SeekForPrev(key []byte) error {
 			}
 			return c.climbPrev() // every key in this leaf exceeds key
 		}
-		ci := n.childIndex(key)
 		c.path = append(c.path, frame{n, ci})
-		pgno = n.children[ci]
+		pgno = child
 	}
 }
 
@@ -220,7 +286,7 @@ func (c *Cursor) Prev() error {
 // bottom (a page emptied by deletes) sends it climbing for the predecessor.
 func (c *Cursor) descendLast(pgno uint32) error {
 	for {
-		n, err := c.readNode(pgno)
+		n, err := c.readNav(pgno)
 		if err != nil {
 			return err
 		}
@@ -272,7 +338,7 @@ func (c *Cursor) climbPrev() error {
 // to continue from the frames just pushed.
 func (c *Cursor) descendRightmost(pgno uint32) (empty bool, err error) {
 	for {
-		n, err := c.readNode(pgno)
+		n, err := c.readNav(pgno)
 		if err != nil {
 			return false, err
 		}

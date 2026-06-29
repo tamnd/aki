@@ -423,6 +423,7 @@ func parseLegacyRangeOptions(opts [][]byte, allowWithScores bool, s *rangeSpec) 
 func (ctx *Ctx) runRange(key, minArg, maxArg []byte, spec rangeSpec) {
 	var (
 		wrongTyp bool
+		streamed bool
 		result   []zmember
 		errStr   string
 	)
@@ -478,8 +479,11 @@ func (ctx *Ctx) runRange(key, minArg, maxArg []byte, spec rangeSpec) {
 				errStr = "ERR value is not an integer or out of range"
 				return nil
 			}
-			result, err = zsetCollRangeByRank(db, key, start, stop, spec.rev)
-			return err
+			// Stream the window straight off the score-index cursor into the encoder,
+			// so a whole-set dump (ZRANGE key 0 -1) never clones the set into a
+			// []zmember nor buffers the whole reply.
+			streamed = true
+			return streamZRangeByRank(ctx, db, key, start, stop, spec.rev, spec.withScores)
 		}
 		// A coll-form lex range walks the member-index rows, which are ordered by
 		// member bytes, straight from the low (or high, reversed) bound. ZRANGEBYLEX
@@ -521,6 +525,10 @@ func (ctx *Ctx) runRange(key, minArg, maxArg []byte, spec rangeSpec) {
 	}
 	if errStr != "" {
 		ctx.enc().WriteError(errStr)
+		return
+	}
+	if streamed {
+		// streamZRangeByRank already wrote the reply inside the read view.
 		return
 	}
 	ctx.writeRange(result, spec.withScores)

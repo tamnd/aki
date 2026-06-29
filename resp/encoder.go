@@ -193,6 +193,45 @@ func (e *Encoder) WriteBulkStreaming(data []byte) {
 	_, _ = buf.WriteString("\r\n")
 }
 
+// WriteDoubleStreaming writes a score with the same wire bytes as WriteDouble, but
+// when the sink is the connection's *bytes.Buffer it formats the float into a stack
+// buffer instead of returning a heap string. A streamed WITHSCORES reply (ZRANGE on
+// a btree-backed sorted set) calls it once per element, so the per-element cost is
+// zero allocations rather than the FormatDouble string WriteDouble makes. Any other
+// Writer falls back to WriteDouble, so the wire bytes are identical.
+func (e *Encoder) WriteDoubleStreaming(f float64) {
+	buf, ok := e.w.(*bytes.Buffer)
+	if !ok {
+		e.WriteDouble(f)
+		return
+	}
+	var num [32]byte
+	var s []byte
+	switch {
+	case math.IsInf(f, 1):
+		s = append(num[:0], "inf"...)
+	case math.IsInf(f, -1):
+		s = append(num[:0], "-inf"...)
+	case math.IsNaN(f):
+		s = append(num[:0], "nan"...)
+	default:
+		s = strconv.AppendFloat(num[:0], f, 'g', 17, 64)
+	}
+	if e.proto == 3 {
+		_ = buf.WriteByte(',')
+		_, _ = buf.Write(s)
+		_, _ = buf.WriteString("\r\n")
+		return
+	}
+	var hdr [8]byte
+	h := append(hdr[:0], '$')
+	h = strconv.AppendInt(h, int64(len(s)), 10)
+	h = append(h, '\r', '\n')
+	_, _ = buf.Write(h)
+	_, _ = buf.Write(s)
+	_, _ = buf.WriteString("\r\n")
+}
+
 // WriteBulkStringStr is WriteBulkString for a Go string, avoiding a []byte
 // conversion on the caller's side.
 func (e *Encoder) WriteBulkStringStr(s string) {
