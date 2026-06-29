@@ -73,6 +73,46 @@ func collectSetMembers(db *keyspace.DB, key []byte) ([][]byte, error) {
 	return members, err
 }
 
+// streamSetMembers writes every member of a btree-backed set as a set reply,
+// straight from a sub-tree cursor into the connection's encoder. The set length
+// comes from the collection's maintained count, so the reply header is written
+// before the walk, and the members stream out one row at a time with a periodic
+// socket flush. Retained memory is one cursor page plus the flush buffer, never
+// the set size, so SMEMBERS on a set far larger than RAM neither clones the set
+// onto the heap nor holds the whole reply in memory before sending. The count
+// and the rows are read under one read view, so the header matches the rows
+// emitted even if another connection mutates the set concurrently.
+func streamSetMembers(ctx *Ctx, db *keyspace.DB, key []byte) error {
+	enc := ctx.enc()
+	_, err := db.CollRead(key, func(r *keyspace.CollReader) error {
+		enc.WriteSetLen(int(r.Count()))
+		c := r.Cursor()
+		c.UseArena()
+		if e := c.First(); e != nil {
+			return e
+		}
+		for i := 0; c.Valid(); i++ {
+			enc.WriteBulkStreaming(c.Key())
+			if i&streamFlushEvery == streamFlushEvery {
+				if e := ctx.Conn.StreamFlush(); e != nil {
+					return e
+				}
+			}
+			if e := c.Next(); e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	return err
+}
+
+// streamFlushEvery is the cursor-step mask at which a streaming reply offers its
+// buffer to StreamFlush. The flush itself is a no-op until the buffer crosses
+// its size threshold, so this only bounds how often that cheap size check runs;
+// a power-of-two-minus-one mask makes the test a single AND.
+const streamFlushEvery = 0xFF
+
 // setCollRandMembers picks members from a btree-backed set for SRANDMEMBER without
 // cloning the whole set. A positive count gives that many distinct members, capped
 // at the member count; a negative count gives exactly its magnitude, with repeats
