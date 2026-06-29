@@ -140,6 +140,11 @@ func collScanPage(db *keyspace.DB, key, prefix, cursor []byte, count int, match 
 	next = "0"
 	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
 		c := r.Cursor()
+		// One page seeks to the start row then walks at most count rows forward; the
+		// forward arena keeps that walk's page decoding to a small constant instead of
+		// allocating fresh key/value slices per cell, so SSCAN/HSCAN/ZSCAN over a
+		// multi-million-element coll-form collection stays O(count), not O(n).
+		c.UseForwardArena()
 		var e error
 		if start {
 			e = c.Seek(prefix)

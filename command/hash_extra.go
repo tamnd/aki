@@ -210,7 +210,7 @@ func handleHIncrByFloat(ctx *Ctx) {
 					nanInf = true
 					return nil
 				}
-				result = formatFloat(sum)
+				result = formatDouble(sum)
 				created, e := w.Put(field, hashRowEncode(ttl, []byte(result)))
 				if e != nil {
 					return e

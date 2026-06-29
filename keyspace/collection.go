@@ -237,6 +237,18 @@ type CollCursor struct {
 	hc   *hybridCursor
 }
 
+// UseForwardArena asks the underlying btree cursor to decode visited nodes into a
+// reused scratch buffer for a forward-only walk, so a bounded scan over a coll-form
+// collection allocates a small constant instead of O(n). It is a no-op for the
+// in-memory overlay and hybrid cursors, which hold their elements in memory and do
+// not decode pages. Call it once, before First or Seek; the caller must copy any
+// Key/Value it keeps before advancing, as those bytes alias the arena.
+func (cc *CollCursor) UseForwardArena() {
+	if cc.c != nil {
+		cc.c.UseForwardArena()
+	}
+}
+
 func (cc *CollCursor) First() error {
 	if cc.hc != nil {
 		cc.hc.first()

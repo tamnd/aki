@@ -7,30 +7,67 @@ import "bytes"
 // reflects the tree as it was when each leaf was read; it is meant for a single
 // scan, not for holding open across concurrent writes.
 type Cursor struct {
-	t    *Tree
-	leaf *node
-	idx  int
+	t     *Tree
+	leaf  *node
+	idx   int
+	arena *nodeArena
 }
 
 // Cursor returns a new, unpositioned cursor. Call First or Seek before reading.
 func (t *Tree) Cursor() *Cursor { return &Cursor{t: t} }
 
+// UseForwardArena makes the cursor decode each visited node into a single reused
+// scratch buffer instead of allocating fresh key and value slices per cell per
+// leaf. It is safe ONLY for a forward-only walk (First/Seek then Next): each leaf
+// step resets the arena and retires the previous leaf, so a caller that copies
+// out the bytes it needs before advancing pays a small constant allocation for the
+// whole scan rather than O(n). Backward motion is not supported with the arena.
+// The caller copies any Key/Value it keeps, as those bytes alias the arena and are
+// overwritten on the next move.
+func (c *Cursor) UseForwardArena() {
+	if c.arena == nil {
+		c.arena = &nodeArena{buf: make([]byte, 0, 8192), tmp: make([]byte, 0, 256)}
+	}
+}
+
+// readNode reads a node honoring the forward arena when one is set. The arena is
+// reset by the caller at each descent/step boundary, not here, so a single
+// root-to-leaf descent shares one buffer.
+func (c *Cursor) readNode(pgno uint32) (*node, error) {
+	if c.arena != nil {
+		return c.t.readNodeAr(pgno, c.arena)
+	}
+	return c.t.readNode(pgno)
+}
+
 // First positions the cursor at the smallest key.
 func (c *Cursor) First() error {
-	n, err := c.t.leftmostLeaf()
-	if err != nil {
-		return err
+	if c.arena != nil {
+		c.arena.reset()
 	}
-	c.leaf = n
-	c.idx = 0
-	return nil
+	pgno := c.t.root
+	for {
+		n, err := c.readNode(pgno)
+		if err != nil {
+			return err
+		}
+		if n.leaf {
+			c.leaf = n
+			c.idx = 0
+			return nil
+		}
+		pgno = n.children[0]
+	}
 }
 
 // Seek positions the cursor at the first key greater than or equal to key.
 func (c *Cursor) Seek(key []byte) error {
+	if c.arena != nil {
+		c.arena.reset()
+	}
 	pgno := c.t.root
 	for {
-		n, err := c.t.readNode(pgno)
+		n, err := c.readNode(pgno)
 		if err != nil {
 			return err
 		}
@@ -83,7 +120,13 @@ func (c *Cursor) advanceLeaf() error {
 			c.idx = 0
 			return nil
 		}
-		n, err := c.t.readNode(sib)
+		// Forward-only: stepping to the sibling retires the current leaf, so the
+		// arena can be reset and reused for it. A caller that needs bytes from the
+		// old leaf has already copied them out before calling Next.
+		if c.arena != nil {
+			c.arena.reset()
+		}
+		n, err := c.readNode(sib)
 		if err != nil {
 			return err
 		}

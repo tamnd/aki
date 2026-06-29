@@ -427,13 +427,36 @@ func (ctx *Ctx) runRange(key, minArg, maxArg []byte, spec rangeSpec) {
 		errStr   string
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		members, hdr, ok, err := getZSet(db, key)
+		hdr, found, err := zsetHeader(db, key)
 		if err != nil {
 			return err
 		}
-		if ok && hdr.Type != keyspace.TypeZSet {
+		if found && hdr.Type != keyspace.TypeZSet {
 			wrongTyp = true
 			return nil
+		}
+		// A coll-form sorted set serves a forward score range by walking the
+		// score-index window directly, so the read stays bounded by the matching
+		// rows instead of cloning the whole set. The reverse direction needs a
+		// backward cursor and the lex and rank forms need a different seek, so those
+		// keep the materialize path for now.
+		if found && hdr.IsColl() && spec.byScore && !spec.rev {
+			loB, ok := parseScoreBound(minArg)
+			if !ok {
+				errStr = "ERR min or max is not a float"
+				return nil
+			}
+			hiB, ok := parseScoreBound(maxArg)
+			if !ok {
+				errStr = "ERR min or max is not a float"
+				return nil
+			}
+			result, _, err = zsetCollRangeByScore(db, key, loB, hiB, spec.limit, spec.offset, spec.count, false)
+			return err
+		}
+		members, _, _, err := getZSet(db, key)
+		if err != nil {
+			return err
 		}
 		result, errStr = computeRange(members, minArg, maxArg, spec)
 		return nil
@@ -469,13 +492,34 @@ func (ctx *Ctx) runRangeCount(key, minArg, maxArg []byte, spec rangeSpec) {
 		errStr   string
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		members, hdr, ok, err := getZSet(db, key)
+		hdr, found, err := zsetHeader(db, key)
 		if err != nil {
 			return err
 		}
-		if ok && hdr.Type != keyspace.TypeZSet {
+		if found && hdr.Type != keyspace.TypeZSet {
 			wrongTyp = true
 			return nil
+		}
+		// ZCOUNT over a coll-form set counts the score-index window in place rather
+		// than materializing the whole set to measure it. ZLEXCOUNT keeps the
+		// materialize path until the lex seek lands here too.
+		if found && hdr.IsColl() && spec.byScore {
+			loB, ok := parseScoreBound(minArg)
+			if !ok {
+				errStr = "ERR min or max is not a float"
+				return nil
+			}
+			hiB, ok := parseScoreBound(maxArg)
+			if !ok {
+				errStr = "ERR min or max is not a float"
+				return nil
+			}
+			_, n, err = zsetCollRangeByScore(db, key, loB, hiB, false, 0, 0, true)
+			return err
+		}
+		members, _, _, err := getZSet(db, key)
+		if err != nil {
+			return err
 		}
 		var result []zmember
 		result, errStr = computeRange(members, minArg, maxArg, spec)
