@@ -1,6 +1,8 @@
 package command
 
 import (
+	"bytes"
+
 	"github.com/tamnd/aki/encoding"
 	"github.com/tamnd/aki/keyspace"
 )
@@ -357,4 +359,264 @@ func listTreeRange(db *keyspace.DB, key []byte, start, stop int64) ([][]byte, er
 		return nil
 	})
 	return out, err
+}
+
+// listTreeTrim keeps only the inclusive logical range [start, stop] of a
+// btree-backed list, deleting the rows outside it and moving the head/tail window
+// inward. The kept window is already contiguous in the position-keyed tree, so the
+// trim deletes a head prefix and a tail suffix and never rewrites a surviving row,
+// holding one element at a time rather than materializing the list. trimmed
+// reports whether anything was removed; emptied reports an empty range, in which
+// case every row is dropped and the zero count makes CollUpdate tear the key down.
+func listTreeTrim(db *keyspace.DB, lim encLimits, key []byte, start, stop int64, prevEnc uint8) (trimmed, emptied bool, err error) {
+	err = db.CollUpdate(key, keyspace.TypeList, prevEnc, func(w *keyspace.CollWriter) error {
+		h, t := w.Head(), w.Tail()
+		n := t - h
+		lo, hi := listRangeBounds(start, stop, n)
+		if lo > hi || n == 0 {
+			emptied = true
+			trimmed = n > 0
+			for p := h; p < t; p++ {
+				if _, e := w.Delete(listPosRow(p)); e != nil {
+					return e
+				}
+			}
+			w.SetHead(0)
+			w.SetTail(0)
+			w.SetCount(0)
+			w.SetBytes(0)
+			return nil
+		}
+		if lo == 0 && hi == n-1 {
+			return nil
+		}
+		trimmed = true
+		var dropped uint64
+		drop := func(from, to int64) error {
+			for p := from; p < to; p++ {
+				row := listPosRow(p)
+				v, ok, e := w.Get(row)
+				if e != nil {
+					return e
+				}
+				if ok {
+					dropped += uint64(lpEntrySize(v))
+				}
+				if _, e := w.Delete(row); e != nil {
+					return e
+				}
+			}
+			return nil
+		}
+		if e := drop(h, h+lo); e != nil {
+			return e
+		}
+		if e := drop(h+hi+1, t); e != nil {
+			return e
+		}
+		w.SetHead(h + lo)
+		w.SetTail(h + hi + 1)
+		w.SetCount(uint64(hi - lo + 1))
+		nb := w.Bytes()
+		if dropped > nb {
+			nb = 0
+		} else {
+			nb -= dropped
+		}
+		w.SetBytes(nb)
+		w.SetEnc(listCollReportedEnc(lim, prevEnc, int(w.Count()), nb))
+		return nil
+	})
+	return trimmed, emptied, err
+}
+
+// listTreeRemove removes up to the LREM count matches of target from a
+// btree-backed list, keeping the position window contiguous by compacting
+// survivors toward the head. A positive or zero count compacts in a single
+// forward pass that drops matches on sight, zero removing every match and a
+// positive count stopping after that many. A negative count first walks the tail
+// backward to mark the last |count| matched positions, a set bounded by |count|,
+// then runs the same forward compaction consulting that set. Survivors slide down
+// to fill the gaps so logical index i stays head+i and the point and range
+// lookups keep working. The compaction starts at the first dropped position, not
+// the head, so survivors below the first match never move and a removal near the
+// tail rewrites only the tail. It holds one element at a time, so retained memory
+// is the result, not the list length. removed is the match count; emptied reports
+// an empty result, which makes CollUpdate tear the key down.
+func listTreeRemove(db *keyspace.DB, lim encLimits, key, target []byte, count int64, prevEnc uint8) (removed int64, emptied bool, err error) {
+	err = db.CollUpdate(key, keyspace.TypeList, prevEnc, func(w *keyspace.CollWriter) error {
+		h, t := w.Head(), w.Tail()
+		if t == h {
+			return nil
+		}
+		backward := count < 0
+		limit := count
+		// from is the first position the compaction has to touch: the survivors
+		// below it never move, so a removal near the tail rewrites only the tail.
+		from := h
+		var dropPos map[int64]struct{}
+		if backward {
+			limit = -count
+			dropPos = make(map[int64]struct{}, limit)
+			var marked int64
+			minPos := t
+			for p := t - 1; p >= h && marked < limit; p-- {
+				v, ok, e := w.Get(listPosRow(p))
+				if e != nil {
+					return e
+				}
+				if ok && bytes.Equal(v, target) {
+					dropPos[p] = struct{}{}
+					marked++
+					if p < minPos {
+						minPos = p
+					}
+				}
+			}
+			if marked == 0 {
+				return nil
+			}
+			from = minPos
+		}
+		wp := from
+		var removedBytes uint64
+		var dropCount int64
+		for rp := from; rp < t; rp++ {
+			row := listPosRow(rp)
+			v, ok, e := w.Get(row)
+			if e != nil {
+				return e
+			}
+			if !ok {
+				continue
+			}
+			drop := false
+			if backward {
+				_, drop = dropPos[rp]
+			} else if bytes.Equal(v, target) && (limit == 0 || dropCount < limit) {
+				drop = true
+			}
+			if drop {
+				dropCount++
+				removedBytes += uint64(lpEntrySize(v))
+				if _, e := w.Delete(row); e != nil {
+					return e
+				}
+				continue
+			}
+			if wp != rp {
+				if _, e := w.Put(listPosRow(wp), append([]byte(nil), v...)); e != nil {
+					return e
+				}
+			}
+			wp++
+		}
+		removed = dropCount
+		if dropCount == 0 {
+			return nil
+		}
+		for p := wp; p < t; p++ {
+			if _, e := w.Delete(listPosRow(p)); e != nil {
+				return e
+			}
+		}
+		w.SetTail(wp)
+		w.SetCount(uint64(wp - h))
+		nb := w.Bytes()
+		if removedBytes > nb {
+			nb = 0
+		} else {
+			nb -= removedBytes
+		}
+		w.SetBytes(nb)
+		if wp == h {
+			emptied = true
+			return nil
+		}
+		w.SetEnc(listCollReportedEnc(lim, prevEnc, int(w.Count()), nb))
+		return nil
+	})
+	return removed, emptied, err
+}
+
+// listTreeInsert inserts val before or after the first occurrence of pivot in a
+// btree-backed list, keeping the window contiguous by shifting the shorter side
+// of the list by one position to open a slot. It scans from the head to find the
+// pivot, which LINSERT is O(n) for in Redis too, then shifts either the prefix
+// down by one into a new head or the suffix up by one into a new tail, whichever
+// side is smaller, and writes val into the freed slot. It holds one element at a
+// time. result is the new length, -1 when the pivot is absent, and 0 when the
+// list is empty.
+func listTreeInsert(db *keyspace.DB, lim encLimits, key, pivot, val []byte, after bool, prevEnc uint8) (result int64, err error) {
+	err = db.CollUpdate(key, keyspace.TypeList, prevEnc, func(w *keyspace.CollWriter) error {
+		h, t := w.Head(), w.Tail()
+		n := t - h
+		if n == 0 {
+			result = 0
+			return nil
+		}
+		idx := int64(-1)
+		for i := int64(0); i < n; i++ {
+			v, ok, e := w.Get(listPosRow(h + i))
+			if e != nil {
+				return e
+			}
+			if ok && bytes.Equal(v, pivot) {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			result = -1
+			return nil
+		}
+		ins := idx
+		if after {
+			ins = idx + 1
+		}
+		move := func(from, to int64) error {
+			v, ok, e := w.Get(listPosRow(from))
+			if e != nil {
+				return e
+			}
+			if ok {
+				if _, e := w.Put(listPosRow(to), append([]byte(nil), v...)); e != nil {
+					return e
+				}
+			}
+			return nil
+		}
+		if ins <= n-ins {
+			// Shift the prefix [0, ins) down by one; the new head is h-1.
+			nh := h - 1
+			for i := int64(0); i < ins; i++ {
+				if e := move(h+i, nh+i); e != nil {
+					return e
+				}
+			}
+			if _, e := w.Put(listPosRow(nh+ins), append([]byte(nil), val...)); e != nil {
+				return e
+			}
+			w.SetHead(nh)
+		} else {
+			// Shift the suffix [ins, n) up by one, tail first so a moved element
+			// never clobbers one not yet read; the new tail is t+1.
+			for i := n - 1; i >= ins; i-- {
+				if e := move(h+i, h+i+1); e != nil {
+					return e
+				}
+			}
+			if _, e := w.Put(listPosRow(h+ins), append([]byte(nil), val...)); e != nil {
+				return e
+			}
+			w.SetTail(t + 1)
+		}
+		w.SetCount(uint64(n + 1))
+		nb := w.Bytes() + uint64(lpEntrySize(val))
+		w.SetBytes(nb)
+		w.SetEnc(listCollReportedEnc(lim, prevEnc, int(w.Count()), nb))
+		result = n + 1
+		return nil
+	})
+	return result, err
 }

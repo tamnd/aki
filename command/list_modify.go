@@ -175,7 +175,7 @@ func handleLInsert(ctx *Ctx) {
 		result   int64
 	)
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		elems, hdr, found, err := getList(db, key)
+		hdr, found, err := listHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -186,6 +186,16 @@ func handleLInsert(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeList {
 			wrongTyp = true
 			return nil
+		}
+		// A btree-backed list opens a slot by shifting its shorter side one
+		// position rather than cloning the whole list and rewriting it as a blob.
+		if hdr.IsColl() {
+			result, err = listTreeInsert(db, ctx.encLimits(), key, pivot, val, after, hdr.Encoding)
+			return err
+		}
+		elems, _, _, err := getList(db, key)
+		if err != nil {
+			return err
 		}
 		idx := -1
 		for i, e := range elems {
@@ -235,7 +245,7 @@ func handleLRem(ctx *Ctx) {
 		removed  int64
 	)
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		elems, hdr, found, err := getList(db, key)
+		hdr, found, err := listHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -245,6 +255,16 @@ func handleLRem(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeList {
 			wrongTyp = true
 			return nil
+		}
+		// A btree-backed list compacts survivors in place rather than cloning the
+		// whole list, filtering it, and rewriting it as a blob.
+		if hdr.IsColl() {
+			removed, emptied, err = listTreeRemove(db, ctx.encLimits(), key, target, count, hdr.Encoding)
+			return err
+		}
+		elems, _, _, err := getList(db, key)
+		if err != nil {
+			return err
 		}
 		rest, n := listRemove(elems, target, count)
 		removed = int64(n)
@@ -340,7 +360,7 @@ func handleLTrim(ctx *Ctx) {
 		emptied  bool
 	)
 	done := ctx.updateShard(key, func(db *keyspace.DB) error {
-		elems, hdr, found, err := getList(db, key)
+		hdr, found, err := listHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -350,6 +370,16 @@ func handleLTrim(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeList {
 			wrongTyp = true
 			return nil
+		}
+		// A btree-backed list deletes the rows outside the kept window and slides
+		// the head/tail in rather than cloning the list and rewriting it as a blob.
+		if hdr.IsColl() {
+			trimmed, emptied, err = listTreeTrim(db, ctx.encLimits(), key, start, stop, hdr.Encoding)
+			return err
+		}
+		elems, _, _, err := getList(db, key)
+		if err != nil {
+			return err
 		}
 		kept := listSlice(elems, start, stop)
 		if len(kept) == 0 {
