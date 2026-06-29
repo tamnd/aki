@@ -293,7 +293,7 @@ func handleXClaim(ctx *Ctx) {
 		justIDs  []streamID
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, key)
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}
@@ -314,43 +314,72 @@ func handleXClaim(ctx *Ctx) {
 			g.lastID = opts.lastID
 		}
 		c, _ := g.getOrCreateConsumer(consumerName, now)
-		for _, id := range ids {
-			idx := g.pelIndex(id)
-			created := false
-			var prev uint64
-			if idx < 0 {
-				if !opts.force || s.findEntry(id) < 0 {
+		// claim walks the requested ids, fetching each entry's body through the
+		// supplied lookup. On the coll form the lookup is a btree point fetch, so
+		// the cost is the number of ids claimed, never the size of the log.
+		claim := func(fields func(streamID) ([][]byte, bool, error)) error {
+			for _, id := range ids {
+				body, exists, err := fields(id)
+				if err != nil {
+					return err
+				}
+				idx := g.pelIndex(id)
+				created := false
+				var prev uint64
+				if idx < 0 {
+					if !opts.force || !exists {
+						continue
+					}
+					created = true
+				} else {
+					if elapsedSince(now, g.pel[idx].deliveryTime) < minIdle {
+						continue
+					}
+					prev = g.pel[idx].deliveryCount
+				}
+				// An entry deleted from the stream is dropped from the PEL, not claimed.
+				if !exists {
+					if idx >= 0 {
+						g.pel = append(g.pel[:idx], g.pel[idx+1:]...)
+					}
 					continue
 				}
-				created = true
-			} else {
-				if elapsedSince(now, g.pel[idx].deliveryTime) < minIdle {
-					continue
+				g.pelInsert(pelEntry{
+					id:            id,
+					consumer:      consumerName,
+					deliveryTime:  opts.claimDeliveryTime(now),
+					deliveryCount: opts.claimDeliveryCount(prev, created),
+				})
+				if opts.justID {
+					justIDs = append(justIDs, id)
+				} else {
+					claimed = append(claimed, streamEntry{id: id, fields: body})
 				}
-				prev = g.pel[idx].deliveryCount
 			}
-			// An entry deleted from the stream is dropped from the PEL, not claimed.
-			if s.findEntry(id) < 0 {
-				if idx >= 0 {
-					g.pel = append(g.pel[:idx], g.pel[idx+1:]...)
+			return nil
+		}
+		if hdr.IsColl() {
+			if _, err := db.CollRead(key, func(r *keyspace.CollReader) error {
+				return claim(func(id streamID) ([][]byte, bool, error) {
+					return streamCollEntry(r, id)
+				})
+			}); err != nil {
+				return err
+			}
+		} else {
+			if err := claim(func(id streamID) ([][]byte, bool, error) {
+				idx := s.findEntry(id)
+				if idx < 0 {
+					return nil, false, nil
 				}
-				continue
-			}
-			g.pelInsert(pelEntry{
-				id:            id,
-				consumer:      consumerName,
-				deliveryTime:  opts.claimDeliveryTime(now),
-				deliveryCount: opts.claimDeliveryCount(prev, created),
-			})
-			if opts.justID {
-				justIDs = append(justIDs, id)
-			} else {
-				claimed = append(claimed, s.entries[s.findEntry(id)])
+				return s.entries[idx].fields, true, nil
+			}); err != nil {
+				return err
 			}
 		}
 		c.seenTime = now
 		c.activeTime = now
-		return storeStream(db, key, s, keepTTL(hdr, found))
+		return storeStreamGroups(db, key, s, keepTTL(hdr, found))
 	}) {
 		return
 	}
@@ -487,7 +516,7 @@ func handleXAutoClaim(ctx *Ctx) {
 		cursor   = streamID{}
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, key)
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}
@@ -505,35 +534,64 @@ func handleXAutoClaim(ctx *Ctx) {
 			return nil
 		}
 		c, _ := g.getOrCreateConsumer(consumerName, now)
-		var scanned int64
 		var drop []streamID
-		for _, pe := range g.pel {
-			if pe.id.less(start) {
-				continue
+		// autoScan walks the PEL from start, fetching each entry's body through the
+		// supplied lookup. The scan is COUNT-bounded, so on the coll form it costs a
+		// COUNT-bounded set of point fetches, never a walk of the whole log.
+		autoScan := func(fields func(streamID) ([][]byte, bool, error)) error {
+			var scanned int64
+			for _, pe := range g.pel {
+				if pe.id.less(start) {
+					continue
+				}
+				if scanned >= count {
+					cursor = pe.id
+					break
+				}
+				scanned++
+				body, exists, err := fields(pe.id)
+				if err != nil {
+					return err
+				}
+				if !exists {
+					deleted = append(deleted, pe.id)
+					drop = append(drop, pe.id)
+					continue
+				}
+				if elapsedSince(now, pe.deliveryTime) < minIdle {
+					continue
+				}
+				g.pelInsert(pelEntry{
+					id:            pe.id,
+					consumer:      consumerName,
+					deliveryTime:  now,
+					deliveryCount: claimAutoCount(pe.deliveryCount, justID),
+				})
+				if justID {
+					justIDs = append(justIDs, pe.id)
+				} else {
+					claimed = append(claimed, streamEntry{id: pe.id, fields: body})
+				}
 			}
-			if scanned >= count {
-				cursor = pe.id
-				break
+			return nil
+		}
+		if hdr.IsColl() {
+			if _, err := db.CollRead(key, func(r *keyspace.CollReader) error {
+				return autoScan(func(id streamID) ([][]byte, bool, error) {
+					return streamCollEntry(r, id)
+				})
+			}); err != nil {
+				return err
 			}
-			scanned++
-			if s.findEntry(pe.id) < 0 {
-				deleted = append(deleted, pe.id)
-				drop = append(drop, pe.id)
-				continue
-			}
-			if elapsedSince(now, pe.deliveryTime) < minIdle {
-				continue
-			}
-			g.pelInsert(pelEntry{
-				id:            pe.id,
-				consumer:      consumerName,
-				deliveryTime:  now,
-				deliveryCount: claimAutoCount(pe.deliveryCount, justID),
-			})
-			if justID {
-				justIDs = append(justIDs, pe.id)
-			} else {
-				claimed = append(claimed, s.entries[s.findEntry(pe.id)])
+		} else {
+			if err := autoScan(func(id streamID) ([][]byte, bool, error) {
+				idx := s.findEntry(id)
+				if idx < 0 {
+					return nil, false, nil
+				}
+				return s.entries[idx].fields, true, nil
+			}); err != nil {
+				return err
 			}
 		}
 		for _, id := range drop {
@@ -543,7 +601,7 @@ func handleXAutoClaim(ctx *Ctx) {
 		}
 		c.seenTime = now
 		c.activeTime = now
-		return storeStream(db, key, s, keepTTL(hdr, found))
+		return storeStreamGroups(db, key, s, keepTTL(hdr, found))
 	}) {
 		return
 	}

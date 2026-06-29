@@ -664,6 +664,23 @@ func streamCollSetID(db *keyspace.DB, key []byte, newLast streamID, setEntriesAd
 	return tooSmall, err
 }
 
+// streamCollEntry point-fetches one entry's fields from a coll stream's entry row
+// through an open reader. ok is false when the row is absent (the entry was deleted
+// or trimmed). The fields are copied, so they stay valid after the reader closes.
+// XCLAIM and XAUTOCLAIM use this to check existence and build their replies without
+// materializing the whole stream.
+func streamCollEntry(r *keyspace.CollReader, id streamID) (fields [][]byte, ok bool, err error) {
+	v, ok, err := r.Get(streamEntryRow(id))
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	f, err := streamEntryFields(v)
+	if err != nil {
+		return nil, false, err
+	}
+	return streamCopyEntry(streamEntry{fields: f}).fields, true, nil
+}
+
 // streamCopyEntry deep-copies an entry's field chunks, which alias the cursor's
 // arena buffer, so the returned entry stays valid after the cursor advances.
 func streamCopyEntry(e streamEntry) streamEntry {
