@@ -1,6 +1,7 @@
 package command
 
 import (
+	"bytes"
 	"strconv"
 	"strings"
 
@@ -101,6 +102,7 @@ func handleXPending(ctx *Ctx) {
 		minID       streamID
 		maxID       streamID
 		collSummary bool
+		rows        []pendingRow
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
 		// The summary reads the header alone: on a coll stream the group's pending
@@ -143,7 +145,11 @@ func handleXPending(ctx *Ctx) {
 			}
 			return nil
 		}
-		s, hdr, found, err := getStreamGroupsFull(db, key)
+		// The extended reply scans the PEL by id range. On the coll form the rows live
+		// in the group's 0x02 siblings, so a header-only load finds the group and a
+		// cursor seeks straight to the range start; the walk costs the scanned window,
+		// not the whole pending list. The blob load already carries the inline PEL.
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}
@@ -158,7 +164,13 @@ func handleXPending(ctx *Ctx) {
 		g = s.findGroup(groupName)
 		if g == nil {
 			noGroup = true
+			return nil
 		}
+		if hdr.IsColl() {
+			rows, err = collectPendingFromColl(db, key, groupName, idle, start, end, count, consumer, hasFilter, now)
+			return err
+		}
+		rows = collectPendingFromPEL(g, idle, start, end, count, consumer, hasFilter, now)
 		return nil
 	}) {
 		return
@@ -179,7 +191,7 @@ func handleXPending(ctx *Ctx) {
 		writePendingSummary(ctx.enc(), g)
 		return
 	}
-	writePendingExtended(ctx.enc(), g, idle, start, end, count, consumer, hasFilter, now)
+	writePendingRows(ctx.enc(), rows)
 }
 
 // writePendingSummary writes the four-element XPENDING summary.
@@ -245,13 +257,17 @@ func writePendingSummaryColl(enc *resp.Encoder, g *group, minID, maxID streamID)
 	}
 }
 
-// writePendingExtended writes the detailed XPENDING reply.
-func writePendingExtended(enc *resp.Encoder, g *group, idle int64, start, end rangeBound, count int64, consumer string, hasFilter bool, now int64) {
-	type row struct {
-		pe      pelEntry
-		elapsed int64
-	}
-	var rows []row
+// pendingRow is one detailed XPENDING entry: the pending record and its idle time.
+type pendingRow struct {
+	pe      pelEntry
+	elapsed int64
+}
+
+// collectPendingFromPEL gathers the detailed XPENDING rows from an in-memory PEL
+// (the blob form, where the whole small PEL is already decoded). The PEL is sorted
+// by id, so the [start, end] range and the COUNT cap bound the walk.
+func collectPendingFromPEL(g *group, idle int64, start, end rangeBound, count int64, consumer string, hasFilter bool, now int64) []pendingRow {
+	var rows []pendingRow
 	for _, pe := range g.pel {
 		if pe.id.less(start.id) || end.id.less(pe.id) {
 			continue
@@ -263,11 +279,61 @@ func writePendingExtended(enc *resp.Encoder, g *group, idle int64, start, end ra
 		if el < idle {
 			continue
 		}
-		rows = append(rows, row{pe: pe, elapsed: el})
+		rows = append(rows, pendingRow{pe: pe, elapsed: el})
 		if count >= 0 && int64(len(rows)) >= count {
 			break
 		}
 	}
+	return rows
+}
+
+// collectPendingFromColl gathers the detailed XPENDING rows by scanning the group's
+// 0x02 PEL rows from the start id forward, stopping at the end id or the COUNT cap.
+// The rows are keyed by id, so the cursor seeks straight to the range start and the
+// walk costs the scanned window, never the whole pending list. The caller has
+// confirmed the key is a coll stream.
+func collectPendingFromColl(db *keyspace.DB, key []byte, group string, idle int64, start, end rangeBound, count int64, consumer string, hasFilter bool, now int64) ([]pendingRow, error) {
+	var rows []pendingRow
+	prefix := streamPELPrefix(group)
+	_, err := db.CollRead(key, func(r *keyspace.CollReader) error {
+		c := r.Cursor()
+		if e := c.Seek(streamPELRow(group, start.id)); e != nil {
+			return e
+		}
+		for c.Valid() {
+			k := c.Key()
+			if !bytes.HasPrefix(k, prefix) {
+				break
+			}
+			id := streamPELRowID(k, len(prefix))
+			if end.id.less(id) {
+				break
+			}
+			pe, e := streamPELFromValue(c.Value())
+			if e != nil {
+				return e
+			}
+			pe.id = id
+			if !hasFilter || pe.consumer == consumer {
+				el := elapsedSince(now, pe.deliveryTime)
+				if el >= idle {
+					rows = append(rows, pendingRow{pe: pe, elapsed: el})
+					if count >= 0 && int64(len(rows)) >= count {
+						break
+					}
+				}
+			}
+			if e := c.Next(); e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	return rows, err
+}
+
+// writePendingRows writes the detailed XPENDING reply from the collected rows.
+func writePendingRows(enc *resp.Encoder, rows []pendingRow) {
 	enc.WriteArrayLen(len(rows))
 	for _, r := range rows {
 		if enc.Proto() >= 3 {

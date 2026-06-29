@@ -425,9 +425,7 @@ func handleXGroupDestroy(ctx *Ctx) {
 		result   int64
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		// Destroying a group drops its pending entries, so load and rewrite the PELs
-		// (storeStreamGroupsFull clears the destroyed group's 0x02 rows).
-		s, hdr, found, err := getStreamGroupsFull(db, key)
+		hdr, found, err := streamHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -437,6 +435,24 @@ func handleXGroupDestroy(ctx *Ctx) {
 		if hdr.Type != keyspace.TypeStream {
 			wrongTyp = true
 			return nil
+		}
+		if hdr.IsColl() {
+			// On the coll form the group's pending list lives in its 0x02 sibling rows,
+			// so destroying it is a header edit plus a prefix delete of that one group's
+			// rows; the entry log and the other groups are never touched.
+			existed, err := streamCollDestroyGroup(db, key, groupName)
+			if err != nil {
+				return err
+			}
+			if existed {
+				result = 1
+			}
+			return nil
+		}
+		// Blob form: the whole small stream decodes and rewrites in one shot.
+		s, _, _, err := getStreamGroupsFull(db, key)
+		if err != nil {
+			return err
 		}
 		if s.removeGroup(groupName) {
 			result = 1
