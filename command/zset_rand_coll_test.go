@@ -13,6 +13,7 @@ import (
 // a few rows, and an OOM under a tight cap on a multi-million-member zset. The bounded
 // path samples through a reservoir cursor walk over the arena-backed member index.
 func TestZRandMemberCollIsBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
 	d := newFuzzDispatcher(t)
 	conn := networking.NewOfflineConn()
 

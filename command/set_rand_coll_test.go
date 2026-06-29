@@ -16,6 +16,7 @@ import (
 // The witness is allocation count for a small count: it stays far below the
 // whole-set clone a materialize would cost.
 func TestSRandMemberCollIsBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
 	d := newFuzzDispatcher(t)
 	conn := networking.NewOfflineConn()
 

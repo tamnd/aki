@@ -18,6 +18,7 @@ import (
 // constant. We rank near the front so the count walk is short; the point of the test is
 // the absence of the whole-set clone, not the walk length.
 func TestZRankCollIsBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
 	d := newFuzzDispatcher(t)
 	conn := networking.NewOfflineConn()
 

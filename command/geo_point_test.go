@@ -20,6 +20,7 @@ import (
 // the skiplist threshold with padded member names so a whole-set clone would move
 // about a megabyte, then assert each command stays a small constant.
 func TestGeoPointReadsAreBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
 	d := newFuzzDispatcher(t)
 	conn := networking.NewOfflineConn()
 

@@ -21,6 +21,7 @@ import (
 // skiplist threshold with padded members so a whole-set clone would move about a
 // megabyte, then assert the reverse band read stays bounded.
 func TestZRevRangeByScoreCollIsBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
 	d := newFuzzDispatcher(t)
 	conn := networking.NewOfflineConn()
 
