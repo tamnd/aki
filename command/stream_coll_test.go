@@ -430,3 +430,191 @@ func TestStreamCollAddBounded(t *testing.T) {
 			"a bounded append should be a small constant, not O(n)", n, allocs)
 	}
 }
+
+// TestStreamCollGroupsMetadata drives the slice-3a consumer-group metadata
+// commands over a coll-form stream: XGROUP CREATE/SETID/CREATECONSUMER/DELCONSUMER/
+// DESTROY, XACK, XPENDING, and XINFO GROUPS/CONSUMERS. These touch only the group
+// state in the header row, never the entry log, so each must stay correct and
+// leave the key coll (no demote, no materialize). XREADGROUP delivers entries to
+// build a PEL (it is not bounded until a later slice, but it must still keep the
+// key coll so the metadata commands see a coll stream).
+func TestStreamCollGroupsMetadata(t *testing.T) {
+	r, c, eng := startDataEng(t)
+	const n = streamCollThreshold + 100
+	for i := 1; i <= n; i++ {
+		_ = bulk(t, r, c, fmt.Sprintf("XADD s %d-0 f v%d", i, i))
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("stream not coll after seeding %d", n)
+	}
+
+	if got := sendLine(t, r, c, "XGROUP CREATE s g 0"); got != "+OK" {
+		t.Fatalf("XGROUP CREATE = %q", got)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XGROUP CREATE demoted to blob")
+	}
+	// Deliver the first five entries into the group PEL.
+	xreadDrain(t, r, sendLine(t, r, c, "XREADGROUP GROUP g cons COUNT 5 STREAMS s >"))
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XREADGROUP demoted to blob")
+	}
+
+	// XPENDING summary reports five pending owned by cons.
+	if got := sendLine(t, r, c, "XPENDING s g"); got != "*4" {
+		t.Fatalf("XPENDING summary header = %q want *4", got)
+	}
+	if got := sendLineRead(t, r); got != ":5" {
+		t.Fatalf("XPENDING pending count = %q want :5", got)
+	}
+	_ = readBulkRaw(t, r) // min id
+	_ = readBulkRaw(t, r) // max id
+	consumers := sendLineRead(t, r)
+	if consumers != "*1" {
+		t.Fatalf("XPENDING consumers header = %q want *1", consumers)
+	}
+	if got := sendLineRead(t, r); got != "*2" {
+		t.Fatalf("XPENDING consumer pair header = %q want *2", got)
+	}
+	_ = readBulkRaw(t, r) // consumer name
+	if got := readBulkRaw(t, r); got != "5" {
+		t.Fatalf("XPENDING consumer count = %q want 5", got)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XPENDING demoted to blob")
+	}
+
+	// XACK two of the five; three remain pending.
+	if got := sendLine(t, r, c, "XACK s g 1-0 2-0"); got != ":2" {
+		t.Fatalf("XACK = %q want :2", got)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XACK demoted to blob")
+	}
+	if got := sendLine(t, r, c, "XPENDING s g"); got != "*4" {
+		t.Fatalf("XPENDING after XACK header = %q want *4", got)
+	}
+	if got := sendLineRead(t, r); got != ":3" {
+		t.Fatalf("XPENDING after XACK count = %q want :3", got)
+	}
+	_ = readBulkRaw(t, r)
+	_ = readBulkRaw(t, r)
+	_ = sendLineRead(t, r) // consumers array
+	_ = sendLineRead(t, r)
+	_ = readBulkRaw(t, r)
+	_ = readBulkRaw(t, r)
+
+	// XINFO GROUPS reports one group with three pending.
+	if got := sendLine(t, r, c, "XINFO GROUPS s"); got != "*1" {
+		t.Fatalf("XINFO GROUPS header = %q want *1", got)
+	}
+	groupInfo := drainFlat(t, r)
+	if pending := flatField(groupInfo, "pending"); pending != ":3" {
+		t.Fatalf("XINFO GROUPS pending = %q want :3", pending)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XINFO GROUPS demoted to blob")
+	}
+
+	// CREATECONSUMER / DELCONSUMER round-trip on the header row.
+	if got := sendLine(t, r, c, "XGROUP CREATECONSUMER s g cons2"); got != ":1" {
+		t.Fatalf("XGROUP CREATECONSUMER = %q want :1", got)
+	}
+	if got := sendLine(t, r, c, "XGROUP DELCONSUMER s g cons2"); got != ":0" {
+		t.Fatalf("XGROUP DELCONSUMER = %q want :0 (cons2 had no pending)", got)
+	}
+	if got := sendLine(t, r, c, "XGROUP SETID s g 0"); got != "+OK" {
+		t.Fatalf("XGROUP SETID = %q", got)
+	}
+	if got := sendLine(t, r, c, "XGROUP DESTROY s g"); got != ":1" {
+		t.Fatalf("XGROUP DESTROY = %q want :1", got)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XGROUP family demoted to blob")
+	}
+	// The stream and its entries survive group teardown.
+	if got := sendLine(t, r, c, "XLEN s"); got != fmt.Sprintf(":%d", n) {
+		t.Fatalf("XLEN after XGROUP DESTROY = %q want :%d", got, n)
+	}
+}
+
+// drainFlat reads a flat array reply (already given its *N header is the previous
+// read) into a slice of its element lines. It is used for the XINFO GROUPS map,
+// whose RESP2 form is a flat [k, v, k, v, ...] array of bulk strings and integers.
+func drainFlat(t *testing.T, r *bufio.Reader) []string {
+	t.Helper()
+	hdr := sendLineRead(t, r)
+	nfields := arrayLen(t, hdr)
+	out := make([]string, 0, nfields)
+	for i := 0; i < nfields; i++ {
+		line := sendLineRead(t, r)
+		if len(line) > 0 && line[0] == '$' {
+			out = append(out, readBulkBody(t, r, line))
+		} else {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// readBulkBody returns the body of a bulk string whose $len header has already
+// been read into hdr; the payload line follows on the wire.
+func readBulkBody(t *testing.T, r *bufio.Reader, hdr string) string {
+	t.Helper()
+	if len(hdr) == 0 || hdr[0] != '$' {
+		t.Fatalf("bad bulk header %q", hdr)
+	}
+	payload, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read bulk payload: %v", err)
+	}
+	return payload[:len(payload)-2]
+}
+
+// flatField returns the value line that follows key in a flat key/value list, or
+// "" when the key is absent.
+func flatField(flat []string, key string) string {
+	for i := 0; i+1 < len(flat); i += 2 {
+		if flat[i] == key {
+			return flat[i+1]
+		}
+	}
+	return ""
+}
+
+// TestStreamCollGroupMetaBounded witnesses that the consumer-group metadata
+// commands on a large coll stream allocate a small constant, not O(entries). With
+// the groups in the header row and getStreamGroups/storeStreamGroups touching only
+// that row, a CREATECONSUMER then DELCONSUMER round-trip never clones the entry
+// log. The pair is self-reversing, so the group state holds steady across runs.
+func TestStreamCollGroupMetaBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
+	d := newFuzzDispatcher(t)
+	conn := networking.NewOfflineConn()
+
+	const n = 4000
+	pad := make([]byte, 240)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	for i := 1; i <= n; i++ {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XADD"), []byte("s"),
+			[]byte(strconv.Itoa(i) + "-0"), []byte("f"), append([]byte("v"), pad...)})
+	}
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XGROUP"), []byte("CREATE"), []byte("s"), []byte("g"), []byte("0")})
+
+	// Each run creates then deletes a consumer: two header-row writes, no entry
+	// touch. A whole-stream clone would move about a megabyte per run.
+	allocs := testing.AllocsPerRun(50, func() {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XGROUP"), []byte("CREATECONSUMER"), []byte("s"), []byte("g"), []byte("tmp")})
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XGROUP"), []byte("DELCONSUMER"), []byte("s"), []byte("g"), []byte("tmp")})
+	})
+	if allocs > 500 {
+		t.Fatalf("CREATECONSUMER+DELCONSUMER on a %d-entry stream allocated %.0f objects per run; "+
+			"a header-row group op should be a small constant, not O(n)", n, allocs)
+	}
+}

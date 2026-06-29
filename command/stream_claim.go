@@ -100,7 +100,7 @@ func handleXPending(ctx *Ctx) {
 		g        *group
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, key)
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}

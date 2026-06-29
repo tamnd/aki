@@ -213,6 +213,63 @@ func streamStoreColl(db *keyspace.DB, key []byte, s *stream) error {
 	})
 }
 
+// getStreamGroups reads a stream's group metadata without materializing the entry
+// log. In coll form it decodes only the small header row (last ID, max-deleted ID,
+// entries-added, and the groups); the entry rows are never touched, so a consumer-
+// group command on a million-entry stream stays bounded by the group set rather
+// than the log. In blob form it falls back to getStream, where the whole small
+// blob decodes in one shot anyway. The returned stream has no entries, so callers
+// must only read or write group and header state, never the entry list.
+func getStreamGroups(db *keyspace.DB, key []byte) (*stream, keyspace.ValueHeader, bool, error) {
+	hdr, found, err := streamHeader(db, key)
+	if err != nil || !found {
+		return nil, hdr, found, err
+	}
+	if hdr.Type != keyspace.TypeStream {
+		return nil, hdr, true, nil
+	}
+	if !hdr.IsColl() {
+		return getStream(db, key)
+	}
+	s := &stream{}
+	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+		hv, ok, e := r.Get([]byte{streamRowHeader})
+		if e != nil {
+			return e
+		}
+		if ok {
+			return streamReadHeader(s, hv)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, hdr, true, err
+	}
+	return s, hdr, true, nil
+}
+
+// storeStreamGroups writes a stream's group metadata back. In coll form it
+// rewrites only the header row, leaving the entry rows and the metadata count
+// untouched, so the write is bounded by the group set and the key stays coll (no
+// demote, no entry rebuild). In blob form it falls back to storeStream. The caller
+// must have loaded s through getStreamGroups (coll: entries empty by design; blob:
+// entries intact) so a blob rewrite never drops the entry log.
+func storeStreamGroups(db *keyspace.DB, key []byte, s *stream, ttlMs int64) error {
+	hdr, found, err := streamHeader(db, key)
+	if err != nil {
+		return err
+	}
+	if !found || !hdr.IsColl() {
+		return storeStream(db, key, s, ttlMs)
+	}
+	return db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
+		// Put on the existing 0x00 row is an update, not an insert, and Count is
+		// caller-maintained, so the entry count the metadata carries is unchanged.
+		_, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(s))
+		return e
+	})
+}
+
 // streamClearRows deletes every row currently in the writer's sub-tree. It
 // gathers the keys in one forward pass before deleting so the cursor is not
 // mutated mid-walk. A freshly created sub-tree (a blob being promoted) has no
