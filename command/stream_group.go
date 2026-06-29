@@ -195,7 +195,7 @@ func handleXGroupCreate(ctx *Ctx) {
 		badID    bool
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, key)
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}
@@ -225,7 +225,7 @@ func handleXGroupCreate(ctx *Ctx) {
 		if found {
 			ttl = keepTTL(hdr, found)
 		}
-		return storeStream(db, key, s, ttl)
+		return storeStreamGroups(db, key, s, ttl)
 	}) {
 		return
 	}
@@ -277,7 +277,7 @@ func handleXGroupSetID(ctx *Ctx) {
 		badID    bool
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, key)
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}
@@ -303,7 +303,7 @@ func handleXGroupSetID(ctx *Ctx) {
 		if setEntriesRead {
 			g.entriesRead = entriesRead
 		}
-		return storeStream(db, key, s, keepTTL(hdr, found))
+		return storeStreamGroups(db, key, s, keepTTL(hdr, found))
 	}) {
 		return
 	}
@@ -336,7 +336,7 @@ func handleXGroupConsumer(ctx *Ctx, create bool) {
 		result   int64
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, key)
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}
@@ -361,7 +361,7 @@ func handleXGroupConsumer(ctx *Ctx, create bool) {
 		} else {
 			result = removeConsumer(g, consumerName)
 		}
-		return storeStream(db, key, s, keepTTL(hdr, found))
+		return storeStreamGroups(db, key, s, keepTTL(hdr, found))
 	}) {
 		return
 	}
@@ -417,7 +417,7 @@ func handleXGroupDestroy(ctx *Ctx) {
 		result   int64
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, key)
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}
@@ -431,7 +431,7 @@ func handleXGroupDestroy(ctx *Ctx) {
 		if s.removeGroup(groupName) {
 			result = 1
 		}
-		return storeStream(db, key, s, keepTTL(hdr, found))
+		return storeStreamGroups(db, key, s, keepTTL(hdr, found))
 	}) {
 		return
 	}
@@ -466,7 +466,7 @@ func handleXAck(ctx *Ctx) {
 		acked    int64
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, key)
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}
@@ -498,7 +498,7 @@ func handleXAck(ctx *Ctx) {
 		if acked == 0 {
 			return nil
 		}
-		return storeStream(db, key, s, keepTTL(hdr, found))
+		return storeStreamGroups(db, key, s, keepTTL(hdr, found))
 	}) {
 		return
 	}
@@ -844,7 +844,7 @@ func loadStreamForInfo(ctx *Ctx, key []byte) (*stream, bool) {
 		noKey    bool
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		s, hdr, found, err := getStream(db, key)
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}
