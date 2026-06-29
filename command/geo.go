@@ -233,14 +233,72 @@ parsed:
 		added    int64
 		changed  int64
 	)
-	done := ctx.updateShard(ctx.Argv[1], func(db *keyspace.DB) error {
-		members, hdr, found, err := getZSet(db, ctx.Argv[1])
+	key := ctx.Argv[1]
+	lim := ctx.encLimits()
+	done := ctx.updateShard(key, func(db *keyspace.DB) error {
+		added, changed = 0, 0
+		var (
+			hdr   keyspace.ValueHeader
+			found bool
+		)
+		// A geo set is a sorted set of geohash scores, so it takes the same storage
+		// path as ZADD. A btree-backed (coll-form) geo set updates each member's two
+		// rows in place through a point write; it is never decoded and rewritten as a
+		// whole blob. This is what keeps a multi-million-member geo set from cloning
+		// itself onto the heap on every GEOADD, and it is the precondition for the
+		// GEODIST/GEOPOS/GEOHASH point reads to stay bounded: those can only do a point
+		// lookup on the member-index row if the set is actually stored as a sub-tree.
+		route, err := db.CollUpdateRouted(key, keyspace.TypeZSet, keyspace.EncSkiplist,
+			func(rFound bool, h keyspace.ValueHeader, _ []byte) keyspace.CollRoute {
+				hdr, found = h, rFound
+				if rFound && h.Type != keyspace.TypeZSet {
+					wrongTyp = true
+					return keyspace.CollRouteSkip
+				}
+				if rFound && h.IsColl() {
+					return keyspace.CollRouteColl
+				}
+				return keyspace.CollRouteBlob
+			},
+			func(w *keyspace.CollWriter) error {
+				for _, p := range points {
+					cur, mfound, e := zTreeScore(w, p.member)
+					if e != nil {
+						return e
+					}
+					if mfound {
+						if nx {
+							continue
+						}
+						if cur != p.score {
+							if e := zTreeSet(w, p.member, p.score, true, cur); e != nil {
+								return e
+							}
+							changed++
+						}
+						continue
+					}
+					if xx {
+						continue
+					}
+					if e := zTreeSet(w, p.member, p.score, false, 0); e != nil {
+						return e
+					}
+					added++
+				}
+				return nil
+			})
 		if err != nil {
 			return err
 		}
-		if found && hdr.Type != keyspace.TypeZSet {
-			wrongTyp = true
+		if route != keyspace.CollRouteBlob {
 			return nil
+		}
+		// Blob path: a small geo set decodes once (bounded by the listpack threshold),
+		// applies the points, then rewrites the blob or promotes to the sub-tree.
+		members, _, _, err := getZSet(db, key)
+		if err != nil {
+			return err
 		}
 		floor := keyspace.EncListpack
 		if found {
@@ -268,7 +326,10 @@ parsed:
 			return nil
 		}
 		zsetSort(members)
-		return db.Set(ctx.Argv[1], zsetEncode(members), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), members, floor), keepTTL(hdr, found))
+		if zsetWantsTree(lim, members, floor) {
+			return zsetPromote(db, key, members)
+		}
+		return db.Set(key, zsetEncode(members), keyspace.TypeZSet, zsetEncoding(lim, members, floor), keepTTL(hdr, found))
 	})
 	if !done {
 		return
@@ -304,7 +365,7 @@ func handleGeoPos(ctx *Ctx) {
 		present  []bool
 	)
 	ok := ctx.view(func(db *keyspace.DB) error {
-		set, hdr, found, err := getZSet(db, ctx.Argv[1])
+		sc, pr, hdr, found, err := zsetMemberScores(db, ctx.Argv[1], members)
 		if err != nil {
 			return err
 		}
@@ -312,14 +373,7 @@ func handleGeoPos(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		scores = make([]float64, len(members))
-		present = make([]bool, len(members))
-		for i, m := range members {
-			if idx := zsetFind(set, m); idx >= 0 {
-				scores[i] = set[idx].score
-				present[i] = true
-			}
-		}
+		scores, present = sc, pr
 		return nil
 	})
 	if !ok {
@@ -365,7 +419,7 @@ func handleGeoDist(ctx *Ctx) {
 		found1, found2 bool
 	)
 	ok := ctx.view(func(db *keyspace.DB) error {
-		set, hdr, found, err := getZSet(db, ctx.Argv[1])
+		sc, pr, hdr, found, err := zsetMemberScores(db, ctx.Argv[1], [][]byte{ctx.Argv[2], ctx.Argv[3]})
 		if err != nil {
 			return err
 		}
@@ -373,12 +427,8 @@ func handleGeoDist(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		if idx := zsetFind(set, ctx.Argv[2]); idx >= 0 {
-			s1, found1 = set[idx].score, true
-		}
-		if idx := zsetFind(set, ctx.Argv[3]); idx >= 0 {
-			s2, found2 = set[idx].score, true
-		}
+		s1, found1 = sc[0], pr[0]
+		s2, found2 = sc[1], pr[1]
 		return nil
 	})
 	if !ok {
@@ -408,7 +458,7 @@ func handleGeoHash(ctx *Ctx) {
 		present  []bool
 	)
 	ok := ctx.view(func(db *keyspace.DB) error {
-		set, hdr, found, err := getZSet(db, ctx.Argv[1])
+		sc, pr, hdr, found, err := zsetMemberScores(db, ctx.Argv[1], members)
 		if err != nil {
 			return err
 		}
@@ -417,11 +467,10 @@ func handleGeoHash(ctx *Ctx) {
 			return nil
 		}
 		out = make([]string, len(members))
-		present = make([]bool, len(members))
-		for i, m := range members {
-			if idx := zsetFind(set, m); idx >= 0 {
-				out[i] = geoHashString(set[idx].score)
-				present[i] = true
+		present = pr
+		for i := range members {
+			if pr[i] {
+				out[i] = geoHashString(sc[i])
 			}
 		}
 		return nil
