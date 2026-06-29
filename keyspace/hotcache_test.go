@@ -187,13 +187,92 @@ func TestHotCachePeekDoesNotPopulate(t *testing.T) {
 		t.Fatal("Peek must not populate the hot cache")
 	}
 
-	// Get re-warms the cache.
+	// Get re-warms the cache. Under the read-miss admission doorkeeper (note 247) a
+	// key arriving fresh from the B-tree is admitted on its second sighting, not its
+	// first, so the first Get after the cold cache records the sighting and the
+	// second Get warms it. Set force-admits, but this key was invalidated above, so
+	// the read path sees it as a first sighting.
 	b, _, found, _ = db.Get([]byte("k"))
 	if !found || string(b) != "v" {
-		t.Fatalf("Get after Peek = %q found=%v", b, found)
+		t.Fatalf("first Get after Peek = %q found=%v", b, found)
+	}
+	b, _, found, _ = db.Get([]byte("k"))
+	if !found || string(b) != "v" {
+		t.Fatalf("second Get after Peek = %q found=%v", b, found)
 	}
 	if _, _, ok := db.hc.Load().cget([]byte("k")); !ok {
-		t.Fatal("Get must populate the hot cache")
+		t.Fatal("Get must populate the hot cache on the second read")
+	}
+}
+
+// TestValueCacheAdmissionDoorkeeper checks the read-miss admission filter: a gated
+// put (cputRead, the B-tree read path) caches a brand-new key only on its second
+// sighting within the epoch, while a force-admit put (cput, the write path) caches
+// immediately. This is the filter that stops a uniform-random scan over a working
+// set larger than the cache from thrashing it (note 247).
+func TestValueCacheAdmissionDoorkeeper(t *testing.T) {
+	c := newDBCache(defaultValueCacheBytes)
+	body := []byte("v")
+
+	// First gated sighting of a fresh key: recorded by the doorkeeper, not cached.
+	c.cputRead("door", body, ValueHeader{Version: 1})
+	if _, _, ok := c.cget([]byte("door")); ok {
+		t.Fatal("first read-miss put admitted the key; doorkeeper did not gate it")
+	}
+	// Second gated sighting: admitted.
+	c.cputRead("door", body, ValueHeader{Version: 1})
+	if _, _, ok := c.cget([]byte("door")); !ok {
+		t.Fatal("second read-miss put did not admit the key")
+	}
+
+	// A force-admit put (write path) caches a brand-new key on the first call.
+	c.cput("force", body, ValueHeader{Version: 1})
+	if _, _, ok := c.cget([]byte("force")); !ok {
+		t.Fatal("force-admit put did not cache the key immediately")
+	}
+}
+
+// TestGetUncachedReadsWithoutInitialProbe checks that GetUncached, the variant
+// handleGet calls after a viewHotGet cache miss, returns the same value as Get and
+// still warms the cache on the way out. It must not depend on the initial cache
+// probe Get does, because its caller already probed and missed: GetUncached skips
+// that probe and reads the write-behind overlay and the B-tree directly. We verify
+// it reads a B-tree-backed key correctly, warms the cache, and reflects an
+// overwrite, matching Get's contract.
+func TestGetUncachedReadsWithoutInitialProbe(t *testing.T) {
+	ks, _, _ := newKS(t)
+	db := mustDB(t, ks, 0)
+
+	if err := db.Set([]byte("k"), []byte("v1"), TypeString, EncRaw, -1); err != nil {
+		t.Fatal(err)
+	}
+	// Drop the entry Set warmed so the read goes through the B-tree, the path that
+	// exercises the skipped-probe code rather than a cache hit.
+	db.hc.Load().cinvalidate([]byte("k"))
+
+	// GetUncached must read the B-tree value without the initial cache probe.
+	b, _, found, err := db.GetUncached([]byte("k"))
+	if err != nil || !found || string(b) != "v1" {
+		t.Fatalf("GetUncached = %q found=%v err=%v want v1", b, found, err)
+	}
+	// Read-miss warming runs through the admission doorkeeper, so a one-hit-wonder
+	// is not cached on its first sighting. A second GetUncached crosses the
+	// doorkeeper and warms the cache, matching Get's gated read-miss contract.
+	b, _, found, err = db.GetUncached([]byte("k"))
+	if err != nil || !found || string(b) != "v1" {
+		t.Fatalf("GetUncached (2nd) = %q found=%v err=%v want v1", b, found, err)
+	}
+	if _, _, ok := db.hc.Load().cget([]byte("k")); !ok {
+		t.Fatal("GetUncached did not warm the cache after the doorkeeper admitted it")
+	}
+
+	// After an overwrite, GetUncached must return the new value, not the cached one.
+	if err := db.Set([]byte("k"), []byte("v2"), TypeString, EncRaw, -1); err != nil {
+		t.Fatal(err)
+	}
+	b, _, found, _ = db.GetUncached([]byte("k"))
+	if !found || string(b) != "v2" {
+		t.Fatalf("GetUncached after overwrite = %q want v2", b)
 	}
 }
 
