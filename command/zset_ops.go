@@ -496,36 +496,26 @@ func handleZMPop(ctx *Ctx) {
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
 		for _, key := range keys {
-			members, hdr, found, err := getZSet(db, key)
+			hdr, found, err := zsetHeader(db, key)
 			if err != nil {
 				return err
 			}
-			if found && hdr.Type != keyspace.TypeZSet {
+			if !found {
+				continue
+			}
+			if hdr.Type != keyspace.TypeZSet {
 				wrongTyp = true
 				return nil
 			}
-			if !found || len(members) == 0 {
-				continue
-			}
-			n := int(min(count, int64(len(members))))
-			var kept []zmember
-			if fromMax {
-				popped = make([]zmember, n)
-				for i := range n {
-					popped[i] = members[len(members)-1-i]
-				}
-				kept = members[:len(members)-n]
-			} else {
-				popped = append(popped, members[:n]...)
-				kept = members[n:]
-			}
-			poppedKey = key
-			if len(kept) == 0 {
-				emptied = true
-				_, err := db.Delete(key)
+			popped, emptied, err = zsetPopN(db, key, hdr, count, fromMax, ctx.encLimits())
+			if err != nil {
 				return err
 			}
-			return db.Set(key, zsetEncode(kept), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), kept, hdr.Encoding), keepTTL(hdr, found))
+			if len(popped) == 0 {
+				continue
+			}
+			poppedKey = key
+			return nil
 		}
 		return nil
 	})
