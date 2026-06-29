@@ -236,6 +236,61 @@ func listTreeIndex(db *keyspace.DB, key []byte, i int64) (elem []byte, found boo
 	return elem, found, err
 }
 
+// listTreeLPos finds the matching positions for LPOS over a btree-backed list
+// without materializing it. The rows are in position order, so a forward LPOS
+// walks the cursor from the head assigning logical indices 0, 1, 2 ... and a
+// backward LPOS (negative rank) walks from the tail assigning n-1, n-2 ... The
+// matcher decides each element and signals when the scan can stop, so a query
+// that wants the first match, or the first COUNT matches, or only compares MAXLEN
+// elements, reads just that prefix of the list rather than the whole thing. Only
+// the matched indices are retained, never the elements, so memory is bounded by
+// the result, not the list length.
+func listTreeLPos(db *keyspace.DB, key, element []byte, rank, count int64, hasCount bool, maxlen int64) ([]int64, error) {
+	m, backward := newLposMatcher(element, rank, count, hasCount, maxlen)
+	_, err := db.CollRead(key, func(r *keyspace.CollReader) error {
+		n := r.Tail() - r.Head()
+		if n == 0 {
+			return nil
+		}
+		c := r.Cursor()
+		c.UseArena()
+		if backward {
+			idx := n - 1
+			if e := c.Last(); e != nil {
+				return e
+			}
+			for c.Valid() {
+				if !m.consider(idx, c.Value()) {
+					return nil
+				}
+				idx--
+				if e := c.Prev(); e != nil {
+					return e
+				}
+			}
+			return nil
+		}
+		idx := int64(0)
+		if e := c.First(); e != nil {
+			return e
+		}
+		for c.Valid() {
+			if !m.consider(idx, c.Value()) {
+				return nil
+			}
+			idx++
+			if e := c.Next(); e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return m.matches, nil
+}
+
 // listTreeSet replaces the element at logical index i in a btree-backed list, a
 // point sub-tree write. A negative index counts from the tail. oob is true when
 // the index is out of range, in which case nothing is written. It reads the old
