@@ -143,6 +143,73 @@ func collectZSetMembers(db *keyspace.DB, key []byte) ([]zmember, error) {
 	return out, err
 }
 
+// zsetScores answers a batch of score lookups (ZSCORE, ZMSCORE) against the sorted
+// set at key with the cheapest path for the storage form, never materializing the
+// whole set. A btree-backed sorted set answers each query with an O(log n) point
+// lookup on its member-index row ('m' + member -> score bytes), reading the score
+// straight from the row value; a small blob decodes once and scans. This is the
+// difference between O(q) point lookups and an O(n) walk that clones every member on
+// every ZSCORE, which on a multi-million-member sorted set is the same allocation
+// blow-up that OOM-killed SISMEMBER before it became a point lookup.
+//
+// scores and present are filled per query (present false for an absent member or an
+// absent key). wrongTyp reports a non-zset value at key. ok is false only when the
+// underlying view failed.
+func zsetScores(ctx *Ctx, key []byte, queries [][]byte) (scores []float64, present []bool, wrongTyp bool, ok bool) {
+	scores = make([]float64, len(queries))
+	present = make([]bool, len(queries))
+	// A small sorted set may be served straight from the lock-free hot cache;
+	// hotGetZSet returns a miss for the coll form, so a hit here is the blob form.
+	if members, hit := hotGetZSet(ctx, key); hit {
+		for i, q := range queries {
+			if idx := zsetFind(members, q); idx >= 0 {
+				scores[i] = members[idx].score
+				present[i] = true
+			}
+		}
+		return scores, present, false, true
+	}
+	ok = ctx.view(func(db *keyspace.DB) error {
+		hdr, found, err := zsetHeader(db, key)
+		if err != nil || !found {
+			return err
+		}
+		if hdr.Type != keyspace.TypeZSet {
+			wrongTyp = true
+			return nil
+		}
+		if hdr.IsColl() {
+			// One reader, a point lookup per query: the score rows are never walked.
+			_, e := db.CollRead(key, func(r *keyspace.CollReader) error {
+				for i, q := range queries {
+					v, p, ge := r.Get(zMemberRow(q))
+					if ge != nil {
+						return ge
+					}
+					if p {
+						scores[i] = zScoreUnbits(encoding.U64BE(v))
+						present[i] = true
+					}
+				}
+				return nil
+			})
+			return e
+		}
+		members, _, _, e := getZSet(db, key)
+		if e != nil {
+			return e
+		}
+		for i, q := range queries {
+			if idx := zsetFind(members, q); idx >= 0 {
+				scores[i] = members[idx].score
+				present[i] = true
+			}
+		}
+		return nil
+	})
+	return scores, present, wrongTyp, ok
+}
+
 // zsetCard returns the member count in whichever form the sorted set is stored.
 // For a btree-backed sorted set it reads the metadata count in O(1).
 func zsetCard(db *keyspace.DB, key []byte) (n int64, hdr keyspace.ValueHeader, keyFound bool, err error) {
