@@ -1067,8 +1067,14 @@ func handleXInfo(ctx *Ctx) {
 		wrongTyp bool
 		noKey    bool
 	)
+	// STREAM FULL embeds each group's PEL, so it loads them; the summary reports
+	// only the group count and stays on the header-only loader.
+	load := getStreamGroups
+	if full {
+		load = getStreamGroupsFull
+	}
 	if !ctx.view(func(db *keyspace.DB) error {
-		s, hdr, found, err := getStreamGroups(db, key)
+		s, hdr, found, err := load(db, key)
 		if err != nil {
 			return err
 		}

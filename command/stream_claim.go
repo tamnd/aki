@@ -100,7 +100,7 @@ func handleXPending(ctx *Ctx) {
 		g        *group
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		s, hdr, found, err := getStreamGroups(db, key)
+		s, hdr, found, err := getStreamGroupsFull(db, key)
 		if err != nil {
 			return err
 		}
@@ -293,7 +293,18 @@ func handleXClaim(ctx *Ctx) {
 		justIDs  []streamID
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStreamGroups(db, key)
+		// A coll claim reads the header alone and reaches each named entry and its PEL
+		// record through point lookups, so its cost is the number of ids claimed, not
+		// the log or the whole pending list. A blob claim works the small inline copy.
+		coll, err := streamHeaderIsColl(db, key)
+		if err != nil {
+			return err
+		}
+		load := getStreamGroups
+		if !coll {
+			load = getStreamGroupsFull
+		}
+		s, hdr, found, err := load(db, key)
 		if err != nil {
 			return err
 		}
@@ -314,71 +325,87 @@ func handleXClaim(ctx *Ctx) {
 			g.lastID = opts.lastID
 		}
 		c, _ := g.getOrCreateConsumer(consumerName, now)
-		// claim walks the requested ids, fetching each entry's body through the
-		// supplied lookup. On the coll form the lookup is a btree point fetch, so
-		// the cost is the number of ids claimed, never the size of the log.
-		claim := func(fields func(streamID) ([][]byte, bool, error)) error {
-			for _, id := range ids {
-				body, exists, err := fields(id)
-				if err != nil {
-					return err
+		c.seenTime = now
+		c.activeTime = now
+		// applyClaim runs the per-id claim decision against a PEL accessor: get the
+		// current record, skip if it is too fresh or absent without FORCE, drop it if
+		// the entry was deleted, otherwise (re)write it to this consumer.
+		applyClaim := func(id streamID, body [][]byte, exists bool, pe pelEntry, has bool,
+			put func(pelEntry) error, del func() error) error {
+			created := false
+			var prev uint64
+			if !has {
+				if !opts.force || !exists {
+					return nil
 				}
-				idx := g.pelIndex(id)
-				created := false
-				var prev uint64
-				if idx < 0 {
-					if !opts.force || !exists {
-						continue
-					}
-					created = true
-				} else {
-					if elapsedSince(now, g.pel[idx].deliveryTime) < minIdle {
-						continue
-					}
-					prev = g.pel[idx].deliveryCount
+				created = true
+			} else {
+				if elapsedSince(now, pe.deliveryTime) < minIdle {
+					return nil
 				}
-				// An entry deleted from the stream is dropped from the PEL, not claimed.
-				if !exists {
-					if idx >= 0 {
-						g.pel = append(g.pel[:idx], g.pel[idx+1:]...)
-					}
-					continue
+				prev = pe.deliveryCount
+			}
+			if !exists {
+				if has {
+					return del()
 				}
-				g.pelInsert(pelEntry{
-					id:            id,
-					consumer:      consumerName,
-					deliveryTime:  opts.claimDeliveryTime(now),
-					deliveryCount: opts.claimDeliveryCount(prev, created),
-				})
-				if opts.justID {
-					justIDs = append(justIDs, id)
-				} else {
-					claimed = append(claimed, streamEntry{id: id, fields: body})
-				}
+				return nil
+			}
+			if err := put(pelEntry{
+				id:            id,
+				consumer:      consumerName,
+				deliveryTime:  opts.claimDeliveryTime(now),
+				deliveryCount: opts.claimDeliveryCount(prev, created),
+			}); err != nil {
+				return err
+			}
+			if opts.justID {
+				justIDs = append(justIDs, id)
+			} else {
+				claimed = append(claimed, streamEntry{id: id, fields: body})
 			}
 			return nil
 		}
-		if hdr.IsColl() {
-			if _, err := db.CollRead(key, func(r *keyspace.CollReader) error {
-				return claim(func(id streamID) ([][]byte, bool, error) {
-					return streamCollEntry(r, id)
-				})
-			}); err != nil {
-				return err
-			}
-		} else {
-			if err := claim(func(id streamID) ([][]byte, bool, error) {
-				idx := s.findEntry(id)
-				if idx < 0 {
-					return nil, false, nil
+		if coll {
+			return db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
+				for _, id := range ids {
+					body, exists, err := streamCollEntry(w, id)
+					if err != nil {
+						return err
+					}
+					pe, has, err := streamPELGet(w, groupName, id)
+					if err != nil {
+						return err
+					}
+					if err := applyClaim(id, body, exists, pe, has,
+						func(np pelEntry) error { return streamPELPut(w, groupName, np) },
+						func() error { _, e := streamPELDelete(w, groupName, id); return e },
+					); err != nil {
+						return err
+					}
 				}
-				return s.entries[idx].fields, true, nil
-			}); err != nil {
+				_, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(s))
+				return e
+			})
+		}
+		for _, id := range ids {
+			idx := s.findEntry(id)
+			body, exists := [][]byte(nil), idx >= 0
+			if exists {
+				body = s.entries[idx].fields
+			}
+			pidx := g.pelIndex(id)
+			var pe pelEntry
+			if pidx >= 0 {
+				pe = g.pel[pidx]
+			}
+			if err := applyClaim(id, body, exists, pe, pidx >= 0,
+				func(np pelEntry) error { g.pelInsert(np); return nil },
+				func() error { g.pel = append(g.pel[:pidx], g.pel[pidx+1:]...); return nil },
+			); err != nil {
 				return err
 			}
 		}
-		c.seenTime = now
-		c.activeTime = now
 		return storeStreamGroups(db, key, s, keepTTL(hdr, found))
 	}) {
 		return
@@ -516,7 +543,7 @@ func handleXAutoClaim(ctx *Ctx) {
 		cursor   = streamID{}
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStreamGroups(db, key)
+		s, hdr, found, err := getStreamGroupsFull(db, key)
 		if err != nil {
 			return err
 		}
@@ -601,7 +628,7 @@ func handleXAutoClaim(ctx *Ctx) {
 		}
 		c.seenTime = now
 		c.activeTime = now
-		return storeStreamGroups(db, key, s, keepTTL(hdr, found))
+		return storeStreamGroupsFull(db, key, s, keepTTL(hdr, found))
 	}) {
 		return
 	}
