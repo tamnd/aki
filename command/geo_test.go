@@ -28,7 +28,7 @@ func readArray(t *testing.T, r *bufio.Reader, c net.Conn, cmd string) []string {
 		// coll-form zset returns thousands of bulk strings) reads far more than the
 		// one deadline sendLine set at command time would allow under the -race
 		// build on a loaded runner, where the server is also slow to produce them.
-		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_ = c.SetReadDeadline(time.Now().Add(testReadDeadline))
 		out = append(out, readElem(t, r))
 	}
 	return out
