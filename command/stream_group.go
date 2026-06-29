@@ -476,7 +476,18 @@ func handleXAck(ctx *Ctx) {
 		acked    int64
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStreamGroupsFull(db, key)
+		// A coll ack reads the header alone and point-deletes each named id's PEL
+		// row, so its cost is the number of ids acked, not the pending total. A blob
+		// ack works the small inline copy.
+		coll, err := streamHeaderIsColl(db, key)
+		if err != nil {
+			return err
+		}
+		load := getStreamGroups
+		if !coll {
+			load = getStreamGroupsFull
+		}
+		s, hdr, found, err := load(db, key)
 		if err != nil {
 			return err
 		}
@@ -493,6 +504,31 @@ func handleXAck(ctx *Ctx) {
 			noGroup = true
 			return nil
 		}
+		if coll {
+			return db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
+				for _, id := range ids {
+					pe, has, err := streamPELGet(w, groupName, id)
+					if err != nil {
+						return err
+					}
+					if !has {
+						continue
+					}
+					if _, err := streamPELDelete(w, groupName, id); err != nil {
+						return err
+					}
+					if c := g.findConsumer(pe.consumer); c != nil {
+						c.activeTime = now
+					}
+					acked++
+				}
+				if acked == 0 {
+					return nil
+				}
+				_, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(s))
+				return e
+			})
+		}
 		for _, id := range ids {
 			idx := g.pelIndex(id)
 			if idx < 0 {
@@ -508,7 +544,7 @@ func handleXAck(ctx *Ctx) {
 		if acked == 0 {
 			return nil
 		}
-		return storeStreamGroupsFull(db, key, s, keepTTL(hdr, found))
+		return storeStreamGroups(db, key, s, keepTTL(hdr, found))
 	}) {
 		return
 	}
