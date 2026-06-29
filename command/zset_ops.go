@@ -346,46 +346,12 @@ func zSetOpStore(ctx *Ctx, op zsetOp) {
 		ctx.enc().WriteError(errStr)
 		return
 	}
-	var (
-		wrongTyp   bool
-		dstDeleted bool
-		n          int64
-	)
-	done := ctx.update(func(db *keyspace.DB) error {
-		// Only the source keys are type-checked. The destination is overwritten
-		// whatever it held, so a string or list at the destination is replaced
-		// rather than rejected, matching Redis.
-		sets, wt, err := loadZSets(db, keys)
-		if err != nil {
-			return err
-		}
-		if wt {
-			wrongTyp = true
-			return nil
-		}
-		result := computeZSetOp(op, sets, weights, agg)
-		n = int64(len(result))
-		if len(result) == 0 {
-			existed, err := db.Delete(dst)
-			dstDeleted = existed
-			return err
-		}
-		return db.Set(dst, zsetEncode(result), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), result, keyspace.EncListpack), -1)
-	})
-	if !done {
-		return
-	}
-	if wrongTyp {
-		ctx.enc().WriteError(wrongTypeError)
-		return
-	}
-	if n > 0 {
-		ctx.notify(notifyZset, zSetStoreEvent(op), dst)
-		ctx.signalReady(dst)
-	} else if dstDeleted {
-		ctx.notify(notifyGeneric, "del", dst)
-	}
-	ctx.enc().WriteInteger(n)
+	// Only the source keys are type-checked. The destination is overwritten whatever
+	// it held, so a string or list at the destination is replaced rather than
+	// rejected, matching Redis. The streamed sink writes the result element by element
+	// and spills to coll form past the threshold, so neither the sources nor the
+	// result are held whole; an aliased destination falls back to the buffered compute.
+	handleZSetOpStore(ctx, op, dst, keys, weights, agg)
 }
 
 // zSetStoreEvent maps a store operation to its keyspace event name.
