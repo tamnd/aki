@@ -423,37 +423,35 @@ func handleHGetAll(ctx *Ctx) {
 		return
 	}
 
-	var (
-		wrongTyp bool
-		fields   []hashField
-	)
-	if !ctx.view(func(db *keyspace.DB) error {
-		fs, hdr, ok, err := hashMaterialize(db, key)
+	enc := ctx.enc()
+	ctx.view(func(db *keyspace.DB) error {
+		body, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
 		}
-		if !ok {
+		if !found {
+			enc.WriteMapLen(0)
 			return nil
 		}
 		if hdr.Type != keyspace.TypeHash {
-			wrongTyp = true
+			enc.WriteError(wrongTypeError)
 			return nil
 		}
-		fields = fs
+		if hdr.IsColl() {
+			return streamHashFull(ctx, db, key, true, true, true)
+		}
+		fields, e := hashDecode(body)
+		if e != nil {
+			return e
+		}
+		fields = dropExpiredFields(fields)
+		enc.WriteMapLen(len(fields))
+		for _, f := range fields {
+			enc.WriteBulkString(f.field)
+			enc.WriteBulkString(f.value)
+		}
 		return nil
-	}) {
-		return
-	}
-	if wrongTyp {
-		ctx.enc().WriteError(wrongTypeError)
-		return
-	}
-	enc := ctx.enc()
-	enc.WriteMapLen(len(fields))
-	for _, f := range fields {
-		enc.WriteBulkString(f.field)
-		enc.WriteBulkString(f.value)
-	}
+	})
 }
 
 // handleHDel implements HDEL: remove the named fields and reply how many were
@@ -630,40 +628,38 @@ func handleHFields(ctx *Ctx, keys, vals bool) {
 		return
 	}
 
-	var (
-		wrongTyp bool
-		fields   []hashField
-	)
-	if !ctx.view(func(db *keyspace.DB) error {
-		fs, hdr, found, err := hashMaterialize(db, key)
+	enc := ctx.enc()
+	ctx.view(func(db *keyspace.DB) error {
+		body, hdr, found, err := db.Get(key)
 		if err != nil {
 			return err
 		}
 		if !found {
+			enc.WriteArrayLen(0)
 			return nil
 		}
 		if hdr.Type != keyspace.TypeHash {
-			wrongTyp = true
+			enc.WriteError(wrongTypeError)
 			return nil
 		}
-		fields = fs
-		return nil
-	}) {
-		return
-	}
-	if wrongTyp {
-		ctx.enc().WriteError(wrongTypeError)
-		return
-	}
-	enc := ctx.enc()
-	enc.WriteArrayLen(len(fields))
-	for _, f := range fields {
-		if keys {
-			enc.WriteBulkString(f.field)
-		} else if vals {
-			enc.WriteBulkString(f.value)
+		if hdr.IsColl() {
+			return streamHashFull(ctx, db, key, keys, vals, false)
 		}
-	}
+		fields, e := hashDecode(body)
+		if e != nil {
+			return e
+		}
+		fields = dropExpiredFields(fields)
+		enc.WriteArrayLen(len(fields))
+		for _, f := range fields {
+			if keys {
+				enc.WriteBulkString(f.field)
+			} else if vals {
+				enc.WriteBulkString(f.value)
+			}
+		}
+		return nil
+	})
 }
 
 // handleHStrLen implements HSTRLEN: the byte length of a field's value, or 0
