@@ -43,37 +43,8 @@ const (
 	opDiff
 )
 
-// handleSetOp implements SINTER, SUNION and SDIFF: compute over the keys and
-// reply the result as a set.
-func handleSetOp(ctx *Ctx, op setOp, keys [][]byte) {
-	var (
-		wrongTyp bool
-		result   [][]byte
-	)
-	if !ctx.view(func(db *keyspace.DB) error {
-		sets, wt, err := loadSets(db, keys)
-		if err != nil {
-			return err
-		}
-		if wt {
-			wrongTyp = true
-			return nil
-		}
-		result = computeSetOp(op, sets)
-		return nil
-	}) {
-		return
-	}
-	if wrongTyp {
-		ctx.enc().WriteError(wrongTypeError)
-		return
-	}
-	enc := ctx.enc()
-	enc.WriteSetLen(len(result))
-	for _, m := range result {
-		enc.WriteBulkString(m)
-	}
-}
+// handleSetOp (SINTER, SUNION, SDIFF) lives in set_algebra_stream.go, where it
+// streams the result without materializing any whole coll source.
 
 // handleSetOpStore implements SINTERSTORE, SUNIONSTORE and SDIFFSTORE: compute
 // over the source keys, store the result at the destination, and reply the
