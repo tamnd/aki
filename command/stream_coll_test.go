@@ -616,6 +616,47 @@ func TestStreamCollAddBoundedWithLargePEL(t *testing.T) {
 	}
 }
 
+// TestStreamCollAckBounded is the slice-3e-2 witness: XACK on a coll stream with a
+// large pending list costs only the acked id, not the pending total. Before this
+// slice XACK loaded the whole PEL through getStreamGroupsFull and rewrote it, so a
+// single ack on a million-entry group paid a million-element round trip. Now it
+// point-deletes the named id's 0x02 row and refreshes the owning consumer in the
+// header alone, so one ack allocates a small constant regardless of pending size.
+func TestStreamCollAckBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
+	d := newFuzzDispatcher(t)
+	conn := networking.NewOfflineConn()
+
+	const n = 4000
+	pad := make([]byte, 240)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	for i := 1; i <= n; i++ {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XADD"), []byte("s"),
+			[]byte(strconv.Itoa(i) + "-0"), []byte("f"), append([]byte("v"), pad...)})
+	}
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XGROUP"), []byte("CREATE"), []byte("s"), []byte("g"), []byte("0")})
+	// Deliver every entry with no ack, so the group carries an n-entry pending list.
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("cons"),
+		[]byte("COUNT"), []byte(strconv.Itoa(n)), []byte("STREAMS"), []byte("s"), []byte(">")})
+
+	id := 0
+	allocs := testing.AllocsPerRun(50, func() {
+		id++
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XACK"), []byte("s"), []byte("g"),
+			[]byte(strconv.Itoa(id) + "-0")})
+	})
+	if allocs > 400 {
+		t.Fatalf("XACK on a stream with a %d-entry pending list allocated %.0f objects per run; "+
+			"a point delete of the acked row should be a small constant, not O(n)", n, allocs)
+	}
+}
+
 // TestStreamCollGroupsMetadata drives the slice-3a consumer-group metadata
 // commands over a coll-form stream: XGROUP CREATE/SETID/CREATECONSUMER/DELCONSUMER/
 // DESTROY, XACK, XPENDING, and XINFO GROUPS/CONSUMERS. These touch only the group
