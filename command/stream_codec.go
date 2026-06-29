@@ -138,46 +138,68 @@ func streamDecode(body []byte) (*stream, error) {
 		}
 		s.entries = append(s.entries, e)
 	}
-	groupCount, err := read()
+	groups, _, err := decodeGroups(body, off)
 	if err != nil {
 		return nil, err
 	}
-	s.groups = make([]*group, 0, groupCount)
+	s.groups = groups
+	return s, nil
+}
+
+// decodeGroups unpacks the trailing group section of a stream body starting at
+// off: a group count followed by that many groups, each with its consumers and
+// pending-entries list. It returns the groups, the offset past the section, and
+// any error, so both the blob codec and the coll-form header row share one
+// reader.
+func decodeGroups(body []byte, off int) ([]*group, int, error) {
+	read := func() (uint64, error) {
+		v, n, err := encoding.Uvarint(body[off:])
+		if err != nil {
+			return 0, err
+		}
+		off += n
+		return v, nil
+	}
+	groupCount, err := read()
+	if err != nil {
+		return nil, off, err
+	}
+	groups := make([]*group, 0, groupCount)
 	for range groupCount {
 		g := &group{}
 		nameChunk, m, err := readChunk(body, off)
 		if err != nil {
-			return nil, err
+			return nil, off, err
 		}
 		off = m
 		g.name = string(nameChunk)
 		if g.lastID.ms, err = read(); err != nil {
-			return nil, err
+			return nil, off, err
 		}
 		if g.lastID.seq, err = read(); err != nil {
-			return nil, err
+			return nil, off, err
 		}
 		if g.entriesRead, err = read(); err != nil {
-			return nil, err
+			return nil, off, err
 		}
 		consumerCount, err := read()
 		if err != nil {
-			return nil, err
+			return nil, off, err
 		}
 		g.consumers = make([]*consumer, 0, consumerCount)
 		for range consumerCount {
 			cn, m, err := readChunk(body, off)
 			if err != nil {
-				return nil, err
+				return nil, off, err
 			}
 			off = m
 			seen, err := read()
 			if err != nil {
-				return nil, err
+				return nil, off, err
 			}
 			active, err := read()
 			if err != nil {
-				return nil, err
+				return nil, off, err
 			}
 			g.consumers = append(g.consumers, &consumer{
 				name:       string(cn),
@@ -187,36 +209,36 @@ func streamDecode(body []byte) (*stream, error) {
 		}
 		pelCount, err := read()
 		if err != nil {
-			return nil, err
+			return nil, off, err
 		}
 		g.pel = make([]pelEntry, 0, pelCount)
 		for range pelCount {
 			var pe pelEntry
 			if pe.id.ms, err = read(); err != nil {
-				return nil, err
+				return nil, off, err
 			}
 			if pe.id.seq, err = read(); err != nil {
-				return nil, err
+				return nil, off, err
 			}
 			cn, m, err := readChunk(body, off)
 			if err != nil {
-				return nil, err
+				return nil, off, err
 			}
 			off = m
 			pe.consumer = string(cn)
 			dt, err := read()
 			if err != nil {
-				return nil, err
+				return nil, off, err
 			}
 			pe.deliveryTime = int64(dt)
 			if pe.deliveryCount, err = read(); err != nil {
-				return nil, err
+				return nil, off, err
 			}
 			g.pel = append(g.pel, pe)
 		}
-		s.groups = append(s.groups, g)
+		groups = append(groups, g)
 	}
-	return s, nil
+	return groups, off, nil
 }
 
 // streamEncode packs a stream back into its stored body form.
@@ -236,8 +258,15 @@ func streamEncode(s *stream) []byte {
 			body = append(body, chunk...)
 		}
 	}
-	body = encoding.AppendUvarint(body, uint64(len(s.groups)))
-	for _, g := range s.groups {
+	return encodeGroups(body, s.groups)
+}
+
+// encodeGroups appends the group section (a count followed by each group's
+// consumers and pending-entries list) to body, shared by the blob codec and the
+// coll-form header row.
+func encodeGroups(body []byte, groups []*group) []byte {
+	body = encoding.AppendUvarint(body, uint64(len(groups)))
+	for _, g := range groups {
 		body = encoding.AppendUvarint(body, uint64(len(g.name)))
 		body = append(body, g.name...)
 		body = encoding.AppendUvarint(body, g.lastID.ms)
@@ -273,6 +302,13 @@ func getStream(db *keyspace.DB, key []byte) (*stream, keyspace.ValueHeader, bool
 	if hdr.Type != keyspace.TypeStream {
 		return nil, hdr, true, nil
 	}
+	// A large stream lives in the btree-backed sub-tree form (stream_tree.go); for
+	// it the value db.Get returned is only the coll metadata, so materialize the
+	// entries and groups from the sub-tree instead of decoding the body as a blob.
+	if hdr.IsColl() {
+		s, e := streamCollMaterialize(db, key)
+		return s, hdr, true, e
+	}
 	s, err := streamDecode(body)
 	if err != nil {
 		return nil, hdr, true, err
@@ -280,8 +316,16 @@ func getStream(db *keyspace.DB, key []byte) (*stream, keyspace.ValueHeader, bool
 	return s, hdr, true, nil
 }
 
-// storeStream writes the stream back at key, keeping the existing TTL.
+// storeStream writes the stream back at key, keeping the existing TTL. A stream
+// past the promote threshold is written in the btree-backed sub-tree form so a
+// large stream is never held or rewritten as one blob; a small one stays inline.
+// The coll write rebuilds the sub-tree in place under one shard write lock, so a
+// key already in coll form is replaced atomically and never demotes to a blob
+// while it is still large.
 func storeStream(db *keyspace.DB, key []byte, s *stream, ttlMs int64) error {
+	if streamWantsTree(s) {
+		return streamStoreColl(db, key, s)
+	}
 	return db.Set(key, streamEncode(s), keyspace.TypeStream, keyspace.EncStream, ttlMs)
 }
 
