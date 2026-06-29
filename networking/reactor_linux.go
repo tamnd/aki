@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+
+	"github.com/tamnd/aki/uring"
 )
 
 // reactor_linux.go is the epoll event-loop networking strategy (Spec/2064/reactor,
@@ -62,6 +64,21 @@ type evLoop struct {
 	wakeW    int
 	stopping atomic.Bool
 
+	// ring is the loop's io_uring, set only in the "uring" net mode and only when
+	// the kernel grants a ring. When nil the loop runs the plain epoll path with one
+	// write syscall per connection; when set the loop batches a turn's writes into
+	// one io_uring_enter (Spec/2064 note 300). The ring is owned solely by this loop
+	// goroutine, so it needs no lock, matching the package's one-ring-per-goroutine
+	// rule.
+	ring *uring.Ring
+	// flushPending holds the connections that produced output this turn, reused
+	// across turns to avoid per-turn allocation. flushLocked holds the subset whose
+	// send was submitted to the ring (writeMu held until the completion is reaped).
+	// comps is the reap scratch buffer.
+	flushPending []*Conn
+	flushLocked  []*Conn
+	comps        []uring.Completion
+
 	// conns maps a registered socket fd to its connection. Only the loop goroutine
 	// touches it.
 	conns map[int32]*Conn
@@ -75,12 +92,12 @@ type evLoop struct {
 // so the existing scheduler-parallelism knob also sizes the reactor. It returns
 // (nil, false) only if the kernel refuses an epoll or pipe fd, in which case the
 // server falls back to the goroutine path.
-func newReactor(s *Server) (netReactor, bool) {
+func newReactor(s *Server, useRing bool) (netReactor, bool) {
 	n := max(runtime.GOMAXPROCS(0), 1)
 	r := &reactor{}
 	bh, _ := s.handler.(BatchHandler)
 	for range n {
-		l, err := newEvLoop(s, r, bh)
+		l, err := newEvLoop(s, r, bh, useRing)
 		if err != nil {
 			for _, made := range r.loops {
 				made.closeFds()
@@ -99,7 +116,7 @@ func newReactor(s *Server) (netReactor, bool) {
 // newEvLoop creates a loop's epoll instance and self-pipe, and arms the pipe's
 // read end so a write to the pipe wakes a blocked epoll_wait. It does not start
 // the loop goroutine.
-func newEvLoop(s *Server, r *reactor, bh BatchHandler) (*evLoop, error) {
+func newEvLoop(s *Server, r *reactor, bh BatchHandler, useRing bool) (*evLoop, error) {
 	epfd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
 	if err != nil {
 		return nil, err
@@ -119,6 +136,16 @@ func newEvLoop(s *Server, r *reactor, bh BatchHandler) (*evLoop, error) {
 		wakeW:        p[1],
 		conns:        make(map[int32]*Conn),
 	}
+	// A turn services at most maxReactorEvents connections, so one send per
+	// connection fits a ring of that size and PrepSend never overflows mid-turn. A
+	// kernel that refuses the ring leaves l.ring nil and the loop runs the plain
+	// epoll path, so the server still starts in "uring" mode on an old kernel.
+	if useRing {
+		if rg, rerr := uring.New(maxReactorEvents); rerr == nil {
+			l.ring = rg
+			l.comps = make([]uring.Completion, maxReactorEvents)
+		}
+	}
 	var ev syscall.EpollEvent
 	ev.Events = syscall.EPOLLIN
 	ev.Fd = int32(l.wakeR)
@@ -130,6 +157,10 @@ func newEvLoop(s *Server, r *reactor, bh BatchHandler) (*evLoop, error) {
 }
 
 func (l *evLoop) closeFds() {
+	if l.ring != nil {
+		_ = l.ring.Close()
+		l.ring = nil
+	}
 	_ = syscall.Close(l.epfd)
 	_ = syscall.Close(l.wakeR)
 	_ = syscall.Close(l.wakeW)
@@ -204,6 +235,10 @@ func (l *evLoop) run() {
 			l.shutdownConns()
 			return
 		}
+		if l.ring != nil {
+			l.serviceBatch(events[:n])
+			continue
+		}
 		for i := range n {
 			fd := events[i].Fd
 			if int(fd) == l.wakeR {
@@ -217,6 +252,193 @@ func (l *evLoop) run() {
 			l.safeService(c)
 		}
 	}
+}
+
+// serviceBatch is the run-loop body when the loop has an io_uring. It services
+// every ready connection without flushing, collects the ones that produced output,
+// then sends them all in one io_uring_enter. This is the write half of the syscall
+// batch the profile names as the lever (Spec/2064 note 300); reads stay one fill
+// per connection, driven by epoll readiness as before.
+func (l *evLoop) serviceBatch(events []syscall.EpollEvent) {
+	pending := l.flushPending[:0]
+	for i := range events {
+		fd := events[i].Fd
+		if int(fd) == l.wakeR {
+			l.drainWake()
+			continue
+		}
+		c := l.conns[fd]
+		if c == nil {
+			continue
+		}
+		if l.safeServiceNoFlush(c) {
+			pending = append(pending, c)
+		}
+	}
+	l.flushPending = pending
+	if len(pending) > 0 {
+		l.flushBatch(pending)
+	}
+}
+
+// safeServiceNoFlush is serviceNoFlush under the same panic contract as safeService.
+func (l *evLoop) safeServiceNoFlush(c *Conn) (hasOutput bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if ph, ok := l.handler.(PanicHandler); ok {
+				ph.OnPanic(r, debug.Stack())
+			}
+			panic(r)
+		}
+	}()
+	return l.serviceNoFlush(c)
+}
+
+// serviceNoFlush mirrors service but defers the normal end-of-turn flush so the
+// caller can batch it. It returns true only in the ordinary case where the
+// connection has buffered replies and is still open; the close, handoff, and
+// over-limit branches are handled inline here exactly as service handles them
+// (they flush synchronously, which is rare) and return false.
+func (l *evLoop) serviceNoFlush(c *Conn) bool {
+	if err := c.fill(); err != nil {
+		l.reap(c)
+		return false
+	}
+	term := c.drain()
+	if l.batchHandler != nil {
+		l.batchHandler.OnBatchComplete(c)
+	}
+	if c.needHandoff {
+		c.needHandoff = false
+		_ = c.flush()
+		l.detach(c)
+		c.server.startGoroutineServe(c)
+		return false
+	}
+	if term {
+		l.reap(c)
+		return false
+	}
+	c.compact()
+	if c.overQueryBufLimit() {
+		_ = c.flush()
+		l.reap(c)
+		return false
+	}
+	return c.outBuf.Len() > 0
+}
+
+// flushBatch sends the buffered replies for every connection in pending in one
+// io_uring submission and one wait, then reaps the completions. A connection whose
+// writeMu is held by another goroutine (a pub/sub push, a MONITOR feed) or that the
+// ring cannot accept falls back to the inline flush, so correctness never depends on
+// the batch winning. A send error closes the connection the same way a failed flush
+// does today, after the batch completes so no close races an unreaped send still
+// referencing the connection's buffer.
+func (l *evLoop) flushBatch(pending []*Conn) {
+	sub := l.flushLocked[:0]
+	for _, c := range pending {
+		if !c.writeMu.TryLock() {
+			if err := c.flush(); err != nil {
+				l.reap(c)
+			}
+			continue
+		}
+		if c.outBuf.Len() == 0 {
+			c.writeMu.Unlock()
+			continue
+		}
+		if !l.ring.PrepSend(uint64(len(sub)), c.fd, c.outBuf.Bytes()) {
+			c.writeMu.Unlock()
+			if err := c.flush(); err != nil {
+				l.reap(c)
+			}
+			continue
+		}
+		sub = append(sub, c)
+	}
+	l.flushLocked = sub
+	if len(sub) == 0 {
+		return
+	}
+	if _, err := l.ring.SubmitAndWait(uint32(len(sub))); err != nil {
+		// The enter itself failed; the ring is unusable for this turn. Unlock and
+		// close every connection whose send was submitted, the honest outcome for
+		// replies that cannot be delivered.
+		for i, c := range sub {
+			if c == nil {
+				continue
+			}
+			c.writeMu.Unlock()
+			l.reap(c)
+			sub[i] = nil
+		}
+		return
+	}
+	got := 0
+	for got < len(sub) {
+		m := l.ring.Reap(l.comps)
+		if m == 0 {
+			// Not all completions are ready yet; wait for the rest. If that wait
+			// fails, stop and close whatever is still unreaped below.
+			if _, err := l.ring.SubmitAndWait(uint32(len(sub) - got)); err != nil {
+				break
+			}
+			continue
+		}
+		for k := range m {
+			comp := l.comps[k]
+			idx := int(comp.UserData)
+			if idx < 0 || idx >= len(sub) || sub[idx] == nil {
+				continue
+			}
+			c := sub[idx]
+			sub[idx] = nil
+			got++
+			l.completeSend(c, comp.Res)
+		}
+	}
+	// Any entry still set was never reaped (a failed re-wait): close it.
+	for i, c := range sub {
+		if c == nil {
+			continue
+		}
+		c.writeMu.Unlock()
+		l.reap(c)
+		sub[i] = nil
+	}
+}
+
+// completeSend finishes one batched send: it accounts the bytes, writes any
+// remainder of a short send inline, resets the output buffer, releases writeMu, and
+// closes the connection on a send error. The caller holds c.writeMu; this releases
+// it.
+func (l *evLoop) completeSend(c *Conn, res int32) {
+	if res < 0 {
+		c.outBuf.Reset()
+		c.writeMu.Unlock()
+		l.reap(c)
+		return
+	}
+	c.totNetOut += uint64(res)
+	if int(res) < c.outBuf.Len() {
+		// Short send: write the unsent tail synchronously before resetting. This is
+		// rare on localhost with small replies; the loop is single-threaded so the
+		// inline write cannot interleave with another batched send.
+		rem := c.outBuf.Bytes()[res:]
+		nw, werr := c.raw.Write(rem)
+		if nw > 0 {
+			c.totNetOut += uint64(nw)
+		}
+		c.outBuf.Reset()
+		c.writeMu.Unlock()
+		if werr != nil {
+			l.reap(c)
+		}
+		return
+	}
+	c.outBuf.Reset()
+	c.writeMu.Unlock()
 }
 
 // processPending arms newly registered connections and reaps requested closes. It
