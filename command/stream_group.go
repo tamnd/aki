@@ -626,7 +626,13 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 		now := keyspace.NowMillis()
 		if !ctx.update(func(db *keyspace.DB) error {
 			for j := range n {
-				s, hdr, found, err := getStream(db, keys[j])
+				// A coll stream loads only its group state from the header row; the
+				// entry log stays on disk and is reached through bounded helpers
+				// (streamCollRange for the > window, collectConsumerPELColl for the
+				// explicit-ID point fetches). getStreamGroups falls back to the full
+				// blob for a small stream, where collectRange/collectConsumerPEL read
+				// the in-memory entry slice.
+				s, hdr, found, err := getStreamGroups(db, keys[j])
 				if err != nil {
 					return err
 				}
@@ -639,6 +645,7 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 					nogKey = string(keys[j])
 					return nil
 				}
+				coll := hdr.IsColl()
 				g := s.findGroup(groupName)
 				if g == nil {
 					noGroup = true
@@ -648,7 +655,15 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 				c, created := g.getOrCreateConsumer(consumerName, now)
 				c.seenTime = now
 				if newDelivery[j] {
-					es := collectRange(s, rangeBound{id: g.lastID, excl: true}, rangeBound{id: maxStreamID}, count)
+					var es []streamEntry
+					if coll {
+						es, err = streamCollRange(db, keys[j], rangeBound{id: g.lastID, excl: true}, rangeBound{id: maxStreamID}, count, false)
+						if err != nil {
+							return err
+						}
+					} else {
+						es = collectRange(s, rangeBound{id: g.lastID, excl: true}, rangeBound{id: maxStreamID}, count)
+					}
 					if len(es) == 0 {
 						continue
 					}
@@ -662,7 +677,7 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 						}
 						rows = append(rows, readEntry{id: e.id, fields: e.fields})
 					}
-					if err := storeStream(db, keys[j], s, keepTTL(hdr, found)); err != nil {
+					if err := storeStreamGroups(db, keys[j], s, keepTTL(hdr, found)); err != nil {
 						return err
 					}
 					if propOn {
@@ -670,9 +685,17 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 					}
 					results = append(results, readGroupResult{key: keys[j], rows: rows})
 				} else {
-					rows := collectConsumerPEL(s, g, consumerName, starts[j], count)
+					var rows []readEntry
+					if coll {
+						rows, err = collectConsumerPELColl(db, keys[j], g, consumerName, starts[j], count)
+						if err != nil {
+							return err
+						}
+					} else {
+						rows = collectConsumerPEL(s, g, consumerName, starts[j], count)
+					}
 					// Creating the consumer above may need persisting.
-					if err := storeStream(db, keys[j], s, keepTTL(hdr, found)); err != nil {
+					if err := storeStreamGroups(db, keys[j], s, keepTTL(hdr, found)); err != nil {
 						return err
 					}
 					// An explicit-ID read delivers nothing new, so the > path's
@@ -790,6 +813,45 @@ func collectConsumerPEL(s *stream, g *group, consumerName string, after streamID
 		}
 	}
 	return rows
+}
+
+// collectConsumerPELColl is the coll-form collectConsumerPEL: instead of reading an
+// in-memory entry slice it point-fetches each pending entry's body from the entry
+// rows, opening one reader for the whole bounded walk. The PEL itself lives inline
+// in the header row, so g.pel is already loaded; the cost here is one btree point
+// lookup per returned row, bounded by count. Entries no longer in the stream become
+// null-field rows.
+func collectConsumerPELColl(db *keyspace.DB, key []byte, g *group, consumerName string, after streamID, count int64) ([]readEntry, error) {
+	var rows []readEntry
+	_, err := db.CollRead(key, func(r *keyspace.CollReader) error {
+		for _, pe := range g.pel {
+			if pe.consumer != consumerName {
+				continue
+			}
+			if !after.less(pe.id) {
+				continue
+			}
+			v, ok, e := r.Get(streamEntryRow(pe.id))
+			if e != nil {
+				return e
+			}
+			if !ok {
+				rows = append(rows, readEntry{id: pe.id, nilF: true})
+			} else {
+				fields, e := streamEntryFields(v)
+				if e != nil {
+					return e
+				}
+				// fields alias the page buffer, so copy before the reader closes.
+				rows = append(rows, readEntry{id: pe.id, fields: streamCopyEntry(streamEntry{fields: fields}).fields})
+			}
+			if count > 0 && int64(len(rows)) >= count {
+				break
+			}
+		}
+		return nil
+	})
+	return rows, err
 }
 
 // writeReadGroupResults writes the XREADGROUP reply. With only > IDs and nothing
