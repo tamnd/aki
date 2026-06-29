@@ -21,6 +21,7 @@ import (
 // scan would be unmistakably expensive, then assert a ZSCORE plus a ZMSCORE allocate a
 // small constant well under the member count.
 func TestZScoreLargeZSetIsPointLookup(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
 	d := newFuzzDispatcher(t)
 	conn := networking.NewOfflineConn()
 

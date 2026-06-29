@@ -14,9 +14,9 @@ func TestShortestSep(t *testing.T) {
 		lo, hi []byte
 		want   []byte
 	}{
-		{[]byte("a"), []byte("b"), []byte("b")},                  // differ at 0
-		{[]byte("app"), []byte("apq"), []byte("apq")},            // differ at 2
-		{[]byte("app"), []byte("application"), []byte("appl")},   // lo is a prefix of hi
+		{[]byte("a"), []byte("b"), []byte("b")},                // differ at 0
+		{[]byte("app"), []byte("apq"), []byte("apq")},          // differ at 2
+		{[]byte("app"), []byte("application"), []byte("appl")}, // lo is a prefix of hi
 		{[]byte("field:000000000123"), []byte("field:000000000124"), []byte("field:000000000124")},
 		{bytes.Repeat([]byte{0x00}, 255), append(bytes.Repeat([]byte{0x00}, 255), 0x01), append(bytes.Repeat([]byte{0x00}, 255), 0x01)},
 		{[]byte{0x10}, []byte{0x20, 0x30, 0x40}, []byte{0x20}}, // big right key collapses to one byte

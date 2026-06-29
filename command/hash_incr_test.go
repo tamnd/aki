@@ -24,6 +24,7 @@ import (
 // about a megabyte, then assert a HINCRBY plus a HINCRBYFLOAT allocate a small
 // constant well under the field count.
 func TestHIncrByLargeHashIsPointWrite(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
 	d := newFuzzDispatcher(t)
 	conn := networking.NewOfflineConn()
 

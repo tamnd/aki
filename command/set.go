@@ -4,6 +4,7 @@ import (
 	"math/rand/v2"
 
 	"github.com/tamnd/aki/keyspace"
+	"github.com/tamnd/aki/resp"
 )
 
 // setDedupMapThreshold is the member count at or above which SADD/SREM build a
@@ -529,6 +530,50 @@ func handleSRandMember(ctx *Ctx) {
 		return
 	}
 
+	// A coll-form set samples through a bounded reservoir walk so it never clones
+	// every member to return a handful; a blob set keeps the materialized path with
+	// its hot-cache fast read.
+	var (
+		wrongTyp bool
+		isColl   bool
+		picked   [][]byte
+	)
+	if !ctx.view(func(db *keyspace.DB) error {
+		hdr, found, err := setHeader(db, key)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nil
+		}
+		if hdr.Type != keyspace.TypeSet {
+			wrongTyp = true
+			return nil
+		}
+		if hdr.IsColl() {
+			isColl = true
+			c := count
+			if !hasCount {
+				c = 1
+			}
+			picked, err = setCollRandMembers(db, key, c)
+			return err
+		}
+		return nil
+	}) {
+		return
+	}
+	if wrongTyp {
+		ctx.enc().WriteError(wrongTypeError)
+		return
+	}
+	enc := ctx.enc()
+
+	if isColl {
+		writeSRandReply(enc, picked, hasCount, count)
+		return
+	}
+
 	members, wrongTyp, ok := readSet(ctx, key)
 	if !ok {
 		return
@@ -537,7 +582,6 @@ func handleSRandMember(ctx *Ctx) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
-	enc := ctx.enc()
 
 	if !hasCount {
 		if len(members) == 0 {
@@ -564,6 +608,31 @@ func handleSRandMember(ctx *Ctx) {
 	enc.WriteSetLen(len(picks))
 	for _, i := range picks {
 		enc.WriteBulkString(members[i])
+	}
+}
+
+// writeSRandReply emits the SRANDMEMBER reply for an already-sampled coll-form set:
+// a single bulk (or null) without a count, a set-typed reply for a positive count,
+// a plain array for a negative count.
+func writeSRandReply(enc *resp.Encoder, picked [][]byte, hasCount bool, count int64) {
+	if !hasCount {
+		if len(picked) == 0 {
+			enc.WriteNull()
+			return
+		}
+		enc.WriteBulkString(picked[0])
+		return
+	}
+	if count < 0 {
+		enc.WriteArrayLen(len(picked))
+		for _, m := range picked {
+			enc.WriteBulkString(m)
+		}
+		return
+	}
+	enc.WriteSetLen(len(picked))
+	for _, m := range picked {
+		enc.WriteBulkString(m)
 	}
 }
 

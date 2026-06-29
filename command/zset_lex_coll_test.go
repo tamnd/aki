@@ -19,6 +19,7 @@ import (
 // commands assume, so member byte order is the rank order. Members are padded so a
 // whole-set clone would move about a megabyte.
 func TestZRangeByLexCollIsBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
 	d := newFuzzDispatcher(t)
 	conn := networking.NewOfflineConn()
 

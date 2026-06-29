@@ -19,6 +19,7 @@ import (
 // small constant no matter how big the set is. Members are padded so a whole-set clone
 // would move about a megabyte.
 func TestZRangeByRankCollIsBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
 	d := newFuzzDispatcher(t)
 	conn := networking.NewOfflineConn()
 

@@ -20,6 +20,7 @@ import (
 // long enough that a scan would be unmistakably expensive, then assert a single
 // SISMEMBER allocates a small constant well under the member count.
 func TestSISMEMBERLargeSetIsPointLookup(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
 	d := newFuzzDispatcher(t)
 	conn := networking.NewOfflineConn()
 
