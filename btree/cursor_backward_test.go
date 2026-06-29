@@ -179,6 +179,70 @@ func TestCursorSeekForPrev(t *testing.T) {
 	}
 }
 
+// arenaBackwardWalk does a full Last+Prev scan on an arena-backed cursor, copying
+// nothing out, and returns the keys visited. It is the shape the whole-set reverse
+// dump (ZREVRANGE key 0 -1) drives: position at the end, step back to the front.
+func arenaBackwardWalk(t *testing.T, tr *Tree) int {
+	t.Helper()
+	c := tr.Cursor()
+	c.UseArena()
+	if err := c.Last(); err != nil {
+		t.Fatalf("Last: %v", err)
+	}
+	count := 0
+	for c.Valid() {
+		_ = c.Key() // consumed before advancing, as the cursor contract requires
+		count++
+		if err := c.Prev(); err != nil {
+			t.Fatalf("Prev: %v", err)
+		}
+	}
+	return count
+}
+
+// TestCursorBackwardArenaBounded guards the backward arena walk against the
+// O(visited-leaves) accumulation it used to pay. Last+Prev keeps the root-to-leaf
+// path live, so the arena could not be reset per leaf the way the forward walk
+// resets it, and a whole-tree reverse scan retained every leaf it touched plus a
+// bytes.Clone of every interior separator: O(n) heap, the OOM a larger-than-RAM
+// reverse dump would hit. The fix decodes the path interiors children-only onto the
+// heap (so they survive the reset) and resets the arena at each leaf boundary, so a
+// reverse scan allocates a small constant set by tree height, flat in the key count.
+//
+// The witness is allocation count at two cardinalities a 4x apart: a per-element or
+// per-leaf cost would scale with n, while the bounded walk stays nearly flat.
+func TestCursorBackwardArenaBounded(t *testing.T) {
+	build := func(n int) *Tree {
+		tr, _ := newTree(t, 4096)
+		for i := range n {
+			if err := tr.Put(fmt.Appendf(nil, "k%06d", i), pad); err != nil {
+				t.Fatalf("Put %d: %v", i, err)
+			}
+		}
+		return tr
+	}
+	small := build(500)
+	large := build(2000)
+
+	if got := arenaBackwardWalk(t, large); got != 2000 {
+		t.Fatalf("backward walk visited %d keys, want 2000", got)
+	}
+
+	aSmall := testing.AllocsPerRun(5, func() { arenaBackwardWalk(t, small) })
+	aLarge := testing.AllocsPerRun(5, func() { arenaBackwardWalk(t, large) })
+
+	// A 4x larger tree must not cost 4x the allocations: the walk is bounded by
+	// tree height, so the two counts sit close together, both far below n.
+	if aLarge > aSmall*2 {
+		t.Fatalf("backward walk allocations scale with n: n=500 -> %.0f, n=2000 -> %.0f; "+
+			"a bounded walk should stay nearly flat", aSmall, aLarge)
+	}
+	if aLarge > 200 {
+		t.Fatalf("backward walk over a 2000-key tree allocated %.0f objects; "+
+			"a bounded reverse scan should be a small constant", aLarge)
+	}
+}
+
 func safeKey(c *Cursor) []byte {
 	if c.Valid() {
 		return c.Key()
