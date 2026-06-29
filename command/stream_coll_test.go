@@ -461,6 +461,45 @@ func TestStreamCollDelTrimSetID(t *testing.T) {
 	}
 }
 
+// TestStreamCollEmptyKeepsGroupPEL checks the slice-3e empty-recreate path: when a
+// coll stream with a consumer group holding pending entries is emptied (XTRIM to
+// zero), the stream rebuilds as an empty blob but its group and that group's PEL
+// must survive, because the PEL rows are loaded back into the surviving metadata
+// before the sub-tree tears down. A pending entry can reference an entry no longer
+// in the stream, exactly as in Redis.
+func TestStreamCollEmptyKeepsGroupPEL(t *testing.T) {
+	r, c, eng := startDataEng(t)
+	const n = streamCollThreshold + 50
+	for i := 1; i <= n; i++ {
+		_ = bulk(t, r, c, fmt.Sprintf("XADD s %d-0 f v%d", i, i))
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("stream not coll after seeding %d", n)
+	}
+	if got := sendLine(t, r, c, "XGROUP CREATE s g 0"); got != "+OK" {
+		t.Fatalf("XGROUP CREATE = %q", got)
+	}
+	// Deliver five entries into cons without acking, so the group holds five pending.
+	xreadDrain(t, r, sendLine(t, r, c, "XREADGROUP GROUP g cons COUNT 5 STREAMS s >"))
+	if got := xpendingCount(t, r, c, "XPENDING s g"); got != 5 {
+		t.Fatalf("XPENDING before empty = %d want 5", got)
+	}
+	// Empty the stream. It still exists, now with no entries.
+	if got := sendLine(t, r, c, "XTRIM s MAXLEN 0"); got != fmt.Sprintf(":%d", n) {
+		t.Fatalf("XTRIM MAXLEN 0 = %q want :%d", got, n)
+	}
+	if got := sendLine(t, r, c, "XLEN s"); got != ":0" {
+		t.Fatalf("XLEN after empty = %q want :0", got)
+	}
+	// The group and its pending list survive the empty.
+	if got := xpendingCount(t, r, c, "XPENDING s g"); got != 5 {
+		t.Fatalf("XPENDING after empty = %d want 5 (group PEL must survive the recreate)", got)
+	}
+	if got := sendLine(t, r, c, "XINFO GROUPS s"); got != "*1" {
+		t.Fatalf("XINFO GROUPS after empty = %q want one group (*1)", got)
+	}
+}
+
 // TestStreamCollDelBounded witnesses that XDEL on a large coll stream allocates a
 // small constant, not O(entries): it point-deletes the named rows rather than
 // cloning the whole stream. We delete one entry and re-add it each run so the
@@ -531,6 +570,49 @@ func TestStreamCollAddBounded(t *testing.T) {
 	if allocs > 400 {
 		t.Fatalf("XADD with MAXLEN trim on a %d-entry stream allocated %.0f objects per run; "+
 			"a bounded append should be a small constant, not O(n)", n, allocs)
+	}
+}
+
+// TestStreamCollAddBoundedWithLargePEL is the slice-3e witness: XADD stays bounded
+// even when a consumer group holds a large never-acknowledged pending list. Before
+// the PEL moved out of the header row, every XADD re-encoded the whole header, so a
+// growing never-ack PEL made each append O(pending) and grew one unbounded row, the
+// never-ack OOM case. With the PEL in its own 0x02 rows the header is bounded by the
+// group and consumer count alone, so XADD allocates a small constant regardless of
+// how many entries sit unacknowledged.
+func TestStreamCollAddBoundedWithLargePEL(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
+	d := newFuzzDispatcher(t)
+	conn := networking.NewOfflineConn()
+
+	const n = 4000
+	pad := make([]byte, 240)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	for i := 1; i <= n; i++ {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XADD"), []byte("s"),
+			[]byte(strconv.Itoa(i) + "-0"), []byte("f"), append([]byte("v"), pad...)})
+	}
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XGROUP"), []byte("CREATE"), []byte("s"), []byte("g"), []byte("0")})
+	// Deliver every entry to one consumer with no ack, so the group carries an
+	// n-entry pending list that would bloat the header under the old inline layout.
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("cons"),
+		[]byte("COUNT"), []byte(strconv.Itoa(n)), []byte("STREAMS"), []byte("s"), []byte(">")})
+
+	id := n
+	allocs := testing.AllocsPerRun(50, func() {
+		id++
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XADD"), []byte("s"),
+			[]byte(strconv.Itoa(id) + "-0"), []byte("f"), append([]byte("v"), pad...)})
+	})
+	if allocs > 400 {
+		t.Fatalf("XADD on a stream with a %d-entry never-ack PEL allocated %.0f objects per run; "+
+			"the header must not carry the PEL, so the append should be a small constant", n, allocs)
 	}
 }
 
