@@ -336,6 +336,10 @@ func handleXGroupConsumer(ctx *Ctx, create bool) {
 		result   int64
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
+		// Both branches load the header alone. CREATECONSUMER then writes the header
+		// back. DELCONSUMER on a coll stream deletes the consumer's PEL rows in place
+		// (streamCollDelConsumer), so it never loads or rewrites the whole pending
+		// list; on a blob stream it edits the small inline copy.
 		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
@@ -358,9 +362,13 @@ func handleXGroupConsumer(ctx *Ctx, create bool) {
 			if made {
 				result = 1
 			}
-		} else {
-			result = removeConsumer(g, consumerName)
+			return storeStreamGroups(db, key, s, keepTTL(hdr, found))
 		}
+		if hdr.IsColl() {
+			result, err = streamCollDelConsumer(db, key, groupName, consumerName)
+			return err
+		}
+		result = removeConsumer(g, consumerName)
 		return storeStreamGroups(db, key, s, keepTTL(hdr, found))
 	}) {
 		return
@@ -417,7 +425,9 @@ func handleXGroupDestroy(ctx *Ctx) {
 		result   int64
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStreamGroups(db, key)
+		// Destroying a group drops its pending entries, so load and rewrite the PELs
+		// (storeStreamGroupsFull clears the destroyed group's 0x02 rows).
+		s, hdr, found, err := getStreamGroupsFull(db, key)
 		if err != nil {
 			return err
 		}
@@ -431,7 +441,7 @@ func handleXGroupDestroy(ctx *Ctx) {
 		if s.removeGroup(groupName) {
 			result = 1
 		}
-		return storeStreamGroups(db, key, s, keepTTL(hdr, found))
+		return storeStreamGroupsFull(db, key, s, keepTTL(hdr, found))
 	}) {
 		return
 	}
@@ -466,7 +476,7 @@ func handleXAck(ctx *Ctx) {
 		acked    int64
 	)
 	if !ctx.updateShard(key, func(db *keyspace.DB) error {
-		s, hdr, found, err := getStreamGroups(db, key)
+		s, hdr, found, err := getStreamGroupsFull(db, key)
 		if err != nil {
 			return err
 		}
@@ -498,7 +508,7 @@ func handleXAck(ctx *Ctx) {
 		if acked == 0 {
 			return nil
 		}
-		return storeStreamGroups(db, key, s, keepTTL(hdr, found))
+		return storeStreamGroupsFull(db, key, s, keepTTL(hdr, found))
 	}) {
 		return
 	}
@@ -626,13 +636,16 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 		now := keyspace.NowMillis()
 		if !ctx.update(func(db *keyspace.DB) error {
 			for j := range n {
-				// A coll stream loads only its group state from the header row; the
-				// entry log stays on disk and is reached through bounded helpers
-				// (streamCollRange for the > window, collectConsumerPELColl for the
-				// explicit-ID point fetches). getStreamGroups falls back to the full
-				// blob for a small stream, where collectRange/collectConsumerPEL read
-				// the in-memory entry slice.
-				s, hdr, found, err := getStreamGroups(db, keys[j])
+				// A > delivery only advances the header and appends one PEL row per
+				// delivered entry, so it loads the header alone (getStreamGroups). An
+				// explicit-ID re-read walks the consumer's existing pending, so it loads
+				// the PEL rows too (getStreamGroupsFull). The blob fallback reads the
+				// whole small stream either way.
+				load := getStreamGroups
+				if !newDelivery[j] {
+					load = getStreamGroupsFull
+				}
+				s, hdr, found, err := load(db, keys[j])
 				if err != nil {
 					return err
 				}
@@ -672,12 +685,19 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 					for _, e := range es {
 						g.lastID = e.id
 						g.entriesRead++
-						if !noAck {
+						if !coll && !noAck {
 							g.pelInsert(pelEntry{id: e.id, consumer: consumerName, deliveryTime: now, deliveryCount: 1})
 						}
 						rows = append(rows, readEntry{id: e.id, fields: e.fields})
 					}
-					if err := storeStreamGroups(db, keys[j], s, keepTTL(hdr, found)); err != nil {
+					if coll {
+						// The coll path writes the header plus one PEL row per delivered
+						// entry, so the persist cost is the delivered count, not the whole
+						// pending list. The blob path rewrites the small inline blob.
+						if err := streamCollPersistDelivery(db, keys[j], s, groupName, es, consumerName, now, noAck); err != nil {
+							return err
+						}
+					} else if err := storeStreamGroups(db, keys[j], s, keepTTL(hdr, found)); err != nil {
 						return err
 					}
 					if propOn {
@@ -694,7 +714,9 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 					} else {
 						rows = collectConsumerPEL(s, g, consumerName, starts[j], count)
 					}
-					// Creating the consumer above may need persisting.
+					// An explicit-ID read never changes a PEL; it may only have created
+					// the consumer above, so it persists the header alone and leaves the
+					// PEL rows untouched.
 					if err := storeStreamGroups(db, keys[j], s, keepTTL(hdr, found)); err != nil {
 						return err
 					}
@@ -817,8 +839,8 @@ func collectConsumerPEL(s *stream, g *group, consumerName string, after streamID
 
 // collectConsumerPELColl is the coll-form collectConsumerPEL: instead of reading an
 // in-memory entry slice it point-fetches each pending entry's body from the entry
-// rows, opening one reader for the whole bounded walk. The PEL itself lives inline
-// in the header row, so g.pel is already loaded; the cost here is one btree point
+// rows, opening one reader for the whole bounded walk. The caller has already
+// loaded g.pel from the 0x02 sibling rows; the cost here is one btree point
 // lookup per returned row, bounded by count. Entries no longer in the stream become
 // null-field rows.
 func collectConsumerPELColl(db *keyspace.DB, key []byte, g *group, consumerName string, after streamID, count int64) ([]readEntry, error) {
@@ -906,7 +928,8 @@ func loadStreamForInfo(ctx *Ctx, key []byte) (*stream, bool) {
 		noKey    bool
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		s, hdr, found, err := getStreamGroups(db, key)
+		// XINFO GROUPS and CONSUMERS report pending counts, so load the PELs.
+		s, hdr, found, err := getStreamGroupsFull(db, key)
 		if err != nil {
 			return err
 		}

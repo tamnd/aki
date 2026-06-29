@@ -1,22 +1,33 @@
 package command
 
 import (
+	"bytes"
+
 	"github.com/tamnd/aki/encoding"
 	"github.com/tamnd/aki/keyspace"
 )
 
 // A large stream is stored element-per-row in the key's btree-backed collection
 // sub-tree (keyspace.CollUpdate / CollRead), the same machinery the hash, set,
-// zset and list types use. A stream keeps two row families in the one sub-tree:
+// zset and list types use. A stream keeps three row families in the one sub-tree:
 //
-//	0x00                         -> header   (last ID, max-deleted ID, entries-added, groups)
-//	0x01 + ms(8 BE) + seq(8 BE)  -> entry    (the packed field/value list)
+//	0x00                                            -> header (last ID, max-deleted ID, entries-added, groups without PELs)
+//	0x01 + ms(8 BE) + seq(8 BE)                     -> entry  (the packed field/value list)
+//	0x02 + uvarint(len(group)) + group + ms + seq   -> PEL    (one pending-entry record: consumer, delivery-time, delivery-count)
 //
 // The entry row key is the 16-byte stream ID in big-endian, so the rows sort in
 // exactly the ascending ID order XADD appends in and XRANGE/XREAD walk. The
 // single header row sorts before every entry row (0x00 < 0x01), so a forward walk
 // of the 0x01 rows reproduces the entry log. The collection metadata count is the
-// live entry count, which makes XLEN O(1).
+// live entry count (the header and PEL rows are not counted), which makes XLEN
+// O(1).
+//
+// The consumer-group pending entries lists live in the 0x02 rows, not inline in
+// the header, so a consumer that never acknowledges does not grow the header row
+// without bound, and the XADD hot path (which rewrites only the header) does not
+// pay the PEL size per append. A PEL row key is the group's length-prefixed name
+// then the 16-byte entry ID, so a group's pending records are contiguous and
+// sorted by ID, and one group's prefix can never collide with another's.
 //
 // A small stream keeps the single-blob form (stream_codec.go). It promotes to the
 // sub-tree when its entry count crosses streamCollThreshold, which is the point
@@ -35,6 +46,7 @@ import (
 const (
 	streamRowHeader = 0x00 // the single stream-level metadata row
 	streamRowEntry  = 0x01 // an entry row, followed by the 16-byte ID
+	streamRowPEL    = 0x02 // a pending-entry row, keyed by group name then 16-byte ID
 
 	// streamCollThreshold is the entry count at which a stream promotes from the
 	// inline blob to the btree-backed sub-tree form.
@@ -101,7 +113,7 @@ func streamHeaderValue(s *stream) []byte {
 	b = encoding.AppendUvarint(b, s.maxDeletedID.ms)
 	b = encoding.AppendUvarint(b, s.maxDeletedID.seq)
 	b = encoding.AppendUvarint(b, s.entriesAdded)
-	return encodeGroups(b, s.groups)
+	return encodeGroupsNoPEL(b, s.groups)
 }
 
 // streamReadHeader fills the stream-level metadata of s from a header row value.
@@ -131,7 +143,7 @@ func streamReadHeader(s *stream, val []byte) error {
 	if s.entriesAdded, err = read(); err != nil {
 		return err
 	}
-	groups, _, err := decodeGroups(val, off)
+	groups, _, err := decodeGroupsNoPEL(val, off)
 	if err != nil {
 		return err
 	}
@@ -139,11 +151,351 @@ func streamReadHeader(s *stream, val []byte) error {
 	return nil
 }
 
+// encodeGroupsNoPEL appends the coll header's group section: a group count then
+// each group's name, last-delivered ID, entries-read counter, and consumer set.
+// Unlike the blob codec's encodeGroups it omits the pending entries list, which
+// the coll form keeps in the 0x02 sibling rows, so the header row stays bounded by
+// the group and consumer count rather than by the pending count.
+func encodeGroupsNoPEL(body []byte, groups []*group) []byte {
+	body = encoding.AppendUvarint(body, uint64(len(groups)))
+	for _, g := range groups {
+		body = encoding.AppendUvarint(body, uint64(len(g.name)))
+		body = append(body, g.name...)
+		body = encoding.AppendUvarint(body, g.lastID.ms)
+		body = encoding.AppendUvarint(body, g.lastID.seq)
+		body = encoding.AppendUvarint(body, g.entriesRead)
+		body = encoding.AppendUvarint(body, uint64(len(g.consumers)))
+		for _, c := range g.consumers {
+			body = encoding.AppendUvarint(body, uint64(len(c.name)))
+			body = append(body, c.name...)
+			body = encoding.AppendUvarint(body, uint64(c.seenTime))
+			body = encoding.AppendUvarint(body, uint64(c.activeTime))
+		}
+	}
+	return body
+}
+
+// decodeGroupsNoPEL unpacks the coll header's group section written by
+// encodeGroupsNoPEL: groups with their consumers but no pending entries list. The
+// returned groups have a nil pel; a caller that needs the PELs reads them from the
+// 0x02 rows through loadGroupPELs.
+func decodeGroupsNoPEL(body []byte, off int) ([]*group, int, error) {
+	read := func() (uint64, error) {
+		v, n, err := encoding.Uvarint(body[off:])
+		if err != nil {
+			return 0, err
+		}
+		off += n
+		return v, nil
+	}
+	groupCount, err := read()
+	if err != nil {
+		return nil, off, err
+	}
+	groups := make([]*group, 0, groupCount)
+	for range groupCount {
+		g := &group{}
+		nameChunk, m, err := readChunk(body, off)
+		if err != nil {
+			return nil, off, err
+		}
+		off = m
+		g.name = string(nameChunk)
+		if g.lastID.ms, err = read(); err != nil {
+			return nil, off, err
+		}
+		if g.lastID.seq, err = read(); err != nil {
+			return nil, off, err
+		}
+		if g.entriesRead, err = read(); err != nil {
+			return nil, off, err
+		}
+		consumerCount, err := read()
+		if err != nil {
+			return nil, off, err
+		}
+		g.consumers = make([]*consumer, 0, consumerCount)
+		for range consumerCount {
+			cn, m, err := readChunk(body, off)
+			if err != nil {
+				return nil, off, err
+			}
+			off = m
+			seen, err := read()
+			if err != nil {
+				return nil, off, err
+			}
+			active, err := read()
+			if err != nil {
+				return nil, off, err
+			}
+			g.consumers = append(g.consumers, &consumer{
+				name:       string(cn),
+				seenTime:   int64(seen),
+				activeTime: int64(active),
+			})
+		}
+		groups = append(groups, g)
+	}
+	return groups, off, nil
+}
+
+// streamPELPrefix builds the row-key prefix shared by every PEL row of one group:
+// the PEL prefix byte, the group name length, and the group name. A group's PEL
+// rows are exactly the rows under this prefix, sorted by entry ID. The length
+// prefix keeps one group's rows from being mistaken for another's even when one
+// name is a prefix of the other.
+func streamPELPrefix(group string) []byte {
+	p := make([]byte, 0, 1+10+len(group))
+	p = append(p, streamRowPEL)
+	p = encoding.AppendUvarint(p, uint64(len(group)))
+	p = append(p, group...)
+	return p
+}
+
+// streamPELRow builds the full PEL row key: the group prefix then the 16-byte ID
+// in big-endian, so a group's records sort by entry ID.
+func streamPELRow(group string, id streamID) []byte {
+	k := streamPELPrefix(group)
+	k = encoding.AppendU64BE(k, id.ms)
+	k = encoding.AppendU64BE(k, id.seq)
+	return k
+}
+
+// streamPELRowID reads the entry ID back out of a PEL row key, given the length of
+// the group prefix the key carries.
+func streamPELRowID(k []byte, prefixLen int) streamID {
+	return streamID{ms: encoding.U64BE(k[prefixLen : prefixLen+8]), seq: encoding.U64BE(k[prefixLen+8 : prefixLen+16])}
+}
+
+// streamPELValue packs a pending-entry record's row value: the owning consumer,
+// the delivery time, and the delivery count. The entry ID lives in the row key.
+func streamPELValue(pe pelEntry) []byte {
+	v := encoding.AppendUvarint(nil, uint64(len(pe.consumer)))
+	v = append(v, pe.consumer...)
+	v = encoding.AppendUvarint(v, uint64(pe.deliveryTime))
+	v = encoding.AppendUvarint(v, pe.deliveryCount)
+	return v
+}
+
+// streamPELFromValue unpacks a PEL row value into a pelEntry. The id field is left
+// zero; the caller fills it from the row key.
+func streamPELFromValue(val []byte) (pelEntry, error) {
+	consumer, off, err := readChunk(val, 0)
+	if err != nil {
+		return pelEntry{}, err
+	}
+	dt, n, err := encoding.Uvarint(val[off:])
+	if err != nil {
+		return pelEntry{}, err
+	}
+	off += n
+	dc, _, err := encoding.Uvarint(val[off:])
+	if err != nil {
+		return pelEntry{}, err
+	}
+	return pelEntry{consumer: string(consumer), deliveryTime: int64(dt), deliveryCount: dc}, nil
+}
+
+// pelCursorSource is the common cursor factory of a CollReader and a CollWriter, so
+// loadGroupPELs can scan the PEL rows from either a read closure or a write closure.
+type pelCursorSource interface {
+	Cursor() *keyspace.CollCursor
+}
+
+// loadGroupPELs fills each group's pel slice from its 0x02 sibling rows, walking
+// one group's contiguous prefix at a time in entry-ID order. The caller uses this
+// only when it needs the PELs (the consumer-group commands); the hot append and
+// trim paths read the header alone and leave the PEL rows untouched.
+func loadGroupPELs(src pelCursorSource, groups []*group) error {
+	for _, g := range groups {
+		prefix := streamPELPrefix(g.name)
+		c := src.Cursor()
+		if err := c.Seek(prefix); err != nil {
+			return err
+		}
+		for c.Valid() {
+			k := c.Key()
+			if !bytes.HasPrefix(k, prefix) {
+				break
+			}
+			pe, err := streamPELFromValue(c.Value())
+			if err != nil {
+				return err
+			}
+			pe.id = streamPELRowID(k, len(prefix))
+			g.pel = append(g.pel, pe)
+			if err := c.Next(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// streamClearPELRows deletes every 0x02 PEL row in the writer's sub-tree, gathering
+// the keys in one forward pass before deleting so the cursor is not mutated
+// mid-walk. storeStreamGroupsFull uses it to replace a stream's PELs wholesale.
+func streamClearPELRows(w *keyspace.CollWriter) error {
+	var keys [][]byte
+	c := w.Cursor()
+	if err := c.Seek([]byte{streamRowPEL}); err != nil {
+		return err
+	}
+	for c.Valid() {
+		k := c.Key()
+		if len(k) == 0 || k[0] != streamRowPEL {
+			break
+		}
+		keys = append(keys, append([]byte(nil), k...))
+		if err := c.Next(); err != nil {
+			return err
+		}
+	}
+	for _, k := range keys {
+		if _, err := w.Delete(k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// collGetter is the point-read method shared by a CollReader and a CollWriter, so
+// the same entry-row and PEL-row lookups serve a read closure or a write closure.
+type collGetter interface {
+	Get(sub []byte) ([]byte, bool, error)
+}
+
+// streamPELGet point-reads one group's PEL row for id, filling the id from the
+// caller (the row value omits it). It is the bounded alternative to scanning a
+// whole group's PEL: a consumer-group command that names specific ids reads only
+// those rows.
+func streamPELGet(g collGetter, group string, id streamID) (pelEntry, bool, error) {
+	v, ok, err := g.Get(streamPELRow(group, id))
+	if err != nil || !ok {
+		return pelEntry{}, false, err
+	}
+	pe, err := streamPELFromValue(v)
+	if err != nil {
+		return pelEntry{}, false, err
+	}
+	pe.id = id
+	return pe, true, nil
+}
+
+// streamPELPut writes one PEL row, an insert or an in-place update of the named
+// pending entry, touching no other row.
+func streamPELPut(w *keyspace.CollWriter, group string, pe pelEntry) error {
+	_, err := w.Put(streamPELRow(group, pe.id), streamPELValue(pe))
+	return err
+}
+
+// streamPELDelete removes one PEL row, reporting whether it existed.
+func streamPELDelete(w *keyspace.CollWriter, group string, id streamID) (bool, error) {
+	return w.Delete(streamPELRow(group, id))
+}
+
+// streamCollPersistDelivery writes back a > delivery: the header row (the advanced
+// group last id, entries-read counter, and consumer times the caller already
+// updated in s) plus one PEL row per just-delivered entry. It touches only the
+// delivered rows, so the cost is the delivered count, never the whole pending
+// list. A NOACK delivery keeps no PEL, so it writes the header alone.
+func streamCollPersistDelivery(db *keyspace.DB, key []byte, s *stream, group string, es []streamEntry, consumer string, now int64, noAck bool) error {
+	return db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
+		if _, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(s)); e != nil {
+			return e
+		}
+		if noAck {
+			return nil
+		}
+		for _, e := range es {
+			pe := pelEntry{id: e.id, consumer: consumer, deliveryTime: now, deliveryCount: 1}
+			if err := streamPELPut(w, group, pe); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// streamCollDelConsumer drops a consumer from the header group and deletes its PEL
+// rows, returning the count removed. It scans only the group's PEL prefix (the rows
+// keyed by group then id), so the cost is the group's pending size, never the entry
+// log; a consumer with nothing pending costs one seek. The caller has confirmed the
+// key is a coll stream and the group exists.
+func streamCollDelConsumer(db *keyspace.DB, key []byte, group, consumer string) (int64, error) {
+	var removed int64
+	err := db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
+		hv, ok, e := w.Get([]byte{streamRowHeader})
+		if e != nil || !ok {
+			return e
+		}
+		s := &stream{}
+		if e := streamReadHeader(s, hv); e != nil {
+			return e
+		}
+		g := s.findGroup(group)
+		if g == nil {
+			return nil
+		}
+		for i, c := range g.consumers {
+			if c.name == consumer {
+				g.consumers = append(g.consumers[:i], g.consumers[i+1:]...)
+				break
+			}
+		}
+		if _, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(s)); e != nil {
+			return e
+		}
+		prefix := streamPELPrefix(group)
+		var keys [][]byte
+		cur := w.Cursor()
+		if e := cur.Seek(prefix); e != nil {
+			return e
+		}
+		for cur.Valid() {
+			k := cur.Key()
+			if !bytes.HasPrefix(k, prefix) {
+				break
+			}
+			pe, e := streamPELFromValue(cur.Value())
+			if e != nil {
+				return e
+			}
+			if pe.consumer == consumer {
+				keys = append(keys, append([]byte(nil), k...))
+			}
+			if e := cur.Next(); e != nil {
+				return e
+			}
+		}
+		for _, k := range keys {
+			if _, e := w.Delete(k); e != nil {
+				return e
+			}
+			removed++
+		}
+		return nil
+	})
+	return removed, err
+}
+
 // streamHeader probes the value header at key without decoding the body, so a
 // command can route to the blob path or the sub-tree path. found is false for a
 // missing key.
 func streamHeader(db *keyspace.DB, key []byte) (keyspace.ValueHeader, bool, error) {
 	return db.CollMetaHeader(key)
+}
+
+// streamHeaderIsColl reports whether key is stored in coll (sub-tree) form, so a
+// command can pick the header-only loader for a coll stream and the full-blob
+// loader otherwise. A missing key reads as not coll.
+func streamHeaderIsColl(db *keyspace.DB, key []byte) (bool, error) {
+	hdr, found, err := streamHeader(db, key)
+	if err != nil || !found {
+		return false, err
+	}
+	return hdr.IsColl(), nil
 }
 
 // streamCollMaterialize reads a btree-backed stream fully into the in-memory
@@ -161,6 +513,9 @@ func streamCollMaterialize(db *keyspace.DB, key []byte) (*stream, error) {
 		}
 		if ok {
 			if e := streamReadHeader(s, hv); e != nil {
+				return e
+			}
+			if e := loadGroupPELs(r, s.groups); e != nil {
 				return e
 			}
 		}
@@ -206,6 +561,16 @@ func streamStoreColl(db *keyspace.DB, key []byte, s *stream) error {
 		for _, e := range s.entries {
 			if _, err := w.Put(streamEntryRow(e.id), streamEntryValue(e.fields)); err != nil {
 				return err
+			}
+		}
+		// The groups' PELs ride in the 0x02 sibling rows, not the header, so write
+		// one row per pending record. A promotion from the blob form carries its
+		// PELs here; streamClearRows above cleared any stale rows first.
+		for _, g := range s.groups {
+			for _, pe := range g.pel {
+				if _, err := w.Put(streamPELRow(g.name, pe.id), streamPELValue(pe)); err != nil {
+					return err
+				}
 			}
 		}
 		w.SetCount(uint64(len(s.entries)))
@@ -267,6 +632,76 @@ func storeStreamGroups(db *keyspace.DB, key []byte, s *stream, ttlMs int64) erro
 		// caller-maintained, so the entry count the metadata carries is unchanged.
 		_, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(s))
 		return e
+	})
+}
+
+// getStreamGroupsFull reads a stream's group metadata together with the pending
+// entries lists. In coll form it decodes the header row for the groups and then
+// scans each group's 0x02 PEL rows into its pel slice; the entry log (the 0x01
+// rows) is still not touched. In blob form it falls back to getStream, where the
+// whole small blob (PELs included) decodes in one shot. The consumer-group commands
+// that read or rewrite a PEL use this rather than getStreamGroups, which leaves the
+// PELs unloaded for the hot append and trim paths.
+func getStreamGroupsFull(db *keyspace.DB, key []byte) (*stream, keyspace.ValueHeader, bool, error) {
+	hdr, found, err := streamHeader(db, key)
+	if err != nil || !found {
+		return nil, hdr, found, err
+	}
+	if hdr.Type != keyspace.TypeStream {
+		return nil, hdr, true, nil
+	}
+	if !hdr.IsColl() {
+		return getStream(db, key)
+	}
+	s := &stream{}
+	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+		hv, ok, e := r.Get([]byte{streamRowHeader})
+		if e != nil {
+			return e
+		}
+		if ok {
+			if e := streamReadHeader(s, hv); e != nil {
+				return e
+			}
+		}
+		return loadGroupPELs(r, s.groups)
+	})
+	if err != nil {
+		return nil, hdr, true, err
+	}
+	return s, hdr, true, nil
+}
+
+// storeStreamGroupsFull writes a stream's group metadata and PELs back. In coll
+// form it rewrites the header row and replaces every 0x02 PEL row from the in-memory
+// groups, leaving the entry rows and the metadata count untouched, so the key stays
+// coll. In blob form it falls back to storeStream. The caller must have loaded s
+// through getStreamGroupsFull (coll: PELs scanned in; blob: PELs inline). It costs
+// the total pending size, the same as the old inline-in-header encoding did; the
+// per-command bounding lands in the later 3e sub-slices.
+func storeStreamGroupsFull(db *keyspace.DB, key []byte, s *stream, ttlMs int64) error {
+	hdr, found, err := streamHeader(db, key)
+	if err != nil {
+		return err
+	}
+	if !found || !hdr.IsColl() {
+		return storeStream(db, key, s, ttlMs)
+	}
+	return db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
+		if _, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(s)); e != nil {
+			return e
+		}
+		if e := streamClearPELRows(w); e != nil {
+			return e
+		}
+		for _, g := range s.groups {
+			for _, pe := range g.pel {
+				if _, e := w.Put(streamPELRow(g.name, pe.id), streamPELValue(pe)); e != nil {
+					return e
+				}
+			}
+		}
+		return nil
 	})
 }
 
@@ -560,7 +995,12 @@ func streamCollDel(db *keyspace.DB, key []byte, ids []streamID) (deleted int64, 
 		}
 		if count == 0 {
 			// Let CollUpdate tear the now entry-less sub-tree down; the caller
-			// recreates the empty stream as a blob from meta.
+			// recreates the empty stream as a blob from meta. Load the PEL rows into
+			// meta first, since the sub-tree (and its 0x02 rows) is about to go and the
+			// recreated blob must keep the groups' pending entries.
+			if e := loadGroupPELs(w, s.groups); e != nil {
+				return e
+			}
 			emptied = true
 			w.SetCount(0)
 			return nil
@@ -601,6 +1041,11 @@ func streamCollTrimCmd(db *keyspace.DB, key []byte, ts trimSpec) (removed int64,
 		removed = dropped
 		newCount := count - dropped
 		if newCount <= 0 && count > 0 {
+			// As in streamCollDel, load the PEL rows into meta before the sub-tree
+			// tears down so the recreated empty blob keeps the groups' pending entries.
+			if e := loadGroupPELs(w, s.groups); e != nil {
+				return e
+			}
 			emptied = true
 			w.SetCount(0)
 			return nil
@@ -669,7 +1114,7 @@ func streamCollSetID(db *keyspace.DB, key []byte, newLast streamID, setEntriesAd
 // or trimmed). The fields are copied, so they stay valid after the reader closes.
 // XCLAIM and XAUTOCLAIM use this to check existence and build their replies without
 // materializing the whole stream.
-func streamCollEntry(r *keyspace.CollReader, id streamID) (fields [][]byte, ok bool, err error) {
+func streamCollEntry(r collGetter, id streamID) (fields [][]byte, ok bool, err error) {
 	v, ok, err := r.Get(streamEntryRow(id))
 	if err != nil || !ok {
 		return nil, ok, err
