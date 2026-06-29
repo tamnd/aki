@@ -1,6 +1,7 @@
 package command
 
 import (
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -722,6 +723,12 @@ func (e *Engine) FlushShardWrites() {
 // is the precondition for the write-behind fast path. Under commitAlways every
 // write must wait for the checkpoint before the reply goes out.
 func (e *Engine) isDeferred() bool {
+	// The hybrid-log engine has no B-tree hot cache or async write worker, so its
+	// writes must take the synchronous db.Set path that routes into the store. Never
+	// defer under it.
+	if e.ks.HybridLog() {
+		return false
+	}
 	return e.shardsRunning.Load() && commitPolicy(e.policy.Load()) != commitAlways
 }
 
@@ -790,6 +797,45 @@ func (e *Engine) sendDeleteAsync(index, shard int, key []byte, ver uint64) error
 func (e *Engine) updateShard(index int, key []byte, fn func(*keyspace.DB) error) error {
 	if e.shardsRunning.Load() && commitPolicy(e.policy.Load()) != commitAlways {
 		s := keyspace.ShardOf(key)
+		// Inline fast path: when shard s's hand-off queue is empty, no earlier write
+		// is waiting on its worker, so this goroutine applies fn itself instead of
+		// handing it off and blocking on the reply. The synchronous round-trip the
+		// hand-off costs is two goroutine wakeups per op (producer->worker on the push,
+		// worker->producer on the done signal), and on a single hot key, which is
+		// exactly what the collection benchmarks drive (redis-benchmark RPUSH/HSET/
+		// SADD/ZADD all hammer one fixed key), that wakeup pair is the throughput cap:
+		// the profile showed the box only half busy with most of its cycles in
+		// pthread_cond_wait/signal and wakep, not in the data path.
+		//
+		// Correctness rests on the keyspace shard write mutex, not on the worker being
+		// the only writer. fn ends in db.set / CollUpdateRouted, both of which take
+		// db.shards[s].mu, the same mutex the worker takes, so an inline apply is
+		// serialized against the worker and against other inline appliers even though
+		// both sides hold only e.mu.RLock (which excludes a checkpoint, matching the
+		// worker's drain). The write sinks are version-guarded, so an apply that races
+		// a concurrent same-key write resolves by version regardless of order. The
+		// length==0 gate keeps an inline apply from jumping ahead of writes already
+		// queued for this shard, so a command that must observe an earlier queued write
+		// to the same key still hands off and serializes behind it on the worker.
+		//
+		// Under the single-key collection load every writer serializes on this one
+		// shard mutex, so nothing piles up behind a worker and the queue stays empty:
+		// the inline path is taken every time and the worker stays parked. Under spread
+		// writes the per-shard queues carry real depth, so the gate falls through to the
+		// hand-off and the worker keeps batching as before.
+		if e.shardQ[s].length.Load() == 0 {
+			e.mu.RLock()
+			db, err := e.ks.DB(index)
+			if err == nil {
+				err = fn(db)
+			}
+			if err == nil {
+				e.pendingDirty.Store(true)
+				e.pendingWrites.Add(1)
+			}
+			e.mu.RUnlock()
+			return err
+		}
 		req := writeReqPool.Get().(*writeReq)
 		req.index = index
 		req.shard = s
@@ -989,6 +1035,123 @@ func (e *Engine) viewHotGet(index int, key []byte) ([]byte, keyspace.ValueHeader
 	return db.HotGet(key)
 }
 
+// hybridLog reports whether the engine runs its string point path on the v2
+// hybrid-log store. GET reads it to pick the hybrid read fast path.
+func (e *Engine) hybridLog() bool { return e.ks.HybridLog() }
+
+// hybridSet applies a plain SET (string type, no TTL, no conditions) straight to
+// the hybrid-log store for the integrated GET/SET fast path. It is the write half
+// of handleSet's plain-SET case without the option parse or the old-value read: the
+// fast path never needs the prior value because it serves no NX/XX/GET option. The
+// engine read lock is held the same way updateShard's inline branch holds it, so a
+// concurrent BGSAVE (which takes the write lock and walks the store) is excluded and
+// sees a consistent point in time. db.Set routes into the store, which carries its
+// own per-shard locks, so writers to different keys do not serialize here. Callers
+// must have confirmed hybridLog().
+func (e *Engine) hybridSet(index int, key, body []byte) error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	db, err := e.ks.DB(index)
+	if err != nil {
+		return err
+	}
+	if err := db.Set(key, body, keyspace.TypeString, stringEncoding(body), -1); err != nil {
+		return err
+	}
+	e.pendingDirty.Store(true)
+	e.pendingWrites.Add(1)
+	return nil
+}
+
+// hybridIncrCode reports the outcome of a hybridIncr beyond the numeric result, so
+// the fast path can render the same reply the general increment path would: the OK
+// result, or one of the three error replies (wrong type, not an integer, overflow).
+type hybridIncrCode uint8
+
+const (
+	hybridIncrOK hybridIncrCode = iota
+	hybridIncrWrongType
+	hybridIncrNotInt
+	hybridIncrOverflow
+)
+
+// hybridIncr applies an INCR-family read-modify-write straight on the hybrid-log
+// store for the integrated fast path. It mirrors incrBy's compute closure: a
+// missing key counts as zero, a non-string value is a wrong-type error, an
+// unparseable value is a not-int error, an out-of-range sum overflows, and a
+// success stores the formatted result with the int encoding while preserving any
+// existing TTL.
+//
+// The read and the write must be one atomic step so two clients incrementing the
+// same key cannot both read the old value and lose an update, exactly the
+// invariant rmwWriteBehind keeps with rmwLocks. So this takes the key's RMW stripe
+// across the whole read-modify-write, the same lock and the same lock order
+// (stripe then engine read lock) the general path uses. The engine read lock is
+// held the way hybridSet holds it, to exclude a concurrent BGSAVE that walks the
+// store. Callers must have confirmed hybridLog().
+func (e *Engine) hybridIncr(index int, key []byte, delta int64) (int64, hybridIncrCode, error) {
+	stripe := rmwStripe(key)
+	e.rmwLocks[stripe].Lock()
+	defer e.rmwLocks[stripe].Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	db, err := e.ks.DB(index)
+	if err != nil {
+		return 0, hybridIncrOK, err
+	}
+	cur, hdr, found, err := db.GetUncached(key)
+	if err != nil {
+		return 0, hybridIncrOK, err
+	}
+	if found && hdr.Type != keyspace.TypeString {
+		return 0, hybridIncrWrongType, nil
+	}
+	var base int64
+	if found {
+		v, ok := parseInteger(cur)
+		if !ok {
+			return 0, hybridIncrNotInt, nil
+		}
+		base = v
+	}
+	sum, ok := addInt64(base, delta)
+	if !ok {
+		return 0, hybridIncrOverflow, nil
+	}
+	// Format the new value into a stack buffer rather than strconv.AppendInt(nil,
+	// ...), which heap-allocates a fresh slice on every INCR. A base-10 int64 is at
+	// most 20 bytes (19 digits plus a sign), so bodyBuf always holds it. This is
+	// safe because the hybrid Set copies the body into the log record synchronously
+	// (keyspace hlSet), so it never retains this slice past the call; hybridIncr is
+	// only reached on the hybrid engine, so that copy-on-write invariant always
+	// holds here. Killing this alloc takes the INCR family from two allocations per
+	// op to one (the remaining one is the header+body cell, removed separately).
+	var bodyBuf [20]byte
+	body := strconv.AppendInt(bodyBuf[:0], sum, 10)
+	if err := db.Set(key, body, keyspace.TypeString, keyspace.EncInt, keepTTL(hdr, found)); err != nil {
+		return 0, hybridIncrOK, err
+	}
+	e.pendingDirty.Store(true)
+	e.pendingWrites.Add(1)
+	return sum, hybridIncrOK, nil
+}
+
+// viewHybridGet reads a key straight off the hybrid-log store. It is the hybrid
+// analogue of viewHotGet: the hybrid engine never populates the hot-value cache,
+// so probing it is wasted work, and the store carries its own per-shard locks so
+// the read needs no engine-level read lock. The ks.DB lookup is safe lock-free
+// because the dbs slice is immutable after Open, and GetUncached routes to the
+// store, which loads its handle through an atomic pointer. So a hybrid GET costs
+// one DB lookup and the store read, with none of the per-command atomics the
+// general view path pays.
+func (e *Engine) viewHybridGet(index int, key []byte) ([]byte, keyspace.ValueHeader, bool, error) {
+	db, err := e.ks.DB(index)
+	if err != nil {
+		return nil, keyspace.ValueHeader{}, false, err
+	}
+	return db.GetUncached(key)
+}
+
 // activeExpireCycle runs one background expiry pass over every database, deleting
 // volatile keys whose TTL has passed and committing the removals so they are
 // durable. The expired keys land in the log for the caller to notify on.
@@ -1110,7 +1273,7 @@ func (e *Engine) filePath() string {
 // most keyspace.MaxInlineBody; the caller must verify this before calling.
 //
 // This function does not take the engine lock: ks.DB() reads an immutable
-// slice, NextVersion() is an atomic increment, and PrepareWriteBehind uses its
+// slice, NextVersionForKey() is a per-key atomic increment, and PrepareWriteBehind uses its
 // own per-shard mutexes. The async B-tree write is queued with sendSetAsync,
 // which stores the arguments directly in a pooled writeReq (no closure
 // allocation) and routes the request to the shard-owned channel.
@@ -1128,7 +1291,7 @@ func (ctx *Ctx) updateWriteBehind(key, body []byte, typ, enc uint8, ttlMs int64)
 		ctx.enc().WriteError("ERR " + dbErr.Error())
 		return false
 	}
-	version := e.ks.NextVersion()
+	version := e.ks.NextVersionForKey(key)
 	hdr := keyspace.ValueHeader{
 		Type:     typ,
 		Encoding: enc,
@@ -1286,7 +1449,7 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 		// the staged-SET path. The key copy outlives this command, so it must not
 		// alias the connection read buffer.
 		keyCopy := append([]byte(nil), key...)
-		version := e.ks.NextVersion()
+		version := e.ks.NextVersionForKey(keyCopy)
 		db.PrepareDeleteBehind(keyCopy, version)
 		e.rmwLocks[stripe].Unlock()
 		if asyncErr := e.sendDeleteAsync(index, shard, keyCopy, version); asyncErr != nil {
@@ -1305,7 +1468,7 @@ func (ctx *Ctx) rmwWriteBehind(key []byte, compute func(cur []byte, hdr keyspace
 	// body is already a fresh allocation. Only this path allocates; the error and
 	// no-write paths above do not.
 	keyCopy := append([]byte(nil), key...)
-	version := e.ks.NextVersion()
+	version := e.ks.NextVersionForKey(keyCopy)
 	// A body over MaxInlineBody rides the overflow chain in the B-tree, so the
 	// staged header must not claim FlagInlineBody for it. The staged copy in the
 	// hot cache and wbPending always carries the full body and the read paths

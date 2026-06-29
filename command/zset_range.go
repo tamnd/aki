@@ -427,13 +427,36 @@ func (ctx *Ctx) runRange(key, minArg, maxArg []byte, spec rangeSpec) {
 		errStr   string
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		members, hdr, ok, err := getZSet(db, key)
+		hdr, found, err := zsetHeader(db, key)
 		if err != nil {
 			return err
 		}
-		if ok && hdr.Type != keyspace.TypeZSet {
+		if found && hdr.Type != keyspace.TypeZSet {
 			wrongTyp = true
 			return nil
+		}
+		// A coll-form sorted set serves a forward score range by walking the
+		// score-index window directly, so the read stays bounded by the matching
+		// rows instead of cloning the whole set. The reverse direction needs a
+		// backward cursor and the lex and rank forms need a different seek, so those
+		// keep the materialize path for now.
+		if found && hdr.IsColl() && spec.byScore && !spec.rev {
+			loB, ok := parseScoreBound(minArg)
+			if !ok {
+				errStr = "ERR min or max is not a float"
+				return nil
+			}
+			hiB, ok := parseScoreBound(maxArg)
+			if !ok {
+				errStr = "ERR min or max is not a float"
+				return nil
+			}
+			result, _, err = zsetCollRangeByScore(db, key, loB, hiB, spec.limit, spec.offset, spec.count, false)
+			return err
+		}
+		members, _, _, err := getZSet(db, key)
+		if err != nil {
+			return err
 		}
 		result, errStr = computeRange(members, minArg, maxArg, spec)
 		return nil
@@ -469,13 +492,34 @@ func (ctx *Ctx) runRangeCount(key, minArg, maxArg []byte, spec rangeSpec) {
 		errStr   string
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		members, hdr, ok, err := getZSet(db, key)
+		hdr, found, err := zsetHeader(db, key)
 		if err != nil {
 			return err
 		}
-		if ok && hdr.Type != keyspace.TypeZSet {
+		if found && hdr.Type != keyspace.TypeZSet {
 			wrongTyp = true
 			return nil
+		}
+		// ZCOUNT over a coll-form set counts the score-index window in place rather
+		// than materializing the whole set to measure it. ZLEXCOUNT keeps the
+		// materialize path until the lex seek lands here too.
+		if found && hdr.IsColl() && spec.byScore {
+			loB, ok := parseScoreBound(minArg)
+			if !ok {
+				errStr = "ERR min or max is not a float"
+				return nil
+			}
+			hiB, ok := parseScoreBound(maxArg)
+			if !ok {
+				errStr = "ERR min or max is not a float"
+				return nil
+			}
+			_, n, err = zsetCollRangeByScore(db, key, loB, hiB, false, 0, 0, true)
+			return err
+		}
+		members, _, _, err := getZSet(db, key)
+		if err != nil {
+			return err
 		}
 		var result []zmember
 		result, errStr = computeRange(members, minArg, maxArg, spec)
@@ -595,16 +639,9 @@ func handleZRangeStore(ctx *Ctx) {
 		rangeErr   string
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
-		// The destination is overwritten, but a non-zset destination is still a
-		// WRONGTYPE error, so check its type before computing.
-		_, dstHdr, dstFound, err := db.Get(dst)
-		if err != nil {
-			return err
-		}
-		if dstFound && dstHdr.Type != keyspace.TypeZSet {
-			wrongTyp = true
-			return nil
-		}
+		// Only the source key is type-checked. The destination is overwritten
+		// whatever it held, so a string or list at the destination is replaced
+		// rather than rejected, matching Redis.
 		members, hdr, found, err := getZSet(db, src)
 		if err != nil {
 			return err
@@ -620,8 +657,8 @@ func handleZRangeStore(ctx *Ctx) {
 		}
 		n = int64(len(result))
 		if len(result) == 0 {
-			dstDeleted = dstFound
-			_, err := db.Delete(dst)
+			existed, err := db.Delete(dst)
+			dstDeleted = existed
 			return err
 		}
 		stored := make([]zmember, len(result))
