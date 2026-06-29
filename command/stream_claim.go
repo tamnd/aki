@@ -95,11 +95,54 @@ func handleXPending(ctx *Ctx) {
 
 	now := keyspace.NowMillis()
 	var (
-		wrongTyp bool
-		noGroup  bool
-		g        *group
+		wrongTyp    bool
+		noGroup     bool
+		g           *group
+		minID       streamID
+		maxID       streamID
+		collSummary bool
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
+		// The summary reads the header alone: on a coll stream the group's pending
+		// total is a header counter and the min and max IDs come from a two-row
+		// cursor scan, so a never-acked million-record group costs one seek; on a
+		// blob stream the header-only load already decodes the small inline PEL. The
+		// extended reply still scans the whole PEL by range, so it keeps the full
+		// load below.
+		if summary {
+			s, hdr, found, err := getStreamGroups(db, key)
+			if err != nil {
+				return err
+			}
+			if !found || hdr.Type != keyspace.TypeStream {
+				if found {
+					wrongTyp = true
+				} else {
+					noGroup = true
+				}
+				return nil
+			}
+			g = s.findGroup(groupName)
+			if g == nil {
+				noGroup = true
+				return nil
+			}
+			if !hdr.IsColl() {
+				// The blob load carries the full PEL, so the in-memory summary serves.
+				return nil
+			}
+			collSummary = true
+			if g.pending > 0 {
+				mn, mx, ok, err := streamCollPELBounds(db, key, groupName)
+				if err != nil {
+					return err
+				}
+				if ok {
+					minID, maxID = mn, mx
+				}
+			}
+			return nil
+		}
 		s, hdr, found, err := getStreamGroupsFull(db, key)
 		if err != nil {
 			return err
@@ -129,6 +172,10 @@ func handleXPending(ctx *Ctx) {
 		return
 	}
 	if summary {
+		if collSummary {
+			writePendingSummaryColl(ctx.enc(), g, minID, maxID)
+			return
+		}
 		writePendingSummary(ctx.enc(), g)
 		return
 	}
@@ -161,6 +208,40 @@ func writePendingSummary(enc *resp.Encoder, g *group) {
 		enc.WriteArrayLen(2)
 		enc.WriteBulkStringStr(name)
 		enc.WriteBulkStringStr(strconv.FormatInt(counts[name], 10))
+	}
+}
+
+// writePendingSummaryColl writes the XPENDING summary for a coll-form stream from
+// the header counters and the two end-of-PEL IDs, never touching the pending list
+// itself. The total comes from g.pending, the min and max from the bounded cursor
+// scan the caller already ran, and the per-consumer breakdown from each consumer's
+// pending counter in name order, skipping consumers with nothing pending (the order
+// Redis reports its consumer-group summary in).
+func writePendingSummaryColl(enc *resp.Encoder, g *group, minID, maxID streamID) {
+	enc.WriteArrayLen(4)
+	enc.WriteInteger(int64(g.pending))
+	if g.pending == 0 {
+		enc.WriteNull()
+		enc.WriteNull()
+		enc.WriteNullArray()
+		return
+	}
+	enc.WriteBulkStringStr(minID.String())
+	enc.WriteBulkStringStr(maxID.String())
+	var n int
+	for _, c := range g.consumers {
+		if c.pending > 0 {
+			n++
+		}
+	}
+	enc.WriteArrayLen(n)
+	for _, c := range g.consumers {
+		if c.pending == 0 {
+			continue
+		}
+		enc.WriteArrayLen(2)
+		enc.WriteBulkStringStr(c.name)
+		enc.WriteBulkStringStr(strconv.FormatUint(c.pending, 10))
 	}
 }
 
@@ -347,9 +428,29 @@ func handleXClaim(ctx *Ctx) {
 			}
 			if !exists {
 				if has {
+					// The entry was deleted under the consumer; the PEL record goes with
+					// it, so drop it from the group and its old owner's counters.
+					if g.pending > 0 {
+						g.pending--
+					}
+					if oc := g.findConsumer(pe.consumer); oc != nil && oc.pending > 0 {
+						oc.pending--
+					}
 					return del()
 				}
 				return nil
+			}
+			// A FORCE-created record adds to the group; a reclaim from a different
+			// consumer moves one pending record between owners (the group total is
+			// unchanged). The counters back the bounded XPENDING summary and XINFO.
+			if created {
+				g.pending++
+				c.pending++
+			} else if pe.consumer != consumerName {
+				if oc := g.findConsumer(pe.consumer); oc != nil && oc.pending > 0 {
+					oc.pending--
+				}
+				c.pending++
 			}
 			if err := put(pelEntry{
 				id:            id,

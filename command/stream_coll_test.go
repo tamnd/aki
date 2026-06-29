@@ -657,6 +657,58 @@ func TestStreamCollAckBounded(t *testing.T) {
 	}
 }
 
+// TestStreamCollPendingSummaryBounded drives the XPENDING summary and the XINFO
+// GROUPS/CONSUMERS pending counts over a coll-form stream whose group carries a
+// large never-acked PEL. The header counters give the totals and the bounded
+// cursor scan gives the min and max IDs, so none of these reads clone the pending
+// list. A whole-PEL load would move roughly a megabyte per call.
+func TestStreamCollPendingSummaryBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
+	d := newFuzzDispatcher(t)
+	conn := networking.NewOfflineConn()
+
+	const n = 4000
+	pad := make([]byte, 240)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	for i := 1; i <= n; i++ {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XADD"), []byte("s"),
+			[]byte(strconv.Itoa(i) + "-0"), []byte("f"), append([]byte("v"), pad...)})
+	}
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XGROUP"), []byte("CREATE"), []byte("s"), []byte("g"), []byte("0")})
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("cons"),
+		[]byte("COUNT"), []byte(strconv.Itoa(n)), []byte("STREAMS"), []byte("s"), []byte(">")})
+
+	summary := testing.AllocsPerRun(200, func() {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XPENDING"), []byte("s"), []byte("g")})
+	})
+	if summary > 1500 {
+		t.Fatalf("XPENDING summary on a %d-entry pending list allocated %.0f objects per run; "+
+			"the header counters and two boundary rows should be a small constant, not O(n)", n, summary)
+	}
+	groups := testing.AllocsPerRun(200, func() {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XINFO"), []byte("GROUPS"), []byte("s")})
+	})
+	if groups > 1500 {
+		t.Fatalf("XINFO GROUPS on a %d-entry pending list allocated %.0f objects per run; "+
+			"the pending count comes from the header counter, not a PEL load", n, groups)
+	}
+	consumers := testing.AllocsPerRun(200, func() {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XINFO"), []byte("CONSUMERS"), []byte("s"), []byte("g")})
+	})
+	if consumers > 1500 {
+		t.Fatalf("XINFO CONSUMERS on a %d-entry pending list allocated %.0f objects per run; "+
+			"the per-consumer pending comes from the header counter, not a PEL load", n, consumers)
+	}
+}
+
 // TestStreamCollGroupsMetadata drives the slice-3a consumer-group metadata
 // commands over a coll-form stream: XGROUP CREATE/SETID/CREATECONSUMER/DELCONSUMER/
 // DESTROY, XACK, XPENDING, and XINFO GROUPS/CONSUMERS. These touch only the group

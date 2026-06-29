@@ -164,12 +164,14 @@ func encodeGroupsNoPEL(body []byte, groups []*group) []byte {
 		body = encoding.AppendUvarint(body, g.lastID.ms)
 		body = encoding.AppendUvarint(body, g.lastID.seq)
 		body = encoding.AppendUvarint(body, g.entriesRead)
+		body = encoding.AppendUvarint(body, g.pending)
 		body = encoding.AppendUvarint(body, uint64(len(g.consumers)))
 		for _, c := range g.consumers {
 			body = encoding.AppendUvarint(body, uint64(len(c.name)))
 			body = append(body, c.name...)
 			body = encoding.AppendUvarint(body, uint64(c.seenTime))
 			body = encoding.AppendUvarint(body, uint64(c.activeTime))
+			body = encoding.AppendUvarint(body, c.pending)
 		}
 	}
 	return body
@@ -210,6 +212,9 @@ func decodeGroupsNoPEL(body []byte, off int) ([]*group, int, error) {
 		if g.entriesRead, err = read(); err != nil {
 			return nil, off, err
 		}
+		if g.pending, err = read(); err != nil {
+			return nil, off, err
+		}
 		consumerCount, err := read()
 		if err != nil {
 			return nil, off, err
@@ -229,10 +234,15 @@ func decodeGroupsNoPEL(body []byte, off int) ([]*group, int, error) {
 			if err != nil {
 				return nil, off, err
 			}
+			pending, err := read()
+			if err != nil {
+				return nil, off, err
+			}
 			g.consumers = append(g.consumers, &consumer{
 				name:       string(cn),
 				seenTime:   int64(seen),
 				activeTime: int64(active),
+				pending:    pending,
 			})
 		}
 		groups = append(groups, g)
@@ -395,6 +405,44 @@ func streamPELDelete(w *keyspace.CollWriter, group string, id streamID) (bool, e
 	return w.Delete(streamPELRow(group, id))
 }
 
+// streamCollPELBounds returns the smallest and largest entry IDs held in one
+// group's PEL rows by reading just the two end rows of the group's 0x02 prefix:
+// a forward seek to the prefix for the min and a backward seek past the prefix
+// for the max. It is the bounded source of the XPENDING summary min/max IDs, so
+// the summary never loads the whole pending list. found is false when the group
+// has no PEL rows.
+func streamCollPELBounds(db *keyspace.DB, key []byte, group string) (minID, maxID streamID, found bool, err error) {
+	prefix := streamPELPrefix(group)
+	ok, e := db.CollRead(key, func(r *keyspace.CollReader) error {
+		c := r.Cursor()
+		if e := c.Seek(prefix); e != nil {
+			return e
+		}
+		if !c.Valid() || !bytes.HasPrefix(c.Key(), prefix) {
+			return nil
+		}
+		minID = streamPELRowID(c.Key(), len(prefix))
+		c2 := r.Cursor()
+		if e := c2.SeekForPrev(streamPELRow(group, maxStreamID)); e != nil {
+			return e
+		}
+		if c2.Valid() && bytes.HasPrefix(c2.Key(), prefix) {
+			maxID = streamPELRowID(c2.Key(), len(prefix))
+		} else {
+			maxID = minID
+		}
+		found = true
+		return nil
+	})
+	if e != nil {
+		return minID, maxID, false, e
+	}
+	if !ok {
+		return minID, maxID, false, nil
+	}
+	return minID, maxID, found, nil
+}
+
 // streamCollPersistDelivery writes back a > delivery: the header row (the advanced
 // group last id, entries-read counter, and consumer times the caller already
 // updated in s) plus one PEL row per just-delivered entry. It touches only the
@@ -444,9 +492,6 @@ func streamCollDelConsumer(db *keyspace.DB, key []byte, group, consumer string) 
 				break
 			}
 		}
-		if _, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(s)); e != nil {
-			return e
-		}
 		prefix := streamPELPrefix(group)
 		var keys [][]byte
 		cur := w.Cursor()
@@ -474,6 +519,16 @@ func streamCollDelConsumer(db *keyspace.DB, key []byte, group, consumer string) 
 				return e
 			}
 			removed++
+		}
+		// Drop the removed rows from the group's pending counter before the header is
+		// written, so the bounded readers see the right count.
+		if uint64(removed) <= g.pending {
+			g.pending -= uint64(removed)
+		} else {
+			g.pending = 0
+		}
+		if _, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(s)); e != nil {
+			return e
 		}
 		return nil
 	})
@@ -551,6 +606,9 @@ func streamCollMaterialize(db *keyspace.DB, key []byte) (*stream, error) {
 // and reuses the existing one when the key was already coll, so either way the
 // result is the exact entry set, and the key's TTL is preserved.
 func streamStoreColl(db *keyspace.DB, key []byte, s *stream) error {
+	// The promotion carries the full PEL in s; derive the header counters from it so
+	// the bounded header-only readers see correct pending counts.
+	recountPending(s)
 	return db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
 		if err := streamClearRows(w); err != nil {
 			return err
@@ -687,6 +745,10 @@ func storeStreamGroupsFull(db *keyspace.DB, key []byte, s *stream, ttlMs int64) 
 	if !found || !hdr.IsColl() {
 		return storeStream(db, key, s, ttlMs)
 	}
+	// This path holds the full PEL in s, so derive the header counters from it; this
+	// both writes correct counts and heals any drift left by a bounded incremental
+	// path before the next full-PEL rewrite.
+	recountPending(s)
 	return db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
 		if _, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(s)); e != nil {
 			return e

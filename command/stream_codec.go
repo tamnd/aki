@@ -50,19 +50,26 @@ type pelEntry struct {
 	deliveryCount uint64
 }
 
-// consumer is one named reader inside a group.
+// consumer is one named reader inside a group. pending mirrors the number of PEL
+// records this consumer owns; on the coll form, where the PEL lives in sibling
+// rows and is not loaded for header-only reads, it is the source of truth for the
+// consumer's pending count.
 type consumer struct {
 	name       string
 	seenTime   int64
 	activeTime int64
+	pending    uint64
 }
 
 // group is a consumer group on a stream. The global PEL is kept sorted by entry
-// ID; the per-consumer PEL is the subset whose consumer field matches.
+// ID; the per-consumer PEL is the subset whose consumer field matches. pending
+// mirrors the total PEL size; on the coll form it is the source of truth for the
+// group's pending count, since the header carries no PEL.
 type group struct {
 	name        string
 	lastID      streamID
 	entriesRead uint64
+	pending     uint64
 	pel         []pelEntry
 	consumers   []*consumer
 }
@@ -236,9 +243,39 @@ func decodeGroups(body []byte, off int) ([]*group, int, error) {
 			}
 			g.pel = append(g.pel, pe)
 		}
+		// The blob codec carries the PEL inline, so derive the pending counters from
+		// it. The coll header keeps the counters explicit (decodeGroupsNoPEL reads
+		// them) because it never loads the PEL for a header-only read.
+		setPendingFromPEL(g)
 		groups = append(groups, g)
 	}
 	return groups, off, nil
+}
+
+// setPendingFromPEL recomputes a group's and its consumers' pending counters from
+// the loaded PEL. A writer with the full PEL in hand calls it so the counters it
+// encodes match the rows, and a blob decode calls it so every loaded group carries
+// correct counters regardless of form.
+func setPendingFromPEL(g *group) {
+	g.pending = uint64(len(g.pel))
+	for _, c := range g.consumers {
+		c.pending = 0
+	}
+	for _, pe := range g.pel {
+		if c := g.findConsumer(pe.consumer); c != nil {
+			c.pending++
+		}
+	}
+}
+
+// recountPending recomputes every group's pending counters from its PEL. A coll
+// writer that holds the full PEL (a promotion or a full-PEL rewrite) calls it
+// before encoding the header so the counters it writes match the rows exactly,
+// which also heals any drift a bounded incremental path might have left.
+func recountPending(s *stream) {
+	for _, g := range s.groups {
+		setPendingFromPEL(g)
+	}
 }
 
 // streamEncode packs a stream back into its stored body form.
