@@ -697,64 +697,6 @@ func (ctx *Ctx) runRangeRemove(spec rangeSpec, event string) {
 	ctx.enc().WriteInteger(removed)
 }
 
-// handleZRangeStore implements ZRANGESTORE dst src min max [...]. It computes the
-// range over the source and stores it at the destination, preserving scores.
-func handleZRangeStore(ctx *Ctx) {
-	spec, errStr := parseZRangeArgs(ctx.Argv[5:])
-	if errStr != "" {
-		ctx.enc().WriteError(errStr)
-		return
-	}
-	dst, src, minArg, maxArg := ctx.Argv[1], ctx.Argv[2], ctx.Argv[3], ctx.Argv[4]
-	var (
-		wrongTyp   bool
-		dstDeleted bool
-		n          int64
-		rangeErr   string
-	)
-	done := ctx.update(func(db *keyspace.DB) error {
-		// Only the source key is type-checked. The destination is overwritten
-		// whatever it held, so a string or list at the destination is replaced
-		// rather than rejected, matching Redis.
-		members, hdr, found, err := getZSet(db, src)
-		if err != nil {
-			return err
-		}
-		if found && hdr.Type != keyspace.TypeZSet {
-			wrongTyp = true
-			return nil
-		}
-		var result []zmember
-		result, rangeErr = computeRange(members, minArg, maxArg, spec)
-		if rangeErr != "" {
-			return nil
-		}
-		n = int64(len(result))
-		if len(result) == 0 {
-			existed, err := db.Delete(dst)
-			dstDeleted = existed
-			return err
-		}
-		stored := make([]zmember, len(result))
-		copy(stored, result)
-		zsetSort(stored)
-		return db.Set(dst, zsetEncode(stored), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), stored, keyspace.EncListpack), -1)
-	})
-	if !done {
-		return
-	}
-	if wrongTyp {
-		ctx.enc().WriteError(wrongTypeError)
-		return
-	}
-	if rangeErr != "" {
-		ctx.enc().WriteError(rangeErr)
-		return
-	}
-	if n > 0 {
-		ctx.notify(notifyZset, "zrangestore", dst)
-	} else if dstDeleted {
-		ctx.notify(notifyGeneric, "del", dst)
-	}
-	ctx.enc().WriteInteger(n)
-}
+// handleZRangeStore (ZRANGESTORE dst src min max [...]) lives in
+// zset_range_store_stream.go, where it streams the matched window of a coll-form
+// source into the destination instead of cloning the whole source into RAM.
