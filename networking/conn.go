@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,15 @@ type HandlerFunc func(c *Conn, argv [][]byte)
 // Handle calls f(c, argv).
 func (f HandlerFunc) Handle(c *Conn, argv [][]byte) { f(c, argv) }
 
+// connCloser is the seam through which CloseASAP routes the shutdown of a
+// connection that an event loop owns (the reactor net mode). The loop, not an
+// arbitrary goroutine, must drive the socket close so it can deregister the fd
+// from epoll before the fd number is freed. The goroutine net mode leaves this
+// nil and closes the socket inline.
+type connCloser interface {
+	requestClose(c *Conn)
+}
+
 // PanicHandler is an optional capability a Handler can implement to turn a panic
 // in a command goroutine into a crash report. The serve loop recovers a panic,
 // calls OnPanic with the cause and the goroutine stack, and the handler is
@@ -45,6 +55,9 @@ type PanicHandler interface {
 
 // readChunk is the size of a single socket read appended to the query buffer.
 const readChunk = 16 * 1024
+
+// crlfBytes is the RESP line terminator, shared by the zero-alloc reply writers.
+var crlfBytes = []byte("\r\n")
 
 // Conn is one client connection. Everything on it is touched by a single
 // goroutine (the read loop), so the per-connection state needs no locking; only
@@ -111,6 +124,21 @@ type Conn struct {
 	// single close.
 	closedCh  chan struct{}
 	closeOnce sync.Once
+
+	// Reactor (event-loop) net-mode fields. They are untouched on the default
+	// goroutine-per-connection path; only the epoll reactor sets them.
+	//
+	//   - fd is the socket file descriptor the owning loop registered with epoll.
+	//   - onLoop is true while an event loop owns this connection's I/O; CloseASAP
+	//     reads it from another goroutine to route the close through the loop.
+	//   - loop is that owning loop, used only when onLoop is true.
+	//   - needHandoff is set inside drain when the loop must move a connection off
+	//     the event loop (it is about to run a blocking command); only the loop
+	//     goroutine reads and clears it.
+	fd          int
+	onLoop      atomic.Bool
+	loop        connCloser
+	needHandoff bool
 }
 
 // NewOfflineConn builds a connection that is not backed by a socket. The command
@@ -193,6 +221,23 @@ func (c *Conn) Enc() *resp.Encoder { return c.enc }
 // framed RESP value.
 func (c *Conn) WriteRaw(p []byte) { c.outBuf.Write(p) }
 
+// WriteBulk appends a RESP bulk string reply ($) straight to the output buffer
+// without the encoder's per-reply length-to-string allocation. The length header
+// is formed on the stack with strconv.AppendInt (an int64 length is at most 19
+// digits, which with the '$' and CRLF fits the 24-byte scratch, so no heap), and
+// the payload is written in place with no scratch copy. A bulk string is framed
+// identically in RESP2 and RESP3, so this is correct in both. It is the GET fast
+// path's reply writer; the general path keeps using the encoder.
+func (c *Conn) WriteBulk(data []byte) {
+	var hdr [24]byte
+	hdr[0] = '$'
+	h := strconv.AppendInt(hdr[:1], int64(len(data)), 10)
+	h = append(h, '\r', '\n')
+	c.outBuf.Write(h)
+	c.outBuf.Write(data)
+	c.outBuf.Write(crlfBytes)
+}
+
 // OutBytes returns the bytes accumulated in the output buffer. It is used by an
 // offline connection (NewOfflineConn) to read back a command's reply, for
 // example when a script's redis.call runs a command and needs its RESP reply.
@@ -227,7 +272,16 @@ func (c *Conn) Quit() { c.closeAfterReply = true }
 // CloseASAP forces the connection shut from another goroutine (server shutdown
 // or CLIENT KILL). It unblocks an in-progress socket read so the read loop
 // observes the close and tears down.
+//
+// When an event loop owns the connection (reactor net mode), the actual socket
+// close must run on that loop so it can deregister the fd from epoll before the
+// fd number is freed. CloseASAP then only hands the connection to the loop and
+// returns; the loop performs the close. On the goroutine path it closes inline.
 func (c *Conn) CloseASAP() {
+	if c.onLoop.Load() {
+		c.loop.requestClose(c)
+		return
+	}
 	if c.closed.CompareAndSwap(false, true) {
 		c.closeOnce.Do(func() { close(c.closedCh) })
 		_ = c.raw.Close()
@@ -294,7 +348,15 @@ func (c *Conn) overQueryBufLimit() bool {
 // drain parses and dispatches every complete command currently in the query
 // buffer. It returns true when the loop should terminate (a protocol error was
 // reported, or QUIT asked to close).
+//
+// The clock is read once per burst, not per command. A pipelined burst can carry
+// dozens of commands, so a per-command time.Now would add that many vDSO reads to
+// the hot loop; reading it once when the first command of the burst is handled and
+// reusing it leaves lastInteraction accurate to the burst, which is far finer than
+// the second-granularity idle field CLIENT LIST reports off it.
 func (c *Conn) drain() bool {
+	var now time.Time
+	var haveNow bool
 	for {
 		argv, n, err := resp.ParseRequest(c.qbuf, c.pos, c.server.MaxBulkLen(), c.argvBuf[:])
 		if errors.Is(err, resp.ErrNeedMore) {
@@ -310,12 +372,26 @@ func (c *Conn) drain() bool {
 			}
 			return true
 		}
-		c.pos = n
 		if argv == nil {
 			// Blank line (a telnet heartbeat); skip and keep parsing.
+			c.pos = n
 			continue
 		}
-		c.lastInteraction = c.server.now()
+		// Reactor net mode: a loop goroutine must never park on one connection, so
+		// a command that might block (BLPOP and the rest) is not run here. Leave the
+		// parse offset at the start of this command, flag the handoff, and return so
+		// the loop moves the connection to a dedicated goroutine that re-parses and
+		// runs it. The goroutine path leaves onLoop false, so this never fires there.
+		if c.onLoop.Load() && c.server.blockProber != nil && c.server.blockProber.MayBlock(argv) {
+			c.needHandoff = true
+			return true
+		}
+		if !haveNow {
+			now = c.server.now()
+			haveNow = true
+		}
+		c.pos = n
+		c.lastInteraction = now
 		c.server.handler.Handle(c, argv)
 		c.totCmds++
 		if c.closeAfterReply {

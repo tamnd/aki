@@ -74,6 +74,34 @@ func TestStartAdminOff(t *testing.T) {
 	d.StopAdmin() // must not panic
 }
 
+// TestStartAdminPortInUse confirms StartAdmin returns the bind error when its
+// port is already held rather than panicking. The caller in cmd/aki turns this
+// error into a warning and keeps serving data, so several aki instances can
+// share a host even though only the first one gets the admin endpoint.
+func TestStartAdminPortInUse(t *testing.T) {
+	// Hold a port, then point a fresh dispatcher's admin endpoint at it.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := New(Config{})
+	d.conf.set("admin-port", port)
+	d.conf.set("admin-bind", "127.0.0.1")
+	if err := d.StartAdmin(); err == nil {
+		d.StopAdmin()
+		t.Fatal("StartAdmin should fail when the port is already in use")
+	}
+	if d.AdminAddr() != "" {
+		t.Fatalf("admin endpoint should not be up after a bind failure: %s", d.AdminAddr())
+	}
+}
+
 // TestStartAdminOn binds an ephemeral port through the config path and confirms
 // the endpoint comes up and shuts down cleanly.
 func TestStartAdminOn(t *testing.T) {

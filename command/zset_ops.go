@@ -339,16 +339,9 @@ func zSetOpStore(ctx *Ctx, op zsetOp) {
 		n          int64
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
-		// The destination is overwritten, but a non-zset destination is still a
-		// WRONGTYPE error, so check its type before computing.
-		_, dstHdr, dstFound, err := db.Get(dst)
-		if err != nil {
-			return err
-		}
-		if dstFound && dstHdr.Type != keyspace.TypeZSet {
-			wrongTyp = true
-			return nil
-		}
+		// Only the source keys are type-checked. The destination is overwritten
+		// whatever it held, so a string or list at the destination is replaced
+		// rather than rejected, matching Redis.
 		sets, wt, err := loadZSets(db, keys)
 		if err != nil {
 			return err
@@ -360,8 +353,8 @@ func zSetOpStore(ctx *Ctx, op zsetOp) {
 		result := computeZSetOp(op, sets, weights, agg)
 		n = int64(len(result))
 		if len(result) == 0 {
-			dstDeleted = dstFound
-			_, err := db.Delete(dst)
+			existed, err := db.Delete(dst)
+			dstDeleted = existed
 			return err
 		}
 		return db.Set(dst, zsetEncode(result), keyspace.TypeZSet, zsetEncoding(ctx.encLimits(), result, keyspace.EncListpack), -1)
