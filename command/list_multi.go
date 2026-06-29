@@ -61,8 +61,9 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 		srcEmptied bool
 		moved      []byte
 	)
+	lim := ctx.encLimits()
 	done := ctx.update(func(db *keyspace.DB) error {
-		srcElems, srcHdr, srcFound, err := getList(db, src)
+		srcHdr, srcFound, err := listHeader(db, src)
 		if err != nil {
 			return err
 		}
@@ -75,13 +76,10 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 			return nil
 		}
 		sameKey := bytes.Equal(src, dst)
-		var (
-			dstElems [][]byte
-			dstHdr   keyspace.ValueHeader
-			dstFound bool
-		)
+		// Validate the destination type up front so a wrong-type dst is reported
+		// before src is touched, matching the all-or-nothing move semantics.
 		if !sameKey {
-			dstElems, dstHdr, dstFound, err = getList(db, dst)
+			dstHdr, dstFound, err := listHeader(db, dst)
 			if err != nil {
 				return err
 			}
@@ -90,37 +88,36 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 				return nil
 			}
 		}
-		if len(srcElems) == 0 {
+		// Pop one element from the chosen src end. A coll list pops the boundary row
+		// in place; a blob list (below the coll threshold) decodes the small body.
+		// Neither materializes a large list.
+		elem, emptied, err := listPopOne(db, src, srcHdr, fromLeft, lim)
+		if err != nil {
+			return err
+		}
+		if elem == nil {
 			absent = true
 			return nil
 		}
-		var elem []byte
-		elem, srcElems = popEnd(srcElems, fromLeft)
 		moved = elem
-
+		// Push the element onto the dst end through the shared push core, which does
+		// a coll point push, a blob splice, or a promotion as the form requires, and
+		// recreates the key when sameKey just emptied it. srcEmptied stays false for a
+		// same-key rotate since the key still exists after the push.
+		pushKey := dst
 		if sameKey {
-			srcElems = pushEnd(srcElems, elem, toLeft)
-			return db.Set(src, listEncode(srcElems), keyspace.TypeList,
-				listEncoding(ctx.encLimits(), srcElems, srcHdr.Encoding), keepTTL(srcHdr, srcFound))
+			pushKey = src
+		} else {
+			srcEmptied = emptied
 		}
-
-		if len(srcElems) == 0 {
-			srcEmptied = true
-			if _, err := db.Delete(src); err != nil {
-				return err
-			}
-		} else if err := db.Set(src, listEncode(srcElems), keyspace.TypeList,
-			listEncoding(ctx.encLimits(), srcElems, srcHdr.Encoding), keepTTL(srcHdr, srcFound)); err != nil {
+		r, err := applyListPush(db, pushKey, [][]byte{elem}, toLeft, false, lim)
+		if err != nil {
 			return err
 		}
-
-		dstElems = pushEnd(dstElems, elem, toLeft)
-		dstPrev := uint8(keyspace.EncListpack)
-		if dstFound {
-			dstPrev = dstHdr.Encoding
+		if r.res == pushResWrongType {
+			wrongTyp = true
 		}
-		return db.Set(dst, listEncode(dstElems), keyspace.TypeList,
-			listEncoding(ctx.encLimits(), dstElems, dstPrev), keepTTL(dstHdr, dstFound))
+		return nil
 	})
 	if !done {
 		return
@@ -148,6 +145,55 @@ func listMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool) {
 	}
 	ctx.signalReady(dst)
 	ctx.enc().WriteBulkString(moved)
+}
+
+// listPopOne removes one element from the head (fromLeft) or tail of the list at
+// key and returns it, reporting whether the pop emptied the list. A coll list
+// deletes the boundary row in place through listTreePop, so it touches one row
+// and never materializes a large list; a blob list (below the coll threshold)
+// decodes its small body, pops the end, and rewrites or deletes the key. elem is
+// nil when the list is empty or absent. The caller has confirmed the key is a
+// list and passes its header so this does not probe it again.
+func listPopOne(db *keyspace.DB, key []byte, hdr keyspace.ValueHeader, fromLeft bool, lim encLimits) (elem []byte, emptied bool, err error) {
+	if hdr.IsColl() {
+		var before int64
+		err = db.CollUpdate(key, keyspace.TypeList, hdr.Encoding, func(w *keyspace.CollWriter) error {
+			before = w.Tail() - w.Head()
+			popped, e := listTreePop(w, 1, fromLeft)
+			if e != nil || len(popped) == 0 {
+				return e
+			}
+			elem = popped[0]
+			return nil
+		})
+		if err != nil || elem == nil {
+			return nil, false, err
+		}
+		// listTreePop already copies the row out, so elem does not alias a page.
+		// A one-element list emptied, in which case CollUpdate tore the key down.
+		return elem, before == 1, nil
+	}
+	elems, ehdr, found, e := getList(db, key)
+	if e != nil {
+		return nil, false, e
+	}
+	if !found || len(elems) == 0 {
+		return nil, false, nil
+	}
+	var rest [][]byte
+	elem, rest = popEnd(elems, fromLeft)
+	elem = append([]byte(nil), elem...)
+	if len(rest) == 0 {
+		if _, e := db.Delete(key); e != nil {
+			return nil, false, e
+		}
+		return elem, true, nil
+	}
+	if e := db.Set(key, listEncode(rest), keyspace.TypeList,
+		listEncoding(lim, rest, ehdr.Encoding), keepTTL(ehdr, found)); e != nil {
+		return nil, false, e
+	}
+	return elem, false, nil
 }
 
 // popEnd removes one element from the head (fromLeft) or tail of elems and
