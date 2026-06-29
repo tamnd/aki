@@ -650,12 +650,41 @@ func (n *node) splitAr(ar *nodeArena) (left, right *node, sep []byte) {
 	if n.leaf {
 		left = &node{leaf: true, keys: n.keys[:mid], vals: n.vals[:mid]}
 		right = &node{leaf: true, keys: n.keys[mid:], vals: n.vals[mid:], rightSibling: n.rightSibling}
-		return left, right, right.keys[0]
+		// Promote the shortest separator that still routes, not the whole first key
+		// of the right page. Interior nodes only need a separator strictly greater
+		// than the left page's last key and no greater than the right page's first
+		// key; the full key bytes live in the leaf. For large keys (a set member is
+		// the key) this shrinks the upper levels by the key length, which is what
+		// keeps a larger-than-memory set's index resident instead of overflowing it.
+		return left, right, shortestSep(n.keys[mid-1], n.keys[mid])
 	}
 	sep = n.keys[mid]
 	left = &node{keys: n.keys[:mid], children: n.children[:mid+1]}
 	right = &node{keys: n.keys[mid+1:], children: n.children[mid+1:]}
 	return left, right, sep
+}
+
+// shortestSep returns the shortest byte string s with lo < s <= hi, as a prefix of
+// hi. It is the suffix-truncated separator promoted on a leaf split: lo is the left
+// page's last key, hi is the right page's first key, and the leaves are sorted and
+// distinct so lo < hi holds. Routing only needs s to sit strictly above every left
+// key and at or below every right key, so a prefix of hi long enough to exceed lo is
+// enough, and it is far shorter than hi when the keys are large. The returned slice
+// aliases hi (which lives in the split arena), so it carries no allocation and stays
+// valid exactly as long as the full key did.
+func shortestSep(lo, hi []byte) []byte {
+	n := min(len(hi), len(lo))
+	for i := range n {
+		if hi[i] != lo[i] {
+			// hi[i] > lo[i] because hi > lo and they agree on bytes [0, i), so the
+			// prefix hi[:i+1] is the shortest prefix of hi strictly greater than lo.
+			return hi[:i+1]
+		}
+	}
+	// lo is a prefix of hi (hi extends lo), so the shortest prefix of hi greater
+	// than lo is lo's length plus one more byte. hi is strictly longer than lo here
+	// because hi > lo and they agree on all of lo, so hi[:n+1] is in range.
+	return hi[:n+1]
 }
 
 // size returns the number of page bytes this node would occupy when serialized.

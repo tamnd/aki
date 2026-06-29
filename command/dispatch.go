@@ -22,6 +22,7 @@ func getCtx(c *networking.Conn, argv [][]byte, d *Dispatcher, sess *session) *Ct
 	ctx.sess = sess
 	ctx.forceProp = false
 	ctx.deferIncr = false
+	ctx.deferPush = false
 	return ctx
 }
 
@@ -35,6 +36,7 @@ func putCtx(ctx *Ctx) {
 	ctx.readyKeysAll = ctx.readyKeysAll[:0]
 	ctx.forceProp = false
 	ctx.deferIncr = false
+	ctx.deferPush = false
 	ctxPool.Put(ctx)
 }
 
@@ -77,6 +79,20 @@ type Dispatcher struct {
 	// reads it with an atomic load so a server with notifications off pays almost
 	// nothing; CONFIG SET updates it with an atomic store.
 	notifyFlags uint32
+
+	// hybridFast is true when the engine runs on the hybrid-log store, the gate for
+	// the integrated GET/SET fast path in Handle. It is set once at construction
+	// because the engine never switches substrate at runtime. getCmd and setCmd are
+	// the GET and SET descriptors resolved once so the fast path can record their
+	// commandstats without a table lookup; the four increment descriptors do the
+	// same for the INCR/INCRBY/DECR/DECRBY fast path.
+	hybridFast bool
+	getCmd     *CmdDesc
+	setCmd     *CmdDesc
+	incrCmd    *CmdDesc
+	incrbyCmd  *CmdDesc
+	decrCmd    *CmdDesc
+	decrbyCmd  *CmdDesc
 
 	// activeExpire gates the background cycle: DEBUG SET-ACTIVE-EXPIRE 0 clears it
 	// so only lazy expiry runs, which tests rely on. The tick rate itself comes
@@ -279,6 +295,13 @@ func New(cfg Config) *Dispatcher {
 		d.engine.onCommit = d.recordIOLatency
 		d.applyLFUConfig()
 		d.applyCommitPolicy()
+		d.hybridFast = d.engine.hybridLog()
+		d.getCmd = d.table.get("get")
+		d.setCmd = d.table.get("set")
+		d.incrCmd = d.table.get("incr")
+		d.incrbyCmd = d.table.get("incrby")
+		d.decrCmd = d.table.get("decr")
+		d.decrbyCmd = d.table.get("decrby")
 	}
 	d.activeExpire.Store(true)
 	d.blockingInit()
@@ -494,6 +517,13 @@ type Ctx struct {
 	// where batching is safe (see canBatchIncr); flushIncrPending applies the batch
 	// and writes the replies in pipeline order.
 	deferIncr bool
+
+	// deferPush is the list-push analogue of deferIncr: it asks the push handler to
+	// accumulate a coll-form LPUSH/RPUSH onto the connection's pending batch instead
+	// of paying a synchronous shard-owner round trip per command. Handle sets it only
+	// for a coll-form push in a batchable state (see canBatchPush and pushKeyIsColl);
+	// flushPushPending applies the batch and writes the replies in pipeline order.
+	deferPush bool
 }
 
 // MarkPropagate makes the running command propagate to the AOF and replicas
@@ -554,6 +584,14 @@ type session struct {
 	// value so a deep pipeline grows one backing array rather than allocating a
 	// struct per command, and it is only ever touched on the connection goroutine.
 	incrPend []deferredIncr
+
+	// pushPend accumulates this connection's deferred coll-form list pushes during a
+	// pipeline drain. flushPushPending hands each shard its sub-batch, writes the
+	// replies in arrival order, and resets the slice. Like incrPend it is held by
+	// value and only touched on the connection goroutine. At most one of incrPend and
+	// pushPend is ever non-empty: deferring a push flushes any pending increments and
+	// vice versa, so reply order across the two families stays correct.
+	pushPend []deferredPush
 
 	// inMulti is true between MULTI and EXEC/DISCARD: commands are queued instead
 	// of run. queue holds them in order, and dirtyExec records a queue-time error
@@ -638,6 +676,15 @@ func (ctx *Ctx) enc() *resp.Encoder { return ctx.Conn.Enc() }
 // the command, check arity, check auth, then call the handler.
 func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	sess := d.sessionFor(c)
+	// Integrated GET/SET fast path. When the engine runs on the hybrid-log store and
+	// both the server-wide environment and this connection's session are in the plain
+	// state where none of the dispatch preamble or runCommand bookkeeping would have
+	// observed or altered the command, serve GET and SET straight off the store. This
+	// is the integrated analogue of the v2 standalone server's raw-buffer fast path,
+	// which clears 2x both rivals at saturation while the general dispatch path stalls.
+	if d.hybridFast && d.tryFastGetSet(c, sess, argv) {
+		return
+	}
 	// getCtx early so ctx.ar backs the name scratch for the pre-lookup checks
 	// below (allowedInSubMode, isMultiControl). defer putCtx covers every early
 	// return and resets the arena after the function exits.
@@ -649,15 +696,32 @@ func (d *Dispatcher) Handle(c *networking.Conn, argv [][]byte) {
 	// name within Handle (putCtx via defer, never mid-function).
 	name := unsafe.String(unsafe.SliceData(nameScratch), len(nameScratch))
 
-	// Batched increment hand-off. A clean increment in a batchable state is deferred
-	// onto the connection's pending list and applied as one per-shard sub-batch at
-	// the end of the drain. Anything else flushes the pending batch first so the
-	// deferred replies keep their place in the pipeline's output before this command
-	// writes anything (including an error reply from the gates below).
-	if structuralIncrOK(name, argv) && d.canBatchIncr(c, sess) {
+	// Batched write hand-off. A clean increment or a coll-form list push in a
+	// batchable state is deferred onto the connection's pending list and applied as
+	// one per-shard sub-batch at the end of the drain, collapsing a pipeline's worth
+	// of per-command shard-owner round trips into one per shard. Anything else flushes
+	// the pending batch first so the deferred replies keep their place in the
+	// pipeline's output before this command writes anything (including an error reply
+	// from the gates below). At most one family batches at a time: deferring a push
+	// flushes any pending increments and vice versa, so replies stay in order.
+	switch {
+	case structuralIncrOK(name, argv) && d.canBatchIncr(c, sess):
+		if len(sess.pushPend) > 0 {
+			d.flushPushPending(c, sess)
+		}
 		ctx.deferIncr = true
-	} else if len(sess.incrPend) > 0 {
-		d.flushIncrPending(c, sess)
+	case structuralPushOK(name, argv) && d.canBatchPush(c, sess) && d.pushKeyIsColl(c, argv):
+		if len(sess.incrPend) > 0 {
+			d.flushIncrPending(c, sess)
+		}
+		ctx.deferPush = true
+	default:
+		if len(sess.incrPend) > 0 {
+			d.flushIncrPending(c, sess)
+		}
+		if len(sess.pushPend) > 0 {
+			d.flushPushPending(c, sess)
+		}
 	}
 
 	// A RESP2 client with active subscriptions is in subscriber mode and may run

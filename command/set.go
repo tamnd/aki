@@ -305,9 +305,11 @@ func handleSMembers(ctx *Ctx) {
 }
 
 // handleSIsMember implements SISMEMBER: 1 when the member is present, else 0.
+// A btree-backed set answers with a single point lookup rather than walking
+// every member, so SISMEMBER stays O(log n) on a multi-million-member set.
 func handleSIsMember(ctx *Ctx) {
 	key, member := ctx.Argv[1], ctx.Argv[2]
-	members, wrongTyp, ok := readSet(ctx, key)
+	present, wrongTyp, ok := setMembership(ctx, key, [][]byte{member})
 	if !ok {
 		return
 	}
@@ -315,18 +317,19 @@ func handleSIsMember(ctx *Ctx) {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
-	if setFind(members, member) >= 0 {
+	if present[0] {
 		ctx.enc().WriteInteger(1)
 	} else {
 		ctx.enc().WriteInteger(0)
 	}
 }
 
-// handleSMIsMember implements SMISMEMBER: a 0/1 per queried member.
+// handleSMIsMember implements SMISMEMBER: a 0/1 per queried member. A
+// btree-backed set answers each query with a point lookup in one reader.
 func handleSMIsMember(ctx *Ctx) {
 	key := ctx.Argv[1]
 	want := ctx.Argv[2:]
-	members, wrongTyp, ok := readSet(ctx, key)
+	present, wrongTyp, ok := setMembership(ctx, key, want)
 	if !ok {
 		return
 	}
@@ -336,8 +339,8 @@ func handleSMIsMember(ctx *Ctx) {
 	}
 	enc := ctx.enc()
 	enc.WriteArrayLen(len(want))
-	for _, m := range want {
-		if setFind(members, m) >= 0 {
+	for _, p := range present {
+		if p {
 			enc.WriteInteger(1)
 		} else {
 			enc.WriteInteger(0)

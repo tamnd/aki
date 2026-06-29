@@ -133,6 +133,12 @@ func hotGetSet(ctx *Ctx, key []byte) ([][]byte, bool) {
 	if hdr.Type != keyspace.TypeSet {
 		return nil, false
 	}
+	if hdr.IsColl() {
+		// A btree-backed set keeps its members in the sub-tree; the cached body is
+		// only metadata and would mis-decode as members. Force the caller onto the
+		// coll-aware path so it does point lookups instead of a whole-set scan.
+		return nil, false
+	}
 	members, err := setDecode(body)
 	if err != nil {
 		return nil, false

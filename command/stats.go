@@ -20,7 +20,13 @@ import (
 // dispatch path can update them without taking a lock, and INFO reads them with
 // plain atomic loads.
 type cmdStat struct {
-	calls    atomic.Uint64
+	// calls is striped per CPU because it is the only counter the integrated fast
+	// path still writes per command (statCallFast dropped usec and the histogram),
+	// so under a saturating single-command load it was the one shared cache line
+	// every core fought over. usec, rejected and failed stay plain atomics: they are
+	// written only off the timed slow path, never on the fast path, so they carry no
+	// saturation contention worth striping.
+	calls    stripedUint64
 	usec     atomic.Uint64
 	rejected atomic.Uint64
 	failed   atomic.Uint64
@@ -114,6 +120,26 @@ func (d *Dispatcher) statCall(cmd *CmdDesc, usec uint64, failed bool) {
 	if failed {
 		cs.failed.Add(1)
 	}
+}
+
+// statCallFast records one successful command on the integrated fast path, which
+// does not time its commands. statCall there is always handed usec 0, so its
+// cs.usec.Add(0) and cs.hist.record(0) only ever add nothing and drop a bogus
+// zero-microsecond sample into the latency histogram, yet both are writes to a
+// single shared counter and a single shared histogram bucket that every core
+// hammers on every command. Under a saturating GET/SET load those two shared
+// cachelines are the per-command cost that stops the fast path scaling cleanly
+// across cores, so this records only the call count, the one figure the fast
+// path can report honestly, and leaves usec and the histogram to the timed slow
+// path. total_commands_processed and commandstats calls stay exact; the only
+// change is that fast-path commands no longer log a fabricated 0us latency, which
+// the latency histogram is better off without.
+func (d *Dispatcher) statCallFast(cmd *CmdDesc) {
+	cs := cmd.stat
+	if cs == nil {
+		cs = d.cmdStatFor(statName(cmd))
+	}
+	cs.calls.Add(1)
 }
 
 // statReject records one command rejected before it ran, by ACL, arity, the

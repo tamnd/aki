@@ -3,6 +3,7 @@ package networking
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -41,6 +42,15 @@ type Config struct {
 	// TCPKeepAlive is the SetKeepAlivePeriod applied to accepted TCP sockets; 0
 	// leaves the OS default and does not enable keepalive.
 	TCPKeepAlive time.Duration
+	// NetMode selects how TCP connections are serviced: "goroutine" (the default,
+	// one read-loop goroutine per connection), "reactor" (a small set of epoll event
+	// loops, each servicing a shard of connections), or "uring" (the reactor with a
+	// per-loop io_uring that batches a turn's writes into one io_uring_enter; spec
+	// 2064 note 300). "reactor" and "uring" apply to TCP on Linux only; on any other
+	// platform, and for Unix-socket connections, the goroutine path is used
+	// regardless, and "uring" on a kernel without io_uring falls back to the plain
+	// reactor path. An empty value means "goroutine".
+	NetMode string
 }
 
 // Server accepts connections on its listeners and runs one goroutine per
@@ -74,8 +84,40 @@ type Server struct {
 
 	wg sync.WaitGroup
 
+	// netMode is the configured TCP service strategy ("goroutine" or "reactor").
+	// reactor holds the running epoll reactor when netMode is "reactor" and the
+	// platform supports it; it is nil otherwise, and TCP connections then take the
+	// goroutine path. blockProber, when the handler implements it, lets the reactor
+	// move a possibly-blocking command off an event loop.
+	netMode     string
+	reactor     netReactor
+	blockProber BlockProber
+
 	// nowFn is the clock, overridable in tests.
 	nowFn func() time.Time
+}
+
+// BlockProber is an optional Handler capability the reactor uses. MayBlock
+// reports whether a parsed command might park the connection (BLPOP and the rest
+// of the blocking family). A reactor event loop must not park on one connection,
+// so a command MayBlock approves is handed to a dedicated goroutine instead of
+// running on the loop. The goroutine net mode never calls it.
+type BlockProber interface {
+	MayBlock(argv [][]byte) bool
+}
+
+// netReactor is the epoll event-loop server, built only on platforms that
+// support it (Linux). The Server holds it behind this interface so the rest of
+// the package compiles everywhere; newReactor returns (nil, false) on
+// unsupported platforms and the Server falls back to the goroutine path.
+type netReactor interface {
+	// register hands an accepted TCP connection to an event loop. It returns false
+	// if the connection cannot be adopted (for example its fd cannot be resolved),
+	// and the caller then serves it on the goroutine path.
+	register(c *Conn) bool
+	// shutdown stops every loop, reaping the connections they own, and returns once
+	// the loops have exited.
+	shutdown()
 }
 
 // New builds a Server from cfg and the command handler. It does not open any
@@ -89,7 +131,11 @@ func New(cfg Config, handler Handler) *Server {
 		handler:    handler,
 		maxClients: cfg.MaxClients,
 		conns:      make(map[uint64]*Conn),
+		netMode:    cfg.NetMode,
 		nowFn:      time.Now,
+	}
+	if bp, ok := handler.(BlockProber); ok {
+		s.blockProber = bp
 	}
 	s.maxBulkLen.Store(maxBulk)
 	s.idleTimeout.Store(int64(cfg.IdleTimeout))
@@ -182,6 +228,17 @@ func (s *Server) ListenAndServe(cfg Config) error {
 	s.listeners = lns
 	s.mu.Unlock()
 
+	// In reactor net mode, start the epoll event loops before accepting. On a
+	// platform that does not support it newReactor returns (nil, false) and TCP
+	// connections fall back to the goroutine path, so the server still starts.
+	if s.netMode == "reactor" || s.netMode == "uring" {
+		if r, ok := newReactor(s, s.netMode == "uring"); ok {
+			s.mu.Lock()
+			s.reactor = r
+			s.mu.Unlock()
+		}
+	}
+
 	var serveWG sync.WaitGroup
 	for _, ln := range lns {
 		serveWG.Add(1)
@@ -226,6 +283,7 @@ func (s *Server) acceptLoop(ln net.Listener) {
 			if errors.As(err, &ne) && ne.Timeout() {
 				continue
 			}
+			fmt.Fprintf(os.Stderr, "aki: acceptLoop exiting on accept error: %v\n", err)
 			return
 		}
 		s.onAccept(nc)
@@ -267,13 +325,41 @@ func (s *Server) onAccept(nc net.Conn) {
 		created:         now,
 		lastInteraction: now,
 		closedCh:        make(chan struct{}),
+		fd:              -1,
 	}
 	c.enc = resp.NewEncoder(c.outBuf, 2)
 	s.conns[id] = c
 	s.clientCount++
+	// One wg ticket per connection. Whoever finally tears the connection down owns
+	// it: the goroutine read loop below, or, in reactor mode, the event loop when
+	// it reaps the connection (or the handoff goroutine if a blocking command moved
+	// it off the loop).
 	s.wg.Add(1)
+	reactor := s.reactor
 	s.mu.Unlock()
 
+	// Reactor net mode: a TCP connection is adopted by an event loop. Unix-socket
+	// connections, and any connection a loop declines, take the goroutine path.
+	if reactor != nil {
+		if _, ok := nc.(*net.TCPConn); ok {
+			if reactor.register(c) {
+				return
+			}
+		}
+	}
+
+	go func() {
+		defer s.wg.Done()
+		c.serve()
+	}()
+}
+
+// startGoroutineServe moves a connection the reactor handed off (it is about to
+// run a blocking command, which a loop must not park on) onto its own read-loop
+// goroutine, where parking is safe. The connection keeps the wg ticket it was
+// accepted with; this goroutine's defer now owns it. The caller (the event loop)
+// has already deregistered the fd from epoll and cleared onLoop.
+func (s *Server) startGoroutineServe(c *Conn) {
 	go func() {
 		defer s.wg.Done()
 		c.serve()
@@ -350,14 +436,25 @@ func (s *Server) Close() error {
 	s.closed = true
 	lns := s.listeners
 	s.listeners = nil
-	conns := make([]*Conn, 0, len(s.conns))
-	for _, c := range s.conns {
-		conns = append(conns, c)
-	}
+	reactor := s.reactor
 	unixSocket := s.unixSocket
 	s.mu.Unlock()
 
 	closeAll(lns)
+	// Reactor event loops own their connections' sockets, so the loops, not this
+	// goroutine, must close those fds (they deregister from epoll first). Shutting
+	// the reactor down reaps every connection a loop still owns and exits the
+	// loops, leaving only goroutine-path and handed-off connections to force-close
+	// below.
+	if reactor != nil {
+		reactor.shutdown()
+	}
+	s.mu.Lock()
+	conns := make([]*Conn, 0, len(s.conns))
+	for _, c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
 	for _, c := range conns {
 		c.CloseASAP()
 	}

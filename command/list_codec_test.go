@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/tamnd/aki/keyspace"
+	"github.com/tamnd/aki/resp"
 )
 
 // listBlobPush splices the pushed run into the raw body, so its result must match
@@ -111,6 +112,51 @@ func TestListBlobReportedEncMatchesListEncoding(t *testing.T) {
 	}
 }
 
+// BenchmarkLRange100 contrasts the two ways to answer LRANGE 0 99 on a hot
+// blob-form list: the old path decodes the whole body into a [][]byte, slices the
+// window, and writes it; the streaming path walks the encoded body in place and
+// writes only the window. The redis-benchmark lrange_100 shape is a list grown
+// far past 100 elements read with a 100-element window, so the decode allocates
+// for the whole list while the stream allocates nothing.
+func BenchmarkLRange100(b *testing.B) {
+	const n = 1000
+	elems := make([][]byte, n)
+	for i := range elems {
+		elems[i] = []byte("element-value-0123456789")
+	}
+	body := listEncode(elems)
+
+	b.Run("decode-slice-write", func(b *testing.B) {
+		var buf bytes.Buffer
+		b.ReportAllocs()
+		for range b.N {
+			buf.Reset()
+			enc := resp.NewEncoder(&buf, 2)
+			decoded, err := listDecode(body)
+			if err != nil {
+				b.Fatal(err)
+			}
+			out := listSlice(decoded, 0, 99)
+			enc.WriteArrayLen(len(out))
+			for _, e := range out {
+				enc.WriteBulkString(e)
+			}
+		}
+	})
+
+	b.Run("stream-window", func(b *testing.B) {
+		var buf bytes.Buffer
+		b.ReportAllocs()
+		for range b.N {
+			buf.Reset()
+			enc := resp.NewEncoder(&buf, 2)
+			if !listBlobRangeReply(enc, body, 0, 99) {
+				b.Fatal("reported corrupt")
+			}
+		}
+	})
+}
+
 func equalElems(a, b [][]byte) bool {
 	if len(a) != len(b) {
 		return false
@@ -121,4 +167,55 @@ func equalElems(a, b [][]byte) bool {
 		}
 	}
 	return true
+}
+
+// listBlobRangeReply streams the requested window straight off the encoded body.
+// Its bytes must match the reference of decoding, slicing with listSlice, and
+// writing an array of bulk strings, across every index form. A corrupt body must
+// return false with nothing written so the caller can fall back.
+func TestListBlobRangeReplyMatchesReference(t *testing.T) {
+	elems := [][]byte{[]byte("a"), []byte("bb"), []byte("ccc"), []byte(""), []byte("eeeee")}
+	body := listEncode(elems)
+
+	ranges := []struct{ start, stop int64 }{
+		{0, -1}, {0, 0}, {1, 3}, {2, 100}, {-2, -1}, {-100, 1},
+		{3, 2}, {5, 10}, {-1, -1}, {0, 4}, {2, 2},
+	}
+	for _, r := range ranges {
+		var ref bytes.Buffer
+		re := resp.NewEncoder(&ref, 2)
+		out := listSlice(elems, r.start, r.stop)
+		re.WriteArrayLen(len(out))
+		for _, e := range out {
+			re.WriteBulkString(e)
+		}
+
+		var got bytes.Buffer
+		if !listBlobRangeReply(resp.NewEncoder(&got, 2), body, r.start, r.stop) {
+			t.Fatalf("range [%d,%d]: reported corrupt on a good body", r.start, r.stop)
+		}
+		if !bytes.Equal(got.Bytes(), ref.Bytes()) {
+			t.Fatalf("range [%d,%d]: got %q want %q", r.start, r.stop, got.Bytes(), ref.Bytes())
+		}
+	}
+
+	// An empty body is a valid empty list.
+	var empty bytes.Buffer
+	if !listBlobRangeReply(resp.NewEncoder(&empty, 2), nil, 0, -1) {
+		t.Fatal("empty body reported corrupt")
+	}
+	if empty.String() != "*0\r\n" {
+		t.Fatalf("empty body: got %q want %q", empty.String(), "*0\r\n")
+	}
+
+	// A body whose element length runs past the end is corrupt: nothing written,
+	// false returned, so the caller takes the cold path.
+	corrupt := []byte{0x01, 0x7f} // count 1, element length 127, no bytes follow
+	var cb bytes.Buffer
+	if listBlobRangeReply(resp.NewEncoder(&cb, 2), corrupt, 0, -1) {
+		t.Fatal("corrupt body reported ok")
+	}
+	if cb.Len() != 0 {
+		t.Fatalf("corrupt body wrote %q, want nothing", cb.Bytes())
+	}
 }
