@@ -893,6 +893,31 @@ func decodeNode(b []byte) (*node, error) {
 	return n, nil
 }
 
+// decodeInteriorChildren parses only the child pointers of an interior page,
+// skipping the separator keys. The backward cursor walk (descendLast,
+// descendRightmost, climbPrev) navigates purely by child index and never reads a
+// separator, so cloning the keys, as decodeNode does, is pure waste; on a
+// whole-set reverse scan that clone is the dominant allocation. This returns a
+// node with children set and keys nil, one slice allocation per interior and
+// nothing per key, so a reverse scan stays allocation-flat in the key count.
+func decodeInteriorChildren(b []byte) (*node, error) {
+	h, err := format.ParsePageHeader(b)
+	if err != nil {
+		return nil, err
+	}
+	if h.Type != format.PageTypeBTreeInt {
+		return nil, fmt.Errorf("aki/btree: not an interior node (page type 0x%02x)", h.Type)
+	}
+	count := int(h.CellCount)
+	n := &node{children: make([]uint32, count+1)}
+	for i := range count {
+		off := int(encoding.U16(b[slotsStart+2*i:]))
+		n.children[i] = encoding.U32(b[off:])
+	}
+	n.children[count] = encoding.U32(b[16:])
+	return n, nil
+}
+
 // encodeNodeAr is like encodeNode but uses ar.tmp as a reusable cell buffer,
 // eliminating one heap allocation per cell (50 allocs per full page saved).
 func encodeNodeAr(b []byte, n *node, ar *nodeArena) error {

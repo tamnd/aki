@@ -7,6 +7,7 @@ import (
 
 	"github.com/tamnd/aki/encoding"
 	"github.com/tamnd/aki/keyspace"
+	"github.com/tamnd/aki/resp"
 )
 
 // A large sorted set is stored element-per-row in the key's btree-backed
@@ -730,6 +731,145 @@ func zsetCollRank(db *keyspace.DB, key, member []byte, rev bool) (rank int64, sc
 // The btree carries no per-node subtree counts, so a window deep in the middle still
 // costs a skip proportional to its distance from the nearer end, but that skip moves
 // the cursor without allocating, so it is slow at worst, never an OOM.
+// streamZRangeByRank writes the [start, stop] rank slice of a coll-form sorted set
+// straight from the score-index cursor into the connection's encoder, the ZRANGE
+// and ZREVRANGE by-rank shape. It is the streaming twin of zsetCollRangeByRank:
+// where that clones the window into a []zmember the caller then writes (an O(n)
+// transient heap when the window is the whole set, the canonical ZRANGE key 0 -1
+// dump), this writes each member as the cursor reaches it and spills the buffer
+// mid-reply, so a full dump of a sorted set far larger than RAM holds only the
+// cursor pages plus the flush buffer.
+//
+// A sorted set carries no per-element TTL, so the live count equals the resolved
+// window length and the reply header is known before the walk: no two-pass count.
+// The output runs in score order (ascending for ZRANGE, descending for ZREVRANGE),
+// so the cursor walks in the output direction after seeking from whichever end of
+// the set is nearer the window start, the same nearer-end seek the buffered path
+// uses, but without the reverse-in-memory step.
+func streamZRangeByRank(ctx *Ctx, db *keyspace.DB, key []byte, start, stop int64, rev, withScores bool) error {
+	enc := ctx.enc()
+	_, err := db.CollRead(key, func(r *keyspace.CollReader) error {
+		card := int64(r.Count())
+		s, e := start, stop
+		if s < 0 {
+			s += card
+		}
+		if e < 0 {
+			e += card
+		}
+		if s < 0 {
+			s = 0
+		}
+		if e >= card {
+			e = card - 1
+		}
+		if s > e || s >= card {
+			writeZRangeHeader(enc, 0, withScores)
+			return nil
+		}
+		// The requested ranks map to an ascending score-index window [aLo, aHi].
+		// For ZREVRANGE rank j is ascending index card-1-j, so the window flips.
+		aLo, aHi := s, e
+		if rev {
+			aLo, aHi = card-1-e, card-1-s
+		}
+		count := aHi - aLo + 1
+		writeZRangeHeader(enc, int(count), withScores)
+
+		// ZRANGE emits ascending from aLo (walk forward); ZREVRANGE emits descending
+		// from aHi (walk backward). Position the cursor at the start index from the
+		// nearer end, then walk in the output direction.
+		startIdx := aLo
+		if rev {
+			startIdx = aHi
+		}
+		c := r.Cursor()
+		c.UseArena()
+		if e := seekScoreIndex(c, startIdx, card); e != nil {
+			return e
+		}
+		// In RESP3 a WITHSCORES element is its own [member, score] pair array; in
+		// RESP2 member and score are two flat entries. The header already accounts
+		// for the difference, so here only the per-pair RESP3 wrapper is emitted.
+		pairWrap := withScores && enc.Proto() == 3
+		emit := func() {
+			k := c.Key()
+			if len(k) == 0 || k[0] != zRowScore {
+				return
+			}
+			if pairWrap {
+				enc.WriteArrayLen(2)
+			}
+			enc.WriteBulkStreaming(k[9:])
+			if withScores {
+				enc.WriteDoubleStreaming(zScoreUnbits(encoding.U64BE(k[1:9])))
+			}
+		}
+		for i := int64(0); i < count && c.Valid(); i++ {
+			emit()
+			if i&streamFlushEvery == streamFlushEvery {
+				if err := ctx.Conn.StreamFlush(); err != nil {
+					return err
+				}
+			}
+			if rev {
+				if err := c.Prev(); err != nil {
+					return err
+				}
+			} else {
+				if err := c.Next(); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	return err
+}
+
+// writeZRangeHeader writes the array header for a streamed range reply, honoring
+// WITHSCORES and the protocol version, so the streamed bytes match writeRange and
+// writeScoredPairs exactly. RESP3 with scores is an array of [member, score]
+// pairs (each pair's own header is written per element by the caller); RESP2 with
+// scores is a flat array of n*2 bulk strings.
+func writeZRangeHeader(enc *resp.Encoder, n int, withScores bool) {
+	if !withScores {
+		enc.WriteArrayLen(n)
+		return
+	}
+	if enc.Proto() == 3 {
+		enc.WriteArrayLen(n)
+		return
+	}
+	enc.WriteArrayLen(n * 2)
+}
+
+// seekScoreIndex positions the cursor at ascending score-index position idx,
+// approaching from whichever end of the set is nearer so a window deep in the set
+// still seeks in min(idx, card-1-idx) cursor steps without allocating.
+func seekScoreIndex(c *keyspace.CollCursor, idx, card int64) error {
+	if idx <= card-1-idx {
+		if e := c.Seek([]byte{zRowScore}); e != nil {
+			return e
+		}
+		for i := int64(0); i < idx && c.Valid(); i++ {
+			if e := c.Next(); e != nil {
+				return e
+			}
+		}
+		return nil
+	}
+	if e := c.Last(); e != nil {
+		return e
+	}
+	for i := card - 1 - idx; i > 0 && c.Valid(); i-- {
+		if e := c.Prev(); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
 func zsetCollRangeByRank(db *keyspace.DB, key []byte, start, stop int64, rev bool) (out []zmember, err error) {
 	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
 		card := int64(r.Count())
