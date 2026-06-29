@@ -176,6 +176,97 @@ func TestSortCollWindowByGet(t *testing.T) {
 	}
 }
 
+// TestSortCollByGetHashFieldParity checks BY and GET against a hash field
+// (pattern->field) still resolve correctly after the deref moved from a full
+// hash materialize to a point sub-tree lookup, including on coll-form hashes.
+func TestSortCollByGetHashFieldParity(t *testing.T) {
+	r, c := startData(t)
+	// Three ids weighted by a hash field, so BY hash->w orders by the weight and
+	// GET hash->name projects a second field. Each hash is pushed past the
+	// listpack threshold so the deref reads coll form, the materialize OOM case.
+	_ = sendLine(t, r, c, "CONFIG SET hash-max-listpack-entries 8")
+	type row struct{ id, weight, name string }
+	rows := []row{{"1", "30", "alice"}, {"2", "10", "bob"}, {"3", "20", "carol"}}
+	for _, rw := range rows {
+		args := []string{"HSET", "h_" + rw.id, "w", rw.weight, "name", rw.name}
+		// Pad the hash past the 8-entry coll boundary with throwaway fields.
+		for i := range 12 {
+			args = append(args, fmt.Sprintf("pad%d", i), "x")
+		}
+		_ = sendWords(t, r, c, args)
+		if enc := bulk(t, r, c, "OBJECT ENCODING h_"+rw.id); enc != "hashtable" {
+			t.Fatalf("hash h_%s not in coll form: OBJECT ENCODING = %q", rw.id, enc)
+		}
+	}
+	_ = sendWords(t, r, c, []string{"RPUSH", "ids", "1", "2", "3"})
+
+	// Ascending by weight: bob(10) carol(20) alice(30); GET projects the name.
+	got := readArray(t, r, c, "SORT ids BY h_*->w GET h_*->name")
+	want := []string{"bob", "carol", "alice"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("SORT BY hash-field GET hash-field = %v want %v", got, want)
+	}
+	// A windowed slice of the same order, to cover the bounded path's deref.
+	got = readArray(t, r, c, "SORT ids BY h_*->w GET h_*->name LIMIT 0 2")
+	if !slices.Equal(got, []string{"bob", "carol"}) {
+		t.Fatalf("SORT BY hash-field window = %v want [bob carol]", got)
+	}
+	// A missing field resolves to nil weight (sorts as 0) and a nil GET element,
+	// matching Redis, proving the point lookup reports absence the same way.
+	if got := readArray(t, r, c, "SORT ids BY h_*->missing GET h_*->missing"); len(got) != 3 {
+		t.Fatalf("SORT BY missing field returned %d elements want 3", len(got))
+	}
+}
+
+// TestSortCollByHashFieldIsPointLookup is the OOM witness for the BY/GET hash
+// deref: a SORT whose weights live in large coll-form hashes must read one field
+// per element, not clone each hash. The per-call allocation must not grow when
+// the referenced hashes grow, which the old getHash materialize would have done.
+func TestSortCollByHashFieldIsPointLookup(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
+	build := func(hashFields int) (*Dispatcher, *networking.Conn) {
+		d := newFuzzDispatcher(t)
+		conn := networking.NewOfflineConn()
+		apply := func(args [][]byte) {
+			conn.ResetOut()
+			d.Handle(conn, args)
+		}
+		// A tiny list of three ids, each weighted by a field in its own hash.
+		for _, id := range []string{"1", "2", "3"} {
+			args := [][]byte{[]byte("HSET"), []byte("h_" + id), []byte("w"), []byte(id)}
+			for i := range hashFields {
+				args = append(args, []byte(fmt.Sprintf("f%d", i)), []byte("v"))
+			}
+			apply(args)
+			apply([][]byte{[]byte("OBJECT"), []byte("ENCODING"), []byte("h_" + id)})
+			if got := string(conn.OutBytes()); got != "$9\r\nhashtable\r\n" {
+				t.Fatalf("hash h_%s not in coll form: OBJECT ENCODING = %q", id, got)
+			}
+		}
+		apply([][]byte{[]byte("RPUSH"), []byte("ids"), []byte("1"), []byte("2"), []byte("3")})
+		return d, conn
+	}
+	sortArgs := [][]byte{[]byte("SORT"), []byte("ids"), []byte("BY"), []byte("h_*->w"), []byte("LIMIT"), []byte("0"), []byte("3")}
+	measure := func(d *Dispatcher, conn *networking.Conn) float64 {
+		return testing.AllocsPerRun(10, func() {
+			conn.ResetOut()
+			d.Handle(conn, sortArgs)
+		})
+	}
+
+	dSmall, cSmall := build(200)
+	small := measure(dSmall, cSmall)
+	dLarge, cLarge := build(4000)
+	large := measure(dLarge, cLarge)
+
+	// Doubling-and-then-some the hash size must not move the per-call cost: the
+	// deref reads one field, so allocation tracks the three ids, not the fields.
+	if large > small+300 {
+		t.Fatalf("SORT BY hash-field allocated %.0f over 4000-field hashes vs %.0f over 200; "+
+			"the deref must be a point lookup, not a full hash materialize", large, small)
+	}
+}
+
 // TestSortCollWindowConvOutsideWindow checks a numeric SORT is rejected when any
 // element is non-numeric, even when that element falls outside the LIMIT window,
 // matching the in-RAM path which sorts every element before applying the window.
