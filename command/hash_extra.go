@@ -312,12 +312,16 @@ func handleHRandField(ctx *Ctx) {
 		return
 	}
 
+	// picked holds the chosen fields in reply order: one element for the no-count
+	// form, the full sample for the count form. A coll-form hash fills it through a
+	// bounded reservoir walk so it never clones the whole hash (the blob getter both
+	// crashes and OOMs on the coll form); a blob hash materializes as before.
 	var (
 		wrongTyp bool
-		fields   []hashField
+		picked   []hashField
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		fs, hdr, found, err := getHash(db, key)
+		hdr, found, err := hashHeader(db, key)
 		if err != nil {
 			return err
 		}
@@ -328,7 +332,27 @@ func handleHRandField(ctx *Ctx) {
 			wrongTyp = true
 			return nil
 		}
-		fields = fs
+		if hdr.IsColl() {
+			c := count
+			if !hasCount {
+				c = 1
+			}
+			picked, err = hashCollRandFields(db, key, c)
+			return err
+		}
+		fields, _, _, err := hashMaterialize(db, key)
+		if err != nil {
+			return err
+		}
+		if !hasCount {
+			if len(fields) > 0 {
+				picked = []hashField{fields[rand.IntN(len(fields))]}
+			}
+			return nil
+		}
+		for _, i := range hashRandIndices(len(fields), count) {
+			picked = append(picked, fields[i])
+		}
 		return nil
 	}) {
 		return
@@ -340,26 +364,25 @@ func handleHRandField(ctx *Ctx) {
 	enc := ctx.enc()
 
 	if !hasCount {
-		if len(fields) == 0 {
+		if len(picked) == 0 {
 			enc.WriteNull()
 			return
 		}
-		enc.WriteBulkString(fields[rand.IntN(len(fields))].field)
+		enc.WriteBulkString(picked[0].field)
 		return
 	}
 
-	picks := hashRandIndices(len(fields), count)
 	if withValues {
-		enc.WriteMapLen(len(picks))
-		for _, i := range picks {
-			enc.WriteBulkString(fields[i].field)
-			enc.WriteBulkString(fields[i].value)
+		enc.WriteMapLen(len(picked))
+		for _, f := range picked {
+			enc.WriteBulkString(f.field)
+			enc.WriteBulkString(f.value)
 		}
 		return
 	}
-	enc.WriteArrayLen(len(picks))
-	for _, i := range picks {
-		enc.WriteBulkString(fields[i].field)
+	enc.WriteArrayLen(len(picked))
+	for _, f := range picked {
+		enc.WriteBulkString(f.field)
 	}
 }
 
