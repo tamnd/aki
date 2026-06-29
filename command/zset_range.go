@@ -439,8 +439,8 @@ func (ctx *Ctx) runRange(key, minArg, maxArg []byte, spec rangeSpec) {
 		// window directly, so the read stays bounded by the matching rows instead of
 		// cloning the whole set. Forward (ZRANGEBYSCORE) walks ascending from the low
 		// bound; reverse (ZREVRANGEBYSCORE, arg order key max min) walks descending
-		// from the high bound with the backward cursor. The lex and rank forms need a
-		// different seek, so those keep the materialize path for now.
+		// from the high bound with the backward cursor. The rank form needs
+		// order-statistics seeks, so it keeps the materialize path for now.
 		if found && hdr.IsColl() && spec.byScore {
 			// In the reverse command minArg is the high bound and maxArg the low.
 			loArg, hiArg := minArg, maxArg
@@ -461,6 +461,31 @@ func (ctx *Ctx) runRange(key, minArg, maxArg []byte, spec rangeSpec) {
 				result, err = zsetCollRevRangeByScore(db, key, loB, hiB, spec.limit, spec.offset, spec.count)
 			} else {
 				result, _, err = zsetCollRangeByScore(db, key, loB, hiB, spec.limit, spec.offset, spec.count, false)
+			}
+			return err
+		}
+		// A coll-form lex range walks the member-index rows, which are ordered by
+		// member bytes, straight from the low (or high, reversed) bound. ZRANGEBYLEX
+		// walks forward, ZREVRANGEBYLEX (arg order key max min) walks backward.
+		if found && hdr.IsColl() && spec.byLex {
+			loArg, hiArg := minArg, maxArg
+			if spec.rev {
+				loArg, hiArg = maxArg, minArg
+			}
+			loB, ok := parseLexBound(loArg)
+			if !ok {
+				errStr = "ERR min or max not valid string range item"
+				return nil
+			}
+			hiB, ok := parseLexBound(hiArg)
+			if !ok {
+				errStr = "ERR min or max not valid string range item"
+				return nil
+			}
+			if spec.rev {
+				result, err = zsetCollRevRangeByLex(db, key, loB, hiB, spec.limit, spec.offset, spec.count)
+			} else {
+				result, _, err = zsetCollRangeByLex(db, key, loB, hiB, spec.limit, spec.offset, spec.count, false)
 			}
 			return err
 		}
@@ -511,8 +536,7 @@ func (ctx *Ctx) runRangeCount(key, minArg, maxArg []byte, spec rangeSpec) {
 			return nil
 		}
 		// ZCOUNT over a coll-form set counts the score-index window in place rather
-		// than materializing the whole set to measure it. ZLEXCOUNT keeps the
-		// materialize path until the lex seek lands here too.
+		// than materializing the whole set to measure it.
 		if found && hdr.IsColl() && spec.byScore {
 			loB, ok := parseScoreBound(minArg)
 			if !ok {
@@ -525,6 +549,21 @@ func (ctx *Ctx) runRangeCount(key, minArg, maxArg []byte, spec rangeSpec) {
 				return nil
 			}
 			_, n, err = zsetCollRangeByScore(db, key, loB, hiB, false, 0, 0, true)
+			return err
+		}
+		// ZLEXCOUNT counts the member-index window in place the same way.
+		if found && hdr.IsColl() && spec.byLex {
+			loB, ok := parseLexBound(minArg)
+			if !ok {
+				errStr = "ERR min or max not valid string range item"
+				return nil
+			}
+			hiB, ok := parseLexBound(maxArg)
+			if !ok {
+				errStr = "ERR min or max not valid string range item"
+				return nil
+			}
+			_, n, err = zsetCollRangeByLex(db, key, loB, hiB, false, 0, 0, true)
 			return err
 		}
 		members, _, _, err := getZSet(db, key)
