@@ -1,6 +1,7 @@
 package command
 
 import (
+	"bytes"
 	"math"
 
 	"github.com/tamnd/aki/encoding"
@@ -428,6 +429,55 @@ func zsetCollRevRangeByLex(db *keyspace.DB, key []byte, lo, hi lexBound, limit b
 		return nil
 	})
 	return out, err
+}
+
+// zsetCollRank returns the 0-based rank of member in a coll-form sorted set: its
+// ascending position for ZRANK, or its descending position for ZREVRANK. It point-looks
+// up the member's score from the member-index row, then counts the score rows before
+// it by walking the score index from the front. The walk allocates nothing per row, so
+// it replaces a getZSet that cloned the whole set to find one position, the materialize
+// trap, with a bounded scan: O(rank) cursor steps and zero per-row allocation, never an
+// OOM. found is false when the member is absent. A logarithmic rank would need
+// order-statistics subtree counts the btree does not carry yet.
+func zsetCollRank(db *keyspace.DB, key, member []byte, rev bool) (rank int64, score float64, found bool, err error) {
+	rank = -1
+	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+		c := r.Cursor()
+		mrow := zMemberRow(member)
+		if e := c.Seek(mrow); e != nil {
+			return e
+		}
+		if !c.Valid() || !bytes.Equal(c.Key(), mrow) {
+			return nil // member absent
+		}
+		found = true
+		score = zScoreUnbits(encoding.U64BE(c.Value()))
+		target := zScoreRow(score, member)
+		if e := c.Seek([]byte{zRowScore}); e != nil {
+			return e
+		}
+		var asc int64
+		for c.Valid() {
+			k := c.Key()
+			if len(k) == 0 || k[0] != zRowScore {
+				break
+			}
+			if bytes.Equal(k, target) {
+				break
+			}
+			asc++
+			if e := c.Next(); e != nil {
+				return e
+			}
+		}
+		if rev {
+			rank = int64(r.Count()) - 1 - asc
+		} else {
+			rank = asc
+		}
+		return nil
+	})
+	return rank, score, found, err
 }
 
 // zsetCollRangeByRank returns the [start, stop] rank slice of a coll-form sorted set,
