@@ -424,22 +424,8 @@ func handleZInterCard(ctx *Ctx) {
 		limit = int(l)
 	}
 
-	var (
-		wrongTyp bool
-		n        int64
-	)
-	if !ctx.view(func(db *keyspace.DB) error {
-		sets, wt, err := loadZSets(db, keys)
-		if err != nil {
-			return err
-		}
-		if wt {
-			wrongTyp = true
-			return nil
-		}
-		n = int64(interCardZ(sets, limit))
-		return nil
-	}) {
+	n, wrongTyp, ok := zinterCardBounded(ctx, keys, limit)
+	if !ok {
 		return
 	}
 	if wrongTyp {
@@ -447,38 +433,6 @@ func handleZInterCard(ctx *Ctx) {
 		return
 	}
 	ctx.enc().WriteInteger(n)
-}
-
-// interCardZ counts the intersection without scores, stopping at limit when it
-// is positive.
-func interCardZ(sets [][]zmember, limit int) int {
-	if len(sets) == 0 || len(sets[0]) == 0 {
-		return 0
-	}
-	others := make([]map[string]float64, len(sets))
-	for j := 1; j < len(sets); j++ {
-		if len(sets[j]) == 0 {
-			return 0
-		}
-		others[j] = scoreMap(sets[j])
-	}
-	count := 0
-	for _, zm := range sets[0] {
-		inAll := true
-		for j := 1; j < len(sets); j++ {
-			if _, ok := others[j][string(zm.member)]; !ok {
-				inAll = false
-				break
-			}
-		}
-		if inAll {
-			count++
-			if limit > 0 && count >= limit {
-				return count
-			}
-		}
-	}
-	return count
 }
 
 // handleZMPop implements ZMPOP numkeys key [key ...] MIN|MAX [COUNT count]. It
