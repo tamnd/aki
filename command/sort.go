@@ -414,16 +414,14 @@ func lookupKeyByPattern(db *keyspace.DB, pattern, subst []byte) ([]byte, bool, e
 	if arrow := bytes.Index(resolved, []byte("->")); arrow >= 0 {
 		hkey := resolved[:arrow]
 		field := resolved[arrow+2:]
-		fields, hdr, found, err := getHash(db, hkey)
-		if err != nil || !found || hdr.Type != keyspace.TypeHash {
+		// A point sub-tree lookup on coll form, not a full materialize: a SORT
+		// with BY weight_*->f over a list whose weight hashes are huge would
+		// otherwise clone a whole hash per element just to read one field.
+		val, fieldFound, hdr, keyFound, err := hashGetField(db, hkey, field)
+		if err != nil || !keyFound || hdr.Type != keyspace.TypeHash || !fieldFound {
 			return nil, false, err
 		}
-		for _, f := range fields {
-			if bytes.Equal(f.field, field) {
-				return f.value, true, nil
-			}
-		}
-		return nil, false, nil
+		return val, true, nil
 	}
 
 	body, hdr, found, err := db.Get(resolved)
