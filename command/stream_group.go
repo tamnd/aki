@@ -517,8 +517,14 @@ func handleXAck(ctx *Ctx) {
 					if _, err := streamPELDelete(w, groupName, id); err != nil {
 						return err
 					}
+					if g.pending > 0 {
+						g.pending--
+					}
 					if c := g.findConsumer(pe.consumer); c != nil {
 						c.activeTime = now
+						if c.pending > 0 {
+							c.pending--
+						}
 					}
 					acked++
 				}
@@ -727,6 +733,13 @@ func handleXReadGroupStreams(ctx *Ctx, groupName, consumerName string, rest [][]
 						rows = append(rows, readEntry{id: e.id, fields: e.fields})
 					}
 					if coll {
+						// The header carries the pending counters, so a non-NOACK delivery
+						// bumps them by the delivered count before the header is written.
+						// NOACK keeps no PEL, so it leaves the counters untouched.
+						if !noAck {
+							g.pending += uint64(len(es))
+							c.pending += uint64(len(es))
+						}
 						// The coll path writes the header plus one PEL row per delivered
 						// entry, so the persist cost is the delivered count, not the whole
 						// pending list. The blob path rewrites the small inline blob.
@@ -964,8 +977,10 @@ func loadStreamForInfo(ctx *Ctx, key []byte) (*stream, bool) {
 		noKey    bool
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		// XINFO GROUPS and CONSUMERS report pending counts, so load the PELs.
-		s, hdr, found, err := getStreamGroupsFull(db, key)
+		// XINFO GROUPS and CONSUMERS report pending counts, which the coll header
+		// carries as counters, so the header-only load suffices; the PEL rows are
+		// never scanned.
+		s, hdr, found, err := getStreamGroups(db, key)
 		if err != nil {
 			return err
 		}
@@ -1022,7 +1037,7 @@ func writeGroupInfo(enc *resp.Encoder, s *stream, g *group) {
 	enc.WriteBulkStringStr("consumers")
 	enc.WriteInteger(int64(len(g.consumers)))
 	enc.WriteBulkStringStr("pending")
-	enc.WriteInteger(int64(len(g.pel)))
+	enc.WriteInteger(int64(g.pending))
 	enc.WriteBulkStringStr("last-delivered-id")
 	enc.WriteBulkStringStr(g.lastID.String())
 	enc.WriteBulkStringStr("entries-read")
@@ -1060,7 +1075,7 @@ func handleXInfoConsumers(ctx *Ctx) {
 		enc.WriteBulkStringStr("name")
 		enc.WriteBulkStringStr(c.name)
 		enc.WriteBulkStringStr("pending")
-		enc.WriteInteger(int64(g.consumerPending(c.name)))
+		enc.WriteInteger(int64(c.pending))
 		enc.WriteBulkStringStr("idle")
 		enc.WriteInteger(now - c.seenTime)
 		enc.WriteBulkStringStr("inactive")
