@@ -17,7 +17,9 @@ import (
 	"github.com/tamnd/aki/btree"
 	"github.com/tamnd/aki/encoding"
 	"github.com/tamnd/aki/format"
+	"github.com/tamnd/aki/hot"
 	"github.com/tamnd/aki/pager"
+	"github.com/tamnd/aki/store"
 )
 
 // NumShards is the number of independent B-tree shards per logical database.
@@ -69,12 +71,19 @@ type Keyspace struct {
 	catRoot uint32 // catalog page number, NullPage until first persisted
 	sysRoot uint32 // system table B-tree root, NullPage until first SystemPut
 	sysTree *btree.Tree
-	version atomic.Uint64 // monotonic write version; use NextVersion to advance
+	version versionCounter // per-key monotonic write version; use NextVersionForKey
 
 	// hashOverlay gates the in-memory hash write overlay. The command layer sets it
 	// through SetHashOverlay after weighing the commit policy; the keyspace hot path
 	// reads it with one atomic load. Off by default. See keyspace/overlay.go.
 	hashOverlay atomic.Bool
+
+	// hybrid is true when the keyspace was opened WithHybridLog, so its string point
+	// path runs on the v2 hybrid-log store. The command layer reads it to disable the
+	// write-behind fast path: that path stages into the B-tree's hot cache and async
+	// write worker, neither of which the hybrid engine has, so under hybrid every
+	// write takes the synchronous db.Set path that routes into the store.
+	hybrid bool
 
 	// expiredLog collects keys deleted by lazy expiry since the last drain. The
 	// command layer empties it with TakeExpired after each access to fire the
@@ -85,9 +94,10 @@ type Keyspace struct {
 
 	// dataBytes is the running estimate of live key and value bytes, the figure
 	// INFO reports as used_memory and the maxmemory eviction loop compares against
-	// the limit. Set and Delete keep it current via atomic Add so concurrent shard
-	// writers can update it without holding the global write lock.
-	dataBytes atomic.Int64
+	// the limit. Set and Delete keep it current via Add so concurrent shard writers
+	// can update it without holding the global write lock. It is striped per-P so
+	// those writers do not serialise on one cache line; Load sums the stripes.
+	dataBytes stripedInt64
 
 	// lfuLogFactor and lfuDecayTime back the lfu-log-factor and lfu-decay-time
 	// config knobs. Open seeds them with the Redis defaults; the command layer
@@ -251,6 +261,19 @@ type DB struct {
 	// hot-GET callers can load the cache without the engine read lock, and SwapDB
 	// can exchange the cache pointer while readers are active.
 	hc atomic.Pointer[dbCache]
+
+	// newHL, when non-nil, routes the string point path (Set/Get/Delete) through a
+	// resident hybrid-log engine instead of the paged B-tree (spec 2064 rewrite,
+	// S1). It is the in-place engine swap, gated off by default: a fresh keyspace
+	// only takes this path when Open is given WithHybridLog (the durable-spill
+	// store/ engine) or WithHotEngine (the clean lock-free hot/ engine). The engine
+	// is an hlEngine so either substrate plugs in behind the same four-method seam.
+	// It is built lazily on first write via hlOnce, so idle databases pay no
+	// resident pages. The path is non-durable and string-only in this slice;
+	// collections, overflow, and durability are later slices.
+	newHL  func() (hlEngine, error)
+	hlOnce sync.Once
+	hl     atomic.Pointer[hlBox]
 }
 
 // wbPendingEntry is one entry in the write-behind pending table. It carries
@@ -273,6 +296,7 @@ type wbPendingEntry struct {
 // the tests rely on when they call Open with no options.
 type openOptions struct {
 	valueCacheBytes int64
+	newHL           func() (hlEngine, error)
 }
 
 // Option configures Open. Options keep the common Open(pgr) call unchanged while
@@ -284,6 +308,30 @@ type Option func(*openOptions)
 // value-cache-fraction; a non-positive value leaves the cache at its default.
 func WithValueCacheBytes(n int64) Option {
 	return func(o *openOptions) { o.valueCacheBytes = n }
+}
+
+// WithHybridLog routes the string point path through the v2 hybrid-log store
+// instead of the paged B-tree (spec 2064 rewrite, S1, the in-place engine swap).
+// It is off by default; passing it opts a keyspace into the new engine for
+// GET/SET/DEL on string keys. The store is built lazily per database on first
+// write. This slice is non-durable and string-only: collections, overflow bodies,
+// and the durability journal are later slices and are not served through it.
+func WithHybridLog(t store.Tunables) Option {
+	return func(o *openOptions) {
+		o.newHL = func() (hlEngine, error) { return store.New(t) }
+	}
+}
+
+// WithHotEngine routes the string point path through the clean hot/ engine: a
+// lock-free-read, in-place-update resident table with no append-only leak (the F2
+// hot tier, spec 2064 rewrite). It is the alternative substrate behind the same
+// hlEngine seam as WithHybridLog and is likewise off by default and opt-in. Like
+// the store/ path it is non-durable in this slice; the cold tier and recovery are
+// later slices. Passing both options is last-one-wins, since both set newHL.
+func WithHotEngine(t hot.Tunables) Option {
+	return func(o *openOptions) {
+		o.newHL = func() (hlEngine, error) { return hot.New(t) }
+	}
 }
 
 // Open binds a Keyspace to a pager and loads the catalog. The number of
@@ -311,6 +359,7 @@ func Open(pgr *pager.Pager, opts ...Option) (*Keyspace, error) {
 		sysRoot:      normalizeRoot(pgr.Meta().SystemRoot),
 		lfuLogFactor: lfuLogFactor,
 		lfuDecayTime: lfuDecayTime,
+		hybrid:       o.newHL != nil,
 	}
 	for i := range ks.dbs {
 		db := &DB{ks: ks, index: i}
@@ -318,6 +367,7 @@ func Open(pgr *pager.Pager, opts ...Option) (*Keyspace, error) {
 			db.shards[s].rootPage = format.NullPage
 		}
 		db.hc.Store(newDBCache(o.valueCacheBytes))
+		db.newHL = o.newHL
 		ks.dbs[i] = db
 	}
 	if ks.catRoot != format.NullPage {
@@ -329,10 +379,13 @@ func Open(pgr *pager.Pager, opts ...Option) (*Keyspace, error) {
 }
 
 // NextVersion atomically increments the keyspace write counter and returns the
-// new version. The write-behind path calls this under the engine read lock to
-// assign a stable version before the B-tree write is queued, so WATCH and the
-// hot-value cache always see a consistent, monotonically increasing value.
-func (ks *Keyspace) NextVersion() uint64 { return ks.version.Add(1) }
+// new version for key. The write-behind path calls this under the engine read
+// lock to assign a stable version before the B-tree write is queued, so WATCH and
+// the hot-value cache always see a version that increases monotonically for the
+// key. The counter is striped by key (see version.go), so the sequence is per key,
+// not global; every keyspace comparison is between two headers of the same key, so
+// per-key monotonicity is all the correctness the version needs.
+func (ks *Keyspace) NextVersionForKey(key []byte) uint64 { return ks.version.next(key) }
 
 // PagerStats returns the underlying pager's counters for the file-growth INFO
 // fields. It is a passthrough so the command layer does not reach into the pager.
@@ -396,6 +449,12 @@ func (db *DB) Index() int { return db.index }
 
 // Len returns the total number of live keys across all shards, the value DBSIZE reports.
 func (db *DB) Len() uint64 {
+	if db.newHL != nil {
+		if b := db.hl.Load(); b != nil {
+			return uint64(b.e.Len())
+		}
+		return 0
+	}
 	var total uint64
 	for s := range NumShards {
 		total += db.shards[s].keyCount.Load()
@@ -449,6 +508,9 @@ func (db *DB) ensureShardTree(s int) (*btree.Tree, error) {
 // A key whose absolute TTL is already in the past is not written and any
 // existing key under that name is removed, matching Redis's write-time expiry.
 func (db *DB) Set(key, body []byte, typ, enc uint8, ttlMs int64) error {
+	if db.newHL != nil {
+		return db.hlSet(key, body, typ, enc, ttlMs)
+	}
 	return db.set(key, body, typ, enc, ttlMs, 0)
 }
 
@@ -497,7 +559,7 @@ func (db *DB) set(key, body []byte, typ, enc uint8, ttlMs int64, preVersion uint
 	if preVersion > 0 {
 		version = preVersion
 	} else {
-		version = db.ks.version.Add(1)
+		version = db.ks.version.next(key)
 	}
 	h := ValueHeader{
 		Type:     typ,
@@ -776,15 +838,52 @@ func (db *DB) Peek(key []byte) (body []byte, hdr ValueHeader, found bool, err er
 	return db.get(key, false)
 }
 
+// GetUncached is Get for callers that already probed the hot-value cache through
+// viewHotGet and missed (handleGet's fast path). It skips the redundant initial
+// cache probe and goes straight to the write-behind overlay and the B-tree, so a
+// GET that misses the cache takes one shard reader lock instead of two. It still
+// records the access and warms the cache on the way out, exactly as Get does. The
+// skipped probe can only differ from Get if a concurrent writer inserts the key in
+// the window between the viewHotGet probe and this call, which then reads the fresh
+// value from the overlay or B-tree instead, so it is never a correctness gap.
+func (db *DB) GetUncached(key []byte) (body []byte, hdr ValueHeader, found bool, err error) {
+	if db.newHL != nil {
+		body, hdr, found, err = db.hlGet(key)
+		if found {
+			// Mirror the btree read path's recordAccess so OBJECT FREQ and the LFU
+			// eviction sampler see the read on the hybrid engine too.
+			db.recordAccess(key, false)
+		}
+		return body, hdr, found, err
+	}
+	return db.getProbe(key, true, false)
+}
+
 // get is the shared read path. When touch is set it records an access for the
 // eviction bookkeeping. An expired key is returned as not-found immediately;
 // its B-tree deletion is deferred to the next active expiry cycle so this
 // function is safe to call concurrently with writes on other shards.
 func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found bool, err error) {
+	if db.newHL != nil {
+		body, hdr, found, err = db.hlGet(key)
+		if found && touch {
+			// Mirror getProbe's touch-time recordAccess so the hybrid read path feeds
+			// the LFU bookkeeping the same way the btree path does.
+			db.recordAccess(key, false)
+		}
+		return body, hdr, found, err
+	}
+	return db.getProbe(key, touch, true)
+}
+
+// getProbe is get with an explicit toggle for the initial hot-cache probe. probe
+// is true on the normal path and false for GetUncached, whose caller already
+// probed the cache via viewHotGet. Everything after the probe is identical.
+func (db *DB) getProbe(key []byte, touch, probe bool) (body []byte, hdr ValueHeader, found bool, err error) {
 	// Hot-cache check comes before the string conversion: cget and cinvalidate
 	// take []byte and do the map op with string(key) as a compiler-elided
 	// temporary, so a hot hit returns without any heap allocation.
-	if touch {
+	if touch && probe {
 		if b, h, ok := db.hc.Load().cget(key); ok {
 			if db.expired(h) {
 				db.hc.Load().cinvalidate(key)
@@ -855,7 +954,10 @@ func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found b
 	// CollRead, not this path; this guard keeps a stray Get from poisoning the
 	// cache.
 	if touch && !h.IsColl() {
-		db.hc.Load().cput(sk, out, h)
+		// Read-miss admission: gate this insert through the doorkeeper so a
+		// one-hit-wonder read does not thrash the cache (note 247). Write-path and
+		// write-behind warm-ups use cput and force-admit.
+		db.hc.Load().cputRead(sk, out, h)
 	}
 	return out, h, true, nil
 }
@@ -871,6 +973,9 @@ func (db *DB) Exists(key []byte) (bool, error) {
 // The caller must NOT hold any shard lock; Delete acquires the shard write lock
 // internally and releases it before returning.
 func (db *DB) Delete(key []byte) (bool, error) {
+	if db.newHL != nil {
+		return db.hlDelete(key)
+	}
 	s := ShardOf(key)
 	db.shards[s].mu.Lock()
 	defer db.shards[s].mu.Unlock()

@@ -115,6 +115,61 @@ func setMemberIn(db *keyspace.DB, key, member []byte, hdr keyspace.ValueHeader) 
 	return setFind(members, member) >= 0, nil
 }
 
+// setMembership answers a batch of membership queries against the set at key
+// with the cheapest path for the storage form, never materializing the whole
+// set. A btree-backed set answers each query with an O(log n) point lookup
+// inside one sub-tree reader; a small blob set decodes once and scans. This is
+// the difference between O(q) point lookups and an O(n) walk of every member,
+// which on a multi-million-member set is the difference between a few page
+// reads and dragging the entire set through memory on every SISMEMBER.
+//
+// present is filled per query (false for an absent key). wrongTyp reports a
+// non-set value at key. ok is false only when the underlying view failed.
+func setMembership(ctx *Ctx, key []byte, queries [][]byte) (present []bool, wrongTyp bool, ok bool) {
+	present = make([]bool, len(queries))
+	// A small set may be served straight from the lock-free hot cache; hotGetSet
+	// returns a miss for the coll form, so a hit here is always the blob form.
+	if ms, hit := hotGetSet(ctx, key); hit {
+		for i, q := range queries {
+			present[i] = setFind(ms, q) >= 0
+		}
+		return present, false, true
+	}
+	ok = ctx.view(func(db *keyspace.DB) error {
+		hdr, found, err := setHeader(db, key)
+		if err != nil || !found {
+			return err
+		}
+		if hdr.Type != keyspace.TypeSet {
+			wrongTyp = true
+			return nil
+		}
+		if hdr.IsColl() {
+			// One reader, a point lookup per query: the whole sub-tree is never walked.
+			_, e := db.CollRead(key, func(r *keyspace.CollReader) error {
+				for i, q := range queries {
+					_, p, ge := r.Get(q)
+					if ge != nil {
+						return ge
+					}
+					present[i] = p
+				}
+				return nil
+			})
+			return e
+		}
+		members, _, _, e := getSet(db, key)
+		if e != nil {
+			return e
+		}
+		for i, q := range queries {
+			present[i] = setFind(members, q) >= 0
+		}
+		return nil
+	})
+	return present, wrongTyp, ok
+}
+
 // setDelOne removes one known-present member from the set at key and reports
 // whether that emptied the key. It handles both storage forms and is used by
 // SMOVE, which moves a single member across keys.

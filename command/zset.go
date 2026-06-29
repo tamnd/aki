@@ -398,91 +398,30 @@ func handleZIncrBy(ctx *Ctx) {
 	ctx.enc().WriteDouble(result)
 }
 
-// handleZScore implements ZSCORE key member.
+// handleZScore implements ZSCORE key member. It answers with a point lookup on the
+// member-index row, so a btree-backed sorted set is never materialized.
 func handleZScore(ctx *Ctx) {
-	if members, ok := hotGetZSet(ctx, ctx.Argv[1]); ok {
-		if idx := zsetFind(members, ctx.Argv[2]); idx >= 0 {
-			ctx.enc().WriteDouble(members[idx].score)
-		} else {
-			ctx.enc().WriteNull()
-		}
-		return
-	}
-
-	var (
-		wrongTyp bool
-		score    float64
-		found    bool
-	)
-	if !ctx.view(func(db *keyspace.DB) error {
-		members, hdr, ok, err := getZSet(db, ctx.Argv[1])
-		if err != nil {
-			return err
-		}
-		if ok && hdr.Type != keyspace.TypeZSet {
-			wrongTyp = true
-			return nil
-		}
-		if idx := zsetFind(members, ctx.Argv[2]); idx >= 0 {
-			score = members[idx].score
-			found = true
-		}
-		return nil
-	}) {
+	scores, present, wrongTyp, ok := zsetScores(ctx, ctx.Argv[1], ctx.Argv[2:3])
+	if !ok {
 		return
 	}
 	if wrongTyp {
 		ctx.enc().WriteError(wrongTypeError)
 		return
 	}
-	if !found {
+	if present[0] {
+		ctx.enc().WriteDouble(scores[0])
+	} else {
 		ctx.enc().WriteNull()
-		return
 	}
-	ctx.enc().WriteDouble(score)
 }
 
-// handleZMScore implements ZMSCORE key member [member ...].
+// handleZMScore implements ZMSCORE key member [member ...]. Each member is a point
+// lookup on the member-index row, never a walk of the whole sorted set.
 func handleZMScore(ctx *Ctx) {
 	queries := ctx.Argv[2:]
-
-	if members, ok := hotGetZSet(ctx, ctx.Argv[1]); ok {
-		enc := ctx.enc()
-		enc.WriteArrayLen(len(queries))
-		for _, q := range queries {
-			if idx := zsetFind(members, q); idx >= 0 {
-				enc.WriteDouble(members[idx].score)
-			} else {
-				enc.WriteNull()
-			}
-		}
-		return
-	}
-
-	var (
-		wrongTyp bool
-		scores   []float64
-		present  []bool
-	)
-	if !ctx.view(func(db *keyspace.DB) error {
-		members, hdr, ok, err := getZSet(db, ctx.Argv[1])
-		if err != nil {
-			return err
-		}
-		if ok && hdr.Type != keyspace.TypeZSet {
-			wrongTyp = true
-			return nil
-		}
-		scores = make([]float64, len(queries))
-		present = make([]bool, len(queries))
-		for i, q := range queries {
-			if idx := zsetFind(members, q); idx >= 0 {
-				scores[i] = members[idx].score
-				present[i] = true
-			}
-		}
-		return nil
-	}) {
+	scores, present, wrongTyp, ok := zsetScores(ctx, ctx.Argv[1], queries)
+	if !ok {
 		return
 	}
 	if wrongTyp {

@@ -143,6 +143,73 @@ func collectZSetMembers(db *keyspace.DB, key []byte) ([]zmember, error) {
 	return out, err
 }
 
+// zsetScores answers a batch of score lookups (ZSCORE, ZMSCORE) against the sorted
+// set at key with the cheapest path for the storage form, never materializing the
+// whole set. A btree-backed sorted set answers each query with an O(log n) point
+// lookup on its member-index row ('m' + member -> score bytes), reading the score
+// straight from the row value; a small blob decodes once and scans. This is the
+// difference between O(q) point lookups and an O(n) walk that clones every member on
+// every ZSCORE, which on a multi-million-member sorted set is the same allocation
+// blow-up that OOM-killed SISMEMBER before it became a point lookup.
+//
+// scores and present are filled per query (present false for an absent member or an
+// absent key). wrongTyp reports a non-zset value at key. ok is false only when the
+// underlying view failed.
+func zsetScores(ctx *Ctx, key []byte, queries [][]byte) (scores []float64, present []bool, wrongTyp bool, ok bool) {
+	scores = make([]float64, len(queries))
+	present = make([]bool, len(queries))
+	// A small sorted set may be served straight from the lock-free hot cache;
+	// hotGetZSet returns a miss for the coll form, so a hit here is the blob form.
+	if members, hit := hotGetZSet(ctx, key); hit {
+		for i, q := range queries {
+			if idx := zsetFind(members, q); idx >= 0 {
+				scores[i] = members[idx].score
+				present[i] = true
+			}
+		}
+		return scores, present, false, true
+	}
+	ok = ctx.view(func(db *keyspace.DB) error {
+		hdr, found, err := zsetHeader(db, key)
+		if err != nil || !found {
+			return err
+		}
+		if hdr.Type != keyspace.TypeZSet {
+			wrongTyp = true
+			return nil
+		}
+		if hdr.IsColl() {
+			// One reader, a point lookup per query: the score rows are never walked.
+			_, e := db.CollRead(key, func(r *keyspace.CollReader) error {
+				for i, q := range queries {
+					v, p, ge := r.Get(zMemberRow(q))
+					if ge != nil {
+						return ge
+					}
+					if p {
+						scores[i] = zScoreUnbits(encoding.U64BE(v))
+						present[i] = true
+					}
+				}
+				return nil
+			})
+			return e
+		}
+		members, _, _, e := getZSet(db, key)
+		if e != nil {
+			return e
+		}
+		for i, q := range queries {
+			if idx := zsetFind(members, q); idx >= 0 {
+				scores[i] = members[idx].score
+				present[i] = true
+			}
+		}
+		return nil
+	})
+	return scores, present, wrongTyp, ok
+}
+
 // zsetCard returns the member count in whichever form the sorted set is stored.
 // For a btree-backed sorted set it reads the metadata count in O(1).
 func zsetCard(db *keyspace.DB, key []byte) (n int64, hdr keyspace.ValueHeader, keyFound bool, err error) {
@@ -165,6 +232,62 @@ func zsetCard(db *keyspace.DB, key []byte) (n int64, hdr keyspace.ValueHeader, k
 		return 0, hdr, true, e
 	}
 	return int64(len(members)), hdr, true, nil
+}
+
+// zsetCollPop removes up to count members from the low end (fromMax false, ZPOPMIN)
+// or the high end (fromMax true, ZPOPMAX) of a coll-form sorted set and returns them
+// in pop order: lowest score first for ZPOPMIN, highest score first for ZPOPMAX. It
+// walks only the popped window of the score index, seeking straight to the end it
+// pops from, so taking a handful off a multi-million-member set is O(count log n).
+// The materialized path it replaces cloned every member onto the heap and rewrote
+// the whole set as a blob (demoting it), which OOM-killed under a tight memory cap.
+// The collected members are deleted after the walk so the cursor is never used past
+// a mutation. CollUpdate tears the key down when the last member goes.
+func zsetCollPop(db *keyspace.DB, key []byte, count int64, fromMax bool) (popped []zmember, err error) {
+	if count <= 0 {
+		return nil, nil
+	}
+	err = db.CollUpdate(key, keyspace.TypeZSet, keyspace.EncSkiplist, func(w *keyspace.CollWriter) error {
+		c := w.Cursor()
+		// Either direction decodes the popped window into the cursor's arena: a forward
+		// walk resets it per leaf, a backward walk holds the root-to-leaf path live and
+		// grows the buffer by the few nodes the bounded pop touches. Both stay a small
+		// constant instead of cloning every member onto the heap.
+		c.UseArena()
+		var step func() error
+		if fromMax {
+			// Score rows ('s' 0x73) sort after member rows ('m' 0x6d), so the last key
+			// in the sub-tree is the highest-scoring member.
+			if e := c.Last(); e != nil {
+				return e
+			}
+			step = c.Prev
+		} else {
+			if e := c.Seek([]byte{zRowScore}); e != nil {
+				return e
+			}
+			step = c.Next
+		}
+		for c.Valid() && int64(len(popped)) < count {
+			k := c.Key()
+			if len(k) == 0 || k[0] != zRowScore {
+				break
+			}
+			score := zScoreUnbits(encoding.U64BE(k[1:9]))
+			member := append([]byte(nil), k[9:]...)
+			popped = append(popped, zmember{member: member, score: score})
+			if e := step(); e != nil {
+				return e
+			}
+		}
+		for _, zm := range popped {
+			if _, e := zTreeDel(w, zm.member); e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	return popped, err
 }
 
 // zScoreAboveHigh reports whether an ascending walk has passed the high score
@@ -202,6 +325,10 @@ func zsetCollRangeByScore(db *keyspace.DB, key []byte, lo, hi scoreBound, limit 
 	}
 	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
 		c := r.Cursor()
+		// Forward score-index walk over one band: the arena keeps page decoding to a
+		// small constant so a narrow ZRANGEBYSCORE/ZCOUNT over a multi-million-member
+		// set stays bounded instead of allocating per cell across every leaf it spans.
+		c.UseArena()
 		seek := encoding.AppendU64BE([]byte{zRowScore}, zScoreBits(lo.value))
 		if e := c.Seek(seek); e != nil {
 			return e
@@ -258,6 +385,11 @@ func zsetCollRevRangeByScore(db *keyspace.DB, key []byte, lo, hi scoreBound, lim
 	}
 	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
 		c := r.Cursor()
+		// Backward score-index walk over one band: the arena holds the root-to-leaf
+		// path live and grows only by the few nodes this reverse band touches, so a
+		// narrow ZREVRANGEBYSCORE over a multi-million-member set stays bounded instead
+		// of allocating fresh key/value slices per cell across every leaf it spans.
+		c.UseArena()
 		// Seek to the start of the score group just above hi, then SeekForPrev lands
 		// on the largest row at or below hi. nextafter has no representable value
 		// between hi and itself, so no score in (hi, next) is skipped.
@@ -303,55 +435,52 @@ func zsetCollRevRangeByScore(db *keyspace.DB, key []byte, lo, hi scoreBound, lim
 	return out, err
 }
 
-// zsetCollPop removes up to count members from the low end (fromMax false, ZPOPMIN)
-// or the high end (fromMax true, ZPOPMAX) of a coll-form sorted set and returns them
-// in pop order: lowest score first for ZPOPMIN, highest score first for ZPOPMAX. It
-// walks only the popped window of the score index, seeking straight to the end it
-// pops from, so taking a handful off a multi-million-member set is O(count log n).
-// The materialized path it replaces cloned every member onto the heap and rewrote
-// the whole set as a blob (demoting it), which OOM-killed under a tight memory cap.
-// The collected members are deleted after the walk so the cursor is never used past
-// a mutation. CollUpdate tears the key down when the last member goes.
-func zsetCollPop(db *keyspace.DB, key []byte, count int64, fromMax bool) (popped []zmember, err error) {
-	if count <= 0 {
-		return nil, nil
+// zsetMemberScores reads the scores of a specific handful of members without
+// materializing the whole sorted set. For a coll-form sorted set each member is a
+// point lookup on its member-index row, so a GEODIST/GEOPOS/GEOHASH against a
+// multi-million-member geo set stays O(queries log n) and constant allocation
+// instead of cloning every member onto the heap, which under a tight memory cap is
+// the difference between serving and an OOM kill. For the blob form it decodes once
+// (bounded by the listpack threshold). present[i] reports whether members[i] was
+// found; scores[i] holds its score when present. keyFound is false for a missing
+// key, and a non-zset value leaves wrongType for the caller to surface via hdr.
+func zsetMemberScores(db *keyspace.DB, key []byte, members [][]byte) (scores []float64, present []bool, hdr keyspace.ValueHeader, keyFound bool, err error) {
+	scores = make([]float64, len(members))
+	present = make([]bool, len(members))
+	hdr, keyFound, err = zsetHeader(db, key)
+	if err != nil || !keyFound {
+		return scores, present, hdr, keyFound, err
 	}
-	err = db.CollUpdate(key, keyspace.TypeZSet, keyspace.EncSkiplist, func(w *keyspace.CollWriter) error {
-		c := w.Cursor()
-		var step func() error
-		if fromMax {
-			// Score rows ('s' 0x73) sort after member rows ('m' 0x6d), so the last key
-			// in the sub-tree is the highest-scoring member.
-			if e := c.Last(); e != nil {
-				return e
+	if hdr.Type != keyspace.TypeZSet {
+		return scores, present, hdr, true, nil
+	}
+	if hdr.IsColl() {
+		_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+			for i, m := range members {
+				v, ok, e := r.Get(zMemberRow(m))
+				if e != nil {
+					return e
+				}
+				if ok {
+					scores[i] = zScoreUnbits(encoding.U64BE(v))
+					present[i] = true
+				}
 			}
-			step = c.Prev
-		} else {
-			if e := c.Seek([]byte{zRowScore}); e != nil {
-				return e
-			}
-			step = c.Next
+			return nil
+		})
+		return scores, present, hdr, true, err
+	}
+	set, _, _, e := getZSet(db, key)
+	if e != nil {
+		return scores, present, hdr, true, e
+	}
+	for i, m := range members {
+		if idx := zsetFind(set, m); idx >= 0 {
+			scores[i] = set[idx].score
+			present[i] = true
 		}
-		for c.Valid() && int64(len(popped)) < count {
-			k := c.Key()
-			if len(k) == 0 || k[0] != zRowScore {
-				break
-			}
-			score := zScoreUnbits(encoding.U64BE(k[1:9]))
-			member := append([]byte(nil), k[9:]...)
-			popped = append(popped, zmember{member: member, score: score})
-			if e := step(); e != nil {
-				return e
-			}
-		}
-		for _, zm := range popped {
-			if _, e := zTreeDel(w, zm.member); e != nil {
-				return e
-			}
-		}
-		return nil
-	})
-	return popped, err
+	}
+	return scores, present, hdr, true, nil
 }
 
 // zTreeScore reads a member's current score from the member-index row inside a

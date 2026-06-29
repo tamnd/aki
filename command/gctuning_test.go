@@ -2,19 +2,22 @@ package command
 
 import (
 	"math"
+	"runtime"
 	"runtime/debug"
 	"testing"
 )
 
-// restoreGC snapshots the process GC settings and restores them when the test
-// ends, so tuning the global runtime here does not leak into other tests.
+// restoreGC snapshots the process GC settings and GOMAXPROCS and restores them when
+// the test ends, so tuning the global runtime here does not leak into other tests.
 func restoreGC(t *testing.T) {
 	t.Helper()
 	prevPct := debug.SetGCPercent(100)
 	prevLimit := debug.SetMemoryLimit(math.MaxInt64)
+	prevProcs := runtime.GOMAXPROCS(0)
 	t.Cleanup(func() {
 		debug.SetGCPercent(prevPct)
 		debug.SetMemoryLimit(prevLimit)
+		runtime.GOMAXPROCS(prevProcs)
 	})
 }
 
@@ -51,6 +54,27 @@ func TestApplyGCTuning(t *testing.T) {
 	}
 }
 
+// TestApplyMaxProcs checks go-maxprocs reaches the runtime: a positive value pins
+// GOMAXPROCS, and 0 leaves it untouched.
+func TestApplyMaxProcs(t *testing.T) {
+	restoreGC(t)
+	d := New(Config{})
+
+	// A positive value pins GOMAXPROCS to exactly that.
+	d.conf.set("go-maxprocs", "3")
+	d.applyMaxProcs()
+	if got := runtime.GOMAXPROCS(0); got != 3 {
+		t.Fatalf("go-maxprocs 3 gave GOMAXPROCS %d want 3", got)
+	}
+
+	// 0 is the leave-default special: it must not change the current setting.
+	d.conf.set("go-maxprocs", "0")
+	d.applyMaxProcs()
+	if got := runtime.GOMAXPROCS(0); got != 3 {
+		t.Fatalf("go-maxprocs 0 changed GOMAXPROCS to %d want it left at 3", got)
+	}
+}
+
 // TestGCTuningConfigSet checks CONFIG SET go-gogc parses, stores the canonical
 // value, and re-tunes the runtime live.
 func TestGCTuningConfigSet(t *testing.T) {
@@ -74,5 +98,16 @@ func TestGCTuningConfigSet(t *testing.T) {
 	val := configGet(t, r, c, "go-memlimit")
 	if val != "67108864" {
 		t.Fatalf("CONFIG GET go-memlimit = %q want 67108864", val)
+	}
+
+	// go-maxprocs pins GOMAXPROCS live and reports back the value it stored.
+	if got := sendLine(t, r, c, "CONFIG SET go-maxprocs 2"); got != "+OK" {
+		t.Fatalf("CONFIG SET go-maxprocs = %q", got)
+	}
+	if got := runtime.GOMAXPROCS(0); got != 2 {
+		t.Fatalf("CONFIG SET go-maxprocs 2 left GOMAXPROCS at %d", got)
+	}
+	if v := configGet(t, r, c, "go-maxprocs"); v != "2" {
+		t.Fatalf("CONFIG GET go-maxprocs = %q want 2", v)
 	}
 }
