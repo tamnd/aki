@@ -299,15 +299,28 @@ func zSetOpRead(ctx *Ctx, op zsetOp) {
 		result   []zmember
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		sets, wt, err := loadZSets(db, keys)
+		// The streamed forms drive the smallest (inter) or first (diff) source and
+		// probe the rest, or stream every source into one accumulator (union), so no
+		// coll source is cloned whole. The result is bounded by the intersection,
+		// the first source, or the distinct union, the same as Redis.
+		var (
+			res []zmember
+			wt  bool
+			err error
+		)
+		switch op {
+		case zopInter:
+			res, wt, err = zinterStream(db, keys, weights, agg)
+		case zopDiff:
+			res, wt, err = zdiffStream(db, keys)
+		default:
+			res, wt, err = zunionStream(db, keys, weights, agg)
+		}
 		if err != nil {
 			return err
 		}
-		if wt {
-			wrongTyp = true
-			return nil
-		}
-		result = computeZSetOp(op, sets, weights, agg)
+		wrongTyp = wt
+		result = res
 		return nil
 	}) {
 		return
