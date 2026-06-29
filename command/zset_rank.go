@@ -84,13 +84,27 @@ func handleZRank(ctx *Ctx, rev bool) {
 		score    float64
 	)
 	if !ctx.view(func(db *keyspace.DB) error {
-		members, hdr, ok, err := getZSet(db, ctx.Argv[1])
+		hdr, ok, err := zsetHeader(db, ctx.Argv[1])
 		if err != nil {
 			return err
 		}
 		if ok && hdr.Type != keyspace.TypeZSet {
 			wrongTyp = true
 			return nil
+		}
+		// A coll-form set finds the rank by a point lookup plus a bounded count walk,
+		// so it never clones the whole set to locate one member.
+		if ok && hdr.IsColl() {
+			var found bool
+			rank, score, found, err = zsetCollRank(db, ctx.Argv[1], member, rev)
+			if err != nil || !found {
+				rank = -1
+			}
+			return err
+		}
+		members, _, _, err := getZSet(db, ctx.Argv[1])
+		if err != nil {
+			return err
 		}
 		idx := zsetFind(members, member)
 		if idx < 0 {
