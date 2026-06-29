@@ -582,6 +582,165 @@ func flatField(flat []string, key string) string {
 	return ""
 }
 
+// xreadGroupEntries parses a single-stream XREADGROUP/XREAD reply (RESP2) into a
+// flat list per entry: ["id", "f", "v", ...]. A tombstone row (entry deleted from
+// the stream but still pending) has null fields and is returned as ["id",
+// tombstoneMark]. A null-array reply (nothing delivered) returns nil.
+const tombstoneMark = "<nil-fields>"
+
+func xreadGroupEntries(t *testing.T, r *bufio.Reader, hdr string) [][]string {
+	t.Helper()
+	if hdr == "*-1" || hdr == "_" {
+		return nil
+	}
+	if arrayLen(t, hdr) != 1 {
+		t.Fatalf("XREADGROUP outer header = %q want one stream", hdr)
+	}
+	if got := sendLineRead(t, r); got != "*2" {
+		t.Fatalf("XREADGROUP stream pair header = %q want *2", got)
+	}
+	_ = readBulkRaw(t, r) // stream name
+	eh := sendLineRead(t, r)
+	ne := arrayLen(t, eh)
+	out := make([][]string, 0, ne)
+	for range ne {
+		if got := sendLineRead(t, r); got != "*2" {
+			t.Fatalf("XREADGROUP entry header = %q want *2", got)
+		}
+		id := readBulkRaw(t, r)
+		fh := sendLineRead(t, r)
+		if fh == "*-1" || fh == "_" {
+			out = append(out, []string{id, tombstoneMark})
+			continue
+		}
+		fn := arrayLen(t, fh)
+		row := []string{id}
+		for range fn {
+			row = append(row, readBulkRaw(t, r))
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// TestStreamCollReadGroup drives XREADGROUP over a coll-form stream end to end: a >
+// delivery walks a bounded entry window and appends to the PEL, an explicit-ID
+// re-read point-fetches each pending entry's body from the entry rows, XACK shrinks
+// the pending set, a deleted-but-pending entry comes back as a tombstone, and a
+// NOACK delivery keeps no PEL. The key must stay coll throughout, and every entry
+// body must match what the blob path would return.
+func TestStreamCollReadGroup(t *testing.T) {
+	r, c, eng := startDataEng(t)
+	const n = streamCollThreshold + 100
+	for i := 1; i <= n; i++ {
+		_ = bulk(t, r, c, fmt.Sprintf("XADD s %d-0 f v%d", i, i))
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("stream not coll after seeding %d", n)
+	}
+	if got := sendLine(t, r, c, "XGROUP CREATE s g 0"); got != "+OK" {
+		t.Fatalf("XGROUP CREATE = %q", got)
+	}
+
+	// > delivery: the first five entries with their bodies, walked from the group
+	// last ID through the bounded entry-row window.
+	got := xreadGroupEntries(t, r, sendLine(t, r, c, "XREADGROUP GROUP g cons COUNT 5 STREAMS s >"))
+	want := [][]string{
+		{"1-0", "f", "v1"}, {"2-0", "f", "v2"}, {"3-0", "f", "v3"},
+		{"4-0", "f", "v4"}, {"5-0", "f", "v5"},
+	}
+	if !sameEntries(got, want) {
+		t.Fatalf("XREADGROUP > = %v want %v", got, want)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XREADGROUP > demoted to blob")
+	}
+
+	// Explicit-ID re-read from 0: the five pending entries come back with the same
+	// bodies, point-fetched from the entry rows (not an in-memory slice).
+	got = xreadGroupEntries(t, r, sendLine(t, r, c, "XREADGROUP GROUP g cons COUNT 10 STREAMS s 0"))
+	if !sameEntries(got, want) {
+		t.Fatalf("XREADGROUP explicit re-read = %v want %v", got, want)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XREADGROUP explicit demoted to blob")
+	}
+
+	// XACK the first two; the explicit re-read now returns the remaining three.
+	if got := sendLine(t, r, c, "XACK s g 1-0 2-0"); got != ":2" {
+		t.Fatalf("XACK = %q want :2", got)
+	}
+	got = xreadGroupEntries(t, r, sendLine(t, r, c, "XREADGROUP GROUP g cons STREAMS s 0"))
+	want = [][]string{{"3-0", "f", "v3"}, {"4-0", "f", "v4"}, {"5-0", "f", "v5"}}
+	if !sameEntries(got, want) {
+		t.Fatalf("XREADGROUP after XACK = %v want %v", got, want)
+	}
+
+	// Delete a still-pending entry; the explicit re-read returns it as a tombstone
+	// (null fields) since the PEL record survives but the entry row is gone.
+	if got := sendLine(t, r, c, "XDEL s 4-0"); got != ":1" {
+		t.Fatalf("XDEL 4-0 = %q want :1", got)
+	}
+	got = xreadGroupEntries(t, r, sendLine(t, r, c, "XREADGROUP GROUP g cons STREAMS s 0"))
+	want = [][]string{{"3-0", "f", "v3"}, {"4-0", tombstoneMark}, {"5-0", "f", "v5"}}
+	if !sameEntries(got, want) {
+		t.Fatalf("XREADGROUP with tombstone = %v want %v", got, want)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XREADGROUP tombstone path demoted to blob")
+	}
+
+	// NOACK delivery on a second consumer delivers the next three and keeps no PEL.
+	got = xreadGroupEntries(t, r, sendLine(t, r, c, "XREADGROUP GROUP g cons2 NOACK COUNT 3 STREAMS s >"))
+	want = [][]string{{"6-0", "f", "v6"}, {"7-0", "f", "v7"}, {"8-0", "f", "v8"}}
+	if !sameEntries(got, want) {
+		t.Fatalf("XREADGROUP NOACK > = %v want %v", got, want)
+	}
+	// cons2 has nothing pending: a NOACK read records no PEL entries, so the
+	// explicit-ID re-read yields an empty (but present) per-stream entry list.
+	if got := xreadGroupEntries(t, r, sendLine(t, r, c, "XREADGROUP GROUP g cons2 STREAMS s 0")); len(got) != 0 {
+		t.Fatalf("XREADGROUP NOACK pending re-read = %v want empty", got)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XREADGROUP NOACK demoted to blob")
+	}
+}
+
+// TestStreamCollReadGroupBounded witnesses that an XREADGROUP > delivery on a large
+// coll stream allocates a window-bounded constant, not O(entries). Each run delivers
+// one fresh entry into the group (COUNT 1, advancing the group last ID) so the work
+// is one entry-row fetch plus one header-row write, never a whole-stream clone.
+func TestStreamCollReadGroupBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
+	d := newFuzzDispatcher(t)
+	conn := networking.NewOfflineConn()
+
+	const n = 4000
+	pad := make([]byte, 240)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	for i := 1; i <= n; i++ {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XADD"), []byte("s"),
+			[]byte(strconv.Itoa(i) + "-0"), []byte("f"), append([]byte("v"), pad...)})
+	}
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XGROUP"), []byte("CREATE"), []byte("s"), []byte("g"), []byte("0")})
+
+	// Each run delivers one new entry with > and COUNT 1: a bounded entry-row read
+	// plus a header-row write. A whole-stream clone would move about a megabyte.
+	allocs := testing.AllocsPerRun(200, func() {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("cons"),
+			[]byte("COUNT"), []byte("1"), []byte("STREAMS"), []byte("s"), []byte(">")})
+	})
+	if allocs > 500 {
+		t.Fatalf("XREADGROUP > on a %d-entry stream allocated %.0f objects per run; "+
+			"a bounded delivery should be a small constant, not O(n)", n, allocs)
+	}
+}
+
 // TestStreamCollGroupMetaBounded witnesses that the consumer-group metadata
 // commands on a large coll stream allocate a small constant, not O(entries). With
 // the groups in the header row and getStreamGroups/storeStreamGroups touching only
