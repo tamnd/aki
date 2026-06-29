@@ -3,6 +3,7 @@ package command
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"strconv"
 	"testing"
 
@@ -738,6 +739,217 @@ func TestStreamCollReadGroupBounded(t *testing.T) {
 	if allocs > 500 {
 		t.Fatalf("XREADGROUP > on a %d-entry stream allocated %.0f objects per run; "+
 			"a bounded delivery should be a small constant, not O(n)", n, allocs)
+	}
+}
+
+// TestStreamCollClaim drives XCLAIM over a coll-form stream: a plain claim moves a
+// pending entry between consumers and returns its body, JUSTID returns only the id,
+// FORCE claims an entry that exists but has no PEL record, and a claim of an entry
+// deleted from the stream drops it from the PEL instead of claiming it. Every entry
+// body is point-fetched from the entry rows, so the key must stay coll throughout.
+func TestStreamCollClaim(t *testing.T) {
+	r, c, eng := startDataEng(t)
+	const n = streamCollThreshold + 100
+	for i := 1; i <= n; i++ {
+		_ = bulk(t, r, c, fmt.Sprintf("XADD s %d-0 f v%d", i, i))
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("stream not coll after seeding %d", n)
+	}
+	if got := sendLine(t, r, c, "XGROUP CREATE s g 0"); got != "+OK" {
+		t.Fatalf("XGROUP CREATE = %q", got)
+	}
+	// Deliver the first ten entries into cons1's PEL.
+	xreadDrain(t, r, sendLine(t, r, c, "XREADGROUP GROUP g cons1 COUNT 10 STREAMS s >"))
+
+	// Plain claim: cons2 takes 1-0 and 2-0, with their bodies point-fetched.
+	got := xentries(t, r, c, "XCLAIM s g cons2 0 1-0 2-0")
+	want := [][]string{{"1-0", "f", "v1"}, {"2-0", "f", "v2"}}
+	if !sameEntries(got, want) {
+		t.Fatalf("XCLAIM = %v want %v", got, want)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XCLAIM demoted to blob")
+	}
+
+	// JUSTID: claim 3-0 and get back only the id.
+	if hdr := sendLine(t, r, c, "XCLAIM s g cons2 0 3-0 JUSTID"); hdr != "*1" {
+		t.Fatalf("XCLAIM JUSTID header = %q want *1", hdr)
+	}
+	if id := readBulkRaw(t, r); id != "3-0" {
+		t.Fatalf("XCLAIM JUSTID id = %q want 3-0", id)
+	}
+
+	// FORCE: 50-0 exists in the stream but was never delivered, so it has no PEL
+	// record. FORCE creates one and claims the entry with its body.
+	got = xentries(t, r, c, "XCLAIM s g cons2 0 50-0 FORCE")
+	want = [][]string{{"50-0", "f", "v50"}}
+	if !sameEntries(got, want) {
+		t.Fatalf("XCLAIM FORCE = %v want %v", got, want)
+	}
+
+	// A claim of an entry deleted from the stream drops it from the PEL rather than
+	// claiming it, so the reply is empty and the pending count falls. Ten entries
+	// were delivered and FORCE added one (50-0), so eleven are pending before the
+	// drop and ten after.
+	before := xpendingCount(t, r, c, "XPENDING s g")
+	if got := sendLine(t, r, c, "XDEL s 4-0"); got != ":1" {
+		t.Fatalf("XDEL 4-0 = %q want :1", got)
+	}
+	if hdr := sendLine(t, r, c, "XCLAIM s g cons2 0 4-0"); hdr != "*0" {
+		t.Fatalf("XCLAIM of deleted entry header = %q want *0", hdr)
+	}
+	after := xpendingCount(t, r, c, "XPENDING s g")
+	if before != 11 || after != 10 {
+		t.Fatalf("pending before/after deleted-entry claim = %d/%d want 11/10", before, after)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XCLAIM deleted-entry path demoted to blob")
+	}
+}
+
+// xpendingCount issues an XPENDING summary, reads the whole four-element reply, and
+// returns the total pending count. It drains the min/max ids and the per-consumer
+// pairs so the connection is left at a clean boundary.
+func xpendingCount(t *testing.T, r *bufio.Reader, c net.Conn, cmd string) int64 {
+	t.Helper()
+	hdr := sendLine(t, r, c, cmd)
+	if arrayLen(t, hdr) != 4 {
+		t.Fatalf("XPENDING summary header = %q want *4", hdr)
+	}
+	countLine := sendLineRead(t, r)
+	if countLine == "" || countLine[0] != ':' {
+		t.Fatalf("XPENDING count = %q want integer", countLine)
+	}
+	count, err := strconv.ParseInt(countLine[1:], 10, 64)
+	if err != nil {
+		t.Fatalf("XPENDING count parse %q: %v", countLine, err)
+	}
+	_, _ = readBulkRaw(t, r), readBulkRaw(t, r) // min id, max id
+	ch := sendLineRead(t, r)
+	if ch == "*-1" || ch == "_" {
+		return count
+	}
+	for range arrayLen(t, ch) {
+		if got := sendLineRead(t, r); got != "*2" {
+			t.Fatalf("XPENDING consumer pair header = %q want *2", got)
+		}
+		_, _ = readBulkRaw(t, r), readBulkRaw(t, r)
+	}
+	return count
+}
+
+// TestStreamCollAutoClaim drives XAUTOCLAIM over a coll-form stream: it claims the
+// idle pending entries from start, returns the next cursor, the claimed entries with
+// their bodies point-fetched from the entry rows, and the ids of entries that were
+// deleted from the stream while still pending. The key must stay coll throughout.
+func TestStreamCollAutoClaim(t *testing.T) {
+	r, c, eng := startDataEng(t)
+	const n = streamCollThreshold + 100
+	for i := 1; i <= n; i++ {
+		_ = bulk(t, r, c, fmt.Sprintf("XADD s %d-0 f v%d", i, i))
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("stream not coll after seeding %d", n)
+	}
+	if got := sendLine(t, r, c, "XGROUP CREATE s g 0"); got != "+OK" {
+		t.Fatalf("XGROUP CREATE = %q", got)
+	}
+	xreadDrain(t, r, sendLine(t, r, c, "XREADGROUP GROUP g cons1 COUNT 5 STREAMS s >"))
+	// Delete 2-0 from the stream while it is still pending: XAUTOCLAIM reports it in
+	// the deleted list and drops it from the PEL.
+	if got := sendLine(t, r, c, "XDEL s 2-0"); got != ":1" {
+		t.Fatalf("XDEL 2-0 = %q want :1", got)
+	}
+
+	cursor, claimed, deleted := xautoclaimReply(t, r, sendLine(t, r, c, "XAUTOCLAIM s g cons2 0 0"))
+	if cursor != "0-0" {
+		t.Fatalf("XAUTOCLAIM cursor = %q want 0-0 (scan complete)", cursor)
+	}
+	wantClaimed := [][]string{
+		{"1-0", "f", "v1"}, {"3-0", "f", "v3"}, {"4-0", "f", "v4"}, {"5-0", "f", "v5"},
+	}
+	if !sameEntries(claimed, wantClaimed) {
+		t.Fatalf("XAUTOCLAIM claimed = %v want %v", claimed, wantClaimed)
+	}
+	if len(deleted) != 1 || deleted[0] != "2-0" {
+		t.Fatalf("XAUTOCLAIM deleted = %v want [2-0]", deleted)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XAUTOCLAIM demoted to blob")
+	}
+	// The four survivors are now owned by cons2.
+	if pending := xpendingCount(t, r, c, "XPENDING s g"); pending != 4 {
+		t.Fatalf("XPENDING after autoclaim = %d want 4", pending)
+	}
+}
+
+// xautoclaimReply parses the three-element XAUTOCLAIM reply (RESP2) whose array
+// header has already been read into hdr: [cursor, entries, deleted-ids].
+func xautoclaimReply(t *testing.T, r *bufio.Reader, hdr string) (cursor string, claimed [][]string, deleted []string) {
+	t.Helper()
+	if arrayLen(t, hdr) != 3 {
+		t.Fatalf("XAUTOCLAIM header = %q want *3", hdr)
+	}
+	cursor = readBulkRaw(t, r)
+	eh := sendLineRead(t, r)
+	ne := arrayLen(t, eh)
+	for range ne {
+		if got := sendLineRead(t, r); got != "*2" {
+			t.Fatalf("XAUTOCLAIM entry header = %q want *2", got)
+		}
+		id := readBulkRaw(t, r)
+		fh := sendLineRead(t, r)
+		fn := arrayLen(t, fh)
+		row := []string{id}
+		for range fn {
+			row = append(row, readBulkRaw(t, r))
+		}
+		claimed = append(claimed, row)
+	}
+	dh := sendLineRead(t, r)
+	nd := arrayLen(t, dh)
+	for range nd {
+		deleted = append(deleted, readBulkRaw(t, r))
+	}
+	return cursor, claimed, deleted
+}
+
+// TestStreamCollClaimBounded witnesses that an XCLAIM on a large coll stream
+// allocates a window-bounded constant, not O(entries). Each run re-claims the same
+// single pending entry (min-idle 0, idempotent ownership), so the work is one
+// entry-row point fetch plus one header-row write, never a whole-stream clone.
+func TestStreamCollClaimBounded(t *testing.T) {
+	skipAllocWitnessUnderRace(t)
+	d := newFuzzDispatcher(t)
+	conn := networking.NewOfflineConn()
+
+	const n = 4000
+	pad := make([]byte, 240)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	for i := 1; i <= n; i++ {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XADD"), []byte("s"),
+			[]byte(strconv.Itoa(i) + "-0"), []byte("f"), append([]byte("v"), pad...)})
+	}
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XGROUP"), []byte("CREATE"), []byte("s"), []byte("g"), []byte("0")})
+	conn.ResetOut()
+	d.Handle(conn, [][]byte{[]byte("XREADGROUP"), []byte("GROUP"), []byte("g"), []byte("cons1"),
+		[]byte("COUNT"), []byte("1"), []byte("STREAMS"), []byte("s"), []byte(">")})
+
+	// Each run re-claims 1-0 to cons2: a bounded entry-row read plus a header-row
+	// write. A whole-stream clone would move about a megabyte.
+	allocs := testing.AllocsPerRun(200, func() {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XCLAIM"), []byte("s"), []byte("g"), []byte("cons2"),
+			[]byte("0"), []byte("1-0")})
+	})
+	if allocs > 500 {
+		t.Fatalf("XCLAIM on a %d-entry stream allocated %.0f objects per run; "+
+			"a bounded claim should be a small constant, not O(n)", n, allocs)
 	}
 }
 
