@@ -177,22 +177,8 @@ func handleSInterCard(ctx *Ctx) {
 		limit = int(l)
 	}
 
-	var (
-		wrongTyp bool
-		n        int64
-	)
-	if !ctx.view(func(db *keyspace.DB) error {
-		sets, wt, err := loadSets(db, keys)
-		if err != nil {
-			return err
-		}
-		if wt {
-			wrongTyp = true
-			return nil
-		}
-		n = int64(intersectCount(sets, limit))
-		return nil
-	}) {
+	n, wrongTyp, ok := sinterCardBounded(ctx, keys, limit)
+	if !ok {
 		return
 	}
 	if wrongTyp {
@@ -259,40 +245,6 @@ func intersect(sets [][][]byte) [][]byte {
 		}
 	}
 	return out
-}
-
-// intersectCount counts the intersection, stopping early once limit members are
-// counted when limit is greater than 0. Unlike intersect it never materializes
-// the result, so a SINTERCARD with a small LIMIT over huge sets returns as soon
-// as the limit is reached instead of walking the whole first set.
-func intersectCount(sets [][][]byte, limit int) int {
-	if len(sets) == 0 || len(sets[0]) == 0 {
-		return 0
-	}
-	others := make([]map[string]struct{}, len(sets)-1)
-	for i := 1; i < len(sets); i++ {
-		if len(sets[i]) == 0 {
-			return 0
-		}
-		others[i-1] = toMembership(sets[i])
-	}
-	count := 0
-	for _, m := range sets[0] {
-		inAll := true
-		for _, set := range others {
-			if _, ok := set[string(m)]; !ok {
-				inAll = false
-				break
-			}
-		}
-		if inAll {
-			count++
-			if limit > 0 && count >= limit {
-				return count
-			}
-		}
-	}
-	return count
 }
 
 // union returns the distinct members across all sets in first-seen order.
