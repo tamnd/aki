@@ -435,6 +435,141 @@ func zsetCollRevRangeByScore(db *keyspace.DB, key []byte, lo, hi scoreBound, lim
 	return out, err
 }
 
+// zsetCollRangeByLex walks a coll-form sorted set's member-index rows in ascending
+// member order and returns the members whose member bytes fall in [lo, hi], the
+// ZRANGEBYLEX shape (the command assumes every member shares one score, so member
+// byte order is the rank order). It seeks the member index straight to the low bound
+// and walks only the matching window, so a narrow lex band over a multi-million-member
+// set stays bounded instead of cloning the whole set. When countOnly is set it returns
+// the match count for ZLEXCOUNT without building the slice. limit applies the LIMIT
+// offset/count during the walk. The caller handles the reverse direction and the blob
+// form.
+func zsetCollRangeByLex(db *keyspace.DB, key []byte, lo, hi lexBound, limit bool, offset, count int64, countOnly bool) (out []zmember, n int64, err error) {
+	if limit && offset < 0 {
+		return nil, 0, nil
+	}
+	if lo.inf == 1 || hi.inf == -1 { // low is +inf or high is -inf: empty
+		return nil, 0, nil
+	}
+	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+		c := r.Cursor()
+		// Forward member-index walk over one lex band: the arena keeps page decoding to
+		// a small constant so a narrow ZRANGEBYLEX/ZLEXCOUNT over a multi-million-member
+		// set stays bounded instead of allocating per cell across every leaf it spans.
+		c.UseArena()
+		seek := []byte{zRowMember}
+		if lo.inf != -1 {
+			seek = zMemberRow(lo.value)
+		}
+		if e := c.Seek(seek); e != nil {
+			return e
+		}
+		skip := int64(0)
+		if limit {
+			skip = offset
+		}
+		for c.Valid() {
+			k := c.Key()
+			if len(k) == 0 || k[0] != zRowMember {
+				break
+			}
+			member := k[1:]
+			if !lexAfterLow(member, lo) { // low-edge exclusive skip
+				if e := c.Next(); e != nil {
+					return e
+				}
+				continue
+			}
+			if !lexBeforeHigh(member, hi) {
+				break
+			}
+			if countOnly {
+				n++
+			} else if skip > 0 {
+				skip--
+			} else {
+				m := append([]byte(nil), member...)
+				score := zScoreUnbits(encoding.U64BE(c.Value()))
+				out = append(out, zmember{member: m, score: score})
+				if limit && count >= 0 && int64(len(out)) >= count {
+					break
+				}
+			}
+			if e := c.Next(); e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	return out, n, err
+}
+
+// zsetCollRevRangeByLex is the reverse of zsetCollRangeByLex: it returns the members
+// in [lo, hi] in descending member order, the ZREVRANGEBYLEX shape. It seeks the
+// member index to the high bound with SeekForPrev and walks backward, so a reverse
+// lex band stays bounded. The caller has already resolved the reversed (max, min)
+// argument order into lo and hi.
+func zsetCollRevRangeByLex(db *keyspace.DB, key []byte, lo, hi lexBound, limit bool, offset, count int64) (out []zmember, err error) {
+	if limit && offset < 0 {
+		return nil, nil
+	}
+	if lo.inf == 1 || hi.inf == -1 {
+		return nil, nil
+	}
+	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
+		c := r.Cursor()
+		// Backward member-index walk over one lex band: the arena holds the root-to-leaf
+		// path live and grows only by the few nodes this reverse band touches, so a
+		// narrow ZREVRANGEBYLEX over a multi-million-member set stays bounded.
+		c.UseArena()
+		// For +inf the largest member row is the one just before the first score row
+		// ('s' 0x73), so SeekForPrev on the bare score prefix lands on it. Otherwise
+		// seek to the high member; SeekForPrev gives the largest member at or below it.
+		seek := []byte{zRowScore}
+		if hi.inf != 1 {
+			seek = zMemberRow(hi.value)
+		}
+		if e := c.SeekForPrev(seek); e != nil {
+			return e
+		}
+		skip := int64(0)
+		if limit {
+			skip = offset
+		}
+		for c.Valid() {
+			k := c.Key()
+			if len(k) == 0 || k[0] != zRowMember {
+				break
+			}
+			member := k[1:]
+			if !lexBeforeHigh(member, hi) { // high-edge exclusive skip
+				if e := c.Prev(); e != nil {
+					return e
+				}
+				continue
+			}
+			if !lexAfterLow(member, lo) {
+				break
+			}
+			if skip > 0 {
+				skip--
+			} else {
+				m := append([]byte(nil), member...)
+				score := zScoreUnbits(encoding.U64BE(c.Value()))
+				out = append(out, zmember{member: m, score: score})
+				if limit && count >= 0 && int64(len(out)) >= count {
+					break
+				}
+			}
+			if e := c.Prev(); e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	return out, err
+}
+
 // zsetMemberScores reads the scores of a specific handful of members without
 // materializing the whole sorted set. For a coll-form sorted set each member is a
 // point lookup on its member-index row, so a GEODIST/GEOPOS/GEOHASH against a
