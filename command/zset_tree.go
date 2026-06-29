@@ -719,26 +719,13 @@ func zsetCollRank(db *keyspace.DB, key, member []byte, rev bool) (rank int64, sc
 	return rank, score, found, err
 }
 
-// zsetCollRangeByRank returns the [start, stop] rank slice of a coll-form sorted set,
-// the ZRANGE and ZREVRANGE by-rank shape, walking only the requested window of the
-// score index. start and stop are the raw (possibly negative) index arguments. rev
-// selects ZREVRANGE, where rank 0 is the highest score. The walk seeks from whichever
-// end of the set is nearer to the window and skips with the cursor rather than cloning,
-// so a small slice off either end of a multi-million-member set stays O(window) in
-// allocation and never materializes the whole set. The materialize path it replaces
-// cloned every member to hand back a handful, an OOM under a tight cap.
-//
-// The btree carries no per-node subtree counts, so a window deep in the middle still
-// costs a skip proportional to its distance from the nearer end, but that skip moves
-// the cursor without allocating, so it is slow at worst, never an OOM.
 // streamZRangeByRank writes the [start, stop] rank slice of a coll-form sorted set
 // straight from the score-index cursor into the connection's encoder, the ZRANGE
-// and ZREVRANGE by-rank shape. It is the streaming twin of zsetCollRangeByRank:
-// where that clones the window into a []zmember the caller then writes (an O(n)
-// transient heap when the window is the whole set, the canonical ZRANGE key 0 -1
-// dump), this writes each member as the cursor reaches it and spills the buffer
-// mid-reply, so a full dump of a sorted set far larger than RAM holds only the
-// cursor pages plus the flush buffer.
+// and ZREVRANGE by-rank shape. start and stop are the raw (possibly negative) index
+// arguments; rev selects ZREVRANGE, where rank 0 is the highest score. Each member
+// is written as the cursor reaches it and the buffer spills mid-reply, so a full
+// dump of a sorted set far larger than RAM holds only the cursor pages plus the
+// flush buffer, never an O(n) clone of the window.
 //
 // A sorted set carries no per-element TTL, so the live count equals the resolved
 // window length and the reply header is known before the walk: no two-pass count.
@@ -868,110 +855,6 @@ func seekScoreIndex(c *keyspace.CollCursor, idx, card int64) error {
 		}
 	}
 	return nil
-}
-
-func zsetCollRangeByRank(db *keyspace.DB, key []byte, start, stop int64, rev bool) (out []zmember, err error) {
-	_, err = db.CollRead(key, func(r *keyspace.CollReader) error {
-		card := int64(r.Count())
-		// Resolve negative indices and clamp, the rankSlice rules, but in terms of the
-		// ascending score-index position regardless of direction.
-		s, e := start, stop
-		if s < 0 {
-			s += card
-		}
-		if e < 0 {
-			e += card
-		}
-		if s < 0 {
-			s = 0
-		}
-		if e >= card {
-			e = card - 1
-		}
-		if s > e || s >= card {
-			return nil
-		}
-		// Map the requested ranks to an ascending-index window [aLo, aHi]. For ZRANGE
-		// that is the window itself; for ZREVRANGE rank j is ascending index card-1-j,
-		// so the window flips and the output runs descending.
-		aLo, aHi := s, e
-		descending := false
-		if rev {
-			aLo, aHi = card-1-e, card-1-s
-			descending = true
-		}
-		count := aHi - aLo + 1
-		distFront := aLo
-		distBack := card - 1 - aHi
-
-		c := r.Cursor()
-		// Either direction decodes the requested window into the cursor's arena: a
-		// forward seek-and-skip resets it per leaf, a backward Last/Prev holds the
-		// root-to-leaf path live and grows by the few nodes the window touches. Both
-		// stay a small constant instead of allocating per cell across every leaf.
-		c.UseArena()
-		asc := make([]zmember, 0, count)
-		readRow := func() bool {
-			k := c.Key()
-			if len(k) == 0 || k[0] != zRowScore {
-				return false
-			}
-			score := zScoreUnbits(encoding.U64BE(k[1:9]))
-			member := append([]byte(nil), k[9:]...)
-			asc = append(asc, zmember{member: member, score: score})
-			return true
-		}
-		if distFront <= distBack {
-			// Seek the low end of the score index and skip forward to aLo.
-			if e := c.Seek([]byte{zRowScore}); e != nil {
-				return e
-			}
-			for i := int64(0); i < aLo && c.Valid(); i++ {
-				if e := c.Next(); e != nil {
-					return e
-				}
-			}
-			for int64(len(asc)) < count && c.Valid() {
-				if !readRow() {
-					break
-				}
-				if e := c.Next(); e != nil {
-					return e
-				}
-			}
-		} else {
-			// Seek the high end (Last lands on the top score row, since score rows sort
-			// after member rows) and skip backward past distBack rows.
-			if e := c.Last(); e != nil {
-				return e
-			}
-			for i := int64(0); i < distBack && c.Valid(); i++ {
-				if e := c.Prev(); e != nil {
-					return e
-				}
-			}
-			for int64(len(asc)) < count && c.Valid() {
-				if !readRow() {
-					break
-				}
-				if e := c.Prev(); e != nil {
-					return e
-				}
-			}
-			// Collected high-to-low; flip to ascending index order.
-			for i, j := 0, len(asc)-1; i < j; i, j = i+1, j-1 {
-				asc[i], asc[j] = asc[j], asc[i]
-			}
-		}
-		if descending {
-			for i, j := 0, len(asc)-1; i < j; i, j = i+1, j-1 {
-				asc[i], asc[j] = asc[j], asc[i]
-			}
-		}
-		out = asc
-		return nil
-	})
-	return out, err
 }
 
 // zsetMemberScores reads the scores of a specific handful of members without
