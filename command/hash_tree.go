@@ -158,6 +158,84 @@ func hashMaterialize(db *keyspace.DB, key []byte) (fields []hashField, hdr keysp
 	return dropExpiredFields(fields), hdr, true, nil
 }
 
+// hashRowExpiredAt reports whether a field ttl has passed as of now. A zero ttl
+// never expires. It takes the clock explicitly so a two-pass walk (count, then
+// emit) uses one instant for both passes and the live set cannot shift between
+// them.
+func hashRowExpiredAt(ttl, now int64) bool { return ttl != 0 && ttl <= now }
+
+// streamHashFull writes every live field of a btree-backed hash as a full reply,
+// straight from a sub-tree cursor into the connection's encoder. emitKeys and
+// emitVals pick HKEYS (keys), HVALS (vals), or HGETALL (both); asMap writes a map
+// header (HGETALL in RESP3) rather than a flat array. Per-field TTLs mean the
+// metadata count can include expired rows, so the live length is not known up
+// front: the walk runs twice under one read view, once to count the live fields
+// for the reply header and once to emit them, with one captured clock so the two
+// passes agree on the live set even if another connection mutates the hash during
+// the reply. Retained memory across the whole reply is the cursor pages plus the
+// flush buffer, never the field total, so HGETALL on a hash far larger than RAM
+// neither clones the hash onto the heap nor holds the whole reply in memory.
+func streamHashFull(ctx *Ctx, db *keyspace.DB, key []byte, emitKeys, emitVals, asMap bool) error {
+	enc := ctx.enc()
+	now := keyspace.NowMillis()
+	_, err := db.CollRead(key, func(r *keyspace.CollReader) error {
+		live := 0
+		cc := r.Cursor()
+		cc.UseArena()
+		if e := cc.First(); e != nil {
+			return e
+		}
+		for cc.Valid() {
+			ttl, _, de := hashRowDecode(cc.Value())
+			if de != nil {
+				return de
+			}
+			if !hashRowExpiredAt(ttl, now) {
+				live++
+			}
+			if e := cc.Next(); e != nil {
+				return e
+			}
+		}
+
+		if asMap {
+			enc.WriteMapLen(live)
+		} else {
+			enc.WriteArrayLen(live)
+		}
+
+		c := r.Cursor()
+		c.UseArena()
+		if e := c.First(); e != nil {
+			return e
+		}
+		for i := 0; c.Valid(); {
+			ttl, val, de := hashRowDecode(c.Value())
+			if de != nil {
+				return de
+			}
+			if !hashRowExpiredAt(ttl, now) {
+				if emitKeys {
+					enc.WriteBulkStreaming(c.Key())
+				}
+				if emitVals {
+					enc.WriteBulkStreaming(val)
+				}
+				if i++; i&streamFlushEvery == streamFlushEvery {
+					if e := ctx.Conn.StreamFlush(); e != nil {
+						return e
+					}
+				}
+			}
+			if e := c.Next(); e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	return err
+}
+
 // hashCollRandFields picks fields from a btree-backed hash for HRANDFIELD without
 // cloning the whole hash. A positive count gives that many distinct fields, capped
 // at the live field count; a negative count gives exactly its magnitude, with
