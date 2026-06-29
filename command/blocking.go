@@ -280,9 +280,10 @@ func blockPop(ctx *Ctx, head bool) {
 			emptied   bool
 			wrongTyp  bool
 		)
+		lim := ctx.encLimits()
 		done := ctx.update(func(d *keyspace.DB) error {
 			for _, key := range keys {
-				elems, hdr, found, err := getList(d, key)
+				hdr, found, err := listHeader(d, key)
 				if err != nil {
 					return err
 				}
@@ -293,24 +294,19 @@ func blockPop(ctx *Ctx, head bool) {
 					wrongTyp = true
 					return nil
 				}
-				if len(elems) == 0 {
-					continue
-				}
-				if head {
-					popped = elems[0]
-					elems = elems[1:]
-				} else {
-					popped = elems[len(elems)-1]
-					elems = elems[:len(elems)-1]
-				}
-				poppedKey = key
-				if len(elems) == 0 {
-					emptied = true
-					_, err := d.Delete(key)
+				// Pop one boundary element in place rather than cloning the list on
+				// each blocking attempt.
+				elem, e, err := listPopOne(d, key, hdr, head, lim)
+				if err != nil {
 					return err
 				}
-				return d.Set(key, listEncode(elems), keyspace.TypeList,
-					listEncoding(ctx.encLimits(), elems, hdr.Encoding), keepTTL(hdr, found))
+				if elem == nil {
+					continue
+				}
+				popped = elem
+				emptied = e
+				poppedKey = key
+				return nil
 			}
 			return nil
 		})
@@ -390,8 +386,9 @@ func blockMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool, timeout float64
 			wrongTyp   bool
 			ok         bool
 		)
+		lim := ctx.encLimits()
 		done := ctx.update(func(d *keyspace.DB) error {
-			srcElems, srcHdr, srcFound, err := getList(d, src)
+			srcHdr, srcFound, err := listHeader(d, src)
 			if err != nil {
 				return err
 			}
@@ -400,13 +397,10 @@ func blockMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool, timeout float64
 				return nil
 			}
 			sameKey := bytes.Equal(src, dst)
-			var (
-				dstElems [][]byte
-				dstHdr   keyspace.ValueHeader
-				dstFound bool
-			)
+			// Validate the destination type before touching src, and keep waiting
+			// (ok stays false) when src is absent or empty.
 			if !sameKey {
-				dstElems, dstHdr, dstFound, err = getList(d, dst)
+				dstHdr, dstFound, err := listHeader(d, dst)
 				if err != nil {
 					return err
 				}
@@ -415,37 +409,34 @@ func blockMove(ctx *Ctx, src, dst []byte, fromLeft, toLeft bool, timeout float64
 					return nil
 				}
 			}
-			if len(srcElems) == 0 {
+			if !srcFound {
 				return nil
 			}
-			var elem []byte
-			elem, srcElems = popEnd(srcElems, fromLeft)
-			moved = elem
-			ok = true
-
-			if sameKey {
-				srcElems = pushEnd(srcElems, elem, toLeft)
-				return d.Set(src, listEncode(srcElems), keyspace.TypeList,
-					listEncoding(ctx.encLimits(), srcElems, srcHdr.Encoding), keepTTL(srcHdr, srcFound))
-			}
-
-			if len(srcElems) == 0 {
-				srcEmptied = true
-				if _, err := d.Delete(src); err != nil {
-					return err
-				}
-			} else if err := d.Set(src, listEncode(srcElems), keyspace.TypeList,
-				listEncoding(ctx.encLimits(), srcElems, srcHdr.Encoding), keepTTL(srcHdr, srcFound)); err != nil {
+			// Pop one element from src in place and push it onto dst through the
+			// shared bounded push core, never cloning either list.
+			elem, emptied, err := listPopOne(d, src, srcHdr, fromLeft, lim)
+			if err != nil {
 				return err
 			}
-
-			dstElems = pushEnd(dstElems, elem, toLeft)
-			dstPrev := uint8(keyspace.EncListpack)
-			if dstFound {
-				dstPrev = dstHdr.Encoding
+			if elem == nil {
+				return nil
 			}
-			return d.Set(dst, listEncode(dstElems), keyspace.TypeList,
-				listEncoding(ctx.encLimits(), dstElems, dstPrev), keepTTL(dstHdr, dstFound))
+			moved = elem
+			ok = true
+			pushKey := dst
+			if sameKey {
+				pushKey = src
+			} else {
+				srcEmptied = emptied
+			}
+			r, err := applyListPush(d, pushKey, [][]byte{elem}, toLeft, false, lim)
+			if err != nil {
+				return err
+			}
+			if r.res == pushResWrongType {
+				wrongTyp = true
+			}
+			return nil
 		})
 		if !done {
 			return true
@@ -549,9 +540,10 @@ func handleBLMPop(ctx *Ctx) {
 			emptied   bool
 			wrongTyp  bool
 		)
+		lim := ctx.encLimits()
 		done := ctx.update(func(d *keyspace.DB) error {
 			for _, key := range keys {
-				elems, hdr, found, err := getList(d, key)
+				hdr, found, err := listHeader(d, key)
 				if err != nil {
 					return err
 				}
@@ -562,30 +554,19 @@ func handleBLMPop(ctx *Ctx) {
 					wrongTyp = true
 					return nil
 				}
-				if len(elems) == 0 {
-					continue
-				}
-				n := int(min(count, int64(len(elems))))
-				var leftover [][]byte
-				if fromLeft {
-					popped = elems[:n]
-					leftover = elems[n:]
-				} else {
-					tail := elems[len(elems)-n:]
-					popped = make([][]byte, n)
-					for i := range tail {
-						popped[i] = tail[n-1-i]
-					}
-					leftover = elems[:len(elems)-n]
-				}
-				poppedKey = key
-				if len(leftover) == 0 {
-					emptied = true
-					_, err := d.Delete(key)
+				// Pop up to count elements from this key's end in place, never
+				// cloning the whole list on a blocking attempt.
+				p, e, err := listPopN(d, key, hdr, count, fromLeft, lim)
+				if err != nil {
 					return err
 				}
-				return d.Set(key, listEncode(leftover), keyspace.TypeList,
-					listEncoding(ctx.encLimits(), leftover, hdr.Encoding), keepTTL(hdr, found))
+				if len(p) == 0 {
+					continue
+				}
+				popped = p
+				emptied = e
+				poppedKey = key
+				return nil
 			}
 			return nil
 		})
