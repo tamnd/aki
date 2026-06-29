@@ -170,6 +170,29 @@ func (e *Encoder) WriteBulkArray(items [][]byte) {
 	}
 }
 
+// WriteBulkStreaming writes one bulk string with the same wire bytes as
+// WriteBulkString, but when the sink is the connection's *bytes.Buffer it formats
+// the length header into a stack buffer instead of allocating a string per call.
+// A command that streams a large reply element by element (SMEMBERS on a
+// btree-backed set, where the whole reply is never held as a slice) calls it in a
+// loop, so the per-element cost is zero allocations rather than the strconv.Itoa
+// string WriteBulkString makes. It is the single-element analog of WriteBulkArray.
+// Any other Writer falls back to the plain path, so the wire bytes are identical.
+func (e *Encoder) WriteBulkStreaming(data []byte) {
+	buf, ok := e.w.(*bytes.Buffer)
+	if !ok {
+		e.WriteBulkString(data)
+		return
+	}
+	var hdr [24]byte
+	hdr[0] = '$'
+	h := strconv.AppendInt(hdr[:1], int64(len(data)), 10)
+	h = append(h, '\r', '\n')
+	_, _ = buf.Write(h)
+	_, _ = buf.Write(data)
+	_, _ = buf.WriteString("\r\n")
+}
+
 // WriteBulkStringStr is WriteBulkString for a Go string, avoiding a []byte
 // conversion on the caller's side.
 func (e *Encoder) WriteBulkStringStr(s string) {

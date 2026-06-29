@@ -287,18 +287,48 @@ func handleSRem(ctx *Ctx) {
 	ctx.enc().WriteInteger(removed)
 }
 
-// handleSMembers implements SMEMBERS: every member as a set reply.
+// handleSMembers implements SMEMBERS: every member as a set reply. A small set
+// (hot cache or blob form) is bounded by its promotion threshold, so it writes
+// from the decoded slice. A btree-backed set streams every member straight from
+// a sub-tree cursor into the reply, flushing to the socket in bounded chunks, so
+// SMEMBERS on a set far larger than RAM never clones the whole set onto the heap
+// and never holds the whole reply in memory at once.
 func handleSMembers(ctx *Ctx) {
 	key := ctx.Argv[1]
-	members, wrongTyp, ok := readSet(ctx, key)
-	if !ok {
-		return
-	}
-	if wrongTyp {
-		ctx.enc().WriteError(wrongTypeError)
+	if ms, hit := hotGetSet(ctx, key); hit {
+		writeSetMembers(ctx.enc(), ms)
 		return
 	}
 	enc := ctx.enc()
+	ctx.view(func(db *keyspace.DB) error {
+		body, hdr, found, err := db.Get(key)
+		if err != nil {
+			return err
+		}
+		if !found {
+			enc.WriteSetLen(0)
+			return nil
+		}
+		if hdr.Type != keyspace.TypeSet {
+			enc.WriteError(wrongTypeError)
+			return nil
+		}
+		if !hdr.IsColl() {
+			members, e := setDecode(body)
+			if e != nil {
+				return e
+			}
+			writeSetMembers(enc, members)
+			return nil
+		}
+		return streamSetMembers(ctx, db, key)
+	})
+}
+
+// writeSetMembers writes a decoded set slice as a set reply. The blob and hot
+// forms are bounded by the promotion threshold, so materializing them first is
+// cheap; the coll form streams instead (streamSetMembers).
+func writeSetMembers(enc *resp.Encoder, members [][]byte) {
 	enc.WriteSetLen(len(members))
 	for _, m := range members {
 		enc.WriteBulkString(m)
