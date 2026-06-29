@@ -465,6 +465,35 @@ func (c *Conn) fill() error {
 	return err
 }
 
+// streamFlushThreshold is the output-buffer size at which StreamFlush spills a
+// reply to the socket mid-command. It is high enough that small and medium
+// replies never trigger a partial write, they still leave in the single
+// per-pipeline flush, and low enough that a huge collection reply (every member
+// of a multi-million-element set) goes out in bounded chunks instead of being
+// held whole in memory.
+const streamFlushThreshold = 64 << 10
+
+// StreamFlush spills the buffered reply to the socket once it has grown past
+// streamFlushThreshold, so a command writing a very large reply can send it in
+// bounded chunks rather than holding the whole reply in memory until the
+// per-pipeline flush. A command that builds a reply element by element calls it
+// periodically; it is cheap when the buffer is still small. It is a no-op on an
+// offline connection (no socket to write to) and below the threshold, so the
+// common case keeps its single flush and offline replay still buffers in full.
+func (c *Conn) StreamFlush() error {
+	if c.raw == nil || c.outBuf.Len() < streamFlushThreshold {
+		return nil
+	}
+	c.writeMu.Lock()
+	n, err := c.raw.Write(c.outBuf.Bytes())
+	if n > 0 {
+		c.totNetOut += uint64(n)
+	}
+	c.writeMu.Unlock()
+	c.outBuf.Reset()
+	return err
+}
+
 // flush writes the buffered replies to the socket in one call and resets the
 // output buffer. A short or failed write ends the connection.
 func (c *Conn) flush() error {
