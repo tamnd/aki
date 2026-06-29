@@ -464,6 +464,23 @@ func (ctx *Ctx) runRange(key, minArg, maxArg []byte, spec rangeSpec) {
 			}
 			return err
 		}
+		// A coll-form by-rank range walks the score index from whichever end of the
+		// set is nearer to the requested window, skipping with the cursor instead of
+		// cloning. A top-N or bottom-N slice off a huge set stays O(window).
+		if found && hdr.IsColl() && !spec.byScore && !spec.byLex {
+			start, ok := parseInteger(minArg)
+			if !ok {
+				errStr = "ERR value is not an integer or out of range"
+				return nil
+			}
+			stop, ok := parseInteger(maxArg)
+			if !ok {
+				errStr = "ERR value is not an integer or out of range"
+				return nil
+			}
+			result, err = zsetCollRangeByRank(db, key, start, stop, spec.rev)
+			return err
+		}
 		// A coll-form lex range walks the member-index rows, which are ordered by
 		// member bytes, straight from the low (or high, reversed) bound. ZRANGEBYLEX
 		// walks forward, ZREVRANGEBYLEX (arg order key max min) walks backward.
