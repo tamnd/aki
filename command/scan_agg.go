@@ -93,13 +93,17 @@ func validScanCursor(c []byte) bool {
 }
 
 // scanCursorSeek decodes a coll-form SCAN cursor into the sub-key to seek to. The
-// "0" token (and any zero numeric token) starts the scan; any other token is the
+// "0" token (and an empty token) starts the scan; any other token is the
 // hex-encoded sub-key of the next unread row, as emitted by the previous page.
+//
+// The token is decoded as hex first, not parsed as a number. A continuation token
+// is hex of a non-empty sub-key, and that hex can read as all decimal digits, for
+// example a list position key or a set member like "12" whose row bytes encode to
+// "3132". Parsing the token as a number first would mistake such a token for a
+// numeric cursor and restart the scan, which loops forever across pages.
 func scanCursorSeek(c []byte) (seek []byte, start bool) {
-	if n, err := strconv.ParseUint(string(c), 10, 64); err == nil {
-		// A numeric token only ever legitimately arrives as the "0" start sentinel;
-		// our continuation tokens are hex of a non-empty sub-key.
-		return nil, n == 0
+	if len(c) == 0 || string(c) == "0" {
+		return nil, true
 	}
 	dec, err := hex.DecodeString(string(c))
 	if err != nil || len(dec) == 0 {
