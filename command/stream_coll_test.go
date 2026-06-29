@@ -707,6 +707,87 @@ func TestStreamCollPendingSummaryBounded(t *testing.T) {
 		t.Fatalf("XINFO CONSUMERS on a %d-entry pending list allocated %.0f objects per run; "+
 			"the per-consumer pending comes from the header counter, not a PEL load", n, consumers)
 	}
+	// XPENDING extended with a small COUNT seeks to the range start and walks only
+	// the returned window, so it stays a small constant even over the large PEL.
+	ext := testing.AllocsPerRun(200, func() {
+		conn.ResetOut()
+		d.Handle(conn, [][]byte{[]byte("XPENDING"), []byte("s"), []byte("g"),
+			[]byte("-"), []byte("+"), []byte("10")})
+	})
+	if ext > 1500 {
+		t.Fatalf("XPENDING extended COUNT 10 on a %d-entry pending list allocated %.0f objects per run; "+
+			"the cursor should seek the range start and walk only the COUNT window, not the whole PEL", n, ext)
+	}
+}
+
+// TestStreamCollGroupDestroyBounded checks XGROUP DESTROY over a coll-form stream
+// with a large never-ack PEL: it edits the header and prefix-deletes the destroyed
+// group's 0x02 rows, leaving the stream coll, the entries intact, and a second
+// group's pending list untouched.
+func TestStreamCollGroupDestroyBounded(t *testing.T) {
+	r, c, eng := startDataEng(t)
+	const n = streamCollThreshold + 200
+	for i := 1; i <= n; i++ {
+		_ = bulk(t, r, c, fmt.Sprintf("XADD s %d-0 f v%d", i, i))
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("stream not in coll form after %d entries", n)
+	}
+	if got := sendLine(t, r, c, "XGROUP CREATE s g1 0"); got != "+OK" {
+		t.Fatalf("XGROUP CREATE g1 = %q", got)
+	}
+	if got := sendLine(t, r, c, "XGROUP CREATE s g2 0"); got != "+OK" {
+		t.Fatalf("XGROUP CREATE g2 = %q", got)
+	}
+	// Both groups read every entry with no ack, so each carries an n-entry PEL.
+	xreadDrain(t, r, sendLine(t, r, c, fmt.Sprintf("XREADGROUP GROUP g1 c1 COUNT %d STREAMS s >", n)))
+	xreadDrain(t, r, sendLine(t, r, c, fmt.Sprintf("XREADGROUP GROUP g2 c2 COUNT %d STREAMS s >", n)))
+
+	if got := sendLine(t, r, c, "XGROUP DESTROY s g1"); got != ":1" {
+		t.Fatalf("XGROUP DESTROY g1 = %q want :1", got)
+	}
+	if !streamIsColl(t, eng, "s") {
+		t.Fatalf("XGROUP DESTROY demoted the stream to blob")
+	}
+	// g1 is gone; g2 still has its full pending list.
+	if got := sendLine(t, r, c, "XGROUP DESTROY s g1"); got != ":0" {
+		t.Fatalf("second XGROUP DESTROY g1 = %q want :0", got)
+	}
+	if got := sendLine(t, r, c, "XLEN s"); got != fmt.Sprintf(":%d", n) {
+		t.Fatalf("XLEN after destroy = %q want :%d", got, n)
+	}
+	if got := xpendingSummaryCount(t, r, c, "s", "g2"); got != int64(n) {
+		t.Fatalf("g2 pending after destroying g1 = %d want %d", got, n)
+	}
+}
+
+// xpendingSummaryCount sends XPENDING key group and returns the leading total.
+func xpendingSummaryCount(t *testing.T, r *bufio.Reader, c net.Conn, key, group string) int64 {
+	t.Helper()
+	hdr := sendLine(t, r, c, fmt.Sprintf("XPENDING %s %s", key, group))
+	if hdr != "*4" {
+		t.Fatalf("XPENDING summary header = %q want *4", hdr)
+	}
+	total := sendLineRead(t, r)
+	// Drain the remaining three elements (min, max, per-consumer array).
+	_ = readBulkRaw(t, r)
+	_ = readBulkRaw(t, r)
+	ch := sendLineRead(t, r)
+	for range arrayLen(t, ch) {
+		if got := sendLineRead(t, r); got != "*2" {
+			t.Fatalf("XPENDING consumer pair header = %q want *2", got)
+		}
+		_ = readBulkRaw(t, r)
+		_ = readBulkRaw(t, r)
+	}
+	if len(total) == 0 || total[0] != ':' {
+		t.Fatalf("XPENDING total = %q want integer", total)
+	}
+	v, err := strconv.ParseInt(total[1:], 10, 64)
+	if err != nil {
+		t.Fatalf("XPENDING total parse %q: %v", total, err)
+	}
+	return v
 }
 
 // TestStreamCollGroupsMetadata drives the slice-3a consumer-group metadata

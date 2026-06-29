@@ -535,6 +535,55 @@ func streamCollDelConsumer(db *keyspace.DB, key []byte, group, consumer string) 
 	return removed, err
 }
 
+// streamCollDestroyGroup removes one group from the header and deletes that group's
+// PEL rows in a single prefix scan of its 0x02 rows, reporting whether the group
+// existed. The cost is the destroyed group's pending size, never the entry log; a
+// group with nothing pending costs one seek. The caller has confirmed the key is a
+// coll stream. The other groups' rows are untouched (their prefixes differ).
+func streamCollDestroyGroup(db *keyspace.DB, key []byte, group string) (bool, error) {
+	var existed bool
+	err := db.CollUpdate(key, keyspace.TypeStream, keyspace.EncStream, func(w *keyspace.CollWriter) error {
+		hv, ok, e := w.Get([]byte{streamRowHeader})
+		if e != nil || !ok {
+			return e
+		}
+		s := &stream{}
+		if e := streamReadHeader(s, hv); e != nil {
+			return e
+		}
+		if !s.removeGroup(group) {
+			return nil
+		}
+		existed = true
+		prefix := streamPELPrefix(group)
+		var keys [][]byte
+		cur := w.Cursor()
+		if e := cur.Seek(prefix); e != nil {
+			return e
+		}
+		for cur.Valid() {
+			k := cur.Key()
+			if !bytes.HasPrefix(k, prefix) {
+				break
+			}
+			keys = append(keys, append([]byte(nil), k...))
+			if e := cur.Next(); e != nil {
+				return e
+			}
+		}
+		for _, k := range keys {
+			if _, e := w.Delete(k); e != nil {
+				return e
+			}
+		}
+		if _, e := w.Put([]byte{streamRowHeader}, streamHeaderValue(s)); e != nil {
+			return e
+		}
+		return nil
+	})
+	return existed, err
+}
+
 // streamHeader probes the value header at key without decoding the body, so a
 // command can route to the blob path or the sub-tree path. found is false for a
 // missing key.
