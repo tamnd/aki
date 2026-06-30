@@ -144,6 +144,11 @@ const noSibling = format.NullPage
 // out of the tree and store a reference instead.
 var ErrCellTooLarge = errors.New("aki/btree: entry too large for a page")
 
+// ErrNotOrderStat is returned by Rank and SelectAt on a tree that was not opened
+// order-statistic, since a plain tree carries no per-child subtree counts to
+// descend by.
+var ErrNotOrderStat = errors.New("aki/btree: tree is not order-statistic")
+
 // Tree is a B-tree rooted at a single page. The root page number changes when
 // the root splits, so callers that persist the root must read Root after a
 // mutation and store the new value.
@@ -632,6 +637,129 @@ func descendOnPage(b, key []byte) (ci int, child uint32, err error) {
 	}
 	off := int(encoding.U16(b[slotsStart+2*pos:]))
 	return pos, encoding.U32(b[off:]), nil
+}
+
+// childCount returns the stored subtree row count for child slot j on the
+// augmented interior page b. count is the page's cell count: a slot j < count
+// names a cell, whose count sits just past the four-byte child pointer, while
+// j >= count names the rightmost child, whose count lives in the per-type header
+// at byte 20. The page must carry the order-stat flag, so a caller reads exact
+// counts only off a tree it opened order-stat.
+func childCount(b []byte, j, count int) uint32 {
+	if j >= count {
+		return encoding.U32(b[20:])
+	}
+	off := int(encoding.U16(b[slotsStart+2*j:]))
+	return encoding.U32(b[off+4:])
+}
+
+// Rank returns the number of keys in the tree strictly less than key (its 0-based
+// position in sort order) and whether key itself is present. It descends root to
+// leaf summing the subtree counts of every child left of the one it follows, so it
+// runs in O(log n) rather than the O(rank) of a counting scan. The tree must be
+// order-statistic.
+func (t *Tree) Rank(key []byte) (uint64, bool, error) {
+	if !t.orderStat {
+		return 0, false, ErrNotOrderStat
+	}
+	pgno := t.root
+	var rank uint64
+	for depth := 0; ; depth++ {
+		if depth > maxDepth {
+			return 0, false, fmt.Errorf("aki/btree: rank deeper than %d levels", maxDepth)
+		}
+		pg, err := t.pgr.Get(pgno)
+		if err != nil {
+			return 0, false, err
+		}
+		b := pg.Data
+		count := int(encoding.U16(b[2:]))
+		if b[0] == format.PageTypeBTreeLeaf {
+			pos, found := searchSlots(b, count, 0, key)
+			t.pgr.Unpin(pg, false)
+			return rank + uint64(pos), found, nil
+		}
+		// Interior page on an order-stat tree is always augmented, so its key prefix
+		// is 8 and every child carries a count. Add the counts of all children left
+		// of the followed child, then descend.
+		pos, found := searchSlots(b, count, 8, key)
+		if found {
+			pos++
+		}
+		for j := 0; j < pos; j++ {
+			rank += uint64(childCount(b, j, count))
+		}
+		var child uint32
+		if pos >= count {
+			child = encoding.U32(b[16:])
+		} else {
+			off := int(encoding.U16(b[slotsStart+2*pos:]))
+			child = encoding.U32(b[off:])
+		}
+		t.pgr.Unpin(pg, false)
+		pgno = child
+	}
+}
+
+// SelectAt returns a heap-owned copy of the key at 0-based rank i (the i-th
+// smallest key). It descends root to leaf, at each interior level subtracting
+// child subtree counts until i falls inside a child, so it runs in O(log n). It
+// reports ok=false when i is past the last key. The tree must be order-statistic.
+func (t *Tree) SelectAt(i uint64) ([]byte, bool, error) {
+	if !t.orderStat {
+		return nil, false, ErrNotOrderStat
+	}
+	pgno := t.root
+	for depth := 0; ; depth++ {
+		if depth > maxDepth {
+			return nil, false, fmt.Errorf("aki/btree: select deeper than %d levels", maxDepth)
+		}
+		pg, err := t.pgr.Get(pgno)
+		if err != nil {
+			return nil, false, err
+		}
+		b := pg.Data
+		count := int(encoding.U16(b[2:]))
+		if b[0] == format.PageTypeBTreeLeaf {
+			if i >= uint64(count) {
+				t.pgr.Unpin(pg, false)
+				return nil, false, nil
+			}
+			off := int(encoding.U16(b[slotsStart+2*i:]))
+			kl, m, derr := encoding.Uvarint(b[off:])
+			if derr != nil {
+				t.pgr.Unpin(pg, false)
+				return nil, false, derr
+			}
+			key := append([]byte(nil), b[off+m:off+m+int(kl)]...)
+			t.pgr.Unpin(pg, false)
+			return key, true, nil
+		}
+		// Walk children left to right, charging each child's whole subtree against i
+		// until i lands inside one. Running off the cell children means i sits in the
+		// rightmost child, bounded by its header count.
+		j := 0
+		for ; j < count; j++ {
+			c := uint64(childCount(b, j, count))
+			if i < c {
+				break
+			}
+			i -= c
+		}
+		var child uint32
+		if j >= count {
+			if i >= uint64(childCount(b, count, count)) {
+				t.pgr.Unpin(pg, false)
+				return nil, false, nil
+			}
+			child = encoding.U32(b[16:])
+		} else {
+			off := int(encoding.U16(b[slotsStart+2*j:]))
+			child = encoding.U32(b[off:])
+		}
+		t.pgr.Unpin(pg, false)
+		pgno = child
+	}
 }
 
 // leafLookup finds key on the leaf page b and returns a heap-owned copy of its

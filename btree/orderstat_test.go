@@ -289,6 +289,103 @@ func TestOrderStatPlainTreeUnaffected(t *testing.T) {
 	}
 }
 
+// TestOrderStatRankSelectRoundTrip inserts a few thousand keys, then checks Rank
+// and SelectAt against the known sorted order: SelectAt(i) returns the i-th key,
+// Rank of that key returns i and reports present, and the two are inverses across
+// the whole tree. It also checks the boundary cases (rank of a key below all keys
+// is 0, of a key above all keys is the cardinality, and SelectAt past the end
+// misses).
+func TestOrderStatRankSelectRoundTrip(t *testing.T) {
+	tr, _ := newOrderStatTree(t)
+	rng := rand.New(rand.NewSource(0x5e1ec7))
+	const n = 4000
+	for _, i := range rng.Perm(n) {
+		if err := tr.Put(wideKey(i), []byte("v")); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	verifyCounts(t, tr, n)
+
+	// wideKey is constructed so ascending i gives ascending key bytes, so rank i is
+	// exactly the key built from i.
+	for i := range n {
+		got, ok, err := tr.SelectAt(uint64(i))
+		if err != nil || !ok {
+			t.Fatalf("selectAt %d: ok %v err %v", i, ok, err)
+		}
+		want := wideKey(i)
+		if string(got) != string(want) {
+			t.Fatalf("selectAt %d = %q, want %q", i, got, want)
+		}
+		rank, present, err := tr.Rank(want)
+		if err != nil || !present {
+			t.Fatalf("rank of key %d: present %v err %v", i, present, err)
+		}
+		if rank != uint64(i) {
+			t.Fatalf("rank of key %d = %d, want %d", i, rank, i)
+		}
+	}
+
+	// A key below every stored key ranks 0; a key above every stored key ranks n.
+	low := []byte("a")
+	if r, present, err := tr.Rank(low); err != nil || present || r != 0 {
+		t.Fatalf("rank of below-all key: r %d present %v err %v", r, present, err)
+	}
+	high := []byte("z")
+	if r, present, err := tr.Rank(high); err != nil || present || r != uint64(n) {
+		t.Fatalf("rank of above-all key: r %d present %v err %v", r, present, err)
+	}
+	if _, ok, err := tr.SelectAt(uint64(n)); err != nil || ok {
+		t.Fatalf("selectAt past end: ok %v err %v", ok, err)
+	}
+}
+
+// TestOrderStatRankAbsentKey checks Rank reports not-present for a key that falls
+// between two stored keys but still returns the correct rank (the number of keys
+// strictly below it).
+func TestOrderStatRankAbsentKey(t *testing.T) {
+	tr, _ := newOrderStatTree(t)
+	const n = 2000
+	// Insert even indices only, so odd-index keys are absent but land between two
+	// present keys.
+	for i := 0; i < 2*n; i += 2 {
+		if err := tr.Put(wideKey(i), []byte("v")); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	verifyCounts(t, tr, n)
+
+	for k := range n {
+		absent := wideKey(2*k + 1) // sits just above the k-th present key (index 2k)
+		rank, present, err := tr.Rank(absent)
+		if err != nil {
+			t.Fatalf("rank absent %d: %v", k, err)
+		}
+		if present {
+			t.Fatalf("rank reported absent key %d present", k)
+		}
+		// Keys 0,2,...,2k are below it: that is k+1 keys.
+		if rank != uint64(k+1) {
+			t.Fatalf("rank of absent key above present %d = %d, want %d", k, rank, k+1)
+		}
+	}
+}
+
+// TestOrderStatRankSelectPlainTreeRejected pins that Rank and SelectAt refuse a
+// plain tree, since it carries no counts to descend by.
+func TestOrderStatRankSelectPlainTreeRejected(t *testing.T) {
+	tr, _ := newTree(t, 4096)
+	if err := tr.Put(wideKey(1), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if _, _, err := tr.Rank(wideKey(1)); err != ErrNotOrderStat {
+		t.Fatalf("Rank on plain tree: err %v, want ErrNotOrderStat", err)
+	}
+	if _, _, err := tr.SelectAt(0); err != ErrNotOrderStat {
+		t.Fatalf("SelectAt on plain tree: err %v, want ErrNotOrderStat", err)
+	}
+}
+
 func assertNoCounts(t *testing.T, tr *Tree, pgno uint32, depth int) {
 	t.Helper()
 	if depth > maxDepth {
