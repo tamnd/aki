@@ -274,6 +274,16 @@ type DB struct {
 	newHL  func() (hlEngine, error)
 	hlOnce sync.Once
 	hl     atomic.Pointer[hlBox]
+
+	// hotAcc is the hot engine when this database runs WithHotEngine, set alongside
+	// hl the first time the engine is built. It is the concrete type rather than the
+	// hlEngine seam because the access-word path is hot-engine-specific: the engine
+	// updates a key's LRU/LFU word in place on every read and write, so the hot
+	// string path skips recordAccess and its global accessMu+map entirely, and the
+	// introspection readers (Idle, Freq, accessMetrics, SetIdle, SetFreq) read and
+	// write the word off the record. nil for the B-tree and store/ engines, which
+	// have no in-memory record to hang the word on and keep using the side map.
+	hotAcc atomic.Pointer[hot.Store]
 }
 
 // wbPendingEntry is one entry in the write-behind pending table. It carries
@@ -848,10 +858,11 @@ func (db *DB) Peek(key []byte) (body []byte, hdr ValueHeader, found bool, err er
 // value from the overlay or B-tree instead, so it is never a correctness gap.
 func (db *DB) GetUncached(key []byte) (body []byte, hdr ValueHeader, found bool, err error) {
 	if db.newHL != nil {
-		body, hdr, found, err = db.hlGet(key)
-		if found {
-			// Mirror the btree read path's recordAccess so OBJECT FREQ and the LFU
-			// eviction sampler see the read on the hybrid engine too.
+		body, hdr, found, err = db.hlGetTouch(key)
+		if found && db.hotAcc.Load() == nil {
+			// The store/ engine has no inline access word, so mirror the btree read
+			// path's recordAccess to feed OBJECT FREQ and the LFU eviction sampler. The
+			// hot engine already bumped its word inside hlGetTouch, so it is skipped.
 			db.recordAccess(key, false)
 		}
 		return body, hdr, found, err
@@ -865,10 +876,15 @@ func (db *DB) GetUncached(key []byte) (body []byte, hdr ValueHeader, found bool,
 // function is safe to call concurrently with writes on other shards.
 func (db *DB) get(key []byte, touch bool) (body []byte, hdr ValueHeader, found bool, err error) {
 	if db.newHL != nil {
-		body, hdr, found, err = db.hlGet(key)
-		if found && touch {
-			// Mirror getProbe's touch-time recordAccess so the hybrid read path feeds
-			// the LFU bookkeeping the same way the btree path does.
+		if !touch {
+			// Peek path: no access recorded, so a pure read that does not bump recency
+			// or frequency. This keeps OBJECT/EXISTS from resetting a key's idle time.
+			return db.hlGet(key)
+		}
+		body, hdr, found, err = db.hlGetTouch(key)
+		if found && db.hotAcc.Load() == nil {
+			// store/ engine has no inline word: feed db.access as the btree path does.
+			// The hot engine bumped its word inside hlGetTouch, so it is skipped.
 			db.recordAccess(key, false)
 		}
 		return body, hdr, found, err

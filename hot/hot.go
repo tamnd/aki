@@ -99,6 +99,19 @@ type entry struct {
 	ilen   uint32 // bytes used in inline when kv is nil
 	inline [inlineCap]byte
 	kv     []byte // non-nil only when key+value exceeds inlineCap
+
+	// acc is the one mutable field on an otherwise immutable entry: a racy access
+	// word the keyspace packs its LRU recency and LFU frequency into (atime,
+	// decay-minute, counter), updated in place on every read and write. It is the
+	// F2/Redis principle that per-record metadata lives in the record, not in a
+	// side structure under a lock, so a hit bumps the counter on the entry already
+	// in hand with one atomic store and no second lookup. It is explicitly
+	// approximate: a torn or lost update to an eviction counter is the same
+	// semantics Redis's sampled LRU/LFU already tolerates, so it does not need to
+	// stay consistent with the value bytes the lock-free read depends on, which
+	// remain immutable. The atomic's noCopy is why an entry is only ever handled by
+	// pointer and never copied by value.
+	acc atomic.Uint64
 }
 
 // data returns the full key+value backing, from the inline array or the heap
@@ -143,6 +156,15 @@ type shard struct {
 	bytes int // approximate resident bytes of live entries, guarded by mu
 }
 
+// AccessFunc computes the next value of an entry's access word from its current
+// value. isNew is true for the first write of a key (seed the counter) and false
+// for a read or an overwrite (decay then bump). It is injected by the keyspace
+// through SetAccessPolicy so the LFU policy stays in the keyspace and only its
+// execution rides into the engine, on the entry the operation already holds. A nil
+// policy means the engine does not track access at all, which is the store/-engine
+// and untuned case.
+type AccessFunc func(old uint64, isNew bool) uint64
+
 // Store is the hot-tier engine. It is safe for concurrent use: the shard for a
 // key is fixed by the key's hash, reads take no lock, and writers take only the
 // owning shard's mutex.
@@ -150,7 +172,19 @@ type Store struct {
 	shards []*shard
 	mask   uint64
 	t      Tunables
+
+	// access, when non-nil, is applied in place to an entry's access word on every
+	// read and write so the keyspace's recency and frequency bookkeeping happens on
+	// the record itself, with no global lock and no side map. It is set once via
+	// SetAccessPolicy before the store is published to readers and never changed, so
+	// a plain field needs no synchronisation.
+	access AccessFunc
 }
+
+// SetAccessPolicy installs the access-word policy the engine applies on reads and
+// writes. The keyspace calls it once, right after New and before the store is
+// visible to any reader, so the field is set before any concurrent access.
+func (s *Store) SetAccessPolicy(f AccessFunc) { s.access = f }
 
 // New builds a Store. It returns an error only for invalid tunables.
 func New(t Tunables) (*Store, error) {
@@ -186,7 +220,7 @@ func (s *Store) shardFor(h uint64) *shard {
 // so the caller may reuse both slices after Set returns.
 func (s *Store) Set(key, value []byte) error {
 	h := hash64(key)
-	s.shardFor(h).set(key, value, h)
+	s.shardFor(h).set(key, value, h, s.access)
 	return nil
 }
 
@@ -195,7 +229,7 @@ func (s *Store) Set(key, value []byte) error {
 // overwrite without a second probe.
 func (s *Store) SetWithPrev(key, value []byte) (prevValLen int, err error) {
 	h := hash64(key)
-	return s.shardFor(h).set(key, value, h), nil
+	return s.shardFor(h).set(key, value, h, s.access), nil
 }
 
 // SetWithPrev2 is SetWithPrev for a value supplied as two segments stored back to
@@ -208,7 +242,7 @@ func (s *Store) SetWithPrev2(key, v0, v1 []byte) (prevValLen int, err error) {
 	copy(buf, v0)
 	copy(buf[len(v0):], v1)
 	h := hash64(key)
-	return s.shardFor(h).set(key, buf, h), nil
+	return s.shardFor(h).set(key, buf, h, s.access), nil
 }
 
 // Get returns the value stored under key. found is false if the key is absent.
@@ -219,6 +253,63 @@ func (s *Store) Get(key []byte) (value []byte, found bool, err error) {
 	h := hash64(key)
 	v, ok := s.shardFor(h).get(key, h)
 	return v, ok, nil
+}
+
+// GetTouch is Get that also updates the entry's access word in place through the
+// installed policy, so a read records its own recency and frequency on the record
+// it just found, with no lock and no second lookup. It is the read path the
+// keyspace uses for a touching GET; Get stays a pure read for the no-touch path
+// (OBJECT, EXISTS) that must not reset idle time. With no policy installed it is
+// exactly Get.
+func (s *Store) GetTouch(key []byte) (value []byte, found bool, err error) {
+	h := hash64(key)
+	v, ok := s.shardFor(h).getTouch(key, h, s.access)
+	return v, ok, nil
+}
+
+// AccessWord returns the entry's current access word and whether the key is
+// present. It is a lock-free read, the same atomic-load probe as get, so the
+// keyspace can answer OBJECT IDLETIME and OBJECT FREQ and feed the eviction
+// sampler straight off the record without a side map or a lock.
+func (s *Store) AccessWord(key []byte) (uint64, bool) {
+	h := hash64(key)
+	sh := s.shardFor(h)
+	t := sh.table.Load()
+	i := h & t.mask
+	for {
+		e := t.slots[i].e.Load()
+		if e == nil {
+			return 0, false
+		}
+		if e != tombstone && e.hash == h && string(e.key()) == string(key) {
+			return e.acc.Load(), true
+		}
+		i = (i + 1) & t.mask
+	}
+}
+
+// SetAccessWord overwrites the entry's access word, returning whether the key was
+// present. RESTORE uses it to reconstruct the LRU clock and LFU counter of a dumped
+// key. It takes the shard write lock so it does not race a concurrent grow that is
+// republishing the table, then stores into the entry's mutable access word.
+func (s *Store) SetAccessWord(key []byte, w uint64) bool {
+	h := hash64(key)
+	sh := s.shardFor(h)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	t := sh.table.Load()
+	i := h & t.mask
+	for {
+		e := t.slots[i].e.Load()
+		if e == nil {
+			return false
+		}
+		if e != tombstone && e.hash == h && string(e.key()) == string(key) {
+			e.acc.Store(w)
+			return true
+		}
+		i = (i + 1) & t.mask
+	}
 }
 
 // Delete removes key, returning whether it was present.
@@ -274,7 +365,7 @@ func (s *Store) IndexBytes() int {
 
 // set inserts or overwrites key. It returns the previous value length, or -1 for
 // a new key. Held under the shard mutex; readers run lock-free throughout.
-func (sh *shard) set(key, value []byte, h uint64) int {
+func (sh *shard) set(key, value []byte, h uint64, access AccessFunc) int {
 	sh.mu.Lock()
 	t := sh.table.Load()
 	// Grow before the table fills so a probe always meets an empty slot, which is
@@ -289,6 +380,9 @@ func (sh *shard) set(key, value []byte, h uint64) int {
 		e := t.slots[i].e.Load()
 		if e == nil {
 			ne := newEntry(h, key, value)
+			if access != nil {
+				ne.acc.Store(access(0, true)) // new key: seed the access word
+			}
 			if firstTomb >= 0 {
 				t.slots[firstTomb].e.Store(ne)
 				sh.tomb--
@@ -309,6 +403,12 @@ func (sh *shard) set(key, value []byte, h uint64) int {
 		}
 		if e.hash == h && string(e.key()) == string(key) {
 			ne := newEntry(h, key, value)
+			if access != nil {
+				// Overwrite is an access: carry the old word forward and bump it, so a
+				// rewritten key keeps its recency and frequency the same way Redis bumps
+				// LFU on lookupKeyWrite.
+				ne.acc.Store(access(e.acc.Load(), false))
+			}
 			prev := len(e.val())
 			t.slots[i].e.Store(ne) // publish the new entry; the old one is now garbage
 			sh.bytes += len(ne.data()) - len(e.data())
@@ -330,6 +430,34 @@ func (sh *shard) get(key []byte, h uint64) ([]byte, bool) {
 			return nil, false
 		}
 		if e != tombstone && e.hash == h && string(e.key()) == string(key) {
+			return e.val(), true
+		}
+		i = (i + 1) & t.mask
+	}
+}
+
+// getTouch is get that also bumps the found entry's access word in place. The
+// store is skipped when the policy returns the word unchanged, which is the common
+// case for a key already accessed this same coarse second whose probabilistic LFU
+// bump did not fire, so a steady stream of reads to the same key does not keep
+// dirtying its cache line. The read itself stays lock-free; the access word is an
+// independent atomic so storing it never disturbs the immutable value bytes the
+// reader returns.
+func (sh *shard) getTouch(key []byte, h uint64, access AccessFunc) ([]byte, bool) {
+	t := sh.table.Load()
+	i := h & t.mask
+	for {
+		e := t.slots[i].e.Load()
+		if e == nil {
+			return nil, false
+		}
+		if e != tombstone && e.hash == h && string(e.key()) == string(key) {
+			if access != nil {
+				old := e.acc.Load()
+				if nw := access(old, false); nw != old {
+					e.acc.Store(nw)
+				}
+			}
 			return e.val(), true
 		}
 		i = (i + 1) & t.mask

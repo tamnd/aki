@@ -76,6 +76,15 @@ func (db *DB) ensureHL() (hlEngine, error) {
 			buildErr = err
 			return
 		}
+		// The hot engine carries each key's LRU/LFU word inline on its entry, so it
+		// updates recency and frequency in place on every read and write with no lock
+		// and no side map. Install the policy and record the concrete engine so the
+		// string hot path skips recordAccess and the introspection readers go to the
+		// word. The store/ engine has no such word and keeps using db.access.
+		if hs, ok := e.(*hot.Store); ok {
+			hs.SetAccessPolicy(db.hotAccessUpdate)
+			db.hotAcc.Store(hs)
+		}
 		db.hl.Store(&hlBox{e: e})
 	})
 	if buildErr != nil {
@@ -149,7 +158,13 @@ func (db *DB) hlAccountStore(key []byte, bodyLen, prevValLen int) {
 		db.ks.dataBytes.Add(-hlEntryBytes(len(key), prevValLen-HeaderSize))
 	}
 	db.ks.dataBytes.Add(hlEntryBytes(len(key), bodyLen))
-	db.recordAccess(key, isNew)
+	// The hot engine already updated the key's inline access word in place during the
+	// Set above (its policy ran on the entry), so the side map and its global mutex
+	// are not touched on this path. recordAccess stays only for the store/ engine,
+	// which has no inline word.
+	if db.hotAcc.Load() == nil {
+		db.recordAccess(key, isNew)
+	}
 }
 
 // hlGet reads a key's header and body back off the hybrid log. An expired key is
@@ -164,6 +179,34 @@ func (db *DB) hlGet(key []byte) (body []byte, hdr ValueHeader, found bool, err e
 		return nil, ValueHeader{}, false, nil
 	}
 	cell, ok, err := b.e.Get(key)
+	return db.hlDecode(key, cell, ok, err)
+}
+
+// hlGetTouch is hlGet that also records the read. On the hot engine the engine's
+// GetTouch bumps the key's inline access word in place during the probe, one
+// lock-free load-modify-store on the entry already in hand, no side map and no
+// global mutex (note 354). On the store/ engine, which has no inline word, it is a
+// plain Get and the caller still feeds db.access through recordAccess. Either way it
+// shares hlDecode with hlGet so the header parse and lazy-expiry path stay identical.
+func (db *DB) hlGetTouch(key []byte) (body []byte, hdr ValueHeader, found bool, err error) {
+	b := db.hl.Load()
+	if b == nil {
+		return nil, ValueHeader{}, false, nil
+	}
+	if hs := db.hotAcc.Load(); hs != nil {
+		cell, ok, gerr := hs.GetTouch(key)
+		return db.hlDecode(key, cell, ok, gerr)
+	}
+	cell, ok, gerr := b.e.Get(key)
+	return db.hlDecode(key, cell, ok, gerr)
+}
+
+// hlDecode turns a store cell into the header and body the read path returns,
+// applying the same lazy expiry the btree read path uses. It is the shared tail of
+// hlGet and hlGetTouch: parse the fixed header, drop an expired key through hlDelete
+// so the freed bytes leave used_memory and its LFU bookkeeping is forgotten, and
+// hand back the body slice past the header.
+func (db *DB) hlDecode(key, cell []byte, ok bool, err error) (body []byte, hdr ValueHeader, found bool, e error) {
 	if err != nil || !ok {
 		return nil, ValueHeader{}, false, err
 	}
@@ -172,9 +215,6 @@ func (db *DB) hlGet(key []byte) (body []byte, hdr ValueHeader, found bool, err e
 		return nil, ValueHeader{}, false, nil
 	}
 	if db.expired(h) {
-		// Lazy expiry mirrors the btree read path. Route through hlDelete so the freed
-		// bytes leave used_memory and the key's LFU bookkeeping is dropped, rather than
-		// hitting the store directly and leaking the accounting.
 		_, _ = db.hlDelete(key)
 		return nil, ValueHeader{}, false, nil
 	}
@@ -226,6 +266,10 @@ func (db *DB) hlDelete(key []byte) (bool, error) {
 		return ok, err
 	}
 	db.ks.dataBytes.Add(-hlEntryBytes(len(key), prevValLen-HeaderSize))
-	db.dropAccess(key)
+	// The hot engine dropped the entry and its inline access word with it, so there is
+	// no side-map record to forget. dropAccess stays only for the store/ engine.
+	if db.hotAcc.Load() == nil {
+		db.dropAccess(key)
+	}
 	return true, nil
 }
