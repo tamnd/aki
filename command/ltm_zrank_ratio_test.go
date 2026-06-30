@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -19,8 +20,15 @@ import (
 // ratio near 10x would mean ZRANK is taking the O(rank) count walk instead, which
 // is what the LTM matrix slowdown would imply if the fast path were not wired.
 //
-// It is skipped in -short because it builds 100k members and runs 40k probes.
+// This is a wall-clock diagnostic, so it is gated behind AKI_LTM_DIAG=1 and not run
+// by the default suite: a timing ratio is noisy on a shared CI runner under -race and
+// would flake the 4x guard. Run it locally with `AKI_LTM_DIAG=1 go test -run
+// TestLTMZRankVsZScoreRatio ./command` to check the order-stat fast path still pays
+// off. It also skips in -short since it builds 100k members and runs 40k probes.
 func TestLTMZRankVsZScoreRatio(t *testing.T) {
+	if os.Getenv("AKI_LTM_DIAG") != "1" {
+		t.Skip("wall-clock diagnostic; set AKI_LTM_DIAG=1 to run")
+	}
 	if testing.Short() {
 		t.Skip("LTM ratio probe builds 100k members; skipped in -short")
 	}
