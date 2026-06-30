@@ -417,6 +417,8 @@ func infoPersistence(ctx *Ctx, b *strings.Builder) {
 		lineInt(b, "aki_wal_frame_count", 0)
 		lineInt(b, "aki_dirty_pages", int64(st.DirtyPages))
 		lineInt(b, "aki_buffer_pool_pages", int64(st.ResidentPages))
+		lineInt(b, "aki_page_cache_hits", int64(st.CacheHits))
+		lineInt(b, "aki_page_cache_misses", int64(st.CacheMisses))
 		line(b, "aki_page_cache_hit_ratio", fmtCacheRatio(st.CacheHits, st.CacheMisses))
 		line(b, "aki_on_disk_vs_ram_ratio", fmtDiskRamRatio(st.FileBytes))
 	}
