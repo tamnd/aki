@@ -112,6 +112,118 @@ func TestOrderStatCountsConsistentRandomInserts(t *testing.T) {
 	}
 }
 
+// TestOrderStatCountsConsistentMixedInsertDelete builds a tree, then runs a long
+// stream of mixed inserts and deletes against a model set, recounting the stored
+// counts against a full independent walk periodically and at the end. Deletes thin
+// out interior subtrees unevenly, so this exercises the per-level decrement on
+// both cell counts and the rightmost-header count, and proves a delete shrinks
+// every ancestor's count by exactly one (and a delete of an absent key shrinks
+// nothing).
+func TestOrderStatCountsConsistentMixedInsertDelete(t *testing.T) {
+	tr, _ := newOrderStatTree(t)
+	rng := rand.New(rand.NewSource(0x0de1e7e))
+
+	const span = 6000
+	present := make(map[int]bool)
+	// Seed with a base population so deletes have something to remove.
+	for _, i := range rng.Perm(span)[:span/2] {
+		if err := tr.Put(wideKey(i), []byte("v")); err != nil {
+			t.Fatalf("seed put %d: %v", i, err)
+		}
+		present[i] = true
+	}
+	verifyCounts(t, tr, len(present))
+
+	const ops = 20000
+	for step := range ops {
+		i := rng.Intn(span)
+		if rng.Intn(2) == 0 {
+			if err := tr.Put(wideKey(i), []byte("v")); err != nil {
+				t.Fatalf("put %d: %v", i, err)
+			}
+			present[i] = true
+		} else {
+			removed, err := tr.Delete(wideKey(i))
+			if err != nil {
+				t.Fatalf("delete %d: %v", i, err)
+			}
+			if removed != present[i] {
+				t.Fatalf("delete %d reported %v, model says present %v", i, removed, present[i])
+			}
+			delete(present, i)
+		}
+		if step%1000 == 999 {
+			verifyCounts(t, tr, len(present))
+		}
+	}
+	verifyCounts(t, tr, len(present))
+
+	// Every surviving key must read back, every removed key must miss.
+	for i := range span {
+		_, ok, err := tr.Get(wideKey(i))
+		if err != nil {
+			t.Fatalf("get %d: %v", i, err)
+		}
+		if ok != present[i] {
+			t.Fatalf("get %d found %v, model says present %v", i, ok, present[i])
+		}
+	}
+}
+
+// TestOrderStatCountsDeleteAbsentUnchanged deletes keys that were never inserted
+// and checks no count moves, since removing nothing removes no row.
+func TestOrderStatCountsDeleteAbsentUnchanged(t *testing.T) {
+	tr, _ := newOrderStatTree(t)
+	const n = 2000
+	for i := range n {
+		if err := tr.Put(wideKey(i), []byte("v")); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	verifyCounts(t, tr, n)
+
+	for i := n; i < n+500; i++ {
+		removed, err := tr.Delete(wideKey(i))
+		if err != nil {
+			t.Fatalf("delete absent %d: %v", i, err)
+		}
+		if removed {
+			t.Fatalf("delete absent %d reported removed", i)
+		}
+	}
+	verifyCounts(t, tr, n)
+}
+
+// TestOrderStatCountsDeleteToEmpty inserts a population then deletes every key,
+// asserting the counts stay exact all the way down to an empty tree.
+func TestOrderStatCountsDeleteToEmpty(t *testing.T) {
+	tr, _ := newOrderStatTree(t)
+	rng := rand.New(rand.NewSource(0xe33))
+	const n = 3000
+	for i := range n {
+		if err := tr.Put(wideKey(i), []byte("v")); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	verifyCounts(t, tr, n)
+
+	left := n
+	for _, i := range rng.Perm(n) {
+		removed, err := tr.Delete(wideKey(i))
+		if err != nil {
+			t.Fatalf("delete %d: %v", i, err)
+		}
+		if !removed {
+			t.Fatalf("delete %d reported not removed", i)
+		}
+		left--
+		if left%500 == 0 {
+			verifyCounts(t, tr, left)
+		}
+	}
+	verifyCounts(t, tr, 0)
+}
+
 // TestOrderStatCountsAppendAscending inserts in ascending key order, which sends
 // every split down the rightmost edge and so leans on the rightmost-child count
 // stored in the per-type header rather than in a cell. A bug in that header slot
