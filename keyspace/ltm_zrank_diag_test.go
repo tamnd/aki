@@ -134,7 +134,7 @@ func TestLTMZRankOrderStatSurvivesReopen(t *testing.T) {
 		t.Fatalf("collread: ok=%v err=%v", ok, err)
 	}
 	if !sawOrderStat {
-		t.Fatalf("FALLBACK CONFIRMED: reopened zset sub-tree reports OrderStat=false, "+
+		t.Fatalf("FALLBACK CONFIRMED: reopened zset sub-tree reports OrderStat=false, " +
 			"so coll-form ZRANK takes the O(rank) count walk, not the O(log n) Rank descent")
 	}
 	// Score rows sort after the n member rows, so the absolute rank of member 5000's
