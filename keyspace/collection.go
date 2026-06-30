@@ -229,6 +229,28 @@ func (r *CollReader) Cursor() *CollCursor {
 	return &CollCursor{c: r.tree.Cursor()}
 }
 
+// OrderStat reports whether this read is served from a sub-tree that maintains
+// order-statistic counts, so the caller can take the O(log n) Rank/SelectAt path
+// instead of a linear cursor walk. It is false for an overlay or hybrid read
+// (those serve from memory) and for a legacy plain sub-tree opened before the
+// augmentation existed, both of which keep the streaming fallback correct.
+func (r *CollReader) OrderStat() bool {
+	return r.tree != nil && r.hc == nil && r.live == nil && r.tree.OrderStat()
+}
+
+// Rank returns the number of element rows that sort strictly before sub and
+// whether sub is itself present, in one O(log n) descent. It is valid only when
+// OrderStat reports true.
+func (r *CollReader) Rank(sub []byte) (uint64, bool, error) {
+	return r.tree.Rank(sub)
+}
+
+// SelectAt returns the element row key at 0-based rank i and whether i is in
+// range, in one O(log n) descent. It is valid only when OrderStat reports true.
+func (r *CollReader) SelectAt(i uint64) ([]byte, bool, error) {
+	return r.tree.SelectAt(i)
+}
+
 // CollCursor is an ordered iterator over a collection's element rows. It wraps the
 // B-tree cursor, or a sorted snapshot of a resident copy for an overlay read, and
 // is valid only while the enclosing CollUpdate/CollRead callback holds the shard
@@ -345,6 +367,32 @@ func (cc *CollCursor) Value() []byte {
 	return cc.c.Value()
 }
 
+// collCreateTree creates a fresh element sub-tree for a collection of the given
+// type. A zset sub-tree is created order-statistic so its dual member/score index
+// answers ZRANK/ZREVRANK and ZRANGE-by-index in O(log n); every other type uses a
+// plain tree, which carries no per-child counts and no augmentation cost. The flag
+// is per-tree, so this single switch is the only place the choice is made on the
+// create path.
+func (db *DB) collCreateTree(typ uint8) (*btree.Tree, error) {
+	if typ == TypeZSet {
+		return btree.CreateOrderStat(db.ks.pgr)
+	}
+	return btree.Create(db.ks.pgr)
+}
+
+// collOpenTree opens an existing element sub-tree at root for a collection of the
+// given type. A zset opens through OpenAutoOrderStat, which reads the root page to
+// decide whether the tree is already augmented: a sub-tree built since the
+// augmentation landed is order-stat, a legacy plain zset sub-tree stays plain and
+// falls back to the streaming rank path, and neither is ever miswritten. Every
+// other type opens plain.
+func (db *DB) collOpenTree(root uint32, typ uint8) (*btree.Tree, error) {
+	if typ == TypeZSet {
+		return btree.OpenAutoOrderStat(db.ks.pgr, root)
+	}
+	return btree.Open(db.ks.pgr, root), nil
+}
+
 // CollUpdate runs fn against the btree-backed collection at key under the shard
 // write lock, then writes the metadata row back. typ is the collection type byte
 // and enc is the OBJECT ENCODING to report (hashtable/skiplist/quicklist). The
@@ -397,10 +445,13 @@ func (db *DB) CollUpdate(key []byte, typ, enc uint8, fn func(w *CollWriter) erro
 		// write; element ops route through lc, not the tree.
 		w.tree = btree.Open(db.ks.pgr, lc.bodyRef)
 	} else if prevIsTree {
-		w.tree = btree.Open(db.ks.pgr, uint32(prev.BodyRef))
+		w.tree, err = db.collOpenTree(uint32(prev.BodyRef), typ)
+		if err != nil {
+			return err
+		}
 		w.meta = decodeCollMeta(prevBody)
 	} else {
-		w.tree, err = btree.Create(db.ks.pgr)
+		w.tree, err = db.collCreateTree(typ)
 		if err != nil {
 			return err
 		}
@@ -511,10 +562,13 @@ func (db *DB) CollUpdateRouted(key []byte, typ, enc uint8, route func(found bool
 		w.meta.count = uint64(lc.count())
 		w.tree = btree.Open(db.ks.pgr, lc.bodyRef)
 	} else if prevIsTree {
-		w.tree = btree.Open(db.ks.pgr, uint32(prev.BodyRef))
+		w.tree, err = db.collOpenTree(uint32(prev.BodyRef), typ)
+		if err != nil {
+			return CollRouteColl, err
+		}
 		w.meta = decodeCollMeta(prevBody)
 	} else {
-		w.tree, err = btree.Create(db.ks.pgr)
+		w.tree, err = db.collCreateTree(typ)
 		if err != nil {
 			return CollRouteColl, err
 		}
@@ -658,7 +712,10 @@ func (db *DB) CollRead(key []byte, fn func(r *CollReader) error) (ok bool, err e
 	if lc := db.shards[s].live[string(key)]; lc != nil {
 		r.live = lc
 	} else {
-		r.tree = btree.Open(db.ks.pgr, uint32(h.BodyRef))
+		r.tree, err = db.collOpenTree(uint32(h.BodyRef), h.Type)
+		if err != nil {
+			return false, err
+		}
 	}
 	return true, fn(r)
 }
@@ -827,7 +884,7 @@ func (db *DB) CollCopyTo(srcKey []byte, dst *DB, dstKey []byte) (ok bool, err er
 		return false, err
 	}
 
-	nt, err := btree.Create(dst.ks.pgr)
+	nt, err := dst.collCreateTree(srcType)
 	if err != nil {
 		return false, err
 	}

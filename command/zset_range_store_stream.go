@@ -463,7 +463,7 @@ func zsetStoreRankWindow(db *keyspace.DB, key []byte, start, stop int64, rev boo
 						return e
 					}
 				}
-			} else if e := seekScoreIndex(c, aLo, card); e != nil {
+			} else if e := seekScoreIndex(r, c, aLo, card, true); e != nil {
 				return e
 			}
 			for c.Valid() && len(batch) < interCardBatch {
