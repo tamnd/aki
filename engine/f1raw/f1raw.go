@@ -1,9 +1,17 @@
-// Package f2raw is a clean-room, from-scratch implementation of the F2/FASTER
-// hot tier, written to measure the raw lock-free ceiling with none of the
-// keyspace, header, write-behind, or value-cache machinery the integrated engine
-// carries. It exists to answer one question from first principles: how fast is a
-// truly lock-free hash-over-log point store on this hardware, before any
+// Package f1raw is a clean-room, from-scratch implementation of the FASTER point
+// store: a single lock-free hash index over one in-memory hybrid log. It is the
+// "F1" baseline in the engine family, written to measure the raw lock-free ceiling
+// with none of the keyspace, header, write-behind, or value-cache machinery the
+// integrated engine carries. It answers one question from first principles: how
+// fast is a truly lock-free hash-over-log point store on this hardware, before any
 // architecture decision layered above it can drag the number down.
+//
+// It is single-tier on purpose. FASTER mixes hot and cold records on one log and
+// reclaims the cold region with log compaction that re-copies live records forward,
+// which couples a small working set to the whole keyspace and pays write
+// amplification under skew. The two-tier successor that splits hot from cold to fix
+// those flaws lives in the sibling package f2raw; f1raw is the design it is measured
+// against, so the F2 win is a real before/after number on the same harness.
 //
 // The design is the FASTER paper's two pieces and nothing else:
 //
@@ -48,7 +56,7 @@
 // writes to one hot key are race-detector clean. The single test that exercises a
 // hot key under contention skips under -race and runs as a plain stress test
 // otherwise.
-package f2raw
+package f1raw
 
 import (
 	"encoding/binary"
@@ -61,10 +69,10 @@ import (
 // ErrFull is returned by Set when the arena has no room for a new record or
 // overflow bucket. The spike sizes the arena for the working set up front; spilling
 // cold records to disk is the production tier's job, not this measurement's.
-var ErrFull = errors.New("f2raw: arena full")
+var ErrFull = errors.New("f1raw: arena full")
 
 // ErrTooBig is returned when a key or value exceeds the 64 KiB field width.
-var ErrTooBig = errors.New("f2raw: key or value over 64 KiB")
+var ErrTooBig = errors.New("f1raw: key or value over 64 KiB")
 
 const (
 	slotsPerBucket = 7  // index entries per cache-line bucket (7*8 + 8-byte link = 64)
@@ -140,7 +148,7 @@ func New(indexBuckets, arenaBytes int) *Store {
 	}
 	s.base = unsafe.Pointer(&s.arena[0])
 	if uintptr(s.base)%8 != 0 {
-		panic("f2raw: arena base not 8-aligned")
+		panic("f1raw: arena base not 8-aligned")
 	}
 	s.tail.Store(8) // reserve offset 0 so an empty index entry (addr 0) is unambiguous
 	return s
@@ -331,7 +339,7 @@ func (s *Store) readValue(off uint64, dst []byte) []byte {
 func (s *Store) Set(key, val []byte) error {
 	if len(key) == 0 || len(key) > maxKey || len(val) > maxVal {
 		if len(key) == 0 {
-			return errors.New("f2raw: empty key")
+			return errors.New("f1raw: empty key")
 		}
 		return ErrTooBig
 	}

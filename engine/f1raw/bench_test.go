@@ -1,4 +1,4 @@
-package f2raw
+package f1raw
 
 import (
 	"encoding/binary"
@@ -11,8 +11,8 @@ import (
 // this store with no wire, no RESP, no keyspace, and no lock. Run the parallel ones
 // across core counts to see the scaling the lock-free index buys:
 //
-//	go test -bench . -benchmem ./f2raw/
-//	go test -bench Parallel -cpu 1,2,4,8 ./f2raw/
+//	go test -bench . -benchmem ./engine/f1raw/
+//	go test -bench Parallel -cpu 1,2,4,8 ./engine/f1raw/
 //
 // GetParallel and SetParallel are the lock-tax probe: a lock-bearing store's
 // throughput flattens or inverts as cores climb because every op bounces one

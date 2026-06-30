@@ -3,7 +3,7 @@ package keyspace
 import (
 	"testing"
 
-	"github.com/tamnd/aki/hot"
+	"github.com/tamnd/aki/engine/hot"
 	"github.com/tamnd/aki/pager"
 	"github.com/tamnd/aki/vfs"
 )

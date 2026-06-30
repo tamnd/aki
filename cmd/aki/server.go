@@ -12,7 +12,7 @@ import (
 	"syscall"
 
 	"github.com/tamnd/aki/command"
-	"github.com/tamnd/aki/hot"
+	"github.com/tamnd/aki/engine/hot"
 	"github.com/tamnd/aki/keyspace"
 	"github.com/tamnd/aki/networking"
 	"github.com/tamnd/aki/pager"

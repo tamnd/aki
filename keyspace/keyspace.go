@@ -17,7 +17,7 @@ import (
 	"github.com/tamnd/aki/btree"
 	"github.com/tamnd/aki/encoding"
 	"github.com/tamnd/aki/format"
-	"github.com/tamnd/aki/hot"
+	"github.com/tamnd/aki/engine/hot"
 	"github.com/tamnd/aki/pager"
 	"github.com/tamnd/aki/store"
 )

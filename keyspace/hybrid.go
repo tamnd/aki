@@ -1,7 +1,7 @@
 package keyspace
 
 import (
-	"github.com/tamnd/aki/hot"
+	"github.com/tamnd/aki/engine/hot"
 	"github.com/tamnd/aki/store"
 )
 
