@@ -50,7 +50,11 @@ func scoreValueDiag(score float64) []byte {
 // ZRANK takes the O(log n) Rank descent, or does it fall back to the O(rank)
 // count walk that would explain a 10x slowdown under a memory cap.
 func TestLTMZRankOrderStatSurvivesReopen(t *testing.T) {
-	const n = 20000
+	// 2000 members fill several leaves under one interior level, so the reopened
+	// tree carries real per-child subtree counts to verify, while staying fast
+	// enough for the -tags debug -race build where btree work runs orders of
+	// magnitude slower (20000 here timed the build out at 10 minutes).
+	const n = 2000
 	key := []byte("z:0")
 	pad := make([]byte, 16)
 	for i := range pad {
@@ -114,19 +118,19 @@ func TestLTMZRankOrderStatSurvivesReopen(t *testing.T) {
 	db2 := ks2.dbs[0]
 
 	var sawOrderStat bool
-	var rankOf5000 uint64
+	var rankOfProbe uint64
 	ok, err := db2.CollRead(key, func(r *CollReader) error {
 		sawOrderStat = r.OrderStat()
 		if r.Count() != n {
 			t.Fatalf("count after reopen = %d, want %d", r.Count(), n)
 		}
 		if sawOrderStat {
-			// ZRANK's second descent: rank of the score row for member 5000.
-			rk, _, e := r.Rank(scoreRowDiag(5000, member(5000)))
+			// ZRANK's second descent: rank of the score row for member 1000.
+			rk, _, e := r.Rank(scoreRowDiag(1000, member(1000)))
 			if e != nil {
 				return e
 			}
-			rankOf5000 = rk
+			rankOfProbe = rk
 		}
 		return nil
 	})
@@ -137,9 +141,9 @@ func TestLTMZRankOrderStatSurvivesReopen(t *testing.T) {
 		t.Fatalf("FALLBACK CONFIRMED: reopened zset sub-tree reports OrderStat=false, " +
 			"so coll-form ZRANK takes the O(rank) count walk, not the O(log n) Rank descent")
 	}
-	// Score rows sort after the n member rows, so the absolute rank of member 5000's
-	// score row is n + 5000.
-	if want := uint64(n + 5000); rankOf5000 != want {
-		t.Fatalf("Rank after reopen = %d, want %d (order-stat counts wrong after reload)", rankOf5000, want)
+	// Score rows sort after the n member rows, so the absolute rank of member 1000's
+	// score row is n + 1000.
+	if want := uint64(n + 1000); rankOfProbe != want {
+		t.Fatalf("Rank after reopen = %d, want %d (order-stat counts wrong after reload)", rankOfProbe, want)
 	}
 }
