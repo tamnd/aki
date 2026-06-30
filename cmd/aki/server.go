@@ -12,7 +12,7 @@ import (
 	"syscall"
 
 	"github.com/tamnd/aki/command"
-	"github.com/tamnd/aki/hot"
+	"github.com/tamnd/aki/engine/hot"
 	"github.com/tamnd/aki/keyspace"
 	"github.com/tamnd/aki/networking"
 	"github.com/tamnd/aki/pager"
@@ -70,7 +70,7 @@ func cmdServer(args []string) error {
 	appendonly := fs.String("appendonly", "", "enable the append-only file: yes or no")
 	appendfsync := fs.String("appendfsync", "", "durability policy: always, everysec, or no")
 	hashOverlay := fs.String("aki-hash-overlay", "", "in-memory hash write fast path: yes or no (default no)")
-	engine := fs.String("aki-engine", "", "storage engine for the string point path: btree (default, durable, all types), hybrid (experimental in-memory durable-spill store, string-only), or hot (experimental in-memory lock-free hot tier, string-only); spec 2064 rewrite")
+	engine := fs.String("aki-engine", "", "storage engine for the string point path. These are the legacy slower engines kept for all-types and durable coverage: btree (default here, durable, all types), hybrid (experimental in-memory durable-spill store, string-only), or hot (experimental in-memory lock-free hot tier, string-only). The fast engine is f1raw, served by the separate f1srv binary; it is the product going forward (spec 2064 f1_rewrite_ltm) and is not selectable here yet because it does not cover collections")
 	akiNet := fs.String("aki-net", "", "TCP networking model: goroutine (default, one read-loop goroutine per connection), reactor (experimental epoll event loops, Linux+TCP only), or uring (experimental reactor that batches a turn's writes into one io_uring_enter, Linux+TCP only; spec 2064 reactor)")
 	save := fs.String("save", "", `RDB save points, e.g. "3600 1 300 100", or "" to disable`)
 	maxmemory := fs.String("maxmemory", "", "memory limit before eviction, e.g. 256mb (0 disables)")
