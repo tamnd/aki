@@ -17,7 +17,7 @@ type connState struct {
 	w    *bufio.Writer
 	rbuf []byte
 	argv [][]byte
-	vbuf []byte  // reused destination for GET/MGET value copies
+	vbuf []byte   // reused destination for GET/MGET value copies
 	num  [24]byte // scratch for formatting integer replies
 }
 
@@ -202,38 +202,41 @@ func indexByte(b []byte, c byte) int {
 
 // --- reply writers, all appending to the batched write buffer ---
 
+// The writers append to a bufio.Writer that records its first error and
+// surfaces it at Flush, so the intermediate write returns are blank-assigned
+// the same way resp.Encoder does; the conn checks the Flush error.
 func (c *connState) writeSimple(s string) {
-	c.w.WriteByte('+')
-	c.w.WriteString(s)
-	c.w.WriteString("\r\n")
+	_ = c.w.WriteByte('+')
+	_, _ = c.w.WriteString(s)
+	_, _ = c.w.WriteString("\r\n")
 }
 
 func (c *connState) writeErr(s string) {
-	c.w.WriteByte('-')
-	c.w.WriteString(s)
-	c.w.WriteString("\r\n")
+	_ = c.w.WriteByte('-')
+	_, _ = c.w.WriteString(s)
+	_, _ = c.w.WriteString("\r\n")
 }
 
 func (c *connState) writeInt(n int64) {
-	c.w.WriteByte(':')
-	c.w.Write(strconv.AppendInt(c.num[:0], n, 10))
-	c.w.WriteString("\r\n")
+	_ = c.w.WriteByte(':')
+	_, _ = c.w.Write(strconv.AppendInt(c.num[:0], n, 10))
+	_, _ = c.w.WriteString("\r\n")
 }
 
 func (c *connState) writeBulk(b []byte) {
-	c.w.WriteByte('$')
-	c.w.Write(strconv.AppendInt(c.num[:0], int64(len(b)), 10))
-	c.w.WriteString("\r\n")
-	c.w.Write(b)
-	c.w.WriteString("\r\n")
+	_ = c.w.WriteByte('$')
+	_, _ = c.w.Write(strconv.AppendInt(c.num[:0], int64(len(b)), 10))
+	_, _ = c.w.WriteString("\r\n")
+	_, _ = c.w.Write(b)
+	_, _ = c.w.WriteString("\r\n")
 }
 
 func (c *connState) writeNil() {
-	c.w.WriteString("$-1\r\n")
+	_, _ = c.w.WriteString("$-1\r\n")
 }
 
 func (c *connState) writeArrayHeader(n int) {
-	c.w.WriteByte('*')
-	c.w.Write(strconv.AppendInt(c.num[:0], int64(n), 10))
-	c.w.WriteString("\r\n")
+	_ = c.w.WriteByte('*')
+	_, _ = c.w.Write(strconv.AppendInt(c.num[:0], int64(n), 10))
+	_, _ = c.w.WriteString("\r\n")
 }

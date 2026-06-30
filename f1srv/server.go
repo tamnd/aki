@@ -25,21 +25,21 @@ import (
 
 // Config sizes the store and tunes the listener.
 type Config struct {
-	Addr          string // listen address, host:port
-	IndexBuckets  int    // f1raw primary index buckets (rounded up to a power of two)
-	ArenaBytes    int    // f1raw arena size in bytes
-	ReadBufSize   int    // initial per-connection read buffer
-	IncrStripes   int    // INCR-family RMW lock stripes (rounded up to a power of two)
+	Addr         string // listen address, host:port
+	IndexBuckets int    // f1raw primary index buckets (rounded up to a power of two)
+	ArenaBytes   int    // f1raw arena size in bytes
+	ReadBufSize  int    // initial per-connection read buffer
+	IncrStripes  int    // INCR-family RMW lock stripes (rounded up to a power of two)
 }
 
 // DefaultConfig returns a config sized for a multi-million-key in-memory benchmark.
 func DefaultConfig(addr string) Config {
 	return Config{
 		Addr:         addr,
-		IndexBuckets: 1 << 22,        // ~4M buckets, ~29M key slots before overflow
-		ArenaBytes:   2 << 30,        // 2 GiB arena
-		ReadBufSize:  64 << 10,       // 64 KiB
-		IncrStripes:  1 << 10,        // 1024 stripes
+		IndexBuckets: 1 << 22,  // ~4M buckets, ~29M key slots before overflow
+		ArenaBytes:   2 << 30,  // 2 GiB arena
+		ReadBufSize:  64 << 10, // 64 KiB
+		IncrStripes:  1 << 10,  // 1024 stripes
 	}
 }
 
@@ -135,9 +135,9 @@ func (s *Server) Close() error {
 
 func (s *Server) serveConn(conn net.Conn) {
 	defer s.wg.Done()
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)
+		_ = tc.SetNoDelay(true)
 	}
 	c := &connState{
 		srv:  s,

@@ -59,7 +59,7 @@ func (c *connState) dispatch(argv [][]byte) {
 	case eqFold(cmd, "QUIT"):
 		c.writeSimple("OK")
 		_ = c.w.Flush()
-		c.conn.Close()
+		_ = c.conn.Close()
 	default:
 		c.writeErr("ERR unknown command '" + string(cmd) + "'")
 	}

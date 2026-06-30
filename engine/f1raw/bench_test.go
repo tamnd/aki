@@ -2,7 +2,6 @@ package f1raw
 
 import (
 	"encoding/binary"
-	"fmt"
 	"math/rand"
 	"runtime"
 	"sync/atomic"
@@ -157,7 +156,7 @@ func BenchmarkSetParallelHotKey(b *testing.B) {
 
 // reportCores prints GOMAXPROCS once so a -cpu sweep is labeled in the output.
 func BenchmarkCoresInfo(b *testing.B) {
-	b.Skip(fmt.Sprintf("GOMAXPROCS=%d NumCPU=%d", runtime.GOMAXPROCS(0), runtime.NumCPU()))
+	b.Skipf("GOMAXPROCS=%d NumCPU=%d", runtime.GOMAXPROCS(0), runtime.NumCPU())
 }
 
 // zipfSequence draws n key indices from a Zipfian distribution over [0,keys) with
