@@ -208,9 +208,9 @@ func packAccessWord(atime uint32, decrMin uint16, freq uint8) uint64 {
 	return uint64(freq)<<accFreqShift | uint64(decrMin)<<accDecrShift | uint64(atime)<<accTimeShift
 }
 
-func accWordTime(w uint64) uint32  { return uint32(w >> accTimeShift) }
-func accWordDecr(w uint64) uint16  { return uint16(w >> accDecrShift) }
-func accWordFreq(w uint64) uint8   { return uint8(w >> accFreqShift) }
+func accWordTime(w uint64) uint32 { return uint32(w >> accTimeShift) }
+func accWordDecr(w uint64) uint16 { return uint16(w >> accDecrShift) }
+func accWordFreq(w uint64) uint8  { return uint8(w >> accFreqShift) }
 
 // lfuElapsedMinutes is the minutes between the decay stamp and now in 16-bit
 // wrapping arithmetic, matching Redis's LFUTimeElapsed: a now at or after the stamp
