@@ -3,7 +3,9 @@ package f1raw
 import (
 	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"runtime"
+	"sync/atomic"
 	"testing"
 )
 
@@ -156,4 +158,100 @@ func BenchmarkSetParallelHotKey(b *testing.B) {
 // reportCores prints GOMAXPROCS once so a -cpu sweep is labeled in the output.
 func BenchmarkCoresInfo(b *testing.B) {
 	b.Skip(fmt.Sprintf("GOMAXPROCS=%d NumCPU=%d", runtime.GOMAXPROCS(0), runtime.NumCPU()))
+}
+
+// zipfSequence draws n key indices from a Zipfian distribution over [0,keys) with
+// skew s (s>1; larger is more skewed). It is precomputed once so the benchmark loop
+// pays no per-op RNG cost and times only the store, and it is seeded with a fixed
+// value so f1raw and f2raw see the exact same access trace and the comparison is
+// apples to apples. A Zipfian trace is the workload the F2 paper targets: a small
+// hot set takes the overwhelming majority of accesses, the realistic shape of a
+// production cache that a flat single-tier index cannot keep cache-resident.
+func zipfSequence(n, keys int, s float64) []uint64 {
+	r := rand.New(rand.NewSource(0x5eed))
+	z := rand.NewZipf(r, s, 1, uint64(keys-1))
+	seq := make([]uint64, n)
+	for i := range seq {
+		seq[i] = z.Uint64()
+	}
+	return seq
+}
+
+const skewSamples = 1 << 20 // length of the precomputed Zipfian access trace
+
+// BenchmarkGetSkewed reads under a Zipfian trace instead of a uniform one. On a flat
+// single-tier store this is barely faster than the uniform read: the hot keys still
+// live scattered across the full 16 MB index and 100 MB arena, so a hot key's bucket
+// and record get evicted from cache by all the cold-key traffic between its hits.
+// That cache-residency miss under skew is exactly the flaw the two-tier f2raw fixes,
+// and this is its f1raw baseline.
+func BenchmarkGetSkewed(b *testing.B) {
+	s := filledStore(benchKeys, 64)
+	seq := zipfSequence(skewSamples, benchKeys, 1.1)
+	var kb [16]byte
+	var dst []byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := makeKey(kb[:], seq[i&(skewSamples-1)])
+		dst, _ = s.Get(k, dst)
+	}
+}
+
+// BenchmarkSetSkewed updates in place under the same Zipfian trace. Same story as the
+// skewed read: a hot key's record is somewhere in the 100 MB arena, so the in-place
+// memcpy keeps missing cache even though the working set is tiny.
+func BenchmarkSetSkewed(b *testing.B) {
+	s := filledStore(benchKeys, 64)
+	seq := zipfSequence(skewSamples, benchKeys, 1.1)
+	val := make([]byte, 64)
+	var kb [16]byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := makeKey(kb[:], seq[i&(skewSamples-1)])
+		if err := s.Set(k, val); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkGetSkewedParallel and BenchmarkSetSkewedParallel run the Zipfian trace
+// across GOMAXPROCS. Each goroutine walks the shared trace from its own offset so
+// the cores collectively reproduce the skew. This is the headline comparison point
+// against f2raw: a flat store cannot exploit the skew, a two-tier store can.
+func BenchmarkGetSkewedParallel(b *testing.B) {
+	s := filledStore(benchKeys, 64)
+	seq := zipfSequence(skewSamples, benchKeys, 1.1)
+	var off uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var kb [16]byte
+		var dst []byte
+		i := int(atomic.AddUint64(&off, 1) * 0x9e3779b1)
+		for pb.Next() {
+			dst, _ = s.Get(makeKey(kb[:], seq[i&(skewSamples-1)]), dst)
+			i++
+		}
+	})
+}
+
+func BenchmarkSetSkewedParallel(b *testing.B) {
+	s := filledStore(benchKeys, 64)
+	seq := zipfSequence(skewSamples, benchKeys, 1.1)
+	val := make([]byte, 64)
+	var off uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var kb [16]byte
+		i := int(atomic.AddUint64(&off, 1) * 0x9e3779b1)
+		for pb.Next() {
+			if err := s.Set(makeKey(kb[:], seq[i&(skewSamples-1)]), val); err != nil {
+				b.Fatal(err)
+			}
+			i++
+		}
+	})
 }
