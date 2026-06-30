@@ -692,21 +692,33 @@ func zsetCollRank(db *keyspace.DB, key, member []byte, rev bool) (rank int64, sc
 		found = true
 		score = zScoreUnbits(encoding.U64BE(c.Value()))
 		target := zScoreRow(score, member)
-		if e := c.Seek([]byte{zRowScore}); e != nil {
-			return e
-		}
 		var asc int64
-		for c.Valid() {
-			k := c.Key()
-			if len(k) == 0 || k[0] != zRowScore {
-				break
-			}
-			if bytes.Equal(k, target) {
-				break
-			}
-			asc++
-			if e := c.Next(); e != nil {
+		if r.OrderStat() {
+			// The sub-tree holds card member rows then card score rows, so the score
+			// row's absolute rank is card+asc; one O(log n) descent gives it directly
+			// instead of the count walk below. The Rank present flag is ignored: the
+			// member lookup above already proved the row is there.
+			absRank, _, e := r.Rank(target)
+			if e != nil {
 				return e
+			}
+			asc = int64(absRank) - int64(r.Count())
+		} else {
+			if e := c.Seek([]byte{zRowScore}); e != nil {
+				return e
+			}
+			for c.Valid() {
+				k := c.Key()
+				if len(k) == 0 || k[0] != zRowScore {
+					break
+				}
+				if bytes.Equal(k, target) {
+					break
+				}
+				asc++
+				if e := c.Next(); e != nil {
+					return e
+				}
 			}
 		}
 		if rev {
@@ -772,7 +784,7 @@ func streamZRangeByRank(ctx *Ctx, db *keyspace.DB, key []byte, start, stop int64
 		}
 		c := r.Cursor()
 		c.UseArena()
-		if e := seekScoreIndex(c, startIdx, card); e != nil {
+		if e := seekScoreIndex(r, c, startIdx, card, !rev); e != nil {
 			return e
 		}
 		// In RESP3 a WITHSCORES element is its own [member, score] pair array; in
@@ -831,10 +843,35 @@ func writeZRangeHeader(enc *resp.Encoder, n int, withScores bool) {
 	enc.WriteArrayLen(n * 2)
 }
 
-// seekScoreIndex positions the cursor at ascending score-index position idx,
-// approaching from whichever end of the set is nearer so a window deep in the set
-// still seeks in min(idx, card-1-idx) cursor steps without allocating.
-func seekScoreIndex(c *keyspace.CollCursor, idx, card int64) error {
+// seekScoreIndex positions the cursor at ascending score-index position idx, ready
+// for a walk in the forward direction (caller steps Next) when forward is true or
+// the backward direction (caller steps Prev) otherwise. When the sub-tree is
+// order-statistic the absolute rank of that score row is card+idx (card member rows
+// sort before all score rows), so one O(log n) SelectAt finds the row key and the
+// cursor seeks straight to it: a forward walk seeks with Seek, a backward walk with
+// SeekForPrev, which is what lays the backward navigation path that Prev needs.
+// Otherwise it approaches from whichever end of the set is nearer so a window deep
+// in the set still seeks in min(idx, card-1-idx) cursor steps without allocating.
+func seekScoreIndex(r *keyspace.CollReader, c *keyspace.CollCursor, idx, card int64, forward bool) error {
+	if r.OrderStat() {
+		k, ok, e := r.SelectAt(uint64(card + idx))
+		if e != nil {
+			return e
+		}
+		if !ok {
+			// idx is within [0,card-1] for every caller, so card+idx names a real
+			// score row; a miss would mean a corrupt count, so fall through to the
+			// streaming seek rather than leaving the cursor unpositioned.
+			if forward {
+				return c.Seek([]byte{zRowScore})
+			}
+			return c.Last()
+		}
+		if forward {
+			return c.Seek(k)
+		}
+		return c.SeekForPrev(k)
+	}
 	if idx <= card-1-idx {
 		if e := c.Seek([]byte{zRowScore}); e != nil {
 			return e

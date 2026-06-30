@@ -200,6 +200,31 @@ func OpenOrderStat(pgr *pager.Pager, root uint32) *Tree {
 	return &Tree{pgr: pgr, root: root, orderStat: true}
 }
 
+// OpenAutoOrderStat opens an existing tree at root and decides from the root page
+// whether it maintains order-statistic counts, so a tree written before the
+// augmentation existed is never miswritten. An augmented interior root (the
+// order-stat flag bit) opens order-stat. A leaf root opens order-stat too: it has
+// no interior pages yet, so the first split builds an augmented interior with
+// counts computed from scratch, which keeps a freshly created or still-tiny tree
+// on the fast path. A plain interior root opens plain, so a legacy tree with
+// existing un-augmented interior pages keeps its counts unmaintained and falls
+// back to the linear rank path rather than corrupting its pages.
+func OpenAutoOrderStat(pgr *pager.Pager, root uint32) (*Tree, error) {
+	pg, err := pgr.Get(root)
+	if err != nil {
+		return nil, err
+	}
+	os := false
+	switch pg.Data[0] {
+	case format.PageTypeBTreeLeaf:
+		os = true
+	case format.PageTypeBTreeInt:
+		os = pg.Data[1]&format.FlagBTreeOrderStat != 0
+	}
+	pgr.Unpin(pg, false)
+	return &Tree{pgr: pgr, root: root, orderStat: os}, nil
+}
+
 // OrderStat reports whether this tree maintains order-statistic counts.
 func (t *Tree) OrderStat() bool { return t.orderStat }
 
