@@ -32,7 +32,9 @@ func main() {
 	indexBuckets := fs.Int("index-buckets", 1<<22, "f1raw index buckets")
 	arenaBytes := fs.Int("arena-bytes", 2<<30, "f1raw arena size in bytes")
 	stripes := fs.Int("incr-stripes", 1<<10, "INCR-family RMW lock stripes")
-	fs.Parse(args)
+	// ExitOnError means a bad flag exits the process, so Parse never returns a
+	// non-nil error here. Blank-assign to satisfy errcheck without dead handling.
+	_ = fs.Parse(args)
 
 	cfg := f1srv.DefaultConfig(*addr)
 	cfg.IndexBuckets = *indexBuckets
