@@ -189,9 +189,106 @@ func (db *DB) lfuIncr(a keyAccess) keyAccess {
 	return a
 }
 
+// The hot engine carries a key's recency and frequency in a single atomic word on
+// the entry instead of in db.access under a global mutex, the F2/Redis principle
+// that per-record metadata lives in the record (note 354). The word packs the same
+// three fields keyAccess holds: the LFU counter in the low byte, the decay minute
+// (low 16 bits of the wall clock in minutes, the way Redis stores ldt) in the next
+// two bytes, and the last-access second in the high 32 bits. freq and decr are
+// 16-bit minute arithmetic exactly like Redis's LFUTimeElapsed, so an old burst
+// still decays correctly across the minute wrap.
+const (
+	accFreqShift = 0
+	accDecrShift = 8
+	accTimeShift = 32
+	accDecrMask  = 0xFFFF
+)
+
+func packAccessWord(atime uint32, decrMin uint16, freq uint8) uint64 {
+	return uint64(freq)<<accFreqShift | uint64(decrMin)<<accDecrShift | uint64(atime)<<accTimeShift
+}
+
+func accWordTime(w uint64) uint32  { return uint32(w >> accTimeShift) }
+func accWordDecr(w uint64) uint16  { return uint16(w >> accDecrShift) }
+func accWordFreq(w uint64) uint8   { return uint8(w >> accFreqShift) }
+
+// lfuElapsedMinutes is the minutes between the decay stamp and now in 16-bit
+// wrapping arithmetic, matching Redis's LFUTimeElapsed: a now at or after the stamp
+// is a plain difference, and a wrap (now below the stamp) counts forward through
+// 65536. A key untouched longer than the 16-bit minute range is maximally decayed
+// either way, which is correct.
+func lfuElapsedMinutes(now, decr uint16) uint16 {
+	if now >= decr {
+		return now - decr
+	}
+	return (65535 - decr) + now + 1
+}
+
+// lfuDecayWord lowers the counter by one for each decay period elapsed since the
+// decay stamp, the word-path twin of lfuDecay. It does not restamp: the caller that
+// writes the word back stamps the current minute, and the read-only introspection
+// callers (Freq, accessMetrics) want the decayed value without recording an access.
+func (db *DB) lfuDecayWord(freq uint8, decr, now uint16) uint8 {
+	decayTime := db.ks.lfuDecayTime
+	if decayTime <= 0 || decr == 0 {
+		return freq
+	}
+	periods := lfuElapsedMinutes(now, decr) / uint16(decayTime)
+	if periods == 0 {
+		return freq
+	}
+	if periods >= uint16(freq) {
+		return 0
+	}
+	return freq - uint8(periods)
+}
+
+// lfuIncrWord is lfuIncr on a bare counter: the same probabilistic climb whose
+// chance shrinks as the counter grows, so the 8-bit field separates a key hit
+// thousands of times from one hit a handful.
+func (db *DB) lfuIncrWord(freq uint8) uint8 {
+	if freq == 255 {
+		return 255
+	}
+	base := 0.0
+	if freq > lfuInitVal {
+		base = float64(freq - lfuInitVal)
+	}
+	p := 1.0 / (base*float64(db.ks.lfuLogFactor) + 1.0)
+	if rand.Float64() < p {
+		freq++
+	}
+	return freq
+}
+
+// hotAccessUpdate is the policy the hot engine runs in place on every read and
+// write. It is the lock-free, side-map-free twin of recordAccess: a new key seeds
+// the counter so it is not the instant eviction victim, and a repeat access decays
+// then bumps the counter and restamps recency, all on the word the engine already
+// holds. The engine skips the store when this returns the word unchanged, which is
+// the common case for a key already touched this second whose bump did not fire.
+func (db *DB) hotAccessUpdate(old uint64, isNew bool) uint64 {
+	nowMin := uint16(coarseMinutes())
+	if isNew {
+		return packAccessWord(coarseSeconds(), nowMin, lfuInitVal)
+	}
+	freq := db.lfuDecayWord(accWordFreq(old), accWordDecr(old), nowMin)
+	freq = db.lfuIncrWord(freq)
+	return packAccessWord(coarseSeconds(), nowMin, freq)
+}
+
 // Idle returns whole seconds since the key was last accessed, the OBJECT IDLETIME
 // answer. A key with no recorded access yet reports zero.
 func (db *DB) Idle(key []byte) uint32 {
+	if hs := db.hotAcc.Load(); hs != nil {
+		if w, ok := hs.AccessWord(key); ok {
+			now := coarseSeconds()
+			if at := accWordTime(w); now > at {
+				return now - at
+			}
+			return 0
+		}
+	}
 	db.accessMu.Lock()
 	a := db.access[string(key)]
 	if a == nil {
@@ -211,6 +308,11 @@ func (db *DB) Idle(key []byte) uint32 {
 // computed for the read but not stored, since reading frequency is not itself an
 // access.
 func (db *DB) Freq(key []byte) uint8 {
+	if hs := db.hotAcc.Load(); hs != nil {
+		if w, ok := hs.AccessWord(key); ok {
+			return db.lfuDecayWord(accWordFreq(w), accWordDecr(w), uint16(coarseMinutes()))
+		}
+	}
 	db.accessMu.Lock()
 	a := db.access[string(key)]
 	if a == nil {
@@ -225,15 +327,28 @@ func (db *DB) Freq(key []byte) uint8 {
 // SetIdle seeds a key's last-access time to idle seconds in the past, which is how
 // RESTORE IDLETIME reconstructs the LRU clock of a dumped key.
 func (db *DB) SetIdle(key []byte, idle uint32) {
-	db.accessMu.Lock()
-	defer db.accessMu.Unlock()
-	if db.access == nil {
-		db.access = make(map[string]*keyAccess)
-	}
 	now := coarseSeconds()
 	at := uint32(0)
 	if idle < now {
 		at = now - idle
+	}
+	// On the hot engine a just-RESTORE'd string key already lives on the engine with
+	// a seeded access word; rewrite that word's recency in place rather than seeding
+	// a shadow map entry the engine-first readers would never consult.
+	if hs := db.hotAcc.Load(); hs != nil {
+		if w, ok := hs.AccessWord(key); ok {
+			decr := accWordDecr(w)
+			if decr == 0 {
+				decr = uint16(coarseMinutes())
+			}
+			hs.SetAccessWord(key, packAccessWord(at, decr, accWordFreq(w)))
+			return
+		}
+	}
+	db.accessMu.Lock()
+	defer db.accessMu.Unlock()
+	if db.access == nil {
+		db.access = make(map[string]*keyAccess)
 	}
 	a := db.access[string(key)]
 	if a == nil {
@@ -250,6 +365,19 @@ func (db *DB) SetIdle(key []byte, idle uint32) {
 // SetFreq seeds a key's LFU counter, which is how RESTORE FREQ reconstructs the
 // frequency of a dumped key.
 func (db *DB) SetFreq(key []byte, freq uint8) {
+	// On the hot engine the key already carries its access word; overwrite the
+	// counter in place and restamp the decay minute, the word twin of the map seed
+	// below, so the engine-first readers see the restored frequency.
+	if hs := db.hotAcc.Load(); hs != nil {
+		if w, ok := hs.AccessWord(key); ok {
+			at := accWordTime(w)
+			if at == 0 {
+				at = coarseSeconds()
+			}
+			hs.SetAccessWord(key, packAccessWord(at, uint16(coarseMinutes()), freq))
+			return
+		}
+	}
 	db.accessMu.Lock()
 	defer db.accessMu.Unlock()
 	if db.access == nil {
@@ -276,6 +404,14 @@ func (db *DB) SetFreq(key []byte, freq uint8) {
 // calling recordAccess, so we check both the hot cache and the access map and
 // take the more recent atime. LFU frequency still comes from the access map.
 func (db *DB) accessMetrics(key []byte) (atime uint32, freq uint8) {
+	// On the hot engine the key's recency and frequency live inline on its entry, so
+	// the eviction sampler reads them straight off the word with no lock and no map
+	// probe. This is the F2/Redis principle the side map could not give the engine.
+	if hs := db.hotAcc.Load(); hs != nil {
+		if w, ok := hs.AccessWord(key); ok {
+			return accWordTime(w), db.lfuDecayWord(accWordFreq(w), accWordDecr(w), uint16(coarseMinutes()))
+		}
+	}
 	hotAtime, inCache := db.hc.Load().cgetAtime(key)
 
 	db.accessMu.Lock()
