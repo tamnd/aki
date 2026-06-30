@@ -2,6 +2,7 @@ package command
 
 import (
 	"bytes"
+	"strconv"
 
 	"github.com/tamnd/aki/keyspace"
 )
@@ -26,10 +27,15 @@ import (
 // huge sources is computed without an in-memory dedup set, the sharpest
 // larger-than-memory win in this family.
 //
-// One case keeps the materialize path: when the destination key is also one of the
-// sources (SINTERSTORE dst dst a). Writing into the destination while reading it
-// would mutate a source mid-walk, so the aliased case falls back to the buffered
-// compute, the same O(result) memory Redis itself uses to build a STORE result.
+// One case needs care: when the destination key is also one of the sources
+// (SINTERSTORE dst dst a). Writing the result into the destination while the walk
+// still reads it would mutate a source mid-walk. The aliased case streams the result
+// into a fresh scratch key with the same sink (so it still spills to disk and never
+// holds the result or any source whole), then installs the scratch onto the
+// destination: a coll result is handed over in O(1) by re-pointing its sub-tree
+// (db.CollMove), and a small blob result is copied across. So even an aliased store
+// off a source far larger than RAM stays bounded, where the old loadSets cloned every
+// input.
 
 // storeSink accumulates a streamed set-algebra result into a destination key. It
 // buffers members while the result still fits a blob (intset or listpack), and the
@@ -194,16 +200,16 @@ func (s *storeSink) finish() (n int64, deletedExisting bool, err error) {
 }
 
 // handleSetOpStore implements SINTERSTORE, SUNIONSTORE and SDIFFSTORE. When the
-// destination is independent of the sources it streams the result into the
-// destination without materializing any whole source (streamSetOpStore). When the
-// destination aliases a source it falls back to the buffered compute, which reads
-// every source before touching the destination (storeSetOpMaterialize).
+// destination is independent of the sources it streams the result straight into the
+// destination (streamSetOpStore). When the destination aliases a source it streams
+// into a scratch key first and installs that onto the destination, so neither path
+// materializes a whole source (streamSetOpStoreAliased).
 func handleSetOpStore(ctx *Ctx, op setOp) {
 	dst := ctx.Argv[1]
 	keys := ctx.Argv[2:]
 	for _, k := range keys {
 		if bytes.Equal(dst, k) {
-			storeSetOpMaterialize(ctx, op, dst, keys)
+			streamSetOpStoreAliased(ctx, op, dst, keys)
 			return
 		}
 	}
@@ -391,33 +397,72 @@ func driveUnion(db *keyspace.DB, keys [][]byte, hdrs []keyspace.ValueHeader, fou
 	return nil
 }
 
-// storeSetOpMaterialize is the fallback for SINTERSTORE/SUNIONSTORE/SDIFFSTORE when
-// the destination aliases a source. It reads every source in full before writing
-// the destination, so the destination read stays consistent while it is rewritten.
-// This is the same O(result) memory Redis uses to build any STORE result.
-func storeSetOpMaterialize(ctx *Ctx, op setOp, dst []byte, keys [][]byte) {
+// streamSetOpStoreAliased handles SINTERSTORE/SUNIONSTORE/SDIFFSTORE when the
+// destination key is also one of the sources. It runs the same bounded drive as
+// streamSetOpStore but lands the result in a fresh scratch key, so the walk can keep
+// reading the destination (an aliased source) while the result accumulates somewhere
+// else. Once the result is complete it is installed onto the destination: a spilled
+// coll result is handed over in O(1) by re-pointing its sub-tree, and a small blob
+// result is copied across. The scratch key lives only inside this one serialized
+// write, so no other command can observe it.
+func streamSetOpStoreAliased(ctx *Ctx, op setOp, dst []byte, keys [][]byte) {
 	var (
-		wrongTyp   bool
-		dstDeleted bool
-		n          int64
+		wrongTyp        bool
+		n               int64
+		deletedExisting bool
 	)
 	done := ctx.update(func(db *keyspace.DB) error {
-		sets, wt, err := loadSets(db, keys)
+		hdrs := make([]keyspace.ValueHeader, len(keys))
+		cards := make([]int64, len(keys))
+		found := make([]bool, len(keys))
+		for i, k := range keys {
+			c, hdr, f, err := setCard(db, k)
+			if err != nil {
+				return err
+			}
+			if f && hdr.Type != keyspace.TypeSet {
+				wrongTyp = true
+				return nil
+			}
+			cards[i], hdrs[i], found[i] = c, hdr, f
+		}
+
+		scratch, err := scratchKey(db, dst)
 		if err != nil {
 			return err
 		}
-		if wt {
-			wrongTyp = true
-			return nil
+		sink := newStoreSink(db, scratch, ctx.encLimits(), op == opUnion)
+
+		switch op {
+		case opUnion:
+			if err := driveUnion(db, keys, hdrs, found, sink); err != nil {
+				return err
+			}
+		default:
+			empty, err := driveInterDiff(db, op, keys, cards, hdrs, sink)
+			if err != nil {
+				return err
+			}
+			if empty {
+				existed, e := db.Delete(dst)
+				deletedExisting = existed
+				return e
+			}
 		}
-		result := computeSetOp(op, sets)
-		n = int64(len(result))
-		if len(result) == 0 {
-			existed, err := db.Delete(dst)
-			dstDeleted = existed
+
+		nn, _, err := sink.finish()
+		if err != nil {
 			return err
 		}
-		return db.Set(dst, setEncode(result), keyspace.TypeSet, setEncoding(ctx.encLimits(), result, keyspace.EncIntset), -1)
+		n = nn
+		if n == 0 {
+			// An empty result overwrites the destination with a delete; finish already
+			// left no scratch behind.
+			existed, e := db.Delete(dst)
+			deletedExisting = existed
+			return e
+		}
+		return installScratch(db, scratch, dst)
 	})
 	if !done {
 		return
@@ -428,8 +473,58 @@ func storeSetOpMaterialize(ctx *Ctx, op setOp, dst []byte, keys [][]byte) {
 	}
 	if n > 0 {
 		ctx.notify(notifySet, setStoreEvent(op), dst)
-	} else if dstDeleted {
+	} else if deletedExisting {
 		ctx.notify(notifyGeneric, "del", dst)
 	}
 	ctx.enc().WriteInteger(n)
+}
+
+// scratchStorePrefix leads every scratch key the aliased store path builds. The NUL
+// bytes keep it clear of ordinary keys, and scratchKey still probes for a free name
+// so a user key that somehow shares the prefix is never clobbered.
+const scratchStorePrefix = "\x00__aki_store_scratch__\x00"
+
+// scratchKey returns a key that does not currently exist, derived from dst. It probes
+// with an increasing integer suffix and returns the first free name, so it never
+// clobbers a live key even in the unlikely event one shares the prefix.
+func scratchKey(db *keyspace.DB, dst []byte) ([]byte, error) {
+	for i := 0; ; i++ {
+		cand := append([]byte(scratchStorePrefix), dst...)
+		cand = append(cand, ':')
+		cand = strconv.AppendInt(cand, int64(i), 10)
+		exists, err := db.Exists(cand)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return cand, nil
+		}
+	}
+}
+
+// installScratch moves the result built at scratch onto dst, overwriting dst. A
+// coll-form result is transferred in O(1) by re-pointing its sub-tree (CollMove); a
+// blob result (small by construction, under the listpack threshold) is read and
+// rewritten, then the scratch key is removed.
+func installScratch(db *keyspace.DB, scratch, dst []byte) error {
+	moved, err := db.CollMove(scratch, dst)
+	if err != nil {
+		return err
+	}
+	if moved {
+		return nil
+	}
+	body, hdr, found, err := db.Get(scratch)
+	if err != nil {
+		return err
+	}
+	if !found {
+		_, e := db.Delete(dst)
+		return e
+	}
+	if err := db.Set(dst, body, hdr.Type, hdr.Encoding, -1); err != nil {
+		return err
+	}
+	_, err = db.Delete(scratch)
+	return err
 }
