@@ -1,6 +1,8 @@
 package keyspace
 
 import (
+	"bytes"
+
 	"github.com/tamnd/aki/btree"
 	"github.com/tamnd/aki/encoding"
 )
@@ -888,5 +890,138 @@ func (db *DB) CollCopyTo(srcKey []byte, dst *DB, dstKey []byte) (ok bool, err er
 	}
 	dst.recordAccess(dstKey, !prevExisted)
 	dst.hc.Load().cinvalidate(dstKey)
+	return true, nil
+}
+
+// CollMove transfers the btree-backed collection at srcKey onto dstKey in the same
+// database, handing dst ownership of src's element sub-tree without copying a single
+// element: src's metadata row is removed (leaving the sub-tree intact), then dst's
+// metadata row is rewritten to point at that same sub-tree root, tearing down
+// whatever dst held before. The cost is O(1) regardless of how many elements the
+// collection holds, so a result far larger than RAM moves without ever materializing.
+// dst takes src's type, encoding, and metadata counters; its TTL is cleared (the
+// streamed STORE results that use this carry none). ok is false (and nothing changes)
+// when src is absent, not in coll form, or resident in the write overlay, so the
+// caller can fall back. src and dst must be distinct keys; the caller holds no shard
+// lock and relies on the serialized command writer so no op interleaves between the
+// two locked phases.
+//
+// This is the move twin of CollCopyTo: CollCopyTo keeps both keys by reproducing the
+// sub-tree (O(n) rows in RAM), while CollMove consumes src and re-points its sub-tree
+// (O(1), no rows in RAM), which is what a STORE into a scratch key followed by an
+// install onto the destination needs.
+func (db *DB) CollMove(srcKey, dstKey []byte) (ok bool, err error) {
+	if bytes.Equal(srcKey, dstKey) {
+		return false, nil
+	}
+	if db.newHL != nil {
+		// Hybrid never hosts coll keys (string-only engine); keep correctness with a
+		// deep copy plus delete in the unreachable case it ever does.
+		copied, e := db.hlCollCopyTo(srcKey, db, dstKey)
+		if e != nil || !copied {
+			return false, e
+		}
+		_, e = db.hlDelete(srcKey)
+		return copied, e
+	}
+
+	// Phase 1: under the source shard write lock, snapshot src's coll metadata and
+	// remove its row, deliberately NOT dropping the sub-tree (dst will adopt it).
+	ss := ShardOf(srcKey)
+	db.shards[ss].mu.Lock()
+	st := db.loadShardTree(ss)
+	if st == nil {
+		db.shards[ss].mu.Unlock()
+		return false, nil
+	}
+	sckp := ckPool.Get().(*[]byte)
+	*sckp = appendCompositeKey(*sckp, srcKey)
+	sck := *sckp
+	sh, sbody, sfound, rerr := db.read(st, sck)
+	if rerr != nil || !sfound || !sh.IsColl() || db.shards[ss].live[string(srcKey)] != nil {
+		ckPool.Put(sckp)
+		db.shards[ss].mu.Unlock()
+		return false, rerr
+	}
+	srcRoot := uint32(sh.BodyRef)
+	metaBody := append([]byte(nil), sbody...)
+	srcType, srcEnc := sh.Type, sh.Encoding
+	if _, derr := st.Delete(sck); derr != nil {
+		ckPool.Put(sckp)
+		db.shards[ss].mu.Unlock()
+		return false, derr
+	}
+	ckPool.Put(sckp)
+	db.shards[ss].rootPage = st.Root()
+	db.shards[ss].keyCount.Add(^uint64(0))
+	db.ks.dataBytes.Add(-(int64(len(srcKey)) + int64(sh.BodyLen) + entryOverhead))
+	db.dropAccess(srcKey)
+	db.hc.Load().cinvalidate(srcKey)
+	if sh.HasTTL() {
+		db.shards[ss].expireCount.Add(^uint64(0))
+	}
+	db.shards[ss].mu.Unlock()
+
+	// Phase 2: under the destination shard write lock, tear down dst's old value and
+	// install a metadata row pointing at src's sub-tree. The sub-tree root is now
+	// referenced by nobody until this Upsert lands, so a failure here only leaks it
+	// (no double reference), the safer side of the trade.
+	ds := ShardOf(dstKey)
+	db.shards[ds].mu.Lock()
+	defer db.shards[ds].mu.Unlock()
+	dt, err := db.ensureShardTree(ds)
+	if err != nil {
+		return false, err
+	}
+	dckp := ckPool.Get().(*[]byte)
+	*dckp = appendCompositeKey(*dckp, dstKey)
+	dck := *dckp
+	defer ckPool.Put(dckp)
+
+	prevH, _, prevExisted, err := db.read(dt, dck)
+	if err != nil {
+		return false, err
+	}
+	if prevExisted {
+		if prevH.IsColl() {
+			db.overlayEvictLocked(ds, dstKey)
+			if derr := btree.DropTree(db.ks.pgr, uint32(prevH.BodyRef)); derr != nil {
+				return false, derr
+			}
+		} else if prevH.Flags&FlagInlineBody == 0 && prevH.BodyRef != 0 {
+			if ferr := db.ks.freeOverflow(uint32(prevH.BodyRef)); ferr != nil {
+				return false, ferr
+			}
+		}
+	}
+
+	h := ValueHeader{
+		Type:     srcType,
+		Encoding: srcEnc,
+		Flags:    FlagInlineBody | FlagCollTree,
+		TTLms:    -1,
+		Version:  db.ks.version.next(dstKey),
+		BodyRef:  uint64(srcRoot),
+		BodyLen:  uint32(len(metaBody)),
+		RefCount: 1,
+	}
+	cell := h.AppendTo(make([]byte, 0, HeaderSize+len(metaBody)))
+	cell = append(cell, metaBody...)
+	if _, err := dt.Upsert(dck, cell); err != nil {
+		return false, err
+	}
+	db.shards[ds].rootPage = dt.Root()
+
+	if !prevExisted {
+		db.shards[ds].keyCount.Add(1)
+	} else {
+		db.ks.dataBytes.Add(-(int64(len(dstKey)) + int64(prevH.BodyLen) + entryOverhead))
+		if prevH.HasTTL() {
+			db.shards[ds].expireCount.Add(^uint64(0))
+		}
+	}
+	db.ks.dataBytes.Add(int64(len(dstKey)) + int64(len(metaBody)) + entryOverhead)
+	db.recordAccess(dstKey, !prevExisted)
+	db.hc.Load().cinvalidate(dstKey)
 	return true, nil
 }
