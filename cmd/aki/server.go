@@ -78,7 +78,7 @@ func cmdServer(args []string) error {
 	daemonize := fs.String("daemonize", "", "accepted for redis compatibility; only 'no' is supported")
 	loadRDB := fs.String("load-rdb", "", "import this dump.rdb on first open (only when the .aki file does not exist)")
 	rdbDB := fs.Int("rdb-db", -1, "with --load-rdb, import only this source database")
-	bufferPoolSize := fs.String("buffer-pool-size", "128mb", "buffer pool capacity (e.g. 128mb, 512mb); controls how much of the .aki file stays in memory")
+	bufferPoolSize := fs.String("buffer-pool-size", "auto", "buffer pool capacity (e.g. 128mb, 512mb); controls how much of the .aki file stays in memory. \"auto\" (default) sizes the pool to a quarter of a detected cgroup memory cap so the rest of the cap stays free for the OS page cache, and to 128mb on an uncapped host")
 	// Diagnostic admin endpoint (pprof, /metrics, health, ready). It defaults to
 	// 127.0.0.1:6399; --admin-port 0 disables it so several instances can share one
 	// host without colliding on the port.
@@ -522,6 +522,16 @@ const defaultPageBytes = 16384
 func parseBufPoolPages(s string) (int, error) {
 	if s == "" || s == "0" {
 		return 0, nil
+	}
+	// "auto" sizes the pool from the detected memory cap (cap-aware sizing, see
+	// memlimit.go): a quarter of a cgroup limit so the page cache keeps the rest,
+	// or the historical 128mb default on an uncapped host.
+	if strings.EqualFold(s, "auto") {
+		pages := int(autoBufferPoolBytes() / defaultPageBytes)
+		if pages < 64 {
+			pages = 64
+		}
+		return pages, nil
 	}
 	val, unit, _ := splitSuffix(s)
 	if val <= 0 {
