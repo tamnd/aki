@@ -496,12 +496,25 @@ func (t *Tree) delAr(pgno uint32, key []byte, ar *nodeArena) (bool, error) {
 	}
 	if pg.Data[0] != format.PageTypeBTreeLeaf {
 		// Interior node: find the child to follow on the page, then descend.
-		_, child, derr := descendOnPage(pg.Data, key)
+		ci, child, derr := descendOnPage(pg.Data, key)
 		t.pgr.Unpin(pg, false)
 		if derr != nil {
 			return false, derr
 		}
-		return t.delAr(child, key, ar)
+		removed, derr := t.delAr(child, key, ar)
+		if derr != nil {
+			return removed, derr
+		}
+		// On an order-statistic tree a genuine removal shrinks the descended
+		// child's subtree by one. Delete never merges or rebalances pages here, so
+		// the only count change is a single in-place decrement per ancestor, the
+		// mirror of the insert bump.
+		if removed && t.orderStat {
+			if berr := t.bumpChildCount(pgno, ci, -1); berr != nil {
+				return removed, berr
+			}
+		}
+		return removed, nil
 	}
 	n, derr := decodeNodeAr(pg.Data, ar)
 	t.pgr.Unpin(pg, false)
