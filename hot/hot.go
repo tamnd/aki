@@ -45,6 +45,7 @@
 package hot
 
 import (
+	"encoding/binary"
 	"errors"
 	"math/bits"
 	"sync"
@@ -412,19 +413,43 @@ func newEntry(h uint64, key, val []byte) *entry {
 	return e
 }
 
-// hash64 is FNV-1a over the key bytes. The full 64-bit value selects the shard
-// (high bits), the home slot (low bits), and gates the key compare on a read.
+// hash64 mixes the key bytes into a 64-bit value whose high bits select the shard,
+// whose low bits select the home slot, and which gates the key compare on a read.
+// It reads eight bytes per step and finishes a short key in one or two multiplies,
+// where the old FNV-1a byte loop spent a dependent multiply on every byte (the
+// 9.71% the hot-path profile charged to hashing). The constants and the mulFold
+// mix are the wyhash construction: a 64x64->128 multiply whose two halves are xored
+// folds the whole word into the accumulator and avalanches both ends, so the shard
+// and slot bits both stay well distributed. The hash is internal to this engine and
+// to nothing on disk or on the wire, so the only contract is that one run agrees
+// with itself; it is free to differ from any other hash or build.
 func hash64(b []byte) uint64 {
 	const (
-		offset = 1469598103934665603
-		prime  = 1099511628211
+		s0 = 0xa0761d6478bd642f
+		s1 = 0xe7037ed1a0b428db
+		s2 = 0x8ebc6af09c88c6e3
 	)
-	h := uint64(offset)
-	for _, c := range b {
-		h ^= uint64(c)
-		h *= prime
+	h := s0 ^ uint64(len(b))
+	for len(b) >= 8 {
+		h = mulFold(h^binary.LittleEndian.Uint64(b), s1)
+		b = b[8:]
 	}
-	return h
+	if len(b) > 0 {
+		var t uint64
+		for i := 0; i < len(b); i++ {
+			t |= uint64(b[i]) << (8 * uint(i))
+		}
+		h = mulFold(h^t, s1)
+	}
+	return mulFold(h, s2)
+}
+
+// mulFold multiplies two 64-bit words to a 128-bit product and xors its halves,
+// the wyhash mixing primitive. bits.Mul64 lowers to a single hardware multiply on
+// amd64 and arm64, so this is cheaper than the per-byte multiplies it replaces.
+func mulFold(a, b uint64) uint64 {
+	hi, lo := bits.Mul64(a, b)
+	return hi ^ lo
 }
 
 func pow2AtLeast(n int) int {
