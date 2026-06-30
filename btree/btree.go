@@ -98,6 +98,10 @@ func (a *nodeArena) allocNode(leaf bool, count int) *node {
 		n := &e.n
 		n.leaf = leaf
 		n.rightSibling = 0
+		// counts must be cleared on every reuse: the arena pool is global, so an
+		// order-statistic tree can leave a stale counts slice on this entry, and a
+		// plain tree decoding into it would otherwise be misread as augmented.
+		n.counts = nil
 		if leaf {
 			n.keys = e.keysBuf[:count]
 			n.vals = e.valsBuf[:count]
@@ -146,6 +150,11 @@ var ErrCellTooLarge = errors.New("aki/btree: entry too large for a page")
 type Tree struct {
 	pgr  *pager.Pager
 	root uint32
+	// orderStat makes this tree maintain per-child subtree row counts on its
+	// interior pages, so Rank and SelectAt run in O(log n). Only opt-in trees
+	// (the zset score sub-tree) set it; the keyspace tree and the other coll
+	// sub-trees leave it false and write plain interior pages.
+	orderStat bool
 }
 
 // Create allocates an empty leaf and returns a tree rooted at it.
@@ -159,11 +168,35 @@ func Create(pgr *pager.Pager) (*Tree, error) {
 	return t, nil
 }
 
+// CreateOrderStat allocates an empty order-statistic tree. Its interior pages
+// carry per-child subtree row counts, so it can answer Rank and SelectAt in
+// O(log n) once it grows past a single leaf.
+func CreateOrderStat(pgr *pager.Pager) (*Tree, error) {
+	t, err := Create(pgr)
+	if err != nil {
+		return nil, err
+	}
+	t.orderStat = true
+	return t, nil
+}
+
 // Open returns a tree rooted at the given page. The page is not read until the
 // first operation.
 func Open(pgr *pager.Pager, root uint32) *Tree {
 	return &Tree{pgr: pgr, root: root}
 }
+
+// OpenOrderStat opens an existing order-statistic tree at root. The caller is
+// responsible for only opening a tree this way that was created with
+// CreateOrderStat; a plain tree opened this way maintains no counts on the pages
+// it already has and Rank/SelectAt would be wrong, so the keyspace pairs the flag
+// with the tree at creation and never mixes the two.
+func OpenOrderStat(pgr *pager.Pager, root uint32) *Tree {
+	return &Tree{pgr: pgr, root: root, orderStat: true}
+}
+
+// OrderStat reports whether this tree maintains order-statistic counts.
+func (t *Tree) OrderStat() bool { return t.orderStat }
 
 // Root returns the current root page number.
 func (t *Tree) Root() uint32 { return t.root }
@@ -179,6 +212,11 @@ type node struct {
 	// keys are all less than keys[i], and children[len(keys)] is the rightmost
 	// subtree. So len(children) == len(keys)+1.
 	children []uint32
+	// counts is set only for interior nodes of an order-statistic (augmented)
+	// tree: counts[i] is the number of leaf rows in the subtree rooted at
+	// children[i], so len(counts) == len(children). A nil counts marks a plain
+	// interior node, which encodes and decodes exactly as before and pays nothing.
+	counts []uint32
 	// rightSibling links leaves left to right for range scans.
 	rightSibling uint32
 }
@@ -226,16 +264,12 @@ func (t *Tree) Put(key, val []byte) error {
 func (t *Tree) Upsert(key, val []byte) ([]byte, error) {
 	ar := nodeArenaPool.Get().(*nodeArena)
 	defer func() { ar.reset(); nodeArenaPool.Put(ar) }()
-	oldVal, sp, err := t.insertAr(t.root, key, val, ar)
+	oldVal, _, sp, err := t.insertAr(t.root, key, val, ar)
 	if err != nil {
 		return nil, err
 	}
 	if sp != nil {
-		newRoot, err := t.writeNewNodeAr(&node{
-			leaf:     false,
-			keys:     [][]byte{sp.sepKey},
-			children: []uint32{t.root, sp.right},
-		}, ar)
+		newRoot, err := t.writeNewNodeAr(t.newRootNode(sp), ar)
 		if err != nil {
 			return nil, err
 		}
@@ -245,10 +279,25 @@ func (t *Tree) Upsert(key, val []byte) ([]byte, error) {
 	return oldVal, nil
 }
 
+// newRootNode builds the interior root that replaces the old root after it split.
+// On an order-statistic tree it carries the two halves' counts so the new root's
+// counts are correct without a recount.
+func (t *Tree) newRootNode(sp *splitResult) *node {
+	n := &node{
+		leaf:     false,
+		keys:     [][]byte{sp.sepKey},
+		children: []uint32{t.root, sp.right},
+	}
+	if t.orderStat {
+		n.counts = []uint32{sp.leftCount, sp.rightCount}
+	}
+	return n
+}
+
 func (t *Tree) put(key, val []byte) error {
 	ar := nodeArenaPool.Get().(*nodeArena)
 	defer func() { ar.reset(); nodeArenaPool.Put(ar) }()
-	_, sp, err := t.insertAr(t.root, key, val, ar)
+	_, _, sp, err := t.insertAr(t.root, key, val, ar)
 	if err != nil {
 		return err
 	}
@@ -256,11 +305,7 @@ func (t *Tree) put(key, val []byte) error {
 		return nil
 	}
 	// The root split: build a new interior root over the two halves.
-	newRoot, err := t.writeNewNodeAr(&node{
-		leaf:     false,
-		keys:     [][]byte{sp.sepKey},
-		children: []uint32{t.root, sp.right},
-	}, ar)
+	newRoot, err := t.writeNewNodeAr(t.newRootNode(sp), ar)
 	if err != nil {
 		return err
 	}
@@ -270,40 +315,44 @@ func (t *Tree) put(key, val []byte) error {
 
 // splitResult reports that inserting into a child page split it: sepKey is the
 // separator to insert into the parent, and right is the new page holding the
-// upper half.
+// upper half. On an order-statistic tree leftCount and rightCount carry the row
+// counts of the two halves, so the parent can set its count for the old child to
+// leftCount and insert rightCount for the new one without recounting.
 type splitResult struct {
-	sepKey []byte
-	right  uint32
+	sepKey     []byte
+	right      uint32
+	leftCount  uint32
+	rightCount uint32
 }
 
 // insertAr traverses the tree from pgno and inserts key/val, using ar to avoid
 // per-cell heap allocations. It returns the previous value stored under key
 // (or nil if key was absent) so callers can inspect or free the old value in
 // a single traversal without a separate Get.
-func (t *Tree) insertAr(pgno uint32, key, val []byte, ar *nodeArena) (oldVal []byte, sp *splitResult, err error) {
+func (t *Tree) insertAr(pgno uint32, key, val []byte, ar *nodeArena) (oldVal []byte, inserted bool, sp *splitResult, err error) {
 	// Peek the page type without decoding the whole node. A leaf is decoded and
 	// modified as before; an interior node is descended by searching its
 	// separators directly on the page, so the common no-split case never decodes
 	// the interior levels at all.
 	pg, err := t.pgr.Get(pgno)
 	if err != nil {
-		return nil, nil, err
+		return nil, false, nil, err
 	}
 	if pg.Data[0] == format.PageTypeBTreeLeaf {
 		// Fast path: mutate the leaf bytes in place when the change fits the page's
 		// free gap, so a single-key write does O(cell) work instead of decoding and
 		// re-encoding the whole page. It cannot split, so a full page falls through
 		// to the decode path below, which compacts dead cells and splits if needed.
-		if ov, done := leafUpsertInPlace(pg.Data, key, val); done {
+		if ov, ins, done := leafUpsertInPlace(pg.Data, key, val); done {
 			t.pgr.Unpin(pg, true)
-			return ov, nil, nil
+			return ov, ins, nil, nil
 		}
 		n, derr := decodeNodeAr(pg.Data, ar)
 		t.pgr.Unpin(pg, false)
 		if derr != nil {
-			return nil, nil, derr
+			return nil, false, nil, derr
 		}
-		oldVal = n.upsertAr(key, val, ar)
+		oldVal, inserted = n.upsertAr(key, val, ar)
 		sp, err = t.writeOrSplitAr(pgno, n, ar)
 		return
 	}
@@ -311,10 +360,22 @@ func (t *Tree) insertAr(pgno uint32, key, val []byte, ar *nodeArena) (oldVal []b
 	ci, child, derr := descendOnPage(pg.Data, key)
 	t.pgr.Unpin(pg, false)
 	if derr != nil {
-		return nil, nil, derr
+		return nil, false, nil, derr
 	}
-	oldVal, sp, err = t.insertAr(child, key, val, ar)
-	if err != nil || sp == nil {
+	oldVal, inserted, sp, err = t.insertAr(child, key, val, ar)
+	if err != nil {
+		return
+	}
+	if sp == nil {
+		// No child split. On an order-statistic tree a genuine insert grows the
+		// descended child's subtree by one, so bump this node's count for that
+		// child in place. The bump is the only interior write the common insert
+		// does, and it touches four bytes without decoding the page.
+		if inserted && t.orderStat {
+			if berr := t.bumpChildCount(pgno, ci, 1); berr != nil {
+				return oldVal, inserted, nil, berr
+			}
+		}
 		return
 	}
 	// The child split. Only now decode this interior node so the new separator
@@ -325,12 +386,48 @@ func (t *Tree) insertAr(pgno uint32, key, val []byte, ar *nodeArena) (oldVal []b
 	// one and stays valid.
 	n, derr := t.readNodeAr(pgno, ar)
 	if derr != nil {
-		return oldVal, nil, derr
+		return oldVal, inserted, nil, derr
 	}
 	n.keys = insertBytes(n.keys, ci, sp.sepKey)
 	n.children = insertU32(n.children, ci+1, sp.right)
+	if t.orderStat {
+		// The split replaced the single child at ci with two: ci keeps the left
+		// half, ci+1 holds the right. Their counts come straight off the split, so
+		// this node's totals stay exact whether the underlying op was an insert or
+		// a same-key replace that happened to overflow the page.
+		n.counts[ci] = sp.leftCount
+		n.counts = insertU32(n.counts, ci+1, sp.rightCount)
+	}
 	sp, err = t.writeOrSplitAr(pgno, n, ar)
 	return
+}
+
+// bumpChildCount adds delta to the subtree row count this interior page stores
+// for the child at slot ci, writing the four count bytes in place without
+// decoding the page. ci == CellCount names the rightmost child, whose count lives
+// in the per-type header at byte 20; a lower ci names a cell, whose count sits
+// just past its four-byte child pointer.
+func (t *Tree) bumpChildCount(pgno uint32, ci int, delta int32) error {
+	pg, err := t.pgr.Get(pgno)
+	if err != nil {
+		return err
+	}
+	interiorBumpCount(pg.Data, ci, delta)
+	t.pgr.Unpin(pg, true)
+	return nil
+}
+
+// interiorBumpCount adds delta to the stored count for child slot ci on the
+// augmented interior page b.
+func interiorBumpCount(b []byte, ci int, delta int32) {
+	count := int(encoding.U16(b[2:]))
+	var off int
+	if ci >= count {
+		off = 20 // rightmost-child count in the per-type header
+	} else {
+		off = int(encoding.U16(b[slotsStart+2*ci:])) + 4 // just past the child pointer
+	}
+	encoding.PutU32(b[off:], uint32(int32(encoding.U32(b[off:]))+delta))
 }
 
 // writeOrSplitAr writes n back to pgno if it fits, otherwise splits it. It uses ar for encoding and split
@@ -356,7 +453,27 @@ func (t *Tree) writeOrSplitAr(pgno uint32, n *node, ar *nodeArena) (*splitResult
 	if err := t.writeNodeAr(pgno, left, ar); err != nil {
 		return nil, err
 	}
-	return &splitResult{sepKey: sep, right: rightNo}, nil
+	res := &splitResult{sepKey: sep, right: rightNo}
+	if t.orderStat {
+		res.leftCount = left.rowCount()
+		res.rightCount = right.rowCount()
+	}
+	return res, nil
+}
+
+// rowCount returns the number of leaf rows under this node: its own key count for
+// a leaf, or the sum of its child counts for an augmented interior node. It is
+// only called on an order-statistic tree, where every interior node carries
+// counts, so the interior branch never sees a nil counts slice.
+func (n *node) rowCount() uint32 {
+	if n.leaf {
+		return uint32(len(n.keys))
+	}
+	var total uint32
+	for _, c := range n.counts {
+		total += c
+	}
+	return total
 }
 
 // Delete removes key and reports whether it was present. Underfull pages are
@@ -482,11 +599,18 @@ func descendOnPage(b, key []byte) (ci int, child uint32, err error) {
 		return 0, 0, fmt.Errorf("aki/btree: descend on non-interior page (type 0x%02x)", h.Type)
 	}
 	count := int(h.CellCount)
+	// An augmented interior page carries a 4-byte subtree count after each child
+	// pointer, so its key prefix is 8 instead of 4; the child pointer itself still
+	// sits at the cell's first four bytes, so only the separator search shifts.
+	keyPrefix := 4
+	if h.Flags&format.FlagBTreeOrderStat != 0 {
+		keyPrefix = 8
+	}
 	// Descend into the child left of the first separator strictly greater than key,
 	// or the rightmost child when key is past every separator. The lower bound is the
 	// first separator >= key; an exact hit must descend to the right of its separator,
 	// so step one past an equal slot to match the original strict-less-than scan.
-	pos, found := searchSlots(b, count, 4, key)
+	pos, found := searchSlots(b, count, keyPrefix, key)
 	if found {
 		pos++
 	}
@@ -533,17 +657,17 @@ func leafLookup(b, key []byte) ([]byte, bool, error) {
 // if key is present), copying key and val into ar. It returns the previous
 // value for key, or nil if the key was not present. The returned slice is a
 // heap-owned copy safe to use after ar is reset.
-func (n *node) upsertAr(key, val []byte, ar *nodeArena) (oldVal []byte) {
+func (n *node) upsertAr(key, val []byte, ar *nodeArena) (oldVal []byte, inserted bool) {
 	i, ok := n.find(key)
 	v := ar.copy(val)
 	if ok {
 		oldVal = bytes.Clone(n.vals[i])
 		n.vals[i] = v
-		return
+		return oldVal, false
 	}
 	n.keys = insertBytes(n.keys, i, ar.copy(key))
 	n.vals = insertBytes(n.vals, i, v)
-	return nil
+	return nil, true
 }
 
 // leafUpsertInPlace inserts or replaces key/val directly in the leaf page bytes b
@@ -568,10 +692,10 @@ func (n *node) upsertAr(key, val []byte, ar *nodeArena) (oldVal []byte) {
 // from slotsStart, so the free gap is the run of bytes from FreeStart to FreeEnd.
 // Every case that returns done=true keeps that gap accounting correct: FreeEnd
 // drops by the new cell's length and, for an insert, FreeStart rises by one slot.
-func leafUpsertInPlace(b, key, val []byte) (oldVal []byte, done bool) {
+func leafUpsertInPlace(b, key, val []byte) (oldVal []byte, inserted, done bool) {
 	h, err := format.ParsePageHeader(b)
 	if err != nil || h.Type != format.PageTypeBTreeLeaf {
-		return nil, false
+		return nil, false, false
 	}
 	count := int(h.CellCount)
 	pos, matched := searchSlots(b, count, 0, key)
@@ -580,12 +704,12 @@ func leafUpsertInPlace(b, key, val []byte) (oldVal []byte, done bool) {
 		off := int(encoding.U16(b[slotsStart+2*pos:]))
 		kl, m, derr := encoding.Uvarint(b[off:])
 		if derr != nil {
-			return nil, false
+			return nil, false, false
 		}
 		vo := off + m + int(kl)
 		vl, m2, derr := encoding.Uvarint(b[vo:])
 		if derr != nil {
-			return nil, false
+			return nil, false, false
 		}
 		matchVStart = vo + m2
 		matchVLen = int(vl)
@@ -601,21 +725,21 @@ func leafUpsertInPlace(b, key, val []byte) (oldVal []byte, done bool) {
 			// Same length means the value-length varint is unchanged, so the value
 			// bytes can be overwritten where they already sit.
 			copy(b[matchVStart:], val)
-			return oldVal, true
+			return oldVal, false, true
 		}
 		if newCellLen > freeEnd-freeStart {
-			return oldVal, false
+			return oldVal, false, false
 		}
 		newOff := freeEnd - newCellLen
 		putLeafCell(b, newOff, key, val)
 		encoding.PutU16(b[slotsStart+2*pos:], uint16(newOff))
 		encoding.PutU16(b[6:], uint16(newOff)) // FreeEnd
-		return oldVal, true
+		return oldVal, false, true
 	}
 
 	// Insert a new key: the change needs the cell plus one 2-byte slot.
 	if newCellLen+2 > freeEnd-freeStart {
-		return nil, false
+		return nil, false, false
 	}
 	newOff := freeEnd - newCellLen
 	putLeafCell(b, newOff, key, val)
@@ -627,7 +751,7 @@ func leafUpsertInPlace(b, key, val []byte) (oldVal []byte, done bool) {
 	encoding.PutU16(b[4:], uint16(slotsEnd+2)) // FreeStart
 	encoding.PutU16(b[6:], uint16(newOff))     // FreeEnd
 	encoding.PutU16(b[20:], uint16(count+1))   // duplicated slot count in the per-type header
-	return nil, true
+	return nil, true, true
 }
 
 // putLeafCell writes a leaf cell (uvarint keylen, key, uvarint vallen, val) into b
@@ -661,6 +785,14 @@ func (n *node) splitAr(ar *nodeArena) (left, right *node, sep []byte) {
 	sep = n.keys[mid]
 	left = &node{keys: n.keys[:mid], children: n.children[:mid+1]}
 	right = &node{keys: n.keys[mid+1:], children: n.children[mid+1:]}
+	if n.counts != nil {
+		// Counts run parallel to children, so they split at the same boundary. The
+		// separator key at mid is promoted, not kept, but its child pointers and
+		// their counts stay: children[:mid+1] with the left half, children[mid+1:]
+		// with the right.
+		left.counts = n.counts[:mid+1]
+		right.counts = n.counts[mid+1:]
+	}
 	return left, right, sep
 }
 
@@ -690,11 +822,18 @@ func shortestSep(lo, hi []byte) []byte {
 // size returns the number of page bytes this node would occupy when serialized.
 func (n *node) size() int {
 	total := slotsStart + 2*len(n.keys)
+	// An augmented interior cell carries a 4-byte subtree count after its 4-byte
+	// child pointer, so its prefix is 8 bytes; the rightmost child's count reuses
+	// the redundant slot-count bytes in the per-type header and costs nothing here.
+	prefix := 4
+	if !n.leaf && n.counts != nil {
+		prefix = 8
+	}
 	for i, k := range n.keys {
 		if n.leaf {
 			total += cellLen(uvarintLen(uint64(len(k))) + len(k) + uvarintLen(uint64(len(n.vals[i]))) + len(n.vals[i]))
 		} else {
-			total += cellLen(4 + uvarintLen(uint64(len(k))) + len(k))
+			total += cellLen(prefix + uvarintLen(uint64(len(k))) + len(k))
 		}
 	}
 	return total
@@ -824,10 +963,19 @@ func decodeNodeAr(b []byte, ar *nodeArena) (*node, error) {
 	}
 
 	rightmost := encoding.U32(b[16:])
+	augmented := h.Flags&format.FlagBTreeOrderStat != 0
+	keyPrefix := 4
+	if augmented {
+		keyPrefix = 8
+		n.counts = make([]uint32, count+1)
+	}
 	for i := range count {
 		off := int(encoding.U16(b[slotsStart+2*i:]))
 		n.children[i] = encoding.U32(b[off:])
-		off += 4
+		if augmented {
+			n.counts[i] = encoding.U32(b[off+4:])
+		}
+		off += keyPrefix
 		kl, m, err := encoding.Uvarint(b[off:])
 		if err != nil {
 			return nil, err
@@ -836,6 +984,9 @@ func decodeNodeAr(b []byte, ar *nodeArena) (*node, error) {
 		n.keys[i] = ar.copy(b[off : off+int(kl)])
 	}
 	n.children[count] = rightmost
+	if augmented {
+		n.counts[count] = encoding.U32(b[20:])
+	}
 	return n, nil
 }
 
@@ -878,10 +1029,19 @@ func decodeNode(b []byte) (*node, error) {
 	rightmost := encoding.U32(b[16:])
 	n.keys = make([][]byte, count)
 	n.children = make([]uint32, count+1)
+	augmented := h.Flags&format.FlagBTreeOrderStat != 0
+	keyPrefix := 4
+	if augmented {
+		keyPrefix = 8
+		n.counts = make([]uint32, count+1)
+	}
 	for i := range count {
 		off := int(encoding.U16(b[slotsStart+2*i:]))
 		n.children[i] = encoding.U32(b[off:])
-		off += 4
+		if augmented {
+			n.counts[i] = encoding.U32(b[off+4:])
+		}
+		off += keyPrefix
 		kl, m, err := encoding.Uvarint(b[off:])
 		if err != nil {
 			return nil, err
@@ -890,6 +1050,9 @@ func decodeNode(b []byte) (*node, error) {
 		n.keys[i] = bytes.Clone(b[off : off+int(kl)])
 	}
 	n.children[count] = rightmost
+	if augmented {
+		n.counts[count] = encoding.U32(b[20:])
+	}
 	return n, nil
 }
 
@@ -929,6 +1092,7 @@ func encodeNodeAr(b []byte, n *node, ar *nodeArena) error {
 	}
 	count := len(n.keys)
 	end := len(b)
+	augmented := !n.leaf && n.counts != nil
 
 	for i := range count {
 		ar.tmp = ar.tmp[:0]
@@ -939,6 +1103,9 @@ func encodeNodeAr(b []byte, n *node, ar *nodeArena) error {
 			ar.tmp = append(ar.tmp, n.vals[i]...)
 		} else {
 			ar.tmp = encoding.AppendU32(ar.tmp, n.children[i])
+			if augmented {
+				ar.tmp = encoding.AppendU32(ar.tmp, n.counts[i])
+			}
 			ar.tmp = encoding.AppendUvarint(ar.tmp, uint64(len(n.keys[i])))
 			ar.tmp = append(ar.tmp, n.keys[i]...)
 		}
@@ -947,6 +1114,19 @@ func encodeNodeAr(b []byte, n *node, ar *nodeArena) error {
 		encoding.PutU16(b[slotsStart+2*i:], uint16(end))
 	}
 
+	if err := writeNodeHeader(b, n, count, end, augmented); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeNodeHeader fills the common header and the per-type header after the cells
+// have been packed. For an augmented interior page it sets the order-statistic
+// flag and stores the rightmost child's subtree count in the per-type header
+// (bytes 20..24) in place of the redundant slot-count and slot-array-start a
+// plain page keeps there; the decoder recovers those two from the common header
+// and the fixed slot start, so nothing is lost.
+func writeNodeHeader(b []byte, n *node, count, end int, augmented bool) error {
 	h := format.PageHeader{
 		CellCount: uint16(count),
 		FreeStart: uint16(slotsStart + 2*count),
@@ -956,6 +1136,9 @@ func encodeNodeAr(b []byte, n *node, ar *nodeArena) error {
 		h.Type = format.PageTypeBTreeLeaf
 	} else {
 		h.Type = format.PageTypeBTreeInt
+		if augmented {
+			h.Flags = format.FlagBTreeOrderStat
+		}
 	}
 	if err := h.MarshalTo(b); err != nil {
 		return err
@@ -963,11 +1146,17 @@ func encodeNodeAr(b []byte, n *node, ar *nodeArena) error {
 
 	if n.leaf {
 		encoding.PutU32(b[16:], n.rightSibling)
-	} else {
-		encoding.PutU32(b[16:], n.children[count])
+		encoding.PutU16(b[20:], uint16(count))
+		encoding.PutU16(b[22:], slotsStart)
+		return nil
 	}
-	encoding.PutU16(b[20:], uint16(count))
-	encoding.PutU16(b[22:], slotsStart)
+	encoding.PutU32(b[16:], n.children[count])
+	if augmented {
+		encoding.PutU32(b[20:], n.counts[count]) // rightmost child's subtree count
+	} else {
+		encoding.PutU16(b[20:], uint16(count))
+		encoding.PutU16(b[22:], slotsStart)
+	}
 	return nil
 }
 
@@ -983,6 +1172,7 @@ func encodeNode(b []byte, n *node) error {
 	}
 	count := len(n.keys)
 	end := len(b)
+	augmented := !n.leaf && n.counts != nil
 
 	for i := range count {
 		var cell []byte
@@ -993,6 +1183,9 @@ func encodeNode(b []byte, n *node) error {
 			cell = append(cell, n.vals[i]...)
 		} else {
 			cell = encoding.AppendU32(cell, n.children[i])
+			if augmented {
+				cell = encoding.AppendU32(cell, n.counts[i])
+			}
 			cell = encoding.AppendUvarint(cell, uint64(len(n.keys[i])))
 			cell = append(cell, n.keys[i]...)
 		}
@@ -1001,29 +1194,7 @@ func encodeNode(b []byte, n *node) error {
 		encoding.PutU16(b[slotsStart+2*i:], uint16(end))
 	}
 
-	h := format.PageHeader{
-		CellCount: uint16(count),
-		FreeStart: uint16(slotsStart + 2*count),
-		FreeEnd:   uint16(end),
-	}
-	if n.leaf {
-		h.Type = format.PageTypeBTreeLeaf
-	} else {
-		h.Type = format.PageTypeBTreeInt
-	}
-	if err := h.MarshalTo(b); err != nil {
-		return err
-	}
-
-	if n.leaf {
-		encoding.PutU32(b[16:], n.rightSibling)
-	} else {
-		encoding.PutU32(b[16:], n.children[count])
-	}
-	// slot_count and slot_array_start, kept in sync with the common header.
-	encoding.PutU16(b[20:], uint16(count))
-	encoding.PutU16(b[22:], slotsStart)
-	return nil
+	return writeNodeHeader(b, n, count, end, augmented)
 }
 
 // uvarintLen returns how many bytes encoding.AppendUvarint uses for v.

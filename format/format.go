@@ -96,6 +96,16 @@ const (
 	EncryptionAESGCM uint8 = 0x01
 )
 
+// Page-flag bits in the common header's Flags byte. Only B-tree pages use it so
+// far. FlagBTreeOrderStat marks an interior page as order-statistic augmented:
+// each child pointer carries a 4-byte subtree row count, so a rank or select is
+// one root-to-leaf descent. Plain interior pages leave the byte zero and read
+// exactly as before, so the bit is backward compatible with files written before
+// it existed (spec 2064 doc 04, implementation note 345).
+const (
+	FlagBTreeOrderStat uint8 = 1 << 0
+)
+
 // File-flag bits in the header's file_flags field (doc 02 §4).
 const (
 	FileFlagInMemory          uint32 = 1 << 0
