@@ -82,6 +82,18 @@ func (c *coldLog) readInto(off uint64, n int, dst []byte) ([]byte, error) {
 	if _, err := c.f.ReadAt(dst, int64(off)); err != nil {
 		return dst[:0], err
 	}
+	// Drop the page cache for exactly the range just read so cold reads never
+	// accumulate cache. WiscKey separation only keeps its promise (resident footprint
+	// near index-plus-keys) if the cold values do not linger in the OS page cache: a
+	// buffered pread pulls each touched value page in, and under a hard memory cap
+	// smaller than the value bytes that cache races the kernel reclaimer and trips the
+	// cgroup OOM killer before reclaim catches up (observed: f1srv killed with anon-rss
+	// near zero, the cgroup filled by cold-read page cache alone). Advising only the
+	// just-read range away after each read holds the resident cache to the handful of
+	// in-flight reads regardless of read volume, so the footprint stays at
+	// index-plus-keys. A real bounded read cache that keeps hot values resident is
+	// milestone M3; M1 just holds the invariant.
+	c.adviseDontNeed(off, n)
 	return dst, nil
 }
 
