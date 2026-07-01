@@ -57,9 +57,11 @@ const (
 	errStreamIDSmaller  = "ERR The ID specified in XADD is equal or smaller than the target stream top item"
 	errStreamIDNotGT0   = "ERR The ID specified in XADD must be greater than 0-0"
 	errStreamInvalidID  = "ERR Invalid stream ID specified as stream command argument"
-	errStreamUnbalanced = "ERR Unbalanced XREAD list of streams: for each stream key there should be an id"
-	errStreamCountER    = "ERR value is not an integer or out of range"
-	errStreamReadCount  = "ERR COUNT must be a positive integer"
+	// The unbalanced-streams message names the command and the id forms it accepts, so XREAD and
+	// XREADGROUP report it exactly the way Redis does (they differ in wording).
+	errStreamUnbalanced      = "ERR Unbalanced 'xread' list of streams: for each stream key an ID, '+', or '$' must be specified."
+	errStreamUnbalancedGroup = "ERR Unbalanced 'xreadgroup' list of streams: for each stream key an ID or '>' must be specified."
+	errStreamCountER         = "ERR value is not an integer or out of range"
 	errStreamTimeoutNeg = "ERR timeout is negative"
 	errStreamTimeoutInt = "ERR timeout is not an integer or out of range"
 	errStreamMaxLenArg  = "ERR The MAXLEN argument must be >= 0."
@@ -406,10 +408,12 @@ func (c *connState) streamTrim(skey []byte, prefix []byte, length uint64, ts str
 
 // dropStream removes a stream's entry rows and its header, the DEL/UNLINK cascade for a stream key.
 // A stream is the one collection whose header outlives an empty entry range, so dropStream is the
-// only path (besides expiry) that removes the header. Later slices extend it to drop the group,
-// consumer, and PEL sibling families.
+// only path (besides expiry) that removes the header. It also drops the consumer-group sibling
+// families (group control rows, consumer rows, and PEL rows), which live under their own family
+// tags off the same stream key, so a DEL of a stream carrying groups leaves no orphan rows.
 func (c *connState) dropStream(skey []byte) {
 	c.dropCollIndex(c.streamEntryPrefix(skey), kindStreamEntry)
+	c.dropStreamGroups(skey)
 	c.srv.store.DeleteKind(skey, kindStreamMeta)
 }
 
@@ -686,11 +690,17 @@ func (c *connState) cmdXRead(argv [][]byte) {
 				return
 			}
 			n, err := strconv.Atoi(string(argv[i+1]))
-			if err != nil || n <= 0 {
-				c.writeErr(errStreamReadCount)
+			if err != nil {
+				c.writeErr(errStreamNotInt)
 				return
 			}
-			count = n
+			// Redis clamps a non-positive COUNT to "no limit" rather than rejecting it, so a
+			// zero or negative count stays the unbounded sentinel.
+			if n > 0 {
+				count = n
+			} else {
+				count = -1
+			}
 			i += 2
 		case "BLOCK":
 			if i+1 >= len(argv) {
