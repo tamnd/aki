@@ -168,6 +168,30 @@ func TestColdIncrOnSeparated(t *testing.T) {
 	}
 }
 
+// TestColdRepeatedReadsDropCache drives many separated reads that each advise their
+// range out of the page cache (FADV_DONTNEED on Linux, a no-op elsewhere) and confirms
+// every value still reads back byte-identical. Correctness must not depend on whether
+// the cache was dropped: dropping only affects residency, never the bytes returned, so
+// re-reading a value whose pages were just advised away must still succeed.
+func TestColdRepeatedReadsDropCache(t *testing.T) {
+	s := newColdStore(t, 512)
+	const n = 64
+	val := strings.Repeat("q", 2048)
+	for i := 0; i < n; i++ {
+		if err := s.Set([]byte{'k', byte(i)}, []byte(val)); err != nil {
+			t.Fatalf("Set %d: %v", i, err)
+		}
+	}
+	for round := 0; round < 4; round++ {
+		for i := 0; i < n; i++ {
+			got, ok := s.Get([]byte{'k', byte(i)}, nil)
+			if !ok || string(got) != val {
+				t.Fatalf("round %d key %d read back wrong across a cache drop (ok=%v)", round, i, ok)
+			}
+		}
+	}
+}
+
 // TestColdInlinePathUnchanged is a guard that opening a cold log does not alter the
 // small-value path: a sub-threshold value stays inline and behaves exactly as it does
 // on a pure in-memory store.
