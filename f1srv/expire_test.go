@@ -420,3 +420,109 @@ func TestGetEx(t *testing.T) {
 	cmd(t, rw, "GETEX", "lst")
 	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
 }
+
+// TestStringTTLFamily covers the string commands that set or drop a value together with its
+// TTL: SETEX, PSETEX, SETNX, GETDEL, and GETSET. Every reply here was captured from live
+// Redis 8.8.0.
+func TestStringTTLFamily(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	// SETEX writes the value and a seconds TTL, readable back through TTL.
+	cmd(t, rw, "SETEX", "a", "100", "v")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "GET", "a")
+	expect(t, rw, "$v")
+	cmd(t, rw, "TTL", "a")
+	expect(t, rw, ":100")
+	// PSETEX is the millisecond form.
+	cmd(t, rw, "PSETEX", "b", "100000", "w")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "TTL", "b")
+	expect(t, rw, ":100")
+	// SETEX overwrites any existing type, and the key reads back as a string.
+	cmd(t, rw, "RPUSH", "lst", "x")
+	expect(t, rw, ":1")
+	cmd(t, rw, "SETEX", "lst", "100", "now-a-string")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "TYPE", "lst")
+	expect(t, rw, "+string")
+	cmd(t, rw, "GET", "lst")
+	expect(t, rw, "$now-a-string")
+
+	// SETEX / PSETEX time must be strictly positive, checked before any write.
+	cmd(t, rw, "SET", "keep", "orig")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "SETEX", "keep", "0", "z")
+	expect(t, rw, "-ERR invalid expire time in 'setex' command")
+	cmd(t, rw, "SETEX", "keep", "-1", "z")
+	expect(t, rw, "-ERR invalid expire time in 'setex' command")
+	cmd(t, rw, "PSETEX", "keep", "0", "z")
+	expect(t, rw, "-ERR invalid expire time in 'psetex' command")
+	cmd(t, rw, "GET", "keep")
+	expect(t, rw, "$orig")
+	cmd(t, rw, "SETEX", "keep", "notanint", "z")
+	expect(t, rw, "-ERR value is not an integer or out of range")
+	cmd(t, rw, "SETEX", "keep", "100")
+	expect(t, rw, "-ERR wrong number of arguments for 'setex' command")
+	cmd(t, rw, "PSETEX", "keep", "100")
+	expect(t, rw, "-ERR wrong number of arguments for 'psetex' command")
+
+	// SETNX writes only when the key is absent, and carries no TTL.
+	cmd(t, rw, "SETNX", "n", "first")
+	expect(t, rw, ":1")
+	cmd(t, rw, "TTL", "n")
+	expect(t, rw, ":-1")
+	cmd(t, rw, "SETNX", "n", "second")
+	expect(t, rw, ":0")
+	cmd(t, rw, "GET", "n")
+	expect(t, rw, "$first")
+	cmd(t, rw, "SETNX", "n")
+	expect(t, rw, "-ERR wrong number of arguments for 'setnx' command")
+	// An expired key is absent to SETNX.
+	cmd(t, rw, "SET", "gone", "old")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "PEXPIREAT", "gone", "1")
+	expect(t, rw, ":1")
+	cmd(t, rw, "SETNX", "gone", "fresh")
+	expect(t, rw, ":1")
+	cmd(t, rw, "GET", "gone")
+	expect(t, rw, "$fresh")
+
+	// GETDEL returns the value and deletes the key, clearing its TTL.
+	cmd(t, rw, "SETEX", "gd", "100", "bye")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "GETDEL", "gd")
+	expect(t, rw, "$bye")
+	cmd(t, rw, "EXISTS", "gd")
+	expect(t, rw, ":0")
+	cmd(t, rw, "GETDEL", "gd")
+	expect(t, rw, "$-1")
+	// GETDEL on a non-string is WRONGTYPE and does not delete.
+	cmd(t, rw, "RPUSH", "gdlst", "a")
+	expect(t, rw, ":1")
+	cmd(t, rw, "GETDEL", "gdlst")
+	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
+	cmd(t, rw, "EXISTS", "gdlst")
+	expect(t, rw, ":1")
+	cmd(t, rw, "GETDEL")
+	expect(t, rw, "-ERR wrong number of arguments for 'getdel' command")
+
+	// GETSET returns the old value, sets the new one, and clears any TTL.
+	cmd(t, rw, "SETEX", "gs", "100", "old")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "GETSET", "gs", "new")
+	expect(t, rw, "$old")
+	cmd(t, rw, "GET", "gs")
+	expect(t, rw, "$new")
+	cmd(t, rw, "TTL", "gs")
+	expect(t, rw, ":-1")
+	cmd(t, rw, "GETSET", "fresh", "created")
+	expect(t, rw, "$-1")
+	cmd(t, rw, "GET", "fresh")
+	expect(t, rw, "$created")
+	cmd(t, rw, "GETSET", "gdlst", "z")
+	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
+	cmd(t, rw, "GETSET", "gs")
+	expect(t, rw, "-ERR wrong number of arguments for 'getset' command")
+}
