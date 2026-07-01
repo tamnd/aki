@@ -1,6 +1,7 @@
 package f1srv
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"math/rand/v2"
@@ -597,4 +598,109 @@ func (c *connState) cmdSPop(argv [][]byte) {
 	for _, m := range members {
 		c.writeBulk(m)
 	}
+}
+
+// lockTwoStripes takes the stripe locks for two keys in a fixed order (lower stripe
+// index first) so two SMOVEs touching the same pair of keys from opposite directions
+// can never deadlock, and returns an unlock closure. When both keys map to the same
+// stripe it locks that one mutex once and unlocks it once, since a sync.Mutex is not
+// reentrant. This is the first two-key write on f1raw; every prior collection write
+// took exactly one stripe lock.
+func (c *connState) lockTwoStripes(a, b []byte) func() {
+	sa := c.srv.stripe(a)
+	sb := c.srv.stripe(b)
+	if sa == sb {
+		mu := &c.srv.incrMu[sa]
+		mu.Lock()
+		return mu.Unlock
+	}
+	lo, hi := sa, sb
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	mlo := &c.srv.incrMu[lo]
+	mhi := &c.srv.incrMu[hi]
+	mlo.Lock()
+	mhi.Lock()
+	return func() {
+		mhi.Unlock()
+		mlo.Unlock()
+	}
+}
+
+// cmdSMove atomically moves one member from a source set to a destination set (spec
+// 2064/f1_rewrite_ltm/06 section 8.9): it removes the member row from the source and
+// adds it to the destination under both sets' stripe locks, keeping both header counts
+// in step, and returns 1 when the member moved or 0 when the member was not in the
+// source (in which case the destination is untouched). If the member already lives in
+// the destination it is only removed from the source, never duplicated. A source that
+// equals the destination is a no-op that reports whether the member is present. Either
+// key holding a plain string is WRONGTYPE.
+func (c *connState) cmdSMove(argv [][]byte) {
+	// SMOVE source destination member
+	if len(argv) != 4 {
+		c.writeErr("ERR wrong number of arguments for 'smove' command")
+		return
+	}
+	source, destination, member := argv[1], argv[2], argv[3]
+
+	unlock := c.lockTwoStripes(source, destination)
+	if c.stringConflict(source) || c.stringConflict(destination) {
+		unlock()
+		c.writeErr(wrongType)
+		return
+	}
+
+	// Source and destination the same set: the move is a no-op, so just report whether
+	// the member is present without touching any row or count.
+	if bytes.Equal(source, destination) {
+		present := c.srv.store.ExistsKind(c.memberKey(source, member), kindSetMember)
+		unlock()
+		if present {
+			c.writeInt(1)
+			return
+		}
+		c.writeInt(0)
+		return
+	}
+
+	// Not in the source: nothing moves and the destination stays untouched.
+	srcMK := c.memberKey(source, member)
+	if !c.srv.store.ExistsKind(srcMK, kindSetMember) {
+		unlock()
+		c.writeInt(0)
+		return
+	}
+
+	// Remove from the source and decrement its header, deleting the header at zero.
+	if c.srv.store.DeleteKind(srcMK, kindSetMember) {
+		c.srv.store.CollRemove(srcMK)
+	}
+	if sc := c.setCard(source); sc > 0 {
+		if err := c.setSetCard(source, sc-1); err != nil {
+			unlock()
+			c.writeErr("ERR " + err.Error())
+			return
+		}
+	}
+
+	// Add to the destination only if absent, so a member already there is not
+	// duplicated and the header count only rises on a genuine insert.
+	dstMK := c.memberKey(destination, member)
+	isNew, err := c.srv.store.PutKind(dstMK, nil, kindSetMember)
+	if err != nil {
+		unlock()
+		c.writeErr("ERR " + err.Error())
+		return
+	}
+	if isNew {
+		c.srv.store.CollInsert(dstMK, kindSetMember)
+		if err := c.setSetCard(destination, c.setCard(destination)+1); err != nil {
+			unlock()
+			c.writeErr("ERR " + err.Error())
+			return
+		}
+	}
+	unlock()
+	c.writeInt(1)
 }
