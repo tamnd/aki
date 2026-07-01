@@ -29,6 +29,7 @@ type Config struct {
 	ArenaBytes   int    // f1raw arena size in bytes
 	ReadBufSize  int    // initial per-connection read buffer
 	IncrStripes  int    // INCR-family RMW lock stripes (rounded up to a power of two)
+	NetMode      string // "go" (goroutine-per-conn, default) or "reactor" (Linux epoll)
 }
 
 // DefaultConfig returns a config sized for a multi-million-key in-memory benchmark.
@@ -107,9 +108,14 @@ func (s *Server) Listen() error {
 }
 
 // ListenAndServe binds (if not already bound) and accepts connections until the
-// listener is closed. Each connection runs on its own goroutine.
+// listener is closed. With NetMode "reactor" on Linux it hands the listener to the
+// epoll event-loop driver; otherwise, and everywhere reactor is unavailable, each
+// connection runs on its own goroutine.
 func (s *Server) ListenAndServe() error {
 	if err := s.Listen(); err != nil {
+		return err
+	}
+	if handled, err := serveWithReactor(s); handled {
 		return err
 	}
 	for {

@@ -3,16 +3,26 @@ package f1srv
 import (
 	"bufio"
 	"net"
+	"os"
 	"testing"
 	"time"
 )
 
 // dialTestServer starts a server on an ephemeral port and returns a connected
 // buffered reader/writer plus a cleanup. The store is sized small; the tests only
-// exercise correctness, not scale.
+// exercise correctness, not scale. Setting F1SRV_TEST_NET=reactor runs the whole suite
+// through the epoll driver on Linux, so the reactor's net path is covered by the same
+// command tests as the goroutine path with one environment switch.
 func dialTestServer(t *testing.T) (*bufio.ReadWriter, func()) {
 	t.Helper()
-	cfg := Config{Addr: "127.0.0.1:0", IndexBuckets: 1 << 12, ArenaBytes: 1 << 20, ReadBufSize: 4 << 10, IncrStripes: 64}
+	return dialTestServerMode(t, os.Getenv("F1SRV_TEST_NET"))
+}
+
+// dialTestServerMode is dialTestServer with an explicit net mode, so a Linux-only test
+// can force the reactor regardless of the environment.
+func dialTestServerMode(t *testing.T, netMode string) (*bufio.ReadWriter, func()) {
+	t.Helper()
+	cfg := Config{Addr: "127.0.0.1:0", IndexBuckets: 1 << 12, ArenaBytes: 1 << 20, ReadBufSize: 4 << 10, IncrStripes: 64, NetMode: netMode}
 	srv := New(cfg)
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("listen: %v", err)
