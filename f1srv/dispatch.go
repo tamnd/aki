@@ -87,6 +87,12 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdSDiff(argv)
 	case eqFold(cmd, "SINTERCARD"):
 		c.cmdSInterCard(argv)
+	case eqFold(cmd, "SINTERSTORE"):
+		c.cmdSInterStore(argv)
+	case eqFold(cmd, "SUNIONSTORE"):
+		c.cmdSUnionStore(argv)
+	case eqFold(cmd, "SDIFFSTORE"):
+		c.cmdSDiffStore(argv)
 	case eqFold(cmd, "PING"):
 		c.cmdPing(argv)
 	case eqFold(cmd, "ECHO"):
