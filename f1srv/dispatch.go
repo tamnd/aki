@@ -227,6 +227,8 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdXClaim(argv)
 	case eqFold(cmd, "XAUTOCLAIM"):
 		c.cmdXAutoClaim(argv)
+	case eqFold(cmd, "XINFO"):
+		c.cmdXInfo(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
