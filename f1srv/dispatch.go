@@ -93,6 +93,18 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdSUnionStore(argv)
 	case eqFold(cmd, "SDIFFSTORE"):
 		c.cmdSDiffStore(argv)
+	case eqFold(cmd, "ZADD"):
+		c.cmdZAdd(argv)
+	case eqFold(cmd, "ZINCRBY"):
+		c.cmdZIncrBy(argv)
+	case eqFold(cmd, "ZSCORE"):
+		c.cmdZScore(argv)
+	case eqFold(cmd, "ZMSCORE"):
+		c.cmdZMScore(argv)
+	case eqFold(cmd, "ZCARD"):
+		c.cmdZCard(argv)
+	case eqFold(cmd, "ZREM"):
+		c.cmdZRem(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
