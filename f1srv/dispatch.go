@@ -74,6 +74,10 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdRandomKey(argv)
 	case eqFold(cmd, "TOUCH"):
 		c.cmdTouch(argv)
+	case eqFold(cmd, "RENAME"):
+		c.cmdRename(argv)
+	case eqFold(cmd, "RENAMENX"):
+		c.cmdRenameNx(argv)
 	case eqFold(cmd, "HSET"):
 		c.cmdHSet(argv)
 	case eqFold(cmd, "HMSET"):
