@@ -120,6 +120,7 @@ func (s *Store) DeleteKind(key []byte, kind byte) bool {
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
 			s.count.Add(-1)
+			s.addTop(kind, -1)
 			return true
 		}
 	}
@@ -144,6 +145,7 @@ func (s *Store) TakeKind(key, dst []byte, kind byte) ([]byte, bool) {
 		v := s.readValue(off, dst)
 		if b.slots[slot].CompareAndSwap(word, 0) {
 			s.count.Add(-1)
+			s.addTop(kind, -1)
 			return v, true
 		}
 	}

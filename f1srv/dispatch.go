@@ -341,7 +341,7 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.srv.store.Reset()
 		c.writeSimple("OK")
 	case eqFold(cmd, "DBSIZE"):
-		c.writeInt(int64(c.srv.store.Len()))
+		c.writeInt(int64(c.srv.store.TopLen()))
 	case eqFold(cmd, "SELECT") || eqFold(cmd, "CLIENT") || eqFold(cmd, "CONFIG") ||
 		eqFold(cmd, "RESET"):
 		c.writeSimple("OK")
