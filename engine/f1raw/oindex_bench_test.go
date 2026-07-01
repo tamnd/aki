@@ -103,6 +103,98 @@ func BenchmarkOIndexSelectAt(b *testing.B) {
 	}
 }
 
+// benchStoreVals builds one target collection of `target` members, each with a
+// valBytes-long value, embedded in `others` unrelated single-member collections. It is
+// benchStore with a realistic value width so the value-carrying enumeration benchmark
+// copies a real payload per field rather than a one-byte token.
+func benchStoreVals(others, target, valBytes int) (*Store, []byte) {
+	s := New(1<<20, 1<<27)
+	val := bytes.Repeat([]byte("x"), valBytes)
+	for i := 0; i < others; i++ {
+		coll := fmt.Sprintf("other%08d", i)
+		k := collKey(coll, "m")
+		if _, err := s.PutKind(k, val, kindTestField); err != nil {
+			panic(err)
+		}
+		s.CollInsert(k, kindTestField)
+	}
+	for i := 0; i < target; i++ {
+		k := collKey("target", fmt.Sprintf("f%08d", i))
+		if _, err := s.PutKind(k, val, kindTestField); err != nil {
+			panic(err)
+		}
+		s.CollInsert(k, kindTestField)
+	}
+	return s, collPrefix("target")
+}
+
+// BenchmarkOIndexEnumerateValues settles the value-carrying enumeration decision (task
+// #190): HGETALL/HVALS walk the ordered index for the field keys, then must produce each
+// field's value. The "split" path re-resolves every value with a GetKind (a fresh hash
+// plus a bucket probe per field), the way the first cut did; the "fused" path reads the
+// value straight from the record offset the ordered walk already yielded (CollScanKV plus
+// ReadValueAt), so a field is one lookup instead of two. Both drain the same target
+// collection in the same 256-key batches a real HGETALL uses, so the delta is purely the
+// per-field second lookup the fused path drops.
+func BenchmarkOIndexEnumerateValues(b *testing.B) {
+	for _, sz := range []struct{ others, target int }{
+		{100000, 100},
+		{100000, 1000},
+	} {
+		s, prefix := benchStoreVals(sz.others, sz.target, 64)
+
+		b.Run(fmt.Sprintf("split/others=%d/target=%d", sz.others, sz.target), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			vbuf := make([]byte, 0, 64)
+			for i := 0; i < b.N; i++ {
+				var after []byte
+				n := 0
+				for {
+					keys, last := s.CollScan(prefix, after, 256, make([][]byte, 0, 256))
+					for _, k := range keys {
+						v, _ := s.GetKind(k, vbuf, kindTestField)
+						vbuf = v
+						n++
+					}
+					if last == nil {
+						break
+					}
+					after = last
+				}
+				if n != sz.target {
+					b.Fatalf("got %d, want %d", n, sz.target)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("fused/others=%d/target=%d", sz.others, sz.target), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			vbuf := make([]byte, 0, 64)
+			for i := 0; i < b.N; i++ {
+				var after []byte
+				n := 0
+				for {
+					keys, offs, last := s.CollScanKV(prefix, after, 256, make([][]byte, 0, 256), make([]uint64, 0, 256))
+					for j := range keys {
+						v := s.ReadValueAt(offs[j], vbuf)
+						vbuf = v
+						n++
+					}
+					if last == nil {
+						break
+					}
+					after = last
+				}
+				if n != sz.target {
+					b.Fatalf("got %d, want %d", n, sz.target)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkOIndexEnumerateFullScan measures the rejected alternative: scan the whole
 // index, keep the prefix matches, sort them. Cost tracks the keyspace size, so it
 // degrades as unrelated collections grow even when the target stays small.

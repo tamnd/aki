@@ -178,6 +178,32 @@ func (oi *oindex) insert(off uint64) {
 	oi.count++
 }
 
+// refresh points the node whose key equals keyAt(off) at off. It is the fix for a value
+// that outgrew its record and was republished at a new offset: the ordered node still
+// holds the old offset, and a value-carrying scan (CollScanKV) reads the value straight
+// from the node's offset, so the node must track the live record or the scan would return
+// a stale value. It is a no-op when no node holds the key (the record is not indexed, such
+// as a header row), so the collection write path can call it after any republish without
+// first checking membership. The traversal orders by keyAt of the nodes' offsets, and the
+// republished record's key bytes are identical to the old record's (immutable key,
+// grow-only arena), so the search lands on the right node. Serialize it with the
+// collection's other writers, the same stripe lock CollInsert relies on.
+func (oi *oindex) refresh(off uint64) {
+	key := oi.store.keyAt(off)
+	oi.mu.Lock()
+	defer oi.mu.Unlock()
+
+	x := oi.head
+	for i := oi.level - 1; i >= 0; i-- {
+		for x.next[i] != nil && bytes.Compare(oi.store.keyAt(x.next[i].off), key) < 0 {
+			x = x.next[i]
+		}
+	}
+	if nx := x.next[0]; nx != nil && bytes.Equal(oi.store.keyAt(nx.off), key) {
+		nx.off = off
+	}
+}
+
 // remove unlinks the node whose key equals the given key bytes and reports whether it
 // was present. The record's arena bytes are left intact (grow-only arena); only the
 // index node is unlinked.

@@ -56,7 +56,17 @@ func (s *Store) PutKind(key, val []byte, kind byte) (created bool, err error) {
 		}
 		// Outgrew the record: republish a wider one. publish rescans and replaces the
 		// entry in place, count unchanged, so this is still an update, not a create.
-		return false, s.publish(key, val, h, kind, 0)
+		if err := s.publish(key, val, h, kind, 0); err != nil {
+			return false, err
+		}
+		// The record moved to a new offset. If it is indexed for ordered enumeration,
+		// point its node at the new offset so a value-carrying scan (CollScanKV) reads the
+		// current value straight from the node instead of the abandoned old record. refresh
+		// is a no-op for an unindexed record (a header row), so this is safe for any kind.
+		if noff, _, _, _, ok := s.find(key, h, kind); ok {
+			s.oidx.refresh(noff)
+		}
+		return false, nil
 	}
 	// Absent under the caller's serialization, so publish will fill an empty slot and
 	// bump the count: a genuine create.
@@ -118,6 +128,32 @@ func (s *Store) CollScan(prefix, after []byte, limit int, dst [][]byte) (keys []
 		dst = append(dst, s.keyAt(off))
 	}
 	return dst, last
+}
+
+// CollScanKV is CollScan for the value-carrying enumerations (HGETALL, HVALS): it appends
+// each element's composite key to dstKeys and its record offset to dstOffs, in key order,
+// so the caller reads the value straight from the offset with ReadValueAt instead of
+// re-resolving it with a per-element GetKind (a hash plus a bucket probe per field). It
+// returns the grown slices and the last key, to resume like CollScan. The offset is
+// authoritative for the live value: a create pairs CollInsert with the offset, an in-place
+// update keeps it, and an outgrow-republish refreshes it (PutKind), so ReadValueAt never
+// reads a stale record. Both slices grow in lockstep, so dstOffs[i] is the offset of
+// dstKeys[i]. This is the primitive that closes the HVALS/HGETALL gap to HKEYS.
+func (s *Store) CollScanKV(prefix, after []byte, limit int, dstKeys [][]byte, dstOffs []uint64) (keys [][]byte, offs []uint64, last []byte) {
+	dstOffs, last = s.oidx.scanBatch(prefix, after, limit, dstOffs)
+	for _, off := range dstOffs {
+		dstKeys = append(dstKeys, s.keyAt(off))
+	}
+	return dstKeys, dstOffs, last
+}
+
+// ReadValueAt copies the value of the record at off into dst (reusing its capacity) and
+// returns it, the seqlock read GetKind runs after it resolves the offset. It is exported
+// for the value-carrying scan (CollScanKV), which already holds the offset from the ordered
+// index and so skips the hash-and-probe find GetKind would repeat. off must come from a
+// current CollScanKV batch, where it is guaranteed to be the element's live record.
+func (s *Store) ReadValueAt(off uint64, dst []byte) []byte {
+	return s.readValue(off, dst)
 }
 
 // CollSelectAt returns the composite key of the element at 0-based localIndex within the
