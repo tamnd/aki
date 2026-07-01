@@ -60,6 +60,8 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdExists(argv)
 	case eqFold(cmd, "MSET"):
 		c.cmdMSet(argv)
+	case eqFold(cmd, "MSETNX"):
+		c.cmdMSetNX(argv)
 	case eqFold(cmd, "MGET"):
 		c.cmdMGet(argv)
 	case eqFold(cmd, "HSET"):
