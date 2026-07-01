@@ -186,6 +186,7 @@ func (s *Store) Reset() {
 	}
 	s.tail.Store(8)
 	s.count.Store(0)
+	s.oidx = newOIndex(s)
 }
 
 // parseInt parses a base-10 signed integer with no leading or trailing slack, the

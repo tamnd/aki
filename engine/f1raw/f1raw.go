@@ -132,6 +132,13 @@ type Store struct {
 	cap     uint64
 	tail    atomic.Uint64 // next free arena offset; starts at 8 so a real addr is never 0
 	count   atomic.Int64
+
+	// oidx is the ordered element index (oindex.go): the in-memory per-collection
+	// sorted run that lets a bounded cursor enumerate one collection's elements in key
+	// order. It is maintained explicitly by the collection element path (CollInsert /
+	// CollRemove) and never touched by the string hot path, so Get/Set/Incr pay
+	// nothing for it.
+	oidx *oindex
 }
 
 // New builds a store whose primary hash index has indexBuckets buckets (rounded up
@@ -160,6 +167,7 @@ func New(indexBuckets, arenaBytes int) *Store {
 		panic("f1raw: arena base not 8-aligned")
 	}
 	s.tail.Store(8) // reserve offset 0 so an empty index entry (addr 0) is unambiguous
+	s.oidx = newOIndex(s)
 	return s
 }
 
