@@ -78,6 +78,8 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdRename(argv)
 	case eqFold(cmd, "RENAMENX"):
 		c.cmdRenameNx(argv)
+	case eqFold(cmd, "COPY"):
+		c.cmdCopy(argv)
 	case eqFold(cmd, "HSET"):
 		c.cmdHSet(argv)
 	case eqFold(cmd, "HMSET"):
