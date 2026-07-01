@@ -72,6 +72,37 @@ func BenchmarkOIndexEnumerateOrdered(b *testing.B) {
 	}
 }
 
+// BenchmarkOIndexSelectAt measures the random-access primitive SPOP/SRANDMEMBER seek
+// through: an order-statistic rank-then-select descent into one target collection
+// embedded in a large keyspace. Cost is O(log n) in the whole-index size and allocation
+// free, which is what keeps a random member O(log n) instead of the O(n) count a plain
+// ordered structure would force. A cheap splitmix walk stands in for the server's
+// uniform draw so the benchmark touches spread positions, not one hot node.
+func BenchmarkOIndexSelectAt(b *testing.B) {
+	for _, sz := range []struct{ others, target int }{
+		{1000, 100},
+		{100000, 100},
+		{100000, 1000},
+	} {
+		b.Run(fmt.Sprintf("others=%d/target=%d", sz.others, sz.target), func(b *testing.B) {
+			s, prefix := benchStore(sz.others, sz.target)
+			b.ReportAllocs()
+			b.ResetTimer()
+			var r uint64 = 0x1234567
+			for i := 0; i < b.N; i++ {
+				r += 0x9e3779b97f4a7c15
+				z := r
+				z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+				z ^= z >> 31
+				idx := int(z % uint64(sz.target))
+				if _, ok := s.CollSelectAt(prefix, idx); !ok {
+					b.Fatalf("CollSelectAt(%d) absent", idx)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkOIndexEnumerateFullScan measures the rejected alternative: scan the whole
 // index, keep the prefix matches, sort them. Cost tracks the keyspace size, so it
 // degrades as unrelated collections grow even when the target stays small.

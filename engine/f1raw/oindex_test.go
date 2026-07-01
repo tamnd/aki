@@ -156,3 +156,147 @@ func TestOIndexManyMembersSorted(t *testing.T) {
 		t.Fatal("enumeration not sorted")
 	}
 }
+
+// CollSelectAt must return the localIndex-th member of one collection in key order,
+// isolated from sibling collections that share a bounding prefix, and must report absent
+// for a localIndex at or past the collection's cardinality rather than leaking a sibling.
+func TestOIndexSelectAt(t *testing.T) {
+	s := New(1<<16, 1<<20)
+	insert := func(coll, member string) {
+		k := collKey(coll, member)
+		if _, err := s.PutKind(k, nil, kindTestField); err != nil {
+			t.Fatal(err)
+		}
+		s.CollInsert(k, kindTestField)
+	}
+	// Two collections whose bare keys are prefixes of one another, plus one whose bare
+	// key sorts before both, so a wrong base rank or a missing prefix guard would show.
+	insert("a", "0")
+	for _, m := range []string{"c", "a", "e", "b", "d"} {
+		insert("h", m)
+	}
+	insert("h2", "z")
+
+	prefix := collPrefix("h")
+	want := []string{"a", "b", "c", "d", "e"} // sorted member order within "h"
+	for i, w := range want {
+		k, ok := s.CollSelectAt(prefix, i)
+		if !ok {
+			t.Fatalf("CollSelectAt(h, %d) absent, want %q", i, w)
+		}
+		if got := string(k[len(prefix):]); got != w {
+			t.Fatalf("CollSelectAt(h, %d) = %q, want %q", i, got, w)
+		}
+	}
+	// One past the cardinality is absent, not "h2"'s member.
+	if k, ok := s.CollSelectAt(prefix, len(want)); ok {
+		t.Fatalf("CollSelectAt(h, %d) = %q, want absent", len(want), k[len(prefix):])
+	}
+	if _, ok := s.CollSelectAt(prefix, -1); ok {
+		t.Fatal("CollSelectAt(h, -1) reported present")
+	}
+}
+
+// The order-statistic spans must stay exact through interleaved inserts and deletes:
+// after every mutation, CollSelectAt over the full index must agree element-for-element
+// with a plain sorted enumeration, which only holds if every width is maintained right.
+func TestOIndexSelectAtAfterMutation(t *testing.T) {
+	s := New(1<<18, 1<<22)
+	live := map[string]bool{}
+	prefix := collPrefix("s")
+
+	add := func(m string) {
+		k := collKey("s", m)
+		created, err := s.PutKind(k, nil, kindTestField)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if created {
+			s.CollInsert(k, kindTestField)
+		}
+		live[m] = true
+	}
+	del := func(m string) {
+		k := collKey("s", m)
+		if s.DeleteKind(k, kindTestField) {
+			s.CollRemove(k)
+		}
+		delete(live, m)
+	}
+
+	for i := 0; i < 400; i++ {
+		add(fmt.Sprintf("m%04d", i))
+	}
+	// Punch holes across the population so several skip levels re-bridge their spans.
+	for i := 0; i < 400; i += 3 {
+		del(fmt.Sprintf("m%04d", i))
+	}
+	for i := 400; i < 500; i++ {
+		add(fmt.Sprintf("m%04d", i))
+	}
+
+	// Ground truth: the sorted live members.
+	var wantMembers []string
+	for m := range live {
+		wantMembers = append(wantMembers, m)
+	}
+	sort.Strings(wantMembers)
+
+	if got := len(scanAll(s, prefix, 64)); got != len(wantMembers) {
+		t.Fatalf("scan sees %d members, want %d", got, len(wantMembers))
+	}
+	for i, w := range wantMembers {
+		k, ok := s.CollSelectAt(prefix, i)
+		if !ok {
+			t.Fatalf("CollSelectAt(%d) absent, want %q", i, w)
+		}
+		if got := string(k[len(prefix):]); got != w {
+			t.Fatalf("CollSelectAt(%d) = %q, want %q", i, got, w)
+		}
+	}
+	if _, ok := s.CollSelectAt(prefix, len(wantMembers)); ok {
+		t.Fatalf("CollSelectAt(%d) present past cardinality", len(wantMembers))
+	}
+}
+
+// A uniform localIndex draw must reach every member with roughly equal frequency, which
+// is the property SPOP/SRANDMEMBER rely on: order-statistic selection is exactly uniform
+// over the index, unlike a byte-space random seek that clumps on the member distribution.
+func TestOIndexSelectAtUniformCoverage(t *testing.T) {
+	s := New(1<<16, 1<<20)
+	const n = 64
+	for i := 0; i < n; i++ {
+		k := collKey("u", fmt.Sprintf("m%03d", i))
+		if _, err := s.PutKind(k, nil, kindTestField); err != nil {
+			t.Fatal(err)
+		}
+		s.CollInsert(k, kindTestField)
+	}
+	prefix := collPrefix("u")
+	seen := make([]int, n)
+	// A fixed splitmix walk over [0,n) stands in for the server's uniform draw, so the
+	// test is deterministic while still touching every index.
+	var r uint64 = 0x1234567
+	for i := 0; i < n*50; i++ {
+		r += 0x9e3779b97f4a7c15
+		z := r
+		z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+		z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+		z ^= z >> 31
+		idx := int(z % n)
+		k, ok := s.CollSelectAt(prefix, idx)
+		if !ok {
+			t.Fatalf("CollSelectAt(%d) absent", idx)
+		}
+		pos := int(k[len(prefix)+1]-'0')*100 + int(k[len(prefix)+2]-'0')*10 + int(k[len(prefix)+3]-'0')
+		if pos != idx {
+			t.Fatalf("index %d resolved to member m%03d", idx, pos)
+		}
+		seen[idx]++
+	}
+	for i, c := range seen {
+		if c == 0 {
+			t.Fatalf("index %d never selected", i)
+		}
+	}
+}
