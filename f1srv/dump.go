@@ -27,14 +27,24 @@ import (
 // field count then that many field/value string pairs, which both reference servers accept on RESTORE
 // at any size. The load side additionally decodes RDB_TYPE_HASH_LISTPACK (type 16), the listpack form
 // both Redis 8.8 and Valkey 9.1 actually emit even for large hashes, so a hash blob produced by either
-// server restores here. The remaining collection types arrive in the follow-up slices; each reuses
-// this file's CRC64, version framing, string primitives, and (for the listpack encodings) lpDecode.
+// server restores here.
+//
+// The set type is the third slice and follows the same shape. aki dumps a set as RDB_TYPE_SET (type
+// 2), a member count then that many member strings, again the plain form both servers accept at any
+// size. The load side decodes the two packed forms both servers emit for a small set: the listpack
+// form (RDB_TYPE_SET_LISTPACK, type 20) and the intset form (RDB_TYPE_SET_INTSET, type 11), an
+// all-integer set packed into a width-prefixed sorted integer array. The remaining collection types
+// arrive in the follow-up slices; each reuses this file's CRC64, version framing, string primitives,
+// and (for the listpack encodings) lpDecode.
 
 // RDB object type bytes. Only the forms aki serializes or has to load are named here.
 const (
 	rdbTypeString       = 0x00 // a plain string value
+	rdbTypeSet          = 0x02 // a set as a member count then that many member strings
 	rdbTypeHash         = 0x04 // a hash as a field count then field/value string pairs
+	rdbTypeSetIntset    = 0x0b // an all-integer set packed into a single intset blob
 	rdbTypeHashListpack = 0x10 // a hash packed into a single listpack blob, the form both servers emit
+	rdbTypeSetListpack  = 0x14 // a set packed into a single listpack blob, the form both servers emit
 )
 
 // rdbVersion is the RDB version stamped into the footer of every DUMP payload aki produces. RESTORE
@@ -120,6 +130,8 @@ func (c *connState) cmdDump(argv [][]byte) {
 		c.writeBulk(rdbSeal(payload))
 	case keyHash:
 		c.writeBulk(rdbSeal(c.rdbDumpHash(key)))
+	case keySet:
+		c.writeBulk(rdbSeal(c.rdbDumpSet(key)))
 	default:
 		c.writeErr("ERR DUMP of this type is not supported yet")
 	}
@@ -150,6 +162,36 @@ func (c *connState) rdbDumpHash(hkey []byte) []byte {
 			payload = rdbAppendString(payload, k[plen:])
 			vbuf = c.srv.store.ReadValueAt(offs[i], vbuf[:0])
 			payload = rdbAppendString(payload, vbuf)
+		}
+		if last == nil {
+			break
+		}
+		after = last
+	}
+	return payload
+}
+
+// rdbDumpSet builds the RDB_TYPE_SET body for a set: the type byte, the member count, then each
+// member as an RDB string (a canonical integer member int-encodes, the way both servers store an
+// all-integer member). It holds the stripe lock and walks the members off the O(1) count and the
+// collection index, the enumerate path SMEMBERS uses, so it never materializes the whole set.
+func (c *connState) rdbDumpSet(skey []byte) []byte {
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.Lock()
+	defer mu.Unlock()
+
+	payload := rdbAppendLen([]byte{rdbTypeSet}, c.setCard(skey))
+	prefix := c.setPrefix(skey)
+	plen := len(prefix)
+	var after []byte
+	scan := make([][]byte, 0, hashScanBatch)
+	for {
+		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
+		if len(keys) == 0 {
+			break
+		}
+		for _, k := range keys {
+			payload = rdbAppendString(payload, k[plen:])
 		}
 		if last == nil {
 			break
@@ -352,9 +394,78 @@ func rdbLoadValue(body []byte) (rdbValue, bool) {
 			return rdbValue{}, false
 		}
 		return rdbValue{kind: keyHash, elems: elems}, true
+	case rdbTypeSet:
+		count, rest, ok := rdbReadLen(body[1:])
+		if !ok {
+			return rdbValue{}, false
+		}
+		elems := make([][]byte, 0, count)
+		for i := uint64(0); i < count; i++ {
+			s, r, ok := rdbReadString(rest)
+			if !ok {
+				return rdbValue{}, false
+			}
+			elems = append(elems, s)
+			rest = r
+		}
+		return rdbValue{kind: keySet, elems: elems}, true
+	case rdbTypeSetListpack:
+		lp, _, ok := rdbReadString(body[1:])
+		if !ok {
+			return rdbValue{}, false
+		}
+		elems, ok := lpDecode(lp)
+		if !ok {
+			return rdbValue{}, false
+		}
+		return rdbValue{kind: keySet, elems: elems}, true
+	case rdbTypeSetIntset:
+		is, _, ok := rdbReadString(body[1:])
+		if !ok {
+			return rdbValue{}, false
+		}
+		elems, ok := intsetDecode(is)
+		if !ok {
+			return rdbValue{}, false
+		}
+		return rdbValue{kind: keySet, elems: elems}, true
 	default:
 		return rdbValue{}, false
 	}
+}
+
+// intsetDecode parses an intset blob into its members rendered as decimal text. An intset is a 4-byte
+// encoding (the byte width of each entry: 2, 4, or 8), a 4-byte entry count, then that many signed
+// integers of that width, everything little-endian and the entries in ascending order. It is the body
+// both servers write for an all-integer set small enough to pack.
+func intsetDecode(b []byte) ([][]byte, bool) {
+	if len(b) < 8 {
+		return nil, false
+	}
+	enc := binary.LittleEndian.Uint32(b[0:4])
+	n := binary.LittleEndian.Uint32(b[4:8])
+	if enc != 2 && enc != 4 && enc != 8 {
+		return nil, false
+	}
+	entries := b[8:]
+	if uint64(len(entries)) < uint64(n)*uint64(enc) {
+		return nil, false
+	}
+	out := make([][]byte, 0, n)
+	for i := uint32(0); i < n; i++ {
+		off := int(i) * int(enc)
+		var v int64
+		switch enc {
+		case 2:
+			v = int64(int16(binary.LittleEndian.Uint16(entries[off:])))
+		case 4:
+			v = int64(int32(binary.LittleEndian.Uint32(entries[off:])))
+		case 8:
+			v = int64(binary.LittleEndian.Uint64(entries[off:]))
+		}
+		out = append(out, strconv.AppendInt(nil, v, 10))
+	}
+	return out, true
 }
 
 // rdbWriteValue lands a decoded value under a key. The caller holds the key's stripe lock and has
@@ -376,6 +487,22 @@ func (c *connState) rdbWriteValue(key []byte, v rdbValue) error {
 			}
 		}
 		return c.setHashCount(key, uint64(len(v.elems)/2))
+	case keySet:
+		var count uint64
+		enc := encNone
+		for _, m := range v.elems {
+			mk := c.memberKey(key, m)
+			isNew, err := c.srv.store.PutKind(mk, nil, kindSetMember)
+			if err != nil {
+				return err
+			}
+			if isNew {
+				c.srv.store.CollInsert(mk, kindSetMember)
+				count++
+				enc = foldSetEnc(enc, m, count)
+			}
+		}
+		return c.setPutHeader(key, count, enc)
 	}
 	return nil
 }
