@@ -22,6 +22,7 @@ type connState struct {
 	pbuf    []byte    // reused scratch for a collection enumeration prefix, held across a scan
 	sbuf    []byte    // reused scratch for formatting a float score reply (ZSCORE/ZINCRBY)
 	zscores []float64 // reused scratch for a ZADD's parsed scores, one per score-member pair
+	zkeys   [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
 	num     [24]byte  // scratch for formatting integer replies
 }
 
@@ -237,6 +238,13 @@ func (c *connState) writeBulk(b []byte) {
 
 func (c *connState) writeNil() {
 	_, _ = c.w.WriteString("$-1\r\n")
+}
+
+// writeNilArray writes the RESP2 null array (*-1), the reply ZRANK WITHSCORE and the
+// other array-returning commands use for an absent element, distinct from the null bulk
+// string a scalar reply uses.
+func (c *connState) writeNilArray() {
+	_, _ = c.w.WriteString("*-1\r\n")
 }
 
 func (c *connState) writeArrayHeader(n int) {

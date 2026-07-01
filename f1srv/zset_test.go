@@ -215,6 +215,139 @@ func TestZsetEncodingAndType(t *testing.T) {
 	expect(t, rw, "$skiplist")
 }
 
+// TestZrank walks ZRANK and ZREVRANK: forward and reverse positions, the WITHSCORE form, and
+// the nil replies for an absent member (a null bulk without WITHSCORE, a null array with it).
+func TestZrank(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "ZADD", "board", "1", "alice", "2", "bob", "3", "carol")
+	expect(t, rw, ":3")
+
+	// Forward rank is the 0-based position in ascending score order.
+	cmd(t, rw, "ZRANK", "board", "alice")
+	expect(t, rw, ":0")
+	cmd(t, rw, "ZRANK", "board", "bob")
+	expect(t, rw, ":1")
+	cmd(t, rw, "ZRANK", "board", "carol")
+	expect(t, rw, ":2")
+
+	// Reverse rank counts from the high end.
+	cmd(t, rw, "ZREVRANK", "board", "alice")
+	expect(t, rw, ":2")
+	cmd(t, rw, "ZREVRANK", "board", "carol")
+	expect(t, rw, ":0")
+
+	// WITHSCORE returns a two-element array of rank then score.
+	cmd(t, rw, "ZRANK", "board", "bob", "WITHSCORE")
+	expect(t, rw, "*2")
+	expect(t, rw, ":1")
+	expect(t, rw, "$2")
+	cmd(t, rw, "ZREVRANK", "board", "bob", "WITHSCORE")
+	expect(t, rw, "*2")
+	expect(t, rw, ":1")
+	expect(t, rw, "$2")
+
+	// An absent member is a null bulk, or a null array under WITHSCORE.
+	cmd(t, rw, "ZRANK", "board", "missing")
+	expect(t, rw, "$-1")
+	cmd(t, rw, "ZRANK", "board", "missing", "WITHSCORE")
+	expect(t, rw, "*-1")
+	cmd(t, rw, "ZREVRANK", "board", "missing")
+	expect(t, rw, "$-1")
+
+	// Rank on a missing key is a null bulk, not an error.
+	cmd(t, rw, "ZRANK", "nokey", "a")
+	expect(t, rw, "$-1")
+}
+
+// TestZrange walks the rank-indexed ZRANGE/ZREVRANGE: a forward window, negative indices, an
+// out-of-range clamp, an empty window, the REV modifier, and WITHSCORES.
+func TestZrange(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "ZADD", "z", "1", "a", "2", "b", "3", "c", "4", "d")
+	expect(t, rw, ":4")
+
+	// Forward window by rank. readReply renders a bulk as "$"+value, so a member "a"
+	// comes back as "$a" and a score "1" as "$1".
+	cmd(t, rw, "ZRANGE", "z", "0", "1")
+	expect(t, rw, "*2")
+	expect(t, rw, "$a")
+	expect(t, rw, "$b")
+
+	// Negative indices count from the end; -1 is the last element.
+	cmd(t, rw, "ZRANGE", "z", "-2", "-1")
+	expect(t, rw, "*2")
+	expect(t, rw, "$c")
+	expect(t, rw, "$d")
+
+	// A stop past the end clamps to the last element.
+	cmd(t, rw, "ZRANGE", "z", "2", "100")
+	expect(t, rw, "*2")
+	expect(t, rw, "$c")
+	expect(t, rw, "$d")
+
+	// start past stop is an empty array.
+	cmd(t, rw, "ZRANGE", "z", "3", "1")
+	expect(t, rw, "*0")
+
+	// WITHSCORES interleaves each member with its score.
+	cmd(t, rw, "ZRANGE", "z", "0", "1", "WITHSCORES")
+	expect(t, rw, "*4")
+	expect(t, rw, "$a")
+	expect(t, rw, "$1")
+	expect(t, rw, "$b")
+	expect(t, rw, "$2")
+
+	// REV walks high to low; ZREVRANGE is the same window.
+	cmd(t, rw, "ZRANGE", "z", "0", "1", "REV")
+	expect(t, rw, "*2")
+	expect(t, rw, "$d")
+	expect(t, rw, "$c")
+	cmd(t, rw, "ZREVRANGE", "z", "0", "1")
+	expect(t, rw, "*2")
+	expect(t, rw, "$d")
+	expect(t, rw, "$c")
+
+	// ZREVRANGE WITHSCORES over the whole set, highest first.
+	cmd(t, rw, "ZREVRANGE", "z", "0", "-1", "WITHSCORES")
+	expect(t, rw, "*8")
+	expect(t, rw, "$d")
+	expect(t, rw, "$4")
+	expect(t, rw, "$c")
+	expect(t, rw, "$3")
+	expect(t, rw, "$b")
+	expect(t, rw, "$2")
+	expect(t, rw, "$a")
+	expect(t, rw, "$1")
+
+	// A missing key is an empty array.
+	cmd(t, rw, "ZRANGE", "nokey", "0", "-1")
+	expect(t, rw, "*0")
+}
+
+// TestZrangeTiesOrderByMember confirms members sharing a score order by member bytes, so rank
+// and range are stable and match Redis's score-then-member ordering.
+func TestZrangeTiesOrderByMember(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "ZADD", "z", "5", "c", "5", "a", "5", "b")
+	expect(t, rw, ":3")
+	cmd(t, rw, "ZRANGE", "z", "0", "-1")
+	expect(t, rw, "*3")
+	expect(t, rw, "$a")
+	expect(t, rw, "$b")
+	expect(t, rw, "$c")
+	// Rank reflects the same score-then-member order.
+	cmd(t, rw, "ZRANK", "z", "a")
+	expect(t, rw, ":0")
+	cmd(t, rw, "ZRANK", "z", "c")
+	expect(t, rw, ":2")
+}
+
 // TestZsetWrongType confirms a zset command against a string key is WRONGTYPE.
 func TestZsetWrongType(t *testing.T) {
 	rw, cleanup := dialTestServer(t)
@@ -233,5 +366,13 @@ func TestZsetWrongType(t *testing.T) {
 	cmd(t, rw, "ZCARD", "s")
 	expect(t, rw, "-"+wrongType)
 	cmd(t, rw, "ZMSCORE", "s", "a")
+	expect(t, rw, "-"+wrongType)
+	cmd(t, rw, "ZRANK", "s", "a")
+	expect(t, rw, "-"+wrongType)
+	cmd(t, rw, "ZREVRANK", "s", "a")
+	expect(t, rw, "-"+wrongType)
+	cmd(t, rw, "ZRANGE", "s", "0", "-1")
+	expect(t, rw, "-"+wrongType)
+	cmd(t, rw, "ZREVRANGE", "s", "0", "-1")
 	expect(t, rw, "-"+wrongType)
 }
