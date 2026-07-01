@@ -1,6 +1,9 @@
 package f1srv
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 // The hash point path is element-per-row on f1raw: HSET writes one field row and
 // maintains the header count, HGET is a single lock-free probe, and HLEN reads the
@@ -128,6 +131,117 @@ func TestHashWrongTypeOnString(t *testing.T) {
 	// The string is still intact.
 	cmd(t, rw, "GET", "k")
 	expect(t, rw, "$v")
+}
+
+// HGETALL, HKEYS, and HVALS enumerate one hash in field-key order off the ordered
+// index, framing the RESP array from the maintained header count so the length always
+// matches what is streamed.
+func TestHashEnumerate(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "HSET", "h", "b", "2", "a", "1", "c", "3")
+	expect(t, rw, ":3")
+
+	// HKEYS is the field names in byte order.
+	cmd(t, rw, "HKEYS", "h")
+	expect(t, rw, "*3")
+	expect(t, rw, "$a")
+	expect(t, rw, "$b")
+	expect(t, rw, "$c")
+
+	// HVALS is the values in the same order.
+	cmd(t, rw, "HVALS", "h")
+	expect(t, rw, "*3")
+	expect(t, rw, "$1")
+	expect(t, rw, "$2")
+	expect(t, rw, "$3")
+
+	// HGETALL interleaves field and value, still in field order.
+	cmd(t, rw, "HGETALL", "h")
+	expect(t, rw, "*6")
+	expect(t, rw, "$a")
+	expect(t, rw, "$1")
+	expect(t, rw, "$b")
+	expect(t, rw, "$2")
+	expect(t, rw, "$c")
+	expect(t, rw, "$3")
+}
+
+// A missing hash enumerates as an empty array, not an error or nil.
+func TestHashEnumerateMissing(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "HGETALL", "nope")
+	expect(t, rw, "*0")
+	cmd(t, rw, "HKEYS", "nope")
+	expect(t, rw, "*0")
+	cmd(t, rw, "HVALS", "nope")
+	expect(t, rw, "*0")
+}
+
+// Enumeration tracks deletes and overwrites: a deleted field drops out, an overwritten
+// field keeps its slot with the fresh value, and a field whose value outgrew its record
+// still enumerates with the new value.
+func TestHashEnumerateAfterMutate(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "HSET", "h", "a", "1", "b", "2", "c", "3")
+	expect(t, rw, ":3")
+	cmd(t, rw, "HDEL", "h", "b")
+	expect(t, rw, ":1")
+	// Overwrite a with a much longer value so the record is republished at a new offset.
+	cmd(t, rw, "HSET", "h", "a", "a-much-longer-value-than-before")
+	expect(t, rw, ":0")
+
+	cmd(t, rw, "HGETALL", "h")
+	expect(t, rw, "*4")
+	expect(t, rw, "$a")
+	expect(t, rw, "$a-much-longer-value-than-before")
+	expect(t, rw, "$c")
+	expect(t, rw, "$3")
+}
+
+// Enumeration must stream more fields than one internal scan batch without dropping or
+// duplicating any, so the RESP length matches across the batch boundary.
+func TestHashEnumerateManyFields(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	const n = 1000
+	args := []string{"HSET", "big"}
+	for i := 0; i < n; i++ {
+		f := fmt.Sprintf("f%05d", i)
+		args = append(args, f, "v")
+	}
+	cmd(t, rw, args...)
+	expect(t, rw, fmt.Sprintf(":%d", n))
+
+	cmd(t, rw, "HLEN", "big")
+	expect(t, rw, fmt.Sprintf(":%d", n))
+
+	cmd(t, rw, "HKEYS", "big")
+	expect(t, rw, fmt.Sprintf("*%d", n))
+	for i := 0; i < n; i++ {
+		expect(t, rw, "$"+fmt.Sprintf("f%05d", i))
+	}
+}
+
+// HGETALL against a string key is WRONGTYPE, matching the point-path type guard.
+func TestHashEnumerateWrongType(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "SET", "k", "v")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "HGETALL", "k")
+	expect(t, rw, "-"+wrongType)
+	cmd(t, rw, "HKEYS", "k")
+	expect(t, rw, "-"+wrongType)
+	cmd(t, rw, "HVALS", "k")
+	expect(t, rw, "-"+wrongType)
 }
 
 // FLUSHALL clears field and header rows along with strings.

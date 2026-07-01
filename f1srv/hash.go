@@ -100,6 +100,7 @@ func (c *connState) cmdHSet(argv [][]byte) {
 			return
 		}
 		if isNew {
+			c.srv.store.CollInsert(fk, kindHashField)
 			created++
 		}
 	}
@@ -138,6 +139,7 @@ func (c *connState) cmdHMSet(argv [][]byte) {
 			return
 		}
 		if isNew {
+			c.srv.store.CollInsert(fk, kindHashField)
 			created++
 		}
 	}
@@ -177,6 +179,7 @@ func (c *connState) cmdHSetNX(argv [][]byte) {
 		c.writeErr("ERR " + err.Error())
 		return
 	}
+	c.srv.store.CollInsert(fk, kindHashField)
 	if err := c.setHashCount(hkey, c.hashCount(hkey)+1); err != nil {
 		mu.Unlock()
 		c.writeErr("ERR " + err.Error())
@@ -239,6 +242,7 @@ func (c *connState) cmdHDel(argv [][]byte) {
 	for _, field := range argv[2:] {
 		fk := c.fieldKey(hkey, field)
 		if c.srv.store.DeleteKind(fk, kindHashField) {
+			c.srv.store.CollRemove(fk)
 			deleted++
 		}
 	}
@@ -296,4 +300,104 @@ func (c *connState) cmdHStrlen(argv [][]byte) {
 		return
 	}
 	c.writeInt(int64(len(v)))
+}
+
+// hashPrefix builds the bounding prefix uvarint(len(hkey)) | hkey for a hash's field
+// rows into the reusable pbuf. Every field row's composite key starts with this exact
+// prefix and no other hash's does, so a scan bounded by it enumerates precisely one
+// hash. It uses pbuf, distinct from the fieldKey scratch kbuf, so the prefix stays
+// stable across an enumeration that reads values through other scratch buffers.
+func (c *connState) hashPrefix(hkey []byte) []byte {
+	b := c.pbuf[:0]
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(len(hkey)))
+	b = append(b, tmp[:n]...)
+	b = append(b, hkey...)
+	c.pbuf = b
+	return b
+}
+
+// hashScanBatch is the batch size one CollScan pulls from the ordered index before the
+// index read lock is released, so a huge HGETALL streams in bounded windows and never
+// holds the index lock across the whole collection.
+const hashScanBatch = 256
+
+// streamHash is the shared enumeration body for HGETALL, HKEYS, and HVALS. It takes the
+// hash's stripe lock so the header count it frames the RESP array with cannot drift
+// against the field rows it then streams, rejects a string of the same key as
+// WRONGTYPE, and walks the ordered element index in bounded batches, emitting the field
+// name (wantField) and the value re-resolved through the authoritative index
+// (wantValue) for each row. The header count and the live field-row count stay exactly
+// equal because every create pairs CollInsert with a count bump and every delete pairs
+// CollRemove with a decrement, so the framed length always matches what is streamed.
+func (c *connState) streamHash(hkey []byte, wantField, wantValue bool) {
+	mu := &c.srv.incrMu[c.srv.stripe(hkey)]
+	mu.Lock()
+	if c.stringConflict(hkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	count := c.hashCount(hkey)
+	perRow := 0
+	if wantField {
+		perRow++
+	}
+	if wantValue {
+		perRow++
+	}
+	c.writeArrayHeader(int(count) * perRow)
+
+	prefix := c.hashPrefix(hkey)
+	var after []byte
+	scan := make([][]byte, 0, hashScanBatch)
+	for {
+		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
+		if len(keys) == 0 {
+			break
+		}
+		for _, k := range keys {
+			field := k[len(prefix):]
+			if wantField {
+				c.writeBulk(field)
+			}
+			if wantValue {
+				v, _ := c.srv.store.GetKind(k, c.vbuf, kindHashField)
+				c.vbuf = v
+				c.writeBulk(v)
+			}
+		}
+		if last == nil {
+			break
+		}
+		after = last
+	}
+	mu.Unlock()
+}
+
+func (c *connState) cmdHGetAll(argv [][]byte) {
+	// HGETALL key
+	if len(argv) != 2 {
+		c.writeErr("ERR wrong number of arguments for 'hgetall' command")
+		return
+	}
+	c.streamHash(argv[1], true, true)
+}
+
+func (c *connState) cmdHKeys(argv [][]byte) {
+	// HKEYS key
+	if len(argv) != 2 {
+		c.writeErr("ERR wrong number of arguments for 'hkeys' command")
+		return
+	}
+	c.streamHash(argv[1], true, false)
+}
+
+func (c *connState) cmdHVals(argv [][]byte) {
+	// HVALS key
+	if len(argv) != 2 {
+		c.writeErr("ERR wrong number of arguments for 'hvals' command")
+		return
+	}
+	c.streamHash(argv[1], false, true)
 }
