@@ -139,6 +139,14 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdZRandMember(argv)
 	case eqFold(cmd, "ZMPOP"):
 		c.cmdZMPop(argv)
+	case eqFold(cmd, "ZUNION"):
+		c.cmdZUnion(argv)
+	case eqFold(cmd, "ZINTER"):
+		c.cmdZInter(argv)
+	case eqFold(cmd, "ZDIFF"):
+		c.cmdZDiff(argv)
+	case eqFold(cmd, "ZINTERCARD"):
+		c.cmdZInterCard(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
