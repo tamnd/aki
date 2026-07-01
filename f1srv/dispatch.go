@@ -80,6 +80,10 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdRenameNx(argv)
 	case eqFold(cmd, "COPY"):
 		c.cmdCopy(argv)
+	case eqFold(cmd, "WAIT"):
+		c.cmdWait(argv)
+	case eqFold(cmd, "WAITAOF"):
+		c.cmdWaitAOF(argv)
 	case eqFold(cmd, "HSET"):
 		c.cmdHSet(argv)
 	case eqFold(cmd, "HMSET"):
