@@ -573,7 +573,14 @@ func (c *connState) cmdSPop(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	card := int(c.setCard(skey))
+	// Read the header once, under the lock, for both the count and the shrink write. On a
+	// removal the encoding never changes (Redis never downgrades) and the stripe lock keeps
+	// any writer out, so the enc read here is the enc the shrink write hands back, which lets
+	// setPutHeader skip the header re-read setSetCard would otherwise do. On a hot single-key
+	// SPOP that re-read is pure critical-section time on a mutex already in convoy at depth,
+	// so cutting it directly lifts the contended throughput ceiling.
+	card64, enc, _ := c.setHeader(skey)
+	card := int(card64)
 
 	if !hasCount {
 		// No-count form: one member as a bulk string, nil on a missing key.
@@ -595,7 +602,7 @@ func (c *connState) cmdSPop(argv [][]byte) {
 		}
 		member := k[len(prefix):]
 		c.srv.store.DeleteKind(k, kindSetMember)
-		if err := c.setSetCard(skey, uint64(card-1)); err != nil {
+		if err := c.setPutHeader(skey, uint64(card-1), enc); err != nil {
 			mu.Unlock()
 			c.writeErr("ERR " + err.Error())
 			return
@@ -623,7 +630,7 @@ func (c *connState) cmdSPop(argv [][]byte) {
 			c.srv.store.CollRemove(mk)
 		}
 	}
-	if err := c.setSetCard(skey, uint64(card-len(members))); err != nil {
+	if err := c.setPutHeader(skey, uint64(card-len(members)), enc); err != nil {
 		mu.Unlock()
 		c.writeErr("ERR " + err.Error())
 		return
