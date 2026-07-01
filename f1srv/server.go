@@ -23,6 +23,7 @@ package f1srv
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tamnd/aki/engine/f1raw"
 )
@@ -75,6 +76,14 @@ type Server struct {
 	// (list-model spec 2064/f1_rewrite_ltm/08 section 9). It lives beside the storage and
 	// holds no element bytes; a blocked client is one queue entry per key it waits on.
 	block blockReg
+
+	// volatile counts the keys that currently carry a TTL (an expire sibling row). It is
+	// the hot-path gate for lazy expiry: when it is zero no key can be expired, so the
+	// read path skips the expiry probe entirely after one atomic load, which keeps the
+	// TTL-free benchmark workload paying nothing for the machinery. Every setExpiry that
+	// creates a fresh expire row bumps it and every clear that removes one drops it, both
+	// under the key's stripe lock so the count stays exact.
+	volatile atomic.Int64
 
 	wg sync.WaitGroup
 }

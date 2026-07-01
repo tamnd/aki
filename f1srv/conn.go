@@ -3,6 +3,7 @@ package f1srv
 import (
 	"net"
 	"strconv"
+	"time"
 )
 
 // connState is one connection's parse-dispatch-reply state. rbuf holds bytes read
@@ -24,6 +25,9 @@ type connState struct {
 	//                  connection's own goroutine; false under the shared-goroutine reactor,
 	//                  where a park would stall every other connection, so the blocking
 	//                  commands there serve non-blocking (immediate element or nil).
+	// nowMs is the wall-clock ms cached once per drained batch, the "now" every command in
+	// the batch reads for expiry, like Redis server.mstime.
+	nowMs   int64
 	argv    [][]byte
 	vbuf    []byte    // reused destination for GET/MGET value copies
 	kbuf    []byte    // reused scratch for building composite collection element keys
@@ -77,6 +81,11 @@ func (c *connState) fill() bool {
 // compacts any partial trailing bytes to the front. It returns false on a protocol
 // error that should close the connection.
 func (c *connState) drain() bool {
+	// Cache the wall clock once for the whole batch so every command in this drain sees
+	// one consistent "now" for expiry, the way Redis caches server.mstime per event-loop
+	// pass. A batch is short, so a single clock read amortizes over the whole pipeline and
+	// no command can observe a key as both alive and dead within itself.
+	c.nowMs = time.Now().UnixMilli()
 	pos := 0
 	for {
 		argv, consumed, status := c.parse(c.rbuf[pos:])
