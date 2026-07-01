@@ -16,7 +16,6 @@
 package f1srv
 
 import (
-	"bufio"
 	"net"
 	"sync"
 
@@ -142,8 +141,8 @@ func (s *Server) serveConn(conn net.Conn) {
 	c := &connState{
 		srv:  s,
 		conn: conn,
-		w:    bufio.NewWriterSize(conn, s.cfg.ReadBufSize),
 		rbuf: make([]byte, 0, s.cfg.ReadBufSize),
+		out:  make([]byte, 0, s.cfg.ReadBufSize),
 	}
 	c.loop()
 }
