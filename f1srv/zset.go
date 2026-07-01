@@ -109,6 +109,23 @@ func encodeSortableScore(dst []byte, score float64) {
 	binary.BigEndian.PutUint64(dst, bits)
 }
 
+// decodeSortableScore inverts encodeSortableScore: it reads the order-preserving 8-byte
+// big-endian encoding back to the original score. If the top bit is set the source score
+// was non-negative and only the sign bit was flipped; if it is clear the source was
+// negative and all 64 bits were flipped. This lets ZRANGE WITHSCORES report a score
+// straight from the score-family key it already walked, with no second read of the
+// member family. +0.0 and -0.0 both encoded to the same bytes and decode to +0.0, which
+// matches the -0 normalization at ingest.
+func decodeSortableScore(b []byte) float64 {
+	bits := binary.BigEndian.Uint64(b)
+	if bits&(1<<63) != 0 {
+		bits ^= 1 << 63
+	} else {
+		bits = ^bits
+	}
+	return math.Float64frombits(bits)
+}
+
 // normalizeZero maps -0.0 to +0.0 and leaves every other value untouched. Redis's default
 // listpack zset collapses -0 to integer 0 (via string2ll), so a score ingested as -0.0 must
 // surface as "0", not "-0"; we normalize at ingest, before the score reaches either family or
@@ -172,6 +189,22 @@ func (c *connState) zscoreKey(zkey []byte, score float64, member []byte) []byte 
 	b = append(b, sortable[:]...)
 	b = append(b, member...)
 	c.kbuf = b
+	return b
+}
+
+// zscorePrefix builds the score-family enumeration prefix for zkey into the reused pbuf:
+// uvarint(len(zkey)) | zkey | 's'. Every score-family row of the zset carries this prefix
+// and no other family does, so a rank or scan bounded by it sees exactly the score rows in
+// numeric order. It uses pbuf, not kbuf, so a caller can hold the prefix across a kbuf
+// rebuild (the score-family key the rank primitive ranks against lives in kbuf).
+func (c *connState) zscorePrefix(zkey []byte) []byte {
+	b := c.pbuf[:0]
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(len(zkey)))
+	b = append(b, tmp[:n]...)
+	b = append(b, zkey...)
+	b = append(b, zsetScoreTag)
+	c.pbuf = b
 	return b
 }
 
@@ -606,4 +639,197 @@ func (c *connState) cmdZRem(argv [][]byte) {
 	}
 	mu.Unlock()
 	c.writeInt(int64(removed))
+}
+
+// cmdZRank answers ZRANK and ZREVRANK (rev selects the reverse order). It reads the
+// member's score from the member family, rebuilds that member's score-family key, and
+// asks the ordered index for that key's position within the score-family prefix, an
+// O(log n) order-statistic seek (spec section 6.1, the model that closed the ZRANK LTM
+// gap). The forward rank is the count of members that sort below (score, then member);
+// the reverse rank is card-1-forward. An absent member replies nil (a null array under
+// WITHSCORE, a null bulk otherwise). The optional WITHSCORE trailer adds the score.
+func (c *connState) cmdZRank(argv [][]byte, rev bool) {
+	// ZRANK key member [WITHSCORE] / ZREVRANK key member [WITHSCORE]
+	name := "zrank"
+	if rev {
+		name = "zrevrank"
+	}
+	if len(argv) < 3 || len(argv) > 4 {
+		c.writeErr("ERR wrong number of arguments for '" + name + "' command")
+		return
+	}
+	withScore := false
+	if len(argv) == 4 {
+		if !eqFold(argv[3], "WITHSCORE") {
+			c.writeErr("ERR syntax error")
+			return
+		}
+		withScore = true
+	}
+	if c.stringConflict(argv[1]) {
+		c.writeErr(wrongType)
+		return
+	}
+	zkey := argv[1]
+	member := argv[2]
+
+	mk := c.zmemberKey(zkey, member)
+	v, ok := c.srv.store.GetKind(mk, c.vbuf[:0], kindZsetMember)
+	c.vbuf = v
+	if !ok {
+		if withScore {
+			c.writeNilArray()
+		} else {
+			c.writeNil()
+		}
+		return
+	}
+	score := math.Float64frombits(binary.LittleEndian.Uint64(v))
+
+	prefix := c.zscorePrefix(zkey)         // held in pbuf across the kbuf rebuild below
+	sk := c.zscoreKey(zkey, score, member) // rebuilds kbuf into the score-family key
+	rank := c.srv.store.CollRankOf(prefix, sk)
+	if rev {
+		rank = int(c.zsetCard(zkey)) - 1 - rank
+	}
+
+	if withScore {
+		c.writeArrayHeader(2)
+		c.writeInt(int64(rank))
+		c.writeScore(score)
+		return
+	}
+	c.writeInt(int64(rank))
+}
+
+func (c *connState) cmdZRange(argv [][]byte) {
+	// ZRANGE key start stop [WITHSCORES] [REV]
+	if len(argv) < 4 {
+		c.writeErr("ERR wrong number of arguments for 'zrange' command")
+		return
+	}
+	rev := false
+	withScores := false
+	for _, opt := range argv[4:] {
+		switch {
+		case eqFold(opt, "WITHSCORES"):
+			withScores = true
+		case eqFold(opt, "REV"):
+			rev = true
+		default:
+			// BYSCORE, BYLEX, and LIMIT are the score/lex cursor forms, a later M6 slice.
+			c.writeErr("ERR syntax error")
+			return
+		}
+	}
+	c.zrangeByIndex(argv[1], argv[2], argv[3], rev, withScores)
+}
+
+func (c *connState) cmdZRevRange(argv [][]byte) {
+	// ZREVRANGE key start stop [WITHSCORES]
+	if len(argv) < 4 {
+		c.writeErr("ERR wrong number of arguments for 'zrevrange' command")
+		return
+	}
+	withScores := false
+	for _, opt := range argv[4:] {
+		if eqFold(opt, "WITHSCORES") {
+			withScores = true
+			continue
+		}
+		c.writeErr("ERR syntax error")
+		return
+	}
+	c.zrangeByIndex(argv[1], argv[2], argv[3], true, withScores)
+}
+
+// zrangeByIndex answers the rank-indexed ZRANGE/ZREVRANGE window. It normalizes the
+// start/stop indices against the cardinality (negative counts from the end, out-of-range
+// clamps or empties), maps the requested indices to a forward score-order window, and
+// selects that window off the score-family order index: one O(log n) seek to the window's
+// first key (CollSelectAt) then a bounded forward scan for the rest (CollScan). A forward
+// range emits the window in ascending score order; a reverse range emits it descending.
+// The cost tracks the window, not the cardinality, so a 100-element window over a
+// billion-member board reads a bounded handful of rows.
+func (c *connState) zrangeByIndex(zkey, startArg, stopArg []byte, rev, withScores bool) {
+	if c.stringConflict(zkey) {
+		c.writeErr(wrongType)
+		return
+	}
+	start, err1 := strconv.ParseInt(string(startArg), 10, 64)
+	stop, err2 := strconv.ParseInt(string(stopArg), 10, 64)
+	if err1 != nil || err2 != nil {
+		c.writeErr("ERR value is not an integer or out of range")
+		return
+	}
+	card := int64(c.zsetCard(zkey))
+	if card == 0 {
+		c.writeArrayHeader(0)
+		return
+	}
+	if start < 0 {
+		start += card
+		if start < 0 {
+			start = 0
+		}
+	}
+	if stop < 0 {
+		stop += card
+	}
+	if start > stop || start >= card {
+		c.writeArrayHeader(0)
+		return
+	}
+	if stop >= card {
+		stop = card - 1
+	}
+
+	// Map the requested indices to a forward (ascending score) window. A reverse request
+	// for indices [start, stop] is the forward window [card-1-stop, card-1-start] read
+	// back to front.
+	fStart, fStop := start, stop
+	if rev {
+		fStart = card - 1 - stop
+		fStop = card - 1 - start
+	}
+	n := fStop - fStart + 1
+
+	prefix := c.zscorePrefix(zkey)
+	plen := len(prefix)
+	first, ok := c.srv.store.CollSelectAt(prefix, int(fStart))
+	if !ok {
+		c.writeArrayHeader(0)
+		return
+	}
+	keys := append(c.zkeys[:0], first)
+	if n > 1 {
+		keys, _ = c.srv.store.CollScan(prefix, first, int(n-1), keys)
+	}
+	c.zkeys = keys
+
+	mult := 1
+	if withScores {
+		mult = 2
+	}
+	c.writeArrayHeader(len(keys) * mult)
+	if rev {
+		for i := len(keys) - 1; i >= 0; i-- {
+			c.emitZrangeMember(keys[i], plen, withScores)
+		}
+		return
+	}
+	for _, k := range keys {
+		c.emitZrangeMember(k, plen, withScores)
+	}
+}
+
+// emitZrangeMember writes one score-family row as a ZRANGE reply element: the member
+// bytes (the key tail past the prefix and the 8 sortable-score bytes), and when
+// withScores is set the score decoded straight from those sortable bytes, so no second
+// read of the member family is needed.
+func (c *connState) emitZrangeMember(k []byte, plen int, withScores bool) {
+	c.writeBulk(k[plen+8:])
+	if withScores {
+		c.writeScore(decodeSortableScore(k[plen : plen+8]))
+	}
 }
