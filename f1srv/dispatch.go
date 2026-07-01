@@ -155,6 +155,20 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdZInterStore(argv)
 	case eqFold(cmd, "ZDIFFSTORE"):
 		c.cmdZDiffStore(argv)
+	case eqFold(cmd, "LPUSH"):
+		c.cmdLPush(argv)
+	case eqFold(cmd, "RPUSH"):
+		c.cmdRPush(argv)
+	case eqFold(cmd, "LPOP"):
+		c.cmdLPop(argv)
+	case eqFold(cmd, "RPOP"):
+		c.cmdRPop(argv)
+	case eqFold(cmd, "LLEN"):
+		c.cmdLLen(argv)
+	case eqFold(cmd, "LINDEX"):
+		c.cmdLIndex(argv)
+	case eqFold(cmd, "LRANGE"):
+		c.cmdLRange(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):

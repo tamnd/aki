@@ -37,6 +37,39 @@ func (s *Store) ExistsKind(key []byte, kind byte) bool {
 	return found
 }
 
+// GetKindAt is GetKind that also returns the record's arena offset, so a caller that
+// will rewrite the same record in place can skip the second index probe PutKind would
+// repeat. It is the read half of the fused read-then-in-place-update a fixed-width
+// header row wants: a list pop reads the header window, edits it, and writes it back,
+// and the offset lets the write-back land straight on the record with InPlaceAt instead
+// of a fresh hash-and-probe. The offset stays valid for the record's life as long as the
+// record is not outgrown-and-republished, which a fixed-width header (constant value
+// size) never is. Serialize the read-edit-write with the key's other writers, the same
+// stripe lock PutKind already requires; a concurrent unrelated write never moves this
+// record (the arena is grow-only and other keys append elsewhere), so the offset holds
+// across the caller's edit.
+func (s *Store) GetKindAt(key, dst []byte, kind byte) (val []byte, off uint64, ok bool) {
+	h := hash(key)
+	o, _, _, _, found := s.find(key, h, kind)
+	if !found {
+		return dst[:0], 0, false
+	}
+	return s.readValue(o, dst), o, true
+}
+
+// InPlaceAt rewrites the value of the record at off under its seqlock, for a caller that
+// already holds the offset from GetKindAt and knows val fits the record's reserved room.
+// It is the write half of the fused header update: a fixed-width header row (list, and any
+// other constant-size coll_header) is always rewritten with a same-length value, which by
+// construction fits the room the first PutKind reserved, so this never needs the outgrow
+// republish path PutKind carries. The caller must guarantee off came from a current
+// GetKindAt under the same stripe lock and that len(val) does not exceed the record's
+// reserved capacity (true for any fixed-width header); using it on a record that could
+// outgrow its cell would silently truncate, so it is deliberately not a general upsert.
+func (s *Store) InPlaceAt(off uint64, val []byte) {
+	s.inPlace(off, val)
+}
+
 // PutKind upserts val under key in the given kind namespace and reports whether the
 // record was newly created (true) versus an update of an existing one (false). HSET
 // reads created to count new fields and to know when to bump the header count. The
@@ -88,6 +121,30 @@ func (s *Store) DeleteKind(key []byte, kind byte) bool {
 		if b.slots[slot].CompareAndSwap(word, 0) {
 			s.count.Add(-1)
 			return true
+		}
+	}
+}
+
+// TakeKind reads the value for key in the given kind namespace into dst and removes the
+// record in a single index probe, reporting whether it was present. It is the fused read
+// then point-delete a list pop wants: LPOP and RPOP read the element they return and then
+// delete its row, and doing both off one find halves the probes a separate GetKind plus
+// DeleteKind would cost. The value is copied into dst before the slot is cleared, so the
+// returned bytes stay valid after the record is gone (the arena is grow-only, so the bytes
+// at the record's offset are never reclaimed underneath the copy either). Like DeleteKind it
+// must be serialized with the key's other writers by the caller's stripe lock; the CAS loop
+// only guards against a lost race, which that lock already prevents.
+func (s *Store) TakeKind(key, dst []byte, kind byte) ([]byte, bool) {
+	h := hash(key)
+	for {
+		off, b, slot, word, found := s.find(key, h, kind)
+		if !found {
+			return dst[:0], false
+		}
+		v := s.readValue(off, dst)
+		if b.slots[slot].CompareAndSwap(word, 0) {
+			s.count.Add(-1)
+			return v, true
 		}
 	}
 }
