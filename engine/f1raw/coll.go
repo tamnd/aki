@@ -56,11 +56,11 @@ func (s *Store) PutKind(key, val []byte, kind byte) (created bool, err error) {
 		}
 		// Outgrew the record: republish a wider one. publish rescans and replaces the
 		// entry in place, count unchanged, so this is still an update, not a create.
-		return false, s.publish(key, val, h, kind)
+		return false, s.publish(key, val, h, kind, 0)
 	}
 	// Absent under the caller's serialization, so publish will fill an empty slot and
 	// bump the count: a genuine create.
-	if err := s.publish(key, val, h, kind); err != nil {
+	if err := s.publish(key, val, h, kind, 0); err != nil {
 		return false, err
 	}
 	return true, nil
