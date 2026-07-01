@@ -640,3 +640,225 @@ func TestStreamClaim(t *testing.T) {
 	cmd(t, rw, "XAUTOCLAIM", "str", "g1", "carol", "0", "0")
 	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
 }
+
+// mapField pulls the value paired with key out of a flat RESP map array, failing when it is absent.
+func mapField(t *testing.T, m []any, key string) any {
+	t.Helper()
+	for i := 0; i+1 < len(m); i += 2 {
+		if s, ok := m[i].(string); ok && s == key {
+			return m[i+1]
+		}
+	}
+	t.Fatalf("field %q not found in %#v", key, m)
+	return nil
+}
+
+// TestStreamInfo covers XINFO STREAM / GROUPS / CONSUMERS / STREAM FULL, the entries-read and lag
+// bookkeeping, and the error and arity paths, pinned to the fields Redis 8.8 and Valkey 9.1 share.
+func TestStreamInfo(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	// Empty stream created by MKSTREAM: length 0, no entries, first/last null, groups 0.
+	cmd(t, rw, "XGROUP", "CREATE", "s", "g1", "$", "MKSTREAM")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "XINFO", "STREAM", "s")
+	m := asArray(t, readValue(t, rw), 20)
+	if got := asInt(t, mapField(t, m, "length")); got != 0 {
+		t.Fatalf("empty length = %d, want 0", got)
+	}
+	if got := asInt(t, mapField(t, m, "radix-tree-keys")); got != 0 {
+		t.Fatalf("empty radix-tree-keys = %d, want 0", got)
+	}
+	if got := asInt(t, mapField(t, m, "radix-tree-nodes")); got != 1 {
+		t.Fatalf("empty radix-tree-nodes = %d, want 1", got)
+	}
+	if got := asInt(t, mapField(t, m, "groups")); got != 1 {
+		t.Fatalf("groups = %d, want 1", got)
+	}
+	if v := mapField(t, m, "first-entry"); v != nil {
+		t.Fatalf("empty first-entry = %#v, want null", v)
+	}
+	if v := mapField(t, m, "last-entry"); v != nil {
+		t.Fatalf("empty last-entry = %#v, want null", v)
+	}
+
+	// Add five entries; length, ids, entries-added, and first/last entry track them.
+	for i := 1; i <= 5; i++ {
+		cmd(t, rw, "XADD", "s", itoa(i)+"-1", "f", itoa(i))
+		readValue(t, rw)
+	}
+	cmd(t, rw, "XINFO", "STREAM", "s")
+	m = asArray(t, readValue(t, rw), 20)
+	if got := asInt(t, mapField(t, m, "length")); got != 5 {
+		t.Fatalf("length = %d, want 5", got)
+	}
+	if got := asInt(t, mapField(t, m, "radix-tree-keys")); got != 1 {
+		t.Fatalf("radix-tree-keys = %d, want 1", got)
+	}
+	if got := asInt(t, mapField(t, m, "radix-tree-nodes")); got != 2 {
+		t.Fatalf("radix-tree-nodes = %d, want 2", got)
+	}
+	asBulk(t, mapField(t, m, "last-generated-id"), "5-1")
+	asBulk(t, mapField(t, m, "recorded-first-entry-id"), "1-1")
+	if got := asInt(t, mapField(t, m, "entries-added")); got != 5 {
+		t.Fatalf("entries-added = %d, want 5", got)
+	}
+	asBulk(t, asArray(t, mapField(t, m, "first-entry"), 2)[0], "1-1")
+	asBulk(t, asArray(t, mapField(t, m, "last-entry"), 2)[0], "5-1")
+
+	// GROUPS before any read: one group, no consumers, cursor at 0-0. Redis and Valkey leave a group's
+	// entries-read null until a > delivery reconciles it, even though the lag is still known (5).
+	cmd(t, rw, "XINFO", "GROUPS", "s")
+	gs := asArray(t, readValue(t, rw), 1)
+	g := asArray(t, gs[0], 12)
+	asBulk(t, mapField(t, g, "name"), "g1")
+	if got := asInt(t, mapField(t, g, "consumers")); got != 0 {
+		t.Fatalf("consumers = %d, want 0", got)
+	}
+	if got := asInt(t, mapField(t, g, "pending")); got != 0 {
+		t.Fatalf("pending = %d, want 0", got)
+	}
+	asBulk(t, mapField(t, g, "last-delivered-id"), "0-0")
+	if v := mapField(t, g, "entries-read"); v != nil {
+		t.Fatalf("pre-read entries-read = %#v, want null", v)
+	}
+	if got := asInt(t, mapField(t, g, "lag")); got != 5 {
+		t.Fatalf("lag = %d, want 5", got)
+	}
+
+	// Two consumers read; entries-read and lag reconcile, and the pending count follows.
+	cmd(t, rw, "XREADGROUP", "GROUP", "g1", "alice", "COUNT", "3", "STREAMS", "s", ">")
+	readValue(t, rw)
+	cmd(t, rw, "XREADGROUP", "GROUP", "g1", "bob", "COUNT", "2", "STREAMS", "s", ">")
+	readValue(t, rw)
+	cmd(t, rw, "XINFO", "GROUPS", "s")
+	gs = asArray(t, readValue(t, rw), 1)
+	g = asArray(t, gs[0], 12)
+	if got := asInt(t, mapField(t, g, "consumers")); got != 2 {
+		t.Fatalf("consumers = %d, want 2", got)
+	}
+	if got := asInt(t, mapField(t, g, "pending")); got != 5 {
+		t.Fatalf("pending = %d, want 5", got)
+	}
+	asBulk(t, mapField(t, g, "last-delivered-id"), "5-1")
+	if got := asInt(t, mapField(t, g, "entries-read")); got != 5 {
+		t.Fatalf("entries-read = %d, want 5", got)
+	}
+	if got := asInt(t, mapField(t, g, "lag")); got != 0 {
+		t.Fatalf("lag = %d, want 0", got)
+	}
+
+	// CONSUMERS: two, in name order, alice with 3 pending, bob with 2, idle and inactive present.
+	cmd(t, rw, "XINFO", "CONSUMERS", "s", "g1")
+	cs := asArray(t, readValue(t, rw), 2)
+	c0 := asArray(t, cs[0], 8)
+	asBulk(t, mapField(t, c0, "name"), "alice")
+	if got := asInt(t, mapField(t, c0, "pending")); got != 3 {
+		t.Fatalf("alice pending = %d, want 3", got)
+	}
+	asInt(t, mapField(t, c0, "idle"))
+	asInt(t, mapField(t, c0, "inactive"))
+	c1 := asArray(t, cs[1], 8)
+	asBulk(t, mapField(t, c1, "name"), "bob")
+	if got := asInt(t, mapField(t, c1, "pending")); got != 2 {
+		t.Fatalf("bob pending = %d, want 2", got)
+	}
+
+	// SETID with an explicit ENTRIESREAD sets the counter; without it the counter is unknown (null).
+	cmd(t, rw, "XGROUP", "SETID", "s", "g1", "0", "ENTRIESREAD", "0")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "XINFO", "GROUPS", "s")
+	gs = asArray(t, readValue(t, rw), 1)
+	g = asArray(t, gs[0], 12)
+	if got := asInt(t, mapField(t, g, "entries-read")); got != 0 {
+		t.Fatalf("post-setid entries-read = %d, want 0", got)
+	}
+	if got := asInt(t, mapField(t, g, "lag")); got != 5 {
+		t.Fatalf("post-setid lag = %d, want 5", got)
+	}
+	cmd(t, rw, "XGROUP", "SETID", "s", "g1", "0")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "XINFO", "GROUPS", "s")
+	gs = asArray(t, readValue(t, rw), 1)
+	g = asArray(t, gs[0], 12)
+	if v := mapField(t, g, "entries-read"); v != nil {
+		t.Fatalf("entries-read after SETID without ENTRIESREAD = %#v, want null", v)
+	}
+
+	// STREAM FULL: header plus the entry window and the nested group/consumer view.
+	cmd(t, rw, "XREADGROUP", "GROUP", "g1", "alice", "COUNT", "5", "STREAMS", "s", ">")
+	readValue(t, rw)
+	cmd(t, rw, "XINFO", "STREAM", "s", "FULL")
+	f := asArray(t, readValue(t, rw), 18)
+	entries := asArray(t, mapField(t, f, "entries"), 5)
+	asBulk(t, asArray(t, entries[0], 2)[0], "1-1")
+	fgroups := asArray(t, mapField(t, f, "groups"), 1)
+	fg := asArray(t, fgroups[0], 14)
+	asBulk(t, mapField(t, fg, "name"), "g1")
+	if got := asInt(t, mapField(t, fg, "pel-count")); got != 5 {
+		t.Fatalf("full pel-count = %d, want 5", got)
+	}
+	fgpending := asArray(t, mapField(t, fg, "pending"), 5)
+	// Each group PEL row is [id, consumer, delivery-time, delivery-count].
+	prow := asArray(t, fgpending[0], 4)
+	asBulk(t, prow[0], "1-1")
+	asBulk(t, prow[1], "alice")
+	// Re-reading with > after the cursor rewind reassigns all five ids to alice. Redis and Valkey keep
+	// bob as a consumer with an empty PEL rather than dropping him, so FULL lists both, in name order.
+	fcons := asArray(t, mapField(t, fg, "consumers"), 2)
+	fc := asArray(t, fcons[0], 10)
+	asBulk(t, mapField(t, fc, "name"), "alice")
+	if got := asInt(t, mapField(t, fc, "pel-count")); got != 5 {
+		t.Fatalf("full consumer pel-count = %d, want 5", got)
+	}
+	// Each consumer PEL row is [id, delivery-time, delivery-count].
+	asArray(t, asArray(t, mapField(t, fc, "pending"), 5)[0], 3)
+	fcbob := asArray(t, fcons[1], 10)
+	asBulk(t, mapField(t, fcbob, "name"), "bob")
+	if got := asInt(t, mapField(t, fcbob, "pel-count")); got != 0 {
+		t.Fatalf("full bob pel-count = %d, want 0", got)
+	}
+	asArray(t, mapField(t, fcbob, "pending"), 0)
+
+	// FULL COUNT bounds the entry window and each PEL list.
+	cmd(t, rw, "XINFO", "STREAM", "s", "FULL", "COUNT", "2")
+	f = asArray(t, readValue(t, rw), 18)
+	asArray(t, mapField(t, f, "entries"), 2)
+	fg = asArray(t, asArray(t, mapField(t, f, "groups"), 1)[0], 14)
+	asArray(t, mapField(t, fg, "pending"), 2)
+
+	// Error and arity paths, all worded the way Redis and Valkey word them.
+	cmd(t, rw, "XINFO")
+	expect(t, rw, "-ERR wrong number of arguments for 'xinfo' command")
+	cmd(t, rw, "XINFO", "STREAM")
+	expect(t, rw, "-ERR wrong number of arguments for 'xinfo|stream' command")
+	cmd(t, rw, "XINFO", "STREAM", "s", "PARTIAL")
+	expect(t, rw, "-ERR unknown subcommand or wrong number of arguments for 'STREAM'. Try XINFO HELP.")
+	cmd(t, rw, "XINFO", "STREAM", "nokey")
+	expect(t, rw, "-ERR no such key")
+	cmd(t, rw, "XINFO", "STREAM", "s", "FULL", "COUNT", "abc")
+	expect(t, rw, "-ERR value is not an integer or out of range")
+	cmd(t, rw, "XINFO", "STREAM", "nokey", "FULL", "COUNT", "abc")
+	expect(t, rw, "-ERR no such key")
+	cmd(t, rw, "XINFO", "GROUPS", "nokey")
+	expect(t, rw, "-ERR no such key")
+	cmd(t, rw, "XINFO", "GROUPS", "s", "extra")
+	expect(t, rw, "-ERR wrong number of arguments for 'xinfo|groups' command")
+	cmd(t, rw, "XINFO", "CONSUMERS", "s", "ghost")
+	expect(t, rw, "-"+streamNoGroup("ghost", "s"))
+	cmd(t, rw, "XINFO", "CONSUMERS", "nokey", "g1")
+	expect(t, rw, "-ERR no such key")
+	cmd(t, rw, "XINFO", "BADSUB")
+	expect(t, rw, "-ERR unknown subcommand 'BADSUB'. Try XINFO HELP.")
+
+	// Wrong type on the key.
+	cmd(t, rw, "SET", "str", "v")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "XINFO", "STREAM", "str")
+	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
+	cmd(t, rw, "XINFO", "GROUPS", "str")
+	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
+	cmd(t, rw, "XINFO", "CONSUMERS", "str", "g1")
+	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
+}
