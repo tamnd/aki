@@ -199,6 +199,16 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdBRPopLPush(argv)
 	case eqFold(cmd, "BLMPOP"):
 		c.cmdBLMPop(argv)
+	case eqFold(cmd, "XADD"):
+		c.cmdXAdd(argv)
+	case eqFold(cmd, "XLEN"):
+		c.cmdXLen(argv)
+	case eqFold(cmd, "XRANGE"):
+		c.cmdXRange(argv, false)
+	case eqFold(cmd, "XREVRANGE"):
+		c.cmdXRange(argv, true)
+	case eqFold(cmd, "XREAD"):
+		c.cmdXRead(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
@@ -363,6 +373,12 @@ func (c *connState) dropKey(key []byte) bool {
 		return true
 	case keyList:
 		c.dropList(key)
+		return true
+	case keyStream:
+		// A stream is the one type whose header outlives an empty entry range, so DEL is the
+		// path that clears it: drop every entry row, then the header. Later slices extend
+		// dropStream to the group, consumer, and PEL sibling families.
+		c.dropStream(key)
 		return true
 	}
 	return false
