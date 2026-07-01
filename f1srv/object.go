@@ -156,6 +156,7 @@ const (
 	keySet
 	keyZset
 	keyList
+	keyStream
 )
 
 // keyTypeOf resolves a key to exactly one type. A key can only ever be one type at a time
@@ -178,6 +179,11 @@ func (c *connState) keyTypeOf(key []byte) keyKind {
 	if c.srv.store.ExistsKind(key, kindListMeta) {
 		return keyList
 	}
+	// A stream is the one type whose header row persists at length 0, so a stream that has had
+	// every entry trimmed still resolves here rather than to keyMissing; only DEL clears it.
+	if c.srv.store.ExistsKind(key, kindStreamMeta) {
+		return keyStream
+	}
 	return keyMissing
 }
 
@@ -199,6 +205,8 @@ func (c *connState) cmdType(argv [][]byte) {
 		c.writeSimple("zset")
 	case keyList:
 		c.writeSimple("list")
+	case keyStream:
+		c.writeSimple("stream")
 	default:
 		c.writeSimple("none")
 	}
@@ -275,6 +283,10 @@ func (c *connState) cmdObject(argv [][]byte) {
 			c.writeBulk([]byte(zsetEncodingName(enc)))
 		case keyList:
 			c.writeBulk([]byte(c.listEncodingName(key)))
+		case keyStream:
+			// A stream has one representation, the radix-tree-of-listpacks, so OBJECT ENCODING
+			// on a stream is always "stream" in Redis and Valkey regardless of contents.
+			c.writeBulk([]byte("stream"))
 		default:
 			c.writeNil()
 		}
