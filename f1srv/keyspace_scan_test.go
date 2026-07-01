@@ -275,6 +275,82 @@ func TestKeyspaceExpiry(t *testing.T) {
 	expect(t, rw, ":1")
 }
 
+// DBSIZE counts logical top-level keys: one per string and one per collection regardless of how
+// many elements it holds, not the element rows. It rises on a create, is flat while a collection
+// only gains or loses elements, and falls when a key is deleted or a collection empties out.
+func TestDBSize(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "DBSIZE")
+	expect(t, rw, ":0")
+
+	for i := 0; i < 5; i++ {
+		cmd(t, rw, "SET", "s"+itoaTest(i), "v")
+		expect(t, rw, "+OK")
+	}
+	cmd(t, rw, "DBSIZE")
+	expect(t, rw, ":5")
+
+	// One collection of each type is one key each, whatever its cardinality.
+	cmd(t, rw, "HSET", "h1", "f1", "v", "f2", "v", "f3", "v")
+	expect(t, rw, ":3")
+	cmd(t, rw, "SADD", "set1", "a", "b", "c")
+	expect(t, rw, ":3")
+	cmd(t, rw, "RPUSH", "list1", "x", "y")
+	expect(t, rw, ":2")
+	cmd(t, rw, "ZADD", "z1", "1", "a", "2", "b")
+	expect(t, rw, ":2")
+	cmd(t, rw, "XADD", "stream1", "*", "f", "v")
+	readReply(t, rw) // the generated ID, opaque here
+	cmd(t, rw, "DBSIZE")
+	expect(t, rw, ":10")
+
+	// Growing or shrinking a collection's elements does not change the key count.
+	cmd(t, rw, "HSET", "h1", "f4", "v")
+	expect(t, rw, ":1")
+	cmd(t, rw, "HDEL", "h1", "f4")
+	expect(t, rw, ":1")
+	cmd(t, rw, "DBSIZE")
+	expect(t, rw, ":10")
+
+	// Emptying a collection drops its key.
+	cmd(t, rw, "DEL", "list1")
+	expect(t, rw, ":1")
+	cmd(t, rw, "SREM", "set1", "a", "b", "c")
+	expect(t, rw, ":3")
+	cmd(t, rw, "DBSIZE")
+	expect(t, rw, ":8")
+
+	cmd(t, rw, "FLUSHALL")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "DBSIZE")
+	expect(t, rw, ":0")
+}
+
+// A logically-expired but unreaped key still counts toward DBSIZE, matching Redis, which counts
+// the dict entry until lazy or active expiry removes it. A typed access that reaps the key then
+// drops the count.
+func TestDBSizeExpiry(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "SET", "live", "v")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "SET", "dying", "v", "PX", "1")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "DBSIZE")
+	expect(t, rw, ":2")
+
+	time.Sleep(30 * time.Millisecond)
+
+	// A GET on the expired key reaps it, and the count then reflects the reap.
+	cmd(t, rw, "GET", "dying")
+	expect(t, rw, "$-1")
+	cmd(t, rw, "DBSIZE")
+	expect(t, rw, ":1")
+}
+
 // itoaTest renders a small non-negative int without pulling strconv into the test's intent.
 func itoaTest(n int) string {
 	if n == 0 {
