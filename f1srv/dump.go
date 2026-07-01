@@ -2,6 +2,7 @@ package f1srv
 
 import (
 	"encoding/binary"
+	"math"
 	"strconv"
 )
 
@@ -33,17 +34,28 @@ import (
 // 2), a member count then that many member strings, again the plain form both servers accept at any
 // size. The load side decodes the two packed forms both servers emit for a small set: the listpack
 // form (RDB_TYPE_SET_LISTPACK, type 20) and the intset form (RDB_TYPE_SET_INTSET, type 11), an
-// all-integer set packed into a width-prefixed sorted integer array. The remaining collection types
-// arrive in the follow-up slices; each reuses this file's CRC64, version framing, string primitives,
-// and (for the listpack encodings) lpDecode.
+// all-integer set packed into a width-prefixed sorted integer array.
+//
+// The sorted set is the fourth slice. aki dumps a zset as RDB_TYPE_ZSET_2 (type 5), a member count
+// then that many member/score pairs where each score is an 8-byte little-endian binary double, the
+// same bytes aki already stores on the member row, so the dump is a copy with no float-to-text step.
+// Both reference servers accept type 5 at any size. The load side additionally decodes the two forms
+// a real server emits for a small zset, the listpack form (RDB_TYPE_ZSET_LISTPACK, type 17, with
+// member and score alternating) and the older ASCII-double form (RDB_TYPE_ZSET, type 3), so a zset
+// blob produced by either server restores here. The remaining collection types arrive in the
+// follow-up slices; each reuses this file's CRC64, version framing, string primitives, and (for the
+// listpack encodings) lpDecode.
 
 // RDB object type bytes. Only the forms aki serializes or has to load are named here.
 const (
 	rdbTypeString       = 0x00 // a plain string value
+	rdbTypeZset         = 0x03 // the old sorted set: a count then member/score pairs, score as ASCII
 	rdbTypeSet          = 0x02 // a set as a member count then that many member strings
 	rdbTypeHash         = 0x04 // a hash as a field count then field/value string pairs
+	rdbTypeZset2        = 0x05 // the sorted set with binary double scores, the form aki writes
 	rdbTypeSetIntset    = 0x0b // an all-integer set packed into a single intset blob
 	rdbTypeHashListpack = 0x10 // a hash packed into a single listpack blob, the form both servers emit
+	rdbTypeZsetListpack = 0x11 // a sorted set packed into a single listpack blob, the small-zset form
 	rdbTypeSetListpack  = 0x14 // a set packed into a single listpack blob, the form both servers emit
 )
 
@@ -110,8 +122,9 @@ func crc64(seed uint64, data []byte) uint64 {
 }
 
 // cmdDump serializes a key's value to the RDB blob RESTORE consumes, or replies null when the key
-// does not exist. The string and hash types are serialized here; the remaining collection types are
-// refused rather than answered with a body this file cannot build, and their slices lift that refusal.
+// does not exist. The string, hash, set, and sorted set types are serialized here; the remaining
+// collection types are refused rather than answered with a body this file cannot build, and their
+// slices lift that refusal.
 func (c *connState) cmdDump(argv [][]byte) {
 	if len(argv) != 2 {
 		c.writeErr("ERR wrong number of arguments for 'dump' command")
@@ -132,6 +145,8 @@ func (c *connState) cmdDump(argv [][]byte) {
 		c.writeBulk(rdbSeal(c.rdbDumpHash(key)))
 	case keySet:
 		c.writeBulk(rdbSeal(c.rdbDumpSet(key)))
+	case keyZset:
+		c.writeBulk(rdbSeal(c.rdbDumpZset(key)))
 	default:
 		c.writeErr("ERR DUMP of this type is not supported yet")
 	}
@@ -192,6 +207,48 @@ func (c *connState) rdbDumpSet(skey []byte) []byte {
 		}
 		for _, k := range keys {
 			payload = rdbAppendString(payload, k[plen:])
+		}
+		if last == nil {
+			break
+		}
+		after = last
+	}
+	return payload
+}
+
+// rdbDumpZset builds the RDB_TYPE_ZSET_2 body for a sorted set: the type byte, the member count, then
+// each member as an RDB string followed by its score as an 8-byte little-endian binary double. It
+// holds the stripe lock and walks the member-family rows off the O(1) count and the collection index,
+// the enumerate path ZRANDMEMBER uses, so it never materializes the whole zset. Each member row's
+// value is already the 8-byte little-endian score bits, which is exactly what ZSET_2 stores, so the
+// score copies through with no float-to-text-and-back round trip.
+func (c *connState) rdbDumpZset(zkey []byte) []byte {
+	mu := &c.srv.incrMu[c.srv.stripe(zkey)]
+	mu.Lock()
+	defer mu.Unlock()
+
+	payload := rdbAppendLen([]byte{rdbTypeZset2}, c.zsetCard(zkey))
+	prefix := c.zmemberPrefix(zkey)
+	plen := len(prefix)
+	var after []byte
+	scanK := make([][]byte, 0, hashScanBatch)
+	scanO := make([]uint64, 0, hashScanBatch)
+	var vbuf []byte
+	for {
+		keys, offs, last := c.srv.store.CollScanKV(prefix, after, hashScanBatch, scanK[:0], scanO[:0])
+		if len(keys) == 0 {
+			break
+		}
+		for i, k := range keys {
+			payload = rdbAppendString(payload, k[plen:])
+			vbuf = c.srv.store.ReadValueAt(offs[i], vbuf[:0])
+			// The member row carries the score as 8 little-endian bytes; a value of any other length
+			// would mean a corrupt row, so fall back to a zero score rather than emit a short blob.
+			var sb [8]byte
+			if len(vbuf) == 8 {
+				copy(sb[:], vbuf)
+			}
+			payload = append(payload, sb[:]...)
 		}
 		if last == nil {
 			break
@@ -350,14 +407,16 @@ func rdbCheckFooter(blob []byte) ([]byte, bool) {
 // elements here lets a single loader handle every type and the caller write them through the type's
 // own primitives without re-parsing.
 type rdbValue struct {
-	kind  keyKind
-	str   []byte
-	elems [][]byte
+	kind   keyKind
+	str    []byte
+	elems  [][]byte
+	scores []float64 // for a zset, the score of each member in elems, aligned by index
 }
 
 // rdbLoadValue parses a value body (a type byte followed by the type's encoding) into an rdbValue. It
-// understands the string type and both hash encodings a real server emits: the plain field-count form
-// and the listpack form. Other type bytes are reported as unparseable until their slices land.
+// understands the string, hash, set, and sorted set types in every encoding a real server emits: the
+// plain count forms, the listpack and intset packed forms, and the binary- and ASCII-double zset
+// forms. Other type bytes are reported as unparseable until their slices land.
 func rdbLoadValue(body []byte) (rdbValue, bool) {
 	if len(body) < 1 {
 		return rdbValue{}, false
@@ -429,9 +488,110 @@ func rdbLoadValue(body []byte) (rdbValue, bool) {
 			return rdbValue{}, false
 		}
 		return rdbValue{kind: keySet, elems: elems}, true
+	case rdbTypeZset2:
+		return rdbLoadZset2(body[1:])
+	case rdbTypeZset:
+		return rdbLoadZsetOld(body[1:])
+	case rdbTypeZsetListpack:
+		lp, _, ok := rdbReadString(body[1:])
+		if !ok {
+			return rdbValue{}, false
+		}
+		flat, ok := lpDecode(lp)
+		if !ok || len(flat)%2 != 0 {
+			return rdbValue{}, false
+		}
+		members := make([][]byte, 0, len(flat)/2)
+		scores := make([]float64, 0, len(flat)/2)
+		for i := 0; i+1 < len(flat); i += 2 {
+			f, err := strconv.ParseFloat(string(flat[i+1]), 64)
+			if err != nil {
+				return rdbValue{}, false
+			}
+			members = append(members, flat[i])
+			scores = append(scores, f)
+		}
+		return rdbValue{kind: keyZset, elems: members, scores: scores}, true
 	default:
 		return rdbValue{}, false
 	}
+}
+
+// rdbLoadZset2 parses the RDB_TYPE_ZSET_2 body: a member count then that many member strings, each
+// followed by an 8-byte little-endian binary double score. This is the form aki dumps and the form
+// both servers write for a large sorted set.
+func rdbLoadZset2(b []byte) (rdbValue, bool) {
+	count, rest, ok := rdbReadLen(b)
+	if !ok {
+		return rdbValue{}, false
+	}
+	members := make([][]byte, 0, count)
+	scores := make([]float64, 0, count)
+	for i := uint64(0); i < count; i++ {
+		m, r, ok := rdbReadString(rest)
+		if !ok {
+			return rdbValue{}, false
+		}
+		if len(r) < 8 {
+			return rdbValue{}, false
+		}
+		members = append(members, m)
+		scores = append(scores, math.Float64frombits(binary.LittleEndian.Uint64(r[:8])))
+		rest = r[8:]
+	}
+	return rdbValue{kind: keyZset, elems: members, scores: scores}, true
+}
+
+// rdbLoadZsetOld parses the older RDB_TYPE_ZSET body, where each score is a length-prefixed ASCII
+// double with three special length bytes for the non-finite values: 255 is negative infinity, 254 is
+// positive infinity, and 253 is NaN (which a sorted set never holds, so it is rejected).
+func rdbLoadZsetOld(b []byte) (rdbValue, bool) {
+	count, rest, ok := rdbReadLen(b)
+	if !ok {
+		return rdbValue{}, false
+	}
+	members := make([][]byte, 0, count)
+	scores := make([]float64, 0, count)
+	for i := uint64(0); i < count; i++ {
+		m, r, ok := rdbReadString(rest)
+		if !ok {
+			return rdbValue{}, false
+		}
+		score, r2, ok := rdbReadDouble(r)
+		if !ok {
+			return rdbValue{}, false
+		}
+		members = append(members, m)
+		scores = append(scores, score)
+		rest = r2
+	}
+	return rdbValue{kind: keyZset, elems: members, scores: scores}, true
+}
+
+// rdbReadDouble decodes one old-format RDB double: a single length byte, with 255/254/253 reserving
+// negative infinity, positive infinity, and NaN, and any other value naming that many ASCII bytes of
+// a decimal float that follow. NaN is rejected because a sorted set score is never NaN.
+func rdbReadDouble(b []byte) (float64, []byte, bool) {
+	if len(b) < 1 {
+		return 0, nil, false
+	}
+	n := b[0]
+	switch n {
+	case 255:
+		return math.Inf(-1), b[1:], true
+	case 254:
+		return math.Inf(1), b[1:], true
+	case 253:
+		return 0, nil, false
+	}
+	if len(b) < 1+int(n) {
+		return 0, nil, false
+	}
+	f, err := strconv.ParseFloat(string(b[1:1+int(n)]), 64)
+	if err != nil {
+		return 0, nil, false
+	}
+	return f, b[1+int(n):], true
 }
 
 // intsetDecode parses an intset blob into its members rendered as decimal text. An intset is a 4-byte
@@ -503,6 +663,19 @@ func (c *connState) rdbWriteValue(key []byte, v rdbValue) error {
 			}
 		}
 		return c.setPutHeader(key, count, enc)
+	case keyZset:
+		enc := encNone
+		for i, m := range v.elems {
+			// A well-formed blob carries each member once, so every insert is a new member; write its
+			// two rows and fold the encoding forward the way ZADD does. -0.0 is normalized to 0.0 to
+			// match aki's own ingest, so a score round-trips to the same text ZSCORE would show.
+			mk := c.zmemberKey(key, m)
+			if err := c.zsetInsertNew(key, m, mk, normalizeZero(v.scores[i])); err != nil {
+				return err
+			}
+			enc = foldZsetEnc(enc, m, uint64(i+1))
+		}
+		return c.zsetPutHeader(key, uint64(len(v.elems)), enc)
 	}
 	return nil
 }
