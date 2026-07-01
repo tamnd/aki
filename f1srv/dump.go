@@ -42,21 +42,41 @@ import (
 // Both reference servers accept type 5 at any size. The load side additionally decodes the two forms
 // a real server emits for a small zset, the listpack form (RDB_TYPE_ZSET_LISTPACK, type 17, with
 // member and score alternating) and the older ASCII-double form (RDB_TYPE_ZSET, type 3), so a zset
-// blob produced by either server restores here. The remaining collection types arrive in the
-// follow-up slices; each reuses this file's CRC64, version framing, string primitives, and (for the
-// listpack encodings) lpDecode.
+// blob produced by either server restores here.
+//
+// The list is the fifth slice. Both Redis 8.8 and Valkey 9.1 serialize every list, small or large, as
+// RDB_TYPE_LIST_QUICKLIST_2 (type 18): a node count then, per node, a container byte (1 PLAIN, a
+// single value stored as the node; 2 PACKED, a listpack of the node's elements) and the node body as
+// an RDB string. aki dumps a list in that same type as a single PACKED node whose listpack holds all
+// the elements in head-to-tail order. The PLAIN container is not used on the write side because both
+// reference servers reject a PLAIN node that carries a short or empty value (they reserve PLAIN for a
+// value too large to pack), so a small or empty element has to ride inside a listpack. The load side
+// decodes the quicklist form both engines emit (PACKED nodes unpacked through lpDecode, PLAIN nodes
+// taken verbatim so a huge-value blob still loads) and the older plain RDB_TYPE_LIST (type 1, a count
+// then that many string elements) for completeness, so a list blob produced by either server restores
+// here. The remaining collection types arrive in the follow-up slices; each reuses this file's CRC64,
+// version framing, string primitives, and the listpack codec.
 
 // RDB object type bytes. Only the forms aki serializes or has to load are named here.
 const (
-	rdbTypeString       = 0x00 // a plain string value
-	rdbTypeZset         = 0x03 // the old sorted set: a count then member/score pairs, score as ASCII
-	rdbTypeSet          = 0x02 // a set as a member count then that many member strings
-	rdbTypeHash         = 0x04 // a hash as a field count then field/value string pairs
-	rdbTypeZset2        = 0x05 // the sorted set with binary double scores, the form aki writes
-	rdbTypeSetIntset    = 0x0b // an all-integer set packed into a single intset blob
-	rdbTypeHashListpack = 0x10 // a hash packed into a single listpack blob, the form both servers emit
-	rdbTypeZsetListpack = 0x11 // a sorted set packed into a single listpack blob, the small-zset form
-	rdbTypeSetListpack  = 0x14 // a set packed into a single listpack blob, the form both servers emit
+	rdbTypeString         = 0x00 // a plain string value
+	rdbTypeList           = 0x01 // the old list: a length then that many string elements
+	rdbTypeZset           = 0x03 // the old sorted set: a count then member/score pairs, score as ASCII
+	rdbTypeSet            = 0x02 // a set as a member count then that many member strings
+	rdbTypeHash           = 0x04 // a hash as a field count then field/value string pairs
+	rdbTypeZset2          = 0x05 // the sorted set with binary double scores, the form aki writes
+	rdbTypeSetIntset      = 0x0b // an all-integer set packed into a single intset blob
+	rdbTypeHashListpack   = 0x10 // a hash packed into a single listpack blob, the form both servers emit
+	rdbTypeZsetListpack   = 0x11 // a sorted set packed into a single listpack blob, the small-zset form
+	rdbTypeListQuicklist2 = 0x12 // a quicklist: a node count then per-node a container byte + node blob
+	rdbTypeSetListpack    = 0x14 // a set packed into a single listpack blob, the form both servers emit
+)
+
+// Quicklist node container tags inside an RDB_TYPE_LIST_QUICKLIST_2 body: a PLAIN node holds one
+// value directly, a PACKED node holds a listpack of the node's elements.
+const (
+	quicklistNodePlain  = 1
+	quicklistNodePacked = 2
 )
 
 // rdbVersion is the RDB version stamped into the footer of every DUMP payload aki produces. RESTORE
@@ -147,6 +167,8 @@ func (c *connState) cmdDump(argv [][]byte) {
 		c.writeBulk(rdbSeal(c.rdbDumpSet(key)))
 	case keyZset:
 		c.writeBulk(rdbSeal(c.rdbDumpZset(key)))
+	case keyList:
+		c.writeBulk(rdbSeal(c.rdbDumpList(key)))
 	default:
 		c.writeErr("ERR DUMP of this type is not supported yet")
 	}
@@ -256,6 +278,125 @@ func (c *connState) rdbDumpZset(zkey []byte) []byte {
 		after = last
 	}
 	return payload
+}
+
+// rdbDumpList builds the RDB_TYPE_LIST_QUICKLIST_2 body for a list: the type byte, a node count of
+// one, a PACKED container byte, and one listpack node holding every element as an RDB string. It holds
+// the stripe lock for a consistent snapshot and walks the window head to tail by position, the same
+// point-lookup path LRANGE uses, appending each element into the listpack as it goes so it never keeps
+// more than the growing node in hand. The PACKED node is required rather than a run of PLAIN nodes:
+// both reference servers reject a PLAIN node that carries a short or empty value, since they reserve
+// PLAIN for a value too large to pack, so a small or empty element has to be encoded inside a listpack.
+func (c *connState) rdbDumpList(lkey []byte) []byte {
+	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
+	mu.Lock()
+	defer mu.Unlock()
+
+	head, tail, _, _, ok := c.listHeader(lkey)
+	if !ok {
+		// cmdDump only reaches here for a live key, so this is the defensive empty-list form.
+		return rdbAppendLen([]byte{rdbTypeListQuicklist2}, 0)
+	}
+	// Build the listpack node: a 6-byte header filled in once the body length and count are known, one
+	// entry per element, and the single 0xFF terminator.
+	lp := []byte{0, 0, 0, 0, 0, 0}
+	var vbuf []byte
+	count := int64(0)
+	for pos := head; pos < tail; pos++ {
+		ek := c.listElemKey(lkey, pos)
+		v, _ := c.srv.store.GetKind(ek, vbuf[:0], kindListElem)
+		vbuf = v
+		lp = lpAppendEntry(lp, v)
+		count++
+	}
+	lp = append(lp, 0xFF)
+	binary.LittleEndian.PutUint32(lp[0:4], uint32(len(lp)))
+	if count > 0xFFFF {
+		count = 0xFFFF // the count field saturates; a loader that sees 0xFFFF rescans the entries
+	}
+	binary.LittleEndian.PutUint16(lp[4:6], uint16(count))
+
+	payload := rdbAppendLen([]byte{rdbTypeListQuicklist2}, 1)
+	payload = rdbAppendLen(payload, quicklistNodePacked)
+	payload = rdbAppendString(payload, lp)
+	return payload
+}
+
+// lpAppendEntry appends one listpack entry for e: its encoding and data, then the back-length that
+// lets the listpack be walked backwards. A value that parses as a canonical int64 takes the compact
+// integer encoding; anything else a string encoding sized by its length. The layout mirrors
+// listEncodingSize and listBacklenSize exactly, so a listpack this builds and one aki sizes agree
+// byte for byte, and it matches what Redis's lpEncodeGetType and lpEncodeBacklen emit.
+func lpAppendEntry(dst, e []byte) []byte {
+	before := len(dst)
+	if v, ok := listTryInteger(e); ok {
+		dst = lpAppendInt(dst, v)
+	} else {
+		dst = lpAppendStr(dst, e)
+	}
+	return lpAppendBacklen(dst, len(dst)-before)
+}
+
+// lpAppendInt appends the listpack integer encoding for v, choosing the smallest of the seven forms
+// lpGet decodes: a 7-bit unsigned byte, a 13-bit signed pair, or a 0xF1..0xF4 tag followed by a 16-,
+// 24-, 32-, or 64-bit little-endian two's-complement value.
+func lpAppendInt(dst []byte, v int64) []byte {
+	switch {
+	case v >= 0 && v <= 127:
+		return append(dst, byte(v)) // 0xxxxxxx
+	case v >= -4096 && v <= 4095:
+		u := uint16(v) & 0x1FFF // 110xxxxx xxxxxxxx, 13-bit two's complement
+		return append(dst, 0xC0|byte(u>>8), byte(u))
+	case v >= -32768 && v <= 32767:
+		u := uint16(v)
+		return append(dst, 0xF1, byte(u), byte(u>>8))
+	case v >= -8388608 && v <= 8388607:
+		u := uint32(v) & 0xFFFFFF
+		return append(dst, 0xF2, byte(u), byte(u>>8), byte(u>>16))
+	case v >= -2147483648 && v <= 2147483647:
+		u := uint32(v)
+		return append(dst, 0xF3, byte(u), byte(u>>8), byte(u>>16), byte(u>>24))
+	default:
+		u := uint64(v)
+		return append(dst, 0xF4, byte(u), byte(u>>8), byte(u>>16), byte(u>>24),
+			byte(u>>32), byte(u>>40), byte(u>>48), byte(u>>56))
+	}
+}
+
+// lpAppendStr appends the listpack string encoding for e: a 6-bit length byte for a short string, a
+// 12-bit length pair for a medium one, or a 0xF0 tag and a 32-bit little-endian length for a long one,
+// each followed by the raw bytes. The boundaries match lpGet and listEncodingSize.
+func lpAppendStr(dst, e []byte) []byte {
+	n := len(e)
+	switch {
+	case n < 64:
+		dst = append(dst, 0x80|byte(n)) // 10xxxxxx
+	case n < 4096:
+		dst = append(dst, 0xE0|byte(n>>8), byte(n)) // 1110xxxx xxxxxxxx
+	default:
+		dst = append(dst, 0xF0, byte(n), byte(n>>8), byte(n>>16), byte(n>>24))
+	}
+	return append(dst, e...)
+}
+
+// lpAppendBacklen appends the entry back-length in the 1-to-5-byte form lpDecodeBacklen reads from the
+// end of an entry: the value's 7-bit groups most-significant first, with the continuation bit set on
+// every byte after the first. The byte count matches listBacklenSize(encLen) so a forward walk skips
+// exactly what this writes.
+func lpAppendBacklen(dst []byte, l int) []byte {
+	switch {
+	case l <= 127:
+		return append(dst, byte(l))
+	case l < 16384:
+		return append(dst, byte(l>>7), byte(l&127)|128)
+	case l < 2097152:
+		return append(dst, byte(l>>14), byte((l>>7)&127)|128, byte(l&127)|128)
+	case l < 268435456:
+		return append(dst, byte(l>>21), byte((l>>14)&127)|128, byte((l>>7)&127)|128, byte(l&127)|128)
+	default:
+		return append(dst, byte(l>>28), byte((l>>21)&127)|128, byte((l>>14)&127)|128,
+			byte((l>>7)&127)|128, byte(l&127)|128)
+	}
 }
 
 // cmdRestore parses a DUMP blob and writes its value under a key, honoring the TTL and the REPLACE,
@@ -399,7 +540,7 @@ func rdbCheckFooter(blob []byte) ([]byte, bool) {
 	if crc64(0, blob[:n-8]) != stored {
 		return nil, false
 	}
-	return blob[: n-10], true
+	return blob[:n-10], true
 }
 
 // rdbValue is the decoded form of a DUMP body: the value's type and, for a string, its bytes, or for
@@ -488,6 +629,10 @@ func rdbLoadValue(body []byte) (rdbValue, bool) {
 			return rdbValue{}, false
 		}
 		return rdbValue{kind: keySet, elems: elems}, true
+	case rdbTypeList:
+		return rdbLoadListPlain(body[1:])
+	case rdbTypeListQuicklist2:
+		return rdbLoadQuicklist2(body[1:])
 	case rdbTypeZset2:
 		return rdbLoadZset2(body[1:])
 	case rdbTypeZset:
@@ -515,6 +660,63 @@ func rdbLoadValue(body []byte) (rdbValue, bool) {
 	default:
 		return rdbValue{}, false
 	}
+}
+
+// rdbLoadListPlain parses the older RDB_TYPE_LIST body: an element count then that many element
+// strings in order. A real server has not written this form for years, but it is trivial to accept and
+// keeps a blob from an ancient dump loadable.
+func rdbLoadListPlain(b []byte) (rdbValue, bool) {
+	count, rest, ok := rdbReadLen(b)
+	if !ok {
+		return rdbValue{}, false
+	}
+	elems := make([][]byte, 0, count)
+	for i := uint64(0); i < count; i++ {
+		s, r, ok := rdbReadString(rest)
+		if !ok {
+			return rdbValue{}, false
+		}
+		elems = append(elems, s)
+		rest = r
+	}
+	return rdbValue{kind: keyList, elems: elems}, true
+}
+
+// rdbLoadQuicklist2 parses the RDB_TYPE_LIST_QUICKLIST_2 body both Redis 8.8 and Valkey 9.1 emit: a
+// node count then, per node, a container byte (1 PLAIN, one value stored as the node; 2 PACKED, a
+// listpack of the node's elements) and the node body as an RDB string, which may itself be
+// LZF-compressed. The elements flatten across nodes into a single ordered list, so a multi-node
+// quicklist and aki's own one-node-per-element form both load to the same list.
+func rdbLoadQuicklist2(b []byte) (rdbValue, bool) {
+	nodes, rest, ok := rdbReadLen(b)
+	if !ok {
+		return rdbValue{}, false
+	}
+	var elems [][]byte
+	for i := uint64(0); i < nodes; i++ {
+		container, r, ok := rdbReadLen(rest)
+		if !ok {
+			return rdbValue{}, false
+		}
+		blob, r2, ok := rdbReadString(r)
+		if !ok {
+			return rdbValue{}, false
+		}
+		switch container {
+		case quicklistNodePlain:
+			elems = append(elems, blob)
+		case quicklistNodePacked:
+			part, ok := lpDecode(blob)
+			if !ok {
+				return rdbValue{}, false
+			}
+			elems = append(elems, part...)
+		default:
+			return rdbValue{}, false
+		}
+		rest = r2
+	}
+	return rdbValue{kind: keyList, elems: elems}, true
 }
 
 // rdbLoadZset2 parses the RDB_TYPE_ZSET_2 body: a member count then that many member strings, each
@@ -676,6 +878,27 @@ func (c *connState) rdbWriteValue(key []byte, v rdbValue) error {
 			enc = foldZsetEnc(enc, m, uint64(i+1))
 		}
 		return c.zsetPutHeader(key, uint64(len(v.elems)), enc)
+	case keyList:
+		// Land the elements as a contiguous window [0, len) the way a fresh RPUSH run would, one
+		// element-per-row point write apiece, then stamp the header with the running listpack byte
+		// size and sticky large flag exactly as a push accumulates them, so OBJECT ENCODING on the
+		// restored list matches what the same elements pushed one at a time would report.
+		if len(v.elems) == 0 {
+			return nil
+		}
+		lpBytes := uint64(listHeaderBytes)
+		everLarge := false
+		for i, e := range v.elems {
+			ek := c.listElemKey(key, int64(i))
+			if _, err := c.srv.store.PutKind(ek, e, kindListElem); err != nil {
+				return err
+			}
+			lpBytes += uint64(listEntrySize(e))
+			if !everLarge && lpBytes > listListpackMaxBytes {
+				everLarge = true
+			}
+		}
+		return c.listPutHeader(key, 0, int64(len(v.elems)), lpBytes, everLarge)
 	}
 	return nil
 }
@@ -1015,7 +1238,7 @@ func lzfDecompress(in []byte, ulen int) ([]byte, bool) {
 		if i >= len(in) {
 			return nil, false
 		}
-		ref := len(out) - ((ctrl&0x1f)<<8) - int(in[i]) - 1
+		ref := len(out) - ((ctrl & 0x1f) << 8) - int(in[i]) - 1
 		i++
 		if ref < 0 {
 			return nil, false
