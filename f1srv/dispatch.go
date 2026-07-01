@@ -125,6 +125,10 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdZCount(argv)
 	case eqFold(cmd, "ZLEXCOUNT"):
 		c.cmdZLexCount(argv)
+	case eqFold(cmd, "ZPOPMIN"):
+		c.cmdZPop(argv, false)
+	case eqFold(cmd, "ZPOPMAX"):
+		c.cmdZPop(argv, true)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):

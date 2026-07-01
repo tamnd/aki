@@ -196,6 +196,75 @@ func TestZlexcount(t *testing.T) {
 	expect(t, rw, ":0")
 }
 
+// TestZpop covers ZPOPMIN and ZPOPMAX: the no-count form, the count form, count past the
+// cardinality, the emptied-key case, and a missing key. Members "a".."e" carry scores 1..5.
+func TestZpop(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "ZADD", "z", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e")
+	expect(t, rw, ":5")
+
+	// No count pops the single lowest, flat member+score.
+	cmd(t, rw, "ZPOPMIN", "z")
+	expect(t, rw, "*2")
+	expect(t, rw, "$a")
+	expect(t, rw, "$1")
+
+	// No count pops the single highest.
+	cmd(t, rw, "ZPOPMAX", "z")
+	expect(t, rw, "*2")
+	expect(t, rw, "$e")
+	expect(t, rw, "$5")
+
+	// The set is now b,c,d. Count pops the two lowest, ascending.
+	cmd(t, rw, "ZPOPMIN", "z", "2")
+	expect(t, rw, "*4")
+	expect(t, rw, "$b")
+	expect(t, rw, "$2")
+	expect(t, rw, "$c")
+	expect(t, rw, "$3")
+
+	// Only d is left; a count past the cardinality pops what remains.
+	cmd(t, rw, "ZPOPMAX", "z", "9")
+	expect(t, rw, "*2")
+	expect(t, rw, "$d")
+	expect(t, rw, "$4")
+
+	// The zset is now empty, so it no longer exists.
+	cmd(t, rw, "ZCARD", "z")
+	expect(t, rw, ":0")
+	cmd(t, rw, "EXISTS", "z")
+	expect(t, rw, ":0")
+
+	// A missing key is an empty array.
+	cmd(t, rw, "ZPOPMIN", "nokey")
+	expect(t, rw, "*0")
+
+	// A zero count is an empty array.
+	cmd(t, rw, "ZADD", "z2", "1", "a")
+	expect(t, rw, ":1")
+	cmd(t, rw, "ZPOPMIN", "z2", "0")
+	expect(t, rw, "*0")
+}
+
+// TestZpopMaxOrder confirms ZPOPMAX with a count returns members highest score first.
+func TestZpopMaxOrder(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "ZADD", "z", "1", "a", "2", "b", "3", "c")
+	expect(t, rw, ":3")
+	cmd(t, rw, "ZPOPMAX", "z", "3")
+	expect(t, rw, "*6")
+	expect(t, rw, "$c")
+	expect(t, rw, "$3")
+	expect(t, rw, "$b")
+	expect(t, rw, "$2")
+	expect(t, rw, "$a")
+	expect(t, rw, "$1")
+}
+
 // TestZrangeBySyntaxErrors confirms the option-combination guards match Redis: LIMIT needs BYSCORE
 // or BYLEX, WITHSCORES is incompatible with BYLEX, and a bad float or lex item is rejected.
 func TestZrangeBySyntaxErrors(t *testing.T) {
