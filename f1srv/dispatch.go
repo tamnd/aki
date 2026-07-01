@@ -52,6 +52,8 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdIncrBy(argv, 0, true)
 	case eqFold(cmd, "DECRBY"):
 		c.cmdIncrBy(argv, 0, true)
+	case eqFold(cmd, "INCRBYFLOAT"):
+		c.cmdIncrByFloat(argv)
 	case eqFold(cmd, "DEL") || eqFold(cmd, "UNLINK"):
 		c.cmdDel(argv)
 	case eqFold(cmd, "EXISTS"):
@@ -88,6 +90,8 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdHScan(argv)
 	case eqFold(cmd, "HINCRBY"):
 		c.cmdHIncrBy(argv)
+	case eqFold(cmd, "HINCRBYFLOAT"):
+		c.cmdHIncrByFloat(argv)
 	case eqFold(cmd, "HRANDFIELD"):
 		c.cmdHRandField(argv)
 	case eqFold(cmd, "SADD"):
