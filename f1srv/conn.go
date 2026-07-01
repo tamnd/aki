@@ -24,13 +24,13 @@ type connState struct {
 	//                  connection's own goroutine; false under the shared-goroutine reactor,
 	//                  where a park would stall every other connection, so the blocking
 	//                  commands there serve non-blocking (immediate element or nil).
-	argv      [][]byte
-	vbuf      []byte    // reused destination for GET/MGET value copies
-	kbuf      []byte    // reused scratch for building composite collection element keys
-	pbuf      []byte    // reused scratch for a collection enumeration prefix, held across a scan
-	sbuf      []byte    // reused scratch for formatting a float score reply (ZSCORE/ZINCRBY)
-	zscores   []float64 // reused scratch for a ZADD's parsed scores, one per score-member pair
-	zkeys     [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
+	argv    [][]byte
+	vbuf    []byte    // reused destination for GET/MGET value copies
+	kbuf    []byte    // reused scratch for building composite collection element keys
+	pbuf    []byte    // reused scratch for a collection enumeration prefix, held across a scan
+	sbuf    []byte    // reused scratch for formatting a float score reply (ZSCORE/ZINCRBY)
+	zscores []float64 // reused scratch for a ZADD's parsed scores, one per score-member pair
+	zkeys   [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
 }
 
 // loop reads from the socket, drains every complete command in the buffer, and

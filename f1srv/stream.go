@@ -54,22 +54,22 @@ const streamTrimBatch = 512
 
 // Stream error strings, kept verbatim to match Redis 8.8 and Valkey 9.1.
 const (
-	errStreamIDSmaller  = "ERR The ID specified in XADD is equal or smaller than the target stream top item"
-	errStreamIDNotGT0   = "ERR The ID specified in XADD must be greater than 0-0"
-	errStreamInvalidID  = "ERR Invalid stream ID specified as stream command argument"
+	errStreamIDSmaller = "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+	errStreamIDNotGT0  = "ERR The ID specified in XADD must be greater than 0-0"
+	errStreamInvalidID = "ERR Invalid stream ID specified as stream command argument"
 	// The unbalanced-streams message names the command and the id forms it accepts, so XREAD and
 	// XREADGROUP report it exactly the way Redis does (they differ in wording).
 	errStreamUnbalanced      = "ERR Unbalanced 'xread' list of streams: for each stream key an ID, '+', or '$' must be specified."
 	errStreamUnbalancedGroup = "ERR Unbalanced 'xreadgroup' list of streams: for each stream key an ID or '>' must be specified."
 	errStreamCountER         = "ERR value is not an integer or out of range"
-	errStreamTimeoutNeg = "ERR timeout is negative"
-	errStreamTimeoutInt = "ERR timeout is not an integer or out of range"
-	errStreamMaxLenArg  = "ERR The MAXLEN argument must be >= 0."
-	errStreamMinIDArg   = "ERR Invalid stream ID specified as stream command argument"
-	errStreamLimitNoApx = "ERR syntax error, LIMIT cannot be used without the special ~ option"
-	errStreamNoSuchKey  = "ERR no such key"
-	errStreamSetIDSmall = "ERR The ID specified in XSETID is smaller than the target stream top item"
-	errStreamNotInt     = "ERR value is not an integer or out of range"
+	errStreamTimeoutNeg      = "ERR timeout is negative"
+	errStreamTimeoutInt      = "ERR timeout is not an integer or out of range"
+	errStreamMaxLenArg       = "ERR The MAXLEN argument must be >= 0."
+	errStreamMinIDArg        = "ERR Invalid stream ID specified as stream command argument"
+	errStreamLimitNoApx      = "ERR syntax error, LIMIT cannot be used without the special ~ option"
+	errStreamNoSuchKey       = "ERR no such key"
+	errStreamSetIDSmall      = "ERR The ID specified in XSETID is smaller than the target stream top item"
+	errStreamNotInt          = "ERR value is not an integer or out of range"
 )
 
 // streamID is a 128-bit entry ID: a millisecond timestamp and a sequence that breaks ties within

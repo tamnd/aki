@@ -120,9 +120,9 @@ func (c *connState) cmdBitOp(argv [][]byte) {
 
 // bfOp is one parsed BITFIELD subcommand.
 type bfOp struct {
-	kind   int   // bfGet, bfSet, bfIncrby
-	sign   bool  // true for i<bits>, false for u<bits>
-	bits   uint  // 1..64 signed, 1..63 unsigned
+	kind   int  // bfGet, bfSet, bfIncrby
+	sign   bool // true for i<bits>, false for u<bits>
+	bits   uint // 1..64 signed, 1..63 unsigned
 	offset uint64
 	arg    int64 // SET value or INCRBY increment
 	owrap  int   // overflow policy in force for this write: bfWrap/bfSat/bfFail
