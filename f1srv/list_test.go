@@ -559,6 +559,122 @@ func TestKeyExistsDelCascade(t *testing.T) {
 	expect(t, rw, ":1")
 }
 
+func TestListLMove(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "RPUSH", "src", "a", "b", "c", "d")
+	expect(t, rw, ":4")
+
+	// RPOPLPUSH is LMOVE src dst RIGHT LEFT: tail of src to head of dst.
+	cmd(t, rw, "RPOPLPUSH", "src", "dst")
+	expect(t, rw, "$d")
+	if got := lrangeCall(t, rw, "LRANGE", "src", "0", "-1"); !eqStrs(got, []string{"a", "b", "c"}) {
+		t.Fatalf("src after rpoplpush = %v", got)
+	}
+	if got := lrangeCall(t, rw, "LRANGE", "dst", "0", "-1"); !eqStrs(got, []string{"d"}) {
+		t.Fatalf("dst after rpoplpush = %v", got)
+	}
+
+	// LMOVE LEFT RIGHT: head of src to tail of dst.
+	cmd(t, rw, "LMOVE", "src", "dst", "LEFT", "RIGHT")
+	expect(t, rw, "$a")
+	if got := lrangeCall(t, rw, "LRANGE", "dst", "0", "-1"); !eqStrs(got, []string{"d", "a"}) {
+		t.Fatalf("dst after lmove = %v", got)
+	}
+
+	// A one-element self-rotate is a no-op, and a self-rotate of many moves one end to the other.
+	cmd(t, rw, "DEL", "rot")
+	readReply(t, rw)
+	cmd(t, rw, "RPUSH", "rot", "x", "y", "z")
+	expect(t, rw, ":3")
+	cmd(t, rw, "RPOPLPUSH", "rot", "rot")
+	expect(t, rw, "$z")
+	if got := lrangeCall(t, rw, "LRANGE", "rot", "0", "-1"); !eqStrs(got, []string{"z", "x", "y"}) {
+		t.Fatalf("rot after self-rotate = %v", got)
+	}
+
+	// Moving the last element out deletes the source key.
+	cmd(t, rw, "DEL", "drain")
+	readReply(t, rw)
+	cmd(t, rw, "RPUSH", "drain", "q")
+	expect(t, rw, ":1")
+	cmd(t, rw, "LMOVE", "drain", "into", "LEFT", "RIGHT")
+	expect(t, rw, "$q")
+	cmd(t, rw, "EXISTS", "drain")
+	expect(t, rw, ":0")
+
+	// An empty or missing source moves nothing and does not create the destination.
+	cmd(t, rw, "RPOPLPUSH", "ghost", "gg")
+	expect(t, rw, "$-1")
+	cmd(t, rw, "EXISTS", "gg")
+	expect(t, rw, ":0")
+
+	// A bad direction token is a syntax error.
+	cmd(t, rw, "LMOVE", "src", "dst", "UP", "DOWN")
+	got := readReply(t, rw)
+	if got != "-ERR syntax error" {
+		t.Fatalf("bad direction = %q", got)
+	}
+}
+
+func TestListLMPop(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "RPUSH", "mp1", "x", "y", "z")
+	expect(t, rw, ":3")
+
+	// LMPOP skips a missing first key and pops from the first non-empty one, up to COUNT.
+	cmd(t, rw, "LMPOP", "2", "nope", "mp1", "LEFT", "COUNT", "2")
+	expect(t, rw, "*2")
+	expect(t, rw, "$mp1")
+	expect(t, rw, "*2")
+	expect(t, rw, "$x")
+	expect(t, rw, "$y")
+	if got := lrangeCall(t, rw, "LRANGE", "mp1", "0", "-1"); !eqStrs(got, []string{"z"}) {
+		t.Fatalf("mp1 after lmpop = %v", got)
+	}
+
+	// Default count is 1, from the tail for RIGHT. This drains the list, deleting the key.
+	cmd(t, rw, "LMPOP", "1", "mp1", "RIGHT")
+	expect(t, rw, "*2")
+	expect(t, rw, "$mp1")
+	expect(t, rw, "*1")
+	expect(t, rw, "$z")
+	cmd(t, rw, "EXISTS", "mp1")
+	expect(t, rw, ":0")
+
+	// Every listed key empty or missing replies with a null array.
+	cmd(t, rw, "LMPOP", "2", "e1", "e2", "LEFT")
+	expect(t, rw, "*-1")
+
+	// A count larger than the list pops the whole list and deletes the key.
+	cmd(t, rw, "RPUSH", "big", "m1", "m2", "m3")
+	expect(t, rw, ":3")
+	cmd(t, rw, "LMPOP", "1", "big", "LEFT", "COUNT", "99")
+	expect(t, rw, "*2")
+	expect(t, rw, "$big")
+	expect(t, rw, "*3")
+	expect(t, rw, "$m1")
+	expect(t, rw, "$m2")
+	expect(t, rw, "$m3")
+	cmd(t, rw, "EXISTS", "big")
+	expect(t, rw, ":0")
+
+	// A zero or negative count is an error, and a missing or bad direction is a syntax error.
+	cmd(t, rw, "RPUSH", "e", "v")
+	expect(t, rw, ":1")
+	cmd(t, rw, "LMPOP", "1", "e", "LEFT", "COUNT", "0")
+	if got := readReply(t, rw); got != "-ERR count should be greater than 0" {
+		t.Fatalf("count 0 = %q", got)
+	}
+	cmd(t, rw, "LMPOP", "1", "e", "SIDE")
+	if got := readReply(t, rw); got != "-ERR syntax error" {
+		t.Fatalf("bad dir = %q", got)
+	}
+}
+
 // A list command against a plain string is WRONGTYPE, and a string command against a list is
 // too, so the two namespaces never cross-read.
 func TestListWrongType(t *testing.T) {
@@ -582,6 +698,9 @@ func TestListWrongType(t *testing.T) {
 		{"LTRIM", "s", "0", "-1"},
 		{"LINSERT", "s", "BEFORE", "a", "b"},
 		{"LREM", "s", "0", "a"},
+		{"LMOVE", "s", "d", "LEFT", "RIGHT"},
+		{"RPOPLPUSH", "s", "d"},
+		{"LMPOP", "1", "s", "LEFT"},
 	} {
 		cmd(t, rw, args...)
 		got := readReply(t, rw)
