@@ -366,6 +366,24 @@ func (c *connState) cmdZInter(argv [][]byte) {
 	c.writeZScored(sortZScored(acc), opts.withScores)
 }
 
+// zdiffAccumulate builds the difference scored map: the members of the first source that no other
+// source holds, keyed to the first source's score. The caller holds the source locks.
+func (c *connState) zdiffAccumulate(keys [][]byte, kinds []keyKind) map[string]float64 {
+	acc := make(map[string]float64)
+	rest := keys[1:]
+	restKinds := kinds[1:]
+	c.zsetSourceEach(keys[0], kinds[0], func(m []byte, s float64) bool {
+		for j, key := range rest {
+			if _, ok := c.zsetSourceScore(key, restKinds[j], m); ok {
+				return true
+			}
+		}
+		acc[string(m)] = s
+		return true
+	})
+	return acc
+}
+
 // cmdZDiff answers ZDIFF: the members of the first source that no other source holds, with the first
 // source's scores, in score order. It takes no WEIGHTS or AGGREGATE.
 func (c *connState) cmdZDiff(argv [][]byte) {
@@ -379,18 +397,7 @@ func (c *connState) cmdZDiff(argv [][]byte) {
 		unlock()
 		return
 	}
-	acc := make(map[string]float64)
-	rest := opts.keys[1:]
-	restKinds := kinds[1:]
-	c.zsetSourceEach(opts.keys[0], kinds[0], func(m []byte, s float64) bool {
-		for j, key := range rest {
-			if _, ok := c.zsetSourceScore(key, restKinds[j], m); ok {
-				return true
-			}
-		}
-		acc[string(m)] = s
-		return true
-	})
+	acc := c.zdiffAccumulate(opts.keys, kinds)
 	unlock()
 	c.writeZScored(sortZScored(acc), opts.withScores)
 }
