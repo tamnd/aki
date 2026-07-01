@@ -10,9 +10,14 @@
 // The surface is the string point path the in-memory benchmark exercises: PING, SET,
 // GET, DEL, EXISTS, INCR/INCRBY/DECR/DECRBY, MSET, MGET, plus the admin verbs a bench
 // harness needs to set up and tear down (FLUSHALL/FLUSHDB, DBSIZE, EXPIRE/TTL stubs,
-// and benign replies for CONFIG/CLIENT/SELECT/COMMAND/INFO). Larger-than-memory and
-// the on-disk .aki file are deliberately out of scope here; this package is the
-// in-memory wire path that the 2x claim is measured on first.
+// and benign replies for CONFIG/CLIENT/SELECT/COMMAND/INFO).
+//
+// The larger-than-memory string regime is engaged by setting Config.ColdPath: the
+// store then keeps its lock-free index and record keys resident and writes any value
+// past the separation threshold to an append-only cold log on disk (f1raw milestone
+// M1, WiscKey key-value separation). With ColdPath empty the server is the pure
+// in-memory path unchanged. The durable single-file .aki format and recovery are a
+// later milestone; the cold log here is fresh-start only.
 package f1srv
 
 import (
@@ -30,6 +35,16 @@ type Config struct {
 	ReadBufSize  int    // initial per-connection read buffer
 	IncrStripes  int    // INCR-family RMW lock stripes (rounded up to a power of two)
 	NetMode      string // "go" (goroutine-per-conn, default) or "reactor" (Linux epoll)
+
+	// ColdPath, when non-empty, engages the larger-than-memory string tier: the store
+	// opens an append-only cold value log at this path and writes any value longer than
+	// SepThreshold there, keeping only the index and record keys resident. Empty means a
+	// pure in-memory store. The log is truncated on open (fresh start; recovery is a
+	// later milestone).
+	ColdPath string
+	// SepThreshold is the inline-versus-separated value cutoff in bytes; a non-positive
+	// value uses the engine default. It is ignored when ColdPath is empty.
+	SepThreshold int
 }
 
 // DefaultConfig returns a config sized for a multi-million-key in-memory benchmark.
@@ -45,9 +60,10 @@ func DefaultConfig(addr string) Config {
 
 // Server is a running f1srv instance.
 type Server struct {
-	cfg   Config
-	store *f1raw.Store
-	ln    net.Listener
+	cfg     Config
+	store   *f1raw.Store
+	ln      net.Listener
+	initErr error // deferred cold-log open error, surfaced by Listen
 
 	// incrMu serializes the read-modify-write of one key's INCR family so two
 	// counters on the same key sum rather than clobber. It does not touch the
@@ -76,12 +92,25 @@ func New(cfg Config) *Server {
 	if stripes < 1 {
 		stripes = 1
 	}
-	return &Server{
+	srv := &Server{
 		cfg:      cfg,
-		store:    f1raw.New(cfg.IndexBuckets, cfg.ArenaBytes),
 		incrMu:   make([]sync.Mutex, stripes),
 		incrMask: uint32(stripes - 1),
 	}
+	// A cold path engages the larger-than-memory tier; opening the log can fail on a
+	// disk error, so defer that error to Listen and keep New's signature simple for the
+	// many in-memory callers and tests that never set ColdPath.
+	if cfg.ColdPath != "" {
+		store, err := f1raw.NewWithCold(cfg.IndexBuckets, cfg.ArenaBytes, cfg.ColdPath, cfg.SepThreshold)
+		if err != nil {
+			srv.initErr = err
+		} else {
+			srv.store = store
+		}
+	} else {
+		srv.store = f1raw.New(cfg.IndexBuckets, cfg.ArenaBytes)
+	}
+	return srv
 }
 
 // Addr reports the address the server is listening on, valid after ListenAndServe
@@ -96,6 +125,9 @@ func (s *Server) Addr() string {
 // Listen binds the socket without serving, so a caller (or a test) can learn the
 // bound address before accepting. ListenAndServe calls it when needed.
 func (s *Server) Listen() error {
+	if s.initErr != nil {
+		return s.initErr
+	}
 	if s.ln != nil {
 		return nil
 	}
@@ -128,13 +160,19 @@ func (s *Server) ListenAndServe() error {
 	}
 }
 
-// Close stops accepting and waits for in-flight connections to drain.
+// Close stops accepting, waits for in-flight connections to drain, and closes the
+// store (which shuts the cold value log when the LTM tier is engaged).
 func (s *Server) Close() error {
 	var err error
 	if s.ln != nil {
 		err = s.ln.Close()
 	}
 	s.wg.Wait()
+	if s.store != nil {
+		if cerr := s.store.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
 	return err
 }
 

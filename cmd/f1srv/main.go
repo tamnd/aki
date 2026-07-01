@@ -12,6 +12,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"path/filepath"
 
 	"github.com/tamnd/aki/f1srv"
 )
@@ -26,7 +27,7 @@ func main() {
 
 	fs := flag.NewFlagSet("f1srv", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:6390", "listen address host:port")
-	_ = fs.String("dir", ".", "working directory (accepted, unused in-memory)")
+	dir := fs.String("dir", ".", "working directory; holds the cold value log when --ltm-cold is set")
 	_ = fs.String("appendonly", "no", "append-only file (accepted, no durability yet)")
 	_ = fs.String("appendfsync", "everysec", "fsync policy (accepted, no durability yet)")
 	_ = fs.String("aki-engine", "f1raw", "engine name (accepted; this binary is always f1raw)")
@@ -34,6 +35,8 @@ func main() {
 	indexBuckets := fs.Int("index-buckets", 1<<22, "f1raw index buckets")
 	arenaBytes := fs.Int("arena-bytes", 2<<30, "f1raw arena size in bytes")
 	stripes := fs.Int("incr-stripes", 1<<10, "INCR-family RMW lock stripes")
+	ltmCold := fs.Bool("ltm-cold", false, "engage the larger-than-memory string tier: separate large values to a cold log under --dir")
+	sepThreshold := fs.Int("sep-threshold", 0, "inline-vs-separated value cutoff in bytes for --ltm-cold (0 = engine default)")
 	pprofAddr := fs.String("pprof", "", "if set, serve net/http/pprof on this host:port (profiling only, off by default)")
 	// ExitOnError means a bad flag exits the process, so Parse never returns a
 	// non-nil error here. Blank-assign to satisfy errcheck without dead handling.
@@ -44,6 +47,10 @@ func main() {
 	cfg.ArenaBytes = *arenaBytes
 	cfg.IncrStripes = *stripes
 	cfg.NetMode = *netMode
+	if *ltmCold {
+		cfg.ColdPath = filepath.Join(*dir, "f1raw-cold.vlog")
+		cfg.SepThreshold = *sepThreshold
+	}
 
 	if *pprofAddr != "" {
 		go func() {
@@ -58,8 +65,12 @@ func main() {
 	if err := srv.Listen(); err != nil {
 		log.Fatalf("f1srv: listen %s: %v", *addr, err)
 	}
-	fmt.Printf("f1srv listening on %s (index-buckets=%d arena=%dMiB)\n",
-		srv.Addr(), *indexBuckets, *arenaBytes>>20)
+	cold := "off"
+	if *ltmCold {
+		cold = cfg.ColdPath
+	}
+	fmt.Printf("f1srv listening on %s (index-buckets=%d arena=%dMiB cold=%s)\n",
+		srv.Addr(), *indexBuckets, *arenaBytes>>20, cold)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("f1srv: serve: %v", err)
 	}

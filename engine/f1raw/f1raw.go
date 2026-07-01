@@ -89,15 +89,17 @@ const (
 	//   [8:10)  klen  uint16  key length, immutable
 	//   [10:12) vcap  uint16  reserved value capacity in 8-byte words, immutable
 	//   [12:13) kind  uint8   record kind (the spec's type_tag), immutable
-	//   [13:16) pad
+	//   [13:14) flags uint8   record flags (flagSep marks a cold pointer), immutable
+	//   [14:16) pad
 	//   [16:16+klen)              key bytes, immutable
 	//   [16+align8(klen): +vcap*8) value bytes, rewritten in place under the seqlock
-	hdrSize = 16
-	offVer  = 0
-	offVlen = 4
-	offKlen = 8
-	offVcap = 10
-	offKind = 12
+	hdrSize  = 16
+	offVer   = 0
+	offVlen  = 4
+	offKlen  = 8
+	offVcap  = 10
+	offKind  = 12
+	offFlags = 13
 
 	verLockBit = 1 // low bit of ver: a writer is mid-update
 
@@ -139,6 +141,14 @@ type Store struct {
 	// CollRemove) and never touched by the string hot path, so Get/Set/Incr pay
 	// nothing for it.
 	oidx *oindex
+
+	// cold is the on-disk value log for the larger-than-memory string regime, or nil
+	// for a pure in-memory store. When set, a string value longer than sepThreshold is
+	// written to the log and the in-memory record holds a cold pointer (cold.go). The
+	// in-memory path is byte-identical whether cold is nil or not, because a value at
+	// or under the threshold never touches the log.
+	cold         *coldLog
+	sepThreshold int
 }
 
 // New builds a store whose primary hash index has indexBuckets buckets (rounded up
@@ -171,8 +181,44 @@ func New(indexBuckets, arenaBytes int) *Store {
 	return s
 }
 
+// NewWithCold builds a store like New but with a cold value log at coldPath for the
+// larger-than-memory string regime. A string value longer than sepThreshold bytes is
+// written to the log and kept out of the in-memory arena, so the resident footprint
+// stays near the index-plus-keys size on a dataset whose values exceed RAM. A
+// non-positive sepThreshold uses defaultSepThreshold. The store owns the log and
+// closes it in Close.
+func NewWithCold(indexBuckets, arenaBytes int, coldPath string, sepThreshold int) (*Store, error) {
+	s := New(indexBuckets, arenaBytes)
+	cl, err := openColdLog(coldPath)
+	if err != nil {
+		return nil, err
+	}
+	if sepThreshold <= 0 {
+		sepThreshold = defaultSepThreshold
+	}
+	s.cold = cl
+	s.sepThreshold = sepThreshold
+	return s, nil
+}
+
+// defaultSepThreshold is the inline-versus-separated cutoff: a value at or under it
+// stays inline in the in-memory arena, a larger value goes to the cold log. The spec
+// biases this to the 256-to-1024-byte range; 512 is the midpoint default and it is a
+// lab knob the benchmark sweeps (checklist section 4, the value-pointer rule in 03).
+const defaultSepThreshold = 512
+
 // Len reports the number of live keys.
 func (s *Store) Len() int { return int(s.count.Load()) }
+
+// Close releases the store's external resources. For a pure in-memory store it is a
+// no-op; for a store with a cold value log it closes the log file. The in-memory
+// arena and index are garbage-collected with the store.
+func (s *Store) Close() error {
+	if s.cold != nil {
+		return s.cold.close()
+	}
+	return nil
+}
 
 // hash is the wyhash-style word-at-a-time mix: it reads eight key bytes per step and
 // finishes a short key in one or two multiplies, so the table probe is not gated on a
@@ -330,6 +376,9 @@ func (s *Store) Get(key, dst []byte) ([]byte, bool) {
 	if !found {
 		return dst[:0], false
 	}
+	if s.cold != nil && s.isSep(off) {
+		return s.readSeparated(off, dst)
+	}
 	return s.readValue(off, dst), true
 }
 
@@ -366,11 +415,21 @@ func (s *Store) Set(key, val []byte) error {
 		return ErrTooBig
 	}
 	h := hash(key)
-	if off, _, _, _, found := s.find(key, h, stringKind); found && uint64(len(val)) <= s.vcapBytes(off) {
+	if s.cold != nil && len(val) > s.sepThreshold {
+		// A large value goes to the cold log as a fresh separated record; it is never
+		// updated in place, so any prior record for the key is replaced by the index
+		// swap inside publish.
+		return s.setSeparated(key, val, h)
+	}
+	// Inline path. The in-place fast update requires the existing record to be inline
+	// too: a separated record's value cell is a 12-byte pointer, so a small inline
+	// value must not be memcpy'd over it. When the target is separated, fall through
+	// to publish, which swaps the entry to a fresh inline record.
+	if off, _, _, _, found := s.find(key, h, stringKind); found && !s.isSep(off) && uint64(len(val)) <= s.vcapBytes(off) {
 		s.inPlace(off, val)
 		return nil
 	}
-	return s.publish(key, val, h, stringKind)
+	return s.publish(key, val, h, stringKind, 0)
 }
 
 // inPlace rewrites a record's value under its seqlock. The latch is the low bit of
@@ -399,15 +458,16 @@ func (s *Store) inPlace(off uint64, val []byte) {
 // private until publish CAS-installs its address into an index entry; that release
 // pairs with the acquire a reader does when it loads the entry, so the bytes are
 // visible and the plain writes are race-detector clean.
-func (s *Store) initRecord(off uint64, key, val []byte, kind byte) {
+func (s *Store) initRecord(off uint64, key, val []byte, kind, flags byte) {
 	binary.LittleEndian.PutUint32(s.arena[off+offVer:], 0)
 	binary.LittleEndian.PutUint32(s.arena[off+offVlen:], uint32(len(val)))
 	binary.LittleEndian.PutUint16(s.arena[off+offKlen:], uint16(len(key)))
 	binary.LittleEndian.PutUint16(s.arena[off+offVcap:], uint16(align8(uint64(len(val)))/8))
-	// The kind byte is written explicitly rather than left to the zero-init arena,
-	// because Reset rewinds the tail without scrubbing bytes, so a reused offset may
-	// still hold a prior record's kind.
+	// The kind and flags bytes are written explicitly rather than left to the
+	// zero-init arena, because Reset rewinds the tail without scrubbing bytes, so a
+	// reused offset may still hold a prior record's kind or flags.
 	s.arena[off+offKind] = kind
+	s.arena[off+offFlags] = flags
 	copy(s.arena[off+hdrSize:], key)
 	copy(s.arena[off+hdrSize+align8(uint64(len(key))):], val)
 }
@@ -419,12 +479,12 @@ func (s *Store) initRecord(off uint64, key, val []byte, kind byte) {
 // new key, count up); otherwise grow the chain with an overflow bucket and rescan. A
 // lost CAS just restarts the scan. The one allocated record is reused across
 // restarts, and is harmlessly abandoned only when another writer published the key.
-func (s *Store) publish(key, val []byte, h uint64, kind byte) error {
+func (s *Store) publish(key, val []byte, h uint64, kind, flags byte) error {
 	off, ok := s.alloc(recSize(len(key), len(val)))
 	if !ok {
 		return ErrFull
 	}
-	s.initRecord(off, key, val, kind)
+	s.initRecord(off, key, val, kind, flags)
 	tag := tagOf(h)
 	newWord := tag<<tagShift | off
 
@@ -450,7 +510,10 @@ outer:
 				if s.recordMatches(a, key, kind) {
 					// Another writer published this key first. Last writer wins: update
 					// their record in place if our value fits, else swap the entry to ours.
-					if uint64(len(val)) <= s.vcapBytes(a) {
+					// A separated write (flags != 0) or a target that is itself separated
+					// must never update in place: a cold pointer is immutable, so both take
+					// the entry-swap path to a fresh record instead of a memcpy.
+					if flags == 0 && !s.isSep(a) && uint64(len(val)) <= s.vcapBytes(a) {
 						s.inPlace(a, val)
 						return nil
 					}
