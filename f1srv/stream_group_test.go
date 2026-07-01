@@ -462,3 +462,181 @@ func TestStreamPending(t *testing.T) {
 	cmd(t, rw, "XPENDING", "str", "g1")
 	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
 }
+
+// TestStreamClaim covers XCLAIM and XAUTOCLAIM: the read and JUSTID claim forms, the min-idle and
+// force filters, dead-entry drops, RETRYCOUNT/IDLE/TIME modifiers, the XAUTOCLAIM cursor and deleted
+// list, and the error and arity paths, all pinned to Redis 8.8 and Valkey 9.1 replies.
+func TestStreamClaim(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	seed := func() {
+		cmd(t, rw, "FLUSHALL")
+		expect(t, rw, "+OK")
+		for _, id := range []string{"1-1", "2-1", "3-1", "4-1", "5-1"} {
+			cmd(t, rw, "XADD", "s", id, "f", id)
+			expect(t, rw, "$"+id)
+		}
+		cmd(t, rw, "XGROUP", "CREATE", "s", "g1", "0")
+		expect(t, rw, "+OK")
+		cmd(t, rw, "XGROUP", "CREATE", "s", "g2", "0")
+		expect(t, rw, "+OK")
+		cmd(t, rw, "XREADGROUP", "GROUP", "g1", "alice", "COUNT", "3", "STREAMS", "s", ">")
+		asArray(t, readValue(t, rw), 1)
+		cmd(t, rw, "XREADGROUP", "GROUP", "g1", "bob", "COUNT", "2", "STREAMS", "s", ">")
+		asArray(t, readValue(t, rw), 1)
+	}
+
+	// XCLAIM reassigns 1-1 and 2-1 to carol, returning them with fields in argument order.
+	seed()
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "1-1", "2-1")
+	cl := asArray(t, readValue(t, rw), 2)
+	asBulk(t, asArray(t, cl[0], 2)[0], "1-1")
+	asBulk(t, asArray(t, cl[1], 2)[0], "2-1")
+	// The claim bumped their delivery counts and moved them to carol.
+	cmd(t, rw, "XPENDING", "s", "g1", "1-1", "1-1", "1")
+	row := asArray(t, asArray(t, readValue(t, rw), 1)[0], 4)
+	asBulk(t, row[1], "carol")
+	if dc := asInt(t, row[3]); dc != 2 {
+		t.Fatalf("delivery-count after claim = %d, want 2", dc)
+	}
+
+	// JUSTID replies just the id and does not bump the delivery count.
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "4-1", "JUSTID")
+	j := asArray(t, readValue(t, rw), 1)
+	asBulk(t, j[0], "4-1")
+	cmd(t, rw, "XPENDING", "s", "g1", "4-1", "4-1", "1")
+	if dc := asInt(t, asArray(t, asArray(t, readValue(t, rw), 1)[0], 4)[3]); dc != 1 {
+		t.Fatalf("delivery-count after JUSTID claim = %d, want 1", dc)
+	}
+
+	// A min-idle floor above the entry's idle claims nothing.
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "999999", "5-1")
+	asArray(t, readValue(t, rw), 0)
+	// An id not pending and not forced is skipped.
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "9-9")
+	asArray(t, readValue(t, rw), 0)
+
+	// FORCE creates a pending row in a group that never delivered the entry, at delivery count 1.
+	cmd(t, rw, "XCLAIM", "s", "g2", "zoe", "0", "2-1", "FORCE")
+	f := asArray(t, readValue(t, rw), 1)
+	asBulk(t, asArray(t, f[0], 2)[0], "2-1")
+	cmd(t, rw, "XPENDING", "s", "g2")
+	g2sum := asArray(t, readValue(t, rw), 4)
+	if got := asInt(t, g2sum[0]); got != 1 {
+		t.Fatalf("g2 pending after force = %d, want 1", got)
+	}
+
+	// RETRYCOUNT sets the delivery count outright.
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "1-1", "RETRYCOUNT", "42")
+	asArray(t, readValue(t, rw), 1)
+	cmd(t, rw, "XPENDING", "s", "g1", "1-1", "1-1", "1")
+	if dc := asInt(t, asArray(t, asArray(t, readValue(t, rw), 1)[0], 4)[3]); dc != 42 {
+		t.Fatalf("delivery-count after RETRYCOUNT = %d, want 42", dc)
+	}
+	// IDLE sets the idle clock back, so the entry reads as at least that idle.
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "5-1", "IDLE", "5000", "JUSTID")
+	asArray(t, readValue(t, rw), 1)
+	cmd(t, rw, "XPENDING", "s", "g1", "5-1", "5-1", "1")
+	if idle := asInt(t, asArray(t, asArray(t, readValue(t, rw), 1)[0], 4)[2]); idle < 5000 {
+		t.Fatalf("idle after IDLE 5000 = %d, want >= 5000", idle)
+	}
+
+	// An entry deleted from the log is dropped from the pending list on claim, not returned.
+	seed()
+	cmd(t, rw, "XDEL", "s", "3-1")
+	expect(t, rw, ":1")
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "3-1")
+	asArray(t, readValue(t, rw), 0)
+	cmd(t, rw, "XPENDING", "s", "g1")
+	if got := asInt(t, asArray(t, readValue(t, rw), 4)[0]); got != 4 {
+		t.Fatalf("pending after dead-entry claim = %d, want 4", got)
+	}
+
+	// XAUTOCLAIM from 0-0 claims the whole pending list, drops the dead 3-1, and reports cursor 0-0.
+	seed()
+	cmd(t, rw, "XDEL", "s", "3-1")
+	expect(t, rw, ":1")
+	cmd(t, rw, "XAUTOCLAIM", "s", "g1", "carol", "0", "0")
+	ac := asArray(t, readValue(t, rw), 3)
+	asBulk(t, ac[0], "0-0")
+	asArray(t, ac[1], 4)
+	del := asArray(t, ac[2], 1)
+	asBulk(t, del[0], "3-1")
+
+	// COUNT stops early and returns the resume cursor; a dead entry counts against COUNT.
+	seed()
+	cmd(t, rw, "XDEL", "s", "3-1")
+	expect(t, rw, ":1")
+	cmd(t, rw, "XAUTOCLAIM", "s", "g1", "carol", "0", "3-1", "COUNT", "2")
+	ac2 := asArray(t, readValue(t, rw), 3)
+	asBulk(t, ac2[0], "5-1")
+	claimed := asArray(t, ac2[1], 1)
+	asBulk(t, asArray(t, claimed[0], 2)[0], "4-1")
+	asBulk(t, asArray(t, ac2[2], 1)[0], "3-1")
+
+	// A high min-idle floor claims nothing and finishes the scan.
+	seed()
+	cmd(t, rw, "XAUTOCLAIM", "s", "g1", "carol", "999999", "0")
+	ac3 := asArray(t, readValue(t, rw), 3)
+	asBulk(t, ac3[0], "0-0")
+	asArray(t, ac3[1], 0)
+	asArray(t, ac3[2], 0)
+
+	// XAUTOCLAIM JUSTID returns bare ids in the claimed slot.
+	cmd(t, rw, "XAUTOCLAIM", "s", "g1", "carol", "0", "0", "JUSTID")
+	ac4 := asArray(t, readValue(t, rw), 3)
+	asBulk(t, asArray(t, ac4[1], 5)[0], "1-1")
+
+	// XCLAIM error and arity paths.
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol")
+	expect(t, rw, "-ERR wrong number of arguments for 'xclaim' command")
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0")
+	expect(t, rw, "-ERR wrong number of arguments for 'xclaim' command")
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "abc", "1-1")
+	expect(t, rw, "-ERR Invalid min-idle-time argument for XCLAIM")
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "badid")
+	expect(t, rw, "-ERR Unrecognized XCLAIM option 'badid'")
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "1-1", "RETRYCOUNT", "abc")
+	expect(t, rw, "-ERR Invalid RETRYCOUNT option argument for XCLAIM")
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "1-1", "IDLE", "abc")
+	expect(t, rw, "-ERR Invalid IDLE option argument for XCLAIM")
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "1-1", "TIME", "abc")
+	expect(t, rw, "-ERR Invalid TIME option argument for XCLAIM")
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "1-1", "IDLE")
+	expect(t, rw, "-ERR Unrecognized XCLAIM option 'IDLE'")
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "1-1", "LASTID", "abc")
+	expect(t, rw, "-ERR Invalid stream ID specified as stream command argument")
+	cmd(t, rw, "XCLAIM", "s", "g1", "carol", "0", "1-1", "frob")
+	expect(t, rw, "-ERR Unrecognized XCLAIM option 'frob'")
+	cmd(t, rw, "XCLAIM", "s", "nope", "carol", "0", "1-1")
+	expect(t, rw, "-NOGROUP No such key 's' or consumer group 'nope'")
+	cmd(t, rw, "XCLAIM", "nokey", "g1", "carol", "0", "1-1")
+	expect(t, rw, "-NOGROUP No such key 'nokey' or consumer group 'g1'")
+
+	// XAUTOCLAIM error and arity paths.
+	cmd(t, rw, "XAUTOCLAIM", "s", "g1", "carol", "0")
+	expect(t, rw, "-ERR wrong number of arguments for 'xautoclaim' command")
+	cmd(t, rw, "XAUTOCLAIM", "s", "g1", "carol", "abc", "0")
+	expect(t, rw, "-ERR Invalid min-idle-time argument for XAUTOCLAIM")
+	cmd(t, rw, "XAUTOCLAIM", "s", "g1", "carol", "0", "badstart")
+	expect(t, rw, "-ERR Invalid stream ID specified as stream command argument")
+	cmd(t, rw, "XAUTOCLAIM", "s", "g1", "carol", "0", "0", "COUNT", "abc")
+	expect(t, rw, "-ERR COUNT must be > 0")
+	cmd(t, rw, "XAUTOCLAIM", "s", "g1", "carol", "0", "0", "COUNT", "0")
+	expect(t, rw, "-ERR COUNT must be > 0")
+	cmd(t, rw, "XAUTOCLAIM", "s", "g1", "carol", "0", "0", "frob")
+	expect(t, rw, "-ERR syntax error")
+	cmd(t, rw, "XAUTOCLAIM", "s", "nope", "carol", "0", "0")
+	expect(t, rw, "-NOGROUP No such key 's' or consumer group 'nope'")
+	cmd(t, rw, "XAUTOCLAIM", "nokey", "g1", "carol", "0", "0")
+	expect(t, rw, "-NOGROUP No such key 'nokey' or consumer group 'g1'")
+
+	// Wrong type on the key.
+	cmd(t, rw, "SET", "str", "v")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "XCLAIM", "str", "g1", "carol", "0", "1-1")
+	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
+	cmd(t, rw, "XAUTOCLAIM", "str", "g1", "carol", "0", "0")
+	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
+}
