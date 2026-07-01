@@ -129,6 +129,12 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdZPop(argv, false)
 	case eqFold(cmd, "ZPOPMAX"):
 		c.cmdZPop(argv, true)
+	case eqFold(cmd, "ZREMRANGEBYRANK"):
+		c.cmdZRemRangeByRank(argv)
+	case eqFold(cmd, "ZREMRANGEBYSCORE"):
+		c.cmdZRemRangeByScore(argv)
+	case eqFold(cmd, "ZREMRANGEBYLEX"):
+		c.cmdZRemRangeByLex(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
