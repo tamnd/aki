@@ -36,6 +36,19 @@ type connState struct {
 	zscores []float64 // reused scratch for a ZADD's parsed scores, one per score-member pair
 	zkeys   [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
 	kscan   [][]byte  // reused scratch for a KEYS/SCAN/RANDOMKEY bucket-walk key batch
+	wkeys   [][]byte  // reused scratch for a write command's touched-key list (WATCH signalling)
+
+	// Transaction state (MULTI/EXEC/DISCARD/WATCH/UNWATCH). inMulti is set between MULTI
+	// and EXEC/DISCARD; while it is set every non-transaction command is copied into
+	// multiQueue and answered +QUEUED instead of running. multiAbort records that a queued
+	// command could not be queued (an unknown command), which turns the EXEC into an
+	// EXECABORT. watched is this connection's optimistic-lock set: each entry is a watched
+	// key and the version it held when WATCH ran, and EXEC aborts if any of them has since
+	// moved. dirtyCAS is unused as a field today; the version compare is done at EXEC time.
+	inMulti    bool
+	multiQueue [][][]byte
+	multiAbort bool
+	watched    []watchedKey
 }
 
 // loop reads from the socket, drains every complete command in the buffer, and
