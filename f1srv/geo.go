@@ -1099,11 +1099,11 @@ func (c *connState) georadiusGeneric(argv [][]byte, srcKeyIndex, flags int) {
 		}
 		return
 	}
-	if flags&geoSearch != 0 && !(frommember || fromloc) {
+	if flags&geoSearch != 0 && !frommember && !fromloc {
 		c.writeErr("ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for " + string(argv[0]))
 		return
 	}
-	if flags&geoSearch != 0 && !(byradius || bybox) {
+	if flags&geoSearch != 0 && !byradius && !bybox {
 		c.writeErr("ERR exactly one of BYRADIUS and BYBOX can be specified for " + string(argv[0]))
 		return
 	}
