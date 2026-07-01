@@ -113,6 +113,18 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdZRange(argv)
 	case eqFold(cmd, "ZREVRANGE"):
 		c.cmdZRevRange(argv)
+	case eqFold(cmd, "ZRANGEBYSCORE"):
+		c.cmdZRangeByScore(argv, false)
+	case eqFold(cmd, "ZREVRANGEBYSCORE"):
+		c.cmdZRangeByScore(argv, true)
+	case eqFold(cmd, "ZRANGEBYLEX"):
+		c.cmdZRangeByLex(argv, false)
+	case eqFold(cmd, "ZREVRANGEBYLEX"):
+		c.cmdZRangeByLex(argv, true)
+	case eqFold(cmd, "ZCOUNT"):
+		c.cmdZCount(argv)
+	case eqFold(cmd, "ZLEXCOUNT"):
+		c.cmdZLexCount(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
