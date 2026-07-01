@@ -79,6 +79,14 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdSPop(argv)
 	case eqFold(cmd, "SMOVE"):
 		c.cmdSMove(argv)
+	case eqFold(cmd, "SINTER"):
+		c.cmdSInter(argv)
+	case eqFold(cmd, "SUNION"):
+		c.cmdSUnion(argv)
+	case eqFold(cmd, "SDIFF"):
+		c.cmdSDiff(argv)
+	case eqFold(cmd, "SINTERCARD"):
+		c.cmdSInterCard(argv)
 	case eqFold(cmd, "PING"):
 		c.cmdPing(argv)
 	case eqFold(cmd, "ECHO"):
