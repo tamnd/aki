@@ -105,6 +105,14 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdZCard(argv)
 	case eqFold(cmd, "ZREM"):
 		c.cmdZRem(argv)
+	case eqFold(cmd, "ZRANK"):
+		c.cmdZRank(argv, false)
+	case eqFold(cmd, "ZREVRANK"):
+		c.cmdZRank(argv, true)
+	case eqFold(cmd, "ZRANGE"):
+		c.cmdZRange(argv)
+	case eqFold(cmd, "ZREVRANGE"):
+		c.cmdZRevRange(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):

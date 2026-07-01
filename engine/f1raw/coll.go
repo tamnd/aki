@@ -132,3 +132,14 @@ func (s *Store) CollScan(prefix, after []byte, limit int, dst [][]byte) (keys []
 func (s *Store) CollSelectAt(prefix []byte, localIndex int) (key []byte, ok bool) {
 	return s.oidx.selectInPrefix(prefix, localIndex)
 }
+
+// CollRankOf returns the 0-based position of key within the collection bounded by
+// prefix, in key order: the inverse of CollSelectAt. It rides the same order-statistic
+// spans, so ZRANK/ZREVRANK seek a member's position in O(log n) rather than counting
+// the members below it. The caller must confirm key is a live element (through GetKind
+// on the element row) before trusting the result, because the rank of an absent key is
+// where it would fall, not an error. localIndex and rank are inverse over a prefix:
+// CollSelectAt(prefix, CollRankOf(prefix, k)) returns k for any live k under prefix.
+func (s *Store) CollRankOf(prefix, key []byte) int {
+	return s.oidx.rankInPrefix(prefix, key)
+}

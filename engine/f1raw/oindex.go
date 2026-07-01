@@ -273,6 +273,19 @@ func (oi *oindex) rankLocked(key []byte) int {
 	return pos
 }
 
+// rankInPrefix returns the 0-based position of key within the collection bounded by
+// prefix, in key order, under a single read lock. The position is prefix-local: it
+// subtracts the prefix's base rank (the count of nodes ordered before the collection's
+// run) from key's global rank, so the result is what the ZRANK family returns directly.
+// Both descents are O(log n). It does not verify key is a live element; the caller
+// confirms membership through the element index first (ZRANK replies nil for an absent
+// member before it ranks anything), so an absent key here reports where it would fall.
+func (oi *oindex) rankInPrefix(prefix, key []byte) int {
+	oi.mu.RLock()
+	defer oi.mu.RUnlock()
+	return oi.rankLocked(key) - oi.rankLocked(prefix)
+}
+
 // selectAtLocked returns the node at 0-based position idx in key order, or nil when idx
 // is out of range. It walks down from the top level following each pointer whose span
 // does not overshoot the target position, so it reaches the idx-th node in O(log n)
