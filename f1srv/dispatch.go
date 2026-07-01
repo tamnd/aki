@@ -84,6 +84,8 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdWait(argv)
 	case eqFold(cmd, "WAITAOF"):
 		c.cmdWaitAOF(argv)
+	case eqFold(cmd, "MEMORY"):
+		c.cmdMemory(argv)
 	case eqFold(cmd, "HSET"):
 		c.cmdHSet(argv)
 	case eqFold(cmd, "HMSET"):
