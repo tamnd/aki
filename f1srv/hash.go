@@ -407,7 +407,7 @@ func (c *connState) cmdHScan(argv [][]byte) {
 	hkey := argv[1]
 
 	var after []byte
-	if !(len(argv[2]) == 1 && argv[2][0] == '0') {
+	if len(argv[2]) != 1 || argv[2][0] != '0' {
 		dec, err := hex.DecodeString(string(argv[2]))
 		if err != nil {
 			c.writeErr("ERR invalid cursor")

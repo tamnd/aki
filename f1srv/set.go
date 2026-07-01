@@ -310,7 +310,7 @@ func (c *connState) cmdSScan(argv [][]byte) {
 	skey := argv[1]
 
 	var after []byte
-	if !(len(argv[2]) == 1 && argv[2][0] == '0') {
+	if len(argv[2]) != 1 || argv[2][0] != '0' {
 		dec, err := hex.DecodeString(string(argv[2]))
 		if err != nil {
 			c.writeErr("ERR invalid cursor")
@@ -583,17 +583,18 @@ func (c *connState) cmdSPop(argv [][]byte) {
 			return
 		}
 		prefix := c.setPrefix(skey)
-		k, ok := c.srv.store.CollSelectAt(prefix, rand.IntN(card))
+		// Fused select-and-remove: one positional descent selects the random victim and
+		// unlinks it from the ordered index, instead of a select descent here and a
+		// separate CollRemove descent below. The returned key is the member row's exact
+		// composite key, so it drives the resident-hash DeleteKind directly with no rebuild.
+		k, ok := c.srv.store.CollSelectRemoveAt(prefix, rand.IntN(card))
 		if !ok {
 			mu.Unlock()
 			c.writeNil()
 			return
 		}
 		member := k[len(prefix):]
-		mk := c.memberKey(skey, member)
-		if c.srv.store.DeleteKind(mk, kindSetMember) {
-			c.srv.store.CollRemove(mk)
-		}
+		c.srv.store.DeleteKind(k, kindSetMember)
 		if err := c.setSetCard(skey, uint64(card-1)); err != nil {
 			mu.Unlock()
 			c.writeErr("ERR " + err.Error())

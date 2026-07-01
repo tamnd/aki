@@ -215,6 +215,62 @@ func (oi *oindex) remove(key []byte) bool {
 	return true
 }
 
+// selectAndRemoveInPrefix selects the element at 0-based localIndex within the collection
+// bounded by prefix, in key order, and unlinks it in the same descent, returning its
+// composite key (a subslice of the immutable arena, valid for the store's life) and
+// whether it existed. It is the fused form of selectInPrefix followed by remove, the pair
+// SPOP-without-count runs on every op: one positional descent that collects the
+// predecessor pointers by position lands on the victim and bridges over it, instead of one
+// descent to select the key and a second, separate descent to find and unlink it. The
+// prefix's base rank still costs one descent, so this is two descents and one write lock
+// where the split path was three descents and a read-then-write lock pair. A localIndex
+// past the collection's cardinality lands on a sibling collection's node (or nil) and is
+// reported absent with nothing removed, exactly as selectInPrefix guards it.
+func (oi *oindex) selectAndRemoveInPrefix(prefix []byte, localIndex int) ([]byte, bool) {
+	oi.mu.Lock()
+	defer oi.mu.Unlock()
+
+	base := oi.rankLocked(prefix)
+	target := base + localIndex + 1 // 1-based position of the victim; head sits at position 0
+	if localIndex < 0 || base+localIndex >= oi.count {
+		return nil, false
+	}
+	// Descend collecting the predecessor at each level: the last node whose position is
+	// strictly before target, so update[i].next[i] is the victim at level 0.
+	var update [oindexMaxLevel]*onode
+	pos := 0
+	x := oi.head
+	for i := oi.level - 1; i >= 0; i-- {
+		for x.next[i] != nil && pos+x.width[i] < target {
+			pos += x.width[i]
+			x = x.next[i]
+		}
+		update[i] = x
+	}
+	victim := update[0].next[0]
+	if victim == nil {
+		return nil, false
+	}
+	k := oi.store.keyAt(victim.off)
+	if !bytes.HasPrefix(k, prefix) {
+		// localIndex ran past this collection into a sibling: report absent, remove nothing.
+		return nil, false
+	}
+	for i := 0; i < oi.level; i++ {
+		if update[i].next[i] == victim {
+			update[i].width[i] += victim.width[i] - 1
+			update[i].next[i] = victim.next[i]
+		} else {
+			update[i].width[i]--
+		}
+	}
+	for oi.level > 1 && oi.head.next[oi.level-1] == nil {
+		oi.level--
+	}
+	oi.count--
+	return k, true
+}
+
 // scanBatch collects up to limit record offsets whose key has the given prefix and is
 // strictly greater than after (nil after means from the start of the prefix), in key
 // order, appending them to dst. It returns the grown dst and the key bytes of the last
