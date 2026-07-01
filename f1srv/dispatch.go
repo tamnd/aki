@@ -57,6 +57,8 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdHKeys(argv)
 	case eqFold(cmd, "HVALS"):
 		c.cmdHVals(argv)
+	case eqFold(cmd, "HSCAN"):
+		c.cmdHScan(argv)
 	case eqFold(cmd, "PING"):
 		c.cmdPing(argv)
 	case eqFold(cmd, "ECHO"):

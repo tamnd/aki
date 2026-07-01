@@ -1,6 +1,9 @@
 package f1srv
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"encoding/hex"
+)
 
 // Hash is the first collection type on f1raw, and it is element-per-row: every field
 // is its own record under a composite key, and a per-hash header row carries the
@@ -373,6 +376,217 @@ func (c *connState) streamHash(hkey []byte, wantField, wantValue bool) {
 		after = last
 	}
 	mu.Unlock()
+}
+
+// cmdHScan is the LTM-safe incremental hash enumeration (spec 2064/f1_rewrite_ltm/05
+// section 8.2): each call scans a bounded window of field rows and returns an opaque
+// cursor to resume, so a client walks a billion-field hash without the server ever
+// materializing it. The cursor encodes the position in field-name order, which is
+// exactly the order the ordered element index already walks, so resuming is a
+// predecessor/successor seek, not a rescan.
+//
+// Cursor encoding: "0" starts a fresh iteration and "0" is returned when it completes;
+// any live position is the hex of the last composite key returned. A composite key
+// always carries the uvarint length prefix, so it is never empty and its hex is never
+// the single byte "0", which keeps a live cursor from ever colliding with the done
+// sentinel. On resume the hex decodes straight back into the scan's `after` bound.
+//
+// Cursor stability: a field present for the whole scan and not modified is returned
+// exactly once (the ordered index walks each key once and the cursor resumes strictly
+// after the last one), a field added or removed mid-scan may or may not appear, and the
+// scan never returns a deleted field's stale value (each surviving key re-resolves its
+// value through the authoritative index). The scan is lock-free like the other hash
+// reads: it takes no stripe lock, and one batch reads the ordered index under its own
+// read lock, so a huge iteration never blocks writers across the whole hash.
+func (c *connState) cmdHScan(argv [][]byte) {
+	// HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]
+	if len(argv) < 3 {
+		c.writeErr("ERR wrong number of arguments for 'hscan' command")
+		return
+	}
+	hkey := argv[1]
+
+	var after []byte
+	if !(len(argv[2]) == 1 && argv[2][0] == '0') {
+		dec, err := hex.DecodeString(string(argv[2]))
+		if err != nil {
+			c.writeErr("ERR invalid cursor")
+			return
+		}
+		after = dec
+	}
+
+	count := 10
+	var pattern []byte
+	noValues := false
+	for i := 3; i < len(argv); i++ {
+		switch {
+		case eqFold(argv[i], "MATCH"):
+			if i+1 >= len(argv) {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			pattern = argv[i+1]
+			i++
+		case eqFold(argv[i], "COUNT"):
+			if i+1 >= len(argv) {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			n, err := atoi64(argv[i+1])
+			if err != nil || n <= 0 {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			count = int(n)
+			i++
+		case eqFold(argv[i], "NOVALUES"):
+			noValues = true
+		default:
+			c.writeErr("ERR syntax error")
+			return
+		}
+	}
+
+	if c.stringConflict(hkey) {
+		c.writeErr(wrongType)
+		return
+	}
+
+	prefix := c.hashPrefix(hkey)
+	// Cap the initial slice header allocation so a client's large COUNT hint cannot make
+	// the server preallocate a giant slice; append grows it as the batch actually fills.
+	initCap := count
+	if initCap > hashScanBatch {
+		initCap = hashScanBatch
+	}
+	scan := make([][]byte, 0, initCap)
+	keys, last := c.srv.store.CollScan(prefix, after, count, scan)
+
+	// Filter by MATCH in place: the composite keys are arena subslices stable for the
+	// store's life, so collecting the survivors before the reply header costs no copy and
+	// lets the array length be exact.
+	plen := len(prefix)
+	matched := keys[:0]
+	for _, k := range keys {
+		if pattern != nil && !globMatch(pattern, k[plen:]) {
+			continue
+		}
+		matched = append(matched, k)
+	}
+
+	// A short batch (fewer than COUNT scanned) means the prefix is exhausted, so the
+	// iteration is complete and the cursor is the done sentinel; otherwise resume past
+	// the last scanned key.
+	var cursor []byte
+	if len(keys) < count || last == nil {
+		cursor = []byte{'0'}
+	} else {
+		cursor = []byte(hex.EncodeToString(last))
+	}
+
+	perRow := 2
+	if noValues {
+		perRow = 1
+	}
+	c.writeArrayHeader(2)
+	c.writeBulk(cursor)
+	c.writeArrayHeader(len(matched) * perRow)
+	for _, k := range matched {
+		c.writeBulk(k[plen:])
+		if !noValues {
+			v, _ := c.srv.store.GetKind(k, c.vbuf, kindHashField)
+			c.vbuf = v
+			c.writeBulk(v)
+		}
+	}
+}
+
+// globMatch reports whether s matches the Redis glob pattern: '*' matches any run,
+// '?' any single byte, '[...]' a class with '^' negation, 'a-z' ranges, and '\'
+// escaping inside, and '\' escapes a metacharacter elsewhere. It is the MATCH filter
+// for HSCAN and works on the raw field-name bytes so it never allocates a string.
+func globMatch(pattern, s []byte) bool {
+	for len(pattern) > 0 {
+		switch pattern[0] {
+		case '*':
+			for len(pattern) > 1 && pattern[1] == '*' {
+				pattern = pattern[1:]
+			}
+			if len(pattern) == 1 {
+				return true // a trailing star matches the rest of s
+			}
+			for i := 0; i <= len(s); i++ {
+				if globMatch(pattern[1:], s[i:]) {
+					return true
+				}
+			}
+			return false
+		case '?':
+			if len(s) == 0 {
+				return false
+			}
+			s = s[1:]
+		case '[':
+			if len(s) == 0 {
+				return false
+			}
+			p := pattern[1:]
+			neg := false
+			if len(p) > 0 && p[0] == '^' {
+				neg = true
+				p = p[1:]
+			}
+			match := false
+			for len(p) > 0 && p[0] != ']' {
+				switch {
+				case p[0] == '\\' && len(p) >= 2:
+					if p[1] == s[0] {
+						match = true
+					}
+					p = p[2:]
+				case len(p) >= 3 && p[1] == '-' && p[2] != ']':
+					lo, hi := p[0], p[2]
+					if lo > hi {
+						lo, hi = hi, lo
+					}
+					if s[0] >= lo && s[0] <= hi {
+						match = true
+					}
+					p = p[3:]
+				default:
+					if p[0] == s[0] {
+						match = true
+					}
+					p = p[1:]
+				}
+			}
+			if len(p) > 0 {
+				p = p[1:] // consume the closing ']'
+			}
+			if neg {
+				match = !match
+			}
+			if !match {
+				return false
+			}
+			s = s[1:]
+			pattern = p
+			continue
+		case '\\':
+			if len(pattern) >= 2 {
+				pattern = pattern[1:]
+			}
+			fallthrough
+		default:
+			if len(s) == 0 || pattern[0] != s[0] {
+				return false
+			}
+			s = s[1:]
+		}
+		pattern = pattern[1:]
+	}
+	return len(s) == 0
 }
 
 func (c *connState) cmdHGetAll(argv [][]byte) {
