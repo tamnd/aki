@@ -215,6 +215,12 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdXTrim(argv)
 	case eqFold(cmd, "XSETID"):
 		c.cmdXSetID(argv)
+	case eqFold(cmd, "XGROUP"):
+		c.cmdXGroup(argv)
+	case eqFold(cmd, "XREADGROUP"):
+		c.cmdXReadGroup(argv)
+	case eqFold(cmd, "XACK"):
+		c.cmdXAck(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
