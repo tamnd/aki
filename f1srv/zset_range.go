@@ -204,36 +204,11 @@ func (c *connState) collectWindow(prefix []byte, lo, hi int) [][]byte {
 // optional LIMIT, reads the window, and emits it ascending (forward) or descending (rev), with
 // scores when withScores is set.
 func (c *connState) zByScore(zkey, loArg, hiArg []byte, rev, withScores, hasLimit bool, offset, count int) {
-	if c.stringConflict(zkey) {
-		c.writeErr(wrongType)
+	keys, plen, errMsg := c.zScoreWindow(zkey, loArg, hiArg, rev, hasLimit, offset, count)
+	if errMsg != "" {
+		c.writeErr(errMsg)
 		return
 	}
-	lo, loExcl, err1 := parseScoreSpec(loArg)
-	hi, hiExcl, err2 := parseScoreSpec(hiArg)
-	if err1 != nil || err2 != nil {
-		c.writeErr("ERR min or max is not a float")
-		return
-	}
-	card := int(c.zsetCard(zkey))
-	if card == 0 {
-		c.writeArrayHeader(0)
-		return
-	}
-	prefix := c.zscorePrefix(zkey)
-	plen := len(prefix)
-	// Inclusive min counts rows below lo; exclusive min counts rows at or below lo. Inclusive max
-	// counts rows at or below hi; exclusive max counts rows below hi.
-	startIdx := c.zscoreRankBoundary(prefix, lo, loExcl, card)
-	endIdx := c.zscoreRankBoundary(prefix, hi, !hiExcl, card)
-	if startIdx >= endIdx {
-		c.writeArrayHeader(0)
-		return
-	}
-	lo2, hi2 := startIdx, endIdx
-	if hasLimit {
-		lo2, hi2 = windowLimit(startIdx, endIdx, offset, count, rev)
-	}
-	keys := c.collectWindow(prefix, lo2, hi2)
 	mult := 1
 	if withScores {
 		mult = 2
@@ -250,27 +225,81 @@ func (c *connState) zByScore(zkey, loArg, hiArg []byte, rev, withScores, hasLimi
 	}
 }
 
+// zScoreWindow computes the score-family window ZRANGEBYSCORE and the BYSCORE ZRANGESTORE share: it
+// ranks both numeric bounds on the score family, applies the optional LIMIT (rev picks the offset
+// direction), and reads exactly the window. It returns the window keys in ascending index order and
+// the prefix length; the caller emits them or stores them. errMsg is non-empty on a wrong-type key
+// (the WRONGTYPE message) or a bad bound, and empty with no keys for a valid but empty range.
+func (c *connState) zScoreWindow(zkey, loArg, hiArg []byte, rev, hasLimit bool, offset, count int) (keys [][]byte, plen int, errMsg string) {
+	if c.stringConflict(zkey) {
+		return nil, 0, wrongType
+	}
+	lo, loExcl, err1 := parseScoreSpec(loArg)
+	hi, hiExcl, err2 := parseScoreSpec(hiArg)
+	if err1 != nil || err2 != nil {
+		return nil, 0, "ERR min or max is not a float"
+	}
+	card := int(c.zsetCard(zkey))
+	if card == 0 {
+		return nil, 0, ""
+	}
+	prefix := c.zscorePrefix(zkey)
+	plen = len(prefix)
+	// Inclusive min counts rows below lo; exclusive min counts rows at or below lo. Inclusive max
+	// counts rows at or below hi; exclusive max counts rows below hi.
+	startIdx := c.zscoreRankBoundary(prefix, lo, loExcl, card)
+	endIdx := c.zscoreRankBoundary(prefix, hi, !hiExcl, card)
+	if startIdx >= endIdx {
+		return nil, plen, ""
+	}
+	lo2, hi2 := startIdx, endIdx
+	if hasLimit {
+		lo2, hi2 = windowLimit(startIdx, endIdx, offset, count, rev)
+	}
+	return c.collectWindow(prefix, lo2, hi2), plen, ""
+}
+
 // zByLex answers ZRANGEBYLEX (rev=false) and ZREVRANGEBYLEX (rev=true), and the BYLEX form of
 // ZRANGE. It ranks both bounds on the member family (member bytes, one shared score assumed by the
 // caller as Redis documents) and emits the members of the window; by-lex never carries scores.
 func (c *connState) zByLex(zkey, loArg, hiArg []byte, rev, hasLimit bool, offset, count int) {
-	if c.stringConflict(zkey) {
-		c.writeErr(wrongType)
+	keys, plen, errMsg := c.zLexWindow(zkey, loArg, hiArg, rev, hasLimit, offset, count)
+	if errMsg != "" {
+		c.writeErr(errMsg)
 		return
+	}
+	c.writeArrayHeader(len(keys))
+	if rev {
+		for i := len(keys) - 1; i >= 0; i-- {
+			c.writeBulk(keys[i][plen:])
+		}
+		return
+	}
+	for _, k := range keys {
+		c.writeBulk(k[plen:])
+	}
+}
+
+// zLexWindow computes the member-family window ZRANGEBYLEX and the BYLEX ZRANGESTORE share: it ranks
+// both lexical bounds on the member family, applies the optional LIMIT, and reads exactly the
+// window. It returns the window keys in ascending member order and the prefix length; the caller
+// emits the members or reads their scores for storing. errMsg is non-empty on a wrong-type key or a
+// bad bound, and empty with no keys for a valid but empty range.
+func (c *connState) zLexWindow(zkey, loArg, hiArg []byte, rev, hasLimit bool, offset, count int) (keys [][]byte, plen int, errMsg string) {
+	if c.stringConflict(zkey) {
+		return nil, 0, wrongType
 	}
 	loKind, loMember, loExcl, err1 := parseLexSpec(loArg)
 	hiKind, hiMember, hiExcl, err2 := parseLexSpec(hiArg)
 	if err1 != nil || err2 != nil {
-		c.writeErr("ERR min or max not valid string range item")
-		return
+		return nil, 0, "ERR min or max not valid string range item"
 	}
 	card := int(c.zsetCard(zkey))
 	if card == 0 {
-		c.writeArrayHeader(0)
-		return
+		return nil, 0, ""
 	}
 	prefix := c.zmemberPrefix(zkey)
-	plen := len(prefix)
+	plen = len(prefix)
 
 	startIdx := 0
 	switch loKind {
@@ -295,24 +324,13 @@ func (c *connState) zByLex(zkey, loArg, hiArg []byte, rev, hasLimit bool, offset
 		endIdx = c.zlexRankBoundary(prefix, hiMember, !hiExcl, card)
 	}
 	if startIdx >= endIdx {
-		c.writeArrayHeader(0)
-		return
+		return nil, plen, ""
 	}
 	lo2, hi2 := startIdx, endIdx
 	if hasLimit {
 		lo2, hi2 = windowLimit(startIdx, endIdx, offset, count, rev)
 	}
-	keys := c.collectWindow(prefix, lo2, hi2)
-	c.writeArrayHeader(len(keys))
-	if rev {
-		for i := len(keys) - 1; i >= 0; i-- {
-			c.writeBulk(keys[i][plen:])
-		}
-		return
-	}
-	for _, k := range keys {
-		c.writeBulk(k[plen:])
-	}
+	return c.collectWindow(prefix, lo2, hi2), plen, ""
 }
 
 // cmdZRangeByScore serves ZRANGEBYSCORE and, with rev, ZREVRANGEBYSCORE. The reverse command's

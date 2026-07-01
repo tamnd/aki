@@ -809,20 +809,47 @@ func (c *connState) cmdZRevRange(argv [][]byte) {
 // The cost tracks the window, not the cardinality, so a 100-element window over a
 // billion-member board reads a bounded handful of rows.
 func (c *connState) zrangeByIndex(zkey, startArg, stopArg []byte, rev, withScores bool) {
-	if c.stringConflict(zkey) {
-		c.writeErr(wrongType)
+	keys, plen, errMsg := c.zIndexWindow(zkey, startArg, stopArg, rev)
+	if errMsg != "" {
+		c.writeErr(errMsg)
 		return
+	}
+	mult := 1
+	if withScores {
+		mult = 2
+	}
+	c.writeArrayHeader(len(keys) * mult)
+	if rev {
+		for i := len(keys) - 1; i >= 0; i-- {
+			c.emitZrangeMember(keys[i], plen, withScores)
+		}
+		return
+	}
+	for _, k := range keys {
+		c.emitZrangeMember(k, plen, withScores)
+	}
+}
+
+// zIndexWindow computes the rank-indexed window ZRANGE/ZREVRANGE and the default form of ZRANGESTORE
+// share. It normalizes the start/stop indices against the cardinality (negative counts from the end,
+// out-of-range clamps or empties), maps the requested indices to a forward score-order window, and
+// selects that window off the score-family order index: one O(log n) seek to the first key
+// (CollSelectAt) then a bounded forward scan for the rest (CollScan). The returned keys are
+// score-family rows in ascending score order; the caller emits them forward or reversed, or stores
+// them. errMsg is non-empty on a wrong-type key or a non-integer index, and empty with no keys for a
+// valid but empty range. The cost tracks the window, not the cardinality.
+func (c *connState) zIndexWindow(zkey, startArg, stopArg []byte, rev bool) (keys [][]byte, plen int, errMsg string) {
+	if c.stringConflict(zkey) {
+		return nil, 0, wrongType
 	}
 	start, err1 := strconv.ParseInt(string(startArg), 10, 64)
 	stop, err2 := strconv.ParseInt(string(stopArg), 10, 64)
 	if err1 != nil || err2 != nil {
-		c.writeErr("ERR value is not an integer or out of range")
-		return
+		return nil, 0, "ERR value is not an integer or out of range"
 	}
 	card := int64(c.zsetCard(zkey))
 	if card == 0 {
-		c.writeArrayHeader(0)
-		return
+		return nil, 0, ""
 	}
 	if start < 0 {
 		start += card
@@ -834,8 +861,7 @@ func (c *connState) zrangeByIndex(zkey, startArg, stopArg []byte, rev, withScore
 		stop += card
 	}
 	if start > stop || start >= card {
-		c.writeArrayHeader(0)
-		return
+		return nil, 0, ""
 	}
 	if stop >= card {
 		stop = card - 1
@@ -852,32 +878,17 @@ func (c *connState) zrangeByIndex(zkey, startArg, stopArg []byte, rev, withScore
 	n := fStop - fStart + 1
 
 	prefix := c.zscorePrefix(zkey)
-	plen := len(prefix)
+	plen = len(prefix)
 	first, ok := c.srv.store.CollSelectAt(prefix, int(fStart))
 	if !ok {
-		c.writeArrayHeader(0)
-		return
+		return nil, plen, ""
 	}
-	keys := append(c.zkeys[:0], first)
+	keys = append(c.zkeys[:0], first)
 	if n > 1 {
 		keys, _ = c.srv.store.CollScan(prefix, first, int(n-1), keys)
 	}
 	c.zkeys = keys
-
-	mult := 1
-	if withScores {
-		mult = 2
-	}
-	c.writeArrayHeader(len(keys) * mult)
-	if rev {
-		for i := len(keys) - 1; i >= 0; i-- {
-			c.emitZrangeMember(keys[i], plen, withScores)
-		}
-		return
-	}
-	for _, k := range keys {
-		c.emitZrangeMember(k, plen, withScores)
-	}
+	return keys, plen, ""
 }
 
 // emitZrangeMember writes one score-family row as a ZRANGE reply element: the member
