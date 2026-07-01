@@ -119,3 +119,16 @@ func (s *Store) CollScan(prefix, after []byte, limit int, dst [][]byte) (keys []
 	}
 	return dst, last
 }
+
+// CollSelectAt returns the composite key of the element at 0-based localIndex within the
+// collection bounded by prefix, in key order, and whether it exists. It rides the ordered
+// index's order-statistic spans, so a random member is one O(log n) rank-then-select
+// descent, never an O(n) count. This is the random-access primitive SPOP and
+// SRANDMEMBER seek through (spec 2064/f1_rewrite_ltm/06 section 10.1): the server draws a
+// uniform localIndex in [0, cardinality) and this returns the corresponding member row's
+// key, a subslice of the immutable arena valid for the store's life. localIndex at or
+// past the collection's cardinality reports absent rather than crossing into a sibling
+// collection.
+func (s *Store) CollSelectAt(prefix []byte, localIndex int) (key []byte, ok bool) {
+	return s.oidx.selectInPrefix(prefix, localIndex)
+}
