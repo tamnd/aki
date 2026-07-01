@@ -286,6 +286,8 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdExpire(argv)
 	case eqFold(cmd, "TTL") || eqFold(cmd, "PTTL"):
 		c.cmdTTL(argv)
+	case eqFold(cmd, "EXPIRETIME") || eqFold(cmd, "PEXPIRETIME"):
+		c.cmdExpireTime(argv)
 	case eqFold(cmd, "PERSIST"):
 		c.cmdPersist(argv)
 	case eqFold(cmd, "FLUSHALL") || eqFold(cmd, "FLUSHDB"):
@@ -315,6 +317,7 @@ func (c *connState) cmdGet(argv [][]byte) {
 		c.writeErr("ERR wrong number of arguments for 'get' command")
 		return
 	}
+	c.expireIfNeeded(argv[1])
 	v, ok := c.srv.store.Get(argv[1], c.vbuf)
 	c.vbuf = v
 	if !ok {
@@ -329,12 +332,17 @@ func (c *connState) cmdSet(argv [][]byte) {
 		c.writeErr("ERR wrong number of arguments for 'set' command")
 		return
 	}
-	// Options (EX/PX/NX/XX/GET/KEEPTTL) are accepted but only the bare set is
-	// honored for now; TTL lands with the .aki durability work. A plain bench SET
-	// sends no options, so this never affects the measured path.
+	// The EX/PX/EXAT/PXAT/KEEPTTL/GET options land in slice 2; this slice honors the
+	// bare SET plus the one TTL rule that is unconditional: a fresh SET replaces the
+	// value object, so it clears any existing TTL (spec 11 section 2.5). A plain bench
+	// SET sends no options and hits no TTL'd key, so the volatile gate keeps this path
+	// exactly the lock-free store.Set it was.
 	if err := c.srv.store.Set(argv[1], argv[2]); err != nil {
 		c.writeErr("ERR " + err.Error())
 		return
+	}
+	if c.srv.volatile.Load() != 0 {
+		c.clearExpiry(argv[1])
 	}
 	c.writeSimple("OK")
 }
@@ -366,6 +374,7 @@ func (c *connState) cmdIncrBy(argv [][]byte, fixed int64, hasArg bool) {
 		key = argv[1]
 		delta = fixed
 	}
+	c.expireIfNeeded(key)
 	mu := &c.srv.incrMu[c.srv.stripe(key)]
 	mu.Lock()
 	n, err := c.srv.store.Incr(key, delta)
@@ -423,7 +432,13 @@ func (c *connState) dropKey(key []byte) bool {
 // hold the relevant stripe lock (BITOP holds every key's stripe under lockStripes before it
 // overwrites the destination).
 func (c *connState) dropKeyLocked(key []byte) bool {
-	switch c.keyTypeOf(key) {
+	// A key that carries a TTL owns an expire sibling row; drop it alongside the value so
+	// DEL, UNLINK, and the expiry reap all release the volatile counter. Gated on the
+	// counter so a TTL-free keyspace never probes for a row that cannot exist.
+	if c.srv.volatile.Load() != 0 {
+		c.clearExpiryLocked(key)
+	}
+	switch c.resolveType(key) {
 	case keyString:
 		return c.srv.store.Delete(key)
 	case keyHash:
@@ -513,6 +528,7 @@ func (c *connState) cmdMGet(argv [][]byte) {
 	}
 	c.writeArrayHeader(len(argv) - 1)
 	for _, k := range argv[1:] {
+		c.expireIfNeeded(k)
 		v, ok := c.srv.store.Get(k, c.vbuf)
 		c.vbuf = v
 		if !ok {
@@ -539,40 +555,229 @@ func (c *connState) cmdEcho(argv [][]byte) {
 	c.writeBulk(argv[1])
 }
 
-// cmdExpire is a presence-reporting stub: it reports 1 when the key exists and 0
-// otherwise, which is enough for the bench smoke check and the in-memory workloads.
-// Real key expiry arrives with the durability and .aki file work, where a record can
-// carry a deadline; it is deliberately not bolted onto the lock-free hot path here.
+// expire condition flags parsed off the EXPIRE family's optional trailing argument.
+const (
+	expNX = 1 << iota // set only if the key has no current expiry
+	expXX             // set only if the key has a current expiry
+	expGT             // set only if the new expiry is greater than the current (extend only)
+	expLT             // set only if the new expiry is less than the current (shorten only)
+)
+
+// cmdExpire implements EXPIRE, PEXPIRE, EXPIREAT, and PEXPIREAT with the NX/XX/GT/LT
+// conditions (spec 11 section 2.1-2.2). All four compute an absolute deadline in unix
+// milliseconds and store it on the key's expire row; they differ only in how the client
+// expresses the time. PEXPIREAT is the primitive and the other three are arithmetic in
+// front of it. A computed deadline already in the past deletes the key immediately and
+// still returns 1, matching Redis's lazy-delete-on-set.
 func (c *connState) cmdExpire(argv [][]byte) {
 	if len(argv) < 3 {
 		c.writeErr("ERR wrong number of arguments")
 		return
 	}
-	if _, ok := c.srv.store.Get(argv[1], c.vbuf[:0]); ok {
+	n, err := atoi64(argv[2])
+	if err != nil {
+		c.writeErr("ERR value is not an integer or out of range")
+		return
+	}
+	// Parse the optional trailing NX/XX/GT/LT conditions. Redis accepts them in any order
+	// and any count (a repeat folds to the same bit and is harmless), then rejects the two
+	// incompatible pairings: NX with any of XX/GT/LT, and GT with LT. An unrecognized option
+	// is reported before the compatibility check, matching Redis's left-to-right parse.
+	var flags int
+	for _, opt := range argv[3:] {
+		switch {
+		case eqFold(opt, "NX"):
+			flags |= expNX
+		case eqFold(opt, "XX"):
+			flags |= expXX
+		case eqFold(opt, "GT"):
+			flags |= expGT
+		case eqFold(opt, "LT"):
+			flags |= expLT
+		default:
+			c.writeErr("ERR Unsupported option " + string(opt))
+			return
+		}
+	}
+	if flags&expNX != 0 && flags&(expXX|expGT|expLT) != 0 {
+		c.writeErr("ERR NX and XX, GT or LT options at the same time are not compatible")
+		return
+	}
+	if flags&expGT != 0 && flags&expLT != 0 {
+		c.writeErr("ERR GT and LT options at the same time are not compatible")
+		return
+	}
+	// Fold the client's time expression into an absolute deadline in ms. The *AT forms are
+	// absolute already; the relative forms add to the batch's cached now. cmd is the verb.
+	cmd := argv[0]
+	var atMs int64
+	var ok bool
+	switch {
+	case eqFold(cmd, "EXPIRE"):
+		var ms int64
+		if ms, ok = secToMs(n); ok {
+			atMs, ok = addOverflow(c.nowMs, ms)
+		}
+	case eqFold(cmd, "PEXPIRE"):
+		atMs, ok = addOverflow(c.nowMs, n)
+	case eqFold(cmd, "EXPIREAT"):
+		atMs, ok = secToMs(n)
+	default: // PEXPIREAT
+		atMs, ok = n, true
+	}
+	if !ok {
+		c.writeErr("ERR invalid expire time in '" + string(cmd) + "' command")
+		return
+	}
+
+	key := argv[1]
+	// A key already past its TTL is reaped first, so EXPIRE on it reports 0 (nothing there
+	// to set an expiry on), matching a missing key.
+	c.expireIfNeeded(key)
+	mu := &c.srv.incrMu[c.srv.stripe(key)]
+	mu.Lock()
+	defer mu.Unlock()
+	if c.resolveType(key) == keyMissing {
+		c.writeInt(0)
+		return
+	}
+	cur, hasCur := c.getExpiry(key)
+	if !c.expireConditionMet(flags, atMs, cur, hasCur) {
+		c.writeInt(0)
+		return
+	}
+	if atMs <= c.nowMs {
+		// The deadline is in the past: delete now rather than store a dead expiry, and still
+		// report 1 because the TTL was accepted (setting it to the past means delete now).
+		c.dropKeyLocked(key)
+		c.writeInt(1)
+		return
+	}
+	c.setExpiryLocked(key, atMs)
+	c.writeInt(1)
+}
+
+// expireConditionMet evaluates the NX/XX/GT/LT guard against the current expiry. The
+// flags that survive validation are NX alone, or any AND-combination of XX/GT/LT, so this
+// evaluates each present bit as a conjunct. A key with no current expiry is treated as
+// infinite for GT/LT: GT never fires against infinity (no finite time is greater), LT
+// always fires (any finite time is less). With no flag the write always happens.
+func (c *connState) expireConditionMet(flags int, newAt, cur int64, hasCur bool) bool {
+	if flags&expNX != 0 {
+		// NX is exclusive of the others (validated in cmdExpire): set only if no current expiry.
+		return !hasCur
+	}
+	if flags&expXX != 0 && !hasCur {
+		return false
+	}
+	if flags&expGT != 0 && (!hasCur || newAt <= cur) {
+		return false
+	}
+	if flags&expLT != 0 && hasCur && newAt >= cur {
+		return false
+	}
+	return true
+}
+
+// cmdTTL implements TTL and PTTL: remaining time to live, -1 when the key exists with no
+// expiry, -2 when the key is missing or already expired (spec 11 section 2.3). TTL rounds
+// to the nearest second the Redis way, adding 500 ms before the integer-second divide.
+func (c *connState) cmdTTL(argv [][]byte) {
+	if len(argv) != 2 {
+		c.writeErr("ERR wrong number of arguments")
+		return
+	}
+	key := argv[1]
+	c.expireIfNeeded(key)
+	if c.resolveType(key) == keyMissing {
+		c.writeInt(-2)
+		return
+	}
+	at, ok := c.getExpiry(key)
+	if !ok {
+		c.writeInt(-1)
+		return
+	}
+	ms := at - c.nowMs
+	if ms < 0 {
+		ms = 0
+	}
+	if eqFold(argv[0], "PTTL") {
+		c.writeInt(ms)
+		return
+	}
+	c.writeInt((ms + 500) / 1000)
+}
+
+// cmdExpireTime implements EXPIRETIME and PEXPIRETIME: the absolute deadline as unix
+// seconds or unix milliseconds, -1 with no expiry, -2 missing (spec 11 section 2.3).
+// These read the stored field directly, so they are the cheapest of the TTL readers.
+func (c *connState) cmdExpireTime(argv [][]byte) {
+	if len(argv) != 2 {
+		c.writeErr("ERR wrong number of arguments")
+		return
+	}
+	key := argv[1]
+	c.expireIfNeeded(key)
+	if c.resolveType(key) == keyMissing {
+		c.writeInt(-2)
+		return
+	}
+	at, ok := c.getExpiry(key)
+	if !ok {
+		c.writeInt(-1)
+		return
+	}
+	if eqFold(argv[0], "PEXPIRETIME") {
+		c.writeInt(at)
+		return
+	}
+	c.writeInt(at / 1000)
+}
+
+// cmdPersist removes a key's expiry, making it immortal again. It returns 1 if an expiry
+// was removed, 0 if the key has no expiry or does not exist (spec 11 section 2.4).
+func (c *connState) cmdPersist(argv [][]byte) {
+	if len(argv) != 2 {
+		c.writeErr("ERR wrong number of arguments")
+		return
+	}
+	key := argv[1]
+	c.expireIfNeeded(key)
+	mu := &c.srv.incrMu[c.srv.stripe(key)]
+	mu.Lock()
+	defer mu.Unlock()
+	if c.resolveType(key) == keyMissing {
+		c.writeInt(0)
+		return
+	}
+	if c.clearExpiryLocked(key) {
 		c.writeInt(1)
 		return
 	}
 	c.writeInt(0)
 }
 
-func (c *connState) cmdTTL(argv [][]byte) {
-	if len(argv) != 2 {
-		c.writeErr("ERR wrong number of arguments")
-		return
+// secToMs converts a seconds count to milliseconds and reports whether the multiply fit
+// in int64, so an EXPIRE or EXPIREAT with an absurd seconds value errors instead of
+// wrapping to a bogus deadline.
+func secToMs(sec int64) (int64, bool) {
+	ms := sec * 1000
+	if sec != 0 && ms/1000 != sec {
+		return 0, false
 	}
-	if _, ok := c.srv.store.Get(argv[1], c.vbuf[:0]); ok {
-		c.writeInt(-1) // exists, no expiry tracked yet
-		return
-	}
-	c.writeInt(-2) // missing
+	return ms, true
 }
 
-func (c *connState) cmdPersist(argv [][]byte) {
-	if len(argv) != 2 {
-		c.writeErr("ERR wrong number of arguments")
-		return
+// addOverflow returns a+b and whether it overflowed int64, so a relative EXPIRE that
+// would push the absolute deadline past the representable range errors instead of
+// wrapping to a past time.
+func addOverflow(a, b int64) (int64, bool) {
+	s := a + b
+	if (b > 0 && s < a) || (b < 0 && s > a) {
+		return 0, false
 	}
-	c.writeInt(0) // no expiry was set, so nothing to persist
+	return s, true
 }
 
 // stripe maps a key to one of the INCR-family RMW lock stripes with a cheap

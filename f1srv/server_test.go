@@ -186,8 +186,9 @@ func TestExpireSmokeShape(t *testing.T) {
 	expect(t, rw, ":1")
 	cmd(t, rw, "EXPIRE", "missing", "100")
 	expect(t, rw, ":0")
+	// The TTL is real now: a key with a 100s expiry reads 100, not -1.
 	cmd(t, rw, "TTL", "k")
-	expect(t, rw, ":-1")
+	expect(t, rw, ":100")
 	cmd(t, rw, "TTL", "missing")
 	expect(t, rw, ":-2")
 }

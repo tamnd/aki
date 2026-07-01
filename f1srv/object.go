@@ -159,11 +159,23 @@ const (
 	keyStream
 )
 
-// keyTypeOf resolves a key to exactly one type. A key can only ever be one type at a time
-// because every write guards the other namespaces with WRONGTYPE, so the probe order only
-// decides which lookup runs first, not the answer. The string namespace is checked first
-// because it is the cheapest and the most common.
+// keyTypeOf resolves a key to exactly one type, first reaping it if it has expired. It is
+// the type probe the read-side and generic commands use, so an expired key reads as
+// missing (and is deleted) on the next touch, which is lazy expiry (spec 11 section 3).
+// The reap is gated on the volatile TTL counter, so a keyspace with no TTLs pays one
+// atomic load and goes straight to resolveType.
 func (c *connState) keyTypeOf(key []byte) keyKind {
+	c.expireIfNeeded(key)
+	return c.resolveType(key)
+}
+
+// resolveType is the pure type probe with no expiry side effect, for the reap path
+// itself (dropKeyLocked runs under the stripe lock and must not re-enter expireIfNeeded)
+// and for any caller that has already handled expiry. A key can only ever be one type at
+// a time because every write guards the other namespaces with WRONGTYPE, so the probe
+// order only decides which lookup runs first, not the answer. The string namespace is
+// checked first because it is the cheapest and the most common.
+func (c *connState) resolveType(key []byte) keyKind {
 	if _, ok := c.srv.store.Get(key, c.vbuf[:0]); ok {
 		return keyString
 	}
