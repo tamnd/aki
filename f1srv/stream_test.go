@@ -296,4 +296,122 @@ func TestStreamWrongType(t *testing.T) {
 	expect(t, rw, "-"+wrongType)
 	cmd(t, rw, "XRANGE", "str", "-", "+")
 	expect(t, rw, "-"+wrongType)
+	cmd(t, rw, "XDEL", "str", "1-1")
+	expect(t, rw, "-"+wrongType)
+	cmd(t, rw, "XTRIM", "str", "MAXLEN", "0")
+	expect(t, rw, "-"+wrongType)
+	cmd(t, rw, "XSETID", "str", "1-1")
+	expect(t, rw, "-"+wrongType)
+}
+
+// TestStreamDel covers XDEL: a point delete drops the live length, an absent id is not counted,
+// and max-deleted-id advances so a re-add at a removed id is still rejected while entries-added
+// (the lifetime counter) holds.
+func TestStreamDel(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	for _, id := range []string{"1-1", "2-1", "3-1"} {
+		cmd(t, rw, "XADD", "s", id, "f", "v")
+		expect(t, rw, "$"+id)
+	}
+
+	// Delete the middle entry and one id that is not present: only the present one counts.
+	cmd(t, rw, "XDEL", "s", "2-1", "9-9")
+	expect(t, rw, ":1")
+	cmd(t, rw, "XLEN", "s")
+	expect(t, rw, ":2")
+
+	// The survivors are the untouched ends, in order.
+	cmd(t, rw, "XRANGE", "s", "-", "+")
+	surv := asArray(t, readValue(t, rw), 2)
+	asBulk(t, asArray(t, surv[0], 2)[0], "1-1")
+	asBulk(t, asArray(t, surv[1], 2)[0], "3-1")
+
+	// Re-adding at the deleted id is still rejected: last-id did not move backward.
+	cmd(t, rw, "XADD", "s", "2-1", "f", "v")
+	expect(t, rw, "-"+errStreamIDSmaller)
+
+	// Deleting every remaining entry leaves the stream present at length zero.
+	cmd(t, rw, "XDEL", "s", "1-1", "3-1")
+	expect(t, rw, ":2")
+	cmd(t, rw, "XLEN", "s")
+	expect(t, rw, ":0")
+	cmd(t, rw, "EXISTS", "s")
+	expect(t, rw, ":1")
+
+	// XDEL on a missing key removes nothing.
+	cmd(t, rw, "XDEL", "missing", "1-1")
+	expect(t, rw, ":0")
+}
+
+// TestStreamXTrim covers standalone XTRIM by MAXLEN and MINID and its removed-count reply.
+func TestStreamXTrim(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	for i := 1; i <= 5; i++ {
+		id := fmt.Sprintf("%d-1", i)
+		cmd(t, rw, "XADD", "s", id, "f", "v")
+		expect(t, rw, "$"+id)
+	}
+
+	// MAXLEN 3 drops the two oldest and reports two removed.
+	cmd(t, rw, "XTRIM", "s", "MAXLEN", "3")
+	expect(t, rw, ":2")
+	cmd(t, rw, "XRANGE", "s", "-", "+")
+	surv := asArray(t, readValue(t, rw), 3)
+	asBulk(t, asArray(t, surv[0], 2)[0], "3-1")
+	asBulk(t, asArray(t, surv[2], 2)[0], "5-1")
+
+	// MINID 5 drops 3-1 and 4-1 (both below 5-0), leaving only 5-1.
+	cmd(t, rw, "XTRIM", "s", "MINID", "5")
+	expect(t, rw, ":2")
+	cmd(t, rw, "XLEN", "s")
+	expect(t, rw, ":1")
+
+	// XTRIM on a missing key removes nothing.
+	cmd(t, rw, "XTRIM", "missing", "MAXLEN", "0")
+	expect(t, rw, ":0")
+
+	// A trailing unbalanced token is a syntax error, not a silent no-op.
+	cmd(t, rw, "XTRIM", "s", "MAXLEN", "1", "BOGUS")
+	expect(t, rw, "-ERR syntax error")
+}
+
+// TestStreamSetID covers XSETID: it rewrites last-id and the counters, rejects an id below the
+// highest present entry, and errors on a missing key.
+func TestStreamSetID(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "XADD", "s", "1-1", "f", "v")
+	expect(t, rw, "$1-1")
+	cmd(t, rw, "XADD", "s", "2-1", "f", "v")
+	expect(t, rw, "$2-1")
+
+	// last-id below the highest present entry (2-1) is refused.
+	cmd(t, rw, "XSETID", "s", "1-0")
+	expect(t, rw, "-"+errStreamSetIDSmall)
+
+	// Bumping last-id forward makes the next auto-add continue from there.
+	cmd(t, rw, "XSETID", "s", "100-5")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "XADD", "s", "100-*", "f", "v")
+	expect(t, rw, "$100-6")
+
+	// ENTRIESADDED and MAXDELETEDID are accepted and echoed back through XINFO-free checks:
+	// setting a smaller last-id still fails against the real top entry, not the counter.
+	cmd(t, rw, "XSETID", "s", "200-0", "ENTRIESADDED", "50", "MAXDELETEDID", "3-3")
+	expect(t, rw, "+OK")
+
+	// A non-integer ENTRIESADDED is rejected.
+	cmd(t, rw, "XSETID", "s", "300-0", "ENTRIESADDED", "notanumber")
+	expect(t, rw, "-"+errStreamNotInt)
+
+	// XSETID on a missing key is an error, not a create.
+	cmd(t, rw, "XSETID", "missing", "1-1")
+	expect(t, rw, "-"+errStreamNoSuchKey)
+	cmd(t, rw, "EXISTS", "missing")
+	expect(t, rw, ":0")
 }
