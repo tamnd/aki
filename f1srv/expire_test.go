@@ -163,6 +163,86 @@ func TestExpireLazyReap(t *testing.T) {
 	expect(t, rw, ":9999999999000")
 }
 
+// TestTypedLazyExpiry confirms a typed read sees an expired key as absent, the way Redis
+// runs expireIfNeeded on every key lookup (spec 11 section 3). The point-path handlers
+// read their element rows directly, so without the dispatch-boundary reap an expired hash
+// would still answer HGET; PEXPIREAT to an absolute past ms makes each key dead
+// deterministically, no sleep. Every reply here matches live Redis 8.8.
+func TestTypedLazyExpiry(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	// Build one key of every type, then expire each to an absolute past ms.
+	cmd(t, rw, "HSET", "h", "f1", "v1", "f2", "v2")
+	expect(t, rw, ":2")
+	cmd(t, rw, "SADD", "s", "a", "b", "c")
+	expect(t, rw, ":3")
+	cmd(t, rw, "ZADD", "z", "1", "a", "2", "b")
+	expect(t, rw, ":2")
+	cmd(t, rw, "RPUSH", "l", "x", "y", "z")
+	expect(t, rw, ":3")
+	cmd(t, rw, "SETBIT", "bm", "5", "1")
+	expect(t, rw, ":0")
+	for _, k := range []string{"h", "s", "z", "l", "bm"} {
+		cmd(t, rw, "PEXPIREAT", k, "1")
+		expect(t, rw, ":1")
+	}
+
+	// Hash reads see nothing.
+	cmd(t, rw, "HGET", "h", "f1")
+	expect(t, rw, "$-1")
+	cmd(t, rw, "HLEN", "h")
+	expect(t, rw, ":0")
+	cmd(t, rw, "HEXISTS", "h", "f1")
+	expect(t, rw, ":0")
+	cmd(t, rw, "HGETALL", "h")
+	expect(t, rw, "*0")
+
+	// Set reads see nothing.
+	cmd(t, rw, "SISMEMBER", "s", "a")
+	expect(t, rw, ":0")
+	cmd(t, rw, "SCARD", "s")
+	expect(t, rw, ":0")
+	cmd(t, rw, "SMEMBERS", "s")
+	expect(t, rw, "*0")
+
+	// Zset reads see nothing.
+	cmd(t, rw, "ZSCORE", "z", "a")
+	expect(t, rw, "$-1")
+	cmd(t, rw, "ZCARD", "z")
+	expect(t, rw, ":0")
+	cmd(t, rw, "ZRANGE", "z", "0", "-1")
+	expect(t, rw, "*0")
+
+	// List reads see nothing.
+	cmd(t, rw, "LLEN", "l")
+	expect(t, rw, ":0")
+	cmd(t, rw, "LINDEX", "l", "0")
+	expect(t, rw, "$-1")
+	cmd(t, rw, "LRANGE", "l", "0", "-1")
+	expect(t, rw, "*0")
+
+	// Bitmap reads see a zero bitmap.
+	cmd(t, rw, "GETBIT", "bm", "5")
+	expect(t, rw, ":0")
+	cmd(t, rw, "BITCOUNT", "bm")
+	expect(t, rw, ":0")
+
+	// TYPE and DBSIZE agree the whole keyspace is empty.
+	cmd(t, rw, "TYPE", "h")
+	expect(t, rw, "+none")
+	cmd(t, rw, "DBSIZE")
+	expect(t, rw, ":0")
+
+	// A write on an expired key starts fresh: the old rows are gone, the new field is 1.
+	cmd(t, rw, "HSET", "h", "g", "w")
+	expect(t, rw, ":1")
+	cmd(t, rw, "HLEN", "h")
+	expect(t, rw, ":1")
+	cmd(t, rw, "TTL", "h")
+	expect(t, rw, ":-1")
+}
+
 // TestSetClearsTTL confirms a plain SET drops any existing TTL (spec 11 section 2.5), the
 // same as Redis with no KEEPTTL.
 func TestSetClearsTTL(t *testing.T) {

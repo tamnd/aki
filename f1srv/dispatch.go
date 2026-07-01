@@ -12,6 +12,11 @@ func (c *connState) dispatch(argv [][]byte) {
 		return
 	}
 	cmd := argv[0]
+	// Reap the command's key if it has expired, before the handler runs. The volatile gate
+	// inside makes this one atomic load when no key carries a TTL, so the hot path is
+	// untouched; when TTLs exist it is what makes a typed read (HGET, ZSCORE, ...) see an
+	// expired key as absent, matching Redis's per-lookup expireIfNeeded.
+	c.reapExpiredKeys(cmd, argv)
 	switch {
 	case eqFold(cmd, "GET"):
 		c.cmdGet(argv)
