@@ -52,7 +52,17 @@ type reactorLoop struct {
 
 	mu      sync.Mutex
 	pending []*reactorConn // accepted connections awaiting adoption by this loop
+	cross   []crossMsg     // pub/sub frames posted by publishers on other loops, drained on wake
 	closing bool           // set by stop(); the loop tears down on the next wake
+}
+
+// crossMsg is one pub/sub message frame handed to a loop for a connection it owns. A publisher
+// running on any loop posts it to the subscriber's loop through the mutex-guarded cross queue and
+// a wake poke; the owning loop drains the queue on its own goroutine and writes the frame, so a
+// connection's output is only ever touched by its own loop.
+type crossMsg struct {
+	rc    *reactorConn
+	frame []byte
 }
 
 // serveWithReactor runs the epoll driver when NetMode is "reactor", returning handled
@@ -249,15 +259,42 @@ func (l *reactorLoop) drainWake() (closing bool) {
 	closing = l.closing
 	pending := l.pending
 	l.pending = nil
+	cross := l.cross
+	l.cross = nil
 	l.mu.Unlock()
 	for _, rc := range pending {
 		l.adoptConn(rc)
 	}
+	// Deliver every pub/sub frame posted by a publisher on another loop. A connection that has
+	// since closed carries fd < 0 and is skipped. The frame is appended to the subscriber's out
+	// buffer and flushed through the same machinery the read path uses, so backpressure and the
+	// EPOLLOUT remainder are handled uniformly.
+	for _, m := range cross {
+		if m.rc.fd < 0 {
+			continue
+		}
+		m.rc.cs.out = append(m.rc.cs.out, m.frame...)
+		l.flush(m.rc)
+	}
 	return closing
 }
 
-// adoptConn installs a connection in the loop's table and registers its fd for reads.
+// crossDeliver posts a pub/sub message frame to this loop for one of its connections and wakes it.
+// It runs on a publisher's goroutine (any loop), so it only touches the mutex-guarded cross queue,
+// never the owning loop's conn table or the connection's out buffer.
+func (l *reactorLoop) crossDeliver(rc *reactorConn, frame []byte) {
+	l.mu.Lock()
+	l.cross = append(l.cross, crossMsg{rc: rc, frame: frame})
+	l.mu.Unlock()
+	l.poke()
+}
+
+// adoptConn installs a connection in the loop's table and registers its fd for reads. It also
+// installs the connection's pub/sub deliver hook: a message frame for this connection is posted
+// to this loop and written on this loop's goroutine, so the connection's output stays
+// single-threaded even when the publisher runs on another loop.
 func (l *reactorLoop) adoptConn(rc *reactorConn) {
+	rc.cs.deliver = func(frame []byte) { l.crossDeliver(rc, frame) }
 	for len(l.conns) <= rc.fd {
 		l.conns = append(l.conns, nil)
 	}
@@ -361,10 +398,12 @@ func (l *reactorLoop) closeConn(rc *reactorConn) {
 	if rc.fd < 0 {
 		return
 	}
-	// Release any watches or open transaction this connection held, so the watch table's
-	// refcounts and the global watching gate do not leak past the closed connection, the
-	// same teardown the goroutine driver runs after loop returns.
+	// Release any watches, open transaction, or pub/sub subscriptions this connection held, so
+	// the watch table's refcounts and the global watching gate and the pub/sub registry do not
+	// leak past the closed connection, the same teardown the goroutine driver runs after loop
+	// returns.
 	rc.cs.discardTx()
+	rc.cs.unsubscribeAll()
 	_ = syscall.EpollCtl(l.epfd, syscall.EPOLL_CTL_DEL, rc.fd, nil)
 	_ = syscall.Close(rc.fd)
 	if rc.fd < len(l.conns) {
