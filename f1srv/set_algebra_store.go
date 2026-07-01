@@ -84,6 +84,7 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 	}
 
 	count := 0
+	enc := encNone
 	var writeErr error
 	insert := func(m []byte) bool {
 		mk := c.memberKey(dest, m)
@@ -95,6 +96,7 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 		if isNew {
 			c.srv.store.CollInsert(mk, kindSetMember)
 			count++
+			enc = foldSetEnc(enc, m, uint64(count))
 		}
 		return true
 	}
@@ -127,7 +129,7 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 		c.writeErr("ERR " + writeErr.Error())
 		return
 	}
-	if err := c.setSetCard(dest, uint64(count)); err != nil {
+	if err := c.setPutHeader(dest, uint64(count), enc); err != nil {
 		unlock()
 		c.writeErr("ERR " + err.Error())
 		return
