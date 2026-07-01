@@ -187,6 +187,70 @@ func (s *Store) CollScan(prefix, after []byte, limit int, dst [][]byte) (keys []
 	return dst, last
 }
 
+// ScanKeys walks the fixed primary bucket array for top-level keys, starting at primary
+// bucket index `cursor`, and appends each key whose record kind satisfies isTop to dst. It
+// is the keyspace enumerator KEYS, SCAN, and RANDOMKEY ride: the engine stays type-agnostic
+// and the caller decides through isTop which kinds are top-level (a plain string record and a
+// collection header row are, an element row and a sidecar expire row are not), so the kind
+// policy stays in the server.
+//
+// The primary bucket array is fixed at construction and never rehashes, and a key never
+// migrates between primary buckets, so a bucket index is a stable resumable cursor: a key
+// present for a whole iteration is visited in exactly one bucket and so returned at least
+// once, which is the SCAN guarantee. It visits whole primary buckets (each with its overflow
+// chain) so a batch never splits a bucket, and returns the next cursor to resume from, which
+// is 0 once the array is exhausted.
+//
+// count is a target key count, not a bucket count: the walk keeps taking whole buckets until
+// it has appended at least count keys, then stops on the bucket boundary. This is what keeps
+// a full iteration proportional to the number of keys rather than the number of buckets, since
+// the array is fixed large (millions of buckets) regardless of how few keys live in it, and a
+// per-bucket batch would force an empty keyspace through millions of round trips. Sweeping the
+// empty stretches inside one call instead of across many is the same amount of bucket work but
+// a handful of round trips. count at or below zero targets a single key, which is how RANDOMKEY
+// asks for the first live key at or after a random bucket. Each appended key is a subslice of
+// the immutable arena, stable for the store's life, so the caller reads it without copying. A
+// record logically expired but not yet reaped is still returned here (the engine has no TTL
+// concept); the caller filters those.
+func (s *Store) ScanKeys(cursor uint64, count int, dst [][]byte, isTop func(kind byte) bool) (out [][]byte, next uint64) {
+	n := uint64(len(s.buckets))
+	if cursor >= n {
+		return dst, 0
+	}
+	target := count
+	if target < 1 {
+		target = 1
+	}
+	start := len(dst)
+	for bi := cursor; bi < n; bi++ {
+		b := &s.buckets[bi]
+		for b != nil {
+			for i := 0; i < slotsPerBucket; i++ {
+				w := b.slots[i].Load()
+				if w == 0 {
+					continue
+				}
+				off := w & addrMask
+				if !isTop(s.arena[off+offKind]) {
+					continue
+				}
+				klen := s.klen(off)
+				dst = append(dst, s.arena[off+hdrSize:off+hdrSize+klen])
+			}
+			b = s.nextBucket(b, false)
+		}
+		if len(dst)-start >= target {
+			// Stop on this bucket boundary; resume at the next bucket. If that is the end of
+			// the array the caller learns the iteration is done from the zero cursor below.
+			if bi+1 >= n {
+				return dst, 0
+			}
+			return dst, bi + 1
+		}
+	}
+	return dst, 0
+}
+
 // CollScanKV is CollScan for the value-carrying enumerations (HGETALL, HVALS): it appends
 // each element's composite key to dstKeys and its record offset to dstOffs, in key order,
 // so the caller reads the value straight from the offset with ReadValueAt instead of

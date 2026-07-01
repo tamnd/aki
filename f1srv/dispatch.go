@@ -66,6 +66,14 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdMGet(argv)
 	case eqFold(cmd, "LCS"):
 		c.cmdLCS(argv)
+	case eqFold(cmd, "KEYS"):
+		c.cmdKeys(argv)
+	case eqFold(cmd, "SCAN"):
+		c.cmdScan(argv)
+	case eqFold(cmd, "RANDOMKEY"):
+		c.cmdRandomKey(argv)
+	case eqFold(cmd, "TOUCH"):
+		c.cmdTouch(argv)
 	case eqFold(cmd, "HSET"):
 		c.cmdHSet(argv)
 	case eqFold(cmd, "HMSET"):
