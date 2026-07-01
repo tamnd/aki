@@ -1,7 +1,6 @@
 package f1srv
 
 import (
-	"bufio"
 	"net"
 	"strconv"
 )
@@ -9,25 +8,31 @@ import (
 // connState is one connection's parse-dispatch-reply state. rbuf holds bytes read
 // from the socket that have not yet been consumed into a complete command; argv is
 // reused across commands and points directly into rbuf, so a command costs no
-// per-argument allocation. The write buffer batches replies and flushes once per read
-// of the socket, so a pipeline of N commands is one read and one write.
+// per-argument allocation. out is the batched reply buffer: every reply writer appends
+// to it and the driver flushes it once per drained batch, so a pipeline of N commands
+// is one read and one write. Keeping the replies in a plain byte slice rather than a
+// bufio.Writer bound to the net.Conn is what lets the goroutine driver and the epoll
+// reactor share the exact same parse-dispatch-reply code and differ only in who reads
+// the socket and who flushes out.
 type connState struct {
-	srv     *Server
-	conn    net.Conn
-	w       *bufio.Writer
-	rbuf    []byte
-	argv    [][]byte
-	vbuf    []byte    // reused destination for GET/MGET value copies
-	kbuf    []byte    // reused scratch for building composite collection element keys
-	pbuf    []byte    // reused scratch for a collection enumeration prefix, held across a scan
-	sbuf    []byte    // reused scratch for formatting a float score reply (ZSCORE/ZINCRBY)
-	zscores []float64 // reused scratch for a ZADD's parsed scores, one per score-member pair
-	zkeys   [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
-	num     [24]byte  // scratch for formatting integer replies
+	srv       *Server
+	conn      net.Conn
+	rbuf      []byte
+	out       []byte // batched reply bytes, flushed once per drained batch
+	wantClose bool   // QUIT sets this; the driver flushes out, then closes the socket
+	argv      [][]byte
+	vbuf      []byte    // reused destination for GET/MGET value copies
+	kbuf      []byte    // reused scratch for building composite collection element keys
+	pbuf      []byte    // reused scratch for a collection enumeration prefix, held across a scan
+	sbuf      []byte    // reused scratch for formatting a float score reply (ZSCORE/ZINCRBY)
+	zscores   []float64 // reused scratch for a ZADD's parsed scores, one per score-member pair
+	zkeys     [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
 }
 
 // loop reads from the socket, drains every complete command in the buffer, and
-// flushes the batched replies, until the peer closes or a protocol error ends it.
+// flushes the batched replies, until the peer closes, a protocol error ends it, or a
+// QUIT asks to close. This is the goroutine driver: it may park on Read and Write, both
+// of which are fine on a dedicated per-connection goroutine.
 func (c *connState) loop() {
 	for {
 		if !c.fill() {
@@ -36,10 +41,14 @@ func (c *connState) loop() {
 		if !c.drain() {
 			return
 		}
-		if c.w.Buffered() > 0 {
-			if err := c.w.Flush(); err != nil {
+		if len(c.out) > 0 {
+			if _, err := c.conn.Write(c.out); err != nil {
 				return
 			}
+			c.out = c.out[:0]
+		}
+		if c.wantClose {
+			return
 		}
 	}
 }
@@ -72,6 +81,14 @@ func (c *connState) drain() bool {
 			c.argv = argv
 			pos += consumed
 			c.dispatch(argv)
+			if c.wantClose {
+				// QUIT: reply to it, then stop draining so a pipeline queued behind
+				// QUIT is discarded, matching Redis, and let the driver flush and close.
+				if pos > 0 {
+					c.rbuf = append(c.rbuf[:0], c.rbuf[pos:]...)
+				}
+				return true
+			}
 		case parseNeedMore:
 			if pos > 0 {
 				c.rbuf = append(c.rbuf[:0], c.rbuf[pos:]...)
@@ -205,50 +222,51 @@ func indexByte(b []byte, c byte) int {
 	return -1
 }
 
-// --- reply writers, all appending to the batched write buffer ---
+// --- reply writers, all appending to the batched reply buffer c.out ---
 
-// The writers append to a bufio.Writer that records its first error and
-// surfaces it at Flush, so the intermediate write returns are blank-assigned
-// the same way resp.Encoder does; the conn checks the Flush error.
+// The writers append RESP bytes straight to c.out. There is no intermediate writer and
+// no error to record: a byte slice append never fails, and the one flush per drain is
+// where a socket error surfaces. The driver owns c.out's lifetime and resets it after
+// each flush.
 func (c *connState) writeSimple(s string) {
-	_ = c.w.WriteByte('+')
-	_, _ = c.w.WriteString(s)
-	_, _ = c.w.WriteString("\r\n")
+	c.out = append(c.out, '+')
+	c.out = append(c.out, s...)
+	c.out = append(c.out, '\r', '\n')
 }
 
 func (c *connState) writeErr(s string) {
-	_ = c.w.WriteByte('-')
-	_, _ = c.w.WriteString(s)
-	_, _ = c.w.WriteString("\r\n")
+	c.out = append(c.out, '-')
+	c.out = append(c.out, s...)
+	c.out = append(c.out, '\r', '\n')
 }
 
 func (c *connState) writeInt(n int64) {
-	_ = c.w.WriteByte(':')
-	_, _ = c.w.Write(strconv.AppendInt(c.num[:0], n, 10))
-	_, _ = c.w.WriteString("\r\n")
+	c.out = append(c.out, ':')
+	c.out = strconv.AppendInt(c.out, n, 10)
+	c.out = append(c.out, '\r', '\n')
 }
 
 func (c *connState) writeBulk(b []byte) {
-	_ = c.w.WriteByte('$')
-	_, _ = c.w.Write(strconv.AppendInt(c.num[:0], int64(len(b)), 10))
-	_, _ = c.w.WriteString("\r\n")
-	_, _ = c.w.Write(b)
-	_, _ = c.w.WriteString("\r\n")
+	c.out = append(c.out, '$')
+	c.out = strconv.AppendInt(c.out, int64(len(b)), 10)
+	c.out = append(c.out, '\r', '\n')
+	c.out = append(c.out, b...)
+	c.out = append(c.out, '\r', '\n')
 }
 
 func (c *connState) writeNil() {
-	_, _ = c.w.WriteString("$-1\r\n")
+	c.out = append(c.out, "$-1\r\n"...)
 }
 
 // writeNilArray writes the RESP2 null array (*-1), the reply ZRANK WITHSCORE and the
 // other array-returning commands use for an absent element, distinct from the null bulk
 // string a scalar reply uses.
 func (c *connState) writeNilArray() {
-	_, _ = c.w.WriteString("*-1\r\n")
+	c.out = append(c.out, "*-1\r\n"...)
 }
 
 func (c *connState) writeArrayHeader(n int) {
-	_ = c.w.WriteByte('*')
-	_, _ = c.w.Write(strconv.AppendInt(c.num[:0], int64(n), 10))
-	_, _ = c.w.WriteString("\r\n")
+	c.out = append(c.out, '*')
+	c.out = strconv.AppendInt(c.out, int64(n), 10)
+	c.out = append(c.out, '\r', '\n')
 }
