@@ -71,6 +71,11 @@ type Server struct {
 	incrMu   []sync.Mutex
 	incrMask uint32
 
+	// block is the per-key blocked-client registry the blocking list commands park in
+	// (list-model spec 2064/f1_rewrite_ltm/08 section 9). It lives beside the storage and
+	// holds no element bytes; a blocked client is one queue entry per key it waits on.
+	block blockReg
+
 	wg sync.WaitGroup
 }
 
@@ -97,6 +102,7 @@ func New(cfg Config) *Server {
 		incrMu:   make([]sync.Mutex, stripes),
 		incrMask: uint32(stripes - 1),
 	}
+	srv.block.waiters = make(map[string][]*listWaiter)
 	// A cold path engages the larger-than-memory tier; opening the log can fail on a
 	// disk error, so defer that error to Listen and keep New's signature simple for the
 	// many in-memory callers and tests that never set ColdPath.
@@ -183,10 +189,11 @@ func (s *Server) serveConn(conn net.Conn) {
 		_ = tc.SetNoDelay(true)
 	}
 	c := &connState{
-		srv:  s,
-		conn: conn,
-		rbuf: make([]byte, 0, s.cfg.ReadBufSize),
-		out:  make([]byte, 0, s.cfg.ReadBufSize),
+		srv:       s,
+		conn:      conn,
+		rbuf:      make([]byte, 0, s.cfg.ReadBufSize),
+		out:       make([]byte, 0, s.cfg.ReadBufSize),
+		blockable: true, // a per-connection goroutine may park on a blocking command
 	}
 	c.loop()
 }

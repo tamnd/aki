@@ -20,6 +20,10 @@ type connState struct {
 	rbuf      []byte
 	out       []byte // batched reply bytes, flushed once per drained batch
 	wantClose bool   // QUIT sets this; the driver flushes out, then closes the socket
+	blockable bool   // true on the goroutine driver, where a blocking command may park this
+	//                  connection's own goroutine; false under the shared-goroutine reactor,
+	//                  where a park would stall every other connection, so the blocking
+	//                  commands there serve non-blocking (immediate element or nil).
 	argv      [][]byte
 	vbuf      []byte    // reused destination for GET/MGET value copies
 	kbuf      []byte    // reused scratch for building composite collection element keys

@@ -248,6 +248,10 @@ func (c *connState) cmdPush(argv [][]byte, atHead, requireExisting bool) {
 		return
 	}
 	mu.Unlock()
+	// A push made the list non-empty, so wake the longest-waiting BLPOP/BRPOP/BLMOVE/BLMPOP
+	// blocked on this key, if any. The call is an atomic load and a return when nobody is
+	// blocked, so the common push pays nothing for the registry.
+	c.srv.signalListKey(lkey)
 	c.writeInt(tail - head)
 }
 
@@ -869,6 +873,8 @@ func (c *connState) cmdLInsert(argv [][]byte) {
 	}
 	c.listPutHeaderAt(hoff, head, tail, lpBytes, everLarge)
 	mu.Unlock()
+	// LINSERT grew the list by one, so it can satisfy a client blocked on this key.
+	c.srv.signalListKey(lkey)
 	c.writeInt(tail - head)
 }
 
@@ -1185,6 +1191,8 @@ func (c *connState) lmove(source, destination, fromTok, toTok []byte) {
 		return
 	}
 	unlock()
+	// The moved element landed on the destination, so wake a client blocked on it.
+	c.srv.signalListKey(destination)
 	c.writeBulk(v)
 }
 
