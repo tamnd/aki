@@ -702,25 +702,82 @@ func (c *connState) cmdZRank(argv [][]byte, rev bool) {
 	c.writeInt(int64(rank))
 }
 
+// cmdZRange is the unified range read: ZRANGE key start stop [BYSCORE | BYLEX] [REV]
+// [LIMIT offset count] [WITHSCORES]. Without BYSCORE or BYLEX it is the rank-indexed window
+// (zrangeByIndex); BYSCORE routes to zByScore and BYLEX to zByLex, the same value-bounded cursor
+// paths ZRANGEBYSCORE/ZRANGEBYLEX use. REV reverses the order, and for the value forms it also
+// means start/stop are given as max then min (Redis's rule), so the bounds are swapped before the
+// shared path sees them.
 func (c *connState) cmdZRange(argv [][]byte) {
-	// ZRANGE key start stop [WITHSCORES] [REV]
 	if len(argv) < 4 {
 		c.writeErr("ERR wrong number of arguments for 'zrange' command")
 		return
 	}
 	rev := false
 	withScores := false
-	for _, opt := range argv[4:] {
+	byScore := false
+	byLex := false
+	hasLimit := false
+	offset := 0
+	count := 0
+	for i := 4; i < len(argv); i++ {
 		switch {
-		case eqFold(opt, "WITHSCORES"):
+		case eqFold(argv[i], "WITHSCORES"):
 			withScores = true
-		case eqFold(opt, "REV"):
+		case eqFold(argv[i], "REV"):
 			rev = true
+		case eqFold(argv[i], "BYSCORE"):
+			byScore = true
+		case eqFold(argv[i], "BYLEX"):
+			byLex = true
+		case eqFold(argv[i], "LIMIT"):
+			if i+2 >= len(argv) {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			o, err1 := strconv.Atoi(string(argv[i+1]))
+			n, err2 := strconv.Atoi(string(argv[i+2]))
+			if err1 != nil || err2 != nil {
+				c.writeErr("ERR value is not an integer or out of range")
+				return
+			}
+			hasLimit = true
+			offset = o
+			count = n
+			i += 2
 		default:
-			// BYSCORE, BYLEX, and LIMIT are the score/lex cursor forms, a later M6 slice.
 			c.writeErr("ERR syntax error")
 			return
 		}
+	}
+	if byScore && byLex {
+		c.writeErr("ERR syntax error, BYSCORE and BYLEX options at the same time are not compatible")
+		return
+	}
+	if hasLimit && !byScore && !byLex {
+		c.writeErr("ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX")
+		return
+	}
+	if withScores && byLex {
+		c.writeErr("ERR syntax error, WITHSCORES not supported in combination with BYLEX")
+		return
+	}
+
+	if byScore {
+		lo, hi := argv[2], argv[3]
+		if rev {
+			lo, hi = argv[3], argv[2]
+		}
+		c.zByScore(argv[1], lo, hi, rev, withScores, hasLimit, offset, count)
+		return
+	}
+	if byLex {
+		lo, hi := argv[2], argv[3]
+		if rev {
+			lo, hi = argv[3], argv[2]
+		}
+		c.zByLex(argv[1], lo, hi, rev, hasLimit, offset, count)
+		return
 	}
 	c.zrangeByIndex(argv[1], argv[2], argv[3], rev, withScores)
 }
