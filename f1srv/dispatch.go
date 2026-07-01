@@ -33,6 +33,24 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdMSet(argv)
 	case eqFold(cmd, "MGET"):
 		c.cmdMGet(argv)
+	case eqFold(cmd, "HSET"):
+		c.cmdHSet(argv)
+	case eqFold(cmd, "HMSET"):
+		c.cmdHMSet(argv)
+	case eqFold(cmd, "HSETNX"):
+		c.cmdHSetNX(argv)
+	case eqFold(cmd, "HGET"):
+		c.cmdHGet(argv)
+	case eqFold(cmd, "HMGET"):
+		c.cmdHMGet(argv)
+	case eqFold(cmd, "HDEL"):
+		c.cmdHDel(argv)
+	case eqFold(cmd, "HEXISTS"):
+		c.cmdHExists(argv)
+	case eqFold(cmd, "HLEN"):
+		c.cmdHLen(argv)
+	case eqFold(cmd, "HSTRLEN"):
+		c.cmdHStrlen(argv)
 	case eqFold(cmd, "PING"):
 		c.cmdPing(argv)
 	case eqFold(cmd, "ECHO"):

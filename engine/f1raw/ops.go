@@ -24,7 +24,7 @@ func (s *Store) Incr(key []byte, delta int64) (int64, error) {
 	h := hash(key)
 	var buf [20]byte
 	for {
-		off, _, _, _, found := s.find(key, h)
+		off, _, _, _, found := s.find(key, h, stringKind)
 		if found {
 			n, ok := s.incrInPlace(off, delta)
 			if !ok {
@@ -47,7 +47,7 @@ func (s *Store) Incr(key []byte, delta int64) (int64, error) {
 				return 0, oerr
 			}
 			b := strconv.AppendInt(buf[:0], n2, 10)
-			if err := s.publish(key, b, h); err != nil {
+			if err := s.publish(key, b, h, stringKind); err != nil {
 				return 0, err
 			}
 			return n2, nil
@@ -55,7 +55,7 @@ func (s *Store) Incr(key []byte, delta int64) (int64, error) {
 		// Absent: try to install delta as a new record, but lose gracefully to a
 		// concurrent creator so the next loop iteration finds it and adds onto it.
 		b := strconv.AppendInt(buf[:0], delta, 10)
-		installed, existed := s.insertAbsent(key, b, h)
+		installed, existed := s.insertAbsent(key, b, h, stringKind)
 		if installed {
 			return delta, nil
 		}
@@ -125,12 +125,12 @@ func (s *Store) readInt(off uint64) (int64, error) {
 // writer already holds the key (so the caller should switch to an update), and both
 // false only when the arena is full. It mirrors publish's bucket scan but never
 // overwrites an existing key's value.
-func (s *Store) insertAbsent(key, val []byte, h uint64) (installed, existed bool) {
+func (s *Store) insertAbsent(key, val []byte, h uint64, kind byte) (installed, existed bool) {
 	off, ok := s.alloc(recSize(len(key), len(val)))
 	if !ok {
 		return false, false
 	}
-	s.initRecord(off, key, val)
+	s.initRecord(off, key, val, kind)
 	tag := tagOf(h)
 	newWord := tag<<tagShift | off
 	for {
@@ -150,7 +150,7 @@ func (s *Store) insertAbsent(key, val []byte, h uint64) (installed, existed bool
 				if w>>tagShift != tag {
 					continue
 				}
-				if s.recordMatches(w&addrMask, key) {
+				if s.recordMatches(w&addrMask, key, kind) {
 					return false, true // key already present
 				}
 			}

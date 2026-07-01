@@ -88,7 +88,8 @@ const (
 	//   [4:8)   vlen  uint32  current value length (<=64 KiB), read under the seqlock
 	//   [8:10)  klen  uint16  key length, immutable
 	//   [10:12) vcap  uint16  reserved value capacity in 8-byte words, immutable
-	//   [12:16) pad
+	//   [12:13) kind  uint8   record kind (the spec's type_tag), immutable
+	//   [13:16) pad
 	//   [16:16+klen)              key bytes, immutable
 	//   [16+align8(klen): +vcap*8) value bytes, rewritten in place under the seqlock
 	hdrSize = 16
@@ -96,8 +97,16 @@ const (
 	offVlen = 4
 	offKlen = 8
 	offVcap = 10
+	offKind = 12
 
 	verLockBit = 1 // low bit of ver: a writer is mid-update
+
+	// stringKind is the record kind for the plain string keyspace. It is zero so a
+	// zero-initialized arena and the existing string hot path need no change: Get,
+	// Set, Delete, and Incr all operate on this kind. Collection element rows use
+	// distinct non-zero kinds (GetKind/PutKind/DeleteKind in coll.go), which keeps a
+	// composite element key from ever matching a string key of the same bytes.
+	stringKind = 0
 
 	bucketSize = 64 // bytes; must equal unsafe.Sizeof(bucket{})
 )
@@ -234,10 +243,15 @@ func (s *Store) vcapBytes(off uint64) uint64 {
 	return uint64(binary.LittleEndian.Uint16(s.arena[off+offVcap:])) * 8
 }
 
-// recordMatches reports whether the record at off carries this key. It reads only
-// immutable fields (key length and the key bytes), so it is safe to call on any live
-// record concurrently with writers to that record's value.
-func (s *Store) recordMatches(off uint64, key []byte) bool {
+// recordMatches reports whether the record at off carries this key in the given kind
+// namespace. It reads only immutable fields (the kind byte, key length, and the key
+// bytes), so it is safe to call on any live record concurrently with writers to that
+// record's value. The kind byte is a cheap one-byte reject checked before the key
+// bytes, so a probe never confuses a string record with a same-key collection row.
+func (s *Store) recordMatches(off uint64, key []byte, kind byte) bool {
+	if s.arena[off+offKind] != kind {
+		return false
+	}
 	if s.klen(off) != uint64(len(key)) {
 		return false
 	}
@@ -278,7 +292,7 @@ func (s *Store) nextBucket(b *bucket, create bool) *bucket {
 // record offset and the entry that points at it (bucket plus slot plus the observed
 // word) so Delete and the replace path can CAS that exact entry. The probe rejects a
 // slot on tag mismatch before touching the arena and verifies the key on a tag hit.
-func (s *Store) find(key []byte, h uint64) (off uint64, b *bucket, slot int, word uint64, found bool) {
+func (s *Store) find(key []byte, h uint64, kind byte) (off uint64, b *bucket, slot int, word uint64, found bool) {
 	tag := tagOf(h)
 	b = &s.buckets[h&s.mask]
 	for b != nil {
@@ -288,7 +302,7 @@ func (s *Store) find(key []byte, h uint64) (off uint64, b *bucket, slot int, wor
 				continue
 			}
 			a := w & addrMask
-			if s.recordMatches(a, key) {
+			if s.recordMatches(a, key, kind) {
 				return a, b, i, w, true
 			}
 		}
@@ -304,7 +318,7 @@ func (s *Store) find(key []byte, h uint64) (off uint64, b *bucket, slot int, wor
 // a reader of a different key.
 func (s *Store) Get(key, dst []byte) ([]byte, bool) {
 	h := hash(key)
-	off, _, _, _, found := s.find(key, h)
+	off, _, _, _, found := s.find(key, h, stringKind)
 	if !found {
 		return dst[:0], false
 	}
@@ -344,11 +358,11 @@ func (s *Store) Set(key, val []byte) error {
 		return ErrTooBig
 	}
 	h := hash(key)
-	if off, _, _, _, found := s.find(key, h); found && uint64(len(val)) <= s.vcapBytes(off) {
+	if off, _, _, _, found := s.find(key, h, stringKind); found && uint64(len(val)) <= s.vcapBytes(off) {
 		s.inPlace(off, val)
 		return nil
 	}
-	return s.publish(key, val, h)
+	return s.publish(key, val, h, stringKind)
 }
 
 // inPlace rewrites a record's value under its seqlock. The latch is the low bit of
@@ -377,11 +391,15 @@ func (s *Store) inPlace(off uint64, val []byte) {
 // private until publish CAS-installs its address into an index entry; that release
 // pairs with the acquire a reader does when it loads the entry, so the bytes are
 // visible and the plain writes are race-detector clean.
-func (s *Store) initRecord(off uint64, key, val []byte) {
+func (s *Store) initRecord(off uint64, key, val []byte, kind byte) {
 	binary.LittleEndian.PutUint32(s.arena[off+offVer:], 0)
 	binary.LittleEndian.PutUint32(s.arena[off+offVlen:], uint32(len(val)))
 	binary.LittleEndian.PutUint16(s.arena[off+offKlen:], uint16(len(key)))
 	binary.LittleEndian.PutUint16(s.arena[off+offVcap:], uint16(align8(uint64(len(val)))/8))
+	// The kind byte is written explicitly rather than left to the zero-init arena,
+	// because Reset rewinds the tail without scrubbing bytes, so a reused offset may
+	// still hold a prior record's kind.
+	s.arena[off+offKind] = kind
 	copy(s.arena[off+hdrSize:], key)
 	copy(s.arena[off+hdrSize+align8(uint64(len(key))):], val)
 }
@@ -393,12 +411,12 @@ func (s *Store) initRecord(off uint64, key, val []byte) {
 // new key, count up); otherwise grow the chain with an overflow bucket and rescan. A
 // lost CAS just restarts the scan. The one allocated record is reused across
 // restarts, and is harmlessly abandoned only when another writer published the key.
-func (s *Store) publish(key, val []byte, h uint64) error {
+func (s *Store) publish(key, val []byte, h uint64, kind byte) error {
 	off, ok := s.alloc(recSize(len(key), len(val)))
 	if !ok {
 		return ErrFull
 	}
-	s.initRecord(off, key, val)
+	s.initRecord(off, key, val, kind)
 	tag := tagOf(h)
 	newWord := tag<<tagShift | off
 
@@ -421,7 +439,7 @@ outer:
 					continue
 				}
 				a := w & addrMask
-				if s.recordMatches(a, key) {
+				if s.recordMatches(a, key, kind) {
 					// Another writer published this key first. Last writer wins: update
 					// their record in place if our value fits, else swap the entry to ours.
 					if uint64(len(val)) <= s.vcapBytes(a) {
@@ -460,7 +478,7 @@ outer:
 func (s *Store) Delete(key []byte) bool {
 	h := hash(key)
 	for {
-		_, b, slot, word, found := s.find(key, h)
+		_, b, slot, word, found := s.find(key, h, stringKind)
 		if !found {
 			return false
 		}

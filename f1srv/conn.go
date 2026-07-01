@@ -18,6 +18,7 @@ type connState struct {
 	rbuf []byte
 	argv [][]byte
 	vbuf []byte   // reused destination for GET/MGET value copies
+	kbuf []byte   // reused scratch for building composite collection element keys
 	num  [24]byte // scratch for formatting integer replies
 }
 
