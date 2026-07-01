@@ -100,10 +100,17 @@ func xgroupSubErr(verbatimSub string) string {
 // streamErrEntriesRead is the fixed reply for an ENTRIESREAD value below -1.
 const streamErrEntriesRead = "ERR value for ENTRIESREAD must be positive or -1"
 
+// streamEntriesReadInvalid marks a group whose entries-read counter is unknown: a group created
+// without ENTRIESREAD, one whose id was moved by SETID without a fresh count, or one whose read
+// position lands in a spot the delivery path could not reconcile. XINFO shows it as a null and the
+// lag falls back to an estimate. It is stored as the max u64 in the group row, a value no real
+// counter reaches.
+const streamEntriesReadInvalid = ^uint64(0)
+
 // parseEntriesRead reads an ENTRIESREAD value. Redis accepts any integer >= -1 (with -1 meaning the
 // count is unknown), rejects a smaller value with a fixed message, and rejects a non-integer with the
-// generic not-an-integer message. It returns the value clamped to a non-negative counter (unknown -1
-// becomes 0, which is all this slice records) and whether it was set.
+// generic not-an-integer message. It returns the counter to store (the unknown -1 becomes the invalid
+// sentinel) and whether it was set.
 func parseEntriesRead(raw []byte) (uint64, string, bool) {
 	v, err := strconv.ParseInt(string(raw), 10, 64)
 	if err != nil {
@@ -113,7 +120,7 @@ func parseEntriesRead(raw []byte) (uint64, string, bool) {
 		return 0, streamErrEntriesRead, false
 	}
 	if v < 0 {
-		return 0, "", true
+		return streamEntriesReadInvalid, "", true
 	}
 	return uint64(v), "", true
 }
@@ -360,7 +367,8 @@ func (c *connState) xgroupCreate(argv [][]byte) {
 	groupName := string(argv[3])
 	rawID := string(argv[4])
 	mkStream := false
-	var entriesRead uint64
+	// A group created without ENTRIESREAD has an unknown read count until a > delivery reconciles it.
+	entriesRead := uint64(streamEntriesReadInvalid)
 	for i := 5; i < len(argv); {
 		switch strings.ToUpper(string(argv[i])) {
 		case "MKSTREAM":
@@ -488,8 +496,13 @@ func (c *connState) xgroupSetID(argv [][]byte) {
 		id = pid
 	}
 	g.lastID = id
+	// SETID moves the read cursor. With an explicit ENTRIESREAD it stores that count; without one it
+	// invalidates the counter, since the old count no longer matches the new position (matching Redis,
+	// where XINFO then shows a null entries-read and the lag falls back to an estimate).
 	if setEntriesRead {
 		g.entriesRead = entriesRead
+	} else {
+		g.entriesRead = streamEntriesReadInvalid
 	}
 	if err := c.putStreamGroup(skey, groupName, g); err != nil {
 		mu.Unlock()
@@ -1629,24 +1642,74 @@ func (c *connState) deliverNew(skey []byte, group, consumer string, g *streamGro
 	if len(w) == 0 {
 		return nil, nil
 	}
+	// Snapshot the stream facts and the pre-delivery read position for the entries-read reconciliation
+	// below, before the loop advances g.lastID.
+	length, lastGenID, maxDel, entriesAdded, _ := c.streamHeader(skey)
+	firstID, _ := c.streamFirstEntryID(skey, length)
+	preRead := g.lastID
 	rows := make([]rgRow, 0, len(w))
+	// A > delivery whose cursor was rewound (XGROUP SETID) can revisit ids that are already pending. Redis
+	// treats that as a reassignment: the group PEL keeps one entry per id, the id moves to the new consumer,
+	// and the previous owner loses it. Track how many rows are genuinely new (groupAdded) versus reassigned
+	// so the group and consumer pending counters stay in step with the actual PEL rows.
+	var groupAdded, conAdded uint64
+	var otherDrain map[string]uint64
 	for _, ek := range w {
 		id := decodeEntryID(ek)
 		g.lastID = id
-		g.entriesRead++
 		rows = append(rows, rgRow{id: id, fields: c.readEntryFields(ek)})
-		if !noAck {
-			if err := c.putStreamPEL(skey, group, id, streamPELEntry{consumer: consumer, deliveryTime: now, deliveryCount: 1}); err != nil {
-				return nil, err
-			}
+		if noAck {
+			continue
 		}
+		prev, existed := c.getStreamPEL(skey, group, id)
+		if err := c.putStreamPEL(skey, group, id, streamPELEntry{consumer: consumer, deliveryTime: now, deliveryCount: 1}); err != nil {
+			return nil, err
+		}
+		switch {
+		case !existed:
+			groupAdded++
+			conAdded++
+		case prev.consumer != consumer:
+			conAdded++
+			if otherDrain == nil {
+				otherDrain = make(map[string]uint64)
+			}
+			otherDrain[prev.consumer]++
+		}
+	}
+	// Debit each previous owner for the ids that moved to the delivering consumer.
+	for name, n := range otherDrain {
+		other, ok := c.getStreamConsumer(skey, group, name)
+		if !ok {
+			continue
+		}
+		if other.pending >= n {
+			other.pending -= n
+		} else {
+			other.pending = 0
+		}
+		if err := c.putStreamConsumer(skey, group, name, other); err != nil {
+			return nil, err
+		}
+	}
+	// Advance the entries-read counter. A live counter simply adds what was delivered. An unknown one
+	// is recovered when the pre-read position can be estimated (base plus delivered) or, failing that,
+	// when the new position lands on an estimable spot (the absolute estimate there). It stays unknown
+	// when neither position is estimable, matching Redis's lazy reconciliation.
+	delivered := uint64(len(w))
+	if g.entriesRead != streamEntriesReadInvalid {
+		g.entriesRead += delivered
+	} else if base, ok := streamEstimateEntriesRead(preRead, firstID, lastGenID, maxDel, length, entriesAdded); ok {
+		g.entriesRead = base + delivered
+	} else if est, ok := streamEstimateEntriesRead(g.lastID, firstID, lastGenID, maxDel, length, entriesAdded); ok {
+		g.entriesRead = est
 	}
 	con, _ := c.getStreamConsumer(skey, group, consumer)
 	con.seenTime = now
 	con.activeTime = now
 	if !noAck {
-		g.pending += uint64(len(w))
-		con.pending += uint64(len(w))
+		g.pending += groupAdded
+		con.pending += conAdded
 	}
 	if err := c.putStreamConsumer(skey, group, consumer, con); err != nil {
 		return nil, err
