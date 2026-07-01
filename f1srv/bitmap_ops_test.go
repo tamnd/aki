@@ -8,9 +8,9 @@ func TestBitopFold(t *testing.T) {
 	rw, cleanup := dialTestServer(t)
 	defer cleanup()
 
-	cmd(t, rw, "SET", "a", "abc")   // 0x61 0x62 0x63
+	cmd(t, rw, "SET", "a", "abc") // 0x61 0x62 0x63
 	expect(t, rw, "+OK")
-	cmd(t, rw, "SET", "b", "abd")   // 0x61 0x62 0x64
+	cmd(t, rw, "SET", "b", "abd") // 0x61 0x62 0x64
 	expect(t, rw, "+OK")
 
 	// AND of "abc" and "abd": 0x61 & 0x61, 0x62 & 0x62, 0x63 & 0x64 = 0x61 0x62 0x60.

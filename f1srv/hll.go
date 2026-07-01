@@ -16,14 +16,14 @@ import (
 // same-version Redis or Valkey, and PFCOUNT returns the same integer they return.
 
 const (
-	hllP        = 14
-	hllQ        = 64 - hllP           // 50: bits left after removing the register index.
-	hllRegisters = 1 << hllP          // 16384 registers.
-	hllPMask    = hllRegisters - 1    // mask to extract the register index from a hash.
-	hllBits     = 6                   // bits per dense register.
+	hllP           = 14
+	hllQ           = 64 - hllP          // 50: bits left after removing the register index.
+	hllRegisters   = 1 << hllP          // 16384 registers.
+	hllPMask       = hllRegisters - 1   // mask to extract the register index from a hash.
+	hllBits        = 6                  // bits per dense register.
 	hllRegisterMax = (1 << hllBits) - 1 // 63: largest value a register holds.
-	hllHdrSize  = 16
-	hllDenseSize = hllHdrSize + (hllRegisters*hllBits+7)/8 // 12304 bytes for a dense HLL.
+	hllHdrSize     = 16
+	hllDenseSize   = hllHdrSize + (hllRegisters*hllBits+7)/8 // 12304 bytes for a dense HLL.
 
 	hllDense       = 0
 	hllSparse      = 1
@@ -118,10 +118,10 @@ func sparseIsZero(b byte) bool  { return b&0xc0 == 0 }
 func sparseIsXzero(b byte) bool { return b&0xc0 == hllSparseXzeroBit }
 func sparseIsVal(b byte) bool   { return b&hllSparseValBit != 0 }
 
-func sparseZeroLen(b byte) int          { return int(b&0x3f) + 1 }
-func sparseXzeroLen(b0, b1 byte) int    { return (int(b0&0x3f)<<8 | int(b1)) + 1 }
-func sparseValValue(b byte) uint8       { return (b>>2)&0x1f + 1 }
-func sparseValLen(b byte) int           { return int(b&0x3) + 1 }
+func sparseZeroLen(b byte) int       { return int(b&0x3f) + 1 }
+func sparseXzeroLen(b0, b1 byte) int { return (int(b0&0x3f)<<8 | int(b1)) + 1 }
+func sparseValValue(b byte) uint8    { return (b>>2)&0x1f + 1 }
+func sparseValLen(b byte) int        { return int(b&0x3) + 1 }
 
 func sparseValByte(val uint8, l int) byte {
 	return byte(((int(val)-1)<<2 | (l - 1)) | hllSparseValBit)
