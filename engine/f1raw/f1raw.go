@@ -135,6 +135,16 @@ type Store struct {
 	tail    atomic.Uint64 // next free arena offset; starts at 8 so a real addr is never 0
 	count   atomic.Int64
 
+	// topCount tracks the live top-level keys, the subset of records whose kind topKind
+	// admits: a plain string record and a collection header row, not element rows, expire
+	// sidecars, or stream PEL rows. It is maintained at exactly the points count is, so it
+	// stays consistent with the index, and it is what DBSIZE reads without a scan. topKind
+	// is the server-supplied policy classifier, set once before serving through
+	// SetTopKindFunc; a nil topKind leaves topCount at zero and DBSIZE would report zero,
+	// so the server must set it at startup.
+	topKind  func(kind byte) bool
+	topCount atomic.Int64
+
 	// oidx is the ordered element index (oindex.go): the in-memory per-collection
 	// sorted run that lets a bounded cursor enumerate one collection's elements in key
 	// order. It is maintained explicitly by the collection element path (CollInsert /
@@ -207,8 +217,31 @@ func NewWithCold(indexBuckets, arenaBytes int, coldPath string, sepThreshold int
 // lab knob the benchmark sweeps (checklist section 4, the value-pointer rule in 03).
 const defaultSepThreshold = 512
 
-// Len reports the number of live keys.
+// Len reports the number of live records, which for a keyspace with collections is more than
+// the number of logical keys, since every element and sidecar row is a record. Use TopLen for
+// the logical key count.
 func (s *Store) Len() int { return int(s.count.Load()) }
+
+// SetTopKindFunc installs the classifier that decides which record kinds are top-level keys, the
+// same policy the server hands ScanKeys. Call it once at startup before serving traffic: the
+// classifier is read on every publish and delete without synchronization, so it must be set
+// before the first write. It also seeds nothing retroactively, so set it on an empty store.
+func (s *Store) SetTopKindFunc(f func(kind byte) bool) { s.topKind = f }
+
+// TopLen reports the number of live top-level keys, an O(1) read of the counter maintained
+// alongside the record count. It is what DBSIZE returns. A key whose TTL has passed but which
+// has not been reaped yet is still counted, matching Redis DBSIZE, which counts the dict entry
+// until lazy or active expiry removes it.
+func (s *Store) TopLen() int { return int(s.topCount.Load()) }
+
+// addTop adjusts the top-level key counter by d when kind names a top-level key. It is called at
+// every point count changes, with the same delta, so topCount tracks the top-level subset of the
+// record count exactly.
+func (s *Store) addTop(kind byte, d int64) {
+	if s.topKind != nil && s.topKind(kind) {
+		s.topCount.Add(d)
+	}
+}
 
 // BucketCount reports the number of primary index buckets, fixed at construction. RANDOMKEY
 // uses it to pick a random primary bucket to start a scan from, and it bounds the cursor space
@@ -534,6 +567,7 @@ outer:
 		if emptySlot >= 0 {
 			if emptyB.slots[emptySlot].CompareAndSwap(0, newWord) {
 				s.count.Add(1) // a genuinely new key
+				s.addTop(kind, 1)
 				return nil
 			}
 			continue // slot filled under us; rescan
@@ -560,6 +594,7 @@ func (s *Store) Delete(key []byte) bool {
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
 			s.count.Add(-1)
+			s.addTop(stringKind, -1)
 			return true
 		}
 	}

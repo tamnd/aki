@@ -160,6 +160,7 @@ func (s *Store) insertAbsent(key, val []byte, h uint64, kind byte) (installed, e
 		if emptySlot >= 0 {
 			if emptyB.slots[emptySlot].CompareAndSwap(0, newWord) {
 				s.count.Add(1)
+				s.addTop(kind, 1)
 				return true, false
 			}
 			continue // slot filled under us; rescan (may now find the key)
@@ -186,6 +187,7 @@ func (s *Store) Reset() {
 	}
 	s.tail.Store(8)
 	s.count.Store(0)
+	s.topCount.Store(0)
 	s.oidx = newOIndex(s)
 }
 

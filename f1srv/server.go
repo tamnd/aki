@@ -125,6 +125,12 @@ func New(cfg Config) *Server {
 	} else {
 		srv.store = f1raw.New(cfg.IndexBuckets, cfg.ArenaBytes)
 	}
+	if srv.store != nil {
+		// Teach the engine which record kinds are top-level keys so it can keep an O(1)
+		// live-key counter for DBSIZE, the same policy KEYS/SCAN/RANDOMKEY hand ScanKeys.
+		// Set before the server accepts traffic, on the still-empty store.
+		srv.store.SetTopKindFunc(isTopKind)
+	}
 	return srv
 }
 
