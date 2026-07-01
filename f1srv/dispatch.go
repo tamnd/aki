@@ -183,6 +183,12 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdLInsert(argv)
 	case eqFold(cmd, "LREM"):
 		c.cmdLRem(argv)
+	case eqFold(cmd, "LMOVE"):
+		c.cmdLMove(argv)
+	case eqFold(cmd, "RPOPLPUSH"):
+		c.cmdRPopLPush(argv)
+	case eqFold(cmd, "LMPOP"):
+		c.cmdLMPop(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
