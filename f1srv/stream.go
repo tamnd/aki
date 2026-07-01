@@ -62,9 +62,12 @@ const (
 	errStreamReadCount  = "ERR COUNT must be a positive integer"
 	errStreamTimeoutNeg = "ERR timeout is negative"
 	errStreamTimeoutInt = "ERR timeout is not an integer or out of range"
-	errStreamMaxLenArg  = "ERR invalid MAXLEN argument"
-	errStreamMinIDArg   = "ERR invalid MINID argument"
-	errStreamLimitZero  = "ERR The ~ prefix is not valid for MINID or MAXLEN when LIMIT is specified with value 0"
+	errStreamMaxLenArg  = "ERR The MAXLEN argument must be >= 0."
+	errStreamMinIDArg   = "ERR Invalid stream ID specified as stream command argument"
+	errStreamLimitNoApx = "ERR syntax error, LIMIT cannot be used without the special ~ option"
+	errStreamNoSuchKey  = "ERR no such key"
+	errStreamSetIDSmall = "ERR The ID specified in XSETID is smaller than the target stream top item"
+	errStreamNotInt     = "ERR value is not an integer or out of range"
 )
 
 // streamID is a 128-bit entry ID: a millisecond timestamp and a sequence that breaks ties within
@@ -322,17 +325,17 @@ func parseStreamTrim(args [][]byte) (streamTrimSpec, int, string) {
 	i++
 	if i < len(args) && strings.EqualFold(string(args[i]), "LIMIT") {
 		if !ts.approx {
-			return ts, 0, "ERR syntax error"
+			return ts, 0, errStreamLimitNoApx
 		}
 		if i+1 >= len(args) {
 			return ts, 0, "ERR syntax error"
 		}
+		// LIMIT count: any non-negative count is accepted, including 0. Redis and Valkey
+		// take 0 as "no cap on entries examined" rather than an error, and since the
+		// element-per-row store trims exactly the count is advisory anyway.
 		n, err := strconv.ParseInt(string(args[i+1]), 10, 64)
 		if err != nil || n < 0 {
 			return ts, 0, "ERR syntax error"
-		}
-		if n == 0 {
-			return ts, 0, errStreamLimitZero
 		}
 		ts.limit = uint64(n)
 		ts.hasLimit = true
@@ -346,6 +349,13 @@ func parseStreamTrim(args [][]byte) (streamTrimSpec, int, string) {
 // dropped row, so a trim touches only the rows it removes, never the whole log. The caller holds
 // the stripe lock and updates the header length by the returned count. max-deleted-id is not
 // advanced by a trim, matching Redis, since last-id already records the high-water mark.
+//
+// The '~' (approximate) flag is accepted but does not loosen the trim: f1raw stores every entry in
+// its own row rather than in radix-tree macro nodes, so there is no whole-node boundary to stop at,
+// and the honest cheapest trim is the exact one. This stays inside the approximate contract, which
+// permits keeping exactly the threshold, but a client that measures the removed count of a '~' trim
+// will see f1srv remove down to the threshold where a stock Redis keeps the trailing partial node.
+// The exact ('=', the default) forms are byte-identical to Redis and Valkey.
 func (c *connState) streamTrim(skey []byte, prefix []byte, length uint64, ts streamTrimSpec) uint64 {
 	var target uint64 // how many to drop
 	switch ts.kind {
@@ -779,4 +789,215 @@ func (c *connState) xreadStreams(rest [][]byte, count int) {
 			c.emitStreamEntry(ek)
 		}
 	}
+}
+
+// cmdXDel implements XDEL key id [id ...]. Each named entry is a point delete of its row: the
+// row leaves the entry family, the live length drops, and max-deleted-id advances to the highest
+// removed id so a later XADD with a reused id is still rejected. entries-added never moves, since
+// it counts lifetime adds, not the live count. An id that is not present is skipped and not
+// counted. A delete that empties the stream leaves the header in place: a stream persists at
+// length zero and only DEL clears it. The reply is the number of entries actually removed.
+func (c *connState) cmdXDel(argv [][]byte) {
+	if len(argv) < 3 {
+		c.writeErr("ERR wrong number of arguments for 'xdel' command")
+		return
+	}
+	skey := argv[1]
+	ids := make([]streamID, 0, len(argv)-2)
+	for _, raw := range argv[2:] {
+		id, ok := parseStreamID(string(raw), 0)
+		if !ok {
+			c.writeErr(errStreamInvalidID)
+			return
+		}
+		ids = append(ids, id)
+	}
+
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.Lock()
+	if c.stringConflict(skey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	length, lastID, maxDel, entriesAdded, exists := c.streamHeader(skey)
+	if !exists {
+		mu.Unlock()
+		c.writeInt(0)
+		return
+	}
+	var deleted int64
+	for _, id := range ids {
+		ek := c.streamEntryKey(skey, id)
+		if !c.srv.store.ExistsKind(ek, kindStreamEntry) {
+			continue
+		}
+		c.srv.store.DeleteKind(ek, kindStreamEntry)
+		c.srv.store.CollRemove(ek)
+		deleted++
+		length--
+		if maxDel.less(id) {
+			maxDel = id
+		}
+	}
+	if deleted > 0 {
+		if err := c.streamPutHeader(skey, length, lastID, maxDel, entriesAdded); err != nil {
+			mu.Unlock()
+			c.writeErr("ERR " + err.Error())
+			return
+		}
+	}
+	mu.Unlock()
+	c.writeInt(deleted)
+}
+
+// cmdXTrim implements XTRIM key MAXLEN|MINID [=|~] threshold [LIMIT count]. It is the standalone
+// form of the trim XADD carries inline, so it reuses the same parse and the same front-drop, and
+// replies the number of entries removed. A trimmed-to-empty stream still exists.
+func (c *connState) cmdXTrim(argv [][]byte) {
+	if len(argv) < 4 {
+		c.writeErr("ERR wrong number of arguments for 'xtrim' command")
+		return
+	}
+	ts, n, errStr := parseStreamTrim(argv[2:])
+	if errStr != "" {
+		c.writeErr(errStr)
+		return
+	}
+	if 2+n != len(argv) {
+		c.writeErr("ERR syntax error")
+		return
+	}
+	skey := argv[1]
+
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.Lock()
+	if c.stringConflict(skey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	length, lastID, maxDel, entriesAdded, exists := c.streamHeader(skey)
+	if !exists {
+		mu.Unlock()
+		c.writeInt(0)
+		return
+	}
+	prefix := c.streamEntryPrefix(skey)
+	dropped := c.streamTrim(skey, prefix, length, ts)
+	if dropped > 0 {
+		length -= dropped
+		if err := c.streamPutHeader(skey, length, lastID, maxDel, entriesAdded); err != nil {
+			mu.Unlock()
+			c.writeErr("ERR " + err.Error())
+			return
+		}
+	}
+	mu.Unlock()
+	c.writeInt(int64(dropped))
+}
+
+// cmdXSetID implements XSETID key last-id [ENTRIESADDED n] [MAXDELETEDID id]. It rewrites the
+// stream's last-id (and optionally the entries-added and max-deleted-id counters) without touching
+// any entry row, so it is one header rewrite. The new last-id may not drop below the highest entry
+// actually present, since the entry family would then out-sort last-id and break XADD's
+// monotonicity guard; that highest id is read from the last entry row, not a materialize. XSETID on
+// a missing key is an error, not a create.
+func (c *connState) cmdXSetID(argv [][]byte) {
+	if len(argv) < 3 {
+		c.writeErr("ERR wrong number of arguments for 'xsetid' command")
+		return
+	}
+	skey := argv[1]
+	newLast, ok := parseStreamID(string(argv[2]), 0)
+	if !ok {
+		c.writeErr(errStreamInvalidID)
+		return
+	}
+	var (
+		setEntriesAdded bool
+		entriesAdded    uint64
+		setMaxDeleted   bool
+		maxDeleted      streamID
+	)
+	for i := 3; i < len(argv); {
+		switch strings.ToUpper(string(argv[i])) {
+		case "ENTRIESADDED":
+			if i+1 >= len(argv) {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			v, err := strconv.ParseInt(string(argv[i+1]), 10, 64)
+			if err != nil || v < 0 {
+				c.writeErr(errStreamNotInt)
+				return
+			}
+			entriesAdded = uint64(v)
+			setEntriesAdded = true
+			i += 2
+		case "MAXDELETEDID":
+			if i+1 >= len(argv) {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			id, okid := parseStreamID(string(argv[i+1]), 0)
+			if !okid {
+				c.writeErr(errStreamInvalidID)
+				return
+			}
+			maxDeleted = id
+			setMaxDeleted = true
+			i += 2
+		default:
+			c.writeErr("ERR syntax error")
+			return
+		}
+	}
+
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.Lock()
+	if c.stringConflict(skey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	length, lastID, maxDel, addedNow, exists := c.streamHeader(skey)
+	if !exists {
+		mu.Unlock()
+		c.writeErr(errStreamNoSuchKey)
+		return
+	}
+	if length > 0 {
+		if maxID, okid := c.streamMaxEntryID(skey, length); okid && newLast.less(maxID) {
+			mu.Unlock()
+			c.writeErr(errStreamSetIDSmall)
+			return
+		}
+	}
+	lastID = newLast
+	if setEntriesAdded {
+		addedNow = entriesAdded
+	}
+	if setMaxDeleted {
+		maxDel = maxDeleted
+	}
+	if err := c.streamPutHeader(skey, length, lastID, maxDel, addedNow); err != nil {
+		mu.Unlock()
+		c.writeErr("ERR " + err.Error())
+		return
+	}
+	mu.Unlock()
+	c.writeSimple("OK")
+}
+
+// streamMaxEntryID returns the highest entry id present, read straight from the last row of the
+// entry family by positional select. It is used to validate XSETID's new last-id without a
+// materialize.
+func (c *connState) streamMaxEntryID(skey []byte, length uint64) (streamID, bool) {
+	prefix := c.streamEntryPrefix(skey)
+	k, ok := c.srv.store.CollSelectAt(prefix, int(length)-1)
+	if !ok {
+		return streamID{}, false
+	}
+	return decodeEntryID(k), true
 }
