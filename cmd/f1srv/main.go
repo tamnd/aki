@@ -9,6 +9,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 
 	"github.com/tamnd/aki/f1srv"
@@ -32,6 +34,7 @@ func main() {
 	indexBuckets := fs.Int("index-buckets", 1<<22, "f1raw index buckets")
 	arenaBytes := fs.Int("arena-bytes", 2<<30, "f1raw arena size in bytes")
 	stripes := fs.Int("incr-stripes", 1<<10, "INCR-family RMW lock stripes")
+	pprofAddr := fs.String("pprof", "", "if set, serve net/http/pprof on this host:port (profiling only, off by default)")
 	// ExitOnError means a bad flag exits the process, so Parse never returns a
 	// non-nil error here. Blank-assign to satisfy errcheck without dead handling.
 	_ = fs.Parse(args)
@@ -40,6 +43,15 @@ func main() {
 	cfg.IndexBuckets = *indexBuckets
 	cfg.ArenaBytes = *arenaBytes
 	cfg.IncrStripes = *stripes
+
+	if *pprofAddr != "" {
+		go func() {
+			log.Printf("f1srv: pprof on http://%s/debug/pprof/", *pprofAddr)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				log.Printf("f1srv: pprof server: %v", err)
+			}
+		}()
+	}
 
 	srv := f1srv.New(cfg)
 	if err := srv.Listen(); err != nil {
