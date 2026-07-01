@@ -504,6 +504,7 @@ func (c *connState) cmdXAdd(argv [][]byte) {
 		return
 	}
 	mu.Unlock()
+	c.srv.signalStreamKey(skey) // wake any XREAD/XREADGROUP parked on this stream
 	c.writeBulk([]byte(id.String()))
 }
 
@@ -682,6 +683,9 @@ func parseRangeBound(arg string, defaultSeq uint64) (id streamID, exclusive, ok 
 func (c *connState) cmdXRead(argv [][]byte) {
 	i := 1
 	count := -1
+	block := false
+	var blockDur time.Duration
+	blockForever := false
 	for i < len(argv) {
 		switch strings.ToUpper(string(argv[i])) {
 		case "COUNT":
@@ -716,10 +720,13 @@ func (c *connState) cmdXRead(argv [][]byte) {
 				c.writeErr(errStreamTimeoutNeg)
 				return
 			}
+			block = true
+			blockForever = ms == 0
+			blockDur = time.Duration(ms) * time.Millisecond
 			i += 2
 		case "STREAMS":
 			i++
-			c.xreadStreams(argv[i:], count)
+			c.xreadStreams(argv[i:], count, block, blockDur, blockForever)
 			return
 		default:
 			c.writeErr("ERR syntax error")
@@ -731,8 +738,11 @@ func (c *connState) cmdXRead(argv [][]byte) {
 
 // xreadStreams reads the key-then-id half of the STREAMS clause and replies the entries after each
 // given id per stream. A '$' or '+' after-id resolves to the stream's current last id, so the read
-// returns nothing for a stream with no newer entries.
-func (c *connState) xreadStreams(rest [][]byte, count int) {
+// returns nothing for a stream with no newer entries. With BLOCK and nothing to serve, the client
+// parks on all named keys until an XADD wakes it or the timeout fires; the '$' after-id is resolved
+// exactly once, before the first serve pass, so a parked reader waits for entries added after the id
+// that was current when the command was issued, not after whatever the last id becomes later.
+func (c *connState) xreadStreams(rest [][]byte, count int, block bool, blockDur time.Duration, blockForever bool) {
 	if len(rest) == 0 || len(rest)%2 != 0 {
 		c.writeErr(errStreamUnbalanced)
 		return
@@ -760,21 +770,67 @@ func (c *connState) xreadStreams(rest [][]byte, count int) {
 		starts[j] = id
 	}
 
-	// Wrong-type guard for every named key before producing any reply.
-	for _, k := range keys {
-		if c.stringConflict(k) {
-			c.writeErr(wrongType)
+	var w *listWaiter
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+		if w != nil {
+			c.srv.removeWaiter(w, keys)
+		}
+	}()
+	for {
+		// Wrong-type guard for every named key before producing any reply, rechecked each pass so a
+		// key that becomes a string while the reader is parked is caught on wake.
+		for _, k := range keys {
+			if c.stringConflict(k) {
+				c.writeErr(wrongType)
+				return
+			}
+		}
+		if c.xreadServe(keys, starts, count) {
+			return
+		}
+		// Nothing to serve. Without BLOCK, or under the reactor where the connection cannot park,
+		// reply as a non-blocking read does, a null array.
+		if !block || !c.blockable {
+			c.writeNilArray()
+			return
+		}
+		if w == nil {
+			w = &listWaiter{ch: make(chan struct{}, 1)}
+			c.srv.addWaiter(w, keys)
+			continue // recheck under the registration before parking, closing the add-then-park race
+		}
+		c.flushBeforeBlock()
+		if timer == nil && !blockForever {
+			timer = time.NewTimer(blockDur)
+		}
+		var timeout <-chan time.Time
+		if timer != nil {
+			timeout = timer.C
+		}
+		select {
+		case <-w.ch:
+			// Woken by an XADD: loop back and rescan the streams from the resolved start ids.
+		case <-timeout:
+			c.writeNilArray()
 			return
 		}
 	}
+}
 
-	// Gather each stream's window; a stream that produced no entries is omitted from the reply.
+// xreadServe runs one XREAD gather pass: it collects each stream's window strictly after its start id
+// and, if any stream produced entries, writes the full reply and reports true. When no stream had a
+// newer entry it writes nothing and reports false, leaving the caller to park or reply null.
+func (c *connState) xreadServe(keys [][]byte, starts []streamID, count int) bool {
 	type result struct {
 		key     []byte
 		entries [][]byte
 	}
 	var results []result
-	for j := 0; j < n; j++ {
+	for j := 0; j < len(keys); j++ {
 		w := c.streamWindow(keys[j], starts[j], true, maxStreamID, false, count, false)
 		if len(w) == 0 {
 			continue
@@ -787,8 +843,7 @@ func (c *connState) xreadStreams(rest [][]byte, count int) {
 	}
 
 	if len(results) == 0 {
-		c.writeNilArray()
-		return
+		return false
 	}
 	c.writeArrayHeader(len(results))
 	for _, r := range results {
@@ -799,6 +854,7 @@ func (c *connState) xreadStreams(rest [][]byte, count int) {
 			c.emitStreamEntry(ek)
 		}
 	}
+	return true
 }
 
 // cmdXDel implements XDEL key id [id ...]. Each named entry is a point delete of its row: the
