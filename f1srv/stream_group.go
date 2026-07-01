@@ -998,6 +998,417 @@ func (c *connState) xpendingExtended(skey []byte, group string, minIdle int64, s
 	}
 }
 
+// --- XCLAIM / XAUTOCLAIM ---
+
+// claimRow is one claimed entry gathered for an XCLAIM or XAUTOCLAIM reply: its id and, for the
+// non-JUSTID form, the field/value list read from the entry log.
+type claimRow struct {
+	id     streamID
+	fields [][]byte
+}
+
+// claimCtx batches the row rewrites a claim run makes. Claiming moves a pending entry between
+// consumers, so each run touches the group control row and a handful of consumer rows; loading each
+// consumer once and flushing at the end keeps a multi-id claim from rewriting the same consumer row
+// repeatedly. The PEL rows themselves are written as they are claimed, since each is touched once.
+type claimCtx struct {
+	c         *connState
+	skey      []byte
+	group     string
+	consumers map[string]*streamConsumer
+	g         *streamGroup
+	gDirty    bool
+}
+
+func (c *connState) newClaimCtx(skey []byte, group string, g *streamGroup) *claimCtx {
+	return &claimCtx{c: c, skey: skey, group: group, consumers: map[string]*streamConsumer{}, g: g}
+}
+
+// consumer returns the named consumer's row, loading it once and creating a fresh image if it does
+// not exist yet, so the claim target is created on first claim the way Redis creates it.
+func (cc *claimCtx) consumer(name string) *streamConsumer {
+	if con, ok := cc.consumers[name]; ok {
+		return con
+	}
+	cv, ok := cc.c.getStreamConsumer(cc.skey, cc.group, name)
+	if !ok {
+		cv = streamConsumer{}
+	}
+	cc.consumers[name] = &cv
+	return &cv
+}
+
+// flush writes back the group control row (if a delete changed its pending count) and every consumer
+// row the run touched, so the target consumer is created and the pending counters are persisted.
+func (cc *claimCtx) flush() error {
+	for name, con := range cc.consumers {
+		if err := cc.c.putStreamConsumer(cc.skey, cc.group, name, *con); err != nil {
+			return err
+		}
+	}
+	if cc.gDirty {
+		if err := cc.c.putStreamGroup(cc.skey, cc.group, *cc.g); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// claimOne applies a single claim decision for id and reports whether the entry was claimed and, if
+// not, whether it was a dead entry removed from the pending list. It is the shared core of XCLAIM and
+// XAUTOCLAIM: an entry gone from the log is dropped from the PEL (deleted), an entry too fresh for the
+// min-idle floor is left alone, a not-yet-pending entry is created only under force, and otherwise the
+// entry is reassigned to the target consumer with its delivery time and count updated. deliveryTime is
+// the wall time to stamp (a resolved IDLE/TIME option or now); retry is the delivery count to set, or
+// negative to mean "increment unless justid".
+func (cc *claimCtx) claimOne(id streamID, target *streamConsumer, targetName string, now, minIdle, deliveryTime int64, retry int64, force, justid bool) (claimed bool, pe streamPELEntry) {
+	c := cc.c
+	existing, has := c.getStreamPEL(cc.skey, cc.group, id)
+	entryExists := c.srv.store.ExistsKind(c.streamEntryKey(cc.skey, id), kindStreamEntry)
+
+	if !entryExists {
+		// The log entry is gone: an unacked id whose entry was trimmed or deleted. Drop the dead PEL
+		// row and decrement the group and owning-consumer pending counts. Nothing is claimed.
+		if has {
+			c.deleteStreamPEL(cc.skey, cc.group, id)
+			if cc.g.pending > 0 {
+				cc.g.pending--
+			}
+			cc.gDirty = true
+			if oc := cc.consumer(existing.consumer); oc.pending > 0 {
+				oc.pending--
+			}
+		}
+		return false, streamPELEntry{}
+	}
+
+	if has {
+		// An existing pending entry is claimable only once it has been idle at least min-idle-time,
+		// force or not: force decides the not-pending case, not the idle floor.
+		if now-existing.deliveryTime < minIdle {
+			return false, streamPELEntry{}
+		}
+		if existing.consumer != targetName {
+			if oc := cc.consumer(existing.consumer); oc.pending > 0 {
+				oc.pending--
+			}
+			target.pending++
+		}
+		existing.consumer = targetName
+		existing.deliveryTime = deliveryTime
+		if retry >= 0 {
+			existing.deliveryCount = uint64(retry)
+		} else if !justid {
+			existing.deliveryCount++
+		}
+		c.putStreamPEL(cc.skey, cc.group, id, existing)
+		return true, existing
+	}
+
+	if !force {
+		// Not pending and no force: XCLAIM leaves it untouched and omits it from the reply.
+		return false, streamPELEntry{}
+	}
+	// Force-create a pending row for an entry that exists in the log but was never delivered to this
+	// group. A fresh row starts at delivery count 1 (or the explicit retry count) and is not
+	// incremented further, matching Redis.
+	np := streamPELEntry{consumer: targetName, deliveryTime: deliveryTime, deliveryCount: 1}
+	if retry >= 0 {
+		np.deliveryCount = uint64(retry)
+	}
+	c.putStreamPEL(cc.skey, cc.group, id, np)
+	cc.g.pending++
+	cc.gDirty = true
+	target.pending++
+	return true, np
+}
+
+// cmdXClaim implements XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME ms] [RETRYCOUNT n] [FORCE] [JUSTID] [LASTID id].
+// It reassigns each named pending entry that has been idle at least min-idle-time to the target
+// consumer, resetting its idle clock and bumping its delivery count (unless JUSTID or RETRYCOUNT set
+// the count outright), so a stalled consumer's work can be handed off. FORCE claims an entry that
+// exists in the log but was never delivered to the group; an entry gone from the log is dropped from
+// the pending list and skipped. The reply is the claimed entries with fields, or just their ids under
+// JUSTID, in the order the ids were given.
+func (c *connState) cmdXClaim(argv [][]byte) {
+	if len(argv) < 6 {
+		c.writeErr("ERR wrong number of arguments for 'xclaim' command")
+		return
+	}
+	skey := argv[1]
+	groupName := string(argv[2])
+	consumerName := string(argv[3])
+	minIdle, err := strconv.ParseInt(string(argv[4]), 10, 64)
+	if err != nil {
+		c.writeErr("ERR Invalid min-idle-time argument for XCLAIM")
+		return
+	}
+
+	// Ids run from argv[5] up to the first token that does not parse as an id; the rest are options.
+	ids := make([]streamID, 0, len(argv)-5)
+	j := 5
+	for ; j < len(argv); j++ {
+		id, ok := parseStreamID(string(argv[j]), 0)
+		if !ok {
+			break
+		}
+		ids = append(ids, id)
+	}
+
+	now := nowMillis()
+	deliveryTime := now
+	retry := int64(-1)
+	force, justid, setLastID := false, false, false
+	var lastID streamID
+	for ; j < len(argv); j++ {
+		opt := strings.ToUpper(string(argv[j]))
+		more := j+1 < len(argv)
+		switch {
+		case opt == "FORCE":
+			force = true
+		case opt == "JUSTID":
+			justid = true
+		case opt == "IDLE" && more:
+			v, e := strconv.ParseInt(string(argv[j+1]), 10, 64)
+			if e != nil {
+				c.writeErr("ERR Invalid IDLE option argument for XCLAIM")
+				return
+			}
+			deliveryTime = now - v
+			j++
+		case opt == "TIME" && more:
+			v, e := strconv.ParseInt(string(argv[j+1]), 10, 64)
+			if e != nil {
+				c.writeErr("ERR Invalid TIME option argument for XCLAIM")
+				return
+			}
+			deliveryTime = v
+			j++
+		case opt == "RETRYCOUNT" && more:
+			v, e := strconv.ParseInt(string(argv[j+1]), 10, 64)
+			if e != nil {
+				c.writeErr("ERR Invalid RETRYCOUNT option argument for XCLAIM")
+				return
+			}
+			retry = v
+			j++
+		case opt == "LASTID" && more:
+			id, ok := parseStreamID(string(argv[j+1]), 0)
+			if !ok {
+				c.writeErr(errStreamInvalidID)
+				return
+			}
+			lastID = id
+			setLastID = true
+			j++
+		default:
+			c.writeErr("ERR Unrecognized XCLAIM option '" + string(argv[j]) + "'")
+			return
+		}
+	}
+
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.Lock()
+	if c.stringConflict(skey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	_, _, _, _, exists := c.streamHeader(skey)
+	if !exists {
+		mu.Unlock()
+		c.writeErr(streamPendingNoGroup(string(skey), groupName))
+		return
+	}
+	g, ok := c.getStreamGroup(skey, groupName)
+	if !ok {
+		mu.Unlock()
+		c.writeErr(streamPendingNoGroup(string(skey), groupName))
+		return
+	}
+
+	cc := c.newClaimCtx(skey, groupName, &g)
+	target := cc.consumer(consumerName)
+	target.seenTime = now
+	target.activeTime = now
+	var rows []claimRow
+	for _, id := range ids {
+		claimed, _ := cc.claimOne(id, target, consumerName, now, minIdle, deliveryTime, retry, force, justid)
+		if !claimed {
+			continue
+		}
+		row := claimRow{id: id}
+		if !justid {
+			row.fields = c.readEntryFields(c.streamEntryKey(skey, id))
+		}
+		rows = append(rows, row)
+	}
+	if setLastID && g.lastID.less(lastID) {
+		g.lastID = lastID
+		cc.gDirty = true
+	}
+	if err := cc.flush(); err != nil {
+		mu.Unlock()
+		c.writeErr("ERR " + err.Error())
+		return
+	}
+	mu.Unlock()
+
+	c.writeClaimRows(rows, justid)
+}
+
+// writeClaimRows writes the claimed-entry portion shared by XCLAIM and XAUTOCLAIM: a flat array of id
+// strings under JUSTID, otherwise an array of [id, field/value list] pairs like XRANGE.
+func (c *connState) writeClaimRows(rows []claimRow, justid bool) {
+	c.writeArrayHeader(len(rows))
+	for _, r := range rows {
+		if justid {
+			c.writeBulk([]byte(r.id.String()))
+			continue
+		}
+		c.writeArrayHeader(2)
+		c.writeBulk([]byte(r.id.String()))
+		c.writeArrayHeader(len(r.fields))
+		for _, f := range r.fields {
+			c.writeBulk(f)
+		}
+	}
+}
+
+// cmdXAutoClaim implements XAUTOCLAIM key group consumer min-idle-time start [COUNT n] [JUSTID]. It
+// walks the group's pending list from start in id order, claiming each entry idle at least
+// min-idle-time to the target consumer until it has claimed COUNT of them (default 100) or scanned
+// COUNT*10 candidates, and drops any entry whose log row is gone. The reply is the cursor to resume
+// from (0-0 when the pending list is exhausted), the claimed entries, and the ids that were dropped.
+func (c *connState) cmdXAutoClaim(argv [][]byte) {
+	if len(argv) < 6 {
+		c.writeErr("ERR wrong number of arguments for 'xautoclaim' command")
+		return
+	}
+	skey := argv[1]
+	groupName := string(argv[2])
+	consumerName := string(argv[3])
+	minIdle, err := strconv.ParseInt(string(argv[4]), 10, 64)
+	if err != nil {
+		c.writeErr("ERR Invalid min-idle-time argument for XAUTOCLAIM")
+		return
+	}
+	start, ok := parseStreamID(string(argv[5]), 0)
+	if !ok {
+		c.writeErr(errStreamInvalidID)
+		return
+	}
+	count := 100
+	justid := false
+	for j := 6; j < len(argv); j++ {
+		opt := strings.ToUpper(string(argv[j]))
+		if opt == "COUNT" && j+1 < len(argv) {
+			n, e := strconv.Atoi(string(argv[j+1]))
+			if e != nil || n < 1 {
+				c.writeErr("ERR COUNT must be > 0")
+				return
+			}
+			count = n
+			j++
+			continue
+		}
+		if opt == "JUSTID" {
+			justid = true
+			continue
+		}
+		c.writeErr("ERR syntax error")
+		return
+	}
+
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.Lock()
+	if c.stringConflict(skey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	_, _, _, _, exists := c.streamHeader(skey)
+	if !exists {
+		mu.Unlock()
+		c.writeErr(streamPendingNoGroup(string(skey), groupName))
+		return
+	}
+	g, ok := c.getStreamGroup(skey, groupName)
+	if !ok {
+		mu.Unlock()
+		c.writeErr(streamPendingNoGroup(string(skey), groupName))
+		return
+	}
+
+	now := nowMillis()
+	cc := c.newClaimCtx(skey, groupName, &g)
+	target := cc.consumer(consumerName)
+	target.seenTime = now
+	target.activeTime = now
+
+	// Seek to the start bound, which is inclusive: scan past the predecessor id so the start row is
+	// included, or from the pending-list front when start is 0-0 with no predecessor.
+	prefix := streamPELPrefix(skey, groupName)
+	var scanAfter []byte
+	if pred, ok := streamIDDec(start); ok {
+		scanAfter = streamPELKey(skey, groupName, pred)
+	}
+	attempts := count * 10
+	remaining := count
+	var rows []claimRow
+	var deleted []streamID
+	var cursor streamID // stays 0-0 when the pending list is exhausted
+	done := false
+	for !done {
+		pkeys, last := c.srv.store.CollScan(prefix, scanAfter, streamTrimBatch, nil)
+		if len(pkeys) == 0 {
+			break
+		}
+		for _, k := range pkeys {
+			id := decodeEntryID(k)
+			// Stop once the claim quota or the scan budget is spent; the current id is where a later
+			// call resumes.
+			if remaining <= 0 || attempts <= 0 {
+				cursor = id
+				done = true
+				break
+			}
+			attempts--
+			claimed, _ := cc.claimOne(id, target, consumerName, now, minIdle, now, -1, false, justid)
+			if claimed {
+				row := claimRow{id: id}
+				if !justid {
+					row.fields = c.readEntryFields(c.streamEntryKey(skey, id))
+				}
+				rows = append(rows, row)
+				remaining--
+				continue
+			}
+			// A dead entry claimOne dropped from the pending list goes in the deleted-id list and, like
+			// a claim, counts against the requested total; a too-fresh entry is simply passed over.
+			if !c.srv.store.ExistsKind(c.streamEntryKey(skey, id), kindStreamEntry) {
+				deleted = append(deleted, id)
+				remaining--
+			}
+		}
+		scanAfter = last
+	}
+	if err := cc.flush(); err != nil {
+		mu.Unlock()
+		c.writeErr("ERR " + err.Error())
+		return
+	}
+	mu.Unlock()
+
+	c.writeArrayHeader(3)
+	c.writeBulk([]byte(cursor.String()))
+	c.writeClaimRows(rows, justid)
+	c.writeArrayHeader(len(deleted))
+	for _, id := range deleted {
+		c.writeBulk([]byte(id.String()))
+	}
+}
+
 // --- XREADGROUP ---
 
 // rgRow is one row of an XREADGROUP reply: an entry with its fields, or a tombstone whose fields
