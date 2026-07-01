@@ -147,6 +147,12 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdZDiff(argv)
 	case eqFold(cmd, "ZINTERCARD"):
 		c.cmdZInterCard(argv)
+	case eqFold(cmd, "ZUNIONSTORE"):
+		c.cmdZUnionStore(argv)
+	case eqFold(cmd, "ZINTERSTORE"):
+		c.cmdZInterStore(argv)
+	case eqFold(cmd, "ZDIFFSTORE"):
+		c.cmdZDiffStore(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
