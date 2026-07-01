@@ -76,14 +76,14 @@ type geoHashBits struct {
 
 // geoHashArea is a decoded geohash cell: the longitude/latitude bounds of the box the bits name.
 type geoHashArea struct {
-	bits                   geoHashBits
-	lonMin, lonMax         float64
-	latMin, latMax         float64
+	bits           geoHashBits
+	lonMin, lonMax float64
+	latMin, latMax float64
 }
 
 // geoHashNeighbors holds the eight geohash boxes adjacent to a center box.
 type geoHashNeighbors struct {
-	north, east, west, south               geoHashBits
+	north, east, west, south                   geoHashBits
 	northEast, southEast, northWest, southWest geoHashBits
 }
 
