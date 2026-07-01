@@ -134,6 +134,108 @@ func TestOIndexRemoveAndRepublish(t *testing.T) {
 	}
 }
 
+// scanAllKV drains CollScanKV the way HGETALL/HVALS do and returns each composite key
+// paired with the value read straight from the offset the ordered index yielded, so a
+// test can assert the fused value-carrying walk agrees with the point path.
+func scanAllKV(s *Store, prefix []byte, batch int) (keys [][]byte, vals [][]byte) {
+	var after []byte
+	for {
+		ks, offs, last := s.CollScanKV(prefix, after, batch, make([][]byte, 0, batch), make([]uint64, 0, batch))
+		if len(ks) == 0 {
+			break
+		}
+		for i, k := range ks {
+			keys = append(keys, append([]byte{}, k...))
+			vals = append(vals, append([]byte{}, s.ReadValueAt(offs[i], nil)...))
+		}
+		if last == nil {
+			break
+		}
+		after = append([]byte{}, last...)
+	}
+	return keys, vals
+}
+
+// The value-carrying scan must return, for every member, the same value a point GetKind
+// returns, in key order, across batch boundaries.
+func TestOIndexScanKVMatchesPoint(t *testing.T) {
+	s := New(1<<16, 1<<20)
+	members := map[string]string{
+		"alpha": "one", "bravo": "two", "charlie": "three",
+		"delta": "four", "echo": "five", "foxtrot": "six",
+	}
+	for m, v := range members {
+		k := collKey("h", m)
+		if _, err := s.PutKind(k, []byte(v), kindTestField); err != nil {
+			t.Fatal(err)
+		}
+		s.CollInsert(k, kindTestField)
+	}
+	// Batch of 2 forces several resume boundaries over six members.
+	keys, vals := scanAllKV(s, collPrefix("h"), 2)
+	if len(keys) != len(members) {
+		t.Fatalf("got %d members, want %d", len(keys), len(members))
+	}
+	prev := ""
+	for i, k := range keys {
+		if ks := string(k); ks <= prev {
+			t.Fatalf("keys out of order at %d: %q then %q", i, prev, ks)
+		} else {
+			prev = ks
+		}
+		pv, ok := s.GetKind(k, nil, kindTestField)
+		if !ok {
+			t.Fatalf("point GetKind absent for %q", k)
+		}
+		if !bytes.Equal(vals[i], pv) {
+			t.Fatalf("member %q: scan value %q, point value %q", k, vals[i], pv)
+		}
+	}
+}
+
+// The staleness guard the fused path depends on: a value that outgrows its record is
+// republished at a new offset, and CollScanKV must read the fresh value from the node, not
+// the abandoned old record. Without PutKind refreshing the ordered node's offset on the
+// outgrow, ReadValueAt would return the stale value. This is the whole reason the offset
+// can be trusted as the value source.
+func TestOIndexScanKVRepublishFresh(t *testing.T) {
+	s := New(1<<16, 1<<20)
+	put := func(member, val string) {
+		k := collKey("h", member)
+		created, err := s.PutKind(k, []byte(val), kindTestField)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if created {
+			s.CollInsert(k, kindTestField)
+		}
+	}
+	put("a", "short-a")
+	put("b", "short-b")
+	put("c", "short-c")
+
+	// Outgrow b so PutKind republishes it at a new offset. created is false, so the server
+	// makes no new node; the fix is that PutKind refreshes the existing node to the new
+	// offset, which is what keeps the fused scan honest.
+	big := "b-value-far-too-long-to-fit-the-original-eight-byte-rounded-capacity-of-short-b"
+	put("b", big)
+
+	keys, vals := scanAllKV(s, collPrefix("h"), 8)
+	if len(keys) != 3 {
+		t.Fatalf("got %d members, want 3: %q", len(keys), keys)
+	}
+	got := map[string]string{}
+	for i, k := range keys {
+		got[string(k[len(collPrefix("h")):])] = string(vals[i])
+	}
+	if got["b"] != big {
+		t.Fatalf("b scanned as %q, want the republished value %q", got["b"], big)
+	}
+	if got["a"] != "short-a" || got["c"] != "short-c" {
+		t.Fatalf("a=%q c=%q, want short-a/short-c", got["a"], got["c"])
+	}
+}
+
 // A larger population must still come back fully sorted through the batched cursor, so
 // the skip list ordering and the prefix bound hold at a size that exercises multiple
 // levels and several batch boundaries.

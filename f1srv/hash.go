@@ -352,23 +352,49 @@ func (c *connState) streamHash(hkey []byte, wantField, wantValue bool) {
 	c.writeArrayHeader(int(count) * perRow)
 
 	prefix := c.hashPrefix(hkey)
+	plen := len(prefix)
 	var after []byte
-	scan := make([][]byte, 0, hashScanBatch)
+	scanK := make([][]byte, 0, hashScanBatch)
+
+	if !wantValue {
+		// HKEYS: field names only. The plain key scan needs no per-element value read, so
+		// it stays the one-lookup-per-field path it already was.
+		for {
+			keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scanK[:0])
+			if len(keys) == 0 {
+				break
+			}
+			for _, k := range keys {
+				c.writeBulk(k[plen:])
+			}
+			if last == nil {
+				break
+			}
+			after = last
+		}
+		mu.Unlock()
+		return
+	}
+
+	// HGETALL and HVALS carry the value alongside the key: CollScanKV returns each field's
+	// record offset from the ordered walk it already does, and ReadValueAt reads the value
+	// straight from that offset, so a field is one lookup, not the walk plus a GetKind
+	// re-resolve the split path paid. The offset is authoritative because PutKind refreshes
+	// the ordered index on an outgrow-republish, and the stripe lock this holds keeps a
+	// concurrent writer from moving a field mid-walk, so the value is never stale.
+	scanO := make([]uint64, 0, hashScanBatch)
 	for {
-		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
+		keys, offs, last := c.srv.store.CollScanKV(prefix, after, hashScanBatch, scanK[:0], scanO[:0])
 		if len(keys) == 0 {
 			break
 		}
-		for _, k := range keys {
-			field := k[len(prefix):]
+		for i, k := range keys {
 			if wantField {
-				c.writeBulk(field)
+				c.writeBulk(k[plen:])
 			}
-			if wantValue {
-				v, _ := c.srv.store.GetKind(k, c.vbuf, kindHashField)
-				c.vbuf = v
-				c.writeBulk(v)
-			}
+			v := c.srv.store.ReadValueAt(offs[i], c.vbuf)
+			c.vbuf = v
+			c.writeBulk(v)
 		}
 		if last == nil {
 			break
