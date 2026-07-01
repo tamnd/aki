@@ -361,6 +361,10 @@ func (l *reactorLoop) closeConn(rc *reactorConn) {
 	if rc.fd < 0 {
 		return
 	}
+	// Release any watches or open transaction this connection held, so the watch table's
+	// refcounts and the global watching gate do not leak past the closed connection, the
+	// same teardown the goroutine driver runs after loop returns.
+	rc.cs.discardTx()
 	_ = syscall.EpollCtl(l.epfd, syscall.EPOLL_CTL_DEL, rc.fd, nil)
 	_ = syscall.Close(rc.fd)
 	if rc.fd < len(l.conns) {

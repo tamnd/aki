@@ -85,7 +85,25 @@ type Server struct {
 	// under the key's stripe lock so the count stays exact.
 	volatile atomic.Int64
 
+	// watch is the optimistic-locking table behind WATCH/EXEC. watchVer holds a monotonic
+	// version per currently-watched key: WATCH snapshots it, a write to that key bumps it,
+	// and EXEC compares. watching is the hot-path gate, the count of live (connection, key)
+	// watches across all clients; when it is zero no key is watched, so the write path skips
+	// the version bump entirely after one atomic load, the same gate pattern volatile uses
+	// for TTLs. watchMu guards the map and the refcounts inside it.
+	watchMu   sync.Mutex
+	watchVer  map[string]*watchEntry
+	watching  atomic.Int64
+
 	wg sync.WaitGroup
+}
+
+// watchEntry is one watched key's version and how many connections currently watch it. The
+// entry lives only while refs > 0, so the table stays bounded to the keys under active
+// WATCH rather than every key ever written.
+type watchEntry struct {
+	ver  uint64
+	refs int
 }
 
 // New builds a server and its store. It does not listen yet; call ListenAndServe.
@@ -112,6 +130,7 @@ func New(cfg Config) *Server {
 		incrMask: uint32(stripes - 1),
 	}
 	srv.block.waiters = make(map[string][]*listWaiter)
+	srv.watchVer = make(map[string]*watchEntry)
 	// A cold path engages the larger-than-memory tier; opening the log can fail on a
 	// disk error, so defer that error to Listen and keep New's signature simple for the
 	// many in-memory callers and tests that never set ColdPath.
@@ -211,4 +230,7 @@ func (s *Server) serveConn(conn net.Conn) {
 		blockable: true, // a per-connection goroutine may park on a blocking command
 	}
 	c.loop()
+	// A client can disconnect mid-transaction or while holding watches; release both so the
+	// watch table's refcounts (and the global watching gate) do not leak past the connection.
+	c.discardTx()
 }
