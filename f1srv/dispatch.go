@@ -86,6 +86,10 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdHVals(argv)
 	case eqFold(cmd, "HSCAN"):
 		c.cmdHScan(argv)
+	case eqFold(cmd, "HINCRBY"):
+		c.cmdHIncrBy(argv)
+	case eqFold(cmd, "HRANDFIELD"):
+		c.cmdHRandField(argv)
 	case eqFold(cmd, "SADD"):
 		c.cmdSAdd(argv)
 	case eqFold(cmd, "SREM"):
