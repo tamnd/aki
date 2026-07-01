@@ -17,6 +17,8 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdGet(argv)
 	case eqFold(cmd, "SET"):
 		c.cmdSet(argv)
+	case eqFold(cmd, "GETEX"):
+		c.cmdGetEx(argv)
 	case eqFold(cmd, "INCR"):
 		c.cmdIncrBy(argv, 1, false)
 	case eqFold(cmd, "DECR"):
@@ -332,19 +334,304 @@ func (c *connState) cmdSet(argv [][]byte) {
 		c.writeErr("ERR wrong number of arguments for 'set' command")
 		return
 	}
-	// The EX/PX/EXAT/PXAT/KEEPTTL/GET options land in slice 2; this slice honors the
-	// bare SET plus the one TTL rule that is unconditional: a fresh SET replaces the
-	// value object, so it clears any existing TTL (spec 11 section 2.5). A plain bench
-	// SET sends no options and hits no TTL'd key, so the volatile gate keeps this path
-	// exactly the lock-free store.Set it was.
-	if err := c.srv.store.Set(argv[1], argv[2]); err != nil {
+	// Bare SET (no options) is the benchmark hot path and stays exactly the lock-free
+	// store.Set it always was. A fresh SET replaces the value object, so it clears any
+	// existing TTL (spec 11 section 2.5); the volatile gate keeps the clear off the path
+	// entirely when no key in the store carries a TTL.
+	if len(argv) == 3 {
+		if err := c.srv.store.Set(argv[1], argv[2]); err != nil {
+			c.writeErr("ERR " + err.Error())
+			return
+		}
+		if c.srv.volatile.Load() != 0 {
+			c.clearExpiry(argv[1])
+		}
+		c.writeSimple("OK")
+		return
+	}
+	c.cmdSetOptions(argv)
+}
+
+// set option flags parsed off SET's trailing arguments.
+const (
+	setNX      = 1 << iota // set only if the key does not exist
+	setXX                  // set only if the key already exists
+	setGet                 // return the old value (nil if absent), as GETSET does
+	setKeepTTL             // preserve the key's existing TTL instead of clearing it
+)
+
+// expiry time units for the EX/PX/EXAT/PXAT family, shared by SET and GETEX.
+const (
+	unitNone  = 0
+	unitEXsec = iota // EX: relative seconds
+	unitPXms         // PX: relative milliseconds
+	unitEXat         // EXAT: absolute unix seconds
+	unitPXat         // PXAT: absolute unix milliseconds
+)
+
+// cmdSetOptions is the full SET with NX/XX/GET and the EX/PX/EXAT/PXAT/KEEPTTL expiry
+// options (spec 11 section 2.5). It takes the key's stripe lock so the existence check, the
+// conditional write, and the TTL update are one atomic step against a concurrent writer.
+// The bare-SET fast path in cmdSet handles the no-option case without the lock.
+func (c *connState) cmdSetOptions(argv [][]byte) {
+	key, val := argv[1], argv[2]
+	var flags, unit int
+	var timeArg int64
+	for i := 3; i < len(argv); i++ {
+		opt := argv[i]
+		switch {
+		case eqFold(opt, "NX"):
+			if flags&setXX != 0 {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			flags |= setNX
+		case eqFold(opt, "XX"):
+			if flags&setNX != 0 {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			flags |= setXX
+		case eqFold(opt, "GET"):
+			flags |= setGet
+		case eqFold(opt, "KEEPTTL"):
+			if unit != unitNone {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			flags |= setKeepTTL
+		case eqFold(opt, "EX"), eqFold(opt, "PX"), eqFold(opt, "EXAT"), eqFold(opt, "PXAT"):
+			// Only one expiry option is allowed, and KEEPTTL is an expiry option too.
+			if unit != unitNone || flags&setKeepTTL != 0 {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			if i+1 >= len(argv) {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			n, err := atoi64(argv[i+1])
+			if err != nil {
+				c.writeErr("ERR value is not an integer or out of range")
+				return
+			}
+			i++
+			timeArg = n
+			switch {
+			case eqFold(opt, "EX"):
+				unit = unitEXsec
+			case eqFold(opt, "PX"):
+				unit = unitPXms
+			case eqFold(opt, "EXAT"):
+				unit = unitEXat
+			default:
+				unit = unitPXat
+			}
+		default:
+			c.writeErr("ERR syntax error")
+			return
+		}
+	}
+
+	// Compute the absolute deadline before touching the key, so a bad expire time errors
+	// without having written anything.
+	var atMs int64
+	if unit != unitNone {
+		var ok bool
+		if atMs, ok = c.expiryDeadline(unit, timeArg); !ok {
+			c.writeErr("ERR invalid expire time in 'set' command")
+			return
+		}
+	}
+
+	mu := &c.srv.incrMu[c.srv.stripe(key)]
+	mu.Lock()
+	defer mu.Unlock()
+	// Reap an expired key under the lock so NX/XX and GET see it as absent.
+	if c.srv.volatile.Load() != 0 {
+		if at, ok := c.getExpiry(key); ok && at <= c.nowMs {
+			c.dropKeyLocked(key)
+		}
+	}
+	kt := c.resolveType(key)
+	// With GET, the old value must be a string; any other existing type is WRONGTYPE and
+	// nothing is written, exactly as Redis checks before applying NX/XX.
+	if flags&setGet != 0 && kt != keyMissing && kt != keyString {
+		c.writeErr(wrongType)
+		return
+	}
+	exists := kt != keyMissing
+
+	// Capture the old value for the GET reply before the write overwrites it.
+	var oldVal []byte
+	var haveOld bool
+	if flags&setGet != 0 && kt == keyString {
+		oldVal, haveOld = c.srv.store.Get(key, c.vbuf[:0])
+		c.vbuf = oldVal
+	}
+
+	// The NX/XX guard decides whether the write happens; GET still returns the old value.
+	if (flags&setNX != 0 && exists) || (flags&setXX != 0 && !exists) {
+		if flags&setGet != 0 {
+			c.replyOldValue(oldVal, haveOld)
+		} else {
+			c.writeNil()
+		}
+		return
+	}
+
+	if err := c.srv.store.Set(key, val); err != nil {
 		c.writeErr("ERR " + err.Error())
 		return
 	}
-	if c.srv.volatile.Load() != 0 {
-		c.clearExpiry(argv[1])
+	// Apply the TTL: an explicit expiry sets it (a past deadline is stored and reaped on the
+	// next touch), KEEPTTL leaves the existing expire row alone, and neither present clears it.
+	switch {
+	case unit != unitNone:
+		c.setExpiryLocked(key, atMs)
+	case flags&setKeepTTL == 0:
+		if c.srv.volatile.Load() != 0 {
+			c.clearExpiryLocked(key)
+		}
+	}
+
+	if flags&setGet != 0 {
+		c.replyOldValue(oldVal, haveOld)
+		return
 	}
 	c.writeSimple("OK")
+}
+
+// replyOldValue writes the SET/GETEX GET reply: the captured old string value, or a nil bulk
+// when the key was absent.
+func (c *connState) replyOldValue(oldVal []byte, haveOld bool) {
+	if haveOld {
+		c.writeBulk(oldVal)
+		return
+	}
+	c.writeNil()
+}
+
+// expiryDeadline folds an EX/PX/EXAT/PXAT (unit, value) pair into an absolute unix-ms
+// deadline, reporting false for a non-positive value or an overflow. The relative units add
+// the batch's cached now; the *AT units are absolute already. This is the shared time
+// arithmetic behind SET and GETEX, matching Redis's getExpireMillisecondsOrReply: the raw
+// argument must be strictly positive in every unit.
+func (c *connState) expiryDeadline(unit int, n int64) (int64, bool) {
+	if n <= 0 {
+		return 0, false
+	}
+	switch unit {
+	case unitEXsec:
+		ms, ok := secToMs(n)
+		if !ok {
+			return 0, false
+		}
+		return addOverflow(c.nowMs, ms)
+	case unitPXms:
+		return addOverflow(c.nowMs, n)
+	case unitEXat:
+		return secToMs(n)
+	default: // unitPXat
+		return n, true
+	}
+}
+
+// cmdGetEx implements GETEX: read a key's value and optionally change its TTL in the same
+// step (spec 11 section 2.5). With no option it is a pure read that leaves the TTL untouched;
+// EX/PX/EXAT/PXAT set a new expiry and PERSIST removes one. It never writes the value, so a
+// missing key is a nil reply and no key is created.
+func (c *connState) cmdGetEx(argv [][]byte) {
+	if len(argv) < 2 {
+		c.writeErr("ERR wrong number of arguments for 'getex' command")
+		return
+	}
+	key := argv[1]
+	var unit int
+	var timeArg int64
+	persist := false
+	for i := 2; i < len(argv); i++ {
+		opt := argv[i]
+		switch {
+		case eqFold(opt, "PERSIST"):
+			if unit != unitNone || persist {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			persist = true
+		case eqFold(opt, "EX"), eqFold(opt, "PX"), eqFold(opt, "EXAT"), eqFold(opt, "PXAT"):
+			if unit != unitNone || persist {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			if i+1 >= len(argv) {
+				c.writeErr("ERR syntax error")
+				return
+			}
+			n, err := atoi64(argv[i+1])
+			if err != nil {
+				c.writeErr("ERR value is not an integer or out of range")
+				return
+			}
+			i++
+			timeArg = n
+			switch {
+			case eqFold(opt, "EX"):
+				unit = unitEXsec
+			case eqFold(opt, "PX"):
+				unit = unitPXms
+			case eqFold(opt, "EXAT"):
+				unit = unitEXat
+			default:
+				unit = unitPXat
+			}
+		default:
+			c.writeErr("ERR syntax error")
+			return
+		}
+	}
+
+	var atMs int64
+	if unit != unitNone {
+		var ok bool
+		if atMs, ok = c.expiryDeadline(unit, timeArg); !ok {
+			c.writeErr("ERR invalid expire time in 'getex' command")
+			return
+		}
+	}
+
+	c.expireIfNeeded(key)
+	mu := &c.srv.incrMu[c.srv.stripe(key)]
+	mu.Lock()
+	defer mu.Unlock()
+	kt := c.resolveType(key)
+	if kt == keyMissing {
+		c.writeNil()
+		return
+	}
+	if kt != keyString {
+		c.writeErr(wrongType)
+		return
+	}
+	v, _ := c.srv.store.Get(key, c.vbuf[:0])
+	c.vbuf = v
+	// Apply the TTL change, if any, then reply with the value. A no-option GETEX leaves the
+	// expiry as it is.
+	switch {
+	case unit != unitNone:
+		if atMs <= c.nowMs {
+			// A past deadline deletes the key now, the same as SET/EXPIRE to the past. The
+			// value already captured above is still what GETEX returns.
+			c.dropKeyLocked(key)
+		} else {
+			c.setExpiryLocked(key, atMs)
+		}
+	case persist:
+		if c.srv.volatile.Load() != 0 {
+			c.clearExpiryLocked(key)
+		}
+	}
+	c.writeBulk(v)
 }
 
 func (c *connState) cmdIncrBy(argv [][]byte, fixed int64, hasArg bool) {

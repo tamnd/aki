@@ -181,3 +181,162 @@ func TestSetClearsTTL(t *testing.T) {
 	cmd(t, rw, "TTL", "s")
 	expect(t, rw, ":-1")
 }
+
+// TestSetOptions covers SET's EX/PX/EXAT/PXAT/KEEPTTL/NX/XX/GET options and their errors,
+// all pinned to Redis 8.8.
+func TestSetOptions(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	// The four expiry units set a real TTL that the readers see.
+	cmd(t, rw, "SET", "k", "v1", "EX", "100")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "TTL", "k")
+	expect(t, rw, ":100")
+	cmd(t, rw, "SET", "k", "v3", "EXAT", "9999999999")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "EXPIRETIME", "k")
+	expect(t, rw, ":9999999999")
+	cmd(t, rw, "SET", "k", "v4", "PXAT", "9999999999000")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "PEXPIRETIME", "k")
+	expect(t, rw, ":9999999999000")
+	// KEEPTTL preserves the deadline; a plain SET clears it.
+	cmd(t, rw, "SET", "k", "v5", "KEEPTTL")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "PEXPIRETIME", "k")
+	expect(t, rw, ":9999999999000")
+	cmd(t, rw, "SET", "k", "v6")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "TTL", "k")
+	expect(t, rw, ":-1")
+
+	// GET returns the old value, or nil when the key was absent.
+	cmd(t, rw, "SET", "gk", "old")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "SET", "gk", "new", "GET")
+	expect(t, rw, "$old")
+	cmd(t, rw, "GET", "gk")
+	expect(t, rw, "$new")
+	cmd(t, rw, "SET", "nope", "val", "GET")
+	expect(t, rw, "$-1")
+
+	// NX only on a missing key, XX only on an existing key.
+	cmd(t, rw, "SET", "n1", "v", "NX")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "SET", "n1", "v2", "NX")
+	expect(t, rw, "$-1")
+	cmd(t, rw, "GET", "n1")
+	expect(t, rw, "$v")
+	cmd(t, rw, "SET", "n1", "v3", "XX")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "SET", "x1", "v", "XX")
+	expect(t, rw, "$-1")
+
+	// NX GET on an existing key returns the old value and does not write.
+	cmd(t, rw, "SET", "gk2", "old")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "SET", "gk2", "new", "NX", "GET")
+	expect(t, rw, "$old")
+	cmd(t, rw, "GET", "gk2")
+	expect(t, rw, "$old")
+
+	// A past absolute deadline writes then reaps: the key is gone on the next read.
+	cmd(t, rw, "SET", "past", "v", "EXAT", "1")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "GET", "past")
+	expect(t, rw, "$-1")
+
+	// Error surface, byte-identical to Redis.
+	cmd(t, rw, "SET", "k", "v", "EX", "10", "PX", "10000")
+	expect(t, rw, "-ERR syntax error")
+	cmd(t, rw, "SET", "k", "v", "EX", "10", "KEEPTTL")
+	expect(t, rw, "-ERR syntax error")
+	cmd(t, rw, "SET", "k", "v", "NX", "XX")
+	expect(t, rw, "-ERR syntax error")
+	cmd(t, rw, "SET", "k", "v", "EX")
+	expect(t, rw, "-ERR syntax error")
+	cmd(t, rw, "SET", "k", "v", "EX", "abc")
+	expect(t, rw, "-ERR value is not an integer or out of range")
+	cmd(t, rw, "SET", "k", "v", "EX", "0")
+	expect(t, rw, "-ERR invalid expire time in 'set' command")
+	cmd(t, rw, "SET", "k", "v", "EX", "-5")
+	expect(t, rw, "-ERR invalid expire time in 'set' command")
+	cmd(t, rw, "SET", "k", "v", "FOO")
+	expect(t, rw, "-ERR syntax error")
+
+	// GET against a key holding a non-string is WRONGTYPE and writes nothing.
+	cmd(t, rw, "RPUSH", "lst", "a")
+	expect(t, rw, ":1")
+	cmd(t, rw, "SET", "lst", "v", "GET")
+	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
+}
+
+// TestGetEx covers GETEX's read-and-retTTL behavior, its options, and its errors, pinned to
+// Redis 8.8.
+func TestGetEx(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "SET", "g", "hello")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "EXPIRE", "g", "100")
+	expect(t, rw, ":1")
+	// A no-option GETEX returns the value and leaves the TTL alone.
+	cmd(t, rw, "GETEX", "g")
+	expect(t, rw, "$hello")
+	cmd(t, rw, "TTL", "g")
+	expect(t, rw, ":100")
+	// EX changes the TTL, PERSIST removes it.
+	cmd(t, rw, "GETEX", "g", "EX", "200")
+	expect(t, rw, "$hello")
+	cmd(t, rw, "TTL", "g")
+	expect(t, rw, ":200")
+	cmd(t, rw, "GETEX", "g", "PERSIST")
+	expect(t, rw, "$hello")
+	cmd(t, rw, "TTL", "g")
+	expect(t, rw, ":-1")
+	// EXAT sets an absolute deadline.
+	cmd(t, rw, "GETEX", "g", "EXAT", "9999999999")
+	expect(t, rw, "$hello")
+	cmd(t, rw, "EXPIRETIME", "g")
+	expect(t, rw, ":9999999999")
+
+	// A missing key is a nil reply, with or without an option, and no key is created.
+	cmd(t, rw, "GETEX", "missing")
+	expect(t, rw, "$-1")
+	cmd(t, rw, "GETEX", "missing", "EX", "100")
+	expect(t, rw, "$-1")
+	cmd(t, rw, "EXISTS", "missing")
+	expect(t, rw, ":0")
+
+	// A past deadline reads the value then deletes the key.
+	cmd(t, rw, "SET", "p", "bye")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "GETEX", "p", "EXAT", "1")
+	expect(t, rw, "$bye")
+	cmd(t, rw, "EXISTS", "p")
+	expect(t, rw, ":0")
+
+	// Error surface.
+	cmd(t, rw, "GETEX", "g", "EX", "10", "PERSIST")
+	expect(t, rw, "-ERR syntax error")
+	cmd(t, rw, "GETEX", "g", "EX", "10", "PX", "100")
+	expect(t, rw, "-ERR syntax error")
+	cmd(t, rw, "GETEX", "g", "EX")
+	expect(t, rw, "-ERR syntax error")
+	cmd(t, rw, "GETEX", "g", "EX", "0")
+	expect(t, rw, "-ERR invalid expire time in 'getex' command")
+	cmd(t, rw, "GETEX", "g", "EX", "-1")
+	expect(t, rw, "-ERR invalid expire time in 'getex' command")
+	cmd(t, rw, "GETEX", "g", "KEEPTTL")
+	expect(t, rw, "-ERR syntax error")
+	cmd(t, rw, "GETEX")
+	expect(t, rw, "-ERR wrong number of arguments for 'getex' command")
+
+	// GETEX on a non-string is WRONGTYPE.
+	cmd(t, rw, "RPUSH", "lst", "a")
+	expect(t, rw, ":1")
+	cmd(t, rw, "GETEX", "lst")
+	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
+}
