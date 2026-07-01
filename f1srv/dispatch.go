@@ -229,6 +229,14 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdXAutoClaim(argv)
 	case eqFold(cmd, "XINFO"):
 		c.cmdXInfo(argv)
+	case eqFold(cmd, "SETBIT"):
+		c.cmdSetBit(argv)
+	case eqFold(cmd, "GETBIT"):
+		c.cmdGetBit(argv)
+	case eqFold(cmd, "BITCOUNT"):
+		c.cmdBitCount(argv)
+	case eqFold(cmd, "BITPOS"):
+		c.cmdBitPos(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
