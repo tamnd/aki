@@ -73,6 +73,52 @@ func (c *connState) clearExpiry(key []byte) bool {
 	return removed
 }
 
+// reapExpiredKeys drops an expired key before its command's handler runs, so a typed read
+// such as HGET or ZSCORE sees an expired key as absent, matching Redis, where every key
+// lookup runs expireIfNeeded. It is gated on the volatile TTL counter, so a keyspace with
+// no TTL at all pays a single atomic load here and the per-command key resolution below
+// never runs, which is what keeps lazy expiry off the hot path.
+//
+// The primary key is argv[1] for the overwhelming majority of commands: every single-key
+// typed command, and the first key of the multi-key commands. The exceptions are the verbs
+// that name no key and the three subcommand-first commands (OBJECT, XINFO, XGROUP), whose
+// real key is argv[2]. Reaping the additional keys of a multi-key command (a second SINTER
+// source, a ZUNIONSTORE source, a second XREAD stream) is a later slice; this one closes
+// the single-key typed-command gap, which is the common case and the one the point-path
+// handlers (hash.go, set.go, zset.go, list.go, stream.go) miss because they read their
+// element rows directly without a type probe.
+func (c *connState) reapExpiredKeys(cmd []byte, argv [][]byte) {
+	if c.srv.volatile.Load() == 0 || len(argv) < 2 {
+		return
+	}
+	switch {
+	case eqFold(cmd, "OBJECT") || eqFold(cmd, "XINFO") || eqFold(cmd, "XGROUP"):
+		if len(argv) >= 3 {
+			c.expireIfNeeded(argv[2])
+		}
+	case noKeyCommand(cmd):
+		// Connection, server, and introspection verbs touch no keyspace, so there is
+		// nothing to reap and argv[1] is a message or subcommand, not a key.
+	default:
+		c.expireIfNeeded(argv[1])
+	}
+}
+
+// noKeyCommand reports whether a command names no key in argv[1], so the reap step leaves
+// its argument alone. These are the connection, server, and introspection verbs f1srv
+// answers without touching the keyspace.
+func noKeyCommand(cmd []byte) bool {
+	switch {
+	case eqFold(cmd, "PING"), eqFold(cmd, "ECHO"), eqFold(cmd, "COMMAND"),
+		eqFold(cmd, "INFO"), eqFold(cmd, "QUIT"), eqFold(cmd, "SELECT"),
+		eqFold(cmd, "CLIENT"), eqFold(cmd, "CONFIG"), eqFold(cmd, "RESET"),
+		eqFold(cmd, "DBSIZE"), eqFold(cmd, "FLUSHALL"), eqFold(cmd, "FLUSHDB"),
+		eqFold(cmd, "PFSELFTEST"):
+		return true
+	}
+	return false
+}
+
 // expireIfNeeded is the lazy-expiry check: if key carries an expiry that is at or before
 // the batch's cached now, it reaps the whole key (every row of whatever type it is) and
 // reports true, so the calling command treats the key as absent. It is gated on the
