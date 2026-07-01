@@ -55,7 +55,12 @@ func openColdLog(path string) (*coldLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &coldLog{f: f}, nil
+	c := &coldLog{f: f}
+	// Cold reads are random point lookups, so tell the kernel to disable readahead on
+	// the log up front. Otherwise each read prefetches a full readahead window that the
+	// per-read DONTNEED does not cover, and those pages accumulate under the memory cap.
+	c.adviseRandom()
+	return c, nil
 }
 
 // append reserves a region for val with one atomic add and pwrites it there. The
