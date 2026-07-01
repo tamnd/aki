@@ -3,6 +3,7 @@ package f1srv
 import (
 	"encoding/hex"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -195,9 +196,9 @@ func TestRestoreTTL(t *testing.T) {
 	}
 }
 
-// TestDumpMissingAndArgs covers DUMP's null reply for a missing key, its arity error, and the
-// current scope boundary: a collection type without its own slice yet is refused, while the types
-// that do have a slice (string, hash, set, zset, list) round-trip through their own tests.
+// TestDumpMissingAndArgs covers DUMP's null reply for a missing key and its arity error. Every
+// value type (string, hash, set, zset, list, stream) now has its own slice and round-trips through
+// its own test, so DUMP no longer refuses any live key.
 func TestDumpMissingAndArgs(t *testing.T) {
 	rw, cleanup := dialTestServer(t)
 	defer cleanup()
@@ -206,12 +207,6 @@ func TestDumpMissingAndArgs(t *testing.T) {
 	expect(t, rw, "$-1")
 	cmd(t, rw, "DUMP")
 	expect(t, rw, "-ERR wrong number of arguments for 'dump' command")
-
-	// A stream has no slice yet, so DUMP still refuses it.
-	cmd(t, rw, "XADD", "strm", "*", "f", "v")
-	drainReply(t, rw)
-	cmd(t, rw, "DUMP", "strm")
-	expect(t, rw, "-ERR DUMP of this type is not supported yet")
 }
 
 // TestDumpRestoreSetRoundTrip dumps a set and restores it under a fresh name, checking every member
@@ -538,5 +533,53 @@ func TestRestoreListCrossEngine(t *testing.T) {
 		expect(t, rw, "$item500")
 		cmd(t, rw, "LINDEX", key, "-1")
 		expect(t, rw, "$item500")
+	}
+}
+
+// TestDumpRestoreStreamRoundTrip dumps a stream and restores it under a fresh name, then checks the
+// entries, the consumer group, and its pending list all survive. The entries carry explicit IDs so
+// the master-ID delta and listpack item encoding round-trip exactly, and the group is left with a
+// consumer holding both entries pending so the global PEL, the consumer record, and the per-entry
+// delivery metadata all pass through the type-21 body.
+func TestDumpRestoreStreamRoundTrip(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "XADD", "src", "1-1", "f", "v")
+	expect(t, rw, "$1-1")
+	cmd(t, rw, "XADD", "src", "2-2", "a", "b", "c", "d")
+	expect(t, rw, "$2-2")
+	cmd(t, rw, "XGROUP", "CREATE", "src", "g1", "0")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "XREADGROUP", "GROUP", "g1", "c1", "COUNT", "10", "STREAMS", "src", ">")
+	drainReply(t, rw)
+
+	cmd(t, rw, "DUMP", "src")
+	reply := readReply(t, rw)
+	if len(reply) < 1 || reply[0] != '$' {
+		t.Fatalf("DUMP stream reply = %q, want a bulk", reply)
+	}
+	blob := reply[1:]
+
+	cmd(t, rw, "DEL", "dst")
+	drainReply(t, rw)
+	cmd(t, rw, "RESTORE", "dst", "0", blob)
+	expect(t, rw, "+OK")
+
+	cmd(t, rw, "XLEN", "dst")
+	expect(t, rw, ":2")
+	cmd(t, rw, "XRANGE", "dst", "-", "+")
+	if got := readReplyDeep(t, rw); got != "[[1-1 [f v]] [2-2 [a b c d]]]" {
+		t.Fatalf("XRANGE dst = %q", got)
+	}
+
+	// The group and its consumer survive, with both entries still pending under c1.
+	cmd(t, rw, "XINFO", "GROUPS", "dst")
+	if got := readReplyDeep(t, rw); !strings.Contains(got, "g1") || !strings.Contains(got, "pending 2") {
+		t.Fatalf("XINFO GROUPS dst = %q, want g1 with pending 2", got)
+	}
+	cmd(t, rw, "XPENDING", "dst", "g1")
+	if got := readReplyDeep(t, rw); got != "[2 1-1 2-2 [[c1 2]]]" {
+		t.Fatalf("XPENDING dst = %q", got)
 	}
 }

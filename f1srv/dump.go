@@ -54,8 +54,21 @@ import (
 // decodes the quicklist form both engines emit (PACKED nodes unpacked through lpDecode, PLAIN nodes
 // taken verbatim so a huge-value blob still loads) and the older plain RDB_TYPE_LIST (type 1, a count
 // then that many string elements) for completeness, so a list blob produced by either server restores
-// here. The remaining collection types arrive in the follow-up slices; each reuses this file's CRC64,
-// version framing, string primitives, and the listpack codec.
+// here.
+//
+// The stream is the sixth and last slice, and the one type whose body is a structure rather than a
+// flat element list. aki dumps a stream as RDB_TYPE_STREAM_LISTPACKS_3 (type 21): a run of listpack
+// nodes (one per entry, each keyed by that entry's 16-byte ID and holding a one-item stream listpack),
+// then the stream metadata (length, last ID, first ID, max-deleted ID, entries-added), then the
+// consumer groups (each with its last ID, entries-read counter, global pending list, and consumers
+// with their own pending lists). Type 21 is chosen because both Redis 8.8 and Valkey 9.1 accept it on
+// RESTORE: Redis 8.8 itself emits the newer type 27 (with an XNACK zone and an idempotent-producer
+// trailer) and Valkey 9.1 emits type 21, so the load side parses all five stream types (15, 19, 21,
+// 26, 27), reading the version-gated fields each carries and consuming and discarding the trailing
+// blocks (the per-group NACK zone of type 27 and the IDMP block of types 26 and 27) that aki does not
+// model. A stream blob produced by either server therefore restores here, and an aki stream restores
+// on either server. This slice reuses this file's CRC64, version framing, string primitives, and the
+// listpack codec, and adds the small-integer listpack helpers and the stream listpack walk.
 
 // RDB object type bytes. Only the forms aki serializes or has to load are named here.
 const (
@@ -70,6 +83,20 @@ const (
 	rdbTypeZsetListpack   = 0x11 // a sorted set packed into a single listpack blob, the small-zset form
 	rdbTypeListQuicklist2 = 0x12 // a quicklist: a node count then per-node a container byte + node blob
 	rdbTypeSetListpack    = 0x14 // a set packed into a single listpack blob, the form both servers emit
+
+	// The stream forms. Each newer type adds fields to the older one's layout; aki writes _3 and reads
+	// every form up to _5.
+	rdbTypeStreamListpacks  = 0x0f // 15: the original stream, no first-id/max-deleted/entries-added
+	rdbTypeStreamListpacks2 = 0x13 // 19: adds first-id, max-deleted-id, entries-added, group entries-read
+	rdbTypeStreamListpacks3 = 0x15 // 21: adds consumer active-time, the form aki writes and Valkey emits
+	rdbTypeStreamListpacks4 = 0x1a // 26: adds the trailing IDMP (idempotent producer) block
+	rdbTypeStreamListpacks5 = 0x1b // 27: adds the per-group NACK zone, the form Redis 8.8 emits
+)
+
+// Stream listpack item flags, stored as the first element of each item inside a stream listpack node.
+const (
+	streamItemDeleted    = 1 << 0 // the item is a tombstone: present in the listpack, skipped on read
+	streamItemSameFields = 1 << 1 // the item's fields are the master entry's fields, so only values follow
 )
 
 // Quicklist node container tags inside an RDB_TYPE_LIST_QUICKLIST_2 body: a PLAIN node holds one
@@ -169,6 +196,8 @@ func (c *connState) cmdDump(argv [][]byte) {
 		c.writeBulk(rdbSeal(c.rdbDumpZset(key)))
 	case keyList:
 		c.writeBulk(rdbSeal(c.rdbDumpList(key)))
+	case keyStream:
+		c.writeBulk(rdbSeal(c.rdbDumpStream(key)))
 	default:
 		c.writeErr("ERR DUMP of this type is not supported yet")
 	}
@@ -320,6 +349,263 @@ func (c *connState) rdbDumpList(lkey []byte) []byte {
 	payload = rdbAppendLen(payload, quicklistNodePacked)
 	payload = rdbAppendString(payload, lp)
 	return payload
+}
+
+// rdbDumpStream builds the RDB_TYPE_STREAM_LISTPACKS_3 body for a stream: the type byte, one listpack
+// node per entry (each keyed by that entry's 16-byte ID and holding a one-item stream listpack), the
+// stream metadata, then the consumer groups with their pending lists and consumers. It holds the
+// stripe lock and walks the entry, group, consumer, and PEL families straight off the ordered index,
+// the same enumerate paths XRANGE and XINFO use, so it never materializes the whole stream. Type 21 is
+// written because both Redis 8.8 and Valkey 9.1 accept it on RESTORE.
+func (c *connState) rdbDumpStream(skey []byte) []byte {
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.Lock()
+	defer mu.Unlock()
+
+	length, lastID, maxDel, entriesAdded, _ := c.streamHeader(skey)
+
+	payload := []byte{rdbTypeStreamListpacks3}
+	// One listpack node per entry. The node count is the live entry count, and each node carries
+	// exactly one entry, so the loader's live-entry sum equals the length written below.
+	payload = rdbAppendLen(payload, length)
+	firstID := streamID{}
+	haveFirst := false
+	prefix := c.streamEntryPrefix(skey)
+	var after []byte
+	scan := make([][]byte, 0, hashScanBatch)
+	for {
+		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
+		if len(keys) == 0 {
+			break
+		}
+		for _, k := range keys {
+			id := decodeEntryID(k)
+			if !haveFirst {
+				firstID = id
+				haveFirst = true
+			}
+			fields := c.readEntryFields(k)
+			var idb [16]byte
+			putStreamID(idb[:], id)
+			payload = rdbAppendString(payload, idb[:])
+			payload = rdbAppendString(payload, buildStreamEntryListpack(fields))
+		}
+		if last == nil {
+			break
+		}
+		after = last
+	}
+
+	// Stream metadata: length, last ID, first ID, max-deleted ID, entries-added.
+	payload = rdbAppendLen(payload, length)
+	payload = rdbAppendLen(payload, lastID.ms)
+	payload = rdbAppendLen(payload, lastID.seq)
+	payload = rdbAppendLen(payload, firstID.ms)
+	payload = rdbAppendLen(payload, firstID.seq)
+	payload = rdbAppendLen(payload, maxDel.ms)
+	payload = rdbAppendLen(payload, maxDel.seq)
+	payload = rdbAppendLen(payload, entriesAdded)
+
+	// Consumer groups. Each group carries its name, last ID, entries-read, global PEL, and consumers.
+	groups := c.dumpStreamGroups(skey)
+	payload = rdbAppendLen(payload, uint64(len(groups)))
+	for _, g := range groups {
+		payload = rdbAppendString(payload, []byte(g.name))
+		payload = rdbAppendLen(payload, g.lastID.ms)
+		payload = rdbAppendLen(payload, g.lastID.seq)
+		payload = rdbAppendLen(payload, g.entriesRead)
+
+		// Global PEL: count then, per entry, the raw 16-byte ID, an 8-byte little-endian delivery
+		// time, and the delivery count. The rows scan in ID order, which is the order Redis writes.
+		payload = rdbAppendLen(payload, uint64(len(g.pel)))
+		for _, pe := range g.pel {
+			var idb [16]byte
+			putStreamID(idb[:], pe.id)
+			payload = append(payload, idb[:]...)
+			payload = rdbAppendMS(payload, pe.deliveryTime)
+			payload = rdbAppendLen(payload, pe.deliveryCount)
+		}
+
+		// Consumers: count then, per consumer, the name, an 8-byte seen time, an 8-byte active time,
+		// and the consumer PEL (just the raw 16-byte IDs it owns, since the delivery bookkeeping lives
+		// on the global PEL and the owner is resolved by ID at load).
+		payload = rdbAppendLen(payload, uint64(len(g.consumers)))
+		for _, con := range g.consumers {
+			payload = rdbAppendString(payload, []byte(con.name))
+			payload = rdbAppendMS(payload, con.seenTime)
+			payload = rdbAppendMS(payload, con.activeTime)
+			owned := g.pel[:0:0]
+			for _, pe := range g.pel {
+				if pe.consumer == con.name {
+					owned = append(owned, pe)
+				}
+			}
+			payload = rdbAppendLen(payload, uint64(len(owned)))
+			for _, pe := range owned {
+				var idb [16]byte
+				putStreamID(idb[:], pe.id)
+				payload = append(payload, idb[:]...)
+			}
+		}
+	}
+	return payload
+}
+
+// dumpStreamGroups reads a stream's groups, each with its global PEL (owner resolved) and its
+// consumers, off the group, PEL, and consumer families. The caller holds the stripe lock. Groups are
+// cold relative to XADD, so the straightforward scan-and-decode here is off any measured hot path.
+func (c *connState) dumpStreamGroups(skey []byte) []rdbStreamGroup {
+	var groups []rdbStreamGroup
+	gPrefix := streamFamilyPrefix(skey, streamGroupTag)
+	gplen := len(gPrefix)
+	var after, gbuf []byte
+	for {
+		keys, last := c.srv.store.CollScan(gPrefix, after, hashScanBatch, nil)
+		if len(keys) == 0 {
+			break
+		}
+		for _, k := range keys {
+			name := string(k[gplen:])
+			v, ok := c.srv.store.GetKind(k, gbuf[:0], kindStreamGroup)
+			if !ok || len(v) < streamGroupBytes {
+				continue
+			}
+			gbuf = v
+			g := rdbStreamGroup{
+				name:        name,
+				lastID:      streamID{ms: binary.LittleEndian.Uint64(v[0:8]), seq: binary.LittleEndian.Uint64(v[8:16])},
+				entriesRead: binary.LittleEndian.Uint64(v[24:32]),
+			}
+			g.pel = c.dumpStreamPEL(skey, name)
+			g.consumers = c.dumpStreamConsumers(skey, name)
+			groups = append(groups, g)
+		}
+		if last == nil {
+			break
+		}
+		after = last
+	}
+	return groups
+}
+
+// dumpStreamPEL reads a group's pending list in ID order, each entry carrying its owning consumer
+// and delivery bookkeeping straight off the PEL row value.
+func (c *connState) dumpStreamPEL(skey []byte, group string) []rdbStreamPEL {
+	var pel []rdbStreamPEL
+	prefix := streamPELPrefix(skey, group)
+	var after, buf []byte
+	for {
+		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, nil)
+		if len(keys) == 0 {
+			break
+		}
+		for _, k := range keys {
+			v, ok := c.srv.store.GetKind(k, buf[:0], kindStreamPEL)
+			if !ok {
+				continue
+			}
+			buf = v
+			pe := decodeStreamPEL(v)
+			pel = append(pel, rdbStreamPEL{
+				id:            decodeEntryID(k),
+				consumer:      pe.consumer,
+				deliveryTime:  pe.deliveryTime,
+				deliveryCount: pe.deliveryCount,
+			})
+		}
+		if last == nil {
+			break
+		}
+		after = last
+	}
+	return pel
+}
+
+// dumpStreamConsumers reads a group's consumers in name order, each with its seen and active
+// clocks. The consumer's pending IDs are not read here: they are on the group PEL, tagged with this
+// consumer as owner, and the dump emits them per consumer from there.
+func (c *connState) dumpStreamConsumers(skey []byte, group string) []rdbStreamConsumer {
+	var cons []rdbStreamConsumer
+	prefix := streamConsumerPrefix(skey, group)
+	plen := len(prefix)
+	var after, buf []byte
+	for {
+		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, nil)
+		if len(keys) == 0 {
+			break
+		}
+		for _, k := range keys {
+			v, ok := c.srv.store.GetKind(k, buf[:0], kindStreamConsumer)
+			if !ok || len(v) < streamConsumerBytes {
+				continue
+			}
+			buf = v
+			cons = append(cons, rdbStreamConsumer{
+				name:       string(k[plen:]),
+				seenTime:   int64(binary.LittleEndian.Uint64(v[0:8])),
+				activeTime: int64(binary.LittleEndian.Uint64(v[8:16])),
+			})
+		}
+		if last == nil {
+			break
+		}
+		after = last
+	}
+	return cons
+}
+
+// buildStreamEntryListpack builds the one-item stream listpack node for an entry's fields. The node
+// holds a master entry (count 1, no tombstones, the entry's field names) followed by a single
+// SAMEFIELDS item that carries only the values, its ID identical to the node's master ID so both
+// diffs are zero. This is the exact shape Redis's streamAppendItem writes for a fresh single-entry
+// node, so a deep RESTORE integrity check walks it the same way it walks a native listpack.
+func buildStreamEntryListpack(fields [][]byte) []byte {
+	m := int64(len(fields) / 2)
+	lp := []byte{0, 0, 0, 0, 0, 0}
+	// Master entry: count, deleted, field-count, the field names, then the zero terminator.
+	lp = lpAppendIntVal(lp, 1)
+	lp = lpAppendIntVal(lp, 0)
+	lp = lpAppendIntVal(lp, m)
+	for i := int64(0); i < m; i++ {
+		lp = lpAppendEntry(lp, fields[i*2])
+	}
+	lp = lpAppendIntVal(lp, 0)
+	// The single item: flags marking it as sharing the master fields, a zero ms and seq diff, the
+	// values, then the entry's backward element count (values + the three leading control elements).
+	lp = lpAppendIntVal(lp, streamItemSameFields)
+	lp = lpAppendIntVal(lp, 0)
+	lp = lpAppendIntVal(lp, 0)
+	for i := int64(0); i < m; i++ {
+		lp = lpAppendEntry(lp, fields[i*2+1])
+	}
+	lp = lpAppendIntVal(lp, m+3)
+	lp = append(lp, 0xFF)
+	binary.LittleEndian.PutUint32(lp[0:4], uint32(len(lp)))
+	// The header element count is the total number of listpack elements: the master entry's M+4 plus
+	// the item's M+4. It saturates at 0xFFFF, the point a loader rescans rather than trusts the count.
+	numele := 2*m + 8
+	if numele > 0xFFFF {
+		numele = 0xFFFF
+	}
+	binary.LittleEndian.PutUint16(lp[4:6], uint16(numele))
+	return lp
+}
+
+// lpAppendIntVal appends one listpack integer entry: the integer encoding for v followed by its
+// back-length. It is the numeric counterpart of lpAppendEntry, used for the control elements of a
+// stream listpack node (counts, flags, ID diffs) that are always integers.
+func lpAppendIntVal(dst []byte, v int64) []byte {
+	before := len(dst)
+	dst = lpAppendInt(dst, v)
+	return lpAppendBacklen(dst, len(dst)-before)
+}
+
+// rdbAppendMS appends a millisecond timestamp as an 8-byte little-endian signed integer, the form
+// rdbSaveMillisecondTime writes for a PEL delivery time and a consumer's seen and active times.
+func rdbAppendMS(dst []byte, t int64) []byte {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], uint64(t))
+	return append(dst, b[:]...)
 }
 
 // lpAppendEntry appends one listpack entry for e: its encoding and data, then the back-length that
@@ -551,7 +837,55 @@ type rdbValue struct {
 	kind   keyKind
 	str    []byte
 	elems  [][]byte
-	scores []float64 // for a zset, the score of each member in elems, aligned by index
+	scores []float64  // for a zset, the score of each member in elems, aligned by index
+	stream *rdbStream // for a stream, the whole decoded log and its groups
+}
+
+// rdbStream is the decoded form of a stream DUMP body: the entry log, the stream metadata, and the
+// consumer groups. It mirrors what f1srv stores on the header, entry, group, consumer, and PEL rows,
+// so rdbWriteValue can land it row for row without re-deriving anything.
+type rdbStream struct {
+	entries      []rdbStreamEntry
+	length       uint64
+	lastID       streamID
+	maxDeleted   streamID
+	entriesAdded uint64
+	groups       []rdbStreamGroup
+}
+
+// rdbStreamEntry is one log entry: its ID and its field/value pairs flattened in insertion order,
+// the same flat form encodeStreamFields takes.
+type rdbStreamEntry struct {
+	id     streamID
+	fields [][]byte
+}
+
+// rdbStreamGroup is one consumer group: its name, last-delivered ID, entries-read counter, global
+// pending list, and consumers. The global PEL carries the owning consumer resolved from the consumer
+// PELs at parse time, so a write is a straight row-per-entry landing.
+type rdbStreamGroup struct {
+	name        string
+	lastID      streamID
+	entriesRead uint64
+	pel         []rdbStreamPEL
+	consumers   []rdbStreamConsumer
+}
+
+// rdbStreamPEL is one pending entry: its ID, delivery bookkeeping, and the consumer that owns it
+// (empty until a consumer PEL claims it, which the NACK-zone case of type 27 can leave empty).
+type rdbStreamPEL struct {
+	id            streamID
+	consumer      string
+	deliveryTime  int64
+	deliveryCount uint64
+}
+
+// rdbStreamConsumer is one consumer's identity and clocks; its pending IDs live on the group PEL
+// with this consumer named as owner, so the consumer's own pending count is derived on write.
+type rdbStreamConsumer struct {
+	name       string
+	seenTime   int64
+	activeTime int64
 }
 
 // rdbLoadValue parses a value body (a type byte followed by the type's encoding) into an rdbValue. It
@@ -657,9 +991,359 @@ func rdbLoadValue(body []byte) (rdbValue, bool) {
 			scores = append(scores, f)
 		}
 		return rdbValue{kind: keyZset, elems: members, scores: scores}, true
+	case rdbTypeStreamListpacks, rdbTypeStreamListpacks2, rdbTypeStreamListpacks3,
+		rdbTypeStreamListpacks4, rdbTypeStreamListpacks5:
+		return rdbLoadStream(body[1:], body[0])
 	default:
 		return rdbValue{}, false
 	}
+}
+
+// rdbLoadStream parses any of the five stream RDB bodies (types 15, 19, 21, 26, 27) into an rdbStream.
+// The newer types are supersets of the older ones, so a single parse gates the fields each form adds:
+// the first-ID/max-deleted/entries-added and group entries-read of type 19 and up, the consumer
+// active-time of type 21 and up, the per-group NACK zone of type 27, and the stream-level IDMP block
+// of types 26 and 27. The NACK zone and IDMP block are consumed and discarded, since f1srv models
+// neither an unowned pending entry nor an idempotent-producer table; every other field lands. A stream
+// blob from Redis 8.8 (type 27) or Valkey 9.1 (type 21) therefore restores here.
+func rdbLoadStream(b []byte, rdbtype byte) (rdbValue, bool) {
+	hasV2 := rdbtype != rdbTypeStreamListpacks
+	hasV3 := rdbtype >= rdbTypeStreamListpacks3
+	hasV4 := rdbtype >= rdbTypeStreamListpacks4
+	hasV5 := rdbtype >= rdbTypeStreamListpacks5
+
+	st := &rdbStream{}
+	nNodes, rest, ok := rdbReadLen(b)
+	if !ok {
+		return rdbValue{}, false
+	}
+	for i := uint64(0); i < nNodes; i++ {
+		nodeKey, r, ok := rdbReadString(rest)
+		if !ok || len(nodeKey) != 16 {
+			return rdbValue{}, false
+		}
+		master := streamID{ms: binary.BigEndian.Uint64(nodeKey[0:8]), seq: binary.BigEndian.Uint64(nodeKey[8:16])}
+		lp, r2, ok := rdbReadString(r)
+		if !ok {
+			return rdbValue{}, false
+		}
+		if !parseStreamNode(st, master, lp) {
+			return rdbValue{}, false
+		}
+		rest = r2
+	}
+
+	// Stream metadata. length, then last ID; the first-ID/max-deleted/entries-added triple only from
+	// type 19 up (an older blob defaults max-deleted to zero and entries-added to the live length).
+	var length, ms, seq uint64
+	if length, rest, ok = rdbReadLen(rest); !ok {
+		return rdbValue{}, false
+	}
+	st.length = length
+	if ms, rest, ok = rdbReadLen(rest); !ok {
+		return rdbValue{}, false
+	}
+	if seq, rest, ok = rdbReadLen(rest); !ok {
+		return rdbValue{}, false
+	}
+	st.lastID = streamID{ms: ms, seq: seq}
+	if hasV2 {
+		// first ID (read and dropped: f1srv derives it from the entry rows), then max-deleted, added.
+		for j := 0; j < 2; j++ {
+			if _, rest, ok = rdbReadLen(rest); !ok {
+				return rdbValue{}, false
+			}
+		}
+		if ms, rest, ok = rdbReadLen(rest); !ok {
+			return rdbValue{}, false
+		}
+		if seq, rest, ok = rdbReadLen(rest); !ok {
+			return rdbValue{}, false
+		}
+		st.maxDeleted = streamID{ms: ms, seq: seq}
+		if st.entriesAdded, rest, ok = rdbReadLen(rest); !ok {
+			return rdbValue{}, false
+		}
+	} else {
+		st.entriesAdded = length
+	}
+
+	// Consumer groups.
+	var nGroups uint64
+	if nGroups, rest, ok = rdbReadLen(rest); !ok {
+		return rdbValue{}, false
+	}
+	for gi := uint64(0); gi < nGroups; gi++ {
+		var name []byte
+		if name, rest, ok = rdbReadString(rest); !ok {
+			return rdbValue{}, false
+		}
+		g := rdbStreamGroup{name: string(name)}
+		if ms, rest, ok = rdbReadLen(rest); !ok {
+			return rdbValue{}, false
+		}
+		if seq, rest, ok = rdbReadLen(rest); !ok {
+			return rdbValue{}, false
+		}
+		g.lastID = streamID{ms: ms, seq: seq}
+		if hasV2 {
+			if g.entriesRead, rest, ok = rdbReadLen(rest); !ok {
+				return rdbValue{}, false
+			}
+		} else {
+			g.entriesRead = streamEntriesReadInvalid
+		}
+
+		// Global PEL: count then, per entry, raw 16-byte ID, 8-byte little-endian delivery time, and
+		// the delivery count. The owner is left empty here and filled from the consumer PELs below.
+		var nPel uint64
+		if nPel, rest, ok = rdbReadLen(rest); !ok {
+			return rdbValue{}, false
+		}
+		pelIndex := make(map[streamID]int, nPel)
+		for pi := uint64(0); pi < nPel; pi++ {
+			var id streamID
+			if id, rest, ok = readRawStreamID(rest); !ok {
+				return rdbValue{}, false
+			}
+			if len(rest) < 8 {
+				return rdbValue{}, false
+			}
+			dt := int64(binary.LittleEndian.Uint64(rest[:8]))
+			rest = rest[8:]
+			var dc uint64
+			if dc, rest, ok = rdbReadLen(rest); !ok {
+				return rdbValue{}, false
+			}
+			pelIndex[id] = len(g.pel)
+			g.pel = append(g.pel, rdbStreamPEL{id: id, deliveryTime: dt, deliveryCount: dc})
+		}
+
+		// Consumers: count then, per consumer, name, 8-byte seen time, (type 21 up) 8-byte active
+		// time, and the consumer PEL of raw 16-byte IDs. Each ID resolves an owner into the global PEL.
+		var nCons uint64
+		if nCons, rest, ok = rdbReadLen(rest); !ok {
+			return rdbValue{}, false
+		}
+		for ci := uint64(0); ci < nCons; ci++ {
+			var cname []byte
+			if cname, rest, ok = rdbReadString(rest); !ok {
+				return rdbValue{}, false
+			}
+			if len(rest) < 8 {
+				return rdbValue{}, false
+			}
+			seen := int64(binary.LittleEndian.Uint64(rest[:8]))
+			rest = rest[8:]
+			active := seen
+			if hasV3 {
+				if len(rest) < 8 {
+					return rdbValue{}, false
+				}
+				active = int64(binary.LittleEndian.Uint64(rest[:8]))
+				rest = rest[8:]
+			}
+			g.consumers = append(g.consumers, rdbStreamConsumer{name: string(cname), seenTime: seen, activeTime: active})
+			var nCPel uint64
+			if nCPel, rest, ok = rdbReadLen(rest); !ok {
+				return rdbValue{}, false
+			}
+			for k := uint64(0); k < nCPel; k++ {
+				var id streamID
+				if id, rest, ok = readRawStreamID(rest); !ok {
+					return rdbValue{}, false
+				}
+				if idx, has := pelIndex[id]; has {
+					g.pel[idx].consumer = string(cname)
+				}
+			}
+		}
+
+		// Type 27's per-group NACK zone: a count then that many raw 16-byte IDs of unowned pending
+		// entries. f1srv has no place for an owner-less pending entry, so the IDs are consumed and the
+		// entries stay ownerless, which drops them on write; the common owned case is unaffected.
+		if hasV5 {
+			var nNacked uint64
+			if nNacked, rest, ok = rdbReadLen(rest); !ok {
+				return rdbValue{}, false
+			}
+			for k := uint64(0); k < nNacked; k++ {
+				if _, rest, ok = readRawStreamID(rest); !ok {
+					return rdbValue{}, false
+				}
+			}
+		}
+		st.groups = append(st.groups, g)
+	}
+
+	// Types 26 and 27 close with a stream-level IDMP block; f1srv does not model idempotent producers,
+	// so the block is walked and discarded.
+	if hasV4 {
+		if rest, ok = skipStreamIdmp(rest); !ok {
+			return rdbValue{}, false
+		}
+	}
+	return rdbValue{kind: keyStream, stream: st}, true
+}
+
+// readRawStreamID reads a 16-byte big-endian stream ID written in raw form (no length prefix), the
+// shape a PEL or NACK-zone entry stores.
+func readRawStreamID(b []byte) (streamID, []byte, bool) {
+	if len(b) < 16 {
+		return streamID{}, nil, false
+	}
+	return streamID{ms: binary.BigEndian.Uint64(b[0:8]), seq: binary.BigEndian.Uint64(b[8:16])}, b[16:], true
+}
+
+// skipStreamIdmp walks the IDMP (idempotent message producer) block that types 26 and 27 append:
+// a duration, a max-entries cap, a producer count, and per producer a producer ID, an entry count,
+// and that many (IID, ms, seq) triples. Every field is read so the cursor lands past the block, but
+// nothing is kept, since f1srv does not track idempotent producers.
+func skipStreamIdmp(b []byte) ([]byte, bool) {
+	var ok bool
+	// idmp_duration, idmp_max_entries.
+	for i := 0; i < 2; i++ {
+		if _, b, ok = rdbReadLen(b); !ok {
+			return nil, false
+		}
+	}
+	var nProducers uint64
+	if nProducers, b, ok = rdbReadLen(b); !ok {
+		return nil, false
+	}
+	for p := uint64(0); p < nProducers; p++ {
+		if _, b, ok = rdbReadString(b); !ok { // producer ID
+			return nil, false
+		}
+		var nEntries uint64
+		if nEntries, b, ok = rdbReadLen(b); !ok {
+			return nil, false
+		}
+		for e := uint64(0); e < nEntries; e++ {
+			if _, b, ok = rdbReadString(b); !ok { // IID
+				return nil, false
+			}
+			for j := 0; j < 2; j++ { // id ms, seq
+				if _, b, ok = rdbReadLen(b); !ok {
+					return nil, false
+				}
+			}
+		}
+	}
+	return b, true
+}
+
+// parseStreamNode decodes one stream listpack node into st.entries. The node is a master entry (a
+// live count, a tombstone count, the master field names, a terminator) followed by count+deleted
+// items, each an entry whose ID is the node's master ID plus the item's ms and seq diffs. A SAMEFIELDS
+// item carries only values and reuses the master fields; a full item carries its own field/value
+// pairs. Deleted items are skipped. This is the inverse of buildStreamEntryListpack and also decodes
+// the multi-item nodes a real server packs, so a Redis- or Valkey-produced node loads here.
+func parseStreamNode(st *rdbStream, master streamID, lp []byte) bool {
+	els, ok := lpDecode(lp)
+	if !ok || len(els) < 4 {
+		return false
+	}
+	p := 0
+	next := func() ([]byte, bool) {
+		if p >= len(els) {
+			return nil, false
+		}
+		v := els[p]
+		p++
+		return v, true
+	}
+	nextInt := func() (int64, bool) {
+		v, ok := next()
+		if !ok {
+			return 0, false
+		}
+		n, err := strconv.ParseInt(string(v), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	}
+
+	count, ok := nextInt()
+	if !ok || count < 0 {
+		return false
+	}
+	deleted, ok := nextInt()
+	if !ok || deleted < 0 {
+		return false
+	}
+	nFields, ok := nextInt()
+	if !ok || nFields < 0 {
+		return false
+	}
+	masterFields := make([][]byte, 0, nFields)
+	for i := int64(0); i < nFields; i++ {
+		f, ok := next()
+		if !ok {
+			return false
+		}
+		masterFields = append(masterFields, f)
+	}
+	// The master entry ends with a zero terminator element.
+	if _, ok := next(); !ok {
+		return false
+	}
+
+	total := count + deleted
+	for i := int64(0); i < total; i++ {
+		flags, ok := nextInt()
+		if !ok {
+			return false
+		}
+		msDiff, ok := nextInt()
+		if !ok {
+			return false
+		}
+		seqDiff, ok := nextInt()
+		if !ok {
+			return false
+		}
+		id := streamID{ms: master.ms + uint64(msDiff), seq: master.seq + uint64(seqDiff)}
+
+		var fields [][]byte
+		if flags&streamItemSameFields != 0 {
+			fields = make([][]byte, 0, nFields*2)
+			for j := int64(0); j < nFields; j++ {
+				val, ok := next()
+				if !ok {
+					return false
+				}
+				fields = append(fields, masterFields[j], val)
+			}
+		} else {
+			nf, ok := nextInt()
+			if !ok || nf < 0 {
+				return false
+			}
+			fields = make([][]byte, 0, nf*2)
+			for j := int64(0); j < nf; j++ {
+				f, ok := next()
+				if !ok {
+					return false
+				}
+				val, ok := next()
+				if !ok {
+					return false
+				}
+				fields = append(fields, f, val)
+			}
+		}
+		// The trailing lp_count element closes the item; skip it.
+		if _, ok := next(); !ok {
+			return false
+		}
+		if flags&streamItemDeleted != 0 {
+			continue
+		}
+		st.entries = append(st.entries, rdbStreamEntry{id: id, fields: fields})
+	}
+	return true
 }
 
 // rdbLoadListPlain parses the older RDB_TYPE_LIST body: an element count then that many element
@@ -899,6 +1583,65 @@ func (c *connState) rdbWriteValue(key []byte, v rdbValue) error {
 			}
 		}
 		return c.listPutHeader(key, 0, int64(len(v.elems)), lpBytes, everLarge)
+	case keyStream:
+		return c.rdbWriteStream(key, v.stream)
+	}
+	return nil
+}
+
+// rdbWriteStream lands a decoded stream under a key: each entry as its own row, the header, then the
+// consumer groups with their consumers and pending lists. It mirrors the write paths XADD, XGROUP, and
+// XREADGROUP take, so a restored stream is indistinguishable from one built command by command. The
+// group and consumer pending counts are derived from the pending rows actually written, so an unowned
+// pending entry (a type 27 NACK-zone entry with no consumer) is dropped rather than landed ownerless.
+func (c *connState) rdbWriteStream(key []byte, st *rdbStream) error {
+	if st == nil {
+		return nil
+	}
+	for _, e := range st.entries {
+		ek := c.streamEntryKey(key, e.id)
+		val := encodeStreamFields(nil, e.fields)
+		isNew, err := c.srv.store.PutKind(ek, val, kindStreamEntry)
+		if err != nil {
+			return err
+		}
+		if isNew {
+			c.srv.store.CollInsert(ek, kindStreamEntry)
+		}
+	}
+	if err := c.streamPutHeader(key, st.length, st.lastID, st.maxDeleted, st.entriesAdded); err != nil {
+		return err
+	}
+	for _, g := range st.groups {
+		// Count each consumer's owned pending entries and the group total from the PEL rows that
+		// actually carry an owner, so the stored counters match what lands below.
+		perConsumer := make(map[string]uint64, len(g.consumers))
+		var groupPending uint64
+		for _, pe := range g.pel {
+			if pe.consumer == "" {
+				continue
+			}
+			perConsumer[pe.consumer]++
+			groupPending++
+		}
+		if err := c.putStreamGroup(key, g.name, streamGroup{lastID: g.lastID, pending: groupPending, entriesRead: g.entriesRead}); err != nil {
+			return err
+		}
+		for _, con := range g.consumers {
+			sc := streamConsumer{seenTime: con.seenTime, activeTime: con.activeTime, pending: perConsumer[con.name]}
+			if err := c.putStreamConsumer(key, g.name, con.name, sc); err != nil {
+				return err
+			}
+		}
+		for _, pe := range g.pel {
+			if pe.consumer == "" {
+				continue
+			}
+			row := streamPELEntry{consumer: pe.consumer, deliveryTime: pe.deliveryTime, deliveryCount: pe.deliveryCount}
+			if err := c.putStreamPEL(key, g.name, pe.id, row); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
