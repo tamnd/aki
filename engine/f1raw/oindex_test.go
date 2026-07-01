@@ -259,6 +259,101 @@ func TestOIndexSelectAtAfterMutation(t *testing.T) {
 	}
 }
 
+// CollSelectRemoveAt is the fused select-then-remove SPOP runs: it must return the
+// localIndex-th member of one collection and unlink it in the same descent, keeping every
+// order-statistic width exact so a following full enumeration still matches the remaining
+// sorted members. Draining the whole collection one random position at a time is the
+// adversarial case: if the fused unlink miscounts a single span, a later select lands on
+// the wrong member or reports a live member absent. Sibling collections that bracket the
+// drained one must stay intact, and an out-of-range index must remove nothing.
+func TestOIndexSelectRemoveAt(t *testing.T) {
+	s := New(1<<18, 1<<22)
+	insert := func(coll, member string) {
+		k := collKey(coll, member)
+		if _, err := s.PutKind(k, nil, kindTestField); err != nil {
+			t.Fatal(err)
+		}
+		s.CollInsert(k, kindTestField)
+	}
+	// Sibling collections whose bare keys bracket "h" on both sides, so a base-rank or
+	// prefix-guard slip in the fused path would splice a neighbour's node.
+	insert("a", "0")
+	live := map[string]bool{}
+	for i := 0; i < 300; i++ {
+		m := fmt.Sprintf("m%04d", i)
+		insert("h", m)
+		live[m] = true
+	}
+	insert("h2", "z")
+	prefix := collPrefix("h")
+
+	// A fixed splitmix walk stands in for the server's uniform draw so the drain is
+	// deterministic. Remove the (r mod card)-th live member each step, verify it was live,
+	// then check the full remaining enumeration equals the sorted live set.
+	var r uint64 = 0xabcdef
+	for len(live) > 0 {
+		card := len(live)
+		r += 0x9e3779b97f4a7c15
+		z := r
+		z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+		z ^= z >> 31
+		idx := int(z % uint64(card))
+		k, ok := s.CollSelectRemoveAt(prefix, idx)
+		if !ok {
+			t.Fatalf("CollSelectRemoveAt(%d) absent at card %d", idx, card)
+		}
+		m := string(k[len(prefix):])
+		if !live[m] {
+			t.Fatalf("removed %q which was not live", m)
+		}
+		// The removed member must have been the idx-th in sorted order.
+		var sorted []string
+		for lm := range live {
+			sorted = append(sorted, lm)
+		}
+		sort.Strings(sorted)
+		if sorted[idx] != m {
+			t.Fatalf("index %d removed %q, want %q", idx, m, sorted[idx])
+		}
+		// Drop the resident row too, matching how SPOP pairs DeleteKind with the unlink.
+		s.DeleteKind(k, kindTestField)
+		delete(live, m)
+
+		// Full enumeration must still match the remaining sorted live set exactly.
+		sorted = sorted[:0]
+		for lm := range live {
+			sorted = append(sorted, lm)
+		}
+		sort.Strings(sorted)
+		for i, w := range sorted {
+			got, ok := s.CollSelectAt(prefix, i)
+			if !ok {
+				t.Fatalf("after removing %q, CollSelectAt(%d) absent, want %q", m, i, w)
+			}
+			if g := string(got[len(prefix):]); g != w {
+				t.Fatalf("after removing %q, CollSelectAt(%d) = %q, want %q", m, i, g, w)
+			}
+		}
+		if _, ok := s.CollSelectAt(prefix, len(sorted)); ok {
+			t.Fatalf("CollSelectAt(%d) present past cardinality after removing %q", len(sorted), m)
+		}
+	}
+	// Draining "h" must not have touched its bracketing siblings.
+	if k, ok := s.CollSelectAt(collPrefix("a"), 0); !ok || string(k[len(collPrefix("a")):]) != "0" {
+		t.Fatal("sibling collection a lost its member")
+	}
+	if k, ok := s.CollSelectAt(collPrefix("h2"), 0); !ok || string(k[len(collPrefix("h2")):]) != "z" {
+		t.Fatal("sibling collection h2 lost its member")
+	}
+	// An out-of-range index on the now-empty collection removes nothing.
+	if _, ok := s.CollSelectRemoveAt(prefix, 0); ok {
+		t.Fatal("CollSelectRemoveAt on empty collection reported present")
+	}
+	if _, ok := s.CollSelectRemoveAt(prefix, -1); ok {
+		t.Fatal("CollSelectRemoveAt(-1) reported present")
+	}
+}
+
 // A uniform localIndex draw must reach every member with roughly equal frequency, which
 // is the property SPOP/SRANDMEMBER rely on: order-statistic selection is exactly uniform
 // over the index, unlike a byte-space random seek that clumps on the member distribution.

@@ -133,6 +133,18 @@ func (s *Store) CollSelectAt(prefix []byte, localIndex int) (key []byte, ok bool
 	return s.oidx.selectInPrefix(prefix, localIndex)
 }
 
+// CollSelectRemoveAt selects the element at localIndex within prefix and drops it from the
+// ordered index in one descent, returning its composite key and whether it existed. It is
+// the fused select-then-CollRemove that SPOP-without-count runs: the caller still deletes
+// the element's row through DeleteKind (the returned key is exactly that row's key), but
+// the ordered-index select and unlink share a single positional descent under one write
+// lock instead of a select descent, a rank descent, and a separate remove descent. Use it
+// only when the very member just selected is the one being removed; for a select that does
+// not remove, use CollSelectAt.
+func (s *Store) CollSelectRemoveAt(prefix []byte, localIndex int) (key []byte, ok bool) {
+	return s.oidx.selectAndRemoveInPrefix(prefix, localIndex)
+}
+
 // CollRankOf returns the 0-based position of key within the collection bounded by
 // prefix, in key order: the inverse of CollSelectAt. It rides the same order-statistic
 // spans, so ZRANK/ZREVRANK seek a member's position in O(log n) rather than counting
