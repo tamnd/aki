@@ -253,6 +253,26 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdPfDebug(argv)
 	case eqFold(cmd, "PFSELFTEST"):
 		c.cmdPfSelfTest(argv)
+	case eqFold(cmd, "GEOADD"):
+		c.cmdGeoAdd(argv)
+	case eqFold(cmd, "GEOPOS"):
+		c.cmdGeoPos(argv)
+	case eqFold(cmd, "GEODIST"):
+		c.cmdGeoDist(argv)
+	case eqFold(cmd, "GEOHASH"):
+		c.cmdGeoHash(argv)
+	case eqFold(cmd, "GEORADIUS"):
+		c.cmdGeoRadius(argv, false)
+	case eqFold(cmd, "GEORADIUS_RO"):
+		c.cmdGeoRadius(argv, true)
+	case eqFold(cmd, "GEORADIUSBYMEMBER"):
+		c.cmdGeoRadiusByMember(argv, false)
+	case eqFold(cmd, "GEORADIUSBYMEMBER_RO"):
+		c.cmdGeoRadiusByMember(argv, true)
+	case eqFold(cmd, "GEOSEARCH"):
+		c.cmdGeoSearch(argv)
+	case eqFold(cmd, "GEOSEARCHSTORE"):
+		c.cmdGeoSearchStore(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
