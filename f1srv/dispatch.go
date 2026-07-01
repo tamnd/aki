@@ -4,10 +4,48 @@ import (
 	"github.com/tamnd/aki/engine/f1raw"
 )
 
-// dispatch routes one parsed command to its handler and writes a reply. Unknown
+// dispatch is the transaction control layer in front of the command table. The five
+// transaction verbs (MULTI, EXEC, DISCARD, WATCH, UNWATCH) plus RESET are always handled
+// here so they work the same whether or not a transaction is open. When a transaction is
+// open every other command is queued and answered +QUEUED instead of run, matching Redis:
+// a MULTI block is dispatched as one unit at EXEC, not incrementally. Outside a transaction
+// the command runs immediately through execCommand.
+func (c *connState) dispatch(argv [][]byte) {
+	if len(argv) == 0 {
+		return
+	}
+	cmd := argv[0]
+	switch {
+	case eqFold(cmd, "MULTI"):
+		c.cmdMulti(argv)
+		return
+	case eqFold(cmd, "EXEC"):
+		c.cmdExec(argv)
+		return
+	case eqFold(cmd, "DISCARD"):
+		c.cmdDiscard(argv)
+		return
+	case eqFold(cmd, "WATCH"):
+		c.cmdWatch(argv)
+		return
+	case eqFold(cmd, "UNWATCH"):
+		c.cmdUnwatch(argv)
+		return
+	case eqFold(cmd, "RESET"):
+		c.cmdReset(argv)
+		return
+	}
+	if c.inMulti {
+		c.queueCommand(argv)
+		return
+	}
+	c.execCommand(argv)
+}
+
+// execCommand routes one parsed command to its handler and writes a reply. Unknown
 // commands get a Redis-shaped error so a misconfigured client fails loudly rather
 // than hanging. The hot string verbs (GET, SET, INCR) are checked first.
-func (c *connState) dispatch(argv [][]byte) {
+func (c *connState) execCommand(argv [][]byte) {
 	if len(argv) == 0 {
 		return
 	}
@@ -17,6 +55,13 @@ func (c *connState) dispatch(argv [][]byte) {
 	// untouched; when TTLs exist it is what makes a typed read (HGET, ZSCORE, ...) see an
 	// expired key as absent, matching Redis's per-lookup expireIfNeeded.
 	c.reapExpiredKeys(cmd, argv)
+	// When any client is watching a key, bump the watch version of every key this command
+	// writes before it runs, so a concurrent EXEC that watched one of them aborts. The
+	// atomic gate keeps this off the path entirely when nothing is watched, the same
+	// zero-cost-when-unused pattern the volatile TTL gate uses.
+	if c.srv.watching.Load() != 0 {
+		c.signalWrites(cmd, argv)
+	}
 	switch {
 	case eqFold(cmd, "GET"):
 		c.cmdGet(argv)
@@ -358,8 +403,7 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.writeSimple("OK")
 	case eqFold(cmd, "DBSIZE"):
 		c.writeInt(int64(c.srv.store.TopLen()))
-	case eqFold(cmd, "SELECT") || eqFold(cmd, "CLIENT") || eqFold(cmd, "CONFIG") ||
-		eqFold(cmd, "RESET"):
+	case eqFold(cmd, "SELECT") || eqFold(cmd, "CLIENT") || eqFold(cmd, "CONFIG"):
 		c.writeSimple("OK")
 	case eqFold(cmd, "COMMAND"):
 		c.writeArrayHeader(0)
