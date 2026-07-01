@@ -97,6 +97,27 @@ func (s *Server) signalListKey(key []byte) {
 	s.block.mu.Unlock()
 }
 
+// signalStreamKey wakes every client blocked on key, not just the FIFO head, because a stream read
+// is non-consuming: a new entry is visible to every blocked XREAD on the stream at once, and every
+// blocked XREADGROUP consumer must re-run its delivery to learn whether the entry fell to it. This
+// differs from signalListKey, where an element goes to exactly one popper so only the head is woken.
+// A woken reader that finds nothing new (its group cursor was already advanced by a peer under the
+// stripe lock) simply re-parks, the same way Redis re-blocks a consumer it served nothing. The atomic
+// fast-out keeps an XADD with no blocked client anywhere off the registry lock.
+func (s *Server) signalStreamKey(key []byte) {
+	if s.block.n.Load() == 0 {
+		return
+	}
+	s.block.mu.Lock()
+	for _, w := range s.block.waiters[string(key)] {
+		select {
+		case w.ch <- struct{}{}:
+		default:
+		}
+	}
+	s.block.mu.Unlock()
+}
+
 // flushBeforeBlock writes any replies buffered so far and empties the buffer, so a reply that
 // precedes a blocking command in the same pipeline reaches the client before this connection
 // parks rather than being held until the block resolves. It is a no-op under the reactor,
