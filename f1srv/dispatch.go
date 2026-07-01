@@ -179,6 +179,10 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdRPushX(argv)
 	case eqFold(cmd, "LTRIM"):
 		c.cmdLTrim(argv)
+	case eqFold(cmd, "LINSERT"):
+		c.cmdLInsert(argv)
+	case eqFold(cmd, "LREM"):
+		c.cmdLRem(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
@@ -290,7 +294,7 @@ func (c *connState) cmdDel(argv [][]byte) {
 	}
 	var n int64
 	for _, k := range argv[1:] {
-		if c.srv.store.Delete(k) {
+		if c.dropKey(k) {
 			n++
 		}
 	}
@@ -304,11 +308,85 @@ func (c *connState) cmdExists(argv [][]byte) {
 	}
 	var n int64
 	for _, k := range argv[1:] {
-		if _, ok := c.srv.store.Get(k, c.vbuf[:0]); ok {
+		if c.keyTypeOf(k) != keyMissing {
 			n++
 		}
 	}
 	c.writeInt(n)
+}
+
+// dropKey removes a key of any type in full and reports whether it existed. A string is a
+// single record, but a collection is a header row plus every element row it owns, so DEL and
+// UNLINK route through here instead of the string-only store.Delete they used to call, which
+// left a collection's element rows (and its header) orphaned in the arena and reported nothing
+// removed. It resolves the type once, then drops the string record or cascades the collection.
+// The stripe lock serializes the cascade against concurrent writers to the same key, the same
+// lock every collection write already takes.
+func (c *connState) dropKey(key []byte) bool {
+	mu := &c.srv.incrMu[c.srv.stripe(key)]
+	mu.Lock()
+	defer mu.Unlock()
+	switch c.keyTypeOf(key) {
+	case keyString:
+		return c.srv.store.Delete(key)
+	case keyHash:
+		c.dropCollIndex(c.hashPrefix(key), kindHashField)
+		c.srv.store.DeleteKind(key, kindHashMeta)
+		return true
+	case keySet:
+		c.dropCollIndex(c.setPrefix(key), kindSetMember)
+		c.srv.store.DeleteKind(key, kindSetMeta)
+		return true
+	case keyZset:
+		// A zset carries two element indexes (member-family and score-family rows), so both
+		// are drained before the header. The member prefix is fully consumed before the score
+		// prefix is built, so the shared pbuf they both borrow is never live for both at once.
+		c.dropCollIndex(c.zmemberPrefix(key), kindZsetMember)
+		c.dropCollIndex(c.zscorePrefix(key), kindZsetScore)
+		c.srv.store.DeleteKind(key, kindZsetMeta)
+		return true
+	case keyList:
+		c.dropList(key)
+		return true
+	}
+	return false
+}
+
+// dropCollIndex deletes every element row under prefix in the given kind and unlinks each from
+// the ordered element index, in bounded batches so a huge collection never holds the index lock
+// across the whole set. It re-scans from the start of the prefix each round because the previous
+// round deleted the batch it returned, so the next scan-from-start surfaces the next survivors;
+// the loop ends when a scan comes back empty. It is the shared drop body for the single-index
+// collections (hash fields, set members) and for each of a zset's two indexes.
+func (c *connState) dropCollIndex(prefix []byte, kind byte) {
+	var scan [][]byte
+	for {
+		keys, _ := c.srv.store.CollScan(prefix, nil, hashScanBatch, scan[:0])
+		if len(keys) == 0 {
+			return
+		}
+		for _, k := range keys {
+			c.srv.store.DeleteKind(k, kind)
+			c.srv.store.CollRemove(k)
+		}
+		scan = keys
+	}
+}
+
+// dropList deletes a list's element rows and header. A list is not carried in the ordered index
+// (positional access is direct window arithmetic), so its elements are walked straight off the
+// header window [head, tail) rather than a prefix scan: each position's row is a point delete,
+// then the header row goes. A missing header is a no-op, which dropKey never reaches since it
+// only calls here after keyTypeOf confirmed the list.
+func (c *connState) dropList(lkey []byte) {
+	head, tail, _, _, ok := c.listHeader(lkey)
+	if !ok {
+		return
+	}
+	for p := head; p < tail; p++ {
+		c.srv.store.DeleteKind(c.listElemKey(lkey, p), kindListElem)
+	}
+	c.srv.store.DeleteKind(lkey, kindListMeta)
 }
 
 func (c *connState) cmdMSet(argv [][]byte) {

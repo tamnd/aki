@@ -763,6 +763,223 @@ func (c *connState) cmdLTrim(argv [][]byte) {
 	c.writeSimple("OK")
 }
 
+// cmdLInsert implements LINSERT key BEFORE|AFTER pivot value. It is the first list command
+// that edits the interior of the window rather than an end, so it is where the dense-window
+// model has to answer what the spec's sparse fractional order key (2064/f1_rewrite_ltm/08)
+// answers with an O(1) key-between-neighbors insert. This engine keeps the dense window on
+// purpose: LINDEX, LRANGE, and the push/pop ends are all O(1) direct index arithmetic here,
+// where a fractional key would push positional access onto an O(log n) order-statistic
+// select. A list is a deque whose reads and end edits dominate and whose interior inserts are
+// rare, so the trade runs the other way from a general ordered index: pay the interior insert,
+// keep the common path free. So this opens the slot by shifting the shorter side of the pivot
+// by one position (the side with fewer elements to move), an O(min(i, n-i)) rewrite that leaves
+// the window contiguous, then writes the new element into the freed slot. A missing key replies
+// 0, a pivot that is not present replies -1, and a plain string under the key is WRONGTYPE.
+func (c *connState) cmdLInsert(argv [][]byte) {
+	if len(argv) != 5 {
+		c.writeErr("ERR wrong number of arguments for 'linsert' command")
+		return
+	}
+	lkey := argv[1]
+	var before bool
+	switch {
+	case eqFold(argv[2], "BEFORE"):
+		before = true
+	case eqFold(argv[2], "AFTER"):
+		before = false
+	default:
+		c.writeErr("ERR syntax error")
+		return
+	}
+	pivot := argv[3]
+	val := argv[4]
+
+	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
+	mu.Lock()
+	if c.stringConflict(lkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
+	if !ok {
+		mu.Unlock()
+		c.writeInt(0)
+		return
+	}
+	// Find the first pivot occurrence in list order. Each element is one direct point read. A
+	// separate found flag carries the result rather than a sentinel position, because the window
+	// runs through negative positions (LPUSH pushes below zero) so no int64 is a safe "absent"
+	// marker.
+	var pivotPos int64
+	pivotFound := false
+	for p := head; p < tail; p++ {
+		v, got := c.srv.store.GetKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
+		c.vbuf = v
+		if got && string(v) == string(pivot) {
+			pivotPos = p
+			pivotFound = true
+			break
+		}
+	}
+	if !pivotFound {
+		mu.Unlock()
+		c.writeInt(-1)
+		return
+	}
+
+	// Insertion index i within the window: BEFORE lands the new element at the pivot's index,
+	// AFTER at the next one. left is how many elements sit before the slot, right how many after.
+	i := pivotPos - head
+	if !before {
+		i++
+	}
+	n := tail - head
+	left := i
+	right := n - i
+
+	var newElemPos int64
+	if left <= right {
+		// Shift the left run [head, head+i) down by one, lowest source first so each target slot
+		// is freshly vacated (head-1 is empty to begin with). The freed slot at head+i-1 takes the
+		// new element and the window grows on the left.
+		for p := head; p < head+i; p++ {
+			v, _ := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
+			c.vbuf = v
+			c.srv.store.PutKind(c.listElemKey(lkey, p-1), v, kindListElem)
+		}
+		newElemPos = head + i - 1
+		head--
+	} else {
+		// Shift the right run [head+i, tail) up by one, highest source first so each target slot is
+		// freshly vacated (tail is empty to begin with). The freed slot at head+i takes the new
+		// element and the window grows on the right.
+		for p := tail - 1; p >= head+i; p-- {
+			v, _ := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
+			c.vbuf = v
+			c.srv.store.PutKind(c.listElemKey(lkey, p+1), v, kindListElem)
+		}
+		newElemPos = head + i
+		tail++
+	}
+	c.srv.store.PutKind(c.listElemKey(lkey, newElemPos), val, kindListElem)
+	lpBytes += uint64(listEntrySize(val))
+	if !everLarge && lpBytes > listListpackMaxBytes {
+		everLarge = true
+	}
+	c.listPutHeaderAt(hoff, head, tail, lpBytes, everLarge)
+	mu.Unlock()
+	c.writeInt(tail - head)
+}
+
+// cmdLRem implements LREM key count value. It removes matching elements from the interior of
+// the window and then compacts the survivors back into a contiguous run so the dense-window
+// invariant holds for the next positional read. count > 0 removes the first count matches
+// scanning from the head, count < 0 the last |count| scanning from the tail, and count 0 all
+// of them. A first pass collects the matching positions (positions only, not values, so a huge
+// list does not buffer its contents), the sign of count selects which of those to drop, and a
+// second pass walks the window with a write cursor, point-deleting the dropped rows and sliding
+// each survivor down to close the gaps. Removing the last element deletes the key, exactly as
+// Redis drops an emptied list. A missing key replies 0 and a plain string under the key is
+// WRONGTYPE.
+func (c *connState) cmdLRem(argv [][]byte) {
+	if len(argv) != 4 {
+		c.writeErr("ERR wrong number of arguments for 'lrem' command")
+		return
+	}
+	lkey := argv[1]
+	count, err := atoi64(argv[2])
+	if err != nil {
+		c.writeErr("ERR value is not an integer or out of range")
+		return
+	}
+	target := argv[3]
+
+	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
+	mu.Lock()
+	if c.stringConflict(lkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
+	if !ok {
+		mu.Unlock()
+		c.writeInt(0)
+		return
+	}
+
+	// Pass one: collect the positions of every match in list order.
+	var matches []int64
+	for p := head; p < tail; p++ {
+		v, found := c.srv.store.GetKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
+		c.vbuf = v
+		if found && string(v) == string(target) {
+			matches = append(matches, p)
+		}
+	}
+	if len(matches) == 0 {
+		mu.Unlock()
+		c.writeInt(0)
+		return
+	}
+	// Select which matches to drop from the sign and magnitude of count: a positive count keeps
+	// the leading matches, a negative count the trailing ones, and zero drops them all.
+	del := make(map[int64]struct{}, len(matches))
+	switch {
+	case count > 0:
+		k := count
+		if k > int64(len(matches)) {
+			k = int64(len(matches))
+		}
+		for _, p := range matches[:k] {
+			del[p] = struct{}{}
+		}
+	case count < 0:
+		k := -count
+		if k > int64(len(matches)) {
+			k = int64(len(matches))
+		}
+		for _, p := range matches[int64(len(matches))-k:] {
+			del[p] = struct{}{}
+		}
+	default:
+		for _, p := range matches {
+			del[p] = struct{}{}
+		}
+	}
+
+	// Pass two: walk the window with a write cursor. A dropped element's row is point-deleted and
+	// its bytes come off the running size; a survivor slides down to the cursor only when a gap has
+	// opened before it, so an untouched prefix is never rewritten.
+	removed := int64(0)
+	w := head
+	for p := head; p < tail; p++ {
+		if _, drop := del[p]; drop {
+			v, took := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
+			if took {
+				lpBytes -= uint64(listEntrySize(v))
+			}
+			removed++
+			continue
+		}
+		if w != p {
+			v, _ := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
+			c.vbuf = v
+			c.srv.store.PutKind(c.listElemKey(lkey, w), v, kindListElem)
+		}
+		w++
+	}
+	if w == head {
+		// Every element was removed: the list is empty, so the key stops existing.
+		c.srv.store.DeleteKind(lkey, kindListMeta)
+	} else {
+		c.listPutHeaderAt(hoff, head, w, lpBytes, everLarge)
+	}
+	mu.Unlock()
+	c.writeInt(removed)
+}
+
 // listEntrySize returns the bytes one element occupies inside a Redis listpack: its encoding
 // plus the backlen field, matching lpEncodeGetType followed by lpEncodeBacklen. This is what
 // the running lpBytes sums, so OBJECT ENCODING flips to quicklist at the exact element the
