@@ -221,6 +221,8 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdXReadGroup(argv)
 	case eqFold(cmd, "XACK"):
 		c.cmdXAck(argv)
+	case eqFold(cmd, "XPENDING"):
+		c.cmdXPending(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):

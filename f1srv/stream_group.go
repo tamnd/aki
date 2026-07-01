@@ -717,6 +717,287 @@ func (c *connState) cmdXAck(argv [][]byte) {
 	c.writeInt(acked)
 }
 
+// --- XPENDING ---
+
+// streamPendingNoGroup is the NOGROUP reply XPENDING gives for a missing key or group. It names the
+// key then the group and carries no trailing clause, so it is worded differently from both the
+// XGROUP/XACK form and the XREADGROUP form.
+func streamPendingNoGroup(key, group string) string {
+	return "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"
+}
+
+// streamIDDec returns the id immediately below id and true, or false when id is 0-0 (no predecessor).
+// It lets an inclusive lower bound reuse the strictly-after CollScan: scanning past the predecessor
+// key yields the first row at or above the bound, since ids are adjacent 128-bit integers with no id
+// strictly between a value and its predecessor.
+func streamIDDec(id streamID) (streamID, bool) {
+	if id.seq > 0 {
+		return streamID{ms: id.ms, seq: id.seq - 1}, true
+	}
+	if id.ms > 0 {
+		return streamID{ms: id.ms - 1, seq: ^uint64(0)}, true
+	}
+	return streamID{}, false
+}
+
+// cmdXPending implements both XPENDING forms. The summary form (XPENDING key group) reports the
+// group's total pending count, the low and high pending ids, and a per-consumer breakdown, all off
+// the group control row and the sibling rows without decoding the whole pending list. The extended
+// form (XPENDING key group [IDLE ms] start end count [consumer]) streams the pending rows in id order
+// across the [start, end] window, up to count, filtered by idle time and consumer, so its cost tracks
+// the requested window, not the pending-list size.
+func (c *connState) cmdXPending(argv [][]byte) {
+	if len(argv) < 3 {
+		c.writeErr("ERR wrong number of arguments for 'xpending' command")
+		return
+	}
+	skey := argv[1]
+	groupName := string(argv[2])
+
+	// Summary form is exactly key + group; any other argument count is either the extended form
+	// (6..9 args) or a syntax error. Redis validates the shape before touching the key, so a bad
+	// shape reports "syntax error" even when the key or group is missing.
+	if len(argv) == 3 {
+		c.xpendingSummary(skey, groupName)
+		return
+	}
+	if len(argv) < 6 || len(argv) > 9 {
+		c.writeErr("ERR syntax error")
+		return
+	}
+
+	// Extended form. Redis parses every option (IDLE, count, start, end) before it looks up the key
+	// or group, so a non-integer or bad-id argument reports its own error ahead of NOGROUP. The
+	// optional leading IDLE keyword shifts the start/end/count triple two positions right.
+	startIdx := 3
+	var minIdle int64
+	if strings.EqualFold(string(argv[3]), "IDLE") {
+		v, err := strconv.ParseInt(string(argv[4]), 10, 64)
+		if err != nil {
+			c.writeErr(errStreamNotInt)
+			return
+		}
+		if len(argv) < 8 {
+			c.writeErr("ERR syntax error")
+			return
+		}
+		minIdle = v
+		startIdx = 5
+	}
+	// count is parsed before start/end, matching Redis: XPENDING key group FOO 0 - + 10 reports the
+	// count error on the "-" at the count position, not a bad-id error on "FOO".
+	count, err := strconv.ParseInt(string(argv[startIdx+2]), 10, 64)
+	if err != nil {
+		c.writeErr(errStreamNotInt)
+		return
+	}
+	start, startExcl, ok1 := parseRangeBound(string(argv[startIdx]), 0)
+	end, endExcl, ok2 := parseRangeBound(string(argv[startIdx+1]), ^uint64(0))
+	if !ok1 || !ok2 {
+		c.writeErr(errStreamInvalidID)
+		return
+	}
+	consumerFilter := ""
+	hasConsumerFilter := false
+	if startIdx+3 < len(argv) {
+		consumerFilter = string(argv[startIdx+3])
+		hasConsumerFilter = true
+	}
+	c.xpendingExtended(skey, groupName, minIdle, start, startExcl, end, endExcl, count, consumerFilter, hasConsumerFilter)
+}
+
+// xpendingSummary answers the summary form. It reads the group's total pending count from the control
+// row, the low and high ids from the first and last PEL rows by positional select, and the
+// per-consumer breakdown by scanning the consumer rows (bounded by the consumer count, not the
+// pending-list size) and reporting each consumer that still owes an ack.
+func (c *connState) xpendingSummary(skey []byte, group string) {
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.Lock()
+	if c.stringConflict(skey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	_, _, _, _, exists := c.streamHeader(skey)
+	if !exists {
+		mu.Unlock()
+		c.writeErr(streamPendingNoGroup(string(skey), group))
+		return
+	}
+	g, ok := c.getStreamGroup(skey, group)
+	if !ok {
+		mu.Unlock()
+		c.writeErr(streamPendingNoGroup(string(skey), group))
+		return
+	}
+
+	// An empty pending list replies count 0, null low, null high, and a null consumer array.
+	if g.pending == 0 {
+		mu.Unlock()
+		c.writeArrayHeader(4)
+		c.writeInt(0)
+		c.writeNil()
+		c.writeNil()
+		c.writeNilArray()
+		return
+	}
+
+	pelPrefix := streamPELPrefix(skey, group)
+	minKeys, _ := c.srv.store.CollScan(pelPrefix, nil, 1, nil)
+	maxKey, maxOK := c.srv.store.CollSelectAt(pelPrefix, int(g.pending)-1)
+
+	// Per-consumer breakdown, in consumer-name order (the order the consumer rows sort in), skipping
+	// any consumer with nothing pending.
+	type consumerCount struct {
+		name    string
+		pending uint64
+	}
+	var breakdown []consumerCount
+	consPrefix := streamConsumerPrefix(skey, group)
+	var after, cbuf []byte
+	for {
+		keys, last := c.srv.store.CollScan(consPrefix, after, streamTrimBatch, nil)
+		if len(keys) == 0 {
+			break
+		}
+		for _, k := range keys {
+			v, got := c.srv.store.GetKind(k, cbuf[:0], kindStreamConsumer)
+			if !got || len(v) < streamConsumerBytes {
+				continue
+			}
+			cbuf = v
+			p := binary.LittleEndian.Uint64(v[16:24])
+			if p == 0 {
+				continue
+			}
+			breakdown = append(breakdown, consumerCount{name: string(k[len(consPrefix):]), pending: p})
+		}
+		after = last
+	}
+	mu.Unlock()
+
+	c.writeArrayHeader(4)
+	c.writeInt(int64(g.pending))
+	if len(minKeys) > 0 {
+		c.writeBulk([]byte(decodeEntryID(minKeys[0]).String()))
+	} else {
+		c.writeNil()
+	}
+	if maxOK {
+		c.writeBulk([]byte(decodeEntryID(maxKey).String()))
+	} else {
+		c.writeNil()
+	}
+	if len(breakdown) == 0 {
+		c.writeNilArray()
+		return
+	}
+	c.writeArrayHeader(len(breakdown))
+	for _, b := range breakdown {
+		c.writeArrayHeader(2)
+		c.writeBulk([]byte(b.name))
+		// The per-consumer count is a bulk string in the summary reply, not an integer.
+		c.writeBulk([]byte(strconv.FormatUint(b.pending, 10)))
+	}
+}
+
+// xpendingExtended answers the extended form. It walks the group's PEL rows in id order across the
+// requested [start, end] window, emitting one [id, consumer, idle-ms, delivery-count] row per pending
+// entry that passes the idle-time and consumer filters, up to count rows. A non-positive count yields
+// an empty reply. The walk seeks to the start bound and stops at the end bound, so it touches the
+// window, not the whole pending list.
+func (c *connState) xpendingExtended(skey []byte, group string, minIdle int64, start streamID, startExcl bool, end streamID, endExcl bool, count int64, consumerFilter string, hasConsumerFilter bool) {
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.Lock()
+	if c.stringConflict(skey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	_, _, _, _, exists := c.streamHeader(skey)
+	if !exists {
+		mu.Unlock()
+		c.writeErr(streamPendingNoGroup(string(skey), group))
+		return
+	}
+	if _, ok := c.getStreamGroup(skey, group); !ok {
+		mu.Unlock()
+		c.writeErr(streamPendingNoGroup(string(skey), group))
+		return
+	}
+
+	type pendingRow struct {
+		id            streamID
+		consumer      string
+		idle          int64
+		deliveryCount uint64
+	}
+	var rows []pendingRow
+	if count > 0 {
+		now := nowMillis()
+		prefix := streamPELPrefix(skey, group)
+		// Seek to the start bound. An exclusive start scans past the start key itself; an inclusive
+		// start scans past the predecessor so the start row is included, or from the prefix front
+		// when the start is 0-0 and has no predecessor.
+		var scanAfter []byte
+		if startExcl {
+			scanAfter = streamPELKey(skey, group, start)
+		} else if pred, ok := streamIDDec(start); ok {
+			scanAfter = streamPELKey(skey, group, pred)
+		}
+		var buf []byte
+		done := false
+		for !done {
+			pkeys, last := c.srv.store.CollScan(prefix, scanAfter, streamTrimBatch, nil)
+			if len(pkeys) == 0 {
+				break
+			}
+			for _, k := range pkeys {
+				id := decodeEntryID(k)
+				// Stop at the end bound: past end for an inclusive end, at or past end for exclusive.
+				if endExcl {
+					if !id.less(end) {
+						done = true
+						break
+					}
+				} else if end.less(id) {
+					done = true
+					break
+				}
+				v, got := c.srv.store.GetKind(k, buf[:0], kindStreamPEL)
+				if !got {
+					continue
+				}
+				buf = v
+				pe := decodeStreamPEL(v)
+				if hasConsumerFilter && pe.consumer != consumerFilter {
+					continue
+				}
+				idle := now - pe.deliveryTime
+				if idle < minIdle {
+					continue
+				}
+				rows = append(rows, pendingRow{id: id, consumer: pe.consumer, idle: idle, deliveryCount: pe.deliveryCount})
+				if int64(len(rows)) >= count {
+					done = true
+					break
+				}
+			}
+			scanAfter = last
+		}
+	}
+	mu.Unlock()
+
+	c.writeArrayHeader(len(rows))
+	for _, r := range rows {
+		c.writeArrayHeader(4)
+		c.writeBulk([]byte(r.id.String()))
+		c.writeBulk([]byte(r.consumer))
+		c.writeInt(r.idle)
+		c.writeInt(int64(r.deliveryCount))
+	}
+}
+
 // --- XREADGROUP ---
 
 // rgRow is one row of an XREADGROUP reply: an entry with its fields, or a tombstone whose fields
