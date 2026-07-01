@@ -336,3 +336,129 @@ func TestStreamGroupErrorParity(t *testing.T) {
 	r := asArray(t, readValue(t, rw), 1)
 	asArray(t, asArray(t, r[0], 2)[1], 1)
 }
+
+// asInt asserts v is an integer reply and returns it.
+func asInt(t *testing.T, v any) int64 {
+	t.Helper()
+	n, ok := v.(int64)
+	if !ok {
+		t.Fatalf("value = %#v, want an integer", v)
+	}
+	return n
+}
+
+// TestStreamPending covers XPENDING summary and extended forms, the idle and consumer filters, and
+// the error and arity paths, all pinned to the replies Redis 8.8 and Valkey 9.1 give.
+func TestStreamPending(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	for _, id := range []string{"1-1", "2-1", "3-1", "4-1"} {
+		cmd(t, rw, "XADD", "s", id, "f", "v")
+		expect(t, rw, "$"+id)
+	}
+	cmd(t, rw, "XGROUP", "CREATE", "s", "g1", "0")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "XGROUP", "CREATE", "s", "empty", "0")
+	expect(t, rw, "+OK")
+
+	// alice takes 1-1..3-1, bob takes 4-1, then 1-1 is acked so alice keeps 2 pending.
+	cmd(t, rw, "XREADGROUP", "GROUP", "g1", "alice", "COUNT", "3", "STREAMS", "s", ">")
+	asArray(t, readValue(t, rw), 1)
+	cmd(t, rw, "XREADGROUP", "GROUP", "g1", "bob", "STREAMS", "s", ">")
+	asArray(t, readValue(t, rw), 1)
+	cmd(t, rw, "XACK", "s", "g1", "1-1")
+	expect(t, rw, ":1")
+
+	// Summary: total 3, low 2-1, high 4-1, breakdown alice=2 (bulk string) then bob=1.
+	cmd(t, rw, "XPENDING", "s", "g1")
+	sum := asArray(t, readValue(t, rw), 4)
+	if got := asInt(t, sum[0]); got != 3 {
+		t.Fatalf("summary total = %d, want 3", got)
+	}
+	asBulk(t, sum[1], "2-1")
+	asBulk(t, sum[2], "4-1")
+	cons := asArray(t, sum[3], 2)
+	a := asArray(t, cons[0], 2)
+	asBulk(t, a[0], "alice")
+	asBulk(t, a[1], "2") // count is a bulk string in the summary
+	b := asArray(t, cons[1], 2)
+	asBulk(t, b[0], "bob")
+	asBulk(t, b[1], "1")
+
+	// Summary of a group with nothing pending: 0, nil, nil, nil.
+	cmd(t, rw, "XPENDING", "s", "empty")
+	e := asArray(t, readValue(t, rw), 4)
+	if got := asInt(t, e[0]); got != 0 {
+		t.Fatalf("empty summary total = %d, want 0", got)
+	}
+	if e[1] != nil || e[2] != nil || e[3] != nil {
+		t.Fatalf("empty summary tail = %#v, want three nils", e[1:])
+	}
+
+	// Extended: the three pending rows in id order, each [id, consumer, idle, delivery-count].
+	cmd(t, rw, "XPENDING", "s", "g1", "-", "+", "10")
+	ext := asArray(t, readValue(t, rw), 3)
+	wantRows := []struct{ id, consumer string }{{"2-1", "alice"}, {"3-1", "alice"}, {"4-1", "bob"}}
+	for i, wr := range wantRows {
+		row := asArray(t, ext[i], 4)
+		asBulk(t, row[0], wr.id)
+		asBulk(t, row[1], wr.consumer)
+		if idle := asInt(t, row[2]); idle < 0 {
+			t.Fatalf("row %d idle = %d, want >= 0", i, idle)
+		}
+		if dc := asInt(t, row[3]); dc != 1 {
+			t.Fatalf("row %d delivery-count = %d, want 1", i, dc)
+		}
+	}
+
+	// Consumer filter narrows to alice's two rows.
+	cmd(t, rw, "XPENDING", "s", "g1", "-", "+", "10", "alice")
+	fa := asArray(t, readValue(t, rw), 2)
+	asBulk(t, asArray(t, fa[0], 4)[0], "2-1")
+	asBulk(t, asArray(t, fa[1], 4)[0], "3-1")
+
+	// COUNT caps the window to the first row.
+	cmd(t, rw, "XPENDING", "s", "g1", "-", "+", "1")
+	asArray(t, readValue(t, rw), 1)
+
+	// A huge IDLE floor filters everything out.
+	cmd(t, rw, "XPENDING", "s", "g1", "IDLE", "9999999", "-", "+", "10")
+	asArray(t, readValue(t, rw), 0)
+
+	// An exclusive start drops the boundary row.
+	cmd(t, rw, "XPENDING", "s", "g1", "(2-1", "+", "10")
+	xs := asArray(t, readValue(t, rw), 2)
+	asBulk(t, asArray(t, xs[0], 4)[0], "3-1")
+
+	// A non-positive COUNT yields an empty reply, not an error.
+	cmd(t, rw, "XPENDING", "s", "g1", "-", "+", "0")
+	asArray(t, readValue(t, rw), 0)
+
+	// Error and arity paths, verbatim to Redis and Valkey.
+	cmd(t, rw, "XPENDING", "nokey", "g1")
+	expect(t, rw, "-NOGROUP No such key 'nokey' or consumer group 'g1'")
+	cmd(t, rw, "XPENDING", "s", "ghost")
+	expect(t, rw, "-NOGROUP No such key 's' or consumer group 'ghost'")
+	cmd(t, rw, "XPENDING", "s")
+	expect(t, rw, "-ERR wrong number of arguments for 'xpending' command")
+	cmd(t, rw, "XPENDING", "s", "g1", "extra")
+	expect(t, rw, "-ERR syntax error")
+	cmd(t, rw, "XPENDING", "s", "g1", "-", "+")
+	expect(t, rw, "-ERR syntax error")
+	cmd(t, rw, "XPENDING", "s", "g1", "-", "+", "abc")
+	expect(t, rw, "-ERR value is not an integer or out of range")
+	cmd(t, rw, "XPENDING", "s", "g1", "xx", "+", "10")
+	expect(t, rw, "-ERR Invalid stream ID specified as stream command argument")
+	cmd(t, rw, "XPENDING", "s", "g1", "IDLE", "abc", "-", "+", "10")
+	expect(t, rw, "-ERR value is not an integer or out of range")
+	// A non-IDLE token in the IDLE slot shifts count onto "-", which fails the integer parse first.
+	cmd(t, rw, "XPENDING", "s", "g1", "FOO", "0", "-", "+", "10")
+	expect(t, rw, "-ERR value is not an integer or out of range")
+
+	// Wrong type on the key.
+	cmd(t, rw, "SET", "str", "v")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "XPENDING", "str", "g1")
+	expect(t, rw, "-WRONGTYPE Operation against a key holding the wrong kind of value")
+}
