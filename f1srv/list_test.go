@@ -374,6 +374,191 @@ func TestListLTrim(t *testing.T) {
 	expect(t, rw, "+OK")
 }
 
+// LINSERT opens an interior slot by shifting the shorter side of the pivot, so the window stays
+// contiguous and dense positional reads keep working. It covers BEFORE and AFTER on both sides
+// of the midpoint, the missing-key and missing-pivot replies, and a bad where token.
+func TestListLInsert(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	// Missing key replies 0 and creates nothing.
+	cmd(t, rw, "LINSERT", "l", "BEFORE", "x", "y")
+	expect(t, rw, ":0")
+	cmd(t, rw, "LLEN", "l")
+	expect(t, rw, ":0")
+
+	cmd(t, rw, "RPUSH", "l", "a", "b", "c", "d", "e")
+	expect(t, rw, ":5")
+
+	// BEFORE near the head shifts the short left side.
+	cmd(t, rw, "LINSERT", "l", "BEFORE", "b", "B1")
+	expect(t, rw, ":6")
+	if got := lrangeCall(t, rw, "LRANGE", "l", "0", "-1"); !eqStrs(got, []string{"a", "B1", "b", "c", "d", "e"}) {
+		t.Fatalf("after LINSERT BEFORE b = %v", got)
+	}
+	// AFTER near the tail shifts the short right side.
+	cmd(t, rw, "LINSERT", "l", "AFTER", "d", "D1")
+	expect(t, rw, ":7")
+	if got := lrangeCall(t, rw, "LRANGE", "l", "0", "-1"); !eqStrs(got, []string{"a", "B1", "b", "c", "d", "D1", "e"}) {
+		t.Fatalf("after LINSERT AFTER d = %v", got)
+	}
+	// First occurrence is the pivot when the value repeats.
+	cmd(t, rw, "LINSERT", "l", "BEFORE", "a", "HEAD")
+	expect(t, rw, ":8")
+	cmd(t, rw, "LINSERT", "l", "AFTER", "e", "TAIL")
+	expect(t, rw, ":9")
+	if got := lrangeCall(t, rw, "LRANGE", "l", "0", "-1"); !eqStrs(got, []string{"HEAD", "a", "B1", "b", "c", "d", "D1", "e", "TAIL"}) {
+		t.Fatalf("after head/tail LINSERT = %v", got)
+	}
+	// The ends still push in order after the interior edits.
+	cmd(t, rw, "LPUSH", "l", "L")
+	expect(t, rw, ":10")
+	cmd(t, rw, "RPUSH", "l", "R")
+	expect(t, rw, ":11")
+	if got := lrangeCall(t, rw, "LRANGE", "l", "0", "-1"); !eqStrs(got, []string{"L", "HEAD", "a", "B1", "b", "c", "d", "D1", "e", "TAIL", "R"}) {
+		t.Fatalf("after push around LINSERT = %v", got)
+	}
+
+	// A pivot that is not present replies -1.
+	cmd(t, rw, "LINSERT", "l", "BEFORE", "nope", "z")
+	expect(t, rw, ":-1")
+	// A bad where token is a syntax error.
+	cmd(t, rw, "LINSERT", "l", "SIDEWAYS", "a", "z")
+	if got := readReply(t, rw); got != "-ERR syntax error" {
+		t.Fatalf("LINSERT bad where = %q", got)
+	}
+}
+
+// LREM removes matching elements and compacts the survivors so the window stays contiguous. It
+// covers head-first positive count, tail-first negative count, remove-all with zero, the missing
+// forms, and the empties-to-deleted case.
+func TestListLRem(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	// Missing key replies 0.
+	cmd(t, rw, "LREM", "l", "0", "a")
+	expect(t, rw, ":0")
+
+	// Positive count removes from the head.
+	cmd(t, rw, "RPUSH", "l", "a", "b", "a", "c", "a", "d")
+	expect(t, rw, ":6")
+	cmd(t, rw, "LREM", "l", "2", "a")
+	expect(t, rw, ":2")
+	if got := lrangeCall(t, rw, "LRANGE", "l", "0", "-1"); !eqStrs(got, []string{"b", "c", "a", "d"}) {
+		t.Fatalf("after LREM 2 a = %v", got)
+	}
+	// The compacted window still pushes and reads by position.
+	cmd(t, rw, "LINDEX", "l", "2")
+	expect(t, rw, "$a")
+	cmd(t, rw, "RPUSH", "l", "e")
+	expect(t, rw, ":5")
+
+	// Negative count removes from the tail.
+	cmd(t, rw, "DEL", "l2")
+	readReply(t, rw)
+	cmd(t, rw, "RPUSH", "l2", "x", "a", "y", "a", "z", "a")
+	expect(t, rw, ":6")
+	cmd(t, rw, "LREM", "l2", "-2", "a")
+	expect(t, rw, ":2")
+	if got := lrangeCall(t, rw, "LRANGE", "l2", "0", "-1"); !eqStrs(got, []string{"x", "a", "y", "z"}) {
+		t.Fatalf("after LREM -2 a = %v", got)
+	}
+
+	// Zero count removes every match.
+	cmd(t, rw, "LREM", "l2", "0", "a")
+	expect(t, rw, ":1")
+	if got := lrangeCall(t, rw, "LRANGE", "l2", "0", "-1"); !eqStrs(got, []string{"x", "y", "z"}) {
+		t.Fatalf("after LREM 0 a = %v", got)
+	}
+	// A value that is not present replies 0 and changes nothing.
+	cmd(t, rw, "LREM", "l2", "0", "nope")
+	expect(t, rw, ":0")
+
+	// Removing the last element deletes the key.
+	cmd(t, rw, "DEL", "l3")
+	readReply(t, rw)
+	cmd(t, rw, "RPUSH", "l3", "a", "a", "a")
+	expect(t, rw, ":3")
+	cmd(t, rw, "LREM", "l3", "0", "a")
+	expect(t, rw, ":3")
+	cmd(t, rw, "LLEN", "l3")
+	expect(t, rw, ":0")
+	cmd(t, rw, "TYPE", "l3")
+	expect(t, rw, "+none")
+}
+
+// EXISTS and DEL must see every namespace, not just strings. A collection lives as a header
+// row plus element rows, so an EXISTS that only probed the string namespace reported a live
+// list/hash/set/zset as missing, and a DEL that only deleted the string record removed nothing
+// and left the collection's rows orphaned. This walks the exact partial-LREM survivor case that
+// surfaced the gap, then the full DEL cascade across all four collection types.
+func TestKeyExistsDelCascade(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	// A partial LREM that leaves a survivor keeps the key: it must still EXIST.
+	cmd(t, rw, "RPUSH", "surv", "b", "c")
+	expect(t, rw, ":2")
+	cmd(t, rw, "LREM", "surv", "0", "b")
+	expect(t, rw, ":1")
+	cmd(t, rw, "EXISTS", "surv")
+	expect(t, rw, ":1")
+	cmd(t, rw, "LINDEX", "surv", "0")
+	expect(t, rw, "$c")
+
+	// EXISTS and DEL see a collection of each type, and DEL cascades header plus element rows.
+	cmd(t, rw, "HSET", "h", "f1", "v1", "f2", "v2")
+	expect(t, rw, ":2")
+	cmd(t, rw, "SADD", "s", "x", "y", "z")
+	expect(t, rw, ":3")
+	cmd(t, rw, "ZADD", "z", "1", "m", "2", "n")
+	expect(t, rw, ":2")
+	cmd(t, rw, "RPUSH", "l", "p", "q", "r")
+	expect(t, rw, ":3")
+
+	cmd(t, rw, "EXISTS", "h", "s", "z", "l")
+	expect(t, rw, ":4")
+	cmd(t, rw, "DEL", "h", "s", "z", "l")
+	expect(t, rw, ":4")
+	cmd(t, rw, "EXISTS", "h", "s", "z", "l")
+	expect(t, rw, ":0")
+
+	// A DEL leaves no orphan element rows behind: re-adding one member yields a set of exactly one.
+	cmd(t, rw, "SADD", "s2", "a", "b", "c")
+	expect(t, rw, ":3")
+	cmd(t, rw, "DEL", "s2")
+	expect(t, rw, ":1")
+	cmd(t, rw, "SADD", "s2", "only")
+	expect(t, rw, ":1")
+	cmd(t, rw, "SCARD", "s2")
+	expect(t, rw, ":1")
+
+	// A re-pushed list starts fresh, no leftover positions from the deleted one.
+	cmd(t, rw, "RPUSH", "l", "b", "c")
+	expect(t, rw, ":2")
+	if got := lrangeCall(t, rw, "LRANGE", "l", "0", "-1"); !eqStrs(got, []string{"b", "c"}) {
+		t.Fatalf("re-pushed list = %v, want [b c]", got)
+	}
+
+	// A re-added zset drops the old members: both indexes were cleared.
+	cmd(t, rw, "ZADD", "z", "5", "q")
+	expect(t, rw, ":1")
+	cmd(t, rw, "ZCARD", "z")
+	expect(t, rw, ":1")
+	if got := lrangeCall(t, rw, "ZRANGE", "z", "0", "-1"); !eqStrs(got, []string{"q"}) {
+		t.Fatalf("re-added zset = %v, want [q]", got)
+	}
+
+	// EXISTS counts each occurrence; DEL counts keys actually removed.
+	cmd(t, rw, "HSET", "hm", "f", "v")
+	expect(t, rw, ":1")
+	cmd(t, rw, "EXISTS", "hm", "hm", "nope")
+	expect(t, rw, ":2")
+	cmd(t, rw, "DEL", "hm", "hm")
+	expect(t, rw, ":1")
+}
+
 // A list command against a plain string is WRONGTYPE, and a string command against a list is
 // too, so the two namespaces never cross-read.
 func TestListWrongType(t *testing.T) {
@@ -395,6 +580,8 @@ func TestListWrongType(t *testing.T) {
 		{"LPUSHX", "s", "x"},
 		{"RPUSHX", "s", "x"},
 		{"LTRIM", "s", "0", "-1"},
+		{"LINSERT", "s", "BEFORE", "a", "b"},
+		{"LREM", "s", "0", "a"},
 	} {
 		cmd(t, rw, args...)
 		got := readReply(t, rw)
