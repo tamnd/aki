@@ -135,6 +135,8 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdZRemRangeByScore(argv)
 	case eqFold(cmd, "ZREMRANGEBYLEX"):
 		c.cmdZRemRangeByLex(argv)
+	case eqFold(cmd, "ZRANDMEMBER"):
+		c.cmdZRandMember(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
