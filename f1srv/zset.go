@@ -1,0 +1,609 @@
+package f1srv
+
+import (
+	"encoding/binary"
+	"errors"
+	"math"
+	"strconv"
+)
+
+// errInvalidFloat is the sentinel parseScore returns for any input Redis's string2d would
+// reject; the call sites translate it to the exact Redis wire message.
+var errInvalidFloat = errors.New("invalid float")
+
+// Sorted set is the fourth collection type on f1raw, and it is the first with two element-row
+// families under one collection key (spec 2064/f1_rewrite_ltm/07 section 2): a member-family
+// row for the map view (ZSCORE, existence, the old-score read inside ZADD/ZINCRBY/ZREM) and a
+// score-family row for the order view (ZRANGE and the rank commands, later slices). Both are
+// element-per-row like the hash and set, so a billion-member board mutates and reads a bounded
+// handful of rows and never materializes the collection.
+//
+// The two families share the composite-key shape the hash and set use, plus a one-byte family
+// discriminator so the single ordered element index keeps them apart. The member family key is
+// uvarint(len(zkey)) | zkey | 'm' | member, sorted by member bytes; the score family key is
+// uvarint(len(zkey)) | zkey | 's' | sortable(score) | member, sorted by score then member. The
+// length prefix makes the collection key injective (no two zsets share a row), and 'm' < 's'
+// keeps every member row of a zset ahead of its score rows, so a prefix scan bounded by
+// uvarint(len(zkey))|zkey|'m' enumerates exactly the member family and the |'s' prefix exactly
+// the score family. The discriminator lives in the key bytes, not just the record kind, because
+// the ordered index scans and removes by key bytes and must never intermix the two families.
+//
+// The member family row value is the raw IEEE-754 score bits, little-endian, so ZSCORE decodes
+// with one Float64frombits and never touches the score family or the sortable codec (spec 5.3
+// raw-bits option). The score family row carries nothing: the presence of the key is the whole
+// content, and its sortable-score prefix is what makes a plain byte comparison equal the numeric
+// score order (section 5.2).
+//
+// A per-zset header row (kindZsetMeta under the bare key) holds the maintained cardinality and
+// the folded encoding tag, so ZCARD is one header read and OBJECT ENCODING answers in O(1). The
+// header count and the live member-row count stay exactly equal because every add pairs a member
+// CollInsert with a count bump and every ZREM pairs a member CollRemove with a decrement.
+//
+// Write serialization: ZADD/ZREM/ZINCRBY take the per-key stripe lock (shared with the INCR
+// family, the hash, and the set) so a zset's two families and its header count stay consistent
+// under concurrent writers. Reads (ZSCORE/ZMSCORE/ZCARD) are lock-free.
+const (
+	kindZsetMember byte = 0x03 // a member-family row, value is the 8-byte little-endian score bits
+	kindZsetScore  byte = 0x04 // a score-family row, empty value, keyed by sortable score then member
+	kindZsetMeta   byte = 0x0A // the per-zset header row (coll_header)
+)
+
+// Family discriminator bytes placed after the length-prefixed collection key. 'm' sorts before
+// 's', so a zset's member rows precede its score rows in the shared ordered index; each family's
+// prefix scan is bounded to its own rows.
+const (
+	zsetMemberTag byte = 'm'
+	zsetScoreTag  byte = 's'
+)
+
+// encSkiplist is the zset counterpart of the set/hash encoding tags in object.go: a zset starts
+// listpack and folds one-way to skiplist. It reuses the shared encoding byte space (encNone=0,
+// encListpack=2 already defined there) with a value distinct from the set tags so a stored tag
+// is unambiguous.
+const encSkiplist byte = 4
+
+// Redis ship defaults for the zset encoding thresholds (zset-max-listpack-entries and
+// zset-max-listpack-value). CONFIG is a no-op on f1srv, so these are the defaults every stock
+// Redis and Valkey runs, which is what a client comparing OBJECT ENCODING expects.
+const (
+	zsetMaxListpackEntries = 128
+	zsetMaxListpackValue   = 64
+)
+
+// foldZsetEnc applies Redis's one-way zset encoding upgrade for a member being added, given the
+// encoding so far and the cardinality after the add. A zset starts listpack and upgrades to
+// skiplist once it outgrows the entry limit or any member outgrows the value-length limit;
+// skiplist is terminal, so a removal never walks it back. It mirrors the listpack/skiplist choice
+// in zsetTypeMaybeConvert.
+func foldZsetEnc(cur byte, member []byte, newCount uint64) byte {
+	if cur == encSkiplist {
+		return encSkiplist
+	}
+	if newCount > zsetMaxListpackEntries || len(member) > zsetMaxListpackValue {
+		return encSkiplist
+	}
+	return encListpack
+}
+
+// zsetEncodingName maps a stored zset encoding tag to the wire name Redis reports.
+func zsetEncodingName(enc byte) string {
+	if enc == encSkiplist {
+		return "skiplist"
+	}
+	return "listpack"
+}
+
+// encodeSortableScore writes the order-preserving 8-byte encoding of a score into dst (spec
+// section 5.2): take the IEEE-754 bits, flip the sign bit when it is clear (positives sort above
+// the transformed negatives) or flip all 64 bits when it is set (larger-magnitude negatives sort
+// first), then store big-endian so the most significant byte compares first. After this a plain
+// byte comparison of two score keys equals the numeric order, -inf transforms to the smallest
+// bytes and +inf to the largest, and +0.0/-0.0 map to the same value.
+func encodeSortableScore(dst []byte, score float64) {
+	bits := math.Float64bits(score)
+	if bits&(1<<63) == 0 {
+		bits ^= 1 << 63
+	} else {
+		bits = ^bits
+	}
+	binary.BigEndian.PutUint64(dst, bits)
+}
+
+// normalizeZero maps -0.0 to +0.0 and leaves every other value untouched. Redis's default
+// listpack zset collapses -0 to integer 0 (via string2ll), so a score ingested as -0.0 must
+// surface as "0", not "-0"; we normalize at ingest, before the score reaches either family or
+// formatScore, so ZSCORE and the ZADD-INCR/ZINCRBY replies match the default encoding.
+func normalizeZero(f float64) float64 {
+	if f == 0 {
+		return 0
+	}
+	return f
+}
+
+// parseScore parses a score argument the way Redis's string2d/getDouble does: the whole string
+// must be a valid float, "inf"/"+inf"/"-inf"/"infinity" are accepted, leading or trailing junk
+// and whitespace are rejected, an out-of-range magnitude (which strtod would flag ERANGE) is
+// rejected, and nan is rejected. Go's ParseFloat already rejects whitespace and trailing junk and
+// returns a non-nil error on the ERANGE cases, so an error from it is exactly Redis's reject set;
+// the extra guards reject an underscore separator ParseFloat would otherwise accept but strtod
+// would not, and reject a nan that parsed cleanly.
+func parseScore(b []byte) (float64, error) {
+	for _, ch := range b {
+		if ch == '_' {
+			return 0, errInvalidFloat
+		}
+	}
+	f, err := strconv.ParseFloat(string(b), 64)
+	if err != nil {
+		return 0, errInvalidFloat
+	}
+	if math.IsNaN(f) {
+		return 0, errInvalidFloat
+	}
+	return f, nil
+}
+
+// zmemberKey builds the member-family composite key for (zkey, member) into the reused kbuf.
+func (c *connState) zmemberKey(zkey, member []byte) []byte {
+	b := c.kbuf[:0]
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(len(zkey)))
+	b = append(b, tmp[:n]...)
+	b = append(b, zkey...)
+	b = append(b, zsetMemberTag)
+	b = append(b, member...)
+	c.kbuf = b
+	return b
+}
+
+// zscoreKey builds the score-family composite key for (zkey, score, member) into the reused
+// kbuf: the length-prefixed key, the score-family tag, the 8 sortable score bytes, then the
+// member. It shares kbuf with zmemberKey, so a caller finishes with a member key before building
+// a score key.
+func (c *connState) zscoreKey(zkey []byte, score float64, member []byte) []byte {
+	b := c.kbuf[:0]
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(len(zkey)))
+	b = append(b, tmp[:n]...)
+	b = append(b, zkey...)
+	b = append(b, zsetScoreTag)
+	var sortable [8]byte
+	encodeSortableScore(sortable[:], score)
+	b = append(b, sortable[:]...)
+	b = append(b, member...)
+	c.kbuf = b
+	return b
+}
+
+// zsetHeader reads a zset's header row: the maintained cardinality and the encoding tag folded
+// forward by its writers. ok is false when the zset has no header (no members); the encoding is
+// the 9th header byte, encNone for a header written before the tag existed.
+func (c *connState) zsetHeader(zkey []byte) (count uint64, enc byte, ok bool) {
+	var cb [9]byte
+	v, got := c.srv.store.GetKind(zkey, cb[:0], kindZsetMeta)
+	if !got || len(v) < 8 {
+		return 0, encNone, false
+	}
+	enc = encNone
+	if len(v) >= 9 {
+		enc = v[8]
+	}
+	return binary.LittleEndian.Uint64(v), enc, true
+}
+
+// zsetCard reads a zset's maintained cardinality, 0 when it has no members.
+func (c *connState) zsetCard(zkey []byte) uint64 {
+	count, _, _ := c.zsetHeader(zkey)
+	return count
+}
+
+// zsetPutHeader writes a zset's cardinality and encoding tag, or deletes the header when the
+// count reaches zero so the key stops existing (empty zset is no zset). It is the write the
+// growing paths (ZADD, ZINCRBY into a new member) use, which know the fresh encoding.
+func (c *connState) zsetPutHeader(zkey []byte, count uint64, enc byte) error {
+	if count == 0 {
+		c.srv.store.DeleteKind(zkey, kindZsetMeta)
+		return nil
+	}
+	var ob [9]byte
+	binary.LittleEndian.PutUint64(ob[:8], count)
+	ob[8] = enc
+	_, err := c.srv.store.PutKind(zkey, ob[:], kindZsetMeta)
+	return err
+}
+
+// zsetSetCard writes a zset's cardinality while preserving its recorded encoding, or deletes the
+// header at zero. It is the write the shrinking path (ZREM) uses: a removal never changes the
+// encoding (Redis never downgrades), so it keeps the tag the zset already carries.
+func (c *connState) zsetSetCard(zkey []byte, count uint64) error {
+	if count == 0 {
+		c.srv.store.DeleteKind(zkey, kindZsetMeta)
+		return nil
+	}
+	_, enc, _ := c.zsetHeader(zkey)
+	return c.zsetPutHeader(zkey, count, enc)
+}
+
+// zsetInsertNew writes a brand-new member's two rows in one logical step (spec section 2.3
+// new-member case): the member-family row carrying the score bits, then the score-family row.
+// The caller holds the stripe lock, has verified the member is absent, and bumps the header
+// count separately. mk is the member key already built in kbuf; this consumes it before
+// rebuilding kbuf for the score key.
+func (c *connState) zsetInsertNew(zkey, member, mk []byte, score float64) error {
+	var sb [8]byte
+	binary.LittleEndian.PutUint64(sb[:], math.Float64bits(score))
+	if _, err := c.srv.store.PutKind(mk, sb[:], kindZsetMember); err != nil {
+		return err
+	}
+	c.srv.store.CollInsert(mk, kindZsetMember)
+	sk := c.zscoreKey(zkey, score, member)
+	if _, err := c.srv.store.PutKind(sk, nil, kindZsetScore); err != nil {
+		return err
+	}
+	c.srv.store.CollInsert(sk, kindZsetScore)
+	return nil
+}
+
+// zsetUpdateScore moves an existing member from oldScore to newScore (spec section 2.4): a
+// score change is a member-row value overwrite plus a score-row delete-then-insert, because the
+// score-family key encodes the score and a row whose key changes is a delete of the old key and
+// an insert of the new. Cardinality is unchanged. The caller holds the stripe lock and has
+// verified newScore differs from oldScore. mk is consumed before kbuf is rebuilt for the score
+// keys.
+func (c *connState) zsetUpdateScore(zkey, member, mk []byte, oldScore, newScore float64) error {
+	var sb [8]byte
+	binary.LittleEndian.PutUint64(sb[:], math.Float64bits(newScore))
+	if _, err := c.srv.store.PutKind(mk, sb[:], kindZsetMember); err != nil {
+		return err
+	}
+	oldSK := c.zscoreKey(zkey, oldScore, member)
+	if c.srv.store.DeleteKind(oldSK, kindZsetScore) {
+		c.srv.store.CollRemove(oldSK)
+	}
+	newSK := c.zscoreKey(zkey, newScore, member)
+	if _, err := c.srv.store.PutKind(newSK, nil, kindZsetScore); err != nil {
+		return err
+	}
+	c.srv.store.CollInsert(newSK, kindZsetScore)
+	return nil
+}
+
+// writeScore replies with a member's score as a RESP2 bulk string, formatted the way Redis
+// formats zset scores (formatScore is the byte-for-byte port of Redis's d2string). It reuses
+// sbuf so the reply costs no allocation.
+func (c *connState) writeScore(value float64) {
+	c.sbuf = formatScore(c.sbuf[:0], value)
+	c.writeBulk(c.sbuf)
+}
+
+func (c *connState) cmdZAdd(argv [][]byte) {
+	// ZADD key [NX | XX] [GT | LT] [CH] [INCR] score member [score member ...]
+	if len(argv) < 4 {
+		c.writeErr("ERR wrong number of arguments for 'zadd' command")
+		return
+	}
+	zkey := argv[1]
+
+	var nx, xx, gt, lt, ch, incr bool
+	i := 2
+scanFlags:
+	for ; i < len(argv); i++ {
+		switch {
+		case eqFold(argv[i], "NX"):
+			nx = true
+		case eqFold(argv[i], "XX"):
+			xx = true
+		case eqFold(argv[i], "GT"):
+			gt = true
+		case eqFold(argv[i], "LT"):
+			lt = true
+		case eqFold(argv[i], "CH"):
+			ch = true
+		case eqFold(argv[i], "INCR"):
+			incr = true
+		default:
+			break scanFlags
+		}
+	}
+	rest := argv[i:]
+	if len(rest) == 0 || len(rest)%2 != 0 {
+		c.writeErr("ERR syntax error")
+		return
+	}
+	pairs := len(rest) / 2
+
+	if nx && xx {
+		c.writeErr("ERR XX and NX options at the same time are not compatible")
+		return
+	}
+	if (gt && nx) || (lt && nx) || (gt && lt) {
+		c.writeErr("ERR GT, LT, and/or NX options at the same time are not compatible")
+		return
+	}
+	if incr && pairs > 1 {
+		c.writeErr("ERR INCR option supports a single increment-element pair")
+		return
+	}
+
+	// Parse every score up front so a malformed float rejects the whole command before any
+	// write, matching Redis, which fills its score array before touching the keyspace.
+	scores := c.zscores[:0]
+	for j := 0; j < pairs; j++ {
+		s, err := parseScore(rest[j*2])
+		if err != nil {
+			c.writeErr("ERR value is not a valid float")
+			return
+		}
+		scores = append(scores, s)
+	}
+	c.zscores = scores
+
+	mu := &c.srv.incrMu[c.srv.stripe(zkey)]
+	mu.Lock()
+	if c.stringConflict(zkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+
+	count, enc, _ := c.zsetHeader(zkey)
+	added := 0
+	changed := 0
+	var incrScore float64
+	incrSuppressed := false
+
+	for j := 0; j < pairs; j++ {
+		member := rest[j*2+1]
+		score := normalizeZero(scores[j])
+
+		mk := c.zmemberKey(zkey, member)
+		oldv, present := c.srv.store.GetKind(mk, c.vbuf[:0], kindZsetMember)
+		c.vbuf = oldv
+
+		if present {
+			oldScore := math.Float64frombits(binary.LittleEndian.Uint64(oldv))
+			newScore := score
+			if incr {
+				newScore = normalizeZero(oldScore + score)
+				if math.IsNaN(newScore) {
+					mu.Unlock()
+					c.writeErr("ERR resulting score is not a number (NaN)")
+					return
+				}
+			}
+			if nx {
+				incrSuppressed = true
+				continue
+			}
+			if (lt && newScore >= oldScore) || (gt && newScore <= oldScore) {
+				incrSuppressed = true
+				continue
+			}
+			incrScore = newScore
+			if newScore != oldScore {
+				if err := c.zsetUpdateScore(zkey, member, mk, oldScore, newScore); err != nil {
+					mu.Unlock()
+					c.writeErr("ERR " + err.Error())
+					return
+				}
+				changed++
+			}
+			continue
+		}
+
+		// Absent member. GT/LT gate only the update path, so a new member is still added
+		// unless XX forbids new members.
+		if xx {
+			incrSuppressed = true
+			continue
+		}
+		if err := c.zsetInsertNew(zkey, member, mk, score); err != nil {
+			mu.Unlock()
+			c.writeErr("ERR " + err.Error())
+			return
+		}
+		count++
+		enc = foldZsetEnc(enc, member, count)
+		added++
+		changed++
+		incrScore = score
+	}
+
+	if added > 0 {
+		if err := c.zsetPutHeader(zkey, count, enc); err != nil {
+			mu.Unlock()
+			c.writeErr("ERR " + err.Error())
+			return
+		}
+	}
+	mu.Unlock()
+
+	if incr {
+		if incrSuppressed {
+			c.writeNil()
+			return
+		}
+		c.writeScore(incrScore)
+		return
+	}
+	if ch {
+		c.writeInt(int64(changed))
+		return
+	}
+	c.writeInt(int64(added))
+}
+
+func (c *connState) cmdZIncrBy(argv [][]byte) {
+	// ZINCRBY key increment member
+	if len(argv) != 4 {
+		c.writeErr("ERR wrong number of arguments for 'zincrby' command")
+		return
+	}
+	incr, err := parseScore(argv[2])
+	if err != nil {
+		c.writeErr("ERR value is not a valid float")
+		return
+	}
+	zkey := argv[1]
+	member := argv[3]
+
+	mu := &c.srv.incrMu[c.srv.stripe(zkey)]
+	mu.Lock()
+	if c.stringConflict(zkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+
+	mk := c.zmemberKey(zkey, member)
+	oldv, present := c.srv.store.GetKind(mk, c.vbuf[:0], kindZsetMember)
+	c.vbuf = oldv
+
+	newScore := incr
+	if present {
+		oldScore := math.Float64frombits(binary.LittleEndian.Uint64(oldv))
+		newScore = oldScore + incr
+		if math.IsNaN(newScore) {
+			mu.Unlock()
+			c.writeErr("ERR resulting score is not a number (NaN)")
+			return
+		}
+		newScore = normalizeZero(newScore)
+		if newScore != oldScore {
+			if err := c.zsetUpdateScore(zkey, member, mk, oldScore, newScore); err != nil {
+				mu.Unlock()
+				c.writeErr("ERR " + err.Error())
+				return
+			}
+		}
+		mu.Unlock()
+		c.writeScore(newScore)
+		return
+	}
+
+	newScore = normalizeZero(newScore)
+	if err := c.zsetInsertNew(zkey, member, mk, newScore); err != nil {
+		mu.Unlock()
+		c.writeErr("ERR " + err.Error())
+		return
+	}
+	count, enc, _ := c.zsetHeader(zkey)
+	count++
+	enc = foldZsetEnc(enc, member, count)
+	if err := c.zsetPutHeader(zkey, count, enc); err != nil {
+		mu.Unlock()
+		c.writeErr("ERR " + err.Error())
+		return
+	}
+	mu.Unlock()
+	c.writeScore(newScore)
+}
+
+func (c *connState) cmdZScore(argv [][]byte) {
+	// ZSCORE key member
+	if len(argv) != 3 {
+		c.writeErr("ERR wrong number of arguments for 'zscore' command")
+		return
+	}
+	if c.stringConflict(argv[1]) {
+		c.writeErr(wrongType)
+		return
+	}
+	mk := c.zmemberKey(argv[1], argv[2])
+	v, ok := c.srv.store.GetKind(mk, c.vbuf[:0], kindZsetMember)
+	c.vbuf = v
+	if !ok {
+		c.writeNil()
+		return
+	}
+	c.writeScore(math.Float64frombits(binary.LittleEndian.Uint64(v)))
+}
+
+func (c *connState) cmdZMScore(argv [][]byte) {
+	// ZMSCORE key member [member ...]
+	if len(argv) < 3 {
+		c.writeErr("ERR wrong number of arguments for 'zmscore' command")
+		return
+	}
+	if c.stringConflict(argv[1]) {
+		c.writeErr(wrongType)
+		return
+	}
+	c.writeArrayHeader(len(argv) - 2)
+	for _, member := range argv[2:] {
+		mk := c.zmemberKey(argv[1], member)
+		v, ok := c.srv.store.GetKind(mk, c.vbuf[:0], kindZsetMember)
+		c.vbuf = v
+		if !ok {
+			c.writeNil()
+			continue
+		}
+		c.writeScore(math.Float64frombits(binary.LittleEndian.Uint64(v)))
+	}
+}
+
+func (c *connState) cmdZCard(argv [][]byte) {
+	// ZCARD key
+	if len(argv) != 2 {
+		c.writeErr("ERR wrong number of arguments for 'zcard' command")
+		return
+	}
+	if c.stringConflict(argv[1]) {
+		c.writeErr(wrongType)
+		return
+	}
+	c.writeInt(int64(c.zsetCard(argv[1])))
+}
+
+func (c *connState) cmdZRem(argv [][]byte) {
+	// ZREM key member [member ...]
+	if len(argv) < 3 {
+		c.writeErr("ERR wrong number of arguments for 'zrem' command")
+		return
+	}
+	zkey := argv[1]
+	mu := &c.srv.incrMu[c.srv.stripe(zkey)]
+	mu.Lock()
+	if c.stringConflict(zkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+
+	removed := 0
+	for _, member := range argv[2:] {
+		mk := c.zmemberKey(zkey, member)
+		v, ok := c.srv.store.GetKind(mk, c.vbuf[:0], kindZsetMember)
+		c.vbuf = v
+		if !ok {
+			continue
+		}
+		// Read the score before touching the member row so the score family can be addressed
+		// directly, the point of storing the score in the member row (spec section 2.5).
+		score := math.Float64frombits(binary.LittleEndian.Uint64(v))
+		if c.srv.store.DeleteKind(mk, kindZsetMember) {
+			c.srv.store.CollRemove(mk)
+		}
+		sk := c.zscoreKey(zkey, score, member)
+		if c.srv.store.DeleteKind(sk, kindZsetScore) {
+			c.srv.store.CollRemove(sk)
+		}
+		removed++
+	}
+
+	if removed > 0 {
+		count := c.zsetCard(zkey)
+		if uint64(removed) >= count {
+			count = 0
+		} else {
+			count -= uint64(removed)
+		}
+		if err := c.zsetSetCard(zkey, count); err != nil {
+			mu.Unlock()
+			c.writeErr("ERR " + err.Error())
+			return
+		}
+	}
+	mu.Unlock()
+	c.writeInt(int64(removed))
+}
