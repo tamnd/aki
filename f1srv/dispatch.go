@@ -169,6 +169,16 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdLIndex(argv)
 	case eqFold(cmd, "LRANGE"):
 		c.cmdLRange(argv)
+	case eqFold(cmd, "LSET"):
+		c.cmdLSet(argv)
+	case eqFold(cmd, "LPOS"):
+		c.cmdLPos(argv)
+	case eqFold(cmd, "LPUSHX"):
+		c.cmdLPushX(argv)
+	case eqFold(cmd, "RPUSHX"):
+		c.cmdRPushX(argv)
+	case eqFold(cmd, "LTRIM"):
+		c.cmdLTrim(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):

@@ -177,18 +177,27 @@ func (c *connState) listEncodingName(lkey []byte) string {
 	return "listpack"
 }
 
-func (c *connState) cmdLPush(argv [][]byte) { c.cmdPush(argv, true) }
-func (c *connState) cmdRPush(argv [][]byte) { c.cmdPush(argv, false) }
+func (c *connState) cmdLPush(argv [][]byte)  { c.cmdPush(argv, true, false) }
+func (c *connState) cmdRPush(argv [][]byte)  { c.cmdPush(argv, false, false) }
+func (c *connState) cmdLPushX(argv [][]byte) { c.cmdPush(argv, true, true) }
+func (c *connState) cmdRPushX(argv [][]byte) { c.cmdPush(argv, false, true) }
 
-// cmdPush is the shared body for LPUSH (atHead) and RPUSH (atTail). It appends every element
-// to the correct end of the window one at a time, so LPUSH a b c leaves the list [c b a] and
-// RPUSH a b c leaves [a b c], matching Redis's per-element prepend/append order. The running
-// listpack byte size grows by each element's entry size, and the sticky large flag latches on
-// the first time the total crosses the byte budget, which is what OBJECT ENCODING reads back.
-func (c *connState) cmdPush(argv [][]byte, atHead bool) {
+// cmdPush is the shared body for LPUSH/LPUSHX (atHead) and RPUSH/RPUSHX (atTail). It appends
+// every element to the correct end of the window one at a time, so LPUSH a b c leaves the list
+// [c b a] and RPUSH a b c leaves [a b c], matching Redis's per-element prepend/append order.
+// The running listpack byte size grows by each element's entry size, and the sticky large flag
+// latches on the first time the total crosses the byte budget, which is what OBJECT ENCODING
+// reads back. When requireExisting is set (the LPUSHX/RPUSHX forms), a missing list is left
+// untouched and the reply is 0 rather than a freshly created list.
+func (c *connState) cmdPush(argv [][]byte, atHead, requireExisting bool) {
 	if len(argv) < 3 {
 		name := "rpush"
-		if atHead {
+		switch {
+		case atHead && requireExisting:
+			name = "lpushx"
+		case requireExisting:
+			name = "rpushx"
+		case atHead:
 			name = "lpush"
 		}
 		c.writeErr("ERR wrong number of arguments for '" + name + "' command")
@@ -203,6 +212,11 @@ func (c *connState) cmdPush(argv [][]byte, atHead bool) {
 		return
 	}
 	head, tail, lpBytes, everLarge, hoff, existed := c.listHeaderAt(lkey)
+	if requireExisting && !existed {
+		mu.Unlock()
+		c.writeInt(0)
+		return
+	}
 	for _, elem := range argv[2:] {
 		var pos int64
 		if atHead {
@@ -466,6 +480,287 @@ func (c *connState) cmdLRange(argv [][]byte) {
 		c.writeBulk(v)
 	}
 	mu.Unlock()
+}
+
+// cmdLSet implements LSET: it overwrites the element at a signed index with a new value, an
+// O(1) positional point write that never touches any other row. It maps the index onto the
+// window exactly as LINDEX does, replaces that one element row, and adjusts the running
+// listpack byte size by the difference between the new and old encoded sizes so OBJECT
+// ENCODING stays exact; the sticky large flag can only latch on, never clear. A missing key is
+// "ERR no such key", an out-of-range index is "ERR index out of range", and a plain string
+// under the key is WRONGTYPE. It takes the stripe lock so the window is stable between the
+// header read and the element write.
+func (c *connState) cmdLSet(argv [][]byte) {
+	if len(argv) != 4 {
+		c.writeErr("ERR wrong number of arguments for 'lset' command")
+		return
+	}
+	lkey := argv[1]
+	idx, err := atoi64(argv[2])
+	if err != nil {
+		c.writeErr("ERR value is not an integer or out of range")
+		return
+	}
+	val := argv[3]
+	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
+	mu.Lock()
+	if c.stringConflict(lkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
+	if !ok {
+		mu.Unlock()
+		c.writeErr("ERR no such key")
+		return
+	}
+	pos := head + idx
+	if idx < 0 {
+		pos = tail + idx
+	}
+	if pos < head || pos >= tail {
+		mu.Unlock()
+		c.writeErr("ERR index out of range")
+		return
+	}
+	ek := c.listElemKey(lkey, pos)
+	old, found := c.srv.store.GetKind(ek, c.vbuf[:0], kindListElem)
+	oldSize := 0
+	if found {
+		oldSize = listEntrySize(old)
+	}
+	if _, err := c.srv.store.PutKind(ek, val, kindListElem); err != nil {
+		mu.Unlock()
+		c.writeErr("ERR " + err.Error())
+		return
+	}
+	lpBytes = lpBytes - uint64(oldSize) + uint64(listEntrySize(val))
+	if !everLarge && lpBytes > listListpackMaxBytes {
+		everLarge = true
+	}
+	c.listPutHeaderAt(hoff, head, tail, lpBytes, everLarge)
+	mu.Unlock()
+	c.writeSimple("OK")
+}
+
+// cmdLPos implements LPOS: it finds the position of an element in list order, scanning by
+// value with the RANK, COUNT, and MAXLEN options. RANK picks which match to start from (1 is
+// the first from the head, a negative rank scans from the tail), COUNT bounds how many matches
+// to return (0 means all, and its presence switches the reply from a single integer or nil to
+// an array), and MAXLEN caps the number of elements compared (0 is unlimited). Every scanned
+// element is one direct point read of its position row; the reported position is the dense
+// external index (offset from the head). A missing key is a nil reply (or an empty array with
+// COUNT), and a plain string under the key is WRONGTYPE. It takes the stripe lock so the
+// window is stable across the scan.
+func (c *connState) cmdLPos(argv [][]byte) {
+	if len(argv) < 3 {
+		c.writeErr("ERR wrong number of arguments for 'lpos' command")
+		return
+	}
+	lkey := argv[1]
+	target := argv[2]
+	var rank int64 = 1
+	rankGiven := false
+	var count int64 = -1 // -1 means COUNT not given (single-match reply)
+	var maxlen int64 = 0 // 0 means no comparison cap
+	for i := 3; i < len(argv); i += 2 {
+		if i+1 >= len(argv) {
+			c.writeErr("ERR syntax error")
+			return
+		}
+		opt := argv[i]
+		n, err := atoi64(argv[i+1])
+		if err != nil {
+			c.writeErr("ERR value is not an integer or out of range")
+			return
+		}
+		switch {
+		case eqFold(opt, "RANK"):
+			if n == 0 {
+				c.writeErr("ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list")
+				return
+			}
+			rank = n
+			rankGiven = true
+		case eqFold(opt, "COUNT"):
+			if n < 0 {
+				c.writeErr("ERR COUNT can't be negative")
+				return
+			}
+			count = n
+		case eqFold(opt, "MAXLEN"):
+			if n < 0 {
+				c.writeErr("ERR MAXLEN can't be negative")
+				return
+			}
+			maxlen = n
+		default:
+			c.writeErr("ERR syntax error")
+			return
+		}
+	}
+	_ = rankGiven
+
+	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
+	mu.Lock()
+	if c.stringConflict(lkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	head, tail, _, _, _, ok := c.listHeaderAt(lkey)
+	if !ok {
+		mu.Unlock()
+		if count >= 0 {
+			c.writeArrayHeader(0)
+		} else {
+			c.writeNil()
+		}
+		return
+	}
+
+	// Direction and how many leading matches to skip come from the sign and magnitude of rank.
+	backward := rank < 0
+	skip := rank - 1
+	if backward {
+		skip = -rank - 1
+	}
+	matches := c.lposScan(lkey, target, head, tail, backward, skip, count, maxlen)
+	mu.Unlock()
+
+	if count >= 0 {
+		c.writeArrayHeader(len(matches))
+		for _, p := range matches {
+			c.writeInt(p)
+		}
+		return
+	}
+	if len(matches) == 0 {
+		c.writeNil()
+		return
+	}
+	c.writeInt(matches[0])
+}
+
+// lposScan walks the window in the search direction, comparing each element to target and
+// collecting the dense positions of the matches after skipping the first skip of them. It
+// stops when it has enough (want, where want <= 0 with a given COUNT means all) or when it has
+// compared maxlen elements (maxlen 0 disables the cap). The returned positions are external
+// indexes (offset from head), so they are already in the form the reply wants.
+func (c *connState) lposScan(lkey, target []byte, head, tail int64, backward bool, skip, want, maxlen int64) []int64 {
+	var out []int64
+	var compared int64
+	step := int64(1)
+	pos := head
+	if backward {
+		step = -1
+		pos = tail - 1
+	}
+	for pos >= head && pos < tail {
+		if maxlen > 0 && compared >= maxlen {
+			break
+		}
+		ek := c.listElemKey(lkey, pos)
+		v, found := c.srv.store.GetKind(ek, c.vbuf[:0], kindListElem)
+		c.vbuf = v
+		compared++
+		if found && string(v) == string(target) {
+			if skip > 0 {
+				skip--
+			} else {
+				out = append(out, pos-head)
+				// want < 0 means single-match mode: one is enough. want == 0 means all matches.
+				if want < 0 || (want > 0 && int64(len(out)) >= want) {
+					break
+				}
+			}
+		}
+		pos += step
+	}
+	return out
+}
+
+// cmdLTrim implements LTRIM: it keeps only the positional window [start, stop] and discards
+// the rest. Because a trim removes only from the two ends, the surviving elements stay a
+// contiguous run, so this moves the head and tail bounds inward and point-deletes the rows that
+// fall outside, no renumbering of survivors. It normalizes the inclusive range the way LRANGE
+// does; an empty or inverted range removes everything and deletes the key. A missing key is a
+// no-op that still replies OK, and a plain string under the key is WRONGTYPE. It takes the
+// stripe lock so the window cannot shift under the trim.
+func (c *connState) cmdLTrim(argv [][]byte) {
+	if len(argv) != 4 {
+		c.writeErr("ERR wrong number of arguments for 'ltrim' command")
+		return
+	}
+	lkey := argv[1]
+	start, err := atoi64(argv[2])
+	if err != nil {
+		c.writeErr("ERR value is not an integer or out of range")
+		return
+	}
+	stop, err := atoi64(argv[3])
+	if err != nil {
+		c.writeErr("ERR value is not an integer or out of range")
+		return
+	}
+	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
+	mu.Lock()
+	if c.stringConflict(lkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
+	if !ok {
+		mu.Unlock()
+		c.writeSimple("OK")
+		return
+	}
+	n := tail - head
+	if start < 0 {
+		start += n
+		if start < 0 {
+			start = 0
+		}
+	}
+	if stop < 0 {
+		stop += n
+	}
+	if stop >= n {
+		stop = n - 1
+	}
+	// An empty or inverted window trims the whole list away: delete every row and the header.
+	if start > stop || start >= n {
+		for p := head; p < tail; p++ {
+			c.srv.store.DeleteKind(c.listElemKey(lkey, p), kindListElem)
+		}
+		c.srv.store.DeleteKind(lkey, kindListMeta)
+		mu.Unlock()
+		c.writeSimple("OK")
+		return
+	}
+	newHead := head + start
+	newTail := head + stop + 1
+	// Point-delete the rows that fall outside the surviving window, subtracting each from the
+	// running byte size so OBJECT ENCODING stays exact. The survivors keep their position keys.
+	for p := head; p < newHead; p++ {
+		ek := c.listElemKey(lkey, p)
+		v, took := c.srv.store.TakeKind(ek, c.vbuf[:0], kindListElem)
+		if took {
+			lpBytes -= uint64(listEntrySize(v))
+		}
+	}
+	for p := newTail; p < tail; p++ {
+		ek := c.listElemKey(lkey, p)
+		v, took := c.srv.store.TakeKind(ek, c.vbuf[:0], kindListElem)
+		if took {
+			lpBytes -= uint64(listEntrySize(v))
+		}
+	}
+	c.listPutHeaderAt(hoff, newHead, newTail, lpBytes, everLarge)
+	mu.Unlock()
+	c.writeSimple("OK")
 }
 
 // listEntrySize returns the bytes one element occupies inside a Redis listpack: its encoding
