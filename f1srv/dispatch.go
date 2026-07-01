@@ -243,6 +243,16 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdBitField(argv, false)
 	case eqFold(cmd, "BITFIELD_RO"):
 		c.cmdBitField(argv, true)
+	case eqFold(cmd, "PFADD"):
+		c.cmdPfAdd(argv)
+	case eqFold(cmd, "PFCOUNT"):
+		c.cmdPfCount(argv)
+	case eqFold(cmd, "PFMERGE"):
+		c.cmdPfMerge(argv)
+	case eqFold(cmd, "PFDEBUG"):
+		c.cmdPfDebug(argv)
+	case eqFold(cmd, "PFSELFTEST"):
+		c.cmdPfSelfTest(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
