@@ -237,6 +237,12 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdBitCount(argv)
 	case eqFold(cmd, "BITPOS"):
 		c.cmdBitPos(argv)
+	case eqFold(cmd, "BITOP"):
+		c.cmdBitOp(argv)
+	case eqFold(cmd, "BITFIELD"):
+		c.cmdBitField(argv, false)
+	case eqFold(cmd, "BITFIELD_RO"):
+		c.cmdBitField(argv, true)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
@@ -380,6 +386,13 @@ func (c *connState) dropKey(key []byte) bool {
 	mu := &c.srv.incrMu[c.srv.stripe(key)]
 	mu.Lock()
 	defer mu.Unlock()
+	return c.dropKeyLocked(key)
+}
+
+// dropKeyLocked is the cascade body of dropKey without the stripe lock, for callers that already
+// hold the relevant stripe lock (BITOP holds every key's stripe under lockStripes before it
+// overwrites the destination).
+func (c *connState) dropKeyLocked(key []byte) bool {
 	switch c.keyTypeOf(key) {
 	case keyString:
 		return c.srv.store.Delete(key)
