@@ -189,6 +189,16 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdRPopLPush(argv)
 	case eqFold(cmd, "LMPOP"):
 		c.cmdLMPop(argv)
+	case eqFold(cmd, "BLPOP"):
+		c.cmdBLPop(argv)
+	case eqFold(cmd, "BRPOP"):
+		c.cmdBRPop(argv)
+	case eqFold(cmd, "BLMOVE"):
+		c.cmdBLMove(argv)
+	case eqFold(cmd, "BRPOPLPUSH"):
+		c.cmdBRPopLPush(argv)
+	case eqFold(cmd, "BLMPOP"):
+		c.cmdBLMPop(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
