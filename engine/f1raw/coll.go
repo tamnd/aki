@@ -81,3 +81,41 @@ func (s *Store) DeleteKind(key []byte, kind byte) bool {
 		}
 	}
 }
+
+// CollInsert records key in the ordered element index so a bounded cursor can
+// enumerate it in key order. Call it right after PutKind reports a new element row so
+// the ordered run and the hash index agree on the live set. It is a no-op if the
+// record is not found (a concurrent delete), keeping the index from pointing at a
+// vanished record. Serialize it with the collection's other writers, the same stripe
+// lock PutKind's created flag relies on.
+func (s *Store) CollInsert(key []byte, kind byte) {
+	h := hash(key)
+	off, _, _, _, found := s.find(key, h, kind)
+	if !found {
+		return
+	}
+	s.oidx.insert(off)
+}
+
+// CollRemove drops key from the ordered element index. Call it right after DeleteKind
+// removes an element row, under the same stripe lock, so the ordered run does not
+// enumerate a deleted element.
+func (s *Store) CollRemove(key []byte) {
+	s.oidx.remove(key)
+}
+
+// CollScan appends, to dst, the full composite keys of up to limit element rows whose
+// key has the given prefix and sorts strictly after `after` (nil after starts at the
+// prefix), in key order. It returns the grown dst and the last key returned, to pass
+// back as `after` for the next batch; last is nil when the batch is empty. Each
+// returned key is a subslice of the immutable arena, valid for the store's life, so
+// the caller reads it without copying and re-resolves the value through GetKind. This
+// is the bounded cursor the whole-collection reads (HGETALL, HKEYS, HVALS, HSCAN)
+// stream through, so they never materialize the collection.
+func (s *Store) CollScan(prefix, after []byte, limit int, dst [][]byte) (keys [][]byte, last []byte) {
+	offs, last := s.oidx.scanBatch(prefix, after, limit, make([]uint64, 0, limit))
+	for _, off := range offs {
+		dst = append(dst, s.keyAt(off))
+	}
+	return dst, last
+}
