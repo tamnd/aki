@@ -24,6 +24,16 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdSet(argv)
 	case eqFold(cmd, "GETEX"):
 		c.cmdGetEx(argv)
+	case eqFold(cmd, "SETEX"):
+		c.cmdSetEx(argv, false)
+	case eqFold(cmd, "PSETEX"):
+		c.cmdSetEx(argv, true)
+	case eqFold(cmd, "SETNX"):
+		c.cmdSetNX(argv)
+	case eqFold(cmd, "GETDEL"):
+		c.cmdGetDel(argv)
+	case eqFold(cmd, "GETSET"):
+		c.cmdGetSet(argv)
 	case eqFold(cmd, "INCR"):
 		c.cmdIncrBy(argv, 1, false)
 	case eqFold(cmd, "DECR"):
