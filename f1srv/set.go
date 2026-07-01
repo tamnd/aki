@@ -62,28 +62,57 @@ func (c *connState) setPrefix(skey []byte) []byte {
 	return b
 }
 
+// setHeader reads a set's header row: the maintained cardinality and the encoding tag folded
+// forward by its writers (object.go). ok is false when the set has no header row (no members),
+// in which case the count is 0 and the encoding is encNone. The encoding byte is the 9th header
+// byte; a header written before the encoding tag existed is read as encNone.
+func (c *connState) setHeader(skey []byte) (count uint64, enc byte, ok bool) {
+	var cb [9]byte
+	v, got := c.srv.store.GetKind(skey, cb[:0], kindSetMeta)
+	if !got || len(v) < 8 {
+		return 0, encNone, false
+	}
+	enc = encNone
+	if len(v) >= 9 {
+		enc = v[8]
+	}
+	return binary.LittleEndian.Uint64(v), enc, true
+}
+
 // setCard reads a set's maintained cardinality from its header row, returning 0 when the
 // set has no members (no header row).
 func (c *connState) setCard(skey []byte) uint64 {
-	var cb [8]byte
-	v, ok := c.srv.store.GetKind(skey, cb[:0], kindSetMeta)
-	if !ok || len(v) < 8 {
-		return 0
-	}
-	return binary.LittleEndian.Uint64(v)
+	count, _, _ := c.setHeader(skey)
+	return count
 }
 
-// setSetCard writes a set's cardinality to its header row, or deletes the header when the
-// count reaches zero so the set key stops existing (empty set is no set).
+// setPutHeader writes a set's cardinality and encoding tag to its header row, or deletes the
+// header when the count reaches zero so the set key stops existing (empty set is no set). It is
+// the write used by the paths that grow a set (SADD, SMOVE into a destination, the STORE forms)
+// and know the fresh encoding.
+func (c *connState) setPutHeader(skey []byte, count uint64, enc byte) error {
+	if count == 0 {
+		c.srv.store.DeleteKind(skey, kindSetMeta)
+		return nil
+	}
+	var ob [9]byte
+	binary.LittleEndian.PutUint64(ob[:8], count)
+	ob[8] = enc
+	_, err := c.srv.store.PutKind(skey, ob[:], kindSetMeta)
+	return err
+}
+
+// setSetCard writes a set's cardinality while preserving its recorded encoding, or deletes the
+// header when the count reaches zero. It is the write used by the paths that only shrink a set
+// (SREM, SPOP, SMOVE out of a source): a removal never changes the encoding (Redis never
+// downgrades), so it keeps the tag the set already carries.
 func (c *connState) setSetCard(skey []byte, count uint64) error {
 	if count == 0 {
 		c.srv.store.DeleteKind(skey, kindSetMeta)
 		return nil
 	}
-	var ob [8]byte
-	binary.LittleEndian.PutUint64(ob[:], count)
-	_, err := c.srv.store.PutKind(skey, ob[:], kindSetMeta)
-	return err
+	_, enc, _ := c.setHeader(skey)
+	return c.setPutHeader(skey, count, enc)
 }
 
 func (c *connState) cmdSAdd(argv [][]byte) {
@@ -100,6 +129,9 @@ func (c *connState) cmdSAdd(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	// Track the running cardinality and encoding so the header is written once with the
+	// count bumped and the encoding folded forward over every member actually added.
+	count, enc, _ := c.setHeader(skey)
 	added := 0
 	for _, member := range argv[2:] {
 		mk := c.memberKey(skey, member)
@@ -112,10 +144,12 @@ func (c *connState) cmdSAdd(argv [][]byte) {
 		if isNew {
 			c.srv.store.CollInsert(mk, kindSetMember)
 			added++
+			count++
+			enc = foldSetEnc(enc, member, count)
 		}
 	}
 	if added > 0 {
-		if err := c.setSetCard(skey, c.setCard(skey)+uint64(added)); err != nil {
+		if err := c.setPutHeader(skey, count, enc); err != nil {
 			mu.Unlock()
 			c.writeErr("ERR " + err.Error())
 			return
@@ -695,7 +729,12 @@ func (c *connState) cmdSMove(argv [][]byte) {
 	}
 	if isNew {
 		c.srv.store.CollInsert(dstMK, kindSetMember)
-		if err := c.setSetCard(destination, c.setCard(destination)+1); err != nil {
+		// A genuine insert can raise the destination's encoding (a non-integer member arriving
+		// at an intset, or a growth past a threshold), so fold it forward like SADD does.
+		count, enc, _ := c.setHeader(destination)
+		count++
+		enc = foldSetEnc(enc, member, count)
+		if err := c.setPutHeader(destination, count, enc); err != nil {
 			unlock()
 			c.writeErr("ERR " + err.Error())
 			return

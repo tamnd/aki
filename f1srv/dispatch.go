@@ -93,6 +93,10 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdSUnionStore(argv)
 	case eqFold(cmd, "SDIFFSTORE"):
 		c.cmdSDiffStore(argv)
+	case eqFold(cmd, "TYPE"):
+		c.cmdType(argv)
+	case eqFold(cmd, "OBJECT"):
+		c.cmdObject(argv)
 	case eqFold(cmd, "PING"):
 		c.cmdPing(argv)
 	case eqFold(cmd, "ECHO"):
