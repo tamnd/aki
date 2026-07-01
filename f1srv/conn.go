@@ -35,6 +35,7 @@ type connState struct {
 	sbuf    []byte    // reused scratch for formatting a float score reply (ZSCORE/ZINCRBY)
 	zscores []float64 // reused scratch for a ZADD's parsed scores, one per score-member pair
 	zkeys   [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
+	kscan   [][]byte  // reused scratch for a KEYS/SCAN/RANDOMKEY bucket-walk key batch
 }
 
 // loop reads from the socket, drains every complete command in the buffer, and
