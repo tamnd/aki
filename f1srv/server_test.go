@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -211,6 +213,62 @@ func TestMSetMGetAndFlush(t *testing.T) {
 	expect(t, rw, "+OK")
 	cmd(t, rw, "DBSIZE")
 	expect(t, rw, ":0")
+}
+
+// dialColdServer starts a server with the larger-than-memory cold tier engaged, its
+// value log in the test's temp dir and a low threshold so a modest value separates.
+func dialColdServer(t *testing.T, threshold int) (*bufio.ReadWriter, func()) {
+	t.Helper()
+	cfg := Config{
+		Addr: "127.0.0.1:0", IndexBuckets: 1 << 12, ArenaBytes: 1 << 20,
+		ReadBufSize: 4 << 10, IncrStripes: 64, NetMode: os.Getenv("F1SRV_TEST_NET"),
+		ColdPath: filepath.Join(t.TempDir(), "cold.vlog"), SepThreshold: threshold,
+	}
+	srv := New(cfg)
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go srv.ListenAndServe()
+	conn, err := net.DialTimeout("tcp", srv.Addr(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+	return rw, func() { conn.Close(); srv.Close() }
+}
+
+// TestColdTierWirePath drives the larger-than-memory tier end to end over RESP: a
+// value past the threshold separates to the cold log and reads back byte-identical,
+// while a small value stays inline. Both must be transparent to the client.
+func TestColdTierWirePath(t *testing.T) {
+	rw, cleanup := dialColdServer(t, 64)
+	defer cleanup()
+
+	small := "tiny"
+	cmd(t, rw, "SET", "s", small)
+	expect(t, rw, "+OK")
+	cmd(t, rw, "GET", "s")
+	expect(t, rw, "$"+small)
+
+	big := strings.Repeat("Z", 4096)
+	cmd(t, rw, "SET", "b", big)
+	expect(t, rw, "+OK")
+	cmd(t, rw, "GET", "b")
+	expect(t, rw, "$"+big)
+
+	// Overwrite the separated key with a small value: it must flip inline and read back.
+	cmd(t, rw, "SET", "b", small)
+	expect(t, rw, "+OK")
+	cmd(t, rw, "GET", "b")
+	expect(t, rw, "$"+small)
+
+	// A large value under a fresh key, then delete, then absent.
+	cmd(t, rw, "SET", "c", big)
+	expect(t, rw, "+OK")
+	cmd(t, rw, "DEL", "c")
+	expect(t, rw, ":1")
+	cmd(t, rw, "GET", "c")
+	expect(t, rw, "$-1")
 }
 
 func TestPipeline(t *testing.T) {
