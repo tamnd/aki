@@ -1454,6 +1454,9 @@ func (c *connState) cmdXReadGroup(argv [][]byte) {
 	groupSet := false
 	count := -1
 	noAck := false
+	block := false
+	var blockDur time.Duration
+	blockForever := false
 	for i := 1; i < len(argv); {
 		switch strings.ToUpper(string(argv[i])) {
 		case "GROUP":
@@ -1497,6 +1500,9 @@ func (c *connState) cmdXReadGroup(argv [][]byte) {
 				c.writeErr(errStreamTimeoutNeg)
 				return
 			}
+			block = true
+			blockForever = ms == 0
+			blockDur = time.Duration(ms) * time.Millisecond
 			i += 2
 		case "NOACK":
 			noAck = true
@@ -1509,7 +1515,7 @@ func (c *connState) cmdXReadGroup(argv [][]byte) {
 				return
 			}
 			i++
-			c.xreadGroupStreams(groupName, consumerName, argv[i:], count, noAck)
+			c.xreadGroupStreams(groupName, consumerName, argv[i:], count, noAck, block, blockDur, blockForever)
 			return
 		default:
 			c.writeErr("ERR syntax error")
@@ -1524,8 +1530,10 @@ func (c *connState) cmdXReadGroup(argv [][]byte) {
 }
 
 // xreadGroupStreams reads the STREAMS clause and delivers per stream. It locks one stream's stripe at
-// a time, so a multi-stream read never holds two locks at once.
-func (c *connState) xreadGroupStreams(groupName, consumerName string, rest [][]byte, count int, noAck bool) {
+// a time, so a multi-stream read never holds two locks at once. With BLOCK and an all-'>' read that
+// delivers nothing, the client parks on the named keys until an XADD wakes it or the timeout fires; a
+// read with any explicit id re-reads pending entries and never blocks, matching Redis.
+func (c *connState) xreadGroupStreams(groupName, consumerName string, rest [][]byte, count int, noAck, block bool, blockDur time.Duration, blockForever bool) {
 	if len(rest) == 0 || len(rest)%2 != 0 {
 		c.writeErr(errStreamUnbalancedGroup)
 		return
@@ -1551,29 +1559,82 @@ func (c *connState) xreadGroupStreams(groupName, consumerName string, rest [][]b
 		}
 		starts[j] = id
 	}
-	now := nowMillis()
+	// Only an all-'>' read parks; an explicit id always yields an immediate per-stream list.
+	canBlock := block && !anyExplicit
 
+	var w *listWaiter
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+		if w != nil {
+			c.srv.removeWaiter(w, keys)
+		}
+	}()
+	for {
+		errored, produced := c.xreadGroupServe(groupName, consumerName, keys, newDelivery, starts, anyExplicit, count, noAck)
+		if errored || produced {
+			return
+		}
+		// An all-'>' read that delivered nothing. Without BLOCK, or under the reactor where the
+		// connection cannot park, reply with the null array a non-blocking read would give.
+		if !canBlock || !c.blockable {
+			c.writeNilArray()
+			return
+		}
+		if w == nil {
+			w = &listWaiter{ch: make(chan struct{}, 1)}
+			c.srv.addWaiter(w, keys)
+			continue // recheck under the registration before parking, closing the add-then-park race
+		}
+		c.flushBeforeBlock()
+		if timer == nil && !blockForever {
+			timer = time.NewTimer(blockDur)
+		}
+		var timeout <-chan time.Time
+		if timer != nil {
+			timeout = timer.C
+		}
+		select {
+		case <-w.ch:
+			// Woken by an XADD: loop back and re-run delivery, which now finds the new entry.
+		case <-timeout:
+			c.writeNilArray()
+			return
+		}
+	}
+}
+
+// xreadGroupServe runs one XREADGROUP delivery pass over every named stream. It returns errored=true
+// when it has already written an error reply (wrong type, or a missing stream or group), and
+// produced=true when it has written a full reply. It returns (false, false) only for an all-'>' read
+// that delivered nothing and has no explicit id, the one case the caller may park on: nothing is
+// written then, so a later pass can still reply. Re-running the pass after a wake is safe because a
+// '>' delivery that finds no new entry advances no cursor and writes no PEL row.
+func (c *connState) xreadGroupServe(groupName, consumerName string, keys [][]byte, newDelivery []bool, starts []streamID, anyExplicit bool, count int, noAck bool) (errored, produced bool) {
+	now := nowMillis()
 	var results []rgResult
-	for j := 0; j < n; j++ {
+	for j := 0; j < len(keys); j++ {
 		skey := keys[j]
 		mu := &c.srv.incrMu[c.srv.stripe(skey)]
 		mu.Lock()
 		if c.stringConflict(skey) {
 			mu.Unlock()
 			c.writeErr(wrongType)
-			return
+			return true, false
 		}
 		_, _, _, _, exists := c.streamHeader(skey)
 		if !exists {
 			mu.Unlock()
 			c.writeErr(streamReadGroupNoGroup(string(skey), groupName))
-			return
+			return true, false
 		}
 		g, ok := c.getStreamGroup(skey, groupName)
 		if !ok {
 			mu.Unlock()
 			c.writeErr(streamReadGroupNoGroup(string(skey), groupName))
-			return
+			return true, false
 		}
 
 		if newDelivery[j] {
@@ -1581,7 +1642,7 @@ func (c *connState) xreadGroupStreams(groupName, consumerName string, rest [][]b
 			if err != nil {
 				mu.Unlock()
 				c.writeErr("ERR " + err.Error())
-				return
+				return true, false
 			}
 			mu.Unlock()
 			if len(rows) == 0 {
@@ -1600,18 +1661,17 @@ func (c *connState) xreadGroupStreams(groupName, consumerName string, rest [][]b
 			if err := c.putStreamConsumer(skey, groupName, consumerName, con); err != nil {
 				mu.Unlock()
 				c.writeErr("ERR " + err.Error())
-				return
+				return true, false
 			}
 			mu.Unlock()
 			results = append(results, rgResult{key: skey, rows: rows})
 		}
 	}
 
-	// A '>' read that delivered nothing returns the null array; an explicit id always yields a
-	// per-stream list, even an empty one.
+	// A '>' read that delivered nothing produces no reply, so the caller can park; an explicit id
+	// always yields a per-stream list, even an empty one.
 	if len(results) == 0 && !anyExplicit {
-		c.writeNilArray()
-		return
+		return false, false
 	}
 	c.writeArrayHeader(len(results))
 	for _, r := range results {
@@ -1631,6 +1691,7 @@ func (c *connState) xreadGroupStreams(groupName, consumerName string, rest [][]b
 			}
 		}
 	}
+	return false, true
 }
 
 // deliverNew delivers the entries newer than the group's last-delivered id (up to count), advances
