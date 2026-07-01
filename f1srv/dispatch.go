@@ -73,6 +73,10 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdSMembers(argv)
 	case eqFold(cmd, "SSCAN"):
 		c.cmdSScan(argv)
+	case eqFold(cmd, "SRANDMEMBER"):
+		c.cmdSRandMember(argv)
+	case eqFold(cmd, "SPOP"):
+		c.cmdSPop(argv)
 	case eqFold(cmd, "PING"):
 		c.cmdPing(argv)
 	case eqFold(cmd, "ECHO"):

@@ -3,6 +3,7 @@ package f1srv
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"math/rand/v2"
 )
 
 // Set is the second collection type on f1raw, and like the hash it is element-per-row:
@@ -346,5 +347,254 @@ func (c *connState) cmdSScan(argv [][]byte) {
 	c.writeArrayHeader(len(matched))
 	for _, k := range matched {
 		c.writeBulk(k[plen:])
+	}
+}
+
+// setWalkAll appends every member of a set, in member order, to dst as arena-stable
+// subslices (the composite key past the prefix). It is the whole-set sequential walk the
+// large-count random-selection path falls back to (spec 2064/f1_rewrite_ltm/06 section
+// 10.1): when the requested count is a big fraction of the cardinality, walking the set
+// once and dropping the surplus is cheaper and steadier than random-seek-and-dedup, whose
+// collision retries blow up as the count approaches the cardinality.
+func (c *connState) setWalkAll(prefix []byte, dst [][]byte) [][]byte {
+	plen := len(prefix)
+	var after []byte
+	scan := make([][]byte, 0, hashScanBatch)
+	for {
+		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
+		if len(keys) == 0 {
+			break
+		}
+		for _, k := range keys {
+			dst = append(dst, k[plen:])
+		}
+		if last == nil {
+			break
+		}
+		after = last
+	}
+	return dst
+}
+
+// setSampleDistinct returns count distinct members of a set of cardinality card (count is
+// assumed already clamped to at most card), as arena-stable member subslices. It is the
+// uniform-without-replacement sampler SPOP and positive-count SRANDMEMBER share.
+//
+// Below half the cardinality it draws a uniform random index into the order-statistic
+// ordered index and selects that member (spec section 10.1), deduping on the index so
+// each member appears at most once; the O(log n) selection means a random member is a
+// descent, never an O(n) count, and the true-uniform draw avoids the byte-space clumping
+// a raw random seek would suffer. At or above half the cardinality it crosses over to a
+// single sequential walk and a partial shuffle, which is O(card) but avoids the retry
+// storm the dedup path hits as count nears card. The caller serializes the set's writers
+// so card and the index agree for the span of the sample.
+func (c *connState) setSampleDistinct(prefix []byte, card, count int) [][]byte {
+	if count >= card {
+		return c.setWalkAll(prefix, make([][]byte, 0, card))
+	}
+	if count*2 >= card {
+		all := c.setWalkAll(prefix, make([][]byte, 0, card))
+		// Partial Fisher-Yates: shuffle only the count positions we return.
+		for i := 0; i < count; i++ {
+			j := i + rand.IntN(len(all)-i)
+			all[i], all[j] = all[j], all[i]
+		}
+		return all[:count]
+	}
+	seen := make(map[int]struct{}, count)
+	out := make([][]byte, 0, count)
+	plen := len(prefix)
+	for len(out) < count {
+		idx := rand.IntN(card)
+		if _, dup := seen[idx]; dup {
+			continue
+		}
+		seen[idx] = struct{}{}
+		k, ok := c.srv.store.CollSelectAt(prefix, idx)
+		if !ok {
+			continue
+		}
+		out = append(out, k[plen:])
+	}
+	return out
+}
+
+// cmdSRandMember is the non-destructive random member read (spec section 8.8). The
+// no-count form returns one uniform random member (nil on a missing key); the count form
+// follows Redis's sign convention exactly, a known compatibility trap: a positive count
+// returns up to that many distinct members (capped at the cardinality, no duplicates),
+// while a negative count returns exactly abs(count) members with replacement, so
+// duplicates are possible and the result is never capped by the cardinality.
+func (c *connState) cmdSRandMember(argv [][]byte) {
+	// SRANDMEMBER key [count]
+	if len(argv) < 2 || len(argv) > 3 {
+		c.writeErr("ERR wrong number of arguments for 'srandmember' command")
+		return
+	}
+	skey := argv[1]
+
+	if len(argv) == 2 {
+		// No-count form: one member, or nil for a missing (or wrong-type) key.
+		if c.stringConflict(skey) {
+			c.writeErr(wrongType)
+			return
+		}
+		card := c.setCard(skey)
+		if card == 0 {
+			c.writeNil()
+			return
+		}
+		prefix := c.setPrefix(skey)
+		k, ok := c.srv.store.CollSelectAt(prefix, rand.IntN(int(card)))
+		if !ok {
+			c.writeNil()
+			return
+		}
+		c.writeBulk(k[len(prefix):])
+		return
+	}
+
+	count, err := atoi64(argv[2])
+	if err != nil {
+		c.writeErr("ERR value is not an integer or out of range")
+		return
+	}
+	// The stripe lock keeps the cardinality and the ordered index consistent across a
+	// multi-pick sample, the same serialization the set's writers take.
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.Lock()
+	if c.stringConflict(skey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	card := int(c.setCard(skey))
+	if count == 0 || card == 0 {
+		mu.Unlock()
+		c.writeArrayHeader(0)
+		return
+	}
+	prefix := c.setPrefix(skey)
+	if count < 0 {
+		// With replacement: exactly abs(count) members, duplicates allowed.
+		n := int(-count)
+		c.writeArrayHeader(n)
+		for i := 0; i < n; i++ {
+			k, ok := c.srv.store.CollSelectAt(prefix, rand.IntN(card))
+			if !ok {
+				c.writeNil()
+				continue
+			}
+			c.writeBulk(k[len(prefix):])
+		}
+		mu.Unlock()
+		return
+	}
+	want := int(count)
+	if want > card {
+		want = card
+	}
+	members := c.setSampleDistinct(prefix, card, want)
+	c.writeArrayHeader(len(members))
+	for _, m := range members {
+		c.writeBulk(m)
+	}
+	mu.Unlock()
+}
+
+// cmdSPop is the destructive random member draw (spec section 8.7): it selects like
+// SRANDMEMBER's positive form (uniform, distinct) but removes what it draws and returns
+// it. The no-count form returns one member as a bulk string (nil on a missing key); the
+// count form returns an array and, unlike SRANDMEMBER, rejects a negative count. Removing
+// the last member deletes the set (empty set is no set), and popping a count at or past
+// the cardinality returns the whole set and deletes it.
+func (c *connState) cmdSPop(argv [][]byte) {
+	// SPOP key [count]
+	if len(argv) < 2 || len(argv) > 3 {
+		c.writeErr("ERR wrong number of arguments for 'spop' command")
+		return
+	}
+	skey := argv[1]
+
+	var count int64 = 1
+	hasCount := len(argv) == 3
+	if hasCount {
+		n, err := atoi64(argv[2])
+		if err != nil {
+			c.writeErr("ERR value is not an integer or out of range")
+			return
+		}
+		if n < 0 {
+			c.writeErr("ERR value is out of range, must be positive")
+			return
+		}
+		count = n
+	}
+
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.Lock()
+	if c.stringConflict(skey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	card := int(c.setCard(skey))
+
+	if !hasCount {
+		// No-count form: one member as a bulk string, nil on a missing key.
+		if card == 0 {
+			mu.Unlock()
+			c.writeNil()
+			return
+		}
+		prefix := c.setPrefix(skey)
+		k, ok := c.srv.store.CollSelectAt(prefix, rand.IntN(card))
+		if !ok {
+			mu.Unlock()
+			c.writeNil()
+			return
+		}
+		member := k[len(prefix):]
+		mk := c.memberKey(skey, member)
+		if c.srv.store.DeleteKind(mk, kindSetMember) {
+			c.srv.store.CollRemove(mk)
+		}
+		if err := c.setSetCard(skey, uint64(card-1)); err != nil {
+			mu.Unlock()
+			c.writeErr("ERR " + err.Error())
+			return
+		}
+		mu.Unlock()
+		c.writeBulk(member)
+		return
+	}
+
+	if count == 0 || card == 0 {
+		mu.Unlock()
+		c.writeArrayHeader(0)
+		return
+	}
+	want := int(count)
+	if want > card {
+		want = card
+	}
+	// Sample all the members to pop first (indices stable, nothing removed yet), then
+	// remove them, so a whole-set pop and a partial pop share one path.
+	members := c.setSampleDistinct(c.setPrefix(skey), card, want)
+	for _, m := range members {
+		mk := c.memberKey(skey, m)
+		if c.srv.store.DeleteKind(mk, kindSetMember) {
+			c.srv.store.CollRemove(mk)
+		}
+	}
+	if err := c.setSetCard(skey, uint64(card-len(members))); err != nil {
+		mu.Unlock()
+		c.writeErr("ERR " + err.Error())
+		return
+	}
+	mu.Unlock()
+	c.writeArrayHeader(len(members))
+	for _, m := range members {
+		c.writeBulk(m)
 	}
 }
