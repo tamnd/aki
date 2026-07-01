@@ -17,16 +17,25 @@ import (
 // or Valkey dumped, and both of them restore what aki dumped. Byte-for-byte the payload cannot match
 // both servers at once because the two servers do not match each other.
 //
-// This slice serializes the string type. The value body is the standard RDB string encoding, so a
-// short canonical integer is int-encoded exactly as Redis does (the DUMP of "12345" is the same
-// leading bytes on all three engines), and any other string is length-prefixed. On the load side the
-// decoder accepts every RDB string form a real server emits, including the LZF-compressed form Redis
-// uses for a long compressible value, so a Redis- or Valkey-produced string blob restores here even
-// though aki's own encoder never compresses. The collection types arrive in the follow-up slices;
-// each reuses this file's CRC64, version framing, and string primitives.
+// The string body is the standard RDB string encoding, so a short canonical integer is int-encoded
+// exactly as Redis does (the DUMP of "12345" is the same leading bytes on all three engines), and any
+// other string is length-prefixed. On the load side the decoder accepts every RDB string form a real
+// server emits, including the LZF-compressed form Redis uses for a long compressible value, so a
+// Redis- or Valkey-produced string blob restores here even though aki's own encoder never compresses.
+//
+// The hash type is the second slice. aki dumps a hash as RDB_TYPE_HASH (type 4), the plain form: a
+// field count then that many field/value string pairs, which both reference servers accept on RESTORE
+// at any size. The load side additionally decodes RDB_TYPE_HASH_LISTPACK (type 16), the listpack form
+// both Redis 8.8 and Valkey 9.1 actually emit even for large hashes, so a hash blob produced by either
+// server restores here. The remaining collection types arrive in the follow-up slices; each reuses
+// this file's CRC64, version framing, string primitives, and (for the listpack encodings) lpDecode.
 
-// rdbTypeString is the RDB object type byte for a plain string value.
-const rdbTypeString = 0x00
+// RDB object type bytes. Only the forms aki serializes or has to load are named here.
+const (
+	rdbTypeString       = 0x00 // a plain string value
+	rdbTypeHash         = 0x04 // a hash as a field count then field/value string pairs
+	rdbTypeHashListpack = 0x10 // a hash packed into a single listpack blob, the form both servers emit
+)
 
 // rdbVersion is the RDB version stamped into the footer of every DUMP payload aki produces. RESTORE
 // on a server refuses a payload whose version is newer than the server's own, so the value is chosen
@@ -91,8 +100,8 @@ func crc64(seed uint64, data []byte) uint64 {
 }
 
 // cmdDump serializes a key's value to the RDB blob RESTORE consumes, or replies null when the key
-// does not exist. This slice serializes the string type; a non-string key is refused rather than
-// answered with a body this slice cannot build, and the follow-up type slices lift that refusal.
+// does not exist. The string and hash types are serialized here; the remaining collection types are
+// refused rather than answered with a body this file cannot build, and their slices lift that refusal.
 func (c *connState) cmdDump(argv [][]byte) {
 	if len(argv) != 2 {
 		c.writeErr("ERR wrong number of arguments for 'dump' command")
@@ -109,9 +118,45 @@ func (c *connState) cmdDump(argv [][]byte) {
 		v, _ := c.srv.store.Get(key, nil)
 		payload := rdbAppendString([]byte{rdbTypeString}, v)
 		c.writeBulk(rdbSeal(payload))
+	case keyHash:
+		c.writeBulk(rdbSeal(c.rdbDumpHash(key)))
 	default:
 		c.writeErr("ERR DUMP of this type is not supported yet")
 	}
+}
+
+// rdbDumpHash builds the RDB_TYPE_HASH body for a hash: the type byte, the field count, then each
+// field and value as an RDB string. It holds the key's stripe lock for a consistent snapshot and
+// walks the fields off the O(1) count and the collection index, the same enumerate path HGETALL uses,
+// so it never depends on an in-memory copy of the whole hash.
+func (c *connState) rdbDumpHash(hkey []byte) []byte {
+	mu := &c.srv.incrMu[c.srv.stripe(hkey)]
+	mu.Lock()
+	defer mu.Unlock()
+
+	payload := rdbAppendLen([]byte{rdbTypeHash}, c.hashCount(hkey))
+	prefix := c.hashPrefix(hkey)
+	plen := len(prefix)
+	var after []byte
+	scanK := make([][]byte, 0, hashScanBatch)
+	scanO := make([]uint64, 0, hashScanBatch)
+	var vbuf []byte
+	for {
+		keys, offs, last := c.srv.store.CollScanKV(prefix, after, hashScanBatch, scanK[:0], scanO[:0])
+		if len(keys) == 0 {
+			break
+		}
+		for i, k := range keys {
+			payload = rdbAppendString(payload, k[plen:])
+			vbuf = c.srv.store.ReadValueAt(offs[i], vbuf[:0])
+			payload = rdbAppendString(payload, vbuf)
+		}
+		if last == nil {
+			break
+		}
+		after = last
+	}
+	return payload
 }
 
 // cmdRestore parses a DUMP blob and writes its value under a key, honoring the TTL and the REPLACE,
@@ -184,8 +229,8 @@ func (c *connState) cmdRestore(argv [][]byte) {
 		c.writeErr("ERR DUMP payload version or checksum are wrong")
 		return
 	}
-	kind, val, ok := rdbLoadValue(body)
-	if !ok || kind != keyString {
+	val, ok := rdbLoadValue(body)
+	if !ok {
 		c.writeErr("ERR Bad data format")
 		return
 	}
@@ -207,7 +252,7 @@ func (c *connState) cmdRestore(argv [][]byte) {
 		}
 		c.dropKeyLocked(key)
 	}
-	if err := c.srv.store.Set(key, val); err != nil {
+	if err := c.rdbWriteValue(key, val); err != nil {
 		c.writeErr("ERR " + err.Error())
 		return
 	}
@@ -258,22 +303,195 @@ func rdbCheckFooter(blob []byte) ([]byte, bool) {
 	return blob[: n-10], true
 }
 
-// rdbLoadValue parses a value body (a type byte followed by the type's encoding) and returns the
-// type and, for a string, its bytes. This slice understands the string type; other type bytes are
-// reported as unparseable until their slices land.
-func rdbLoadValue(body []byte) (kind keyKind, val []byte, ok bool) {
+// rdbValue is the decoded form of a DUMP body: the value's type and, for a string, its bytes, or for
+// a collection, its elements in order (a hash carries field, value, field, value ...). Keeping the
+// elements here lets a single loader handle every type and the caller write them through the type's
+// own primitives without re-parsing.
+type rdbValue struct {
+	kind  keyKind
+	str   []byte
+	elems [][]byte
+}
+
+// rdbLoadValue parses a value body (a type byte followed by the type's encoding) into an rdbValue. It
+// understands the string type and both hash encodings a real server emits: the plain field-count form
+// and the listpack form. Other type bytes are reported as unparseable until their slices land.
+func rdbLoadValue(body []byte) (rdbValue, bool) {
 	if len(body) < 1 {
-		return keyMissing, nil, false
+		return rdbValue{}, false
 	}
 	switch body[0] {
 	case rdbTypeString:
 		s, _, ok := rdbReadString(body[1:])
 		if !ok {
-			return keyMissing, nil, false
+			return rdbValue{}, false
 		}
-		return keyString, s, true
+		return rdbValue{kind: keyString, str: s}, true
+	case rdbTypeHash:
+		count, rest, ok := rdbReadLen(body[1:])
+		if !ok {
+			return rdbValue{}, false
+		}
+		elems := make([][]byte, 0, count*2)
+		for i := uint64(0); i < count*2; i++ {
+			s, r, ok := rdbReadString(rest)
+			if !ok {
+				return rdbValue{}, false
+			}
+			elems = append(elems, s)
+			rest = r
+		}
+		return rdbValue{kind: keyHash, elems: elems}, true
+	case rdbTypeHashListpack:
+		lp, _, ok := rdbReadString(body[1:])
+		if !ok {
+			return rdbValue{}, false
+		}
+		elems, ok := lpDecode(lp)
+		if !ok || len(elems)%2 != 0 {
+			return rdbValue{}, false
+		}
+		return rdbValue{kind: keyHash, elems: elems}, true
 	default:
-		return keyMissing, nil, false
+		return rdbValue{}, false
+	}
+}
+
+// rdbWriteValue lands a decoded value under a key. The caller holds the key's stripe lock and has
+// already cleared any prior value, so this only has to insert. A string is a single Set; a hash writes
+// each field/value pair through the same field-key primitives HSET uses, then stamps the O(1) count.
+func (c *connState) rdbWriteValue(key []byte, v rdbValue) error {
+	switch v.kind {
+	case keyString:
+		return c.srv.store.Set(key, v.str)
+	case keyHash:
+		for i := 0; i+1 < len(v.elems); i += 2 {
+			fk := c.fieldKey(key, v.elems[i])
+			isNew, err := c.srv.store.PutKind(fk, v.elems[i+1], kindHashField)
+			if err != nil {
+				return err
+			}
+			if isNew {
+				c.srv.store.CollInsert(fk, kindHashField)
+			}
+		}
+		return c.setHashCount(key, uint64(len(v.elems)/2))
+	}
+	return nil
+}
+
+// lpDecode parses a listpack blob into its elements in order. A listpack is a 6-byte header (a 4-byte
+// total length and a 2-byte element count, both little-endian), a run of entries, and a single 0xFF
+// terminator. Each entry is an encoding byte or two, its data, and a back-length that a forward walk
+// skips, so the walk only has to size each entry to reach the next. An integer entry is rendered to
+// its decimal text, the shape a hash field or value takes once loaded.
+func lpDecode(b []byte) ([][]byte, bool) {
+	// Six header bytes and one terminator are the smallest possible listpack.
+	if len(b) < 7 {
+		return nil, false
+	}
+	p := 6
+	var out [][]byte
+	for p < len(b) {
+		if b[p] == 0xFF {
+			return out, true
+		}
+		val, n, ok := lpGet(b[p:])
+		if !ok {
+			return nil, false
+		}
+		out = append(out, val)
+		p += n + lpBacklenSize(n)
+	}
+	return nil, false
+}
+
+// lpGet decodes one listpack entry from the front of b and returns its value, the number of bytes the
+// encoding and data occupy (not counting the trailing back-length), and whether it decoded. The
+// encodings follow the listpack format: a 7-bit small uint, 6-, 12-, and 32-bit string lengths, and
+// 13-, 16-, 24-, 32-, and 64-bit signed integers, every one a hash field or value can take.
+func lpGet(b []byte) ([]byte, int, bool) {
+	if len(b) < 1 {
+		return nil, 0, false
+	}
+	c := b[0]
+	switch {
+	case c&0x80 == 0: // 0xxxxxxx: 7-bit unsigned int
+		return strconv.AppendInt(nil, int64(c&0x7f), 10), 1, true
+	case c&0xC0 == 0x80: // 10xxxxxx: 6-bit string length
+		n := int(c & 0x3f)
+		if len(b) < 1+n {
+			return nil, 0, false
+		}
+		return append([]byte(nil), b[1:1+n]...), 1 + n, true
+	case c&0xE0 == 0xC0: // 110xxxxx yyyyyyyy: 13-bit signed int
+		if len(b) < 2 {
+			return nil, 0, false
+		}
+		v := int(c&0x1f)<<8 | int(b[1])
+		if v >= 1<<12 {
+			v -= 1 << 13
+		}
+		return strconv.AppendInt(nil, int64(v), 10), 2, true
+	case c&0xF0 == 0xE0: // 1110xxxx yyyyyyyy: 12-bit string length
+		if len(b) < 2 {
+			return nil, 0, false
+		}
+		n := int(c&0x0f)<<8 | int(b[1])
+		if len(b) < 2+n {
+			return nil, 0, false
+		}
+		return append([]byte(nil), b[2:2+n]...), 2 + n, true
+	case c == 0xF0: // 32-bit string length, little-endian
+		if len(b) < 5 {
+			return nil, 0, false
+		}
+		n := int(binary.LittleEndian.Uint32(b[1:5]))
+		if n < 0 || len(b) < 5+n {
+			return nil, 0, false
+		}
+		return append([]byte(nil), b[5:5+n]...), 5 + n, true
+	case c == 0xF1: // 16-bit signed int, little-endian
+		if len(b) < 3 {
+			return nil, 0, false
+		}
+		return strconv.AppendInt(nil, int64(int16(binary.LittleEndian.Uint16(b[1:3]))), 10), 3, true
+	case c == 0xF2: // 24-bit signed int, little-endian
+		if len(b) < 4 {
+			return nil, 0, false
+		}
+		u := uint32(b[1]) | uint32(b[2])<<8 | uint32(b[3])<<16
+		v := int32(u<<8) >> 8 // sign-extend the 24-bit value
+		return strconv.AppendInt(nil, int64(v), 10), 4, true
+	case c == 0xF3: // 32-bit signed int, little-endian
+		if len(b) < 5 {
+			return nil, 0, false
+		}
+		return strconv.AppendInt(nil, int64(int32(binary.LittleEndian.Uint32(b[1:5]))), 10), 5, true
+	case c == 0xF4: // 64-bit signed int, little-endian
+		if len(b) < 9 {
+			return nil, 0, false
+		}
+		return strconv.AppendInt(nil, int64(binary.LittleEndian.Uint64(b[1:9])), 10), 9, true
+	}
+	return nil, 0, false
+}
+
+// lpBacklenSize returns how many bytes the back-length field occupies for an entry whose encoding and
+// data span l bytes. The listpack stores the back-length in 7-bit groups, so the count steps up at
+// each power-of-128 boundary; the forward walk adds it to reach the next entry.
+func lpBacklenSize(l int) int {
+	switch {
+	case l < 128:
+		return 1
+	case l < 16384:
+		return 2
+	case l < 2097152:
+		return 3
+	case l < 268435456:
+		return 4
+	default:
+		return 5
 	}
 }
 
