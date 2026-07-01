@@ -47,7 +47,7 @@ func (s *Store) Incr(key []byte, delta int64) (int64, error) {
 				return 0, oerr
 			}
 			b := strconv.AppendInt(buf[:0], n2, 10)
-			if err := s.publish(key, b, h, stringKind); err != nil {
+			if err := s.publish(key, b, h, stringKind, 0); err != nil {
 				return 0, err
 			}
 			return n2, nil
@@ -130,7 +130,7 @@ func (s *Store) insertAbsent(key, val []byte, h uint64, kind byte) (installed, e
 	if !ok {
 		return false, false
 	}
-	s.initRecord(off, key, val, kind)
+	s.initRecord(off, key, val, kind, 0)
 	tag := tagOf(h)
 	newWord := tag<<tagShift | off
 	for {
