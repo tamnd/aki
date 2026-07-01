@@ -34,6 +34,16 @@ func (c *connState) dispatch(argv [][]byte) {
 		c.cmdGetDel(argv)
 	case eqFold(cmd, "GETSET"):
 		c.cmdGetSet(argv)
+	case eqFold(cmd, "STRLEN"):
+		c.cmdStrlen(argv)
+	case eqFold(cmd, "APPEND"):
+		c.cmdAppend(argv)
+	case eqFold(cmd, "GETRANGE"):
+		c.cmdGetRange(argv, "getrange")
+	case eqFold(cmd, "SUBSTR"):
+		c.cmdGetRange(argv, "substr")
+	case eqFold(cmd, "SETRANGE"):
+		c.cmdSetRange(argv)
 	case eqFold(cmd, "INCR"):
 		c.cmdIncrBy(argv, 1, false)
 	case eqFold(cmd, "DECR"):
