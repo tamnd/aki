@@ -210,6 +210,11 @@ const defaultSepThreshold = 512
 // Len reports the number of live keys.
 func (s *Store) Len() int { return int(s.count.Load()) }
 
+// BucketCount reports the number of primary index buckets, fixed at construction. RANDOMKEY
+// uses it to pick a random primary bucket to start a scan from, and it bounds the cursor space
+// ScanKeys walks.
+func (s *Store) BucketCount() int { return len(s.buckets) }
+
 // Close releases the store's external resources. For a pure in-memory store it is a
 // no-op; for a store with a cold value log it closes the log file. The in-memory
 // arena and index are garbage-collected with the store.
