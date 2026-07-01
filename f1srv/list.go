@@ -1056,3 +1056,236 @@ func listTryInteger(e []byte) (int64, bool) {
 	}
 	return v, true
 }
+
+// listPopEnd removes one element from the head (atHead) or the tail of lkey and returns it,
+// assuming the caller already holds lkey's stripe lock and has ruled out a string conflict. ok
+// is false when the list is empty or missing. It maintains the header exactly like cmdPop: the
+// window bound advances at the chosen end, the running listpack size drops by the element, and
+// the header is rewritten in place or deleted when the pop drains the list to empty. The value
+// is returned aliasing c.vbuf (a copy out of the arena), so it stays valid after the row is
+// gone and can be pushed straight onto another list.
+func (c *connState) listPopEnd(lkey []byte, atHead bool) (val []byte, ok bool) {
+	head, tail, lpBytes, everLarge, hoff, have := c.listHeaderAt(lkey)
+	if !have {
+		return c.vbuf[:0], false
+	}
+	var pos int64
+	if atHead {
+		pos = head
+		head++
+	} else {
+		pos = tail - 1
+		tail--
+	}
+	ek := c.listElemKey(lkey, pos)
+	v, _ := c.srv.store.TakeKind(ek, c.vbuf[:0], kindListElem)
+	c.vbuf = v
+	lpBytes -= uint64(listEntrySize(v))
+	c.listWriteBackHeader(lkey, head, tail, lpBytes, everLarge, hoff)
+	return v, true
+}
+
+// listPushEnd prepends (atHead) or appends one element to lkey, assuming the caller already
+// holds lkey's stripe lock and has ruled out a string conflict. It mirrors cmdPush for a single
+// element: it extends the window at the chosen end, grows the running listpack size, latches the
+// sticky large flag, and rewrites the header in place or creates it for a new list. elem may
+// alias c.vbuf (the value a listPopEnd just returned) because it is copied into the arena by
+// PutKind before the header read that would reuse the buffer, and the header read lands in its
+// own scratch, not vbuf.
+func (c *connState) listPushEnd(lkey, elem []byte, atHead bool) error {
+	head, tail, lpBytes, everLarge, hoff, existed := c.listHeaderAt(lkey)
+	var pos int64
+	if atHead {
+		head--
+		pos = head
+	} else {
+		pos = tail
+		tail++
+	}
+	ek := c.listElemKey(lkey, pos)
+	if _, err := c.srv.store.PutKind(ek, elem, kindListElem); err != nil {
+		return err
+	}
+	lpBytes += uint64(listEntrySize(elem))
+	if !everLarge && lpBytes > listListpackMaxBytes {
+		everLarge = true
+	}
+	if existed {
+		c.listPutHeaderAt(hoff, head, tail, lpBytes, everLarge)
+		return nil
+	}
+	return c.listPutHeader(lkey, head, tail, lpBytes, everLarge)
+}
+
+// parseLR decodes a LEFT/RIGHT direction token (case-insensitive), reporting atHead for LEFT.
+// The list move and multi-pop commands take one or two of these to say which end they act on.
+func parseLR(tok []byte) (atHead, ok bool) {
+	switch {
+	case eqFold(tok, "LEFT"):
+		return true, true
+	case eqFold(tok, "RIGHT"):
+		return false, true
+	}
+	return false, false
+}
+
+// cmdLMove implements LMOVE source destination <LEFT|RIGHT> <LEFT|RIGHT>: it pops one element
+// from the chosen end of the source and pushes it onto the chosen end of the destination,
+// atomically under both keys' stripe locks, and returns the moved element (a nil bulk when the
+// source is empty or missing). Source equal to destination is a rotation on one list, which the
+// pop-then-push handles directly: the pop rewrites (or deletes) the header and the push reads it
+// back, so rotating a one-element list is the no-op Redis makes it. Either key holding a string
+// is WRONGTYPE.
+func (c *connState) cmdLMove(argv [][]byte) {
+	if len(argv) != 5 {
+		c.writeErr("ERR wrong number of arguments for 'lmove' command")
+		return
+	}
+	c.lmove(argv[1], argv[2], argv[3], argv[4])
+}
+
+// cmdRPopLPush implements RPOPLPUSH source destination, the classic form that predates LMOVE and
+// is exactly LMOVE source destination RIGHT LEFT: pop the source's tail, push it to the
+// destination's head.
+func (c *connState) cmdRPopLPush(argv [][]byte) {
+	if len(argv) != 3 {
+		c.writeErr("ERR wrong number of arguments for 'rpoplpush' command")
+		return
+	}
+	c.lmove(argv[1], argv[2], []byte("RIGHT"), []byte("LEFT"))
+}
+
+// lmove is the shared body for LMOVE and RPOPLPUSH once the direction tokens are known. It
+// validates the two directions, takes both stripe locks in a fixed order (deadlock-safe against
+// a concurrent move of the same pair the other way), then pops one element from the source and
+// pushes it to the destination. A missing or empty source moves nothing and replies with a nil
+// bulk.
+func (c *connState) lmove(source, destination, fromTok, toTok []byte) {
+	fromHead, ok1 := parseLR(fromTok)
+	toHead, ok2 := parseLR(toTok)
+	if !ok1 || !ok2 {
+		c.writeErr("ERR syntax error")
+		return
+	}
+	unlock := c.lockTwoStripes(source, destination)
+	if c.stringConflict(source) || c.stringConflict(destination) {
+		unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	v, ok := c.listPopEnd(source, fromHead)
+	if !ok {
+		unlock()
+		c.writeNil()
+		return
+	}
+	if err := c.listPushEnd(destination, v, toHead); err != nil {
+		unlock()
+		c.writeErr("ERR " + err.Error())
+		return
+	}
+	unlock()
+	c.writeBulk(v)
+}
+
+// cmdLMPop implements LMPOP numkeys key [key ...] <LEFT|RIGHT> [COUNT count]: it pops up to count
+// elements (default 1) from the chosen end of the first key in the list that is a non-empty list,
+// and replies with a two-element array of that key's name and the popped elements, or a nil array
+// when every listed key is empty or missing. It scans the keys left to right under each key's own
+// stripe lock, so it never holds more than one lock and stops at the first key that yields
+// anything. A listed key holding a plain string is WRONGTYPE.
+func (c *connState) cmdLMPop(argv [][]byte) {
+	// LMPOP numkeys key [key ...] <LEFT|RIGHT> [COUNT count]
+	if len(argv) < 4 {
+		c.writeErr("ERR wrong number of arguments for 'lmpop' command")
+		return
+	}
+	numkeys, err := atoi64(argv[1])
+	if err != nil {
+		c.writeErr("ERR numkeys should be greater than 0")
+		return
+	}
+	if numkeys <= 0 {
+		c.writeErr("ERR numkeys should be greater than 0")
+		return
+	}
+	// argv layout after numkeys: numkeys keys, then the direction, then an optional COUNT count.
+	if int64(len(argv)) < 2+numkeys+1 {
+		c.writeErr("ERR syntax error")
+		return
+	}
+	keys := argv[2 : 2+numkeys]
+	rest := argv[2+numkeys:]
+	if len(rest) == 0 {
+		c.writeErr("ERR syntax error")
+		return
+	}
+	atHead, ok := parseLR(rest[0])
+	if !ok {
+		c.writeErr("ERR syntax error")
+		return
+	}
+	count := int64(1)
+	switch len(rest) {
+	case 1:
+		// direction only, count defaults to 1
+	case 3:
+		if !eqFold(rest[1], "COUNT") {
+			c.writeErr("ERR syntax error")
+			return
+		}
+		n, err := atoi64(rest[2])
+		if err != nil || n <= 0 {
+			c.writeErr("ERR count should be greater than 0")
+			return
+		}
+		count = n
+	default:
+		c.writeErr("ERR syntax error")
+		return
+	}
+
+	for _, key := range keys {
+		mu := &c.srv.incrMu[c.srv.stripe(key)]
+		mu.Lock()
+		if c.stringConflict(key) {
+			mu.Unlock()
+			c.writeErr(wrongType)
+			return
+		}
+		head, tail, lpBytes, everLarge, hoff, have := c.listHeaderAt(key)
+		if !have {
+			mu.Unlock()
+			continue
+		}
+		n := tail - head
+		want := count
+		if want > n {
+			want = n
+		}
+		// Two-element reply: the key name, then the array of popped elements.
+		c.writeArrayHeader(2)
+		c.writeBulk(key)
+		c.writeArrayHeader(int(want))
+		for i := int64(0); i < want; i++ {
+			var pos int64
+			if atHead {
+				pos = head
+				head++
+			} else {
+				pos = tail - 1
+				tail--
+			}
+			ek := c.listElemKey(key, pos)
+			v, _ := c.srv.store.TakeKind(ek, c.vbuf[:0], kindListElem)
+			c.vbuf = v
+			lpBytes -= uint64(listEntrySize(v))
+			c.writeBulk(v)
+		}
+		c.listWriteBackHeader(key, head, tail, lpBytes, everLarge, hoff)
+		mu.Unlock()
+		return
+	}
+	// Every listed key was empty or missing.
+	c.writeNilArray()
+}
