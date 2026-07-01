@@ -155,6 +155,7 @@ const (
 	keyHash
 	keySet
 	keyZset
+	keyList
 )
 
 // keyTypeOf resolves a key to exactly one type. A key can only ever be one type at a time
@@ -173,6 +174,9 @@ func (c *connState) keyTypeOf(key []byte) keyKind {
 	}
 	if c.srv.store.ExistsKind(key, kindZsetMeta) {
 		return keyZset
+	}
+	if c.srv.store.ExistsKind(key, kindListMeta) {
+		return keyList
 	}
 	return keyMissing
 }
@@ -193,6 +197,8 @@ func (c *connState) cmdType(argv [][]byte) {
 		c.writeSimple("set")
 	case keyZset:
 		c.writeSimple("zset")
+	case keyList:
+		c.writeSimple("list")
 	default:
 		c.writeSimple("none")
 	}
@@ -267,6 +273,8 @@ func (c *connState) cmdObject(argv [][]byte) {
 		case keyZset:
 			_, enc, _ := c.zsetHeader(key)
 			c.writeBulk([]byte(zsetEncodingName(enc)))
+		case keyList:
+			c.writeBulk([]byte(c.listEncodingName(key)))
 		default:
 			c.writeNil()
 		}

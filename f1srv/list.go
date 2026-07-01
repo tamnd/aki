@@ -1,0 +1,546 @@
+package f1srv
+
+import (
+	"encoding/binary"
+	"strconv"
+)
+
+// List is the fourth collection type on f1raw, and unlike the hash, set, and zset it has
+// no stable per-element key: a list is a deque whose element identity is its relative
+// position, not any bytes it carries (spec 2064/f1_rewrite_ltm/08 section 1). So the model
+// manufactures an order-preserving position key for every element and stores each element
+// element-per-row under it, exactly the element-per-row shape the other collections use, so
+// a list rides the same lock-free point path with no second structure.
+//
+// The position is an int64 index into an ever-growing window [head, tail): RPUSH writes at
+// tail and advances it, LPUSH decrements head and writes there, and the window stays
+// perfectly contiguous under end-only edits (push and pop). Contiguity is what makes this
+// model beat a general order-statistic index for a deque: positional access (LINDEX,
+// LRANGE) is direct index arithmetic plus one point lookup, an O(1) descent-free seek, where
+// a quicklist walks nodes and a plain ordered index pays an O(log n) rank descent. The
+// window is stored in a per-list header row (kindListMeta under the bare key) as head, tail,
+// the running listpack byte size, and a sticky "has ever been large" bit; count is tail-head,
+// so LLEN is one header read with no scan.
+//
+// Element sub-key layout: uvarint(len(listKey)) | listKey | orderKey, where orderKey is the
+// 8-byte order-preserving big-endian encoding of the int64 position. The length prefix makes
+// (listKey, position) injective so two lists never share a row, and the order-preserving
+// encoding means a byte comparison of two element keys equals their position order, so the
+// rows of one list sort head-to-tail. A list has a single element family, so the record kind
+// byte alone (kindListElem) keeps element rows disjoint from every other type's rows; no
+// in-key family tag is needed the way the zset's dual member/score families require one.
+//
+// Write serialization: the push and pop commands take the per-key stripe lock (shared with
+// the INCR family and the other collections) so a list's element rows and its header window
+// stay consistent under concurrent writers. LINDEX and LRANGE take the same lock so the
+// window they walk cannot shift out from under them mid-read; LLEN is a single lock-free
+// header read like SCARD.
+const (
+	kindListElem byte = 0x05 // a single list element row, value is the element bytes verbatim
+	kindListMeta byte = 0x0B // the per-list header row (coll_header): head, tail, lpBytes, everLarge
+)
+
+// listHeaderBytes is the fixed listpack overhead Redis counts in lpBytes: the 6-byte header
+// (4-byte total length plus 2-byte element count) and the 1-byte 0xFF terminator. An empty
+// list's running byte count starts here, and each element adds its listEntrySize on top, so
+// the total mirrors the lpBytes t_list.c compares against list-max-listpack-size.
+const listHeaderBytes = 7
+
+// listListpackMaxBytes is the byte budget for the default list-max-listpack-size of -2: a
+// list reports "listpack" for OBJECT ENCODING until its elements would fill more than 8192
+// bytes inside a real listpack, then "quicklist" and never back (Redis never downgrades). The
+// default carries no element-count cap and no per-element value cap, only this byte budget,
+// which the running Redis 8.8 and Valkey 9.1 defaults both confirm (200 tiny integers and a
+// 100-byte value both stay listpack). CONFIG is a no-op on f1srv, so this is the threshold
+// every stock server a client compares against uses.
+const listListpackMaxBytes = 8192
+
+// listMetaSize is the fixed width of the header row: head int64 | tail int64 | lpBytes uint64,
+// each 8 bytes little-endian, then a 1-byte sticky "ever large" flag.
+const listMetaSize = 25
+
+// listElemKey builds the composite element key for (lkey, pos) into the reused kbuf, so a
+// list command allocates nothing for its key. The 8-byte order key is uint64(pos) with the
+// sign bit flipped and stored big-endian, so negative positions (produced by LPUSH pushing
+// below zero) sort before positive ones and a plain byte comparison of two element keys
+// equals their position order.
+func (c *connState) listElemKey(lkey []byte, pos int64) []byte {
+	b := c.kbuf[:0]
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(len(lkey)))
+	b = append(b, tmp[:n]...)
+	b = append(b, lkey...)
+	var ord [8]byte
+	binary.BigEndian.PutUint64(ord[:], uint64(pos)^(1<<63))
+	b = append(b, ord[:]...)
+	c.kbuf = b
+	return b
+}
+
+// listHeader reads a list's header window: the head and tail positions, the running listpack
+// byte size, and the sticky large flag. ok is false when the list has no header (empty or
+// missing key), in which case head and tail are 0 (an empty window) and lpBytes is the empty
+// listpack overhead, so a first push starts counting from the right base.
+func (c *connState) listHeader(lkey []byte) (head, tail int64, lpBytes uint64, everLarge, ok bool) {
+	var hb [listMetaSize]byte
+	v, got := c.srv.store.GetKind(lkey, hb[:0], kindListMeta)
+	if !got || len(v) < listMetaSize {
+		return 0, 0, listHeaderBytes, false, false
+	}
+	head = int64(binary.LittleEndian.Uint64(v[0:8]))
+	tail = int64(binary.LittleEndian.Uint64(v[8:16]))
+	lpBytes = binary.LittleEndian.Uint64(v[16:24])
+	everLarge = v[24] != 0
+	return head, tail, lpBytes, everLarge, true
+}
+
+// listHeaderAt is listHeader that also returns the header row's arena offset, so a push or
+// pop that will write the window straight back can rewrite it in place with listPutHeaderAt
+// and skip the second index probe a plain PutHeader would repeat under the stripe lock. off
+// is meaningful only when ok is true; it stays valid across the caller's element edits
+// because a fixed-width header row is never outgrown-republished and element writes append
+// under different keys, so the header record does not move.
+func (c *connState) listHeaderAt(lkey []byte) (head, tail int64, lpBytes uint64, everLarge bool, off uint64, ok bool) {
+	var hb [listMetaSize]byte
+	v, o, got := c.srv.store.GetKindAt(lkey, hb[:0], kindListMeta)
+	if !got || len(v) < listMetaSize {
+		return 0, 0, listHeaderBytes, false, 0, false
+	}
+	head = int64(binary.LittleEndian.Uint64(v[0:8]))
+	tail = int64(binary.LittleEndian.Uint64(v[8:16]))
+	lpBytes = binary.LittleEndian.Uint64(v[16:24])
+	everLarge = v[24] != 0
+	return head, tail, lpBytes, everLarge, o, true
+}
+
+// listPackHeader lays the 25-byte header window into ob so both the create path (PutKind) and
+// the in-place update path (InPlaceAt) share one encoding.
+func listPackHeader(ob *[listMetaSize]byte, head, tail int64, lpBytes uint64, everLarge bool) {
+	binary.LittleEndian.PutUint64(ob[0:8], uint64(head))
+	binary.LittleEndian.PutUint64(ob[8:16], uint64(tail))
+	binary.LittleEndian.PutUint64(ob[16:24], lpBytes)
+	ob[24] = 0
+	if everLarge {
+		ob[24] = 1
+	}
+}
+
+// listPutHeader writes a list's header window, or deletes the header when the window is empty
+// (head == tail) so the list key stops existing: an empty list is no list, exactly as Redis
+// deletes a list whose last element is popped.
+func (c *connState) listPutHeader(lkey []byte, head, tail int64, lpBytes uint64, everLarge bool) error {
+	if head == tail {
+		c.srv.store.DeleteKind(lkey, kindListMeta)
+		return nil
+	}
+	var ob [listMetaSize]byte
+	listPackHeader(&ob, head, tail, lpBytes, everLarge)
+	_, err := c.srv.store.PutKind(lkey, ob[:], kindListMeta)
+	return err
+}
+
+// listPutHeaderAt writes a non-empty header window in place at a known offset, the fused
+// write-back that pairs with listHeaderAt: the header is a fixed 25 bytes so it always fits
+// the room the first PutKind reserved, and rewriting it at off skips the index probe
+// listPutHeader would spend. It is only for a still-live window (head != tail); a pop that
+// drains the list to empty must delete the header through listPutHeader instead, which is the
+// rare once-per-lifetime path where the extra probe does not matter.
+func (c *connState) listPutHeaderAt(off uint64, head, tail int64, lpBytes uint64, everLarge bool) {
+	var ob [listMetaSize]byte
+	listPackHeader(&ob, head, tail, lpBytes, everLarge)
+	c.srv.store.InPlaceAt(off, ob[:])
+}
+
+// listWriteBackHeader is the pop write-back: it rewrites the surviving window in place at the
+// offset the header read returned (the common case, one fewer index probe), or deletes the
+// header when the pop drained the list to empty so the key stops existing. off must be the
+// offset from the listHeaderAt read taken under this same stripe lock; the take of the popped
+// element rows does not move the header record, so off still points at it.
+func (c *connState) listWriteBackHeader(lkey []byte, head, tail int64, lpBytes uint64, everLarge bool, off uint64) {
+	if head == tail {
+		c.srv.store.DeleteKind(lkey, kindListMeta)
+		return
+	}
+	c.listPutHeaderAt(off, head, tail, lpBytes, everLarge)
+}
+
+// listEncodingName reports a list's OBJECT ENCODING: "quicklist" once the list has ever grown
+// past the listpack byte budget (the sticky flag latched by a push), else "listpack". It reads
+// the flag straight from the header with no scan, and the stickiness mirrors Redis, which never
+// converts a quicklist back to a listpack when it shrinks. A missing header reads as the empty
+// default, "listpack".
+func (c *connState) listEncodingName(lkey []byte) string {
+	_, _, _, everLarge, _ := c.listHeader(lkey)
+	if everLarge {
+		return "quicklist"
+	}
+	return "listpack"
+}
+
+func (c *connState) cmdLPush(argv [][]byte) { c.cmdPush(argv, true) }
+func (c *connState) cmdRPush(argv [][]byte) { c.cmdPush(argv, false) }
+
+// cmdPush is the shared body for LPUSH (atHead) and RPUSH (atTail). It appends every element
+// to the correct end of the window one at a time, so LPUSH a b c leaves the list [c b a] and
+// RPUSH a b c leaves [a b c], matching Redis's per-element prepend/append order. The running
+// listpack byte size grows by each element's entry size, and the sticky large flag latches on
+// the first time the total crosses the byte budget, which is what OBJECT ENCODING reads back.
+func (c *connState) cmdPush(argv [][]byte, atHead bool) {
+	if len(argv) < 3 {
+		name := "rpush"
+		if atHead {
+			name = "lpush"
+		}
+		c.writeErr("ERR wrong number of arguments for '" + name + "' command")
+		return
+	}
+	lkey := argv[1]
+	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
+	mu.Lock()
+	if c.stringConflict(lkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	head, tail, lpBytes, everLarge, hoff, existed := c.listHeaderAt(lkey)
+	for _, elem := range argv[2:] {
+		var pos int64
+		if atHead {
+			head--
+			pos = head
+		} else {
+			pos = tail
+			tail++
+		}
+		ek := c.listElemKey(lkey, pos)
+		if _, err := c.srv.store.PutKind(ek, elem, kindListElem); err != nil {
+			mu.Unlock()
+			c.writeErr("ERR " + err.Error())
+			return
+		}
+		lpBytes += uint64(listEntrySize(elem))
+		if !everLarge && lpBytes > listListpackMaxBytes {
+			everLarge = true
+		}
+	}
+	// A push never empties the window, so the header is always written, not deleted. When the
+	// list already had a header, rewrite it in place at its known offset (the fused write-back,
+	// one fewer index probe); when this push created the list, create the header row.
+	if existed {
+		c.listPutHeaderAt(hoff, head, tail, lpBytes, everLarge)
+	} else if err := c.listPutHeader(lkey, head, tail, lpBytes, everLarge); err != nil {
+		mu.Unlock()
+		c.writeErr("ERR " + err.Error())
+		return
+	}
+	mu.Unlock()
+	c.writeInt(tail - head)
+}
+
+func (c *connState) cmdLPop(argv [][]byte) { c.cmdPop(argv, true) }
+func (c *connState) cmdRPop(argv [][]byte) { c.cmdPop(argv, false) }
+
+// cmdPop is the shared body for LPOP (atHead) and RPOP (atTail). Without a count it returns
+// one element as a bulk string (nil on a missing key); with a count it returns an array of up
+// to count elements (a null array on a missing key), drawn from the head outward for LPOP or
+// the tail inward for RPOP, so RPOP key 2 over [a b c d] yields [d c]. Popping the last
+// element deletes the list. Each element's row is read then point-deleted and the window bound
+// advanced, so a pop is O(1) per element with no scan and no rewrite of the surviving rows.
+func (c *connState) cmdPop(argv [][]byte, atHead bool) {
+	if len(argv) < 2 || len(argv) > 3 {
+		name := "rpop"
+		if atHead {
+			name = "lpop"
+		}
+		c.writeErr("ERR wrong number of arguments for '" + name + "' command")
+		return
+	}
+	hasCount := len(argv) == 3
+	var count int64 = 1
+	if hasCount {
+		n, err := atoi64(argv[2])
+		if err != nil {
+			c.writeErr("ERR value is out of range, must be positive")
+			return
+		}
+		if n < 0 {
+			c.writeErr("ERR value is out of range, must be positive")
+			return
+		}
+		count = n
+	}
+
+	lkey := argv[1]
+	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
+	mu.Lock()
+	if c.stringConflict(lkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
+	if !ok {
+		mu.Unlock()
+		if hasCount {
+			c.writeNilArray()
+		} else {
+			c.writeNil()
+		}
+		return
+	}
+	n := tail - head
+	want := count
+	if want > n {
+		want = n
+	}
+
+	// No-count form: one element as a bulk string. The window is non-empty here (ok is true
+	// only for a live header), so the single pop always yields an element.
+	if !hasCount {
+		var pos int64
+		if atHead {
+			pos = head
+			head++
+		} else {
+			pos = tail - 1
+			tail--
+		}
+		ek := c.listElemKey(lkey, pos)
+		v, _ := c.srv.store.TakeKind(ek, c.vbuf[:0], kindListElem)
+		c.vbuf = v
+		lpBytes -= uint64(listEntrySize(v))
+		c.listWriteBackHeader(lkey, head, tail, lpBytes, everLarge, hoff)
+		mu.Unlock()
+		c.writeBulk(v)
+		return
+	}
+
+	// Count form: stream up to want elements as an array. Each element is copied straight into
+	// the reply buffer by writeBulk before the next read reuses vbuf, so no per-element buffer
+	// is held. The array header is exact because want is clamped to the live window size.
+	c.writeArrayHeader(int(want))
+	for i := int64(0); i < want; i++ {
+		var pos int64
+		if atHead {
+			pos = head
+			head++
+		} else {
+			pos = tail - 1
+			tail--
+		}
+		ek := c.listElemKey(lkey, pos)
+		v, _ := c.srv.store.TakeKind(ek, c.vbuf[:0], kindListElem)
+		c.vbuf = v
+		lpBytes -= uint64(listEntrySize(v))
+		c.writeBulk(v)
+	}
+	c.listWriteBackHeader(lkey, head, tail, lpBytes, everLarge, hoff)
+	mu.Unlock()
+}
+
+// cmdLLen implements LLEN: the list length is tail-head from the header, read lock-free with
+// no scan, and 0 for a missing key. A plain string under the key is WRONGTYPE.
+func (c *connState) cmdLLen(argv [][]byte) {
+	if len(argv) != 2 {
+		c.writeErr("ERR wrong number of arguments for 'llen' command")
+		return
+	}
+	lkey := argv[1]
+	if c.stringConflict(lkey) {
+		c.writeErr(wrongType)
+		return
+	}
+	head, tail, _, _, _ := c.listHeader(lkey)
+	c.writeInt(tail - head)
+}
+
+// cmdLIndex implements LINDEX: it maps the signed index onto the contiguous window (a
+// non-negative index counts from head, a negative one from tail) and reads that one element's
+// row directly, an O(1) point lookup with no descent. An out-of-range index or a missing key
+// replies nil; a plain string under the key is WRONGTYPE. It takes the stripe lock so the
+// window cannot shift under a concurrent pop between the header read and the element read.
+func (c *connState) cmdLIndex(argv [][]byte) {
+	if len(argv) != 3 {
+		c.writeErr("ERR wrong number of arguments for 'lindex' command")
+		return
+	}
+	lkey := argv[1]
+	idx, err := atoi64(argv[2])
+	if err != nil {
+		c.writeErr("ERR value is not an integer or out of range")
+		return
+	}
+	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
+	mu.Lock()
+	if c.stringConflict(lkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	head, tail, _, _, ok := c.listHeader(lkey)
+	if !ok {
+		mu.Unlock()
+		c.writeNil()
+		return
+	}
+	var pos int64
+	if idx < 0 {
+		pos = tail + idx
+	} else {
+		pos = head + idx
+	}
+	if pos < head || pos >= tail {
+		mu.Unlock()
+		c.writeNil()
+		return
+	}
+	ek := c.listElemKey(lkey, pos)
+	v, found := c.srv.store.GetKind(ek, c.vbuf[:0], kindListElem)
+	c.vbuf = v
+	mu.Unlock()
+	if !found {
+		c.writeNil()
+		return
+	}
+	c.writeBulk(v)
+}
+
+// cmdLRange implements LRANGE: it normalizes the inclusive [start, stop] range against the
+// list length the way Redis does (negatives count from the end, start clamps up to 0, stop
+// clamps down to the last index) and streams each element in the window directly by position,
+// one point lookup apiece. An empty or inverted range replies with an empty array; a plain
+// string under the key is WRONGTYPE. It takes the stripe lock so the window is stable across
+// the walk.
+func (c *connState) cmdLRange(argv [][]byte) {
+	if len(argv) != 4 {
+		c.writeErr("ERR wrong number of arguments for 'lrange' command")
+		return
+	}
+	lkey := argv[1]
+	start, err := atoi64(argv[2])
+	if err != nil {
+		c.writeErr("ERR value is not an integer or out of range")
+		return
+	}
+	stop, err := atoi64(argv[3])
+	if err != nil {
+		c.writeErr("ERR value is not an integer or out of range")
+		return
+	}
+	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
+	mu.Lock()
+	if c.stringConflict(lkey) {
+		mu.Unlock()
+		c.writeErr(wrongType)
+		return
+	}
+	head, tail, _, _, ok := c.listHeader(lkey)
+	if !ok {
+		mu.Unlock()
+		c.writeArrayHeader(0)
+		return
+	}
+	n := tail - head
+	if start < 0 {
+		start += n
+		if start < 0 {
+			start = 0
+		}
+	}
+	if stop < 0 {
+		stop += n
+	}
+	if stop >= n {
+		stop = n - 1
+	}
+	if start > stop || start >= n {
+		mu.Unlock()
+		c.writeArrayHeader(0)
+		return
+	}
+	c.writeArrayHeader(int(stop - start + 1))
+	for i := start; i <= stop; i++ {
+		ek := c.listElemKey(lkey, head+i)
+		v, _ := c.srv.store.GetKind(ek, c.vbuf[:0], kindListElem)
+		c.vbuf = v
+		c.writeBulk(v)
+	}
+	mu.Unlock()
+}
+
+// listEntrySize returns the bytes one element occupies inside a Redis listpack: its encoding
+// plus the backlen field, matching lpEncodeGetType followed by lpEncodeBacklen. This is what
+// the running lpBytes sums, so OBJECT ENCODING flips to quicklist at the exact element the
+// real listpack would overflow the byte budget. A value that parses as a canonical int64 takes
+// the compact integer encoding; anything else a string encoding sized by its length.
+func listEntrySize(e []byte) int {
+	enc := listEncodingSize(e)
+	return enc + listBacklenSize(enc)
+}
+
+// listEncodingSize returns the size of an element's listpack encoding: the type byte or bytes
+// plus the payload, before the backlen.
+func listEncodingSize(e []byte) int {
+	if v, ok := listTryInteger(e); ok {
+		switch {
+		case v >= 0 && v <= 127:
+			return 1 // 7-bit unsigned
+		case v >= -4096 && v <= 4095:
+			return 2 // 13-bit
+		case v >= -32768 && v <= 32767:
+			return 3 // 16-bit
+		case v >= -8388608 && v <= 8388607:
+			return 4 // 24-bit
+		case v >= -2147483648 && v <= 2147483647:
+			return 5 // 32-bit
+		default:
+			return 9 // 64-bit
+		}
+	}
+	n := len(e)
+	switch {
+	case n < 64:
+		return 1 + n // 6-bit string length
+	case n < 4096:
+		return 2 + n // 12-bit string length
+	default:
+		return 5 + n // 32-bit string length
+	}
+}
+
+// listBacklenSize returns the number of bytes lpEncodeBacklen uses for an entry whose encoding
+// is encLen bytes long; the backlen lets a listpack be walked backwards and grows one byte per
+// 7 bits of entry length.
+func listBacklenSize(encLen int) int {
+	switch {
+	case encLen <= 127:
+		return 1
+	case encLen < 16384:
+		return 2
+	case encLen < 2097152:
+		return 3
+	case encLen < 268435456:
+		return 4
+	default:
+		return 5
+	}
+}
+
+// listTryInteger reports whether e is the canonical decimal form of an int64, the test
+// lpStringToInt64 makes before storing an element as an integer. The round-trip check rejects
+// leading zeros, a leading plus, "-0", surrounding spaces, and any other non-canonical
+// spelling, so "10" is an integer but "010", "+10", "-0", and "10\n" are strings, exactly as
+// Redis's listpack decides.
+func listTryInteger(e []byte) (int64, bool) {
+	if len(e) == 0 || len(e) > 20 {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(string(e), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	if strconv.FormatInt(v, 10) != string(e) {
+		return 0, false
+	}
+	return v, true
+}
