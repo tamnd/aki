@@ -74,10 +74,19 @@ type listWindow struct {
 	// position outside that block was appended lock-free after admission and lives only in the ring,
 	// never in an f1raw row (slice 3: push stops writing rows for resident positions). resident(pos)
 	// tells pop and read which store to use: the ring for a resident position, the f1raw row for a
-	// pre-block one. The block is immutable for the window's life; it only ever shrinks conceptually
-	// as pops drain through it, and drainEvict flushes the surviving resident positions to rows on
-	// retire so the persisted image is whole.
-	preLo, preHi int64
+	// pre-block one.
+	//
+	// The block only ever shrinks over the window's life, never grows: a pop that drains a bound into
+	// the seed span deletes those rows for good, so contractPreblock walks the matching end inward as
+	// each pop lands. That monotonic contraction is what keeps residency correct across a pop-then-push
+	// that reuses a position number: a tail pop past preHi frees a seed position, and a later push
+	// re-fills that same position into the ring, so preHi must have already stepped below it or the
+	// re-pushed value would be misread from its deleted row. The two bounds are atomic because a
+	// reader (LPOS, LRANGE) scans them under the shared gate while a concurrent pop contracts them
+	// under the same shared gate; every write is monotonic, so a racing reader sees either the old or
+	// the new bound and both are consistent with the committed span it also snapshots. drainEvict
+	// flushes the surviving resident positions to rows on retire so the persisted image is whole.
+	preLo, preHi atomic.Int64
 }
 
 // resident reports whether position pos lives in the ring rather than an f1raw row. A position is
@@ -85,7 +94,42 @@ type listWindow struct {
 // block [preLo, preHi). Pop reads a resident position straight from the ring with no hash probe,
 // the whole point of the model, and takes a pre-block position from its f1raw row.
 func (w *listWindow) resident(pos int64) bool {
-	return pos < w.preLo || pos >= w.preHi
+	return pos < w.preLo.Load() || pos >= w.preHi.Load()
+}
+
+// contractPreblock walks the pre-block band inward after a pop advanced a committed bound into it, so
+// the seed rows a pop deleted stop being classified as pre-block and a position re-pushed into that
+// freed number reads from the ring where the push put it. A head pop raises the low bound to the new
+// committed head; a tail pop lowers the high bound to the new committed tail. When the two bounds
+// cross, the seed is fully drained and the band collapses to empty. The caller holds w.mu, and the
+// writes are monotonic (preLo only rises, preHi only falls), so a reader scanning the band under the
+// shared gate never sees it widen. It is a cheap pair of compares on the pop path, off the ring work.
+func (w *listWindow) contractPreblock(atHead bool, newBound int64) {
+	lo, hi := w.preLo.Load(), w.preHi.Load()
+	if lo >= hi {
+		return // already empty, nothing seeded to protect
+	}
+	if atHead {
+		if newBound <= lo {
+			return // the pop stayed below the seed, band unchanged
+		}
+		if newBound >= hi {
+			w.preLo.Store(0)
+			w.preHi.Store(0)
+			return
+		}
+		w.preLo.Store(newBound)
+		return
+	}
+	if newBound >= hi {
+		return // the pop stayed above the seed, band unchanged
+	}
+	if newBound <= lo {
+		w.preLo.Store(0)
+		w.preHi.Store(0)
+		return
+	}
+	w.preHi.Store(newBound)
 }
 
 // pendRun is a committed-but-not-yet-visible push run held for its in-order predecessor to drain.
@@ -123,8 +167,8 @@ func newListWindow(head, tail int64) *listWindow {
 	w.committedTail.Store(tail)
 	// The seed span was written to f1raw rows by the admitting stripe-lock push; mark it the pre-block
 	// so pop takes those positions from their rows and every later lock-free push lands resident.
-	w.preLo = head
-	w.preHi = tail
+	w.preLo.Store(head)
+	w.preHi.Store(tail)
 	w.pendTail = make(map[int64]pendRun)
 	w.pendHead = make(map[int64]pendRun)
 	span := tail - head
