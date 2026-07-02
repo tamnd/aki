@@ -74,15 +74,6 @@ func newListWindow(head, tail int64) *listWindow {
 	return w
 }
 
-// count is the visible length, two atomic loads with no lock, so LLEN never contends the push
-// path. It reads committedTail before committedHead; a concurrent push only widens the window, so a
-// torn read can undercount by an in-flight push but never reports a position that is not committed.
-func (w *listWindow) count() int64 {
-	t := w.committedTail.Load()
-	h := w.committedHead.Load()
-	return t - h
-}
-
 // seedBytes sets the running listpack byte size and the sticky large flag at admission, from the
 // header the cold-key push just wrote. After this the window owns the size; the header row is
 // stale until drainEvict flushes it back.
