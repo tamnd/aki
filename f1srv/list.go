@@ -1196,15 +1196,24 @@ func (c *connState) cmdLPos(argv [][]byte) {
 	// listpack walk. A cold list has no window, so w is nil and every position falls to its row.
 	w := c.srv.listWinLookup(lkey)
 	if w != nil {
-		w.gate.Lock()
+		w.gate.RLock()
 		if w.evicted.Load() {
-			w.gate.Unlock()
+			w.gate.RUnlock()
 			w = nil
 		}
 	}
 	var head, tail int64
 	if w != nil {
 		head, tail = w.bounds()
+		// LPOS only reads, so the shared gate is enough: it excludes the interior edits that take
+		// the gate exclusively (LINSERT, LREM, drainEvict) and runs alongside the lock-free pushes,
+		// which only extend the committed tail above this snapshot and never touch a scanned slot.
+		// With the ring and bounds pinned by the shared gate, the stripe lock is no longer needed, so
+		// release it here: LPOS on one hot key then runs in parallel across cores instead of
+		// serializing on the stripe, which is what a uniform scan over a large list needs to beat a
+		// single-threaded listpack walk. The cold path below keeps the stripe lock, since a list with
+		// no window has no gate to stand in for it.
+		mu.Unlock()
 	} else {
 		var ok bool
 		head, tail, _, _, ok = c.listHeader(lkey)
@@ -1227,9 +1236,10 @@ func (c *connState) cmdLPos(argv [][]byte) {
 	}
 	matches := c.lposScan(w, lkey, target, head, tail, backward, skip, count, maxlen)
 	if w != nil {
-		w.gate.Unlock()
+		w.gate.RUnlock()
+	} else {
+		mu.Unlock()
 	}
-	mu.Unlock()
 
 	if count >= 0 {
 		c.writeArrayHeader(len(matches))
