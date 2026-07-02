@@ -17,8 +17,13 @@ import (
 // reactor share the exact same parse-dispatch-reply code and differ only in who reads
 // the socket and who flushes out.
 type connState struct {
-	srv       *Server
-	conn      net.Conn
+	srv  *Server
+	conn net.Conn
+	// id is this connection's unique identifier, assigned once at accept from the server's
+	// monotonic counter, the value CLIENT ID reports. name is the label CLIENT SETNAME assigns
+	// and CLIENT GETNAME reads back; it is nil until a name is set, which is the nil-reply case.
+	id        int64
+	name      []byte
 	rbuf      []byte
 	out       []byte // batched reply bytes, flushed once per drained batch
 	wantClose bool   // QUIT sets this; the driver flushes out, then closes the socket

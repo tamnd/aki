@@ -117,6 +117,11 @@ type Server struct {
 	psPat   map[string]map[*connState]struct{}
 	psShard map[string]map[*connState]struct{}
 
+	// nextConnID hands out the per-connection identifier CLIENT ID reports. Redis numbers clients
+	// from 1, so the first Add returns 1. Both drivers (goroutine and reactor) draw from it, so the
+	// ids stay unique across the whole server regardless of which accept path took the connection.
+	nextConnID atomic.Int64
+
 	wg sync.WaitGroup
 }
 
@@ -250,6 +255,7 @@ func (s *Server) serveConn(conn net.Conn) {
 	c := &connState{
 		srv:       s,
 		conn:      conn,
+		id:        s.nextConnID.Add(1),
 		rbuf:      make([]byte, 0, s.cfg.ReadBufSize),
 		out:       make([]byte, 0, s.cfg.ReadBufSize),
 		blockable: true, // a per-connection goroutine may park on a blocking command

@@ -476,10 +476,22 @@ func (c *connState) execCommand(argv [][]byte) {
 		c.writeSimple("OK")
 	case eqFold(cmd, "DBSIZE"):
 		c.writeInt(int64(c.srv.store.TopLen()))
-	case eqFold(cmd, "SELECT") || eqFold(cmd, "CLIENT") || eqFold(cmd, "CONFIG"):
+	case eqFold(cmd, "CLIENT"):
+		c.cmdClient(argv)
+	case eqFold(cmd, "SELECT") || eqFold(cmd, "CONFIG"):
 		c.writeSimple("OK")
 	case eqFold(cmd, "COMMAND"):
 		c.writeArrayHeader(0)
+	case eqFold(cmd, "TIME"):
+		c.cmdTime(argv)
+	case eqFold(cmd, "ROLE"):
+		c.cmdRole(argv)
+	case eqFold(cmd, "AUTH"):
+		c.cmdAuth(argv)
+	case eqFold(cmd, "SLOWLOG"):
+		c.cmdSlowlog(argv)
+	case eqFold(cmd, "LATENCY"):
+		c.cmdLatency(argv)
 	case eqFold(cmd, "INFO"):
 		c.writeBulk([]byte("# Server\r\nredis_version:7.4.0\r\n"))
 	case eqFold(cmd, "QUIT"):
