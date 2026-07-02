@@ -1,5 +1,26 @@
 package f1srv
 
+import "bytes"
+
+// listSig folds an element down to one byte, the signature a resident scan (LPOS, LINSERT pivot
+// search, LREM match collection) filters on before it pays for a full compare. It samples the
+// length and the first, middle, and last bytes rather than hashing the whole element, so it stays
+// O(1) on the push path that fills it. It only has to spread well enough that a scan's target
+// signature rules out the vast majority of non-matching positions: a collision costs one wasted
+// full compare, never a wrong answer, so a weak signature degrades speed, not correctness. Sampling
+// the ends and the length separates the "member_1", "member_2", ... shape a real list carries,
+// where a first-byte-only signature would collapse every element onto one value.
+func listSig(v []byte) byte {
+	n := len(v)
+	if n == 0 {
+		return 0
+	}
+	h := uint64(n)*0x9E3779B1 + uint64(v[0])
+	h = h*131 + uint64(v[n-1])
+	h = h*131 + uint64(v[n>>1])
+	return byte(h ^ (h >> 11) ^ (h >> 23))
+}
+
 // listRing is the resident element-byte deque for a hot list (spec 2064/f1_rewrite_ltm/impl/34). It
 // holds the raw element bytes for the positions currently resident in a listWindow, indexed by
 // position modulo a power-of-two capacity, so a pop reads bytes straight from a slot with no f1raw
@@ -14,6 +35,7 @@ package f1srv
 // lands in [0, 2^k) because the mask clears the sign and high bits.
 type listRing struct {
 	slots [][]byte // ring of element byte slices, len == cap, a power of two
+	sig   []byte   // per-slot element signature, len == cap, kept in lockstep with slots
 	mask  int64    // cap - 1, so slot(p) == p & mask
 }
 
@@ -24,7 +46,7 @@ func newListRing(capPow2 int64) *listRing {
 	if capPow2 <= 0 || capPow2&(capPow2-1) != 0 {
 		panic("f1srv: listRing capacity must be a positive power of two")
 	}
-	return &listRing{slots: make([][]byte, capPow2), mask: capPow2 - 1}
+	return &listRing{slots: make([][]byte, capPow2), sig: make([]byte, capPow2), mask: capPow2 - 1}
 }
 
 // cap returns the ring's slot count, the resident-span ceiling.
@@ -37,6 +59,7 @@ func (r *listRing) capacity() int64 { return int64(len(r.slots)) }
 func (r *listRing) put(pos int64, v []byte) {
 	i := pos & r.mask
 	r.slots[i] = append(r.slots[i][:0], v...)
+	r.sig[i] = listSig(v)
 }
 
 // get returns the bytes stored at pos. The returned slice aliases the ring slot and stays valid until
@@ -85,10 +108,77 @@ func (r *listRing) grow(head, tail int64) {
 	oldCap := int64(len(r.slots))
 	newCap := oldCap << 1
 	newSlots := make([][]byte, newCap)
+	newSig := make([]byte, newCap)
 	newMask := newCap - 1
 	for p := head; p < tail; p++ {
 		newSlots[p&newMask] = r.slots[p&r.mask]
+		newSig[p&newMask] = r.sig[p&r.mask]
 	}
 	r.slots = newSlots
+	r.sig = newSig
 	r.mask = newMask
+}
+
+// scanSigForward calls visit with each live position in [lo, hi) whose signature equals want, in
+// ascending position order, and stops early when visit returns true. The range must be resident and
+// collision-free (span < cap), which the window guarantees for a committed span, so the slot indices
+// for consecutive positions increment by one modulo cap: the range maps to one contiguous run of sig
+// bytes, or two when it wraps the ring end. bytes.IndexByte walks each run at memory-bandwidth speed
+// (it is AVX2 on amd64), so a scan pays a byte compare per position and a full element compare only
+// at the rare signature hit. want is the target's signature; visit does the authoritative full
+// compare, since the signature only filters.
+func (r *listRing) scanSigForward(lo, hi int64, want byte, visit func(pos int64) bool) {
+	for lo < hi {
+		startSlot := lo & r.mask
+		run := int64(len(r.sig)) - startSlot
+		if run > hi-lo {
+			run = hi - lo
+		}
+		seg := r.sig[startSlot : startSlot+run]
+		off := 0
+		for {
+			i := bytes.IndexByte(seg[off:], want)
+			if i < 0 {
+				break
+			}
+			if visit(lo + int64(off+i)) {
+				return
+			}
+			off += i + 1
+			if off >= len(seg) {
+				break
+			}
+		}
+		lo += run
+	}
+}
+
+// scanSigBackward mirrors scanSigForward in descending position order, walking the range's sig runs
+// from the high end with bytes.LastIndexByte. It is the direction a negative-rank LPOS wants.
+func (r *listRing) scanSigBackward(lo, hi int64, want byte, visit func(pos int64) bool) {
+	for hi > lo {
+		// The topmost live position is hi-1; walk the contiguous run of sig bytes ending at its slot.
+		endSlot := (hi - 1) & r.mask
+		run := endSlot + 1
+		if run > hi-lo {
+			run = hi - lo
+		}
+		seg := r.sig[endSlot+1-run : endSlot+1] // len == run; seg[i] is position base+i
+		base := hi - run
+		end := int(run)
+		for {
+			i := bytes.LastIndexByte(seg[:end], want)
+			if i < 0 {
+				break
+			}
+			if visit(base + int64(i)) {
+				return
+			}
+			end = i
+			if end == 0 {
+				break
+			}
+		}
+		hi -= run
+	}
 }
