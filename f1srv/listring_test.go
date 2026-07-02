@@ -149,6 +149,79 @@ func TestListRingGrowThenQueueSpan(t *testing.T) {
 	}
 }
 
+// TestListRingScanSig checks that the signature scan visits exactly the live positions whose element
+// signature equals the target, in ascending order forward and descending order backward, over a live
+// range that wraps the ring end and dips below zero (LPUSH growth). The reference is a plain loop over
+// the same range computing listSig per element, so the test pins the position math the wrapped
+// bytes.IndexByte walk does, independent of any full compare the caller layers on top.
+func TestListRingScanSig(t *testing.T) {
+	const capp = 32
+	r := newListRing(capp)
+	// A live span that wraps: start below zero, run past the ring end, stay under cap.
+	const head, tail = int64(-5), int64(20) // span 25 < cap 32
+	for p := head; p < tail; p++ {
+		// Vary the bytes so signatures spread, with deliberate repeats so several positions collide.
+		r.put(p, []byte(fmt.Sprintf("e%d", p%7)))
+	}
+	for want := 0; want < 256; want++ {
+		wb := byte(want)
+		var refFwd []int64
+		for p := head; p < tail; p++ {
+			if listSig(r.get(p)) == wb {
+				refFwd = append(refFwd, p)
+			}
+		}
+		var gotFwd []int64
+		r.scanSigForward(head, tail, wb, func(pos int64) bool { gotFwd = append(gotFwd, pos); return false })
+		if !eqI64(gotFwd, refFwd) {
+			t.Fatalf("sig %d forward: got %v want %v", want, gotFwd, refFwd)
+		}
+		refBwd := make([]int64, len(refFwd))
+		for i, p := range refFwd {
+			refBwd[len(refFwd)-1-i] = p
+		}
+		var gotBwd []int64
+		r.scanSigBackward(head, tail, wb, func(pos int64) bool { gotBwd = append(gotBwd, pos); return false })
+		if !eqI64(gotBwd, refBwd) {
+			t.Fatalf("sig %d backward: got %v want %v", want, gotBwd, refBwd)
+		}
+	}
+}
+
+// TestListRingScanSigEarlyStop confirms visit returning true halts the walk at the first match, the
+// single-match LPOS path, in both directions.
+func TestListRingScanSigEarlyStop(t *testing.T) {
+	const capp = 16
+	r := newListRing(capp)
+	const head, tail = int64(0), int64(12)
+	for p := head; p < tail; p++ {
+		r.put(p, []byte("same"))
+	}
+	want := listSig([]byte("same"))
+	var fwd []int64
+	r.scanSigForward(head, tail, want, func(pos int64) bool { fwd = append(fwd, pos); return true })
+	if len(fwd) != 1 || fwd[0] != head {
+		t.Fatalf("forward early stop: got %v want [%d]", fwd, head)
+	}
+	var bwd []int64
+	r.scanSigBackward(head, tail, want, func(pos int64) bool { bwd = append(bwd, pos); return true })
+	if len(bwd) != 1 || bwd[0] != tail-1 {
+		t.Fatalf("backward early stop: got %v want [%d]", bwd, tail-1)
+	}
+}
+
+func eqI64(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestListRingBadCapacity(t *testing.T) {
 	for _, bad := range []int64{0, -8, 3, 6, 100} {
 		func() {

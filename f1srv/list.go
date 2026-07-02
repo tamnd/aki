@@ -1251,33 +1251,55 @@ func (c *connState) cmdLPos(argv [][]byte) {
 	c.writeInt(matches[0])
 }
 
-// lposScan walks the window in the search direction, comparing each element to target and
-// collecting the dense positions of the matches after skipping the first skip of them. It
-// stops when it has enough (want, where want <= 0 with a given COUNT means all) or when it has
-// compared maxlen elements (maxlen 0 disables the cap). The returned positions are external
-// indexes (offset from head), so they are already in the form the reply wants.
+// lposScan walks the window in the search direction, collecting the dense positions of the elements
+// equal to target after skipping the first skip of them. It stops when it has enough (want, where
+// want <= 0 with a given COUNT means all) or once it has examined maxlen positions (maxlen 0 disables
+// the cap). The returned positions are external indexes (offset from head), the form the reply wants.
+//
+// For a hot list the resident positions are scanned through the ring's signature array: bytes.Index
+// rules out every position whose one-byte signature cannot match the target, so a full byte compare
+// runs only at the rare signature hit instead of once per position. That is what carries a large-list
+// LPOS past a contiguous listpack walk, where the per-position pointer chase of the raw ring could
+// not. The small pre-block band still reads its f1raw rows one position at a time. A cold list has no
+// window (w is nil) and falls entirely to row reads.
 func (c *connState) lposScan(w *listWindow, lkey, target []byte, head, tail int64, backward bool, skip, want, maxlen int64) []int64 {
-	var out []int64
-	var compared int64
-	step := int64(1)
-	pos := head
-	if backward {
-		step = -1
-		pos = tail - 1
-	}
-	for pos >= head && pos < tail {
-		if maxlen > 0 && compared >= maxlen {
-			break
+	// Clamp the examined range to at most maxlen positions from the scan's starting end, which is
+	// exactly LPOS MAXLEN: a match past that many positions is not reported.
+	eLo, eHi := head, tail
+	if maxlen > 0 {
+		if backward {
+			if eHi-maxlen > eLo {
+				eLo = eHi - maxlen
+			}
+		} else {
+			if eLo+maxlen < eHi {
+				eHi = eLo + maxlen
+			}
 		}
-		v, found := c.listElemRead(w, lkey, pos)
-		compared++
-		if found && string(v) == string(target) {
-			if skip > 0 {
-				skip--
-			} else {
-				out = append(out, pos-head)
-				// want < 0 means single-match mode: one is enough. want == 0 means all matches.
-				if want < 0 || (want > 0 && int64(len(out)) >= want) {
+	}
+
+	var out []int64
+	// emit records a confirmed match after honoring the skip prefix and reports whether the scan has
+	// collected enough to stop. want < 0 is single-match mode, want == 0 (COUNT 0) is all matches.
+	emit := func(pos int64) bool {
+		if skip > 0 {
+			skip--
+			return false
+		}
+		out = append(out, pos-head)
+		return want < 0 || (want > 0 && int64(len(out)) >= want)
+	}
+
+	if w == nil {
+		if backward {
+			for pos := eHi - 1; pos >= eLo; pos-- {
+				if v, found := c.listElemRead(nil, lkey, pos); found && string(v) == string(target) && emit(pos) {
+					break
+				}
+			}
+		} else {
+			for pos := eLo; pos < eHi; pos++ {
+				if v, found := c.listElemRead(nil, lkey, pos); found && string(v) == string(target) && emit(pos) {
 					break
 				}
 			}
@@ -1286,13 +1308,9 @@ func (c *connState) lposScan(w *listWindow, lkey, target []byte, head, tail int6
 	}
 
 	wantSig := listSig(target)
-	wantSig2 := listSig2(target)
 	scanResident := func(lo, hi int64) bool {
 		stop := false
 		visit := func(pos int64) bool {
-			if !w.ring.sig2Hit(pos, wantSig2) {
-				return false
-			}
 			if v := w.ring.get(pos); v != nil && string(v) == string(target) && emit(pos) {
 				stop = true
 				return true
@@ -1326,7 +1344,7 @@ func (c *connState) lposScan(w *listWindow, lkey, target []byte, head, tail int6
 	// The only non-resident positions are the pre-block band [preLo, preHi); everything else is in
 	// the ring. Split the examined range into resident head, pre-block middle, resident tail, and walk
 	// the three in search-direction order so matches come back in list order.
-	bLo, bHi := clampRange(w.preLo.Load(), eLo, eHi), clampRange(w.preHi.Load(), eLo, eHi)
+	bLo, bHi := clampRange(w.preLo, eLo, eHi), clampRange(w.preHi, eLo, eHi)
 	if backward {
 		if scanResident(bHi, eHi) || scanRows(bLo, bHi) || scanResident(eLo, bLo) {
 			return out
