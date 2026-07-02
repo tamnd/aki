@@ -147,6 +147,7 @@ func (s *Server) adopt(conn net.Conn) (*reactorConn, bool) {
 	}
 	cs := &connState{
 		srv:  s,
+		id:   s.nextConnID.Add(1),
 		rbuf: make([]byte, 0, s.cfg.ReadBufSize),
 		out:  make([]byte, 0, s.cfg.ReadBufSize),
 	}
