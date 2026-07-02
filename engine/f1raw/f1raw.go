@@ -248,6 +248,24 @@ func (s *Store) addTop(kind byte, d int64) {
 // ScanKeys walks.
 func (s *Store) BucketCount() int { return len(s.buckets) }
 
+// ArenaBytes reports the resident arena's split: used is the bytes the bump allocator has
+// handed out (record headers, keys, inline values, and overflow buckets), cap is the arena's
+// fixed size. used never rewinds except on a flush, so used/cap is the resident fill the
+// introspection path (INFO used_memory) surfaces. A separated value's bytes live in the cold
+// log, not the arena, so this counts only the resident footprint, which is the figure the
+// larger-than-memory regime keeps near index-plus-keys. tail starts at 8 (offset 0 is
+// reserved so an empty index slot is unambiguous), so used excludes that reserved byte.
+func (s *Store) ArenaBytes() (used, total uint64) {
+	t := s.tail.Load()
+	if t < 8 {
+		t = 8
+	}
+	if t > s.cap {
+		t = s.cap // a failed alloc advances tail past cap; report the arena as full, not over
+	}
+	return t - 8, s.cap
+}
+
 // Close releases the store's external resources. For a pure in-memory store it is a
 // no-op; for a store with a cold value log it closes the log file. The in-memory
 // arena and index are garbage-collected with the store.
