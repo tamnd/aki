@@ -87,6 +87,68 @@ func TestListRingQueueSpan(t *testing.T) {
 	}
 }
 
+// TestListRingGrowPreservesLive fills a ring to just under capacity, grows it, and confirms every live
+// position still reads back its exact bytes at the new mask. Positions include a negative head so the
+// head-below-zero case (LPUSH growth) is covered across the doubling.
+func TestListRingGrowPreservesLive(t *testing.T) {
+	r := newListRing(8)
+	const head, tail = int64(-3), int64(4) // span 7 < cap 8
+	for p := head; p < tail; p++ {
+		r.put(p, []byte(fmt.Sprintf("v%d", p)))
+	}
+	r.grow(head, tail)
+	if r.capacity() != 16 {
+		t.Fatalf("after grow cap=%d want 16", r.capacity())
+	}
+	for p := head; p < tail; p++ {
+		want := []byte(fmt.Sprintf("v%d", p))
+		if got := r.get(p); !bytes.Equal(got, want) {
+			t.Fatalf("after grow pos %d: got %q want %q", p, got, want)
+		}
+	}
+}
+
+// TestListRingGrowMovesBackingByReference proves the rehash relocates the slice header without copying
+// the element bytes: the backing array a live position points at before the grow is the same array it
+// points at after. This is what keeps growth O(span) pointer moves, not O(bytes).
+func TestListRingGrowMovesBackingByReference(t *testing.T) {
+	r := newListRing(4)
+	const head, tail = int64(0), int64(3)
+	for p := head; p < tail; p++ {
+		r.put(p, []byte(fmt.Sprintf("value-%d", p)))
+	}
+	before := &r.get(1)[0]
+	r.grow(head, tail)
+	if after := &r.get(1)[0]; before != after {
+		t.Fatalf("grow copied element bytes, backing array moved")
+	}
+}
+
+// TestListRingGrowThenQueueSpan grows mid-walk and keeps running the queue pattern, so a grow that
+// lands in the middle of steady push/pop churn does not lose the head element. The span stays under
+// the post-grow cap, so the collision-free guarantee holds through and past the doubling.
+func TestListRingGrowThenQueueSpan(t *testing.T) {
+	r := newListRing(8)
+	var head, tail int64
+	const span = 6 // < initial cap 8
+	for tail-head < span {
+		r.put(tail, []byte(fmt.Sprintf("v%d", tail)))
+		tail++
+	}
+	// Grow while live, then keep walking the queue far past the new cap.
+	r.grow(head, tail)
+	for step := 0; step < 10*16; step++ {
+		want := []byte(fmt.Sprintf("v%d", head))
+		if got := r.get(head); !bytes.Equal(got, want) {
+			t.Fatalf("step %d head %d: got %q want %q", step, head, got, want)
+		}
+		r.reset(head)
+		head++
+		r.put(tail, []byte(fmt.Sprintf("v%d", tail)))
+		tail++
+	}
+}
+
 func TestListRingBadCapacity(t *testing.T) {
 	for _, bad := range []int64{0, -8, 3, 6, 100} {
 		func() {
