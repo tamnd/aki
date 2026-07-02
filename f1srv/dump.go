@@ -321,6 +321,10 @@ func (c *connState) rdbDumpList(lkey []byte) []byte {
 	mu.Lock()
 	defer mu.Unlock()
 
+	// A resident push leaves element bytes only in the ring, so retire the hot-list window to flush
+	// them to f1raw rows before this positional dump reads them (slice 3, impl/34). This holds the
+	// key's exclusive stripe lock, which drainEvict requires.
+	c.listWinDrainEvict(lkey)
 	head, tail, _, _, ok := c.listHeader(lkey)
 	if !ok {
 		// cmdDump only reaches here for a live key, so this is the defensive empty-list form.
