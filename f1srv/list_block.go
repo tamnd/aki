@@ -190,7 +190,7 @@ func (c *connState) blockingPop(argv [][]byte, atHead bool) {
 		for _, key := range keys {
 			mu := &c.srv.incrMu[c.srv.stripe(key)]
 			mu.Lock()
-			if c.stringConflict(key) {
+			if c.listWrongType(key) {
 				mu.Unlock()
 				c.writeErr(wrongType)
 				return
@@ -286,7 +286,7 @@ func (c *connState) blockingMove(source, destination, fromTok, toTok, timeoutTok
 	}()
 	for {
 		unlock := c.lockTwoStripes(source, destination)
-		if c.stringConflict(source) || c.stringConflict(destination) {
+		if c.listWrongType(source) || c.listWrongType(destination) {
 			unlock()
 			c.writeErr(wrongType)
 			return
@@ -398,7 +398,7 @@ func (c *connState) cmdBLMPop(argv [][]byte) {
 		for _, key := range keys {
 			mu := &c.srv.incrMu[c.srv.stripe(key)]
 			mu.Lock()
-			if c.stringConflict(key) {
+			if c.listWrongType(key) {
 				mu.Unlock()
 				c.writeErr(wrongType)
 				return
