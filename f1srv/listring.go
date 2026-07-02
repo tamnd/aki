@@ -57,6 +57,22 @@ func (r *listRing) reset(pos int64) {
 	}
 }
 
+// takeSlot detaches the byte slice at pos and returns it, leaving the slot nil so nothing else can
+// alias or overwrite the bytes. A pop uses this to claim an element under the window commit mutex and
+// then frame it onto the wire after releasing the lock: because the slot is nil'd, the returned slice
+// is sole-owned and stays valid even though later pushes and a grow run concurrently. It is safe
+// against those two writers precisely because a claimed position sits behind committedHead (or ahead
+// of committedTail), outside the live [head, tail) span: a concurrent push only touches slots inside
+// the span, and grow only rehashes the live span by reference, so neither reads a detached slot. The
+// one cost is that the next push reaching a nil slot allocates a fresh backing instead of reusing one,
+// which a pop-then-push churn never triggers on the same slot within a single window generation.
+func (r *listRing) takeSlot(pos int64) []byte {
+	i := pos & r.mask
+	v := r.slots[i]
+	r.slots[i] = nil
+	return v
+}
+
 // grow doubles the ring and rehashes the live positions [head, tail) into their new slots. It is
 // called by the window when a push would drive the live span up to capacity, so the collision-free
 // invariant (span < cap) keeps holding as the list gets longer. The rehash is required, not optional:
