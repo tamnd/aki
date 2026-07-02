@@ -480,6 +480,12 @@ func (c *connState) execCommand(argv [][]byte) {
 		c.writeSimple("OK")
 	case eqFold(cmd, "COMMAND"):
 		c.writeArrayHeader(0)
+	case eqFold(cmd, "TIME"):
+		c.cmdTime(argv)
+	case eqFold(cmd, "ROLE"):
+		c.cmdRole(argv)
+	case eqFold(cmd, "AUTH"):
+		c.cmdAuth(argv)
 	case eqFold(cmd, "INFO"):
 		c.writeBulk([]byte("# Server\r\nredis_version:7.4.0\r\n"))
 	case eqFold(cmd, "QUIT"):
