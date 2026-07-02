@@ -166,3 +166,50 @@ func (w *listWindow) commitHead(start, n int64) {
 	w.committedHead.Store(next)
 	w.mu.Unlock()
 }
+
+// popRun claims a run of want positions from a committed end of the window for an off-lock pop,
+// the pop-side mirror of the reserve-then-fill push path (impl/33). atHead claims the low end
+// (LPOP), else the high end (RPOP), and it returns the claimed half-open run [lo, hi) for the
+// caller to TakeKind off the mutex and off the stripe lock. It is deliberately conservative and
+// returns ok false, sending the caller to the stripe-lock pop, in two cases the off-lock path
+// must not touch:
+//
+//   - A push is mid-flight (a reserved bound sits ahead of its committed bound). The push commit
+//     ordering (pendHead, pendTail) assumes a bound moves one direction only, so a pop that moved
+//     the same bound the other way could strand a pending run. Requiring the window quiescent of
+//     pushes (reserved == committed at both ends) keeps the pop clear of that ordering.
+//   - The pop would empty the list or underflow it (want >= live). The emptying-to-header-delete
+//     transition and any head/tail crossing belong to the stripe path, which owns deleting the key.
+//
+// When it does claim, it advances both the committed and the reserved bound of the popping end
+// together (they are equal by the quiescence check) under the same per-list mutex the push commit
+// uses, so a concurrent popper claims a disjoint run and the two takes run in parallel.
+func (w *listWindow) popRun(atHead bool, want int64) (lo, hi int64, ok bool) {
+	if want <= 0 {
+		return 0, 0, false
+	}
+	w.mu.Lock()
+	ch := w.committedHead.Load()
+	ct := w.committedTail.Load()
+	if w.reservedHead.Load() != ch || w.reservedTail.Load() != ct {
+		w.mu.Unlock()
+		return 0, 0, false
+	}
+	if want >= ct-ch {
+		w.mu.Unlock()
+		return 0, 0, false
+	}
+	if atHead {
+		lo = ch
+		hi = ch + want
+		w.committedHead.Store(hi)
+		w.reservedHead.Store(hi)
+	} else {
+		hi = ct
+		lo = ct - want
+		w.committedTail.Store(lo)
+		w.reservedTail.Store(lo)
+	}
+	w.mu.Unlock()
+	return lo, hi, true
+}
