@@ -544,6 +544,63 @@ func (c *connState) cmdPushCoalesced(lkey []byte, atHead, requireExisting bool, 
 func (c *connState) cmdLPop(argv [][]byte) { c.cmdPop(argv, true) }
 func (c *connState) cmdRPop(argv [][]byte) { c.cmdPop(argv, false) }
 
+// popThroughWindow serves LPOP/RPOP off the resident hot-list window, the pop-side mirror of
+// pushThroughWindow (impl/33). It claims the popped positions with one mutex-guarded bound bump
+// and takes their rows off the stripe lock, so a pipelined pop burst on one hot key runs on many
+// cores instead of serializing on the key's stripe mutex the way the drain-then-stripe pop does.
+// It returns false, leaving the caller to run the ordinary stripe-lock pop, when no window is
+// resident, when the pop is unsafe off-lock (a push is mid-flight, or the pop would empty the
+// list, both of which popRun rejects), or when the run carries no element to pop. A resident
+// window means the key is already a list, admitted only after a push cleared the string-conflict
+// check, so no WRONGTYPE check is needed here, exactly as the push fast path omits it. want is the
+// requested element count (1 for the no-count form); hasCount picks the single-bulk versus array
+// reply shape. On success the list is still non-empty (popRun guarantees it), so no blocked-client
+// signal is needed, which only a push that makes a list non-empty raises.
+func (c *connState) popThroughWindow(lkey []byte, atHead, hasCount bool, want int64) bool {
+	w := c.srv.listWinLookup(lkey)
+	if w == nil {
+		return false
+	}
+	w.gate.RLock()
+	if w.evicted.Load() {
+		w.gate.RUnlock()
+		return false
+	}
+	lo, hi, ok := w.popRun(atHead, want)
+	if !ok {
+		w.gate.RUnlock()
+		return false
+	}
+	n := hi - lo
+	if hasCount {
+		c.writeArrayHeader(int(n))
+	}
+	// LPOP returns elements head-outward (positions lo, lo+1, ...); RPOP returns them tail-inward
+	// (hi-1, hi-2, ...). Each row is taken off the stripe lock and copied into the reply by
+	// writeBulk before the next take reuses vbuf, so no per-element buffer is held.
+	var sumBytes int64
+	if atHead {
+		for pos := lo; pos < hi; pos++ {
+			ek := c.listElemKey(lkey, pos)
+			v, _ := c.srv.store.TakeKind(ek, c.vbuf[:0], kindListElem)
+			c.vbuf = v
+			sumBytes += int64(listEntrySize(v))
+			c.writeBulk(v)
+		}
+	} else {
+		for pos := hi - 1; pos >= lo; pos-- {
+			ek := c.listElemKey(lkey, pos)
+			v, _ := c.srv.store.TakeKind(ek, c.vbuf[:0], kindListElem)
+			c.vbuf = v
+			sumBytes += int64(listEntrySize(v))
+			c.writeBulk(v)
+		}
+	}
+	w.addBytes(-sumBytes)
+	w.gate.RUnlock()
+	return true
+}
+
 // cmdPop is the shared body for LPOP (atHead) and RPOP (atTail). Without a count it returns
 // one element as a bulk string (nil on a missing key); with a count it returns an array of up
 // to count elements (a null array on a missing key), drawn from the head outward for LPOP or
@@ -575,6 +632,12 @@ func (c *connState) cmdPop(argv [][]byte, atHead bool) {
 	}
 
 	lkey := argv[1]
+	// A resident hot-list window serves the pop lock-free off the stripe lock. It short-circuits on
+	// a single atomic load when no list is hot, and bails to the stripe path below when the pop is
+	// near-empty or racing a push, so a cold key or a draining tail falls straight through.
+	if c.popThroughWindow(lkey, atHead, hasCount, count) {
+		return
+	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
 	if c.stringConflict(lkey) {

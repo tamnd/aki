@@ -146,6 +146,167 @@ func TestListWindowDifferential(t *testing.T) {
 	}
 }
 
+// TestListWindowCountPopDifferential drives the count forms of LPOP and RPOP against a hot key and
+// checks each popped array and the surviving list against a reference deque. The count pop is the
+// path popThroughWindow serves off the window when the count leaves the list non-empty, and it
+// falls to the stripe path when the count would drain the list, so the sequence deliberately mixes
+// counts that keep the list alive with counts that empty it, exercising both the fast pop and the
+// bail. A divergence would show as a wrong popped array or a surviving list that does not match.
+func TestListWindowCountPopDifferential(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	keys := []string{"a", "b", "c"}
+	model := map[string][]string{}
+	rng := rand.New(rand.NewSource(0x51ce55ed))
+	full := func(k string) []string { return lrangeCall(t, rw, "LRANGE", k, "0", "-1") }
+
+	const steps = 3000
+	seq := 0
+	for s := 0; s < steps; s++ {
+		k := keys[rng.Intn(len(keys))]
+		switch rng.Intn(6) {
+		case 0, 1, 2: // push a small run so a hot key stays populated and its window admits
+			atHead := rng.Intn(2) == 0
+			verb := "RPUSH"
+			if atHead {
+				verb = "LPUSH"
+			}
+			m := 1 + rng.Intn(4)
+			args := []string{verb, k}
+			for i := 0; i < m; i++ {
+				seq++
+				v := "v" + itoa(seq)
+				args = append(args, v)
+				if atHead {
+					model[k] = append([]string{v}, model[k]...)
+				} else {
+					model[k] = append(model[k], v)
+				}
+			}
+			cmd(t, rw, args...)
+			expect(t, rw, ":"+itoa(len(model[k])))
+		case 3, 4: // LPOP k count: pop the first count elements, head outward
+			cnt := rng.Intn(5)
+			got := lrangeCall(t, rw, "LPOP", k, itoa(cnt))
+			want := popHeadModel(&model, k, cnt)
+			if !eqStrs(got, want) {
+				t.Fatalf("step %d LPOP %s %d: server %v != model %v", s, k, cnt, got, want)
+			}
+		case 5: // RPOP k count: pop the last count elements, tail inward
+			cnt := rng.Intn(5)
+			got := lrangeCall(t, rw, "RPOP", k, itoa(cnt))
+			want := popTailModel(&model, k, cnt)
+			if !eqStrs(got, want) {
+				t.Fatalf("step %d RPOP %s %d: server %v != model %v", s, k, cnt, got, want)
+			}
+		}
+		if got, want := full(k), model[k]; !eqStrs(got, want) {
+			t.Fatalf("step %d key %q: server %v != model %v", s, k, got, want)
+		}
+	}
+}
+
+// popHeadModel removes and returns the first cnt elements of key k from the reference deque, the
+// LPOP-with-count result, clamping cnt to the list length and dropping an emptied key.
+func popHeadModel(model *map[string][]string, k string, cnt int) []string {
+	l := (*model)[k]
+	if cnt > len(l) {
+		cnt = len(l)
+	}
+	out := make([]string, cnt)
+	copy(out, l[:cnt])
+	rest := l[cnt:]
+	if len(rest) == 0 {
+		delete(*model, k)
+	} else {
+		(*model)[k] = append([]string(nil), rest...)
+	}
+	return out
+}
+
+// popTailModel removes the last cnt elements of key k and returns them tail inward, the
+// RPOP-with-count result, so RPOP over [a b c d] with cnt 2 returns [d c].
+func popTailModel(model *map[string][]string, k string, cnt int) []string {
+	l := (*model)[k]
+	if cnt > len(l) {
+		cnt = len(l)
+	}
+	out := make([]string, cnt)
+	for i := 0; i < cnt; i++ {
+		out[i] = l[len(l)-1-i]
+	}
+	rest := l[:len(l)-cnt]
+	if len(rest) == 0 {
+		delete(*model, k)
+	} else {
+		(*model)[k] = append([]string(nil), rest...)
+	}
+	return out
+}
+
+// TestListWindowConcurrentPop seeds one hot key with a large list, then has many connections drain
+// it with LPOP at once, each collecting the elements it pops until the list runs dry. The off-lock
+// pop claims a disjoint run under the window's commit mutex, so the union of what every connection
+// popped, plus whatever the final LRANGE still holds, must be the seeded set with each element
+// exactly once. A torn claim would surface here as an element popped by two connections (a
+// duplicate) or a slot claimed but never returned (a lost element and a short total).
+func TestListWindowConcurrentPop(t *testing.T) {
+	const conns = 8
+	const total = 8000
+	rws, cleanup := dialNGo(t, conns+1)
+	defer cleanup()
+
+	seed := rws[conns]
+	// Seed in batches so the window admits (the second push sees the list exist) and every element
+	// is a distinct value the drain can account for.
+	for i := 0; i < total; i++ {
+		cmd(t, seed, "RPUSH", "hot", "e"+itoa(i))
+		if got := readReply(t, seed); len(got) == 0 || got[0] != ':' {
+			t.Fatalf("seed push reply = %q, want an integer", got)
+		}
+	}
+
+	var mu sync.Mutex
+	seen := make(map[string]int, total)
+	var wg sync.WaitGroup
+	for g := 0; g < conns; g++ {
+		wg.Add(1)
+		go func(rw *bufio.ReadWriter) {
+			defer wg.Done()
+			for {
+				cmd(t, rw, "LPOP", "hot")
+				r := readReply(t, rw)
+				if r == "$-1" { // list drained
+					return
+				}
+				if len(r) == 0 || r[0] != '$' {
+					t.Errorf("LPOP reply = %q, want a bulk string or nil", r)
+					return
+				}
+				v := r[1:]
+				mu.Lock()
+				seen[v]++
+				mu.Unlock()
+			}
+		}(rws[g])
+	}
+	wg.Wait()
+
+	// Whatever survived a near-empty bail to the stripe path is still readable; fold it in.
+	for _, v := range lrangeCall(t, seed, "LRANGE", "hot", "0", "-1") {
+		seen[v]++
+	}
+	if len(seen) != total {
+		t.Fatalf("distinct elements accounted = %d, want %d", len(seen), total)
+	}
+	for v, c := range seen {
+		if c != 1 {
+			t.Fatalf("element %q accounted %d times, want once (a torn or double claim)", v, c)
+		}
+	}
+}
+
 // trimModel mirrors LTRIM on the reference deque: negative indexes count from the end, the range
 // is clamped, and an inverted range empties the list. It matches Redis's LTRIM so the model tracks
 // the server through the evicting path LTRIM takes.
