@@ -446,6 +446,8 @@ var knownCommands = map[string]struct{}{
 	"HSET": {}, "HMSET": {}, "HSETNX": {}, "HGET": {}, "HMGET": {}, "HDEL": {},
 	"HEXISTS": {}, "HLEN": {}, "HSTRLEN": {}, "HGETALL": {}, "HKEYS": {}, "HVALS": {},
 	"HSCAN": {}, "HINCRBY": {}, "HINCRBYFLOAT": {}, "HRANDFIELD": {},
+	"HEXPIRE": {}, "HPEXPIRE": {}, "HEXPIREAT": {}, "HPEXPIREAT": {}, "HTTL": {}, "HPTTL": {},
+	"HEXPIRETIME": {}, "HPEXPIRETIME": {}, "HPERSIST": {}, "HGETEX": {}, "HGETDEL": {},
 	"SADD": {}, "SREM": {}, "SISMEMBER": {}, "SMISMEMBER": {}, "SCARD": {}, "SMEMBERS": {},
 	"SSCAN": {}, "SRANDMEMBER": {}, "SPOP": {}, "SMOVE": {}, "SINTER": {}, "SUNION": {},
 	"SDIFF": {}, "SINTERCARD": {}, "SINTERSTORE": {}, "SUNIONSTORE": {}, "SDIFFSTORE": {},

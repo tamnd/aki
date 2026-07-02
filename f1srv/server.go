@@ -85,6 +85,16 @@ type Server struct {
 	// under the key's stripe lock so the count stays exact.
 	volatile atomic.Int64
 
+	// hfe counts hash fields across the keyspace that currently carry a field TTL (a
+	// kindHashFieldTTL sibling row). It is the hot-path gate for hash-field lazy expiry, the
+	// same pattern volatile uses for key TTLs: when it is zero no hash field can be expired, so
+	// every hash read skips the field-expiry probe after one atomic load and the TTL-free
+	// benchmark workload pays nothing for the machinery. Each set of a field's first TTL bumps
+	// it and each clear or reap of one drops it, both under the hash's stripe lock. A non-zero
+	// hfe only means some hash somewhere has a field TTL; a whole-hash read still consults the
+	// per-hash kindHashTTLMeta hint before it will scan, so a TTL-free hash stays O(1).
+	hfe atomic.Int64
+
 	// watch is the optimistic-locking table behind WATCH/EXEC. watchVer holds a monotonic
 	// version per currently-watched key: WATCH snapshots it, a write to that key bumps it,
 	// and EXEC compares. watching is the hot-path gate, the count of live (connection, key)
