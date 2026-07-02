@@ -21,6 +21,27 @@ func listSig(v []byte) byte {
 	return byte(h ^ (h >> 11) ^ (h >> 23))
 }
 
+// listSig2 is a second, near-independent signature byte, checked after the AVX2 scan on listSig hits
+// but before the full element compare. The first-byte scan on listSig runs at memory-bandwidth speed,
+// but its one byte collides once every 256 positions in the best case and far more often on real
+// data: a list of "member_1", "member_2", ... shares a prefix, a length, and often the sampled bytes,
+// so a target's signature can match thousands of positions that are not the target. Each such hit
+// otherwise pays a full compare (a pointer chase and a memcmp), and on a long hot list that dominates
+// LPOS and the LINSERT pivot search. A second byte sampled from different offsets with a different
+// mix cuts the surviving false-positive rate by another ~256x for one array lookup, so the expensive
+// compare runs only on near-certain matches. Like listSig it only filters: a collision costs a wasted
+// compare, never a wrong answer.
+func listSig2(v []byte) byte {
+	n := len(v)
+	if n == 0 {
+		return 0
+	}
+	h := uint64(n)*0xD1B54A33 + uint64(v[n-1])<<7
+	h = h*0x100000001B3 + uint64(v[n>>2])
+	h = h*0x100000001B3 + uint64(v[(n*3)>>2])
+	return byte(h ^ (h >> 17) ^ (h >> 29))
+}
+
 // listRing is the resident element-byte deque for a hot list (spec 2064/f1_rewrite_ltm/impl/34). It
 // holds the raw element bytes for the positions currently resident in a listWindow, indexed by
 // position modulo a power-of-two capacity, so a pop reads bytes straight from a slot with no f1raw
@@ -36,6 +57,7 @@ func listSig(v []byte) byte {
 type listRing struct {
 	slots [][]byte // ring of element byte slices, len == cap, a power of two
 	sig   []byte   // per-slot element signature, len == cap, kept in lockstep with slots
+	sig2  []byte   // per-slot second signature, checked after a sig hit before the full compare
 	mask  int64    // cap - 1, so slot(p) == p & mask
 }
 
@@ -46,7 +68,12 @@ func newListRing(capPow2 int64) *listRing {
 	if capPow2 <= 0 || capPow2&(capPow2-1) != 0 {
 		panic("f1srv: listRing capacity must be a positive power of two")
 	}
-	return &listRing{slots: make([][]byte, capPow2), sig: make([]byte, capPow2), mask: capPow2 - 1}
+	return &listRing{
+		slots: make([][]byte, capPow2),
+		sig:   make([]byte, capPow2),
+		sig2:  make([]byte, capPow2),
+		mask:  capPow2 - 1,
+	}
 }
 
 // cap returns the ring's slot count, the resident-span ceiling.
@@ -60,6 +87,15 @@ func (r *listRing) put(pos int64, v []byte) {
 	i := pos & r.mask
 	r.slots[i] = append(r.slots[i][:0], v...)
 	r.sig[i] = listSig(v)
+	r.sig2[i] = listSig2(v)
+}
+
+// sig2Hit reports whether the second signature at pos equals want2. A scan calls it after the AVX2
+// first-signature scan lands on pos, so it rejects most collisions with one array read before paying
+// for the full element compare. It never rules out a true match: put and move keep sig2 in lockstep
+// with the element, so a real target's second signature always matches.
+func (r *listRing) sig2Hit(pos int64, want2 byte) bool {
+	return r.sig2[pos&r.mask] == want2
 }
 
 // get returns the bytes stored at pos. The returned slice aliases the ring slot and stays valid until
@@ -109,13 +145,16 @@ func (r *listRing) grow(head, tail int64) {
 	newCap := oldCap << 1
 	newSlots := make([][]byte, newCap)
 	newSig := make([]byte, newCap)
+	newSig2 := make([]byte, newCap)
 	newMask := newCap - 1
 	for p := head; p < tail; p++ {
 		newSlots[p&newMask] = r.slots[p&r.mask]
 		newSig[p&newMask] = r.sig[p&r.mask]
+		newSig2[p&newMask] = r.sig2[p&r.mask]
 	}
 	r.slots = newSlots
 	r.sig = newSig
+	r.sig2 = newSig2
 	r.mask = newMask
 }
 
@@ -134,6 +173,7 @@ func (r *listRing) move(dst, src int64) {
 	}
 	r.slots[i] = r.slots[j]
 	r.sig[i] = r.sig[j]
+	r.sig2[i] = r.sig2[j]
 	r.slots[j] = nil
 }
 

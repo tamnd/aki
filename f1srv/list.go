@@ -1302,9 +1302,13 @@ func (c *connState) lposScan(w *listWindow, lkey, target []byte, head, tail int6
 	}
 
 	wantSig := listSig(target)
+	wantSig2 := listSig2(target)
 	scanResident := func(lo, hi int64) bool {
 		stop := false
 		visit := func(pos int64) bool {
+			if !w.ring.sig2Hit(pos, wantSig2) {
+				return false
+			}
 			if v := w.ring.get(pos); v != nil && string(v) == string(target) && emit(pos) {
 				stop = true
 				return true
@@ -1487,9 +1491,13 @@ func (c *connState) linsertResident(w *listWindow, lkey, pivot, val []byte, befo
 	head, tail := w.bounds()
 
 	wantSig := listSig(pivot)
+	wantSig2 := listSig2(pivot)
 	var pivotPos int64
 	found := false
 	w.ring.scanSigForward(head, tail, wantSig, func(pos int64) bool {
+		if !w.ring.sig2Hit(pos, wantSig2) {
+			return false
+		}
 		if v := w.ring.get(pos); v != nil && string(v) == string(pivot) {
 			pivotPos = pos
 			found = true
@@ -1538,10 +1546,14 @@ func (c *connState) lremResident(w *listWindow, lkey, target []byte, count int64
 	head, tail := w.bounds()
 
 	wantSig := listSig(target)
+	wantSig2 := listSig2(target)
 	del := make(map[int64]struct{})
 	if count >= 0 {
 		need := count // 0 means every match
 		w.ring.scanSigForward(head, tail, wantSig, func(pos int64) bool {
+			if !w.ring.sig2Hit(pos, wantSig2) {
+				return false
+			}
 			if v := w.ring.get(pos); v != nil && string(v) == string(target) {
 				del[pos] = struct{}{}
 				if need > 0 && int64(len(del)) >= need {
@@ -1553,6 +1565,9 @@ func (c *connState) lremResident(w *listWindow, lkey, target []byte, count int64
 	} else {
 		need := -count
 		w.ring.scanSigBackward(head, tail, wantSig, func(pos int64) bool {
+			if !w.ring.sig2Hit(pos, wantSig2) {
+				return false
+			}
 			if v := w.ring.get(pos); v != nil && string(v) == string(target) {
 				del[pos] = struct{}{}
 				if int64(len(del)) >= need {
