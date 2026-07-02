@@ -56,9 +56,26 @@ const listHeaderBytes = 7
 // every stock server a client compares against uses.
 const listListpackMaxBytes = 8192
 
-// listMetaSize is the fixed width of the header row: head int64 | tail int64 | lpBytes uint64,
-// each 8 bytes little-endian, then a 1-byte sticky "ever large" flag.
+// listMetaSize is the v1 header width and the read floor: head int64 | tail int64 | lpBytes
+// uint64, each 8 bytes little-endian, then a 1-byte sticky "ever large" flag. A header record is
+// never shorter than this, so the dense readers below always find their four fields.
 const listMetaSize = 25
+
+// listMetaSizeV2 is the header width the order-statistic list model writes. It keeps the v1
+// fields at their original offsets so every dense reader decodes a v2 record unchanged, then
+// appends the sparse-model state past offset 25: a sticky everSparse flag (latched the first time
+// a list retires a popped key or takes an interior insert), the live element count (the authority
+// for LLEN once positions go sparse and tail-head no longer counts the live rows), and the oindex
+// generation for the bounded rebalance. Until the sparse push, pop, and insert paths latch real
+// values these are written as dense-derived defaults (everSparse=false, count=tail-head,
+// generation=0), so widening to this record is behaviour-preserving on its own.
+const listMetaSizeV2 = 42
+
+const (
+	listMetaOffEverSparse = 25 // 1 byte, sticky sparse flag
+	listMetaOffCount      = 26 // 8 bytes little-endian, live element count
+	listMetaOffGeneration = 34 // 8 bytes little-endian, oindex rebalance generation
+)
 
 // listElemKey builds the composite element key for (lkey, pos) into the reused kbuf, so a
 // list command allocates nothing for its key. The 8-byte order key is uint64(pos) with the
@@ -98,7 +115,7 @@ func (c *connState) listHeader(lkey []byte) (head, tail int64, lpBytes uint64, e
 		lp, large := w.sizeState()
 		return h, t, lp, large, true
 	}
-	var hb [listMetaSize]byte
+	var hb [listMetaSizeV2]byte
 	v, got := c.srv.store.GetKind(lkey, hb[:0], kindListMeta)
 	if !got || len(v) < listMetaSize {
 		return 0, 0, listHeaderBytes, false, false
@@ -117,7 +134,7 @@ func (c *connState) listHeader(lkey []byte) (head, tail int64, lpBytes uint64, e
 // because a fixed-width header row is never outgrown-republished and element writes append
 // under different keys, so the header record does not move.
 func (c *connState) listHeaderAt(lkey []byte) (head, tail int64, lpBytes uint64, everLarge bool, off uint64, ok bool) {
-	var hb [listMetaSize]byte
+	var hb [listMetaSizeV2]byte
 	v, o, got := c.srv.store.GetKindAt(lkey, hb[:0], kindListMeta)
 	if !got || len(v) < listMetaSize {
 		return 0, 0, listHeaderBytes, false, 0, false
@@ -129,9 +146,11 @@ func (c *connState) listHeaderAt(lkey []byte) (head, tail int64, lpBytes uint64,
 	return head, tail, lpBytes, everLarge, o, true
 }
 
-// listPackHeader lays the 25-byte header window into ob so both the create path (PutKind) and
-// the in-place update path (InPlaceAt) share one encoding.
-func listPackHeader(ob *[listMetaSize]byte, head, tail int64, lpBytes uint64, everLarge bool) {
+// listPackHeaderV2 lays the full order-statistic header into ob: the v1 dense fields at their
+// original offsets, then the sparse-model state. Every header write routes through here so a
+// header record is always the v2 width, which keeps the in-place update path (listPutHeaderAt)
+// rewriting a same-width record and never needing PutKind's outgrow republish.
+func listPackHeaderV2(ob *[listMetaSizeV2]byte, head, tail int64, lpBytes uint64, everLarge, everSparse bool, count, generation uint64) {
 	binary.LittleEndian.PutUint64(ob[0:8], uint64(head))
 	binary.LittleEndian.PutUint64(ob[8:16], uint64(tail))
 	binary.LittleEndian.PutUint64(ob[16:24], lpBytes)
@@ -139,6 +158,39 @@ func listPackHeader(ob *[listMetaSize]byte, head, tail int64, lpBytes uint64, ev
 	if everLarge {
 		ob[24] = 1
 	}
+	ob[listMetaOffEverSparse] = 0
+	if everSparse {
+		ob[listMetaOffEverSparse] = 1
+	}
+	binary.LittleEndian.PutUint64(ob[listMetaOffCount:listMetaOffCount+8], count)
+	binary.LittleEndian.PutUint64(ob[listMetaOffGeneration:listMetaOffGeneration+8], generation)
+}
+
+// listPackHeader writes the header for a dense list, deriving the sparse-model fields from the
+// window bounds: a dense list has retired no key and taken no interior insert (everSparse=false),
+// its live count is exactly tail-head, and it has not rebalanced the oindex (generation 0). The
+// dense push and pop paths call this; the sparse paths (later slices) call listPackHeaderV2 with
+// the latched values.
+func listPackHeader(ob *[listMetaSizeV2]byte, head, tail int64, lpBytes uint64, everLarge bool) {
+	listPackHeaderV2(ob, head, tail, lpBytes, everLarge, false, uint64(tail-head), 0)
+}
+
+// listHeaderDecodeFull reads every header field from a header record value, tolerating a short v1
+// record (25 bytes) by deriving the sparse-model fields the same way listPackHeader does, so a
+// header written before the v2 widening still decodes to consistent values. The sparse push, pop,
+// and insert paths read the latched everSparse, count, and generation through this decode.
+func listHeaderDecodeFull(v []byte) (head, tail int64, lpBytes uint64, everLarge, everSparse bool, count, generation uint64) {
+	head = int64(binary.LittleEndian.Uint64(v[0:8]))
+	tail = int64(binary.LittleEndian.Uint64(v[8:16]))
+	lpBytes = binary.LittleEndian.Uint64(v[16:24])
+	everLarge = v[24] != 0
+	if len(v) < listMetaSizeV2 {
+		return head, tail, lpBytes, everLarge, false, uint64(tail - head), 0
+	}
+	everSparse = v[listMetaOffEverSparse] != 0
+	count = binary.LittleEndian.Uint64(v[listMetaOffCount : listMetaOffCount+8])
+	generation = binary.LittleEndian.Uint64(v[listMetaOffGeneration : listMetaOffGeneration+8])
+	return head, tail, lpBytes, everLarge, everSparse, count, generation
 }
 
 // listPutHeader writes a list's header window, or deletes the header when the window is empty
@@ -149,20 +201,20 @@ func (c *connState) listPutHeader(lkey []byte, head, tail int64, lpBytes uint64,
 		c.srv.store.DeleteKind(lkey, kindListMeta)
 		return nil
 	}
-	var ob [listMetaSize]byte
+	var ob [listMetaSizeV2]byte
 	listPackHeader(&ob, head, tail, lpBytes, everLarge)
 	_, err := c.srv.store.PutKind(lkey, ob[:], kindListMeta)
 	return err
 }
 
 // listPutHeaderAt writes a non-empty header window in place at a known offset, the fused
-// write-back that pairs with listHeaderAt: the header is a fixed 25 bytes so it always fits
-// the room the first PutKind reserved, and rewriting it at off skips the index probe
+// write-back that pairs with listHeaderAt: the header is a fixed width (listMetaSizeV2) so it
+// always fits the room the first PutKind reserved, and rewriting it at off skips the index probe
 // listPutHeader would spend. It is only for a still-live window (head != tail); a pop that
 // drains the list to empty must delete the header through listPutHeader instead, which is the
 // rare once-per-lifetime path where the extra probe does not matter.
 func (c *connState) listPutHeaderAt(off uint64, head, tail int64, lpBytes uint64, everLarge bool) {
-	var ob [listMetaSize]byte
+	var ob [listMetaSizeV2]byte
 	listPackHeader(&ob, head, tail, lpBytes, everLarge)
 	c.srv.store.InPlaceAt(off, ob[:])
 }
