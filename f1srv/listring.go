@@ -119,6 +119,46 @@ func (r *listRing) grow(head, tail int64) {
 	r.mask = newMask
 }
 
+// move relocates the element at src to dst, the element pointer and its signature together, and
+// detaches src by leaving its slot nil. The detach is the point: moving a slice header alone would
+// leave dst and src aliasing one backing array, and a later put reusing src's array in place would
+// then corrupt the element now living at dst. Nilling src keeps every live slot owning a distinct
+// array, so the interior edits can slide a run by pointer at ring speed and still let put reuse
+// backings on the steady push path. dst and src must differ; the caller (a one-position shift or a
+// compaction that skips the no-op case) never passes them equal, and the guard makes an equal call a
+// harmless no-op rather than a self-nil.
+func (r *listRing) move(dst, src int64) {
+	i, j := dst&r.mask, src&r.mask
+	if i == j {
+		return
+	}
+	r.slots[i] = r.slots[j]
+	r.sig[i] = r.sig[j]
+	r.slots[j] = nil
+}
+
+// shiftDown slides the live run [lo, hi) one position lower, so the element at p lands at p-1 for
+// every p in [lo, hi). It walks ascending, lowest source first, so each source is read before a
+// higher move overwrites it. move detaches each source, so after the walk the top slot hi-1 is nil
+// and the caller puts the new element there fresh. It is the left-run open an interior insert makes
+// when it grows the window head by one.
+func (r *listRing) shiftDown(lo, hi int64) {
+	for p := lo; p < hi; p++ {
+		r.move(p-1, p)
+	}
+}
+
+// shiftUp slides the live run [lo, hi) one position higher, so the element at p lands at p+1. It
+// walks descending, highest source first, so each source is read before a lower move overwrites it.
+// move detaches each source, so after the walk the bottom slot lo is nil and the caller puts the new
+// element there fresh. It is the right-run open an interior insert makes when it grows the window
+// tail by one.
+func (r *listRing) shiftUp(lo, hi int64) {
+	for p := hi - 1; p >= lo; p-- {
+		r.move(p+1, p)
+	}
+}
+
 // scanSigForward calls visit with each live position in [lo, hi) whose signature equals want, in
 // ascending position order, and stops early when visit returns true. The range must be resident and
 // collision-free (span < cap), which the window guarantees for a committed span, so the slot indices
