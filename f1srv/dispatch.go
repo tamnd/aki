@@ -300,6 +300,12 @@ func (c *connState) execCommand(argv [][]byte) {
 		c.cmdZPop(argv, false)
 	case eqFold(cmd, "ZPOPMAX"):
 		c.cmdZPop(argv, true)
+	case eqFold(cmd, "BZPOPMIN"):
+		c.cmdBZPopMin(argv)
+	case eqFold(cmd, "BZPOPMAX"):
+		c.cmdBZPopMax(argv)
+	case eqFold(cmd, "BZMPOP"):
+		c.cmdBZMPop(argv)
 	case eqFold(cmd, "ZREMRANGEBYRANK"):
 		c.cmdZRemRangeByRank(argv)
 	case eqFold(cmd, "ZREMRANGEBYSCORE"):

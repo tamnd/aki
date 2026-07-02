@@ -451,6 +451,12 @@ scanFlags:
 	}
 	mu.Unlock()
 
+	// A sorted set that gained members can serve a client blocked on BZPOPMIN/BZPOPMAX/BZMPOP.
+	// The atomic fast-out in signalListKey keeps this off the registry lock when nobody blocks.
+	if added > 0 {
+		c.srv.signalListKey(zkey)
+	}
+
 	if incr {
 		if incrSuppressed {
 			c.writeNil()
@@ -529,6 +535,8 @@ func (c *connState) cmdZIncrBy(argv [][]byte) {
 		return
 	}
 	mu.Unlock()
+	// A new member can serve a client blocked on BZPOPMIN/BZPOPMAX/BZMPOP.
+	c.srv.signalListKey(zkey)
 	c.writeScore(newScore)
 }
 
