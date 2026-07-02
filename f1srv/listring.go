@@ -56,3 +56,23 @@ func (r *listRing) reset(pos int64) {
 		r.slots[i] = r.slots[i][:0]
 	}
 }
+
+// grow doubles the ring and rehashes the live positions [head, tail) into their new slots. It is
+// called by the window when a push would drive the live span up to capacity, so the collision-free
+// invariant (span < cap) keeps holding as the list gets longer. The rehash is required, not optional:
+// after doubling, a live position p that sat at p & oldmask must move to p & newmask, and because two
+// positions cap apart shared the old slot the copy has to be driven by the live position list, not by
+// walking the old slot array. It moves the byte slices by reference, so no element bytes are copied,
+// only the pointers, and growth is O(span) and happens log(n) times over a list's life, off the
+// per-element push path (under the window's commit mutex).
+func (r *listRing) grow(head, tail int64) {
+	oldCap := int64(len(r.slots))
+	newCap := oldCap << 1
+	newSlots := make([][]byte, newCap)
+	newMask := newCap - 1
+	for p := head; p < tail; p++ {
+		newSlots[p&newMask] = r.slots[p&r.mask]
+	}
+	r.slots = newSlots
+	r.mask = newMask
+}
