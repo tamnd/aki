@@ -47,6 +47,7 @@ type connState struct {
 	hscanO   []uint64  // reused scratch for a whole-hash value-carrying read's record-offset batch
 	pushColl [][]byte  // reused scratch for a coalesced push run's elements, in arrival order
 	pushBnd  []int     // reused scratch for the coalesced push run's per-command element boundaries
+	popBufs  [][]byte  // reused scratch for a window pop run's claimed element slices, framed after the commit mutex releases
 
 	// Transaction state (MULTI/EXEC/DISCARD/WATCH/UNWATCH). inMulti is set between MULTI
 	// and EXEC/DISCARD; while it is set every non-transaction command is copied into
