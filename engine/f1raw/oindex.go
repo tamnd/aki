@@ -322,15 +322,22 @@ func (oi *oindex) scanBatch(prefix, after []byte, limit int, dst []uint64) ([]ui
 	}
 	x = x.next[0]
 
+	// The seek positioned x at the first node whose key is >= max(prefix, after), so every
+	// node before x is already excluded. Element keys are unique, so at most one node can
+	// equal `after`, and if it exists it is exactly this first node. Skip it once here
+	// rather than comparing every element against `after` inside the walk, which would run a
+	// full bytes.Compare per element for a boundary that can match only the head of the batch.
+	if after != nil && x != nil {
+		if bytes.Compare(oi.store.keyAt(x.off), after) <= 0 {
+			x = x.next[0]
+		}
+	}
+
 	var last []byte
 	for x != nil && len(dst) < limit {
 		k := oi.store.keyAt(x.off)
 		if !bytes.HasPrefix(k, prefix) {
 			break
-		}
-		if after != nil && bytes.Compare(k, after) <= 0 {
-			x = x.next[0]
-			continue
 		}
 		dst = append(dst, x.off)
 		last = k
