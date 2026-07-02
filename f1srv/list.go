@@ -850,7 +850,7 @@ func (c *connState) cmdLInsert(argv [][]byte) {
 		for p := head; p < head+i; p++ {
 			v, _ := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
 			c.vbuf = v
-			c.srv.store.PutKind(c.listElemKey(lkey, p-1), v, kindListElem)
+			_, _ = c.srv.store.PutKind(c.listElemKey(lkey, p-1), v, kindListElem)
 		}
 		newElemPos = head + i - 1
 		head--
@@ -861,12 +861,12 @@ func (c *connState) cmdLInsert(argv [][]byte) {
 		for p := tail - 1; p >= head+i; p-- {
 			v, _ := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
 			c.vbuf = v
-			c.srv.store.PutKind(c.listElemKey(lkey, p+1), v, kindListElem)
+			_, _ = c.srv.store.PutKind(c.listElemKey(lkey, p+1), v, kindListElem)
 		}
 		newElemPos = head + i
 		tail++
 	}
-	c.srv.store.PutKind(c.listElemKey(lkey, newElemPos), val, kindListElem)
+	_, _ = c.srv.store.PutKind(c.listElemKey(lkey, newElemPos), val, kindListElem)
 	lpBytes += uint64(listEntrySize(val))
 	if !everLarge && lpBytes > listListpackMaxBytes {
 		everLarge = true
@@ -972,7 +972,7 @@ func (c *connState) cmdLRem(argv [][]byte) {
 		if w != p {
 			v, _ := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
 			c.vbuf = v
-			c.srv.store.PutKind(c.listElemKey(lkey, w), v, kindListElem)
+			_, _ = c.srv.store.PutKind(c.listElemKey(lkey, w), v, kindListElem)
 		}
 		w++
 	}

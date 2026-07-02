@@ -473,7 +473,7 @@ func (c *connState) cmdZInterCard(argv [][]byte) {
 				}
 			}
 			count++
-			return !(limit > 0 && count >= limit)
+			return limit <= 0 || count < limit
 		})
 	}
 	unlock()

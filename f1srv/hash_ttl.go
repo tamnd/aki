@@ -816,7 +816,11 @@ func (c *connState) cmdHExpireAt(argv [][]byte)  { c.cmdHExpireGeneric(argv, hfe
 func (c *connState) cmdHPExpireAt(argv [][]byte) { c.cmdHExpireGeneric(argv, hfeAbsMs, "hpexpireat") }
 
 // The four reader verbs share cmdHTTLGeneric.
-func (c *connState) cmdHTTL(argv [][]byte)         { c.cmdHTTLGeneric(argv, hfeReadTTLSec, "httl") }
-func (c *connState) cmdHPTTL(argv [][]byte)        { c.cmdHTTLGeneric(argv, hfeReadTTLMs, "hpttl") }
-func (c *connState) cmdHExpireTime(argv [][]byte)  { c.cmdHTTLGeneric(argv, hfeReadExpSec, "hexpiretime") }
-func (c *connState) cmdHPExpireTime(argv [][]byte) { c.cmdHTTLGeneric(argv, hfeReadExpMs, "hpexpiretime") }
+func (c *connState) cmdHTTL(argv [][]byte)  { c.cmdHTTLGeneric(argv, hfeReadTTLSec, "httl") }
+func (c *connState) cmdHPTTL(argv [][]byte) { c.cmdHTTLGeneric(argv, hfeReadTTLMs, "hpttl") }
+func (c *connState) cmdHExpireTime(argv [][]byte) {
+	c.cmdHTTLGeneric(argv, hfeReadExpSec, "hexpiretime")
+}
+func (c *connState) cmdHPExpireTime(argv [][]byte) {
+	c.cmdHTTLGeneric(argv, hfeReadExpMs, "hpexpiretime")
+}

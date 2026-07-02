@@ -149,7 +149,7 @@ func (c *connState) zsetClear(zkey []byte) {
 // already cleared the destination and holds its stripe lock. The result members are arena-independent
 // copies, so writing them is safe even when the destination aliased a source.
 func (c *connState) zsetWriteResult(dest []byte, res []zScored) (int, error) {
-	var enc byte = encNone
+	var enc = encNone
 	count := uint64(0)
 	for _, e := range res {
 		score := normalizeZero(e.score)

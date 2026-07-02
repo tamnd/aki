@@ -312,7 +312,7 @@ func (c *connState) zLexWindow(zkey, loArg, hiArg []byte, rev, hasLimit bool, of
 		// (rows at or below m).
 		startIdx = c.zlexRankBoundary(prefix, loMember, loExcl, card)
 	}
-	endIdx := card
+	var endIdx int
 	switch hiKind {
 	case lexMaxInf:
 		endIdx = card
@@ -445,7 +445,7 @@ func (c *connState) cmdZLexCount(argv [][]byte) {
 	default:
 		startIdx = c.zlexRankBoundary(prefix, loMember, loExcl, card)
 	}
-	endIdx := card
+	var endIdx int
 	switch hiKind {
 	case lexMaxInf:
 		endIdx = card

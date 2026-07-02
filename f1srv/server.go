@@ -101,9 +101,9 @@ type Server struct {
 	// watches across all clients; when it is zero no key is watched, so the write path skips
 	// the version bump entirely after one atomic load, the same gate pattern volatile uses
 	// for TTLs. watchMu guards the map and the refcounts inside it.
-	watchMu   sync.Mutex
-	watchVer  map[string]*watchEntry
-	watching  atomic.Int64
+	watchMu  sync.Mutex
+	watchVer map[string]*watchEntry
+	watching atomic.Int64
 
 	// Pub/sub registry. psChan/psPat/psShard map a channel name, a pattern, or a shard channel
 	// to the set of connections subscribed to it; PUBLISH walks psChan plus every matching entry

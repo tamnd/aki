@@ -54,9 +54,9 @@ func TestMultiExec(t *testing.T) {
 
 	cmd(t, rw, "EXEC")
 	expect(t, rw, "*3")
-	expect(t, rw, "+OK")  // SET
-	expect(t, rw, ":1")   // INCR n
-	expect(t, rw, "$v")   // GET k
+	expect(t, rw, "+OK") // SET
+	expect(t, rw, ":1")  // INCR n
+	expect(t, rw, "$v")  // GET k
 
 	// After EXEC the writes are durable in the keyspace.
 	cmd(t, rw, "GET", "k")
