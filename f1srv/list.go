@@ -1446,6 +1446,164 @@ func (c *connState) cmdLTrim(argv [][]byte) {
 	c.writeSimple("OK")
 }
 
+// listPromoteResident flushes a hot list's pre-block into the ring and drops the backing rows, so
+// every live position becomes ring-resident and an interior edit can slide slots in memory instead
+// of rewriting f1raw rows. The pre-block is the seed span the admitting push left in rows; for a
+// list built by appends (an RPUSH or LPUSH per element) it is a single position, so this is
+// O(pre-block), not O(n). The caller holds the key stripe lock and the window eviction gate, so no
+// push is in flight and the ring and bounds are quiescent. After it preLo == preHi == 0, so
+// resident() is true for every position and a later drainEvict re-flushes them all from the ring.
+// Taking each pre-block row here removes its counted f1raw record; drainEvict re-creates it, so the
+// count balances over the window's life exactly as it did before promotion.
+func (c *connState) listPromoteResident(w *listWindow, lkey []byte) {
+	head, tail := w.bounds()
+	lo, hi := w.preLo, w.preHi
+	if lo < head {
+		lo = head
+	}
+	if hi > tail {
+		hi = tail
+	}
+	for p := lo; p < hi; p++ {
+		v, found := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
+		if found {
+			c.vbuf = v
+			w.ring.put(p, v)
+		}
+	}
+	w.preLo, w.preHi = 0, 0
+}
+
+// linsertResident runs LINSERT on a resident hot list entirely in memory. It promotes the tiny
+// pre-block into the ring, finds the pivot through the signature scan, then opens a one-slot gap by
+// sliding the shorter side of the pivot in the ring (pointer moves, no per-row I/O) and writes the
+// new element into the freed slot. The window head or tail grows by one to match, both its committed
+// and reserved bound since no push is in flight under the gate. It returns the new length, or -1 when
+// the pivot is absent. This is the path that has to clear the 2x bar: the old row-shift walk paid an
+// f1raw take-and-put per shifted position, tens of milliseconds on a deep pivot, where a real
+// listpack shifts its bytes in memory.
+func (c *connState) linsertResident(w *listWindow, lkey, pivot, val []byte, before bool) int64 {
+	c.listPromoteResident(w, lkey)
+	head, tail := w.bounds()
+
+	wantSig := listSig(pivot)
+	var pivotPos int64
+	found := false
+	w.ring.scanSigForward(head, tail, wantSig, func(pos int64) bool {
+		if v := w.ring.get(pos); v != nil && string(v) == string(pivot) {
+			pivotPos = pos
+			found = true
+			return true
+		}
+		return false
+	})
+	if !found {
+		return -1
+	}
+
+	// Insertion index i within the window: BEFORE lands at the pivot's index, AFTER at the next one.
+	// Shift whichever side of the slot has fewer elements, so the move is O(min(i, n-i)) ring slides.
+	i := pivotPos - head
+	if !before {
+		i++
+	}
+	n := tail - head
+	if i <= n-i {
+		w.ringEnsure(head-1, tail)
+		w.ring.shiftDown(head, head+i)
+		w.ring.put(head+i-1, val)
+		w.committedHead.Store(head - 1)
+		w.reservedHead.Store(head - 1)
+	} else {
+		w.ringEnsure(head, tail+1)
+		w.ring.shiftUp(head+i, tail)
+		w.ring.put(head+i, val)
+		w.committedTail.Store(tail + 1)
+		w.reservedTail.Store(tail + 1)
+	}
+	w.addBytes(int64(listEntrySize(val)))
+	return n + 1
+}
+
+// lremResident runs LREM on a resident hot list entirely in memory. It promotes the pre-block, then
+// collects the positions to drop through the signature scan, bounded by the count: a positive count
+// stops after the first count matches from the head, a negative count after the last |count| from the
+// tail, and zero takes them all. It then compacts the survivors down through the ring with a write
+// cursor, sliding a survivor by a pointer move only when a gap has opened before it, and shrinks the
+// committed tail to match. Removing the last element retires the window and drops the key. It returns
+// the number removed. The old path scanned the whole list on every LREM even for count 1 and rewrote
+// each survivor's f1raw row; this bounds the scan and keeps the compaction in memory.
+func (c *connState) lremResident(w *listWindow, lkey, target []byte, count int64) int64 {
+	c.listPromoteResident(w, lkey)
+	head, tail := w.bounds()
+
+	wantSig := listSig(target)
+	del := make(map[int64]struct{})
+	if count >= 0 {
+		need := count // 0 means every match
+		w.ring.scanSigForward(head, tail, wantSig, func(pos int64) bool {
+			if v := w.ring.get(pos); v != nil && string(v) == string(target) {
+				del[pos] = struct{}{}
+				if need > 0 && int64(len(del)) >= need {
+					return true
+				}
+			}
+			return false
+		})
+	} else {
+		need := -count
+		w.ring.scanSigBackward(head, tail, wantSig, func(pos int64) bool {
+			if v := w.ring.get(pos); v != nil && string(v) == string(target) {
+				del[pos] = struct{}{}
+				if int64(len(del)) >= need {
+					return true
+				}
+			}
+			return false
+		})
+	}
+	if len(del) == 0 {
+		return 0
+	}
+
+	removed := int64(0)
+	wpos := head
+	for p := head; p < tail; p++ {
+		if _, drop := del[p]; drop {
+			w.addBytes(-int64(listEntrySize(w.ring.get(p))))
+			removed++
+			continue
+		}
+		if wpos != p {
+			w.ring.move(wpos, p)
+		}
+		wpos++
+	}
+	if wpos == head {
+		c.listWinDropEmpty(w, lkey)
+		return removed
+	}
+	w.committedTail.Store(wpos)
+	w.reservedTail.Store(wpos)
+	return removed
+}
+
+// listWinDropEmpty retires a hot list's window when an interior edit removed its last element,
+// deleting the persistent header row so the key stops existing. The caller holds the key stripe lock
+// and the window gate, so no push is in flight and no other command is mid-read; after this the key
+// is cold and a later push re-admits from a fresh header. The pre-block was already promoted and its
+// rows taken, and resident positions were never rows, so no element rows remain to delete.
+func (c *connState) listWinDropEmpty(w *listWindow, lkey []byte) {
+	s := c.srv
+	sh := s.listWinShardFor(lkey)
+	sh.mu.Lock()
+	delete(sh.m, string(lkey))
+	sh.mu.Unlock()
+	w.evicted.Store(true)
+	s.listWinLive.Add(-1)
+	c.srv.store.DeleteKind(lkey, kindListMeta)
+}
+
 // cmdLInsert implements LINSERT key BEFORE|AFTER pivot value. It is the first list command
 // that edits the interior of the window rather than an end, so it is where the dense-window
 // model has to answer what the spec's sparse fractional order key (2064/f1_rewrite_ltm/08)
@@ -1484,7 +1642,30 @@ func (c *connState) cmdLInsert(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	c.listWinDrainEvict(lkey)
+	// A hot list carries its live elements in the resident ring, so the interior shift runs there as
+	// pointer moves instead of a take-and-put per position on f1raw rows, the difference between a
+	// deep-pivot LINSERT costing milliseconds and costing microseconds. Hold the eviction gate so the
+	// ring and bounds are stable (the stripe lock already excludes other non-push commands); a cold
+	// list has no window and falls to the row path below.
+	w := c.srv.listWinLookup(lkey)
+	if w != nil {
+		w.gate.Lock()
+		if w.evicted.Load() {
+			w.gate.Unlock()
+			w = nil
+		}
+	}
+	if w != nil {
+		reply := c.linsertResident(w, lkey, pivot, val, before)
+		w.gate.Unlock()
+		mu.Unlock()
+		if reply > 0 {
+			// The list grew by one, so it can satisfy a client blocked on this key.
+			c.srv.signalListKey(lkey)
+		}
+		c.writeInt(reply)
+		return
+	}
 	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
 	if !ok {
 		mu.Unlock()
@@ -1588,7 +1769,25 @@ func (c *connState) cmdLRem(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	c.listWinDrainEvict(lkey)
+	// A hot list removes and compacts in the resident ring: the match scan is bounded by the count
+	// and the survivor slide is pointer moves, where the row path scanned the whole list on every
+	// call and rewrote each survivor's f1raw row. Hold the eviction gate so the ring and bounds are
+	// stable; a cold list has no window and falls to the row path below.
+	w := c.srv.listWinLookup(lkey)
+	if w != nil {
+		w.gate.Lock()
+		if w.evicted.Load() {
+			w.gate.Unlock()
+			w = nil
+		}
+	}
+	if w != nil {
+		removed := c.lremResident(w, lkey, target, count)
+		w.gate.Unlock()
+		mu.Unlock()
+		c.writeInt(removed)
+		return
+	}
 	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
 	if !ok {
 		mu.Unlock()
@@ -1596,13 +1795,18 @@ func (c *connState) cmdLRem(argv [][]byte) {
 		return
 	}
 
-	// Pass one: collect the positions of every match in list order.
+	// Pass one: collect the positions of every match in list order. A positive count only ever drops
+	// the leading matches, so the scan can stop once it has that many; a non-positive count needs
+	// every match, so it runs to the end.
 	var matches []int64
 	for p := head; p < tail; p++ {
 		v, found := c.srv.store.GetKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
 		c.vbuf = v
 		if found && string(v) == string(target) {
 			matches = append(matches, p)
+			if count > 0 && int64(len(matches)) >= count {
+				break
+			}
 		}
 	}
 	if len(matches) == 0 {
@@ -1640,7 +1844,7 @@ func (c *connState) cmdLRem(argv [][]byte) {
 	// its bytes come off the running size; a survivor slides down to the cursor only when a gap has
 	// opened before it, so an untouched prefix is never rewritten.
 	removed := int64(0)
-	w := head
+	wc := head
 	for p := head; p < tail; p++ {
 		if _, drop := del[p]; drop {
 			v, took := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
@@ -1650,18 +1854,18 @@ func (c *connState) cmdLRem(argv [][]byte) {
 			removed++
 			continue
 		}
-		if w != p {
+		if wc != p {
 			v, _ := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
 			c.vbuf = v
-			_, _ = c.srv.store.PutKind(c.listElemKey(lkey, w), v, kindListElem)
+			_, _ = c.srv.store.PutKind(c.listElemKey(lkey, wc), v, kindListElem)
 		}
-		w++
+		wc++
 	}
-	if w == head {
+	if wc == head {
 		// Every element was removed: the list is empty, so the key stops existing.
 		c.srv.store.DeleteKind(lkey, kindListMeta)
 	} else {
-		c.listPutHeaderAt(hoff, head, w, lpBytes, everLarge)
+		c.listPutHeaderAt(hoff, head, wc, lpBytes, everLarge)
 	}
 	mu.Unlock()
 	c.writeInt(removed)
