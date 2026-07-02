@@ -77,6 +77,56 @@ func TestOIndexOrderAndIsolation(t *testing.T) {
 	}
 }
 
+// TestOIndexScanResumeBoundary pins the batched-resume boundary scanBatch handles when
+// the caller passes an `after` that is exactly an existing element key. Driving scanAll
+// with batch 1 forces every resume to seek to a key equal to the last one emitted, which
+// is precisely the one node scanBatch must skip once at the head of each batch rather than
+// re-comparing against `after` for every element. A sibling collection sharing the prefix
+// bytes guards against the resume walking past the prefix run into a neighbour. If the
+// skip regressed the walk would either loop on the boundary key (duplicate) or overshoot
+// it (drop the next key), so exact order and completeness at batch 1 is the assertion.
+func TestOIndexScanResumeBoundary(t *testing.T) {
+	s := New(1<<16, 1<<20)
+	insert := func(coll, member string) {
+		k := collKey(coll, member)
+		if _, err := s.PutKind(k, []byte("v"), kindTestField); err != nil {
+			t.Fatalf("PutKind(%q,%q): %v", coll, member, err)
+		}
+		s.CollInsert(k, kindTestField)
+	}
+	members := []string{"a", "b", "c", "d", "e", "f", "g"}
+	for _, m := range members {
+		insert("h", m)
+	}
+	// A sibling collection whose bare key extends "h" so its element rows sort right after
+	// h's run; a resume at h's last member must not leak into it.
+	insert("h2", "a")
+
+	prefix := collPrefix("h")
+	got := scanAll(s, prefix, 1)
+	if len(got) != len(members) {
+		t.Fatalf("batch-1 resume returned %d keys, want %d: %q", len(got), len(members), got)
+	}
+	for i, m := range members {
+		if !bytes.Equal(got[i], collKey("h", m)) {
+			t.Fatalf("batch-1 resume key %d: got %q want %q", i, got[i], collKey("h", m))
+		}
+	}
+	// Every batch size must return the identical sequence, so the boundary skip is
+	// independent of where a batch happens to split.
+	for _, batch := range []int{2, 3, 5, 100} {
+		alt := scanAll(s, prefix, batch)
+		if len(alt) != len(got) {
+			t.Fatalf("batch %d returned %d keys, want %d", batch, len(alt), len(got))
+		}
+		for i := range got {
+			if !bytes.Equal(alt[i], got[i]) {
+				t.Fatalf("batch %d key %d: got %q want %q", batch, i, alt[i], got[i])
+			}
+		}
+	}
+}
+
 // collPrefix mirrors the server's hashPrefix so scanAll can bound one collection.
 func collPrefix(coll string) []byte {
 	var tmp [binary.MaxVarintLen64]byte
