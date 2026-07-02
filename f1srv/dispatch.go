@@ -158,6 +158,10 @@ func (c *connState) execCommand(argv [][]byte) {
 		c.cmdRenameNx(argv)
 	case eqFold(cmd, "COPY"):
 		c.cmdCopy(argv)
+	case eqFold(cmd, "SORT"):
+		c.cmdSort(argv)
+	case eqFold(cmd, "SORT_RO"):
+		c.cmdSortRO(argv)
 	case eqFold(cmd, "WAIT"):
 		c.cmdWait(argv)
 	case eqFold(cmd, "WAITAOF"):
