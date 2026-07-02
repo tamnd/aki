@@ -3,6 +3,7 @@ package f1srv
 import (
 	"bufio"
 	"sort"
+	"strconv"
 	"testing"
 )
 
@@ -127,6 +128,56 @@ func TestSDiff(t *testing.T) {
 	if got := sortedArray(t, rw); !eqStrings(got, []string{"w", "x", "y", "z"}) {
 		t.Fatalf("SDIFF a gone = %v, want [w x y z]", got)
 	}
+}
+
+// TestSInterBranches drives both SINTER strategies with the same known-overlap data so the
+// merge path (chosen for similar-sized sources) and the probe path (chosen when one source is
+// far smaller) each return the exact intersection. sinterEach picks by cardinality, so equal
+// sets take the sorted merge and a tiny-versus-large pair takes the probe, and both must agree.
+func TestSInterBranches(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	addRange := func(key string, lo, hi int) {
+		args := []string{"SADD", key}
+		for i := lo; i < hi; i++ {
+			args = append(args, "m"+strconv.Itoa(i))
+		}
+		cmd(t, rw, args...)
+		expect(t, rw, ":"+strconv.Itoa(hi-lo))
+	}
+	want := func(lo, hi int) []string {
+		out := make([]string, 0, hi-lo)
+		for i := lo; i < hi; i++ {
+			out = append(out, "m"+strconv.Itoa(i))
+		}
+		sort.Strings(out)
+		return out
+	}
+
+	// Equal 300-member sets overlapping on m150..m299: sinterEach takes the merge branch.
+	addRange("eqa", 0, 300)
+	addRange("eqb", 150, 450)
+	cmd(t, rw, "SINTER", "eqa", "eqb")
+	if got := sortedArray(t, rw); !eqStrings(got, want(150, 300)) {
+		t.Fatalf("SINTER equal sets (merge) = %d members, want 150", len(got))
+	}
+
+	// A 10-member source against a 400-member source (400 > 3*10) takes the probe branch;
+	// the small set sits inside the big one, so the intersection is the whole small set.
+	addRange("tiny", 20, 30)
+	addRange("big", 0, 400)
+	cmd(t, rw, "SINTER", "tiny", "big")
+	if got := sortedArray(t, rw); !eqStrings(got, want(20, 30)) {
+		t.Fatalf("SINTER asymmetric sets (probe) = %v, want m20..m29", got)
+	}
+
+	// Same asymmetric pair through SINTERCARD, which shares sinterEach: full count then a
+	// LIMIT that stops the merge/probe early.
+	cmd(t, rw, "SINTERCARD", "2", "tiny", "big")
+	expect(t, rw, ":10")
+	cmd(t, rw, "SINTERCARD", "2", "eqa", "eqb", "LIMIT", "40")
+	expect(t, rw, ":40")
 }
 
 // SINTERCARD returns the size of the intersection, and stops counting at a positive LIMIT.
