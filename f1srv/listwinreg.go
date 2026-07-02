@@ -77,19 +77,6 @@ func (c *connState) listWinDrainEvict(lkey []byte) {
 	w.gate.Lock()
 	head, tail := w.bounds()
 	lpBytes, everLarge := w.sizeState()
-	// Flush every resident position back to its f1raw row before the header, so the persisted image
-	// is whole and a later read (or recovery) finds the element bytes a lock-free push left only in
-	// the ring (slice 3, impl/34). A resident push skipped PutKind, so these rows do not yet exist and
-	// their records are uncounted; PutKind here creates the row and increments the count, restoring the
-	// pre-window invariant that every live element is a counted row. Pre-block positions already have
-	// their rows (the admitting push wrote them), so resident() skips them and no row is written twice.
-	// gate.Lock has waited out every in-flight push and pop, so the ring is quiescent and read without
-	// the commit mutex. The window is being retired, so resetting slots is unnecessary.
-	for pos := head; pos < tail; pos++ {
-		if w.resident(pos) {
-			_, _ = c.srv.store.PutKind(c.listElemKey(lkey, pos), w.ring.get(pos), kindListElem)
-		}
-	}
 	// Flush the committed window to the header row, or delete the header when the window drained to
 	// empty, exactly the write-back listPutHeader already does for a pop that empties a list.
 	_ = c.listPutHeader(lkey, head, tail, lpBytes, everLarge)
