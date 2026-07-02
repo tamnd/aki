@@ -82,9 +82,11 @@ func (c *connState) listElemKey(lkey []byte, pos int64) []byte {
 // pos and the f1raw element row otherwise. w may be nil (a cold list with no resident window), in
 // which case every position is a row. A scan uses this to read a hot list at memory speed: a
 // resident position is a plain ring-slot fetch with no hash probe, and only the pre-block seed
-// positions [preLo, preHi) still cost a row read. The caller must hold the key's stripe lock, and
-// additionally w.gate.Lock when w is non-nil, so the ring and its live bounds stay put across the
-// read. The returned slice aliases the ring slot or the read buffer and is valid until the next
+// positions [preLo, preHi) still cost a row read. When w is non-nil the caller must hold w.gate,
+// either the shared RLock (LPOS, LRANGE, which read a hot key in parallel across cores) or the
+// exclusive Lock (an interior edit), so the ring and its live bounds stay put across the read; the
+// pre-block band only ever contracts under the gate, so a resident classification never turns stale
+// mid-read. The returned slice aliases the ring slot or the read buffer and is valid until the next
 // read reuses that buffer, which is the same contract the row-only scan already relied on.
 func (c *connState) listElemRead(w *listWindow, lkey []byte, pos int64) ([]byte, bool) {
 	if w != nil && w.resident(pos) {
@@ -761,6 +763,15 @@ func (c *connState) popEmitWindow(w *listWindow, lkey []byte, atHead, hasCount b
 			claim(pos)
 		}
 	}
+	// The claim loop has read every popped position at its pre-contraction classification, so it is
+	// now safe to walk the pre-block band inward to the bound this pop just advanced. That keeps a
+	// position re-pushed into a freed seed number reading from the ring the push filled it in, not
+	// from the row this pop deleted.
+	if atHead {
+		w.contractPreblock(true, hi)
+	} else {
+		w.contractPreblock(false, lo)
+	}
 	w.mu.Unlock()
 	c.popBufs = buf
 	// Frame the claimed bytes off-lock. popBufs is already in emission order for both ends.
@@ -995,8 +1006,16 @@ func (c *connState) cmdLIndex(argv [][]byte) {
 // list length the way Redis does (negatives count from the end, start clamps up to 0, stop
 // clamps down to the last index) and streams each element in the window directly by position,
 // one point lookup apiece. An empty or inverted range replies with an empty array; a plain
-// string under the key is WRONGTYPE. It takes the stripe lock so the window is stable across
-// the walk.
+// string under the key is WRONGTYPE.
+//
+// When the list is hot it reads resident-first off the window: each in-range position that lives
+// in the ring is a plain slot fetch with no f1raw probe, and only the small pre-block band still
+// costs a row read. It holds the window's eviction gate as a reader for that, which pins the ring
+// and bounds and runs alongside the lock-free pushes (they only extend the tail above this
+// snapshot) while excluding the interior edits that take the gate exclusively. With the ring
+// pinned by the shared gate the stripe lock is no longer needed, so it is released, and LRANGE on
+// one hot key then runs in parallel across cores instead of serializing on the stripe. A cold list
+// has no window (w is nil) and every position falls to its row under the stripe lock.
 func (c *connState) cmdLRange(argv [][]byte) {
 	if len(argv) != 4 {
 		c.writeErr("ERR wrong number of arguments for 'lrange' command")
@@ -1014,22 +1033,32 @@ func (c *connState) cmdLRange(argv [][]byte) {
 		return
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
-	// A resident push leaves element bytes only in the ring, so LRANGE retires the window first to
-	// flush every resident position to its f1raw row, which needs the exclusive stripe lock. That
-	// gives up the shared-reader concurrency the pre-slice-3 LRANGE had; slice 4 makes the read
-	// resident-first off the window and restores the shared lock. For now correctness comes first.
 	mu.Lock()
 	if c.stringConflict(lkey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
 	}
-	c.listWinDrainEvict(lkey)
-	head, tail, _, _, ok := c.listHeader(lkey)
-	if !ok {
+	w := c.srv.listWinLookup(lkey)
+	if w != nil {
+		w.gate.RLock()
+		if w.evicted.Load() {
+			w.gate.RUnlock()
+			w = nil
+		}
+	}
+	var head, tail int64
+	if w != nil {
+		head, tail = w.bounds()
 		mu.Unlock()
-		c.writeArrayHeader(0)
-		return
+	} else {
+		var ok bool
+		head, tail, _, _, ok = c.listHeader(lkey)
+		if !ok {
+			mu.Unlock()
+			c.writeArrayHeader(0)
+			return
+		}
 	}
 	n := tail - head
 	if start < 0 {
@@ -1045,18 +1074,24 @@ func (c *connState) cmdLRange(argv [][]byte) {
 		stop = n - 1
 	}
 	if start > stop || start >= n {
-		mu.Unlock()
+		if w != nil {
+			w.gate.RUnlock()
+		} else {
+			mu.Unlock()
+		}
 		c.writeArrayHeader(0)
 		return
 	}
 	c.writeArrayHeader(int(stop - start + 1))
 	for i := start; i <= stop; i++ {
-		ek := c.listElemKey(lkey, head+i)
-		v, _ := c.srv.store.GetKind(ek, c.vbuf[:0], kindListElem)
-		c.vbuf = v
+		v, _ := c.listElemRead(w, lkey, head+i)
 		c.writeBulk(v)
 	}
-	mu.Unlock()
+	if w != nil {
+		w.gate.RUnlock()
+	} else {
+		mu.Unlock()
+	}
 }
 
 // cmdLSet implements LSET: it overwrites the element at a signed index with a new value, an
@@ -1352,7 +1387,7 @@ func (c *connState) lposScan(w *listWindow, lkey, target []byte, head, tail int6
 	// The only non-resident positions are the pre-block band [preLo, preHi); everything else is in
 	// the ring. Split the examined range into resident head, pre-block middle, resident tail, and walk
 	// the three in search-direction order so matches come back in list order.
-	bLo, bHi := clampRange(w.preLo, eLo, eHi), clampRange(w.preHi, eLo, eHi)
+	bLo, bHi := clampRange(w.preLo.Load(), eLo, eHi), clampRange(w.preHi.Load(), eLo, eHi)
 	if backward {
 		if scanResident(bHi, eHi) || scanRows(bLo, bHi) || scanResident(eLo, bLo) {
 			return out
@@ -1471,7 +1506,7 @@ func (c *connState) cmdLTrim(argv [][]byte) {
 // count balances over the window's life exactly as it did before promotion.
 func (c *connState) listPromoteResident(w *listWindow, lkey []byte) {
 	head, tail := w.bounds()
-	lo, hi := w.preLo, w.preHi
+	lo, hi := w.preLo.Load(), w.preHi.Load()
 	if lo < head {
 		lo = head
 	}
@@ -1485,7 +1520,8 @@ func (c *connState) listPromoteResident(w *listWindow, lkey []byte) {
 			w.ring.put(p, v)
 		}
 	}
-	w.preLo, w.preHi = 0, 0
+	w.preLo.Store(0)
+	w.preHi.Store(0)
 }
 
 // linsertResident runs LINSERT on a resident hot list entirely in memory. It promotes the tiny
