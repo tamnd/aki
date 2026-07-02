@@ -210,6 +210,113 @@ func TestListRingScanSigEarlyStop(t *testing.T) {
 	}
 }
 
+// TestListRingMoveDetaches confirms move relocates the element and leaves the source slot nil, so
+// dst and src never end up aliasing one backing array. A put at src afterward must allocate fresh
+// and must not disturb the element now at dst.
+func TestListRingMoveDetaches(t *testing.T) {
+	r := newListRing(8)
+	r.put(2, []byte("keep"))
+	r.move(3, 2)
+	if got := r.get(3); string(got) != "keep" {
+		t.Fatalf("move dst: got %q want keep", got)
+	}
+	if r.slots[2&r.mask] != nil {
+		t.Fatalf("move left source non-nil, slots share a backing array")
+	}
+	if r.sig[3&r.mask] != listSig([]byte("keep")) {
+		t.Fatalf("move did not carry the signature")
+	}
+	// A put reusing the source slot allocates fresh and must not touch the moved element.
+	r.put(2, []byte("new"))
+	if got := r.get(3); string(got) != "keep" {
+		t.Fatalf("put at source corrupted dst: got %q want keep", got)
+	}
+	if got := r.get(2); string(got) != "new" {
+		t.Fatalf("put at source: got %q want new", got)
+	}
+}
+
+// TestListRingShiftDownFillTop shifts the left run down by one and puts a new element into the top
+// slot the shift frees, the exact sequence a BEFORE-pivot LINSERT runs. Every survivor must read
+// back its own bytes and the new element must not alias any of them, the aliasing trap that a
+// pointer move without a detach would spring when put reuses the freed slot's backing.
+func TestListRingShiftDownFillTop(t *testing.T) {
+	r := newListRing(16)
+	const head, tail = int64(0), int64(6)
+	for p := head; p < tail; p++ {
+		r.put(p, []byte(fmt.Sprintf("v%d", p)))
+	}
+	// Insert before index 3: shift [head, head+3) down, fill the freed slot at head+2.
+	const i = int64(3)
+	r.shiftDown(head, head+i)
+	r.put(head+i-1, []byte("NEW"))
+	want := []string{"v0", "v1", "v2", "NEW", "v3", "v4", "v5"}
+	for j, w := range want {
+		p := head - 1 + int64(j)
+		if got := r.get(p); string(got) != w {
+			t.Fatalf("pos %d: got %q want %q", p, got, w)
+		}
+	}
+}
+
+// TestListRingShiftUpFillBottom mirrors the above for an AFTER-pivot LINSERT that shifts the right
+// run up by one and fills the freed bottom slot.
+func TestListRingShiftUpFillBottom(t *testing.T) {
+	r := newListRing(16)
+	const head, tail = int64(0), int64(6)
+	for p := head; p < tail; p++ {
+		r.put(p, []byte(fmt.Sprintf("v%d", p)))
+	}
+	// Insert after index 2 (before index 3): shift [head+3, tail) up, fill the freed slot at head+3.
+	const i = int64(3)
+	r.shiftUp(head+i, tail)
+	r.put(head+i, []byte("NEW"))
+	want := []string{"v0", "v1", "v2", "NEW", "v3", "v4", "v5"}
+	for j, w := range want {
+		p := head + int64(j)
+		if got := r.get(p); string(got) != w {
+			t.Fatalf("pos %d: got %q want %q", p, got, w)
+		}
+	}
+}
+
+// TestListRingCompact runs the LREM compaction pattern: drop a set of positions and slide survivors
+// down with a write cursor, moving only across a gap. The survivors must end contiguous from head in
+// their original order, and a put reusing any vacated tail slot must not alias a live survivor.
+func TestListRingCompact(t *testing.T) {
+	r := newListRing(16)
+	const head, tail = int64(0), int64(8)
+	for p := head; p < tail; p++ {
+		r.put(p, []byte(fmt.Sprintf("v%d", p)))
+	}
+	drop := map[int64]bool{1: true, 2: true, 5: true}
+	wpos := head
+	for p := head; p < tail; p++ {
+		if drop[p] {
+			continue
+		}
+		if wpos != p {
+			r.move(wpos, p)
+		}
+		wpos++
+	}
+	want := []string{"v0", "v3", "v4", "v6", "v7"}
+	for j, w := range want {
+		p := head + int64(j)
+		if got := r.get(p); string(got) != w {
+			t.Fatalf("survivor pos %d: got %q want %q", p, got, w)
+		}
+	}
+	// A push reusing a now-dead tail slot must not disturb any survivor.
+	r.put(wpos, []byte("PUSH"))
+	for j, w := range want {
+		p := head + int64(j)
+		if got := r.get(p); string(got) != w {
+			t.Fatalf("after tail push, survivor pos %d: got %q want %q", p, got, w)
+		}
+	}
+}
+
 func eqI64(a, b []int64) bool {
 	if len(a) != len(b) {
 		return false
