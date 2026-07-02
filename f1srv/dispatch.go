@@ -264,6 +264,8 @@ func (c *connState) execCommand(argv [][]byte) {
 		c.cmdZAdd(argv)
 	case eqFold(cmd, "ZINCRBY"):
 		c.cmdZIncrBy(argv)
+	case eqFold(cmd, "ZSCAN"):
+		c.cmdZScan(argv)
 	case eqFold(cmd, "ZSCORE"):
 		c.cmdZScore(argv)
 	case eqFold(cmd, "ZMSCORE"):
