@@ -417,3 +417,26 @@ func (oi *oindex) selectInPrefix(prefix []byte, localIndex int) ([]byte, bool) {
 	}
 	return k, true
 }
+
+// selectOffInPrefix is selectInPrefix that returns the selected node's record offset instead
+// of its key. The order-statistic list positional reads (LINDEX, LSET, LRANGE) want the offset,
+// not the key: they map a client index to a row and then read or overwrite that row's value, so
+// handing back the offset lets the caller read the value straight from the arena with
+// ReadValueAt or ValueAtLocked instead of recomputing a hash and probing a bucket. The descent
+// is identical to selectInPrefix, one rank plus one select, both O(log n); only the return
+// differs, so the positional read pays the descent in place of the point probe rather than on
+// top of it. The prefix guard still fires, so a localIndex past the collection's cardinality
+// reports absent instead of leaking a sibling collection's row.
+func (oi *oindex) selectOffInPrefix(prefix []byte, localIndex int) (uint64, bool) {
+	oi.mu.RLock()
+	defer oi.mu.RUnlock()
+	base := oi.rankLocked(prefix)
+	node := oi.selectAtLocked(base + localIndex)
+	if node == nil {
+		return 0, false
+	}
+	if !bytes.HasPrefix(oi.store.keyAt(node.off), prefix) {
+		return 0, false
+	}
+	return node.off, true
+}

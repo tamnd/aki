@@ -367,6 +367,18 @@ func (s *Store) CollSelectAt(prefix []byte, localIndex int) (key []byte, ok bool
 	return s.oidx.selectInPrefix(prefix, localIndex)
 }
 
+// CollSelectOffAt returns the arena offset of the element at 0-based localIndex within the
+// collection bounded by prefix, in key order, and whether it exists. It is CollSelectAt for a
+// caller that wants to read or overwrite the selected row's value rather than its key: the
+// order-statistic list's positional reads (LINDEX, LSET, LRANGE on a sparse list) map a client
+// index to a row through this one O(log n) descent and then read the value with ReadValueAt or
+// ValueAtLocked, so the descent stands in for the point probe instead of preceding it. Pair it
+// with a held stripe lock when the offset feeds ValueAtLocked, exactly as the other zero-copy
+// reads require.
+func (s *Store) CollSelectOffAt(prefix []byte, localIndex int) (off uint64, ok bool) {
+	return s.oidx.selectOffInPrefix(prefix, localIndex)
+}
+
 // CollSelectRemoveAt selects the element at localIndex within prefix and drops it from the
 // ordered index in one descent, returning its composite key and whether it existed. It is
 // the fused select-then-CollRemove that SPOP-without-count runs: the caller still deletes
