@@ -152,6 +152,8 @@ func (c *connState) drain() bool {
 			// either of those, or any other command, takes the ordinary one-command dispatch.
 			if atHead, requireExisting, ok := pushVerb(argv); ok && !c.inMulti && !c.psMode {
 				pos = c.drainPush(argv, atHead, requireExisting, pos)
+			} else if atHead, ok := popVerb(argv); ok && !c.inMulti && !c.psMode {
+				pos = c.drainPop(argv, atHead, pos)
 			} else {
 				c.dispatch(argv)
 			}

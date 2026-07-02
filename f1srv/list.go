@@ -541,6 +541,85 @@ func (c *connState) cmdPushCoalesced(lkey []byte, atHead, requireExisting bool, 
 	}
 }
 
+// popVerb classifies argv[0] as LPOP or RPOP in its no-count form (exactly two args: verb, key),
+// the shape the drain loop coalesces. atHead is true for LPOP. The count form (LPOP key N) and
+// every other command return ok false, so only a bare pipelined pop burst is folded and the count
+// form keeps its own array-reply dispatch. The leading-byte switch keeps the classification off
+// the GET/SET hot path, matching pushVerb.
+func popVerb(argv [][]byte) (atHead, ok bool) {
+	if len(argv) != 2 {
+		return false, false
+	}
+	cmd := argv[0]
+	if len(cmd) == 0 {
+		return false, false
+	}
+	switch cmd[0] {
+	case 'L', 'l', 'R', 'r':
+	default:
+		return false, false
+	}
+	switch {
+	case eqFold(cmd, "LPOP"):
+		return true, true
+	case eqFold(cmd, "RPOP"):
+		return false, true
+	}
+	return false, false
+}
+
+// lpopName and rpopName back the argv the drainPop fallback replays through cmdPop. cmdPop reads
+// argv[0] only for the arity error text, which a two-element argv never triggers, so a fixed name
+// is enough and no allocation per replayed pop is needed.
+var lpopName = []byte("LPOP")
+var rpopName = []byte("RPOP")
+
+// drainPop mirrors drainPush for the no-count pop: it counts a run of same-key, same-end LPOP or
+// RPOP commands from this one connection's pipeline and folds them into a single window claim, so a
+// pop burst on one hot key takes the window's commit mutex once instead of once per pop. It returns
+// the buffer offset past every command it counted. first is the already-parsed leading pop; pos
+// points just past it. lkey points into rbuf, which drain does not compact mid-batch, so it stays
+// valid across the peeks even as each parse reuses the shared argv backing.
+//
+// When popThroughWindowRun cannot serve the whole run (no window resident, the run would drain the
+// list, or a push is mid-flight) it replays exactly the commands it counted through the ordinary
+// one-command pop, so the reply shape, the near-empty tail, and a cold key behave identically to
+// running them unfolded. The replay uses a fixed two-element argv, so it needs the key, which
+// outlives the batch, and a static verb name.
+func (c *connState) drainPop(first [][]byte, atHead bool, pos int) int {
+	lkey := first[1]
+	n := int64(1)
+	end := pos
+	for {
+		argv, consumed, status := c.parse(c.rbuf[end:])
+		if status != parseOK {
+			break
+		}
+		ah, ok := popVerb(argv)
+		if !ok || ah != atHead || !bytes.Equal(argv[1], lkey) {
+			break
+		}
+		end += consumed
+		n++
+	}
+	if n > 1 {
+		// Folding is only a win past one command; a lone pop takes the ordinary path, which itself
+		// tries the window before the stripe lock.
+		if c.popThroughWindowRun(lkey, atHead, n) {
+			return end
+		}
+	}
+	name := rpopName
+	if atHead {
+		name = lpopName
+	}
+	replay := [2][]byte{name, lkey}
+	for i := int64(0); i < n; i++ {
+		c.cmdPop(replay[:], atHead)
+	}
+	return end
+}
+
 func (c *connState) cmdLPop(argv [][]byte) { c.cmdPop(argv, true) }
 func (c *connState) cmdRPop(argv [][]byte) { c.cmdPop(argv, false) }
 
@@ -571,14 +650,22 @@ func (c *connState) popThroughWindow(lkey []byte, atHead, hasCount bool, want in
 		w.gate.RUnlock()
 		return false
 	}
-	n := hi - lo
 	if hasCount {
-		c.writeArrayHeader(int(n))
+		c.writeArrayHeader(int(hi - lo))
 	}
-	// LPOP returns elements head-outward (positions lo, lo+1, ...); RPOP returns them tail-inward
-	// (hi-1, hi-2, ...). Each row is taken off the stripe lock and copied into the reply by
-	// writeBulk before the next take reuses vbuf, so no per-element buffer is held.
-	var sumBytes int64
+	sumBytes := c.writePoppedRun(lkey, atHead, lo, hi)
+	w.addBytes(-sumBytes)
+	w.gate.RUnlock()
+	return true
+}
+
+// writePoppedRun takes each row in the claimed half-open run [lo, hi) off the stripe lock and
+// writes it as one bulk reply, returning the total entry bytes so the caller can shrink the
+// window's running size in one addBytes. LPOP returns elements head-outward (positions lo, lo+1,
+// ...); RPOP returns them tail-inward (hi-1, hi-2, ...). Each row is copied into the reply by
+// writeBulk before the next take reuses vbuf, so no per-element buffer is held. It is the shared
+// body of the single-command popThroughWindow and the coalesced popThroughWindowRun.
+func (c *connState) writePoppedRun(lkey []byte, atHead bool, lo, hi int64) (sumBytes int64) {
 	if atHead {
 		for pos := lo; pos < hi; pos++ {
 			ek := c.listElemKey(lkey, pos)
@@ -596,6 +683,34 @@ func (c *connState) popThroughWindow(lkey []byte, atHead, hasCount bool, want in
 			c.writeBulk(v)
 		}
 	}
+	return sumBytes
+}
+
+// popThroughWindowRun serves a run of n no-count pops off the resident hot-list window in one
+// bound bump, then writes one bulk reply per popped element. It is the coalesced form of
+// popThroughWindow: the drain loop counts a pipeline's consecutive same-key, same-end LPOP or RPOP
+// commands from one connection and folds them here so the window's commit mutex is taken once for
+// the whole run instead of once per pop, the piece that lets a pop burst on one hot key use more
+// than one core. It returns false, leaving the caller to replay the run one command at a time,
+// whenever popRun cannot serve the whole run off-lock (no window resident, a push is mid-flight, or
+// the run would drain the list). A resident window means the key is already a list, so no WRONGTYPE
+// check is needed, exactly as popThroughWindow and the push fast path omit it.
+func (c *connState) popThroughWindowRun(lkey []byte, atHead bool, n int64) bool {
+	w := c.srv.listWinLookup(lkey)
+	if w == nil {
+		return false
+	}
+	w.gate.RLock()
+	if w.evicted.Load() {
+		w.gate.RUnlock()
+		return false
+	}
+	lo, hi, ok := w.popRun(atHead, n)
+	if !ok {
+		w.gate.RUnlock()
+		return false
+	}
+	sumBytes := c.writePoppedRun(lkey, atHead, lo, hi)
 	w.addBytes(-sumBytes)
 	w.gate.RUnlock()
 	return true
