@@ -38,6 +38,8 @@ type connState struct {
 	zkeys   [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
 	kscan   [][]byte  // reused scratch for a KEYS/SCAN/RANDOMKEY bucket-walk key batch
 	wkeys   [][]byte  // reused scratch for a write command's touched-key list (WATCH signalling)
+	hscanK  [][]byte  // reused scratch for a whole-hash read's element-key batch (HGETALL/HKEYS/HVALS)
+	hscanO  []uint64  // reused scratch for a whole-hash value-carrying read's record-offset batch
 
 	// Transaction state (MULTI/EXEC/DISCARD/WATCH/UNWATCH). inMulti is set between MULTI
 	// and EXEC/DISCARD; while it is set every non-transaction command is copied into
