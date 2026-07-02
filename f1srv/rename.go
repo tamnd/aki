@@ -195,6 +195,10 @@ func (c *connState) moveIndexedFamily(src, dst []byte, kind byte) {
 // walking the header window [head, tail) and re-keying each position under dst. The destination
 // keeps the same window (moveHeader copies the header verbatim), so position p maps to position p.
 func (c *connState) moveListElems(src, dst []byte) {
+	// Retire any resident hot-list window on src first, so its ring-only positions become f1raw rows
+	// before this positional move takes them (slice 3, impl/34). RENAME holds src's exclusive stripe
+	// lock, which drainEvict requires.
+	c.listWinDrainEvict(src)
 	head, tail, _, _, ok := c.listHeader(src)
 	if !ok {
 		return

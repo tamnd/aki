@@ -190,6 +190,10 @@ func (c *connState) copyIndexedFamily(src, dst []byte, kind byte) {
 // walking the header window [head, tail) and re-keying each position under dst. The destination
 // header is copied verbatim, so it keeps the same window and position p maps to position p.
 func (c *connState) copyListElems(src, dst []byte) {
+	// Retire any resident hot-list window on src first, so its ring-only positions are flushed to
+	// f1raw rows before this positional copy reads them (slice 3, impl/34). COPY holds src's exclusive
+	// stripe lock, which drainEvict requires.
+	c.listWinDrainEvict(src)
 	head, tail, _, _, ok := c.listHeader(src)
 	if !ok {
 		return
