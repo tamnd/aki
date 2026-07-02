@@ -302,9 +302,7 @@ func (c *connState) drainPush(first [][]byte, atHead, requireExisting bool, pos 
 	lkey := first[1]
 	coll := c.pushColl[:0]
 	bnd := c.pushBnd[:0]
-	for _, e := range first[2:] {
-		coll = append(coll, e)
-	}
+	coll = append(coll, first[2:]...)
 	bnd = append(bnd, len(coll))
 	for {
 		argv, consumed, status := c.parse(c.rbuf[pos:])
@@ -316,9 +314,7 @@ func (c *connState) drainPush(first [][]byte, atHead, requireExisting bool, pos 
 			break
 		}
 		pos += consumed
-		for _, e := range argv[2:] {
-			coll = append(coll, e)
-		}
+		coll = append(coll, argv[2:]...)
 		bnd = append(bnd, len(coll))
 	}
 	c.pushColl = coll
