@@ -281,14 +281,6 @@ func hllSparseSet(blob []byte, index int, count uint8) ([]byte, int) {
 		return blob, -1
 	}
 
-	next := p + 1
-	if sparseIsXzero(blob[p]) {
-		next = p + 2
-	}
-	if next >= end {
-		next = -1
-	}
-
 	isZero, isXzero, isVal := false, false, false
 	runlen := 0
 	switch {
@@ -562,7 +554,7 @@ func hllTau(x float64) float64 {
 		zPrime := z
 		y *= 0.5
 		t := 1 - x
-		prod := math.Pow(t, 2) * y
+		prod := t * t * y
 		z -= prod
 		if zPrime == z {
 			break

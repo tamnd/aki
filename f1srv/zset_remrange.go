@@ -195,7 +195,7 @@ func (c *connState) cmdZRemRangeByLex(argv [][]byte) {
 	default:
 		startIdx = c.zlexRankBoundary(prefix, loMember, loExcl, card)
 	}
-	endIdx := card
+	var endIdx int
 	switch hiKind {
 	case lexMaxInf:
 		endIdx = card

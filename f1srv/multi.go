@@ -423,7 +423,7 @@ var readOnlyCommands = map[string]struct{}{
 	"PFCOUNT": {}, "PFSELFTEST": {},
 	"GEOPOS": {}, "GEODIST": {}, "GEOHASH": {}, "GEOSEARCH": {}, "GEORADIUS_RO": {},
 	"GEORADIUSBYMEMBER_RO": {},
-	"TYPE": {}, "OBJECT": {}, "PING": {}, "ECHO": {}, "TTL": {}, "PTTL": {},
+	"TYPE":                 {}, "OBJECT": {}, "PING": {}, "ECHO": {}, "TTL": {}, "PTTL": {},
 	"EXPIRETIME": {}, "PEXPIRETIME": {}, "DBSIZE": {}, "SELECT": {}, "CLIENT": {},
 	"CONFIG": {}, "COMMAND": {}, "INFO": {},
 	// Pub/sub touches no keyspace, so a watched key can never move because of it. The publish
@@ -467,7 +467,7 @@ var knownCommands = map[string]struct{}{
 	"XCLAIM": {}, "XAUTOCLAIM": {}, "XINFO": {},
 	"SETBIT": {}, "GETBIT": {}, "BITCOUNT": {}, "BITPOS": {}, "BITOP": {}, "BITFIELD": {},
 	"BITFIELD_RO": {},
-	"PFADD": {}, "PFCOUNT": {}, "PFMERGE": {}, "PFDEBUG": {}, "PFSELFTEST": {},
+	"PFADD":       {}, "PFCOUNT": {}, "PFMERGE": {}, "PFDEBUG": {}, "PFSELFTEST": {},
 	"GEOADD": {}, "GEOPOS": {}, "GEODIST": {}, "GEOHASH": {}, "GEORADIUS": {},
 	"GEORADIUS_RO": {}, "GEORADIUSBYMEMBER": {}, "GEORADIUSBYMEMBER_RO": {},
 	"GEOSEARCH": {}, "GEOSEARCHSTORE": {},

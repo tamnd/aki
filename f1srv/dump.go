@@ -1179,7 +1179,7 @@ func rdbLoadStream(b []byte, rdbtype byte) (rdbValue, bool) {
 	// Types 26 and 27 close with a stream-level IDMP block; f1srv does not model idempotent producers,
 	// so the block is walked and discarded.
 	if hasV4 {
-		if rest, ok = skipStreamIdmp(rest); !ok {
+		if _, ok = skipStreamIdmp(rest); !ok {
 			return rdbValue{}, false
 		}
 	}
