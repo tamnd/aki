@@ -375,15 +375,31 @@ const hashScanBatch = 256
 // CollRemove with a decrement, so the framed length always matches what is streamed.
 func (c *connState) streamHash(hkey []byte, wantField, wantValue bool) {
 	mu := &c.srv.incrMu[c.srv.stripe(hkey)]
-	mu.Lock()
+	// A whole-hash read only has to exclude concurrent writers, not other readers, so it takes
+	// the shared lock and lets many HGETALL/HKEYS/HVALS of one hot key run on many cores at
+	// once. The one exception is reaping expired fields, a mutation that needs the exclusive
+	// lock; reaping is only possible when some hash in the keyspace carries a field TTL
+	// (hfe > 0), so a TTL-free keyspace, the common case, always takes the shared path.
+	reap := c.srv.hfe.Load() != 0
+	if reap {
+		mu.Lock()
+	} else {
+		mu.RLock()
+	}
 	if c.stringConflict(hkey) {
-		mu.Unlock()
+		if reap {
+			mu.Unlock()
+		} else {
+			mu.RUnlock()
+		}
 		c.writeErr(wrongType)
 		return
 	}
 	// Reap expired fields before framing the reply so the header count and the streamed rows
-	// both exclude them. Gated, so a TTL-free hash pays nothing.
-	c.reapHashExpiredLocked(hkey)
+	// both exclude them. Only reached on the exclusive path, so the mutation is safe.
+	if reap {
+		c.reapHashExpiredLocked(hkey)
+	}
 	count := c.hashCount(hkey)
 	perRow := 0
 	if wantField {
@@ -397,7 +413,12 @@ func (c *connState) streamHash(hkey []byte, wantField, wantValue bool) {
 	prefix := c.hashPrefix(hkey)
 	plen := len(prefix)
 	var after []byte
-	scanK := make([][]byte, 0, hashScanBatch)
+	// The scan key and offset batches are reused across calls off the connection, so a
+	// whole-hash read allocates nothing per call. At a high HGETALL rate a fresh
+	// make([][]byte) plus make([]uint64) every call was a steady stream of garbage whose
+	// collection showed up as a p99 tail spike (p50 held near the mean but p99 ran an order
+	// of magnitude past it); reusing the connection's buffers flattens that tail.
+	scanK := c.hscanK[:0]
 
 	if !wantValue {
 		// HKEYS: field names only. The plain key scan needs no per-element value read, so
@@ -407,6 +428,7 @@ func (c *connState) streamHash(hkey []byte, wantField, wantValue bool) {
 			if len(keys) == 0 {
 				break
 			}
+			scanK = keys // retain the grown backing array across windows and calls
 			for _, k := range keys {
 				c.writeBulk(k[plen:])
 			}
@@ -415,36 +437,59 @@ func (c *connState) streamHash(hkey []byte, wantField, wantValue bool) {
 			}
 			after = last
 		}
-		mu.Unlock()
+		c.hscanK = scanK
+		if reap {
+			mu.Unlock()
+		} else {
+			mu.RUnlock()
+		}
 		return
 	}
 
 	// HGETALL and HVALS carry the value alongside the key: CollScanKV returns each field's
-	// record offset from the ordered walk it already does, and ReadValueAt reads the value
-	// straight from that offset, so a field is one lookup, not the walk plus a GetKind
-	// re-resolve the split path paid. The offset is authoritative because PutKind refreshes
-	// the ordered index on an outgrow-republish, and the stripe lock this holds keeps a
-	// concurrent writer from moving a field mid-walk, so the value is never stale.
-	scanO := make([]uint64, 0, hashScanBatch)
+	// record offset from the ordered walk it already does, so a field is one lookup, not the
+	// walk plus a GetKind re-resolve the split path paid. The offset is authoritative because
+	// PutKind refreshes the ordered index on an outgrow-republish, and the stripe lock this
+	// holds keeps a concurrent writer from moving a field mid-walk, so the value is never stale.
+	//
+	// The value read is zero-copy: because this holds the stripe lock no writer can rewrite a
+	// field record under us, so ValueAtLocked hands the value bytes straight out of the arena to
+	// writeBulk, the same way the field name is already a zero-copy arena subslice. That drops
+	// the per-field copy into c.vbuf that ReadValueAt paid on every one of a hundred-thousand
+	// fields, so HGETALL walks value-carrying at the same cost SMEMBERS walks key-only. A cold-log
+	// separated value is a pointer, not inline bytes, so ValueAtLocked reports inline=false for it
+	// and we fall back to the copying ReadValueAt, which resolves the cold log.
+	scanO := c.hscanO[:0]
 	for {
 		keys, offs, last := c.srv.store.CollScanKV(prefix, after, hashScanBatch, scanK[:0], scanO[:0])
 		if len(keys) == 0 {
 			break
 		}
+		scanK = keys // retain both grown backing arrays across windows and calls
+		scanO = offs
 		for i, k := range keys {
 			if wantField {
 				c.writeBulk(k[plen:])
 			}
-			v := c.srv.store.ReadValueAt(offs[i], c.vbuf)
-			c.vbuf = v
-			c.writeBulk(v)
+			if v, inline := c.srv.store.ValueAtLocked(offs[i]); inline {
+				c.writeBulk(v)
+			} else {
+				c.vbuf = c.srv.store.ReadValueAt(offs[i], c.vbuf)
+				c.writeBulk(c.vbuf)
+			}
 		}
 		if last == nil {
 			break
 		}
 		after = last
 	}
-	mu.Unlock()
+	c.hscanK = scanK
+	c.hscanO = scanO
+	if reap {
+		mu.Unlock()
+	} else {
+		mu.RUnlock()
+	}
 }
 
 // cmdHScan is the LTM-safe incremental hash enumeration (spec 2064/f1_rewrite_ltm/05
