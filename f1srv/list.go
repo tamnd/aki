@@ -266,34 +266,28 @@ func (c *connState) pushThroughWindow(lkey []byte, atHead bool, elems [][]byte, 
 	n := int64(len(elems))
 	var baseLen, sumBytes int64
 	if atHead {
-		start := w.reserveHead(n) // lowest position of the run
-		oldHead := start + n
-		baseLen = w.committedTail.Load() - oldHead
-		// LPUSH prepends each element in turn, so element i lands just below the old head: the run
-		// [e0..e_{n-1}] leaves the list [e_{n-1} .. e0, old...], which is element i at position
-		// start + (n-1-i), the same order the stripe-lock body produces by decrementing head. posElems
-		// is the run in position order (posElems[j] is the element at start+j), the reverse of the push
-		// order, so the ring fill in commitHead can index it by offset. No f1raw row is written here:
-		// a lock-free push lands its bytes only in the resident ring (commitHead fills it), and pop
-		// reads them straight from the ring with no hash probe. drainEvict flushes the surviving
-		// resident bytes to rows on retire, so durability and recovery are unchanged (slice 3, impl/34).
+		// LPUSH prepends each element in turn, so the run [e0..e_{n-1}] leaves the list
+		// [e_{n-1} .. e0, old...], which is element i at position start + (n-1-i), the same order the
+		// stripe-lock body produces by decrementing head. posElems is the run in position order
+		// (posElems[j] is the element at start+j), the reverse of the push order, so appendHead can fill
+		// the ring by offset. No f1raw row is written here: a lock-free push lands its bytes only in the
+		// resident ring (appendHead fills it), and pop reads them straight from the ring with no hash
+		// probe. drainEvict flushes the surviving resident bytes to rows on retire, so durability and
+		// recovery are unchanged (slice 3, impl/34).
 		posElems := make([][]byte, n)
 		for i, elem := range elems {
-			pos := start + (n - 1 - int64(i))
-			posElems[pos-start] = elem
+			posElems[n-1-int64(i)] = elem
 			sumBytes += int64(listEntrySize(elem))
 		}
-		w.commitHead(start, n, posElems)
+		baseLen = w.appendHead(n, posElems)
 	} else {
-		start := w.reserveTail(n)
-		baseLen = start - w.committedHead.Load()
 		// RPUSH appends in order, so element i lands at start+i and elems is already in position
-		// order; it doubles as posElems for the ring fill in commitTail. No f1raw row is written: the
+		// order; it doubles as posElems for the ring fill in appendTail. No f1raw row is written: the
 		// bytes land only in the resident ring, and pop reads them from there (slice 3, impl/34).
 		for _, elem := range elems {
 			sumBytes += int64(listEntrySize(elem))
 		}
-		w.commitTail(start, n, elems)
+		baseLen = w.appendTail(n, elems)
 	}
 	w.addBytes(sumBytes)
 	w.gate.RUnlock()
@@ -683,9 +677,9 @@ func (c *connState) popThroughWindow(lkey []byte, atHead, hasCount bool, want in
 // no-count form writes a bare bulk. It returns false, sending the caller to the stripe-lock pop,
 // when the pop is unsafe off-lock, in the same two cases the old popRun rejected:
 //
-//   - A push is mid-flight (a reserved bound sits ahead of its committed bound). The push commit
-//     ordering (pendHead, pendTail) assumes a bound moves one direction only, so a pop that moved
-//     the same bound the other way could strand a pending run.
+//   - A reserved bound sits ahead of its committed bound. Fused appends keep the two equal, so this
+//     never trips for a concurrent push, but the guard stays as a cheap invariant check: a pop only
+//     claims a run when the window's reserved and committed bounds agree at both ends.
 //   - The pop would empty or underflow the list (want >= live). The emptying-to-header-delete
 //     transition and any head/tail crossing belong to the stripe path, which owns deleting the key.
 //
@@ -2161,16 +2155,14 @@ func (c *connState) popOneResident(w *listWindow, lkey []byte, fromHead bool) ([
 
 // pushOneResident appends one element to the chosen end of a resident window, the single-element push
 // core an lmove reuses. The caller holds w.gate (RLock) and has checked evicted false. It mirrors the
-// single-element path of pushThroughWindow: reserve one position, fill it into the ring in commit
-// order, and grow the running size, with no wire reply. commitHead/commitTail copy v into the ring, so
-// v stays valid for the caller to write back as the reply.
+// single-element path of pushThroughWindow: claim one position and fill it into the ring in one
+// mu-guarded step, and grow the running size, with no wire reply. appendHead/appendTail copy v into
+// the ring, so v stays valid for the caller to write back as the reply.
 func (c *connState) pushOneResident(w *listWindow, toHead bool, v []byte) {
 	if toHead {
-		start := w.reserveHead(1)
-		w.commitHead(start, 1, [][]byte{v})
+		w.appendHead(1, [][]byte{v})
 	} else {
-		start := w.reserveTail(1)
-		w.commitTail(start, 1, [][]byte{v})
+		w.appendTail(1, [][]byte{v})
 	}
 	w.addBytes(int64(listEntrySize(v)))
 }
