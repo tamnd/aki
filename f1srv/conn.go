@@ -33,18 +33,20 @@ type connState struct {
 	//                  commands there serve non-blocking (immediate element or nil).
 	// nowMs is the wall-clock ms cached once per drained batch, the "now" every command in
 	// the batch reads for expiry, like Redis server.mstime.
-	nowMs   int64
-	argv    [][]byte
-	vbuf    []byte    // reused destination for GET/MGET value copies
-	kbuf    []byte    // reused scratch for building composite collection element keys
-	pbuf    []byte    // reused scratch for a collection enumeration prefix, held across a scan
-	sbuf    []byte    // reused scratch for formatting a float score reply (ZSCORE/ZINCRBY)
-	zscores []float64 // reused scratch for a ZADD's parsed scores, one per score-member pair
-	zkeys   [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
-	kscan   [][]byte  // reused scratch for a KEYS/SCAN/RANDOMKEY bucket-walk key batch
-	wkeys   [][]byte  // reused scratch for a write command's touched-key list (WATCH signalling)
-	hscanK  [][]byte  // reused scratch for a whole-hash read's element-key batch (HGETALL/HKEYS/HVALS)
-	hscanO  []uint64  // reused scratch for a whole-hash value-carrying read's record-offset batch
+	nowMs    int64
+	argv     [][]byte
+	vbuf     []byte    // reused destination for GET/MGET value copies
+	kbuf     []byte    // reused scratch for building composite collection element keys
+	pbuf     []byte    // reused scratch for a collection enumeration prefix, held across a scan
+	sbuf     []byte    // reused scratch for formatting a float score reply (ZSCORE/ZINCRBY)
+	zscores  []float64 // reused scratch for a ZADD's parsed scores, one per score-member pair
+	zkeys    [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
+	kscan    [][]byte  // reused scratch for a KEYS/SCAN/RANDOMKEY bucket-walk key batch
+	wkeys    [][]byte  // reused scratch for a write command's touched-key list (WATCH signalling)
+	hscanK   [][]byte  // reused scratch for a whole-hash read's element-key batch (HGETALL/HKEYS/HVALS)
+	hscanO   []uint64  // reused scratch for a whole-hash value-carrying read's record-offset batch
+	pushColl [][]byte  // reused scratch for a coalesced push run's elements, in arrival order
+	pushBnd  []int     // reused scratch for the coalesced push run's per-command element boundaries
 
 	// Transaction state (MULTI/EXEC/DISCARD/WATCH/UNWATCH). inMulti is set between MULTI
 	// and EXEC/DISCARD; while it is set every non-transaction command is copied into
@@ -143,7 +145,16 @@ func (c *connState) drain() bool {
 		case parseOK:
 			c.argv = argv
 			pos += consumed
-			c.dispatch(argv)
+			// A run of same-key, same-verb pushes from this one connection collapses into a
+			// single locked batch instead of one lock cycle per command. The gate is the plain
+			// execution path (no open transaction, not in subscribe context) so MULTI queuing
+			// and the subscribe-mode command restriction keep their own dispatch. A push under
+			// either of those, or any other command, takes the ordinary one-command dispatch.
+			if atHead, requireExisting, ok := pushVerb(argv); ok && !c.inMulti && !c.psMode {
+				pos = c.drainPush(argv, atHead, requireExisting, pos)
+			} else {
+				c.dispatch(argv)
+			}
 			if c.wantClose {
 				// QUIT: reply to it, then stop draining so a pipeline queued behind
 				// QUIT is discarded, matching Redis, and let the driver flush and close.

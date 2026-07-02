@@ -1,6 +1,7 @@
 package f1srv
 
 import (
+	"bytes"
 	"encoding/binary"
 	"strconv"
 )
@@ -253,6 +254,167 @@ func (c *connState) cmdPush(argv [][]byte, atHead, requireExisting bool) {
 	// blocked, so the common push pays nothing for the registry.
 	c.srv.signalListKey(lkey)
 	c.writeInt(tail - head)
+}
+
+// pushVerb classifies argv[0] as one of the four list-append verbs and reports how it appends:
+// atHead for LPUSH/LPUSHX, requireExisting for the X forms. ok is false for every other command
+// and for a push carrying no element (fewer than three args), so the caller keeps that on the
+// ordinary single-command dispatch, where the arity error text is produced. The leading-byte
+// switch keeps the classification off the GET/SET hot path: only a command whose verb starts
+// with L or R pays the eqFold comparisons.
+func pushVerb(argv [][]byte) (atHead, requireExisting, ok bool) {
+	if len(argv) < 3 {
+		return false, false, false
+	}
+	cmd := argv[0]
+	if len(cmd) == 0 {
+		return false, false, false
+	}
+	switch cmd[0] {
+	case 'L', 'l', 'R', 'r':
+	default:
+		return false, false, false
+	}
+	switch {
+	case eqFold(cmd, "RPUSH"):
+		return false, false, true
+	case eqFold(cmd, "LPUSH"):
+		return true, false, true
+	case eqFold(cmd, "RPUSHX"):
+		return false, true, true
+	case eqFold(cmd, "LPUSHX"):
+		return true, true, true
+	}
+	return false, false, false
+}
+
+// drainPush handles a push command that the drain loop has classified, then greedily peeks ahead
+// in the same pipeline for more pushes to the same key with the same verb from this one
+// connection and folds them all into one cmdPushCoalesced call. It returns the buffer offset past
+// every command it consumed. first is the already-parsed leading push; pos points just past it.
+//
+// Every element slice points into rbuf, which drain does not compact until the whole batch is
+// parsed, so a captured element stays valid across the look-ahead even though each parse reuses
+// the shared argv backing. That reuse is exactly why first must not be read after the first
+// peek: its element headers live in that backing and the peek overwrites them, so this collects
+// first's elements up front and never touches first again.
+func (c *connState) drainPush(first [][]byte, atHead, requireExisting bool, pos int) int {
+	lkey := first[1]
+	coll := c.pushColl[:0]
+	bnd := c.pushBnd[:0]
+	coll = append(coll, first[2:]...)
+	bnd = append(bnd, len(coll))
+	for {
+		argv, consumed, status := c.parse(c.rbuf[pos:])
+		if status != parseOK {
+			break
+		}
+		ah, re, ok := pushVerb(argv)
+		if !ok || ah != atHead || re != requireExisting || !bytes.Equal(argv[1], lkey) {
+			break
+		}
+		pos += consumed
+		coll = append(coll, argv[2:]...)
+		bnd = append(bnd, len(coll))
+	}
+	c.pushColl = coll
+	c.pushBnd = bnd
+	c.cmdPushCoalesced(lkey, atHead, requireExisting, coll, bnd)
+	return pos
+}
+
+// cmdPushCoalesced applies a run of same-key, same-verb pushes captured from one connection's
+// pipeline under a single stripe-lock acquisition, then writes one integer reply per original
+// command. It is exactly equivalent to running the commands one after another: they arrived from
+// one connection in program order, which the run preserves, so folding them touches the key's
+// lock once rather than once per command. The only thing another client can observe is that its
+// own ops on the key land before or after the whole run rather than between two of these pushes,
+// and the wire protocol never ordered one client's commands against another's. elems holds every
+// element in arrival order; bnd[k] is the cumulative element count through command k. Because each
+// element lengthens the window by exactly one whichever end it joins, the reply for command k is
+// the pre-run length plus bnd[k], so the replies need no per-element bookkeeping.
+func (c *connState) cmdPushCoalesced(lkey []byte, atHead, requireExisting bool, elems [][]byte, bnd []int) {
+	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
+	mu.Lock()
+	if c.stringConflict(lkey) {
+		mu.Unlock()
+		for range bnd {
+			c.writeErr(wrongType)
+		}
+		return
+	}
+	head, tail, lpBytes, everLarge, hoff, existed := c.listHeaderAt(lkey)
+	if requireExisting && !existed {
+		// An X-form push onto a missing list creates nothing and replies 0, and every command in
+		// the run sees the same missing list, so each replies 0.
+		mu.Unlock()
+		for range bnd {
+			c.writeInt(0)
+		}
+		return
+	}
+	baseLen := tail - head
+	for i, elem := range elems {
+		var pos int64
+		if atHead {
+			head--
+			pos = head
+		} else {
+			pos = tail
+			tail++
+		}
+		ek := c.listElemKey(lkey, pos)
+		if _, err := c.srv.store.PutKind(ek, elem, kindListElem); err != nil {
+			// Undo the reservation for the element that did not land, persist the header for the
+			// elements that did so the window stays consistent, then reply the running length for
+			// every command that completed and an error for the one the failure fell in and all
+			// still queued behind it, the way a mid-pipeline store error would surface one at a
+			// time. A store PutKind error is effectively unreachable in the in-memory regime; this
+			// path exists so a coalesced run degrades exactly like the per-command path.
+			if atHead {
+				head++
+			} else {
+				tail--
+			}
+			if existed {
+				c.listPutHeaderAt(hoff, head, tail, lpBytes, everLarge)
+			} else if head != tail {
+				_ = c.listPutHeader(lkey, head, tail, lpBytes, everLarge)
+			}
+			mu.Unlock()
+			if head != tail {
+				c.srv.signalListKey(lkey)
+			}
+			emsg := "ERR " + err.Error()
+			for _, b := range bnd {
+				if b <= i {
+					c.writeInt(baseLen + int64(b))
+				} else {
+					c.writeErr(emsg)
+				}
+			}
+			return
+		}
+		lpBytes += uint64(listEntrySize(elem))
+		if !everLarge && lpBytes > listListpackMaxBytes {
+			everLarge = true
+		}
+	}
+	if existed {
+		c.listPutHeaderAt(hoff, head, tail, lpBytes, everLarge)
+	} else if err := c.listPutHeader(lkey, head, tail, lpBytes, everLarge); err != nil {
+		mu.Unlock()
+		emsg := "ERR " + err.Error()
+		for range bnd {
+			c.writeErr(emsg)
+		}
+		return
+	}
+	mu.Unlock()
+	c.srv.signalListKey(lkey)
+	for _, b := range bnd {
+		c.writeInt(baseLen + int64(b))
+	}
 }
 
 func (c *connState) cmdLPop(argv [][]byte) { c.cmdPop(argv, true) }
