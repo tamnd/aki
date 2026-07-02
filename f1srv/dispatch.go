@@ -476,7 +476,9 @@ func (c *connState) execCommand(argv [][]byte) {
 		c.writeSimple("OK")
 	case eqFold(cmd, "DBSIZE"):
 		c.writeInt(int64(c.srv.store.TopLen()))
-	case eqFold(cmd, "SELECT") || eqFold(cmd, "CLIENT") || eqFold(cmd, "CONFIG"):
+	case eqFold(cmd, "CLIENT"):
+		c.cmdClient(argv)
+	case eqFold(cmd, "SELECT") || eqFold(cmd, "CONFIG"):
 		c.writeSimple("OK")
 	case eqFold(cmd, "COMMAND"):
 		c.writeArrayHeader(0)

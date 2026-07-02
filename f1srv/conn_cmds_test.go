@@ -1,21 +1,9 @@
 package f1srv
 
 import (
-	"bufio"
 	"strconv"
 	"testing"
 )
-
-// readBulk reads one RESP bulk-string reply element and returns its payload without the "$"
-// marker, failing when the reply is not a bulk string.
-func readBulk(t *testing.T, rw *bufio.ReadWriter) string {
-	t.Helper()
-	got := readReply(t, rw)
-	if len(got) == 0 || got[0] != '$' {
-		t.Fatalf("reply = %q, want a bulk string", got)
-	}
-	return got[1:]
-}
 
 // TIME replies with a two-element array of unix seconds and leftover microseconds, both bulk
 // strings that parse as non-negative integers, with microseconds under one million.
