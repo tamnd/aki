@@ -211,3 +211,130 @@ func TestColdInlinePathUnchanged(t *testing.T) {
 		t.Fatalf("inline update path broke under a cold log: (%q, %v)", got, ok)
 	}
 }
+
+// TestColdKindSeparatedRoundtrip is the collection twin of TestColdSeparatedRoundtrip: a
+// large element value (a big hash field) written through PutKind must separate to the cold
+// log and read back byte-identical through GetKind's cold branch. This is the property that
+// lets a collection of large values exceed memory while its index and field names stay
+// resident.
+func TestColdKindSeparatedRoundtrip(t *testing.T) {
+	s := newColdStore(t, 512)
+	big := bytes.Repeat([]byte("x"), 4096)
+	created, err := s.PutKind([]byte("f"), big, benchKindHashField)
+	if err != nil {
+		t.Fatalf("PutKind: %v", err)
+	}
+	if !created {
+		t.Fatal("first PutKind of a field should report created")
+	}
+	off, _, _, _, found := s.find([]byte("f"), hash([]byte("f")), benchKindHashField)
+	if !found {
+		t.Fatal("field record not found after PutKind")
+	}
+	if !s.isSep(off) {
+		t.Fatal("field value over threshold was not separated to the cold log")
+	}
+	got, ok := s.GetKind([]byte("f"), nil, benchKindHashField)
+	if !ok || !bytes.Equal(got, big) {
+		t.Fatalf("GetKind = (%d bytes, %v), want the 4096-byte field value", len(got), ok)
+	}
+}
+
+// TestColdKindOverwriteTransitions walks a field across every inline/separated transition,
+// the collection twin of the three string overwrite tests. Each transition must read back
+// the new value, never stale bytes, and the created flag must stay false for every
+// overwrite of an existing field.
+func TestColdKindOverwriteTransitions(t *testing.T) {
+	s := newColdStore(t, 512)
+	small := []byte("small")
+	big := bytes.Repeat([]byte("z"), 2048)
+	big2 := bytes.Repeat([]byte("w"), 3072)
+
+	check := func(stage string, val []byte, wantSep bool) {
+		off, _, _, _, found := s.find([]byte("f"), hash([]byte("f")), benchKindHashField)
+		if !found {
+			t.Fatalf("%s: field not found", stage)
+		}
+		if s.isSep(off) != wantSep {
+			t.Fatalf("%s: isSep=%v, want %v", stage, s.isSep(off), wantSep)
+		}
+		got, ok := s.GetKind([]byte("f"), nil, benchKindHashField)
+		if !ok || !bytes.Equal(got, val) {
+			t.Fatalf("%s: GetKind wrong (ok=%v, len=%d)", stage, ok, len(got))
+		}
+	}
+	put := func(stage string, val []byte, wantCreated bool) {
+		created, err := s.PutKind([]byte("f"), val, benchKindHashField)
+		if err != nil {
+			t.Fatalf("%s: PutKind: %v", stage, err)
+		}
+		if created != wantCreated {
+			t.Fatalf("%s: created=%v, want %v", stage, created, wantCreated)
+		}
+	}
+
+	put("create-inline", small, true)
+	check("create-inline", small, false)
+	put("inline->sep", big, false)
+	check("inline->sep", big, true)
+	put("sep->sep", big2, false)
+	check("sep->sep", big2, true)
+	put("sep->inline", small, false)
+	check("sep->inline", small, false)
+}
+
+// TestColdTakeKindSeparated confirms the fused read-then-delete a list pop runs resolves a
+// separated element through the cold log: TakeKind must return the large value intact and
+// then remove the row, so a popped large list element reads correctly before it vanishes.
+func TestColdTakeKindSeparated(t *testing.T) {
+	s := newColdStore(t, 512)
+	big := bytes.Repeat([]byte("p"), 2048)
+	if _, err := s.PutKind([]byte("e"), big, benchKindHashField); err != nil {
+		t.Fatalf("PutKind: %v", err)
+	}
+	got, ok := s.TakeKind([]byte("e"), nil, benchKindHashField)
+	if !ok || !bytes.Equal(got, big) {
+		t.Fatalf("TakeKind = (%d bytes, %v), want the separated value intact", len(got), ok)
+	}
+	if s.ExistsKind([]byte("e"), benchKindHashField) {
+		t.Fatal("element still present after TakeKind")
+	}
+}
+
+// TestColdScanKVSeparated drives the value-carrying enumeration (the HGETALL path) over a
+// hash whose field values are all separated to the cold log. The walk resolves each value
+// through ValueAtLocked (which reports inline=false for a separated record) then the
+// ReadValueAt cold fallback, so every field must read back its exact value. This is the
+// path the ValueAtLocked doc promised but that had no separated-collection coverage until
+// the collection cold tier existed.
+func TestColdScanKVSeparated(t *testing.T) {
+	s := newColdStore(t, 512)
+	const n = 32
+	const coll = "h:"
+	want := make(map[string][]byte, n)
+	var kb [64]byte
+	for i := 0; i < n; i++ {
+		k := collElemKey(kb[:], coll, uint64(i))
+		v := bytes.Repeat([]byte{byte('a' + i%26)}, 1024)
+		if _, err := s.PutKind(k, v, benchKindHashField); err != nil {
+			t.Fatalf("PutKind %d: %v", i, err)
+		}
+		s.CollInsert(k, benchKindHashField)
+		want[string(k)] = v
+	}
+	keys, offs, _ := s.CollScanKV([]byte(coll), nil, n, nil, nil)
+	if len(keys) != n {
+		t.Fatalf("CollScanKV returned %d keys, want %d", len(keys), n)
+	}
+	for i, off := range offs {
+		_, inline := s.ValueAtLocked(off)
+		if inline {
+			t.Fatalf("field %d reported inline, want separated (value should be on the cold log)", i)
+		}
+		val := s.ReadValueAt(off, nil)
+		w := want[string(keys[i])]
+		if !bytes.Equal(val, w) {
+			t.Fatalf("field %q read back wrong through the cold enumeration fallback", keys[i])
+		}
+	}
+}

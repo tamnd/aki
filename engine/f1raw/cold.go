@@ -150,3 +150,20 @@ func (s *Store) setSeparated(key, val []byte, h uint64) error {
 	encPtr(ptr[:], coldOff, len(val))
 	return s.publish(key, ptr[:], h, stringKind, flagSep)
 }
+
+// putKindSeparated is setSeparated for a collection element namespace: it appends a large
+// element value to the cold log and publishes a record in the given kind whose value cell is
+// the resulting 12-byte pointer, flagged separated. It is the collection twin of the string
+// setSeparated, so a hash of large field values keeps its index and field names resident and
+// spills only the values, the property that lets a single collection exceed memory. A same-key
+// overwrite always lands here as a fresh record (the index entry swaps to it), so a separated
+// element record is never updated in place and stays immutable for its life.
+func (s *Store) putKindSeparated(key, val []byte, h uint64, kind byte) error {
+	coldOff, err := s.cold.append(val)
+	if err != nil {
+		return err
+	}
+	var ptr [ptrSize]byte
+	encPtr(ptr[:], coldOff, len(val))
+	return s.publish(key, ptr[:], h, kind, flagSep)
+}

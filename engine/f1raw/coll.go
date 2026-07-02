@@ -20,11 +20,18 @@ import "errors"
 
 // GetKind copies the value for key in the given kind namespace into dst and reports
 // whether it is present. It is the lock-free element read: HGET is one call of this.
+// When the store runs the cold tier and this element's value was separated (a large hash
+// field value), the record's cell holds a 12-byte cold pointer, so the read resolves
+// through one pread of the immutable cold log, the collection twin of the string Get cold
+// branch. A separated record never mutates, so the cold read needs no seqlock.
 func (s *Store) GetKind(key, dst []byte, kind byte) ([]byte, bool) {
 	h := hash(key)
 	off, _, _, _, found := s.find(key, h, kind)
 	if !found {
 		return dst[:0], false
+	}
+	if s.cold != nil && s.isSep(off) {
+		return s.readSeparated(off, dst)
 	}
 	return s.readValue(off, dst), true
 }
@@ -82,13 +89,35 @@ func (s *Store) PutKind(key, val []byte, kind byte) (created bool, err error) {
 		return false, ErrTooBig
 	}
 	h := hash(key)
-	if off, _, _, _, found := s.find(key, h, kind); found {
-		if uint64(len(val)) <= s.vcapBytes(off) {
+	off, _, _, _, found := s.find(key, h, kind)
+	// A large element value goes out of line to the cold log as a fresh separated record,
+	// exactly like the string setSeparated path: the index entry swaps to it, so any prior
+	// record for this key/kind is replaced, and a separated record is immutable (never an
+	// in-place update). This is what lets a collection of large values (a hash of big
+	// fields) exceed memory while its index and field names stay resident. created is true
+	// only when no prior record existed under the caller's serialization.
+	if s.cold != nil && len(val) > s.sepThreshold {
+		if err := s.putKindSeparated(key, val, h, kind); err != nil {
+			return false, err
+		}
+		// The record moved; point any ordered-index node at the new offset so a
+		// value-carrying scan reads the current record. A no-op for an unindexed record.
+		if noff, _, _, _, ok := s.find(key, h, kind); ok {
+			s.oidx.refresh(noff)
+		}
+		return !found, nil
+	}
+	if found {
+		// An inline in-place update needs the existing record inline too: a separated
+		// record's cell is a 12-byte cold pointer, not value bytes, so a small value must
+		// not be memcpy'd over it. When the target is separated (a shrinking overwrite of a
+		// once-large field), fall through to publish, which swaps to a fresh inline record.
+		if !s.isSep(off) && uint64(len(val)) <= s.vcapBytes(off) {
 			s.inPlace(off, val)
 			return false, nil
 		}
-		// Outgrew the record: republish a wider one. publish rescans and replaces the
-		// entry in place, count unchanged, so this is still an update, not a create.
+		// Outgrew the record (or it was separated): republish a wider one. publish rescans
+		// and replaces the entry in place, count unchanged, so this is still an update.
 		if err := s.publish(key, val, h, kind, 0); err != nil {
 			return false, err
 		}
@@ -142,7 +171,20 @@ func (s *Store) TakeKind(key, dst []byte, kind byte) ([]byte, bool) {
 		if !found {
 			return dst[:0], false
 		}
-		v := s.readValue(off, dst)
+		// A separated element (a large list element on the cold log) resolves through the
+		// pread path; the value is copied into dst before the slot is cleared, so the
+		// returned bytes stay valid after the index entry is gone. The cold bytes are left
+		// as dead space, reclaimed by a later compaction milestone, the same as any other
+		// separated overwrite.
+		var v []byte
+		if s.cold != nil && s.isSep(off) {
+			var ok bool
+			if v, ok = s.readSeparated(off, dst); !ok {
+				return dst[:0], false
+			}
+		} else {
+			v = s.readValue(off, dst)
+		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
 			s.count.Add(-1)
 			s.addTop(kind, -1)
@@ -274,8 +316,16 @@ func (s *Store) CollScanKV(prefix, after []byte, limit int, dstKeys [][]byte, ds
 // returns it, the seqlock read GetKind runs after it resolves the offset. It is exported
 // for the value-carrying scan (CollScanKV), which already holds the offset from the ordered
 // index and so skips the hash-and-probe find GetKind would repeat. off must come from a
-// current CollScanKV batch, where it is guaranteed to be the element's live record.
+// current CollScanKV batch, where it is guaranteed to be the element's live record. When the
+// record's value was separated to the cold log, this resolves it with one pread, which is the
+// fallback ValueAtLocked documents for a separated record (its zero-copy path serves inline
+// values only), so a value-carrying enumeration over a hash of large fields reads each
+// field's value straight from the cold log.
 func (s *Store) ReadValueAt(off uint64, dst []byte) []byte {
+	if s.cold != nil && s.isSep(off) {
+		v, _ := s.readSeparated(off, dst)
+		return v
+	}
 	return s.readValue(off, dst)
 }
 
