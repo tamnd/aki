@@ -815,6 +815,23 @@ func (c *connState) cmdPop(argv [][]byte, atHead bool) {
 	if c.popThroughWindow(lkey, atHead, hasCount, count) {
 		return
 	}
+	// Lock-free empty/missing fast path. A drained queue that many connections keep polling would
+	// otherwise serialize every nil-returning pop on the key's stripe mutex: 512 pollers each take
+	// the exclusive lock only to observe the key is gone and reply nil, and that single mutex caps
+	// the whole workload at one core. popThroughWindow already returned false, so there is no
+	// resident window to serve, and resolveType reads through f1raw's lock-free index alone. Seeing
+	// nothing means the list was empty at this instant, so each poller answers its own nil in
+	// parallel. It is linearizable: a later push that recreates the key is ordered after this reply,
+	// exactly as a stripe-locked miss would order it. resolveType may leave scratch in c.vbuf, which
+	// is fine because this branch returns without touching a held element.
+	if c.resolveType(lkey) == keyMissing {
+		if hasCount {
+			c.writeNilArray()
+		} else {
+			c.writeNil()
+		}
+		return
+	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
 	if c.stringConflict(lkey) {
