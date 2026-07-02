@@ -2161,14 +2161,16 @@ func (c *connState) popOneResident(w *listWindow, lkey []byte, fromHead bool) ([
 
 // pushOneResident appends one element to the chosen end of a resident window, the single-element push
 // core an lmove reuses. The caller holds w.gate (RLock) and has checked evicted false. It mirrors the
-// single-element path of pushThroughWindow: claim one position and fill it into the ring in one
-// mu-guarded step, and grow the running size, with no wire reply. appendHead/appendTail copy v into
-// the ring, so v stays valid for the caller to write back as the reply.
+// single-element path of pushThroughWindow: reserve one position, fill it into the ring in commit
+// order, and grow the running size, with no wire reply. commitHead/commitTail copy v into the ring, so
+// v stays valid for the caller to write back as the reply.
 func (c *connState) pushOneResident(w *listWindow, toHead bool, v []byte) {
 	if toHead {
-		w.appendHead(1, [][]byte{v})
+		start := w.reserveHead(1)
+		w.commitHead(start, 1, [][]byte{v})
 	} else {
-		w.appendTail(1, [][]byte{v})
+		start := w.reserveTail(1)
+		w.commitTail(start, 1, [][]byte{v})
 	}
 	w.addBytes(int64(listEntrySize(v)))
 }
