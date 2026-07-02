@@ -247,9 +247,13 @@ func (c *connState) cmdSCard(argv [][]byte) {
 // with a decrement, so the framed length always matches what is streamed.
 func (c *connState) streamSet(skey []byte) {
 	mu := &c.srv.incrMu[c.srv.stripe(skey)]
-	mu.Lock()
+	// A whole-set read only excludes concurrent SADD/SREM writers, not other readers, so it
+	// takes the shared lock and lets many SMEMBERS of one hot set run on many cores at once, a
+	// win a single-threaded server cannot match. A set has no per-member TTL, so there is
+	// nothing to reap, and the read never mutates under the lock; the shared path is always safe.
+	mu.RLock()
 	if c.stringConflict(skey) {
-		mu.Unlock()
+		mu.RUnlock()
 		c.writeErr(wrongType)
 		return
 	}
@@ -273,7 +277,7 @@ func (c *connState) streamSet(skey []byte) {
 		}
 		after = last
 	}
-	mu.Unlock()
+	mu.RUnlock()
 }
 
 func (c *connState) cmdSMembers(argv [][]byte) {

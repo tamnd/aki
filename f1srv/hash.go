@@ -375,15 +375,31 @@ const hashScanBatch = 256
 // CollRemove with a decrement, so the framed length always matches what is streamed.
 func (c *connState) streamHash(hkey []byte, wantField, wantValue bool) {
 	mu := &c.srv.incrMu[c.srv.stripe(hkey)]
-	mu.Lock()
+	// A whole-hash read only has to exclude concurrent writers, not other readers, so it takes
+	// the shared lock and lets many HGETALL/HKEYS/HVALS of one hot key run on many cores at
+	// once. The one exception is reaping expired fields, a mutation that needs the exclusive
+	// lock; reaping is only possible when some hash in the keyspace carries a field TTL
+	// (hfe > 0), so a TTL-free keyspace, the common case, always takes the shared path.
+	reap := c.srv.hfe.Load() != 0
+	if reap {
+		mu.Lock()
+	} else {
+		mu.RLock()
+	}
 	if c.stringConflict(hkey) {
-		mu.Unlock()
+		if reap {
+			mu.Unlock()
+		} else {
+			mu.RUnlock()
+		}
 		c.writeErr(wrongType)
 		return
 	}
 	// Reap expired fields before framing the reply so the header count and the streamed rows
-	// both exclude them. Gated, so a TTL-free hash pays nothing.
-	c.reapHashExpiredLocked(hkey)
+	// both exclude them. Only reached on the exclusive path, so the mutation is safe.
+	if reap {
+		c.reapHashExpiredLocked(hkey)
+	}
 	count := c.hashCount(hkey)
 	perRow := 0
 	if wantField {
@@ -415,7 +431,11 @@ func (c *connState) streamHash(hkey []byte, wantField, wantValue bool) {
 			}
 			after = last
 		}
-		mu.Unlock()
+		if reap {
+			mu.Unlock()
+		} else {
+			mu.RUnlock()
+		}
 		return
 	}
 
@@ -444,7 +464,11 @@ func (c *connState) streamHash(hkey []byte, wantField, wantValue bool) {
 		}
 		after = last
 	}
-	mu.Unlock()
+	if reap {
+		mu.Unlock()
+	} else {
+		mu.RUnlock()
+	}
 }
 
 // cmdHScan is the LTM-safe incremental hash enumeration (spec 2064/f1_rewrite_ltm/05
