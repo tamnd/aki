@@ -200,6 +200,28 @@ func (c *connState) execCommand(argv [][]byte) {
 		c.cmdHIncrByFloat(argv)
 	case eqFold(cmd, "HRANDFIELD"):
 		c.cmdHRandField(argv)
+	case eqFold(cmd, "HEXPIRE"):
+		c.cmdHExpire(argv)
+	case eqFold(cmd, "HPEXPIRE"):
+		c.cmdHPExpire(argv)
+	case eqFold(cmd, "HEXPIREAT"):
+		c.cmdHExpireAt(argv)
+	case eqFold(cmd, "HPEXPIREAT"):
+		c.cmdHPExpireAt(argv)
+	case eqFold(cmd, "HTTL"):
+		c.cmdHTTL(argv)
+	case eqFold(cmd, "HPTTL"):
+		c.cmdHPTTL(argv)
+	case eqFold(cmd, "HEXPIRETIME"):
+		c.cmdHExpireTime(argv)
+	case eqFold(cmd, "HPEXPIRETIME"):
+		c.cmdHPExpireTime(argv)
+	case eqFold(cmd, "HPERSIST"):
+		c.cmdHPersist(argv)
+	case eqFold(cmd, "HGETEX"):
+		c.cmdHGetEx(argv)
+	case eqFold(cmd, "HGETDEL"):
+		c.cmdHGetDel(argv)
 	case eqFold(cmd, "SADD"):
 		c.cmdSAdd(argv)
 	case eqFold(cmd, "SREM"):
@@ -873,6 +895,13 @@ func (c *connState) dropKeyLocked(key []byte) bool {
 	case keyString:
 		return c.srv.store.Delete(key)
 	case keyHash:
+		// Clear any field-TTL sibling rows and the per-hash TTL hint before the field rows go,
+		// since the sweep finds the TTL rows by scanning the still-present field prefix. Gated,
+		// so a TTL-free hash pays only one atomic load. The prefix is rebuilt after because the
+		// sweep and dropCollIndex both borrow the shared pbuf.
+		if c.srv.hfe.Load() != 0 {
+			c.dropHashFieldTTLsLocked(key, c.hashPrefix(key))
+		}
 		c.dropCollIndex(c.hashPrefix(key), kindHashField)
 		c.srv.store.DeleteKind(key, kindHashMeta)
 		return true

@@ -93,9 +93,11 @@ func (c *connState) cmdHSet(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	hadTTL := c.hashHasFieldTTL(hkey)
 	created := 0
 	for i := 2; i+1 < len(argv); i += 2 {
 		fk := c.fieldKey(hkey, argv[i])
+		c.discardFieldTTLBeforeSet(hkey, fk, hadTTL)
 		isNew, err := c.srv.store.PutKind(fk, argv[i+1], kindHashField)
 		if err != nil {
 			mu.Unlock()
@@ -132,9 +134,11 @@ func (c *connState) cmdHMSet(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	hadTTL := c.hashHasFieldTTL(hkey)
 	created := 0
 	for i := 2; i+1 < len(argv); i += 2 {
 		fk := c.fieldKey(hkey, argv[i])
+		c.discardFieldTTLBeforeSet(hkey, fk, hadTTL)
 		isNew, err := c.srv.store.PutKind(fk, argv[i+1], kindHashField)
 		if err != nil {
 			mu.Unlock()
@@ -172,6 +176,13 @@ func (c *connState) cmdHSetNX(argv [][]byte) {
 		return
 	}
 	fk := c.fieldKey(hkey, argv[2])
+	// An already-expired field reads as absent, so reap it first and let the NX set proceed.
+	if c.hashHasFieldTTL(hkey) {
+		if at, has := c.fieldTTL(fk); has && at <= c.nowMs {
+			c.reapFieldLocked(hkey, fk)
+			fk = c.fieldKey(hkey, argv[2])
+		}
+	}
 	if c.srv.store.ExistsKind(fk, kindHashField) {
 		mu.Unlock()
 		c.writeInt(0)
@@ -198,6 +209,12 @@ func (c *connState) cmdHGet(argv [][]byte) {
 		c.writeErr("ERR wrong number of arguments for 'hget' command")
 		return
 	}
+	// Lazy field expiry runs before fk is built for the value read: hfieldExpired may reap the
+	// field and rebuild the scratch kbuf, so a fk captured earlier would dangle.
+	if c.hfieldExpired(argv[1], argv[2]) {
+		c.writeNil()
+		return
+	}
 	fk := c.fieldKey(argv[1], argv[2])
 	v, ok := c.srv.store.GetKind(fk, c.vbuf, kindHashField)
 	c.vbuf = v
@@ -216,6 +233,10 @@ func (c *connState) cmdHMGet(argv [][]byte) {
 	}
 	c.writeArrayHeader(len(argv) - 2)
 	for _, field := range argv[2:] {
+		if c.hfieldExpired(argv[1], field) {
+			c.writeNil()
+			continue
+		}
 		fk := c.fieldKey(argv[1], field)
 		v, ok := c.srv.store.GetKind(fk, c.vbuf, kindHashField)
 		c.vbuf = v
@@ -246,6 +267,9 @@ func (c *connState) cmdHDel(argv [][]byte) {
 		fk := c.fieldKey(hkey, field)
 		if c.srv.store.DeleteKind(fk, kindHashField) {
 			c.srv.store.CollRemove(fk)
+			// Drop any TTL sibling the field carried so the global hfe gate and the per-hash
+			// hint stay exact when a TTL'd field is deleted outright.
+			c.clearFieldTTLLocked(hkey, fk)
 			deleted++
 		}
 	}
@@ -272,6 +296,10 @@ func (c *connState) cmdHExists(argv [][]byte) {
 		c.writeErr("ERR wrong number of arguments for 'hexists' command")
 		return
 	}
+	if c.hfieldExpired(argv[1], argv[2]) {
+		c.writeInt(0)
+		return
+	}
 	fk := c.fieldKey(argv[1], argv[2])
 	if c.srv.store.ExistsKind(fk, kindHashField) {
 		c.writeInt(1)
@@ -286,6 +314,14 @@ func (c *connState) cmdHLen(argv [][]byte) {
 		c.writeErr("ERR wrong number of arguments for 'hlen' command")
 		return
 	}
+	// When the hash carries field TTLs, reap the expired ones under the stripe lock first so the
+	// count reflects only live fields, matching Redis. The gate skips this for a TTL-free hash.
+	if c.hashHasFieldTTL(argv[1]) {
+		mu := &c.srv.incrMu[c.srv.stripe(argv[1])]
+		mu.Lock()
+		c.reapHashExpiredLocked(argv[1])
+		mu.Unlock()
+	}
 	c.writeInt(int64(c.hashCount(argv[1])))
 }
 
@@ -293,6 +329,10 @@ func (c *connState) cmdHStrlen(argv [][]byte) {
 	// HSTRLEN key field
 	if len(argv) != 3 {
 		c.writeErr("ERR wrong number of arguments for 'hstrlen' command")
+		return
+	}
+	if c.hfieldExpired(argv[1], argv[2]) {
+		c.writeInt(0)
 		return
 	}
 	fk := c.fieldKey(argv[1], argv[2])
@@ -341,6 +381,9 @@ func (c *connState) streamHash(hkey []byte, wantField, wantValue bool) {
 		c.writeErr(wrongType)
 		return
 	}
+	// Reap expired fields before framing the reply so the header count and the streamed rows
+	// both exclude them. Gated, so a TTL-free hash pays nothing.
+	c.reapHashExpiredLocked(hkey)
 	count := c.hashCount(hkey)
 	perRow := 0
 	if wantField {
@@ -493,10 +536,19 @@ func (c *connState) cmdHScan(argv [][]byte) {
 	// store's life, so collecting the survivors before the reply header costs no copy and
 	// lets the array length be exact.
 	plen := len(prefix)
+	// When the hash carries field TTLs, an already-expired field reads as absent, so it is
+	// skipped from this window rather than emitted; a later point read or whole-hash read reaps
+	// it. The gate keeps a TTL-free hash on the plain filter path.
+	checkTTL := c.hashHasFieldTTL(hkey)
 	matched := keys[:0]
 	for _, k := range keys {
 		if pattern != nil && !globMatch(pattern, k[plen:]) {
 			continue
+		}
+		if checkTTL {
+			if at, has := c.fieldTTL(k); has && at <= c.nowMs {
+				continue
+			}
 		}
 		matched = append(matched, k)
 	}
