@@ -480,6 +480,14 @@ func (c *connState) execCommand(argv [][]byte) {
 		c.cmdClient(argv)
 	case eqFold(cmd, "SELECT") || eqFold(cmd, "CONFIG"):
 		c.writeSimple("OK")
+	case eqFold(cmd, "CLUSTER"):
+		c.cmdCluster(argv)
+	case eqFold(cmd, "REPLICAOF"):
+		c.cmdReplicaof(argv, "replicaof")
+	case eqFold(cmd, "SLAVEOF"):
+		c.cmdReplicaof(argv, "slaveof")
+	case eqFold(cmd, "FAILOVER"):
+		c.cmdFailover(argv)
 	case eqFold(cmd, "COMMAND"):
 		c.writeArrayHeader(0)
 	case eqFold(cmd, "TIME"):
