@@ -709,3 +709,118 @@ func TestListWrongType(t *testing.T) {
 		}
 	}
 }
+
+// writeCmd buffers one command without flushing, so a test can stack several into one write and
+// deliver them as a single pipeline the drain loop sees in one pass. This is how the coalesced
+// push path is reached: a run of same-key, same-verb pushes arriving together folds into one
+// locked batch, and every reply must still read as if the pushes ran one at a time.
+func writeCmd(t *testing.T, rw *bufio.ReadWriter, args ...string) {
+	t.Helper()
+	rw.WriteByte('*')
+	rw.WriteString(itoa(len(args)))
+	rw.WriteString("\r\n")
+	for _, a := range args {
+		rw.WriteByte('$')
+		rw.WriteString(itoa(len(a)))
+		rw.WriteString("\r\n")
+		rw.WriteString(a)
+		rw.WriteString("\r\n")
+	}
+}
+
+// A pipeline of same-key pushes must coalesce into one locked batch yet reply exactly as if each
+// push had run on its own: every reply is the running length after that command's elements, and
+// the final window is in list order. This drives the drainPush look-ahead across the shapes that
+// break a run: a differing verb, a differing key, and an unrelated command in the middle.
+func TestListPushCoalesced(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	// A run of RPUSHes to one key, some multi-element, folds to one batch. Each reply is the
+	// running length: 2, 3, 6, 7.
+	writeCmd(t, rw, "RPUSH", "l", "a", "b")
+	writeCmd(t, rw, "RPUSH", "l", "c")
+	writeCmd(t, rw, "RPUSH", "l", "d", "e", "f")
+	writeCmd(t, rw, "RPUSH", "l", "g")
+	if err := rw.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	for _, want := range []string{":2", ":3", ":6", ":7"} {
+		expect(t, rw, want)
+	}
+	if got := lrangeCall(t, rw, "LRANGE", "l", "0", "-1"); !eqStrs(got, []string{"a", "b", "c", "d", "e", "f", "g"}) {
+		t.Fatalf("after coalesced RPUSH = %v", got)
+	}
+
+	// A run of LPUSHes prepends per element within each command and per command across the run,
+	// so LPUSH k h then LPUSH k i j leaves [j i h ...] ahead of the existing tail.
+	writeCmd(t, rw, "LPUSH", "k", "h")
+	writeCmd(t, rw, "LPUSH", "k", "i", "j")
+	if err := rw.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	expect(t, rw, ":1")
+	expect(t, rw, ":3")
+	if got := lrangeCall(t, rw, "LRANGE", "k", "0", "-1"); !eqStrs(got, []string{"j", "i", "h"}) {
+		t.Fatalf("after coalesced LPUSH = %v", got)
+	}
+
+	// A differing verb breaks the run: the RPUSHes coalesce, the LPUSH stands alone, and order is
+	// preserved because drainPush stops the run at the verb change.
+	writeCmd(t, rw, "RPUSH", "m", "1", "2")
+	writeCmd(t, rw, "RPUSH", "m", "3")
+	writeCmd(t, rw, "LPUSH", "m", "0")
+	if err := rw.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	expect(t, rw, ":2")
+	expect(t, rw, ":3")
+	expect(t, rw, ":4")
+	if got := lrangeCall(t, rw, "LRANGE", "m", "0", "-1"); !eqStrs(got, []string{"0", "1", "2", "3"}) {
+		t.Fatalf("after verb-broken run = %v", got)
+	}
+
+	// A differing key breaks the run, and an unrelated command in the middle breaks it too: the
+	// GET runs on its own between the two pushes, and both pushes still land in order.
+	writeCmd(t, rw, "RPUSH", "p", "x")
+	writeCmd(t, rw, "GET", "nope")
+	writeCmd(t, rw, "RPUSH", "p", "y")
+	writeCmd(t, rw, "RPUSH", "q", "z")
+	if err := rw.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	expect(t, rw, ":1")
+	expect(t, rw, "$-1")
+	expect(t, rw, ":2")
+	expect(t, rw, ":1")
+	if got := lrangeCall(t, rw, "LRANGE", "p", "0", "-1"); !eqStrs(got, []string{"x", "y"}) {
+		t.Fatalf("after command-broken run = %v", got)
+	}
+
+	// LPUSHX onto a missing key in a coalesced run creates nothing and every command replies 0,
+	// matching the per-command X-form semantics.
+	writeCmd(t, rw, "RPUSHX", "gone", "a")
+	writeCmd(t, rw, "RPUSHX", "gone", "b", "c")
+	if err := rw.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	expect(t, rw, ":0")
+	expect(t, rw, ":0")
+	cmd(t, rw, "EXISTS", "gone")
+	expect(t, rw, ":0")
+
+	// A pipelined run against a string key replies WRONGTYPE for every command in the run.
+	cmd(t, rw, "SET", "s", "v")
+	expect(t, rw, "+OK")
+	writeCmd(t, rw, "RPUSH", "s", "a")
+	writeCmd(t, rw, "RPUSH", "s", "b")
+	if err := rw.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		got := readReply(t, rw)
+		if !strings.HasPrefix(got, "-WRONGTYPE") {
+			t.Fatalf("coalesced push on string reply %d = %q, want WRONGTYPE", i, got)
+		}
+	}
+}
