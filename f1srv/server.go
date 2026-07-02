@@ -95,6 +95,18 @@ type Server struct {
 	watchVer  map[string]*watchEntry
 	watching  atomic.Int64
 
+	// Pub/sub registry. psChan/psPat/psShard map a channel name, a pattern, or a shard channel
+	// to the set of connections subscribed to it; PUBLISH walks psChan plus every matching entry
+	// of psPat, SPUBLISH walks psShard alone (shard channels are a separate namespace regular
+	// PUBLISH never reaches). psMu guards all three maps and the subscriber sets inside them. An
+	// entry lives only while it has at least one subscriber, so the table stays bounded to the
+	// channels under active subscription. There is no hot-path gate here because pub/sub touches
+	// no keyspace and the GET/SET path never consults these maps.
+	psMu    sync.Mutex
+	psChan  map[string]map[*connState]struct{}
+	psPat   map[string]map[*connState]struct{}
+	psShard map[string]map[*connState]struct{}
+
 	wg sync.WaitGroup
 }
 
@@ -131,6 +143,9 @@ func New(cfg Config) *Server {
 	}
 	srv.block.waiters = make(map[string][]*listWaiter)
 	srv.watchVer = make(map[string]*watchEntry)
+	srv.psChan = make(map[string]map[*connState]struct{})
+	srv.psPat = make(map[string]map[*connState]struct{})
+	srv.psShard = make(map[string]map[*connState]struct{})
 	// A cold path engages the larger-than-memory tier; opening the log can fail on a
 	// disk error, so defer that error to Listen and keep New's signature simple for the
 	// many in-memory callers and tests that never set ColdPath.
@@ -229,8 +244,13 @@ func (s *Server) serveConn(conn net.Conn) {
 		out:       make([]byte, 0, s.cfg.ReadBufSize),
 		blockable: true, // a per-connection goroutine may park on a blocking command
 	}
+	// On the goroutine driver a message frame is written straight to the socket, under writeMu
+	// so a publisher on another goroutine and this connection's own flush cannot interleave.
+	c.deliver = c.writeToConn
 	c.loop()
-	// A client can disconnect mid-transaction or while holding watches; release both so the
-	// watch table's refcounts (and the global watching gate) do not leak past the connection.
+	// A client can disconnect mid-transaction, while holding watches, or while subscribed;
+	// release all three so the watch table's refcounts (and the global watching gate) and the
+	// pub/sub registry do not leak past the connection.
 	c.discardTx()
+	c.unsubscribeAll()
 }

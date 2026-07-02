@@ -3,6 +3,7 @@ package f1srv
 import (
 	"net"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -49,6 +50,23 @@ type connState struct {
 	multiQueue [][][]byte
 	multiAbort bool
 	watched    []watchedKey
+
+	// Pub/sub state. psChannels/psPatterns/psShard are this connection's own subscription
+	// sets, allocated lazily so a connection that never subscribes carries no map. psMode is
+	// the hot-path gate: it is true exactly when any of the three sets is non-empty, so the
+	// flush path and the subscribe-context command restriction test one bool instead of three
+	// map lengths. deliver is installed by the driver: on the goroutine driver it writes a
+	// message frame straight to the socket under writeMu (a publisher on another goroutine and
+	// this connection's own goroutine can both write), on the reactor driver it posts the frame
+	// to this connection's owning loop, which serializes all writes and needs no lock. writeMu
+	// guards the socket write on the goroutine driver and is taken at flush time only while
+	// psMode is set.
+	psChannels map[string]struct{}
+	psPatterns map[string]struct{}
+	psShard    map[string]struct{}
+	psMode     bool
+	deliver    func(frame []byte)
+	writeMu    sync.Mutex
 }
 
 // loop reads from the socket, drains every complete command in the buffer, and
@@ -64,7 +82,18 @@ func (c *connState) loop() {
 			return
 		}
 		if len(c.out) > 0 {
-			if _, err := c.conn.Write(c.out); err != nil {
+			// While this connection is subscribed, a publisher running on another goroutine
+			// may write a message frame straight to the same socket through deliver, so the
+			// per-batch flush must serialize against it. A connection that never subscribes
+			// keeps psMode false and takes no lock, so the GET/SET path is untouched.
+			if c.psMode {
+				c.writeMu.Lock()
+				_, err := c.conn.Write(c.out)
+				c.writeMu.Unlock()
+				if err != nil {
+					return
+				}
+			} else if _, err := c.conn.Write(c.out); err != nil {
 				return
 			}
 			c.out = c.out[:0]
