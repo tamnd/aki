@@ -689,16 +689,24 @@ func (c *connState) popThroughWindow(lkey []byte, atHead, hasCount bool, want in
 //   - The pop would empty or underflow the list (want >= live). The emptying-to-header-delete
 //     transition and any head/tail crossing belong to the stripe path, which owns deleting the key.
 //
-// Why the whole emit runs under w.mu, not just the claim: a concurrent push's commit grows the ring
-// by rehashing only the live range [committedHead, committedTail). Once this pop advances the
-// committed bound past the claimed run, those positions fall outside the live range, so a racing
-// grow would drop their slots. Reading (and resetting) the ring slots in the same w.mu section that
-// advanced the bound keeps the read ahead of any grow, so a plain non-atomic ring is safe. writeBulk
-// copies the bytes into the reply buffer, so nothing aliases a slot after the mutex is released.
+// The critical section is the claim, not the emit: under w.mu the pop validates the bounds, advances
+// the committed end past the run, and detaches each claimed element's bytes into a per-connection
+// scratch (c.popBufs), then releases the mutex and does all RESP framing (the array header plus one
+// writeBulk per element) off-lock. That split is what lets many connections popping the SAME hot key
+// use more than one core: the RESP framing (integer-to-ASCII length, the $-len-CRLF wrapper, the byte
+// copy into the reply buffer) is the dominant per-op cost, and holding w.mu across it serialized
+// every popper on this key. Advancing the bound is O(1), so the mutex is now held for O(run) pointer
+// moves instead of O(run) framings.
 //
-// A pre-block position (one still backed by an f1raw row from the admitting push) is taken through
-// TakeKindNoCount, so the store's shared record counter is touched once per run in a single AddCount
-// rather than per element, keeping that contended line off the per-element path. Resident positions
+// Detaching is what makes the off-lock emit race-free. A resident slot is taken with ring.takeSlot,
+// which nils the slot, so the returned slice is sole-owned: a concurrent push cannot alias it (push
+// only writes slots inside the live [committedHead, committedTail) span, and the claimed run now sits
+// outside that span) and a concurrent grow cannot drop it (grow rehashes only the live span by
+// reference). A pre-block position (still backed by an f1raw row from the admitting push) is taken
+// with TakeKindNoCount into a freshly allocated buffer, not the shared c.vbuf, because popBufs holds
+// every claimed slice across the whole run and a shared buffer would let each take clobber the last.
+// TakeKindNoCount leaves the store's shared record counter untouched so it is adjusted once per run in
+// a single AddCount after the lock, rather than per element on the contended line; resident positions
 // were never counted (their push skipped PutKind), so they owe no count adjustment.
 func (c *connState) popEmitWindow(w *listWindow, lkey []byte, atHead, hasCount bool, want int64) bool {
 	if want <= 0 {
@@ -727,36 +735,43 @@ func (c *connState) popEmitWindow(w *listWindow, lkey []byte, atHead, hasCount b
 		w.committedTail.Store(lo)
 		w.reservedTail.Store(lo)
 	}
-	if hasCount {
-		c.writeArrayHeader(int(hi - lo))
-	}
+	// Claim each element's bytes into popBufs in emission order. Resident slots are detached (nil'd)
+	// so the captured slice survives a concurrent push or grow; pre-block rows are taken into a fresh
+	// buffer so popBufs entries never alias one another.
+	buf := c.popBufs[:0]
 	var sumBytes, preCount int64
-	emit := func(pos int64) {
+	claim := func(pos int64) {
 		if w.resident(pos) {
-			v := w.ring.get(pos)
+			v := w.ring.takeSlot(pos)
 			sumBytes += int64(listEntrySize(v))
-			c.writeBulk(v)
-			w.ring.reset(pos)
+			buf = append(buf, v)
 			return
 		}
 		ek := c.listElemKey(lkey, pos)
-		v, _ := c.srv.store.TakeKindNoCount(ek, c.vbuf[:0], kindListElem)
-		c.vbuf = v
+		v, _ := c.srv.store.TakeKindNoCount(ek, nil, kindListElem)
 		sumBytes += int64(listEntrySize(v))
-		c.writeBulk(v)
+		buf = append(buf, v)
 		preCount++
 	}
 	// LPOP returns elements head-outward (positions lo, lo+1, ...); RPOP returns them tail-inward.
 	if atHead {
 		for pos := lo; pos < hi; pos++ {
-			emit(pos)
+			claim(pos)
 		}
 	} else {
 		for pos := hi - 1; pos >= lo; pos-- {
-			emit(pos)
+			claim(pos)
 		}
 	}
 	w.mu.Unlock()
+	c.popBufs = buf
+	// Frame the claimed bytes off-lock. popBufs is already in emission order for both ends.
+	if hasCount {
+		c.writeArrayHeader(len(buf))
+	}
+	for _, v := range buf {
+		c.writeBulk(v)
+	}
 	if preCount > 0 {
 		c.srv.store.AddCount(-preCount)
 	}
