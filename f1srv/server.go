@@ -21,9 +21,12 @@
 package f1srv
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tamnd/aki/engine/f1raw"
 )
@@ -124,7 +127,22 @@ type Server struct {
 	// nextConnID hands out the per-connection identifier CLIENT ID reports. Redis numbers clients
 	// from 1, so the first Add returns 1. Both drivers (goroutine and reactor) draw from it, so the
 	// ids stay unique across the whole server regardless of which accept path took the connection.
+	// Its current value is also the total number of connections ever accepted, which INFO reports
+	// as total_connections_received.
 	nextConnID atomic.Int64
+
+	// clients is the count of connections currently open, bumped up when a connection's state is
+	// created and back down when it tears down, on both the goroutine and the reactor driver. It
+	// costs one atomic add per accept and one per close, nothing per command, so the GET/SET hot
+	// path never touches it. INFO reports it as connected_clients.
+	clients atomic.Int64
+
+	// startTime is the wall-clock instant New built the server, the origin INFO's uptime fields
+	// count from. runID is a 40-hex random token generated once at construction, the identity a
+	// client uses to tell one server run from another (INFO run_id, matching Redis's width). Both
+	// are set once and never mutated, so they need no synchronization.
+	startTime time.Time
+	runID     string
 
 	wg sync.WaitGroup
 }
@@ -156,9 +174,11 @@ func New(cfg Config) *Server {
 		stripes = 1
 	}
 	srv := &Server{
-		cfg:      cfg,
-		incrMu:   make([]sync.RWMutex, stripes),
-		incrMask: uint32(stripes - 1),
+		cfg:       cfg,
+		incrMu:    make([]sync.RWMutex, stripes),
+		incrMask:  uint32(stripes - 1),
+		startTime: time.Now(),
+		runID:     newRunID(),
 	}
 	srv.block.waiters = make(map[string][]*listWaiter)
 	srv.watchVer = make(map[string]*watchEntry)
@@ -185,6 +205,17 @@ func New(cfg Config) *Server {
 		srv.store.SetTopKindFunc(isTopKind)
 	}
 	return srv
+}
+
+// newRunID returns a 40-character hex token identifying this server run, the width Redis uses
+// for its run_id. It draws 20 random bytes; if the system source fails (it does not in practice),
+// it falls back to a fixed marker so New never fails on account of an identity string.
+func newRunID() string {
+	var b [20]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "0000000000000000000000000000000000000000"
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // Addr reports the address the server is listening on, valid after ListenAndServe
@@ -264,6 +295,8 @@ func (s *Server) serveConn(conn net.Conn) {
 		out:       make([]byte, 0, s.cfg.ReadBufSize),
 		blockable: true, // a per-connection goroutine may park on a blocking command
 	}
+	s.clients.Add(1)
+	defer s.clients.Add(-1)
 	// On the goroutine driver a message frame is written straight to the socket, under writeMu
 	// so a publisher on another goroutine and this connection's own flush cannot interleave.
 	c.deliver = c.writeToConn
