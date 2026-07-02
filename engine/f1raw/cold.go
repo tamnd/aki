@@ -44,6 +44,7 @@ const flagSep = 1 << 0
 // syscall lands at its own offset regardless of interleaving.
 type coldLog struct {
 	f    *os.File
+	path string // the log file's path, so compaction can rename a fresh log over it
 	tail atomic.Uint64
 	// dead counts the bytes in the log that are no longer referenced by any live record:
 	// the cold value of every separated record a same-key overwrite or a delete has
@@ -65,7 +66,7 @@ func openColdLog(path string) (*coldLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &coldLog{f: f}
+	c := &coldLog{f: f, path: path}
 	// Cold reads are random point lookups, so tell the kernel to disable readahead on
 	// the log up front. Otherwise each read prefetches a full readahead window that the
 	// per-read DONTNEED does not cover, and those pages accumulate under the memory cap.
