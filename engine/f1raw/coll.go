@@ -279,6 +279,26 @@ func (s *Store) ReadValueAt(off uint64, dst []byte) []byte {
 	return s.readValue(off, dst)
 }
 
+// ValueAtLocked returns the inline value of the record at off as a zero-copy subslice of the
+// grow-only arena, the value twin of keyAt, so the value-carrying scan (HGETALL/HVALS) hands
+// both the field and its value straight to writeBulk without the ReadValueAt copy into a
+// scratch buffer. It is safe only under two conditions the caller must guarantee. First, the
+// caller holds the key's stripe lock, so no concurrent writer can rewrite the value in place
+// or outgrow-republish the record while the returned slice is read; without that lock a writer
+// under the seqlock could tear the read, which is exactly why the general Get path copies under
+// the latch instead. Second, the record is inline: a cold-log separated value is a 12-byte
+// pointer, not value bytes, so this reports inline=false for a separated record and the caller
+// must fall back to ReadValueAt, which resolves the cold log. The arena never moves a published
+// record, so under the held lock the returned slice stays valid for the caller's use of it.
+func (s *Store) ValueAtLocked(off uint64) (val []byte, inline bool) {
+	if s.cold != nil && s.isSep(off) {
+		return nil, false
+	}
+	vbase := off + hdrSize + align8(s.klen(off))
+	n := uint64(s.vlenAt(off).Load())
+	return s.arena[vbase : vbase+n], true
+}
+
 // CollSelectAt returns the composite key of the element at 0-based localIndex within the
 // collection bounded by prefix, in key order, and whether it exists. It rides the ordered
 // index's order-statistic spans, so a random member is one O(log n) rank-then-select
