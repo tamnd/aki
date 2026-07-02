@@ -446,15 +446,19 @@ func (c *connState) cmdLRange(argv [][]byte) {
 		return
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
-	mu.Lock()
+	// LRANGE only excludes concurrent list writers, not other readers, so it takes the shared
+	// lock and lets many LRANGE of one hot list run on many cores at once, a win a
+	// single-threaded server cannot match. A list has no per-element TTL and the read never
+	// mutates under the lock, so the shared path is always safe.
+	mu.RLock()
 	if c.stringConflict(lkey) {
-		mu.Unlock()
+		mu.RUnlock()
 		c.writeErr(wrongType)
 		return
 	}
 	head, tail, _, _, ok := c.listHeader(lkey)
 	if !ok {
-		mu.Unlock()
+		mu.RUnlock()
 		c.writeArrayHeader(0)
 		return
 	}
@@ -472,7 +476,7 @@ func (c *connState) cmdLRange(argv [][]byte) {
 		stop = n - 1
 	}
 	if start > stop || start >= n {
-		mu.Unlock()
+		mu.RUnlock()
 		c.writeArrayHeader(0)
 		return
 	}
@@ -483,7 +487,7 @@ func (c *connState) cmdLRange(argv [][]byte) {
 		c.vbuf = v
 		c.writeBulk(v)
 	}
-	mu.Unlock()
+	mu.RUnlock()
 }
 
 // cmdLSet implements LSET: it overwrites the element at a signed index with a new value, an

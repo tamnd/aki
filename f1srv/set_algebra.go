@@ -175,25 +175,107 @@ func (c *connState) sunionEach(keys [][]byte, emit func([]byte) bool) {
 	}
 }
 
-// sinterEach drives off the smallest source set and calls emit for each member the every
-// other source also holds, in the driver's member order (spec section 5.2). Reading the k
-// O(1) header counts first lets it pick the smallest set to iterate and point-probe the
-// rest, so the work is bounded by the smallest set, not the largest. If any source is empty
-// the intersection is empty and it emits nothing. emit returns false to stop early, which
-// SINTERCARD uses to stop at its LIMIT.
+// sinterProbeWeight is how many cursor-advance steps one point-probe of a source costs,
+// used by sinterEach to choose its strategy. A probe builds the composite member key and
+// walks the lock-free hash index, which is several times the cost of a single ordered-cursor
+// advance, so this is deliberately above one. It only steers the merge-vs-probe choice; both
+// paths return the same members, so the exact value trades a little work either side of the
+// crossover and never affects correctness.
+const sinterProbeWeight = 4
+
+// sinterEach yields every member present in all source sets, in ascending member-byte order,
+// and returns early when emit returns false (SINTERCARD's LIMIT). It picks between two exact
+// strategies from the O(1) header cardinalities:
+//
+//   - a sorted k-way merge (sinterMergeEach) that walks every source cursor once in lockstep,
+//     costing about the sum of the cardinalities with no per-member key build or hash probe.
+//     This is only possible because f1raw keeps every set's members in one sort order, a
+//     property a hashtable set does not have, and it is what makes SINTER a merge rather than
+//     a probe here.
+//   - the classic drive-off-the-smallest-set probe (sinterProbeEach) that iterates the
+//     smallest source and point-probes the rest, costing about the smallest cardinality times
+//     the probe weight. This wins when one source is far smaller than the others.
+//
+// It uses whichever the cardinalities say is cheaper. Any empty source makes the intersection
+// empty and it yields nothing.
 func (c *connState) sinterEach(keys [][]byte, emit func([]byte) bool) {
+	var sumCard, minCard uint64 = 0, ^uint64(0)
 	driverIdx := 0
-	minCard := ^uint64(0)
 	for i, k := range keys {
 		card := c.setCard(k)
 		if card == 0 {
 			return // an empty source means an empty intersection
 		}
+		sumCard += card
 		if card < minCard {
 			minCard = card
 			driverIdx = i
 		}
 	}
+	// Merge cost is about sumCard cursor steps; probe cost is about minCard*(k-1) probes,
+	// each sinterProbeWeight steps. Take the cheaper. A lone source (k==1) has no other
+	// source to probe, so the merge (a single cursor walk) is always the right path.
+	probeCost := minCard * uint64(len(keys)-1) * sinterProbeWeight
+	if len(keys) == 1 || sumCard <= probeCost {
+		c.sinterMergeEach(keys, emit)
+		return
+	}
+	c.sinterProbeEach(keys, driverIdx, emit)
+}
+
+// sinterMergeEach yields the intersection by a sorted k-way merge over the source cursors: it
+// repeatedly takes the largest member currently at any cursor front, advances every cursor
+// that sits below it, and yields the member when all cursors have caught up to it exactly.
+// Every advance makes forward progress, so the whole merge is bounded by the sum of the source
+// cardinalities and touches each member row once. It allocates nothing per member and never
+// probes the hash index. emit returns false to stop early.
+func (c *connState) sinterMergeEach(keys [][]byte, emit func([]byte) bool) {
+	cursors := make([]*setCursor, len(keys))
+	for i, k := range keys {
+		sc := c.newSetCursor(k)
+		if sc.cur == nil {
+			return // an empty source means an empty intersection
+		}
+		cursors[i] = sc
+	}
+	for {
+		max := cursors[0].cur
+		for _, sc := range cursors[1:] {
+			if bytes.Compare(sc.cur, max) > 0 {
+				max = sc.cur
+			}
+		}
+		allEqual := true
+		for _, sc := range cursors {
+			for bytes.Compare(sc.cur, max) < 0 {
+				sc.advance()
+				if sc.cur == nil {
+					return // this source is exhausted, so nothing more can intersect
+				}
+			}
+			if !bytes.Equal(sc.cur, max) {
+				allEqual = false
+			}
+		}
+		if allEqual {
+			if !emit(max) {
+				return
+			}
+			for _, sc := range cursors {
+				sc.advance()
+				if sc.cur == nil {
+					return
+				}
+			}
+		}
+	}
+}
+
+// sinterProbeEach yields the intersection by iterating the smallest source (driverIdx, already
+// chosen from the header counts) and point-probing every other source for each member. The
+// work is bounded by the smallest source, which wins when it is far smaller than the rest.
+// emit returns false to stop early.
+func (c *connState) sinterProbeEach(keys [][]byte, driverIdx int, emit func([]byte) bool) {
 	driver := c.newSetCursor(keys[driverIdx])
 	for driver.cur != nil {
 		m := driver.cur
