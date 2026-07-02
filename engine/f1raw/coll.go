@@ -198,6 +198,48 @@ func (s *Store) TakeKind(key, dst []byte, kind byte) ([]byte, bool) {
 	}
 }
 
+// TakeKindNoCount reads and removes key like TakeKind but leaves the store's record count
+// alone, so a coalesced run of takes charges the shared counter once instead of once per
+// element. A pop burst on one hot list claims a contiguous run of element rows and takes
+// them off the window's commit mutex; s.count is a single line every connection's push and
+// pop hammer, so decrementing it once per popped element puts a contended atomic back on
+// the per-element path the window claim just took off it. The caller takes the run through
+// this variant, counts the rows it actually removed, and folds them into one AddCount, the
+// same coalescing the window claim already applies to the commit mutex. It must be
+// serialized with the key's other writers by the caller's stripe lock, exactly like
+// TakeKind, and the caller must call AddCount with the negated number of rows removed so
+// the counter stays consistent with the index. It is only correct for a kind that is never
+// top-level (a list element row), since it does not adjust topCount; a top-level kind must
+// go through TakeKind.
+func (s *Store) TakeKindNoCount(key, dst []byte, kind byte) ([]byte, bool) {
+	h := hash(key)
+	for {
+		off, b, slot, word, found := s.find(key, h, kind)
+		if !found {
+			return dst[:0], false
+		}
+		var v []byte
+		if s.cold != nil && s.isSep(off) {
+			var ok bool
+			if v, ok = s.readSeparated(off, dst); !ok {
+				return dst[:0], false
+			}
+		} else {
+			v = s.readValue(off, dst)
+		}
+		if b.slots[slot].CompareAndSwap(word, 0) {
+			s.markSepDead(off)
+			return v, true
+		}
+	}
+}
+
+// AddCount folds a coalesced run's record-count change into the shared counter in one
+// atomic, the batched companion to TakeKindNoCount. Serialize it with the key's other
+// writers the same way TakeKind is serialized, and pass the negated number of rows the run
+// actually removed so the counter tracks the live record set exactly.
+func (s *Store) AddCount(delta int64) { s.count.Add(delta) }
+
 // CollInsert records key in the ordered element index so a bounded cursor can
 // enumerate it in key order. Call it right after PutKind reports a new element row so
 // the ordered run and the hash index agree on the live set. It is a no-op if the

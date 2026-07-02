@@ -665,11 +665,18 @@ func (c *connState) popThroughWindow(lkey []byte, atHead, hasCount bool, want in
 // ...); RPOP returns them tail-inward (hi-1, hi-2, ...). Each row is copied into the reply by
 // writeBulk before the next take reuses vbuf, so no per-element buffer is held. It is the shared
 // body of the single-command popThroughWindow and the coalesced popThroughWindowRun.
+//
+// The rows come off through TakeKindNoCount, so the store's shared record counter is left alone
+// per element and folded into one AddCount for the whole run. That counter is a single line every
+// connection's push and pop touch, so charging it once per popped element would put a contended
+// atomic back on the per-element path that the window claim just took off the commit mutex.
+// List element rows are never top-level, so no topCount adjustment is owed. The run is under the
+// window's gate, the same serialization TakeKind and AddCount both require.
 func (c *connState) writePoppedRun(lkey []byte, atHead bool, lo, hi int64) (sumBytes int64) {
 	if atHead {
 		for pos := lo; pos < hi; pos++ {
 			ek := c.listElemKey(lkey, pos)
-			v, _ := c.srv.store.TakeKind(ek, c.vbuf[:0], kindListElem)
+			v, _ := c.srv.store.TakeKindNoCount(ek, c.vbuf[:0], kindListElem)
 			c.vbuf = v
 			sumBytes += int64(listEntrySize(v))
 			c.writeBulk(v)
@@ -677,12 +684,13 @@ func (c *connState) writePoppedRun(lkey []byte, atHead bool, lo, hi int64) (sumB
 	} else {
 		for pos := hi - 1; pos >= lo; pos-- {
 			ek := c.listElemKey(lkey, pos)
-			v, _ := c.srv.store.TakeKind(ek, c.vbuf[:0], kindListElem)
+			v, _ := c.srv.store.TakeKindNoCount(ek, c.vbuf[:0], kindListElem)
 			c.vbuf = v
 			sumBytes += int64(listEntrySize(v))
 			c.writeBulk(v)
 		}
 	}
+	c.srv.store.AddCount(-(hi - lo))
 	return sumBytes
 }
 
