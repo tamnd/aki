@@ -45,6 +45,16 @@ const flagSep = 1 << 0
 type coldLog struct {
 	f    *os.File
 	tail atomic.Uint64
+	// dead counts the bytes in the log that are no longer referenced by any live record:
+	// the cold value of every separated record a same-key overwrite or a delete has
+	// unlinked. The log is append-only, so a superseded value's bytes are not freed in
+	// place; they sit as dead space until a compaction milestone rewrites the live bytes
+	// forward and truncates. This counter is the accounting that later compaction reads to
+	// decide when the dead fraction (dead/tail) is worth a compaction pass. It is dormant
+	// here: nothing acts on it yet, it only has to stay honest so the trigger it feeds is
+	// measuring the real waste. Bumped with a plain atomic add at each unlink site, so it
+	// costs one add on the delete and overwrite paths and nothing on the read path.
+	dead atomic.Uint64
 }
 
 // openColdLog creates (truncating any prior file) and opens the cold value log at
@@ -113,6 +123,42 @@ func (c *coldLog) close() error {
 // value. The flags byte is immutable for a record's life, so this is a plain read.
 func (s *Store) isSep(off uint64) bool {
 	return s.arena[off+offFlags]&flagSep != 0
+}
+
+// sepValLen returns the cold value length a separated record at off points at, read from
+// the length field of its 12-byte cold pointer. The pointer is immutable for the record's
+// life, so this is a plain read. The caller must have checked isSep(off); on an inline
+// record the value cell is value bytes, not a pointer, and this would misread them.
+func (s *Store) sepValLen(off uint64) int {
+	vbase := off + hdrSize + align8(s.klen(off))
+	return int(binary.LittleEndian.Uint32(s.arena[vbase+8:]))
+}
+
+// markSepDead accounts the cold bytes of the record at off as dead space, if that record
+// is separated. It is called at every site that unlinks a record from the index (an
+// overwrite's entry swap, a delete, a collection element delete, a list pop), right after
+// the unlink commits, so the cold bytes the unlinked record pointed at are counted exactly
+// once as reclaimable. An inline record or a store with no cold log is a no-op: there is no
+// cold value to reclaim. The record bytes stay valid in the grow-only arena, so reading the
+// pointer here is safe even though the index no longer points at the record.
+func (s *Store) markSepDead(off uint64) {
+	if s.cold == nil || !s.isSep(off) {
+		return
+	}
+	s.cold.dead.Add(uint64(s.sepValLen(off)))
+}
+
+// ColdBytes reports the cold value log's total appended bytes and the subset of those that
+// are dead (unreferenced by any live record). A store with no cold log reports zero for
+// both. live = total - dead is the bytes a compaction pass would keep; dead is what it
+// would reclaim. This is the accounting a later compaction milestone reads to decide when
+// the dead fraction is worth a rewrite; it is exposed now so the invariant is testable and
+// the introspection path can surface it.
+func (s *Store) ColdBytes() (total, dead uint64) {
+	if s.cold == nil {
+		return 0, 0
+	}
+	return s.cold.tail.Load(), s.cold.dead.Load()
 }
 
 // encPtr writes a cold pointer (offset then value length) into a 12-byte cell.
