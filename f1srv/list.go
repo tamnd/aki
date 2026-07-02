@@ -78,6 +78,25 @@ func (c *connState) listElemKey(lkey []byte, pos int64) []byte {
 	return b
 }
 
+// listElemRead returns the bytes at position pos, reading the resident ring when the window w holds
+// pos and the f1raw element row otherwise. w may be nil (a cold list with no resident window), in
+// which case every position is a row. A scan uses this to read a hot list at memory speed: a
+// resident position is a plain ring-slot fetch with no hash probe, and only the pre-block seed
+// positions [preLo, preHi) still cost a row read. The caller must hold the key's stripe lock, and
+// additionally w.gate.Lock when w is non-nil, so the ring and its live bounds stay put across the
+// read. The returned slice aliases the ring slot or the read buffer and is valid until the next
+// read reuses that buffer, which is the same contract the row-only scan already relied on.
+func (c *connState) listElemRead(w *listWindow, lkey []byte, pos int64) ([]byte, bool) {
+	if w != nil && w.resident(pos) {
+		v := w.ring.get(pos)
+		return v, v != nil
+	}
+	ek := c.listElemKey(lkey, pos)
+	v, found := c.srv.store.GetKind(ek, c.vbuf[:0], kindListElem)
+	c.vbuf = v
+	return v, found
+}
+
 // listHeader reads a list's header window: the head and tail positions, the running listpack
 // byte size, and the sticky large flag. ok is false when the list has no header (empty or
 // missing key), in which case head and tail are 0 (an empty window) and lpBytes is the empty
@@ -1168,18 +1187,36 @@ func (c *connState) cmdLPos(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	// Resident positions live only in the ring, so flush the window to rows before the scan reads
-	// element rows (slice 3). The evict needs the exclusive stripe lock this command holds.
-	c.listWinDrainEvict(lkey)
-	head, tail, _, _, ok := c.listHeader(lkey)
-	if !ok {
-		mu.Unlock()
-		if count >= 0 {
-			c.writeArrayHeader(0)
-		} else {
-			c.writeNil()
+	// Scan the list in place. When the list is hot its elements live in the resident ring, so the
+	// scan reads them straight from ring slots with no f1raw probe and no flush to rows: it holds the
+	// window's eviction gate, which waits out every in-flight push and blocks new ones, so the ring
+	// and bounds are stable for the read (the stripe lock already excludes other non-push commands).
+	// A uniform-pivot LPOS over a large list scans about half the list, so keeping that scan at
+	// memory speed instead of one hash probe per position is what carries it past a contiguous
+	// listpack walk. A cold list has no window, so w is nil and every position falls to its row.
+	w := c.srv.listWinLookup(lkey)
+	if w != nil {
+		w.gate.Lock()
+		if w.evicted.Load() {
+			w.gate.Unlock()
+			w = nil
 		}
-		return
+	}
+	var head, tail int64
+	if w != nil {
+		head, tail = w.bounds()
+	} else {
+		var ok bool
+		head, tail, _, _, ok = c.listHeader(lkey)
+		if !ok {
+			mu.Unlock()
+			if count >= 0 {
+				c.writeArrayHeader(0)
+			} else {
+				c.writeNil()
+			}
+			return
+		}
 	}
 
 	// Direction and how many leading matches to skip come from the sign and magnitude of rank.
@@ -1188,7 +1225,10 @@ func (c *connState) cmdLPos(argv [][]byte) {
 	if backward {
 		skip = -rank - 1
 	}
-	matches := c.lposScan(lkey, target, head, tail, backward, skip, count, maxlen)
+	matches := c.lposScan(w, lkey, target, head, tail, backward, skip, count, maxlen)
+	if w != nil {
+		w.gate.Unlock()
+	}
 	mu.Unlock()
 
 	if count >= 0 {
@@ -1210,7 +1250,7 @@ func (c *connState) cmdLPos(argv [][]byte) {
 // stops when it has enough (want, where want <= 0 with a given COUNT means all) or when it has
 // compared maxlen elements (maxlen 0 disables the cap). The returned positions are external
 // indexes (offset from head), so they are already in the form the reply wants.
-func (c *connState) lposScan(lkey, target []byte, head, tail int64, backward bool, skip, want, maxlen int64) []int64 {
+func (c *connState) lposScan(w *listWindow, lkey, target []byte, head, tail int64, backward bool, skip, want, maxlen int64) []int64 {
 	var out []int64
 	var compared int64
 	step := int64(1)
@@ -1223,9 +1263,7 @@ func (c *connState) lposScan(lkey, target []byte, head, tail int64, backward boo
 		if maxlen > 0 && compared >= maxlen {
 			break
 		}
-		ek := c.listElemKey(lkey, pos)
-		v, found := c.srv.store.GetKind(ek, c.vbuf[:0], kindListElem)
-		c.vbuf = v
+		v, found := c.listElemRead(w, lkey, pos)
 		compared++
 		if found && string(v) == string(target) {
 			if skip > 0 {
