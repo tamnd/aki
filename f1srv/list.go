@@ -249,11 +249,14 @@ func (c *connState) pushThroughWindow(lkey []byte, atHead bool, elems [][]byte, 
 		baseLen = w.committedTail.Load() - oldHead
 		// LPUSH prepends each element in turn, so element i lands just below the old head: the run
 		// [e0..e_{n-1}] leaves the list [e_{n-1} .. e0, old...], which is element i at position
-		// start + (n-1-i), the same order the stripe-lock body produces by decrementing head.
+		// start + (n-1-i), the same order the stripe-lock body produces by decrementing head. The
+		// PutKind error is dropped because the loop above pre-screened every element against
+		// listElemFastMax (f1raw's max value size), so a fixed-size element key and an in-bounds
+		// value cannot fail the point publish; the stripe-lock fallback is what handles oversize.
 		for i, elem := range elems {
 			pos := start + (n - 1 - int64(i))
 			ek := c.listElemKey(lkey, pos)
-			c.srv.store.PutKind(ek, elem, kindListElem)
+			_, _ = c.srv.store.PutKind(ek, elem, kindListElem)
 			sumBytes += int64(listEntrySize(elem))
 		}
 		w.commitHead(start, n)
@@ -262,7 +265,7 @@ func (c *connState) pushThroughWindow(lkey []byte, atHead bool, elems [][]byte, 
 		baseLen = start - w.committedHead.Load()
 		for i, elem := range elems {
 			ek := c.listElemKey(lkey, start+int64(i))
-			c.srv.store.PutKind(ek, elem, kindListElem)
+			_, _ = c.srv.store.PutKind(ek, elem, kindListElem)
 			sumBytes += int64(listEntrySize(elem))
 		}
 		w.commitTail(start, n)
