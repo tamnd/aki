@@ -143,11 +143,13 @@ func (s *Store) PutKind(key, val []byte, kind byte) (created bool, err error) {
 func (s *Store) DeleteKind(key []byte, kind byte) bool {
 	h := hash(key)
 	for {
-		_, b, slot, word, found := s.find(key, h, kind)
+		off, b, slot, word, found := s.find(key, h, kind)
 		if !found {
 			return false
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
+			// A separated element's cold value is now unreferenced; account it as dead.
+			s.markSepDead(off)
 			s.count.Add(-1)
 			s.addTop(kind, -1)
 			return true
@@ -186,6 +188,9 @@ func (s *Store) TakeKind(key, dst []byte, kind byte) ([]byte, bool) {
 			v = s.readValue(off, dst)
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
+			// The popped element's cold value (a separated large list element) is now
+			// unreferenced; account it as dead space for a later compaction pass.
+			s.markSepDead(off)
 			s.count.Add(-1)
 			s.addTop(kind, -1)
 			return v, true
