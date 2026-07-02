@@ -82,11 +82,9 @@ func (c *connState) listElemKey(lkey []byte, pos int64) []byte {
 // pos and the f1raw element row otherwise. w may be nil (a cold list with no resident window), in
 // which case every position is a row. A scan uses this to read a hot list at memory speed: a
 // resident position is a plain ring-slot fetch with no hash probe, and only the pre-block seed
-// positions [preLo, preHi) still cost a row read. When w is non-nil the caller must hold w.gate,
-// either the shared RLock (LPOS, LRANGE, which read a hot key in parallel across cores) or the
-// exclusive Lock (an interior edit), so the ring and its live bounds stay put across the read; the
-// pre-block band only ever contracts under the gate, so a resident classification never turns stale
-// mid-read. The returned slice aliases the ring slot or the read buffer and is valid until the next
+// positions [preLo, preHi) still cost a row read. The caller must hold the key's stripe lock, and
+// additionally w.gate.Lock when w is non-nil, so the ring and its live bounds stay put across the
+// read. The returned slice aliases the ring slot or the read buffer and is valid until the next
 // read reuses that buffer, which is the same contract the row-only scan already relied on.
 func (c *connState) listElemRead(w *listWindow, lkey []byte, pos int64) ([]byte, bool) {
 	if w != nil && w.resident(pos) {
@@ -1195,12 +1193,24 @@ func (c *connState) cmdLPos(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	// Resident positions live only in the ring, so flush the window to rows before the scan reads
-	// element rows (slice 3). The evict needs the exclusive stripe lock this command holds.
-	c.listWinDrainEvict(lkey)
-	head, tail, _, _, ok := c.listHeader(lkey)
-	if !ok {
-		mu.Unlock()
+	// Scan the list in place. When the list is hot its elements live in the resident ring, so the
+	// scan reads them straight from ring slots with no f1raw probe and no flush to rows: it holds the
+	// window's eviction gate, which waits out every in-flight push and blocks new ones, so the ring
+	// and bounds are stable for the read (the stripe lock already excludes other non-push commands).
+	// A uniform-pivot LPOS over a large list scans about half the list, so keeping that scan at
+	// memory speed instead of one hash probe per position is what carries it past a contiguous
+	// listpack walk. A cold list has no window, so w is nil and every position falls to its row.
+	w := c.srv.listWinLookup(lkey)
+	if w != nil {
+		w.gate.Lock()
+		if w.evicted.Load() {
+			w.gate.Unlock()
+			w = nil
+		}
+	}
+	var head, tail int64
+	if w != nil {
+		head, tail = w.bounds()
 	} else {
 		var ok bool
 		head, tail, _, _, ok = c.listHeader(lkey)
@@ -1223,10 +1233,9 @@ func (c *connState) cmdLPos(argv [][]byte) {
 	}
 	matches := c.lposScan(w, lkey, target, head, tail, backward, skip, count, maxlen)
 	if w != nil {
-		w.gate.RUnlock()
-	} else {
-		mu.Unlock()
+		w.gate.Unlock()
 	}
+	mu.Unlock()
 
 	if count >= 0 {
 		c.writeArrayHeader(len(matches))
@@ -1242,55 +1251,33 @@ func (c *connState) cmdLPos(argv [][]byte) {
 	c.writeInt(matches[0])
 }
 
-// lposScan walks the window in the search direction, collecting the dense positions of the elements
-// equal to target after skipping the first skip of them. It stops when it has enough (want, where
-// want <= 0 with a given COUNT means all) or once it has examined maxlen positions (maxlen 0 disables
-// the cap). The returned positions are external indexes (offset from head), the form the reply wants.
-//
-// For a hot list the resident positions are scanned through the ring's signature array: bytes.Index
-// rules out every position whose one-byte signature cannot match the target, so a full byte compare
-// runs only at the rare signature hit instead of once per position. That is what carries a large-list
-// LPOS past a contiguous listpack walk, where the per-position pointer chase of the raw ring could
-// not. The small pre-block band still reads its f1raw rows one position at a time. A cold list has no
-// window (w is nil) and falls entirely to row reads.
+// lposScan walks the window in the search direction, comparing each element to target and
+// collecting the dense positions of the matches after skipping the first skip of them. It
+// stops when it has enough (want, where want <= 0 with a given COUNT means all) or when it has
+// compared maxlen elements (maxlen 0 disables the cap). The returned positions are external
+// indexes (offset from head), so they are already in the form the reply wants.
 func (c *connState) lposScan(w *listWindow, lkey, target []byte, head, tail int64, backward bool, skip, want, maxlen int64) []int64 {
-	// Clamp the examined range to at most maxlen positions from the scan's starting end, which is
-	// exactly LPOS MAXLEN: a match past that many positions is not reported.
-	eLo, eHi := head, tail
-	if maxlen > 0 {
-		if backward {
-			if eHi-maxlen > eLo {
-				eLo = eHi - maxlen
-			}
-		} else {
-			if eLo+maxlen < eHi {
-				eHi = eLo + maxlen
-			}
-		}
-	}
-
 	var out []int64
-	// emit records a confirmed match after honoring the skip prefix and reports whether the scan has
-	// collected enough to stop. want < 0 is single-match mode, want == 0 (COUNT 0) is all matches.
-	emit := func(pos int64) bool {
-		if skip > 0 {
-			skip--
-			return false
-		}
-		out = append(out, pos-head)
-		return want < 0 || (want > 0 && int64(len(out)) >= want)
+	var compared int64
+	step := int64(1)
+	pos := head
+	if backward {
+		step = -1
+		pos = tail - 1
 	}
-
-	if w == nil {
-		if backward {
-			for pos := eHi - 1; pos >= eLo; pos-- {
-				if v, found := c.listElemRead(nil, lkey, pos); found && string(v) == string(target) && emit(pos) {
-					break
-				}
-			}
-		} else {
-			for pos := eLo; pos < eHi; pos++ {
-				if v, found := c.listElemRead(nil, lkey, pos); found && string(v) == string(target) && emit(pos) {
+	for pos >= head && pos < tail {
+		if maxlen > 0 && compared >= maxlen {
+			break
+		}
+		v, found := c.listElemRead(w, lkey, pos)
+		compared++
+		if found && string(v) == string(target) {
+			if skip > 0 {
+				skip--
+			} else {
+				out = append(out, pos-head)
+				// want < 0 means single-match mode: one is enough. want == 0 means all matches.
+				if want < 0 || (want > 0 && int64(len(out)) >= want) {
 					break
 				}
 			}
