@@ -1027,7 +1027,7 @@ func (c *connState) cmdXSetID(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	length, lastID, maxDel, addedNow, exists := c.streamHeader(skey)
+	length, _, maxDel, addedNow, exists := c.streamHeader(skey)
 	if !exists {
 		mu.Unlock()
 		c.writeErr(errStreamNoSuchKey)
@@ -1040,7 +1040,7 @@ func (c *connState) cmdXSetID(argv [][]byte) {
 			return
 		}
 	}
-	lastID = newLast
+	lastID := newLast
 	if setEntriesAdded {
 		addedNow = entriesAdded
 	}

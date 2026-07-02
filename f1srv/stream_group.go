@@ -1114,7 +1114,7 @@ func (cc *claimCtx) claimOne(id streamID, target *streamConsumer, targetName str
 		} else if !justid {
 			existing.deliveryCount++
 		}
-		c.putStreamPEL(cc.skey, cc.group, id, existing)
+		_ = c.putStreamPEL(cc.skey, cc.group, id, existing)
 		return true, existing
 	}
 
@@ -1129,7 +1129,7 @@ func (cc *claimCtx) claimOne(id streamID, target *streamConsumer, targetName str
 	if retry >= 0 {
 		np.deliveryCount = uint64(retry)
 	}
-	c.putStreamPEL(cc.skey, cc.group, id, np)
+	_ = c.putStreamPEL(cc.skey, cc.group, id, np)
 	cc.g.pending++
 	cc.gDirty = true
 	target.pending++
