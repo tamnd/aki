@@ -307,6 +307,105 @@ func TestListWindowConcurrentPop(t *testing.T) {
 	}
 }
 
+// writePop queues one no-count LPOP or RPOP into the writer without flushing, so a caller can pack
+// several into one buffer and flush once, landing them in a single server drain where drainPop
+// folds them into one window claim. This is the shape the test needs and cmd (which flushes every
+// command) cannot express.
+func writePop(t *testing.T, rw *bufio.ReadWriter, verb, key string) {
+	t.Helper()
+	rw.WriteString("*2\r\n$")
+	rw.WriteString(itoa(len(verb)))
+	rw.WriteString("\r\n")
+	rw.WriteString(verb)
+	rw.WriteString("\r\n$")
+	rw.WriteString(itoa(len(key)))
+	rw.WriteString("\r\n")
+	rw.WriteString(key)
+	rw.WriteString("\r\n")
+}
+
+// TestListWindowPipelinePopDifferential sends pipelines of no-count LPOP and RPOP against a hot key
+// in one flush each, so the whole run lands in a single drain and takes the coalesced drainPop
+// path, then checks every reply and the surviving list against a reference deque. The pipeline
+// depth is chosen to sometimes exceed the live length, which drives the coalesced claim's
+// near-empty bail into the per-command replay, and occasional refills keep the window admitted, so
+// the run exercises both the fast fold on a populated list and the fallback as the list drains and
+// past empty. A divergence would show as a wrong popped element, a missing or extra nil, or a
+// surviving list that does not match.
+func TestListWindowPipelinePopDifferential(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	const key = "p"
+	var model []string
+	rng := rand.New(rand.NewSource(0x900df00d))
+	full := func() []string { return lrangeCall(t, rw, "LRANGE", key, "0", "-1") }
+
+	seq := 0
+	// Seed enough that the window admits (the second push sees the list exist) and the first
+	// pipelines run on a populated list.
+	for i := 0; i < 200; i++ {
+		seq++
+		v := "s" + itoa(seq)
+		cmd(t, rw, "RPUSH", key, v)
+		expect(t, rw, ":"+itoa(i+1))
+		model = append(model, v)
+	}
+
+	const rounds = 2000
+	for r := 0; r < rounds; r++ {
+		switch rng.Intn(5) {
+		case 0: // refill a small run so the list does not stay drained
+			m := 1 + rng.Intn(6)
+			args := []string{"RPUSH", key}
+			for i := 0; i < m; i++ {
+				seq++
+				v := "r" + itoa(seq)
+				args = append(args, v)
+				model = append(model, v)
+			}
+			cmd(t, rw, args...)
+			expect(t, rw, ":"+itoa(len(model)))
+		default: // a pipeline of pops, all the same end, in one flush
+			atHead := rng.Intn(2) == 0
+			verb := "RPOP"
+			if atHead {
+				verb = "LPOP"
+			}
+			d := 1 + rng.Intn(20)
+			for i := 0; i < d; i++ {
+				writePop(t, rw, verb, key)
+			}
+			if err := rw.Flush(); err != nil {
+				t.Fatalf("round %d flush: %v", r, err)
+			}
+			for i := 0; i < d; i++ {
+				got := readReply(t, rw)
+				if len(model) == 0 {
+					if got != "$-1" {
+						t.Fatalf("round %d pop %d on empty: got %q, want $-1", r, i, got)
+					}
+					continue
+				}
+				var want string
+				if atHead {
+					want = model[0]
+					model = model[1:]
+				} else {
+					want = model[len(model)-1]
+					model = model[:len(model)-1]
+				}
+				if got != "$"+want {
+					t.Fatalf("round %d pop %d: got %q, want %q", r, i, got, "$"+want)
+				}
+			}
+		}
+		if got := full(); !eqStrs(got, model) {
+			t.Fatalf("round %d: server %v != model %v", r, got, model)
+		}
+	}
+}
+
 // trimModel mirrors LTRIM on the reference deque: negative indexes count from the end, the range
 // is clamped, and an inverted range empties the list. It matches Redis's LTRIM so the model tracks
 // the server through the evicting path LTRIM takes.

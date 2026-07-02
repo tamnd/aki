@@ -671,14 +671,22 @@ func (c *connState) popThroughWindow(lkey []byte, atHead, hasCount bool, want in
 		w.gate.RUnlock()
 		return false
 	}
-	n := hi - lo
 	if hasCount {
-		c.writeArrayHeader(int(n))
+		c.writeArrayHeader(int(hi - lo))
 	}
-	// LPOP returns elements head-outward (positions lo, lo+1, ...); RPOP returns them tail-inward
-	// (hi-1, hi-2, ...). Each row is taken off the stripe lock and copied into the reply by
-	// writeBulk before the next take reuses vbuf, so no per-element buffer is held.
-	var sumBytes int64
+	sumBytes := c.writePoppedRun(lkey, atHead, lo, hi)
+	w.addBytes(-sumBytes)
+	w.gate.RUnlock()
+	return true
+}
+
+// writePoppedRun takes each row in the claimed half-open run [lo, hi) off the stripe lock and
+// writes it as one bulk reply, returning the total entry bytes so the caller can shrink the
+// window's running size in one addBytes. LPOP returns elements head-outward (positions lo, lo+1,
+// ...); RPOP returns them tail-inward (hi-1, hi-2, ...). Each row is copied into the reply by
+// writeBulk before the next take reuses vbuf, so no per-element buffer is held. It is the shared
+// body of the single-command popThroughWindow and the coalesced popThroughWindowRun.
+func (c *connState) writePoppedRun(lkey []byte, atHead bool, lo, hi int64) (sumBytes int64) {
 	if atHead {
 		for pos := lo; pos < hi; pos++ {
 			ek := c.listElemKey(lkey, pos)
@@ -696,6 +704,34 @@ func (c *connState) popThroughWindow(lkey []byte, atHead, hasCount bool, want in
 			c.writeBulk(v)
 		}
 	}
+	return sumBytes
+}
+
+// popThroughWindowRun serves a run of n no-count pops off the resident hot-list window in one
+// bound bump, then writes one bulk reply per popped element. It is the coalesced form of
+// popThroughWindow: the drain loop counts a pipeline's consecutive same-key, same-end LPOP or RPOP
+// commands from one connection and folds them here so the window's commit mutex is taken once for
+// the whole run instead of once per pop, the piece that lets a pop burst on one hot key use more
+// than one core. It returns false, leaving the caller to replay the run one command at a time,
+// whenever popRun cannot serve the whole run off-lock (no window resident, a push is mid-flight, or
+// the run would drain the list). A resident window means the key is already a list, so no WRONGTYPE
+// check is needed, exactly as popThroughWindow and the push fast path omit it.
+func (c *connState) popThroughWindowRun(lkey []byte, atHead bool, n int64) bool {
+	w := c.srv.listWinLookup(lkey)
+	if w == nil {
+		return false
+	}
+	w.gate.RLock()
+	if w.evicted.Load() {
+		w.gate.RUnlock()
+		return false
+	}
+	lo, hi, ok := w.popRun(atHead, n)
+	if !ok {
+		w.gate.RUnlock()
+		return false
+	}
+	sumBytes := c.writePoppedRun(lkey, atHead, lo, hi)
 	w.addBytes(-sumBytes)
 	w.gate.RUnlock()
 	return true
