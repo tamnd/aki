@@ -238,10 +238,11 @@ func (c *connState) admitListWindow(lkey []byte, head, tail int64, lpBytes uint6
 }
 
 // pushThroughWindow is the lock-free append fast path. When a hot-list window is resident it claims
-// the run's positions with one atomic bump of the reserved bound, writes the N element rows off the
-// stripe lock through f1raw's lock-free publish, then advances the committed bound in reservation
-// order, so many connections append to one hot key in parallel instead of serializing on its stripe
-// mutex. It returns false when no window is resident (the cold-key path admits one) or when the run
+// the run's positions with one atomic bump of the reserved bound, fills the N element bytes into the
+// resident ring off the stripe lock, then advances the committed bound in reservation order, so many
+// connections append to one hot key in parallel instead of serializing on its stripe mutex. No f1raw
+// row is written for a resident position (slice 3, impl/34): the ring is the only store for a
+// lock-free push, pop reads it with no hash probe, and drainEvict flushes survivors to rows on retire. It returns false when no window is resident (the cold-key path admits one) or when the run
 // carries an over-limit element (the stripe-lock body reports that error), leaving the caller to run
 // its stripe-lock body. bnd carries the per-command cumulative element counts for a coalesced run;
 // a nil bnd is a single command that replies one integer, the final length. The reply length is the
@@ -272,16 +273,14 @@ func (c *connState) pushThroughWindow(lkey []byte, atHead bool, elems [][]byte, 
 		// [e0..e_{n-1}] leaves the list [e_{n-1} .. e0, old...], which is element i at position
 		// start + (n-1-i), the same order the stripe-lock body produces by decrementing head. posElems
 		// is the run in position order (posElems[j] is the element at start+j), the reverse of the push
-		// order, so the ring fill in commitHead can index it by offset. The PutKind error is dropped
-		// because the loop above pre-screened every element against listElemFastMax (f1raw's max value
-		// size), so a fixed-size element key and an in-bounds value cannot fail the point publish; the
-		// stripe-lock fallback is what handles oversize.
+		// order, so the ring fill in commitHead can index it by offset. No f1raw row is written here:
+		// a lock-free push lands its bytes only in the resident ring (commitHead fills it), and pop
+		// reads them straight from the ring with no hash probe. drainEvict flushes the surviving
+		// resident bytes to rows on retire, so durability and recovery are unchanged (slice 3, impl/34).
 		posElems := make([][]byte, n)
 		for i, elem := range elems {
 			pos := start + (n - 1 - int64(i))
 			posElems[pos-start] = elem
-			ek := c.listElemKey(lkey, pos)
-			_, _ = c.srv.store.PutKind(ek, elem, kindListElem)
 			sumBytes += int64(listEntrySize(elem))
 		}
 		w.commitHead(start, n, posElems)
@@ -289,10 +288,9 @@ func (c *connState) pushThroughWindow(lkey []byte, atHead bool, elems [][]byte, 
 		start := w.reserveTail(n)
 		baseLen = start - w.committedHead.Load()
 		// RPUSH appends in order, so element i lands at start+i and elems is already in position
-		// order; it doubles as posElems for the ring fill in commitTail.
-		for i, elem := range elems {
-			ek := c.listElemKey(lkey, start+int64(i))
-			_, _ = c.srv.store.PutKind(ek, elem, kindListElem)
+		// order; it doubles as posElems for the ring fill in commitTail. No f1raw row is written: the
+		// bytes land only in the resident ring, and pop reads them from there (slice 3, impl/34).
+		for _, elem := range elems {
 			sumBytes += int64(listEntrySize(elem))
 		}
 		w.commitTail(start, n, elems)
@@ -672,53 +670,98 @@ func (c *connState) popThroughWindow(lkey []byte, atHead, hasCount bool, want in
 		w.gate.RUnlock()
 		return false
 	}
-	lo, hi, ok := w.popRun(atHead, want)
-	if !ok {
-		w.gate.RUnlock()
+	ok := c.popEmitWindow(w, lkey, atHead, hasCount, want)
+	w.gate.RUnlock()
+	return ok
+}
+
+// popEmitWindow claims a run of want positions from a committed end of the window and emits each as
+// one bulk reply, all under the window's commit mutex, the single critical section slice 3 relies on
+// for correctness. It is the pop-side mirror of the reserve-then-fill push path (impl/33), rewritten
+// so the element bytes come from the resident ring instead of an f1raw hash probe, which is what
+// removes the measured 36% find (impl/34). hasCount writes the array header for the count form; the
+// no-count form writes a bare bulk. It returns false, sending the caller to the stripe-lock pop,
+// when the pop is unsafe off-lock, in the same two cases the old popRun rejected:
+//
+//   - A push is mid-flight (a reserved bound sits ahead of its committed bound). The push commit
+//     ordering (pendHead, pendTail) assumes a bound moves one direction only, so a pop that moved
+//     the same bound the other way could strand a pending run.
+//   - The pop would empty or underflow the list (want >= live). The emptying-to-header-delete
+//     transition and any head/tail crossing belong to the stripe path, which owns deleting the key.
+//
+// Why the whole emit runs under w.mu, not just the claim: a concurrent push's commit grows the ring
+// by rehashing only the live range [committedHead, committedTail). Once this pop advances the
+// committed bound past the claimed run, those positions fall outside the live range, so a racing
+// grow would drop their slots. Reading (and resetting) the ring slots in the same w.mu section that
+// advanced the bound keeps the read ahead of any grow, so a plain non-atomic ring is safe. writeBulk
+// copies the bytes into the reply buffer, so nothing aliases a slot after the mutex is released.
+//
+// A pre-block position (one still backed by an f1raw row from the admitting push) is taken through
+// TakeKindNoCount, so the store's shared record counter is touched once per run in a single AddCount
+// rather than per element, keeping that contended line off the per-element path. Resident positions
+// were never counted (their push skipped PutKind), so they owe no count adjustment.
+func (c *connState) popEmitWindow(w *listWindow, lkey []byte, atHead, hasCount bool, want int64) bool {
+	if want <= 0 {
 		return false
+	}
+	w.mu.Lock()
+	ch := w.committedHead.Load()
+	ct := w.committedTail.Load()
+	if w.reservedHead.Load() != ch || w.reservedTail.Load() != ct {
+		w.mu.Unlock()
+		return false
+	}
+	if want >= ct-ch {
+		w.mu.Unlock()
+		return false
+	}
+	var lo, hi int64
+	if atHead {
+		lo = ch
+		hi = ch + want
+		w.committedHead.Store(hi)
+		w.reservedHead.Store(hi)
+	} else {
+		hi = ct
+		lo = ct - want
+		w.committedTail.Store(lo)
+		w.reservedTail.Store(lo)
 	}
 	if hasCount {
 		c.writeArrayHeader(int(hi - lo))
 	}
-	sumBytes := c.writePoppedRun(lkey, atHead, lo, hi)
-	w.addBytes(-sumBytes)
-	w.gate.RUnlock()
-	return true
-}
-
-// writePoppedRun takes each row in the claimed half-open run [lo, hi) off the stripe lock and
-// writes it as one bulk reply, returning the total entry bytes so the caller can shrink the
-// window's running size in one addBytes. LPOP returns elements head-outward (positions lo, lo+1,
-// ...); RPOP returns them tail-inward (hi-1, hi-2, ...). Each row is copied into the reply by
-// writeBulk before the next take reuses vbuf, so no per-element buffer is held. It is the shared
-// body of the single-command popThroughWindow and the coalesced popThroughWindowRun.
-//
-// The rows come off through TakeKindNoCount, so the store's shared record counter is left alone
-// per element and folded into one AddCount for the whole run. That counter is a single line every
-// connection's push and pop touch, so charging it once per popped element would put a contended
-// atomic back on the per-element path that the window claim just took off the commit mutex.
-// List element rows are never top-level, so no topCount adjustment is owed. The run is under the
-// window's gate, the same serialization TakeKind and AddCount both require.
-func (c *connState) writePoppedRun(lkey []byte, atHead bool, lo, hi int64) (sumBytes int64) {
-	if atHead {
-		for pos := lo; pos < hi; pos++ {
-			ek := c.listElemKey(lkey, pos)
-			v, _ := c.srv.store.TakeKindNoCount(ek, c.vbuf[:0], kindListElem)
-			c.vbuf = v
+	var sumBytes, preCount int64
+	emit := func(pos int64) {
+		if w.resident(pos) {
+			v := w.ring.get(pos)
 			sumBytes += int64(listEntrySize(v))
 			c.writeBulk(v)
+			w.ring.reset(pos)
+			return
+		}
+		ek := c.listElemKey(lkey, pos)
+		v, _ := c.srv.store.TakeKindNoCount(ek, c.vbuf[:0], kindListElem)
+		c.vbuf = v
+		sumBytes += int64(listEntrySize(v))
+		c.writeBulk(v)
+		preCount++
+	}
+	// LPOP returns elements head-outward (positions lo, lo+1, ...); RPOP returns them tail-inward.
+	if atHead {
+		for pos := lo; pos < hi; pos++ {
+			emit(pos)
 		}
 	} else {
 		for pos := hi - 1; pos >= lo; pos-- {
-			ek := c.listElemKey(lkey, pos)
-			v, _ := c.srv.store.TakeKindNoCount(ek, c.vbuf[:0], kindListElem)
-			c.vbuf = v
-			sumBytes += int64(listEntrySize(v))
-			c.writeBulk(v)
+			emit(pos)
 		}
 	}
-	c.srv.store.AddCount(-(hi - lo))
-	return sumBytes
+	w.mu.Unlock()
+	if preCount > 0 {
+		c.srv.store.AddCount(-preCount)
+	}
+	w.addBytes(-sumBytes)
+	return true
 }
 
 // popThroughWindowRun serves a run of n no-count pops off the resident hot-list window in one
@@ -727,28 +770,18 @@ func (c *connState) writePoppedRun(lkey []byte, atHead bool, lo, hi int64) (sumB
 // commands from one connection and folds them here so the window's commit mutex is taken once for
 // the whole run instead of once per pop, the piece that lets a pop burst on one hot key use more
 // than one core. It returns false, leaving the caller to replay the run one command at a time,
-// whenever popRun cannot serve the whole run off-lock (no window resident, a push is mid-flight, or
-// the run would drain the list). A resident window means the key is already a list, so no WRONGTYPE
-// check is needed, exactly as popThroughWindow and the push fast path omit it.
+// whenever the run cannot be served off-lock (no window resident, a push is mid-flight, or the run
+// would drain the list). A resident window means the key is already a list, so no WRONGTYPE check
+// is needed, exactly as popThroughWindow and the push fast path omit it.
 func (c *connState) popThroughWindowRun(lkey []byte, atHead bool, n int64) bool {
 	w := c.srv.listWinLookup(lkey)
 	if w == nil {
 		return false
 	}
 	w.gate.RLock()
-	if w.evicted.Load() {
-		w.gate.RUnlock()
-		return false
-	}
-	lo, hi, ok := w.popRun(atHead, n)
-	if !ok {
-		w.gate.RUnlock()
-		return false
-	}
-	sumBytes := c.writePoppedRun(lkey, atHead, lo, hi)
-	w.addBytes(-sumBytes)
+	ok := !w.evicted.Load() && c.popEmitWindow(w, lkey, atHead, false, n)
 	w.gate.RUnlock()
-	return true
+	return ok
 }
 
 // cmdPop is the shared body for LPOP (atHead) and RPOP (atTail). Without a count it returns
@@ -959,32 +992,22 @@ func (c *connState) cmdLRange(argv [][]byte) {
 		return
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
+	// A resident push leaves element bytes only in the ring, so LRANGE retires the window first to
+	// flush every resident position to its f1raw row, which needs the exclusive stripe lock. That
+	// gives up the shared-reader concurrency the pre-slice-3 LRANGE had; slice 4 makes the read
+	// resident-first off the window and restores the shared lock. For now correctness comes first.
 	mu.Lock()
 	if c.stringConflict(lkey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
 	}
-	w := c.srv.listWinLookup(lkey)
-	if w != nil {
-		w.gate.RLock()
-		if w.evicted.Load() {
-			w.gate.RUnlock()
-			w = nil
-		}
-	}
-	var head, tail int64
-	if w != nil {
-		head, tail = w.bounds()
+	c.listWinDrainEvict(lkey)
+	head, tail, _, _, ok := c.listHeader(lkey)
+	if !ok {
 		mu.Unlock()
-	} else {
-		var ok bool
-		head, tail, _, _, ok = c.listHeader(lkey)
-		if !ok {
-			mu.Unlock()
-			c.writeArrayHeader(0)
-			return
-		}
+		c.writeArrayHeader(0)
+		return
 	}
 	n := tail - head
 	if start < 0 {
@@ -1000,11 +1023,7 @@ func (c *connState) cmdLRange(argv [][]byte) {
 		stop = n - 1
 	}
 	if start > stop || start >= n {
-		if w != nil {
-			w.gate.RUnlock()
-		} else {
-			mu.Unlock()
-		}
+		mu.Unlock()
 		c.writeArrayHeader(0)
 		return
 	}
@@ -1013,11 +1032,7 @@ func (c *connState) cmdLRange(argv [][]byte) {
 		v, _ := c.listElemRead(w, lkey, head+i)
 		c.writeBulk(v)
 	}
-	if w != nil {
-		w.gate.RUnlock()
-	} else {
-		mu.Unlock()
-	}
+	mu.Unlock()
 }
 
 // cmdLSet implements LSET: it overwrites the element at a signed index with a new value, an
@@ -1148,6 +1163,9 @@ func (c *connState) cmdLPos(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	// Resident positions live only in the ring, so flush the window to rows before the scan reads
+	// element rows (slice 3). The evict needs the exclusive stripe lock this command holds.
+	c.listWinDrainEvict(lkey)
 	head, tail, _, _, ok := c.listHeader(lkey)
 	if !ok {
 		mu.Unlock()
