@@ -666,142 +666,39 @@ func (c *connState) popThroughWindow(lkey []byte, atHead, hasCount bool, want in
 		w.gate.RUnlock()
 		return false
 	}
-	ok := c.popEmitWindow(w, lkey, atHead, hasCount, want)
-	w.gate.RUnlock()
-	return ok
-}
-
-// popEmitWindow claims a run of want positions from a committed end of the window and emits each as
-// one bulk reply, all under the window's commit mutex, the single critical section slice 3 relies on
-// for correctness. It is the pop-side mirror of the reserve-then-fill push path (impl/33), rewritten
-// so the element bytes come from the resident ring instead of an f1raw hash probe, which is what
-// removes the measured 36% find (impl/34). hasCount writes the array header for the count form; the
-// no-count form writes a bare bulk. It returns false, sending the caller to the stripe-lock pop,
-// when the pop is unsafe off-lock, in the same two cases the old popRun rejected:
-//
-//   - A reserved bound sits ahead of its committed bound. Fused appends keep the two equal, so this
-//     never trips for a concurrent push, but the guard stays as a cheap invariant check: a pop only
-//     claims a run when the window's reserved and committed bounds agree at both ends.
-//   - The pop would empty or underflow the list (want >= live). The emptying-to-header-delete
-//     transition and any head/tail crossing belong to the stripe path, which owns deleting the key.
-//
-// The critical section is the claim, not the emit: under w.mu the pop validates the bounds, advances
-// the committed end past the run, and detaches each claimed element's bytes into a per-connection
-// scratch (c.popBufs), then releases the mutex and does all RESP framing (the array header plus one
-// writeBulk per element) off-lock. That split is what lets many connections popping the SAME hot key
-// use more than one core: the RESP framing (integer-to-ASCII length, the $-len-CRLF wrapper, the byte
-// copy into the reply buffer) is the dominant per-op cost, and holding w.mu across it serialized
-// every popper on this key. Advancing the bound is O(1), so the mutex is now held for O(run) pointer
-// moves instead of O(run) framings.
-//
-// Detaching is what makes the off-lock emit race-free. A resident slot is taken with ring.takeSlot,
-// which nils the slot, so the returned slice is sole-owned: a concurrent push cannot alias it (push
-// only writes slots inside the live [committedHead, committedTail) span, and the claimed run now sits
-// outside that span) and a concurrent grow cannot drop it (grow rehashes only the live span by
-// reference). A pre-block position (still backed by an f1raw row from the admitting push) is taken
-// with TakeKindNoCount into a freshly allocated buffer, not the shared c.vbuf, because popBufs holds
-// every claimed slice across the whole run and a shared buffer would let each take clobber the last.
-// TakeKindNoCount leaves the store's shared record counter untouched so it is adjusted once per run in
-// a single AddCount after the lock, rather than per element on the contended line; resident positions
-// were never counted (their push skipped PutKind), so they owe no count adjustment.
-func (c *connState) popEmitWindow(w *listWindow, lkey []byte, atHead, hasCount bool, want int64) bool {
-	if want <= 0 {
+	lo, hi, ok := w.popRun(atHead, want)
+	if !ok {
+		w.gate.RUnlock()
 		return false
 	}
-	w.mu.Lock()
-	ch := w.committedHead.Load()
-	ct := w.committedTail.Load()
-	if w.reservedHead.Load() != ch || w.reservedTail.Load() != ct {
-		w.mu.Unlock()
-		return false
+	n := hi - lo
+	if hasCount {
+		c.writeArrayHeader(int(n))
 	}
-	if want >= ct-ch {
-		w.mu.Unlock()
-		return false
-	}
-	var lo, hi int64
-	if atHead {
-		lo = ch
-		hi = ch + want
-		w.committedHead.Store(hi)
-		w.reservedHead.Store(hi)
-	} else {
-		hi = ct
-		lo = ct - want
-		w.committedTail.Store(lo)
-		w.reservedTail.Store(lo)
-	}
-	// Claim each element's bytes into popBufs in emission order. Resident slots are detached (nil'd)
-	// so the captured slice survives a concurrent push or grow; pre-block rows are taken into a fresh
-	// buffer so popBufs entries never alias one another.
-	buf := c.popBufs[:0]
-	var sumBytes, preCount int64
-	claim := func(pos int64) {
-		if w.resident(pos) {
-			v := w.ring.takeSlot(pos)
-			sumBytes += int64(listEntrySize(v))
-			buf = append(buf, v)
-			return
-		}
-		ek := c.listElemKey(lkey, pos)
-		v, _ := c.srv.store.TakeKindNoCount(ek, nil, kindListElem)
-		sumBytes += int64(listEntrySize(v))
-		buf = append(buf, v)
-		preCount++
-	}
-	// LPOP returns elements head-outward (positions lo, lo+1, ...); RPOP returns them tail-inward.
+	// LPOP returns elements head-outward (positions lo, lo+1, ...); RPOP returns them tail-inward
+	// (hi-1, hi-2, ...). Each row is taken off the stripe lock and copied into the reply by
+	// writeBulk before the next take reuses vbuf, so no per-element buffer is held.
+	var sumBytes int64
 	if atHead {
 		for pos := lo; pos < hi; pos++ {
-			claim(pos)
+			ek := c.listElemKey(lkey, pos)
+			v, _ := c.srv.store.TakeKind(ek, c.vbuf[:0], kindListElem)
+			c.vbuf = v
+			sumBytes += int64(listEntrySize(v))
+			c.writeBulk(v)
 		}
 	} else {
 		for pos := hi - 1; pos >= lo; pos-- {
-			claim(pos)
+			ek := c.listElemKey(lkey, pos)
+			v, _ := c.srv.store.TakeKind(ek, c.vbuf[:0], kindListElem)
+			c.vbuf = v
+			sumBytes += int64(listEntrySize(v))
+			c.writeBulk(v)
 		}
 	}
-	// The claim loop has read every popped position at its pre-contraction classification, so it is
-	// now safe to walk the pre-block band inward to the bound this pop just advanced. That keeps a
-	// position re-pushed into a freed seed number reading from the ring the push filled it in, not
-	// from the row this pop deleted.
-	if atHead {
-		w.contractPreblock(true, hi)
-	} else {
-		w.contractPreblock(false, lo)
-	}
-	w.mu.Unlock()
-	c.popBufs = buf
-	// Frame the claimed bytes off-lock. popBufs is already in emission order for both ends.
-	if hasCount {
-		c.writeArrayHeader(len(buf))
-	}
-	for _, v := range buf {
-		c.writeBulk(v)
-	}
-	if preCount > 0 {
-		c.srv.store.AddCount(-preCount)
-	}
 	w.addBytes(-sumBytes)
-	return true
-}
-
-// popThroughWindowRun serves a run of n no-count pops off the resident hot-list window in one
-// bound bump, then writes one bulk reply per popped element. It is the coalesced form of
-// popThroughWindow: the drain loop counts a pipeline's consecutive same-key, same-end LPOP or RPOP
-// commands from one connection and folds them here so the window's commit mutex is taken once for
-// the whole run instead of once per pop, the piece that lets a pop burst on one hot key use more
-// than one core. It returns false, leaving the caller to replay the run one command at a time,
-// whenever the run cannot be served off-lock (no window resident, a push is mid-flight, or the run
-// would drain the list). A resident window means the key is already a list, so no WRONGTYPE check
-// is needed, exactly as popThroughWindow and the push fast path omit it.
-func (c *connState) popThroughWindowRun(lkey []byte, atHead bool, n int64) bool {
-	w := c.srv.listWinLookup(lkey)
-	if w == nil {
-		return false
-	}
-	w.gate.RLock()
-	ok := !w.evicted.Load() && c.popEmitWindow(w, lkey, atHead, false, n)
 	w.gate.RUnlock()
-	return ok
+	return true
 }
 
 // cmdPop is the shared body for LPOP (atHead) and RPOP (atTail). Without a count it returns
@@ -839,23 +736,6 @@ func (c *connState) cmdPop(argv [][]byte, atHead bool) {
 	// a single atomic load when no list is hot, and bails to the stripe path below when the pop is
 	// near-empty or racing a push, so a cold key or a draining tail falls straight through.
 	if c.popThroughWindow(lkey, atHead, hasCount, count) {
-		return
-	}
-	// Lock-free empty/missing fast path. A drained queue that many connections keep polling would
-	// otherwise serialize every nil-returning pop on the key's stripe mutex: 512 pollers each take
-	// the exclusive lock only to observe the key is gone and reply nil, and that single mutex caps
-	// the whole workload at one core. popThroughWindow already returned false, so there is no
-	// resident window to serve, and resolveType reads through f1raw's lock-free index alone. Seeing
-	// nothing means the list was empty at this instant, so each poller answers its own nil in
-	// parallel. It is linearizable: a later push that recreates the key is ordered after this reply,
-	// exactly as a stripe-locked miss would order it. resolveType may leave scratch in c.vbuf, which
-	// is fine because this branch returns without touching a held element.
-	if c.resolveType(lkey) == keyMissing {
-		if hasCount {
-			c.writeNilArray()
-		} else {
-			c.writeNil()
-		}
 		return
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
