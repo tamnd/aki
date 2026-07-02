@@ -478,8 +478,10 @@ func (c *connState) execCommand(argv [][]byte) {
 		c.writeInt(int64(c.srv.store.TopLen()))
 	case eqFold(cmd, "CLIENT"):
 		c.cmdClient(argv)
-	case eqFold(cmd, "SELECT") || eqFold(cmd, "CONFIG"):
+	case eqFold(cmd, "SELECT"):
 		c.writeSimple("OK")
+	case eqFold(cmd, "CONFIG"):
+		c.cmdConfig(argv)
 	case eqFold(cmd, "CLUSTER"):
 		c.cmdCluster(argv)
 	case eqFold(cmd, "REPLICAOF"):
