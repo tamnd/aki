@@ -37,27 +37,6 @@ type listWindow struct {
 	// pendHead mirrors pendTail for the head end, mapping a finished head run's low end (the more
 	// negative bound, which is where the next-lower run continues from) to its high end.
 	pendHead map[int64]int64
-
-	// gate separates the lock-free push fast path from the rare command that must retire the
-	// window. A push takes gate.RLock across its reserve, element writes, and commit, so many
-	// pushes run in parallel; drainEvict takes gate.Lock, which waits out every in-flight push
-	// (so no reserved slot is left unpublished) and blocks new pushes from entering, then flushes
-	// the committed bounds to the persistent header row and marks the window evicted. This is the
-	// only coordination a push pays beyond its own reserve and commit, and it never contends
-	// unless a non-push command lands on the same hot key.
-	gate sync.RWMutex
-	// evicted latches true once drainEvict has retired this window. A push that took gate.RLock
-	// after a racing drainEvict set the flag but before it removed the map entry sees the flag and
-	// falls back to the stripe-lock path, which re-reads the freshly flushed header and re-admits.
-	evicted atomic.Bool
-
-	// lpBytes is the running listpack byte size, seeded from the header at admission and grown by
-	// each push run's element bytes. It is a single atomic line updated once per run (not per
-	// element), so it is off the per-element path; the everLarge sticky bit latches when it first
-	// crosses the byte budget. Reads that need the size or the encoding take these from the window
-	// when it is resident, since the header row is stale until the window flushes.
-	lpBytes   atomic.Int64
-	everLarge atomic.Bool
 }
 
 // newListWindow starts an empty window seeded from a list's persisted header bounds. A cold key
@@ -74,33 +53,13 @@ func newListWindow(head, tail int64) *listWindow {
 	return w
 }
 
-// seedBytes sets the running listpack byte size and the sticky large flag at admission, from the
-// header the cold-key push just wrote. After this the window owns the size; the header row is
-// stale until drainEvict flushes it back.
-func (w *listWindow) seedBytes(lpBytes uint64, everLarge bool) {
-	w.lpBytes.Store(int64(lpBytes))
-	w.everLarge.Store(everLarge)
-}
-
-// addBytes grows the running size by one push run's element bytes in a single atomic add and
-// latches everLarge the first time the total crosses the listpack byte budget. It is called once
-// per run, not per element, so the size line is off the per-element path.
-func (w *listWindow) addBytes(delta int64) {
-	total := w.lpBytes.Add(delta)
-	if total > listListpackMaxBytes && !w.everLarge.Load() {
-		w.everLarge.Store(true)
-	}
-}
-
-// sizeState reads the running size and the large flag for a flush or an encoding read.
-func (w *listWindow) sizeState() (lpBytes uint64, everLarge bool) {
-	return uint64(w.lpBytes.Load()), w.everLarge.Load()
-}
-
-// bounds returns the visible window, the committed head and tail, for a read that consults the
-// window instead of the stale header row.
-func (w *listWindow) bounds() (head, tail int64) {
-	return w.committedHead.Load(), w.committedTail.Load()
+// count is the visible length, two atomic loads with no lock, so LLEN never contends the push
+// path. It reads committedTail before committedHead; a concurrent push only widens the window, so a
+// torn read can undercount by an in-flight push but never reports a position that is not committed.
+func (w *listWindow) count() int64 {
+	t := w.committedTail.Load()
+	h := w.committedHead.Load()
+	return t - h
 }
 
 // reserveTail claims n contiguous positions at the tail for an RPUSH run and returns the first, so
