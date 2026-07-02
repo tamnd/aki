@@ -491,7 +491,7 @@ func (c *connState) execCommand(argv [][]byte) {
 	case eqFold(cmd, "FAILOVER"):
 		c.cmdFailover(argv)
 	case eqFold(cmd, "COMMAND"):
-		c.writeArrayHeader(0)
+		c.cmdCommand(argv)
 	case eqFold(cmd, "TIME"):
 		c.cmdTime(argv)
 	case eqFold(cmd, "ROLE"):
