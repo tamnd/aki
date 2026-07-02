@@ -486,6 +486,10 @@ func (c *connState) execCommand(argv [][]byte) {
 		c.cmdRole(argv)
 	case eqFold(cmd, "AUTH"):
 		c.cmdAuth(argv)
+	case eqFold(cmd, "SLOWLOG"):
+		c.cmdSlowlog(argv)
+	case eqFold(cmd, "LATENCY"):
+		c.cmdLatency(argv)
 	case eqFold(cmd, "INFO"):
 		c.writeBulk([]byte("# Server\r\nredis_version:7.4.0\r\n"))
 	case eqFold(cmd, "QUIT"):
