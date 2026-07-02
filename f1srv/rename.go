@@ -118,6 +118,7 @@ func (c *connState) moveRows(src, dst []byte) {
 		_ = c.srv.store.Set(dst, v)
 		c.srv.store.Delete(src)
 	case keyHash:
+		c.propagateHashFieldTTLs(src, dst, true)
 		c.moveIndexedFamily(src, dst, kindHashField)
 		c.moveHeader(src, dst, kindHashMeta)
 	case keySet:

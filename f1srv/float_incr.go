@@ -214,6 +214,14 @@ func (c *connState) cmdHIncrByFloat(argv [][]byte) {
 		return
 	}
 	fk := c.fieldKey(hkey, argv[2])
+	// An already-expired field reads as absent: start from zero and recreate it with no TTL. A
+	// live-TTL field keeps its TTL through the increment, matching Redis.
+	if c.hashHasFieldTTL(hkey) {
+		if at, has := c.fieldTTL(fk); has && at <= c.nowMs {
+			c.reapFieldLocked(hkey, fk)
+			fk = c.fieldKey(hkey, argv[2])
+		}
+	}
 	old, exists := c.srv.store.GetKind(fk, c.vbuf[:0], kindHashField)
 	c.vbuf = old
 	var oldVal float64

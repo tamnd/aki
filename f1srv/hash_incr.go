@@ -97,6 +97,14 @@ func (c *connState) cmdHIncrBy(argv [][]byte) {
 		return
 	}
 	fk := c.fieldKey(hkey, argv[2])
+	// An already-expired field reads as absent, so HINCRBY starts from zero and creates it
+	// fresh (with no TTL), matching Redis. A live-TTL field keeps its TTL through the increment.
+	if c.hashHasFieldTTL(hkey) {
+		if at, has := c.fieldTTL(fk); has && at <= c.nowMs {
+			c.reapFieldLocked(hkey, fk)
+			fk = c.fieldKey(hkey, argv[2])
+		}
+	}
 	old, exists := c.srv.store.GetKind(fk, c.vbuf[:0], kindHashField)
 	c.vbuf = old
 	var oldVal int64
@@ -221,6 +229,12 @@ func (c *connState) cmdHRandField(argv [][]byte) {
 			c.writeErr(wrongType)
 			return
 		}
+		if c.hashHasFieldTTL(hkey) {
+			mu := &c.srv.incrMu[c.srv.stripe(hkey)]
+			mu.Lock()
+			c.reapHashExpiredLocked(hkey)
+			mu.Unlock()
+		}
 		card := c.hashCount(hkey)
 		if card == 0 {
 			c.writeNil()
@@ -265,6 +279,8 @@ func (c *connState) cmdHRandField(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	// Reap expired fields under the lock so the sample draws only from live fields.
+	c.reapHashExpiredLocked(hkey)
 	card := int(c.hashCount(hkey))
 	if count == 0 || card == 0 {
 		mu.Unlock()

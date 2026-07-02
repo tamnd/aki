@@ -121,6 +121,7 @@ func (c *connState) copyRows(src, dst []byte) {
 	case keyHash:
 		c.copyIndexedFamily(src, dst, kindHashField)
 		c.copyHeader(src, dst, kindHashMeta)
+		c.propagateHashFieldTTLs(src, dst, false)
 	case keySet:
 		c.copyIndexedFamily(src, dst, kindSetMember)
 		c.copyHeader(src, dst, kindSetMeta)
