@@ -15,6 +15,15 @@ func (c *connState) dispatch(argv [][]byte) {
 		return
 	}
 	cmd := argv[0]
+	// While a connection is in subscribe context (RESP2), Redis allows only a small set of
+	// commands; every other command is refused with a fixed error naming the lowercased verb.
+	// This gate runs before the transaction verbs so an EXEC or a data command issued while
+	// subscribed is refused the same way. A connection that never subscribes keeps psMode
+	// false and skips the test.
+	if c.psMode && !allowedInSubscribeMode(cmd) {
+		c.writeErr("ERR Can't execute '" + lowerName(cmd) + "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context")
+		return
+	}
 	switch {
 	case eqFold(cmd, "MULTI"):
 		c.cmdMulti(argv)
@@ -33,6 +42,30 @@ func (c *connState) dispatch(argv [][]byte) {
 		return
 	case eqFold(cmd, "RESET"):
 		c.cmdReset(argv)
+		return
+	}
+	// The subscribe verbs change per-connection state directly and are never queued in a
+	// transaction; Redis refuses them inside MULTI, which doSubscribe/doUnsubscribe enforce.
+	// PUBLISH, SPUBLISH, and PUBSUB are ordinary commands handled in execCommand, so they may
+	// be queued in a transaction like any other write.
+	switch {
+	case eqFold(cmd, "SUBSCRIBE"):
+		c.doSubscribe(argv, psKindChannel)
+		return
+	case eqFold(cmd, "UNSUBSCRIBE"):
+		c.doUnsubscribe(argv, psKindChannel)
+		return
+	case eqFold(cmd, "PSUBSCRIBE"):
+		c.doSubscribe(argv, psKindPattern)
+		return
+	case eqFold(cmd, "PUNSUBSCRIBE"):
+		c.doUnsubscribe(argv, psKindPattern)
+		return
+	case eqFold(cmd, "SSUBSCRIBE"):
+		c.doSubscribe(argv, psKindShard)
+		return
+	case eqFold(cmd, "SUNSUBSCRIBE"):
+		c.doUnsubscribe(argv, psKindShard)
 		return
 	}
 	if c.inMulti {
@@ -381,6 +414,12 @@ func (c *connState) execCommand(argv [][]byte) {
 		c.cmdGeoSearch(argv)
 	case eqFold(cmd, "GEOSEARCHSTORE"):
 		c.cmdGeoSearchStore(argv)
+	case eqFold(cmd, "PUBLISH"):
+		c.cmdPublish(argv, false)
+	case eqFold(cmd, "SPUBLISH"):
+		c.cmdPublish(argv, true)
+	case eqFold(cmd, "PUBSUB"):
+		c.cmdPubSub(argv)
 	case eqFold(cmd, "TYPE"):
 		c.cmdType(argv)
 	case eqFold(cmd, "OBJECT"):
@@ -932,6 +971,19 @@ func (c *connState) cmdMGet(argv [][]byte) {
 }
 
 func (c *connState) cmdPing(argv [][]byte) {
+	// In subscribe context (RESP2) PING replies with a two-element array ["pong", <arg-or-empty>]
+	// rather than +PONG, so a subscribed client can tell the reply apart from a pushed message
+	// frame. Outside subscribe context PING is the plain +PONG or a bulk echo of its argument.
+	if c.psMode {
+		c.writeArrayHeader(2)
+		c.writeBulk([]byte("pong"))
+		if len(argv) >= 2 {
+			c.writeBulk(argv[1])
+		} else {
+			c.writeBulk(nil)
+		}
+		return
+	}
 	if len(argv) >= 2 {
 		c.writeBulk(argv[1])
 		return

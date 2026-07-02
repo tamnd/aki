@@ -136,13 +136,15 @@ func (c *connState) cmdUnwatch(argv [][]byte) {
 }
 
 // cmdReset returns the connection to a clean state and replies +RESET. On this single-db
-// server the state a client can carry is an open transaction and a watch set; the other
-// duties of Redis RESET (deauth, reselect db 0, unsubscribe) do not apply here.
+// server the state a client can carry is an open transaction, a watch set, and a set of pub/sub
+// subscriptions; RESET drops all three silently (no unsubscribe confirmations), the way Redis
+// RESET does. The remaining duties of Redis RESET (deauth, reselect db 0) do not apply here.
 func (c *connState) cmdReset(argv [][]byte) {
 	c.inMulti = false
 	c.multiAbort = false
 	c.multiQueue = c.multiQueue[:0]
 	c.unwatchAll()
+	c.unsubscribeAll()
 	c.writeSimple("RESET")
 }
 
@@ -424,6 +426,12 @@ var readOnlyCommands = map[string]struct{}{
 	"TYPE": {}, "OBJECT": {}, "PING": {}, "ECHO": {}, "TTL": {}, "PTTL": {},
 	"EXPIRETIME": {}, "PEXPIRETIME": {}, "DBSIZE": {}, "SELECT": {}, "CLIENT": {},
 	"CONFIG": {}, "COMMAND": {}, "INFO": {},
+	// Pub/sub touches no keyspace, so a watched key can never move because of it. The publish
+	// and introspection verbs (the only pub/sub commands a transaction can carry) suppress the
+	// watch bump like any other read.
+	"PUBLISH": {}, "SPUBLISH": {}, "PUBSUB": {},
+	"SUBSCRIBE": {}, "UNSUBSCRIBE": {}, "PSUBSCRIBE": {}, "PUNSUBSCRIBE": {},
+	"SSUBSCRIBE": {}, "SUNSUBSCRIBE": {},
 }
 
 // knownCommands is every command this server dispatches, used to reject an unknown command
