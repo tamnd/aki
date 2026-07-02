@@ -69,7 +69,11 @@ type Server struct {
 	// incrMu serializes the read-modify-write of one key's INCR family so two
 	// counters on the same key sum rather than clobber. It does not touch the
 	// lock-free GET/SET path. Striped by key hash to keep distinct keys parallel.
-	incrMu   []sync.Mutex
+	// It is an RWMutex so a whole-collection read (HGETALL/SMEMBERS and friends)
+	// can take the shared lock and let many readers of one hot key run on many
+	// cores at once, which a single-threaded server cannot; writers still take
+	// the exclusive lock, so a reader never sees a field move mid-walk.
+	incrMu   []sync.RWMutex
 	incrMask uint32
 
 	// block is the per-key blocked-client registry the blocking list commands park in
@@ -153,7 +157,7 @@ func New(cfg Config) *Server {
 	}
 	srv := &Server{
 		cfg:      cfg,
-		incrMu:   make([]sync.Mutex, stripes),
+		incrMu:   make([]sync.RWMutex, stripes),
 		incrMask: uint32(stripes - 1),
 	}
 	srv.block.waiters = make(map[string][]*listWaiter)
