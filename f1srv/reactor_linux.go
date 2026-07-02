@@ -305,7 +305,12 @@ func (l *reactorLoop) adoptConn(rc *reactorConn) {
 		l.conns[rc.fd] = nil
 		_ = syscall.Close(rc.fd)
 		rc.fd = -1
+		return
 	}
+	// The connection is now live in the loop. Count it toward connected_clients; closeConn and
+	// shutdown, the two ways it can leave, drop the count back. A registration that failed above
+	// returned early, so it is never counted and never double-decremented.
+	l.srv.clients.Add(1)
 }
 
 func (l *reactorLoop) get(fd int) *reactorConn {
@@ -411,6 +416,7 @@ func (l *reactorLoop) closeConn(rc *reactorConn) {
 		l.conns[rc.fd] = nil
 	}
 	rc.fd = -1
+	l.srv.clients.Add(-1) // matches the increment in adoptConn
 }
 
 // shutdown closes every owned connection and the loop's own descriptors. It runs on the
@@ -421,6 +427,7 @@ func (l *reactorLoop) shutdown() {
 		if rc != nil && rc.fd >= 0 {
 			_ = syscall.Close(rc.fd)
 			rc.fd = -1
+			l.srv.clients.Add(-1) // these were counted at adoptConn; closeConn never ran for them
 		}
 	}
 	l.conns = nil

@@ -503,7 +503,7 @@ func (c *connState) execCommand(argv [][]byte) {
 	case eqFold(cmd, "LATENCY"):
 		c.cmdLatency(argv)
 	case eqFold(cmd, "INFO"):
-		c.writeBulk([]byte("# Server\r\nredis_version:7.4.0\r\n"))
+		c.cmdInfo(argv)
 	case eqFold(cmd, "QUIT"):
 		// Reply, then ask the driver to flush and close. Draining stops after this
 		// command so a pipeline queued behind QUIT is discarded, matching Redis.
