@@ -44,6 +44,45 @@ func (s *Store) ExistsKind(key []byte, kind byte) bool {
 	return found
 }
 
+// ExistsAnyKey reports whether any record carries key in any kind namespace, hashing the key once
+// and walking its probe chain. It is the lock-free "does this key exist at all" probe a generic
+// command wants when it must tell a truly missing key apart from a wrong-typed one without paying a
+// separate ExistsKind per candidate type. All kinds of one key share a probe chain because the index
+// hashes the key bytes alone (the kind is not in the hash), so one walk sees a string record and
+// every collection header row for the key; the element rows live under composite keys and never
+// collide, so a header hit is exactly key existence. It matches on key bytes and ignores the kind
+// byte, and reads only immutable record fields, so it is safe against concurrent writers exactly
+// like ExistsKind.
+func (s *Store) ExistsAnyKey(key []byte) bool {
+	h := hash(key)
+	tag := tagOf(h)
+	b := &s.buckets[h&s.mask]
+	for b != nil {
+		for i := 0; i < slotsPerBucket; i++ {
+			w := b.slots[i].Load()
+			if w == 0 || w>>tagShift != tag {
+				continue
+			}
+			if s.recordMatchesKey(w&addrMask, key) {
+				return true
+			}
+		}
+		b = s.nextBucket(b, false)
+	}
+	return false
+}
+
+// recordMatchesKey is recordMatches without the kind check, for the kind-agnostic ExistsAnyKey
+// probe. It reads only the immutable key length and key bytes, so it is concurrency-safe like
+// recordMatches.
+func (s *Store) recordMatchesKey(off uint64, key []byte) bool {
+	if s.klen(off) != uint64(len(key)) {
+		return false
+	}
+	start := off + hdrSize
+	return string(s.arena[start:start+uint64(len(key))]) == string(key)
+}
+
 // GetKindAt is GetKind that also returns the record's arena offset, so a caller that
 // will rewrite the same record in place can skip the second index probe PutKind would
 // repeat. It is the read half of the fused read-then-in-place-update a fixed-width

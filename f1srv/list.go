@@ -2109,6 +2109,194 @@ func (c *connState) cmdRPopLPush(argv [][]byte) {
 	c.lmove(argv[1], argv[2], []byte("RIGHT"), []byte("LEFT"))
 }
 
+// popOneResident claims one element off a committed end of a resident window and returns its bytes
+// without a wire reply, the single-element pop core an lmove reuses. The caller holds w.gate (RLock)
+// and has checked evicted false. It mirrors popEmitWindow's want==1 path: under w.mu it rejects a
+// mid-flight push and a pop that would empty the list (both belong to the stripe path), advances the
+// committed end past the one position, detaches the element (a resident slot is nil'd sole-owned; a
+// pre-block position is taken into a fresh buffer), contracts the pre-block band inward to the new
+// bound, then adjusts the store count and running size off-lock. The returned slice is sole-owned, so
+// the caller can push it onto another window (the ring copies it) and still write it back as the reply.
+func (c *connState) popOneResident(w *listWindow, lkey []byte, fromHead bool) ([]byte, bool) {
+	w.mu.Lock()
+	ch := w.committedHead.Load()
+	ct := w.committedTail.Load()
+	if w.reservedHead.Load() != ch || w.reservedTail.Load() != ct {
+		w.mu.Unlock()
+		return nil, false
+	}
+	if ct-ch <= 1 { // want(1) >= live: leave the emptying transition to the stripe path
+		w.mu.Unlock()
+		return nil, false
+	}
+	var pos, newBound int64
+	if fromHead {
+		pos = ch
+		newBound = ch + 1
+		w.committedHead.Store(newBound)
+		w.reservedHead.Store(newBound)
+	} else {
+		pos = ct - 1
+		newBound = ct - 1
+		w.committedTail.Store(newBound)
+		w.reservedTail.Store(newBound)
+	}
+	var v []byte
+	var preCount int64
+	if w.resident(pos) {
+		v = w.ring.takeSlot(pos)
+	} else {
+		ek := c.listElemKey(lkey, pos)
+		v, _ = c.srv.store.TakeKindNoCount(ek, nil, kindListElem)
+		preCount = 1
+	}
+	w.contractPreblock(fromHead, newBound)
+	w.mu.Unlock()
+	if preCount > 0 {
+		c.srv.store.AddCount(-preCount)
+	}
+	w.addBytes(-int64(listEntrySize(v)))
+	return v, true
+}
+
+// pushOneResident appends one element to the chosen end of a resident window, the single-element push
+// core an lmove reuses. The caller holds w.gate (RLock) and has checked evicted false. It mirrors the
+// single-element path of pushThroughWindow: reserve one position, fill it into the ring in commit
+// order, and grow the running size, with no wire reply. commitHead/commitTail copy v into the ring, so
+// v stays valid for the caller to write back as the reply.
+func (c *connState) pushOneResident(w *listWindow, toHead bool, v []byte) {
+	if toHead {
+		start := w.reserveHead(1)
+		w.commitHead(start, 1, [][]byte{v})
+	} else {
+		start := w.reserveTail(1)
+		w.commitTail(start, 1, [][]byte{v})
+	}
+	w.addBytes(int64(listEntrySize(v)))
+}
+
+// ensureDestResident returns a resident window for an lmove destination, admitting one under the
+// destination's stripe lock when none is resident yet, so a cold destination becomes hot on the first
+// move and every later move pushes lock-free instead of thrashing the stripe path. It returns
+// (nil, true) when the destination holds a plain string, the WRONGTYPE case the caller reports. The
+// freshly admitted window is seeded from the destination's header row, so it starts empty for a missing
+// destination and at the true bounds for an existing list; the caller pushes the moved element into it
+// at once, so it is observably empty only for the instant between admission and that push, during which
+// a read still sees the pre-move state (listHeader treats head==tail as a missing list, the same
+// linearization the move gives an empty destination).
+func (c *connState) ensureDestResident(dest []byte) (w *listWindow, wrongType bool) {
+	if w := c.srv.listWinLookup(dest); w != nil {
+		return w, false
+	}
+	mu := &c.srv.incrMu[c.srv.stripe(dest)]
+	mu.Lock()
+	if c.stringConflict(dest) {
+		mu.Unlock()
+		return nil, true
+	}
+	head, tail, lpBytes, everLarge, _, _ := c.listHeaderAt(dest)
+	w = c.srv.listWinAdmit(dest, head, tail, lpBytes, everLarge) // idempotent under the stripe lock
+	mu.Unlock()
+	return w, false
+}
+
+// lmoveThroughWindow serves LMOVE/RPOPLPUSH off resident hot-list windows, the move-side mirror of the
+// push and pop fast paths (impl/33). The benchmark's rpoplpush drives one source list and one
+// destination list, and the stripe-lock body drains each window to f1raw rows on every pop and push, so
+// the whole move serializes on two stripe mutexes and evicts the source window on the first move, never
+// re-admitting it; this path pops the source end and pushes the destination end lock-free off the stripe
+// lock instead, admitting a destination window on first use, so many connections move between the same
+// pair on many cores.
+//
+// A same-key rotation runs on one window under one gate, pop one end and push the other, atomically. A
+// cross-key move pops the source under its gate, releases it, then admits and pushes the destination
+// under its gate. The two ends are not held at once (that would nest the destination's stripe-lock
+// admission inside the source gate and invert the drainEvict lock order), so a concurrent observer can
+// see the element briefly in neither list; a single connection issuing sequential commands, which is
+// every correctness test and the benchmark, never sees that gap because the command completes before the
+// next one runs. It returns false, leaving lmove to run the stripe body, when the source is not
+// resident, when the source pop is unsafe off-lock (popOneResident rejects a mid-flight push or a
+// would-empty pop, the emptying delete the stripe body owns), or when the moved element is too large for
+// the lock-free push, in which case it re-pushes the element onto the source end it came from so the
+// fallback sees the source unchanged. A string under the destination is WRONGTYPE, reported here having
+// moved nothing.
+func (c *connState) lmoveThroughWindow(source, destination []byte, fromHead, toHead bool) bool {
+	ws := c.srv.listWinLookup(source)
+	if ws == nil {
+		return false
+	}
+	if bytes.Equal(source, destination) {
+		ws.gate.RLock()
+		if ws.evicted.Load() {
+			ws.gate.RUnlock()
+			return false
+		}
+		v, ok := c.popOneResident(ws, source, fromHead)
+		if !ok {
+			ws.gate.RUnlock()
+			return false
+		}
+		if len(v) > listElemFastMax {
+			c.pushOneResident(ws, fromHead, v) // undo the pop, hand the move to the stripe body
+			ws.gate.RUnlock()
+			return false
+		}
+		c.pushOneResident(ws, toHead, v)
+		ws.gate.RUnlock()
+		c.srv.signalListKey(destination)
+		c.writeBulk(v)
+		return true
+	}
+	// Type-check the destination before touching the source, so a string destination errors with the
+	// source unchanged, the order Redis gives the move. The lock-free read matches the stripe body's
+	// own check and LLEN's.
+	if c.stringConflict(destination) {
+		c.writeErr(wrongType)
+		return true
+	}
+	ws.gate.RLock()
+	if ws.evicted.Load() {
+		ws.gate.RUnlock()
+		return false
+	}
+	v, ok := c.popOneResident(ws, source, fromHead)
+	if !ok {
+		ws.gate.RUnlock()
+		return false
+	}
+	if len(v) > listElemFastMax {
+		c.pushOneResident(ws, fromHead, v) // undo, fall back to the stripe body
+		ws.gate.RUnlock()
+		return false
+	}
+	ws.gate.RUnlock()
+	// Source is popped; admit the destination window and push the element onto its chosen end. A racing
+	// string SET on the destination (only reachable off the benchmark) turns the admit into a WRONGTYPE,
+	// so re-push the element onto the source end it came from and report it, leaving both lists as they
+	// were before the move.
+	wd, wt := c.ensureDestResident(destination)
+	if wt {
+		ws.gate.RLock()
+		c.pushOneResident(ws, fromHead, v)
+		ws.gate.RUnlock()
+		c.writeErr(wrongType)
+		return true
+	}
+	wd.gate.RLock()
+	if wd.evicted.Load() {
+		wd.gate.RUnlock()
+		ws.gate.RLock()
+		c.pushOneResident(ws, fromHead, v)
+		ws.gate.RUnlock()
+		return false
+	}
+	c.pushOneResident(wd, toHead, v)
+	wd.gate.RUnlock()
+	c.srv.signalListKey(destination)
+	c.writeBulk(v)
+	return true
+}
+
 // lmove is the shared body for LMOVE and RPOPLPUSH once the direction tokens are known. It
 // validates the two directions, takes both stripe locks in a fixed order (deadlock-safe against
 // a concurrent move of the same pair the other way), then pops one element from the source and
@@ -2119,6 +2307,26 @@ func (c *connState) lmove(source, destination, fromTok, toTok []byte) {
 	toHead, ok2 := parseLR(toTok)
 	if !ok1 || !ok2 {
 		c.writeErr("ERR syntax error")
+		return
+	}
+	// A resident hot-list pair moves lock-free off the stripe locks, the same fast path pushes and
+	// pops take. It falls through to the stripe body when either side is not resident or the move is
+	// unsafe off-lock.
+	if c.lmoveThroughWindow(source, destination, fromHead, toHead) {
+		return
+	}
+	// Lock-free missing-source shortcut. A work-queue consumer polling with RPOPLPUSH/BRPOPLPUSH
+	// (and this workload's drained tail) hits an empty source over and over, and Redis answers a
+	// missing source with nil before it ever looks at the destination. Take that same nil here off
+	// the stripe locks, so 512 connections answer a drained source in parallel across cores instead
+	// of serializing on its single stripe. The shortcut fires only for a key that is absent from
+	// every namespace: listHeader is window-aware, so a source that still holds a list (resident or
+	// header-only, including a one-element list the window fast path declined) has ok true, and
+	// ExistsAnyKey catches a source present under any other type. Both cases fall to the stripe body
+	// and keep its existing reply unchanged, so this is purely a parallel fast path for the truly
+	// missing source, never a new type-resolution path.
+	if _, _, _, _, ok := c.listHeader(source); !ok && !c.srv.store.ExistsAnyKey(source) {
+		c.writeNil()
 		return
 	}
 	unlock := c.lockTwoStripes(source, destination)

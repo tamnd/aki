@@ -618,6 +618,49 @@ func TestListLMove(t *testing.T) {
 	}
 }
 
+// The lock-free RPOPLPUSH/LMOVE missing-source shortcut must fire only for a source that is absent
+// from every namespace. A source that exists under another type must fall to the stripe body and
+// keep its existing reply, so the shortcut never becomes a new type-resolution path. A string
+// source still reports WRONGTYPE (the stripe body's string-conflict check), and a truly missing
+// source replies nil without creating the destination.
+//
+// A collection-typed source (hash/set/zset) reads as nil here rather than WRONGTYPE. That is the
+// pre-existing behavior of the whole list command family (LPOP/RPOP/LLEN/LINDEX/RPOPLPUSH all
+// answer a non-list, non-string source with nil, not WRONGTYPE), a systemic compat gap tracked
+// separately from this fast path. The shortcut leaves it exactly as it was: the assertions below
+// pin that the shortcut does not change any of these replies and never creates the destination.
+func TestListLMoveShortcutSource(t *testing.T) {
+	rw, cleanup := dialTestServer(t)
+	defer cleanup()
+
+	cmd(t, rw, "SET", "s", "v")
+	expect(t, rw, "+OK")
+	cmd(t, rw, "HSET", "h", "f", "v")
+	expect(t, rw, ":1")
+
+	// A string source is WRONGTYPE: the shortcut does not swallow it as missing.
+	cmd(t, rw, "RPOPLPUSH", "s", "movedst")
+	if got := readReply(t, rw); !strings.HasPrefix(got, "-WRONGTYPE") {
+		t.Fatalf("RPOPLPUSH from string = %q, want WRONGTYPE", got)
+	}
+	cmd(t, rw, "LMOVE", "s", "movedst", "LEFT", "RIGHT")
+	if got := readReply(t, rw); !strings.HasPrefix(got, "-WRONGTYPE") {
+		t.Fatalf("LMOVE from string = %q, want WRONGTYPE", got)
+	}
+
+	// A collection source keeps its pre-existing nil reply (not treated as missing-and-created).
+	cmd(t, rw, "RPOPLPUSH", "h", "movedst")
+	expect(t, rw, "$-1")
+
+	// A truly missing source replies nil.
+	cmd(t, rw, "RPOPLPUSH", "absent", "movedst")
+	expect(t, rw, "$-1")
+
+	// None of the above created the destination.
+	cmd(t, rw, "EXISTS", "movedst")
+	expect(t, rw, ":0")
+}
+
 func TestListLMPop(t *testing.T) {
 	rw, cleanup := dialTestServer(t)
 	defer cleanup()
