@@ -58,6 +58,9 @@ type connState struct {
 	pushColl [][]byte  // reused scratch for a coalesced push run's elements, in arrival order
 	pushBnd  []int     // reused scratch for the coalesced push run's per-command element boundaries
 	popBufs  [][]byte  // reused scratch for a window pop run's claimed element slices, framed after the commit mutex releases
+	delColl  [][]byte  // reused scratch for a coalesced delete run's elements (HDEL/SREM/ZREM), in arrival order
+	delBnd   []int     // reused scratch for the coalesced delete run's per-command element boundaries
+	delCnt   []int     // reused scratch for the coalesced delete run's per-command removed counts
 
 	// Transaction state (MULTI/EXEC/DISCARD/WATCH/UNWATCH). inMulti is set between MULTI
 	// and EXEC/DISCARD; while it is set every non-transaction command is copied into
@@ -206,6 +209,12 @@ func (c *connState) drain() bool {
 				pos = c.drainPush(argv, atHead, requireExisting, pos)
 			} else if atHead, ok := popVerb(argv); ok && !c.inMulti && !c.psMode {
 				pos = c.drainPop(argv, atHead, pos)
+			} else if fam, ok := delVerb(argv); ok && !c.inMulti && !c.psMode {
+				// A run of same-key, same-verb named-element deletes (HDEL/SREM/ZREM) from this
+				// one connection folds into a single locked batch, the delete counterpart to the
+				// coalesced push. Same gate: plain execution path only, so MULTI queuing and the
+				// subscribe-mode restriction keep their own dispatch.
+				pos = c.drainDelete(argv, fam, pos)
 			} else {
 				c.dispatch(argv)
 			}
