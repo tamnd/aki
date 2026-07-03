@@ -137,6 +137,9 @@ func (c *connState) cmdSAdd(argv [][]byte) {
 	// Track the running cardinality and encoding so the header is written once with the
 	// count bumped and the encoding folded forward over every member actually added.
 	count, enc, _ := c.setHeader(skey)
+	// The member vector's bounding prefix is stable across the loop: setPrefix uses pbuf while
+	// memberKey uses the distinct kbuf, so building each member key does not disturb it.
+	prefix := c.setPrefix(skey)
 	added := 0
 	for _, member := range argv[2:] {
 		mk := c.memberKey(skey, member)
@@ -148,6 +151,10 @@ func (c *connState) cmdSAdd(argv [][]byte) {
 		}
 		if isNew {
 			c.srv.store.CollInsert(mk, kindSetMember)
+			// Keep the dense member vector in step with the ordered index: append the new member's
+			// offset if a vector exists, a no-op otherwise (the lazy contract, spec 2064/18 section
+			// 5.1). Only on a genuine insert, so a re-add of an existing member appends nothing.
+			c.srv.store.CollRandInsert(prefix, mk, kindSetMember)
 			added++
 			count++
 			enc = foldSetEnc(enc, member, count)
@@ -183,10 +190,15 @@ func (c *connState) cmdSRem(argv [][]byte) {
 	// splice is deferred off this stripe-locked reply path in one batch (spec 2064/16 slice 2)
 	// instead of one synchronous O(log n) splice per member here. memberKey reuses its scratch
 	// on the next call, so each removed key is copied into the packed buffer before the next.
+	prefix := c.setPrefix(skey)
 	buf := c.delKeyBuf[:0]
 	ends := c.delKeyEnd[:0]
 	for _, member := range argv[2:] {
 		mk := c.memberKey(skey, member)
+		// Swap-remove the member from the dense vector before the hash record is deleted, so its
+		// offset is still resolvable (spec 2064/18 section 5.2). A no-op when no vector exists or
+		// the member was not a vector slot, so a miss costs one shard-mutex acquire and nothing more.
+		c.srv.store.CollRandRemove(prefix, mk, kindSetMember)
 		if c.srv.store.DeleteKind(mk, kindSetMember) {
 			buf = append(buf, mk...)
 			ends = append(ends, len(buf))
@@ -493,18 +505,13 @@ func (c *connState) cmdSRandMember(argv [][]byte) {
 			c.writeErr(wrongType)
 			return
 		}
-		// Rank-based select walks ordered-index widths, which count any not-yet-spliced dead
-		// node from a deferred SREM (spec 2064/16 slice 2), so reconcile the index first. This
-		// is a no-op (one atomic load) when nothing is pending, the steady state for a select
-		// workload that is not interleaved with deletes.
-		c.srv.store.SyncPendingRemovals()
-		card := c.setCard(skey)
-		if card == 0 {
-			c.writeNil()
-			return
-		}
+		// Draw from the set's dense member vector (spec 2064/18): an O(1) array index instead of
+		// the O(log n) order-statistic skip-list descent CollSelectAt walked. The vector builds
+		// itself on this first draw by scanning the live ordered run, so it needs no
+		// SyncPendingRemovals reconcile (the scan already skips a tombstoned-but-not-yet-spliced
+		// node) and no separate cardinality probe (an empty or missing set draws ok=false).
 		prefix := c.setPrefix(skey)
-		k, ok := c.srv.store.CollSelectAt(prefix, rand.IntN(int(card)))
+		k, ok := c.srv.store.CollRandSelect(prefix)
 		if !ok {
 			c.writeNil()
 			return
@@ -634,6 +641,12 @@ func (c *connState) cmdSPop(argv [][]byte) {
 			return
 		}
 		member := k[len(prefix):]
+		// Keep the dense vector consistent with the removal (spec 2064/18 section 5.2): drop the
+		// popped member's offset before its record is deleted. Slice 2 still draws the victim from
+		// the ordered index (CollSelectRemoveAt); a later slice moves the draw itself onto the
+		// vector so the descent goes away, but the vector must already track removals for the
+		// SRANDMEMBER draw to trust it.
+		c.srv.store.CollRandRemove(prefix, k, kindSetMember)
 		c.srv.store.DeleteKind(k, kindSetMember)
 		if err := c.setPutHeader(skey, uint64(card-1), enc); err != nil {
 			mu.Unlock()
@@ -656,9 +669,12 @@ func (c *connState) cmdSPop(argv [][]byte) {
 	}
 	// Sample all the members to pop first (indices stable, nothing removed yet), then
 	// remove them, so a whole-set pop and a partial pop share one path.
-	members := c.setSampleDistinct(c.setPrefix(skey), card, want)
+	prefix := c.setPrefix(skey)
+	members := c.setSampleDistinct(prefix, card, want)
 	for _, m := range members {
 		mk := c.memberKey(skey, m)
+		// Drop the popped member from the dense vector before its record goes (spec 2064/18 5.2).
+		c.srv.store.CollRandRemove(prefix, mk, kindSetMember)
 		if c.srv.store.DeleteKind(mk, kindSetMember) {
 			c.srv.store.CollRemove(mk)
 		}
@@ -747,7 +763,10 @@ func (c *connState) cmdSMove(argv [][]byte) {
 		return
 	}
 
-	// Remove from the source and decrement its header, deleting the header at zero.
+	// Remove from the source and decrement its header, deleting the header at zero. Drop the
+	// member from the source's dense vector first, while its record is still resolvable (spec
+	// 2064/18 section 5.2).
+	c.srv.store.CollRandRemove(c.setPrefix(source), srcMK, kindSetMember)
 	if c.srv.store.DeleteKind(srcMK, kindSetMember) {
 		c.srv.store.CollRemove(srcMK)
 	}
@@ -770,6 +789,8 @@ func (c *connState) cmdSMove(argv [][]byte) {
 	}
 	if isNew {
 		c.srv.store.CollInsert(dstMK, kindSetMember)
+		// Append the moved member to the destination's dense vector if it exists (spec 2064/18 5.1).
+		c.srv.store.CollRandInsert(c.setPrefix(destination), dstMK, kindSetMember)
 		// A genuine insert can raise the destination's encoding (a non-integer member arriving
 		// at an intset, or a growth past a threshold), so fold it forward like SADD does.
 		count, enc, _ := c.setHeader(destination)

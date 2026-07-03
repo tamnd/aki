@@ -338,39 +338,9 @@ func (s *Store) CollRandDrop(prefix []byte) {
 	sh.mu.Unlock()
 }
 
-// CollRandRekey moves a set's vector from oldPrefix to newPrefix, for RENAME: the member
-// rows do not move under a rename (only the key's prefix binding changes), so their arena
-// offsets stay valid and the vector is re-keyed rather than rebuilt. When the source has no
-// vector this is a no-op and the destination will build one lazily on its first draw. When
-// the two prefixes hash to different shards the vector moves between shards under both
-// mutexes, taken in a fixed order (lower shard index first) so two concurrent rekeys of the
-// same pair cannot deadlock.
-func (s *Store) CollRandRekey(oldPrefix, newPrefix []byte) {
-	oi := hash(oldPrefix) & (randVecShards - 1)
-	ni := hash(newPrefix) & (randVecShards - 1)
-	if oi == ni {
-		sh := &s.rvec.shards[oi]
-		sh.mu.Lock()
-		if v := sh.get(oldPrefix); v != nil {
-			delete(sh.m, string(oldPrefix))
-			sh.put(newPrefix, v)
-		}
-		sh.mu.Unlock()
-		return
-	}
-	lo, hiIdx := oi, ni
-	if lo > hiIdx {
-		lo, hiIdx = hiIdx, lo
-	}
-	loSh, hiSh := &s.rvec.shards[lo], &s.rvec.shards[hiIdx]
-	loSh.mu.Lock()
-	hiSh.mu.Lock()
-	src := &s.rvec.shards[oi]
-	dst := &s.rvec.shards[ni]
-	if v := src.get(oldPrefix); v != nil {
-		delete(src.m, string(oldPrefix))
-		dst.put(newPrefix, v)
-	}
-	hiSh.mu.Unlock()
-	loSh.mu.Unlock()
-}
+// RENAME has no vector re-key primitive on purpose. The member rows carry their set's key name
+// inside their composite key, so a rename cannot rewrite a member's key in place: moveIndexedFamily
+// publishes a fresh record under the new prefix and deletes the old one, which gives every moved
+// member a new arena offset. An offset-preserving map move would therefore leave the vector
+// pointing at the deleted source records, so RENAME instead drops the source vector (CollRandDrop)
+// and lets the destination build its own on first draw from the freshly-published rows.

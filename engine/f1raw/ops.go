@@ -200,6 +200,11 @@ func (s *Store) Reset() {
 	s.count.Store(0)
 	s.topCount.Store(0)
 	s.oidx = newOIndex(s)
+	// Drop every set's dense member vector too (randvec.go): a reset clears the keyspace, so a
+	// fresh randVec starts every shard empty and the first draw against any later set rebuilds
+	// its vector from the now-empty index. The vector is never persisted, so there is nothing
+	// else to reconcile.
+	s.rvec = newRandVec()
 	// A reset unlinks every record, so every byte the cold log holds is now dead space no
 	// live record points at. The log itself is left in place (M1 does no reclamation; a
 	// later compaction milestone truncates it), so the dead counter is set to the current

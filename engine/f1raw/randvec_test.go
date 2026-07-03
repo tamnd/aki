@@ -270,38 +270,6 @@ func TestRandVecRebuildAfterDrop(t *testing.T) {
 	}
 }
 
-func TestRandVecRekey(t *testing.T) {
-	s := newTestStore()
-	oldPrefix := setPrefixBytes("s")
-	s.CollRandEnsure(oldPrefix)
-	const n = 50
-	for i := 0; i < n; i++ {
-		addMember(t, s, oldPrefix, "s", fmt.Sprintf("m%d", i))
-	}
-	checkDense(t, s, oldPrefix, n)
-	// Rekey moves the same vector under a new prefix; the member offsets are unchanged (the
-	// rows do not move), so the destination is dense with the same count.
-	newPrefix := setPrefixBytes("dest")
-	s.CollRandRekey(oldPrefix, newPrefix)
-	sh := s.rvec.shardFor(oldPrefix)
-	sh.mu.Lock()
-	survived := sh.get(oldPrefix) != nil
-	sh.mu.Unlock()
-	if survived {
-		t.Fatalf("source vector survived rekey")
-	}
-	// The destination vector has the right size; note its member offsets still point at rows
-	// keyed under the old skey, which is fine for the draw (the rows are what moved keys in
-	// a real RENAME; here we only exercise the vector move).
-	shN := s.rvec.shardFor(newPrefix)
-	shN.mu.Lock()
-	v := shN.get(newPrefix)
-	shN.mu.Unlock()
-	if v == nil || len(v.slots) != n {
-		t.Fatalf("destination vector size wrong after rekey")
-	}
-}
-
 // TestRandVecUniform draws a large sample from a fixed set and checks the empirical
 // frequency of each member is inside a chi-square band for uniform, catching a swap-remove
 // or draw bug that biases the distribution.
