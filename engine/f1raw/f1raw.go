@@ -61,6 +61,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math/bits"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 )
@@ -158,6 +159,27 @@ type Store struct {
 	// or under the threshold never touches the log.
 	cold         *coldLog
 	sepThreshold int
+
+	// The deferred ordered-index removal state (tombstone.go). When deferred removal is
+	// enabled, an element delete hands the composite key to tombHead (a lock-free Treiber
+	// stack of removal batches) instead of splicing the skip list inline, and a background
+	// folder goroutine drains the stack under oi.mu off the delete's critical path. tombPend
+	// is the number of queued-but-not-yet-spliced element keys; it gates the enumeration
+	// liveness filter so a read pays the per-node liveness probe only while a splice is
+	// actually outstanding. All three are zero-valued and unused until EnableDeferredRemoval
+	// starts the folder, so a store that never enables it behaves exactly as before.
+	tombHead   atomic.Pointer[tombNode]
+	tombPend   atomic.Int64
+	folderOn   atomic.Bool
+	folderStop chan struct{}
+	folderDone chan struct{}
+	folderWake chan struct{}
+	// folderMu serializes a drain (whether run by the folder or by a foreground
+	// SyncPendingRemovals) against another drain, so a foreground caller that needs the ordered
+	// index reconciled right now waits for any in-flight folder splice to finish rather than
+	// racing it. It is taken only on the drain path, never on the delete hot path, so an
+	// element delete never blocks on it.
+	folderMu sync.Mutex
 }
 
 // New builds a store whose primary hash index has indexBuckets buckets (rounded up
@@ -269,6 +291,13 @@ func (s *Store) ArenaBytes() (used, total uint64) {
 // no-op; for a store with a cold value log it closes the log file. The in-memory
 // arena and index are garbage-collected with the store.
 func (s *Store) Close() error {
+	if s.folderOn.Load() {
+		// Stop the folder and let it splice out every tombstone it still holds, so a close
+		// leaves the ordered index reconciled with the hash index rather than carrying dead
+		// nodes a later reopen would have to reconcile.
+		close(s.folderStop)
+		<-s.folderDone
+	}
 	if s.cold != nil {
 		return s.cold.close()
 	}

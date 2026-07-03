@@ -235,6 +235,10 @@ func (c *connState) cmdHRandField(argv [][]byte) {
 			c.reapHashExpiredLocked(hkey)
 			mu.Unlock()
 		}
+		// Rank-based select walks ordered-index widths, which count any not-yet-spliced dead
+		// node from a deferred HDEL (spec 2064/16 slice 2), so reconcile the index first. This
+		// is a no-op (one atomic load) when nothing is pending.
+		c.srv.store.SyncPendingRemovals()
 		card := c.hashCount(hkey)
 		if card == 0 {
 			c.writeNil()
@@ -281,6 +285,10 @@ func (c *connState) cmdHRandField(argv [][]byte) {
 	}
 	// Reap expired fields under the lock so the sample draws only from live fields.
 	c.reapHashExpiredLocked(hkey)
+	// Reconcile any deferred HDEL splices before rank-based sampling: the stripe lock keeps this
+	// hash's cardinality and ordered index consistent across the multi-pick sample, and draining
+	// under it means no new tombstone for this key can appear mid-sample (spec 2064/16 slice 2).
+	c.srv.store.SyncPendingRemovals()
 	card := int(c.hashCount(hkey))
 	if count == 0 || card == 0 {
 		mu.Unlock()

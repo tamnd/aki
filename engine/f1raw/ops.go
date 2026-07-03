@@ -173,11 +173,22 @@ func (s *Store) insertAbsent(key, val []byte, h uint64, kind byte) (installed, e
 
 // Reset empties the store: every index entry is cleared, the arena tail rewinds, and
 // the live count drops to zero. It is the FLUSHALL/FLUSHDB primitive. It is NOT safe
-// against concurrent readers or writers; the caller must quiesce traffic first, which
-// is how Redis treats a flush in practice. The arena bytes are not scrubbed; rewinding
-// the tail is enough because a later publish overwrites the header before exposing the
-// record through an index entry.
+// against concurrent foreground readers or writers; the caller must quiesce traffic
+// first, which is how Redis treats a flush in practice. The arena bytes are not scrubbed;
+// rewinding the tail is enough because a later publish overwrites the header before
+// exposing the record through an index entry.
+//
+// The one background actor a flush must coordinate with is the tombstone folder: it drains
+// under folderMu and touches s.oidx, so Reset takes folderMu across the whole flush. That
+// makes the flush and any in-flight folder drain mutually exclusive, so replacing the oidx
+// pointer never races the folder's read of it. Every queued tombstone points at a record
+// this flush is about to unlink, so the queue is dropped wholesale under the same lock; a
+// folder that wakes after Reset returns swaps an empty stack and does nothing.
 func (s *Store) Reset() {
+	s.folderMu.Lock()
+	defer s.folderMu.Unlock()
+	s.tombHead.Store(nil)
+	s.tombPend.Store(0)
 	for bi := range s.buckets {
 		b := &s.buckets[bi]
 		for i := 0; i < slotsPerBucket; i++ {
