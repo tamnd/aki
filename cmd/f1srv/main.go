@@ -13,6 +13,8 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"strconv"
 
 	"github.com/tamnd/aki/f1srv"
 )
@@ -38,9 +40,38 @@ func main() {
 	ltmCold := fs.Bool("ltm-cold", false, "engage the larger-than-memory string tier: separate large values to a cold log under --dir")
 	sepThreshold := fs.Int("sep-threshold", 0, "inline-vs-separated value cutoff in bytes for --ltm-cold (0 = engine default)")
 	pprofAddr := fs.String("pprof", "", "if set, serve net/http/pprof on this host:port (profiling only, off by default)")
+	// --gogc and --gomemlimit are optional heap-pacing knobs for the LTM regime,
+	// where a large arena and a cold value log grow the heap and an operator may
+	// want to trade RSS against collection frequency or hold the process under a
+	// hard byte ceiling. They are off by default: the in-memory path meets its
+	// throughput and tail targets on the runtime default GC, so the default here
+	// changes nothing and leaves an explicit GOGC/GOMEMLIMIT in the environment
+	// untouched. Set --gogc to a positive percent to raise the target, and set
+	// --gomemlimit to a positive byte count to engage the soft ceiling.
+	gogc := fs.Int("gogc", 0, "GC target percent for the LTM regime (0 = leave the runtime default); higher trades RSS for fewer collections")
+	gomemlimit := fs.Int64("gomemlimit", 0, "soft heap ceiling in bytes for the LTM regime (0 = off); the collector runs before the heap crosses it")
 	// ExitOnError means a bad flag exits the process, so Parse never returns a
 	// non-nil error here. Blank-assign to satisfy errcheck without dead handling.
 	_ = fs.Parse(args)
+
+	// Apply the optional GC knobs. Only touch the runtime when the operator asked
+	// for it with a positive flag; a zero flag leaves whatever the runtime already
+	// resolved from the environment in place. effGOGC is the value the banner
+	// reports: the flag when we set it, otherwise the environment's GOGC, otherwise
+	// the runtime default of 100.
+	effGOGC := 100
+	if envVal, envSet := os.LookupEnv("GOGC"); envSet {
+		if n, err := strconv.Atoi(envVal); err == nil {
+			effGOGC = n
+		}
+	}
+	if *gogc > 0 {
+		debug.SetGCPercent(*gogc)
+		effGOGC = *gogc
+	}
+	if *gomemlimit > 0 {
+		debug.SetMemoryLimit(*gomemlimit)
+	}
 
 	cfg := f1srv.DefaultConfig(*addr)
 	cfg.IndexBuckets = *indexBuckets
@@ -69,8 +100,12 @@ func main() {
 	if *ltmCold {
 		cold = cfg.ColdPath
 	}
-	fmt.Printf("f1srv listening on %s (index-buckets=%d arena=%dMiB cold=%s)\n",
-		srv.Addr(), *indexBuckets, *arenaBytes>>20, cold)
+	memlimit := "off"
+	if *gomemlimit > 0 {
+		memlimit = fmt.Sprintf("%dMiB", *gomemlimit>>20)
+	}
+	fmt.Printf("f1srv listening on %s (index-buckets=%d arena=%dMiB cold=%s gogc=%d gomemlimit=%s)\n",
+		srv.Addr(), *indexBuckets, *arenaBytes>>20, cold, effGOGC, memlimit)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("f1srv: serve: %v", err)
 	}
