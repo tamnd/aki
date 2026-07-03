@@ -82,7 +82,12 @@ type crossMsg struct {
 // connection to a loop round-robin. On any setup failure it reports handled false so the
 // caller falls back to the goroutine driver on the same already-bound listener.
 func serveWithReactor(s *Server) (bool, error) {
-	if s.cfg.NetMode != "reactor" {
+	// "auto" is the default: the reactor is the fast path on Linux, so resolve it here rather than
+	// forcing every caller to name the platform. "reactor" forces it. Anything else (including "go"
+	// and the empty string) stays on the goroutine driver. On a setup failure the loop constructors
+	// below return handled false, so an "auto" or "reactor" run still falls back to the goroutine
+	// driver on the same already-bound listener rather than failing to serve.
+	if s.cfg.NetMode != "reactor" && s.cfg.NetMode != "auto" {
 		return false, nil
 	}
 	n := runtime.GOMAXPROCS(0)
