@@ -78,6 +78,27 @@ func (c *connState) listElemKey(lkey []byte, pos int64) []byte {
 	return b
 }
 
+// listElemRead returns the bytes at position pos, reading the resident ring when the window w holds
+// pos and the f1raw element row otherwise. w may be nil (a cold list with no resident window), in
+// which case every position is a row. A scan uses this to read a hot list at memory speed: a
+// resident position is a plain ring-slot fetch with no hash probe, and only the pre-block seed
+// positions [preLo, preHi) still cost a row read. When w is non-nil the caller must hold w.gate,
+// either the shared RLock (LPOS, LRANGE, which read a hot key in parallel across cores) or the
+// exclusive Lock (an interior edit), so the ring and its live bounds stay put across the read; the
+// pre-block band only ever contracts under the gate, so a resident classification never turns stale
+// mid-read. The returned slice aliases the ring slot or the read buffer and is valid until the next
+// read reuses that buffer, which is the same contract the row-only scan already relied on.
+func (c *connState) listElemRead(w *listWindow, lkey []byte, pos int64) ([]byte, bool) {
+	if w != nil && w.resident(pos) {
+		v := w.ring.get(pos)
+		return v, v != nil
+	}
+	ek := c.listElemKey(lkey, pos)
+	v, found := c.srv.store.GetKind(ek, c.vbuf[:0], kindListElem)
+	c.vbuf = v
+	return v, found
+}
+
 // listHeader reads a list's header window: the head and tail positions, the running listpack
 // byte size, and the sticky large flag. ok is false when the list has no header (empty or
 // missing key), in which case head and tail are 0 (an empty window) and lpBytes is the empty
@@ -217,10 +238,11 @@ func (c *connState) admitListWindow(lkey []byte, head, tail int64, lpBytes uint6
 }
 
 // pushThroughWindow is the lock-free append fast path. When a hot-list window is resident it claims
-// the run's positions with one atomic bump of the reserved bound, writes the N element rows off the
-// stripe lock through f1raw's lock-free publish, then advances the committed bound in reservation
-// order, so many connections append to one hot key in parallel instead of serializing on its stripe
-// mutex. It returns false when no window is resident (the cold-key path admits one) or when the run
+// the run's positions with one atomic bump of the reserved bound, fills the N element bytes into the
+// resident ring off the stripe lock, then advances the committed bound in reservation order, so many
+// connections append to one hot key in parallel instead of serializing on its stripe mutex. No f1raw
+// row is written for a resident position (slice 3, impl/34): the ring is the only store for a
+// lock-free push, pop reads it with no hash probe, and drainEvict flushes survivors to rows on retire. It returns false when no window is resident (the cold-key path admits one) or when the run
 // carries an over-limit element (the stripe-lock body reports that error), leaving the caller to run
 // its stripe-lock body. bnd carries the per-command cumulative element counts for a coalesced run;
 // a nil bnd is a single command that replies one integer, the final length. The reply length is the
@@ -249,26 +271,29 @@ func (c *connState) pushThroughWindow(lkey []byte, atHead bool, elems [][]byte, 
 		baseLen = w.committedTail.Load() - oldHead
 		// LPUSH prepends each element in turn, so element i lands just below the old head: the run
 		// [e0..e_{n-1}] leaves the list [e_{n-1} .. e0, old...], which is element i at position
-		// start + (n-1-i), the same order the stripe-lock body produces by decrementing head. The
-		// PutKind error is dropped because the loop above pre-screened every element against
-		// listElemFastMax (f1raw's max value size), so a fixed-size element key and an in-bounds
-		// value cannot fail the point publish; the stripe-lock fallback is what handles oversize.
+		// start + (n-1-i), the same order the stripe-lock body produces by decrementing head. posElems
+		// is the run in position order (posElems[j] is the element at start+j), the reverse of the push
+		// order, so the ring fill in commitHead can index it by offset. No f1raw row is written here:
+		// a lock-free push lands its bytes only in the resident ring (commitHead fills it), and pop
+		// reads them straight from the ring with no hash probe. drainEvict flushes the surviving
+		// resident bytes to rows on retire, so durability and recovery are unchanged (slice 3, impl/34).
+		posElems := make([][]byte, n)
 		for i, elem := range elems {
 			pos := start + (n - 1 - int64(i))
-			ek := c.listElemKey(lkey, pos)
-			_, _ = c.srv.store.PutKind(ek, elem, kindListElem)
+			posElems[pos-start] = elem
 			sumBytes += int64(listEntrySize(elem))
 		}
-		w.commitHead(start, n)
+		w.commitHead(start, n, posElems)
 	} else {
 		start := w.reserveTail(n)
 		baseLen = start - w.committedHead.Load()
-		for i, elem := range elems {
-			ek := c.listElemKey(lkey, start+int64(i))
-			_, _ = c.srv.store.PutKind(ek, elem, kindListElem)
+		// RPUSH appends in order, so element i lands at start+i and elems is already in position
+		// order; it doubles as posElems for the ring fill in commitTail. No f1raw row is written: the
+		// bytes land only in the resident ring, and pop reads them from there (slice 3, impl/34).
+		for _, elem := range elems {
 			sumBytes += int64(listEntrySize(elem))
 		}
-		w.commitTail(start, n)
+		w.commitTail(start, n, elems)
 	}
 	w.addBytes(sumBytes)
 	w.gate.RUnlock()
@@ -541,8 +566,247 @@ func (c *connState) cmdPushCoalesced(lkey []byte, atHead, requireExisting bool, 
 	}
 }
 
+// popVerb classifies argv[0] as LPOP or RPOP in its no-count form (exactly two args: verb, key),
+// the shape the drain loop coalesces. atHead is true for LPOP. The count form (LPOP key N) and
+// every other command return ok false, so only a bare pipelined pop burst is folded and the count
+// form keeps its own array-reply dispatch. The leading-byte switch keeps the classification off
+// the GET/SET hot path, matching pushVerb.
+func popVerb(argv [][]byte) (atHead, ok bool) {
+	if len(argv) != 2 {
+		return false, false
+	}
+	cmd := argv[0]
+	if len(cmd) == 0 {
+		return false, false
+	}
+	switch cmd[0] {
+	case 'L', 'l', 'R', 'r':
+	default:
+		return false, false
+	}
+	switch {
+	case eqFold(cmd, "LPOP"):
+		return true, true
+	case eqFold(cmd, "RPOP"):
+		return false, true
+	}
+	return false, false
+}
+
+// lpopName and rpopName back the argv the drainPop fallback replays through cmdPop. cmdPop reads
+// argv[0] only for the arity error text, which a two-element argv never triggers, so a fixed name
+// is enough and no allocation per replayed pop is needed.
+var lpopName = []byte("LPOP")
+var rpopName = []byte("RPOP")
+
+// drainPop mirrors drainPush for the no-count pop: it counts a run of same-key, same-end LPOP or
+// RPOP commands from this one connection's pipeline and folds them into a single window claim, so a
+// pop burst on one hot key takes the window's commit mutex once instead of once per pop. It returns
+// the buffer offset past every command it counted. first is the already-parsed leading pop; pos
+// points just past it. lkey points into rbuf, which drain does not compact mid-batch, so it stays
+// valid across the peeks even as each parse reuses the shared argv backing.
+//
+// When popThroughWindowRun cannot serve the whole run (no window resident, the run would drain the
+// list, or a push is mid-flight) it replays exactly the commands it counted through the ordinary
+// one-command pop, so the reply shape, the near-empty tail, and a cold key behave identically to
+// running them unfolded. The replay uses a fixed two-element argv, so it needs the key, which
+// outlives the batch, and a static verb name.
+func (c *connState) drainPop(first [][]byte, atHead bool, pos int) int {
+	lkey := first[1]
+	n := int64(1)
+	end := pos
+	for {
+		argv, consumed, status := c.parse(c.rbuf[end:])
+		if status != parseOK {
+			break
+		}
+		ah, ok := popVerb(argv)
+		if !ok || ah != atHead || !bytes.Equal(argv[1], lkey) {
+			break
+		}
+		end += consumed
+		n++
+	}
+	if n > 1 {
+		// Folding is only a win past one command; a lone pop takes the ordinary path, which itself
+		// tries the window before the stripe lock.
+		if c.popThroughWindowRun(lkey, atHead, n) {
+			return end
+		}
+	}
+	name := rpopName
+	if atHead {
+		name = lpopName
+	}
+	replay := [2][]byte{name, lkey}
+	for i := int64(0); i < n; i++ {
+		c.cmdPop(replay[:], atHead)
+	}
+	return end
+}
+
 func (c *connState) cmdLPop(argv [][]byte) { c.cmdPop(argv, true) }
 func (c *connState) cmdRPop(argv [][]byte) { c.cmdPop(argv, false) }
+
+// popThroughWindow serves LPOP/RPOP off the resident hot-list window, the pop-side mirror of
+// pushThroughWindow (impl/33). It claims the popped positions with one mutex-guarded bound bump
+// and takes their rows off the stripe lock, so a pipelined pop burst on one hot key runs on many
+// cores instead of serializing on the key's stripe mutex the way the drain-then-stripe pop does.
+// It returns false, leaving the caller to run the ordinary stripe-lock pop, when no window is
+// resident, when the pop is unsafe off-lock (a push is mid-flight, or the pop would empty the
+// list, both of which popRun rejects), or when the run carries no element to pop. A resident
+// window means the key is already a list, admitted only after a push cleared the string-conflict
+// check, so no WRONGTYPE check is needed here, exactly as the push fast path omits it. want is the
+// requested element count (1 for the no-count form); hasCount picks the single-bulk versus array
+// reply shape. On success the list is still non-empty (popRun guarantees it), so no blocked-client
+// signal is needed, which only a push that makes a list non-empty raises.
+func (c *connState) popThroughWindow(lkey []byte, atHead, hasCount bool, want int64) bool {
+	w := c.srv.listWinLookup(lkey)
+	if w == nil {
+		return false
+	}
+	w.gate.RLock()
+	if w.evicted.Load() {
+		w.gate.RUnlock()
+		return false
+	}
+	ok := c.popEmitWindow(w, lkey, atHead, hasCount, want)
+	w.gate.RUnlock()
+	return ok
+}
+
+// popEmitWindow claims a run of want positions from a committed end of the window and emits each as
+// one bulk reply, all under the window's commit mutex, the single critical section slice 3 relies on
+// for correctness. It is the pop-side mirror of the reserve-then-fill push path (impl/33), rewritten
+// so the element bytes come from the resident ring instead of an f1raw hash probe, which is what
+// removes the measured 36% find (impl/34). hasCount writes the array header for the count form; the
+// no-count form writes a bare bulk. It returns false, sending the caller to the stripe-lock pop,
+// when the pop is unsafe off-lock, in the same two cases the old popRun rejected:
+//
+//   - A push is mid-flight (a reserved bound sits ahead of its committed bound). The push commit
+//     ordering (pendHead, pendTail) assumes a bound moves one direction only, so a pop that moved
+//     the same bound the other way could strand a pending run.
+//   - The pop would empty or underflow the list (want >= live). The emptying-to-header-delete
+//     transition and any head/tail crossing belong to the stripe path, which owns deleting the key.
+//
+// The critical section is the claim, not the emit: under w.mu the pop validates the bounds, advances
+// the committed end past the run, and detaches each claimed element's bytes into a per-connection
+// scratch (c.popBufs), then releases the mutex and does all RESP framing (the array header plus one
+// writeBulk per element) off-lock. That split is what lets many connections popping the SAME hot key
+// use more than one core: the RESP framing (integer-to-ASCII length, the $-len-CRLF wrapper, the byte
+// copy into the reply buffer) is the dominant per-op cost, and holding w.mu across it serialized
+// every popper on this key. Advancing the bound is O(1), so the mutex is now held for O(run) pointer
+// moves instead of O(run) framings.
+//
+// Detaching is what makes the off-lock emit race-free. A resident slot is taken with ring.takeSlot,
+// which nils the slot, so the returned slice is sole-owned: a concurrent push cannot alias it (push
+// only writes slots inside the live [committedHead, committedTail) span, and the claimed run now sits
+// outside that span) and a concurrent grow cannot drop it (grow rehashes only the live span by
+// reference). A pre-block position (still backed by an f1raw row from the admitting push) is taken
+// with TakeKindNoCount into a freshly allocated buffer, not the shared c.vbuf, because popBufs holds
+// every claimed slice across the whole run and a shared buffer would let each take clobber the last.
+// TakeKindNoCount leaves the store's shared record counter untouched so it is adjusted once per run in
+// a single AddCount after the lock, rather than per element on the contended line; resident positions
+// were never counted (their push skipped PutKind), so they owe no count adjustment.
+func (c *connState) popEmitWindow(w *listWindow, lkey []byte, atHead, hasCount bool, want int64) bool {
+	if want <= 0 {
+		return false
+	}
+	w.mu.Lock()
+	ch := w.committedHead.Load()
+	ct := w.committedTail.Load()
+	if w.reservedHead.Load() != ch || w.reservedTail.Load() != ct {
+		w.mu.Unlock()
+		return false
+	}
+	if want >= ct-ch {
+		w.mu.Unlock()
+		return false
+	}
+	var lo, hi int64
+	if atHead {
+		lo = ch
+		hi = ch + want
+		w.committedHead.Store(hi)
+		w.reservedHead.Store(hi)
+	} else {
+		hi = ct
+		lo = ct - want
+		w.committedTail.Store(lo)
+		w.reservedTail.Store(lo)
+	}
+	// Claim each element's bytes into popBufs in emission order. Resident slots are detached (nil'd)
+	// so the captured slice survives a concurrent push or grow; pre-block rows are taken into a fresh
+	// buffer so popBufs entries never alias one another.
+	buf := c.popBufs[:0]
+	var sumBytes, preCount int64
+	claim := func(pos int64) {
+		if w.resident(pos) {
+			v := w.ring.takeSlot(pos)
+			sumBytes += int64(listEntrySize(v))
+			buf = append(buf, v)
+			return
+		}
+		ek := c.listElemKey(lkey, pos)
+		v, _ := c.srv.store.TakeKindNoCount(ek, nil, kindListElem)
+		sumBytes += int64(listEntrySize(v))
+		buf = append(buf, v)
+		preCount++
+	}
+	// LPOP returns elements head-outward (positions lo, lo+1, ...); RPOP returns them tail-inward.
+	if atHead {
+		for pos := lo; pos < hi; pos++ {
+			claim(pos)
+		}
+	} else {
+		for pos := hi - 1; pos >= lo; pos-- {
+			claim(pos)
+		}
+	}
+	// The claim loop has read every popped position at its pre-contraction classification, so it is
+	// now safe to walk the pre-block band inward to the bound this pop just advanced. That keeps a
+	// position re-pushed into a freed seed number reading from the ring the push filled it in, not
+	// from the row this pop deleted.
+	if atHead {
+		w.contractPreblock(true, hi)
+	} else {
+		w.contractPreblock(false, lo)
+	}
+	w.mu.Unlock()
+	c.popBufs = buf
+	// Frame the claimed bytes off-lock. popBufs is already in emission order for both ends.
+	if hasCount {
+		c.writeArrayHeader(len(buf))
+	}
+	for _, v := range buf {
+		c.writeBulk(v)
+	}
+	if preCount > 0 {
+		c.srv.store.AddCount(-preCount)
+	}
+	w.addBytes(-sumBytes)
+	return true
+}
+
+// popThroughWindowRun serves a run of n no-count pops off the resident hot-list window in one
+// bound bump, then writes one bulk reply per popped element. It is the coalesced form of
+// popThroughWindow: the drain loop counts a pipeline's consecutive same-key, same-end LPOP or RPOP
+// commands from one connection and folds them here so the window's commit mutex is taken once for
+// the whole run instead of once per pop, the piece that lets a pop burst on one hot key use more
+// than one core. It returns false, leaving the caller to replay the run one command at a time,
+// whenever the run cannot be served off-lock (no window resident, a push is mid-flight, or the run
+// would drain the list). A resident window means the key is already a list, so no WRONGTYPE check
+// is needed, exactly as popThroughWindow and the push fast path omit it.
+func (c *connState) popThroughWindowRun(lkey []byte, atHead bool, n int64) bool {
+	w := c.srv.listWinLookup(lkey)
+	if w == nil {
+		return false
+	}
+	w.gate.RLock()
+	ok := !w.evicted.Load() && c.popEmitWindow(w, lkey, atHead, false, n)
+	w.gate.RUnlock()
+	return ok
+}
 
 // cmdPop is the shared body for LPOP (atHead) and RPOP (atTail). Without a count it returns
 // one element as a bulk string (nil on a missing key); with a count it returns an array of up
@@ -575,6 +839,29 @@ func (c *connState) cmdPop(argv [][]byte, atHead bool) {
 	}
 
 	lkey := argv[1]
+	// A resident hot-list window serves the pop lock-free off the stripe lock. It short-circuits on
+	// a single atomic load when no list is hot, and bails to the stripe path below when the pop is
+	// near-empty or racing a push, so a cold key or a draining tail falls straight through.
+	if c.popThroughWindow(lkey, atHead, hasCount, count) {
+		return
+	}
+	// Lock-free empty/missing fast path. A drained queue that many connections keep polling would
+	// otherwise serialize every nil-returning pop on the key's stripe mutex: 512 pollers each take
+	// the exclusive lock only to observe the key is gone and reply nil, and that single mutex caps
+	// the whole workload at one core. popThroughWindow already returned false, so there is no
+	// resident window to serve, and resolveType reads through f1raw's lock-free index alone. Seeing
+	// nothing means the list was empty at this instant, so each poller answers its own nil in
+	// parallel. It is linearizable: a later push that recreates the key is ordered after this reply,
+	// exactly as a stripe-locked miss would order it. resolveType may leave scratch in c.vbuf, which
+	// is fine because this branch returns without touching a held element.
+	if c.resolveType(lkey) == keyMissing {
+		if hasCount {
+			c.writeNilArray()
+		} else {
+			c.writeNil()
+		}
+		return
+	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
 	if c.stringConflict(lkey) {
@@ -682,6 +969,11 @@ func (c *connState) cmdLIndex(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	// A resident push leaves the element bytes only in the ring, not in an f1raw row (slice 3), so
+	// retire the window first to flush every resident position back to its row before the point read.
+	// Slice 4 will make this read resident-first and drop the evict; for now the interim flush keeps
+	// LINDEX correct. The evict needs the exclusive stripe lock, which this command already holds.
+	c.listWinDrainEvict(lkey)
 	head, tail, _, _, ok := c.listHeader(lkey)
 	if !ok {
 		mu.Unlock()
@@ -714,8 +1006,16 @@ func (c *connState) cmdLIndex(argv [][]byte) {
 // list length the way Redis does (negatives count from the end, start clamps up to 0, stop
 // clamps down to the last index) and streams each element in the window directly by position,
 // one point lookup apiece. An empty or inverted range replies with an empty array; a plain
-// string under the key is WRONGTYPE. It takes the stripe lock so the window is stable across
-// the walk.
+// string under the key is WRONGTYPE.
+//
+// When the list is hot it reads resident-first off the window: each in-range position that lives
+// in the ring is a plain slot fetch with no f1raw probe, and only the small pre-block band still
+// costs a row read. It holds the window's eviction gate as a reader for that, which pins the ring
+// and bounds and runs alongside the lock-free pushes (they only extend the tail above this
+// snapshot) while excluding the interior edits that take the gate exclusively. With the ring
+// pinned by the shared gate the stripe lock is no longer needed, so it is released, and LRANGE on
+// one hot key then runs in parallel across cores instead of serializing on the stripe. A cold list
+// has no window (w is nil) and every position falls to its row under the stripe lock.
 func (c *connState) cmdLRange(argv [][]byte) {
 	if len(argv) != 4 {
 		c.writeErr("ERR wrong number of arguments for 'lrange' command")
@@ -733,21 +1033,32 @@ func (c *connState) cmdLRange(argv [][]byte) {
 		return
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
-	// LRANGE only excludes concurrent list writers, not other readers, so it takes the shared
-	// lock and lets many LRANGE of one hot list run on many cores at once, a win a
-	// single-threaded server cannot match. A list has no per-element TTL and the read never
-	// mutates under the lock, so the shared path is always safe.
-	mu.RLock()
+	mu.Lock()
 	if c.stringConflict(lkey) {
-		mu.RUnlock()
+		mu.Unlock()
 		c.writeErr(wrongType)
 		return
 	}
-	head, tail, _, _, ok := c.listHeader(lkey)
-	if !ok {
-		mu.RUnlock()
-		c.writeArrayHeader(0)
-		return
+	w := c.srv.listWinLookup(lkey)
+	if w != nil {
+		w.gate.RLock()
+		if w.evicted.Load() {
+			w.gate.RUnlock()
+			w = nil
+		}
+	}
+	var head, tail int64
+	if w != nil {
+		head, tail = w.bounds()
+		mu.Unlock()
+	} else {
+		var ok bool
+		head, tail, _, _, ok = c.listHeader(lkey)
+		if !ok {
+			mu.Unlock()
+			c.writeArrayHeader(0)
+			return
+		}
 	}
 	n := tail - head
 	if start < 0 {
@@ -763,18 +1074,24 @@ func (c *connState) cmdLRange(argv [][]byte) {
 		stop = n - 1
 	}
 	if start > stop || start >= n {
-		mu.RUnlock()
+		if w != nil {
+			w.gate.RUnlock()
+		} else {
+			mu.Unlock()
+		}
 		c.writeArrayHeader(0)
 		return
 	}
 	c.writeArrayHeader(int(stop - start + 1))
 	for i := start; i <= stop; i++ {
-		ek := c.listElemKey(lkey, head+i)
-		v, _ := c.srv.store.GetKind(ek, c.vbuf[:0], kindListElem)
-		c.vbuf = v
+		v, _ := c.listElemRead(w, lkey, head+i)
 		c.writeBulk(v)
 	}
-	mu.RUnlock()
+	if w != nil {
+		w.gate.RUnlock()
+	} else {
+		mu.Unlock()
+	}
 }
 
 // cmdLSet implements LSET: it overwrites the element at a signed index with a new value, an
@@ -905,15 +1222,45 @@ func (c *connState) cmdLPos(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	head, tail, _, _, ok := c.listHeader(lkey)
-	if !ok {
-		mu.Unlock()
-		if count >= 0 {
-			c.writeArrayHeader(0)
-		} else {
-			c.writeNil()
+	// Scan the list in place. When the list is hot its elements live in the resident ring, so the
+	// scan reads them straight from ring slots with no f1raw probe and no flush to rows: it holds the
+	// window's eviction gate, which waits out every in-flight push and blocks new ones, so the ring
+	// and bounds are stable for the read (the stripe lock already excludes other non-push commands).
+	// A uniform-pivot LPOS over a large list scans about half the list, so keeping that scan at
+	// memory speed instead of one hash probe per position is what carries it past a contiguous
+	// listpack walk. A cold list has no window, so w is nil and every position falls to its row.
+	w := c.srv.listWinLookup(lkey)
+	if w != nil {
+		w.gate.RLock()
+		if w.evicted.Load() {
+			w.gate.RUnlock()
+			w = nil
 		}
-		return
+	}
+	var head, tail int64
+	if w != nil {
+		head, tail = w.bounds()
+		// LPOS only reads, so the shared gate is enough: it excludes the interior edits that take
+		// the gate exclusively (LINSERT, LREM, drainEvict) and runs alongside the lock-free pushes,
+		// which only extend the committed tail above this snapshot and never touch a scanned slot.
+		// With the ring and bounds pinned by the shared gate, the stripe lock is no longer needed, so
+		// release it here: LPOS on one hot key then runs in parallel across cores instead of
+		// serializing on the stripe, which is what a uniform scan over a large list needs to beat a
+		// single-threaded listpack walk. The cold path below keeps the stripe lock, since a list with
+		// no window has no gate to stand in for it.
+		mu.Unlock()
+	} else {
+		var ok bool
+		head, tail, _, _, ok = c.listHeader(lkey)
+		if !ok {
+			mu.Unlock()
+			if count >= 0 {
+				c.writeArrayHeader(0)
+			} else {
+				c.writeNil()
+			}
+			return
+		}
 	}
 
 	// Direction and how many leading matches to skip come from the sign and magnitude of rank.
@@ -922,8 +1269,12 @@ func (c *connState) cmdLPos(argv [][]byte) {
 	if backward {
 		skip = -rank - 1
 	}
-	matches := c.lposScan(lkey, target, head, tail, backward, skip, count, maxlen)
-	mu.Unlock()
+	matches := c.lposScan(w, lkey, target, head, tail, backward, skip, count, maxlen)
+	if w != nil {
+		w.gate.RUnlock()
+	} else {
+		mu.Unlock()
+	}
 
 	if count >= 0 {
 		c.writeArrayHeader(len(matches))
@@ -939,42 +1290,126 @@ func (c *connState) cmdLPos(argv [][]byte) {
 	c.writeInt(matches[0])
 }
 
-// lposScan walks the window in the search direction, comparing each element to target and
-// collecting the dense positions of the matches after skipping the first skip of them. It
-// stops when it has enough (want, where want <= 0 with a given COUNT means all) or when it has
-// compared maxlen elements (maxlen 0 disables the cap). The returned positions are external
-// indexes (offset from head), so they are already in the form the reply wants.
-func (c *connState) lposScan(lkey, target []byte, head, tail int64, backward bool, skip, want, maxlen int64) []int64 {
-	var out []int64
-	var compared int64
-	step := int64(1)
-	pos := head
-	if backward {
-		step = -1
-		pos = tail - 1
-	}
-	for pos >= head && pos < tail {
-		if maxlen > 0 && compared >= maxlen {
-			break
+// lposScan walks the window in the search direction, collecting the dense positions of the elements
+// equal to target after skipping the first skip of them. It stops when it has enough (want, where
+// want <= 0 with a given COUNT means all) or once it has examined maxlen positions (maxlen 0 disables
+// the cap). The returned positions are external indexes (offset from head), the form the reply wants.
+//
+// For a hot list the resident positions are scanned through the ring's signature array: bytes.Index
+// rules out every position whose one-byte signature cannot match the target, so a full byte compare
+// runs only at the rare signature hit instead of once per position. That is what carries a large-list
+// LPOS past a contiguous listpack walk, where the per-position pointer chase of the raw ring could
+// not. The small pre-block band still reads its f1raw rows one position at a time. A cold list has no
+// window (w is nil) and falls entirely to row reads.
+func (c *connState) lposScan(w *listWindow, lkey, target []byte, head, tail int64, backward bool, skip, want, maxlen int64) []int64 {
+	// Clamp the examined range to at most maxlen positions from the scan's starting end, which is
+	// exactly LPOS MAXLEN: a match past that many positions is not reported.
+	eLo, eHi := head, tail
+	if maxlen > 0 {
+		if backward {
+			if eHi-maxlen > eLo {
+				eLo = eHi - maxlen
+			}
+		} else {
+			if eLo+maxlen < eHi {
+				eHi = eLo + maxlen
+			}
 		}
-		ek := c.listElemKey(lkey, pos)
-		v, found := c.srv.store.GetKind(ek, c.vbuf[:0], kindListElem)
-		c.vbuf = v
-		compared++
-		if found && string(v) == string(target) {
-			if skip > 0 {
-				skip--
-			} else {
-				out = append(out, pos-head)
-				// want < 0 means single-match mode: one is enough. want == 0 means all matches.
-				if want < 0 || (want > 0 && int64(len(out)) >= want) {
+	}
+
+	var out []int64
+	// emit records a confirmed match after honoring the skip prefix and reports whether the scan has
+	// collected enough to stop. want < 0 is single-match mode, want == 0 (COUNT 0) is all matches.
+	emit := func(pos int64) bool {
+		if skip > 0 {
+			skip--
+			return false
+		}
+		out = append(out, pos-head)
+		return want < 0 || (want > 0 && int64(len(out)) >= want)
+	}
+
+	if w == nil {
+		if backward {
+			for pos := eHi - 1; pos >= eLo; pos-- {
+				if v, found := c.listElemRead(nil, lkey, pos); found && string(v) == string(target) && emit(pos) {
+					break
+				}
+			}
+		} else {
+			for pos := eLo; pos < eHi; pos++ {
+				if v, found := c.listElemRead(nil, lkey, pos); found && string(v) == string(target) && emit(pos) {
 					break
 				}
 			}
 		}
-		pos += step
+		return out
+	}
+
+	wantSig := listSig(target)
+	wantSig2 := listSig2(target)
+	scanResident := func(lo, hi int64) bool {
+		stop := false
+		visit := func(pos int64) bool {
+			if !w.ring.sig2Hit(pos, wantSig2) {
+				return false
+			}
+			if v := w.ring.get(pos); v != nil && string(v) == string(target) && emit(pos) {
+				stop = true
+				return true
+			}
+			return false
+		}
+		if backward {
+			w.ring.scanSigBackward(lo, hi, wantSig, visit)
+		} else {
+			w.ring.scanSigForward(lo, hi, wantSig, visit)
+		}
+		return stop
+	}
+	scanRows := func(lo, hi int64) bool {
+		if backward {
+			for pos := hi - 1; pos >= lo; pos-- {
+				if v, found := c.listElemRead(w, lkey, pos); found && string(v) == string(target) && emit(pos) {
+					return true
+				}
+			}
+		} else {
+			for pos := lo; pos < hi; pos++ {
+				if v, found := c.listElemRead(w, lkey, pos); found && string(v) == string(target) && emit(pos) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// The only non-resident positions are the pre-block band [preLo, preHi); everything else is in
+	// the ring. Split the examined range into resident head, pre-block middle, resident tail, and walk
+	// the three in search-direction order so matches come back in list order.
+	bLo, bHi := clampRange(w.preLo.Load(), eLo, eHi), clampRange(w.preHi.Load(), eLo, eHi)
+	if backward {
+		if scanResident(bHi, eHi) || scanRows(bLo, bHi) || scanResident(eLo, bLo) {
+			return out
+		}
+	} else {
+		if scanResident(eLo, bLo) || scanRows(bLo, bHi) || scanResident(bHi, eHi) {
+			return out
+		}
 	}
 	return out
+}
+
+// clampRange returns v confined to [lo, hi], the helper lposScan uses to fit the pre-block bounds
+// into the examined range so its three segments stay ordered and non-overlapping.
+func clampRange(v, lo, hi int64) int64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 // cmdLTrim implements LTRIM: it keeps only the positional window [start, stop] and discards
@@ -1060,6 +1495,176 @@ func (c *connState) cmdLTrim(argv [][]byte) {
 	c.writeSimple("OK")
 }
 
+// listPromoteResident flushes a hot list's pre-block into the ring and drops the backing rows, so
+// every live position becomes ring-resident and an interior edit can slide slots in memory instead
+// of rewriting f1raw rows. The pre-block is the seed span the admitting push left in rows; for a
+// list built by appends (an RPUSH or LPUSH per element) it is a single position, so this is
+// O(pre-block), not O(n). The caller holds the key stripe lock and the window eviction gate, so no
+// push is in flight and the ring and bounds are quiescent. After it preLo == preHi == 0, so
+// resident() is true for every position and a later drainEvict re-flushes them all from the ring.
+// Taking each pre-block row here removes its counted f1raw record; drainEvict re-creates it, so the
+// count balances over the window's life exactly as it did before promotion.
+func (c *connState) listPromoteResident(w *listWindow, lkey []byte) {
+	head, tail := w.bounds()
+	lo, hi := w.preLo.Load(), w.preHi.Load()
+	if lo < head {
+		lo = head
+	}
+	if hi > tail {
+		hi = tail
+	}
+	for p := lo; p < hi; p++ {
+		v, found := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
+		if found {
+			c.vbuf = v
+			w.ring.put(p, v)
+		}
+	}
+	w.preLo.Store(0)
+	w.preHi.Store(0)
+}
+
+// linsertResident runs LINSERT on a resident hot list entirely in memory. It promotes the tiny
+// pre-block into the ring, finds the pivot through the signature scan, then opens a one-slot gap by
+// sliding the shorter side of the pivot in the ring (pointer moves, no per-row I/O) and writes the
+// new element into the freed slot. The window head or tail grows by one to match, both its committed
+// and reserved bound since no push is in flight under the gate. It returns the new length, or -1 when
+// the pivot is absent. This is the path that has to clear the 2x bar: the old row-shift walk paid an
+// f1raw take-and-put per shifted position, tens of milliseconds on a deep pivot, where a real
+// listpack shifts its bytes in memory.
+func (c *connState) linsertResident(w *listWindow, lkey, pivot, val []byte, before bool) int64 {
+	c.listPromoteResident(w, lkey)
+	head, tail := w.bounds()
+
+	wantSig := listSig(pivot)
+	wantSig2 := listSig2(pivot)
+	var pivotPos int64
+	found := false
+	w.ring.scanSigForward(head, tail, wantSig, func(pos int64) bool {
+		if !w.ring.sig2Hit(pos, wantSig2) {
+			return false
+		}
+		if v := w.ring.get(pos); v != nil && string(v) == string(pivot) {
+			pivotPos = pos
+			found = true
+			return true
+		}
+		return false
+	})
+	if !found {
+		return -1
+	}
+
+	// Insertion index i within the window: BEFORE lands at the pivot's index, AFTER at the next one.
+	// Shift whichever side of the slot has fewer elements, so the move is O(min(i, n-i)) ring slides.
+	i := pivotPos - head
+	if !before {
+		i++
+	}
+	n := tail - head
+	if i <= n-i {
+		w.ringEnsure(head-1, tail)
+		w.ring.shiftDown(head, head+i)
+		w.ring.put(head+i-1, val)
+		w.committedHead.Store(head - 1)
+		w.reservedHead.Store(head - 1)
+	} else {
+		w.ringEnsure(head, tail+1)
+		w.ring.shiftUp(head+i, tail)
+		w.ring.put(head+i, val)
+		w.committedTail.Store(tail + 1)
+		w.reservedTail.Store(tail + 1)
+	}
+	w.addBytes(int64(listEntrySize(val)))
+	return n + 1
+}
+
+// lremResident runs LREM on a resident hot list entirely in memory. It promotes the pre-block, then
+// collects the positions to drop through the signature scan, bounded by the count: a positive count
+// stops after the first count matches from the head, a negative count after the last |count| from the
+// tail, and zero takes them all. It then compacts the survivors down through the ring with a write
+// cursor, sliding a survivor by a pointer move only when a gap has opened before it, and shrinks the
+// committed tail to match. Removing the last element retires the window and drops the key. It returns
+// the number removed. The old path scanned the whole list on every LREM even for count 1 and rewrote
+// each survivor's f1raw row; this bounds the scan and keeps the compaction in memory.
+func (c *connState) lremResident(w *listWindow, lkey, target []byte, count int64) int64 {
+	c.listPromoteResident(w, lkey)
+	head, tail := w.bounds()
+
+	wantSig := listSig(target)
+	wantSig2 := listSig2(target)
+	del := make(map[int64]struct{})
+	if count >= 0 {
+		need := count // 0 means every match
+		w.ring.scanSigForward(head, tail, wantSig, func(pos int64) bool {
+			if !w.ring.sig2Hit(pos, wantSig2) {
+				return false
+			}
+			if v := w.ring.get(pos); v != nil && string(v) == string(target) {
+				del[pos] = struct{}{}
+				if need > 0 && int64(len(del)) >= need {
+					return true
+				}
+			}
+			return false
+		})
+	} else {
+		need := -count
+		w.ring.scanSigBackward(head, tail, wantSig, func(pos int64) bool {
+			if !w.ring.sig2Hit(pos, wantSig2) {
+				return false
+			}
+			if v := w.ring.get(pos); v != nil && string(v) == string(target) {
+				del[pos] = struct{}{}
+				if int64(len(del)) >= need {
+					return true
+				}
+			}
+			return false
+		})
+	}
+	if len(del) == 0 {
+		return 0
+	}
+
+	removed := int64(0)
+	wpos := head
+	for p := head; p < tail; p++ {
+		if _, drop := del[p]; drop {
+			w.addBytes(-int64(listEntrySize(w.ring.get(p))))
+			removed++
+			continue
+		}
+		if wpos != p {
+			w.ring.move(wpos, p)
+		}
+		wpos++
+	}
+	if wpos == head {
+		c.listWinDropEmpty(w, lkey)
+		return removed
+	}
+	w.committedTail.Store(wpos)
+	w.reservedTail.Store(wpos)
+	return removed
+}
+
+// listWinDropEmpty retires a hot list's window when an interior edit removed its last element,
+// deleting the persistent header row so the key stops existing. The caller holds the key stripe lock
+// and the window gate, so no push is in flight and no other command is mid-read; after this the key
+// is cold and a later push re-admits from a fresh header. The pre-block was already promoted and its
+// rows taken, and resident positions were never rows, so no element rows remain to delete.
+func (c *connState) listWinDropEmpty(w *listWindow, lkey []byte) {
+	s := c.srv
+	sh := s.listWinShardFor(lkey)
+	sh.mu.Lock()
+	delete(sh.m, string(lkey))
+	sh.mu.Unlock()
+	w.evicted.Store(true)
+	s.listWinLive.Add(-1)
+	c.srv.store.DeleteKind(lkey, kindListMeta)
+}
+
 // cmdLInsert implements LINSERT key BEFORE|AFTER pivot value. It is the first list command
 // that edits the interior of the window rather than an end, so it is where the dense-window
 // model has to answer what the spec's sparse fractional order key (2064/f1_rewrite_ltm/08)
@@ -1098,7 +1703,30 @@ func (c *connState) cmdLInsert(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	c.listWinDrainEvict(lkey)
+	// A hot list carries its live elements in the resident ring, so the interior shift runs there as
+	// pointer moves instead of a take-and-put per position on f1raw rows, the difference between a
+	// deep-pivot LINSERT costing milliseconds and costing microseconds. Hold the eviction gate so the
+	// ring and bounds are stable (the stripe lock already excludes other non-push commands); a cold
+	// list has no window and falls to the row path below.
+	w := c.srv.listWinLookup(lkey)
+	if w != nil {
+		w.gate.Lock()
+		if w.evicted.Load() {
+			w.gate.Unlock()
+			w = nil
+		}
+	}
+	if w != nil {
+		reply := c.linsertResident(w, lkey, pivot, val, before)
+		w.gate.Unlock()
+		mu.Unlock()
+		if reply > 0 {
+			// The list grew by one, so it can satisfy a client blocked on this key.
+			c.srv.signalListKey(lkey)
+		}
+		c.writeInt(reply)
+		return
+	}
 	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
 	if !ok {
 		mu.Unlock()
@@ -1202,7 +1830,25 @@ func (c *connState) cmdLRem(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	c.listWinDrainEvict(lkey)
+	// A hot list removes and compacts in the resident ring: the match scan is bounded by the count
+	// and the survivor slide is pointer moves, where the row path scanned the whole list on every
+	// call and rewrote each survivor's f1raw row. Hold the eviction gate so the ring and bounds are
+	// stable; a cold list has no window and falls to the row path below.
+	w := c.srv.listWinLookup(lkey)
+	if w != nil {
+		w.gate.Lock()
+		if w.evicted.Load() {
+			w.gate.Unlock()
+			w = nil
+		}
+	}
+	if w != nil {
+		removed := c.lremResident(w, lkey, target, count)
+		w.gate.Unlock()
+		mu.Unlock()
+		c.writeInt(removed)
+		return
+	}
 	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
 	if !ok {
 		mu.Unlock()
@@ -1210,13 +1856,18 @@ func (c *connState) cmdLRem(argv [][]byte) {
 		return
 	}
 
-	// Pass one: collect the positions of every match in list order.
+	// Pass one: collect the positions of every match in list order. A positive count only ever drops
+	// the leading matches, so the scan can stop once it has that many; a non-positive count needs
+	// every match, so it runs to the end.
 	var matches []int64
 	for p := head; p < tail; p++ {
 		v, found := c.srv.store.GetKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
 		c.vbuf = v
 		if found && string(v) == string(target) {
 			matches = append(matches, p)
+			if count > 0 && int64(len(matches)) >= count {
+				break
+			}
 		}
 	}
 	if len(matches) == 0 {
@@ -1254,7 +1905,7 @@ func (c *connState) cmdLRem(argv [][]byte) {
 	// its bytes come off the running size; a survivor slides down to the cursor only when a gap has
 	// opened before it, so an untouched prefix is never rewritten.
 	removed := int64(0)
-	w := head
+	wc := head
 	for p := head; p < tail; p++ {
 		if _, drop := del[p]; drop {
 			v, took := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
@@ -1264,18 +1915,18 @@ func (c *connState) cmdLRem(argv [][]byte) {
 			removed++
 			continue
 		}
-		if w != p {
+		if wc != p {
 			v, _ := c.srv.store.TakeKind(c.listElemKey(lkey, p), c.vbuf[:0], kindListElem)
 			c.vbuf = v
-			_, _ = c.srv.store.PutKind(c.listElemKey(lkey, w), v, kindListElem)
+			_, _ = c.srv.store.PutKind(c.listElemKey(lkey, wc), v, kindListElem)
 		}
-		w++
+		wc++
 	}
-	if w == head {
+	if wc == head {
 		// Every element was removed: the list is empty, so the key stops existing.
 		c.srv.store.DeleteKind(lkey, kindListMeta)
 	} else {
-		c.listPutHeaderAt(hoff, head, w, lpBytes, everLarge)
+		c.listPutHeaderAt(hoff, head, wc, lpBytes, everLarge)
 	}
 	mu.Unlock()
 	c.writeInt(removed)

@@ -47,6 +47,7 @@ type connState struct {
 	hscanO   []uint64  // reused scratch for a whole-hash value-carrying read's record-offset batch
 	pushColl [][]byte  // reused scratch for a coalesced push run's elements, in arrival order
 	pushBnd  []int     // reused scratch for the coalesced push run's per-command element boundaries
+	popBufs  [][]byte  // reused scratch for a window pop run's claimed element slices, framed after the commit mutex releases
 
 	// Transaction state (MULTI/EXEC/DISCARD/WATCH/UNWATCH). inMulti is set between MULTI
 	// and EXEC/DISCARD; while it is set every non-transaction command is copied into
@@ -152,6 +153,8 @@ func (c *connState) drain() bool {
 			// either of those, or any other command, takes the ordinary one-command dispatch.
 			if atHead, requireExisting, ok := pushVerb(argv); ok && !c.inMulti && !c.psMode {
 				pos = c.drainPush(argv, atHead, requireExisting, pos)
+			} else if atHead, ok := popVerb(argv); ok && !c.inMulti && !c.psMode {
+				pos = c.drainPop(argv, atHead, pos)
 			} else {
 				c.dispatch(argv)
 			}
