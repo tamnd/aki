@@ -942,6 +942,10 @@ func (c *connState) dropKeyLocked(key []byte) bool {
 	case keySet:
 		c.dropCollIndex(c.setPrefix(key), kindSetMember)
 		c.srv.store.DeleteKind(key, kindSetMeta)
+		// Drop the set's dense member vector alongside its rows (spec 2064/18 5.3). setPrefix
+		// is rebuilt here because dropCollIndex already consumed the shared pbuf; CollRandDrop
+		// consumes this fresh prefix synchronously, so the two never overlap.
+		c.srv.store.CollRandDrop(c.setPrefix(key))
 		return true
 	case keyZset:
 		// A zset carries two element indexes (member-family and score-family rows), so both

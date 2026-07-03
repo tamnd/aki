@@ -51,6 +51,11 @@ func (c *connState) clearSetRows(skey []byte) {
 		}
 	}
 	c.srv.store.DeleteKind(skey, kindSetMeta)
+	// Drop skey's dense member vector wholesale (spec 2064/18 5.3): the set is gone, so its
+	// vector is stale. A later STORE into this same key rebuilds a fresh vector on first draw
+	// from the newly-published rows, and the per-member CollRandInsert calls in storeAlgebra
+	// no-op until then, so nothing points at the just-deleted rows.
+	c.srv.store.CollRandDrop(prefix)
 }
 
 // storeAlgebra is the shared body of the three STORE forms: it locks the destination and
@@ -95,6 +100,10 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 		}
 		if isNew {
 			c.srv.store.CollInsert(mk, kindSetMember)
+			// Append the freshly-stored member to the destination's dense vector if one exists (spec
+			// 2064/18 5.1). The prefix is rebuilt per member into pbuf, distinct from mk's kbuf, and
+			// consumed synchronously, so it never collides with the member key being inserted.
+			c.srv.store.CollRandInsert(c.setPrefix(dest), mk, kindSetMember)
 			count++
 			enc = foldSetEnc(enc, m, uint64(count))
 		}

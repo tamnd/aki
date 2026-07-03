@@ -124,6 +124,11 @@ func (c *connState) moveRows(src, dst []byte) {
 	case keySet:
 		c.moveIndexedFamily(src, dst, kindSetMember)
 		c.moveHeader(src, dst, kindSetMeta)
+		// Drop the source's dense member vector (spec 2064/18 5.3): moveIndexedFamily republishes
+		// every member under dst's prefix at a fresh arena offset and deletes the source rows, so
+		// an offset-preserving re-key is impossible. The destination builds its own vector on first
+		// draw from the moved rows; the source vector would only point at deleted records.
+		c.srv.store.CollRandDrop(c.setPrefix(src))
 	case keyZset:
 		c.moveIndexedFamily(src, dst, kindZsetMember)
 		c.moveIndexedFamily(src, dst, kindZsetScore)
