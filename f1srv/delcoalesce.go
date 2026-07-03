@@ -179,12 +179,21 @@ func (c *connState) cmdSRemCoalesced(skey []byte, elems [][]byte, bnd []int) {
 	counts := c.delCnt[:0]
 	buf := c.delKeyBuf[:0]
 	ends := c.delKeyEnd[:0]
+	// Hoist the set prefix once (pbuf) for the dense vector's remove routing. memberKey below uses
+	// kbuf and CollRandRemove never touches pbuf, so this stays stable across the whole run.
+	prefix := c.setPrefix(skey)
 	total := 0
 	i := 0
 	for _, end := range bnd {
 		removed := 0
 		for ; i < end; i++ {
 			mk := c.memberKey(skey, elems[i])
+			// Swap-remove the member from the dense vector if one exists (spec 2064/18 5.2) BEFORE
+			// the record is deleted: CollRandRemove resolves the member's arena offset through the
+			// hash index, so it must run while the record is still resolvable. On a member that is
+			// not actually present the find returns not-found and this no-ops, matching the
+			// DeleteKindNoCount below which then also reports nothing removed.
+			c.srv.store.CollRandRemove(prefix, mk, kindSetMember)
 			if c.srv.store.DeleteKindNoCount(mk, kindSetMember) {
 				buf = append(buf, mk...)
 				ends = append(ends, len(buf))

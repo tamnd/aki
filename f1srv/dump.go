@@ -1540,6 +1540,7 @@ func (c *connState) rdbWriteValue(key []byte, v rdbValue) error {
 	case keySet:
 		var count uint64
 		enc := encNone
+		prefix := c.setPrefix(key)
 		for _, m := range v.elems {
 			mk := c.memberKey(key, m)
 			isNew, err := c.srv.store.PutKind(mk, nil, kindSetMember)
@@ -1548,6 +1549,11 @@ func (c *connState) rdbWriteValue(key []byte, v rdbValue) error {
 			}
 			if isNew {
 				c.srv.store.CollInsert(mk, kindSetMember)
+				// Route the member into the set's dense vector (spec 2064/18 5.1). RESTORE always
+				// lands on an absent key (REPLACE drops the prior key first, which drops its vector),
+				// so this no-ops until a later draw builds the vector, but wiring it keeps the add-site
+				// list exhaustive. prefix is pbuf; mk is kbuf; the two never collide.
+				c.srv.store.CollRandInsert(prefix, mk, kindSetMember)
 				count++
 				enc = foldSetEnc(enc, m, count)
 			}
