@@ -79,11 +79,16 @@ func (c *connState) setHeader(skey []byte) (count uint64, enc byte, ok bool) {
 	return binary.LittleEndian.Uint64(v), enc, true
 }
 
-// setCard reads a set's maintained cardinality from its header row, returning 0 when the
-// set has no members (no header row).
+// setCard reads a set's maintained cardinality from its header row lock-free, returning 0
+// when the set has no members (no header row). It loads the count word with one atomic read
+// (CountInt64) rather than decoding the whole header value, so SCARD never takes the stripe
+// lock and never tears against a concurrent in-place count decrement.
 func (c *connState) setCard(skey []byte) uint64 {
-	count, _, _ := c.setHeader(skey)
-	return count
+	n, ok := c.srv.store.CountInt64(skey, kindSetMeta)
+	if !ok || n < 0 {
+		return 0
+	}
+	return uint64(n)
 }
 
 // setPutHeader writes a set's cardinality and encoding tag to its header row, or deletes the
@@ -182,16 +187,16 @@ func (c *connState) cmdSRem(argv [][]byte) {
 		}
 	}
 	if removed > 0 {
-		count := c.setCard(skey)
-		if uint64(removed) >= count {
-			count = 0
-		} else {
-			count -= uint64(removed)
-		}
-		if err := c.setSetCard(skey, count); err != nil {
-			mu.Unlock()
-			c.writeErr("ERR " + err.Error())
-			return
+		// Decrement the maintained cardinality with one in-place atomic instead of a
+		// GetKind + PutKind read-modify-write of the whole header value. The stripe lock
+		// still serializes this set's writers, so the decrement cannot interleave with a
+		// concurrent SADD's header write, and it stays consistent with a lock-free SCARD
+		// that reads the same word atomically. When the count reaches zero the set is
+		// empty, so the header row is deleted under the same lock (empty set is no set),
+		// the retire-to-zero boundary the design keeps serialized.
+		n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, -int64(removed))
+		if !ok || n <= 0 {
+			c.srv.store.DeleteKind(skey, kindSetMeta)
 		}
 	}
 	mu.Unlock()

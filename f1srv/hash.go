@@ -48,14 +48,14 @@ func (c *connState) fieldKey(hkey, field []byte) []byte {
 }
 
 // hashCount reads a hash's maintained field count from its header row, returning 0
-// when the hash has no fields (no header row).
+// when the hash has no fields (no header row). The read goes through the record's
+// seqlock so it never tears against an in-place HDEL decrement and takes no lock.
 func (c *connState) hashCount(hkey []byte) uint64 {
-	var cb [8]byte
-	v, ok := c.srv.store.GetKind(hkey, cb[:0], kindHashMeta)
-	if !ok || len(v) < 8 {
+	n, ok := c.srv.store.CountInt64(hkey, kindHashMeta)
+	if !ok || n < 0 {
 		return 0
 	}
-	return binary.LittleEndian.Uint64(v)
+	return uint64(n)
 }
 
 // setHashCount writes a hash's field count to its header row, or deletes the header
@@ -280,16 +280,9 @@ func (c *connState) cmdHDel(argv [][]byte) {
 		}
 	}
 	if deleted > 0 {
-		count := c.hashCount(hkey)
-		if uint64(deleted) >= count {
-			count = 0
-		} else {
-			count -= uint64(deleted)
-		}
-		if err := c.setHashCount(hkey, count); err != nil {
-			mu.Unlock()
-			c.writeErr("ERR " + err.Error())
-			return
+		n, ok := c.srv.store.CountAddInt64(hkey, kindHashMeta, -int64(deleted))
+		if !ok || n <= 0 {
+			c.srv.store.DeleteKind(hkey, kindHashMeta)
 		}
 	}
 	mu.Unlock()

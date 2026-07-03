@@ -1,6 +1,9 @@
 package f1raw
 
-import "errors"
+import (
+	"encoding/binary"
+	"errors"
+)
 
 // The collection primitives are the string point path over again, but parameterized
 // on a record kind so an element row lives in its own namespace. The engine stays a
@@ -278,6 +281,78 @@ func (s *Store) TakeKindNoCount(key, dst []byte, kind byte) ([]byte, bool) {
 // writers the same way TakeKind is serialized, and pass the negated number of rows the run
 // actually removed so the counter tracks the live record set exactly.
 func (s *Store) AddCount(delta int64) { s.count.Add(delta) }
+
+// CountAddInt64 adds delta to the 8-byte little-endian signed counter held in the first
+// eight value bytes of key's record in the given kind namespace, returning the post-add
+// value and whether the record was present. This is the cheap cardinality update a
+// collection header row uses for its element count: a delete decrements it with one latched
+// read-modify-write of the count word instead of a GetKind plus a full-value PutKind that
+// re-reads the encoding tag and rewrites the whole header value.
+//
+// The read-modify-write runs under the record's seqlock, the same latch inPlace and
+// incrInPlace take, so it is consistent with a concurrent readValue: a reader spins while
+// the latch is held and retries if the version moved during its copy, so it never observes a
+// torn count. Only bytes 0..7 move here; a sibling field packed at value byte 8 (a set or
+// hash encoding tag) is left untouched, so a header keeps its encoding across a count update.
+// The caller must still serialize this with the key's other header writers (SADD's full
+// header write) through its stripe lock, exactly as the pre-atomic count path was serialized;
+// the seqlock only makes the update safe against lock-free readers, not against a racing
+// writer. The record must already exist: the absent-to-present create that first writes the
+// header stays under the caller's stripe lock.
+func (s *Store) CountAddInt64(key []byte, kind byte, delta int64) (int64, bool) {
+	h := hash(key)
+	off, _, _, _, found := s.find(key, h, kind)
+	if !found {
+		return 0, false
+	}
+	if uint64(s.vlenAt(off).Load()) < 8 {
+		return 0, false
+	}
+	verp := s.verAt(off)
+	vbase := off + hdrSize + align8(s.klen(off))
+	for {
+		v := verp.Load()
+		if v&verLockBit != 0 {
+			continue
+		}
+		if !verp.CompareAndSwap(v, v+1) { // acquire: make it odd
+			continue
+		}
+		cur := int64(binary.LittleEndian.Uint64(s.arena[vbase : vbase+8]))
+		res := cur + delta
+		binary.LittleEndian.PutUint64(s.arena[vbase:vbase+8], uint64(res))
+		verp.Store(v + 2) // release: back to even, one tick newer
+		return res, true
+	}
+}
+
+// CountInt64 reads the 8-byte little-endian signed counter in the first eight value bytes of
+// key's record in the given kind namespace, returning the value and whether the record was
+// present. It is the lock-free read SCARD, HLEN, and ZCARD ride: it takes the seqlock read
+// path (spin while latched, retry if the version moved), so a cardinality query never takes
+// the stripe lock and never tears against a concurrent CountAddInt64.
+func (s *Store) CountInt64(key []byte, kind byte) (int64, bool) {
+	h := hash(key)
+	off, _, _, _, found := s.find(key, h, kind)
+	if !found {
+		return 0, false
+	}
+	verp := s.verAt(off)
+	vbase := off + hdrSize + align8(s.klen(off))
+	for {
+		v1 := verp.Load()
+		if v1&verLockBit != 0 {
+			continue
+		}
+		if uint64(s.vlenAt(off).Load()) < 8 {
+			return 0, false
+		}
+		x := binary.LittleEndian.Uint64(s.arena[vbase : vbase+8])
+		if verp.Load() == v1 {
+			return int64(x), true
+		}
+	}
+}
 
 // CollInsert records key in the ordered element index so a bounded cursor can
 // enumerate it in key order. Call it right after PutKind reports a new element row so
