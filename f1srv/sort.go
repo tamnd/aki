@@ -209,6 +209,10 @@ func (c *connState) sortReadSource(key []byte, typ keyKind) [][]byte {
 // List element rows are keyed by position, not carried in the ordered index, so the window is
 // read positionally exactly as LRANGE reads it.
 func (c *connState) sortReadList(key []byte) [][]byte {
+	// A resident push leaves element bytes only in the ring, not in f1raw rows, so retire the hot-list
+	// window first to flush them back before this positional read (slice 3, impl/34). SORT holds the
+	// source key's exclusive stripe lock through lockStripes, which is what drainEvict requires.
+	c.listWinDrainEvict(key)
 	head, tail, _, _, ok := c.listHeader(key)
 	if !ok {
 		return nil
