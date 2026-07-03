@@ -29,8 +29,18 @@ type connState struct {
 	wantClose bool   // QUIT sets this; the driver flushes out, then closes the socket
 	blockable bool   // true on the goroutine driver, where a blocking command may park this
 	//                  connection's own goroutine; false under the shared-goroutine reactor,
-	//                  where a park would stall every other connection, so the blocking
-	//                  commands there serve non-blocking (immediate element or nil).
+	//                  where a park on the loop would stall every other connection, so there a
+	//                  blocking command hands itself to a park goroutine through park.begin.
+	// parked, park, and parkCancel drive blocking commands under the epoll reactor. When a
+	// blocking command finds its keys empty and blockable is false, it calls park.begin, which
+	// stops the loop reading this connection and reruns the command on a dedicated park goroutine
+	// that is free to sleep. parked marks that state so the loop skips the connection until the
+	// park resolves; parkCancel is closed by the loop on a peer disconnect so the park goroutine
+	// unwinds without replying. All three are zero on the goroutine driver, where blockable is
+	// true and a blocking command parks its own goroutine directly.
+	parked     bool
+	park       reactorParker
+	parkCancel chan struct{}
 	// nowMs is the wall-clock ms cached once per drained batch, the "now" every command in
 	// the batch reads for expiry, like Redis server.mstime.
 	nowMs    int64
@@ -77,6 +87,15 @@ type connState struct {
 	psMode     bool
 	deliver    func(frame []byte)
 	writeMu    sync.Mutex
+}
+
+// reactorParker hands a blocking command off to a park goroutine under the epoll reactor. The
+// reactor connection implements it; the goroutine driver leaves connState.park nil and never calls
+// it, since there a blocking command parks its own goroutine. begin runs on the owning loop and is
+// given a closure that reruns the blocking command with parking enabled, so the existing blocking
+// bodies drive the wait and write the eventual reply through the loop.
+type reactorParker interface {
+	begin(rerun func())
 }
 
 // loop reads from the socket, drains every complete command in the buffer, and
@@ -193,6 +212,15 @@ func (c *connState) drain() bool {
 			if c.wantClose {
 				// QUIT: reply to it, then stop draining so a pipeline queued behind
 				// QUIT is discarded, matching Redis, and let the driver flush and close.
+				if pos > 0 {
+					c.rbuf = append(c.rbuf[:0], c.rbuf[pos:]...)
+				}
+				return true
+			}
+			if c.parked {
+				// A blocking command handed this connection to a reactor park goroutine. Stop
+				// draining so the commands pipelined behind it wait, keeping the unconsumed
+				// remainder at the front for the loop to drain when the park resolves.
 				if pos > 0 {
 					c.rbuf = append(c.rbuf[:0], c.rbuf[pos:]...)
 				}

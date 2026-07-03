@@ -129,6 +129,32 @@ func (c *connState) flushBeforeBlock() {
 	}
 }
 
+// parkOnReactor hands a blocking command to the reactor's park goroutine when the connection cannot
+// sleep on the loop, which is the case under the epoll reactor where connState.blockable is false. It
+// reruns rerun on the park goroutine, where the command re-scans its keys and, still finding them
+// empty, parks properly on the wait channel and timer, writing the eventual reply through the owning
+// loop. It reports true when the handoff was installed, so the caller returns without replying; false
+// means there is no reactor park facility (the goroutine driver, which never reaches this since
+// blockable is true there) and the caller writes the non-blocking reply itself. The argv rerun closes
+// over must be a copy, since the loop reuses the connection's read buffer once it resumes.
+func (c *connState) parkOnReactor(rerun func()) bool {
+	if c.park == nil {
+		return false
+	}
+	c.park.begin(rerun)
+	return true
+}
+
+// dupArgv deep-copies a command's arguments so a park goroutine can reuse them after the loop has
+// moved on and overwritten the read buffer the originals pointed into.
+func dupArgv(argv [][]byte) [][]byte {
+	out := make([][]byte, len(argv))
+	for i, a := range argv {
+		out[i] = append([]byte(nil), a...)
+	}
+	return out
+}
+
 // parseTimeout reads a blocking command's timeout, a double count of seconds since Redis 6.0
 // where 0 means block forever. It returns the duration, whether the block is unbounded, and a
 // Redis-shaped error string when the value is not a finite non-negative float. A fractional
@@ -206,9 +232,14 @@ func (c *connState) blockingPop(argv [][]byte, atHead bool) {
 			}
 			mu.Unlock()
 		}
-		// Every key empty. Under the reactor the connection cannot park, so it replies now as a
-		// non-blocking pop would, a null array.
+		// Every key empty. On the goroutine driver this connection parks below; under the reactor
+		// it cannot sleep on the loop, so it hands the command to a park goroutine that reruns it
+		// with parking enabled, and only if there is no park facility does it reply non-blocking.
 		if !c.blockable {
+			ac := dupArgv(argv)
+			if c.parkOnReactor(func() { c.blockingPop(ac, atHead) }) {
+				return
+			}
 			c.writeNilArray()
 			return
 		}
@@ -230,6 +261,10 @@ func (c *connState) blockingPop(argv [][]byte, atHead bool) {
 			// Woken by a push: loop back and rescan the keys.
 		case <-timeout:
 			c.writeNilArray()
+			return
+		case <-c.parkCancel:
+			// Reactor only: the peer disconnected while this park goroutine was blocked, so unwind
+			// without replying. The channel is nil on the goroutine driver, where this never fires.
 			return
 		}
 	}
@@ -306,6 +341,14 @@ func (c *connState) blockingMove(source, destination, fromTok, toTok, timeoutTok
 		}
 		unlock()
 		if !c.blockable {
+			src := append([]byte(nil), source...)
+			dst := append([]byte(nil), destination...)
+			ft := append([]byte(nil), fromTok...)
+			tt := append([]byte(nil), toTok...)
+			tot := append([]byte(nil), timeoutTok...)
+			if c.parkOnReactor(func() { c.blockingMove(src, dst, ft, tt, tot, name) }) {
+				return
+			}
 			c.writeNil()
 			return
 		}
@@ -326,6 +369,8 @@ func (c *connState) blockingMove(source, destination, fromTok, toTok, timeoutTok
 		case <-w.ch:
 		case <-timeout:
 			c.writeNil()
+			return
+		case <-c.parkCancel:
 			return
 		}
 	}
@@ -437,6 +482,10 @@ func (c *connState) cmdBLMPop(argv [][]byte) {
 			return
 		}
 		if !c.blockable {
+			ac := dupArgv(argv)
+			if c.parkOnReactor(func() { c.cmdBLMPop(ac) }) {
+				return
+			}
 			c.writeNilArray()
 			return
 		}
@@ -457,6 +506,8 @@ func (c *connState) cmdBLMPop(argv [][]byte) {
 		case <-w.ch:
 		case <-timeout:
 			c.writeNilArray()
+			return
+		case <-c.parkCancel:
 			return
 		}
 	}

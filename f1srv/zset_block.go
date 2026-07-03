@@ -128,9 +128,13 @@ func (c *connState) blockingZPop(argv [][]byte, max bool) {
 			}
 			mu.Unlock()
 		}
-		// Every key empty. Under the reactor the connection cannot park, so it replies now as a
-		// non-blocking pop would, a null array.
+		// Every key empty. On the goroutine driver this connection parks below; under the reactor
+		// it hands the command to a park goroutine that reruns it with parking enabled.
 		if !c.blockable {
+			ac := dupArgv(argv)
+			if c.parkOnReactor(func() { c.blockingZPop(ac, max) }) {
+				return
+			}
 			c.writeNilArray()
 			return
 		}
@@ -152,6 +156,8 @@ func (c *connState) blockingZPop(argv [][]byte, max bool) {
 			// Woken by a ZADD: loop back and rescan the keys.
 		case <-timeout:
 			c.writeNilArray()
+			return
+		case <-c.parkCancel:
 			return
 		}
 	}
@@ -269,6 +275,10 @@ func (c *connState) cmdBZMPop(argv [][]byte) {
 			return
 		}
 		if !c.blockable {
+			ac := dupArgv(argv)
+			if c.parkOnReactor(func() { c.cmdBZMPop(ac) }) {
+				return
+			}
 			c.writeNilArray()
 			return
 		}
@@ -289,6 +299,8 @@ func (c *connState) cmdBZMPop(argv [][]byte) {
 		case <-w.ch:
 		case <-timeout:
 			c.writeNilArray()
+			return
+		case <-c.parkCancel:
 			return
 		}
 	}

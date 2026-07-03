@@ -1562,6 +1562,15 @@ func (c *connState) xreadGroupStreams(groupName, consumerName string, rest [][]b
 	// Only an all-'>' read parks; an explicit id always yields an immediate per-stream list.
 	canBlock := block && !anyExplicit
 
+	c.xreadGroupBlock(groupName, consumerName, keys, newDelivery, starts, anyExplicit, canBlock, count, noAck, blockDur, blockForever)
+}
+
+// xreadGroupBlock runs XREADGROUP's deliver-or-park loop after the per-stream ids and the all-'>'
+// blocking gate have been resolved. It is called once inline for the first delivery pass and, under
+// the epoll reactor where the connection cannot sleep on the loop, again on a park goroutine with
+// copied keys, newDelivery, and starts, so a re-run after a wake advances no cursor and writes no PEL
+// row, exactly as the inline park path does.
+func (c *connState) xreadGroupBlock(groupName, consumerName string, keys [][]byte, newDelivery []bool, starts []streamID, anyExplicit, canBlock bool, count int, noAck bool, blockDur time.Duration, blockForever bool) {
 	var w *listWaiter
 	var timer *time.Timer
 	defer func() {
@@ -1577,9 +1586,22 @@ func (c *connState) xreadGroupStreams(groupName, consumerName string, rest [][]b
 		if errored || produced {
 			return
 		}
-		// An all-'>' read that delivered nothing. Without BLOCK, or under the reactor where the
-		// connection cannot park, reply with the null array a non-blocking read would give.
-		if !canBlock || !c.blockable {
+		// An all-'>' read that delivered nothing. Without BLOCK, reply with the null array a
+		// non-blocking read would give.
+		if !canBlock {
+			c.writeNilArray()
+			return
+		}
+		// Under the reactor hand the read to a park goroutine that reruns it with parking enabled.
+		if !c.blockable {
+			kc := dupArgv(keys)
+			nd := append([]bool(nil), newDelivery...)
+			sc := append([]streamID(nil), starts...)
+			if c.parkOnReactor(func() {
+				c.xreadGroupBlock(groupName, consumerName, kc, nd, sc, anyExplicit, canBlock, count, noAck, blockDur, blockForever)
+			}) {
+				return
+			}
 			c.writeNilArray()
 			return
 		}
@@ -1601,6 +1623,9 @@ func (c *connState) xreadGroupStreams(groupName, consumerName string, rest [][]b
 			// Woken by an XADD: loop back and re-run delivery, which now finds the new entry.
 		case <-timeout:
 			c.writeNilArray()
+			return
+		case <-c.parkCancel:
+			// Reactor only: peer disconnected while parked; unwind without replying.
 			return
 		}
 	}
