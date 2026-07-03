@@ -377,6 +377,105 @@ func TestDeferredRemovalConcurrentFolderChurn(t *testing.T) {
 	}
 }
 
+// Reset (the FLUSHALL/FLUSHDB primitive) must coordinate with the folder: it replaces the ordered
+// index and rewinds the arena, so a folder mid-drain would read a stale oidx pointer. Reset takes
+// folderMu and drops the queue, so after a flush the tombstone count is zero, no queued node
+// survives to splice against the fresh index, and the store is empty.
+func TestResetDropsPendingTombstones(t *testing.T) {
+	s := New(1<<16, 1<<20)
+	s.EnableDeferredRemoval()
+	defer s.Close()
+
+	for i := 0; i < 100; i++ {
+		k := collKey("h", fmt.Sprintf("m%03d", i))
+		if _, err := s.PutKind(k, []byte("v"), kindTestField); err != nil {
+			t.Fatal(err)
+		}
+		s.CollInsert(k, kindTestField)
+	}
+	// Queue a burst of deferred deletes, then flush before the folder is guaranteed to have run.
+	for i := 0; i < 100; i += 2 {
+		k := collKey("h", fmt.Sprintf("m%03d", i))
+		if s.DeleteKind(k, kindTestField) {
+			buf, ends := packKeys(k)
+			s.CollRemovePacked(buf, ends, kindTestField)
+		}
+	}
+	s.Reset()
+	if s.tombPend.Load() != 0 {
+		t.Fatalf("tombPend %d after Reset, want 0", s.tombPend.Load())
+	}
+	if got := scanAll(s, collPrefix("h"), 64); len(got) != 0 {
+		t.Fatalf("scan after Reset got %d keys, want 0", len(got))
+	}
+	// The store must be usable again after the flush: a fresh insert enumerates on its own.
+	k := collKey("h", "fresh")
+	if _, err := s.PutKind(k, []byte("v"), kindTestField); err != nil {
+		t.Fatal(err)
+	}
+	s.CollInsert(k, kindTestField)
+	if got := scanAll(s, collPrefix("h"), 8); len(got) != 1 || !bytes.Equal(got[0], k) {
+		t.Fatalf("post-Reset insert enumerated %q, want just %q", got, k)
+	}
+}
+
+// Reset racing the live folder is the interleaving the race detector flagged: FLUSHALL swaps the
+// oidx pointer while the folder reads it mid-drain. Run under -race with churn plus repeated flushes
+// to prove folderMu makes the swap and any in-flight splice mutually exclusive.
+func TestResetConcurrentFolderChurn(t *testing.T) {
+	s := New(1<<18, 1<<22)
+	s.EnableDeferredRemoval()
+	defer s.Close()
+
+	const n = 300
+	member := func(i int) []byte { return collKey("h", fmt.Sprintf("m%04d", i)) }
+
+	var wg sync.WaitGroup
+	// Writer/deleter: repopulates then defer-deletes, feeding the folder a steady tombstone stream.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for round := 0; round < 60; round++ {
+			for i := 0; i < n; i++ {
+				k := member(i)
+				created, err := s.PutKind(k, []byte("v"), kindTestField)
+				if err != nil {
+					panic(err)
+				}
+				if created {
+					s.CollInsert(k, kindTestField)
+				}
+			}
+			for i := 0; i < n; i += 2 {
+				k := member(i)
+				if s.DeleteKind(k, kindTestField) {
+					buf, ends := packKeys(k)
+					s.CollRemovePacked(buf, ends, kindTestField)
+				}
+			}
+		}
+	}()
+	// Flusher: hammers Reset, racing the folder's oidx read.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for round := 0; round < 60; round++ {
+			s.Reset()
+		}
+	}()
+	wg.Wait()
+
+	// A flush may have raced the last inserts, so the only invariant that must hold is consistency:
+	// after a final flush the store is empty and no tombstone is left dangling.
+	s.Reset()
+	if s.tombPend.Load() != 0 {
+		t.Fatalf("tombPend %d after final Reset, want 0", s.tombPend.Load())
+	}
+	if got := scanAll(s, collPrefix("h"), 512); len(got) != 0 {
+		t.Fatalf("scan after final Reset got %d keys, want 0", len(got))
+	}
+}
+
 // sliceTail returns k past plen, or a marker when k is too short, so a failed assertion prints
 // something readable instead of panicking on a bad slice.
 func sliceTail(k []byte, plen int) string {
