@@ -9,9 +9,8 @@
 // It is single-tier on purpose. FASTER mixes hot and cold records on one log and
 // reclaims the cold region with log compaction that re-copies live records forward,
 // which couples a small working set to the whole keyspace and pays write
-// amplification under skew. The two-tier successor that splits hot from cold to fix
-// those flaws lives in the sibling package f2raw; f1raw is the design it is measured
-// against, so the F2 win is a real before/after number on the same harness.
+// amplification under skew. f1raw keeps the resident hash index over one hybrid log
+// and leans on the cold value log plus compaction to bound that cost.
 //
 // The design is the FASTER paper's two pieces and nothing else:
 //

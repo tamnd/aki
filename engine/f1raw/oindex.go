@@ -210,7 +210,32 @@ func (oi *oindex) refresh(off uint64) {
 func (oi *oindex) remove(key []byte) bool {
 	oi.mu.Lock()
 	defer oi.mu.Unlock()
+	return oi.removeLocked(key)
+}
 
+// removeMany unlinks each key under a single write-lock acquisition, the batched form
+// remove takes for a coalesced delete run (HDEL/SREM/ZREM folded across a pipeline). One
+// lock cycle for the whole run instead of one per element is what keeps a burst of
+// same-key deletes from ping-ponging the global index lock across every connection, the
+// residual serialization that folding the stripe lock and count header alone leaves
+// behind. Each key is still its own O(log n) descent; keys need not be sorted, and any
+// key already absent is skipped. The keys must stay valid for the call, so the caller
+// copies them out of the shared key scratch before handing them in.
+func (oi *oindex) removeMany(keys [][]byte) {
+	if len(keys) == 0 {
+		return
+	}
+	oi.mu.Lock()
+	defer oi.mu.Unlock()
+	for _, key := range keys {
+		oi.removeLocked(key)
+	}
+}
+
+// removeLocked unlinks the node whose key equals the given bytes and reports whether it
+// was present, assuming the write lock is already held. The record's arena bytes are left
+// intact (grow-only arena); only the index node is unlinked.
+func (oi *oindex) removeLocked(key []byte) bool {
 	var update [oindexMaxLevel]*onode
 	x := oi.head
 	for i := oi.level - 1; i >= 0; i-- {

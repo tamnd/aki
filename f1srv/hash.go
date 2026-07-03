@@ -263,13 +263,19 @@ func (c *connState) cmdHDel(argv [][]byte) {
 		return
 	}
 	deleted := 0
+	// One coarse gate: when no field of this hash carries a TTL (answered by a single atomic
+	// load while the keyspace has no field TTL at all) the per-field TTL-row delete below is a
+	// guaranteed no-op, so skip it and save a hash probe per deleted field.
+	hadTTL := c.hashHasFieldTTL(hkey)
 	for _, field := range argv[2:] {
 		fk := c.fieldKey(hkey, field)
 		if c.srv.store.DeleteKind(fk, kindHashField) {
 			c.srv.store.CollRemove(fk)
 			// Drop any TTL sibling the field carried so the global hfe gate and the per-hash
 			// hint stay exact when a TTL'd field is deleted outright.
-			c.clearFieldTTLLocked(hkey, fk)
+			if hadTTL {
+				c.clearFieldTTLLocked(hkey, fk)
+			}
 			deleted++
 		}
 	}
