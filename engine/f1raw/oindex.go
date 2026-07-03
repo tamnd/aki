@@ -308,6 +308,11 @@ func (oi *oindex) removeLocked(key []byte) bool {
 // past the collection's cardinality lands on a sibling collection's node (or nil) and is
 // reported absent with nothing removed, exactly as selectInPrefix guards it.
 func (oi *oindex) selectAndRemoveInPrefix(prefix []byte, localIndex int) ([]byte, bool) {
+	// A positional descent reads order-statistic widths, which count a dead node the folder
+	// has not yet spliced as if it were live. Reconcile the index before selecting by position
+	// so base rank and target land on live members. Gated on tombPend, so a workload not
+	// interleaved with deletes pays one atomic load here and never drains.
+	oi.store.SyncPendingRemovals()
 	oi.mu.Lock()
 	defer oi.mu.Unlock()
 
@@ -436,6 +441,10 @@ func (oi *oindex) rankLocked(key []byte) int {
 // confirms membership through the element index first (ZRANK replies nil for an absent
 // member before it ranks anything), so an absent key here reports where it would fall.
 func (oi *oindex) rankInPrefix(prefix, key []byte) int {
+	// rankLocked sums order-statistic widths without filtering a dead node the folder has
+	// not yet spliced, so reconcile the index before ranking by width. Gated on tombPend,
+	// so a rank read not interleaved with deletes pays one atomic load and never drains.
+	oi.store.SyncPendingRemovals()
 	oi.mu.RLock()
 	defer oi.mu.RUnlock()
 	return oi.rankLocked(key) - oi.rankLocked(prefix)
@@ -470,6 +479,10 @@ func (oi *oindex) selectAtLocked(idx int) *onode {
 // sibling collection's member. Both steps are O(log n), so a uniform random member is
 // one descent, not a scan.
 func (oi *oindex) selectInPrefix(prefix []byte, localIndex int) ([]byte, bool) {
+	// Base rank and positional select both read order-statistic widths, which count a dead
+	// node the folder has not yet spliced as if it were live. Reconcile the index first.
+	// Gated on tombPend, so a select not interleaved with deletes pays one atomic load.
+	oi.store.SyncPendingRemovals()
 	oi.mu.RLock()
 	defer oi.mu.RUnlock()
 	base := oi.rankLocked(prefix)

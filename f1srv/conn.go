@@ -63,7 +63,8 @@ type connState struct {
 	delCnt    []int     // reused scratch for the coalesced delete run's per-command removed counts
 	delKeyBuf []byte    // reused byte arena holding copies of a delete run's removed composite keys, packed end to end
 	delKeyEnd []int     // reused scratch for the cumulative end offset of each key packed in delKeyBuf
-	delKeys   [][]byte  // reused scratch reslicing delKeyBuf into one entry per removed key for the batched oindex remove
+	delScrBuf []byte    // reused byte arena for a ZREM run's removed score-row keys, packed end to end, kept separate so each kind defers in one CollRemovePacked call
+	delScrEnd []int     // reused scratch for the cumulative end offset of each score-row key packed in delScrBuf
 
 	// Transaction state (MULTI/EXEC/DISCARD/WATCH/UNWATCH). inMulti is set between MULTI
 	// and EXEC/DISCARD; while it is set every non-transaction command is copied into
