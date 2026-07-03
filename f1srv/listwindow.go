@@ -28,17 +28,13 @@ type listWindow struct {
 	reservedTail  atomic.Int64 // next RPUSH position, incremented to reserve
 	committedTail atomic.Int64 // one past the highest visible position
 
-	mu sync.Mutex // guards the two pending sets, the commit-bound advance, and every ring mutation
-	// pendTail maps a finished tail run's start position to its far bound (end) and element bytes,
-	// for runs that committed out of reservation order. The in-order predecessor drains the chain
-	// forward when it reaches that start, filling each drained run's bytes into the ring as it goes,
-	// so the ring is always filled in commit order and its live range stays exactly the committed
-	// span. It is empty in the common case, where one connection's pipelined run reserves a
-	// contiguous block and commits it in one step.
-	pendTail map[int64]pendRun
-	// pendHead mirrors pendTail for the head end, keyed by a finished head run's high end and
-	// carrying its low bound (where the next-lower run continues from) and element bytes.
-	pendHead map[int64]pendRun
+	// mu guards the committed-bound advance and every ring mutation. A push claims its positions and
+	// fills its ring slots in one step under this mutex (appendTail/appendHead), so positions are
+	// assigned in commit order by construction and there is never an out-of-order run to stash. Pushes
+	// to one hot key serialize here only over the bound move and the ring fill, never an element write
+	// or any I/O, which is the whole lever: today's stripe lock is held across N element PutKind writes,
+	// and the window holds this mutex across a bound bump and one ring copy instead.
+	mu sync.Mutex
 
 	// ring holds the resident element bytes for every committed position, so a read or pop can take
 	// bytes straight from a slot instead of paying an f1raw hash probe per element (spec 2064/impl/34).
@@ -132,15 +128,6 @@ func (w *listWindow) contractPreblock(atHead bool, newBound int64) {
 	w.preHi.Store(newBound)
 }
 
-// pendRun is a committed-but-not-yet-visible push run held for its in-order predecessor to drain.
-// far is the run's opposite bound from its map key (the end for a tail run keyed by start, the low
-// bound for a head run keyed by high), and elems carries the run's element bytes in position order,
-// deep-copied at stash time because the originals alias the connection read buffer.
-type pendRun struct {
-	far   int64
-	elems [][]byte
-}
-
 // listRingMinCap is the floor capacity a fresh window's ring starts at, a power of two generous
 // enough that a short-lived list never grows the ring while staying small.
 const listRingMinCap = 1 << 10
@@ -169,26 +156,12 @@ func newListWindow(head, tail int64) *listWindow {
 	// so pop takes those positions from their rows and every later lock-free push lands resident.
 	w.preLo.Store(head)
 	w.preHi.Store(tail)
-	w.pendTail = make(map[int64]pendRun)
-	w.pendHead = make(map[int64]pendRun)
 	span := tail - head
 	if span < listRingMinCap {
 		span = listRingMinCap
 	}
 	w.ring = newListRing(nextPow2(span + 1))
 	return w
-}
-
-// copyRun deep-copies a run's element bytes for stashing in a pending map, since the originals alias
-// the connection read buffer that the next command overwrites.
-func copyRun(posElems [][]byte) [][]byte {
-	out := make([][]byte, len(posElems))
-	for i, e := range posElems {
-		b := make([]byte, len(e))
-		copy(b, e)
-		out[i] = b
-	}
-	return out
 }
 
 // ringPutRun fills the ring slots for a run whose position start+j holds posElems[j]. The caller
@@ -239,80 +212,43 @@ func (w *listWindow) bounds() (head, tail int64) {
 	return w.committedHead.Load(), w.committedTail.Load()
 }
 
-// reserveTail claims n contiguous positions at the tail for an RPUSH run and returns the first, so
-// the run writes elements at [start, start+n). It is a single lock-free atomic add, the hot path
-// that replaces taking the stripe lock.
-func (w *listWindow) reserveTail(n int64) (start int64) {
-	return w.reservedTail.Add(n) - n
-}
-
-// commitTail makes an RPUSH run's positions [start, start+n) visible, advancing committedTail only
-// in reservation order so a reader never sees a gap. posElems carries the run's element bytes in
-// position order (posElems[j] is the element at start+j). If this run is next (committedTail ==
-// start) it fills its bytes into the ring, advances the bound past itself, and drains any later runs
-// that were waiting on it, filling each as it goes; otherwise it stashes its bytes for the in-order
-// predecessor to pick up. Every ring fill and grow happens here under the per-list mutex, so the ring
-// is mutated in commit order and its live range stays exactly the committed span.
-func (w *listWindow) commitTail(start, n int64, posElems [][]byte) {
-	end := start + n
+// appendTail claims n tail positions and fills them into the ring in one mu-guarded step, returning
+// the visible length before the run so an RPUSH reply is baseLen+n. It assigns the run's positions at
+// commit time, start == committedTail, so the ring is filled in commit order by construction and there
+// is never an out-of-order run to stash. The earlier lock-free reserve-then-commit split existed to
+// move an off-lock element write out of the lock, but a resident push writes only the ring, which is
+// itself mu-guarded, so fusing the reserve and the commit removes the out-of-order stash (its
+// allocation and map churn) with no loss of parallelism: pushes to one hot key already serialized on
+// this mutex to fill the ring in order. posElems is the run in position order (posElems[j] is the
+// element at start+j). reservedTail is kept equal to committedTail so the pop fast path, which falls
+// back when the two bounds differ, never sees a phantom mid-flight push.
+func (w *listWindow) appendTail(n int64, posElems [][]byte) (baseLen int64) {
 	w.mu.Lock()
-	if w.committedTail.Load() != start {
-		w.pendTail[start] = pendRun{far: end, elems: copyRun(posElems)}
-		w.mu.Unlock()
-		return
-	}
+	start := w.committedTail.Load()
+	baseLen = start - w.committedHead.Load()
+	end := start + n
 	w.ringEnsure(w.committedHead.Load(), end)
 	w.ringPutRun(start, posElems)
+	w.reservedTail.Store(end)
 	w.committedTail.Store(end)
-	next := end
-	for {
-		pr, ok := w.pendTail[next]
-		if !ok {
-			break
-		}
-		delete(w.pendTail, next)
-		w.ringEnsure(w.committedHead.Load(), pr.far)
-		w.ringPutRun(next, pr.elems)
-		w.committedTail.Store(pr.far)
-		next = pr.far
-	}
 	w.mu.Unlock()
+	return baseLen
 }
 
-// reserveHead claims n contiguous positions at the head for an LPUSH run and returns the lowest, so
-// the run writes elements at [start, start+n) with start below the old head. The reserved bound
-// moves down by n, mirroring reserveTail.
-func (w *listWindow) reserveHead(n int64) (start int64) {
-	return w.reservedHead.Add(-n)
-}
-
-// commitHead makes an LPUSH run's positions [start, start+n) visible, advancing committedHead down
-// only in reservation order. The head chains on the high end (start+n): the run whose high end
-// equals the current committedHead is next, and it drains lower runs waiting on its own low end.
-// posElems carries the run's element bytes in position order (posElems[j] is the element at start+j),
-// filled into the ring as each run becomes visible, under the per-list mutex like commitTail.
-func (w *listWindow) commitHead(start, n int64, posElems [][]byte) {
-	high := start + n
+// appendHead mirrors appendTail at the low end: it claims n positions below the current head, fills
+// them into the ring in one mu-guarded step, and returns the visible length before the run so an LPUSH
+// reply is baseLen+n. posElems is the run in position order (posElems[j] is the element at start+j),
+// the reverse of the LPUSH push order, matching how the stripe-lock body lands elements by
+// decrementing the head. reservedHead is kept equal to committedHead for the same pop-fast-path reason.
+func (w *listWindow) appendHead(n int64, posElems [][]byte) (baseLen int64) {
 	w.mu.Lock()
-	if w.committedHead.Load() != high {
-		w.pendHead[high] = pendRun{far: start, elems: copyRun(posElems)}
-		w.mu.Unlock()
-		return
-	}
+	high := w.committedHead.Load()
+	start := high - n
+	baseLen = w.committedTail.Load() - high
 	w.ringEnsure(start, w.committedTail.Load())
 	w.ringPutRun(start, posElems)
+	w.reservedHead.Store(start)
 	w.committedHead.Store(start)
-	next := start
-	for {
-		pr, ok := w.pendHead[next]
-		if !ok {
-			break
-		}
-		delete(w.pendHead, next)
-		w.ringEnsure(pr.far, w.committedTail.Load())
-		w.ringPutRun(pr.far, pr.elems)
-		w.committedHead.Store(pr.far)
-		next = pr.far
-	}
 	w.mu.Unlock()
+	return baseLen
 }
