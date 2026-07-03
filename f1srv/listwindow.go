@@ -316,4 +316,3 @@ func (w *listWindow) commitHead(start, n int64, posElems [][]byte) {
 	}
 	w.mu.Unlock()
 }
-
