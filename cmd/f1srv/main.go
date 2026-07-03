@@ -33,7 +33,7 @@ func main() {
 	_ = fs.String("appendonly", "no", "append-only file (accepted, no durability yet)")
 	_ = fs.String("appendfsync", "everysec", "fsync policy (accepted, no durability yet)")
 	_ = fs.String("aki-engine", "f1raw", "engine name (accepted; this binary is always f1raw)")
-	netMode := fs.String("aki-net", "go", "net model: go (goroutine-per-conn, default) or reactor (Linux epoll)")
+	netMode := fs.String("aki-net", "auto", "net model: auto (reactor on Linux, goroutine elsewhere), go (goroutine-per-conn), or reactor (Linux epoll)")
 	indexBuckets := fs.Int("index-buckets", 1<<22, "f1raw index buckets")
 	arenaBytes := fs.Int("arena-bytes", 2<<30, "f1raw arena size in bytes")
 	stripes := fs.Int("incr-stripes", 1<<10, "INCR-family RMW lock stripes")

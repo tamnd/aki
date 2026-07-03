@@ -38,7 +38,7 @@ type Config struct {
 	ArenaBytes   int    // f1raw arena size in bytes
 	ReadBufSize  int    // initial per-connection read buffer
 	IncrStripes  int    // INCR-family RMW lock stripes (rounded up to a power of two)
-	NetMode      string // "go" (goroutine-per-conn, default) or "reactor" (Linux epoll)
+	NetMode      string // "auto" (reactor on Linux, goroutine elsewhere; the default), "go" (goroutine-per-conn), or "reactor" (Linux epoll)
 
 	// ColdPath, when non-empty, engages the larger-than-memory string tier: the store
 	// opens an append-only cold value log at this path and writes any value longer than
@@ -59,6 +59,7 @@ func DefaultConfig(addr string) Config {
 		ArenaBytes:   2 << 30,  // 2 GiB arena
 		ReadBufSize:  64 << 10, // 64 KiB
 		IncrStripes:  1 << 10,  // 1024 stripes
+		NetMode:      "auto",   // reactor on Linux, goroutine driver elsewhere
 	}
 }
 
@@ -260,9 +261,9 @@ func (s *Server) Listen() error {
 }
 
 // ListenAndServe binds (if not already bound) and accepts connections until the
-// listener is closed. With NetMode "reactor" on Linux it hands the listener to the
-// epoll event-loop driver; otherwise, and everywhere reactor is unavailable, each
-// connection runs on its own goroutine.
+// listener is closed. With NetMode "auto" (the default) or "reactor" on Linux it hands
+// the listener to the epoll event-loop driver; otherwise, and everywhere the reactor is
+// unavailable or its setup fails, each connection runs on its own goroutine.
 func (s *Server) ListenAndServe() error {
 	if err := s.Listen(); err != nil {
 		return err
