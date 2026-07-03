@@ -79,6 +79,17 @@ type Server struct {
 	incrMu   []sync.RWMutex
 	incrMask uint32
 
+	// listWin is the resident hot-list window registry (spec 2064/f1_rewrite_ltm/impl/26). Each
+	// shard is a map from a list key to its listWindow, indexed by the same stripe hash as incrMu,
+	// so a key's window shard and its stripe lock line up. A window is admitted on a list's first
+	// push, lets subsequent pushes append lock-free off the stripe lock through a reserved/committed
+	// bound split, and is retired the moment any non-push command lands on the key. listWinLive is
+	// the count of resident windows across all shards, the hot-path gate: when it is zero no list
+	// has a window, so every read and every non-push list command skips the registry after one
+	// atomic load and the all-cold workload pays nothing for the machinery.
+	listWin     []listWinShard
+	listWinLive atomic.Int64
+
 	// block is the per-key blocked-client registry the blocking list commands park in
 	// (list-model spec 2064/f1_rewrite_ltm/08 section 9). It lives beside the storage and
 	// holds no element bytes; a blocked client is one queue entry per key it waits on.
@@ -179,6 +190,10 @@ func New(cfg Config) *Server {
 		incrMask:  uint32(stripes - 1),
 		startTime: time.Now(),
 		runID:     newRunID(),
+	}
+	srv.listWin = make([]listWinShard, stripes)
+	for i := range srv.listWin {
+		srv.listWin[i].m = make(map[string]*listWindow)
 	}
 	srv.block.waiters = make(map[string][]*listWaiter)
 	srv.watchVer = make(map[string]*watchEntry)

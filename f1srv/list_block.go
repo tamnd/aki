@@ -403,6 +403,7 @@ func (c *connState) cmdBLMPop(argv [][]byte) {
 				c.writeErr(wrongType)
 				return
 			}
+			c.listWinDrainEvict(key)
 			head, tail, lpBytes, everLarge, hoff, have := c.listHeaderAt(key)
 			if !have {
 				mu.Unlock()

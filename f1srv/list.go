@@ -83,6 +83,21 @@ func (c *connState) listElemKey(lkey []byte, pos int64) []byte {
 // missing key), in which case head and tail are 0 (an empty window) and lpBytes is the empty
 // listpack overhead, so a first push starts counting from the right base.
 func (c *connState) listHeader(lkey []byte) (head, tail int64, lpBytes uint64, everLarge, ok bool) {
+	// A resident hot-list window is the source of truth while it lives: its committed bounds and
+	// size reflect the lock-free pushes that have not yet flushed to the header row (impl/26). Every
+	// pure read funnels through here, so consulting the window here makes LLEN, LINDEX, LRANGE, LPOS,
+	// OBJECT ENCODING, and the multi-key readers window-aware with no change at their call sites. It
+	// is gated on listWinLive, one atomic load when no list is hot. A mutator that must write the
+	// header first retires the window (listWinDrainEvict) and then reads through listHeaderAt, which
+	// stays header-only, so this path is only ever the read view.
+	if w := c.srv.listWinLookup(lkey); w != nil {
+		h, t := w.bounds()
+		if h == t {
+			return 0, 0, listHeaderBytes, false, false
+		}
+		lp, large := w.sizeState()
+		return h, t, lp, large, true
+	}
 	var hb [listMetaSize]byte
 	v, got := c.srv.store.GetKind(lkey, hb[:0], kindListMeta)
 	if !got || len(v) < listMetaSize {
@@ -178,6 +193,98 @@ func (c *connState) listEncodingName(lkey []byte) string {
 	return "listpack"
 }
 
+// listWinMax bounds the number of resident hot-list windows so a workload with many growing lists
+// cannot pin unbounded overlay memory. Each window is a few hundred bytes; the cap is generous for
+// the handful of genuinely hot lists a real workload keeps, and a list over the cap simply keeps
+// taking the stripe lock (the correct, slightly slower path). Ageing windows out under memory
+// pressure is a later slice; this cap is the floor that keeps the overlay bounded today.
+const listWinMax = 1 << 12
+
+// listElemFastMax is the largest element the lock-free push path will place. f1raw rejects a value
+// over 64 KiB (ErrTooBig), and the fast path cannot cleanly unwind a reservation whose element
+// write fails, so a run carrying an over-limit element falls back to the stripe-lock body, which
+// reports the error one command at a time exactly as Redis does. Normal elements are far under this.
+const listElemFastMax = 0xffff
+
+// admitListWindow installs a hot-list window for a list that has shown repeat push traffic, seeded
+// from the header the just-completed slow push wrote. The caller holds the key's stripe lock. It is
+// a no-op once the resident-window cap is reached, so the overlay memory stays bounded.
+func (c *connState) admitListWindow(lkey []byte, head, tail int64, lpBytes uint64, everLarge bool) {
+	if c.srv.listWinLive.Load() >= listWinMax {
+		return
+	}
+	c.srv.listWinAdmit(lkey, head, tail, lpBytes, everLarge)
+}
+
+// pushThroughWindow is the lock-free append fast path. When a hot-list window is resident it claims
+// the run's positions with one atomic bump of the reserved bound, writes the N element rows off the
+// stripe lock through f1raw's lock-free publish, then advances the committed bound in reservation
+// order, so many connections append to one hot key in parallel instead of serializing on its stripe
+// mutex. It returns false when no window is resident (the cold-key path admits one) or when the run
+// carries an over-limit element (the stripe-lock body reports that error), leaving the caller to run
+// its stripe-lock body. bnd carries the per-command cumulative element counts for a coalesced run;
+// a nil bnd is a single command that replies one integer, the final length. The reply length is the
+// pre-run visible length plus each command's cumulative count, the same value the stripe-lock body
+// computes, best-effort under concurrent appenders to one key (which Redis leaves equally undefined).
+func (c *connState) pushThroughWindow(lkey []byte, atHead bool, elems [][]byte, bnd []int) bool {
+	w := c.srv.listWinLookup(lkey)
+	if w == nil {
+		return false
+	}
+	for _, e := range elems {
+		if len(e) > listElemFastMax {
+			return false
+		}
+	}
+	w.gate.RLock()
+	if w.evicted.Load() {
+		w.gate.RUnlock()
+		return false
+	}
+	n := int64(len(elems))
+	var baseLen, sumBytes int64
+	if atHead {
+		start := w.reserveHead(n) // lowest position of the run
+		oldHead := start + n
+		baseLen = w.committedTail.Load() - oldHead
+		// LPUSH prepends each element in turn, so element i lands just below the old head: the run
+		// [e0..e_{n-1}] leaves the list [e_{n-1} .. e0, old...], which is element i at position
+		// start + (n-1-i), the same order the stripe-lock body produces by decrementing head. The
+		// PutKind error is dropped because the loop above pre-screened every element against
+		// listElemFastMax (f1raw's max value size), so a fixed-size element key and an in-bounds
+		// value cannot fail the point publish; the stripe-lock fallback is what handles oversize.
+		for i, elem := range elems {
+			pos := start + (n - 1 - int64(i))
+			ek := c.listElemKey(lkey, pos)
+			_, _ = c.srv.store.PutKind(ek, elem, kindListElem)
+			sumBytes += int64(listEntrySize(elem))
+		}
+		w.commitHead(start, n)
+	} else {
+		start := w.reserveTail(n)
+		baseLen = start - w.committedHead.Load()
+		for i, elem := range elems {
+			ek := c.listElemKey(lkey, start+int64(i))
+			_, _ = c.srv.store.PutKind(ek, elem, kindListElem)
+			sumBytes += int64(listEntrySize(elem))
+		}
+		w.commitTail(start, n)
+	}
+	w.addBytes(sumBytes)
+	w.gate.RUnlock()
+	// The list is non-empty, so wake any BLPOP/BRPOP/BLMOVE/BLMPOP blocked on it; the call is an
+	// atomic load and a return when nobody waits, so the common push pays nothing for the registry.
+	c.srv.signalListKey(lkey)
+	if bnd == nil {
+		c.writeInt(baseLen + n)
+		return true
+	}
+	for _, b := range bnd {
+		c.writeInt(baseLen + int64(b))
+	}
+	return true
+}
+
 func (c *connState) cmdLPush(argv [][]byte)  { c.cmdPush(argv, true, false) }
 func (c *connState) cmdRPush(argv [][]byte)  { c.cmdPush(argv, false, false) }
 func (c *connState) cmdLPushX(argv [][]byte) { c.cmdPush(argv, true, true) }
@@ -205,6 +312,11 @@ func (c *connState) cmdPush(argv [][]byte, atHead, requireExisting bool) {
 		return
 	}
 	lkey := argv[1]
+	// A resident hot-list window appends lock-free off the stripe lock. It short-circuits on a
+	// single atomic load when no list is hot, so a cold or random-key push falls straight through.
+	if c.pushThroughWindow(lkey, atHead, argv[2:], nil) {
+		return
+	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
 	if c.stringConflict(lkey) {
@@ -243,6 +355,10 @@ func (c *connState) cmdPush(argv [][]byte, atHead, requireExisting bool) {
 	// one fewer index probe); when this push created the list, create the header row.
 	if existed {
 		c.listPutHeaderAt(hoff, head, tail, lpBytes, everLarge)
+		// The list already existed, so this push is repeat traffic: admit a hot-list window and let
+		// every later push append lock-free. A first push to a fresh key (existed == false) never
+		// admits, so a random-key push workload keeps paying nothing for the overlay.
+		c.admitListWindow(lkey, head, tail, lpBytes, everLarge)
 	} else if err := c.listPutHeader(lkey, head, tail, lpBytes, everLarge); err != nil {
 		mu.Unlock()
 		c.writeErr("ERR " + err.Error())
@@ -334,6 +450,11 @@ func (c *connState) drainPush(first [][]byte, atHead, requireExisting bool, pos 
 // element lengthens the window by exactly one whichever end it joins, the reply for command k is
 // the pre-run length plus bnd[k], so the replies need no per-element bookkeeping.
 func (c *connState) cmdPushCoalesced(lkey []byte, atHead, requireExisting bool, elems [][]byte, bnd []int) {
+	// A resident hot-list window applies the whole run lock-free with one reserved-bound bump and N
+	// element writes off the stripe lock, the piece that lets one hot key use more than one core.
+	if c.pushThroughWindow(lkey, atHead, elems, bnd) {
+		return
+	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
 	if c.stringConflict(lkey) {
@@ -402,6 +523,9 @@ func (c *connState) cmdPushCoalesced(lkey []byte, atHead, requireExisting bool, 
 	}
 	if existed {
 		c.listPutHeaderAt(hoff, head, tail, lpBytes, everLarge)
+		// Repeat push traffic on an existing list: admit a hot-list window so the next run of this
+		// key appends lock-free through pushThroughWindow instead of taking the stripe lock here.
+		c.admitListWindow(lkey, head, tail, lpBytes, everLarge)
 	} else if err := c.listPutHeader(lkey, head, tail, lpBytes, everLarge); err != nil {
 		mu.Unlock()
 		emsg := "ERR " + err.Error()
@@ -458,6 +582,7 @@ func (c *connState) cmdPop(argv [][]byte, atHead bool) {
 		c.writeErr(wrongType)
 		return
 	}
+	c.listWinDrainEvict(lkey)
 	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
 	if !ok {
 		mu.Unlock()
@@ -679,6 +804,7 @@ func (c *connState) cmdLSet(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	c.listWinDrainEvict(lkey)
 	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
 	if !ok {
 		mu.Unlock()
@@ -779,7 +905,7 @@ func (c *connState) cmdLPos(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	head, tail, _, _, _, ok := c.listHeaderAt(lkey)
+	head, tail, _, _, ok := c.listHeader(lkey)
 	if !ok {
 		mu.Unlock()
 		if count >= 0 {
@@ -881,6 +1007,7 @@ func (c *connState) cmdLTrim(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	c.listWinDrainEvict(lkey)
 	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
 	if !ok {
 		mu.Unlock()
@@ -971,6 +1098,7 @@ func (c *connState) cmdLInsert(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	c.listWinDrainEvict(lkey)
 	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
 	if !ok {
 		mu.Unlock()
@@ -1074,6 +1202,7 @@ func (c *connState) cmdLRem(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	c.listWinDrainEvict(lkey)
 	head, tail, lpBytes, everLarge, hoff, ok := c.listHeaderAt(lkey)
 	if !ok {
 		mu.Unlock()
@@ -1237,6 +1366,7 @@ func listTryInteger(e []byte) (int64, bool) {
 // is returned aliasing c.vbuf (a copy out of the arena), so it stays valid after the row is
 // gone and can be pushed straight onto another list.
 func (c *connState) listPopEnd(lkey []byte, atHead bool) (val []byte, ok bool) {
+	c.listWinDrainEvict(lkey)
 	head, tail, lpBytes, everLarge, hoff, have := c.listHeaderAt(lkey)
 	if !have {
 		return c.vbuf[:0], false
@@ -1265,6 +1395,7 @@ func (c *connState) listPopEnd(lkey []byte, atHead bool) (val []byte, ok bool) {
 // PutKind before the header read that would reuse the buffer, and the header read lands in its
 // own scratch, not vbuf.
 func (c *connState) listPushEnd(lkey, elem []byte, atHead bool) error {
+	c.listWinDrainEvict(lkey)
 	head, tail, lpBytes, everLarge, hoff, existed := c.listHeaderAt(lkey)
 	var pos int64
 	if atHead {
@@ -1427,6 +1558,7 @@ func (c *connState) cmdLMPop(argv [][]byte) {
 			c.writeErr(wrongType)
 			return
 		}
+		c.listWinDrainEvict(key)
 		head, tail, lpBytes, everLarge, hoff, have := c.listHeaderAt(key)
 		if !have {
 			mu.Unlock()
