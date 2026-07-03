@@ -252,4 +252,3 @@ func (w *listWindow) appendHead(n int64, posElems [][]byte) (baseLen int64) {
 	w.mu.Unlock()
 	return baseLen
 }
-
