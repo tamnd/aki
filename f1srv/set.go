@@ -608,56 +608,46 @@ func (c *connState) cmdSPop(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	// Reconcile any deferred SREM splices before the rank-based victim draw: a not-yet-spliced
-	// dead node would inflate the ordered-index widths and skew the uniform pick (spec 2064/16
-	// slice 2). Under this key's stripe lock no new tombstone for it can appear mid-command, and
-	// the call is a single atomic load when nothing is pending.
-	c.srv.store.SyncPendingRemovals()
-	// Read the header once, under the lock, for both the count and the shrink write. On a
-	// removal the encoding never changes (Redis never downgrades) and the stripe lock keeps
-	// any writer out, so the enc read here is the enc the shrink write hands back, which lets
-	// setPutHeader skip the header re-read setSetCard would otherwise do. On a hot single-key
-	// SPOP that re-read is pure critical-section time on a mutex already in convoy at depth,
-	// so cutting it directly lifts the contended throughput ceiling.
-	card64, enc, _ := c.setHeader(skey)
-	card := int(card64)
-
 	if !hasCount {
-		// No-count form: one member as a bulk string, nil on a missing key.
-		if card == 0 {
-			mu.Unlock()
-			c.writeNil()
-			return
-		}
+		// No-count form: draw one uniform victim from the dense member vector and swap-remove it
+		// in O(1) (spec 2064/18 section 5), instead of the O(log n) rank descent the count form
+		// still runs. The vector tracks live membership on its own, so this path needs neither the
+		// header read the shrink used nor the SyncPendingRemovals reconcile a rank draw requires.
 		prefix := c.setPrefix(skey)
-		// Fused select-and-remove: one positional descent selects the random victim and
-		// unlinks it from the ordered index, instead of a select descent here and a
-		// separate CollRemove descent below. The returned key is the member row's exact
-		// composite key, so it drives the resident-hash DeleteKind directly with no rebuild.
-		k, ok := c.srv.store.CollSelectRemoveAt(prefix, rand.IntN(card))
+		k, ok := c.srv.store.CollRandSelectRemove(prefix)
 		if !ok {
+			// Empty or missing set: the vector built from a live scan has no slot to draw.
 			mu.Unlock()
 			c.writeNil()
 			return
 		}
 		member := k[len(prefix):]
-		// Keep the dense vector consistent with the removal (spec 2064/18 section 5.2): drop the
-		// popped member's offset before its record is deleted. Slice 2 still draws the victim from
-		// the ordered index (CollSelectRemoveAt); a later slice moves the draw itself onto the
-		// vector so the descent goes away, but the vector must already track removals for the
-		// SRANDMEMBER draw to trust it.
-		c.srv.store.CollRandRemove(prefix, k, kindSetMember)
+		// The vector already dropped the victim's slot; delete its hash record, then defer the
+		// ordered-index splice off this reply path in one batched tombstone, the same handoff SREM
+		// makes (spec 2064/16 slice 2). k is a stable arena subslice, so packing it and returning
+		// its member tail after the delete is safe.
 		c.srv.store.DeleteKind(k, kindSetMember)
-		if err := c.setPutHeader(skey, uint64(card-1), enc); err != nil {
-			mu.Unlock()
-			c.writeErr("ERR " + err.Error())
-			return
+		buf := append(c.delKeyBuf[:0], k...)
+		c.delKeyBuf = buf
+		ends := append(c.delKeyEnd[:0], len(buf))
+		c.delKeyEnd = ends
+		c.srv.store.CollRemovePacked(buf, ends, kindSetMember)
+		// Decrement the maintained cardinality in place; at zero the set is gone and its header row
+		// is dropped under the same lock (empty set is no set), exactly as SREM retires to zero.
+		if n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, -1); !ok || n <= 0 {
+			c.srv.store.DeleteKind(skey, kindSetMeta)
 		}
 		mu.Unlock()
 		c.writeBulk(member)
 		return
 	}
 
+	// Count form: reconcile any deferred splices so the rank-based sample sees exact ordered-index
+	// widths (a not-yet-spliced dead node would skew the uniform pick, spec 2064/16 slice 2), then
+	// read the header once under the lock for both the sample bound and the shrink write.
+	c.srv.store.SyncPendingRemovals()
+	card64, enc, _ := c.setHeader(skey)
+	card := int(card64)
 	if count == 0 || card == 0 {
 		mu.Unlock()
 		c.writeArrayHeader(0)
