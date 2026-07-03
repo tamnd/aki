@@ -219,6 +219,10 @@ func New(cfg Config) *Server {
 		// live-key counter for DBSIZE, the same policy KEYS/SCAN/RANDOMKEY hand ScanKeys.
 		// Set before the server accepts traffic, on the still-empty store.
 		srv.store.SetTopKindFunc(isTopKind)
+		// Take the O(log n) ordered-index splice off the element-delete reply path: a delete
+		// queues the removal and a background folder splices it under the index lock later
+		// (spec 2064/16 slice 2). Enable once here, before the server accepts traffic.
+		srv.store.EnableDeferredRemoval()
 	}
 	return srv
 }

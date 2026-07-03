@@ -179,13 +179,23 @@ func (c *connState) cmdSRem(argv [][]byte) {
 		return
 	}
 	removed := 0
+	// Accumulate the removed member composite keys packed end to end so the ordered-index
+	// splice is deferred off this stripe-locked reply path in one batch (spec 2064/16 slice 2)
+	// instead of one synchronous O(log n) splice per member here. memberKey reuses its scratch
+	// on the next call, so each removed key is copied into the packed buffer before the next.
+	buf := c.delKeyBuf[:0]
+	ends := c.delKeyEnd[:0]
 	for _, member := range argv[2:] {
 		mk := c.memberKey(skey, member)
 		if c.srv.store.DeleteKind(mk, kindSetMember) {
-			c.srv.store.CollRemove(mk)
+			buf = append(buf, mk...)
+			ends = append(ends, len(buf))
 			removed++
 		}
 	}
+	c.delKeyBuf = buf
+	c.delKeyEnd = ends
+	c.srv.store.CollRemovePacked(buf, ends, kindSetMember)
 	if removed > 0 {
 		// Decrement the maintained cardinality with one in-place atomic instead of a
 		// GetKind + PutKind read-modify-write of the whole header value. The stripe lock
@@ -483,6 +493,11 @@ func (c *connState) cmdSRandMember(argv [][]byte) {
 			c.writeErr(wrongType)
 			return
 		}
+		// Rank-based select walks ordered-index widths, which count any not-yet-spliced dead
+		// node from a deferred SREM (spec 2064/16 slice 2), so reconcile the index first. This
+		// is a no-op (one atomic load) when nothing is pending, the steady state for a select
+		// workload that is not interleaved with deletes.
+		c.srv.store.SyncPendingRemovals()
 		card := c.setCard(skey)
 		if card == 0 {
 			c.writeNil()
@@ -512,6 +527,10 @@ func (c *connState) cmdSRandMember(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	// Reconcile any deferred SREM splices before rank-based sampling: the stripe lock keeps this
+	// key's cardinality and ordered index consistent across the multi-pick sample, and draining
+	// under it means no new tombstone for this key can appear mid-sample (spec 2064/16 slice 2).
+	c.srv.store.SyncPendingRemovals()
 	card := int(c.setCard(skey))
 	if count == 0 || card == 0 {
 		mu.Unlock()
@@ -582,6 +601,11 @@ func (c *connState) cmdSPop(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	// Reconcile any deferred SREM splices before the rank-based victim draw: a not-yet-spliced
+	// dead node would inflate the ordered-index widths and skew the uniform pick (spec 2064/16
+	// slice 2). Under this key's stripe lock no new tombstone for it can appear mid-command, and
+	// the call is a single atomic load when nothing is pending.
+	c.srv.store.SyncPendingRemovals()
 	// Read the header once, under the lock, for both the count and the shrink write. On a
 	// removal the encoding never changes (Redis never downgrades) and the stripe lock keeps
 	// any writer out, so the enc read here is the enc the shrink write hands back, which lets
