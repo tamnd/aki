@@ -144,3 +144,110 @@ func TestReactorConcurrentConns(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// startReactorServer starts a reactor-mode server on an ephemeral port and returns its
+// address plus a cleanup. Unlike dialTestServerMode it opens no connection, so a test can
+// drive several independent clients against the same loops, which is what the blocking-park
+// path needs: one client blocks while another wakes it.
+func startReactorServer(t *testing.T) (string, func()) {
+	t.Helper()
+	cfg := Config{Addr: "127.0.0.1:0", IndexBuckets: 1 << 12, ArenaBytes: 1 << 20, ReadBufSize: 4 << 10, IncrStripes: 64, NetMode: "reactor"}
+	srv := New(cfg)
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go srv.ListenAndServe()
+	return srv.Addr(), func() { srv.Close() }
+}
+
+func dialRW(t *testing.T, addr string) (net.Conn, *bufio.ReadWriter) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	return conn, bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+}
+
+// TestReactorBlockingParkServed proves the async-park facility on the epoll loop: a BLPOP on
+// an empty key must not reply immediately (the reactor disarms reads and hands the command to
+// a park goroutine), and a later LPUSH from another connection wakes it with the pushed
+// element. This is the semantics the goroutine driver gives for free by parking the
+// connection's own goroutine; here the connection stays on the shared loop, so the test
+// guards against both a lost wake and a busy reply that would mean the command never parked.
+func TestReactorBlockingParkServed(t *testing.T) {
+	addr, stop := startReactorServer(t)
+	defer stop()
+
+	blkConn, blk := dialRW(t, addr)
+	defer blkConn.Close()
+	cmd(t, blk, "BLPOP", "mylist", "0")
+
+	// The blocked client must stay silent until a push arrives. A short read deadline that
+	// times out is the proof it parked rather than replying nil right away.
+	_ = blkConn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	if _, err := blk.ReadString('\n'); err == nil {
+		t.Fatal("BLPOP replied before any push; it did not park")
+	}
+	_ = blkConn.SetReadDeadline(time.Time{})
+
+	pushConn, push := dialRW(t, addr)
+	defer pushConn.Close()
+	cmd(t, push, "LPUSH", "mylist", "hello")
+	if got := readReply(t, push); got != ":1" {
+		t.Fatalf("LPUSH: got %q", got)
+	}
+
+	// The park goroutine wrote its reply into cs.out and posted the connection back to the
+	// loop, which flushed it: a two-element array of the key name and the popped value.
+	_ = blkConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if got := readReply(t, blk); got != "*2" {
+		t.Fatalf("BLPOP header: got %q", got)
+	}
+	if got := readReply(t, blk); got != "$mylist" {
+		t.Fatalf("BLPOP key: got %q", got)
+	}
+	if got := readReply(t, blk); got != "$hello" {
+		t.Fatalf("BLPOP value: got %q", got)
+	}
+}
+
+// TestReactorBlockingParkDisconnect proves the peer-disconnect path: a client that closes its
+// socket while blocked in BLPOP must unwind the park goroutine (through parkCancel) without
+// consuming a later push, and must not wedge or crash the loop. After the disconnect a fresh
+// client pushes and pops the same key, which confirms the waiter was fully removed and the
+// loop still serves.
+func TestReactorBlockingParkDisconnect(t *testing.T) {
+	addr, stop := startReactorServer(t)
+	defer stop()
+
+	blkConn, blk := dialRW(t, addr)
+	cmd(t, blk, "BLPOP", "gone", "0")
+	// Let the command reach the loop and park before the peer vanishes.
+	_ = blkConn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	if _, err := blk.ReadString('\n'); err == nil {
+		t.Fatal("BLPOP replied before parking")
+	}
+	blkConn.Close()
+	// Give the loop a moment to observe EPOLLRDHUP and cancel the park.
+	time.Sleep(150 * time.Millisecond)
+
+	// A push after the disconnect must not have been delivered to the dead waiter: the value
+	// stays in the list and a fresh BLPOP pops it.
+	otherConn, other := dialRW(t, addr)
+	defer otherConn.Close()
+	cmd(t, other, "LPUSH", "gone", "world")
+	if got := readReply(t, other); got != ":1" {
+		t.Fatalf("LPUSH after disconnect: got %q", got)
+	}
+	cmd(t, other, "BLPOP", "gone", "0")
+	if got := readReply(t, other); got != "*2" {
+		t.Fatalf("BLPOP header: got %q", got)
+	}
+	if got := readReply(t, other); got != "$gone" {
+		t.Fatalf("BLPOP key: got %q", got)
+	}
+	if got := readReply(t, other); got != "$world" {
+		t.Fatalf("BLPOP value: got %q", got)
+	}
+}
