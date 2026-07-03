@@ -91,6 +91,26 @@ func (c *connState) drainDelete(first [][]byte, fam delFamily, pos int) int {
 	return pos
 }
 
+// collRemoveBatch drops every composite key an applier deleted from the hash index out of
+// the ordered element index under one index-lock acquisition. buf holds the removed keys
+// packed end to end and ends[k] is the cumulative byte length through the k-th key, so the
+// keys reslice out of buf without copying again. The reslice runs only after buf is fully
+// built, so a mid-build append that reallocated buf cannot leave an earlier entry pointing
+// at freed backing. An empty run touches nothing and never takes the lock.
+func (c *connState) collRemoveBatch(buf []byte, ends []int) {
+	if len(ends) == 0 {
+		return
+	}
+	keys := c.delKeys[:0]
+	prev := 0
+	for _, e := range ends {
+		keys = append(keys, buf[prev:e])
+		prev = e
+	}
+	c.delKeys = keys
+	c.srv.store.CollRemoveMany(keys)
+}
+
 // cmdHDelCoalesced applies a run of same-key HDELs captured from one connection's pipeline
 // under a single stripe-lock acquisition and a single hash-count rewrite, then writes one
 // integer reply per original command. It is exactly equivalent to running the commands one
@@ -110,6 +130,8 @@ func (c *connState) cmdHDelCoalesced(hkey []byte, elems [][]byte, bnd []int) {
 		return
 	}
 	counts := c.delCnt[:0]
+	buf := c.delKeyBuf[:0]
+	ends := c.delKeyEnd[:0]
 	total := 0
 	i := 0
 	for _, end := range bnd {
@@ -117,7 +139,10 @@ func (c *connState) cmdHDelCoalesced(hkey []byte, elems [][]byte, bnd []int) {
 		for ; i < end; i++ {
 			fk := c.fieldKey(hkey, elems[i])
 			if c.srv.store.DeleteKind(fk, kindHashField) {
-				c.srv.store.CollRemove(fk)
+				// Copy the composite key into the packed arena for one batched oindex remove
+				// at the end of the run; kbuf is reused on the next fieldKey call.
+				buf = append(buf, fk...)
+				ends = append(ends, len(buf))
 				// Drop any TTL sibling the field carried so the global hfe gate and the per-hash
 				// hint stay exact when a TTL'd field is deleted outright.
 				c.clearFieldTTLLocked(hkey, fk)
@@ -127,7 +152,10 @@ func (c *connState) cmdHDelCoalesced(hkey []byte, elems [][]byte, bnd []int) {
 		counts = append(counts, deleted)
 		total += deleted
 	}
+	c.delKeyBuf = buf
+	c.delKeyEnd = ends
 	c.delCnt = counts
+	c.collRemoveBatch(buf, ends)
 	if total > 0 {
 		count := c.hashCount(hkey)
 		if uint64(total) >= count {
@@ -163,6 +191,8 @@ func (c *connState) cmdSRemCoalesced(skey []byte, elems [][]byte, bnd []int) {
 		return
 	}
 	counts := c.delCnt[:0]
+	buf := c.delKeyBuf[:0]
+	ends := c.delKeyEnd[:0]
 	total := 0
 	i := 0
 	for _, end := range bnd {
@@ -170,14 +200,18 @@ func (c *connState) cmdSRemCoalesced(skey []byte, elems [][]byte, bnd []int) {
 		for ; i < end; i++ {
 			mk := c.memberKey(skey, elems[i])
 			if c.srv.store.DeleteKind(mk, kindSetMember) {
-				c.srv.store.CollRemove(mk)
+				buf = append(buf, mk...)
+				ends = append(ends, len(buf))
 				removed++
 			}
 		}
 		counts = append(counts, removed)
 		total += removed
 	}
+	c.delKeyBuf = buf
+	c.delKeyEnd = ends
 	c.delCnt = counts
+	c.collRemoveBatch(buf, ends)
 	if total > 0 {
 		count := c.setCard(skey)
 		if uint64(total) >= count {
@@ -214,6 +248,8 @@ func (c *connState) cmdZRemCoalesced(zkey []byte, elems [][]byte, bnd []int) {
 		return
 	}
 	counts := c.delCnt[:0]
+	buf := c.delKeyBuf[:0]
+	ends := c.delKeyEnd[:0]
 	total := 0
 	i := 0
 	for _, end := range bnd {
@@ -230,18 +266,24 @@ func (c *connState) cmdZRemCoalesced(zkey []byte, elems [][]byte, bnd []int) {
 			// directly, the point of storing the score in the member row (spec section 2.5).
 			score := math.Float64frombits(binary.LittleEndian.Uint64(v))
 			if c.srv.store.DeleteKind(mk, kindZsetMember) {
-				c.srv.store.CollRemove(mk)
+				// Copy the member key out of kbuf before zscoreKey rebuilds kbuf below.
+				buf = append(buf, mk...)
+				ends = append(ends, len(buf))
 			}
 			sk := c.zscoreKey(zkey, score, member)
 			if c.srv.store.DeleteKind(sk, kindZsetScore) {
-				c.srv.store.CollRemove(sk)
+				buf = append(buf, sk...)
+				ends = append(ends, len(buf))
 			}
 			removed++
 		}
 		counts = append(counts, removed)
 		total += removed
 	}
+	c.delKeyBuf = buf
+	c.delKeyEnd = ends
 	c.delCnt = counts
+	c.collRemoveBatch(buf, ends)
 	if total > 0 {
 		count := c.zsetCard(zkey)
 		if uint64(total) >= count {

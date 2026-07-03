@@ -301,6 +301,16 @@ func (s *Store) CollRemove(key []byte) {
 	s.oidx.remove(key)
 }
 
+// CollRemoveMany drops every key in keys from the ordered element index under a single
+// index-lock acquisition. It is the batched counterpart to CollRemove for a coalesced
+// delete run: the server has already removed each element row from the hash index and
+// copied the removed keys out of its per-command key scratch, so this folds one lock
+// cycle over the whole run instead of one per element. Call it under the collection's
+// stripe lock, the same serialization CollRemove relies on.
+func (s *Store) CollRemoveMany(keys [][]byte) {
+	s.oidx.removeMany(keys)
+}
+
 // CollScan appends, to dst, the full composite keys of up to limit element rows whose
 // key has the given prefix and sorts strictly after `after` (nil after starts at the
 // prefix), in key order. It returns the grown dst and the last key returned, to pass

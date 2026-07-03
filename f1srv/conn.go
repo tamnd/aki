@@ -43,24 +43,27 @@ type connState struct {
 	parkCancel chan struct{}
 	// nowMs is the wall-clock ms cached once per drained batch, the "now" every command in
 	// the batch reads for expiry, like Redis server.mstime.
-	nowMs    int64
-	argv     [][]byte
-	vbuf     []byte    // reused destination for GET/MGET value copies
-	kbuf     []byte    // reused scratch for building composite collection element keys
-	pbuf     []byte    // reused scratch for a collection enumeration prefix, held across a scan
-	sbuf     []byte    // reused scratch for formatting a float score reply (ZSCORE/ZINCRBY)
-	zscores  []float64 // reused scratch for a ZADD's parsed scores, one per score-member pair
-	zkeys    [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
-	kscan    [][]byte  // reused scratch for a KEYS/SCAN/RANDOMKEY bucket-walk key batch
-	wkeys    [][]byte  // reused scratch for a write command's touched-key list (WATCH signalling)
-	hscanK   [][]byte  // reused scratch for a whole-hash read's element-key batch (HGETALL/HKEYS/HVALS)
-	hscanO   []uint64  // reused scratch for a whole-hash value-carrying read's record-offset batch
-	pushColl [][]byte  // reused scratch for a coalesced push run's elements, in arrival order
-	pushBnd  []int     // reused scratch for the coalesced push run's per-command element boundaries
-	popBufs  [][]byte  // reused scratch for a window pop run's claimed element slices, framed after the commit mutex releases
-	delColl  [][]byte  // reused scratch for a coalesced delete run's elements (HDEL/SREM/ZREM), in arrival order
-	delBnd   []int     // reused scratch for the coalesced delete run's per-command element boundaries
-	delCnt   []int     // reused scratch for the coalesced delete run's per-command removed counts
+	nowMs     int64
+	argv      [][]byte
+	vbuf      []byte    // reused destination for GET/MGET value copies
+	kbuf      []byte    // reused scratch for building composite collection element keys
+	pbuf      []byte    // reused scratch for a collection enumeration prefix, held across a scan
+	sbuf      []byte    // reused scratch for formatting a float score reply (ZSCORE/ZINCRBY)
+	zscores   []float64 // reused scratch for a ZADD's parsed scores, one per score-member pair
+	zkeys     [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
+	kscan     [][]byte  // reused scratch for a KEYS/SCAN/RANDOMKEY bucket-walk key batch
+	wkeys     [][]byte  // reused scratch for a write command's touched-key list (WATCH signalling)
+	hscanK    [][]byte  // reused scratch for a whole-hash read's element-key batch (HGETALL/HKEYS/HVALS)
+	hscanO    []uint64  // reused scratch for a whole-hash value-carrying read's record-offset batch
+	pushColl  [][]byte  // reused scratch for a coalesced push run's elements, in arrival order
+	pushBnd   []int     // reused scratch for the coalesced push run's per-command element boundaries
+	popBufs   [][]byte  // reused scratch for a window pop run's claimed element slices, framed after the commit mutex releases
+	delColl   [][]byte  // reused scratch for a coalesced delete run's elements (HDEL/SREM/ZREM), in arrival order
+	delBnd    []int     // reused scratch for the coalesced delete run's per-command element boundaries
+	delCnt    []int     // reused scratch for the coalesced delete run's per-command removed counts
+	delKeyBuf []byte    // reused byte arena holding copies of a delete run's removed composite keys, packed end to end
+	delKeyEnd []int     // reused scratch for the cumulative end offset of each key packed in delKeyBuf
+	delKeys   [][]byte  // reused scratch reslicing delKeyBuf into one entry per removed key for the batched oindex remove
 
 	// Transaction state (MULTI/EXEC/DISCARD/WATCH/UNWATCH). inMulti is set between MULTI
 	// and EXEC/DISCARD; while it is set every non-transaction command is copied into
