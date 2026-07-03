@@ -23,7 +23,9 @@ package f1srv
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"log"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +41,7 @@ type Config struct {
 	ReadBufSize  int    // initial per-connection read buffer
 	IncrStripes  int    // INCR-family RMW lock stripes (rounded up to a power of two)
 	NetMode      string // "auto" (reactor on Linux, goroutine elsewhere; the default), "go" (goroutine-per-conn), or "reactor" (Linux epoll)
+	ExecModel    string // "shared" (default: any loop runs any key under its stripe lock) or "affinity" (route each key to its owning shard worker, spec 2064/17). Inert until the routing slices land.
 
 	// ColdPath, when non-empty, engages the larger-than-memory string tier: the store
 	// opens an append-only cold value log at this path and writes any value longer than
@@ -60,6 +63,7 @@ func DefaultConfig(addr string) Config {
 		ReadBufSize:  64 << 10, // 64 KiB
 		IncrStripes:  1 << 10,  // 1024 stripes
 		NetMode:      "auto",   // reactor on Linux, goroutine driver elsewhere
+		ExecModel:    "shared", // stripe-locked shared store; "affinity" is opt-in until proven (spec 2064/17)
 	}
 }
 
@@ -79,6 +83,14 @@ type Server struct {
 	// the exclusive lock, so a reader never sees a field move mid-walk.
 	incrMu   []sync.RWMutex
 	incrMask uint32
+
+	// execModel is the resolved command-execution model (spec 2064/17), parsed once from
+	// cfg.ExecModel in New. execShards is the shard count the affinity model routes over,
+	// GOMAXPROCS so one shard maps to one worker core. Both are read-only after New. The
+	// affinity routing path is not wired yet; these carry the resolved choice so INFO and
+	// the routing slices that follow read one field instead of re-parsing the flag string.
+	execModel  execModel
+	execShards int
 
 	// listWin is the resident hot-list window registry (spec 2064/f1_rewrite_ltm/impl/26). Each
 	// shard is a map from a list key to its listWindow, indexed by the same stripe hash as incrMu,
@@ -185,12 +197,24 @@ func New(cfg Config) *Server {
 	if stripes < 1 {
 		stripes = 1
 	}
+	// Resolve the execution model once. An unrecognized value falls back to the shared
+	// default rather than refusing to start; the warning is logged so a typo is visible.
+	em, ok := parseExecModel(cfg.ExecModel)
+	if !ok {
+		log.Printf("f1srv: unknown --exec-model %q, using %q", cfg.ExecModel, em)
+	}
+	shards := runtime.GOMAXPROCS(0)
+	if shards < 1 {
+		shards = 1
+	}
 	srv := &Server{
-		cfg:       cfg,
-		incrMu:    make([]sync.RWMutex, stripes),
-		incrMask:  uint32(stripes - 1),
-		startTime: time.Now(),
-		runID:     newRunID(),
+		cfg:        cfg,
+		incrMu:     make([]sync.RWMutex, stripes),
+		incrMask:   uint32(stripes - 1),
+		execModel:  em,
+		execShards: shards,
+		startTime:  time.Now(),
+		runID:      newRunID(),
 	}
 	srv.listWin = make([]listWinShard, stripes)
 	for i := range srv.listWin {
