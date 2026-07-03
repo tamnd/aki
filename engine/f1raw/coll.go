@@ -199,6 +199,35 @@ func (s *Store) DeleteKind(key []byte, kind byte) bool {
 	}
 }
 
+// DeleteKindNoCount removes key in the given kind namespace like DeleteKind but leaves the
+// store's global record count alone, so a coalesced run of deletes charges the shared counter
+// once instead of once per element. It is the destructive counterpart to TakeKindNoCount: the
+// count-batching a set or hash delete burst wants. s.count is a single line every connection's
+// write hammers, so decrementing it once per removed element under a hot single-key SREM/HDEL
+// burst puts a contended atomic back on the per-element path the coalesced applier is trying to
+// keep off it, exactly the line the profile named on the delete gate. The caller counts the rows
+// it actually removed and folds them into one AddCount, the same coalescing slice 1 applied to
+// the header cardinality. Like DeleteKind it must be serialized with the key's other writers by
+// the caller's stripe lock; the CAS loop only guards a lost race. It is only correct for a kind
+// that is never top-level (a collection element or score row), since it does not adjust topCount;
+// a top-level kind must go through DeleteKind so DBSIZE stays exact.
+func (s *Store) DeleteKindNoCount(key []byte, kind byte) bool {
+	h := hash(key)
+	for {
+		off, b, slot, word, found := s.find(key, h, kind)
+		if !found {
+			return false
+		}
+		if b.slots[slot].CompareAndSwap(word, 0) {
+			// A separated element's cold value is now unreferenced; account it as dead. This
+			// stays per element because it addresses the specific record's cold bytes; only the
+			// contended global count is what the caller batches.
+			s.markSepDead(off)
+			return true
+		}
+	}
+}
+
 // TakeKind reads the value for key in the given kind namespace into dst and removes the
 // record in a single index probe, reporting whether it was present. It is the fused read
 // then point-delete a list pop wants: LPOP and RPOP read the element they return and then

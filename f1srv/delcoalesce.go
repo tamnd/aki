@@ -143,7 +143,7 @@ func (c *connState) cmdHDelCoalesced(hkey []byte, elems [][]byte, bnd []int) {
 		deleted := 0
 		for ; i < end; i++ {
 			fk := c.fieldKey(hkey, elems[i])
-			if c.srv.store.DeleteKind(fk, kindHashField) {
+			if c.srv.store.DeleteKindNoCount(fk, kindHashField) {
 				// Copy the composite key into the packed arena for one batched oindex remove
 				// at the end of the run; kbuf is reused on the next fieldKey call.
 				buf = append(buf, fk...)
@@ -162,6 +162,12 @@ func (c *connState) cmdHDelCoalesced(hkey []byte, elems [][]byte, bnd []int) {
 	c.delKeyBuf = buf
 	c.delKeyEnd = ends
 	c.delCnt = counts
+	// Fold the whole run's global record-count decrement into one atomic (spec 2064/16 slice 3).
+	// The per-field deletes above went through DeleteKindNoCount to keep the contended s.count line
+	// off the hot path, so charge it once here for every field actually removed.
+	if total > 0 {
+		c.srv.store.AddCount(-int64(total))
+	}
 	// Defer the ordered-index splice off the stripe-locked reply path (spec 2064/16 slice 2).
 	// CollRemovePacked copies the packed keys onto the tombstone queue when deferred removal is
 	// on, so buf and ends are free to reuse the moment it returns.
@@ -199,7 +205,7 @@ func (c *connState) cmdSRemCoalesced(skey []byte, elems [][]byte, bnd []int) {
 		removed := 0
 		for ; i < end; i++ {
 			mk := c.memberKey(skey, elems[i])
-			if c.srv.store.DeleteKind(mk, kindSetMember) {
+			if c.srv.store.DeleteKindNoCount(mk, kindSetMember) {
 				buf = append(buf, mk...)
 				ends = append(ends, len(buf))
 				removed++
@@ -211,6 +217,11 @@ func (c *connState) cmdSRemCoalesced(skey []byte, elems [][]byte, bnd []int) {
 	c.delKeyBuf = buf
 	c.delKeyEnd = ends
 	c.delCnt = counts
+	// Fold the run's global record-count decrement into one atomic (spec 2064/16 slice 3): the
+	// members went through DeleteKindNoCount to keep the contended s.count line off the hot path.
+	if total > 0 {
+		c.srv.store.AddCount(-int64(total))
+	}
 	// Defer the ordered-index splice off the stripe-locked reply path (spec 2064/16 slice 2).
 	c.srv.store.CollRemovePacked(buf, ends, kindSetMember)
 	if total > 0 {
@@ -242,6 +253,7 @@ func (c *connState) cmdZRemCoalesced(zkey []byte, elems [][]byte, bnd []int) {
 	buf := c.delKeyBuf[:0]
 	ends := c.delKeyEnd[:0]
 	total := 0
+	recs := 0
 	i := 0
 	for _, end := range bnd {
 		removed := 0
@@ -252,21 +264,24 @@ func (c *connState) cmdZRemCoalesced(zkey []byte, elems [][]byte, bnd []int) {
 			// probe, where a GetKind then DeleteKind would find the same record twice. The
 			// score is copied into vbuf before the slot clears, so it stays readable below to
 			// address the score row directly, the point of storing the score in the member row
-			// (spec section 2.5).
-			v, ok := c.srv.store.TakeKind(mk, c.vbuf[:0], kindZsetMember)
+			// (spec section 2.5). NoCount keeps the contended global s.count line off the hot
+			// path; the run charges it once through AddCount below (spec 2064/16 slice 3).
+			v, ok := c.srv.store.TakeKindNoCount(mk, c.vbuf[:0], kindZsetMember)
 			c.vbuf = v
 			if !ok {
 				continue
 			}
+			recs++
 			score := math.Float64frombits(binary.LittleEndian.Uint64(v))
 			// The member row is gone; record its composite key for the batched oindex remove.
 			// Copy it out of kbuf before zscoreKey rebuilds kbuf below.
 			buf = append(buf, mk...)
 			ends = append(ends, len(buf))
 			sk := c.zscoreKey(zkey, score, member)
-			if c.srv.store.DeleteKind(sk, kindZsetScore) {
+			if c.srv.store.DeleteKindNoCount(sk, kindZsetScore) {
 				buf = append(buf, sk...)
 				ends = append(ends, len(buf))
+				recs++
 			}
 			removed++
 		}
@@ -276,6 +291,11 @@ func (c *connState) cmdZRemCoalesced(zkey []byte, elems [][]byte, bnd []int) {
 	c.delKeyBuf = buf
 	c.delKeyEnd = ends
 	c.delCnt = counts
+	// One global record-count decrement for every row the run actually unlinked (member rows
+	// plus their score sidecars), the batched companion to TakeKindNoCount/DeleteKindNoCount.
+	if recs > 0 {
+		c.srv.store.AddCount(-int64(recs))
+	}
 	c.collRemoveBatch(buf, ends)
 	if total > 0 {
 		n, ok := c.srv.store.CountAddInt64(zkey, kindZsetMeta, -int64(total))
