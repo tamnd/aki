@@ -99,11 +99,16 @@ func (s *Store) folderLoop() {
 // caller's scratch is reused), and it is far cheaper than the O(log n) globally-locked splice it
 // replaces on the hot path.
 func (s *Store) enqueueTomb(buf []byte, ends []int, kind byte) {
-	b := make([]byte, len(buf))
-	copy(b, buf)
-	e := make([]int, len(ends))
-	copy(e, ends)
-	n := &tombNode{buf: b, ends: e, kind: kind}
+	n, _ := s.tombPool.Get().(*tombNode)
+	if n == nil {
+		n = &tombNode{}
+	}
+	// Reuse the node's arenas: append onto a zero-length reslice grows them only when a batch is
+	// larger than any this node held before, so a steady stream of same-size drains never allocates.
+	n.buf = append(n.buf[:0], buf...)
+	n.ends = append(n.ends[:0], ends...)
+	n.kind = kind
+	n.next = nil
 	for {
 		head := s.tombHead.Load()
 		n.next = head
@@ -134,9 +139,16 @@ func (s *Store) drainTombstones() int {
 		return 0
 	}
 	total := 0
-	for n := head; n != nil; n = n.next {
+	for n := head; n != nil; {
 		s.oidx.removeManyLive(n.buf, n.ends, n.kind)
 		total += len(n.ends)
+		// The node is off the stack in this drain's private snapshot and now spliced, so nothing
+		// else references it; hand it and its arenas back to the pool for the next enqueue. Read
+		// next before recycling, since a producer may repopulate n the moment it is Put.
+		next := n.next
+		n.next = nil
+		s.tombPool.Put(n)
+		n = next
 	}
 	s.tombPend.Add(int64(-total))
 	return total
