@@ -614,17 +614,17 @@ func (c *connState) cmdZRem(argv [][]byte) {
 	removed := 0
 	for _, member := range argv[2:] {
 		mk := c.zmemberKey(zkey, member)
-		v, ok := c.srv.store.GetKind(mk, c.vbuf[:0], kindZsetMember)
+		// Take reads the score and deletes the member row in one index probe, where a GetKind
+		// then DeleteKind would find the same record twice. The score is copied into vbuf
+		// before the slot clears, so it stays readable below to address the score row directly,
+		// the point of storing the score in the member row (spec section 2.5).
+		v, ok := c.srv.store.TakeKind(mk, c.vbuf[:0], kindZsetMember)
 		c.vbuf = v
 		if !ok {
 			continue
 		}
-		// Read the score before touching the member row so the score family can be addressed
-		// directly, the point of storing the score in the member row (spec section 2.5).
 		score := math.Float64frombits(binary.LittleEndian.Uint64(v))
-		if c.srv.store.DeleteKind(mk, kindZsetMember) {
-			c.srv.store.CollRemove(mk)
-		}
+		c.srv.store.CollRemove(mk)
 		sk := c.zscoreKey(zkey, score, member)
 		if c.srv.store.DeleteKind(sk, kindZsetScore) {
 			c.srv.store.CollRemove(sk)
