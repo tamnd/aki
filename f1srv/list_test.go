@@ -648,9 +648,12 @@ func TestListLMoveShortcutSource(t *testing.T) {
 		t.Fatalf("LMOVE from string = %q, want WRONGTYPE", got)
 	}
 
-	// A collection source keeps its pre-existing nil reply (not treated as missing-and-created).
+	// A non-string collection source is WRONGTYPE, the same as a string source: the shortcut only
+	// swallows a truly missing key as nil, never a key that exists under another type.
 	cmd(t, rw, "RPOPLPUSH", "h", "movedst")
-	expect(t, rw, "$-1")
+	if got := readReply(t, rw); !strings.HasPrefix(got, "-WRONGTYPE") {
+		t.Fatalf("RPOPLPUSH from hash = %q, want WRONGTYPE", got)
+	}
 
 	// A truly missing source replies nil.
 	cmd(t, rw, "RPOPLPUSH", "absent", "movedst")
@@ -659,6 +662,62 @@ func TestListLMoveShortcutSource(t *testing.T) {
 	// None of the above created the destination.
 	cmd(t, rw, "EXISTS", "movedst")
 	expect(t, rw, ":0")
+}
+
+// TestListWrongTypeAgainstCollections pins that every list command answers WRONGTYPE when the key
+// holds a non-string collection (hash, set, zset, stream), not just a string, and that a push does
+// not create a list header on top of the other type. Before the listWrongType gate the family
+// checked only the string namespace, so a collection source slipped through to a nil or empty reply
+// and a push silently produced a dual-type key.
+func TestListWrongTypeAgainstCollections(t *testing.T) {
+	makers := map[string][][]string{
+		"hash":   {{"HSET", "k", "f", "v"}},
+		"set":    {{"SADD", "k", "m"}},
+		"zset":   {{"ZADD", "k", "1", "m"}},
+		"stream": {{"XADD", "k", "1-1", "f", "v"}},
+	}
+	// Every list command that takes the key as its list operand. Each must be WRONGTYPE.
+	listCmds := [][]string{
+		{"LLEN", "k"},
+		{"LINDEX", "k", "0"},
+		{"LRANGE", "k", "0", "-1"},
+		{"LPOS", "k", "x"},
+		{"LPOP", "k"},
+		{"RPOP", "k"},
+		{"LPUSH", "k", "v"},
+		{"RPUSH", "k", "v"},
+		{"LPUSHX", "k", "v"},
+		{"RPUSHX", "k", "v"},
+		{"LSET", "k", "0", "x"},
+		{"LREM", "k", "0", "x"},
+		{"LTRIM", "k", "0", "-1"},
+		{"LINSERT", "k", "BEFORE", "a", "b"},
+		{"LMPOP", "1", "k", "LEFT"},
+		{"RPOPLPUSH", "k", "movedst"},
+		{"LMOVE", "k", "movedst", "LEFT", "RIGHT"},
+	}
+	for typ, setup := range makers {
+		t.Run(typ, func(t *testing.T) {
+			rw, cleanup := dialTestServer(t)
+			defer cleanup()
+			for _, s := range setup {
+				cmd(t, rw, s...)
+				readReply(t, rw)
+			}
+			for _, lc := range listCmds {
+				cmd(t, rw, lc...)
+				if got := readReply(t, rw); !strings.HasPrefix(got, "-WRONGTYPE") {
+					t.Fatalf("%s against a %s = %q, want WRONGTYPE", lc[0], typ, got)
+				}
+			}
+			// The failed pushes must not have created a list on top of the other type: the key still
+			// reports its original type, and the move destination was never created.
+			cmd(t, rw, "TYPE", "k")
+			expect(t, rw, "+"+typ)
+			cmd(t, rw, "EXISTS", "movedst")
+			expect(t, rw, ":0")
+		})
+	}
 }
 
 func TestListLMPop(t *testing.T) {

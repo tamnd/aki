@@ -131,6 +131,30 @@ func (c *connState) listHeader(lkey []byte) (head, tail int64, lpBytes uint64, e
 	return head, tail, lpBytes, everLarge, true
 }
 
+// listWrongType reports whether key holds a value of some type other than list, so a list command
+// must answer WRONGTYPE rather than its missing-key reply. It is the list-command type guard, a
+// window-aware superset of the string-only stringConflict every list command used before: a plain
+// string, a hash, a set, a zset, or a stream under the key is wrong type. A resident hot-list window
+// means the key is a live list (a window is admitted only after a push cleared this same check), so
+// it is never wrong type even while its positions live only in the ring with a stale header row. A
+// key absent from every namespace is not wrong type; the caller answers its own nil or empty reply
+// for a missing key. The probe is lock-free (listWinLookup is one atomic load, resolveType reads the
+// f1raw index), and it only runs on the stripe-locked slow path a cold or non-list key takes, never
+// on the resident-window fast path, so it adds nothing to the hot-list throughput. Before this the
+// list family checked stringConflict alone, so a non-string collection under the key slipped through
+// to a nil or empty reply, and a push even created a list header on top of it, a dual-type key.
+func (c *connState) listWrongType(lkey []byte) bool {
+	if w := c.srv.listWinLookup(lkey); w != nil {
+		return false
+	}
+	switch c.resolveType(lkey) {
+	case keyMissing, keyList:
+		return false
+	default:
+		return true
+	}
+}
+
 // listHeaderAt is listHeader that also returns the header row's arena offset, so a push or
 // pop that will write the window straight back can rewrite it in place with listPutHeaderAt
 // and skip the second index probe a plain PutHeader would repeat under the stripe lock. off
@@ -338,7 +362,7 @@ func (c *connState) cmdPush(argv [][]byte, atHead, requireExisting bool) {
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
-	if c.stringConflict(lkey) {
+	if c.listWrongType(lkey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
@@ -476,7 +500,7 @@ func (c *connState) cmdPushCoalesced(lkey []byte, atHead, requireExisting bool, 
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
-	if c.stringConflict(lkey) {
+	if c.listWrongType(lkey) {
 		mu.Unlock()
 		for range bnd {
 			c.writeErr(wrongType)
@@ -858,7 +882,7 @@ func (c *connState) cmdPop(argv [][]byte, atHead bool) {
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
-	if c.stringConflict(lkey) {
+	if c.listWrongType(lkey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
@@ -932,7 +956,7 @@ func (c *connState) cmdLLen(argv [][]byte) {
 		return
 	}
 	lkey := argv[1]
-	if c.stringConflict(lkey) {
+	if c.listWrongType(lkey) {
 		c.writeErr(wrongType)
 		return
 	}
@@ -958,7 +982,7 @@ func (c *connState) cmdLIndex(argv [][]byte) {
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
-	if c.stringConflict(lkey) {
+	if c.listWrongType(lkey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
@@ -1028,7 +1052,7 @@ func (c *connState) cmdLRange(argv [][]byte) {
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
-	if c.stringConflict(lkey) {
+	if c.listWrongType(lkey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
@@ -1110,7 +1134,7 @@ func (c *connState) cmdLSet(argv [][]byte) {
 	val := argv[3]
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
-	if c.stringConflict(lkey) {
+	if c.listWrongType(lkey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
@@ -1211,7 +1235,7 @@ func (c *connState) cmdLPos(argv [][]byte) {
 
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
-	if c.stringConflict(lkey) {
+	if c.listWrongType(lkey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
@@ -1431,7 +1455,7 @@ func (c *connState) cmdLTrim(argv [][]byte) {
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
-	if c.stringConflict(lkey) {
+	if c.listWrongType(lkey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
@@ -1692,7 +1716,7 @@ func (c *connState) cmdLInsert(argv [][]byte) {
 
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
-	if c.stringConflict(lkey) {
+	if c.listWrongType(lkey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
@@ -1819,7 +1843,7 @@ func (c *connState) cmdLRem(argv [][]byte) {
 
 	mu := &c.srv.incrMu[c.srv.stripe(lkey)]
 	mu.Lock()
-	if c.stringConflict(lkey) {
+	if c.listWrongType(lkey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
@@ -2182,7 +2206,7 @@ func (c *connState) ensureDestResident(dest []byte) (w *listWindow, wrongType bo
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(dest)]
 	mu.Lock()
-	if c.stringConflict(dest) {
+	if c.listWrongType(dest) {
 		mu.Unlock()
 		return nil, true
 	}
@@ -2242,7 +2266,7 @@ func (c *connState) lmoveThroughWindow(source, destination []byte, fromHead, toH
 	// Type-check the destination before touching the source, so a string destination errors with the
 	// source unchanged, the order Redis gives the move. The lock-free read matches the stripe body's
 	// own check and LLEN's.
-	if c.stringConflict(destination) {
+	if c.listWrongType(destination) {
 		c.writeErr(wrongType)
 		return true
 	}
@@ -2322,7 +2346,7 @@ func (c *connState) lmove(source, destination, fromTok, toTok []byte) {
 		return
 	}
 	unlock := c.lockTwoStripes(source, destination)
-	if c.stringConflict(source) || c.stringConflict(destination) {
+	if c.listWrongType(source) || c.listWrongType(destination) {
 		unlock()
 		c.writeErr(wrongType)
 		return
@@ -2404,7 +2428,7 @@ func (c *connState) cmdLMPop(argv [][]byte) {
 	for _, key := range keys {
 		mu := &c.srv.incrMu[c.srv.stripe(key)]
 		mu.Lock()
-		if c.stringConflict(key) {
+		if c.listWrongType(key) {
 			mu.Unlock()
 			c.writeErr(wrongType)
 			return
