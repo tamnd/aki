@@ -257,19 +257,21 @@ func (c *connState) cmdZRemCoalesced(zkey []byte, elems [][]byte, bnd []int) {
 		for ; i < end; i++ {
 			member := elems[i]
 			mk := c.zmemberKey(zkey, member)
-			v, ok := c.srv.store.GetKind(mk, c.vbuf[:0], kindZsetMember)
+			// Take reads the score out of the member row and deletes that row in one index
+			// probe, where a GetKind then DeleteKind would find the same record twice. The
+			// score is copied into vbuf before the slot clears, so it stays readable below to
+			// address the score row directly, the point of storing the score in the member row
+			// (spec section 2.5).
+			v, ok := c.srv.store.TakeKind(mk, c.vbuf[:0], kindZsetMember)
 			c.vbuf = v
 			if !ok {
 				continue
 			}
-			// Read the score before touching the member row so the score family can be addressed
-			// directly, the point of storing the score in the member row (spec section 2.5).
 			score := math.Float64frombits(binary.LittleEndian.Uint64(v))
-			if c.srv.store.DeleteKind(mk, kindZsetMember) {
-				// Copy the member key out of kbuf before zscoreKey rebuilds kbuf below.
-				buf = append(buf, mk...)
-				ends = append(ends, len(buf))
-			}
+			// The member row is gone; record its composite key for the batched oindex remove.
+			// Copy it out of kbuf before zscoreKey rebuilds kbuf below.
+			buf = append(buf, mk...)
+			ends = append(ends, len(buf))
 			sk := c.zscoreKey(zkey, score, member)
 			if c.srv.store.DeleteKind(sk, kindZsetScore) {
 				buf = append(buf, sk...)
