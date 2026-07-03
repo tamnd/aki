@@ -152,6 +152,13 @@ type Store struct {
 	// nothing for it.
 	oidx *oindex
 
+	// rvec is the set type's dense member vector (randvec.go): the resident array of member
+	// offsets that answers a uniform random draw (SPOP, SRANDMEMBER) in O(1) instead of an
+	// order-statistic descent over oidx. It is a striped, prefix-keyed map built lazily on the
+	// first draw against a set, so a keyspace that never draws at random allocates nothing here
+	// and the string and point-collection paths never touch it.
+	rvec *randVec
+
 	// cold is the on-disk value log for the larger-than-memory string regime, or nil
 	// for a pure in-memory store. When set, a string value longer than sepThreshold is
 	// written to the log and the in-memory record holds a cold pointer (cold.go). The
@@ -218,6 +225,7 @@ func New(indexBuckets, arenaBytes int) *Store {
 	}
 	s.tail.Store(8) // reserve offset 0 so an empty index entry (addr 0) is unambiguous
 	s.oidx = newOIndex(s)
+	s.rvec = newRandVec()
 	return s
 }
 
