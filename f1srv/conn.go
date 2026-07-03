@@ -131,6 +131,38 @@ func (c *connState) fill() bool {
 }
 
 // drain parses and dispatches every complete command currently in rbuf, then
+// outHighWater is the reply-buffer size past which the goroutine driver streams the batch
+// out mid-drain instead of letting a pipeline of large replies grow one contiguous buffer
+// without bound. A pipeline of whole-collection replies (HGETALL, SMEMBERS, HVALS, LRANGE,
+// ZRANGE over a large collection) would otherwise append every reply into c.out and grow it
+// through gigabytes of doubling copies before a single socket write, so the encode races the
+// allocator instead of the network and P16 collapses well under P1. Flushing at the high-water
+// mark bounds the buffer to this size and overlaps the socket write with the encoding of the
+// rest of the pipeline. 256 KiB is large enough that an ordinary pipeline of small replies
+// never trips it, so the GET/SET path still flushes exactly once per batch, and small enough
+// that the buffer never grows into a multi-megabyte realloc storm.
+const outHighWater = 256 << 10
+
+// streamOut writes the reply buffer to the socket mid-drain and resets it, the high-water
+// counterpart to the driver's once-per-batch flush. It serializes against a pub/sub publisher
+// on another goroutine when this connection is subscribed, the same guard loop() takes, so a
+// message frame and a batched reply never interleave on the socket. It only runs on the
+// goroutine driver, where the caller has already checked c.conn is non-nil; the reactor owns
+// its own non-blocking writes and never calls this. The write is best effort: a dead socket
+// surfaces at the terminal per-batch flush, which ends the connection, so a mid-drain write
+// error need not unwind the drain loop, and it only ever flushes at a command boundary where
+// c.out holds whole replies, never a partial one.
+func (c *connState) streamOut() {
+	if c.psMode {
+		c.writeMu.Lock()
+		_, _ = c.conn.Write(c.out)
+		c.writeMu.Unlock()
+	} else {
+		_, _ = c.conn.Write(c.out)
+	}
+	c.out = c.out[:0]
+}
+
 // compacts any partial trailing bytes to the front. It returns false on a protocol
 // error that should close the connection.
 func (c *connState) drain() bool {
@@ -165,6 +197,13 @@ func (c *connState) drain() bool {
 					c.rbuf = append(c.rbuf[:0], c.rbuf[pos:]...)
 				}
 				return true
+			}
+			// Stream the batch out once its replies pass the high-water mark, so a pipeline of
+			// large materialize replies never accumulates one unbounded reply buffer. Only the
+			// goroutine driver (c.conn set) writes here; the reactor flushes its own way. c.out
+			// holds only whole replies at this command boundary, so the flush never splits one.
+			if c.conn != nil && len(c.out) >= outHighWater {
+				c.streamOut()
 			}
 		case parseNeedMore:
 			if pos > 0 {
