@@ -134,6 +134,11 @@ func (c *connState) cmdHDelCoalesced(hkey []byte, elems [][]byte, bnd []int) {
 	ends := c.delKeyEnd[:0]
 	total := 0
 	i := 0
+	// One coarse gate for the whole run: when no field of this hash carries a TTL (the common
+	// case, answered by a single atomic load while the keyspace has no field TTL at all) the
+	// per-field TTL-row delete below is a guaranteed no-op, so skip it and save a hash probe
+	// per deleted field.
+	hadTTL := c.hashHasFieldTTL(hkey)
 	for _, end := range bnd {
 		deleted := 0
 		for ; i < end; i++ {
@@ -145,7 +150,9 @@ func (c *connState) cmdHDelCoalesced(hkey []byte, elems [][]byte, bnd []int) {
 				ends = append(ends, len(buf))
 				// Drop any TTL sibling the field carried so the global hfe gate and the per-hash
 				// hint stay exact when a TTL'd field is deleted outright.
-				c.clearFieldTTLLocked(hkey, fk)
+				if hadTTL {
+					c.clearFieldTTLLocked(hkey, fk)
+				}
 				deleted++
 			}
 		}
