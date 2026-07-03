@@ -770,6 +770,15 @@ func (c *connState) xreadStreams(rest [][]byte, count int, block bool, blockDur 
 		starts[j] = id
 	}
 
+	c.xreadBlock(keys, starts, count, block, blockDur, blockForever)
+}
+
+// xreadBlock runs XREAD's serve-or-park loop with the after-ids already resolved, so a '$' stays
+// fixed on the id that was current when the command was issued, across a park and every wake. It is
+// called once inline for the first serve pass and, under the epoll reactor where the connection
+// cannot sleep on the loop, again on a park goroutine with copied keys and starts, which is why the
+// handoff copies both rather than closing over the loop's reused read buffer.
+func (c *connState) xreadBlock(keys [][]byte, starts []streamID, count int, block bool, blockDur time.Duration, blockForever bool) {
 	var w *listWaiter
 	var timer *time.Timer
 	defer func() {
@@ -792,9 +801,20 @@ func (c *connState) xreadStreams(rest [][]byte, count int, block bool, blockDur 
 		if c.xreadServe(keys, starts, count) {
 			return
 		}
-		// Nothing to serve. Without BLOCK, or under the reactor where the connection cannot park,
-		// reply as a non-blocking read does, a null array.
-		if !block || !c.blockable {
+		// Nothing to serve. Without BLOCK, reply as a non-blocking read does, a null array.
+		if !block {
+			c.writeNilArray()
+			return
+		}
+		// Under the reactor the connection cannot park on the loop, so hand the read to a park
+		// goroutine that reruns it with parking enabled; only with no park facility does it reply
+		// non-blocking.
+		if !c.blockable {
+			kc := dupArgv(keys)
+			sc := append([]streamID(nil), starts...)
+			if c.parkOnReactor(func() { c.xreadBlock(kc, sc, count, block, blockDur, blockForever) }) {
+				return
+			}
 			c.writeNilArray()
 			return
 		}
@@ -816,6 +836,9 @@ func (c *connState) xreadStreams(rest [][]byte, count int, block bool, blockDur 
 			// Woken by an XADD: loop back and rescan the streams from the resolved start ids.
 		case <-timeout:
 			c.writeNilArray()
+			return
+		case <-c.parkCancel:
+			// Reactor only: peer disconnected while parked; unwind without replying.
 			return
 		}
 	}

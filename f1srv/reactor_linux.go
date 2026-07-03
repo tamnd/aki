@@ -36,6 +36,16 @@ type reactorConn struct {
 	cs           *connState
 	fd           int
 	writeBlocked bool
+
+	// loop is the owning loop, set at adoption, so a blocking command's park handoff can reach the
+	// loop's epoll set and wake queue. parkCancel is created when a blocking command parks and closed
+	// by the loop on a peer disconnect, so the park goroutine unwinds without replying; parkCancelled
+	// records that close so finishPark closes the connection rather than replying. All three are only
+	// touched on the loop goroutine except parkCancel's close, which the park goroutine observes
+	// through the channel.
+	loop          *reactorLoop
+	parkCancel    chan struct{}
+	parkCancelled bool
 }
 
 // reactorLoop is one event loop: one epoll instance, one self-pipe used to wake the
@@ -53,6 +63,7 @@ type reactorLoop struct {
 	mu      sync.Mutex
 	pending []*reactorConn // accepted connections awaiting adoption by this loop
 	cross   []crossMsg     // pub/sub frames posted by publishers on other loops, drained on wake
+	done    []*reactorConn // connections whose park goroutine finished, awaiting flush + resume
 	closing bool           // set by stop(); the loop tears down on the next wake
 }
 
@@ -226,6 +237,15 @@ func (l *reactorLoop) run() {
 			if rc == nil {
 				continue
 			}
+			if rc.cs.parked {
+				// A blocking command holds this connection on a park goroutine. Reads are disarmed, so
+				// the only event that matters is the peer going away: cancel the park so its goroutine
+				// unwinds and finishPark closes the connection.
+				if ev.Events&(syscall.EPOLLHUP|syscall.EPOLLERR|syscall.EPOLLRDHUP) != 0 {
+					l.cancelPark(rc)
+				}
+				continue
+			}
 			if ev.Events&(syscall.EPOLLHUP|syscall.EPOLLERR) != 0 {
 				l.closeConn(rc)
 				continue
@@ -262,9 +282,16 @@ func (l *reactorLoop) drainWake() (closing bool) {
 	l.pending = nil
 	cross := l.cross
 	l.cross = nil
+	done := l.done
+	l.done = nil
 	l.mu.Unlock()
 	for _, rc := range pending {
 		l.adoptConn(rc)
+	}
+	// Resume every connection whose blocking command finished on its park goroutine: flush the reply
+	// it wrote and re-arm reads, or tear the connection down if the peer left while it waited.
+	for _, rc := range done {
+		l.finishPark(rc)
 	}
 	// Deliver every pub/sub frame posted by a publisher on another loop. A connection that has
 	// since closed carries fd < 0 and is skipped. The frame is appended to the subscriber's out
@@ -290,11 +317,104 @@ func (l *reactorLoop) crossDeliver(rc *reactorConn, frame []byte) {
 	l.poke()
 }
 
+// begin drives a blocking command that found its keys empty. It runs on the loop goroutine, inside
+// the drain that dispatched the command, and satisfies the reactorParker interface connState.park
+// holds. It flushes the replies from any earlier pipelined commands, disarms reads on this
+// connection so the shared loop is never held by one waiter, and hands the command to a dedicated
+// park goroutine that reruns it with blocking enabled. The goroutine owns cs.out from here until
+// parkDone posts the connection back to the loop.
+func (rc *reactorConn) begin(rerun func()) {
+	l := rc.loop
+	if len(rc.cs.out) > 0 {
+		if !l.flush(rc) {
+			return // flush closed the connection; there is nothing left to park
+		}
+	}
+	if rc.fd < 0 {
+		return
+	}
+	rc.cs.parked = true
+	rc.parkCancel = make(chan struct{})
+	rc.cs.parkCancel = rc.parkCancel
+	l.modInterest(rc, syscall.EPOLLRDHUP) // keep only the disconnect signal while it waits
+	go rc.runPark(rerun)
+}
+
+// runPark reruns the blocking command on its own goroutine with blockable set, so the rerun parks on
+// its wait channel and timeout exactly like the goroutine driver and writes its reply into cs.out.
+// When the rerun returns, whether served, timed out, or cancelled, parkDone hands the connection
+// back to the loop for the flush and read re-arm.
+func (rc *reactorConn) runPark(rerun func()) {
+	rc.cs.blockable = true
+	rerun()
+	rc.cs.blockable = false
+	rc.loop.parkDone(rc)
+}
+
+// parkDone queues a finished park for its loop and wakes the loop. It runs on the park goroutine, so
+// it only touches the mutex-guarded done queue and the wake pipe, never the loop's conn table.
+func (l *reactorLoop) parkDone(rc *reactorConn) {
+	l.mu.Lock()
+	l.done = append(l.done, rc)
+	l.mu.Unlock()
+	l.poke()
+}
+
+// finishPark resumes a connection whose park goroutine has returned. It runs on the loop goroutine
+// from drainWake. When the peer left while the command waited, cancelPark has already unwound the
+// goroutine and the connection is torn down. Otherwise the reply the goroutine wrote is flushed, any
+// pipelined commands that arrived after the blocking one are drained, and read interest is restored.
+func (l *reactorLoop) finishPark(rc *reactorConn) {
+	cs := rc.cs
+	cs.parked = false
+	rc.parkCancel = nil
+	cs.parkCancel = nil
+	if rc.parkCancelled {
+		rc.parkCancelled = false
+		l.closeConn(rc)
+		return
+	}
+	// Drain commands the peer pipelined behind the blocking one. drain compacted them to the front of
+	// rbuf when it parked; a following blocking command re-parks through begin, which flushes the
+	// reply already sitting in cs.out and re-arms the wait, so this returns with the connection parked.
+	if len(cs.rbuf) > 0 {
+		if !cs.drain() {
+			l.flush(rc)
+			l.closeConn(rc)
+			return
+		}
+		if cs.parked {
+			return
+		}
+	}
+	if !l.flush(rc) {
+		return // flush closed the connection
+	}
+	if rc.fd >= 0 && !rc.writeBlocked {
+		l.modInterest(rc, syscall.EPOLLIN|syscall.EPOLLRDHUP)
+	}
+}
+
+// cancelPark tells a parked connection's goroutine to unwind without replying, because the peer has
+// disconnected. Closing parkCancel wakes the rerun's select; the goroutine returns and parkDone runs
+// finishPark, which sees parkCancelled and closes the connection. It runs on the loop goroutine and
+// is idempotent, so a burst of HUP and RDHUP events cancels once.
+func (l *reactorLoop) cancelPark(rc *reactorConn) {
+	if !rc.parkCancelled {
+		rc.parkCancelled = true
+		close(rc.parkCancel)
+	}
+}
+
 // adoptConn installs a connection in the loop's table and registers its fd for reads. It also
 // installs the connection's pub/sub deliver hook: a message frame for this connection is posted
 // to this loop and written on this loop's goroutine, so the connection's output stays
 // single-threaded even when the publisher runs on another loop.
 func (l *reactorLoop) adoptConn(rc *reactorConn) {
+	rc.loop = l
+	// Wire the blocking-command park facility: a blocking command that finds its keys empty calls
+	// cs.park.begin, which runs on this loop and hands the command to a park goroutine.
+	rc.cs.park = rc
 	rc.cs.deliver = func(frame []byte) { l.crossDeliver(rc, frame) }
 	for len(l.conns) <= rc.fd {
 		l.conns = append(l.conns, nil)
@@ -337,6 +457,11 @@ func (l *reactorLoop) serviceRead(rc *reactorConn) {
 		if !cs.drain() {
 			l.flush(rc) // best-effort protocol-error reply
 			l.closeConn(rc)
+			return
+		}
+		if cs.parked {
+			// A blocking command in this batch parked. begin() already flushed the replies from any
+			// earlier commands and handed cs.out to the park goroutine, so the loop must not flush here.
 			return
 		}
 		l.flush(rc) // owns the post-drain flush and the QUIT close
