@@ -162,7 +162,10 @@ func (c *connState) cmdHDelCoalesced(hkey []byte, elems [][]byte, bnd []int) {
 	c.delKeyBuf = buf
 	c.delKeyEnd = ends
 	c.delCnt = counts
-	c.collRemoveBatch(buf, ends)
+	// Defer the ordered-index splice off the stripe-locked reply path (spec 2064/16 slice 2).
+	// CollRemovePacked copies the packed keys onto the tombstone queue when deferred removal is
+	// on, so buf and ends are free to reuse the moment it returns.
+	c.srv.store.CollRemovePacked(buf, ends, kindHashField)
 	if total > 0 {
 		n, ok := c.srv.store.CountAddInt64(hkey, kindHashMeta, -int64(total))
 		if !ok || n <= 0 {
@@ -208,7 +211,8 @@ func (c *connState) cmdSRemCoalesced(skey []byte, elems [][]byte, bnd []int) {
 	c.delKeyBuf = buf
 	c.delKeyEnd = ends
 	c.delCnt = counts
-	c.collRemoveBatch(buf, ends)
+	// Defer the ordered-index splice off the stripe-locked reply path (spec 2064/16 slice 2).
+	c.srv.store.CollRemovePacked(buf, ends, kindSetMember)
 	if total > 0 {
 		n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, -int64(total))
 		if !ok || n <= 0 {

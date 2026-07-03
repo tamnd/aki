@@ -263,6 +263,12 @@ func (c *connState) cmdHDel(argv [][]byte) {
 		return
 	}
 	deleted := 0
+	// Accumulate the removed field composite keys packed end to end so the ordered-index splice
+	// is deferred off this stripe-locked reply path in one batch (spec 2064/16 slice 2) instead
+	// of one synchronous O(log n) splice per field here. fieldKey reuses its scratch on the next
+	// call, so each removed key is copied into the packed buffer before the next fieldKey.
+	buf := c.delKeyBuf[:0]
+	ends := c.delKeyEnd[:0]
 	// One coarse gate: when no field of this hash carries a TTL (answered by a single atomic
 	// load while the keyspace has no field TTL at all) the per-field TTL-row delete below is a
 	// guaranteed no-op, so skip it and save a hash probe per deleted field.
@@ -270,7 +276,8 @@ func (c *connState) cmdHDel(argv [][]byte) {
 	for _, field := range argv[2:] {
 		fk := c.fieldKey(hkey, field)
 		if c.srv.store.DeleteKind(fk, kindHashField) {
-			c.srv.store.CollRemove(fk)
+			buf = append(buf, fk...)
+			ends = append(ends, len(buf))
 			// Drop any TTL sibling the field carried so the global hfe gate and the per-hash
 			// hint stay exact when a TTL'd field is deleted outright.
 			if hadTTL {
@@ -279,6 +286,9 @@ func (c *connState) cmdHDel(argv [][]byte) {
 			deleted++
 		}
 	}
+	c.delKeyBuf = buf
+	c.delKeyEnd = ends
+	c.srv.store.CollRemovePacked(buf, ends, kindHashField)
 	if deleted > 0 {
 		n, ok := c.srv.store.CountAddInt64(hkey, kindHashMeta, -int64(deleted))
 		if !ok || n <= 0 {

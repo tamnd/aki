@@ -232,6 +232,36 @@ func (oi *oindex) removeMany(keys [][]byte) {
 	}
 }
 
+// removeManyLive is removeMany for the deferred folder: it splices each key out under a single
+// write-lock acquisition, but first re-checks liveness against the authoritative hash index and
+// skips any key whose record is live again. That re-check is what makes deferring the splice safe
+// against a re-add. A delete queues the key here with the node still present and the hash record
+// already gone; if the same key is added back before the folder runs, the re-add republishes the
+// hash record and refreshes the existing node to it (oindex.insert's "same key republished"
+// branch), so removing the node now would drop a live element. Reading ExistsKind under the same
+// oi.mu that guards the splice orders the check against the re-add's own insert (which also takes
+// oi.mu): the folder either sees the live record and keeps the node, or sees no record and splices
+// a node that is and stays dead. buf holds the composite keys packed end to end with ends[k] the
+// cumulative length through the k-th key, and kind is the namespace they share.
+func (oi *oindex) removeManyLive(buf []byte, ends []int, kind byte) {
+	if len(ends) == 0 {
+		return
+	}
+	oi.mu.Lock()
+	defer oi.mu.Unlock()
+	prev := 0
+	for _, e := range ends {
+		key := buf[prev:e]
+		prev = e
+		if oi.store.ExistsKind(key, kind) {
+			// Re-added since the tombstone was queued: the node points at the live record now,
+			// so leave it. The stale tombstone is simply dropped.
+			continue
+		}
+		oi.removeLocked(key)
+	}
+}
+
 // removeLocked unlinks the node whose key equals the given bytes and reports whether it
 // was present, assuming the write lock is already held. The record's arena bytes are left
 // intact (grow-only arena); only the index node is unlinked.
@@ -358,11 +388,22 @@ func (oi *oindex) scanBatch(prefix, after []byte, limit int, dst []uint64) ([]ui
 		}
 	}
 
+	// With deferred removal on, the list can hold nodes for elements the hash index has
+	// already dropped but the folder has not yet spliced. Skip such a dead node so enumeration
+	// never surfaces a since-deleted element. The check is gated on tombPend so a store with no
+	// pending tombstones (the steady state, and always when deferred removal is off) pays one
+	// atomic load for the whole batch and never the per-node liveAt probe.
+	filter := oi.store.tombPend.Load() > 0
+
 	var last []byte
 	for x != nil && len(dst) < limit {
 		k := oi.store.keyAt(x.off)
 		if !bytes.HasPrefix(k, prefix) {
 			break
+		}
+		if filter && !oi.store.liveAt(x.off) {
+			x = x.next[0]
+			continue
 		}
 		dst = append(dst, x.off)
 		last = k
