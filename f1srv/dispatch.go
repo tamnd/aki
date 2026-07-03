@@ -991,6 +991,7 @@ func (c *connState) dropCollIndex(prefix []byte, kind byte) {
 // then the header row goes. A missing header is a no-op, which dropKey never reaches since it
 // only calls here after keyTypeOf confirmed the list.
 func (c *connState) dropList(lkey []byte) {
+	c.listWinDrainEvict(lkey)
 	head, tail, _, _, ok := c.listHeader(lkey)
 	if !ok {
 		return
