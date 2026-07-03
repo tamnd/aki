@@ -224,10 +224,16 @@ func (c *connState) zsetHeader(zkey []byte) (count uint64, enc byte, ok bool) {
 	return binary.LittleEndian.Uint64(v), enc, true
 }
 
-// zsetCard reads a zset's maintained cardinality, 0 when it has no members.
+// zsetCard reads a zset's maintained cardinality, 0 when it has no members. The read goes
+// through the header record's seqlock so it never tears against an in-place ZREM decrement
+// and takes no lock. The full header (count and encoding) is still read via zsetHeader where
+// the encoding tag is needed.
 func (c *connState) zsetCard(zkey []byte) uint64 {
-	count, _, _ := c.zsetHeader(zkey)
-	return count
+	n, ok := c.srv.store.CountInt64(zkey, kindZsetMeta)
+	if !ok || n < 0 {
+		return 0
+	}
+	return uint64(n)
 }
 
 // zsetPutHeader writes a zset's cardinality and encoding tag, or deletes the header when the
@@ -633,16 +639,9 @@ func (c *connState) cmdZRem(argv [][]byte) {
 	}
 
 	if removed > 0 {
-		count := c.zsetCard(zkey)
-		if uint64(removed) >= count {
-			count = 0
-		} else {
-			count -= uint64(removed)
-		}
-		if err := c.zsetSetCard(zkey, count); err != nil {
-			mu.Unlock()
-			c.writeErr("ERR " + err.Error())
-			return
+		n, ok := c.srv.store.CountAddInt64(zkey, kindZsetMeta, -int64(removed))
+		if !ok || n <= 0 {
+			c.srv.store.DeleteKind(zkey, kindZsetMeta)
 		}
 	}
 	mu.Unlock()

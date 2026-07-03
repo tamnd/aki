@@ -164,19 +164,9 @@ func (c *connState) cmdHDelCoalesced(hkey []byte, elems [][]byte, bnd []int) {
 	c.delCnt = counts
 	c.collRemoveBatch(buf, ends)
 	if total > 0 {
-		count := c.hashCount(hkey)
-		if uint64(total) >= count {
-			count = 0
-		} else {
-			count -= uint64(total)
-		}
-		if err := c.setHashCount(hkey, count); err != nil {
-			mu.Unlock()
-			emsg := "ERR " + err.Error()
-			for range bnd {
-				c.writeErr(emsg)
-			}
-			return
+		n, ok := c.srv.store.CountAddInt64(hkey, kindHashMeta, -int64(total))
+		if !ok || n <= 0 {
+			c.srv.store.DeleteKind(hkey, kindHashMeta)
 		}
 	}
 	mu.Unlock()
@@ -220,19 +210,9 @@ func (c *connState) cmdSRemCoalesced(skey []byte, elems [][]byte, bnd []int) {
 	c.delCnt = counts
 	c.collRemoveBatch(buf, ends)
 	if total > 0 {
-		count := c.setCard(skey)
-		if uint64(total) >= count {
-			count = 0
-		} else {
-			count -= uint64(total)
-		}
-		if err := c.setSetCard(skey, count); err != nil {
-			mu.Unlock()
-			emsg := "ERR " + err.Error()
-			for range bnd {
-				c.writeErr(emsg)
-			}
-			return
+		n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, -int64(total))
+		if !ok || n <= 0 {
+			c.srv.store.DeleteKind(skey, kindSetMeta)
 		}
 	}
 	mu.Unlock()
@@ -294,19 +274,9 @@ func (c *connState) cmdZRemCoalesced(zkey []byte, elems [][]byte, bnd []int) {
 	c.delCnt = counts
 	c.collRemoveBatch(buf, ends)
 	if total > 0 {
-		count := c.zsetCard(zkey)
-		if uint64(total) >= count {
-			count = 0
-		} else {
-			count -= uint64(total)
-		}
-		if err := c.zsetSetCard(zkey, count); err != nil {
-			mu.Unlock()
-			emsg := "ERR " + err.Error()
-			for range bnd {
-				c.writeErr(emsg)
-			}
-			return
+		n, ok := c.srv.store.CountAddInt64(zkey, kindZsetMeta, -int64(total))
+		if !ok || n <= 0 {
+			c.srv.store.DeleteKind(zkey, kindZsetMeta)
 		}
 	}
 	mu.Unlock()
