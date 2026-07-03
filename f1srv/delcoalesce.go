@@ -91,26 +91,6 @@ func (c *connState) drainDelete(first [][]byte, fam delFamily, pos int) int {
 	return pos
 }
 
-// collRemoveBatch drops every composite key an applier deleted from the hash index out of
-// the ordered element index under one index-lock acquisition. buf holds the removed keys
-// packed end to end and ends[k] is the cumulative byte length through the k-th key, so the
-// keys reslice out of buf without copying again. The reslice runs only after buf is fully
-// built, so a mid-build append that reallocated buf cannot leave an earlier entry pointing
-// at freed backing. An empty run touches nothing and never takes the lock.
-func (c *connState) collRemoveBatch(buf []byte, ends []int) {
-	if len(ends) == 0 {
-		return
-	}
-	keys := c.delKeys[:0]
-	prev := 0
-	for _, e := range ends {
-		keys = append(keys, buf[prev:e])
-		prev = e
-	}
-	c.delKeys = keys
-	c.srv.store.CollRemoveMany(keys)
-}
-
 // cmdHDelCoalesced applies a run of same-key HDELs captured from one connection's pipeline
 // under a single stripe-lock acquisition and a single hash-count rewrite, then writes one
 // integer reply per original command. It is exactly equivalent to running the commands one
@@ -250,8 +230,16 @@ func (c *connState) cmdZRemCoalesced(zkey []byte, elems [][]byte, bnd []int) {
 		return
 	}
 	counts := c.delCnt[:0]
-	buf := c.delKeyBuf[:0]
-	ends := c.delKeyEnd[:0]
+	// A ZREM unlinks two rows of two different kinds per member: the member row (kindZsetMember)
+	// and its score sidecar (kindZsetScore). Pack them into two kind-separated arenas so each kind
+	// defers its ordered-index splice in one CollRemovePacked call off the reply path, the same
+	// deferral SREM/HDEL get. Interleaving both kinds in one buffer would force the synchronous
+	// splice, since CollRemovePacked takes a single kind, which is what held ZREM at the global
+	// oindex lock and a hair under 2x at P16 (spec 2064/16 section 8.2).
+	mbuf := c.delKeyBuf[:0]
+	mends := c.delKeyEnd[:0]
+	sbuf := c.delScrBuf[:0]
+	sends := c.delScrEnd[:0]
 	total := 0
 	recs := 0
 	i := 0
@@ -273,14 +261,14 @@ func (c *connState) cmdZRemCoalesced(zkey []byte, elems [][]byte, bnd []int) {
 			}
 			recs++
 			score := math.Float64frombits(binary.LittleEndian.Uint64(v))
-			// The member row is gone; record its composite key for the batched oindex remove.
-			// Copy it out of kbuf before zscoreKey rebuilds kbuf below.
-			buf = append(buf, mk...)
-			ends = append(ends, len(buf))
+			// The member row is gone; record its composite key in the member arena for the
+			// deferred oindex remove. Copy it out of kbuf before zscoreKey rebuilds kbuf below.
+			mbuf = append(mbuf, mk...)
+			mends = append(mends, len(mbuf))
 			sk := c.zscoreKey(zkey, score, member)
 			if c.srv.store.DeleteKindNoCount(sk, kindZsetScore) {
-				buf = append(buf, sk...)
-				ends = append(ends, len(buf))
+				sbuf = append(sbuf, sk...)
+				sends = append(sends, len(sbuf))
 				recs++
 			}
 			removed++
@@ -288,15 +276,21 @@ func (c *connState) cmdZRemCoalesced(zkey []byte, elems [][]byte, bnd []int) {
 		counts = append(counts, removed)
 		total += removed
 	}
-	c.delKeyBuf = buf
-	c.delKeyEnd = ends
+	c.delKeyBuf = mbuf
+	c.delKeyEnd = mends
+	c.delScrBuf = sbuf
+	c.delScrEnd = sends
 	c.delCnt = counts
 	// One global record-count decrement for every row the run actually unlinked (member rows
 	// plus their score sidecars), the batched companion to TakeKindNoCount/DeleteKindNoCount.
 	if recs > 0 {
 		c.srv.store.AddCount(-int64(recs))
 	}
-	c.collRemoveBatch(buf, ends)
+	// Defer both ordered-index splices off the stripe-locked reply path (spec 2064/16 slice 2),
+	// one CollRemovePacked per kind. Both copy their packed keys onto the tombstone queue when
+	// deferred removal is on, so both arenas are free to reuse the moment these return.
+	c.srv.store.CollRemovePacked(mbuf, mends, kindZsetMember)
+	c.srv.store.CollRemovePacked(sbuf, sends, kindZsetScore)
 	if total > 0 {
 		n, ok := c.srv.store.CountAddInt64(zkey, kindZsetMeta, -int64(total))
 		if !ok || n <= 0 {

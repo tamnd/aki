@@ -180,6 +180,15 @@ type Store struct {
 	// racing it. It is taken only on the drain path, never on the delete hot path, so an
 	// element delete never blocks on it.
 	folderMu sync.Mutex
+	// tombPool recycles drained tombNodes (and the byte and offset arenas each carries) back to
+	// the producers. A delete-heavy pipeline pushes one node per drain and the folder discards it
+	// right after the splice, so without recycling every drain allocates a node plus two slices
+	// that live only until the folder runs, feeding a steady stream of short-lived garbage that
+	// shows up as GC-driven p99 spikes on the single-hot-key delete gate. The folder returns each
+	// node here after splicing and enqueueTomb takes one back, reusing the arenas, so the steady
+	// state allocates nothing. sync.Pool may drop entries under GC pressure, in which case a push
+	// falls back to a fresh node, so correctness never depends on the pool being warm.
+	tombPool sync.Pool
 }
 
 // New builds a store whose primary hash index has indexBuckets buckets (rounded up
