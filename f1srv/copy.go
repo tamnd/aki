@@ -123,8 +123,17 @@ func (c *connState) copyRows(src, dst []byte) {
 		c.copyHeader(src, dst, kindHashMeta)
 		c.propagateHashFieldTTLs(src, dst, false)
 	case keySet:
+		// copyIndexedFamily re-keys each row's bytes after the key header verbatim, so a partitioned
+		// source's partition byte carries over and copyHeader copies the P exponent byte, leaving dst
+		// physically laid out at the source's partition count. partitionsFor reads the registry, not
+		// the header, so dst must be engaged at srcP to route that layout (cmdCopy's REPLACE drop
+		// already unengaged any prior dst).
+		srcP := c.srv.partitionP(src)
 		c.copyIndexedFamily(src, dst, kindSetMember)
 		c.copyHeader(src, dst, kindSetMeta)
+		if srcP > 1 {
+			c.srv.engageP(dst, srcP)
+		}
 	case keyZset:
 		c.copyIndexedFamily(src, dst, kindZsetMember)
 		c.copyIndexedFamily(src, dst, kindZsetScore)

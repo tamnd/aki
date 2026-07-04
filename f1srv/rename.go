@@ -122,6 +122,12 @@ func (c *connState) moveRows(src, dst []byte) {
 		c.moveIndexedFamily(src, dst, kindHashField)
 		c.moveHeader(src, dst, kindHashMeta)
 	case keySet:
+		// Capture the source's partition count before the move. moveIndexedFamily re-keys each row's
+		// bytes after the key header verbatim, so a partitioned source's partition byte and member
+		// carry over unchanged and moveHeader copies the P exponent byte, leaving dst physically laid
+		// out at srcP. partitionsFor reads the registry, not the header, so dst must be engaged at
+		// srcP for that layout to route, and src must be dropped from the registry with its rows.
+		srcP := c.srv.partitionP(src)
 		c.moveIndexedFamily(src, dst, kindSetMember)
 		c.moveHeader(src, dst, kindSetMeta)
 		// Drop the source's dense member vector (spec 2064/18 5.3): moveIndexedFamily republishes
@@ -129,6 +135,10 @@ func (c *connState) moveRows(src, dst []byte) {
 		// an offset-preserving re-key is impossible. The destination builds its own vector on first
 		// draw from the moved rows; the source vector would only point at deleted records.
 		c.srv.store.CollRandDrop(c.setPrefix(src))
+		if srcP > 1 {
+			c.srv.engageP(dst, srcP)
+		}
+		c.srv.unengageP(src)
 	case keyZset:
 		c.moveIndexedFamily(src, dst, kindZsetMember)
 		c.moveIndexedFamily(src, dst, kindZsetScore)

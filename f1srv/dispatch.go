@@ -473,6 +473,7 @@ func (c *connState) execCommand(argv [][]byte) {
 		c.cmdPersist(argv)
 	case eqFold(cmd, "FLUSHALL") || eqFold(cmd, "FLUSHDB"):
 		c.srv.store.Reset()
+		c.srv.resetPartitions()
 		c.writeSimple("OK")
 	case eqFold(cmd, "DBSIZE"):
 		c.writeInt(int64(c.srv.store.TopLen()))
@@ -946,6 +947,10 @@ func (c *connState) dropKeyLocked(key []byte) bool {
 		// is rebuilt here because dropCollIndex already consumed the shared pbuf; CollRandDrop
 		// consumes this fresh prefix synchronously, so the two never overlap.
 		c.srv.store.CollRandDrop(c.setPrefix(key))
+		// Clear any partition registry entry so a set recreated under this name starts fresh at P=1
+		// (spec 2064/f1_rewrite_ltm/19 section 3.1). A no-op for the common unpartitioned set, which
+		// was never registered.
+		c.srv.unengageP(key)
 		return true
 	case keyZset:
 		// A zset carries two element indexes (member-family and score-family rows), so both
