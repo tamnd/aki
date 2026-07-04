@@ -52,7 +52,28 @@ type Config struct {
 	// SepThreshold is the inline-versus-separated value cutoff in bytes; a non-positive
 	// value uses the engine default. It is ignored when ColdPath is empty.
 	SepThreshold int
+
+	// SetPartitionMax caps the partitions one hot set can engage under the adaptive intra-key
+	// partitioning of spec 2064/f1_rewrite_ltm/19. The default of 1 leaves the feature off: every
+	// set stays unpartitioned and the set commands run their existing single-lock bodies with no
+	// added cost. A value above 1 (rounded up to a power of two in New) turns the engage-and-grow
+	// trigger on and bounds how far one set can spread, typically the machine's data-core count.
+	// SetPartitionThreshold is the cardinality a set must reach before it engages at all, and
+	// SetPartitionTarget is the members-per-partition the grow aims for; a non-positive threshold
+	// or target takes the built-in default. All three are settled empirically in slice 6c.
+	SetPartitionMax       int
+	SetPartitionThreshold int
+	SetPartitionTarget    int
 }
+
+// Built-in defaults for the adaptive set-partitioning knobs, used when the feature is on
+// (SetPartitionMax > 1) but the threshold or target is left unset. They sit in the middle of the
+// ranges spec 2064/f1_rewrite_ltm/19 section 3 proposes (engage threshold 10k-100k, target
+// 64k-256k members per partition) and are the values slice 6c's microbenchmark sweep replaces.
+const (
+	defaultSetPartitionThreshold = 1 << 16 // 65536: a set engages once it crosses this cardinality
+	defaultSetPartitionTarget    = 1 << 17 // 131072: the members-per-partition a grow aims for
+)
 
 // DefaultConfig returns a config sized for a multi-million-key in-memory benchmark.
 func DefaultConfig(addr string) Config {
@@ -104,6 +125,16 @@ type Server struct {
 	// copy-on-write, the same discipline the store's descriptor and vector maps use.
 	setPartP  atomic.Pointer[map[string]int]
 	setPartMu sync.Mutex
+
+	// setPartMax, setPartThreshold, and setPartTarget are the resolved adaptive-partitioning knobs
+	// (Config.SetPartition*), read-only after New. setPartMax is the power-of-two cap on how far one
+	// set may spread and, at its default of 1, the master off switch: when it is 1 the engage trigger
+	// (maybeEngageSet) returns after one comparison, no set is ever partitioned, and every set command
+	// keeps its unpartitioned fast path. Above 1 the trigger grows a set toward
+	// min(setPartMax, roundUpPow2(card/setPartTarget)) once its cardinality reaches setPartThreshold.
+	setPartMax       int
+	setPartThreshold int
+	setPartTarget    int
 
 	// execModel is the resolved command-execution model (spec 2064/17), parsed once from
 	// cfg.ExecModel in New. execShards is the shard count the affinity model routes over,
@@ -228,14 +259,33 @@ func New(cfg Config) *Server {
 	if shards < 1 {
 		shards = 1
 	}
+	// Resolve the adaptive set-partitioning knobs once. The cap rounds up to a power of two because
+	// P is always a power of two; a cap of 1 (the default) leaves the feature off. The threshold and
+	// target fall back to the built-in defaults when unset, so turning the feature on needs only the
+	// cap.
+	partMax := 1
+	if cfg.SetPartitionMax > 1 {
+		partMax = int(nextPow2(int64(cfg.SetPartitionMax)))
+	}
+	partThreshold := cfg.SetPartitionThreshold
+	if partThreshold <= 0 {
+		partThreshold = defaultSetPartitionThreshold
+	}
+	partTarget := cfg.SetPartitionTarget
+	if partTarget <= 0 {
+		partTarget = defaultSetPartitionTarget
+	}
 	srv := &Server{
-		cfg:        cfg,
-		incrMu:     make([]sync.RWMutex, stripes),
-		incrMask:   uint32(stripes - 1),
-		execModel:  em,
-		execShards: shards,
-		startTime:  time.Now(),
-		runID:      newRunID(),
+		cfg:              cfg,
+		incrMu:           make([]sync.RWMutex, stripes),
+		incrMask:         uint32(stripes - 1),
+		execModel:        em,
+		execShards:       shards,
+		setPartMax:       partMax,
+		setPartThreshold: partThreshold,
+		setPartTarget:    partTarget,
+		startTime:        time.Now(),
+		runID:            newRunID(),
 	}
 	srv.listWin = make([]listWinShard, stripes)
 	for i := range srv.listWin {
