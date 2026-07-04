@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"math/bits"
 	"math/rand/v2"
 )
 
@@ -118,6 +119,54 @@ func (c *connState) setSetCard(skey []byte, count uint64) error {
 	}
 	_, enc, _ := c.setHeader(skey)
 	return c.setPutHeader(skey, count, enc)
+}
+
+// setHeaderEncodeP builds a set header value carrying the cardinality, the encoding tag, and the
+// partition count P (spec 2064/f1_rewrite_ltm/19 section 5). For P==1, the unpartitioned set, it
+// writes the existing 9-byte header (8 LittleEndian count + 1 encoding byte) byte-for-byte, so a
+// set that never engages partitioning keeps exactly the header a stock reader already understands
+// and a header written before this field existed reads back as P=1. For P>1 it appends the one
+// partition byte after the encoding, holding P as its base-2 exponent (P=2 stores 1, P=256 stores
+// 8) so the whole range fits a single byte and only ever decodes to a power of two. That records
+// how many partitions a recovering reader must expect so it derives each partition's vector from
+// the right prefix range. Slice 2 defines and tests this codec; the write paths keep calling
+// setPutHeader (P=1) until the adaptive engage in slice 6 grows a hot set to P>1 and starts
+// writing the partition byte. P must be a power of two in [1, 256].
+func setHeaderEncodeP(dst []byte, count uint64, enc byte, p int) []byte {
+	var hb [8]byte
+	binary.LittleEndian.PutUint64(hb[:], count)
+	dst = append(dst, hb[:]...)
+	dst = append(dst, enc)
+	if p > 1 {
+		dst = append(dst, byte(bits.TrailingZeros(uint(p))))
+	}
+	return dst
+}
+
+// setHeaderDecodeP reads a set header value back into its cardinality, encoding tag, and partition
+// count. A value shorter than 8 bytes is not a header and reports ok=false. The encoding is the 9th
+// byte, encNone when a pre-encoding header omitted it. The partition count is the 10th byte when
+// present, read as the base-2 exponent setHeaderEncodeP wrote, and defaults to 1 (unpartitioned)
+// for every header without it, which is every header written before partitioning and every header
+// of a set that never engaged it. An exponent above 8 would decode to more than 256 partitions, so
+// it is rejected back to P=1 rather than trusted, keeping a corrupt or foreign tenth byte from
+// mis-routing a scan.
+func setHeaderDecodeP(v []byte) (count uint64, enc byte, p int, ok bool) {
+	if len(v) < 8 {
+		return 0, encNone, 1, false
+	}
+	count = binary.LittleEndian.Uint64(v)
+	enc = encNone
+	if len(v) >= 9 {
+		enc = v[8]
+	}
+	p = 1
+	if len(v) >= 10 {
+		if exp := v[9]; exp >= 1 && exp <= 8 {
+			p = 1 << exp
+		}
+	}
+	return count, enc, p, true
 }
 
 func (c *connState) cmdSAdd(argv [][]byte) {
