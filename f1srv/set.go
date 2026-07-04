@@ -171,19 +171,92 @@ func setHeaderDecodeP(v []byte) (count uint64, enc byte, p int, ok bool) {
 	return count, enc, p, true
 }
 
+// partitionP returns the engaged partition count for skey from the per-key registry, or 1 when the
+// set is unpartitioned (spec 2064/f1_rewrite_ltm/19 slice 6). It is the lock-free read partitionsFor
+// takes on every set command: one atomic load of the published registry pointer, a nil check that
+// returns 1 for the common empty-registry case (no set has engaged, which is every keyspace until
+// the adaptive transition grows a hot set), and otherwise a single map lookup that does not allocate
+// because Go elides the []byte-to-string conversion for a map index. A set appears here only once it
+// has engaged partitioning, so the overwhelming majority of keys miss and take the P=1 path.
+func (s *Server) partitionP(skey []byte) int {
+	m := s.setPartP.Load()
+	if m == nil {
+		return 1
+	}
+	if p, ok := (*m)[string(skey)]; ok && p > 1 {
+		return p
+	}
+	return 1
+}
+
+// engageP records that skey is now partitioned into p partitions, installed by copy-on-write so a
+// concurrent lock-free partitionP walks either the old or the new map, never a half-updated one. The
+// caller holds the set's whole-key exclusive lock across the migration this publishes, so two
+// engagements of one key cannot race; setPartMu serializes the map swap against engagements and
+// drops of other keys. p must be greater than 1: P=1 is the absence of an entry, not an entry of 1,
+// so a set never engaged records nothing and reads back as unpartitioned.
+func (s *Server) engageP(skey []byte, p int) {
+	s.setPartMu.Lock()
+	old := s.setPartP.Load()
+	n := 1
+	if old != nil {
+		n += len(*old)
+	}
+	nm := make(map[string]int, n)
+	if old != nil {
+		for k, v := range *old {
+			nm[k] = v
+		}
+	}
+	nm[string(skey)] = p
+	s.setPartP.Store(&nm)
+	s.setPartMu.Unlock()
+}
+
+// unengageP removes skey from the partition registry, the reset a DEL/UNLINK/expiry drop or a RENAME
+// source drop performs so a key recreated under the same name starts fresh at P=1 (section 3.1). It
+// checks the published map lock-free first and returns at once when the key is absent, which is the
+// common case (an unpartitioned key was never registered), so a drop of an ordinary set never takes
+// setPartMu. Only a drop of a genuinely engaged set swaps the map by copy-on-write under the mutex.
+func (s *Server) unengageP(skey []byte) {
+	if m := s.setPartP.Load(); m == nil {
+		return
+	} else if _, ok := (*m)[string(skey)]; !ok {
+		return
+	}
+	s.setPartMu.Lock()
+	old := s.setPartP.Load()
+	if old == nil {
+		s.setPartMu.Unlock()
+		return
+	}
+	if _, ok := (*old)[string(skey)]; !ok {
+		s.setPartMu.Unlock()
+		return
+	}
+	nm := make(map[string]int, len(*old))
+	for k, v := range *old {
+		if k == string(skey) {
+			continue
+		}
+		nm[k] = v
+	}
+	s.setPartP.Store(&nm)
+	s.setPartMu.Unlock()
+}
+
 // partitionsFor reports the partition count P every set command routes key skey through
-// (spec 2064/f1_rewrite_ltm/19 slice 3). It reads the server's forceP hook with one atomic
-// load: forceP is 0 in production so the common path returns P=1 after a single load and takes
-// the unpartitioned body byte-for-byte, and the slice-3 correctness test and contention
-// microbenchmark set forceP to drive the four routed commands through P>1. The header-driven
-// per-key P a recovering set carries in its meta row is deferred to the adaptive engage in
-// slice 6; until then partitioning engages only under the test hook, so every served set is P=1
-// and behaves exactly as it does today.
+// (spec 2064/f1_rewrite_ltm/19 slices 3 and 6). It reads the server's forceP hook with one atomic
+// load first: forceP is 0 in production so the common path falls through to the per-key registry,
+// and the slice-3 correctness tests and the contention microbenchmark set forceP to drive every set
+// through one P regardless of the registry. With forceP unset, the per-key registry answers: a set
+// that has engaged the adaptive transition (slice 6) carries its P there and routes through it, and
+// every other set misses the registry and takes the unpartitioned P=1 body byte-for-byte.
 func (c *connState) partitionsFor(skey []byte) int {
 	if p := int(c.srv.forceP.Load()); p > 1 {
 		return p
 	}
-	return 1
+	return c.srv.partitionP(skey)
 }
 
 // partScanBase builds the partition-scan prefix uvarint(len(skey))|skey|<byte> into the reusable
