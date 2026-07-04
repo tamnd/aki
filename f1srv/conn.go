@@ -50,7 +50,7 @@ type connState struct {
 	// key no longer share the engine's per-shard PRNG under an exclusive lock: the draw takes
 	// only the shard read lock and this word (spec 2064/19 slice 1). Seeded once at accept from
 	// the connection id so two connections draw independent sequences.
-	rngState uint64
+	rngState  uint64
 	argv      [][]byte
 	vbuf      []byte    // reused destination for GET/MGET value copies
 	kbuf      []byte    // reused scratch for building composite collection element keys
