@@ -165,6 +165,9 @@ func TestDerivePartVec(t *testing.T) {
 	for part := 0; part < p; part++ {
 		v := s.derivePartVec(skey, part, p)
 		ps.setPartVec(part, v)
+		if ps.partVec(part) != v {
+			t.Fatalf("part %d: partVec did not return the installed vector", part)
+		}
 		ps.count[part].Store(int64(len(v.slots)))
 		rebuilt += len(v.slots)
 
