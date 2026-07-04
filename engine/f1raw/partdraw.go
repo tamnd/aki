@@ -10,11 +10,15 @@ package f1raw
 // comes out with probability exactly 1/total, skew and all, because a fat partition's higher pick
 // probability is exactly cancelled by its members' lower per-slot probability.
 //
-// The count read is lock-free: each partition vector publishes its slots snapshot through an
-// atomic pointer, so summing P snapshot lengths touches no lock and P concurrent draws that route
-// to P different partitions take P different locks (or none, on the non-destructive read). This is
-// the fix for the single-hot-key wall: doc 18's one vector under one lock became P vectors under P
-// locks, so a hot set's draws scale across cores instead of serializing on one (section 1).
+// The count read is lock-free and, after warmup, map-lookup-free. Each partition vector publishes
+// its slots snapshot through an atomic pointer, so summing P snapshot lengths touches no lock, and
+// the P partition-vector pointers are cached in a per-set descriptor (partdesc.go), so summing the
+// counts is P atomic loads with no shard-map probe. P concurrent draws that route to P different
+// partitions take P different locks (or none, on the non-destructive read). This is the fix for the
+// single-hot-key wall: doc 18's one vector under one lock became P vectors under P locks, so a hot
+// set's draws scale across cores instead of serializing on one (section 1). The descriptor is what
+// makes that split show as throughput: slice 4 read the counts with O(P) map lookups per draw, a tax
+// that grew with P faster than the lock split saved, so slice 4b (section 5) caches the pointers.
 //
 // A partition's vector is built lazily on the first draw against it (deriveOnFirstDraw scans the
 // partition's prefix range), exactly as the unpartitioned vector is, so a partition never drawn
@@ -54,24 +58,6 @@ func (s *Store) collPartVec(prefix []byte) *memberVec {
 	return v
 }
 
-// weightedCounts reads the P partition counts into counts and returns their sum, building each
-// partition's vector lazily. base is the partition-scan prefix with a placeholder final byte that
-// this rewrites to each partition id in turn, so the caller reuses one buffer across all P reads
-// rather than allocating a prefix per partition. Each count is the partition vector's live length,
-// read from its atomic slots snapshot, so the whole reduction is lock-free. counts must have room
-// for at least p entries.
-func (s *Store) weightedCounts(base []byte, p int, counts []int) (total int) {
-	last := len(base) - 1
-	for part := 0; part < p; part++ {
-		base[last] = byte(part)
-		v := s.collPartVec(base)
-		n := len(v.view.Load().s)
-		counts[part] = n
-		total += n
-	}
-	return total
-}
-
 // walkPart maps a global index g in [0, total) to its partition by the prefix-sum walk: it
 // subtracts each partition's count until g falls within the current partition's range, and
 // returns that partition and the within-partition index. An empty partition contributes a
@@ -105,9 +91,10 @@ func walkPart(counts []int, p, g int) (part, local int) {
 // bounded so a pathological concurrent-drain cannot spin.
 func (s *Store) CollPartRandOne(base []byte, p int, r uint64) (key []byte, ok bool) {
 	last := len(base) - 1
+	d := s.partDescFor(base[:last], p)
 	for attempt := 0; attempt < 8; attempt++ {
 		var counts [maxPartitions]int
-		total := s.weightedCounts(base, p, counts[:])
+		total := s.weightedCountsDesc(d, base, counts[:])
 		if total == 0 {
 			return nil, false
 		}
@@ -132,8 +119,9 @@ func (s *Store) CollPartRandOne(base []byte, p int, r uint64) (key []byte, ok bo
 // is the partition-scan prefix whose final byte this rewrites per partition, and each partition's
 // vector is built lazily as it is counted.
 func (s *Store) CollPartTotal(base []byte, p int) int {
+	d := s.partDescFor(base[:len(base)-1], p)
 	var counts [maxPartitions]int
-	return s.weightedCounts(base, p, counts[:])
+	return s.weightedCountsDesc(d, base, counts[:])
 }
 
 // CollPartPick chooses a partition weighted by the P lock-free partition counts and returns it, or
@@ -146,8 +134,9 @@ func (s *Store) CollPartTotal(base []byte, p int) int {
 // destructive SPOP's partition selection: lock-free, so P pops routing to P partitions never
 // contend on the selection, only on their distinct partition locks.
 func (s *Store) CollPartPick(base []byte, p int, r uint64) int {
+	d := s.partDescFor(base[:len(base)-1], p)
 	var counts [maxPartitions]int
-	total := s.weightedCounts(base, p, counts[:])
+	total := s.weightedCountsDesc(d, base, counts[:])
 	if total == 0 {
 		return -1
 	}
@@ -199,8 +188,9 @@ func (s *Store) CollPartSampleDistinct(base []byte, p, want int, r uint64, dst [
 		return dst
 	}
 	last := len(base) - 1
+	d := s.partDescFor(base[:last], p)
 	var counts [maxPartitions]int
-	total := s.weightedCounts(base, p, counts[:])
+	total := s.weightedCountsDesc(d, base, counts[:])
 	if total == 0 {
 		return dst
 	}
