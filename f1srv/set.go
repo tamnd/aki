@@ -1226,8 +1226,16 @@ func (c *connState) cmdSPopPart(skey []byte, count int64, hasCount bool, p int) 
 // reentrant. This is the first two-key write on f1raw; every prior collection write
 // took exactly one stripe lock.
 func (c *connState) lockTwoStripes(a, b []byte) func() {
-	sa := c.srv.stripe(a)
-	sb := c.srv.stripe(b)
+	return c.lockTwoStripeIdx(c.srv.stripe(a), c.srv.stripe(b))
+}
+
+// lockTwoStripeIdx takes two stripe mutexes by index in ascending index order (lower first),
+// deduplicating when both indices are the same, and returns an unlock closure. Ascending index
+// order is the one global lock order lockStripes and lockSetPartitionsShared also follow, so a
+// two-stripe write can never deadlock against a concurrent multi-stripe algebra or shared read that
+// holds a superset of stripes: every acquirer takes its stripes in the same total order. When both
+// indices coincide it locks the one mutex once, since a sync.Mutex is not reentrant.
+func (c *connState) lockTwoStripeIdx(sa, sb uint32) func() {
 	if sa == sb {
 		mu := &c.srv.incrMu[sa]
 		mu.Lock()
@@ -1262,6 +1270,15 @@ func (c *connState) cmdSMove(argv [][]byte) {
 		return
 	}
 	source, destination, member := argv[1], argv[2], argv[3]
+
+	// A partitioned set routes the member to one partition and locks only that partition's stripe,
+	// so the move goes through the partition-aware body (spec 2064/f1_rewrite_ltm/19 section 6.10).
+	// partitionsFor is a whole-server hook until slice 6, so source and destination share P and both
+	// are partitioned together; the per-key P values differing is a slice-6 concern.
+	if pSrc, pDst := c.partitionsFor(source), c.partitionsFor(destination); pSrc > 1 || pDst > 1 {
+		c.smovePart(source, destination, member, pSrc, pDst)
+		return
+	}
 
 	unlock := c.lockTwoStripes(source, destination)
 	if c.stringConflict(source) || c.stringConflict(destination) {
@@ -1331,5 +1348,108 @@ func (c *connState) cmdSMove(argv [][]byte) {
 		}
 	}
 	unlock()
+	c.writeInt(1)
+}
+
+// smovePart is the P>1 routing of SMOVE (spec 2064/f1_rewrite_ltm/19 section 6.10). The member
+// routes to the source partition PartitionOf(m, pSrc) and, independently, the destination partition
+// PartitionOf(m, pDst); the two partition ids are unrelated because they are computed against two
+// possibly-different partition counts. The command locks exactly those two partition stripes, taken
+// in ascending stripe-index order through lockTwoStripeIdx, the same global order lockStripes and
+// lockSetPartitionsShared follow, so two SMOVEs touching the same pair of partitions from opposite
+// argument order agree on the order and cannot deadlock, and neither can an SMOVE deadlock against a
+// concurrent algebra or SMEMBERS holding a superset of those stripes. Under both locks it removes
+// the member from the source partition and adds it to the destination partition. The shared per-key
+// counts are bumped after the locks release, exactly as cmdSAddPart and cmdSRemPart bump them: the
+// header count is eventually consistent and every partitioned reader reframes from the live rows, so
+// the momentary lag is invisible.
+func (c *connState) smovePart(source, destination, member []byte, pSrc, pDst int) {
+	srcStripe := c.srv.stripe(source)
+	srcPart := 0
+	if pSrc > 1 {
+		srcPart = f1raw.PartitionOf(member, pSrc)
+		srcStripe = c.srv.stripePart(source, srcPart)
+	}
+	dstStripe := c.srv.stripe(destination)
+	dstPart := 0
+	if pDst > 1 {
+		dstPart = f1raw.PartitionOf(member, pDst)
+		dstStripe = c.srv.stripePart(destination, dstPart)
+	}
+	unlock := c.lockTwoStripeIdx(srcStripe, dstStripe)
+
+	if c.stringConflict(source) || c.stringConflict(destination) {
+		unlock()
+		c.writeErr(wrongType)
+		return
+	}
+
+	// Source equals destination: the member routes to one partition under one key, so a move cannot
+	// change which partition holds it. Report presence without touching a row or a count, exactly as
+	// the unpartitioned same-key case does.
+	if bytes.Equal(source, destination) {
+		present := c.srv.store.ExistsKind(c.partMemberKey(source, member, srcPart, pSrc), kindSetMember)
+		unlock()
+		if present {
+			c.writeInt(1)
+		} else {
+			c.writeInt(0)
+		}
+		return
+	}
+
+	// Not in the source partition: nothing moves and the destination stays untouched.
+	srcMK := c.partMemberKey(source, member, srcPart, pSrc)
+	if !c.srv.store.ExistsKind(srcMK, kindSetMember) {
+		unlock()
+		c.writeInt(0)
+		return
+	}
+
+	// Remove from the source partition. Drop from that partition's dense vector first, while the
+	// record is still resolvable (spec 2064/18 section 5.2). The vector base is built into ppbuf with
+	// its final byte set to the source partition; srcMK lives in the distinct kbuf, so both stay live
+	// at once without colliding. An unpartitioned source (pSrc==1) uses its whole-set prefix instead.
+	if pSrc > 1 {
+		base := c.partScanBase(source)
+		base[len(base)-1] = byte(srcPart)
+		c.srv.store.CollRandRemove(base, srcMK, kindSetMember)
+	} else {
+		c.srv.store.CollRandRemove(c.setPrefix(source), srcMK, kindSetMember)
+	}
+	if c.srv.store.DeleteKind(srcMK, kindSetMember) {
+		c.srv.store.CollRemove(srcMK)
+	}
+
+	// Add to the destination partition only if absent, so a member already there is not duplicated.
+	// partMemberKey reuses kbuf, overwriting srcMK, which is already consumed; the vector base reuses
+	// ppbuf, overwriting the source base, also already consumed.
+	dstMK := c.partMemberKey(destination, member, dstPart, pDst)
+	isNew, err := c.srv.store.PutKind(dstMK, nil, kindSetMember)
+	if err != nil {
+		unlock()
+		c.writeErr("ERR " + err.Error())
+		return
+	}
+	if isNew {
+		c.srv.store.CollInsert(dstMK, kindSetMember)
+		if pDst > 1 {
+			base := c.partScanBase(destination)
+			base[len(base)-1] = byte(dstPart)
+			c.srv.store.CollRandInsert(base, dstMK, kindSetMember)
+		} else {
+			c.srv.store.CollRandInsert(c.setPrefix(destination), dstMK, kindSetMember)
+		}
+	}
+	unlock()
+
+	// Adjust the shared per-key counts off the partition locks. The source always lost a member (it
+	// was present under the lock), the destination gained one only on a genuine insert. A partitioned
+	// set carries its count in the whole-key header word bumped lock-free; setBumpCard stamps the
+	// hashtable encoding a partitioned set always reports, so no encoding fold is needed here.
+	c.setBumpCard(source, -1, pSrc)
+	if isNew {
+		c.setBumpCard(destination, 1, pDst)
+	}
 	c.writeInt(1)
 }
