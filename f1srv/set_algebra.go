@@ -28,12 +28,12 @@ import (
 // span of the operation, so the sets it reads cannot change under it. That makes the two
 // SUNION passes see identical state, so the framed count always matches what is streamed.
 
-// setCursor is a forward, member-ordered cursor over one set's member rows on the f1raw
-// ordered element index. cur is the current member (the composite key past the prefix, an
-// arena-stable subslice) or nil when the set is exhausted. Each cursor owns its prefix and
-// batch buffers so several can run at once during a k-way merge, unlike the single shared
-// c.pbuf a lone enumeration uses.
-type setCursor struct {
+// partWalk is a forward, member-ordered walk over one contiguous member-row run: a whole
+// unpartitioned set, or one partition of a partitioned set. prefix bounds that run and plen is
+// where the member starts (past the length-prefixed set key, and past the partition byte for a
+// partition run), so cur = batch[idx][plen:] is the bare member. Each walk owns its prefix and
+// batch buffers so P partition walks (and k cursors in a merge) never share a buffer.
+type partWalk struct {
 	st     *f1raw.Store
 	prefix []byte
 	plen   int
@@ -44,73 +44,156 @@ type setCursor struct {
 	cur    []byte
 }
 
-// newSetCursor opens a member-ordered cursor over skey, positioned on the first member
-// (cur nil when the set is empty). The prefix is a fresh copy, not c.pbuf, so k cursors in
-// one merge never share a prefix buffer.
-func (c *connState) newSetCursor(skey []byte) *setCursor {
+// advance moves the walk to the next member, refilling from the ordered index in bounded
+// batches, and sets cur to nil once the run is exhausted. Every yielded member is a subslice of
+// the immutable arena, valid for the store's life, so a merge holds it without copying even
+// after the walk refills its batch buffer.
+func (pw *partWalk) advance() {
+	if pw.idx < len(pw.batch) {
+		pw.cur = pw.batch[pw.idx][pw.plen:]
+		pw.idx++
+		return
+	}
+	if pw.done {
+		pw.cur = nil
+		return
+	}
+	keys, last := pw.st.CollScan(pw.prefix, pw.after, hashScanBatch, pw.batch[:0])
+	pw.batch = keys
+	pw.idx = 0
+	if last == nil {
+		pw.done = true
+	} else {
+		pw.after = last
+	}
+	if len(keys) == 0 {
+		pw.cur = nil
+		return
+	}
+	pw.cur = pw.batch[pw.idx][pw.plen:]
+	pw.idx++
+}
+
+// setCursor is a forward, member-ordered cursor over one whole set's members, in pure member-byte
+// order, whatever the set's partition count. cur is the current member (an arena-stable subslice)
+// or nil at exhaustion. An unpartitioned set is one partWalk (single); a partitioned set is P
+// per-partition walks merged into one member-ordered stream. The merge matters because the P
+// partition rows sort by (partition, member) under the whole-set prefix, not by member, so a lone
+// walk of that prefix would break the k-way merge that every algebra caller relies on. A member
+// routes to exactly one partition (PartitionOf), so no member is ever in two walks and the merge
+// is a plain min-scan with no dedup.
+type setCursor struct {
+	single *partWalk   // non-nil for an unpartitioned set (P==1): the whole-set walk
+	walks  []*partWalk // non-nil for a partitioned set (P>1): one walk per partition
+	cur    []byte
+}
+
+// newPartWalk opens a walk over one member run of skey: the whole set when p==1, or partition
+// part when p>1. The prefix is a fresh copy, not a shared scratch buffer, so P walks in one
+// partitioned cursor never share a prefix. The member offset is len(prefix), which already skips
+// the partition byte when present, so advance strips exactly the member.
+func (c *connState) newPartWalk(skey []byte, part, p int) *partWalk {
 	var tmp [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(tmp[:], uint64(len(skey)))
-	prefix := make([]byte, 0, n+len(skey))
+	prefix := make([]byte, 0, n+len(skey)+1)
 	prefix = append(prefix, tmp[:n]...)
 	prefix = append(prefix, skey...)
-	sc := &setCursor{
+	if p > 1 {
+		prefix = append(prefix, byte(part))
+	}
+	pw := &partWalk{
 		st:     c.srv.store,
 		prefix: prefix,
 		plen:   len(prefix),
 		batch:  make([][]byte, 0, hashScanBatch),
 	}
+	pw.advance()
+	return pw
+}
+
+// newSetCursor opens a member-ordered cursor over skey, positioned on the first member (cur nil
+// when the set is empty). It reads the set's partition count once: an unpartitioned set gets one
+// direct walk (the hot common path, no per-member merge), a partitioned set gets P walks merged.
+func (c *connState) newSetCursor(skey []byte) *setCursor {
+	sc := &setCursor{}
+	if p := c.partitionsFor(skey); p > 1 {
+		sc.walks = make([]*partWalk, p)
+		for part := 0; part < p; part++ {
+			sc.walks[part] = c.newPartWalk(skey, part, p)
+		}
+	} else {
+		sc.single = c.newPartWalk(skey, 0, 1)
+	}
 	sc.advance()
 	return sc
 }
 
-// advance moves the cursor to the next member, refilling from the ordered index in bounded
-// batches, and sets cur to nil once the set is exhausted. Every yielded member is a
-// subslice of the immutable arena, valid for the store's life, so a merge holds it without
-// copying even after the cursor refills its batch buffer.
+// advance moves the cursor to the next member in member-byte order. The unpartitioned cursor just
+// steps its lone walk. The partitioned cursor takes the smallest member currently at any partition
+// walk's front and advances that walk, so the P sorted per-partition streams merge into one sorted
+// stream; because a member lives in exactly one partition, exactly one walk sits on the smallest,
+// but it advances every walk equal to it defensively so a would-be duplicate never stalls the merge.
 func (sc *setCursor) advance() {
-	if sc.idx < len(sc.batch) {
-		sc.cur = sc.batch[sc.idx][sc.plen:]
-		sc.idx++
+	if sc.single != nil {
+		// Read the current front, then step the walk to prepare the next, exactly as the
+		// merge path reads each walk's front before advancing the one at the minimum. The
+		// walk is already positioned on its first member at construction, so reading before
+		// stepping yields that first member instead of skipping past it.
+		sc.cur = sc.single.cur
+		sc.single.advance()
 		return
 	}
-	if sc.done {
+	var min []byte
+	found := false
+	for _, pw := range sc.walks {
+		if pw.cur == nil {
+			continue
+		}
+		if !found || bytes.Compare(pw.cur, min) < 0 {
+			min = pw.cur
+			found = true
+		}
+	}
+	if !found {
 		sc.cur = nil
 		return
 	}
-	keys, last := sc.st.CollScan(sc.prefix, sc.after, hashScanBatch, sc.batch[:0])
-	sc.batch = keys
-	sc.idx = 0
-	if last == nil {
-		sc.done = true
-	} else {
-		sc.after = last
+	sc.cur = min
+	for _, pw := range sc.walks {
+		if pw.cur != nil && bytes.Equal(pw.cur, min) {
+			pw.advance()
+		}
 	}
-	if len(keys) == 0 {
-		sc.cur = nil
-		return
-	}
-	sc.cur = sc.batch[sc.idx][sc.plen:]
-	sc.idx++
 }
 
 // lockStripes takes the stripe locks for every distinct key in keys, in ascending stripe
 // index order so a multi-key read can never deadlock against SMOVE or another algebra call
-// that touches an overlapping key set, and returns an unlock closure. Keys that map to the
-// same stripe lock it once. The set of distinct stripes is small (one per source), so the
-// linear dedup and insertion sort cost nothing measurable.
+// that touches an overlapping key set, and returns an unlock closure. A partitioned key
+// contributes every one of its partition stripes (stripePart per partition), because its
+// member writers hold per-partition stripe write locks, not the whole-key stripe, so a
+// whole-key stripe alone would not exclude them. An unpartitioned key contributes its one
+// whole-key stripe. Stripes are deduplicated (two partitions or two keys can hash to one
+// stripe) and taken in ascending index order, the same global order lockSetPartitionsShared
+// uses, so exclusive algebra locks and shared SMEMBERS locks over overlapping partition
+// stripes acquire in one order and never form a cycle. The distinct-stripe set stays small,
+// so the linear dedup and insertion sort cost nothing measurable.
 func (c *connState) lockStripes(keys [][]byte) func() {
 	idxs := make([]uint32, 0, len(keys))
-	for _, k := range keys {
-		s := c.srv.stripe(k)
-		dup := false
+	add := func(s uint32) {
 		for _, e := range idxs {
 			if e == s {
-				dup = true
-				break
+				return
 			}
 		}
-		if !dup {
-			idxs = append(idxs, s)
+		idxs = append(idxs, s)
+	}
+	for _, k := range keys {
+		if p := c.partitionsFor(k); p > 1 {
+			for part := 0; part < p; part++ {
+				add(c.srv.stripePart(k, part))
+			}
+		} else {
+			add(c.srv.stripe(k))
 		}
 	}
 	for i := 1; i < len(idxs); i++ {
@@ -173,6 +256,21 @@ func (c *connState) sunionEach(keys [][]byte, emit func([]byte) bool) {
 			}
 		}
 	}
+}
+
+// setMemberExists reports whether member is in set skey, routing the probe to the member's
+// partition when skey is partitioned (spec 2064/f1_rewrite_ltm/19 section 6.9). The
+// intersection and difference drivers probe non-driver sources one member at a time, and a
+// partitioned source stores that member only under its routed partition key, so an
+// unpartitioned memberKey probe would miss it. For an unpartitioned set it is byte-identical
+// to the plain probe. member is an arena-stable driver member, so building the composite key
+// into the per-connection scratch is safe: the result is consumed before the next probe.
+func (c *connState) setMemberExists(skey, member []byte) bool {
+	if p := c.partitionsFor(skey); p > 1 {
+		part := f1raw.PartitionOf(member, p)
+		return c.srv.store.ExistsKind(c.partMemberKey(skey, member, part, p), kindSetMember)
+	}
+	return c.srv.store.ExistsKind(c.memberKey(skey, member), kindSetMember)
 }
 
 // sinterProbeWeight is how many cursor-advance steps one point-probe of a source costs,
@@ -284,7 +382,7 @@ func (c *connState) sinterProbeEach(keys [][]byte, driverIdx int, emit func([]by
 			if i == driverIdx {
 				continue
 			}
-			if !c.srv.store.ExistsKind(c.memberKey(k, m), kindSetMember) {
+			if !c.setMemberExists(k, m) {
 				inAll = false
 				break
 			}
@@ -309,7 +407,7 @@ func (c *connState) sdiffEach(keys [][]byte, emit func([]byte) bool) {
 		m := driver.cur
 		inRest := false
 		for _, k := range rest {
-			if c.srv.store.ExistsKind(c.memberKey(k, m), kindSetMember) {
+			if c.setMemberExists(k, m) {
 				inRest = true
 				break
 			}
