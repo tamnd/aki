@@ -638,10 +638,12 @@ func (c *connState) streamSetPart(skey []byte, p int) {
 // read of a partitioned set takes the shared side so many readers of one hot set still run at once,
 // while excluding the partitioned member writers that hold the partition stripe write lock. The
 // stripe set is deduplicated because stripePart can map two partitions to one stripe and recursively
-// read-locking a single RWMutex can deadlock against a waiting writer. Distinct readers taking only
-// shared locks never deadlock regardless of order, and a partitioned writer holds just one stripe
-// write lock at a time with nothing else held while it waits, so no lock-order cycle is possible and
-// no sort of the stripes is needed.
+// read-locking a single RWMutex can deadlock against a waiting writer. The stripes are taken in
+// ascending index order, the same global order lockStripes uses for its exclusive algebra locks, so
+// a shared SMEMBERS read and an exclusive SINTER/SINTERSTORE over overlapping partition stripes of
+// one set acquire in one order and can never form a lock-order cycle. A partitioned member writer
+// holds just one stripe write lock at a time with nothing else held while it waits, so it never
+// closes a cycle either.
 func (c *connState) lockSetPartitionsShared(skey []byte, p int) []uint32 {
 	stripes := make([]uint32, 0, p)
 	for part := 0; part < p; part++ {
@@ -655,6 +657,11 @@ func (c *connState) lockSetPartitionsShared(skey []byte, p int) []uint32 {
 		}
 		if !dup {
 			stripes = append(stripes, s)
+		}
+	}
+	for i := 1; i < len(stripes); i++ {
+		for j := i; j > 0 && stripes[j] < stripes[j-1]; j-- {
+			stripes[j], stripes[j-1] = stripes[j-1], stripes[j]
 		}
 	}
 	for _, s := range stripes {
