@@ -93,6 +93,18 @@ type Server struct {
 	// written only in tests, so it is an atomic rather than a plain field.
 	forceP atomic.Int64
 
+	// setPartP is the per-key partition registry: the source partitionsFor reads to decide the P a
+	// set's commands route through once the whole-server forceP hook is retired (spec
+	// 2064/f1_rewrite_ltm/19 slice 6). It is an atomically-published immutable map keyed by the set's
+	// key bytes, nil until the first set engages partitioning, so a keyspace with no engaged set pays
+	// one atomic load and a nil check on the set hot path and nothing more. The adaptive engage-and-
+	// grow transition installs a key's P here under setPartMu when it re-homes the set to P>1, and the
+	// drop path removes it so a deleted-and-recreated key restarts at P=1 (section 3.1). partitionsFor
+	// reads it lock-free; only the rare engage/grow/drop takes setPartMu to swap the map by
+	// copy-on-write, the same discipline the store's descriptor and vector maps use.
+	setPartP  atomic.Pointer[map[string]int]
+	setPartMu sync.Mutex
+
 	// execModel is the resolved command-execution model (spec 2064/17), parsed once from
 	// cfg.ExecModel in New. execShards is the shard count the affinity model routes over,
 	// GOMAXPROCS so one shard maps to one worker core. Both are read-only after New. The
