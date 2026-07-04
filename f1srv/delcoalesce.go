@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math"
+
+	"github.com/tamnd/aki/engine/f1raw"
 )
 
 // delFamily names the three named-element delete commands the drain loop coalesces:
@@ -84,7 +86,16 @@ func (c *connState) drainDelete(first [][]byte, fam delFamily, pos int) int {
 	case delHash:
 		c.cmdHDelCoalesced(key, elems, bnd)
 	case delSet:
-		c.cmdSRemCoalesced(key, elems, bnd)
+		// A set that engaged partitioning scatters its members across P partition locks, so the
+		// single whole-key stripe lock the coalescer folds the run under does not apply: route the
+		// run through the partition-aware applier instead. partitionsFor is a whole-server hook that
+		// returns 1 in production, where this branch is dead and the run folds under one lock exactly
+		// as before.
+		if p := c.partitionsFor(key); p > 1 {
+			c.cmdSRemCoalescedPart(key, elems, bnd, p)
+		} else {
+			c.cmdSRemCoalesced(key, elems, bnd)
+		}
 	case delZset:
 		c.cmdZRemCoalesced(key, elems, bnd)
 	}
@@ -220,6 +231,65 @@ func (c *connState) cmdSRemCoalesced(skey []byte, elems [][]byte, bnd []int) {
 		}
 	}
 	mu.Unlock()
+	for _, r := range counts {
+		c.writeInt(int64(r))
+	}
+}
+
+// cmdSRemCoalescedPart is the partitioned counterpart to cmdSRemCoalesced, the applier drainDelete
+// routes a same-key SREM run to when the set has engaged partitioning (spec 2064/f1_rewrite_ltm/19
+// slice 5). Coalescing folds a run under one whole-key stripe lock, but a partitioned set's members
+// scatter across P partition locks by member hash, so there is no single lock to fold under: this
+// routes each member to its partition and removes it there, the same per-member path cmdSRemPart
+// takes, and it preserves the coalescer's per-command reply contract by counting removals within
+// each command's boundary. The shared cardinality is bumped once after the whole run, off every
+// partition lock, exactly as the routed SADD and SREM bump it. elems holds every member in arrival
+// order; bnd[k] is the cumulative member count through command k, so command k owns
+// elems[bnd[k-1]:bnd[k]], and a member an earlier command in the run already removed counts zero for
+// a later one just as the unfolded commands would leave it.
+func (c *connState) cmdSRemCoalescedPart(skey []byte, elems [][]byte, bnd []int, p int) {
+	// The type guard is a lock-free probe, the same one the single-command SREM does before it routes
+	// to cmdSRemPart: a partitioned set can never also be a string, and a routed remove never contends
+	// with the whole-key stripe. On a conflict every command in the run reports WRONGTYPE.
+	if c.stringConflict(skey) {
+		for range bnd {
+			c.writeErr(wrongType)
+		}
+		return
+	}
+	// Hoist the partition-scan base once (ppbuf); its final byte is rewritten per member to route the
+	// dense-vector remove, and partMemberKey below builds the routed row key in the distinct kbuf, so
+	// the two stay live together across the whole run.
+	base := c.partScanBase(skey)
+	last := len(base) - 1
+	counts := c.delCnt[:0]
+	total := 0
+	i := 0
+	for _, end := range bnd {
+		removed := 0
+		for ; i < end; i++ {
+			member := elems[i]
+			part := f1raw.PartitionOf(member, p)
+			mu := &c.srv.incrMu[c.srv.stripePart(skey, part)]
+			mu.Lock()
+			mk := c.partMemberKey(skey, member, part, p)
+			base[last] = byte(part)
+			// Swap-remove from the partition's draw vector before DeleteKind clears the record, so the
+			// vector slot's arena offset is still resolvable; a partition with no vector is a no-op.
+			c.srv.store.CollRandRemove(base, mk, kindSetMember)
+			if c.srv.store.DeleteKind(mk, kindSetMember) {
+				c.srv.store.CollRemove(mk)
+				removed++
+			}
+			mu.Unlock()
+		}
+		counts = append(counts, removed)
+		total += removed
+	}
+	c.delCnt = counts
+	if total > 0 {
+		c.setBumpCard(skey, -total, p)
+	}
 	for _, r := range counts {
 		c.writeInt(int64(r))
 	}
