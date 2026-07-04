@@ -205,6 +205,10 @@ func (s *Store) Reset() {
 	// its vector from the now-empty index. The vector is never persisted, so there is nothing
 	// else to reconcile.
 	s.rvec = newRandVec()
+	// Drop every partitioned set's descriptor too (partdesc.go): a reset clears the keyspace, so a
+	// fresh table starts empty and the first draw against any later partitioned set rebuilds its
+	// descriptor. Like the vector, the descriptor is never persisted, so nothing else reconciles.
+	s.pdescs = newPartDescs()
 	// A reset unlinks every record, so every byte the cold log holds is now dead space no
 	// live record points at. The log itself is left in place (M1 does no reclamation; a
 	// later compaction milestone truncates it), so the dead counter is set to the current
