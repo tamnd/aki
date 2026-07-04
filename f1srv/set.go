@@ -252,6 +252,20 @@ func (s *Server) unengageP(skey []byte) {
 // through one P regardless of the registry. With forceP unset, the per-key registry answers: a set
 // that has engaged the adaptive transition (slice 6) carries its P there and routes through it, and
 // every other set misses the registry and takes the unpartitioned P=1 body byte-for-byte.
+// resetPartitions clears the whole partition registry, the reset FLUSHALL/FLUSHDB performs alongside
+// the store wipe so a set recreated under a name a partitioned set used before the flush starts fresh
+// at P=1 rather than inheriting a stale registry entry that would route it to partition rows the flush
+// deleted. It swaps in an empty map by copy-on-write under setPartMu so a concurrent lock-free
+// partitionP reads either the old or the empty map, never a torn one.
+func (s *Server) resetPartitions() {
+	if s.setPartP.Load() == nil {
+		return
+	}
+	s.setPartMu.Lock()
+	s.setPartP.Store(nil)
+	s.setPartMu.Unlock()
+}
+
 func (c *connState) partitionsFor(skey []byte) int {
 	if p := int(c.srv.forceP.Load()); p > 1 {
 		return p
@@ -302,21 +316,27 @@ func (c *connState) partMemberKey(skey, member []byte, part, p int) []byte {
 // setBumpCard adjusts a set's maintained cardinality by delta under the partitioned write paths.
 // The count stays a single whole-key header word (slice 3 keeps one cardinality per set; the
 // per-partition counts of partSet arrive with slice 4's draw), so a routed write bumps it with one
-// in-place atomic (CountAddInt64) that never takes a whole-key lock in the common case: the header
-// already exists once a set has any member. Only the first add to an empty set finds no header, and
-// only then does it take the whole-key stripe lock to create one, recording P via setHeaderEncodeP
-// with the hashtable encoding a partitioned set always reports (section 6.11). A drain to zero
-// deletes the header so an empty set stops existing. The whole-key stripe is distinct from every
-// partition stripe (stripePart always folds one extra byte), so this create never contends with a
-// concurrent routed member write on a partition lock.
+// in-place atomic (CountAddInt64). It takes the whole-key stripe in shared mode across the bump: the
+// shared side lets many concurrent bumps of one hot set proceed in parallel (the count word is itself
+// atomic, so they never corrupt one another), while a partition migration takes the same stripe
+// exclusively across its header rewrite (engageSetPartitions phase 2), so a bump lands either fully
+// before the migration reads the header (and is included in the preserved count) or fully after (and
+// is applied by this atomic onto the newP header). Either way the cardinality stays exact across a
+// grow. Only the first add to an empty set finds no header, and only then does it upgrade to the
+// exclusive stripe lock to create one, recording P via setHeaderEncodeP with the hashtable encoding a
+// partitioned set always reports (section 6.11). A drain to zero deletes the header so an empty set
+// stops existing.
 func (c *connState) setBumpCard(skey []byte, delta, p int) {
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.RLock()
 	if n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, int64(delta)); ok {
 		if n <= 0 {
 			c.srv.store.DeleteKind(skey, kindSetMeta)
 		}
+		mu.RUnlock()
 		return
 	}
-	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.RUnlock()
 	mu.Lock()
 	if n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, int64(delta)); ok {
 		if n <= 0 {
@@ -344,10 +364,9 @@ func (c *connState) cmdSAddPart(skey []byte, members [][]byte, p int) {
 	base := c.partScanBase(skey)
 	last := len(base) - 1
 	for _, member := range members {
-		part := f1raw.PartitionOf(member, p)
-		mu := &c.srv.incrMu[c.srv.stripePart(skey, part)]
-		mu.Lock()
-		mk := c.partMemberKey(skey, member, part, p)
+		mu, part, mp := c.lockMemberPartition(skey, member, p)
+		p = mp
+		mk := c.partMemberKey(skey, member, part, mp)
 		isNew, err := c.srv.store.PutKind(mk, nil, kindSetMember)
 		if err != nil {
 			mu.Unlock()
@@ -380,10 +399,9 @@ func (c *connState) cmdSRemPart(skey []byte, members [][]byte, p int) {
 	base := c.partScanBase(skey)
 	last := len(base) - 1
 	for _, member := range members {
-		part := f1raw.PartitionOf(member, p)
-		mu := &c.srv.incrMu[c.srv.stripePart(skey, part)]
-		mu.Lock()
-		mk := c.partMemberKey(skey, member, part, p)
+		mu, part, mp := c.lockMemberPartition(skey, member, p)
+		p = mp
+		mk := c.partMemberKey(skey, member, part, mp)
 		base[last] = byte(part)
 		c.srv.store.CollRandRemove(base, mk, kindSetMember)
 		if c.srv.store.DeleteKind(mk, kindSetMember) {
@@ -398,31 +416,22 @@ func (c *connState) cmdSRemPart(skey []byte, members [][]byte, p int) {
 	c.writeInt(int64(removed))
 }
 
-// cmdSIsMemberPart is the P>1 routing of SISMEMBER: the member routes to its partition and the
-// probe is a single lock-free index lookup on the partition-routed key, exactly as the
-// unpartitioned probe is, since a read never contends with a partition write.
-func (c *connState) cmdSIsMemberPart(skey, member []byte, p int) {
-	part := f1raw.PartitionOf(member, p)
-	mk := c.partMemberKey(skey, member, part, p)
-	if c.srv.store.ExistsKind(mk, kindSetMember) {
-		c.writeInt(1)
-		return
-	}
-	c.writeInt(0)
-}
-
-// cmdSMIsMemberPart is the P>1 routing of SMISMEMBER: each member routes to its partition and gets
-// one lock-free probe, framed by the same array header the unpartitioned path writes.
-func (c *connState) cmdSMIsMemberPart(skey []byte, members [][]byte, p int) {
-	c.writeArrayHeader(len(members))
-	for _, member := range members {
+// setMemberProbe reports whether member is in set skey, routing through the set's partitions with the
+// grow-safe re-read the partitioned SISMEMBER/SMISMEMBER share: probe under the current P, and on a
+// miss re-read P and re-probe if a concurrent migration grew the set, since a re-homed member's old
+// home is gone but its new home is live and published. It returns 1 for present, 0 for absent.
+func setMemberProbe(c *connState, skey, member []byte, p int) int {
+	for {
 		part := f1raw.PartitionOf(member, p)
 		mk := c.partMemberKey(skey, member, part, p)
 		if c.srv.store.ExistsKind(mk, kindSetMember) {
-			c.writeInt(1)
-			continue
+			return 1
 		}
-		c.writeInt(0)
+		cur := c.partitionsFor(skey)
+		if cur == p {
+			return 0
+		}
+		p = cur
 	}
 }
 
@@ -443,6 +452,20 @@ func (c *connState) cmdSAdd(argv [][]byte) {
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(skey)]
 	mu.Lock()
+	// The partitionsFor read above is unlocked, so an engage migration could have grown the set to
+	// P>1 in the window before this lock. A migration holds stripe(skey) for its whole span, so once
+	// this holds that stripe P is stable; re-check under the lock and route to the partitioned path if
+	// the set became partitioned, otherwise an unpartitioned insert would write a member into the
+	// unpartitioned home of a now-partitioned set, orphaning a row the partitioned reads never find.
+	if p := c.partitionsFor(skey); p > 1 {
+		mu.Unlock()
+		if c.stringConflict(skey) {
+			c.writeErr(wrongType)
+			return
+		}
+		c.cmdSAddPart(skey, argv[2:], p)
+		return
+	}
 	if c.stringConflict(skey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
@@ -502,6 +525,19 @@ func (c *connState) cmdSRem(argv [][]byte) {
 	}
 	mu := &c.srv.incrMu[c.srv.stripe(skey)]
 	mu.Lock()
+	// Re-check P under the lock for the same reason cmdSAdd does: an engage migration could have grown
+	// the set between the unlocked partitionsFor read and this lock. A migration holds stripe(skey), so
+	// holding it here makes P stable; route to the partitioned remove if the set became partitioned, or
+	// an unpartitioned delete would address the unpartitioned home and miss the member's partition row.
+	if p := c.partitionsFor(skey); p > 1 {
+		mu.Unlock()
+		if c.stringConflict(skey) {
+			c.writeErr(wrongType)
+			return
+		}
+		c.cmdSRemPart(skey, argv[2:], p)
+		return
+	}
 	if c.stringConflict(skey) {
 		mu.Unlock()
 		c.writeErr(wrongType)
@@ -553,16 +589,11 @@ func (c *connState) cmdSIsMember(argv [][]byte) {
 		c.writeErr("ERR wrong number of arguments for 'sismember' command")
 		return
 	}
-	if p := c.partitionsFor(argv[1]); p > 1 {
-		c.cmdSIsMemberPart(argv[1], argv[2], p)
-		return
-	}
-	mk := c.memberKey(argv[1], argv[2])
-	if c.srv.store.ExistsKind(mk, kindSetMember) {
-		c.writeInt(1)
-		return
-	}
-	c.writeInt(0)
+	// setMemberProbe with the current P covers both regimes: at P=1 its key is byte-identical to the
+	// unpartitioned home, and on a miss it re-reads P and re-probes, so a probe that started before an
+	// engage migration grew the set (and deleted the unpartitioned home) re-routes to the new
+	// partition home the migration published, never a spurious absence.
+	c.writeInt(int64(setMemberProbe(c, argv[1], argv[2], c.partitionsFor(argv[1]))))
 }
 
 func (c *connState) cmdSMIsMember(argv [][]byte) {
@@ -571,18 +602,12 @@ func (c *connState) cmdSMIsMember(argv [][]byte) {
 		c.writeErr("ERR wrong number of arguments for 'smismember' command")
 		return
 	}
-	if p := c.partitionsFor(argv[1]); p > 1 {
-		c.cmdSMIsMemberPart(argv[1], argv[2:], p)
-		return
-	}
+	// Each member gets the same grow-safe probe as SISMEMBER: byte-identical to the unpartitioned home
+	// at P=1 and re-routing on a miss if an engage migration grew the set under the reply.
+	p := c.partitionsFor(argv[1])
 	c.writeArrayHeader(len(argv) - 2)
 	for _, member := range argv[2:] {
-		mk := c.memberKey(argv[1], member)
-		if c.srv.store.ExistsKind(mk, kindSetMember) {
-			c.writeInt(1)
-			continue
-		}
-		c.writeInt(0)
+		c.writeInt(int64(setMemberProbe(c, argv[1], member, p)))
 	}
 }
 
