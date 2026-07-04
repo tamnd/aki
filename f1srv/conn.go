@@ -43,7 +43,14 @@ type connState struct {
 	parkCancel chan struct{}
 	// nowMs is the wall-clock ms cached once per drained batch, the "now" every command in
 	// the batch reads for expiry, like Redis server.mstime.
-	nowMs     int64
+	nowMs int64
+	// rngState is this connection's private splitmix64 PRNG for the no-count random draws
+	// (SRANDMEMBER no-count). A connection is served by one goroutine at a time, so advancing
+	// it needs no lock, and keeping it per-connection means concurrent draws against one hot
+	// key no longer share the engine's per-shard PRNG under an exclusive lock: the draw takes
+	// only the shard read lock and this word (spec 2064/19 slice 1). Seeded once at accept from
+	// the connection id so two connections draw independent sequences.
+	rngState  uint64
 	argv      [][]byte
 	vbuf      []byte    // reused destination for GET/MGET value copies
 	kbuf      []byte    // reused scratch for building composite collection element keys
@@ -385,6 +392,25 @@ func indexByte(b []byte, c byte) int {
 // no error to record: a byte slice append never fails, and the one flush per drain is
 // where a socket error surfaces. The driver owns c.out's lifetime and resets it after
 // each flush.
+// seedConnRNG returns a distinct non-zero splitmix64 seed for a connection from its id, the
+// same distinct-odd-constant scheme the engine's per-shard PRNG uses, so two connections never
+// draw the same sequence and no connection is seeded to zero.
+func seedConnRNG(id int64) uint64 {
+	return 0x9e3779b97f4a7c15 * (uint64(id)*2 + 1)
+}
+
+// nextRand advances this connection's private splitmix64 PRNG and returns the next word. It is
+// called only on the connection's own serving goroutine, so it needs no lock; the word feeds
+// the shard-read-lock draw in CollRandSelect so a no-count SRANDMEMBER never touches a shared
+// counter (spec 2064/19 slice 1).
+func (c *connState) nextRand() uint64 {
+	c.rngState += 0x9e3779b97f4a7c15
+	z := c.rngState
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
+
 func (c *connState) writeSimple(s string) {
 	c.out = append(c.out, '+')
 	c.out = append(c.out, s...)

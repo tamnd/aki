@@ -3,6 +3,7 @@ package f1raw
 import (
 	"math/bits"
 	"sync"
+	"sync/atomic"
 )
 
 // The dense member vector is the set type's second resident structure, the one that
@@ -48,11 +49,33 @@ import (
 //
 // Concurrency. Vectors live in a striped map keyed by the collection's byte prefix, so two
 // sets' vectors are independent and a hot set's draws contend only with that set's own
-// writers, which the server's per-key stripe lock already serializes. A shard's mutex
-// guards its map and every memberVec in it. The lock order is stripe lock (server, per key)
-// then vector shard mutex then oindex mutex; a draw takes only the shard mutex, a mutating
-// command holds its stripe lock and takes the shard mutex under it, and the ordered-index
-// folder takes only oi.mu, so the three never form a cycle.
+// writers, which the server's per-key stripe lock already serializes. The non-destructive draw
+// is lock-free (spec 2064/19 slice 1): the shard publishes its prefix map through an atomic
+// pointer and each memberVec publishes its slots slice through an atomic pointer, so a draw
+// atomic-loads the map snapshot, indexes it to the vector, atomic-loads the vector's slots
+// snapshot, and reads one slot, touching no lock and writing no shared cache line. That is what
+// lets many concurrent draws against one hot set scale across cores: an RWMutex read lock would
+// still bounce a single shared reader counter and cap the draw, which a measurement confirmed,
+// so the read path takes no lock at all. The draw takes a caller-supplied random word (the
+// server's per-connection splitmix64) so two draws never share a counter either.
+//
+// Every mutation still serializes on the shard's write mutex: add, remove, the lazy first-draw
+// build, the destructive SPOP draw that swap-removes, and the rare structural change (a new set's
+// first vector, a dropped set). A structural change copies the shard's prefix map and atomically
+// swaps the pointer (copy-on-write), which is cheap because it is per-set-lifecycle, not per-op,
+// and a shard holds few sets. An add or remove mutates its memberVec's working slots and back
+// index under the mutex and republishes the slots snapshot. The lock order is stripe lock
+// (server, per key) then vector shard mutex then oindex mutex; the ordered-index folder takes
+// only oi.mu, so the three never form a cycle.
+//
+// Because reads are lock-free, a draw and a concurrent write on one key are not ordered against
+// each other: a draw may return a member a concurrent SREM or SPOP is removing, or miss one a
+// concurrent SADD is adding. This is the same arbitrary order two clients' commands have under
+// Redis, which serializes on one thread but gives no cross-client happens-before, so the drawn
+// offset always resolves to valid arena bytes and the relaxation changes nothing a client can
+// rely on. This is the single-hot-key read fix's first slice; it scales the read draw but not the
+// write path, which SPOP/SADD/SREM still serialize on one key, the target of the intra-key
+// partitioning in spec 2064/19.
 
 // randVecShards is the number of independent stripes the vector map is split into. It is a
 // power of two so a prefix hash maps to a shard with a mask, and it is sized well above the
@@ -60,41 +83,73 @@ import (
 // effectively a per-set lock the server's stripe lock already implies.
 const randVecShards = 256
 
+// vecSlots is an immutable snapshot header a reader loads to draw. It carries the slots
+// slice a memberVec published under the write lock; a reader atomic-loads the pointer, so it
+// reads a consistent (backing, len) pair in one go rather than a torn three-word slice header,
+// then indexes it with no lock. The backing array a snapshot points at is never freed while a
+// reader holds the snapshot (the arena of offsets is grow-only and the slice keeps it alive),
+// so an index into it always resolves.
+type vecSlots struct {
+	s []uint64
+}
+
 // memberVec is one set's dense vector plus its back-index. slots holds the arena offsets of
 // the set's live member rows with no holes, so len(slots) is the cardinality and slots[i]
 // is a uniform random member for i drawn in [0, len). back maps an offset to its slot so a
 // remove finds the victim's slot in O(1) rather than scanning. The invariant after every
 // operation is len(slots) == len(back) and back[slots[i]] == i for all i.
+//
+// view is the atomically-published read snapshot of slots. Every mutation republishes it
+// (publish, below) under the shard write lock, and a draw loads it lock-free (spec 2064/19
+// slice 1). slots and back are the writer's working copies, touched only under the write
+// lock; readers never look at them, only at view.
 type memberVec struct {
+	view  atomic.Pointer[vecSlots]
 	slots []uint64
 	back  map[uint64]int
 }
 
 func newMemberVec(capHint int) *memberVec {
-	return &memberVec{
+	v := &memberVec{
 		slots: make([]uint64, 0, capHint),
 		back:  make(map[uint64]int, capHint),
 	}
+	v.publish()
+	return v
 }
 
-// add appends off as a new member. It is idempotent against a duplicate offset: an offset
-// is unique per live record and a re-added member is a fresh record at a new offset, so a
-// duplicate should never occur, but skipping one keeps a stray double-call from corrupting
-// the density invariant rather than silently biasing the draw toward the doubled member.
+// publish stores the current slots slice as the read snapshot. It is called under the shard
+// write lock after every mutation, so a lock-free draw always loads a slots view that is a
+// valid dense vector (every slot a live member offset). The published slice shares the
+// writer's backing array; a reader that loaded an older snapshot keeps its own backing alive
+// through the slice, so a concurrent append that reallocates does not disturb it.
+func (v *memberVec) publish() {
+	v.view.Store(&vecSlots{s: v.slots})
+}
+
+// add appends off as a new member and republishes the read snapshot. It is idempotent against
+// a duplicate offset: an offset is unique per live record and a re-added member is a fresh
+// record at a new offset, so a duplicate should never occur, but skipping one keeps a stray
+// double-call from corrupting the density invariant rather than silently biasing the draw
+// toward the doubled member.
 func (v *memberVec) add(off uint64) {
 	if _, ok := v.back[off]; ok {
 		return
 	}
 	v.back[off] = len(v.slots)
 	v.slots = append(v.slots, off)
+	v.publish()
 }
 
-// remove swap-drops the member at off and reports whether it was present. It reads the
-// victim's slot from back, moves the last slot's offset into the hole, fixes the moved
-// offset's back-index entry, shortens by one, and deletes the victim's entry. When the
-// victim is itself the last slot the move is a self-assignment and harmless. It is O(1)
-// and touches only the one moved member's slot, which is what keeps a delete burst O(k)
-// rather than O(k*n).
+// remove swap-drops the member at off, republishes the read snapshot, and reports whether it
+// was present. It reads the victim's slot from back, moves the last slot's offset into the
+// hole, fixes the moved offset's back-index entry, shortens by one, and deletes the victim's
+// entry. When the victim is itself the last slot the move is a self-assignment and harmless.
+// It is O(1) and touches only the one moved member's slot, which is what keeps a delete burst
+// O(k) rather than O(k*n). A lock-free draw that loaded the pre-remove snapshot may still draw
+// the just-removed member for one more read; that is the same benign race two clients running
+// SREM and SRANDMEMBER against one key have under Redis's arbitrary cross-client order, and the
+// returned offset still resolves to valid arena bytes.
 func (v *memberVec) remove(off uint64) bool {
 	i, ok := v.back[off]
 	if !ok {
@@ -106,18 +161,32 @@ func (v *memberVec) remove(off uint64) bool {
 	v.back[moved] = i
 	v.slots = v.slots[:last]
 	delete(v.back, off)
+	v.publish()
 	return true
 }
 
-// randVecShard is one stripe of the vector map: a mutex, the prefix-keyed vectors it holds,
-// and a per-shard PRNG for the uniform draw. The PRNG is a splitmix64 counter mixed on each
-// draw, seeded distinctly per shard so two shards do not draw identical sequences; it needs
-// no lock beyond the shard mutex already held for the draw and no global rand source, so a
-// draw allocates nothing and touches no shared counter.
+// vecMap is one shard's immutable prefix-to-vector map snapshot. A structural change (a new
+// set's first vector, a dropped set) copies it under the write mutex and swaps the pointer, so
+// a lock-free draw loads a consistent map without a lock and a writer never mutates a map a
+// reader is walking (copy-on-write).
+type vecMap struct {
+	m map[string]*memberVec
+}
+
+// randVecShard is one stripe of the vector map: a write mutex the mutations serialize on, an
+// atomically-published prefix-to-vector map the lock-free draw loads, and a per-shard PRNG the
+// destructive draw uses. The non-destructive draw (CollRandSelect) takes no lock: it loads the
+// map snapshot and the target vector's slots snapshot through atomic pointers, so concurrent
+// draws on one hot set scale across cores instead of serializing on a lock or a shared reader
+// counter (spec 2064/19 slice 1). Every mutation (add, remove, the lazy build, a destructive
+// draw, a put or drop) takes the write mutex. The per-shard PRNG is a splitmix64 counter mixed
+// on each draw, seeded distinctly per shard; it is advanced only under the write mutex (by the
+// destructive draw), so the read path never touches it and instead takes a caller-supplied
+// random word, which is what keeps concurrent read draws off any shared counter.
 type randVecShard struct {
-	mu  sync.Mutex
-	m   map[string]*memberVec
-	rng uint64
+	mu   sync.Mutex
+	view atomic.Pointer[vecMap]
+	rng  uint64
 }
 
 // randVec is the store's whole set-random-access structure: a fixed array of shards. It is
@@ -144,23 +213,61 @@ func (rv *randVec) shardFor(prefix []byte) *randVecShard {
 	return &rv.shards[hash(prefix)&(randVecShards-1)]
 }
 
-// get returns the vector for prefix, or nil if the shard has none. The shard map is created
-// lazily on the first put, so a shard that has never held a vector reads as a nil map, which
-// returns the zero value without allocating. The caller holds the shard mutex.
+// get returns the vector for prefix, or nil if the shard has none. It loads the atomically-
+// published map snapshot, so it is safe with no lock (the draw's fast path) and equally safe
+// under the write mutex (the mutation paths). A shard that has never held a vector reads as a
+// nil snapshot, which returns the zero value without allocating.
 func (sh *randVecShard) get(prefix []byte) *memberVec {
-	if sh.m == nil {
+	vm := sh.view.Load()
+	if vm == nil {
 		return nil
 	}
-	return sh.m[string(prefix)]
+	return vm.m[string(prefix)]
 }
 
-// put installs v under prefix, creating the shard map on first use so an untouched shard
-// costs nothing. The caller holds the shard mutex.
+// put installs v under prefix by copy-on-write: it copies the current map, adds the entry, and
+// atomically swaps the pointer, so a concurrent lock-free draw walks either the old or the new
+// map, never a half-updated one. The caller holds the shard write mutex, so two puts do not
+// race to copy. The copy is O(sets in this shard), which is small because the map is striped
+// 256 ways, and a put happens once per set's first draw, not per draw.
 func (sh *randVecShard) put(prefix []byte, v *memberVec) {
-	if sh.m == nil {
-		sh.m = make(map[string]*memberVec)
+	old := sh.view.Load()
+	nm := make(map[string]*memberVec, mapLen(old)+1)
+	if old != nil {
+		for k, vv := range old.m {
+			nm[k] = vv
+		}
 	}
-	sh.m[string(prefix)] = v
+	nm[string(prefix)] = v
+	sh.view.Store(&vecMap{m: nm})
+}
+
+// drop removes prefix's vector by the same copy-on-write swap, a no-op when the shard has no
+// such vector. The caller holds the shard write mutex.
+func (sh *randVecShard) drop(prefix []byte) {
+	old := sh.view.Load()
+	if old == nil {
+		return
+	}
+	if _, ok := old.m[string(prefix)]; !ok {
+		return
+	}
+	nm := make(map[string]*memberVec, len(old.m))
+	for k, vv := range old.m {
+		if k == string(prefix) {
+			continue
+		}
+		nm[k] = vv
+	}
+	sh.view.Store(&vecMap{m: nm})
+}
+
+// mapLen is the entry count of a possibly-nil map snapshot, used only to size a copy.
+func mapLen(vm *vecMap) int {
+	if vm == nil {
+		return 0
+	}
+	return len(vm.m)
 }
 
 // next draws the next splitmix64 value from the shard's PRNG. The caller holds the shard
@@ -179,6 +286,16 @@ func (sh *randVecShard) next() uint64 {
 // takes, and it is one multiply where a modulo would be a divide. n must be positive.
 func (sh *randVecShard) drawIndex(n int) int {
 	hi, _ := bits.Mul64(sh.next(), uint64(n))
+	return int(hi)
+}
+
+// drawIndexWord is the same Lemire multiply-shift reduction as drawIndex but on a random word
+// the caller supplies instead of the shard's PRNG, so a read draw holding only the shard read
+// lock can pick a uniform index without advancing any shared counter. r is one random 64-bit
+// word from the caller's own PRNG (the server's per-connection splitmix64), and n must be
+// positive.
+func drawIndexWord(r uint64, n int) int {
+	hi, _ := bits.Mul64(r, uint64(n))
 	return int(hi)
 }
 
@@ -267,22 +384,42 @@ func (s *Store) CollRandRemove(prefix, key []byte, kind byte) bool {
 // subslice of the immutable arena, valid for the store's life, so the caller reads it
 // without copying and re-resolves the value (a set member has none) or returns it directly.
 // It is the non-destructive draw behind SRANDMEMBER no-count.
-func (s *Store) CollRandSelect(prefix []byte) (key []byte, ok bool) {
+//
+// r is one random 64-bit word from the caller's own PRNG (the server's per-connection
+// splitmix64), which is what lets the common case take no lock at all: many draws against one
+// hot set run in parallel, each atomic-loading the vector's slots snapshot and picking its slot
+// from its own random word, with no lock and no shared counter to serialize on (spec 2064/19
+// slice 1). Only the first draw against a set, when no vector exists yet, takes the write mutex
+// to build it, and that build happens once.
+func (s *Store) CollRandSelect(prefix []byte, r uint64) (key []byte, ok bool) {
 	sh := s.rvec.shardFor(prefix)
+	// Fast path: the vector already exists, so the whole draw is lock-free. get loads the map
+	// snapshot atomically, and view.Load reads a consistent slots snapshot, so a concurrent
+	// mutation that republishes either pointer cannot tear this read.
+	if v := sh.get(prefix); v != nil {
+		vs := v.view.Load()
+		n := len(vs.s)
+		if n == 0 {
+			return nil, false
+		}
+		return s.keyAt(vs.s[drawIndexWord(r, n)]), true
+	}
+
+	// No vector yet: build it under the write mutex. Re-check after taking the mutex so two
+	// concurrent first-draws build only once (the loser finds the winner's vector present).
 	sh.mu.Lock()
 	v := sh.get(prefix)
 	if v == nil {
 		v = s.deriveOnFirstDraw(prefix)
 		sh.put(prefix, v)
 	}
-	n := len(v.slots)
+	sh.mu.Unlock()
+	vs := v.view.Load()
+	n := len(vs.s)
 	if n == 0 {
-		sh.mu.Unlock()
 		return nil, false
 	}
-	off := v.slots[sh.drawIndex(n)]
-	sh.mu.Unlock()
-	return s.keyAt(off), true
+	return s.keyAt(vs.s[drawIndexWord(r, n)]), true
 }
 
 // CollRandSelectRemove draws a uniform random live member and swap-removes it from the
@@ -334,7 +471,7 @@ func (s *Store) CollRandEnsure(prefix []byte) {
 func (s *Store) CollRandDrop(prefix []byte) {
 	sh := s.rvec.shardFor(prefix)
 	sh.mu.Lock()
-	delete(sh.m, string(prefix))
+	sh.drop(prefix)
 	sh.mu.Unlock()
 }
 
