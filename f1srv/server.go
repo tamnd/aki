@@ -84,6 +84,15 @@ type Server struct {
 	incrMu   []sync.RWMutex
 	incrMask uint32
 
+	// forceP forces the partition count P every set command routes through, the slice-3 test and
+	// microbench hook for intra-key set partitioning (spec 2064/f1_rewrite_ltm/19). It is 0 in
+	// production, so partitionsFor returns P=1 after one atomic load and the set point commands run
+	// their existing unpartitioned bodies untouched. A test or a contention microbenchmark stores a
+	// power of two here to exercise and measure the routed partition path before the adaptive engage
+	// transition (slice 6) exists to grow a hot set to P>1 on its own. It is read on the hot path and
+	// written only in tests, so it is an atomic rather than a plain field.
+	forceP atomic.Int64
+
 	// execModel is the resolved command-execution model (spec 2064/17), parsed once from
 	// cfg.ExecModel in New. execShards is the shard count the affinity model routes over,
 	// GOMAXPROCS so one shard maps to one worker core. Both are read-only after New. The

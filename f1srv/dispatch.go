@@ -1303,6 +1303,29 @@ func (s *Server) stripe(key []byte) uint32 {
 	return uint32(h) & s.incrMask
 }
 
+// stripePart maps (key, partition) to one of the INCR-family lock stripes, the per-partition
+// lock a routed set command takes so P partitions of one hot key spread across the stripe table
+// (spec 2064/f1_rewrite_ltm/19 slice 3). It is the same FNV-1a word-at-a-time mix as stripe with
+// one extra partition byte folded in, so distinct partitions of one key hash to a spread of stripes
+// and, at the same partition value, always the same stripe. Partitioning does not depend on any
+// partition stripe differing from the whole-key stripe(key): a routed single-member op holds only
+// its one partition lock at a time and setBumpCard creates a header under stripe(key) with no
+// partition lock held, so no path ever nests two of these locks and a coincidence between a
+// partition stripe and the whole-key stripe costs at most a little extra serialization, never a
+// deadlock. On a finite stripe table (incrMask+1 stripes) such coincidences are inherent and
+// harmless. It draws from the shared incrMu array, so a partitioned set and every other
+// stripe-locked writer coexist on one lock table.
+func (s *Server) stripePart(key []byte, part int) uint32 {
+	var h uint64 = 1469598103934665603
+	for _, b := range key {
+		h ^= uint64(b)
+		h *= 1099511628211
+	}
+	h ^= uint64(byte(part))
+	h *= 1099511628211
+	return uint32(h) & s.incrMask
+}
+
 // eqFold reports whether b equals the ASCII command name s case-insensitively,
 // without allocating.
 func eqFold(b []byte, s string) bool {
