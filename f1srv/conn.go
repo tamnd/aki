@@ -55,6 +55,7 @@ type connState struct {
 	vbuf      []byte    // reused destination for GET/MGET value copies
 	kbuf      []byte    // reused scratch for building composite collection element keys
 	pbuf      []byte    // reused scratch for a collection enumeration prefix, held across a scan
+	ppbuf     []byte    // reused scratch for a partition-scan prefix uvarint(len)|skey|<byte>, last byte rewritten per partition by the weighted draw
 	sbuf      []byte    // reused scratch for formatting a float score reply (ZSCORE/ZINCRBY)
 	zscores   []float64 // reused scratch for a ZADD's parsed scores, one per score-member pair
 	zkeys     [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
