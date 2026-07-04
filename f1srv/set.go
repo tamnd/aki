@@ -530,6 +530,10 @@ func (c *connState) cmdSCard(argv [][]byte) {
 // because every SADD pairs CollInsert with a count bump and every SREM pairs CollRemove
 // with a decrement, so the framed length always matches what is streamed.
 func (c *connState) streamSet(skey []byte) {
+	if p := c.partitionsFor(skey); p > 1 {
+		c.streamSetPart(skey, p)
+		return
+	}
 	mu := &c.srv.incrMu[c.srv.stripe(skey)]
 	// A whole-set read only excludes concurrent SADD/SREM writers, not other readers, so it
 	// takes the shared lock and lets many SMEMBERS of one hot set run on many cores at once, a
@@ -562,6 +566,109 @@ func (c *connState) streamSet(skey []byte) {
 		after = last
 	}
 	mu.RUnlock()
+}
+
+// streamSetPart is the SMEMBERS body for a partitioned set (spec 2064/f1_rewrite_ltm/19 section
+// 6.7). One large logical set is stored as P partitions, and because the partition byte sits
+// between the length-prefixed set key and the member (appendPartMemberKey), the whole-set prefix
+// bounds every partition's rows in one contiguous ordered run in (partition, member) order. So a
+// single walk of that prefix sweeps all P partitions with no per-partition scan, the same total
+// work as the unpartitioned walk, just crossing partition boundaries transparently.
+//
+// A whole-set read must exclude the partitioned member writers so a row cannot be removed and its
+// arena offset reused while this streams it, exactly the protection the unpartitioned path gets
+// from the whole-key stripe RLock. The partitioned writers take per-partition stripe write locks
+// (cmdSAddPart/cmdSRemPart), so this read-locks all P partition stripes, deduplicated because two
+// partitions can hash to one stripe and recursive read-locking one RWMutex can deadlock a waiting
+// writer. Under those held read locks the member rows are frozen.
+//
+// The array is framed from a counting pass, not the header count: a partitioned write bumps the
+// shared cardinality with a lock-free CountAddInt64 only after it releases its partition lock
+// (setBumpCard), so the header count can momentarily lag the actual rows even with the writers
+// excluded. Framing from a first pass that counts the frozen rows and streaming them in a second
+// pass guarantees the framed length equals the number of members emitted. The member starts one
+// byte past the whole-set prefix because the partition byte precedes it, so it strips plen+1.
+func (c *connState) streamSetPart(skey []byte, p int) {
+	if c.stringConflict(skey) {
+		c.writeErr(wrongType)
+		return
+	}
+	stripes := c.lockSetPartitionsShared(skey, p)
+	defer c.unlockSetPartitionsShared(stripes)
+
+	prefix := c.setPrefix(skey)
+	moff := len(prefix) + 1
+	scan := make([][]byte, 0, hashScanBatch)
+
+	// Pass 1: count the frozen member rows so the frame matches exactly what pass 2 streams.
+	var n int
+	var after []byte
+	for {
+		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
+		if len(keys) == 0 {
+			break
+		}
+		n += len(keys)
+		if last == nil {
+			break
+		}
+		after = last
+	}
+	c.writeArrayHeader(n)
+
+	// Pass 2: stream the same rows, stripping the partition byte to recover each member.
+	after = nil
+	for {
+		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
+		if len(keys) == 0 {
+			break
+		}
+		for _, k := range keys {
+			c.writeBulk(k[moff:])
+		}
+		if last == nil {
+			break
+		}
+		after = last
+	}
+}
+
+// lockSetPartitionsShared read-locks every distinct stripe the P partitions of skey route to and
+// returns them so the caller unlocks in reverse (spec 2064/f1_rewrite_ltm/19 section 7). A whole-set
+// read of a partitioned set takes the shared side so many readers of one hot set still run at once,
+// while excluding the partitioned member writers that hold the partition stripe write lock. The
+// stripe set is deduplicated because stripePart can map two partitions to one stripe and recursively
+// read-locking a single RWMutex can deadlock against a waiting writer. Distinct readers taking only
+// shared locks never deadlock regardless of order, and a partitioned writer holds just one stripe
+// write lock at a time with nothing else held while it waits, so no lock-order cycle is possible and
+// no sort of the stripes is needed.
+func (c *connState) lockSetPartitionsShared(skey []byte, p int) []uint32 {
+	stripes := make([]uint32, 0, p)
+	for part := 0; part < p; part++ {
+		s := c.srv.stripePart(skey, part)
+		dup := false
+		for _, e := range stripes {
+			if e == s {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			stripes = append(stripes, s)
+		}
+	}
+	for _, s := range stripes {
+		c.srv.incrMu[s].RLock()
+	}
+	return stripes
+}
+
+// unlockSetPartitionsShared releases the shared partition-stripe locks lockSetPartitionsShared took,
+// in reverse acquisition order.
+func (c *connState) unlockSetPartitionsShared(stripes []uint32) {
+	for i := len(stripes) - 1; i >= 0; i-- {
+		c.srv.incrMu[stripes[i]].RUnlock()
+	}
 }
 
 func (c *connState) cmdSMembers(argv [][]byte) {
@@ -649,10 +756,19 @@ func (c *connState) cmdSScan(argv [][]byte) {
 	scan := make([][]byte, 0, initCap)
 	keys, last := c.srv.store.CollScan(prefix, after, count, scan)
 
-	plen := len(prefix)
+	// The whole-set prefix bounds every partition's rows in (partition, member) order, so one
+	// bounded window naturally crosses partition boundaries and the opaque cursor (the hex of the
+	// last composite key, which carries the partition byte) resumes into the next partition with no
+	// special cursor layout. For a partitioned set the member sits one byte past the prefix because
+	// the partition byte precedes it, so both the MATCH filter and the reply strip plen+1 (spec
+	// 2064/f1_rewrite_ltm/19 section 6.8).
+	moff := len(prefix)
+	if c.partitionsFor(skey) > 1 {
+		moff++
+	}
 	matched := keys[:0]
 	for _, k := range keys {
-		if pattern != nil && !globMatch(pattern, k[plen:]) {
+		if pattern != nil && !globMatch(pattern, k[moff:]) {
 			continue
 		}
 		matched = append(matched, k)
@@ -669,7 +785,7 @@ func (c *connState) cmdSScan(argv [][]byte) {
 	c.writeBulk(cursor)
 	c.writeArrayHeader(len(matched))
 	for _, k := range matched {
-		c.writeBulk(k[plen:])
+		c.writeBulk(k[moff:])
 	}
 }
 
