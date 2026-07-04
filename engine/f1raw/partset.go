@@ -43,6 +43,18 @@ func partOf(member []byte, p int) int {
 	return int(hash(member) & uint64(p-1))
 }
 
+// PartitionOf is the exported entry the server's command layer calls to route a member to its
+// partition under partition count p, hash(member) & (p-1). It uses the same store hash the ordered
+// index uses, so a member the server routes to a partition-prefixed key here lands in the same
+// partition a later derivePartVec scan of that prefix range rebuilds, and a routed probe finds the
+// row a routed write left. p must be a power of two in [1, 256]; p==1 routes every member to
+// partition 0, the unpartitioned set. It is the only piece of partition routing the server cannot
+// compute itself, because the store hash is unexported; the server builds the partition key and
+// takes the partition lock on its own side.
+func PartitionOf(member []byte, p int) int {
+	return partOf(member, p)
+}
+
 // appendPartPrefix appends the bounding prefix for one partition of set skey under partition
 // count p. For p==1 it is uvarint(len(skey)) | skey, byte-identical to the unpartitioned set
 // prefix, so a P=1 set scans exactly as it does today. For p>1 it is uvarint(len(skey)) | skey |

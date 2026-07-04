@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"math/bits"
 	"math/rand/v2"
+
+	"github.com/tamnd/aki/engine/f1raw"
 )
 
 // Set is the second collection type on f1raw, and like the hash it is element-per-row:
@@ -169,6 +171,157 @@ func setHeaderDecodeP(v []byte) (count uint64, enc byte, p int, ok bool) {
 	return count, enc, p, true
 }
 
+// partitionsFor reports the partition count P every set command routes key skey through
+// (spec 2064/f1_rewrite_ltm/19 slice 3). It reads the server's forceP hook with one atomic
+// load: forceP is 0 in production so the common path returns P=1 after a single load and takes
+// the unpartitioned body byte-for-byte, and the slice-3 correctness test and contention
+// microbenchmark set forceP to drive the four routed commands through P>1. The header-driven
+// per-key P a recovering set carries in its meta row is deferred to the adaptive engage in
+// slice 6; until then partitioning engages only under the test hook, so every served set is P=1
+// and behaves exactly as it does today.
+func (c *connState) partitionsFor(skey []byte) int {
+	if p := int(c.srv.forceP.Load()); p > 1 {
+		return p
+	}
+	return 1
+}
+
+// partMemberKey builds the partition-routed composite element key for (skey, member) into the
+// reused scratch buffer, mirroring memberKey but inserting the one partition byte between the
+// length-prefixed set key and the member when p>1. For p==1 it is byte-identical to memberKey, so
+// the routed path and the unpartitioned path address the same row for an unpartitioned set. The
+// bytes match f1raw.appendPartMemberKey exactly, so a key this builds under partition part is the
+// key a later derivePartVec scan of part's prefix range rebuilds and a routed probe resolves. The
+// caller supplies part (already computed once via f1raw.PartitionOf) so a write and its later
+// lookup never recompute a possibly-different partition.
+func (c *connState) partMemberKey(skey, member []byte, part, p int) []byte {
+	b := c.kbuf[:0]
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(len(skey)))
+	b = append(b, tmp[:n]...)
+	b = append(b, skey...)
+	if p > 1 {
+		b = append(b, byte(part))
+	}
+	b = append(b, member...)
+	c.kbuf = b
+	return b
+}
+
+// setBumpCard adjusts a set's maintained cardinality by delta under the partitioned write paths.
+// The count stays a single whole-key header word (slice 3 keeps one cardinality per set; the
+// per-partition counts of partSet arrive with slice 4's draw), so a routed write bumps it with one
+// in-place atomic (CountAddInt64) that never takes a whole-key lock in the common case: the header
+// already exists once a set has any member. Only the first add to an empty set finds no header, and
+// only then does it take the whole-key stripe lock to create one, recording P via setHeaderEncodeP
+// with the hashtable encoding a partitioned set always reports (section 6.11). A drain to zero
+// deletes the header so an empty set stops existing. The whole-key stripe is distinct from every
+// partition stripe (stripePart always folds one extra byte), so this create never contends with a
+// concurrent routed member write on a partition lock.
+func (c *connState) setBumpCard(skey []byte, delta, p int) {
+	if n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, int64(delta)); ok {
+		if n <= 0 {
+			c.srv.store.DeleteKind(skey, kindSetMeta)
+		}
+		return
+	}
+	mu := &c.srv.incrMu[c.srv.stripe(skey)]
+	mu.Lock()
+	if n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, int64(delta)); ok {
+		if n <= 0 {
+			c.srv.store.DeleteKind(skey, kindSetMeta)
+		}
+	} else if delta > 0 {
+		hdr := setHeaderEncodeP(nil, uint64(delta), encHashtable, p)
+		_, _ = c.srv.store.PutKind(skey, hdr, kindSetMeta)
+	}
+	mu.Unlock()
+}
+
+// cmdSAddPart is the P>1 routing of SADD (spec 2064/f1_rewrite_ltm/19 slice 3): each member routes
+// to partition f1raw.PartitionOf(member, p) and the add takes only that partition's stripe lock,
+// held across just this one member, so two members in different partitions of one hot key add on
+// two cores at once instead of serializing on the set's single stripe. The members process
+// sequentially with no two partition locks held at once (section 7 lock ordering), and the shared
+// cardinality is bumped once after the loop off any partition lock. The dense per-partition draw
+// vector is not maintained here; slice 4 derives it on first draw, so this path does only the row
+// insert, the ordered-index insert, and the count bump.
+func (c *connState) cmdSAddPart(skey []byte, members [][]byte, p int) {
+	added := 0
+	for _, member := range members {
+		part := f1raw.PartitionOf(member, p)
+		mu := &c.srv.incrMu[c.srv.stripePart(skey, part)]
+		mu.Lock()
+		mk := c.partMemberKey(skey, member, part, p)
+		isNew, err := c.srv.store.PutKind(mk, nil, kindSetMember)
+		if err != nil {
+			mu.Unlock()
+			c.writeErr("ERR " + err.Error())
+			return
+		}
+		if isNew {
+			c.srv.store.CollInsert(mk, kindSetMember)
+			added++
+		}
+		mu.Unlock()
+	}
+	if added > 0 {
+		c.setBumpCard(skey, added, p)
+	}
+	c.writeInt(int64(added))
+}
+
+// cmdSRemPart is the P>1 routing of SREM: each member routes to its partition and the remove takes
+// only that partition's lock, held across just this member. It mirrors cmdSRem's deferred index
+// splice, batching removed keys packed end to end, but the splice is issued per partition so the
+// batch never mixes partitions. The shared cardinality is decremented once after the loop.
+func (c *connState) cmdSRemPart(skey []byte, members [][]byte, p int) {
+	removed := 0
+	for _, member := range members {
+		part := f1raw.PartitionOf(member, p)
+		mu := &c.srv.incrMu[c.srv.stripePart(skey, part)]
+		mu.Lock()
+		mk := c.partMemberKey(skey, member, part, p)
+		if c.srv.store.DeleteKind(mk, kindSetMember) {
+			c.srv.store.CollRemove(mk)
+			removed++
+		}
+		mu.Unlock()
+	}
+	if removed > 0 {
+		c.setBumpCard(skey, -removed, p)
+	}
+	c.writeInt(int64(removed))
+}
+
+// cmdSIsMemberPart is the P>1 routing of SISMEMBER: the member routes to its partition and the
+// probe is a single lock-free index lookup on the partition-routed key, exactly as the
+// unpartitioned probe is, since a read never contends with a partition write.
+func (c *connState) cmdSIsMemberPart(skey, member []byte, p int) {
+	part := f1raw.PartitionOf(member, p)
+	mk := c.partMemberKey(skey, member, part, p)
+	if c.srv.store.ExistsKind(mk, kindSetMember) {
+		c.writeInt(1)
+		return
+	}
+	c.writeInt(0)
+}
+
+// cmdSMIsMemberPart is the P>1 routing of SMISMEMBER: each member routes to its partition and gets
+// one lock-free probe, framed by the same array header the unpartitioned path writes.
+func (c *connState) cmdSMIsMemberPart(skey []byte, members [][]byte, p int) {
+	c.writeArrayHeader(len(members))
+	for _, member := range members {
+		part := f1raw.PartitionOf(member, p)
+		mk := c.partMemberKey(skey, member, part, p)
+		if c.srv.store.ExistsKind(mk, kindSetMember) {
+			c.writeInt(1)
+			continue
+		}
+		c.writeInt(0)
+	}
+}
+
 func (c *connState) cmdSAdd(argv [][]byte) {
 	// SADD key member [member ...]
 	if len(argv) < 3 {
@@ -176,6 +329,14 @@ func (c *connState) cmdSAdd(argv [][]byte) {
 		return
 	}
 	skey := argv[1]
+	if p := c.partitionsFor(skey); p > 1 {
+		if c.stringConflict(skey) {
+			c.writeErr(wrongType)
+			return
+		}
+		c.cmdSAddPart(skey, argv[2:], p)
+		return
+	}
 	mu := &c.srv.incrMu[c.srv.stripe(skey)]
 	mu.Lock()
 	if c.stringConflict(skey) {
@@ -227,6 +388,14 @@ func (c *connState) cmdSRem(argv [][]byte) {
 		return
 	}
 	skey := argv[1]
+	if p := c.partitionsFor(skey); p > 1 {
+		if c.stringConflict(skey) {
+			c.writeErr(wrongType)
+			return
+		}
+		c.cmdSRemPart(skey, argv[2:], p)
+		return
+	}
 	mu := &c.srv.incrMu[c.srv.stripe(skey)]
 	mu.Lock()
 	if c.stringConflict(skey) {
@@ -280,6 +449,10 @@ func (c *connState) cmdSIsMember(argv [][]byte) {
 		c.writeErr("ERR wrong number of arguments for 'sismember' command")
 		return
 	}
+	if p := c.partitionsFor(argv[1]); p > 1 {
+		c.cmdSIsMemberPart(argv[1], argv[2], p)
+		return
+	}
 	mk := c.memberKey(argv[1], argv[2])
 	if c.srv.store.ExistsKind(mk, kindSetMember) {
 		c.writeInt(1)
@@ -292,6 +465,10 @@ func (c *connState) cmdSMIsMember(argv [][]byte) {
 	// SMISMEMBER key member [member ...]
 	if len(argv) < 3 {
 		c.writeErr("ERR wrong number of arguments for 'smismember' command")
+		return
+	}
+	if p := c.partitionsFor(argv[1]); p > 1 {
+		c.cmdSMIsMemberPart(argv[1], argv[2:], p)
 		return
 	}
 	c.writeArrayHeader(len(argv) - 2)
