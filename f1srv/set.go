@@ -186,6 +186,24 @@ func (c *connState) partitionsFor(skey []byte) int {
 	return 1
 }
 
+// partScanBase builds the partition-scan prefix uvarint(len(skey))|skey|<byte> into the reusable
+// ppbuf, distinct from the memberKey scratch (kbuf) and the enumeration prefix (pbuf) so it stays
+// stable while a member key is built alongside it in the routed write loop. The final byte is a
+// placeholder the caller rewrites to a partition id (the routed writes) or the store's weighted
+// draw rewrites per partition (the routed reads); because its length equals a partition prefix,
+// the member of a draw key returned against it sits at k[len(base):]. It is built only on the P>1
+// path, so the partition byte is always present (an unpartitioned set never calls this).
+func (c *connState) partScanBase(skey []byte) []byte {
+	b := c.ppbuf[:0]
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(len(skey)))
+	b = append(b, tmp[:n]...)
+	b = append(b, skey...)
+	b = append(b, 0)
+	c.ppbuf = b
+	return b
+}
+
 // partMemberKey builds the partition-routed composite element key for (skey, member) into the
 // reused scratch buffer, mirroring memberKey but inserting the one partition byte between the
 // length-prefixed set key and the member when p>1. For p==1 it is byte-identical to memberKey, so
@@ -243,11 +261,15 @@ func (c *connState) setBumpCard(skey []byte, delta, p int) {
 // held across just this one member, so two members in different partitions of one hot key add on
 // two cores at once instead of serializing on the set's single stripe. The members process
 // sequentially with no two partition locks held at once (section 7 lock ordering), and the shared
-// cardinality is bumped once after the loop off any partition lock. The dense per-partition draw
-// vector is not maintained here; slice 4 derives it on first draw, so this path does only the row
-// insert, the ordered-index insert, and the count bump.
+// cardinality is bumped once after the loop off any partition lock. When a partition's draw vector
+// has already been built (a draw has run against that partition), the new member is spliced into it
+// under the partition lock via CollRandInsert so a later draw sees it; a partition never yet drawn
+// from has no vector and stays lazy, deriving on its first draw. The base prefix is built once and
+// its final byte rewritten per member, so the whole add allocates no per-member prefix.
 func (c *connState) cmdSAddPart(skey []byte, members [][]byte, p int) {
 	added := 0
+	base := c.partScanBase(skey)
+	last := len(base) - 1
 	for _, member := range members {
 		part := f1raw.PartitionOf(member, p)
 		mu := &c.srv.incrMu[c.srv.stripePart(skey, part)]
@@ -261,6 +283,8 @@ func (c *connState) cmdSAddPart(skey []byte, members [][]byte, p int) {
 		}
 		if isNew {
 			c.srv.store.CollInsert(mk, kindSetMember)
+			base[last] = byte(part)
+			c.srv.store.CollRandInsert(base, mk, kindSetMember)
 			added++
 		}
 		mu.Unlock()
@@ -274,14 +298,21 @@ func (c *connState) cmdSAddPart(skey []byte, members [][]byte, p int) {
 // cmdSRemPart is the P>1 routing of SREM: each member routes to its partition and the remove takes
 // only that partition's lock, held across just this member. It mirrors cmdSRem's deferred index
 // splice, batching removed keys packed end to end, but the splice is issued per partition so the
-// batch never mixes partitions. The shared cardinality is decremented once after the loop.
+// batch never mixes partitions. When the partition's draw vector is built, the member is swap-
+// removed from it via CollRandRemove BEFORE DeleteKind clears the hash record, so the vector slot's
+// arena offset is still resolvable; a partition with no vector is a no-op. The shared cardinality is
+// decremented once after the loop.
 func (c *connState) cmdSRemPart(skey []byte, members [][]byte, p int) {
 	removed := 0
+	base := c.partScanBase(skey)
+	last := len(base) - 1
 	for _, member := range members {
 		part := f1raw.PartitionOf(member, p)
 		mu := &c.srv.incrMu[c.srv.stripePart(skey, part)]
 		mu.Lock()
 		mk := c.partMemberKey(skey, member, part, p)
+		base[last] = byte(part)
+		c.srv.store.CollRandRemove(base, mk, kindSetMember)
 		if c.srv.store.DeleteKind(mk, kindSetMember) {
 			c.srv.store.CollRemove(mk)
 			removed++
@@ -725,6 +756,11 @@ func (c *connState) cmdSRandMember(argv [][]byte) {
 	}
 	skey := argv[1]
 
+	if p := c.partitionsFor(skey); p > 1 {
+		c.cmdSRandMemberPart(argv, p)
+		return
+	}
+
 	if len(argv) == 2 {
 		// No-count form: one member, or nil for a missing (or wrong-type) key.
 		if c.stringConflict(skey) {
@@ -827,6 +863,11 @@ func (c *connState) cmdSPop(argv [][]byte) {
 		count = n
 	}
 
+	if p := c.partitionsFor(skey); p > 1 {
+		c.cmdSPopPart(skey, count, hasCount, p)
+		return
+	}
+
 	mu := &c.srv.incrMu[c.srv.stripe(skey)]
 	mu.Lock()
 	if c.stringConflict(skey) {
@@ -903,6 +944,154 @@ func (c *connState) cmdSPop(argv [][]byte) {
 	mu.Unlock()
 	c.writeArrayHeader(len(members))
 	for _, m := range members {
+		c.writeBulk(m)
+	}
+}
+
+// cmdSRandMemberPart is the P>1 routing of SRANDMEMBER (spec 2064/f1_rewrite_ltm/19 sections 6.5
+// and 6.6): every form composes the P per-partition draw vectors into one exactly-uniform draw
+// through the weighted-partition scheme, non-destructively and lock-free on the common path. The
+// no-count form draws one member; the negative-count form draws abs(count) with replacement by
+// looping the single draw; the positive-count form draws up to count distinct members without
+// replacement. A missing or empty set yields nil for the no-count form and an empty array for the
+// count form, matching the unpartitioned path.
+func (c *connState) cmdSRandMemberPart(argv [][]byte, p int) {
+	skey := argv[1]
+	if c.stringConflict(skey) {
+		c.writeErr(wrongType)
+		return
+	}
+	base := c.partScanBase(skey)
+
+	if len(argv) == 2 {
+		// No-count form: one uniform member across the P partitions, or nil for an empty set.
+		k, ok := c.srv.store.CollPartRandOne(base, p, c.nextRand())
+		if !ok {
+			c.writeNil()
+			return
+		}
+		c.writeBulk(k[len(base):])
+		return
+	}
+
+	count, err := atoi64(argv[2])
+	if err != nil {
+		c.writeErr("ERR value is not an integer or out of range")
+		return
+	}
+	if count == 0 || c.srv.store.CollPartTotal(base, p) == 0 {
+		c.writeArrayHeader(0)
+		return
+	}
+	if count < 0 {
+		// With replacement: exactly abs(count) draws, each an independent uniform member, so
+		// duplicates are allowed and the result is never capped by the cardinality.
+		n := int(-count)
+		c.writeArrayHeader(n)
+		for i := 0; i < n; i++ {
+			k, ok := c.srv.store.CollPartRandOne(base, p, c.nextRand())
+			if !ok {
+				c.writeNil()
+				continue
+			}
+			c.writeBulk(k[len(base):])
+		}
+		return
+	}
+	// Positive count: up to count distinct members, without replacement, capped at the cardinality
+	// inside CollPartSampleDistinct.
+	members := c.srv.store.CollPartSampleDistinct(base, p, int(count), c.nextRand(), nil)
+	c.writeArrayHeader(len(members))
+	for _, m := range members {
+		c.writeBulk(m[len(base):])
+	}
+}
+
+// cmdSPopPart is the P>1 routing of SPOP (spec 2064/f1_rewrite_ltm/19 section 6.6): it draws a
+// uniform member by the weighted-partition scheme and removes it. Because each pop shrinks the set,
+// looping the single draw is exactly sampling without replacement. The pick of a partition is
+// lock-free; the pop then takes only that partition's stripe lock, held across the vector swap-
+// remove, the hash-record delete, and the ordered-index splice, so two pops routing to two
+// partitions of one hot key run on two cores instead of serializing on the set's single stripe.
+// Holding the partition stripe lock across the whole pop serializes it with that partition's SADD
+// and SREM, so a concurrent SREM of the same member cannot double-count the cardinality. When the
+// picked partition drains under a concurrent pop between the lock-free pick and the lock, the pop
+// re-picks with fresh counts (section 6.6.1). The cardinality is decremented once after the loop.
+func (c *connState) cmdSPopPart(skey []byte, count int64, hasCount bool, p int) {
+	if c.stringConflict(skey) {
+		c.writeErr(wrongType)
+		return
+	}
+	base := c.partScanBase(skey)
+	last := len(base) - 1
+
+	if !hasCount {
+		// No-count form: pop one uniform member, or nil for an empty set. The retry budget bounds a
+		// pathological concurrent drain that keeps emptying the partition this pick lands on.
+		for attempt := 0; attempt < 16; attempt++ {
+			part := c.srv.store.CollPartPick(base, p, c.nextRand())
+			if part < 0 {
+				c.writeNil()
+				return
+			}
+			mu := &c.srv.incrMu[c.srv.stripePart(skey, part)]
+			mu.Lock()
+			base[last] = byte(part)
+			k, ok := c.srv.store.CollPartPopLocked(base)
+			if !ok {
+				mu.Unlock()
+				continue
+			}
+			member := k[len(base):]
+			if c.srv.store.DeleteKind(k, kindSetMember) {
+				c.srv.store.CollRemove(k)
+			}
+			mu.Unlock()
+			c.setBumpCard(skey, -1, p)
+			c.writeBulk(member)
+			return
+		}
+		c.writeNil()
+		return
+	}
+
+	// Count form: pop up to count distinct members, each a fresh weighted draw+remove, until count is
+	// reached or the set empties. The member keys are stable arena subslices, so they stay valid to
+	// write after every removal.
+	if count == 0 {
+		c.writeArrayHeader(0)
+		return
+	}
+	want := int(count)
+	initCap := want
+	if initCap > 256 {
+		initCap = 256
+	}
+	out := make([][]byte, 0, initCap)
+	for len(out) < want {
+		part := c.srv.store.CollPartPick(base, p, c.nextRand())
+		if part < 0 {
+			break
+		}
+		mu := &c.srv.incrMu[c.srv.stripePart(skey, part)]
+		mu.Lock()
+		base[last] = byte(part)
+		k, ok := c.srv.store.CollPartPopLocked(base)
+		if !ok {
+			mu.Unlock()
+			continue
+		}
+		if c.srv.store.DeleteKind(k, kindSetMember) {
+			c.srv.store.CollRemove(k)
+		}
+		mu.Unlock()
+		out = append(out, k[len(base):])
+	}
+	if len(out) > 0 {
+		c.setBumpCard(skey, -len(out), p)
+	}
+	c.writeArrayHeader(len(out))
+	for _, m := range out {
 		c.writeBulk(m)
 	}
 }
