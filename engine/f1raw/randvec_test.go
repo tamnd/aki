@@ -15,6 +15,19 @@ import (
 // is byte-identical to a served set, and they assert the density invariant after every
 // mutation.
 
+// testRNG is a splitmix64 generator that hands the draw tests a fresh random word each call,
+// standing in for the per-connection rng the server feeds CollRandSelect. A varying word is
+// what makes the coverage and uniformity assertions meaningful.
+type testRNG uint64
+
+func (r *testRNG) next() uint64 {
+	*r += 0x9e3779b97f4a7c15
+	z := uint64(*r)
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
+
 // setPrefixBytes builds the bounding prefix uvarint(len(skey)) | skey the server's setPrefix
 // builds, so a test set's member rows land under exactly the prefix the vector is keyed by.
 func setPrefixBytes(skey string) []byte {
@@ -219,8 +232,9 @@ func TestRandVecLazyBuild(t *testing.T) {
 
 	// The first draw builds the whole thing; sample many times and confirm coverage.
 	drawn := map[string]bool{}
+	var rng testRNG
 	for i := 0; i < n*20; i++ {
-		k, ok := s.CollRandSelect(prefix)
+		k, ok := s.CollRandSelect(prefix, rng.next())
 		if !ok {
 			t.Fatalf("draw reported empty on a set of %d", n)
 		}
@@ -257,8 +271,9 @@ func TestRandVecRebuildAfterDrop(t *testing.T) {
 	sh.mu.Unlock()
 
 	drawn := map[string]bool{}
+	var rng testRNG
 	for i := 0; i < n*20; i++ {
-		k, ok := s.CollRandSelect(prefix)
+		k, ok := s.CollRandSelect(prefix, rng.next())
 		if !ok {
 			t.Fatalf("draw empty after rebuild")
 		}
@@ -283,8 +298,9 @@ func TestRandVecUniform(t *testing.T) {
 	}
 	const draws = n * 500
 	counts := map[string]int{}
+	var rng testRNG
 	for i := 0; i < draws; i++ {
-		k, ok := s.CollRandSelect(prefix)
+		k, ok := s.CollRandSelect(prefix, rng.next())
 		if !ok {
 			t.Fatal("empty draw")
 		}

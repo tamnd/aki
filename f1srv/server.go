@@ -331,10 +331,12 @@ func (s *Server) serveConn(conn net.Conn) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 	}
+	connID := s.nextConnID.Add(1)
 	c := &connState{
 		srv:       s,
 		conn:      conn,
-		id:        s.nextConnID.Add(1),
+		id:        connID,
+		rngState:  seedConnRNG(connID),
 		rbuf:      make([]byte, 0, s.cfg.ReadBufSize),
 		out:       make([]byte, 0, s.cfg.ReadBufSize),
 		blockable: true, // a per-connection goroutine may park on a blocking command
