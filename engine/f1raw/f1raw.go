@@ -159,6 +159,13 @@ type Store struct {
 	// and the string and point-collection paths never touch it.
 	rvec *randVec
 
+	// pdescs is the partition descriptor table (partdesc.go): per partitioned set, the cached P
+	// partition-vector pointers that turn the weighted draw's count read from O(P) shard-map
+	// lookups into O(P) atomic loads (spec 2064/f1_rewrite_ltm/19 section 5). It is keyed by the
+	// whole-set prefix, built lazily on the first draw against a partitioned set, and torn down with
+	// the set's vectors by CollRandDrop, so an unpartitioned keyspace allocates nothing here.
+	pdescs *partDescs
+
 	// cold is the on-disk value log for the larger-than-memory string regime, or nil
 	// for a pure in-memory store. When set, a string value longer than sepThreshold is
 	// written to the log and the in-memory record holds a cold pointer (cold.go). The
@@ -226,6 +233,7 @@ func New(indexBuckets, arenaBytes int) *Store {
 	s.tail.Store(8) // reserve offset 0 so an empty index entry (addr 0) is unambiguous
 	s.oidx = newOIndex(s)
 	s.rvec = newRandVec()
+	s.pdescs = newPartDescs()
 	return s
 }
 

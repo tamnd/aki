@@ -473,6 +473,12 @@ func (s *Store) CollRandDrop(prefix []byte) {
 	sh.mu.Lock()
 	sh.drop(prefix)
 	sh.mu.Unlock()
+	// If this set engaged partitioning, its P partition vectors live under partition-prefixed keys
+	// this unpartitioned prefix does not cover, and a partition descriptor caches their pointers.
+	// dropPartVecs drops both so a recreated set under the same key rebuilds fresh rather than
+	// reading a stale cached pointer as empty (partdesc.go). It is a cheap lock-free descriptor probe
+	// that returns at once for the common unpartitioned set, which has no descriptor.
+	s.dropPartVecs(prefix)
 }
 
 // RENAME has no vector re-key primitive on purpose. The member rows carry their set's key name
