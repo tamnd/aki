@@ -3,6 +3,8 @@ package f1srv
 import (
 	"bytes"
 	"encoding/binary"
+
+	"github.com/tamnd/aki/engine/f1raw"
 )
 
 // The STORE forms (SINTERSTORE/SUNIONSTORE/SDIFFSTORE) compute the same k-way merge as
@@ -88,11 +90,38 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 		}
 	}
 
+	// The destination is partitioned exactly when the sources are (partitionsFor is a whole-server
+	// hook until the adaptive engage of slice 6), so a routed store writes each result member under
+	// its partition-routed key and the same reader (streamSetPart) that framed the sources reads the
+	// result back byte-for-byte. A partitioned set reports the hashtable encoding (section 6.11), so
+	// the routed write skips the encoding fold and stamps the header with P via setHeaderEncodeP.
+	destP := c.partitionsFor(dest)
 	count := 0
 	enc := encNone
 	var writeErr error
 	insert := func(m []byte) bool {
-		mk := c.memberKey(dest, m)
+		var mk []byte
+		if destP > 1 {
+			part := f1raw.PartitionOf(m, destP)
+			mk = c.partMemberKey(dest, m, part, destP)
+			isNew, err := c.srv.store.PutKind(mk, nil, kindSetMember)
+			if err != nil {
+				writeErr = err
+				return false
+			}
+			if isNew {
+				c.srv.store.CollInsert(mk, kindSetMember)
+				// Splice into the partition's dense vector if one exists (a no-op after clearSetRows
+				// dropped it, so the vector rebuilds lazily on first draw). base is built into ppbuf,
+				// distinct from mk's kbuf, and its final byte set to the member's partition.
+				base := c.partScanBase(dest)
+				base[len(base)-1] = byte(part)
+				c.srv.store.CollRandInsert(base, mk, kindSetMember)
+				count++
+			}
+			return true
+		}
+		mk = c.memberKey(dest, m)
 		isNew, err := c.srv.store.PutKind(mk, nil, kindSetMember)
 		if err != nil {
 			writeErr = err
@@ -138,13 +167,33 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 		c.writeErr("ERR " + writeErr.Error())
 		return
 	}
-	if err := c.setPutHeader(dest, uint64(count), enc); err != nil {
+	if err := c.storePutHeader(dest, count, enc, destP); err != nil {
 		unlock()
 		c.writeErr("ERR " + err.Error())
 		return
 	}
 	unlock()
 	c.writeInt(int64(count))
+}
+
+// storePutHeader writes the destination set's header after a STORE, routing on the destination's
+// partition count. An unpartitioned destination keeps the existing 9-byte header (count plus the
+// folded encoding), so a P=1 store is byte-for-byte what it was before partitioning. A partitioned
+// destination stamps the partition count into the header via setHeaderEncodeP and records the
+// hashtable encoding a partitioned set always reports (section 6.11), matching what setBumpCard
+// writes on a routed SADD so a STORE-built and an SADD-built partitioned set are indistinguishable.
+// A zero count deletes the header either way, so an empty result leaves no set.
+func (c *connState) storePutHeader(dest []byte, count int, enc byte, p int) error {
+	if p <= 1 {
+		return c.setPutHeader(dest, uint64(count), enc)
+	}
+	if count == 0 {
+		c.srv.store.DeleteKind(dest, kindSetMeta)
+		return nil
+	}
+	hdr := setHeaderEncodeP(nil, uint64(count), encHashtable, p)
+	_, err := c.srv.store.PutKind(dest, hdr, kindSetMeta)
+	return err
 }
 
 // cmdSInterStore stores the intersection of the sources into the destination and replies
