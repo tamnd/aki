@@ -511,7 +511,7 @@ func (c *connState) cmdSRandMember(argv [][]byte) {
 		// SyncPendingRemovals reconcile (the scan already skips a tombstoned-but-not-yet-spliced
 		// node) and no separate cardinality probe (an empty or missing set draws ok=false).
 		prefix := c.setPrefix(skey)
-		k, ok := c.srv.store.CollRandSelect(prefix)
+		k, ok := c.srv.store.CollRandSelect(prefix, c.nextRand())
 		if !ok {
 			c.writeNil()
 			return

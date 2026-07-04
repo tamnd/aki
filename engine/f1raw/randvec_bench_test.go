@@ -38,12 +38,44 @@ func BenchmarkRandSelectVec(b *testing.B) {
 	for _, n := range []int{100_000, 1_000_000} {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
 			s, prefix := buildBenchSet(b, n)
+			var rng uint64 = 0x9e3779b97f4a7c15
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, ok := s.CollRandSelect(prefix); !ok {
+				rng += 0x9e3779b97f4a7c15
+				if _, ok := s.CollRandSelect(prefix, rng); !ok {
 					b.Fatal("empty draw")
 				}
 			}
+		})
+	}
+}
+
+// BenchmarkRandSelectVecParallel is the slice 1 measurement: many goroutines draw from one
+// hot key at once, the shape SRANDMEMBER runs under a P16 pipeline against a single giant set.
+// The read draw takes the shard RLock and a caller-supplied random word, so concurrent draws
+// on one key run in parallel instead of serializing on a single mutex. Compare its ns/op to
+// the serial BenchmarkRandSelectVec above: a flat or near-flat number here is the read-side
+// lock split doing its job, a number that climbs with -cpu is the serialization slice 1 is
+// meant to remove. This is the pre-partitioning ceiling; the write path still needs doc 19.
+func BenchmarkRandSelectVecParallel(b *testing.B) {
+	for _, n := range []int{100_000, 1_000_000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			s, prefix := buildBenchSet(b, n)
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				// Each goroutine carries its own splitmix64 stream, matching the per-connection
+				// rng the server feeds in; no shared draw state means no false contention.
+				var rng uint64 = 0x9e3779b97f4a7c15
+				for pb.Next() {
+					rng += 0x9e3779b97f4a7c15
+					z := rng
+					z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+					z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+					if _, ok := s.CollRandSelect(prefix, z^(z>>31)); !ok {
+						b.Fatal("empty draw")
+					}
+				}
+			})
 		})
 	}
 }
