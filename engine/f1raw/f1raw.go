@@ -395,6 +395,17 @@ func (s *Store) vlenAt(off uint64) *atomic.Uint32 {
 	return (*atomic.Uint32)(unsafe.Add(s.base, off+offVlen))
 }
 
+// countAt returns the 8-byte signed counter at the start of a record's value region as
+// an atomic word. A set/hash/zset META record carries its cardinality here, bumped by
+// CountAddInt64 and read by CountInt64. The counter is accessed atomically so concurrent
+// bumps of one hot key under a shared stripe lock (setBumpCard's parallel path) and the
+// lock-free readers synchronize on this word directly, not only through the seqlock
+// version. The value region starts at hdrSize + align8(klen) past an 8-byte-aligned
+// record, so the word is 8-byte aligned as atomic.Int64 requires.
+func (s *Store) countAt(off uint64) *atomic.Int64 {
+	return (*atomic.Int64)(unsafe.Add(s.base, off+hdrSize+align8(s.klen(off))))
+}
+
 // klen, vcapBytes, and keyAt read immutable header fields with plain loads. They are
 // written once before the record is published and never touched again, and the
 // publishing CAS on the index entry establishes the happens-before a reader needs,

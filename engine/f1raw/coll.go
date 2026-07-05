@@ -1,7 +1,6 @@
 package f1raw
 
 import (
-	"encoding/binary"
 	"errors"
 )
 
@@ -338,7 +337,6 @@ func (s *Store) CountAddInt64(key []byte, kind byte, delta int64) (int64, bool) 
 		return 0, false
 	}
 	verp := s.verAt(off)
-	vbase := off + hdrSize + align8(s.klen(off))
 	for {
 		v := verp.Load()
 		if v&verLockBit != 0 {
@@ -347,9 +345,9 @@ func (s *Store) CountAddInt64(key []byte, kind byte, delta int64) (int64, bool) 
 		if !verp.CompareAndSwap(v, v+1) { // acquire: make it odd
 			continue
 		}
-		cur := int64(binary.LittleEndian.Uint64(s.arena[vbase : vbase+8]))
-		res := cur + delta
-		binary.LittleEndian.PutUint64(s.arena[vbase:vbase+8], uint64(res))
+		cnt := s.countAt(off)
+		res := cnt.Load() + delta
+		cnt.Store(res)    // atomic: synchronizes concurrent shared-lock bumps and lock-free readers
 		verp.Store(v + 2) // release: back to even, one tick newer
 		return res, true
 	}
@@ -367,7 +365,6 @@ func (s *Store) CountInt64(key []byte, kind byte) (int64, bool) {
 		return 0, false
 	}
 	verp := s.verAt(off)
-	vbase := off + hdrSize + align8(s.klen(off))
 	for {
 		v1 := verp.Load()
 		if v1&verLockBit != 0 {
@@ -376,9 +373,9 @@ func (s *Store) CountInt64(key []byte, kind byte) (int64, bool) {
 		if uint64(s.vlenAt(off).Load()) < 8 {
 			return 0, false
 		}
-		x := binary.LittleEndian.Uint64(s.arena[vbase : vbase+8])
+		x := s.countAt(off).Load()
 		if verp.Load() == v1 {
-			return int64(x), true
+			return x, true
 		}
 	}
 }
