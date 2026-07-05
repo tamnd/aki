@@ -43,6 +43,15 @@ import (
 const (
 	oindexMaxLevel = 20   // supports ~2^20 elements at p=1/4 before the top level saturates
 	oindexP        = 0.25 // fraction of nodes that rise to the next level
+	// onodeInlineCap is how many leading composite-key bytes a node caches inline so the
+	// skiplist descent can order without reading the arena. A hot set/hash/zset member key
+	// is a length-prefixed collection key plus a short member, well under this, so the whole
+	// key fits inline and the descent's byte compares never chase the record offset into the
+	// arena, which the saturating SPOP profile named as 42.5% of CPU (all cache-miss-bound in
+	// keyAt/klen). Keys longer than the cap keep the offset-and-arena compare path, so the
+	// cache is a pure hint and ordering is unchanged. 32 bytes covers the common member key
+	// whole while keeping the node under two cache lines.
+	onodeInlineCap = 32
 )
 
 // onode is one skip-list node. off is the arena offset of the indexed record; next
@@ -56,9 +65,25 @@ const (
 // skip list (Pugh's augmentation), the structure the random-selection commands
 // (SPOP/SRANDMEMBER, section 10.1 of spec 2064/f1_rewrite_ltm/06) seek through.
 type onode struct {
-	off   uint64
-	next  []*onode
-	width []int
+	off    uint64
+	klen   uint32               // full composite-key length, so a fully-inlined key is known without an arena read
+	inline [onodeInlineCap]byte // first min(klen, cap) key bytes, cached for arena-free ordering
+	next   []*onode
+	width  []int
+}
+
+// cmpKey orders the node's composite key against key the way bytes.Compare does, but reads
+// the inline key cache instead of the arena whenever the whole key fits (klen <= cap). That
+// keeps the hot skiplist descent from chasing off into the 1.9M-element arena for every byte
+// compare, which is the cache-miss cost the SPOP profile is bound on. A key longer than the
+// cap falls back to the arena bytes, so the cache never changes the ordering, only where the
+// bytes are read from. The record's key is immutable (grow-only arena), so a republish that
+// only moves off leaves klen and inline correct without a refresh.
+func (n *onode) cmpKey(s *Store, key []byte) int {
+	if int(n.klen) <= onodeInlineCap {
+		return bytes.Compare(n.inline[:n.klen], key)
+	}
+	return bytes.Compare(s.keyAt(n.off), key)
 }
 
 // oindex is the ordered element index. head is a sentinel whose forward pointers are
@@ -141,13 +166,13 @@ func (oi *oindex) insert(off uint64) {
 		} else {
 			rank[i] = rank[i+1]
 		}
-		for x.next[i] != nil && bytes.Compare(oi.store.keyAt(x.next[i].off), key) < 0 {
+		for x.next[i] != nil && x.next[i].cmpKey(oi.store, key) < 0 {
 			rank[i] += x.width[i]
 			x = x.next[i]
 		}
 		update[i] = x
 	}
-	if nx := x.next[0]; nx != nil && bytes.Equal(oi.store.keyAt(nx.off), key) {
+	if nx := x.next[0]; nx != nil && nx.cmpKey(oi.store, key) == 0 {
 		nx.off = off // same key republished: point at the current record
 		return
 	}
@@ -162,7 +187,8 @@ func (oi *oindex) insert(off uint64) {
 		}
 		oi.level = lvl
 	}
-	n := &onode{off: off, next: make([]*onode, lvl), width: make([]int, lvl)}
+	n := &onode{off: off, klen: uint32(len(key)), next: make([]*onode, lvl), width: make([]int, lvl)}
+	copy(n.inline[:], key) // copies min(cap, len(key)); the tail beyond cap is unused (klen>cap falls back to arena)
 	for i := 0; i < lvl; i++ {
 		n.next[i] = update[i].next[i]
 		update[i].next[i] = n
@@ -195,11 +221,11 @@ func (oi *oindex) refresh(off uint64) {
 
 	x := oi.head
 	for i := oi.level - 1; i >= 0; i-- {
-		for x.next[i] != nil && bytes.Compare(oi.store.keyAt(x.next[i].off), key) < 0 {
+		for x.next[i] != nil && x.next[i].cmpKey(oi.store, key) < 0 {
 			x = x.next[i]
 		}
 	}
-	if nx := x.next[0]; nx != nil && bytes.Equal(oi.store.keyAt(nx.off), key) {
+	if nx := x.next[0]; nx != nil && nx.cmpKey(oi.store, key) == 0 {
 		nx.off = off
 	}
 }
@@ -269,13 +295,13 @@ func (oi *oindex) removeLocked(key []byte) bool {
 	var update [oindexMaxLevel]*onode
 	x := oi.head
 	for i := oi.level - 1; i >= 0; i-- {
-		for x.next[i] != nil && bytes.Compare(oi.store.keyAt(x.next[i].off), key) < 0 {
+		for x.next[i] != nil && x.next[i].cmpKey(oi.store, key) < 0 {
 			x = x.next[i]
 		}
 		update[i] = x
 	}
 	target := x.next[0]
-	if target == nil || !bytes.Equal(oi.store.keyAt(target.off), key) {
+	if target == nil || target.cmpKey(oi.store, key) != 0 {
 		return false
 	}
 	for i := 0; i < oi.level; i++ {
@@ -376,7 +402,7 @@ func (oi *oindex) scanBatch(prefix, after []byte, limit int, dst []uint64) ([]ui
 	}
 	x := oi.head
 	for i := oi.level - 1; i >= 0; i-- {
-		for x.next[i] != nil && bytes.Compare(oi.store.keyAt(x.next[i].off), seek) < 0 {
+		for x.next[i] != nil && x.next[i].cmpKey(oi.store, seek) < 0 {
 			x = x.next[i]
 		}
 	}
@@ -388,7 +414,7 @@ func (oi *oindex) scanBatch(prefix, after []byte, limit int, dst []uint64) ([]ui
 	// rather than comparing every element against `after` inside the walk, which would run a
 	// full bytes.Compare per element for a boundary that can match only the head of the batch.
 	if after != nil && x != nil {
-		if bytes.Compare(oi.store.keyAt(x.off), after) <= 0 {
+		if x.cmpKey(oi.store, after) <= 0 {
 			x = x.next[0]
 		}
 	}
@@ -425,7 +451,7 @@ func (oi *oindex) rankLocked(key []byte) int {
 	pos := 0
 	x := oi.head
 	for i := oi.level - 1; i >= 0; i-- {
-		for x.next[i] != nil && bytes.Compare(oi.store.keyAt(x.next[i].off), key) < 0 {
+		for x.next[i] != nil && x.next[i].cmpKey(oi.store, key) < 0 {
 			pos += x.width[i]
 			x = x.next[i]
 		}
