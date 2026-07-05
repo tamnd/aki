@@ -276,17 +276,27 @@ func (c *connState) partitionsFor(skey []byte) int {
 // targetPartitions is the partition count a set of the given cardinality warrants under the adaptive
 // engage policy (spec 2064/f1_rewrite_ltm/19 section 3): P stays 1 below the engage threshold, then
 // rises as card/target rounded up to a power of two, capped at the configured maximum and floored at
-// two once it engages. It is the one-way target maybeEngageSet compares against the set's current P.
-// Because it is monotonic in card and the transition only ever grows, a set climbs 1 -> 2 -> 4 ...
-// toward the cap as it fills and never steps back down. With the feature off (setPartMax <= 1) it is
-// always 1, so no set ever engages.
+// four once it engages. It is the one-way target maybeEngageSet compares against the set's current P.
+// Because it is monotonic in card and the transition only ever grows, a set jumps 1 -> 4 on engage and
+// climbs 4 -> 8 -> 16 toward the cap as it fills, never stepping back down. With the feature off
+// (setPartMax <= 1) it is always 1, so no set ever engages.
+//
+// The floor is four, not two, because the slice-6c sweep found P=2 is the worst operating point: under
+// 14-core write contention P=2 barely beats or ties P=1, while it already pays the full partitioned
+// draw tax (a weighted pick across the partitions runs ~3.6x an unpartitioned dense-vector draw). P=4
+// is where the exclusive-lock split first pays for itself on writes (~1.5x under contention) at a
+// draw tax still far below P=8/P=16, so an engaging set skips two and lands on four.
 func (s *Server) targetPartitions(card int) int {
 	if s.setPartMax <= 1 || card < s.setPartThreshold {
 		return 1
 	}
 	p := int(nextPow2(int64((card + s.setPartTarget - 1) / s.setPartTarget)))
-	if p < 2 {
-		p = 2
+	floor := 4
+	if s.setPartMax < floor {
+		floor = s.setPartMax
+	}
+	if p < floor {
+		p = floor
 	}
 	if p > s.setPartMax {
 		p = s.setPartMax
