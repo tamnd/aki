@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -306,6 +307,97 @@ func TestOIndexManyMembersSorted(t *testing.T) {
 	}
 	if !sort.SliceIsSorted(got, func(i, j int) bool { return bytes.Compare(got[i], got[j]) < 0 }) {
 		t.Fatal("enumeration not sorted")
+	}
+}
+
+// The inline comparison-key cache decides ordering from the node's copied bytes only when
+// the whole composite key fits (klen <= onodeInlineCap); longer keys must fall back to the
+// arena. This test drives keys on both sides of that boundary at once, and, critically, a
+// run of keys that are byte-identical through the first onodeInlineCap bytes and diverge only
+// after it: those can order correctly only if cmpKey falls back to the arena rather than
+// trusting the truncated inline prefix. Insert order is shuffled away from sorted so the
+// skip-list descent actually exercises the compare at every level, and enumeration plus
+// order-statistic select must both match a ground-truth sort. A regression that compared the
+// inline prefix for over-cap keys would collapse the diverging tail and drop or misorder them.
+func TestOIndexInlineArenaBoundary(t *testing.T) {
+	s := New(1<<18, 1<<22)
+
+	// A 30-byte common stem so "stem"+one byte is 31 bytes; with the 2-byte "h" collection
+	// prefix the composite key is 33 bytes, past the 32-byte inline cap, and every such key
+	// shares its first 32 bytes with the others (the stem), forcing the arena fallback to see
+	// the diverging final byte. The single-char members stay well under the cap (inline path).
+	stem := strings.Repeat("x", 30)
+	members := []string{
+		"a", "m", "z", // short: fully inline
+		stem + "1", stem + "5", stem + "9", stem + "3", // over-cap, diverge only past the cap
+		strings.Repeat("y", 28), // 28-byte member -> 30-byte key, still inline (boundary-adjacent)
+		strings.Repeat("y", 30), // 30-byte member -> 32-byte key, exactly at the cap (inline)
+		strings.Repeat("y", 31), // 31-byte member -> 33-byte key, one past the cap (arena)
+	}
+	// Insert in an order that is not the sorted order, so the descent compares at height.
+	order := []int{4, 0, 8, 2, 6, 9, 1, 5, 7, 3}
+	for _, i := range order {
+		k := collKey("h", members[i])
+		if _, err := s.PutKind(k, []byte("v"), kindTestField); err != nil {
+			t.Fatalf("PutKind(%q): %v", members[i], err)
+		}
+		s.CollInsert(k, kindTestField)
+	}
+
+	// Ground truth: the members sorted the way byte-order over the composite keys sorts them.
+	want := make([]string, len(members))
+	copy(want, members)
+	sort.Slice(want, func(i, j int) bool {
+		return bytes.Compare(collKey("h", want[i]), collKey("h", want[j])) < 0
+	})
+
+	prefix := collPrefix("h")
+	got := scanAll(s, prefix, 3) // batch 3 forces resume boundaries across the mixed lengths
+	if len(got) != len(want) {
+		t.Fatalf("scan returned %d keys, want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if !bytes.Equal(got[i], collKey("h", w)) {
+			t.Fatalf("scan pos %d: got %q, want member %q", i, got[i], w)
+		}
+	}
+	// Order-statistic select must agree element-for-element, which only holds if the descent
+	// ordered every over-cap key by its arena tail rather than its shared inline prefix.
+	for i, w := range want {
+		k, ok := s.CollSelectAt(prefix, i)
+		if !ok {
+			t.Fatalf("CollSelectAt(%d) absent, want %q", i, w)
+		}
+		if !bytes.Equal(k, collKey("h", w)) {
+			t.Fatalf("CollSelectAt(%d) = %q, want member %q", i, k, w)
+		}
+	}
+
+	// Removing an over-cap key must find and unlink exactly it, proving removeLocked's compare
+	// also falls back to the arena. Delete the diverging-tail members one at a time and confirm
+	// the survivors stay complete and sorted.
+	for _, m := range []string{stem + "5", stem + "1", stem + "9", stem + "3"} {
+		k := collKey("h", m)
+		if !s.DeleteKind(k, kindTestField) {
+			t.Fatalf("DeleteKind(%q) reported absent", m)
+		}
+		s.CollRemove(k)
+	}
+	rem := scanAll(s, prefix, 64)
+	var wantRem []string
+	for _, w := range want {
+		if strings.HasPrefix(w, stem) {
+			continue
+		}
+		wantRem = append(wantRem, w)
+	}
+	if len(rem) != len(wantRem) {
+		t.Fatalf("after removing over-cap keys, scan returned %d, want %d: %q", len(rem), len(wantRem), rem)
+	}
+	for i, w := range wantRem {
+		if !bytes.Equal(rem[i], collKey("h", w)) {
+			t.Fatalf("post-remove pos %d: got %q, want member %q", i, rem[i], w)
+		}
 	}
 }
 

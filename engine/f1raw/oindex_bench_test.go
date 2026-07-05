@@ -195,6 +195,43 @@ func BenchmarkOIndexEnumerateValues(b *testing.B) {
 	}
 }
 
+// BenchmarkOIndexRemoveReinsert measures the compare-heavy skip-list descent directly: a
+// remove-by-key followed by re-insert of the same key, both of which walk the express lanes
+// comparing the composite key against nodes at every level. This is the path the saturating
+// SPOP profile named (removeLocked plus the deferred folder's splice), and it is where the
+// inline comparison-key cache replaces a random arena read per compared node with an inline
+// read. Population is a single large collection so the descent has real height; a splitmix
+// walk spreads the target key across the whole run so the benchmark measures the average
+// descent, not one hot cache-resident node. Reported ns/op is one remove plus one insert.
+func BenchmarkOIndexRemoveReinsert(b *testing.B) {
+	for _, n := range []int{10000, 200000, 2000000} {
+		b.Run(fmt.Sprintf("members=%d", n), func(b *testing.B) {
+			s := New(1<<20, 1<<27)
+			keys := make([][]byte, n)
+			for i := 0; i < n; i++ {
+				k := collKey("hot", fmt.Sprintf("m%08d", i))
+				if _, err := s.PutKind(k, []byte("v"), kindTestField); err != nil {
+					b.Fatal(err)
+				}
+				s.CollInsert(k, kindTestField)
+				keys[i] = k
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			var r uint64 = 0x9e3779b1
+			for i := 0; i < b.N; i++ {
+				r += 0x9e3779b97f4a7c15
+				z := r
+				z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+				z ^= z >> 31
+				k := keys[int(z%uint64(n))]
+				s.CollRemove(k)                // removeLocked descent: compare per node at each level
+				s.CollInsert(k, kindTestField) // insert descent: compare per node at each level
+			}
+		})
+	}
+}
+
 // BenchmarkOIndexEnumerateFullScan measures the rejected alternative: scan the whole
 // index, keep the prefix matches, sort them. Cost tracks the keyspace size, so it
 // degrades as unrelated collections grow even when the target stays small.
