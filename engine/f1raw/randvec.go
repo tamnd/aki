@@ -378,6 +378,86 @@ func (s *Store) CollRandRemove(prefix, key []byte, kind byte) bool {
 	return ok
 }
 
+// SetVecLen returns the number of live members in the set bounded by prefix, reading the dense
+// member vector rather than counting the ordered index. It builds the vector on first use (the
+// same lazy build the random draw runs) and reads the published snapshot length, so a set that
+// has never been drawn from or enumerated pays one O(card) build and every read after is O(1).
+// prefix is the whole-set prefix uvarint(len(skey))|skey for an unpartitioned set or one
+// partition's scan prefix ...|byte(part) for a partitioned set.
+func (s *Store) SetVecLen(prefix []byte) int {
+	v := s.collPartVec(prefix)
+	return len(v.view.Load().s)
+}
+
+// SetVecScanDown appends up to limit members of the set bounded by prefix to dst as arena-stable
+// composite keys, walking the dense member vector's published snapshot downward from index hi
+// (pass hi < 0 to start at the current top). It returns the grown slice and the next lower
+// boundary, which is 0 once the vector is fully scanned. Walking high index to low is what keeps
+// an SSCAN cursor stable under the vector's swap-remove: a remove moves the tail slot into the
+// hole and shrinks, so a downward walk never skips a member that is present for the whole scan,
+// and a shrink below the cursor clamps to the current top rather than reading past the end (spec
+// 2064/f1_rewrite_ltm/20 section 5). SMEMBERS drives it under the set's stripe read lock, so the
+// snapshot is frozen and one drained sequence of calls returns every member exactly once; SSCAN
+// drives it lock-free across calls, so a concurrent add or remove may add or drop a member from
+// the window, which the SCAN contract allows. It builds the vector on first use and is otherwise
+// lock-free. The keys are arena subslices valid for the store's life, so the caller reads them
+// without copying.
+func (s *Store) SetVecScanDown(prefix []byte, hi, limit int, dst [][]byte) ([][]byte, int) {
+	v := s.collPartVec(prefix)
+	vs := v.view.Load()
+	n := len(vs.s)
+	upper := hi
+	if hi < 0 || upper > n {
+		upper = n
+	}
+	lo := upper - limit
+	if lo < 0 {
+		lo = 0
+	}
+	for i := upper - 1; i >= lo; i-- {
+		dst = append(dst, s.keyAt(vs.s[i]))
+	}
+	return dst, lo
+}
+
+// SetPartVecLen returns partition part's live member count for the P-partition set whose
+// partition-scan base is base (uvarint(len(skey))|skey|<byte>, final byte rewritten to part
+// internally). Unlike SetVecLen, which resolves a vector straight through the randVec shard, it
+// resolves the partition vector through the set's partition descriptor, the same path the weighted
+// draw uses (partDescFor then descPartVec). That is what keeps an enumerated-but-never-drawn
+// partitioned set's vectors registered for descriptor-driven teardown: CollRandDrop drops only the
+// partition vectors a descriptor names, so a partition vector built off a descriptor is torn down
+// with the set (DEL, expiry, a grow's Phase 4 re-home) while one built straight through the shard
+// would linger and go stale. p is the partition count; part is the partition to size.
+func (s *Store) SetPartVecLen(base []byte, p, part int) int {
+	d := s.partDescFor(base[:len(base)-1], p)
+	v := s.descPartVec(d, base, part)
+	return len(v.view.Load().s)
+}
+
+// SetPartVecScanDown is SetVecScanDown for one partition of a P-partition set, resolving the
+// partition vector through the descriptor for the same teardown-registration reason SetPartVecLen
+// documents. base is the partition-scan prefix whose final byte it rewrites to part; the downward
+// walk from hi and the returned next-lower boundary are identical to SetVecScanDown.
+func (s *Store) SetPartVecScanDown(base []byte, p, part, hi, limit int, dst [][]byte) ([][]byte, int) {
+	d := s.partDescFor(base[:len(base)-1], p)
+	v := s.descPartVec(d, base, part)
+	vs := v.view.Load()
+	n := len(vs.s)
+	upper := hi
+	if hi < 0 || upper > n {
+		upper = n
+	}
+	lo := upper - limit
+	if lo < 0 {
+		lo = 0
+	}
+	for i := upper - 1; i >= lo; i-- {
+		dst = append(dst, s.keyAt(vs.s[i]))
+	}
+	return dst, lo
+}
+
 // CollRandSelect returns the composite key of a uniform random live member of the set
 // bounded by prefix, or reports empty. It builds the vector on the first draw against a set
 // (deriveOnFirstDraw) and draws an O(1) array index thereafter. The returned key is a
