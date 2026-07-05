@@ -173,6 +173,13 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 		return
 	}
 	unlock()
+	// A STORE can materialize a set large enough to warrant partitioning in one shot, so the engage
+	// trigger runs on the freshly-built destination the same way it does after a SADD. It is a no-op
+	// when the feature is off or the result is below threshold, and runs off the stripe locks the
+	// store held so it can take the migration's exclusive stripe set without self-deadlock.
+	if count > 0 {
+		c.maybeEngageSet(dest, count)
+	}
 	c.writeInt(int64(count))
 }
 

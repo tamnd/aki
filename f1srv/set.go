@@ -273,6 +273,76 @@ func (c *connState) partitionsFor(skey []byte) int {
 	return c.srv.partitionP(skey)
 }
 
+// targetPartitions is the partition count a set of the given cardinality warrants under the adaptive
+// engage policy (spec 2064/f1_rewrite_ltm/19 section 3): P stays 1 below the engage threshold, then
+// rises as card/target rounded up to a power of two, capped at the configured maximum and floored at
+// two once it engages. It is the one-way target maybeEngageSet compares against the set's current P.
+// Because it is monotonic in card and the transition only ever grows, a set climbs 1 -> 2 -> 4 ...
+// toward the cap as it fills and never steps back down. With the feature off (setPartMax <= 1) it is
+// always 1, so no set ever engages.
+func (s *Server) targetPartitions(card int) int {
+	if s.setPartMax <= 1 || card < s.setPartThreshold {
+		return 1
+	}
+	p := int(nextPow2(int64((card + s.setPartTarget - 1) / s.setPartTarget)))
+	if p < 2 {
+		p = 2
+	}
+	if p > s.setPartMax {
+		p = s.setPartMax
+	}
+	return p
+}
+
+// maybeEngageSet is the adaptive engage-and-grow trigger (spec 2064/f1_rewrite_ltm/19 section 3): a
+// set write that raised the cardinality to card calls it, and it grows the set to the partition count
+// that size warrants when that exceeds the current P. The caller passes the cardinality it just wrote
+// under its own write latch rather than have this re-read it, so the trigger never takes the lock-free
+// count seqlock while another writer is bumping it; on an actual grow it hands off to
+// engageSetPartitions, which takes the whole-key and partition stripes itself. It therefore must run
+// with no stripe lock held; every caller invokes it after releasing the write's lock. The transition is
+// one-way, so a target at or below the current P is a no-op, and hysteresis is inherent: the target only
+// rises as the set fills, and engageSetPartitions never shrinks it. The feature is off by default
+// (setPartMax <= 1), and then this returns after one comparison without touching the registry, so the
+// common workload pays nothing.
+func (c *connState) maybeEngageSet(skey []byte, card int) {
+	if c.srv.setPartMax <= 1 {
+		return
+	}
+	if target := c.srv.targetPartitions(card); target > c.srv.partitionP(skey) {
+		c.engageSetPartitions(skey, target)
+	}
+}
+
+// rlockSet freezes set skey's partition layout for the duration of a whole-set read and returns the
+// stable partition count P under the held locks plus the unlock to release them (spec
+// 2064/f1_rewrite_ltm/19 section 11.6). For an unpartitioned set (P==1) it holds the whole-key stripe
+// shared; for a partitioned set it holds every partition stripe over [0, P) shared. It re-reads P after
+// taking the locks and retries if a concurrent engage grew the set (or a delete reset it) in the window
+// before the locks landed, so the returned P and the locks it holds always describe one consistent
+// layout. A migration is excluded because engageSetPartitions holds the whole-key stripe and every
+// [0, newP) partition stripe exclusively, all of which overlap whatever this holds, and P only ever
+// grows, so equal reads across the acquire prove no migration slipped through and the retry converges.
+func (c *connState) rlockSet(skey []byte) (int, func()) {
+	for {
+		p := c.partitionsFor(skey)
+		if p <= 1 {
+			mu := &c.srv.incrMu[c.srv.stripe(skey)]
+			mu.RLock()
+			if c.partitionsFor(skey) <= 1 {
+				return 1, mu.RUnlock
+			}
+			mu.RUnlock()
+			continue
+		}
+		stripes := c.lockSetPartitionsShared(skey, p)
+		if c.partitionsFor(skey) == p {
+			return p, func() { c.unlockSetPartitionsShared(stripes) }
+		}
+		c.unlockSetPartitionsShared(stripes)
+	}
+}
+
 // partScanBase builds the partition-scan prefix uvarint(len(skey))|skey|<byte> into the reusable
 // ppbuf, distinct from the memberKey scratch (kbuf) and the enumeration prefix (pbuf) so it stays
 // stable while a member key is built alongside it in the routed write loop. The final byte is a
@@ -326,27 +396,35 @@ func (c *connState) partMemberKey(skey, member []byte, part, p int) []byte {
 // exclusive stripe lock to create one, recording P via setHeaderEncodeP with the hashtable encoding a
 // partitioned set always reports (section 6.11). A drain to zero deletes the header so an empty set
 // stops existing.
-func (c *connState) setBumpCard(skey []byte, delta, p int) {
+// It returns the resulting cardinality (0 when the header was just deleted at a drain to zero, or
+// when a decrement found no header), so a caller that grows the set can hand that count straight to
+// maybeEngageSet without a second lock-free count read racing this bump.
+func (c *connState) setBumpCard(skey []byte, delta, p int) int {
 	mu := &c.srv.incrMu[c.srv.stripe(skey)]
 	mu.RLock()
 	if n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, int64(delta)); ok {
 		if n <= 0 {
 			c.srv.store.DeleteKind(skey, kindSetMeta)
+			n = 0
 		}
 		mu.RUnlock()
-		return
+		return int(n)
 	}
 	mu.RUnlock()
 	mu.Lock()
+	defer mu.Unlock()
 	if n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, int64(delta)); ok {
 		if n <= 0 {
 			c.srv.store.DeleteKind(skey, kindSetMeta)
+			return 0
 		}
+		return int(n)
 	} else if delta > 0 {
 		hdr := setHeaderEncodeP(nil, uint64(delta), encHashtable, p)
 		_, _ = c.srv.store.PutKind(skey, hdr, kindSetMeta)
+		return delta
 	}
-	mu.Unlock()
+	return 0
 }
 
 // cmdSAddPart is the P>1 routing of SADD (spec 2064/f1_rewrite_ltm/19 slice 3): each member routes
@@ -382,7 +460,12 @@ func (c *connState) cmdSAddPart(skey []byte, members [][]byte, p int) {
 		mu.Unlock()
 	}
 	if added > 0 {
-		c.setBumpCard(skey, added, p)
+		card := c.setBumpCard(skey, added, p)
+		// An already-partitioned set can still warrant a larger P as it keeps filling; re-check off the
+		// partition locks (setBumpCard has released its shared stripe lock) with the cardinality it just
+		// returned under its own latch. engageSetPartitions is a no-op when the target does not exceed the
+		// current P, so a set at its cap pays only the compare.
+		c.maybeEngageSet(skey, card)
 	}
 	c.writeInt(int64(added))
 }
@@ -505,6 +588,13 @@ func (c *connState) cmdSAdd(argv [][]byte) {
 		}
 	}
 	mu.Unlock()
+	// The engage trigger runs off the stripe lock: engageSetPartitions takes the whole-key and
+	// partition stripes itself, so calling it while still holding mu would self-deadlock. It is a no-op
+	// unless the set just crossed the adaptive threshold, and cheap (one comparison) with the feature
+	// off. Only a genuine insert can make a set larger, so a no-op re-add never triggers it.
+	if added > 0 {
+		c.maybeEngageSet(skey, int(count))
+	}
 	c.writeInt(int64(added))
 }
 
@@ -620,36 +710,75 @@ func (c *connState) cmdSCard(argv [][]byte) {
 	c.writeInt(int64(c.setCard(argv[1])))
 }
 
-// streamSet is the enumeration body for SMEMBERS. It takes the set's stripe lock so the
-// header count it frames the RESP array with cannot drift against the member rows it then
-// streams, rejects a string of the same key as WRONGTYPE, and walks the ordered element
-// index in bounded batches, emitting each member (the composite key past the prefix) in
-// member-byte order. The header count and the live member-row count stay exactly equal
-// because every SADD pairs CollInsert with a count bump and every SREM pairs CollRemove
-// with a decrement, so the framed length always matches what is streamed.
+// streamSet is the enumeration body for SMEMBERS. It freezes the set's partition layout with
+// rlockSet so the member rows it walks cannot move under it and the returned P matches the rows it
+// streams even across a concurrent engage, rejects a string of the same key as WRONGTYPE, and walks
+// the ordered element index in bounded batches, emitting each member (the composite key past the
+// prefix) in member-byte order.
+//
+// An unpartitioned set (P==1) frames the RESP array from the header count, which stays exactly equal
+// to the live member-row count because every SADD pairs CollInsert with a count bump and every SREM
+// pairs CollRemove with a decrement under the whole-key stripe rlockSet holds shared.
+//
+// A partitioned set (P>1) stores its members as P partitions, and because the partition byte sits
+// between the length-prefixed set key and the member (appendPartMemberKey), the whole-set prefix
+// bounds every partition's rows in one contiguous (partition, member)-ordered run, so a single walk
+// sweeps all P partitions with no per-partition scan. It frames from a first counting pass rather
+// than the header count: a partitioned write bumps the shared cardinality with a lock-free
+// CountAddInt64 only after it releases its partition lock (setBumpCard), so the header count can lag
+// the frozen rows even with the writers excluded, and counting the frozen rows first guarantees the
+// framed length equals what the second pass streams. The member starts one byte past the prefix
+// because the partition byte precedes it, so the partitioned pass strips plen+1.
 func (c *connState) streamSet(skey []byte) {
-	if p := c.partitionsFor(skey); p > 1 {
-		c.streamSetPart(skey, p)
-		return
-	}
-	mu := &c.srv.incrMu[c.srv.stripe(skey)]
-	// A whole-set read only excludes concurrent SADD/SREM writers, not other readers, so it
-	// takes the shared lock and lets many SMEMBERS of one hot set run on many cores at once, a
-	// win a single-threaded server cannot match. A set has no per-member TTL, so there is
-	// nothing to reap, and the read never mutates under the lock; the shared path is always safe.
-	mu.RLock()
+	p, unlock := c.rlockSet(skey)
+	defer unlock()
 	if c.stringConflict(skey) {
-		mu.RUnlock()
 		c.writeErr(wrongType)
 		return
 	}
+	prefix := c.setPrefix(skey)
+	scan := make([][]byte, 0, hashScanBatch)
+
+	if p > 1 {
+		// Pass 1: count the frozen member rows so the frame matches exactly what pass 2 streams.
+		var n int
+		var after []byte
+		for {
+			keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
+			if len(keys) == 0 {
+				break
+			}
+			n += len(keys)
+			if last == nil {
+				break
+			}
+			after = last
+		}
+		c.writeArrayHeader(n)
+
+		// Pass 2: stream the same rows, stripping the partition byte to recover each member.
+		moff := len(prefix) + 1
+		after = nil
+		for {
+			keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
+			if len(keys) == 0 {
+				break
+			}
+			for _, k := range keys {
+				c.writeBulk(k[moff:])
+			}
+			if last == nil {
+				break
+			}
+			after = last
+		}
+		return
+	}
+
 	count := c.setCard(skey)
 	c.writeArrayHeader(int(count))
-
-	prefix := c.setPrefix(skey)
 	plen := len(prefix)
 	var after []byte
-	scan := make([][]byte, 0, hashScanBatch)
 	for {
 		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
 		if len(keys) == 0 {
@@ -657,72 +786,6 @@ func (c *connState) streamSet(skey []byte) {
 		}
 		for _, k := range keys {
 			c.writeBulk(k[plen:])
-		}
-		if last == nil {
-			break
-		}
-		after = last
-	}
-	mu.RUnlock()
-}
-
-// streamSetPart is the SMEMBERS body for a partitioned set (spec 2064/f1_rewrite_ltm/19 section
-// 6.7). One large logical set is stored as P partitions, and because the partition byte sits
-// between the length-prefixed set key and the member (appendPartMemberKey), the whole-set prefix
-// bounds every partition's rows in one contiguous ordered run in (partition, member) order. So a
-// single walk of that prefix sweeps all P partitions with no per-partition scan, the same total
-// work as the unpartitioned walk, just crossing partition boundaries transparently.
-//
-// A whole-set read must exclude the partitioned member writers so a row cannot be removed and its
-// arena offset reused while this streams it, exactly the protection the unpartitioned path gets
-// from the whole-key stripe RLock. The partitioned writers take per-partition stripe write locks
-// (cmdSAddPart/cmdSRemPart), so this read-locks all P partition stripes, deduplicated because two
-// partitions can hash to one stripe and recursive read-locking one RWMutex can deadlock a waiting
-// writer. Under those held read locks the member rows are frozen.
-//
-// The array is framed from a counting pass, not the header count: a partitioned write bumps the
-// shared cardinality with a lock-free CountAddInt64 only after it releases its partition lock
-// (setBumpCard), so the header count can momentarily lag the actual rows even with the writers
-// excluded. Framing from a first pass that counts the frozen rows and streaming them in a second
-// pass guarantees the framed length equals the number of members emitted. The member starts one
-// byte past the whole-set prefix because the partition byte precedes it, so it strips plen+1.
-func (c *connState) streamSetPart(skey []byte, p int) {
-	if c.stringConflict(skey) {
-		c.writeErr(wrongType)
-		return
-	}
-	stripes := c.lockSetPartitionsShared(skey, p)
-	defer c.unlockSetPartitionsShared(stripes)
-
-	prefix := c.setPrefix(skey)
-	moff := len(prefix) + 1
-	scan := make([][]byte, 0, hashScanBatch)
-
-	// Pass 1: count the frozen member rows so the frame matches exactly what pass 2 streams.
-	var n int
-	var after []byte
-	for {
-		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
-		if len(keys) == 0 {
-			break
-		}
-		n += len(keys)
-		if last == nil {
-			break
-		}
-		after = last
-	}
-	c.writeArrayHeader(n)
-
-	// Pass 2: stream the same rows, stripping the partition byte to recover each member.
-	after = nil
-	for {
-		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
-		if len(keys) == 0 {
-			break
-		}
-		for _, k := range keys {
-			c.writeBulk(k[moff:])
 		}
 		if last == nil {
 			break
@@ -853,6 +916,20 @@ func (c *connState) cmdSScan(argv [][]byte) {
 		return
 	}
 
+	// When adaptive partitioning is on, a concurrent engage could grow this set during the window
+	// read, moving the member one byte along and rewriting the rows under the whole-set prefix, so
+	// freeze the layout with rlockSet for the single bounded scan and the partition-byte strip so they
+	// agree on one P. The cursor stays loose either way (a member added or removed mid-iteration may or
+	// may not appear). With the feature off no engage ever runs, so the scan stays lock-free as before
+	// and reads the partition count directly (the forceP microbench hook can still partition a set
+	// without arming the trigger). The scanned keys and the cursor key are arena-stable subslices, so
+	// they remain valid to frame and write after the lock releases.
+	p := c.partitionsFor(skey)
+	var unlock func()
+	if c.srv.setPartMax > 1 {
+		p, unlock = c.rlockSet(skey)
+	}
+
 	prefix := c.setPrefix(skey)
 	initCap := count
 	if initCap > hashScanBatch {
@@ -868,7 +945,7 @@ func (c *connState) cmdSScan(argv [][]byte) {
 	// the partition byte precedes it, so both the MATCH filter and the reply strip plen+1 (spec
 	// 2064/f1_rewrite_ltm/19 section 6.8).
 	moff := len(prefix)
-	if c.partitionsFor(skey) > 1 {
+	if p > 1 {
 		moff++
 	}
 	matched := keys[:0]
@@ -884,6 +961,9 @@ func (c *connState) cmdSScan(argv [][]byte) {
 		cursor = []byte{'0'}
 	} else {
 		cursor = []byte(hex.EncodeToString(last))
+	}
+	if unlock != nil {
+		unlock()
 	}
 
 	c.writeArrayHeader(2)
@@ -993,6 +1073,30 @@ func (c *connState) cmdSRandMember(argv [][]byte) {
 		// itself on this first draw by scanning the live ordered run, so it needs no
 		// SyncPendingRemovals reconcile (the scan already skips a tombstoned-but-not-yet-spliced
 		// node) and no separate cardinality probe (an empty or missing set draws ok=false).
+		//
+		// When adaptive partitioning is armed the lock-free draw must freeze the layout: a migration
+		// that grows this key mid-draw drops the whole-set draw vector (engage phase 4) out from under
+		// the select. Taking the whole-key stripe shared and re-reading P routes to the partitioned
+		// draw if the set grew, and otherwise holds off a migration for the span of the read. When the
+		// feature is off (setPartMax<=1) the path stays lock-free exactly as before.
+		if c.srv.setPartMax > 1 {
+			mu := &c.srv.incrMu[c.srv.stripe(skey)]
+			mu.RLock()
+			if p := c.partitionsFor(skey); p > 1 {
+				mu.RUnlock()
+				c.cmdSRandMemberPart(argv, p)
+				return
+			}
+			prefix := c.setPrefix(skey)
+			k, ok := c.srv.store.CollRandSelect(prefix, c.nextRand())
+			mu.RUnlock()
+			if !ok {
+				c.writeNil()
+				return
+			}
+			c.writeBulk(k[len(prefix):])
+			return
+		}
 		prefix := c.setPrefix(skey)
 		k, ok := c.srv.store.CollRandSelect(prefix, c.nextRand())
 		if !ok {
@@ -1016,6 +1120,16 @@ func (c *connState) cmdSRandMember(argv [][]byte) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
+	}
+	// A migration could have grown this key while the count form waited on the whole-key stripe. The
+	// re-read routes the count draw to the partitioned path, which the migration published before it
+	// dropped the whole-set vector, so the sample runs against a layout that will not vanish under it.
+	if c.srv.setPartMax > 1 {
+		if p := c.partitionsFor(skey); p > 1 {
+			mu.Unlock()
+			c.cmdSRandMemberPart(argv, p)
+			return
+		}
 	}
 	// Reconcile any deferred SREM splices before rank-based sampling: the stripe lock keeps this
 	// key's cardinality and ordered index consistent across the multi-pick sample, and draining
@@ -1095,6 +1209,16 @@ func (c *connState) cmdSPop(argv [][]byte) {
 		mu.Unlock()
 		c.writeErr(wrongType)
 		return
+	}
+	// A migration could have grown this key while the pop waited on the whole-key stripe, moving its
+	// members into the partitioned layout and dropping the whole-set draw vector. Re-read P and route
+	// to the partitioned pop, which the migration published before it dropped the vector.
+	if c.srv.setPartMax > 1 {
+		if p := c.partitionsFor(skey); p > 1 {
+			mu.Unlock()
+			c.cmdSPopPart(skey, count, hasCount, p)
+			return
+		}
 	}
 	if !hasCount {
 		// No-count form: draw one uniform victim from the dense member vector and swap-remove it
@@ -1176,12 +1300,35 @@ func (c *connState) cmdSPop(argv [][]byte) {
 // looping the single draw; the positive-count form draws up to count distinct members without
 // replacement. A missing or empty set yields nil for the no-count form and an empty array for the
 // count form, matching the unpartitioned path.
-func (c *connState) cmdSRandMemberPart(argv [][]byte, p int) {
+func (c *connState) cmdSRandMemberPart(argv [][]byte, _ int) {
 	skey := argv[1]
 	if c.stringConflict(skey) {
 		c.writeErr(wrongType)
 		return
 	}
+	// Freeze the layout for the span of the draw: rlockSet holds the P partition stripes (or the
+	// whole-key stripe when the set is unpartitioned) shared, so a migration that would drop the draw
+	// vectors is excluded and the P it re-reads is the one in force. The p the caller routed on is
+	// advisory; rlockSet re-reads the authoritative value and returns 1 if a DELETE plus recreate
+	// reset the key to the unpartitioned layout while the caller waited, in which case the draw runs
+	// off the whole-set vector exactly as the unpartitioned path does.
+	p, unlock := c.rlockSet(skey)
+	defer unlock()
+
+	if p <= 1 {
+		// A DELETE plus recreate reset the key to the unpartitioned layout after the caller routed
+		// here on P>1. The set the routed draw was aimed at no longer exists, so the empty reply
+		// orders exactly at that delete, a valid linearization since a concurrent SRANDMEMBER carries
+		// no ordering against the recreate. The no-count form replies nil, the count form an empty
+		// array, matching what the unpartitioned path returns for a missing key.
+		if len(argv) == 2 {
+			c.writeNil()
+		} else {
+			c.writeArrayHeader(0)
+		}
+		return
+	}
+
 	base := c.partScanBase(skey)
 
 	if len(argv) == 2 {
@@ -1252,6 +1399,13 @@ func (c *connState) cmdSPopPart(skey []byte, count int64, hasCount bool, p int) 
 		for attempt := 0; attempt < 16; attempt++ {
 			part := c.srv.store.CollPartPick(base, p, c.nextRand())
 			if part < 0 {
+				// An empty pick over [0,p) can mean a migration grew the set and re-homed members into
+				// partitions p and above that this stale p does not scan. Re-read P; if it grew, retry
+				// the pick over the wider layout before concluding the set is empty (section 6.6.1).
+				if np := c.partitionsFor(skey); np > p {
+					p = np
+					continue
+				}
 				c.writeNil()
 				return
 			}
@@ -1292,6 +1446,12 @@ func (c *connState) cmdSPopPart(skey []byte, count int64, hasCount bool, p int) 
 	for len(out) < want {
 		part := c.srv.store.CollPartPick(base, p, c.nextRand())
 		if part < 0 {
+			// A migration may have grown the set and re-homed members above the stale p; re-read P and
+			// retry over the wider layout before concluding the set drained (section 6.6.1).
+			if np := c.partitionsFor(skey); np > p {
+				p = np
+				continue
+			}
 			break
 		}
 		mu := &c.srv.incrMu[c.srv.stripePart(skey, part)]
