@@ -1428,8 +1428,18 @@ func (c *connState) cmdSPopPart(skey []byte, count int64, hasCount bool, p int) 
 				continue
 			}
 			member := k[len(base):]
+			// Delete the hash-index row, then defer the ordered-index splice to the folder in one
+			// batched tombstone (spec 2064/16 slice 2) rather than splicing inline under the store's
+			// single global index lock. An inline splice re-serialized every partition's pops on that
+			// one lock, undoing the stripe split the partitioning bought; the whole-key SPOP path
+			// (cmdSPop) already defers for exactly this reason. k is a stable arena subslice, so packing
+			// it and returning its member tail after the delete stays valid.
 			if c.srv.store.DeleteKind(k, kindSetMember) {
-				c.srv.store.CollRemove(k)
+				buf := append(c.delKeyBuf[:0], k...)
+				c.delKeyBuf = buf
+				ends := append(c.delKeyEnd[:0], len(buf))
+				c.delKeyEnd = ends
+				c.srv.store.CollRemovePacked(buf, ends, kindSetMember)
 			}
 			mu.Unlock()
 			c.setBumpCard(skey, -1, p)
@@ -1472,8 +1482,15 @@ func (c *connState) cmdSPopPart(skey []byte, count int64, hasCount bool, p int) 
 			mu.Unlock()
 			continue
 		}
+		// Defer the ordered-index splice to the folder, same as the no-count form above, so a
+		// multi-member pop does not take the global index lock once per popped member on the reply
+		// path. delKeyBuf is copied into the tombstone, so reusing it next iteration is safe.
 		if c.srv.store.DeleteKind(k, kindSetMember) {
-			c.srv.store.CollRemove(k)
+			buf := append(c.delKeyBuf[:0], k...)
+			c.delKeyBuf = buf
+			ends := append(c.delKeyEnd[:0], len(buf))
+			c.delKeyEnd = ends
+			c.srv.store.CollRemovePacked(buf, ends, kindSetMember)
 		}
 		mu.Unlock()
 		out = append(out, k[len(base):])
