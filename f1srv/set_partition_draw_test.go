@@ -358,6 +358,47 @@ func BenchmarkSetPartitionPopContention(b *testing.B) {
 	}
 }
 
+// BenchmarkSetPartitionPopDrain mirrors the wire SPOP workload the two-box evidence measured: one
+// large hot key drained by many concurrent poppers with no re-add, so the pop path is measured in
+// isolation instead of mixed with SADD's own ordered-index insert. Run it with a fixed iteration
+// count below the prefill size (go test -benchtime=400000x) so the set never empties and every
+// iteration is a real pop. The set is large (prefillDrain members) on purpose: the ordered-index
+// splice the pop drives is O(log n) held under the store's single global index lock, so its cost and
+// the contention it creates grow with the set, which an 8192-member cache-resident set hides. The
+// deferred-splice pop (this file's fix) takes that splice off the reply path, so the poppers stay on
+// their split partition stripes instead of re-serializing on the one index lock.
+const prefillDrain = 1 << 20
+
+func BenchmarkSetPartitionPopDrain(b *testing.B) {
+	for _, p := range []int{1, 8} {
+		b.Run(fmt.Sprintf("P=%d", p), func(b *testing.B) {
+			srv := newPartServer(b, p)
+			defer srv.Close()
+			key := "hot"
+			c0 := bareConn(srv)
+			// Prefill in chunks so one SADD argv does not balloon to a million elements.
+			const chunk = 4096
+			for base := 0; base < prefillDrain; base += chunk {
+				args := make([]string, 0, chunk+2)
+				args = append(args, "SADD", key)
+				for i := base; i < base+chunk && i < prefillDrain; i++ {
+					args = append(args, fmt.Sprintf("ele:%012d", i))
+				}
+				call(c0, func(c *connState, a [][]byte) { c.cmdSAdd(a) }, args...)
+			}
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				c := bareConn(srv)
+				spop := [][]byte{[]byte("SPOP"), []byte(key)}
+				for pb.Next() {
+					c.out = c.out[:0]
+					c.cmdSPop(spop)
+				}
+			})
+		})
+	}
+}
+
 // parseBulkBytes is the allocation-free byte form of parseBulk for the hot benchmark loop: it returns
 // the member payload as a subslice of the reply buffer rather than a fresh string.
 func parseBulkBytes(s []byte) ([]byte, bool) {
