@@ -67,12 +67,17 @@ type Config struct {
 }
 
 // Built-in defaults for the adaptive set-partitioning knobs, used when the feature is on
-// (SetPartitionMax > 1) but the threshold or target is left unset. They sit in the middle of the
-// ranges spec 2064/f1_rewrite_ltm/19 section 3 proposes (engage threshold 10k-100k, target
-// 64k-256k members per partition) and are the values slice 6c's microbenchmark sweep replaces.
+// (SetPartitionMax > 1) but the threshold or target is left unset. Slice 6c's microbenchmark sweep
+// settled both from the clean (allocation-free) grid on the 14-data-core GamingPC: the exclusive-lock
+// write split pays off from P=4 upward with no uncontended tax, while the non-destructive weighted
+// draw pays a tax that climbs with P. So engagement is gated to genuinely large hot sets (threshold
+// 262144, the cardinality band where a set stops fitting comfortably in cache and write contention is
+// the plausible bottleneck) and the target is sized (262144 members per partition) so an engaged set
+// lands on P=4 and only climbs to P=8/P=16 past ~2M/~4M members, keeping the common case at the sweep's
+// balance point rather than the draw-taxing high-P end.
 const (
-	defaultSetPartitionThreshold = 1 << 16 // 65536: a set engages once it crosses this cardinality
-	defaultSetPartitionTarget    = 1 << 17 // 131072: the members-per-partition a grow aims for
+	defaultSetPartitionThreshold = 1 << 18 // 262144: a set engages once it crosses this cardinality
+	defaultSetPartitionTarget    = 1 << 18 // 262144: the members-per-partition a grow aims for
 )
 
 // DefaultConfig returns a config sized for a multi-million-key in-memory benchmark.
