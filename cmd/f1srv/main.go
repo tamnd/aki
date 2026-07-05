@@ -38,6 +38,14 @@ func main() {
 	indexBuckets := fs.Int("index-buckets", 1<<22, "f1raw index buckets")
 	arenaBytes := fs.Int("arena-bytes", 2<<30, "f1raw arena size in bytes")
 	stripes := fs.Int("incr-stripes", 1<<10, "INCR-family RMW lock stripes")
+	// Adaptive intra-key set partitioning (spec 2064/f1_rewrite_ltm/19). Off by default:
+	// --set-partition-max 1 leaves every set unpartitioned on its existing single-lock body.
+	// Above 1 a hot set that reaches --set-partition-threshold members grows toward
+	// min(max, roundUpPow2(card/target)) partitions so its single-key writes scale with cores.
+	// The threshold and target default to the slice-6c sweep winners when left at 0.
+	setPartMax := fs.Int("set-partition-max", 1, "cap on partitions one hot set can engage (1 = feature off); rounded up to a power of two")
+	setPartThreshold := fs.Int("set-partition-threshold", 0, "cardinality at which a set first engages partitioning (0 = built-in default)")
+	setPartTarget := fs.Int("set-partition-target", 0, "members-per-partition a grow aims for (0 = built-in default)")
 	ltmCold := fs.Bool("ltm-cold", false, "engage the larger-than-memory string tier: separate large values to a cold log under --dir")
 	sepThreshold := fs.Int("sep-threshold", 0, "inline-vs-separated value cutoff in bytes for --ltm-cold (0 = engine default)")
 	pprofAddr := fs.String("pprof", "", "if set, serve net/http/pprof on this host:port (profiling only, off by default)")
@@ -80,6 +88,9 @@ func main() {
 	cfg.IncrStripes = *stripes
 	cfg.NetMode = *netMode
 	cfg.ExecModel = *execModel
+	cfg.SetPartitionMax = *setPartMax
+	cfg.SetPartitionThreshold = *setPartThreshold
+	cfg.SetPartitionTarget = *setPartTarget
 	if *ltmCold {
 		cfg.ColdPath = filepath.Join(*dir, "f1raw-cold.vlog")
 		cfg.SepThreshold = *sepThreshold
@@ -106,8 +117,12 @@ func main() {
 	if *gomemlimit > 0 {
 		memlimit = fmt.Sprintf("%dMiB", *gomemlimit>>20)
 	}
-	fmt.Printf("f1srv listening on %s (index-buckets=%d arena=%dMiB cold=%s gogc=%d gomemlimit=%s)\n",
-		srv.Addr(), *indexBuckets, *arenaBytes>>20, cold, effGOGC, memlimit)
+	setPart := "off"
+	if *setPartMax > 1 {
+		setPart = fmt.Sprintf("max=%d", *setPartMax)
+	}
+	fmt.Printf("f1srv listening on %s (index-buckets=%d arena=%dMiB cold=%s gogc=%d gomemlimit=%s set-partition=%s)\n",
+		srv.Addr(), *indexBuckets, *arenaBytes>>20, cold, effGOGC, memlimit, setPart)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("f1srv: serve: %v", err)
 	}
