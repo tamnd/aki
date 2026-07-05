@@ -45,6 +45,40 @@ func sscanCall(t *testing.T, rw *bufio.ReadWriter, args ...string) sscanReply {
 	return sscanReply{cursor: cur[1:], items: items}
 }
 
+// readMemberSet reads a RESP array of bulk members into a set, so an order-insensitive
+// enumeration can be asserted by membership rather than sequence. Redis leaves SMEMBERS and
+// SSCAN order unspecified, and aki enumerates off the dense member vector (spec
+// 2064/f1_rewrite_ltm/20), not in sorted key order, so the tests compare member sets.
+func readMemberSet(t *testing.T, rw *bufio.ReadWriter, want int) map[string]bool {
+	t.Helper()
+	ah := readReply(t, rw)
+	if ah != fmt.Sprintf("*%d", want) {
+		t.Fatalf("array header = %q, want *%d", ah, want)
+	}
+	got := make(map[string]bool, want)
+	for i := 0; i < want; i++ {
+		b := readReply(t, rw)
+		if len(b) == 0 || b[0] != '$' {
+			t.Fatalf("member %d = %q, want a bulk string", i, b)
+		}
+		got[b[1:]] = true
+	}
+	return got
+}
+
+// wantMembers asserts a decoded member set equals exactly the given members.
+func wantMembers(t *testing.T, got map[string]bool, members ...string) {
+	t.Helper()
+	if len(got) != len(members) {
+		t.Fatalf("got %d members, want %d", len(got), len(members))
+	}
+	for _, m := range members {
+		if !got[m] {
+			t.Fatalf("member %q missing from reply", m)
+		}
+	}
+}
+
 // The set point path is element-per-row on f1raw, the hash with the value stripped:
 // SADD writes one empty-valued member row and maintains the header count, SISMEMBER is a
 // single lock-free index probe, and SCARD reads the header count with no scan.
@@ -163,8 +197,9 @@ func TestSetWrongTypeOnString(t *testing.T) {
 	expect(t, rw, "$v")
 }
 
-// SMEMBERS enumerates one set in member-byte order off the ordered index, framing the
-// RESP array from the maintained header count so the length always matches what streams.
+// SMEMBERS enumerates one set off the dense member vector, framing the RESP array from the
+// vector length so it always matches what streams. Order is unspecified (Redis leaves it so),
+// so the reply is asserted as a member set.
 func TestSetMembers(t *testing.T) {
 	rw, cleanup := dialTestServer(t)
 	defer cleanup()
@@ -173,10 +208,7 @@ func TestSetMembers(t *testing.T) {
 	expect(t, rw, ":3")
 
 	cmd(t, rw, "SMEMBERS", "s")
-	expect(t, rw, "*3")
-	expect(t, rw, "$a")
-	expect(t, rw, "$b")
-	expect(t, rw, "$c")
+	wantMembers(t, readMemberSet(t, rw, 3), "a", "b", "c")
 }
 
 // A missing set enumerates as an empty array, not an error or nil.
@@ -198,14 +230,11 @@ func TestSetMembersAfterMutate(t *testing.T) {
 	expect(t, rw, ":3")
 	cmd(t, rw, "SREM", "s", "b")
 	expect(t, rw, ":1")
-	cmd(t, rw, "SADD", "s", "b") // re-add, back in order
+	cmd(t, rw, "SADD", "s", "b") // re-add
 	expect(t, rw, ":1")
 
 	cmd(t, rw, "SMEMBERS", "s")
-	expect(t, rw, "*3")
-	expect(t, rw, "$a")
-	expect(t, rw, "$b")
-	expect(t, rw, "$c")
+	wantMembers(t, readMemberSet(t, rw, 3), "a", "b", "c")
 }
 
 // Enumeration must stream more members than one internal scan batch without dropping or
@@ -226,9 +255,11 @@ func TestSetMembersManyMembers(t *testing.T) {
 	expect(t, rw, fmt.Sprintf(":%d", n))
 
 	cmd(t, rw, "SMEMBERS", "big")
-	expect(t, rw, fmt.Sprintf("*%d", n))
+	got := readMemberSet(t, rw, n)
 	for i := 0; i < n; i++ {
-		expect(t, rw, "$"+fmt.Sprintf("m%05d", i))
+		if !got[fmt.Sprintf("m%05d", i)] {
+			t.Fatalf("member m%05d missing from SMEMBERS", i)
+		}
 	}
 }
 
@@ -244,7 +275,7 @@ func TestSetMembersWrongType(t *testing.T) {
 }
 
 // SSCAN walks a small set in one batch when COUNT covers it: cursor 0 back means the
-// iteration is complete, and the results are the flat members in member-byte order.
+// iteration is complete, and the results are the flat members (order unspecified).
 func TestSetScanOneBatch(t *testing.T) {
 	rw, cleanup := dialTestServer(t)
 	defer cleanup()
@@ -253,13 +284,15 @@ func TestSetScanOneBatch(t *testing.T) {
 	expect(t, rw, ":3")
 
 	// COUNT 100 scans the whole three-member set in one call, so the cursor comes back 0.
-	cmd(t, rw, "SSCAN", "s", "0", "COUNT", "100")
-	expect(t, rw, "*2")
-	expect(t, rw, "$0") // cursor "0" means the iteration is complete
-	expect(t, rw, "*3")
-	expect(t, rw, "$a")
-	expect(t, rw, "$b")
-	expect(t, rw, "$c")
+	reply := sscanCall(t, rw, "SSCAN", "s", "0", "COUNT", "100")
+	if reply.cursor != "0" {
+		t.Fatalf("cursor = %q, want 0 (iteration complete)", reply.cursor)
+	}
+	got := map[string]bool{}
+	for _, m := range reply.items {
+		got[m] = true
+	}
+	wantMembers(t, got, "a", "b", "c")
 }
 
 // A missing set scans as a completed empty iteration: cursor 0 and no results.
@@ -282,12 +315,15 @@ func TestSetScanMatch(t *testing.T) {
 	expect(t, rw, ":3")
 
 	// Only the user:* members survive.
-	cmd(t, rw, "SSCAN", "s", "0", "COUNT", "100", "MATCH", "user:*")
-	expect(t, rw, "*2")
-	expect(t, rw, "$0")
-	expect(t, rw, "*2")
-	expect(t, rw, "$user:1")
-	expect(t, rw, "$user:2")
+	reply := sscanCall(t, rw, "SSCAN", "s", "0", "COUNT", "100", "MATCH", "user:*")
+	if reply.cursor != "0" {
+		t.Fatalf("cursor = %q, want 0 (iteration complete)", reply.cursor)
+	}
+	got := map[string]bool{}
+	for _, m := range reply.items {
+		got[m] = true
+	}
+	wantMembers(t, got, "user:1", "user:2")
 }
 
 // A full iteration with a small COUNT returns every member exactly once across batches:
