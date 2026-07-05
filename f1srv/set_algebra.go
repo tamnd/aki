@@ -177,36 +177,63 @@ func (sc *setCursor) advance() {
 // uses, so exclusive algebra locks and shared SMEMBERS locks over overlapping partition
 // stripes acquire in one order and never form a cycle. The distinct-stripe set stays small,
 // so the linear dedup and insertion sort cost nothing measurable.
+// When adaptive partitioning is off no key's P ever changes, so one pass locks the exact stripe set.
+// When it is armed a migration could grow one of these keys after this reads its P but before it
+// takes the stripes, leaving the key's new partitions unlocked. The retry re-reads every key's P
+// under the acquired locks and, if any grew, releases and redoes the acquisition over the wider
+// layout. It converges because P only ever rises and is bounded by the configured cap, and it takes
+// the same ascending stripe-index order every iteration, so a migration holding an overlapping
+// superset of stripes and this call can never form a cycle.
 func (c *connState) lockStripes(keys [][]byte) func() {
-	idxs := make([]uint32, 0, len(keys))
-	add := func(s uint32) {
-		for _, e := range idxs {
-			if e == s {
-				return
+	for {
+		idxs := make([]uint32, 0, len(keys))
+		add := func(s uint32) {
+			for _, e := range idxs {
+				if e == s {
+					return
+				}
+			}
+			idxs = append(idxs, s)
+		}
+		ps := make([]int, len(keys))
+		for i, k := range keys {
+			p := c.partitionsFor(k)
+			ps[i] = p
+			if p > 1 {
+				for part := 0; part < p; part++ {
+					add(c.srv.stripePart(k, part))
+				}
+			} else {
+				add(c.srv.stripe(k))
 			}
 		}
-		idxs = append(idxs, s)
-	}
-	for _, k := range keys {
-		if p := c.partitionsFor(k); p > 1 {
-			for part := 0; part < p; part++ {
-				add(c.srv.stripePart(k, part))
+		for i := 1; i < len(idxs); i++ {
+			for j := i; j > 0 && idxs[j] < idxs[j-1]; j-- {
+				idxs[j], idxs[j-1] = idxs[j-1], idxs[j]
 			}
-		} else {
-			add(c.srv.stripe(k))
 		}
-	}
-	for i := 1; i < len(idxs); i++ {
-		for j := i; j > 0 && idxs[j] < idxs[j-1]; j-- {
-			idxs[j], idxs[j-1] = idxs[j-1], idxs[j]
+		for _, s := range idxs {
+			c.srv.incrMu[s].Lock()
 		}
-	}
-	for _, s := range idxs {
-		c.srv.incrMu[s].Lock()
-	}
-	return func() {
-		for i := len(idxs) - 1; i >= 0; i-- {
-			c.srv.incrMu[idxs[i]].Unlock()
+		if c.srv.setPartMax > 1 {
+			stale := false
+			for i, k := range keys {
+				if c.partitionsFor(k) != ps[i] {
+					stale = true
+					break
+				}
+			}
+			if stale {
+				for i := len(idxs) - 1; i >= 0; i-- {
+					c.srv.incrMu[idxs[i]].Unlock()
+				}
+				continue
+			}
+		}
+		return func() {
+			for i := len(idxs) - 1; i >= 0; i-- {
+				c.srv.incrMu[idxs[i]].Unlock()
+			}
 		}
 	}
 }
