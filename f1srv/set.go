@@ -721,24 +721,24 @@ func (c *connState) cmdSCard(argv [][]byte) {
 }
 
 // streamSet is the enumeration body for SMEMBERS. It freezes the set's partition layout with
-// rlockSet so the member rows it walks cannot move under it and the returned P matches the rows it
-// streams even across a concurrent engage, rejects a string of the same key as WRONGTYPE, and walks
-// the ordered element index in bounded batches, emitting each member (the composite key past the
-// prefix) in member-byte order.
+// rlockSet so the members it walks cannot move under it and the returned P matches what it streams
+// even across a concurrent engage, rejects a string of the same key as WRONGTYPE, and walks the
+// dense member vector in bounded batches, emitting each member (the composite key past the prefix).
 //
-// An unpartitioned set (P==1) frames the RESP array from the header count, which stays exactly equal
-// to the live member-row count because every SADD pairs CollInsert with a count bump and every SREM
-// pairs CollRemove with a decrement under the whole-key stripe rlockSet holds shared.
+// It reads the member vector rather than the ordered element index (spec 2064/f1_rewrite_ltm/20):
+// the vector is a dense array of arena offsets, so a walk is a linear index sweep with one key
+// resolve each, no skip-list descent and no per-node comparison or liveness filter, and a repeated
+// enumeration reuses the already-built vector. SetVecScanDown walks a partition's published snapshot
+// from the top down; under the frozen layout one drained sequence of calls returns every member
+// exactly once, and SetVecLen gives the exact frame because no writer can shrink the vector while
+// rlockSet holds the stripes shared. The vector is built on first use from the same live members the
+// ordered index holds, so an unenumerated, undrawn set pays one O(card) build here and O(1) after.
 //
-// A partitioned set (P>1) stores its members as P partitions, and because the partition byte sits
-// between the length-prefixed set key and the member (appendPartMemberKey), the whole-set prefix
-// bounds every partition's rows in one contiguous (partition, member)-ordered run, so a single walk
-// sweeps all P partitions with no per-partition scan. It frames from a first counting pass rather
-// than the header count: a partitioned write bumps the shared cardinality with a lock-free
-// CountAddInt64 only after it releases its partition lock (setBumpCard), so the header count can lag
-// the frozen rows even with the writers excluded, and counting the frozen rows first guarantees the
-// framed length equals what the second pass streams. The member starts one byte past the prefix
-// because the partition byte precedes it, so the partitioned pass strips plen+1.
+// An unpartitioned set (P==1) walks the single whole-set vector; the member is the composite key
+// past the length-prefixed set key, so it strips plen. A partitioned set (P>1) walks the P partition
+// vectors in turn, each keyed by the partition-scan prefix uvarint(len(skey))|skey|byte(part); the
+// partition byte precedes the member (appendPartMemberKey), so a partitioned member sits one byte
+// further in, at k[len(base):].
 func (c *connState) streamSet(skey []byte) {
 	p, unlock := c.rlockSet(skey)
 	defer unlock()
@@ -746,61 +746,49 @@ func (c *connState) streamSet(skey []byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	prefix := c.setPrefix(skey)
 	scan := make([][]byte, 0, hashScanBatch)
 
 	if p > 1 {
-		// Pass 1: count the frozen member rows so the frame matches exactly what pass 2 streams.
+		base := c.partScanBase(skey)
+		moff := len(base) // member starts right after uvarint(len)|skey|byte(part)
+		// Resolve each partition vector through the descriptor (SetPartVec*, not SetVec*), so a vector
+		// this enumeration builds is registered for descriptor-driven teardown. CollRandDrop drops only
+		// the partition vectors a descriptor names, so a vector built straight through the shard would
+		// survive a later DEL+recreate or a grow's Phase 4 re-home and go stale (spec 2064/20 section 6).
 		var n int
-		var after []byte
-		for {
-			keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
-			if len(keys) == 0 {
-				break
-			}
-			n += len(keys)
-			if last == nil {
-				break
-			}
-			after = last
+		for part := 0; part < p; part++ {
+			n += c.srv.store.SetPartVecLen(base, p, part)
 		}
 		c.writeArrayHeader(n)
-
-		// Pass 2: stream the same rows, stripping the partition byte to recover each member.
-		moff := len(prefix) + 1
-		after = nil
-		for {
-			keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
-			if len(keys) == 0 {
-				break
+		for part := 0; part < p; part++ {
+			hi := -1
+			for {
+				keys, next := c.srv.store.SetPartVecScanDown(base, p, part, hi, hashScanBatch, scan[:0])
+				for _, k := range keys {
+					c.writeBulk(k[moff:])
+				}
+				if next == 0 {
+					break
+				}
+				hi = next
 			}
-			for _, k := range keys {
-				c.writeBulk(k[moff:])
-			}
-			if last == nil {
-				break
-			}
-			after = last
 		}
 		return
 	}
 
-	count := c.setCard(skey)
-	c.writeArrayHeader(int(count))
+	prefix := c.setPrefix(skey)
 	plen := len(prefix)
-	var after []byte
+	c.writeArrayHeader(c.srv.store.SetVecLen(prefix))
+	hi := -1
 	for {
-		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
-		if len(keys) == 0 {
-			break
-		}
+		keys, next := c.srv.store.SetVecScanDown(prefix, hi, hashScanBatch, scan[:0])
 		for _, k := range keys {
 			c.writeBulk(k[plen:])
 		}
-		if last == nil {
+		if next == 0 {
 			break
 		}
-		after = last
+		hi = next
 	}
 }
 
@@ -864,16 +852,25 @@ func (c *connState) cmdSMembers(argv [][]byte) {
 // materializing it. The set has no per-member value, so SSCAN returns a flat member array
 // with no NOVALUES option, unlike HSCAN.
 //
-// Cursor encoding mirrors HSCAN: "0" starts a fresh iteration and "0" is returned when it
-// completes, and any live position is the hex of the last composite key returned. A
-// composite key always carries the uvarint length prefix, so it is never empty and its
-// hex is never the single byte "0", which keeps a live cursor from ever colliding with the
-// done sentinel.
+// It walks the dense member vector top-down rather than the ordered index (spec
+// 2064/f1_rewrite_ltm/20 section 5): the vector is a swap-remove array, so descending from
+// the current top toward index zero is what keeps a member present for the whole scan
+// reachable exactly once even as concurrent removes move the tail into holes below the
+// cursor. The opaque cursor carries the resume index rather than a key: "0" starts a fresh
+// iteration and "0" is returned when the walk reaches index zero. For an unpartitioned set
+// it is the uvarint of the next lower boundary (always > 0 while live, so its hex is never
+// the single byte "0"); for a partitioned set it is uvarint(P) | uvarint(partition) |
+// uvarint(boundary+1), where the leading P lets a concurrent engage that grew the set be
+// detected and the scan restarted, and boundary+1 == 0 means "start at this partition's
+// top". One call scans within a single partition, and the partition byte biases the member
+// offset by one; a partition boundary is crossed by resuming the next partition on the
+// following call.
 //
-// Cursor stability: a member present for the whole scan and never removed is returned
-// exactly once (the ordered index walks each key once and the cursor resumes strictly
-// after the last one), and a member added or removed mid-scan may or may not appear. The
-// scan is lock-free like the other set reads.
+// Cursor stability: a member present for the whole scan and never removed is returned at
+// least once (the descending sweep covers every index a present member can occupy), and a
+// member added or removed mid-scan may or may not appear, which the SCAN contract allows.
+// The vector is built on first use and the scan is otherwise lock-free like the other set
+// reads.
 func (c *connState) cmdSScan(argv [][]byte) {
 	// SSCAN key cursor [MATCH pattern] [COUNT count]
 	if len(argv) < 3 {
@@ -940,37 +937,65 @@ func (c *connState) cmdSScan(argv [][]byte) {
 		p, unlock = c.rlockSet(skey)
 	}
 
-	prefix := c.setPrefix(skey)
 	initCap := count
 	if initCap > hashScanBatch {
 		initCap = hashScanBatch
 	}
 	scan := make([][]byte, 0, initCap)
-	keys, last := c.srv.store.CollScan(prefix, after, count, scan)
 
-	// The whole-set prefix bounds every partition's rows in (partition, member) order, so one
-	// bounded window naturally crosses partition boundaries and the opaque cursor (the hex of the
-	// last composite key, which carries the partition byte) resumes into the next partition with no
-	// special cursor layout. For a partitioned set the member sits one byte past the prefix because
-	// the partition byte precedes it, so both the MATCH filter and the reply strip plen+1 (spec
-	// 2064/f1_rewrite_ltm/19 section 6.8).
-	moff := len(prefix)
+	var keys [][]byte
+	var cursor []byte
+	var moff int
+
 	if p > 1 {
-		moff++
+		// One call scans within one partition's vector. The cursor carries the partition it left
+		// off in and the within-partition boundary; a partition boundary is crossed by resuming the
+		// next partition on the following call. The partition byte precedes the member, so the
+		// member sits at k[len(base):].
+		base := c.partScanBase(skey)
+		moff = len(base)
+		part, hi := 0, -1
+		if ip, pt, hp, ok := decodeSScanPn(after); ok && ip == p && pt < p {
+			part = pt
+			if hp > 0 {
+				hi = hp - 1
+			}
+		}
+		// Resolve through the descriptor (SetPartVecScanDown) for the teardown-registration reason
+		// streamSet documents: an enumeration-built partition vector must be descriptor-named so a
+		// later drop tears it down rather than leaving it to go stale.
+		ks, next := c.srv.store.SetPartVecScanDown(base, p, part, hi, count, scan)
+		keys = ks
+		switch {
+		case next > 0:
+			cursor = sscanPnCursor(p, part, next+1)
+		case part+1 < p:
+			cursor = sscanPnCursor(p, part+1, 0)
+		default:
+			cursor = []byte{'0'}
+		}
+	} else {
+		prefix := c.setPrefix(skey)
+		moff = len(prefix)
+		hi := -1
+		if b, ok := decodeSScanP1(after); ok {
+			hi = b
+		}
+		ks, next := c.srv.store.SetVecScanDown(prefix, hi, count, scan)
+		keys = ks
+		if next > 0 {
+			cursor = sscanP1Cursor(next)
+		} else {
+			cursor = []byte{'0'}
+		}
 	}
+
 	matched := keys[:0]
 	for _, k := range keys {
 		if pattern != nil && !globMatch(pattern, k[moff:]) {
 			continue
 		}
 		matched = append(matched, k)
-	}
-
-	var cursor []byte
-	if len(keys) < count || last == nil {
-		cursor = []byte{'0'}
-	} else {
-		cursor = []byte(hex.EncodeToString(last))
 	}
 	if unlock != nil {
 		unlock()
@@ -982,6 +1007,59 @@ func (c *connState) cmdSScan(argv [][]byte) {
 	for _, k := range matched {
 		c.writeBulk(k[moff:])
 	}
+}
+
+// sscanP1Cursor encodes the unpartitioned SSCAN resume boundary (the lower index the next call
+// starts below) as an opaque hex cursor. boundary is always > 0 for a live cursor, so the uvarint's
+// first byte is nonzero and the hex is never the single-byte "0" done sentinel.
+func sscanP1Cursor(boundary int) []byte {
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(boundary))
+	return []byte(hex.EncodeToString(tmp[:n]))
+}
+
+// decodeSScanP1 reads an unpartitioned SSCAN cursor back to its resume boundary, reporting false for
+// the "0" fresh-start cursor (decoded to a nil slice) or any malformed input so the caller starts at
+// the vector's top.
+func decodeSScanP1(b []byte) (int, bool) {
+	v, n := binary.Uvarint(b)
+	if n <= 0 {
+		return 0, false
+	}
+	return int(v), true
+}
+
+// sscanPnCursor encodes a partitioned SSCAN resume point: the partition count it was issued under
+// (so a concurrent engage that grew the set is detected and the scan restarted), the partition
+// index, and the within-partition boundary biased by one so that zero means "start at this
+// partition's top". P is at least four when a set is partitioned, so the leading uvarint is nonzero
+// and the hex never collides with the "0" done sentinel.
+func sscanPnCursor(p, part, hiPlus1 int) []byte {
+	var tmp [3 * binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(p))
+	n += binary.PutUvarint(tmp[n:], uint64(part))
+	n += binary.PutUvarint(tmp[n:], uint64(hiPlus1))
+	return []byte(hex.EncodeToString(tmp[:n]))
+}
+
+// decodeSScanPn reads a partitioned SSCAN cursor back to (P, partition, boundary+1), reporting false
+// for the "0" fresh-start cursor or any short or malformed input so the caller restarts the scan.
+func decodeSScanPn(b []byte) (p, part, hiPlus1 int, ok bool) {
+	pv, n := binary.Uvarint(b)
+	if n <= 0 {
+		return 0, 0, 0, false
+	}
+	b = b[n:]
+	ptv, n := binary.Uvarint(b)
+	if n <= 0 {
+		return 0, 0, 0, false
+	}
+	b = b[n:]
+	hv, n := binary.Uvarint(b)
+	if n <= 0 {
+		return 0, 0, 0, false
+	}
+	return int(pv), int(ptv), int(hv), true
 }
 
 // setWalkAll appends every member of a set, in member order, to dst as arena-stable
