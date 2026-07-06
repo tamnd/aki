@@ -239,30 +239,55 @@ func (c *connState) rdbDumpHash(hkey []byte) []byte {
 
 // rdbDumpSet builds the RDB_TYPE_SET body for a set: the type byte, the member count, then each
 // member as an RDB string (a canonical integer member int-encodes, the way both servers store an
-// all-integer member). It holds the stripe lock and walks the members off the O(1) count and the
-// collection index, the enumerate path SMEMBERS uses, so it never materializes the whole set.
+// all-integer member). It freezes the partition layout with rlockSet and walks the dense member
+// vector the same way SMEMBERS does (spec 2064/f1_rewrite_ltm/20 section 5), so it never
+// materializes the whole set and never touches the global ordered index. The member count in the
+// header is the vector length under the frozen layout, so it always equals the number of members
+// the walk emits. The vector carries no order, so the members serialize in an implementation-defined
+// order, which RESTORE and both servers accept for a set.
 func (c *connState) rdbDumpSet(skey []byte) []byte {
-	mu := &c.srv.incrMu[c.srv.stripe(skey)]
-	mu.Lock()
-	defer mu.Unlock()
+	p, unlock := c.rlockSet(skey)
+	defer unlock()
 
-	payload := rdbAppendLen([]byte{rdbTypeSet}, c.setCard(skey))
+	scan := make([][]byte, 0, hashScanBatch)
+
+	if p > 1 {
+		base := c.partScanBase(skey)
+		moff := len(base) // member starts right after uvarint(len)|skey|byte(part)
+		var n int
+		for part := 0; part < p; part++ {
+			n += c.srv.store.SetPartVecLen(base, p, part)
+		}
+		payload := rdbAppendLen([]byte{rdbTypeSet}, uint64(n))
+		for part := 0; part < p; part++ {
+			hi := -1
+			for {
+				keys, next := c.srv.store.SetPartVecScanDown(base, p, part, hi, hashScanBatch, scan[:0])
+				for _, k := range keys {
+					payload = rdbAppendString(payload, k[moff:])
+				}
+				if next == 0 {
+					break
+				}
+				hi = next
+			}
+		}
+		return payload
+	}
+
 	prefix := c.setPrefix(skey)
 	plen := len(prefix)
-	var after []byte
-	scan := make([][]byte, 0, hashScanBatch)
+	payload := rdbAppendLen([]byte{rdbTypeSet}, uint64(c.srv.store.SetVecLen(prefix)))
+	hi := -1
 	for {
-		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
-		if len(keys) == 0 {
-			break
-		}
+		keys, next := c.srv.store.SetVecScanDown(prefix, hi, hashScanBatch, scan[:0])
 		for _, k := range keys {
 			payload = rdbAppendString(payload, k[plen:])
 		}
-		if last == nil {
+		if next == 0 {
 			break
 		}
-		after = last
+		hi = next
 	}
 	return payload
 }
