@@ -195,7 +195,7 @@ func (c *connState) sortReadSource(key []byte, typ keyKind) [][]byte {
 	case keyList:
 		return c.sortReadList(key)
 	case keySet:
-		return c.sortReadFamily(c.setPrefix(key), 0)
+		return c.sortReadSet(key)
 	case keyZset:
 		// A score-family row is keyed prefix | 8 sortable score bytes | member, so a byte-order
 		// scan yields members in score order and the member starts 8 bytes past the prefix.
@@ -225,6 +225,53 @@ func (c *connState) sortReadList(key []byte) [][]byte {
 			continue
 		}
 		out = append(out, append([]byte(nil), v...))
+	}
+	return out
+}
+
+// sortReadSet enumerates a set's members off the dense member vector rather than a raw ordered-run
+// scan, mirroring streamSet, so the SORT set source no longer leans on the global order index (the
+// oindex is being retired for the set type). SORT already holds the source key's exclusive stripe lock
+// through lockStripes, which freezes the partition layout (a grow takes the whole-key stripe) and, for
+// an unpartitioned set, the member writers as well, so the vector is read under a stable snapshot and
+// there is no need to re-take rlockSet (which would self-deadlock on the key stripe this command already
+// holds). partitionsFor is stable for the same reason. Each member is copied out because the shared scan
+// scratch is reused by the following BY/GET lookups. For a partitioned set the member starts past the
+// partition prefix (moff), which the old whole-prefix scan did not account for, so this also corrects
+// the lab-only P>1 path to match streamSet.
+func (c *connState) sortReadSet(skey []byte) [][]byte {
+	var out [][]byte
+	scan := make([][]byte, 0, hashScanBatch)
+	if p := c.partitionsFor(skey); p > 1 {
+		base := c.partScanBase(skey)
+		moff := len(base)
+		for part := 0; part < p; part++ {
+			hi := -1
+			for {
+				keys, next := c.srv.store.SetPartVecScanDown(base, p, part, hi, hashScanBatch, scan[:0])
+				for _, k := range keys {
+					out = append(out, append([]byte(nil), k[moff:]...))
+				}
+				if next == 0 {
+					break
+				}
+				hi = next
+			}
+		}
+		return out
+	}
+	prefix := c.setPrefix(skey)
+	plen := len(prefix)
+	hi := -1
+	for {
+		keys, next := c.srv.store.SetVecScanDown(prefix, hi, hashScanBatch, scan[:0])
+		for _, k := range keys {
+			out = append(out, append([]byte(nil), k[plen:]...))
+		}
+		if next == 0 {
+			break
+		}
+		hi = next
 	}
 	return out
 }
