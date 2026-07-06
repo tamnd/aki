@@ -437,6 +437,32 @@ func (c *connState) setBumpCard(skey []byte, delta, p int) int {
 	return 0
 }
 
+// setVectorFeeder returns a per-published-row callback the set reconstruction paths (COPY and RENAME)
+// run so a copied or renamed set is enumerable from its dense member vector right away, without a
+// first draw. Doc 20 makes the vector the authoritative membership structure, so every path that
+// creates set-member rows must feed it eagerly, not only the SADD write path: COPY and RENAME
+// republish each member under the destination key, so each freshly published row is added to the
+// destination's vector exactly as CollRandInsert/CollPartRandInsert add it on a routed SADD.
+//
+// destP is the destination's partition count, captured at the call site before engageP flips the
+// registry; engageP only publishes the registry entry and never tears down a vector (unlike a grow
+// migration's CollRandDrop), so a vector fed here survives the later engage. suffix is the published
+// key's bytes past the destination key header. For a partitioned destination the reconstruction
+// re-keyed each row verbatim, so suffix[0] is the partition byte carried over from the source row and
+// the feeder routes by it directly rather than decoding the member and recomputing PartitionOf. The
+// unpartitioned feeder rebuilds pbuf/ppbuf per call, distinct from the family loop's own nkbuf, so it
+// never disturbs the key being published.
+func (c *connState) setVectorFeeder(dst []byte, destP int) func(newKey, suffix []byte) {
+	if destP > 1 {
+		return func(newKey, suffix []byte) {
+			c.srv.store.CollPartRandInsert(c.partScanBase(dst), destP, int(suffix[0]), newKey, kindSetMember)
+		}
+	}
+	return func(newKey, suffix []byte) {
+		c.srv.store.CollRandInsert(c.setPrefix(dst), newKey, kindSetMember)
+	}
+}
+
 // cmdSAddPart is the P>1 routing of SADD (spec 2064/f1_rewrite_ltm/19 slice 3): each member routes
 // to partition f1raw.PartitionOf(member, p) and the add takes only that partition's stripe lock,
 // held across just this one member, so two members in different partitions of one hot key add on
