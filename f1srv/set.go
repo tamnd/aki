@@ -1062,28 +1062,29 @@ func decodeSScanPn(b []byte) (p, part, hiPlus1 int, ok bool) {
 	return int(pv), int(ptv), int(hv), true
 }
 
-// setWalkAll appends every member of a set, in member order, to dst as arena-stable
-// subslices (the composite key past the prefix). It is the whole-set sequential walk the
-// large-count random-selection path falls back to (spec 2064/f1_rewrite_ltm/06 section
-// 10.1): when the requested count is a big fraction of the cardinality, walking the set
-// once and dropping the surplus is cheaper and steadier than random-seek-and-dedup, whose
-// collision retries blow up as the count approaches the cardinality.
+// setWalkAll appends every member of a set to dst as arena-stable subslices (the composite key
+// past the prefix). It is the whole-set sequential walk the large-count random-selection path
+// falls back to (spec 2064/f1_rewrite_ltm/06 section 10.1): when the requested count is a big
+// fraction of the cardinality, walking the set once and dropping the surplus is cheaper and
+// steadier than random-seek-and-dedup, whose collision retries blow up as the count approaches
+// the cardinality. It reads the dense member vector (spec 2064/f1_rewrite_ltm/20), not the ordered
+// index, so it emits in the vector's insertion-dense order rather than member-byte order; the two
+// callers both shuffle or sample the result, so the walk order is never observable. The set is
+// unpartitioned here (partitioned keys route to the partitioned sampler before this point), so the
+// whole-set vector prefix bounds the entire set.
 func (c *connState) setWalkAll(prefix []byte, dst [][]byte) [][]byte {
 	plen := len(prefix)
-	var after []byte
 	scan := make([][]byte, 0, hashScanBatch)
+	hi := -1
 	for {
-		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
-		if len(keys) == 0 {
-			break
-		}
+		keys, next := c.srv.store.SetVecScanDown(prefix, hi, hashScanBatch, scan[:0])
 		for _, k := range keys {
 			dst = append(dst, k[plen:])
 		}
-		if last == nil {
+		if next == 0 {
 			break
 		}
-		after = last
+		hi = next
 	}
 	return dst
 }
@@ -1092,14 +1093,14 @@ func (c *connState) setWalkAll(prefix []byte, dst [][]byte) [][]byte {
 // assumed already clamped to at most card), as arena-stable member subslices. It is the
 // uniform-without-replacement sampler SPOP and positive-count SRANDMEMBER share.
 //
-// Below half the cardinality it draws a uniform random index into the order-statistic
-// ordered index and selects that member (spec section 10.1), deduping on the index so
-// each member appears at most once; the O(log n) selection means a random member is a
-// descent, never an O(n) count, and the true-uniform draw avoids the byte-space clumping
-// a raw random seek would suffer. At or above half the cardinality it crosses over to a
-// single sequential walk and a partial shuffle, which is O(card) but avoids the retry
-// storm the dedup path hits as count nears card. The caller serializes the set's writers
-// so card and the index agree for the span of the sample.
+// Below half the cardinality it draws a uniform random index into the dense member vector and
+// selects that member (spec section 10.1, spec 2064/f1_rewrite_ltm/20), deduping on the index so
+// each member appears at most once; the O(1) array index means a random member is a slot read, not
+// the O(log n) order-statistic descent CollSelectAt walked, and the dense vector carries no holes so
+// every index in [0, card) hits a live member. At or above half the cardinality it crosses over to a
+// single sequential walk and a partial shuffle, which is O(card) but avoids the retry storm the dedup
+// path hits as count nears card. The caller serializes the set's writers so card and the vector agree
+// for the span of the sample.
 func (c *connState) setSampleDistinct(prefix []byte, card, count int) [][]byte {
 	if count >= card {
 		return c.setWalkAll(prefix, make([][]byte, 0, card))
@@ -1122,7 +1123,7 @@ func (c *connState) setSampleDistinct(prefix []byte, card, count int) [][]byte {
 			continue
 		}
 		seen[idx] = struct{}{}
-		k, ok := c.srv.store.CollSelectAt(prefix, idx)
+		k, ok := c.srv.store.SetVecAt(prefix, idx)
 		if !ok {
 			continue
 		}
@@ -1235,7 +1236,7 @@ func (c *connState) cmdSRandMember(argv [][]byte) {
 		n := int(-count)
 		c.writeArrayHeader(n)
 		for i := 0; i < n; i++ {
-			k, ok := c.srv.store.CollSelectAt(prefix, rand.IntN(card))
+			k, ok := c.srv.store.SetVecAt(prefix, rand.IntN(card))
 			if !ok {
 				c.writeNil()
 				continue
