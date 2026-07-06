@@ -75,7 +75,12 @@ func (s *Store) collPartVec(prefix []byte) *memberVec {
 // dropped set's vector, matching CollRandInsert's drop safety.
 func (s *Store) CollPartRandInsert(base []byte, p, part int, key []byte, kind byte) {
 	d := s.partDescFor(base[:len(base)-1], p)
-	s.descPartVec(d, base, part) // rewrites base's final byte to part and registers the vector
+	s.descPartVec(d, base, part) // registers the vector through the descriptor
+	// descPartVec only rewrites base's final byte on its build path; on a cached-pointer hit it
+	// returns without touching base, so the shard load below must set the partition byte itself or it
+	// would read whatever partition base was last left at (the seed loop leaves it at p-1) and add the
+	// member's offset to the wrong partition vector.
+	base[len(base)-1] = byte(part)
 	sh := s.rvec.shardFor(base)
 	sh.mu.Lock()
 	if v := sh.get(base); v != nil {
@@ -84,6 +89,38 @@ func (s *Store) CollPartRandInsert(base []byte, p, part int, key []byte, kind by
 		}
 	}
 	sh.mu.Unlock()
+}
+
+// CollPartVecSeedEmpty discards any draw state for the p-partition set whose partition-scan base is
+// base and installs a fresh descriptor plus p empty partition vectors, so a caller that then feeds
+// every live member through CollPartRandInsert builds the vectors from the explicit membership
+// through the authoritative hash index, never through a deriveOnFirstDraw scan of the ordered index.
+// It is the migration's Phase 4 rebuild primitive (spec 2064/f1_rewrite_ltm/20): the set type stops
+// feeding the ordered index once every vector rebuild reads the members it already holds rather than
+// descending the skip-list, and a rebuild that scanned the ordered index would be wrong anyway while
+// deferred removal leaves a just-deleted old-layout row live in a new partition's prefix range, which
+// deriveOnFirstDraw would then pick up at its old offset alongside the member's new-layout offset and
+// double-count it. Call it after CollRandDrop has torn down the stale layout and before the per-member
+// CollPartRandInsert loop, with base the partition-scan prefix whose final byte this rewrites per
+// partition. The seeded vectors are empty, so the first CollPartRandInsert against each partition
+// finds a non-nil vector and appends the member rather than lazily building the partition whole.
+func (s *Store) CollPartVecSeedEmpty(base []byte, p int) {
+	last := len(base) - 1
+	setPrefix := base[:last]
+	d := newPartVecDesc(p)
+	for i := 0; i < p; i++ {
+		base[last] = byte(i)
+		v := newMemberVec(64)
+		sh := s.rvec.shardFor(base)
+		sh.mu.Lock()
+		sh.put(base, v)
+		sh.mu.Unlock()
+		d.vecs[i].Store(v)
+	}
+	dsh := s.pdescs.shardFor(setPrefix)
+	dsh.mu.Lock()
+	dsh.put(setPrefix, d)
+	dsh.mu.Unlock()
 }
 
 // walkPart maps a global index g in [0, total) to its partition by the prefix-sum walk: it
