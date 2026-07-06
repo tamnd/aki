@@ -130,10 +130,11 @@ func TestSDiff(t *testing.T) {
 	}
 }
 
-// TestSInterBranches drives both SINTER strategies with the same known-overlap data so the
-// merge path (chosen for similar-sized sources) and the probe path (chosen when one source is
-// far smaller) each return the exact intersection. sinterEach picks by cardinality, so equal
-// sets take the sorted merge and a tiny-versus-large pair takes the probe, and both must agree.
+// TestSInterBranches drives SINTER with two overlap shapes, an equal-sized pair and a
+// tiny-versus-large pair, so the probe that drives off the smallest source returns the exact
+// intersection whichever source is smallest. sinterEach always probes off the smallest source
+// (the dense member vector carries no order to merge on), so both shapes exercise the one path
+// and both must return the full overlap.
 func TestSInterBranches(t *testing.T) {
 	rw, cleanup := dialTestServer(t)
 	defer cleanup()
@@ -270,9 +271,10 @@ func TestSetAlgebraArity(t *testing.T) {
 	expect(t, rw, "-ERR wrong number of arguments for 'sintercard' command")
 }
 
-// The intersection emits its members in member-byte order, the ordered-index property the
-// k-way merge rides, so a client that wants sorted output gets it without asking.
-func TestSInterEmitsSorted(t *testing.T) {
+// The intersection returns every shared member exactly once. It reads the dense member vector, which
+// is unordered (spec 2064/f1_rewrite_ltm/20), so the members arrive in an implementation-defined order
+// no client may depend on, exactly as Redis's own set order is; the reply is compared as a set.
+func TestSInterEmitsAll(t *testing.T) {
 	rw, cleanup := dialTestServer(t)
 	defer cleanup()
 
@@ -283,8 +285,9 @@ func TestSInterEmitsSorted(t *testing.T) {
 
 	cmd(t, rw, "SINTER", "a", "b")
 	got := readArray(t, rw)
+	sort.Strings(got)
 	want := []string{"a", "b", "c", "d", "e"}
 	if !eqStrings(got, want) {
-		t.Fatalf("SINTER emitted %v, want sorted %v", got, want)
+		t.Fatalf("SINTER emitted %v, want the set %v", got, want)
 	}
 }

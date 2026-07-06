@@ -1,169 +1,95 @@
 package f1srv
 
 import (
-	"bytes"
 	"encoding/binary"
 
 	"github.com/tamnd/aki/engine/f1raw"
 )
 
-// Set algebra (SINTER/SUNION/SDIFF and SINTERCARD) is a k-way merge over the
-// member-ordered composite keys, never a materialize (spec 2064/f1_rewrite_ltm/06
-// section 5). Every set's member rows already sort in member-byte order under the
-// ordered element index, so the algebra rides forward cursors: SUNION is a k-way merge
-// emitting each distinct member once, SINTER drives off the smallest set and point-probes
-// the rest, and SDIFF walks the first set and rejects any member the others hold. The
-// peak memory is k cursors plus one member in hand, so an intersection of billion-member
-// sets never pulls a whole source into RAM.
+// Set algebra (SINTER/SUNION/SDIFF and SINTERCARD) reads each source set by enumerating its
+// dense member vector, never the global ordered index and never a whole-source materialize
+// (spec 2064/f1_rewrite_ltm/20). A set owes no member order, so the algebra does not need one:
+// SINTER drives off the smallest source and point-probes the rest through the hash index, SDIFF
+// walks the first source and rejects any member the others hold, and SUNION enumerates every
+// source and deduplicates through a seen-set. None of the three depends on the sources arriving
+// in sorted order, which is what lets them read the unordered vector instead of the ordered index.
 //
-// The RESP2 array count has to precede the elements, but a merge does not know its result
-// count up front. SINTER and SDIFF bound their result by one driving set (the smallest,
-// the first), so they buffer the qualifying members (arena-stable subslices) and frame
-// from the buffer length. SUNION's result is unbounded (the sum of all sources), so it
-// runs the merge twice under the source locks, counting first and emitting second, which
-// keeps the framing exact without ever holding the whole union.
+// The RESP2 array count has to precede the elements. SINTER and SDIFF bound their result by one
+// driving set (the smallest, the first), so they buffer the qualifying members (arena-stable
+// subslices) and frame from the buffer length. SUNION's result is the distinct union, so it
+// buffers the deduplicated members and frames from that buffer; the seen-set it builds to
+// deduplicate is O(union) in memory, exactly as Redis's own dict-backed SUNION is.
 //
 // Locking: an algebra read takes every source set's stripe lock (distinct stripes, in
 // ascending index order so it can never deadlock against another multi-key write) for the
-// span of the operation, so the sets it reads cannot change under it. That makes the two
-// SUNION passes see identical state, so the framed count always matches what is streamed.
+// span of the operation, so the sets it reads cannot change under it. setVecEach reads the
+// vectors under those already-held locks and takes none of its own.
 
-// partWalk is a forward, member-ordered walk over one contiguous member-row run: a whole
-// unpartitioned set, or one partition of a partitioned set. prefix bounds that run and plen is
-// where the member starts (past the length-prefixed set key, and past the partition byte for a
-// partition run), so cur = batch[idx][plen:] is the bare member. Each walk owns its prefix and
-// batch buffers so P partition walks (and k cursors in a merge) never share a buffer.
-type partWalk struct {
-	st     *f1raw.Store
-	prefix []byte
-	plen   int
-	after  []byte
-	batch  [][]byte
-	idx    int
-	done   bool
-	cur    []byte
-}
-
-// advance moves the walk to the next member, refilling from the ordered index in bounded
-// batches, and sets cur to nil once the run is exhausted. Every yielded member is a subslice of
-// the immutable arena, valid for the store's life, so a merge holds it without copying even
-// after the walk refills its batch buffer.
-func (pw *partWalk) advance() {
-	if pw.idx < len(pw.batch) {
-		pw.cur = pw.batch[pw.idx][pw.plen:]
-		pw.idx++
-		return
-	}
-	if pw.done {
-		pw.cur = nil
-		return
-	}
-	keys, last := pw.st.CollScan(pw.prefix, pw.after, hashScanBatch, pw.batch[:0])
-	pw.batch = keys
-	pw.idx = 0
-	if last == nil {
-		pw.done = true
-	} else {
-		pw.after = last
-	}
-	if len(keys) == 0 {
-		pw.cur = nil
-		return
-	}
-	pw.cur = pw.batch[pw.idx][pw.plen:]
-	pw.idx++
-}
-
-// setCursor is a forward, member-ordered cursor over one whole set's members, in pure member-byte
-// order, whatever the set's partition count. cur is the current member (an arena-stable subslice)
-// or nil at exhaustion. An unpartitioned set is one partWalk (single); a partitioned set is P
-// per-partition walks merged into one member-ordered stream. The merge matters because the P
-// partition rows sort by (partition, member) under the whole-set prefix, not by member, so a lone
-// walk of that prefix would break the k-way merge that every algebra caller relies on. A member
-// routes to exactly one partition (PartitionOf), so no member is ever in two walks and the merge
-// is a plain min-scan with no dedup.
-type setCursor struct {
-	single *partWalk   // non-nil for an unpartitioned set (P==1): the whole-set walk
-	walks  []*partWalk // non-nil for a partitioned set (P>1): one walk per partition
-	cur    []byte
-}
-
-// newPartWalk opens a walk over one member run of skey: the whole set when p==1, or partition
-// part when p>1. The prefix is a fresh copy, not a shared scratch buffer, so P walks in one
-// partitioned cursor never share a prefix. The member offset is len(prefix), which already skips
-// the partition byte when present, so advance strips exactly the member.
-func (c *connState) newPartWalk(skey []byte, part, p int) *partWalk {
+// setVecEach enumerates every live member of set skey, calling emit with each member (the bare
+// member bytes, an arena-stable subslice). It reads the set's dense member vector, not the ordered
+// index (spec 2064/f1_rewrite_ltm/20 section 6): an unpartitioned set walks its one whole-set
+// vector, a partitioned set walks its P partition vectors in turn. It resolves a partitioned set's
+// vectors through the descriptor (SetPartVec*, the same path streamSet and the draw use) so a vector
+// this enumeration builds is registered for descriptor-driven teardown and cannot leak past a DEL or
+// a grow (section 6.1). emit returns false to stop early, and setVecEach then returns false so a
+// caller like SINTERCARD's LIMIT or an intersection driver can cut the walk short. The caller holds
+// every source's stripe lock, so the layout and the vectors are stable and setVecEach locks nothing.
+//
+// Buffer discipline: setVecEach owns its bounding prefix, freshly allocated rather than borrowed from
+// the connection's pbuf/ppbuf scratch, because a probing or storing emit reuses those same scratch
+// buffers (setMemberExists builds into kbuf, but storeAlgebra's insert builds the destination base
+// into ppbuf and the destination prefix into pbuf). A borrowed prefix would be clobbered mid-walk by
+// such an emit, dropping every member past the first scan batch; a walk that owns its prefix survives
+// any emit. Each yielded member points into the immutable arena, so it stays valid after the scan
+// buffer refills and after any probe or store.
+func (c *connState) setVecEach(skey []byte, emit func([]byte) bool) bool {
+	scan := make([][]byte, 0, hashScanBatch)
 	var tmp [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(tmp[:], uint64(len(skey)))
-	prefix := make([]byte, 0, n+len(skey)+1)
+	if p := c.partitionsFor(skey); p > 1 {
+		// base = uvarint(len(skey)) | skey | <partByte placeholder>, the partition-scan prefix
+		// SetPartVecScanDown rewrites the last byte of per partition (matching partScanBase).
+		base := make([]byte, 0, n+len(skey)+1)
+		base = append(base, tmp[:n]...)
+		base = append(base, skey...)
+		base = append(base, 0)
+		moff := len(base) // member starts past uvarint(len)|skey|byte(part)
+		for part := 0; part < p; part++ {
+			hi := -1
+			for {
+				keys, next := c.srv.store.SetPartVecScanDown(base, p, part, hi, hashScanBatch, scan[:0])
+				for _, k := range keys {
+					if !emit(k[moff:]) {
+						return false
+					}
+				}
+				if next == 0 {
+					break
+				}
+				hi = next
+			}
+		}
+		return true
+	}
+	// prefix = uvarint(len(skey)) | skey, the whole-set bounding prefix (matching setPrefix).
+	prefix := make([]byte, 0, n+len(skey))
 	prefix = append(prefix, tmp[:n]...)
 	prefix = append(prefix, skey...)
-	if p > 1 {
-		prefix = append(prefix, byte(part))
-	}
-	pw := &partWalk{
-		st:     c.srv.store,
-		prefix: prefix,
-		plen:   len(prefix),
-		batch:  make([][]byte, 0, hashScanBatch),
-	}
-	pw.advance()
-	return pw
-}
-
-// newSetCursor opens a member-ordered cursor over skey, positioned on the first member (cur nil
-// when the set is empty). It reads the set's partition count once: an unpartitioned set gets one
-// direct walk (the hot common path, no per-member merge), a partitioned set gets P walks merged.
-func (c *connState) newSetCursor(skey []byte) *setCursor {
-	sc := &setCursor{}
-	if p := c.partitionsFor(skey); p > 1 {
-		sc.walks = make([]*partWalk, p)
-		for part := 0; part < p; part++ {
-			sc.walks[part] = c.newPartWalk(skey, part, p)
+	plen := len(prefix)
+	hi := -1
+	for {
+		keys, next := c.srv.store.SetVecScanDown(prefix, hi, hashScanBatch, scan[:0])
+		for _, k := range keys {
+			if !emit(k[plen:]) {
+				return false
+			}
 		}
-	} else {
-		sc.single = c.newPartWalk(skey, 0, 1)
-	}
-	sc.advance()
-	return sc
-}
-
-// advance moves the cursor to the next member in member-byte order. The unpartitioned cursor just
-// steps its lone walk. The partitioned cursor takes the smallest member currently at any partition
-// walk's front and advances that walk, so the P sorted per-partition streams merge into one sorted
-// stream; because a member lives in exactly one partition, exactly one walk sits on the smallest,
-// but it advances every walk equal to it defensively so a would-be duplicate never stalls the merge.
-func (sc *setCursor) advance() {
-	if sc.single != nil {
-		// Read the current front, then step the walk to prepare the next, exactly as the
-		// merge path reads each walk's front before advancing the one at the minimum. The
-		// walk is already positioned on its first member at construction, so reading before
-		// stepping yields that first member instead of skipping past it.
-		sc.cur = sc.single.cur
-		sc.single.advance()
-		return
-	}
-	var min []byte
-	found := false
-	for _, pw := range sc.walks {
-		if pw.cur == nil {
-			continue
+		if next == 0 {
+			break
 		}
-		if !found || bytes.Compare(pw.cur, min) < 0 {
-			min = pw.cur
-			found = true
-		}
+		hi = next
 	}
-	if !found {
-		sc.cur = nil
-		return
-	}
-	sc.cur = min
-	for _, pw := range sc.walks {
-		if pw.cur != nil && bytes.Equal(pw.cur, min) {
-			pw.advance()
-		}
-	}
+	return true
 }
 
 // lockStripes takes the stripe locks for every distinct key in keys, in ascending stripe
@@ -250,37 +176,29 @@ func (c *connState) anyStringConflict(keys [][]byte) bool {
 	return false
 }
 
-// sunionEach runs the k-way merge over every source set and calls emit once for each
-// distinct member, in member-byte order. It advances every cursor that sits on the emitted
-// member, so a member shared by several sets is emitted exactly once. emit returns false to
-// stop early; SUNION never does, but the signature matches the other iterators.
+// sunionEach calls emit once for each distinct member across all source sets. It enumerates every
+// source's member vector and deduplicates through a seen-set keyed by the member bytes, so a member
+// several sources share is emitted exactly once. The seen-set is O(distinct union) in memory, the
+// same cost Redis's dict-backed SUNION pays; there is no sorted-merge shortcut because the vector is
+// unordered. emit returns false to stop early; the read SUNION never does, but SUNIONSTORE's insert
+// can fail and stop the walk.
 func (c *connState) sunionEach(keys [][]byte, emit func([]byte) bool) {
-	cursors := make([]*setCursor, len(keys))
-	for i, k := range keys {
-		cursors[i] = c.newSetCursor(k)
-	}
-	for {
-		var smallest []byte
-		found := false
-		for _, sc := range cursors {
-			if sc.cur == nil {
-				continue
+	seen := make(map[string]struct{})
+	for _, k := range keys {
+		stop := false
+		c.setVecEach(k, func(m []byte) bool {
+			if _, ok := seen[string(m)]; ok {
+				return true
 			}
-			if !found || bytes.Compare(sc.cur, smallest) < 0 {
-				smallest = sc.cur
-				found = true
+			seen[string(m)] = struct{}{}
+			if !emit(m) {
+				stop = true
+				return false
 			}
-		}
-		if !found {
+			return true
+		})
+		if stop {
 			return
-		}
-		if !emit(smallest) {
-			return
-		}
-		for _, sc := range cursors {
-			if sc.cur != nil && bytes.Equal(sc.cur, smallest) {
-				sc.advance()
-			}
 		}
 	}
 }
@@ -300,152 +218,65 @@ func (c *connState) setMemberExists(skey, member []byte) bool {
 	return c.srv.store.ExistsKind(c.memberKey(skey, member), kindSetMember)
 }
 
-// sinterProbeWeight is how many cursor-advance steps one point-probe of a source costs,
-// used by sinterEach to choose its strategy. A probe builds the composite member key and
-// walks the lock-free hash index, which is several times the cost of a single ordered-cursor
-// advance, so this is deliberately above one. It only steers the merge-vs-probe choice; both
-// paths return the same members, so the exact value trades a little work either side of the
-// crossover and never affects correctness.
-const sinterProbeWeight = 4
-
-// sinterEach yields every member present in all source sets, in ascending member-byte order,
-// and returns early when emit returns false (SINTERCARD's LIMIT). It picks between two exact
-// strategies from the O(1) header cardinalities:
+// sinterEach yields every member present in all source sets and returns early when emit returns
+// false (SINTERCARD's LIMIT). It drives off the smallest source, chosen from the O(1) header
+// cardinalities, and point-probes every other source through the hash index for each of the
+// smallest source's members, so the work is bounded by the smallest source. Any empty source
+// makes the intersection empty and it yields nothing.
 //
-//   - a sorted k-way merge (sinterMergeEach) that walks every source cursor once in lockstep,
-//     costing about the sum of the cardinalities with no per-member key build or hash probe.
-//     This is only possible because f1raw keeps every set's members in one sort order, a
-//     property a hashtable set does not have, and it is what makes SINTER a merge rather than
-//     a probe here.
-//   - the classic drive-off-the-smallest-set probe (sinterProbeEach) that iterates the
-//     smallest source and point-probes the rest, costing about the smallest cardinality times
-//     the probe weight. This wins when one source is far smaller than the others.
-//
-// It uses whichever the cardinalities say is cheaper. Any empty source makes the intersection
-// empty and it yields nothing.
+// The ordered-index era had a second strategy, a sorted k-way merge over the sources that cost the
+// sum of the cardinalities with no per-member probe. That merge existed only because every set's
+// members sat in one sort order under the global ordered index (spec 2064/f1_rewrite_ltm/20). The
+// dense member vector is unordered, so there is no sorted-merge form to fall back to; SINTER always
+// probes off the smallest source, which is the same strategy Redis uses.
 func (c *connState) sinterEach(keys [][]byte, emit func([]byte) bool) {
-	var sumCard, minCard uint64 = 0, ^uint64(0)
+	minCard := ^uint64(0)
 	driverIdx := 0
 	for i, k := range keys {
 		card := c.setCard(k)
 		if card == 0 {
 			return // an empty source means an empty intersection
 		}
-		sumCard += card
 		if card < minCard {
 			minCard = card
 			driverIdx = i
 		}
 	}
-	// Merge cost is about sumCard cursor steps; probe cost is about minCard*(k-1) probes,
-	// each sinterProbeWeight steps. Take the cheaper. A lone source (k==1) has no other
-	// source to probe, so the merge (a single cursor walk) is always the right path.
-	probeCost := minCard * uint64(len(keys)-1) * sinterProbeWeight
-	if len(keys) == 1 || sumCard <= probeCost {
-		c.sinterMergeEach(keys, emit)
-		return
-	}
 	c.sinterProbeEach(keys, driverIdx, emit)
 }
 
-// sinterMergeEach yields the intersection by a sorted k-way merge over the source cursors: it
-// repeatedly takes the largest member currently at any cursor front, advances every cursor
-// that sits below it, and yields the member when all cursors have caught up to it exactly.
-// Every advance makes forward progress, so the whole merge is bounded by the sum of the source
-// cardinalities and touches each member row once. It allocates nothing per member and never
-// probes the hash index. emit returns false to stop early.
-func (c *connState) sinterMergeEach(keys [][]byte, emit func([]byte) bool) {
-	cursors := make([]*setCursor, len(keys))
-	for i, k := range keys {
-		sc := c.newSetCursor(k)
-		if sc.cur == nil {
-			return // an empty source means an empty intersection
-		}
-		cursors[i] = sc
-	}
-	for {
-		max := cursors[0].cur
-		for _, sc := range cursors[1:] {
-			if bytes.Compare(sc.cur, max) > 0 {
-				max = sc.cur
-			}
-		}
-		allEqual := true
-		for _, sc := range cursors {
-			for bytes.Compare(sc.cur, max) < 0 {
-				sc.advance()
-				if sc.cur == nil {
-					return // this source is exhausted, so nothing more can intersect
-				}
-			}
-			if !bytes.Equal(sc.cur, max) {
-				allEqual = false
-			}
-		}
-		if allEqual {
-			if !emit(max) {
-				return
-			}
-			for _, sc := range cursors {
-				sc.advance()
-				if sc.cur == nil {
-					return
-				}
-			}
-		}
-	}
-}
-
-// sinterProbeEach yields the intersection by iterating the smallest source (driverIdx, already
-// chosen from the header counts) and point-probing every other source for each member. The
-// work is bounded by the smallest source, which wins when it is far smaller than the rest.
-// emit returns false to stop early.
+// sinterProbeEach yields the intersection by enumerating the smallest source (driverIdx, already
+// chosen from the header counts) and point-probing every other source for each member. The work is
+// bounded by the smallest source. A lone source (no other source to probe) yields all its members,
+// which is the intersection of one set with itself. emit returns false to stop early.
 func (c *connState) sinterProbeEach(keys [][]byte, driverIdx int, emit func([]byte) bool) {
-	driver := c.newSetCursor(keys[driverIdx])
-	for driver.cur != nil {
-		m := driver.cur
-		inAll := true
+	c.setVecEach(keys[driverIdx], func(m []byte) bool {
 		for i, k := range keys {
 			if i == driverIdx {
 				continue
 			}
 			if !c.setMemberExists(k, m) {
-				inAll = false
-				break
+				return true // not in every source, skip but keep walking the driver
 			}
 		}
-		if inAll {
-			if !emit(m) {
-				return
-			}
-		}
-		driver.advance()
-	}
+		return emit(m)
+	})
 }
 
-// sdiffEach walks the first source set and calls emit for each member none of the other
-// sources hold, in the first set's member order (spec section 5). SDIFF is not commutative,
-// so the first key is always the driver and the rest are probed. The result is bounded by
-// the first set.
+// sdiffEach walks the first source set and calls emit for each member none of the other sources
+// hold, in the first set's enumeration order (spec section 5). SDIFF is not commutative, so the
+// first key is always the driver and the rest are probed through the hash index. The result is
+// bounded by the first set.
 func (c *connState) sdiffEach(keys [][]byte, emit func([]byte) bool) {
-	driver := c.newSetCursor(keys[0])
 	rest := keys[1:]
-	for driver.cur != nil {
-		m := driver.cur
-		inRest := false
+	c.setVecEach(keys[0], func(m []byte) bool {
 		for _, k := range rest {
 			if c.setMemberExists(k, m) {
-				inRest = true
-				break
+				return true // present in a later source, not in the difference
 			}
 		}
-		if !inRest {
-			if !emit(m) {
-				return
-			}
-		}
-		driver.advance()
-	}
+		return emit(m)
+	})
 }
 
 // cmdSInter answers SINTER by buffering the members present in every source (bounded by the
