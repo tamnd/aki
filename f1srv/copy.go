@@ -119,7 +119,7 @@ func (c *connState) copyRows(src, dst []byte) {
 		v, _ := c.srv.store.Get(src, nil)
 		_ = c.srv.store.Set(dst, v)
 	case keyHash:
-		c.copyIndexedFamily(src, dst, kindHashField)
+		c.copyIndexedFamily(src, dst, kindHashField, nil)
 		c.copyHeader(src, dst, kindHashMeta)
 		c.propagateHashFieldTTLs(src, dst, false)
 	case keySet:
@@ -129,23 +129,23 @@ func (c *connState) copyRows(src, dst []byte) {
 		// the header, so dst must be engaged at srcP to route that layout (cmdCopy's REPLACE drop
 		// already unengaged any prior dst).
 		srcP := c.srv.partitionP(src)
-		c.copyIndexedFamily(src, dst, kindSetMember)
+		c.copyIndexedFamily(src, dst, kindSetMember, c.setVectorFeeder(dst, srcP))
 		c.copyHeader(src, dst, kindSetMeta)
 		if srcP > 1 {
 			c.srv.engageP(dst, srcP)
 		}
 	case keyZset:
-		c.copyIndexedFamily(src, dst, kindZsetMember)
-		c.copyIndexedFamily(src, dst, kindZsetScore)
+		c.copyIndexedFamily(src, dst, kindZsetMember, nil)
+		c.copyIndexedFamily(src, dst, kindZsetScore, nil)
 		c.copyHeader(src, dst, kindZsetMeta)
 	case keyList:
 		c.copyListElems(src, dst)
 		c.copyHeader(src, dst, kindListMeta)
 	case keyStream:
-		c.copyIndexedFamily(src, dst, kindStreamEntry)
-		c.copyIndexedFamily(src, dst, kindStreamGroup)
-		c.copyIndexedFamily(src, dst, kindStreamConsumer)
-		c.copyIndexedFamily(src, dst, kindStreamPEL)
+		c.copyIndexedFamily(src, dst, kindStreamEntry, nil)
+		c.copyIndexedFamily(src, dst, kindStreamGroup, nil)
+		c.copyIndexedFamily(src, dst, kindStreamConsumer, nil)
+		c.copyIndexedFamily(src, dst, kindStreamPEL, nil)
 		c.copyHeader(src, dst, kindStreamMeta)
 	}
 }
@@ -155,7 +155,10 @@ func (c *connState) copyRows(src, dst []byte) {
 // re-keys it under dst's key-header and its own suffix and inserts the new row into the ordered
 // index, leaving the source row untouched. It is copyRows' counterpart to rename's
 // moveIndexedFamily, minus the delete of the old row.
-func (c *connState) copyIndexedFamily(src, dst []byte, kind byte) {
+// feed, when non-nil, is called after each row is published under dst with the new key and the
+// portion of it past dst's key header, so the set path can add each republished member to the
+// destination's dense vector (setVectorFeeder). Every other family passes nil.
+func (c *connState) copyIndexedFamily(src, dst []byte, kind byte, feed func(newKey, suffix []byte)) {
 	prefix := familyScanPrefix(src, kind)
 	hdrLen := keyHeaderLen(src)
 	dstHeader := appendKeyHeader(nil, dst)
@@ -192,6 +195,9 @@ func (c *connState) copyIndexedFamily(src, dst []byte, kind byte) {
 			continue
 		}
 		c.srv.store.CollInsert(nkbuf, kind)
+		if feed != nil {
+			feed(nkbuf, sk[hdrLen:])
+		}
 	}
 }
 
