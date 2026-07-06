@@ -119,33 +119,33 @@ func (c *connState) copyRows(src, dst []byte) {
 		v, _ := c.srv.store.Get(src, nil)
 		_ = c.srv.store.Set(dst, v)
 	case keyHash:
-		c.copyIndexedFamily(src, dst, kindHashField, nil)
+		c.copyIndexedFamily(src, dst, kindHashField)
 		c.copyHeader(src, dst, kindHashMeta)
 		c.propagateHashFieldTTLs(src, dst, false)
 	case keySet:
-		// copyIndexedFamily re-keys each row's bytes after the key header verbatim, so a partitioned
+		// copySetFamily re-keys each member's bytes after the key header verbatim, so a partitioned
 		// source's partition byte carries over and copyHeader copies the P exponent byte, leaving dst
 		// physically laid out at the source's partition count. partitionsFor reads the registry, not
 		// the header, so dst must be engaged at srcP to route that layout (cmdCopy's REPLACE drop
 		// already unengaged any prior dst).
 		srcP := c.srv.partitionP(src)
-		c.copyIndexedFamily(src, dst, kindSetMember, c.setVectorFeeder(dst, srcP))
+		c.copySetFamily(src, dst, srcP, c.setVectorFeeder(dst, srcP))
 		c.copyHeader(src, dst, kindSetMeta)
 		if srcP > 1 {
 			c.srv.engageP(dst, srcP)
 		}
 	case keyZset:
-		c.copyIndexedFamily(src, dst, kindZsetMember, nil)
-		c.copyIndexedFamily(src, dst, kindZsetScore, nil)
+		c.copyIndexedFamily(src, dst, kindZsetMember)
+		c.copyIndexedFamily(src, dst, kindZsetScore)
 		c.copyHeader(src, dst, kindZsetMeta)
 	case keyList:
 		c.copyListElems(src, dst)
 		c.copyHeader(src, dst, kindListMeta)
 	case keyStream:
-		c.copyIndexedFamily(src, dst, kindStreamEntry, nil)
-		c.copyIndexedFamily(src, dst, kindStreamGroup, nil)
-		c.copyIndexedFamily(src, dst, kindStreamConsumer, nil)
-		c.copyIndexedFamily(src, dst, kindStreamPEL, nil)
+		c.copyIndexedFamily(src, dst, kindStreamEntry)
+		c.copyIndexedFamily(src, dst, kindStreamGroup)
+		c.copyIndexedFamily(src, dst, kindStreamConsumer)
+		c.copyIndexedFamily(src, dst, kindStreamPEL)
 		c.copyHeader(src, dst, kindStreamMeta)
 	}
 }
@@ -154,11 +154,10 @@ func (c *connState) copyRows(src, dst []byte) {
 // gathers the source rows first (a pure read that leaves the ordered index stable), then for each
 // re-keys it under dst's key-header and its own suffix and inserts the new row into the ordered
 // index, leaving the source row untouched. It is copyRows' counterpart to rename's
-// moveIndexedFamily, minus the delete of the old row.
-// feed, when non-nil, is called after each row is published under dst with the new key and the
-// portion of it past dst's key header, so the set path can add each republished member to the
-// destination's dense vector (setVectorFeeder). Every other family passes nil.
-func (c *connState) copyIndexedFamily(src, dst []byte, kind byte, feed func(newKey, suffix []byte)) {
+// moveIndexedFamily, minus the delete of the old row. The set type no longer rides this path: it
+// is enumerated off its dense member vector by copySetFamily (spec 2064/f1_rewrite_ltm/20), so
+// every family that still uses copyIndexedFamily is one the ordered index owns.
+func (c *connState) copyIndexedFamily(src, dst []byte, kind byte) {
 	prefix := familyScanPrefix(src, kind)
 	hdrLen := keyHeaderLen(src)
 	dstHeader := appendKeyHeader(nil, dst)
@@ -195,10 +194,76 @@ func (c *connState) copyIndexedFamily(src, dst []byte, kind byte, feed func(newK
 			continue
 		}
 		c.srv.store.CollInsert(nkbuf, kind)
+	}
+}
+
+// copySetFamily copies a set's member rows from src to dst by enumerating the source members from
+// its dense member vector rather than the ordered index (spec 2064/f1_rewrite_ltm/20), the same
+// structure SMEMBERS reads. Every other indexed family still rides copyIndexedFamily's ordered-index
+// scan; only the set type is being lifted off the skip-list. The caller holds both keys' stripe
+// locks, so the source layout is frozen and one drained walk per partition yields every live member
+// once. Each member is re-keyed under dst's key-header (its bytes past the header carry over
+// verbatim, partition byte and all), published with no value (set members carry none), inserted into
+// the ordered index (kept consistent while set writers still maintain it), and handed to feed so the
+// destination's dense vector is built as SMEMBERS-authoritative. srcP is the source's physical
+// partition count, which copyRows also engages dst at, so one count drives both the source read and
+// the destination write. The source rows stay in place, so a family scan of src never sees the copies.
+func (c *connState) copySetFamily(src, dst []byte, srcP int, feed func(newKey, suffix []byte)) {
+	hdrLen := keyHeaderLen(src)
+	dstHeader := appendKeyHeader(nil, dst)
+	members := c.collectSetMembers(src, srcP)
+	var nkbuf []byte
+	for _, k := range members {
+		suffix := k[hdrLen:]
+		nkbuf = append(nkbuf[:0], dstHeader...)
+		nkbuf = append(nkbuf, suffix...)
+		if _, err := c.srv.store.PutKind(nkbuf, nil, kindSetMember); err != nil {
+			continue
+		}
+		c.srv.store.CollInsert(nkbuf, kindSetMember)
 		if feed != nil {
-			feed(nkbuf, sk[hdrLen:])
+			feed(nkbuf, suffix)
 		}
 	}
+}
+
+// collectSetMembers gathers every live member's composite key of a set from its dense member vector,
+// partition-branched exactly like streamSet, into a fresh slice the caller can iterate while it
+// mutates the index. The returned keys are arena subslices; the arena is grow-only, so they stay
+// valid for the store's life, and the slice headers are copied out of the scan buffer each batch so a
+// later batch reusing that buffer never clobbers an earlier key. SetVecScanDown and
+// SetPartVecScanDown build the vector on first use, so a set never yet enumerated still resolves its
+// members. p is the set's physical partition count. The caller must hold the set's stripe lock so the
+// layout is frozen and one drained downward walk per partition yields every member once.
+func (c *connState) collectSetMembers(skey []byte, p int) [][]byte {
+	var out [][]byte
+	scan := make([][]byte, 0, hashScanBatch)
+	if p > 1 {
+		base := c.partScanBase(skey)
+		for part := 0; part < p; part++ {
+			hi := -1
+			for {
+				keys, next := c.srv.store.SetPartVecScanDown(base, p, part, hi, hashScanBatch, scan[:0])
+				out = append(out, keys...)
+				if next == 0 {
+					break
+				}
+				hi = next
+			}
+		}
+	} else {
+		prefix := c.setPrefix(skey)
+		hi := -1
+		for {
+			keys, next := c.srv.store.SetVecScanDown(prefix, hi, hashScanBatch, scan[:0])
+			out = append(out, keys...)
+			if next == 0 {
+				break
+			}
+			hi = next
+		}
+	}
+	return out
 }
 
 // copyListElems copies a list's element rows, which are not carried in the ordered index, by
