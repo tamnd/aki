@@ -77,8 +77,9 @@ func (c *connState) unlockSetMigration(stripes []uint32) {
 //     not change) and publishes newP into the registry. Only after phase 1 has populated every new
 //     home does any reader or writer that reads P route to it.
 //   - Phase 3 deletes each member's old-layout row, now that the new home is live and published.
-//   - Phase 4 drops the set's dense draw vectors so the new layout rebuilds them lazily on first draw
-//     against the re-homed rows rather than reading stale pointers into deleted records.
+//   - Phase 4 drops the set's stale old-layout draw vectors and rebuilds the new layout's partition
+//     vectors eagerly from the re-homed members, so the vectors are complete when the migration returns
+//     and no reader ever has to build them by scanning the ordered index.
 //
 // A grow (old P greater than one) leaves a member whose partition byte is unchanged under the larger
 // P exactly where it is: its old row already is its new row, so phases 1 and 3 both skip it.
@@ -192,8 +193,32 @@ func (c *connState) engageSetPartitions(skey []byte, newP int) {
 		}
 	}
 
-	// Phase 4: drop the draw vectors so the new layout rebuilds them lazily.
+	// Phase 4: rebuild the new layout's dense draw vectors eagerly from the re-homed members rather
+	// than dropping them and deferring to a lazy first-draw scan of the ordered index. Feeding every
+	// member straight into its new partition vector through the authoritative hash index is what lets
+	// the set type stop maintaining the ordered index at all: the vectors are complete the instant the
+	// migration returns, so no later reader has to descend the skip-list to build them. CollRandDrop
+	// first clears the stale old-layout state (the old whole-set vector when oldP == 1, or the old
+	// partition vectors and descriptor when oldP > 1). CollPartVecSeedEmpty then installs the newP
+	// descriptor and P empty partition vectors, so the per-member CollPartRandInsert appends each member
+	// through the hash index rather than triggering deriveOnFirstDraw: a lazy first-draw scan of the
+	// ordered index would be wrong here because Phase 3's deletes are removed from the ordered index
+	// lazily, so a just-deleted old-layout row still sits live in a new partition's prefix range and the
+	// scan would pick it up at its old offset alongside the member's new-layout offset and double it.
+	// newP is always at least two here (the early return above), so every member re-homes into a
+	// partition vector and there is no whole-set vector to rebuild. base is built into ppbuf and nk into
+	// kbuf, so the two never collide.
 	c.srv.store.CollRandDrop(prefix)
+	base := c.partScanBase(skey)
+	c.srv.store.CollPartVecSeedEmpty(base, newP)
+	start = 0
+	for _, end := range ends {
+		member := buf[start:end]
+		start = end
+		newPart := f1raw.PartitionOf(member, newP)
+		nk := c.partMemberKey(skey, member, newPart, newP)
+		c.srv.store.CollPartRandInsert(base, newP, newPart, nk, kindSetMember)
+	}
 }
 
 // lockMemberPartition locks the partition stripe member routes to under set skey and returns the held
