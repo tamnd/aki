@@ -285,6 +285,63 @@ func TestRandVecRebuildAfterDrop(t *testing.T) {
 	}
 }
 
+// TestRandVecAt walks every dense index of a set and confirms SetVecAt hands back each live
+// member exactly once, that the vector builds lazily on the first index read the way the draw
+// path builds it, and that an out-of-range index reports absent rather than reading past the
+// end. This is the count-sampler contract: SRANDMEMBER/SPOP with a count pick indices in
+// [0,card) and expect a live member for each, and a sampler that races a shrink expects a
+// clean false rather than a stale offset.
+func TestRandVecAt(t *testing.T) {
+	s := newTestStore()
+	prefix := setPrefixBytes("s")
+	const n = 300
+	members := map[string]bool{}
+	for i := 0; i < n; i++ {
+		m := fmt.Sprintf("m%d", i)
+		addMember(t, s, prefix, "s", m) // no vector yet, so the first SetVecAt builds it
+		members[m] = true
+	}
+	// No vector exists before the first index read; SetVecAt must build it like the draw path.
+	sh := s.rvec.shardFor(prefix)
+	sh.mu.Lock()
+	if sh.get(prefix) != nil {
+		sh.mu.Unlock()
+		t.Fatalf("vector exists before any index read")
+	}
+	sh.mu.Unlock()
+
+	seen := map[string]bool{}
+	for i := 0; i < n; i++ {
+		k, ok := s.SetVecAt(prefix, i)
+		if !ok {
+			t.Fatalf("SetVecAt(%d) reported absent on a set of %d", i, n)
+		}
+		member := string(k[len(prefix):])
+		if !members[member] {
+			t.Fatalf("SetVecAt(%d) returned %q which is not a member", i, member)
+		}
+		if seen[member] {
+			t.Fatalf("SetVecAt returned %q twice; vector is not dense", member)
+		}
+		seen[member] = true
+	}
+	if len(seen) != n {
+		t.Fatalf("SetVecAt covered %d distinct members, want %d", len(seen), n)
+	}
+	checkDense(t, s, prefix, n)
+
+	// Out-of-range indices report absent, not a panic or a stale offset.
+	if _, ok := s.SetVecAt(prefix, n); ok {
+		t.Fatalf("SetVecAt(card) reported present, want absent")
+	}
+	if _, ok := s.SetVecAt(prefix, -1); ok {
+		t.Fatalf("SetVecAt(-1) reported present, want absent")
+	}
+	if _, ok := s.SetVecAt(prefix, n*10); ok {
+		t.Fatalf("SetVecAt past the end reported present, want absent")
+	}
+}
+
 // TestRandVecUniform draws a large sample from a fixed set and checks the empirical
 // frequency of each member is inside a chi-square band for uniform, catching a swap-remove
 // or draw bug that biases the distribution.
