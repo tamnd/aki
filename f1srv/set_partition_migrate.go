@@ -67,9 +67,9 @@ func (c *connState) unlockSetMigration(stripes []uint32) {
 // The re-home is ordered insert-new, publish, delete-old, drop-vectors so a lock-free single-member
 // reader is always correct:
 //
-//   - Phase 0 gathers every member from the current layout in one walk of the whole-set prefix, into
+//   - Phase 0 gathers every member from the current layout by walking its dense member vector(s) into
 //     a packed buffer, so the re-home that follows can rewrite rows under the same prefix without the
-//     scan revisiting them.
+//     scan revisiting them. The bare member bytes are copied out, so they outlive the vector teardown.
 //   - Phase 1 inserts each member's new-layout row before any old row is deleted, so a member is
 //     findable in at least one home at every instant; a lock-free SISMEMBER never sees a present
 //     member as absent.
@@ -106,8 +106,16 @@ func (c *connState) engageSetPartitions(skey []byte, newP int) {
 		return
 	}
 
-	// Phase 0: gather every member. moff strips the current layout's key header and, when the set is
-	// already partitioned, its one partition byte, recovering the bare member bytes.
+	// Phase 0: gather every member by walking the current layout's dense member vector(s) rather than
+	// the ordered index (spec 2064/f1_rewrite_ltm/20): the vector is the authoritative membership
+	// structure for the set type, so the re-home reads it exactly as SMEMBERS does and never descends
+	// the skip-list. The migration holds every stripe over [0, newP), a superset of the current
+	// partitions, so the layout is frozen and one drained downward walk per current partition yields
+	// every live member once. moff strips the current layout's key header and, when the set is already
+	// partitioned, its one partition byte, recovering the bare member bytes. SetVecScanDown and
+	// SetPartVecScanDown build the vector on first use, so a set that grew large enough to migrate
+	// before it was ever drawn from still resolves its members. The recovered bytes are copied into buf,
+	// so they stay valid after phase 4 tears the vectors down.
 	prefix := c.setPrefix(skey)
 	moff := len(prefix)
 	if oldP > 1 {
@@ -115,21 +123,36 @@ func (c *connState) engageSetPartitions(skey []byte, newP int) {
 	}
 	var buf []byte
 	var ends []int
-	var after []byte
 	scan := make([][]byte, 0, hashScanBatch)
-	for {
-		keys, last := c.srv.store.CollScan(prefix, after, hashScanBatch, scan[:0])
-		if len(keys) == 0 {
-			break
+	if oldP > 1 {
+		base := c.partScanBase(skey)
+		for part := 0; part < oldP; part++ {
+			hi := -1
+			for {
+				keys, next := c.srv.store.SetPartVecScanDown(base, oldP, part, hi, hashScanBatch, scan[:0])
+				for _, k := range keys {
+					buf = append(buf, k[moff:]...)
+					ends = append(ends, len(buf))
+				}
+				if next == 0 {
+					break
+				}
+				hi = next
+			}
 		}
-		for _, k := range keys {
-			buf = append(buf, k[moff:]...)
-			ends = append(ends, len(buf))
+	} else {
+		hi := -1
+		for {
+			keys, next := c.srv.store.SetVecScanDown(prefix, hi, hashScanBatch, scan[:0])
+			for _, k := range keys {
+				buf = append(buf, k[moff:]...)
+				ends = append(ends, len(buf))
+			}
+			if next == 0 {
+				break
+			}
+			hi = next
 		}
-		if last == nil {
-			break
-		}
-		after = last
 	}
 
 	// Phase 1: insert new-layout rows.
