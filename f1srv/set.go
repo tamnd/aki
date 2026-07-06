@@ -464,7 +464,7 @@ func (c *connState) cmdSAddPart(skey []byte, members [][]byte, p int) {
 		if isNew {
 			c.srv.store.CollInsert(mk, kindSetMember)
 			base[last] = byte(part)
-			c.srv.store.CollRandInsert(base, mk, kindSetMember)
+			c.srv.store.CollPartRandInsert(base, p, part, mk, kindSetMember)
 			added++
 		}
 		mu.Unlock()
@@ -1799,8 +1799,7 @@ func (c *connState) smovePart(source, destination, member []byte, pSrc, pDst int
 		c.srv.store.CollInsert(dstMK, kindSetMember)
 		if pDst > 1 {
 			base := c.partScanBase(destination)
-			base[len(base)-1] = byte(dstPart)
-			c.srv.store.CollRandInsert(base, dstMK, kindSetMember)
+			c.srv.store.CollPartRandInsert(base, pDst, dstPart, dstMK, kindSetMember)
 		} else {
 			c.srv.store.CollRandInsert(c.setPrefix(destination), dstMK, kindSetMember)
 		}
