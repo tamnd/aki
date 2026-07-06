@@ -420,6 +420,23 @@ func (s *Store) SetVecScanDown(prefix []byte, hi, limit int, dst [][]byte) ([][]
 	return dst, lo
 }
 
+// SetVecAt returns the composite key of the member at dense index idx in the set bounded by prefix,
+// or reports false when idx falls outside the current live count. It reads the same published vector
+// snapshot the random draw and SetVecLen read, building the vector on first use, so a caller sampling
+// several distinct indices under the set's stripe lock gets an O(1) array index per pick rather than
+// the O(log n) order-statistic skip-list descent CollSelectAt walked. prefix is the whole-set prefix
+// uvarint(len(skey))|skey; a partitioned set samples through the weighted partition draw, not this
+// call. The out-of-range report lets a sampler that races a shrink retry its draw rather than read
+// past the end. The key is an arena subslice valid for the store's life, read without copying.
+func (s *Store) SetVecAt(prefix []byte, idx int) (key []byte, ok bool) {
+	v := s.collPartVec(prefix)
+	vs := v.view.Load()
+	if idx < 0 || idx >= len(vs.s) {
+		return nil, false
+	}
+	return s.keyAt(vs.s[idx]), true
+}
+
 // SetPartVecLen returns partition part's live member count for the P-partition set whose
 // partition-scan base is base (uvarint(len(skey))|skey|<byte>, final byte rewritten to part
 // internally). Unlike SetVecLen, which resolves a vector straight through the randVec shard, it
