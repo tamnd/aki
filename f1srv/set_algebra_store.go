@@ -2,7 +2,6 @@ package f1srv
 
 import (
 	"bytes"
-	"encoding/binary"
 
 	"github.com/tamnd/aki/engine/f1raw"
 )
@@ -34,30 +33,63 @@ import (
 // A caller may hold arena-stable subslices of skey's own members across this clear (the
 // aliased-store case): a delete frees only the ordered-index slot, never the arena bytes the
 // subslices point at, so the buffered result survives.
+//
+// It enumerates the members to delete from the dense member vector rather than the ordered
+// index (spec 2064/f1_rewrite_ltm/20): the vector is the authoritative membership structure
+// for the set type, so the clear walks it exactly as SMEMBERS does and never descends the
+// skip-list. The caller holds skey's stripe lock across the STORE, so the layout is frozen and
+// one drained downward walk per partition yields every live member once. Each member row is
+// dropped from both the hash index (DeleteKind) and the ordered index (CollRemove); the
+// CollRemove keeps the ordered index consistent while the set type still maintains it and
+// becomes a no-op once the writer flip stops indexing set members. SetVecScanDown and
+// SetPartVecScanDown build the vector on first use, so a set cleared before it was ever
+// enumerated or drawn from still resolves its members. Walking the frozen snapshot while
+// deleting is safe: DeleteKind and CollRemove touch the hash and ordered indexes, not the
+// vector, so the snapshot length stays stable and the downward walk covers every member once;
+// the vector itself is torn down wholesale at the end.
 func (c *connState) clearSetRows(skey []byte) {
-	var tmp [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(tmp[:], uint64(len(skey)))
-	prefix := make([]byte, 0, n+len(skey))
-	prefix = append(prefix, tmp[:n]...)
-	prefix = append(prefix, skey...)
-	batch := make([][]byte, 0, hashScanBatch)
-	for {
-		keys, _ := c.srv.store.CollScan(prefix, nil, hashScanBatch, batch[:0])
-		if len(keys) == 0 {
-			break
-		}
-		for _, k := range keys {
-			if c.srv.store.DeleteKind(k, kindSetMember) {
-				c.srv.store.CollRemove(k)
+	p := c.partitionsFor(skey)
+	scan := make([][]byte, 0, hashScanBatch)
+	if p > 1 {
+		base := c.partScanBase(skey)
+		for part := 0; part < p; part++ {
+			hi := -1
+			for {
+				keys, next := c.srv.store.SetPartVecScanDown(base, p, part, hi, hashScanBatch, scan[:0])
+				for _, k := range keys {
+					if c.srv.store.DeleteKind(k, kindSetMember) {
+						c.srv.store.CollRemove(k)
+					}
+				}
+				if next == 0 {
+					break
+				}
+				hi = next
 			}
+		}
+	} else {
+		prefix := c.setPrefix(skey)
+		hi := -1
+		for {
+			keys, next := c.srv.store.SetVecScanDown(prefix, hi, hashScanBatch, scan[:0])
+			for _, k := range keys {
+				if c.srv.store.DeleteKind(k, kindSetMember) {
+					c.srv.store.CollRemove(k)
+				}
+			}
+			if next == 0 {
+				break
+			}
+			hi = next
 		}
 	}
 	c.srv.store.DeleteKind(skey, kindSetMeta)
-	// Drop skey's dense member vector wholesale (spec 2064/18 5.3): the set is gone, so its
-	// vector is stale. A later STORE into this same key rebuilds a fresh vector on first draw
-	// from the newly-published rows, and the per-member CollRandInsert calls in storeAlgebra
-	// no-op until then, so nothing points at the just-deleted rows.
-	c.srv.store.CollRandDrop(prefix)
+	// Drop skey's dense member vector(s) and partition descriptor wholesale (spec 2064/18 5.3):
+	// the set is gone, so the vectors are stale. CollRandDrop drops the whole-set vector and,
+	// through the descriptor, every partition vector. A later STORE into this same key rebuilds a
+	// fresh vector as it publishes members, and the per-member CollRandInsert/CollPartRandInsert
+	// calls in storeAlgebra build-or-append onto that, so nothing points at the just-deleted rows.
+	c.srv.store.CollRandDrop(c.setPrefix(skey))
 }
 
 // storeAlgebra is the shared body of the three STORE forms: it locks the destination and
