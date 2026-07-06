@@ -119,38 +119,38 @@ func (c *connState) moveRows(src, dst []byte) {
 		c.srv.store.Delete(src)
 	case keyHash:
 		c.propagateHashFieldTTLs(src, dst, true)
-		c.moveIndexedFamily(src, dst, kindHashField, nil)
+		c.moveIndexedFamily(src, dst, kindHashField)
 		c.moveHeader(src, dst, kindHashMeta)
 	case keySet:
-		// Capture the source's partition count before the move. moveIndexedFamily re-keys each row's
+		// Capture the source's partition count before the move. moveSetFamily re-keys each member's
 		// bytes after the key header verbatim, so a partitioned source's partition byte and member
 		// carry over unchanged and moveHeader copies the P exponent byte, leaving dst physically laid
 		// out at srcP. partitionsFor reads the registry, not the header, so dst must be engaged at
 		// srcP for that layout to route, and src must be dropped from the registry with its rows.
 		srcP := c.srv.partitionP(src)
-		c.moveIndexedFamily(src, dst, kindSetMember, c.setVectorFeeder(dst, srcP))
+		c.moveSetFamily(src, dst, srcP, c.setVectorFeeder(dst, srcP))
 		c.moveHeader(src, dst, kindSetMeta)
-		// Drop the source's dense member vector (spec 2064/18 5.3): moveIndexedFamily republishes
-		// every member under dst's prefix at a fresh arena offset and deletes the source rows, so
-		// an offset-preserving re-key is impossible. The destination builds its own vector on first
-		// draw from the moved rows; the source vector would only point at deleted records.
+		// Drop the source's dense member vector (spec 2064/18 5.3): moveSetFamily republishes every
+		// member under dst's prefix at a fresh arena offset and deletes the source rows, so an
+		// offset-preserving re-key is impossible. The destination builds its own vector from the
+		// moved members as it feeds them; the source vector would only point at deleted records.
 		c.srv.store.CollRandDrop(c.setPrefix(src))
 		if srcP > 1 {
 			c.srv.engageP(dst, srcP)
 		}
 		c.srv.unengageP(src)
 	case keyZset:
-		c.moveIndexedFamily(src, dst, kindZsetMember, nil)
-		c.moveIndexedFamily(src, dst, kindZsetScore, nil)
+		c.moveIndexedFamily(src, dst, kindZsetMember)
+		c.moveIndexedFamily(src, dst, kindZsetScore)
 		c.moveHeader(src, dst, kindZsetMeta)
 	case keyList:
 		c.moveListElems(src, dst)
 		c.moveHeader(src, dst, kindListMeta)
 	case keyStream:
-		c.moveIndexedFamily(src, dst, kindStreamEntry, nil)
-		c.moveIndexedFamily(src, dst, kindStreamGroup, nil)
-		c.moveIndexedFamily(src, dst, kindStreamConsumer, nil)
-		c.moveIndexedFamily(src, dst, kindStreamPEL, nil)
+		c.moveIndexedFamily(src, dst, kindStreamEntry)
+		c.moveIndexedFamily(src, dst, kindStreamGroup)
+		c.moveIndexedFamily(src, dst, kindStreamConsumer)
+		c.moveIndexedFamily(src, dst, kindStreamPEL)
 		c.moveHeader(src, dst, kindStreamMeta)
 	}
 }
@@ -162,10 +162,12 @@ func (c *connState) moveRows(src, dst []byte) {
 // entry/group/consumer/PEL all move with the same rewrite. Each moved row is inserted into the
 // ordered index under its new key and the old row is deleted and unlinked, so the index and the
 // hash agree on the live set exactly as a normal write would leave them.
-// feed, when non-nil, is called after each row is published under dst with the new key and the
-// portion of it past dst's key header, so the set path can add each republished member to the
-// destination's dense vector (setVectorFeeder). Every other family passes nil.
-func (c *connState) moveIndexedFamily(src, dst []byte, kind byte, feed func(newKey, suffix []byte)) {
+//
+// The set type moves through moveSetFamily instead, which enumerates the source off its dense
+// member vector rather than the ordered index (spec 2064/f1_rewrite_ltm/20); this generic path
+// serves the hash, both zset indexes, and all four stream families, none of which the set flip
+// touches.
+func (c *connState) moveIndexedFamily(src, dst []byte, kind byte) {
 	prefix := familyScanPrefix(src, kind)
 	hdrLen := keyHeaderLen(src)
 	dstHeader := appendKeyHeader(nil, dst)
@@ -204,11 +206,40 @@ func (c *connState) moveIndexedFamily(src, dst []byte, kind byte, feed func(newK
 			continue
 		}
 		c.srv.store.CollInsert(nkbuf, kind)
-		if feed != nil {
-			feed(nkbuf, oldk[hdrLen:])
-		}
 		c.srv.store.DeleteKind(oldk, kind)
 		c.srv.store.CollRemove(oldk)
+	}
+}
+
+// moveSetFamily moves a set's member rows from src to dst, enumerating the source off its dense
+// member vector rather than the ordered index (spec 2064/f1_rewrite_ltm/20): the vector is the
+// authoritative membership structure for the set type, so the move walks it exactly as SMEMBERS
+// does and never descends the skip-list. It mirrors copySetFamily but also deletes each source row
+// after republishing it, since a rename empties the source. srcP is the source's partition count,
+// so a partitioned source is enumerated partition by partition; the destination is engaged at the
+// same P by the caller, so a member's partition byte and bytes carry over verbatim under dst's
+// key header. feed adds each republished member to the destination's dense vector (setVectorFeeder).
+//
+// collectSetMembers gathers every source member's composite key first (arena subslices, valid for
+// the store's life because the arena is grow-only), so the two-phase republish-then-delete never
+// reads a row it already deleted: the gathered keys stay readable after their index slots clear.
+func (c *connState) moveSetFamily(src, dst []byte, srcP int, feed func(newKey, suffix []byte)) {
+	hdrLen := keyHeaderLen(src)
+	dstHeader := appendKeyHeader(nil, dst)
+	members := c.collectSetMembers(src, srcP)
+	var nkbuf []byte
+	for _, k := range members {
+		nkbuf = append(nkbuf[:0], dstHeader...)
+		nkbuf = append(nkbuf, k[hdrLen:]...)
+		if _, err := c.srv.store.PutKind(nkbuf, nil, kindSetMember); err != nil {
+			continue
+		}
+		c.srv.store.CollInsert(nkbuf, kindSetMember)
+		if feed != nil {
+			feed(nkbuf, k[hdrLen:])
+		}
+		c.srv.store.DeleteKind(k, kindSetMember)
+		c.srv.store.CollRemove(k)
 	}
 }
 
