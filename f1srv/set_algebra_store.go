@@ -111,12 +111,12 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 			}
 			if isNew {
 				c.srv.store.CollInsert(mk, kindSetMember)
-				// Splice into the partition's dense vector if one exists (a no-op after clearSetRows
-				// dropped it, so the vector rebuilds lazily on first draw). base is built into ppbuf,
-				// distinct from mk's kbuf, and its final byte set to the member's partition.
+				// Eagerly build-or-splice the partition's dense vector through the descriptor so
+				// CollRandDrop can tear it down (doc 20 section 6.1). After clearSetRows dropped the
+				// old vector the first stored member rebuilds it; each subsequent member appends. base
+				// is built into ppbuf, distinct from mk's kbuf; CollPartRandInsert sets its final byte.
 				base := c.partScanBase(dest)
-				base[len(base)-1] = byte(part)
-				c.srv.store.CollRandInsert(base, mk, kindSetMember)
+				c.srv.store.CollPartRandInsert(base, destP, part, mk, kindSetMember)
 				count++
 			}
 			return true

@@ -58,6 +58,34 @@ func (s *Store) collPartVec(prefix []byte) *memberVec {
 	return v
 }
 
+// CollPartRandInsert records a newly-added member's offset in partition part's dense vector of the
+// P-partition set whose partition-scan base is base, building the partition vector eagerly if it
+// does not exist yet. It is the partitioned companion of CollRandInsert: doc 20 makes the vector the
+// authoritative membership structure, so a partitioned set that is only enumerated still needs its
+// partition vectors built on write rather than deferred to the first draw. The build goes through the
+// descriptor (partDescFor then descPartVec), not straight through the randVec shard, because a
+// partition vector is torn down only through the descriptor CollRandDrop consults: a vector built off
+// the shard alone would leak past DEL and a grow's re-home and read stale (doc 20 section 6.1).
+// descPartVec builds it whole through collPartVec's deriveOnFirstDraw scan, which CollInsert has
+// already fed this member into, so the resolve-and-add below is idempotent for this member and only
+// appends when the vector already existed. Call it under the partition's stripe lock, right after
+// PutKind reports a new member and CollInsert adds its ordered node; base's final byte is rewritten
+// to part internally. It re-reads the vector under the shard mutex before adding so a concurrent
+// CollRandDrop between the descriptor build and the add makes it a no-op rather than reviving a
+// dropped set's vector, matching CollRandInsert's drop safety.
+func (s *Store) CollPartRandInsert(base []byte, p, part int, key []byte, kind byte) {
+	d := s.partDescFor(base[:len(base)-1], p)
+	s.descPartVec(d, base, part) // rewrites base's final byte to part and registers the vector
+	sh := s.rvec.shardFor(base)
+	sh.mu.Lock()
+	if v := sh.get(base); v != nil {
+		if off, _, _, _, found := s.find(key, hash(key), kind); found {
+			v.add(off)
+		}
+	}
+	sh.mu.Unlock()
+}
+
 // walkPart maps a global index g in [0, total) to its partition by the prefix-sum walk: it
 // subtracts each partition's count until g falls within the current partition's range, and
 // returns that partition and the within-partition index. An empty partition contributes a
