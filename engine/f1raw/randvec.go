@@ -326,24 +326,29 @@ func (s *Store) deriveOnFirstDraw(prefix []byte) *memberVec {
 	return v
 }
 
-// CollRandInsert records a newly-added member's offset in the set's dense vector, if the
-// vector already exists. It is a no-op when no vector exists for prefix, which is the lazy
-// contract: a set that has never been drawn from has no vector, and building a partial one
-// from a single insert would leave the earlier members unreachable by a draw, so the vector
-// is instead built whole by the first draw's deriveOnFirstDraw. Call it under the set's
-// stripe lock, right after PutKind reports a newly-created member and CollInsert adds its
-// ordered-index node, with the member's live composite key so the offset can be resolved
-// through the authoritative hash index. It resolves the offset itself (the same find
-// CollInsert does) rather than taking a caller-passed offset, so the two insert calls share
-// the same failure mode: a member removed by a concurrent writer resolves to not-found and
-// neither structure records it.
+// CollRandInsert records a newly-added member's offset in the set's dense vector for the
+// whole-set (P=1) prefix, building the vector eagerly if it does not exist yet. Doc 20 makes
+// the dense vector the authoritative membership structure, so it can no longer be lazy: a set
+// that is only ever enumerated (SMEMBERS) and never drawn from still needs a vector to read.
+// On the first write to a set with no vector this builds it whole through deriveOnFirstDraw,
+// which scans the ordered index CollInsert has already updated with this member, so the built
+// vector holds every live member; the resolve-and-add below is then idempotent for this
+// member and only appends when the vector already existed. The whole-set vector needs no
+// partition descriptor: CollRandDrop drops it directly under prefix (doc 20 section 6.1); the
+// partition case goes through CollPartRandInsert instead so its vector is descriptor-named.
+// Call it under the set's stripe lock, right after PutKind reports a newly-created member and
+// CollInsert adds its ordered-index node, with the member's live composite key so the offset
+// can be resolved through the authoritative hash index. It resolves the offset itself (the
+// same find CollInsert does) rather than taking a caller-passed offset, so the two insert
+// calls share the same failure mode: a member removed by a concurrent writer resolves to
+// not-found and neither structure records it.
 func (s *Store) CollRandInsert(prefix, key []byte, kind byte) {
 	sh := s.rvec.shardFor(prefix)
 	sh.mu.Lock()
 	v := sh.get(prefix)
 	if v == nil {
-		sh.mu.Unlock()
-		return
+		v = s.deriveOnFirstDraw(prefix)
+		sh.put(prefix, v)
 	}
 	off, _, _, _, found := s.find(key, hash(key), kind)
 	if found {

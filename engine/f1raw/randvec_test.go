@@ -209,28 +209,30 @@ func TestRandVecDrainToEmpty(t *testing.T) {
 	}
 }
 
-func TestRandVecLazyBuild(t *testing.T) {
-	// Members added before any draw leave no vector; the first draw must build a complete
-	// one from the ordered index, not a partial one from a single insert.
+func TestRandVecEagerBuild(t *testing.T) {
+	// Doc 20 makes the vector eager and authoritative: SADD builds it on the set's first member
+	// and maintains it thereafter, so a set that is only ever enumerated and never drawn still
+	// has a complete vector. This is the property the old lazy contract could not offer.
 	s := newTestStore()
 	prefix := setPrefixBytes("s")
 	const n = 300
 	members := map[string]bool{}
 	for i := 0; i < n; i++ {
 		m := fmt.Sprintf("m%d", i)
-		addMember(t, s, prefix, "s", m) // no vector yet, so CollRandInsert is a no-op
+		addMember(t, s, prefix, "s", m) // eager: CollRandInsert builds/appends on every add
 		members[m] = true
 	}
-	// No vector should exist yet (pay-for-what-you-use).
+	// The vector exists and is a complete dense space before any draw or enumeration.
 	sh := s.rvec.shardFor(prefix)
 	sh.mu.Lock()
-	if sh.get(prefix) != nil {
-		sh.mu.Unlock()
-		t.Fatalf("vector exists before any draw")
-	}
+	present := sh.get(prefix) != nil
 	sh.mu.Unlock()
+	if !present {
+		t.Fatalf("vector missing after adds; eager build did not run")
+	}
+	checkDense(t, s, prefix, n)
 
-	// The first draw builds the whole thing; sample many times and confirm coverage.
+	// Every member draws out; sample many times and confirm coverage.
 	drawn := map[string]bool{}
 	var rng testRNG
 	for i := 0; i < n*20; i++ {
@@ -286,11 +288,11 @@ func TestRandVecRebuildAfterDrop(t *testing.T) {
 }
 
 // TestRandVecAt walks every dense index of a set and confirms SetVecAt hands back each live
-// member exactly once, that the vector builds lazily on the first index read the way the draw
-// path builds it, and that an out-of-range index reports absent rather than reading past the
-// end. This is the count-sampler contract: SRANDMEMBER/SPOP with a count pick indices in
-// [0,card) and expect a live member for each, and a sampler that races a shrink expects a
-// clean false rather than a stale offset.
+// member exactly once, that the eager vector is present and complete before any index read,
+// and that an out-of-range index reports absent rather than reading past the end. This is the
+// count-sampler contract: SRANDMEMBER/SPOP with a count pick indices in [0,card) and expect a
+// live member for each, and a sampler that races a shrink expects a clean false rather than a
+// stale offset.
 func TestRandVecAt(t *testing.T) {
 	s := newTestStore()
 	prefix := setPrefixBytes("s")
@@ -298,17 +300,17 @@ func TestRandVecAt(t *testing.T) {
 	members := map[string]bool{}
 	for i := 0; i < n; i++ {
 		m := fmt.Sprintf("m%d", i)
-		addMember(t, s, prefix, "s", m) // no vector yet, so the first SetVecAt builds it
+		addMember(t, s, prefix, "s", m) // eager: the vector is built and maintained on every add
 		members[m] = true
 	}
-	// No vector exists before the first index read; SetVecAt must build it like the draw path.
+	// The eager vector exists before the first index read.
 	sh := s.rvec.shardFor(prefix)
 	sh.mu.Lock()
-	if sh.get(prefix) != nil {
-		sh.mu.Unlock()
-		t.Fatalf("vector exists before any index read")
-	}
+	present := sh.get(prefix) != nil
 	sh.mu.Unlock()
+	if !present {
+		t.Fatalf("vector missing after adds; eager build did not run")
+	}
 
 	seen := map[string]bool{}
 	for i := 0; i < n; i++ {
