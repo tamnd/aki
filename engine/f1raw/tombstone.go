@@ -140,7 +140,7 @@ func (s *Store) drainTombstones() int {
 	}
 	total := 0
 	for n := head; n != nil; {
-		s.oidx.removeManyLive(n.buf, n.ends, n.kind)
+		s.oidx.Load().removeManyLive(n.buf, n.ends, n.kind)
 		total += len(n.ends)
 		// The node is off the stack in this drain's private snapshot and now spliced, so nothing
 		// else references it; hand it and its arenas back to the pool for the next enqueue. Read
@@ -175,7 +175,7 @@ func (s *Store) CollRemovePacked(buf []byte, ends []int, kind byte) {
 		keys = append(keys, buf[prev:e])
 		prev = e
 	}
-	s.oidx.removeMany(keys)
+	s.oidx.Load().removeMany(keys)
 }
 
 // SyncPendingRemovals drains any outstanding tombstones synchronously, so a caller that needs the

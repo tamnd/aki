@@ -180,10 +180,16 @@ func (s *Store) insertAbsent(key, val []byte, h uint64, kind byte) (installed, e
 //
 // The one background actor a flush must coordinate with is the tombstone folder: it drains
 // under folderMu and touches s.oidx, so Reset takes folderMu across the whole flush. That
-// makes the flush and any in-flight folder drain mutually exclusive, so replacing the oidx
-// pointer never races the folder's read of it. Every queued tombstone points at a record
-// this flush is about to unlink, so the queue is dropped wholesale under the same lock; a
-// folder that wakes after Reset returns swaps an empty stack and does nothing.
+// makes the flush and any in-flight folder drain mutually exclusive. Every queued tombstone
+// points at a record this flush is about to unlink, so the queue is dropped wholesale under
+// the same lock; a folder that wakes after Reset returns swaps an empty stack and does
+// nothing.
+//
+// The oidx swap itself is a single atomic store (f1raw.go), so a foreground collection
+// insert or scan that reads the pointer without folderMu sees either the old or the new
+// index, never a torn word. Such a reader may still land in the index this flush is about to
+// discard; that is the flush-races-insert case the store already tolerates, and a caller that
+// needs the flush to be a hard barrier quiesces traffic as noted above.
 func (s *Store) Reset() {
 	s.folderMu.Lock()
 	defer s.folderMu.Unlock()
@@ -203,7 +209,7 @@ func (s *Store) Reset() {
 	}
 	s.count.Store(0)
 	s.topCount.Store(0)
-	s.oidx = newOIndex(s)
+	s.oidx.Store(newOIndex(s))
 	// Drop every set's dense member vector too (randvec.go): a reset clears the keyspace, so a
 	// fresh randVec starts every shard empty and the first draw against any later set rebuilds
 	// its vector from the now-empty index. The vector is never persisted, so there is nothing
