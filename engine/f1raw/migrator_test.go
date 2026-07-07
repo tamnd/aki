@@ -135,6 +135,71 @@ func TestBackpressureServesBeyondArena(t *testing.T) {
 	}
 }
 
+// TestMigratorLeavesCollectionRecordsResident is the M3 slice-6a gate for the string-only migration
+// restriction (doc 21 section 9, deferring collection tiering to D8/D20). A collection element
+// record still has resident addresses cached in its type's secondary structures, so the migrator
+// must not sink it: only string records, which have no secondary structure and a fully tier-aware
+// path, may go cold. It fills one segment with string records plus a single collection-kind record,
+// drains that segment, and asserts the strings went cold while the collection record stayed
+// resident and readable, so the segment kept a nonzero live total and did not retire.
+func TestMigratorLeavesCollectionRecordsResident(t *testing.T) {
+	s := churnSegColdStore(t, 4)
+	const collKind = byte(1)
+
+	// Lay the collection record down first so it lands at the base of the still-empty target
+	// segment, then fill the rest of that segment with string records.
+	target := s.curSeg.Load()
+	collKey := []byte("coll-elem")
+	if _, err := s.PutKind(collKey, []byte("coll-value"), collKind); err != nil {
+		t.Fatalf("PutKind: %v", err)
+	}
+	var strKeys [][]byte
+	for i := 0; s.curSeg.Load() == target; i++ {
+		k := []byte(fmt.Sprintf("s%06d", i))
+		if err := s.Set(k, churnVal("s", i)); err != nil {
+			t.Fatalf("Set %q: %v", k, err)
+		}
+		if s.curSeg.Load() != target {
+			s.Delete(k) // spilled into the next segment; keep the tracked set within target
+			break
+		}
+		strKeys = append(strKeys, k)
+	}
+	if len(strKeys) == 0 {
+		t.Fatal("no string records landed in the target segment")
+	}
+	coldBefore, _ := s.ColdRecords()
+
+	s.drainSegment(target)
+
+	// Every string record in the segment sank cold and still reads its exact value.
+	for i, k := range strKeys {
+		if !s.entryIsCold(t, k, stringKind) {
+			t.Fatalf("string key %q stayed resident; migrator did not sink it", k)
+		}
+		v, ok := s.Get(k, nil)
+		if !ok || string(v) != string(churnVal("s", i)) {
+			t.Fatalf("Get %q = %q,%v; want its exact value", k, v, ok)
+		}
+	}
+	if coldAfter, _ := s.ColdRecords(); coldAfter <= coldBefore {
+		t.Fatalf("cold region did not grow draining strings: %d -> %d", coldBefore, coldAfter)
+	}
+
+	// The collection record must have stayed resident: its type's secondary structures still hold
+	// its resident address, so a cold flip would dangle them until D8/D20.
+	if s.entryIsCold(t, collKey, collKind) {
+		t.Fatal("collection record was migrated cold; the string-only gate did not hold")
+	}
+	if v, ok := s.GetKind(collKey, nil, collKind); !ok || string(v) != "coll-value" {
+		t.Fatalf("GetKind coll-elem = %q,%v; want coll-value,true", v, ok)
+	}
+	// With one record still live, the segment kept a nonzero live total and did not retire.
+	if live := s.segs[target].live.Load(); live <= 0 {
+		t.Fatalf("target segment live=%d; want > 0 while the collection record remains", live)
+	}
+}
+
 // setWithMigratorRetry writes one record, waiting on the migrator when the arena is momentarily full.
 // The migrator runs on its own goroutine, so a burst of writes can outrun its draining and hit
 // ErrFull before a segment frees; this signals the migrator and retries with a short backoff, which
