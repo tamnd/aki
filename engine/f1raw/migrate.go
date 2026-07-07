@@ -1,5 +1,19 @@
 package f1raw
 
+import "time"
+
+// migWaitStep and migWaitPolls bound the write-path backpressure wait (D12): when the arena is
+// full and the migrator is engaged, allocRecord signals the migrator and polls this many times,
+// sleeping migWaitStep between polls, for a segment to free before it gives up and reports the
+// arena full. The product is the total budget a single allocation blocks, kept short enough that a
+// genuine out-of-space (cold region full, disk error keeping a drain from completing) still
+// surfaces as ErrFull promptly rather than hanging, and long enough that a burst outrunning the
+// migrator's own draining waits it out instead of failing a write the migrator would have served.
+const (
+	migWaitStep  = 100 * time.Microsecond
+	migWaitPolls = 10000 // 100us x 10000 = up to 1s per blocked allocation
+)
+
 // defaultMigHiNum and defaultMigLoNum are the high- and low-water numerators over 100 of the
 // segment budget the migrator drains between (doc 21 D14). It wakes when the resident live-byte
 // total crosses 85% of the budget and drains cold until it falls below 75%, then sleeps. The gap
@@ -169,6 +183,37 @@ func (s *Store) signalMigrator() {
 	case s.migWake <- struct{}{}:
 	default:
 	}
+}
+
+// waitForSegment is the write-path backpressure (D12): when allocRecord cannot get a segment it
+// calls this to wait for the migrator to free one rather than reporting the arena full at once. It
+// returns true when a segment has become available to retry the allocation, false when no migrator
+// is engaged or the bounded wait elapsed with the arena still full, which surfaces as ErrFull.
+//
+// The wait is what makes a bounded arena serve a dataset larger than itself transparently: the
+// migrator drains full segments cold, which moves their records out of RAM and frees the segment,
+// so a write that momentarily finds no room blocks on the drain instead of failing. It signals the
+// migrator, then polls, reclaiming retired segments each round (a drained segment is free once its
+// pre-flip readers quiesce) and checking for a free or never-used segment. Progress holds as long
+// as the cold region can take more; when it genuinely cannot, the poll budget elapses and the
+// caller reports the arena full. A store with no migrator returns false immediately and pays
+// nothing, so the non-LTM path keeps returning ErrFull exactly as before.
+func (s *Store) waitForSegment() bool {
+	if !s.migOn.Load() {
+		return false // no migrator: the arena is genuinely full, report it at once
+	}
+	for i := 0; i < migWaitPolls; i++ {
+		s.signalMigrator()
+		time.Sleep(migWaitStep)
+		s.reclaimSegments() // turn any drained-and-retired segments into reusable ones
+		s.segMu.Lock()
+		free := len(s.freeSegs) > 0 || s.highWater < uint64(len(s.segs))
+		s.segMu.Unlock()
+		if free {
+			return true
+		}
+	}
+	return false
 }
 
 // migrator is the background goroutine's loop: sleep until woken by a segment advance or a stop,
