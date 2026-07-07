@@ -103,12 +103,15 @@ const incrNeedsGrow = int64(-1) << 62
 func (s *Store) incrInPlace(off uint64, delta int64) (int64, bool) {
 	verp := s.verAt(off)
 	vbase := off + hdrSize + align8(s.klen(off))
+	spins := 0
 	for {
 		v := verp.Load()
 		if v&verLockBit != 0 {
+			spins = spinWait(spins)
 			continue
 		}
 		if !verp.CompareAndSwap(v, v+1) {
+			spins = spinWait(spins)
 			continue
 		}
 		n := uint64(s.vlenAt(off).Load())

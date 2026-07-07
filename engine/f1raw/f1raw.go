@@ -61,6 +61,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math/bits"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -472,6 +473,29 @@ func (s *Store) verAt(off uint64) *atomic.Uint32 {
 	return (*atomic.Uint32)(unsafe.Add(s.base, off+offVer))
 }
 
+// spinsBeforeYield is how many times a contended seqlock spin busy-loops before it
+// yields the P. The common case, an uncontended latch, wins on the first attempt and
+// never spins, so this threshold is paid only when several goroutines fight over one
+// record's version word. A handful of cheap spins rides out a latch a same-key writer
+// holds for a single memcpy; past that the holder or the next CAS winner may be off-P,
+// so yielding lets it run instead of the spinner burning the core.
+const spinsBeforeYield = 24
+
+// spinWait backs off one iteration of a seqlock spin loop. It busy-spins for the first
+// spinsBeforeYield turns, then calls runtime.Gosched so a spinner never starves the
+// latch holder on an oversubscribed machine (more contending goroutines than cores, or
+// a loaded box). Without this a hot key hammered by many writers can livelock: every
+// spinner holds its P in a tight continue while the holder that would release the latch
+// never gets scheduled. Returns the next spin count. The uncontended path never reaches
+// here, so the hot GET/SET/INCR loop pays nothing.
+func spinWait(spins int) int {
+	if spins >= spinsBeforeYield {
+		runtime.Gosched()
+		return 0
+	}
+	return spins + 1
+}
+
 // vlenAt returns the atomic value-length word for the record at off. It is written
 // under the latch and read under the seqlock, so a reader never sees a length from
 // one update paired with bytes from another.
@@ -617,9 +641,11 @@ func (s *Store) Get(key, dst []byte) ([]byte, bool) {
 func (s *Store) readValue(off uint64, dst []byte) []byte {
 	verp := s.verAt(off)
 	vbase := off + hdrSize + align8(s.klen(off))
+	spins := 0
 	for {
 		v1 := verp.Load()
 		if v1&verLockBit != 0 {
+			spins = spinWait(spins)
 			continue
 		}
 		n := uint64(s.vlenAt(off).Load())
@@ -627,6 +653,7 @@ func (s *Store) readValue(off uint64, dst []byte) []byte {
 		if verp.Load() == v1 {
 			return dst
 		}
+		spins = spinWait(spins)
 	}
 }
 
@@ -671,9 +698,11 @@ func (s *Store) Set(key, val []byte) error {
 func (s *Store) inPlace(off uint64, val []byte) {
 	verp := s.verAt(off)
 	vbase := off + hdrSize + align8(s.klen(off))
+	spins := 0
 	for {
 		v := verp.Load()
 		if v&verLockBit != 0 {
+			spins = spinWait(spins)
 			continue
 		}
 		if verp.CompareAndSwap(v, v+1) { // acquire: make it odd
@@ -682,6 +711,7 @@ func (s *Store) inPlace(off uint64, val []byte) {
 			verp.Store(v + 2) // release: back to even, one tick newer
 			return
 		}
+		spins = spinWait(spins)
 	}
 }
 
