@@ -82,13 +82,15 @@ func (s *Store) drainRecord(off uint64) bool {
 		return false
 	}
 	kind := s.arena[off+offKind]
-	if !migratable(kind) {
-		// A collection element record still has resident addresses cached in its type's
-		// secondary structures (the ordered index and the set member vectors), which a cold
-		// flip would leave dangling until D8/D20 refreshes them on migration. Until that
-		// lands, only string records, which have no secondary structure and a fully
-		// tier-aware read, write, and delete path, are safe to sink; leave the rest resident.
-		// A pure-string larger-than-memory workload drains its segments fully regardless.
+	if !s.migratable(kind) {
+		// A kind the policy does not admit stays resident. The string floor is always safe (no
+		// secondary structure, a fully tier-aware read, write, and delete path). A collection kind
+		// is safe only once its type's secondary structures follow a record cold: the ordered index
+		// does (each node re-resolves through the tier-aware primary index on access, D22 Option B),
+		// so a server that has proven a hash, zset, or list read path admits those kinds; the set
+		// member vector still caches resident offsets it cannot re-resolve, so a server leaves the
+		// set kinds out until that lands. A pure-string larger-than-memory workload drains its
+		// segments fully regardless of the policy.
 		return false
 	}
 	klen := s.klen(off)
@@ -117,13 +119,17 @@ func (s *Store) drainRecord(off uint64) bool {
 }
 
 // migratable reports whether a record of the given kind is safe for the background migrator to
-// sink to the cold region. Only string records qualify today: they carry no secondary structure
-// and their read, write, and delete paths all cross the tier boundary (doc 21 section 9). A
-// collection element record's kind fails this until D8/D20 teaches its type's ordered index and
-// member vectors to follow a record cold, so the migrator leaves such records resident. This is
-// the one place the safe set is named, so widening it later is a single edit here.
-func migratable(kind byte) bool {
-	return kind == stringKind
+// sink to the cold region. A string record always qualifies: it carries no secondary structure and
+// its read, write, and delete paths all cross the tier boundary (doc 21 section 9). Any other kind
+// qualifies only when the server's migratableKind policy admits it, which the server sets once it
+// has proven that kind's secondary structures follow a record cold (SetMigratableKindFunc). The
+// engine is type-agnostic, so it cannot judge a collection kind's tier-safety itself; it names the
+// unconditional string floor here and defers the rest to the policy, the same split topKind uses.
+// A nil policy (the default) leaves the migrator string-only, exactly as before any kind is opted
+// in, so a store that never registers a policy drains only strings and every collection record
+// stays resident.
+func (s *Store) migratable(kind byte) bool {
+	return kind == stringKind || (s.migratableKind != nil && s.migratableKind(kind))
 }
 
 // drainSegment sinks every record still live in segment si to the cold region and retires the
