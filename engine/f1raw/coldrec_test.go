@@ -147,6 +147,77 @@ func TestColdRecordSeparatedValue(t *testing.T) {
 	}
 }
 
+// TestColdRecordBringUpOnWrite is the M3 slice-5 gate for doc 21 section 9's tier-crossing write
+// and delete paths. A cold record's frame is immutable, so a write to a cold key must not mutate it
+// in place: it appends a fresh resident record and flips the entry back to the arena (write brings
+// the record up), marking the old cold frame dead. Incr on a cold counter does the same after
+// reading the current value from the region. A delete of a cold key drops the entry and marks the
+// frame dead. Every step is checked through the public API plus the tier probe and the region's
+// dead accounting, so a path that indexed the arena at a cold offset would panic or read garbage.
+func TestColdRecordBringUpOnWrite(t *testing.T) {
+	s := newRecStore(t)
+
+	// A plain overwrite of a cold key brings it back up resident, reads the new value, and marks
+	// the old frame dead.
+	if err := s.Set([]byte("k1"), []byte("v1")); err != nil {
+		t.Fatalf("Set k1: %v", err)
+	}
+	if !s.MigrateToCold([]byte("k1"), stringKind) {
+		t.Fatal("MigrateToCold(k1) returned false")
+	}
+	if !s.entryIsCold(t, []byte("k1"), stringKind) {
+		t.Fatal("k1 not cold after migration")
+	}
+	_, deadBefore := s.ColdRecords()
+	if err := s.Set([]byte("k1"), []byte("v2-longer")); err != nil {
+		t.Fatalf("Set k1 (bring-up): %v", err)
+	}
+	if s.entryIsCold(t, []byte("k1"), stringKind) {
+		t.Fatal("k1 still cold after overwrite; write did not bring it up")
+	}
+	if v, ok := s.Get([]byte("k1"), nil); !ok || string(v) != "v2-longer" {
+		t.Fatalf("Get k1 after bring-up = %q,%v; want v2-longer,true", v, ok)
+	}
+	if _, deadAfter := s.ColdRecords(); deadAfter <= deadBefore {
+		t.Fatalf("cold dead bytes did not grow on bring-up: %d -> %d", deadBefore, deadAfter)
+	}
+
+	// Incr on a cold counter reads the region, adds, and republishes resident.
+	if err := s.Set([]byte("ctr"), []byte("41")); err != nil {
+		t.Fatalf("Set ctr: %v", err)
+	}
+	if !s.MigrateToCold([]byte("ctr"), stringKind) {
+		t.Fatal("MigrateToCold(ctr) returned false")
+	}
+	if n, err := s.Incr([]byte("ctr"), 1); err != nil || n != 42 {
+		t.Fatalf("Incr cold ctr = %d,%v; want 42,nil", n, err)
+	}
+	if s.entryIsCold(t, []byte("ctr"), stringKind) {
+		t.Fatal("ctr still cold after Incr; write did not bring it up")
+	}
+	if v, ok := s.Get([]byte("ctr"), nil); !ok || string(v) != "42" {
+		t.Fatalf("Get ctr after Incr = %q,%v; want 42,true", v, ok)
+	}
+
+	// A delete of a cold key drops the entry and marks its frame dead.
+	if err := s.Set([]byte("gone"), []byte("bye")); err != nil {
+		t.Fatalf("Set gone: %v", err)
+	}
+	if !s.MigrateToCold([]byte("gone"), stringKind) {
+		t.Fatal("MigrateToCold(gone) returned false")
+	}
+	_, deadBefore = s.ColdRecords()
+	if !s.Delete([]byte("gone")) {
+		t.Fatal("Delete(cold gone) returned false")
+	}
+	if _, ok := s.Get([]byte("gone"), nil); ok {
+		t.Fatal("Get gone after delete still found it")
+	}
+	if _, deadAfter := s.ColdRecords(); deadAfter <= deadBefore {
+		t.Fatalf("cold dead bytes did not grow on cold delete: %d -> %d", deadBefore, deadAfter)
+	}
+}
+
 // entryIsCold reports whether key's index entry in the given kind namespace carries a cold
 // (tier-bit-set) address. It probes the index directly so a test can assert which tier a key
 // landed in.
