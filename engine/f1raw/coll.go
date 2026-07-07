@@ -32,10 +32,7 @@ func (s *Store) GetKind(key, dst []byte, kind byte) ([]byte, bool) {
 	if !found {
 		return dst[:0], false
 	}
-	if s.cold != nil && s.isSep(off) {
-		return s.readSeparated(off, dst)
-	}
-	return s.readValue(off, dst), true
+	return s.readValueByAddr(off, dst)
 }
 
 // ExistsKind reports whether key is present in the given kind namespace without
