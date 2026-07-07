@@ -135,6 +135,27 @@ type Store struct {
 	tail    atomic.Uint64 // next free arena offset; starts at 8 so a real addr is never 0
 	count   atomic.Int64
 
+	// The reclaimable segmented arena (arena.go), milestone M0 of the collection
+	// cold-record tiering plan (spec 2064/21). It is inert unless the store is built with
+	// NewSegmented, which sets segmented true; New leaves it false and every allocation
+	// runs the grow-only bump path above. When segmented, records are bump-allocated from
+	// the current segment (curSeg) of segs, each a segSize slice of the one arena starting
+	// at segStart, and overflow buckets come from the never-reclaimed region [ovBase,
+	// ovEnd) with cursor ovTail. segMu guards the rare current-segment advance, the free
+	// list, and highWater (the count of segments ever brought into use), never the
+	// per-record allocation add.
+	segmented bool
+	segSize   uint64
+	segStart  uint64
+	segs      []segment
+	freeSegs  []uint64
+	highWater uint64
+	curSeg    atomic.Uint64
+	ovBase    uint64
+	ovEnd     uint64
+	ovTail    atomic.Uint64
+	segMu     sync.Mutex
+
 	// topCount tracks the live top-level keys, the subset of records whose kind topKind
 	// admits: a plain string record and a collection header row, not element rows, expire
 	// sidecars, or stream PEL rows. It is maintained at exactly the points count is, so it
@@ -302,6 +323,9 @@ func (s *Store) BucketCount() int { return len(s.buckets) }
 // larger-than-memory regime keeps near index-plus-keys. tail starts at 8 (offset 0 is
 // reserved so an empty index slot is unambiguous), so used excludes that reserved byte.
 func (s *Store) ArenaBytes() (used, total uint64) {
+	if s.segmented {
+		return s.segmentUsed(), s.cap
+	}
 	t := s.tail.Load()
 	if t < 8 {
 		t = 8
@@ -450,7 +474,7 @@ func (s *Store) nextBucket(b *bucket, create bool) *bucket {
 	if !create {
 		return nil
 	}
-	off, ok := s.alloc(bucketSize)
+	off, ok := s.allocBkt()
 	if !ok {
 		return nil
 	}
@@ -600,7 +624,7 @@ func (s *Store) initRecord(off uint64, key, val []byte, kind, flags byte) {
 // lost CAS just restarts the scan. The one allocated record is reused across
 // restarts, and is harmlessly abandoned only when another writer published the key.
 func (s *Store) publish(key, val []byte, h uint64, kind, flags byte) error {
-	off, ok := s.alloc(recSize(len(key), len(val)))
+	off, ok := s.allocRec(recSize(len(key), len(val)))
 	if !ok {
 		return ErrFull
 	}
