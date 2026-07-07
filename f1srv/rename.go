@@ -127,7 +127,7 @@ func (c *connState) moveRows(src, dst []byte) {
 		// carry over unchanged and moveHeader copies the P exponent byte, leaving dst physically laid
 		// out at srcP. partitionsFor reads the registry, not the header, so dst must be engaged at
 		// srcP for that layout to route, and src must be dropped from the registry with its rows.
-		srcP := c.srv.partitionP(src)
+		srcP := c.partitionsFor(src)
 		c.moveSetFamily(src, dst, srcP, c.setVectorFeeder(dst, srcP))
 		c.moveHeader(src, dst, kindSetMeta)
 		// Drop the source's dense member vector (spec 2064/18 5.3): moveSetFamily republishes every
@@ -234,12 +234,10 @@ func (c *connState) moveSetFamily(src, dst []byte, srcP int, feed func(newKey, s
 		if _, err := c.srv.store.PutKind(nkbuf, nil, kindSetMember); err != nil {
 			continue
 		}
-		c.srv.store.CollInsert(nkbuf, kindSetMember)
 		if feed != nil {
 			feed(nkbuf, k[hdrLen:])
 		}
 		c.srv.store.DeleteKind(k, kindSetMember)
-		c.srv.store.CollRemove(k)
 	}
 }
 
