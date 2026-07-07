@@ -170,7 +170,16 @@ func (s *Store) allocRecord(nbytes uint64) (uint64, bool) {
 			seg.live.Add(int64(n))
 			return end - n, true
 		}
-		if !s.advanceSeg(si) {
+		if s.advanceSeg(si) {
+			continue
+		}
+		// No segment has room and none can be brought in. If the migrator is engaged it frees
+		// segments by draining full ones cold, so wait on it before reporting the arena full
+		// (D12 write-path backpressure). waitForSegment signals the migrator and polls for a
+		// freed segment up to a bounded budget; on success the loop retries the allocation, and
+		// only a genuine out-of-space returns false. A store with no migrator returns at once,
+		// so the non-segmented and no-migrator paths keep reporting ErrFull unchanged.
+		if !s.waitForSegment() {
 			return 0, false
 		}
 	}
