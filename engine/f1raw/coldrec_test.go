@@ -362,3 +362,144 @@ func TestColdCollScanReresolvesMigratedLongKey(t *testing.T) {
 		t.Fatal("no enumerated long-key field re-resolved to a cold address; the migration or re-resolution did not engage")
 	}
 }
+
+// fillSegHashFields is fillSegBig for the value-carrying hash-field kind: it writes churnVal
+// element records under collection prefix coll until the current segment advances, maintaining the
+// ordered index alongside each record so the drained hash still enumerates. It returns the segment
+// the fields landed in and a map of composite key to value for exactly the fields that stayed in
+// that segment, dropping the one field that spilled into the next segment so the returned set is
+// precisely startSeg's live fields.
+func fillSegHashFields(t *testing.T, s *Store, coll string) (startSeg uint64, want map[string][]byte) {
+	t.Helper()
+	want = make(map[string][]byte)
+	startSeg = s.curSeg.Load()
+	var kb [64]byte
+	for i := 0; s.curSeg.Load() == startSeg; i++ {
+		k := append([]byte(nil), collElemKey(kb[:], coll, uint64(i))...)
+		v := churnVal(coll, i)
+		if _, err := s.PutKind(k, v, benchKindHashField); err != nil {
+			t.Fatalf("PutKind %q: %v", k, err)
+		}
+		if s.curSeg.Load() != startSeg {
+			s.DeleteKind(k, benchKindHashField) // spilled into the next segment; keep the set exactly startSeg's
+			break
+		}
+		s.CollInsert(k, benchKindHashField)
+		want[string(k)] = v
+	}
+	if len(want) == 0 {
+		t.Fatal("filled no hash fields before the segment advanced")
+	}
+	return startSeg, want
+}
+
+// TestMigratorDrainsAdmittedHashKind is the D22 Option B gate for the real background migrator (not
+// the MigrateToCold test hook): once the server admits the hash-field kind through
+// SetMigratableKindFunc, drainSegment must sink every live hash element in a full segment to the
+// cold region, and every hash read path must resolve those elements across the tier boundary. The
+// hash field's only secondary structure is the ordered index, whose nodes re-resolve their address
+// through the tier-aware primary index on each access, so the migrator needs no per-node hook: the
+// point read (GetKind), the value-carrying enumeration (CollScanKV + ReadValueAt), and the
+// random-select-by-rank path (CollSelectAt) all follow the record cold on their own. Draining the
+// whole segment to live == 0 with every field readable is the proof the policy widened the
+// migrator's safe set past the string floor without breaking a single hash path.
+func TestMigratorDrainsAdmittedHashKind(t *testing.T) {
+	s := churnSegColdStore(t, 5)
+	// Server policy: the hash-field kind is tier-safe (its ordered index re-resolves through the
+	// primary index), so admit it; every other kind stays out and drains only if it is a string.
+	s.SetMigratableKindFunc(func(kind byte) bool { return kind == benchKindHashField })
+
+	const coll = "h:"
+	seg0, want := fillSegHashFields(t, s, coll)
+	// Advance past seg0 so it is a full, non-current segment, the only kind drainSegment drains.
+	fillSegHashFields(t, s, "g:")
+	if seg0 == s.curSeg.Load() {
+		t.Fatal("seg0 is still the current segment; the fill did not advance off it")
+	}
+
+	s.drainSegment(seg0)
+
+	// The segment emptied and retired: every live hash field left it for the cold region.
+	if got := s.segs[seg0].live.Load(); got != 0 {
+		t.Fatalf("seg %d live = %d after drain, want 0 (every admitted field should have migrated)", seg0, got)
+	}
+
+	// Point path: GetKind reads each field across the tier, and every field is genuinely cold now,
+	// proving the migrator moved it rather than leaving it resident.
+	for k, v := range want {
+		if !s.entryIsCold(t, []byte(k), benchKindHashField) {
+			t.Fatalf("field %q did not migrate cold; the admitted kind was not drained", k)
+		}
+		got, ok := s.GetKind([]byte(k), nil, benchKindHashField)
+		if !ok || !bytes.Equal(got, v) {
+			t.Fatalf("GetKind %q = %q,%v after drain; want %q,true", k, got, ok, v)
+		}
+	}
+
+	// Enumeration path: CollScanKV re-resolves each node through the tier-aware index and hands back
+	// the current (cold) offset, which ReadValueAt reads from the cold frame. Every field must come
+	// back exactly once with its exact value; a stale resident offset would read foreign bytes.
+	keys, offs, _ := s.CollScanKV([]byte(coll), nil, len(want)+8, nil, nil)
+	if len(keys) != len(want) {
+		t.Fatalf("CollScanKV returned %d fields, want %d", len(keys), len(want))
+	}
+	seen := make(map[string]bool, len(want))
+	for i, k := range keys {
+		v, ok := want[string(k)]
+		if !ok {
+			t.Fatalf("CollScanKV returned unexpected key %q (a stale resident offset)", k)
+		}
+		if seen[string(k)] {
+			t.Fatalf("CollScanKV returned key %q twice", k)
+		}
+		seen[string(k)] = true
+		if off := offs[i]; off&tierBit == 0 {
+			t.Fatalf("CollScanKV re-resolved field %q to a resident offset, want cold after the drain", k)
+		}
+		if got := s.ReadValueAt(offs[i], nil); !bytes.Equal(got, v) {
+			t.Fatalf("CollScanKV value for %q read back wrong across the tier", k)
+		}
+	}
+
+	// Random-select path: CollSelectAt returns a member key by local rank arena-free, and GetKind
+	// reads its value from the cold tier. Every local index in range must name a known field.
+	for i := 0; i < len(want); i++ {
+		k, ok := s.CollSelectAt([]byte(coll), i)
+		if !ok {
+			t.Fatalf("CollSelectAt(%d) not found, want a field", i)
+		}
+		v, ok := want[string(k)]
+		if !ok {
+			t.Fatalf("CollSelectAt(%d) returned unknown key %q", i, k)
+		}
+		got, ok := s.GetKind(k, nil, benchKindHashField)
+		if !ok || !bytes.Equal(got, v) {
+			t.Fatalf("CollSelectAt(%d) value for %q read back wrong across the tier", i, k)
+		}
+	}
+}
+
+// TestMigratorLeavesUnadmittedHashKindResident is the negative half of the policy gate: with no
+// migratable policy registered the migrator is string-only, exactly the pre-policy behavior, so a
+// hash field record must stay resident even when its segment is drained. This guards against a
+// future default that silently sinks a kind whose secondary structures are not yet tier-safe (the
+// set member vector is the live example): admitting a kind must be an explicit server opt-in, never
+// the engine's own default.
+func TestMigratorLeavesUnadmittedHashKindResident(t *testing.T) {
+	s := churnSegColdStore(t, 5)
+	// No SetMigratableKindFunc call: the default nil policy leaves the migrator string-only.
+	const coll = "h:"
+	seg0, want := fillSegHashFields(t, s, coll)
+	fillSegHashFields(t, s, "g:")
+	if seg0 == s.curSeg.Load() {
+		t.Fatal("seg0 is still the current segment; the fill did not advance off it")
+	}
+
+	s.drainSegment(seg0)
+
+	for k := range want {
+		if s.entryIsCold(t, []byte(k), benchKindHashField) {
+			t.Fatalf("field %q migrated cold with no migratable policy set; want resident", k)
+		}
+	}
+}

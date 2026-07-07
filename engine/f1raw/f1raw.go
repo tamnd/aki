@@ -180,6 +180,19 @@ type Store struct {
 	topKind  func(kind byte) bool
 	topCount atomic.Int64
 
+	// migratableKind is the server-supplied policy that widens the set of record kinds the
+	// background migrator may sink to the cold region past the string floor (migrate.go). The
+	// engine is type-agnostic: it knows a kind byte but not that a given kind is a hash field
+	// row whose secondary structure (the ordered index) is tier-safe or a set member row whose
+	// member vector is not yet, so which collection kinds are safe to migrate is the server's
+	// call, set once before serving through SetMigratableKindFunc. A string record is always
+	// migratable regardless of this hook (it carries no secondary structure and a fully
+	// tier-aware path), so a nil hook leaves the migrator string-only, exactly as before any
+	// server opts a collection kind in. The correctness burden the hook carries is that a kind
+	// it admits must have every read, write, and delete path follow a record across the tier
+	// boundary; the engine trusts the policy the same way it trusts topKind.
+	migratableKind func(kind byte) bool
+
 	// oidx is the ordered element index (oindex.go): the in-memory per-collection
 	// sorted run that lets a bounded cursor enumerate one collection's elements in key
 	// order. It is maintained explicitly by the collection element path (CollInsert /
@@ -342,6 +355,15 @@ func (s *Store) Len() int { return int(s.count.Load()) }
 // classifier is read on every publish and delete without synchronization, so it must be set
 // before the first write. It also seeds nothing retroactively, so set it on an empty store.
 func (s *Store) SetTopKindFunc(f func(kind byte) bool) { s.topKind = f }
+
+// SetMigratableKindFunc installs the policy that widens the background migrator's safe set past the
+// string floor to the collection kinds whose secondary structures follow a record across the tier
+// boundary (migrate.go). Like SetTopKindFunc it is server policy, since the engine knows a kind
+// byte but not the data model behind it, and like SetTopKindFunc it is read without synchronization
+// on the migrator goroutine, so set it once at startup before serving. A nil hook (the default)
+// leaves the migrator string-only. A string record is migratable regardless of this hook, so a hook
+// need only name the collection kinds it opts in, not repeat stringKind.
+func (s *Store) SetMigratableKindFunc(f func(kind byte) bool) { s.migratableKind = f }
 
 // TopLen reports the number of live top-level keys, an O(1) read of the counter maintained
 // alongside the record count. It is what DBSIZE returns. A key whose TTL has passed but which
