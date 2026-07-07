@@ -488,7 +488,6 @@ func (c *connState) cmdSAddPart(skey []byte, members [][]byte, p int) {
 			return
 		}
 		if isNew {
-			c.srv.store.CollInsert(mk, kindSetMember)
 			base[last] = byte(part)
 			c.srv.store.CollPartRandInsert(base, p, part, mk, kindSetMember)
 			added++
@@ -524,7 +523,6 @@ func (c *connState) cmdSRemPart(skey []byte, members [][]byte, p int) {
 		base[last] = byte(part)
 		c.srv.store.CollRandRemove(base, mk, kindSetMember)
 		if c.srv.store.DeleteKind(mk, kindSetMember) {
-			c.srv.store.CollRemove(mk)
 			removed++
 		}
 		mu.Unlock()
@@ -606,10 +604,10 @@ func (c *connState) cmdSAdd(argv [][]byte) {
 			return
 		}
 		if isNew {
-			c.srv.store.CollInsert(mk, kindSetMember)
-			// Keep the dense member vector in step with the ordered index: append the new member's
-			// offset if a vector exists, a no-op otherwise (the lazy contract, spec 2064/18 section
-			// 5.1). Only on a genuine insert, so a re-add of an existing member appends nothing.
+			// Append the new member's offset to the dense vector, the authoritative membership
+			// structure for the set type (spec 2064/f1_rewrite_ltm/20): CollRandInsert builds the
+			// vector on first insert and appends thereafter, so the set type no longer touches the
+			// ordered index. Only on a genuine insert, so a re-add of an existing member appends nothing.
 			c.srv.store.CollRandInsert(prefix, mk, kindSetMember)
 			added++
 			count++
@@ -670,13 +668,11 @@ func (c *connState) cmdSRem(argv [][]byte) {
 		return
 	}
 	removed := 0
-	// Accumulate the removed member composite keys packed end to end so the ordered-index
-	// splice is deferred off this stripe-locked reply path in one batch (spec 2064/16 slice 2)
-	// instead of one synchronous O(log n) splice per member here. memberKey reuses its scratch
-	// on the next call, so each removed key is copied into the packed buffer before the next.
+	// The dense member vector is the authoritative membership structure for the set type (spec
+	// 2064/f1_rewrite_ltm/20), so the remove swap-removes each member from the vector and never
+	// touches the ordered index. CollRandRemove consumes memberKey's scratch synchronously, so no
+	// packed copy of the removed keys is needed.
 	prefix := c.setPrefix(skey)
-	buf := c.delKeyBuf[:0]
-	ends := c.delKeyEnd[:0]
 	for _, member := range argv[2:] {
 		mk := c.memberKey(skey, member)
 		// Swap-remove the member from the dense vector before the hash record is deleted, so its
@@ -684,14 +680,9 @@ func (c *connState) cmdSRem(argv [][]byte) {
 		// the member was not a vector slot, so a miss costs one shard-mutex acquire and nothing more.
 		c.srv.store.CollRandRemove(prefix, mk, kindSetMember)
 		if c.srv.store.DeleteKind(mk, kindSetMember) {
-			buf = append(buf, mk...)
-			ends = append(ends, len(buf))
 			removed++
 		}
 	}
-	c.delKeyBuf = buf
-	c.delKeyEnd = ends
-	c.srv.store.CollRemovePacked(buf, ends, kindSetMember)
 	if removed > 0 {
 		// Decrement the maintained cardinality with one in-place atomic instead of a
 		// GetKind + PutKind read-modify-write of the whole header value. The stripe lock
@@ -1349,16 +1340,10 @@ func (c *connState) cmdSPop(argv [][]byte) {
 			return
 		}
 		member := k[len(prefix):]
-		// The vector already dropped the victim's slot; delete its hash record, then defer the
-		// ordered-index splice off this reply path in one batched tombstone, the same handoff SREM
-		// makes (spec 2064/16 slice 2). k is a stable arena subslice, so packing it and returning
-		// its member tail after the delete is safe.
+		// The vector already dropped the victim's slot, so the pop only has to delete the hash record;
+		// the set type no longer maintains the ordered index (spec 2064/f1_rewrite_ltm/20). k is a
+		// stable arena subslice, so returning its member tail after the delete is safe.
 		c.srv.store.DeleteKind(k, kindSetMember)
-		buf := append(c.delKeyBuf[:0], k...)
-		c.delKeyBuf = buf
-		ends := append(c.delKeyEnd[:0], len(buf))
-		c.delKeyEnd = ends
-		c.srv.store.CollRemovePacked(buf, ends, kindSetMember)
 		// Decrement the maintained cardinality in place; at zero the set is gone and its header row
 		// is dropped under the same lock (empty set is no set), exactly as SREM retires to zero.
 		if n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, -1); !ok || n <= 0 {
@@ -1369,10 +1354,10 @@ func (c *connState) cmdSPop(argv [][]byte) {
 		return
 	}
 
-	// Count form: reconcile any deferred splices so the rank-based sample sees exact ordered-index
-	// widths (a not-yet-spliced dead node would skew the uniform pick, spec 2064/16 slice 2), then
-	// read the header once under the lock for both the sample bound and the shrink write.
-	c.srv.store.SyncPendingRemovals()
+	// Count form: read the header once under the lock for both the sample bound and the shrink write.
+	// The sampler draws from the dense member vector, the authoritative membership structure for the
+	// set type (spec 2064/f1_rewrite_ltm/20), and card comes from the header the writers maintain
+	// eagerly, so the pick needs no ordered-index reconcile.
 	card64, enc, _ := c.setHeader(skey)
 	card := int(card64)
 	if count == 0 || card == 0 {
@@ -1392,9 +1377,7 @@ func (c *connState) cmdSPop(argv [][]byte) {
 		mk := c.memberKey(skey, m)
 		// Drop the popped member from the dense vector before its record goes (spec 2064/18 5.2).
 		c.srv.store.CollRandRemove(prefix, mk, kindSetMember)
-		if c.srv.store.DeleteKind(mk, kindSetMember) {
-			c.srv.store.CollRemove(mk)
-		}
+		c.srv.store.DeleteKind(mk, kindSetMember)
 	}
 	if err := c.setPutHeader(skey, uint64(card-len(members)), enc); err != nil {
 		mu.Unlock()
@@ -1533,19 +1516,11 @@ func (c *connState) cmdSPopPart(skey []byte, count int64, hasCount bool, p int) 
 				continue
 			}
 			member := k[len(base):]
-			// Delete the hash-index row, then defer the ordered-index splice to the folder in one
-			// batched tombstone (spec 2064/16 slice 2) rather than splicing inline under the store's
-			// single global index lock. An inline splice re-serialized every partition's pops on that
-			// one lock, undoing the stripe split the partitioning bought; the whole-key SPOP path
-			// (cmdSPop) already defers for exactly this reason. k is a stable arena subslice, so packing
-			// it and returning its member tail after the delete stays valid.
-			if c.srv.store.DeleteKind(k, kindSetMember) {
-				buf := append(c.delKeyBuf[:0], k...)
-				c.delKeyBuf = buf
-				ends := append(c.delKeyEnd[:0], len(buf))
-				c.delKeyEnd = ends
-				c.srv.store.CollRemovePacked(buf, ends, kindSetMember)
-			}
+			// CollPartPopLocked already dropped the victim's vector slot, the authoritative membership
+			// structure for the set type (spec 2064/f1_rewrite_ltm/20), so the pop only has to delete the
+			// hash-index row; it no longer touches the ordered index. k is a stable arena subslice, so
+			// returning its member tail after the delete stays valid.
+			c.srv.store.DeleteKind(k, kindSetMember)
 			mu.Unlock()
 			c.setBumpCard(skey, -1, p)
 			c.writeBulk(member)
@@ -1587,16 +1562,10 @@ func (c *connState) cmdSPopPart(skey []byte, count int64, hasCount bool, p int) 
 			mu.Unlock()
 			continue
 		}
-		// Defer the ordered-index splice to the folder, same as the no-count form above, so a
-		// multi-member pop does not take the global index lock once per popped member on the reply
-		// path. delKeyBuf is copied into the tombstone, so reusing it next iteration is safe.
-		if c.srv.store.DeleteKind(k, kindSetMember) {
-			buf := append(c.delKeyBuf[:0], k...)
-			c.delKeyBuf = buf
-			ends := append(c.delKeyEnd[:0], len(buf))
-			c.delKeyEnd = ends
-			c.srv.store.CollRemovePacked(buf, ends, kindSetMember)
-		}
+		// CollPartPopLocked already dropped the victim's vector slot (the authoritative membership
+		// structure for the set type, spec 2064/f1_rewrite_ltm/20), so the pop only deletes the
+		// hash-index row and no longer touches the ordered index.
+		c.srv.store.DeleteKind(k, kindSetMember)
 		mu.Unlock()
 		out = append(out, k[len(base):])
 	}
@@ -1702,9 +1671,7 @@ func (c *connState) cmdSMove(argv [][]byte) {
 	// member from the source's dense vector first, while its record is still resolvable (spec
 	// 2064/18 section 5.2).
 	c.srv.store.CollRandRemove(c.setPrefix(source), srcMK, kindSetMember)
-	if c.srv.store.DeleteKind(srcMK, kindSetMember) {
-		c.srv.store.CollRemove(srcMK)
-	}
+	c.srv.store.DeleteKind(srcMK, kindSetMember)
 	if sc := c.setCard(source); sc > 0 {
 		if err := c.setSetCard(source, sc-1); err != nil {
 			unlock()
@@ -1723,8 +1690,9 @@ func (c *connState) cmdSMove(argv [][]byte) {
 		return
 	}
 	if isNew {
-		c.srv.store.CollInsert(dstMK, kindSetMember)
-		// Append the moved member to the destination's dense vector if it exists (spec 2064/18 5.1).
+		// Append the moved member to the destination's dense vector, the authoritative membership
+		// structure for the set type (spec 2064/f1_rewrite_ltm/20); the set type no longer indexes
+		// members in the ordered index.
 		c.srv.store.CollRandInsert(c.setPrefix(destination), dstMK, kindSetMember)
 		// A genuine insert can raise the destination's encoding (a non-integer member arriving
 		// at an intset, or a growth past a threshold), so fold it forward like SADD does.
@@ -1807,9 +1775,7 @@ func (c *connState) smovePart(source, destination, member []byte, pSrc, pDst int
 	} else {
 		c.srv.store.CollRandRemove(c.setPrefix(source), srcMK, kindSetMember)
 	}
-	if c.srv.store.DeleteKind(srcMK, kindSetMember) {
-		c.srv.store.CollRemove(srcMK)
-	}
+	c.srv.store.DeleteKind(srcMK, kindSetMember)
 
 	// Add to the destination partition only if absent, so a member already there is not duplicated.
 	// partMemberKey reuses kbuf, overwriting srcMK, which is already consumed; the vector base reuses
@@ -1822,7 +1788,6 @@ func (c *connState) smovePart(source, destination, member []byte, pSrc, pDst int
 		return
 	}
 	if isNew {
-		c.srv.store.CollInsert(dstMK, kindSetMember)
 		if pDst > 1 {
 			base := c.partScanBase(destination)
 			c.srv.store.CollPartRandInsert(base, pDst, dstPart, dstMK, kindSetMember)

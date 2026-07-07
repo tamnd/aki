@@ -84,20 +84,31 @@ func (c *connState) zsetSourceCard(key []byte, kind keyKind) uint64 {
 	return c.setCard(key)
 }
 
-// zsetSourceEach iterates every (member, score) of a source that is a sorted set or a plain set, in
-// member-byte order, calling emit for each until emit returns false. A set member carries score 1.
-// Members are arena-stable subslices. It scans the element index in bounded batches, so a source is
-// streamed, never decoded whole. The prefix and buffers are local, so this can run as the driver of
-// an aggregation while point probes into other sources use the shared scratch buffers.
+// zsetSourceEach iterates every (member, score) of a source that is a sorted set or a plain set,
+// calling emit for each until emit returns false. A set member carries score 1. Members are
+// arena-stable subslices. A source is streamed in bounded batches, never decoded whole. The prefix
+// and buffers are local, so this can run as the driver of an aggregation while point probes into
+// other sources use the shared scratch buffers.
+//
+// A set source enumerates its dense member vector (setVecEach), the authoritative membership
+// structure for the set type: the set type no longer indexes members in the ordered index (spec
+// 2064/f1_rewrite_ltm/20), so a CollScan over the set prefix would find nothing. The vector is
+// unordered, so set members arrive in no particular order; ZUNION/ZINTER/ZDIFF aggregate into a
+// map and sort by score before replying, so enumeration order does not matter. A zset source still
+// scans the ordered element index, where its scored members live.
 func (c *connState) zsetSourceEach(key []byte, kind keyKind, emit func(member []byte, score float64) bool) {
+	if kind != keyZset {
+		c.setVecEach(key, func(m []byte) bool {
+			return emit(m, 1.0)
+		})
+		return
+	}
 	var prefix []byte
 	var tmp [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(tmp[:], uint64(len(key)))
 	prefix = append(prefix, tmp[:n]...)
 	prefix = append(prefix, key...)
-	if kind == keyZset {
-		prefix = append(prefix, zsetMemberTag)
-	}
+	prefix = append(prefix, zsetMemberTag)
 	plen := len(prefix)
 	var after []byte
 	batch := make([][]byte, 0, hashScanBatch)
@@ -109,13 +120,11 @@ func (c *connState) zsetSourceEach(key []byte, kind keyKind, emit func(member []
 			return
 		}
 		for _, k := range keys {
+			v, ok := c.srv.store.GetKind(k, vbuf[:0], kindZsetMember)
+			vbuf = v
 			score := 1.0
-			if kind == keyZset {
-				v, ok := c.srv.store.GetKind(k, vbuf[:0], kindZsetMember)
-				vbuf = v
-				if ok {
-					score = math.Float64frombits(binary.LittleEndian.Uint64(v))
-				}
+			if ok {
+				score = math.Float64frombits(binary.LittleEndian.Uint64(v))
 			}
 			if !emit(k[plen:], score) {
 				return

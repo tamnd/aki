@@ -247,6 +247,154 @@ func TestSetMembersPartitionConcurrentWriters(t *testing.T) {
 	}
 }
 
+// TestSetScanCompletenessUnderConcurrentSrem pins the guarantee that lets SSCAN enumerate off the
+// dense member vector once the set type is off the ordered index (spec 2064/f1_rewrite_ltm/20): an
+// SSCAN full cycle driven lock-free while writers churn the set with SADD and SREM must still return
+// every member that is present for the whole scan at least once. A stable member is only lost if a
+// concurrent swap-remove moves an unvisited member into an already-visited slot; SetVecScanDown walks
+// the vector high index to low precisely so that can never happen (a remove moves the tail, always at
+// or above the cursor, into the hole), so the never-removed members are the floor the SCAN contract
+// promises. The churn set is disjoint from the stable set and is repeatedly removed and re-added, so
+// the vector shrinks and grows under the reader and swap-remove fires against live rows the whole time.
+// Runs at P=1 (the whole-set vector) and P=8 (per-partition vectors), the two vector layouts.
+func TestSetScanCompletenessUnderConcurrentSrem(t *testing.T) {
+	for _, p := range []int{1, 8} {
+		srv := newPartServer(t, p)
+
+		// Seed the stable members that must every one be seen, plus an initial churn population so the
+		// first scan already walks a mixed vector.
+		seed := bareConn(srv)
+		stable := make([]string, 400)
+		seedArgs := []string{"SADD", "hot"}
+		for i := range stable {
+			stable[i] = fmt.Sprintf("keep:%04d", i)
+			seedArgs = append(seedArgs, stable[i])
+		}
+		call(seed, func(c *connState, a [][]byte) { c.cmdSAdd(a) }, seedArgs...)
+
+		done := make(chan struct{})
+		const writers = 6
+		errCh := make(chan error, writers)
+		for w := 0; w < writers; w++ {
+			go func(base int) {
+				c := bareConn(srv)
+				i := 0
+				for {
+					select {
+					case <-done:
+						errCh <- nil
+						return
+					default:
+					}
+					// A rolling window of churn members unique to this writer: the SADD grows the vector,
+					// the SREM swap-removes a live row, so the reader always races both against live rows.
+					m := fmt.Sprintf("churn:%02d:%08d", base, i%2000)
+					call(c, func(c *connState, a [][]byte) { c.cmdSAdd(a) }, "SADD", "hot", m)
+					call(c, func(c *connState, a [][]byte) { c.cmdSRem(a) }, "SREM", "hot", m)
+					i++
+				}
+			}(w)
+		}
+
+		// Drive a full SSCAN cycle with a small COUNT to force many lock-free resume hops while the churn
+		// runs. Every stable member must appear at least once across the cycle.
+		reader := bareConn(srv)
+		seen := map[string]bool{}
+		cursor := "0"
+		hops := 0
+		for {
+			cur, members := parseSscan(t, call(reader, func(c *connState, a [][]byte) { c.cmdSScan(a) },
+				"SSCAN", "hot", cursor, "COUNT", "11"))
+			for _, m := range members {
+				if strings.HasPrefix(m, "keep:") {
+					seen[m] = true
+				}
+			}
+			cursor = cur
+			hops++
+			if cursor == "0" {
+				break
+			}
+			if hops > 100000 {
+				close(done)
+				t.Fatalf("P=%d SSCAN did not terminate", p)
+			}
+		}
+		close(done)
+		for i := 0; i < writers; i++ {
+			if err := <-errCh; err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if len(seen) != len(stable) {
+			var missing []string
+			for _, m := range stable {
+				if !seen[m] {
+					missing = append(missing, m)
+				}
+			}
+			sort.Strings(missing)
+			show := missing
+			if len(show) > 10 {
+				show = show[:10]
+			}
+			t.Fatalf("P=%d SSCAN saw %d of %d stable members under concurrent SREM, missing %d (first: %v)",
+				p, len(seen), len(stable), len(missing), show)
+		}
+		srv.Close()
+	}
+}
+
+// TestSetDropClearsMembersFromVector locks the regression that dropping a set must delete its member
+// rows by walking the dense member vector, not the ordered index. Since the set type no longer indexes
+// its members there (spec 2064/f1_rewrite_ltm/20), a CollScan-driven drop finds nothing and leaks every
+// row, and a later SISMEMBER (a point ExistsKind on the row) reads the leaked set as still present. It
+// seeds a set, DELs it, and asserts SISMEMBER, SCARD, and SMEMBERS all report empty, then re-adds to
+// confirm the name is reusable. Runs at P=1 (whole-set vector) and P=4 (per-partition vectors), the two
+// layouts dropSetMembersLocked branches on.
+func TestSetDropClearsMembersFromVector(t *testing.T) {
+	for _, p := range []int{1, 4} {
+		srv := newPartServer(t, p)
+		c := bareConn(srv)
+
+		members := make([]string, 50)
+		addArgs := []string{"SADD", "hot"}
+		for i := range members {
+			members[i] = fmt.Sprintf("m:%04d", i)
+			addArgs = append(addArgs, members[i])
+		}
+		call(c, func(c *connState, a [][]byte) { c.cmdSAdd(a) }, addArgs...)
+		if got := call(c, func(c *connState, a [][]byte) { c.cmdSCard(a) }, "SCARD", "hot"); got != ":50\r\n" {
+			t.Fatalf("P=%d SCARD after seed = %q, want :50", p, got)
+		}
+
+		call(c, func(c *connState, a [][]byte) { c.cmdDel(a) }, "DEL", "hot")
+
+		if got := call(c, func(c *connState, a [][]byte) { c.cmdSCard(a) }, "SCARD", "hot"); got != ":0\r\n" {
+			t.Fatalf("P=%d SCARD after DEL = %q, want :0", p, got)
+		}
+		if got := call(c, func(c *connState, a [][]byte) { c.cmdSMembers(a) }, "SMEMBERS", "hot"); got != "*0\r\n" {
+			t.Fatalf("P=%d SMEMBERS after DEL = %q, want empty array", p, got)
+		}
+		for _, m := range members {
+			if got := call(c, func(c *connState, a [][]byte) { c.cmdSIsMember(a) }, "SISMEMBER", "hot", m); got != ":0\r\n" {
+				t.Fatalf("P=%d SISMEMBER %q after DEL = %q, want :0 (leaked member row)", p, m, got)
+			}
+		}
+
+		// The name is reusable: a fresh SADD builds a new set with only the re-added member.
+		call(c, func(c *connState, a [][]byte) { c.cmdSAdd(a) }, "SADD", "hot", "again")
+		if got := call(c, func(c *connState, a [][]byte) { c.cmdSCard(a) }, "SCARD", "hot"); got != ":1\r\n" {
+			t.Fatalf("P=%d SCARD after re-add = %q, want :1", p, got)
+		}
+		if got := call(c, func(c *connState, a [][]byte) { c.cmdSIsMember(a) }, "SISMEMBER", "hot", members[0]); got != ":0\r\n" {
+			t.Fatalf("P=%d SISMEMBER old member after re-add = %q, want :0", p, got)
+		}
+		srv.Close()
+	}
+}
+
 // TestSetEnumPartitionWrongType confirms the routed SMEMBERS and SSCAN still reject a string key with
 // WRONGTYPE, the same guard the unpartitioned path applies, so partitioning never opens a type hole.
 func TestSetEnumPartitionWrongType(t *testing.T) {
