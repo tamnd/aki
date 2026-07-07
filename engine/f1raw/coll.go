@@ -356,12 +356,15 @@ func (s *Store) CountAddInt64(key []byte, kind byte, delta int64) (int64, bool) 
 		return 0, false
 	}
 	verp := s.verAt(off)
+	spins := 0
 	for {
 		v := verp.Load()
 		if v&verLockBit != 0 {
+			spins = spinWait(spins)
 			continue
 		}
 		if !verp.CompareAndSwap(v, v+1) { // acquire: make it odd
+			spins = spinWait(spins)
 			continue
 		}
 		cnt := s.countAt(off)
@@ -384,9 +387,11 @@ func (s *Store) CountInt64(key []byte, kind byte) (int64, bool) {
 		return 0, false
 	}
 	verp := s.verAt(off)
+	spins := 0
 	for {
 		v1 := verp.Load()
 		if v1&verLockBit != 0 {
+			spins = spinWait(spins)
 			continue
 		}
 		if uint64(s.vlenAt(off).Load()) < 8 {
@@ -396,6 +401,7 @@ func (s *Store) CountInt64(key []byte, kind byte) (int64, bool) {
 		if verp.Load() == v1 {
 			return x, true
 		}
+		spins = spinWait(spins)
 	}
 }
 
