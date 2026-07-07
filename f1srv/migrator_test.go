@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -128,6 +129,62 @@ func TestServerMigratorServesHashBeyondArena(t *testing.T) {
 		f := fmt.Sprintf("f%08d", i)
 		if got[f] != migVal(i, val) {
 			t.Fatalf("HGETALL field %s = %q, want %q", f, got[f], migVal(i, val))
+		}
+	}
+}
+
+// TestServerMigratorServesZsetBeyondArena is the D22 Option B gate for the zset at the server level:
+// with both zset element kinds admitted to the migrator (isMigratableKind), a sorted set whose
+// element rows outgrow the resident arena is served correctly over the wire, most rows now cold. It
+// fills one zset with far more large members than the small arena can hold, so the migrator sinks
+// full segments of member and score rows into the cold record region as they fill while the zset
+// header row stays resident, and every ZADD must still succeed (D12 backpressure waits on the
+// migrator rather than erroring). Then ZSCORE reads each member's score back across the tier through
+// the primary index, and a single ZRANGE WITHSCORES re-resolves every element through the tier-aware
+// ordered index and reads its member from whichever tier holds it. Without the admission the element
+// rows cannot migrate, the arena fills, and ZADD errors partway through the load.
+func TestServerMigratorServesZsetBeyondArena(t *testing.T) {
+	rw, cleanup := dialMigratorServer(t)
+	defer cleanup()
+
+	// One zset, many large members: each member string carries the load, so both the member row and
+	// the score row are several arenas' worth of record bytes and cannot all stay resident, while the
+	// single header row pins at most one segment. Scores are the index i, and the member's %08d prefix
+	// makes lexical member order agree with score order, so a by-rank range returns them in i order.
+	// Pipeline the writes so the load is not one round trip per member.
+	const n = 20000
+	val := strings.Repeat("x", 200)
+	for i := 0; i < n; i++ {
+		cmd(t, rw, "ZADD", "z", strconv.Itoa(i), migVal(i, val))
+	}
+	for i := 0; i < n; i++ {
+		expect(t, rw, ":1") // each member is new, so ZADD reports one added
+	}
+
+	// Point path: ZSCORE reads each member's score back, most members now cold, all exact. An integer
+	// score comes back as its plain decimal bulk string (ZSCORE board bob -> $2 in the point-path test).
+	for i := 0; i < n; i++ {
+		cmd(t, rw, "ZSCORE", "z", migVal(i, val))
+	}
+	for i := 0; i < n; i++ {
+		want := "$" + strconv.Itoa(i)
+		if got := readReply(t, rw); got != want {
+			t.Fatalf("ZSCORE z member(%d) = %q, want %q", i, got, want)
+		}
+	}
+
+	// Enumeration path: one ZRANGE WITHSCORES returns every member with its exact score, re-resolving
+	// the migrated ones through the tier-aware ordered index. WITHSCORES interleaves member and score,
+	// which readArrayMap reads as a member->score map.
+	cmd(t, rw, "ZRANGE", "z", "0", "-1", "WITHSCORES")
+	got := readArrayMap(t, rw)
+	if len(got) != n {
+		t.Fatalf("ZRANGE WITHSCORES returned %d members, want %d", len(got), n)
+	}
+	for i := 0; i < n; i++ {
+		m := migVal(i, val)
+		if got[m] != strconv.Itoa(i) {
+			t.Fatalf("ZRANGE member(%d) score = %q, want %q", i, got[m], strconv.Itoa(i))
 		}
 	}
 }

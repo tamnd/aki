@@ -369,8 +369,8 @@ func New(cfg Config) *Server {
 		srv.store.SetTopKindFunc(isTopKind)
 		// Widen the background migrator past its string floor to the collection element kinds the
 		// server has proven tier-safe (spec 2064/21 D22 Option B), so those elements can sink cold
-		// under fill pressure while their header row stays resident. Only the hash field kind
-		// qualifies today; isMigratableKind documents why the other element kinds still wait. This
+		// under fill pressure while their header row stays resident. The hash field and both zset
+		// element kinds qualify today; isMigratableKind documents why the rest still wait. This
 		// is inert unless cfg.Migrator started the migrator below, and like SetTopKindFunc it is set
 		// once here on the still-empty store, before the server accepts traffic.
 		srv.store.SetMigratableKindFunc(isMigratableKind)
