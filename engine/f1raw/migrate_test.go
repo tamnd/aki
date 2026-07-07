@@ -2,6 +2,7 @@ package f1raw
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -190,12 +191,7 @@ func TestDrainSegmentNoUseAfterFree(t *testing.T) {
 	for iter := 0; iter < len(keysA)*40 && !reused; iter++ {
 		s.reclaimSegments()
 		k := []byte(fmt.Sprintf("c%07d", iter))
-		if err := s.Set(k, churnVal("c", iter)); err != nil {
-			s.reclaimSegments()
-			if err2 := s.Set(k, churnVal("c", iter)); err2 != nil {
-				break
-			}
-		}
+		setReusingFreedSeg(t, s, k, churnVal("c", iter))
 		s.Delete(k)
 		if s.curSeg.Load() == seg0 {
 			reused = true
@@ -216,4 +212,29 @@ func TestDrainSegmentNoUseAfterFree(t *testing.T) {
 			t.Fatalf("post-churn Get %q = %q,%v; want %q,true", k, v, ok, want[i])
 		}
 	}
+}
+
+// setReusingFreedSeg writes one filler record during the reuse-under-readers churn, treating a
+// momentary full arena as backpressure rather than a failure. The full error means the drained
+// segment is retired but not yet safe to reclaim, because an in-flight reader still holds its
+// epoch; yield so those readers advance and release it, reclaim, and retry. The reclaimed segment
+// then frees and the next allocation lands on it. An earlier form broke out of the churn on the
+// second full error, which flaked on slower boxes where the readers held their epoch across the
+// whole fill so the segment never freed inside the two attempts. It fails only if the arena stays
+// full across a long yield budget, which flags a genuine reclamation stall (the epoch gate never
+// releasing the segment) rather than scheduling timing.
+func setReusingFreedSeg(t *testing.T, s *Store, k, v []byte) {
+	t.Helper()
+	for attempt := 0; attempt < 200000; attempt++ {
+		err := s.Set(k, v)
+		if err == nil {
+			return
+		}
+		if err != ErrFull {
+			t.Fatalf("reuse Set %q: %v", k, err)
+		}
+		runtime.Gosched()
+		s.reclaimSegments()
+	}
+	t.Fatalf("arena stayed full reusing a freed segment for %q; reclamation stalled", k)
 }
