@@ -228,6 +228,53 @@ func (s *Store) allocBucket() (uint64, bool) {
 	return end - bucketSize, true
 }
 
+// recBytesAt returns the resident arena bytes the segment allocator charged to a segment's
+// live counter for the record at off: the header, the 8-aligned key, and the reserved value
+// capacity (vcap words times 8). That equals align8(recSize(klen, vlen)) at allocation, because
+// recSize is already 8-aligned and vcap is align8(vlen)/8, so charging this figure back when the
+// record leaves the index cancels the allocation charge exactly and live returns to zero once the
+// segment's last record is gone. It reads only immutable header fields, so it is safe on a record
+// the index no longer points at, whose bytes are still valid until its segment is freed as a unit.
+func (s *Store) recBytesAt(off uint64) uint64 {
+	return hdrSize + align8(s.klen(off)) + s.vcapBytes(off)
+}
+
+// segOf returns the index of the segment that owns resident arena offset off, with ok false when
+// off is not a segment record: a non-segmented store, a cold address (tier bit set, not an arena
+// offset at all), or an offset in the never-reclaimed overflow region below segStart. It is pure
+// arithmetic over the fixed segment tiling, a subtract, a divide, and one bound check, no lock, so
+// the unlink path pays almost nothing to find the segment whose live counter it must adjust.
+func (s *Store) segOf(off uint64) (uint64, bool) {
+	if !s.segmented || off&tierBit != 0 || off < s.segStart {
+		return 0, false
+	}
+	si := (off - s.segStart) / s.segSize
+	if si >= uint64(len(s.segs)) {
+		return 0, false
+	}
+	return si, true
+}
+
+// unlinkResident charges a just-unlinked resident record's bytes back to its owning segment's
+// live counter, the decrement M0 and M1 deferred: until now live only ever rose, on allocation,
+// so a segment never reported itself drained. It is called at every site that removes a resident
+// record from the index, right after the unlink commits, mirroring markSepDead: a string or
+// element delete, an overwrite's entry swap to a fresh record, a list or collection element take,
+// and the migrator's cold flip. When the last record a segment handed out has been unlinked its
+// live counter reaches zero, which is the signal the migrator's drain-completion check reads to
+// retire the segment and the emptiest-segment selection (D15) reads to pick its next drain target.
+// A cold entry, an overflow-region offset, or a non-segmented store is a no-op, since there is no
+// per-segment live counter to adjust. Reading the header here is safe because the record's bytes
+// stay valid until its segment is freed as a unit, and the segment cannot be freed while this
+// record's own charge still stands in live, which it does until this very decrement lands.
+func (s *Store) unlinkResident(off uint64) {
+	si, ok := s.segOf(off)
+	if !ok {
+		return
+	}
+	s.segs[si].live.Add(-int64(s.recBytesAt(off)))
+}
+
 // freeSegment returns segment si to the free list, resetting its cursor to base and its
 // live counter to zero so a later advance can reuse it from scratch. It is the only path
 // that frees a segment in M0, and the caller must have already unlinked every record the
