@@ -23,6 +23,7 @@ package f1srv
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"log"
 	"net"
 	"runtime"
@@ -69,6 +70,21 @@ type Config struct {
 	// ArenaSegmented is set.
 	ArenaSegmentBytes  int
 	ArenaOverflowBytes int
+
+	// ColdRecordsPath, when non-empty, opens the cold record region (spec 2064/21 M1): the
+	// tier the background migrator sinks whole string records into under arena fill pressure.
+	// It is distinct from ColdPath, which separates large values alone; a store can run either,
+	// both, or neither. Empty leaves the record region off, so nothing migrates and the resident
+	// path is unchanged. Like ColdPath the file is truncated on open (durable reopen is a later
+	// milestone), and opening it can fail on a disk error, which New defers to Listen.
+	ColdRecordsPath string
+	// Migrator starts the background migrator that drives records cold once the resident arena
+	// crosses its high-water mark (spec 2064/21 M3), the switch that makes a bounded arena serve a
+	// string dataset larger than itself. It requires ArenaSegmented and a ColdRecordsPath: the
+	// migrator drains whole segments into the record region, so both must be set or New records a
+	// configuration error surfaced by Listen. Default false leaves the arena grow-only with no
+	// migrator goroutine, so a store that never sets it pays nothing for the machinery.
+	Migrator bool
 
 	// SetPartitionMax caps the partitions one hot set can engage under the adaptive intra-key
 	// partitioning of spec 2064/f1_rewrite_ltm/19. The default of 1 leaves the feature off: every
@@ -337,6 +353,15 @@ func New(cfg Config) *Server {
 		// (spec 2064/21 M0). Default off leaves the grow-only bump path in place.
 		srv.store.EnableSegments(cfg.ArenaSegmentBytes, cfg.ArenaOverflowBytes)
 	}
+	if srv.store != nil && srv.initErr == nil && cfg.ColdRecordsPath != "" {
+		// Open the cold record region the migrator sinks whole frames into (spec 2064/21 M1),
+		// on the still-empty store. Like the cold value log, opening the file can fail on a disk
+		// error, deferred to Listen; a failure leaves srv.store set but the region unopened, so
+		// the migrator wiring below sees no region and reports the same configuration error.
+		if err := srv.store.EnableColdRecords(cfg.ColdRecordsPath); err != nil {
+			srv.initErr = err
+		}
+	}
 	if srv.store != nil {
 		// Teach the engine which record kinds are top-level keys so it can keep an O(1)
 		// live-key counter for DBSIZE, the same policy KEYS/SCAN/RANDOMKEY hand ScanKeys.
@@ -346,6 +371,21 @@ func New(cfg Config) *Server {
 		// queues the removal and a background folder splices it under the index lock later
 		// (spec 2064/16 slice 2). Enable once here, before the server accepts traffic.
 		srv.store.EnableDeferredRemoval()
+	}
+	if cfg.Migrator {
+		// Start the background migrator that sinks records cold under fill pressure (spec 2064/21
+		// M3). It needs the segmented arena and an open cold record region, both set up above, so
+		// a bad combination is a configuration error surfaced by Listen rather than a panic from
+		// EnableMigrator. The store is guarded because a deferred cold-log open error above can
+		// leave it nil.
+		switch {
+		case srv.initErr != nil:
+			// An earlier cold-region open already failed; keep that error.
+		case srv.store == nil || !cfg.ArenaSegmented || cfg.ColdRecordsPath == "":
+			srv.initErr = errors.New("f1srv: Migrator requires ArenaSegmented and ColdRecordsPath")
+		default:
+			srv.store.EnableMigrator()
+		}
 	}
 	return srv
 }

@@ -51,6 +51,7 @@ func main() {
 	arenaSegmented := fs.Bool("arena-segmented", false, "use the reclaimable segmented arena (spec 2064/21 M0); off keeps the grow-only bump arena")
 	arenaSegmentBytes := fs.Int("arena-segment-bytes", 0, "segment size in bytes for --arena-segmented (0 = engine default 8 MiB, floored at the largest record)")
 	arenaOverflowBytes := fs.Int("arena-overflow-bytes", 0, "never-reclaimed overflow-bucket region size for --arena-segmented (0 = an eighth of the arena)")
+	ltmMigrator := fs.Bool("ltm-migrator", false, "engage the background migrator that sinks whole string records cold under arena fill pressure (spec 2064/21 M3); serves a string dataset larger than the arena. Implies --arena-segmented and opens a cold record region under --dir")
 	pprofAddr := fs.String("pprof", "", "if set, serve net/http/pprof on this host:port (profiling only, off by default)")
 	// --gogc and --gomemlimit are optional heap-pacing knobs for the LTM regime,
 	// where a large arena and a cold value log grow the heap and an operator may
@@ -101,6 +102,14 @@ func main() {
 		cfg.ColdPath = filepath.Join(*dir, "f1raw-cold.vlog")
 		cfg.SepThreshold = *sepThreshold
 	}
+	if *ltmMigrator {
+		// The migrator drains whole segments into the cold record region, so it needs the
+		// segmented arena and an open record region. Force both on here rather than making the
+		// operator remember to pair the flags: --ltm-migrator alone is the LTM string switch.
+		cfg.ArenaSegmented = true
+		cfg.ColdRecordsPath = filepath.Join(*dir, "f1raw-cold.recs")
+		cfg.Migrator = true
+	}
 
 	if *pprofAddr != "" {
 		go func() {
@@ -127,8 +136,12 @@ func main() {
 	if *setPartMax > 1 {
 		setPart = fmt.Sprintf("max=%d", *setPartMax)
 	}
-	fmt.Printf("f1srv listening on %s (index-buckets=%d arena=%dMiB cold=%s gogc=%d gomemlimit=%s set-partition=%s)\n",
-		srv.Addr(), *indexBuckets, *arenaBytes>>20, cold, effGOGC, memlimit, setPart)
+	migrator := "off"
+	if *ltmMigrator {
+		migrator = cfg.ColdRecordsPath
+	}
+	fmt.Printf("f1srv listening on %s (index-buckets=%d arena=%dMiB cold=%s migrator=%s gogc=%d gomemlimit=%s set-partition=%s)\n",
+		srv.Addr(), *indexBuckets, *arenaBytes>>20, cold, migrator, effGOGC, memlimit, setPart)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("f1srv: serve: %v", err)
 	}
