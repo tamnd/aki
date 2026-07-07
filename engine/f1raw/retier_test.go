@@ -3,6 +3,9 @@ package f1raw
 import (
 	"fmt"
 	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -133,5 +136,241 @@ func TestColdSetMemberRetierDrawAndScan(t *testing.T) {
 	}
 	if !drewCold {
 		t.Fatal("no random draw landed on a migrated (cold) member across many draws; the cold slots are unreachable")
+	}
+}
+
+// setChurnColdStore builds a segmented store with a cold record region that admits kindSetMember to
+// both the vector-member (Option A retier) path and the background migrator's policy, so a set member
+// row the migrator picks up during drainSegment is retiered in place through migrateVecMember rather
+// than left as a stale resident offset. It is the M2 analogue of newSetRecStore on the reclaimable
+// segmented arena the -race fuzz needs.
+func setChurnColdStore(t *testing.T, nSeg int) *Store {
+	t.Helper()
+	s := churnSegColdStore(t, nSeg)
+	s.SetVecMemberKindFunc(func(k byte) bool { return k == tKindSetMember })
+	s.SetMigratableKindFunc(func(k byte) bool { return k == tKindSetMember })
+	return s
+}
+
+// setMemberLen makes each set member big enough that a segment holds only tens of them, so the fuzz
+// set spills across several segments and the migrator has full segments to drain, the set-member
+// analogue of churnValLen.
+const setMemberLen = 2600
+
+// bigSetMember builds a distinct, verifiable member string of setMemberLen bytes. A torn read from a
+// reused segment produces bytes outside this fixed shape, so a membership check against the universe
+// catches a use-after-free the race detector might only have surfaced as a data race.
+func bigSetMember(i int) string {
+	b := make([]byte, setMemberLen)
+	head := fmt.Sprintf("mem-%06d:", i)
+	copy(b, head)
+	for j := len(head); j < len(b); j++ {
+		b[j] = byte('a' + (i+j)%26)
+	}
+	return string(b)
+}
+
+// TestSetMemberRetierRaceUnderMigrator is the D22 Option A M2 -race gate (spec 2064/f1_rewrite_ltm/22
+// section 5, section 10 M2): the background migrator drains set member rows cold through drainRecord's
+// kindSetMember dispatch while writers churn SADD/SREM on the same set and readers draw and scan it
+// lock-free. The migrator retiers each moved member's cached vector slot in place under the shard
+// mutex (race 1 and 2) and the draws hold the reader epoch across the offset-to-key resolution so a
+// retiered-and-reclaimed segment cannot be reused under a draw mid-read (race 3). Under -race the run
+// must be clean, no draw or scan may return a key outside the fixed member universe (which a torn read
+// would), and at quiesce the vector must hold exactly the reconciled membership with its density
+// invariant intact and every member still resolvable across whatever tier it settled in.
+func TestSetMemberRetierRaceUnderMigrator(t *testing.T) {
+	s := setChurnColdStore(t, 12)
+	// Drain aggressively so members keep moving cold under the readers rather than staying resident:
+	// a low high-water keeps the migrator retiering throughout the churn, maximizing the race surface.
+	s.migHiNum, s.migLoNum = 20, 10
+	s.EnableMigrator()
+
+	const skey = "s"
+	const universe = 300
+	prefix := setPrefixBytes(skey)
+
+	// The fixed universe of composite member keys. A draw or scan may only ever return one of these.
+	memberKeys := make([][]byte, universe)
+	want := make(map[string]bool, universe)
+	for i := 0; i < universe; i++ {
+		mk := memberKeyBytes(skey, bigSetMember(i))
+		memberKeys[i] = mk
+		want[string(mk)] = true
+	}
+
+	// writeMu serializes writers to the one set key, the engine-test stand-in for the server's per-key
+	// stripe lock: SADD's PutKind+CollRandInsert and SREM's CollRandRemove+DeleteKind never interleave,
+	// so the vector and the primary index stay consistent exactly as they do on the wire. The migrator
+	// does not take it, so it races the vector mutation on the shard mutex and the lock-free draws,
+	// which is the surface section 5 races 1 through 3 cover.
+	var writeMu sync.Mutex
+	sadd := func(mk []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		created, err := s.PutKind(mk, nil, tKindSetMember)
+		if err != nil {
+			return err
+		}
+		if created {
+			s.CollRandInsert(prefix, mk, tKindSetMember)
+		}
+		return nil
+	}
+	srem := func(mk []byte) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		s.CollRandRemove(prefix, mk, tKindSetMember)
+		s.DeleteKind(mk, tKindSetMember)
+	}
+
+	// Seed the whole universe so the set spans several segments before the churn starts.
+	for _, mk := range memberKeys {
+		if err := sadd(mk); err != nil {
+			t.Fatalf("seed SADD: %v", err)
+		}
+	}
+
+	var stop atomic.Bool
+	var firstErr atomic.Pointer[string]
+	fail := func(msg string) { firstErr.CompareAndSwap(nil, &msg) }
+	var ops atomic.Int64
+	var wg sync.WaitGroup
+
+	// Readers: lock-free draws and downward scans, every returned key checked against the universe.
+	const readers = 6
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			rng := testRNG(uint64(r)*2654435761 + 1)
+			var scan [][]byte
+			for j := 0; !stop.Load(); j++ {
+				if j&1 == 0 {
+					if k, ok := s.CollRandSelect(prefix, rng.next()); ok && !want[string(k)] {
+						fail(fmt.Sprintf("CollRandSelect drew non-universe key of len %d", len(k)))
+						return
+					}
+					continue
+				}
+				hi := -1
+				for !stop.Load() {
+					var next int
+					scan, next = s.SetVecScanDown(prefix, hi, 32, scan[:0])
+					for _, k := range scan {
+						if !want[string(k)] {
+							fail(fmt.Sprintf("SetVecScanDown returned non-universe key of len %d", len(k)))
+							return
+						}
+					}
+					if next == 0 || len(scan) == 0 {
+						break
+					}
+					hi = next
+				}
+			}
+		}(r)
+	}
+
+	// Writers: random SADD/SREM over the universe against the one set, serialized by writeMu. A full
+	// arena during a churn SADD is transient backpressure the migrator relieves, so it retries rather
+	// than fails; a genuine stall would still time out inside PutKind's waitForSegment.
+	const writers = 4
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			rng := testRNG(uint64(w)*40503 + 7)
+			for !stop.Load() && firstErr.Load() == nil {
+				mk := memberKeys[int(rng.next()%universe)]
+				if rng.next()&1 == 0 {
+					srem(mk)
+				} else if err := sadd(mk); err != nil && err != ErrFull {
+					fail(fmt.Sprintf("churn SADD: %v", err))
+					return
+				}
+				ops.Add(1)
+			}
+		}(w)
+	}
+
+	for ops.Load() < 20000 && firstErr.Load() == nil {
+		runtime.Gosched()
+	}
+	stop.Store(true)
+	wg.Wait()
+	if msg := firstErr.Load(); msg != nil {
+		t.Fatal(*msg)
+	}
+
+	// Reconcile to the whole universe, quiesce, then assert the vector is exactly the universe with its
+	// density invariant intact and every member resolvable across whatever tier the churn left it in.
+	for _, mk := range memberKeys {
+		created, err := s.PutKind(mk, nil, tKindSetMember)
+		if err != nil {
+			t.Fatalf("reconcile PutKind: %v", err)
+		}
+		if created {
+			s.CollRandInsert(prefix, mk, tKindSetMember)
+		}
+	}
+
+	if got := s.SetVecLen(prefix); got != universe {
+		t.Fatalf("SetVecLen = %d after reconcile, want %d", got, universe)
+	}
+
+	sh := s.rvec.shardFor(prefix)
+	sh.mu.Lock()
+	v := sh.get(prefix)
+	if v == nil {
+		sh.mu.Unlock()
+		t.Fatal("no member vector after reconcile")
+	}
+	if len(v.slots) != len(v.back) {
+		n, m := len(v.slots), len(v.back)
+		sh.mu.Unlock()
+		t.Fatalf("density broken: %d slots, %d back entries", n, m)
+	}
+	for i, off := range v.slots {
+		if v.back[off] != i {
+			bi := v.back[off]
+			sh.mu.Unlock()
+			t.Fatalf("density broken: back[slots[%d]] = %d, want %d", i, bi, i)
+		}
+	}
+	nslots := len(v.slots)
+	sh.mu.Unlock()
+	if nslots != universe {
+		t.Fatalf("vector holds %d slots after reconcile, want %d", nslots, universe)
+	}
+
+	var all [][]byte
+	hi := -1
+	for {
+		var next int
+		all, next = s.SetVecScanDown(prefix, hi, 64, all)
+		if next == 0 {
+			break
+		}
+		hi = next
+	}
+	seen := make(map[string]bool, universe)
+	for _, k := range all {
+		ks := string(k)
+		if !want[ks] {
+			t.Fatalf("final scan returned non-universe key of len %d", len(k))
+		}
+		if seen[ks] {
+			t.Fatalf("final scan returned a duplicate member")
+		}
+		seen[ks] = true
+	}
+	if len(seen) != universe {
+		t.Fatalf("final scan covered %d distinct members, want %d", len(seen), universe)
+	}
+	for _, mk := range memberKeys {
+		if !s.ExistsKind(mk, tKindSetMember) {
+			t.Fatalf("a member is not present after reconcile")
+		}
 	}
 }
