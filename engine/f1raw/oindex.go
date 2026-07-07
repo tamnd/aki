@@ -148,6 +148,25 @@ func (s *Store) keyAt(off uint64) []byte {
 	return s.arena[start : start+klen]
 }
 
+// nodeKey returns the composite key bytes of ordered-index node n. When the whole key fits
+// the node's inline cache (klen <= onodeInlineCap), it returns that cache directly: the
+// inline copy is a verbatim prefix of the key taken at insert, so for a fully-inlined key it
+// is byte-identical to keyAt(n.off), only read without chasing the record offset into the
+// arena. That decoupling is what lets the ordered index yield an element's key after the
+// element's record has migrated cold and its resident bytes were reclaimed, since for an
+// inline-fitting key the retrieval path never touches the record, the same independence
+// cmpKey already relies on for ordering. A key longer than the cache falls back to
+// keyAt(n.off), the resident read; the record-tiering follow-up widens that tail to the cold
+// frame. The common collection member key (a length-prefixed collection key plus a short
+// member) fits inline, so the SPOP/HSCAN/SRANDMEMBER retrieval paths take the arena-free
+// branch, matching the descent's own cache hit.
+func (s *Store) nodeKey(n *onode) []byte {
+	if int(n.klen) <= onodeInlineCap {
+		return n.inline[:n.klen]
+	}
+	return s.keyAt(n.off)
+}
+
 // insert adds off's record to the ordered index. If a node with the same key already
 // exists (a field overwrite that happened to republish, or a redundant call), the
 // node's offset is refreshed rather than duplicated, so the index holds exactly one
@@ -363,7 +382,7 @@ func (oi *oindex) selectAndRemoveInPrefix(prefix []byte, localIndex int) ([]byte
 	if victim == nil {
 		return nil, false
 	}
-	k := oi.store.keyAt(victim.off)
+	k := oi.store.nodeKey(victim)
 	if !bytes.HasPrefix(k, prefix) {
 		// localIndex ran past this collection into a sibling: report absent, remove nothing.
 		return nil, false
@@ -385,11 +404,17 @@ func (oi *oindex) selectAndRemoveInPrefix(prefix []byte, localIndex int) ([]byte
 
 // scanBatch collects up to limit record offsets whose key has the given prefix and is
 // strictly greater than after (nil after means from the start of the prefix), in key
-// order, appending them to dst. It returns the grown dst and the key bytes of the last
-// offset appended (a subslice of the arena, valid for the store's life) so the caller
-// can resume the next batch with it. Holding the read lock only for the batch keeps a
-// large enumeration from blocking writers across the whole collection.
-func (oi *oindex) scanBatch(prefix, after []byte, limit int, dst []uint64) ([]uint64, []byte) {
+// order, appending them to dstOffs. When dstKeys is non-nil it also appends each node's
+// composite key, in lockstep with the offsets, so dstKeys[i] is the key of dstOffs[i]; a
+// caller that wants only the offsets passes nil and pays for no key collection. The keys
+// come from nodeKey, the node's own inline cache for an inline-fitting key, so an
+// enumeration returns an element's key without reading the record, which is what keeps the
+// key correct after the element's record has migrated cold and its resident offset was
+// reclaimed. It returns the grown offset and key slices and the key bytes of the last
+// node appended, so the caller can resume the next batch with it. Holding the read lock
+// only for the batch keeps a large enumeration from blocking writers across the whole
+// collection.
+func (oi *oindex) scanBatch(prefix, after []byte, limit int, dstOffs []uint64, dstKeys [][]byte) ([]uint64, [][]byte, []byte) {
 	oi.mu.RLock()
 	defer oi.mu.RUnlock()
 
@@ -427,8 +452,8 @@ func (oi *oindex) scanBatch(prefix, after []byte, limit int, dst []uint64) ([]ui
 	filter := oi.store.tombPend.Load() > 0
 
 	var last []byte
-	for x != nil && len(dst) < limit {
-		k := oi.store.keyAt(x.off)
+	for x != nil && len(dstOffs) < limit {
+		k := oi.store.nodeKey(x)
 		if !bytes.HasPrefix(k, prefix) {
 			break
 		}
@@ -436,11 +461,14 @@ func (oi *oindex) scanBatch(prefix, after []byte, limit int, dst []uint64) ([]ui
 			x = x.next[0]
 			continue
 		}
-		dst = append(dst, x.off)
+		dstOffs = append(dstOffs, x.off)
+		if dstKeys != nil {
+			dstKeys = append(dstKeys, k)
+		}
 		last = k
 		x = x.next[0]
 	}
-	return dst, last
+	return dstOffs, dstKeys, last
 }
 
 // rankLocked returns the number of live nodes whose key sorts strictly before key,
@@ -516,7 +544,7 @@ func (oi *oindex) selectInPrefix(prefix []byte, localIndex int) ([]byte, bool) {
 	if node == nil {
 		return nil, false
 	}
-	k := oi.store.keyAt(node.off)
+	k := oi.store.nodeKey(node)
 	if !bytes.HasPrefix(k, prefix) {
 		return nil, false
 	}

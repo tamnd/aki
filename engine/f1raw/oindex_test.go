@@ -401,6 +401,86 @@ func TestOIndexInlineArenaBoundary(t *testing.T) {
 	}
 }
 
+// nodeKey serves an inline-fitting element key from the node's own cache, so ordered-index
+// retrieval no longer depends on the record's arena bytes. This is the tier-safety property
+// the collection cold-record migrator relies on: once an element's record flips cold and its
+// resident bytes are reclaimed, enumeration and positional select must still return the right
+// key. The test simulates the reclaim by scribbling over each inline record's arena key bytes
+// after insert, the way a freed or MADV_DONTNEED'd segment leaves stale pages behind the
+// ordered node's offset, then asserts scan and select still return the true keys. Every member
+// here is well under onodeInlineCap so the retrieval path is the arena-free inline branch; the
+// over-cap arena fallback keeps its own coverage in TestOIndexInlineArenaBoundary, and is left
+// out here precisely because its ordering is arena-dependent and a scribble would corrupt the
+// descent, which is the distinction this slice draws.
+func TestOIndexNodeKeyArenaIndependent(t *testing.T) {
+	s := New(1<<16, 1<<20)
+	members := []string{"a", "bb", "ccc", "dddd", "e5", "f"}
+	for _, m := range members {
+		k := collKey("h", m)
+		if _, err := s.PutKind(k, []byte("v"), kindTestField); err != nil {
+			t.Fatalf("PutKind(%q): %v", m, err)
+		}
+		s.CollInsert(k, kindTestField)
+	}
+
+	// Scribble each member's record key bytes in the arena, standing in for the stale or
+	// zeroed pages a reclaimed cold-flipped segment leaves behind the node's offset. Every
+	// key fits inline, so cmpKey and nodeKey both read the node cache, never these bytes.
+	for _, m := range members {
+		k := collKey("h", m)
+		off, _, _, _, found := s.find(k, hash(k), kindTestField)
+		if !found {
+			t.Fatalf("record for %q not found", m)
+		}
+		kstart := off + hdrSize
+		for i := uint64(0); i < s.klen(off); i++ {
+			s.arena[kstart+i] = 0xff
+		}
+	}
+
+	// Enumeration must still return every member in order despite the scribbled arena.
+	prefix := collPrefix("h")
+	got := scanAll(s, prefix, 2)
+	want := make([]string, len(members))
+	copy(want, members)
+	sort.Slice(want, func(i, j int) bool {
+		return bytes.Compare(collKey("h", want[i]), collKey("h", want[j])) < 0
+	})
+	if len(got) != len(want) {
+		t.Fatalf("scan returned %d keys, want %d: %q", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if !bytes.Equal(got[i], collKey("h", w)) {
+			t.Fatalf("scan pos %d: got %q, want member %q", i, got[i], w)
+		}
+	}
+
+	// Positional select must also resolve to the true key from the node cache.
+	for i, w := range want {
+		k, ok := s.CollSelectAt(prefix, i)
+		if !ok {
+			t.Fatalf("CollSelectAt(%d) absent, want %q", i, w)
+		}
+		if !bytes.Equal(k, collKey("h", w)) {
+			t.Fatalf("CollSelectAt(%d) = %q, want member %q", i, k, w)
+		}
+	}
+
+	// The fused select-and-remove path returns its victim key through nodeKey too, so it must
+	// survive the scribble as well; drain the whole collection and check each removed key.
+	for len(want) > 0 {
+		k, ok := s.CollSelectRemoveAt(prefix, 0)
+		if !ok {
+			t.Fatalf("CollSelectRemoveAt(0) absent at %d remaining", len(want))
+		}
+		if !bytes.Equal(k, collKey("h", want[0])) {
+			t.Fatalf("CollSelectRemoveAt(0) = %q, want member %q", k, want[0])
+		}
+		s.DeleteKind(k, kindTestField)
+		want = want[1:]
+	}
+}
+
 // CollSelectAt must return the localIndex-th member of one collection in key order,
 // isolated from sibling collections that share a bounding prefix, and must report absent
 // for a localIndex at or past the collection's cardinality rather than leaking a sibling.
