@@ -203,6 +203,15 @@ type Store struct {
 	cold         *coldLog
 	sepThreshold int
 
+	// recs is the cold record region for the tier-tagged index (coldrec.go), milestone M1
+	// of the collection cold-record tiering plan (spec 2064/21). It is a second append-only
+	// log, separate from cold above: cold holds separated values, recs holds whole migrated
+	// record frames. When set, a migrated record's frame lands here and its index entry
+	// flips to a cold address (bit 47 of the entry set). It is nil unless EnableColdRecords
+	// engages it, and nothing migrates on its own in M1, so a store that never enables it
+	// has no cold entries and the tier check on the read path is a never-taken branch.
+	recs *coldLog
+
 	// The deferred ordered-index removal state (tombstone.go). When deferred removal is
 	// enabled, an element delete hands the composite key to tombHead (a lock-free Treiber
 	// stack of removal batches) instead of splicing the skip list inline, and a background
@@ -354,6 +363,11 @@ func (s *Store) Close() error {
 		// nodes a later reopen would have to reconcile.
 		close(s.folderStop)
 		<-s.folderDone
+	}
+	if s.recs != nil {
+		if err := s.recs.close(); err != nil {
+			return err
+		}
 	}
 	if s.cold != nil {
 		return s.cold.close()
@@ -508,7 +522,16 @@ func (s *Store) find(key []byte, h uint64, kind byte) (off uint64, b *bucket, sl
 				continue
 			}
 			a := w & addrMask
-			if s.recordMatches(a, key, kind) {
+			// The tier bit (bit 47, coldrec.go D1) is clear for a resident record, the
+			// predicted path: match against the arena exactly as before. It is set only
+			// for a migrated cold record, whose key lives in its frame, not the arena, so
+			// matching reads the frame instead. No entry carries a cold address unless a
+			// migration set it, so this branch is never taken until the cold tier is used.
+			if a&tierBit == 0 {
+				if s.recordMatches(a, key, kind) {
+					return a, b, i, w, true
+				}
+			} else if s.coldFrameMatches(a&^tierBit, key, kind) {
 				return a, b, i, w, true
 			}
 		}
@@ -528,10 +551,7 @@ func (s *Store) Get(key, dst []byte) ([]byte, bool) {
 	if !found {
 		return dst[:0], false
 	}
-	if s.cold != nil && s.isSep(off) {
-		return s.readSeparated(off, dst)
-	}
-	return s.readValue(off, dst), true
+	return s.readValueByAddr(off, dst)
 }
 
 // readValue is the seqlock read. It spins while a writer holds the latch (odd
