@@ -53,13 +53,16 @@ const maxRecordBytes = hdrSize + ((maxKey + 7) &^ 7) + ((maxVal + 7) &^ 7)
 // exactly as the old single-arena bump abandons its tail). live counts the record bytes
 // handed out of this segment, the figure the later migrator reads to pick a drain
 // target; M0 only increments it on allocation and zeroes it on free, since there is no
-// migrator yet to decrement it. The padding keeps adjacent descriptors off one cache
-// line so two segments filling concurrently do not false-share.
+// migrator yet to decrement it. retire is the epoch the segment was retired at (M2, doc 21
+// section 7), valid only while the segment sits on retSegs awaiting reader quiescence; it is
+// touched solely under segMu, so a plain field suffices. The padding keeps adjacent descriptors
+// off one cache line so two segments filling concurrently do not false-share.
 type segment struct {
-	base  uint64
-	alloc atomic.Uint64
-	live  atomic.Int64
-	_     [64 - 24]byte
+	base   uint64
+	alloc  atomic.Uint64
+	live   atomic.Int64
+	retire uint64
+	_      [64 - 32]byte
 }
 
 // NewSegmented builds a store whose arena is divided into reclaimable segments of
@@ -123,6 +126,11 @@ func (s *Store) EnableSegments(segBytes, ovBytes int) {
 	s.ovTail.Store(ovBase)
 	s.highWater = 1 // segment 0 is the first current segment
 	s.curSeg.Store(0)
+
+	// A segmented store can free and reuse a segment, so it needs the reader epoch framework
+	// (epoch.go M2) to gate a free on reader quiescence. A non-segmented store never reaches
+	// this and never pays for the slots.
+	s.initEpoch()
 }
 
 // allocRec is the record allocator the write paths call. It routes to the segmented
@@ -192,7 +200,16 @@ func (s *Store) advanceSeg(observed uint64) bool {
 		ni = s.highWater
 		s.highWater++
 	default:
-		return false // no free segment and no unused segment: arena full
+		// No free segment and no unused one. A migrator may have retired segments that are now
+		// safe to reuse; reclaim inline before giving up so a fill that outpaces the migrator's
+		// own reclamation pass still recovers freed space rather than reporting a full arena
+		// while retired segments wait.
+		s.reclaimLocked()
+		if len(s.freeSegs) == 0 {
+			return false
+		}
+		ni = s.freeSegs[len(s.freeSegs)-1]
+		s.freeSegs = s.freeSegs[:len(s.freeSegs)-1]
 	}
 	s.curSeg.Store(ni)
 	return true
@@ -228,10 +245,75 @@ func (s *Store) freeSegment(si uint64) {
 	s.freeSegs = append(s.freeSegs, si)
 }
 
-// resetSegments rewinds every segment to empty, drops the free list, and rewinds the
-// overflow region, the segmented-arena half of Reset. Like Reset itself it assumes
+// retireSegment marks segment si dead but not yet free, the epoch-gated replacement for
+// freeSegment on the concurrent migration path (M2, doc 21 section 7 D18). Where freeSegment
+// returns a segment to the free list at once (safe only when traffic is quiesced), a migrator
+// running against live readers cannot: a reader may have loaded a resident address from si
+// before the migrator flipped the record away and still be copying those bytes. So this bumps
+// the global epoch and records si tagged with the epoch just below the bump, the highest epoch a
+// stale reader could hold, and defers the actual free to reclaimLocked once the safe epoch passes
+// it. The bump is what lets the safe epoch advance under a steady read load: new readers publish
+// an epoch above the retire epoch, so as the in-flight readers finish, the minimum published
+// epoch rises past it. The caller (the migrator, or the M2 test) must have already flipped every
+// live record's index entry off this segment, so nothing the index points at lives here anymore.
+// It opportunistically reclaims, which frees si immediately when no reader is active.
+func (s *Store) retireSegment(si uint64) {
+	s.segMu.Lock()
+	defer s.segMu.Unlock()
+	newE := s.ep.global.Add(1)
+	s.segs[si].retire = newE - 1
+	s.retSegs = append(s.retSegs, si)
+	s.reclaimLocked()
+}
+
+// reclaimLocked returns every retired segment whose retire epoch the safe epoch has passed to the
+// free list, resetting each one's cursor and live counter so a later advance reuses it from
+// scratch. It must be called under segMu. The safe-epoch read (epoch.go) is the whole guarantee:
+// a segment freed here has a retire epoch strictly below every active reader's published epoch, so
+// no reader still holds an address into it. A segment whose retire epoch has not yet been passed
+// stays on retSegs for a later pass. The in-place filter reuses the retSegs backing array: it only
+// ever writes a kept entry at an index at or below the one just read, so it never clobbers an
+// entry it has not consumed.
+func (s *Store) reclaimLocked() {
+	if len(s.retSegs) == 0 {
+		return
+	}
+	safe := s.safeEpoch()
+	kept := s.retSegs[:0]
+	for _, si := range s.retSegs {
+		if safe > s.segs[si].retire {
+			seg := &s.segs[si]
+			seg.alloc.Store(seg.base)
+			seg.live.Store(0)
+			s.freeSegs = append(s.freeSegs, si)
+		} else {
+			kept = append(kept, si)
+		}
+	}
+	s.retSegs = kept
+}
+
+// reclaimSegments runs one reclamation pass under segMu and reports how many segments it returned
+// to the free list. The migrator calls it to turn drained-and-retired segments into reusable ones
+// as readers quiesce, off the foreground path (doc 21 D17 batches this per drained segment); the
+// M2 test calls it to drive the retire-then-free cycle and to observe that reclamation made
+// progress once its readers released their epochs. advanceSeg reclaims inline through reclaimLocked
+// when it runs out of segments, so a fill that outpaces explicit reclamation still recovers freed
+// space before reporting the arena full.
+func (s *Store) reclaimSegments() int {
+	s.segMu.Lock()
+	defer s.segMu.Unlock()
+	before := len(s.freeSegs)
+	s.reclaimLocked()
+	return len(s.freeSegs) - before
+}
+
+// resetSegments rewinds every segment to empty, drops the free list and the retire list, and
+// rewinds the overflow region, the segmented-arena half of Reset. Like Reset itself it assumes
 // traffic is quiesced, so it takes segMu only to stay consistent with the concurrent
-// allocation paths' view of these fields.
+// allocation paths' view of these fields. The global epoch is left as is: it is monotonic and a
+// flush does not need to rewind it, and dropping retSegs is safe under quiescence because the
+// rewind loop already returns every retired segment's bytes to empty.
 func (s *Store) resetSegments() {
 	s.segMu.Lock()
 	defer s.segMu.Unlock()
@@ -240,6 +322,7 @@ func (s *Store) resetSegments() {
 		s.segs[i].live.Store(0)
 	}
 	s.freeSegs = s.freeSegs[:0]
+	s.retSegs = s.retSegs[:0]
 	s.highWater = 1
 	s.curSeg.Store(0)
 	s.ovTail.Store(s.ovBase)
