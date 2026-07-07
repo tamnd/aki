@@ -147,6 +147,13 @@ func (s *Store) MigrateToCold(key []byte, kind byte) bool {
 		}
 		newWord := (word &^ addrMask) | frameOff | tierBit
 		if b.slots[slot].CompareAndSwap(word, newWord) {
+			// The record now lives cold and its resident bytes are dead space. Return them to
+			// the source segment's live counter so the segment drains toward zero, the signal
+			// the migrator retires it on (doc 21 section 6). off is a resident arena offset here
+			// (the tier-bit branch above returned already), so unlinkResident charges the right
+			// segment. This is the decrement M1 deferred; the pressure-driven migrator (M3)
+			// relies on it to know when a drained segment is empty and safe to retire.
+			s.unlinkResident(off)
 			return true
 		}
 		// Lost the entry to a concurrent writer; the appended frame is now dead space.

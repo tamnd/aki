@@ -722,8 +722,10 @@ outer:
 					if b.slots[i].CompareAndSwap(w, newWord) {
 						// The old record a is now unlinked. If it was separated, its cold
 						// value is dead space no live record points at anymore; account it
-						// so a later compaction pass sees the real waste.
+						// so a later compaction pass sees the real waste. Its resident bytes
+						// leave its segment's live total too, so a segmented arena can drain it.
 						s.markSepDead(a)
+						s.unlinkResident(a)
 						return nil // replace: count unchanged
 					}
 					continue outer // entry changed under us; rescan
@@ -761,8 +763,10 @@ func (s *Store) Delete(key []byte) bool {
 			return false
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
-			// A separated string's cold value is now unreferenced; account it as dead.
+			// A separated string's cold value is now unreferenced; account it as dead,
+			// and return its resident bytes to its segment so the arena can drain it.
 			s.markSepDead(off)
+			s.unlinkResident(off)
 			s.count.Add(-1)
 			s.addTop(stringKind, -1)
 			return true

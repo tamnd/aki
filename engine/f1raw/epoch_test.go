@@ -71,6 +71,71 @@ func fillSegBig(t *testing.T, s *Store, prefix string) (startSeg uint64, keys []
 	return startSeg, keys
 }
 
+// TestSegmentLiveDrainsToZero is the M3 slice-1 gate for segment live-byte accounting (doc 21
+// section 5.1, section 6). M0 and M1 only ever incremented a segment's live counter, on
+// allocation, so a segment never reported itself drained; the drain loop's completion check
+// (seg.live == 0) and D15's emptiest-segment selection both need live to fall as records leave
+// the index. This fills one segment, checks its live counter equals the resident bytes of the
+// records it holds, then removes every one of those records by both routes a real drain uses, a
+// delete and a cold migration, and asserts the counter lands exactly on zero. A drained segment
+// then retires and frees at once because no reader is active, closing the accounting loop.
+func TestSegmentLiveDrainsToZero(t *testing.T) {
+	s := churnSegColdStore(t, 5)
+
+	seg0, keysA := fillSegBig(t, s, "a")
+
+	// The live counter equals the summed resident bytes of the records the fill left in seg0.
+	var want int64
+	for _, k := range keysA {
+		off, _, _, _, ok := s.find(k, hash(k), stringKind)
+		if !ok {
+			t.Fatalf("filled key %q is missing from the index", k)
+		}
+		want += int64(s.recBytesAt(off))
+	}
+	if got := s.segs[seg0].live.Load(); got != want {
+		t.Fatalf("seg %d live = %d, want %d (summed resident record bytes)", seg0, got, want)
+	}
+
+	// Remove every record: half by delete, half by cold migration. Each route must charge the
+	// record's bytes back to seg0's live counter, so both together drain it to exactly zero.
+	for i, k := range keysA {
+		if i%2 == 0 {
+			if !s.Delete(k) {
+				t.Fatalf("Delete %q returned false", k)
+			}
+		} else {
+			if !s.MigrateToCold(k, stringKind) {
+				t.Fatalf("MigrateToCold %q returned false", k)
+			}
+		}
+	}
+	if got := s.segs[seg0].live.Load(); got != 0 {
+		t.Fatalf("after draining every record, seg %d live = %d, want 0", seg0, got)
+	}
+
+	// Drained to zero and no reader active, so retiring frees the segment at once.
+	before := len(s.freeSegs)
+	s.retireSegment(seg0)
+	if len(s.freeSegs) != before+1 {
+		t.Fatalf("drained segment did not free: freeSegs %d -> %d, want +1", before, len(s.freeSegs))
+	}
+
+	// The deleted keys are gone; the migrated keys still read their exact value from cold.
+	for i, k := range keysA {
+		v, ok := s.Get(k, nil)
+		if i%2 == 0 {
+			if ok {
+				t.Fatalf("deleted key %q still present as %q", k, v)
+			}
+			continue
+		}
+		if !ok || string(v) != string(churnVal("a", i)) {
+			t.Fatalf("migrated key %q = %q,%v; want its cold value", k, v, ok)
+		}
+	}
+}
+
 // TestEpochReclaimGate is the deterministic M2 gate for the retire-then-free machinery (doc 21
 // section 7, D18 to D20). It checks three things without concurrency, so a failure points at the
 // epoch math rather than a scheduling accident: a segment with no active reader frees the moment
