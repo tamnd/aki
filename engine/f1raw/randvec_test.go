@@ -203,7 +203,7 @@ func TestRandVecDrainToEmpty(t *testing.T) {
 		t.Fatalf("drained %d distinct, want %d", len(got), n)
 	}
 	// The ordered index for the prefix is empty.
-	offs, _ := s.oidx.Load().scanBatch(prefix, nil, 16, nil)
+	offs, _, _ := s.oidx.Load().scanBatch(prefix, nil, 16, nil, nil)
 	if len(offs) != 0 {
 		t.Fatalf("ordered index still holds %d members after drain", len(offs))
 	}
