@@ -101,8 +101,17 @@ type vecSlots struct {
 //
 // view is the atomically-published read snapshot of slots. Every mutation republishes it
 // (publish, below) under the shard write lock, and a draw loads it lock-free (spec 2064/19
-// slice 1). slots and back are the writer's working copies, touched only under the write
-// lock; readers never look at them, only at view.
+// slice 1). back is the writer's working copy, touched only under the write lock; readers
+// never look at it. slots is shared: publish hands readers a vecSlots aliasing the same
+// backing array, so a swap-remove that overwrites a live slot in place is visible to a
+// lock-free reader still holding an earlier snapshot. That single in-place slot write
+// (remove) and every lock-free slot read therefore go through atomic word access, which
+// keeps the read path lock-free and the swap-remove O(1) while giving concurrent access to
+// a slot well-defined semantics: a racing reader observes either the victim offset or the
+// tail offset moved into its place, and both resolve to valid arena bytes. add is the same
+// story in reverse: once removes have shrunk the length, a later add reuses a backing slot an
+// old-but-longer reader snapshot still covers, so add's capacity-reuse write is atomic too; only
+// when add reallocates does it write a fresh array no reader shares, and that store stays plain.
 type memberVec struct {
 	view  atomic.Pointer[vecSlots]
 	slots []uint64
@@ -136,8 +145,20 @@ func (v *memberVec) add(off uint64) {
 	if _, ok := v.back[off]; ok {
 		return
 	}
-	v.back[off] = len(v.slots)
-	v.slots = append(v.slots, off)
+	i := len(v.slots)
+	v.back[off] = i
+	if i < cap(v.slots) {
+		// Reusing a backing slot an earlier remove freed: a lock-free reader holding an older,
+		// longer snapshot still aliases this address, so extend the length first (the reader reads
+		// only the published snapshot, never this not-yet-published slot) and store atomically to
+		// pair with that reader's atomic load.
+		v.slots = v.slots[:i+1]
+		atomic.StoreUint64(&v.slots[i], off)
+	} else {
+		// At capacity: append reallocates a fresh backing array no reader shares, so the plain
+		// write is safe and becomes visible through publish's release store.
+		v.slots = append(v.slots, off)
+	}
 	v.publish()
 }
 
@@ -157,7 +178,10 @@ func (v *memberVec) remove(off uint64) bool {
 	}
 	last := len(v.slots) - 1
 	moved := v.slots[last]
-	v.slots[i] = moved
+	// Overwrite the victim's slot atomically: a lock-free draw or scan may be loading this same
+	// slot through an earlier published snapshot that aliases this backing array, so the store
+	// must pair with the readers' atomic loads for the concurrent access to be well-defined.
+	atomic.StoreUint64(&v.slots[i], moved)
 	v.back[moved] = i
 	v.slots = v.slots[:last]
 	delete(v.back, off)
@@ -330,18 +354,19 @@ func (s *Store) deriveOnFirstDraw(prefix []byte) *memberVec {
 // whole-set (P=1) prefix, building the vector eagerly if it does not exist yet. Doc 20 makes
 // the dense vector the authoritative membership structure, so it can no longer be lazy: a set
 // that is only ever enumerated (SMEMBERS) and never drawn from still needs a vector to read.
-// On the first write to a set with no vector this builds it whole through deriveOnFirstDraw,
-// which scans the ordered index CollInsert has already updated with this member, so the built
-// vector holds every live member; the resolve-and-add below is then idempotent for this
-// member and only appends when the vector already existed. The whole-set vector needs no
-// partition descriptor: CollRandDrop drops it directly under prefix (doc 20 section 6.1); the
-// partition case goes through CollPartRandInsert instead so its vector is descriptor-named.
-// Call it under the set's stripe lock, right after PutKind reports a newly-created member and
-// CollInsert adds its ordered-index node, with the member's live composite key so the offset
-// can be resolved through the authoritative hash index. It resolves the offset itself (the
-// same find CollInsert does) rather than taking a caller-passed offset, so the two insert
-// calls share the same failure mode: a member removed by a concurrent writer resolves to
-// not-found and neither structure records it.
+// The set type no longer indexes members in the ordered index (doc 20), so deriveOnFirstDraw
+// is reachable here only on the first member of a set, when the set's ordered-index prefix
+// range is empty: it builds an empty vector, and the resolve-and-add below then appends this
+// first member's offset. Every later insert finds the vector already present and just appends.
+// Because the ordered range is always empty when deriveOnFirstDraw runs for a set, the build
+// can never pick up a stale offset, so the vector stays exactly the live membership. The
+// whole-set vector needs no partition descriptor: CollRandDrop drops it directly under prefix
+// (doc 20 section 6.1); the partition case goes through CollPartRandInsert instead so its
+// vector is descriptor-named. Call it under the set's stripe lock, right after PutKind reports
+// a newly-created member, with the member's live composite key so the offset can be resolved
+// through the authoritative hash index. It resolves the offset itself rather than taking a
+// caller-passed offset, so a member removed by a concurrent writer resolves to not-found and
+// is not recorded.
 func (s *Store) CollRandInsert(prefix, key []byte, kind byte) {
 	sh := s.rvec.shardFor(prefix)
 	sh.mu.Lock()
@@ -420,7 +445,7 @@ func (s *Store) SetVecScanDown(prefix []byte, hi, limit int, dst [][]byte) ([][]
 		lo = 0
 	}
 	for i := upper - 1; i >= lo; i-- {
-		dst = append(dst, s.keyAt(vs.s[i]))
+		dst = append(dst, s.keyAt(atomic.LoadUint64(&vs.s[i])))
 	}
 	return dst, lo
 }
@@ -439,7 +464,7 @@ func (s *Store) SetVecAt(prefix []byte, idx int) (key []byte, ok bool) {
 	if idx < 0 || idx >= len(vs.s) {
 		return nil, false
 	}
-	return s.keyAt(vs.s[idx]), true
+	return s.keyAt(atomic.LoadUint64(&vs.s[idx])), true
 }
 
 // SetPartVecLen returns partition part's live member count for the P-partition set whose
@@ -475,7 +500,7 @@ func (s *Store) SetPartVecScanDown(base []byte, p, part, hi, limit int, dst [][]
 		lo = 0
 	}
 	for i := upper - 1; i >= lo; i-- {
-		dst = append(dst, s.keyAt(vs.s[i]))
+		dst = append(dst, s.keyAt(atomic.LoadUint64(&vs.s[i])))
 	}
 	return dst, lo
 }
@@ -504,7 +529,7 @@ func (s *Store) CollRandSelect(prefix []byte, r uint64) (key []byte, ok bool) {
 		if n == 0 {
 			return nil, false
 		}
-		return s.keyAt(vs.s[drawIndexWord(r, n)]), true
+		return s.keyAt(atomic.LoadUint64(&vs.s[drawIndexWord(r, n)])), true
 	}
 
 	// No vector yet: build it under the write mutex. Re-check after taking the mutex so two
@@ -521,7 +546,7 @@ func (s *Store) CollRandSelect(prefix []byte, r uint64) (key []byte, ok bool) {
 	if n == 0 {
 		return nil, false
 	}
-	return s.keyAt(vs.s[drawIndexWord(r, n)]), true
+	return s.keyAt(atomic.LoadUint64(&vs.s[drawIndexWord(r, n)])), true
 }
 
 // CollRandSelectRemove draws a uniform random live member and swap-removes it from the

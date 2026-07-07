@@ -39,14 +39,12 @@ import (
 // for the set type, so the clear walks it exactly as SMEMBERS does and never descends the
 // skip-list. The caller holds skey's stripe lock across the STORE, so the layout is frozen and
 // one drained downward walk per partition yields every live member once. Each member row is
-// dropped from both the hash index (DeleteKind) and the ordered index (CollRemove); the
-// CollRemove keeps the ordered index consistent while the set type still maintains it and
-// becomes a no-op once the writer flip stops indexing set members. SetVecScanDown and
-// SetPartVecScanDown build the vector on first use, so a set cleared before it was ever
-// enumerated or drawn from still resolves its members. Walking the frozen snapshot while
-// deleting is safe: DeleteKind and CollRemove touch the hash and ordered indexes, not the
-// vector, so the snapshot length stays stable and the downward walk covers every member once;
-// the vector itself is torn down wholesale at the end.
+// dropped from the hash index (DeleteKind); the set type no longer indexes members in the
+// ordered index. SetVecScanDown and SetPartVecScanDown build the vector on first use, so a set
+// cleared before it was ever enumerated or drawn from still resolves its members. Walking the
+// frozen snapshot while deleting is safe: DeleteKind touches the hash index, not the vector, so
+// the snapshot length stays stable and the downward walk covers every member once; the vector
+// itself is torn down wholesale at the end.
 func (c *connState) clearSetRows(skey []byte) {
 	p := c.partitionsFor(skey)
 	scan := make([][]byte, 0, hashScanBatch)
@@ -57,9 +55,7 @@ func (c *connState) clearSetRows(skey []byte) {
 			for {
 				keys, next := c.srv.store.SetPartVecScanDown(base, p, part, hi, hashScanBatch, scan[:0])
 				for _, k := range keys {
-					if c.srv.store.DeleteKind(k, kindSetMember) {
-						c.srv.store.CollRemove(k)
-					}
+					c.srv.store.DeleteKind(k, kindSetMember)
 				}
 				if next == 0 {
 					break
@@ -73,9 +69,7 @@ func (c *connState) clearSetRows(skey []byte) {
 		for {
 			keys, next := c.srv.store.SetVecScanDown(prefix, hi, hashScanBatch, scan[:0])
 			for _, k := range keys {
-				if c.srv.store.DeleteKind(k, kindSetMember) {
-					c.srv.store.CollRemove(k)
-				}
+				c.srv.store.DeleteKind(k, kindSetMember)
 			}
 			if next == 0 {
 				break
@@ -142,11 +136,12 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 				return false
 			}
 			if isNew {
-				c.srv.store.CollInsert(mk, kindSetMember)
 				// Eagerly build-or-splice the partition's dense vector through the descriptor so
-				// CollRandDrop can tear it down (doc 20 section 6.1). After clearSetRows dropped the
-				// old vector the first stored member rebuilds it; each subsequent member appends. base
-				// is built into ppbuf, distinct from mk's kbuf; CollPartRandInsert sets its final byte.
+				// CollRandDrop can tear it down (doc 20 section 6.1). The vector is the authoritative
+				// membership structure for the set type, so the store no longer touches the ordered
+				// index. After clearSetRows dropped the old vector the first stored member rebuilds it;
+				// each subsequent member appends. base is built into ppbuf, distinct from mk's kbuf;
+				// CollPartRandInsert sets its final byte.
 				base := c.partScanBase(dest)
 				c.srv.store.CollPartRandInsert(base, destP, part, mk, kindSetMember)
 				count++
@@ -160,10 +155,10 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 			return false
 		}
 		if isNew {
-			c.srv.store.CollInsert(mk, kindSetMember)
-			// Append the freshly-stored member to the destination's dense vector if one exists (spec
-			// 2064/18 5.1). The prefix is rebuilt per member into pbuf, distinct from mk's kbuf, and
-			// consumed synchronously, so it never collides with the member key being inserted.
+			// Append the freshly-stored member to the destination's dense vector, the authoritative
+			// membership structure for the set type (spec 2064/f1_rewrite_ltm/20); the store no longer
+			// indexes members in the ordered index. The prefix is rebuilt per member into pbuf, distinct
+			// from mk's kbuf, and consumed synchronously, so it never collides with the member key.
 			c.srv.store.CollRandInsert(c.setPrefix(dest), mk, kindSetMember)
 			count++
 			enc = foldSetEnc(enc, m, uint64(count))

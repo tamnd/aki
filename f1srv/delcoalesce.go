@@ -188,8 +188,6 @@ func (c *connState) cmdSRemCoalesced(skey []byte, elems [][]byte, bnd []int) {
 		return
 	}
 	counts := c.delCnt[:0]
-	buf := c.delKeyBuf[:0]
-	ends := c.delKeyEnd[:0]
 	// Hoist the set prefix once (pbuf) for the dense vector's remove routing. memberKey below uses
 	// kbuf and CollRandRemove never touches pbuf, so this stays stable across the whole run.
 	prefix := c.setPrefix(skey)
@@ -199,31 +197,26 @@ func (c *connState) cmdSRemCoalesced(skey []byte, elems [][]byte, bnd []int) {
 		removed := 0
 		for ; i < end; i++ {
 			mk := c.memberKey(skey, elems[i])
-			// Swap-remove the member from the dense vector if one exists (spec 2064/18 5.2) BEFORE
-			// the record is deleted: CollRandRemove resolves the member's arena offset through the
-			// hash index, so it must run while the record is still resolvable. On a member that is
-			// not actually present the find returns not-found and this no-ops, matching the
-			// DeleteKindNoCount below which then also reports nothing removed.
+			// Swap-remove the member from the dense vector, the authoritative membership structure for
+			// the set type (spec 2064/f1_rewrite_ltm/20), BEFORE the record is deleted: CollRandRemove
+			// resolves the member's arena offset through the hash index, so it must run while the record
+			// is still resolvable. On a member that is not actually present the find returns not-found and
+			// this no-ops, matching the DeleteKindNoCount below which then also reports nothing removed.
+			// The set type no longer indexes members in the ordered index.
 			c.srv.store.CollRandRemove(prefix, mk, kindSetMember)
 			if c.srv.store.DeleteKindNoCount(mk, kindSetMember) {
-				buf = append(buf, mk...)
-				ends = append(ends, len(buf))
 				removed++
 			}
 		}
 		counts = append(counts, removed)
 		total += removed
 	}
-	c.delKeyBuf = buf
-	c.delKeyEnd = ends
 	c.delCnt = counts
 	// Fold the run's global record-count decrement into one atomic (spec 2064/16 slice 3): the
 	// members went through DeleteKindNoCount to keep the contended s.count line off the hot path.
 	if total > 0 {
 		c.srv.store.AddCount(-int64(total))
 	}
-	// Defer the ordered-index splice off the stripe-locked reply path (spec 2064/16 slice 2).
-	c.srv.store.CollRemovePacked(buf, ends, kindSetMember)
 	if total > 0 {
 		n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, -int64(total))
 		if !ok || n <= 0 {
@@ -278,7 +271,6 @@ func (c *connState) cmdSRemCoalescedPart(skey []byte, elems [][]byte, bnd []int,
 			// vector slot's arena offset is still resolvable; a partition with no vector is a no-op.
 			c.srv.store.CollRandRemove(base, mk, kindSetMember)
 			if c.srv.store.DeleteKind(mk, kindSetMember) {
-				c.srv.store.CollRemove(mk)
 				removed++
 			}
 			mu.Unlock()

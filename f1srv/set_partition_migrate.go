@@ -166,9 +166,10 @@ func (c *connState) engageSetPartitions(skey []byte, newP int) {
 			continue
 		}
 		nk := c.partMemberKey(skey, member, newPart, newP)
-		if created, err := c.srv.store.PutKind(nk, nil, kindSetMember); err == nil && created {
-			c.srv.store.CollInsert(nk, kindSetMember)
-		}
+		// Create the new-layout hash row only; the set type no longer indexes members in the ordered
+		// index (spec 2064/f1_rewrite_ltm/20), and Phase 4 rebuilds the new partition draw vectors
+		// eagerly from these rows.
+		_, _ = c.srv.store.PutKind(nk, nil, kindSetMember)
 	}
 
 	// Phase 2: stamp the header with newP (preserving count and encoding) and publish.
@@ -188,9 +189,7 @@ func (c *connState) engageSetPartitions(skey []byte, newP int) {
 			continue
 		}
 		ok := c.partMemberKey(skey, member, oldPart, oldP)
-		if c.srv.store.DeleteKind(ok, kindSetMember) {
-			c.srv.store.CollRemove(ok)
-		}
+		c.srv.store.DeleteKind(ok, kindSetMember)
 	}
 
 	// Phase 4: rebuild the new layout's dense draw vectors eagerly from the re-homed members rather

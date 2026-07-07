@@ -941,10 +941,14 @@ func (c *connState) dropKeyLocked(key []byte) bool {
 		c.srv.store.DeleteKind(key, kindHashMeta)
 		return true
 	case keySet:
-		c.dropCollIndex(c.setPrefix(key), kindSetMember)
+		// The set type no longer indexes its members in the ordered index (spec 2064/f1_rewrite_ltm/20),
+		// so its rows are dropped by walking the dense member vector, not the CollScan the shared
+		// dropCollIndex runs. A CollScan-driven drop would find nothing here and leak every member row,
+		// which a later SISMEMBER (a point ExistsKind on that row) would still answer present.
+		c.dropSetMembersLocked(key, c.partitionsFor(key))
 		c.srv.store.DeleteKind(key, kindSetMeta)
 		// Drop the set's dense member vector alongside its rows (spec 2064/18 5.3). setPrefix
-		// is rebuilt here because dropCollIndex already consumed the shared pbuf; CollRandDrop
+		// is rebuilt here because dropSetMembersLocked already consumed the shared pbuf; CollRandDrop
 		// consumes this fresh prefix synchronously, so the two never overlap.
 		c.srv.store.CollRandDrop(c.setPrefix(key))
 		// Clear any partition registry entry so a set recreated under this name starts fresh at P=1
@@ -991,6 +995,48 @@ func (c *connState) dropCollIndex(prefix []byte, kind byte) {
 			c.srv.store.CollRemove(k)
 		}
 		scan = keys
+	}
+}
+
+// dropSetMembersLocked deletes every kindSetMember row of set skey, sourcing the member keys from the
+// dense member vector rather than the ordered index. The set type no longer indexes its members there
+// (spec 2064/f1_rewrite_ltm/20), so the CollScan-driven dropCollIndex would surface nothing for a set
+// and leak every member row; a later SISMEMBER (a point ExistsKind on that row) would then still find
+// the set present. It walks the vector in bounded batches, per partition when p>1, deleting each row
+// as it goes; the vector itself is torn down by the CollRandDrop the caller runs next. The caller holds
+// the set's stripe lock, so the layout is frozen and one drained downward walk per partition yields
+// every member once, and DeleteKind touches only the store row, never the vector, so the walk stays
+// stable under it. Member keys are arena subslices, valid past the delete of their store row.
+func (c *connState) dropSetMembersLocked(skey []byte, p int) {
+	scan := make([][]byte, 0, hashScanBatch)
+	if p > 1 {
+		base := c.partScanBase(skey)
+		for part := 0; part < p; part++ {
+			hi := -1
+			for {
+				keys, next := c.srv.store.SetPartVecScanDown(base, p, part, hi, hashScanBatch, scan[:0])
+				for _, k := range keys {
+					c.srv.store.DeleteKind(k, kindSetMember)
+				}
+				if next == 0 {
+					break
+				}
+				hi = next
+			}
+		}
+		return
+	}
+	prefix := c.setPrefix(skey)
+	hi := -1
+	for {
+		keys, next := c.srv.store.SetVecScanDown(prefix, hi, hashScanBatch, scan[:0])
+		for _, k := range keys {
+			c.srv.store.DeleteKind(k, kindSetMember)
+		}
+		if next == 0 {
+			break
+		}
+		hi = next
 	}
 }
 

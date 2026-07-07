@@ -1573,11 +1573,12 @@ func (c *connState) rdbWriteValue(key []byte, v rdbValue) error {
 				return err
 			}
 			if isNew {
-				c.srv.store.CollInsert(mk, kindSetMember)
-				// Route the member into the set's dense vector (spec 2064/18 5.1). RESTORE always
-				// lands on an absent key (REPLACE drops the prior key first, which drops its vector),
-				// so this no-ops until a later draw builds the vector, but wiring it keeps the add-site
-				// list exhaustive. prefix is pbuf; mk is kbuf; the two never collide.
+				// Route the member into the set's dense vector, the authoritative membership structure
+				// for the set type (spec 2064/f1_rewrite_ltm/20); the set type no longer indexes members
+				// in the ordered index. RESTORE always lands on an absent key (REPLACE drops the prior key
+				// first, which drops its vector), so the first member builds the vector by scanning an
+				// empty set-prefix range and each member appends onto it. prefix is pbuf; mk is kbuf; the
+				// two never collide.
 				c.srv.store.CollRandInsert(prefix, mk, kindSetMember)
 				count++
 				enc = foldSetEnc(enc, m, count)

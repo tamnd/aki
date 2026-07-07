@@ -128,7 +128,7 @@ func (c *connState) copyRows(src, dst []byte) {
 		// physically laid out at the source's partition count. partitionsFor reads the registry, not
 		// the header, so dst must be engaged at srcP to route that layout (cmdCopy's REPLACE drop
 		// already unengaged any prior dst).
-		srcP := c.srv.partitionP(src)
+		srcP := c.partitionsFor(src)
 		c.copySetFamily(src, dst, srcP, c.setVectorFeeder(dst, srcP))
 		c.copyHeader(src, dst, kindSetMeta)
 		if srcP > 1 {
@@ -203,9 +203,10 @@ func (c *connState) copyIndexedFamily(src, dst []byte, kind byte) {
 // scan; only the set type is being lifted off the skip-list. The caller holds both keys' stripe
 // locks, so the source layout is frozen and one drained walk per partition yields every live member
 // once. Each member is re-keyed under dst's key-header (its bytes past the header carry over
-// verbatim, partition byte and all), published with no value (set members carry none), inserted into
-// the ordered index (kept consistent while set writers still maintain it), and handed to feed so the
-// destination's dense vector is built as SMEMBERS-authoritative. srcP is the source's physical
+// verbatim, partition byte and all), published with no value (set members carry none), and handed to
+// feed so the destination's dense vector is built as SMEMBERS-authoritative. The set type no longer
+// indexes members in the ordered index (spec 2064/f1_rewrite_ltm/20), so the copy does not either.
+// srcP is the source's physical
 // partition count, which copyRows also engages dst at, so one count drives both the source read and
 // the destination write. The source rows stay in place, so a family scan of src never sees the copies.
 func (c *connState) copySetFamily(src, dst []byte, srcP int, feed func(newKey, suffix []byte)) {
@@ -220,7 +221,6 @@ func (c *connState) copySetFamily(src, dst []byte, srcP int, feed func(newKey, s
 		if _, err := c.srv.store.PutKind(nkbuf, nil, kindSetMember); err != nil {
 			continue
 		}
-		c.srv.store.CollInsert(nkbuf, kindSetMember)
 		if feed != nil {
 			feed(nkbuf, suffix)
 		}
