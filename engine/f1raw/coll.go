@@ -28,6 +28,21 @@ import (
 // branch. A separated record never mutates, so the cold read needs no seqlock.
 func (s *Store) GetKind(key, dst []byte, kind byte) ([]byte, bool) {
 	h := hash(key)
+	if s.segmented {
+		// Pin the operation to the live epoch so a migrator cannot free the segment holding
+		// this element's bytes while the read resolves and copies them (arena.go M2, doc 21
+		// section 7 D18), the collection twin of the string Get guard. Only on the opt-in
+		// segmented path; the default in-memory element read below is unchanged.
+		g := s.pin()
+		off, _, _, _, found := s.find(key, h, kind)
+		if !found {
+			g.unpin()
+			return dst[:0], false
+		}
+		v, ok := s.readValueByAddr(off, dst)
+		g.unpin()
+		return v, ok
+	}
 	off, _, _, _, found := s.find(key, h, kind)
 	if !found {
 		return dst[:0], false
@@ -418,6 +433,14 @@ func (s *Store) CollRemoveMany(keys [][]byte) {
 // is the bounded cursor the whole-collection reads (HGETALL, HKEYS, HVALS, HSCAN)
 // stream through, so they never materialize the collection.
 func (s *Store) CollScan(prefix, after []byte, limit int, dst [][]byte) (keys [][]byte, last []byte) {
+	if s.segmented {
+		// Hold the epoch for the span of this one bounded batch so a migrator cannot free a
+		// segment holding an element this batch resolves keyAt against (doc 21 section 7 D20).
+		// The window is bounded by limit, and a fresh CollScan for the next batch republishes,
+		// so a long enumeration never starves reclamation. Only on the opt-in segmented path.
+		g := s.pin()
+		defer g.unpin()
+	}
 	offs, last := s.oidx.Load().scanBatch(prefix, after, limit, make([]uint64, 0, limit))
 	for _, off := range offs {
 		dst = append(dst, s.keyAt(off))

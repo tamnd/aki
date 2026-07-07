@@ -156,6 +156,19 @@ type Store struct {
 	ovTail    atomic.Uint64
 	segMu     sync.Mutex
 
+	// The reader epoch framework (epoch.go), milestone M2 of the collection cold-record
+	// tiering plan (spec 2064/21 section 7). It gates a drained segment's return to the free
+	// list on reader quiescence so a migrator can free a segment without pulling live bytes out
+	// from under a reader that loaded the old address before the migration flip. ep holds the
+	// global epoch and the per-worker published-epoch slots; a segmented read pins a slot for
+	// the operation (Get, GetKind, the cursor batch). retSegs holds segments the migrator has
+	// drained and retired but that are not yet safe to reuse: each carries the epoch it was
+	// retired at, and it returns to freeSegs only once the safe epoch passes that epoch
+	// (reclaimLocked). Both are engaged only on the segmented path; a non-segmented store never
+	// reclaims, so ep stays empty and retSegs stays nil.
+	ep      epoch
+	retSegs []uint64
+
 	// topCount tracks the live top-level keys, the subset of records whose kind topKind
 	// admits: a plain string record and a collection header row, not element rows, expire
 	// sidecars, or stream PEL rows. It is maintained at exactly the points count is, so it
@@ -547,6 +560,23 @@ func (s *Store) find(key []byte, h uint64, kind byte) (off uint64, b *bucket, sl
 // a reader of a different key.
 func (s *Store) Get(key, dst []byte) ([]byte, bool) {
 	h := hash(key)
+	if s.segmented {
+		// A segmented store can free and reuse an arena segment (arena.go M2), so a read
+		// must publish its epoch for the span of the lookup and the value copy: that pins the
+		// segment holding the record's bytes against a concurrent migrator freeing it under the
+		// read (doc 21 section 7, D18). The pin is two relaxed stores and only on the opt-in
+		// segmented path; the default in-memory store below never reclaims and never pins, so
+		// its point path is unchanged.
+		g := s.pin()
+		off, _, _, _, found := s.find(key, h, stringKind)
+		if !found {
+			g.unpin()
+			return dst[:0], false
+		}
+		v, ok := s.readValueByAddr(off, dst)
+		g.unpin()
+		return v, ok
+	}
 	off, _, _, _, found := s.find(key, h, stringKind)
 	if !found {
 		return dst[:0], false
