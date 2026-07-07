@@ -189,6 +189,30 @@ func (v *memberVec) remove(off uint64) bool {
 	return true
 }
 
+// retierSlot repoints the slot holding oldOff to newOff in place, for a member whose record
+// changed tiers: its identity and membership are unchanged, only its arena address moved to a
+// cold-tagged region offset (spec 2064/f1_rewrite_ltm/22 section 3). It is deliberately not a
+// remove-then-add: a swap-remove would relocate the tail member into the hole and change another
+// member's slot, but a retier touches exactly one member's address and must leave every other
+// slot's index byte-identical so a concurrent lock-free draw that indexed a different slot is
+// unaffected, and so the density invariant (len(slots) == len(back), back[slots[i]] == i) still
+// holds. The atomic store on the slot pairs with the draw's atomic load, the same discipline
+// remove's swap store and add's capacity-reuse store follow, so a draw racing the retier observes
+// either the old resident offset or the new cold address and section 5 shows both resolve to valid
+// bytes. It reports false when oldOff is absent, which a racing SREM that already dropped the member
+// produces and the caller treats as nothing to repair.
+func (v *memberVec) retierSlot(oldOff, newOff uint64) bool {
+	i, ok := v.back[oldOff]
+	if !ok {
+		return false
+	}
+	atomic.StoreUint64(&v.slots[i], newOff)
+	delete(v.back, oldOff)
+	v.back[newOff] = i
+	v.publish()
+	return true
+}
+
 // vecMap is one shard's immutable prefix-to-vector map snapshot. A structural change (a new
 // set's first vector, a dropped set) copies it under the write mutex and swaps the pointer, so
 // a lock-free draw loads a consistent map without a lock and a writer never mutates a map a
@@ -445,7 +469,7 @@ func (s *Store) SetVecScanDown(prefix []byte, hi, limit int, dst [][]byte) ([][]
 		lo = 0
 	}
 	for i := upper - 1; i >= lo; i-- {
-		dst = append(dst, s.keyAt(atomic.LoadUint64(&vs.s[i])))
+		dst = append(dst, s.keyAtTiered(atomic.LoadUint64(&vs.s[i]), nil))
 	}
 	return dst, lo
 }
@@ -464,7 +488,7 @@ func (s *Store) SetVecAt(prefix []byte, idx int) (key []byte, ok bool) {
 	if idx < 0 || idx >= len(vs.s) {
 		return nil, false
 	}
-	return s.keyAt(atomic.LoadUint64(&vs.s[idx])), true
+	return s.keyAtTiered(atomic.LoadUint64(&vs.s[idx]), nil), true
 }
 
 // SetPartVecLen returns partition part's live member count for the P-partition set whose
@@ -500,7 +524,7 @@ func (s *Store) SetPartVecScanDown(base []byte, p, part, hi, limit int, dst [][]
 		lo = 0
 	}
 	for i := upper - 1; i >= lo; i-- {
-		dst = append(dst, s.keyAt(atomic.LoadUint64(&vs.s[i])))
+		dst = append(dst, s.keyAtTiered(atomic.LoadUint64(&vs.s[i]), nil))
 	}
 	return dst, lo
 }
@@ -529,7 +553,7 @@ func (s *Store) CollRandSelect(prefix []byte, r uint64) (key []byte, ok bool) {
 		if n == 0 {
 			return nil, false
 		}
-		return s.keyAt(atomic.LoadUint64(&vs.s[drawIndexWord(r, n)])), true
+		return s.keyAtTiered(atomic.LoadUint64(&vs.s[drawIndexWord(r, n)]), nil), true
 	}
 
 	// No vector yet: build it under the write mutex. Re-check after taking the mutex so two
@@ -546,7 +570,7 @@ func (s *Store) CollRandSelect(prefix []byte, r uint64) (key []byte, ok bool) {
 	if n == 0 {
 		return nil, false
 	}
-	return s.keyAt(atomic.LoadUint64(&vs.s[drawIndexWord(r, n)])), true
+	return s.keyAtTiered(atomic.LoadUint64(&vs.s[drawIndexWord(r, n)]), nil), true
 }
 
 // CollRandSelectRemove draws a uniform random live member and swap-removes it from the
@@ -574,7 +598,7 @@ func (s *Store) CollRandSelectRemove(prefix []byte) (key []byte, ok bool) {
 	off := v.slots[i]
 	v.remove(off)
 	sh.mu.Unlock()
-	return s.keyAt(off), true
+	return s.keyAtTiered(off, nil), true
 }
 
 // CollRandEnsure builds the vector for prefix if it does not exist yet, so a caller can warm

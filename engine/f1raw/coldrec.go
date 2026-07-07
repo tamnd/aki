@@ -133,6 +133,26 @@ func (s *Store) MigrateToCold(key []byte, kind byte) bool {
 		return false
 	}
 	h := hash(key)
+	if s.isVecMember(kind) {
+		// A set member row rides Option A (retier.go): the move flips the index entry and repairs the
+		// dense member vector's cached offset in place under the vector shard mutex, so the vector never
+		// holds a stale resident offset a lock-free draw could read past a reclaimed segment (spec
+		// 2064/f1_rewrite_ltm/22). Re-probe on a lost flip until the record is cold or gone, mirroring
+		// the string loop below; under no concurrency (the hand path's usual caller) this runs once.
+		for {
+			off, _, _, _, found := s.find(key, h, kind)
+			if !found {
+				return false
+			}
+			if off&tierBit != 0 {
+				return true // already cold
+			}
+			if s.migrateVecMember(key, kind, off) {
+				return true
+			}
+			// Lost the flip to a concurrent writer; re-probe the new state.
+		}
+	}
 	for {
 		off, b, slot, word, found := s.find(key, h, kind)
 		if !found {
@@ -250,6 +270,39 @@ func (s *Store) markColdRecDead(coldOff uint64) {
 		return
 	}
 	s.cold.dead.Add(uint64(binary.LittleEndian.Uint32(p[8:])))
+}
+
+// readColdKey resolves the member key of the cold frame at region offset coldOff into dst, the
+// key-only analog of readColdValue. It reads the frame header for klen, then the klen key bytes at
+// coldOff + frameHdrSize (D5: the frame stores the full key). coldFrameMatches already reads a
+// frame's key the same way to compare it; this returns the bytes instead. The region is served by
+// pread against an append-only file, not a stable mapping, so a cold key has no arena slice to
+// alias and the returned bytes live in dst, which the caller owns.
+func (s *Store) readColdKey(coldOff uint64, dst []byte) []byte {
+	var hdr [frameHdrSize]byte
+	if _, err := s.recs.readInto(coldOff, frameHdrSize, hdr[:]); err != nil {
+		return dst[:0]
+	}
+	klen := int(binary.LittleEndian.Uint16(hdr[frameOffKlen:]))
+	k, err := s.recs.readInto(coldOff+frameHdrSize, klen, dst)
+	if err != nil {
+		return dst[:0]
+	}
+	return k
+}
+
+// keyAtTiered resolves an index address to its member key across tiers, for the set member vector
+// whose slots can hold a cold address after a retier (spec 2064/f1_rewrite_ltm/22 section 6). The
+// resident branch is keyAt verbatim, a zero-copy arena subslice, so the in-memory-fit draw is
+// unchanged and pays one not-taken branch on tierBit. The cold branch reads the frame's key bytes
+// out of the cold record region into dst and returns that copy; a nil dst has readColdKey allocate a
+// fresh buffer the caller owns, which is the LTM-only cost paid on a member that has spilled, far
+// below the pread that dominates it.
+func (s *Store) keyAtTiered(off uint64, dst []byte) []byte {
+	if off&tierBit == 0 {
+		return s.keyAt(off)
+	}
+	return s.readColdKey(off&^tierBit, dst)
 }
 
 // readValueByAddr resolves a value from a logical index address into dst, branching on the
