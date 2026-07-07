@@ -63,14 +63,25 @@ func isTopKind(kind byte) bool {
 //     followed through the tier-aware primary index. The resident hot-window overlay holds element
 //     bytes in memory rather than arena offsets, so it never dangles across a migration, and the
 //     list header row stays a top-level resident key.
+//   - Stream entry, group, consumer, and PEL: every stream row is read either by an explicit key
+//     through GetKind (entry values in emitStreamEntry, group control rows, consumer rows, and PEL
+//     rows) or through the ordered entry index by key and rank (CollScan, CollSelectAt, CollRankOf),
+//     never through a cached arena offset. XRANGE, XREVRANGE, XREAD, and the group readers all take
+//     keys from the ordered index and then read each entry with a by-key GetKind, so a migrated row
+//     is followed across the tier. Admitting all four kinds keeps a stream that mixes heavy entry
+//     volume with consumer-group state fully drainable, so no pinned group or PEL row blocks a
+//     segment drain. The stream header row stays a top-level resident key.
 //
-// The remaining element kinds are excluded until each is audited the same way. The set member row
-// is read through the dense member vector, which caches a raw arena offset and reads the member key
-// from it (engine randvec.go), so it cannot re-resolve by key and needs the heavier Option A retier
-// hook before it can migrate. The stream element kinds await their own audit.
+// The set member row is the one element kind still excluded: it is read through the dense member
+// vector, which caches a raw arena offset and reads the member key from it (engine randvec.go), so
+// it cannot re-resolve by key and needs the heavier Option A retier hook before it can migrate.
 func isMigratableKind(kind byte) bool {
-	return kind == kindHashField || kind == kindZsetMember || kind == kindZsetScore ||
-		kind == kindListElem
+	switch kind {
+	case kindHashField, kindZsetMember, kindZsetScore, kindListElem,
+		kindStreamEntry, kindStreamGroup, kindStreamConsumer, kindStreamPEL:
+		return true
+	}
+	return false
 }
 
 // keyKindName maps a resolved key type to the Redis type name SCAN's TYPE filter compares
