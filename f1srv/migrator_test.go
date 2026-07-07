@@ -274,12 +274,21 @@ func TestServerMigratorServesStreamBeyondArena(t *testing.T) {
 	cmd(t, rw, "XLEN", "st")
 	expect(t, rw, ":"+strconv.Itoa(n))
 
-	// Point path: a single-ID XRANGE reads each entry back, most now cold, all exact. One entry
-	// serializes as [[id [f val]]].
-	for i := 0; i < n; i++ {
+	// Point path: a single-ID XRANGE reads a spread of entries back, most now cold, all exact. One
+	// entry serializes as [[id [f val]]]. A single-ID XRANGE resolves its bounds through the ordered
+	// entry index by rank, whose cold-tier descent re-resolves each probed node through the primary
+	// index, so sampling a spread of IDs proves the tier-following point read without paying an
+	// O(n log n) rank search for every one of the n entries (the full enumeration below covers them
+	// all in one O(n) forward scan).
+	sample := make([]int, 0, 64)
+	for i := 0; i < n; i += n / 64 {
+		sample = append(sample, i)
+	}
+	sample = append(sample, n-1)
+	for _, i := range sample {
 		cmd(t, rw, "XRANGE", "st", idOf(i), idOf(i))
 	}
-	for i := 0; i < n; i++ {
+	for _, i := range sample {
 		want := "[[" + idOf(i) + " [f " + migVal(i, val) + "]]]"
 		if got := readReplyDeep(t, rw); got != want {
 			t.Fatalf("XRANGE st %s = %q, want %q", idOf(i), got, want)
