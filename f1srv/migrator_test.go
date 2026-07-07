@@ -189,6 +189,57 @@ func TestServerMigratorServesZsetBeyondArena(t *testing.T) {
 	}
 }
 
+// TestServerMigratorServesListBeyondArena is the D22 Option B gate for the list at the server level:
+// with the list element kind admitted to the migrator (isMigratableKind), a list whose element rows
+// outgrow the resident arena is served correctly over the wire, most rows now cold. It pushes far
+// more large elements than the small arena can hold, so the migrator sinks full segments of element
+// rows into the cold record region as they fill while the list header row stays resident, and every
+// RPUSH must still succeed (D12 backpressure waits on the migrator rather than erroring). Then LINDEX
+// reads each element back across the tier through the primary index, and a single LRANGE 0 -1 re-reads
+// every element in order. The list keeps no secondary structure at all, so each element read is a
+// by-key GetKind on its positional key, which follows a migrated row across the tier. Without the
+// admission the element rows cannot migrate, the arena fills, and RPUSH errors partway through the load.
+func TestServerMigratorServesListBeyondArena(t *testing.T) {
+	rw, cleanup := dialMigratorServer(t)
+	defer cleanup()
+
+	// One list, many 200-byte elements: the element rows are several arenas' worth of record bytes and
+	// cannot all stay resident, while the single header row pins at most one segment. Pipeline the
+	// pushes so the load is not one round trip per element.
+	const n = 20000
+	val := strings.Repeat("x", 200)
+	for i := 0; i < n; i++ {
+		cmd(t, rw, "RPUSH", "l", migVal(i, val))
+	}
+	for i := 0; i < n; i++ {
+		expect(t, rw, ":"+strconv.Itoa(i+1)) // RPUSH returns the new length after each append
+	}
+
+	// Point path: LINDEX reads each element back by position, most now cold, all exact.
+	for i := 0; i < n; i++ {
+		cmd(t, rw, "LINDEX", "l", strconv.Itoa(i))
+	}
+	for i := 0; i < n; i++ {
+		want := "$" + migVal(i, val)
+		if got := readReply(t, rw); got != want {
+			t.Fatalf("LINDEX l %d = %q, want %q", i, got, want)
+		}
+	}
+
+	// Enumeration path: one LRANGE 0 -1 returns every element in push order, re-reading each from
+	// whichever tier holds it.
+	cmd(t, rw, "LRANGE", "l", "0", "-1")
+	got := readArray(t, rw)
+	if len(got) != n {
+		t.Fatalf("LRANGE returned %d elements, want %d", len(got), n)
+	}
+	for i := 0; i < n; i++ {
+		if got[i] != migVal(i, val) {
+			t.Fatalf("LRANGE element %d = %q, want %q", i, got[i], migVal(i, val))
+		}
+	}
+}
+
 // TestServerMigratorConfigError checks that asking for the migrator without the segmented arena
 // it needs is a clean configuration error surfaced by Listen, not a panic from EnableMigrator.
 func TestServerMigratorConfigError(t *testing.T) {
