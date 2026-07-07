@@ -151,6 +151,13 @@ func (s *Store) drainSegment(si uint64) {
 		return
 	}
 	seg := &s.segs[si]
+	if seg.live.Load() == 0 {
+		// Already empty (every record deleted or drained on an earlier pass): retire it without
+		// re-walking. The walk would re-find each now-cold record through the tier-aware index,
+		// paying a cold-frame probe per record for nothing, so skip straight to the retire.
+		s.retireSegment(si)
+		return
+	}
 	limit := seg.base + s.segSize
 	if a := seg.alloc.Load(); a < limit {
 		limit = a
@@ -163,8 +170,15 @@ func (s *Store) drainSegment(si uint64) {
 		s.drainRecord(off)
 		off += recBytes
 	}
-	if seg.live.Load() == 0 {
+	if live := seg.live.Load(); live == 0 {
 		s.retireSegment(si)
+	} else {
+		// The segment still holds live bytes the migrator cannot move: records of a kind the policy
+		// does not admit (a collection header row stays resident while its fields migrate). Record
+		// the residue so pickDrainTarget skips this segment until a delete lowers its live below the
+		// mark, rather than re-picking the emptiest-but-unretireable segment every pass and starving
+		// the field-bearing segments that can actually drain and free space.
+		seg.stuck.Store(live)
 	}
 }
 
@@ -323,6 +337,14 @@ func (s *Store) pickDrainTarget() (uint64, bool) {
 			continue // already drained and retired, awaiting reader quiescence
 		}
 		live := seg.live.Load()
+		if live > 0 && live == seg.stuck.Load() {
+			// A prior drain already sank every migratable record here and left only a non-migratable
+			// residue (a resident collection header row), so re-picking it just re-walks a segment
+			// that can never retire, starving the field-bearing segments that can. It re-qualifies
+			// once a delete (unlinkResident) lowers live below the stuck mark, so this skips it only
+			// while the residue is genuinely unretireable, not permanently.
+			continue
+		}
 		if bestLive < 0 || live < bestLive {
 			bestLive = live
 			best = si
