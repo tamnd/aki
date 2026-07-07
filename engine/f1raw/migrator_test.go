@@ -200,6 +200,76 @@ func TestMigratorLeavesCollectionRecordsResident(t *testing.T) {
 	}
 }
 
+// TestPickDrainTargetSkipsPinnedSegment is the regression gate for the pinned-segment drain
+// livelock. A non-migratable record (a collection header row) pins its segment: the migrator can
+// never move it, so that segment can never retire and keeps a small live residue. Once its
+// migratable records have sunk cold it becomes the emptiest full segment, so the emptiest-first
+// pickDrainTarget kept re-selecting it and re-walking a segment that can never free space, starving
+// the string-full segments that could. The fix records the futile-drain residue (segment.stuck) and
+// skips a segment while its live still equals that mark. This drives the two code paths directly and
+// synchronously: fill seg0 with a pinning record plus strings and seg1 with strings only, drain seg0
+// so it stuck-pins, then assert the next pickDrainTarget steps over seg0 to the drainable seg1.
+// Without the fix pickDrainTarget returns seg0 (the emptiest) forever and seg1 never drains.
+func TestPickDrainTargetSkipsPinnedSegment(t *testing.T) {
+	s := churnSegColdStore(t, 5)
+	// Leave migratableKind at its nil default: only string records migrate, so the collection-kind
+	// record below is exactly the non-migratable resident that pins its segment.
+	const collKind = byte(1)
+
+	// seg0 gets one non-migratable collection record at its base, then strings fill the rest. seg1
+	// gets strings only. After this the current segment is seg2, so seg0 and seg1 are both full,
+	// non-current drain candidates.
+	seg0 := s.curSeg.Load()
+	pinKey := []byte("pinned-coll-header")
+	if _, err := s.PutKind(pinKey, []byte("header-value"), collKind); err != nil {
+		t.Fatalf("PutKind pin: %v", err)
+	}
+	fillSegBig(t, s, "a") // fills the rest of seg0 with strings
+	seg1, _ := fillSegBig(t, s, "b")
+	if seg1 == seg0 {
+		t.Fatalf("seg1 %d did not advance past seg0 %d", seg1, seg0)
+	}
+
+	// Drain seg0: its strings sink cold, the collection record cannot move, so seg0 keeps a nonzero
+	// live residue, does not retire, and records that residue as its stuck mark.
+	s.drainSegment(seg0)
+	live := s.segs[seg0].live.Load()
+	if live <= 0 {
+		t.Fatalf("seg0 live=%d after drain; want the pinning record's bytes to remain", live)
+	}
+	if stuck := s.segs[seg0].stuck.Load(); stuck != live {
+		t.Fatalf("seg0 stuck=%d after a futile drain; want it to equal the residue live=%d", stuck, live)
+	}
+	// seg0 now has the fewest live bytes (just the pinning record), so the plain emptiest-first pick
+	// would choose it. The stuck skip must step over it to seg1, which can actually drain and free.
+	if seg1Live := s.segs[seg1].live.Load(); seg1Live <= live {
+		t.Fatalf("seg1 live=%d is not above seg0 residue %d; test would not exercise the skip", seg1Live, live)
+	}
+	got, ok := s.pickDrainTarget()
+	if !ok {
+		t.Fatal("pickDrainTarget found no target; want seg1")
+	}
+	if got == seg0 {
+		t.Fatal("pickDrainTarget returned the stuck-pinned seg0; the skip did not engage, so field segments starve")
+	}
+	if got != seg1 {
+		t.Fatalf("pickDrainTarget returned seg %d; want the drainable seg1 %d", got, seg1)
+	}
+
+	// Draining the chosen segment frees space, closing the loop: seg1 retires while seg0 stays pinned.
+	s.drainSegment(got)
+	if l := s.segs[seg1].live.Load(); l != 0 {
+		t.Fatalf("seg1 live=%d after drain; want it fully drained and retired", l)
+	}
+
+	// A delete that lowers seg0's live below its stuck mark must re-enable it as a target, so the
+	// residue is skipped only while it is genuinely unretireable, not permanently blacklisted.
+	s.DeleteKind(pinKey, collKind)
+	if l := s.segs[seg0].live.Load(); l >= live {
+		t.Fatalf("seg0 live=%d after deleting the pin; want it below the old residue %d", l, live)
+	}
+}
+
 // setWithMigratorRetry writes one record, waiting on the migrator when the arena is momentarily full.
 // The migrator runs on its own goroutine, so a burst of writes can outrun its draining and hit
 // ErrFull before a segment frees; this signals the migrator and retries with a short backoff, which
