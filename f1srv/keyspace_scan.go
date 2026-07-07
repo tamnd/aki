@@ -43,26 +43,34 @@ func isTopKind(kind byte) bool {
 // floor. A kind is tier-safe only when every one of its read, write, and delete paths follows a
 // record across the tier boundary rather than trusting a cached resident address.
 //
-// The hash field row and both zset element rows qualify today. Each has only ordered-index
-// secondary structures, whose nodes re-resolve their address through the tier-aware primary index
-// on each access (spec 2064/21 D22 Option B), so a read follows a migrated element from the cold
-// frame with no per-node migration hook.
+// The hash field row, both zset element rows, and the list element row qualify today. Each follows
+// a migrated element across the tier boundary with no cached resident address, so no per-record
+// migration hook is needed.
 //
-//   - Hash field: its sole index is the ordered element index, so HGET, HGETALL, HSCAN, and
-//     HRANDFIELD all resolve a migrated field from the cold frame. The header row stays resident.
+//   - Hash field: its sole index is the ordered element index, whose nodes re-resolve their address
+//     through the tier-aware primary index on each access (spec 2064/21 D22 Option B), so HGET,
+//     HGETALL, HSCAN, and HRANDFIELD all resolve a migrated field from the cold frame. The header
+//     row stays resident.
 //   - Zset member and score: the two rows are the type's whole storage, and every access is by key
 //     or through an ordered index. Point reads (ZSCORE, ZMSCORE) and deletes (ZREM) go through the
 //     primary index by key; range and rank reads take keys from the ordered index inline cache
 //     (CollScan, CollSelectAt, CollRankOf) and then read each value with a by-key GetKind, so a
 //     migrated member or score row is followed across the tier with no cached arena offset. The
 //     zset header row stays a top-level resident key.
+//   - List element: the list keeps no secondary structure at all. Every element read is by
+//     positional key (listElemKey through GetKind with kindListElem), and every edit goes through
+//     GetKind/TakeKind/PutKind/DeleteKind on that positional key, so a migrated element row is
+//     followed through the tier-aware primary index. The resident hot-window overlay holds element
+//     bytes in memory rather than arena offsets, so it never dangles across a migration, and the
+//     list header row stays a top-level resident key.
 //
 // The remaining element kinds are excluded until each is audited the same way. The set member row
 // is read through the dense member vector, which caches a raw arena offset and reads the member key
 // from it (engine randvec.go), so it cannot re-resolve by key and needs the heavier Option A retier
-// hook before it can migrate. The list and stream element kinds await their own audits.
+// hook before it can migrate. The stream element kinds await their own audit.
 func isMigratableKind(kind byte) bool {
-	return kind == kindHashField || kind == kindZsetMember || kind == kindZsetScore
+	return kind == kindHashField || kind == kindZsetMember || kind == kindZsetScore ||
+		kind == kindListElem
 }
 
 // keyKindName maps a resolved key type to the Redis type name SCAN's TYPE filter compares
