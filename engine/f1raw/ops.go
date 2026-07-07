@@ -26,6 +26,30 @@ func (s *Store) Incr(key []byte, delta int64) (int64, error) {
 	for {
 		off, _, _, _, found := s.find(key, h, stringKind)
 		if found {
+			if off&tierBit != 0 {
+				// The counter migrated cold. Its frame is immutable, so read the current
+				// value from the record region, add, and republish a fresh resident record,
+				// bringing the counter back up (doc 21 section 9). A lost publish race just
+				// reloops and re-reads.
+				var rbuf [24]byte
+				cur, cok := s.readColdValue(off&^tierBit, rbuf[:0])
+				if !cok {
+					return 0, ErrNotInt
+				}
+				n0, perr := parseInt(cur)
+				if perr != nil {
+					return 0, ErrNotInt
+				}
+				n2, oerr := addChecked(n0, delta)
+				if oerr != nil {
+					return 0, oerr
+				}
+				b := strconv.AppendInt(buf[:0], n2, 10)
+				if err := s.publish(key, b, h, stringKind, 0); err != nil {
+					return 0, err
+				}
+				return n2, nil
+			}
 			n, ok := s.incrInPlace(off, delta)
 			if !ok {
 				return 0, ErrNotInt
