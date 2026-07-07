@@ -212,6 +212,12 @@ func (s *Store) advanceSeg(observed uint64) bool {
 		s.freeSegs = s.freeSegs[:len(s.freeSegs)-1]
 	}
 	s.curSeg.Store(ni)
+	// A segment just filled and the current pointer moved to a new one: signal the migrator so it
+	// checks the fill level and drains cold if it crossed the high-water mark. This is the once-per-
+	// segment wake (D14), off the per-record allocation path, and it is a no-op unless the migrator
+	// is engaged. It runs while segMu is held, but signalMigrator only does a non-blocking channel
+	// send, so it never blocks the advance.
+	s.signalMigrator()
 	return true
 }
 
