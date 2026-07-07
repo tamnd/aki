@@ -651,8 +651,12 @@ func (s *Store) Set(key, val []byte) error {
 	// Inline path. The in-place fast update requires the existing record to be inline
 	// too: a separated record's value cell is a 12-byte pointer, so a small inline
 	// value must not be memcpy'd over it. When the target is separated, fall through
-	// to publish, which swaps the entry to a fresh inline record.
-	if off, _, _, _, found := s.find(key, h, stringKind); found && !s.isSep(off) && uint64(len(val)) <= s.vcapBytes(off) {
+	// to publish, which swaps the entry to a fresh inline record. A cold target
+	// (tierBit set) also falls through: its frame lives in the record region, not the
+	// arena, so isSep and vcapBytes would index the arena out of bounds, and a write
+	// to a cold key brings it back up rather than mutating the immutable frame (doc 21
+	// section 9), which publish handles.
+	if off, _, _, _, found := s.find(key, h, stringKind); found && off&tierBit == 0 && !s.isSep(off) && uint64(len(val)) <= s.vcapBytes(off) {
 		s.inPlace(off, val)
 		return nil
 	}
@@ -734,7 +738,21 @@ outer:
 					continue
 				}
 				a := w & addrMask
-				if s.recordMatches(a, key, kind) {
+				if a&tierBit != 0 {
+					// A migrated cold record for this key. Its frame in the record region is
+					// immutable, so it can never be updated in place: swap the entry to our
+					// fresh resident record, bringing the record back up to the arena, and
+					// mark the old cold frame dead (doc 21 section 9's write-brings-up). A tag
+					// collision (the frame holds a different key) just falls through to the
+					// next slot.
+					if s.coldFrameMatches(a&^tierBit, key, kind) {
+						if b.slots[i].CompareAndSwap(w, newWord) {
+							s.markColdRecDead(a &^ tierBit)
+							return nil // replace: count unchanged
+						}
+						continue outer // entry changed under us; rescan
+					}
+				} else if s.recordMatches(a, key, kind) {
 					// Another writer published this key first. Last writer wins: update
 					// their record in place if our value fits, else swap the entry to ours.
 					// A separated write (flags != 0) or a target that is itself separated
@@ -788,10 +806,16 @@ func (s *Store) Delete(key []byte) bool {
 			return false
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
-			// A separated string's cold value is now unreferenced; account it as dead,
-			// and return its resident bytes to its segment so the arena can drain it.
-			s.markSepDead(off)
-			s.unlinkResident(off)
+			if off&tierBit != 0 {
+				// A cold key: its frame in the record region is now unreferenced dead space,
+				// and there is no resident record to return to a segment (doc 21 section 9).
+				s.markColdRecDead(off &^ tierBit)
+			} else {
+				// A separated string's cold value is now unreferenced; account it as dead,
+				// and return its resident bytes to its segment so the arena can drain it.
+				s.markSepDead(off)
+				s.unlinkResident(off)
+			}
 			s.count.Add(-1)
 			s.addTop(stringKind, -1)
 			return true

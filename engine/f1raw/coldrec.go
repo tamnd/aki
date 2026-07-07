@@ -219,6 +219,39 @@ func (s *Store) readColdValue(coldOff uint64, dst []byte) ([]byte, bool) {
 	return v, true
 }
 
+// markColdRecDead accounts the cold record frame at region offset coldOff as dead space, the
+// record-region analog of markSepDead. It is called wherever a cold entry leaves the index (a
+// write bringing the record back up to the arena, or a delete of a cold key), right after the
+// CAS that drops the entry, so the frame the entry pointed at is counted exactly once as
+// reclaimable by the record-region compactor. A frame that is itself doubly-cold (flagSep: its
+// value already lived in the value log before the record migrated) also releases those
+// value-log bytes, so both regions' dead totals stay exact. A store with no record region is a
+// no-op. The frame is immutable and stays valid in the append-only region, so reading its
+// header here is safe even though the index no longer points at it.
+func (s *Store) markColdRecDead(coldOff uint64) {
+	if s.recs == nil {
+		return
+	}
+	var hdr [frameHdrSize]byte
+	if _, err := s.recs.readInto(coldOff, frameHdrSize, hdr[:]); err != nil {
+		return
+	}
+	s.recs.dead.Add(uint64(binary.LittleEndian.Uint32(hdr[frameOffTotal:])))
+	if hdr[frameOffFlags]&flagSep == 0 || s.cold == nil {
+		return
+	}
+	// Doubly-cold: the frame's value bytes are the 12-byte value-log pointer, so the value-log
+	// span it named is unreferenced too. Read the pointer and account its length against the
+	// value log's dead total.
+	klen := uint64(binary.LittleEndian.Uint16(hdr[frameOffKlen:]))
+	var ptr [ptrSize]byte
+	p, err := s.recs.readInto(coldOff+frameHdrSize+klen, ptrSize, ptr[:])
+	if err != nil {
+		return
+	}
+	s.cold.dead.Add(uint64(binary.LittleEndian.Uint32(p[8:])))
+}
+
 // readValueByAddr resolves a value from a logical index address into dst, branching on the
 // tier bit (D1, doc 21 section 9). The resident branch is exactly today's read: a separated
 // record reads through the value log, an inline record reads under the seqlock. The cold
