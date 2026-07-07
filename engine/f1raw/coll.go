@@ -201,8 +201,10 @@ func (s *Store) DeleteKind(key []byte, kind byte) bool {
 			return false
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
-			// A separated element's cold value is now unreferenced; account it as dead.
+			// A separated element's cold value is now unreferenced; account it as dead,
+			// and return its resident bytes to its segment so the arena can drain it.
 			s.markSepDead(off)
+			s.unlinkResident(off)
 			s.count.Add(-1)
 			s.addTop(kind, -1)
 			return true
@@ -232,8 +234,10 @@ func (s *Store) DeleteKindNoCount(key []byte, kind byte) bool {
 		if b.slots[slot].CompareAndSwap(word, 0) {
 			// A separated element's cold value is now unreferenced; account it as dead. This
 			// stays per element because it addresses the specific record's cold bytes; only the
-			// contended global count is what the caller batches.
+			// contended global count is what the caller batches. The resident bytes leave the
+			// segment too, per element for the same reason.
 			s.markSepDead(off)
+			s.unlinkResident(off)
 			return true
 		}
 	}
@@ -271,8 +275,10 @@ func (s *Store) TakeKind(key, dst []byte, kind byte) ([]byte, bool) {
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
 			// The popped element's cold value (a separated large list element) is now
-			// unreferenced; account it as dead space for a later compaction pass.
+			// unreferenced; account it as dead space for a later compaction pass, and
+			// return its resident bytes to its segment so the arena can drain it.
 			s.markSepDead(off)
+			s.unlinkResident(off)
 			s.count.Add(-1)
 			s.addTop(kind, -1)
 			return v, true
@@ -311,6 +317,7 @@ func (s *Store) TakeKindNoCount(key, dst []byte, kind byte) ([]byte, bool) {
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
 			s.markSepDead(off)
+			s.unlinkResident(off)
 			return v, true
 		}
 	}
