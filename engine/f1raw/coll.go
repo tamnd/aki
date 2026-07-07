@@ -555,17 +555,17 @@ func (s *Store) CollScanKV(prefix, after []byte, limit int, dstKeys [][]byte, ds
 // returns it, the seqlock read GetKind runs after it resolves the offset. It is exported
 // for the value-carrying scan (CollScanKV), which already holds the offset from the ordered
 // index and so skips the hash-and-probe find GetKind would repeat. off must come from a
-// current CollScanKV batch, where it is guaranteed to be the element's live record. When the
-// record's value was separated to the cold log, this resolves it with one pread, which is the
-// fallback ValueAtLocked documents for a separated record (its zero-copy path serves inline
-// values only), so a value-carrying enumeration over a hash of large fields reads each
-// field's value straight from the cold log.
+// current CollScanKV batch, where it is guaranteed to be the element's live record. off is a
+// logical address, so it carries the tier bit: when the cold record region is engaged, the
+// scan re-resolves each node through the tier-aware index (D22 Option B) and hands back a
+// tier-tagged address for an element that migrated cold, so this funnels through
+// readValueByAddr to follow the record across the tier boundary with one pread. The resident
+// branch is exactly today's read: a value separated to the cold value log resolves with one
+// pread, an inline value reads under the seqlock. A value-carrying enumeration over a hash of
+// large fields thus reads each field straight from whichever tier holds it.
 func (s *Store) ReadValueAt(off uint64, dst []byte) []byte {
-	if s.cold != nil && s.isSep(off) {
-		v, _ := s.readSeparated(off, dst)
-		return v
-	}
-	return s.readValue(off, dst)
+	v, _ := s.readValueByAddr(off, dst)
+	return v
 }
 
 // ValueAtLocked returns the inline value of the record at off as a zero-copy subslice of the
@@ -577,9 +577,15 @@ func (s *Store) ReadValueAt(off uint64, dst []byte) []byte {
 // under the seqlock could tear the read, which is exactly why the general Get path copies under
 // the latch instead. Second, the record is inline: a cold-log separated value is a 12-byte
 // pointer, not value bytes, so this reports inline=false for a separated record and the caller
-// must fall back to ReadValueAt, which resolves the cold log. The arena never moves a published
-// record, so under the held lock the returned slice stays valid for the caller's use of it.
+// must fall back to ReadValueAt, which resolves the cold log. A record that migrated to the cold
+// record region is likewise not resident, so off carries the tier bit and this reports inline=false
+// for it too, sending the caller to ReadValueAt (which preads the cold frame); the zero-copy arena
+// slice is only ever returned for a genuinely resident inline record. The arena never moves a
+// published record, so under the held lock the returned slice stays valid for the caller's use of it.
 func (s *Store) ValueAtLocked(off uint64) (val []byte, inline bool) {
+	if off&tierBit != 0 {
+		return nil, false
+	}
 	if s.cold != nil && s.isSep(off) {
 		return nil, false
 	}

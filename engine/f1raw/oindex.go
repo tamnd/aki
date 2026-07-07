@@ -67,6 +67,7 @@ const (
 type onode struct {
 	off    uint64
 	klen   uint32               // full composite-key length, so a fully-inlined key is known without an arena read
+	kind   byte                 // record kind, captured at insert so the node re-resolves its address through the tier-aware index without reading the (possibly migrated) record
 	inline [onodeInlineCap]byte // first min(klen, cap) key bytes, cached for arena-free ordering
 	next   []*onode
 	width  []int
@@ -167,6 +168,27 @@ func (s *Store) nodeKey(n *onode) []byte {
 	return s.keyAt(n.off)
 }
 
+// nodeAddr returns the current logical address of node n's record, tier-tagged so a value read
+// resolves it through readValueByAddr regardless of which tier it sits in, along with whether the
+// element is still live. This is D22 Option B (spec 2064/f1_rewrite_ltm/21): the node caches an
+// offset that is correct only while the record is resident, so once the cold record region is
+// engaged the node re-resolves its address through the tier-aware primary index on each access
+// rather than trusting the cached off, which the migrator would leave dangling at a reclaimed
+// segment after a cold flip. When no cold record region exists (the in-memory-fit regime), no
+// record ever migrates, so the cached off is authoritative and this returns it with no probe,
+// keeping enumeration on exactly the fast path it had before tiering. When the region is engaged,
+// it probes the primary index by the node's own key and kind: a hit gives the live tier-tagged
+// address, a miss means the element was deleted (the delete clears the primary slot synchronously,
+// while only the ordered-index splice is deferred), so found is an authoritative liveness signal.
+func (s *Store) nodeAddr(n *onode) (off uint64, live bool) {
+	if s.recs == nil {
+		return n.off, true
+	}
+	key := s.nodeKey(n)
+	cur, _, _, _, found := s.find(key, hash(key), n.kind)
+	return cur, found
+}
+
 // insert adds off's record to the ordered index. If a node with the same key already
 // exists (a field overwrite that happened to republish, or a redundant call), the
 // node's offset is refreshed rather than duplicated, so the index holds exactly one
@@ -206,7 +228,7 @@ func (oi *oindex) insert(off uint64) {
 		}
 		oi.level = lvl
 	}
-	n := &onode{off: off, klen: uint32(len(key)), next: make([]*onode, lvl), width: make([]int, lvl)}
+	n := &onode{off: off, klen: uint32(len(key)), kind: oi.store.arena[off+offKind], next: make([]*onode, lvl), width: make([]int, lvl)}
 	copy(n.inline[:], key) // copies min(cap, len(key)); the tail beyond cap is unused (klen>cap falls back to arena)
 	for i := 0; i < lvl; i++ {
 		n.next[i] = update[i].next[i]
@@ -451,17 +473,34 @@ func (oi *oindex) scanBatch(prefix, after []byte, limit int, dstOffs []uint64, d
 	// atomic load for the whole batch and never the per-node liveAt probe.
 	filter := oi.store.tombPend.Load() > 0
 
+	// When the cold record region is engaged, a node's cached offset can dangle after a migration
+	// reclaimed the resident segment it pointed at, so re-resolve each emitted address through the
+	// tier-aware index (D22 Option B, spec 2064/f1_rewrite_ltm/21): the re-resolved address is
+	// tier-tagged, so a later value read follows the record across the tier boundary. The
+	// re-resolution's hit/miss is an authoritative liveness signal (the delete clears the primary
+	// slot synchronously and only defers the ordered-index splice), so on this path it subsumes the
+	// tombPend liveAt check. In the in-memory-fit regime no record ever migrates, so recs is nil,
+	// the cached offset is authoritative, and the walk stays on the existing fast path.
+	resolve := oi.store.recs != nil
+
 	var last []byte
 	for x != nil && len(dstOffs) < limit {
 		k := oi.store.nodeKey(x)
 		if !bytes.HasPrefix(k, prefix) {
 			break
 		}
-		if filter && !oi.store.liveAt(x.off) {
+		off := x.off
+		if resolve {
+			var live bool
+			if off, live = oi.store.nodeAddr(x); !live {
+				x = x.next[0]
+				continue
+			}
+		} else if filter && !oi.store.liveAt(x.off) {
 			x = x.next[0]
 			continue
 		}
-		dstOffs = append(dstOffs, x.off)
+		dstOffs = append(dstOffs, off)
 		if dstKeys != nil {
 			dstKeys = append(dstKeys, k)
 		}
