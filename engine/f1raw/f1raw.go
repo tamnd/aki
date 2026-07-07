@@ -216,6 +216,23 @@ type Store struct {
 	cold         *coldLog
 	sepThreshold int
 
+	// The background migrator (migrate.go), milestone M3 of the collection cold-record tiering
+	// plan (spec 2064/21 section 6). When engaged by EnableMigrator, a single goroutine watches
+	// the resident live-byte total against the segment budget and, when it crosses a high-water
+	// fraction (D14), drains the emptiest eligible full segments to the cold region (D15, drainSegment)
+	// until the total falls below a low-water fraction, then sleeps until the next wake. The write
+	// path signals it once per segment advance (signalMigrator), off the per-record hot path, so a
+	// fill that crosses the threshold wakes the migrator and returns rather than migrating inline. It
+	// is inert on a store that never calls EnableMigrator: migOn stays false, the channels stay nil,
+	// and signalMigrator is a single atomic load that returns at once. migHiNum and migLoNum are the
+	// high- and low-water numerators over 100 of the segment budget, lab knobs the bench sweeps.
+	migOn    atomic.Bool
+	migStop  chan struct{}
+	migDone  chan struct{}
+	migWake  chan struct{}
+	migHiNum uint64
+	migLoNum uint64
+
 	// recs is the cold record region for the tier-tagged index (coldrec.go), milestone M1
 	// of the collection cold-record tiering plan (spec 2064/21). It is a second append-only
 	// log, separate from cold above: cold holds separated values, recs holds whole migrated
@@ -376,6 +393,14 @@ func (s *Store) Close() error {
 		// nodes a later reopen would have to reconcile.
 		close(s.folderStop)
 		<-s.folderDone
+	}
+	if s.migOn.Load() {
+		// Stop the migrator before closing the cold record region it appends to, so no drain is
+		// mid-flight writing a frame into a closed file. It finishes the segment it is on, if any,
+		// then exits.
+		s.migOn.Store(false)
+		close(s.migStop)
+		<-s.migDone
 	}
 	if s.recs != nil {
 		if err := s.recs.close(); err != nil {
