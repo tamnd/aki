@@ -104,6 +104,37 @@ func TestMigratorServesBeyondArena(t *testing.T) {
 	}
 }
 
+// TestBackpressureServesBeyondArena is the M3 slice-4 gate for the write-path backpressure (D12):
+// with the migrator engaged, a plain Set that momentarily finds the arena full must wait on the
+// migrator and succeed on its own, not return ErrFull, so a caller writing a dataset larger than
+// the arena never sees a spurious full error. It is TestMigratorServesBeyondArena without the
+// external retry helper: every write goes straight through Set, and any ErrFull is a failure of the
+// backpressure to wait. Every distinct key still reads back its exact value, most from cold.
+func TestBackpressureServesBeyondArena(t *testing.T) {
+	s := churnSegColdStore(t, 6)
+	s.EnableMigrator()
+
+	perSeg := int(s.segSize / align8(recSize(12, churnValLen)))
+	total := perSeg * len(s.segs) * 4
+	for i := 0; i < total; i++ {
+		k := []byte(fmt.Sprintf("k%08d", i))
+		if err := s.Set(k, churnVal("k", i)); err != nil {
+			t.Fatalf("Set %q returned %v with the migrator engaged; backpressure did not wait (i=%d/%d)", k, err, i, total)
+		}
+	}
+
+	if coldTotal, _ := s.ColdRecords(); coldTotal < s.cap {
+		t.Fatalf("cold region holds %d bytes, want more than one arena (%d): records did not sink", coldTotal, s.cap)
+	}
+	for i := 0; i < total; i++ {
+		k := []byte(fmt.Sprintf("k%08d", i))
+		v, ok := s.Get(k, nil)
+		if !ok || string(v) != string(churnVal("k", i)) {
+			t.Fatalf("key %q = %q,%v; want its exact value (i=%d)", k, v, ok, i)
+		}
+	}
+}
+
 // setWithMigratorRetry writes one record, waiting on the migrator when the arena is momentarily full.
 // The migrator runs on its own goroutine, so a burst of writes can outrun its draining and hit
 // ErrFull before a segment frees; this signals the migrator and retries with a short backoff, which
