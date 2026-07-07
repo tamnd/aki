@@ -22,15 +22,17 @@ import (
 // enumerating a collection is a seek to that prefix and a forward walk until the
 // prefix stops matching.
 //
-// A node stores only the arena offset of its record, never a copy of the key: the key
-// bytes are read from the immutable record header at that offset, so the index adds no
-// key duplication. The offset is used only to read the key bytes for ordering and for
-// the caller to re-resolve the value through the authoritative hash index; it is never
-// used to read the value directly, because a value that outgrew its record was
-// republished at a new offset while this node still points at the old one. The old
-// record's key bytes are identical (grow-only arena, immutable key), so ordering stays
-// correct, and the value always comes from a fresh GetKind by the caller. This is the
-// spec's "the column is authoritative, the sibling index is a derived hint" contract.
+// A node caches its own copy of the composite key so ordering and enumeration never read
+// the arena: a key up to onodeInlineCap bytes lives in a fixed inline array, and a longer
+// key lives in an owned full slice. The node still holds the record's arena offset, but the
+// offset is used only for the caller to re-resolve the value through the authoritative hash
+// index (and, under cold-record tiering, to re-resolve the live tier-tagged address), never
+// to read the value directly, because a value that outgrew its record was republished at a
+// new offset while this node still points at the old one. Keeping the key in the node is what
+// lets an element surface from the ordered index after its record has migrated to the cold
+// region and its resident bytes were reclaimed, since no ordering or key-read path depends on
+// those bytes still being live. This is the spec's "the column is authoritative, the sibling
+// index is a derived hint" contract.
 //
 // Concurrency: the index has its own RWMutex, distinct from the hash index's lock-free
 // path, so it never touches the string hot path or the point HGET/HSET value path. A
@@ -48,9 +50,10 @@ const (
 	// is a length-prefixed collection key plus a short member, well under this, so the whole
 	// key fits inline and the descent's byte compares never chase the record offset into the
 	// arena, which the saturating SPOP profile named as 42.5% of CPU (all cache-miss-bound in
-	// keyAt/klen). Keys longer than the cap keep the offset-and-arena compare path, so the
-	// cache is a pure hint and ordering is unchanged. 32 bytes covers the common member key
-	// whole while keeping the node under two cache lines.
+	// keyAt/klen). Keys longer than the cap spill into the node's owned full slice instead, so
+	// ordering is still arena-free, only paying one pointer indirection rather than an inline
+	// read. 32 bytes covers the common member key whole while keeping the node under two cache
+	// lines.
 	onodeInlineCap = 32
 )
 
@@ -69,22 +72,25 @@ type onode struct {
 	klen   uint32               // full composite-key length, so a fully-inlined key is known without an arena read
 	kind   byte                 // record kind, captured at insert so the node re-resolves its address through the tier-aware index without reading the (possibly migrated) record
 	inline [onodeInlineCap]byte // first min(klen, cap) key bytes, cached for arena-free ordering
+	full   []byte               // whole composite key, held only when klen > cap so a long key is arena-free too (nil for a fully-inlined key)
 	next   []*onode
 	width  []int
 }
 
 // cmpKey orders the node's composite key against key the way bytes.Compare does, but reads
-// the inline key cache instead of the arena whenever the whole key fits (klen <= cap). That
-// keeps the hot skiplist descent from chasing off into the 1.9M-element arena for every byte
-// compare, which is the cache-miss cost the SPOP profile is bound on. A key longer than the
-// cap falls back to the arena bytes, so the cache never changes the ordering, only where the
-// bytes are read from. The record's key is immutable (grow-only arena), so a republish that
-// only moves off leaves klen and inline correct without a refresh.
-func (n *onode) cmpKey(s *Store, key []byte) int {
+// the node's own copy of the key instead of the arena. When the whole key fits (klen <= cap)
+// it compares the inline cache, which keeps the hot skiplist descent from chasing off into the
+// 1.9M-element arena for every byte compare, the cache-miss cost the SPOP profile is bound on.
+// A key longer than the cap compares n.full, the whole-key copy the node holds for exactly this
+// case, so ordering never touches the record either. Neither branch reads the arena, so a node
+// orders correctly even after its record has migrated cold and its resident bytes were reclaimed.
+// The record's key is immutable, so a republish that only moves off leaves klen, inline, and full
+// correct without a refresh.
+func (n *onode) cmpKey(key []byte) int {
 	if int(n.klen) <= onodeInlineCap {
 		return bytes.Compare(n.inline[:n.klen], key)
 	}
-	return bytes.Compare(s.keyAt(n.off), key)
+	return bytes.Compare(n.full, key)
 }
 
 // oindex is the ordered element index. head is a sentinel whose forward pointers are
@@ -149,23 +155,22 @@ func (s *Store) keyAt(off uint64) []byte {
 	return s.arena[start : start+klen]
 }
 
-// nodeKey returns the composite key bytes of ordered-index node n. When the whole key fits
-// the node's inline cache (klen <= onodeInlineCap), it returns that cache directly: the
-// inline copy is a verbatim prefix of the key taken at insert, so for a fully-inlined key it
-// is byte-identical to keyAt(n.off), only read without chasing the record offset into the
-// arena. That decoupling is what lets the ordered index yield an element's key after the
-// element's record has migrated cold and its resident bytes were reclaimed, since for an
-// inline-fitting key the retrieval path never touches the record, the same independence
-// cmpKey already relies on for ordering. A key longer than the cache falls back to
-// keyAt(n.off), the resident read; the record-tiering follow-up widens that tail to the cold
-// frame. The common collection member key (a length-prefixed collection key plus a short
-// member) fits inline, so the SPOP/HSCAN/SRANDMEMBER retrieval paths take the arena-free
-// branch, matching the descent's own cache hit.
+// nodeKey returns the composite key bytes of ordered-index node n from the node's own storage,
+// never the arena. When the whole key fits the inline cache (klen <= onodeInlineCap) it returns
+// that cache: the inline copy is a verbatim prefix of the key taken at insert, so for a
+// fully-inlined key it is byte-identical to keyAt(n.off). A longer key returns n.full, the
+// whole-key copy the node took at insert for exactly this case. Either way the retrieval never
+// touches the record, which is what lets the ordered index yield an element's key after the
+// element's record has migrated cold and its resident bytes were reclaimed, the same independence
+// cmpKey relies on for ordering. The common collection member key (a length-prefixed collection
+// key plus a short member) fits inline, so the SPOP/HSCAN/SRANDMEMBER retrieval paths take the
+// inline branch, matching the descent's own cache hit; a long member falls to the n.full copy
+// and stays arena-free too.
 func (s *Store) nodeKey(n *onode) []byte {
 	if int(n.klen) <= onodeInlineCap {
 		return n.inline[:n.klen]
 	}
-	return s.keyAt(n.off)
+	return n.full
 }
 
 // nodeAddr returns the current logical address of node n's record, tier-tagged so a value read
@@ -207,13 +212,13 @@ func (oi *oindex) insert(off uint64) {
 		} else {
 			rank[i] = rank[i+1]
 		}
-		for x.next[i] != nil && x.next[i].cmpKey(oi.store, key) < 0 {
+		for x.next[i] != nil && x.next[i].cmpKey(key) < 0 {
 			rank[i] += x.width[i]
 			x = x.next[i]
 		}
 		update[i] = x
 	}
-	if nx := x.next[0]; nx != nil && nx.cmpKey(oi.store, key) == 0 {
+	if nx := x.next[0]; nx != nil && nx.cmpKey(key) == 0 {
 		nx.off = off // same key republished: point at the current record
 		return
 	}
@@ -229,7 +234,14 @@ func (oi *oindex) insert(off uint64) {
 		oi.level = lvl
 	}
 	n := &onode{off: off, klen: uint32(len(key)), kind: oi.store.arena[off+offKind], next: make([]*onode, lvl), width: make([]int, lvl)}
-	copy(n.inline[:], key) // copies min(cap, len(key)); the tail beyond cap is unused (klen>cap falls back to arena)
+	copy(n.inline[:], key) // copies min(cap, len(key)); the tail beyond cap lives in n.full
+	if len(key) > onodeInlineCap {
+		// The key aliases the arena (keyAt), which the migrator may later reclaim, so a long
+		// key gets its own copy the node owns for life. A short key needs none: the inline
+		// cache already holds it whole. This is what keeps nodeKey/cmpKey arena-free for every
+		// key length once cold-record tiering is engaged.
+		n.full = append([]byte(nil), key...)
+	}
 	for i := 0; i < lvl; i++ {
 		n.next[i] = update[i].next[i]
 		update[i].next[i] = n
@@ -262,11 +274,11 @@ func (oi *oindex) refresh(off uint64) {
 
 	x := oi.head
 	for i := oi.level - 1; i >= 0; i-- {
-		for x.next[i] != nil && x.next[i].cmpKey(oi.store, key) < 0 {
+		for x.next[i] != nil && x.next[i].cmpKey(key) < 0 {
 			x = x.next[i]
 		}
 	}
-	if nx := x.next[0]; nx != nil && nx.cmpKey(oi.store, key) == 0 {
+	if nx := x.next[0]; nx != nil && nx.cmpKey(key) == 0 {
 		nx.off = off
 	}
 }
@@ -336,13 +348,13 @@ func (oi *oindex) removeLocked(key []byte) bool {
 	var update [oindexMaxLevel]*onode
 	x := oi.head
 	for i := oi.level - 1; i >= 0; i-- {
-		for x.next[i] != nil && x.next[i].cmpKey(oi.store, key) < 0 {
+		for x.next[i] != nil && x.next[i].cmpKey(key) < 0 {
 			x = x.next[i]
 		}
 		update[i] = x
 	}
 	target := x.next[0]
-	if target == nil || target.cmpKey(oi.store, key) != 0 {
+	if target == nil || target.cmpKey(key) != 0 {
 		return false
 	}
 	for i := 0; i < oi.level; i++ {
@@ -449,7 +461,7 @@ func (oi *oindex) scanBatch(prefix, after []byte, limit int, dstOffs []uint64, d
 	}
 	x := oi.head
 	for i := oi.level - 1; i >= 0; i-- {
-		for x.next[i] != nil && x.next[i].cmpKey(oi.store, seek) < 0 {
+		for x.next[i] != nil && x.next[i].cmpKey(seek) < 0 {
 			x = x.next[i]
 		}
 	}
@@ -461,7 +473,7 @@ func (oi *oindex) scanBatch(prefix, after []byte, limit int, dstOffs []uint64, d
 	// rather than comparing every element against `after` inside the walk, which would run a
 	// full bytes.Compare per element for a boundary that can match only the head of the batch.
 	if after != nil && x != nil {
-		if x.cmpKey(oi.store, after) <= 0 {
+		if x.cmpKey(after) <= 0 {
 			x = x.next[0]
 		}
 	}
@@ -518,7 +530,7 @@ func (oi *oindex) rankLocked(key []byte) int {
 	pos := 0
 	x := oi.head
 	for i := oi.level - 1; i >= 0; i-- {
-		for x.next[i] != nil && x.next[i].cmpKey(oi.store, key) < 0 {
+		for x.next[i] != nil && x.next[i].cmpKey(key) < 0 {
 			pos += x.width[i]
 			x = x.next[i]
 		}
