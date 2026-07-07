@@ -240,6 +240,67 @@ func TestServerMigratorServesListBeyondArena(t *testing.T) {
 	}
 }
 
+// TestServerMigratorServesStreamBeyondArena is the D22 Option B gate for the stream at the server
+// level: with the four stream element kinds admitted to the migrator (isMigratableKind), a stream
+// whose entry rows outgrow the resident arena is served correctly over the wire, most rows now cold.
+// It appends far more large entries than the small arena can hold, so the migrator sinks full
+// segments of entry rows into the cold record region as they fill while the stream header row stays
+// resident, and every XADD must still succeed (D12 backpressure waits on the migrator rather than
+// erroring). Then a per-entry XRANGE reads each entry back across the tier by its exact ID, and one
+// full XRANGE - + re-reads every entry in ID order. Each entry value is read with a by-key GetKind
+// off the ordered entry index, so a migrated entry row is followed across the tier. Without the
+// admission the entry rows cannot migrate, the arena fills, and XADD errors partway through the load.
+func TestServerMigratorServesStreamBeyondArena(t *testing.T) {
+	rw, cleanup := dialMigratorServer(t)
+	defer cleanup()
+
+	// One stream, many 200-byte entry values under a single field: each entry row is arena-sized and
+	// they cannot all stay resident, while the single header row pins at most one segment. Explicit
+	// strictly increasing IDs keep insertion order equal to ID order, so a forward XRANGE returns
+	// them in i order. Pipeline the appends so the load is not one round trip per entry.
+	const n = 20000
+	val := strings.Repeat("x", 200)
+	idOf := func(i int) string { return strconv.Itoa(i+1) + "-1" }
+	for i := 0; i < n; i++ {
+		cmd(t, rw, "XADD", "st", idOf(i), "f", migVal(i, val))
+	}
+	for i := 0; i < n; i++ {
+		if got := readReply(t, rw); got != "$"+idOf(i) {
+			t.Fatalf("XADD %d = %q, want %q", i, got, "$"+idOf(i))
+		}
+	}
+
+	// The header count stays exact across the tier.
+	cmd(t, rw, "XLEN", "st")
+	expect(t, rw, ":"+strconv.Itoa(n))
+
+	// Point path: a single-ID XRANGE reads each entry back, most now cold, all exact. One entry
+	// serializes as [[id [f val]]].
+	for i := 0; i < n; i++ {
+		cmd(t, rw, "XRANGE", "st", idOf(i), idOf(i))
+	}
+	for i := 0; i < n; i++ {
+		want := "[[" + idOf(i) + " [f " + migVal(i, val) + "]]]"
+		if got := readReplyDeep(t, rw); got != want {
+			t.Fatalf("XRANGE st %s = %q, want %q", idOf(i), got, want)
+		}
+	}
+
+	// Enumeration path: one XRANGE - + returns every entry in ID order, re-reading each from
+	// whichever tier holds it.
+	cmd(t, rw, "XRANGE", "st", "-", "+")
+	h := readReply(t, rw)
+	if h != "*"+strconv.Itoa(n) {
+		t.Fatalf("XRANGE - + header = %q, want %q", h, "*"+strconv.Itoa(n))
+	}
+	for i := 0; i < n; i++ {
+		want := "[" + idOf(i) + " [f " + migVal(i, val) + "]]"
+		if got := readReplyDeep(t, rw); got != want {
+			t.Fatalf("XRANGE - + entry %d = %q, want %q", i, got, want)
+		}
+	}
+}
+
 // TestServerMigratorConfigError checks that asking for the migrator without the segmented arena
 // it needs is a clean configuration error surfaced by Listen, not a panic from EnableMigrator.
 func TestServerMigratorConfigError(t *testing.T) {
