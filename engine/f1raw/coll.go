@@ -454,10 +454,16 @@ func (s *Store) CollScan(prefix, after []byte, limit int, dst [][]byte) (keys []
 		g := s.pin()
 		defer g.unpin()
 	}
-	offs, last := s.oidx.Load().scanBatch(prefix, after, limit, make([]uint64, 0, limit))
-	for _, off := range offs {
-		dst = append(dst, s.keyAt(off))
+	// Take the keys from the ordered index itself (the node's inline cache for an inline key),
+	// not from keyAt(off), so enumeration returns the right key after the element's record has
+	// migrated cold and its resident offset was reclaimed. The offsets are discarded here; the
+	// value-carrying twin CollScanKV keeps them for the value read. A nil dst would tell
+	// scanBatch to collect no keys (the offsets-only convention the set-vector rebuilds use),
+	// so materialize a slice first: CollScan's contract is to return the keys.
+	if dst == nil {
+		dst = make([][]byte, 0, limit)
 	}
+	_, dst, last = s.oidx.Load().scanBatch(prefix, after, limit, make([]uint64, 0, limit), dst)
 	return dst, last
 }
 
@@ -535,10 +541,13 @@ func (s *Store) ScanKeys(cursor uint64, count int, dst [][]byte, isTop func(kind
 // reads a stale record. Both slices grow in lockstep, so dstOffs[i] is the offset of
 // dstKeys[i]. This is the primitive that closes the HVALS/HGETALL gap to HKEYS.
 func (s *Store) CollScanKV(prefix, after []byte, limit int, dstKeys [][]byte, dstOffs []uint64) (keys [][]byte, offs []uint64, last []byte) {
-	dstOffs, last = s.oidx.Load().scanBatch(prefix, after, limit, dstOffs)
-	for _, off := range dstOffs {
-		dstKeys = append(dstKeys, s.keyAt(off))
+	// A nil dstKeys means "collect no keys" to scanBatch (the offsets-only convention the set
+	// member-vector rebuilds use), but CollScanKV must return the keys alongside their offsets,
+	// so materialize a slice first when the caller passed none.
+	if dstKeys == nil {
+		dstKeys = make([][]byte, 0, limit)
 	}
+	dstOffs, dstKeys, last = s.oidx.Load().scanBatch(prefix, after, limit, dstOffs, dstKeys)
 	return dstKeys, dstOffs, last
 }
 

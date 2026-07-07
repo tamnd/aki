@@ -204,7 +204,7 @@ func (s *Store) derivePartVec(skey []byte, part, p int) *memberVec {
 	buf := make([]uint64, 0, 512)
 	for {
 		buf = buf[:0]
-		offs, last := s.oidx.Load().scanBatch(prefix, after, 512, buf)
+		offs, _, last := s.oidx.Load().scanBatch(prefix, after, 512, buf, nil)
 		for _, off := range offs {
 			v.add(off)
 		}
