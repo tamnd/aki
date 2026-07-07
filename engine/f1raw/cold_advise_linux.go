@@ -5,6 +5,7 @@ package f1raw
 import (
 	"os"
 	"syscall"
+	"unsafe"
 )
 
 // fadvDontNeed is POSIX_FADV_DONTNEED: advise the kernel that a file range is not
@@ -36,6 +37,32 @@ func (c *coldLog) adviseDontNeed(off uint64, n int) {
 	start := off &^ (pageSize - 1)
 	end := (off + uint64(n) + pageSize - 1) &^ (pageSize - 1)
 	_, _, _ = syscall.Syscall6(syscall.SYS_FADVISE64, c.f.Fd(), uintptr(start), uintptr(end-start), fadvDontNeed, 0, 0)
+}
+
+// releaseArenaPages returns the physical pages backing arena offsets [off, off+n) to the OS
+// with MADV_DONTNEED, so a segment freed under memory pressure drops its resident footprint
+// instead of pinning its pages for the store's life. Without it, once a larger-than-memory
+// firehose has touched every segment once, the whole arena stays resident even as segments are
+// drained cold and reused, and that resident set plus the Go heap can cross a tight cgroup cap
+// and trip the OOM killer (the 3.1GB-under-400M firehose death). The arena is a pointer-free
+// byte slice, so dropping its pages is safe: a later write into a reused segment faults fresh
+// zero pages, which initRecord fully rewrites before any index entry exposes the record. Only
+// whole pages strictly inside the range are advised, so the partial page at either end that may
+// hold a neighbor segment's bytes is never touched. It is a hint and failure is ignored: the
+// worst case is the pages linger until the next reclaim. It runs only on the segmented reclaim
+// path, so the non-segmented hot path never reaches it.
+func (s *Store) releaseArenaPages(off, n uint64) {
+	if len(s.arena) == 0 {
+		return
+	}
+	ps := uintptr(pageSize)
+	abs := uintptr(unsafe.Pointer(&s.arena[0]))
+	astart := (abs + uintptr(off) + ps - 1) &^ (ps - 1)
+	aend := (abs + uintptr(off+n)) &^ (ps - 1)
+	if aend <= astart {
+		return
+	}
+	_ = syscall.Madvise(s.arena[astart-abs:aend-abs], syscall.MADV_DONTNEED)
 }
 
 // adviseRandom marks the whole cold log for random access so the kernel disables

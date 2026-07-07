@@ -304,6 +304,7 @@ func (s *Store) freeSegment(si uint64) {
 	seg := &s.segs[si]
 	seg.alloc.Store(seg.base)
 	seg.live.Store(0)
+	s.releaseArenaPages(seg.base, s.segSize)
 	s.freeSegs = append(s.freeSegs, si)
 }
 
@@ -347,6 +348,7 @@ func (s *Store) reclaimLocked() {
 			seg := &s.segs[si]
 			seg.alloc.Store(seg.base)
 			seg.live.Store(0)
+			s.releaseArenaPages(seg.base, s.segSize)
 			s.freeSegs = append(s.freeSegs, si)
 		} else {
 			kept = append(kept, si)
