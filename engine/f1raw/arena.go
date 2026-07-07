@@ -1,0 +1,266 @@
+package f1raw
+
+import "sync/atomic"
+
+// This file adds the reclaimable segmented arena, milestone M0 of the collection
+// cold-record tiering plan (spec 2064/f1_rewrite_ltm/21). It is inert unless the store
+// is built with NewSegmented: New leaves s.segmented false and every allocation still
+// runs the original grow-only bump path in f1raw.go, so the resident point path pays
+// nothing until the segmented path is proven.
+//
+// The design, from doc 21:
+//
+//   - The one arena []byte is divided into fixed segments of segSize bytes (D8). A
+//     record never spans a segment (D9), so segSize is floored at the largest possible
+//     record. Segments are subdivisions of the single backing slice, not separate
+//     allocations, so every unsafe.Add(s.base, off) address in the store stays valid
+//     unchanged.
+//
+//   - Overflow buckets live in their own region at the front of the arena that never
+//     reclaims (D10). A reclaimed segment must not hold overflow buckets, since the
+//     index still links them; keeping them out of segments keeps a freed segment free
+//     of anything the index points at. The region is one bump cursor, like the old
+//     arena but bounded.
+//
+//   - Each segment carries a descriptor with its base, a bump cursor, and a live-byte
+//     counter (D11). A free list of segment indices plus a current-segment pointer give
+//     the head advance and reuse (D12). Allocation within the current segment is one
+//     atomic add; the rare segment advance and the free-list edits take a mutex, since
+//     an advance happens once per segSize bytes, far off the per-record hot path.
+//
+// M0 stops here: it makes the arena reclaimable and proves a freed segment can be
+// reused without corrupting live records in other segments. The migrator that actually
+// drives frees (D14 to D17), the tier-tagged index (D1), and the cold region (D5) land
+// in later milestones. Until the migrator exists, freeSegment is the only way a segment
+// is returned, which the M0 test drives directly after clearing a segment's records.
+
+// defaultSegBytes is the segment size when NewSegmented is given a non-positive
+// segBytes. Doc 21 D8 sizes a segment near 8 MiB: large enough that the per-segment
+// descriptor and the once-per-segment advance are negligible against the records it
+// holds, small enough that draining one for reuse copies a bounded amount.
+const defaultSegBytes = 8 << 20
+
+// maxRecordBytes is the largest a single record can be: the header plus a max-width key
+// and a max-width value, each rounded to 8. A segment is never smaller than this so no
+// record spans a segment (D9), and allocRecord can assume any valid record fits one
+// segment.
+const maxRecordBytes = hdrSize + ((maxKey + 7) &^ 7) + ((maxVal + 7) &^ 7)
+
+// segment is one arena segment's descriptor. base is the segment's 8-aligned start
+// offset in the arena, fixed for the store's life. alloc is the bump cursor, the next
+// free offset within the segment; it equals base for an empty or freshly freed segment
+// and advances past base+segSize once the segment is full (the overshoot is abandoned,
+// exactly as the old single-arena bump abandons its tail). live counts the record bytes
+// handed out of this segment, the figure the later migrator reads to pick a drain
+// target; M0 only increments it on allocation and zeroes it on free, since there is no
+// migrator yet to decrement it. The padding keeps adjacent descriptors off one cache
+// line so two segments filling concurrently do not false-share.
+type segment struct {
+	base  uint64
+	alloc atomic.Uint64
+	live  atomic.Int64
+	_     [64 - 24]byte
+}
+
+// NewSegmented builds a store whose arena is divided into reclaimable segments of
+// segBytes each, with a separate never-reclaimed overflow-bucket region of ovBytes at
+// the front. A non-positive segBytes uses defaultSegBytes; segBytes is rounded up to 8
+// and floored at maxRecordBytes so no record spans a segment. A non-positive ovBytes
+// reserves an eighth of the arena for overflow buckets. It panics if the arena cannot
+// hold the overflow region plus at least one segment, the caller's sizing error.
+//
+// Everything else is New: the index, the cold-log fields, and the collection sidecars
+// are identical, and a store built here serves reads and writes through the same paths.
+// Only the allocator changes, dispatched on s.segmented.
+func NewSegmented(indexBuckets, arenaBytes, segBytes, ovBytes int) *Store {
+	s := New(indexBuckets, arenaBytes)
+	s.EnableSegments(segBytes, ovBytes)
+	return s
+}
+
+// EnableSegments switches an existing store's arena to the reclaimable segmented layout,
+// the same setup NewSegmented performs. It must be called on an empty store before it
+// serves traffic, since it repartitions the arena the allocator draws from; the server
+// calls it at startup on the store it built, so the segmented arena composes with a cold
+// value log (NewWithCold) without a separate constructor. Calling it twice, or on a store
+// that has already allocated records, is a caller error. The segBytes and ovBytes rules
+// match NewSegmented.
+func (s *Store) EnableSegments(segBytes, ovBytes int) {
+	arenaBytes := int(s.cap)
+	if segBytes <= 0 {
+		segBytes = defaultSegBytes
+	}
+	segSize := align8(uint64(segBytes))
+	if segSize < maxRecordBytes {
+		segSize = align8(maxRecordBytes)
+	}
+	if ovBytes <= 0 {
+		ovBytes = arenaBytes / 8
+	}
+	ovB := align8(uint64(ovBytes))
+
+	// The overflow region starts at offset 8, preserving the reserved offset 0 so an
+	// empty index entry (addr 0) stays unambiguous. Segments tile the arena after it.
+	const ovBase = uint64(8)
+	ovEnd := ovBase + ovB
+	segStart := align8(ovEnd)
+	if segStart+segSize > s.cap {
+		panic("f1raw: arena too small for overflow region plus one segment")
+	}
+	nSeg := (s.cap - segStart) / segSize
+	segs := make([]segment, nSeg)
+	for i := range segs {
+		segs[i].base = segStart + uint64(i)*segSize
+		segs[i].alloc.Store(segs[i].base)
+	}
+
+	s.segmented = true
+	s.segSize = segSize
+	s.segStart = segStart
+	s.segs = segs
+	s.ovBase = ovBase
+	s.ovEnd = ovEnd
+	s.ovTail.Store(ovBase)
+	s.highWater = 1 // segment 0 is the first current segment
+	s.curSeg.Store(0)
+}
+
+// allocRec is the record allocator the write paths call. It routes to the segmented
+// allocator when the store is segmented, and to the original single-arena bump
+// otherwise, so a non-segmented store's write path is byte-for-byte unchanged.
+func (s *Store) allocRec(nbytes uint64) (uint64, bool) {
+	if s.segmented {
+		return s.allocRecord(nbytes)
+	}
+	return s.alloc(nbytes)
+}
+
+// allocBkt is the overflow-bucket allocator the index growth path calls. In a segmented
+// store it draws from the never-reclaimed overflow region; otherwise it bump-allocates
+// from the one arena exactly as before.
+func (s *Store) allocBkt() (uint64, bool) {
+	if s.segmented {
+		return s.allocBucket()
+	}
+	return s.alloc(bucketSize)
+}
+
+// allocRecord bump-allocates an 8-byte-aligned record block from the current segment.
+// The common case is one atomic add on the current segment's cursor. When that add
+// overshoots the segment, the segment is full: advance to a new current segment (from
+// the free list or the next unused segment) and retry. The overshoot is abandoned, the
+// same bounded waste the old single-arena bump left at the arena tail, now capped at one
+// segment. It returns ok=false only when no segment has room and none can be brought in,
+// which the write path reports as ErrFull.
+func (s *Store) allocRecord(nbytes uint64) (uint64, bool) {
+	n := align8(nbytes)
+	for {
+		si := s.curSeg.Load()
+		seg := &s.segs[si]
+		end := seg.alloc.Add(n)
+		if end <= seg.base+s.segSize {
+			seg.live.Add(int64(n))
+			return end - n, true
+		}
+		if !s.advanceSeg(si) {
+			return 0, false
+		}
+	}
+}
+
+// advanceSeg moves the current-segment pointer off the full segment observed by the
+// caller, returning true when a segment is available to fill. It takes segMu, so the
+// concurrent allocators that all overshot the same segment serialize here and only one
+// actually advances; the rest see curSeg already moved and return. A new current segment
+// comes from the free list first, then from the next never-used segment; when neither
+// exists the arena is full and it returns false. A popped free segment already has its
+// cursor reset to base and its live counter zeroed by freeSegment, and a never-used
+// segment was initialized so at NewSegmented, so the new current segment is always ready
+// to allocate from.
+func (s *Store) advanceSeg(observed uint64) bool {
+	s.segMu.Lock()
+	defer s.segMu.Unlock()
+	if s.curSeg.Load() != observed {
+		return true // another allocator advanced already
+	}
+	var ni uint64
+	switch {
+	case len(s.freeSegs) > 0:
+		ni = s.freeSegs[len(s.freeSegs)-1]
+		s.freeSegs = s.freeSegs[:len(s.freeSegs)-1]
+	case s.highWater < uint64(len(s.segs)):
+		ni = s.highWater
+		s.highWater++
+	default:
+		return false // no free segment and no unused segment: arena full
+	}
+	s.curSeg.Store(ni)
+	return true
+}
+
+// allocBucket bump-allocates one 64-byte overflow bucket from the never-reclaimed
+// overflow region. It is one atomic add bounded by the region end; ok is false when the
+// region is exhausted, which the caller treats the same as a full arena. Overflow
+// buckets stay here rather than in a segment because the index links them for the store's
+// life, so a reclaimed segment must never contain one (D10).
+func (s *Store) allocBucket() (uint64, bool) {
+	end := s.ovTail.Add(bucketSize)
+	if end > s.ovEnd {
+		return 0, false
+	}
+	return end - bucketSize, true
+}
+
+// freeSegment returns segment si to the free list, resetting its cursor to base and its
+// live counter to zero so a later advance can reuse it from scratch. It is the only path
+// that frees a segment in M0, and the caller must have already unlinked every record the
+// segment holds from the index, so no live record's bytes are reclaimed. The later
+// migrator (D14 to D17) will drive this after draining a segment's live records forward;
+// until then the M0 test calls it directly. The bytes are not scrubbed: a reused offset's
+// header is fully rewritten by initRecord before any index entry exposes it, the same
+// contract Reset relies on. segMu serializes this against advanceSeg and other frees.
+func (s *Store) freeSegment(si uint64) {
+	s.segMu.Lock()
+	defer s.segMu.Unlock()
+	seg := &s.segs[si]
+	seg.alloc.Store(seg.base)
+	seg.live.Store(0)
+	s.freeSegs = append(s.freeSegs, si)
+}
+
+// resetSegments rewinds every segment to empty, drops the free list, and rewinds the
+// overflow region, the segmented-arena half of Reset. Like Reset itself it assumes
+// traffic is quiesced, so it takes segMu only to stay consistent with the concurrent
+// allocation paths' view of these fields.
+func (s *Store) resetSegments() {
+	s.segMu.Lock()
+	defer s.segMu.Unlock()
+	for i := range s.segs {
+		s.segs[i].alloc.Store(s.segs[i].base)
+		s.segs[i].live.Store(0)
+	}
+	s.freeSegs = s.freeSegs[:0]
+	s.highWater = 1
+	s.curSeg.Store(0)
+	s.ovTail.Store(s.ovBase)
+}
+
+// segmentUsed reports the resident bytes the segmented arena has handed out: the
+// overflow region's used bytes plus each segment's allocated bytes, clamped per segment
+// to segSize so a full segment's abandoned overshoot is not double counted. Freed and
+// never-used segments read their base as their cursor and contribute nothing. It backs
+// ArenaBytes in segmented mode and is an introspection call, not a hot path, so the walk
+// over segments is fine.
+func (s *Store) segmentUsed() uint64 {
+	used := s.ovTail.Load() - s.ovBase
+	for i := range s.segs {
+		seg := &s.segs[i]
+		a := seg.alloc.Load()
+		if a <= seg.base {
+			continue
+		}
+		u := min(a-seg.base, s.segSize)
+		used += u
+	}
+	return used
+}
