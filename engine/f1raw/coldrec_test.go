@@ -219,6 +219,86 @@ func TestColdRecordBringUpOnWrite(t *testing.T) {
 	}
 }
 
+// TestColdKindWriteDeleteTakeAcrossTiers is the collection twin of the string bring-up test: the
+// element-per-row *Kind write, delete, and take paths must handle a cold (tier-bit-set) offset the
+// same way Set/Delete handle a cold string. Once the background migrator admits a collection element
+// kind (hash field, set member, list element), a live SADD/HSET/SREM/LPOP can land on a field whose
+// record the migrator already sank cold, so PutKind's in-place branch, DeleteKind, and TakeKind each
+// see a cold offset. Before the tier guard those indexed the arena at a tier-tagged offset and
+// panicked out of range. This drives the flip directly with MigrateToCold to prove the point paths
+// are tier-correct independent of the background migrator.
+func TestColdKindWriteDeleteTakeAcrossTiers(t *testing.T) {
+	s := newRecStore(t)
+
+	// Overwrite a cold field: PutKind must bring it up resident, read the new value, and mark the
+	// old frame dead rather than memcpy over the immutable cold frame.
+	if _, err := s.PutKind([]byte("f-write"), []byte("v1"), benchKindHashField); err != nil {
+		t.Fatalf("PutKind f-write: %v", err)
+	}
+	if !s.MigrateToCold([]byte("f-write"), benchKindHashField) {
+		t.Fatal("MigrateToCold(f-write) returned false")
+	}
+	if !s.entryIsCold(t, []byte("f-write"), benchKindHashField) {
+		t.Fatal("f-write not cold after migration")
+	}
+	_, deadBefore := s.ColdRecords()
+	created, err := s.PutKind([]byte("f-write"), []byte("v2-longer"), benchKindHashField)
+	if err != nil {
+		t.Fatalf("PutKind f-write (bring-up): %v", err)
+	}
+	if created {
+		t.Fatal("PutKind over an existing cold field reported created; want update")
+	}
+	if s.entryIsCold(t, []byte("f-write"), benchKindHashField) {
+		t.Fatal("f-write still cold after overwrite; write did not bring it up")
+	}
+	if v, ok := s.GetKind([]byte("f-write"), nil, benchKindHashField); !ok || string(v) != "v2-longer" {
+		t.Fatalf("GetKind f-write after bring-up = %q,%v; want v2-longer,true", v, ok)
+	}
+	if _, deadAfter := s.ColdRecords(); deadAfter <= deadBefore {
+		t.Fatalf("cold dead bytes did not grow on field bring-up: %d -> %d", deadBefore, deadAfter)
+	}
+
+	// Delete a cold field: DeleteKind must drop the entry and mark its frame dead, not charge a
+	// resident segment for bytes that never left the region.
+	if _, err := s.PutKind([]byte("f-del"), []byte("d1"), benchKindHashField); err != nil {
+		t.Fatalf("PutKind f-del: %v", err)
+	}
+	if !s.MigrateToCold([]byte("f-del"), benchKindHashField) {
+		t.Fatal("MigrateToCold(f-del) returned false")
+	}
+	_, deadBefore = s.ColdRecords()
+	if !s.DeleteKind([]byte("f-del"), benchKindHashField) {
+		t.Fatal("DeleteKind(cold f-del) returned false")
+	}
+	if s.ExistsKind([]byte("f-del"), benchKindHashField) {
+		t.Fatal("f-del still present after cold delete")
+	}
+	if _, deadAfter := s.ColdRecords(); deadAfter <= deadBefore {
+		t.Fatalf("cold dead bytes did not grow on cold field delete: %d -> %d", deadBefore, deadAfter)
+	}
+
+	// Take a cold field: TakeKind must read the value through the cold frame, drop the entry, and
+	// mark the frame dead, the fused read-then-delete a list pop rides.
+	if _, err := s.PutKind([]byte("f-take"), []byte("t1-value"), benchKindHashField); err != nil {
+		t.Fatalf("PutKind f-take: %v", err)
+	}
+	if !s.MigrateToCold([]byte("f-take"), benchKindHashField) {
+		t.Fatal("MigrateToCold(f-take) returned false")
+	}
+	_, deadBefore = s.ColdRecords()
+	v, ok := s.TakeKind([]byte("f-take"), nil, benchKindHashField)
+	if !ok || string(v) != "t1-value" {
+		t.Fatalf("TakeKind cold f-take = %q,%v; want t1-value,true", v, ok)
+	}
+	if s.ExistsKind([]byte("f-take"), benchKindHashField) {
+		t.Fatal("f-take still present after cold take")
+	}
+	if _, deadAfter := s.ColdRecords(); deadAfter <= deadBefore {
+		t.Fatalf("cold dead bytes did not grow on cold field take: %d -> %d", deadBefore, deadAfter)
+	}
+}
+
 // entryIsCold reports whether key's index entry in the given kind namespace carries a cold
 // (tier-bit-set) address. It probes the index directly so a test can assert which tier a key
 // landed in.

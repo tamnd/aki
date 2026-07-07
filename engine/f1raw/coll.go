@@ -165,7 +165,12 @@ func (s *Store) PutKind(key, val []byte, kind byte) (created bool, err error) {
 		// record's cell is a 12-byte cold pointer, not value bytes, so a small value must
 		// not be memcpy'd over it. When the target is separated (a shrinking overwrite of a
 		// once-large field), fall through to publish, which swaps to a fresh inline record.
-		if !s.isSep(off) && uint64(len(val)) <= s.vcapBytes(off) {
+		// A cold target (tierBit set) also falls through: its frame lives in the record
+		// region, not the arena, so isSep and vcapBytes would index the arena out of bounds,
+		// and a write to a cold element brings it back up to the arena rather than mutating
+		// the immutable frame (doc 21 section 9), which publish handles by swapping the entry
+		// and marking the old cold frame dead.
+		if off&tierBit == 0 && !s.isSep(off) && uint64(len(val)) <= s.vcapBytes(off) {
 			s.inPlace(off, val)
 			return false, nil
 		}
@@ -201,10 +206,17 @@ func (s *Store) DeleteKind(key []byte, kind byte) bool {
 			return false
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
-			// A separated element's cold value is now unreferenced; account it as dead,
-			// and return its resident bytes to its segment so the arena can drain it.
-			s.markSepDead(off)
-			s.unlinkResident(off)
+			if off&tierBit != 0 {
+				// A cold element: its frame in the record region is now unreferenced dead
+				// space, and there is no resident record to return to a segment (doc 21
+				// section 9), the collection twin of Delete's cold branch.
+				s.markColdRecDead(off &^ tierBit)
+			} else {
+				// A separated element's cold value is now unreferenced; account it as dead,
+				// and return its resident bytes to its segment so the arena can drain it.
+				s.markSepDead(off)
+				s.unlinkResident(off)
+			}
 			s.count.Add(-1)
 			s.addTop(kind, -1)
 			return true
@@ -232,6 +244,12 @@ func (s *Store) DeleteKindNoCount(key []byte, kind byte) bool {
 			return false
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
+			if off&tierBit != 0 {
+				// A cold element: its immutable frame is now unreferenced dead space, with no
+				// resident bytes to return to a segment (doc 21 section 9).
+				s.markColdRecDead(off &^ tierBit)
+				return true
+			}
 			// A separated element's cold value is now unreferenced; account it as dead. This
 			// stays per element because it addresses the specific record's cold bytes; only the
 			// contended global count is what the caller batches. The resident bytes leave the
@@ -259,26 +277,26 @@ func (s *Store) TakeKind(key, dst []byte, kind byte) ([]byte, bool) {
 		if !found {
 			return dst[:0], false
 		}
-		// A separated element (a large list element on the cold log) resolves through the
-		// pread path; the value is copied into dst before the slot is cleared, so the
-		// returned bytes stay valid after the index entry is gone. The cold bytes are left
-		// as dead space, reclaimed by a later compaction milestone, the same as any other
-		// separated overwrite.
-		var v []byte
-		if s.cold != nil && s.isSep(off) {
-			var ok bool
-			if v, ok = s.readSeparated(off, dst); !ok {
-				return dst[:0], false
-			}
-		} else {
-			v = s.readValue(off, dst)
+		// A cold element (a migrated row on the record region) or a separated element (a
+		// large list element on the cold value log) both resolve through the pread path;
+		// readValueByAddr branches on the tier bit. The value is copied into dst before the
+		// slot is cleared, so the returned bytes stay valid after the index entry is gone.
+		v, ok := s.readValueByAddr(off, dst)
+		if !ok {
+			return dst[:0], false
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
-			// The popped element's cold value (a separated large list element) is now
-			// unreferenced; account it as dead space for a later compaction pass, and
-			// return its resident bytes to its segment so the arena can drain it.
-			s.markSepDead(off)
-			s.unlinkResident(off)
+			if off&tierBit != 0 {
+				// A cold element: its frame is now unreferenced dead space, no resident
+				// bytes to return to a segment (doc 21 section 9).
+				s.markColdRecDead(off &^ tierBit)
+			} else {
+				// The popped element's cold value (a separated large list element) is now
+				// unreferenced; account it as dead space for a later compaction pass, and
+				// return its resident bytes to its segment so the arena can drain it.
+				s.markSepDead(off)
+				s.unlinkResident(off)
+			}
 			s.count.Add(-1)
 			s.addTop(kind, -1)
 			return v, true
@@ -306,16 +324,15 @@ func (s *Store) TakeKindNoCount(key, dst []byte, kind byte) ([]byte, bool) {
 		if !found {
 			return dst[:0], false
 		}
-		var v []byte
-		if s.cold != nil && s.isSep(off) {
-			var ok bool
-			if v, ok = s.readSeparated(off, dst); !ok {
-				return dst[:0], false
-			}
-		} else {
-			v = s.readValue(off, dst)
+		v, ok := s.readValueByAddr(off, dst)
+		if !ok {
+			return dst[:0], false
 		}
 		if b.slots[slot].CompareAndSwap(word, 0) {
+			if off&tierBit != 0 {
+				s.markColdRecDead(off &^ tierBit)
+				return v, true
+			}
 			s.markSepDead(off)
 			s.unlinkResident(off)
 			return v, true
