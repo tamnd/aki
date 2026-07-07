@@ -240,13 +240,10 @@ func TestSegmentEpochNoUseAfterFree(t *testing.T) {
 	for iter := 0; iter < len(keysA)*40 && !reused; iter++ {
 		s.reclaimSegments()
 		k := []byte(fmt.Sprintf("c%07d", iter))
-		if err := s.Set(k, churnVal("c", iter)); err != nil {
-			// Arena momentarily full: a reclaim pass may free seg0 now that readers have moved on.
-			s.reclaimSegments()
-			if err2 := s.Set(k, churnVal("c", iter)); err2 != nil {
-				break
-			}
-		}
+		// A momentary full arena means seg0 is retired but not yet safe to reclaim while a reader
+		// still holds its epoch; setReusingFreedSeg yields until the readers release it and the
+		// reclaim frees seg0, rather than giving up after two attempts (which flaked on slower boxes).
+		setReusingFreedSeg(t, s, k, churnVal("c", iter))
 		// Delete the filler so the index stays bounded across the long churn; the point is to
 		// keep advancing the current segment through seg0, not to accumulate keys.
 		s.Delete(k)
