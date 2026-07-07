@@ -168,10 +168,10 @@ func (s *Store) CollPartRandOne(base []byte, p int, r uint64) (key []byte, ok bo
 		vs := s.rvec.shardFor(base).get(base).view.Load()
 		n := len(vs.s)
 		if local < n {
-			return s.keyAt(vs.s[local]), true
+			return s.keyAtTiered(vs.s[local], nil), true
 		}
 		if n > 0 {
-			return s.keyAt(vs.s[drawIndexWord(mixWord(r), n)]), true
+			return s.keyAtTiered(vs.s[drawIndexWord(mixWord(r), n)], nil), true
 		}
 		r = mixWord(r)
 	}
@@ -237,7 +237,7 @@ func (s *Store) CollPartPopLocked(base []byte) (key []byte, ok bool) {
 	off := v.slots[i]
 	v.remove(off)
 	sh.mu.Unlock()
-	return s.keyAt(off), true
+	return s.keyAtTiered(off, nil), true
 }
 
 // CollPartSampleDistinct draws up to want distinct members by the weighted scheme without
@@ -276,7 +276,7 @@ func (s *Store) CollPartSampleDistinct(base []byte, p, want int, r uint64, dst [
 			continue
 		}
 		seen[off] = struct{}{}
-		dst = append(dst, s.keyAt(off))
+		dst = append(dst, s.keyAtTiered(off, nil))
 	}
 	return dst
 }

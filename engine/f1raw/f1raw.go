@@ -193,6 +193,20 @@ type Store struct {
 	// boundary; the engine trusts the policy the same way it trusts topKind.
 	migratableKind func(kind byte) bool
 
+	// vecMemberKind is the server-supplied classifier that names the record kinds whose membership
+	// is cached in a dense member vector (randvec.go), the set member row today. The engine is
+	// type-agnostic, so it cannot tell a set member row from a hash field row by its kind byte, yet
+	// the two follow a record across the tier boundary by different mechanisms: the hash field's
+	// ordered index re-resolves the record's address through the primary index on each access (D22
+	// Option B, tier-safe with no migrator help), while the set member vector caches a raw resident
+	// offset the migrator must repair in place as the record moves (D22 Option A, migrate.go
+	// dispatches such a kind to migrateVecMember instead of the plain flip). A nil hook (the
+	// default) means no kind is vector-backed, so the migrator uses the plain flip for every
+	// migratable kind, exactly as before any server opts a set kind in. It is read without
+	// synchronization on the migrator goroutine, so set it once at startup through
+	// SetVecMemberKindFunc before serving.
+	vecMemberKind func(kind byte) bool
+
 	// oidx is the ordered element index (oindex.go): the in-memory per-collection
 	// sorted run that lets a bounded cursor enumerate one collection's elements in key
 	// order. It is maintained explicitly by the collection element path (CollInsert /
@@ -364,6 +378,23 @@ func (s *Store) SetTopKindFunc(f func(kind byte) bool) { s.topKind = f }
 // leaves the migrator string-only. A string record is migratable regardless of this hook, so a hook
 // need only name the collection kinds it opts in, not repeat stringKind.
 func (s *Store) SetMigratableKindFunc(f func(kind byte) bool) { s.migratableKind = f }
+
+// SetVecMemberKindFunc installs the classifier that names the record kinds whose membership lives in
+// a dense member vector (the set member row), so the migrator repairs the cached offset in place as
+// such a record moves to the cold region (D22 Option A) instead of the plain address flip a
+// tier-safe collection kind gets. Like the other kind hooks it is server policy, read without
+// synchronization on the migrator goroutine, so set it once at startup before serving. A nil hook
+// (the default) means no kind is vector-backed and every migratable kind takes the plain flip. A
+// kind admitted here must also be admitted by SetMigratableKindFunc, since the migrator only reaches
+// the vector dispatch for a kind it is already allowed to sink.
+func (s *Store) SetVecMemberKindFunc(f func(kind byte) bool) { s.vecMemberKind = f }
+
+// isVecMember reports whether kind names a set member row whose offset the migrator must retier in
+// place. It centralizes the nil-hook default so the migrator's dispatch and MigrateToCold's
+// hand-mover ask the same question the same way.
+func (s *Store) isVecMember(kind byte) bool {
+	return s.vecMemberKind != nil && s.vecMemberKind(kind)
+}
 
 // TopLen reports the number of live top-level keys, an O(1) read of the counter maintained
 // alongside the record count. It is what DBSIZE returns. A key whose TTL has passed but which
