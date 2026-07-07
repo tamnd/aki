@@ -367,6 +367,13 @@ func New(cfg Config) *Server {
 		// live-key counter for DBSIZE, the same policy KEYS/SCAN/RANDOMKEY hand ScanKeys.
 		// Set before the server accepts traffic, on the still-empty store.
 		srv.store.SetTopKindFunc(isTopKind)
+		// Widen the background migrator past its string floor to the collection element kinds the
+		// server has proven tier-safe (spec 2064/21 D22 Option B), so those elements can sink cold
+		// under fill pressure while their header row stays resident. Only the hash field kind
+		// qualifies today; isMigratableKind documents why the other element kinds still wait. This
+		// is inert unless cfg.Migrator started the migrator below, and like SetTopKindFunc it is set
+		// once here on the still-empty store, before the server accepts traffic.
+		srv.store.SetMigratableKindFunc(isMigratableKind)
 		// Take the O(log n) ordered-index splice off the element-delete reply path: a delete
 		// queues the removal and a background folder splices it under the index lock later
 		// (spec 2064/16 slice 2). Enable once here, before the server accepts traffic.

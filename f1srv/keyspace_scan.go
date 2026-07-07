@@ -37,6 +37,27 @@ func isTopKind(kind byte) bool {
 	return false
 }
 
+// isMigratableKind reports whether the background migrator may sink a record of this kind to the
+// cold region (engine SetMigratableKindFunc). The engine already migrates strings unconditionally;
+// this predicate names the collection element kinds the server has proven tier-safe on top of that
+// floor. A kind is tier-safe only when every one of its read, write, and delete paths follows a
+// record across the tier boundary rather than trusting a cached resident address.
+//
+// Only the hash field row qualifies today. Its sole secondary structure is the ordered element
+// index, whose nodes re-resolve their address through the tier-aware primary index on each access
+// (spec 2064/21 D22 Option B), so HGET, HGETALL, HSCAN, and HRANDFIELD all resolve a migrated field
+// from the cold frame with no per-node migration hook. The hash header row stays a top-level key
+// and resident, so it is never offered here.
+//
+// The other element kinds are deliberately excluded until each is audited the same way. The zset
+// carries two element kinds (a member row and a score-family row) that a range read walks together,
+// the list keeps an order-statistic window, and the set member row is read through the dense member
+// vector, which caches a raw arena offset and reads the member key from it (engine randvec.go), so
+// it cannot re-resolve by key and needs the heavier Option A retier hook before it can migrate.
+func isMigratableKind(kind byte) bool {
+	return kind == kindHashField
+}
+
 // keyKindName maps a resolved key type to the Redis type name SCAN's TYPE filter compares
 // against, matching the words TYPE returns.
 func keyKindName(k keyKind) string {
