@@ -84,17 +84,6 @@ type epochGuard struct {
 	idx int
 }
 
-// protect returns an epoch guard for the current operation. On a segmented store it pins a slot
-// and publishes the live epoch (pin); on a non-segmented store, which never reclaims, it returns
-// the zero guard whose unpin is a no-op, so the in-memory-fit point path pays nothing. A caller
-// that already branches on s.segmented for the hot path calls pin directly instead.
-func (s *Store) protect() epochGuard {
-	if !s.segmented {
-		return epochGuard{}
-	}
-	return s.pin()
-}
-
 // pin claims a free epoch slot and publishes the current global epoch into it, returning a guard
 // that holds the slot until unpin. Claiming scans the slot array from a rotating hint for a free
 // (zero) slot and CAS-claims it with the live epoch in one word, so the claim and the first
