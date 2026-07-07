@@ -82,6 +82,15 @@ func (s *Store) drainRecord(off uint64) bool {
 		return false
 	}
 	kind := s.arena[off+offKind]
+	if !migratable(kind) {
+		// A collection element record still has resident addresses cached in its type's
+		// secondary structures (the ordered index and the set member vectors), which a cold
+		// flip would leave dangling until D8/D20 refreshes them on migration. Until that
+		// lands, only string records, which have no secondary structure and a fully
+		// tier-aware read, write, and delete path, are safe to sink; leave the rest resident.
+		// A pure-string larger-than-memory workload drains its segments fully regardless.
+		return false
+	}
 	klen := s.klen(off)
 	key := s.arena[off+hdrSize : off+hdrSize+klen]
 	h := hash(key)
@@ -105,6 +114,16 @@ func (s *Store) drainRecord(off uint64) bool {
 		// Lost the entry to a concurrent writer; the appended frame is now dead space. Re-probe:
 		// if the key moved off this offset the next iteration bails, otherwise the retry sinks it.
 	}
+}
+
+// migratable reports whether a record of the given kind is safe for the background migrator to
+// sink to the cold region. Only string records qualify today: they carry no secondary structure
+// and their read, write, and delete paths all cross the tier boundary (doc 21 section 9). A
+// collection element record's kind fails this until D8/D20 teaches its type's ordered index and
+// member vectors to follow a record cold, so the migrator leaves such records resident. This is
+// the one place the safe set is named, so widening it later is a single edit here.
+func migratable(kind byte) bool {
+	return kind == stringKind
 }
 
 // drainSegment sinks every record still live in segment si to the cold region and retires the
