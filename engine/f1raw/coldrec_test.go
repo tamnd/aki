@@ -301,3 +301,64 @@ func TestColdCollScanReresolvesMigrated(t *testing.T) {
 		t.Fatal("no enumerated field re-resolved to a cold address; the migration or re-resolution did not engage")
 	}
 }
+
+// TestColdCollScanReresolvesMigratedLongKey is the same D22 Option B gate as above, but every
+// element's composite key is longer than onodeInlineCap (32), so the ordered-index node cannot
+// hold the whole key inline and instead keeps its own full copy. The point of the test is that a
+// long key stays arena-free too: once an element's record migrates cold and its resident bytes
+// are reclaimed, nodeKey and cmpKey must still yield the key from the node's own storage, and
+// nodeAddr must re-resolve the live cold address through the primary index by that key. If the
+// node still read the key from the (reclaimed) arena offset, enumeration would either miss the
+// element or read a foreign key, so the scan returning every field by its exact key and value is
+// the proof the long-key path is arena-independent.
+func TestColdCollScanReresolvesMigratedLongKey(t *testing.T) {
+	s := newRecStore(t)
+	const n = 24
+	const coll = "h:"
+	want := make(map[string][]byte, n)
+	keysByIndex := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		// A member long enough that coll+member exceeds onodeInlineCap, forcing the node's
+		// full-key copy rather than the inline cache.
+		member := fmt.Sprintf("member-with-a-deliberately-long-name-%03d", i)
+		k := append([]byte(coll), member...)
+		if len(k) <= onodeInlineCap {
+			t.Fatalf("test key %q is %d bytes, not longer than the inline cap %d", k, len(k), onodeInlineCap)
+		}
+		v := []byte(fmt.Sprintf("field-value-%02d", i))
+		if _, err := s.PutKind(k, v, benchKindHashField); err != nil {
+			t.Fatalf("PutKind %d: %v", i, err)
+		}
+		s.CollInsert(k, benchKindHashField)
+		keysByIndex[i] = k
+		want[string(k)] = v
+	}
+
+	for i := 0; i < n; i += 3 {
+		if !s.MigrateToCold(keysByIndex[i], benchKindHashField) {
+			t.Fatalf("MigrateToCold field %d returned false", i)
+		}
+	}
+
+	keys, offs, _ := s.CollScanKV([]byte(coll), nil, n, nil, nil)
+	if len(keys) != n {
+		t.Fatalf("CollScanKV returned %d keys, want %d", len(keys), n)
+	}
+	sawCold := false
+	for i, off := range offs {
+		w, ok := want[string(keys[i])]
+		if !ok {
+			t.Fatalf("enumeration returned unexpected key %q, the long-key node read a stale arena offset", keys[i])
+		}
+		val := s.ReadValueAt(off, nil)
+		if !bytes.Equal(val, w) {
+			t.Fatalf("field %q read back %q, want %q through the tier-aware enumeration", keys[i], val, w)
+		}
+		if off&tierBit != 0 {
+			sawCold = true
+		}
+	}
+	if !sawCold {
+		t.Fatal("no enumerated long-key field re-resolved to a cold address; the migration or re-resolution did not engage")
+	}
+}
