@@ -81,6 +81,57 @@ func TestServerMigratorServesBeyondArena(t *testing.T) {
 	}
 }
 
+// TestServerMigratorServesHashBeyondArena is the D22 Option B gate at the server level: with the
+// hash field kind admitted to the migrator (isMigratableKind), a hash whose field rows outgrow the
+// resident arena is served correctly over the wire, most fields now cold. It fills one hash with
+// far more large fields than the small arena can hold, so the migrator sinks full segments of field
+// rows into the cold record region as they fill while the hash header row stays resident, and every
+// HSET must still succeed (D12 backpressure waits on the migrator rather than erroring). Then HGET
+// reads each field back across the tier, and a single HGETALL re-resolves every field through the
+// tier-aware ordered index and reads its value from whichever tier holds it. Without the admission
+// the field rows cannot migrate, the arena fills, and HSET errors partway through the load.
+func TestServerMigratorServesHashBeyondArena(t *testing.T) {
+	rw, cleanup := dialMigratorServer(t)
+	defer cleanup()
+
+	// One hash, many 200-byte fields: the field rows are several arenas' worth of record bytes and
+	// cannot all stay resident, while the single header row pins at most one segment. Pipeline the
+	// writes so the load is not one round trip per field.
+	const n = 20000
+	val := strings.Repeat("x", 200)
+	for i := 0; i < n; i++ {
+		cmd(t, rw, "HSET", "h", fmt.Sprintf("f%08d", i), migVal(i, val))
+	}
+	for i := 0; i < n; i++ {
+		expect(t, rw, ":1") // each field is new, so HSET reports one field added
+	}
+
+	// Point path: HGET reads each field back, most from the cold region, all exact.
+	for i := 0; i < n; i++ {
+		cmd(t, rw, "HGET", "h", fmt.Sprintf("f%08d", i))
+	}
+	for i := 0; i < n; i++ {
+		want := "$" + migVal(i, val)
+		if got := readReply(t, rw); got != want {
+			t.Fatalf("HGET h f%08d = %q, want %q", i, got, want)
+		}
+	}
+
+	// Enumeration path: one HGETALL returns every field with its exact value, re-resolving the
+	// migrated ones through the tier-aware ordered index.
+	cmd(t, rw, "HGETALL", "h")
+	got := readArrayMap(t, rw)
+	if len(got) != n {
+		t.Fatalf("HGETALL returned %d fields, want %d", len(got), n)
+	}
+	for i := 0; i < n; i++ {
+		f := fmt.Sprintf("f%08d", i)
+		if got[f] != migVal(i, val) {
+			t.Fatalf("HGETALL field %s = %q, want %q", f, got[f], migVal(i, val))
+		}
+	}
+}
+
 // TestServerMigratorConfigError checks that asking for the migrator without the segmented arena
 // it needs is a clean configuration error surfaced by Listen, not a panic from EnableMigrator.
 func TestServerMigratorConfigError(t *testing.T) {
