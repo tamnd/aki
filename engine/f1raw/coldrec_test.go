@@ -1,6 +1,7 @@
 package f1raw
 
 import (
+	"bytes"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -239,4 +240,64 @@ func (s *Store) isSepKey(t *testing.T, key []byte, kind byte) bool {
 		t.Fatalf("isSepKey: key %q missing", key)
 	}
 	return off&tierBit == 0 && s.isSep(off)
+}
+
+// TestColdCollScanReresolvesMigrated is the D22 Option B gate: a value-carrying enumeration
+// over a hash whose element records have partly migrated to the cold record region must return
+// every field's value, resolving the migrated ones through the cold frame. The ordered-index
+// node caches the element's resident offset, which the migration turned into dead space, so a
+// scan that trusted that cached offset would read stale bytes (or dangle once the segment is
+// reclaimed). scanBatch re-resolves each node through the tier-aware index, so a migrated
+// element surfaces with its cold (tier-bit-set) address and ReadValueAt preads the frame. The
+// migrator ships gated to strings, so this drives the flip directly with MigrateToCold to prove
+// the enumeration path is correct the moment migratable() widens to collection kinds.
+func TestColdCollScanReresolvesMigrated(t *testing.T) {
+	s := newRecStore(t)
+	const n = 24
+	const coll = "h:"
+	want := make(map[string][]byte, n)
+	var kb [64]byte
+	keysByIndex := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		k := collElemKey(kb[:], coll, uint64(i))
+		v := []byte(fmt.Sprintf("field-value-%02d", i))
+		if _, err := s.PutKind(k, v, benchKindHashField); err != nil {
+			t.Fatalf("PutKind %d: %v", i, err)
+		}
+		s.CollInsert(k, benchKindHashField)
+		kc := append([]byte(nil), k...)
+		keysByIndex[i] = kc
+		want[string(kc)] = v
+	}
+
+	// Migrate every third element cold; the rest stay resident. The scan must read both tiers.
+	for i := 0; i < n; i += 3 {
+		if !s.MigrateToCold(keysByIndex[i], benchKindHashField) {
+			t.Fatalf("MigrateToCold field %d returned false", i)
+		}
+	}
+
+	keys, offs, _ := s.CollScanKV([]byte(coll), nil, n, nil, nil)
+	if len(keys) != n {
+		t.Fatalf("CollScanKV returned %d keys, want %d", len(keys), n)
+	}
+	sawCold := false
+	for i, off := range offs {
+		val := s.ReadValueAt(off, nil)
+		w := want[string(keys[i])]
+		if !bytes.Equal(val, w) {
+			t.Fatalf("field %q read back %q, want %q through the tier-aware enumeration", keys[i], val, w)
+		}
+		if off&tierBit != 0 {
+			sawCold = true
+			// A migrated element must report non-inline so a consumer that tries the zero-copy
+			// path falls back to the cold pread rather than indexing the arena with a tagged offset.
+			if _, inline := s.ValueAtLocked(off); inline {
+				t.Fatalf("cold field %q reported inline, want the ReadValueAt fallback", keys[i])
+			}
+		}
+	}
+	if !sawCold {
+		t.Fatal("no enumerated field re-resolved to a cold address; the migration or re-resolution did not engage")
+	}
 }
