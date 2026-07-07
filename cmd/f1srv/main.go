@@ -48,6 +48,9 @@ func main() {
 	setPartTarget := fs.Int("set-partition-target", 0, "members-per-partition a grow aims for (0 = built-in default)")
 	ltmCold := fs.Bool("ltm-cold", false, "engage the larger-than-memory string tier: separate large values to a cold log under --dir")
 	sepThreshold := fs.Int("sep-threshold", 0, "inline-vs-separated value cutoff in bytes for --ltm-cold (0 = engine default)")
+	arenaSegmented := fs.Bool("arena-segmented", false, "use the reclaimable segmented arena (spec 2064/21 M0); off keeps the grow-only bump arena")
+	arenaSegmentBytes := fs.Int("arena-segment-bytes", 0, "segment size in bytes for --arena-segmented (0 = engine default 8 MiB, floored at the largest record)")
+	arenaOverflowBytes := fs.Int("arena-overflow-bytes", 0, "never-reclaimed overflow-bucket region size for --arena-segmented (0 = an eighth of the arena)")
 	pprofAddr := fs.String("pprof", "", "if set, serve net/http/pprof on this host:port (profiling only, off by default)")
 	// --gogc and --gomemlimit are optional heap-pacing knobs for the LTM regime,
 	// where a large arena and a cold value log grow the heap and an operator may
@@ -91,6 +94,9 @@ func main() {
 	cfg.SetPartitionMax = *setPartMax
 	cfg.SetPartitionThreshold = *setPartThreshold
 	cfg.SetPartitionTarget = *setPartTarget
+	cfg.ArenaSegmented = *arenaSegmented
+	cfg.ArenaSegmentBytes = *arenaSegmentBytes
+	cfg.ArenaOverflowBytes = *arenaOverflowBytes
 	if *ltmCold {
 		cfg.ColdPath = filepath.Join(*dir, "f1raw-cold.vlog")
 		cfg.SepThreshold = *sepThreshold

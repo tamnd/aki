@@ -53,6 +53,23 @@ type Config struct {
 	// value uses the engine default. It is ignored when ColdPath is empty.
 	SepThreshold int
 
+	// ArenaSegmented switches the store's arena to the reclaimable segmented layout of the
+	// collection cold-record tiering plan (spec 2064/21), milestone M0. Default false keeps
+	// the grow-only bump arena, so the resident point path is unchanged. When true the arena
+	// is divided into ArenaSegmentBytes segments that can be freed and reused, with overflow
+	// buckets in their own never-reclaimed region; it composes with a cold value log. The
+	// milestones that make it close the collection-LTM gap (the tier-tagged index, the cold
+	// record region, and the migrator) land on top of this in later slices, so on its own the
+	// segmented arena changes only how bytes are reclaimed, not what spills to disk.
+	ArenaSegmented bool
+	// ArenaSegmentBytes is the segment size when ArenaSegmented is set; a non-positive value
+	// uses the engine default (8 MiB). It is floored at the largest record so no record spans
+	// a segment. ArenaOverflowBytes sizes the never-reclaimed overflow-bucket region; a
+	// non-positive value reserves an eighth of the arena. Both are ignored unless
+	// ArenaSegmented is set.
+	ArenaSegmentBytes  int
+	ArenaOverflowBytes int
+
 	// SetPartitionMax caps the partitions one hot set can engage under the adaptive intra-key
 	// partitioning of spec 2064/f1_rewrite_ltm/19. The default of 1 leaves the feature off: every
 	// set stays unpartitioned and the set commands run their existing single-lock bodies with no
@@ -313,6 +330,12 @@ func New(cfg Config) *Server {
 		}
 	} else {
 		srv.store = f1raw.New(cfg.IndexBuckets, cfg.ArenaBytes)
+	}
+	if srv.store != nil && cfg.ArenaSegmented {
+		// Switch the arena to the reclaimable segmented layout before serving, on the
+		// still-empty store, so it composes with a cold log or a pure in-memory store
+		// (spec 2064/21 M0). Default off leaves the grow-only bump path in place.
+		srv.store.EnableSegments(cfg.ArenaSegmentBytes, cfg.ArenaOverflowBytes)
 	}
 	if srv.store != nil {
 		// Teach the engine which record kinds are top-level keys so it can keep an O(1)

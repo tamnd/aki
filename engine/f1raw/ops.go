@@ -126,7 +126,7 @@ func (s *Store) readInt(off uint64) (int64, error) {
 // false only when the arena is full. It mirrors publish's bucket scan but never
 // overwrites an existing key's value.
 func (s *Store) insertAbsent(key, val []byte, h uint64, kind byte) (installed, existed bool) {
-	off, ok := s.alloc(recSize(len(key), len(val)))
+	off, ok := s.allocRec(recSize(len(key), len(val)))
 	if !ok {
 		return false, false
 	}
@@ -196,7 +196,11 @@ func (s *Store) Reset() {
 		}
 		b.link.Store(0)
 	}
-	s.tail.Store(8)
+	if s.segmented {
+		s.resetSegments()
+	} else {
+		s.tail.Store(8)
+	}
 	s.count.Store(0)
 	s.topCount.Store(0)
 	s.oidx = newOIndex(s)
