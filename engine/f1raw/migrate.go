@@ -1,5 +1,15 @@
 package f1raw
 
+// defaultMigHiNum and defaultMigLoNum are the high- and low-water numerators over 100 of the
+// segment budget the migrator drains between (doc 21 D14). It wakes when the resident live-byte
+// total crosses 85% of the budget and drains cold until it falls below 75%, then sleeps. The gap
+// is the batch budget and the hysteresis that keeps the migrator off the boundary. Both are lab
+// knobs the bench sweeps; EnableMigrator seeds these defaults and a test overrides the fields.
+const (
+	defaultMigHiNum = 85
+	defaultMigLoNum = 75
+)
+
 // This file adds the migrator's drain loop, the core of milestone M3 of the collection
 // cold-record tiering plan (spec 2064/f1_rewrite_ltm/21 section 6). M0 made the arena
 // reclaimable, M1 gave a record a way to leave RAM whole (the tier-tagged index and the
@@ -117,4 +127,151 @@ func (s *Store) drainSegment(si uint64) {
 	if seg.live.Load() == 0 {
 		s.retireSegment(si)
 	}
+}
+
+// EnableMigrator starts the background migrator, the goroutine that drives records cold under
+// arena fill pressure (doc 21 section 6). It requires a segmented arena and an enabled cold record
+// region: the migrator sinks whole record frames into the region, so both must be set up first,
+// which the server does at startup and a test does before writing. It seeds the default high- and
+// low-water marks, which a caller can override on the store fields before the first fill, and spawns
+// one migrator goroutine. Calling it twice, or without segments or a cold region, is a caller error;
+// a store that never calls it never allocates the channels and never pays for the migrator. Close
+// stops the goroutine before closing the cold region it writes to.
+func (s *Store) EnableMigrator() {
+	if !s.segmented || s.recs == nil {
+		panic("f1raw: EnableMigrator needs a segmented arena and an enabled cold record region")
+	}
+	if s.migOn.Load() {
+		panic("f1raw: migrator already enabled")
+	}
+	if s.migHiNum == 0 {
+		s.migHiNum = defaultMigHiNum
+	}
+	if s.migLoNum == 0 {
+		s.migLoNum = defaultMigLoNum
+	}
+	s.migStop = make(chan struct{})
+	s.migDone = make(chan struct{})
+	s.migWake = make(chan struct{}, 1)
+	s.migOn.Store(true)
+	go s.migrator()
+}
+
+// signalMigrator wakes the migrator to reassess the fill level. It is a single non-blocking send on
+// a size-one channel, so a wake already pending coalesces with this one and the caller never blocks,
+// which is what lets it be called from advanceSeg under segMu. It is a no-op unless the migrator is
+// engaged, gated by one atomic load so the non-segmented and no-migrator paths pay nothing.
+func (s *Store) signalMigrator() {
+	if !s.migOn.Load() {
+		return
+	}
+	select {
+	case s.migWake <- struct{}{}:
+	default:
+	}
+}
+
+// migrator is the background goroutine's loop: sleep until woken by a segment advance or a stop,
+// then run one migration pass. It owns no segment between passes, so a stop between passes exits at
+// once; a stop during a pass is picked up by the pass's own stop check, then this returns on the
+// next select. It closes migDone on exit so Close can wait for it to finish.
+func (s *Store) migrator() {
+	defer close(s.migDone)
+	for {
+		select {
+		case <-s.migStop:
+			return
+		case <-s.migWake:
+		}
+		s.migrateDown()
+	}
+}
+
+// migrateDown runs one migration pass: if the resident live-byte total is above the high-water mark
+// it drains the emptiest eligible full segments to cold, one at a time, until the total falls below
+// the low-water mark or no eligible segment remains. It bounds the pass at the segment count so a
+// disk error that keeps a segment from draining cannot spin the goroutine; the next wake resumes.
+// It checks the stop signal between segments so Close does not wait a whole pass.
+func (s *Store) migrateDown() {
+	budget := uint64(len(s.segs)) * s.segSize
+	hi := budget * s.migHiNum / 100
+	lo := budget * s.migLoNum / 100
+	if s.liveBytes() < hi {
+		return
+	}
+	for n := 0; n < len(s.segs) && s.liveBytes() >= lo; n++ {
+		si, ok := s.pickDrainTarget()
+		if !ok {
+			return
+		}
+		s.drainSegment(si)
+		select {
+		case <-s.migStop:
+			return
+		default:
+		}
+	}
+}
+
+// liveBytes sums the resident live-byte total across every segment, the figure the migrator's
+// trigger reads against the budget (D14). It is an O(segment count) walk of atomic counters, run on
+// the migrator goroutine and never on the foreground request path, so the walk is fine. A freed or
+// never-used segment reads its counter as zero and contributes nothing.
+func (s *Store) liveBytes() uint64 {
+	var total int64
+	for i := range s.segs {
+		if v := s.segs[i].live.Load(); v > 0 {
+			total += v
+		}
+	}
+	return uint64(total)
+}
+
+// pickDrainTarget returns the emptiest full segment eligible to drain, the D15 unit-of-work
+// selection: preferring the one with the fewest live bytes (least work per segment freed) among the
+// full segments that are neither the current allocation target nor already retired. A full segment
+// is one whose bump cursor reached its seal, so a free or partially filled segment (cursor below the
+// seal) is never a target and no new record is landing in the one chosen. It runs under segMu so its
+// view of the current pointer and the retire list is consistent with the allocators and the
+// reclaimer. ok is false when no full segment is eligible, which sends the migrator back to sleep.
+func (s *Store) pickDrainTarget() (uint64, bool) {
+	s.segMu.Lock()
+	defer s.segMu.Unlock()
+	cur := s.curSeg.Load()
+	var best uint64
+	var bestLive int64 = -1
+	for i := range s.segs {
+		si := uint64(i)
+		if si == cur {
+			continue
+		}
+		seg := &s.segs[i]
+		if seg.alloc.Load() < seg.base+s.segSize {
+			continue // free or partially filled: not a full drain target
+		}
+		if s.isRetiredLocked(si) {
+			continue // already drained and retired, awaiting reader quiescence
+		}
+		live := seg.live.Load()
+		if bestLive < 0 || live < bestLive {
+			bestLive = live
+			best = si
+		}
+	}
+	if bestLive < 0 {
+		return 0, false
+	}
+	return best, true
+}
+
+// isRetiredLocked reports whether segment si is on the retire list, awaiting the epoch gate before
+// it returns to the free list. It must be called under segMu. The list holds only drained segments
+// not yet reclaimed, so it stays short, and the linear scan is off the foreground path.
+func (s *Store) isRetiredLocked(si uint64) bool {
+	for _, r := range s.retSegs {
+		if r == si {
+			return true
+		}
+	}
+	return false
 }
