@@ -121,7 +121,7 @@ func TestDeferredRemovalReAddKeepsNode(t *testing.T) {
 
 	// Now the folder runs: removeManyLive must skip b because its record is live again.
 	buf, ends := packKeys(bk)
-	s.oidx.removeManyLive(buf, ends, kindTestField)
+	s.oidx.Load().removeManyLive(buf, ends, kindTestField)
 
 	prefix := collPrefix("h")
 	got := scanAll(s, prefix, 8)
@@ -162,7 +162,7 @@ func TestDeferredRemovalDeadKeySpliced(t *testing.T) {
 		t.Fatal("DeleteKind(b) reported absent")
 	}
 	buf, ends := packKeys(bk)
-	s.oidx.removeManyLive(buf, ends, kindTestField)
+	s.oidx.Load().removeManyLive(buf, ends, kindTestField)
 
 	prefix := collPrefix("h")
 	got := scanAll(s, prefix, 8)

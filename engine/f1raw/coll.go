@@ -144,7 +144,7 @@ func (s *Store) PutKind(key, val []byte, kind byte) (created bool, err error) {
 		// The record moved; point any ordered-index node at the new offset so a
 		// value-carrying scan reads the current record. A no-op for an unindexed record.
 		if noff, _, _, _, ok := s.find(key, h, kind); ok {
-			s.oidx.refresh(noff)
+			s.oidx.Load().refresh(noff)
 		}
 		return !found, nil
 	}
@@ -167,7 +167,7 @@ func (s *Store) PutKind(key, val []byte, kind byte) (created bool, err error) {
 		// current value straight from the node instead of the abandoned old record. refresh
 		// is a no-op for an unindexed record (a header row), so this is safe for any kind.
 		if noff, _, _, _, ok := s.find(key, h, kind); ok {
-			s.oidx.refresh(noff)
+			s.oidx.Load().refresh(noff)
 		}
 		return false, nil
 	}
@@ -392,14 +392,14 @@ func (s *Store) CollInsert(key []byte, kind byte) {
 	if !found {
 		return
 	}
-	s.oidx.insert(off)
+	s.oidx.Load().insert(off)
 }
 
 // CollRemove drops key from the ordered element index. Call it right after DeleteKind
 // removes an element row, under the same stripe lock, so the ordered run does not
 // enumerate a deleted element.
 func (s *Store) CollRemove(key []byte) {
-	s.oidx.remove(key)
+	s.oidx.Load().remove(key)
 }
 
 // CollRemoveMany drops every key in keys from the ordered element index under a single
@@ -409,7 +409,7 @@ func (s *Store) CollRemove(key []byte) {
 // cycle over the whole run instead of one per element. Call it under the collection's
 // stripe lock, the same serialization CollRemove relies on.
 func (s *Store) CollRemoveMany(keys [][]byte) {
-	s.oidx.removeMany(keys)
+	s.oidx.Load().removeMany(keys)
 }
 
 // CollScan appends, to dst, the full composite keys of up to limit element rows whose
@@ -421,7 +421,7 @@ func (s *Store) CollRemoveMany(keys [][]byte) {
 // is the bounded cursor the whole-collection reads (HGETALL, HKEYS, HVALS, HSCAN)
 // stream through, so they never materialize the collection.
 func (s *Store) CollScan(prefix, after []byte, limit int, dst [][]byte) (keys [][]byte, last []byte) {
-	offs, last := s.oidx.scanBatch(prefix, after, limit, make([]uint64, 0, limit))
+	offs, last := s.oidx.Load().scanBatch(prefix, after, limit, make([]uint64, 0, limit))
 	for _, off := range offs {
 		dst = append(dst, s.keyAt(off))
 	}
@@ -502,7 +502,7 @@ func (s *Store) ScanKeys(cursor uint64, count int, dst [][]byte, isTop func(kind
 // reads a stale record. Both slices grow in lockstep, so dstOffs[i] is the offset of
 // dstKeys[i]. This is the primitive that closes the HVALS/HGETALL gap to HKEYS.
 func (s *Store) CollScanKV(prefix, after []byte, limit int, dstKeys [][]byte, dstOffs []uint64) (keys [][]byte, offs []uint64, last []byte) {
-	dstOffs, last = s.oidx.scanBatch(prefix, after, limit, dstOffs)
+	dstOffs, last = s.oidx.Load().scanBatch(prefix, after, limit, dstOffs)
 	for _, off := range dstOffs {
 		dstKeys = append(dstKeys, s.keyAt(off))
 	}
@@ -556,7 +556,7 @@ func (s *Store) ValueAtLocked(off uint64) (val []byte, inline bool) {
 // past the collection's cardinality reports absent rather than crossing into a sibling
 // collection.
 func (s *Store) CollSelectAt(prefix []byte, localIndex int) (key []byte, ok bool) {
-	return s.oidx.selectInPrefix(prefix, localIndex)
+	return s.oidx.Load().selectInPrefix(prefix, localIndex)
 }
 
 // CollSelectRemoveAt selects the element at localIndex within prefix and drops it from the
@@ -568,7 +568,7 @@ func (s *Store) CollSelectAt(prefix []byte, localIndex int) (key []byte, ok bool
 // only when the very member just selected is the one being removed; for a select that does
 // not remove, use CollSelectAt.
 func (s *Store) CollSelectRemoveAt(prefix []byte, localIndex int) (key []byte, ok bool) {
-	return s.oidx.selectAndRemoveInPrefix(prefix, localIndex)
+	return s.oidx.Load().selectAndRemoveInPrefix(prefix, localIndex)
 }
 
 // CollRankOf returns the 0-based position of key within the collection bounded by
@@ -579,5 +579,5 @@ func (s *Store) CollSelectRemoveAt(prefix []byte, localIndex int) (key []byte, o
 // where it would fall, not an error. localIndex and rank are inverse over a prefix:
 // CollSelectAt(prefix, CollRankOf(prefix, k)) returns k for any live k under prefix.
 func (s *Store) CollRankOf(prefix, key []byte) int {
-	return s.oidx.rankInPrefix(prefix, key)
+	return s.oidx.Load().rankInPrefix(prefix, key)
 }

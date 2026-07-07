@@ -171,7 +171,15 @@ type Store struct {
 	// order. It is maintained explicitly by the collection element path (CollInsert /
 	// CollRemove) and never touched by the string hot path, so Get/Set/Incr pay
 	// nothing for it.
-	oidx *oindex
+	//
+	// It is an atomic pointer because Reset swaps in a fresh index (FLUSHALL clears the
+	// keyspace) while a foreground collection insert or scan may be reading the old one
+	// on another goroutine. The folder path already serializes against Reset under
+	// folderMu, but the foreground path does not, so the pointer itself is loaded and
+	// stored atomically. A load that races a swap sees either the old or the new index,
+	// never a torn word; an insert that lands in the about-to-be-discarded index is the
+	// flush-races-insert case the store already tolerates.
+	oidx atomic.Pointer[oindex]
 
 	// rvec is the set type's dense member vector (randvec.go): the resident array of member
 	// offsets that answers a uniform random draw (SPOP, SRANDMEMBER) in O(1) instead of an
@@ -252,7 +260,7 @@ func New(indexBuckets, arenaBytes int) *Store {
 		panic("f1raw: arena base not 8-aligned")
 	}
 	s.tail.Store(8) // reserve offset 0 so an empty index entry (addr 0) is unambiguous
-	s.oidx = newOIndex(s)
+	s.oidx.Store(newOIndex(s))
 	s.rvec = newRandVec()
 	s.pdescs = newPartDescs()
 	return s
