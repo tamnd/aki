@@ -468,9 +468,14 @@ func (s *Store) SetVecScanDown(prefix []byte, hi, limit int, dst [][]byte) ([][]
 	if lo < 0 {
 		lo = 0
 	}
+	// Hold the reader's epoch across the whole batch so a migrator cannot reclaim a segment whose
+	// offset a slot still caches while we resolve it; on the segmented arena keyAtTiered copies each
+	// resident key out under this pin, so the returned keys outlive it (spec 22 section 5 race 3).
+	g := s.pinTiered()
 	for i := upper - 1; i >= lo; i-- {
 		dst = append(dst, s.keyAtTiered(atomic.LoadUint64(&vs.s[i]), nil))
 	}
+	g.unpin()
 	return dst, lo
 }
 
@@ -488,7 +493,10 @@ func (s *Store) SetVecAt(prefix []byte, idx int) (key []byte, ok bool) {
 	if idx < 0 || idx >= len(vs.s) {
 		return nil, false
 	}
-	return s.keyAtTiered(atomic.LoadUint64(&vs.s[idx]), nil), true
+	g := s.pinTiered()
+	k := s.keyAtTiered(atomic.LoadUint64(&vs.s[idx]), nil)
+	g.unpin()
+	return k, true
 }
 
 // SetPartVecLen returns partition part's live member count for the P-partition set whose
@@ -523,9 +531,11 @@ func (s *Store) SetPartVecScanDown(base []byte, p, part, hi, limit int, dst [][]
 	if lo < 0 {
 		lo = 0
 	}
+	g := s.pinTiered()
 	for i := upper - 1; i >= lo; i-- {
 		dst = append(dst, s.keyAtTiered(atomic.LoadUint64(&vs.s[i]), nil))
 	}
+	g.unpin()
 	return dst, lo
 }
 
@@ -553,7 +563,13 @@ func (s *Store) CollRandSelect(prefix []byte, r uint64) (key []byte, ok bool) {
 		if n == 0 {
 			return nil, false
 		}
-		return s.keyAtTiered(atomic.LoadUint64(&vs.s[drawIndexWord(r, n)]), nil), true
+		// Pin before the slot load so a retier-then-reclaim of the segment this offset names cannot
+		// free the bytes while keyAtTiered copies the key out (spec 22 section 5 race 3). On the
+		// in-memory arena the pin and copy are both no-ops and the draw stays fully lock-free.
+		g := s.pinTiered()
+		k := s.keyAtTiered(atomic.LoadUint64(&vs.s[drawIndexWord(r, n)]), nil)
+		g.unpin()
+		return k, true
 	}
 
 	// No vector yet: build it under the write mutex. Re-check after taking the mutex so two
@@ -570,7 +586,10 @@ func (s *Store) CollRandSelect(prefix []byte, r uint64) (key []byte, ok bool) {
 	if n == 0 {
 		return nil, false
 	}
-	return s.keyAtTiered(atomic.LoadUint64(&vs.s[drawIndexWord(r, n)]), nil), true
+	g := s.pinTiered()
+	k := s.keyAtTiered(atomic.LoadUint64(&vs.s[drawIndexWord(r, n)]), nil)
+	g.unpin()
+	return k, true
 }
 
 // CollRandSelectRemove draws a uniform random live member and swap-removes it from the
@@ -597,8 +616,14 @@ func (s *Store) CollRandSelectRemove(prefix []byte) (key []byte, ok bool) {
 	i := sh.drawIndex(n)
 	off := v.slots[i]
 	v.remove(off)
+	// Pin before releasing the shard mutex, while off's segment is still known live under it, so a
+	// migrator draining the row we just removed from the vector cannot retire and free that segment
+	// before keyAtTiered resolves off (spec 22 section 5 race 3). The copy outlives the pin.
+	g := s.pinTiered()
 	sh.mu.Unlock()
-	return s.keyAtTiered(off, nil), true
+	k := s.keyAtTiered(off, nil)
+	g.unpin()
+	return k, true
 }
 
 // CollRandEnsure builds the vector for prefix if it does not exist yet, so a caller can warm

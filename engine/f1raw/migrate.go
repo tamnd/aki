@@ -95,6 +95,14 @@ func (s *Store) drainRecord(off uint64) bool {
 	}
 	klen := s.klen(off)
 	key := s.arena[off+hdrSize : off+hdrSize+klen]
+	if s.isVecMember(kind) {
+		// A set member row rides Option A (retier.go): the dense member vector caches this record's
+		// raw resident offset and cannot re-resolve it, so the flip must repair the cached slot in
+		// place under the vector shard mutex rather than trust a secondary structure to follow. Both
+		// movers share migrateVecMember, so the background drain retiers exactly as MigrateToCold does.
+		// key aliases the arena here; migrateVecMember copies it before any path that could mutate it.
+		return s.migrateVecMember(key, kind, off)
+	}
 	h := hash(key)
 	for {
 		cur, b, slot, word, found := s.find(key, h, kind)

@@ -174,6 +174,19 @@ func (s *Store) PutKind(key, val []byte, kind byte) (created bool, err error) {
 			s.inPlace(off, val)
 			return false, nil
 		}
+		// A set member row (Option A, retier.go) that did not take the resident in-place path
+		// above is cold: its member identity is the key and its value is always empty, so an
+		// existing member needs no write regardless of tier. Return without republishing rather
+		// than bring it up to a fresh resident offset. A republish would move the record to a new
+		// offset the dense member vector still caches the old cold address for, and the vector has
+		// no key to re-resolve it (unlike the ordered-index kinds, which re-resolve through the
+		// primary index on access), so the slot would dangle: a later SREM could not find the new
+		// offset to drop it and a re-add would then duplicate the member. The migrator is the only
+		// actor that moves a set member's offset, and it repairs the vector in place under the
+		// shard mutex when it does; the write path must not create a move it cannot repair.
+		if s.isVecMember(kind) {
+			return false, nil
+		}
 		// Outgrew the record (or it was separated): republish a wider one. publish rescans
 		// and replaces the entry in place, count unchanged, so this is still an update.
 		if err := s.publish(key, val, h, kind, 0); err != nil {
