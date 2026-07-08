@@ -109,9 +109,9 @@ func TestBackpressureStallSurfacesFull(t *testing.T) {
 		}
 	}()
 
-	// The stall budget is migStallPolls * migWaitStep (about one second); allow generous slack, and
+	// The stall budget is migStallWindow (about one second of no progress); allow generous slack, and
 	// treat exceeding it as a hang, the failure the progress gate must not have.
-	budget := time.Duration(migStallPolls)*migWaitStep + 10*time.Second
+	budget := migStallWindow + 10*time.Second
 	select {
 	case err := <-done:
 		if !errors.Is(err, ErrFull) {

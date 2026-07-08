@@ -5,20 +5,22 @@ import (
 	"time"
 )
 
-// migWaitStep and migStallPolls bound the write-path backpressure wait (D12, doc 23): when the
+// migWaitStep and migStallWindow bound the write-path backpressure wait (D12, doc 23): when the
 // arena is full and the migrator is engaged, allocRecord signals the migrator and blocks in
 // waitForSegment for a segment to free rather than reporting the arena full at once. The wait gives
-// up only after migStallPolls consecutive polls, each migWaitStep apart, show NO forward progress,
-// where progress is the cold-log tail advancing (bytes leaving RAM). Any advance resets the
-// counter, so a slow-but-draining migrator holds the writer indefinitely and a write is dropped
-// only on a genuine stall (cold region full, disk error, non-migratable residue, leaked epoch),
-// which keeps the tail fixed. This is the block-not-drop property: a collection larger than the
-// arena loads fully rather than truncating, matching a swapping store, slow under overflow but never
-// lossy. It replaces the old fixed poll budget, which gave up on wall-clock time and so dropped
-// writes a slow migrator would have served (the SET LTM SADD collapse doc 23 root-causes).
+// up only after migStallWindow of wall-clock time passes with NO forward progress, where progress is
+// the cold-log tail advancing (bytes leaving RAM). Any advance resets the window, so a slow-but-
+// draining migrator holds the writer indefinitely and a write is dropped only on a genuine stall
+// (cold region full, disk error, non-migratable residue, leaked epoch), which keeps the tail fixed.
+// This is the block-not-drop property: a collection larger than the arena loads fully rather than
+// truncating, matching a swapping store, slow under overflow but never lossy. It replaces the old
+// fixed poll budget, which gave up on total elapsed time and so dropped writes a slow migrator would
+// have served (the SET LTM SADD collapse doc 23 root-causes). The window is measured in wall-clock,
+// not poll count, because time.Sleep(migWaitStep) inflates to milliseconds under scheduler pressure,
+// so a poll count would stretch the real give-up far past the intended window on a loaded box.
 const (
-	migWaitStep   = 100 * time.Microsecond
-	migStallPolls = 10000 // 100us x 10000 = up to 1s of ZERO progress before ErrFull
+	migWaitStep    = 100 * time.Microsecond
+	migStallWindow = time.Second // wall-clock of ZERO progress before ErrFull
 	// migSpinIters is the adaptive spin the backpressure wait runs before falling to the sleeping
 	// poll. When the migrator keeps up, a drained segment retires and becomes reclaimable within a
 	// few microseconds of the writer blocking, far under one migWaitStep. Sleeping migWaitStep in
@@ -348,10 +350,10 @@ func (s *Store) signalMigrator() {
 // migrator, then polls, reclaiming retired segments each round (a drained segment is free once its
 // pre-flip readers quiesce) and checking for a free or never-used segment.
 //
-// The stopping rule is forward progress, not wall-clock time (doc 23, D23-1). While the migrator
+// The stopping rule is forward progress, not total elapsed time (doc 23, D23-1). While the migrator
 // keeps draining, the cold-log tail keeps advancing, so the wait keeps blocking however long the
-// drain takes; only when the tail sits still for migStallPolls consecutive polls does the migrator
-// count as stalled and the caller report the arena full. That is the block-not-drop property: a hot
+// drain takes; only when the tail sits still for migStallWindow does the migrator count as stalled
+// and the caller report the arena full. That is the block-not-drop property: a hot
 // set larger than the arena blocks on the drain rather than dropping the write, and ErrFull is
 // reserved for a genuine stall (cold region full, disk error, non-migratable residue, leaked epoch),
 // each of which keeps the tail fixed. A store with no migrator returns false immediately and pays
@@ -360,6 +362,12 @@ func (s *Store) waitForSegment() bool {
 	if !s.migOn.Load() {
 		return false // no migrator: the arena is genuinely full, report it at once
 	}
+	// Reaching here means the fast alloc found no segment and had to wait for the migrator, so count
+	// the backpressure event now, before either the spin or the sleep serves it. Counting at entry
+	// rather than only on the sleeping path keeps the INFO waits counter honest under a migrator fast
+	// enough to free a segment within the spin: the arena was still overrun and a writer still blocked,
+	// which is exactly what the counter reports (doc 23, D23-4).
+	s.backpressureWaits.Add(1)
 	// Fast path: wake the migrator and spin, yielding to it and reclaiming retired segments as
 	// readers quiesce, so the common case where a drain frees a segment within microseconds returns
 	// without paying a migWaitStep sleep. reclaimSegments turns the just-retired segment reusable
@@ -374,16 +382,15 @@ func (s *Store) waitForSegment() bool {
 	}
 	// Slow path: the drain is lagging (a large single drain, or heavy writer contention on the shard
 	// mutex the migrator needs). Block while the migrator makes forward progress, giving up only after
-	// migStallPolls consecutive polls with none. Progress is the cold-log tail advancing: the migrator
+	// migStallWindow of wall-clock with none. Progress is the cold-log tail advancing: the migrator
 	// bumps it on every record it sinks cold, so a moving tail means bytes are leaving RAM and a
 	// segment is on the way to free, and the write should keep waiting. A tail that sits still for the
 	// whole stall window means a genuine stall (cold region full, disk error, non-migratable residue,
 	// leaked epoch), and only then does the write report the arena full. A retired segment that frees
 	// on reader quiescence rather than a fresh drain is caught by segAvailable directly, so it does not
 	// need to show in the progress signal (doc 23, D23-1..D23-3).
-	s.backpressureWaits.Add(1)
 	lastTail := s.coldTail()
-	stall := 0
+	lastProgress := time.Now()
 	for {
 		s.signalMigrator()
 		time.Sleep(migWaitStep)
@@ -392,10 +399,10 @@ func (s *Store) waitForSegment() bool {
 		}
 		if t := s.coldTail(); t != lastTail {
 			lastTail = t
-			stall = 0 // migrator is draining; keep waiting however long it takes
+			lastProgress = time.Now() // migrator is draining; keep waiting however long it takes
 			continue
 		}
-		if stall++; stall >= migStallPolls {
+		if time.Since(lastProgress) >= migStallWindow {
 			s.backpressureStalls.Add(1)
 			return false // no progress for the stall window: genuine stall, report full
 		}

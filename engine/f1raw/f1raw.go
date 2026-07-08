@@ -274,9 +274,10 @@ type Store struct {
 	migLoNum uint64
 
 	// backpressureWaits and backpressureStalls are the write-path backpressure observability
-	// (doc 23, D23-4). waits counts each allocation that entered the progress-gated sleep in
-	// waitForSegment; stalls counts each one that gave up with ErrFull after the no-progress
-	// window. A healthy overflow shows waits climbing and stalls flat (the migrator is slow but
+	// (doc 23, D23-4). waits counts each allocation that found no segment and had to wait for the
+	// migrator in waitForSegment, whether the spin or the sleep ended up serving it; stalls counts
+	// each one that gave up with ErrFull after the no-progress window. A healthy overflow shows waits
+	// climbing and stalls flat (the migrator is slow but
 	// serving); a genuinely full store shows stalls climbing (the cold tier cannot take more).
 	// The pair surfaces in INFO's cold-tier section so an operator can tell the two apart. Both
 	// are plain counters bumped off the foreground fast path (only a blocked write touches them).
