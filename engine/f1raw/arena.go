@@ -66,16 +66,21 @@ const maxRecordBytes = hdrSize + ((maxKey + 7) &^ 7) + ((maxVal + 7) &^ 7)
 // (doc 23 D23-6): allocRecord claims a slot before it bumps the cursor and the writer releases it in
 // commitRecord once initRecord has written the record, so a drain of a just-sealed segment waits for
 // pending to reach zero before it walks the records, closing the race where the migrator reads a
-// header a concurrent initRecord is still writing. The padding keeps adjacent descriptors off one
-// cache line so two segments filling concurrently do not false-share.
+// header a concurrent initRecord is still writing. draining marks a segment a migrator worker has
+// claimed for the current drain so a parallel worker pool never picks the same segment twice:
+// pickDrainTarget sets it under segMu on the segment it hands out and skips any segment already
+// draining, and the drain clears it when it finishes, so N workers each drain a distinct segment
+// concurrently and multiply the cold-sink queue depth the NVMe rewards. The padding keeps adjacent
+// descriptors off one cache line so two segments filling or draining concurrently do not false-share.
 type segment struct {
-	base    uint64
-	alloc   atomic.Uint64
-	live    atomic.Int64
-	retire  uint64
-	stuck   atomic.Int64
-	pending atomic.Int64
-	_       [64 - 48]byte
+	base     uint64
+	alloc    atomic.Uint64
+	live     atomic.Int64
+	retire   uint64
+	stuck    atomic.Int64
+	pending  atomic.Int64
+	draining atomic.Bool
+	_        [64 - 52]byte
 }
 
 // NewSegmented builds a store whose arena is divided into reclaimable segments of
@@ -341,6 +346,7 @@ func (s *Store) freeSegment(si uint64) {
 	seg.alloc.Store(seg.base)
 	seg.live.Store(0)
 	seg.stuck.Store(0)
+	seg.draining.Store(false)
 	s.releaseArenaPages(seg.base, s.segSize)
 	s.freeSegs = append(s.freeSegs, si)
 }
@@ -386,6 +392,7 @@ func (s *Store) reclaimLocked() {
 			seg.alloc.Store(seg.base)
 			seg.live.Store(0)
 			seg.stuck.Store(0)
+			seg.draining.Store(false)
 			s.releaseArenaPages(seg.base, s.segSize)
 			s.freeSegs = append(s.freeSegs, si)
 		} else {
@@ -423,6 +430,7 @@ func (s *Store) resetSegments() {
 		s.segs[i].alloc.Store(s.segs[i].base)
 		s.segs[i].live.Store(0)
 		s.segs[i].stuck.Store(0)
+		s.segs[i].draining.Store(false)
 	}
 	s.freeSegs = s.freeSegs[:0]
 	s.retSegs = s.retSegs[:0]
