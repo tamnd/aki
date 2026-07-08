@@ -2,6 +2,7 @@ package f1srv
 
 import (
 	"bufio"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -189,5 +190,47 @@ func TestInfoAkiColdEnabled(t *testing.T) {
 	}
 	if v, _ := infoField(body, "aki_cold_log_live_bytes"); v != "64" {
 		t.Fatalf("aki_cold_log_live_bytes = %q, want 64", v)
+	}
+}
+
+// TestInfoAkiMigratorRegion checks the Aki section surfaces the migrator's cold record region and
+// backpressure counters when the store runs the --ltm-migrator switch (ColdRecordsPath set, no
+// ColdPath). It used to report aki_cold_enabled:0 and hide every counter because the section keyed
+// only off ColdPath, blinding an operator on the documented LTM string switch. After a dataset far
+// larger than the small arena the migrator has sunk records cold, so the record-region byte fields
+// are present and non-zero and the backpressure waits counter has moved.
+func TestInfoAkiMigratorRegion(t *testing.T) {
+	rw, cleanup := dialMigratorServer(t)
+	defer cleanup()
+
+	body := infoReply(t, rw, "aki")
+	if v, ok := infoField(body, "aki_cold_enabled"); !ok || v != "1" {
+		t.Fatalf("aki_cold_enabled = %q, %v; want 1 on the migrator switch", v, ok)
+	}
+	// The value-log fields belong to the WiscKey ColdPath tier, which this store does not run.
+	if _, ok := infoField(body, "aki_cold_log_bytes"); ok {
+		t.Fatalf("aki_cold_log_bytes present with only the migrator region open:\n%s", body)
+	}
+
+	// Write far more than the 4 MiB arena holds so the migrator drains full segments cold.
+	const n = 20000
+	val := strings.Repeat("x", 200)
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "SET", fmt.Sprintf("k%08d", i), migVal(i, val)) },
+		func(i int) { expect(t, rw, "+OK") })
+
+	body = infoReply(t, rw, "aki")
+	total, ok := infoField(body, "aki_cold_records_bytes")
+	if !ok {
+		t.Fatalf("aki_cold_records_bytes absent with the migrator region open:\n%s", body)
+	}
+	if total == "0" {
+		t.Fatalf("aki_cold_records_bytes = 0 after the migrator drained a larger-than-arena dataset:\n%s", body)
+	}
+	if _, ok := infoField(body, "aki_cold_records_live_bytes"); !ok {
+		t.Fatalf("aki_cold_records_live_bytes absent:\n%s", body)
+	}
+	if _, ok := infoField(body, "aki_backpressure_waits"); !ok {
+		t.Fatalf("aki_backpressure_waits absent with the migrator on:\n%s", body)
 	}
 }
