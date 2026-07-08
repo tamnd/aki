@@ -213,27 +213,126 @@ func (v *memberVec) retierSlot(oldOff, newOff uint64) bool {
 	return true
 }
 
-// vecMap is one shard's immutable prefix-to-vector map snapshot. A structural change (a new
-// set's first vector, a dropped set) copies it under the write mutex and swaps the pointer, so
-// a lock-free draw loads a consistent map without a lock and a writer never mutates a map a
-// reader is walking (copy-on-write).
-type vecMap struct {
-	m map[string]*memberVec
+// vecEntry is one immutable (prefix, vector) pair in a shard's open-addressed table. A writer
+// publishes it with a single atomic store into a slot and never mutates it after (a re-put stores
+// a fresh entry), so a lock-free reader that loads the slot pointer reads a consistent entry. h is
+// the prefix hash cached at creation so a probe rejects a colliding slot with one word compare
+// before the byte compare, and so a grow rehashes without re-hashing the prefix bytes.
+type vecEntry struct {
+	h      uint64
+	prefix string
+	vec    *memberVec
 }
 
-// randVecShard is one stripe of the vector map: a write mutex the mutations serialize on, an
-// atomically-published prefix-to-vector map the lock-free draw loads, and a per-shard PRNG the
-// destructive draw uses. The non-destructive draw (CollRandSelect) takes no lock: it loads the
-// map snapshot and the target vector's slots snapshot through atomic pointers, so concurrent
-// draws on one hot set scale across cores instead of serializing on a lock or a shared reader
-// counter (spec 2064/19 slice 1). Every mutation (add, remove, the lazy build, a destructive
-// draw, a put or drop) takes the write mutex. The per-shard PRNG is a splitmix64 counter mixed
-// on each draw, seeded distinctly per shard; it is advanced only under the write mutex (by the
-// destructive draw), so the read path never touches it and instead takes a caller-supplied
-// random word, which is what keeps concurrent read draws off any shared counter.
+// vecTomb is the tombstone sentinel a drop stores into a slot: a lock-free probe treats it as
+// occupied and keeps scanning (so it never stops short of a live key that hashed past the dropped
+// one), and an insert may reclaim its slot. It is one shared address compared by pointer, so it
+// never matches a real prefix.
+var vecTomb = &vecEntry{}
+
+// vecTable is one shard's open-addressed prefix-to-vector table: a power-of-two array of atomic
+// entry pointers a lock-free draw probes and a mutex-serialized writer stores into. It replaces the
+// whole-map copy-on-write that rebuilt the shard map on every set's first-vector install, which
+// made filling a keyspace of N small sets O(N^2) (the multi-key SADDNEW insert flood, spec
+// 2064/f1_rewrite_ltm/20). Reads stay lock-free: a draw loads the shard's current table pointer,
+// hashes the prefix to a slot, and linear-probes with atomic loads until it matches or hits an
+// empty (nil) slot, skipping tombstones. Writes serialize on the shard mutex the caller already
+// holds, so a slot store races no other writer and needs only the atomic store that publishes the
+// entry to readers. A grow allocates a larger table, rehashes the live entries, and atomically
+// swaps the shard pointer, so a reader walks either the old table (which still holds every pre-grow
+// entry) or the new one, never a torn mix. Amortized over N inserts a table fills in O(N).
+type vecTable struct {
+	slots []atomic.Pointer[vecEntry]
+	mask  uint64
+	live  int // live (non-tombstone) entries; writer-only, guarded by the shard mutex
+	used  int // occupied slots including tombstones; writer-only
+}
+
+// vecTableInitCap is a fresh shard table's slot count. Small because the 256 shards spread a
+// keyspace thin, and a table doubles on demand, so a shard that ends up holding many sets pays a
+// few amortized rehashes rather than one big up-front allocation.
+const vecTableInitCap = 8
+
+func newVecTable(capPow2 int) *vecTable {
+	return &vecTable{slots: make([]atomic.Pointer[vecEntry], capPow2), mask: uint64(capPow2 - 1)}
+}
+
+// get returns the vector stored under prefix, or nil if absent. It is lock-free: a linear probe
+// over atomic slot loads that stops at the matching entry or the first empty slot, skipping
+// tombstones with a pointer compare and colliding live entries with a hash compare before the
+// byte compare.
+func (t *vecTable) get(prefix []byte) *memberVec {
+	hp := hash(prefix)
+	i := hp & t.mask
+	for {
+		e := t.slots[i].Load()
+		if e == nil {
+			return nil
+		}
+		if e != vecTomb && e.h == hp && e.prefix == string(prefix) {
+			return e.vec
+		}
+		i = (i + 1) & t.mask
+	}
+}
+
+// insert places v under prefix, assuming spare capacity (put grows first). Writer-only: it probes
+// from the prefix hash, overwrites a matching live entry in place, or claims the first tombstone or
+// empty slot at the end of the probe chain, storing the published entry atomically for readers.
+func (t *vecTable) insert(prefix []byte, v *memberVec) {
+	hp := hash(prefix)
+	i := hp & t.mask
+	tomb := -1
+	for {
+		e := t.slots[i].Load()
+		if e == nil {
+			if tomb >= 0 {
+				t.slots[tomb].Store(&vecEntry{h: hp, prefix: string(prefix), vec: v})
+			} else {
+				t.slots[i].Store(&vecEntry{h: hp, prefix: string(prefix), vec: v})
+				t.used++
+			}
+			t.live++
+			return
+		}
+		if e == vecTomb {
+			if tomb < 0 {
+				tomb = int(i)
+			}
+		} else if e.h == hp && e.prefix == string(prefix) {
+			t.slots[i].Store(&vecEntry{h: hp, prefix: e.prefix, vec: v})
+			return
+		}
+		i = (i + 1) & t.mask
+	}
+}
+
+// insertEntry rehomes an existing live entry into a fresh (tombstone-free) table during a grow. It
+// never overwrites or tombstones, so it just probes to the first empty slot and stores the entry
+// object as-is, reusing its cached hash.
+func (t *vecTable) insertEntry(e *vecEntry) {
+	i := e.h & t.mask
+	for t.slots[i].Load() != nil {
+		i = (i + 1) & t.mask
+	}
+	t.slots[i].Store(e)
+	t.used++
+	t.live++
+}
+
+// randVecShard is one stripe of the vector table: a write mutex the mutations serialize on, an
+// atomically-published open-addressed prefix-to-vector table the lock-free draw loads, and a
+// per-shard PRNG the destructive draw uses. The non-destructive draw (CollRandSelect) takes no
+// lock: it loads the table pointer and the target vector's slots snapshot through atomic pointers,
+// so concurrent draws on one hot set scale across cores instead of serializing on a lock or a
+// shared reader counter (spec 2064/19 slice 1). Every mutation (add, remove, the lazy build, a
+// destructive draw, a put or drop) takes the write mutex. The per-shard PRNG is a splitmix64
+// counter mixed on each draw, seeded distinctly per shard; it is advanced only under the write
+// mutex (by the destructive draw), so the read path never touches it and instead takes a
+// caller-supplied random word, which is what keeps concurrent read draws off any shared counter.
 type randVecShard struct {
 	mu   sync.Mutex
-	view atomic.Pointer[vecMap]
+	view atomic.Pointer[vecTable]
 	rng  uint64
 }
 
@@ -262,60 +361,82 @@ func (rv *randVec) shardFor(prefix []byte) *randVecShard {
 }
 
 // get returns the vector for prefix, or nil if the shard has none. It loads the atomically-
-// published map snapshot, so it is safe with no lock (the draw's fast path) and equally safe
-// under the write mutex (the mutation paths). A shard that has never held a vector reads as a
-// nil snapshot, which returns the zero value without allocating.
+// published table and probes it lock-free, so it is safe with no lock (the draw's fast path) and
+// equally safe under the write mutex (the mutation paths). A shard that has never held a vector
+// reads as a nil table, which returns nil without probing.
 func (sh *randVecShard) get(prefix []byte) *memberVec {
-	vm := sh.view.Load()
-	if vm == nil {
+	t := sh.view.Load()
+	if t == nil {
 		return nil
 	}
-	return vm.m[string(prefix)]
+	return t.get(prefix)
 }
 
-// put installs v under prefix by copy-on-write: it copies the current map, adds the entry, and
-// atomically swaps the pointer, so a concurrent lock-free draw walks either the old or the new
-// map, never a half-updated one. The caller holds the shard write mutex, so two puts do not
-// race to copy. The copy is O(sets in this shard), which is small because the map is striped
-// 256 ways, and a put happens once per set's first draw, not per draw.
+// put installs v under prefix in the shard's open-addressed table, growing it first if adding the
+// entry would push it past the load-factor ceiling. The caller holds the shard write mutex, so the
+// probe and the slot store race no other writer; the store is atomic so a lock-free reader sees a
+// complete entry. A put for a prefix already present overwrites its vector in place. Unlike the
+// copy-on-write map it replaces, it does not rebuild the table per set, only on the rare doubling,
+// so filling a shard with N sets costs O(N), not O(N^2).
 func (sh *randVecShard) put(prefix []byte, v *memberVec) {
-	old := sh.view.Load()
-	nm := make(map[string]*memberVec, mapLen(old)+1)
-	if old != nil {
-		for k, vv := range old.m {
-			nm[k] = vv
-		}
+	t := sh.view.Load()
+	if t == nil {
+		t = newVecTable(vecTableInitCap)
+		sh.view.Store(t)
 	}
-	nm[string(prefix)] = v
-	sh.view.Store(&vecMap{m: nm})
+	// Grow when occupied slots (live entries plus tombstones) reach three quarters of capacity, so a
+	// probe chain stays short. A table thick with tombstones from set churn compacts in place at the
+	// same size; one genuinely full of live entries doubles.
+	if (t.used+1)*4 > len(t.slots)*3 {
+		t = sh.grow()
+	}
+	t.insert(prefix, v)
 }
 
-// drop removes prefix's vector by the same copy-on-write swap, a no-op when the shard has no
-// such vector. The caller holds the shard write mutex.
+// grow rehashes the shard's live entries into a fresh table and atomically publishes it. It doubles
+// the slot count when the table is genuinely full of live entries and keeps the same size when it is
+// mostly tombstones (so churn compacts rather than grows unbounded). The caller holds the shard
+// write mutex. A concurrent lock-free reader keeps walking the old table until it loads the new
+// pointer; the old table still holds every live entry, so no lookup is lost across the swap.
+func (sh *randVecShard) grow() *vecTable {
+	old := sh.view.Load()
+	capNew := len(old.slots)
+	if old.live*2 >= capNew {
+		capNew *= 2
+	}
+	nt := newVecTable(capNew)
+	for i := range old.slots {
+		if e := old.slots[i].Load(); e != nil && e != vecTomb {
+			nt.insertEntry(e)
+		}
+	}
+	sh.view.Store(nt)
+	return nt
+}
+
+// drop tombstones prefix's slot, a no-op when the shard has no such vector. The caller holds the
+// shard write mutex. It stores the tombstone sentinel rather than clearing the slot so a lock-free
+// probe for a live key that hashed past this one keeps scanning; the tombstone is reclaimed at the
+// next grow.
 func (sh *randVecShard) drop(prefix []byte) {
-	old := sh.view.Load()
-	if old == nil {
+	t := sh.view.Load()
+	if t == nil {
 		return
 	}
-	if _, ok := old.m[string(prefix)]; !ok {
-		return
-	}
-	nm := make(map[string]*memberVec, len(old.m))
-	for k, vv := range old.m {
-		if k == string(prefix) {
-			continue
+	hp := hash(prefix)
+	i := hp & t.mask
+	for {
+		e := t.slots[i].Load()
+		if e == nil {
+			return
 		}
-		nm[k] = vv
+		if e != vecTomb && e.h == hp && e.prefix == string(prefix) {
+			t.slots[i].Store(vecTomb)
+			t.live--
+			return
+		}
+		i = (i + 1) & t.mask
 	}
-	sh.view.Store(&vecMap{m: nm})
-}
-
-// mapLen is the entry count of a possibly-nil map snapshot, used only to size a copy.
-func mapLen(vm *vecMap) int {
-	if vm == nil {
-		return 0
-	}
-	return len(vm.m)
 }
 
 // next draws the next splitmix64 value from the shard's PRNG. The caller holds the shard
