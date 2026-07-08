@@ -198,16 +198,29 @@ func (s *Server) infoAki(b *strings.Builder) {
 	// dead/total here to decide when to quiesce and compact.
 	b.WriteString("# Aki\r\n")
 	b.WriteString("aki_engine:f1raw\r\n")
-	if s.cfg.ColdPath == "" {
+	// The cold tier is engaged by either the WiscKey value log (ColdPath, large-value separation)
+	// or the migrator's cold record region (ColdRecordsPath, whole-record tiering under arena fill,
+	// the --ltm-migrator switch). A store can run either, both, or neither, so the section reports
+	// whichever regions are open. Keying only off ColdPath used to hide the migrator's accounting
+	// and backpressure counters from an operator running the documented LTM string switch.
+	if s.cfg.ColdPath == "" && s.cfg.ColdRecordsPath == "" {
 		b.WriteString("aki_cold_enabled:0\r\n")
 		b.WriteString("\r\n")
 		return
 	}
-	total, dead := s.store.ColdBytes()
 	b.WriteString("aki_cold_enabled:1\r\n")
-	b.WriteString("aki_cold_log_bytes:" + strconv.FormatUint(total, 10) + "\r\n")
-	b.WriteString("aki_cold_log_dead_bytes:" + strconv.FormatUint(dead, 10) + "\r\n")
-	b.WriteString("aki_cold_log_live_bytes:" + strconv.FormatUint(total-dead, 10) + "\r\n")
+	if s.cfg.ColdPath != "" {
+		total, dead := s.store.ColdBytes()
+		b.WriteString("aki_cold_log_bytes:" + strconv.FormatUint(total, 10) + "\r\n")
+		b.WriteString("aki_cold_log_dead_bytes:" + strconv.FormatUint(dead, 10) + "\r\n")
+		b.WriteString("aki_cold_log_live_bytes:" + strconv.FormatUint(total-dead, 10) + "\r\n")
+	}
+	if s.cfg.ColdRecordsPath != "" {
+		total, dead := s.store.ColdRecords()
+		b.WriteString("aki_cold_records_bytes:" + strconv.FormatUint(total, 10) + "\r\n")
+		b.WriteString("aki_cold_records_dead_bytes:" + strconv.FormatUint(dead, 10) + "\r\n")
+		b.WriteString("aki_cold_records_live_bytes:" + strconv.FormatUint(total-dead, 10) + "\r\n")
+	}
 	// Write-path backpressure counters (doc 23): waits is the number of allocations that blocked
 	// waiting for the migrator to free a segment, stalls the subset that gave up with the arena
 	// full. waits climbing with stalls flat is a healthy slow overflow; stalls climbing is a
