@@ -84,6 +84,15 @@ func (s *Store) ColdRecords() (total, dead uint64) {
 	return s.recs.tail.Load(), s.recs.dead.Load()
 }
 
+// BackpressureStats reports the write-path backpressure counters (doc 23): waits is the number of
+// allocations that blocked in the progress-gated wait for the migrator to free a segment, stalls is
+// the subset that gave up with ErrFull after the no-progress window. The introspection path surfaces
+// the pair so an operator can tell a slow-but-serving overflow (waits climb, stalls flat) from a
+// genuinely full store (stalls climb). Both are zero on a store with no migrator.
+func (s *Store) BackpressureStats() (waits, stalls uint64) {
+	return s.backpressureWaits.Load(), s.backpressureStalls.Load()
+}
+
 // migrateRecordAt copies the resident record at arena offset off into the cold record
 // region as one frame and returns the frame's region offset. It reads only immutable
 // header fields plus the value: an inline value is copied under the seqlock so a concurrent

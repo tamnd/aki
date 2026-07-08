@@ -5,16 +5,20 @@ import (
 	"time"
 )
 
-// migWaitStep and migWaitPolls bound the write-path backpressure wait (D12): when the arena is
-// full and the migrator is engaged, allocRecord signals the migrator and polls this many times,
-// sleeping migWaitStep between polls, for a segment to free before it gives up and reports the
-// arena full. The product is the total budget a single allocation blocks, kept short enough that a
-// genuine out-of-space (cold region full, disk error keeping a drain from completing) still
-// surfaces as ErrFull promptly rather than hanging, and long enough that a burst outrunning the
-// migrator's own draining waits it out instead of failing a write the migrator would have served.
+// migWaitStep and migStallPolls bound the write-path backpressure wait (D12, doc 23): when the
+// arena is full and the migrator is engaged, allocRecord signals the migrator and blocks in
+// waitForSegment for a segment to free rather than reporting the arena full at once. The wait gives
+// up only after migStallPolls consecutive polls, each migWaitStep apart, show NO forward progress,
+// where progress is the cold-log tail advancing (bytes leaving RAM). Any advance resets the
+// counter, so a slow-but-draining migrator holds the writer indefinitely and a write is dropped
+// only on a genuine stall (cold region full, disk error, non-migratable residue, leaked epoch),
+// which keeps the tail fixed. This is the block-not-drop property: a collection larger than the
+// arena loads fully rather than truncating, matching a swapping store, slow under overflow but never
+// lossy. It replaces the old fixed poll budget, which gave up on wall-clock time and so dropped
+// writes a slow migrator would have served (the SET LTM SADD collapse doc 23 root-causes).
 const (
-	migWaitStep  = 100 * time.Microsecond
-	migWaitPolls = 10000 // 100us x 10000 = up to 1s per blocked allocation
+	migWaitStep   = 100 * time.Microsecond
+	migStallPolls = 10000 // 100us x 10000 = up to 1s of ZERO progress before ErrFull
 	// migSpinIters is the adaptive spin the backpressure wait runs before falling to the sleeping
 	// poll. When the migrator keeps up, a drained segment retires and becomes reclaimable within a
 	// few microseconds of the writer blocking, far under one migWaitStep. Sleeping migWaitStep in
@@ -183,6 +187,18 @@ func (s *Store) drainSegment(si uint64) {
 		s.retireSegment(si)
 		return
 	}
+	// Wait for every writer that reserved a record in this segment to finish laying its bytes down
+	// before walking them (doc 23 D23-6). A writer that reserved one of the segment's last slots while
+	// it was still the current allocation target can still be inside initRecord after the seal moved
+	// the current pointer off it and this drain was picked; the walk reads each record's immutable
+	// header (recBytesAt, the liveness probe's key), so touching those bytes mid-write is a data race.
+	// The segment is sealed (pickDrainTarget only returns full, non-current segments), so no new
+	// reservation lands here and pending only falls, reaching zero once the last in-flight writer
+	// commits. This runs on the single migrator goroutine off the foreground path, and the wait is
+	// microseconds (initRecord is a memcpy), so a yielding spin is right.
+	for seg.pending.Load() != 0 {
+		runtime.Gosched()
+	}
 	limit := seg.base + s.segSize
 	if a := seg.alloc.Load(); a < limit {
 		limit = a
@@ -323,15 +339,22 @@ func (s *Store) signalMigrator() {
 // waitForSegment is the write-path backpressure (D12): when allocRecord cannot get a segment it
 // calls this to wait for the migrator to free one rather than reporting the arena full at once. It
 // returns true when a segment has become available to retry the allocation, false when no migrator
-// is engaged or the bounded wait elapsed with the arena still full, which surfaces as ErrFull.
+// is engaged or the migrator has genuinely stalled with the arena still full, which surfaces as
+// ErrFull.
 //
 // The wait is what makes a bounded arena serve a dataset larger than itself transparently: the
 // migrator drains full segments cold, which moves their records out of RAM and frees the segment,
 // so a write that momentarily finds no room blocks on the drain instead of failing. It signals the
 // migrator, then polls, reclaiming retired segments each round (a drained segment is free once its
-// pre-flip readers quiesce) and checking for a free or never-used segment. Progress holds as long
-// as the cold region can take more; when it genuinely cannot, the poll budget elapses and the
-// caller reports the arena full. A store with no migrator returns false immediately and pays
+// pre-flip readers quiesce) and checking for a free or never-used segment.
+//
+// The stopping rule is forward progress, not wall-clock time (doc 23, D23-1). While the migrator
+// keeps draining, the cold-log tail keeps advancing, so the wait keeps blocking however long the
+// drain takes; only when the tail sits still for migStallPolls consecutive polls does the migrator
+// count as stalled and the caller report the arena full. That is the block-not-drop property: a hot
+// set larger than the arena blocks on the drain rather than dropping the write, and ErrFull is
+// reserved for a genuine stall (cold region full, disk error, non-migratable residue, leaked epoch),
+// each of which keeps the tail fixed. A store with no migrator returns false immediately and pays
 // nothing, so the non-LTM path keeps returning ErrFull exactly as before.
 func (s *Store) waitForSegment() bool {
 	if !s.migOn.Load() {
@@ -349,17 +372,47 @@ func (s *Store) waitForSegment() bool {
 		}
 		runtime.Gosched()
 	}
-	// Slow path: the drain is genuinely lagging (cold-region I/O stall, a reader pinning an epoch
-	// that keeps a retired segment from reclaiming). Fall to the bounded sleeping poll so a burst
-	// that outruns the migrator waits it out instead of failing a write the migrator would serve.
-	for i := 0; i < migWaitPolls; i++ {
+	// Slow path: the drain is lagging (a large single drain, or heavy writer contention on the shard
+	// mutex the migrator needs). Block while the migrator makes forward progress, giving up only after
+	// migStallPolls consecutive polls with none. Progress is the cold-log tail advancing: the migrator
+	// bumps it on every record it sinks cold, so a moving tail means bytes are leaving RAM and a
+	// segment is on the way to free, and the write should keep waiting. A tail that sits still for the
+	// whole stall window means a genuine stall (cold region full, disk error, non-migratable residue,
+	// leaked epoch), and only then does the write report the arena full. A retired segment that frees
+	// on reader quiescence rather than a fresh drain is caught by segAvailable directly, so it does not
+	// need to show in the progress signal (doc 23, D23-1..D23-3).
+	s.backpressureWaits.Add(1)
+	lastTail := s.coldTail()
+	stall := 0
+	for {
 		s.signalMigrator()
 		time.Sleep(migWaitStep)
 		if s.segAvailable() {
 			return true
 		}
+		if t := s.coldTail(); t != lastTail {
+			lastTail = t
+			stall = 0 // migrator is draining; keep waiting however long it takes
+			continue
+		}
+		if stall++; stall >= migStallPolls {
+			s.backpressureStalls.Add(1)
+			return false // no progress for the stall window: genuine stall, report full
+		}
 	}
-	return false
+}
+
+// coldTail reports the cold-log append cursor, the write-path backpressure's forward-progress
+// signal: it advances by the drained bytes on every record the migrator sinks cold and sits still
+// when a drain cannot complete. It is one atomic load and no lock. A store with the migrator engaged
+// always has a cold log, so the nil case is only the non-LTM path that never reaches the wait, and
+// it reads zero there, which makes the progress check see a permanent stall and fall back to the old
+// bounded give-up rather than blocking forever.
+func (s *Store) coldTail() uint64 {
+	if s.cold == nil {
+		return 0
+	}
+	return s.cold.tail.Load()
 }
 
 // segAvailable reclaims any drained-and-retired segments whose readers have quiesced, then reports

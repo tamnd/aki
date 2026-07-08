@@ -159,6 +159,10 @@ func (s *Store) insertAbsent(key, val []byte, h uint64, kind byte) (installed, e
 		return false, false, ErrFull
 	}
 	s.initRecord(off, key, val, kind, 0)
+	// The record's bytes are down: release the in-flight-writer slot allocRecord claimed on its
+	// segment so a concurrent drain may walk it (doc 23 D23-6), the same release publish does. Safe
+	// before the index CAS below for the same reason: the walk reads only the written header.
+	s.commitRecord(off)
 	tag := tagOf(h)
 	newWord := tag<<tagShift | off
 	for {

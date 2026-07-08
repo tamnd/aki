@@ -208,6 +208,13 @@ func (s *Server) infoAki(b *strings.Builder) {
 	b.WriteString("aki_cold_log_bytes:" + strconv.FormatUint(total, 10) + "\r\n")
 	b.WriteString("aki_cold_log_dead_bytes:" + strconv.FormatUint(dead, 10) + "\r\n")
 	b.WriteString("aki_cold_log_live_bytes:" + strconv.FormatUint(total-dead, 10) + "\r\n")
+	// Write-path backpressure counters (doc 23): waits is the number of allocations that blocked
+	// waiting for the migrator to free a segment, stalls the subset that gave up with the arena
+	// full. waits climbing with stalls flat is a healthy slow overflow; stalls climbing is a
+	// genuinely full store (cold tier cannot take more).
+	waits, stalls := s.store.BackpressureStats()
+	b.WriteString("aki_backpressure_waits:" + strconv.FormatUint(waits, 10) + "\r\n")
+	b.WriteString("aki_backpressure_stalls:" + strconv.FormatUint(stalls, 10) + "\r\n")
 	b.WriteString("\r\n")
 }
 
