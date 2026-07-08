@@ -145,6 +145,59 @@ func TestReactorConcurrentConns(t *testing.T) {
 	}
 }
 
+// TestReactorLoopsKnob runs the reactor with an explicit loop count instead of the GOMAXPROCS
+// default and drives more connections than there are loops, so several share each loop. It
+// guards the --reactor-loops plumbing: a fixed small loop count must still adopt, serve, and
+// isolate every connection. The count is a throughput-tuning knob, so correctness must not
+// depend on it matching the core count.
+func TestReactorLoopsKnob(t *testing.T) {
+	cfg := Config{Addr: "127.0.0.1:0", IndexBuckets: 1 << 14, ArenaBytes: 1 << 22, ReadBufSize: 4 << 10, IncrStripes: 256, NetMode: "reactor", ReactorLoops: 2}
+	srv := New(cfg)
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go srv.ListenAndServe()
+	defer srv.Close()
+	addr := srv.Addr()
+
+	const conns = 8
+	const perConn = 100
+	var wg sync.WaitGroup
+	errs := make(chan error, conns)
+	for c := 0; c < conns; c++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+			if err != nil {
+				errs <- fmt.Errorf("conn %d dial: %w", id, err)
+				return
+			}
+			defer conn.Close()
+			br := bufio.NewReader(conn)
+			bw := bufio.NewWriter(conn)
+			for i := 0; i < perConn; i++ {
+				key := fmt.Sprintf("c%d:k%d", id, i)
+				fmt.Fprintf(bw, "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$1\r\nx\r\n", len(key), key)
+				if err := bw.Flush(); err != nil {
+					errs <- fmt.Errorf("conn %d flush: %w", id, err)
+					return
+				}
+				line, err := br.ReadString('\n')
+				if err != nil || line != "+OK\r\n" {
+					errs <- fmt.Errorf("conn %d SET reply %q err %v", id, line, err)
+					return
+				}
+			}
+		}(c)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
 // startReactorServer starts a reactor-mode server on an ephemeral port and returns its
 // address plus a cleanup. Unlike dialTestServerMode it opens no connection, so a test can
 // drive several independent clients against the same loops, which is what the blocking-park

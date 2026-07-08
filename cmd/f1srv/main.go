@@ -35,6 +35,7 @@ func main() {
 	_ = fs.String("aki-engine", "f1raw", "engine name (accepted; this binary is always f1raw)")
 	netMode := fs.String("aki-net", "auto", "net model: auto (reactor on Linux, goroutine elsewhere), go (goroutine-per-conn), or reactor (Linux epoll)")
 	execModel := fs.String("exec-model", "shared", "command execution model: shared (stripe-locked shared store) or affinity (route each key to its owning shard worker, spec 2064/17)")
+	reactorLoops := fs.Int("reactor-loops", 0, "number of epoll event loops for the reactor net model (0 = GOMAXPROCS); tune to find the throughput optimum on the deployment")
 	indexBuckets := fs.Int("index-buckets", 1<<22, "f1raw index buckets")
 	arenaBytes := fs.Int("arena-bytes", 2<<30, "f1raw arena size in bytes")
 	stripes := fs.Int("incr-stripes", 1<<10, "INCR-family RMW lock stripes")
@@ -92,6 +93,7 @@ func main() {
 	cfg.IncrStripes = *stripes
 	cfg.NetMode = *netMode
 	cfg.ExecModel = *execModel
+	cfg.ReactorLoops = *reactorLoops
 	cfg.SetPartitionMax = *setPartMax
 	cfg.SetPartitionThreshold = *setPartThreshold
 	cfg.SetPartitionTarget = *setPartTarget
@@ -140,8 +142,15 @@ func main() {
 	if *ltmMigrator {
 		migrator = cfg.ColdRecordsPath
 	}
-	fmt.Printf("f1srv listening on %s (index-buckets=%d arena=%dMiB cold=%s migrator=%s gogc=%d gomemlimit=%s set-partition=%s)\n",
-		srv.Addr(), *indexBuckets, *arenaBytes>>20, cold, migrator, effGOGC, memlimit, setPart)
+	// Report the net model (and the reactor loop count when overridden) so a run self-documents
+	// which network path it served on: the reactor and goroutine paths differ in throughput, so a
+	// benchmark log that names the path leaves no doubt about what was measured.
+	net := *netMode
+	if *reactorLoops > 0 {
+		net = fmt.Sprintf("%s/loops=%d", net, *reactorLoops)
+	}
+	fmt.Printf("f1srv listening on %s (net=%s index-buckets=%d arena=%dMiB cold=%s migrator=%s gogc=%d gomemlimit=%s set-partition=%s)\n",
+		srv.Addr(), net, *indexBuckets, *arenaBytes>>20, cold, migrator, effGOGC, memlimit, setPart)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("f1srv: serve: %v", err)
 	}
