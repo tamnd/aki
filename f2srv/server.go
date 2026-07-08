@@ -65,7 +65,7 @@ func (s *Server) ListenAndServe(addr string) error {
 			return err
 		}
 		if tc, ok := conn.(*net.TCPConn); ok {
-			tc.SetNoDelay(true)
+			_ = tc.SetNoDelay(true)
 		}
 		c := &connState{
 			srv:  s,
@@ -97,7 +97,7 @@ type connState struct {
 // loop reads, drains every complete command, and flushes the batched replies until
 // the peer closes or a protocol error ends the connection.
 func (c *connState) loop() {
-	defer c.conn.Close()
+	defer func() { _ = c.conn.Close() }()
 	for {
 		if !c.fill() {
 			return
