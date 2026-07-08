@@ -375,6 +375,60 @@ func TestServerMigratorServesSetBeyondArena(t *testing.T) {
 	}
 }
 
+// TestServerMigratorServesManySmallSetsBeyondArena is the header-residue livelock gate. The
+// single-set test above only ever pins one segment with its lone header row, so it never exposes
+// the failure mode this test targets: with many small sets, one resident set header (kindSetMeta)
+// lands in every segment, and if headers are not migratable no segment can ever fully drain. The
+// migrator frees each segment's member bytes but leaves the header residue, so no segment retires,
+// the free list stays empty, and every SADD blocks forever in waitForSegment while the migrator
+// sleeps (liveBytes reads below the high-water mark because the real scarce resource is free
+// segments, not live bytes). The fix admits kindSetMeta to isMigratableKind and makes the header
+// cardinality fast paths (CountAddInt64 write-brings-up, CountInt64 cold read) tier-aware, so a
+// full segment of headers plus members drains clean and retires. This test writes far more small
+// sets than the arena can hold headers-plus-members for, then checks cardinality and membership
+// hold across the tier. Before the fix it hangs (the pipelined SADDs never all return); the test
+// timeout is the failure signal.
+func TestServerMigratorServesManySmallSetsBeyondArena(t *testing.T) {
+	rw, cleanup := dialMigratorServer(t)
+	defer cleanup()
+
+	// Many small sets, each with four 200-byte members. The per-set header rows scatter across every
+	// segment, so draining a segment must move its header residue too or the segment never retires.
+	// The member bytes alone are several arenas' worth, so the migrator has to sink full segments as
+	// they fill. Pipeline so the load is not one round trip per SADD.
+	const sets = 8000
+	body := strings.Repeat("x", 200)
+	members := []string{migVal(0, body), migVal(1, body), migVal(2, body), migVal(3, body)}
+	key := func(i int) string { return fmt.Sprintf("s%08d", i) }
+	for i := 0; i < sets; i++ {
+		cmd(t, rw, "SADD", key(i), members[0], members[1], members[2], members[3])
+	}
+	for i := 0; i < sets; i++ {
+		expect(t, rw, ":4") // four new members per set; if this never returns the livelock is back
+	}
+
+	// Cardinality holds across the tier for sets whose headers have migrated cold.
+	for _, i := range []int{0, sets / 2, sets - 1} {
+		cmd(t, rw, "SCARD", key(i))
+		expect(t, rw, ":4")
+	}
+
+	// Membership resolves each member by key through the primary index across whichever tier holds it.
+	cmd(t, rw, "SISMEMBER", key(0), members[2])
+	expect(t, rw, ":1")
+	cmd(t, rw, "SISMEMBER", key(sets-1), members[0])
+	expect(t, rw, ":1")
+	cmd(t, rw, "SISMEMBER", key(0), "not-a-member")
+	expect(t, rw, ":0")
+
+	// A cold header still bumps correctly: adding a fresh member write-brings-up the header and the
+	// count advances by one, proving the CountAddInt64 cold branch, not the raw unsafe.Add path.
+	cmd(t, rw, "SADD", key(0), migVal(4, body))
+	expect(t, rw, ":1")
+	cmd(t, rw, "SCARD", key(0))
+	expect(t, rw, ":5")
+}
+
 // TestServerMigratorConfigError checks that asking for the migrator without the segmented arena
 // it needs is a clean configuration error surfaced by Listen, not a panic from EnableMigrator.
 func TestServerMigratorConfigError(t *testing.T) {
