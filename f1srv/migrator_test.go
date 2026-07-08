@@ -63,23 +63,19 @@ func TestServerMigratorServesBeyondArena(t *testing.T) {
 	// arena cannot hold it at once. Pipeline the writes so the test is not one round trip per key.
 	const n = 20000
 	val := strings.Repeat("x", 200)
-	for i := 0; i < n; i++ {
-		cmd(t, rw, "SET", fmt.Sprintf("k%08d", i), migVal(i, val))
-	}
-	for i := 0; i < n; i++ {
-		expect(t, rw, "+OK")
-	}
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "SET", fmt.Sprintf("k%08d", i), migVal(i, val)) },
+		func(i int) { expect(t, rw, "+OK") })
 
 	// Every distinct key reads back its exact value, whether it ended up resident or cold.
-	for i := 0; i < n; i++ {
-		cmd(t, rw, "GET", fmt.Sprintf("k%08d", i))
-	}
-	for i := 0; i < n; i++ {
-		want := "$" + migVal(i, val)
-		if got := readReply(t, rw); got != want {
-			t.Fatalf("GET k%08d = %q, want %q", i, got, want)
-		}
-	}
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "GET", fmt.Sprintf("k%08d", i)) },
+		func(i int) {
+			want := "$" + migVal(i, val)
+			if got := readReply(t, rw); got != want {
+				t.Fatalf("GET k%08d = %q, want %q", i, got, want)
+			}
+		})
 }
 
 // TestServerMigratorServesHashBeyondArena is the D22 Option B gate at the server level: with the
@@ -100,23 +96,19 @@ func TestServerMigratorServesHashBeyondArena(t *testing.T) {
 	// writes so the load is not one round trip per field.
 	const n = 20000
 	val := strings.Repeat("x", 200)
-	for i := 0; i < n; i++ {
-		cmd(t, rw, "HSET", "h", fmt.Sprintf("f%08d", i), migVal(i, val))
-	}
-	for i := 0; i < n; i++ {
-		expect(t, rw, ":1") // each field is new, so HSET reports one field added
-	}
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "HSET", "h", fmt.Sprintf("f%08d", i), migVal(i, val)) },
+		func(i int) { expect(t, rw, ":1") }) // each field is new, so HSET reports one field added
 
 	// Point path: HGET reads each field back, most from the cold region, all exact.
-	for i := 0; i < n; i++ {
-		cmd(t, rw, "HGET", "h", fmt.Sprintf("f%08d", i))
-	}
-	for i := 0; i < n; i++ {
-		want := "$" + migVal(i, val)
-		if got := readReply(t, rw); got != want {
-			t.Fatalf("HGET h f%08d = %q, want %q", i, got, want)
-		}
-	}
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "HGET", "h", fmt.Sprintf("f%08d", i)) },
+		func(i int) {
+			want := "$" + migVal(i, val)
+			if got := readReply(t, rw); got != want {
+				t.Fatalf("HGET h f%08d = %q, want %q", i, got, want)
+			}
+		})
 
 	// Enumeration path: one HGETALL returns every field with its exact value, re-resolving the
 	// migrated ones through the tier-aware ordered index.
@@ -154,24 +146,20 @@ func TestServerMigratorServesZsetBeyondArena(t *testing.T) {
 	// Pipeline the writes so the load is not one round trip per member.
 	const n = 20000
 	val := strings.Repeat("x", 200)
-	for i := 0; i < n; i++ {
-		cmd(t, rw, "ZADD", "z", strconv.Itoa(i), migVal(i, val))
-	}
-	for i := 0; i < n; i++ {
-		expect(t, rw, ":1") // each member is new, so ZADD reports one added
-	}
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "ZADD", "z", strconv.Itoa(i), migVal(i, val)) },
+		func(i int) { expect(t, rw, ":1") }) // each member is new, so ZADD reports one added
 
 	// Point path: ZSCORE reads each member's score back, most members now cold, all exact. An integer
 	// score comes back as its plain decimal bulk string (ZSCORE board bob -> $2 in the point-path test).
-	for i := 0; i < n; i++ {
-		cmd(t, rw, "ZSCORE", "z", migVal(i, val))
-	}
-	for i := 0; i < n; i++ {
-		want := "$" + strconv.Itoa(i)
-		if got := readReply(t, rw); got != want {
-			t.Fatalf("ZSCORE z member(%d) = %q, want %q", i, got, want)
-		}
-	}
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "ZSCORE", "z", migVal(i, val)) },
+		func(i int) {
+			want := "$" + strconv.Itoa(i)
+			if got := readReply(t, rw); got != want {
+				t.Fatalf("ZSCORE z member(%d) = %q, want %q", i, got, want)
+			}
+		})
 
 	// Enumeration path: one ZRANGE WITHSCORES returns every member with its exact score, re-resolving
 	// the migrated ones through the tier-aware ordered index. WITHSCORES interleaves member and score,
@@ -208,23 +196,19 @@ func TestServerMigratorServesListBeyondArena(t *testing.T) {
 	// pushes so the load is not one round trip per element.
 	const n = 20000
 	val := strings.Repeat("x", 200)
-	for i := 0; i < n; i++ {
-		cmd(t, rw, "RPUSH", "l", migVal(i, val))
-	}
-	for i := 0; i < n; i++ {
-		expect(t, rw, ":"+strconv.Itoa(i+1)) // RPUSH returns the new length after each append
-	}
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "RPUSH", "l", migVal(i, val)) },
+		func(i int) { expect(t, rw, ":"+strconv.Itoa(i+1)) }) // RPUSH returns the new length after each append
 
 	// Point path: LINDEX reads each element back by position, most now cold, all exact.
-	for i := 0; i < n; i++ {
-		cmd(t, rw, "LINDEX", "l", strconv.Itoa(i))
-	}
-	for i := 0; i < n; i++ {
-		want := "$" + migVal(i, val)
-		if got := readReply(t, rw); got != want {
-			t.Fatalf("LINDEX l %d = %q, want %q", i, got, want)
-		}
-	}
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "LINDEX", "l", strconv.Itoa(i)) },
+		func(i int) {
+			want := "$" + migVal(i, val)
+			if got := readReply(t, rw); got != want {
+				t.Fatalf("LINDEX l %d = %q, want %q", i, got, want)
+			}
+		})
 
 	// Enumeration path: one LRANGE 0 -1 returns every element in push order, re-reading each from
 	// whichever tier holds it.
@@ -261,14 +245,13 @@ func TestServerMigratorServesStreamBeyondArena(t *testing.T) {
 	const n = 20000
 	val := strings.Repeat("x", 200)
 	idOf := func(i int) string { return strconv.Itoa(i+1) + "-1" }
-	for i := 0; i < n; i++ {
-		cmd(t, rw, "XADD", "st", idOf(i), "f", migVal(i, val))
-	}
-	for i := 0; i < n; i++ {
-		if got := readReply(t, rw); got != "$"+idOf(i) {
-			t.Fatalf("XADD %d = %q, want %q", i, got, "$"+idOf(i))
-		}
-	}
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "XADD", "st", idOf(i), "f", migVal(i, val)) },
+		func(i int) {
+			if got := readReply(t, rw); got != "$"+idOf(i) {
+				t.Fatalf("XADD %d = %q, want %q", i, got, "$"+idOf(i))
+			}
+		})
 
 	// The header count stays exact across the tier.
 	cmd(t, rw, "XLEN", "st")
@@ -334,24 +317,18 @@ func TestServerMigratorServesSetBeyondArena(t *testing.T) {
 	const n = 20000
 	body := strings.Repeat("x", 200)
 	member := func(i int) string { return migVal(i, body) }
-	for i := 0; i < n; i++ {
-		cmd(t, rw, "SADD", "s", member(i))
-	}
-	for i := 0; i < n; i++ {
-		expect(t, rw, ":1") // each member is new, so SADD reports one added
-	}
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "SADD", "s", member(i)) },
+		func(i int) { expect(t, rw, ":1") }) // each member is new, so SADD reports one added
 
 	// The header cardinality stays exact across the tier.
 	cmd(t, rw, "SCARD", "s")
 	expect(t, rw, ":"+strconv.Itoa(n))
 
 	// Point path: SISMEMBER resolves each member by key through the primary index, most now cold.
-	for i := 0; i < n; i++ {
-		cmd(t, rw, "SISMEMBER", "s", member(i))
-	}
-	for i := 0; i < n; i++ {
-		expect(t, rw, ":1")
-	}
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "SISMEMBER", "s", member(i)) },
+		func(i int) { expect(t, rw, ":1") })
 
 	// Enumeration path: one SMEMBERS returns every member, drawn from the dense member vector, whose
 	// scan resolves each cached offset to its key across whichever tier holds it. A set is unordered,
@@ -400,12 +377,9 @@ func TestServerMigratorServesManySmallSetsBeyondArena(t *testing.T) {
 	body := strings.Repeat("x", 200)
 	members := []string{migVal(0, body), migVal(1, body), migVal(2, body), migVal(3, body)}
 	key := func(i int) string { return fmt.Sprintf("s%08d", i) }
-	for i := 0; i < sets; i++ {
-		cmd(t, rw, "SADD", key(i), members[0], members[1], members[2], members[3])
-	}
-	for i := 0; i < sets; i++ {
-		expect(t, rw, ":4") // four new members per set; if this never returns the livelock is back
-	}
+	pipeDrain(t, rw, sets,
+		func(i int) { bcmd(rw, "SADD", key(i), members[0], members[1], members[2], members[3]) },
+		func(i int) { expect(t, rw, ":4") }) // four new members per set; if this never returns the livelock is back
 
 	// Cardinality holds across the tier for sets whose headers have migrated cold.
 	for _, i := range []int{0, sets / 2, sets - 1} {

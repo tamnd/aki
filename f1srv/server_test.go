@@ -60,6 +60,47 @@ func cmd(t *testing.T, rw *bufio.ReadWriter, args ...string) {
 	}
 }
 
+// bcmd buffers a RESP multibulk command into the writer without flushing, for the send side of
+// pipeDrain. bufio streams the buffer to the socket on its own as it fills, so a large pipeline goes
+// out incrementally rather than in one final flush.
+func bcmd(rw *bufio.ReadWriter, args ...string) {
+	rw.WriteByte('*')
+	rw.WriteString(itoa(len(args)))
+	rw.WriteString("\r\n")
+	for _, a := range args {
+		rw.WriteByte('$')
+		rw.WriteString(itoa(len(a)))
+		rw.WriteString("\r\n")
+		rw.WriteString(a)
+		rw.WriteString("\r\n")
+	}
+}
+
+// pipeDrain writes n commands with send while concurrently reading their n replies with read, so the
+// reply stream drains as it is produced. A send-all-then-read-all loop piles the whole reply pipeline
+// into the kernel socket buffers and deadlocks once it outgrows them: the server blocks flushing
+// replies the client is not yet reading, so it stops reading requests, so the client blocks sending
+// the rest of the batch, and neither side moves. A real pipelining client reads replies as it streams
+// requests, and so does this, which keeps the beyond-arena tests deadlock-free for any batch size on
+// any runner. send runs on a separate goroutine and must only write (never call t.Fatalf, which is
+// illegal off the test goroutine); read runs here and may fail the test.
+func pipeDrain(t *testing.T, rw *bufio.ReadWriter, n int, send func(i int), read func(i int)) {
+	t.Helper()
+	werr := make(chan error, 1)
+	go func() {
+		for i := 0; i < n; i++ {
+			send(i)
+		}
+		werr <- rw.Flush()
+	}()
+	for i := 0; i < n; i++ {
+		read(i)
+	}
+	if err := <-werr; err != nil {
+		t.Fatalf("pipeline write: %v", err)
+	}
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
