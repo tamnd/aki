@@ -11,9 +11,9 @@ import "encoding/binary"
 // offset would dangle the moment the migrator reclaimed the resident bytes. Option A repairs the
 // cached offset in place as the record moves, which only the migrator can do because it is the one
 // actor that knows both the old resident offset and the new cold address. migrateVecMember is the
-// shared mover both the hand path (MigrateToCold) and the background path (drainRecord) call, so the
-// flip-and-retier is written once and the vector is never left holding a stale resident offset a
-// concurrent draw could read past a reclaimed segment.
+// shared mover the hand path (MigrateToCold) and the background drain (flipVecMember, called from
+// drainSegment) both flow through, so the flip-and-retier is written once and the vector is never
+// left holding a stale resident offset a concurrent draw could read past a reclaimed segment.
 
 // resolveMemberVec locates the dense member vector and its owning randVec shard for the set member
 // row whose composite key is memberKey (spec 2064/f1_rewrite_ltm/22 section 4). The member key
@@ -78,7 +78,23 @@ func (s *Store) migrateVecMember(key []byte, kind byte, off uint64) bool {
 	if err != nil {
 		return false
 	}
-	newAddr := frameOff | tierBit
+	return s.flipVecMember(key, kind, off, frameOff|tierBit)
+}
+
+// flipVecMember is the retier half migrateVecMember and the batched migrator drain share: it
+// takes the vector shard mutex and, under it, flips the primary index entry for the set member
+// row at off to newAddr and repairs the dense member vector's cached offset (spec
+// 2064/f1_rewrite_ltm/22 sections 3 and 5, Option A). The frame newAddr points at is already
+// written: migrateVecMember appends it per record, the drain writes a whole segment's frames in
+// one pwrite before any flip, so by the time a flipped entry is visible its cold frame is durable
+// on disk. Holding the shard mutex across the find, the CAS, and retierSlot is the placement rule
+// section 5 proves safe: a set writer (SADD/SREM) taking the same mutex never observes a flipped
+// primary entry the vector has not yet been repaired for. The CAS stays conditional on the entry
+// still pointing at the resident off, so a raced overwrite, delete, or partition engage that moved
+// the key off off makes the CAS lose and the already-written frame becomes dead space, touching no
+// vector. It returns false without retrying: a lost CAS means the row is no longer at off, a
+// terminal state for this off.
+func (s *Store) flipVecMember(key []byte, kind byte, off, newAddr uint64) bool {
 	sh, v := s.resolveMemberVec(key)
 	if sh == nil {
 		return false
@@ -87,7 +103,7 @@ func (s *Store) migrateVecMember(key []byte, kind byte, off uint64) bool {
 	curOff, b, slot, word, found := s.find(key, hash(key), kind)
 	if !found || curOff != off {
 		// The row moved off `off` (a raced overwrite, delete, or partition engage) or vanished
-		// before the retier: drop the appended frame as dead space and touch no vector.
+		// before the retier: leave the written frame as dead space and touch no vector.
 		sh.mu.Unlock()
 		return false
 	}

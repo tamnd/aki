@@ -93,30 +93,52 @@ func (s *Store) ColdRecords() (total, dead uint64) {
 // with tierBit set; until it does, the frame is unreferenced dead space, so a failure here
 // leaves the resident record authoritative.
 func (s *Store) migrateRecordAt(off uint64) (uint64, error) {
+	var frame [1]byte
+	f, _ := s.encodeColdFrame(off, frame[:0])
+	return s.recs.append(f)
+}
+
+// encodeColdFrame appends the resident record at arena offset off to dst as one cold record
+// frame and returns the grown slice together with the seqlock version the framed value
+// belongs to. It is the encode half migrateRecordAt and the batched migrator drain
+// (drainSegment) share: migrateRecordAt appends the frame with its own pwrite, while the
+// drain encodes a whole segment's frames into one buffer and issues a single pwrite, so the
+// per-record layout lives in one place. An inline value is copied under the seqlock through
+// readValueVer, which returns the even version the bytes settled on; a separated value's
+// 12-byte cold pointer is immutable, so its version is read plainly and never moves. The
+// returned version lets the drain's flip step reject a record an in-place update touched
+// between encode and flip. dst is grown, not overwritten, so a caller can pack many frames
+// back to back.
+func (s *Store) encodeColdFrame(off uint64, dst []byte) ([]byte, uint32) {
 	kind := s.arena[off+offKind]
 	flags := s.arena[off+offFlags]
 	klen := s.klen(off)
 	kstart := off + hdrSize
 
 	var valBuf []byte
+	var ver uint32
 	if flags&flagSep != 0 {
-		// The value cell is the immutable 12-byte cold value pointer; carry it verbatim.
+		// The value cell is the immutable 12-byte cold value pointer; carry it verbatim. A
+		// separated record never updates in place, so its version is stable and read plainly.
 		vbase := off + hdrSize + align8(klen)
 		valBuf = append(valBuf, s.arena[vbase:vbase+ptrSize]...)
+		ver = s.verAt(off).Load()
 	} else {
-		valBuf = s.readValue(off, nil)
+		valBuf, ver = s.readValueVer(off, nil)
 	}
 
-	frame := make([]byte, frameHdrSize+int(klen)+len(valBuf))
-	binary.LittleEndian.PutUint32(frame[frameOffTotal:], uint32(len(frame)))
+	total := frameHdrSize + int(klen) + len(valBuf)
+	start := len(dst)
+	dst = append(dst, make([]byte, total)...)
+	frame := dst[start:]
+	binary.LittleEndian.PutUint32(frame[frameOffTotal:], uint32(total))
 	frame[frameOffKind] = kind
 	frame[frameOffFlags] = flags
 	binary.LittleEndian.PutUint16(frame[frameOffKlen:], uint16(klen))
 	binary.LittleEndian.PutUint32(frame[frameOffVlen:], uint32(len(valBuf)))
 	copy(frame[frameHdrSize:], s.arena[kstart:kstart+klen])
 	copy(frame[frameHdrSize+int(klen):], valBuf)
-
-	return s.recs.append(frame)
+	return dst, ver
 }
 
 // MigrateToCold moves the record for key in the given kind namespace to the cold record
