@@ -84,13 +84,27 @@ func isTopKind(kind byte) bool {
 //     epoch across the offset-to-key resolution, so a migrated member is followed across the tier
 //     with no dangling offset. SISMEMBER goes through the primary index by key (ExistsKind), and a
 //     write to an existing member is a no-op regardless of tier since a member row carries no value,
-//     so nothing brings a cold member back up to strand the vector. The set header row stays a
-//     top-level resident key. A kind admitted here must also be registered with SetVecMemberKindFunc.
+//     so nothing brings a cold member back up to strand the vector. A kind admitted here that is
+//     read through the vector must also be registered with SetVecMemberKindFunc.
+//
+//   - Set header: a many-small-sets larger-than-memory workload scatters one resident set header
+//     row across every arena segment, and a resident header the migrator cannot move pins its whole
+//     segment so no segment ever retires, freeSegs stays empty, and SADD livelocks in the write
+//     path's segment wait. Admitting the header lets the migrator sink it cold so the segment
+//     drains. The header body holds only a cardinality, an encoding tag, and an optional partition
+//     exponent, no arena offsets, so a physical move to cold is content-safe. Every header access
+//     already follows the tier: the point read and the type check go through the tier-aware primary
+//     index (setHeader/GetKind, ExistsKind), a full-header rewrite brings a cold header back up
+//     through PutKind's publish, DeleteKind unlinks a cold header across tiers, and the cardinality
+//     fast paths CountInt64/CountAddInt64 read the cold frame and write-bring-up the header on a
+//     bump (engine coll.go). The dense member vector is keyed by the set key, not the header offset,
+//     so migrating the header does not touch it. The header is not a vec member, so it drains
+//     through the plain index flip, not the Option A retier hook.
 func isMigratableKind(kind byte) bool {
 	switch kind {
 	case kindHashField, kindZsetMember, kindZsetScore, kindListElem,
 		kindStreamEntry, kindStreamGroup, kindStreamConsumer, kindStreamPEL,
-		kindSetMember:
+		kindSetMember, kindSetMeta:
 		return true
 	}
 	return false
