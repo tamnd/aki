@@ -272,6 +272,15 @@ type Store struct {
 	migWake  chan struct{}
 	migHiNum uint64
 	migLoNum uint64
+	// migWorkers is the number of migrator goroutines EnableMigrator spawns. A single migrator
+	// serializes every cold drain, which caps write throughput under a tight memory cgroup: the
+	// arena fills, all writers block in waitForSegment, and one goroutine's 8 MiB pwrite (throttled
+	// by the cgroup dirty-page limit) is the only thing freeing segments. An SSD sustains far more
+	// in-flight writeback than one stream feeds it, so a small pool of workers each draining a
+	// distinct segment (the segment.draining guard keeps them apart) multiplies the drain bandwidth
+	// the writers wait on. It is a lab knob a test overrides before EnableMigrator; a non-positive
+	// value takes defaultMigWorkers.
+	migWorkers int
 
 	// backpressureWaits and backpressureStalls are the write-path backpressure observability
 	// (doc 23, D23-4). waits counts each allocation that found no segment and had to wait for the
@@ -293,17 +302,16 @@ type Store struct {
 	// has no cold entries and the tier check on the read path is a never-taken branch.
 	recs *coldLog
 
-	// drainMu, drainBuf, and drainStg are the migrator's batched-drain scratch (migrate.go).
-	// drainSegment encodes every migratable record's cold frame into drainBuf, issues one
-	// pwrite for the whole batch, then flips each record's index entry, so a full segment
-	// drains with one syscall instead of one per record (measured 28x cheaper per record on
-	// the cold-region sink). The migrator drives the drain on its single goroutine; drainMu
-	// serializes the rare direct test call so the reused buffers stay race-clean, and never
-	// contends in production where drains do not overlap. The buffers are retained across
-	// drains so a steady drain rate does not re-allocate the batch each pass.
-	drainMu  sync.Mutex
-	drainBuf []byte
-	drainStg []stagedDrain
+	// drainPool holds the migrator's batched-drain scratch (migrate.go), one *drainScratch per
+	// concurrent drain. drainSegment encodes every migratable record's cold frame into the
+	// scratch's buffer, issues one pwrite for the whole batch, then flips each record's index
+	// entry, so a full segment drains with one syscall instead of one per record (measured 28x
+	// cheaper per record on the cold-region sink). With a worker pool each drain must have its own
+	// scratch, so the buffers come from this pool rather than a single shared pair: a drain gets a
+	// scratch, drains, and returns it, so the pool retains at most one buffer per active worker and
+	// a steady drain rate reuses them without re-allocating the batch each pass. A store with no
+	// migrator never puts a scratch in it, so it stays empty.
+	drainPool sync.Pool
 
 	// The deferred ordered-index removal state (tombstone.go). When deferred removal is
 	// enabled, an element delete hands the composite key to tombHead (a lock-free Treiber
