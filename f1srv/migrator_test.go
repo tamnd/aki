@@ -422,6 +422,87 @@ func TestServerMigratorConfigError(t *testing.T) {
 	}
 }
 
+// TestServerMigratorTuningServesBeyondArena is the plumbing gate for the drain-ahead knobs
+// (MigHiWater/MigLoWater/MigWorkers). It repeats the beyond-arena string load with non-default
+// watermarks and a larger worker pool set through the config, so the override reaches the store's
+// migrator before the first fill and the LTM regime is still served correctly over the wire. A bad
+// override (one the store rejects) would surface as a Listen error; an ignored one would leave the
+// arena filling and SET erroring partway through. This proves the config path down to the engine
+// setter without asserting on unexported store fields (the engine test covers those directly).
+func TestServerMigratorTuningServesBeyondArena(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		Addr:               "127.0.0.1:0",
+		IndexBuckets:       1 << 14,
+		ArenaBytes:         4 << 20,
+		ReadBufSize:        16 << 10,
+		IncrStripes:        64,
+		ArenaSegmented:     true,
+		ArenaSegmentBytes:  256 << 10,
+		ArenaOverflowBytes: 256 << 10,
+		ColdRecordsPath:    filepath.Join(dir, "f1raw-cold.recs"),
+		Migrator:           true,
+		// Drain earlier and deeper than the 85/75 default, with a larger pool, exercising the
+		// override path. These stay a well-ordered pair the store accepts.
+		MigHiWater: 80,
+		MigLoWater: 60,
+		MigWorkers: 6,
+	}
+	srv := New(cfg)
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("listen with migrator tuning: %v", err)
+	}
+	go srv.ListenAndServe()
+	defer srv.Close()
+	conn, err := net.DialTimeout("tcp", srv.Addr(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+
+	const n = 20000
+	val := strings.Repeat("x", 200)
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "SET", fmt.Sprintf("k%08d", i), migVal(i, val)) },
+		func(i int) { expect(t, rw, "+OK") })
+	pipeDrain(t, rw, n,
+		func(i int) { bcmd(rw, "GET", fmt.Sprintf("k%08d", i)) },
+		func(i int) {
+			want := "$" + migVal(i, val)
+			if got := readReply(t, rw); got != want {
+				t.Fatalf("GET k%08d = %q, want %q", i, got, want)
+			}
+		})
+}
+
+// TestServerMigratorTuningConfigError checks that an inverted watermark override is rejected at
+// Listen (the store's SetMigratorTuning panics, which New converts to an init error) rather than
+// crashing the server. It confirms the config path validates the pair rather than passing a
+// hysteresis-inverting setting through to the running migrator.
+func TestServerMigratorTuningConfigError(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		Addr:               "127.0.0.1:0",
+		IndexBuckets:       1 << 14,
+		ArenaBytes:         4 << 20,
+		ReadBufSize:        16 << 10,
+		IncrStripes:        64,
+		ArenaSegmented:     true,
+		ArenaSegmentBytes:  256 << 10,
+		ArenaOverflowBytes: 256 << 10,
+		ColdRecordsPath:    filepath.Join(dir, "f1raw-cold.recs"),
+		Migrator:           true,
+		MigHiWater:         60, // low >= high: an inverted pair the store must reject
+		MigLoWater:         70,
+	}
+	srv := New(cfg)
+	if err := srv.Listen(); err == nil {
+		srv.Close()
+		t.Fatal("Listen accepted an inverted migrator watermark pair; want an error")
+	}
+}
+
 // migVal tags the shared value body with the key index so a misrouted read (wrong key served)
 // shows up as a value mismatch, not just a length match.
 func migVal(i int, body string) string {

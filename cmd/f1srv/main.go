@@ -53,6 +53,14 @@ func main() {
 	arenaSegmentBytes := fs.Int("arena-segment-bytes", 0, "segment size in bytes for --arena-segmented (0 = engine default 8 MiB, floored at the largest record)")
 	arenaOverflowBytes := fs.Int("arena-overflow-bytes", 0, "never-reclaimed overflow-bucket region size for --arena-segmented (0 = an eighth of the arena)")
 	ltmMigrator := fs.Bool("ltm-migrator", false, "engage the background migrator that sinks whole string records cold under arena fill pressure (spec 2064/21 M3); serves a string dataset larger than the arena. Implies --arena-segmented and opens a cold record region under --dir")
+	// Migrator drain-ahead knobs for the LTM insert-flood regime. All default to 0 = engine
+	// default (drain between 85% and 75% of the segment budget, 4 drain workers), so an operator
+	// who leaves them alone gets the shipped behavior. Draining earlier and deeper, or with more
+	// workers, trades resident headroom for a shallower write-path backpressure queue; ignored
+	// unless --ltm-migrator is set.
+	migHiWater := fs.Int("mig-hi-water", 0, "migrator high-water percent of the segment budget: it wakes to drain at this fill (0 = engine default 85); needs --ltm-migrator")
+	migLoWater := fs.Int("mig-lo-water", 0, "migrator low-water percent: it drains cold until fill falls below this (0 = engine default 75); needs --ltm-migrator")
+	migWorkers := fs.Int("mig-workers", 0, "number of migrator drain goroutines (0 = engine default 4); needs --ltm-migrator")
 	pprofAddr := fs.String("pprof", "", "if set, serve net/http/pprof on this host:port (profiling only, off by default)")
 	// --gogc and --gomemlimit are optional heap-pacing knobs for the LTM regime,
 	// where a large arena and a cold value log grow the heap and an operator may
@@ -111,6 +119,9 @@ func main() {
 		cfg.ArenaSegmented = true
 		cfg.ColdRecordsPath = filepath.Join(*dir, "f1raw-cold.recs")
 		cfg.Migrator = true
+		cfg.MigHiWater = *migHiWater
+		cfg.MigLoWater = *migLoWater
+		cfg.MigWorkers = *migWorkers
 	}
 
 	if *pprofAddr != "" {
@@ -141,6 +152,11 @@ func main() {
 	migrator := "off"
 	if *ltmMigrator {
 		migrator = cfg.ColdRecordsPath
+		// Name the drain-ahead overrides when any is set so an LTM run self-documents the
+		// watermarks and worker count it was measured on; the shipped defaults stay unprinted.
+		if *migHiWater != 0 || *migLoWater != 0 || *migWorkers != 0 {
+			migrator = fmt.Sprintf("%s/hi=%d/lo=%d/workers=%d", migrator, *migHiWater, *migLoWater, *migWorkers)
+		}
 	}
 	// Report the net model (and the reactor loop count when overridden) so a run self-documents
 	// which network path it served on: the reactor and goroutine paths differ in throughput, so a
