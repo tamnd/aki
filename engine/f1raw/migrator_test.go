@@ -104,6 +104,64 @@ func TestMigratorServesBeyondArena(t *testing.T) {
 	}
 }
 
+// TestSetMigratorTuning checks the before-first-fill override that lets an operator move the LTM
+// drain-ahead watermarks and worker count off the built-in defaults. A zero argument must leave that
+// field for EnableMigrator to seed from the default; a non-zero one must take. An inverted watermark
+// pair, or a call after the migrator is already running, must panic rather than silently misconfigure.
+func TestSetMigratorTuning(t *testing.T) {
+	// A partial override: high-water and worker count set, low-water left for the default.
+	s := churnSegColdStore(t, 6)
+	s.SetMigratorTuning(90, 0, 8)
+	s.EnableMigrator()
+	if s.migHiNum != 90 {
+		t.Fatalf("migHiNum = %d, want the override 90", s.migHiNum)
+	}
+	if s.migLoNum != defaultMigLoNum {
+		t.Fatalf("migLoNum = %d, want the seeded default %d", s.migLoNum, defaultMigLoNum)
+	}
+	if s.migWorkers != 8 {
+		t.Fatalf("migWorkers = %d, want the override 8", s.migWorkers)
+	}
+
+	// All zeros is a no-op: EnableMigrator seeds every field from its default.
+	s2 := churnSegColdStore(t, 6)
+	s2.SetMigratorTuning(0, 0, 0)
+	s2.EnableMigrator()
+	if s2.migHiNum != defaultMigHiNum || s2.migLoNum != defaultMigLoNum || s2.migWorkers != defaultMigWorkers {
+		t.Fatalf("all-zero tuning changed a default: hi=%d lo=%d workers=%d", s2.migHiNum, s2.migLoNum, s2.migWorkers)
+	}
+
+	// An inverted watermark pair (low >= high) is rejected before it can invert the hysteresis.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("SetMigratorTuning(70, 80, 0) did not panic on an inverted watermark pair")
+			}
+		}()
+		churnSegColdStore(t, 6).SetMigratorTuning(70, 80, 0)
+	}()
+
+	// A high-water above 100 percent is rejected: it would never trigger a drain.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("SetMigratorTuning(120, 75, 0) did not panic on an out-of-range high-water")
+			}
+		}()
+		churnSegColdStore(t, 6).SetMigratorTuning(120, 75, 0)
+	}()
+
+	// Calling it after the migrator is running is a caller error.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("SetMigratorTuning after EnableMigrator did not panic")
+			}
+		}()
+		s.SetMigratorTuning(88, 70, 4)
+	}()
+}
+
 // TestBackpressureServesBeyondArena is the M3 slice-4 gate for the write-path backpressure (D12):
 // with the migrator engaged, a plain Set that momentarily finds the arena full must wait on the
 // migrator and succeed on its own, not return ErrFull, so a caller writing a dataset larger than
