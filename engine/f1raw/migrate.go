@@ -56,6 +56,19 @@ const (
 // foreground writers of cores while giving the disk enough concurrent drains to stay busy.
 const defaultMigWorkers = 4
 
+// maxDrainBatchBytes caps how many cold-frame bytes one drain accumulates before it flushes them
+// with a single pwrite and resets its buffer, rather than copying a whole segment's live records
+// into one segment-sized buffer. The buffer is a transient copy of the bytes being drained, held
+// alongside the resident arena those bytes still occupy, and getScratch/putScratch retain the grown
+// buffer per worker. With migWorkers drains in flight, an unbounded per-drain buffer stacks
+// migWorkers segments of transient heap (migWorkers*arenaSegmentBytes) on top of the resident
+// arena; under the tight soft heap limit the LTM regime runs at, that overshoot trips the cgroup
+// OOM killer the cap enforces. Chunking holds each drain's working copy to one chunk regardless of
+// segment size, so the pool retains migWorkers*maxDrainBatchBytes and the drain issues one pwrite
+// per chunk instead of one per segment. One MiB is large enough to keep the cold sink's queue depth
+// deep (about a thousand ~1KB records per pwrite) while small enough to leave ample headroom.
+const maxDrainBatchBytes = 1 << 20
+
 // This file adds the migrator's drain loop, the core of milestone M3 of the collection
 // cold-record tiering plan (spec 2064/f1_rewrite_ltm/21 section 6). M0 made the arena
 // reclaimable, M1 gave a record a way to leave RAM whole (the tier-tagged index and the
@@ -262,10 +275,40 @@ func (s *Store) drainSegment(si uint64) {
 	buf := sc.buf
 	stg := sc.stg
 
-	// Phase 1: encode every migratable record's frame into one buffer. A record is probed for
-	// liveness before it is encoded, so a dead record (deleted or overwritten) is stepped over
-	// without adding its bytes to the batch, and the frame offset staged here is batch-relative
-	// until the reservation in phase 2 turns it absolute.
+	// flush lands one accumulated chunk: it reserves the chunk's span in the cold region with one
+	// atomic tail bump and one pwrite, so every frame is durable before any index entry names it, then
+	// flips each staged record's entry to its absolute cold offset (batch-relative frame offsets turn
+	// absolute against the chunk's reserved base). It returns the buffers emptied so the walk keeps
+	// filling them for the next chunk. A write failure abandons the reserved span as a hole in the cold
+	// region and leaves the chunk's records resident to re-drain on a later pass once the sink recovers.
+	flush := func(buf []byte, stg []stagedDrain) ([]byte, []stagedDrain) {
+		if len(buf) == 0 {
+			return buf, stg
+		}
+		n := uint64(len(buf))
+		base := s.recs.tail.Add(n) - n
+		if _, err := s.recs.f.WriteAt(buf, int64(base)); err != nil {
+			return buf[:0], stg[:0]
+		}
+		for i := range stg {
+			st := stg[i]
+			st.frameOff += base // chunk-relative -> absolute cold-region offset
+			if st.vec {
+				klen := s.klen(st.off)
+				key := s.arena[st.off+hdrSize : st.off+hdrSize+klen]
+				s.flipVecMember(key, st.kind, st.off, st.frameOff|tierBit)
+			} else {
+				s.flipResident(st)
+			}
+		}
+		return buf[:0], stg[:0]
+	}
+
+	// Walk the segment record by record, encoding every migratable, still-live record's frame into the
+	// current chunk and flushing the chunk once it crosses the batch bound, so the drain never holds
+	// more than one chunk of transient copy at a time. A record is probed for liveness before it is
+	// encoded, so a dead record (deleted or overwritten) is stepped over without adding its bytes, and
+	// the frame offset staged here is chunk-relative until flush turns it absolute.
 	for off := seg.base; off+hdrSize <= limit; {
 		recBytes := s.recBytesAt(off)
 		if recBytes == 0 || off+recBytes > limit {
@@ -283,39 +326,13 @@ func (s *Store) drainSegment(si uint64) {
 				kind:     kind,
 				vec:      s.isVecMember(kind),
 			})
+			if len(buf) >= maxDrainBatchBytes {
+				buf, stg = flush(buf, stg)
+			}
 		}
 		off += recBytes
 	}
-
-	// Phase 2: reserve the batch's span in the cold region with one atomic tail bump and write it
-	// with one pwrite, so every frame is durable before phase 3 publishes any offset into it.
-	var base uint64
-	writeOK := true
-	if len(buf) > 0 {
-		n := uint64(len(buf))
-		base = s.recs.tail.Add(n) - n
-		if _, err := s.recs.f.WriteAt(buf, int64(base)); err != nil {
-			// The batch write failed: publish nothing and leave every staged record resident. The
-			// reserved span is abandoned as a hole in the cold region; the records re-drain on a
-			// later pass once the sink recovers.
-			writeOK = false
-		}
-	}
-
-	// Phase 3: flip each staged record's index entry to its absolute cold offset.
-	if writeOK {
-		for i := range stg {
-			st := stg[i]
-			st.frameOff += base // batch-relative -> absolute cold-region offset
-			if st.vec {
-				klen := s.klen(st.off)
-				key := s.arena[st.off+hdrSize : st.off+hdrSize+klen]
-				s.flipVecMember(key, st.kind, st.off, st.frameOff|tierBit)
-			} else {
-				s.flipResident(st)
-			}
-		}
-	}
+	buf, stg = flush(buf, stg)
 
 	sc.buf = buf
 	sc.stg = stg
