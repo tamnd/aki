@@ -453,14 +453,21 @@ func (s *Store) waitForSegment() bool {
 	// enough to free a segment within the spin: the arena was still overrun and a writer still blocked,
 	// which is exactly what the counter reports (doc 23, D23-4).
 	s.backpressureWaits.Add(1)
-	// Fast path: wake the migrator and spin, yielding to it and reclaiming retired segments as
-	// readers quiesce, so the common case where a drain frees a segment within microseconds returns
-	// without paying a migWaitStep sleep. reclaimSegments turns the just-retired segment reusable
-	// once the safe epoch passes it, which for a writer not holding an epoch here happens almost
-	// immediately. Gosched hands the P to the migrator between checks rather than busy-burning it.
+	// Fast path: wake the migrator and spin, yielding to it so the common case where a drain frees a
+	// segment within microseconds returns without paying a migWaitStep sleep. The spin reads the
+	// lock-free availSegs hint rather than calling segAvailable, which would lock segMu and run
+	// reclaimLocked on every iteration: with many writers blocked at once that per-iteration lock
+	// turned the spin into a segMu storm that starved the migrator workers of the very lock they need
+	// to retire and free a segment, so the drain could not make progress and concurrent-insert
+	// throughput under a full arena collapsed (the SADDNEW-under-migration ceiling). availSegs counts
+	// only immediately claimable segments, so a positive read means advanceSeg will find room; the
+	// retire-and-reclaim that produces one happens on the migrator under segMu, now uncontended.
+	// Gosched hands the P to the migrator between checks rather than busy-burning it. A segment freed
+	// by a migrator that retired it while a reader still held an epoch is not yet in availSegs; the
+	// slow sleeping poll below still calls the locking segAvailable, so that case is never missed.
 	s.signalMigrator()
 	for i := 0; i < migSpinIters; i++ {
-		if s.segAvailable() {
+		if s.availSegs.Load() > 0 {
 			return true
 		}
 		runtime.Gosched()

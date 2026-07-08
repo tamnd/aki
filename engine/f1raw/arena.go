@@ -144,6 +144,9 @@ func (s *Store) EnableSegments(segBytes, ovBytes int) {
 	s.ovTail.Store(ovBase)
 	s.highWater = 1 // segment 0 is the first current segment
 	s.curSeg.Store(0)
+	// Every segment but the current one is immediately available (free list empty, all headroom
+	// unused), so seed the lock-free hint with that count. It tracks freeSegs and highWater from here.
+	s.availSegs.Store(int64(nSeg) - 1)
 
 	// A segmented store can free and reuse a segment, so it needs the reader epoch framework
 	// (epoch.go M2) to gate a free on reader quiescence. A non-segmented store never reaches
@@ -232,20 +235,23 @@ func (s *Store) advanceSeg(observed uint64) bool {
 	case len(s.freeSegs) > 0:
 		ni = s.freeSegs[len(s.freeSegs)-1]
 		s.freeSegs = s.freeSegs[:len(s.freeSegs)-1]
+		s.availSegs.Add(-1) // drew one claimable segment out of the free list
 	case s.highWater < uint64(len(s.segs)):
 		ni = s.highWater
 		s.highWater++
+		s.availSegs.Add(-1) // consumed one segment of never-used headroom
 	default:
 		// No free segment and no unused one. A migrator may have retired segments that are now
 		// safe to reuse; reclaim inline before giving up so a fill that outpaces the migrator's
 		// own reclamation pass still recovers freed space rather than reporting a full arena
 		// while retired segments wait.
-		s.reclaimLocked()
+		s.reclaimLocked() // credits availSegs for each segment it moves onto the free list
 		if len(s.freeSegs) == 0 {
 			return false
 		}
 		ni = s.freeSegs[len(s.freeSegs)-1]
 		s.freeSegs = s.freeSegs[:len(s.freeSegs)-1]
+		s.availSegs.Add(-1) // drew the just-reclaimed segment out of the free list
 	}
 	s.curSeg.Store(ni)
 	// A segment just filled and the current pointer moved to a new one: signal the migrator so it
@@ -349,6 +355,7 @@ func (s *Store) freeSegment(si uint64) {
 	seg.draining.Store(false)
 	s.releaseArenaPages(seg.base, s.segSize)
 	s.freeSegs = append(s.freeSegs, si)
+	s.availSegs.Add(1) // one more segment a blocked writer's advanceSeg can now claim
 }
 
 // retireSegment marks segment si dead but not yet free, the epoch-gated replacement for
@@ -395,6 +402,7 @@ func (s *Store) reclaimLocked() {
 			seg.draining.Store(false)
 			s.releaseArenaPages(seg.base, s.segSize)
 			s.freeSegs = append(s.freeSegs, si)
+			s.availSegs.Add(1) // reclaimed a retired segment: now claimable, credit the hint
 		} else {
 			kept = append(kept, si)
 		}
@@ -436,6 +444,8 @@ func (s *Store) resetSegments() {
 	s.retSegs = s.retSegs[:0]
 	s.highWater = 1
 	s.curSeg.Store(0)
+	// Back to the initial layout: segment 0 current, every other segment claimable headroom.
+	s.availSegs.Store(int64(len(s.segs)) - 1)
 	s.ovTail.Store(s.ovBase)
 }
 
