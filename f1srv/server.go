@@ -370,11 +370,17 @@ func New(cfg Config) *Server {
 		// Widen the background migrator past its string floor to the collection element kinds the
 		// server has proven tier-safe (spec 2064/21 D22 Option B), so those elements can sink cold
 		// under fill pressure while their header row stays resident. The hash field and both zset
-		// element kinds, the list element kind, and the four stream element kinds qualify today; only
-		// the set member row still waits, and isMigratableKind documents why. This
-		// is inert unless cfg.Migrator started the migrator below, and like SetTopKindFunc it is set
-		// once here on the still-empty store, before the server accepts traffic.
+		// element kinds, the list element kind, the four stream element kinds, and the set member row
+		// all qualify today; isMigratableKind documents each kind's tier-safety. This is inert unless
+		// cfg.Migrator started the migrator below, and like SetTopKindFunc it is set once here on the
+		// still-empty store, before the server accepts traffic.
 		srv.store.SetMigratableKindFunc(isMigratableKind)
+		// The set member row is the one migratable kind whose secondary structure (the dense member
+		// vector) caches a raw arena offset it cannot re-resolve by key, so the migrator repairs the
+		// cached offset in place under the vector shard mutex as it flips the record cold (Option A,
+		// spec 2064/22 and engine retier.go). Registering the kind here routes the engine's migrator
+		// through that retier hook for it; every other admitted kind rides the plain index flip.
+		srv.store.SetVecMemberKindFunc(isVecMemberKind)
 		// Take the O(log n) ordered-index splice off the element-delete reply path: a delete
 		// queues the removal and a background folder splices it under the index lock later
 		// (spec 2064/16 slice 2). Enable once here, before the server accepts traffic.

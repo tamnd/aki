@@ -310,6 +310,71 @@ func TestServerMigratorServesStreamBeyondArena(t *testing.T) {
 	}
 }
 
+// TestServerMigratorServesSetBeyondArena is the D22 Option A gate for the set at the server level:
+// with the set member kind admitted to the migrator (isMigratableKind) and registered as the
+// vec-member kind (SetVecMemberKindFunc), a set whose member rows outgrow the resident arena is
+// served correctly over the wire, most rows now cold. It fills one set with far more large members
+// than the small arena can hold, so the migrator sinks full segments of member rows into the cold
+// record region as they fill while the set header row stays resident, and every SADD must still
+// succeed (D12 backpressure waits on the migrator rather than erroring). Unlike the ordered-index
+// kinds the set has no key to re-resolve, so the migrator repairs the dense member vector's cached
+// offset in place as it flips each row cold (Option A, migrateVecMember). Then SISMEMBER reads each
+// member back across the tier through the primary index, and one SMEMBERS re-resolves every member
+// from the vector, whose lock-free scan pins the reader's epoch and copies each key out of whichever
+// tier holds it. Without the admission and the retier hook the member rows cannot migrate, the arena
+// fills, and SADD errors partway through the load.
+func TestServerMigratorServesSetBeyondArena(t *testing.T) {
+	rw, cleanup := dialMigratorServer(t)
+	defer cleanup()
+
+	// One set, many members whose keys are 200 bytes each: the member rows are several arenas' worth
+	// of record bytes and cannot all stay resident, while the single header row pins at most one
+	// segment. A set member row carries no value, so the member string is the record's key. Pipeline
+	// the writes so the load is not one round trip per member.
+	const n = 20000
+	body := strings.Repeat("x", 200)
+	member := func(i int) string { return migVal(i, body) }
+	for i := 0; i < n; i++ {
+		cmd(t, rw, "SADD", "s", member(i))
+	}
+	for i := 0; i < n; i++ {
+		expect(t, rw, ":1") // each member is new, so SADD reports one added
+	}
+
+	// The header cardinality stays exact across the tier.
+	cmd(t, rw, "SCARD", "s")
+	expect(t, rw, ":"+strconv.Itoa(n))
+
+	// Point path: SISMEMBER resolves each member by key through the primary index, most now cold.
+	for i := 0; i < n; i++ {
+		cmd(t, rw, "SISMEMBER", "s", member(i))
+	}
+	for i := 0; i < n; i++ {
+		expect(t, rw, ":1")
+	}
+
+	// Enumeration path: one SMEMBERS returns every member, drawn from the dense member vector, whose
+	// scan resolves each cached offset to its key across whichever tier holds it. A set is unordered,
+	// so collect into a map and check every member is present exactly once.
+	cmd(t, rw, "SMEMBERS", "s")
+	got := readArray(t, rw)
+	if len(got) != n {
+		t.Fatalf("SMEMBERS returned %d members, want %d", len(got), n)
+	}
+	seen := make(map[string]bool, n)
+	for _, m := range got {
+		if seen[m] {
+			t.Fatalf("SMEMBERS returned a duplicate member")
+		}
+		seen[m] = true
+	}
+	for i := 0; i < n; i++ {
+		if !seen[member(i)] {
+			t.Fatalf("SMEMBERS missing member %d", i)
+		}
+	}
+}
+
 // TestServerMigratorConfigError checks that asking for the migrator without the segmented arena
 // it needs is a clean configuration error surfaced by Listen, not a panic from EnableMigrator.
 func TestServerMigratorConfigError(t *testing.T) {
