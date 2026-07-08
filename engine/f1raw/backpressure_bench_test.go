@@ -25,12 +25,22 @@ func BenchmarkBackpressureConcurrent(b *testing.B) {
 	)
 	// Each segment is floored at maxRecordBytes so no record spans one, so size the arena
 	// from that floor: nSeg+1 segments plus the overflow region. Distinct keys never delete,
-	// so the resident set fills the arena within a few thousand writes and every steady-state
-	// write then blocks in waitForSegment until the migrator drains a segment cold.
+	// so the resident set fills the small nSeg-segment record region within a few thousand
+	// writes and every steady-state write then blocks in waitForSegment until the migrator
+	// drains a segment cold. That drain-wait is the quantity this benchmark measures.
+	//
+	// The record region stays small (nSeg segments) so backpressure engages, but the resident
+	// index must hold an entry for every distinct key the benchmark ever writes (cold ones too:
+	// a migrated record keeps its index entry). So size the index generously and give it a large
+	// overflow region: at 1<<22 primary buckets (~29M slots) the driven key count stays at load
+	// far under one per bucket for any reasonable benchtime, so almost no overflow bucket is
+	// needed and the benchmark measures record-arena backpressure rather than exhausting the
+	// index. An absurd benchtime that still outruns this sizing surfaces the legible ErrIndexFull
+	// (raise IndexBuckets), distinct from the ErrFull the record arena would report.
 	segSize := int(align8(maxRecordBytes))
-	ov := 1 << 16
+	ov := 1 << 20 // 1 MiB of overflow buckets, ample headroom past the ~zero the load needs
 	arena := 8 + ov + (nSeg+1)*segSize
-	s := NewSegmented(1<<16, arena, segSize, ov)
+	s := NewSegmented(1<<22, arena, segSize, ov)
 	if !s.segmented {
 		b.Fatal("NewSegmented did not enable the segmented arena")
 	}

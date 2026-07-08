@@ -79,14 +79,14 @@ func (s *Store) Incr(key []byte, delta int64) (int64, error) {
 		// Absent: try to install delta as a new record, but lose gracefully to a
 		// concurrent creator so the next loop iteration finds it and adds onto it.
 		b := strconv.AppendInt(buf[:0], delta, 10)
-		installed, existed := s.insertAbsent(key, b, h, stringKind)
+		installed, existed, ierr := s.insertAbsent(key, b, h, stringKind)
 		if installed {
 			return delta, nil
 		}
 		if existed {
 			continue // someone created it; loop back into the update path
 		}
-		return 0, ErrFull
+		return 0, ierr
 	}
 }
 
@@ -150,12 +150,13 @@ func (s *Store) readInt(off uint64) (int64, error) {
 // insertAbsent publishes val under key only if the key is absent. It returns
 // installed=true when this call created the record, existed=true when a concurrent
 // writer already holds the key (so the caller should switch to an update), and both
-// false only when the arena is full. It mirrors publish's bucket scan but never
-// overwrites an existing key's value.
-func (s *Store) insertAbsent(key, val []byte, h uint64, kind byte) (installed, existed bool) {
+// false with a non-nil err when neither is possible: ErrFull when the record arena has
+// no room, ErrIndexFull when the resident index is out of overflow buckets. It mirrors
+// publish's bucket scan but never overwrites an existing key's value.
+func (s *Store) insertAbsent(key, val []byte, h uint64, kind byte) (installed, existed bool, err error) {
 	off, ok := s.allocRec(recSize(len(key), len(val)))
 	if !ok {
-		return false, false
+		return false, false, ErrFull
 	}
 	s.initRecord(off, key, val, kind, 0)
 	tag := tagOf(h)
@@ -178,7 +179,7 @@ func (s *Store) insertAbsent(key, val []byte, h uint64, kind byte) (installed, e
 					continue
 				}
 				if s.recordMatches(w&addrMask, key, kind) {
-					return false, true // key already present
+					return false, true, nil // key already present
 				}
 			}
 			last = b
@@ -188,12 +189,14 @@ func (s *Store) insertAbsent(key, val []byte, h uint64, kind byte) (installed, e
 			if emptyB.slots[emptySlot].CompareAndSwap(0, newWord) {
 				s.count.Add(1)
 				s.addTop(kind, 1)
-				return true, false
+				return true, false, nil
 			}
 			continue // slot filled under us; rescan (may now find the key)
 		}
+		// The chain is full: a failed grow is the overflow region exhausted, not the
+		// record arena (allocRec already succeeded), so it is the resident-index ceiling.
 		if s.nextBucket(last, true) == nil {
-			return false, false
+			return false, false, ErrIndexFull
 		}
 	}
 }
