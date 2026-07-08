@@ -61,15 +61,21 @@ const maxRecordBytes = hdrSize + ((maxKey + 7) &^ 7) + ((maxVal + 7) &^ 7)
 // stuck mark so the migrator does not re-pick the same unretireable segment forever and starves
 // the field-bearing segments that can actually drain. drainSegment writes it lock-free while
 // pickDrainTarget and the reclaimer read and clear it under segMu, so it is atomic; a later delete
-// lowers live below stuck and re-enables the segment, and a free zeroes both. The padding keeps
-// adjacent descriptors off one cache line so two segments filling concurrently do not false-share.
+// lowers live below stuck and re-enables the segment, and a free zeroes both. pending counts the
+// writers that have reserved a record in this segment but not yet finished laying its bytes down
+// (doc 23 D23-6): allocRecord claims a slot before it bumps the cursor and the writer releases it in
+// commitRecord once initRecord has written the record, so a drain of a just-sealed segment waits for
+// pending to reach zero before it walks the records, closing the race where the migrator reads a
+// header a concurrent initRecord is still writing. The padding keeps adjacent descriptors off one
+// cache line so two segments filling concurrently do not false-share.
 type segment struct {
-	base   uint64
-	alloc  atomic.Uint64
-	live   atomic.Int64
-	retire uint64
-	stuck  atomic.Int64
-	_      [64 - 40]byte
+	base    uint64
+	alloc   atomic.Uint64
+	live    atomic.Int64
+	retire  uint64
+	stuck   atomic.Int64
+	pending atomic.Int64
+	_       [64 - 48]byte
 }
 
 // NewSegmented builds a store whose arena is divided into reclaimable segments of
@@ -172,11 +178,20 @@ func (s *Store) allocRecord(nbytes uint64) (uint64, bool) {
 	for {
 		si := s.curSeg.Load()
 		seg := &s.segs[si]
+		// Claim an in-flight-writer slot on this segment before bumping its cursor, so a drain of a
+		// just-sealed segment can wait for every writer that reserved a record here to finish laying
+		// its bytes down before it walks them (doc 23 D23-6). The claim is taken ahead of the cursor
+		// bump so a drain that observes pending == 0 is guaranteed no writer is between reserving a
+		// slot and committing its bytes: a writer that has made the slot visible (bumped alloc) has
+		// already raised pending. The caller releases the slot in commitRecord once initRecord has
+		// written the record; an overshoot that lands in no segment here releases it below.
+		seg.pending.Add(1)
 		end := seg.alloc.Add(n)
 		if end <= seg.base+s.segSize {
 			seg.live.Add(int64(n))
-			return end - n, true
+			return end - n, true // pending held until the caller commitRecords the written bytes
 		}
+		seg.pending.Add(-1) // overshoot: this writer wrote no bytes into this segment
 		if s.advanceSeg(si) {
 			continue
 		}
@@ -275,6 +290,20 @@ func (s *Store) segOf(off uint64) (uint64, bool) {
 		return 0, false
 	}
 	return si, true
+}
+
+// commitRecord releases the in-flight-writer slot allocRecord claimed on the segment that owns off,
+// called once the record's bytes are fully written (initRecord done) so the migrator may safely walk
+// them (doc 23 D23-6). It pairs one-to-one with the pending increment allocRecord took for the
+// reservation that produced off: segOf recovers the same segment from off, so the decrement lands on
+// the segment the increment raised, keeping the counter balanced without threading the segment index
+// through the write path. A non-segmented store, a cold address, or an overflow-region offset owns no
+// per-segment counter, so it is a no-op there, matching allocRec's own dispatch and the alloc path
+// that never raised pending.
+func (s *Store) commitRecord(off uint64) {
+	if si, ok := s.segOf(off); ok {
+		s.segs[si].pending.Add(-1)
+	}
 }
 
 // unlinkResident charges a just-unlinked resident record's bytes back to its owning segment's
