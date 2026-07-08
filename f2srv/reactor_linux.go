@@ -56,14 +56,18 @@ type reactorLoop struct {
 	closing bool           // set by stop(); the loop tears down on the next wake
 }
 
-// serveWithReactor runs the epoll driver when NetMode is "reactor" or "auto", returning
+// serveWithReactor runs the epoll driver only when NetMode is an explicit "reactor", returning
 // handled true so ListenAndServe does not also run the goroutine accept loop. It starts
 // one loop goroutine per GOMAXPROCS (or ReactorLoops), then accepts on the caller's
 // goroutine and hands each new connection to a loop round-robin. On any setup failure it
 // reports handled false so the caller falls back to the goroutine driver on the same
 // already-bound listener.
 func serveWithReactor(s *Server) (bool, error) {
-	if s.NetMode != "reactor" && s.NetMode != "auto" {
+	// The epoll reactor benchmarks slower than the goroutine-per-conn path on every
+	// box measured (WSL 32c and a bare-metal 6c VPS), P1 and P16 alike, and degrades
+	// further as server cores climb. So it stays strictly opt-in: "auto" and the empty
+	// default both run the goroutine driver; only an explicit "reactor" engages epoll.
+	if s.NetMode != "reactor" {
 		return false, nil
 	}
 	n := s.ReactorLoops
