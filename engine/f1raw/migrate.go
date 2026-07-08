@@ -1,6 +1,9 @@
 package f1raw
 
-import "time"
+import (
+	"runtime"
+	"time"
+)
 
 // migWaitStep and migWaitPolls bound the write-path backpressure wait (D12): when the arena is
 // full and the migrator is engaged, allocRecord signals the migrator and polls this many times,
@@ -12,6 +15,15 @@ import "time"
 const (
 	migWaitStep  = 100 * time.Microsecond
 	migWaitPolls = 10000 // 100us x 10000 = up to 1s per blocked allocation
+	// migSpinIters is the adaptive spin the backpressure wait runs before falling to the sleeping
+	// poll. When the migrator keeps up, a drained segment retires and becomes reclaimable within a
+	// few microseconds of the writer blocking, far under one migWaitStep. Sleeping migWaitStep in
+	// that case pins every blocked allocation at ~100us and is the P16 SADD-under-migration ceiling:
+	// with many concurrent writers each one wakes only once per 100us quantum even though a segment
+	// freed almost immediately. The spin yields to the migrator and reclaims retired segments as
+	// readers quiesce, so the common fast-free case returns in microseconds; only a genuinely slow
+	// drain (cold-region I/O stall, reader holding an epoch) falls through to the sleeping poll.
+	migSpinIters = 256
 )
 
 // defaultMigHiNum and defaultMigLoNum are the high- and low-water numerators over 100 of the
@@ -249,18 +261,41 @@ func (s *Store) waitForSegment() bool {
 	if !s.migOn.Load() {
 		return false // no migrator: the arena is genuinely full, report it at once
 	}
+	// Fast path: wake the migrator and spin, yielding to it and reclaiming retired segments as
+	// readers quiesce, so the common case where a drain frees a segment within microseconds returns
+	// without paying a migWaitStep sleep. reclaimSegments turns the just-retired segment reusable
+	// once the safe epoch passes it, which for a writer not holding an epoch here happens almost
+	// immediately. Gosched hands the P to the migrator between checks rather than busy-burning it.
+	s.signalMigrator()
+	for i := 0; i < migSpinIters; i++ {
+		if s.segAvailable() {
+			return true
+		}
+		runtime.Gosched()
+	}
+	// Slow path: the drain is genuinely lagging (cold-region I/O stall, a reader pinning an epoch
+	// that keeps a retired segment from reclaiming). Fall to the bounded sleeping poll so a burst
+	// that outruns the migrator waits it out instead of failing a write the migrator would serve.
 	for i := 0; i < migWaitPolls; i++ {
 		s.signalMigrator()
 		time.Sleep(migWaitStep)
-		s.reclaimSegments() // turn any drained-and-retired segments into reusable ones
-		s.segMu.Lock()
-		free := len(s.freeSegs) > 0 || s.highWater < uint64(len(s.segs))
-		s.segMu.Unlock()
-		if free {
+		if s.segAvailable() {
 			return true
 		}
 	}
 	return false
+}
+
+// segAvailable reclaims any drained-and-retired segments whose readers have quiesced, then reports
+// whether a segment is ready to allocate from: a reclaimed or previously-freed segment on the free
+// list, or a never-used segment below the high-water mark. It folds the reclaim and the check into
+// one segMu acquisition so a caller polling for room does not take the lock twice per round.
+func (s *Store) segAvailable() bool {
+	s.segMu.Lock()
+	s.reclaimLocked()
+	free := len(s.freeSegs) > 0 || s.highWater < uint64(len(s.segs))
+	s.segMu.Unlock()
+	return free
 }
 
 // migrator is the background goroutine's loop: sleep until woken by a segment advance or a stop,
