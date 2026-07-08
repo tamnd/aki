@@ -299,10 +299,34 @@ func (s *Store) readColdKey(coldOff uint64, dst []byte) []byte {
 // fresh buffer the caller owns, which is the LTM-only cost paid on a member that has spilled, far
 // below the pread that dominates it.
 func (s *Store) keyAtTiered(off uint64, dst []byte) []byte {
-	if off&tierBit == 0 {
-		return s.keyAt(off)
+	if off&tierBit != 0 {
+		return s.readColdKey(off&^tierBit, dst)
 	}
-	return s.readColdKey(off&^tierBit, dst)
+	if s.segmented {
+		// On the reclaimable segmented arena a resident key must be copied into a caller-owned
+		// buffer, not returned as a zero-copy arena alias: the vector slot this offset came from can
+		// retier cold and its segment be reclaimed and reused the instant after a lock-free draw
+		// loaded the offset, so an alias would dangle once the reader's epoch pin drops. The copy runs
+		// under that pin (the draw and scan sites hold it across this call, spec 22 section 5 race 3),
+		// so the bytes are stable while they are read out, and the returned copy outlives the pin. The
+		// pure in-memory arena never reclaims, so it keeps the zero-copy return below.
+		return append(dst[:0], s.keyAt(off)...)
+	}
+	return s.keyAt(off)
+}
+
+// pinTiered returns a live epoch guard on the segmented arena and the zero (no-op) guard otherwise,
+// so a randvec draw or scan can hold the reader's epoch across an offset-to-key resolution without
+// branching on s.segmented at every call site (spec 2064/f1_rewrite_ltm/22 section 5, race 3). A
+// resident offset a lock-free draw loads from a vector slot can retier cold and have its segment
+// reclaimed the instant after the load, so the pin must be published before the slot load and held
+// until keyAtTiered has copied the key out; the pure in-memory arena never reclaims, so it pays
+// nothing here.
+func (s *Store) pinTiered() epochGuard {
+	if s.segmented {
+		return s.pin()
+	}
+	return epochGuard{}
 }
 
 // readValueByAddr resolves a value from a logical index address into dst, branching on the
