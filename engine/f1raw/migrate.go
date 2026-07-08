@@ -74,67 +74,58 @@ const (
 //     bytes already charged out of the segment's live counter when it was unlinked. Nobody
 //     frees or reuses a byte except under the epoch gate, so a reader mid-copy is never cut.
 
-// drainRecord sinks the single resident record at arena offset off to the cold region if it
-// is still the live record for its key, returning true when it moved one. It is the per-record
-// step of drainSegment and the identity-anchored twin of MigrateToCold: where MigrateToCold
-// migrates whatever record currently answers a key, this migrates only the record at off, so a
-// walk sinks the bytes it is actually trying to drain and never a fresh record a concurrent
-// overwrite published in another segment.
-//
-// It reads the key and kind from the record's immutable header, probes the index, and acts only
-// when the entry still points at off. A miss (the key was deleted) or a hit at a different offset
-// (the key was overwritten to a new record) means off is already dead space the arena reclaims
-// with the segment, so there is nothing to do and its bytes are already out of the live counter.
-// On a match it appends the cold frame and CAS-flips the entry to it; a lost CAS re-probes, and if
-// the re-probe no longer lands on off the record was unlinked under us and the fresh cold frame is
-// abandoned as dead space, exactly MigrateToCold's rule. On the winning CAS it charges the resident
-// bytes back to the segment so the segment drains toward zero.
-func (s *Store) drainRecord(off uint64) bool {
-	if s.recs == nil || off&tierBit != 0 {
-		return false
-	}
-	kind := s.arena[off+offKind]
-	if !s.migratable(kind) {
-		// A kind the policy does not admit stays resident. The string floor is always safe (no
-		// secondary structure, a fully tier-aware read, write, and delete path). A collection kind
-		// is safe only once its type's secondary structures follow a record cold: the ordered index
-		// does (each node re-resolves through the tier-aware primary index on access, D22 Option B),
-		// so a server that has proven a hash, zset, or list read path admits those kinds; the set
-		// member vector still caches resident offsets it cannot re-resolve, so a server leaves the
-		// set kinds out until that lands. A pure-string larger-than-memory workload drains its
-		// segments fully regardless of the policy.
-		return false
-	}
-	klen := s.klen(off)
-	key := s.arena[off+hdrSize : off+hdrSize+klen]
-	if s.isVecMember(kind) {
-		// A set member row rides Option A (retier.go): the dense member vector caches this record's
-		// raw resident offset and cannot re-resolve it, so the flip must repair the cached slot in
-		// place under the vector shard mutex rather than trust a secondary structure to follow. Both
-		// movers share migrateVecMember, so the background drain retiers exactly as MigrateToCold does.
-		// key aliases the arena here; migrateVecMember copies it before any path that could mutate it.
-		return s.migrateVecMember(key, kind, off)
-	}
+// stagedDrain records one record the batched drain (drainSegment) encoded into the shared frame
+// buffer during its walk, so the flip pass can point each record's index entry at its cold frame
+// after the single pwrite lands. off is the resident arena offset being drained; frameOff is the
+// absolute cold-region offset the record's frame will occupy once the batch is written; kind and
+// vec select the flip discipline (set member rows retier their dense vector under a shard mutex,
+// every other kind flips the index entry directly); ver is the seqlock version encodeColdFrame
+// paired with the framed value, so the resident flip can reject a record an in-place update touched
+// after it was encoded rather than publish a stale frame.
+type stagedDrain struct {
+	off      uint64
+	frameOff uint64
+	ver      uint32
+	kind     byte
+	vec      bool
+}
+
+// flipResident points the index entry for the non-vector record at off at its already-written cold
+// frame frameOff, the flip step of the batched drain for every kind but the set member row. It is
+// the identity-and-version-anchored successor to the old per-record drainRecord flip: it probes the
+// index and acts only when the entry still points at off (a miss or a hit at another offset means
+// off was deleted or overwritten and is dead space already out of the segment's live counter), and
+// only when the record's seqlock version still equals the one encodeColdFrame framed the value with.
+// That version guard closes a hole the per-record path left open: inPlace ticks the version by two,
+// so a value update that landed between the drain encoding this record and flipping it changes the
+// version, and the guard leaves the record resident to re-drain with a fresh frame rather than flip
+// the index to a frame holding the pre-update value. The residual window between the version load
+// and the CAS is a few instructions, far shorter than the whole encode-to-flip span the old path
+// left unguarded, so this is strictly safer than before. A lost CAS re-probes with the same
+// frameOff; if the re-probe no longer lands on off the record moved and the frame is left as dead
+// space. On the winning CAS it charges the resident bytes out of the segment so it drains toward
+// retirement.
+func (s *Store) flipResident(st stagedDrain) {
+	klen := s.klen(st.off)
+	key := s.arena[st.off+hdrSize : st.off+hdrSize+klen]
 	h := hash(key)
 	for {
-		cur, b, slot, word, found := s.find(key, h, kind)
-		if !found || cur != off {
-			// off is not the live record for this key anymore: deleted, or overwritten to a
-			// fresh record elsewhere. Either way it is dead space, already unlinked from the
-			// segment's live counter, so the drain leaves it alone.
-			return false
+		cur, b, slot, word, found := s.find(key, h, st.kind)
+		if !found || cur != st.off {
+			return
 		}
-		frameOff, err := s.migrateRecordAt(off)
-		if err != nil {
-			return false
+		if s.verAt(st.off).Load() != st.ver {
+			// An in-place update landed after this record was encoded: its framed value is stale.
+			// Leave it resident so the next drain pass re-encodes and re-flips it.
+			return
 		}
-		newWord := (word &^ addrMask) | frameOff | tierBit
+		newWord := (word &^ addrMask) | st.frameOff | tierBit
 		if b.slots[slot].CompareAndSwap(word, newWord) {
-			s.unlinkResident(off)
-			return true
+			s.unlinkResident(st.off)
+			return
 		}
-		// Lost the entry to a concurrent writer; the appended frame is now dead space. Re-probe:
-		// if the key moved off this offset the next iteration bails, otherwise the retry sinks it.
+		// Lost the entry to a concurrent writer; re-probe. The written frame is still valid, so a
+		// re-probe that still lands on off retries the flip against the fresh word.
 	}
 }
 
@@ -153,19 +144,33 @@ func (s *Store) migratable(kind byte) bool {
 }
 
 // drainSegment sinks every record still live in segment si to the cold region and retires the
-// segment once it is empty, the M3 drain the pressure loop (a later slice) will call to reclaim a
-// full segment's bytes. It walks the segment from its base to its allocation cursor, stepping
-// record to record by the immutable record size, and drains each one through drainRecord. Dead
-// records (already overwritten, deleted, or migrated) are stepped over at no cost beyond the probe;
-// live ones move cold and leave the segment's live counter. When the last live record has left, the
-// counter reads zero and the segment retires through the epoch gate (retireSegment), so it returns
-// to the free list as soon as the readers that could hold a pre-flip address into it drain.
+// segment once it is empty, the drain the pressure loop calls to reclaim a full segment's bytes. It
+// runs in two phases so a whole segment drains with one cold-region pwrite instead of one per
+// record: the per-record append the earlier per-record drain issued was the SET larger-than-memory
+// write bound (measured ~1µs per record on the cold sink versus ~40ns per record when a segment's
+// frames share one pwrite, a 28x cut).
 //
-// The caller must pass a full segment that is not the current allocation target, so no new record
-// is being laid into it during the walk (D15). The walk clamps at the segment end rather than the
-// raw cursor, since a failed final allocation can leave the cursor overshot past the segment with no
-// record written there. It takes no lock: the sinks are index-entry CASes and the segment is not
-// freed until this same call retires it at the end.
+// Phase 1 walks the segment from its base to its allocation cursor, stepping record to record by the
+// immutable record size, and encodes every migratable record's cold frame into one shared buffer,
+// capturing each record's seqlock version alongside its batch-relative frame offset. Phase 2 reserves
+// the whole buffer's span in the cold region with one atomic tail bump and writes it with one pwrite,
+// so every frame is durable before any index entry points at it. Phase 3 flips each staged record's
+// index entry to its now-absolute cold offset: a set member row retiers its dense vector under the
+// vector shard mutex (flipVecMember, Option A), every other kind flips the primary entry directly
+// (flipResident), and both act only when the entry still points at the resident record and, for the
+// direct flip, only when the version has not moved since the frame was encoded. A record deleted or
+// overwritten between the walk and the flip is left as dead space in the batch, exactly as a lost CAS
+// was before. When the last live record has left, the segment retires through the epoch gate
+// (retireSegment) so it returns to the free list once the readers that could hold a pre-flip address
+// into it drain.
+//
+// The caller must pass a full segment that is not the current allocation target, so no new record is
+// laid into it during the walk (D15). The walk clamps at the segment end rather than the raw cursor,
+// since a failed final allocation can leave the cursor overshot past the segment with no record
+// written there. drainMu serializes only the reused scratch buffers, so a rare direct test call and
+// the single migrator goroutine never corrupt the shared batch; production drains do not overlap, so
+// it never contends. The segment is not freed until this same call retires it at the end, so the
+// walk needs no other lock.
 func (s *Store) drainSegment(si uint64) {
 	if s.recs == nil || si >= uint64(len(s.segs)) {
 		return
@@ -182,14 +187,70 @@ func (s *Store) drainSegment(si uint64) {
 	if a := seg.alloc.Load(); a < limit {
 		limit = a
 	}
+
+	s.drainMu.Lock()
+	buf := s.drainBuf[:0]
+	stg := s.drainStg[:0]
+
+	// Phase 1: encode every migratable record's frame into one buffer. A record is probed for
+	// liveness before it is encoded, so a dead record (deleted or overwritten) is stepped over
+	// without adding its bytes to the batch, and the frame offset staged here is batch-relative
+	// until the reservation in phase 2 turns it absolute.
 	for off := seg.base; off+hdrSize <= limit; {
 		recBytes := s.recBytesAt(off)
 		if recBytes == 0 || off+recBytes > limit {
 			break // a torn or zero-width header would desync the walk; stop rather than misread
 		}
-		s.drainRecord(off)
+		kind := s.arena[off+offKind]
+		if s.migratable(kind) && s.liveRecordAt(off, kind) {
+			rel := uint64(len(buf))
+			var ver uint32
+			buf, ver = s.encodeColdFrame(off, buf)
+			stg = append(stg, stagedDrain{
+				off:      off,
+				frameOff: rel,
+				ver:      ver,
+				kind:     kind,
+				vec:      s.isVecMember(kind),
+			})
+		}
 		off += recBytes
 	}
+
+	// Phase 2: reserve the batch's span in the cold region with one atomic tail bump and write it
+	// with one pwrite, so every frame is durable before phase 3 publishes any offset into it.
+	var base uint64
+	writeOK := true
+	if len(buf) > 0 {
+		n := uint64(len(buf))
+		base = s.recs.tail.Add(n) - n
+		if _, err := s.recs.f.WriteAt(buf, int64(base)); err != nil {
+			// The batch write failed: publish nothing and leave every staged record resident. The
+			// reserved span is abandoned as a hole in the cold region; the records re-drain on a
+			// later pass once the sink recovers.
+			writeOK = false
+		}
+	}
+
+	// Phase 3: flip each staged record's index entry to its absolute cold offset.
+	if writeOK {
+		for i := range stg {
+			st := stg[i]
+			st.frameOff += base // batch-relative -> absolute cold-region offset
+			if st.vec {
+				klen := s.klen(st.off)
+				key := s.arena[st.off+hdrSize : st.off+hdrSize+klen]
+				s.flipVecMember(key, st.kind, st.off, st.frameOff|tierBit)
+			} else {
+				s.flipResident(st)
+			}
+		}
+	}
+
+	s.drainBuf = buf
+	s.drainStg = stg
+	s.drainMu.Unlock()
+
 	if live := seg.live.Load(); live == 0 {
 		s.retireSegment(si)
 	} else {
@@ -200,6 +261,21 @@ func (s *Store) drainSegment(si uint64) {
 		// the field-bearing segments that can actually drain and free space.
 		seg.stuck.Store(live)
 	}
+}
+
+// liveRecordAt reports whether the record at resident offset off is still the live record its key
+// resolves to, the phase-1 liveness probe drainSegment uses to skip dead records (deleted or
+// overwritten to a fresh record elsewhere) before encoding them into the batch. It is the
+// identity-checked probe (cur == off), stronger than the enumeration filter's liveAt (which only asks
+// whether the key still exists as some record of that kind): a key overwritten to a fresh record
+// elsewhere leaves off dead even though the key still exists, and encoding that dead record would
+// waste cold-region space on a frame no index entry would ever point at. The key is read from the
+// record's immutable header, so the probe is a plain index lookup.
+func (s *Store) liveRecordAt(off uint64, kind byte) bool {
+	klen := s.klen(off)
+	key := s.arena[off+hdrSize : off+hdrSize+klen]
+	cur, _, _, _, found := s.find(key, hash(key), kind)
+	return found && cur == off
 }
 
 // EnableMigrator starts the background migrator, the goroutine that drives records cold under
