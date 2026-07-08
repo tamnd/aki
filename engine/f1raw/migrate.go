@@ -9,15 +9,18 @@ import (
 // arena is full and the migrator is engaged, allocRecord signals the migrator and blocks in
 // waitForSegment for a segment to free rather than reporting the arena full at once. The wait gives
 // up only after migStallWindow of wall-clock time passes with NO forward progress, where progress is
-// the cold-log tail advancing (bytes leaving RAM). Any advance resets the window, so a slow-but-
-// draining migrator holds the writer indefinitely and a write is dropped only on a genuine stall
-// (cold region full, disk error, non-migratable residue, leaked epoch), which keeps the tail fixed.
-// This is the block-not-drop property: a collection larger than the arena loads fully rather than
-// truncating, matching a swapping store, slow under overflow but never lossy. It replaces the old
-// fixed poll budget, which gave up on total elapsed time and so dropped writes a slow migrator would
-// have served (the SET LTM SADD collapse doc 23 root-causes). The window is measured in wall-clock,
-// not poll count, because time.Sleep(migWaitStep) inflates to milliseconds under scheduler pressure,
-// so a poll count would stretch the real give-up far past the intended window on a loaded box.
+// either the cold-log tail advancing (bytes leaving RAM) or a drain target still existing (a full,
+// migratable segment the migrator could free). Either resets the window, so a slow-but-draining
+// migrator, or one merely starved of CPU while drainable work remains, holds the writer indefinitely.
+// A write is dropped only on a genuine stall, the absence of any drain target: cold region full,
+// disk error, non-migratable residue, or a leaked epoch, each of which leaves nothing the migrator
+// could do to free a segment. This is the block-not-drop property: a collection larger than the arena
+// loads fully rather than truncating, matching a swapping store, slow under overflow but never lossy.
+// It replaces the old fixed poll budget, which gave up on total elapsed time and so dropped writes a
+// slow migrator would have served (the SET LTM SADD collapse doc 23 root-causes). The window is
+// measured in wall-clock, not poll count, because time.Sleep(migWaitStep) inflates to milliseconds
+// under scheduler pressure, so a poll count would stretch the real give-up far past the intended
+// window on a loaded box.
 const (
 	migWaitStep    = 100 * time.Microsecond
 	migStallWindow = time.Second // wall-clock of ZERO progress before ErrFull
@@ -381,14 +384,15 @@ func (s *Store) waitForSegment() bool {
 		runtime.Gosched()
 	}
 	// Slow path: the drain is lagging (a large single drain, or heavy writer contention on the shard
-	// mutex the migrator needs). Block while the migrator makes forward progress, giving up only after
-	// migStallWindow of wall-clock with none. Progress is the cold-log tail advancing: the migrator
-	// bumps it on every record it sinks cold, so a moving tail means bytes are leaving RAM and a
-	// segment is on the way to free, and the write should keep waiting. A tail that sits still for the
-	// whole stall window means a genuine stall (cold region full, disk error, non-migratable residue,
-	// leaked epoch), and only then does the write report the arena full. A retired segment that frees
-	// on reader quiescence rather than a fresh drain is caught by segAvailable directly, so it does not
-	// need to show in the progress signal (doc 23, D23-1..D23-3).
+	// mutex the migrator needs). Block while forward progress is still possible, giving up only after
+	// migStallWindow of wall-clock with none. Progress is either the cold-log tail advancing (the
+	// migrator bumps it on every record it sinks cold, so a moving tail means bytes are leaving RAM) or
+	// a drain target still existing (pickDrainTarget finds a full, migratable segment the migrator could
+	// yet free). Either keeps the write waiting. Only the absence of both for the whole stall window is
+	// a genuine stall (cold region full, disk error, non-migratable residue, leaked epoch), and only
+	// then does the write report the arena full. A retired segment that frees on reader quiescence
+	// rather than a fresh drain is caught by segAvailable directly, so it does not need to show in the
+	// progress signal (doc 23, D23-1..D23-3).
 	lastTail := s.coldTail()
 	lastProgress := time.Now()
 	for {
@@ -402,9 +406,22 @@ func (s *Store) waitForSegment() bool {
 			lastProgress = time.Now() // migrator is draining; keep waiting however long it takes
 			continue
 		}
+		// The tail did not advance this poll, but that alone is not a stall: under CPU oversubscription
+		// (many blocked writers plus the race detector on a few cores) the single migrator goroutine can
+		// go unscheduled for a while, so no bytes leave RAM even though a segment is still drainable. As
+		// long as pickDrainTarget finds a full, migratable segment, room can still be freed and the write
+		// must keep blocking, which is the block-not-drop guarantee: a write waits on a possible drain
+		// rather than dropping just because the migrator has not run yet. A genuine stall is the absence
+		// of any drain target: every full segment is the current one, already retired, or non-migratable
+		// residue (a failed cold write leaves records resident and marked stuck too), so nothing the
+		// migrator could do would free a segment. Only that, sustained for migStallWindow, reports full.
+		if _, ok := s.pickDrainTarget(); ok {
+			lastProgress = time.Now()
+			continue
+		}
 		if time.Since(lastProgress) >= migStallWindow {
 			s.backpressureStalls.Add(1)
-			return false // no progress for the stall window: genuine stall, report full
+			return false // no drainable segment for the stall window: genuine stall, report full
 		}
 	}
 }
