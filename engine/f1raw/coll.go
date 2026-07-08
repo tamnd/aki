@@ -1,6 +1,7 @@
 package f1raw
 
 import (
+	"encoding/binary"
 	"errors"
 )
 
@@ -382,6 +383,30 @@ func (s *Store) CountAddInt64(key []byte, kind byte, delta int64) (int64, bool) 
 	if !found {
 		return 0, false
 	}
+	if off&tierBit != 0 {
+		// The header was migrated cold. Its frame in the record region is immutable, so the count
+		// cannot be latched and bumped in place the way the resident path below does: verAt/countAt
+		// would index the arena with a bit-47-tagged offset and clobber unrelated memory. Instead
+		// read the current count from the cold frame, apply delta, and bring the header back up to
+		// the arena as a fresh resident record carrying the new count (write-brings-up, doc 21
+		// section 9), marking the old cold frame dead through publish. The caller serializes this
+		// key's header writers under its stripe lock, so no concurrent bump races the bring-up; a
+		// lock-free reader re-probes and sees either the cold frame (old count) or the swapped-in
+		// resident record (new count) through one atomic index CAS, never a torn value.
+		var vb [64]byte
+		v, ok := s.readColdValue(off&^tierBit, vb[:])
+		if !ok || len(v) < 8 {
+			return 0, false
+		}
+		res := int64(binary.LittleEndian.Uint64(v)) + delta
+		nb := make([]byte, len(v))
+		copy(nb, v)
+		binary.LittleEndian.PutUint64(nb[:8], uint64(res))
+		if err := s.publish(key, nb, h, kind, 0); err != nil {
+			return 0, false
+		}
+		return res, true
+	}
 	if uint64(s.vlenAt(off).Load()) < 8 {
 		return 0, false
 	}
@@ -416,6 +441,13 @@ func (s *Store) CountInt64(key []byte, kind byte) (int64, bool) {
 	if !found {
 		return 0, false
 	}
+	if off&tierBit != 0 {
+		// The header was migrated cold: its count lives in the record region, not the arena, so
+		// read it straight from the immutable cold frame rather than through the seqlock path,
+		// which reaches resident arena bytes only. A cold frame never changes in place, so the
+		// read needs no version check.
+		return s.coldCountAt(off)
+	}
 	verp := s.verAt(off)
 	spins := 0
 	for {
@@ -433,6 +465,21 @@ func (s *Store) CountInt64(key []byte, kind byte) (int64, bool) {
 		}
 		spins = spinWait(spins)
 	}
+}
+
+// coldCountAt reads the 8-byte little-endian counter from the value of the cold frame at the
+// tierBit-tagged offset off, the cold twin of countAt. countAt reaches resident arena bytes
+// only, so a migrated collection header (whose offset carries tierBit) needs its count word read
+// from the record region instead. The count is the first eight value bytes of the header, so it
+// decodes them straight out of the cold frame. A cold frame is immutable, so no seqlock is
+// needed. ok is false when the frame cannot be read or carries fewer than eight value bytes.
+func (s *Store) coldCountAt(off uint64) (int64, bool) {
+	var vb [64]byte
+	v, ok := s.readColdValue(off&^tierBit, vb[:])
+	if !ok || len(v) < 8 {
+		return 0, false
+	}
+	return int64(binary.LittleEndian.Uint64(v)), true
 }
 
 // CollInsert records key in the ordered element index so a bounded cursor can
