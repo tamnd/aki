@@ -14,10 +14,15 @@ package f2srv
 import (
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 
 	"github.com/tamnd/aki/engine/f2raw"
 )
+
+// readBufSize is the initial per-connection read and reply buffer capacity. Both
+// drivers grow it on demand for a value larger than the buffer.
+const readBufSize = 16 << 10
 
 // Server owns the listener and the shared f2raw store. One store serves every
 // connection; the engine is lock-free across distinct keys, so connections never
@@ -25,19 +30,34 @@ import (
 type Server struct {
 	store  *f2raw.Store
 	nextID atomic.Int64
+
+	// NetMode selects the network driver: "auto" (epoll reactor on Linux, goroutine
+	// per connection elsewhere; the default), "go" (goroutine per connection), or
+	// "reactor" (Linux epoll). ReactorLoops sets the epoll loop count (0 = GOMAXPROCS).
+	NetMode      string
+	ReactorLoops int
+
+	ln net.Listener
+	wg sync.WaitGroup
 }
 
-// New builds a server over store.
+// New builds a server over store with the default auto network driver.
 func New(store *f2raw.Store) *Server {
-	return &Server{store: store}
+	return &Server{store: store, NetMode: "auto"}
 }
 
-// ListenAndServe binds addr and serves connections until the listener closes. Each
-// connection runs on its own goroutine.
+// ListenAndServe binds addr and serves connections until the listener closes. On
+// Linux with NetMode "auto" or "reactor" it hands the listener to the epoll driver;
+// otherwise, and everywhere the reactor is unavailable, each connection runs on its
+// own goroutine.
 func (s *Server) ListenAndServe(addr string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
+	}
+	s.ln = ln
+	if handled, rerr := serveWithReactor(s); handled {
+		return rerr
 	}
 	for {
 		conn, err := ln.Accept()
@@ -51,8 +71,8 @@ func (s *Server) ListenAndServe(addr string) error {
 			srv:  s,
 			conn: conn,
 			id:   s.nextID.Add(1),
-			rbuf: make([]byte, 0, 16<<10),
-			out:  make([]byte, 0, 16<<10),
+			rbuf: make([]byte, 0, readBufSize),
+			out:  make([]byte, 0, readBufSize),
 			vbuf: make([]byte, 0, 64),
 		}
 		go c.loop()

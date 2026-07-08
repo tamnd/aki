@@ -29,6 +29,8 @@ func main() {
 	indexBuckets := fs.Int("index-buckets", 1<<22, "f2raw index buckets")
 	arenaBytes := fs.Int("arena-bytes", 2<<30, "f2raw arena size in bytes")
 	gogc := fs.Int("gogc", 0, "GOGC percent (0 = Go default 100); raise to trade memory for fewer GC cycles")
+	netMode := fs.String("net", "auto", "network driver: auto (reactor on Linux), go (goroutine per conn), or reactor")
+	reactorLoops := fs.Int("reactor-loops", 0, "epoll loop count for the reactor driver (0 = GOMAXPROCS)")
 	// Flags the harness passes to the redis/aki servers; accepted and ignored so a
 	// shared launch line does not need special casing for this binary.
 	_ = fs.String("dir", ".", "working directory (accepted, unused)")
@@ -46,6 +48,8 @@ func main() {
 
 	store := f2raw.New(*indexBuckets, *arenaBytes)
 	srv := f2srv.New(store)
+	srv.NetMode = *netMode
+	srv.ReactorLoops = *reactorLoops
 	log.Printf("f2srv listening on %s (index-buckets=%d arena-bytes=%d)", *addr, *indexBuckets, *arenaBytes)
 	if err := srv.ListenAndServe(*addr); err != nil {
 		log.Fatal(err)
