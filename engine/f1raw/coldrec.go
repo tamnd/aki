@@ -1,6 +1,18 @@
 package f1raw
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"sync"
+)
+
+// coldMatchBufPool hands out scratch buffers for the single-pread cold-key compare so a
+// hot re-add confirm (SADD/SISMEMBER of an already-present member whose record has been
+// tiered cold) never allocates. Under a hard memory cap the migrator holds only a small
+// resident index, so every membership confirm resolves through a cold pread; a per-probe
+// make([]byte, klen) there turned a pipelined confirm flood into a GC storm (the arena's
+// soft heap limit is deliberately tight), which showed up as re-add SADD scaling
+// negatively from P1 to P16. Pooling the compare buffer removes that allocation entirely.
+var coldMatchBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 64); return &b }}
 
 // This file adds the tier-tagged index and the cold record region, milestone M1 of the
 // collection cold-record tiering plan (spec 2064/f1_rewrite_ltm/21). It builds on M0's
@@ -219,22 +231,27 @@ func (s *Store) MigrateToCold(key []byte, kind byte) bool {
 // through the region's pread path, so this is only reached on a tag hit, never on the
 // fast-reject majority of probe slots.
 func (s *Store) coldFrameMatches(coldOff uint64, key []byte, kind byte) bool {
-	var hdr [frameHdrSize]byte
-	if _, err := s.recs.readInto(coldOff, frameHdrSize, hdr[:]); err != nil {
-		return false
+	// One pread covers the frame header plus room for a key exactly as long as the probe
+	// key: a real match has klen == len(key) by definition, so the matching frame always
+	// carries those bytes, and any frame with a different key length is rejected on the
+	// header alone. Reading the fixed header-plus-key span in a single pread (instead of a
+	// header pread followed by a key pread) halves the syscalls and the DONTNEED advises on
+	// this hot per-confirm path, and readAtMost tolerates a short read at the file tail as a
+	// non-match so over-reading past a shorter tail frame is safe.
+	need := frameHdrSize + len(key)
+	bufp := coldMatchBufPool.Get().(*[]byte)
+	if cap(*bufp) < need {
+		*bufp = make([]byte, need)
 	}
-	if hdr[frameOffKind] != kind {
-		return false
-	}
-	klen := binary.LittleEndian.Uint16(hdr[frameOffKlen:])
-	if int(klen) != len(key) {
-		return false
-	}
-	kbuf := make([]byte, klen)
-	if _, err := s.recs.readInto(coldOff+frameHdrSize, int(klen), kbuf); err != nil {
-		return false
-	}
-	return string(kbuf) == string(key)
+	got, err := s.recs.readAtMost(coldOff, need, (*bufp)[:need])
+	match := err == nil &&
+		len(got) >= frameHdrSize &&
+		got[frameOffKind] == kind &&
+		int(binary.LittleEndian.Uint16(got[frameOffKlen:])) == len(key) &&
+		len(got) >= need &&
+		string(got[frameHdrSize:need]) == string(key)
+	coldMatchBufPool.Put(bufp)
+	return match
 }
 
 // readColdValue resolves the value of the cold frame at region offset coldOff into dst. It

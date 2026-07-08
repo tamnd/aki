@@ -86,6 +86,28 @@ func (c *coldLog) append(val []byte) (uint64, error) {
 	return off, nil
 }
 
+// readAtMost preads up to n bytes at off into dst and tolerates a short read at the
+// file tail, returning the bytes actually read. It is readInto for a caller that reads
+// a fixed upper bound past a variable-length record: the cold-key compare reads
+// frameHdrSize+len(probeKey) in one shot without first learning the frame's own key
+// length, and a probe key longer than a tail frame must read as a benign non-match, not
+// an error. It advises away exactly the range it touched so the LTM resident-footprint
+// invariant holds. Only a zero-byte read with an error is a real failure.
+func (c *coldLog) readAtMost(off uint64, n int, dst []byte) ([]byte, error) {
+	if cap(dst) < n {
+		dst = make([]byte, n)
+	}
+	dst = dst[:n]
+	k, err := c.f.ReadAt(dst, int64(off))
+	if k > 0 {
+		c.adviseDontNeed(off, k)
+	}
+	if err != nil && k == 0 {
+		return dst[:0], err
+	}
+	return dst[:k], nil
+}
+
 // readInto preads n bytes at off into dst, reusing dst's capacity when it fits. A
 // written region of the log is immutable and the log is grow-only, so a pread against
 // a published offset is always valid and needs no coordination with appenders or
