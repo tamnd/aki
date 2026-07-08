@@ -94,6 +94,18 @@ type Config struct {
 	// configuration error surfaced by Listen. Default false leaves the arena grow-only with no
 	// migrator goroutine, so a store that never sets it pays nothing for the machinery.
 	Migrator bool
+	// MigHiWater, MigLoWater, and MigWorkers tune the migrator's drain-ahead behavior for the LTM
+	// insert-flood regime (spec 2064/21 D14). MigHiWater and MigLoWater are the high- and low-water
+	// percents of the segment budget the migrator drains between: it wakes at the high mark and
+	// drains cold until it falls below the low mark. MigWorkers is the number of migrator drain
+	// goroutines. All three default to 0, which leaves the engine's built-in values (85/75 and 4
+	// workers) in place, so a store that sets none changes nothing. They are ignored unless Migrator
+	// is set, and take effect only before the first fill: New applies them to the store just before
+	// EnableMigrator. Draining earlier and deeper (a wider high-to-low gap), or with more workers,
+	// trades a little resident headroom for a shallower write-path backpressure queue.
+	MigHiWater int
+	MigLoWater int
+	MigWorkers int
 
 	// SetPartitionMax caps the partitions one hot set can engage under the adaptive intra-key
 	// partitioning of spec 2064/f1_rewrite_ltm/19. The default of 1 leaves the feature off: every
@@ -406,7 +418,18 @@ func New(cfg Config) *Server {
 			// An earlier cold-region open already failed; keep that error.
 		case srv.store == nil || !cfg.ArenaSegmented || cfg.ColdRecordsPath == "":
 			srv.initErr = errors.New("f1srv: Migrator requires ArenaSegmented and ColdRecordsPath")
+		case cfg.MigHiWater != 0 && cfg.MigLoWater != 0 && (cfg.MigHiWater <= cfg.MigLoWater || cfg.MigHiWater > 100):
+			// Validate an operator-supplied watermark pair here and surface it as a clean Listen error,
+			// rather than letting the engine's SetMigratorTuning panic crash the process on bad input.
+			srv.initErr = errors.New("f1srv: Migrator watermarks need MigLoWater < MigHiWater <= 100")
 		default:
+			// Apply the operator's drain-ahead overrides on the still-empty store before the migrator
+			// starts; a zero leaves that watermark or worker count at the engine default. This is the
+			// only window: EnableMigrator seeds the defaults and spawns the workers, after which the
+			// fields are fixed for the run.
+			if cfg.MigHiWater != 0 || cfg.MigLoWater != 0 || cfg.MigWorkers != 0 {
+				srv.store.SetMigratorTuning(uint64(cfg.MigHiWater), uint64(cfg.MigLoWater), cfg.MigWorkers)
+			}
 			srv.store.EnableMigrator()
 		}
 	}

@@ -365,6 +365,38 @@ func (s *Store) liveRecordAt(off uint64, kind byte) bool {
 	return found && cur == off
 }
 
+// SetMigratorTuning overrides the migrator's drain-ahead watermarks and worker count before the
+// migrator starts. It exists so an operator (or the bench sweep) can move the LTM insert-flood
+// regime toward its throughput optimum without recompiling: draining earlier and deeper, or with
+// more concurrent drains, trades a little resident headroom for a shallower backpressure queue.
+// hiNum and loNum are the high- and low-water numerators over 100 of the segment budget the
+// migrator drains between (D14); workers is the number of migrator goroutines. A zero argument
+// leaves that field at its built-in default (EnableMigrator seeds it), so passing all zeros is a
+// no-op that preserves the shipped behavior exactly. Non-zero arguments are validated so a bad
+// pair cannot invert the hysteresis: hiNum must be in (loNum, 100] and loNum in [1, hiNum), or the
+// call panics like the other before-first-fill setters. It must be called before EnableMigrator,
+// on a store with no migrator running; calling it after has no effect on the already-seeded fields.
+func (s *Store) SetMigratorTuning(hiNum, loNum uint64, workers int) {
+	if s.migOn.Load() {
+		panic("f1raw: SetMigratorTuning must be called before EnableMigrator")
+	}
+	// Validate only when both watermarks are supplied; a lone override pairs with the built-in
+	// default of the other, which the defaults (85/75) keep well ordered. Reject an inverted or
+	// out-of-range pair rather than silently draining on a boundary that never triggers.
+	if hiNum != 0 && loNum != 0 && (hiNum <= loNum || hiNum > 100) {
+		panic("f1raw: SetMigratorTuning needs loNum < hiNum <= 100")
+	}
+	if hiNum != 0 {
+		s.migHiNum = hiNum
+	}
+	if loNum != 0 {
+		s.migLoNum = loNum
+	}
+	if workers != 0 {
+		s.migWorkers = workers
+	}
+}
+
 // EnableMigrator starts the background migrator, the goroutine that drives records cold under
 // arena fill pressure (doc 21 section 6). It requires a segmented arena and an enabled cold record
 // region: the migrator sinks whole record frames into the region, so both must be set up first,
