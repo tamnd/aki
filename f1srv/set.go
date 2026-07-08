@@ -1331,11 +1331,28 @@ func (c *connState) cmdSPop(argv [][]byte) {
 		// in O(1) (spec 2064/18 section 5), instead of the O(log n) rank descent the count form
 		// still runs. The vector tracks live membership on its own, so this path needs neither the
 		// header read the shrink used nor the SyncPendingRemovals reconcile a rank draw requires.
+		//
+		// CollRandSelectRemove makes the draw and the vector swap-remove atomic under the vector's
+		// own shard lock, the index delete below is a lock-free CAS, and the header decrement is an
+		// atomic add, so on the unpartitioned path (setPartMax<=1) the whole-key stripe adds nothing
+		// but serialization. Under LTM the popped member's bytes can sit in the cold tier, so the
+		// draw pays a random disk read to resolve them; holding the stripe across that read forces
+		// every concurrent pop on a hot key to wait it out in turn, which is the SPOP LTM collapse
+		// (P16 no faster than P1). Release the stripe before the draw so pipelined pops overlap
+		// their reads exactly as the lock-free SRANDMEMBER draw already does. When adaptive
+		// partitioning is armed a migration can drop the whole-set vector mid-draw, so that mode
+		// keeps the stripe held across the draw as before.
+		lockFree := c.srv.setPartMax <= 1
+		if lockFree {
+			mu.Unlock()
+		}
 		prefix := c.setPrefix(skey)
 		k, ok := c.srv.store.CollRandSelectRemove(prefix)
 		if !ok {
 			// Empty or missing set: the vector built from a live scan has no slot to draw.
-			mu.Unlock()
+			if !lockFree {
+				mu.Unlock()
+			}
 			c.writeNil()
 			return
 		}
@@ -1345,11 +1362,13 @@ func (c *connState) cmdSPop(argv [][]byte) {
 		// stable arena subslice, so returning its member tail after the delete is safe.
 		c.srv.store.DeleteKind(k, kindSetMember)
 		// Decrement the maintained cardinality in place; at zero the set is gone and its header row
-		// is dropped under the same lock (empty set is no set), exactly as SREM retires to zero.
+		// is dropped (empty set is no set), exactly as SREM retires to zero.
 		if n, ok := c.srv.store.CountAddInt64(skey, kindSetMeta, -1); !ok || n <= 0 {
 			c.srv.store.DeleteKind(skey, kindSetMeta)
 		}
-		mu.Unlock()
+		if !lockFree {
+			mu.Unlock()
+		}
 		c.writeBulk(member)
 		return
 	}
