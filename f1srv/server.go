@@ -44,6 +44,15 @@ type Config struct {
 	NetMode      string // "auto" (reactor on Linux, goroutine elsewhere; the default), "go" (goroutine-per-conn), or "reactor" (Linux epoll)
 	ExecModel    string // "shared" (default: any loop runs any key under its stripe lock) or "affinity" (route each key to its owning shard worker, spec 2064/17). Inert until the routing slices land.
 
+	// ReactorLoops sets how many epoll event loops the reactor driver runs (NetMode reactor/auto
+	// on Linux). Each loop is one goroutine parked in a blocking epoll_wait owning an fd-sharded
+	// slice of connections. A non-positive value uses GOMAXPROCS, the historical default. It exists
+	// because GOMAXPROCS loops is not always the throughput optimum: on a box with expensive
+	// syscalls, many blocking loops can lose to a smaller set that amortizes each epoll_wait over
+	// more ready connections, so the count is tunable to find the balance for the deployment. It is
+	// ignored on the goroutine driver and off Linux.
+	ReactorLoops int
+
 	// ColdPath, when non-empty, engages the larger-than-memory string tier: the store
 	// opens an append-only cold value log at this path and writes any value longer than
 	// SepThreshold there, keeping only the index and record keys resident. Empty means a
