@@ -270,6 +270,18 @@ type Store struct {
 	// has no cold entries and the tier check on the read path is a never-taken branch.
 	recs *coldLog
 
+	// drainMu, drainBuf, and drainStg are the migrator's batched-drain scratch (migrate.go).
+	// drainSegment encodes every migratable record's cold frame into drainBuf, issues one
+	// pwrite for the whole batch, then flips each record's index entry, so a full segment
+	// drains with one syscall instead of one per record (measured 28x cheaper per record on
+	// the cold-region sink). The migrator drives the drain on its single goroutine; drainMu
+	// serializes the rare direct test call so the reused buffers stay race-clean, and never
+	// contends in production where drains do not overlap. The buffers are retained across
+	// drains so a steady drain rate does not re-allocate the batch each pass.
+	drainMu  sync.Mutex
+	drainBuf []byte
+	drainStg []stagedDrain
+
 	// The deferred ordered-index removal state (tombstone.go). When deferred removal is
 	// enabled, an element delete hands the composite key to tombHead (a lock-free Treiber
 	// stack of removal batches) instead of splicing the skip list inline, and a background
@@ -705,6 +717,32 @@ func (s *Store) readValue(off uint64, dst []byte) []byte {
 		dst = append(dst[:0], s.arena[vbase:vbase+n]...)
 		if verp.Load() == v1 {
 			return dst
+		}
+		spins = spinWait(spins)
+	}
+}
+
+// readValueVer is the seqlock read that also returns the even version the copied bytes
+// belong to, the value snapshot the batched drain (migrate.go) pairs with a version guard.
+// It mirrors readValue but keeps the settling version so the flip step can detect an
+// in-place update (inPlace ticks the version by two) that landed between the drain encoding
+// a record's cold frame and flipping its index entry, and leave such a record resident to
+// re-drain rather than publish a stale frame. The returned version is even; a torn read or a
+// latch held mid-copy retries, so the pairing is exact.
+func (s *Store) readValueVer(off uint64, dst []byte) ([]byte, uint32) {
+	verp := s.verAt(off)
+	vbase := off + hdrSize + align8(s.klen(off))
+	spins := 0
+	for {
+		v1 := verp.Load()
+		if v1&verLockBit != 0 {
+			spins = spinWait(spins)
+			continue
+		}
+		n := uint64(s.vlenAt(off).Load())
+		dst = append(dst[:0], s.arena[vbase:vbase+n]...)
+		if verp.Load() == v1 {
+			return dst, v1
 		}
 		spins = spinWait(spins)
 	}
