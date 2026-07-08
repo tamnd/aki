@@ -2,6 +2,7 @@ package f1raw
 
 import (
 	"runtime"
+	"sync"
 	"time"
 )
 
@@ -44,6 +45,16 @@ const (
 	defaultMigHiNum = 85
 	defaultMigLoNum = 75
 )
+
+// defaultMigWorkers is the number of migrator goroutines EnableMigrator spawns when the store's
+// migWorkers field is left at its zero value. A single migrator serializes every 8MB drain, so
+// under a bounded arena (LTM) all writers pile up in waitForSegment while the one drainer rewrites a
+// segment cold, and the write throughput collapses to a fraction of Redis/Valkey. A small pool lets
+// several drains proceed at once, each on a distinct segment (pickDrainTarget claims segments so the
+// workers never contend for the same one), which multiplies the cold-sink queue depth an NVMe
+// rewards and breaks the write serialization. Four keeps the pool small enough not to starve
+// foreground writers of cores while giving the disk enough concurrent drains to stay busy.
+const defaultMigWorkers = 4
 
 // This file adds the migrator's drain loop, the core of milestone M3 of the collection
 // cold-record tiering plan (spec 2064/f1_rewrite_ltm/21 section 6). M0 made the arena
@@ -97,6 +108,37 @@ type stagedDrain struct {
 	ver      uint32
 	kind     byte
 	vec      bool
+}
+
+// drainScratch is one drain's reusable working memory: buf accumulates the whole segment's cold
+// frames for the single batched pwrite, and stg records where each frame lands so the flip pass can
+// point the index at it. A worker pool means concurrent drains, so each drain takes its own scratch
+// from s.drainPool rather than sharing one pair of buffers, and returns it when done. The pool
+// retains at most one scratch per active worker, so a steady drain rate reuses the buffers without
+// re-allocating the batch on every pass.
+type drainScratch struct {
+	buf []byte
+	stg []stagedDrain
+}
+
+// getScratch returns a drainScratch for one drain, reusing a pooled one when available. The buffers
+// come back reset to zero length with their capacity intact, so a reused scratch re-fills its batch
+// without allocating.
+func (s *Store) getScratch() *drainScratch {
+	if v := s.drainPool.Get(); v != nil {
+		sc := v.(*drainScratch)
+		sc.buf = sc.buf[:0]
+		sc.stg = sc.stg[:0]
+		return sc
+	}
+	return &drainScratch{}
+}
+
+// putScratch returns a drain's scratch to the pool with its grown buffers retained for the next
+// drain to reuse. It is called once the drain has issued its pwrite and flipped its index entries,
+// so nothing still references the buffers.
+func (s *Store) putScratch(sc *drainScratch) {
+	s.drainPool.Put(sc)
 }
 
 // flipResident points the index entry for the non-vector record at off at its already-written cold
@@ -176,15 +218,19 @@ func (s *Store) migratable(kind byte) bool {
 // The caller must pass a full segment that is not the current allocation target, so no new record is
 // laid into it during the walk (D15). The walk clamps at the segment end rather than the raw cursor,
 // since a failed final allocation can leave the cursor overshot past the segment with no record
-// written there. drainMu serializes only the reused scratch buffers, so a rare direct test call and
-// the single migrator goroutine never corrupt the shared batch; production drains do not overlap, so
-// it never contends. The segment is not freed until this same call retires it at the end, so the
-// walk needs no other lock.
+// written there. Each drain takes its own scratch from s.drainPool, so parallel migrator workers,
+// each draining a distinct segment (pickDrainTarget claims segments under segMu so two workers never
+// pick the same one), never share a batch buffer and need no mutex between them. The segment is not
+// freed until this same call retires it at the end, so the walk needs no other lock.
 func (s *Store) drainSegment(si uint64) {
 	if s.recs == nil || si >= uint64(len(s.segs)) {
 		return
 	}
 	seg := &s.segs[si]
+	// Clear the draining claim pickDrainTarget set on this segment once the drain finishes, so a
+	// later pass can re-pick it (a stuck residue segment re-qualifies once a delete lowers its live).
+	// A direct test call never set it, so clearing an already-false bool is a harmless no-op there.
+	defer seg.draining.Store(false)
 	if seg.live.Load() == 0 {
 		// Already empty (every record deleted or drained on an earlier pass): retire it without
 		// re-walking. The walk would re-find each now-cold record through the tier-aware index,
@@ -209,9 +255,12 @@ func (s *Store) drainSegment(si uint64) {
 		limit = a
 	}
 
-	s.drainMu.Lock()
-	buf := s.drainBuf[:0]
-	stg := s.drainStg[:0]
+	// Each drain claims its own scratch from the pool so parallel migrator workers, each draining a
+	// distinct segment, never contend on a single shared buffer. The pool amortizes the allocation
+	// across drains; a fresh worker that finds the pool empty allocates once and returns it.
+	sc := s.getScratch()
+	buf := sc.buf
+	stg := sc.stg
 
 	// Phase 1: encode every migratable record's frame into one buffer. A record is probed for
 	// liveness before it is encoded, so a dead record (deleted or overwritten) is stepped over
@@ -268,9 +317,9 @@ func (s *Store) drainSegment(si uint64) {
 		}
 	}
 
-	s.drainBuf = buf
-	s.drainStg = stg
-	s.drainMu.Unlock()
+	sc.buf = buf
+	sc.stg = stg
+	s.putScratch(sc)
 
 	if live := seg.live.Load(); live == 0 {
 		s.retireSegment(si)
@@ -320,11 +369,27 @@ func (s *Store) EnableMigrator() {
 	if s.migLoNum == 0 {
 		s.migLoNum = defaultMigLoNum
 	}
+	if s.migWorkers <= 0 {
+		s.migWorkers = defaultMigWorkers
+	}
 	s.migStop = make(chan struct{})
 	s.migDone = make(chan struct{})
 	s.migWake = make(chan struct{}, 1)
 	s.migOn.Store(true)
-	go s.migrator()
+	// Spawn a pool of migrator goroutines. Each runs the same loop and pulls a distinct segment from
+	// pickDrainTarget (which claims the segment under segMu so peers skip it), so the pool drains
+	// several segments in parallel to multiply cold-sink bandwidth. A single done channel closes once
+	// every worker has exited: a WaitGroup counts the workers, and one closer goroutine waits on it so
+	// Close's <-migDone unblocks only after the last drain finishes.
+	var wg sync.WaitGroup
+	wg.Add(s.migWorkers)
+	for range s.migWorkers {
+		go s.migrator(&wg)
+	}
+	go func() {
+		wg.Wait()
+		close(s.migDone)
+	}()
 }
 
 // signalMigrator wakes the migrator to reassess the fill level. It is a single non-blocking send on
@@ -415,7 +480,7 @@ func (s *Store) waitForSegment() bool {
 		// of any drain target: every full segment is the current one, already retired, or non-migratable
 		// residue (a failed cold write leaves records resident and marked stuck too), so nothing the
 		// migrator could do would free a segment. Only that, sustained for migStallWindow, reports full.
-		if _, ok := s.pickDrainTarget(); ok {
+		if s.hasDrainTarget() {
 			lastProgress = time.Now()
 			continue
 		}
@@ -451,12 +516,13 @@ func (s *Store) segAvailable() bool {
 	return free
 }
 
-// migrator is the background goroutine's loop: sleep until woken by a segment advance or a stop,
-// then run one migration pass. It owns no segment between passes, so a stop between passes exits at
-// once; a stop during a pass is picked up by the pass's own stop check, then this returns on the
-// next select. It closes migDone on exit so Close can wait for it to finish.
-func (s *Store) migrator() {
-	defer close(s.migDone)
+// migrator is one pool goroutine's loop: sleep until woken by a segment advance, a peer worker, or a
+// stop, then run one migration pass. It owns no segment between passes, so a stop between passes
+// exits at once; a stop during a pass is picked up by the pass's own stop check, then this returns
+// on the next select. It signals the WaitGroup on exit so the pool's closer can close migDone once
+// every worker has finished, which is what Close waits on.
+func (s *Store) migrator(wg *sync.WaitGroup) {
+	defer wg.Done()
 	for {
 		select {
 		case <-s.migStop:
@@ -484,6 +550,11 @@ func (s *Store) migrateDown() {
 		if !ok {
 			return
 		}
+		// Wake a peer worker before starting this drain so the pool ramps up: this worker holds one
+		// claimed segment, the woken peer claims the next-emptiest one, and its wake pulls in a third,
+		// cascading until every worker is busy or pickDrainTarget runs dry. The signal is a non-blocking
+		// send on a size-one channel, so it is cheap and coalesces when a wake is already pending.
+		s.signalMigrator()
 		s.drainSegment(si)
 		select {
 		case <-s.migStop:
@@ -517,6 +588,33 @@ func (s *Store) liveBytes() uint64 {
 func (s *Store) pickDrainTarget() (uint64, bool) {
 	s.segMu.Lock()
 	defer s.segMu.Unlock()
+	best, ok := s.bestDrainTargetLocked()
+	if !ok {
+		return 0, false
+	}
+	// Claim the chosen segment before releasing segMu so a peer worker calling pickDrainTarget
+	// concurrently skips it and picks a different one, which is what lets the workers drain distinct
+	// segments in parallel. drainSegment clears the claim when it finishes (its deferred store).
+	s.segs[best].draining.Store(true)
+	return best, true
+}
+
+// hasDrainTarget reports whether any full, migratable, unclaimed segment could be drained, the
+// non-claiming probe waitForSegment uses to decide the arena is not yet genuinely stalled. It shares
+// the eligibility scan with pickDrainTarget but never sets the draining claim, so using it as a mere
+// liveness signal cannot strand a segment marked draining with no worker to drain it.
+func (s *Store) hasDrainTarget() bool {
+	s.segMu.Lock()
+	defer s.segMu.Unlock()
+	_, ok := s.bestDrainTargetLocked()
+	return ok
+}
+
+// bestDrainTargetLocked returns the emptiest eligible full segment without claiming it. It must be
+// called under segMu. Eligibility is the D15 rule: a full segment (bump cursor reached its seal)
+// that is neither the current allocation target, already retired, already claimed by a peer worker,
+// nor a pure non-migratable residue.
+func (s *Store) bestDrainTargetLocked() (uint64, bool) {
 	cur := s.curSeg.Load()
 	var best uint64
 	var bestLive int64 = -1
@@ -531,6 +629,9 @@ func (s *Store) pickDrainTarget() (uint64, bool) {
 		}
 		if s.isRetiredLocked(si) {
 			continue // already drained and retired, awaiting reader quiescence
+		}
+		if seg.draining.Load() {
+			continue // another migrator worker already claimed this segment for its drain
 		}
 		live := seg.live.Load()
 		if live > 0 && live == seg.stuck.Load() {
