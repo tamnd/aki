@@ -67,10 +67,22 @@ import (
 	"unsafe"
 )
 
-// ErrFull is returned by Set when the arena has no room for a new record or
-// overflow bucket. The spike sizes the arena for the working set up front; spilling
-// cold records to disk is the production tier's job, not this measurement's.
+// ErrFull is returned by Set when the record arena has no room for a new record:
+// every segment is full and, under the migrator, the drain could not free one within
+// the backpressure budget, or a non-segmented arena's bump reached its cap. Raising the
+// arena bytes (or the cold tier's capacity) is the response.
 var ErrFull = errors.New("f1raw: arena full")
+
+// ErrIndexFull is returned when the resident index runs out of overflow buckets: a
+// bucket chain filled and the never-reclaimed overflow region had no room for another
+// bucket. It is distinct from ErrFull because the fix is different: the record arena has
+// room, but the index that must hold an entry for every key (resident even for a
+// migrated cold record) is sized at construction from IndexBuckets and the overflow
+// region, and that sizing was exceeded. Raising IndexBuckets (and, for a segmented
+// store, the overflow region) is the response. The resident index is O(distinct keys)
+// and does not rehash, so it is the key-count ceiling a larger-than-memory store hits
+// first once the value arena tiers cold but the key count keeps climbing.
+var ErrIndexFull = errors.New("f1raw: index full (resident index out of overflow buckets; raise IndexBuckets)")
 
 // ErrTooBig is returned when a key or value exceeds the 64 KiB field width.
 var ErrTooBig = errors.New("f1raw: key or value over 64 KiB")
@@ -906,9 +918,11 @@ outer:
 			}
 			continue // slot filled under us; rescan
 		}
-		// Every entry in the chain is taken: extend it and rescan into the new bucket.
+		// Every entry in the chain is taken: extend it and rescan into the new bucket. A
+		// failed grow means the overflow region is exhausted, not the record arena (the
+		// record was already allocated above), so it is the resident-index ceiling.
 		if s.nextBucket(last, true) == nil {
-			return ErrFull
+			return ErrIndexFull
 		}
 	}
 }
