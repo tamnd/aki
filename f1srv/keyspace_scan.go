@@ -51,18 +51,21 @@ func isTopKind(kind byte) bool {
 //     through the tier-aware primary index on each access (spec 2064/21 D22 Option B), so HGET,
 //     HGETALL, HSCAN, and HRANDFIELD all resolve a migrated field from the cold frame. The header
 //     row stays resident.
+//
 //   - Zset member and score: the two rows are the type's whole storage, and every access is by key
 //     or through an ordered index. Point reads (ZSCORE, ZMSCORE) and deletes (ZREM) go through the
 //     primary index by key; range and rank reads take keys from the ordered index inline cache
 //     (CollScan, CollSelectAt, CollRankOf) and then read each value with a by-key GetKind, so a
 //     migrated member or score row is followed across the tier with no cached arena offset. The
 //     zset header row stays a top-level resident key.
+//
 //   - List element: the list keeps no secondary structure at all. Every element read is by
 //     positional key (listElemKey through GetKind with kindListElem), and every edit goes through
 //     GetKind/TakeKind/PutKind/DeleteKind on that positional key, so a migrated element row is
 //     followed through the tier-aware primary index. The resident hot-window overlay holds element
 //     bytes in memory rather than arena offsets, so it never dangles across a migration, and the
 //     list header row stays a top-level resident key.
+//
 //   - Stream entry, group, consumer, and PEL: every stream row is read either by an explicit key
 //     through GetKind (entry values in emitStreamEntry, group control rows, consumer rows, and PEL
 //     rows) or through the ordered entry index by key and rank (CollScan, CollSelectAt, CollRankOf),
@@ -72,16 +75,34 @@ func isTopKind(kind byte) bool {
 //     volume with consumer-group state fully drainable, so no pinned group or PEL row blocks a
 //     segment drain. The stream header row stays a top-level resident key.
 //
-// The set member row is the one element kind still excluded: it is read through the dense member
-// vector, which caches a raw arena offset and reads the member key from it (engine randvec.go), so
-// it cannot re-resolve by key and needs the heavier Option A retier hook before it can migrate.
+//   - Set member: unlike the ordered-index kinds above it cannot re-resolve by key, because its only
+//     secondary structure is the dense member vector, which caches a raw arena offset and reads the
+//     member key from that offset (engine randvec.go). So the set rides Option A (spec 2064/22): the
+//     migrator repairs the cached offset in place under the vector shard mutex as it flips the record
+//     cold (migrateVecMember), and the server registers the kind through SetVecMemberKindFunc so the
+//     engine takes that retier path for it. The lock-free draw and scan read sites pin the reader's
+//     epoch across the offset-to-key resolution, so a migrated member is followed across the tier
+//     with no dangling offset. SISMEMBER goes through the primary index by key (ExistsKind), and a
+//     write to an existing member is a no-op regardless of tier since a member row carries no value,
+//     so nothing brings a cold member back up to strand the vector. The set header row stays a
+//     top-level resident key. A kind admitted here must also be registered with SetVecMemberKindFunc.
 func isMigratableKind(kind byte) bool {
 	switch kind {
 	case kindHashField, kindZsetMember, kindZsetScore, kindListElem,
-		kindStreamEntry, kindStreamGroup, kindStreamConsumer, kindStreamPEL:
+		kindStreamEntry, kindStreamGroup, kindStreamConsumer, kindStreamPEL,
+		kindSetMember:
 		return true
 	}
 	return false
+}
+
+// isVecMemberKind reports whether kind is a set member row, the one migratable kind the engine must
+// move through the Option A retier hook rather than a plain index flip (engine SetVecMemberKindFunc).
+// It is the single-kind subset of isMigratableKind that needs the dense member vector's cached offset
+// repaired in place as the record moves cold, and every kind it names must also be admitted by
+// isMigratableKind, since the engine only reaches the vector dispatch for a kind it may already sink.
+func isVecMemberKind(kind byte) bool {
+	return kind == kindSetMember
 }
 
 // keyKindName maps a resolved key type to the Redis type name SCAN's TYPE filter compares
