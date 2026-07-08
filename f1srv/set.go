@@ -567,6 +567,27 @@ func (c *connState) cmdSAdd(argv [][]byte) {
 		c.cmdSAddPart(skey, argv[2:], p)
 		return
 	}
+	// Lock-free all-re-add fast path: an SADD whose every member is already present mutates
+	// nothing (no new row, no header bump, no vector append), so answer it without ever taking
+	// the stripe lock. Each ExistsKind is the same lock-free, cold-tier-aware probe SISMEMBER
+	// rides, so under LTM this resolves each member with a cold pread that runs concurrently
+	// across connections instead of serializing every SADD on the stripe lock behind PutKind's
+	// own identity read. A genuinely-new member's index slot is empty, so ExistsKind returns
+	// false without any cold read; we break on the first one and fall through to the locked
+	// insert, so an insert-flood pays only one wasted probe (on member[0]) and never regresses.
+	// A string key can never make a member row exist, so allPresent implies a real set and the
+	// WRONGTYPE check below is not skipped for any conflicting key.
+	allPresent := true
+	for _, member := range argv[2:] {
+		if !c.srv.store.ExistsKind(c.memberKey(skey, member), kindSetMember) {
+			allPresent = false
+			break
+		}
+	}
+	if allPresent {
+		c.writeInt(0)
+		return
+	}
 	mu := &c.srv.incrMu[c.srv.stripe(skey)]
 	mu.Lock()
 	// The partitionsFor read above is unlocked, so an engage migration could have grown the set to
