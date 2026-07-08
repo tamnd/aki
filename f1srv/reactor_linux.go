@@ -90,7 +90,14 @@ func serveWithReactor(s *Server) (bool, error) {
 	if s.cfg.NetMode != "reactor" && s.cfg.NetMode != "auto" {
 		return false, nil
 	}
-	n := runtime.GOMAXPROCS(0)
+	// The loop count defaults to GOMAXPROCS (one loop per scheduler core) but is tunable through
+	// ReactorLoops: GOMAXPROCS blocking epoll loops is not always the throughput optimum, since on a
+	// box with expensive syscalls a smaller set that amortizes each epoll_wait over more ready
+	// connections can beat one-loop-per-core. A non-positive value keeps the GOMAXPROCS default.
+	n := s.cfg.ReactorLoops
+	if n < 1 {
+		n = runtime.GOMAXPROCS(0)
+	}
 	if n < 1 {
 		n = 1
 	}
