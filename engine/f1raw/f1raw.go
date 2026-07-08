@@ -168,6 +168,21 @@ type Store struct {
 	ovEnd     uint64
 	ovTail    atomic.Uint64
 	segMu     sync.Mutex
+	// availSegs is a lock-free count of segments advanceSeg could immediately draw a new current
+	// segment from: the free list plus the never-used headroom (len(segs)-highWater). It is
+	// maintained under segMu at exactly the points freeSegs and highWater move, so it stays in step
+	// with them, but it is read locklessly by the write-path backpressure spin. That read is the
+	// point: waitForSegment's adaptive spin used to call segAvailable (which locks segMu and runs
+	// reclaimLocked) on every one of its iterations, so many concurrent blocked writers turned the
+	// spin into a segMu storm that starved the migrator workers of the very lock they need to retire
+	// and free a segment, a convoy that capped concurrent-insert throughput under a full arena. The
+	// spin now reads this counter instead and takes no lock until a segment is actually available,
+	// which lets the migrator hold segMu long enough to make progress. It counts only immediately
+	// claimable segments (retired-but-not-yet-reclaimed ones are excluded, since a writer cannot draw
+	// them until reclaimLocked moves them to freeSegs), so a positive value means advanceSeg will find
+	// room; a stale zero at worst costs one extra spin round, and the slow sleeping poll still calls
+	// the locking segAvailable so a retired segment freed on reader quiescence is never missed.
+	availSegs atomic.Int64
 
 	// The reader epoch framework (epoch.go), milestone M2 of the collection cold-record
 	// tiering plan (spec 2064/21 section 7). It gates a drained segment's return to the free
