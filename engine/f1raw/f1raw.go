@@ -273,6 +273,17 @@ type Store struct {
 	migHiNum uint64
 	migLoNum uint64
 
+	// backpressureWaits and backpressureStalls are the write-path backpressure observability
+	// (doc 23, D23-4). waits counts each allocation that found no segment and had to wait for the
+	// migrator in waitForSegment, whether the spin or the sleep ended up serving it; stalls counts
+	// each one that gave up with ErrFull after the no-progress window. A healthy overflow shows waits
+	// climbing and stalls flat (the migrator is slow but
+	// serving); a genuinely full store shows stalls climbing (the cold tier cannot take more).
+	// The pair surfaces in INFO's cold-tier section so an operator can tell the two apart. Both
+	// are plain counters bumped off the foreground fast path (only a blocked write touches them).
+	backpressureWaits  atomic.Uint64
+	backpressureStalls atomic.Uint64
+
 	// recs is the cold record region for the tier-tagged index (coldrec.go), milestone M1
 	// of the collection cold-record tiering plan (spec 2064/21). It is a second append-only
 	// log, separate from cold above: cold holds separated values, recs holds whole migrated
@@ -849,6 +860,11 @@ func (s *Store) publish(key, val []byte, h uint64, kind, flags byte) error {
 		return ErrFull
 	}
 	s.initRecord(off, key, val, kind, flags)
+	// The record's bytes are down: release the in-flight-writer slot allocRecord claimed on its
+	// segment so a concurrent drain of that segment may walk it (doc 23 D23-6). Done before the index
+	// CAS below because the walk reads only the record's now-written immutable header, never the index
+	// linkage, and an abandoned record (a concurrent writer won the key) keeps its bytes fixed too.
+	s.commitRecord(off)
 	tag := tagOf(h)
 	newWord := tag<<tagShift | off
 
