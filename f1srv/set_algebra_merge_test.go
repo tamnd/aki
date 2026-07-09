@@ -213,6 +213,171 @@ func TestSetMergeIneligibleFallsBack(t *testing.T) {
 	}
 }
 
+// diffWant returns the members SDIFF A B must produce for a mergeFixture seeded with these counts: the
+// aonly block, since the shared block is removed and A has no other private members. It is sorted to
+// compare against the merge's ascending-hash emission after bulksToSorted.
+func diffWant(nA int) []string {
+	out := make([]string, nA)
+	for i := 0; i < nA; i++ {
+		out[i] = fmt.Sprintf("aonly:%06d", i)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// unionWant returns the members SUNION A B must produce for a mergeFixture: the shared block plus both
+// private blocks, deduplicated (the shared members appear once). It is sorted for the same reason.
+func unionWant(nShared, nA, nB int) []string {
+	out := make([]string, 0, nShared+nA+nB)
+	for i := 0; i < nShared; i++ {
+		out = append(out, fmt.Sprintf("share:%06d", i))
+	}
+	for i := 0; i < nA; i++ {
+		out = append(out, fmt.Sprintf("aonly:%06d", i))
+	}
+	for i := 0; i < nB; i++ {
+		out = append(out, fmt.Sprintf("bonly:%06d", i))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestSetMergeDiffEngagesAndMatches is the slice-3 diff twin of TestSetMergeIntersectEngagesAndMatches:
+// it drives setMergeDiff directly at every P, asserts it engages and reproduces exactly A minus B, then
+// confirms the full SDIFF command reply on the merge server matches a merge-off probe server. Diff is
+// asymmetric (A\B != B\A), so the fixture's aonly block is the whole answer and any stray shared or
+// bonly member would fail the exact compare.
+func TestSetMergeDiffEngagesAndMatches(t *testing.T) {
+	for _, p := range []int{1, 2, 4, 8} {
+		msrv := newMergeServer(t, p)
+		mc := bareConn(msrv)
+		mergeFixture(t, mc, 1200, 800, 800) // |A|=|B|=2000, ratio 1, both above the floor
+		want := diffWant(800)
+		keys := [][]byte{[]byte("A"), []byte("B")}
+
+		unlock := mc.lockStripes(keys)
+		merged, ok := mc.setMergeDiff(keys)
+		got := bulksToSorted(merged)
+		unlock()
+
+		if !ok {
+			t.Fatalf("P=%d setMergeDiff did not engage on eligible sets", p)
+		}
+		if !eqStrs(got, want) {
+			t.Fatalf("P=%d merge diff has %d members, want %d (mismatch)", p, len(got), len(want))
+		}
+
+		psrv := newPartServer(t, p)
+		pc := bareConn(psrv)
+		mergeFixture(t, pc, 1200, 800, 800)
+
+		mDiff := sortedFlatReply(t, call(mc, func(c *connState, a [][]byte) { c.cmdSDiff(a) }, "SDIFF", "A", "B"))
+		pDiff := sortedFlatReply(t, call(pc, func(c *connState, a [][]byte) { c.cmdSDiff(a) }, "SDIFF", "A", "B"))
+		if strings.Join(mDiff, "\x00") != strings.Join(pDiff, "\x00") {
+			t.Fatalf("P=%d SDIFF merge reply differs from probe reply", p)
+		}
+		psrv.Close()
+		msrv.Close()
+	}
+}
+
+// TestSetMergeUnionEngagesAndMatches is the slice-3 union twin: it drives setMergeUnion directly at
+// every P, asserts it engages and reproduces the deduplicated union, then confirms the full SUNION
+// command reply matches a merge-off probe. Union is the one form that emits from both operands, so the
+// shared block must appear exactly once (the byte-confirm in unionEmit drops the B copy of each shared
+// member) and both private blocks in full.
+func TestSetMergeUnionEngagesAndMatches(t *testing.T) {
+	for _, p := range []int{1, 2, 4, 8} {
+		msrv := newMergeServer(t, p)
+		mc := bareConn(msrv)
+		mergeFixture(t, mc, 1200, 800, 800)
+		want := unionWant(1200, 800, 800)
+		keys := [][]byte{[]byte("A"), []byte("B")}
+
+		unlock := mc.lockStripes(keys)
+		merged, ok := mc.setMergeUnion(keys)
+		got := bulksToSorted(merged)
+		unlock()
+
+		if !ok {
+			t.Fatalf("P=%d setMergeUnion did not engage on eligible sets", p)
+		}
+		if !eqStrs(got, want) {
+			t.Fatalf("P=%d merge union has %d members, want %d (mismatch)", p, len(got), len(want))
+		}
+
+		psrv := newPartServer(t, p)
+		pc := bareConn(psrv)
+		mergeFixture(t, pc, 1200, 800, 800)
+
+		mUnion := sortedFlatReply(t, call(mc, func(c *connState, a [][]byte) { c.cmdSUnion(a) }, "SUNION", "A", "B"))
+		pUnion := sortedFlatReply(t, call(pc, func(c *connState, a [][]byte) { c.cmdSUnion(a) }, "SUNION", "A", "B"))
+		if strings.Join(mUnion, "\x00") != strings.Join(pUnion, "\x00") {
+			t.Fatalf("P=%d SUNION merge reply differs from probe reply", p)
+		}
+		psrv.Close()
+		msrv.Close()
+	}
+}
+
+// TestSetMergeStoreForms drives the three STORE commands through the merge and asserts the stored set
+// matches a merge-off probe server byte for byte, across P and across three destination shapes: a fresh
+// destination, an aliased destination that is also a source (SINTERSTORE A A B, so the merge buffers the
+// arena-stable result before clearing A), and a self-source pair (both sources the same key). The
+// merge-first path in storeAlgebra subsumes aliasing by buffering the result before any destination
+// write, so an aliased store must land exactly what a probe store lands. The stored set is read back
+// with SMEMBERS so the comparison covers what was actually persisted, not just what the merge returned.
+func TestSetMergeStoreForms(t *testing.T) {
+	type form struct {
+		cmd string
+		fn  func(*connState, [][]byte)
+	}
+	forms := []form{
+		{"SINTERSTORE", func(c *connState, a [][]byte) { c.cmdSInterStore(a) }},
+		{"SUNIONSTORE", func(c *connState, a [][]byte) { c.cmdSUnionStore(a) }},
+		{"SDIFFSTORE", func(c *connState, a [][]byte) { c.cmdSDiffStore(a) }},
+	}
+	// Each shape is the argv after the command name: destination then sources. "A A B" aliases the
+	// destination onto a source; "A B B" repeats a source; "D A B" is a fresh destination.
+	shapes := [][]string{
+		{"D", "A", "B"},
+		{"A", "A", "B"},
+		{"A", "B", "B"},
+	}
+	for _, p := range []int{1, 2, 4, 8} {
+		for _, f := range forms {
+			for _, sh := range shapes {
+				name := fmt.Sprintf("%s/P%d/%s", f.cmd, p, strings.Join(sh, "_"))
+				t.Run(name, func(t *testing.T) {
+					msrv := newMergeServer(t, p)
+					mc := bareConn(msrv)
+					mergeFixture(t, mc, 1200, 800, 800)
+					psrv := newPartServer(t, p)
+					pc := bareConn(psrv)
+					mergeFixture(t, pc, 1200, 800, 800)
+
+					argv := append([]string{f.cmd}, sh...)
+					mCount := call(mc, f.fn, argv...)
+					pCount := call(pc, f.fn, argv...)
+					if mCount != pCount {
+						t.Fatalf("%s: merge stored-count reply %q differs from probe %q", name, mCount, pCount)
+					}
+
+					dest := sh[0]
+					mMembers := sortedFlatReply(t, call(mc, func(c *connState, a [][]byte) { c.cmdSMembers(a) }, "SMEMBERS", dest))
+					pMembers := sortedFlatReply(t, call(pc, func(c *connState, a [][]byte) { c.cmdSMembers(a) }, "SMEMBERS", dest))
+					if strings.Join(mMembers, "\x00") != strings.Join(pMembers, "\x00") {
+						t.Fatalf("%s: stored set on merge server differs from probe server (%d vs %d members)",
+							name, len(mMembers), len(pMembers))
+					}
+					psrv.Close()
+					msrv.Close()
+				})
+			}
+		}
+	}
+}
+
 // TestSetMergeConcurrent runs many partitioned merges at once under the race detector: each goroutine
 // owns a disjoint pair of large overlapping sets, seeds them, and runs SINTER and SINTERCARD through the
 // merge, asserting the exact intersection every time. Each partitioned SINTER fans its partitions across
