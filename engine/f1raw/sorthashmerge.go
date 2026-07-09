@@ -18,16 +18,42 @@ func (s *Store) SortedHashEnabled() bool {
 }
 
 // SortedHashMergeStable reports whether the sorted arrays' cached arena offsets stay resolvable for
-// the life of the entry, which holds exactly when the arena is not segmented. The merge resolves each
-// member through the raw offset the fold recorded, and only the segmented arena ever reclaims a
-// resident segment out from under such an offset: the migrator's Option A retier (retier.go) repairs
-// the dense member vector as a record moves cold but not this separate sorted array, so a migrated
-// member would leave a stale resident offset here. On the grow-only arena a member's bytes are never
-// reclaimed, so an offset the fold holds always resolves and the merge is safe. The driver gates on
-// this, keeping the larger-than-memory regime with an active migrator on the always-correct probe
-// until the sorted array grows its own retier hook.
+// the life of the merge, which now holds on the segmented arena too (spec 2064/f1_rewrite_ltm/24 slice
+// 4d). The merge resolves each member through the raw offset the fold recorded, and only the segmented
+// arena ever reclaims a resident segment out from under such an offset. Two mechanisms make that safe.
+// First, the migrator's flipVecMember journals a remove(oldOff)+add(newAddr) retier through the fold
+// facility (sorthashfold.go) the same instant it repairs the dense member vector, so a migrated
+// member's sorted entry either reads not-current (and the merge falls to the probe) or folds to the
+// cold tier-tagged address, which never reclaims: no stale resident offset survives in the array.
+// Second, the driver holds one reader epoch across the whole merge (PinMerge, taken before the
+// reconciling SyncSortedHashes), so a member that migrates while the merge runs keeps its resident
+// bytes pinned until the merge resolves them. With both in place the offset the fold holds always
+// resolves, so the merge is safe in both regimes and this reports true unconditionally.
 func (s *Store) SortedHashMergeStable() bool {
-	return !s.segmented
+	return true
+}
+
+// MergeEpoch is a live reader-epoch hold f1srv takes across one whole set-algebra merge, from the
+// SyncSortedHashes that reconciles the sorted arrays through the last member the merge resolves. The
+// mixed-P path (sorthashmixed.go) captures a partition's arena offsets in SortedRepartition and
+// dereferences them in separate per-target calls, so no per-call pin can span them: the driver holds
+// this single pin across the view build and every target merge instead, keeping the safe epoch below
+// any segment a concurrent migrator retires mid-merge so no offset the merge still names is reclaimed.
+// On the in-memory arena it is the zero guard and costs nothing. Take it on the command goroutine and
+// release it with Unpin once the merge has resolved its last member; the segmented keyAtTiered returns
+// a caller-owned copy, so the emitted members outlive the hold.
+type MergeEpoch struct{ g epochGuard }
+
+// PinMerge publishes the reader epoch for a whole merge and returns the hold to release when it ends.
+// It is the exported entry to pinTiered, so f1srv can span the mixed-P view build and its per-target
+// merges under one epoch without naming the engine-internal guard.
+func (s *Store) PinMerge() MergeEpoch {
+	return MergeEpoch{g: s.pinTiered()}
+}
+
+// Unpin releases the merge's reader-epoch hold. On the zero (in-memory) guard it is a no-op.
+func (e MergeEpoch) Unpin() {
+	e.g.unpin()
 }
 
 // sortedMergeConfirm builds the byte-confirm the merge calls on a 64-bit hash match: it resolves both

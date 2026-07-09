@@ -97,6 +97,24 @@ func (r *shReg) part(prefix []byte) *shPart {
 	return p
 }
 
+// partIf returns the fold state for a partition prefix if it already exists, or nil without creating
+// it, the peek the retier path needs. shRetier repairs only partitions the fold facility has actually
+// materialized: a set the algebra path never touched has no sorted array, so a member of it migrating
+// cold journals nothing and pays only this registry probe. It takes the same shard lock as part but
+// never inserts, and the string(prefix) map lookup does not allocate, so a migration of a never-merged
+// set costs one lock and one map probe. It mirrors part's striping so the two never contend beyond the
+// shard granularity.
+func (r *shReg) partIf(prefix []byte) *shPart {
+	sh := &r.shards[hash(prefix)&(shRegShards-1)]
+	sh.mu.Lock()
+	var p *shPart
+	if sh.m != nil {
+		p = sh.m[string(prefix)]
+	}
+	sh.mu.Unlock()
+	return p
+}
+
 // EnableSortedHashFold builds the partition registry and starts the folder goroutine. Like
 // EnableDeferredRemoval it is a startup call, made once before the store serves traffic: the write
 // path reads shOn without synchronization to decide whether to journal a delta, so the registry and
@@ -132,6 +150,46 @@ func (s *Store) shAppend(prefix []byte, memberHash, off uint64, add bool) {
 	p.enq++
 	p.jmu.Unlock()
 	s.shPend.Add(1)
+	if p.queued.CompareAndSwap(false, true) {
+		for {
+			head := s.shDirty.Load()
+			p.dnext = head
+			if s.shDirty.CompareAndSwap(head, p) {
+				break
+			}
+		}
+	}
+	select {
+	case s.shWake <- struct{}{}:
+	default:
+	}
+}
+
+// shRetier rewrites a member's cached arena offset in the sorted array after the migrator moved its
+// record from oldOff to newOff (spec 2064/f1_rewrite_ltm/24 slice 4d). It journals the pair
+// remove(oldOff) then add(newOff) under the member's unchanged hash, the exact shape foldBatch already
+// folds: the remove is keyed by the stale resident offset and the add carries the cold tier-tagged
+// address, so once the folder applies the batch the sorted entry names the record's new home and the
+// merge resolves it through keyAtTiered. It is a peek, not a find-or-create: a partition the fold
+// facility never materialized has no sorted array to repair, so the retier of a member whose set the
+// algebra path never touched journals nothing. The two counted deltas bump enq by two, so the
+// partition reads not-current the instant the record moves and the merge falls to the always-correct
+// probe until the folder rebuilds the entry with the cold address. flipVecMember calls it under the
+// vector shard mutex, beside the vector's own retierSlot, so the sorted array and the member vector go
+// stale together rather than through a window where one is repaired and the other still names the
+// reclaimable resident bytes.
+func (s *Store) shRetier(prefix []byte, memberHash, oldOff, newOff uint64) {
+	p := s.shReg.partIf(prefix)
+	if p == nil {
+		return
+	}
+	p.jmu.Lock()
+	p.jrnl = append(p.jrnl,
+		foldDelta{hash: memberHash, off: oldOff, add: false},
+		foldDelta{hash: memberHash, off: newOff, add: true})
+	p.enq += 2
+	p.jmu.Unlock()
+	s.shPend.Add(2)
 	if p.queued.CompareAndSwap(false, true) {
 		for {
 			head := s.shDirty.Load()
@@ -243,6 +301,22 @@ func (s *Store) SortedHashSnapshot(prefix []byte) *sortedSnap {
 	return p.sorted.load()
 }
 
+// SortedHashLen returns the number of members in a partition's current published sorted array, or -1
+// if the fold facility is off or the partition has never been written. It reads the published snapshot
+// length lock-free, so a caller can observe how large a destination's sorted order is (a STORE-built
+// destination should hold exactly its stored cardinality) without walking the array.
+func (s *Store) SortedHashLen(prefix []byte) int {
+	if s.shReg == nil {
+		return -1
+	}
+	p := s.shReg.part(prefix)
+	snap := p.sorted.load()
+	if snap == nil {
+		return -1
+	}
+	return len(snap.h)
+}
+
 // SortedHashCurrent reports whether a partition's sorted array reflects every delta appended to it,
 // the condition the merge checks before trusting the array over the probe fallback. It reads the
 // counters under the partition's journal lock so the answer is consistent with a concurrent append.
@@ -255,4 +329,83 @@ func (s *Store) SortedHashCurrent(prefix []byte) bool {
 	current := p.folded == p.enq
 	p.jmu.Unlock()
 	return current
+}
+
+// SortedHashEntry is one member's (hash, offset) pair for a bulk build: Hash is MemberHash(member)
+// and Off is the member row's arena offset, the same pair shAppend journals one at a time. A caller
+// that has just written a whole set (a SINTERSTORE destination) hands the folder the full list in one
+// SortedHashBuild instead of a delta per member.
+type SortedHashEntry struct {
+	Hash uint64
+	Off  uint64
+}
+
+// MemberHash returns the 64-bit member hash the sorted-hash fold keys on, so a caller building a
+// destination's sorted array in bulk computes the same hash the incremental shAppend path would and a
+// STORE-built array is byte-identical to an SADD-built one. The argument is the member bytes alone
+// (the composite key minus its set prefix), exactly what shAppend hashes.
+func MemberHash(member []byte) uint64 { return hash(member) }
+
+// SortedHashBuild replaces a partition's sorted array with one folded from entries in a single pass,
+// discarding the old array and any pending journal, and marks the partition current. It is the bulk
+// path a SINTERSTORE-family destination takes: storeAlgebra writes the whole result, collects each
+// member's (hash, offset) as it inserts, and calls this once per destination partition, so the sorted
+// order is built with one O(k log k) sort instead of the O(k^2) that k incremental folds of a growing
+// flat array cost (the cliff labs/setstorebuild isolates). A destination that STORE emptied passes no
+// members for that partition and SortedHashReset clears it. It is a no-op when the fold facility is
+// off. It takes shMu, the same lock shDrain holds, so it never races a concurrent fold of the same
+// partition, and it clears the journal under jmu so a stale delta cannot reappear on top of the fresh
+// array. enq and folded are reset to len(entries): the sorted array now reflects exactly those
+// members, so the partition reads current, and a later SADD bumps enq above and re-lists the partition
+// as usual. entries is sorted in place.
+func (s *Store) SortedHashBuild(prefix []byte, entries []SortedHashEntry) {
+	if !s.shOn.Load() {
+		return
+	}
+	ho := make([]hashOff, len(entries))
+	for i := range entries {
+		ho[i] = hashOff{h: entries[i].Hash, off: entries[i].Off}
+	}
+	p := s.shReg.part(prefix)
+	s.shMu.Lock()
+	p.jmu.Lock()
+	pending := len(p.jrnl)
+	p.jrnl = nil
+	p.enq = uint64(len(ho))
+	p.folded = uint64(len(ho))
+	p.sorted.build(ho, p.enq)
+	p.jmu.Unlock()
+	s.shMu.Unlock()
+	if pending > 0 {
+		s.shPend.Add(int64(-pending))
+	}
+}
+
+// SortedHashReset clears a partition's sorted array to empty and drops any pending journal, the bulk
+// counterpart to SortedHashBuild for a destination partition that a STORE left with no members. It is
+// a peek, not a find-or-create: a partition the fold facility never materialized has no array to
+// clear, so a STORE whose destination never took the algebra path pays only the registry probe.
+// Without it a destination reused across STOREs would fold each new result on top of the previous
+// one's stale offsets, so this is what keeps a repeated SINTERSTORE into one key from accumulating
+// dead entries. It takes shMu like SortedHashBuild so it never races the folder.
+func (s *Store) SortedHashReset(prefix []byte) {
+	if !s.shOn.Load() {
+		return
+	}
+	p := s.shReg.partIf(prefix)
+	if p == nil {
+		return
+	}
+	s.shMu.Lock()
+	p.jmu.Lock()
+	pending := len(p.jrnl)
+	p.jrnl = nil
+	p.enq = 0
+	p.folded = 0
+	p.sorted.build(nil, 0)
+	p.jmu.Unlock()
+	s.shMu.Unlock()
+	if pending > 0 {
+		s.shPend.Add(int64(-pending))
+	}
 }

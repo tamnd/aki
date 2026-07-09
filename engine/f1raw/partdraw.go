@@ -74,6 +74,24 @@ func (s *Store) collPartVec(prefix []byte) *memberVec {
 // CollRandDrop between the descriptor build and the add makes it a no-op rather than reviving a
 // dropped set's vector, matching CollRandInsert's drop safety.
 func (s *Store) CollPartRandInsert(base []byte, p, part int, key []byte, kind byte) {
+	off, found := s.CollPartRandInsertOff(base, p, part, key, kind)
+	// Journal the add for the sorted-hash fold under this partition's prefix, base with its final
+	// byte set to part above, off the shard lock. base is the partition prefix the merge reads a
+	// snapshot for, and key[len(base):] is the member bytes alone, so the same member in another
+	// set's matching partition hashes to the same value. Only when the vector was live (a concurrent
+	// CollRandDrop makes it a no-op, matching the vector add) and the folder is enabled.
+	if found && s.shOn.Load() && len(key) >= len(base) {
+		s.shAppend(base, hash(key[len(base):]), off, true)
+	}
+}
+
+// CollPartRandInsertOff is CollPartRandInsert's vector insert without the sorted-hash journal,
+// returning the member's resolved arena offset and whether the record was found. It is the
+// partitioned counterpart to CollRandInsertOff: a bulk SortedHashBuild caller adds the member to the
+// partition vector here, records the offset, and folds the whole partition once. CollPartRandInsert is
+// exactly this plus one shAppend. base's final byte is rewritten to part internally, so the caller
+// hands it the partition-scan base and the offset comes back against that partition's vector.
+func (s *Store) CollPartRandInsertOff(base []byte, p, part int, key []byte, kind byte) (off uint64, found bool) {
 	d := s.partDescFor(base[:len(base)-1], p)
 	s.descPartVec(d, base, part) // registers the vector through the descriptor
 	// descPartVec only rewrites base's final byte on its build path; on a cached-pointer hit it
@@ -83,8 +101,6 @@ func (s *Store) CollPartRandInsert(base []byte, p, part int, key []byte, kind by
 	base[len(base)-1] = byte(part)
 	sh := s.rvec.shardFor(base)
 	sh.mu.Lock()
-	var off uint64
-	var found bool
 	if v := sh.get(base); v != nil {
 		if o, _, _, _, f := s.find(key, hash(key), kind); f {
 			off, found = o, true
@@ -92,14 +108,7 @@ func (s *Store) CollPartRandInsert(base []byte, p, part int, key []byte, kind by
 		}
 	}
 	sh.mu.Unlock()
-	// Journal the add for the sorted-hash fold under this partition's prefix, base with its final
-	// byte set to part above, off the shard lock. base is the partition prefix the merge reads a
-	// snapshot for, and key[len(base):] is the member bytes alone, so the same member in another
-	// set's matching partition hashes to the same value. Only when the vector was live (a concurrent
-	// CollRandDrop makes it a no-op, matching the vector add) and the folder is enabled.
-	if found && s.shOn.Load() && len(key) >= len(base) {
-		s.shAppend(base, hash(key[len(base):]), off, true)
-	}
+	return off, found
 }
 
 // CollPartVecSeedEmpty discards any draw state for the p-partition set whose partition-scan base is
