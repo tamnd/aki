@@ -47,6 +47,11 @@ func main() {
 	setPartMax := fs.Int("set-partition-max", 1, "cap on partitions one hot set can engage (1 = feature off); rounded up to a power of two")
 	setPartThreshold := fs.Int("set-partition-threshold", 0, "cardinality at which a set first engages partitioning (0 = built-in default)")
 	setPartTarget := fs.Int("set-partition-target", 0, "members-per-partition a grow aims for (0 = built-in default)")
+	// Sorted-hash set-algebra merge (spec 2064/f1_rewrite_ltm/24). Off by default: the folder does
+	// not run and SINTER/SINTERCARD keep the smallest-source point-probe, so a workload that never
+	// runs set algebra pays nothing on its SADD/SREM. On, each set maintains a per-partition sorted
+	// array of member hashes off the reply path and the algebra path merges two same-P sources.
+	setAlgebraMerge := fs.Bool("set-algebra-merge", false, "maintain a sorted member-hash array per set so SINTER/SINTERCARD run a partition-parallel two-pointer merge (spec 2064/24); off keeps the point-probe")
 	ltmCold := fs.Bool("ltm-cold", false, "engage the larger-than-memory string tier: separate large values to a cold log under --dir")
 	sepThreshold := fs.Int("sep-threshold", 0, "inline-vs-separated value cutoff in bytes for --ltm-cold (0 = engine default)")
 	arenaSegmented := fs.Bool("arena-segmented", false, "use the reclaimable segmented arena (spec 2064/21 M0); off keeps the grow-only bump arena")
@@ -105,6 +110,7 @@ func main() {
 	cfg.SetPartitionMax = *setPartMax
 	cfg.SetPartitionThreshold = *setPartThreshold
 	cfg.SetPartitionTarget = *setPartTarget
+	cfg.SetAlgebraMerge = *setAlgebraMerge
 	cfg.ArenaSegmented = *arenaSegmented
 	cfg.ArenaSegmentBytes = *arenaSegmentBytes
 	cfg.ArenaOverflowBytes = *arenaOverflowBytes

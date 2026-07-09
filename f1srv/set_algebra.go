@@ -2,6 +2,8 @@ package f1srv
 
 import (
 	"encoding/binary"
+	"sync"
+	"sync/atomic"
 
 	"github.com/tamnd/aki/engine/f1raw"
 )
@@ -318,6 +320,223 @@ func (c *connState) sdiffEach(keys [][]byte, emit func([]byte) bool) {
 	})
 }
 
+// The sorted-hash merge (spec 2064/f1_rewrite_ltm/24) is the structural win the smallest-source probe
+// cannot reach: when the folder is on, each set keeps a per-partition array of its member hashes in
+// ascending order off the reply path, so an intersection of two sets becomes a two-pointer merge over
+// those arrays, work proportional to the sum of the two cardinalities with no per-member point-probe
+// into the shared composite index. Redis and Valkey cannot run it: their sets carry no maintained
+// sorted view a merge could walk. The merge is fenced to the case where it is both correct and a clear
+// win: exactly two sources, the same partition count P (so a shared member lands in the same partition
+// index in both, section 4), both large enough to amortize the fold (setMergeFloor), and comparable in
+// size (setMergeMaxRatio) since a wildly asymmetric pair is cheaper to probe off the tiny source. Every
+// other shape stays on the doc-20 probe, which is always correct. When eligible the driver holds the
+// sources' stripe locks (the caller took them), forces a synchronous fold so the arrays are current,
+// then runs the two-pointer merge per partition, fanning the partitions across workers for P>1.
+
+const (
+	// setMergeFloor is the smallest source cardinality the merge engages at. Below it the intersection
+	// is tiny enough that the point-probe off the smaller source already runs in the noise, and the
+	// synchronous fold the merge forces would cost more than it saves. It is deliberately conservative
+	// for slice 2; slice 4 settles the real crossover empirically.
+	setMergeFloor = 1024
+	// setMergeMaxRatio caps how lopsided the two sources may be for the merge to engage. The probe's
+	// cost tracks the smaller source while the merge walks both arrays, so once the larger source is
+	// more than this many times the smaller, probing off the tiny source wins and the driver stays on
+	// the probe.
+	setMergeMaxRatio = 8
+)
+
+// setMergePrefix builds the sorted-array registry prefix for one partition of set skey, matching the
+// prefix the fold registers a member under (sorthashfold.go, randvec.go, partdraw.go): uvarint(len(skey))
+// | skey for an unpartitioned set (p == 1), and that run plus the partition byte for one partition of a
+// partitioned set (p > 1). It allocates a fresh buffer rather than borrowing the connection's kbuf/pbuf/
+// ppbuf scratch, because the merge holds several prefixes live at once (two per partition, and every
+// partition's pair concurrently under the fan-out) and the scratch buffers back single-use command keys.
+func setMergePrefix(skey []byte, part, p int) []byte {
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(len(skey)))
+	sz := n + len(skey)
+	if p > 1 {
+		sz++
+	}
+	b := make([]byte, 0, sz)
+	b = append(b, tmp[:n]...)
+	b = append(b, skey...)
+	if p > 1 {
+		b = append(b, byte(part))
+	}
+	return b
+}
+
+// setMergeEligible reports the shared partition count P and whether the sorted-hash merge should run
+// for keys. It requires the feature flag and the folder both on, offsets that stay resolvable (the
+// non-segmented arena; the merge holds raw offsets the segmented migrator would reclaim, see
+// SortedHashMergeStable), exactly two sources, an equal partition count (so a shared member routes to
+// the same partition index in both), both cardinalities at or above setMergeFloor, and a size ratio no
+// wider than setMergeMaxRatio. Any miss returns false and the caller keeps the doc-20 probe.
+func (c *connState) setMergeEligible(keys [][]byte) (int, bool) {
+	if !c.srv.setAlgebraMerge || len(keys) != 2 {
+		return 0, false
+	}
+	if !c.srv.store.SortedHashEnabled() || !c.srv.store.SortedHashMergeStable() {
+		return 0, false
+	}
+	p := c.partitionsFor(keys[0])
+	if c.partitionsFor(keys[1]) != p {
+		return 0, false
+	}
+	c0 := c.setCard(keys[0])
+	c1 := c.setCard(keys[1])
+	if c0 < setMergeFloor || c1 < setMergeFloor {
+		return 0, false
+	}
+	hi, lo := c0, c1
+	if lo > hi {
+		hi, lo = lo, hi
+	}
+	if hi/lo > setMergeMaxRatio {
+		return 0, false
+	}
+	return p, true
+}
+
+// fanPartitions runs fn once for each partition index in [0, p), across a bounded pool of worker
+// goroutines (min(p, execShards)), and returns when every partition has completed. A single-partition
+// or single-worker fan runs inline with no goroutine, so the common unpartitioned merge stays on the
+// calling goroutine. Workers pull the next partition index off one shared atomic counter, so the work
+// balances without a per-partition goroutine. The caller holds the sources' stripe locks across the
+// whole fan, so every worker reads a stable layout.
+func (c *connState) fanPartitions(p int, fn func(part int)) {
+	workers := c.srv.execShards
+	if workers > p {
+		workers = p
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers == 1 {
+		for part := 0; part < p; part++ {
+			fn(part)
+		}
+		return
+	}
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for {
+				part := int(next.Add(1)) - 1
+				if part >= p {
+					return
+				}
+				fn(part)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// setMergeIntersect computes SINTER's result through the sorted-hash merge when keys are eligible,
+// returning the shared members and true, or nil and false to fall back to the probe. It forces a
+// synchronous fold so the arrays reflect every SADD/SREM (the caller holds the stripe locks, so no new
+// write can land after the sync), then runs the per-partition two-pointer merge: one pair for an
+// unpartitioned set, one pair per partition fanned across workers for a partitioned one. A partition
+// whose array is not current (which the held locks make unexpected) aborts the whole merge back to the
+// probe rather than return a partial result. Each partition's members go into its own buffer so the
+// fan-out never races on a shared slice, and the buffers concatenate into the result. The members are
+// arena-stable subslices, valid after the merge returns.
+func (c *connState) setMergeIntersect(keys [][]byte) ([][]byte, bool) {
+	p, ok := c.setMergeEligible(keys)
+	if !ok {
+		return nil, false
+	}
+	c.srv.store.SyncSortedHashes()
+	if p == 1 {
+		pa := setMergePrefix(keys[0], 0, 1)
+		pb := setMergePrefix(keys[1], 0, 1)
+		out := make([][]byte, 0)
+		if !c.srv.store.SetSortedIntersectPart(pa, pb, func(m []byte) {
+			out = append(out, m)
+		}) {
+			return nil, false
+		}
+		return out, true
+	}
+	parts := make([][][]byte, p)
+	var aborted atomic.Bool
+	c.fanPartitions(p, func(part int) {
+		pa := setMergePrefix(keys[0], part, p)
+		pb := setMergePrefix(keys[1], part, p)
+		local := make([][]byte, 0)
+		if !c.srv.store.SetSortedIntersectPart(pa, pb, func(m []byte) {
+			local = append(local, m)
+		}) {
+			aborted.Store(true)
+			return
+		}
+		parts[part] = local
+	})
+	if aborted.Load() {
+		return nil, false
+	}
+	total := 0
+	for _, pp := range parts {
+		total += len(pp)
+	}
+	out := make([][]byte, 0, total)
+	for _, pp := range parts {
+		out = append(out, pp...)
+	}
+	return out, true
+}
+
+// setMergeIntersectCard computes SINTERCARD's count through the sorted-hash merge when keys are
+// eligible, returning the count and true, or 0 and false to fall back to the probe. It mirrors
+// setMergeIntersect but counts without materializing members: each partition intersection is disjoint
+// (a member routes to exactly one partition), so the per-partition counts sum to the whole intersection
+// size, and the command's LIMIT passes to each partition as an early-stop cap with the sum capped again
+// at LIMIT. A not-current partition aborts to the probe.
+func (c *connState) setMergeIntersectCard(keys [][]byte, limit int) (int, bool) {
+	p, ok := c.setMergeEligible(keys)
+	if !ok {
+		return 0, false
+	}
+	c.srv.store.SyncSortedHashes()
+	capTo := func(n int) int {
+		if limit > 0 && n > limit {
+			return limit
+		}
+		return n
+	}
+	if p == 1 {
+		pa := setMergePrefix(keys[0], 0, 1)
+		pb := setMergePrefix(keys[1], 0, 1)
+		n, cur := c.srv.store.SetSortedIntersectCountPart(pa, pb, limit)
+		if !cur {
+			return 0, false
+		}
+		return capTo(n), true
+	}
+	var total atomic.Int64
+	var aborted atomic.Bool
+	c.fanPartitions(p, func(part int) {
+		pa := setMergePrefix(keys[0], part, p)
+		pb := setMergePrefix(keys[1], part, p)
+		n, cur := c.srv.store.SetSortedIntersectCountPart(pa, pb, limit)
+		if !cur {
+			aborted.Store(true)
+			return
+		}
+		total.Add(int64(n))
+	})
+	if aborted.Load() {
+		return 0, false
+	}
+	return capTo(int(total.Load())), true
+}
+
 // cmdSInter answers SINTER by buffering the members present in every source (arena-stable subslices)
 // and framing the reply from the buffer length. It deliberately buffers rather than streaming each
 // member into the reply as it is found: SINTER's cost is almost entirely the point-probe into the
@@ -338,6 +557,14 @@ func (c *connState) cmdSInter(argv [][]byte) {
 	if c.anyStringConflict(keys) {
 		unlock()
 		c.writeErr(wrongType)
+		return
+	}
+	if merged, ok := c.setMergeIntersect(keys); ok {
+		c.writeArrayHeader(len(merged))
+		for _, m := range merged {
+			c.writeBulk(m)
+		}
+		unlock()
 		return
 	}
 	out := make([][]byte, 0)
@@ -457,6 +684,11 @@ func (c *connState) cmdSInterCard(argv [][]byte) {
 	if c.anyStringConflict(keys) {
 		unlock()
 		c.writeErr(wrongType)
+		return
+	}
+	if n, ok := c.setMergeIntersectCard(keys, limit); ok {
+		unlock()
+		c.writeInt(int64(n))
 		return
 	}
 	count := 0

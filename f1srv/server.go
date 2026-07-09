@@ -118,6 +118,16 @@ type Config struct {
 	SetPartitionMax       int
 	SetPartitionThreshold int
 	SetPartitionTarget    int
+
+	// SetAlgebraMerge turns on the sorted-hash set-algebra merge (spec 2064/f1_rewrite_ltm/24). The
+	// default of false leaves the folder off: SADD/SREM journal nothing, no background folder runs,
+	// and SINTER/SINTERCARD keep the smallest-source point-probe of doc 20, so a workload that never
+	// runs set algebra pays nothing on its writes. When true, New calls EnableSortedHashFold so each
+	// set maintains a per-partition sorted array of member hashes off the reply path, and the algebra
+	// path runs the partition-parallel two-pointer merge over two same-P sources before it falls back
+	// to the probe. It is opt-in because the merge trades a small per-write fold cost for a large
+	// intersection speedup; the GamingPC 2x gate measures both together.
+	SetAlgebraMerge bool
 }
 
 // Built-in defaults for the adaptive set-partitioning knobs, used when the feature is on
@@ -194,6 +204,12 @@ type Server struct {
 	setPartMax       int
 	setPartThreshold int
 	setPartTarget    int
+
+	// setAlgebraMerge is the resolved Config.SetAlgebraMerge flag, read-only after New. It records
+	// that the sorted-hash folder was enabled so the set-algebra driver gates the merge path on one
+	// server field before it touches the engine's own SortedHashEnabled check; when false the driver
+	// never leaves the doc-20 probe.
+	setAlgebraMerge bool
 
 	// execModel is the resolved command-execution model (spec 2064/17), parsed once from
 	// cfg.ExecModel in New. execShards is the shard count the affinity model routes over,
@@ -343,6 +359,7 @@ func New(cfg Config) *Server {
 		setPartMax:       partMax,
 		setPartThreshold: partThreshold,
 		setPartTarget:    partTarget,
+		setAlgebraMerge:  cfg.SetAlgebraMerge,
 		startTime:        time.Now(),
 		runID:            newRunID(),
 	}
@@ -406,6 +423,14 @@ func New(cfg Config) *Server {
 		// queues the removal and a background folder splices it under the index lock later
 		// (spec 2064/16 slice 2). Enable once here, before the server accepts traffic.
 		srv.store.EnableDeferredRemoval()
+		if cfg.SetAlgebraMerge {
+			// Turn on the sorted-hash fold so each set maintains a per-partition sorted array of member
+			// hashes off the reply path (spec 2064/f1_rewrite_ltm/24). It starts the background folder
+			// and makes SADD/SREM journal a fold delta; the set-algebra driver consumes the published
+			// arrays through the partition-parallel two-pointer merge. Enabled once here on the
+			// still-empty store, and only under the flag so the default write path pays nothing.
+			srv.store.EnableSortedHashFold()
+		}
 	}
 	if cfg.Migrator {
 		// Start the background migrator that sinks records cold under fill pressure (spec 2064/21
