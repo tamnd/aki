@@ -185,7 +185,7 @@ func TestSetMergeIneligibleFallsBack(t *testing.T) {
 					append([]string{"SADD", "C"}, "share:000000")...)
 				keys = [][]byte{[]byte("A"), []byte("B"), []byte("C")}
 			}
-			if _, _, ok := mc.setMergeEligible(keys); ok != sh.wantMergeAttempt {
+			if _, ok := mc.setMergeEligible(keys); ok != sh.wantMergeAttempt {
 				t.Fatalf("%s: setMergeEligible = %v, want %v", sh.name, ok, sh.wantMergeAttempt)
 			}
 
@@ -443,5 +443,102 @@ func TestSetMergeConcurrent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// newMixedMergeServer builds a merge-on server that reads per-key partition counts from the registry
+// (forceP left 0), so a test can engage two sets to different P and drive the mixed-P re-partition merge
+// (spec 2064/f1_rewrite_ltm/24 section 5.1). It mirrors newMergeServer minus the whole-server forceP so
+// A and B can sit at different P.
+func newMixedMergeServer(t testing.TB) *Server {
+	t.Helper()
+	cfg := Config{
+		Addr:            "127.0.0.1:0",
+		IndexBuckets:    1 << 12,
+		ArenaBytes:      1 << 24,
+		ReadBufSize:     4 << 10,
+		IncrStripes:     64,
+		SetAlgebraMerge: true,
+	}
+	return New(cfg)
+}
+
+// TestSetMergeMixedPartition drives the mixed-P re-partition merge: two eligible sets engaged to
+// different partition counts must re-partition the smaller-P operand up into the larger P and return
+// exactly what the merge-off probe returns, for SINTER, SDIFF, SUNION, and SINTERCARD. It runs both
+// operand orders and a flat-vs-partitioned pair so the bigIsA flag, the SDIFF A/B bookkeeping, and the
+// pSmall==1 bucket-split are all exercised. Driving setMergeEligible directly asserts the plan is
+// genuinely the mixed path, not a silent fall-through to the probe.
+func TestSetMergeMixedPartition(t *testing.T) {
+	cases := []struct {
+		name   string
+		pA, pB int
+	}{
+		{"A-larger", 8, 4},
+		{"B-larger", 4, 8},
+		{"A-partitioned-B-flat", 8, 1},
+		{"A-flat-B-partitioned", 1, 8},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msrv := newMixedMergeServer(t)
+			if tc.pA > 1 {
+				msrv.engageP([]byte("A"), tc.pA)
+			}
+			if tc.pB > 1 {
+				msrv.engageP([]byte("B"), tc.pB)
+			}
+			mc := bareConn(msrv)
+			mergeFixture(t, mc, 1200, 800, 800) // |A|=|B|=2000, intersection 1200, ratio 1
+			keys := [][]byte{[]byte("A"), []byte("B")}
+
+			unlock := mc.lockStripes(keys)
+			plan, elig := mc.setMergeEligible(keys)
+			merged, ok := mc.setMergeIntersect(keys)
+			got := bulksToSorted(merged)
+			n, okc := mc.setMergeIntersectCard(keys, 0)
+			unlock()
+
+			if !elig || !plan.mixed {
+				t.Fatalf("expected an eligible mixed plan, got elig=%v mixed=%v", elig, plan.mixed)
+			}
+			if !ok {
+				t.Fatalf("setMergeIntersect did not engage on the mixed pair")
+			}
+
+			// The merge-off probe at P=1 is the reference for the whole slice.
+			psrv := newPartServer(t, 1)
+			pc := bareConn(psrv)
+			want := mergeFixture(t, pc, 1200, 800, 800)
+			if !eqStrs(got, want) {
+				t.Fatalf("mixed intersect has %d members, want %d", len(got), len(want))
+			}
+			if !okc || n != len(want) {
+				t.Fatalf("mixed SINTERCARD = %d (ok=%v), want %d", n, okc, len(want))
+			}
+
+			reads := []struct {
+				name string
+				fn   func(*connState, [][]byte)
+			}{
+				{"SINTER", func(c *connState, a [][]byte) { c.cmdSInter(a) }},
+				{"SDIFF", func(c *connState, a [][]byte) { c.cmdSDiff(a) }},
+				{"SUNION", func(c *connState, a [][]byte) { c.cmdSUnion(a) }},
+			}
+			for _, r := range reads {
+				m := sortedFlatReply(t, call(mc, r.fn, r.name, "A", "B"))
+				p := sortedFlatReply(t, call(pc, r.fn, r.name, "A", "B"))
+				if strings.Join(m, "\x00") != strings.Join(p, "\x00") {
+					t.Fatalf("%s mixed reply differs from probe", r.name)
+				}
+				mr := sortedFlatReply(t, call(mc, r.fn, r.name, "B", "A"))
+				pr := sortedFlatReply(t, call(pc, r.fn, r.name, "B", "A"))
+				if strings.Join(mr, "\x00") != strings.Join(pr, "\x00") {
+					t.Fatalf("%s reversed mixed reply differs from probe", r.name)
+				}
+			}
+			psrv.Close()
+			msrv.Close()
+		})
 	}
 }
