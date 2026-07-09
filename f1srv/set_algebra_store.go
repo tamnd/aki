@@ -169,8 +169,10 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 	if aliased {
 		// Buffer the arena-stable result before touching the destination: the destination is
 		// one of the sources, so clearing it first would corrupt the cursor reading it. The
-		// buffered members survive the clear because a delete frees only index slots.
-		out := make([][]byte, 0)
+		// buffered members survive the clear because a delete frees only index slots. Size the
+		// buffer to the summed source cardinalities, the upper bound for any of the three set
+		// operations, so the append does not double and re-copy as members land.
+		out := make([][]byte, 0, algebraBufCap(c.summedCard(keys)))
 		each(keys, func(m []byte) bool {
 			out = append(out, m)
 			return true

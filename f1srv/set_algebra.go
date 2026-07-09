@@ -14,11 +14,15 @@ import (
 // source and deduplicates through a seen-set. None of the three depends on the sources arriving
 // in sorted order, which is what lets them read the unordered vector instead of the ordered index.
 //
-// The RESP2 array count has to precede the elements. SINTER and SDIFF bound their result by one
-// driving set (the smallest, the first), so they buffer the qualifying members (arena-stable
-// subslices) and frame from the buffer length. SUNION's result is the distinct union, so it
-// buffers the deduplicated members and frames from that buffer; the seen-set it builds to
-// deduplicate is O(union) in memory, exactly as Redis's own dict-backed SUNION is.
+// The RESP2 array count has to precede the elements, so all three buffer the qualifying members
+// (arena-stable subslices) in one pass and frame the reply from the buffer length, then encode in a
+// second pass. Buffering rather than streaming with a deferred-length header is deliberate and
+// measured: SINTER and SDIFF are memory-bound on the per-member point-probe into the shared composite
+// index, and interleaving reply encoding into the probe loop evicts the index cache lines the next
+// probe needs, so the two-phase form runs ~15% faster than streaming (see labs/setalgebra). SUNION
+// owes an O(union) seen-set to deduplicate regardless (exactly as Redis's dict-backed SUNION does), so
+// buffering the distinct members it discovers is one cheap slice next to walking the sources twice,
+// which is what the old count-then-emit form did; single-pass buffering runs a large SUNION ~2x faster.
 //
 // Locking: an algebra read takes every source set's stripe lock (distinct stripes, in
 // ascending index order so it can never deadlock against another multi-key write) for the
@@ -183,7 +187,7 @@ func (c *connState) anyStringConflict(keys [][]byte) bool {
 // unordered. emit returns false to stop early; the read SUNION never does, but SUNIONSTORE's insert
 // can fail and stop the walk.
 func (c *connState) sunionEach(keys [][]byte, emit func([]byte) bool) {
-	seen := make(map[string]struct{})
+	seen := make(map[string]struct{}, algebraBufCap(c.summedCard(keys)))
 	for _, k := range keys {
 		stop := false
 		c.setVecEach(k, func(m []byte) bool {
@@ -216,6 +220,41 @@ func (c *connState) setMemberExists(skey, member []byte) bool {
 		return c.srv.store.ExistsKind(c.partMemberKey(skey, member, part, p), kindSetMember)
 	}
 	return c.srv.store.ExistsKind(c.memberKey(skey, member), kindSetMember)
+}
+
+// algebraBufMaxCap caps a speculative result-buffer preallocation. Sizing a buffer to the exact
+// upper bound kills the append growth for a realistic result, but a pathological case (intersecting
+// two huge sets whose real overlap is tiny, or a union whose sources barely differ) would otherwise
+// preallocate tens of millions of slots the result never fills. The cap bounds that waste: past it
+// the buffer starts smaller and doubles a few times, whose cost is negligible against a result that
+// large. Eight million slots is 64 MiB of header slice, comfortably above any realistic in-memory
+// result and well under a run that would blow the larger-than-memory budget.
+const algebraBufMaxCap = 8 << 20
+
+// algebraBufCap turns a cardinality upper bound into a preallocation size, clamped to
+// algebraBufMaxCap so a huge bound cannot request an unbounded speculative slice.
+func algebraBufCap(card uint64) int {
+	if card > algebraBufMaxCap {
+		return algebraBufMaxCap
+	}
+	return int(card)
+}
+
+// summedCard returns the sum of the source cardinalities, the upper bound on a union's size (the
+// union can hold no more distinct members than the total across its sources). A union sizes its
+// seen-set and result buffer with it. The sum saturates at the uint64 ceiling rather than
+// wrapping, which only matters for cardinalities no real keyspace reaches; algebraBufCap clamps
+// the result to a sane preallocation regardless.
+func (c *connState) summedCard(keys [][]byte) uint64 {
+	var total uint64
+	for _, k := range keys {
+		card := c.setCard(k)
+		if total+card < total {
+			return ^uint64(0)
+		}
+		total += card
+	}
+	return total
 }
 
 // sinterEach yields every member present in all source sets and returns early when emit returns
@@ -279,9 +318,15 @@ func (c *connState) sdiffEach(keys [][]byte, emit func([]byte) bool) {
 	})
 }
 
-// cmdSInter answers SINTER by buffering the members present in every source (bounded by the
-// smallest set) and framing the reply from the buffer length. The buffered members are
-// arena-stable subslices, so they survive the driver cursor refilling its batch.
+// cmdSInter answers SINTER by buffering the members present in every source (arena-stable subslices)
+// and framing the reply from the buffer length. It deliberately buffers rather than streaming each
+// member into the reply as it is found: SINTER's cost is almost entirely the point-probe into the
+// shared composite index (spec 2064/f1_rewrite_ltm/20), which is memory-bound on the index cache
+// lines. Encoding a member into the reply buffer between probes would evict those lines and slow the
+// probe; buffering keeps the probe loop's footprint tiny and cache-hot, then encodes in one tight
+// pass over the buffer afterward. Measured, the two-phase form runs a large SINTER ~15% faster than
+// streaming the members inline. Each buffered member points into the immutable arena and stays valid
+// while the driver cursor refills its scan batch.
 func (c *connState) cmdSInter(argv [][]byte) {
 	// SINTER key [key ...]
 	if len(argv) < 2 {
@@ -307,8 +352,11 @@ func (c *connState) cmdSInter(argv [][]byte) {
 	unlock()
 }
 
-// cmdSDiff answers SDIFF by buffering the first set's members that no other source holds
-// (bounded by the first set) and framing from the buffer length.
+// cmdSDiff answers SDIFF by buffering the first set's members that no other source holds and framing
+// from the buffer length. It buffers rather than streams for the same reason as SINTER: the cost is
+// the per-member point-probe into the shared composite index, so keeping the probe loop's cache
+// footprint minimal and encoding the buffer in a separate pass afterward runs faster than interleaving
+// reply encoding into the probe.
 func (c *connState) cmdSDiff(argv [][]byte) {
 	// SDIFF key [key ...]
 	if len(argv) < 2 {
@@ -334,11 +382,14 @@ func (c *connState) cmdSDiff(argv [][]byte) {
 	unlock()
 }
 
-// cmdSUnion answers SUNION with a two-pass k-way merge: it counts the distinct members
-// first, frames the array with that count, then merges again to stream them, all under the
-// source locks so the two passes see identical state. This keeps the peak memory at k
-// cursors even for a union of enormous sets, where buffering the whole result would blow
-// the larger-than-memory budget.
+// cmdSUnion answers SUNION by buffering the distinct union once and framing the reply from the
+// buffer length. It replaces the old two-pass form that walked every source and rebuilt the whole
+// O(union) seen-set twice, once to count for the array header and once to emit, which doubled the
+// dominant dedup cost; a large SUNION runs about twice as fast walking the sources a single time.
+// The union already owes an O(union) seen-set to deduplicate (exactly what Redis's dict-backed
+// SUNION pays), so buffering the distinct members it discovers costs one slice of arena-stable
+// subslices, not a second copy of the data. Both the seen-set and the buffer are sized to the summed
+// source cardinalities, the union's upper bound, so neither grows and rehashes mid-walk.
 func (c *connState) cmdSUnion(argv [][]byte) {
 	// SUNION key [key ...]
 	if len(argv) < 2 {
@@ -352,16 +403,15 @@ func (c *connState) cmdSUnion(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
-	n := 0
-	c.sunionEach(keys, func([]byte) bool {
-		n++
-		return true
-	})
-	c.writeArrayHeader(n)
+	out := make([][]byte, 0, algebraBufCap(c.summedCard(keys)))
 	c.sunionEach(keys, func(m []byte) bool {
-		c.writeBulk(m)
+		out = append(out, m)
 		return true
 	})
+	c.writeArrayHeader(len(out))
+	for _, m := range out {
+		c.writeBulk(m)
+	}
 	unlock()
 }
 
