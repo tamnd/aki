@@ -25,13 +25,15 @@
 //
 //	BenchmarkGlobalProbe               40 ms   shared index holds only A,B (probe only)
 //	BenchmarkGlobalProbeDiluted        73 ms   shared index also holds 8x other keys
+//	BenchmarkPartitionedProbe          44 ms   doc 19 routed probe, undiluted index
+//	BenchmarkPartitionedProbeDiluted   77 ms   doc 19 routed probe, 8x diluted index
 //	BenchmarkCompactFingerprint        74 ms   build table over B, then probe
 //	BenchmarkCompactFingerprintProbeOnly 41 ms   probe only, table already built
 //	BenchmarkRedisDict                153 ms   build map over B, then probe
 //	BenchmarkFullSInter                43 ms   probe + buffer + RESP-encode the ~1M hits
 //	BenchmarkEncodeOnly                 3 ms   serialize an already-known ~1M result
 //
-// Four facts fall straight out.
+// Five facts fall straight out.
 //
 // First: with the shared index holding only the two operands (GlobalProbe, 40 ms)
 // the composite-key probe is already as fast as a bare member-only probe
@@ -62,21 +64,34 @@
 // into a multi-MB table 2x cheaper, because the cost is DRAM latency, not
 // instructions.
 //
+// Fifth, and this one retracts a guess an earlier draft of this file made: doc 19's
+// per-member partition routing is NOT the hidden cost. setMemberExists on a
+// partitioned set (f1srv/set_algebra.go:217) does not probe a smaller table; it still
+// probes the one shared index, it just routes first, computing PartitionOf (a second
+// full member hash) and building a partition-qualified composite key one byte longer
+// than the plain one. BenchmarkPartitionedProbe puts exactly that routing on top of
+// BenchmarkGlobalProbe and it costs ~10% on the undiluted index (44 ms vs 40 ms) and
+// essentially nothing once the shared index is diluted to production size (77 ms vs
+// 73 ms). The extra member hash hides in the DRAM stall the probe already pays. So
+// routing is cheap; the earlier draft named it as the leading suspect for the real
+// gap and the measurement clears it. This is the whole reason the lab exists: the
+// suspected 2x cost was a ~10%-and-vanishing one.
+//
 // # The consequence for the real redesign
 //
 // Put together, the levers this lab tested against the isolated SINTER bench (the
 // one the 2x gate runs) are all small or negative: per-op rebuild is a wash,
-// composite-vs-member-only is ~5%, reply encode is 7%. None of them is a 2x. So when
-// the real f1srv SINTER runs at ~0.35x of Valkey on two 2<<20 sets, the gap is not
-// in the shape of the index or the reply; it is the layers the real probe carries
-// that this minimal model strips away: per-member partition routing (doc 19 splits a
-// 2M set into many partition vectors, and setMemberExists re-routes every probe),
-// composite-key reconstruction per member, interface dispatch, and bounds checks.
-// The redesign that pays is a direct, minimal, member-only resident probe path for
-// the algebra hot loop, one that bypasses partition routing and composite
-// reconstruction, i.e. make the real probe cost the 40 ns this lab shows is
-// available. That closes toward parity; it does not manufacture a 2x, because at
-// equal set sizes both engines do ~1M DRAM-latency probes.
+// composite-vs-member-only is ~5%, partition routing is ~10% and vanishes under cache
+// pressure, reply encode is 7%. None of them is a 2x, and their sum is not either. So
+// when the real f1srv SINTER runs at ~0.35x of Valkey on two 2<<20 sets, the gap is
+// not in the shape of the index, the routing, or the reply that this lab can model in
+// plain Go. What is left, and what the lab cannot reach without importing the engine,
+// is the concrete cost of one real probe: interface dispatch through the store SPI,
+// the bounds checks and the arena indirection the real find carries, the driver
+// selection off the header cardinalities, and GC pressure on the result buffer. Those
+// are parity-class costs, worth cutting, but the lab's numbers say cutting them lands
+// near Valkey, not at 2x, because at equal set sizes both engines do ~1M
+// DRAM-latency probes and neither can make that cheaper.
 //
 // The honest ceiling: a clean 2x over Valkey on a large equal-size SINTER is not a
 // data-structure result. It needs either an algorithm that avoids random probing

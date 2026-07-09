@@ -29,6 +29,8 @@ Rules for a lab:
   wrong line.
 - [setintersect](setintersect/) — a per-operation rebuild of a compact probe
   table does not beat aki's resident shared index: the O(|B|) build cost equals
-  the cache-locality it buys, so it is a wash by construction. The only shape
-  that reaches ~2x under a real keyspace is a resident per-set member-only index,
-  which does nothing for the isolated SINTER bench.
+  the cache-locality it buys, so it is a wash by construction. Doc 19's per-member
+  partition routing, suspected of being the real SINTER gap, is measured at ~10%
+  undiluted and ~0% under production cache pressure, so it is cleared. SINTER on
+  equal-size sets is DRAM-latency-bound on ~1M probes; no data-structure change
+  makes that 2x, only set ordering or asymmetric sizes does.

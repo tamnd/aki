@@ -240,6 +240,103 @@ func buildDict(members [][]byte) map[string]struct{} {
 	return d
 }
 
+// --- strategy 4: partitioned routing over the shared index (models f1raw doc 19) ------
+//
+// This is the cost the "40 ns floor" model omits, and the one the real f1srv SINTER pays.
+// Doc 19 splits a large set into P partitions, but membership does NOT get a smaller table:
+// setMemberExists still probes the ONE shared composite index (f1srv/set_algebra.go:217), it
+// just routes first. Per driver member it computes PartitionOf(member, p) = hash(member) & (p-1)
+// (a second full member hash, on top of the composite hash the probe already runs), then builds
+// a partition-qualified composite uvarint(len(skey))|skey|byte(part)|member (one byte longer than
+// the unpartitioned key), then probes the same global table. So the routing tax over the plain
+// diluted probe is exactly: one extra member hash and a one-byte-longer composite key. The global
+// table stays the same size, so this must be compared against BenchmarkGlobalProbeDiluted (same
+// table dilution); the delta is the routing, nothing else.
+
+const labPartitions = 64 // power of two; a 2M set engages many partitions under doc 19
+
+// compositePart writes uvarint(len(skey))|skey|byte(part)|member, f1raw's partMemberKey layout
+// (f1srv/set.go partMemberKey), into dst[:0] and returns it.
+func compositePart(dst, skey []byte, part int, member []byte) []byte {
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(len(skey)))
+	dst = append(dst[:0], tmp[:n]...)
+	dst = append(dst, skey...)
+	dst = append(dst, byte(part))
+	dst = append(dst, member...)
+	return dst
+}
+
+// insertPart adds member under its routed partition-qualified key, the way a partitioned SADD
+// writes it, so a routed probe of the same member resolves the row.
+func (g *globalIndex) insertPart(skey, member []byte, p int) {
+	part := int(hashBytes(member) & uint64(p-1))
+	var kb [64]byte
+	key := compositePart(kb[:0], skey, part, member)
+	off := len(g.arena)
+	var lb [4]byte
+	binary.LittleEndian.PutUint32(lb[:], uint32(len(key)))
+	g.arena = append(g.arena, lb[:]...)
+	g.arena = append(g.arena, key...)
+	h := hashBytes(key)
+	tag := (h >> gTagShift) | 1
+	w := tag<<gTagShift | uint64(off+1)
+	for i := h & g.mask; ; i = (i + 1) & g.mask {
+		if g.slots[i].Load() == 0 {
+			g.slots[i].Store(w)
+			return
+		}
+	}
+}
+
+// existsPart reproduces the doc 19 routed probe: hash the member to pick its partition, build the
+// partition-qualified composite, then probe the same shared table. The extra member hash and the
+// longer key are the whole routing tax this benchmark prices.
+func (g *globalIndex) existsPart(skey, member []byte, p int) bool {
+	part := int(hashBytes(member) & uint64(p-1))
+	var kb [64]byte
+	key := compositePart(kb[:0], skey, part, member)
+	h := hashBytes(key)
+	tag := (h >> gTagShift) | 1
+	for i := h & g.mask; ; i = (i + 1) & g.mask {
+		w := g.slots[i].Load()
+		if w == 0 {
+			return false
+		}
+		if w>>gTagShift != tag {
+			continue
+		}
+		off := int(w&((1<<gTagShift)-1)) - 1
+		klen := int(binary.LittleEndian.Uint32(g.arena[off:]))
+		start := off + 4
+		if string(g.arena[start:start+klen]) == string(key) {
+			return true
+		}
+	}
+}
+
+// newPartitionedIndex builds a shared table (diluted like production) holding B's members under
+// partition-qualified keys, so it is the exact same global structure as newGlobalIndex(dilute) but
+// keyed the way a partitioned set writes. dilute pads it with other keys' members, the condition
+// under which the shared table dwarfs cache.
+func newPartitionedIndex(members [][]byte, p, dilute int) *globalIndex {
+	total := dilute + len(members)
+	n := pow2AtLeast(total * 2)
+	g := &globalIndex{slots: make([]atomic.Uint64, n), mask: uint64(n - 1)}
+	g.arena = make([]byte, 0, total*24)
+	if dilute > 0 {
+		dil := []byte("dilute")
+		for i := range dilute {
+			g.insert(dil, []byte("x:"+strconv.Itoa(i)))
+		}
+	}
+	skey := []byte("set:0")
+	for _, m := range members {
+		g.insertPart(skey, m, p)
+	}
+	return g
+}
+
 // --- benchmarks -----------------------------------------------------------------------
 
 var sink int
@@ -323,6 +420,45 @@ func BenchmarkCompactFingerprintProbeOnly(b *testing.B) {
 		n := 0
 		for _, m := range a {
 			if t.has(m) {
+				n++
+			}
+		}
+		sink = n
+	}
+}
+
+// BenchmarkPartitionedProbe is the real f1srv SINTER inner loop on a partitioned set: for every
+// driver member, route through PartitionOf, build the partition-qualified composite, then probe
+// the same shared index. Compared against BenchmarkGlobalProbe (unpartitioned, same undiluted
+// table) the delta is the routing tax alone: the extra member hash and the one-byte-longer key.
+func BenchmarkPartitionedProbe(b *testing.B) {
+	a, bset := intersectFixture()
+	g := newPartitionedIndex(bset, labPartitions, 0)
+	skeyB := []byte("set:0")
+	for b.Loop() {
+		n := 0
+		for _, m := range a {
+			if g.existsPart(skeyB, m, labPartitions) {
+				n++
+			}
+		}
+		sink = n
+	}
+}
+
+// BenchmarkPartitionedProbeDiluted is the production condition for the routed probe: the shared
+// index also carries 8x the two sets in other keys, so the table dwarfs cache exactly as it does
+// for BenchmarkGlobalProbeDiluted. The gap between those two benchmarks is the doc 19 routing tax
+// under the real cache pressure, the single cost the "40 ns floor" model left out, and the number
+// that says whether unrouting the algebra probe is worth a slice.
+func BenchmarkPartitionedProbeDiluted(b *testing.B) {
+	a, bset := intersectFixture()
+	g := newPartitionedIndex(bset, labPartitions, 8*labN)
+	skeyB := []byte("set:0")
+	for b.Loop() {
+		n := 0
+		for _, m := range a {
+			if g.existsPart(skeyB, m, labPartitions) {
 				n++
 			}
 		}
