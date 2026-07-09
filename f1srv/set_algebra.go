@@ -369,10 +369,17 @@ func (c *connState) sdiffEach(keys [][]byte, emit func([]byte) bool) {
 // gate routes it to the probe, which is at the random-probe floor and needs no re-partition.
 
 const (
-	// setMergeFloor is the smallest source cardinality the merge engages at. Below it the intersection
-	// is tiny enough that the point-probe off the smaller source already runs in the noise, and the
-	// synchronous fold the merge forces would cost more than it saves.
-	setMergeFloor = 1024
+	// setMergeFloor is the smallest source cardinality the merge engages at. The GamingPC three-way gate
+	// showed the point-probe into the global open-addressed index is not competitive against
+	// Redis/Valkey's cache-hot per-set dict even at a few hundred members: at 256 members SINTER ran
+	// 0.64x and SINTERCARD 0.64x on the probe and 1.28x / 1.78x once the merge engaged. The old 1024
+	// floor was set by the labs/seteager single-key micro (spec 2064/24 section 7), which measured the
+	// merge's fold and setup cost in isolation without the probe's cross-set cache-miss penalty a live
+	// three-way run pays; against real Redis the merge wins well below 1024. 128 is the crossover the
+	// labs/setmergefloor sweep and the GamingPC A/B agree on: at and above it the merge wins, below it
+	// (16-member sets) the per-call merge setup outweighs the tiny probe and the driver stays on the
+	// probe. See labs/setmergefloor for the small-N merge-vs-probe crossover the floor rests on.
+	setMergeFloor = 128
 	// setMergeMaxRatio caps how lopsided the two sources may be for the merge to engage. The probe's
 	// cost tracks the smaller source while the merge walks both arrays, so once the larger source is
 	// more than this many times the smaller, probing off the tiny source wins and the driver stays on
