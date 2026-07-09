@@ -326,12 +326,21 @@ func (c *connState) sdiffEach(keys [][]byte, emit func([]byte) bool) {
 // those arrays, work proportional to the sum of the two cardinalities with no per-member point-probe
 // into the shared composite index. Redis and Valkey cannot run it: their sets carry no maintained
 // sorted view a merge could walk. The merge is fenced to the case where it is both correct and a clear
-// win: exactly two sources, the same partition count P (so a shared member lands in the same partition
-// index in both, section 4), both large enough to amortize the fold (setMergeFloor), and comparable in
+// win: exactly two sources, both large enough to amortize the fold (setMergeFloor), and comparable in
 // size (setMergeMaxRatio) since a wildly asymmetric pair is cheaper to probe off the tiny source. Every
 // other shape stays on the doc-20 probe, which is always correct. When eligible the driver holds the
 // sources' stripe locks (the caller took them), forces a synchronous fold so the arrays are current,
 // then runs the two-pointer merge per partition, fanning the partitions across workers for P>1.
+//
+// Two operands at the same partition count P pair partition for partition: a shared member lands in the
+// same partition index in both (section 4). Two operands at different P do not, because a member routes
+// to hash & (P-1) and the same hash picks a different index at different P. Doc 19 grows P with
+// cardinality, so even a comparable pair can straddle a power-of-two boundary and sit at different P.
+// The driver handles that mixed-P case by re-partitioning the smaller-P operand's already-sorted arrays
+// up into the larger operand's P in one O(|small|) pass (a stable bucket-split, since P is a power of
+// two and routing is the low bits), then running the same-P merge against the larger operand's real
+// partitions (section 5.1). The far-smaller asymmetric pair never reaches the merge at all: the ratio
+// gate routes it to the probe, which is at the random-probe floor and needs no re-partition.
 
 const (
 	// setMergeFloor is the smallest source cardinality the merge engages at. Below it the intersection
@@ -378,38 +387,77 @@ func setMergePrefix(skey []byte, part, p int) []byte {
 	return b
 }
 
-// setMergeEligible reports the shared partition count P, the smaller source's cardinality, and whether
-// the sorted-hash merge should run for keys. It requires the feature flag and the folder both on,
-// offsets that stay resolvable (the non-segmented arena; the merge holds raw offsets the segmented
-// migrator would reclaim, see SortedHashMergeStable), exactly two sources, an equal partition count (so
-// a shared member routes to the same partition index in both), both cardinalities at or above
-// setMergeFloor, and a size ratio no wider than setMergeMaxRatio. The smaller cardinality lets the
-// caller estimate the per-partition element count (lo/P) for the fan-out floor. Any miss returns false
-// and the caller keeps the doc-20 probe.
-func (c *connState) setMergeEligible(keys [][]byte) (p, lo int, ok bool) {
+// mergePlan is the resolved sorted-hash merge shape for a two-source algebra command, produced by
+// setMergeEligible. p is the partition count the merge runs at (the larger of the two operands' P for
+// the mixed case, the shared P otherwise) and lo is the smaller operand's cardinality, which the
+// fan-out floor divides by p. When mixed is false the merge pairs keys[0] and keys[1] partition for
+// partition. When mixed is true the two operands sit at different P: the merge re-partitions the
+// smaller-P operand (smallKey, at pSmall) up into p target buckets and pairs each against the larger-P
+// operand (realKey), with bigIsA recording whether the larger-P operand is keys[0], the A operand SDIFF
+// keeps as its minuend.
+type mergePlan struct {
+	p        int
+	lo       int
+	mixed    bool
+	realKey  []byte
+	smallKey []byte
+	pSmall   int
+	bigIsA   bool
+}
+
+// setMergeEligible resolves the merge plan for keys and reports whether the sorted-hash merge should
+// run. It requires the feature flag and the folder both on, offsets that stay resolvable (the
+// non-segmented arena; the merge holds raw offsets the segmented migrator would reclaim, see
+// SortedHashMergeStable), exactly two sources, both cardinalities at or above setMergeFloor, and a size
+// ratio no wider than setMergeMaxRatio. Equal-P operands merge partition for partition; different-P
+// operands re-partition the smaller-P side up into the larger P (the mixed path). The smaller
+// cardinality (plan.lo) lets the caller estimate the per-partition element count (lo/p) for the fan-out
+// floor. Any miss returns false and the caller keeps the doc-20 probe.
+func (c *connState) setMergeEligible(keys [][]byte) (mergePlan, bool) {
+	var plan mergePlan
 	if !c.srv.setAlgebraMerge || len(keys) != 2 {
-		return 0, 0, false
+		return plan, false
 	}
 	if !c.srv.store.SortedHashEnabled() || !c.srv.store.SortedHashMergeStable() {
-		return 0, 0, false
-	}
-	p = c.partitionsFor(keys[0])
-	if c.partitionsFor(keys[1]) != p {
-		return 0, 0, false
+		return plan, false
 	}
 	c0 := c.setCard(keys[0])
 	c1 := c.setCard(keys[1])
 	if c0 < setMergeFloor || c1 < setMergeFloor {
-		return 0, 0, false
+		return plan, false
 	}
 	hi, small := c0, c1
 	if small > hi {
 		hi, small = small, hi
 	}
 	if hi/small > setMergeMaxRatio {
-		return 0, 0, false
+		return plan, false
 	}
-	return p, int(small), true
+	plan.lo = int(small)
+	pA := c.partitionsFor(keys[0])
+	pB := c.partitionsFor(keys[1])
+	if pA == pB {
+		plan.p = pA
+		return plan, true
+	}
+	// Mixed P: the merge re-partitions the smaller-P operand up into the larger operand's P. Because
+	// P only ever grows (doc 19) and is a power of two, the larger operand is the real target layout
+	// and the smaller-P operand splits into it. bigIsA fixes the A/B order SDIFF depends on.
+	plan.mixed = true
+	if pA >= pB {
+		plan.p = pA
+		plan.pSmall = pB
+		plan.realKey = keys[0]
+		plan.smallKey = keys[1]
+		plan.bigIsA = true
+	} else {
+		plan.p = pB
+		plan.pSmall = pA
+		plan.realKey = keys[1]
+		plan.smallKey = keys[0]
+		plan.bigIsA = false
+	}
+	return plan, true
 }
 
 // mergeFanWorkers is the worker cap the merge fans P partition pairs across, applying the fan-out floor
@@ -478,12 +526,16 @@ func (c *connState) fanPartitions(p, maxWorkers int, fn func(part int)) {
 // return a partial result. Each partition's members go into its own buffer so the fan-out never races on
 // a shared slice, and the buffers concatenate into the result. The members are arena-stable subslices,
 // valid after the merge returns.
-func (c *connState) setMergeCollect(keys [][]byte, part func(pa, pb []byte, emit func([]byte)) bool) ([][]byte, bool) {
-	p, lo, ok := c.setMergeEligible(keys)
+func (c *connState) setMergeCollect(keys [][]byte, part func(pa, pb []byte, emit func([]byte)) bool, mixed mixedPartFn) ([][]byte, bool) {
+	plan, ok := c.setMergeEligible(keys)
 	if !ok {
 		return nil, false
 	}
 	c.srv.store.SyncSortedHashes()
+	if plan.mixed {
+		return c.mergeCollectMixed(plan, mixed)
+	}
+	p, lo := plan.p, plan.lo
 	if p == 1 {
 		pa := setMergePrefix(keys[0], 0, 1)
 		pb := setMergePrefix(keys[1], 0, 1)
@@ -523,10 +575,72 @@ func (c *connState) setMergeCollect(keys [][]byte, part func(pa, pb []byte, emit
 	return out, true
 }
 
+// mixedPartFn is the per-target merge emitter the mixed-P path fans across the larger operand's
+// partitions. realPrefix names the larger operand's target partition, realIsA says whether that
+// operand is keys[0] (the A operand SDIFF keeps as its minuend; commutative ops ignore it), view is the
+// smaller operand re-partitioned into the larger P, and target is the partition index into the view. It
+// returns false when the larger operand's target partition is not current, which aborts the merge to
+// the probe.
+type mixedPartFn func(realPrefix []byte, realIsA bool, view *f1raw.RepartView, target int, emit func([]byte)) bool
+
+// buildRepartView re-partitions the smaller-P operand's sorted arrays up into the larger operand's P,
+// the O(|small|) bucket-split the mixed-P merge reads. It names the smaller operand's source partitions
+// with the same setMergePrefix format the fold registers members under, so the engine snapshots them by
+// the registry key, and returns false if any source is not current so the caller falls back to the
+// probe rather than merge a stale view.
+func (c *connState) buildRepartView(plan mergePlan) (*f1raw.RepartView, bool) {
+	srcPrefixes := make([][]byte, plan.pSmall)
+	for i := range plan.pSmall {
+		srcPrefixes[i] = setMergePrefix(plan.smallKey, i, plan.pSmall)
+	}
+	return c.srv.store.SortedRepartition(srcPrefixes, plan.p)
+}
+
+// mergeCollectMixed runs the mixed-P merge: it builds the smaller operand's re-partitioned view once,
+// then fans the larger operand's p partitions across workers, pairing each real partition against the
+// view's matching target bucket through the op-specific mixed emitter. It concatenates the per-target
+// members exactly as the same-P collector does, and aborts to the probe if the view build or any target
+// merge reports not-current. The members are arena-stable subslices, valid after the merge returns.
+func (c *connState) mergeCollectMixed(plan mergePlan, mixed mixedPartFn) ([][]byte, bool) {
+	view, ok := c.buildRepartView(plan)
+	if !ok {
+		return nil, false
+	}
+	p := plan.p
+	parts := make([][][]byte, p)
+	var aborted atomic.Bool
+	c.fanPartitions(p, c.mergeFanWorkers(p, plan.lo), func(target int) {
+		realPrefix := setMergePrefix(plan.realKey, target, p)
+		local := make([][]byte, 0)
+		if !mixed(realPrefix, plan.bigIsA, view, target, func(m []byte) {
+			local = append(local, m)
+		}) {
+			aborted.Store(true)
+			return
+		}
+		parts[target] = local
+	})
+	if aborted.Load() {
+		return nil, false
+	}
+	total := 0
+	for _, pp := range parts {
+		total += len(pp)
+	}
+	out := make([][]byte, 0, total)
+	for _, pp := range parts {
+		out = append(out, pp...)
+	}
+	return out, true
+}
+
 // setMergeIntersect computes SINTER's result through the sorted-hash merge when keys are eligible,
 // returning the shared members and true, or nil and false to fall back to the smallest-source probe.
 func (c *connState) setMergeIntersect(keys [][]byte) ([][]byte, bool) {
-	return c.setMergeCollect(keys, c.srv.store.SetSortedIntersectPart)
+	return c.setMergeCollect(keys, c.srv.store.SetSortedIntersectPart,
+		func(realPrefix []byte, _ bool, view *f1raw.RepartView, target int, emit func([]byte)) bool {
+			return c.srv.store.SetSortedIntersectMixed(realPrefix, view, target, emit)
+		})
 }
 
 // setMergeDiff computes SDIFF's result (the first source minus the second) through the sorted-hash
@@ -534,7 +648,10 @@ func (c *connState) setMergeIntersect(keys [][]byte) ([][]byte, bool) {
 // to the probe. SDIFF is not commutative, so the driver always treats keys[0] as A and keys[1] as B, the
 // same order the engine's diffEmit assumes.
 func (c *connState) setMergeDiff(keys [][]byte) ([][]byte, bool) {
-	return c.setMergeCollect(keys, c.srv.store.SetSortedDiffPart)
+	return c.setMergeCollect(keys, c.srv.store.SetSortedDiffPart,
+		func(realPrefix []byte, realIsA bool, view *f1raw.RepartView, target int, emit func([]byte)) bool {
+			return c.srv.store.SetSortedDiffMixed(realPrefix, realIsA, view, target, emit)
+		})
 }
 
 // setMergeUnion computes SUNION's result through the sorted-hash merge when keys are eligible, returning
@@ -542,7 +659,10 @@ func (c *connState) setMergeDiff(keys [][]byte) ([][]byte, bool) {
 // both sorted arrays with no O(union) dictionary, which is the win over the probe form's per-member map
 // insert.
 func (c *connState) setMergeUnion(keys [][]byte) ([][]byte, bool) {
-	return c.setMergeCollect(keys, c.srv.store.SetSortedUnionPart)
+	return c.setMergeCollect(keys, c.srv.store.SetSortedUnionPart,
+		func(realPrefix []byte, _ bool, view *f1raw.RepartView, target int, emit func([]byte)) bool {
+			return c.srv.store.SetSortedUnionMixed(realPrefix, view, target, emit)
+		})
 }
 
 // setMergeIntersectCard computes SINTERCARD's count through the sorted-hash merge when keys are
@@ -552,7 +672,7 @@ func (c *connState) setMergeUnion(keys [][]byte) ([][]byte, bool) {
 // size, and the command's LIMIT passes to each partition as an early-stop cap with the sum capped again
 // at LIMIT. A not-current partition aborts to the probe.
 func (c *connState) setMergeIntersectCard(keys [][]byte, limit int) (int, bool) {
-	p, lo, ok := c.setMergeEligible(keys)
+	plan, ok := c.setMergeEligible(keys)
 	if !ok {
 		return 0, false
 	}
@@ -563,6 +683,10 @@ func (c *connState) setMergeIntersectCard(keys [][]byte, limit int) (int, bool) 
 		}
 		return n
 	}
+	if plan.mixed {
+		return c.mergeIntersectCardMixed(plan, limit, capTo)
+	}
+	p, lo := plan.p, plan.lo
 	if p == 1 {
 		pa := setMergePrefix(keys[0], 0, 1)
 		pb := setMergePrefix(keys[1], 0, 1)
@@ -578,6 +702,34 @@ func (c *connState) setMergeIntersectCard(keys [][]byte, limit int) (int, bool) 
 		pa := setMergePrefix(keys[0], part, p)
 		pb := setMergePrefix(keys[1], part, p)
 		n, cur := c.srv.store.SetSortedIntersectCountPart(pa, pb, limit)
+		if !cur {
+			aborted.Store(true)
+			return
+		}
+		total.Add(int64(n))
+	})
+	if aborted.Load() {
+		return 0, false
+	}
+	return capTo(int(total.Load())), true
+}
+
+// mergeIntersectCardMixed counts SINTERCARD's intersection through the mixed-P merge: it builds the
+// smaller operand's re-partitioned view once, then fans the larger operand's p partitions across
+// workers, summing each target's disjoint count through SetSortedIntersectCountMixed with LIMIT as the
+// per-target early-stop cap and the sum capped again at LIMIT. It aborts to the probe if the view build
+// or any target reports not-current.
+func (c *connState) mergeIntersectCardMixed(plan mergePlan, limit int, capTo func(int) int) (int, bool) {
+	view, ok := c.buildRepartView(plan)
+	if !ok {
+		return 0, false
+	}
+	p := plan.p
+	var total atomic.Int64
+	var aborted atomic.Bool
+	c.fanPartitions(p, c.mergeFanWorkers(p, plan.lo), func(target int) {
+		realPrefix := setMergePrefix(plan.realKey, target, p)
+		n, cur := c.srv.store.SetSortedIntersectCountMixed(realPrefix, view, target, limit)
 		if !cur {
 			aborted.Store(true)
 			return
