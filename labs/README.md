@@ -27,6 +27,16 @@ Rules for a lab:
   memory-bound point-probe (SINTER), and a single walk beats two walks for a
   dedup-bound union (SUNION). Also: why a contaminated CPU profile blamed the
   wrong line.
+- [seteager](seteager/) — the follow-on to setintersect: if the merge needs the set
+  kept in hash order, what container keeps it ordered cheaply? A single flat sorted
+  array gives the best merge (5.8 ms) but an impossible ~90 us O(n) SADD; a skiplist
+  gives the cheapest write (83 ns) but a 183 ms merge because in-order pointer-chasing
+  throws away the sequential streaming the merge exists for. Per-partition sorted arrays
+  (f1raw's doc 19 layout, member in hash(m)&(P-1)) win both: an O(n/P) insert (205 ns at
+  P=256) and a merge identical to the single array (5.78 vs 5.80 ms) because two same-P
+  sets intersect partition-by-partition, which also makes the merge parallel across P
+  cores where the rivals run one thread. The SADD tax is folded off the reply path by the
+  async folder, keeping "eager" meaning always-materialized rather than built-on-read.
 - [setintersect](setintersect/) — the 2x lever for large symmetric SINTER is a
   sorted-hash merge, not a better probe. A two-pointer merge over two resident
   sorted arrays is ~3-5x faster than the random probe (12 ms vs 40 ms) because it
