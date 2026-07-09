@@ -209,6 +209,32 @@ func (c *connState) sunionEach(keys [][]byte, emit func([]byte) bool) {
 	}
 }
 
+// sunionEachRaw enumerates every source's members with no deduplication, for SUNIONSTORE. The store
+// path's insert already dedups through the destination index (PutKind reports isNew, and count, the
+// encoding fold and the sorted-hash buckets all advance only on a new member), so a member several
+// sources share is stored once whether or not the walk filters the duplicate first. sunionEach's
+// seen-set is therefore pure overhead on the store path: it hashes and stores every member into a
+// throwaway Go map sized to the union, an O(union) allocation and hash pass that dominated
+// SUNIONSTORE and grew worse with cardinality (the map rehashes as it fills). Dropping it hands the
+// raw concatenation straight to insert, which is the dedup the read form's map was duplicating.
+// Correctness rests on insert being idempotent per member, which it is. emit returns false to stop
+// early when insert hits a write error, the same stop signal sunionEach honors.
+func (c *connState) sunionEachRaw(keys [][]byte, emit func([]byte) bool) {
+	for _, k := range keys {
+		stop := false
+		c.setVecEach(k, func(m []byte) bool {
+			if !emit(m) {
+				stop = true
+				return false
+			}
+			return true
+		})
+		if stop {
+			return
+		}
+	}
+}
+
 // setMemberExists reports whether member is in set skey, routing the probe to the member's
 // partition when skey is partitioned (spec 2064/f1_rewrite_ltm/19 section 6.9). The
 // intersection and difference drivers probe non-driver sources one member at a time, and a
