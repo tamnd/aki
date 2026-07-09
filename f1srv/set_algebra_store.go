@@ -132,6 +132,15 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 	count := 0
 	enc := encNone
 	var writeErr error
+	// Collect each stored member as a (hash, offset) entry per destination partition so the sorted-hash
+	// order is folded once in bulk after the write (SortedHashBuild below), not one incremental fold per
+	// member. The per-member fold regrows the destination's flat sorted array O(k) times for an O(k^2)
+	// build, the cliff labs/setstorebuild isolates and the reason a STORE that spilled to the coll form
+	// collapsed against the rivals; the bulk build is one O(k log k) sort. buckets has one slot per
+	// destination partition, and an unpartitioned destination uses slot 0. The member hash is computed
+	// while m is in hand (it aliases arena or cursor scratch that a later member reuses), so only the
+	// uint64 hash and the offset are kept, never the member bytes.
+	buckets := make([][]f1raw.SortedHashEntry, destP)
 	insert := func(m []byte) bool {
 		var mk []byte
 		if destP > 1 {
@@ -148,9 +157,13 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 				// membership structure for the set type, so the store no longer touches the ordered
 				// index. After clearSetRows dropped the old vector the first stored member rebuilds it;
 				// each subsequent member appends. base is built into ppbuf, distinct from mk's kbuf;
-				// CollPartRandInsert sets its final byte.
+				// CollPartRandInsertOff sets its final byte and returns the member's arena offset for
+				// the bulk sorted-hash build.
 				base := c.partScanBase(dest)
-				c.srv.store.CollPartRandInsert(base, destP, part, mk, kindSetMember)
+				off, ok := c.srv.store.CollPartRandInsertOff(base, destP, part, mk, kindSetMember)
+				if ok {
+					buckets[part] = append(buckets[part], f1raw.SortedHashEntry{Hash: f1raw.MemberHash(m), Off: off})
+				}
 				count++
 			}
 			return true
@@ -162,11 +175,17 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 			return false
 		}
 		if isNew {
-			// Append the freshly-stored member to the destination's dense vector, the authoritative
-			// membership structure for the set type (spec 2064/f1_rewrite_ltm/20); the store no longer
-			// indexes members in the ordered index. The prefix is rebuilt per member into pbuf, distinct
-			// from mk's kbuf, and consumed synchronously, so it never collides with the member key.
-			c.srv.store.CollRandInsert(c.setPrefix(dest), mk, kindSetMember)
+			// Collect the freshly-stored member's offset for the two one-shot builds run after the write:
+			// the dense member vector (CollRandBulkBuild) and the sorted-hash order (SortedHashBuild). The
+			// store no longer inserts each member into the vector as it goes (CollRandInsertOff): rebuilding
+			// the reused destination's vector one add at a time paid a back-index map insert, a snapshot
+			// allocation, and an occasional slots doubling per member, and labs/setvecbuild shows folding the
+			// same offsets into one bulk build is 3-4x cheaper for a fraction of the allocations. MemberOff
+			// resolves the offset PutKind just wrote without touching the vector.
+			off, ok := c.srv.store.MemberOff(mk, kindSetMember)
+			if ok {
+				buckets[0] = append(buckets[0], f1raw.SortedHashEntry{Hash: f1raw.MemberHash(m), Off: off})
+			}
 			count++
 			enc = foldSetEnc(enc, m, uint64(count))
 		}
@@ -223,6 +242,42 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 		c.writeErr("ERR " + writeErr.Error())
 		return
 	}
+	// Build the unpartitioned destination's dense member vector in one pass from the offsets collected
+	// during the write, rather than the per-member vector insert the write dropped (see insert above).
+	// clearSetRows dropped the old vector, so this installs the fresh one; a lock-free draw sees no
+	// vector or the whole vector, never a partial. An empty result installs no vector, matching the
+	// header delete storePutHeader does for a zero count. Only the unpartitioned destination takes this
+	// path: a partitioned destination's per-partition vectors are still built through the descriptor by
+	// CollPartRandInsertOff in insert, which the bulk build does not replace.
+	if destP == 1 && len(buckets[0]) > 0 {
+		offs := make([]uint64, len(buckets[0]))
+		for i, e := range buckets[0] {
+			offs[i] = e.Off
+		}
+		c.srv.store.CollRandBulkBuild(c.setPrefix(dest), offs)
+	}
+	// Fold each destination partition's sorted-hash array in one bulk pass from the entries collected
+	// during the write, instead of the O(k^2) per-member incremental fold the write would otherwise
+	// have journaled. A partition that took members is built from them; a partition left empty (a STORE
+	// that emptied a previously-populated destination, or every member routing elsewhere) is reset so a
+	// destination reused across STOREs never folds a new result on top of the previous one's stale
+	// offsets. Both are no-ops when the fold facility is off. This runs under the destination's stripe
+	// lock, still held, so no concurrent reader sees a half-built order.
+	for part := 0; part < destP; part++ {
+		var prefix []byte
+		if destP > 1 {
+			base := c.partScanBase(dest)
+			base[len(base)-1] = byte(part)
+			prefix = base
+		} else {
+			prefix = c.setPrefix(dest)
+		}
+		if len(buckets[part]) == 0 {
+			c.srv.store.SortedHashReset(prefix)
+		} else {
+			c.srv.store.SortedHashBuild(prefix, buckets[part])
+		}
+	}
 	if err := c.storePutHeader(dest, count, enc, destP); err != nil {
 		unlock()
 		c.writeErr("ERR " + err.Error())
@@ -268,7 +323,10 @@ func (c *connState) cmdSInterStore(argv [][]byte) {
 // cmdSUnionStore stores the union of the sources into the destination and replies with its
 // cardinality.
 func (c *connState) cmdSUnionStore(argv [][]byte) {
-	c.storeAlgebra(argv, "sunionstore", c.sunionEach, c.setMergeUnion)
+	// The store path dedups through the destination index, so it walks the sources raw (sunionEachRaw)
+	// rather than the read form's seen-set (sunionEach): the map was re-deduplicating what insert already
+	// deduplicates, an O(union) allocation that made SUNIONSTORE the worst-scaling algebra store.
+	c.storeAlgebra(argv, "sunionstore", c.sunionEachRaw, c.setMergeUnion)
 }
 
 // cmdSDiffStore stores the difference of the first source minus the rest into the
