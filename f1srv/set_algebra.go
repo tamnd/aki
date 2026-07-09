@@ -577,10 +577,14 @@ func (c *connState) setMergeCollect(keys [][]byte, part func(pa, pb []byte, emit
 		return c.mergeCollectMixed(plan, mixed)
 	}
 	p, lo := plan.p, plan.lo
+	// lo is the smaller source's cardinality, an exact upper bound for intersect and diff and a close
+	// lower bound for union. Presizing the collect buffers to it (and to lo/p per partition) drops the
+	// growslice churn the SINTER profile charged at ~12% on the hot P=1 path, where every matched member
+	// otherwise reallocated the result slice from zero.
 	if p == 1 {
 		pa := setMergePrefix(keys[0], 0, 1)
 		pb := setMergePrefix(keys[1], 0, 1)
-		out := make([][]byte, 0)
+		out := make([][]byte, 0, lo)
 		if !part(pa, pb, func(m []byte) {
 			out = append(out, m)
 		}) {
@@ -588,12 +592,13 @@ func (c *connState) setMergeCollect(keys [][]byte, part func(pa, pb []byte, emit
 		}
 		return out, true
 	}
+	perPart := lo/p + 1
 	parts := make([][][]byte, p)
 	var aborted atomic.Bool
 	c.fanPartitions(p, c.mergeFanWorkers(p, lo), func(idx int) {
 		pa := setMergePrefix(keys[0], idx, p)
 		pb := setMergePrefix(keys[1], idx, p)
-		local := make([][]byte, 0)
+		local := make([][]byte, 0, perPart)
 		if !part(pa, pb, func(m []byte) {
 			local = append(local, m)
 		}) {
@@ -648,11 +653,12 @@ func (c *connState) mergeCollectMixed(plan mergePlan, mixed mixedPartFn) ([][]by
 		return nil, false
 	}
 	p := plan.p
+	perPart := plan.lo/p + 1
 	parts := make([][][]byte, p)
 	var aborted atomic.Bool
 	c.fanPartitions(p, c.mergeFanWorkers(p, plan.lo), func(target int) {
 		realPrefix := setMergePrefix(plan.realKey, target, p)
-		local := make([][]byte, 0)
+		local := make([][]byte, 0, perPart)
 		if !mixed(realPrefix, plan.bigIsA, view, target, func(m []byte) {
 			local = append(local, m)
 		}) {
