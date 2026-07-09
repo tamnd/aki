@@ -136,12 +136,34 @@ func (v *memberVec) publish() {
 	v.view.Store(&vecSlots{s: v.slots})
 }
 
+// ensureBack builds the offset-to-slot back index from slots when it is nil, which is how a
+// bulk-built vector arrives: CollRandBulkBuild fills slots in one dense pass and leaves back
+// unbuilt, because a set that is only read or drawn after a STORE never needs it (the draw path
+// reads slots alone, and SISMEMBER goes through the hash index, not the vector). back is the
+// writer's private structure touched only under the shard write lock, so the first mutation
+// (add/remove/retierSlot) materializes it here, once, and every later mutation finds it present.
+// Deferring it moves the whole k-entry map off the STORE hot path onto the rare first-SREM path:
+// building one large map per STORE is slower in wall-clock than the many tiny snapshot allocations
+// the per-member build made, even though it allocates far less, because a big map touches a large
+// region with poor locality and roots a big GC scan while the tiny allocations die young. A set
+// written and never mutated pays for the map never.
+func (v *memberVec) ensureBack() {
+	if v.back != nil {
+		return
+	}
+	v.back = make(map[uint64]int, len(v.slots))
+	for i, off := range v.slots {
+		v.back[off] = i
+	}
+}
+
 // add appends off as a new member and republishes the read snapshot. It is idempotent against
 // a duplicate offset: an offset is unique per live record and a re-added member is a fresh
 // record at a new offset, so a duplicate should never occur, but skipping one keeps a stray
 // double-call from corrupting the density invariant rather than silently biasing the draw
 // toward the doubled member.
 func (v *memberVec) add(off uint64) {
+	v.ensureBack()
 	if _, ok := v.back[off]; ok {
 		return
 	}
@@ -172,6 +194,7 @@ func (v *memberVec) add(off uint64) {
 // SREM and SRANDMEMBER against one key have under Redis's arbitrary cross-client order, and the
 // returned offset still resolves to valid arena bytes.
 func (v *memberVec) remove(off uint64) bool {
+	v.ensureBack()
 	i, ok := v.back[off]
 	if !ok {
 		return false
@@ -202,6 +225,7 @@ func (v *memberVec) remove(off uint64) bool {
 // bytes. It reports false when oldOff is absent, which a racing SREM that already dropped the member
 // produces and the caller treats as nothing to repair.
 func (v *memberVec) retierSlot(oldOff, newOff uint64) bool {
+	v.ensureBack()
 	i, ok := v.back[oldOff]
 	if !ok {
 		return false
@@ -392,18 +416,7 @@ func (s *Store) deriveOnFirstDraw(prefix []byte) *memberVec {
 // caller-passed offset, so a member removed by a concurrent writer resolves to not-found and
 // is not recorded.
 func (s *Store) CollRandInsert(prefix, key []byte, kind byte) {
-	sh := s.rvec.shardFor(prefix)
-	sh.mu.Lock()
-	v := sh.get(prefix)
-	if v == nil {
-		v = s.deriveOnFirstDraw(prefix)
-		sh.put(prefix, v)
-	}
-	off, _, _, _, found := s.find(key, hash(key), kind)
-	if found {
-		v.add(off)
-	}
-	sh.mu.Unlock()
+	off, found := s.CollRandInsertOff(prefix, key, kind)
 	// Journal the add for the sorted-hash fold (sorthashfold.go) once the offset is known, off the
 	// vector's shard lock so a hot SADD does not pay the journal append under the lock a concurrent
 	// draw contends. The hash is over the member bytes alone, key[len(prefix):], not the composite
@@ -413,6 +426,72 @@ func (s *Store) CollRandInsert(prefix, key []byte, kind byte) {
 	if found && s.shOn.Load() && len(key) >= len(prefix) {
 		s.shAppend(prefix, hash(key[len(prefix):]), off, true)
 	}
+}
+
+// CollRandInsertOff is CollRandInsert's vector insert without the sorted-hash journal, returning the
+// member's resolved arena offset and whether the record was found. A caller doing a bulk sorted-hash
+// build (SortedHashBuild) uses this to add the member to the dense vector and record the offset
+// itself, then folds the whole set in one pass instead of paying a per-member incremental fold, so a
+// SINTERSTORE that writes k members builds the destination's sorted order once rather than k times
+// (the O(k^2) cliff labs/setstorebuild isolates). CollRandInsert is exactly this plus one shAppend, so
+// the two share the vector insert and a member added either way lands at the same offset. Call it under
+// the set's stripe lock, right after PutKind reports a newly-created member.
+func (s *Store) CollRandInsertOff(prefix, key []byte, kind byte) (off uint64, found bool) {
+	sh := s.rvec.shardFor(prefix)
+	sh.mu.Lock()
+	v := sh.get(prefix)
+	if v == nil {
+		v = s.deriveOnFirstDraw(prefix)
+		sh.put(prefix, v)
+	}
+	off, _, _, _, found = s.find(key, hash(key), kind)
+	if found {
+		v.add(off)
+	}
+	sh.mu.Unlock()
+	return off, found
+}
+
+// MemberOff resolves the arena offset of the record under key in the given kind namespace, reporting
+// false when no such record exists. It is the offset half of CollRandInsertOff without the vector
+// insert, for a STORE that collects every stored member's offset to seed one bulk vector build
+// (CollRandBulkBuild) and one bulk sorted-hash build (SortedHashBuild) after the write, rather than
+// inserting each member into the vector as it goes. Call it right after PutKind reports a newly-created
+// member, under the set's stripe lock, so the offset names the record PutKind just wrote.
+func (s *Store) MemberOff(key []byte, kind byte) (off uint64, ok bool) {
+	off, _, _, _, ok = s.find(key, hash(key), kind)
+	return off, ok
+}
+
+// CollRandBulkBuild installs the whole dense member vector for prefix from offs in one pass, for a
+// caller that just materialized a set's entire membership and holds every member's arena offset (the
+// STORE forms, which collect each stored member's offset for the bulk sorted-hash build and hand the
+// same offsets here). It replaces the k separate CollRandInsertOff calls a k-member STORE into a reused
+// destination would otherwise make: clearSetRows drops the destination's old vector, so the first insert
+// would rebuild a fresh one from empty and every insert would append through memberVec.add, paying a
+// back-index map insert, a snapshot allocation (publish, once per add), and an occasional slots doubling
+// per member. This sizes slots to len(offs) once, copies them in a single append, and publishes the
+// snapshot a single time. The back index is left nil: it is only read by the mutation paths
+// (add/remove/retierSlot), never by any draw or membership read, so a fresh STORE destination that is
+// only ever drawn or re-cleared never pays for it, and the first mutation materializes it lazily through
+// ensureBack. That drops both the per-member work of the incremental build and the whole-map
+// construction a size-hinted bulk map would still cost, which at large cardinalities dominated: a big
+// map roots a wide GC scan and touches memory with poor locality, so building it eagerly was slower than
+// the per-member adds it replaced. offs must be the set's live members with no duplicates (the store
+// appends an offset only for a newly-created member); duplicates would double a slot and break the
+// density invariant when ensureBack later rebuilds back. Call it under the set's stripe lock after
+// clearSetRows dropped any prior vector; it installs the vector by the same copy-on-write map swap put
+// uses, so a concurrent lock-free draw loads either no vector or the fully-built one, never a partial. A
+// caller with an empty result does not call this: an empty set has no vector, matching the header delete
+// storePutHeader does for a zero count.
+func (s *Store) CollRandBulkBuild(prefix []byte, offs []uint64) {
+	v := &memberVec{slots: make([]uint64, 0, len(offs))}
+	v.slots = append(v.slots, offs...)
+	v.publish()
+	sh := s.rvec.shardFor(prefix)
+	sh.mu.Lock()
+	sh.put(prefix, v)
+	sh.mu.Unlock()
 }
 
 // CollRandRemove drops a member from the set's dense vector, if the vector exists, and
