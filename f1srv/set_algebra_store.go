@@ -90,7 +90,14 @@ func (c *connState) clearSetRows(skey []byte) {
 // every source, rejects a source held by a plain string, computes the result with the given
 // iterator, writes it into the destination as a fresh set, and replies with the stored
 // cardinality. each is sinterEach/sunionEach/sdiffEach; only the iterator differs.
-func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]byte, func([]byte) bool)) {
+//
+// merge is the sorted-hash merge form of the same operation (setMergeIntersect/setMergeDiff/
+// setMergeUnion): when it engages it returns the whole result as arena-stable subslices before any
+// destination mutation, which the store then clears the destination and writes, exactly as the aliased
+// buffered path does. It engages only for the eligible two-source same-P shapes and returns false
+// otherwise, so the each fallback still handles every other shape. The store holds all sources' stripe
+// locks, so the merge's synchronous fold and read are current.
+func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]byte, func([]byte) bool), merge func([][]byte) ([][]byte, bool)) {
 	// <CMD> destination key [key ...]
 	if len(argv) < 3 {
 		c.writeErr("ERR wrong number of arguments for '" + cmdName + "' command")
@@ -166,30 +173,50 @@ func (c *connState) storeAlgebra(argv [][]byte, cmdName string, each func([][]by
 		return true
 	}
 
-	if aliased {
-		// Buffer the arena-stable result before touching the destination: the destination is
-		// one of the sources, so clearing it first would corrupt the cursor reading it. The
-		// buffered members survive the clear because a delete frees only index slots. Size the
-		// buffer to the summed source cardinalities, the upper bound for any of the three set
-		// operations, so the append does not double and re-copy as members land.
-		out := make([][]byte, 0, algebraBufCap(c.summedCard(keys)))
-		each(keys, func(m []byte) bool {
-			out = append(out, m)
-			return true
-		})
-		c.srv.store.Delete(dest)
-		c.clearSetRows(dest)
-		for _, m := range out {
-			if !insert(m) {
-				break
+	handled := false
+	if merge != nil {
+		// The sorted-hash merge yields the whole result as arena-stable subslices before any
+		// destination write, so it subsumes the aliased case: clear the destination (the buffered
+		// members survive a delete that frees only index slots) and insert the buffer. It engages
+		// only for the eligible two-source same-P shapes; otherwise ok is false and the each
+		// fallback below runs.
+		if merged, ok := merge(keys); ok {
+			c.srv.store.Delete(dest)
+			c.clearSetRows(dest)
+			for _, m := range merged {
+				if !insert(m) {
+					break
+				}
 			}
+			handled = true
 		}
-	} else {
-		// The destination is not a source, so stream the result straight in: peak memory is k
-		// cursors plus one member in hand even for a result of millions of members.
-		c.srv.store.Delete(dest)
-		c.clearSetRows(dest)
-		each(keys, insert)
+	}
+	if !handled {
+		if aliased {
+			// Buffer the arena-stable result before touching the destination: the destination is
+			// one of the sources, so clearing it first would corrupt the cursor reading it. The
+			// buffered members survive the clear because a delete frees only index slots. Size the
+			// buffer to the summed source cardinalities, the upper bound for any of the three set
+			// operations, so the append does not double and re-copy as members land.
+			out := make([][]byte, 0, algebraBufCap(c.summedCard(keys)))
+			each(keys, func(m []byte) bool {
+				out = append(out, m)
+				return true
+			})
+			c.srv.store.Delete(dest)
+			c.clearSetRows(dest)
+			for _, m := range out {
+				if !insert(m) {
+					break
+				}
+			}
+		} else {
+			// The destination is not a source, so stream the result straight in: peak memory is k
+			// cursors plus one member in hand even for a result of millions of members.
+			c.srv.store.Delete(dest)
+			c.clearSetRows(dest)
+			each(keys, insert)
+		}
 	}
 	if writeErr != nil {
 		unlock()
@@ -235,17 +262,17 @@ func (c *connState) storePutHeader(dest []byte, count int, enc byte, p int) erro
 // cmdSInterStore stores the intersection of the sources into the destination and replies
 // with its cardinality.
 func (c *connState) cmdSInterStore(argv [][]byte) {
-	c.storeAlgebra(argv, "sinterstore", c.sinterEach)
+	c.storeAlgebra(argv, "sinterstore", c.sinterEach, c.setMergeIntersect)
 }
 
 // cmdSUnionStore stores the union of the sources into the destination and replies with its
 // cardinality.
 func (c *connState) cmdSUnionStore(argv [][]byte) {
-	c.storeAlgebra(argv, "sunionstore", c.sunionEach)
+	c.storeAlgebra(argv, "sunionstore", c.sunionEach, c.setMergeUnion)
 }
 
 // cmdSDiffStore stores the difference of the first source minus the rest into the
 // destination and replies with its cardinality.
 func (c *connState) cmdSDiffStore(argv [][]byte) {
-	c.storeAlgebra(argv, "sdiffstore", c.sdiffEach)
+	c.storeAlgebra(argv, "sdiffstore", c.sdiffEach, c.setMergeDiff)
 }

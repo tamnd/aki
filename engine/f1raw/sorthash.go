@@ -358,3 +358,59 @@ func diffEmit(a, b *sortedSnap, confirm confirmFunc, emit func(offA uint64)) {
 		j = jend
 	}
 }
+
+// unionEmit walks two ascending snapshots and calls emitA/emitB with the A-side or B-side offset of
+// every distinct member across both, in the merged ascending hash order. It is the SUNION(A, B) merge
+// over one partition pair. Every A member is in the union, so each is emitted through emitA. A B member
+// is emitted through emitB only when no A member in its equal-hash run byte-confirms equal to it, so a
+// member both sets hold is emitted once (from A) and a bare hash collision keeps both distinct members.
+// Two side callbacks rather than one let the caller resolve an A offset against A's prefix length and a
+// B offset against B's, which differ whenever the two sets have different key lengths. The merge streams
+// both arrays sequentially with no per-member hashmap, which is the win over the seen-set probe form that
+// pays an O(union) dictionary insert per member.
+func unionEmit(a, b *sortedSnap, confirm confirmFunc, emitA, emitB func(off uint64)) {
+	i, j := 0, 0
+	na, nb := len(a.h), len(b.h)
+	for i < na && j < nb {
+		switch {
+		case a.h[i] < b.h[j]:
+			emitA(a.off[i])
+			i++
+		case a.h[i] > b.h[j]:
+			emitB(b.off[j])
+			j++
+		default:
+			hv := a.h[i]
+			iend := i
+			for iend < na && a.h[iend] == hv {
+				iend++
+			}
+			jend := j
+			for jend < nb && b.h[jend] == hv {
+				jend++
+			}
+			for x := i; x < iend; x++ {
+				emitA(a.off[x])
+			}
+			for y := j; y < jend; y++ {
+				matched := false
+				for x := i; x < iend; x++ {
+					if confirm(a.off[x], b.off[y]) {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					emitB(b.off[y])
+				}
+			}
+			i, j = iend, jend
+		}
+	}
+	for ; i < na; i++ {
+		emitA(a.off[i])
+	}
+	for ; j < nb; j++ {
+		emitB(b.off[j])
+	}
+}

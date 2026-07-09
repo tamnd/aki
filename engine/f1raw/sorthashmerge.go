@@ -104,3 +104,65 @@ func (s *Store) SetSortedIntersectCountPart(prefixA, prefixB []byte, limit int) 
 	g.unpin()
 	return n, true
 }
+
+// SetSortedDiffPart runs the two-pointer difference over one partition pair and calls emit with each
+// member of A not present in B (byte-confirmed), in A's ascending hash order. It mirrors
+// SetSortedIntersectPart: same currency gate, same snapshot load, same epoch pin, but the inner loop is
+// diffEmit. Every emitted member comes from the A operand, so it resolves against prefixA's length. It
+// reports false when either partition's array is not current, so the caller falls back to the probe.
+func (s *Store) SetSortedDiffPart(prefixA, prefixB []byte, emit func(member []byte)) bool {
+	if !s.SortedHashCurrent(prefixA) || !s.SortedHashCurrent(prefixB) {
+		return false
+	}
+	a := s.SortedHashSnapshot(prefixA)
+	b := s.SortedHashSnapshot(prefixB)
+	if a == nil || b == nil {
+		return false
+	}
+	la := len(prefixA)
+	confirm := s.sortedMergeConfirm(la, len(prefixB))
+	g := s.pinTiered()
+	diffEmit(a, b, confirm, func(offA uint64) {
+		k := s.keyAtTiered(offA, nil)
+		if len(k) >= la {
+			emit(k[la:])
+		}
+	})
+	g.unpin()
+	return true
+}
+
+// SetSortedUnionPart runs the two-pointer union over one partition pair and calls emit with each
+// distinct member across both, in merged ascending hash order. It mirrors SetSortedIntersectPart but
+// the inner loop is unionEmit, which yields members from both operands: an A member resolves against
+// prefixA's length and a B-only member against prefixB's, since the two prefixes differ whenever the
+// sets have different key lengths. It reports false when either partition's array is not current, so
+// the caller falls back to the seen-set probe.
+func (s *Store) SetSortedUnionPart(prefixA, prefixB []byte, emit func(member []byte)) bool {
+	if !s.SortedHashCurrent(prefixA) || !s.SortedHashCurrent(prefixB) {
+		return false
+	}
+	a := s.SortedHashSnapshot(prefixA)
+	b := s.SortedHashSnapshot(prefixB)
+	if a == nil || b == nil {
+		return false
+	}
+	la, lb := len(prefixA), len(prefixB)
+	confirm := s.sortedMergeConfirm(la, lb)
+	g := s.pinTiered()
+	unionEmit(a, b, confirm,
+		func(offA uint64) {
+			k := s.keyAtTiered(offA, nil)
+			if len(k) >= la {
+				emit(k[la:])
+			}
+		},
+		func(offB uint64) {
+			k := s.keyAtTiered(offB, nil)
+			if len(k) >= lb {
+				emit(k[lb:])
+			}
+		})
+	g.unpin()
+	return true
+}

@@ -438,16 +438,19 @@ func (c *connState) fanPartitions(p int, fn func(part int)) {
 	wg.Wait()
 }
 
-// setMergeIntersect computes SINTER's result through the sorted-hash merge when keys are eligible,
-// returning the shared members and true, or nil and false to fall back to the probe. It forces a
-// synchronous fold so the arrays reflect every SADD/SREM (the caller holds the stripe locks, so no new
-// write can land after the sync), then runs the per-partition two-pointer merge: one pair for an
-// unpartitioned set, one pair per partition fanned across workers for a partitioned one. A partition
-// whose array is not current (which the held locks make unexpected) aborts the whole merge back to the
-// probe rather than return a partial result. Each partition's members go into its own buffer so the
-// fan-out never races on a shared slice, and the buffers concatenate into the result. The members are
-// arena-stable subslices, valid after the merge returns.
-func (c *connState) setMergeIntersect(keys [][]byte) ([][]byte, bool) {
+// setMergeCollect runs a two-source per-partition merge emitter across the shared partition count and
+// concatenates the members it yields, or returns nil and false to fall back to the probe. It is the
+// shared body of the intersect, diff, and union drivers, which differ only in the engine method they
+// pass as part (SetSortedIntersectPart/SetSortedDiffPart/SetSortedUnionPart): each appends its
+// partition's members to the buffer it is given and returns false when that partition's array is not
+// current. setMergeCollect forces a synchronous fold so the arrays reflect every SADD/SREM (the caller
+// holds the stripe locks, so no new write can land after the sync), then runs part once for an
+// unpartitioned set or once per partition fanned across workers for a partitioned one. A not-current
+// partition (which the held locks make unexpected) aborts the whole merge back to the probe rather than
+// return a partial result. Each partition's members go into its own buffer so the fan-out never races on
+// a shared slice, and the buffers concatenate into the result. The members are arena-stable subslices,
+// valid after the merge returns.
+func (c *connState) setMergeCollect(keys [][]byte, part func(pa, pb []byte, emit func([]byte)) bool) ([][]byte, bool) {
 	p, ok := c.setMergeEligible(keys)
 	if !ok {
 		return nil, false
@@ -457,7 +460,7 @@ func (c *connState) setMergeIntersect(keys [][]byte) ([][]byte, bool) {
 		pa := setMergePrefix(keys[0], 0, 1)
 		pb := setMergePrefix(keys[1], 0, 1)
 		out := make([][]byte, 0)
-		if !c.srv.store.SetSortedIntersectPart(pa, pb, func(m []byte) {
+		if !part(pa, pb, func(m []byte) {
 			out = append(out, m)
 		}) {
 			return nil, false
@@ -466,17 +469,17 @@ func (c *connState) setMergeIntersect(keys [][]byte) ([][]byte, bool) {
 	}
 	parts := make([][][]byte, p)
 	var aborted atomic.Bool
-	c.fanPartitions(p, func(part int) {
-		pa := setMergePrefix(keys[0], part, p)
-		pb := setMergePrefix(keys[1], part, p)
+	c.fanPartitions(p, func(idx int) {
+		pa := setMergePrefix(keys[0], idx, p)
+		pb := setMergePrefix(keys[1], idx, p)
 		local := make([][]byte, 0)
-		if !c.srv.store.SetSortedIntersectPart(pa, pb, func(m []byte) {
+		if !part(pa, pb, func(m []byte) {
 			local = append(local, m)
 		}) {
 			aborted.Store(true)
 			return
 		}
-		parts[part] = local
+		parts[idx] = local
 	})
 	if aborted.Load() {
 		return nil, false
@@ -490,6 +493,28 @@ func (c *connState) setMergeIntersect(keys [][]byte) ([][]byte, bool) {
 		out = append(out, pp...)
 	}
 	return out, true
+}
+
+// setMergeIntersect computes SINTER's result through the sorted-hash merge when keys are eligible,
+// returning the shared members and true, or nil and false to fall back to the smallest-source probe.
+func (c *connState) setMergeIntersect(keys [][]byte) ([][]byte, bool) {
+	return c.setMergeCollect(keys, c.srv.store.SetSortedIntersectPart)
+}
+
+// setMergeDiff computes SDIFF's result (the first source minus the second) through the sorted-hash
+// merge when keys are eligible, returning the surviving members and true, or nil and false to fall back
+// to the probe. SDIFF is not commutative, so the driver always treats keys[0] as A and keys[1] as B, the
+// same order the engine's diffEmit assumes.
+func (c *connState) setMergeDiff(keys [][]byte) ([][]byte, bool) {
+	return c.setMergeCollect(keys, c.srv.store.SetSortedDiffPart)
+}
+
+// setMergeUnion computes SUNION's result through the sorted-hash merge when keys are eligible, returning
+// the distinct union and true, or nil and false to fall back to the seen-set probe. The merge streams
+// both sorted arrays with no O(union) dictionary, which is the win over the probe form's per-member map
+// insert.
+func (c *connState) setMergeUnion(keys [][]byte) ([][]byte, bool) {
+	return c.setMergeCollect(keys, c.srv.store.SetSortedUnionPart)
 }
 
 // setMergeIntersectCard computes SINTERCARD's count through the sorted-hash merge when keys are
@@ -597,6 +622,14 @@ func (c *connState) cmdSDiff(argv [][]byte) {
 		c.writeErr(wrongType)
 		return
 	}
+	if merged, ok := c.setMergeDiff(keys); ok {
+		c.writeArrayHeader(len(merged))
+		for _, m := range merged {
+			c.writeBulk(m)
+		}
+		unlock()
+		return
+	}
 	out := make([][]byte, 0)
 	c.sdiffEach(keys, func(m []byte) bool {
 		out = append(out, m)
@@ -628,6 +661,14 @@ func (c *connState) cmdSUnion(argv [][]byte) {
 	if c.anyStringConflict(keys) {
 		unlock()
 		c.writeErr(wrongType)
+		return
+	}
+	if merged, ok := c.setMergeUnion(keys); ok {
+		c.writeArrayHeader(len(merged))
+		for _, m := range merged {
+			c.writeBulk(m)
+		}
+		unlock()
 		return
 	}
 	out := make([][]byte, 0, algebraBufCap(c.summedCard(keys)))
