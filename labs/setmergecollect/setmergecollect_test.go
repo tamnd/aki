@@ -131,6 +131,34 @@ func collectPresize(a *arena) [][]byte {
 	return out
 }
 
+// collectReuse is the second change on this same path: the result slice is not allocated per command at
+// all. The connection owns one scratch buffer that a command resets to length zero and grows to lo once,
+// then every later SINTER/SDIFF/SUNION on that connection reuses it, so the steady state runs zero
+// allocations. The caller frames the collected members into the reply (or inserts them into a STORE
+// destination) and drops the slice before the next command, and a connection runs one command at a time,
+// so the reuse is safe with the same arena-stable subslices. scratch models that per-connection buffer:
+// the benchmark hands the same backing slice back each iteration, which is exactly the live reuse.
+func collectReuse(a *arena, scratch [][]byte) [][]byte {
+	out := scratch[:0]
+	if cap(out) < a.lo {
+		out = make([][]byte, 0, a.lo)
+	}
+	i, j := 0, 0
+	for i < len(a.sortedA) && j < len(a.sortedB) {
+		switch {
+		case a.sortedA[i] < a.sortedB[j]:
+			i++
+		case a.sortedA[i] > a.sortedB[j]:
+			j++
+		default:
+			out = append(out, a.members[a.sortedA[i]])
+			i++
+			j++
+		}
+	}
+	return out
+}
+
 // cardinalities brackets the gate's set sizes: 128 (the merge floor), 256 (the profiled dip), and the
 // larger sizes the fanned-partition path takes.
 var cardinalities = []int{128, 256, 512, 1024, 4096}
@@ -160,6 +188,24 @@ func BenchmarkCollectPresize(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				sink = len(collectPresize(a))
+			}
+		})
+	}
+}
+
+// BenchmarkCollectReuse measures the reuse collect at each cardinality against a persistent scratch
+// buffer: after the first iteration grows it to lo it should report zero allocs/op, the whole point of
+// the change, and a ns/op at or below BenchmarkCollectPresize since it also skips the single make.
+func BenchmarkCollectReuse(b *testing.B) {
+	for _, n := range cardinalities {
+		a := buildArena(n, 0x5eed+uint64(n))
+		b.Run("n="+strconv.Itoa(n), func(b *testing.B) {
+			var scratch [][]byte
+			b.ReportAllocs()
+			for b.Loop() {
+				out := collectReuse(a, scratch)
+				scratch = out
+				sink = len(out)
 			}
 		})
 	}
@@ -223,6 +269,16 @@ func TestCollectAgree(t *testing.T) {
 		}
 		if got := len(collectPresize(a)); got != want {
 			t.Fatalf("n=%d: presize = %d, want %d", n, got, want)
+		}
+		// The reuse collect must agree both on a fresh scratch (first command on a connection) and on a
+		// scratch already grown by a prior command (steady state), the two states the live buffer takes.
+		var scratch [][]byte
+		first := collectReuse(a, scratch)
+		if got := len(first); got != want {
+			t.Fatalf("n=%d: reuse (fresh) = %d, want %d", n, got, want)
+		}
+		if got := len(collectReuse(a, first)); got != want {
+			t.Fatalf("n=%d: reuse (warm) = %d, want %d", n, got, want)
 		}
 	}
 }

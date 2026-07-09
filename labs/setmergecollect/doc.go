@@ -33,8 +33,10 @@
 // appending each match into a result slice built two ways.
 //
 //   - collectGrow: out := make([][]byte, 0), the pre-change buffer that grows from zero.
-//   - collectPresize: out := make([][]byte, 0, lo), the post-change buffer sized from the smaller
-//     cardinality.
+//   - collectPresize: out := make([][]byte, 0, lo), the presize buffer sized from the smaller
+//     cardinality, one allocation per command.
+//   - collectReuse: out := scratch[:0], grown to lo once and then reused, the connection-owned buffer
+//     that allocates on no command after the first.
 //
 // Both emit the members as []byte subslices of one arena, so the benchmark captures the pointer append
 // and slice growth the live path pays, not member materialization (which is identical either way). The
@@ -50,4 +52,18 @@
 // 4096 members the grow path pays ~11 doublings and copies ~2048 pointers, all of which the single
 // presized allocation avoids. The parallel benchmark runs the collect under GOMAXPROCS workers, each on
 // its own arrays, to show the saving holds under the fanned-partition regime the larger sets take.
+//
+// # The second lever: reuse over presize
+//
+// Presize made the collect one allocation per command, but a SINTER-256 CPU profile on the goroutine net
+// then charged that one make([][]byte, 0, lo) at ~10% of the whole command: 256 slice headers is a
+// scanned-heap allocation the garbage collector must walk, and at the gate's command rate that is real
+// mallocgc and memclr time on the hot path. collectReuse removes it. The connection owns one merge
+// scratch slice; a command resets it to length zero and only allocates when the smaller source is larger
+// than the current capacity, so after the first SINTER on a connection the collect allocates nothing.
+// The returned members are framed into the reply (or inserted into a STORE destination) and dropped
+// before the next command, and one connection runs one command at a time, so the buffer is never live
+// across two merges and reuse is safe with the same arena-stable subslices. BenchmarkCollectReuse should
+// report zero allocs/op in steady state and a ns/op at or under the presize bench, the make itself now
+// gone from the per-command cost.
 package setmergecollect
