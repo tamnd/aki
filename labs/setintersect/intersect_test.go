@@ -8,6 +8,18 @@ import (
 	"testing"
 )
 
+// encodeBulk appends one RESP bulk string for m, the model of f1srv's writeBulk:
+// a "$<len>\r\n" header (with the strconv the real one runs) plus the payload. A
+// SINTER on two 1<<20 half-overlapping sets returns ~1M of these, so at the bench
+// scale the reply is a multi-MB serialization, not a rounding error next to the probe.
+func encodeBulk(dst, m []byte) []byte {
+	dst = append(dst, '$')
+	dst = strconv.AppendInt(dst, int64(len(m)), 10)
+	dst = append(dst, '\r', '\n')
+	dst = append(dst, m...)
+	return append(dst, '\r', '\n')
+}
+
 // This lab measures the SINTER inner loop three ways to settle a first-principles
 // question: is aki's global-composite-index probe (what f1srv does today) the reason
 // SINTER lags, and does a purpose-built compact fingerprint table over the non-driver
@@ -315,5 +327,64 @@ func BenchmarkCompactFingerprintProbeOnly(b *testing.B) {
 			}
 		}
 		sink = n
+	}
+}
+
+// sinkReply keeps the encoded reply buffer live so the compiler cannot drop the encode.
+var sinkReply int
+
+// BenchmarkFullSInter is the whole command the way f1srv runs it: probe every driver
+// member into the shared index, buffer the ~1M hits, then serialize them as a RESP
+// array. The gap against BenchmarkGlobalProbe (probe only, same index) is the reply
+// encode, and that split is the point of this benchmark. If the encode is the larger
+// half, the SINTER 2x lever is the multi-bulk reply path, not the probe structure that
+// the rest of this lab already showed is near its memory-bound floor.
+func BenchmarkFullSInter(b *testing.B) {
+	a, bset := intersectFixture()
+	g := newGlobalIndex([][][]byte{bset}, 0)
+	skeyB := []byte("set:0")
+	buf := make([][]byte, 0, labN)
+	out := make([]byte, 0, labN*16)
+	for b.Loop() {
+		buf = buf[:0]
+		for _, m := range a {
+			if g.exists(skeyB, m) {
+				buf = append(buf, m)
+			}
+		}
+		out = out[:0]
+		out = append(out, '*')
+		out = strconv.AppendInt(out, int64(len(buf)), 10)
+		out = append(out, '\r', '\n')
+		for _, m := range buf {
+			out = encodeBulk(out, m)
+		}
+		sink = len(buf)
+		sinkReply = len(out)
+	}
+}
+
+// BenchmarkEncodeOnly isolates just the reply serialization over an already-known
+// ~1M-member result, so the encode cost stands alone next to BenchmarkGlobalProbe.
+func BenchmarkEncodeOnly(b *testing.B) {
+	a, bset := intersectFixture()
+	g := newGlobalIndex([][][]byte{bset}, 0)
+	skeyB := []byte("set:0")
+	result := make([][]byte, 0, labN)
+	for _, m := range a {
+		if g.exists(skeyB, m) {
+			result = append(result, m)
+		}
+	}
+	out := make([]byte, 0, labN*16)
+	for b.Loop() {
+		out = out[:0]
+		out = append(out, '*')
+		out = strconv.AppendInt(out, int64(len(result)), 10)
+		out = append(out, '\r', '\n')
+		for _, m := range result {
+			out = encodeBulk(out, m)
+		}
+		sinkReply = len(out)
 	}
 }
