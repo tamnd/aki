@@ -396,6 +396,18 @@ const (
 	// clear win and not a coin-flip that adds dispatch variance for no gain. The driver estimates the
 	// per-partition count as the smaller source's cardinality divided by P.
 	setFanOutFloor = 128
+	// setAlgebraOffloadFloor is the larger source cardinality at or above which a multi-source
+	// set-algebra read hands itself off the epoll reactor loop to a park goroutine (offloadSetAlgebra).
+	// Below it the compute is cheap enough that the inline path on the loop beats the handoff's
+	// goroutine spawn and two epoll interest re-arms. At or above it the inline compute plus the large
+	// multibulk reply write stall the loop long enough to starve the other connections it serves, which
+	// is where the inline reactor SINTER dipped to 0.62x of Redis at the 256-member size while flat SET
+	// held 2.74x; the handoff moves that work onto a goroutine the Go scheduler spreads across cores so
+	// the loop stays responsive and the algebra parallelizes. The threshold matches setMergeFloor's
+	// larger neighbour: it sits at the size where the reply grew past the loop's tolerance in the gate
+	// profile, and it gates on cardinality rather than reply bytes so SINTERCARD, whose reply is a single
+	// integer but whose compute is just as heavy, offloads too.
+	setAlgebraOffloadFloor = 256
 )
 
 // setMergePrefix builds the sorted-array registry prefix for one partition of set skey, matching the
@@ -795,6 +807,47 @@ func (c *connState) mergeIntersectCardMixed(plan mergePlan, limit int, capTo fun
 	return capTo(int(total.Load())), true
 }
 
+// offloadSetAlgebra hands a heavy multi-source set-algebra read off the epoll reactor loop to a park
+// goroutine when the connection is being driven by the loop itself. The reactor drains every command in
+// a batch inline on the loop goroutine, so a large SINTER/SUNION/SDIFF/SINTERCARD runs its compute and
+// writes its multibulk reply on the loop, stalling the loop long enough to starve the other connections
+// it serves; that is where the inline reactor SINTER dipped to 0.62x of Redis at the 256-member size
+// while flat SET (a tiny reply) held 2.74x. Reusing the blocking-command park facility, begin flushes
+// any pipelined replies, disarms reads on this connection, and reruns the command on a dedicated
+// goroutine the Go scheduler spreads across cores, so the loop stays responsive and the algebra
+// parallelizes. rerun must close over a dup of argv because the reactor reuses the read buffer once the
+// loop resumes.
+//
+// It offloads only on the loop's own pass (blockable false): the rerun runs with blockable true, so the
+// re-entrant call falls through here and executes inline on the park goroutine, and the goroutine net
+// driver (blockable always true, park nil) never offloads at all. The gate is a cheap unlocked O(P)
+// cardinality read per source, a heuristic for "is this reply/compute big enough to be worth the two
+// epoll interest re-arms and the goroutine spawn"; being racy is fine because it only steers the command
+// between two correct execution paths.
+func (c *connState) offloadSetAlgebra(keys [][]byte, rerun func()) bool {
+	if c.blockable || c.park == nil || !c.srv.setAlgebraOffload {
+		return false
+	}
+	if !c.setAlgebraHeavy(keys) {
+		return false
+	}
+	c.park.begin(rerun)
+	return true
+}
+
+// setAlgebraHeavy reports whether any source set is large enough that running the read inline on the
+// reactor loop would stall it. It gates on cardinality rather than reply bytes so SINTERCARD, whose
+// reply is a single integer but whose compute is just as heavy as SINTER's, offloads too. setCard is the
+// same unlocked atomic O(P) read setMergeEligible uses, safe to call here without the stripe locks.
+func (c *connState) setAlgebraHeavy(keys [][]byte) bool {
+	for _, k := range keys {
+		if c.setCard(k) >= setAlgebraOffloadFloor {
+			return true
+		}
+	}
+	return false
+}
+
 // cmdSInter answers SINTER by buffering the members present in every source (arena-stable subslices)
 // and framing the reply from the buffer length. It deliberately buffers rather than streaming each
 // member into the reply as it is found: SINTER's cost is almost entirely the point-probe into the
@@ -811,6 +864,9 @@ func (c *connState) cmdSInter(argv [][]byte) {
 		return
 	}
 	keys := argv[1:]
+	if c.offloadSetAlgebra(keys, func() { c.cmdSInter(dupArgv(argv)) }) {
+		return
+	}
 	unlock := c.lockStripes(keys)
 	if c.anyStringConflict(keys) {
 		unlock()
@@ -849,6 +905,9 @@ func (c *connState) cmdSDiff(argv [][]byte) {
 		return
 	}
 	keys := argv[1:]
+	if c.offloadSetAlgebra(keys, func() { c.cmdSDiff(dupArgv(argv)) }) {
+		return
+	}
 	unlock := c.lockStripes(keys)
 	if c.anyStringConflict(keys) {
 		unlock()
@@ -890,6 +949,9 @@ func (c *connState) cmdSUnion(argv [][]byte) {
 		return
 	}
 	keys := argv[1:]
+	if c.offloadSetAlgebra(keys, func() { c.cmdSUnion(dupArgv(argv)) }) {
+		return
+	}
 	unlock := c.lockStripes(keys)
 	if c.anyStringConflict(keys) {
 		unlock()
@@ -953,6 +1015,9 @@ func (c *connState) cmdSInterCard(argv [][]byte) {
 			return
 		}
 		limit = int(l)
+	}
+	if c.offloadSetAlgebra(keys, func() { c.cmdSInterCard(dupArgv(argv)) }) {
+		return
 	}
 	unlock := c.lockStripes(keys)
 	if c.anyStringConflict(keys) {
