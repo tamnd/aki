@@ -396,18 +396,25 @@ const (
 	// clear win and not a coin-flip that adds dispatch variance for no gain. The driver estimates the
 	// per-partition count as the smaller source's cardinality divided by P.
 	setFanOutFloor = 128
-	// setAlgebraOffloadFloor is the larger source cardinality at or above which a multi-source
-	// set-algebra read hands itself off the epoll reactor loop to a park goroutine (offloadSetAlgebra).
-	// Below it the compute is cheap enough that the inline path on the loop beats the handoff's
-	// goroutine spawn and two epoll interest re-arms. At or above it the inline compute plus the large
-	// multibulk reply write stall the loop long enough to starve the other connections it serves, which
-	// is where the inline reactor SINTER dipped to 0.62x of Redis at the 256-member size while flat SET
-	// held 2.74x; the handoff moves that work onto a goroutine the Go scheduler spreads across cores so
-	// the loop stays responsive and the algebra parallelizes. The threshold matches setMergeFloor's
+	// setAlgebraOffloadFloor is the larger source cardinality at or above which a big-reply set-algebra
+	// read (SINTER/SUNION/SDIFF) hands itself off the epoll reactor loop to a park goroutine
+	// (offloadSetAlgebra). Below it the compute is cheap enough that the inline path on the loop beats the
+	// handoff's goroutine spawn and two epoll interest re-arms. At or above it the inline compute plus the
+	// large multibulk reply write stall the loop long enough to starve the other connections it serves,
+	// which is where the inline reactor SINTER dipped to 0.62x of Redis at the 256-member size while flat
+	// SET held 2.74x; the handoff moves that work onto a goroutine the Go scheduler spreads across cores
+	// so the loop stays responsive and the algebra parallelizes. The threshold matches setMergeFloor's
 	// larger neighbour: it sits at the size where the reply grew past the loop's tolerance in the gate
-	// profile, and it gates on cardinality rather than reply bytes so SINTERCARD, whose reply is a single
-	// integer but whose compute is just as heavy, offloads too.
+	// profile.
 	setAlgebraOffloadFloor = 256
+	// setAlgebraCountOffloadFloor is the same handoff threshold for the count form (SINTERCARD), which
+	// returns a single integer instead of a multibulk reply. With no large reply to move off the loop, the
+	// handoff pays for itself only once the pure intersection compute alone stalls the loop, which happens
+	// at a larger cardinality than the reply-carrying forms. The GamingPC crossover sweep put it right at
+	// 512: at 256 members offloading dropped SINTERCARD to 0.99x of Redis versus 1.22x inline, while from
+	// 512 up it wins (1.26x vs 1.22x at 512, 2.27x vs 1.74x at 2048, 2.46x vs 2.25x at 4096). So the read
+	// forms offload from 256 but the count form waits for 512.
+	setAlgebraCountOffloadFloor = 512
 )
 
 // setMergePrefix builds the sorted-array registry prefix for one partition of set skey, matching the
@@ -824,24 +831,26 @@ func (c *connState) mergeIntersectCardMixed(plan mergePlan, limit int, capTo fun
 // cardinality read per source, a heuristic for "is this reply/compute big enough to be worth the two
 // epoll interest re-arms and the goroutine spawn"; being racy is fine because it only steers the command
 // between two correct execution paths.
-func (c *connState) offloadSetAlgebra(keys [][]byte, rerun func()) bool {
+func (c *connState) offloadSetAlgebra(keys [][]byte, floor int, rerun func()) bool {
 	if c.blockable || c.park == nil || !c.srv.setAlgebraOffload {
 		return false
 	}
-	if !c.setAlgebraHeavy(keys) {
+	if !c.setAlgebraHeavy(keys, floor) {
 		return false
 	}
 	c.park.begin(rerun)
 	return true
 }
 
-// setAlgebraHeavy reports whether any source set is large enough that running the read inline on the
-// reactor loop would stall it. It gates on cardinality rather than reply bytes so SINTERCARD, whose
-// reply is a single integer but whose compute is just as heavy as SINTER's, offloads too. setCard is the
-// same unlocked atomic O(P) read setMergeEligible uses, safe to call here without the stripe locks.
-func (c *connState) setAlgebraHeavy(keys [][]byte) bool {
+// setAlgebraHeavy reports whether any source set's cardinality reaches floor, the size at or above which
+// running the read inline on the reactor loop would stall it. The big-reply read forms pass
+// setAlgebraOffloadFloor; the count form (SINTERCARD) passes the higher setAlgebraCountOffloadFloor
+// because its single-integer reply carries nothing off the loop, so its handoff only pays once the pure
+// compute is heavy. setCard is the same unlocked atomic O(P) read setMergeEligible uses, safe to call
+// here without the stripe locks.
+func (c *connState) setAlgebraHeavy(keys [][]byte, floor int) bool {
 	for _, k := range keys {
-		if c.setCard(k) >= setAlgebraOffloadFloor {
+		if c.setCard(k) >= uint64(floor) {
 			return true
 		}
 	}
@@ -864,7 +873,7 @@ func (c *connState) cmdSInter(argv [][]byte) {
 		return
 	}
 	keys := argv[1:]
-	if c.offloadSetAlgebra(keys, func() { c.cmdSInter(dupArgv(argv)) }) {
+	if c.offloadSetAlgebra(keys, setAlgebraOffloadFloor, func() { c.cmdSInter(dupArgv(argv)) }) {
 		return
 	}
 	unlock := c.lockStripes(keys)
@@ -905,7 +914,7 @@ func (c *connState) cmdSDiff(argv [][]byte) {
 		return
 	}
 	keys := argv[1:]
-	if c.offloadSetAlgebra(keys, func() { c.cmdSDiff(dupArgv(argv)) }) {
+	if c.offloadSetAlgebra(keys, setAlgebraOffloadFloor, func() { c.cmdSDiff(dupArgv(argv)) }) {
 		return
 	}
 	unlock := c.lockStripes(keys)
@@ -949,7 +958,7 @@ func (c *connState) cmdSUnion(argv [][]byte) {
 		return
 	}
 	keys := argv[1:]
-	if c.offloadSetAlgebra(keys, func() { c.cmdSUnion(dupArgv(argv)) }) {
+	if c.offloadSetAlgebra(keys, setAlgebraOffloadFloor, func() { c.cmdSUnion(dupArgv(argv)) }) {
 		return
 	}
 	unlock := c.lockStripes(keys)
@@ -1016,7 +1025,7 @@ func (c *connState) cmdSInterCard(argv [][]byte) {
 		}
 		limit = int(l)
 	}
-	if c.offloadSetAlgebra(keys, func() { c.cmdSInterCard(dupArgv(argv)) }) {
+	if c.offloadSetAlgebra(keys, setAlgebraCountOffloadFloor, func() { c.cmdSInterCard(dupArgv(argv)) }) {
 		return
 	}
 	unlock := c.lockStripes(keys)
