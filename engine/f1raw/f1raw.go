@@ -357,6 +357,29 @@ type Store struct {
 	// state allocates nothing. sync.Pool may drop entries under GC pressure, in which case a push
 	// falls back to a fresh node, so correctness never depends on the pool being warm.
 	tombPool sync.Pool
+
+	// The sorted-hash fold facility (sorthashfold.go). A per-partition sorted []uint64 of member
+	// hashes is maintained off the reply path so the set-algebra merge (SINTER/SDIFF, spec
+	// 2064/24) has a hash-ordered array to two-pointer over, the arm doc 20 dropped when it made
+	// the dense vector authoritative. On a set write the command path appends a foldDelta to the
+	// target partition's journal; shDirty is a lock-free Treiber stack of the partitions with a
+	// pending journal, and the shFoldLoop goroutine pops it and applies each partition's batch
+	// through sortedHashes.foldBatch off the reply path, exactly the shape the tombstone folder
+	// above uses. shReg holds the per-partition-prefix sorted arrays and journals. Everything is
+	// zero-valued and idle until EnableSortedHashFold builds shReg and starts the folder, so a
+	// store that never enables it is unaffected.
+	shReg   *shReg
+	shDirty atomic.Pointer[shPart]
+	shPend  atomic.Int64
+	shOn    atomic.Bool
+	shStop  chan struct{}
+	shDone  chan struct{}
+	shWake  chan struct{}
+	// shMu serializes a fold drain (whether run by the folder or by a foreground SyncSortedHashes)
+	// against another drain, so a foreground merge that needs the sorted arrays current right now
+	// waits for an in-flight fold rather than racing it. It is never taken on the set write hot
+	// path, so a SADD never blocks on it.
+	shMu sync.Mutex
 }
 
 // New builds a store whose primary hash index has indexBuckets buckets (rounded up
@@ -505,6 +528,12 @@ func (s *Store) Close() error {
 		// nodes a later reopen would have to reconcile.
 		close(s.folderStop)
 		<-s.folderDone
+	}
+	if s.shOn.Load() {
+		// Stop the sorted-hash folder and let it apply every pending journal, so a close leaves the
+		// sorted arrays reconciled with the member vectors rather than dropping folds on the floor.
+		close(s.shStop)
+		<-s.shDone
 	}
 	if s.migOn.Load() {
 		// Stop the migrator before closing the cold record region it appends to, so no drain is
