@@ -446,6 +446,62 @@ func TestSetMergeConcurrent(t *testing.T) {
 	}
 }
 
+// TestSetMergeStoreDestCurrent pins the bulk destination build the STORE cliff fix installs. After a
+// SINTERSTORE the destination's sorted-hash array must be current (folded == enq, so a follow-on merge
+// trusts it) and hold exactly the stored members; a repeated STORE into the same key must rebuild it to
+// the same size rather than accumulate the previous result's stale offsets; and the freshly-built
+// destination must serve a merge that uses it as a source with the same reply a merge-off probe returns.
+// The old per-member incremental fold got the size right but paid the O(k^2) build the labs/setstorebuild
+// lab isolates; the accumulation guard catches the latent stale-offset bug the same change closes.
+func TestSetMergeStoreDestCurrent(t *testing.T) {
+	msrv := newMergeServer(t, 1)
+	defer msrv.Close()
+	mc := bareConn(msrv)
+	mergeFixture(t, mc, 1200, 800, 800) // |A|=|B|=2000, intersection 1200, above the merge floor
+
+	destPrefix := append([]byte{}, mc.setPrefix([]byte("D"))...)
+
+	// Store the intersection three times into the same destination. Each store must leave the sorted
+	// array current and sized to exactly the 1200-member intersection; a stale-offset accumulation would
+	// grow the array past 1200 on the second and third store.
+	for iter := 0; iter < 3; iter++ {
+		count := call(mc, func(c *connState, a [][]byte) { c.cmdSInterStore(a) }, "SINTERSTORE", "D", "A", "B")
+		if count != ":1200\r\n" {
+			t.Fatalf("iter %d SINTERSTORE D = %q, want :1200", iter, count)
+		}
+		if !msrv.store.SortedHashCurrent(destPrefix) {
+			t.Fatalf("iter %d destination sorted array is not current after the store", iter)
+		}
+		if n := msrv.store.SortedHashLen(destPrefix); n != 1200 {
+			t.Fatalf("iter %d destination sorted array holds %d members, want 1200", iter, n)
+		}
+	}
+
+	// The freshly-built destination serves a merge that uses it as a source. SINTER D A engages the
+	// two-pointer merge over D's just-built sorted array (asserted directly so a silent probe fallback
+	// cannot pass this), and the full command reply must match a merge-off probe server. A miswritten
+	// build (wrong offsets, stale order) would diverge here.
+	dakeys := [][]byte{[]byte("D"), []byte("A")}
+	unlock := mc.lockStripes(dakeys)
+	_, ok := mc.setMergeIntersect(dakeys)
+	unlock()
+	if !ok {
+		t.Fatal("merge did not engage over the STORE-built destination; the test would not exercise its sorted array")
+	}
+
+	psrv := newPartServer(t, 1)
+	defer psrv.Close()
+	pc := bareConn(psrv)
+	mergeFixture(t, pc, 1200, 800, 800)
+	call(pc, func(c *connState, a [][]byte) { c.cmdSInterStore(a) }, "SINTERSTORE", "D", "A", "B")
+
+	mReply := sortedFlatReply(t, call(mc, func(c *connState, a [][]byte) { c.cmdSInter(a) }, "SINTER", "D", "A"))
+	pReply := sortedFlatReply(t, call(pc, func(c *connState, a [][]byte) { c.cmdSInter(a) }, "SINTER", "D", "A"))
+	if strings.Join(mReply, "\x00") != strings.Join(pReply, "\x00") {
+		t.Fatalf("SINTER over the STORE-built destination differs from probe (%d vs %d members)", len(mReply), len(pReply))
+	}
+}
+
 // newMixedMergeServer builds a merge-on server that reads per-key partition counts from the registry
 // (forceP left 0), so a test can engage two sets to different P and drive the mixed-P re-partition merge
 // (spec 2064/f1_rewrite_ltm/24 section 5.1). It mirrors newMergeServer minus the whole-server forceP so

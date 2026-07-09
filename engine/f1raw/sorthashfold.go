@@ -301,6 +301,22 @@ func (s *Store) SortedHashSnapshot(prefix []byte) *sortedSnap {
 	return p.sorted.load()
 }
 
+// SortedHashLen returns the number of members in a partition's current published sorted array, or -1
+// if the fold facility is off or the partition has never been written. It reads the published snapshot
+// length lock-free, so a caller can observe how large a destination's sorted order is (a STORE-built
+// destination should hold exactly its stored cardinality) without walking the array.
+func (s *Store) SortedHashLen(prefix []byte) int {
+	if s.shReg == nil {
+		return -1
+	}
+	p := s.shReg.part(prefix)
+	snap := p.sorted.load()
+	if snap == nil {
+		return -1
+	}
+	return len(snap.h)
+}
+
 // SortedHashCurrent reports whether a partition's sorted array reflects every delta appended to it,
 // the condition the merge checks before trusting the array over the probe fallback. It reads the
 // counters under the partition's journal lock so the answer is consistent with a concurrent append.
@@ -313,4 +329,83 @@ func (s *Store) SortedHashCurrent(prefix []byte) bool {
 	current := p.folded == p.enq
 	p.jmu.Unlock()
 	return current
+}
+
+// SortedHashEntry is one member's (hash, offset) pair for a bulk build: Hash is MemberHash(member)
+// and Off is the member row's arena offset, the same pair shAppend journals one at a time. A caller
+// that has just written a whole set (a SINTERSTORE destination) hands the folder the full list in one
+// SortedHashBuild instead of a delta per member.
+type SortedHashEntry struct {
+	Hash uint64
+	Off  uint64
+}
+
+// MemberHash returns the 64-bit member hash the sorted-hash fold keys on, so a caller building a
+// destination's sorted array in bulk computes the same hash the incremental shAppend path would and a
+// STORE-built array is byte-identical to an SADD-built one. The argument is the member bytes alone
+// (the composite key minus its set prefix), exactly what shAppend hashes.
+func MemberHash(member []byte) uint64 { return hash(member) }
+
+// SortedHashBuild replaces a partition's sorted array with one folded from entries in a single pass,
+// discarding the old array and any pending journal, and marks the partition current. It is the bulk
+// path a SINTERSTORE-family destination takes: storeAlgebra writes the whole result, collects each
+// member's (hash, offset) as it inserts, and calls this once per destination partition, so the sorted
+// order is built with one O(k log k) sort instead of the O(k^2) that k incremental folds of a growing
+// flat array cost (the cliff labs/setstorebuild isolates). A destination that STORE emptied passes no
+// members for that partition and SortedHashReset clears it. It is a no-op when the fold facility is
+// off. It takes shMu, the same lock shDrain holds, so it never races a concurrent fold of the same
+// partition, and it clears the journal under jmu so a stale delta cannot reappear on top of the fresh
+// array. enq and folded are reset to len(entries): the sorted array now reflects exactly those
+// members, so the partition reads current, and a later SADD bumps enq above and re-lists the partition
+// as usual. entries is sorted in place.
+func (s *Store) SortedHashBuild(prefix []byte, entries []SortedHashEntry) {
+	if !s.shOn.Load() {
+		return
+	}
+	ho := make([]hashOff, len(entries))
+	for i := range entries {
+		ho[i] = hashOff{h: entries[i].Hash, off: entries[i].Off}
+	}
+	p := s.shReg.part(prefix)
+	s.shMu.Lock()
+	p.jmu.Lock()
+	pending := len(p.jrnl)
+	p.jrnl = nil
+	p.enq = uint64(len(ho))
+	p.folded = uint64(len(ho))
+	p.sorted.build(ho, p.enq)
+	p.jmu.Unlock()
+	s.shMu.Unlock()
+	if pending > 0 {
+		s.shPend.Add(int64(-pending))
+	}
+}
+
+// SortedHashReset clears a partition's sorted array to empty and drops any pending journal, the bulk
+// counterpart to SortedHashBuild for a destination partition that a STORE left with no members. It is
+// a peek, not a find-or-create: a partition the fold facility never materialized has no array to
+// clear, so a STORE whose destination never took the algebra path pays only the registry probe.
+// Without it a destination reused across STOREs would fold each new result on top of the previous
+// one's stale offsets, so this is what keeps a repeated SINTERSTORE into one key from accumulating
+// dead entries. It takes shMu like SortedHashBuild so it never races the folder.
+func (s *Store) SortedHashReset(prefix []byte) {
+	if !s.shOn.Load() {
+		return
+	}
+	p := s.shReg.partIf(prefix)
+	if p == nil {
+		return
+	}
+	s.shMu.Lock()
+	p.jmu.Lock()
+	pending := len(p.jrnl)
+	p.jrnl = nil
+	p.enq = 0
+	p.folded = 0
+	p.sorted.build(nil, 0)
+	p.jmu.Unlock()
+	s.shMu.Unlock()
+	if pending > 0 {
+		s.shPend.Add(int64(-pending))
+	}
 }
