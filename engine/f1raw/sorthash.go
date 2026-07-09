@@ -264,15 +264,18 @@ func (sh *sortedHashes) build(entries []hashOff, toGen uint64) {
 // to a live member. offA comes from the A operand's array, offB from the B operand's.
 type confirmFunc func(offA, offB uint64) bool
 
-// intersectEmit walks two ascending (hash, off) snapshots and, for each member present in both
-// (byte-confirmed), calls emit with the A-side offset, in A's ascending order. It is the SINTER
-// merge inner loop over one partition pair. Two forward cursors, sequential reads the prefetcher
-// serves, no random probe. On a hash match it scans the run of equal hashes on both sides and
-// confirms the cross pairs, emitting an A member as soon as some B member confirms equal; runs of
-// length one are the common case, so the cross-scan is O(1) amortized. Both cursors advance past
-// the whole matched run so a run is processed once. It is the caller's job to make emit append to a
-// per-partition result buffer; the P partition merges share nothing, so they run in parallel.
-func intersectEmit(a, b *sortedSnap, confirm confirmFunc, emit func(offA uint64)) {
+// intersectEmit walks two ascending (hash, off) snapshots and, for each member present in both,
+// calls onPair with the candidate (A, B) offsets in A's ascending order. onPair byte-confirms the
+// pair and, when it names the same member, emits it and returns true so the walk stops scanning that
+// A member's B run. Folding confirm and emit into one callback lets the caller resolve the A member's
+// bytes once for both the confirm and the emit instead of resolving the offset a second time to
+// materialize it (the SINTER hot path charged that third keyAtTiered per matched member). It is the
+// SINTER merge inner loop over one partition pair: two forward cursors, sequential reads the
+// prefetcher serves, no random probe. On a hash match it scans the run of equal hashes on both sides;
+// runs of length one are the common case, so the cross-scan is O(1) amortized, and both cursors
+// advance past the whole matched run so a run is processed once. The P partition merges share
+// nothing, so they run in parallel.
+func intersectEmit(a, b *sortedSnap, onPair func(offA, offB uint64) bool) {
 	i, j := 0, 0
 	na, nb := len(a.h), len(b.h)
 	for i < na && j < nb {
@@ -293,8 +296,7 @@ func intersectEmit(a, b *sortedSnap, confirm confirmFunc, emit func(offA uint64)
 			}
 			for x := i; x < iend; x++ {
 				for y := j; y < jend; y++ {
-					if confirm(a.off[x], b.off[y]) {
-						emit(a.off[x])
+					if onPair(a.off[x], b.off[y]) {
 						break
 					}
 				}

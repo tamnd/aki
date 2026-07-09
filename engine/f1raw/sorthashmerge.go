@@ -93,16 +93,25 @@ func (s *Store) SetSortedIntersectPart(prefixA, prefixB []byte, emit func(member
 	if a == nil || b == nil {
 		return false
 	}
-	la := len(prefixA)
-	confirm := s.sortedMergeConfirm(la, len(prefixB))
+	la, lb := len(prefixA), len(prefixB)
 	// Pin the reader's epoch across the whole merge so a migrator cannot reclaim a segment an offset
 	// still names while keyAtTiered copies its key out; a no-op on the pure in-memory arena.
 	g := s.pinTiered()
-	intersectEmit(a, b, confirm, func(offA uint64) {
-		k := s.keyAtTiered(offA, nil)
-		if len(k) >= la {
-			emit(k[la:])
+	// Fuse the byte-confirm and the emit: resolve the A member's bytes once, compare its payload to
+	// B's to confirm the hash match, and reuse the very same bytes for the emit. The old split
+	// resolved offA in the confirm and then a second time to materialize the member, a third
+	// keyAtTiered per matched member the SINTER profile charged on the hot P=1 path.
+	intersectEmit(a, b, func(offA, offB uint64) bool {
+		ka := s.keyAtTiered(offA, nil)
+		kb := s.keyAtTiered(offB, nil)
+		if len(ka) < la || len(kb) < lb {
+			return false
 		}
+		if string(ka[la:]) != string(kb[lb:]) {
+			return false
+		}
+		emit(ka[la:])
+		return true
 	})
 	g.unpin()
 	return true

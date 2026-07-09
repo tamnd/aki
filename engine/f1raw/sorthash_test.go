@@ -166,8 +166,12 @@ func TestIntersectEmit(t *testing.T) {
 	b := buildSnap(map[uint64]uint64{50: 70, 51: 84, 52: 98, 53: 200})
 
 	var got []uint64
-	intersectEmit(a, b, func(offA, offB uint64) bool { return a.hashAt(offA) == b.hashAt(offB) }, func(offA uint64) {
-		got = append(got, offA)
+	intersectEmit(a, b, func(offA, offB uint64) bool {
+		if a.hashAt(offA) == b.hashAt(offB) {
+			got = append(got, offA)
+			return true
+		}
+		return false
 	})
 	// Shared hashes are 70(off10), 84(off12), 98(off14).
 	want := []uint64{10, 12, 14}
@@ -184,17 +188,25 @@ func TestIntersectHashCollisionRejected(t *testing.T) {
 
 	// identity: offset 1 is "alpha", offset 2 is "beta"; they collide on hash but differ.
 	ident := map[uint64]string{1: "alpha", 2: "beta"}
-	confirm := func(offA, offB uint64) bool { return ident[offA] == ident[offB] }
+	emitEqual := func(got *[]uint64) func(offA, offB uint64) bool {
+		return func(offA, offB uint64) bool {
+			if ident[offA] == ident[offB] {
+				*got = append(*got, offA)
+				return true
+			}
+			return false
+		}
+	}
 
 	var got []uint64
-	intersectEmit(a, b, confirm, func(offA uint64) { got = append(got, offA) })
+	intersectEmit(a, b, emitEqual(&got))
 	if len(got) != 0 {
 		t.Fatalf("hash collision wrongly emitted %v", got)
 	}
 	// And a real match on the same hash IS emitted.
 	ident[2] = "alpha"
 	got = got[:0]
-	intersectEmit(a, b, confirm, func(offA uint64) { got = append(got, offA) })
+	intersectEmit(a, b, emitEqual(&got))
 	if !slices.Equal(got, []uint64{1}) {
 		t.Fatalf("real match on colliding hash not emitted: %v", got)
 	}
@@ -207,10 +219,15 @@ func TestIntersectRunOnBothSides(t *testing.T) {
 	a := buildSnap(map[uint64]uint64{1: 42, 2: 42, 3: 42})
 	b := buildSnap(map[uint64]uint64{4: 42, 5: 42})
 	ident := map[uint64]string{1: "a1", 2: "a2", 3: "a3", 4: "b1", 5: "a2"} // off5 equals off2
-	confirm := func(offA, offB uint64) bool { return ident[offA] == ident[offB] }
 
 	var got []uint64
-	intersectEmit(a, b, confirm, func(offA uint64) { got = append(got, offA) })
+	intersectEmit(a, b, func(offA, offB uint64) bool {
+		if ident[offA] == ident[offB] {
+			got = append(got, offA)
+			return true
+		}
+		return false
+	})
 	if !slices.Equal(got, []uint64{2}) {
 		t.Fatalf("run intersection emitted %v, want [2]", got)
 	}
@@ -266,8 +283,8 @@ func TestIntersectEmptyOperands(t *testing.T) {
 	full := buildSnap(map[uint64]uint64{1: 10, 2: 20})
 	confirm := func(offA, offB uint64) bool { return true }
 
-	intersectEmit(empty, full, confirm, func(uint64) { t.Fatal("emitted from empty A") })
-	intersectEmit(full, empty, confirm, func(uint64) { t.Fatal("emitted from empty B") })
+	intersectEmit(empty, full, func(offA, offB uint64) bool { t.Fatal("emitted from empty A"); return false })
+	intersectEmit(full, empty, func(offA, offB uint64) bool { t.Fatal("emitted from empty B"); return false })
 	if n := intersectCount(empty, empty, confirm, 0); n != 0 {
 		t.Fatalf("empty count %d, want 0", n)
 	}
