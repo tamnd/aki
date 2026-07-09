@@ -883,10 +883,7 @@ func (c *connState) cmdSInter(argv [][]byte) {
 		return
 	}
 	if merged, ok := c.setMergeIntersect(keys); ok {
-		c.writeArrayHeader(len(merged))
-		for _, m := range merged {
-			c.writeBulk(m)
-		}
+		c.writeBulkArray(merged)
 		unlock()
 		return
 	}
@@ -895,10 +892,7 @@ func (c *connState) cmdSInter(argv [][]byte) {
 		out = append(out, m)
 		return true
 	})
-	c.writeArrayHeader(len(out))
-	for _, m := range out {
-		c.writeBulk(m)
-	}
+	c.writeBulkArray(out)
 	unlock()
 }
 
@@ -924,10 +918,7 @@ func (c *connState) cmdSDiff(argv [][]byte) {
 		return
 	}
 	if merged, ok := c.setMergeDiff(keys); ok {
-		c.writeArrayHeader(len(merged))
-		for _, m := range merged {
-			c.writeBulk(m)
-		}
+		c.writeBulkArray(merged)
 		unlock()
 		return
 	}
@@ -936,10 +927,7 @@ func (c *connState) cmdSDiff(argv [][]byte) {
 		out = append(out, m)
 		return true
 	})
-	c.writeArrayHeader(len(out))
-	for _, m := range out {
-		c.writeBulk(m)
-	}
+	c.writeBulkArray(out)
 	unlock()
 }
 
@@ -968,10 +956,7 @@ func (c *connState) cmdSUnion(argv [][]byte) {
 		return
 	}
 	if merged, ok := c.setMergeUnion(keys); ok {
-		c.writeArrayHeader(len(merged))
-		for _, m := range merged {
-			c.writeBulk(m)
-		}
+		c.writeBulkArray(merged)
 		unlock()
 		return
 	}
@@ -980,10 +965,7 @@ func (c *connState) cmdSUnion(argv [][]byte) {
 		out = append(out, m)
 		return true
 	})
-	c.writeArrayHeader(len(out))
-	for _, m := range out {
-		c.writeBulk(m)
-	}
+	c.writeBulkArray(out)
 	unlock()
 }
 
