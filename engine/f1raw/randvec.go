@@ -404,6 +404,15 @@ func (s *Store) CollRandInsert(prefix, key []byte, kind byte) {
 		v.add(off)
 	}
 	sh.mu.Unlock()
+	// Journal the add for the sorted-hash fold (sorthashfold.go) once the offset is known, off the
+	// vector's shard lock so a hot SADD does not pay the journal append under the lock a concurrent
+	// draw contends. The hash is over the member bytes alone, key[len(prefix):], not the composite
+	// key: the set-algebra merge two-pointers the sorted arrays of two different sets, so the same
+	// member must hash identically regardless of which set's prefix it sits behind. Guarded by shOn,
+	// so a store that never enabled the folder appends nothing and pays one atomic load.
+	if found && s.shOn.Load() && len(key) >= len(prefix) {
+		s.shAppend(prefix, hash(key[len(prefix):]), off, true)
+	}
 }
 
 // CollRandRemove drops a member from the set's dense vector, if the vector exists, and
@@ -429,6 +438,14 @@ func (s *Store) CollRandRemove(prefix, key []byte, kind byte) bool {
 	}
 	ok := v.remove(off)
 	sh.mu.Unlock()
+	// Journal the remove for the sorted-hash fold with the offset resolved above, before the caller
+	// deletes the hash record. foldBatch drops the sorted entry by offset, so the fold sees exactly
+	// the slot the insert added. Journaled whenever the record was found, even if it was not a vector
+	// slot: the sorted array is maintained independently of the vector, and a member inserted while
+	// the folder was on has a sorted entry to drop. Off the shard lock and guarded by shOn.
+	if found && s.shOn.Load() && len(key) >= len(prefix) {
+		s.shAppend(prefix, hash(key[len(prefix):]), off, false)
+	}
 	return ok
 }
 
