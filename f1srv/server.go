@@ -128,6 +128,17 @@ type Config struct {
 	// to the probe. It is opt-in because the merge trades a small per-write fold cost for a large
 	// intersection speedup; the GamingPC 2x gate measures both together.
 	SetAlgebraMerge bool
+
+	// SetAlgebraOffload hands a heavy multi-source set-algebra read (SINTER/SUNION/SDIFF/SINTERCARD
+	// over a source at or above setAlgebraOffloadFloor) to a reactor park goroutine instead of running
+	// it inline on the epoll loop. The reactor executes a batch's commands on the loop goroutine, so a
+	// big intersection's compute and large multibulk reply stall the loop and starve the other
+	// connections it serves, which is why the inline reactor SINTER dipped to 0.62x at the 256-member
+	// size while flat SET held 2.74x. Offloading moves that work onto a fresh goroutine the Go scheduler
+	// spreads across cores, so the loop stays responsive to point ops while the algebra parallelizes.
+	// It defaults on and is a no-op on the goroutine driver, where every connection already has its own
+	// goroutine and there is no shared loop to protect.
+	SetAlgebraOffload bool
 }
 
 // Built-in defaults for the adaptive set-partitioning knobs, used when the feature is on
@@ -210,6 +221,11 @@ type Server struct {
 	// server field before it touches the engine's own SortedHashEnabled check; when false the driver
 	// never leaves the doc-20 probe.
 	setAlgebraMerge bool
+
+	// setAlgebraOffload is the resolved Config.SetAlgebraOffload flag, read-only after New. When set,
+	// a heavy set-algebra read on the reactor hands itself to a park goroutine (offloadSetAlgebra)
+	// rather than running inline on the loop; the goroutine driver ignores it.
+	setAlgebraOffload bool
 
 	// execModel is the resolved command-execution model (spec 2064/17), parsed once from
 	// cfg.ExecModel in New. execShards is the shard count the affinity model routes over,
@@ -351,17 +367,18 @@ func New(cfg Config) *Server {
 		partTarget = defaultSetPartitionTarget
 	}
 	srv := &Server{
-		cfg:              cfg,
-		incrMu:           make([]sync.RWMutex, stripes),
-		incrMask:         uint32(stripes - 1),
-		execModel:        em,
-		execShards:       shards,
-		setPartMax:       partMax,
-		setPartThreshold: partThreshold,
-		setPartTarget:    partTarget,
-		setAlgebraMerge:  cfg.SetAlgebraMerge,
-		startTime:        time.Now(),
-		runID:            newRunID(),
+		cfg:               cfg,
+		incrMu:            make([]sync.RWMutex, stripes),
+		incrMask:          uint32(stripes - 1),
+		execModel:         em,
+		execShards:        shards,
+		setPartMax:        partMax,
+		setPartThreshold:  partThreshold,
+		setPartTarget:     partTarget,
+		setAlgebraMerge:   cfg.SetAlgebraMerge,
+		setAlgebraOffload: cfg.SetAlgebraOffload,
+		startTime:         time.Now(),
+		runID:             newRunID(),
 	}
 	srv.listWin = make([]listWinShard, stripes)
 	for i := range srv.listWin {

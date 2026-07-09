@@ -55,6 +55,7 @@ func main() {
 	// SINTERCARD 4096 0.66x->2.22x, 65536 0.67x->2.75x) while the fold costs SADD only ~0.25x of its
 	// headroom (4.25x->4.00x). Turn it off to keep the smallest-source point-probe.
 	setAlgebraMerge := fs.Bool("set-algebra-merge", true, "maintain a sorted member-hash array per set so SINTER/SINTERCARD/SDIFF run a partition-parallel two-pointer merge (spec 2064/24); off keeps the point-probe")
+	setAlgebraOffload := fs.Bool("set-algebra-offload", true, "under the epoll reactor, hand a heavy SINTER/SUNION/SDIFF/SINTERCARD read to a park goroutine instead of running it inline on the loop, so its compute and reply do not stall the loop's other connections; no-op on the goroutine net model")
 	ltmCold := fs.Bool("ltm-cold", false, "engage the larger-than-memory string tier: separate large values to a cold log under --dir")
 	sepThreshold := fs.Int("sep-threshold", 0, "inline-vs-separated value cutoff in bytes for --ltm-cold (0 = engine default)")
 	arenaSegmented := fs.Bool("arena-segmented", false, "use the reclaimable segmented arena (spec 2064/21 M0); off keeps the grow-only bump arena")
@@ -114,6 +115,7 @@ func main() {
 	cfg.SetPartitionThreshold = *setPartThreshold
 	cfg.SetPartitionTarget = *setPartTarget
 	cfg.SetAlgebraMerge = *setAlgebraMerge
+	cfg.SetAlgebraOffload = *setAlgebraOffload
 	cfg.ArenaSegmented = *arenaSegmented
 	cfg.ArenaSegmentBytes = *arenaSegmentBytes
 	cfg.ArenaOverflowBytes = *arenaOverflowBytes
