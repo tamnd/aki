@@ -168,7 +168,7 @@ func TestSetMergeIneligibleFallsBack(t *testing.T) {
 	}
 	shapes := []shape{
 		{"asymmetric", 1100, 200, 20000, false, false}, // |A|=1300, |B|=21100, ratio > 8
-		{"below-floor", 100, 50, 50, false, false},     // both sets far under 1024
+		{"below-floor", 40, 20, 20, false, false},      // |A|=|B|=60, both under setMergeFloor (128)
 		{"three-source", 1200, 800, 800, true, false},  // eligible sizes but three sources
 		{"eligible", 1200, 800, 800, false, true},      // control: this one must engage
 	}
