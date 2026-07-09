@@ -90,14 +90,21 @@ func (s *Store) SetSortedIntersectMixed(realPrefix []byte, view *RepartView, tar
 		return false
 	}
 	b := view.snaps[target]
-	la := len(realPrefix)
-	confirm := s.sortedMergeConfirm(la, view.prefixLen)
+	la, lb := len(realPrefix), view.prefixLen
 	g := s.pinTiered()
-	intersectEmit(a, b, confirm, func(offA uint64) {
-		k := s.keyAtTiered(offA, nil)
-		if len(k) >= la {
-			emit(k[la:])
+	// Same fused confirm+emit as the same-P path: resolve the real operand's member bytes once, use
+	// them for both the byte-confirm and the emit.
+	intersectEmit(a, b, func(offA, offB uint64) bool {
+		ka := s.keyAtTiered(offA, nil)
+		kb := s.keyAtTiered(offB, nil)
+		if len(ka) < la || len(kb) < lb {
+			return false
 		}
+		if string(ka[la:]) != string(kb[lb:]) {
+			return false
+		}
+		emit(ka[la:])
+		return true
 	})
 	g.unpin()
 	return true

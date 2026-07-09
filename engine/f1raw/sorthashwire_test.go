@@ -162,17 +162,15 @@ func TestWireIntersectAcrossSets(t *testing.T) {
 
 	// Confirm two offsets name the same member by comparing their composite key tails, exactly the
 	// byte-confirm the real merge uses to reject a bare hash collision.
-	confirm := func(offA, offB uint64) bool {
+	got := map[string]struct{}{}
+	intersectEmit(snapA, snapB, func(offA, offB uint64) bool {
 		ka := s.keyAtTiered(offA, nil)
 		kb := s.keyAtTiered(offB, nil)
-		ma := ka[len(pa):]
-		mb := kb[len(pb):]
-		return string(ma) == string(mb)
-	}
-	got := map[string]struct{}{}
-	intersectEmit(snapA, snapB, confirm, func(offA uint64) {
-		k := s.keyAtTiered(offA, nil)
-		got[string(k[len(pa):])] = struct{}{}
+		if string(ka[len(pa):]) != string(kb[len(pb):]) {
+			return false
+		}
+		got[string(ka[len(pa):])] = struct{}{}
+		return true
 	})
 
 	if len(got) != len(shared) {

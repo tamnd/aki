@@ -149,13 +149,16 @@ func TestSortedRetierUnderHandMigration(t *testing.T) {
 	confirm := s.sortedMergeConfirm(len(pa), len(pb))
 	got := map[string]struct{}{}
 	sawCold := false
-	intersectEmit(snapA, snapB, confirm, func(offA uint64) {
+	intersectEmit(snapA, snapB, func(offA, offB uint64) bool {
+		if !confirm(offA, offB) {
+			return false
+		}
 		k := s.keyAtTiered(offA, nil)
-		mm := string(k[len(pa):])
-		got[mm] = struct{}{}
+		got[string(k[len(pa):])] = struct{}{}
 		if offA&tierBit != 0 {
 			sawCold = true
 		}
+		return true
 	})
 	if len(got) != len(shared) {
 		t.Fatalf("merge size %d, want %d", len(got), len(shared))
