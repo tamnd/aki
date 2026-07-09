@@ -97,6 +97,24 @@ func (r *shReg) part(prefix []byte) *shPart {
 	return p
 }
 
+// partIf returns the fold state for a partition prefix if it already exists, or nil without creating
+// it, the peek the retier path needs. shRetier repairs only partitions the fold facility has actually
+// materialized: a set the algebra path never touched has no sorted array, so a member of it migrating
+// cold journals nothing and pays only this registry probe. It takes the same shard lock as part but
+// never inserts, and the string(prefix) map lookup does not allocate, so a migration of a never-merged
+// set costs one lock and one map probe. It mirrors part's striping so the two never contend beyond the
+// shard granularity.
+func (r *shReg) partIf(prefix []byte) *shPart {
+	sh := &r.shards[hash(prefix)&(shRegShards-1)]
+	sh.mu.Lock()
+	var p *shPart
+	if sh.m != nil {
+		p = sh.m[string(prefix)]
+	}
+	sh.mu.Unlock()
+	return p
+}
+
 // EnableSortedHashFold builds the partition registry and starts the folder goroutine. Like
 // EnableDeferredRemoval it is a startup call, made once before the store serves traffic: the write
 // path reads shOn without synchronization to decide whether to journal a delta, so the registry and
@@ -132,6 +150,46 @@ func (s *Store) shAppend(prefix []byte, memberHash, off uint64, add bool) {
 	p.enq++
 	p.jmu.Unlock()
 	s.shPend.Add(1)
+	if p.queued.CompareAndSwap(false, true) {
+		for {
+			head := s.shDirty.Load()
+			p.dnext = head
+			if s.shDirty.CompareAndSwap(head, p) {
+				break
+			}
+		}
+	}
+	select {
+	case s.shWake <- struct{}{}:
+	default:
+	}
+}
+
+// shRetier rewrites a member's cached arena offset in the sorted array after the migrator moved its
+// record from oldOff to newOff (spec 2064/f1_rewrite_ltm/24 slice 4d). It journals the pair
+// remove(oldOff) then add(newOff) under the member's unchanged hash, the exact shape foldBatch already
+// folds: the remove is keyed by the stale resident offset and the add carries the cold tier-tagged
+// address, so once the folder applies the batch the sorted entry names the record's new home and the
+// merge resolves it through keyAtTiered. It is a peek, not a find-or-create: a partition the fold
+// facility never materialized has no sorted array to repair, so the retier of a member whose set the
+// algebra path never touched journals nothing. The two counted deltas bump enq by two, so the
+// partition reads not-current the instant the record moves and the merge falls to the always-correct
+// probe until the folder rebuilds the entry with the cold address. flipVecMember calls it under the
+// vector shard mutex, beside the vector's own retierSlot, so the sorted array and the member vector go
+// stale together rather than through a window where one is repaired and the other still names the
+// reclaimable resident bytes.
+func (s *Store) shRetier(prefix []byte, memberHash, oldOff, newOff uint64) {
+	p := s.shReg.partIf(prefix)
+	if p == nil {
+		return
+	}
+	p.jmu.Lock()
+	p.jrnl = append(p.jrnl,
+		foldDelta{hash: memberHash, off: oldOff, add: false},
+		foldDelta{hash: memberHash, off: newOff, add: true})
+	p.enq += 2
+	p.jmu.Unlock()
+	s.shPend.Add(2)
 	if p.queued.CompareAndSwap(false, true) {
 		for {
 			head := s.shDirty.Load()

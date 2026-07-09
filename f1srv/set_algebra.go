@@ -531,6 +531,14 @@ func (c *connState) setMergeCollect(keys [][]byte, part func(pa, pb []byte, emit
 	if !ok {
 		return nil, false
 	}
+	// Hold one reader epoch across the whole merge so the larger-than-memory regime is safe: a member
+	// the migrator moves cold mid-merge keeps its resident bytes pinned until the merge resolves them,
+	// and the mixed-P view's offsets, captured in one call and dereferenced in the per-target merges,
+	// stay covered by a single hold no per-call pin could span. It is taken before the reconciling sync
+	// and released when this returns; the segmented keyAtTiered hands back copies, so the members
+	// outlive it. On the in-memory arena it is the zero guard and costs nothing.
+	mp := c.srv.store.PinMerge()
+	defer mp.Unpin()
 	c.srv.store.SyncSortedHashes()
 	if plan.mixed {
 		return c.mergeCollectMixed(plan, mixed)
@@ -676,6 +684,12 @@ func (c *connState) setMergeIntersectCard(keys [][]byte, limit int) (int, bool) 
 	if !ok {
 		return 0, false
 	}
+	// Hold one reader epoch across the whole count merge, the same larger-than-memory guard the
+	// materializing collector takes: a member migrated cold mid-merge stays pinned until it is counted,
+	// and the mixed-P view's captured offsets stay covered across the per-target counts. A no-op on the
+	// in-memory arena.
+	mp := c.srv.store.PinMerge()
+	defer mp.Unpin()
 	c.srv.store.SyncSortedHashes()
 	capTo := func(n int) int {
 		if limit > 0 && n > limit {
