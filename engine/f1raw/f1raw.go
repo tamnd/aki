@@ -308,6 +308,17 @@ type Store struct {
 	backpressureWaits  atomic.Uint64
 	backpressureStalls atomic.Uint64
 
+	// blockedWriters gauges how many writers are parked in waitForSegment's slow sleeping path right
+	// now, the live backpressure demand the migrator reads to force a drain (doc 23). The steady-state
+	// migrator only drains when the resident live-byte total crosses the high-water mark, but a writer
+	// blocked with a full arena needs a segment freed regardless of that mark: if every full segment
+	// sits below the high-water total the trigger declines to drain, yet waitForSegment keeps the
+	// writer blocked as long as a drain target exists, so the two disagree and the write hangs forever.
+	// A writer raises this on entering the sleep path and lowers it on leaving, so migrateDown drains
+	// down to free a segment whenever it is positive, closing that livelock without changing the
+	// steady-state high-water behavior when no writer is waiting.
+	blockedWriters atomic.Int64
+
 	// recs is the cold record region for the tier-tagged index (coldrec.go), milestone M1
 	// of the collection cold-record tiering plan (spec 2064/21). It is a second append-only
 	// log, separate from cold above: cold holds separated values, recs holds whole migrated
