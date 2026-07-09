@@ -164,21 +164,7 @@ func (sh *sortedHashes) foldBatch(deltas []foldDelta, toGen uint64) {
 		}
 		adds = append(adds, hashOff{h: d.hash, off: d.off})
 	}
-	slices.SortFunc(adds, func(a, b hashOff) int {
-		if a.h != b.h {
-			if a.h < b.h {
-				return -1
-			}
-			return 1
-		}
-		if a.off != b.off {
-			if a.off < b.off {
-				return -1
-			}
-			return 1
-		}
-		return 0
-	})
+	slices.SortFunc(adds, cmpHashOff)
 
 	// Merge the surviving existing entries with the sorted adds into fresh arrays. Fresh arrays,
 	// not an in-place edit, are what keep a concurrent merge holding the old snapshot correct.
@@ -228,6 +214,48 @@ func (sh *sortedHashes) foldBatch(deltas []foldDelta, toGen uint64) {
 type hashOff struct {
 	h   uint64
 	off uint64
+}
+
+// cmpHashOff is the total order the sorted array is kept in, (hash, off) ascending: ties on the
+// 64-bit member hash break on the arena offset so a run of equal hashes is contiguous and the sort
+// is deterministic. foldBatch sorts a batch's adds by it, and build sorts a whole set by it, so an
+// array built in bulk is byte-identical to one grown one fold at a time.
+func cmpHashOff(a, b hashOff) int {
+	if a.h != b.h {
+		if a.h < b.h {
+			return -1
+		}
+		return 1
+	}
+	if a.off != b.off {
+		if a.off < b.off {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+// build replaces the sorted array with one built from entries in a single sort, discarding whatever
+// was there, and publishes a fresh snapshot at toGen. It is the bulk counterpart to foldBatch: a
+// caller that already holds a set's whole member list (a SINTERSTORE destination it just wrote, say)
+// folds it once here instead of appending a per-member journal and paying an incremental fold per
+// member, which regrows the flat array O(n) times for an O(n^2) build. Fresh arrays, like foldBatch,
+// so a merge holding an older snapshot is undisturbed. entries is sorted in place (the caller's slice
+// is scratch it does not keep). Passing nil clears the array to empty, which is how a destination that
+// a STORE emptied drops its stale order.
+func (sh *sortedHashes) build(entries []hashOff, toGen uint64) {
+	slices.SortFunc(entries, cmpHashOff)
+	nh := make([]uint64, len(entries))
+	noff := make([]uint64, len(entries))
+	for i := range entries {
+		nh[i] = entries[i].h
+		noff[i] = entries[i].off
+	}
+	sh.h = nh
+	sh.off = noff
+	sh.gen = toGen
+	sh.publish()
 }
 
 // confirmFunc resolves two arena offsets to their member bytes and reports whether they name the

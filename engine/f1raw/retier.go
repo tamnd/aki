@@ -25,10 +25,14 @@ import "encoding/binary"
 // for a partitioned set and nothing for the common unpartitioned one, the same probe dropPartVecs
 // makes. It returns a nil shard when the key is too short to parse, which a torn or non-member key
 // would produce and the caller treats as nothing to repair.
-func (s *Store) resolveMemberVec(memberKey []byte) (*randVecShard, *memberVec) {
+// The third result is the partition prefix the sorted-hash fold registers this member under (the
+// whole-set prefix for an unpartitioned set, that plus the partition byte for a partitioned one), the
+// same prefix the vector itself keys on, so flipVecMember can journal the sorted array's retier under
+// it without re-parsing the key.
+func (s *Store) resolveMemberVec(memberKey []byte) (*randVecShard, *memberVec, []byte) {
 	skLen, n := binary.Uvarint(memberKey)
 	if n <= 0 || int(skLen) > len(memberKey)-n {
-		return nil, nil
+		return nil, nil, nil
 	}
 	prefixLen := n + int(skLen) // len(uvarint) + len(skey), the whole-set vector prefix length
 	setPrefix := memberKey[:prefixLen]
@@ -37,11 +41,11 @@ func (s *Store) resolveMemberVec(memberKey []byte) (*randVecShard, *memberVec) {
 	// has none, so this is a single lock-free descriptor-shard map load and returns at once.
 	if d := s.pdescs.shardFor(setPrefix).get(setPrefix); d != nil {
 		if prefixLen >= len(memberKey) {
-			return nil, nil // partitioned layout requires a partition byte after the set prefix
+			return nil, nil, nil // partitioned layout requires a partition byte after the set prefix
 		}
 		part := int(memberKey[prefixLen])
 		if part >= d.p {
-			return nil, nil // partition byte past the engaged count: a torn key, skip it
+			return nil, nil, nil // partition byte past the engaged count: a torn key, skip it
 		}
 		// descPartVec may rewrite base's final byte to resolve a not-yet-cached partition pointer, so
 		// hand it a copy rather than the caller's key, which for the drain path aliases the arena and
@@ -49,12 +53,12 @@ func (s *Store) resolveMemberVec(memberKey []byte) (*randVecShard, *memberVec) {
 		// only on the first-ever draw against this partition, never on the steady drain path.
 		base := append([]byte(nil), memberKey[:prefixLen+1]...)
 		sh := s.rvec.shardFor(base)
-		return sh, s.descPartVec(d, base, part)
+		return sh, s.descPartVec(d, base, part), base
 	}
 
 	// Unpartitioned: the vector is keyed straight by the whole-set prefix.
 	sh := s.rvec.shardFor(setPrefix)
-	return sh, sh.get(setPrefix)
+	return sh, sh.get(setPrefix), setPrefix
 }
 
 // migrateVecMember sinks the resident set member row at off to the cold record region and repairs
@@ -95,7 +99,7 @@ func (s *Store) migrateVecMember(key []byte, kind byte, off uint64) bool {
 // vector. It returns false without retrying: a lost CAS means the row is no longer at off, a
 // terminal state for this off.
 func (s *Store) flipVecMember(key []byte, kind byte, off, newAddr uint64) bool {
-	sh, v := s.resolveMemberVec(key)
+	sh, v, prefix := s.resolveMemberVec(key)
 	if sh == nil {
 		return false
 	}
@@ -119,6 +123,16 @@ func (s *Store) flipVecMember(key []byte, kind byte, off, newAddr uint64) bool {
 	// member is gone from the vector and the tier-aware delete path accounts the frame.
 	if v != nil {
 		v.retierSlot(off, newAddr)
+	}
+	// Repair the sorted-hash side array the same way, under the same mutex, so the set algebra merge
+	// sees a migrated member's entry go stale together with the vector rather than through a window
+	// where one names the reclaimable resident bytes (spec 2064/f1_rewrite_ltm/24 slice 4d). It journals
+	// remove(off)+add(newAddr) only for a partition the fold facility has materialized, so a set the
+	// algebra path never touched pays only the peek. off is the stale resident offset, newAddr the cold
+	// tier-tagged address, and the member hash is taken past the vector prefix exactly as the write path
+	// journals it in CollRandInsert.
+	if s.shOn.Load() && prefix != nil && len(key) >= len(prefix) {
+		s.shRetier(prefix, hash(key[len(prefix):]), off, newAddr)
 	}
 	// Charge the resident bytes out of their segment so it drains toward retirement, the same
 	// decrement the string flip does. off is a resident offset here (curOff == off, no tier bit).

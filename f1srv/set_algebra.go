@@ -209,6 +209,32 @@ func (c *connState) sunionEach(keys [][]byte, emit func([]byte) bool) {
 	}
 }
 
+// sunionEachRaw enumerates every source's members with no deduplication, for SUNIONSTORE. The store
+// path's insert already dedups through the destination index (PutKind reports isNew, and count, the
+// encoding fold and the sorted-hash buckets all advance only on a new member), so a member several
+// sources share is stored once whether or not the walk filters the duplicate first. sunionEach's
+// seen-set is therefore pure overhead on the store path: it hashes and stores every member into a
+// throwaway Go map sized to the union, an O(union) allocation and hash pass that dominated
+// SUNIONSTORE and grew worse with cardinality (the map rehashes as it fills). Dropping it hands the
+// raw concatenation straight to insert, which is the dedup the read form's map was duplicating.
+// Correctness rests on insert being idempotent per member, which it is. emit returns false to stop
+// early when insert hits a write error, the same stop signal sunionEach honors.
+func (c *connState) sunionEachRaw(keys [][]byte, emit func([]byte) bool) {
+	for _, k := range keys {
+		stop := false
+		c.setVecEach(k, func(m []byte) bool {
+			if !emit(m) {
+				stop = true
+				return false
+			}
+			return true
+		})
+		if stop {
+			return
+		}
+	}
+}
+
 // setMemberExists reports whether member is in set skey, routing the probe to the member's
 // partition when skey is partitioned (spec 2064/f1_rewrite_ltm/19 section 6.9). The
 // intersection and difference drivers probe non-driver sources one member at a time, and a
@@ -531,6 +557,14 @@ func (c *connState) setMergeCollect(keys [][]byte, part func(pa, pb []byte, emit
 	if !ok {
 		return nil, false
 	}
+	// Hold one reader epoch across the whole merge so the larger-than-memory regime is safe: a member
+	// the migrator moves cold mid-merge keeps its resident bytes pinned until the merge resolves them,
+	// and the mixed-P view's offsets, captured in one call and dereferenced in the per-target merges,
+	// stay covered by a single hold no per-call pin could span. It is taken before the reconciling sync
+	// and released when this returns; the segmented keyAtTiered hands back copies, so the members
+	// outlive it. On the in-memory arena it is the zero guard and costs nothing.
+	mp := c.srv.store.PinMerge()
+	defer mp.Unpin()
 	c.srv.store.SyncSortedHashes()
 	if plan.mixed {
 		return c.mergeCollectMixed(plan, mixed)
@@ -676,6 +710,12 @@ func (c *connState) setMergeIntersectCard(keys [][]byte, limit int) (int, bool) 
 	if !ok {
 		return 0, false
 	}
+	// Hold one reader epoch across the whole count merge, the same larger-than-memory guard the
+	// materializing collector takes: a member migrated cold mid-merge stays pinned until it is counted,
+	// and the mixed-P view's captured offsets stay covered across the per-target counts. A no-op on the
+	// in-memory arena.
+	mp := c.srv.store.PinMerge()
+	defer mp.Unpin()
 	c.srv.store.SyncSortedHashes()
 	capTo := func(n int) int {
 		if limit > 0 && n > limit {
