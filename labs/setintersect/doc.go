@@ -32,8 +32,10 @@
 //	BenchmarkRedisDict                153 ms   build map over B, then probe
 //	BenchmarkFullSInter                43 ms   probe + buffer + RESP-encode the ~1M hits
 //	BenchmarkEncodeOnly                 3 ms   serialize an already-known ~1M result
+//	BenchmarkMergeIntersect            12 ms   two-pointer merge of two resident sorted arrays
+//	BenchmarkMergeIntersectWithSort   450 ms   same merge, but sorting both sources per call
 //
-// Five facts fall straight out.
+// Six facts fall straight out.
 //
 // First: with the shared index holding only the two operands (GlobalProbe, 40 ms)
 // the composite-key probe is already as fast as a bare member-only probe
@@ -77,35 +79,57 @@
 // gap and the measurement clears it. This is the whole reason the lab exists: the
 // suspected 2x cost was a ~10%-and-vanishing one.
 //
+// Sixth, and this is the constructive one, the one that says how the gate is won: stop
+// probing. Every strategy so far reads the non-driver set at random, one DRAM miss per
+// member, and so does Redis and so does Valkey, so no probe can beat them 2x. A merge
+// of two sorted hash arrays reads both sets sequentially, cursors only moving forward,
+// so the prefetcher serves it from cache. BenchmarkMergeIntersect is 12 ms against
+// GlobalProbe's 40 ms, ~3-5x depending on the run, comfortably past the gate, on the
+// exact same two sets. The merge touches ~2x more elements and still wins by a wide
+// margin because sequential streaming is ~10x cheaper per element than a random probe.
+// This is the access pattern Redis structurally cannot use: its set is an unordered
+// dict, it has nothing sorted to merge. aki can, because it can hold a large set in
+// hash order.
+//
+// The one condition, and it is the whole design question: the merge only wins if the
+// sets are ALREADY sorted. BenchmarkMergeIntersectWithSort, which sorts both sources
+// per call, is 450 ms, ~10x SLOWER than the probe. So a set must be kept in hash order
+// incrementally, on its writes, not re-sorted per operation. That ordered
+// representation is exactly the SET oindex spec 2064 doc 20 dropped to win the point
+// ops (SPOP/SMEMBERS/SSCAN off the unordered dense vector). The 450 ms is a full
+// comparison re-sort with interface dispatch; an engine keeping order incrementally
+// (a skiplist or B-tree of member hashes, as the dropped oindex was) pays O(log n) per
+// write and ~0 per SINTER, leaving the 12 ms merge as the operative number.
+//
 // # The consequence for the real redesign
 //
-// Put together, the levers this lab tested against the isolated SINTER bench (the
-// one the 2x gate runs) are all small or negative: per-op rebuild is a wash,
-// composite-vs-member-only is ~5%, partition routing is ~10% and vanishes under cache
-// pressure, reply encode is 7%. None of them is a 2x, and their sum is not either. So
-// when the real f1srv SINTER runs at ~0.35x of Valkey on two 2<<20 sets, the gap is
-// not in the shape of the index, the routing, or the reply that this lab can model in
-// plain Go. What is left, and what the lab cannot reach without importing the engine,
-// is the concrete cost of one real probe: interface dispatch through the store SPI,
-// the bounds checks and the arena indirection the real find carries, the driver
-// selection off the header cardinalities, and GC pressure on the result buffer. Those
-// are parity-class costs, worth cutting, but the lab's numbers say cutting them lands
-// near Valkey, not at 2x, because at equal set sizes both engines do ~1M
-// DRAM-latency probes and neither can make that cheaper.
+// The negative levers this lab tested against the isolated SINTER bench are all small:
+// per-op rebuild is a wash, composite-vs-member-only is ~5%, partition routing is ~10%
+// and vanishes under cache pressure, reply encode is 7%. None is a 2x, so no amount of
+// probe-path tuning reaches the gate; the best it does is close f1srv's current 0.35x
+// toward parity by cutting the SPI dispatch, arena indirection, driver selection, and
+// result-buffer GC the plain-Go probe models omit. Parity, not 2x.
 //
-// The honest ceiling: a clean 2x over Valkey on a large equal-size SINTER is not a
-// data-structure result. It needs either an algorithm that avoids random probing
-// (a sorted merge-intersection, which doc 20 dropped when it removed the SET oindex)
-// or a workload where one source is much smaller. That is the decision this lab
-// hands up: cut f1srv's probe overhead to the 40 ns floor for a parity-class win,
-// and treat a headline 2x on large symmetric SINTER as out of reach without
-// re-introducing set ordering.
+// The 2x is the merge. The redesign the numbers point to is: bring back a hash-ordered
+// representation for the SET type, but scoped so it does not undo doc 20's point-op win.
+// Two shapes fit. One, keep the unordered dense vector for SPOP/SMEMBERS/SSCAN and add a
+// separate sorted dense []uint64 of member hashes maintained on writes, consumed only by
+// the algebra path, which is a merge over hashes with a byte-confirm on ties. Two, build
+// the sorted array lazily on the first algebra call against a set and cache it with
+// write-invalidation, so a read-heavy algebra set amortizes the one sort over many
+// merges (the 450 ms sort pays for itself after ~11 SINTERs against the same operands).
+// Either way the algebra hot loop becomes the 12 ms merge, not the 40 ms probe, and
+// large symmetric SINTER clears 2x over both rivals. The asymmetric case (one small
+// source) still wants the probe off the small driver, so the real command picks merge
+// when both sources are large and comparable, probe when one is much smaller, the same
+// adaptive choice the ordered-index era made (spec 2064, task 263) before the oindex
+// drop deleted the merge arm.
 //
 // The reference RedisDict (153 ms) is a reminder that the per-set structure is not
 // magic either: a Go map rebuilt per call is 3.7x slower than aki's resident probe.
 //
 // The real code these numbers inform is aki/f1srv/set_algebra.go (cmdSInter,
-// cmdSDiff) and the f1raw SET index in aki/engine/f1raw.
+// cmdSDiff, sinterEach) and the f1raw SET index in aki/engine/f1raw.
 //
 // Numbers observed on an Apple M4 (GOMAXPROCS=10); re-run to reproduce on yours.
 package setintersect

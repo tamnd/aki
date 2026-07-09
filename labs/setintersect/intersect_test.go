@@ -3,6 +3,7 @@ package setintersect
 import (
 	"encoding/binary"
 	"math/bits"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -337,6 +338,49 @@ func newPartitionedIndex(members [][]byte, p, dilute int) *globalIndex {
 	return g
 }
 
+// --- strategy 5: sorted-hash merge intersection (the 2x lever) ------------------------
+//
+// Every probe strategy above reads the non-driver set RANDOMLY: one member hash scatters to
+// one slot far away in a multi-MB table, a DRAM cache miss, ~40 ns. Redis and Valkey pay the
+// same, they probe their unordered set dict, so no probe design beats them 2x. The way past
+// that floor is not a better table, it is a different access pattern. If both sets are kept
+// as SORTED arrays of member hashes, intersecting is a two-pointer merge: both cursors only
+// ever move forward, so every read is sequential and the hardware prefetcher serves it from
+// L1/L2 at a few ns instead of a DRAM round trip. The merge touches |A|+|B| elements against
+// the probe's |A|, ~2x more, but each element is ~10x cheaper, so it wins several times over.
+//
+// This is the shape Redis structurally cannot use: its set is a hash dict, unordered, so it
+// has no sorted array to merge and falls back to probing. aki can, because it can keep a large
+// set's members in hash order, which is exactly what the ordered index (spec 2064 doc 20)
+// held before it was dropped for the point-op win. A 64-bit hash collision (two distinct
+// members sharing a hash) is caught by comparing member bytes only on a hash tie, so the
+// result stays exact; at 1<<20 members that tie is astronomically rare, so the byte compare
+// almost never runs and the merge stays a pure uint64 scan.
+
+// buildSorted returns members' hashes in ascending order plus the members in the same order,
+// so the hot loop streams the dense uint64 hashes and only touches a member slice to confirm a
+// hash tie. This models a set kept in hash order; the sort is the amortized maintenance cost the
+// engine pays incrementally on writes (as the ordered index did), not per operation, so it is
+// built once outside the timed loop exactly as the resident probe index is.
+func buildSorted(members [][]byte) (hashes []uint64, mem [][]byte) {
+	type hm struct {
+		h uint64
+		m []byte
+	}
+	pairs := make([]hm, len(members))
+	for i, m := range members {
+		pairs[i] = hm{hashBytes(m), m}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].h < pairs[j].h })
+	hashes = make([]uint64, len(pairs))
+	mem = make([][]byte, len(pairs))
+	for i, p := range pairs {
+		hashes[i] = p.h
+		mem[i] = p.m
+	}
+	return hashes, mem
+}
+
 // --- benchmarks -----------------------------------------------------------------------
 
 var sink int
@@ -460,6 +504,68 @@ func BenchmarkPartitionedProbeDiluted(b *testing.B) {
 		for _, m := range a {
 			if g.existsPart(skeyB, m, labPartitions) {
 				n++
+			}
+		}
+		sink = n
+	}
+}
+
+// BenchmarkMergeIntersect is the 2x lever: with both sets resident as sorted hash arrays, the
+// intersection is a two-pointer merge, all sequential reads. Against BenchmarkGlobalProbe (the
+// same two sets, random probe) the gap is the whole point: sequential streaming beats random
+// probing by more than the 2x the gate needs, because the probe is DRAM-latency-bound and the
+// merge is prefetcher-served. The sorted arrays are built outside the loop, the amortized cost of
+// keeping a large set in hash order, the same way the probe's index is resident.
+func BenchmarkMergeIntersect(b *testing.B) {
+	a, bset := intersectFixture()
+	ah, am := buildSorted(a)
+	bh, bm := buildSorted(bset)
+	for b.Loop() {
+		n := 0
+		i, j := 0, 0
+		for i < len(ah) && j < len(bh) {
+			switch {
+			case ah[i] < bh[j]:
+				i++
+			case ah[i] > bh[j]:
+				j++
+			default:
+				// Hash tie: confirm the members really match to exclude a 64-bit collision.
+				if string(am[i]) == string(bm[j]) {
+					n++
+				}
+				i++
+				j++
+			}
+		}
+		sink = n
+	}
+}
+
+// BenchmarkMergeIntersectWithSort charges the sort inside the loop, the pessimistic case where
+// the set is NOT kept in hash order and the algebra path must sort both sources per call. It is
+// the counterpart to CompactFingerprint's per-op build: it shows what the merge costs if the
+// ordered representation has to be produced on the fly, so the gap against BenchmarkMergeIntersect
+// is exactly the sort, and the decision of whether to keep sets hash-ordered turns on it.
+func BenchmarkMergeIntersectWithSort(b *testing.B) {
+	a, bset := intersectFixture()
+	for b.Loop() {
+		ah, am := buildSorted(a)
+		bh, bm := buildSorted(bset)
+		n := 0
+		i, j := 0, 0
+		for i < len(ah) && j < len(bh) {
+			switch {
+			case ah[i] < bh[j]:
+				i++
+			case ah[i] > bh[j]:
+				j++
+			default:
+				if string(am[i]) == string(bm[j]) {
+					n++
+				}
+				i++
+				j++
 			}
 		}
 		sink = n
