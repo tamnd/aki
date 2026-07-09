@@ -336,14 +336,24 @@ func (c *connState) sdiffEach(keys [][]byte, emit func([]byte) bool) {
 const (
 	// setMergeFloor is the smallest source cardinality the merge engages at. Below it the intersection
 	// is tiny enough that the point-probe off the smaller source already runs in the noise, and the
-	// synchronous fold the merge forces would cost more than it saves. It is deliberately conservative
-	// for slice 2; slice 4 settles the real crossover empirically.
+	// synchronous fold the merge forces would cost more than it saves.
 	setMergeFloor = 1024
 	// setMergeMaxRatio caps how lopsided the two sources may be for the merge to engage. The probe's
 	// cost tracks the smaller source while the merge walks both arrays, so once the larger source is
 	// more than this many times the smaller, probing off the tiny source wins and the driver stays on
-	// the probe.
-	setMergeMaxRatio = 8
+	// the probe. Settled by the labs/seteager driver sweep (spec 2064/f1_rewrite_ltm/24 section 7): the
+	// single-thread merge stays ahead through a 4:1 ratio and the probe overtakes by 7:1, so 7 is the
+	// crossover. It is conservative on top of that because the real merge fans across P workers while
+	// the probe runs single-threaded off the small source, so the parallel merge's true crossover sits
+	// at or past the single-thread number.
+	setMergeMaxRatio = 7
+	// setFanOutFloor is the per-partition element count at or above which the merge fans its P partition
+	// pairs across shard workers; below it the P merges run inline on the calling goroutine. The
+	// labs/seteager sweep (section 7) put fan-out break-even near 64 members per partition on a 10-core
+	// box; 128 is one doubling above it, so the driver spends goroutines only where the parallelism is a
+	// clear win and not a coin-flip that adds dispatch variance for no gain. The driver estimates the
+	// per-partition count as the smaller source's cardinality divided by P.
+	setFanOutFloor = 128
 )
 
 // setMergePrefix builds the sorted-array registry prefix for one partition of set skey, matching the
@@ -368,46 +378,64 @@ func setMergePrefix(skey []byte, part, p int) []byte {
 	return b
 }
 
-// setMergeEligible reports the shared partition count P and whether the sorted-hash merge should run
-// for keys. It requires the feature flag and the folder both on, offsets that stay resolvable (the
-// non-segmented arena; the merge holds raw offsets the segmented migrator would reclaim, see
-// SortedHashMergeStable), exactly two sources, an equal partition count (so a shared member routes to
-// the same partition index in both), both cardinalities at or above setMergeFloor, and a size ratio no
-// wider than setMergeMaxRatio. Any miss returns false and the caller keeps the doc-20 probe.
-func (c *connState) setMergeEligible(keys [][]byte) (int, bool) {
+// setMergeEligible reports the shared partition count P, the smaller source's cardinality, and whether
+// the sorted-hash merge should run for keys. It requires the feature flag and the folder both on,
+// offsets that stay resolvable (the non-segmented arena; the merge holds raw offsets the segmented
+// migrator would reclaim, see SortedHashMergeStable), exactly two sources, an equal partition count (so
+// a shared member routes to the same partition index in both), both cardinalities at or above
+// setMergeFloor, and a size ratio no wider than setMergeMaxRatio. The smaller cardinality lets the
+// caller estimate the per-partition element count (lo/P) for the fan-out floor. Any miss returns false
+// and the caller keeps the doc-20 probe.
+func (c *connState) setMergeEligible(keys [][]byte) (p, lo int, ok bool) {
 	if !c.srv.setAlgebraMerge || len(keys) != 2 {
-		return 0, false
+		return 0, 0, false
 	}
 	if !c.srv.store.SortedHashEnabled() || !c.srv.store.SortedHashMergeStable() {
-		return 0, false
+		return 0, 0, false
 	}
-	p := c.partitionsFor(keys[0])
+	p = c.partitionsFor(keys[0])
 	if c.partitionsFor(keys[1]) != p {
-		return 0, false
+		return 0, 0, false
 	}
 	c0 := c.setCard(keys[0])
 	c1 := c.setCard(keys[1])
 	if c0 < setMergeFloor || c1 < setMergeFloor {
-		return 0, false
+		return 0, 0, false
 	}
-	hi, lo := c0, c1
-	if lo > hi {
-		hi, lo = lo, hi
+	hi, small := c0, c1
+	if small > hi {
+		hi, small = small, hi
 	}
-	if hi/lo > setMergeMaxRatio {
-		return 0, false
+	if hi/small > setMergeMaxRatio {
+		return 0, 0, false
 	}
-	return p, true
+	return p, int(small), true
 }
 
-// fanPartitions runs fn once for each partition index in [0, p), across a bounded pool of worker
-// goroutines (min(p, execShards)), and returns when every partition has completed. A single-partition
-// or single-worker fan runs inline with no goroutine, so the common unpartitioned merge stays on the
-// calling goroutine. Workers pull the next partition index off one shared atomic counter, so the work
-// balances without a per-partition goroutine. The caller holds the sources' stripe locks across the
-// whole fan, so every worker reads a stable layout.
-func (c *connState) fanPartitions(p int, fn func(part int)) {
+// mergeFanWorkers is the worker cap the merge fans P partition pairs across, applying the fan-out floor
+// (section 7): when the estimated per-partition element count (the smaller source's cardinality over P)
+// is below setFanOutFloor, the P merges run inline on the calling goroutine (one worker), because the
+// goroutine dispatch would outweigh the merges; at or above it the driver fans across every shard
+// worker. lo is the smaller cardinality setMergeEligible returned.
+func (c *connState) mergeFanWorkers(p, lo int) int {
+	if p <= 1 || lo/p < setFanOutFloor {
+		return 1
+	}
+	return c.srv.execShards
+}
+
+// fanPartitions runs fn once for each partition index in [0, p), across a bounded pool of at most
+// maxWorkers goroutines (further capped at min(p, execShards)), and returns when every partition has
+// completed. A single-partition or single-worker fan runs inline with no goroutine, so the common
+// unpartitioned merge and any fan below the fan-out floor stay on the calling goroutine. Workers pull
+// the next partition index off one shared atomic counter, so the work balances without a per-partition
+// goroutine. The caller holds the sources' stripe locks across the whole fan, so every worker reads a
+// stable layout.
+func (c *connState) fanPartitions(p, maxWorkers int, fn func(part int)) {
 	workers := c.srv.execShards
+	if workers > maxWorkers {
+		workers = maxWorkers
+	}
 	if workers > p {
 		workers = p
 	}
@@ -451,7 +479,7 @@ func (c *connState) fanPartitions(p int, fn func(part int)) {
 // a shared slice, and the buffers concatenate into the result. The members are arena-stable subslices,
 // valid after the merge returns.
 func (c *connState) setMergeCollect(keys [][]byte, part func(pa, pb []byte, emit func([]byte)) bool) ([][]byte, bool) {
-	p, ok := c.setMergeEligible(keys)
+	p, lo, ok := c.setMergeEligible(keys)
 	if !ok {
 		return nil, false
 	}
@@ -469,7 +497,7 @@ func (c *connState) setMergeCollect(keys [][]byte, part func(pa, pb []byte, emit
 	}
 	parts := make([][][]byte, p)
 	var aborted atomic.Bool
-	c.fanPartitions(p, func(idx int) {
+	c.fanPartitions(p, c.mergeFanWorkers(p, lo), func(idx int) {
 		pa := setMergePrefix(keys[0], idx, p)
 		pb := setMergePrefix(keys[1], idx, p)
 		local := make([][]byte, 0)
@@ -524,7 +552,7 @@ func (c *connState) setMergeUnion(keys [][]byte) ([][]byte, bool) {
 // size, and the command's LIMIT passes to each partition as an early-stop cap with the sum capped again
 // at LIMIT. A not-current partition aborts to the probe.
 func (c *connState) setMergeIntersectCard(keys [][]byte, limit int) (int, bool) {
-	p, ok := c.setMergeEligible(keys)
+	p, lo, ok := c.setMergeEligible(keys)
 	if !ok {
 		return 0, false
 	}
@@ -546,7 +574,7 @@ func (c *connState) setMergeIntersectCard(keys [][]byte, limit int) (int, bool) 
 	}
 	var total atomic.Int64
 	var aborted atomic.Bool
-	c.fanPartitions(p, func(part int) {
+	c.fanPartitions(p, c.mergeFanWorkers(p, lo), func(part int) {
 		pa := setMergePrefix(keys[0], part, p)
 		pb := setMergePrefix(keys[1], part, p)
 		n, cur := c.srv.store.SetSortedIntersectCountPart(pa, pb, limit)

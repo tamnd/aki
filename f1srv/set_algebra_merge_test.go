@@ -185,7 +185,7 @@ func TestSetMergeIneligibleFallsBack(t *testing.T) {
 					append([]string{"SADD", "C"}, "share:000000")...)
 				keys = [][]byte{[]byte("A"), []byte("B"), []byte("C")}
 			}
-			if _, ok := mc.setMergeEligible(keys); ok != sh.wantMergeAttempt {
+			if _, _, ok := mc.setMergeEligible(keys); ok != sh.wantMergeAttempt {
 				t.Fatalf("%s: setMergeEligible = %v, want %v", sh.name, ok, sh.wantMergeAttempt)
 			}
 
