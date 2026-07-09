@@ -1289,10 +1289,7 @@ func (c *connState) cmdSRandMember(argv [][]byte) {
 		want = card
 	}
 	members := c.setSampleDistinct(prefix, card, want)
-	c.writeArrayHeader(len(members))
-	for _, m := range members {
-		c.writeBulk(m)
-	}
+	c.writeBulkArray(members)
 	mu.Unlock()
 }
 
@@ -1425,10 +1422,7 @@ func (c *connState) cmdSPop(argv [][]byte) {
 		return
 	}
 	mu.Unlock()
-	c.writeArrayHeader(len(members))
-	for _, m := range members {
-		c.writeBulk(m)
-	}
+	c.writeBulkArray(members)
 }
 
 // cmdSRandMemberPart is the P>1 routing of SRANDMEMBER (spec 2064/f1_rewrite_ltm/19 sections 6.5
@@ -1612,10 +1606,7 @@ func (c *connState) cmdSPopPart(skey []byte, count int64, hasCount bool, p int) 
 	if len(out) > 0 {
 		c.setBumpCard(skey, -len(out), p)
 	}
-	c.writeArrayHeader(len(out))
-	for _, m := range out {
-		c.writeBulk(m)
-	}
+	c.writeBulkArray(out)
 }
 
 // lockTwoStripes takes the stripe locks for two keys in a fixed order (lower stripe

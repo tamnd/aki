@@ -438,6 +438,77 @@ func (c *connState) writeBulk(b []byte) {
 	c.out = append(c.out, '\r', '\n')
 }
 
+// writeBulkArray frames a whole array-of-bulk-strings reply (the shape SINTER/SUNION/SDIFF/SMEMBERS
+// and the other member-list reads return) in a single buffer growth. writeBulk appends five times per
+// member, so a several-hundred-member reply pays that many append calls, each with its own bounds and
+// grow check; here the exact reply length is summed once, the out buffer is grown once to fit, and the
+// members are filled with a moving index. It emits byte-for-byte what writeArrayHeader plus a writeBulk
+// loop would, so it is a drop-in for that pair. Measured on a member-list reply it runs the encode
+// ~25% faster than the per-member loop at 0 allocs (labs/bulkarray), a share of the small-N set-algebra
+// per-command cost the merge itself does not dominate.
+func (c *connState) writeBulkArray(ms [][]byte) {
+	total := 1 + declen(len(ms)) + 2 // '*' + count + CRLF
+	for _, b := range ms {
+		total += 1 + declen(len(b)) + 2 + len(b) + 2 // '$' + len + CRLF + payload + CRLF
+	}
+	base := len(c.out)
+	if cap(c.out)-base < total {
+		grown := make([]byte, base, base+total)
+		copy(grown, c.out)
+		c.out = grown
+	}
+	out := c.out[:base+total]
+	p := base
+	out[p] = '*'
+	p++
+	p += putDecimal(out[p:], len(ms))
+	out[p] = '\r'
+	out[p+1] = '\n'
+	p += 2
+	for _, b := range ms {
+		out[p] = '$'
+		p++
+		p += putDecimal(out[p:], len(b))
+		out[p] = '\r'
+		out[p+1] = '\n'
+		p += 2
+		p += copy(out[p:], b)
+		out[p] = '\r'
+		out[p+1] = '\n'
+		p += 2
+	}
+	c.out = out
+}
+
+// declen returns the decimal digit count of a non-negative length, the width of a RESP count or bulk
+// header field, so writeBulkArray can size the reply exactly before it writes.
+func declen(n int) int {
+	if n < 10 {
+		return 1
+	}
+	d := 0
+	for n > 0 {
+		d++
+		n /= 10
+	}
+	return d
+}
+
+// putDecimal writes n as decimal into the front of dst and returns the digit count. The caller sizes
+// dst to hold declen(n) bytes.
+func putDecimal(dst []byte, n int) int {
+	if n < 10 {
+		dst[0] = byte('0' + n)
+		return 1
+	}
+	d := declen(n)
+	for i := d - 1; i >= 0; i-- {
+		dst[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return d
+}
+
 func (c *connState) writeNil() {
 	c.out = append(c.out, "$-1\r\n"...)
 }
