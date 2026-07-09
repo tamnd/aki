@@ -367,18 +367,18 @@ func New(cfg Config) *Server {
 		partTarget = defaultSetPartitionTarget
 	}
 	srv := &Server{
-		cfg:              cfg,
-		incrMu:           make([]sync.RWMutex, stripes),
-		incrMask:         uint32(stripes - 1),
-		execModel:        em,
-		execShards:       shards,
-		setPartMax:       partMax,
-		setPartThreshold: partThreshold,
-		setPartTarget:    partTarget,
-		setAlgebraMerge:  cfg.SetAlgebraMerge,
+		cfg:               cfg,
+		incrMu:            make([]sync.RWMutex, stripes),
+		incrMask:          uint32(stripes - 1),
+		execModel:         em,
+		execShards:        shards,
+		setPartMax:        partMax,
+		setPartThreshold:  partThreshold,
+		setPartTarget:     partTarget,
+		setAlgebraMerge:   cfg.SetAlgebraMerge,
 		setAlgebraOffload: cfg.SetAlgebraOffload,
-		startTime:        time.Now(),
-		runID:            newRunID(),
+		startTime:         time.Now(),
+		runID:             newRunID(),
 	}
 	srv.listWin = make([]listWinShard, stripes)
 	for i := range srv.listWin {
