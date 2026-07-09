@@ -27,3 +27,8 @@ Rules for a lab:
   memory-bound point-probe (SINTER), and a single walk beats two walks for a
   dedup-bound union (SUNION). Also: why a contaminated CPU profile blamed the
   wrong line.
+- [setintersect](setintersect/) — a per-operation rebuild of a compact probe
+  table does not beat aki's resident shared index: the O(|B|) build cost equals
+  the cache-locality it buys, so it is a wash by construction. The only shape
+  that reaches ~2x under a real keyspace is a resident per-set member-only index,
+  which does nothing for the isolated SINTER bench.
