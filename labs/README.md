@@ -27,3 +27,12 @@ Rules for a lab:
   memory-bound point-probe (SINTER), and a single walk beats two walks for a
   dedup-bound union (SUNION). Also: why a contaminated CPU profile blamed the
   wrong line.
+- [setintersect](setintersect/) — the 2x lever for large symmetric SINTER is a
+  sorted-hash merge, not a better probe. A two-pointer merge over two resident
+  sorted arrays is ~3-5x faster than the random probe (12 ms vs 40 ms) because it
+  reads sequentially (prefetcher-served) where the probe misses DRAM per member,
+  and Redis/Valkey can only probe. It wins only if the set is kept in hash order:
+  re-sorting per call is ~10x slower than the probe. The negative results that
+  frame it: a per-op compact-table rebuild is a wash by construction, and doc 19's
+  per-member partition routing (suspected of being the gap) is ~10% undiluted and
+  ~0% under production cache pressure, so it is cleared.
