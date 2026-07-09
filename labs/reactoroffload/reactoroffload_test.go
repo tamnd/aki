@@ -114,6 +114,29 @@ func (h *heavyOp) run() int {
 	return int(acc)
 }
 
+// runCount intersects the same two sources but only counts the matches, the compute SINTERCARD pays: it
+// runs the identical two-pointer walk as run but skips the members-map payload gather and the reply
+// append, because the count form returns a single integer, not the matched members. That is why the count
+// form occupies the reactor loop less at the same cardinality and needs a higher offload floor than the
+// reply-carrying forms: the same intersection walk stalls the loop for a shorter time when it does not
+// also gather payloads and build a multibulk reply.
+func (h *heavyOp) runCount() int {
+	i, j, n := 0, 0, 0
+	for i < len(h.sortedA) && j < len(h.sortedB) {
+		switch {
+		case h.sortedA[i] < h.sortedB[j]:
+			i++
+		case h.sortedA[i] > h.sortedB[j]:
+			j++
+		default:
+			n++
+			i++
+			j++
+		}
+	}
+	return n
+}
+
 // lightWork is one cheap point op: hash an 8-byte key and copy a small value into a reply word, the
 // GET-shaped commands that dominate a real batch and whose latency the heavy op inflates when it runs
 // inline on the loop.
@@ -217,6 +240,27 @@ func runOffload(s *stream, p *pool) time.Duration {
 	return lastLight
 }
 
+// runInlineCount drains the stream the way the reactor does today but runs each heavy op as the count
+// form (runCount) instead of the reply-carrying form: the loop still pays the intersection compute inline,
+// but not the payload gather or the reply write. It returns the same light-makespan, which is why it is
+// lower than runInline's at the same cardinality and why the count command tolerates a higher offload
+// floor before the handoff pays for itself.
+func runInlineCount(s *stream) time.Duration {
+	start := time.Now()
+	var lastLight time.Duration
+	hi := 0
+	for i, heavy := range s.events {
+		if heavy {
+			sink.Add(uint64(s.heavies[hi].runCount()))
+			hi++
+			continue
+		}
+		sink.Add(lightWork(s.keys[i]))
+		lastLight = time.Since(start)
+	}
+	return lastLight
+}
+
 // BenchmarkReactorInline measures the loop's occupancy draining a batch with heavy set-algebra ops run
 // inline: ns/op is the whole stream's loop time (lights + heavies) and light-makespan-ns is how long the
 // last light op waited, which includes every heavy op's compute the loop ran first.
@@ -227,6 +271,25 @@ func BenchmarkReactorInline(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		makespan += runInline(s)
+		iters++
+	}
+	b.ReportMetric(float64(makespan.Nanoseconds())/float64(iters), "light-makespan-ns")
+}
+
+// BenchmarkReactorInlineCount measures the same inline drain with the count form of the heavy op. Its
+// light-makespan-ns runs below BenchmarkReactorInline's at the same heavyN because the count form skips
+// the payload gather and reply write, so the same intersection cardinality stalls the loop for less time.
+// That gap is the empirical basis for setAlgebraCountOffloadFloor sitting above setAlgebraOffloadFloor:
+// the count command has to reach a larger set before its inline loop occupancy matches what the
+// reply-carrying forms already hit at the read floor, so the GamingPC crossover for SINTERCARD landed at
+// 512 while the read forms cross at 256.
+func BenchmarkReactorInlineCount(b *testing.B) {
+	s := buildStream(0x5eed)
+	var makespan time.Duration
+	var iters int64
+	b.ReportAllocs()
+	for b.Loop() {
+		makespan += runInlineCount(s)
 		iters++
 	}
 	b.ReportMetric(float64(makespan.Nanoseconds())/float64(iters), "light-makespan-ns")
@@ -258,6 +321,17 @@ func TestHeavyIntersectExact(t *testing.T) {
 	h.run()
 	if got := len(h.reply); got != heavyN/2 {
 		t.Fatalf("intersect = %d members, want %d", got, heavyN/2)
+	}
+}
+
+// TestCountMatchesReplyLen pins that the count form returns exactly the reply-carrying form's member
+// count, so BenchmarkReactorInlineCount measures the same intersection work minus the reply build, not a
+// cheaper-because-wrong walk.
+func TestCountMatchesReplyLen(t *testing.T) {
+	h := buildHeavy(7)
+	h.run()
+	if got, want := h.runCount(), len(h.reply); got != want {
+		t.Fatalf("runCount = %d, want reply len %d", got, want)
 	}
 }
 
