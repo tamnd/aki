@@ -285,6 +285,24 @@ func (c *connState) summedCard(keys [][]byte) uint64 {
 	return total
 }
 
+// smallestCard returns the smallest source cardinality, the exact upper bound on an intersection's
+// size (the result cannot hold a member the smallest source lacks). SINTER's probe buffer sizes with
+// it so the collect never grows from zero on the sub-floor path the merge does not take. An empty or
+// missing source makes minCard zero and the intersection empty, which the buffer sizing handles as a
+// zero-capacity preallocation.
+func (c *connState) smallestCard(keys [][]byte) uint64 {
+	minCard := ^uint64(0)
+	for _, k := range keys {
+		if card := c.setCard(k); card < minCard {
+			minCard = card
+		}
+	}
+	if minCard == ^uint64(0) {
+		return 0
+	}
+	return minCard
+}
+
 // sinterEach yields every member present in all source sets and returns early when emit returns
 // false (SINTERCARD's LIMIT). It drives off the smallest source, chosen from the O(1) header
 // cardinalities, and point-probes every other source through the hash index for each of the
@@ -900,7 +918,7 @@ func (c *connState) cmdSInter(argv [][]byte) {
 		unlock()
 		return
 	}
-	out := make([][]byte, 0)
+	out := make([][]byte, 0, algebraBufCap(c.smallestCard(keys)))
 	c.sinterEach(keys, func(m []byte) bool {
 		out = append(out, m)
 		return true
@@ -935,7 +953,9 @@ func (c *connState) cmdSDiff(argv [][]byte) {
 		unlock()
 		return
 	}
-	out := make([][]byte, 0)
+	// SDIFF cannot exceed the first source: every result member comes from keys[0] and no other. Size
+	// the probe buffer to it so the collect never grows from zero on the sub-floor path.
+	out := make([][]byte, 0, algebraBufCap(c.setCard(keys[0])))
 	c.sdiffEach(keys, func(m []byte) bool {
 		out = append(out, m)
 		return true
