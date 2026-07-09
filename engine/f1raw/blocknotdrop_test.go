@@ -76,6 +76,61 @@ func TestBackpressureConcurrentServesBeyondArena(t *testing.T) {
 	}
 }
 
+// TestBackpressureServesBelowHighWater is the regression for the below-high-water livelock: a writer
+// blocked in waitForSegment must free a segment through the migrator even when the resident live-byte
+// total sits under the migrate-down high-water mark. Before the fix the migrator's only drain trigger
+// was that high-water mark, so with it set above what the resident set ever reaches, migrateDown
+// declined to drain and parked idle while the blocked writer's progress gate kept waiting on a drain
+// target that never got drained, hanging forever. It drives one serial writer (no contention, so the
+// hang is not a scheduling artifact) through several arenas' worth of records with the high-water mark
+// pinned at 99% so the resident set, kept small by migration, never crosses it, and asserts every write
+// lands. A tight deadline turns a reintroduced hang into a fast failure rather than a package timeout.
+func TestBackpressureServesBelowHighWater(t *testing.T) {
+	s := churnSegColdStore(t, 6)
+	// Pin the steady-state drain trigger just below full: the resident set stays well under this once
+	// migration is sinking records cold, so only the backpressure-forced drain can free a segment for a
+	// blocked writer. loNum is one below so the tuning validates.
+	s.SetMigratorTuning(99, 98, 0)
+	s.EnableMigrator()
+
+	perSeg := int(s.segSize / align8(recSize(12, churnValLen)))
+	total := perSeg * len(s.segs) * 4
+
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; i < total; i++ {
+			k := []byte(fmt.Sprintf("k%08d", i))
+			if err := s.Set(k, churnVal("k", i)); err != nil {
+				done <- fmt.Errorf("Set %q (i=%d/%d): %w", k, i, total, err)
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	// The whole run is a few dozen 8MB drains; 60 seconds is generous headroom on a slow CI box while
+	// still catching a genuine hang, which would otherwise consume the package timeout.
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("writes did not complete in 60s with the high-water mark above the resident set; the migrator did not drain for a blocked writer (below-high-water livelock)")
+	}
+
+	for i := 0; i < total; i++ {
+		k := []byte(fmt.Sprintf("k%08d", i))
+		v, ok := s.Get(k, nil)
+		if !ok || string(v) != string(churnVal("k", i)) {
+			t.Fatalf("key %q = %q,%v; want its exact value (i=%d/%d)", k, v, ok, i, total)
+		}
+	}
+	if waits, _ := s.BackpressureStats(); waits == 0 {
+		t.Fatal("no backpressure waits recorded; the arena was never overrun, so the below-high-water path was not exercised")
+	}
+}
+
 // TestBackpressureStallSurfacesFull is the doc 23 liveness backstop: the progress-gated wait must
 // give up with ErrFull when the migrator genuinely cannot make room, not block forever. It builds
 // the no-migratable-residue stall from the taxonomy (D23-3): the arena is filled with collection-kind

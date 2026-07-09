@@ -514,6 +514,13 @@ func (s *Store) waitForSegment() bool {
 	// then does the write report the arena full. A retired segment that frees on reader quiescence
 	// rather than a fresh drain is caught by segAvailable directly, so it does not need to show in the
 	// progress signal (doc 23, D23-1..D23-3).
+	// Register this writer as live backpressure demand for the whole slow wait, so migrateDown drains
+	// a segment free for it even when the resident live-byte total sits below the high-water mark. The
+	// gauge is lowered on every exit from the wait, so a writer that gets a segment (or gives up on a
+	// genuine stall) stops forcing drains at once.
+	s.blockedWriters.Add(1)
+	defer s.blockedWriters.Add(-1)
+	s.signalMigrator() // wake the migrator now that the demand is visible, so it drains on this pass
 	lastTail := s.coldTail()
 	lastProgress := time.Now()
 	for {
@@ -598,10 +605,22 @@ func (s *Store) migrateDown() {
 	budget := uint64(len(s.segs)) * s.segSize
 	hi := budget * s.migHiNum / 100
 	lo := budget * s.migLoNum / 100
-	if s.liveBytes() < hi {
+	// The trigger is either the steady-state high-water mark or live backpressure demand. In steady
+	// state the migrator drains only once the resident live-byte total crosses hi, so it does not
+	// churn hot records cold below that mark. But a writer blocked in waitForSegment means the arena
+	// has no allocatable segment right now, and the block-not-drop guarantee (doc 23) is that such a
+	// write blocks on a drain rather than dropping: if every full segment sits below hi the high-water
+	// trigger would decline to drain while waitForSegment keeps the writer blocked as long as a drain
+	// target exists, and the two disagree into a hang. So when a writer is waiting the migrator drains
+	// regardless of hi, and keeps draining past lo until the demand clears or no target remains.
+	forced := s.blockedWriters.Load() > 0
+	if !forced && s.liveBytes() < hi {
 		return
 	}
-	for n := 0; n < len(s.segs) && s.liveBytes() >= lo; n++ {
+	for n := 0; n < len(s.segs); n++ {
+		if !forced && s.liveBytes() < lo {
+			return
+		}
 		si, ok := s.pickDrainTarget()
 		if !ok {
 			return
@@ -617,6 +636,10 @@ func (s *Store) migrateDown() {
 			return
 		default:
 		}
+		// Re-read the backpressure demand: a drain that freed a segment lets a blocked writer proceed
+		// and drop off the gauge, so once no writer is waiting the loop falls back to the lo floor and
+		// stops rather than over-draining hot records cold.
+		forced = s.blockedWriters.Load() > 0
 	}
 }
 
