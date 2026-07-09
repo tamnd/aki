@@ -603,12 +603,25 @@ func (c *connState) setMergeCollect(keys [][]byte, part func(pa, pb []byte, emit
 	if p == 1 {
 		pa := setMergePrefix(keys[0], 0, 1)
 		pb := setMergePrefix(keys[1], 0, 1)
-		out := make([][]byte, 0, lo)
+		// Reuse this connection's merge scratch instead of allocating a fresh header slice per
+		// command. The P=1 collect otherwise made a [][]byte of cap lo on every SINTER/SDIFF/SUNION,
+		// a scanned-heap allocation the CPU profile charged at ~10% of the whole command on a
+		// 256-member gate. The caller frames the returned members into the reply (or inserts them
+		// into a STORE destination) and drops the slice before the next command runs, so one
+		// per-connection buffer, reset to length zero and grown to lo once, serves every merge with
+		// the same arena-stable subslices and no allocation. It is never held across two merges: a
+		// connection runs one command at a time.
+		out := c.mergeColl[:0]
+		if cap(out) < lo {
+			out = make([][]byte, 0, lo)
+		}
 		if !part(pa, pb, func(m []byte) {
 			out = append(out, m)
 		}) {
+			c.mergeColl = out[:0]
 			return nil, false
 		}
+		c.mergeColl = out
 		return out, true
 	}
 	perPart := lo/p + 1

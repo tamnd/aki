@@ -61,6 +61,7 @@ type connState struct {
 	zkeys     [][]byte  // reused scratch for a ZRANGE window's score-family key subslices
 	kscan     [][]byte  // reused scratch for a KEYS/SCAN/RANDOMKEY bucket-walk key batch
 	wkeys     [][]byte  // reused scratch for a write command's touched-key list (WATCH signalling)
+	mergeColl [][]byte  // reused scratch for a P=1 set-algebra merge's collected members, reframed into the reply before the next command
 	hscanK    [][]byte  // reused scratch for a whole-hash read's element-key batch (HGETALL/HKEYS/HVALS)
 	hscanO    []uint64  // reused scratch for a whole-hash value-carrying read's record-offset batch
 	pushColl  [][]byte  // reused scratch for a coalesced push run's elements, in arrival order
