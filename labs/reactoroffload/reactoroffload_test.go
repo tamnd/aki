@@ -9,8 +9,11 @@ import (
 	"time"
 )
 
-// sink keeps the compiler from folding the modeled work away.
-var sink uint64
+// sink keeps the compiler from folding the modeled work away. It is atomic because the offload path's
+// pool workers add to it concurrently with the loop goroutine adding its light-op results, the same
+// cross-goroutine accumulation the real offload has when a park goroutine runs the heavy compute while
+// the reactor loop keeps servicing point ops.
+var sink atomic.Uint64
 
 // splitmix64 is a small deterministic PRNG so the fixtures are reproducible without touching the wall
 // clock or the global rand source.
@@ -165,7 +168,7 @@ func newPool(workers, cap int) *pool {
 	for range workers {
 		p.wg.Go(func() {
 			for h := range p.ch {
-				sink += uint64(h.run())
+				sink.Add(uint64(h.run()))
 				p.done.Add(1)
 			}
 		})
@@ -185,11 +188,11 @@ func runInline(s *stream) time.Duration {
 	hi := 0
 	for i, heavy := range s.events {
 		if heavy {
-			sink += uint64(s.heavies[hi].run())
+			sink.Add(uint64(s.heavies[hi].run()))
 			hi++
 			continue
 		}
-		sink += lightWork(s.keys[i])
+		sink.Add(lightWork(s.keys[i]))
 		lastLight = time.Since(start)
 	}
 	return lastLight
@@ -208,7 +211,7 @@ func runOffload(s *stream, p *pool) time.Duration {
 			hi++
 			continue
 		}
-		sink += lightWork(s.keys[i])
+		sink.Add(lightWork(s.keys[i]))
 		lastLight = time.Since(start)
 	}
 	return lastLight
