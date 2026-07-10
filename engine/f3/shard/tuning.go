@@ -47,11 +47,23 @@ const (
 	// node keeps the larger buffer for its next life.
 	repCap = batchDataCap + 64*batchCap
 
-	// spinWindow is how long an idle worker burns plain loads on its inbound
-	// queue before it parks (doc 03 section 9.2, provisional 4us): long enough
-	// to catch the gap between pipelined bursts, short enough that a quiet
-	// server converges to parked. Lab: spin-before-park window (PRED-X7).
+	// spinWindow is how long an idle connection writer burns plain loads on
+	// its outbound queue before it parks (doc 03 section 9.2, provisional
+	// 4us): long enough to catch the gap between pipelined bursts, short
+	// enough that a quiet server converges to parked. Lab: spin-before-park
+	// window (PRED-X7, labs/f3/m0/03_spin_park).
 	spinWindow = 4 * time.Microsecond
+
+	// workerSpinWindow is the shard worker's own spin-before-park window,
+	// swept separately from the connection writers' because the workers are
+	// the hot consumers. The labs/f3/m0/11_transport sweep froze 0: on a
+	// single box the server and its clients share the cores, so every
+	// microsecond a worker burns spinning is stolen from the net goroutines
+	// that would feed it, and the sweep lost throughput monotonically from 0
+	// through 80us in both reps. Parking immediately is cheap once the
+	// workers are unpinned (a plain gopark, no locked-M thread handoff); the
+	// wake tax issue #542 measured was the pin's, not the park's.
+	workerSpinWindow = 0 * time.Microsecond
 
 	// prefetchDepth caps how many of a batch's index buckets stage one touches
 	// ahead of execution (doc 03 section 3.4). At the provisional value the
@@ -99,9 +111,30 @@ const (
 // so a calibration run on a busy machine that lands somewhere near 4us is
 // fine, and the clamp keeps a bad clock reading from producing a windowless
 // or unbounded spin.
-var spinIters = calibrateSpinIters()
+var spinIters = spinItersFor(spinWindow)
 
-func calibrateSpinIters() int {
+// workerSpinIters is the worker's window in the same calibrated units. The
+// windows differ (see workerSpinWindow), so each gets its own count.
+var workerSpinIters = spinItersFor(workerSpinWindow)
+
+// SetWorkerSpinWindow recalibrates the worker spin-before-park window, with 0
+// meaning park immediately. It is the labs/f3/m0/11_transport sweep knob;
+// call it only before Runtime.Start, the workers read the count with plain
+// loads.
+func SetWorkerSpinWindow(d time.Duration) {
+	workerSpinIters = spinItersFor(d)
+}
+
+// spinItersFor turns a window into calibrated iterations; zero and below mean
+// no spin at all, which the clamp in the calibration would otherwise round up.
+func spinItersFor(window time.Duration) int {
+	if window <= 0 {
+		return 0
+	}
+	return calibrateSpinIters(window)
+}
+
+func calibrateSpinIters(window time.Duration) int {
 	var a, b, c atomic.Uint32
 	const probe = 1 << 15
 	s := uint32(0)
@@ -118,12 +151,12 @@ func calibrateSpinIters() int {
 	if el <= 0 {
 		return 1 << 12
 	}
-	it := int(int64(probe) * int64(spinWindow) / int64(el))
+	it := int(int64(probe) * int64(window) / int64(el))
 	if it < 1<<8 {
 		it = 1 << 8
 	}
-	if it > 1<<20 {
-		it = 1 << 20
+	if it > 1<<22 {
+		it = 1 << 22
 	}
 	return it
 }
