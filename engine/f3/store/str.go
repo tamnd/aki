@@ -270,16 +270,47 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 
 	if addr != 0 {
 		// In place when the record holds its bytes itself (int or embedded; a
-		// separated or chunked record's area is a pointer, so a full replace
-		// always republishes and re-selects the band from scratch), the value
-		// fits the reserved capacity, and the TTL layout is compatible: a
-		// record without a slot cannot take a deadline, and a record with one
-		// keeps it for life (clearing writes zero into the slot).
+		// chunked record's full replace always republishes and re-selects the
+		// band from scratch), the value fits the reserved capacity, and the
+		// TTL layout is compatible: a record without a slot cannot take a
+		// deadline, and a record with one keeps it for life (clearing writes
+		// zero into the slot).
 		f := s.recFlags(addr)
 		hasSlot := f&flagHasTTL != 0
 		need := uint64(len(val))
 		if isInt {
 			need = 8
+		}
+		if f&flagChunked == 0 && f&flagSep != 0 && !isInt &&
+			len(val) > strInlineMax && len(val) < strChunkMin && (at == 0 || hasSlot) {
+			// Separated over separated: the record's value area is the run
+			// pointer either way, so the record itself is reused and only the
+			// run is touched. In place when the new value fits the old run's
+			// arena capacity; otherwise a fresh run replaces it and the old
+			// bytes are charged dead where they sit (their segment, or the
+			// value log). Without this path a sustained same-size overwrite at
+			// separated sizes republished record and run on every SET and bled
+			// the arena dry.
+			vs := s.valueStart(addr)
+			word, vlen, vcap := s.readPtr(vs)
+			if word&inLogBit == 0 && uint64(len(val)) <= uint64(vcap) {
+				run := word & runAddrMask
+				copy(s.arena.buf[run:run+uint64(len(val))], val)
+			} else {
+				nw, nc, err := s.writeRun(val, nil, 0)
+				if err != nil {
+					return err
+				}
+				s.dropRun(word, vlen, vcap)
+				word, vcap = nw, nc
+			}
+			s.writePtr(vs, word, uint32(len(val)), vcap)
+			s.setRecFlags(addr, f&^flagRawSticky)
+			s.setVlen(addr, uint32(len(val)))
+			if hasSlot {
+				s.setExpireAt(addr, at)
+			}
+			return nil
 		}
 		if f&(flagSep|flagChunked) == 0 && need <= s.vcapBytes(addr) && (at == 0 || hasSlot) {
 			vs := s.valueStart(addr)
