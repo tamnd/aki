@@ -83,7 +83,17 @@ func (s *Store) readValueRef(addr uint64) ([]byte, bool) {
 			if err != nil {
 				return nil, false
 			}
+			// The residency hooks (resid.go): promotion only allocates, so a
+			// view an earlier read of this batch returned stays valid. The
+			// read counter is unconditional; only the policy is gated.
+			s.logReads++
+			if s.ltmOn {
+				s.maybePromote(addr, vs, vlen, v)
+			}
 			return v, true
+		}
+		if s.ltmOn {
+			s.touchResident(addr)
 		}
 		run := word & runAddrMask
 		return s.arena.buf[run : run+uint64(vlen)], true

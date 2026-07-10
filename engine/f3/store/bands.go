@@ -67,8 +67,18 @@ func (s *Store) writePtr(vs uint64, word uint64, vlen, vcap uint32) {
 // resident budget, the doc 09 section 8 RAM-exceeded rule: past the cap a
 // separated or chunked value's bytes go to the log instead of the arena. Only
 // the value bytes move; the record, header, and key always stay resident.
+//
+// The budget is charged against the live bytes, not the fill: dead bytes are
+// the compactor's debt, and gating admission on them deadlocks the resident
+// set. With a fill gate, a fill parked just over the cap by dead bytes too
+// thin for any segment to be a victim blocks every promotion and every fresh
+// write forever, and the hot set can never form (lab 13's cap=1GiB cell hit
+// exactly this: zero promotions, the miss rate frozen at the fill-order
+// prefix). The fill excess over live is bounded by the compaction trigger at
+// the owner boundaries (ResidentOver fires on fill), so the cap still bounds
+// the touched pages, it just does not let garbage crowd out the working set.
 func (s *Store) spillNow(n uint64) bool {
-	return s.vlog != nil && s.residentCap > 0 && s.arena.used()+n > s.residentCap
+	return s.vlog != nil && s.residentCap > 0 && s.arena.live()+n > s.residentCap
 }
 
 // writeRun places a value run of a and then b (b may be nil), reserving capB

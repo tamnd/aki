@@ -31,6 +31,25 @@ type Store struct {
 	vlog        *vlog
 	residentCap uint64
 
+	// The residency machinery (resid.go). ltmOn folds the whole
+	// configuration check into one load for the read path; residMode is the
+	// promotion policy (labs override it); demoteHand is the clock hand's
+	// directory position; the counters are the ResidStats surface.
+	ltmOn      bool
+	residMode  int
+	dkDen      uint64
+	dkRng      uint64
+	demoteHand uint64
+	promotes   uint64
+	demotes    uint64
+	logReads   uint64
+
+	// dbuf and dstage are the demotion pass's staging: value bytes coalesce
+	// in dbuf so the log sees few large writes, dstage holds the pointer
+	// swaps applied after the write lands. Grown capacity is kept, like vbuf.
+	dbuf   []byte
+	dstage []demoteMove
+
 	// Band census and log-run count, plain single-owner counters.
 	bands   [4]uint64
 	logRuns uint64
@@ -106,6 +125,9 @@ func Open(o Options) (*Store, error) {
 		}
 		s.vlog = l
 		s.residentCap = o.ResidentCapBytes
+		s.ltmOn = s.residentCap > 0
+		s.dkDen = residDoorkeeperDen
+		s.dkRng = 0x9e3779b97f4a7c15
 	}
 	return s, nil
 }
@@ -171,6 +193,12 @@ func (s *Store) Reset() {
 	s.chunkBytes = 0
 	s.vbuf = nil
 	s.cbuf = nil
+	s.demoteHand = 0
+	s.promotes = 0
+	s.demotes = 0
+	s.logReads = 0
+	s.dbuf = nil
+	s.dstage = nil
 	if s.vlog != nil {
 		_ = s.vlog.f.Truncate(0)
 		s.vlog.tail = 0

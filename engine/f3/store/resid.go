@@ -1,0 +1,327 @@
+package store
+
+// Hot-set residency for the larger-than-memory regime (spec 2064/f3/09
+// section 8, the M0 subset of the doc 06 tiering milestone). Before this file
+// the resident cap was a one-way valve: once the arena fill crossed it, new
+// separated values spilled to the value log and nothing ever came back, so
+// under churn the resident set decayed toward zero live values and a zipfian
+// workload paid one synchronous log read per GET for the same few hot keys
+// forever. Residency makes the resident band track the working set from both
+// sides:
+//
+//   - Promotion rides the read path. A log-resident separated run that is
+//     read twice (the doorkeeper: a first touch only marks, and only a
+//     sampled 1-in-residDoorkeeperDen of them, so a one-hit wonder never
+//     promotes and uniform churn stays bounded) has its bytes copied into
+//     the arena while the live charge sits under the cap, and every later
+//     read of it is a memory read.
+//   - Demotion rides the owner boundaries. When the resident live charge
+//     crosses the low-water mark (the cap minus a slack fraction), a clock
+//     hand walks the live index entries SIEVE-style: a resident
+//     separated run whose visited bit is set survives with the bit cleared,
+//     one whose bit is clear has its bytes appended to the value log and its
+//     arena run charged dead. The hand also clears the doorkeeper mark on
+//     log-resident records it passes, which is the ghost-window decay: a
+//     cold key must be touched twice within one hand revolution to promote,
+//     so uniform access over a dataset far past the cap promotes almost
+//     nothing while zipfian heat promotes quickly and stays.
+//
+// The policy state is one header bit and plain single-owner counters: no
+// atomics, no background goroutine, no per-record clock fields. The bit
+// serves both roles because a run is in exactly one place at a time.
+//
+// Lifetime rules (the #566 contract) carry over unchanged: demotion frees
+// arena bytes a GetView could name, so it runs only where compaction already
+// runs, at the owner's idle boundary and between drain passes, never inside a
+// command, and it refuses to run under an open ChunkStream. Promotion inside
+// a read only allocates (and at worst triggers the fully-dead-segment
+// backstop arenaAlloc already carries), which cannot invalidate a live view
+// by the same argument reclaimOnFull's contract makes.
+//
+// Deferred past this slice, the doc 16 machinery this file is the subset of:
+// chunked-band demotion and promotion (giant values already spill at write
+// time and never promote whole by the doc 09 rule), whole-record demotion for
+// the int and embedded bands, the evict byte with the 5-bit LFU counter, and
+// async or batched value-log reads on the GET path (a cold GET stays one
+// synchronous pread this slice, the same posture reclaim.go takes on
+// epoch-gated freeing).
+const (
+	// residSlackDen sets the demotion low-water mark: a pass drives the live
+	// charge down to cap - cap/residSlackDen, so promotions and fresh writes
+	// between boundaries have headroom instead of spilling on arrival.
+	// Frozen by labs/f3/m0/13_ltm_residency.
+	residSlackDen = 8
+
+	// demotePassBudget caps the value bytes one demotion pass may move to the
+	// log, so the pause a pass adds to its boundary stays bounded the same way
+	// arenaMoveBudget bounds a compaction pass. Under sustained pressure the
+	// trigger fires again at the next boundary and the hand resumes.
+	demotePassBudget = 8 << 20
+
+	// demoteScanBudget caps the index slots one pass may examine, the guard
+	// for the regime where the fill is over the cap but almost nothing is
+	// demotable (records and dead bytes, which are compaction's job): the
+	// pass must not degenerate into a full index walk per boundary.
+	demoteScanBudget = 64 << 10
+
+	// demoteFlushBytes is the staging buffer's flush threshold: demoted runs
+	// coalesce into one buffer and hit the log in writes of about this size,
+	// not one pwrite per run.
+	demoteFlushBytes = 1 << 20
+
+	// residDoorkeeperDen samples the doorkeeper: a first touch of a
+	// log-resident run sets the mark with probability 1/den, so a key needs
+	// about den+1 log reads to promote instead of two. The hand's mark decay
+	// is far slower than the uniform re-touch interval, so without sampling
+	// the marks saturate and two-touch degenerates to first-touch under
+	// uniform access: lab 13 measured 0.16 promotions per GET there, and the
+	// f3-ltm-strings bench (uniform by protocol) ran 4.7x slower than
+	// no-residency main under the churn. Sampling cuts the uniform promotion
+	// rate by about den while a zipfian hot key, read thousands of times,
+	// still promotes within its first dozen touches. Frozen by lab 13's
+	// doorkeeper rows.
+	residDoorkeeperDen = 8
+)
+
+// Residency modes, TuneResidency's lab surface. The shipped mode is the
+// two-touch doorkeeper; first-touch and off exist so the lab sweep can
+// measure the policy against its alternatives in one binary.
+const (
+	ResidTwoTouch = iota
+	ResidFirstTouch
+	ResidOff
+)
+
+// ResidStats is the residency evidence surface: cumulative promotions,
+// demotions, and value-log point reads, the figures the LTM lab and the INFO
+// blob read to compute hit ratios and reads per op.
+type ResidStats struct {
+	Promotes uint64
+	Demotes  uint64
+	LogReads uint64
+}
+
+// Resid reports the residency counters.
+func (s *Store) Resid() ResidStats {
+	return ResidStats{Promotes: s.promotes, Demotes: s.demotes, LogReads: s.logReads}
+}
+
+// TuneResidency overrides the promotion policy. Labs and tests only; the
+// shipped mode is the frozen two-touch doorkeeper.
+func (s *Store) TuneResidency(mode int) {
+	s.residMode = mode
+	s.ltmOn = s.vlog != nil && s.residentCap > 0 && mode != ResidOff
+}
+
+// TuneDoorkeeper overrides the doorkeeper sampling denominator. Labs and
+// tests only; den 1 marks every first touch (the deterministic doorkeeper
+// the promotion tests pin), the shipped value is residDoorkeeperDen.
+func (s *Store) TuneDoorkeeper(den uint64) {
+	if den == 0 {
+		den = 1
+	}
+	s.dkDen = den
+}
+
+// touchResident sets the visited bit on a resident separated run's record,
+// the SIEVE mark the demotion hand honors. Check-then-set so a hot record's
+// header line is not re-dirtied on every read.
+func (s *Store) touchResident(addr uint64) {
+	if f := s.recFlags(addr); f&flagVisited == 0 {
+		s.setRecFlags(addr, f|flagVisited)
+	}
+}
+
+// maybePromote is the read path's promotion hook for a log-resident separated
+// run whose bytes were just read into v. First touch marks (the doorkeeper),
+// a marked touch promotes: the run's bytes go to the arena when the fill has
+// headroom under the cap, the log bytes are charged dead, and the record's
+// pointer swaps in place. No headroom means no promotion; the next boundary's
+// demotion makes room and the mark keeps the record first in line.
+func (s *Store) maybePromote(addr, vs uint64, vlen uint32, v []byte) {
+	f := s.recFlags(addr)
+	if s.residMode == ResidTwoTouch && f&flagVisited == 0 {
+		// Sampled doorkeeper: mark 1 in dkDen first touches (see
+		// residDoorkeeperDen). The xorshift is owner-local state, no atomics.
+		r := s.dkRng
+		r ^= r << 13
+		r ^= r >> 7
+		r ^= r << 17
+		s.dkRng = r
+		if r%s.dkDen == 0 {
+			s.setRecFlags(addr, f|flagVisited)
+		}
+		return
+	}
+	need := align8(uint64(vlen))
+	if s.spillNow(need) {
+		return
+	}
+	off, ok := s.arenaAlloc(need)
+	if !ok {
+		return
+	}
+	copy(s.arena.buf[off:off+uint64(vlen)], v)
+	s.vlog.dead += uint64(vlen)
+	s.logRuns--
+	s.writePtr(vs, off, vlen, uint32(need))
+	if f&flagVisited == 0 {
+		s.setRecFlags(addr, f|flagVisited)
+	}
+	s.promotes++
+}
+
+// ResidentOver reports whether the arena fill sits past the resident cap, the
+// boundary trigger for the compaction that turns dead and demoted bytes into
+// freed pages. Fill-based on purpose where admission (spillNow) is live-based:
+// live past the cap is demotion's job, fill past the cap with live under it is
+// dead bytes, and this is what schedules their reclaim. Independent of the
+// residency mode: the cap bounds pages whether or not promotion is on.
+// O(segments), boundary-rate only.
+func (s *Store) ResidentOver() bool {
+	return s.vlog != nil && s.residentCap > 0 && s.arena.used() > s.residentCap
+}
+
+// MaybeDemote runs one bounded demotion pass when the resident live charge
+// sits past the low-water mark, and reports the arena bytes it freed.
+// Owner-only, and only at a boundary where no caller holds an arena address,
+// the CompactArena rule.
+//
+// The trigger is live past low, not fill past cap, and the distinction is the
+// whole steady state. spillNow stops admitting at the cap, so the fill parks
+// just under it and never crosses; a fill-triggered pass would fire once at
+// most and the store would freeze with zero promotion headroom, the resident
+// set forever the fill-order prefix. Targeting live > low keeps a slack of
+// cap/residSlackDen open at every boundary: promotions and fresh writes fill
+// the slack between boundaries, the next pass demotes the coldest runs back
+// to the mark, and the visited bits decide who stays. Fill past the cap with
+// live under the mark is dead bytes, compaction's job, and the pass declines.
+func (s *Store) MaybeDemote() uint64 {
+	if !s.ltmOn || s.openStreams > 0 {
+		return 0
+	}
+	low := s.residentCap - s.residentCap/residSlackDen
+	live := s.arena.live()
+	if live <= low {
+		return 0
+	}
+	return s.demotePass(live - low)
+}
+
+// demoteMove is one staged demotion: the record's pointer slot, the arena run
+// it currently names, and the log offset its bytes will live at once the
+// staging buffer flushes. Staged rather than applied so a log write failure
+// leaves every touched record still resident and correct.
+type demoteMove struct {
+	vs   uint64
+	run  uint64
+	off  uint64
+	vlen uint32
+	vcap uint32
+}
+
+// demotePass advances the clock hand until it has freed want arena bytes, hit
+// a pass budget, or completed one full revolution. The hand walks directory
+// positions; a segment whose localDepth trails the global depth owns a
+// contiguous alias run (top-bits indexing), so stepping by the alias span
+// visits each segment exactly once per revolution.
+func (s *Store) demotePass(want uint64) uint64 {
+	dir := s.idx.dir
+	if s.demoteHand >= uint64(len(dir)) {
+		s.demoteHand = 0
+	}
+	var moved, scanned, steps uint64
+	for steps < uint64(len(dir)) && moved < want && moved < demotePassBudget && scanned < demoteScanBudget {
+		ord := dir[s.demoteHand]
+		seg := s.idx.segs[ord]
+		span := uint64(1) << (s.idx.gd - seg.localDepth)
+		s.demoteHand = s.demoteHand&^(span-1) + span
+		if s.demoteHand >= uint64(len(dir)) {
+			s.demoteHand = 0
+		}
+		steps += span
+		for bi := range seg.buckets {
+			moved += s.demoteBucket(&seg.buckets[bi], &scanned)
+		}
+		for bi := range seg.overflow {
+			moved += s.demoteBucket(&seg.overflow[bi], &scanned)
+		}
+	}
+	moved += s.flushDemotes()
+	return moved
+}
+
+// demoteBucket runs the hand over one bucket: resident separated runs demote
+// or lose their visited bit, log-resident records lose their doorkeeper mark
+// (the ghost-window decay). It returns the arena bytes freed by moves already
+// applied through a staging flush inside the call.
+func (s *Store) demoteBucket(b *bucket, scanned *uint64) uint64 {
+	var freed uint64
+	for i := 0; i < slotsPerBucket; i++ {
+		w := b.slots[i]
+		if w == 0 {
+			continue
+		}
+		*scanned++
+		addr := w & addrMask
+		f := s.recFlags(addr)
+		if f&flagChunked != 0 || f&flagSep == 0 {
+			continue // int, embedded, chunked: not this slice's tenants
+		}
+		vs := s.valueStart(addr)
+		word, vlen, vcap := s.readPtr(vs)
+		if word&inLogBit != 0 {
+			if f&flagVisited != 0 {
+				s.setRecFlags(addr, f&^flagVisited)
+			}
+			continue
+		}
+		if f&flagVisited != 0 {
+			s.setRecFlags(addr, f&^flagVisited) // second chance
+			continue
+		}
+		run := word & runAddrMask
+		s.dstage = append(s.dstage, demoteMove{
+			vs:   vs,
+			run:  run,
+			off:  s.vlog.tail + uint64(len(s.dbuf)),
+			vlen: vlen,
+			vcap: vcap,
+		})
+		s.dbuf = append(s.dbuf, s.arena.buf[run:run+uint64(vlen)]...)
+		if len(s.dbuf) >= demoteFlushBytes {
+			freed += s.flushDemotes()
+		}
+	}
+	return freed
+}
+
+// flushDemotes writes the staged runs to the log tail in one pwrite and
+// applies the pointer swaps: log run in, arena run charged dead, the same
+// ledger deltas writeRun-to-log plus dropRun make on the write path. On a
+// write error the stage is discarded and every staged record stays resident,
+// so a failing disk degrades to no demotion, never to a dangling pointer. It
+// returns the arena bytes freed.
+func (s *Store) flushDemotes() uint64 {
+	if len(s.dstage) == 0 {
+		return 0
+	}
+	if _, err := s.vlog.f.WriteAt(s.dbuf, int64(s.vlog.tail)); err != nil {
+		s.dstage = s.dstage[:0]
+		s.dbuf = s.dbuf[:0]
+		return 0
+	}
+	s.vlog.tail += uint64(len(s.dbuf))
+	var freed uint64
+	for _, m := range s.dstage {
+		s.arena.unlink(m.run, uint64(m.vcap))
+		// A log run is immutable, so its capacity is exactly its length.
+		s.writePtr(m.vs, inLogBit|m.off, m.vlen, m.vlen)
+		s.logRuns++
+		s.demotes++
+		freed += uint64(m.vcap)
+	}
+	s.dstage = s.dstage[:0]
+	s.dbuf = s.dbuf[:0]
+	return freed
+}

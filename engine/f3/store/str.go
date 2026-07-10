@@ -202,15 +202,25 @@ func (s *Store) readValue(addr uint64, dst []byte) ([]byte, bool) {
 
 // readSep copies a separated record's run into dst: a view copy from the
 // arena, or one pread from the log. A log read error reads as absent, the
-// only answer a point read can give for bytes it cannot reach.
+// only answer a point read can give for bytes it cannot reach. Under a
+// resident cap the read is also the residency policy's input: an arena run
+// gets its visited bit, a log run goes through the promotion doorkeeper.
 func (s *Store) readSep(addr uint64, dst []byte) ([]byte, bool) {
-	word, vlen, _ := s.readPtr(s.valueStart(addr))
+	vs := s.valueStart(addr)
+	word, vlen, _ := s.readPtr(vs)
 	if word&inLogBit != 0 {
 		v, err := s.vlog.readInto(word&runAddrMask, int(vlen), dst)
 		if err != nil {
 			return dst[:0], false
 		}
+		s.logReads++ // a fact, not a policy: counted with residency off too
+		if s.ltmOn {
+			s.maybePromote(addr, vs, vlen, v)
+		}
 		return v, true
+	}
+	if s.ltmOn {
+		s.touchResident(addr)
 	}
 	run := word & runAddrMask
 	return append(dst[:0], s.arena.buf[run:run+uint64(vlen)]...), true
@@ -484,6 +494,9 @@ func (s *Store) materialize(addr uint64, scratch []byte) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Counted but never promoted: materialize serves a rewrite, and
+			// the rewrite's own placement decides where the value lands.
+			s.logReads++
 			return v, nil
 		}
 		run := word & runAddrMask
