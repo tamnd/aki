@@ -2,6 +2,8 @@ package store
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"testing"
 	"unsafe"
 )
@@ -150,5 +152,53 @@ func TestGetViewDiesAtNextWrite(t *testing.T) {
 	}
 	if !bytes.Equal(saved, a) {
 		t.Fatal("copy taken before the write lost the old value")
+	}
+}
+
+// BenchmarkReadValue is the copy-vs-view A/B this API exists for, one pair
+// per resident band: 64B and 1KiB embedded, 4KiB separated (arena run). The
+// copy lane is GetString into a reused scratch, the exact read GET ran before
+// the view path.
+func BenchmarkReadValue(b *testing.B) {
+	for _, sz := range []int{64, 1024, 4096} {
+		keys := 1 << 20
+		if sz == 4096 {
+			keys = 1 << 18
+		}
+		s := New(keys*(sz+96)+keys*(sz+96)/4+(16<<20), 0)
+		val := make([]byte, sz)
+		var kb [16]byte
+		fill := func(i int) []byte {
+			binary.LittleEndian.PutUint64(kb[0:8], uint64(i))
+			binary.LittleEndian.PutUint64(kb[8:16], uint64(i)*0x9e3779b97f4a7c15)
+			return kb[:16]
+		}
+		for i := 0; i < keys; i++ {
+			if err := s.SetString(fill(i), val, 0, 0, false); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.Run(fmt.Sprintf("copy/%d", sz), func(b *testing.B) {
+			var dst []byte
+			b.SetBytes(int64(sz))
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				var ok bool
+				dst, ok = s.GetString(fill(i&(keys-1)), 0, dst)
+				if !ok {
+					b.Fatal("miss")
+				}
+			}
+		})
+		b.Run(fmt.Sprintf("view/%d", sz), func(b *testing.B) {
+			b.SetBytes(int64(sz))
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				v, ok := s.GetView(fill(i&(keys-1)), 0)
+				if !ok || len(v) != sz {
+					b.Fatal("miss")
+				}
+			}
+		})
 	}
 }
