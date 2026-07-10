@@ -95,6 +95,47 @@ type Conn struct {
 	inlineEmit func([]byte)
 }
 
+// SetWriterNotify makes the writer-side wake target pluggable: a claimed wake
+// calls fn instead of sending the waker channel token. It exists for drivers
+// whose consumer cannot block on a channel, the reactor loop being the one
+// today: the loop parks in epoll_wait, so the owner's wake must reach it
+// through an eventfd, and fn is where the driver hangs that write. The
+// waker's publish-then-check proof is untouched; only the token's transport
+// changes. fn runs on whichever owner goroutine claims the wake, so it must
+// be safe from any goroutine and must never block. Call before any traffic on
+// the connection.
+func (c *Conn) SetWriterNotify(fn func()) { c.wk.notify = fn }
+
+// CanEnqueue reports whether one more command can enqueue without the Do
+// throttle engaging: the reader is less than a full reorder ring ahead of the
+// writer's emit cursor. A notifier-driven transport (the reactor loop) checks
+// it before every dispatch and stops parsing when it goes false, because the
+// throttle's wait paths would block or spin the loop thread; the loop resumes
+// its parse backlog once DrainReplies has advanced the cursor. Reader side
+// only.
+func (c *Conn) CanEnqueue() bool {
+	return c.seq-c.emitted.Load() < uint32(len(c.ring))
+}
+
+// ParkWriter arms the writer-side wake for a notifier-driven consumer and
+// reports whether it parked clean: it stores parked, then re-checks the
+// outbound queue, the same publish-then-check shape as idleOnce, so an owner
+// push landing between the drain and the park cannot be lost (either this
+// re-check sees the work, or the owner's state load sees parked and delivers
+// the notify). A false return means work is already queued, or the connection
+// is closed, and the caller must service it again instead of sleeping. It
+// must be the last touch on the connection before the consumer blocks in its
+// own wait (epoll_wait for the loop). Writer side only.
+func (c *Conn) ParkWriter() bool {
+	c.wk.state.Store(stateParked)
+	if c.out.ready() || c.closed.Load() {
+		c.wk.unparkSelf()
+		return false
+	}
+	c.parks.bump()
+	return true
+}
+
 // SetInlineDrain declares this connection single-goroutine driven and gives
 // the reader-side throttle the emit to drain replies through when the reader
 // runs a full reorder ring ahead of its own emit cursor. Without it a

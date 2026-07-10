@@ -19,9 +19,19 @@ const (
 // the raw futex of doc 03 section 9.1: a parked consumer blocks on a receive
 // and the claiming producer sends the one token. It has capacity one so the
 // send never blocks the producer.
+//
+// notify, when set, replaces the channel as the wake delivery: the claiming
+// producer calls it instead of sending the token. It exists for consumers
+// that cannot block on a channel, like an epoll loop that parks in epoll_wait
+// and must be woken through an eventfd. The state machine and its lost-wake
+// proof are unchanged; only the token's transport differs. A notify wake is
+// level-like on the consumer side (a redundant delivery is drained harmlessly
+// by the consumer's own re-check), so unlike the channel token it never needs
+// consuming after a lost unpark race.
 type waker struct {
-	state atomic.Uint32
-	ch    chan struct{}
+	state  atomic.Uint32
+	ch     chan struct{}
+	notify func()
 }
 
 func (w *waker) init() {
@@ -35,7 +45,11 @@ func (w *waker) init() {
 // 08 section 9.5 counters) without charging the common single-load path.
 func (w *waker) wake() bool {
 	if w.state.Load() == stateParked && w.state.CompareAndSwap(stateParked, stateRunning) {
-		w.ch <- struct{}{}
+		if w.notify != nil {
+			w.notify()
+		} else {
+			w.ch <- struct{}{}
+		}
 		return true
 	}
 	return false
@@ -51,8 +65,10 @@ func (w *waker) park() {
 // unparkSelf is the consumer taking itself out of parked after its post-store
 // re-check found work. When the CAS fails a producer claimed the wake first,
 // so its token must be consumed or it would satisfy the next park spuriously.
+// A notify-delivered wake has no token to consume: the redundant delivery is
+// drained by the consumer's own service pass and re-check.
 func (w *waker) unparkSelf() {
-	if !w.state.CompareAndSwap(stateParked, stateRunning) {
+	if !w.state.CompareAndSwap(stateParked, stateRunning) && w.notify == nil {
 		<-w.ch
 	}
 }
