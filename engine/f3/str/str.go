@@ -42,11 +42,13 @@ func eqFold(b []byte, s string) bool {
 
 // Get answers GET key. A chunked value answers as a streamed reply: the
 // worker pumps it chunk by chunk and the connection writer serves it onto the
-// socket under a bounded window, never materializing the value.
+// socket under a bounded window, never materializing the value. A resident
+// value comes back as a view under the store.GetView lifetime rule; Bulk
+// copies it into the reply arena before anything else touches the store, so
+// the view is consumed inside its window.
 func Get(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	v, cs, ok := cx.St.GetStream(args[0], cx.NowMs, cx.Val)
+	v, cs, ok := cx.St.GetViewStream(args[0], cx.NowMs)
 	if !ok {
-		cx.Val = v
 		r.Null()
 		return
 	}
@@ -54,7 +56,6 @@ func Get(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Stream(cs.Total(), cs)
 		return
 	}
-	cx.Val = v
 	r.Bulk(v)
 }
 
@@ -191,7 +192,8 @@ func Set(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 
 	// Capture the old value for the GET reply before the write overwrites it.
 	// The lookup also reaps an expired record, so NX and GET both see it as
-	// absent.
+	// absent. This must stay a copy, not a GetView: SetString runs between
+	// the read and the Bulk, and an in-place overwrite would mutate a view.
 	var oldVal []byte
 	haveOld := false
 	if flags&setGet != 0 {
