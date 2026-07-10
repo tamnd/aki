@@ -135,10 +135,14 @@ func (s *Store) Delete(key []byte) bool {
 	return s.Del(key, 0)
 }
 
-// Reset drops every key and rewinds the arena, the flush path. Quiesced by
-// construction: the owner calls it between commands. The value log rewinds
-// with it; the truncate is best-effort, since a stale tail past the rewound
-// cursor is unreachable either way.
+// Reset drops every key and rewinds the arena, the flush path (FLUSHALL rides
+// this). Quiesced by construction: the owner calls it between commands. The
+// index is rebuilt from scratch so its grown tables go back to the GC, the
+// arena hands its touched pages back to the OS, and the scratch buffers are
+// dropped: a flush must actually return the memory, not just zero the
+// counters, or the resident footprint carries the old dataset forever. The
+// value log rewinds with it; the truncate is best-effort, since a stale tail
+// past the rewound cursor is unreachable either way.
 func (s *Store) Reset() {
 	s.idx = newIndex()
 	s.arena.reset()
@@ -146,6 +150,8 @@ func (s *Store) Reset() {
 	s.bands = [4]uint64{}
 	s.logRuns = 0
 	s.chunkBytes = 0
+	s.vbuf = nil
+	s.cbuf = nil
 	if s.vlog != nil {
 		_ = s.vlog.f.Truncate(0)
 		s.vlog.tail = 0
