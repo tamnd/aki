@@ -45,6 +45,14 @@ jobs:
         run: ./scripts/f3-import-boundary.sh
       - name: test
         run: go test -race -count=1 -coverprofile=coverage.out ./...
+      # Rerun the network-facing suites on the epoll reactor driver. AKI_NET
+      # is the suite-wide override in server_test.go, the same pattern as
+      # AKI_CONN_SHAPE; Linux only because the reactor only exists there.
+      - name: test with the reactor net driver
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          AKI_NET: reactor
+        run: go test -race -count=1 ./f3srv/... ./engine/f3/...
       - name: coverage summary
         if: matrix.os == 'ubuntu-latest'
         run: go tool cover -func=coverage.out | tail -1
