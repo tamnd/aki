@@ -133,8 +133,19 @@ func (c *Conn) flushShard(sh int) {
 	b := c.pending[sh]
 	c.pending[sh] = nil
 	w := c.rt.workers[sh]
-	w.inbound.push(b)
-	w.wk.wake()
+	if w.inbound.push(b) {
+		w.wk.wake()
+		return
+	}
+	// Wake skipped. The invariant: a wake may be skipped only when the
+	// observed queue state guarantees the consumer will re-check after its
+	// current pass. The push's tail swap returned a real node, so at publish
+	// time the queue held a batch the worker has not returned; the worker
+	// parks only after storing parked and re-checking ready(), and ready()
+	// stays true from that earlier batch through our push until our node is
+	// popped, so the worker cannot park without seeing it. Whoever published
+	// that earlier node already paid the wake (or skipped under this same
+	// rule against a still-earlier one).
 }
 
 // take pulls a node from the free list, or allocates when the list is dry;

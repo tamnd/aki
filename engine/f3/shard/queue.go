@@ -23,10 +23,17 @@ func (q *mpsc) init() {
 
 // push publishes b. Any goroutine may call it; the swap serializes producers
 // and a single producer's pushes stay in its program order.
-func (q *mpsc) push(b *hopBatch) {
+//
+// The return value reports whether the swap found the queue empty: the
+// previous tail was the stub. A non-stub prev is a node the consumer has not
+// returned yet (tail moves off a node only when a later push lands behind it
+// or when the consumer cycles the stub to detach it as the last node), which
+// is the fact the producers' wake-skip rule keys on.
+func (q *mpsc) push(b *hopBatch) bool {
 	b.next.Store(nil)
 	prev := q.tail.Swap(b)
 	prev.next.Store(b)
+	return prev == &q.stub
 }
 
 // ready reports whether a pop can make progress, the plain-load check the
