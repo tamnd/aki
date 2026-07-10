@@ -23,6 +23,7 @@ func startLTMServer(t *testing.T, residentCap uint64) (net.Conn, *bufio.Reader) 
 		SegBytes:         1 << 18,
 		VlogDir:          t.TempDir(),
 		ResidentCapBytes: residentCap,
+		ConnShape:        testConnShape(),
 	})
 	if err != nil {
 		t.Fatal(err)

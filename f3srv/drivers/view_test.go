@@ -17,7 +17,7 @@ import (
 
 func startOneShard(t *testing.T) (net.Conn, *bufio.Reader) {
 	t.Helper()
-	srv, err := Listen(Options{Addr: "127.0.0.1:0", Shards: 1, ArenaBytes: 4 << 20, SegBytes: 1 << 18})
+	srv, err := Listen(Options{Addr: "127.0.0.1:0", Shards: 1, ArenaBytes: 4 << 20, SegBytes: 1 << 18, ConnShape: testConnShape()})
 	if err != nil {
 		t.Fatal(err)
 	}
