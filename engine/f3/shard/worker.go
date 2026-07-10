@@ -35,6 +35,11 @@ type worker struct {
 	// sink absorbs the prefetch touch loads so the compiler cannot treat the
 	// stage-one loop as dead.
 	sink uint64
+
+	// streams are the in-flight streamed replies this shard is pumping. The
+	// worker keeps servicing them between batches and never parks while any
+	// are live, so a consumer waiting on the ring always has a live producer.
+	streams []*stream
 }
 
 func newWorker(id int, st *store.Store) *worker {
@@ -55,13 +60,51 @@ func (w *worker) run() {
 	runtime.LockOSThread()
 	defer close(w.done)
 	for {
-		if w.drainAndExecute() == 0 {
+		n := w.drainAndExecute()
+		if len(w.streams) > 0 {
+			w.pumpStreams()
+		}
+		if n == 0 {
 			if w.stop.Load() {
+				w.abortStreams()
 				return
+			}
+			if len(w.streams) > 0 {
+				// Streams in flight: stay live for the pump, yield instead of
+				// parking so the consumers cannot wait on a parked producer.
+				runtime.Gosched()
+				continue
 			}
 			w.idle()
 		}
 	}
+}
+
+// pumpStreams runs one producer pass over the in-flight streams, dropping the
+// ones that finished or failed. Compaction is in place; order among streams
+// does not matter, each has its own ring.
+func (w *worker) pumpStreams() {
+	live := w.streams[:0]
+	for _, st := range w.streams {
+		if !st.pump() {
+			live = append(live, st)
+		}
+	}
+	for i := len(live); i < len(w.streams); i++ {
+		w.streams[i] = nil
+	}
+	w.streams = live
+}
+
+// abortStreams fails every in-flight stream on shutdown so a consumer blocked
+// on an empty ring unwinds instead of waiting on a producer that exited.
+func (w *worker) abortStreams() {
+	for i, st := range w.streams {
+		st.failed.Store(true)
+		st.conn.wk.wake()
+		w.streams[i] = nil
+	}
+	w.streams = w.streams[:0]
 }
 
 // drainAndExecute pops one batch and runs it as a unit: prefetch, execute,
@@ -103,6 +146,16 @@ func (w *worker) drainAndExecute() int {
 		w.execute(b, i)
 	}
 	w.ep.exit()
+
+	// Adopt any streamed replies before the push: after it the writer may
+	// recycle the node at any moment, so the stream handles must be off it.
+	if b.hasStream {
+		for i := 0; i < n; i++ {
+			if st := b.stream(i); st != nil {
+				w.streams = append(w.streams, st)
+			}
+		}
+	}
 
 	// Flush: the whole node goes back on the connection's outbound queue with
 	// one atomic push, and the writer is woken by the section 9.1 rule.

@@ -140,10 +140,12 @@ func TestKeyValueLimits(t *testing.T) {
 	if err := s.Set(make([]byte, maxKey+1), []byte("v")); err != ErrTooBig {
 		t.Fatalf("oversize key: %v", err)
 	}
-	if err := s.Set([]byte("k"), make([]byte, maxVal+1)); err != ErrTooBig {
+	// The value ceiling is the 512MiB proto limit, pinned through SETRANGE so
+	// the test never allocates a value that size.
+	if _, err := s.SetRange([]byte("k"), maxValueLen, []byte("v"), 0); err != ErrTooBig {
 		t.Fatalf("oversize value: %v", err)
 	}
-	// The widest legal record must fit.
+	// The widest key plus a separated-band-width value must fit.
 	if err := s.Set(make([]byte, maxKey), make([]byte, maxVal)); err != nil {
 		t.Fatalf("max-width record: %v", err)
 	}

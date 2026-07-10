@@ -168,7 +168,7 @@ func TestSeparatedNotInt(t *testing.T) {
 }
 
 // TestSeparatedSpillsToLog opens a store with a value log and a tiny resident
-// budget and checks separated values land in the log (LogValues, LogBytes),
+// budget and checks separated values land in the log (LogRuns, LogBytes),
 // read back intact, and their overwrites and deletes feed the dead counter.
 func TestSeparatedSpillsToLog(t *testing.T) {
 	s := newLogStore(t, 1<<20)
@@ -177,7 +177,7 @@ func TestSeparatedSpillsToLog(t *testing.T) {
 	mustSet(t, s, "k1", v1)
 	mustSet(t, s, "k2", v2)
 	st := s.Stats()
-	if st.Separated != 2 || st.LogValues != 2 {
+	if st.Separated != 2 || st.LogRuns != 2 {
 		t.Fatalf("stats = %+v, want 2 separated in the log", st)
 	}
 	if total, dead := s.LogBytes(); total != uint64(len(v1)+len(v2)) || dead != 0 {
@@ -191,7 +191,7 @@ func TestSeparatedSpillsToLog(t *testing.T) {
 	if _, dead := s.LogBytes(); dead != uint64(len(v1)) {
 		t.Fatalf("dead after overwrite = %d, want %d", dead, len(v1))
 	}
-	if st := s.Stats(); st.Separated != 2 || st.LogValues != 2 {
+	if st := s.Stats(); st.Separated != 2 || st.LogRuns != 2 {
 		t.Fatalf("stats after overwrite = %+v, want 2/2", st)
 	}
 	checkGet(t, s, "k1", v1b)
@@ -202,7 +202,7 @@ func TestSeparatedSpillsToLog(t *testing.T) {
 	if _, dead := s.LogBytes(); dead != uint64(len(v1)+len(v2)) {
 		t.Fatalf("dead after delete = %d, want %d", dead, len(v1)+len(v2))
 	}
-	if st := s.Stats(); st.Separated != 1 || st.LogValues != 1 {
+	if st := s.Stats(); st.Separated != 1 || st.LogRuns != 1 {
 		t.Fatalf("stats after delete = %+v, want 1/1", st)
 	}
 }
@@ -226,7 +226,7 @@ func TestAppendOnLogRun(t *testing.T) {
 	if _, dead := s.LogBytes(); dead != uint64(len(v)) {
 		t.Fatalf("dead after log-run growth = %d, want %d", dead, len(v))
 	}
-	if st := s.Stats(); st.Separated != 1 || st.LogValues != 1 {
+	if st := s.Stats(); st.Separated != 1 || st.LogRuns != 1 {
 		t.Fatalf("stats = %+v, want 1/1", st)
 	}
 	// SETRANGE over a log run likewise rewrites.
@@ -255,24 +255,25 @@ func TestSeparatedExpiryReap(t *testing.T) {
 	if _, dead := s.LogBytes(); dead != uint64(len(v)) {
 		t.Fatalf("dead after reap = %d, want %d", dead, len(v))
 	}
-	if st := s.Stats(); st.Separated != 0 || st.LogValues != 0 {
+	if st := s.Stats(); st.Separated != 0 || st.LogRuns != 0 {
 		t.Fatalf("stats after reap = %+v, want empty", st)
 	}
 }
 
-// TestValueCapStillHolds pins the commit's ceiling: the chunked band is not
-// wired yet, so a value at 64KiB still answers ErrTooBig, from SET and from
-// APPEND growth alike.
-func TestValueCapStillHolds(t *testing.T) {
+// TestValueCeilingLifted pins the ceiling with the chunked band wired: a
+// value past the old 64KiB field width stores fine (chunked band), and the
+// 512MiB proto-max-bulk-len limit is the only refusal left, checked through
+// SETRANGE so the test never allocates a value that size.
+func TestValueCeilingLifted(t *testing.T) {
 	s := newArenaSepStore(t)
-	if err := s.Set([]byte("k"), bytes.Repeat([]byte("x"), maxVal+1)); err != ErrTooBig {
-		t.Fatalf("Set over cap = %v, want ErrTooBig", err)
+	v := bytes.Repeat([]byte("x"), maxVal+1)
+	mustSet(t, s, "k", v)
+	checkGet(t, s, "k", v)
+	if st := s.Stats(); st.Chunked != 1 {
+		t.Fatalf("stats = %+v, want one chunked record", st)
 	}
-	under := bytes.Repeat([]byte("y"), maxVal)
-	mustSet(t, s, "k", under)
-	checkGet(t, s, "k", under)
-	if _, err := s.Append([]byte("k"), []byte("z"), 0); err != ErrTooBig {
-		t.Fatalf("Append over cap = %v, want ErrTooBig", err)
+	if _, err := s.SetRange([]byte("k"), maxValueLen, []byte("x"), 0); err != ErrTooBig {
+		t.Fatalf("SetRange past ceiling = %v, want ErrTooBig", err)
 	}
 }
 
@@ -295,7 +296,7 @@ func TestResetClearsLog(t *testing.T) {
 	v := bytes.Repeat([]byte("w"), 3000)
 	mustSet(t, s, "k2", v)
 	checkGet(t, s, "k2", v)
-	if st := s.Stats(); st.Separated != 1 || st.LogValues != 1 {
+	if st := s.Stats(); st.Separated != 1 || st.LogRuns != 1 {
 		t.Fatalf("stats after post-Reset write = %+v, want 1/1", st)
 	}
 }
@@ -317,7 +318,7 @@ func TestSeparatedArenaStaysResident(t *testing.T) {
 	mustSet(t, s, "k", v)
 	checkGet(t, s, "k", v)
 	st := s.Stats()
-	if st.Separated != 1 || st.LogValues != 0 {
+	if st.Separated != 1 || st.LogRuns != 0 {
 		t.Fatalf("stats = %+v, want separated 1 with an empty log", st)
 	}
 	if total, _ := s.LogBytes(); total != 0 {

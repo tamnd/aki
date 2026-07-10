@@ -31,13 +31,17 @@ type Store struct {
 	vlog        *vlog
 	residentCap uint64
 
-	// Band census and log-value count, plain single-owner counters.
+	// Band census and log-run count, plain single-owner counters.
 	bands   [4]uint64
-	logVals uint64
+	logRuns uint64
 
 	// vbuf is the store's value scratch for paths that must materialize a
 	// run (log-resident reads inside a rewrite); grown capacity is kept.
+	// cbuf is the chunk staging buffer, one chunk wide, allocated on the
+	// first chunked write so stores that never see a giant value never pay
+	// for it.
 	vbuf []byte
+	cbuf []byte
 }
 
 // Options configures a store beyond the arena geometry.
@@ -132,7 +136,7 @@ func (s *Store) Reset() {
 	s.arena.reset()
 	s.count = 0
 	s.bands = [4]uint64{}
-	s.logVals = 0
+	s.logRuns = 0
 	if s.vlog != nil {
 		_ = s.vlog.f.Truncate(0)
 		s.vlog.tail = 0
