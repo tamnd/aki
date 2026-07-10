@@ -59,6 +59,11 @@ type Options struct {
 	// ReplyBufBytes overrides the per-connection reply writer buffer;
 	// non-positive takes replyBufSize. The knob exists for the lab sweep.
 	ReplyBufBytes int
+	// FlushEveryDrain restores the pre-boundary flush discipline: the writer
+	// flushes its socket buffer after every drain pass instead of waiting for
+	// the pipeline boundary. The knob exists for the labs/f3/m0/11_transport
+	// A/B; production keeps it off.
+	FlushEveryDrain bool
 	// PprofAddr, when set, binds a second listener serving net/http/pprof
 	// under /debug/pprof/. Empty keeps it off. The endpoint has no auth, so
 	// bind it to loopback (for example "127.0.0.1:6060"). This is a server
@@ -70,13 +75,24 @@ type Options struct {
 // reader goroutine parses RESP2 and routes through the dispatch table, a
 // writer goroutine drains replies in request order onto the socket.
 type Server struct {
-	rt       *shard.Runtime
-	ln       net.Listener
-	pprofLn  net.Listener
-	replyBuf int
-	closed   atomic.Bool
-	conns    sync.WaitGroup
+	rt         *shard.Runtime
+	ln         net.Listener
+	pprofLn    net.Listener
+	replyBuf   int
+	flushEvery bool
+	closed     atomic.Bool
+	conns      sync.WaitGroup
+
+	// flushes counts writer socket flushes across all connections. With the
+	// reply buffer at its default every flush is one write syscall (a P16
+	// round of point replies never fills 64KiB), so the counter is the labs'
+	// writes-per-round evidence. One relaxed add per flush, nothing per reply.
+	flushes atomic.Uint64
 }
+
+// Flushes reports the total writer socket flushes since start, the lab and
+// test surface for syscalls-per-round accounting.
+func (s *Server) Flushes() uint64 { return s.flushes.Load() }
 
 // Listen builds the runtime, registers the command table, starts the workers,
 // and binds the listener. Serve must be called to accept.
@@ -105,7 +121,7 @@ func Listen(o Options) (*Server, error) {
 	if o.ReplyBufBytes <= 0 {
 		o.ReplyBufBytes = replyBufSize
 	}
-	s := &Server{rt: rt, ln: ln, replyBuf: o.ReplyBufBytes}
+	s := &Server{rt: rt, ln: ln, replyBuf: o.ReplyBufBytes, flushEvery: o.FlushEveryDrain}
 	if o.PprofAddr != "" {
 		pln, err := net.Listen("tcp", o.PprofAddr)
 		if err != nil {
@@ -193,11 +209,30 @@ func (s *Server) handle(nc net.Conn) {
 				// coherent can follow, so the connection drops.
 				return
 			}
+			if !s.flushEvery && c.Owes() {
+				// This drain ended mid-pipeline: replies are still due for
+				// commands the reader has already handed to the shards, so
+				// the rest of the round lands in the buffer and the flush
+				// waits for the boundary. The worker wakes this goroutine
+				// again for every owed reply, so the deferral is bounded by
+				// the round, and bufio flushes on its own if the buffer
+				// fills first. A lone command never gets here: its reply
+				// zeroes the owed count and flushes immediately below.
+				continue
+			}
+			if bw.Buffered() > 0 {
+				// An empty Flush is a no-op without a syscall; count only
+				// the ones that write.
+				s.flushes.Add(1)
+			}
 			if bw.Flush() != nil {
 				return
 			}
 		}
 		c.DrainReplies(emit)
+		if bw.Buffered() > 0 {
+			s.flushes.Add(1)
+		}
 		_ = bw.Flush()
 	}()
 	defer func() {
