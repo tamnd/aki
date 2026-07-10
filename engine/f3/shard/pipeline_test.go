@@ -19,7 +19,7 @@ func TestCrossShardPipelineOrder(t *testing.T) {
 	const shards = 4
 	const n = 5000
 
-	rt := New(shards, testArena, testSeg)
+	rt := testRuntime(shards)
 	rt.Start()
 	defer rt.Stop()
 	c := rt.NewConn()
@@ -35,7 +35,7 @@ func TestCrossShardPipelineOrder(t *testing.T) {
 			case 0: // keyless, round-robins across shards
 				p := fmt.Sprintf("e%05d", i)
 				want[i] = []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(p), p))
-				if err := c.Do(OpEcho, nil, []byte(p)); err != nil {
+				if err := c.Do(opEcho, false, args(p)); err != nil {
 					t.Error(err)
 					return
 				}
@@ -45,7 +45,7 @@ func TestCrossShardPipelineOrder(t *testing.T) {
 				lastVal[k] = v
 				touched[rt.ShardOf([]byte(k))] = true
 				want[i] = []byte("+OK\r\n")
-				if err := c.Do(OpSet, []byte(k), []byte(v)); err != nil {
+				if err := c.Do(opSet, true, args(k, v)); err != nil {
 					t.Error(err)
 					return
 				}
@@ -57,7 +57,7 @@ func TestCrossShardPipelineOrder(t *testing.T) {
 				} else {
 					want[i] = []byte("$-1\r\n")
 				}
-				if err := c.Do(OpGet, []byte(k), nil); err != nil {
+				if err := c.Do(opGet, true, args(k)); err != nil {
 					t.Error(err)
 					return
 				}

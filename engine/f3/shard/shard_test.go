@@ -33,24 +33,32 @@ func collect(t *testing.T, c *Conn, want int) [][]byte {
 	return got
 }
 
+func args(ss ...string) [][]byte {
+	out := make([][]byte, len(ss))
+	for i, s := range ss {
+		out[i] = []byte(s)
+	}
+	return out
+}
+
 func TestSingleShardSmoke(t *testing.T) {
-	rt := New(1, testArena, testSeg)
+	rt := testRuntime(1)
 	rt.Start()
 	defer rt.Stop()
 
 	c := rt.NewConn()
-	mustDo := func(op byte, key, arg string) {
+	mustDo := func(op byte, keyed bool, a [][]byte) {
 		t.Helper()
-		if err := c.Do(op, []byte(key), []byte(arg)); err != nil {
+		if err := c.Do(op, keyed, a); err != nil {
 			t.Fatal(err)
 		}
 	}
-	mustDo(OpPing, "", "")
-	mustDo(OpEcho, "", "hello")
-	mustDo(OpSet, "k1", "v1")
-	mustDo(OpGet, "k1", "")
-	mustDo(OpGet, "missing", "")
-	mustDo(OpError, "", "unknown command 'NOPE'")
+	mustDo(opPing, false, nil)
+	mustDo(opEcho, false, args("hello"))
+	mustDo(opSet, true, args("k1", "v1"))
+	mustDo(opGet, true, args("k1"))
+	mustDo(opGet, true, args("missing"))
+	mustDo(OpError, false, args("ERR unknown command 'NOPE'"))
 	c.Flush()
 
 	got := collect(t, c, 6)
@@ -73,17 +81,17 @@ func TestSingleShardSmoke(t *testing.T) {
 // window, then pushes and expects the reply: the producer-side wake rule has
 // to bring a parked worker back.
 func TestWakeFromPark(t *testing.T) {
-	rt := New(2, testArena, testSeg)
+	rt := testRuntime(2)
 	rt.Start()
 	defer rt.Stop()
 	c := rt.NewConn()
 
 	for round := 0; round < 3; round++ {
 		time.Sleep(5 * time.Millisecond) // well past spinWindow: workers parked
-		if err := c.Do(OpEcho, nil, []byte("wake")); err != nil {
+		if err := c.Do(opEcho, false, args("wake")); err != nil {
 			t.Fatal(err)
 		}
-		if err := c.Do(OpSet, []byte(fmt.Sprintf("wk%d", round)), []byte("v")); err != nil {
+		if err := c.Do(opSet, true, args(fmt.Sprintf("wk%d", round), "v")); err != nil {
 			t.Fatal(err)
 		}
 		c.Flush()
@@ -97,7 +105,7 @@ func TestWakeFromPark(t *testing.T) {
 // TestBatchOverflowSplits fills past one node's command capacity in a single
 // flush window and checks nothing is lost or reordered.
 func TestBatchOverflowSplits(t *testing.T) {
-	rt := New(1, testArena, testSeg)
+	rt := testRuntime(1)
 	rt.Start()
 	defer rt.Stop()
 	c := rt.NewConn()
@@ -106,7 +114,7 @@ func TestBatchOverflowSplits(t *testing.T) {
 	want := make([][]byte, n)
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("k%03d", i)
-		if err := c.Do(OpSet, []byte(key), []byte(key)); err != nil {
+		if err := c.Do(opSet, true, args(key, key)); err != nil {
 			t.Fatal(err)
 		}
 		want[i] = []byte("+OK\r\n")
@@ -120,10 +128,47 @@ func TestBatchOverflowSplits(t *testing.T) {
 	}
 }
 
-func TestCommandTooBig(t *testing.T) {
-	rt := New(1, testArena, testSeg)
+// TestOversizedCommandGrowsNode admits a single command past the node's
+// steady data cap by growing an empty node, and the command still executes:
+// the store's own caps decide the outcome, not the transport's.
+func TestOversizedCommandGrowsNode(t *testing.T) {
+	rt := testRuntime(1)
+	rt.Start()
+	defer rt.Stop()
 	c := rt.NewConn()
-	if err := c.Do(OpSet, []byte("k"), make([]byte, batchDataCap+1)); err != ErrTooBig {
+
+	big := bytes.Repeat([]byte{'x'}, 2*batchDataCap)
+	if err := c.Do(opSet, true, [][]byte{[]byte("pre"), []byte("v")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Do(opSet, true, [][]byte{[]byte("big"), big}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Do(opGet, true, [][]byte{[]byte("big")}); err != nil {
+		t.Fatal(err)
+	}
+	c.Flush()
+	got := collect(t, c, 3)
+	if !bytes.Equal(got[0], []byte("+OK\r\n")) || !bytes.Equal(got[1], []byte("+OK\r\n")) {
+		t.Fatalf("writes = %q, %q", got[0], got[1])
+	}
+	want := append([]byte(fmt.Sprintf("$%d\r\n", len(big))), append(big, '\r', '\n')...)
+	if !bytes.Equal(got[2], want) {
+		t.Fatalf("oversized value came back %d bytes, want %d", len(got[2]), len(want))
+	}
+}
+
+func TestCommandTooBig(t *testing.T) {
+	rt := testRuntime(1)
+	c := rt.NewConn()
+	if err := c.Do(opSet, true, [][]byte{[]byte("k"), make([]byte, maxCmdBytes+1)}); err != ErrTooBig {
 		t.Fatalf("err = %v, want ErrTooBig", err)
+	}
+	many := make([][]byte, spanCap+1)
+	for i := range many {
+		many[i] = []byte("a")
+	}
+	if err := c.Do(opSet, true, many); err != ErrTooBig {
+		t.Fatalf("span overflow err = %v, want ErrTooBig", err)
 	}
 }

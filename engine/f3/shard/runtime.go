@@ -26,6 +26,19 @@ func New(shards, arenaBytes, segBytes int) *Runtime {
 	return r
 }
 
+// Use registers the op-indexed handler table on every worker: the handler for
+// op b sits at index b. Index 0 and OpError are reserved. Use must run before
+// Start; the table is fixed for the runtime's life so the owner loop reads it
+// with plain loads.
+func (r *Runtime) Use(handlers []Handler) {
+	if r.started {
+		panic("shard: Use after Start")
+	}
+	for _, w := range r.workers {
+		w.handlers = handlers
+	}
+}
+
 // Shards reports the shard count.
 func (r *Runtime) Shards() int { return len(r.workers) }
 

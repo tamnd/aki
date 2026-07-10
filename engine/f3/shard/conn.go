@@ -7,10 +7,11 @@ import (
 	"time"
 )
 
-// ErrTooBig is returned by Do when one command's key plus argument cannot fit
-// an empty batch node. The chunked giant-value path lifts this bound in the
-// value-bands slice.
-var ErrTooBig = errors.New("shard: command exceeds the batch data cap")
+// ErrTooBig is returned by Do when one command cannot fit even an empty batch
+// node: more than spanCap arguments, or more than maxCmdBytes of argument
+// data. The dispatcher answers it with an in-order error reply; the chunked
+// giant-value path lifts the byte bound in the value-bands slice.
+var ErrTooBig = errors.New("shard: command exceeds the batch node caps")
 
 // parked is one out-of-order reply held in the reorder ring until every lower
 // sequence has been emitted. The buffer is owned by the slot and reused, so
@@ -67,22 +68,24 @@ func (r *Runtime) NewConn() *Conn {
 	return c
 }
 
-// Do enqueues one command. Keyed ops route by wyhash of the key; keyless ops
+// Do enqueues one command with its full argument vector; a keyed command's
+// args[0] is its key. Keyed ops route by wyhash of the key; keyless ops
 // (PING, ECHO, parse errors) round-robin by sequence so the smoke surface
-// exercises the hop on every shard. Nothing is published until Flush or the
-// node fills.
-func (c *Conn) Do(op byte, key, arg []byte) error {
+// exercises the hop on every shard. The arguments are copied into the node
+// before Do returns, so the caller may reuse its views immediately. Nothing
+// is published until Flush or the node fills.
+func (c *Conn) Do(op byte, keyed bool, args [][]byte) error {
 	// The pipeline-window throttle: a reader more than a ring ahead of the
 	// writer blocks on the writer's progress, so a parked reply always has a
 	// distinct ring slot. The doc 03 section 4.5 watermarks replace this with
-	// per-shard backpressure in the RESP2 slice.
+	// per-shard backpressure in a later slice.
 	for c.seq-c.emitted.Load() >= uint32(len(c.ring)) {
 		c.Flush()
 		runtime.Gosched()
 	}
 	var sh int
-	if len(key) > 0 {
-		sh = c.rt.ShardOf(key)
+	if keyed {
+		sh = c.rt.ShardOf(args[0])
 	} else {
 		sh = int(c.seq % uint32(len(c.rt.workers)))
 	}
@@ -91,11 +94,11 @@ func (c *Conn) Do(op byte, key, arg []byte) error {
 		b = c.take()
 		c.pending[sh] = b
 	}
-	if !b.add(op, c.seq, key, arg) {
+	if !b.add(op, c.seq, keyed, args) {
 		c.flushShard(sh)
 		b = c.take()
 		c.pending[sh] = b
-		if !b.add(op, c.seq, key, arg) {
+		if !b.add(op, c.seq, keyed, args) {
 			return ErrTooBig
 		}
 	}
