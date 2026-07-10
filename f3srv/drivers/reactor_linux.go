@@ -36,12 +36,31 @@ import (
 // per touched loop (WakeLoop), so the owner-to-loop syscall traffic is
 // O(touched loops) per pass, not O(dirty connections).
 //
-// Streamed giant replies are still pumped inline into the connection's output
-// buffer (the Class OF slow-client discipline is slice 5), and the loop count
-// default is a placeholder for the slice 6 lab.
+// Streamed giant replies are Class OF on the loop (slice 5, doc 08 sections
+// 3.3, 3.5, and 9.1): the connection runs in step mode (SetStreamStep), so a
+// due stream becomes a cursor whose chunks the loop emits incrementally,
+// bounded per pass by streamQuanta and per buffer by the reply-buffer
+// headroom. The loop writes what the socket accepts, arms EPOLLOUT on a short
+// write, and resumes on writability or on the pump's chunk wake; it never
+// materializes the value in the output buffer and never blocks on one
+// connection's ring. A slow client past the OutBufLimitBytes hard cap is
+// disconnected mid-cycle, that connection only, and a failed stream likewise
+// drops only its own connection.
 
 // reactorMaxEvents is one epoll_wait's event budget per turn.
 const reactorMaxEvents = 256
+
+// streamQuanta bounds the streamed-reply chunks one service pass emits before
+// the loop requeues the connection behind its own eventfd: a fast-reading
+// giant GET shares the loop with every other connection on the fd shard
+// instead of owning it for the value's duration, which is the Class OF yield
+// (doc 08 section 9.1) expressed on the consumer side.
+const streamQuanta = 4
+
+// closeFD is syscall.Close for the dup'd connection fds, behind a variable so
+// the fd-lifecycle test can count every close. Each adopted (or adoption-
+// refused) dup must pass through here exactly once: no leak, no double close.
+var closeFD = syscall.Close
 
 // eventfd2 flags, mirrored from the kernel ABI; the stdlib syscall package
 // has the syscall number but not the flag names.
@@ -171,13 +190,13 @@ func adoptFD(nc net.Conn) (int, bool) {
 	_ = tc.Close()
 	if ctlErr != nil || dupfd < 0 {
 		if dupfd >= 0 {
-			_ = syscall.Close(dupfd)
+			_ = closeFD(dupfd)
 		}
 		return -1, false
 	}
 	if syscall.SetsockoptInt(dupfd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1) != nil ||
 		syscall.SetNonblock(dupfd, true) != nil {
-		_ = syscall.Close(dupfd)
+		_ = closeFD(dupfd)
 		return -1, false
 	}
 	return dupfd, true
@@ -222,10 +241,12 @@ type reactorConn struct {
 	pos  int
 	n    int
 
-	// out is the pending reply bytes. DrainReplies emits into it; flushOut
-	// writes as much as the socket takes and keeps the remainder. A streamed
-	// giant reply is pumped whole into it for now, so its bound is the reply
-	// size, not a window; the slice 5 slow-client discipline replaces that.
+	// out is the pending reply bytes. DrainReplies and stepStream emit into
+	// it; flushOut writes as much as the socket takes and keeps the
+	// remainder. A streamed giant reply feeds it one headroom-bounded
+	// quantum at a time (stepStream), so its working bound is the reply
+	// buffer plus the point-reply backlog, never the value; OutBufLimitBytes
+	// is the hard cap behind that (doc 08 section 3.5).
 	out  []byte
 	emit func([]byte)
 
@@ -282,7 +303,7 @@ func (l *reactorLoop) enqueue(fd int) {
 	l.mu.Lock()
 	if l.closing {
 		l.mu.Unlock()
-		_ = syscall.Close(fd)
+		_ = closeFD(fd)
 		return
 	}
 	l.pending = append(l.pending, fd)
@@ -445,6 +466,10 @@ func (l *reactorLoop) adopt(fd int) {
 	}
 	rc.cs = &connState{sc: rc.sc}
 	rc.emit = func(rep []byte) { rc.out = append(rc.out, rep...) }
+	// Step mode: a streamed reply becomes a cursor the loop advances with
+	// StreamStep instead of a blocking emit; the loop must never wait on one
+	// connection's chunk ring while the rest of its fd shard is ready.
+	rc.sc.SetStreamStep()
 	// Before any traffic, per the seam's contract: owners read the hook
 	// through the inbound queue's ordering. The batched form: a worker's
 	// drain pass marks each claimed connection dirty here and sends one
@@ -461,7 +486,7 @@ func (l *reactorLoop) adopt(fd int) {
 	if err := syscall.EpollCtl(l.epfd, syscall.EPOLL_CTL_ADD, fd, &ev); err != nil {
 		l.conns[fd] = nil
 		rc.sc.Close()
-		_ = syscall.Close(fd)
+		_ = closeFD(fd)
 		rc.fd = -1
 		return
 	}
@@ -519,10 +544,15 @@ func (l *reactorLoop) service(rc *reactorConn) {
 			return // dispatch failed; the conn is closed
 		}
 		rc.sc.DrainReplies(rc.emit)
-		if rc.sc.Failed() {
+		yielded := l.stepStream(rc)
+		if rc.fd < 0 {
+			return // a write error inside the step closed the conn
+		}
+		if rc.sc.Failed() || rc.sc.StreamAborted() {
 			// A streamed reply died after its header went out; nothing
 			// coherent can follow. Best-effort flush, then drop, mid-cycle,
-			// this conn only.
+			// this conn only. StreamAborted covers the write-blocked case,
+			// where the step never ran to observe the failure.
 			_ = l.flushOut(rc)
 			if rc.fd >= 0 {
 				l.closeConn(rc)
@@ -542,12 +572,82 @@ func (l *reactorLoop) service(rc *reactorConn) {
 			// backlog before parking.
 			continue
 		}
+		if yielded {
+			// The stream still has ready chunks but this pass's quanta are
+			// spent; stepStream's requeue guarantees the loop comes back.
+			// Parking would spin (ParkWriter re-checks stream readiness), so
+			// the writer stays unparked and the dirty entry is the wake.
+			break
+		}
+		if rc.writeBlocked && rc.sc.StreamReady() {
+			// Chunks are ready but the socket is full: the resume edge is
+			// EPOLLOUT, already armed by the short write. Same no-park
+			// reasoning as the yield above; completions that land meanwhile
+			// queue at the connection and drain when writability returns.
+			break
+		}
 		if rc.sc.ParkWriter() {
 			break
 		}
 		// Replies landed between the drain and the park; go around.
 	}
 	l.rearm(rc)
+}
+
+// stepStream advances the connection's in-progress streamed reply, the Class
+// OF quantum on the consumer side: emit ready chunks into the output buffer
+// only while it has headroom under the reply-buffer mark (doc 08 section 3.5,
+// the backlog-headroom check before building the next chunk), flush between
+// quanta, and stop after streamQuanta rounds. A stream still ready past the
+// budget requeues the connection behind the loop's own eventfd, so every
+// other ready fd is serviced between quanta; a stream stalled on the socket
+// resumes on EPOLLOUT, and one stalled on the ring resumes on the pump's
+// writer wake. It reports whether it stopped on the quanta budget with the
+// stream still ready (the caller must not park the writer then).
+func (l *reactorLoop) stepStream(rc *reactorConn) bool {
+	if !rc.sc.StreamReady() {
+		return false
+	}
+	for q := 0; q < streamQuanta; q++ {
+		if rc.writeBlocked || rc.fd < 0 || !rc.sc.StreamReady() {
+			return false
+		}
+		headroom := l.b.s.replyBuf - len(rc.out)
+		if headroom <= 0 {
+			if !l.flushOut(rc) {
+				return false
+			}
+			continue
+		}
+		rc.sc.StreamStep(rc.emit, headroom)
+		if rc.sc.Failed() {
+			return false
+		}
+		if !l.flushOut(rc) {
+			return false
+		}
+	}
+	if !rc.writeBlocked && rc.sc.StreamReady() {
+		l.requeue(rc)
+		return true
+	}
+	return false
+}
+
+// requeue marks rc dirty on its own loop and pokes the eventfd, the yield
+// half of the Class OF discipline: the pass's remaining stream work runs on a
+// later drainWake turn, after every other fd ready in this epoll batch has
+// been serviced. A false markDirty means an earlier mark is still queued with
+// a delivery behind it, so the loop is coming back regardless.
+func (l *reactorLoop) requeue(rc *reactorConn) {
+	if !l.markDirty(rc) {
+		return
+	}
+	l.mu.Lock()
+	if !l.closing {
+		l.wake()
+	}
+	l.mu.Unlock()
 }
 
 // parsePass parses every complete command the buffer holds while the
@@ -637,6 +737,16 @@ func (l *reactorLoop) flushOut(rc *reactorConn) bool {
 		switch err {
 		case syscall.EAGAIN:
 			rc.out = append(rc.out[:0], buf...) // shift remainder to the front
+			if lim := l.b.s.outLimit; lim > 0 && len(rc.out) > lim {
+				// The client's unread backlog passed the hard cap (doc 08
+				// section 3.5, client-output-buffer-limit): disconnect it,
+				// mid-cycle, this connection only, and count the event for
+				// INFO. The shard conn's Close fails any in-flight stream on
+				// the producer side, so nothing leaks.
+				l.b.s.outbufDrops.Add(1)
+				l.closeConn(rc)
+				return false
+			}
 			rc.writeBlocked = true
 			if wrote {
 				l.b.s.flushes.Add(1)
@@ -698,7 +808,7 @@ func (l *reactorLoop) closeConn(rc *reactorConn) {
 		return
 	}
 	_ = syscall.EpollCtl(l.epfd, syscall.EPOLL_CTL_DEL, rc.fd, nil)
-	_ = syscall.Close(rc.fd)
+	_ = closeFD(rc.fd)
 	if rc.fd < len(l.conns) {
 		l.conns[rc.fd] = nil
 	}
@@ -724,6 +834,6 @@ func (l *reactorLoop) shutdown() {
 	l.dirty = nil
 	l.mu.Unlock()
 	for _, fd := range pending {
-		_ = syscall.Close(fd)
+		_ = closeFD(fd)
 	}
 }

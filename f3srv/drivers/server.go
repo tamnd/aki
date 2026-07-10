@@ -117,6 +117,15 @@ type Options struct {
 	// shard count. The binding loop-count decision is the M10 slice 6 lab;
 	// this knob exists so that lab has something to sweep.
 	NetLoops int
+	// OutBufLimitBytes is the hard cap on one connection's pending reply
+	// bytes buffered driver-side (the client-output-buffer-limit lineage,
+	// doc 08 section 3.5): a client whose unread backlog passes it is
+	// disconnected, that connection only, and the event is counted in INFO as
+	// net_disconnects_outbuf. 0, the default, means no cap, matching Redis
+	// normal-class clients. The reactor driver enforces it; the goroutine
+	// driver's writer blocks on the socket instead of buffering, so it has no
+	// equivalent backlog to cap.
+	OutBufLimitBytes int
 }
 
 // Server is the goroutine-per-connection driver over the shard runtime. In
@@ -129,6 +138,7 @@ type Server struct {
 	ln         net.Listener
 	pprofLn    net.Listener
 	replyBuf   int
+	outLimit   int
 	flushEvery bool
 	shape      string
 	conns      sync.WaitGroup
@@ -152,6 +162,11 @@ type Server struct {
 	// happens before the Wait or never happens at all.
 	closeMu sync.Mutex
 	closed  bool
+
+	// outbufDrops counts connections disconnected at the OutBufLimitBytes
+	// hard cap, the doc 08 section 3.5 write-side discipline event; INFO
+	// renders it as net_disconnects_outbuf.
+	outbufDrops atomic.Uint64
 
 	// flushes counts writer socket flushes across all connections. With the
 	// reply buffer at its default every flush is one write syscall (a P16
@@ -231,6 +246,7 @@ func Listen(o Options) (*Server, error) {
 		rt:         rt,
 		ln:         ln,
 		replyBuf:   o.ReplyBufBytes,
+		outLimit:   o.OutBufLimitBytes,
 		flushEvery: o.FlushEveryDrain,
 		shape:      o.ConnShape,
 		driver:     NetGoroutine,
