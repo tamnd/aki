@@ -180,3 +180,121 @@ func TestPipelinedStrings(t *testing.T) {
 	}
 	expect(t, br, "+OK\r\n+OK\r\n$1\r\n1\r\n:3\r\n$-1\r\n:1\r\n:0\r\n+string\r\n")
 }
+
+// TestIncrFamily walks INCR/DECR/INCRBY/DECRBY/INCRBYFLOAT and their error
+// edges against the Redis texts.
+func TestIncrFamily(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	send(t, nc, "INCR", "n")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "INCRBY", "n", "41")
+	expect(t, br, ":42\r\n")
+	send(t, nc, "DECR", "n")
+	expect(t, br, ":41\r\n")
+	send(t, nc, "DECRBY", "n", "40")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "GET", "n")
+	expect(t, br, "$1\r\n1\r\n")
+
+	// A canonical text value converts; anything else refuses.
+	send(t, nc, "SET", "t", "99")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "INCR", "t")
+	expect(t, br, ":100\r\n")
+	send(t, nc, "SET", "t", "abc")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "INCR", "t")
+	expect(t, br, "-ERR value is not an integer or out of range\r\n")
+	send(t, nc, "INCRBY", "n", "ten")
+	expect(t, br, "-ERR value is not an integer or out of range\r\n")
+
+	// Overflow edges.
+	send(t, nc, "SET", "m", "9223372036854775807")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "INCR", "m")
+	expect(t, br, "-ERR increment or decrement would overflow\r\n")
+	send(t, nc, "SET", "m", "-9223372036854775808")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "DECR", "m")
+	expect(t, br, "-ERR increment or decrement would overflow\r\n")
+	send(t, nc, "DECRBY", "m", "-9223372036854775808")
+	expect(t, br, "-ERR decrement would overflow\r\n")
+
+	// INCRBYFLOAT: create from zero, then in-place add, TTL untouched.
+	send(t, nc, "INCRBYFLOAT", "f", "10.5")
+	expect(t, br, "$4\r\n10.5\r\n")
+	send(t, nc, "INCRBYFLOAT", "f", "0.1")
+	expect(t, br, "$4\r\n10.6\r\n")
+	send(t, nc, "INCRBYFLOAT", "f", "-5")
+	expect(t, br, "$3\r\n5.6\r\n")
+	send(t, nc, "INCRBYFLOAT", "f", "5e3")
+	expect(t, br, "$6\r\n5005.6\r\n")
+	send(t, nc, "INCRBYFLOAT", "f", "nan")
+	expect(t, br, "-ERR value is not a valid float\r\n")
+	send(t, nc, "INCRBYFLOAT", "f", "inf")
+	expect(t, br, "-ERR increment would produce NaN or Infinity\r\n")
+	send(t, nc, "SET", "t", "abc")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "INCRBYFLOAT", "t", "1")
+	expect(t, br, "-ERR value is not a valid float\r\n")
+}
+
+// TestStringValueOps walks APPEND, SETRANGE, and GETRANGE (with its SUBSTR
+// alias) over the socket.
+func TestStringValueOps(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	send(t, nc, "APPEND", "k", "hello")
+	expect(t, br, ":5\r\n")
+	send(t, nc, "APPEND", "k", " world")
+	expect(t, br, ":11\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$11\r\nhello world\r\n")
+
+	// SETRANGE inside, past the end with a zero gap, and the empty-value
+	// probe that never writes.
+	send(t, nc, "SETRANGE", "k", "6", "there")
+	expect(t, br, ":11\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$11\r\nhello there\r\n")
+	send(t, nc, "SETRANGE", "gap", "3", "xy")
+	expect(t, br, ":5\r\n")
+	send(t, nc, "GET", "gap")
+	expect(t, br, "$5\r\n\x00\x00\x00xy\r\n")
+	send(t, nc, "SETRANGE", "nope", "0", "")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "EXISTS", "nope")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "SETRANGE", "k", "-1", "x")
+	expect(t, br, "-ERR offset is out of range\r\n")
+	send(t, nc, "SETRANGE", "k", "536870912", "x")
+	expect(t, br, "-ERR string exceeds maximum allowed size (proto-max-bulk-len)\r\n")
+
+	// GETRANGE clamping, negative indexes, and the wholly negative reversed
+	// range that answers empty before folding.
+	send(t, nc, "GETRANGE", "k", "0", "4")
+	expect(t, br, "$5\r\nhello\r\n")
+	send(t, nc, "GETRANGE", "k", "-5", "-1")
+	expect(t, br, "$5\r\nthere\r\n")
+	send(t, nc, "GETRANGE", "k", "0", "-1")
+	expect(t, br, "$11\r\nhello there\r\n")
+	send(t, nc, "GETRANGE", "k", "5", "100000")
+	expect(t, br, "$6\r\n there\r\n")
+	send(t, nc, "GETRANGE", "k", "-100", "-200")
+	expect(t, br, "$0\r\n\r\n")
+	send(t, nc, "GETRANGE", "k", "9", "5")
+	expect(t, br, "$0\r\n\r\n")
+	send(t, nc, "GETRANGE", "missing", "0", "-1")
+	expect(t, br, "$0\r\n\r\n")
+	send(t, nc, "SUBSTR", "k", "0", "4")
+	expect(t, br, "$5\r\nhello\r\n")
+
+	// APPEND onto an int cell goes through the digits.
+	send(t, nc, "INCR", "n")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "APPEND", "n", "0")
+	expect(t, br, ":2\r\n")
+	send(t, nc, "INCR", "n")
+	expect(t, br, ":11\r\n")
+}
