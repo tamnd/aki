@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -150,5 +151,258 @@ func TestSetSepReplaceBandChange(t *testing.T) {
 	st := s.Stats()
 	if st.Embedded != 1 || st.Separated != 0 {
 		t.Fatalf("band census emb=%d sep=%d, want 1/0", st.Embedded, st.Separated)
+	}
+}
+
+// fillSepSeg writes separated-band records under prefix-numbered keys until
+// the current segment advances, returning the keys whose record and run both
+// landed in the segment that was current when it started.
+func fillSepSeg(t *testing.T, s *Store, prefix string, vlen int) (startSeg uint64, keys [][]byte) {
+	t.Helper()
+	startSeg = s.arena.cur
+	for i := 0; s.arena.cur == startSeg; i++ {
+		k := []byte(fmt.Sprintf("%s%06d", prefix, i))
+		if err := s.Set(k, sepVal(byte('a'+i%26), vlen)); err != nil {
+			t.Fatalf("Set %q: %v", k, err)
+		}
+		if s.arena.cur != startSeg {
+			s.Delete(k)
+			break
+		}
+		keys = append(keys, k)
+	}
+	if len(keys) == 0 {
+		t.Fatal("filled no keys before the segment advanced")
+	}
+	return startSeg, keys
+}
+
+// TestDeleteHeavyReclaim deletes every record in the first segments and pins
+// path 4, the whole-segment drop: CompactArena frees the fully dead segments
+// with no relocation and the arena fill drops back to the survivors.
+func TestDeleteHeavyReclaim(t *testing.T) {
+	s := testStore(t, 6)
+	seg0, keysA := fillSepSeg(t, s, "a", 4096)
+	seg1, keysB := fillSepSeg(t, s, "b", 4096)
+	_, keysC := fillSepSeg(t, s, "c", 4096)
+	for _, k := range append(keysA, keysB...) {
+		if !s.Delete(k) {
+			t.Fatalf("Delete %q: missing", k)
+		}
+	}
+	freed := s.CompactArena()
+	if freed < 2 {
+		t.Fatalf("CompactArena freed %d segments, want at least 2", freed)
+	}
+	if f := s.arena.fillOf(seg0); f != 0 {
+		t.Fatalf("segment %d still holds %d bytes", seg0, f)
+	}
+	if f := s.arena.fillOf(seg1); f != 0 {
+		t.Fatalf("segment %d still holds %d bytes", seg1, f)
+	}
+	for i, k := range keysC {
+		mustGet(t, s, k, string(sepVal(byte('a'+i%26), 4096)))
+	}
+}
+
+// TestCompactSurvivors forces a dead-fraction compaction and checks the
+// survivors: keys readable at their new addresses, values intact byte for
+// byte, deadline flag and value preserved, and the victim segment freed.
+func TestCompactSurvivors(t *testing.T) {
+	s := testStore(t, 6)
+	seg0, keys := fillSepSeg(t, s, "a", 4096)
+
+	// One survivor carries a deadline: republish it with a slot.
+	surv := keys[3]
+	if err := s.SetString(surv, sepVal('T', 4096), 1_000, 99_000, false); err != nil {
+		t.Fatal(err)
+	}
+	// And one embedded survivor, so both tenant kinds move.
+	emb := keys[5]
+	if err := s.Set(emb, []byte("embedded-survivor")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The republishes above may have advanced the cursor; make sure seg0 is
+	// not current, then kill everything else in it.
+	if s.arena.cur == seg0 {
+		fillSepSeg(t, s, "pad", 4096)
+	}
+	for _, k := range keys {
+		if string(k) == string(surv) || string(k) == string(emb) {
+			continue
+		}
+		s.Delete(k)
+	}
+
+	fill := s.arena.fillOf(seg0)
+	dead := s.arena.deadOf(seg0)
+	if dead*s.segDeadDen < fill*s.segDeadNum {
+		t.Fatalf("segment %d dead/fill %d/%d under the threshold; test setup broken", seg0, dead, fill)
+	}
+	_, oldSurv, _ := s.findEntry(Hash(surv), surv)
+	if si, _ := s.arena.segOf(oldSurv); si != seg0 {
+		// The TTL republish moved the survivor off the victim; that is fine,
+		// the embedded one is still there.
+		if si2, _ := s.arena.segOf(func() uint64 { _, a, _ := s.findEntry(Hash(emb), emb); return a }()); si2 != seg0 {
+			t.Skip("no survivor left in the victim segment; sizing changed")
+		}
+	}
+
+	if freed := s.CompactArena(); freed < 1 {
+		t.Fatalf("CompactArena freed %d segments, want at least 1", freed)
+	}
+	if f := s.arena.fillOf(seg0); f != 0 {
+		t.Fatalf("victim segment %d still holds %d bytes", seg0, f)
+	}
+	mustGet(t, s, surv, string(sepVal('T', 4096)))
+	mustGet(t, s, emb, "embedded-survivor")
+	_, addr, _ := s.findEntry(Hash(surv), surv)
+	if at := s.expireAt(addr); at != 99_000 {
+		t.Fatalf("survivor deadline %d after the move, want 99000", at)
+	}
+	if si, _ := s.arena.segOf(addr); si == seg0 {
+		t.Fatal("survivor still addresses the freed segment")
+	}
+}
+
+// TestCompactChunkedSurvivor moves a chunked record, its directory, and its
+// arena chunks across a forced compaction and reads the value back whole.
+func TestCompactChunkedSurvivor(t *testing.T) {
+	s := testStore(t, 12)
+	val := make([]byte, 3*strChunkMin/2) // two chunks, one partial
+	for i := range val {
+		val[i] = byte(i * 31)
+	}
+	if err := s.Set([]byte("big"), val); err != nil {
+		t.Fatal(err)
+	}
+	// Surround with churn so the chunks' segments go mostly dead.
+	_, keys := fillSepSeg(t, s, "pad", 4096)
+	for _, k := range keys {
+		s.Delete(k)
+	}
+	// Mark every touched non-current segment a victim by tuning the
+	// threshold to zero, so the chunked tenant is guaranteed to move.
+	s.TuneArenaReclaim(0, 1)
+	if freed := s.CompactArena(); freed < 1 {
+		t.Fatalf("CompactArena freed %d segments, want at least 1", freed)
+	}
+	got, ok := s.Get([]byte("big"), nil)
+	if !ok || !bytes.Equal(got, val) {
+		t.Fatalf("chunked value corrupt after compaction: ok=%v len=%d", ok, len(got))
+	}
+}
+
+// TestOpenStreamPinsArena pins the stream rule: while a ChunkStream is open
+// the compactor refuses to run, and after Release it runs again.
+func TestOpenStreamPinsArena(t *testing.T) {
+	s := testStore(t, 12)
+	val := make([]byte, strChunkMin)
+	if err := s.Set([]byte("big"), val); err != nil {
+		t.Fatal(err)
+	}
+	_, cs, ok := s.GetStream([]byte("big"), 0, nil)
+	if !ok || cs == nil {
+		t.Fatal("GetStream did not return a stream")
+	}
+	_, keys := fillSepSeg(t, s, "pad", 4096)
+	for _, k := range keys {
+		s.Delete(k)
+	}
+	s.TuneArenaReclaim(0, 1)
+	if freed := s.CompactArena(); freed != 0 {
+		t.Fatalf("CompactArena ran under an open stream, freed %d", freed)
+	}
+	cs.Release()
+	cs.Release() // idempotent
+	if freed := s.CompactArena(); freed < 1 {
+		t.Fatal("CompactArena did not run after the stream released")
+	}
+}
+
+// TestOverwriteSteadyState is the gate scenario in miniature: a small arena,
+// separated-band values, overwrite forever with varying sizes so runs churn,
+// compacting at simulated drain boundaries. The arena must never report full
+// and the fill must stay bounded under its total.
+func TestOverwriteSteadyState(t *testing.T) {
+	s := testStore(t, 8)
+	const nKeys = 32
+	sizes := []int{1536, 2048, 3072, 4096, 6144}
+	for i := 0; i < 20_000; i++ {
+		k := []byte(fmt.Sprintf("key%03d", i%nKeys))
+		v := sepVal(byte('a'+i%26), sizes[(i*7)%len(sizes)])
+		if err := s.Set(k, v); err != nil {
+			t.Fatalf("op %d: %v", i, err)
+		}
+		if i%256 == 0 && s.ArenaTight() {
+			s.CompactArena()
+		}
+	}
+	used, total := s.ArenaBytes()
+	if used > total {
+		t.Fatalf("arena fill %d over total %d", used, total)
+	}
+	for i := 0; i < nKeys; i++ {
+		k := []byte(fmt.Sprintf("key%03d", i))
+		if _, ok := s.Get(k, nil); !ok {
+			t.Fatalf("key %d missing after churn", i)
+		}
+	}
+}
+
+// TestArenaFullBackstop pins the write path's synchronous reclaim: with the
+// free list empty and a fully dead segment sitting there, a SET that would
+// have reported arena full frees it mid-command and succeeds.
+func TestArenaFullBackstop(t *testing.T) {
+	s := testStore(t, 2)
+	_, keysA := fillSepSeg(t, s, "a", 4096)
+	for _, k := range keysA {
+		s.Delete(k)
+	}
+	// Segment 0 is fully dead but on nobody's free list. Now write until the
+	// remaining segments would run out; the backstop must free segment 0
+	// instead of surfacing ErrFull.
+	var keysB [][]byte
+	for i := 0; i < 3*len(keysA); i++ {
+		k := []byte(fmt.Sprintf("b%06d", i))
+		if err := s.Set(k, sepVal('b', 4096)); err != nil {
+			t.Fatalf("op %d: %v", i, err)
+		}
+		keysB = append(keysB, k)
+		if len(keysB) > len(keysA) {
+			s.Delete(keysB[0])
+			keysB = keysB[1:]
+		}
+	}
+	for _, k := range keysB {
+		mustGet(t, s, k, string(sepVal('b', 4096)))
+	}
+}
+
+// TestArenaGenuinelyFull keeps the error path honest: when the live bytes
+// exceed what the arena can hold, ErrFull still surfaces and the store stays
+// readable.
+func TestArenaGenuinelyFull(t *testing.T) {
+	s := testStore(t, 2)
+	var keys [][]byte
+	var sawFull bool
+	for i := 0; i < 10_000; i++ {
+		k := []byte(fmt.Sprintf("k%06d", i))
+		err := s.Set(k, sepVal('x', 4096))
+		if err == ErrFull {
+			sawFull = true
+			break
+		}
+		if err != nil {
+			t.Fatalf("op %d: %v", i, err)
+		}
+		keys = append(keys, k)
+	}
+	if !sawFull {
+		t.Fatal("live fill never reported ErrFull")
+	}
+	for _, k := range keys {
+		mustGet(t, s, k, string(sepVal('x', 4096)))
 	}
 }

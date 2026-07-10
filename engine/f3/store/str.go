@@ -137,7 +137,7 @@ func (s *Store) allocString(key []byte, vcapB uint64, flags byte, at int64) (uin
 	if flags&flagHasTTL != 0 {
 		need += 8
 	}
-	off, ok := s.arena.allocRecord(need)
+	off, ok := s.arenaAlloc(need)
 	if !ok {
 		return 0, ErrFull
 	}

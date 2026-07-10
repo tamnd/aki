@@ -43,6 +43,23 @@ type Store struct {
 	// "where are they".
 	chunkBytes uint64
 
+	// segDeadNum/segDeadDen is the arena compactor's per-segment dead-fraction
+	// threshold, defaulted from the frozen lab constant; TuneArenaReclaim
+	// overrides it for the lab sweep.
+	segDeadNum uint64
+	segDeadDen uint64
+
+	// openStreams counts live ChunkStreams: each holds a snapshot of chunk
+	// run addresses, so while any is open no arena segment may be freed or
+	// compacted. chunkStreamAt pins, ChunkStream.Release unpins, both on the
+	// owner goroutine.
+	openStreams int
+
+	// victims and seen are the compactor's reusable scratch: the victim mask
+	// by arena segment and the visited mask by index segment.
+	victims []bool
+	seen    []bool
+
 	// vbuf is the store's value scratch for paths that must materialize a
 	// run (log-resident reads inside a rewrite); grown capacity is kept.
 	// cbuf is the chunk staging buffer, one chunk wide, allocated on the
@@ -72,8 +89,10 @@ type Options struct {
 // index ceiling short of the directory depth cap.
 func New(arenaBytes, segBytes int) *Store {
 	return &Store{
-		arena: newArena(arenaBytes, segBytes),
-		idx:   newIndex(),
+		arena:      newArena(arenaBytes, segBytes),
+		idx:        newIndex(),
+		segDeadNum: arenaSegDeadNum,
+		segDeadDen: arenaSegDeadDen,
 	}
 }
 
