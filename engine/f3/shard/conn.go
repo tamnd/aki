@@ -70,6 +70,16 @@ type Conn struct {
 	// already on the wire, so nothing coherent can follow and the transport
 	// must drop the connection. Writer side only, plain field.
 	failed bool
+
+	// wokeWorkers counts the worker wake tokens the reader side sent (the
+	// flushShard wake path, only when the CAS claimed a parked worker).
+	// Reader-side single-writer counter; see NetWakes.
+	wokeWorkers eventCounter
+
+	// parks counts the writer goroutine's real parks: blocks taken on the
+	// waker channel after the spin window, not spin turns. Writer-side
+	// single-writer counter; see NetWakes.
+	parks eventCounter
 }
 
 // Failed reports whether a streamed reply died mid-emit, leaving the wire in
@@ -163,7 +173,9 @@ func (c *Conn) flushShard(sh int) {
 	c.published.Store(c.seq)
 	w := c.rt.workers[sh]
 	if w.inbound.push(b) {
-		w.wk.wake()
+		if w.wk.wake() {
+			c.wokeWorkers.bump()
+		}
 		return
 	}
 	// Wake skipped. The invariant: a wake may be skipped only when the
@@ -316,6 +328,7 @@ func (c *Conn) idleOnce() {
 		c.wk.unparkSelf()
 		return
 	}
+	c.parks.bump()
 	c.wk.park()
 }
 

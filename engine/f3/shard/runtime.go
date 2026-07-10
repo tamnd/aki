@@ -13,6 +13,13 @@ import (
 type Runtime struct {
 	workers []*worker
 	started bool
+
+	// netInfo, when set, appends the transport's "# Net" lines to the INFO
+	// stats text (doc 08 section 9.5). The server layer owns the transport
+	// counters and registers the renderer through SetNetInfo before Start;
+	// connection writer goroutines read the field with plain loads during an
+	// INFO gather, which the fixed-before-Start rule makes safe.
+	netInfo func([]byte) []byte
 }
 
 // New builds a runtime of shards workers, each with its own store of

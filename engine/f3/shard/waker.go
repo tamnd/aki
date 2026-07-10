@@ -30,11 +30,15 @@ func (w *waker) init() {
 
 // wake is the producer side, called after work is published. The claim CAS
 // makes the token exactly-once: a producer that loses the race knows another
-// producer's token is already in flight.
-func (w *waker) wake() {
+// producer's token is already in flight. The return reports whether this call
+// sent the token, so callers can count real cross-goroutine wakeups (the doc
+// 08 section 9.5 counters) without charging the common single-load path.
+func (w *waker) wake() bool {
 	if w.state.Load() == stateParked && w.state.CompareAndSwap(stateParked, stateRunning) {
 		w.ch <- struct{}{}
+		return true
 	}
+	return false
 }
 
 // park blocks the consumer after it has stored stateParked and re-checked its
