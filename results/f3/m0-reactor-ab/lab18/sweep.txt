@@ -1,0 +1,13 @@
+GET 64B, 1048576 keys, 4 shards, 4 loops, 4s per cell, in process
+conn wakes/op is what slice 3 wrote to eventfd; loop wakes/op is what slice 4 writes
+
+| conns | pipeline | ops/s | conn wakes/op | loop wakes/op | yield | writes/op |
+|---|---|---|---|---|---|---|
+| 8 | P1 | 81437 | 1.000 | 0.919 | 1.09x | 1.000 |
+| 8 | P16 | 1046121 | 0.087 | 0.067 | 1.30x | 0.078 |
+| 64 | P1 | 344183 | 1.000 | 0.463 | 2.16x | 1.000 |
+| 64 | P16 | 4162516 | 0.098 | 0.026 | 3.84x | 0.082 |
+| 256 | P1 | 871534 | 1.000 | 0.189 | 5.30x | 1.000 |
+| 256 | P16 | 7633274 | 0.122 | 0.016 | 7.70x | 0.093 |
+| 512 | P1 | 1182954 | 1.000 | 0.145 | 6.89x | 1.000 |
+| 512 | P16 | 9045607 | 0.121 | 0.013 | 9.23x | 0.092 |
