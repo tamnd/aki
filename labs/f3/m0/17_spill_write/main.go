@@ -202,7 +202,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		_ = pprof.StartCPUProfile(f)
 		defer pprof.StopCPUProfile()
 	}
