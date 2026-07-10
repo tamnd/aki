@@ -22,7 +22,7 @@ import (
 // that never comes shows up as a read timeout, not a hang. Run under -race;
 // the CI f3 race pass covers it.
 func TestBoundaryFlushStress(t *testing.T) {
-	srv, err := Listen(Options{Addr: "127.0.0.1:0", Shards: 4, ArenaBytes: 32 << 20})
+	srv, err := Listen(Options{Addr: "127.0.0.1:0", Shards: 4, ArenaBytes: 32 << 20, ConnShape: testConnShape()})
 	if err != nil {
 		t.Fatal(err)
 	}

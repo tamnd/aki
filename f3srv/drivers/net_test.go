@@ -150,6 +150,13 @@ func TestInfoNetSection(t *testing.T) {
 	if !strings.Contains(text, "net_driver:goroutine\r\n") {
 		t.Fatalf("INFO missing net_driver line:\n%s", text)
 	}
+	shape := testConnShape()
+	if shape == "" {
+		shape = ShapeSingle
+	}
+	if !strings.Contains(text, "net_conn_shape:"+shape+"\r\n") {
+		t.Fatalf("INFO missing net_conn_shape:%s line:\n%s", shape, text)
+	}
 	stats := make(map[string]uint64)
 	for _, line := range strings.Split(text, "\r\n") {
 		name, val, ok := strings.Cut(line, ":")

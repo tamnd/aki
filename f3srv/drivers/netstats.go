@@ -66,6 +66,11 @@ type NetStats struct {
 	// verify the running config instead of trusting launch flags.
 	Driver string
 
+	// Shape is the goroutine driver's connection shape (ShapeSingle or
+	// ShapePair), recorded for the same reason: the lab 15 A/B reads it back
+	// off the wire instead of trusting the flag it launched with.
+	Shape string
+
 	// ReadSyscalls counts the reader goroutines' blocking socket reads;
 	// WriteSyscalls the writer goroutines' socket writes.
 	ReadSyscalls  uint64
@@ -112,6 +117,7 @@ func (s *Server) NetStats() NetStats {
 	s.netMu.Unlock()
 	ns.ConnWakes, ns.WorkerParks = s.rt.NetWakes()
 	ns.Driver = "goroutine"
+	ns.Shape = s.shape
 	return ns
 }
 
@@ -141,6 +147,8 @@ func (s *Server) appendNetInfo(text []byte) []byte {
 	ns := s.NetStats()
 	text = append(text, "\r\n# Net\r\nnet_driver:"...)
 	text = append(text, ns.Driver...)
+	text = append(text, "\r\nnet_conn_shape:"...)
+	text = append(text, ns.Shape...)
 	text = append(text, '\r', '\n')
 	stat := func(name string, v uint64) {
 		text = append(text, name...)
