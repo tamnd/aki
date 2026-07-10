@@ -21,8 +21,14 @@ The GET cells were expected to be controls and their rival rb numbers are bit-id
 ## Regression found: aki rb GETs down 8-12% vs m0-rerun
 
 aki rb GET 64B 5.71M to 5.00M and GET 1KiB 3.63M to 3.33M on an identical harness and box, while rival rb numbers did not move at all.
-The only aki change in the window is #573, and the suspect is the residency mark: GET now sets the flagVisited bit in the record header, turning a read-only path into one that dirties a cache line per hit.
-Open item for the next slice: make the mark check-before-store (only write the bit when it is clear) or sample it; the zipf LTM hit ratio argues the policy survives either.
+The only aki change in the window is #573, and the suspect on file at the time was the residency mark: GET setting the flagVisited bit in the record header, dirtying a cache line per hit.
+
+Correction (#578): the suspect was cleared and the delta is a session-state artifact, not a code regression.
+The headline GET cells run with no vlog, so the residency read path never executes on them, and the mark was check-before-store from #573's first commit anyway.
+An interleaved three-arm wire A/B on the box with run 3's exact parameters read old build, new build, and run 3's byte-identical binary at 4.696/4.695/4.696M (64B) and 3.324/3.325/3.324M (1KiB), identical within 0.1%.
+The same binary swings 13% across box sessions (5.32M vs 4.70M within an hour), and run 3's 5.00M vs the rerun's 5.71M sits inside that envelope, with run 3's p99 tails 3x the rerun's.
+Lab 16 (labs/f3/m0/16_visited_mark) prices the mark off/check/always on a fully resident GET path and all three tie within 0.6%.
+Standing rule from this episode: a cross-run delta on the box is attributed to a commit only after a same-session interleaved A/B reproduces it.
 
 ## LTM strings (2M x 1032B, aki 512MiB resident cap, rivals maxmemory 512mb allkeys-lfu)
 
@@ -46,4 +52,4 @@ Write-cell bytes/key now reads 113.4 at SET 64B (was 8.2 in m0-rerun); that is n
 ## State of the round after run 3
 
 Standing: all headliners between 1.12x and 1.58x, aki over valkey everywhere, memory bar green on LTM, no crashes, no generator-bound windows.
-Remaining to 2.0x on uniform point cells: the reactor pull-forward (notes/Spec 2064/f3/m10-pullforward.md), plus the two items this run opened, the flagVisited read-path regression and the LTM spill write path.
+Remaining to 2.0x on uniform point cells: the reactor pull-forward (notes/Spec 2064/f3/m10-pullforward.md), plus the one item this run opened that survived scrutiny, the LTM spill write path (the flagVisited suspicion was cleared by #578, see the correction above).
