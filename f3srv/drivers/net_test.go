@@ -172,7 +172,7 @@ func TestInfoNetSection(t *testing.T) {
 			t.Fatalf("%s = 0 in INFO after traffic (%v)", k, stats)
 		}
 	}
-	for _, k := range []string{"net_conn_wakes", "net_worker_parks", "net_conn_parks"} {
+	for _, k := range []string{"net_conn_wakes", "net_worker_parks", "net_conn_parks", "net_loop_wakes"} {
 		if _, ok := stats[k]; !ok {
 			t.Fatalf("%s missing from INFO (%v)", k, stats)
 		}

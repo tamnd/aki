@@ -180,6 +180,9 @@ func (s *Server) Flushes() uint64 { return s.flushes.Load() }
 type netBackend interface {
 	serve() error
 	stop()
+	// wakes reports the owner-to-loop wake deliveries the driver has paid
+	// (the reactor's eventfd writes), the NetStats.LoopWakes source.
+	wakes() uint64
 }
 
 // Listen builds the runtime, registers the command table, starts the workers,

@@ -91,6 +91,14 @@ type NetStats struct {
 	// channel after the spin window, not spin turns.
 	WorkerParks uint64
 	ConnParks   uint64
+
+	// LoopWakes counts the owner-to-loop wake deliveries the reactor driver
+	// paid: eventfd writes, batched to one per touched loop per worker drain
+	// pass (M10 pull-forward slice 4). ConnWakes still counts the per-
+	// connection claims, so LoopWakes/ConnWakes is the batching yield the
+	// slice exists for; the goroutine driver reports zero here because its
+	// per-connection channel token is the delivery.
+	LoopWakes uint64
 }
 
 // addConn folds one connection's counters into the snapshot.
@@ -116,6 +124,9 @@ func (s *Server) NetStats() NetStats {
 	}
 	s.netMu.Unlock()
 	ns.ConnWakes, ns.WorkerParks = s.rt.NetWakes()
+	if s.backend != nil {
+		ns.LoopWakes = s.backend.wakes()
+	}
 	ns.Driver = s.driver
 	ns.Shape = s.shape
 	return ns
@@ -164,5 +175,6 @@ func (s *Server) appendNetInfo(text []byte) []byte {
 	stat("net_worker_parks", ns.WorkerParks)
 	stat("net_conn_wakes", ns.ConnWakes)
 	stat("net_conn_parks", ns.ConnParks)
+	stat("net_loop_wakes", ns.LoopWakes)
 	return text
 }
