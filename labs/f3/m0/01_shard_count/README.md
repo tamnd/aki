@@ -34,3 +34,35 @@ Notes on the shape:
 ## Provisional verdict
 
 Laptop numbers, hypothesis until the GamingPC rerun. One shard per data-plane core is the rule: the engine scales essentially linearly to the core count and there is no cliff to avoid. The 2x-cores row's small gain is a P/E-core artifact of macOS scheduling, not evidence for oversubscription; on the gate box, where owners pin to homogeneous cores and the other ~40 percent of cores must stay free for parse and syscalls, oversubscribing owners would steal exactly those cores. The doc 03 default (S = 8 owners on the 14-core gate box, sweep {6, 8, 10}) stands. The gate-box sweep must rerun this with real `sched_setaffinity` pinning before the shard-count flag default is frozen.
+
+## Gate box results
+
+GamingPC: i9-13900K (Raptor Lake, 8 P-cores + 16 E-cores, 32 CPUs with HT), 56GB RAM, WSL2 Debian on Windows 11 (kernel 6.18.33.2-microsoft-standard-WSL2), Go 1.26.0, aki fc4a79f. Real Linux affinity this time: `taskset -c 0,2,4,6,8,10,12,14` restricts the run to one HT sibling per P-core (the lab sees 8 homogeneous cores), and a second run uses the full 32-CPU mask. Single run each; the 8-shard row repeated within 2 percent across the two configs.
+
+Pinned to 8 P-cores:
+
+| shards | Mops/s | speedup vs 1 | per-shard Mops/s |
+|---|---|---|---|
+| 1 | 4.9 | 1.00x | 4.89 |
+| 2 | 9.9 | 2.02x | 4.93 |
+| 4 | 20.7 | 4.24x | 5.18 |
+| 8 | 50.4 | 10.31x | 6.30 |
+| 8 | 49.4 | 10.12x | 6.18 |
+| 16 | 68.6 | 14.05x | 4.29 |
+
+All 32 CPUs:
+
+| shards | Mops/s | speedup vs 1 | per-shard Mops/s |
+|---|---|---|---|
+| 1 | 4.9 | 1.00x | 4.86 |
+| 2 | 9.8 | 2.01x | 4.89 |
+| 4 | 20.6 | 4.23x | 5.14 |
+| 8 | 49.8 | 10.24x | 6.22 |
+| 32 | 186.4 | 38.34x | 5.83 |
+| 64 | 306.6 | 63.05x | 4.79 |
+
+The superlinear column is the working-set shrink the laptop notes already called out, and on this box it is the whole story of the oversubscribed rows: the lab deals a fixed 1M keys, so 64 shards hold 16k keys each and every shard runs cache-resident. The 16-on-8 and 64-on-32 gains are that artifact, not evidence that time-slicing owners helps; per-shard throughput peaks exactly at shards = cores (6.3 Mops/s at 8-on-8, 5.8 at 32-on-32) and falls once shards oversubscribe. 8 shards perform the same under the 8-P-core mask and the full mask, so E-cores add nothing to 8 pinned owners.
+
+## Gate box verdict
+
+One shard per data-plane core stands with honest `sched_setaffinity` pinning: 10.3x at 8 shards on 8 P-cores, no cliff, and the oversubscription rows are a fixed-keyspace artifact rather than a scheduling win. The doc 03 default (S = 8 owners, sweep {6, 8, 10} on this box) is confirmed; the shard-count flag default can freeze.
