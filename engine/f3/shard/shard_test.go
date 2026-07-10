@@ -71,32 +71,25 @@ func TestSingleShardSmoke(t *testing.T) {
 
 // TestWakeFromPark parks every worker by going quiet well past the spin
 // window, then pushes and expects the reply: the producer-side wake rule has
-// to bring a parked worker back. One command per round so the check does not
-// lean on cross-shard reply order.
+// to bring a parked worker back.
 func TestWakeFromPark(t *testing.T) {
 	rt := New(2, testArena, testSeg)
 	rt.Start()
 	defer rt.Stop()
 	c := rt.NewConn()
 
-	for round := 0; round < 6; round++ {
+	for round := 0; round < 3; round++ {
 		time.Sleep(5 * time.Millisecond) // well past spinWindow: workers parked
-		var want []byte
-		if round%2 == 0 {
-			if err := c.Do(OpEcho, nil, []byte("wake")); err != nil {
-				t.Fatal(err)
-			}
-			want = []byte("$4\r\nwake\r\n")
-		} else {
-			if err := c.Do(OpSet, []byte(fmt.Sprintf("wk%d", round)), []byte("v")); err != nil {
-				t.Fatal(err)
-			}
-			want = []byte("+OK\r\n")
+		if err := c.Do(OpEcho, nil, []byte("wake")); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Do(OpSet, []byte(fmt.Sprintf("wk%d", round)), []byte("v")); err != nil {
+			t.Fatal(err)
 		}
 		c.Flush()
-		got := collect(t, c, 1)
-		if !bytes.Equal(got[0], want) {
-			t.Fatalf("round %d reply = %q, want %q", round, got[0], want)
+		got := collect(t, c, 2)
+		if !bytes.Equal(got[0], []byte("$4\r\nwake\r\n")) || !bytes.Equal(got[1], []byte("+OK\r\n")) {
+			t.Fatalf("round %d replies = %q, %q", round, got[0], got[1])
 		}
 	}
 }
