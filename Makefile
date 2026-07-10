@@ -1,6 +1,6 @@
 # Build into bin/ (gitignored) so the binary never collides with package source.
-BINARY  := bin/aki
-PKG     := ./cmd/aki
+BINARY  := bin/f1srv
+PKG     := ./cmd/f1srv
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 LDFLAGS := -s -w -X main.Version=$(VERSION) -X main.Commit=$(COMMIT)

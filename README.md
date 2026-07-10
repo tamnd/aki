@@ -8,22 +8,21 @@ The design is captured in a detailed multi-document specification, and implement
 
 ## Status
 
-Early development. The storage substrate (the virtual-filesystem seam, CRC-32C checksums, the varint/record encoding, the single-file format, the pager and buffer pool, the write-ahead log, group commit, and crash recovery) is the M0 milestone and lands first; the Redis personality (RESP server, command dispatch, data types) follows on top of it.
+Early development. The tree holds the f1 engine (`engine/f1raw`, `f1srv`), which keeps serving as the reference, and the f2 spike (`engine/f2raw`, `f2srv`). The f3 rebuild lands next under `engine/f3` and `f3srv`; the pre-f1 btree/pager storage tree has been removed.
 
 ## Layout
 
-- `vfs` — the virtual-filesystem seam: open/read/write/sync/truncate over a named file, with an in-memory and a fault-injecting backend for crash testing.
-- `checksum` — CRC-32C (Castagnoli) used by the file header, page headers, and WAL frames.
-- `encoding` — varint (LEB128), zigzag, and fixed-width little-endian integer codecs.
-- `format` — the on-disk `.aki` format: the 16-byte magic, the file header, page types, the slotted page layout, and the double-buffered meta pages.
-- `pager` — the pager and buffer pool: page allocation, the freelist, pin/unpin, dirty write-back under WAL discipline.
-- `wal` — the write-ahead log, group commit, the fsync model, checkpointing, and crash recovery.
-- `cmd/aki` — the `aki` binary (`server`, `cli`, `check`, `dump`, `import`, `bench`).
+- `engine/f1raw` — the f1 in-memory engine: bucket index, arenas, cold tiering.
+- `f1srv` — the RESP server on top of `engine/f1raw`.
+- `cmd/f1srv` — the `f1srv` binary, the serving reference until the f3 engine replaces it.
+- `engine/f2raw`, `f2srv`, `cmd/f2srv` — the f2 point-store spike, kept until the f3 M0 gate posts.
+- `labs` — standalone microbenchmarks that settle design constants.
+- `bench` — benchmark helpers.
 
 ## Build
 
 ```
-make build      # build bin/aki
+make build      # build bin/f1srv
 make test       # go test ./...
 make race       # go test -race ./...
 ```
