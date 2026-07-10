@@ -110,13 +110,14 @@ func (s *Store) writeRun(a, b []byte, capB uint64) (word uint64, vcap uint32, er
 		return 0, 0, err
 	}
 	if len(b) > 0 {
-		if _, err := s.vlog.f.WriteAt(b, int64(s.vlog.tail)); err != nil {
+		// Contiguous with a by append's contract: single owner, no
+		// interleaving appender exists.
+		if _, err := s.vlog.append(b); err != nil {
 			// The a bytes are already appended; they become dead space the
 			// next compaction drops.
 			s.vlog.dead += uint64(len(a))
 			return 0, 0, err
 		}
-		s.vlog.tail += uint64(len(b))
 	}
 	s.logRuns++
 	return inLogBit | off, uint32(n), nil

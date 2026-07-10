@@ -54,6 +54,7 @@ func (s *Store) CompactLog() error {
 	if err != nil {
 		return err
 	}
+	nl.flushAt = old.flushAt // carry a lab-tuned threshold across the swap
 	// Copy phase. buf is reused across reads: readInto fills it from the old
 	// log, append copies those bytes into the new log before the next read
 	// overwrites them, so one buffer serves the whole walk. It grows to the
@@ -83,6 +84,13 @@ func (s *Store) CompactLog() error {
 				return err
 			}
 		}
+	}
+	// The copies are buffered appends; land them before any pointer moves so
+	// the apply phase stays failure-free. An abort here loses nothing, the
+	// same as a copy-phase abort.
+	if err := nl.flush(); err != nil {
+		abortCompact(nl, newPath)
+		return err
 	}
 	// Apply phase, no failure possible from here. Repoint every staged
 	// record, swap the new log in before dropping the old one so a read after
