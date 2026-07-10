@@ -7,12 +7,10 @@ import (
 	"strconv"
 )
 
-// The string surface (spec 2064/f3/09): the point commands' storage half.
-// Two bands live here, the V_INT cell and the embedded bytes; the separated
-// and chunked bands land with the value-bands slice, so the 64KiB embed cap
-// is the hard value bound until then. TTL is the inline expiry slot with lazy
-// delete-on-touch; every read path funnels through findLive so an expired
-// record is reaped by the first touch that sees it.
+// The string surface (spec 2064/f3/09): the point commands' storage half,
+// over the value bands bands.go defines. TTL is the inline expiry slot with
+// lazy delete-on-touch; every read path funnels through findLive so an
+// expired record is reaped by the first touch that sees it.
 
 // ErrNotInt is returned when arithmetic hits a value that is not a canonical
 // integer.
@@ -122,7 +120,7 @@ func (s *Store) findLive(h uint64, key []byte, now int64) (slot *uint64, addr ui
 	if addr != 0 && now != 0 {
 		if at := s.expireAt(addr); at != 0 && at <= now {
 			s.deleteAt(h, slot, inOverflow)
-			s.arena.unlink(addr, s.recBytes(addr))
+			s.dropRecord(addr)
 			s.count--
 			return nil, 0, false
 		}
@@ -159,12 +157,14 @@ func (s *Store) allocString(key []byte, vcapB uint64, flags byte, at int64) (uin
 }
 
 // publish points the index at a fresh record: repoint the existing slot and
-// charge back the old bytes, or insert a new entry.
+// release the superseded record (its band count, its outside value bytes, its
+// arena charge), or insert a new entry.
 func (s *Store) publish(h uint64, slot *uint64, oldAddr, off uint64) {
 	word := tagOf(h)<<tagShift | off
+	s.noteNew(s.recFlags(off))
 	if oldAddr != 0 {
 		*slot = word
-		s.arena.unlink(oldAddr, s.recBytes(oldAddr))
+		s.dropRecord(oldAddr)
 		return
 	}
 	s.insertEntry(h, word)
@@ -180,11 +180,31 @@ func (s *Store) GetString(key []byte, now int64, dst []byte) ([]byte, bool) {
 		return dst[:0], false
 	}
 	vs := s.valueStart(addr)
-	if s.recFlags(addr)&flagInt != 0 {
+	f := s.recFlags(addr)
+	if f&flagInt != 0 {
 		n := int64(binary.LittleEndian.Uint64(s.arena.buf[vs:]))
 		return strconv.AppendInt(dst[:0], n, 10), true
 	}
+	if f&flagSep != 0 {
+		return s.readSep(addr, dst)
+	}
 	return append(dst[:0], s.arena.buf[vs:vs+s.vlen(addr)]...), true
+}
+
+// readSep copies a separated record's run into dst: a view copy from the
+// arena, or one pread from the log. A log read error reads as absent, the
+// only answer a point read can give for bytes it cannot reach.
+func (s *Store) readSep(addr uint64, dst []byte) ([]byte, bool) {
+	word, vlen, _ := s.readPtr(s.valueStart(addr))
+	if word&inLogBit != 0 {
+		v, err := s.vlog.readInto(word&runAddrMask, int(vlen), dst)
+		if err != nil {
+			return dst[:0], false
+		}
+		return v, true
+	}
+	run := word & runAddrMask
+	return append(dst[:0], s.arena.buf[run:run+uint64(vlen)]...), true
 }
 
 // Exists reports whether key holds a live record.
@@ -212,7 +232,7 @@ func (s *Store) Del(key []byte, now int64) bool {
 		return false
 	}
 	s.deleteAt(h, slot, inOverflow)
-	s.arena.unlink(addr, s.recBytes(addr))
+	s.dropRecord(addr)
 	s.count--
 	return true
 }
@@ -240,17 +260,19 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 	iv, isInt := ParseInt(val)
 
 	if addr != 0 {
-		// In place when the value fits the reserved capacity and the TTL
-		// layout is compatible: a record without a slot cannot take a
-		// deadline, and a record with one keeps it for life (clearing writes
-		// zero into the slot).
+		// In place when the record holds its bytes itself (int or embedded;
+		// a separated record's area is a pointer, so a full replace always
+		// republishes and re-selects the band from scratch), the value fits
+		// the reserved capacity, and the TTL layout is compatible: a record
+		// without a slot cannot take a deadline, and a record with one keeps
+		// it for life (clearing writes zero into the slot).
 		f := s.recFlags(addr)
 		hasSlot := f&flagHasTTL != 0
 		need := uint64(len(val))
 		if isInt {
 			need = 8
 		}
-		if need <= s.vcapBytes(addr) && (at == 0 || hasSlot) {
+		if f&flagSep == 0 && need <= s.vcapBytes(addr) && (at == 0 || hasSlot) {
 			vs := s.valueStart(addr)
 			nf := f &^ (flagInt | flagRawSticky)
 			if isInt {
@@ -259,6 +281,7 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 			} else {
 				copy(s.arena.buf[vs:vs+uint64(len(val))], val)
 			}
+			s.noteFlip(f, nf)
 			s.setRecFlags(addr, nf)
 			s.setVlen(addr, uint32(len(val)))
 			if hasSlot {
@@ -270,9 +293,13 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 
 	var flags byte
 	vcapB := align8(uint64(len(val)))
-	if isInt {
+	switch {
+	case isInt:
 		flags |= flagInt
 		vcapB = 8
+	case len(val) > strInlineMax:
+		flags |= flagSep
+		vcapB = ptrSize
 	}
 	if at != 0 {
 		flags |= flagHasTTL
@@ -282,9 +309,17 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 		return err
 	}
 	vs := s.valueStart(off)
-	if isInt {
+	switch {
+	case isInt:
 		binary.LittleEndian.PutUint64(s.arena.buf[vs:], uint64(iv))
-	} else {
+	case flags&flagSep != 0:
+		word, vcap, err := s.writeRun(val, nil, 0)
+		if err != nil {
+			s.arena.unlink(off, s.recBytes(off))
+			return err
+		}
+		s.writePtr(s.valueStart(off), word, uint32(len(val)), vcap)
+	default:
 		copy(s.arena.buf[vs:], val)
 	}
 	s.setVlen(off, uint32(len(val)))
@@ -322,6 +357,11 @@ func (s *Store) IncrBy(key []byte, delta, now int64) (int64, error) {
 	if f&flagInt != 0 {
 		cur = int64(binary.LittleEndian.Uint64(s.arena.buf[vs:]))
 	} else {
+		// A separated or chunked value is over 1KiB by construction, far past
+		// any integer's text, so it is not int-shaped without reading it.
+		if f&flagSep != 0 {
+			return 0, ErrNotInt
+		}
 		var ok bool
 		cur, ok = ParseInt(s.arena.buf[vs : vs+s.vlen(addr)])
 		if !ok {
@@ -333,23 +373,23 @@ func (s *Store) IncrBy(key []byte, delta, now int64) (int64, error) {
 	}
 	n := cur + delta
 	binary.LittleEndian.PutUint64(s.arena.buf[vs:], uint64(n))
-	s.setRecFlags(addr, (f&^flagRawSticky)|flagInt)
+	nf := (f &^ flagRawSticky) | flagInt
+	s.noteFlip(f, nf)
+	s.setRecFlags(addr, nf)
 	s.setVlen(addr, decLen(n))
 	return n, nil
 }
 
 // growCap is the doc 09 section 2 capacity policy for a growing embedded
 // value: republish with the larger of the exact need and double the old
-// reservation. The multiplier is the settled APPEND growth lab (doubling
-// inside the embedded band); the doc stops doubling at str_inline_max and
-// moves the value to the separated band past it, but that band is a later
-// slice, so until it lands doubling runs to the 64KiB embed cap.
+// reservation, and stop doubling at str_inline_max, past which the value
+// moves to the separated band. The multiplier is the settled APPEND growth
+// lab (doubling inside the embedded band, 1.5x in the separated band).
 func growCap(newLen, oldCap uint64) uint64 {
-	const capMax = (maxVal + 7) &^ 7
 	c := align8(newLen)
 	d := 2 * oldCap
-	if d > capMax {
-		d = capMax
+	if d > strInlineMax {
+		d = strInlineMax
 	}
 	if d > c {
 		c = d
@@ -357,20 +397,92 @@ func growCap(newLen, oldCap uint64) uint64 {
 	return c
 }
 
-// materialize returns the record's value as text: the embedded bytes
-// directly, or an int cell rendered into scratch.
-func (s *Store) materialize(addr uint64, scratch []byte) []byte {
-	vs := s.valueStart(addr)
-	if s.recFlags(addr)&flagInt != 0 {
-		n := int64(binary.LittleEndian.Uint64(s.arena.buf[vs:]))
-		return strconv.AppendInt(scratch[:0], n, 10)
+// growSepCap is the separated band's run growth: 1.5x the old run, floored at
+// the exact need.
+func growSepCap(newLen, oldCap uint64) uint64 {
+	c := align8(newLen)
+	if d := align8(oldCap + oldCap/2); d > c {
+		c = d
 	}
-	return s.arena.buf[vs : vs+s.vlen(addr)]
+	return c
+}
+
+// materialize returns the record's value as text: the embedded bytes or an
+// arena run directly, an int cell rendered into scratch, or a log run read
+// into the store scratch. The view is valid until the next store write.
+func (s *Store) materialize(addr uint64, scratch []byte) ([]byte, error) {
+	vs := s.valueStart(addr)
+	f := s.recFlags(addr)
+	if f&flagInt != 0 {
+		n := int64(binary.LittleEndian.Uint64(s.arena.buf[vs:]))
+		return strconv.AppendInt(scratch[:0], n, 10), nil
+	}
+	if f&flagSep != 0 {
+		word, vlen, _ := s.readPtr(vs)
+		if word&inLogBit != 0 {
+			v, err := s.vlog.readInto(word&runAddrMask, int(vlen), s.vbuf)
+			s.vbuf = v[:cap(v)][:0]
+			if err != nil {
+				return nil, err
+			}
+			return v, nil
+		}
+		run := word & runAddrMask
+		return s.arena.buf[run : run+uint64(vlen)], nil
+	}
+	return s.arena.buf[vs : vs+s.vlen(addr)], nil
+}
+
+// allocSep lays down a fresh separated record: header and key through
+// allocString, the run of a then b (b may be nil) through writeRun, then the
+// pointer in the value area. The record is unlinked again if the run fails,
+// so a caller sees either a complete record or nothing.
+func (s *Store) allocSep(key, a, b []byte, flags byte, at int64) (uint64, error) {
+	off, err := s.allocString(key, ptrSize, flags|flagSep, at)
+	if err != nil {
+		return 0, err
+	}
+	word, vcap, err := s.writeRun(a, b, 0)
+	if err != nil {
+		s.arena.unlink(off, s.recBytes(off))
+		return 0, err
+	}
+	n := uint32(len(a) + len(b))
+	s.writePtr(s.valueStart(off), word, n, vcap)
+	s.setVlen(off, n)
+	return off, nil
+}
+
+// appendSep grows a separated record's run to old followed by add: in place
+// when the run sits in the arena with capacity to spare, otherwise a fresh
+// run under growSepCap and a pointer swap inside the unchanged record. The
+// record never republishes because its value area is the pointer either way.
+func (s *Store) appendSep(addr uint64, old, add []byte, newLen int) (int64, error) {
+	vs := s.valueStart(addr)
+	word, _, vcap := s.readPtr(vs)
+	f := s.recFlags(addr)
+	if word&inLogBit == 0 && uint64(newLen) <= uint64(vcap) {
+		run := word & runAddrMask
+		copy(s.arena.buf[run+uint64(len(old)):], add)
+	} else {
+		nw, nc, err := s.writeRun(old, add, growSepCap(uint64(newLen), uint64(vcap)))
+		if err != nil {
+			return 0, err
+		}
+		// Release the old run while the pointer still names it, then swap.
+		s.dropValue(addr)
+		word, vcap = nw, nc
+	}
+	s.writePtr(vs, word, uint32(newLen), vcap)
+	s.setRecFlags(addr, f|flagRawSticky)
+	s.setVlen(addr, uint32(newLen))
+	return int64(newLen), nil
 }
 
 // Append concatenates add onto key's value, creating the key when absent,
 // and returns the new length. In place when the result fits the reserved
-// capacity; otherwise one republish under growCap. Any existing deadline
+// capacity; otherwise one republish under growCap, or a run swap under
+// growSepCap once the value sits in the separated band. Any existing deadline
 // rides along: APPEND modifies the value, it does not replace the key.
 func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 	if len(key) == 0 {
@@ -387,6 +499,14 @@ func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 		}
 		// Create-on-miss is SET with the raw-sticky bit: zero headroom, the
 		// first growth buys the slack.
+		if len(add) > strInlineMax {
+			off, err := s.allocSep(key, add, nil, flagRawSticky, 0)
+			if err != nil {
+				return 0, err
+			}
+			s.publish(h, slot, 0, off)
+			return int64(len(add)), nil
+		}
 		off, err := s.allocString(key, align8(uint64(len(add))), flagRawSticky, 0)
 		if err != nil {
 			return 0, err
@@ -398,10 +518,16 @@ func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 	}
 	f := s.recFlags(addr)
 	var scratch [20]byte
-	old := s.materialize(addr, scratch[:])
+	old, err := s.materialize(addr, scratch[:])
+	if err != nil {
+		return 0, err
+	}
 	newLen := len(old) + len(add)
 	if newLen > maxVal {
 		return 0, ErrTooBig
+	}
+	if f&flagSep != 0 {
+		return s.appendSep(addr, old, add, newLen)
 	}
 	vs := s.valueStart(addr)
 	if uint64(newLen) <= s.vcapBytes(addr) {
@@ -409,7 +535,9 @@ func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 			copy(s.arena.buf[vs:], old)
 		}
 		copy(s.arena.buf[vs+uint64(len(old)):], add)
-		s.setRecFlags(addr, (f&^flagInt)|flagRawSticky)
+		nf := (f &^ flagInt) | flagRawSticky
+		s.noteFlip(f, nf)
+		s.setRecFlags(addr, nf)
 		s.setVlen(addr, uint32(newLen))
 		return int64(newLen), nil
 	}
@@ -417,6 +545,16 @@ func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 	flags := byte(flagRawSticky)
 	if at != 0 {
 		flags |= flagHasTTL
+	}
+	if newLen > strInlineMax {
+		// The growth crosses the embedded cap: the record leaves the band and
+		// republishes in separated form.
+		off, err := s.allocSep(key, old, add, flags, at)
+		if err != nil {
+			return 0, err
+		}
+		s.publish(h, slot, addr, off)
+		return int64(newLen), nil
 	}
 	off, err := s.allocString(key, growCap(uint64(newLen), s.vcapBytes(addr)), flags, at)
 	if err != nil {
@@ -451,6 +589,15 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 	slot, addr, _ := s.findLive(h, key, now)
 	buf := s.arena.buf
 	if addr == 0 {
+		if end > strInlineMax {
+			nv := s.patchValue(nil, offset, val)
+			off, err := s.allocSep(key, nv, nil, flagRawSticky, 0)
+			if err != nil {
+				return 0, err
+			}
+			s.publish(h, slot, 0, off)
+			return int64(end), nil
+		}
 		off, err := s.allocString(key, align8(uint64(end)), flagRawSticky, 0)
 		if err != nil {
 			return 0, err
@@ -464,10 +611,16 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 	}
 	f := s.recFlags(addr)
 	var scratch [20]byte
-	old := s.materialize(addr, scratch[:])
+	old, err := s.materialize(addr, scratch[:])
+	if err != nil {
+		return 0, err
+	}
 	newLen := len(old)
 	if end > newLen {
 		newLen = end
+	}
+	if f&flagSep != 0 {
+		return s.setRangeSep(addr, old, offset, val, newLen)
 	}
 	vs := s.valueStart(addr)
 	if uint64(newLen) <= s.vcapBytes(addr) {
@@ -478,7 +631,9 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 			clear(buf[vs+uint64(len(old)) : vs+uint64(offset)])
 		}
 		copy(buf[vs+uint64(offset):], val)
-		s.setRecFlags(addr, (f&^flagInt)|flagRawSticky)
+		nf := (f &^ flagInt) | flagRawSticky
+		s.noteFlip(f, nf)
+		s.setRecFlags(addr, nf)
 		s.setVlen(addr, uint32(newLen))
 		return int64(newLen), nil
 	}
@@ -486,6 +641,17 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 	flags := byte(flagRawSticky)
 	if at != 0 {
 		flags |= flagHasTTL
+	}
+	if newLen > strInlineMax {
+		// The write crosses the embedded cap: the record leaves the band and
+		// republishes in separated form over the patched bytes.
+		nv := s.patchValue(old, offset, val)
+		off, err := s.allocSep(key, nv, nil, flags, at)
+		if err != nil {
+			return 0, err
+		}
+		s.publish(h, slot, addr, off)
+		return int64(newLen), nil
 	}
 	off, err := s.allocString(key, growCap(uint64(newLen), s.vcapBytes(addr)), flags, at)
 	if err != nil {
@@ -499,5 +665,58 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 	copy(buf[nvs+uint64(offset):], val)
 	s.setVlen(off, uint32(newLen))
 	s.publish(h, slot, addr, off)
+	return int64(newLen), nil
+}
+
+// patchValue builds old with val overwritten at offset, zero-filling any gap
+// past old's end, in the store scratch. old may itself be the scratch (a
+// log-resident materialize): the prefix copy is then the identity and the
+// patch lands over it either way. The view is valid until the next store
+// write.
+func (s *Store) patchValue(old []byte, offset int, val []byte) []byte {
+	newLen := offset + len(val)
+	if len(old) > newLen {
+		newLen = len(old)
+	}
+	nv := s.vbuf
+	if cap(nv) < newLen {
+		nv = make([]byte, newLen)
+	}
+	nv = nv[:newLen]
+	n := copy(nv, old)
+	if offset > n {
+		clear(nv[n:offset])
+	}
+	copy(nv[offset:], val)
+	s.vbuf = nv[:0]
+	return nv
+}
+
+// setRangeSep patches a separated record's run: in place when the run sits in
+// the arena (an arena run is mutable and the write fits under its capacity
+// whenever end does not grow past it), otherwise a fresh run over the patched
+// bytes and a pointer swap, since a log run is immutable.
+func (s *Store) setRangeSep(addr uint64, old []byte, offset int, val []byte, newLen int) (int64, error) {
+	vs := s.valueStart(addr)
+	word, _, vcap := s.readPtr(vs)
+	f := s.recFlags(addr)
+	if word&inLogBit == 0 && uint64(newLen) <= uint64(vcap) {
+		run := word & runAddrMask
+		if offset > len(old) {
+			clear(s.arena.buf[run+uint64(len(old)) : run+uint64(offset)])
+		}
+		copy(s.arena.buf[run+uint64(offset):], val)
+	} else {
+		nv := s.patchValue(old, offset, val)
+		nw, nc, err := s.writeRun(nv, nil, growSepCap(uint64(newLen), uint64(vcap)))
+		if err != nil {
+			return 0, err
+		}
+		s.dropValue(addr)
+		word, vcap = nw, nc
+	}
+	s.writePtr(vs, word, uint32(newLen), vcap)
+	s.setRecFlags(addr, f|flagRawSticky)
+	s.setVlen(addr, uint32(newLen))
 	return int64(newLen), nil
 }
