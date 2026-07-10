@@ -1,0 +1,676 @@
+//go:build linux
+
+package drivers
+
+import (
+	"encoding/binary"
+	"net"
+	"sync"
+	"sync/atomic"
+	"syscall"
+
+	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/f3srv/dispatch"
+	"github.com/tamnd/aki/f3srv/resp"
+)
+
+// The raw-epoll event-loop driver (doc 08 section 4.2), ported from the
+// quarantined f1srv/reactor_linux.go with the M10 pull-forward corrections.
+// M loops, each owning one epoll instance, one eventfd for wakes, and a
+// disjoint fd-sharded connection table: a connection is only ever touched by
+// its own loop, so the per-loop tables need no lock. On accept the fd is
+// dup'd out of the Go runtime and the net.Conn closed, so the netpoller never
+// sees the socket again; reads and writes are raw non-blocking syscalls.
+//
+// The loop owns parse and reply serialization. Each connection keeps its
+// resumable resp.Parser and shard.Conn; the loop reads, parses, dispatches
+// through the unchanged shard inbound MPSC, and drains replies through the
+// existing reorder ring, of which it is the single consumer. The new edge is
+// outbound: a shard owner that completes a batch must wake the loop that owns
+// the connection, and that wake rides the SetWriterNotify seam into this
+// loop's eventfd, under the same publish-then-check proof the waker carries
+// (the loop parks the connection with ParkWriter before it sleeps, so a push
+// that lands in the gap is seen by the park's re-check or claims the notify).
+//
+// This slice is correctness only. The wake path pays one eventfd write per
+// claimed wake (batching is slice 4), streamed giant replies are pumped
+// inline into the connection's output buffer (the Class OF slow-client
+// discipline is slice 5), and the loop count default is a placeholder for
+// the slice 6 lab.
+
+// reactorMaxEvents is one epoll_wait's event budget per turn.
+const reactorMaxEvents = 256
+
+// eventfd2 flags, mirrored from the kernel ABI; the stdlib syscall package
+// has the syscall number but not the flag names.
+const (
+	efdCloexec  = 0x80000 // EFD_CLOEXEC
+	efdNonblock = 0x800   // EFD_NONBLOCK
+)
+
+// reactorBackend is the netBackend the server drives: it owns the loops and
+// the accept handoff. Loops start at construction (they idle in epoll_wait),
+// serve runs the accept loop on the caller's goroutine, stop tears everything
+// down exactly once.
+type reactorBackend struct {
+	s     *Server
+	loops []*reactorLoop
+	wg    sync.WaitGroup
+	once  sync.Once
+}
+
+// newReactorBackend builds the loops or reports why it cannot; the caller
+// logs the fallback. Loop count is NetLoops, defaulting to the shard count
+// (the section 4.2 loop-count question is settled by the slice 6 lab, not
+// here).
+func newReactorBackend(s *Server, o Options) (netBackend, error) {
+	n := o.NetLoops
+	if n < 1 {
+		n = o.Shards
+	}
+	if n < 1 {
+		n = 1
+	}
+	b := &reactorBackend{s: s}
+	for i := 0; i < n; i++ {
+		l, err := newReactorLoop(b)
+		if err != nil {
+			b.stopLoops()
+			return nil, err
+		}
+		b.loops = append(b.loops, l)
+	}
+	for _, l := range b.loops {
+		b.wg.Add(1)
+		go l.run()
+	}
+	return b, nil
+}
+
+// serve accepts until the listener closes and hands each connection to its
+// fd-sharded loop. Loop teardown belongs to stop (driven by Close), not to
+// this return: the accept loop can exit while connections are still live.
+func (b *reactorBackend) serve() error {
+	for {
+		nc, err := b.s.ln.Accept()
+		if err != nil {
+			if b.s.isClosed() {
+				return nil
+			}
+			return err
+		}
+		fd, ok := adoptFD(nc)
+		if !ok {
+			continue
+		}
+		b.loops[fd%len(b.loops)].enqueue(fd)
+	}
+}
+
+// stop shuts the loops down and joins them, then releases the loop
+// descriptors. The epoll and event fds outlive the join on purpose: a late
+// accept racing Close can still call enqueue, whose wake write must never
+// land on a closed (and possibly reused) fd. enqueue wakes under the loop
+// mutex and checks closing there, so after every loop has observed closing
+// no wake can start, and closing the fds after the join is safe.
+func (b *reactorBackend) stop() {
+	b.once.Do(func() {
+		for _, l := range b.loops {
+			l.stop()
+		}
+		b.wg.Wait()
+		b.stopLoops()
+	})
+}
+
+// stopLoops closes the per-loop descriptors, for teardown and for the
+// construction error path (where loops never ran).
+func (b *reactorBackend) stopLoops() {
+	for _, l := range b.loops {
+		_ = syscall.Close(l.epfd)
+		_ = syscall.Close(l.evfd)
+	}
+}
+
+// adoptFD takes a freshly accepted connection whole: dup the socket fd out of
+// the runtime, close the net.Conn (the socket lives on through the dup), then
+// re-set TCP_NODELAY and nonblocking on the dup itself. The NODELAY re-set is
+// not redundant: doc 08 section 6.3 names the silently-missing-NODELAY dup as
+// the trap that puts a 40ms Nagle floor under P1, so the option is set on the
+// exact fd the loop will write, not trusted to the runtime's copy.
+func adoptFD(nc net.Conn) (int, bool) {
+	tc, ok := nc.(*net.TCPConn)
+	if !ok {
+		_ = nc.Close()
+		return -1, false
+	}
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		_ = tc.Close()
+		return -1, false
+	}
+	dupfd := -1
+	ctlErr := raw.Control(func(fd uintptr) {
+		if d, derr := syscall.Dup(int(fd)); derr == nil {
+			dupfd = d
+		}
+	})
+	_ = tc.Close()
+	if ctlErr != nil || dupfd < 0 {
+		if dupfd >= 0 {
+			_ = syscall.Close(dupfd)
+		}
+		return -1, false
+	}
+	if syscall.SetsockoptInt(dupfd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1) != nil ||
+		syscall.SetNonblock(dupfd, true) != nil {
+		_ = syscall.Close(dupfd)
+		return -1, false
+	}
+	return dupfd, true
+}
+
+// reactorLoop is one event loop: one epoll instance, one eventfd, and the
+// fd-indexed table of connections it owns. Only the loop goroutine touches
+// conns and the epoll interest set; other goroutines reach the loop solely
+// through the mutex-guarded pending and dirty queues plus an eventfd wake.
+type reactorLoop struct {
+	b    *reactorBackend
+	epfd int
+	evfd int
+
+	conns []*reactorConn // indexed by fd; loop goroutine only
+
+	mu      sync.Mutex
+	pending []int          // accepted fds awaiting adoption
+	dirty   []*reactorConn // conns owed a writer service, posted by owners
+	closing bool
+}
+
+// reactorConn is one connection owned entirely by a single loop: the dup'd
+// fd, the shard connection, the resumable parser, and the read and reply
+// buffers. Everything here is loop-goroutine state except queued, which the
+// owner-side notify path claims.
+type reactorConn struct {
+	loop *reactorLoop
+	fd   int
+	sc   *shard.Conn
+	cs   *connState
+	p    resp.Parser
+
+	// Read buffer, same discipline as readLoop (doc 08 section 2.1): rbuf
+	// holds [pos, n) unparsed bytes, compacted or grown at pass boundaries.
+	rbuf []byte
+	pos  int
+	n    int
+
+	// out is the pending reply bytes. DrainReplies emits into it; flushOut
+	// writes as much as the socket takes and keeps the remainder. A streamed
+	// giant reply is pumped whole into it for now, so its bound is the reply
+	// size, not a window; the slice 5 slow-client discipline replaces that.
+	out  []byte
+	emit func([]byte)
+
+	// armed is the epoll interest currently registered, so rearm only pays
+	// the epoll_ctl when the wanted set changes.
+	armed uint32
+
+	// writeBlocked: a short write left bytes in out; interest is EPOLLOUT
+	// and reads hold until the peer drains (backpressure).
+	writeBlocked bool
+
+	// throttled: complete commands sit unparsed in rbuf because the pipeline
+	// window is full. Reads are disarmed entirely (a level-triggered fd we
+	// refuse to read would spin the loop); the window reopening on a drain
+	// resumes the parse and re-arms.
+	throttled bool
+
+	// closing: a protocol error was answered; the connection drains its owed
+	// replies, flushes, and closes, reading nothing more.
+	closing bool
+
+	// queued marks the conn as sitting in its loop's dirty list, so racing
+	// owner notifies fold into one service (the eventfd counter shape).
+	queued atomic.Bool
+}
+
+func newReactorLoop(b *reactorBackend) (*reactorLoop, error) {
+	epfd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
+	if err != nil {
+		return nil, err
+	}
+	evfd, _, errno := syscall.Syscall(syscall.SYS_EVENTFD2, 0, efdCloexec|efdNonblock, 0)
+	if errno != 0 {
+		_ = syscall.Close(epfd)
+		return nil, errno
+	}
+	l := &reactorLoop{b: b, epfd: epfd, evfd: int(evfd)}
+	ev := syscall.EpollEvent{Events: syscall.EPOLLIN, Fd: int32(l.evfd)}
+	if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, l.evfd, &ev); err != nil {
+		_ = syscall.Close(epfd)
+		_ = syscall.Close(l.evfd)
+		return nil, err
+	}
+	return l, nil
+}
+
+// enqueue hands an accepted fd to the loop. It runs on the accept goroutine.
+// The wake stays under the mutex so it can never start after stop has marked
+// the loop closing, which is what lets stop close the eventfd after the join.
+func (l *reactorLoop) enqueue(fd int) {
+	l.mu.Lock()
+	if l.closing {
+		l.mu.Unlock()
+		_ = syscall.Close(fd)
+		return
+	}
+	l.pending = append(l.pending, fd)
+	l.wake()
+	l.mu.Unlock()
+}
+
+// stop asks the loop to tear down at its next wake.
+func (l *reactorLoop) stop() {
+	l.mu.Lock()
+	l.closing = true
+	l.wake()
+	l.mu.Unlock()
+}
+
+// notify is the owner-to-loop wake edge: shard owners call it through the
+// connection's SetWriterNotify hook when a claimed wake fires. One eventfd
+// write per claimed wake for this slice; the queued flag folds racing owners
+// into one dirty entry, and drainWake clears it before servicing so a notify
+// landing mid-service re-queues.
+func (l *reactorLoop) notify(rc *reactorConn) {
+	if !rc.queued.CompareAndSwap(false, true) {
+		return
+	}
+	l.mu.Lock()
+	l.dirty = append(l.dirty, rc)
+	l.wake()
+	l.mu.Unlock()
+}
+
+// wake pokes the loop's eventfd. The write adds to the eventfd counter, so
+// it cannot be lost: the counter stays readable (and epoll stays ready) from
+// the write until the loop's drain, whether the loop was parked or mid-pass.
+func (l *reactorLoop) wake() {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], 1)
+	for {
+		if _, err := syscall.Write(l.evfd, buf[:]); err != syscall.EINTR {
+			return
+		}
+	}
+}
+
+// run is the loop: park in epoll_wait, service every ready fd. The eventfd
+// delivers adoptions, owner notifies, and shutdown; every other fd is a
+// client socket.
+func (l *reactorLoop) run() {
+	defer l.b.wg.Done()
+	events := make([]syscall.EpollEvent, reactorMaxEvents)
+	for {
+		n, err := syscall.EpollWait(l.epfd, events, -1)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			l.shutdown()
+			return
+		}
+		for i := 0; i < n; i++ {
+			ev := &events[i]
+			fd := int(ev.Fd)
+			if fd == l.evfd {
+				if l.drainWake() {
+					l.shutdown()
+					return
+				}
+				continue
+			}
+			rc := l.get(fd)
+			if rc == nil {
+				continue
+			}
+			if ev.Events&(syscall.EPOLLHUP|syscall.EPOLLERR) != 0 {
+				l.closeConn(rc)
+				continue
+			}
+			if ev.Events&syscall.EPOLLOUT != 0 && rc.writeBlocked {
+				if !l.flushOut(rc) {
+					continue
+				}
+				if !rc.writeBlocked {
+					// The block lifted: drain whatever completed while
+					// writes were held, then fall back to normal interest.
+					l.service(rc)
+					continue
+				}
+			}
+			if ev.Events&(syscall.EPOLLIN|syscall.EPOLLRDHUP) != 0 &&
+				!rc.writeBlocked && !rc.throttled && !rc.closing {
+				l.serviceRead(rc)
+			}
+		}
+	}
+}
+
+// drainWake empties the eventfd, adopts pending fds, and services dirty
+// connections. It reports whether shutdown was requested. Adoption happens
+// here, on the loop goroutine, so the conn table stays single-threaded.
+func (l *reactorLoop) drainWake() (closing bool) {
+	var buf [8]byte
+	for {
+		if _, err := syscall.Read(l.evfd, buf[:]); err != syscall.EINTR {
+			break
+		}
+	}
+	l.mu.Lock()
+	if l.closing {
+		l.mu.Unlock()
+		return true
+	}
+	pending := l.pending
+	l.pending = nil
+	dirty := l.dirty
+	l.dirty = nil
+	l.mu.Unlock()
+	for _, fd := range pending {
+		l.adopt(fd)
+	}
+	for _, rc := range dirty {
+		rc.queued.Store(false)
+		if rc.fd < 0 {
+			continue
+		}
+		l.service(rc)
+	}
+	return false
+}
+
+// adopt installs an accepted fd: shard connection, notify hook, counter
+// registration, epoll registration, and the initial writer park so the first
+// owner completion claims a wake.
+func (l *reactorLoop) adopt(fd int) {
+	rc := &reactorConn{
+		loop: l,
+		fd:   fd,
+		sc:   l.b.s.rt.NewConn(),
+		rbuf: make([]byte, readBufSize),
+		out:  make([]byte, 0, l.b.s.replyBuf),
+	}
+	rc.cs = &connState{sc: rc.sc}
+	rc.emit = func(rep []byte) { rc.out = append(rc.out, rep...) }
+	// Before any traffic, per the seam's contract: owners read the hook
+	// through the inbound queue's ordering.
+	rc.sc.SetWriterNotify(func() { l.notify(rc) })
+	for len(l.conns) <= fd {
+		l.conns = append(l.conns, nil)
+	}
+	l.conns[fd] = rc
+	rc.armed = syscall.EPOLLIN | uint32(syscall.EPOLLRDHUP)
+	ev := syscall.EpollEvent{Events: rc.armed, Fd: int32(fd)}
+	if err := syscall.EpollCtl(l.epfd, syscall.EPOLL_CTL_ADD, fd, &ev); err != nil {
+		l.conns[fd] = nil
+		rc.sc.Close()
+		_ = syscall.Close(fd)
+		rc.fd = -1
+		return
+	}
+	l.b.s.register(rc.cs)
+	rc.sc.ParkWriter() // fresh conn, nothing queued; parks clean
+}
+
+func (l *reactorLoop) get(fd int) *reactorConn {
+	if fd >= 0 && fd < len(l.conns) {
+		return l.conns[fd]
+	}
+	return nil
+}
+
+// serviceRead does one non-blocking read into the connection's buffer and
+// runs the service pump over what arrived. Level-triggered epoll re-reports
+// the fd next turn if the read left bytes on the socket, so one read per
+// readiness keeps the loop's time per connection bounded.
+func (l *reactorLoop) serviceRead(rc *reactorConn) {
+	if rc.n == len(rc.rbuf) {
+		if rc.pos > 0 {
+			rc.n = copy(rc.rbuf, rc.rbuf[rc.pos:rc.n])
+			rc.pos = 0
+		} else {
+			// One command larger than the buffer: grow, there is no other
+			// way to see its end.
+			bigger := make([]byte, 2*len(rc.rbuf))
+			rc.n = copy(bigger, rc.rbuf[:rc.n])
+			rc.rbuf = bigger
+		}
+	}
+	m, err := syscall.Read(rc.fd, rc.rbuf[rc.n:])
+	rc.cs.reads.bump()
+	if m > 0 {
+		rc.n += m
+		l.service(rc)
+		return
+	}
+	if err == syscall.EAGAIN || err == syscall.EINTR {
+		return
+	}
+	// Zero is the peer's clean close; anything else is a dead socket.
+	l.closeConn(rc)
+}
+
+// service is the pump: parse and dispatch what the window allows, drain
+// completed replies into the output buffer, flush, and either resume the
+// parse backlog or park the writer side. The ParkWriter at the bottom is the
+// lost-wake guard: it must be the last touch before the loop goes back to
+// epoll_wait, so an owner push landing after the drain either shows up in
+// the park's re-check or claims the notify that brings the loop back here.
+func (l *reactorLoop) service(rc *reactorConn) {
+	for {
+		if !l.parsePass(rc) {
+			return // dispatch failed; the conn is closed
+		}
+		rc.sc.DrainReplies(rc.emit)
+		if rc.sc.Failed() {
+			// A streamed reply died after its header went out; nothing
+			// coherent can follow. Best-effort flush, then drop, mid-cycle,
+			// this conn only.
+			_ = l.flushOut(rc)
+			if rc.fd >= 0 {
+				l.closeConn(rc)
+			}
+			return
+		}
+		if !l.flushOut(rc) {
+			return // write error closed the conn
+		}
+		if rc.closing {
+			if !rc.sc.Owes() && len(rc.out) == 0 {
+				l.closeConn(rc)
+				return
+			}
+		} else if rc.throttled && rc.sc.CanEnqueue() {
+			// The drain opened the pipeline window; consume the parse
+			// backlog before parking.
+			continue
+		}
+		if rc.sc.ParkWriter() {
+			break
+		}
+		// Replies landed between the drain and the park; go around.
+	}
+	l.rearm(rc)
+}
+
+// parsePass parses every complete command the buffer holds while the
+// pipeline window is open and dispatches each through the shard hop, then
+// publishes the batch (the section 2.2 boundary). It stops early when the
+// window fills: the Do throttle must never engage on the loop thread (its
+// wait paths would block or spin the whole fd shard), so the window is
+// checked before every dispatch and the leftover stays in rbuf as the
+// throttle backlog. It returns false when it closed the connection.
+func (l *reactorLoop) parsePass(rc *reactorConn) bool {
+	if rc.closing {
+		return true
+	}
+	cmds := uint64(0)
+	throttled := false
+	for rc.pos < rc.n {
+		if !rc.sc.CanEnqueue() {
+			throttled = true
+			break
+		}
+		args, consumed, st := rc.p.Next(rc.rbuf[rc.pos:rc.n])
+		if st == resp.NeedMore {
+			break
+		}
+		if st == resp.ProtoErr {
+			// Answer in pipeline order, then drain and close: the stream
+			// cannot be resynced after a framing error.
+			_ = rc.sc.Do(shard.OpError, false, [][]byte{[]byte("ERR Protocol error: " + rc.p.LastError())})
+			rc.closing = true
+			break
+		}
+		rc.pos += consumed
+		if len(args) == 0 {
+			continue
+		}
+		cmds++
+		if derr := dispatch.Dispatch(rc.sc, args); derr != nil {
+			l.closeConn(rc)
+			return false
+		}
+	}
+	rc.throttled = throttled
+	if cmds > 0 {
+		rc.cs.commands.add(cmds)
+		rc.cs.batches.bump()
+	}
+	if rc.pos == rc.n {
+		rc.pos, rc.n = 0, 0
+		// A giant inbound bulk grew the buffer; once drained, shrink back so
+		// an idle connection does not pin megabytes.
+		if len(rc.rbuf) > 16*readBufSize {
+			rc.rbuf = make([]byte, readBufSize)
+		}
+	} else if rc.pos > 0 && rc.n-rc.pos <= compactMax {
+		rc.n = copy(rc.rbuf, rc.rbuf[rc.pos:rc.n])
+		rc.pos = 0
+	}
+	rc.sc.Flush()
+	return true
+}
+
+// flushOut writes as much of out as the socket accepts. On EAGAIN it keeps
+// the unsent remainder at the front of out and flips writeBlocked, which
+// swings interest to EPOLLOUT and holds reads until the peer drains. It
+// returns false when a write error closed the connection.
+func (l *reactorLoop) flushOut(rc *reactorConn) bool {
+	if len(rc.out) == 0 || rc.fd < 0 {
+		return rc.fd >= 0
+	}
+	buf := rc.out
+	wrote := false
+	for len(buf) > 0 {
+		n, err := syscall.Write(rc.fd, buf)
+		if n > 0 {
+			rc.cs.writes.bump()
+			wrote = true
+			buf = buf[n:]
+			continue
+		}
+		switch err {
+		case syscall.EAGAIN:
+			rc.out = append(rc.out[:0], buf...) // shift remainder to the front
+			rc.writeBlocked = true
+			if wrote {
+				l.b.s.flushes.Add(1)
+			}
+			l.rearm(rc)
+			return true
+		case syscall.EINTR:
+			continue
+		default:
+			l.closeConn(rc)
+			return false
+		}
+	}
+	rc.out = rc.out[:0]
+	// A streamed giant reply grew the buffer; give the pages back once sent.
+	if cap(rc.out) > 4*l.b.s.replyBuf {
+		rc.out = make([]byte, 0, l.b.s.replyBuf)
+	}
+	if wrote {
+		l.b.s.flushes.Add(1)
+	}
+	if rc.writeBlocked {
+		rc.writeBlocked = false
+		l.rearm(rc)
+	}
+	return true
+}
+
+// rearm recomputes and applies the connection's epoll interest. Reads are
+// armed only when nothing holds them: not write backpressure, not the
+// pipeline-window throttle, not a close in progress. A throttled connection
+// drops even EPOLLRDHUP, because a level-triggered readable fd the loop
+// refuses to read would spin epoll_wait; a peer that dies while throttled is
+// caught by EPOLLHUP/EPOLLERR (always delivered) or by the write path.
+func (l *reactorLoop) rearm(rc *reactorConn) {
+	if rc.fd < 0 {
+		return
+	}
+	var want uint32
+	if rc.writeBlocked {
+		want |= syscall.EPOLLOUT
+	} else if !rc.throttled && !rc.closing {
+		want |= syscall.EPOLLIN | uint32(syscall.EPOLLRDHUP)
+	}
+	if want == rc.armed {
+		return
+	}
+	ev := syscall.EpollEvent{Events: want, Fd: int32(rc.fd)}
+	_ = syscall.EpollCtl(l.epfd, syscall.EPOLL_CTL_MOD, rc.fd, &ev)
+	rc.armed = want
+}
+
+// closeConn deregisters and closes a connection: epoll DEL, one close of the
+// dup'd fd, shard conn close (which drops in-flight replies by contract),
+// counter fold. Idempotent through the fd sentinel so the read and write
+// paths can both call it without coordinating.
+func (l *reactorLoop) closeConn(rc *reactorConn) {
+	if rc.fd < 0 {
+		return
+	}
+	_ = syscall.EpollCtl(l.epfd, syscall.EPOLL_CTL_DEL, rc.fd, nil)
+	_ = syscall.Close(rc.fd)
+	if rc.fd < len(l.conns) {
+		l.conns[rc.fd] = nil
+	}
+	rc.fd = -1
+	rc.sc.Close()
+	l.b.s.unregister(rc.cs)
+}
+
+// shutdown closes every owned connection and any fds still waiting for
+// adoption. It runs on the loop goroutine after stop has been observed. The
+// epoll and event fds stay open; backend.stop closes them after the join
+// (see stop for the race this avoids).
+func (l *reactorLoop) shutdown() {
+	for _, rc := range l.conns {
+		if rc != nil && rc.fd >= 0 {
+			l.closeConn(rc)
+		}
+	}
+	l.conns = nil
+	l.mu.Lock()
+	pending := l.pending
+	l.pending = nil
+	l.dirty = nil
+	l.mu.Unlock()
+	for _, fd := range pending {
+		_ = syscall.Close(fd)
+	}
+}
