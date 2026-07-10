@@ -14,11 +14,25 @@ const (
 	// keeps the node small. Lab: hop batch cap (sweep {16, 32, 64}, PRED-X8).
 	batchCap = 32
 
-	// batchDataCap bounds the argument bytes one batch node carries. The M0
-	// transport copies parsed arguments into the node; the zero-copy argument
-	// spans into the connection read buffer, with their buffer-generation
-	// lifetime rules (doc 03 section 4.4), land with the RESP2 slice.
+	// batchDataCap is a node's steady-state argument-byte capacity: a fuller
+	// node splits, and only a single command bigger than the cap grows an
+	// empty node's buffer. The M0 transport copies parsed arguments into the
+	// node; the zero-copy argument spans into the connection read buffer, with
+	// their buffer-generation lifetime rules (doc 03 section 4.4), land with
+	// the value-bands work.
 	batchDataCap = 8192
+
+	// spanCap bounds a node's argument count across its commands, sized so
+	// the point surface never comes near it (SET with a full option run is
+	// eight arguments). The multi-key fan-out slice revisits it for MSET.
+	spanCap = 8 * batchCap
+
+	// maxCmdBytes bounds one command's total argument bytes, the ceiling on
+	// how far a single oversized command may grow an empty node. It clears
+	// the store's 64KiB key and value caps with room; anything bigger cannot
+	// succeed downstream, so the dispatcher answers ErrTooBig with an error
+	// reply instead of carrying the bytes.
+	maxCmdBytes = 1 << 20
 
 	// repCap is the starting capacity of a node's reply buffer, sized so the
 	// steady path never grows it: every point reply plus an echoed payload fits

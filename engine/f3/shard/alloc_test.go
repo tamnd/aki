@@ -15,27 +15,30 @@ func TestDrainedPathZeroAllocs(t *testing.T) {
 	if raceEnabled {
 		t.Skip("allocation accounting is not meaningful under the race detector")
 	}
-	rt := New(1, testArena, testSeg)
+	rt := testRuntime(1)
 	c := rt.NewConn()
 	w := rt.workers[0]
 
-	keys := make([][]byte, 16)
-	for i := range keys {
-		keys[i] = []byte(fmt.Sprintf("key%03d", i))
-	}
 	val := []byte("value-of-64-bytes-0123456789012345678901234567890123456789012")
+	setArgs := make([][][]byte, 16)
+	getArgs := make([][][]byte, 16)
+	for i := range setArgs {
+		key := []byte(fmt.Sprintf("key%03d", i))
+		setArgs[i] = [][]byte{key, val}
+		getArgs[i] = [][]byte{key}
+	}
 
 	sink := make([]byte, 0, 64<<10)
 	emit := func(rep []byte) { sink = append(sink, rep...) }
 
 	run := func() {
-		for i, k := range keys {
+		for i := range setArgs {
 			if i%2 == 0 {
-				if err := c.Do(OpSet, k, val); err != nil {
+				if err := c.Do(opSet, true, setArgs[i]); err != nil {
 					t.Error(err)
 				}
 			} else {
-				if err := c.Do(OpGet, k, nil); err != nil {
+				if err := c.Do(opGet, true, getArgs[i]); err != nil {
 					t.Error(err)
 				}
 			}
@@ -63,22 +66,30 @@ func TestDrainedPathZeroAllocs(t *testing.T) {
 // batch on the owner path, allocs reported so a regression shows in CI output.
 func BenchmarkDrainExecute(b *testing.B) {
 	rt := New(1, 64<<20, 0)
+	rt.Use(testHandlers())
 	c := rt.NewConn()
 	w := rt.workers[0]
 
-	keys := make([][]byte, batchCap)
-	for i := range keys {
-		keys[i] = []byte(fmt.Sprintf("key%03d", i))
-	}
 	val := []byte("value-of-64-bytes-0123456789012345678901234567890123456789012")
+	setArgs := make([][][]byte, batchCap)
+	getArgs := make([][][]byte, batchCap)
+	for i := range setArgs {
+		key := []byte(fmt.Sprintf("key%03d", i))
+		setArgs[i] = [][]byte{key, val}
+		getArgs[i] = [][]byte{key}
+	}
 	emit := func([]byte) {}
 
 	run := func() {
-		for i, k := range keys {
+		for i := range setArgs {
 			if i%2 == 0 {
-				c.Do(OpSet, k, val)
+				if err := c.Do(opSet, true, setArgs[i]); err != nil {
+					b.Fatal(err)
+				}
 			} else {
-				c.Do(OpGet, k, nil)
+				if err := c.Do(opGet, true, getArgs[i]); err != nil {
+					b.Fatal(err)
+				}
 			}
 		}
 		c.Flush()

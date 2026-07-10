@@ -20,10 +20,17 @@ type worker struct {
 	stop    atomic.Bool
 	done    chan struct{}
 
-	// val is the worker's value scratch for GET: the store copies into it and
-	// the reply builder copies out, so the buffer's grown capacity is reused
-	// and the steady path allocates nothing.
-	val []byte
+	// handlers is the op-indexed table Runtime.Use registered, fixed before
+	// Start. The worker looks handlers up by op byte and never interprets one.
+	handlers []Handler
+
+	// cx is the worker's handler context, one per shard for its whole life:
+	// the store, the per-batch clock, and the value scratch whose grown
+	// capacity carries across commands so the steady path allocates nothing.
+	cx Ctx
+
+	// argv is the reused argument-view slice handed to handlers.
+	argv [][]byte
 
 	// sink absorbs the prefetch touch loads so the compiler cannot treat the
 	// stage-one loop as dead.
@@ -32,6 +39,8 @@ type worker struct {
 
 func newWorker(id int, st *store.Store) *worker {
 	w := &worker{id: id, st: st, done: make(chan struct{})}
+	w.cx.St = st
+	w.argv = make([][]byte, 0, 16)
 	w.wk.init()
 	w.ep.init()
 	w.inbound.init()
@@ -66,6 +75,10 @@ func (w *worker) drainAndExecute() int {
 	w.ep.enter()
 	n := int(b.n)
 
+	// The batch's clock: read once, shared by every expiry comparison in the
+	// batch (doc 09 section 2's cached now_ms).
+	w.cx.NowMs = time.Now().UnixMilli()
+
 	// Stage one: hash every keyed command and touch its home bucket, so the
 	// probes in the execute loop run against warm lines instead of paying a
 	// serialized miss each. Go has no prefetch intrinsic, so the touch is a
@@ -76,8 +89,8 @@ func (w *worker) drainAndExecute() int {
 		depth = prefetchDepth
 	}
 	for i := 0; i < depth; i++ {
-		if b.cmds[i].klen != 0 {
-			touched += w.st.TouchBucket(store.Hash(b.key(i)))
+		if b.cmds[i].keyed {
+			touched += w.st.TouchBucket(store.Hash(b.arg(i, 0)))
 		}
 	}
 	w.sink += touched
@@ -99,35 +112,30 @@ func (w *worker) drainAndExecute() int {
 	return n
 }
 
+// execute runs one command through the registered handler table. OpError is
+// the one shard builtin: it echoes the message the dispatcher routed, keeping
+// parse-side errors in pipeline order.
 func (w *worker) execute(b *hopBatch, i int) {
-	switch b.cmds[i].op {
-	case OpPing:
-		if b.cmds[i].alen == 0 {
-			b.replyStatic(i, "+PONG\r\n")
-		} else {
-			b.replyBulk(i, b.arg(i))
-		}
-	case OpEcho:
-		b.replyBulk(i, b.arg(i))
-	case OpGet:
-		v, ok := w.st.Get(b.key(i), w.val)
-		w.val = v[:0]
-		if ok {
-			b.replyBulk(i, v)
-		} else {
-			b.replyStatic(i, "$-1\r\n")
-		}
-	case OpSet:
-		if err := w.st.Set(b.key(i), b.arg(i)); err != nil {
-			b.replyError(i, []byte(err.Error()))
-		} else {
-			b.replyStatic(i, "+OK\r\n")
-		}
-	case OpError:
-		b.replyError(i, b.arg(i))
-	default:
-		b.replyError(i, []byte("unknown op"))
+	c := &b.cmds[i]
+	r := Reply{b: b, i: i}
+	if c.op == OpError {
+		r.errBytes(b.arg(i, 0))
+		return
 	}
+	var h Handler
+	if int(c.op) < len(w.handlers) {
+		h = w.handlers[c.op]
+	}
+	if h == nil {
+		r.Err("ERR unknown op")
+		return
+	}
+	argv := w.argv[:0]
+	for k := 0; k < int(c.argn); k++ {
+		argv = append(argv, b.arg(i, k))
+	}
+	w.argv = argv
+	h(&w.cx, argv, r)
 }
 
 // idle is the spin-then-park protocol (doc 03 section 9.1): store spinning,
