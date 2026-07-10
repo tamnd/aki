@@ -18,6 +18,15 @@ type entry struct {
 	minArgs int // arguments after the verb
 	maxArgs int // -1: unbounded, the handler validates the tail
 	keyed   bool
+
+	// The fan-out route: a non-zero fan kind scatters the command through
+	// DoFan with fanOp as the per-shard sub-command op. A verb with both a
+	// point op and a fan route (DEL, UNLINK, EXISTS) takes the point path for
+	// one key and fans for more; MGET and MSET always fan.
+	fan     shard.FanKind
+	fanOp   byte
+	paired  bool // MSET-shaped tail: alternating key value
+	fanOnly bool // no point op; a single key still fans
 }
 
 // maxVerb bounds the uppercase scratch for verb lookup; no Redis verb comes
@@ -47,18 +56,51 @@ func register(name string, h shard.Handler, minArgs, maxArgs int, keyed bool) {
 	handlers = append(handlers, h)
 }
 
+// registerShard wires a fan-out sub-command handler: it gets an op and a slot
+// in the vector but no verb, so a client can never call it directly.
+func registerShard(h shard.Handler) byte {
+	op := byte(len(handlers))
+	handlers = append(handlers, h)
+	return op
+}
+
+// registerFan attaches a fan route to an already registered verb.
+func registerFan(name string, kind shard.FanKind, fanOp byte, paired, fanOnly bool) {
+	e := table[name]
+	e.fan = kind
+	e.fanOp = fanOp
+	e.paired = paired
+	e.fanOnly = fanOnly
+}
+
 func init() {
 	register("PING", ping, 0, 1, false)
 	register("ECHO", echo, 1, 1, false)
 
 	// The string point surface. SET's tail is option soup, so the handler
-	// validates it; DEL and EXISTS are single-key until the fan-out slice.
+	// validates it.
 	register("SET", str.Set, 2, -1, true)
 	register("GET", str.Get, 1, 1, true)
 	register("STRLEN", str.Strlen, 1, 1, true)
-	register("EXISTS", str.Exists, 1, 1, true)
-	register("DEL", str.Del, 1, 1, true)
 	register("TYPE", str.Type, 1, 1, true)
+
+	// The tier-one multi-key commands: a single key keeps the point path,
+	// more keys scatter through the fan-out; MGET and MSET always fan. The
+	// sub-command handlers are shard-only ops with no verb.
+	mget := registerShard(str.MGetShard)
+	mset := registerShard(str.MSetShard)
+	del := registerShard(str.DelShard)
+	exists := registerShard(str.ExistsShard)
+	register("EXISTS", str.Exists, 1, -1, true)
+	register("DEL", str.Del, 1, -1, true)
+	register("UNLINK", str.Del, 1, -1, true)
+	register("MGET", nil, 1, -1, true)
+	register("MSET", nil, 2, -1, true)
+	registerFan("EXISTS", shard.FanCount, exists, false, false)
+	registerFan("DEL", shard.FanCount, del, false, false)
+	registerFan("UNLINK", shard.FanCount, del, false, false)
+	registerFan("MGET", shard.FanMGet, mget, false, true)
+	registerFan("MSET", shard.FanOK, mset, true, true)
 
 	// The INCR family, APPEND, and the range pair. SUBSTR is GETRANGE under
 	// its old name; a distinct row so arity errors quote 'substr'.
@@ -102,10 +144,39 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 	if n < e.minArgs || (e.maxArgs >= 0 && n > e.maxArgs) {
 		return oops(c, "ERR wrong number of arguments for '"+e.name+"' command")
 	}
+	if e.fan != 0 && (e.fanOnly || n > 1) {
+		return dispatchFan(c, e, args)
+	}
 	err := c.Do(e.op, e.keyed, args[1:])
 	if err == shard.ErrTooBig {
 		// The command never entered a node, so the error reply can take its
 		// pipeline slot and the connection lives on.
+		return oops(c, "ERR command too large")
+	}
+	return err
+}
+
+// dispatchFan scatters one multi-key command. The fan path allocates its key
+// slices; it is the multi-key surface, not the point path.
+func dispatchFan(c *shard.Conn, e *entry, args [][]byte) error {
+	var keys, vals [][]byte
+	if e.paired {
+		n := len(args) - 1
+		if n%2 != 0 {
+			return oops(c, "ERR wrong number of arguments for '"+e.name+"' command")
+		}
+		k := n / 2
+		keys = make([][]byte, k)
+		vals = make([][]byte, k)
+		for i := 0; i < k; i++ {
+			keys[i] = args[1+2*i]
+			vals[i] = args[2+2*i]
+		}
+	} else {
+		keys = args[1:]
+	}
+	err := c.DoFan(e.fanOp, e.fan, keys, vals)
+	if err == shard.ErrTooBig {
 		return oops(c, "ERR command too large")
 	}
 	return err

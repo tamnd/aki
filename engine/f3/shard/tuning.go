@@ -28,11 +28,17 @@ const (
 	spanCap = 8 * batchCap
 
 	// maxCmdBytes bounds one command's total argument bytes, the ceiling on
-	// how far a single oversized command may grow an empty node. It clears
-	// the store's 64KiB key and value caps with room; anything bigger cannot
-	// succeed downstream, so the dispatcher answers ErrTooBig with an error
-	// reply instead of carrying the bytes.
-	maxCmdBytes = 1 << 20
+	// how far a single oversized command may grow an empty node. The chunked
+	// band accepts values to the 512MiB proto-max-bulk-len cap, so the node
+	// ceiling sits just above it (key and option slack on top of the value);
+	// anything bigger cannot succeed downstream, so the dispatcher answers
+	// ErrTooBig with an error reply instead of carrying the bytes.
+	maxCmdBytes = 512<<20 + 128<<10
+
+	// keepNodeBytes is the largest buffer a recycled node keeps: a node that
+	// carried a giant-value command shrinks back on reset instead of pinning
+	// hundreds of megabytes on the free list.
+	keepNodeBytes = 1 << 20
 
 	// repCap is the starting capacity of a node's reply buffer, sized so the
 	// steady path never grows it: every point reply plus an echoed payload fits

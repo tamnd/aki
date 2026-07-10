@@ -55,6 +55,13 @@ type hopBatch struct {
 	// command order, located by reps.
 	reps [batchCap]repSpan
 	rep  []byte
+
+	// fans marks which commands are fan-out sub-commands: a non-nil entry is
+	// the coordinator the writer merges that command's partial into instead of
+	// emitting it. The slice is nil until a connection's first fan-out and the
+	// hasFan flag keeps reset free on the point-op path.
+	fans   []*fanCmd
+	hasFan bool
 }
 
 func newBatch() *hopBatch {
@@ -68,10 +75,41 @@ func newBatch() *hopBatch {
 // grown capacity: a node that once carried an oversized command keeps the
 // larger data buffer for its next life, the same rule the reply buffer has.
 func (b *hopBatch) reset() {
+	if b.hasFan {
+		for i := range b.fans {
+			b.fans[i] = nil
+		}
+		b.hasFan = false
+	}
 	b.n = 0
 	b.sn = 0
 	b.data = b.data[:0]
 	b.rep = b.rep[:0]
+	// A node that carried a giant chunked-band command must not pin its grown
+	// buffers forever; anything past the keep cap shrinks back.
+	if cap(b.data) > keepNodeBytes {
+		b.data = make([]byte, 0, batchDataCap)
+	}
+	if cap(b.rep) > keepNodeBytes {
+		b.rep = make([]byte, 0, repCap)
+	}
+}
+
+// setFan marks command i as a fan-out sub-command owned by fc.
+func (b *hopBatch) setFan(i int, fc *fanCmd) {
+	if b.fans == nil {
+		b.fans = make([]*fanCmd, batchCap)
+	}
+	b.fans[i] = fc
+	b.hasFan = true
+}
+
+// fan returns command i's coordinator, or nil for an ordinary command.
+func (b *hopBatch) fan(i int) *fanCmd {
+	if !b.hasFan {
+		return nil
+	}
+	return b.fans[i]
 }
 
 // add appends one command, copying its arguments into the node's data buffer.
