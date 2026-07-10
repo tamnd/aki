@@ -620,9 +620,16 @@ func (l *reactorLoop) flushOut(rc *reactorConn) bool {
 	buf := rc.out
 	wrote := false
 	for len(buf) > 0 {
+		// Count the attempt before the syscall, the countedWriter discipline:
+		// a reader that saw these bytes arrive must also see the counter
+		// moved, and bumping after the return leaves a window where the loop
+		// goroutine is descheduled between the kernel delivering the bytes
+		// and the bump (a NetStats snapshot taken there undercounts). EAGAIN
+		// and EINTR attempts are write(2) calls too, so counting them is
+		// what the counter's name says.
+		rc.cs.writes.bump()
 		n, err := syscall.Write(rc.fd, buf)
 		if n > 0 {
-			rc.cs.writes.bump()
 			wrote = true
 			buf = buf[n:]
 			continue
