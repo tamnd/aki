@@ -56,6 +56,16 @@ type Conn struct {
 	emitted atomic.Uint32 // writer's progress, read by the reader's throttle
 	closed  atomic.Bool
 
+	// published is the reader's issued-sequence watermark at its last publish:
+	// the value of seq the last time a node went onto a shard queue. Some
+	// commands below it may still sit in other shards' pending nodes at that
+	// moment, but the reader publishes everything pending before it blocks (the
+	// boundary Flush in the transport read loop, or the throttle above), so a
+	// reply for every sequence below the watermark arrives without further
+	// input from the client. The writer compares it against its own emit
+	// progress in Owes, the transport's flush gate.
+	published atomic.Uint32
+
 	// failed flips when a streamed reply dies mid-emit: the bulk header is
 	// already on the wire, so nothing coherent can follow and the transport
 	// must drop the connection. Writer side only, plain field.
@@ -66,6 +76,23 @@ type Conn struct {
 // an unrecoverable state. The transport checks it after each drain and tears
 // the connection down when set. Writer side only.
 func (c *Conn) Failed() bool { return c.failed }
+
+// Owes reports whether replies are still due for commands at or below the
+// reader's publish watermark: the writer has not yet emitted every sequence
+// the reader had issued at its last publish. The transport writer uses it as
+// its flush gate, deferring the socket flush until a pipelined round has fully
+// drained; a lone command hits zero the moment its reply emits, so nothing
+// idles in the buffer. A false from a stale or overtaken watermark read only
+// means one early flush, never a stall: every sequence under the watermark has
+// a reply on the way with no further input from the client (see published), so
+// the writer that skips a flush is always woken again. The comparison is the
+// wrap-safe signed difference, not equality, because a fan-out's sub-commands
+// carry a sequence the reader has not advanced past yet: a node fill mid-fan
+// publishes a watermark of exactly that sequence, and once the gathered reply
+// emits the cursor sits one past it. Equality would read that as owed and
+// defer the flush with nothing left in flight. Writer side only (it reads the
+// writer's plain emit cursor).
+func (c *Conn) Owes() bool { return int32(c.published.Load()-c.next) > 0 }
 
 // NewConn builds a connection against the runtime.
 func (r *Runtime) NewConn() *Conn {
@@ -131,6 +158,9 @@ func (c *Conn) Flush() {
 func (c *Conn) flushShard(sh int) {
 	b := c.pending[sh]
 	c.pending[sh] = nil
+	// Advance the watermark before the push so that by the time this node's
+	// replies drain, Owes already accounts for every sequence issued so far.
+	c.published.Store(c.seq)
 	w := c.rt.workers[sh]
 	if w.inbound.push(b) {
 		w.wk.wake()
