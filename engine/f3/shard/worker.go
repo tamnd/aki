@@ -83,14 +83,22 @@ func (w *worker) run() {
 		if len(w.streams) > 0 {
 			w.pumpStreams()
 		}
-		if n > 0 && len(w.streams) == 0 && w.st.ArenaTight() {
+		if n > 0 && len(w.streams) == 0 {
 			// Sustained writes can walk the arena to its full state without
 			// the queue ever draining, which is how the M0 gate died at 4KiB
 			// (issue #542): the idle trigger below never fired. The tight
 			// check is O(1), and the boundary between two drain passes holds
 			// no arena address (views die with their command, streams are
 			// checked), so a compaction here is as safe as one at idle.
-			w.st.CompactArena()
+			// Residency demotion shares the boundary and the safety argument:
+			// past the resident cap, cold value runs move to the log here,
+			// and the compaction that follows turns the bytes they and the
+			// tight state left dead into freed segments whose pages go back
+			// to the OS, which is what keeps the cap an RSS bound and not
+			// just a placement rule.
+			if w.st.MaybeDemote() > 0 || w.st.ArenaTight() || w.st.ResidentOver() {
+				w.st.CompactArena()
+			}
 		}
 		if n == 0 {
 			if w.stop.Load() {
@@ -123,7 +131,10 @@ func (w *worker) maybeCompact() {
 	if dead >= compactMinDead && dead*2 >= total {
 		_ = w.st.CompactLog()
 	}
-	if w.st.ArenaReclaimable() >= arenaCompactMinDead {
+	// Demote before the arena trigger reads the dead figures: a demotion pass
+	// creates exactly the dead bytes the compaction that follows reclaims.
+	demoted := w.st.MaybeDemote()
+	if demoted > 0 || w.st.ArenaReclaimable() >= arenaCompactMinDead {
 		w.st.CompactArena()
 	}
 }

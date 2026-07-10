@@ -26,6 +26,9 @@ const (
 	StatIndexBytes
 	StatArenaLive
 	StatChunkedBytes
+	StatVlogReads
+	StatPromotes
+	StatDemotes
 	NumStats
 )
 
@@ -44,6 +47,9 @@ var statNames = [NumStats]string{
 	StatIndexBytes:    "index_bytes",
 	StatArenaLive:     "arena_live_bytes",
 	StatChunkedBytes:  "chunked_bytes",
+	StatVlogReads:     "vlog_reads",
+	StatPromotes:      "ltm_promotes",
+	StatDemotes:       "ltm_demotes",
 }
 
 // appendStat writes one name:value INFO line.
