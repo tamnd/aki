@@ -330,8 +330,13 @@ func TestCompactAbortSafety(t *testing.T) {
 		t.Fatalf("overwrite k0: %v", err)
 	}
 	totalBefore, deadBefore := s.LogBytes()
-	// Cut into the last-appended value (k0's overwrite sits at the tail), so
-	// its read back fails while every earlier value stays whole on disk.
+	// Land the buffered appends, then cut into the last-appended value (k0's
+	// overwrite sits at the tail), so its read back fails while every earlier
+	// value stays whole on disk. Without the flush the tail bytes would still
+	// be served from the pending buffer and the truncation would cut nothing.
+	if err := s.vlog.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 	logPath := s.vlog.path
 	if err := s.vlog.f.Truncate(int64(totalBefore) - 100); err != nil {
 		t.Fatalf("Truncate: %v", err)

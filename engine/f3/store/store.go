@@ -46,12 +46,6 @@ type Store struct {
 	demotes    uint64
 	logReads   uint64
 
-	// dbuf and dstage are the demotion pass's staging: value bytes coalesce
-	// in dbuf so the log sees few large writes, dstage holds the pointer
-	// swaps applied after the write lands. Grown capacity is kept, like vbuf.
-	dbuf   []byte
-	dstage []demoteMove
-
 	// Band census and log-run count, plain single-owner counters.
 	bands   [4]uint64
 	logRuns uint64
@@ -199,11 +193,12 @@ func (s *Store) Reset() {
 	s.promotes = 0
 	s.demotes = 0
 	s.logReads = 0
-	s.dbuf = nil
-	s.dstage = nil
 	if s.vlog != nil {
 		_ = s.vlog.f.Truncate(0)
 		s.vlog.tail = 0
+		s.vlog.wtail = 0
+		s.vlog.pending = nil
+		s.vlog.werr = nil
 		s.vlog.dead = 0
 	}
 }
