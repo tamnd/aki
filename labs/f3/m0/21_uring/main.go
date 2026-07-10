@@ -225,7 +225,7 @@ func serveURing(conns []*econn, msgBytes int, stop *atomic.Bool, echoed *uint64)
 		e.fd = int32(c.fd)
 		e.addr = uint64(uintptr(unsafe.Pointer(&c.buf[0])))
 		e.len = uint32(len(c.buf))
-		e.userData = uint64(c.fd)<<1 | 0
+		e.userData = uint64(c.fd) << 1
 	}
 	for _, c := range conns {
 		byFD[c.fd] = c
@@ -393,7 +393,7 @@ func main() {
 		wg.Add(1)
 		go func(nc net.Conn) {
 			defer wg.Done()
-			defer nc.Close()
+			defer func() { _ = nc.Close() }()
 			got := make([]byte, len(burst))
 			for !stop.Load() {
 				if _, err := nc.Write(burst); err != nil {
