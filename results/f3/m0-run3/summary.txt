@@ -1,0 +1,67 @@
+f3 M0 run3 — aki #573 (hot-set LTM residency) + aki-bench #42 (honest per-connection key streams)
+headline ratio per cell = min(ab-vs-ab, rb-vs-rb); each harness ratio = min over rivals
+
+cell               aki_ab     rds_ab     vky_ab   r_ab     aki_rb     rds_rb     vky_rb   r_rb   HEAD aki_p99us   aki_rss   rds_rss   vky_rss  aki_B/k  rds_B/k  notes
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+set_64b_1m      4,168,954  3,692,438  2,890,311  1.13x  3,991,219  3,473,428  2,756,340  1.15x  1.13x   4,180.0  441776kB  142636kB  130048kB    113.4    127.5  
+incr_1m         5,977,360  4,464,972  3,990,211  1.34x  5,323,396  4,207,869  3,806,624  1.27x  1.27x   2,826.2  387260kB   59296kB   65564kB     57.5     47.5  
+set_1k_1m       3,611,921  3,088,696  2,126,026  1.17x  3,980,892  2,849,815  1,997,603  1.40x  1.17x   4,591.6 1454696kB 1338104kB 1348548kB  1,073.4  1,327.5  
+get_64b_1m      5,255,979  4,695,065  3,958,441  1.12x  4,995,005  4,437,542  3,996,004  1.13x  1.12x   3,285.0  550876kB  138340kB  127652kB    113.4    127.5  
+get_1k_1m       3,374,522  2,097,246  1,816,028  1.61x  3,328,895  2,103,934  1,997,204  1.58x  1.58x   5,005.3 3242448kB 1326444kB 1334844kB  1,073.4  1,327.5  
+
+distinct_keys_est check (aki windows, uniform std cells):
+  set_64b_1m rep0 aki: distinct_keys_est=1,000,000 draws=40,406,432 expected=1,000,000 dev=+0.0%
+  set_64b_1m rep1 aki: distinct_keys_est=1,000,000 draws=33,358,176 expected=1,000,000 dev=+0.0%
+  set_64b_1m rep2 aki: distinct_keys_est=1,000,000 draws=32,961,424 expected=1,000,000 dev=+0.0%
+  incr_1m rep0 aki: distinct_keys_est=1,000,000 draws=56,954,224 expected=1,000,000 dev=+0.0%
+  incr_1m rep1 aki: distinct_keys_est=1,000,000 draws=47,823,104 expected=1,000,000 dev=+0.0%
+  incr_1m rep2 aki: distinct_keys_est=1,000,000 draws=47,464,896 expected=1,000,000 dev=+0.0%
+  set_1k_1m rep0 aki: distinct_keys_est=1,000,000 draws=34,935,808 expected=1,000,000 dev=+0.0%
+  set_1k_1m rep1 aki: distinct_keys_est=1,000,000 draws=28,903,232 expected=1,000,000 dev=+0.0%
+  set_1k_1m rep2 aki: distinct_keys_est=1,000,000 draws=28,465,200 expected=1,000,000 dev=+0.0%
+  get_64b_1m rep0 aki: distinct_keys_est=1,000,000 draws=50,085,424 expected=1,000,000 dev=+0.0%
+  get_64b_1m rep1 aki: distinct_keys_est=1,000,000 draws=42,063,408 expected=1,000,000 dev=+0.0%
+  get_64b_1m rep2 aki: distinct_keys_est=1,000,000 draws=42,039,200 expected=1,000,000 dev=+0.0%
+  get_1k_1m rep0 aki: distinct_keys_est=1,000,000 draws=32,037,504 expected=1,000,000 dev=+0.0%
+  get_1k_1m rep1 aki: distinct_keys_est=1,000,000 draws=27,003,056 expected=1,000,000 dev=+0.0%
+  get_1k_1m rep2 aki: distinct_keys_est=1,000,000 draws=26,985,664 expected=1,000,000 dev=+0.0%
+coverage warnings printed by aki-bench:
+  none
+
+LTM strings (2M x 1032B ~2GB raw; aki 4x128MiB resident cap + vlog; rivals maxmemory 512mb allkeys-lfu)
+aki-bench sole harness (rb would count rival nils as ops). ratio = value-bearing ops vs best rival.
+cell             tgt         vops/s      ops/s   hit%   nil%    p99us   ratio
+-----------------------------------------------------------------------------
+ltm_get_uniform  aki        786,687    786,687  100.0    0.0 11,468.8        
+ltm_get_uniform  redis      662,854  3,302,169   20.1   79.9    606.7        
+ltm_get_uniform  valkey     652,665  3,244,195   20.1   79.9    529.9        
+                 value-bearing ratio: 1.19x (vs best rival)
+                 aki vlog_reads by snap: pre-rep0=0 post-rep0=14,558,207 post-rep1=14,484,799 post-rep2=14,441,331 end=14,441,331
+                 aki ltm_promotes: pre-rep0=0 post-rep0=729,904 post-rep1=723,405 post-rep2=716,632 end=716,632 | ltm_demotes: pre-rep0=0 post-rep0=2,369,512 post-rep1=2,364,815 post-rep2=2,357,396 end=2,357,396
+                 aki resident-hit approx: 1 - dvlog_reads/measured_ops = 0.6943 (dvlog_reads=14,441,331, measured ops=47,236,688; warm traffic not in denominator)
+                 redis INFO end: evicted_keys:4796185 keyspace_hits:45843467 keyspace_misses:182614741 
+                 valkey INFO end: evicted_keys:4792913 keyspace_hits:45082094 keyspace_misses:178980930 
+                 RSS max (1s samples): aki=962MiB redis=595MiB valkey=691MiB | aki/cap(512MiB)=1.88x | aki/best-rival-rss=1.39x (memory bar: <2x)
+
+ltm_get_zipf     aki      1,820,800  1,820,800  100.0    0.0  1,223.7        
+ltm_get_zipf     redis    1,299,874  3,299,669   39.7   60.3    625.7        
+ltm_get_zipf     valkey   1,303,951  3,187,664   40.9   59.1    553.5        
+                 value-bearing ratio: 1.40x (vs best rival)
+                 aki vlog_reads by snap: pre-rep0=0 post-rep0=7,587,387 post-rep1=7,245,556 post-rep2=7,324,077 end=7,324,077
+                 aki ltm_promotes: pre-rep0=0 post-rep0=473,860 post-rep1=456,787 post-rep2=461,756 end=461,756 | ltm_demotes: pre-rep0=0 post-rep0=2,114,895 post-rep1=2,096,428 post-rep2=2,101,565 end=2,101,565
+                 aki resident-hit approx: 1 - dvlog_reads/measured_ops = 0.9335 (dvlog_reads=7,324,077, measured ops=110,177,136; warm traffic not in denominator)
+                 redis INFO end: evicted_keys:4796195 keyspace_hits:90236880 keyspace_misses:137051616 
+                 valkey INFO end: evicted_keys:4792867 keyspace_hits:89965793 keyspace_misses:129979839 
+                 RSS max (1s samples): aki=973MiB redis=594MiB valkey=689MiB | aki/cap(512MiB)=1.90x | aki/best-rival-rss=1.41x (memory bar: <2x)
+
+ltm_set_uniform  aki        192,086    192,086  100.0    0.0 14,016.5        
+ltm_set_uniform  redis    1,044,995  1,044,995  100.0    0.0  1,459.2        
+ltm_set_uniform  valkey     925,633    925,633  100.0    0.0  1,599.5        
+                 value-bearing ratio: 0.18x (vs best rival)
+                 aki vlog_reads by snap: pre-rep0=0 post-rep0=0 post-rep1=0 post-rep2=0 end=0
+                 aki ltm_promotes: pre-rep0=0 post-rep0=0 post-rep1=0 post-rep2=0 end=0 | ltm_demotes: pre-rep0=0 post-rep0=4,093,931 post-rep1=4,089,283 post-rep2=4,093,057 end=4,093,057
+                 aki resident-hit approx: 1 - dvlog_reads/measured_ops = 1.0000 (dvlog_reads=0, measured ops=11,737,920; warm traffic not in denominator)
+                 redis INFO end: evicted_keys:55900668 keyspace_hits:0 keyspace_misses:0 
+                 valkey INFO end: evicted_keys:48831390 keyspace_hits:0 keyspace_misses:0 
+                 RSS max (1s samples): aki=1253MiB redis=534MiB valkey=841MiB | aki/cap(512MiB)=2.45x | aki/best-rival-rss=1.49x (memory bar: <2x)
+
