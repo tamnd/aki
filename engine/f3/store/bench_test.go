@@ -78,7 +78,7 @@ func BenchmarkGet(b *testing.B) {
 // values under a resident cap with headroom, so every hit runs the
 // visited-bit mark (touchResident) that plain BenchmarkGet never reaches.
 // The number prices the residency machinery's whole read-path addition;
-// lab 15 (labs/f3/m0/15_visited_mark) holds the sweep across mark variants.
+// lab 16 (labs/f3/m0/16_visited_mark) holds the sweep across mark variants.
 func BenchmarkGetResident(b *testing.B) {
 	const keys = 1 << 18
 	const valLen = 1032 // separated band

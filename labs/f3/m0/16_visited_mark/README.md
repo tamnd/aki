@@ -1,4 +1,4 @@
-# Lab 15: the visited mark's price on the resident GET path
+# Lab 16: the visited mark's price on the resident GET path
 
 Part of issue #542, the m0-run3 regression report.
 
