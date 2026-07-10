@@ -9,8 +9,7 @@ import (
 
 // ErrTooBig is returned by Do when one command cannot fit even an empty batch
 // node: more than spanCap arguments, or more than maxCmdBytes of argument
-// data. The dispatcher answers it with an in-order error reply; the chunked
-// giant-value path lifts the byte bound in the value-bands slice.
+// data. The dispatcher answers it with an in-order error reply.
 var ErrTooBig = errors.New("shard: command exceeds the batch node caps")
 
 // parked is one out-of-order reply held in the reorder ring until every lower
@@ -160,6 +159,10 @@ func (c *Conn) DrainReplies(emit func([]byte)) int {
 			return n
 		}
 		for i := 0; i < int(b.n); i++ {
+			if fc := b.fan(i); fc != nil {
+				n += c.mergeFan(fc, b.cmds[i].seq, b, i, emit)
+				continue
+			}
 			n += c.deliver(b.cmds[i].seq, b.reply(i), emit)
 		}
 		c.recycle(b)
