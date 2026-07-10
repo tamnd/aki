@@ -82,7 +82,7 @@ func overlayPatch(dst []byte, base, offset int, val []byte) {
 // placed so far unwinds and the store is as before.
 func (s *Store) writeChunked(old []byte, offset int, val []byte, newLen int) (dirOff uint64, n uint32, err error) {
 	n = chunkCount(uint64(newLen))
-	dirOff, ok := s.arena.allocRecord(uint64(n) * ptrSize)
+	dirOff, ok := s.arenaAlloc(uint64(n) * ptrSize)
 	if !ok {
 		return 0, 0, ErrFull
 	}
@@ -179,7 +179,7 @@ func (s *Store) updateChunked(addr uint64, offset int, val []byte, oldLen, newLe
 		if maxN := chunkCount(maxValueLen); grow > maxN {
 			grow = maxN
 		}
-		nd, ok := s.arena.allocRecord(uint64(grow) * ptrSize)
+		nd, ok := s.arenaAlloc(uint64(grow) * ptrSize)
 		if !ok {
 			return ErrFull
 		}
@@ -299,12 +299,13 @@ type chunkRef struct {
 }
 
 // ChunkStream reads one chunked value chunk by chunk, the streaming reply's
-// source. It snapshots the chunk locations at open: arena bytes are never
-// freed in this milestone and the log is append-only, so the snapshot stays
-// readable across later writes to the same key; CompactLog is the one thing
-// that moves logged bytes, and it must not run under an open stream (its
-// trigger runs on the owner between commands and defers while streams are
-// live).
+// source. It snapshots the chunk locations at open and pins the store's
+// arena while it lives: the arena compactor and the write path's full-arena
+// backstop both refuse to free or move segments while any stream is open
+// (store.openStreams), and the log is append-only with CompactLog gated to
+// the same stream-free idle boundary, so the snapshot stays readable across
+// later writes to the same key. The shard's stream pump calls Release when
+// the stream finishes, fails, or aborts.
 type ChunkStream struct {
 	s     *Store
 	l     *vlog
@@ -316,6 +317,16 @@ type ChunkStream struct {
 // Total is the value's byte length, the bulk header the streamed reply
 // carries.
 func (cs *ChunkStream) Total() int64 { return cs.total }
+
+// Release drops the stream's pin on the store's arena; the compactor may
+// move or free segments again once every open stream has released.
+// Idempotent, and owner-goroutine only like every other store touch.
+func (cs *ChunkStream) Release() {
+	if cs.s != nil {
+		cs.s.openStreams--
+		cs.s = nil
+	}
+}
 
 // Next copies the next chunk into dst and returns its length, zero once the
 // value is exhausted. dst must be at least ChunkSize bytes. It runs on the
@@ -363,6 +374,7 @@ func (s *Store) chunkStreamAt(addr uint64) *ChunkStream {
 	word, n, _ := s.readPtr(s.valueStart(addr))
 	dirOff := word & runAddrMask
 	cs := &ChunkStream{s: s, l: s.vlog, total: int64(s.vlen(addr)), refs: make([]chunkRef, n)}
+	s.openStreams++
 	for k := uint32(0); k < n; k++ {
 		w, l, _ := s.readPtr(dirOff + uint64(k)*ptrSize)
 		cs.refs[k] = chunkRef{word: w, clen: l}
