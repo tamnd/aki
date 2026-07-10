@@ -156,10 +156,24 @@ func (w *worker) maybeCompact() {
 // pumpStreams runs one producer pass over the in-flight streams, dropping the
 // ones that finished or failed. Compaction is in place; order among streams
 // does not matter, each has its own ring.
+//
+// A pass that published chunks (or a failure) owes the connection a writer
+// wake: a step-mode consumer (the reactor loop) parks between chunks instead
+// of spinning on the ring, so the pump pays the same publish-then-wake the
+// reply push pays, with the chunk ring's prod store as the publication and
+// ParkWriter's StreamReady re-check as the other half of the proof. The claim
+// CAS folds redundant deliveries, and a goroutine-driver consumer is never
+// parked mid-stream (emitStream spins), so the wake there is the one
+// uncontended load wake always costs.
 func (w *worker) pumpStreams() {
 	live := w.streams[:0]
 	for _, st := range w.streams {
-		if !st.pump() {
+		before := st.prod.Load()
+		done := st.pump()
+		if st.prod.Load() != before || st.failed.Load() {
+			st.conn.wk.wake()
+		}
+		if !done {
 			live = append(live, st)
 		}
 	}
@@ -170,7 +184,12 @@ func (w *worker) pumpStreams() {
 }
 
 // abortStreams fails every in-flight stream on shutdown so a consumer blocked
-// on an empty ring unwinds instead of waiting on a producer that exited.
+// on an empty ring unwinds instead of waiting on a producer that exited. The
+// wake goes through wk.wake, which for a loop-owned connection is the
+// SetWriterBatchNotify seam: the claim marks the connection dirty on its loop
+// and delivers one WakeLoop, so a reactor loop parked in epoll_wait comes
+// back, observes the failure through StreamReady/StreamAborted, and drops the
+// connection instead of waiting forever on chunks that will never come.
 func (w *worker) abortStreams() {
 	for i, st := range w.streams {
 		st.failed.Store(true)

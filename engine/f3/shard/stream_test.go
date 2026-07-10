@@ -213,3 +213,124 @@ func TestStreamThroughStore(t *testing.T) {
 		t.Fatalf("wire bytes differ: got %d bytes, want %d", len(out), len(want))
 	}
 }
+
+// TestStreamStepConsumer drives a streamed reply the way the reactor loop
+// does (SetStreamStep): the consumer never blocks on the chunk ring. It
+// drains what is there, steps the stream cursor while chunks are ready, parks
+// the writer, and blocks on the notify seam like the loop blocks in
+// epoll_wait. The producer's pump owes a wake for every chunk publish, so a
+// lost wake on that edge shows up here as the watchdog deadline firing with
+// the stream mid-flight.
+func TestStreamStepConsumer(t *testing.T) {
+	const chunks = 24
+	total := int64(chunks * store.ChunkSize)
+	src := &patSource{total: total}
+	rt := streamRuntime(src, total)
+	rt.Start()
+	defer rt.Stop()
+
+	nl := newNotifyLoop()
+	c := rt.NewConn()
+	c.SetStreamStep()
+	c.SetWriterNotify(nl.notify)
+	defer c.Close()
+
+	if err := c.Do(opStream, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Do(opPing, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.Flush()
+
+	var out []byte
+	emit := func(rep []byte) { out = append(out, rep...) }
+	deadline := time.Now().Add(20 * time.Second)
+	for c.Owes() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out with %d bytes emitted of %d", len(out), total)
+		}
+		c.DrainReplies(emit)
+		for c.StreamReady() && !c.Failed() {
+			// The loop's quantum: bounded emit, never a spin on the ring.
+			c.StreamStep(emit, store.ChunkSize)
+		}
+		if c.Failed() {
+			t.Fatal("connection failed on a healthy stream")
+		}
+		if !c.Owes() {
+			break
+		}
+		if c.ParkWriter() {
+			if !nl.wait(10 * time.Second) {
+				t.Fatal("no wake with the stream mid-flight; a parked consumer would hang")
+			}
+		}
+	}
+
+	want := []byte("$" + itoa(total) + "\r\n")
+	if !bytes.HasPrefix(out, want) {
+		t.Fatalf("reply starts %q, want %q", out[:min(len(out), 16)], want)
+	}
+	body := out[len(want):]
+	if !bytes.HasSuffix(body, []byte("\r\n+PONG\r\n")) {
+		t.Fatalf("reply tail = %q, want the trailer then the pipelined PONG", body[max(0, len(body)-16):])
+	}
+	body = body[:len(body)-len("\r\n+PONG\r\n")]
+	if int64(len(body)) != total {
+		t.Fatalf("streamed %d bytes, want %d", len(body), total)
+	}
+	for i := range body {
+		if body[i] != byte(int64(i)*31) {
+			t.Fatalf("byte %d = %#x, want %#x", i, body[i], byte(int64(i)*31))
+		}
+	}
+}
+
+// TestStreamStepFailureUnparks fails the source mid-stream against a step
+// consumer parked on the notify seam: the pump's failure wake must bring the
+// consumer back so StreamStep observes the failure and flips Failed, instead
+// of the consumer waiting forever on chunks that will never come. This is the
+// same unwind path a shard-shutdown abortStreams takes to a loop-owned
+// connection.
+func TestStreamStepFailureUnparks(t *testing.T) {
+	total := int64(8 * store.ChunkSize)
+	src := &patSource{total: total, fail: 2 * store.ChunkSize}
+	rt := streamRuntime(src, total)
+	rt.Start()
+	defer rt.Stop()
+
+	nl := newNotifyLoop()
+	c := rt.NewConn()
+	c.SetStreamStep()
+	c.SetWriterNotify(nl.notify)
+	defer c.Close()
+
+	if err := c.Do(opStream, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.Flush()
+
+	emit := func([]byte) {}
+	deadline := time.Now().Add(20 * time.Second)
+	for !c.Failed() {
+		if time.Now().After(deadline) {
+			t.Fatal("connection never reported the stream failure")
+		}
+		c.DrainReplies(emit)
+		for c.StreamReady() && !c.Failed() {
+			c.StreamStep(emit, store.ChunkSize)
+		}
+		if c.Failed() {
+			break
+		}
+		if c.ParkWriter() {
+			if !nl.wait(10 * time.Second) {
+				t.Fatal("no wake for the stream failure; a parked consumer would hang")
+			}
+		}
+	}
+	if c.StreamAborted() {
+		t.Fatal("StreamAborted still set after the failure was consumed")
+	}
+}
