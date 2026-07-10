@@ -6,8 +6,10 @@ import (
 )
 
 // TestInfoUsedMemory checks the INFO memory surface end to end: used_memory
-// parses out of the reply, grows when a value lands, and gives the bytes back
-// when the key leaves.
+// parses out of the reply, is the allocator-held sum (index tables plus the
+// arena's touched-segment fill), grows when a value lands, keeps holding a
+// deleted record's bytes until reclaim actually drains them, and gives
+// everything back on FLUSHALL.
 func TestInfoUsedMemory(t *testing.T) {
 	_, nc, br := startServer(t)
 
@@ -18,9 +20,9 @@ func TestInfoUsedMemory(t *testing.T) {
 	if base["index_bytes"] == 0 {
 		t.Fatalf("no index_bytes in INFO: %v", base)
 	}
-	if base["used_memory"] != base["index_bytes"]+base["arena_live_bytes"] {
-		t.Fatalf("used_memory %d != index %d + arena live %d",
-			base["used_memory"], base["index_bytes"], base["arena_live_bytes"])
+	if base["used_memory"] != base["index_bytes"]+base["arena_used_bytes"] {
+		t.Fatalf("used_memory %d != index %d + arena fill %d",
+			base["used_memory"], base["index_bytes"], base["arena_used_bytes"])
 	}
 
 	const valLen = 1 << 20
@@ -36,15 +38,39 @@ func TestInfoUsedMemory(t *testing.T) {
 		t.Fatalf("chunked_bytes = %d, want %d", grown["chunked_bytes"], valLen)
 	}
 
+	// A delete credits the live charge but the dead bytes still hold their
+	// pages until a compaction drains the segment, and used_memory must keep
+	// saying so: allocator-held, not live-only (issue #542).
 	send(t, nc, "DEL", "big")
 	expect(t, br, ":1\r\n")
 	after := readInfo(t, nc, br)
-	if after["used_memory"] != base["used_memory"] {
-		t.Fatalf("used_memory did not drain: base %d, after %d",
+	if after["arena_live_bytes"] != base["arena_live_bytes"] {
+		t.Fatalf("live charge did not drain: base %d, after %d",
+			base["arena_live_bytes"], after["arena_live_bytes"])
+	}
+	if after["used_memory"] != after["index_bytes"]+after["arena_used_bytes"] {
+		t.Fatalf("used_memory %d != index %d + arena fill %d",
+			after["used_memory"], after["index_bytes"], after["arena_used_bytes"])
+	}
+	if after["used_memory"] < base["used_memory"] {
+		t.Fatalf("used_memory fell below the fill floor: base %d, after %d",
 			base["used_memory"], after["used_memory"])
 	}
 	if after["chunked_bytes"] != 0 {
 		t.Fatalf("chunked_bytes did not drain: %d", after["chunked_bytes"])
+	}
+
+	// FLUSHALL is the real drain: the arena rewinds and hands its pages back,
+	// so used_memory falls to the index floor.
+	send(t, nc, "FLUSHALL")
+	expect(t, br, "+OK\r\n")
+	flushed := readInfo(t, nc, br)
+	if flushed["arena_used_bytes"] != 0 {
+		t.Fatalf("arena fill survived FLUSHALL: %d", flushed["arena_used_bytes"])
+	}
+	if flushed["used_memory"] != flushed["index_bytes"] {
+		t.Fatalf("used_memory %d != index floor %d after FLUSHALL",
+			flushed["used_memory"], flushed["index_bytes"])
 	}
 }
 

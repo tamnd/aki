@@ -130,7 +130,10 @@ func TestMemLedgerVlog(t *testing.T) {
 	if m.VlogTotalBytes == 0 || m.VlogLiveBytes == 0 {
 		t.Fatalf("no spill: %+v", m)
 	}
-	if m.UsedMemory() >= m.VlogLiveBytes+m.IndexBytes+m.ArenaLiveBytes {
+	if m.UsedMemory() != m.IndexBytes+m.ArenaAllocBytes {
+		t.Fatalf("UsedMemory is not the allocator-held sum: %+v", m)
+	}
+	if m.UsedMemory() >= m.IndexBytes+m.ArenaAllocBytes+m.VlogLiveBytes {
 		t.Fatalf("UsedMemory counts log bytes: %+v", m)
 	}
 

@@ -48,14 +48,27 @@ type MemLedger struct {
 	ChunkedBytes uint64
 }
 
-// UsedMemory is the shard's accounted live memory: index tables plus the
-// arena bytes charged to live records, runs, and chunk directories. It is an
-// account, not a measurement: no RSS, no Go runtime, no allocator slack, no
-// dead arena bytes awaiting segment reclaim, and no value-log bytes, which
-// are disk. The honest RSS number is used_memory_rss where the platform can
-// read it, and the two are expected to differ.
+// UsedMemory is the shard's allocator-held memory: index tables plus the
+// arena's touched-segment fill (ArenaAllocBytes), which is live records plus
+// the dead bytes waiting for compaction plus the reuse slack behind the bump
+// cursors. The definition is pinned by what the doc 18 memory columns compare
+// against: redis's INFO used_memory is what its allocator holds for the
+// dataset, dead-space slack included, and the arena is this store's
+// allocator, so the comparable figure is everything the arena has handed out
+// of touched segments and cannot hand back to the OS. Counting only the live
+// charge undercounted by the whole dead share on republish-heavy churn
+// (issue #542: 52MB reported against redis's 220MB on the same load), which
+// made the gate table's memory column read as a win that was really
+// unaccounted garbage.
+//
+// Still excluded, on purpose: untouched segment headroom and freed segments
+// (their pages are not resident, or went back through MADV_DONTNEED),
+// value-log bytes (disk per doc 16; VlogTotalBytes reports them separately),
+// and Go runtime slack. It is an account, not a measurement: the honest RSS
+// number is used_memory_rss where the platform can read it, and the two are
+// expected to differ.
 func (m MemLedger) UsedMemory() uint64 {
-	return m.IndexBytes + m.ArenaLiveBytes
+	return m.IndexBytes + m.ArenaAllocBytes
 }
 
 // Mem snapshots the shard's ledger. Owner-goroutine only, like every other

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"testing"
 )
 
@@ -256,5 +258,159 @@ func TestLedgerInvariantTightArena(t *testing.T) {
 			t.Fatalf("%s: %v", step, err)
 		}
 		checkLedger(t, s, step)
+	}
+}
+
+// rssBytes is the process's peak resident set in bytes, the ground truth the
+// churn test compares the ledger against.
+func rssBytes(t *testing.T) uint64 {
+	t.Helper()
+	var ru syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		t.Fatalf("getrusage: %v", err)
+	}
+	rss := uint64(ru.Maxrss)
+	if runtime.GOOS == "linux" {
+		rss *= 1024 // linux reports KiB, darwin bytes
+	}
+	return rss
+}
+
+// TestUsedMemoryChurn mimics the M0 gate SET cell: a keyspace of small
+// fixed-size values loaded once and then overwritten uniformly, the workload
+// issue #542 measured. used_memory must track the bytes the store actually
+// holds pages for (the touched-segment fill plus the index), not just the
+// live charges: on republish-heavy churn the dead-but-uncompacted share is
+// real resident memory, and reporting live-only made the gate table's memory
+// column a multiple-x undercount against redis's allocator-held used_memory.
+func TestUsedMemoryChurn(t *testing.T) {
+	nKeys := 1 << 20
+	passes := 3
+	if testing.Short() {
+		nKeys = 1 << 16
+	}
+	s := New(512<<20, 8<<20)
+	rng := rand.New(rand.NewPCG(7, 542))
+	v := make([]byte, 64)
+	fill := func() {
+		for i := range v {
+			v[i] = 'a' + byte(rng.IntN(26))
+		}
+	}
+	key := func(i int) []byte { return fmt.Appendf(nil, "key:%012d", i) }
+	fill()
+	for i := 0; i < nKeys; i++ {
+		if err := s.Set(key(i), v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loaded := s.Mem()
+	for p := 0; p < passes; p++ {
+		for i := 0; i < nKeys; i++ {
+			fill()
+			if err := s.Set(key(rng.IntN(nKeys)), v); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	m := s.Mem()
+	t.Logf("loaded:  used=%d index=%d live=%d alloc=%d", loaded.UsedMemory(), loaded.IndexBytes, loaded.ArenaLiveBytes, loaded.ArenaAllocBytes)
+	t.Logf("churned: used=%d index=%d live=%d alloc=%d", m.UsedMemory(), m.IndexBytes, m.ArenaLiveBytes, m.ArenaAllocBytes)
+
+	// The counters must still balance against the walk after the churn.
+	checkLedger(t, s, "after churn")
+
+	// The definitional pin: used_memory is allocator-held, so it can never
+	// read below the touched-segment fill plus the index tables.
+	if m.UsedMemory() < m.IndexBytes+m.ArenaAllocBytes {
+		t.Fatalf("used_memory %d below allocator-held floor %d (index %d + arena fill %d)",
+			m.UsedMemory(), m.IndexBytes+m.ArenaAllocBytes, m.IndexBytes, m.ArenaAllocBytes)
+	}
+}
+
+// TestUsedMemoryChurnBursty is the shape that produced the undercount: value
+// sizes flipping across the inline boundary, so about half the overwrites
+// change band and republish, stranding the old record as dead bytes behind
+// its live neighbors (lab 10's pass-two workload). The compactor runs at the
+// emulated worker boundaries like the shard does, so the dead share is the
+// realistic steady state, not an unbounded pile. Under the live-only
+// definition used_memory missed that whole share; under the allocator-held
+// definition it tracks the fill, and the test pins both the gap and the
+// ground truth against the process's own RSS growth.
+func TestUsedMemoryChurnBursty(t *testing.T) {
+	nKeys := 128 << 10
+	passes := 4
+	if testing.Short() {
+		nKeys = 16 << 10
+	}
+	rssBefore := rssBytes(t)
+	s := New(1<<30, 8<<20)
+	rng := rand.New(rand.NewPCG(11, 542))
+	buf := make([]byte, 4<<10)
+	for i := range buf {
+		buf[i] = 'a' + byte(rng.IntN(26))
+	}
+	key := func(i int) []byte { return fmt.Appendf(nil, "key:%012d", i) }
+	pick := func() []byte {
+		if rng.IntN(2) == 0 {
+			return buf[:512]
+		}
+		return buf[:4<<10]
+	}
+	for i := 0; i < nKeys; i++ {
+		if err := s.Set(key(i), pick()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Emulated worker boundaries, the lab 10 loop: tightness check per batch,
+	// the idle reclaim trigger every 64 batches at the 1MiB floor.
+	const batch = 1024
+	ops := 0
+	boundary := func() {
+		ops++
+		if ops%batch != 0 {
+			return
+		}
+		if s.ArenaTight() {
+			s.CompactArena()
+		}
+		if ops%(64*batch) == 0 && s.ArenaReclaimable() >= 1<<20 {
+			s.CompactArena()
+		}
+	}
+	for p := 0; p < passes; p++ {
+		for i := 0; i < nKeys; i++ {
+			// A pinned eighth never rewrites, the long-lived residents that
+			// keep segments from dying whole.
+			k := rng.IntN(nKeys)
+			if k%8 == 0 {
+				continue
+			}
+			if err := s.Set(key(k), pick()); err != nil {
+				t.Fatal(err)
+			}
+			boundary()
+		}
+	}
+	m := s.Mem()
+	checkLedger(t, s, "after bursty churn")
+	oldDef := m.IndexBytes + m.ArenaLiveBytes
+	newDef := m.UsedMemory()
+	rssGrowth := rssBytes(t) - rssBefore
+	t.Logf("live-only (old) = %d, allocator-held (new) = %d, dead share = %d, rss growth = %d",
+		oldDef, newDef, m.ArenaAllocBytes-m.ArenaLiveBytes, rssGrowth)
+	if newDef != m.IndexBytes+m.ArenaAllocBytes {
+		t.Fatalf("used_memory %d is not index %d + arena fill %d", newDef, m.IndexBytes, m.ArenaAllocBytes)
+	}
+	if newDef <= oldDef {
+		t.Fatalf("bursty churn produced no dead share: old %d, new %d", oldDef, newDef)
+	}
+	// Ground truth: the account must be within shouting distance of the pages
+	// the process actually gained, never the multiple-x undercount the gate
+	// follow-up caught. RSS growth carries Go runtime slack and test scratch
+	// on top, so the bar is a factor, not equality; under the race detector
+	// the shadow memory swamps it, so the bar only holds on regular builds.
+	if !raceEnabled && newDef*2 < rssGrowth {
+		t.Fatalf("used_memory %d is under half the RSS growth %d", newDef, rssGrowth)
 	}
 }
