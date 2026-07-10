@@ -22,6 +22,10 @@ const (
 	StatBandEmbedded
 	StatBandSeparated
 	StatBandChunked
+	StatUsedMemory
+	StatIndexBytes
+	StatArenaLive
+	StatChunkedBytes
 	NumStats
 )
 
@@ -36,19 +40,47 @@ var statNames = [NumStats]string{
 	StatBandEmbedded:  "band_embedded",
 	StatBandSeparated: "band_separated",
 	StatBandChunked:   "band_chunked",
+	StatUsedMemory:    "used_memory",
+	StatIndexBytes:    "index_bytes",
+	StatArenaLive:     "arena_live_bytes",
+	StatChunkedBytes:  "chunked_bytes",
 }
 
-// renderStats formats the summed counters as the INFO bulk reply: one
-// name:value line per field, resident memory and value-log accounting first,
-// band counts after.
+// appendStat writes one name:value INFO line.
+func appendStat(text []byte, name string, v uint64) []byte {
+	text = append(text, name...)
+	text = append(text, ':')
+	text = strconv.AppendUint(text, v, 10)
+	return append(text, '\r', '\n')
+}
+
+// renderStats formats the summed counters as the INFO bulk reply. The Memory
+// section leads with the fields a Redis INFO parser looks for: used_memory is
+// the shards' accounted live bytes (store.MemLedger.UsedMemory: index tables
+// plus arena live charges; no dead bytes, no allocator slack, no Go runtime,
+// no value-log bytes, which are disk), so it is an honest account, not RSS.
+// used_memory_rss is the kernel's resident figure where the platform exposes
+// it, and the two are expected to differ. The f3 section keeps the per-band
+// census and log accounting the LTM harness reads.
 func renderStats(dst []byte, stats []uint64) []byte {
+	get := func(i int) uint64 {
+		if i < len(stats) {
+			return stats[i]
+		}
+		return 0
+	}
 	var text []byte
-	text = append(text, "# f3\r\n"...)
+	text = append(text, "# Memory\r\n"...)
+	text = appendStat(text, "used_memory", get(StatUsedMemory))
+	if rss := readRSS(); rss != 0 {
+		text = appendStat(text, "used_memory_rss", rss)
+	}
+	text = append(text, "\r\n# f3\r\n"...)
 	for i := 0; i < NumStats && i < len(stats); i++ {
-		text = append(text, statNames[i]...)
-		text = append(text, ':')
-		text = strconv.AppendUint(text, stats[i], 10)
-		text = append(text, '\r', '\n')
+		if i == StatUsedMemory {
+			continue
+		}
+		text = appendStat(text, statNames[i], stats[i])
 	}
 	return resp.AppendBulk(dst, text)
 }

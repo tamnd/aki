@@ -18,18 +18,29 @@ func InfoShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	var b [shard.NumStats * 8]byte
 	put := func(i int, v uint64) { binary.LittleEndian.PutUint64(b[i*8:], v) }
 	st := cx.St
-	put(shard.StatKeys, uint64(st.Len()))
-	used, total := st.ArenaBytes()
-	put(shard.StatArenaUsed, used)
-	put(shard.StatArenaTotal, total)
-	lt, ld := st.LogBytes()
-	put(shard.StatVlogBytes, lt)
-	put(shard.StatVlogDead, ld)
+	m := st.Mem()
+	put(shard.StatKeys, m.Keys)
+	put(shard.StatArenaUsed, m.ArenaAllocBytes)
+	put(shard.StatArenaTotal, m.ArenaTotalBytes)
+	put(shard.StatVlogBytes, m.VlogTotalBytes)
+	put(shard.StatVlogDead, m.VlogTotalBytes-m.VlogLiveBytes)
 	bs := st.Stats()
 	put(shard.StatVlogRuns, bs.LogRuns)
 	put(shard.StatBandInt, bs.Int)
 	put(shard.StatBandEmbedded, bs.Embedded)
 	put(shard.StatBandSeparated, bs.Separated)
 	put(shard.StatBandChunked, bs.Chunked)
+	put(shard.StatUsedMemory, m.UsedMemory())
+	put(shard.StatIndexBytes, m.IndexBytes)
+	put(shard.StatArenaLive, m.ArenaLiveBytes)
+	put(shard.StatChunkedBytes, m.ChunkedBytes)
 	r.Raw(b[:])
+}
+
+// DBSizeShard answers a DBSIZE sub-command: one shard's live key count as a
+// FanCount partial; the gather sums the shards into the single integer reply,
+// so DBSIZE is O(shards), never a scan. With used_memory this is the
+// bytes-per-key denominator the benchmark harness reads.
+func DBSizeShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	r.FanCount(int64(cx.St.Len()))
 }
