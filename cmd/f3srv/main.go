@@ -18,12 +18,18 @@ func main() {
 	shards := flag.Int("shards", shard.DefaultShards(),
 		"owner workers, one pinned thread and one store each; the default is the 60 percent core split of spec 2064/f3/03 section 2.2")
 	arenaMiB := flag.Int("arena-mib", 256, "arena MiB per shard")
+	vlogDir := flag.String("vlog-dir", "",
+		"directory for per-shard value logs; empty keeps values in memory")
+	residentMiB := flag.Int("resident-cap-mib", 0,
+		"resident byte budget MiB per shard; past it, large values spill to the shard's value log (needs -vlog-dir; 0 means uncapped)")
 	flag.Parse()
 
 	srv, err := drivers.Listen(drivers.Options{
-		Addr:       *addr,
-		Shards:     *shards,
-		ArenaBytes: *arenaMiB << 20,
+		Addr:             *addr,
+		Shards:           *shards,
+		ArenaBytes:       *arenaMiB << 20,
+		VlogDir:          *vlogDir,
+		ResidentCapBytes: uint64(*residentMiB) << 20,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "f3srv:", err)
