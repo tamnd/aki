@@ -41,8 +41,9 @@ const (
 	kindString = 0x01
 
 	// maxKey and maxVal are the 64KiB field widths klen and the vcap word
-	// count can express. Values past the embed threshold move to extents in a
-	// later slice; until then this is the hard cap.
+	// count can express. Keys keep this cap for good; values at and past
+	// 64KiB move to the chunked band in a later slice, and until it lands
+	// this is the value's hard cap too.
 	maxKey = 0xffff
 	maxVal = 0xffff
 )
