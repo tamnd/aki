@@ -9,20 +9,49 @@ import (
 // response.
 var ErrFull = errors.New("store: arena full")
 
-// ErrTooBig is returned when a key or value exceeds the 64 KiB field width.
-// Values past the embed threshold move to extents in a later slice.
-var ErrTooBig = errors.New("store: key or value over 64 KiB")
+// ErrTooBig is returned when a key exceeds the 64 KiB field width or a value
+// the 512MiB proto-max-bulk-len ceiling.
+var ErrTooBig = errors.New("store: key or value over the size cap")
 
 var errEmptyKey = errors.New("store: empty key")
 
 // Store is one shard's memory engine: the segment-split index over the
-// segmented bump arena. It belongs to exactly one goroutine; nothing in it is
-// safe for concurrent use, on purpose, because the single-owner contract is
-// what deletes the whole coordination category from the hot path.
+// segmented bump arena, plus the shard's value log when one is configured. It
+// belongs to exactly one goroutine; nothing in it is safe for concurrent use,
+// on purpose, because the single-owner contract is what deletes the whole
+// coordination category from the hot path.
 type Store struct {
 	arena arena
 	idx   index
 	count int64
+
+	// The value-log half (doc 09 section 8): nil without a log. residentCap
+	// is the resident byte budget; past it a separated or chunked value's
+	// bytes spill to the log.
+	vlog        *vlog
+	residentCap uint64
+
+	// Band census and log-value count, plain single-owner counters.
+	bands   [4]uint64
+	logVals uint64
+
+	// vbuf is the store's value scratch for paths that must materialize a
+	// run (log-resident reads inside a rewrite); grown capacity is kept.
+	vbuf []byte
+}
+
+// Options configures a store beyond the arena geometry.
+type Options struct {
+	ArenaBytes int
+	SegBytes   int
+
+	// VlogPath enables the per-shard value log at this path (created,
+	// truncating any prior file).
+	VlogPath string
+
+	// ResidentCapBytes is the resident byte budget; 0 means uncapped. Only
+	// meaningful with a value log.
+	ResidentCapBytes uint64
 }
 
 // New builds a store whose arena holds arenaBytes, tiled into segments of
@@ -34,6 +63,30 @@ func New(arenaBytes, segBytes int) *Store {
 		arena: newArena(arenaBytes, segBytes),
 		idx:   newIndex(),
 	}
+}
+
+// Open is New plus the value-log configuration.
+func Open(o Options) (*Store, error) {
+	s := New(o.ArenaBytes, o.SegBytes)
+	if o.VlogPath != "" {
+		l, err := openVlog(o.VlogPath)
+		if err != nil {
+			return nil, err
+		}
+		s.vlog = l
+		s.residentCap = o.ResidentCapBytes
+	}
+	return s, nil
+}
+
+// Close releases the value log, if any. The arena is plain memory.
+func (s *Store) Close() error {
+	if s.vlog == nil {
+		return nil
+	}
+	err := s.vlog.close()
+	s.vlog = nil
+	return err
 }
 
 // Len reports the number of live keys.
@@ -71,9 +124,18 @@ func (s *Store) Delete(key []byte) bool {
 }
 
 // Reset drops every key and rewinds the arena, the flush path. Quiesced by
-// construction: the owner calls it between commands.
+// construction: the owner calls it between commands. The value log rewinds
+// with it; the truncate is best-effort, since a stale tail past the rewound
+// cursor is unreachable either way.
 func (s *Store) Reset() {
 	s.idx = newIndex()
 	s.arena.reset()
 	s.count = 0
+	s.bands = [4]uint64{}
+	s.logVals = 0
+	if s.vlog != nil {
+		_ = s.vlog.f.Truncate(0)
+		s.vlog.tail = 0
+		s.vlog.dead = 0
+	}
 }
