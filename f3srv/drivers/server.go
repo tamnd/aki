@@ -95,13 +95,13 @@ func (s *Server) Close() error {
 // handle runs one connection: a reader goroutine (this one) parses and routes,
 // a writer goroutine drains the reply queue in request order onto the socket.
 func (s *Server) handle(nc net.Conn) {
-	defer nc.Close()
+	defer func() { _ = nc.Close() }()
 	c := s.rt.NewConn()
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
 		bw := bufio.NewWriter(nc)
-		emit := func(rep []byte) { bw.Write(rep) }
+		emit := func(rep []byte) { _, _ = bw.Write(rep) }
 		for c.Wait() {
 			c.DrainReplies(emit)
 			if bw.Flush() != nil {
@@ -109,7 +109,7 @@ func (s *Server) handle(nc net.Conn) {
 			}
 		}
 		c.DrainReplies(emit)
-		bw.Flush()
+		_ = bw.Flush()
 	}()
 
 	br := bufio.NewReader(nc)
