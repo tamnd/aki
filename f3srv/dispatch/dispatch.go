@@ -27,6 +27,10 @@ type entry struct {
 	fanOp   byte
 	paired  bool // MSET-shaped tail: alternating key value
 	fanOnly bool // no point op; a single key still fans
+
+	// flushOpt marks the FLUSHALL/FLUSHDB tail: the one optional argument
+	// must be the ASYNC or SYNC token, anything else is a syntax error.
+	flushOpt bool
 }
 
 // maxVerb bounds the uppercase scratch for verb lookup; no Redis verb comes
@@ -115,6 +119,22 @@ func init() {
 	register("DBSIZE", nil, 0, 0, false)
 	registerFan("DBSIZE", shard.FanCount, dbsize, false, true)
 
+	// FLUSHALL scatters a reset intent to every shard; each owner rebuilds
+	// its store empty and the gather answers +OK only after every shard has
+	// confirmed, so the flush is a barrier against later commands from the
+	// same connection. FLUSHDB is an alias: f3 has a single keyspace (no
+	// SELECT), so flushing the db is flushing everything. The optional ASYNC
+	// and SYNC tokens are both accepted and both run synchronously for now:
+	// the reset is a segment rewind plus a truncate, quick enough that a
+	// background reclaim buys nothing yet.
+	flush := registerShard(str.FlushShard)
+	register("FLUSHALL", nil, 0, 1, false)
+	register("FLUSHDB", nil, 0, 1, false)
+	registerFan("FLUSHALL", shard.FanOK, flush, false, true)
+	registerFan("FLUSHDB", shard.FanOK, flush, false, true)
+	table["FLUSHALL"].flushOpt = true
+	table["FLUSHDB"].flushOpt = true
+
 	// The INCR family, APPEND, and the range pair. SUBSTR is GETRANGE under
 	// its old name; a distinct row so arity errors quote 'substr'.
 	register("INCR", str.Incr, 1, 1, true)
@@ -173,8 +193,11 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 // slices; it is the multi-key surface, not the point path.
 func dispatchFan(c *shard.Conn, e *entry, args [][]byte) error {
 	if !e.keyed {
-		// A keyless fan (INFO) scatters to every shard rather than routing by
-		// key.
+		// A keyless fan (INFO, FLUSHALL) scatters to every shard rather than
+		// routing by key.
+		if e.flushOpt && len(args) == 2 && !flushToken(args[1]) {
+			return oops(c, "ERR syntax error")
+		}
 		err := c.DoFanAll(e.fanOp, e.fan)
 		if err == shard.ErrTooBig {
 			return oops(c, "ERR command too large")
@@ -202,6 +225,29 @@ func dispatchFan(c *shard.Conn, e *entry, args [][]byte) error {
 		return oops(c, "ERR command too large")
 	}
 	return err
+}
+
+// flushToken reports whether arg is the ASYNC or SYNC option, case folded.
+// Both are accepted; dispatchFan runs either synchronously.
+func flushToken(arg []byte) bool {
+	return tokenIs(arg, "ASYNC") || tokenIs(arg, "SYNC")
+}
+
+// tokenIs is a case-insensitive ASCII compare against an uppercase word.
+func tokenIs(arg []byte, word string) bool {
+	if len(arg) != len(word) {
+		return false
+	}
+	for i := 0; i < len(word); i++ {
+		ch := arg[i]
+		if ch >= 'a' && ch <= 'z' {
+			ch -= 32
+		}
+		if ch != word[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func unknown(c *shard.Conn, verb []byte) error {
