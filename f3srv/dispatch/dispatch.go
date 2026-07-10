@@ -59,6 +59,18 @@ func init() {
 	register("EXISTS", str.Exists, 1, 1, true)
 	register("DEL", str.Del, 1, 1, true)
 	register("TYPE", str.Type, 1, 1, true)
+
+	// The INCR family, APPEND, and the range pair. SUBSTR is GETRANGE under
+	// its old name; a distinct row so arity errors quote 'substr'.
+	register("INCR", str.Incr, 1, 1, true)
+	register("DECR", str.Decr, 1, 1, true)
+	register("INCRBY", str.IncrByCmd, 2, 2, true)
+	register("DECRBY", str.DecrByCmd, 2, 2, true)
+	register("INCRBYFLOAT", str.IncrByFloat, 2, 2, true)
+	register("APPEND", str.Append, 2, 2, true)
+	register("SETRANGE", str.SetRange, 3, 3, true)
+	register("GETRANGE", str.GetRange, 3, 3, true)
+	register("SUBSTR", str.GetRange, 3, 3, true)
 }
 
 // Handlers returns the op-indexed handler vector for Runtime.Use.
