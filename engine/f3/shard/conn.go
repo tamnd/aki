@@ -11,6 +11,12 @@ import (
 // data. The dispatcher answers it with an in-order error reply.
 var ErrTooBig = errors.New("shard: command exceeds the batch node caps")
 
+// ErrConnFailed is returned by Do and DoFan on a single-goroutine connection
+// (SetInlineDrain) whose inline throttle drain hit an unrecoverable wire: a
+// streamed reply died mid-emit, or the connection closed under the enqueue.
+// Fatal to the connection, like any non-ErrTooBig Do error.
+var ErrConnFailed = errors.New("shard: connection failed")
+
 // parked is one out-of-order reply held in the reorder ring until every lower
 // sequence has been emitted. The buffer is owned by the slot and reused, so
 // parking costs a copy but no allocation once the slot has been warm. A
@@ -80,7 +86,23 @@ type Conn struct {
 	// waker channel after the spin window, not spin turns. Writer-side
 	// single-writer counter; see NetWakes.
 	parks eventCounter
+
+	// inlineEmit, when set, declares the connection single-goroutine driven:
+	// the same goroutine runs the reader and writer sides, so the pipeline
+	// throttle in Do cannot yield to a writer goroutine that does not exist
+	// and instead drains replies itself through this emit. Set once before
+	// traffic; read by the reader side only.
+	inlineEmit func([]byte)
 }
+
+// SetInlineDrain declares this connection single-goroutine driven and gives
+// the reader-side throttle the emit to drain replies through when the reader
+// runs a full reorder ring ahead of its own emit cursor. Without it a
+// single-goroutine transport would deadlock in Do the moment one read pass
+// parses more than a ring's worth of commands: the throttle would wait on a
+// drain only this goroutine can run. Call before any traffic on the
+// connection.
+func (c *Conn) SetInlineDrain(emit func([]byte)) { c.inlineEmit = emit }
 
 // Failed reports whether a streamed reply died mid-emit, leaving the wire in
 // an unrecoverable state. The transport checks it after each drain and tears
@@ -124,13 +146,10 @@ func (r *Runtime) NewConn() *Conn {
 // before Do returns, so the caller may reuse its views immediately. Nothing
 // is published until Flush or the node fills.
 func (c *Conn) Do(op byte, keyed bool, args [][]byte) error {
-	// The pipeline-window throttle: a reader more than a ring ahead of the
-	// writer blocks on the writer's progress, so a parked reply always has a
-	// distinct ring slot. The doc 03 section 4.5 watermarks replace this with
-	// per-shard backpressure in a later slice.
-	for c.seq-c.emitted.Load() >= uint32(len(c.ring)) {
-		c.Flush()
-		runtime.Gosched()
+	if c.seq-c.emitted.Load() >= uint32(len(c.ring)) {
+		if err := c.throttle(); err != nil {
+			return err
+		}
 	}
 	var sh int
 	if keyed {
@@ -152,6 +171,38 @@ func (c *Conn) Do(op byte, keyed bool, args [][]byte) error {
 		}
 	}
 	c.seq++
+	return nil
+}
+
+// throttle is the pipeline-window backstop, entered only when the reader is a
+// full reorder ring ahead of the emit cursor, so a parked reply always has a
+// distinct ring slot. On a paired connection it yields to the writer
+// goroutine and rechecks. A single-goroutine connection (SetInlineDrain) is
+// its own writer, so yielding could never open the window: it publishes, waits
+// on the conn waker like the transport's boundary drain does, and drains the
+// replies right here. The doc 03 section 4.5 watermarks replace this with
+// per-shard backpressure in a later slice.
+func (c *Conn) throttle() error {
+	for c.seq-c.emitted.Load() >= uint32(len(c.ring)) {
+		c.Flush()
+		if c.inlineEmit == nil {
+			runtime.Gosched()
+			continue
+		}
+		if !c.Wait() {
+			// Closed with the window still full. A single-goroutine
+			// connection closes itself, so this is unreachable in the
+			// transport; it exists so a misuse unwinds instead of spinning.
+			return ErrConnFailed
+		}
+		c.DrainReplies(c.inlineEmit)
+		if c.failed {
+			// A streamed reply died mid-emit during the inline drain; the
+			// wire is unrecoverable and the enqueue must unwind so the
+			// transport can tear the connection down.
+			return ErrConnFailed
+		}
+	}
 	return nil
 }
 
