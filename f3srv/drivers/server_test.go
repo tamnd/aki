@@ -3,12 +3,19 @@ package drivers
 import (
 	"bufio"
 	"net"
+	"os"
 	"testing"
 )
 
+// testConnShape is the suite-wide shape override: AKI_CONN_SHAPE=pair reruns
+// every driver test on the pair shape, which is how CI and the lab 15 A/B
+// cover both shapes without doubling the test code. Empty means the single
+// default.
+func testConnShape() string { return os.Getenv("AKI_CONN_SHAPE") }
+
 func startServer(t *testing.T) (*Server, net.Conn, *bufio.Reader) {
 	t.Helper()
-	srv, err := Listen(Options{Addr: "127.0.0.1:0", Shards: 2, ArenaBytes: 4 << 20, SegBytes: 1 << 18})
+	srv, err := Listen(Options{Addr: "127.0.0.1:0", Shards: 2, ArenaBytes: 4 << 20, SegBytes: 1 << 18, ConnShape: testConnShape()})
 	if err != nil {
 		t.Fatal(err)
 	}

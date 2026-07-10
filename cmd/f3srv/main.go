@@ -26,6 +26,8 @@ func main() {
 		"lock each shard worker to an OS thread; off by default, the locked-M park/unpark handoff costs more than thread residency buys (labs/f3/m0/11_transport)")
 	pprofAddr := flag.String("pprof-addr", "",
 		"listen address for net/http/pprof, e.g. 127.0.0.1:6060; the endpoint has no auth, so keep it on loopback; empty leaves it off")
+	connShape := flag.String("conn-shape", drivers.ShapeSingle,
+		"per-connection goroutine shape: single (one goroutine reads, dispatches, drains, and flushes) or pair (the M0 reader/writer pair, kept for the labs/f3/m0/15_conn_single A/B)")
 	flag.Parse()
 
 	srv, err := drivers.Listen(drivers.Options{
@@ -36,6 +38,7 @@ func main() {
 		ResidentCapBytes: uint64(*residentMiB) << 20,
 		PinWorkers:       *pinWorkers,
 		PprofAddr:        *pprofAddr,
+		ConnShape:        *connShape,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "f3srv:", err)

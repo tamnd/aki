@@ -2,6 +2,7 @@ package drivers
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -11,6 +12,22 @@ import (
 	"github.com/tamnd/aki/engine/f3/shard"
 	"github.com/tamnd/aki/f3srv/dispatch"
 	"github.com/tamnd/aki/f3srv/resp"
+)
+
+// The connection goroutine shapes Options.ConnShape selects between.
+const (
+	// ShapeSingle is one goroutine per connection, the doc 08 section 4.1
+	// shape: read, parse, dispatch, wait on the batch's completions, drain
+	// the replies, flush, read again. The default.
+	ShapeSingle = "single"
+
+	// ShapePair is the reader/writer pair the M0 transport shipped with: a
+	// reader goroutine parses and dispatches, a writer goroutine drains
+	// replies onto the socket. It costs one goroutine, one channel, and a
+	// worker-to-writer wake plus a writer park per request-reply round; it
+	// stays selectable for the labs/f3/m0/15_conn_single A/B and leaves with
+	// the M10 driver decision.
+	ShapePair = "pair"
 )
 
 // defaultArenaBytes is the per-shard arena when the caller leaves it zero,
@@ -72,17 +89,24 @@ type Options struct {
 	// bind it to loopback (for example "127.0.0.1:6060"). This is a server
 	// layer concern; the engine stays free of net/http.
 	PprofAddr string
+	// ConnShape picks the per-connection goroutine shape: ShapeSingle (also
+	// the empty default) or ShapePair. The pair shape exists for the lab 15
+	// A/B until the M10 driver decision.
+	ConnShape string
 }
 
-// Server is the goroutine-per-connection driver over the shard runtime: a
-// reader goroutine parses RESP2 and routes through the dispatch table, a
-// writer goroutine drains replies in request order onto the socket.
+// Server is the goroutine-per-connection driver over the shard runtime. In
+// the default single shape, one goroutine per connection parses RESP2, routes
+// through the dispatch table, waits on the batch's completions, and drains
+// the replies in request order onto the socket itself; the pair shape splits
+// the drain onto a second writer goroutine.
 type Server struct {
 	rt         *shard.Runtime
 	ln         net.Listener
 	pprofLn    net.Listener
 	replyBuf   int
 	flushEvery bool
+	shape      string
 	closed     atomic.Bool
 	conns      sync.WaitGroup
 
@@ -108,6 +132,13 @@ func (s *Server) Flushes() uint64 { return s.flushes.Load() }
 // Listen builds the runtime, registers the command table, starts the workers,
 // and binds the listener. Serve must be called to accept.
 func Listen(o Options) (*Server, error) {
+	switch o.ConnShape {
+	case "":
+		o.ConnShape = ShapeSingle
+	case ShapeSingle, ShapePair:
+	default:
+		return nil, fmt.Errorf("drivers: unknown conn shape %q", o.ConnShape)
+	}
 	if o.Shards <= 0 {
 		o.Shards = shard.DefaultShards()
 	}
@@ -138,6 +169,7 @@ func Listen(o Options) (*Server, error) {
 		ln:         ln,
 		replyBuf:   o.ReplyBufBytes,
 		flushEvery: o.FlushEveryDrain,
+		shape:      o.ConnShape,
 		netLive:    make(map[*connState]struct{}),
 	}
 	rt.SetNetInfo(s.appendNetInfo)
@@ -205,15 +237,87 @@ func (s *Server) Close() error {
 	return err
 }
 
-// handle runs one connection: this goroutine reads, parses, and routes; a
-// writer goroutine drains the reply queue in request order onto the socket.
-//
-// Buffer discipline is doc 08 section 2.1: parse every complete command the
-// buffer holds after each read (the parser hands out views, and Do copies
-// them into the hop node before returning, so the buffer is free again by the
-// time the loop advances), flush at the drained boundary, and either recycle
-// the buffer whole or fold a small tail to the head.
+// handle runs one connection in the configured shape.
 func (s *Server) handle(nc net.Conn) {
+	if s.shape == ShapePair {
+		s.handlePair(nc)
+		return
+	}
+	s.handleSingle(nc)
+}
+
+// handleSingle runs one connection on one goroutine, the doc 08 section 4.1
+// shape: read, parse, dispatch, wait on the batch's completions, drain the
+// replies, flush the socket, read again. Request-reply traffic never needs a
+// second goroutine: every reply answers a command this goroutine already
+// dispatched and published, so the boundary below drains to Owes() == false
+// before the next read and nothing can complete while the goroutine is
+// blocked in Read. The M0 surface has no push mode or blocking command yet,
+// so the section 4.1 flush-from-the-completing-owner try-lock is not needed
+// either; when those land, their completions arrive unsolicited and that path
+// gets built with them. Streamed replies already work here: emitStream runs
+// on this goroutine inside the boundary drain (or the Do throttle's inline
+// drain), consuming the worker's chunk ring like the pair's writer did.
+//
+// The waker machinery and its #564 skip rules are unchanged; Wait's
+// spin-then-park just runs on this goroutine, so a round costs the worker
+// wake alone where the pair also paid a worker-to-writer channel handoff.
+func (s *Server) handleSingle(nc net.Conn) {
+	defer func() { _ = nc.Close() }()
+	c := s.rt.NewConn()
+	cs := &connState{sc: c}
+	s.register(cs)
+	// LIFO defers: close first, then fold the final counts. In-flight replies
+	// for a gone client are dropped by Close's contract, nobody drains them.
+	defer s.unregister(cs)
+	defer c.Close()
+
+	bw := bufio.NewWriterSize(&countedWriter{w: nc, n: &cs.writes}, s.replyBuf)
+	emit := func(rep []byte) { _, _ = bw.Write(rep) }
+	// The pipeline-window throttle in Do drains through the same emit when
+	// the parse pass runs a full reorder ring ahead; without it a burst
+	// deeper than the ring in one read pass would deadlock this goroutine.
+	c.SetInlineDrain(emit)
+
+	s.readLoop(nc, c, cs, func() bool {
+		// Publish everything batched so far, one atomic push per touched
+		// shard, then serve the round: wait, drain, and hold the socket flush
+		// to the boundary so a P16 round stays one write syscall. A lone
+		// command zeroes the owed count on its first drain and flushes at
+		// once, which is the P1 immediate-flush contract.
+		c.Flush()
+		for c.Owes() {
+			if !c.Wait() {
+				return false
+			}
+			c.DrainReplies(emit)
+			if c.Failed() {
+				// A streamed reply died after its header went out; nothing
+				// coherent can follow, so the connection drops.
+				return false
+			}
+			if s.flushEvery && bw.Buffered() > 0 {
+				s.flushes.Add(1)
+				if bw.Flush() != nil {
+					return false
+				}
+			}
+		}
+		if bw.Buffered() > 0 {
+			s.flushes.Add(1)
+			if bw.Flush() != nil {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// handlePair runs one connection as the M0 reader/writer pair: this goroutine
+// reads, parses, and routes; a writer goroutine drains the reply queue in
+// request order onto the socket. Kept behind Options.ConnShape for the lab 15
+// A/B against handleSingle.
+func (s *Server) handlePair(nc net.Conn) {
 	defer func() { _ = nc.Close() }()
 	c := s.rt.NewConn()
 	cs := &connState{sc: c}
@@ -264,6 +368,27 @@ func (s *Server) handle(nc net.Conn) {
 		<-writerDone
 	}()
 
+	s.readLoop(nc, c, cs, func() bool {
+		// A drained read is the pipeline boundary: publish everything batched
+		// so far, one atomic push per touched shard. The writer goroutine
+		// owns the drain and the socket flush.
+		c.Flush()
+		return true
+	})
+}
+
+// readLoop is the read-parse-dispatch loop both shapes share. boundary runs
+// after every read pass (the section 2.2 pipeline boundary) and must publish
+// the batch; returning false tears the connection down. The protocol-error
+// reply goes through boundary too, so a single-goroutine connection drains
+// and flushes the in-order error before closing.
+//
+// Buffer discipline is doc 08 section 2.1: parse every complete command the
+// buffer holds after each read (the parser hands out views, and Do copies
+// them into the hop node before returning, so the buffer is free again by the
+// time the loop advances), and either recycle the buffer whole or fold a
+// small tail to the head.
+func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary func() bool) {
 	var p resp.Parser
 	buf := make([]byte, readBufSize)
 	n, pos := 0, 0
@@ -297,7 +422,7 @@ func (s *Server) handle(nc net.Conn) {
 					// Answer in pipeline order, then close: the stream cannot
 					// be resynced after a framing error.
 					_ = c.Do(shard.OpError, false, [][]byte{[]byte("ERR Protocol error: " + p.LastError())})
-					c.Flush()
+					boundary()
 					return
 				}
 				pos += consumed
@@ -327,9 +452,9 @@ func (s *Server) handle(nc net.Conn) {
 				n = copy(buf, buf[pos:n])
 				pos = 0
 			}
-			// A drained read is the pipeline boundary: publish everything
-			// batched so far, one atomic push per touched shard.
-			c.Flush()
+			if !boundary() {
+				return
+			}
 		}
 		if err != nil {
 			return

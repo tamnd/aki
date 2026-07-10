@@ -22,7 +22,7 @@ func TestPprofOff(t *testing.T) {
 func TestPprofOn(t *testing.T) {
 	srv, err := Listen(Options{
 		Addr: "127.0.0.1:0", Shards: 2, ArenaBytes: 4 << 20, SegBytes: 1 << 18,
-		PprofAddr: "127.0.0.1:0",
+		PprofAddr: "127.0.0.1:0", ConnShape: testConnShape(),
 	})
 	if err != nil {
 		t.Fatal(err)
