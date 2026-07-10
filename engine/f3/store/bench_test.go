@@ -22,8 +22,14 @@ func makeKey(buf []byte, n uint64) []byte {
 	return buf[:16]
 }
 
+// benchRecSize is the arena charge of a plain record (no expiry slot), the
+// sizing arithmetic allocString runs.
+func benchRecSize(klen, vlen int) uint64 {
+	return hdrSize + align8(uint64(klen)) + align8(uint64(vlen))
+}
+
 func filledStore(keys, valLen int) *Store {
-	rec := int(recSize(16, valLen))
+	rec := int(benchRecSize(16, valLen))
 	s := New(keys*rec+keys*rec/4+(16<<20), 0)
 	val := make([]byte, valLen)
 	var kb [16]byte
@@ -93,18 +99,19 @@ func BenchmarkArenaAppend(b *testing.B) {
 	s := New(256<<20, 0)
 	var kb [16]byte
 	val := make([]byte, 64)
-	n := recSize(16, 64)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		off, ok := s.arena.allocRecord(n)
-		if !ok {
+		k := makeKey(kb[:], uint64(i))
+		off, err := s.allocString(k, align8(64), 0, 0)
+		if err != nil {
 			s.arena.reset()
-			off, ok = s.arena.allocRecord(n)
-			if !ok {
+			off, err = s.allocString(k, align8(64), 0, 0)
+			if err != nil {
 				b.Fatal("alloc failed on a fresh arena")
 			}
 		}
-		s.initRecord(off, makeKey(kb[:], uint64(i)), val, kindString, 0)
+		copy(s.arena.buf[s.valueStart(off):], val)
+		s.setVlen(off, uint32(len(val)))
 	}
 }
