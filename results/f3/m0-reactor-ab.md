@@ -26,7 +26,7 @@ The standing numbers they move from are run 3's (aki 19c08a4): GET 64B P16/512 1
 
 ## Loop-count lab (slice 6, labs/f3/m0/19_loop_count)
 
-Ran first, 2026-07-11, aki c76d0 build; full tables and the sweep protocol live in the lab README.
+Ran first, 2026-07-11, aki c76d6c0 build; full tables and the sweep protocol live in the lab README.
 The knee is 3 loops on the 8-cpu server mask at every shard count tried (3, 4, 5): GET 64B P16/512 reads 2.05 / 6.14 / 6.64 / 6.65 / 4.70 / 3.47 Mops at loops 1/2/3/4/6/8, an interleaved second pass reproduces it within 0.1%, and an 8-thread-generator rerun rules out a generator ceiling.
 The 3-vs-4 tie on GET breaks toward 3 on SET (6.64 vs 6.14 Mops, +8%) and on p99 (1.38 vs 1.56 ms).
 The doc 08 section 4.2 spec amendment this resolves: neither M = shards (loses at shards=5: 5 loops 5.70 vs 3 loops 6.65 Mops) nor M = cores minus shards (loses at shards=3: 5 loops 5.70 vs 3 loops 6.65, and on SET/p99 at shards=4); the loop count follows the core budget alone, the 2/5 network share of the doc 03 section 2.2 split, the complement of shard.DefaultShards' 3/5.
@@ -37,7 +37,11 @@ RSS at 512 conns moves with loop count (516 to 701 MiB across the sweep), not wi
 
 ## Lab 18 box sweep (owed)
 
-Pending; box table replaces the provisional container label in labs/f3/m0/18_wake_batch/README.md.
+Delivered 2026-07-11 at aki b7fb698; the box table and the old-arm A/B live in labs/f3/m0/18_wake_batch/README.md, container numbers now labeled superseded.
+The fold mechanism reproduces on the box and wider than the container showed: at P16/512 loop wakes are 0.013/op against conn wakes 0.121/op, a 9.23x yield, and the P1 low-conn rows sit near 1x as filed.
+PRED-7 judgment: hit on both clauses (yield >= 8x and loop wakes <= 0.03 at the gate shape; P1 counters converge at low conns).
+The owed old-vs-new throughput A/B (d81a66b pre-batch arm vs main, both -net reactor -net-loops 3, GET 64B P16/512, 3 interleaved reps) reads old 6.642-6.647 Mops p99 1.39-1.46 ms against new 6.649 Mops p99 1.391 ms in all three reps: a tie at the harness plateau with a steadier tail, because at P16 the unbatched path only paid ~0.12 eventfd writes/op and the batch's own headroom at that depth is small.
+The plan's 1.5-1.65x figure was always the whole-reactor-vs-rivals claim, and that is judged by the slice 7 matrix below, not by this arm pair.
 
 ## A/B matrix (slice 7)
 
