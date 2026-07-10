@@ -26,6 +26,15 @@ const (
 	flagChunked = 1 << 2 // payload is a chunk-extent table
 	flagDead    = 1 << 3 // superseded; counted in the segment's dead bytes
 
+	// flagInt marks the V_INT band (doc 09 section 2): the value area holds a
+	// raw 8-byte int64 cell and vlen carries the decimal digit count, so
+	// STRLEN and reply presizing read vlen uniformly across bands.
+	flagInt = 1 << 4
+
+	// flagRawSticky records that APPEND or SETRANGE touched the value, the
+	// F_RAWSTICKY bit OBJECT ENCODING will read once that shim lands.
+	flagRawSticky = 1 << 5
+
 	// kindString is the plain string key record. Non-zero on purpose: a
 	// zero kind byte in a reused, unscrubbed arena offset must never read as a
 	// valid record kind.
@@ -39,14 +48,6 @@ const (
 )
 
 func align8(n uint64) uint64 { return (n + 7) &^ 7 }
-
-// recSize is the arena bytes a fresh record needs. No TTL variant yet: the
-// expiry slot and the TTL-class segment steering land with the expiry slice,
-// and the layout helpers below already account for the flag so that slice
-// changes writers, not readers.
-func recSize(klen, vlen int) uint64 {
-	return hdrSize + align8(uint64(klen)) + align8(uint64(vlen))
-}
 
 // keyStart is the key's offset within the record: past the header, and past
 // the expiry word when the record carries one.
@@ -92,23 +93,6 @@ func (s *Store) recordMatches(off uint64, key []byte) bool {
 	}
 	start := s.keyStart(off)
 	return string(s.arena.buf[start:start+uint64(len(key))]) == string(key)
-}
-
-// initRecord lays down a fresh record with plain stores. The kind and flags
-// bytes are written explicitly rather than trusted to zero-init, because a
-// freed segment's bytes are reused unscrubbed and a stale header must never
-// leak into a new record.
-func (s *Store) initRecord(off uint64, key, val []byte, kind, flags byte) {
-	buf := s.arena.buf
-	binary.LittleEndian.PutUint32(buf[off+offVer:], 0)
-	binary.LittleEndian.PutUint32(buf[off+offVlen:], uint32(len(val)))
-	binary.LittleEndian.PutUint16(buf[off+offKlen:], uint16(len(key)))
-	binary.LittleEndian.PutUint16(buf[off+offVcap:], uint16(align8(uint64(len(val)))/8))
-	buf[off+offKind] = kind
-	buf[off+offFlags] = flags
-	binary.LittleEndian.PutUint16(buf[off+offKindBits:], 0)
-	copy(buf[off+hdrSize:], key)
-	copy(buf[off+hdrSize+align8(uint64(len(key))):], val)
 }
 
 // recBytes is the arena bytes the allocator charged for the record at off:

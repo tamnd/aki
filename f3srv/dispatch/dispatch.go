@@ -6,6 +6,7 @@ package dispatch
 
 import (
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/engine/f3/str"
 )
 
 // entry is one command's table row. op doubles as the handler's index in the
@@ -49,6 +50,15 @@ func register(name string, h shard.Handler, minArgs, maxArgs int, keyed bool) {
 func init() {
 	register("PING", ping, 0, 1, false)
 	register("ECHO", echo, 1, 1, false)
+
+	// The string point surface. SET's tail is option soup, so the handler
+	// validates it; DEL and EXISTS are single-key until the fan-out slice.
+	register("SET", str.Set, 2, -1, true)
+	register("GET", str.Get, 1, 1, true)
+	register("STRLEN", str.Strlen, 1, 1, true)
+	register("EXISTS", str.Exists, 1, 1, true)
+	register("DEL", str.Del, 1, 1, true)
+	register("TYPE", str.Type, 1, 1, true)
 }
 
 // Handlers returns the op-indexed handler vector for Runtime.Use.
