@@ -255,14 +255,14 @@ func TestWakeBatchingCounters(t *testing.T) {
 	}
 
 	ns := srv.NetStats()
-	if ns.Driver != NetReactor {
+	if ns.Driver == NetGoroutine {
 		if ns.LoopWakes != 0 {
 			t.Fatalf("goroutine driver reported %d loop wakes, want 0", ns.LoopWakes)
 		}
 		return
 	}
 	if ns.LoopWakes == 0 {
-		t.Fatalf("reactor served %d rounds with zero loop wakes; the counter is not wired", rounds)
+		t.Fatalf("%s served %d rounds with zero loop wakes; the counter is not wired", ns.Driver, rounds)
 	}
 	if ns.LoopWakes > ns.ConnWakes {
 		t.Fatalf("loop wakes %d exceed conn wakes %d; a delivery fired without a claim", ns.LoopWakes, ns.ConnWakes)

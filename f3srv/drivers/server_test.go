@@ -15,19 +15,34 @@ import (
 func testConnShape() string { return os.Getenv("AKI_CONN_SHAPE") }
 
 // testNetDriver is the same suite-wide override for the network driver:
-// AKI_NET=reactor reruns every driver test on the epoll reactor, which is how
-// the ubuntu CI leg covers it without doubling the test code. Empty means the
-// goroutine default.
+// AKI_NET=reactor or AKI_NET=uring reruns every driver test on that event
+// loop, which is how the ubuntu CI legs cover them without doubling the test
+// code. Empty means the goroutine default.
 func testNetDriver() string { return os.Getenv("AKI_NET") }
 
 // wantNetDriver is the driver a server built with testNetDriver should
-// report: the reactor where it exists, the logged goroutine fallback
-// everywhere else.
+// report: the requested event loop where it exists (for uring, where the
+// kernel probe also passes), the logged goroutine fallback everywhere else.
 func wantNetDriver() string {
-	if testNetDriver() == NetReactor && runtime.GOOS == "linux" {
-		return NetReactor
+	switch testNetDriver() {
+	case NetReactor:
+		if runtime.GOOS == "linux" {
+			return NetReactor
+		}
+	case NetURing:
+		if runtime.GOOS == "linux" && uringAvailable() {
+			return NetURing
+		}
 	}
 	return NetGoroutine
+}
+
+// wantEventLoop reports whether the suite is running on an event-loop driver
+// (reactor or uring); the tests that pin loop behaviors (wake batching,
+// stream stepping under a shared loop, the mid-cycle output cap) gate on it.
+func wantEventLoop() bool {
+	d := wantNetDriver()
+	return d == NetReactor || d == NetURing
 }
 
 func startServer(t *testing.T) (*Server, net.Conn, *bufio.Reader) {

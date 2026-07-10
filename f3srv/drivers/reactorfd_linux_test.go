@@ -13,8 +13,9 @@ import (
 	"time"
 )
 
-// TestReactorCloseFDLifecycle is the fd-lifecycle proof for the reactor
-// shutdown contract: Close with a stream in flight to a slow reader, a
+// TestReactorCloseFDLifecycle is the fd-lifecycle proof for the event-loop
+// shutdown contract (the reactor and the uring driver share the dup design):
+// Close with a stream in flight to a slow reader, a
 // write-blocked reply backlog, and idle clients pending must terminate within
 // a deadline, and every dup'd connection fd must go through closeFD exactly
 // once with no error. The counting seam catches both failure modes the dup
@@ -24,8 +25,8 @@ import (
 // abortStreams proof: the mid-flight stream's consumer unwinds through the
 // loop notifier instead of waiting forever on chunks that stopped coming.
 func TestReactorCloseFDLifecycle(t *testing.T) {
-	if wantNetDriver() != NetReactor {
-		t.Skip("fd lifecycle is reactor-only; the goroutine driver never dups the fd")
+	if !wantEventLoop() {
+		t.Skip("fd lifecycle is event-loop-only; the goroutine driver never dups the fd")
 	}
 
 	var mu sync.Mutex
