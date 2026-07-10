@@ -406,3 +406,49 @@ func TestArenaGenuinelyFull(t *testing.T) {
 		mustGet(t, s, k, string(sepVal('x', 4096)))
 	}
 }
+
+// TestCompactBudgetedWhenTight pins the victim budget: with the arena down
+// to its last free segment and every filled segment past an aggressive
+// threshold, an unbudgeted pass copies survivors into the remaining tail
+// without draining any victim and wedges the arena (the lab 10 1/8 cell died
+// with ErrFull at 0.18x turnover). The budgeted pass takes only what the
+// free space holds, so the store stays writable through repeated tight
+// compactions.
+func TestCompactBudgetedWhenTight(t *testing.T) {
+	s := testStore(t, 8)
+	s.TuneArenaReclaim(1, 8)
+	var survivors [][]byte
+	for p := 0; s.arena.freeSegCount() > 2; p++ {
+		_, keys := fillSepSeg(t, s, fmt.Sprintf("p%d-", p), 4096)
+		for i, k := range keys {
+			if i%4 == 0 {
+				if !s.Delete(k) {
+					t.Fatalf("Delete %q: missing", k)
+				}
+			} else {
+				survivors = append(survivors, k)
+			}
+		}
+	}
+	for i := 0; i < 64; i++ {
+		if s.ArenaTight() {
+			s.CompactArena()
+		}
+		k := []byte(fmt.Sprintf("post%03d", i))
+		if err := s.Set(k, sepVal('z', 4096)); err != nil {
+			t.Fatalf("write %d after tight compaction: %v", i, err)
+		}
+		if !s.Delete(k) {
+			t.Fatalf("delete %d: missing", i)
+		}
+	}
+	for _, k := range survivors {
+		v, ok := s.Get(k, nil)
+		if !ok {
+			t.Fatalf("survivor %q missing after tight compactions", k)
+		}
+		if len(v) != 4096 || v[0] != v[4095] {
+			t.Fatalf("survivor %q corrupt: %d bytes, ends %q/%q", k, len(v), v[0], v[len(v)-1])
+		}
+	}
+}
