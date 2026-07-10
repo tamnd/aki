@@ -131,9 +131,9 @@ func hammer(addr string, pipeline int, seed uint64, deadline time.Time) (uint64,
 
 // cell is one sweep point's per-op counter movement.
 type cell struct {
-	opsPerSec           float64
-	connWakes, loopWaks float64
-	writes              float64
+	opsPerSec            float64
+	connWakes, loopWakes float64
+	writes               float64
 }
 
 func runCell(pipeline, conns int, dur time.Duration) (cell, error) {
@@ -181,7 +181,7 @@ func runCell(pipeline, conns int, dur time.Duration) (cell, error) {
 	return cell{
 		opsPerSec: ops / el.Seconds(),
 		connWakes: d(ns1.ConnWakes, ns0.ConnWakes),
-		loopWaks:  d(ns1.LoopWakes, ns0.LoopWakes),
+		loopWakes: d(ns1.LoopWakes, ns0.LoopWakes),
 		writes:    d(ns1.WriteSyscalls, ns0.WriteSyscalls),
 	}, nil
 }
@@ -202,11 +202,11 @@ func main() {
 				os.Exit(1)
 			}
 			yield := 0.0
-			if c.loopWaks > 0 {
-				yield = c.connWakes / c.loopWaks
+			if c.loopWakes > 0 {
+				yield = c.connWakes / c.loopWakes
 			}
 			fmt.Printf("| %d | P%d | %.0f | %.3f | %.3f | %.2fx | %.3f |\n",
-				conns, pipeline, c.opsPerSec, c.connWakes, c.loopWaks, yield, c.writes)
+				conns, pipeline, c.opsPerSec, c.connWakes, c.loopWakes, yield, c.writes)
 		}
 	}
 }
