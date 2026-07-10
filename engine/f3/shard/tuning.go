@@ -1,0 +1,62 @@
+package shard
+
+import (
+	"runtime"
+	"time"
+)
+
+// The constants the M0 labs own. Each one ships with the spec 2064/f3/03
+// provisional default and is swept by its lab before the gate run; a lab that
+// moves one lands the new value in its own PR with the sweep data attached.
+const (
+	// batchCap is the command capacity of one hop batch node (doc 03 section
+	// 3.2): it covers the P16 gate depth in one node with room to coalesce and
+	// keeps the node small. Lab: hop batch cap (sweep {16, 32, 64}, PRED-X8).
+	batchCap = 32
+
+	// batchDataCap bounds the argument bytes one batch node carries. The M0
+	// transport copies parsed arguments into the node; the zero-copy argument
+	// spans into the connection read buffer, with their buffer-generation
+	// lifetime rules (doc 03 section 4.4), land with the RESP2 slice.
+	batchDataCap = 8192
+
+	// repCap is the starting capacity of a node's reply buffer, sized so the
+	// steady path never grows it: every point reply plus an echoed payload fits
+	// with headroom. A reply run past the cap grows the buffer once and the
+	// node keeps the larger buffer for its next life.
+	repCap = batchDataCap + 64*batchCap
+
+	// spinWindow is how long an idle worker burns plain loads on its inbound
+	// queue before it parks (doc 03 section 9.2, provisional 4us): long enough
+	// to catch the gap between pipelined bursts, short enough that a quiet
+	// server converges to parked. Lab: spin-before-park window (PRED-X7).
+	spinWindow = 4 * time.Microsecond
+
+	// prefetchDepth caps how many of a batch's index buckets stage one touches
+	// ahead of execution (doc 03 section 3.4). At the provisional value the
+	// whole batch prefetches; the lab decides whether a shorter window beats
+	// the memory system's sustainable depth. Lab: prefetch depth (PRED-X6).
+	prefetchDepth = 32
+
+	// replyRing is a connection's pipeline window: the reply reorder ring holds
+	// this many in-flight replies, and a producer past the window blocks on the
+	// writer's progress. The doc 03 section 4.5 watermarks refine this into
+	// per-shard backpressure in the RESP2 slice.
+	replyRing = 1024
+
+	// freeListCap bounds a connection's batch-node free list. Nodes past the
+	// cap fall to the collector; the steady path recycles well under it.
+	freeListCap = 64
+)
+
+// DefaultShards is the shard count when the flag is unset: the data plane gets
+// about 60 percent of the cores and the net goroutines take the remainder,
+// the split the saturating profiles bound (doc 03 section 2.2: parse plus
+// syscalls run a third to a half of total CPU). Lab: shard count per box.
+func DefaultShards() int {
+	n := runtime.GOMAXPROCS(0) * 3 / 5
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
