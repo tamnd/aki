@@ -22,6 +22,11 @@ type Ctx struct {
 	// reads into Val[:0] and stores the result back, so the capacity is reused
 	// and the steady path allocates nothing.
 	Val []byte
+
+	// Aux is a second scratch for handlers that need one while Val is busy:
+	// the fan-out partial builders assemble their encoding here while reading
+	// values through Val. Same reuse contract as Val.
+	Aux []byte
 }
 
 // Handler executes one command against its shard. args are views into the hop
