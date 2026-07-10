@@ -119,6 +119,11 @@ func (s *Server) handle(nc net.Conn) {
 		emit := func(rep []byte) { _, _ = bw.Write(rep) }
 		for c.Wait() {
 			c.DrainReplies(emit)
+			if c.Failed() {
+				// A streamed reply died after its header went out; nothing
+				// coherent can follow, so the connection drops.
+				return
+			}
 			if bw.Flush() != nil {
 				return
 			}
@@ -172,6 +177,11 @@ func (s *Server) handle(nc net.Conn) {
 			}
 			if pos == n {
 				pos, n = 0, 0
+				// A giant inbound bulk grew the buffer; once drained, shrink
+				// back so an idle connection does not pin megabytes.
+				if len(buf) > 16*readBufSize {
+					buf = make([]byte, readBufSize)
+				}
 			} else if pos > 0 && n-pos <= compactMax {
 				n = copy(buf, buf[pos:n])
 				pos = 0

@@ -172,18 +172,27 @@ func (s *Store) publish(h uint64, slot *uint64, oldAddr, off uint64) {
 }
 
 // GetString copies the value for key into dst (reusing its capacity) and
-// reports presence, rendering an int cell back to its decimal text.
+// reports presence, rendering an int cell back to its decimal text. A chunked
+// value materializes whole here; the streaming read path is GetStream.
 func (s *Store) GetString(key []byte, now int64, dst []byte) ([]byte, bool) {
 	h := Hash(key)
 	_, addr, _ := s.findLive(h, key, now)
 	if addr == 0 {
 		return dst[:0], false
 	}
+	return s.readValue(addr, dst)
+}
+
+// readValue copies a live record's value into dst, whatever its band.
+func (s *Store) readValue(addr uint64, dst []byte) ([]byte, bool) {
 	vs := s.valueStart(addr)
 	f := s.recFlags(addr)
 	if f&flagInt != 0 {
 		n := int64(binary.LittleEndian.Uint64(s.arena.buf[vs:]))
 		return strconv.AppendInt(dst[:0], n, 10), true
+	}
+	if f&flagChunked != 0 {
+		return s.readChunked(addr, dst)
 	}
 	if f&flagSep != 0 {
 		return s.readSep(addr, dst)
@@ -247,7 +256,7 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 	if len(key) == 0 {
 		return errEmptyKey
 	}
-	if len(key) > maxKey || len(val) > maxVal {
+	if len(key) > maxKey || len(val) > maxValueLen {
 		return ErrTooBig
 	}
 	h := Hash(key)
@@ -260,19 +269,19 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 	iv, isInt := ParseInt(val)
 
 	if addr != 0 {
-		// In place when the record holds its bytes itself (int or embedded;
-		// a separated record's area is a pointer, so a full replace always
-		// republishes and re-selects the band from scratch), the value fits
-		// the reserved capacity, and the TTL layout is compatible: a record
-		// without a slot cannot take a deadline, and a record with one keeps
-		// it for life (clearing writes zero into the slot).
+		// In place when the record holds its bytes itself (int or embedded; a
+		// separated or chunked record's area is a pointer, so a full replace
+		// always republishes and re-selects the band from scratch), the value
+		// fits the reserved capacity, and the TTL layout is compatible: a
+		// record without a slot cannot take a deadline, and a record with one
+		// keeps it for life (clearing writes zero into the slot).
 		f := s.recFlags(addr)
 		hasSlot := f&flagHasTTL != 0
 		need := uint64(len(val))
 		if isInt {
 			need = 8
 		}
-		if f&flagSep == 0 && need <= s.vcapBytes(addr) && (at == 0 || hasSlot) {
+		if f&(flagSep|flagChunked) == 0 && need <= s.vcapBytes(addr) && (at == 0 || hasSlot) {
 			vs := s.valueStart(addr)
 			nf := f &^ (flagInt | flagRawSticky)
 			if isInt {
@@ -297,6 +306,9 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 	case isInt:
 		flags |= flagInt
 		vcapB = 8
+	case len(val) >= strChunkMin:
+		flags |= flagChunked
+		vcapB = ptrSize
 	case len(val) > strInlineMax:
 		flags |= flagSep
 		vcapB = ptrSize
@@ -312,6 +324,13 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 	switch {
 	case isInt:
 		binary.LittleEndian.PutUint64(s.arena.buf[vs:], uint64(iv))
+	case flags&flagChunked != 0:
+		dirOff, n, err := s.writeChunked(nil, 0, val, len(val))
+		if err != nil {
+			s.arena.unlink(off, s.recBytes(off))
+			return err
+		}
+		s.writePtr(s.valueStart(off), dirOff, n, n)
 	case flags&flagSep != 0:
 		word, vcap, err := s.writeRun(val, nil, 0)
 		if err != nil {
@@ -359,7 +378,7 @@ func (s *Store) IncrBy(key []byte, delta, now int64) (int64, error) {
 	} else {
 		// A separated or chunked value is over 1KiB by construction, far past
 		// any integer's text, so it is not int-shaped without reading it.
-		if f&flagSep != 0 {
+		if f&(flagSep|flagChunked) != 0 {
 			return 0, ErrNotInt
 		}
 		var ok bool
@@ -416,6 +435,14 @@ func (s *Store) materialize(addr uint64, scratch []byte) ([]byte, error) {
 	if f&flagInt != 0 {
 		n := int64(binary.LittleEndian.Uint64(s.arena.buf[vs:]))
 		return strconv.AppendInt(scratch[:0], n, 10), nil
+	}
+	if f&flagChunked != 0 {
+		v, ok := s.readChunked(addr, s.vbuf)
+		s.vbuf = v[:cap(v)][:0]
+		if !ok {
+			return nil, errChunkRead
+		}
+		return v, nil
 	}
 	if f&flagSep != 0 {
 		word, vlen, _ := s.readPtr(vs)
@@ -494,11 +521,19 @@ func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 	h := Hash(key)
 	slot, addr, _ := s.findLive(h, key, now)
 	if addr == 0 {
-		if len(add) > maxVal {
+		if len(add) > maxValueLen {
 			return 0, ErrTooBig
 		}
 		// Create-on-miss is SET with the raw-sticky bit: zero headroom, the
 		// first growth buys the slack.
+		if len(add) >= strChunkMin {
+			off, err := s.allocChunked(key, nil, 0, add, len(add), flagRawSticky, 0)
+			if err != nil {
+				return 0, err
+			}
+			s.publish(h, slot, 0, off)
+			return int64(len(add)), nil
+		}
 		if len(add) > strInlineMax {
 			off, err := s.allocSep(key, add, nil, flagRawSticky, 0)
 			if err != nil {
@@ -517,14 +552,43 @@ func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 		return int64(len(add)), nil
 	}
 	f := s.recFlags(addr)
+	if f&flagChunked != 0 {
+		// Chunk-bounded: no materialize, the patch composes only the final
+		// and the fresh chunks.
+		oldLen := int(s.vlen(addr))
+		newLen := oldLen + len(add)
+		if newLen > maxValueLen {
+			return 0, ErrTooBig
+		}
+		if err := s.updateChunked(addr, oldLen, add, oldLen, newLen); err != nil {
+			return 0, err
+		}
+		return int64(newLen), nil
+	}
 	var scratch [20]byte
 	old, err := s.materialize(addr, scratch[:])
 	if err != nil {
 		return 0, err
 	}
 	newLen := len(old) + len(add)
-	if newLen > maxVal {
+	if newLen > maxValueLen {
 		return 0, ErrTooBig
+	}
+	if newLen >= strChunkMin {
+		// The growth crosses the chunk threshold: the record republishes in
+		// chunked form over old then add. old is under the threshold by
+		// construction, so the materialized copy is bounded.
+		at := s.expireAt(addr)
+		flags := byte(flagRawSticky)
+		if at != 0 {
+			flags |= flagHasTTL
+		}
+		off, err := s.allocChunked(key, old, len(old), add, newLen, flags, at)
+		if err != nil {
+			return 0, err
+		}
+		s.publish(h, slot, addr, off)
+		return int64(newLen), nil
 	}
 	if f&flagSep != 0 {
 		return s.appendSep(addr, old, add, newLen)
@@ -582,13 +646,21 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 		return 0, ErrTooBig
 	}
 	end := offset + len(val)
-	if end > maxVal {
+	if end > maxValueLen {
 		return 0, ErrTooBig
 	}
 	h := Hash(key)
 	slot, addr, _ := s.findLive(h, key, now)
 	buf := s.arena.buf
 	if addr == 0 {
+		if end >= strChunkMin {
+			off, err := s.allocChunked(key, nil, offset, val, end, flagRawSticky, 0)
+			if err != nil {
+				return 0, err
+			}
+			s.publish(h, slot, 0, off)
+			return int64(end), nil
+		}
 		if end > strInlineMax {
 			nv := s.patchValue(nil, offset, val)
 			off, err := s.allocSep(key, nv, nil, flagRawSticky, 0)
@@ -610,6 +682,19 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 		return int64(end), nil
 	}
 	f := s.recFlags(addr)
+	if f&flagChunked != 0 {
+		// Chunk-bounded: no materialize, only the chunks the patch range,
+		// the gap fill, and any extension touch are rewritten.
+		oldLen := int(s.vlen(addr))
+		newLen := oldLen
+		if end > newLen {
+			newLen = end
+		}
+		if err := s.updateChunked(addr, offset, val, oldLen, newLen); err != nil {
+			return 0, err
+		}
+		return int64(newLen), nil
+	}
 	var scratch [20]byte
 	old, err := s.materialize(addr, scratch[:])
 	if err != nil {
@@ -618,6 +703,22 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 	newLen := len(old)
 	if end > newLen {
 		newLen = end
+	}
+	if newLen >= strChunkMin {
+		// The write crosses the chunk threshold: the record republishes in
+		// chunked form over the patched bytes. old is under the threshold by
+		// construction, so the materialized copy is bounded.
+		at := s.expireAt(addr)
+		flags := byte(flagRawSticky)
+		if at != 0 {
+			flags |= flagHasTTL
+		}
+		off, err := s.allocChunked(key, old, offset, val, newLen, flags, at)
+		if err != nil {
+			return 0, err
+		}
+		s.publish(h, slot, addr, off)
+		return int64(newLen), nil
 	}
 	if f&flagSep != 0 {
 		return s.setRangeSep(addr, old, offset, val, newLen)

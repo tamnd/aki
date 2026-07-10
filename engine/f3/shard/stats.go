@@ -17,7 +17,7 @@ const (
 	StatArenaTotal
 	StatVlogBytes
 	StatVlogDead
-	StatVlogValues
+	StatVlogRuns
 	StatBandInt
 	StatBandEmbedded
 	StatBandSeparated
@@ -31,7 +31,7 @@ var statNames = [NumStats]string{
 	StatArenaTotal:    "arena_total_bytes",
 	StatVlogBytes:     "vlog_bytes",
 	StatVlogDead:      "vlog_dead_bytes",
-	StatVlogValues:    "vlog_values",
+	StatVlogRuns:      "vlog_runs",
 	StatBandInt:       "band_int",
 	StatBandEmbedded:  "band_embedded",
 	StatBandSeparated: "band_separated",

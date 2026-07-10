@@ -114,10 +114,36 @@ func (s *Store) compactBucket(b *bucket, old, nl *vlog, buf *[]byte, moves []rep
 			continue
 		}
 		addr := w & addrMask
-		if s.recFlags(addr)&flagSep == 0 {
+		f := s.recFlags(addr)
+		if f&(flagSep|flagChunked) == 0 {
 			continue // inline record, its value lives in the record, nothing to move
 		}
 		vs := s.valueStart(addr)
+		if f&flagChunked != 0 {
+			// A chunked record's runs hang off its directory: each logged
+			// chunk copies forward and stages its own directory-entry
+			// rewrite. The directory itself is arena metadata and stays put.
+			word, n, _ := s.readPtr(vs)
+			dirOff := word & runAddrMask
+			for k := uint32(0); k < n; k++ {
+				es := dirOff + uint64(k)*ptrSize
+				cw, clen, _ := s.readPtr(es)
+				if cw&inLogBit == 0 {
+					continue
+				}
+				v, err := old.readInto(cw&runAddrMask, int(clen), *buf)
+				if err != nil {
+					return moves, errCompactRead
+				}
+				*buf = v
+				newOff, err := nl.append(v)
+				if err != nil {
+					return moves, err
+				}
+				moves = append(moves, repoint{vs: es, off: newOff, vlen: clen})
+			}
+			continue
+		}
 		word, vlen, _ := s.readPtr(vs)
 		if word&inLogBit == 0 {
 			continue // arena run, resident bytes stay where they are

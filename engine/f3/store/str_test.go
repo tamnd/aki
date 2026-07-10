@@ -217,13 +217,17 @@ func TestAppendGrowth(t *testing.T) {
 	if s.Exists([]byte("t"), 9000) {
 		t.Fatal("APPEND republish lost the deadline")
 	}
-	// The 64KiB cap holds.
+	// Growth past the chunk threshold moves the value to the chunked band.
 	big := make([]byte, maxVal)
 	if err := s.SetString([]byte("b"), big, 1, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Append([]byte("b"), []byte("x"), 1); err != ErrTooBig {
-		t.Fatalf("cap err = %v, want ErrTooBig", err)
+	if n, err := s.Append([]byte("b"), []byte("x"), 1); err != nil || n != maxVal+1 {
+		t.Fatalf("append past threshold = %d, %v", n, err)
+	}
+	got, ok := s.GetString([]byte("b"), 1, nil)
+	if !ok || len(got) != maxVal+1 || got[maxVal] != 'x' {
+		t.Fatalf("chunk transition value: len %d, ok %v", len(got), ok)
 	}
 }
 
@@ -266,7 +270,7 @@ func TestSetRangeZeroFill(t *testing.T) {
 	if string(got) != "1934" {
 		t.Fatalf("int setrange value = %q", got)
 	}
-	if _, err := s.SetRange(key, maxVal, []byte("x"), 1); err != ErrTooBig {
+	if _, err := s.SetRange(key, maxValueLen, []byte("x"), 1); err != ErrTooBig {
 		t.Fatalf("cap err = %v, want ErrTooBig", err)
 	}
 }

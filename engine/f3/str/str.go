@@ -9,10 +9,9 @@ import (
 	"github.com/tamnd/aki/engine/f3/store"
 )
 
-// maxStringLength is the Redis proto-max-bulk-len string size ceiling. The
-// store's embedded band caps values at 64 KiB until the separated and chunked
-// bands land, so today store.ErrTooBig fires long before this figure; the
-// error text is already the one clients expect.
+// errStringTooLong is the proto-max-bulk-len refusal: with the chunked band
+// wired the store's value ceiling is the 512MiB proto limit itself, so this
+// is exactly when store.ErrTooBig fires for a value.
 const errStringTooLong = "ERR string exceeds maximum allowed size (proto-max-bulk-len)"
 
 // storeErr maps a store error to its wire text.
@@ -41,14 +40,21 @@ func eqFold(b []byte, s string) bool {
 	return true
 }
 
-// Get answers GET key.
+// Get answers GET key. A chunked value answers as a streamed reply: the
+// worker pumps it chunk by chunk and the connection writer serves it onto the
+// socket under a bounded window, never materializing the value.
 func Get(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	v, ok := cx.St.GetString(args[0], cx.NowMs, cx.Val)
-	cx.Val = v
+	v, cs, ok := cx.St.GetStream(args[0], cx.NowMs, cx.Val)
 	if !ok {
+		cx.Val = v
 		r.Null()
 		return
 	}
+	if cs != nil {
+		r.Stream(cs.Total(), cs)
+		return
+	}
+	cx.Val = v
 	r.Bulk(v)
 }
 
