@@ -307,11 +307,10 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 				run := word & runAddrMask
 				copy(s.arena.buf[run:run+uint64(len(val))], val)
 			} else {
-				nw, nc, err := s.writeRun(val, nil, 0)
+				nw, nc, err := s.replaceSepRun(word, vlen, vcap, val)
 				if err != nil {
 					return err
 				}
-				s.dropRun(word, vlen, vcap)
 				word, vcap = nw, nc
 			}
 			s.writePtr(vs, word, uint32(len(val)), vcap)
@@ -386,6 +385,31 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 	s.setVlen(off, uint32(len(val)))
 	s.publish(h, slot, addr, off)
 	return nil
+}
+
+// replaceSepRun places val as a separated record's new run and releases the
+// old one, the full-replace half of the sep-over-sep SET path. A log-resident
+// value being overwritten while the store sits past the demotion low-water
+// mark goes straight back to the log (spillCold, one buffered append): the
+// doc 09 section 8 placement rule, touched bytes hot or fresh-cold, bulk
+// stays cold, and lab 17's verdict against the arena round trip. Everything
+// else takes writeRun's usual placement. A broken log falls through to the
+// arena path, which is the only placement left that can take the bytes.
+func (s *Store) replaceSepRun(word uint64, vlen, vcap uint32, val []byte) (uint64, uint32, error) {
+	if word&inLogBit != 0 && s.spillCold(align8(uint64(len(val)))) {
+		if off, err := s.vlog.append(val); err == nil {
+			s.dropRun(word, vlen, vcap)
+			s.logRuns++
+			// A log run is immutable, so its capacity is exactly its length.
+			return inLogBit | off, uint32(len(val)), nil
+		}
+	}
+	nw, nc, err := s.writeRun(val, nil, 0)
+	if err != nil {
+		return 0, 0, err
+	}
+	s.dropRun(word, vlen, vcap)
+	return nw, nc, nil
 }
 
 // IncrBy adds delta to the integer at key, creating the key at delta when
