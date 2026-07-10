@@ -185,3 +185,87 @@ func TestManyConnsWakeEdge(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestWakeBatchingCounters pins the slice 4 evidence surface on live traffic:
+// on the reactor, LoopWakes counts the owner-to-loop eventfd writes and can
+// never exceed ConnWakes (a delivery without a claim behind it would be a
+// wake the protocol never issued); on the goroutine driver it stays exactly
+// zero, the no-behavior-change guarantee for the default path. The traffic
+// shape is many concurrent pipelined connections funneled through few loops,
+// the shape whose pass-end folding the batching exists for.
+func TestWakeBatchingCounters(t *testing.T) {
+	srv, err := Listen(Options{Addr: "127.0.0.1:0", Shards: 4, ArenaBytes: 16 << 20, SegBytes: 1 << 18, ConnShape: testConnShape(), NetDriver: testNetDriver(), NetLoops: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	t.Cleanup(func() { srv.Close() })
+
+	const conns = 8
+	const pipeline = 16
+	rounds := 200
+	if testing.Short() {
+		rounds = 40
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, conns)
+	for cid := 0; cid < conns; cid++ {
+		wg.Add(1)
+		go func(cid int) {
+			defer wg.Done()
+			nc, err := net.Dial("tcp", srv.Addr().String())
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer nc.Close()
+			br := bufio.NewReader(nc)
+			var req strings.Builder
+			for j := 0; j < pipeline; j++ {
+				req.WriteString(cmd("SET", fmt.Sprintf("b%02d-%02d", cid, j), "v"))
+			}
+			want := strings.Repeat("+OK\r\n", pipeline)
+			got := make([]byte, len(want))
+			for r := 0; r < rounds; r++ {
+				_ = nc.SetDeadline(time.Now().Add(10 * time.Second))
+				if _, err := nc.Write([]byte(req.String())); err != nil {
+					errs <- fmt.Errorf("conn %d round %d: %v", cid, r, err)
+					return
+				}
+				for n := 0; n < len(got); {
+					m, err := br.Read(got[n:])
+					if err != nil {
+						errs <- fmt.Errorf("conn %d round %d: reply starved: %v", cid, r, err)
+						return
+					}
+					n += m
+				}
+				if string(got) != want {
+					errs <- fmt.Errorf("conn %d round %d: bad replies %q", cid, r, got)
+					return
+				}
+			}
+		}(cid)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	ns := srv.NetStats()
+	if ns.Driver != NetReactor {
+		if ns.LoopWakes != 0 {
+			t.Fatalf("goroutine driver reported %d loop wakes, want 0", ns.LoopWakes)
+		}
+		return
+	}
+	if ns.LoopWakes == 0 {
+		t.Fatalf("reactor served %d rounds with zero loop wakes; the counter is not wired", rounds)
+	}
+	if ns.LoopWakes > ns.ConnWakes {
+		t.Fatalf("loop wakes %d exceed conn wakes %d; a delivery fired without a claim", ns.LoopWakes, ns.ConnWakes)
+	}
+	t.Logf("conn wakes %d, loop wakes %d (%.2fx batching)", ns.ConnWakes, ns.LoopWakes, float64(ns.ConnWakes)/float64(ns.LoopWakes))
+}

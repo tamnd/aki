@@ -27,16 +27,18 @@ import (
 // through the unchanged shard inbound MPSC, and drains replies through the
 // existing reorder ring, of which it is the single consumer. The new edge is
 // outbound: a shard owner that completes a batch must wake the loop that owns
-// the connection, and that wake rides the SetWriterNotify seam into this
+// the connection, and that wake rides the SetWriterBatchNotify seam into this
 // loop's eventfd, under the same publish-then-check proof the waker carries
 // (the loop parks the connection with ParkWriter before it sleeps, so a push
 // that lands in the gap is seen by the park's re-check or claims the notify).
+// The wake is batched (slice 4): a worker's drain pass marks each claimed
+// connection dirty on its loop (markDirty) and ends with one eventfd write
+// per touched loop (WakeLoop), so the owner-to-loop syscall traffic is
+// O(touched loops) per pass, not O(dirty connections).
 //
-// This slice is correctness only. The wake path pays one eventfd write per
-// claimed wake (batching is slice 4), streamed giant replies are pumped
-// inline into the connection's output buffer (the Class OF slow-client
-// discipline is slice 5), and the loop count default is a placeholder for
-// the slice 6 lab.
+// Streamed giant replies are still pumped inline into the connection's output
+// buffer (the Class OF slow-client discipline is slice 5), and the loop count
+// default is a placeholder for the slice 6 lab.
 
 // reactorMaxEvents is one epoll_wait's event budget per turn.
 const reactorMaxEvents = 256
@@ -123,6 +125,17 @@ func (b *reactorBackend) stop() {
 	})
 }
 
+// wakes sums the loops' owner-to-loop eventfd writes for NetStats.
+func (b *reactorBackend) wakes() uint64 {
+	var n uint64
+	for _, l := range b.loops {
+		l.mu.Lock()
+		n += l.ownerWakes
+		l.mu.Unlock()
+	}
+	return n
+}
+
 // stopLoops closes the per-loop descriptors, for teardown and for the
 // construction error path (where loops never ran).
 func (b *reactorBackend) stopLoops() {
@@ -185,6 +198,11 @@ type reactorLoop struct {
 	pending []int          // accepted fds awaiting adoption
 	dirty   []*reactorConn // conns owed a writer service, posted by owners
 	closing bool
+
+	// ownerWakes counts the owner-to-loop eventfd writes (WakeLoop calls that
+	// wrote), the figure the slice 4 batching exists to shrink. Written under
+	// mu, so effectively single-writer; aggregated on read by backend.wakes.
+	ownerWakes uint64
 }
 
 // reactorConn is one connection owned entirely by a single loop: the dup'd
@@ -230,7 +248,10 @@ type reactorConn struct {
 	closing bool
 
 	// queued marks the conn as sitting in its loop's dirty list, so racing
-	// owner notifies fold into one service (the eventfd counter shape).
+	// owner marks fold into one dirty entry (and one service). drainWake
+	// clears it before servicing, so a mark landing mid-service queues fresh
+	// and forces a new WakeLoop; that ordering is what lets a marker whose
+	// CAS loses skip the wake delivery safely.
 	queued atomic.Bool
 }
 
@@ -277,18 +298,39 @@ func (l *reactorLoop) stop() {
 	l.mu.Unlock()
 }
 
-// notify is the owner-to-loop wake edge: shard owners call it through the
-// connection's SetWriterNotify hook when a claimed wake fires. One eventfd
-// write per claimed wake for this slice; the queued flag folds racing owners
-// into one dirty entry, and drainWake clears it before servicing so a notify
-// landing mid-service re-queues.
-func (l *reactorLoop) notify(rc *reactorConn) {
+// markDirty is the mark half of the owner-to-loop wake edge (the connection's
+// SetWriterBatchNotify hook): it queues rc on the loop's dirty list and
+// reports whether this call queued it. The queued flag folds racing owners
+// into one dirty entry, and drainWake clears it before servicing so a mark
+// landing mid-service re-queues. No eventfd write happens here; the caller
+// owes the loop one WakeLoop after its marks (the worker sends one per
+// touched loop at the end of its drain pass), and a false return means an
+// earlier mark's entry is still queued with that delivery behind it.
+func (l *reactorLoop) markDirty(rc *reactorConn) bool {
 	if !rc.queued.CompareAndSwap(false, true) {
-		return
+		return false
 	}
 	l.mu.Lock()
 	l.dirty = append(l.dirty, rc)
-	l.wake()
+	l.mu.Unlock()
+	return true
+}
+
+// WakeLoop is the delivery half (shard.LoopWaker): one eventfd write covering
+// every markDirty since the loop's last drain. The write stays under the
+// mutex for the same reason enqueue's does: once stop has marked the loop
+// closing no new wake can start, so backend.stop can close the eventfd after
+// the join without a worker's late delivery landing on a reused fd. The
+// eventfd is a counter, so a write after drainWake's read leaves the fd
+// readable and epoll reports it again: a connection marked dirty after the
+// loop's list swap always gets the loop back, which is the lost-wake proof
+// this batching leans on.
+func (l *reactorLoop) WakeLoop() {
+	l.mu.Lock()
+	if !l.closing {
+		l.ownerWakes++
+		l.wake()
+	}
 	l.mu.Unlock()
 }
 
@@ -404,8 +446,12 @@ func (l *reactorLoop) adopt(fd int) {
 	rc.cs = &connState{sc: rc.sc}
 	rc.emit = func(rep []byte) { rc.out = append(rc.out, rep...) }
 	// Before any traffic, per the seam's contract: owners read the hook
-	// through the inbound queue's ordering.
-	rc.sc.SetWriterNotify(func() { l.notify(rc) })
+	// through the inbound queue's ordering. The batched form: a worker's
+	// drain pass marks each claimed connection dirty here and sends one
+	// WakeLoop per touched loop at the pass end; wakes claimed outside a pass
+	// (Close, a stream abort) mark and deliver immediately through the same
+	// pair.
+	rc.sc.SetWriterBatchNotify(l, func() bool { return l.markDirty(rc) })
 	for len(l.conns) <= fd {
 		l.conns = append(l.conns, nil)
 	}
