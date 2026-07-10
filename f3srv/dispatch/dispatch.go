@@ -102,6 +102,13 @@ func init() {
 	registerFan("MGET", shard.FanMGet, mget, false, true)
 	registerFan("MSET", shard.FanOK, mset, true, true)
 
+	// INFO scatters keyless to every shard: each answers the fixed-width
+	// counter blob and the gather sums the fields and renders the text. The
+	// optional section argument is accepted and ignored; there is one section.
+	info := registerShard(str.InfoShard)
+	register("INFO", nil, 0, 1, false)
+	registerFan("INFO", shard.FanStats, info, false, true)
+
 	// The INCR family, APPEND, and the range pair. SUBSTR is GETRANGE under
 	// its old name; a distinct row so arity errors quote 'substr'.
 	register("INCR", str.Incr, 1, 1, true)
@@ -159,6 +166,15 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 // dispatchFan scatters one multi-key command. The fan path allocates its key
 // slices; it is the multi-key surface, not the point path.
 func dispatchFan(c *shard.Conn, e *entry, args [][]byte) error {
+	if !e.keyed {
+		// A keyless fan (INFO) scatters to every shard rather than routing by
+		// key.
+		err := c.DoFanAll(e.fanOp, e.fan)
+		if err == shard.ErrTooBig {
+			return oops(c, "ERR command too large")
+		}
+		return err
+	}
 	var keys, vals [][]byte
 	if e.paired {
 		n := len(args) - 1

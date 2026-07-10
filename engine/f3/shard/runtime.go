@@ -1,6 +1,9 @@
 package shard
 
 import (
+	"fmt"
+	"path/filepath"
+
 	"github.com/tamnd/aki/engine/f3/store"
 )
 
@@ -24,6 +27,50 @@ func New(shards, arenaBytes, segBytes int) *Runtime {
 		r.workers[i] = newWorker(i, store.New(arenaBytes, segBytes))
 	}
 	return r
+}
+
+// Config is the runtime topology plus the larger-than-memory knobs of doc 09
+// section 8: a value-log directory and a resident byte budget, both per
+// shard. Sharding is fixed at startup like everything else here.
+type Config struct {
+	Shards     int
+	ArenaBytes int
+	SegBytes   int
+
+	// VlogDir, when set, gives every shard its own value log under this
+	// directory (one file per shard, fresh-start semantics). Without it the
+	// stores are memory-only and ResidentCapBytes is ignored.
+	VlogDir string
+
+	// ResidentCapBytes is each shard's resident byte budget; past it a
+	// separated or chunked value's bytes spill to the shard's log. 0 means
+	// uncapped.
+	ResidentCapBytes uint64
+}
+
+// Open is New with the value-log configuration: each shard gets its own log
+// file so the single-owner contract extends to the disk tier.
+func Open(cfg Config) (*Runtime, error) {
+	if cfg.Shards < 1 {
+		cfg.Shards = 1
+	}
+	r := &Runtime{workers: make([]*worker, cfg.Shards)}
+	for i := range r.workers {
+		o := store.Options{ArenaBytes: cfg.ArenaBytes, SegBytes: cfg.SegBytes}
+		if cfg.VlogDir != "" {
+			o.VlogPath = filepath.Join(cfg.VlogDir, fmt.Sprintf("shard-%03d.vlog", i))
+			o.ResidentCapBytes = cfg.ResidentCapBytes
+		}
+		st, err := store.Open(o)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = r.workers[j].st.Close()
+			}
+			return nil, err
+		}
+		r.workers[i] = newWorker(i, st)
+	}
+	return r, nil
 }
 
 // Use registers the op-indexed handler table on every worker: the handler for
@@ -77,5 +124,10 @@ func (r *Runtime) Stop() {
 	}
 	for _, w := range r.workers {
 		<-w.done
+	}
+	// The workers are gone; releasing the value logs here is single-owner by
+	// exhaustion.
+	for _, w := range r.workers {
+		_ = w.st.Close()
 	}
 }

@@ -38,6 +38,13 @@ type Options struct {
 	// SegBytes is the arena segment size per shard; non-positive takes the
 	// store default.
 	SegBytes int
+	// VlogDir, when set, gives every shard its own value-log file under this
+	// directory; empty keeps the stores memory-only.
+	VlogDir string
+	// ResidentCapBytes is each shard's resident byte budget when VlogDir is
+	// set; past it, separated and chunked value bytes spill to the shard's
+	// log. 0 means uncapped.
+	ResidentCapBytes uint64
 }
 
 // Server is the goroutine-per-connection driver over the shard runtime: a
@@ -63,7 +70,18 @@ func Listen(o Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{rt: shard.New(o.Shards, o.ArenaBytes, o.SegBytes), ln: ln}
+	rt, err := shard.Open(shard.Config{
+		Shards:           o.Shards,
+		ArenaBytes:       o.ArenaBytes,
+		SegBytes:         o.SegBytes,
+		VlogDir:          o.VlogDir,
+		ResidentCapBytes: o.ResidentCapBytes,
+	})
+	if err != nil {
+		_ = ln.Close()
+		return nil, err
+	}
+	s := &Server{rt: rt, ln: ln}
 	s.rt.Use(dispatch.Handlers())
 	s.rt.Start()
 	return s, nil

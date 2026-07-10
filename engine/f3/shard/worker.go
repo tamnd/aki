@@ -75,8 +75,23 @@ func (w *worker) run() {
 				runtime.Gosched()
 				continue
 			}
+			w.maybeCompact()
 			w.idle()
 		}
+	}
+}
+
+// maybeCompact is the owner-scheduled value-log compaction trigger: it runs
+// only at the idle boundary (the queue is drained and no streams are in
+// flight, so no ChunkStream snapshot can name the bytes it moves), and only
+// when the dead share of the log is worth the rewrite: at least
+// compactMinDead bytes dead and at least half the log. A failed compaction
+// leaves the store on its original log by CompactLog's contract, and the
+// same trigger simply fires again once more bytes die.
+func (w *worker) maybeCompact() {
+	total, dead := w.st.LogBytes()
+	if dead >= compactMinDead && dead*2 >= total {
+		_ = w.st.CompactLog()
 	}
 }
 

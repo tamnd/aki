@@ -67,6 +67,12 @@ const (
 	// freeListCap bounds a connection's batch-node free list. Nodes past the
 	// cap fall to the collector; the steady path recycles well under it.
 	freeListCap = 64
+
+	// compactMinDead is the value-log compaction floor: below this many dead
+	// bytes a rewrite reclaims too little to pay for reading the live set. The
+	// trigger also demands the dead share be at least half the log, so the
+	// rewrite cost amortizes against at least its own size in reclaimed space.
+	compactMinDead = 1 << 20
 )
 
 // DefaultShards is the shard count when the flag is unset: the data plane gets
