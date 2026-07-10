@@ -116,7 +116,7 @@ func (s *Server) NetStats() NetStats {
 	}
 	s.netMu.Unlock()
 	ns.ConnWakes, ns.WorkerParks = s.rt.NetWakes()
-	ns.Driver = "goroutine"
+	ns.Driver = s.driver
 	ns.Shape = s.shape
 	return ns
 }
