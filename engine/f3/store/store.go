@@ -35,6 +35,14 @@ type Store struct {
 	bands   [4]uint64
 	logRuns uint64
 
+	// chunkBytes is the live chunked-band value bytes: charged against the
+	// record's value length when a chunked record publishes or grows,
+	// credited against it when the record leaves the index. Placement does
+	// not matter; arena chunks and logged chunks both count, because the
+	// figure answers "how many value bytes live in the giant band", not
+	// "where are they".
+	chunkBytes uint64
+
 	// vbuf is the store's value scratch for paths that must materialize a
 	// run (log-resident reads inside a rewrite); grown capacity is kept.
 	// cbuf is the chunk staging buffer, one chunk wide, allocated on the
@@ -137,6 +145,7 @@ func (s *Store) Reset() {
 	s.count = 0
 	s.bands = [4]uint64{}
 	s.logRuns = 0
+	s.chunkBytes = 0
 	if s.vlog != nil {
 		_ = s.vlog.f.Truncate(0)
 		s.vlog.tail = 0
