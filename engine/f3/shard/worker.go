@@ -71,6 +71,15 @@ func (w *worker) run() {
 		if len(w.streams) > 0 {
 			w.pumpStreams()
 		}
+		if n > 0 && len(w.streams) == 0 && w.st.ArenaTight() {
+			// Sustained writes can walk the arena to its full state without
+			// the queue ever draining, which is how the M0 gate died at 4KiB
+			// (issue #542): the idle trigger below never fired. The tight
+			// check is O(1), and the boundary between two drain passes holds
+			// no arena address (views die with their command, streams are
+			// checked), so a compaction here is as safe as one at idle.
+			w.st.CompactArena()
+		}
 		if n == 0 {
 			if w.stop.Load() {
 				w.abortStreams()
@@ -88,17 +97,22 @@ func (w *worker) run() {
 	}
 }
 
-// maybeCompact is the owner-scheduled value-log compaction trigger: it runs
-// only at the idle boundary (the queue is drained and no streams are in
-// flight, so no ChunkStream snapshot can name the bytes it moves), and only
-// when the dead share of the log is worth the rewrite: at least
-// compactMinDead bytes dead and at least half the log. A failed compaction
-// leaves the store on its original log by CompactLog's contract, and the
-// same trigger simply fires again once more bytes die.
+// maybeCompact is the owner-scheduled compaction trigger for both dead-byte
+// pools: it runs only at the idle boundary (the queue is drained and no
+// streams are in flight, so no ChunkStream snapshot can name the bytes it
+// moves). The value log rewrites when at least compactMinDead bytes are dead
+// and they are at least half the log; a failed compaction leaves the store
+// on its original log by CompactLog's contract, and the same trigger simply
+// fires again once more bytes die. The arena compacts when its
+// victim-eligible segments hold at least arenaCompactMinDead dead bytes, the
+// same worth-the-pass floor.
 func (w *worker) maybeCompact() {
 	total, dead := w.st.LogBytes()
 	if dead >= compactMinDead && dead*2 >= total {
 		_ = w.st.CompactLog()
+	}
+	if w.st.ArenaReclaimable() >= arenaCompactMinDead {
+		w.st.CompactArena()
 	}
 }
 
@@ -123,6 +137,7 @@ func (w *worker) pumpStreams() {
 func (w *worker) abortStreams() {
 	for i, st := range w.streams {
 		st.failed.Store(true)
+		st.finish()
 		st.conn.wk.wake()
 		w.streams[i] = nil
 	}
