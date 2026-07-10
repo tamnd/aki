@@ -34,8 +34,8 @@ func TestNetCountersMoveUnderPipeline(t *testing.T) {
 	srv, nc, br := startServer(t)
 
 	base := srv.NetStats()
-	if base.Driver != "goroutine" {
-		t.Fatalf("net driver = %q, want goroutine", base.Driver)
+	if base.Driver != wantNetDriver() {
+		t.Fatalf("net driver = %q, want %q", base.Driver, wantNetDriver())
 	}
 
 	// Round one: 16 pipelined SETs in one write.
@@ -147,7 +147,7 @@ func TestInfoNetSection(t *testing.T) {
 	if !strings.Contains(text, "\r\n# Net\r\n") {
 		t.Fatalf("INFO missing # Net section:\n%s", text)
 	}
-	if !strings.Contains(text, "net_driver:goroutine\r\n") {
+	if !strings.Contains(text, "net_driver:"+wantNetDriver()+"\r\n") {
 		t.Fatalf("INFO missing net_driver line:\n%s", text)
 	}
 	shape := testConnShape()
