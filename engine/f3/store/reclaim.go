@@ -1,5 +1,7 @@
 package store
 
+import "sort"
+
 // Arena reclaim (spec 2064/f3/04 section 4.3, path 3, dead-fraction
 // compaction, and path 4, whole-segment drop). A superseded or deleted
 // record's bytes stay in their segment; unlink charges them back so the
@@ -24,10 +26,20 @@ package store
 const (
 	// arenaSegDeadNum/arenaSegDeadDen is the dead fraction past which a
 	// segment is a compaction victim: dead*den >= fill*num. Swept by lab
-	// labs/f3/m0/10_arena_reclaim over {1/8, 1/4, 1/2}; 1/4 won on ops/s
-	// with pause p99 and RSS inside noise of the alternatives.
+	// labs/f3/m0/10_arena_reclaim over {1/8, 1/4, 1/2} under band-flip
+	// churn with a pinned eighth: 1/4 edges 1/8 on ops/s at the same pause
+	// p99 and steady footprint, and 1/2 trades a fifth more throughput for
+	// an arena that rides one segment from full with the tight-path
+	// widening doing all the reclaim, the regime that returned ErrFull
+	// before the widening existed. 1/4 keeps the proactive path in charge.
 	arenaSegDeadNum = 1
 	arenaSegDeadDen = 4
+
+	// arenaMoveBudget caps the survivor bytes one compaction pass may copy,
+	// so the pause a pass adds to its drain boundary stays bounded no matter
+	// how many segments crossed the threshold at once. The trigger fires
+	// again at the next boundary and the pass resumes where it stopped.
+	arenaMoveBudget = 64 << 20
 )
 
 // TuneArenaReclaim overrides the per-segment dead-fraction threshold
@@ -77,20 +89,54 @@ func (s *Store) ArenaTight() bool {
 // holds chunk addresses across commands, so the pass refuses to run under
 // one.
 //
+// Victim selection is budgeted: survivors land at the bump tail, so a pass
+// may only move what the free space can hold, most-dead segments first so
+// every byte of tail spent frees the most segment. Unbudgeted selection
+// under a tight arena copies live bytes into the last free segments without
+// draining any victim, which is how a compactor wedges the arena it was
+// saving (the lab 10 sweep died exactly there before the budget). The pass
+// loops while segments keep coming free, so each drained victim funds the
+// next round; the move cap bounds the total copied per call, and an
+// oversized backlog drains across calls.
+//
+// A tight arena also widens eligibility from the dead-fraction threshold to
+// any segment with dead bytes: the threshold schedules proactive work, but
+// backpressure's contract is that ErrFull means live bytes genuinely exceed
+// capacity, and a store one segment from full does not get to be picky about
+// which dead bytes it takes back (the lab 10 1/2 cell died at a third of the
+// arena dead, all of it under the threshold).
+//
 // A relocation that cannot place a survivor (the tail is out of room)
-// aborts the pass; every move already made is complete (bytes copied, entry
-// repointed, old charge dead), so an abort loses nothing and the next pass
-// picks up where this one stopped.
+// aborts its round; every move already made is complete (bytes copied, entry
+// repointed, old charge dead), so an abort loses nothing and the next round
+// or call picks up where it stopped.
 func (s *Store) CompactArena() int {
 	if s.openStreams > 0 {
 		return 0
 	}
 	freed := 0
+	budget := uint64(arenaMoveBudget)
+	for {
+		n, moved := s.compactPass(budget)
+		freed += n
+		if n == 0 || moved >= budget {
+			return freed
+		}
+		budget -= moved
+	}
+}
+
+// compactPass is one selection walk and one relocation walk: free the fully
+// dead segments, pick victims most-dead-first within the space and move
+// budgets, relocate their survivors, free the drained. It reports the
+// segments freed and the survivor bytes it committed to moving.
+func (s *Store) compactPass(moveBudget uint64) (freed int, moved uint64) {
 	if cap(s.victims) < len(s.arena.segs) {
 		s.victims = make([]bool, len(s.arena.segs))
 	}
 	victims := s.victims[:len(s.arena.segs)]
-	nv := 0
+	tight := s.arena.freeSegCount() < 2
+	var cands []segCand
 	for si := range s.arena.segs {
 		victims[si] = false
 		u := uint64(si)
@@ -108,13 +154,42 @@ func (s *Store) CompactArena() int {
 			freed++
 			continue
 		}
-		if dead*s.segDeadDen >= fill*s.segDeadNum {
-			victims[si] = true
-			nv++
+		if dead == 0 {
+			continue
+		}
+		if tight || dead*s.segDeadDen >= fill*s.segDeadNum {
+			cands = append(cands, segCand{si: u, live: fill - dead})
 		}
 	}
+	if len(cands) == 0 {
+		return freed, 0
+	}
+	// The space budget: what the tail can absorb without the pass eating the
+	// arena. Moves that fit the current segment's remaining room are always
+	// safe (no advance, nothing abandoned); past that, one whole segment
+	// stays back as slack for the tails a spanning placement abandons.
+	cur := &s.arena.segs[s.arena.cur]
+	room := cur.base + s.arena.segSize - cur.alloc
+	budget := room
+	if fc := s.arena.freeSegCount(); fc > 0 {
+		budget = fc*s.arena.segSize + room - s.arena.segSize
+	}
+	if budget > moveBudget {
+		budget = moveBudget
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i].live < cands[j].live })
+	nv := 0
+	for _, c := range cands {
+		if c.live > budget {
+			break
+		}
+		budget -= c.live
+		moved += c.live
+		victims[c.si] = true
+		nv++
+	}
 	if nv == 0 {
-		return freed
+		return freed, 0
 	}
 	s.relocateLive(victims)
 	for si := range victims {
@@ -124,7 +199,15 @@ func (s *Store) CompactArena() int {
 			freed++
 		}
 	}
-	return freed
+	return freed, moved
+}
+
+// segCand is one victim candidate: the segment and its live bytes, which is
+// exactly what a relocation would copy to the tail (moves reallocate the
+// same aligned sizes), so the budget arithmetic is exact.
+type segCand struct {
+	si   uint64
+	live uint64
 }
 
 // reclaimOnFull is the write path's backstop when allocRecord comes up
