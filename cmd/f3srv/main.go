@@ -28,6 +28,10 @@ func main() {
 		"listen address for net/http/pprof, e.g. 127.0.0.1:6060; the endpoint has no auth, so keep it on loopback; empty leaves it off")
 	connShape := flag.String("conn-shape", drivers.ShapeSingle,
 		"per-connection goroutine shape: single (one goroutine reads, dispatches, drains, and flushes) or pair (the M0 reader/writer pair, kept for the labs/f3/m0/15_conn_single A/B)")
+	netDriver := flag.String("net", drivers.NetGoroutine,
+		"network driver: goroutine (the default, one shape-selected handler per connection) or reactor (raw epoll event loops, Linux only; elsewhere it logs a notice and serves on the goroutine driver)")
+	netLoops := flag.Int("net-loops", 0,
+		"reactor event loops; 0 means one per shard (only the reactor driver reads this)")
 	flag.Parse()
 
 	srv, err := drivers.Listen(drivers.Options{
@@ -39,6 +43,8 @@ func main() {
 		PinWorkers:       *pinWorkers,
 		PprofAddr:        *pprofAddr,
 		ConnShape:        *connShape,
+		NetDriver:        *netDriver,
+		NetLoops:         *netLoops,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "f3srv:", err)
