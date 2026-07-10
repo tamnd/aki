@@ -87,6 +87,14 @@ type Conn struct {
 	// single-writer counter; see NetWakes.
 	parks eventCounter
 
+	// The batched writer-notify seam (SetWriterBatchNotify): batchMark marks
+	// this connection dirty on its consumer loop, batchLoop is the loop whose
+	// one pass-end WakeLoop covers every mark of the pass. Both are set once
+	// before traffic and read by owner goroutines through the inbound queue's
+	// ordering, like wk.notify.
+	batchMark func() bool
+	batchLoop LoopWaker
+
 	// inlineEmit, when set, declares the connection single-goroutine driven:
 	// the same goroutine runs the reader and writer sides, so the pipeline
 	// throttle in Do cannot yield to a writer goroutine that does not exist
@@ -105,6 +113,48 @@ type Conn struct {
 // be safe from any goroutine and must never block. Call before any traffic on
 // the connection.
 func (c *Conn) SetWriterNotify(fn func()) { c.wk.notify = fn }
+
+// LoopWaker is the delivery half of the batched writer notify: one WakeLoop
+// covers every connection marked dirty on that loop since its last drain.
+// Connections sharing a consumer loop must be registered with the identical
+// LoopWaker value, because the worker dedups its pass-end deliveries on it.
+type LoopWaker interface {
+	// WakeLoop delivers one wake to the loop (the reactor's eventfd write).
+	// It must behave like a level trigger: a delivery after the loop's
+	// dirty-list swap must bring the loop back for another swap, never fold
+	// into a wake the loop has already consumed. It runs on whichever owner
+	// goroutine ends a drain pass, so it must be safe from any goroutine and
+	// must never block.
+	WakeLoop()
+}
+
+// SetWriterBatchNotify is SetWriterNotify's batched form, for consumers that
+// own many connections behind one wake fd (the reactor loop). mark records
+// this connection dirty on the loop and reports whether this call queued it;
+// a false means an earlier mark is still queued and undrained, so the wake
+// delivery that mark owes covers this one too. mark may elide ONLY on that
+// evidence: the loop clears the queued state before it services the
+// connection, so any mark the loop could miss is a queuing one and forces a
+// fresh WakeLoop.
+//
+// The worker's drain pass claims the writer wake per connection (the waker
+// CAS, counted as a conn wake), calls mark for each claim, and ends the pass
+// with one WakeLoop per distinct loop marked, which is the slice 4 batching:
+// eventfd writes per pass drop from O(dirty connections) to O(touched loops).
+// Wakes claimed outside a drain pass (Close, a stream abort) deliver
+// immediately through the same mark-then-WakeLoop pair, so the loop never
+// learns about a dirty connection without a delivery behind it. The waker's
+// publish-then-check proof is unchanged; only the token's transport is.
+// Call before any traffic on the connection.
+func (c *Conn) SetWriterBatchNotify(loop LoopWaker, mark func() bool) {
+	c.batchMark = mark
+	c.batchLoop = loop
+	c.wk.notify = func() {
+		if mark() {
+			loop.WakeLoop()
+		}
+	}
+}
 
 // CanEnqueue reports whether one more command can enqueue without the Do
 // throttle engaging: the reader is less than a full reorder ring ahead of the
