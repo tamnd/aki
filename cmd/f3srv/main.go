@@ -1,7 +1,7 @@
 // Command f3srv is the f3 server binary (spec 2064/f3). What runs today is
-// the M0 smoke surface: the shard runtime behind a TCP listener answering
-// PING and ECHO; the RESP2 slice grows the parser and the string slices grow
-// the command table.
+// the M0 point surface: the shard runtime behind a TCP listener speaking
+// RESP2, with PING, ECHO, and the string commands in the dispatch table; the
+// remaining M0 slices grow the table from here.
 package main
 
 import (

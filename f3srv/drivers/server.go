@@ -2,20 +2,30 @@ package drivers
 
 import (
 	"bufio"
-	"bytes"
-	"errors"
-	"fmt"
 	"net"
-	"strconv"
 	"sync"
 	"sync/atomic"
 
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/f3srv/dispatch"
+	"github.com/tamnd/aki/f3srv/resp"
 )
 
 // defaultArenaBytes is the per-shard arena when the caller leaves it zero,
-// generous for the smoke surface; the product sizing rides the maxmemory work.
+// generous for the M0 surface; the product sizing rides the maxmemory work.
 const defaultArenaBytes = 256 << 20
+
+const (
+	// readBufSize is a connection's initial read buffer. It grows only when a
+	// single command outsizes it.
+	readBufSize = 64 << 10
+
+	// compactMax is the doc 08 section 2.1 tail rule: a leftover smaller than
+	// this is copied to the buffer head after a parse pass, and a bigger one
+	// stays put until the buffer fills, so a large half-arrived bulk is not
+	// re-copied on every read.
+	compactMax = 512
+)
 
 // Options configures a server.
 type Options struct {
@@ -30,11 +40,9 @@ type Options struct {
 	SegBytes int
 }
 
-// Server is the M0 smoke server: the goroutine-per-connection driver over the
-// shard runtime, answering PING and ECHO through the full hop path so the
-// runtime is exercised end to end from a raw socket. The parser below is the
-// smoke parser; the RESP2 slice replaces it and this file keeps only the
-// accept loop and the connection pairing.
+// Server is the goroutine-per-connection driver over the shard runtime: a
+// reader goroutine parses RESP2 and routes through the dispatch table, a
+// writer goroutine drains replies in request order onto the socket.
 type Server struct {
 	rt     *shard.Runtime
 	ln     net.Listener
@@ -42,8 +50,8 @@ type Server struct {
 	conns  sync.WaitGroup
 }
 
-// Listen builds the runtime, starts its workers, and binds the listener.
-// Serve must be called to accept.
+// Listen builds the runtime, registers the command table, starts the workers,
+// and binds the listener. Serve must be called to accept.
 func Listen(o Options) (*Server, error) {
 	if o.Shards <= 0 {
 		o.Shards = shard.DefaultShards()
@@ -56,6 +64,7 @@ func Listen(o Options) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{rt: shard.New(o.Shards, o.ArenaBytes, o.SegBytes), ln: ln}
+	s.rt.Use(dispatch.Handlers())
 	s.rt.Start()
 	return s, nil
 }
@@ -92,8 +101,14 @@ func (s *Server) Close() error {
 	return err
 }
 
-// handle runs one connection: a reader goroutine (this one) parses and routes,
-// a writer goroutine drains the reply queue in request order onto the socket.
+// handle runs one connection: this goroutine reads, parses, and routes; a
+// writer goroutine drains the reply queue in request order onto the socket.
+//
+// Buffer discipline is doc 08 section 2.1: parse every complete command the
+// buffer holds after each read (the parser hands out views, and Do copies
+// them into the hop node before returning, so the buffer is free again by the
+// time the loop advances), flush at the drained boundary, and either recycle
+// the buffer whole or fold a small tail to the head.
 func (s *Server) handle(nc net.Conn) {
 	defer func() { _ = nc.Close() }()
 	c := s.rt.NewConn()
@@ -111,124 +126,62 @@ func (s *Server) handle(nc net.Conn) {
 		c.DrainReplies(emit)
 		_ = bw.Flush()
 	}()
+	defer func() {
+		c.Close()
+		<-writerDone
+	}()
 
-	br := bufio.NewReader(nc)
+	var p resp.Parser
+	buf := make([]byte, readBufSize)
+	n, pos := 0, 0
 	for {
-		args, err := readCommand(br)
-		if err != nil {
-			break
+		if n == len(buf) {
+			if pos > 0 {
+				n = copy(buf, buf[pos:n])
+				pos = 0
+			} else {
+				// One command larger than the buffer: grow, there is no other
+				// way to see its end.
+				bigger := make([]byte, 2*len(buf))
+				n = copy(bigger, buf[:n])
+				buf = bigger
+			}
 		}
-		if err := s.dispatch(c, args); err != nil {
-			break
-		}
-		// A drained read buffer is the pipeline boundary: publish everything
-		// batched so far, one atomic push per touched shard.
-		if br.Buffered() == 0 {
+		m, err := nc.Read(buf[n:])
+		n += m
+		if m > 0 {
+			for pos < n {
+				args, consumed, st := p.Next(buf[pos:n])
+				if st == resp.NeedMore {
+					break
+				}
+				if st == resp.ProtoErr {
+					// Answer in pipeline order, then close: the stream cannot
+					// be resynced after a framing error.
+					_ = c.Do(shard.OpError, false, [][]byte{[]byte("ERR Protocol error: " + p.LastError())})
+					c.Flush()
+					return
+				}
+				pos += consumed
+				if len(args) == 0 {
+					continue
+				}
+				if derr := dispatch.Dispatch(c, args); derr != nil {
+					return
+				}
+			}
+			if pos == n {
+				pos, n = 0, 0
+			} else if pos > 0 && n-pos <= compactMax {
+				n = copy(buf, buf[pos:n])
+				pos = 0
+			}
+			// A drained read is the pipeline boundary: publish everything
+			// batched so far, one atomic push per touched shard.
 			c.Flush()
 		}
-	}
-	c.Close()
-	<-writerDone
-}
-
-// dispatch routes one parsed command. Unknown verbs and arity errors travel
-// through the hop as OpError so their replies keep pipeline order.
-func (s *Server) dispatch(c *shard.Conn, args [][]byte) error {
-	verb := string(bytes.ToUpper(args[0]))
-	switch verb {
-	case "PING":
-		switch len(args) {
-		case 1:
-			return c.Do(shard.OpPing, nil, nil)
-		case 2:
-			return c.Do(shard.OpPing, nil, args[1])
-		}
-		return c.Do(shard.OpError, nil, []byte("wrong number of arguments for 'ping' command"))
-	case "ECHO":
-		if len(args) == 2 {
-			return c.Do(shard.OpEcho, nil, args[1])
-		}
-		return c.Do(shard.OpError, nil, []byte("wrong number of arguments for 'echo' command"))
-	default:
-		return c.Do(shard.OpError, nil, fmt.Appendf(nil, "unknown command '%s'", args[0]))
-	}
-}
-
-// The smoke parser. It reads just enough of RESP to carry PING and ECHO: the
-// array-of-bulk-strings form every client sends, plus the inline form for a
-// bare netcat. It allocates per command and enforces only sanity bounds; the
-// RESP2 slice replaces it wholesale with the fuzzed zero-copy parser, and
-// nothing outside this file calls it.
-
-var errProtocol = errors.New("drivers: protocol error")
-
-const (
-	smokeMaxArgs = 64
-	smokeMaxBulk = 1 << 20
-)
-
-func readLine(br *bufio.Reader) ([]byte, error) {
-	line, err := br.ReadBytes('\n')
-	if err != nil {
-		return nil, err
-	}
-	line = line[:len(line)-1]
-	if n := len(line); n > 0 && line[n-1] == '\r' {
-		line = line[:n-1]
-	}
-	return line, nil
-}
-
-func readCommand(br *bufio.Reader) ([][]byte, error) {
-	for {
-		line, err := readLine(br)
 		if err != nil {
-			return nil, err
-		}
-		if len(line) == 0 {
-			continue // empty inline line, ignored like the real server
-		}
-		if line[0] != '*' {
-			return bytes.Fields(line), nil
-		}
-		n, err := strconv.Atoi(string(line[1:]))
-		if err != nil || n < 1 || n > smokeMaxArgs {
-			return nil, errProtocol
-		}
-		args := make([][]byte, n)
-		for i := 0; i < n; i++ {
-			hdr, err := readLine(br)
-			if err != nil {
-				return nil, err
-			}
-			if len(hdr) < 2 || hdr[0] != '$' {
-				return nil, errProtocol
-			}
-			l, err := strconv.Atoi(string(hdr[1:]))
-			if err != nil || l < 0 || l > smokeMaxBulk {
-				return nil, errProtocol
-			}
-			buf := make([]byte, l+2)
-			if _, err := readFull(br, buf); err != nil {
-				return nil, err
-			}
-			if buf[l] != '\r' || buf[l+1] != '\n' {
-				return nil, errProtocol
-			}
-			args[i] = buf[:l]
-		}
-		return args, nil
-	}
-}
-
-func readFull(br *bufio.Reader, buf []byte) (int, error) {
-	n := 0
-	for n < len(buf) {
-		m, err := br.Read(buf[n:])
-		n += m
-		if err != nil {
-			return n, err
+			return
 		}
 	}
-	return n, nil
 }
