@@ -45,9 +45,6 @@ const (
 // Enter flags.
 const uringEnterGetEvents = 1 << 0 // IORING_ENTER_GETEVENTS
 
-// SQ ring flags (the kernel-written flags word).
-const uringSQCQOverflow = 1 << 1 // IORING_SQ_CQ_OVERFLOW
-
 // Opcodes the driver uses.
 const (
 	uringOpNop         = 0
@@ -355,12 +352,6 @@ func (r *uring) reap(fn func(uringCQE)) int {
 		fn(cqe)
 	}
 	return n
-}
-
-// cqOverflowed reports the kernel-side overflow flag; the loop answers it
-// with a GETEVENTS enter so the backlogged completions flush into the ring.
-func (r *uring) cqOverflowed() bool {
-	return atomic.LoadUint32(r.sqFlags)&uringSQCQOverflow != 0
 }
 
 // uringProbe asks the kernel which opcodes this ring supports, the
