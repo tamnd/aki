@@ -81,6 +81,13 @@ const (
 	// trigger also demands the dead share be at least half the log, so the
 	// rewrite cost amortizes against at least its own size in reclaimed space.
 	compactMinDead = 1 << 20
+
+	// arenaCompactMinDead is the arena compaction floor at the idle boundary:
+	// below this many reclaimable dead bytes the pass is not worth its index
+	// walk. The per-segment victim threshold itself is the store's frozen
+	// lab constant (labs/f3/m0/10_arena_reclaim); this floor only keeps a
+	// quiet shard from re-walking its index over scraps.
+	arenaCompactMinDead = 1 << 20
 )
 
 // spinIters is spinWindow expressed as iterations of the idle re-check loop,

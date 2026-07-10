@@ -60,6 +60,17 @@ func (r Reply) Stream(total int64, src StreamSource) {
 	r.span(len(r.b.rep))
 }
 
+// finish marks the stream done on the producer side and releases whatever
+// the source pinned: a store.ChunkStream pins its shard's arena against
+// compaction while it lives, so the release must happen at every producer
+// exit, and it runs on the owner goroutine like the pins themselves.
+func (st *stream) finish() {
+	st.done = true
+	if r, ok := st.src.(interface{ Release() }); ok {
+		r.Release()
+	}
+}
+
 // pump runs the producer side once: fill ring slots until the ring is full or
 // the value is exhausted. It returns true when this stream needs no more
 // pumping (finished or failed). Owner goroutine only.
@@ -71,7 +82,7 @@ func (st *stream) pump() bool {
 		// The client is gone or the consumer failed; stop reading chunks for
 		// it. The consumer side observes failed and unwinds.
 		st.failed.Store(true)
-		st.done = true
+		st.finish()
 		return true
 	}
 	for st.produced < st.total {
@@ -89,14 +100,14 @@ func (st *stream) pump() bool {
 			// bulk header may already be on the wire, so the reply cannot be
 			// repaired, only failed.
 			st.failed.Store(true)
-			st.done = true
+			st.finish()
 			return true
 		}
 		st.lens[slot] = int32(n)
 		st.produced += int64(n)
 		st.prod.Store(p + 1)
 	}
-	st.done = true
+	st.finish()
 	return true
 }
 
