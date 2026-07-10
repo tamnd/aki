@@ -28,7 +28,8 @@ GamingPC WSL2, aki b7fb698, 2026-07-11, `taskset -c 0-15 go run . -dur 4s`, in p
 The prediction's mechanism lands on the box: the fold widens with connection count to 9.23x at the gate shape's 512/P16 (loop wakes 0.013/op against conn wakes 0.121/op), and the P1 rows sit near 1x at low conns exactly as filed.
 The owed throughput A/B (main, wake-batched, vs the pre-batch d81a66b, both `-net reactor -net-loops 3`, GET 64B P16/512, redis-benchmark --threads 4, interleaved 3 reps per arm): old 6.642-6.647 Mops p99 1.39-1.46 ms, new 6.649 Mops (all three reps) p99 1.391 ms flat.
 That is a tie at the harness plateau, not the predicted 1.24x-to-1.5x jump as an old-vs-new delta: at P16 the unbatched path only paid ~0.12 eventfd writes/op to begin with, so the batch's headroom at this depth is small and the campaign throughput claim rides the slice 7 driver A/B against the rivals, where the whole reactor (loops, batch, and all) is the arm.
-The batched arm is never worse, holds the flatter tail, and at P1/512 (1.0 conn wakes/op unbatched) is where the fold pays; the matrix's P1 rows carry that regime.
+The batched arm is never worse, holds the flatter tail, and at P1/512 (1.0 conn wakes/op unbatched) is where the fold pays.
+A second interleaved A/B at exactly that shape (GET 64B P1/512, redis-benchmark --threads 4, n=3M, 3 reps per arm) reads the payment in latency, not throughput: both arms plateau at 855.2-855.9 krps (the client is the limiter at P1), but the batched arm holds avg 0.423-0.424 ms and p99 0.855-0.871 ms against the unbatched 0.454-0.464 ms avg and 0.903-0.919 ms p99, an ~8% avg and ~6% p99 cut from deleting most of the per-op eventfd writes.
 
 ## Container numbers (2026-07-10, superseded by the box table above)
 
