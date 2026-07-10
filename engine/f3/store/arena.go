@@ -155,8 +155,16 @@ func (a *arena) freeSegment(si uint64) {
 }
 
 // reset rewinds every segment to empty, the arena half of a flush. The caller
-// owns the index and must have dropped it too.
+// owns the index and must have dropped it too. The pages behind every touched
+// segment go back to the OS, same as freeSegment: a flush that only rewound
+// cursors would leave the whole dataset resident, and the point of FLUSHALL
+// is that the footprint actually drops. Off Linux releasePages is a no-op and
+// the pages linger, which is the same story as freed segments there.
 func (a *arena) reset() {
+	touched := a.segStart + a.highWater*a.segSize
+	if touched > uint64(len(a.buf)) {
+		touched = uint64(len(a.buf))
+	}
 	for i := range a.segs {
 		a.segs[i].alloc = a.segs[i].base
 		a.segs[i].live = 0
@@ -164,6 +172,7 @@ func (a *arena) reset() {
 	a.freeSegs = a.freeSegs[:0]
 	a.highWater = 1
 	a.cur = 0
+	a.releasePages(0, touched)
 }
 
 // used reports the bytes handed out: each touched segment's cursor advance,
