@@ -1,5 +1,5 @@
 // Lab: the visited-bit mark's price on the resident GET path (spec 2064/f3
-// doc 09 section 8, lab 15).
+// doc 09 section 8, lab 16).
 //
 // The question, from the m0-run3 report: run 3 measured aki's redis-benchmark
 // GET rows 8-12% under the 514d57b re-run with rivals bit-identical, and the
