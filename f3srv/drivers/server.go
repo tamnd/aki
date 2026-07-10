@@ -3,6 +3,7 @@ package drivers
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -28,6 +29,20 @@ const (
 	// stays selectable for the labs/f3/m0/15_conn_single A/B and leaves with
 	// the M10 driver decision.
 	ShapePair = "pair"
+)
+
+// The network drivers Options.NetDriver selects between.
+const (
+	// NetGoroutine is the goroutine-per-connection driver, the default on
+	// every platform and the only driver on non-Linux.
+	NetGoroutine = "goroutine"
+
+	// NetReactor is the raw-epoll event-loop driver (doc 08 section 4.2),
+	// Linux only, pulled forward from M10 as a correctness-only skeleton
+	// behind this knob. On other platforms it falls back to the goroutine
+	// driver with a logged notice. It becomes a default nowhere until it wins
+	// its regime A/B under the section 4.4 rule.
+	NetReactor = "reactor"
 )
 
 // defaultArenaBytes is the per-shard arena when the caller leaves it zero,
@@ -93,6 +108,15 @@ type Options struct {
 	// the empty default) or ShapePair. The pair shape exists for the lab 15
 	// A/B until the M10 driver decision.
 	ConnShape string
+	// NetDriver picks the network driver: NetGoroutine (also the empty
+	// default) or NetReactor. The reactor runs on Linux only; elsewhere it
+	// falls back to the goroutine driver with a logged notice, and NetStats
+	// reports the driver actually running, never the one asked for.
+	NetDriver string
+	// NetLoops is the reactor's event-loop count; non-positive takes the
+	// shard count. The binding loop-count decision is the M10 slice 6 lab;
+	// this knob exists so that lab has something to sweep.
+	NetLoops int
 }
 
 // Server is the goroutine-per-connection driver over the shard runtime. In
@@ -108,6 +132,16 @@ type Server struct {
 	flushEvery bool
 	shape      string
 	conns      sync.WaitGroup
+
+	// driver names the network driver actually running (NetGoroutine or
+	// NetReactor), fixed at Listen after the platform fallback has resolved,
+	// so NetStats and INFO report the running config, not the requested one.
+	driver string
+
+	// backend is the non-goroutine driver when one is active, nil otherwise.
+	// It is built at Listen (so the driver name above is settled before any
+	// traffic), serves in place of the accept loop, and is stopped by Close.
+	backend netBackend
 
 	// closeMu orders the accept path against Close. A queued connection can
 	// win the Accept race with ln.Close, so without the gate Serve's
@@ -138,6 +172,16 @@ type Server struct {
 // test surface for syscalls-per-round accounting.
 func (s *Server) Flushes() uint64 { return s.flushes.Load() }
 
+// netBackend is the seam a non-goroutine network driver plugs into: serve
+// owns the accept loop and everything behind it, stop tears the driver's
+// resources down and joins its threads. The goroutine driver is not a backend;
+// it is the code in this file, and stays the fallback whenever a backend
+// cannot be built.
+type netBackend interface {
+	serve() error
+	stop()
+}
+
 // Listen builds the runtime, registers the command table, starts the workers,
 // and binds the listener. Serve must be called to accept.
 func Listen(o Options) (*Server, error) {
@@ -147,6 +191,13 @@ func Listen(o Options) (*Server, error) {
 	case ShapeSingle, ShapePair:
 	default:
 		return nil, fmt.Errorf("drivers: unknown conn shape %q", o.ConnShape)
+	}
+	switch o.NetDriver {
+	case "":
+		o.NetDriver = NetGoroutine
+	case NetGoroutine, NetReactor:
+	default:
+		return nil, fmt.Errorf("drivers: unknown net driver %q", o.NetDriver)
 	}
 	if o.Shards <= 0 {
 		o.Shards = shard.DefaultShards()
@@ -179,7 +230,21 @@ func Listen(o Options) (*Server, error) {
 		replyBuf:   o.ReplyBufBytes,
 		flushEvery: o.FlushEveryDrain,
 		shape:      o.ConnShape,
+		driver:     NetGoroutine,
 		netLive:    make(map[*connState]struct{}),
+	}
+	if o.NetDriver == NetReactor {
+		// Platform-resolved: on Linux this builds the epoll loops and flips
+		// the driver name; elsewhere (or on a setup failure) it logs the
+		// fallback notice and the goroutine driver serves as usual. Resolved
+		// here rather than in Serve so the driver name is settled before the
+		// listener sees a byte.
+		if b, err := newReactorBackend(s, o); err != nil {
+			log.Printf("drivers: reactor driver unavailable (%v), falling back to the goroutine driver", err)
+		} else {
+			s.backend = b
+			s.driver = NetReactor
+		}
 	}
 	rt.SetNetInfo(s.appendNetInfo)
 	if o.PprofAddr != "" {
@@ -217,6 +282,9 @@ func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 // Serve accepts connections until Close. It returns nil after a Close and the
 // accept error otherwise.
 func (s *Server) Serve() error {
+	if s.backend != nil {
+		return s.backend.serve()
+	}
 	for {
 		nc, err := s.ln.Accept()
 		if err != nil {
@@ -266,6 +334,12 @@ func (s *Server) Close() error {
 		_ = s.pprofLn.Close()
 	}
 	s.conns.Wait()
+	if s.backend != nil {
+		// The backend's loops close every adopted fd exactly once and join
+		// before this returns, so the runtime stop below never races a loop
+		// still driving shard connections.
+		s.backend.stop()
+	}
 	s.rt.Stop()
 	return err
 }
