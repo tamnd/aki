@@ -190,7 +190,21 @@ func TestLedgerInvariantOpMix(t *testing.T) {
 			if _, err := s.IncrBy(k, int64(rng.IntN(1000)), now); err != nil && err != ErrNotInt {
 				t.Fatalf("%s: %v", step, err)
 			}
+		case op < 94:
+			// Two reads back to back: the first sets the doorkeeper mark on a
+			// log-resident run, the second promotes it into the arena when the
+			// fill allows, so the promotion deltas face the walk too.
+			step = fmt.Sprintf("step %d: GET GET %s", i, k)
+			s.Get(k, nil)
+			s.Get(k, nil)
 		case op < 96:
+			// The worker's boundary pair: demote cold resident runs, then let
+			// the compaction reclaim the bytes the pass left dead.
+			step = fmt.Sprintf("step %d: MaybeDemote", i)
+			if s.MaybeDemote() > 0 || s.ArenaTight() || s.ResidentOver() {
+				s.CompactArena()
+			}
+		case op < 97:
 			step = fmt.Sprintf("step %d: CompactArena", i)
 			s.CompactArena()
 		case op < 99:

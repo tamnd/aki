@@ -35,6 +35,13 @@ const (
 	// F_RAWSTICKY bit OBJECT ENCODING will read once that shim lands.
 	flagRawSticky = 1 << 5
 
+	// flagVisited is the residency clock bit (resid.go): on a resident
+	// separated run it is the SIEVE second-chance mark a read sets and the
+	// demotion hand clears, and on a log-resident run it is the promotion
+	// doorkeeper's first-touch mark. Owner-only plain stores, like every
+	// other header bit.
+	flagVisited = 1 << 6
+
 	// kindString is the plain string key record. Non-zero on purpose: a
 	// zero kind byte in a reused, unscrubbed arena offset must never read as a
 	// valid record kind.
