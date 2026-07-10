@@ -109,6 +109,12 @@ func init() {
 	register("INFO", nil, 0, 1, false)
 	registerFan("INFO", shard.FanStats, info, false, true)
 
+	// DBSIZE is the same keyless scatter with the count gather: every shard
+	// answers its key count and the sum is the reply.
+	dbsize := registerShard(str.DBSizeShard)
+	register("DBSIZE", nil, 0, 0, false)
+	registerFan("DBSIZE", shard.FanCount, dbsize, false, true)
+
 	// The INCR family, APPEND, and the range pair. SUBSTR is GETRANGE under
 	// its old name; a distinct row so arity errors quote 'substr'.
 	register("INCR", str.Incr, 1, 1, true)
