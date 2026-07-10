@@ -1,0 +1,38 @@
+cf2_pins aki=pid 693's current affinity list: 0-7 redis=pid 694's current affinity list: 0-7 valkey=pid 695's current affinity list: 0-7
+launch aki_extra='--arena-mib 512' io_threads redis=4 valkey=4 warm=3s
+shards_banner with 4 shards
+rss[launch] aki=11632kB redis=9024kB valkey=9228kB
+used_memory[launch] aki=32912 redis=1292488 valkey=1523992
+dbsize[launch] aki=0 redis=0 valkey=0
+cell wl=set value=64 keys=1000000 dist=uniform conns=512 pipeline=16 arena_mib_per_shard=512 warm=3s dur=8s
+GENBOUND flagged in rep0
+rss[post-rep0] aki=86164kB redis=24328kB valkey=19240kB
+used_memory[post-rep0] aki=9588672 redis=11328880 valkey=6861960
+dbsize[post-rep0] aki=87840 redis=76384 valkey=47824
+GENBOUND flagged in rep1
+GENBOUND flagged in rep2
+rss[post-ab] aki=202172kB redis=24516kB valkey=17892kB
+used_memory[post-ab] aki=8127680 redis=11230320 valkey=6809992
+dbsize[post-ab] aki=73568 redis=75552 valkey=47328
+rss[post-rb] aki=415092kB redis=50032kB valkey=129232kB
+used_memory[post-rb] aki=32912 redis=1457752 valkey=115081352
+dbsize[post-rb] aki=0 redis=0 valkey=1000000
+--- f3info[end]
+# Memory
+used_memory:32912
+used_memory_rss:425689088
+
+# f3
+keys:0
+arena_used_bytes:0
+arena_total_bytes:2147483648
+vlog_bytes:0
+vlog_dead_bytes:0
+vlog_runs:0
+band_int:0
+band_embedded:0
+band_separated:0
+band_chunked:0
+index_bytes:32912
+arena_live_bytes:0
+chunked_bytes:0

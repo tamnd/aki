@@ -1,0 +1,39 @@
+cf2_pins aki=pid 2344's current affinity list: 0-7 redis=pid 2345's current affinity list: 0-7 valkey=pid 2346's current affinity list: 0-7
+launch aki_extra='--arena-mib 512' io_threads redis=4 valkey=4 warm=3s
+shards_banner with 4 shards
+rss[launch] aki=11796kB redis=9012kB valkey=8984kB
+used_memory[launch] aki=32912 redis=1292488 valkey=1524056
+dbsize[launch] aki=0 redis=0 valkey=0
+cell wl=get value=64 keys=1000000 dist=zipfian conns=512 pipeline=16 arena_mib_per_shard=512 warm=3s dur=8s
+GENBOUND flagged in rep0
+rss[post-rep0] aki=258820kB redis=137588kB valkey=128068kB
+used_memory[post-rep0] aki=113449984 redis=127524256 valkey=115107960
+dbsize[post-rep0] aki=1000000 redis=1000000 valkey=1000000
+GENBOUND flagged in rep1
+GENBOUND flagged in rep2
+rss[post-ab] aki=550664kB redis=138296kB valkey=128052kB
+used_memory[post-ab] aki=113449984 redis=127524560 valkey=115107960
+dbsize[post-ab] aki=1000000 redis=1000000 valkey=1000000
+rb: n/a (none/zipfian) aki-bench is the sole harness for this row
+rss[post-rb] aki=550752kB redis=138296kB valkey=128052kB
+used_memory[post-rb] aki=113449984 redis=127524560 valkey=115107960
+dbsize[post-rb] aki=1000000 redis=1000000 valkey=1000000
+--- f3info[end]
+# Memory
+used_memory:113449984
+used_memory_rss:564056064
+
+# f3
+keys:1000000
+arena_used_bytes:95920000
+arena_total_bytes:2147483648
+vlog_bytes:0
+vlog_dead_bytes:0
+vlog_runs:0
+band_int:0
+band_embedded:1000000
+band_separated:0
+band_chunked:0
+index_bytes:17529984
+arena_live_bytes:95920000
+chunked_bytes:0
