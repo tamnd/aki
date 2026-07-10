@@ -91,6 +91,14 @@ type Server struct {
 	// round of point replies never fills 64KiB), so the counter is the labs'
 	// writes-per-round evidence. One relaxed add per flush, nothing per reply.
 	flushes atomic.Uint64
+
+	// The akinet counter registry (doc 08 section 9.5): live connections'
+	// counter homes, and the folded totals of closed ones. The mutex guards
+	// only registration, unregistration, and the aggregation walk; the
+	// counters themselves are single-writer per-connection state.
+	netMu   sync.Mutex
+	netLive map[*connState]struct{}
+	netDone NetStats
 }
 
 // Flushes reports the total writer socket flushes since start, the lab and
@@ -125,7 +133,14 @@ func Listen(o Options) (*Server, error) {
 	if o.ReplyBufBytes <= 0 {
 		o.ReplyBufBytes = replyBufSize
 	}
-	s := &Server{rt: rt, ln: ln, replyBuf: o.ReplyBufBytes, flushEvery: o.FlushEveryDrain}
+	s := &Server{
+		rt:         rt,
+		ln:         ln,
+		replyBuf:   o.ReplyBufBytes,
+		flushEvery: o.FlushEveryDrain,
+		netLive:    make(map[*connState]struct{}),
+	}
+	rt.SetNetInfo(s.appendNetInfo)
 	if o.PprofAddr != "" {
 		pln, err := net.Listen("tcp", o.PprofAddr)
 		if err != nil {
@@ -201,10 +216,15 @@ func (s *Server) Close() error {
 func (s *Server) handle(nc net.Conn) {
 	defer func() { _ = nc.Close() }()
 	c := s.rt.NewConn()
+	cs := &connState{sc: c}
+	s.register(cs)
+	// LIFO defers put the fold after the writer join below, so it reads final
+	// counts: the reader is this goroutine and the writer is gone by then.
+	defer s.unregister(cs)
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
-		bw := bufio.NewWriterSize(nc, s.replyBuf)
+		bw := bufio.NewWriterSize(&countedWriter{w: nc, n: &cs.writes}, s.replyBuf)
 		emit := func(rep []byte) { _, _ = bw.Write(rep) }
 		for c.Wait() {
 			c.DrainReplies(emit)
@@ -261,8 +281,13 @@ func (s *Server) handle(nc net.Conn) {
 			}
 		}
 		m, err := nc.Read(buf[n:])
+		// One bump per blocking Read call: each is one read(2) as the akinet
+		// counters see it (a netpoller EAGAIN retry hides inside, but the
+		// counter's job is reads per op, and those move together).
+		cs.reads.bump()
 		n += m
 		if m > 0 {
+			cmds := uint64(0)
 			for pos < n {
 				args, consumed, st := p.Next(buf[pos:n])
 				if st == resp.NeedMore {
@@ -279,9 +304,17 @@ func (s *Server) handle(nc net.Conn) {
 				if len(args) == 0 {
 					continue
 				}
+				cmds++
 				if derr := dispatch.Dispatch(c, args); derr != nil {
 					return
 				}
+			}
+			if cmds > 0 {
+				// The pass's command count folds into one store, and a pass
+				// that completed commands is one batch boundary (section 2.2):
+				// commands/batch is the pipeline depth the server actually saw.
+				cs.commands.add(cmds)
+				cs.batches.bump()
 			}
 			if pos == n {
 				pos, n = 0, 0
