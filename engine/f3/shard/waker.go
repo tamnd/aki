@@ -38,13 +38,26 @@ func (w *waker) init() {
 	w.ch = make(chan struct{}, 1)
 }
 
+// claim is the producer-side wake claim without the delivery: the CAS makes
+// the wake exactly-once, and a producer that loses the race knows another
+// producer's delivery is already in flight. wake pairs it with an immediate
+// delivery; the batched completion path (worker.wakeConns over a batch-
+// notified connection) claims here and defers the delivery to the end of its
+// drain pass, so one eventfd write can cover every claim on the same loop.
+// A claim must always be followed by a delivery on the same code path; a
+// claim whose delivery never comes is exactly the lost wake the state machine
+// exists to prevent.
+func (w *waker) claim() bool {
+	return w.state.Load() == stateParked && w.state.CompareAndSwap(stateParked, stateRunning)
+}
+
 // wake is the producer side, called after work is published. The claim CAS
 // makes the token exactly-once: a producer that loses the race knows another
 // producer's token is already in flight. The return reports whether this call
 // sent the token, so callers can count real cross-goroutine wakeups (the doc
 // 08 section 9.5 counters) without charging the common single-load path.
 func (w *waker) wake() bool {
-	if w.state.Load() == stateParked && w.state.CompareAndSwap(stateParked, stateRunning) {
+	if w.claim() {
 		if w.notify != nil {
 			w.notify()
 		} else {

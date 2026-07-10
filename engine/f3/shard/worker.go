@@ -57,6 +57,13 @@ type worker struct {
 	// one wake, not one per batch. Owner goroutine only.
 	wakes []*Conn
 
+	// loops collects the distinct LoopWakers behind the batch-notified
+	// connections in wakes whose claim this pass won; wakeConns delivers one
+	// WakeLoop to each at the end of the pass, which is the slice 4 batching
+	// (one eventfd write per touched loop, not per dirty connection). Owner
+	// goroutine only, like wakes.
+	loops []LoopWaker
+
 	// connWakes counts the connection writer wake tokens this worker sent
 	// (wakeConns, only the sends that claimed a parked writer), and parks
 	// counts the worker's real parks. Owner-goroutine single-writer counters;
@@ -284,18 +291,51 @@ func (w *worker) noteWake(c *Conn) {
 // wakeConns delivers the wakes the pass deferred and clears the list. The
 // wake happens after every push of the pass, so the section 9.1 publish-then-
 // load order holds for each of them.
+//
+// A batch-notified connection (SetWriterBatchNotify) splits its wake in two:
+// the per-connection claim happens here (the same waker CAS, so the counters
+// and the exactly-once rule are unchanged), but the delivery is deferred once
+// more, to the loop level: each claim marks its connection dirty on its loop,
+// and the pass ends with one WakeLoop per distinct loop touched. Between the
+// claim and that WakeLoop the pass runs only the straight-line loop below, so
+// the delivery every claim owes arrives within a bounded number of plain
+// instructions; nothing here can block or park with a claim outstanding.
 func (w *worker) wakeConns() {
 	sent := uint64(0)
 	for i, c := range w.wakes {
-		if c.wk.wake() {
+		if c.batchMark != nil {
+			if c.wk.claim() {
+				sent++
+				if c.batchMark() {
+					w.noteLoop(c.batchLoop)
+				}
+			}
+		} else if c.wk.wake() {
 			sent++
 		}
 		w.wakes[i] = nil
 	}
 	w.wakes = w.wakes[:0]
+	for i, l := range w.loops {
+		l.WakeLoop()
+		w.loops[i] = nil
+	}
+	w.loops = w.loops[:0]
 	if sent > 0 {
 		w.connWakes.add(sent)
 	}
+}
+
+// noteLoop records that l is owed a pass-end WakeLoop, deduplicated like
+// noteWake: the scan is linear over the loops the pass has touched, at most
+// one entry per event loop behind the connections in wakes.
+func (w *worker) noteLoop(l LoopWaker) {
+	for _, x := range w.loops {
+		if x == l {
+			return
+		}
+	}
+	w.loops = append(w.loops, l)
 }
 
 // execute runs one command through the registered handler table. OpError is
