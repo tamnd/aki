@@ -351,15 +351,21 @@ func (s *Store) GetStream(key []byte, now int64, dst []byte) ([]byte, *ChunkStre
 		return dst[:0], nil, false
 	}
 	if s.recFlags(addr)&flagChunked != 0 {
-		word, n, _ := s.readPtr(s.valueStart(addr))
-		dirOff := word & runAddrMask
-		cs := &ChunkStream{s: s, l: s.vlog, total: int64(s.vlen(addr)), refs: make([]chunkRef, n)}
-		for k := uint32(0); k < n; k++ {
-			w, l, _ := s.readPtr(dirOff + uint64(k)*ptrSize)
-			cs.refs[k] = chunkRef{word: w, clen: l}
-		}
-		return dst[:0], cs, true
+		return dst[:0], s.chunkStreamAt(addr), true
 	}
 	v, ok := s.readValue(addr, dst)
 	return v, nil, ok
+}
+
+// chunkStreamAt snapshots a chunked record's directory into a fresh
+// ChunkStream, the one allocation the giant band accepts.
+func (s *Store) chunkStreamAt(addr uint64) *ChunkStream {
+	word, n, _ := s.readPtr(s.valueStart(addr))
+	dirOff := word & runAddrMask
+	cs := &ChunkStream{s: s, l: s.vlog, total: int64(s.vlen(addr)), refs: make([]chunkRef, n)}
+	for k := uint32(0); k < n; k++ {
+		w, l, _ := s.readPtr(dirOff + uint64(k)*ptrSize)
+		cs.refs[k] = chunkRef{word: w, clen: l}
+	}
+	return cs
 }

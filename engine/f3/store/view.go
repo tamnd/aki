@@ -1,0 +1,90 @@
+package store
+
+import (
+	"encoding/binary"
+	"strconv"
+)
+
+// The view read path: GET-shaped reads that hand resident value bytes to the
+// reply builder without the scratch copy GetString pays. Profiling put that
+// copy (readSep plus the reply-arena append) near 10 percent of CPU at 4KiB
+// values; the reply builder copies into the reply arena anyway, so the first
+// copy buys nothing.
+
+// GetView returns the value for key with the resident bands' copy elided: an
+// embedded value or an arena-resident separated run comes back as a view into
+// the arena itself. An int cell renders into the store scratch, and a
+// log-resident run or a chunked value materializes into it, so those bands
+// still pay one copy (the log read stays on the copying path on purpose; it
+// is a pread and cannot alias the arena).
+//
+// Lifetime rule: the view is valid until the owner returns from the current
+// command execution, and dies at the next store write on this shard. The
+// handler runs on the shard's single owner goroutine inside the batch's epoch
+// bracket (shard worker executeOne), and nothing moves or releases arena
+// bytes mid-command: value-log compaction runs only at the owner's idle
+// boundary, after a drain pass came up empty (shard worker maybeCompact,
+// called from the run loop only when drainPass returned zero batches), and
+// arena.freeSegment has no caller on the command path. A later write may
+// reuse or overwrite the viewed bytes in place, so the caller must consume
+// the view (Reply.Bulk and AppendFanValue copy immediately) before its next
+// store call.
+func (s *Store) GetView(key []byte, now int64) ([]byte, bool) {
+	_, addr, _ := s.findLive(Hash(key), key, now)
+	if addr == 0 {
+		return nil, false
+	}
+	return s.readValueRef(addr)
+}
+
+// GetViewStream is GetView with the chunked band split out for streaming,
+// the way GetStream splits it out of GetString: a chunked value comes back as
+// a ChunkStream and no bytes, everything else through readValueRef under the
+// GetView lifetime rule.
+func (s *Store) GetViewStream(key []byte, now int64) ([]byte, *ChunkStream, bool) {
+	_, addr, _ := s.findLive(Hash(key), key, now)
+	if addr == 0 {
+		return nil, nil, false
+	}
+	if s.recFlags(addr)&flagChunked != 0 {
+		return nil, s.chunkStreamAt(addr), true
+	}
+	v, ok := s.readValueRef(addr)
+	return v, nil, ok
+}
+
+// readValueRef is readValue minus the copy where the band allows it. The
+// embedded bytes and an arena-resident separated run return as direct views;
+// an int cell, a log-resident run, and a chunked value go through the store
+// scratch, whose grown capacity carries across calls like the shard scratch
+// does. The result is subject to the GetView lifetime rule either way: the
+// scratch is store state and the next view read reuses it.
+func (s *Store) readValueRef(addr uint64) ([]byte, bool) {
+	vs := s.valueStart(addr)
+	f := s.recFlags(addr)
+	if f&flagInt != 0 {
+		n := int64(binary.LittleEndian.Uint64(s.arena.buf[vs:]))
+		v := strconv.AppendInt(s.vbuf[:0], n, 10)
+		s.vbuf = v[:0]
+		return v, true
+	}
+	if f&flagChunked != 0 {
+		v, ok := s.readChunked(addr, s.vbuf)
+		s.vbuf = v[:cap(v)][:0]
+		return v, ok
+	}
+	if f&flagSep != 0 {
+		word, vlen, _ := s.readPtr(vs)
+		if word&inLogBit != 0 {
+			v, err := s.vlog.readInto(word&runAddrMask, int(vlen), s.vbuf)
+			s.vbuf = v[:cap(v)][:0]
+			if err != nil {
+				return nil, false
+			}
+			return v, true
+		}
+		run := word & runAddrMask
+		return s.arena.buf[run : run+uint64(vlen)], true
+	}
+	return s.arena.buf[vs : vs+s.vlen(addr)], true
+}
