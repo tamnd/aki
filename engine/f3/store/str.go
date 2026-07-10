@@ -331,6 +331,7 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 			return err
 		}
 		s.writePtr(s.valueStart(off), dirOff, n, n)
+		s.chunkBytes += uint64(len(val))
 	case flags&flagSep != 0:
 		word, vcap, err := s.writeRun(val, nil, 0)
 		if err != nil {

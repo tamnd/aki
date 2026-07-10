@@ -115,8 +115,12 @@ func (s *Store) writeChunked(old []byte, offset int, val []byte, newLen int) (di
 }
 
 // dropChunks releases a chunked record's outside bytes: every chunk run,
-// then the directory block.
+// then the directory block. The chunked-band charge is credited against the
+// record's value length, the same figure the charge sites added, so the
+// counter balances even when an error path left a chunk longer than the
+// committed length.
 func (s *Store) dropChunks(addr uint64) {
+	s.chunkBytes -= s.vlen(addr)
 	word, n, dcap := s.readPtr(s.valueStart(addr))
 	dirOff := word & runAddrMask
 	for k := uint32(0); k < n; k++ {
@@ -265,6 +269,7 @@ func (s *Store) updateChunked(addr uint64, offset int, val []byte, oldLen, newLe
 	s.writePtr(vs, dirOff, newN, dcap)
 	s.setRecFlags(addr, s.recFlags(addr)|flagRawSticky)
 	s.setVlen(addr, uint32(newLen))
+	s.chunkBytes += uint64(newLen) - uint64(oldLen)
 	return nil
 }
 
@@ -283,6 +288,7 @@ func (s *Store) allocChunked(key, old []byte, offset int, val []byte, newLen int
 	}
 	s.writePtr(s.valueStart(off), dirOff, n, n)
 	s.setVlen(off, uint32(newLen))
+	s.chunkBytes += uint64(newLen)
 	return off, nil
 }
 
