@@ -12,11 +12,23 @@ At P1 with few conns a pass rarely claims more than one connection, so the two c
 
 ## Container numbers (provisional)
 
-Numbers below are from a podman golang container on the darwin dev box, not the gate box; they show the counter mechanism, not the campaign ratios.
+Numbers below are from a podman golang:1.26 container (applehv VM, 5 CPUs, 6GiB) on the darwin dev box, not the gate box; they show the counter mechanism, not the campaign ratios.
 The gate box A/B (P16/512 GET 64B against the slice 3 baseline) is owed and runs once the box frees up from the other campaign.
 
-(pending: run `go run ./labs/f3/m0/18_wake_batch` in the container and paste the table)
+GET 64B, 1M keys, 4 shards, 4 loops, 4s per cell, in process, `-dur 4s`.
 
-## Verdict
+| conns | pipeline | ops/s | conn wakes/op | loop wakes/op | yield | writes/op |
+|---|---|---|---|---|---|---|
+| 8 | P1 | 80075 | 1.000 | 0.883 | 1.13x | 1.000 |
+| 8 | P16 | 738281 | 0.147 | 0.083 | 1.77x | 0.105 |
+| 64 | P1 | 202915 | 1.000 | 0.259 | 3.86x | 1.000 |
+| 64 | P16 | 1542508 | 0.169 | 0.025 | 6.77x | 0.109 |
+| 256 | P1 | 324915 | 1.000 | 0.132 | 7.56x | 1.000 |
+| 256 | P16 | 2180952 | 0.182 | 0.018 | 9.96x | 0.110 |
+| 512 | P1 | 360327 | 1.000 | 0.111 | 9.00x | 1.000 |
+| 512 | P16 | 2241119 | 0.189 | 0.017 | 11.42x | 0.112 |
 
-(pending the container run; the box sweep stays owed either way)
+## Verdict (provisional, container)
+
+The mechanism holds and moves the way the prediction said it must: the fold widens with connection count, from 1.13x at 8 conns P1 (a pass rarely claims more than one connection, the two counters sit near each other) to 11.42x at the gate shape's 512/P16, where the eventfd writes per op drop from the 0.189 the unbatched path paid to 0.017, O(touched loops) instead of O(dirty conns).
+Throughput in the VM is loop-count and CPU bound, so the ops/s column is not campaign evidence; the throughput claim (GET 64B ~1.24x toward 1.5-1.65x at P16/512) stays with the owed gate box A/B.
