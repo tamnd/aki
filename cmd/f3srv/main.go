@@ -22,6 +22,8 @@ func main() {
 		"directory for per-shard value logs; empty keeps values in memory")
 	residentMiB := flag.Int("resident-cap-mib", 0,
 		"resident byte budget MiB per shard; past it, large values spill to the shard's value log (needs -vlog-dir; 0 means uncapped)")
+	pprofAddr := flag.String("pprof-addr", "",
+		"listen address for net/http/pprof, e.g. 127.0.0.1:6060; the endpoint has no auth, so keep it on loopback; empty leaves it off")
 	flag.Parse()
 
 	srv, err := drivers.Listen(drivers.Options{
@@ -30,12 +32,16 @@ func main() {
 		ArenaBytes:       *arenaMiB << 20,
 		VlogDir:          *vlogDir,
 		ResidentCapBytes: uint64(*residentMiB) << 20,
+		PprofAddr:        *pprofAddr,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "f3srv:", err)
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "f3srv: serving on %s with %d shards\n", srv.Addr(), *shards)
+	if pa := srv.PprofAddr(); pa != nil {
+		fmt.Fprintf(os.Stderr, "f3srv: pprof on http://%s/debug/pprof/\n", pa)
+	}
 	if err := srv.Serve(); err != nil {
 		fmt.Fprintln(os.Stderr, "f3srv:", err)
 		os.Exit(1)
