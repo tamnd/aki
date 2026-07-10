@@ -10,6 +10,7 @@ const (
 	opEcho
 	opGet
 	opSet
+	opIncr
 )
 
 func testHandlers() []Handler {
@@ -39,6 +40,14 @@ func testHandlers() []Handler {
 				return
 			}
 			r.Status("OK")
+		},
+		opIncr: func(cx *Ctx, args [][]byte, r Reply) {
+			n, err := cx.St.IncrBy(args[0], 1, cx.NowMs)
+			if err != nil {
+				r.Err("ERR " + err.Error())
+				return
+			}
+			r.Int(n)
 		},
 	}
 }

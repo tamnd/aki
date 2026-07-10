@@ -20,12 +20,13 @@ func TestDrainedPathZeroAllocs(t *testing.T) {
 	w := rt.workers[0]
 
 	val := []byte("value-of-64-bytes-0123456789012345678901234567890123456789012")
-	setArgs := make([][][]byte, 16)
-	getArgs := make([][][]byte, 16)
+	setArgs := make([][][]byte, 18)
+	getArgs := make([][][]byte, 18)
+	incArgs := make([][][]byte, 18)
 	for i := range setArgs {
-		key := []byte(fmt.Sprintf("key%03d", i))
-		setArgs[i] = [][]byte{key, val}
-		getArgs[i] = [][]byte{key}
+		setArgs[i] = [][]byte{[]byte(fmt.Sprintf("key%03d", i)), val}
+		getArgs[i] = [][]byte{[]byte(fmt.Sprintf("key%03d", i))}
+		incArgs[i] = [][]byte{[]byte(fmt.Sprintf("ctr%03d", i))}
 	}
 
 	sink := make([]byte, 0, 64<<10)
@@ -33,14 +34,17 @@ func TestDrainedPathZeroAllocs(t *testing.T) {
 
 	run := func() {
 		for i := range setArgs {
-			if i%2 == 0 {
-				if err := c.Do(opSet, true, setArgs[i]); err != nil {
-					t.Error(err)
-				}
-			} else {
-				if err := c.Do(opGet, true, getArgs[i]); err != nil {
-					t.Error(err)
-				}
+			var err error
+			switch i % 3 {
+			case 0:
+				err = c.Do(opSet, true, setArgs[i])
+			case 1:
+				err = c.Do(opGet, true, getArgs[i])
+			default:
+				err = c.Do(opIncr, true, incArgs[i])
+			}
+			if err != nil {
+				t.Error(err)
 			}
 		}
 		c.Flush()
