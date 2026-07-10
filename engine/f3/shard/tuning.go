@@ -58,6 +58,13 @@ const (
 	// the memory system's sustainable depth. Lab: prefetch depth (PRED-X6).
 	prefetchDepth = 32
 
+	// drainPassCap bounds one worker drain pass: up to this many batches run
+	// back to back before the deferred writer wakes go out and the loop
+	// returns to its stream pump. Big enough that a saturated inbound queue
+	// coalesces wakes well, small enough that no writer waits long for a
+	// deferred token.
+	drainPassCap = 32
+
 	// replyRing is a connection's pipeline window: the reply reorder ring holds
 	// this many in-flight replies, and a producer past the window blocks on the
 	// writer's progress. The doc 03 section 4.5 watermarks refine this into
