@@ -1,0 +1,5 @@
+fe54065dc7007f3713ac425410d5ac1216042289aebbceb1ae527398d49f2bc2  /root/f3gate/m0-rerun/bin/f3srv
+cf2f9ef0fef6a1f6f880690407147793044cf709400d17f80a1f93da79cd0979  /root/f3gate/m0-rerun/bin/aki-bench
+3bea75409d8182add0459b2765cd62cd5962ffbcf8adb8ccf637205e70cbadb0  /root/bin/redis-server
+3ee5b35da0bd9916c7058c83221972d06fe69182e0790029a183ca8ffd0cf4af  /root/bin/valkey-server
+6c5be4074733eaf19ceb212633dd9b0c699f5f17315fb61fa7ea50f74491babb  /root/bin/redis-benchmark
