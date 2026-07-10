@@ -1,0 +1,49 @@
+File: f3prof
+Build ID: da91fbb9e9878c0646c090596717e83b17353a10
+Type: cpu
+Time: 2026-07-10 16:38:05 +07
+Duration: 30s, Total samples = 200.12s (667.06%)
+Showing nodes accounting for 181.86s, 90.88% of 200.12s total
+Dropped 184 nodes (cum <= 1s)
+Showing top 40 nodes out of 97
+      flat  flat%   sum%        cum   cum%
+    60.92s 30.44% 30.44%     60.92s 30.44%  internal/runtime/syscall/linux.Syscall6
+    53.36s 26.66% 57.11%     53.36s 26.66%  time.runtimeNow
+    16.79s  8.39% 65.50%     18.36s  9.17%  github.com/tamnd/aki/engine/f3/store.(*Store).recordMatches (inline)
+     5.38s  2.69% 68.18%     39.56s 19.77%  github.com/tamnd/aki/engine/f3/shard.(*worker).drainAndExecute
+     5.36s  2.68% 70.86%      5.36s  2.68%  runtime.futex
+     5.12s  2.56% 73.42%      5.12s  2.56%  runtime.memmove
+     2.77s  1.38% 74.81%     56.13s 28.05%  time.Now
+     1.80s   0.9% 75.70%      2.73s  1.36%  sync/atomic.(*Pointer[go.shape.1f5c887c3d0b14f3f7e9cfeb836004fe77852da0577687e91edf2e19d8246b63]).Store (inline)
+     1.65s  0.82% 76.53%      1.78s  0.89%  github.com/tamnd/aki/engine/f3/store.Hash
+     1.65s  0.82% 77.35%      5.70s  2.85%  runtime.chanrecv
+     1.65s  0.82% 78.18%      1.65s  0.82%  sync/atomic.(*Pointer[go.shape.1f5c887c3d0b14f3f7e9cfeb836004fe77852da0577687e91edf2e19d8246b63]).Load (inline)
+     1.57s  0.78% 78.96%      1.57s  0.78%  aeshashbody
+     1.41s   0.7% 79.67%      1.41s   0.7%  time.Time.Before
+     1.40s   0.7% 80.37%      5.35s  2.67%  github.com/tamnd/aki/engine/f3/shard.(*Conn).deliver
+     1.40s   0.7% 81.07%        20s  9.99%  github.com/tamnd/aki/engine/f3/store.(*Store).findEntry
+     1.36s  0.68% 81.75%      1.36s  0.68%  time.now
+     1.28s  0.64% 82.39%      1.28s  0.64%  memeqbody
+     1.23s  0.61% 83.00%      1.23s  0.61%  internal/runtime/atomic.(*Uint32).CompareAndSwap (inline)
+     1.20s   0.6% 83.60%      2.17s  1.08%  github.com/tamnd/aki/engine/f3/shard.(*mpsc).pop
+     1.19s  0.59% 84.19%      1.54s  0.77%  github.com/tamnd/aki/engine/f3/shard.(*hopBatch).add
+     1.12s  0.56% 84.75%      1.12s  0.56%  github.com/tamnd/aki/engine/f3/shard.(*hopBatch).arg (inline)
+     1.12s  0.56% 85.31%      1.25s  0.62%  runtime.lock2
+     1.11s  0.55% 85.87%      1.11s  0.55%  runtime.cputicks
+     1.03s  0.51% 86.38%      1.25s  0.62%  github.com/tamnd/aki/engine/f3/store.(*Store).TouchBucket (inline)
+     0.93s  0.46% 86.85%      1.82s  0.91%  github.com/tamnd/aki/engine/f3/shard.(*mpsc).ready (inline)
+     0.92s  0.46% 87.31%      1.25s  0.62%  runtime.unlock2
+     0.73s  0.36% 87.67%      1.40s   0.7%  github.com/tamnd/aki/f3srv/resp.(*Parser).Next
+     0.69s  0.34% 88.02%      1.91s  0.95%  github.com/tamnd/aki/engine/f3/shard.(*Conn).drainParked
+     0.68s  0.34% 88.36%      3.89s  1.94%  github.com/tamnd/aki/engine/f3/shard.(*Conn).Do
+     0.64s  0.32% 88.68%      9.46s  4.73%  github.com/tamnd/aki/engine/f3/shard.(*Conn).DrainReplies
+     0.64s  0.32% 89.00%      4.54s  2.27%  runtime.chansend
+     0.56s  0.28% 89.28%      2.93s  1.46%  runtime.mapaccess1_faststr
+     0.54s  0.27% 89.55%     10.31s  5.15%  runtime.schedule
+     0.42s  0.21% 89.76%     60.40s 30.18%  github.com/tamnd/aki/engine/f3/shard.(*Conn).idleOnce
+     0.42s  0.21% 89.97%      7.24s  3.62%  github.com/tamnd/aki/f3srv/dispatch.Dispatch
+     0.41s   0.2% 90.17%     23.89s 11.94%  github.com/tamnd/aki/engine/f3/shard.(*worker).execute
+     0.39s  0.19% 90.37%      2.03s  1.01%  runtime.netpoll
+     0.37s  0.18% 90.55%      2.13s  1.06%  github.com/tamnd/aki/engine/f3/shard.(*Conn).flushShard
+     0.33s  0.16% 90.72%     19.62s  9.80%  github.com/tamnd/aki/f3srv/drivers.(*Server).handle
+     0.32s  0.16% 90.88%      2.01s  1.00%  runtime.send

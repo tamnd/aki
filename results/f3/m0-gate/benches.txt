@@ -1,0 +1,23 @@
+-- TestDrainedPathZeroAllocs:
+=== RUN   TestDrainedPathZeroAllocs
+--- PASS: TestDrainedPathZeroAllocs (0.00s)
+PASS
+ok  	github.com/tamnd/aki/engine/f3/shard	0.003s
+-- BenchmarkDrainExecute (hop+drain per-op) / store Get,Set (direct engine call):
+BenchmarkDrainExecute 	 1605626	      1483 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDrainExecute 	 1616515	      1478 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDrainExecute 	 1625246	      1488 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDrainExecute 	 1606555	      1501 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDrainExecute 	 1606185	      1495 ns/op	       0 B/op	       0 allocs/op
+ok  	github.com/tamnd/aki/engine/f3/shard	19.618s
+BenchmarkGet 	16892072	       144.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGet 	16963509	       143.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGet 	17069622	       143.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGet 	17056495	       143.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGet 	16485663	       144.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSet 	16200951	       149.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSet 	16436118	       151.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSet 	16634234	       152.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSet 	15731204	       153.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSet 	16400037	       152.3 ns/op	       0 B/op	       0 allocs/op
+ok  	github.com/tamnd/aki/engine/f3/store	36.678s
