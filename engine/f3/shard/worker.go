@@ -309,8 +309,10 @@ func (w *worker) idle() {
 	w.wk.state.Store(stateSpinning)
 	// The window is counted in calibrated iterations, not clock reads: a
 	// time.Now per turn was measurable CPU and the window only needs to be
-	// roughly spinWindow (see spinIters).
-	for i := 0; i < spinIters; i++ {
+	// roughly workerSpinWindow (see workerSpinIters). The worker's window is
+	// its own, swept apart from the connection writers' in lab 11; at the
+	// frozen value of zero the loop is skipped and the worker parks at once.
+	for i := 0; i < workerSpinIters; i++ {
 		if w.inbound.ready() || w.stop.Load() {
 			w.wk.state.Store(stateRunning)
 			return
