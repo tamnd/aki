@@ -312,6 +312,14 @@ type Server struct {
 	runID     string
 
 	wg sync.WaitGroup
+
+	// closeMu and closing guard connection admission against Close: an accept
+	// that lands after Close began (a connection already queued in the
+	// listener backlog when the test tears down, typically) must not wg.Add
+	// while Close sits in wg.Wait, which the race detector rightly flags.
+	// The check and the Add are one critical section.
+	closeMu sync.Mutex
+	closing bool
 }
 
 // watchEntry is one watched key's version and how many connections currently watch it. The
@@ -531,14 +539,32 @@ func (s *Server) ListenAndServe() error {
 		if err != nil {
 			return err
 		}
-		s.wg.Add(1)
+		if !s.track() {
+			_ = conn.Close()
+			continue
+		}
 		go s.serveConn(conn)
 	}
+}
+
+// track admits an accepted connection into the handler WaitGroup, refusing
+// once Close has begun; see closing.
+func (s *Server) track() bool {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closing {
+		return false
+	}
+	s.wg.Add(1)
+	return true
 }
 
 // Close stops accepting, waits for in-flight connections to drain, and closes the
 // store (which shuts the cold value log when the LTM tier is engaged).
 func (s *Server) Close() error {
+	s.closeMu.Lock()
+	s.closing = true
+	s.closeMu.Unlock()
 	var err error
 	if s.ln != nil {
 		err = s.ln.Close()
