@@ -64,11 +64,6 @@ const (
 	// pass must not degenerate into a full index walk per boundary.
 	demoteScanBudget = 64 << 10
 
-	// demoteFlushBytes is the staging buffer's flush threshold: demoted runs
-	// coalesce into one buffer and hit the log in writes of about this size,
-	// not one pwrite per run.
-	demoteFlushBytes = 1 << 20
-
 	// residDoorkeeperDen samples the doorkeeper: a first touch of a
 	// log-resident run sets the mark with probability 1/den, so a key needs
 	// about den+1 log reads to promote instead of two. The hand's mark decay
@@ -222,24 +217,15 @@ func (s *Store) MaybeDemote() uint64 {
 	return s.demotePass(live - low)
 }
 
-// demoteMove is one staged demotion: the record's pointer slot, the arena run
-// it currently names, and the log offset its bytes will live at once the
-// staging buffer flushes. Staged rather than applied so a log write failure
-// leaves every touched record still resident and correct.
-type demoteMove struct {
-	vs   uint64
-	run  uint64
-	off  uint64
-	vlen uint32
-	vcap uint32
-}
-
 // demotePass advances the clock hand until it has freed want arena bytes, hit
 // a pass budget, or completed one full revolution. The hand walks directory
 // positions; a segment whose localDepth trails the global depth owns a
 // contiguous alias run (top-bits indexing), so stepping by the alias span
 // visits each segment exactly once per revolution.
 func (s *Store) demotePass(want uint64) uint64 {
+	if s.vlog.werr != nil {
+		return 0 // a broken log takes no demotions; the store stays resident
+	}
 	dir := s.idx.dir
 	if s.demoteHand >= uint64(len(dir)) {
 		s.demoteHand = 0
@@ -261,14 +247,16 @@ func (s *Store) demotePass(want uint64) uint64 {
 			moved += s.demoteBucket(&seg.overflow[bi], &scanned)
 		}
 	}
-	moved += s.flushDemotes()
 	return moved
 }
 
 // demoteBucket runs the hand over one bucket: resident separated runs demote
 // or lose their visited bit, log-resident records lose their doorkeeper mark
-// (the ghost-window decay). It returns the arena bytes freed by moves already
-// applied through a staging flush inside the call.
+// (the ghost-window decay). A demotion is one buffered log append and the
+// pointer swap in place: the appended bytes are readable from the pending
+// buffer immediately (vlog.append's contract), so the swap cannot dangle on
+// the flush cadence, and the ledger deltas are the writeRun-to-log plus
+// dropRun pair the write path makes. It returns the arena bytes freed.
 func (s *Store) demoteBucket(b *bucket, scanned *uint64) uint64 {
 	var freed uint64
 	for i := 0; i < slotsPerBucket; i++ {
@@ -295,47 +283,16 @@ func (s *Store) demoteBucket(b *bucket, scanned *uint64) uint64 {
 			continue
 		}
 		run := word & runAddrMask
-		s.dstage = append(s.dstage, demoteMove{
-			vs:   vs,
-			run:  run,
-			off:  s.vlog.tail + uint64(len(s.dbuf)),
-			vlen: vlen,
-			vcap: vcap,
-		})
-		s.dbuf = append(s.dbuf, s.arena.buf[run:run+uint64(vlen)]...)
-		if len(s.dbuf) >= demoteFlushBytes {
-			freed += s.flushDemotes()
+		off, err := s.vlog.append(s.arena.buf[run : run+uint64(vlen)])
+		if err != nil {
+			return freed // log broken mid-pass: stop moving, keep the rest resident
 		}
-	}
-	return freed
-}
-
-// flushDemotes writes the staged runs to the log tail in one pwrite and
-// applies the pointer swaps: log run in, arena run charged dead, the same
-// ledger deltas writeRun-to-log plus dropRun make on the write path. On a
-// write error the stage is discarded and every staged record stays resident,
-// so a failing disk degrades to no demotion, never to a dangling pointer. It
-// returns the arena bytes freed.
-func (s *Store) flushDemotes() uint64 {
-	if len(s.dstage) == 0 {
-		return 0
-	}
-	if _, err := s.vlog.f.WriteAt(s.dbuf, int64(s.vlog.tail)); err != nil {
-		s.dstage = s.dstage[:0]
-		s.dbuf = s.dbuf[:0]
-		return 0
-	}
-	s.vlog.tail += uint64(len(s.dbuf))
-	var freed uint64
-	for _, m := range s.dstage {
-		s.arena.unlink(m.run, uint64(m.vcap))
+		s.arena.unlink(run, uint64(vcap))
 		// A log run is immutable, so its capacity is exactly its length.
-		s.writePtr(m.vs, inLogBit|m.off, m.vlen, m.vlen)
+		s.writePtr(vs, inLogBit|off, vlen, vlen)
 		s.logRuns++
 		s.demotes++
-		freed += uint64(m.vcap)
+		freed += uint64(vcap)
 	}
-	s.dstage = s.dstage[:0]
-	s.dbuf = s.dbuf[:0]
 	return freed
 }
