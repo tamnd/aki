@@ -64,7 +64,8 @@ func readInfo(t *testing.T, nc net.Conn, br *bufio.Reader) map[string]uint64 {
 		}
 		v, err := strconv.ParseUint(val, 10, 64)
 		if err != nil {
-			t.Fatalf("info line %q: %v", line, err)
+			// String-valued lines (net_driver) are not counters.
+			continue
 		}
 		stats[name] = v
 	}
