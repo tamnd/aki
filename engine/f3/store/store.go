@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"runtime"
 )
 
 // ErrFull is returned by Set when no arena segment has room for a new record.
@@ -110,12 +111,21 @@ type Options struct {
 // segment and grows by splitting, so there is no bucket-count parameter and no
 // index ceiling short of the directory depth cap.
 func New(arenaBytes, segBytes int) *Store {
-	return &Store{
+	s := &Store{
 		arena:      newArena(arenaBytes, segBytes),
 		idx:        newIndex(),
 		segDeadNum: arenaSegDeadNum,
 		segDeadDen: arenaSegDeadDen,
 	}
+	if s.arena.mapped {
+		// The arena backing lives outside the Go heap (arena_map_unix.go), so
+		// the GC cannot release it; the finalizer does what dropping the last
+		// reference to a heap slice used to. It fires exactly when the buffer
+		// would have been collected, so no live store can lose its arena, and
+		// Close keeps its narrow contract (the log only).
+		runtime.SetFinalizer(s, func(st *Store) { arenaUnmap(st.arena.buf) })
+	}
+	return s
 }
 
 // Open is New plus the value-log configuration.
