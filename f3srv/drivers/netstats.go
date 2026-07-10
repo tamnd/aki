@@ -99,6 +99,13 @@ type NetStats struct {
 	// slice exists for; the goroutine driver reports zero here because its
 	// per-connection channel token is the delivery.
 	LoopWakes uint64
+
+	// OutbufDisconnects counts connections dropped at the OutBufLimitBytes
+	// hard cap (doc 08 section 3.5's client-output-buffer-limit discipline):
+	// the client's unread reply backlog passed the configured bound and the
+	// driver disconnected it, that connection only. Zero when the cap is off
+	// (the default) or never hit.
+	OutbufDisconnects uint64
 }
 
 // addConn folds one connection's counters into the snapshot.
@@ -124,6 +131,7 @@ func (s *Server) NetStats() NetStats {
 	}
 	s.netMu.Unlock()
 	ns.ConnWakes, ns.WorkerParks = s.rt.NetWakes()
+	ns.OutbufDisconnects = s.outbufDrops.Load()
 	if s.backend != nil {
 		ns.LoopWakes = s.backend.wakes()
 	}
@@ -176,5 +184,6 @@ func (s *Server) appendNetInfo(text []byte) []byte {
 	stat("net_conn_wakes", ns.ConnWakes)
 	stat("net_conn_parks", ns.ConnParks)
 	stat("net_loop_wakes", ns.LoopWakes)
+	stat("net_disconnects_outbuf", ns.OutbufDisconnects)
 	return text
 }
