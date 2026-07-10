@@ -51,6 +51,15 @@ import (
 // reactorMaxEvents is one epoll_wait's event budget per turn.
 const reactorMaxEvents = 256
 
+// loopBufFree caps each per-loop buffer free list (doc 08 section 6.2: a
+// fixed-capacity free list per network thread, never sync.Pool). 256 buffers
+// of each kind is 32MiB per loop at the defaults, which covers a loop's share
+// of the 512-conn gate shape with room, so a fully active shard leases and
+// returns against the list with no allocator traffic; past the cap a returned
+// buffer goes to the GC, so a connection spike cannot permanently inflate the
+// pool footprint (the L19 pool-cap lesson).
+const loopBufFree = 256
+
 // streamQuanta bounds the streamed-reply chunks one service pass emits before
 // the loop requeues the connection behind its own eventfd: a fast-reading
 // giant GET shares the loop with every other connection on the fd shard
@@ -226,10 +235,20 @@ type reactorLoop struct {
 
 	conns []*reactorConn // indexed by fd; loop goroutine only
 
+	// The buffer free lists (doc 08 section 6.2): buffers are leased, not
+	// owned, so a parked-clean connection holds no read or reply buffer at
+	// all. Loop-goroutine only, like conns, so no lock; capped at loopBufFree.
+	rfree [][]byte // read buffers, len readBufSize
+	ofree [][]byte // reply buffers, len 0, cap replyBuf
+
 	mu      sync.Mutex
 	pending []int          // accepted fds awaiting adoption
 	dirty   []*reactorConn // conns owed a writer service, posted by owners
-	closing bool
+	// dirtySpare is the drained dirty list's backing, swapped back in by
+	// drainWake so the steady wake traffic appends into recycled capacity
+	// instead of regrowing from nil every drain.
+	dirtySpare []*reactorConn
+	closing    bool
 
 	// ownerWakes counts the owner-to-loop eventfd writes (WakeLoop calls that
 	// wrote), the figure the slice 4 batching exists to shrink. Written under
@@ -250,6 +269,8 @@ type reactorConn struct {
 
 	// Read buffer, same discipline as readLoop (doc 08 section 2.1): rbuf
 	// holds [pos, n) unparsed bytes, compacted or grown at pass boundaries.
+	// Leased from the loop's free list on first read, nil while the
+	// connection is parked clean (doc 08 section 6.2).
 	rbuf []byte
 	pos  int
 	n    int
@@ -451,17 +472,22 @@ func (l *reactorLoop) drainWake() (closing bool) {
 	pending := l.pending
 	l.pending = nil
 	dirty := l.dirty
-	l.dirty = nil
+	l.dirty = l.dirtySpare
+	l.dirtySpare = nil
 	l.mu.Unlock()
 	for _, fd := range pending {
 		l.adopt(fd)
 	}
-	for _, rc := range dirty {
+	for i, rc := range dirty {
+		dirty[i] = nil // do not pin the conn from the spare's backing
 		rc.queued.Store(false)
 		if rc.fd < 0 {
 			continue
 		}
 		l.service(rc)
+	}
+	if dirty != nil {
+		l.dirtySpare = dirty[:0]
 	}
 	return false
 }
@@ -474,11 +500,19 @@ func (l *reactorLoop) adopt(fd int) {
 		loop: l,
 		fd:   fd,
 		sc:   l.b.s.rt.NewConn(),
-		rbuf: make([]byte, readBufSize),
-		out:  make([]byte, 0, l.b.s.replyBuf),
 	}
 	rc.cs = &connState{sc: rc.sc}
-	rc.emit = func(rep []byte) { rc.out = append(rc.out, rep...) }
+	// No buffers yet: they are leased on first use (serviceRead for rbuf, the
+	// emit below for out) and returned when the connection parks clean, so an
+	// idle connection holds no buffers at all (doc 08 section 6.2). The nil
+	// check in emit is the lease point for the reply buffer; append on a leased
+	// buffer is exactly append on the old owned one.
+	rc.emit = func(rep []byte) {
+		if rc.out == nil {
+			rc.out = l.leaseOut()
+		}
+		rc.out = append(rc.out, rep...)
+	}
 	// Step mode: a streamed reply becomes a cursor the loop advances with
 	// StreamStep instead of a blocking emit; the loop must never wait on one
 	// connection's chunk ring while the rest of its fd shard is ready.
@@ -507,6 +541,55 @@ func (l *reactorLoop) adopt(fd int) {
 	rc.sc.ParkWriter() // fresh conn, nothing queued; parks clean
 }
 
+// leaseRbuf hands out a read buffer: the free list first, the allocator past
+// it. Loop goroutine only.
+func (l *reactorLoop) leaseRbuf() []byte {
+	if n := len(l.rfree); n > 0 {
+		b := l.rfree[n-1]
+		l.rfree[n-1] = nil
+		l.rfree = l.rfree[:n-1]
+		return b
+	}
+	return make([]byte, readBufSize)
+}
+
+// leaseOut is leaseRbuf for the reply buffer.
+func (l *reactorLoop) leaseOut() []byte {
+	if n := len(l.ofree); n > 0 {
+		b := l.ofree[n-1]
+		l.ofree[n-1] = nil
+		l.ofree = l.ofree[:n-1]
+		return b
+	}
+	return make([]byte, 0, l.b.s.replyBuf)
+}
+
+// releaseIdle returns a cleanly parked connection's buffers to the loop's
+// free lists, the lease-not-own half of doc 08 section 6.2: an idle
+// connection holds nothing, so 512 mostly-parked connections cost their
+// reactorConn structs and not 64MiB of buffers. Clean means genuinely idle:
+// no unparsed bytes, no unsent reply, no hold that will resume with state in
+// hand. Only stock-sized buffers go back on the list; a grown buffer drops to
+// the GC here, which is the pooling policy's grown-buffer rule and also what
+// makes the old 16x-shrink heuristic mostly moot on this driver.
+func (l *reactorLoop) releaseIdle(rc *reactorConn) {
+	if rc.closing || rc.throttled || rc.writeBlocked || rc.pos != 0 || rc.n != 0 || len(rc.out) != 0 {
+		return
+	}
+	if rc.rbuf != nil {
+		if len(rc.rbuf) == readBufSize && len(l.rfree) < loopBufFree {
+			l.rfree = append(l.rfree, rc.rbuf)
+		}
+		rc.rbuf = nil
+	}
+	if rc.out != nil {
+		if cap(rc.out) == l.b.s.replyBuf && len(l.ofree) < loopBufFree {
+			l.ofree = append(l.ofree, rc.out)
+		}
+		rc.out = nil
+	}
+}
+
 func (l *reactorLoop) get(fd int) *reactorConn {
 	if fd >= 0 && fd < len(l.conns) {
 		return l.conns[fd]
@@ -519,6 +602,9 @@ func (l *reactorLoop) get(fd int) *reactorConn {
 // the fd next turn if the read left bytes on the socket, so one read per
 // readiness keeps the loop's time per connection bounded.
 func (l *reactorLoop) serviceRead(rc *reactorConn) {
+	if rc.rbuf == nil {
+		rc.rbuf = l.leaseRbuf()
+	}
 	if rc.n == len(rc.rbuf) {
 		if rc.pos > 0 {
 			rc.n = copy(rc.rbuf, rc.rbuf[rc.pos:rc.n])
@@ -600,6 +686,7 @@ func (l *reactorLoop) service(rc *reactorConn) {
 			break
 		}
 		if rc.sc.ParkWriter() {
+			l.releaseIdle(rc)
 			break
 		}
 		// Replies landed between the drain and the park; go around.
@@ -709,10 +796,11 @@ func (l *reactorLoop) parsePass(rc *reactorConn) bool {
 	}
 	if rc.pos == rc.n {
 		rc.pos, rc.n = 0, 0
-		// A giant inbound bulk grew the buffer; once drained, shrink back so
-		// an idle connection does not pin megabytes.
+		// A giant inbound bulk grew the buffer; once drained, drop it so a
+		// megabytes-wide buffer never lingers. The next read leases a stock
+		// one; a grown buffer never enters the free list.
 		if len(rc.rbuf) > 16*readBufSize {
-			rc.rbuf = make([]byte, readBufSize)
+			rc.rbuf = nil
 		}
 	} else if rc.pos > 0 && rc.n-rc.pos <= compactMax {
 		rc.n = copy(rc.rbuf, rc.rbuf[rc.pos:rc.n])
@@ -775,8 +863,10 @@ func (l *reactorLoop) flushOut(rc *reactorConn) bool {
 	}
 	rc.out = rc.out[:0]
 	// A streamed giant reply grew the buffer; give the pages back once sent.
+	// nil, not a fresh allocation: the next emit leases from the free list,
+	// and the grown buffer never enters it.
 	if cap(rc.out) > 4*l.b.s.replyBuf {
-		rc.out = make([]byte, 0, l.b.s.replyBuf)
+		rc.out = nil
 	}
 	if wrote {
 		l.b.s.flushes.Add(1)
@@ -828,6 +918,22 @@ func (l *reactorLoop) closeConn(rc *reactorConn) {
 	rc.fd = -1
 	rc.sc.Close()
 	l.b.s.unregister(rc.cs)
+	// Recycle the buffers regardless of their content: the fd is gone, so any
+	// unparsed bytes or unsent reply are dead, and a read fully overwrites
+	// [0, n) before the parser sees a leased buffer again. Stock sizes only,
+	// same rule as releaseIdle.
+	if rc.rbuf != nil {
+		if len(rc.rbuf) == readBufSize && len(l.rfree) < loopBufFree {
+			l.rfree = append(l.rfree, rc.rbuf)
+		}
+		rc.rbuf = nil
+	}
+	if rc.out != nil {
+		if cap(rc.out) == l.b.s.replyBuf && len(l.ofree) < loopBufFree {
+			l.ofree = append(l.ofree, rc.out[:0])
+		}
+		rc.out = nil
+	}
 }
 
 // shutdown closes every owned connection and any fds still waiting for
