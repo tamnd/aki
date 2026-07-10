@@ -101,4 +101,13 @@ for L in 3 5; do
   arm "s5_get_loops$L" "--shards 5" "$L" get
 done
 
+# Formula-pinning arms after the first pass read loops=3 winning at both
+# shard counts: shards=5 loops=2 separates cores-shards (3) from
+# cores-shards-1 (2), and shards=3 separates cores-shards (5) from a
+# constant knee near 3.
+arm "s5_get_loops2" "--shards 5" 2 get
+for L in 3 4 5 6; do
+  arm "s3_get_loops$L" "--shards 3" "$L" get
+done
+
 log "lab19 sweep complete"

@@ -114,8 +114,12 @@ type Options struct {
 	// reports the driver actually running, never the one asked for.
 	NetDriver string
 	// NetLoops is the reactor's event-loop count; non-positive takes the
-	// shard count. The binding loop-count decision is the M10 slice 6 lab;
-	// this knob exists so that lab has something to sweep.
+	// network share of the doc 03 core split, GOMAXPROCS*2/5 floored (min 1),
+	// the complement of shard.DefaultShards' 3/5. Lab 19
+	// (labs/f3/m0/19_loop_count) froze this: on the gate box's 8-cpu server
+	// mask the knee sits at 3 loops for every shard count tried (3, 4, 5),
+	// so the loop count follows the core budget, not the shard count, and
+	// both readings of doc 08 section 4.2 lose their tie to shards.
 	NetLoops int
 	// OutBufLimitBytes is the hard cap on one connection's pending reply
 	// bytes buffered driver-side (the client-output-buffer-limit lineage,
