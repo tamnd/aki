@@ -31,7 +31,7 @@ func main() {
 	netDriver := flag.String("net", drivers.NetGoroutine,
 		"network driver: goroutine (the default, one shape-selected handler per connection) or reactor (raw epoll event loops, Linux only; elsewhere it logs a notice and serves on the goroutine driver)")
 	netLoops := flag.Int("net-loops", 0,
-		"reactor event loops; 0 means one per shard (only the reactor driver reads this)")
+		"reactor event loops; 0 takes the 2/5 network share of the core split (labs/f3/m0/19_loop_count; only the reactor driver reads this)")
 	flag.Parse()
 
 	srv, err := drivers.Listen(drivers.Options{

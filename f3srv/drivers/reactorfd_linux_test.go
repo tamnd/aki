@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -111,5 +112,18 @@ func TestReactorCloseFDLifecycle(t *testing.T) {
 	}
 	for _, err := range errs {
 		t.Errorf("closeFD returned %v; a failure here is a double close or a bookkeeping bug", err)
+	}
+}
+
+// TestDefaultNetLoops pins the lab 19 freeze: the reactor's loop count
+// defaults to the 2/5 network share of the core split, never the shard
+// count, and never below one.
+func TestDefaultNetLoops(t *testing.T) {
+	want := runtime.GOMAXPROCS(0) * 2 / 5
+	if want < 1 {
+		want = 1
+	}
+	if got := defaultNetLoops(); got != want {
+		t.Fatalf("defaultNetLoops() = %d, want %d (GOMAXPROCS*2/5 floored, min 1)", got, want)
 	}
 }

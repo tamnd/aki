@@ -26,7 +26,14 @@ The standing numbers they move from are run 3's (aki 19c08a4): GET 64B P16/512 1
 
 ## Loop-count lab (slice 6, labs/f3/m0/19_loop_count)
 
-Pending; box table lands here and in the lab README.
+Ran first, 2026-07-11, aki c76d0 build; full tables and the sweep protocol live in the lab README.
+The knee is 3 loops on the 8-cpu server mask at every shard count tried (3, 4, 5): GET 64B P16/512 reads 2.05 / 6.14 / 6.64 / 6.65 / 4.70 / 3.47 Mops at loops 1/2/3/4/6/8, an interleaved second pass reproduces it within 0.1%, and an 8-thread-generator rerun rules out a generator ceiling.
+The 3-vs-4 tie on GET breaks toward 3 on SET (6.64 vs 6.14 Mops, +8%) and on p99 (1.38 vs 1.56 ms).
+The doc 08 section 4.2 spec amendment this resolves: neither M = shards (loses at shards=5: 5 loops 5.70 vs 3 loops 6.65 Mops) nor M = cores minus shards (loses at shards=3: 5 loops 5.70 vs 3 loops 6.65, and on SET/p99 at shards=4); the loop count follows the core budget alone, the 2/5 network share of the doc 03 section 2.2 split, the complement of shard.DefaultShards' 3/5.
+Frozen in code: Options.NetLoops <= 0 takes max(1, GOMAXPROCS*2/5), which is 3 on the gate mask (f3srv/drivers/reactor_linux.go defaultNetLoops, pinned by TestDefaultNetLoops).
+Oversubscription is the predicted failure mode confirmed: every loop past the knee costs throughput (-29% at 6, -48% at 8) and p99 (2.4x at 8).
+PRED-6 judgment: half hit; the knee-then-dip shape and the oversubscription mechanism landed, and loops=5 at shards=5 lost as predicted, but the predicted winner was 4 and the measured winner is 3, and the disambiguation arm falsified both spec formulas instead of electing cores-minus-shards.
+RSS at 512 conns moves with loop count (516 to 701 MiB across the sweep), not with connection buffers; at the frozen default it reads 568 MiB, so section 6.2 buffer leasing is not forced at this connection count and stays a named follow-up for the 10k-conn shape (PRED-8's lab-19 half holds so far).
 
 ## Lab 18 box sweep (owed)
 
