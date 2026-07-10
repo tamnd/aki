@@ -69,8 +69,9 @@ func appendStat(text []byte, name string, v uint64) []byte {
 // RSS.
 // used_memory_rss is the kernel's resident figure where the platform exposes
 // it, and the two are expected to differ. The f3 section keeps the per-band
-// census and log accounting the LTM harness reads.
-func renderStats(dst []byte, stats []uint64) []byte {
+// census and log accounting the LTM harness reads. The transport's "# Net"
+// section, when a driver registered one through SetNetInfo, comes last.
+func (r *Runtime) renderStats(dst []byte, stats []uint64) []byte {
 	get := func(i int) uint64 {
 		if i < len(stats) {
 			return stats[i]
@@ -89,6 +90,9 @@ func renderStats(dst []byte, stats []uint64) []byte {
 			continue
 		}
 		text = appendStat(text, statNames[i], stats[i])
+	}
+	if r.netInfo != nil {
+		text = r.netInfo(text)
 	}
 	return resp.AppendBulk(dst, text)
 }

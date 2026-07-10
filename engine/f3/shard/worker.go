@@ -56,6 +56,13 @@ type worker struct {
 	// delivers them at its end so a run of batches for one connection costs
 	// one wake, not one per batch. Owner goroutine only.
 	wakes []*Conn
+
+	// connWakes counts the connection writer wake tokens this worker sent
+	// (wakeConns, only the sends that claimed a parked writer), and parks
+	// counts the worker's real parks. Owner-goroutine single-writer counters;
+	// see Runtime.NetWakes.
+	connWakes eventCounter
+	parks     eventCounter
 }
 
 func newWorker(id int, st *store.Store) *worker {
@@ -278,11 +285,17 @@ func (w *worker) noteWake(c *Conn) {
 // wake happens after every push of the pass, so the section 9.1 publish-then-
 // load order holds for each of them.
 func (w *worker) wakeConns() {
+	sent := uint64(0)
 	for i, c := range w.wakes {
-		c.wk.wake()
+		if c.wk.wake() {
+			sent++
+		}
 		w.wakes[i] = nil
 	}
 	w.wakes = w.wakes[:0]
+	if sent > 0 {
+		w.connWakes.add(sent)
+	}
 }
 
 // execute runs one command through the registered handler table. OpError is
@@ -334,5 +347,6 @@ func (w *worker) idle() {
 		w.wk.unparkSelf()
 		return
 	}
+	w.parks.bump()
 	w.wk.park()
 }
