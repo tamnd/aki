@@ -24,6 +24,7 @@ func startLTMServer(t *testing.T, residentCap uint64) (net.Conn, *bufio.Reader) 
 		VlogDir:          t.TempDir(),
 		ResidentCapBytes: residentCap,
 		ConnShape:        testConnShape(),
+		NetDriver:        testNetDriver(),
 	})
 	if err != nil {
 		t.Fatal(err)
