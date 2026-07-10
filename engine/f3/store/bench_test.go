@@ -74,6 +74,43 @@ func BenchmarkGet(b *testing.B) {
 	}
 }
 
+// BenchmarkGetResident is BenchmarkGet on the LTM read path: separated
+// values under a resident cap with headroom, so every hit runs the
+// visited-bit mark (touchResident) that plain BenchmarkGet never reaches.
+// The number prices the residency machinery's whole read-path addition;
+// lab 15 (labs/f3/m0/15_visited_mark) holds the sweep across mark variants.
+func BenchmarkGetResident(b *testing.B) {
+	const keys = 1 << 18
+	const valLen = 1032 // separated band
+	s, err := Open(Options{
+		ArenaBytes:       1 << 30,
+		VlogPath:         b.TempDir() + "/vlog",
+		ResidentCapBytes: 1 << 30, // everything stays resident: the mark, no demotion
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	val := make([]byte, valLen)
+	var kb [16]byte
+	for i := 0; i < keys; i++ {
+		if err := s.Set(makeKey(kb[:], uint64(i)), val); err != nil {
+			b.Fatal(err)
+		}
+	}
+	var dst []byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := makeKey(kb[:], uint64(i)&(keys-1))
+		var ok bool
+		dst, ok = s.Get(k, dst)
+		if !ok {
+			b.Fatal("miss")
+		}
+	}
+}
+
 func BenchmarkSet(b *testing.B) {
 	// Pre-fill so every Set is an in-place update on the bounded arena (the
 	// sustained write path); a fresh-key Set would measure the bump allocator,
