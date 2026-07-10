@@ -64,6 +64,9 @@ type Options struct {
 	// the pipeline boundary. The knob exists for the labs/f3/m0/11_transport
 	// A/B; production keeps it off.
 	FlushEveryDrain bool
+	// PinWorkers locks each shard worker to an OS thread; see
+	// shard.Config.PinWorkers. Default off.
+	PinWorkers bool
 	// PprofAddr, when set, binds a second listener serving net/http/pprof
 	// under /debug/pprof/. Empty keeps it off. The endpoint has no auth, so
 	// bind it to loopback (for example "127.0.0.1:6060"). This is a server
@@ -113,6 +116,7 @@ func Listen(o Options) (*Server, error) {
 		SegBytes:         o.SegBytes,
 		VlogDir:          o.VlogDir,
 		ResidentCapBytes: o.ResidentCapBytes,
+		PinWorkers:       o.PinWorkers,
 	})
 	if err != nil {
 		_ = ln.Close()

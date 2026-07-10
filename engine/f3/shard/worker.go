@@ -20,6 +20,16 @@ type worker struct {
 	stop    atomic.Bool
 	done    chan struct{}
 
+	// pin locks the worker goroutine to an OS thread for its whole life.
+	// Correctness never needs it: the single-owner invariant is goroutine
+	// affinity, one goroutine owning the shard, and that holds wherever the
+	// scheduler runs it. The lock only ever bought cache residency, and it
+	// charges every park and unpark the handoffp/startlockedm double
+	// cond_signal (issue #542's wake tax); the labs/f3/m0/11_transport sweep
+	// measured unpinned as winning or tying every cell. Default off; Config
+	// exposes it for boxes where thread residency measurably pays.
+	pin bool
+
 	// handlers is the op-indexed table Runtime.Use registered, fixed before
 	// Start. The worker looks handlers up by op byte and never interprets one.
 	handlers []Handler
@@ -61,10 +71,12 @@ func newWorker(id int, st *store.Store) *worker {
 
 // run is the owner loop (doc 03 section 3.1, the M0 subset: batches and idle;
 // intents, timers, parked resumptions, and the background slice land with
-// their milestones). The thread lock is for keeps: the worker owns its thread
-// so cache residency and the future core pinning mean something.
+// their milestones). When pin is set the thread lock is for keeps: the worker
+// owns its thread so cache residency and core pinning mean something.
 func (w *worker) run() {
-	runtime.LockOSThread()
+	if w.pin {
+		runtime.LockOSThread()
+	}
 	defer close(w.done)
 	for {
 		n := w.drainPass()

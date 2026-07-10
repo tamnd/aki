@@ -7,8 +7,8 @@ import (
 	"github.com/tamnd/aki/engine/f3/store"
 )
 
-// Runtime is the shard topology: S workers, each pinned to an OS thread and
-// owning one store, fixed at startup. Shards never split, merge, or rebalance
+// Runtime is the shard topology: S workers, each a single goroutine owning
+// one store (and optionally locked to an OS thread), fixed at startup. Shards never split, merge, or rebalance
 // at runtime; resizing S means restarting the process (doc 03 section 2.2).
 type Runtime struct {
 	workers []*worker
@@ -46,6 +46,13 @@ type Config struct {
 	// separated or chunked value's bytes spill to the shard's log. 0 means
 	// uncapped.
 	ResidentCapBytes uint64
+
+	// PinWorkers locks each worker goroutine to an OS thread. Off by default:
+	// the single-owner invariant is goroutine affinity and needs no thread,
+	// and the labs/f3/m0/11_transport sweep measured the lock as a net loss
+	// through the locked-M park/unpark handoff. The knob stays for boxes
+	// where thread residency measurably pays.
+	PinWorkers bool
 }
 
 // Open is New with the value-log configuration: each shard gets its own log
@@ -69,6 +76,7 @@ func Open(cfg Config) (*Runtime, error) {
 			return nil, err
 		}
 		r.workers[i] = newWorker(i, st)
+		r.workers[i].pin = cfg.PinWorkers
 	}
 	return r, nil
 }
