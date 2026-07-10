@@ -33,10 +33,12 @@ type Store struct {
 
 	// The residency machinery (resid.go). ltmOn folds the whole
 	// configuration check into one load for the read path; residMode is the
-	// promotion policy (labs override it); demoteHand is the clock hand's
+	// promotion policy (labs override it); markAlways is lab 15's
+	// always-store mark variant; demoteHand is the clock hand's
 	// directory position; the counters are the ResidStats surface.
 	ltmOn      bool
 	residMode  int
+	markAlways bool
 	dkDen      uint64
 	dkRng      uint64
 	demoteHand uint64

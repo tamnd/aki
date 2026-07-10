@@ -123,12 +123,26 @@ func (s *Store) TuneDoorkeeper(den uint64) {
 	s.dkDen = den
 }
 
+// TuneMarkAlways switches touchResident to store the visited bit on every
+// resident hit instead of check-then-set. Labs only: this is the always-store
+// variant lab 15 prices the shipped check against, the "flagVisited turns a
+// read-only GET into a cache-line write" suspicion from the run3 report.
+// Bit semantics are identical either way; only the store count differs.
+func (s *Store) TuneMarkAlways(on bool) {
+	s.markAlways = on
+}
+
 // touchResident sets the visited bit on a resident separated run's record,
 // the SIEVE mark the demotion hand honors. Check-then-set so a hot record's
-// header line is not re-dirtied on every read.
+// header line is not re-dirtied on every read; lab 15 measured the
+// alternatives (no mark, this, store-every-hit) within noise of each other
+// on the fully resident GET path at a 1M-key footprint, so the check is kept
+// as free insurance, not as a proven save.
 func (s *Store) touchResident(addr uint64) {
 	if f := s.recFlags(addr); f&flagVisited == 0 {
 		s.setRecFlags(addr, f|flagVisited)
+	} else if s.markAlways {
+		s.setRecFlags(addr, f)
 	}
 }
 

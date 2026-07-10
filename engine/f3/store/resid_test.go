@@ -215,3 +215,50 @@ func TestResidencyOffIsInert(t *testing.T) {
 		t.Fatalf("residency off still moved values: %+v", r)
 	}
 }
+
+// TestMarkAlwaysSameBits pins lab 15's knob: the always-store mark variant
+// must be observationally identical to the shipped check-then-set, because
+// the two only differ in how many times the same bit value is written. Run
+// the demote-evicts-cold shape under the knob and check the policy outcome
+// is unchanged: hot stays resident, cold demotes.
+func TestMarkAlwaysSameBits(t *testing.T) {
+	s := residStore(t, 2<<20)
+	s.TuneMarkAlways(true)
+	fillPast(t, s, 1500, 2<<10) // ~3MiB of values against a 2MiB cap
+	// Touch a hot resident subset so its visited bits are set (and, under
+	// the knob, re-stored on every one of these reads).
+	var dst []byte
+	hot := [][]byte{}
+	for i := 0; i < 64; i++ {
+		hot = append(hot, fmt.Appendf(nil, "key:%05d", i))
+	}
+	for range 3 {
+		for _, k := range hot {
+			if dst, _ = s.Get(k, dst); len(dst) == 0 {
+				t.Fatalf("hot key %s unreadable", k)
+			}
+		}
+	}
+	moved := uint64(0)
+	for i := 0; i < 64; i++ {
+		n := s.MaybeDemote()
+		moved += n
+		s.CompactArena()
+		if n == 0 {
+			break
+		}
+	}
+	if moved == 0 {
+		t.Fatal("no demotion ran over a store past its cap")
+	}
+	checkLedger(t, s, "after demotion under mark-always")
+	base := s.Resid().LogReads
+	for _, k := range hot {
+		if dst, _ = s.Get(k, dst); len(dst) == 0 {
+			t.Fatalf("hot key %s unreadable after demotion", k)
+		}
+	}
+	if got := s.Resid().LogReads; got != base {
+		t.Fatalf("hot keys were demoted under mark-always: %d log reads", got-base)
+	}
+}
