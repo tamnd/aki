@@ -22,6 +22,8 @@ func main() {
 		"directory for per-shard value logs; empty keeps values in memory")
 	residentMiB := flag.Int("resident-cap-mib", 0,
 		"resident byte budget MiB per shard; past it, large values spill to the shard's value log (needs -vlog-dir; 0 means uncapped)")
+	pinWorkers := flag.Bool("pin-workers", false,
+		"lock each shard worker to an OS thread; off by default, the locked-M park/unpark handoff costs more than thread residency buys (labs/f3/m0/11_transport)")
 	pprofAddr := flag.String("pprof-addr", "",
 		"listen address for net/http/pprof, e.g. 127.0.0.1:6060; the endpoint has no auth, so keep it on loopback; empty leaves it off")
 	flag.Parse()
@@ -32,6 +34,7 @@ func main() {
 		ArenaBytes:       *arenaMiB << 20,
 		VlogDir:          *vlogDir,
 		ResidentCapBytes: uint64(*residentMiB) << 20,
+		PinWorkers:       *pinWorkers,
 		PprofAddr:        *pprofAddr,
 	})
 	if err != nil {
