@@ -56,9 +56,11 @@ func appendStat(text []byte, name string, v uint64) []byte {
 
 // renderStats formats the summed counters as the INFO bulk reply. The Memory
 // section leads with the fields a Redis INFO parser looks for: used_memory is
-// the shards' accounted live bytes (store.MemLedger.UsedMemory: index tables
-// plus arena live charges; no dead bytes, no allocator slack, no Go runtime,
-// no value-log bytes, which are disk), so it is an honest account, not RSS.
+// the shards' allocator-held bytes (store.MemLedger.UsedMemory: index tables
+// plus the arena's touched-segment fill, dead-but-uncompacted bytes included,
+// the figure comparable to redis's allocator-held used_memory; no Go runtime
+// slack, no value-log bytes, which are disk), so it is an honest account, not
+// RSS.
 // used_memory_rss is the kernel's resident figure where the platform exposes
 // it, and the two are expected to differ. The f3 section keeps the per-band
 // census and log accounting the LTM harness reads.
