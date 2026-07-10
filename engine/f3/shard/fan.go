@@ -258,7 +258,7 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 			}
 		}
 	case FanStats:
-		fc.out = renderStats(fc.out, fc.stats)
+		fc.out = c.rt.renderStats(fc.out, fc.stats)
 	}
 	return c.deliver(seq, fc.out, emit)
 }
