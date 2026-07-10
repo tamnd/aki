@@ -5,6 +5,7 @@ package drivers
 import (
 	"encoding/binary"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -80,17 +81,29 @@ type reactorBackend struct {
 	once  sync.Once
 }
 
+// defaultNetLoops is the frozen lab 19 answer to doc 08 section 4.2's
+// loop-count contradiction: neither M = shards nor M = cores minus shards.
+// The knee on the gate box's 8-cpu server mask sits at 3 loops for shard
+// counts 3, 4, and 5 alike (GET 64B P16/512: 2.05/6.14/6.65/6.65/4.70/3.47
+// Mops at loops 1/2/3/4/6/8, with SET and p99 breaking the 3-vs-4 tie
+// toward 3), so the loop count follows the core budget alone: the 2/5
+// network share of the doc 03 section 2.2 split, the complement of
+// shard.DefaultShards' 3/5.
+func defaultNetLoops() int {
+	n := runtime.GOMAXPROCS(0) * 2 / 5
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 // newReactorBackend builds the loops or reports why it cannot; the caller
-// logs the fallback. Loop count is NetLoops, defaulting to the shard count
-// (the section 4.2 loop-count question is settled by the slice 6 lab, not
-// here).
+// logs the fallback. Loop count is NetLoops, defaulting to defaultNetLoops
+// (lab 19's frozen verdict).
 func newReactorBackend(s *Server, o Options) (netBackend, error) {
 	n := o.NetLoops
 	if n < 1 {
-		n = o.Shards
-	}
-	if n < 1 {
-		n = 1
+		n = defaultNetLoops()
 	}
 	b := &reactorBackend{s: s}
 	for i := 0; i < n; i++ {
