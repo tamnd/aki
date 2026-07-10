@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"net"
 	"os"
+	"runtime"
 	"testing"
 )
 
@@ -13,9 +14,25 @@ import (
 // default.
 func testConnShape() string { return os.Getenv("AKI_CONN_SHAPE") }
 
+// testNetDriver is the same suite-wide override for the network driver:
+// AKI_NET=reactor reruns every driver test on the epoll reactor, which is how
+// the ubuntu CI leg covers it without doubling the test code. Empty means the
+// goroutine default.
+func testNetDriver() string { return os.Getenv("AKI_NET") }
+
+// wantNetDriver is the driver a server built with testNetDriver should
+// report: the reactor where it exists, the logged goroutine fallback
+// everywhere else.
+func wantNetDriver() string {
+	if testNetDriver() == NetReactor && runtime.GOOS == "linux" {
+		return NetReactor
+	}
+	return NetGoroutine
+}
+
 func startServer(t *testing.T) (*Server, net.Conn, *bufio.Reader) {
 	t.Helper()
-	srv, err := Listen(Options{Addr: "127.0.0.1:0", Shards: 2, ArenaBytes: 4 << 20, SegBytes: 1 << 18, ConnShape: testConnShape()})
+	srv, err := Listen(Options{Addr: "127.0.0.1:0", Shards: 2, ArenaBytes: 4 << 20, SegBytes: 1 << 18, ConnShape: testConnShape(), NetDriver: testNetDriver()})
 	if err != nil {
 		t.Fatal(err)
 	}
