@@ -114,22 +114,44 @@ func (st *stream) pump() bool {
 // crlf is the bulk trailer the consumer emits after the last chunk.
 var crlf = []byte("\r\n")
 
-// emitStream runs the consumer side to completion: the bulk header, every
-// chunk in order, the trailer. It blocks (spinning with yields) while the
-// ring is empty, because RESP replies are ordered and nothing after this
-// reply may be emitted early. It reports false when the stream failed; the
-// header was already sent by then, so the connection is unrecoverable and the
-// caller must tear it down. Writer side only.
-func (c *Conn) emitStream(st *stream, emit func([]byte)) bool {
+// header appends the stream's bulk header through emit. Writer side only, and
+// exactly once per stream: the header commits the wire to st.total bytes.
+func (st *stream) header(emit func([]byte)) {
 	var hdr [32]byte
 	h := append(hdr[:0], '$')
 	h = strconv.AppendInt(h, st.total, 10)
 	h = append(h, '\r', '\n')
 	emit(h)
+}
+
+// consumeOne emits the ring's next ready chunk and reports its length; ok is
+// false when the ring holds nothing right now. Writer side only.
+func (st *stream) consumeOne(emit func([]byte)) (n int64, ok bool) {
+	k := st.cons.Load()
+	if st.prod.Load() == k {
+		return 0, false
+	}
+	slot := k % streamWindow
+	ln := st.lens[slot]
+	emit(st.bufs[slot][:ln])
+	st.cons.Store(k + 1)
+	return int64(ln), true
+}
+
+// emitStream runs the consumer side to completion: the bulk header, every
+// chunk in order, the trailer. It blocks (spinning with yields) while the
+// ring is empty, because RESP replies are ordered and nothing after this
+// reply may be emitted early. It reports false when the stream failed; the
+// header was already sent by then, so the connection is unrecoverable and the
+// caller must tear it down. Writer side only; this is the goroutine driver's
+// shape, where blocking parks a per-connection goroutine and convoys nothing.
+// A consumer that must not block steps instead (SetStreamStep, StreamStep).
+func (c *Conn) emitStream(st *stream, emit func([]byte)) bool {
+	st.header(emit)
 	var sent int64
 	for sent < st.total {
-		k := st.cons.Load()
-		if st.prod.Load() == k {
+		n, ok := st.consumeOne(emit)
+		if !ok {
 			if st.failed.Load() {
 				c.failed = true
 				return false
@@ -137,11 +159,7 @@ func (c *Conn) emitStream(st *stream, emit func([]byte)) bool {
 			runtime.Gosched()
 			continue
 		}
-		slot := k % streamWindow
-		n := st.lens[slot]
-		emit(st.bufs[slot][:n])
-		sent += int64(n)
-		st.cons.Store(k + 1)
+		sent += n
 	}
 	emit(crlf)
 	return true

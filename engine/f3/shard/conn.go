@@ -95,6 +95,16 @@ type Conn struct {
 	batchMark func() bool
 	batchLoop LoopWaker
 
+	// The step-mode stream cursor (SetStreamStep): cur is the streamed reply
+	// mid-emit, whose bulk header is already on the wire and whose sequence
+	// still holds the reorder cursor; curSent is its body progress. A
+	// non-blocking consumer (the reactor loop) adopts a due stream here
+	// instead of blocking in emitStream, and advances it with StreamStep at
+	// its own pace. Writer side only.
+	stepStream bool
+	cur        *stream
+	curSent    int64
+
 	// inlineEmit, when set, declares the connection single-goroutine driven:
 	// the same goroutine runs the reader and writer sides, so the pipeline
 	// throttle in Do cannot yield to a writer goroutine that does not exist
@@ -169,21 +179,109 @@ func (c *Conn) CanEnqueue() bool {
 
 // ParkWriter arms the writer-side wake for a notifier-driven consumer and
 // reports whether it parked clean: it stores parked, then re-checks the
-// outbound queue, the same publish-then-check shape as idleOnce, so an owner
-// push landing between the drain and the park cannot be lost (either this
-// re-check sees the work, or the owner's state load sees parked and delivers
-// the notify). A false return means work is already queued, or the connection
-// is closed, and the caller must service it again instead of sleeping. It
+// outbound queue and the in-progress stream, the same publish-then-check
+// shape as idleOnce, so an owner push or a pump's chunk publish landing
+// between the drain and the park cannot be lost (either this re-check sees
+// the work, or the producer's state load sees parked and delivers the
+// notify). A false return means work is already queued, a stream can make
+// progress, or the connection is closed, and the caller must service it
+// again instead of sleeping. It
 // must be the last touch on the connection before the consumer blocks in its
 // own wait (epoll_wait for the loop). Writer side only.
 func (c *Conn) ParkWriter() bool {
 	c.wk.state.Store(stateParked)
-	if c.out.ready() || c.closed.Load() {
+	if c.out.ready() || c.closed.Load() || c.StreamReady() {
 		c.wk.unparkSelf()
 		return false
 	}
 	c.parks.bump()
 	return true
+}
+
+// SetStreamStep declares the writer side a non-blocking consumer: a streamed
+// reply whose turn comes in the reorder order is adopted as an in-progress
+// cursor (its header emitted, its sequence holding the reorder cursor)
+// instead of being drained to completion inside DrainReplies, and the caller
+// advances it with StreamStep as its socket and buffers allow. It exists for
+// the reactor loop, which owns every connection on its fd shard and must
+// never block on one of them (doc 08 sections 3.3 and 9.1: a streaming reply
+// on the loop yields between chunks or it convoys the shard). Call before any
+// traffic on the connection.
+func (c *Conn) SetStreamStep() { c.stepStream = true }
+
+// StreamReady reports whether the in-progress streamed reply can make
+// progress right now: chunks sit ready in its ring, the body is complete and
+// only the trailer (and any parked successors) remains, or it has failed and
+// the failure is waiting to be observed. ParkWriter re-checks it, so a
+// producer's chunk publish landing against a parking consumer is never lost
+// (the pump's publish-then-wake pairs with the park's store-then-re-check,
+// the waker proof shape). Writer side only.
+func (c *Conn) StreamReady() bool {
+	st := c.cur
+	if st == nil {
+		return false
+	}
+	return st.prod.Load() != st.cons.Load() || st.failed.Load() || c.curSent == st.total
+}
+
+// StreamAborted reports whether the in-progress streamed reply has failed
+// (source error, client gone, shard shutdown). The header is already on the
+// wire, so the connection is unrecoverable and the transport must drop it,
+// mid-cycle, without waiting for write-side room to observe the failure
+// through StreamStep. Writer side only.
+func (c *Conn) StreamAborted() bool {
+	st := c.cur
+	return st != nil && st.failed.Load()
+}
+
+// StreamStep advances the in-progress streamed reply (step mode): it emits
+// ready chunks until the ring runs dry, roughly budget bytes have gone out,
+// or the stream completes. On completion it emits the trailer, advances the
+// reorder cursor, and drains parked successors, which may adopt the next
+// parked stream as the new cursor and continue under the same budget. A dry
+// ring returns without spinning; the producer's pump delivers the writer wake
+// that resumes the step. A failed stream flips Failed and clears the cursor;
+// the caller tears the connection down. Writer side only.
+func (c *Conn) StreamStep(emit func([]byte), budget int) {
+	advanced := false
+	for st := c.cur; st != nil; st = c.cur {
+		if st.failed.Load() {
+			c.failed = true
+			c.cur = nil
+			break
+		}
+		if c.curSent == st.total {
+			emit(crlf)
+			c.cur = nil
+			c.next++
+			c.drainParked(emit)
+			advanced = true
+			continue
+		}
+		if budget <= 0 {
+			break
+		}
+		n, ok := st.consumeOne(emit)
+		if !ok {
+			break
+		}
+		c.curSent += n
+		budget -= int(n)
+	}
+	if advanced {
+		c.emitted.Store(c.next)
+	}
+}
+
+// beginStream adopts st as the connection's in-progress streamed reply (step
+// mode): the bulk header goes out now, the chunks follow through StreamStep.
+// The reorder cursor stays on the stream's sequence until the last chunk and
+// the trailer have been emitted, so everything behind it in the pipeline
+// parks in the ring, bounded by the reader-side window. Writer side only.
+func (c *Conn) beginStream(st *stream, emit func([]byte)) {
+	st.header(emit)
+	c.cur = st
+	c.curSent = 0
 }
 
 // SetInlineDrain declares this connection single-goroutine driven and gives
@@ -400,7 +498,8 @@ func (c *Conn) deliver(seq uint32, rep []byte, emit func([]byte)) int {
 // deliverStream reorders one streamed reply under the same rule: serve it now
 // when it is the next sequence, park its handle otherwise. Serving blocks
 // until the stream completes, because everything behind it in the pipeline
-// must wait anyway.
+// must wait anyway; a step-mode connection adopts it as the in-progress
+// cursor instead and never blocks here.
 func (c *Conn) deliverStream(seq uint32, st *stream, emit func([]byte)) int {
 	if seq != c.next {
 		s := &c.ring[seq%uint32(len(c.ring))]
@@ -410,13 +509,19 @@ func (c *Conn) deliverStream(seq uint32, st *stream, emit func([]byte)) int {
 		s.buf = s.buf[:0]
 		return 0
 	}
+	if c.stepStream {
+		c.beginStream(st, emit)
+		return 0
+	}
 	c.emitStream(st, emit)
 	c.next++
 	return 1 + c.drainParked(emit)
 }
 
 // drainParked emits the contiguous parked run starting at c.next, bytes and
-// streams alike.
+// streams alike. A parked stream stops the run on a step-mode connection: it
+// becomes the in-progress cursor without advancing the reorder cursor, and
+// the run resumes through StreamStep once its bytes are out.
 func (c *Conn) drainParked(emit func([]byte)) int {
 	n := 0
 	for {
@@ -428,6 +533,10 @@ func (c *Conn) drainParked(emit func([]byte)) int {
 			st := s.st
 			s.st = nil
 			s.live = false
+			if c.stepStream {
+				c.beginStream(st, emit)
+				return n
+			}
 			c.emitStream(st, emit)
 		} else {
 			emit(s.buf)
