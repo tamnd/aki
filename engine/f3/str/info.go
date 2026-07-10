@@ -34,6 +34,10 @@ func InfoShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	put(shard.StatIndexBytes, m.IndexBytes)
 	put(shard.StatArenaLive, m.ArenaLiveBytes)
 	put(shard.StatChunkedBytes, m.ChunkedBytes)
+	rs := st.Resid()
+	put(shard.StatVlogReads, rs.LogReads)
+	put(shard.StatPromotes, rs.Promotes)
+	put(shard.StatDemotes, rs.Demotes)
 	r.Raw(b[:])
 }
 
