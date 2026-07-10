@@ -2,6 +2,7 @@ package shard
 
 import (
 	"runtime"
+	"sync/atomic"
 	"time"
 )
 
@@ -81,6 +82,44 @@ const (
 	// rewrite cost amortizes against at least its own size in reclaimed space.
 	compactMinDead = 1 << 20
 )
+
+// spinIters is spinWindow expressed as iterations of the idle re-check loop,
+// calibrated once at package init so the spin does not pay a time.Now per
+// turn (the M0 gate profile put that at about 1.4 percent of CPU). The probe
+// times a loop of the same shape as the real check, three atomic loads, and
+// scales the count to spinWindow. The window only has to be roughly right:
+// the lab 3 sweep showed the regime, not the microsecond, is what matters,
+// so a calibration run on a busy machine that lands somewhere near 4us is
+// fine, and the clamp keeps a bad clock reading from producing a windowless
+// or unbounded spin.
+var spinIters = calibrateSpinIters()
+
+func calibrateSpinIters() int {
+	var a, b, c atomic.Uint32
+	const probe = 1 << 15
+	s := uint32(0)
+	start := time.Now()
+	for i := 0; i < probe; i++ {
+		s += a.Load() + b.Load() + c.Load()
+	}
+	el := time.Since(start)
+	if s != 0 {
+		// Never taken (the atomics stay zero), but consuming s keeps the
+		// probe loop observable so it cannot fold away.
+		return 1 << 12
+	}
+	if el <= 0 {
+		return 1 << 12
+	}
+	it := int(int64(probe) * int64(spinWindow) / int64(el))
+	if it < 1<<8 {
+		it = 1 << 8
+	}
+	if it > 1<<20 {
+		it = 1 << 20
+	}
+	return it
+}
 
 // DefaultShards is the shard count when the flag is unset: the data plane gets
 // about 60 percent of the cores and the net goroutines take the remainder,
