@@ -15,11 +15,12 @@ import (
 // partial is one length-prefixed entry per key, in sub-command order. A
 // chunked value is materialized whole into the partial here; MGET does not
 // stream in M0, only GET does, and the copy is bounded by the value cap.
+// Each read is a view under the store.GetView lifetime rule, consumed by
+// AppendFanValue's copy before the next read reuses the store scratch.
 func MGetShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	part := cx.Aux[:0]
 	for _, key := range args[:len(args)-1] {
-		v, ok := cx.St.GetString(key, cx.NowMs, cx.Val)
-		cx.Val = v
+		v, ok := cx.St.GetView(key, cx.NowMs)
 		part = shard.AppendFanValue(part, v, ok)
 	}
 	cx.Aux = part

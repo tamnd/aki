@@ -259,7 +259,9 @@ func getRangeBytes(v []byte, start, end int64) []byte {
 }
 
 // GetRange answers GETRANGE key start end (and its alias SUBSTR): the clamped
-// substring, an empty bulk when the range misses or the key is absent.
+// substring, an empty bulk when the range misses or the key is absent. The
+// read is a view under the store.GetView lifetime rule; the clamp only
+// reslices it and Bulk copies it into the reply arena straight away.
 func GetRange(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	start, ok := store.ParseInt(args[1])
 	if !ok {
@@ -271,7 +273,6 @@ func GetRange(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err("ERR value is not an integer or out of range")
 		return
 	}
-	v, _ := cx.St.GetString(args[0], cx.NowMs, cx.Val)
-	cx.Val = v
+	v, _ := cx.St.GetView(args[0], cx.NowMs)
 	r.Bulk(getRangeBytes(v, start, end))
 }
