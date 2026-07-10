@@ -1,7 +1,6 @@
 package store
 
 import (
-	"encoding/binary"
 	"errors"
 )
 
@@ -51,58 +50,16 @@ func (s *Store) ArenaBytes() (used, total uint64) {
 }
 
 // Get copies the value for key into dst (reusing its capacity) and reports
-// whether the key is present. The read is two plain loads deep: the entry
-// word, then the record bytes. No version bracket, no retry.
+// whether the key is present. Clockless form of GetString: it never reaps, so
+// it is for callers with no expiry semantics.
 func (s *Store) Get(key, dst []byte) ([]byte, bool) {
-	h := Hash(key)
-	_, addr, _ := s.findEntry(h, key)
-	if addr == 0 {
-		return dst[:0], false
-	}
-	vs := s.valueStart(addr)
-	return append(dst[:0], s.arena.buf[vs:vs+s.vlen(addr)]...), true
+	return s.GetString(key, 0, dst)
 }
 
-// Set stores val under key, blind-upsert semantics. An existing record with
-// reserved room for val is rewritten in place; otherwise a fresh record is
-// appended and the entry repointed with one plain store, and the old record's
-// bytes are charged back to its segment.
+// Set stores val under key, blind-upsert semantics, no deadline. Clockless
+// form of SetString.
 func (s *Store) Set(key, val []byte) error {
-	if len(key) == 0 {
-		return errEmptyKey
-	}
-	if len(key) > maxKey || len(val) > maxVal {
-		return ErrTooBig
-	}
-	h := Hash(key)
-	slot, addr, _ := s.findEntry(h, key)
-	if addr != 0 && uint64(len(val)) <= s.vcapBytes(addr) {
-		s.inPlace(addr, val)
-		return nil
-	}
-	off, ok := s.arena.allocRecord(recSize(len(key), len(val)))
-	if !ok {
-		return ErrFull
-	}
-	s.initRecord(off, key, val, kindString, 0)
-	word := tagOf(h)<<tagShift | off
-	if addr != 0 {
-		*slot = word
-		s.arena.unlink(addr, s.recBytes(addr))
-		return nil
-	}
-	s.insertEntry(h, word)
-	s.count++
-	return nil
-}
-
-// inPlace rewrites a record's value bytes and length with plain stores. The
-// owner is the only reader, so there is nothing to bracket: the next read on
-// this goroutine sees the new bytes by program order.
-func (s *Store) inPlace(off uint64, val []byte) {
-	vs := s.valueStart(off)
-	copy(s.arena.buf[vs:vs+uint64(len(val))], val)
-	binary.LittleEndian.PutUint32(s.arena.buf[off+offVlen:], uint32(len(val)))
+	return s.SetString(key, val, 0, 0, false)
 }
 
 // Delete removes key and reports whether it was present. The entry word is
@@ -110,15 +67,7 @@ func (s *Store) inPlace(off uint64, val []byte) {
 // bytes stay valid until their segment is freed, and their charge leaves the
 // segment's live counter now so a fully dead segment reads as drained.
 func (s *Store) Delete(key []byte) bool {
-	h := Hash(key)
-	slot, addr, inOverflow := s.findEntry(h, key)
-	if addr == 0 {
-		return false
-	}
-	s.deleteAt(h, slot, inOverflow)
-	s.arena.unlink(addr, s.recBytes(addr))
-	s.count--
-	return true
+	return s.Del(key, 0)
 }
 
 // Reset drops every key and rewinds the arena, the flush path. Quiesced by
