@@ -296,3 +296,40 @@ func (s *Store) demoteBucket(b *bucket, scanned *uint64) uint64 {
 	}
 	return freed
 }
+
+// spillCold reports whether an overwrite of a log-resident separated value
+// should place its new bytes straight into the log. The residency policy's
+// heat signal is reads (the doorkeeper); a write carries no read evidence, so
+// once the live charge sits past the demotion low-water mark the
+// arena-admit-then-demote round trip is pure churn: lab 17 measured it at
+// 0.83 demotions per uniform SET, with the boundary demotion pwrites and the
+// full-index compaction walks they trigger eating over 80% of the cell's CPU.
+// Below the mark the arena has genuine headroom and the value comes back
+// resident, the same recovery a promotion would buy. The gate is the
+// low-water mark, not the cap, so the slack band stays what MaybeDemote's
+// comment says it is: headroom for read-heat promotions, not for cold
+// overwrite traffic.
+func (s *Store) spillCold(n uint64) bool {
+	if s.vlog == nil || s.residentCap == 0 || !s.spillLogDirect {
+		return false
+	}
+	low := s.residentCap - s.residentCap/residSlackDen
+	return s.arena.live()+n > low
+}
+
+// TuneSpillPlacement overrides the cold-overwrite placement policy. Labs and
+// tests only: false restores the pre-slice arena-admit-then-demote behavior
+// lab 17 prices the shipped log-direct placement against.
+func (s *Store) TuneSpillPlacement(logDirect bool) {
+	s.spillLogDirect = logDirect
+}
+
+// TuneVlogFlush overrides the value log's pending-buffer flush threshold.
+// Labs and tests only: 1 flushes every append, the pre-batching posture; the
+// shipped value is vlogFlushBytes.
+func (s *Store) TuneVlogFlush(n int) {
+	if s.vlog == nil || n <= 0 {
+		return
+	}
+	s.vlog.flushAt = n
+}

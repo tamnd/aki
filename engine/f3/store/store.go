@@ -46,6 +46,13 @@ type Store struct {
 	demotes    uint64
 	logReads   uint64
 
+	// spillLogDirect is the cold-overwrite placement policy (resid.go's
+	// spillCold): with the live charge past the demotion low-water mark, an
+	// overwrite of a log-resident separated value appends straight to the log
+	// instead of round-tripping through the arena and the demotion hand.
+	// Shipped on; TuneSpillPlacement overrides it for the lab 17 sweep.
+	spillLogDirect bool
+
 	// Band census and log-run count, plain single-owner counters.
 	bands   [4]uint64
 	logRuns uint64
@@ -122,6 +129,7 @@ func Open(o Options) (*Store, error) {
 		s.vlog = l
 		s.residentCap = o.ResidentCapBytes
 		s.ltmOn = s.residentCap > 0
+		s.spillLogDirect = true
 		s.dkDen = residDoorkeeperDen
 		s.dkRng = 0x9e3779b97f4a7c15
 	}
