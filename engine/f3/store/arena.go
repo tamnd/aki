@@ -32,7 +32,11 @@ type aseg struct {
 }
 
 type arena struct {
-	buf      []byte
+	buf []byte
+	// mapped records whether buf is an anonymous mapping outside the Go heap
+	// (arena_map_unix.go) rather than the heap fallback; only a mapped buffer
+	// may be unmapped when the store goes away.
+	mapped   bool
 	segSize  uint64
 	segStart uint64
 	segs     []aseg
@@ -65,8 +69,10 @@ func newArena(arenaBytes, segBytes int) arena {
 		segs[i].base = segStart + uint64(i)*segSize
 		segs[i].alloc = segs[i].base
 	}
+	buf, mapped := arenaMap(arenaBytes)
 	return arena{
-		buf:       make([]byte, arenaBytes),
+		buf:       buf,
+		mapped:    mapped,
 		segSize:   segSize,
 		segStart:  segStart,
 		segs:      segs,
