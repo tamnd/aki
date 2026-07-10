@@ -2,7 +2,6 @@ package shard
 
 import (
 	"encoding/binary"
-	"runtime"
 
 	"github.com/tamnd/aki/f3srv/resp"
 )
@@ -77,9 +76,10 @@ func (c *Conn) DoFan(op byte, kind FanKind, keys, vals [][]byte) error {
 			return ErrTooBig
 		}
 	}
-	for c.seq-c.emitted.Load() >= uint32(len(c.ring)) {
-		c.Flush()
-		runtime.Gosched()
+	if c.seq-c.emitted.Load() >= uint32(len(c.ring)) {
+		if err := c.throttle(); err != nil {
+			return err
+		}
 	}
 
 	shards := len(c.rt.workers)
@@ -158,9 +158,10 @@ func (c *Conn) DoFan(op byte, kind FanKind, keys, vals [][]byte) error {
 // stats surface rides: every shard answers a partial and the gather renders
 // one reply.
 func (c *Conn) DoFanAll(op byte, kind FanKind) error {
-	for c.seq-c.emitted.Load() >= uint32(len(c.ring)) {
-		c.Flush()
-		runtime.Gosched()
+	if c.seq-c.emitted.Load() >= uint32(len(c.ring)) {
+		if err := c.throttle(); err != nil {
+			return err
+		}
 	}
 	// The countdown is final before the first enqueue; see DoFan.
 	fc := &fanCmd{kind: kind, pending: int32(len(c.rt.workers))}
