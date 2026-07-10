@@ -62,6 +62,12 @@ type hopBatch struct {
 	// hasFan flag keeps reset free on the point-op path.
 	fans   []*fanCmd
 	hasFan bool
+
+	// streams marks which commands answered with a streamed reply: a non-nil
+	// entry is the stream the writer serves in that command's pipeline slot.
+	// Same lazy-slice-plus-flag shape as fans.
+	streams   []*stream
+	hasStream bool
 }
 
 func newBatch() *hopBatch {
@@ -80,6 +86,12 @@ func (b *hopBatch) reset() {
 			b.fans[i] = nil
 		}
 		b.hasFan = false
+	}
+	if b.hasStream {
+		for i := range b.streams {
+			b.streams[i] = nil
+		}
+		b.hasStream = false
 	}
 	b.n = 0
 	b.sn = 0
@@ -110,6 +122,23 @@ func (b *hopBatch) fan(i int) *fanCmd {
 		return nil
 	}
 	return b.fans[i]
+}
+
+// setStream marks command i as answered by a streamed reply.
+func (b *hopBatch) setStream(i int, st *stream) {
+	if b.streams == nil {
+		b.streams = make([]*stream, batchCap)
+	}
+	b.streams[i] = st
+	b.hasStream = true
+}
+
+// stream returns command i's streamed reply, or nil for an inline one.
+func (b *hopBatch) stream(i int) *stream {
+	if !b.hasStream {
+		return nil
+	}
+	return b.streams[i]
 }
 
 // add appends one command, copying its arguments into the node's data buffer.

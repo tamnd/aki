@@ -108,15 +108,18 @@ func (s *Store) writeRun(a, b []byte, capB uint64) (word uint64, vcap uint32, er
 		}
 		s.vlog.tail += uint64(len(b))
 	}
-	s.logVals++
+	s.logRuns++
 	return inLogBit | off, uint32(n), nil
 }
 
 // dropRun releases one value run: a log run's bytes become dead space the
-// compactor reclaims, an arena run's bytes charge back to their segment.
+// compactor reclaims, an arena run's bytes charge back to their segment. The
+// log-run counter moves here, mirror to writeRun, so the pair balances at
+// every placement and release site.
 func (s *Store) dropRun(word uint64, vlen, vcap uint32) {
 	if word&inLogBit != 0 {
 		s.vlog.dead += uint64(vlen)
+		s.logRuns--
 		return
 	}
 	s.arena.unlink(word&runAddrMask, uint64(vcap))
@@ -124,18 +127,18 @@ func (s *Store) dropRun(word uint64, vlen, vcap uint32) {
 
 // dropValue releases whatever the record's value area points at outside the
 // record itself. Embedded and int bands own no outside bytes; a separated
-// record owns one run.
+// record owns one run; a chunked record owns a directory and its chunks.
 func (s *Store) dropValue(addr uint64) {
 	f := s.recFlags(addr)
+	if f&flagChunked != 0 {
+		s.dropChunks(addr)
+		return
+	}
 	if f&flagSep == 0 {
 		return
 	}
-	vs := s.valueStart(addr)
-	word, vlen, vcap := s.readPtr(vs)
+	word, vlen, vcap := s.readPtr(s.valueStart(addr))
 	s.dropRun(word, vlen, vcap)
-	if word&inLogBit != 0 {
-		s.logVals--
-	}
 }
 
 // dropRecord is the one exit for a record leaving the index: band accounting,
@@ -146,7 +149,7 @@ func (s *Store) dropRecord(addr uint64) {
 	s.arena.unlink(addr, s.recBytes(addr))
 }
 
-// BandStats is the per-band live-record census plus the log-resident value
+// BandStats is the per-band live-record census plus the log-resident run
 // count, the evidence surface the LTM harness reads through INFO.
 type BandStats struct {
 	Int       uint64
@@ -154,9 +157,10 @@ type BandStats struct {
 	Separated uint64
 	Chunked   uint64
 
-	// LogValues counts live values whose bytes (any part) sit in the value
-	// log rather than the arena.
-	LogValues uint64
+	// LogRuns counts live value runs (a separated value's one run, a chunked
+	// value's chunks each) whose bytes sit in the value log rather than the
+	// arena.
+	LogRuns uint64
 }
 
 func bandIdx(f byte) int {
@@ -183,13 +187,13 @@ func (s *Store) noteFlip(oldF, newF byte) {
 	}
 }
 
-// Stats reports the band census and log-value count.
+// Stats reports the band census and log-run count.
 func (s *Store) Stats() BandStats {
 	return BandStats{
 		Int:       s.bands[0],
 		Embedded:  s.bands[1],
 		Separated: s.bands[2],
 		Chunked:   s.bands[3],
-		LogValues: s.logVals,
+		LogRuns:   s.logRuns,
 	}
 }

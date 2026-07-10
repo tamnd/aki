@@ -73,6 +73,16 @@ func (l *vlog) readInto(off uint64, n int, dst []byte) ([]byte, error) {
 	return dst, nil
 }
 
+// readFill preads exactly len(b) bytes at off into b, under the same
+// immutability and advise-away rules as readInto.
+func (l *vlog) readFill(off uint64, b []byte) error {
+	if _, err := l.f.ReadAt(b, int64(off)); err != nil {
+		return err
+	}
+	l.adviseDontNeed(off, len(b))
+	return nil
+}
+
 func (l *vlog) close() error {
 	if l.f == nil {
 		return nil

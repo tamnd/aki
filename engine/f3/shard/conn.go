@@ -14,11 +14,15 @@ var ErrTooBig = errors.New("shard: command exceeds the batch node caps")
 
 // parked is one out-of-order reply held in the reorder ring until every lower
 // sequence has been emitted. The buffer is owned by the slot and reused, so
-// parking costs a copy but no allocation once the slot has been warm.
+// parking costs a copy but no allocation once the slot has been warm. A
+// streamed reply parks as its stream handle instead of bytes: the chunks stay
+// in the stream's ring (where the worker keeps pumping into the bounded
+// window) until the sequence comes due.
 type parked struct {
 	seq  uint32
 	live bool
 	buf  []byte
+	st   *stream
 }
 
 // Conn is one client connection's two halves of the hop transport.
@@ -52,7 +56,17 @@ type Conn struct {
 	ring    []parked
 	emitted atomic.Uint32 // writer's progress, read by the reader's throttle
 	closed  atomic.Bool
+
+	// failed flips when a streamed reply dies mid-emit: the bulk header is
+	// already on the wire, so nothing coherent can follow and the transport
+	// must drop the connection. Writer side only, plain field.
+	failed bool
 }
+
+// Failed reports whether a streamed reply died mid-emit, leaving the wire in
+// an unrecoverable state. The transport checks it after each drain and tears
+// the connection down when set. Writer side only.
+func (c *Conn) Failed() bool { return c.failed }
 
 // NewConn builds a connection against the runtime.
 func (r *Runtime) NewConn() *Conn {
@@ -163,6 +177,10 @@ func (c *Conn) DrainReplies(emit func([]byte)) int {
 				n += c.mergeFan(fc, b.cmds[i].seq, b, i, emit)
 				continue
 			}
+			if st := b.stream(i); st != nil {
+				n += c.deliverStream(b.cmds[i].seq, st, emit)
+				continue
+			}
 			n += c.deliver(b.cmds[i].seq, b.reply(i), emit)
 		}
 		c.recycle(b)
@@ -176,19 +194,51 @@ func (c *Conn) deliver(seq uint32, rep []byte, emit func([]byte)) int {
 		s := &c.ring[seq%uint32(len(c.ring))]
 		s.seq = seq
 		s.live = true
+		s.st = nil
 		s.buf = append(s.buf[:0], rep...)
 		return 0
 	}
 	emit(rep)
 	c.next++
-	n := 1
+	return 1 + c.drainParked(emit)
+}
+
+// deliverStream reorders one streamed reply under the same rule: serve it now
+// when it is the next sequence, park its handle otherwise. Serving blocks
+// until the stream completes, because everything behind it in the pipeline
+// must wait anyway.
+func (c *Conn) deliverStream(seq uint32, st *stream, emit func([]byte)) int {
+	if seq != c.next {
+		s := &c.ring[seq%uint32(len(c.ring))]
+		s.seq = seq
+		s.live = true
+		s.st = st
+		s.buf = s.buf[:0]
+		return 0
+	}
+	c.emitStream(st, emit)
+	c.next++
+	return 1 + c.drainParked(emit)
+}
+
+// drainParked emits the contiguous parked run starting at c.next, bytes and
+// streams alike.
+func (c *Conn) drainParked(emit func([]byte)) int {
+	n := 0
 	for {
 		s := &c.ring[c.next%uint32(len(c.ring))]
 		if !s.live || s.seq != c.next {
 			return n
 		}
-		emit(s.buf)
-		s.live = false
+		if s.st != nil {
+			st := s.st
+			s.st = nil
+			s.live = false
+			c.emitStream(st, emit)
+		} else {
+			emit(s.buf)
+			s.live = false
+		}
 		c.next++
 		n++
 	}
