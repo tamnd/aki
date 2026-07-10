@@ -20,7 +20,7 @@ before:
 builds:
   - id: aki
     binary: aki
-    main: ./cmd/aki
+    main: ./cmd/f1srv
     env:
       - CGO_ENABLED=0
     flags:
