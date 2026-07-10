@@ -53,6 +53,14 @@ jobs:
         env:
           AKI_NET: reactor
         run: go test -race -count=1 ./f3srv/... ./engine/f3/...
+      # Same rerun on the io_uring driver. Where the runner's kernel or
+      # sandbox denies io_uring the suite still runs, on the logged goroutine
+      # fallback, and wantNetDriver keeps the driver assertions honest.
+      - name: test with the uring net driver
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          AKI_NET: uring
+        run: go test -race -count=1 ./f3srv/... ./engine/f3/...
       - name: coverage summary
         if: matrix.os == 'ubuntu-latest'
         run: go tool cover -func=coverage.out | tail -1
