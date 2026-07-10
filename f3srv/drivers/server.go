@@ -25,6 +25,15 @@ const (
 	// stays put until the buffer fills, so a large half-arrived bulk is not
 	// re-copied on every read.
 	compactMax = 512
+
+	// replyBufSize is the writer goroutine's socket buffer. The sizing rule is
+	// pipeline depth times typical reply size: the buffer must hold one full
+	// round of replies so a pipelined burst amortizes into about one write()
+	// per drained boundary instead of one per buffer-full mid-drain flush. At
+	// the gate shape (P16, separated-band values to 4KiB) that is 16 x 4KiB =
+	// 64KiB; the labs/f3/m0/08_reply_buffer sweep froze it there. Cost: 64KiB
+	// of writer buffer per connection, 32MiB at the 512-connection point.
+	replyBufSize = 64 << 10
 )
 
 // Options configures a server.
@@ -45,16 +54,20 @@ type Options struct {
 	// set; past it, separated and chunked value bytes spill to the shard's
 	// log. 0 means uncapped.
 	ResidentCapBytes uint64
+	// ReplyBufBytes overrides the per-connection reply writer buffer;
+	// non-positive takes replyBufSize. The knob exists for the lab sweep.
+	ReplyBufBytes int
 }
 
 // Server is the goroutine-per-connection driver over the shard runtime: a
 // reader goroutine parses RESP2 and routes through the dispatch table, a
 // writer goroutine drains replies in request order onto the socket.
 type Server struct {
-	rt     *shard.Runtime
-	ln     net.Listener
-	closed atomic.Bool
-	conns  sync.WaitGroup
+	rt       *shard.Runtime
+	ln       net.Listener
+	replyBuf int
+	closed   atomic.Bool
+	conns    sync.WaitGroup
 }
 
 // Listen builds the runtime, registers the command table, starts the workers,
@@ -81,7 +94,10 @@ func Listen(o Options) (*Server, error) {
 		_ = ln.Close()
 		return nil, err
 	}
-	s := &Server{rt: rt, ln: ln}
+	if o.ReplyBufBytes <= 0 {
+		o.ReplyBufBytes = replyBufSize
+	}
+	s := &Server{rt: rt, ln: ln, replyBuf: o.ReplyBufBytes}
 	s.rt.Use(dispatch.Handlers())
 	s.rt.Start()
 	return s, nil
@@ -133,7 +149,7 @@ func (s *Server) handle(nc net.Conn) {
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
-		bw := bufio.NewWriter(nc)
+		bw := bufio.NewWriterSize(nc, s.replyBuf)
 		emit := func(rep []byte) { _, _ = bw.Write(rep) }
 		for c.Wait() {
 			c.DrainReplies(emit)
