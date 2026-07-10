@@ -29,9 +29,9 @@ func main() {
 	connShape := flag.String("conn-shape", drivers.ShapeSingle,
 		"per-connection goroutine shape: single (one goroutine reads, dispatches, drains, and flushes) or pair (the M0 reader/writer pair, kept for the labs/f3/m0/15_conn_single A/B)")
 	netDriver := flag.String("net", drivers.NetGoroutine,
-		"network driver: goroutine (the default, one shape-selected handler per connection) or reactor (raw epoll event loops, Linux only; elsewhere it logs a notice and serves on the goroutine driver)")
+		"network driver: goroutine (the default, one shape-selected handler per connection), reactor (raw epoll event loops, Linux only), or uring (io_uring event loops, Linux with a probed kernel); where an event-loop driver cannot run it logs a notice and serves on the goroutine driver")
 	netLoops := flag.Int("net-loops", 0,
-		"reactor event loops; 0 takes the 2/5 network share of the core split (labs/f3/m0/19_loop_count; only the reactor driver reads this)")
+		"event loops for the reactor and uring drivers; 0 takes the 2/5 network share of the core split (labs/f3/m0/19_loop_count; the goroutine driver ignores this)")
 	flag.Parse()
 
 	srv, err := drivers.Listen(drivers.Options{
