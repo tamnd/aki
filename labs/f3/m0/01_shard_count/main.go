@@ -133,6 +133,6 @@ func main() {
 			base = m
 		}
 		fmt.Printf("| %d | %.1f | %.2fx | %.2f |\n", n, m, m/base, m/float64(n))
-		os.Stdout.Sync()
+		_ = os.Stdout.Sync()
 	}
 }
