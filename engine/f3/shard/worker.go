@@ -280,14 +280,13 @@ func (w *worker) execute(b *hopBatch, i int) {
 // producer sees parked and sends the token.
 func (w *worker) idle() {
 	w.wk.state.Store(stateSpinning)
-	deadline := time.Now().Add(spinWindow)
-	for {
+	// The window is counted in calibrated iterations, not clock reads: a
+	// time.Now per turn was measurable CPU and the window only needs to be
+	// roughly spinWindow (see spinIters).
+	for i := 0; i < spinIters; i++ {
 		if w.inbound.ready() || w.stop.Load() {
 			w.wk.state.Store(stateRunning)
 			return
-		}
-		if !time.Now().Before(deadline) {
-			break
 		}
 	}
 	w.wk.state.Store(stateParked)

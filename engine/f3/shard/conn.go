@@ -4,7 +4,6 @@ import (
 	"errors"
 	"runtime"
 	"sync/atomic"
-	"time"
 )
 
 // ErrTooBig is returned by Do when one command cannot fit even an empty batch
@@ -274,8 +273,9 @@ func (c *Conn) Wait() bool {
 // protocol with the same lost-wake guard the worker's idle carries.
 func (c *Conn) idleOnce() {
 	c.wk.state.Store(stateSpinning)
-	deadline := time.Now().Add(spinWindow)
-	for time.Now().Before(deadline) {
+	// Calibrated iteration count instead of a time.Now per turn; see
+	// spinIters in tuning.go.
+	for i := 0; i < spinIters; i++ {
 		if c.out.ready() || c.closed.Load() {
 			c.wk.state.Store(stateRunning)
 			return
