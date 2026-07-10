@@ -251,11 +251,11 @@ func TestStreamClientGoneMidStream(t *testing.T) {
 // replies into the driver-side output buffer once the socket backs up, and
 // past OutBufLimitBytes the driver disconnects it, that connection only,
 // counting the event as net_disconnects_outbuf. The goroutine driver has no
-// equivalent backlog (its writer blocks on the socket), so the test is
-// reactor-only.
+// equivalent backlog (its writer blocks on the socket), so the test runs on
+// the event-loop drivers only.
 func TestSlowClientOutbufDrop(t *testing.T) {
-	if wantNetDriver() != NetReactor {
-		t.Skip("output-buffer cap is a reactor discipline; the goroutine writer blocks on the socket instead")
+	if !wantEventLoop() {
+		t.Skip("output-buffer cap is an event-loop discipline; the goroutine writer blocks on the socket instead")
 	}
 
 	srv, err := Listen(Options{Addr: "127.0.0.1:0", Shards: 2, ArenaBytes: 16 << 20, SegBytes: 1 << 20, NetLoops: 1, OutBufLimitBytes: 256 << 10, ConnShape: testConnShape(), NetDriver: testNetDriver()})
