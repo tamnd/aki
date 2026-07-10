@@ -43,6 +43,16 @@ const (
 	// driver with a logged notice. It becomes a default nowhere until it wins
 	// its regime A/B under the section 4.4 rule.
 	NetReactor = "reactor"
+
+	// NetURing is the io_uring event-loop driver (doc 08 section 4.3), the
+	// reactor's architecture with the per-op syscalls replaced by ring
+	// submissions: one io_uring_enter per loop pass covers the recv re-arms
+	// and the batched sends. Linux only, and probed at Listen (the syscalls,
+	// IORING_FEAT_NODROP, and the RECV/SEND/READ/ASYNC_CANCEL opcodes, kernel
+	// 5.6+); anywhere the probe fails it falls back to the goroutine driver
+	// with a logged notice. Same section 4.4 rule: a default nowhere until it
+	// wins its regime A/B.
+	NetURing = "uring"
 )
 
 // defaultArenaBytes is the per-shard arena when the caller leaves it zero,
@@ -109,11 +119,14 @@ type Options struct {
 	// A/B until the M10 driver decision.
 	ConnShape string
 	// NetDriver picks the network driver: NetGoroutine (also the empty
-	// default) or NetReactor. The reactor runs on Linux only; elsewhere it
-	// falls back to the goroutine driver with a logged notice, and NetStats
-	// reports the driver actually running, never the one asked for.
+	// default), NetReactor, or NetURing. The reactor and uring drivers run on
+	// Linux only (uring additionally needs a kernel that passes the probe);
+	// elsewhere they fall back to the goroutine driver with a logged notice,
+	// and NetStats reports the driver actually running, never the one asked
+	// for.
 	NetDriver string
-	// NetLoops is the reactor's event-loop count; non-positive takes the
+	// NetLoops is the event-loop count for the reactor and uring drivers;
+	// non-positive takes the
 	// network share of the doc 03 core split, GOMAXPROCS*2/5 floored (min 1),
 	// the complement of shard.DefaultShards' 3/5. Lab 19
 	// (labs/f3/m0/19_loop_count) froze this: on the gate box's 8-cpu server
@@ -126,9 +139,9 @@ type Options struct {
 	// doc 08 section 3.5): a client whose unread backlog passes it is
 	// disconnected, that connection only, and the event is counted in INFO as
 	// net_disconnects_outbuf. 0, the default, means no cap, matching Redis
-	// normal-class clients. The reactor driver enforces it; the goroutine
-	// driver's writer blocks on the socket instead of buffering, so it has no
-	// equivalent backlog to cap.
+	// normal-class clients. The reactor and uring drivers enforce it; the
+	// goroutine driver's writer blocks on the socket instead of buffering, so
+	// it has no equivalent backlog to cap.
 	OutBufLimitBytes int
 }
 
@@ -217,7 +230,7 @@ func Listen(o Options) (*Server, error) {
 	switch o.NetDriver {
 	case "":
 		o.NetDriver = NetGoroutine
-	case NetGoroutine, NetReactor:
+	case NetGoroutine, NetReactor, NetURing:
 	default:
 		return nil, fmt.Errorf("drivers: unknown net driver %q", o.NetDriver)
 	}
@@ -256,7 +269,8 @@ func Listen(o Options) (*Server, error) {
 		driver:     NetGoroutine,
 		netLive:    make(map[*connState]struct{}),
 	}
-	if o.NetDriver == NetReactor {
+	switch o.NetDriver {
+	case NetReactor:
 		// Platform-resolved: on Linux this builds the epoll loops and flips
 		// the driver name; elsewhere (or on a setup failure) it logs the
 		// fallback notice and the goroutine driver serves as usual. Resolved
@@ -267,6 +281,16 @@ func Listen(o Options) (*Server, error) {
 		} else {
 			s.backend = b
 			s.driver = NetReactor
+		}
+	case NetURing:
+		// Same resolution shape, one more way to fail: the kernel probe. The
+		// probe result folds into the error, so the notice says why (ENOSYS,
+		// sysctl, seccomp, missing ops) and the goroutine driver serves.
+		if b, err := newURingBackend(s, o); err != nil {
+			log.Printf("drivers: uring driver unavailable (%v), falling back to the goroutine driver", err)
+		} else {
+			s.backend = b
+			s.driver = NetURing
 		}
 	}
 	rt.SetNetInfo(s.appendNetInfo)
