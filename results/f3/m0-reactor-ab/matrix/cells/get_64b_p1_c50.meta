@@ -1,0 +1,20 @@
+pins single=pid 12336's current affinity list: 0-7 reactor=pid 12338's current affinity list: 0-7 redis=pid 12339's current affinity list: 0-7
+launch arena_mib=512 net_loops=3 warm=3s io_threads=4
+driver_stamp single=net_driver:goroutine pair=net_driver:goroutine reactor=net_driver:reactor
+rss[launch] single=12180kB pair=11992kB reactor=12004kB redis=9076kB valkey=9168kB
+cell wl=get value=64 keys=1000000 dist=uniform conns=50 pipeline=1 arena_mib_per_shard=512 warm=3s dur=8s
+rss[post-ab-single-rep0] single=165304kB pair=14172kB reactor=12216kB redis=135352kB valkey=124736kB
+rss[post-ab-pair-rep0] single=71680kB pair=165256kB reactor=14340kB redis=135480kB valkey=124920kB
+rss[post-ab-reactor-rep0] single=71720kB pair=71612kB reactor=223780kB redis=135516kB valkey=124964kB
+rss[post-ab-single-rep1] single=222300kB pair=71656kB reactor=130160kB redis=135460kB valkey=124968kB
+rss[post-ab-pair-rep1] single=128832kB pair=175796kB reactor=130884kB redis=135420kB valkey=124944kB
+rss[post-ab-reactor-rep1] single=128984kB pair=82344kB reactor=236068kB redis=135508kB valkey=124952kB
+rss[post-ab-single-rep2] single=232796kB pair=82444kB reactor=142396kB redis=135540kB valkey=124968kB
+rss[post-ab-pair-rep2] single=139124kB pair=232928kB reactor=142416kB redis=135420kB valkey=124960kB
+rss[post-ab-reactor-rep2] single=139124kB pair=139252kB reactor=237488kB redis=135392kB valkey=124972kB
+rss[post-rb-single] single=233904kB pair=139288kB reactor=143928kB redis=12328kB valkey=108588kB
+rss[post-rb-pair] single=141952kB pair=234004kB reactor=144164kB redis=12332kB valkey=31656kB
+rss[post-rb-reactor] single=142052kB pair=141952kB reactor=363012kB redis=12332kB valkey=13056kB
+rss[post-rb-redis] single=142124kB pair=141976kB reactor=271016kB redis=142824kB valkey=13056kB
+rss[post-rb-valkey] single=142324kB pair=142000kB reactor=271064kB redis=13712kB valkey=124616kB
+dbsize_end single=0 reactor=0 redis=0
