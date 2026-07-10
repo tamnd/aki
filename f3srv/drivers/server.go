@@ -107,8 +107,17 @@ type Server struct {
 	replyBuf   int
 	flushEvery bool
 	shape      string
-	closed     atomic.Bool
 	conns      sync.WaitGroup
+
+	// closeMu orders the accept path against Close. A queued connection can
+	// win the Accept race with ln.Close, so without the gate Serve's
+	// conns.Add(1) can land while Close is already in conns.Wait (the
+	// TestPprofOff race), and the handler would then run against a stopped
+	// runtime. track takes the lock to check closed and Add as one step;
+	// Close flips closed under the same lock before it waits, so every Add
+	// happens before the Wait or never happens at all.
+	closeMu sync.Mutex
+	closed  bool
 
 	// flushes counts writer socket flushes across all connections. With the
 	// reply buffer at its default every flush is one write syscall (a P16
@@ -211,12 +220,15 @@ func (s *Server) Serve() error {
 	for {
 		nc, err := s.ln.Accept()
 		if err != nil {
-			if s.closed.Load() {
+			if s.isClosed() {
 				return nil
 			}
 			return err
 		}
-		s.conns.Add(1)
+		if !s.track() {
+			_ = nc.Close()
+			return nil
+		}
 		go func() {
 			defer s.conns.Done()
 			s.handle(nc)
@@ -224,10 +236,31 @@ func (s *Server) Serve() error {
 	}
 }
 
+// track admits an accepted connection into the handler WaitGroup, refusing
+// once Close has begun. The check and the Add are one critical section; see
+// closeMu.
+func (s *Server) track() bool {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.conns.Add(1)
+	return true
+}
+
+func (s *Server) isClosed() bool {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	return s.closed
+}
+
 // Close stops accepting, waits for the connection handlers, and stops the
 // shard workers.
 func (s *Server) Close() error {
-	s.closed.Store(true)
+	s.closeMu.Lock()
+	s.closed = true
+	s.closeMu.Unlock()
 	err := s.ln.Close()
 	if s.pprofLn != nil {
 		_ = s.pprofLn.Close()
