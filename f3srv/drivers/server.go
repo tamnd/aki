@@ -3,6 +3,8 @@ package drivers
 import (
 	"bufio"
 	"net"
+	"net/http"
+	"net/http/pprof"
 	"sync"
 	"sync/atomic"
 
@@ -57,6 +59,11 @@ type Options struct {
 	// ReplyBufBytes overrides the per-connection reply writer buffer;
 	// non-positive takes replyBufSize. The knob exists for the lab sweep.
 	ReplyBufBytes int
+	// PprofAddr, when set, binds a second listener serving net/http/pprof
+	// under /debug/pprof/. Empty keeps it off. The endpoint has no auth, so
+	// bind it to loopback (for example "127.0.0.1:6060"). This is a server
+	// layer concern; the engine stays free of net/http.
+	PprofAddr string
 }
 
 // Server is the goroutine-per-connection driver over the shard runtime: a
@@ -65,6 +72,7 @@ type Options struct {
 type Server struct {
 	rt       *shard.Runtime
 	ln       net.Listener
+	pprofLn  net.Listener
 	replyBuf int
 	closed   atomic.Bool
 	conns    sync.WaitGroup
@@ -98,9 +106,33 @@ func Listen(o Options) (*Server, error) {
 		o.ReplyBufBytes = replyBufSize
 	}
 	s := &Server{rt: rt, ln: ln, replyBuf: o.ReplyBufBytes}
+	if o.PprofAddr != "" {
+		pln, err := net.Listen("tcp", o.PprofAddr)
+		if err != nil {
+			_ = ln.Close()
+			rt.Stop()
+			return nil, err
+		}
+		s.pprofLn = pln
+		mux := http.NewServeMux()
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		go func() { _ = http.Serve(pln, mux) }()
+	}
 	s.rt.Use(dispatch.Handlers())
 	s.rt.Start()
 	return s, nil
+}
+
+// PprofAddr reports the bound pprof listen address, nil when disabled.
+func (s *Server) PprofAddr() net.Addr {
+	if s.pprofLn == nil {
+		return nil
+	}
+	return s.pprofLn.Addr()
 }
 
 // Addr reports the bound listen address.
@@ -130,6 +162,9 @@ func (s *Server) Serve() error {
 func (s *Server) Close() error {
 	s.closed.Store(true)
 	err := s.ln.Close()
+	if s.pprofLn != nil {
+		_ = s.pprofLn.Close()
+	}
 	s.conns.Wait()
 	s.rt.Stop()
 	return err
