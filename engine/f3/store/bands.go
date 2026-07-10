@@ -83,7 +83,7 @@ func (s *Store) writeRun(a, b []byte, capB uint64) (word uint64, vcap uint32, er
 		capB = align8(n)
 	}
 	if !s.spillNow(capB) {
-		if off, ok := s.arena.allocRecord(capB); ok {
+		if off, ok := s.arenaAlloc(capB); ok {
 			copy(s.arena.buf[off:], a)
 			copy(s.arena.buf[off+uint64(len(a)):], b)
 			return off, uint32(capB), nil

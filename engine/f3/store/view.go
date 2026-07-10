@@ -22,10 +22,12 @@ import (
 // command execution, and dies at the next store write on this shard. The
 // handler runs on the shard's single owner goroutine inside the batch's epoch
 // bracket (shard worker executeOne), and nothing moves or releases arena
-// bytes mid-command: value-log compaction runs only at the owner's idle
-// boundary, after a drain pass came up empty (shard worker maybeCompact,
-// called from the run loop only when drainPass returned zero batches), and
-// arena.freeSegment has no caller on the command path. A later write may
+// bytes a live view can name mid-command: value-log compaction and arena
+// compaction run only at drain boundaries (shard worker maybeCompact and the
+// tight-arena check, never inside a batch), and the one command-path
+// reclaimer, the full-arena backstop (reclaimOnFull), frees only fully dead
+// segments, which cannot back a view because a viewed record's charge is
+// live until the write that kills the view drops it. A later write may
 // reuse or overwrite the viewed bytes in place, so the caller must consume
 // the view (Reply.Bulk and AppendFanValue copy immediately) before its next
 // store call.

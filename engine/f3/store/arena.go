@@ -175,6 +175,36 @@ func (a *arena) reset() {
 	a.releasePages(0, touched)
 }
 
+// fillOf is segment si's handed-out bytes: the cursor advance, clamped to the
+// segment size. Zero for an untouched or freed segment.
+func (a *arena) fillOf(si uint64) uint64 {
+	seg := &a.segs[si]
+	if seg.alloc <= seg.base {
+		return 0
+	}
+	return min(seg.alloc-seg.base, a.segSize)
+}
+
+// deadOf is segment si's dead bytes: handed out minus still charged. The
+// figure is derived, not counted, because every alloc adds to live and every
+// unlink subtracts, so fill minus live is exactly the bytes whose records
+// left the index. The compactor reads it to pick drain targets.
+func (a *arena) deadOf(si uint64) uint64 {
+	f := a.fillOf(si)
+	l := a.segs[si].live
+	if l < 0 || uint64(l) >= f {
+		return 0
+	}
+	return f - uint64(l)
+}
+
+// freeSegCount is how many whole segments the allocator can still bring in:
+// the free list plus the never-used headroom. The tightness check reads it,
+// so it is O(1) on purpose.
+func (a *arena) freeSegCount() uint64 {
+	return uint64(len(a.freeSegs)) + uint64(len(a.segs)) - a.highWater
+}
+
 // used reports the bytes handed out: each touched segment's cursor advance,
 // clamped to segSize so a full segment's abandoned overshoot is not counted
 // twice. Introspection only, so the walk over segments is fine.
