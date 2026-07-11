@@ -516,6 +516,313 @@ func TestRangeErrorsAgainstRedis(t *testing.T) {
 	}
 }
 
+// TestPopsAgainstRedis replays random churn against a live Redis and drains it
+// through ZPOPMIN and ZPOPMAX, checking the flat [m, s, ...] reply agrees byte
+// for byte with the local zset draining in lockstep, across both bands. It also
+// pins the two edge forms: an absent key answers the empty array, and the
+// no-count form answers a two-element array. The ZMPOP nested reply is checked
+// separately over the multi-key selection.
+func TestPopsAgainstRedis(t *testing.T) {
+	addr := os.Getenv("AKI_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("set AKI_REDIS_ADDR=host:port to replay pops against a live Redis")
+	}
+	c, err := dialRedis(addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	defer c.close()
+
+	// Absent key: the empty array in both the plain and count forms.
+	for _, args := range [][]string{{"ZPOPMIN", "aki:zpop:absent"}, {"ZPOPMAX", "aki:zpop:absent", "4"}} {
+		el, notNull, err := c.cmdArray(args...)
+		if err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if !notNull || len(el) != 0 {
+			t.Fatalf("%v on absent key: got %v notNull=%v, want empty array", args, el, notNull)
+		}
+	}
+
+	for _, space := range []int{20, 400} {
+		key := "aki:zpop:" + itoa(space)
+		c.cmd("DEL", key)
+		z := newZset()
+		rng := rand.New(rand.NewPCG(41, uint64(space)))
+		for step := 0; step < 1500; step++ {
+			m := "m" + itoa(rng.IntN(space))
+			s := float64(rng.IntN(12) - 6) // small score space forces ties
+			z.update([]byte(m), s, flags{})
+			if _, err := c.cmd("ZADD", key, string(resp.FormatScore(nil, s)), m); err != nil {
+				t.Fatalf("ZADD: %v", err)
+			}
+		}
+
+		// No-count form: a single [m, s] pair off each end.
+		for _, verb := range []string{"ZPOPMIN", "ZPOPMAX"} {
+			rElems, _, err := c.cmdArray(verb, key)
+			if err != nil {
+				t.Fatalf("%s: %v", verb, err)
+			}
+			want := popStrings(z, verb == "ZPOPMIN", 1)
+			if !eqStrings(rElems, want) {
+				t.Fatalf("%s no-count:\n redis %v\n zset  %v", verb, rElems, want)
+			}
+		}
+
+		// Drain both sides in lockstep with random ends and counts.
+		for z.card() > 0 {
+			min := rng.IntN(2) == 0
+			count := 1 + rng.IntN(31)
+			verb := "ZPOPMIN"
+			if !min {
+				verb = "ZPOPMAX"
+			}
+			rElems, _, err := c.cmdArray(verb, key, itoa(count))
+			if err != nil {
+				t.Fatalf("%s %d: %v", verb, count, err)
+			}
+			want := popStrings(z, min, count)
+			if !eqStrings(rElems, want) {
+				t.Fatalf("%s %d:\n redis %v\n zset  %v", verb, count, rElems, want)
+			}
+		}
+		// Drained on both sides: the empty array.
+		rElems, _, err := c.cmdArray("ZPOPMIN", key)
+		if err != nil {
+			t.Fatalf("ZPOPMIN drained: %v", err)
+		}
+		if len(rElems) != 0 {
+			t.Fatalf("ZPOPMIN on drained key: %v, want empty", rElems)
+		}
+		c.cmd("DEL", key)
+	}
+}
+
+// popStrings pops count members off z at the named end and renders the flat
+// [member, score, ...] element strings the wire reply carries, the reference the
+// live drain compares Redis against.
+func popStrings(z *zset, min bool, count int) []string {
+	var out []string
+	z.pop(min, count, func(m []byte, s float64) {
+		out = append(out, string(m), string(resp.FormatScore(nil, s)))
+	})
+	return out
+}
+
+// TestZmpopAgainstRedis pins the ZMPOP nested reply against a live Redis: it
+// skips the empty and absent keys and pops from the first key with members,
+// answering [keyname, [[member, score], ...]], and answers a null array when
+// every listed key is empty.
+func TestZmpopAgainstRedis(t *testing.T) {
+	addr := os.Getenv("AKI_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("set AKI_REDIS_ADDR=host:port to replay ZMPOP against a live Redis")
+	}
+	c, err := dialRedis(addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	defer c.close()
+
+	empty := "aki:zmpop:empty"
+	full := "aki:zmpop:full"
+	absent := "aki:zmpop:absent"
+	c.cmd("DEL", empty, full, absent)
+
+	// Every key empty or absent: a null array.
+	rep, err := c.cmdReply("ZMPOP", "2", empty, absent, "MIN")
+	if err != nil {
+		t.Fatalf("ZMPOP all-empty: %v", err)
+	}
+	if rep != nil {
+		t.Fatalf("ZMPOP over empty keys = %v, want null array", rep)
+	}
+
+	z := newZset()
+	rng := rand.New(rand.NewPCG(43, 7))
+	for step := 0; step < 800; step++ {
+		m := "m" + itoa(rng.IntN(300))
+		s := float64(rng.IntN(20) - 10)
+		z.update([]byte(m), s, flags{})
+		if _, err := c.cmd("ZADD", full, string(resp.FormatScore(nil, s)), m); err != nil {
+			t.Fatalf("ZADD: %v", err)
+		}
+	}
+
+	for z.card() > 0 {
+		min := rng.IntN(2) == 0
+		count := 1 + rng.IntN(9)
+		end := "MIN"
+		if !min {
+			end = "MAX"
+		}
+		// The empty and absent keys are skipped; full is the first with members.
+		rep, err := c.cmdReply("ZMPOP", "3", empty, absent, full, end, "COUNT", itoa(count))
+		if err != nil {
+			t.Fatalf("ZMPOP: %v", err)
+		}
+		want := zmpopModel(z, full, min, count)
+		if !zmpopEqual(rep, want) {
+			t.Fatalf("ZMPOP %s %d:\n redis %v\n want  %v", end, count, rep, want)
+		}
+	}
+	c.cmd("DEL", empty, full, absent)
+}
+
+// zmpopModel builds the [keyname, [[m, s], ...]] shape from popping z, the
+// reference the live ZMPOP compares against.
+func zmpopModel(z *zset, key string, min bool, count int) []any {
+	var pairs []any
+	z.pop(min, count, func(m []byte, s float64) {
+		pairs = append(pairs, []any{string(m), string(resp.FormatScore(nil, s))})
+	})
+	return []any{key, pairs}
+}
+
+// zmpopEqual compares a recursive Redis reply against the modeled ZMPOP reply.
+func zmpopEqual(got any, want []any) bool {
+	ga, ok := got.([]any)
+	if !ok || len(ga) != 2 {
+		return false
+	}
+	if ga[0] != want[0] {
+		return false
+	}
+	gp, ok := ga[1].([]any)
+	wp := want[1].([]any)
+	if !ok || len(gp) != len(wp) {
+		return false
+	}
+	for i := range gp {
+		gpair, ok := gp[i].([]any)
+		wpair := wp[i].([]any)
+		if !ok || len(gpair) != 2 || gpair[0] != wpair[0] || gpair[1] != wpair[1] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestRandmemberAgainstRedis checks ZRANDMEMBER against a live Redis on the
+// properties its reply must hold, since the member order is unspecified: the
+// no-count form answers one member of the set (nil when absent); a positive
+// count answers that many distinct members, capped at the cardinality; a
+// negative count answers exactly that many with repetition allowed; and every
+// returned member carries its true score under WITHSCORES. Both bands are run.
+func TestRandmemberAgainstRedis(t *testing.T) {
+	addr := os.Getenv("AKI_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("set AKI_REDIS_ADDR=host:port to replay ZRANDMEMBER against a live Redis")
+	}
+	c, err := dialRedis(addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	defer c.close()
+
+	// Absent key: nil for the no-count form, empty array for the count form.
+	if v, err := c.cmd("ZRANDMEMBER", "aki:zrand:absent"); err != nil || v != "" {
+		t.Fatalf("ZRANDMEMBER absent no-count = %q,%v, want nil", v, err)
+	}
+	if el, _, err := c.cmdArray("ZRANDMEMBER", "aki:zrand:absent", "3"); err != nil || len(el) != 0 {
+		t.Fatalf("ZRANDMEMBER absent count = %v,%v, want empty array", el, err)
+	}
+
+	for _, space := range []int{20, 400} {
+		key := "aki:zrand:" + itoa(space)
+		c.cmd("DEL", key)
+		z := newZset()
+		scores := map[string]float64{}
+		rng := rand.New(rand.NewPCG(47, uint64(space)))
+		for i := 0; i < space; i++ {
+			m := "m" + itoa(i)
+			s := float64(rng.IntN(40)-20) / 2
+			z.update([]byte(m), s, flags{})
+			scores[m] = s
+			if _, err := c.cmd("ZADD", key, string(resp.FormatScore(nil, s)), m); err != nil {
+				t.Fatalf("ZADD: %v", err)
+			}
+		}
+		card := z.card()
+
+		// No-count: one member of the set.
+		v, err := c.cmd("ZRANDMEMBER", key)
+		if err != nil {
+			t.Fatalf("ZRANDMEMBER: %v", err)
+		}
+		if _, ok := scores[v]; !ok {
+			t.Fatalf("ZRANDMEMBER returned %q, not a member", v)
+		}
+
+		for _, count := range []int{1, 5, card, card + 10, -1, -7, -(card + 5)} {
+			for _, ws := range []bool{false, true} {
+				args := []string{"ZRANDMEMBER", key, itoa(count)}
+				if ws {
+					args = append(args, "WITHSCORES")
+				}
+				el, _, err := c.cmdArray(args...)
+				if err != nil {
+					t.Fatalf("%v: %v", args, err)
+				}
+				members := checkRandScores(t, args, el, scores, ws)
+				if count >= 0 {
+					// Distinct, capped at the cardinality.
+					exp := count
+					if exp > card {
+						exp = card
+					}
+					if len(members) != exp {
+						t.Fatalf("%v: got %d members, want %d", args, len(members), exp)
+					}
+					if distinctCount(members) != len(members) {
+						t.Fatalf("%v: positive count returned a repeat: %v", args, members)
+					}
+				} else if len(members) != -count {
+					// With replacement: exactly -count members.
+					t.Fatalf("%v: got %d members, want %d", args, len(members), -count)
+				}
+			}
+		}
+		c.cmd("DEL", key)
+	}
+}
+
+// checkRandScores validates a ZRANDMEMBER array: every element is a member of
+// the set, and under WITHSCORES each member is followed by its true score. It
+// returns the member list for the caller's count and distinctness checks.
+func checkRandScores(t *testing.T, args, el []string, scores map[string]float64, ws bool) []string {
+	t.Helper()
+	var members []string
+	step := 1
+	if ws {
+		step = 2
+	}
+	for i := 0; i < len(el); i += step {
+		m := el[i]
+		s, ok := scores[m]
+		if !ok {
+			t.Fatalf("%v: %q is not a member", args, m)
+		}
+		if ws {
+			want := string(resp.FormatScore(nil, s))
+			if el[i+1] != want {
+				t.Fatalf("%v: score for %q = %q, want %q", args, m, el[i+1], want)
+			}
+		}
+		members = append(members, m)
+	}
+	return members
+}
+
+func distinctCount(xs []string) int {
+	seen := map[string]bool{}
+	for _, x := range xs {
+		seen[x] = true
+	}
+	return len(seen)
+}
+
 // TestScoreFormattingAgainstRedis pins the zero and infinity reply forms
 // against a live Redis, with both sides parsing the same wire bytes. The
 // interesting split: a -0 score collapses to "0" in the listpack band (Redis

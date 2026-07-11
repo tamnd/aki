@@ -137,6 +137,68 @@ func (rc *redisConn) readElem() (string, error) {
 	}
 }
 
+// cmdReply sends a command and reads one full reply into a recursive form:
+// nil for a null bulk or null array, a string for a status/integer/bulk, and a
+// []any for an array (which may nest). It covers the ZMPOP shape the flat
+// cmdArray reader cannot, [key, [[member, score], ...]].
+func (rc *redisConn) cmdReply(args ...string) (any, error) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "*%d\r\n", len(args))
+	for _, a := range args {
+		fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(a), a)
+	}
+	rc.c.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := rc.c.Write([]byte(b.String())); err != nil {
+		return nil, err
+	}
+	return rc.readReply()
+}
+
+// readReply reads one RESP2 reply of any shape into the recursive form cmdReply
+// documents.
+func (rc *redisConn) readReply() (any, error) {
+	line, err := rc.r.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	line = strings.TrimRight(line, "\r\n")
+	if line == "" {
+		return nil, fmt.Errorf("empty reply")
+	}
+	switch line[0] {
+	case '+', ':':
+		return line[1:], nil
+	case '-':
+		return nil, fmt.Errorf("redis: %s", line[1:])
+	case '$':
+		n, _ := strconv.Atoi(line[1:])
+		if n < 0 {
+			return nil, nil
+		}
+		buf := make([]byte, n+2)
+		if _, err := readFull(rc.r, buf); err != nil {
+			return nil, err
+		}
+		return string(buf[:n]), nil
+	case '*':
+		n, _ := strconv.Atoi(line[1:])
+		if n < 0 {
+			return nil, nil
+		}
+		out := make([]any, n)
+		for i := 0; i < n; i++ {
+			el, err := rc.readReply()
+			if err != nil {
+				return nil, err
+			}
+			out[i] = el
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unexpected reply %q", line)
+	}
+}
+
 func readFull(r *bufio.Reader, buf []byte) (int, error) {
 	total := 0
 	for total < len(buf) {
