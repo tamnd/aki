@@ -2,6 +2,7 @@ package set
 
 import (
 	"encoding/binary"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -90,3 +91,68 @@ func benchSAddDup(b *testing.B, n int) {
 
 func BenchmarkSAddDup10k(b *testing.B) { benchSAddDup(b, 10_000) }
 func BenchmarkSAddDup1M(b *testing.B)  { benchSAddDup(b, 1_000_000) }
+
+// The draw microbenchmarks (doc 11 section 5). BenchmarkSRandMember is the pure
+// P10 vector draw, non-mutating, which is the K11 port-lab bar of 4.8ns at 100k
+// members and 12.2ns at 1M. BenchmarkSPop adds the swap-remove: it drains the set
+// and refills off the clock, so the timed region is draw plus swap-remove plus
+// table tombstone only. Members are 16 bytes (the gate default).
+
+var sinkBytes []byte
+
+func benchReg() *reg {
+	return &reg{m: map[string]*set{}, rng: *rand.NewPCG(0x9e3779b97f4a7c15, 0xbf58476d1ce4e5b9)}
+}
+
+func benchSRandMember(b *testing.B, n int) {
+	s := buildHT(members16(n))
+	if s.enc != encHashtable {
+		b.Fatalf("enc = %s, want hashtable", s.enc)
+	}
+	g := benchReg()
+	var sc [64]byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sinkBytes = s.drawOne(g, sc[:])
+	}
+}
+
+func BenchmarkSRandMember10k(b *testing.B) { benchSRandMember(b, 10_000) }
+func BenchmarkSRandMember1M(b *testing.B)  { benchSRandMember(b, 1_000_000) }
+
+func benchSPop(b *testing.B, n int) {
+	keys := members16(n)
+	s := buildHT(keys)
+	g := benchReg()
+	var sc [64]byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if s.card() == 0 {
+			b.StopTimer()
+			s = buildHT(keys)
+			b.StartTimer()
+		}
+		sinkBytes = s.popOne(g, sc[:])
+	}
+}
+
+func BenchmarkSPop10k(b *testing.B) { benchSPop(b, 10_000) }
+func BenchmarkSPop1M(b *testing.B)  { benchSPop(b, 1_000_000) }
+
+// benchSRandMemberCount times the count-form draws: a positive count is the
+// distinct sample, a negative count is with replacement. Both reuse the
+// registry's scratch, so a steady-state count draw should not allocate.
+func benchSRandMemberCount(b *testing.B, n, count int) {
+	s := buildHT(members16(n))
+	g := benchReg()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.sampleDistinct(g, count, func(m []byte) { sinkBytes = m })
+	}
+}
+
+func BenchmarkSRandMemberCount10k(b *testing.B) { benchSRandMemberCount(b, 10_000, 10) }
+func BenchmarkSRandMemberCount1M(b *testing.B)  { benchSRandMemberCount(b, 1_000_000, 10) }
