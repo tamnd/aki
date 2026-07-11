@@ -55,8 +55,11 @@ flush_all() {
   sleep 0.5
 }
 
+# Steady RSS and peak (VmHWM) both, per the tightened same-data memory bar:
+# a throughput win that pins more memory has to show it here.
 rss_snap() { # tag
   meta "rss[$1] single=$(awk '/VmRSS/{print $2$3}' /proc/$SPID/status 2>/dev/null) reactor=$(awk '/VmRSS/{print $2$3}' /proc/$XPID/status 2>/dev/null) uring=$(awk '/VmRSS/{print $2$3}' /proc/$UPID/status 2>/dev/null) redis=$(awk '/VmRSS/{print $2$3}' /proc/$RPID/status 2>/dev/null) valkey=$(awk '/VmRSS/{print $2$3}' /proc/$VPID/status 2>/dev/null)"
+  meta "hwm[$1] single=$(awk '/VmHWM/{print $2$3}' /proc/$SPID/status 2>/dev/null) reactor=$(awk '/VmHWM/{print $2$3}' /proc/$XPID/status 2>/dev/null) uring=$(awk '/VmHWM/{print $2$3}' /proc/$UPID/status 2>/dev/null) redis=$(awk '/VmHWM/{print $2$3}' /proc/$RPID/status 2>/dev/null) valkey=$(awk '/VmHWM/{print $2$3}' /proc/$VPID/status 2>/dev/null)"
 }
 
 start_servers() { # $1 arena-mib
