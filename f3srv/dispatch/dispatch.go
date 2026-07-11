@@ -185,6 +185,13 @@ func init() {
 	register("SINTERSTORE", set.Sinterstore, 2, -1, true)
 	register("SUNIONSTORE", set.Sunionstore, 2, -1, true)
 	register("SDIFFSTORE", set.Sdiffstore, 2, -1, true)
+	// SMOVE (spec 2064/f3/11 section 9.2) is a tier-two two-key write. It routes on
+	// its source key (args[0], the first-argument route SADD uses) and reads both
+	// source and destination from that shard's registry, the co-located-operand
+	// constraint the algebra and STORE forms already document (smove.go). A
+	// cross-shard source and destination need the F17 intent path; until that
+	// substrate lands SMOVE assumes co-located keys.
+	register("SMOVE", set.Smove, 3, 3, true)
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
