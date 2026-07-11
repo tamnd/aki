@@ -141,6 +141,55 @@ func (n *nativeStore) rem(m []byte) bool {
 	return true
 }
 
+// pop removes up to count entries from an end of the native band, handing each
+// popped member (aliasing the slab) and its score to emit in pop order: ascending
+// from the low end when min, descending from the high end otherwise. It is the
+// ZPOPMIN/ZPOPMAX-count and ZMPOP drain (spec 2064/f3/12 section 6.7). Each step
+// is one fused tree pop (single descent, count fixup and rebalance in the same
+// pass) plus the member-hash delete for the same member, so the dual structure
+// stays coordinated. The member is handed to emit before the hash delete and
+// before any rebuild, since a rebuild moves the slab out from under the alias.
+// The reclamation runs once at the end, not per element, so a large drain pays
+// one amortized rebuild at most.
+func (n *nativeStore) pop(min bool, count int, emit func(m []byte, score float64)) int {
+	popped := 0
+	for popped < count {
+		var (
+			ref uint32
+			ok  bool
+		)
+		if min {
+			_, ref, ok = n.tree.PopMin()
+		} else {
+			_, ref, ok = n.tree.PopMax()
+		}
+		if !ok {
+			break
+		}
+		r := &n.recs[ref]
+		m := n.slab[r.loc : r.loc+r.mlen]
+		emit(m, math.Float64frombits(r.bits))
+		n.tbl.Delete(store.Hash(m), m, n)
+		n.deadBytes += int(r.mlen)
+		n.deadRecs++
+		popped++
+	}
+	if popped > 0 && n.card() > 0 {
+		n.maybeRebuild()
+	}
+	return popped
+}
+
+// at resolves the member at forward rank idx to its bytes (aliasing the slab)
+// and raw score bits, the ZRANDMEMBER draw's rank-to-member step: one counted
+// select on the tree, then the record read. The caller guarantees idx is in
+// range.
+func (n *nativeStore) at(idx int) ([]byte, uint64) {
+	_, ref, _ := n.tree.SelectAt(uint64(idx))
+	r := &n.recs[ref]
+	return n.slab[r.loc : r.loc+r.mlen], r.bits
+}
+
 // newRecord seats m's bytes in the slab and takes a fresh record ordinal.
 // Ordinals are never reused between rebuilds (see the deadRecs comment).
 func (n *nativeStore) newRecord(m []byte, bits uint64) uint32 {
