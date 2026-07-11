@@ -464,6 +464,39 @@ func BenchmarkLPOS(b *testing.B) {
 // geometries, but resolving every position through locate the way the old
 // get(i)-per-element lposScan did. It exists only to price the seek the shipped
 // scan deletes.
+// The same-shard move (spec 2064/f3/13 M3 slice 6), priced on the native band so
+// the pop and the push each ride the deque's O(1) end path. BenchmarkLMOVE times
+// a cross-key RIGHT LEFT move and then moves the element straight back, keeping
+// both lists native and steady, so the reported ns/op is one round trip of two
+// moves. BenchmarkRPOPLPUSH times a same-key RIGHT LEFT rotation, the tail-to-head
+// move that never changes the list length. This slice prices no new constant, so
+// it is a package benchmark and not a labs/f3 microbenchmark (the slice-1
+// precedent: only a slice that freezes a constant earns a lab).
+
+func BenchmarkLMOVE(b *testing.B) {
+	g, cx := newMoveReg()
+	g.m["a"] = seedList(bigVals("a", 300)...)
+	g.m["b"] = seedList(bigVals("b", 300)...)
+	ka, kb := []byte("a"), []byte("b")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		lmove(g, cx, ka, kb, false, true)
+		lmove(g, cx, kb, ka, false, true)
+	}
+}
+
+func BenchmarkRPOPLPUSH(b *testing.B) {
+	g, cx := newMoveReg()
+	g.m["k"] = seedList(bigVals("k", 300)...)
+	kk := []byte("k")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		lmove(g, cx, kk, kk, false, true)
+	}
+}
+
 func BenchmarkLPOSByIndex(b *testing.B) {
 	target := []byte("TGT")
 	filler := []byte("elem")
