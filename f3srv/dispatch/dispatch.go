@@ -329,6 +329,16 @@ func init() {
 	}
 	table["RPOPLPUSH"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 
+	// LMPOP numkeys key [key ...] <LEFT|RIGHT> [COUNT count] (spec 2064/f3/13 M3
+	// slice 8) is the non-blocking multi-key pop, the list twin of ZMPOP. It leads
+	// with numkeys, so it routes on the argument after it (keyAt=1, the post-count
+	// route ZMPOP and SINTERCARD use) and reads every listed key from that shard's
+	// registry, the co-located-operand convention. It is the only non-blocking
+	// member of the slice-8 family; the blocking forms BLPOP, BRPOP, BLMOVE, and
+	// BLMPOP land in later slice-8 PRs on the deferred-reply and waiter substrate.
+	register("LMPOP", list.Lmpop, 3, -1, false)
+	table["LMPOP"].keyAt = 1
+
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard

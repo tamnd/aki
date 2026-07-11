@@ -497,6 +497,31 @@ func BenchmarkRPOPLPUSH(b *testing.B) {
 	}
 }
 
+// BenchmarkLMPOP prices the non-blocking multi-key pop on the native band (spec
+// 2064/f3/13 M3 slice 8). It pops one element off the head of a many-chunk list
+// each iteration, reusing the reply buffer so the steady path allocates nothing,
+// and reseeds under a stopped timer when the list drains, so the reported ns/op
+// is the key-selection plus O(1) front pop plus reply build, not the reseed. Like
+// the move benchmarks this slice prices no new constant, so it is a package
+// benchmark and not a labs/f3 microbenchmark (the slice-1 precedent: only a slice
+// that freezes a constant earns a lab).
+func BenchmarkLMPOP(b *testing.B) {
+	g, cx := newMoveReg()
+	keys := bb("a", "b")
+	var buf []byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if g.m["a"] == nil {
+			b.StopTimer()
+			g.m["a"] = seedList(bigVals("a", 4096)...) // native band, ~ a few hundred chunks
+			b.StartTimer()
+		}
+		out, _, _ := lmpop(g, cx, buf[:0], keys, true, 1)
+		buf = out
+	}
+}
+
 func BenchmarkLPOSByIndex(b *testing.B) {
 	target := []byte("TGT")
 	filler := []byte("elem")
