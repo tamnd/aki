@@ -26,8 +26,29 @@ On the server gate cells: 64B P16/512 VmRSS lands near 230-280MB against redis's
 
 ## Results
 
-Pending the box run.
+Gate box (GamingPC WSL2, 32-thread, 56GiB), binaries cross-built at 49ab548 (A, heap-backed arena) and at the arena-map commit (B, mapped arena), taskset 0-7, one run per arm per shape, 2026-07-11.
 
-## Verdict
+64B (4 x 512MiB arenas), figures in MB:
 
-Pending the box run.
+| phase | A rss | A heapAlloc | A gc | B rss | B heapAlloc | B gc |
+|---|---|---|---|---|---|---|
+| launch | 5.4 | 2048.2 | 2 | 2.6 | 0.2 | 0 |
+| rep0 post-fill | 609.1 | 2588.6 | 3 | 206.2 | 139.1 | 19 |
+| rep0 post-flush | 548.5 | 2588.7 | 3 | 145.5 | 139.1 | 19 |
+| rep1 post-fill | 1152.0 | 3129.0 | 3 | 175.0 | 75.1 | 37 |
+| rep1 post-flush | 1091.3 | 3129.0 | 3 | 114.4 | 75.1 | 37 |
+| rep2 post-fill | 1695.1 | 3669.4 | 3 | 192.7 | 75.1 | 50 |
+| rep2 post-flush | 1634.3 | 3669.5 | 3 | 131.9 | 75.1 | 50 |
+
+The A arm's heap starts at the 2GiB reservation, the collector runs 3 times in the whole run because the pacing goal sits past 4GiB, and every rep's garbage (the ~512MB of conn-buffer churn plus the rebuilt index) lands on the heap and stays: the post-flush residual climbs 548 to 1091 to 1634MB, the exact shape of the campaign's per-cell climb, scaled by this lab's heavier churn.
+The B arm's heap holds only the substrate (75-139MB of index at fill), the collector runs 19 then 37 then 50 times under default pacing, and the post-flush residual is flat at 114-146MB.
+The 1KiB shape (-val 1024, 4 x 1024MiB arenas) tells the same story wider: A launches with a 4GiB heap, collects 3 times, and the residual climbs 551 to 1094 to 1637MB; B fills to 786-813MB (the values really are resident, VmHWM 820MB), collects 17 then 35 then 54 times, and flushes back flat to 114-146MB.
+One prediction missed: the A arm's launch RSS is 5.4MB, not eagerly resident gigabytes, because the runtime backs a giant make with demand-zero pages too; the reservation costs pacing, not launch pages, which is the whole point.
+
+## Verdict (frozen)
+
+The 64B RSS breach was GC pacing, not arena pages: the heap-accounted reservation multiplied the pacing goal and the scavenger retention target, so per-run garbage became permanent RSS while the arena's own MADV_DONTNEED kept working.
+The fix maps the arena backing anonymously on unix builds (engine/f3/store/arena_map_unix.go), heap fallback elsewhere and on mmap failure, unmapped by a finalizer when the store goes away.
+This lab isolates the mechanism, not the standing bar: it proves the mapped arm flattens the post-flush residual and returns to substrate, which is a large step down in RSS but not the whole distance.
+The standing memory bar was tightened after this lab to aki resident and peak RSS at or below one rival's for the same dataset (not the old under-2x ceiling), and the server-side matrix judges the after-state against it honestly: the fix clears the old ceiling everywhere and passes the new bar only where the values dominate (1KiB SET), still exceeding rivals on 64B where the arena's dead-record slack and per-shard reservation outweigh a value that small.
+The server-side gate numbers, the same-data bytes-per-key decomposition, and the named follow-up levers are in results/f3/m0-rss.md.
