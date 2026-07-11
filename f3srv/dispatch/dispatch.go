@@ -35,6 +35,14 @@ type entry struct {
 	// flushOpt marks the FLUSHALL/FLUSHDB tail: the one optional argument
 	// must be the ASYNC or SYNC token, anything else is a syntax error.
 	flushOpt bool
+
+	// cross is the tier-two cross-shard route (spec 2064/f3/03 section 6.7):
+	// a two-key write whose keys land on different shards leaves the point
+	// path and runs cross under an intent transaction holding args[0] and
+	// args[1] of its tail. Co-located keys keep the point path, the free
+	// single-shard case. SMOVE is the first rider; RENAME, COPY, and LMOVE
+	// join with their slices.
+	cross func(t *shard.Txn, args [][]byte) []byte
 }
 
 // maxVerb bounds the uppercase scratch for verb lookup; no Redis verb comes
@@ -186,13 +194,17 @@ func init() {
 	register("SINTERSTORE", set.Sinterstore, 2, -1, true)
 	register("SUNIONSTORE", set.Sunionstore, 2, -1, true)
 	register("SDIFFSTORE", set.Sdiffstore, 2, -1, true)
-	// SMOVE (spec 2064/f3/11 section 9.2) is a tier-two two-key write. It routes on
-	// its source key (args[0], the first-argument route SADD uses) and reads both
-	// source and destination from that shard's registry, the co-located-operand
-	// constraint the algebra and STORE forms already document (smove.go). A
-	// cross-shard source and destination need the F17 intent path; until that
-	// substrate lands SMOVE assumes co-located keys.
+	// SMOVE (spec 2064/f3/11 section 9.2) is a tier-two two-key write. When
+	// source and destination are co-located it routes on the source (args[0],
+	// the first-argument route SADD uses) and runs the whole move on that
+	// owner, the free single-shard case of doc 03 section 6.1. Cross-shard it
+	// rides the F17 intent path: DoTxn arms write intents on both keys in
+	// inbound order and SmoveCross runs the doc 6.7 two-hop plan under the
+	// barrier.
 	register("SMOVE", set.Smove, 3, 3, true)
+	table["SMOVE"].cross = func(t *shard.Txn, a [][]byte) []byte {
+		return set.SmoveCross(t, a[0], a[1], a[2])
+	}
 	// The zset surface (spec 2064/f3/12 M2 slice 1). Point ops, ZINCRBY, ZREM,
 	// rank, and ZRANGE by index over the inline band, all keyed on the first
 	// argument the same way SADD is. Handlers validate their own tails.
@@ -287,6 +299,9 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 	if e.fan != 0 && (e.fanOnly || n > 1) {
 		return dispatchFan(c, e, args)
 	}
+	if e.cross != nil && !c.SameShard(args[1], args[2]) {
+		return dispatchCross(c, e, args)
+	}
 	if e.keyAt > 0 && n > e.keyAt {
 		// A verb whose routing key is not its first argument (OBJECT) goes to
 		// the shard owning args[keyAt]; without that key it falls through to the
@@ -338,6 +353,26 @@ func dispatchFan(c *shard.Conn, e *entry, args [][]byte) error {
 		keys = args[1:]
 	}
 	err := c.DoFan(e.fanOp, e.fan, keys, vals)
+	if err == shard.ErrTooBig {
+		return oops(c, "ERR command too large")
+	}
+	return err
+}
+
+// dispatchCross routes one tier-two command whose two keys span shards: the
+// argument tail is copied (the transaction body runs on its own goroutine
+// after these parser views die) and DoTxn arms intents on both keys, runs
+// e.cross under the barrier, and delivers the reply at this command's
+// pipeline slot. Cross-shard tier-two traffic is rare, so the copies are off
+// every hot path.
+func dispatchCross(c *shard.Conn, e *entry, args [][]byte) error {
+	a := make([][]byte, len(args)-1)
+	for i := range a {
+		a[i] = append([]byte(nil), args[i+1]...)
+	}
+	err := c.DoTxn([][]byte{a[0], a[1]}, func(t *shard.Txn) []byte {
+		return e.cross(t, a)
+	})
 	if err == shard.ErrTooBig {
 		return oops(c, "ERR command too large")
 	}
