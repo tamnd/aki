@@ -72,6 +72,14 @@ func storeResult(hint int, drive func(emit func(m []byte))) *set {
 	if ht.card() == 0 {
 		return nil
 	}
+	if ht.card() >= partitionThreshold {
+		// A destination that crosses the engagement threshold is born partitioned,
+		// not left as one oversized native table (doc 11 section 7): the result is
+		// already bulk-built, so pre-partitioning it here is one more redistribution
+		// pass, and it saves the set from paying a first rehash pause on its next
+		// write. Picking the band at build time is not a downward conversion (F4).
+		return partitionedSet(ht)
+	}
 	return bandFor(ht, allInt, maxLen, ht.card())
 }
 
