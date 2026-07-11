@@ -263,6 +263,63 @@ func BenchmarkZRangeByLexNative(b *testing.B) {
 	}
 }
 
+// BenchmarkZMPopNative measures the ZMPOP drain per element at the lab's
+// saturating batch of 31 (one leaf), over the native band at 10k and 1M
+// members. Each step is one fused tree pop plus the member-hash delete; the set
+// is rebuilt off the timer when it drains, so the steady figure is the pop pair
+// looped over a cache-resident spine. ns/op reads per element, the number that
+// sits against the tree lab's fused pop.
+func BenchmarkZMPopNative(b *testing.B) {
+	const batch = 31
+	for _, n := range []int{10_000, 1_000_000} {
+		b.Run(itoa(n), func(b *testing.B) {
+			z := buildNative(n)
+			b.ReportAllocs()
+			b.ResetTimer()
+			done := 0
+			for i := 0; i < b.N; i += batch {
+				if done+batch > n {
+					b.StopTimer()
+					z = buildNative(n)
+					done = 0
+					b.StartTimer()
+				}
+				z.pop(true, batch, func([]byte, float64) {})
+				done += batch
+			}
+		})
+	}
+}
+
+// BenchmarkZRandMemberNative measures the single ZRANDMEMBER draw at 10k and 1M
+// members: one owner-local PCG draw (Lemire, exactly uniform) resolved to a
+// member by one counted select on the tree, no removal. The draw allocates
+// nothing per call, so this is the read-path cost the F15 kernel adds over a
+// bare counted select.
+func BenchmarkZRandMemberNative(b *testing.B) {
+	benchNativeSizes(b, func(b *testing.B, z *zset, n int) {
+		g := newReg(uint64(n))
+		for i := 0; i < b.N; i++ {
+			sinkBytes, _ = z.at(g.next(z.card()))
+		}
+	})
+}
+
+// BenchmarkZRemNative measures the ZREM hot pair at 10k and 1M members: remove
+// one hot member then re-add it, so the set size holds steady and the timed cost
+// is the member-hash delete plus the fused tree delete, plus the reinsert that
+// keeps the member present. It is the churn a leaderboard's ZREM/ZADD pair pays.
+func BenchmarkZRemNative(b *testing.B) {
+	benchNativeSizes(b, func(b *testing.B, z *zset, n int) {
+		m := []byte("member:" + pad(n/2))
+		s := float64(n / 2)
+		for i := 0; i < b.N; i++ {
+			z.rem(m)
+			z.update(m, s, flags{})
+		}
+	})
+}
+
 // drawRanks precomputes drawCount rank samples over [0,n): uniform, or a zipfian
 // draw at exponent 0.99 (the PRED-F3-M2-ZRANKZIPF shape) that piles onto the low
 // ranks so the descents hammer one hot region of the tree.
