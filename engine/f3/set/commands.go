@@ -188,9 +188,16 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		popped = s.card()
 	}
 	out := resp.AppendArrayHeader(cx.Aux[:0], popped)
-	var sc [64]byte
-	for i := 0; i < popped; i++ {
-		out = resp.AppendBulk(out, s.popOne(g, sc[:]))
+	if popped < s.card() && s.fanDraws(cx, popped) {
+		// The escalated aggregate (drawfan.go): indices drawn serially on the
+		// owner, the resolve fanned to donated workers, removal back on the
+		// owner. Exact uniform without replacement either way (F15).
+		popFan(cx, g, s, popped, func(m []byte) { out = resp.AppendBulk(out, m) })
+	} else {
+		var sc [64]byte
+		for i := 0; i < popped; i++ {
+			out = resp.AppendBulk(out, s.popOne(g, sc[:]))
+		}
 	}
 	cx.Aux = out
 	r.Raw(out)
@@ -229,23 +236,36 @@ func Srandmember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	if count < 0 {
-		// With replacement: exactly -count draws, repeats allowed.
+		// With replacement: exactly -count draws, repeats allowed. The escalated
+		// aggregate fans the resolve (drawfan.go); the indices are the same
+		// serial owner draws either way.
 		want := int(-count)
 		out := resp.AppendArrayHeader(cx.Aux[:0], want)
-		s.sampleWithReplacement(g, want, func(m []byte) { out = resp.AppendBulk(out, m) })
+		emit := func(m []byte) { out = resp.AppendBulk(out, m) }
+		if s.fanDraws(cx, want) {
+			drawFanReplacement(cx, g, s, want, emit)
+		} else {
+			s.sampleWithReplacement(g, want, emit)
+		}
 		cx.Aux = out
 		r.Raw(out)
 		return
 	}
 	// Distinct: up to count members, no repeats, each an exact uniform sample
 	// without replacement (doc 11 section 5.2). The header carries the delivered
-	// count, which caps at the cardinality.
+	// count, which caps at the cardinality. The escalated aggregate fans the
+	// resolve (drawfan.go).
 	want := int(count)
 	if want > s.card() {
 		want = s.card()
 	}
 	out := resp.AppendArrayHeader(cx.Aux[:0], want)
-	s.sampleDistinct(g, want, func(m []byte) { out = resp.AppendBulk(out, m) })
+	emit := func(m []byte) { out = resp.AppendBulk(out, m) }
+	if want < s.card() && s.fanDraws(cx, want) {
+		drawFanDistinct(cx, g, s, want, emit)
+	} else {
+		s.sampleDistinct(g, want, emit)
+	}
 	cx.Aux = out
 	r.Raw(out)
 }
