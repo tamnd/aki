@@ -321,9 +321,11 @@ func zrankImpl(cx *shard.Ctx, args [][]byte, r shard.Reply, rev bool) {
 	r.Raw(out)
 }
 
-// Zrange answers ZRANGE key start stop [WITHSCORES] [REV] over the inline band's
-// index form (section 6.4). The BYSCORE, BYLEX, and LIMIT forms land with the
-// range slices; this slice serves the index range, which every band answers.
+// Zrange answers ZRANGE key start stop [WITHSCORES] [REV] over the index form
+// (section 6.4): a counted select to the start rank then a bounded leaf-chain
+// walk, streamed straight into the reply. The BYSCORE, BYLEX, and LIMIT forms
+// land with the range slices; this slice serves the index range, which every
+// band answers.
 func Zrange(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	withScores := false
 	rev := false
@@ -338,6 +340,28 @@ func Zrange(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			return
 		}
 	}
+	zrangeByIndex(cx, args, r, rev, withScores)
+}
+
+// Zrevrange answers ZREVRANGE key start stop [WITHSCORES], the deprecated alias
+// that indexes the high-to-low order (section 6.4). It shares the ZRANGE REV
+// plan; only its tail grammar differs, taking WITHSCORES and no REV token.
+func Zrevrange(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	withScores := false
+	for _, opt := range args[3:] {
+		if !eqFold(opt, "WITHSCORES") {
+			r.Err("ERR syntax error")
+			return
+		}
+		withScores = true
+	}
+	zrangeByIndex(cx, args, r, true, withScores)
+}
+
+// zrangeByIndex is the shared index-range plan for ZRANGE and ZREVRANGE: parse
+// the bounds, clamp per Redis, and stream the window into the shard scratch. rev
+// selects the high-to-low order.
+func zrangeByIndex(cx *shard.Ctx, args [][]byte, r shard.Reply, rev, withScores bool) {
 	start, ok1 := parseIndex(args[1])
 	stop, ok2 := parseIndex(args[2])
 	if !ok1 || !ok2 {
@@ -354,28 +378,16 @@ func Zrange(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Raw(resp.AppendArrayHeader(cx.Aux[:0], 0))
 		return
 	}
-	ev := z.entries()
-	if rev {
-		reverse(ev)
-	}
-	lo, hi, empty := clampRange(start, stop, len(ev))
+	lo, hi, empty := clampRange(start, stop, z.card())
 	if empty {
 		r.Raw(resp.AppendArrayHeader(cx.Aux[:0], 0))
 		return
 	}
-	count := hi - lo + 1
-	n := count
+	n := hi - lo + 1
 	if withScores {
 		n *= 2
 	}
-	out := resp.AppendArrayHeader(cx.Aux[:0], n)
-	var sc [40]byte
-	for j := lo; j <= hi; j++ {
-		out = resp.AppendBulk(out, ev[j].member)
-		if withScores {
-			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], ev[j].score))
-		}
-	}
+	out := z.rangeByIndex(resp.AppendArrayHeader(cx.Aux[:0], n), lo, hi, rev, withScores)
 	cx.Aux = out
 	r.Raw(out)
 }
