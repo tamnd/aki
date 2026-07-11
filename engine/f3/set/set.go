@@ -18,13 +18,12 @@ import (
 //     64 bytes per member.
 //
 // A write that breaches a cap converts one way to the native member table
-// (F4, never backward). The native table is a later M1 slice, so until it
-// lands the converted band is a placeholder map that answers every command
-// correctly at the same semantics; promote is the single seam that slice
-// re-points, and nothing above it changes. The frozen caps are lab 02's
-// verdict: intset binary search wins to 512, and the listpack cap is Redis's
-// 128 for parity, its scan cost dominated by per-command fixed cost at that
-// size.
+// (F4, never backward). The native table is the Swiss-style member table in
+// member.go (spec 2064/f3/11 section 2): the three *ToHashtable functions build
+// it in one bulk pass, and every hashtable-encoding command routes through it.
+// The frozen caps are lab 02's verdict: intset binary search wins to 512, and
+// the listpack cap is Redis's 128 for parity, its scan cost dominated by
+// per-command fixed cost at that size.
 const (
 	maxIntsetEntries   = 512
 	maxListpackEntries = 128
@@ -37,7 +36,7 @@ type encoding uint8
 const (
 	encIntset encoding = iota
 	encListpack
-	encHashtable // the native band placeholder, replaced by the member-table slice
+	encHashtable // the native member table (member.go)
 )
 
 func (e encoding) String() string {
@@ -67,9 +66,9 @@ type set struct {
 	blob []byte
 	n    int
 
-	// hashtable-class placeholder: the native member table slots in here. Keys
-	// are member strings (copied, since the argument bytes are reused).
-	ht map[string]struct{}
+	// hashtable-class: the native member table (member.go). Built by the
+	// *ToHashtable conversions and never converted back (F4).
+	ht *htable
 }
 
 // newSet builds an empty set whose first member decides intset versus
@@ -89,7 +88,7 @@ func (s *set) card() int {
 	case encListpack:
 		return s.n
 	default:
-		return len(s.ht)
+		return s.ht.card()
 	}
 }
 
@@ -108,8 +107,7 @@ func (s *set) has(m []byte) bool {
 	case encListpack:
 		return s.listpackIndex(m) >= 0
 	default:
-		_, ok := s.ht[string(m)]
-		return ok
+		return s.ht.has(m)
 	}
 }
 
@@ -148,11 +146,7 @@ func (s *set) add(m []byte) bool {
 	case encListpack:
 		return s.addListpack(m)
 	default:
-		if _, ok := s.ht[string(m)]; ok {
-			return false
-		}
-		s.ht[string(m)] = struct{}{}
-		return true
+		return s.ht.add(m)
 	}
 }
 
@@ -167,8 +161,7 @@ func (s *set) addIntset(m []byte) bool {
 			return s.addListpack(m)
 		}
 		s.intsetToHashtable()
-		s.ht[string(m)] = struct{}{}
-		return true
+		return s.ht.add(m)
 	}
 	i := sort.Search(len(s.ints), func(i int) bool { return s.ints[i] >= v })
 	if i < len(s.ints) && s.ints[i] == v {
@@ -178,8 +171,7 @@ func (s *set) addIntset(m []byte) bool {
 		// The intset cap (512) is far above the listpack entry cap (128), so a
 		// breach here always lands in the table; there is no listpack step.
 		s.intsetToHashtable()
-		s.ht[string(m)] = struct{}{}
-		return true
+		return s.ht.add(m)
 	}
 	s.ints = append(s.ints, 0)
 	copy(s.ints[i+1:], s.ints[i:])
@@ -193,8 +185,7 @@ func (s *set) addListpack(m []byte) bool {
 	}
 	if s.n+1 > maxListpackEntries || len(m) > maxListpackValue {
 		s.listpackToHashtable()
-		s.ht[string(m)] = struct{}{}
-		return true
+		return s.ht.add(m)
 	}
 	s.appendListpack(m)
 	return true
@@ -238,11 +229,7 @@ func (s *set) rem(m []byte) bool {
 		s.n--
 		return true
 	default:
-		if _, ok := s.ht[string(m)]; !ok {
-			return false
-		}
-		delete(s.ht, string(m))
-		return true
+		return s.ht.rem(m)
 	}
 }
 
@@ -266,9 +253,7 @@ func (s *set) each(fn func(m []byte)) {
 			i = start + n
 		}
 	default:
-		for k := range s.ht {
-			fn([]byte(k))
-		}
+		s.ht.each(fn)
 	}
 }
 
@@ -289,13 +274,7 @@ func (s *set) at(i int, sc []byte) []byte {
 		n := int(b[pos])
 		return b[pos+2 : pos+2+n]
 	default:
-		for k := range s.ht {
-			if i == 0 {
-				return append(sc[:0], k...)
-			}
-			i--
-		}
-		return sc[:0]
+		return s.ht.at(i)
 	}
 }
 
@@ -310,18 +289,22 @@ func (s *set) intsetToListpack() {
 }
 
 func (s *set) intsetToHashtable() {
-	s.ht = make(map[string]struct{}, len(s.ints)+1)
+	ints := s.ints
+	s.ht = newHashtable(len(ints) + 1)
 	var sc [20]byte
-	for _, v := range s.ints {
-		s.ht[string(strconv.AppendInt(sc[:0], v, 10))] = struct{}{}
+	for _, v := range ints {
+		s.ht.add(strconv.AppendInt(sc[:0], v, 10))
 	}
 	s.ints = nil
 	s.enc = encHashtable
 }
 
 func (s *set) listpackToHashtable() {
-	s.ht = make(map[string]struct{}, s.n+1)
-	s.each(func(m []byte) { s.ht[string(m)] = struct{}{} })
+	// Read the blob before pointing enc at the new table: each() dispatches on
+	// enc, so the walk must finish against the listpack it is draining.
+	ht := newHashtable(s.n + 1)
+	s.each(func(m []byte) { ht.add(m) })
+	s.ht = ht
 	s.blob = nil
 	s.n = 0
 	s.enc = encHashtable

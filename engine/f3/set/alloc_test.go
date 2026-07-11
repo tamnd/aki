@@ -40,6 +40,35 @@ func TestZeroAllocListpack(t *testing.T) {
 	checkZero(t, "listpack add existing", func() { sink = s.add(dup) })
 }
 
+// The native member table must hold the same zero-allocation bar as the inline
+// bands (F7, doc 11 section 2): SISMEMBER, SCARD, a duplicate SADD, and SREM all
+// run over the table, records, slab, and draw vector in place, with only genuine
+// growth (a new member outgrowing the slab, record slab, vector, or table)
+// escaping, which these cases avoid by touching members already resident.
+func TestZeroAllocHashtable(t *testing.T) {
+	s := newSet([]byte("0"))
+	for i := 0; i < 700; i++ { // past the 512 intset cap, so enc is hashtable
+		s.add([]byte(strconv.Itoa(i)))
+	}
+	if s.enc != encHashtable {
+		t.Fatalf("enc = %s, want hashtable", s.enc)
+	}
+	hit := []byte("400")
+	miss := []byte("nope")
+	dup := []byte("400")
+
+	checkZero(t, "hashtable has hit", func() { sink = s.has(hit) })
+	checkZero(t, "hashtable has miss", func() { sink = s.has(miss) })
+	checkZero(t, "hashtable card", func() { sinkInt = s.card() })
+	checkZero(t, "hashtable add existing", func() { sink = s.add(dup) })
+
+	// SREM is zero-alloc too: the free-list append and swap-remove run over
+	// preallocated capacity. Removing the same member is a no-op after the first
+	// run, which AllocsPerRun measures past its warm-up call.
+	gone := []byte("399")
+	checkZero(t, "hashtable rem", func() { sink = s.rem(gone) })
+}
+
 var (
 	sink    bool
 	sinkInt int
