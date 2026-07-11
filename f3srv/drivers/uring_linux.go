@@ -73,6 +73,16 @@ const (
 	uringCQEntries = 4096
 )
 
+// uringOFreeCap is the reply-buffer free list's cap. The reactor budgets
+// loopBufFree read buffers plus loopBufFree reply buffers per loop; this
+// driver double-buffers replies (out plus inflight) and pins its read
+// buffers on the conns, so the one list gets the same total budget. With
+// the reactor's cap a P1 shard at the 512-conn gate shape parks two reply
+// buffers per conn into a list sized for one, and the overflow turns into
+// a steady drop-and-reallocate cycle the GC has to chew through (the box
+// session read ~250MB of pacing headroom from exactly that churn).
+const uringOFreeCap = 2 * loopBufFree
+
 // user_data layout: kind in the top byte, the fd slot's generation in the
 // middle 32 bits, the fd in the low 24.
 const (
@@ -196,7 +206,7 @@ type uringLoop struct {
 	gens  []uint32     // per-fd-slot generation; loop goroutine only
 
 	// The reply-buffer free list (doc 08 section 6.2): filled by idle parks
-	// only (see the package comment), capped at loopBufFree. There is no
+	// only (see the package comment), capped at uringOFreeCap. There is no
 	// read-buffer list because a conn's rbuf is leased once at the first
 	// recv and pinned by the armed recv until the close drops it.
 	// Loop-goroutine only, like conns.
@@ -744,13 +754,13 @@ func (l *uringLoop) releaseIdle(rc *uringConn) {
 		return
 	}
 	if rc.out != nil {
-		if cap(rc.out) == l.b.s.replyBuf && len(l.ofree) < loopBufFree {
+		if cap(rc.out) == l.b.s.replyBuf && len(l.ofree) < uringOFreeCap {
 			l.ofree = append(l.ofree, rc.out[:0])
 		}
 		rc.out = nil
 	}
 	if rc.inflight != nil {
-		if cap(rc.inflight) == l.b.s.replyBuf && len(l.ofree) < loopBufFree {
+		if cap(rc.inflight) == l.b.s.replyBuf && len(l.ofree) < uringOFreeCap {
 			l.ofree = append(l.ofree, rc.inflight[:0])
 		}
 		rc.inflight = nil
