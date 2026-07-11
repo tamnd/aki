@@ -236,12 +236,17 @@ func applyLimit(lo, hiExcl int, rev, limit bool, offset, count int) (a, b int, e
 
 // parseRangeOpts reads the trailing [WITHSCORES] [LIMIT offset count] options a
 // by-bound range command takes, in any order. withScoresOK is false for the lex
-// commands, where WITHSCORES is a syntax error. It returns the parsed options
-// and a non-empty Redis error string on a malformed tail.
+// commands, where WITHSCORES gets the specific not-with-BYLEX error Redis emits
+// (the lex commands share the generic range plan upstream, so the rejection
+// text is the BYLEX one, not the plain syntax error). It returns the parsed
+// options and a non-empty Redis error string on a malformed tail.
 func parseRangeOpts(tail [][]byte, withScoresOK bool) (ws, limit bool, offset, count int, errMsg string) {
 	for i := 0; i < len(tail); {
 		switch {
-		case withScoresOK && eqFold(tail[i], "WITHSCORES"):
+		case eqFold(tail[i], "WITHSCORES"):
+			if !withScoresOK {
+				return false, false, 0, 0, errLexScores
+			}
 			ws = true
 			i++
 		case eqFold(tail[i], "LIMIT"):

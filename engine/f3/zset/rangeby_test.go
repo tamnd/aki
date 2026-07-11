@@ -29,8 +29,10 @@ func TestParseScoreBound(t *testing.T) {
 		{"-inf", math.Inf(-1), false, true},
 		{"(+inf", math.Inf(1), true, true},
 		{"(-inf", math.Inf(-1), true, true},
-		{"(", 0, false, false},
-		{"", 0, false, false},
+		// The empty remainder is strtod's 0, so a bare "(" is exclusive zero and a
+		// bare "" is inclusive zero, same as redis-server 8.8.0.
+		{"(", 0, true, true},
+		{"", 0, false, true},
 		{"nan", 0, false, false},
 		{"(nan", 0, false, false},
 		{"abc", 0, false, false},

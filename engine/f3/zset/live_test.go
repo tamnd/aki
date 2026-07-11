@@ -334,7 +334,9 @@ func TestRangeByBoundAgainstRedis(t *testing.T) {
 			}
 		}
 
-		scoreArgs := []string{"-inf", "+inf", "-3", "(-3", "0", "(2", "5", "(5"}
+		// "(" and "" are the strtod empty-remainder bounds: exclusive zero and
+		// inclusive zero, accepted by Redis, so they belong in the matrix.
+		scoreArgs := []string{"-inf", "+inf", "-3", "(-3", "0", "(2", "5", "(5", "(", ""}
 		for _, lo := range scoreArgs {
 			for _, hi := range scoreArgs {
 				for _, ws := range []bool{false, true} {
@@ -489,13 +491,15 @@ func TestRangeErrorsAgainstRedis(t *testing.T) {
 		args []string
 		want string // the exact error text this package emits, checked against Redis
 	}{
+		// A bare "(" is not an error: strtod reads the empty remainder as 0, so
+		// it parses as exclusive zero and lives in the bound matrix above.
 		{[]string{"ZRANGEBYSCORE", key, "notafloat", "2"}, errScoreBound},
-		{[]string{"ZRANGEBYSCORE", key, "(", "2"}, errScoreBound},
+		{[]string{"ZRANGEBYSCORE", key, "(x", "2"}, errScoreBound},
 		{[]string{"ZRANGEBYSCORE", key, "1", "nan"}, errScoreBound},
 		{[]string{"ZCOUNT", key, "x", "2"}, errScoreBound},
 		{[]string{"ZRANGEBYLEX", key, "a", "[b"}, errLexBound},
 		{[]string{"ZRANGEBYLEX", key, "[a", "b"}, errLexBound},
-		{[]string{"ZRANGEBYLEX", key, "[a", "[b", "WITHSCORES"}, "ERR syntax error"},
+		{[]string{"ZRANGEBYLEX", key, "[a", "[b", "WITHSCORES"}, errLexScores},
 		{[]string{"ZLEXCOUNT", key, "+x", "-"}, errLexBound},
 		{[]string{"ZRANGE", key, "0", "-1", "LIMIT", "0", "5"}, errLimitOnly},
 		{[]string{"ZRANGE", key, "(1", "3", "BYSCORE", "BYLEX"}, "ERR syntax error"},

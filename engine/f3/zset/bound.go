@@ -18,13 +18,20 @@ type scoreBound struct {
 
 // parseScoreBound reads a ZRANGEBYSCORE min or max item: an optional "(" for the
 // exclusive form, then a float that parseScore accepts (ordinary decimals, the
-// inf spellings; NaN and garbage reject). A lone "(" rejects because parseScore
-// refuses the empty string, matching Redis.
+// inf spellings; NaN and garbage reject). An empty remainder is zero: Redis's
+// zslParseRange hands whatever follows to strtod, which reads the empty string
+// as 0 and leaves eptr on the terminator, so a bare "(" is exclusive zero and a
+// bare "" is inclusive zero. That leniency is the range grammar's alone; the
+// score parser ZADD uses still rejects the empty string, like Redis. Verified
+// against redis-server 8.8.0, and the live bound matrix carries both cases.
 func parseScoreBound(b []byte) (scoreBound, bool) {
 	ex := false
 	if len(b) > 0 && b[0] == '(' {
 		ex = true
 		b = b[1:]
+	}
+	if len(b) == 0 {
+		return scoreBound{exclusive: ex}, true
 	}
 	v, ok := parseScore(b)
 	if !ok {
