@@ -1,21 +1,37 @@
 package set
 
 import (
+	"strconv"
+
 	"github.com/tamnd/aki/engine/f3/shard"
-	"github.com/tamnd/aki/engine/f3/store"
 	"github.com/tamnd/aki/f3srv/resp"
 )
 
-// Sscan answers SSCAN key cursor [MATCH pattern] [COUNT count]: the inline
-// band returns the whole set in one page with cursor 0 (doc 11 section 3.2),
-// which satisfies the SCAN guarantee vacuously. COUNT is accepted and ignored
-// because there is only ever one page; MATCH filters the members by glob.
+// defaultScanCount is the COUNT hint Redis applies when a client omits it: a
+// page examines this many draw slots unless COUNT says otherwise (doc 11
+// section 8.3, COUNT bounds elements examined, not returned).
+const defaultScanCount = 10
+
+// Sscan answers SSCAN key cursor [MATCH pattern] [COUNT count].
+//
+// The cursor rides the draw vector downward (doc 11 section 8.2): each page
+// examines COUNT slots from the top of the unscanned region and returns the
+// lower boundary as the next cursor, 0 when the scan is complete. The port
+// carries doc 20's correctness proof whole: swap-remove only moves the vector's
+// last element into a vacated slot, so an element present for the whole scan is
+// either still below the cursor when the cursor reaches it or was moved there
+// from the already-scanned side, and in both cases it is returned at least once
+// (scanPage below). The inline bands have no vector, so they return the whole
+// set in one page with cursor 0, which satisfies the guarantee vacuously (doc
+// 11 section 3.2). COUNT is a hint; MATCH filters the emitted members by glob.
 func Sscan(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	if _, ok := store.ParseInt(args[1]); !ok {
+	cursor, err := strconv.ParseUint(string(args[1]), 10, 64)
+	if err != nil {
 		r.Err("ERR invalid cursor")
 		return
 	}
 	var match []byte
+	count := defaultScanCount
 	for i := 2; i < len(args); i++ {
 		switch {
 		case eqFold(args[i], "MATCH"):
@@ -30,10 +46,12 @@ func Sscan(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 				r.Err("ERR syntax error")
 				return
 			}
-			if _, ok := store.ParseInt(args[i+1]); !ok {
-				r.Err("ERR value is not an integer or out of range")
+			c, ok := parseCount(args[i+1])
+			if !ok {
+				r.Err("ERR syntax error")
 				return
 			}
+			count = c
 			i++
 		default:
 			r.Err("ERR syntax error")
@@ -48,27 +66,90 @@ func Sscan(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 
-	// The reply is a two-element array: the next cursor (always "0" inline) and
-	// the member page. The page is built first so its header carries the exact
-	// post-filter count.
+	// The reply is a two-element array: the next cursor and the member page.
+	// The page is built first so its header carries the exact post-filter count.
 	page := cx.Val[:0]
 	n := 0
+	var next uint64
 	if s != nil {
-		s.each(func(m []byte) {
-			if match == nil || globMatch(match, m) {
-				page = resp.AppendBulk(page, m)
-				n++
-			}
+		next = s.scanPage(cursor, count, match, func(m []byte) {
+			page = resp.AppendBulk(page, m)
+			n++
 		})
 	}
 	cx.Val = page
 
+	var cbuf [20]byte
 	out := resp.AppendArrayHeader(cx.Aux[:0], 2)
-	out = resp.AppendBulk(out, []byte("0"))
+	out = resp.AppendBulk(out, strconv.AppendUint(cbuf[:0], next, 10))
 	out = resp.AppendArrayHeader(out, n)
 	out = append(out, page...)
 	cx.Aux = out
 	r.Raw(out)
+}
+
+// parseCount reads a COUNT argument: a positive integer. Redis rejects zero and
+// negatives with a syntax error, so anything not strictly positive is invalid.
+func parseCount(b []byte) (int, bool) {
+	v, err := strconv.Atoi(string(b))
+	if err != nil || v < 1 {
+		return 0, false
+	}
+	return v, true
+}
+
+// scanPage returns one SSCAN page starting from cursor and reports the cursor to
+// resume from, 0 when the scan is complete. It examines at most count draw slots
+// and emits each survivor of the MATCH filter. The inline bands are one page;
+// the hashtable band walks the downward cursor (member.go, scanPage on htable).
+func (s *set) scanPage(cursor uint64, count int, match []byte, emit func(m []byte)) uint64 {
+	switch s.enc {
+	case encIntset, encListpack:
+		// One page, cursor 0. An inline set never converts back down (F4), so a
+		// nonzero cursor here is only a client replaying a finished scan; it
+		// gets the done cursor and no members.
+		if cursor != 0 {
+			return 0
+		}
+		s.each(func(m []byte) {
+			if match == nil || globMatch(match, m) {
+				emit(m)
+			}
+		})
+		return 0
+	default:
+		return s.ht.scanPage(cursor, count, match, emit)
+	}
+}
+
+// scanPage is the hashtable band's downward cursor (doc 11 section 8.2). The
+// cursor is the boundary: draw-vector indices [b, len) have been returned by
+// earlier pages and [0, b) remain. The page examines up to count slots
+// downward from b and returns the new lower boundary, or 0 when it reaches the
+// bottom. A fresh scan (cursor 0) opens with the whole vector unscanned; a
+// resumed cursor is clamped to the current length, since a mid-scan shrink can
+// only have carried the old boundary past the new end, and additions land above
+// the boundary (the already-scanned side) where this walk never revisits them.
+func (h *htable) scanPage(cursor uint64, count int, match []byte, emit func(m []byte)) uint64 {
+	n := uint64(len(h.vec))
+	if n == 0 {
+		return 0
+	}
+	b := n
+	if cursor != 0 && cursor < b {
+		b = cursor
+	}
+	lo := uint64(0)
+	if b > uint64(count) {
+		lo = b - uint64(count)
+	}
+	for i := b; i > lo; i-- {
+		m := h.memberByOrd(h.vec[i-1])
+		if match == nil || globMatch(match, m) {
+			emit(m)
+		}
+	}
+	return lo
 }
 
 // eqFold reports whether b equals the uppercase option name s, ASCII case
