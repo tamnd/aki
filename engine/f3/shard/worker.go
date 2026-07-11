@@ -20,6 +20,15 @@ type worker struct {
 	stop    atomic.Bool
 	done    chan struct{}
 
+	// The F17 tier-two intent path (intent.go): intentInbox carries the
+	// coordinator's control ops, intentPending gates the drain so a shard with
+	// no tier-two traffic pays one relaxed load per pass, and keyQ holds the
+	// owner-only per-key intent queues. All three are untouched by the
+	// single-key fast path.
+	intentInbox   opQueue
+	intentPending atomic.Int64
+	keyQ          map[string]*keyList
+
 	// pin locks the worker goroutine to an OS thread for its whole life.
 	// Correctness never needs it: the single-owner invariant is goroutine
 	// affinity, one goroutine owning the shard, and that holds wherever the
@@ -77,9 +86,11 @@ func newWorker(id int, st *store.Store) *worker {
 	w.cx.St = st
 	w.argv = make([][]byte, 0, 16)
 	w.wakes = make([]*Conn, 0, drainPassCap)
+	w.keyQ = make(map[string]*keyList)
 	w.wk.init()
 	w.ep.init()
 	w.inbound.init()
+	w.intentInbox.init()
 	return w
 }
 
@@ -94,6 +105,11 @@ func (w *worker) run() {
 	defer close(w.done)
 	for {
 		n := w.drainPass()
+		// Advance the tier-two intent queues (doc 03 section 6): near-free when
+		// no tier-two traffic is in flight, one relaxed load per pass. A pass
+		// that applied ops counts them so the loop stays awake to service the
+		// coordinator that posted them.
+		n += w.advanceIntents()
 		if len(w.streams) > 0 {
 			w.pumpStreams()
 		}
@@ -396,13 +412,17 @@ func (w *worker) idle() {
 	// its own, swept apart from the connection writers' in lab 11; at the
 	// frozen value of zero the loop is skipped and the worker parks at once.
 	for i := 0; i < workerSpinIters; i++ {
-		if w.inbound.ready() || w.stop.Load() {
+		if w.inbound.ready() || w.intentReady() || w.stop.Load() {
 			w.wk.state.Store(stateRunning)
 			return
 		}
 	}
 	w.wk.state.Store(stateParked)
-	if w.inbound.ready() || w.stop.Load() {
+	// The re-check after the parked store is the lost-wake guard, and it covers
+	// the intent queue too: an intent op posted before its wake either shows in
+	// this check or the posting producer's wake claims the park (postIntent
+	// wakes exactly like a hop producer).
+	if w.inbound.ready() || w.intentReady() || w.stop.Load() {
 		w.wk.unparkSelf()
 		return
 	}
