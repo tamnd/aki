@@ -287,9 +287,7 @@ func init() {
 	// The list surface (spec 2064/f3/13 M3 slice 1): the inline listpack band and
 	// its one-way promotion to the native quicklist placeholder. The pushes, pops,
 	// LLEN, LINDEX, LRANGE, LSET, LREM, LTRIM, LINSERT, and LPOS all key on the
-	// first argument the same way SADD does and validate their own tails. The
-	// blocking forms BLPOP/BRPOP/BLMPOP/BLMOVE and the cross-key moves LMOVE/LMPOP
-	// are deferred to later M3 slices.
+	// first argument the same way SADD does and validate their own tails.
 	register("LPUSH", list.Lpush, 2, -1, true)
 	register("RPUSH", list.Rpush, 2, -1, true)
 	register("LPUSHX", list.Lpushx, 2, -1, true)
@@ -304,6 +302,15 @@ func init() {
 	register("LTRIM", list.Ltrim, 3, 3, true)
 	register("LINSERT", list.Linsert, 4, 4, true)
 	register("LPOS", list.Lpos, 2, -1, true)
+	// LMOVE and RPOPLPUSH (spec 2064/f3/13 M3 slice 6) are two-key moves that now
+	// land same-shard here: keyed on the source (args[0], the first-argument route
+	// the pushes use), the whole move runs on that owner's registry while source
+	// and destination are co-located, the free single-shard case of doc 03 section
+	// 6.1. They take no cross/crossKeys path this slice; cross-shard LMOVE rides
+	// the F17 intent pair in slice 7. The blocking forms
+	// BLPOP/BRPOP/BLMPOP/BLMOVE and LMPOP stay deferred to later M3 slices.
+	register("LMOVE", list.Lmove, 4, 4, true)
+	register("RPOPLPUSH", list.Rpoplpush, 2, 2, true)
 
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
