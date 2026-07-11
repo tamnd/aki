@@ -1,0 +1,85 @@
+f3 arena-rss A/B matrix (issue #542, lab 20)
+before = osingle/oreactor (main 49ab548, heap arena); after = nsingle/nreactor (branch, mapped arena + leased buffers)
+throughput HEAD = min(ab-ratio, rb-ratio), each min over both rivals
+memory bar (tightened): aki loaded-idle RSS <= 1.0x leanest rival for the same 1M-key dataset; ideal 0.5x
+
+THROUGHPUT
+cell              arm           aki_ab   r_ab     aki_rb   r_rb   HEAD    p99us
+-------------------------------------------------------------------------------
+get_64b_p16_c512  osingle    3,820,105  0.82x  3,805,899  0.81x  0.81x    4,809
+get_64b_p16_c512  oreactor   7,004,969  1.50x  6,657,790  1.42x  1.42x    2,574
+get_64b_p16_c512  nsingle    3,756,773  0.80x  4,435,574  0.94x  0.80x    4,899
+get_64b_p16_c512  nreactor   7,164,788  1.53x  6,644,518  1.41x  1.41x    2,492
+
+set_64b_p16_c512  osingle    4,722,435  1.28x  4,439,512  1.28x  1.28x    3,703
+set_64b_p16_c512  oreactor   6,975,936  1.89x  6,146,282  1.77x  1.77x    2,617
+set_64b_p16_c512  nsingle    4,606,072  1.25x  4,988,776  1.44x  1.25x    3,770
+set_64b_p16_c512  nreactor   7,008,419  1.90x  6,134,970  1.77x  1.77x    2,583
+
+get_1k_p16_c512   osingle    2,764,009  1.30x  2,853,881  1.36x  1.30x    6,066
+get_1k_p16_c512   oreactor   3,835,948  1.85x  3,985,652  1.90x  1.85x    4,289
+get_1k_p16_c512   nsingle    2,724,687  1.32x  3,067,485  1.46x  1.32x    6,250
+get_1k_p16_c512   nreactor   4,065,361  1.96x  4,428,698  2.11x  1.96x    4,239
+
+set_1k_p16_c512   osingle    3,970,902  1.29x  3,988,831  1.40x  1.29x    4,207
+set_1k_p16_c512   oreactor   4,157,588  1.34x  3,993,610  1.40x  1.34x    3,820
+set_1k_p16_c512   nsingle    3,542,916  1.15x  3,980,892  1.40x  1.15x    4,755
+set_1k_p16_c512   nreactor   4,480,818  1.46x  4,426,738  1.55x  1.46x    3,686
+
+get_64b_p1_c512   osingle      800,333  0.73x    705,219  0.76x  0.73x    2,476
+get_64b_p1_c512   oreactor   1,024,288  0.93x    855,920  0.93x  0.93x    1,004
+get_64b_p1_c512   nsingle      914,104  0.84x    798,297  0.87x  0.84x    2,122
+get_64b_p1_c512   nreactor   1,018,402  0.93x    855,432  0.93x  0.93x    1,006
+
+set_64b_p1_c512   osingle      942,928  0.90x    749,438  0.81x  0.81x    2,047
+set_64b_p1_c512   oreactor   1,020,725  0.99x    856,409  0.93x  0.93x    1,004
+set_64b_p1_c512   nsingle      771,058  0.75x    748,503  0.81x  0.75x    2,599
+set_64b_p1_c512   nreactor   1,020,508  0.98x    855,676  0.93x  0.93x      999
+
+MEMORY = same-data in-memory fit (MiB). bars vs leanest rival, goal <= 1.0x each.
+loadRSS = own post-rb idle (1M keys resident); peakHWM = max VmHWM in cell (transient peak).
+ledgB/key = internal used_memory per key; rssB/key = resident growth per key.
+cell              server     loadRSS     steadyBar  peakHWM       peakBar  rssB/key  ledgB/key
+----------------------------------------------------------------------------------------------
+get_64b_p16_c512  redis          146             -      150             -       144      127.5
+get_64b_p16_c512  valkey         125             -      126             -       121      115.1
+get_64b_p16_c512  osingle        524    4.20x FAIL      524    4.17x FAIL       538      113.4
+get_64b_p16_c512  oreactor       731    5.86x FAIL      731    5.82x FAIL       756      113.4
+get_64b_p16_c512  nsingle        341    2.73x FAIL      353    2.81x FAIL       349      113.4
+get_64b_p16_c512  nreactor       288    2.31x FAIL      296    2.36x FAIL       295      113.4
+
+set_64b_p16_c512  redis          152             -      157             -       151      127.5
+set_64b_p16_c512  valkey         127             -      130             -       124      115.1
+set_64b_p16_c512  osingle        405    3.19x FAIL      405    3.11x FAIL       413      113.4
+set_64b_p16_c512  oreactor       632    4.97x FAIL      632    4.86x FAIL       651      113.4
+set_64b_p16_c512  nsingle        315    2.48x FAIL      318    2.45x FAIL       322      113.4
+set_64b_p16_c512  nreactor       187    1.47x FAIL      222    1.70x FAIL       188      113.4
+
+get_1k_p16_c512   redis        1,354             -    1,360             -     1,410    1,327.5
+get_1k_p16_c512   valkey       1,412             -    1,496             -     1,471    1,331.1
+get_1k_p16_c512   osingle      3,111    2.30x FAIL    3,111    2.29x FAIL     3,249    1,073.4
+get_1k_p16_c512   oreactor     3,196    2.36x FAIL    3,196    2.35x FAIL     3,338    1,073.4
+get_1k_p16_c512   nsingle      2,127    1.57x FAIL    2,268    1.67x FAIL     2,223    1,073.4
+get_1k_p16_c512   nreactor     2,059    1.52x FAIL    2,117    1.56x FAIL     2,152    1,073.4
+
+set_1k_p16_c512   redis        1,322             -    1,332             -     1,377    1,327.5
+set_1k_p16_c512   valkey       1,326             -    1,588             -     1,381    1,331.1
+set_1k_p16_c512   osingle      1,381    1.04x FAIL    1,381    1.04x FAIL     1,434    1,073.4
+set_1k_p16_c512   oreactor     1,516    1.15x FAIL    1,516    1.14x FAIL     1,576    1,073.4
+set_1k_p16_c512   nsingle      1,181    0.89x PASS    1,209    0.91x PASS     1,231    1,073.4
+set_1k_p16_c512   nreactor     1,153    0.87x PASS    1,158    0.87x PASS     1,201    1,073.4
+
+get_64b_p1_c512   redis          144             -      149             -       141      127.5
+get_64b_p1_c512   valkey         124             -      125             -       121      115.1
+get_64b_p1_c512   osingle        292    2.35x FAIL      292    2.33x FAIL       296      113.6
+get_64b_p1_c512   oreactor       602    4.84x FAIL      602    4.80x FAIL       620      113.5
+get_64b_p1_c512   nsingle        228    1.83x FAIL      228    1.82x FAIL       231      113.5
+get_64b_p1_c512   nreactor       167    1.35x FAIL      167    1.33x FAIL       168      113.5
+
+set_64b_p1_c512   redis          145             -      150             -       142      127.5
+set_64b_p1_c512   valkey         125             -      126             -       122      115.1
+set_64b_p1_c512   osingle        288    2.30x FAIL      288    2.29x FAIL       291      113.5
+set_64b_p1_c512   oreactor       600    4.79x FAIL      600    4.77x FAIL       619      113.5
+set_64b_p1_c512   nsingle        233    1.86x FAIL      248    1.97x FAIL       238      113.5
+set_64b_p1_c512   nreactor       171    1.36x FAIL      171    1.36x FAIL       171      113.5
+
