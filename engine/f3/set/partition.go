@@ -83,6 +83,13 @@ type partitioned struct {
 	counts []uint64  // per-partition live count, parallel to parts; the draw weights
 	total  uint64    // sum of counts, the set cardinality
 	pgen   uint32    // partition generation, bumped on every split (SSCAN cursor tag)
+
+	// esc is the F13 draw-escalation layer (escalate.go), nil until the execution
+	// model engages it on a saturated draw-heavy hot key (doc 11 section 5.4). When
+	// set it groups the partitions into k draw-groups and carries the two-level
+	// weighted draw; a nil esc is the default, so add, rem, and at pay one
+	// never-taken branch and the flat draw path stays the pre-escalation path.
+	esc *escalation
 }
 
 // buildPartitioned redistributes the members drained by drain into p sub-tables.
@@ -125,6 +132,10 @@ func partitionedSet(h *htable) *set {
 // out of the wrong partition. newP is always larger than the current P (F4, P
 // never shrinks).
 func (pt *partitioned) grow(newP int) {
+	k := 0
+	if pt.esc != nil {
+		k = len(pt.esc.totals) // preserve the F13 group count across the split
+	}
 	old := pt.parts
 	np := buildPartitioned(newP, int(pt.total), func(emit func(m []byte)) {
 		for _, h := range old {
@@ -133,6 +144,12 @@ func (pt *partitioned) grow(newP int) {
 	})
 	np.pgen = pt.pgen + 1
 	*pt = *np
+	if k > 0 {
+		// The split raised P; rebuild the escalation groups over the new partitions
+		// keeping k, since k divides every P in the one-way doubling walk (both are
+		// powers of two and k <= P). The draw stays escalated across the grow (F4).
+		pt.esc = newEscalation(pt.counts, newP/k, k)
+	}
 }
 
 // add routes m to its partition and inserts it, then splits when the growing
@@ -145,6 +162,9 @@ func (pt *partitioned) add(m []byte) bool {
 	}
 	pt.counts[idx]++
 	pt.total++
+	if pt.esc != nil {
+		pt.esc.totals[idx/pt.esc.span]++ // keep the group scatter weight current (5.4)
+	}
 	if target := deriveP(int(pt.total)); target > len(pt.parts) {
 		pt.grow(target)
 	}
@@ -161,6 +181,9 @@ func (pt *partitioned) rem(m []byte) bool {
 	}
 	pt.counts[idx]--
 	pt.total--
+	if pt.esc != nil {
+		pt.esc.totals[idx/pt.esc.span]-- // a drain thins the group weight, never de-escalates (5.4, F4)
+	}
 	return true
 }
 
@@ -232,7 +255,12 @@ func (pt *partitioned) locate(r uint64) (part, local int) {
 // picks a uniform i in [0, card) and at resolves it to the weighted partition and
 // in-partition draw, so nothing in draw.go changes for the partitioned band.
 func (pt *partitioned) at(i int) []byte {
-	part, local := pt.locate(uint64(i))
+	var part, local int
+	if pt.esc != nil {
+		part, local = pt.locateEscalated(uint64(i)) // F13 two-level draw (escalate.go)
+	} else {
+		part, local = pt.locate(uint64(i))
+	}
 	return pt.parts[part].at(local)
 }
 
