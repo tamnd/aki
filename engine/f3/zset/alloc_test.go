@@ -116,10 +116,45 @@ func TestZeroAllocRangeByLexNative(t *testing.T) {
 	})
 }
 
+// The native single pop is one fused tree descent plus the member-hash delete,
+// no state restore and no per-pop rebuild below the reclaim thresholds (section
+// 6.7), so it holds the zero-allocation bar. The emit sink captures nothing, so
+// it stays a static function and adds no closure allocation of its own. The set
+// is large enough that 200 pops never trip a wholesale rebuild.
+func TestZeroAllocPopNative(t *testing.T) {
+	zmin := buildNative(20_000)
+	checkZero(t, "native pop min single", func() {
+		zmin.nat.pop(true, 1, func(m []byte, s float64) { sinkBytes, sinkFloat = m, s })
+	})
+	zmax := buildNative(20_000)
+	checkZero(t, "native pop max single", func() {
+		zmax.nat.pop(false, 1, func(m []byte, s float64) { sinkBytes, sinkFloat = m, s })
+	})
+}
+
+// ZREM over the native band is one member-hash probe plus a fused tree delete,
+// with the dead counters bumped in place: no down-conversion, no state restore,
+// no allocation (section 6.6). The members are pre-built so the loop counter
+// alone selects a distinct present member each run, keeping the removal on the
+// real delete path without allocating the key.
+func TestZeroAllocRemNative(t *testing.T) {
+	z := buildNative(20_000)
+	members := make([][]byte, 400)
+	for j := range members {
+		members[j] = []byte("member:" + pad(j))
+	}
+	i := 0
+	checkZero(t, "native rem", func() {
+		sinkBool = z.rem(members[i])
+		i++
+	})
+}
+
 var (
-	sinkBool bool
-	sinkInt  int
-	sinkInt2 int
+	sinkBool  bool
+	sinkInt   int
+	sinkInt2  int
+	sinkFloat float64
 )
 
 func checkZero(t *testing.T, name string, fn func()) {

@@ -190,6 +190,60 @@ func (z *zset) rem(m []byte) bool {
 	return z.nat.rem(m)
 }
 
+// pop removes up to count members from an end of the set and hands each to emit
+// in pop order: ascending from the smallest when min, descending from the
+// largest otherwise (spec 2064/f3/12 section 6.7). It backs ZPOPMIN, ZPOPMAX,
+// and ZMPOP. The native band rides the fused tree pop; the inline band trims its
+// ordered blob from the matching end, one entry per step. It returns the number
+// popped, which the caller uses to size the reply header and to decide whether
+// the key emptied. The emitted member aliases live storage and is copied into
+// the reply before the next step mutates it.
+func (z *zset) pop(min bool, count int, emit func(m []byte, score float64)) int {
+	if count <= 0 {
+		return 0
+	}
+	if z.enc == encSkiplist {
+		return z.nat.pop(min, count, emit)
+	}
+	return z.listpackPop(min, count, emit)
+}
+
+// listpackPop trims up to count entries off the ordered blob: the front entries
+// for a min pop, the back entries for a max pop. A min pop copies the head out,
+// emits it, then slides the tail down over it; a max pop reads the last entry
+// and truncates. Both emit before the mutation, so the aliased member survives
+// the reslice.
+func (z *zset) listpackPop(min bool, count int, emit func(m []byte, score float64)) int {
+	popped := 0
+	for popped < count && z.n > 0 {
+		if min {
+			m, s, next := decodeEntry(z.blob, 0)
+			emit(m, s)
+			z.blob = append(z.blob[:0], z.blob[next:]...)
+		} else {
+			off := z.lastEntryOffset()
+			m, s, _ := decodeEntry(z.blob, off)
+			emit(m, s)
+			z.blob = z.blob[:off]
+		}
+		z.n--
+		popped++
+	}
+	return popped
+}
+
+// lastEntryOffset returns the byte offset of the final entry in the blob, the
+// splice point a max pop truncates at. The caller guarantees a non-empty blob.
+func (z *zset) lastEntryOffset() int {
+	last := 0
+	for i := 0; i < len(z.blob); {
+		last = i
+		_, _, next := decodeEntry(z.blob, i)
+		i = next
+	}
+	return last
+}
+
 // entryView is one member and its score in a read snapshot. member aliases the
 // blob (listpack) or the native slab; a read command holds it only until the
 // reply is built, and no write runs during a read on the owner.

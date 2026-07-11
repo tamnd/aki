@@ -107,6 +107,77 @@ func BenchmarkDelete(b *testing.B) {
 	}
 }
 
+// BenchmarkPopMin measures the fused single-descent pop against the naive
+// two-descent baseline the lab priced at 109ns at 1M (SelectAt the min, then
+// Delete it), the win this slice exists to bank (lab 04, labs/f3/m2). Both arms
+// drain the tree and rebuild it outside the timer when it runs low, so the timed
+// region is the pop technique alone with no refill mixed in.
+func BenchmarkPopMin(b *testing.B) {
+	rebuild := func(scores []uint64) *Tree {
+		tr := newTreeSized(BranchSize, LeafSize, CountWidth)
+		for i, s := range scores {
+			tr.Insert(s, nil, uint32(i), nilMembers{})
+		}
+		return tr
+	}
+	for _, n := range benchCards {
+		b.Run(fmt.Sprintf("card=%d/fused", n), func(b *testing.B) {
+			_, scores := benchTree(n)
+			tr := rebuild(scores)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if tr.Len() == 0 {
+					b.StopTimer()
+					tr = rebuild(scores)
+					b.StartTimer()
+				}
+				tr.PopMin()
+			}
+		})
+		b.Run(fmt.Sprintf("card=%d/twoDescent", n), func(b *testing.B) {
+			_, scores := benchTree(n)
+			tr := rebuild(scores)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if tr.Len() == 0 {
+					b.StopTimer()
+					tr = rebuild(scores)
+					b.StartTimer()
+				}
+				s, _, _ := tr.SelectAt(0)
+				tr.Delete(s, nil, nilMembers{})
+			}
+		})
+	}
+}
+
+// BenchmarkPopMinN measures the ZMPOP-style drain per element at the lab's
+// saturating batch of 31 (one leaf). The tree is rebuilt when it drains, so the
+// steady cost is the fused pop looped over a cache-resident spine.
+func BenchmarkPopMinN(b *testing.B) {
+	const batch = 31
+	for _, n := range benchCards {
+		b.Run(fmt.Sprintf("card=%d", n), func(b *testing.B) {
+			tr, scores := benchTree(n)
+			b.ResetTimer()
+			done := 0
+			for i := 0; i < b.N; i += batch {
+				if done+batch > n {
+					b.StopTimer()
+					tr = newTreeSized(BranchSize, LeafSize, CountWidth)
+					for j, s := range scores {
+						tr.Insert(s, nil, uint32(j), nilMembers{})
+					}
+					done = 0
+					b.StartTimer()
+				}
+				tr.PopMinN(batch, func(uint64, uint32) {})
+				done += batch
+			}
+		})
+	}
+}
+
 // TestBytesPerEntryReport logs the memory column the milestone gates against the
 // 2-3B/entry F14 bar: the structural overhead beyond the 16-byte leaf entry, for
 // both a right-edge 0.9-fill bulk load and random single-key insertion (which
