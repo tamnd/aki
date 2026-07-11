@@ -216,6 +216,18 @@ func init() {
 	register("ZCOUNT", zset.Zcount, 3, 3, true)
 	register("ZLEXCOUNT", zset.Zlexcount, 3, 3, true)
 
+	// The pops and random surface (spec 2064/f3/12 sections 6.7, 6.8): ZPOPMIN,
+	// ZPOPMAX, and ZRANDMEMBER key on the first argument the same way ZADD does.
+	// ZMPOP leads with numkeys, so its routing key is the argument after it
+	// (keyAt=1), the same post-count route SINTERCARD uses; it reads every listed
+	// key from that shard's registry, the co-located-operand convention. The
+	// blocking forms BZPOPMIN/BZPOPMAX/BZMPOP are deferred to the F17 intent slice.
+	register("ZPOPMIN", zset.Zpopmin, 1, 2, true)
+	register("ZPOPMAX", zset.Zpopmax, 1, 2, true)
+	register("ZRANDMEMBER", zset.Zrandmember, 1, 3, true)
+	register("ZMPOP", zset.Zmpop, 3, -1, false)
+	table["ZMPOP"].keyAt = 1
+
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
