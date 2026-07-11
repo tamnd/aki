@@ -15,12 +15,10 @@ import (
 // the same call.
 //
 // A write that would breach the byte budget converts the band one way to the
-// native form (F4, never backward). The native form here is a placeholder slice
-// clearly marked for the chunked-deque slice to replace file for file, the same
-// staged-seam pattern the set band used for its native member table: the
-// placeholder answers every command correctly so the band-transition
-// differential holds, and the resident ring-backed deque drops in behind the
-// same encoding() and length() seam later.
+// native form (F4, never backward). The native form is the owner-local
+// ring-backed chunked deque in native.go (spec 2064/f3/13 section 2): the inline
+// blob's elements move into the deque's chunks on promotion, and every command
+// reaches the deque through the encoding() and length() seam this file owns.
 
 const (
 	// listpackBudget is Redis's list-max-listpack-size -2 default: an 8 KiB
@@ -71,9 +69,8 @@ type list struct {
 	n    int    // live element count
 	lpsz int    // packed listpack byte estimate, lpOverhead + sum of entry sizes
 
-	// native band placeholder (encQuicklist): the chunked-deque slice replaces
-	// this file for file. A plain element slice, correct but not the resident
-	// ring-backed deque the gate measures.
+	// native band (encQuicklist): the owner-local ring-backed chunked deque in
+	// native.go once a write crosses the budget.
 	nat *native
 
 	everLarge bool
@@ -95,7 +92,7 @@ func (l *list) encoding() encoding {
 // length is LLEN in O(1) on both bands.
 func (l *list) length() int {
 	if l.nat != nil {
-		return len(l.nat.elems)
+		return l.nat.count
 	}
 	return l.n
 }
@@ -327,18 +324,18 @@ func uvarintLen(x uint64) int {
 	return n
 }
 
-// toNative promotes the inline band to the native placeholder, the one-way F4
-// transition (spec 2064/f3/13 section 4.3). It copies every element into the
-// placeholder slice, sets the sticky quicklist bit, and releases the inline
-// blob. The chunked-deque slice replaces the body of native with the resident
-// ring; this function keeps its signature.
+// toNative promotes the inline band to the native chunked deque, the one-way F4
+// transition (spec 2064/f3/13 section 4.3). It pushes every element into the
+// deque through the tail path (adopting the inline order), sets the sticky
+// quicklist bit, and releases the inline blob. A single oversized element lands
+// as a lone chunk through the same push path.
 func (l *list) toNative() {
 	if l.nat != nil {
 		return
 	}
-	nt := &native{elems: make([][]byte, 0, l.n+1)}
+	nt := &native{}
 	for _, v := range l.inlineDecode() {
-		nt.elems = append(nt.elems, cloneBytes(v))
+		nt.pushBack(v)
 	}
 	l.nat = nt
 	l.blob = nil
