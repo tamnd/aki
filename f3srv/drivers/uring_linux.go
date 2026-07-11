@@ -716,9 +716,11 @@ func (l *uringLoop) service(rc *uringConn) {
 				l.closeConn(rc)
 				return
 			}
-		} else if rc.throttled && rc.sc.CanEnqueue() {
-			// The drain opened the pipeline window; consume the parse
-			// backlog before parking.
+		} else if rc.throttled && rc.sc.CanEnqueue() && !rc.sc.Blocked() {
+			// The drain opened the pipeline window and no block is outstanding;
+			// consume the parse backlog before parking. A still-blocked
+			// connection stays parked with its backlog until the serving push
+			// drains the barrier, then this same edge re-parses it.
 			continue
 		}
 		if yielded {
@@ -847,7 +849,12 @@ func (l *uringLoop) parsePass(rc *uringConn) bool {
 	cmds := uint64(0)
 	throttled := false
 	for rc.pos < rc.n {
-		if !rc.sc.CanEnqueue() {
+		// The pipeline window closing and an unresolved block both stop the
+		// parse the same way: the leftover stays in rbuf as the backlog and the
+		// resume edge re-runs parsePass. Folding Blocked in keeps a command
+		// pipelined behind a BLPOP from running until the block's reply goes out,
+		// for one relaxed load on the open-window path.
+		if !rc.sc.CanEnqueue() || rc.sc.Blocked() {
 			throttled = true
 			break
 		}

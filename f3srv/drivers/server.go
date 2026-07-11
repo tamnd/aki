@@ -9,6 +9,7 @@ import (
 	"net/http/pprof"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tamnd/aki/engine/f3/shard"
 	"github.com/tamnd/aki/f3srv/dispatch"
@@ -69,6 +70,16 @@ const (
 	// stays put until the buffer fills, so a large half-arrived bulk is not
 	// re-copied on every read.
 	compactMax = 512
+
+	// blockPollSpin and blockPollSleep tune the handlePair reader's wait for a
+	// block to clear. That shape's writer drains on another goroutine, so the
+	// reader cannot drain the barrier itself and polls instead: it spins a short
+	// window (a serving push usually lands fast) before it sleeps, keeping a long
+	// block off a busy core. handleSingle never uses these; it drains the block
+	// in its boundary. ShapePair is the lab-only A/B shape, so the values favor
+	// simplicity over a tuned backoff.
+	blockPollSpin  = 512
+	blockPollSleep = 100 * time.Microsecond
 
 	// replyBufSize is the writer goroutine's socket buffer. The sizing rule is
 	// pipeline depth times typical reply size: the buffer must hold one full
@@ -464,6 +475,13 @@ func (s *Server) handleSingle(nc net.Conn) {
 			}
 		}
 		return true
+	}, func() bool {
+		// This shape's boundary already drained the block to completion (the
+		// for c.Owes() loop above waits for the parked reply), so on return the
+		// emit watermark has crossed the barrier and Blocked is already false.
+		// The readLoop's for c.Blocked() guard therefore never calls this; it
+		// exists to satisfy the shared signature.
+		return true
 	})
 }
 
@@ -528,6 +546,24 @@ func (s *Server) handlePair(nc net.Conn) {
 		// owns the drain and the socket flush.
 		c.Flush()
 		return true
+	}, func() bool {
+		// This shape's writer drains on its own goroutine, so the reader polls
+		// the barrier instead of draining it: spin a bounded window, then sleep
+		// so a long block does not burn a core. A closed connection surfaces as
+		// the writer goroutine finishing, which ends the wait so the reader can
+		// tear down. Returning true just re-checks Blocked in the caller.
+		for i := 0; i < blockPollSpin; i++ {
+			if !c.Blocked() {
+				return true
+			}
+		}
+		select {
+		case <-writerDone:
+			return false
+		default:
+		}
+		time.Sleep(blockPollSleep)
+		return true
 	})
 }
 
@@ -542,7 +578,17 @@ func (s *Server) handlePair(nc net.Conn) {
 // them into the hop node before returning, so the buffer is free again by the
 // time the loop advances), and either recycle the buffer whole or fold a
 // small tail to the head.
-func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary func() bool) {
+//
+// A blocking verb (BLPOP and kin) adds one gate: after it is dispatched the
+// connection's reader barrier is armed (Blocked), and the parse loop stops there
+// so a command pipelined behind an unresolved block does not run until the
+// block's reply goes out. The buffered tail is held, not dropped, and re-parsed
+// the moment the block clears. handleSingle drains the block inside boundary and
+// returns with the barrier already down, so its unblock is a no-op; handlePair's
+// writer drains on its own goroutine, so its unblock polls the barrier. On a
+// connection that never blocks the only added cost is one relaxed Blocked load
+// per parse iteration.
+func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary func() bool, unblock func() bool) {
 	var p resp.Parser
 	buf := make([]byte, readBufSize)
 	n, pos := 0, 0
@@ -566,48 +612,77 @@ func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary fu
 		cs.reads.bump()
 		n += m
 		if m > 0 {
-			cmds := uint64(0)
-			for pos < n {
-				args, consumed, st := p.Next(buf[pos:n])
-				if st == resp.NeedMore {
+			// The inner loop re-runs when a parse pass stopped on an unresolved
+			// block: once the block clears, the buffered tail is re-parsed
+			// without a fresh read. A pass that runs to the buffer's end or to a
+			// partial command breaks out and reads more.
+			for {
+				stoppedOnBlock := false
+				cmds := uint64(0)
+				for pos < n {
+					// A blocking command already dispatched on this connection
+					// holds the barrier: stop here so a pipelined command behind
+					// it does not run until its reply goes out. The tail stays
+					// buffered for the re-parse after the block clears.
+					if c.Blocked() {
+						stoppedOnBlock = true
+						break
+					}
+					args, consumed, st := p.Next(buf[pos:n])
+					if st == resp.NeedMore {
+						break
+					}
+					if st == resp.ProtoErr {
+						// Answer in pipeline order, then close: the stream cannot
+						// be resynced after a framing error.
+						_ = c.Do(shard.OpError, false, [][]byte{[]byte("ERR Protocol error: " + p.LastError())})
+						boundary()
+						return
+					}
+					pos += consumed
+					if len(args) == 0 {
+						continue
+					}
+					cmds++
+					if derr := dispatch.Dispatch(c, args); derr != nil {
+						return
+					}
+				}
+				if cmds > 0 {
+					// The pass's command count folds into one store, and a pass
+					// that completed commands is one batch boundary (section
+					// 2.2): commands/batch is the pipeline depth the server saw.
+					cs.commands.add(cmds)
+					cs.batches.bump()
+				}
+				if pos == n {
+					pos, n = 0, 0
+					// A giant inbound bulk grew the buffer; once drained, shrink
+					// back so an idle connection does not pin megabytes.
+					if len(buf) > 16*readBufSize {
+						buf = make([]byte, readBufSize)
+					}
+				} else if pos > 0 && n-pos <= compactMax {
+					n = copy(buf, buf[pos:n])
+					pos = 0
+				}
+				if !boundary() {
+					return
+				}
+				if !stoppedOnBlock {
 					break
 				}
-				if st == resp.ProtoErr {
-					// Answer in pipeline order, then close: the stream cannot
-					// be resynced after a framing error.
-					_ = c.Do(shard.OpError, false, [][]byte{[]byte("ERR Protocol error: " + p.LastError())})
-					boundary()
-					return
+				// The pass stopped on an unresolved block. Wait for its reply to
+				// go out, then re-parse the buffered tail so the pipelined
+				// command behind it runs the moment the block clears.
+				for c.Blocked() {
+					if !unblock() {
+						return
+					}
 				}
-				pos += consumed
-				if len(args) == 0 {
-					continue
+				if pos >= n {
+					break
 				}
-				cmds++
-				if derr := dispatch.Dispatch(c, args); derr != nil {
-					return
-				}
-			}
-			if cmds > 0 {
-				// The pass's command count folds into one store, and a pass
-				// that completed commands is one batch boundary (section 2.2):
-				// commands/batch is the pipeline depth the server actually saw.
-				cs.commands.add(cmds)
-				cs.batches.bump()
-			}
-			if pos == n {
-				pos, n = 0, 0
-				// A giant inbound bulk grew the buffer; once drained, shrink
-				// back so an idle connection does not pin megabytes.
-				if len(buf) > 16*readBufSize {
-					buf = make([]byte, readBufSize)
-				}
-			} else if pos > 0 && n-pos <= compactMax {
-				n = copy(buf, buf[pos:n])
-				pos = 0
-			}
-			if !boundary() {
-				return
 			}
 		}
 		if err != nil {

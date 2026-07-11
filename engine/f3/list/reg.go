@@ -17,7 +17,9 @@ import (
 // keyspace-unification slice folds this into the shared collection holder Ctx
 // grows, at which point this map goes away.
 type reg struct {
-	m map[string]*list
+	m       map[string]*list
+	waiters map[string]*waitList
+	wpool   waitPool
 }
 
 var regs sync.Map // *store.Store -> *reg
@@ -29,7 +31,10 @@ func registry(cx *shard.Ctx) *reg {
 	if v, ok := regs.Load(cx.St); ok {
 		return v.(*reg)
 	}
-	v, _ := regs.LoadOrStore(cx.St, &reg{m: make(map[string]*list)})
+	v, _ := regs.LoadOrStore(cx.St, &reg{
+		m:       make(map[string]*list),
+		waiters: make(map[string]*waitList),
+	})
 	return v.(*reg)
 }
 
@@ -51,6 +56,31 @@ func (g *reg) lookup(cx *shard.Ctx, key []byte) (l *list, wrong bool) {
 // drop removes an emptied list from the registry: Redis deletes a list the
 // moment its last element leaves.
 func (g *reg) drop(key []byte) { delete(g.m, string(key)) }
+
+// waitListFor returns the waiter FIFO for key, creating an empty one on first
+// block. It lazily initializes the map so a registry built directly in a unit
+// test (with a nil waiters map) can still park; the real registry() path
+// pre-builds it.
+func (g *reg) waitListFor(key []byte) *waitList {
+	if g.waiters == nil {
+		g.waiters = make(map[string]*waitList)
+	}
+	wl := g.waiters[string(key)]
+	if wl == nil {
+		wl = &waitList{pool: &g.wpool, key: string(key), head: nilIdx, tail: nilIdx}
+		g.waiters[string(key)] = wl
+	}
+	return wl
+}
+
+// dropWaitersIfEmpty removes a waiter list from the registry once its last
+// waiter leaves, mirroring drop for the value map so a key that was blocked on
+// and then drained leaves nothing behind.
+func (g *reg) dropWaitersIfEmpty(wl *waitList) {
+	if wl.n == 0 {
+		delete(g.waiters, wl.key)
+	}
+}
 
 // wrongType is the shared WRONGTYPE reply text, Redis's exact wording.
 const wrongType = "WRONGTYPE Operation against a key holding the wrong kind of value"
