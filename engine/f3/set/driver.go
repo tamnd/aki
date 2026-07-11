@@ -1,9 +1,6 @@
 package set
 
-import (
-	"bytes"
-	"slices"
-)
+import "slices"
 
 // The set-algebra driver (spec 2064/f3/11 section 6.4): for each command it
 // chooses between the probe path (iterate the smaller operand, probe the larger
@@ -12,11 +9,13 @@ import (
 // pair, by the pre-registered crossover and the merge floor.
 //
 // Probe is the always-correct baseline: it needs nothing but has() on the other
-// operands, so it works over every band (intset, listpack, native) and works
-// with SetAlgebraMaintain off, when no set is ever indexed. The merge path is an
-// optimization that only fires when both operands carry the maintained arrays
-// (the flag is on and both cleared the floor) and their size ratio sits below
-// the crossover. This keeps the dispatcher correct in both flag states: off, the
+// operands, so it works over every band (intset, listpack, native, partitioned)
+// and works with SetAlgebraMaintain off, when no set is ever indexed. The merge
+// path is an optimization that only fires when both operands carry the
+// maintained arrays (the flag is on and both cleared the floor), their band
+// shapes match (flat with flat, partitioned with partitioned; fanout.go runs
+// the partitioned pairs group by group), and their size ratio sits below the
+// crossover. This keeps the dispatcher correct in both flag states: off, the
 // kernels are simply unavailable and probe always runs; on, comparable large
 // pairs take the merge lever the gate box proves (doc 11 section 6.5).
 
@@ -45,21 +44,49 @@ const (
 )
 
 // mergeable reports whether a set carries the maintained sorted-hash arrays the
-// merge kernels stream. It is the native band with an engaged index, which only
-// happens under SetAlgebraMaintain once the set cleared the floor (algebra.go).
+// merge kernels stream: the native band with an engaged index, or the
+// partitioned band with every populated partition indexed (fanout.go). Either
+// only happens under SetAlgebraMaintain once the members cleared the floor
+// (algebra.go).
 func (s *set) mergeable() bool {
-	return s != nil && s.enc == encHashtable && s.ht.indexed()
+	if s == nil {
+		return false
+	}
+	switch s.enc {
+	case encHashtable:
+		return s.ht.indexed()
+	case encPartitioned:
+		return s.part.indexed()
+	}
+	return false
+}
+
+// mergeablePair reports whether two operands can take the merge path together:
+// both mergeable and the same band shape, so the group views line up (flat
+// with flat, partitioned with partitioned; fanout.go). A mixed flat and
+// partitioned pair falls to probe, the recorded cross-shape deferral.
+func mergeablePair(a, b *set) bool {
+	return a.mergeable() && b.mergeable() && a.enc == b.enc
 }
 
 // avgMemberBytes is the mean live member size, the large-member signal the
-// crossover bias reads (lab 03). It is defined only for the native band; the
-// inline bands never reach the merge path.
+// crossover bias reads (lab 03). It is defined only for the bands that reach
+// the merge path; the inline bands never do.
 func (s *set) avgMemberBytes() int {
-	if s.enc != encHashtable || s.card() == 0 {
+	if s.card() == 0 {
 		return 0
 	}
-	live := len(s.ht.slab) - s.ht.dead
-	return live / s.card()
+	switch s.enc {
+	case encHashtable:
+		return (len(s.ht.slab) - s.ht.dead) / s.card()
+	case encPartitioned:
+		live := 0
+		for _, h := range s.part.parts {
+			live += len(h.slab) - h.dead
+		}
+		return live / s.card()
+	}
+	return 0
 }
 
 // chooseMergeIntersect decides probe versus merge for one intersection pair,
@@ -68,7 +95,7 @@ func (s *set) avgMemberBytes() int {
 // (raised for large members). Everything else, including either operand inline
 // or the flag off, falls to probe.
 func chooseMergeIntersect(small, large *set) bool {
-	if !small.mergeable() || !large.mergeable() {
+	if !mergeablePair(small, large) {
 		return false
 	}
 	if small.card() < algebraFloor {
@@ -86,7 +113,7 @@ func chooseMergeIntersect(small, large *set) bool {
 // to probe); the crossover gates the max/min ratio, raised for large members on
 // the driving operand.
 func chooseMergeDiff(a, b *set) bool {
-	if !a.mergeable() || !b.mergeable() {
+	if !mergeablePair(a, b) {
 		return false
 	}
 	if a.card() < algebraFloor || b.card() < algebraFloor {
@@ -109,7 +136,7 @@ func chooseMergeDiff(a, b *set) bool {
 // and past the floor, and it then dedups the pair in one sequential pass with no
 // transient table.
 func chooseMergeUnion(a, b *set) bool {
-	if !a.mergeable() || !b.mergeable() {
+	if !mergeablePair(a, b) {
 		return false
 	}
 	return min(a.card(), b.card()) >= algebraFloor
@@ -148,22 +175,6 @@ func sinter(sets []*set, emit func(m []byte)) {
 	})
 }
 
-// mergeIntersectPair intersects two indexed operands through the section-6.6
-// kernel, emitting each confirmed member once in A's ascending hash order.
-func mergeIntersectPair(a, b *set, emit func(m []byte)) {
-	ha, hb := a.ht, b.ht
-	sa, _, _ := ha.mergeStream(nil)
-	sb, _, _ := hb.mergeStream(nil)
-	mergeIntersect(&sa, &sb, func(oa, ob uint32) bool {
-		ma := ha.memberByOrd(oa)
-		if bytes.Equal(ma, hb.memberByOrd(ob)) {
-			emit(ma)
-			return true
-		}
-		return false
-	})
-}
-
 // sintercard counts the intersection with SINTERCARD's LIMIT early-stop: a
 // positive limit stops the count the moment it is reached, limit 0 means
 // unlimited (Redis). The merge path threads the limit through
@@ -180,12 +191,7 @@ func sintercard(sets []*set, limit int) int {
 	small := order[0]
 	rest := order[1:]
 	if len(order) == 2 && chooseMergeIntersect(small, order[1]) {
-		ha, hb := small.ht, order[1].ht
-		sa, _, _ := ha.mergeStream(nil)
-		sb, _, _ := hb.mergeStream(nil)
-		return mergeIntersectCount(&sa, &sb, func(oa, ob uint32) bool {
-			return bytes.Equal(ha.memberByOrd(oa), hb.memberByOrd(ob))
-		}, limit)
+		return mergeIntersectCountPair(small, order[1], limit)
 	}
 	count := 0
 	small.eachUntil(func(m []byte) bool {
@@ -226,17 +232,6 @@ func sdiff(sets []*set, emit func(m []byte)) {
 	})
 }
 
-// mergeDiffPair walks A minus B through the section-6.6 kernel, emitting each
-// surviving A member in A's ascending hash order.
-func mergeDiffPair(a, b *set, emit func(m []byte)) {
-	ha, hb := a.ht, b.ht
-	sa, _, _ := ha.mergeStream(nil)
-	sb, _, _ := hb.mergeStream(nil)
-	mergeDiff(&sa, &sb, func(oa, ob uint32) bool {
-		return bytes.Equal(ha.memberByOrd(oa), hb.memberByOrd(ob))
-	}, func(o uint32) { emit(ha.memberByOrd(o)) })
-}
-
 // sunion emits the distinct union of every operand (Redis SUNION). Missing keys
 // contribute nothing. Two indexed operands dedup in one merge pass; otherwise a
 // transient member table is the dedup, exactly the doc's "the result table is the
@@ -267,16 +262,4 @@ func sunion(sets []*set, emit func(m []byte)) {
 		s.each(func(m []byte) { dst.addRaw(m) })
 	}
 	dst.each(emit)
-}
-
-// mergeUnionPair walks A union B through the section-6.6 kernel, emitting each
-// distinct member once (A's copy on a tie) with no transient table.
-func mergeUnionPair(a, b *set, emit func(m []byte)) {
-	ha, hb := a.ht, b.ht
-	sa, _, _ := ha.mergeStream(nil)
-	sb, _, _ := hb.mergeStream(nil)
-	mergeUnion(&sa, &sb,
-		func(oa, ob uint32) bool { return bytes.Equal(ha.memberByOrd(oa), hb.memberByOrd(ob)) },
-		func(o uint32) { emit(ha.memberByOrd(o)) },
-		func(o uint32) { emit(hb.memberByOrd(o)) })
 }
