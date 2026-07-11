@@ -30,11 +30,15 @@ Addendum, filed 2026-07-11 before the box session, after the rebase onto the are
 
 ## Kernel and probe
 
-Pending the box session: uname -r, the uringAvailable probe result, and the multishot-recv feature line (5.19+) recorded here before any timed rep.
+Recorded 2026-07-11 before any timed rep.
+Kernel: 6.18.33.2-microsoft-standard-WSL2 (well past the 5.19 multishot-recv line; single-shot is this slice's design choice, not a kernel limit).
+kernel.io_uring_disabled = 0.
+Probe: f3srv -net uring -net-loops 3 at commit 4db804f serves with INFO net_driver:uring, no fallback line in the log, SET and GET round-trip; the uringAvailable gate (setup, IORING_FEAT_NODROP, REGISTER_PROBE for ASYNC_CANCEL/READ/SEND/RECV) passed.
 
 ## Lab 21 (echo loops)
 
-Pending; table and verdict land in labs/f3/m0/21_uring/README.md and the headline is copied here.
+Table and verdict in labs/f3/m0/21_uring/README.md; the headline: the ring deletes the loop syscalls wholesale (2.008 to 0.004 syscalls/op at P1/C512) and is never slower, but on this WSL2 kernel that deletion is worth 6-7% of echo wall time, not the 2x-shaped slice the reactor campaign's blocking-path syscall figures (876ns write + 537ns read) suggested.
+Hot nonblocking loopback syscalls are much cheaper here than the blocking-path measurements, so PRED-U1's 1.4-1.9x band is at risk before the A/B starts, and the P1 verdict will be set by engine and wake costs the ring does not touch.
 
 ## A/B matrix
 

@@ -20,8 +20,27 @@ syscalls/op counts the loop side only, because the loop's syscall budget is what
 
 ## Results
 
-Pending the box session; the sweep runs under the campaign's BOX LOCK alongside the A/B.
+Gate box, 2026-07-11, kernel 6.18.33.2-microsoft-standard-WSL2, `taskset -c 0-7 sh run.sh`, commit 4db804f.
+
+| conns | pipe | epoll ns/op | epoll sys/op | uring ns/op | uring sys/op | uring/epoll ns |
+|------:|-----:|------------:|-------------:|------------:|-------------:|---------------:|
+| 1     | 1    | 26307       | 3.000        | 26345       | 2.000        | 1.00x          |
+| 1     | 16   | 1674        | 0.188        | 1651        | 0.125        | 0.99x          |
+| 64    | 1    | 2055        | 2.023        | 1973        | 0.043        | 0.96x          |
+| 64    | 16   | 136         | 0.126        | 128         | 0.003        | 0.94x          |
+| 512   | 1    | 2133        | 2.008        | 1989        | 0.004        | 0.93x          |
+| 512   | 16   | 139         | 0.125        | 130         | 0.000        | 0.94x          |
+
+Prediction judgments:
+
+- L-1 CORRECT: epoll P1/C512 reads 2.008 syscalls/op, uring reads 0.004, a 500x fold; the deletion mechanism works exactly as designed.
+- L-2 WRONG, and it is the finding of the lab: uring ns/op at P1/C512 is 0.93x epoll's, not the predicted at-most-0.6x. Deleting two syscalls per op bought 144ns/op of wall time, not the ~1.4us the bare-metal per-syscall figures (876ns write + 537ns read) priced in. On this WSL2 kernel a hot non-blocking read/write on loopback is far cheaper than those blocking-path figures, so the syscall floor the ring deletes is a small slice of the echo op here.
+- L-3 CORRECT: P1/C1 reads 1.00x, one sleeping transition per op either way.
+- L-4 CORRECT: every P16 cell sits at 0.94x, inside the 1.1x band.
 
 ## Verdict
 
-Pending the results table.
+Frozen 2026-07-11.
+The ring deletes the loop's syscalls wholesale (2.0 to 0.004 syscalls/op at P1/C512) and is never slower: 0.93-0.94x ns/op at every folded cell, parity at C1.
+But on this virtualized kernel the deleted syscalls are worth single-digit percent of wall time, not the 2x-shaped slice the reactor campaign's blocking-path measurements suggested, so the server A/B should expect uring to land near the reactor arm plus a few percent, and the section 5.4 question at P1 will be answered by the engine and wake costs the ring does not touch.
+The 0.6x-shaped win, if it exists, lives on bare metal where syscall entry is the measured 500-900ns; that scoping goes in the campaign note's verdict.
