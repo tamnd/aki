@@ -1,6 +1,7 @@
 package set
 
 import (
+	"math/rand/v2"
 	"sort"
 	"strconv"
 	"testing"
@@ -214,10 +215,10 @@ func TestAtCoversEveryIndex(t *testing.T) {
 	}
 }
 
-// The owner-local PRNG spreads draws roughly uniformly; a coarse chi-style
-// bucket check catches a stuck or degenerate generator without being flaky.
+// The owner-local PRNG spreads draws roughly uniformly; a coarse bucket check
+// catches a stuck or degenerate generator without being flaky.
 func TestDrawSpread(t *testing.T) {
-	g := &reg{rng: 0x9e3779b97f4a7c15}
+	g := &reg{m: map[string]*set{}, rng: *rand.NewPCG(1, 2)}
 	const n, iters = 8, 80000
 	var hits [n]int
 	for i := 0; i < iters; i++ {
