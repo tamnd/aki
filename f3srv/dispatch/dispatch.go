@@ -5,6 +5,7 @@
 package dispatch
 
 import (
+	"github.com/tamnd/aki/engine/f3/set"
 	"github.com/tamnd/aki/engine/f3/shard"
 	"github.com/tamnd/aki/engine/f3/str"
 )
@@ -18,6 +19,8 @@ type entry struct {
 	minArgs int // arguments after the verb
 	maxArgs int // -1: unbounded, the handler validates the tail
 	keyed   bool
+	keyAt   int // index into args[1:] of the routing key; 0 for every verb
+	// but OBJECT, whose key follows its subcommand token
 
 	// The fan-out route: a non-zero fan kind scatters the command through
 	// DoFan with fanOp as the per-shard sub-command op. A verb with both a
@@ -86,7 +89,10 @@ func init() {
 	register("SET", str.Set, 2, -1, true)
 	register("GET", str.Get, 1, 1, true)
 	register("STRLEN", str.Strlen, 1, 1, true)
-	register("TYPE", str.Type, 1, 1, true)
+	// TYPE spans the string store and the set registry, so the set package
+	// owns its point handler; the same holds for the single-key EXISTS and DEL
+	// paths registered below.
+	register("TYPE", set.Type, 1, 1, true)
 
 	// The tier-one multi-key commands: a single key keeps the point path,
 	// more keys scatter through the fan-out; MGET and MSET always fan. The
@@ -95,9 +101,9 @@ func init() {
 	mset := registerShard(str.MSetShard)
 	del := registerShard(str.DelShard)
 	exists := registerShard(str.ExistsShard)
-	register("EXISTS", str.Exists, 1, -1, true)
-	register("DEL", str.Del, 1, -1, true)
-	register("UNLINK", str.Del, 1, -1, true)
+	register("EXISTS", set.Exists, 1, -1, true)
+	register("DEL", set.Del, 1, -1, true)
+	register("UNLINK", set.Del, 1, -1, true)
 	register("MGET", nil, 1, -1, true)
 	register("MSET", nil, 2, -1, true)
 	registerFan("EXISTS", shard.FanCount, exists, false, false)
@@ -146,6 +152,25 @@ func init() {
 	register("SETRANGE", str.SetRange, 3, 3, true)
 	register("GETRANGE", str.GetRange, 3, 3, true)
 	register("SUBSTR", str.GetRange, 3, 3, true)
+
+	// The set surface (spec 2064/f3/11 M1, inline band). Point ops, draws,
+	// enumeration, and the inline SSCAN, plus OBJECT ENCODING for the
+	// differential encoding check. Handlers validate their own tails.
+	register("SADD", set.Sadd, 2, -1, true)
+	register("SREM", set.Srem, 2, -1, true)
+	register("SISMEMBER", set.Sismember, 2, 2, true)
+	register("SMISMEMBER", set.Smismember, 2, -1, true)
+	register("SCARD", set.Scard, 1, 1, true)
+	register("SMEMBERS", set.Smembers, 1, 1, true)
+	register("SPOP", set.Spop, 1, 2, true)
+	register("SRANDMEMBER", set.Srandmember, 1, 2, true)
+	register("SSCAN", set.Sscan, 2, -1, true)
+	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
+	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
+	// keyless here; the keyAt route in Dispatch sends it to the owning shard
+	// when a key is present, and OBJECT HELP with no key round-robins.
+	register("OBJECT", set.Object, 1, -1, false)
+	table["OBJECT"].keyAt = 1
 }
 
 // Handlers returns the op-indexed handler vector for Runtime.Use.
@@ -179,6 +204,16 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 	}
 	if e.fan != 0 && (e.fanOnly || n > 1) {
 		return dispatchFan(c, e, args)
+	}
+	if e.keyAt > 0 && n > e.keyAt {
+		// A verb whose routing key is not its first argument (OBJECT) goes to
+		// the shard owning args[keyAt]; without that key it falls through to the
+		// keyless path below.
+		err := c.DoAt(e.op, e.keyAt, args[1:])
+		if err == shard.ErrTooBig {
+			return oops(c, "ERR command too large")
+		}
+		return err
 	}
 	err := c.Do(e.op, e.keyed, args[1:])
 	if err == shard.ErrTooBig {
