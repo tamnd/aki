@@ -14,7 +14,6 @@ package f2srv
 import (
 	"net"
 	"strconv"
-	"sync"
 	"sync/atomic"
 
 	"github.com/tamnd/aki/engine/f2raw"
@@ -38,7 +37,6 @@ type Server struct {
 	ReactorLoops int
 
 	ln net.Listener
-	wg sync.WaitGroup
 }
 
 // New builds a server over store with the default auto network driver.
