@@ -777,6 +777,72 @@ func (nt *native) each(fn func(v []byte)) {
 	}
 }
 
+// lpos scans the deque for target under the RANK, COUNT, and MAXLEN rules and
+// returns the matching dense positions (LPOS, section 5.9). It is a contiguous
+// frame walk, the ~2.9ns/elem scan note 29 measured, not a per-index probe: a
+// positive rank walks chunks head to tail and each chunk's live window low to
+// high, a negative rank walks tail to head and high to low, and the absolute
+// position is the running count of elements walked, so no locate is needed to
+// name a hit. skip is the RANK-1 matches to pass before collecting, limit <= 0
+// collects every match and limit > 0 caps the count, and maxlen > 0 bounds the
+// number of elements compared (not matched), with early termination on any
+// stop. The rule bookkeeping mirrors the flat lposScan exactly; only the
+// traversal changes from get(i) to a direct frame walk, so the result is
+// byte-identical for every input.
+func (nt *native) lpos(target []byte, rank, limit, maxlen int) []int {
+	forward := rank > 0
+	skip := rank
+	if skip < 0 {
+		skip = -skip
+	}
+	skip-- // matches to skip before collecting
+	var out []int
+	compared := 0
+	// visit applies the rules to the element at absolute position abs and
+	// reports whether the walk should continue.
+	visit := func(abs int, val []byte) bool {
+		if maxlen > 0 && compared >= maxlen {
+			return false
+		}
+		compared++
+		if !bytesEqual(val, target) {
+			return true
+		}
+		if skip > 0 {
+			skip--
+			return true
+		}
+		out = append(out, abs)
+		return limit <= 0 || len(out) < limit
+	}
+	if forward {
+		abs := 0
+		for i := 0; i < nt.ring.n; i++ {
+			c := nt.ring.at(i)
+			for p := c.lo; p < c.hi; p++ {
+				val, _ := c.frameAt(int(c.dir[p]))
+				if !visit(abs, val) {
+					return out
+				}
+				abs++
+			}
+		}
+	} else {
+		abs := nt.count - 1
+		for i := nt.ring.n - 1; i >= 0; i-- {
+			c := nt.ring.at(i)
+			for p := c.hi - 1; p >= c.lo; p-- {
+				val, _ := c.frameAt(int(c.dir[p]))
+				if !visit(abs, val) {
+					return out
+				}
+				abs--
+			}
+		}
+	}
+	return out
+}
+
 // --- rebuild support ------------------------------------------------------
 
 // toSlice materializes every element as an owned copy, independent of the chunk

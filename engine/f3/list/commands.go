@@ -454,7 +454,16 @@ func clampRange(start, stop, n int) (lo, hi int, ok bool) {
 // returns the matching positions. A positive rank scans head to tail, a negative
 // rank tail to head; limit <= 0 collects every match, limit > 0 caps the count;
 // maxlen > 0 bounds the number of elements compared.
+//
+// The native band scans contiguously through the chunk frames without a
+// per-element directory seek (native.lpos, the note 29 walk); the inline band
+// keeps the get(i) walk, which on the packed inline blob is itself a short bounded
+// scan (the blob never exceeds the ~8 KiB listpack budget), so the O(i)-per-get
+// cost is bounded and off the gate's path (spec 2064/f3/13 section 5.9).
 func lposScan(l *list, target []byte, rank, limit, maxlen int) []int {
+	if l.nat != nil {
+		return l.nat.lpos(target, rank, limit, maxlen)
+	}
 	forward := rank > 0
 	skip := rank
 	if skip < 0 {
