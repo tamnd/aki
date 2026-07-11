@@ -179,17 +179,48 @@ func (n *nativeStore) each(fn func(m []byte, score float64)) {
 	})
 }
 
-// rankScan writes the count of members sorting before m into idx. The caller
-// has confirmed m is present, so the hash probe and the counted descent both
-// hit; the descent is O(log n) on the subtree counts, no walk.
-func (n *nativeStore) rankScan(m []byte, idx *int) {
+// rank returns the count of members sorting before m, its score, and whether m
+// is present, in a single member-hash probe plus one counted descent (section
+// 6.3). The probe yields the raw score bits, which decode to the float ZRANK
+// WITHSCORE formats and encode to the sortable key the tree descends on, so the
+// hot path touches the hash once and the tree once, no second lookup. The
+// descent is O(log n) on the subtree counts, no walk.
+func (n *nativeStore) rank(m []byte) (int, float64, bool) {
 	ord, ok := n.tbl.Find(store.Hash(m), m, n)
 	if !ok {
-		return
+		return 0, 0, false
 	}
 	sc := math.Float64frombits(n.recs[ord].bits)
 	r, _ := n.tree.Rank(scoreKey(sc), m, n)
-	*idx = int(r)
+	return int(r), sc, true
+}
+
+// walkRange streams entries at forward ranks lo..hi inclusive in ascending
+// order, handing each member (aliasing the slab, valid until the next write)
+// and its raw score bits to fn. It seeks to lo with a counted select then
+// follows the leaf chain over just the window (section 6.4), so a far ZRANGE is
+// a seek plus a bounded walk, not a full scan, and it allocates nothing.
+func (n *nativeStore) walkRange(lo, hi int, fn func(m []byte, bits uint64)) {
+	remaining := hi - lo + 1
+	n.tree.WalkFromRank(uint64(lo), func(_ uint64, ref uint32) bool {
+		r := &n.recs[ref]
+		fn(n.slab[r.loc:r.loc+r.mlen], r.bits)
+		remaining--
+		return remaining > 0
+	})
+}
+
+// walkRangeRev streams the same forward-rank window hi..lo in descending order,
+// the ZRANGE REV and ZREVRANGE walk. It descends to the high end and walks back
+// with the tree's reverse leaf walk, re-seeking at most once per leaf boundary.
+func (n *nativeStore) walkRangeRev(lo, hi int, fn func(m []byte, bits uint64)) {
+	remaining := hi - lo + 1
+	n.tree.WalkFromRankRev(uint64(hi), func(_ uint64, ref uint32) bool {
+		r := &n.recs[ref]
+		fn(n.slab[r.loc:r.loc+r.mlen], r.bits)
+		remaining--
+		return remaining > 0
+	})
 }
 
 // maybeRebuild rebuilds the whole dual structure from its live entries once
