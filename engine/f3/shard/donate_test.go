@@ -108,32 +108,57 @@ func TestFanOutAllTasksOnce(t *testing.T) {
 	}
 }
 
-// TestFanOutUsesDonees proves the parallelism is real: with an idle pool and
-// tasks long enough to outlast the donees' wake latency, more than one
-// goroutine must execute tasks. This is the live half of the k-way scaling
-// story; the magnitude is the lab's to measure (labs/f3/m1/09_donation_live).
+// TestFanOutUsesDonees proves the parallelism is real: with an idle pool, more
+// than one goroutine must execute tasks concurrently. Rather than race the
+// donees' wake against a serial drain (a timing bet that loses on a loaded
+// runner, where the coordinator finishes every spin-task before any donee is
+// scheduled), each task parks on a shared gate until two distinct goroutines
+// are simultaneously inside tasks. The coordinator holding one task cannot
+// drain the rest, since FanOut offers the whole job to idle donees up front, so
+// the donees claim the remaining tasks off the cursor: the moment a second
+// goroutine enters, overlap is witnessed and the gate opens. This can only fail
+// if donation never engages at all, never because a runner was slow: a late
+// donee wake just makes the witness arrive later, and the coordinator is parked
+// waiting for it, not draining past it. This is the live half of the k-way
+// scaling story; the magnitude is the lab's to measure
+// (labs/f3/m1/09_donation_live).
 func TestFanOutUsesDonees(t *testing.T) {
 	const tasks = 64
-	var gids [tasks]uint64
+	const need = 2 // distinct goroutines that must be inside tasks at once
+	var mu sync.Mutex
+	seen := map[uint64]bool{}
+	release := make(chan struct{})
+	overlapped := make(chan struct{})
+	var once sync.Once
 	rt := fanRuntime(t, 8, func(k int) {
-		spin(100 * time.Microsecond)
-		gids[k] = gid()
+		mu.Lock()
+		seen[gid()] = true
+		n := len(seen)
+		mu.Unlock()
+		if n >= need {
+			once.Do(func() { close(overlapped) })
+		}
+		<-release // hold the goroutine so the coordinator cannot drain serially
 	}, tasks)
 	c := rt.NewConn()
 	if err := c.Do(opFan, true, args("k")); err != nil {
 		t.Fatal(err)
 	}
 	c.Flush()
-	collect(t, c, 1)
-	distinct := map[uint64]bool{}
-	for _, g := range gids {
-		if g == 0 {
-			t.Fatal("a task did not record its goroutine")
-		}
-		distinct[g] = true
+	select {
+	case <-overlapped:
+	case <-time.After(15 * time.Second):
+		close(release)
+		collect(t, c, 1)
+		t.Fatal("donation never engaged: fewer than 2 goroutines ran tasks concurrently")
 	}
-	if len(distinct) < 2 {
-		t.Fatalf("all %d tasks ran on one goroutine; donation never engaged", tasks)
+	close(release)
+	collect(t, c, 1)
+	mu.Lock()
+	got := len(seen)
+	mu.Unlock()
+	if got < need {
+		t.Fatalf("only %d goroutines ran tasks; donation never engaged", got)
 	}
 }
 

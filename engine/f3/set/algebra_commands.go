@@ -10,12 +10,12 @@ import (
 // SINTER, SUNION, SDIFF, and SINTERCARD. Every operand key routes to one shard
 // (the dispatch table keys SINTER/SUNION/SDIFF on their first key and SINTERCARD
 // on the key after numkeys), so a handler reads every operand from its own
-// owner-local registry with no cross-shard hop. That holds while a command's
-// keys are co-located, which the current router does not guarantee for keys that
-// hash to different shards; a true cross-shard gather rides the F17 intent path
-// the write slices build, and until then multi-key set reads assume co-located
-// operands. This is recorded honestly rather than papered over with machinery
-// this slice does not own.
+// owner-local registry with no cross-shard hop. Dispatch guarantees that: a
+// command whose operands are co-located comes here, and one whose operands
+// span shards takes the F17 gather route instead (gathercross.go), which
+// clones the remote operands under the intent barrier and runs these same
+// drivers on the first key's owner. The STORE forms (setstore.go) still
+// assume co-located sources, the remaining recorded deferral.
 //
 // The reply is buffer-then-encode (doc 11 section 6.4, the setalgebra lab):
 // members land in the shard's value scratch as they are found, the exact count
@@ -93,34 +93,10 @@ func Sdiff(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // walk early. LIMIT 0 means unlimited (Redis). The command keys on the first
 // operand (args[1]) via the dispatch keyAt route, so args[0] here is numkeys.
 func Sintercard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	numkeys, ok := store.ParseInt(args[0])
-	if !ok || numkeys <= 0 {
-		r.Err("ERR numkeys should be greater than 0")
+	keys, limit, msg := sintercardArgs(args)
+	if msg != "" {
+		r.Err(msg)
 		return
-	}
-	nk := int(numkeys)
-	if nk > len(args)-1 {
-		r.Err("ERR Number of keys can't be greater than number of args")
-		return
-	}
-	keys := args[1 : 1+nk]
-	limit := 0
-	for i := 1 + nk; i < len(args); {
-		if !eqFold(args[i], "LIMIT") {
-			r.Err("ERR syntax error")
-			return
-		}
-		if i+1 >= len(args) {
-			r.Err("ERR syntax error")
-			return
-		}
-		lv, ok := store.ParseInt(args[i+1])
-		if !ok || lv < 0 {
-			r.Err("ERR LIMIT can't be negative")
-			return
-		}
-		limit = int(lv)
-		i += 2
 	}
 	sets, wrong := gather(registry(cx), cx, keys)
 	if wrong {
@@ -128,4 +104,33 @@ func Sintercard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	r.Int(int64(sintercard(cx, sets, limit)))
+}
+
+// sintercardArgs parses the SINTERCARD tail (numkeys, the keys, the LIMIT
+// option): the operand keys, the limit (0 unlimited), and the error reply
+// text when the tail is malformed. The point handler and the cross route
+// share it, and dispatch reads the keys through SintercardKeys for the
+// co-location check.
+func sintercardArgs(args [][]byte) (keys [][]byte, limit int, msg string) {
+	numkeys, ok := store.ParseInt(args[0])
+	if !ok || numkeys <= 0 {
+		return nil, 0, "ERR numkeys should be greater than 0"
+	}
+	nk := int(numkeys)
+	if nk > len(args)-1 {
+		return nil, 0, "ERR Number of keys can't be greater than number of args"
+	}
+	keys = args[1 : 1+nk]
+	for i := 1 + nk; i < len(args); {
+		if !eqFold(args[i], "LIMIT") || i+1 >= len(args) {
+			return nil, 0, "ERR syntax error"
+		}
+		lv, ok := store.ParseInt(args[i+1])
+		if !ok || lv < 0 {
+			return nil, 0, "ERR LIMIT can't be negative"
+		}
+		limit = int(lv)
+		i += 2
+	}
+	return keys, limit, ""
 }
