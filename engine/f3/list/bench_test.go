@@ -379,3 +379,162 @@ func trimViaRebuild(nt *native, start, stop int) {
 	all := nt.toSlice()
 	nt.rebuild(all[start : stop+1])
 }
+
+// The LPOS scan, native band, against the per-index walk it replaces (spec
+// 2064/f3/13 section 5.9). native.lpos walks the chunk frames contiguously and
+// carries the absolute position as the running element count, so it pays no
+// per-element directory seek; the old shape resolved every index through
+// locate, which above the flat/Fenwick crossover is an O(log chunks) rank
+// descent per element. Each arm builds a 100000-element deque (~782 chunks, well
+// past flatMax) and times a full scan: forward_tail seeks a token at the very
+// tail (the worst case for a head-to-tail walk, it compares every element),
+// backward_head seeks a token at the head with RANK -1 (the worst case for a
+// tail-to-head walk), and count_all collects every match of a token sprinkled
+// every 1000 positions with COUNT 0. The "contig" arm is the shipped native.lpos;
+// the "byindex" arm is the old per-element locate walk, kept here for the A/B.
+//
+// Measured on an Apple M4 (darwin/arm64, go1.26.5), one run, 100000 elements:
+//
+//	                              contig ns/op   byindex ns/op   contig ns/elem
+//	BenchmarkLPOS/forward_tail       301245        1326127          3.01
+//	BenchmarkLPOS/backward_head      295623        1328524          2.96
+//	BenchmarkLPOS/count_all          310923        1311041          3.11
+//
+// Verdict: the contiguous walk is ~3.0 ns per element compared, the low
+// single-digit ns the note 29 scan-cost lab predicts (~2.9ns/elem), while the
+// per-index walk pays ~13.2 ns per element, about 4.4x more, because it resolves
+// every position through locate on top of the same compare. The win is the
+// deleted per-element directory seek, not a cheaper compare: both arms run the
+// same length-gated bytesEqual, and both allocate only the small result slice
+// (1 alloc for a single-hit reply, 8 for the count-all growth). One honest note:
+// the byindex arm here is the deque's own per-element locate (a resident Fenwick
+// descent, ~13 ns), not f1's ~70 ns dense-model hash probe, so this A/B prices
+// the seek the native scan deletes rather than restaging the f1 24x gap; the
+// gate row measures aki against Redis's quicklist, which pays the same contiguous
+// listpack walk this arm now matches.
+
+const benchLposN = 100000
+
+// buildNativeLpos builds a benchLposN-scale deque of 4-byte fillers with the
+// 3-byte target token placed where want reports true, matching the differential's
+// element shape.
+func buildNativeLpos(want func(i int) bool, target, filler []byte) *native {
+	nt := &native{}
+	for i := 0; i < benchLposN; i++ {
+		if want(i) {
+			nt.pushBack(target)
+		} else {
+			nt.pushBack(filler)
+		}
+	}
+	return nt
+}
+
+func BenchmarkLPOS(b *testing.B) {
+	target := []byte("TGT")
+	filler := []byte("elem")
+	forwardTail := buildNativeLpos(func(i int) bool { return i == benchLposN-1 }, target, filler)
+	backwardHead := buildNativeLpos(func(i int) bool { return i == 0 }, target, filler)
+	countAll := buildNativeLpos(func(i int) bool { return i%1000 == 0 }, target, filler)
+
+	b.Run("forward_tail", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			sinkHits = forwardTail.lpos(target, 1, 1, 0)
+		}
+	})
+	b.Run("backward_head", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			sinkHits = backwardHead.lpos(target, -1, 1, 0)
+		}
+	})
+	b.Run("count_all", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			sinkHits = countAll.lpos(target, 1, 0, 0)
+		}
+	})
+}
+
+// BenchmarkLPOSByIndex is the A/B baseline: the same three scans over the same
+// geometries, but resolving every position through locate the way the old
+// get(i)-per-element lposScan did. It exists only to price the seek the shipped
+// scan deletes.
+func BenchmarkLPOSByIndex(b *testing.B) {
+	target := []byte("TGT")
+	filler := []byte("elem")
+	forwardTail := buildNativeLpos(func(i int) bool { return i == benchLposN-1 }, target, filler)
+	backwardHead := buildNativeLpos(func(i int) bool { return i == 0 }, target, filler)
+	countAll := buildNativeLpos(func(i int) bool { return i%1000 == 0 }, target, filler)
+
+	b.Run("forward_tail", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			sinkHits = lposByIndex(forwardTail, target, 1, 1, 0)
+		}
+	})
+	b.Run("backward_head", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			sinkHits = lposByIndex(backwardHead, target, -1, 1, 0)
+		}
+	})
+	b.Run("count_all", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			sinkHits = lposByIndex(countAll, target, 1, 0, 0)
+		}
+	})
+}
+
+// lposByIndex is the old per-index LPOS walk the contiguous scan replaces: it
+// resolves each position through nt.at, which routes through locate, so a long
+// ring pays a directory seek per element. Kept in the benchmark only, for the
+// A/B against native.lpos.
+func lposByIndex(nt *native, target []byte, rank, limit, maxlen int) []int {
+	forward := rank > 0
+	skip := rank
+	if skip < 0 {
+		skip = -skip
+	}
+	skip--
+	n := nt.count
+	var out []int
+	compared := 0
+	visit := func(i int) bool {
+		if maxlen > 0 && compared >= maxlen {
+			return false
+		}
+		compared++
+		if !bytesEqual(nt.at(i), target) {
+			return true
+		}
+		if skip > 0 {
+			skip--
+			return true
+		}
+		out = append(out, i)
+		return limit <= 0 || len(out) < limit
+	}
+	if forward {
+		for i := 0; i < n; i++ {
+			if !visit(i) {
+				break
+			}
+		}
+	} else {
+		for i := n - 1; i >= 0; i-- {
+			if !visit(i) {
+				break
+			}
+		}
+	}
+	return out
+}
