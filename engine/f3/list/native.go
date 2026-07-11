@@ -143,15 +143,59 @@ func (r *chunkRing) popTail() {
 	r.buf[(r.head+r.n)%len(r.buf)] = nil
 }
 
+// insertAt splices c in at logical position i (0..n), the middle-of-ring insert
+// LINSERT's chunk split needs. The two ends stay O(1) through pushHead/pushTail;
+// a true middle insert shifts the handles after i up by one, which is O(chunks)
+// pointer moves (8 bytes each), the bound the doc accepts as cheap next to the
+// element scan that found the pivot (section 5.7).
+func (r *chunkRing) insertAt(i int, c *chunk) {
+	if i == r.n {
+		r.pushTail(c)
+		return
+	}
+	if i == 0 {
+		r.pushHead(c)
+		return
+	}
+	if r.n == len(r.buf) {
+		r.grow()
+	}
+	for j := r.n; j > i; j-- {
+		r.buf[(r.head+j)%len(r.buf)] = r.buf[(r.head+j-1)%len(r.buf)]
+	}
+	r.buf[(r.head+i)%len(r.buf)] = c
+	r.n++
+}
+
+// removeAt unlinks the chunk at logical position i, the mirror of insertAt that
+// LREM and LTRIM use to drop a chunk emptied by removals. The ends stay O(1);
+// a middle removal shifts the handles after i down by one over the freed slot.
+func (r *chunkRing) removeAt(i int) {
+	if i == 0 {
+		r.popHead()
+		return
+	}
+	if i == r.n-1 {
+		r.popTail()
+		return
+	}
+	for j := i; j < r.n-1; j++ {
+		r.buf[(r.head+j)%len(r.buf)] = r.buf[(r.head+j+1)%len(r.buf)]
+	}
+	r.buf[(r.head+r.n-1)%len(r.buf)] = nil
+	r.n--
+}
+
 // native is the ring header (spec 2064/f3/13 section 2.1). count is LLEN in
 // O(1); bytes is the live payload total that feeds F14 accounting; the sticky
 // everLarge quicklist bit lives on the list, not here.
 type native struct {
-	ring  chunkRing
-	count int
-	bytes int
-	free  []*chunk // recycled slabs for reuse, bounded by freeCap
-	dir   chunkDir // Fenwick chunk directory for the above-crossover seek (2.4)
+	ring    chunkRing
+	count   int
+	bytes   int
+	free    []*chunk // recycled slabs for reuse, bounded by freeCap
+	dir     chunkDir // Fenwick chunk directory for the above-crossover seek (2.4)
+	scratch []byte   // reused repack buffer for interior surgery, so a chunk rewrite does not allocate per call
 }
 
 // --- slab allocation and recycling ---------------------------------------
@@ -392,8 +436,9 @@ func (nt *native) at(i int) []byte {
 }
 
 // setAt overwrites the element at dense index i (LSET). A same-length value is
-// written in place over the frame; a length change re-packs the deque, the
-// O(CAP) surgery the doc prices at parity and slice 3 tightens (section 5.6).
+// written in place over the frame; a length change repacks the one chunk that
+// holds the element, splitting it when the new value overflows, the bounded
+// O(CAP) surgery the doc prices at parity (section 5.6), never an O(n) rebuild.
 func (nt *native) setAt(i int, v []byte) {
 	ci, ord := nt.locate(i)
 	c := nt.ring.at(ci)
@@ -403,56 +448,321 @@ func (nt *native) setAt(i int, v []byte) {
 		copy(c.blob[off+uvarintLen(uint64(len(v))):], v)
 		return
 	}
-	vals := nt.toSlice()
-	vals[i] = cloneBytes(v)
-	nt.rebuild(vals)
+	n := c.count()
+	vals := make([][]byte, 0, n)
+	for p := 0; p < n; p++ {
+		if p == ord {
+			vals = append(vals, v)
+			continue
+		}
+		val, _ := c.frameAt(int(c.dir[c.lo+p]))
+		vals = append(vals, val)
+	}
+	nt.bytes += len(v) - len(old)
+	nt.spliceChunk(ci, vals)
+	nt.dir.stale = true
 }
 
 // insert places v before or after the first pivot match (LINSERT) and reports
-// whether the pivot was found.
+// whether the pivot was found. The pivot is found by a forward value scan at
+// contiguous speed, irreducible since LINSERT is addressed by value; on a hit
+// the new frame goes into the pivot's chunk through the bounded surgery
+// (section 5.7), an in-chunk repack that splits the chunk when it overflows.
 func (nt *native) insert(before bool, pivot, v []byte) bool {
-	vals := nt.toSlice()
-	idx := -1
-	for i, e := range vals {
-		if bytesEqual(e, pivot) {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
+	ci, ord, found := nt.findPivot(pivot)
+	if !found {
 		return false
 	}
-	at := idx
+	at := ord
 	if !before {
 		at++
 	}
-	vals = append(vals, nil)
-	copy(vals[at+1:], vals[at:])
-	vals[at] = cloneBytes(v)
-	nt.rebuild(vals)
+	c := nt.ring.at(ci)
+	n := c.count()
+	vals := make([][]byte, 0, n+1)
+	for p := 0; p < n; p++ {
+		if p == at {
+			vals = append(vals, v)
+		}
+		val, _ := c.frameAt(int(c.dir[c.lo+p]))
+		vals = append(vals, val)
+	}
+	if at == n {
+		vals = append(vals, v)
+	}
+	nt.count++
+	nt.bytes += len(v)
+	nt.spliceChunk(ci, vals)
+	nt.dir.stale = true
 	return true
 }
 
+// findPivot scans the ring head to tail and each chunk's live window low to high
+// for the first frame equal to pivot, returning its chunk index and in-chunk
+// ordinal. This is the irreducible value walk LINSERT and Redis's quicklist both
+// pay (section 5.7).
+func (nt *native) findPivot(pivot []byte) (ci, ord int, found bool) {
+	for i := 0; i < nt.ring.n; i++ {
+		c := nt.ring.at(i)
+		for p := c.lo; p < c.hi; p++ {
+			val, _ := c.frameAt(int(c.dir[p]))
+			if bytesEqual(val, pivot) {
+				return i, p - c.lo, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
 // remove deletes matches of v under the LREM count-sign rule and reports how
-// many it dropped.
+// many it dropped (section 5.8). It scans at contiguous speed and removes in
+// place: a hit repacks its chunk to drop the frame, and a chunk emptied by
+// removals is unlinked and recycled, never a whole-list rebuild. count > 0 scans
+// head to tail up to count hits, count < 0 tail to head up to -count, count == 0
+// removes every match.
 func (nt *native) remove(count int, v []byte) int {
-	vals := nt.toSlice()
-	kept, removed := removeMatches(vals, count, v)
+	backward := count < 0
+	unlimited := count == 0
+	remaining := count
+	if backward {
+		remaining = -count
+	}
+	removed := 0
+	if backward {
+		for i := nt.ring.n - 1; i >= 0 && remaining > 0; i-- {
+			r, _ := nt.dropInChunk(i, v, true, remaining)
+			removed += r
+			remaining -= r
+		}
+	} else {
+		for i := 0; i < nt.ring.n; {
+			if !unlimited && remaining == 0 {
+				break
+			}
+			budget := 0
+			if !unlimited {
+				budget = remaining
+			}
+			r, emptied := nt.dropInChunk(i, v, false, budget)
+			removed += r
+			if !unlimited {
+				remaining -= r
+			}
+			if !emptied {
+				i++
+			}
+		}
+	}
 	if removed > 0 {
-		nt.rebuild(kept)
+		nt.dir.stale = true
 	}
 	return removed
 }
 
+// dropInChunk removes up to budget matches of v from the chunk at ring index i,
+// scanning its live ordinals forward or backward; budget <= 0 means unlimited.
+// It returns how many it removed and whether the chunk emptied (and so was
+// unlinked and recycled). A chunk left non-empty is repacked to drop the frames.
+func (nt *native) dropInChunk(i int, v []byte, backward bool, budget int) (int, bool) {
+	c := nt.ring.at(i)
+	n := c.count()
+	var drop [chunkElemCap]bool
+	dropped, droppedBytes := 0, 0
+	consider := func(ord int) bool {
+		val, _ := c.frameAt(int(c.dir[c.lo+ord]))
+		if !bytesEqual(val, v) {
+			return true
+		}
+		drop[ord] = true
+		dropped++
+		droppedBytes += len(val)
+		return budget <= 0 || dropped < budget
+	}
+	if backward {
+		for ord := n - 1; ord >= 0; ord-- {
+			if !consider(ord) {
+				break
+			}
+		}
+	} else {
+		for ord := 0; ord < n; ord++ {
+			if !consider(ord) {
+				break
+			}
+		}
+	}
+	if dropped == 0 {
+		return 0, false
+	}
+	nt.count -= dropped
+	nt.bytes -= droppedBytes
+	if dropped == n {
+		nt.recycle(c)
+		nt.ring.removeAt(i)
+		return dropped, true
+	}
+	kept := make([][]byte, 0, n-dropped)
+	for ord := 0; ord < n; ord++ {
+		if drop[ord] {
+			continue
+		}
+		val, _ := c.frameAt(int(c.dir[c.lo+ord]))
+		kept = append(kept, val)
+	}
+	nt.loadChunk(c, kept)
+	return dropped, false
+}
+
 // trim keeps the inclusive dense range [start, stop] and clears the deque when
 // the range is empty (LTRIM). start and stop are already clamped by the caller.
+// It is a chunk-range delete: whole chunks before start's chunk and after stop's
+// chunk are unlinked and recycled, and the two boundary chunks are trimmed in
+// place by moving their live window, the way a pop leaves dead bytes until the
+// chunk recycles, so the cost is O(dropped) not O(n) (section 5.6, doc row 5).
 func (nt *native) trim(start, stop int) {
 	if start > stop {
 		nt.rebuild(nil)
 		return
 	}
-	vals := nt.toSlice()
-	nt.rebuild(vals[start : stop+1])
+	sci, sord := nt.locate(start)
+	eci, eord := nt.locate(stop)
+	same := sci == eci
+	for nt.ring.n-1 > eci {
+		c := nt.ring.tail()
+		nt.bytes -= chunkLiveBytes(c)
+		nt.recycle(c)
+		nt.ring.popTail()
+	}
+	for k := 0; k < sci; k++ {
+		c := nt.ring.front()
+		nt.bytes -= chunkLiveBytes(c)
+		nt.recycle(c)
+		nt.ring.popHead()
+	}
+	if same {
+		c := nt.ring.front()
+		for c.count()-1 > eord {
+			c.hi--
+			val, _ := c.frameAt(int(c.dir[c.hi]))
+			nt.bytes -= len(val)
+		}
+		for k := 0; k < sord; k++ {
+			val, _ := c.frameAt(int(c.dir[c.lo]))
+			nt.bytes -= len(val)
+			c.lo++
+		}
+	} else {
+		fc := nt.ring.front()
+		for k := 0; k < sord; k++ {
+			val, _ := fc.frameAt(int(fc.dir[fc.lo]))
+			nt.bytes -= len(val)
+			fc.lo++
+		}
+		tc := nt.ring.tail()
+		for tc.count()-1 > eord {
+			tc.hi--
+			val, _ := tc.frameAt(int(tc.dir[tc.hi]))
+			nt.bytes -= len(val)
+		}
+	}
+	nt.count = stop - start + 1
+	nt.dir.stale = true
+}
+
+// chunkLiveBytes sums the value byte lengths of a chunk's live frames, the live
+// payload a whole-chunk drop takes out of the deque's byte total.
+func chunkLiveBytes(c *chunk) int {
+	total := 0
+	for p := c.lo; p < c.hi; p++ {
+		val, _ := c.frameAt(int(c.dir[p]))
+		total += len(val)
+	}
+	return total
+}
+
+// loadChunk rewrites c to hold exactly vals in logical order, canonicalized to a
+// low-to-high contiguous layout (lo == 0). The bytes copy through the reused
+// scratch buffer first, so vals may alias c's own blob, and the caller must have
+// sized c so the packed frames fit cap(c.blob) and len(vals) <= chunkElemCap.
+func (nt *native) loadChunk(c *chunk, vals [][]byte) {
+	total := 0
+	for _, v := range vals {
+		total += frameLen(len(v))
+	}
+	if cap(nt.scratch) < total {
+		nt.scratch = make([]byte, total)
+	}
+	buf := nt.scratch[:total]
+	off := 0
+	for i, v := range vals {
+		c.dir[i] = uint16(off)
+		w := binary.PutUvarint(buf[off:], uint64(len(v)))
+		copy(buf[off+w:], v)
+		off += w + len(v)
+	}
+	copy(c.blob, buf)
+	c.lo, c.hi, c.bytesUsed = 0, len(vals), total
+}
+
+// spliceChunk replaces the chunk at ring index ci with vals, the surgery LINSERT
+// and a length-changing LSET share. When vals fit one chunk it repacks in place;
+// when they overflow the blob budget or the element cap it splits into a run of
+// chunks packed left to right and links the extras in after ci. Every value is
+// read into its destination before c's blob is overwritten, so vals may alias c.
+func (nt *native) spliceChunk(ci int, vals [][]byte) {
+	groups := splitVals(vals)
+	c := nt.ring.at(ci)
+	chunks := make([]*chunk, len(groups))
+	reuse := groupBytes(groups[0]) <= cap(c.blob)
+	for gi := range groups {
+		if gi == 0 && reuse {
+			chunks[gi] = c // loaded last, after the other groups read c's blob
+			continue
+		}
+		nc := nt.getChunk(groupBytes(groups[gi]))
+		nt.loadChunk(nc, groups[gi])
+		chunks[gi] = nc
+	}
+	if reuse {
+		nt.loadChunk(c, groups[0])
+	} else {
+		nt.recycle(c)
+	}
+	nt.ring.buf[(nt.ring.head+ci)%len(nt.ring.buf)] = chunks[0]
+	for k := 1; k < len(chunks); k++ {
+		nt.ring.insertAt(ci+k, chunks[k])
+	}
+}
+
+// groupBytes is the packed frame byte total of one chunk group.
+func groupBytes(vals [][]byte) int {
+	total := 0
+	for _, v := range vals {
+		total += frameLen(len(v))
+	}
+	return total
+}
+
+// splitVals partitions vals into consecutive groups that each fit one chunk: at
+// most chunkElemCap frames and at most chunkBlobCap packed bytes, with a lone
+// oversized frame taking a group to itself (its chunk gets a right-sized slab).
+// The groups are subslices of vals, so the common single-chunk case allocates
+// only the one-element outer slice.
+func splitVals(vals [][]byte) [][][]byte {
+	if len(vals) <= chunkElemCap && groupBytes(vals) <= chunkBlobCap {
+		return [][][]byte{vals}
+	}
+	var groups [][][]byte
+	start, used := 0, 0
+	for i, v := range vals {
+		f := frameLen(len(v))
+		if i > start && (used+f > chunkBlobCap || i-start >= chunkElemCap) {
+			groups = append(groups, vals[start:i])
+			start, used = i, 0
+		}
+		used += f
+	}
+	return append(groups, vals[start:])
 }
 
 // each visits every element in order, the bytes aliasing the blob, walking the
