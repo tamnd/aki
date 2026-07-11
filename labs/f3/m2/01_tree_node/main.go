@@ -920,23 +920,15 @@ func main() {
 			}
 			insKeys[i] = k
 		}
-		// distinct present keys to delete, drawn once and shared across arms.
-		// There are only cd present keys, so the delete bench is capped there.
+		// distinct present keys to delete, shared across arms. There are only cd
+		// present keys, so the delete bench is capped there; keys is already in a
+		// hash-scrambled order, so a prefix is a random present subset.
 		delN := opN
 		if delN > cd {
 			delN = cd
 		}
-		delKeys := make([]uint64, delN)
-		dperm := make([]uint64, cd)
-		copy(dperm, keys)
-		dm := xorshift(0xabcdef ^ uint64(cd))
-		for i := 0; i < delN; i++ {
-			j := i + int(dm.next()%uint64(cd-i))
-			dperm[i], dperm[j] = dperm[j], dperm[i]
-			delKeys[i] = dperm[i]
-		}
-		dperm = nil
-		seen = nil // release the dedup set before building the large trees.
+		delKeys := keys[:delN]
+		clear(seen) // release the dedup set before building the large trees.
 
 		for _, a := range arms {
 			// t serves rank/select/range and the random-fill memory reading.
