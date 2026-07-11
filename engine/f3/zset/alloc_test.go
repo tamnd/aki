@@ -26,6 +26,24 @@ func TestZeroAllocInline(t *testing.T) {
 	checkZero(t, "inline card", func() { sinkInt = z.card() })
 }
 
+// The native band holds the same bar: ZSCORE is one member-hash probe reading
+// the record's raw bits, ZCARD reads the table's counter, neither allocates.
+func TestZeroAllocNative(t *testing.T) {
+	z := newZset()
+	for i := 0; i < maxListpackEntries+64; i++ {
+		z.update([]byte("m"+strconv.Itoa(i)), float64(i), flags{})
+	}
+	if z.enc != encSkiplist {
+		t.Fatalf("enc = %s, want skiplist", z.enc)
+	}
+	hit := []byte("m140")
+	miss := []byte("absent")
+
+	checkZero(t, "native score hit", func() { _, sinkBool = z.score(hit) })
+	checkZero(t, "native score miss", func() { _, sinkBool = z.score(miss) })
+	checkZero(t, "native card", func() { sinkInt = z.card() })
+}
+
 var (
 	sinkBool bool
 	sinkInt  int
