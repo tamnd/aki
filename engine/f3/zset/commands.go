@@ -321,26 +321,89 @@ func zrankImpl(cx *shard.Ctx, args [][]byte, r shard.Reply, rev bool) {
 	r.Raw(out)
 }
 
-// Zrange answers ZRANGE key start stop [WITHSCORES] [REV] over the index form
-// (section 6.4): a counted select to the start rank then a bounded leaf-chain
-// walk, streamed straight into the reply. The BYSCORE, BYLEX, and LIMIT forms
-// land with the range slices; this slice serves the index range, which every
-// band answers.
+// Zrange answers ZRANGE key start stop [BYSCORE|BYLEX] [REV] [LIMIT offset
+// count] [WITHSCORES] (section 6.4), the umbrella that subsumes ZRANGEBYSCORE,
+// ZRANGEBYLEX, and their reverse forms. It parses the options, rejects the
+// illegal combinations with Redis's exact strings, then dispatches to the score,
+// lex, or index plan; each resolves to a rank window and streams it. When REV is
+// set with BYSCORE or BYLEX the start and stop are the high and low bounds, so
+// they swap before parsing, matching Redis.
 func Zrange(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	withScores := false
-	rev := false
-	for _, opt := range args[3:] {
+	var byScore, byLex, rev, withScores, limit bool
+	var offset, count int
+	for i := 3; i < len(args); {
 		switch {
-		case eqFold(opt, "WITHSCORES"):
-			withScores = true
-		case eqFold(opt, "REV"):
+		case eqFold(args[i], "BYSCORE"):
+			byScore = true
+			i++
+		case eqFold(args[i], "BYLEX"):
+			byLex = true
+			i++
+		case eqFold(args[i], "REV"):
 			rev = true
+			i++
+		case eqFold(args[i], "WITHSCORES"):
+			withScores = true
+			i++
+		case eqFold(args[i], "LIMIT"):
+			if i+2 >= len(args) {
+				r.Err("ERR syntax error")
+				return
+			}
+			o, ok1 := parseIndex(args[i+1])
+			c, ok2 := parseIndex(args[i+2])
+			if !ok1 || !ok2 {
+				r.Err(errNotInt)
+				return
+			}
+			offset, count, limit = o, c, true
+			i += 3
 		default:
 			r.Err("ERR syntax error")
 			return
 		}
 	}
-	zrangeByIndex(cx, args, r, rev, withScores)
+	if byScore && byLex {
+		r.Err("ERR syntax error")
+		return
+	}
+	if byLex && withScores {
+		r.Err(errLexScores)
+		return
+	}
+	if limit && !byScore && !byLex {
+		r.Err(errLimitOnly)
+		return
+	}
+
+	switch {
+	case byScore:
+		lo, hi := args[1], args[2]
+		if rev {
+			lo, hi = args[2], args[1]
+		}
+		min, ok1 := parseScoreBound(lo)
+		max, ok2 := parseScoreBound(hi)
+		if !ok1 || !ok2 {
+			r.Err(errScoreBound)
+			return
+		}
+		execByScore(cx, r, args[0], min, max, rev, withScores, limit, offset, count)
+	case byLex:
+		lo, hi := args[1], args[2]
+		if rev {
+			lo, hi = args[2], args[1]
+		}
+		min, ok1 := parseLexBound(lo)
+		max, ok2 := parseLexBound(hi)
+		if !ok1 || !ok2 {
+			r.Err(errLexBound)
+			return
+		}
+		execByLex(cx, r, args[0], min, max, rev, limit, offset, count)
+	default:
+		zrangeByIndex(cx, args, r, rev, withScores)
+	}
 }
 
 // Zrevrange answers ZREVRANGE key start stop [WITHSCORES], the deprecated alias
