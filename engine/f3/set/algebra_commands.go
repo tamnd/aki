@@ -62,7 +62,7 @@ func Sinter(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	emitArray(cx, r, func(emit func(m []byte)) { sinter(sets, emit) })
+	emitArray(cx, r, func(emit func(m []byte)) { sinter(cx, sets, emit) })
 }
 
 // Sunion answers SUNION key [key ...]: the distinct union of every set, a flat
@@ -73,7 +73,7 @@ func Sunion(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	emitArray(cx, r, func(emit func(m []byte)) { sunion(sets, emit) })
+	emitArray(cx, r, func(emit func(m []byte)) { sunion(cx, sets, emit) })
 }
 
 // Sdiff answers SDIFF key [key ...]: the members of the first set not in any
@@ -85,7 +85,7 @@ func Sdiff(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	emitArray(cx, r, func(emit func(m []byte)) { sdiff(sets, emit) })
+	emitArray(cx, r, func(emit func(m []byte)) { sdiff(cx, sets, emit) })
 }
 
 // Sintercard answers SINTERCARD numkeys key [key ...] [LIMIT limit]: the size of
@@ -127,5 +127,5 @@ func Sintercard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	r.Int(int64(sintercard(sets, limit)))
+	r.Int(int64(sintercard(cx, sets, limit)))
 }

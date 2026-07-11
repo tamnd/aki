@@ -37,7 +37,7 @@ func benchSinter(b *testing.B, aN, bN int, maintain bool) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		sink = false
-		sinter(sets, func(m []byte) { sink = true })
+		sinter(nil, sets, func(m []byte) { sink = true })
 	}
 }
 
@@ -61,7 +61,7 @@ func benchSintercard(b *testing.B, aN, bN, limit int, maintain bool) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		sinkN = sintercard(sets, limit)
+		sinkN = sintercard(nil, sets, limit)
 	}
 }
 

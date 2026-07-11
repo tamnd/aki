@@ -39,6 +39,7 @@ func New(shards, arenaBytes, segBytes int) *Runtime {
 	r := &Runtime{workers: make([]*worker, shards)}
 	for i := range r.workers {
 		r.workers[i] = newWorker(i, store.New(arenaBytes, segBytes))
+		r.workers[i].rt = r
 	}
 	return r
 }
@@ -90,6 +91,7 @@ func Open(cfg Config) (*Runtime, error) {
 			return nil, err
 		}
 		r.workers[i] = newWorker(i, st)
+		r.workers[i].rt = r
 		r.workers[i].pin = cfg.PinWorkers
 	}
 	return r, nil

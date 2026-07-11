@@ -61,12 +61,12 @@ func TestAlgebraAgainstRedis(t *testing.T) {
 			if redisCard != wantCard {
 				t.Fatalf("SINTERCARD: redis %d, oracle %d", redisCard, wantCard)
 			}
-			if got := sintercard(sets, 0); got != redisCard {
+			if got := sintercard(nil, sets, 0); got != redisCard {
 				t.Fatalf("SINTERCARD driver %d, redis %d", got, redisCard)
 			}
 			limit := 5
 			redisLim := c.cmdInt(t, append([]string{"SINTERCARD", strconv.Itoa(len(keys))}, append(append([]string{}, keys...), "LIMIT", strconv.Itoa(limit))...)...)
-			if got := sintercard(sets, limit); got != redisLim {
+			if got := sintercard(nil, sets, limit); got != redisLim {
 				t.Fatalf("SINTERCARD LIMIT %d: driver %d, redis %d", limit, got, redisLim)
 			}
 		})
