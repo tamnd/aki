@@ -46,7 +46,19 @@ import (
 // the next recv is armed. Ops in flight across a close are fenced by a
 // per-fd-slot generation in the CQE user_data: closeConn bumps it, cancels
 // the pending ops, and stale completions (including fd-number reuse by a
-// later accept) drop on the mismatch.
+// later accept) drop on the mismatch. A close with ops still pending parks
+// the connection on the loop's zombie list until those CQEs land, because
+// the kernel reads and writes those buffers until then and the GC must not
+// reclaim them first.
+//
+// Buffers are leased from per-loop free lists, the reactor's doc 08 section
+// 6.2 discipline (loopBufFree cap, stock sizes only, grown buffers drop to
+// the GC), with one honest exception: a connected conn keeps a single-shot
+// recv armed, and the kernel owns that buffer until the CQE, so the read
+// buffer cannot be released while the connection idles. That per-conn
+// readBufSize pin is the proactor model's floor; provided-buffer rings
+// (multishot recv) are the fix and a measured follow-up, not part of this
+// slice. Reply buffers (out and inflight) do release on a clean park.
 
 // uring ring sizing per loop: the SQ bounds one pass's staged ops (getSQE
 // flushes early if a pathological pass overruns it), the CQ is oversized so
@@ -178,6 +190,17 @@ type uringLoop struct {
 	conns []*uringConn // indexed by fd; loop goroutine only
 	gens  []uint32     // per-fd-slot generation; loop goroutine only
 
+	// The buffer free lists (doc 08 section 6.2): buffers are leased, not
+	// owned. Loop-goroutine only, like conns; capped at loopBufFree.
+	rfree [][]byte // read buffers, len readBufSize
+	ofree [][]byte // reply buffers, len 0, cap replyBuf
+
+	// zombies holds connections closed while a recv or send was still in
+	// flight: the kernel touches their buffers until the canceled ops'
+	// CQEs arrive, so the conn (and its buffers) must stay reachable until
+	// then. Retirement recycles the stock buffers. Loop goroutine only.
+	zombies []*uringZombie
+
 	evBuf [8]byte // the armed eventfd read's landing pad
 
 	mu      sync.Mutex
@@ -235,6 +258,15 @@ type uringConn struct {
 	// queued folds racing owner marks into one dirty entry, exactly the
 	// reactor's protocol (see markDirty).
 	queued atomic.Bool
+}
+
+// uringZombie is a closed connection with kernel ops still in flight; fd and
+// gen identify the CQEs it waits for, ops counts them down.
+type uringZombie struct {
+	fd  int
+	gen uint32
+	ops int
+	rc  *uringConn
 }
 
 func newURingLoop(b *uringBackend) (*uringLoop, error) {
@@ -366,13 +398,17 @@ func (l *uringLoop) handleCQE(cqe uringCQE) bool {
 	case udKindRecv:
 		rc := l.get(fd)
 		if rc == nil || rc.gen != gen {
-			return false // stale: the conn closed with this op in flight
+			// Stale: the conn closed with this op in flight; retire its
+			// zombie hold now that the kernel is done with the buffer.
+			l.reapZombie(fd, gen)
+			return false
 		}
 		rc.recvPending = false
 		l.completeRecv(rc, cqe.res)
 	case udKindSend:
 		rc := l.get(fd)
 		if rc == nil || rc.gen != gen {
+			l.reapZombie(fd, gen)
 			return false
 		}
 		rc.sendPending = false
@@ -416,15 +452,21 @@ func (l *uringLoop) drainWake() (closing bool) {
 // registration, the initial writer park, and the first armed recv.
 func (l *uringLoop) adopt(fd int) {
 	rc := &uringConn{
-		loop:     l,
-		fd:       fd,
-		sc:       l.b.s.rt.NewConn(),
-		rbuf:     make([]byte, readBufSize),
-		out:      make([]byte, 0, l.b.s.replyBuf),
-		inflight: make([]byte, 0, l.b.s.replyBuf),
+		loop: l,
+		fd:   fd,
+		sc:   l.b.s.rt.NewConn(),
 	}
 	rc.cs = &connState{sc: rc.sc}
-	rc.emit = func(rep []byte) { rc.out = append(rc.out, rep...) }
+	// No buffers yet: rbuf is leased in ensureRecv (and pinned from then on
+	// by the armed recv), out here at the first emit, inflight by the
+	// queueSend swap. The nil check is the lease point; append on a leased
+	// buffer is exactly append on the old owned one.
+	rc.emit = func(rep []byte) {
+		if rc.out == nil {
+			rc.out = l.leaseOut()
+		}
+		rc.out = append(rc.out, rep...)
+	}
 	rc.sc.SetStreamStep()
 	rc.sc.SetWriterBatchNotify(l, func() bool { return l.markDirty(rc) })
 	for len(l.conns) <= fd {
@@ -460,14 +502,18 @@ func (l *uringLoop) ensureRecv(rc *uringConn) {
 	}
 	if rc.pos == rc.n {
 		rc.pos, rc.n = 0, 0
-		// A giant inbound bulk grew the buffer; once drained, shrink back so
-		// an idle connection does not pin megabytes.
+		// A giant inbound bulk grew the buffer; once drained, drop it to the
+		// GC so a megabytes-wide buffer never lingers and never enters the
+		// free list. The lease below hands back a stock one.
 		if len(rc.rbuf) > 16*readBufSize {
-			rc.rbuf = make([]byte, readBufSize)
+			rc.rbuf = nil
 		}
 	} else if rc.pos > 0 && (rc.n-rc.pos <= compactMax || rc.n == len(rc.rbuf)) {
 		rc.n = copy(rc.rbuf, rc.rbuf[rc.pos:rc.n])
 		rc.pos = 0
+	}
+	if rc.rbuf == nil {
+		rc.rbuf = l.leaseRbuf()
 	}
 	if rc.n == len(rc.rbuf) {
 		// One command larger than the buffer: grow, there is no other way to
@@ -543,8 +589,10 @@ func (l *uringLoop) completeSend(rc *uringConn, res int32) {
 	}
 	rc.inflight = rc.inflight[:0]
 	// A streamed giant reply grew the buffer; give the pages back once sent.
+	// nil, not a fresh allocation: the queueSend swap or the free list hands
+	// out the next one, and a grown buffer never enters the list.
 	if cap(rc.inflight) > 4*l.b.s.replyBuf {
-		rc.inflight = make([]byte, 0, l.b.s.replyBuf)
+		rc.inflight = nil
 	}
 	if rc.dropAfterSend {
 		if len(rc.out) == 0 {
@@ -668,10 +716,60 @@ func (l *uringLoop) service(rc *uringConn) {
 			break
 		}
 		if rc.sc.ParkWriter() {
+			l.releaseIdle(rc)
 			break
 		}
 		// Replies landed between the drain and the park; go around.
 	}
+}
+
+// releaseIdle returns a cleanly parked connection's reply buffers to the
+// loop's free list, the lease-not-own half of doc 08 section 6.2. Clean means
+// genuinely idle: no unparsed bytes, no staged reply, no send in flight, no
+// state that resumes with buffers in hand. The read buffer is the exception
+// this driver owns up to: the armed single-shot recv keeps the kernel writing
+// into rbuf, so it stays leased for the connection's lifetime (see the
+// package comment). Stock capacities only; a grown buffer never enters the
+// list.
+func (l *uringLoop) releaseIdle(rc *uringConn) {
+	if rc.closing || rc.throttled || rc.dropAfterSend || rc.sendPending || rc.pos != 0 || rc.n != 0 || len(rc.out) != 0 {
+		return
+	}
+	if rc.out != nil {
+		if cap(rc.out) == l.b.s.replyBuf && len(l.ofree) < loopBufFree {
+			l.ofree = append(l.ofree, rc.out[:0])
+		}
+		rc.out = nil
+	}
+	if rc.inflight != nil {
+		if cap(rc.inflight) == l.b.s.replyBuf && len(l.ofree) < loopBufFree {
+			l.ofree = append(l.ofree, rc.inflight[:0])
+		}
+		rc.inflight = nil
+	}
+}
+
+// leaseRbuf hands out a read buffer: the free list first, the allocator past
+// it. Loop goroutine only.
+func (l *uringLoop) leaseRbuf() []byte {
+	if n := len(l.rfree); n > 0 {
+		b := l.rfree[n-1]
+		l.rfree[n-1] = nil
+		l.rfree = l.rfree[:n-1]
+		return b
+	}
+	return make([]byte, readBufSize)
+}
+
+// leaseOut is leaseRbuf for the reply buffer.
+func (l *uringLoop) leaseOut() []byte {
+	if n := len(l.ofree); n > 0 {
+		b := l.ofree[n-1]
+		l.ofree[n-1] = nil
+		l.ofree = l.ofree[:n-1]
+		return b
+	}
+	return make([]byte, 0, l.b.s.replyBuf)
 }
 
 // stepStream advances the connection's in-progress streamed reply in
@@ -786,11 +884,14 @@ func (l *uringLoop) closeConn(rc *uringConn) {
 		return
 	}
 	fd := rc.fd
+	ops := 0
 	if rc.recvPending {
 		l.cancelOp(packUD(udKindRecv, rc.gen, fd))
+		ops++
 	}
 	if rc.sendPending {
 		l.cancelOp(packUD(udKindSend, rc.gen, fd))
+		ops++
 	}
 	l.gens[fd]++
 	l.conns[fd] = nil
@@ -798,6 +899,58 @@ func (l *uringLoop) closeConn(rc *uringConn) {
 	_ = closeFD(fd)
 	rc.sc.Close()
 	l.b.s.unregister(rc.cs)
+	// The staged buffer is never kernel-owned, so it recycles now. rbuf and
+	// inflight are only safe once no op references them: immediately when
+	// nothing was pending, otherwise at zombie retirement, when the canceled
+	// ops' CQEs prove the kernel is done with the memory.
+	if rc.out != nil {
+		if cap(rc.out) == l.b.s.replyBuf && len(l.ofree) < loopBufFree {
+			l.ofree = append(l.ofree, rc.out[:0])
+		}
+		rc.out = nil
+	}
+	if ops == 0 {
+		l.recycleKernelBufs(rc)
+		return
+	}
+	l.zombies = append(l.zombies, &uringZombie{fd: fd, gen: rc.gen, ops: ops, rc: rc})
+}
+
+// recycleKernelBufs returns the buffers the kernel may have held (the recv
+// target and the in-flight send) to the free lists, callable only once no op
+// references them. Stock sizes only, same rule as releaseIdle.
+func (l *uringLoop) recycleKernelBufs(rc *uringConn) {
+	if rc.rbuf != nil {
+		if len(rc.rbuf) == readBufSize && len(l.rfree) < loopBufFree {
+			l.rfree = append(l.rfree, rc.rbuf)
+		}
+		rc.rbuf = nil
+	}
+	if rc.inflight != nil {
+		if cap(rc.inflight) == l.b.s.replyBuf && len(l.ofree) < loopBufFree {
+			l.ofree = append(l.ofree, rc.inflight[:0])
+		}
+		rc.inflight = nil
+	}
+}
+
+// reapZombie counts down a closed connection's outstanding ops as their CQEs
+// land (they arrive on this loop, gen-fenced, so the scan is loop-local) and
+// retires the hold when the last one does.
+func (l *uringLoop) reapZombie(fd int, gen uint32) {
+	for i, z := range l.zombies {
+		if z.fd == fd && z.gen == gen {
+			z.ops--
+			if z.ops == 0 {
+				l.recycleKernelBufs(z.rc)
+				last := len(l.zombies) - 1
+				l.zombies[i] = l.zombies[last]
+				l.zombies[last] = nil
+				l.zombies = l.zombies[:last]
+			}
+			return
+		}
+	}
 }
 
 // cancelOp stages an IORING_OP_ASYNC_CANCEL for the op with the given

@@ -1,7 +1,7 @@
 # M0 io_uring A/B: the syscall-floor arm and the section 5.4 verdict
 
 Campaign note for M10 slice 3 proper, the io_uring network driver (-net uring), the last named throughput lever before the doc 08 section 5.4 verdict.
-Box and protocol as the reactor campaign (results/f3/m0-reactor-ab.md): GamingPC i9-13900K WSL2, servers taskset 0-7, generator 8-15, redis 8.8.0 and valkey 9.1.0 io-threads 4, warm 3s, 3 timed 8s windows, none discarded, FLUSHALL between reps on all servers, 1M keys uniform, p99 and VmRSS captured.
+Box and protocol as the reactor campaign (results/f3/m0-reactor-ab.md): GamingPC i9-13900K WSL2, servers taskset 0-7, generator 8-15, redis 8.8.0 and valkey 9.1.0 io-threads 4, warm 3s, 3 timed 8s windows, none discarded, FLUSHALL between reps on all servers, 1M keys uniform, p99, VmRSS, and VmHWM captured for every arm and both rivals.
 Ratios are the min of per-harness ratios (aki-ab vs rival-ab and aki-rb vs rival-rb, each harness compared with itself, never mixed).
 Arms interleave within each cell in one session: goroutine-single, reactor (-net-loops 3), uring (-net-loops 3), against both rivals.
 WSL2 caveat, named up front per doc 08 section 5.4: io_uring under a virtualized kernel carries a confound the epoll comparison does not, so if the uring arm underperforms here the verdict is scoped to this kernel and the bare-metal question stays open; the kernel version and probe result are recorded below.
@@ -23,6 +23,10 @@ The mechanism being priced: the uring loop deletes its own read and write syscal
 - PRED-U7, counters: net_read_syscalls and net_write_syscalls on the uring arm read as ring ops not kernel entries (the counter seam counts submissions), and net_loop_wakes/op at P16/512 stays at the reactor's ~0.01 band since the wake path is unchanged.
 - PRED-U8, memory bar: uring RSS tracks the reactor arm within ~10% per cell (same buffers, two per conn instead of out+bufio), the 64B cells keep breaching the pre-existing arena 2x bar, the 1KiB cells keep passing, per the f3 memory-bar rule no new unbounded state is introduced (the out cap is OutBufLimitBytes, inflight is bounded by the swap discipline).
 - PRED-U9, F16: the uring driver does not meet the 0.95x-elsewhere clause (expected soft spots: P16/50 and P1/50, same as the reactor), so goroutine-single stays the sole default and uring stays behind -net uring with its wins recorded.
+
+Addendum, filed 2026-07-11 before the box session, after the rebase onto the arena-RSS merge (#587) and the tightened same-data bar (at or below 1x rival RSS, peak counted): the uring driver now leases reply buffers from per-loop free lists like the reactor, but its armed single-shot recv pins one readBufSize buffer per connected conn that leasing cannot release.
+
+- PRED-U10, tightened bar: on the 512-conn cells the uring arm's VmRSS sits within 32MiB+10% of the reactor arm (512 x 64KiB of pinned recv buffers, ~32MiB, is the structural delta; under load the reactor's conns hold leased buffers too so the observed gap is smaller), VmHWM tracks VmRSS within 15% on both aki event-loop arms (no burst allocator in either), and the 1KiB cells hold aki at or below both rivals on VmRSS and VmHWM while the 64B cells stay above (the arena floor, already published in m0-arena-rss).
 
 ## Kernel and probe
 
