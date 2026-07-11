@@ -36,6 +36,13 @@ type Ctx struct {
 	// registry here. A second collection type sharing the slot lands with the
 	// shared holder the keyspace-unification slice introduces.
 	Coll any
+
+	// ZColl is the same owner-local slot for the zset type (spec 2064/f3/12
+	// M2): the zset registry hangs here so a zset command and a set command on
+	// the same shard do not fight over Coll. It is the temporary parallel field
+	// the Coll comment anticipates; the keyspace-unification slice folds both
+	// into one shared holder. Owner-only, so no lock.
+	ZColl any
 }
 
 // Handler executes one command against its shard. args are views into the hop

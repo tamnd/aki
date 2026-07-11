@@ -8,6 +8,7 @@ import (
 	"github.com/tamnd/aki/engine/f3/set"
 	"github.com/tamnd/aki/engine/f3/shard"
 	"github.com/tamnd/aki/engine/f3/str"
+	"github.com/tamnd/aki/engine/f3/zset"
 )
 
 // entry is one command's table row. op doubles as the handler's index in the
@@ -192,6 +193,19 @@ func init() {
 	// cross-shard source and destination need the F17 intent path; until that
 	// substrate lands SMOVE assumes co-located keys.
 	register("SMOVE", set.Smove, 3, 3, true)
+	// The zset surface (spec 2064/f3/12 M2 slice 1). Point ops, ZINCRBY, ZREM,
+	// rank, and ZRANGE by index over the inline band, all keyed on the first
+	// argument the same way SADD is. Handlers validate their own tails.
+	register("ZADD", zset.Zadd, 3, -1, true)
+	register("ZSCORE", zset.Zscore, 2, 2, true)
+	register("ZMSCORE", zset.Zmscore, 2, -1, true)
+	register("ZCARD", zset.Zcard, 1, 1, true)
+	register("ZINCRBY", zset.Zincrby, 3, 3, true)
+	register("ZREM", zset.Zrem, 2, -1, true)
+	register("ZRANK", zset.Zrank, 2, 3, true)
+	register("ZREVRANK", zset.Zrevrank, 2, 3, true)
+	register("ZRANGE", zset.Zrange, 3, -1, true)
+
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
