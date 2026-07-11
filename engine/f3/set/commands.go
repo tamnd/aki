@@ -115,8 +115,10 @@ func Scard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 }
 
 // Smembers answers SMEMBERS key: an array of every member, an empty array when
-// absent. Each member is copied straight from its inline storage into the
-// reply.
+// absent. A small reply is materialized in the shard scratch and handed over
+// whole; a large native-band reply is streamed frame by frame through the ring
+// (smembers.go) so a million-member set holds a bounded window, not one giant
+// buffer. The stream cutover is the same chunk width the string band streams at.
 func Smembers(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
 	s, wrong := g.lookup(cx, args[0])
@@ -124,14 +126,18 @@ func Smembers(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	n := 0
-	if s != nil {
-		n = s.card()
+	if s == nil {
+		r.Raw(resp.AppendArrayHeader(cx.Aux[:0], 0))
+		return
 	}
-	out := resp.AppendArrayHeader(cx.Aux[:0], n)
-	if s != nil {
-		s.each(func(m []byte) { out = resp.AppendBulk(out, m) })
+	if s.enc == encHashtable {
+		if total := s.ht.membersTotal(); total > store.ChunkSize {
+			r.StreamRaw(total, s.ht.pinMembersStream())
+			return
+		}
 	}
+	out := resp.AppendArrayHeader(cx.Aux[:0], s.card())
+	s.each(func(m []byte) { out = resp.AppendBulk(out, m) })
 	cx.Aux = out
 	r.Raw(out)
 }
