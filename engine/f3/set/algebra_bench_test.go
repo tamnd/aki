@@ -64,3 +64,39 @@ func benchMerge(b *testing.B, n int) {
 func BenchmarkMergeIntersect10k(b *testing.B)  { benchMerge(b, 10_000) }
 func BenchmarkMergeIntersect100k(b *testing.B) { benchMerge(b, 100_000) }
 func BenchmarkMergeIntersect1M(b *testing.B)   { benchMerge(b, 1_000_000) }
+
+// benchChurnMaintain times the steady-state insert-plus-remove pair on an indexed
+// n-member set: this is the f1 K-lab maintenance-economics shape (doc 11 section
+// 6.1: 411ns for the pair at a million members, ~205ns per op). It builds the
+// table once with maintenance on, then per iteration removes a live member and
+// re-adds it, so cardinality stays at n. The run tombstone (onRemove), the tail
+// append (onAdd), and the periodic flush all fall inside the timed pair. The f1
+// bar quotes a fixed P=256 partition count; f3's partitioned band derives P=4 at
+// a million members, but the maintenance kernel is per-htable and identical either
+// way, so a single maintained table is the faithful port-lab shape.
+func benchChurnMaintain(b *testing.B, n int) {
+	defer SetAlgebraMaintain(SetAlgebraMaintain(true))
+	base := members16(n)
+	h := newHashtable(n)
+	for _, k := range base {
+		h.add(k)
+	}
+	if !h.indexed() {
+		b.Fatal("table not indexed: maintenance did not engage")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		j := i % n
+		h.rem(base[j])
+		h.add(base[j])
+	}
+}
+
+// The 4096 cell matches the f1 bar's shape: at P=256 a million-member set holds
+// ~3906 members per partition, and maintenance runs on that per-partition run, so
+// the sorted run the churn binary-searches is a few thousand entries, not a
+// million. The 1M cell is the flat worst case, one giant run, where the onRemove
+// binary search walks a 16MB array and hits DRAM on every probe.
+func BenchmarkSChurnMaintain4k(b *testing.B) { benchChurnMaintain(b, 4096) }
+func BenchmarkSChurnMaintain1M(b *testing.B) { benchChurnMaintain(b, 1_000_000) }
