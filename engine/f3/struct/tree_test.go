@@ -183,6 +183,52 @@ func TestRankSelectPerWidth(t *testing.T) {
 	}
 }
 
+// TestWalkFromRankRevEdges pins the reverse walk's boundaries: an empty tree
+// yields nothing, a start past the end clamps to the last entry, and a full
+// descending scan visits every rank exactly once across many leaf boundaries.
+func TestWalkFromRankRevEdges(t *testing.T) {
+	empty := NewTree()
+	empty.WalkFromRankRev(0, func(uint64, uint32) bool {
+		t.Fatal("empty tree yielded an entry")
+		return true
+	})
+	empty.WalkFromRankRev(100, func(uint64, uint32) bool {
+		t.Fatal("empty tree yielded an entry for an out-of-range start")
+		return true
+	})
+
+	const n = 4000
+	tr := NewTree()
+	for i := 0; i < n; i++ {
+		tr.Insert(uint64(i)<<8, nil, uint32(i), nilMembers{})
+	}
+	// A start past the end clamps to rank n-1, so the full descending scan begins
+	// at the top and lands exactly n entries.
+	want := n - 1
+	tr.WalkFromRankRev(uint64(n+50), func(sc uint64, _ uint32) bool {
+		if sc != uint64(want)<<8 {
+			t.Fatalf("reverse scan at %d saw score %d, want %d", want, sc, uint64(want)<<8)
+		}
+		want--
+		return true
+	})
+	if want != -1 {
+		t.Fatalf("reverse scan stopped with %d entries unseen", want+1)
+	}
+	// Early stop: a reverse walk that returns false after one entry visits only it.
+	seen := 0
+	tr.WalkFromRankRev(10, func(sc uint64, _ uint32) bool {
+		if sc != uint64(10)<<8 {
+			t.Fatalf("reverse walk from rank 10 started at score %d", sc)
+		}
+		seen++
+		return false
+	})
+	if seen != 1 {
+		t.Fatalf("early-stop reverse walk visited %d, want 1", seen)
+	}
+}
+
 // --- Bulk load and the bytes-per-entry bar ---
 
 // TestBulkLoadBytesPerEntry is the F14 memory bar (test e): a right-edge 0.9-fill
@@ -379,6 +425,25 @@ func TestPropertyGrowChurn(t *testing.T) {
 			})
 			if j != len(want) {
 				t.Fatalf("%s: walk emitted %d, want %d", phase, j, len(want))
+			}
+			// A reverse walk from a random rank emits the model window in
+			// descending order, re-seeking across each leaf boundary it crosses.
+			rstart := rng.Intn(len(model))
+			lo := rstart - 25
+			if lo < 0 {
+				lo = 0
+			}
+			wantRev := model[lo : rstart+1]
+			k := len(wantRev) - 1
+			tr.WalkFromRankRev(uint64(rstart), func(sc uint64, ref uint32) bool {
+				if sc != wantRev[k].score || string(ms.Member(ref)) != wantRev[k].member {
+					t.Fatalf("%s: WalkFromRankRev[%d]=(%d,%q), want %v", phase, k, sc, ms.Member(ref), wantRev[k])
+				}
+				k--
+				return k >= 0
+			})
+			if k != -1 {
+				t.Fatalf("%s: reverse walk emitted %d short of the window", phase, k+1)
 			}
 		}
 	}

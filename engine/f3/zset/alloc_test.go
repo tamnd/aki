@@ -44,6 +44,34 @@ func TestZeroAllocNative(t *testing.T) {
 	checkZero(t, "native card", func() { sinkInt = z.card() })
 }
 
+// The native rank path is one member-hash probe plus a counted descent (section
+// 6.3), no second lookup and no walk, so it holds the zero-allocation bar.
+func TestZeroAllocRankNative(t *testing.T) {
+	z := buildNative(20_000)
+	hit := []byte("member:" + pad(10_000))
+	miss := []byte("absent")
+	checkZero(t, "native rank hit", func() { sinkInt, _, sinkBool = z.rank(hit) })
+	checkZero(t, "native rank miss", func() { sinkInt, _, sinkBool = z.rank(miss) })
+}
+
+// ZRANGE by index over the native band seeks with a counted select and streams
+// the window straight into a reply buffer (section 6.4): once the scratch is
+// warm it grows for none of the elements, so the walk allocates nothing per
+// element in any direction, with or without scores.
+func TestZeroAllocRangeNative(t *testing.T) {
+	z := buildNative(20_000)
+	buf := make([]byte, 0, 1<<20) // pre-grown reply scratch, reused each run
+	run := func(name string, rev, ws bool) {
+		checkZero(t, name, func() {
+			sinkBytes = z.rangeByIndex(buf[:0], 5_000, 5_099, rev, ws)
+		})
+	}
+	run("native range fwd", false, false)
+	run("native range fwd withscores", false, true)
+	run("native range rev", true, false)
+	run("native range rev withscores", true, true)
+}
+
 var (
 	sinkBool bool
 	sinkInt  int

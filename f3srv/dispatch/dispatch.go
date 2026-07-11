@@ -205,6 +205,7 @@ func init() {
 	register("ZRANK", zset.Zrank, 2, 3, true)
 	register("ZREVRANK", zset.Zrevrank, 2, 3, true)
 	register("ZRANGE", zset.Zrange, 3, -1, true)
+	register("ZREVRANGE", zset.Zrevrange, 3, -1, true)
 
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked

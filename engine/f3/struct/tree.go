@@ -652,6 +652,41 @@ func (t *Tree) WalkFromRank(start uint64, fn func(score uint64, ref uint32) bool
 	}
 }
 
+// WalkFromRankRev iterates from rank start down to rank 0 in descending order,
+// the seek-then-walk a ZRANGE REV or ZREVRANGE by index rides. Leaves are singly
+// linked (section 6.4), so a leaf runs its entries backward in place and the
+// crossing to the previous leaf re-descends by rank once per leaf boundary, the
+// small ancestor re-seek the lab measured against 4-byte back-links. It stops
+// early if fn returns false.
+func (t *Tree) WalkFromRankRev(start uint64, fn func(score uint64, ref uint32) bool) {
+	if t.entries == 0 {
+		return
+	}
+	if start >= t.entries {
+		start = t.entries - 1
+	}
+	k := start
+	ord := t.descendToRank(&k)
+	off := int(k)
+	base := start - k // global rank of this leaf's entry 0
+	for {
+		for off >= 0 {
+			if !fn(t.lScore(ord, off), t.lRef(ord, off)) {
+				return
+			}
+			off--
+		}
+		if base == 0 {
+			return
+		}
+		prev := base - 1 // global rank of the last entry in the previous leaf
+		k = prev
+		ord = t.descendToRank(&k)
+		off = int(k)
+		base = prev - k
+	}
+}
+
 // WalkFrom iterates from the first entry at or after (score, member) in order,
 // the seek a ZRANGEBYSCORE or ZRANGEBYLEX low bound rides, stopping early if fn
 // returns false.

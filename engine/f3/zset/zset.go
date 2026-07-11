@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math"
+
+	"github.com/tamnd/aki/f3srv/resp"
 )
 
 // The inline zset band (spec 2064/f3/12 section 4): a small zset is one packed
@@ -215,27 +217,65 @@ func (z *zset) entries() []entryView {
 
 // rank returns the number of members sorting before m, its score, and whether
 // it is present. Linear over the inline band (count while scanning, section
-// 6.3); the native band is one hash probe plus a counted descent.
+// 6.3); the native band is one hash probe plus a counted descent (nat.rank).
 func (z *zset) rank(m []byte) (int, float64, bool) {
+	if z.enc == encSkiplist {
+		return z.nat.rank(m)
+	}
 	sc, ok := z.score(m)
 	if !ok {
 		return 0, 0, false
 	}
 	idx := 0
-	if z.enc == encListpack {
-		b := z.blob
-		for i := 0; i < len(b); {
-			em, _, next := decodeEntry(b, i)
-			if bytes.Equal(em, m) {
-				return idx, sc, true
-			}
-			idx++
-			i = next
+	b := z.blob
+	for i := 0; i < len(b); {
+		em, _, next := decodeEntry(b, i)
+		if bytes.Equal(em, m) {
+			return idx, sc, true
 		}
-		return idx, sc, true
+		idx++
+		i = next
 	}
-	z.nat.rankScan(m, &idx)
 	return idx, sc, true
+}
+
+// rangeByIndex streams the members at ranks lo..hi inclusive (already clamped)
+// into out as RESP bulk strings, with each score appended when withScores, and
+// returns the grown buffer. When rev the window is emitted high-to-low, the
+// ZRANGE REV and ZREVRANGE order. The inline band slices its already-ordered
+// blob; the native band seeks with a counted select and walks the leaf chain
+// over just the window (section 6.4), formatting each score straight from the
+// record's raw bits so a native -0.0 prints "-0" while the inline band prints
+// "0". out is the shard scratch, reused across commands, so a warm buffer grows
+// for none of the window's elements.
+func (z *zset) rangeByIndex(out []byte, lo, hi int, rev, withScores bool) []byte {
+	var sc [40]byte
+	emit := func(m []byte, bits uint64) {
+		out = resp.AppendBulk(out, m)
+		if withScores {
+			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(bits)))
+		}
+	}
+	if z.enc == encSkiplist {
+		if rev {
+			// The window indexes the reversed sequence; reversed index i is
+			// forward rank card-1-i, so [lo,hi] maps to the forward-rank window
+			// [card-1-hi, card-1-lo], walked high-to-low.
+			card := z.nat.card()
+			z.nat.walkRangeRev(card-1-hi, card-1-lo, emit)
+		} else {
+			z.nat.walkRange(lo, hi, emit)
+		}
+		return out
+	}
+	ev := z.entries()
+	if rev {
+		reverse(ev)
+	}
+	for j := lo; j <= hi; j++ {
+		emit(ev[j].member, math.Float64bits(ev[j].score))
+	}
+	return out
 }
 
 // listpackInsert writes one entry at its sorted position with a single memmove,
