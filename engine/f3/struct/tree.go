@@ -823,6 +823,54 @@ func (t *Tree) deleteFrom(ord uint32, level int, score uint64, member []byte, m 
 	return ref, true
 }
 
+// DeleteAt removes the entry at rank r, 0-based, and returns its score, its
+// member reference, and false when r is out of range. It is the bounded removal
+// the ZREMRANGEBY* window surgery loops over (spec 2064/f3/12 section 6.9): one
+// rank-routed descent takes the entry, and the unwind decrements the single child
+// count on the path and rebalances the one child that may have underflowed, the
+// same count-fixup and merge machinery Delete and the fused pops share, so the
+// tree stays a valid counted B+ tree after every call. The descent routes on the
+// subtree counts alone, exactly as SelectAt and the pops do, so it reads no member
+// bytes and never invokes the Members callback.
+func (t *Tree) DeleteAt(r uint64) (score uint64, ref uint32, ok bool) {
+	if r >= t.entries {
+		return 0, 0, false
+	}
+	score, ref = t.deleteAtFrom(t.root, t.height, r)
+	t.entries--
+	t.collapseRoot()
+	return score, ref, true
+}
+
+func (t *Tree) deleteAtFrom(ord uint32, level int, r uint64) (uint64, uint32) {
+	if level == 1 {
+		score, ref := t.lScore(ord, int(r)), t.lRef(ord, int(r))
+		t.leafRemove(ord, int(r))
+		return score, ref
+	}
+	nk := t.bNkeys(ord)
+	c := 0
+	for c <= nk {
+		cc := t.bCount(ord, c)
+		if r < cc {
+			break
+		}
+		r -= cc
+		c++
+	}
+	child := t.bChild(ord, c)
+	score, ref := t.deleteAtFrom(child, level-1, r)
+	t.bSetCount(ord, c, t.bCount(ord, c)-1)
+	if level-1 == 1 {
+		if t.lNent(child) < t.leafMin() {
+			t.fixLeafUnderflow(ord, c)
+		}
+	} else if t.bNkeys(child) < t.branchMin() {
+		t.fixBranchUnderflow(ord, c)
+	}
+	return score, ref
+}
+
 func (t *Tree) leafMin() int   { return t.leafCap / 4 }
 func (t *Tree) branchMin() int { return t.sepMax / 4 }
 
