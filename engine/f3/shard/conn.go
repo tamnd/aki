@@ -251,7 +251,9 @@ func (c *Conn) StreamStep(emit func([]byte), budget int) {
 			break
 		}
 		if c.curSent == st.total {
-			emit(crlf)
+			if !st.raw {
+				emit(crlf)
+			}
 			c.cur = nil
 			c.next++
 			c.drainParked(emit)
