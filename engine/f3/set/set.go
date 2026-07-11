@@ -257,6 +257,34 @@ func (s *set) each(fn func(m []byte)) {
 	}
 }
 
+// eachUntil calls fn for each member until it returns false, the early-stop
+// iteration SINTERCARD's LIMIT walk uses over any band. The []byte handed to fn
+// aliases internal storage (or a scratch for integers) and is valid only for the
+// call.
+func (s *set) eachUntil(fn func(m []byte) bool) {
+	switch s.enc {
+	case encIntset:
+		var sc [20]byte
+		for _, v := range s.ints {
+			if !fn(strconv.AppendInt(sc[:0], v, 10)) {
+				return
+			}
+		}
+	case encListpack:
+		b := s.blob
+		for i := 0; i < len(b); {
+			n := int(b[i])
+			start := i + 2
+			if !fn(b[start : start+n]) {
+				return
+			}
+			i = start + n
+		}
+	default:
+		s.ht.eachUntil(fn)
+	}
+}
+
 // at returns the member at draw index i in [0, card), rendered into sc for the
 // intset branch. Used by the uniform draw; the listpack walk is O(i), which is
 // bounded by the 128 cap, and the table placeholder iterates i steps until the
