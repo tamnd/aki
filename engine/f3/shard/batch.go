@@ -68,6 +68,12 @@ type hopBatch struct {
 	// Same lazy-slice-plus-flag shape as fans.
 	streams   []*stream
 	hasStream bool
+
+	// deferN counts this node's commands parked behind queued intents
+	// (txnroute.go). While it is non-zero the node stays with its owner;
+	// runDeferred pushes it to the connection when the count hits zero.
+	// Owner-goroutine only.
+	deferN int
 }
 
 func newBatch() *hopBatch {
@@ -95,6 +101,7 @@ func (b *hopBatch) reset() {
 	}
 	b.n = 0
 	b.sn = 0
+	b.deferN = 0
 	b.data = b.data[:0]
 	b.rep = b.rep[:0]
 	// A node that carried a giant chunked-band command must not pin its grown

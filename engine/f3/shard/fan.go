@@ -37,6 +37,12 @@ const (
 	// FanStats sums fixed-width per-shard counter blobs and renders the
 	// INFO-style text reply: the evidence surface the LTM harness reads.
 	FanStats
+
+	// FanTxn gathers a cross-shard tier-two command's arm partials
+	// (txnroute.go) and emits nothing: the reply arrives later on the
+	// transaction's loopback node at the same sequence, once the barrier work
+	// has run.
+	FanTxn
 )
 
 // maxFanKeys caps the keys one sub-command carries, so a sub-command's
@@ -58,6 +64,12 @@ type fanCmd struct {
 	stats   []uint64
 	errMsg  []byte
 	out     []byte
+
+	// txn is the FanTxn coordinator's transaction: the arm builtin reads it
+	// on the owner to find the intent its key enqueues. Set before the first
+	// enqueue and immutable afterwards, so the owner-side read is ordered by
+	// the hop queue's publish.
+	txn *Txn
 }
 
 // DoFan enqueues one tier-one multi-key command: keys are the routed keys in
@@ -237,6 +249,11 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 	}
 	fc.pending--
 	if fc.pending > 0 {
+		return 0
+	}
+	if fc.kind == FanTxn {
+		// The arms have all executed; the reply comes later on the
+		// transaction's loopback node, so there is nothing to emit here.
 		return 0
 	}
 	fc.out = fc.out[:0]
