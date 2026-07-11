@@ -358,10 +358,11 @@ func (n *nativeStore) lexWindow(min, max lexBound) (lo, hiExcl int) {
 }
 
 // maybeRebuild rebuilds the whole dual structure from its live entries once
-// removals leave more dead bytes or dead records than live ones, so churn
-// cannot grow the store without bound. The rebuild walks the tree in order and
-// bulk-loads a fresh store, which also refreshes every separator, so no stale
-// ref survives it. Amortized maintenance, not a steady-path cost.
+// removals leave more dead bytes or dead records than live ones, so churn cannot
+// grow the store without bound. It reclaims into a fresh store that keeps the
+// record order of the live members rather than re-sorting them, and refreshes
+// every tree separator, so no stale ref survives it. Amortized maintenance, not a
+// steady-path cost.
 func (n *nativeStore) maybeRebuild() {
 	live := n.tbl.Len()
 	bytesHeavy := n.deadBytes >= 4096 && n.deadBytes > len(n.slab)/2
@@ -369,15 +370,129 @@ func (n *nativeStore) maybeRebuild() {
 	if !bytesHeavy && !recsHeavy {
 		return
 	}
-	oldTree, oldRecs, oldSlab := n.tree, n.recs, n.slab
-	fresh := newNativeStore(live)
-	oldTree.Each(func(_ uint64, ref uint32) bool {
-		r := &oldRecs[ref]
-		fresh.appendSorted(oldSlab[r.loc:r.loc+r.mlen], math.Float64frombits(r.bits))
+	n.rebuild(live)
+}
+
+// rebuild compacts the dual structure to its live members, preserving their
+// record order instead of re-sorting them. The stable order is what keeps an
+// interleaved ZSCAN's downward record cursor honest (spec 2064/f3/12 section
+// 6.11): a live member's record index can only fall across a rebuild, because the
+// only cells that leave are the dead ones below it, so a record still below the
+// cursor stays below it and the at-least-once guarantee survives the reclaim. The
+// tree is rebuilt sorted by a bulk load with its refs remapped to the new record
+// ordinals, so the ordered views stay correct while the scan order stays stable.
+func (n *nativeStore) rebuild(live int) {
+	liveMark := make([]bool, len(n.recs))
+	n.tree.Each(func(_ uint64, ref uint32) bool {
+		liveMark[ref] = true
 		return true
 	})
-	fresh.seal()
+	remap := make([]uint32, len(n.recs))
+	fresh := &nativeStore{tbl: structs.MakeTable(live)}
+	if live > 0 {
+		fresh.recs = make([]natRecord, 0, live)
+		fresh.slab = make([]byte, 0, len(n.slab)-n.deadBytes)
+	}
+	for old := 0; old < len(n.recs); old++ {
+		if !liveMark[old] {
+			continue
+		}
+		r := n.recs[old]
+		m := n.slab[r.loc : r.loc+r.mlen]
+		newOrd := uint32(len(fresh.recs))
+		remap[old] = newOrd
+		loc := uint32(len(fresh.slab))
+		fresh.slab = append(fresh.slab, m...)
+		fresh.recs = append(fresh.recs, natRecord{loc: loc, mlen: r.mlen, bits: r.bits})
+		fresh.tbl.Insert(store.Hash(m), newOrd, fresh)
+	}
+	entries := make([]structs.Entry, 0, live)
+	n.tree.Each(func(score uint64, ref uint32) bool {
+		entries = append(entries, structs.Entry{Score: score, Ref: remap[ref]})
+		return true
+	})
+	fresh.tree = structs.BulkLoad(entries)
 	*n = *fresh
+}
+
+// scanPage returns one ZSCAN page over the member records and the cursor to
+// resume from, 0 when the scan completes (spec 2064/f3/12 section 6.11). The
+// cursor rides the record array downward, the same downward-cursor convention
+// SSCAN established (set/scan.go): records [b, len) have been returned by earlier
+// pages and [0, b) remain, and a page examines up to count records from the
+// boundary down. New members append above the boundary, on the already-scanned
+// side, so growth mid-scan is never revisited; a removed member leaves a dead
+// record cell in place that this walk skips, so a member present for the whole
+// scan keeps its index and is returned at least once. A reclaim rebuild only
+// lowers a live record's index (rebuild, above), so the guarantee survives it.
+// COUNT bounds records examined, not members emitted; MATCH filters the survivors.
+func (n *nativeStore) scanPage(cursor uint64, count int, match []byte, emit func(m []byte, bits uint64)) uint64 {
+	total := uint64(len(n.recs))
+	if total == 0 {
+		return 0
+	}
+	b := total
+	if cursor != 0 && cursor < b {
+		b = cursor
+	}
+	lo := uint64(0)
+	if b > uint64(count) {
+		lo = b - uint64(count)
+	}
+	for i := b; i > lo; i-- {
+		ord := uint32(i - 1)
+		r := &n.recs[ord]
+		m := n.slab[r.loc : r.loc+r.mlen]
+		if !n.liveAt(ord, m) {
+			continue
+		}
+		if match != nil && !globMatch(match, m) {
+			continue
+		}
+		emit(m, r.bits)
+	}
+	return lo
+}
+
+// liveAt reports whether record ord is still a live member: its bytes must probe
+// back to this same ordinal. A removed record keeps valid bytes until the next
+// rebuild, since records never move in place, so the slab read is always safe; a
+// member re-added after removal takes a fresh ordinal, so an equal-bytes probe
+// that resolves to a different ordinal correctly reads the old cell as dead.
+func (n *nativeStore) liveAt(ord uint32, m []byte) bool {
+	got, ok := n.tbl.Find(store.Hash(m), m, n)
+	return ok && got == ord
+}
+
+// removeRange deletes the entries at forward ranks [lo, hiExcl) as a bounded tree
+// operation and reports how many left (spec 2064/f3/12 section 6.9). It resolves
+// to a loop of fused single-descent rank deletes (tree.DeleteAt), the same
+// loop-of-fused-pops shape lab 04 froze for the pops (labs/f3/m2): the DeleteAt
+// descent routes on the subtree counts with no member compare and fixes the one
+// count path and any underflow in the same pass, and the spine it re-walks stays
+// hot across the window. The loop runs high rank to low, so each delete takes the
+// current right edge of the shrinking window and the ranks still below it do not
+// shift. Each removed entry still pays its member-hash delete and dead accounting,
+// the honest O(w) floor, and one amortized rebuild runs at the end rather than per
+// element, so a native ZREMRANGEBY* has no deferred teardown to shoulder a p99.
+func (n *nativeStore) removeRange(lo, hiExcl int) int {
+	removed := 0
+	for r := hiExcl - 1; r >= lo; r-- {
+		_, ref, ok := n.tree.DeleteAt(uint64(r))
+		if !ok {
+			break
+		}
+		rec := &n.recs[ref]
+		m := n.slab[rec.loc : rec.loc+rec.mlen]
+		n.tbl.Delete(store.Hash(m), m, n)
+		n.deadBytes += int(rec.mlen)
+		n.deadRecs++
+		removed++
+	}
+	if removed > 0 && n.card() > 0 {
+		n.maybeRebuild()
+	}
+	return removed
 }
 
 // bytes is the structure's allocated footprint for the memory tests: the tree

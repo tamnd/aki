@@ -348,3 +348,44 @@ func drawRanks(n int, zipf bool, seed uint64) []int {
 	}
 	return out
 }
+
+// BenchmarkZscanNative measures the ZSCAN per-member cost at 10k and 1M members:
+// each page rides COUNT records down the member array, probes the hash to skip
+// dead cells, and emits the live member with its stored score bits. The cursor
+// wraps to the top when it reaches the floor so the steady loop keeps paging a
+// cache-resident array. A page emits pageCount members, so ns/op divided by
+// pageCount reads the per-member cost, the figure the ZSCAN row quotes.
+func BenchmarkZscanNative(b *testing.B) {
+	const pageCount = 1000
+	benchNativeSizes(b, func(b *testing.B, z *zset, n int) {
+		cursor := uint64(0)
+		for i := 0; i < b.N; i++ {
+			cursor = z.nat.scanPage(cursor, pageCount, nil, func(m []byte, bits uint64) {
+				sinkBytes = m
+				sinkInt2 = int(bits)
+			})
+			if cursor == 0 {
+				cursor = uint64(n)
+			}
+		}
+	})
+}
+
+// BenchmarkRemoveRangeNative measures ZREMRANGEBYRANK per element at the 10k
+// window on a 1M native set, the shape the removal spec prices (lab 04 tied v1's
+// ZREM p99 shoulder to deferred teardown, so this removal is inline: the window
+// is deleted as a bounded high-to-low run of counted tree deletes plus member
+// hash deletes, one amortized reclaim rebuild at the end). The set is rebuilt off
+// the timer before each removal, so the timed figure is the window delete alone.
+// ns/op divided by the window reads the per-element cost.
+func BenchmarkRemoveRangeNative(b *testing.B) {
+	const n, win = 1_000_000, 10_000
+	lo := n/2 - win/2
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		z := buildNative(n)
+		b.StartTimer()
+		sinkInt = z.removeRange(lo, lo+win)
+	}
+}
