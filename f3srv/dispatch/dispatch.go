@@ -176,6 +176,15 @@ func init() {
 	register("SDIFF", set.Sdiff, 1, -1, true)
 	register("SINTERCARD", set.Sintercard, 2, -1, false)
 	table["SINTERCARD"].keyAt = 1
+	// The STORE forms (spec 2064/f3/11 section 7) write the result to the
+	// destination and read the sources, so they key on the destination (args[0])
+	// for routing, the same first-argument route SADD uses; the sources are read
+	// from the destination shard's registry, the co-located-operand constraint
+	// the read-side algebra already documents (algebra_commands.go). Minimum two
+	// arguments: a destination and at least one source key.
+	register("SINTERSTORE", set.Sinterstore, 2, -1, true)
+	register("SUNIONSTORE", set.Sunionstore, 2, -1, true)
+	register("SDIFFSTORE", set.Sdiffstore, 2, -1, true)
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
