@@ -278,6 +278,152 @@ func (z *zset) rangeByIndex(out []byte, lo, hi int, rev, withScores bool) []byte
 	return out
 }
 
+// scoreWindow returns the half-open forward-rank window [lo, hiExcl) of members
+// scored in [min, max], the span ZRANGEBYSCORE streams and ZCOUNT measures. The
+// native band answers with two counted descents (nat.scoreWindow); the inline
+// band scans its already score-ordered blob, contiguous because entries sharing
+// a score sit together.
+func (z *zset) scoreWindow(min, max scoreBound) (lo, hiExcl int) {
+	if z.enc == encSkiplist {
+		return z.nat.scoreWindow(min, max)
+	}
+	ev := z.entries()
+	for lo < len(ev) && scoreBelowLow(ev[lo].score, min) {
+		lo++
+	}
+	hiExcl = lo
+	for hiExcl < len(ev) && scoreWithinHigh(ev[hiExcl].score, max) {
+		hiExcl++
+	}
+	return lo, hiExcl
+}
+
+// lexWindow returns the forward-rank window [lo, hiExcl) of members in the lex
+// band [min, max], defined at equal scores (section 3.2). The inline band
+// anchors the compare to the leftmost entry's score exactly as the native band
+// anchors to its band score, so the two produce identical windows for the same
+// data.
+func (z *zset) lexWindow(min, max lexBound) (lo, hiExcl int) {
+	if z.enc == encSkiplist {
+		return z.nat.lexWindow(min, max)
+	}
+	ev := z.entries()
+	if len(ev) == 0 {
+		return 0, 0
+	}
+	band := ev[0].score
+	switch min.inf {
+	case lexNegInf:
+		lo = 0
+	case lexPosInf:
+		return len(ev), len(ev)
+	default:
+		for lo < len(ev) && lexBelowLow(band, ev[lo].score, ev[lo].member, min) {
+			lo++
+		}
+	}
+	hiExcl = lo
+	switch max.inf {
+	case lexPosInf:
+		hiExcl = len(ev)
+	case lexNegInf:
+		hiExcl = lo
+	default:
+		for hiExcl < len(ev) && lexWithinHigh(band, ev[hiExcl].score, ev[hiExcl].member, max) {
+			hiExcl++
+		}
+	}
+	return lo, hiExcl
+}
+
+// scoreBelowLow reports whether a member at score s sorts strictly below the low
+// score bound: at or under it when exclusive, strictly under it when inclusive.
+func scoreBelowLow(s float64, min scoreBound) bool {
+	if min.exclusive {
+		return s <= min.value
+	}
+	return s < min.value
+}
+
+// scoreWithinHigh reports whether score s is still inside the high score bound.
+func scoreWithinHigh(s float64, max scoreBound) bool {
+	if max.exclusive {
+		return s < max.value
+	}
+	return s <= max.value
+}
+
+// lexBelowLow reports whether entry (s, m) sorts strictly below the low lex
+// bound, anchored to the band score so a plain-band autocomplete zset compares
+// on member bytes alone.
+func lexBelowLow(band, s float64, m []byte, min lexBound) bool {
+	c := cmpEntryKey(s, m, band, min.value)
+	if min.exclusive {
+		return c <= 0
+	}
+	return c < 0
+}
+
+// lexWithinHigh reports whether entry (s, m) is still inside the high lex bound.
+func lexWithinHigh(band, s float64, m []byte, max lexBound) bool {
+	c := cmpEntryKey(s, m, band, max.value)
+	if max.exclusive {
+		return c < 0
+	}
+	return c <= 0
+}
+
+// cmpEntryKey orders (sA, mA) against the key (sB, mB) the same way the tree
+// does: score first, member bytes on a score tie.
+func cmpEntryKey(sA float64, mA []byte, sB float64, mB []byte) int {
+	if sA != sB {
+		if sA < sB {
+			return -1
+		}
+		return 1
+	}
+	return bytes.Compare(mA, mB)
+}
+
+// rangeByRankWindow streams the members at forward ranks a..hi inclusive into
+// out as RESP bulk strings, scores appended when withScores, emitted descending
+// when rev. It is the shared streamer the score, lex, and index ranges reduce
+// to once their bounds are resolved to a rank window: the native band seeks with
+// a counted select and walks the leaf chain, the inline band slices its ordered
+// entries, and out is the shard scratch so a warm buffer grows for none of the
+// window's elements.
+func (z *zset) rangeByRankWindow(out []byte, a, hi int, rev, withScores bool) []byte {
+	if hi < a {
+		return out
+	}
+	var sc [40]byte
+	emit := func(m []byte, bits uint64) {
+		out = resp.AppendBulk(out, m)
+		if withScores {
+			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(bits)))
+		}
+	}
+	if z.enc == encSkiplist {
+		if rev {
+			z.nat.walkRangeRev(a, hi, emit)
+		} else {
+			z.nat.walkRange(a, hi, emit)
+		}
+		return out
+	}
+	ev := z.entries()
+	if rev {
+		for j := hi; j >= a; j-- {
+			emit(ev[j].member, math.Float64bits(ev[j].score))
+		}
+	} else {
+		for j := a; j <= hi; j++ {
+			emit(ev[j].member, math.Float64bits(ev[j].score))
+		}
+	}
+	return out
+}
+
 // listpackInsert writes one entry at its sorted position with a single memmove,
 // copying the member bytes so the argument view is never retained. A -0.0
 // score lands as +0.0, the collapse Redis's listpack integer encoding applies

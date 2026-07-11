@@ -223,6 +223,80 @@ func (n *nativeStore) walkRangeRev(lo, hi int, fn func(m []byte, bits uint64)) {
 	})
 }
 
+// scoreWindow returns the half-open forward-rank window [lo, hiExcl) of the
+// members whose score falls in [min, max] (spec 2064/f3/12 section 6.4). It is
+// two counted descents and no walk: lo is the count of entries strictly below
+// the low bound, hiExcl the count at or below the high bound, so ZCOUNT is
+// hiExcl-lo and a ZRANGEBYSCORE stream is the index range over that window. The
+// low bound seeks with the member -inf sentinel (nil), so an inclusive bound
+// lands the first entry at the bound's score and an exclusive bound skips the
+// whole tied score band via the +1 on the sortable key, one comparison tweak in
+// the descent rather than a post-filter (section 6.5).
+func (n *nativeStore) scoreWindow(min, max scoreBound) (lo, hiExcl int) {
+	lk := scoreKey(min.value)
+	if min.exclusive {
+		lk++ // entries at the bound score sort before (lk, nil), so they count as below
+	}
+	lr, _ := n.tree.Rank(lk, nil, n)
+
+	hk := scoreKey(max.value)
+	if !max.exclusive {
+		hk++ // include the bound score: count entries strictly below the next key
+	}
+	hr, _ := n.tree.Rank(hk, nil, n)
+
+	lo = int(lr)
+	hiExcl = int(hr)
+	if hiExcl < lo {
+		hiExcl = lo
+	}
+	return lo, hiExcl
+}
+
+// lexWindow returns the forward-rank window [lo, hiExcl) of the members whose
+// bytes fall in the lex band [min, max], defined at equal scores (section 3.2).
+// The band's score is the score of the leftmost entry, so the seek is to (band
+// score, low member) and the walk runs to the high member, the exact shape
+// section 3.2 names; over mixed scores the result is unspecified, matching
+// Redis. Two counted descents, so ZLEXCOUNT is hiExcl-lo with no walk.
+func (n *nativeStore) lexWindow(min, max lexBound) (lo, hiExcl int) {
+	card := n.card()
+	if card == 0 {
+		return 0, 0
+	}
+	band, _, _ := n.tree.SelectAt(0) // the tied band's sortable score key
+
+	switch min.inf {
+	case lexNegInf:
+		lo = 0
+	case lexPosInf:
+		return card, card
+	default:
+		r, present := n.tree.Rank(band, min.value, n)
+		lo = int(r)
+		if min.exclusive && present {
+			lo++
+		}
+	}
+
+	switch max.inf {
+	case lexPosInf:
+		hiExcl = card
+	case lexNegInf:
+		hiExcl = 0
+	default:
+		r, present := n.tree.Rank(band, max.value, n)
+		hiExcl = int(r)
+		if !max.exclusive && present {
+			hiExcl++
+		}
+	}
+	if hiExcl < lo {
+		hiExcl = lo
+	}
+	return lo, hiExcl
+}
+
 // maybeRebuild rebuilds the whole dual structure from its live entries once
 // removals leave more dead bytes or dead records than live ones, so churn
 // cannot grow the store without bound. The rebuild walks the tree in order and
