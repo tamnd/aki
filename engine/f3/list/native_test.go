@@ -272,6 +272,142 @@ func TestNativeAgainstModel(t *testing.T) {
 	}
 }
 
+// forceFlatLocate resolves k by the flat linear scan regardless of ring size,
+// the exact scan locate runs at or below flatMax. Tests and benchmarks use it to
+// exercise the flat path above the crossover, where locate itself would pick the
+// Fenwick descent.
+func forceFlatLocate(nt *native, k int) (ci, ord int) {
+	for i := 0; i < nt.ring.n; i++ {
+		n := nt.ring.at(i).count()
+		if k < n {
+			return i, k
+		}
+		k -= n
+	}
+	return nt.ring.n - 1, k
+}
+
+// buildNativeVals pushes vals onto a fresh deque through the tail path, the same
+// promotion order toNative uses, so the ring geometry matches a real list.
+func buildNativeVals(vals [][]byte) *native {
+	nt := &native{}
+	for _, v := range vals {
+		nt.pushBack(v)
+	}
+	return nt
+}
+
+// checkLocateAgree asserts that for every dense index k the flat scan and the
+// Fenwick descent return the identical (chunk, ordinal) pair. It forces a fresh
+// Fenwick build so the descent reads the current chunk geometry, mirroring lab
+// 02's flat-versus-Fenwick equivalence assertion. This is the pre-registered
+// correctness bar for the crossover: the switch at flatMax may never change an
+// answer.
+func checkLocateAgree(t *testing.T, nt *native, label string) {
+	t.Helper()
+	nt.dir.stale = true
+	nt.dir.sync(&nt.ring)
+	// Walk the chunks in order so the flat expectation is one pass, then compare
+	// the Fenwick descent at every k against it.
+	k := 0
+	for ci := 0; ci < nt.ring.n; ci++ {
+		n := nt.ring.at(ci).count()
+		for ord := 0; ord < n; ord++ {
+			bc, bo := nt.dir.rank(k)
+			if bc != ci || bo != ord {
+				t.Fatalf("%s: k=%d flat=(%d,%d) fenwick=(%d,%d) chunks=%d",
+					label, k, ci, ord, bc, bo, nt.ring.n)
+			}
+			k++
+		}
+	}
+}
+
+// TestLocateFlatMatchesFenwick is the equivalence bar for the chunk directory
+// (section 2.4, invariant 2). Across many ring geometries, including well past
+// the 128-chunk crossover and past 512 chunks, and after sequences of mixed
+// head/tail pushes, pops, inserts, removes, trims, and length-changing sets, the
+// flat scan and the Fenwick descent must resolve every k identically. The churn
+// drives the ring through chunk appends, edge removals at both ends, head-side
+// renumbering, and interior rebuilds, so the directory is proven through
+// structural change, not just a static build.
+func TestLocateFlatMatchesFenwick(t *testing.T) {
+	// Static geometries: chunk fills from a few elements to near-full, at chunk
+	// counts straddling and far past the crossover. elemSize picks the fill: ~1200
+	// bytes gives three to four per chunk, 64 bytes about sixty, 4 bytes the max.
+	static := []struct {
+		chunks   int
+		elemSize int
+	}{
+		{4, 64}, {17, 1200}, {130, 4}, {130, 1200}, {200, 64}, {512, 4}, {600, 64},
+	}
+	for _, cfg := range static {
+		// Enough elements to reach the target chunk count at this fill.
+		perChunk := chunkElemCap
+		if cfg.elemSize >= 1024 {
+			perChunk = 3
+		} else if cfg.elemSize >= 64 {
+			perChunk = 60
+		}
+		vals := make([][]byte, cfg.chunks*perChunk)
+		for i := range vals {
+			vals[i] = sized(cfg.elemSize, i)
+		}
+		nt := buildNativeVals(vals)
+		checkLocateAgree(t, nt, "static")
+	}
+
+	// Churn: start past the crossover, then drive a long mixed-op stream and
+	// re-check the equivalence at every step, so the Fenwick is exercised through
+	// appends, both-end pops, and interior rebuilds rather than one static build.
+	rng := rand.New(rand.NewPCG(0x5eed, 0x1337))
+	vals := make([][]byte, 150*60) // ~150 chunks of 64-byte values, past the crossover
+	for i := range vals {
+		vals[i] = sized(64, i)
+	}
+	nt := buildNativeVals(vals)
+	for step := 0; step < 200; step++ {
+		switch rng.IntN(8) {
+		case 0:
+			nt.pushBack(sized(64, step))
+		case 1:
+			nt.pushFront(sized(64, step))
+		case 2:
+			if nt.count > 0 {
+				nt.popFront()
+			}
+		case 3:
+			if nt.count > 0 {
+				nt.popBack()
+			}
+		case 4:
+			if nt.count > 0 {
+				nt.setAt(rng.IntN(nt.count), sized(1200, step)) // length-changing set, rebuild
+			}
+		case 5:
+			if nt.count > 0 {
+				pivot := nt.at(rng.IntN(nt.count))
+				nt.insert(rng.IntN(2) == 0, cloneBytes(pivot), sized(64, step))
+			}
+		case 6:
+			if nt.count > 0 {
+				nt.remove(rng.IntN(5)-2, nt.at(rng.IntN(nt.count)))
+			}
+		case 7:
+			if nt.count > 4 {
+				a, b := rng.IntN(nt.count), rng.IntN(nt.count)
+				if a > b {
+					a, b = b, a
+				}
+				nt.trim(a, b)
+			}
+		}
+		if nt.count > 0 {
+			checkLocateAgree(t, nt, "churn step "+strconv.Itoa(step))
+		}
+	}
+}
+
 // modelLpos is the independent LPOS reference: positions of target under the
 // RANK direction and COUNT cap, no MAXLEN.
 func modelLpos(m *listModel, target []byte, rank, limit int) []int {

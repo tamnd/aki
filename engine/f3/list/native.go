@@ -28,8 +28,10 @@ import "encoding/binary"
 //
 // Constants are frozen by the merged labs: chunkBlobCap and chunkElemCap by lab
 // 01 (labs/f3/m3/01_chunk_capacity). The flat-versus-Fenwick crossover frozen by
-// lab 02 (02_directory_crossover) lands with its consumer in slice 3; this slice
-// runs the flat scan at every ring size, which is correct everywhere.
+// lab 02 (02_directory_crossover) lands here with its consumer: locate runs the
+// flat scan at or below flatMax chunks and the Fenwick rank descent above it
+// (section 2.4). Both paths resolve every index identically, so the switch is a
+// pure seek acceleration and changes no answer.
 const (
 	// chunkBlobCap is the per-chunk blob byte budget, 4 KiB. Lab 01 froze it as
 	// the smallest budget that clears the 3-4B per-element memory bar at the 64B
@@ -149,6 +151,7 @@ type native struct {
 	count int
 	bytes int
 	free  []*chunk // recycled slabs for reuse, bounded by freeCap
+	dir   chunkDir // Fenwick chunk directory for the above-crossover seek (2.4)
 }
 
 // --- slab allocation and recycling ---------------------------------------
@@ -204,6 +207,7 @@ func (nt *native) pushBack(v []byte) {
 	c.hi++
 	nt.count++
 	nt.bytes += len(v)
+	nt.dir.stale = true
 }
 
 // pushFront prepends v to the head, filling a fresh head chunk back to front so
@@ -227,6 +231,7 @@ func (nt *native) pushFront(v []byte) {
 	c.dir[c.lo] = uint16(off)
 	nt.count++
 	nt.bytes += len(v)
+	nt.dir.stale = true
 }
 
 // popFront removes and returns the head element (LPOP). The bytes alias the blob
@@ -244,6 +249,7 @@ func (nt *native) popFront() []byte {
 	}
 	nt.count--
 	nt.bytes -= len(v)
+	nt.dir.stale = true
 	if c.count() == 0 {
 		nt.recycle(c)
 		nt.ring.popHead()
@@ -262,6 +268,7 @@ func (nt *native) popBack() []byte {
 	}
 	nt.count--
 	nt.bytes -= len(v)
+	nt.dir.stale = true
 	if c.count() == 0 {
 		nt.recycle(c)
 		nt.ring.popTail()
@@ -271,23 +278,107 @@ func (nt *native) popBack() []byte {
 
 // --- positional access (section 2.4) -------------------------------------
 
-// locate resolves a dense index k, already in [0, count), to a (chunk index,
-// in-chunk ordinal) pair through the flat per-chunk count directory.
+// flatMax is the ring chunk count at or below which locate runs the flat linear
+// scan and above which it runs the Fenwick rank descent. Lab 02
+// (labs/f3/m3/02_directory_crossover) froze it at 128: below the crossover the
+// flat scan wins select outright and its update is far cheaper, at 128 the two
+// select paths are tied inside run noise, and above it the flat scan climbs
+// linearly while the Fenwick descent stays near flat, so Fenwick is the only
+// choice for long rings. 128 is also a clean power of two the branch tests with a
+// single comparison.
+const flatMax = 128
+
+// chunkDir is the Fenwick directory over the ring's per-chunk live counts
+// (section 2.4). It is a cache, not the source of truth: the live counts are the
+// chunks' own hi-lo windows, so the flat scan needs no separate structure and the
+// hot edge ops never walk this tree. They only flip stale, and locate rebuilds
+// the tree from the logical chunk order before the first rank descent that needs
+// it. That keeps a plain push, pop, or edge count change O(1) on the tree while
+// still giving an above-crossover seek an O(log chunks) descent, and it sidesteps
+// the circular ring entirely: a head-side push or pop that renumbers the logical
+// chunk positions just marks the tree stale and the next rebuild reads the new
+// order straight off ring.at, so no index shifting is ever mirrored into the tree.
 //
-// SLICE 3 SEAM: above flatMax chunks the Fenwick rank descent replaces the flat
-// scan here (doc 2.4). The branch point is marked below; until slice 3 lands the
-// flat scan runs at every ring size. It is correct everywhere, only O(chunks)
-// instead of O(log chunks) on the seek above the crossover, which no edge or
-// LLEN op pays because none of them call locate.
-func (nt *native) locate(k int) (ci, ord int) {
-	// if nt.ring.n > flatMax { return nt.fenwick.rank(k) } // slice 3
-	for i := 0; i < nt.ring.n; i++ {
-		c := nt.ring.at(i)
-		if n := c.count(); k < n {
-			return i, k
-		} else {
-			k -= n
+// tree is 1-indexed with a dummy slot 0; tree[i] holds the sum of a block of
+// per-chunk counts ending at logical position i. pw is the largest power of two
+// not exceeding n, the start stride for the descent. The build and the descent
+// are lab 02's validated mirror, reused verbatim.
+type chunkDir struct {
+	tree  []uint64
+	n     int
+	pw    int
+	stale bool
+}
+
+// sync rebuilds the tree from the ring's live chunk counts when it is stale or
+// its length no longer matches the ring. The rebuild is O(chunks); it happens
+// once per run of mutations, so a seek-heavy stretch pays it once and every
+// following descent reuses the tree.
+func (d *chunkDir) sync(r *chunkRing) {
+	if !d.stale && d.n == r.n {
+		return
+	}
+	n := r.n
+	if cap(d.tree) >= n+1 {
+		d.tree = d.tree[:n+1]
+		for i := range d.tree {
+			d.tree[i] = 0
 		}
+	} else {
+		d.tree = make([]uint64, n+1)
+	}
+	for i := 0; i < n; i++ {
+		d.tree[i+1] = uint64(r.at(i).count())
+	}
+	for i := 1; i <= n; i++ {
+		j := i + (i & -i)
+		if j <= n {
+			d.tree[j] += d.tree[i]
+		}
+	}
+	pw := 1
+	for pw<<1 <= n {
+		pw <<= 1
+	}
+	d.n = n
+	d.pw = pw
+	d.stale = false
+}
+
+// rank finds the chunk bracketing dense index k and the in-chunk ordinal within
+// it, returning the same (chunk, ordinal) pair the flat scan does. It is a
+// power-of-two descent: at each stride it steps right if the block sum there
+// still fits under the remaining index, consuming that block. k must be in
+// [0, count) and the tree must be current (sync first).
+func (d *chunkDir) rank(k int) (ci, ord int) {
+	pos, rem := 0, k
+	for pw := d.pw; pw > 0; pw >>= 1 {
+		next := pos + pw
+		if next <= d.n && d.tree[next] <= uint64(rem) {
+			pos = next
+			rem -= int(d.tree[next])
+		}
+	}
+	return pos, rem
+}
+
+// locate resolves a dense index k, already in [0, count), to a (chunk index,
+// in-chunk ordinal) pair. Below the crossover it runs the flat linear scan over
+// the live chunk counts; above it it descends the Fenwick directory (section
+// 2.4). Both paths return the identical pair for every k, so the switch is a pure
+// seek acceleration. No edge or LLEN op reaches here, so none of them pays the
+// directory depth.
+func (nt *native) locate(k int) (ci, ord int) {
+	if nt.ring.n > flatMax {
+		nt.dir.sync(&nt.ring)
+		return nt.dir.rank(k)
+	}
+	for i := 0; i < nt.ring.n; i++ {
+		n := nt.ring.at(i).count()
+		if k < n {
+			return i, k
+		}
+		k -= n
 	}
 	panic("list: locate index out of range")
 }
