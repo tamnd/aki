@@ -51,14 +51,19 @@ import (
 // the kernel reads and writes those buffers until then and the GC must not
 // reclaim them first.
 //
-// Buffers are leased from per-loop free lists, the reactor's doc 08 section
-// 6.2 discipline (loopBufFree cap, stock sizes only, grown buffers drop to
-// the GC), with one honest exception: a connected conn keeps a single-shot
-// recv armed, and the kernel owns that buffer until the CQE, so the read
-// buffer cannot be released while the connection idles. That per-conn
-// readBufSize pin is the proactor model's floor; provided-buffer rings
-// (multishot recv) are the fix and a measured follow-up, not part of this
-// slice. Reply buffers (out and inflight) do release on a clean park.
+// Buffers follow the reactor's doc 08 section 6.2 discipline (lease, not
+// own; loopBufFree cap; stock sizes only; grown buffers drop to the GC),
+// with two driver-shaped adjustments. First, a connected conn keeps a
+// single-shot recv armed and the kernel owns that buffer until the CQE, so
+// the read buffer cannot be released while the connection idles: that
+// per-conn readBufSize pin is the proactor model's floor, priced in the
+// campaign note, and provided-buffer rings (multishot recv) are the fix and
+// a measured follow-up. Second, the free list fills only from idle parks,
+// never from closes: a disconnect storm on this driver has no interleaved
+// lease to balance the returns (the reactor's death read leases first), so
+// close-time recycling would leave the lists parked at cap, tens of MiB an
+// idle server never gives back. Closed conns' buffers drop to the GC.
+// Reply buffers (out and inflight) release on a clean park.
 
 // uring ring sizing per loop: the SQ bounds one pass's staged ops (getSQE
 // flushes early if a pathological pass overruns it), the CQ is oversized so
@@ -190,15 +195,18 @@ type uringLoop struct {
 	conns []*uringConn // indexed by fd; loop goroutine only
 	gens  []uint32     // per-fd-slot generation; loop goroutine only
 
-	// The buffer free lists (doc 08 section 6.2): buffers are leased, not
-	// owned. Loop-goroutine only, like conns; capped at loopBufFree.
-	rfree [][]byte // read buffers, len readBufSize
+	// The reply-buffer free list (doc 08 section 6.2): filled by idle parks
+	// only (see the package comment), capped at loopBufFree. There is no
+	// read-buffer list because a conn's rbuf is leased once at the first
+	// recv and pinned by the armed recv until the close drops it.
+	// Loop-goroutine only, like conns.
 	ofree [][]byte // reply buffers, len 0, cap replyBuf
 
 	// zombies holds connections closed while a recv or send was still in
 	// flight: the kernel touches their buffers until the canceled ops'
 	// CQEs arrive, so the conn (and its buffers) must stay reachable until
-	// then. Retirement recycles the stock buffers. Loop goroutine only.
+	// then. Retirement drops the hold; the buffers go to the GC like every
+	// close-path buffer. Loop goroutine only.
 	zombies []*uringZombie
 
 	evBuf [8]byte // the armed eventfd read's landing pad
@@ -513,7 +521,7 @@ func (l *uringLoop) ensureRecv(rc *uringConn) {
 		rc.pos = 0
 	}
 	if rc.rbuf == nil {
-		rc.rbuf = l.leaseRbuf()
+		rc.rbuf = make([]byte, readBufSize)
 	}
 	if rc.n == len(rc.rbuf) {
 		// One command larger than the buffer: grow, there is no other way to
@@ -749,19 +757,8 @@ func (l *uringLoop) releaseIdle(rc *uringConn) {
 	}
 }
 
-// leaseRbuf hands out a read buffer: the free list first, the allocator past
+// leaseOut hands out a reply buffer: the free list first, the allocator past
 // it. Loop goroutine only.
-func (l *uringLoop) leaseRbuf() []byte {
-	if n := len(l.rfree); n > 0 {
-		b := l.rfree[n-1]
-		l.rfree[n-1] = nil
-		l.rfree = l.rfree[:n-1]
-		return b
-	}
-	return make([]byte, readBufSize)
-}
-
-// leaseOut is leaseRbuf for the reply buffer.
 func (l *uringLoop) leaseOut() []byte {
 	if n := len(l.ofree); n > 0 {
 		b := l.ofree[n-1]
@@ -899,50 +896,28 @@ func (l *uringLoop) closeConn(rc *uringConn) {
 	_ = closeFD(fd)
 	rc.sc.Close()
 	l.b.s.unregister(rc.cs)
-	// The staged buffer is never kernel-owned, so it recycles now. rbuf and
-	// inflight are only safe once no op references them: immediately when
-	// nothing was pending, otherwise at zombie retirement, when the canceled
-	// ops' CQEs prove the kernel is done with the memory.
-	if rc.out != nil {
-		if cap(rc.out) == l.b.s.replyBuf && len(l.ofree) < loopBufFree {
-			l.ofree = append(l.ofree, rc.out[:0])
-		}
-		rc.out = nil
-	}
+	// Every buffer drops to the GC here, never to the free list: closes come
+	// in storms with no interleaved lease to balance them, and a list filled
+	// by a storm stays at cap for the life of the process (see the package
+	// comment). Buffers a pending op still references stay reachable through
+	// the zombie hold until their CQEs land.
+	rc.out = nil
 	if ops == 0 {
-		l.recycleKernelBufs(rc)
+		rc.rbuf = nil
+		rc.inflight = nil
 		return
 	}
 	l.zombies = append(l.zombies, &uringZombie{fd: fd, gen: rc.gen, ops: ops, rc: rc})
 }
 
-// recycleKernelBufs returns the buffers the kernel may have held (the recv
-// target and the in-flight send) to the free lists, callable only once no op
-// references them. Stock sizes only, same rule as releaseIdle.
-func (l *uringLoop) recycleKernelBufs(rc *uringConn) {
-	if rc.rbuf != nil {
-		if len(rc.rbuf) == readBufSize && len(l.rfree) < loopBufFree {
-			l.rfree = append(l.rfree, rc.rbuf)
-		}
-		rc.rbuf = nil
-	}
-	if rc.inflight != nil {
-		if cap(rc.inflight) == l.b.s.replyBuf && len(l.ofree) < loopBufFree {
-			l.ofree = append(l.ofree, rc.inflight[:0])
-		}
-		rc.inflight = nil
-	}
-}
-
 // reapZombie counts down a closed connection's outstanding ops as their CQEs
 // land (they arrive on this loop, gen-fenced, so the scan is loop-local) and
-// retires the hold when the last one does.
+// drops the hold when the last one does; the GC takes the buffers from there.
 func (l *uringLoop) reapZombie(fd int, gen uint32) {
 	for i, z := range l.zombies {
 		if z.fd == fd && z.gen == gen {
 			z.ops--
 			if z.ops == 0 {
-				l.recycleKernelBufs(z.rc)
 				last := len(l.zombies) - 1
 				l.zombies[i] = l.zombies[last]
 				l.zombies[last] = nil
