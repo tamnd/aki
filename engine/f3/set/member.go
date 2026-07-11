@@ -49,6 +49,12 @@ type htable struct {
 	// store's openStreams arena pin (doc 11 section 8.1), the only price the
 	// downward-vector enumeration pays for not copying the members.
 	streams int
+
+	// alg is the algebra-indexed sorted-array maintenance (algebra.go), nil until
+	// the set engages it. Engagement only happens under the algebraMaintain flag,
+	// so while the flag is off this pointer stays nil and add/rem carry one
+	// never-taken branch (doc 11 section 6.3).
+	alg *sortedIndex
 }
 
 // newHashtable builds an empty table sized for hint members, so a band
@@ -93,6 +99,14 @@ func (h *htable) add(m []byte) bool {
 	}
 	ord := h.newRecord(m)
 	h.tbl.Insert(hash, ord, h)
+	if h.alg != nil {
+		h.alg.onAdd(hash, ord, h.tbl.Len())
+	} else if algebraMaintain && h.tbl.Len() >= algebraFloor {
+		// The set has just crossed the maintenance floor with the flag on: build
+		// the sorted arrays once, then keep them current inline from here (doc 11
+		// sections 6.3 and 6.7).
+		h.engageAlgebra()
+	}
 	return true
 }
 
@@ -122,7 +136,8 @@ func (h *htable) newRecord(m []byte) uint32 {
 // draw vector so the vector stays dense, the doc 11 section 2.2 kernel: read the
 // victim's vslot, move the last ordinal into it, fix the moved record's vslot.
 func (h *htable) rem(m []byte) bool {
-	ord, ok := h.tbl.Delete(store.Hash(m), m, h)
+	hash := store.Hash(m)
+	ord, ok := h.tbl.Delete(hash, m, h)
 	if !ok {
 		return false
 	}
@@ -134,6 +149,12 @@ func (h *htable) rem(m []byte) bool {
 	h.recs[moved].vslot = v
 	h.vec = h.vec[:last]
 
+	if h.alg != nil {
+		// Drop the member from the sorted arrays before its ordinal returns to the
+		// free list, so a later reuse of the ordinal never aliases a stale entry
+		// (doc 11 section 6.3). SPOP reaches this same path through popOne.
+		h.alg.onRemove(hash, ord)
+	}
 	h.dead += int(r.mlen)
 	h.free = append(h.free, ord)
 	h.maybeCompact()
