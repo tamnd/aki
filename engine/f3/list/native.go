@@ -27,7 +27,9 @@ import "encoding/binary"
 // uvarint write plus a copy with no reslicing.
 //
 // Constants are frozen by the merged labs: chunkBlobCap and chunkElemCap by lab
-// 01 (labs/f3/m3/01_chunk_capacity), flatMax by lab 02 (02_directory_crossover).
+// 01 (labs/f3/m3/01_chunk_capacity). The flat-versus-Fenwick crossover frozen by
+// lab 02 (02_directory_crossover) lands with its consumer in slice 3; this slice
+// runs the flat scan at every ring size, which is correct everywhere.
 const (
 	// chunkBlobCap is the per-chunk blob byte budget, 4 KiB. Lab 01 froze it as
 	// the smallest budget that clears the 3-4B per-element memory bar at the 64B
@@ -37,13 +39,6 @@ const (
 	// the byte budget. It keeps the uint16 directory at or under 256 bytes and
 	// every header field honestly uint16 at any legal geometry (lab 01, doc 2.3).
 	chunkElemCap = 128
-	// flatMax is the flat-versus-Fenwick chunk-count crossover, 128 (lab 02). At
-	// or below flatMax chunks the flat linear scan of per-chunk counts resolves a
-	// position at least as fast as a Fenwick rank descent; above it Fenwick wins.
-	// Slice 3 drops the Fenwick descent in at the seam marked in locate; this
-	// slice runs the flat scan at every ring size, which is correct everywhere and
-	// only leaves seek performance on the table above flatMax.
-	flatMax = 128
 	// freeCap bounds the per-list slab freelist. Edge churn recycles at most a
 	// chunk or two per boundary crossing, so a small freelist keeps the steady
 	// push/pop path allocation-free without pinning memory on a drained list.
