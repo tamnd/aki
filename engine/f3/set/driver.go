@@ -1,6 +1,10 @@
 package set
 
-import "slices"
+import (
+	"slices"
+
+	"github.com/tamnd/aki/engine/f3/shard"
+)
 
 // The set-algebra driver (spec 2064/f3/11 section 6.4): for each command it
 // chooses between the probe path (iterate the smaller operand, probe the larger
@@ -151,7 +155,7 @@ func byCardAsc(a, b *set) int { return a.card() - b.card() }
 // operands are ordered by ascending cardinality so the smallest drives; the
 // two-operand indexed case takes the merge lever, everything else probes the
 // smallest's members against the rest.
-func sinter(sets []*set, emit func(m []byte)) {
+func sinter(cx *shard.Ctx, sets []*set, emit func(m []byte)) {
 	for _, s := range sets {
 		if s == nil || s.card() == 0 {
 			return
@@ -162,7 +166,7 @@ func sinter(sets []*set, emit func(m []byte)) {
 	small := order[0]
 	rest := order[1:]
 	if len(order) == 2 && chooseMergeIntersect(small, order[1]) {
-		mergeIntersectPair(small, order[1], emit)
+		mergeIntersectPair(cx, small, order[1], emit)
 		return
 	}
 	small.each(func(m []byte) {
@@ -180,7 +184,7 @@ func sinter(sets []*set, emit func(m []byte)) {
 // unlimited (Redis). The merge path threads the limit through
 // mergeIntersectCount; the probe path stops its own smallest-drive walk the same
 // way.
-func sintercard(sets []*set, limit int) int {
+func sintercard(cx *shard.Ctx, sets []*set, limit int) int {
 	for _, s := range sets {
 		if s == nil || s.card() == 0 {
 			return 0
@@ -191,7 +195,7 @@ func sintercard(sets []*set, limit int) int {
 	small := order[0]
 	rest := order[1:]
 	if len(order) == 2 && chooseMergeIntersect(small, order[1]) {
-		return mergeIntersectCountPair(small, order[1], limit)
+		return mergeIntersectCountPair(cx, small, order[1], limit)
 	}
 	count := 0
 	small.eachUntil(func(m []byte) bool {
@@ -212,14 +216,14 @@ func sintercard(sets []*set, limit int) int {
 // sdiff emits the members of the first operand not present in any later operand
 // (Redis SDIFF). The first operand drives, so its members carry the reply; a
 // missing first key is an empty result and a missing later key excludes nothing.
-func sdiff(sets []*set, emit func(m []byte)) {
+func sdiff(cx *shard.Ctx, sets []*set, emit func(m []byte)) {
 	first := sets[0]
 	if first == nil || first.card() == 0 {
 		return
 	}
 	rest := sets[1:]
 	if len(sets) == 2 && chooseMergeDiff(first, sets[1]) {
-		mergeDiffPair(first, sets[1], emit)
+		mergeDiffPair(cx, first, sets[1], emit)
 		return
 	}
 	first.each(func(m []byte) {
@@ -236,7 +240,7 @@ func sdiff(sets []*set, emit func(m []byte)) {
 // contribute nothing. Two indexed operands dedup in one merge pass; otherwise a
 // transient member table is the dedup, exactly the doc's "the result table is the
 // dedup" with no separate seen-set (doc 11 section 6.4, the setunionstore lab).
-func sunion(sets []*set, emit func(m []byte)) {
+func sunion(cx *shard.Ctx, sets []*set, emit func(m []byte)) {
 	live := make([]*set, 0, len(sets))
 	total := 0
 	for _, s := range sets {
@@ -253,7 +257,7 @@ func sunion(sets []*set, emit func(m []byte)) {
 		return
 	case 2:
 		if chooseMergeUnion(live[0], live[1]) {
-			mergeUnionPair(live[0], live[1], emit)
+			mergeUnionPair(cx, live[0], live[1], emit)
 			return
 		}
 	}

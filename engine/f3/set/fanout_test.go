@@ -52,7 +52,7 @@ func TestPartitionedGroupsCoverDomain(t *testing.T) {
 	}
 	p := len(s.part.parts)
 	for _, g := range []int{p, 2 * p, 4 * p} {
-		gv := s.part.groups(g)
+		gv := s.part.groups(g, s.part.streams(nil))
 		if len(gv) != g {
 			t.Fatalf("groups(%d) returned %d views", g, len(gv))
 		}
@@ -118,8 +118,8 @@ func TestPartitionedAlgebraOracle(t *testing.T) {
 					eqStrings(t, "union", driveUnion(sets), oracleUnion(ops))
 					eqStrings(t, "diff", driveDiff(sets), oracleDiff(ops))
 					eqStrings(t, "diff rev", driveDiff([]*set{sb, sa}), oracleDiff([][]string{mb, ma}))
-					if got, want := sintercard(sets, 0), len(oracleInter(ops)); got != want {
-						t.Fatalf("sintercard(limit 0) = %d, want %d", got, want)
+					if got, want := sintercard(nil, sets, 0), len(oracleInter(ops)); got != want {
+						t.Fatalf("sintercard(nil, limit 0) = %d, want %d", got, want)
 					}
 				})
 			}
@@ -144,7 +144,7 @@ func TestPartitionedSintercardLimit(t *testing.T) {
 		if limit == 0 || limit > card {
 			want = card
 		}
-		if got := sintercard([]*set{sa, sb}, limit); got != want {
+		if got := sintercard(nil, []*set{sa, sb}, limit); got != want {
 			t.Fatalf("limit %d: got %d, want %d", limit, got, want)
 		}
 	}

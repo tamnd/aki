@@ -137,21 +137,21 @@ func oracleDiff(ops [][]string) []string {
 
 func driveInter(sets []*set) []string {
 	var got []string
-	sinter(sets, func(m []byte) { got = append(got, string(m)) })
+	sinter(nil, sets, func(m []byte) { got = append(got, string(m)) })
 	sort.Strings(got)
 	return got
 }
 
 func driveUnion(sets []*set) []string {
 	var got []string
-	sunion(sets, func(m []byte) { got = append(got, string(m)) })
+	sunion(nil, sets, func(m []byte) { got = append(got, string(m)) })
 	sort.Strings(got)
 	return got
 }
 
 func driveDiff(sets []*set) []string {
 	var got []string
-	sdiff(sets, func(m []byte) { got = append(got, string(m)) })
+	sdiff(nil, sets, func(m []byte) { got = append(got, string(m)) })
 	sort.Strings(got)
 	return got
 }
@@ -205,8 +205,8 @@ func TestAlgebraDriverOracle(t *testing.T) {
 				eqStrings(t, "diff", driveDiff(sets), oracleDiff(tc.ops))
 
 				wantCard := len(oracleInter(tc.ops))
-				if got := sintercard(sets, 0); got != wantCard {
-					t.Fatalf("sintercard(limit 0) = %d, want %d", got, wantCard)
+				if got := sintercard(nil, sets, 0); got != wantCard {
+					t.Fatalf("sintercard(nil, limit 0) = %d, want %d", got, wantCard)
 				}
 			})
 		}
@@ -237,7 +237,7 @@ func TestSintercardLimit(t *testing.T) {
 					if limit == 0 || limit > sh.card {
 						want = sh.card
 					}
-					if got := sintercard(sets, limit); got != want {
+					if got := sintercard(nil, sets, limit); got != want {
 						t.Fatalf("limit %d: got %d, want %d", limit, got, want)
 					}
 				}

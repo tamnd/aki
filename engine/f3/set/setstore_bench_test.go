@@ -55,11 +55,11 @@ func benchStore(b *testing.B, n int, op string) {
 		var s *set
 		switch op {
 		case "inter":
-			s = storeResult(minCard(sets), func(e func([]byte)) { sinter(sets, e) })
+			s = storeResult(minCard(sets), func(e func([]byte)) { sinter(nil, sets, e) })
 		case "union":
 			s = storeResult(totalCard(sets), func(e func([]byte)) { unionInto(sets, e) })
 		case "diff":
-			s = storeResult(firstCard(sets), func(e func([]byte)) { sdiff(sets, e) })
+			s = storeResult(firstCard(sets), func(e func([]byte)) { sdiff(nil, sets, e) })
 		}
 		sink = s != nil
 	}
