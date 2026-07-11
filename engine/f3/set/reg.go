@@ -1,6 +1,12 @@
 package set
 
-import "github.com/tamnd/aki/engine/f3/shard"
+import (
+	"math/bits"
+	"math/rand/v2"
+	"sync/atomic"
+
+	"github.com/tamnd/aki/engine/f3/shard"
+)
 
 // The set type keeps its per-key structures in an owner-local registry hung off
 // the shard's Ctx.Coll (spec 2064/f3/11): one map from key to the inline set,
@@ -12,12 +18,33 @@ import "github.com/tamnd/aki/engine/f3/shard"
 // keyspace slice; this slice keeps the set surface self-consistent and refuses
 // the cross-type collisions it cannot yet resolve.
 
-// reg is the shard's set registry plus its draw randomness. The PRNG is
-// owner-local, so SPOP and SRANDMEMBER never touch shared rand state (doc 11
-// section 5.6).
+// reg is the shard's set registry plus its draw state. The PRNG is owner-local
+// (doc 11 section 5.6): SPOP and SRANDMEMBER draw from a per-shard PCG that is
+// never shared and never locked, so the draw path takes no atomic and touches no
+// global rand state. The two scratch slices back the count-form draws and are
+// reused across commands, so a steady-state count draw allocates nothing.
 type reg struct {
 	m   map[string]*set
-	rng uint64
+	rng rand.PCG
+
+	// idxScratch is the full index permutation the large-sample distinct draw
+	// (SRANDMEMBER positive count above the crossover) partial-shuffles in place.
+	idxScratch []uint32
+	// pickScratch holds the indexes already chosen by the small-sample distinct
+	// draw so its rejection loop can skip repeats without a map.
+	pickScratch []int
+}
+
+// setSeed hands each shard's registry a distinct PCG stream. The counter is
+// touched once per registry, at first use, never on the draw path, so the "never
+// locked" contract of doc 11 section 5.6 holds where it matters. The stream is
+// deterministic given creation order, which keeps a shard's draws reproducible
+// for a replay without a shared global generator.
+var setSeed atomic.Uint64
+
+func freshPCG() rand.PCG {
+	n := setSeed.Add(1)
+	return *rand.NewPCG(n*0x9e3779b97f4a7c15+0x243f6a8885a308d3, n*0xbf58476d1ce4e5b9+0x13198a2e03707344)
 }
 
 // registry returns the shard's set registry, building it on first use. The
@@ -25,20 +52,26 @@ type reg struct {
 // on one command is there for the next.
 func registry(cx *shard.Ctx) *reg {
 	if cx.Coll == nil {
-		cx.Coll = &reg{m: make(map[string]*set), rng: 0x9e3779b97f4a7c15}
+		cx.Coll = &reg{m: make(map[string]*set), rng: freshPCG()}
 	}
 	return cx.Coll.(*reg)
 }
 
-// next advances the xorshift PRNG and returns a value in [0, n). n is always
-// positive at the call sites (a draw only happens on a non-empty set).
+// next returns a uniform integer in [0, n) with no modulo bias (F15 exact
+// uniformity): Lemire's multiply-shift with rejection, the same unbiased bound
+// math/rand/v2 uses, over the owner-local PCG. n is always positive at the call
+// sites, since a draw only runs on a non-empty set.
 func (g *reg) next(n int) int {
-	x := g.rng
-	x ^= x << 13
-	x ^= x >> 7
-	x ^= x << 17
-	g.rng = x
-	return int(x % uint64(n))
+	un := uint64(n)
+	hi, lo := bits.Mul64(g.rng.Uint64(), un)
+	if lo < un {
+		// Only the low tail of the 2^64 space can bias the result; reject it.
+		thresh := -un % un
+		for lo < thresh {
+			hi, lo = bits.Mul64(g.rng.Uint64(), un)
+		}
+	}
+	return int(hi)
 }
 
 // lookup finds the set for key. present is false when no set exists; wrong is
