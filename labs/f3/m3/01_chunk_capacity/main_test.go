@@ -11,7 +11,7 @@ import (
 // deque stores structurally beyond the payload.
 type model struct{ v []int }
 
-func (m *model) rpush(n int)     { m.v = append(m.v, n) }
+func (m *model) rpush(n int) { m.v = append(m.v, n) }
 func (m *model) lpop() (int, bool) {
 	if len(m.v) == 0 {
 		return 0, false
