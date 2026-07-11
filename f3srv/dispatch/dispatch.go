@@ -343,6 +343,19 @@ func init() {
 	register("LMPOP", list.Lmpop, 3, -1, false)
 	table["LMPOP"].keyAt = 1
 
+	// BLPOP/BRPOP key [key ...] timeout (spec 2064/f3/13 M3 slice 8) are the first
+	// blocking list verbs. They key on the first listed key (keyAt 0) and read
+	// every listed key from that shard's registry, the same co-located convention
+	// LMPOP uses; a cross-shard multi-key wait is a later slice. blocks arms the
+	// reader barrier after enqueue so a command pipelined behind an unresolved
+	// BLPOP does not run until its reply goes out. The immediate-serve path still
+	// replies in place; the barrier disarms itself either way once emitted crosses
+	// it. BLMOVE and BLMPOP join once the cross-shard claim lands.
+	register("BLPOP", list.Blpop, 2, -1, true)
+	table["BLPOP"].blocks = true
+	register("BRPOP", list.Brpop, 2, -1, true)
+	table["BRPOP"].blocks = true
+
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard

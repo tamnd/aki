@@ -666,9 +666,11 @@ func (l *reactorLoop) service(rc *reactorConn) {
 				l.closeConn(rc)
 				return
 			}
-		} else if rc.throttled && rc.sc.CanEnqueue() {
-			// The drain opened the pipeline window; consume the parse
-			// backlog before parking.
+		} else if rc.throttled && rc.sc.CanEnqueue() && !rc.sc.Blocked() {
+			// The drain opened the pipeline window and no block is outstanding;
+			// consume the parse backlog before parking. A still-blocked
+			// connection stays parked with its backlog until the serving push
+			// drains the barrier, then this same edge re-parses it.
 			continue
 		}
 		if yielded {
@@ -764,7 +766,13 @@ func (l *reactorLoop) parsePass(rc *reactorConn) bool {
 	cmds := uint64(0)
 	throttled := false
 	for rc.pos < rc.n {
-		if !rc.sc.CanEnqueue() {
+		// The pipeline window closing and an unresolved block both stop the
+		// parse the same way: the leftover stays in rbuf as the backlog and the
+		// resume edge (a drain that clears CanEnqueue, or a serving push that
+		// clears Blocked) re-runs parsePass. Folding Blocked in here means a
+		// command pipelined behind a BLPOP does not run until the block's reply
+		// goes out, and it costs one relaxed load on the open-window path.
+		if !rc.sc.CanEnqueue() || rc.sc.Blocked() {
 			throttled = true
 			break
 		}
