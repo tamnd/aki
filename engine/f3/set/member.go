@@ -29,7 +29,7 @@ type record struct {
 	loc   uint32 // slab offset of this member's bytes
 	vslot uint32 // this member's index in the draw vector, kept current by swap-remove
 	mlen  uint16 // member byte length
-	flags uint8  // band and tier bits, reserved for the algebra and LTM slices
+	_     uint8  // band and tier bits, reserved for the algebra and LTM slices
 }
 
 // htable is the native band for one set. It is owner-local, so nothing locks.
