@@ -1,0 +1,48 @@
+
+== ecap_get_uniform ==
+server        vops/sec    cov%   peak MB    B/retr key
+aki            930,768   100.0       755           396
+redis          662,272    20.1       594         1,547
+valkey         651,796    20.1       695         1,812
+  aki vops vs redis: 1.41x  (coverage differs: aki 100% vs redis 20%; compare coverage first)
+  aki vops vs valkey: 1.43x  (coverage differs: aki 100% vs valkey 20%; compare coverage first)
+
+== ecap_get_zipf ==
+server        vops/sec    cov%   peak MB    B/retr key
+aki          2,010,514   100.0       738           387
+redis        1,247,722    20.0       598         1,571
+valkey       1,275,294    20.2       709         1,843
+  aki vops vs redis: 1.61x  (coverage differs: aki 100% vs redis 20%; compare coverage first)
+  aki vops vs valkey: 1.58x  (coverage differs: aki 100% vs valkey 20%; compare coverage first)
+
+== ecap_set_uniform ==
+server        vops/sec    cov%   peak MB    B/retr key
+aki            324,818    96.2       799           435
+redis        1,052,960    20.1       532         1,391
+valkey         925,127    20.2       925         2,402
+  aki vops vs redis: 0.31x  (coverage differs: aki 96% vs redis 20%; compare coverage first)
+  aki vops vs valkey: 0.35x  (coverage differs: aki 96% vs valkey 20%; compare coverage first)
+
+== edata_get_uniform ==
+server        vops/sec    cov%   peak MB    B/retr key
+aki            925,804   100.0       682           358
+redis        1,986,521   100.0      2567         1,346
+valkey       1,948,882   100.0      2575         1,350
+  aki vops vs redis: 0.47x
+  aki vops vs valkey: 0.48x
+
+== edata_get_zipf ==
+server        vops/sec    cov%   peak MB    B/retr key
+aki          1,989,225   100.0       683           358
+redis        2,313,289   100.0      2567         1,346
+valkey       2,424,296   100.0      2575         1,350
+  aki vops vs redis: 0.86x
+  aki vops vs valkey: 0.82x
+
+== edata_set_uniform ==
+server        vops/sec    cov%   peak MB    B/retr key
+aki            320,017    96.0       738           403
+redis        2,502,736   100.0      2674         1,402
+valkey       2,080,171   100.0      2718         1,425
+  aki vops vs redis: 0.13x  (coverage differs: aki 96% vs redis 100%; compare coverage first)
+  aki vops vs valkey: 0.15x  (coverage differs: aki 96% vs valkey 100%; compare coverage first)
