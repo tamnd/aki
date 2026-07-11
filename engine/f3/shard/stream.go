@@ -37,6 +37,13 @@ type stream struct {
 	src   StreamSource
 	total int64
 
+	// raw carries a reply that is already RESP on the wire: the source yields
+	// the whole reply bytes (a multi-bulk array header and every element),
+	// self-framed, so the writer emits no bulk header and no trailer around
+	// them. A single chunked bulk value (GET) leaves raw clear and gets the
+	// $-header wrapper; a streamed multi-bulk enumeration (SMEMBERS) sets it.
+	raw bool
+
 	bufs [streamWindow][]byte
 	lens [streamWindow]int32
 	prod atomic.Uint32
@@ -56,6 +63,17 @@ type stream struct {
 // header and the chunks when this command's turn in the pipeline order comes.
 func (r Reply) Stream(total int64, src StreamSource) {
 	st := &stream{conn: r.b.conn, src: src, total: total}
+	r.b.setStream(r.i, st)
+	r.span(len(r.b.rep))
+}
+
+// StreamRaw records a streamed reply whose src yields total bytes of finished
+// RESP: the array header and every element, already framed. The writer serves
+// them verbatim, with no bulk header and no trailer, so a large multi-bulk
+// enumeration (SMEMBERS over a big set) never materializes one giant reply
+// buffer, only the bounded chunk window the ring holds.
+func (r Reply) StreamRaw(total int64, src StreamSource) {
+	st := &stream{conn: r.b.conn, src: src, total: total, raw: true}
 	r.b.setStream(r.i, st)
 	r.span(len(r.b.rep))
 }
@@ -117,6 +135,11 @@ var crlf = []byte("\r\n")
 // header appends the stream's bulk header through emit. Writer side only, and
 // exactly once per stream: the header commits the wire to st.total bytes.
 func (st *stream) header(emit func([]byte)) {
+	if st.raw {
+		// The source frames its own reply, so there is no bulk header to emit;
+		// the reorder cursor still commits to st.total bytes.
+		return
+	}
 	var hdr [32]byte
 	h := append(hdr[:0], '$')
 	h = strconv.AppendInt(h, st.total, 10)
@@ -161,6 +184,8 @@ func (c *Conn) emitStream(st *stream, emit func([]byte)) bool {
 		}
 		sent += n
 	}
-	emit(crlf)
+	if !st.raw {
+		emit(crlf)
+	}
 	return true
 }
