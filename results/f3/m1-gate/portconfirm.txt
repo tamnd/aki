@@ -1,0 +1,12 @@
+goos: linux
+goarch: amd64
+pkg: github.com/tamnd/aki/engine/f3/set
+cpu: 13th Gen Intel(R) Core(TM) i9-13900K
+BenchmarkMergeIntersect10k-8    	   20679	    172855 ns/op	         8.643 ns/member	      32 B/op	       2 allocs/op
+BenchmarkMergeIntersect100k-8   	    1851	   1904111 ns/op	         9.521 ns/member	      32 B/op	       2 allocs/op
+BenchmarkMergeIntersect1M-8     	      97	  36444534 ns/op	        18.22 ns/member	      32 B/op	       2 allocs/op
+BenchmarkSChurnMaintain4k-8     	17675598	       203.5 ns/op	     101 B/op	       0 allocs/op
+BenchmarkSChurnMaintain1M-8     	  267685	     13646 ns/op	      77 B/op	       0 allocs/op
+BenchmarkSRandMember100k-8      	796712588	         4.477 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSRandMember1M-8        	213690700	        16.79 ns/op	       0 B/op	       0 allocs/op
+PASS
