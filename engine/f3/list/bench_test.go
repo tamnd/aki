@@ -236,3 +236,146 @@ func BenchmarkPromoteInlineToNative(b *testing.B) {
 		sinkInt = l.length()
 	}
 }
+
+// The interior-edit surgery against the whole-list rebuild it replaces (spec
+// 2064/f3/13 sections 5.6 to 5.8). Each benchmark builds a fresh 50000-element
+// deque under the stopped timer, then times one edit: the "surgery" arm runs the
+// bounded in-chunk repack or chunk-range delete, the "rebuild" arm runs the old
+// toSlice plus rebuild placeholder on the same input. The build is under the
+// stopped timer, so the reported allocs/op is the edit's own cost: the surgery
+// touches a handful of small header slices, the rebuild clones every element
+// through toSlice (about 50000 allocs, one per element).
+//
+// Measured on an Apple M4 (darwin/arm64, go1.26.5), one run:
+//
+//	                             ns/op    allocs/op
+//	BenchmarkLINSERT/surgery     67516            8    pivot scan + in-chunk repack/split
+//	BenchmarkLINSERT/rebuild   1090749        51156    toSlice + splice + full rebuild
+//	BenchmarkLREM/surgery       140521            6    count-signed scan + per-hit repack
+//	BenchmarkLREM/rebuild      1615242        51180    toSlice + removeMatches + rebuild
+//	BenchmarkLTRIM/surgery      101314            5    chunk-range delete, keep a window
+//	BenchmarkLTRIM/rebuild      459185        50005    toSlice + rebuild of the window
+//
+// Verdict: the surgery is bounded by CAP and the match or dropped count, not by
+// the list length, so its allocs/op stays a single-digit constant while the
+// rebuild allocs one clone per element (about 6000x to 8500x fewer allocations).
+// On ns the surgery is 16x faster for LINSERT, 11x for LREM, and 4.5x for LTRIM.
+// LINSERT and LREM still pay the irreducible value scan the doc prices at parity
+// with Redis (the mid-list pivot walk for LINSERT, the full-list victim walk for
+// remove-all LREM), so their remaining ns is that scan plus the O(CAP) surgery,
+// the deleted term being the O(n) rebuild and per-element renumber. LTRIM's
+// surgery ns is dominated by the O(dropped) byte-accounting walk over the chunks
+// it unlinks, still well under the rebuild that clones all 50000 through toSlice.
+
+// benchInteriorN is the element count the surgery-versus-rebuild benchmarks build,
+// large enough that the O(n) rebuild is visibly expensive against the bounded edit.
+const benchInteriorN = 50000
+
+// benchInterior builds a fresh deque from vals under the stopped timer and times
+// op, so the reported ns/op is the edit cost and the build is not double counted.
+func benchInterior(b *testing.B, vals [][]byte, op func(nt *native)) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		nt := buildNativeVals(vals)
+		b.StartTimer()
+		op(nt)
+	}
+}
+
+// insertVals is the 50000-element input with distinct 4-byte values and a known
+// pivot near the middle.
+func insertVals() ([][]byte, []byte) {
+	vals := make([][]byte, benchInteriorN)
+	for i := range vals {
+		vals[i] = sized(8, i)
+	}
+	pivot := append([]byte(nil), vals[benchInteriorN/2]...)
+	return vals, pivot
+}
+
+func BenchmarkLINSERT(b *testing.B) {
+	vals, pivot := insertVals()
+	nv := []byte("NEWV")
+	b.Run("surgery", func(b *testing.B) {
+		benchInterior(b, vals, func(nt *native) { nt.insert(true, pivot, nv) })
+	})
+	b.Run("rebuild", func(b *testing.B) {
+		benchInterior(b, vals, func(nt *native) { insertViaRebuild(nt, pivot, nv) })
+	})
+}
+
+// insertViaRebuild is the placeholder LINSERT the surgery replaces: it
+// materializes the whole list, splices, and repacks from empty.
+func insertViaRebuild(nt *native, pivot, v []byte) {
+	all := nt.toSlice()
+	idx := -1
+	for i, e := range all {
+		if bytesEqual(e, pivot) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return
+	}
+	all = append(all, nil)
+	copy(all[idx+1:], all[idx:])
+	all[idx] = cloneBytes(v)
+	nt.rebuild(all)
+}
+
+// remVals sprinkles a repeated victim token through the 50000-element list so a
+// removal finds a handful of matches spread across chunks.
+func remVals() [][]byte {
+	vals := make([][]byte, benchInteriorN)
+	for i := range vals {
+		if i%10000 == 5000 {
+			vals[i] = []byte("RM")
+			continue
+		}
+		vals[i] = sized(8, i)
+	}
+	return vals
+}
+
+func BenchmarkLREM(b *testing.B) {
+	vals := remVals()
+	victim := []byte("RM")
+	b.Run("surgery", func(b *testing.B) {
+		benchInterior(b, vals, func(nt *native) { nt.remove(0, victim) })
+	})
+	b.Run("rebuild", func(b *testing.B) {
+		benchInterior(b, vals, func(nt *native) { removeViaRebuild(nt, 0, victim) })
+	})
+}
+
+// removeViaRebuild is the placeholder LREM the surgery replaces.
+func removeViaRebuild(nt *native, count int, v []byte) {
+	all := nt.toSlice()
+	kept, removed := removeMatches(all, count, v)
+	if removed > 0 {
+		nt.rebuild(kept)
+	}
+}
+
+func BenchmarkLTRIM(b *testing.B) {
+	vals := make([][]byte, benchInteriorN)
+	for i := range vals {
+		vals[i] = sized(8, i)
+	}
+	lo, hi := benchInteriorN/2-50, benchInteriorN/2+50 // a ~100-element middle window
+	b.Run("surgery", func(b *testing.B) {
+		benchInterior(b, vals, func(nt *native) { nt.trim(lo, hi) })
+	})
+	b.Run("rebuild", func(b *testing.B) {
+		benchInterior(b, vals, func(nt *native) { trimViaRebuild(nt, lo, hi) })
+	})
+}
+
+// trimViaRebuild is the placeholder LTRIM the surgery replaces.
+func trimViaRebuild(nt *native, start, stop int) {
+	all := nt.toSlice()
+	nt.rebuild(all[start : stop+1])
+}
