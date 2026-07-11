@@ -1,0 +1,25 @@
+Steady-state memory probe, 2026-07-11, GamingPC.
+One set, 1M members, preloaded via aki-bench sismember at conns=8 pipe=1 duration=1s, read 8s after the preload settles.
+aki f3srv shards=4, rivals io-threads 4, all pinned 0-7, fresh workdirs.
+
+baseline (kB, VmHWM / VmRSS):
+  aki    6676 / 6676
+  redis  8496 / 8496
+  valkey 9152 / 9152
+
+after 1M-member preload (kB, VmHWM / VmRSS):
+  aki    61884 / 61884
+  redis  42416 / 39452
+  valkey 49852 / 44988
+
+derived bytes/member (delta over baseline x 1024 / 1e6):
+  aki    HWM 56.5  RSS 56.5
+  redis  HWM 34.7  RSS 31.7
+  valkey HWM 41.7  RSS 36.7
+
+MEMORY USAGE set:probe SAMPLES 0:
+  aki    ERR unknown command 'MEMORY' (missing surface, recorded as a gap)
+  redis  41284114 bytes -> 41.3 B/member
+  valkey 32680048 bytes -> 32.7 B/member
+
+aki DBSIZE returned 0 with the set present and serving (known wb-drift DBSIZE bug).
