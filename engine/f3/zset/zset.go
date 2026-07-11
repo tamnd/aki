@@ -27,7 +27,7 @@ type encoding uint8
 
 const (
 	encListpack encoding = iota
-	encSkiplist          // the native band (skiplist.go placeholder, tree later)
+	encSkiplist          // the native band (skiplist.go: member hash plus counted tree)
 )
 
 func (e encoding) String() string {
@@ -53,10 +53,11 @@ type zset struct {
 	// sortable form of doc 12 section 3.1. The band has no separate member hash,
 	// so the blob is the only place ZSCORE can read a score from, and section
 	// 3.1's rule is that the raw-bits copy is what ZSCORE formats without a
-	// decode. Raw bits also round-trip signed zero: a member added at -0.0
-	// reports "-0" and one at +0.0 reports "0", matching Redis, where the
-	// sortable form would collapse the two. Ordering still treats -0.0 and +0.0
-	// as equal because a plain float compare does.
+	// decode. One exception: -0.0 is stored as +0.0, because Redis's listpack
+	// integer-encodes a zero score and loses the sign, so an inline member added
+	// at -0.0 answers ZSCORE "0" on both engines; only the native band keeps the
+	// sign, exactly like Redis's skiplist. Ordering treats -0.0 and +0.0 as
+	// equal either way because a plain float compare does.
 	blob []byte
 	n    int
 
@@ -78,9 +79,8 @@ func (z *zset) card() int {
 }
 
 // score returns the member's score and whether it is present. Zero allocation
-// on both branches: the listpack scan compares in place, and the native map
-// read takes the argument bytes as the key without a string copy (Go elides it
-// for a map read).
+// on both branches: the listpack scan compares in place, and the native band
+// is one member-hash probe that formats from the record's raw score bits.
 func (z *zset) score(m []byte) (float64, bool) {
 	if z.enc == encListpack {
 		if off := z.listpackIndex(m); off >= 0 {
@@ -189,8 +189,8 @@ func (z *zset) rem(m []byte) bool {
 }
 
 // entryView is one member and its score in a read snapshot. member aliases the
-// blob (listpack) or a fresh copy (native placeholder); a read command holds it
-// only until the reply is built, and no write runs during a read on the owner.
+// blob (listpack) or the native slab; a read command holds it only until the
+// reply is built, and no write runs during a read on the owner.
 type entryView struct {
 	member []byte
 	score  float64
@@ -215,7 +215,7 @@ func (z *zset) entries() []entryView {
 
 // rank returns the number of members sorting before m, its score, and whether
 // it is present. Linear over the inline band (count while scanning, section
-// 6.3); the native placeholder walks its ordered slice.
+// 6.3); the native band is one hash probe plus a counted descent.
 func (z *zset) rank(m []byte) (int, float64, bool) {
 	sc, ok := z.score(m)
 	if !ok {
@@ -239,8 +239,13 @@ func (z *zset) rank(m []byte) (int, float64, bool) {
 }
 
 // listpackInsert writes one entry at its sorted position with a single memmove,
-// copying the member bytes so the argument view is never retained.
+// copying the member bytes so the argument view is never retained. A -0.0
+// score lands as +0.0, the collapse Redis's listpack integer encoding applies
+// (see the blob comment); the native band has no such step.
 func (z *zset) listpackInsert(m []byte, score float64) {
+	if score == 0 {
+		score = 0 // -0.0 collapses, matching Redis's listpack int encoding
+	}
 	off := z.listpackSeek(m, score)
 	entryLen := 2 + len(m) + 8
 	z.blob = append(z.blob, make([]byte, entryLen)...)
@@ -280,8 +285,8 @@ func (z *zset) listpackRemove(m []byte) bool {
 }
 
 // listpackToNative engages the native band on the blob, the one-way transition
-// of section 4. Entries are already in order, so they load straight into the
-// placeholder with no re-sort.
+// of section 4. Entries are already in order, so they fill the member hash in
+// one pass and bulk-load the tree at the right-edge 0.9 fill, no re-sort.
 func (z *zset) listpackToNative() {
 	nat := newNativeStore(z.n + 1)
 	b := z.blob
@@ -290,6 +295,7 @@ func (z *zset) listpackToNative() {
 		nat.appendSorted(m, s)
 		i = next
 	}
+	nat.seal()
 	z.nat = nat
 	z.blob = nil
 	z.n = 0

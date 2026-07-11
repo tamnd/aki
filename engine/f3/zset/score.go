@@ -11,6 +11,12 @@ import (
 // clients send, including the inf spellings and hex floats, and rejects leading
 // and trailing whitespace the same way Redis does.
 //
+// Negative zero passes through with its sign, like strtod: what happens to it
+// then depends on the band, exactly as in Redis, where the skiplist keeps the
+// double (ZSCORE answers "-0") and the listpack collapses it to an integer
+// zero (ZSCORE answers "0"). The live formatting test pins both behaviors
+// against a real server.
+//
 // The score format side (ZSCORE, ZADD INCR, ZINCRBY, WITHSCORES replies) is
 // resp.FormatScore, a byte-for-byte port of Redis's d2string, so this package
 // does not reimplement it.

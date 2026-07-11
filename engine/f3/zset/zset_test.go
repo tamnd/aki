@@ -6,6 +6,15 @@ import (
 	"testing"
 )
 
+// lessStr is the zset total order over string members, the reference the
+// ordering assertions compare against.
+func lessStr(sA float64, mA string, sB float64, mB string) bool {
+	if sA != sB {
+		return sA < sB
+	}
+	return mA < mB
+}
+
 // order drains a zset into parallel member and score slices in the zset total
 // order, so a test can check both contents and ordering across bands.
 func order(z *zset) ([]string, []float64) {
