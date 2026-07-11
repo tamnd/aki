@@ -14,6 +14,7 @@ import "testing"
 var (
 	sinkBytes []byte
 	sinkInt   int
+	sinkHits  []int
 )
 
 // warmList builds a list of n four-byte elements and cycles a push/pop pair a
