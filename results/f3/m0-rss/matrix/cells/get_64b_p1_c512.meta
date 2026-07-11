@@ -1,0 +1,42 @@
+launch arena_mib=512 net_loops=3 warm=3s io_threads=4
+driver_stamp osingle=net_driver:goroutine oreactor=net_driver:reactor nsingle=net_driver:goroutine nreactor=net_driver:reactor
+rss[launch] osingle=10848kB oreactor=10872kB nsingle=7648kB nreactor=7656kB redis=9192kB valkey=9116kB
+hwm[launch] osingle=10848kB oreactor=10872kB nsingle=7648kB nreactor=7656kB redis=9192kB valkey=9116kB
+cell wl=get value=64 keys=1000000 dist=uniform conns=512 pipeline=1 arena_mib_per_shard=512 warm=3s dur=8s
+rss[post-ab-osingle-rep0] osingle=177640kB oreactor=13028kB nsingle=7760kB nreactor=7868kB redis=136740kB valkey=127092kB
+hwm[post-ab-osingle-rep0] osingle=177640kB oreactor=13028kB nsingle=7760kB nreactor=7868kB redis=143932kB valkey=127092kB
+rss[post-ab-oreactor-rep0] osingle=84032kB oreactor=444276kB nsingle=7896kB nreactor=7900kB redis=136520kB valkey=127104kB
+hwm[post-ab-oreactor-rep0] osingle=176280kB oreactor=444276kB nsingle=7896kB nreactor=7900kB redis=144536kB valkey=127268kB
+rss[post-ab-nsingle-rep0] osingle=84056kB oreactor=350668kB nsingle=146456kB nreactor=7940kB redis=136824kB valkey=127068kB
+hwm[post-ab-nsingle-rep0] osingle=176280kB oreactor=443032kB nsingle=146456kB nreactor=7940kB redis=144536kB valkey=127268kB
+rss[post-ab-nreactor-rep0] osingle=84080kB oreactor=350708kB nsingle=52832kB nreactor=137952kB redis=136844kB valkey=127372kB
+hwm[post-ab-nreactor-rep0] osingle=176280kB oreactor=443032kB nsingle=145764kB nreactor=137952kB redis=144828kB valkey=127372kB
+rss[post-ab-osingle-rep1] osingle=267136kB oreactor=351544kB nsingle=52844kB nreactor=44288kB redis=136764kB valkey=126996kB
+hwm[post-ab-osingle-rep1] osingle=267136kB oreactor=443032kB nsingle=145764kB nreactor=137060kB redis=144828kB valkey=127384kB
+rss[post-ab-oreactor-rep1] osingle=173600kB oreactor=535316kB nsingle=52856kB nreactor=44308kB redis=136868kB valkey=126920kB
+hwm[post-ab-oreactor-rep1] osingle=266040kB oreactor=535316kB nsingle=145764kB nreactor=137060kB redis=144828kB valkey=127384kB
+rss[post-ab-nsingle-rep1] osingle=173704kB oreactor=441636kB nsingle=143984kB nreactor=44352kB redis=136740kB valkey=126840kB
+hwm[post-ab-nsingle-rep1] osingle=266040kB oreactor=534340kB nsingle=145764kB nreactor=137060kB redis=144828kB valkey=127384kB
+rss[post-ab-nreactor-rep1] osingle=173900kB oreactor=441648kB nsingle=50328kB nreactor=139396kB redis=136748kB valkey=126072kB
+hwm[post-ab-nreactor-rep1] osingle=266040kB oreactor=534340kB nsingle=145764kB nreactor=139396kB redis=144828kB valkey=127384kB
+rss[post-ab-osingle-rep2] osingle=268904kB oreactor=442492kB nsingle=50408kB nreactor=45736kB redis=136744kB valkey=126816kB
+hwm[post-ab-osingle-rep2] osingle=268904kB oreactor=534340kB nsingle=145764kB nreactor=138096kB redis=144828kB valkey=127384kB
+rss[post-ab-oreactor-rep2] osingle=175420kB oreactor=536544kB nsingle=50436kB nreactor=45768kB redis=136876kB valkey=126408kB
+hwm[post-ab-oreactor-rep2] osingle=267836kB oreactor=536544kB nsingle=145764kB nreactor=138096kB redis=144828kB valkey=127384kB
+rss[post-ab-nsingle-rep2] osingle=175480kB oreactor=442868kB nsingle=145404kB nreactor=45780kB redis=136896kB valkey=126904kB
+hwm[post-ab-nsingle-rep2] osingle=267836kB oreactor=535316kB nsingle=145764kB nreactor=138096kB redis=144828kB valkey=127384kB
+rss[post-ab-nreactor-rep2] osingle=175636kB oreactor=442916kB nsingle=51760kB nreactor=140044kB redis=136728kB valkey=127472kB
+hwm[post-ab-nreactor-rep2] osingle=267836kB oreactor=535316kB nsingle=145764kB nreactor=140044kB redis=144828kB valkey=127472kB
+rss[post-rb-osingle] osingle=299156kB oreactor=443768kB nsingle=51768kB nreactor=46396kB redis=13100kB valkey=13980kB
+hwm[post-rb-osingle] osingle=299156kB oreactor=535316kB nsingle=145764kB nreactor=139036kB redis=144828kB valkey=127384kB
+rss[post-rb-oreactor] osingle=207144kB oreactor=616612kB nsingle=51776kB nreactor=46420kB redis=13096kB valkey=13980kB
+hwm[post-rb-oreactor] osingle=298140kB oreactor=616612kB nsingle=145764kB nreactor=139036kB redis=144828kB valkey=127384kB
+rss[post-rb-nsingle] osingle=207172kB oreactor=524592kB nsingle=233396kB nreactor=46424kB redis=13084kB valkey=13980kB
+hwm[post-rb-nsingle] osingle=298140kB oreactor=615656kB nsingle=233396kB nreactor=139036kB redis=144828kB valkey=127384kB
+rss[post-rb-nreactor] osingle=207216kB oreactor=524628kB nsingle=141504kB nreactor=171416kB redis=13084kB valkey=13980kB
+hwm[post-rb-nreactor] osingle=298140kB oreactor=615656kB nsingle=232140kB nreactor=171416kB redis=144828kB valkey=127384kB
+rss[post-rb-redis] osingle=207260kB oreactor=524656kB nsingle=141700kB nreactor=79460kB redis=147076kB valkey=13980kB
+hwm[post-rb-redis] osingle=298140kB oreactor=615656kB nsingle=232140kB nreactor=170200kB redis=152788kB valkey=127384kB
+rss[post-rb-valkey] osingle=207304kB oreactor=524696kB nsingle=141748kB nreactor=79564kB redis=21440kB valkey=127340kB
+hwm[post-rb-valkey] osingle=298140kB oreactor=615656kB nsingle=232140kB nreactor=170200kB redis=152788kB valkey=128508kB
+dbsize_end osingle=0 nsingle=0 redis=0
