@@ -29,6 +29,18 @@ type worker struct {
 	intentPending atomic.Int64
 	keyQ          map[string]*keyList
 
+	// timers is the owner-only deadline heap (timer.go): a blocking command with
+	// a finite timeout arms one so its timeout reply fires on this shard even if
+	// no serving push arrives. It is empty on the throughput hot path, so
+	// fireTimers and the idle park both gate on w.timers.len(), one relaxed load
+	// per pass exactly like intentPending and donated. timerDue is the reused
+	// scratch fireTimers pops into so a firing pass allocates nothing, and
+	// parkTimer is the single reusable *time.Timer the idle timed park selects
+	// over; both stay nil until the first blocking command actually uses them.
+	timers    timerHeap
+	timerDue  []*timer
+	parkTimer *time.Timer
+
 	// rt is the runtime this worker belongs to, fixed before Start: the intent
 	// coordinator and the donation offer walk the pool through it.
 	rt *Runtime
@@ -115,6 +127,11 @@ func (w *worker) run() {
 	defer close(w.done)
 	for {
 		n := w.drainPass()
+		// Fire any deadlines that came due (timer.go): near-free when no timer is
+		// armed, one relaxed length check per pass exactly like the intent gate
+		// below. A pass that fired timers counts them so the loop makes another
+		// pass in case more are due past the batch cap.
+		n += w.fireTimers()
 		// Advance the tier-two intent queues (doc 03 section 6): near-free when
 		// no tier-two traffic is in flight, one relaxed load per pass. A pass
 		// that applied ops counts them so the loop stays awake to service the
@@ -253,6 +270,33 @@ func (w *worker) drainPass() int {
 func (w *worker) drainAndExecute() int {
 	n := w.executeOne()
 	w.wakeConns()
+	return n
+}
+
+// fireTimers runs the deadlines that came due on this owner. The empty-heap
+// gate is the whole hot-path cost: with no timer armed it is one plain length
+// load and a return, byte-identical to a pass that never had the call. When
+// timers exist it reads the wall clock here (there is no batch clock at this
+// boundary, unlike executeOne's cached NowMs), pops every timer at or before
+// now up to timerFireCap into the reused w.timerDue scratch, and runs each fire
+// on the owner. The cap bounds how long a burst of simultaneous timeouts can
+// hold the loop off command processing; a pass that hit the cap leaves the rest
+// and returns a positive count, so the owner loop comes right back for them.
+func (w *worker) fireTimers() int {
+	if w.timers.len() == 0 {
+		return 0
+	}
+	nowMs := time.Now().UnixMilli()
+	w.timerDue = w.timers.popDue(nowMs, timerFireCap, w.timerDue[:0])
+	n := len(w.timerDue)
+	for _, t := range w.timerDue {
+		t.fire(&w.cx)
+	}
+	for i := range w.timerDue {
+		w.timers.release(w.timerDue[i])
+		w.timerDue[i] = nil
+	}
+	w.timerDue = w.timerDue[:0]
 	return n
 }
 
@@ -474,6 +518,84 @@ func (w *worker) idle() {
 		w.wk.unparkSelf()
 		return
 	}
+	// The no-timer path is byte-identical to before: with an empty heap this is
+	// one plain length load and then the same plain park. A worker only has a
+	// timer armed while a blocking command with a finite timeout is parked on
+	// it, which never happens on the throughput path, so the timed branch below
+	// is off everywhere that matters for P1.
+	if w.timers.len() > 0 {
+		w.timedPark()
+		return
+	}
 	w.parks.bump()
 	w.wk.park()
+}
+
+// timedPark blocks until the nearest armed deadline or a producer wake,
+// whichever comes first, entered only from idle with state already stateParked.
+// It is the subtle half of the timer wiring, so the waker-state contract is
+// spelled out here in full.
+//
+// If the nearest deadline is already at or past now, it does not park at all:
+// it puts the worker back to running and returns, and the next loop pass runs
+// fireTimers on the due timer. Otherwise it selects over the waker channel and
+// a single reusable *time.Timer (never a fresh timer per park), reset with the
+// drain-before-reset idiom so a stale fire from a prior park cannot leak in.
+//
+// The two branches restore the waker state differently, because wk.park's proof
+// (a producer CAS'd stateParked->stateRunning before it sent the token) holds on
+// only one of them:
+//   - The channel branch is exactly wk.park: a producer already claimed the wake
+//     and moved the state to running before the token we just received, so there
+//     is nothing to restore, only the pending timer to stop and drain.
+//   - The timer branch had no producer touch the state, so it is still
+//     stateParked and this worker must move it back itself. unparkSelf does
+//     exactly that and also closes the race where a producer's claim landed
+//     between the timer firing and here: its CAS fails, and because a claim is
+//     always followed by a delivery (waker.go), the token is on its way and
+//     unparkSelf consumes it, so no wake is lost and no stale token survives to
+//     satisfy a later park.
+func (w *worker) timedPark() {
+	deadlineMs, ok := w.timers.peekDeadline()
+	if !ok {
+		w.parks.bump()
+		w.wk.park()
+		return
+	}
+	d := time.Duration(deadlineMs-time.Now().UnixMilli()) * time.Millisecond
+	if d <= 0 {
+		// Already due: do not park, hand the state back and let fireTimers take it
+		// on the next pass. unparkSelf restores running and drains a racing token.
+		w.wk.unparkSelf()
+		return
+	}
+	if w.parkTimer == nil {
+		w.parkTimer = time.NewTimer(d)
+	} else {
+		if !w.parkTimer.Stop() {
+			select {
+			case <-w.parkTimer.C:
+			default:
+			}
+		}
+		w.parkTimer.Reset(d)
+	}
+	w.parks.bump()
+	select {
+	case <-w.wk.ch:
+		// A producer claimed the park and sent the token, the wk.park case: the
+		// state is already running. Cancel the timer and drain it if it fired in
+		// the meantime so the next reset starts clean.
+		if !w.parkTimer.Stop() {
+			select {
+			case <-w.parkTimer.C:
+			default:
+			}
+		}
+	case <-w.parkTimer.C:
+		// The deadline fired and no producer necessarily touched the state, so
+		// take the worker out of parked ourselves, consuming a racing producer's
+		// token if one is in flight.
+		w.wk.unparkSelf()
+	}
 }
