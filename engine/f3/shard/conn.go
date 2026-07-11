@@ -346,6 +346,32 @@ func (c *Conn) Do(op byte, keyed bool, args [][]byte) error {
 	} else {
 		sh = int(c.seq % uint32(len(c.rt.workers)))
 	}
+	return c.enqueue(op, keyed, sh, args)
+}
+
+// DoAt is Do for a keyed command whose key is not its first argument: it routes
+// by args[keyIdx] instead of args[0]. OBJECT ENCODING is the one verb in this
+// shape, its key sitting after the subcommand token; every other keyed command
+// keys on args[0] and goes through Do. The command is marked keyed on the wire
+// so replies keep their reorder slot.
+func (c *Conn) DoAt(op byte, keyIdx int, args [][]byte) error {
+	if c.seq-c.emitted.Load() >= uint32(len(c.ring)) {
+		if err := c.throttle(); err != nil {
+			return err
+		}
+	}
+	// The node is marked keyless: routing is already fixed by the shard picked
+	// here, and the only other reader of the flag is the prefetch stage, which
+	// touches the store bucket for args[0]. OBJECT's args[0] is its subcommand,
+	// not a key, so a prefetch there would warm the wrong line; skipping it
+	// costs nothing on a command this rare.
+	return c.enqueue(op, false, c.rt.ShardOf(args[keyIdx]), args)
+}
+
+// enqueue adds one command to the pending node for shard sh, flushing and
+// retrying once if the node is full, and advances the sequence. Do and DoAt
+// share it; they differ only in how they pick sh.
+func (c *Conn) enqueue(op byte, keyed bool, sh int, args [][]byte) error {
 	b := c.pending[sh]
 	if b == nil {
 		b = c.take()

@@ -27,6 +27,15 @@ type Ctx struct {
 	// the fan-out partial builders assemble their encoding here while reading
 	// values through Val. Same reuse contract as Val.
 	Aux []byte
+
+	// Coll is the shard's owner-local collection state: the per-key native
+	// structures a type keeps outside the string store. It lives for the
+	// worker's life like the rest of Ctx and is only ever touched by the owner
+	// goroutine, so a type stashes a plain map or struct here with no lock. The
+	// set type (spec 2064/f3/11 M1) is the first user; it holds its per-key
+	// registry here. A second collection type sharing the slot lands with the
+	// shared holder the keyspace-unification slice introduces.
+	Coll any
 }
 
 // Handler executes one command against its shard. args are views into the hop
