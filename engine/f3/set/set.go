@@ -36,7 +36,8 @@ type encoding uint8
 const (
 	encIntset encoding = iota
 	encListpack
-	encHashtable // the native member table (member.go)
+	encHashtable   // the native member table (member.go)
+	encPartitioned // the partitioned band (partition.go): P native sub-tables
 )
 
 func (e encoding) String() string {
@@ -69,6 +70,11 @@ type set struct {
 	// hashtable-class: the native member table (member.go). Built by the
 	// *ToHashtable conversions and never converted back (F4).
 	ht *htable
+
+	// partitioned-class: P native sub-tables split by member hash (partition.go),
+	// engaged when the native table crosses the partition threshold. Set only when
+	// enc is encPartitioned; a set never converts back out of the band (F4).
+	part *partitioned
 }
 
 // newSet builds an empty set whose first member decides intset versus
@@ -87,6 +93,8 @@ func (s *set) card() int {
 		return len(s.ints)
 	case encListpack:
 		return s.n
+	case encPartitioned:
+		return s.part.card()
 	default:
 		return s.ht.card()
 	}
@@ -106,6 +114,8 @@ func (s *set) has(m []byte) bool {
 		return s.intsetHas(v)
 	case encListpack:
 		return s.listpackIndex(m) >= 0
+	case encPartitioned:
+		return s.part.has(m)
 	default:
 		return s.ht.has(m)
 	}
@@ -145,9 +155,29 @@ func (s *set) add(m []byte) bool {
 		return s.addIntset(m)
 	case encListpack:
 		return s.addListpack(m)
+	case encPartitioned:
+		return s.part.add(m)
 	default:
-		return s.ht.add(m)
+		added := s.ht.add(m)
+		if added && s.ht.card() >= partitionThreshold {
+			// The write crossed the engagement threshold: split the native table
+			// into the partitioned band in one bulk pass, one-way (F4). From here
+			// s.part carries the set and s.ht is released (partition.go).
+			s.nativeToPartitioned()
+		}
+		return added
 	}
+}
+
+// nativeToPartitioned engages the partitioned band on the native table, the
+// one-way transition of doc 11 section 4.1. It runs inline in the triggering
+// SADD, redistributing every member into the derived P sub-tables; the old table
+// is dropped once its members are reseated.
+func (s *set) nativeToPartitioned() {
+	ps := partitionedSet(s.ht)
+	s.part = ps.part
+	s.ht = nil
+	s.enc = encPartitioned
 }
 
 func (s *set) addIntset(m []byte) bool {
@@ -228,6 +258,8 @@ func (s *set) rem(m []byte) bool {
 		s.blob = append(s.blob[:i], s.blob[end:]...)
 		s.n--
 		return true
+	case encPartitioned:
+		return s.part.rem(m)
 	default:
 		return s.ht.rem(m)
 	}
@@ -252,6 +284,8 @@ func (s *set) each(fn func(m []byte)) {
 			fn(b[start : start+n])
 			i = start + n
 		}
+	case encPartitioned:
+		s.part.each(fn)
 	default:
 		s.ht.each(fn)
 	}
@@ -280,6 +314,8 @@ func (s *set) eachUntil(fn func(m []byte) bool) {
 			}
 			i = start + n
 		}
+	case encPartitioned:
+		s.part.eachUntil(fn)
 	default:
 		s.ht.eachUntil(fn)
 	}
@@ -301,6 +337,8 @@ func (s *set) at(i int, sc []byte) []byte {
 		}
 		n := int(b[pos])
 		return b[pos+2 : pos+2+n]
+	case encPartitioned:
+		return s.part.at(i)
 	default:
 		return s.ht.at(i)
 	}

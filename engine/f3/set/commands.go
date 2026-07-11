@@ -130,9 +130,17 @@ func Smembers(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Raw(resp.AppendArrayHeader(cx.Aux[:0], 0))
 		return
 	}
-	if s.enc == encHashtable {
+	switch s.enc {
+	case encHashtable:
 		if total := s.ht.membersTotal(); total > store.ChunkSize {
 			r.StreamRaw(total, s.ht.pinMembersStream())
+			return
+		}
+	case encPartitioned:
+		// A partitioned set is always past the engagement threshold, so its reply
+		// is far wider than a chunk: stream it across every partition (partition.go).
+		if total := s.part.membersTotal(); total > store.ChunkSize {
+			r.StreamRaw(total, s.part.pinMembersStream())
 			return
 		}
 	}

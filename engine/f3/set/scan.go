@@ -117,6 +117,8 @@ func (s *set) scanPage(cursor uint64, count int, match []byte, emit func(m []byt
 			}
 		})
 		return 0
+	case encPartitioned:
+		return s.part.scanPage(cursor, count, match, emit)
 	default:
 		return s.ht.scanPage(cursor, count, match, emit)
 	}
