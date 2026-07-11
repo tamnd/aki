@@ -1,6 +1,9 @@
 package list
 
-import "github.com/tamnd/aki/engine/f3/shard"
+import (
+	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/f3srv/resp"
+)
 
 // The blocking-waiter set (spec 2064/f3/13 M3 slice 8, lab 03's frozen verdict).
 // A connection that BLPOP/BRPOP-blocks on one or more keys parks a waitNode on
@@ -18,6 +21,19 @@ import "github.com/tamnd/aki/engine/f3/shard"
 // pointer. A real node index is a slab offset and never equals it.
 const nilIdx = ^uint32(0)
 
+// The waiter kind discriminates the three blocking shapes a parked node can
+// carry, so one serve loop can complete any of them off the same key's FIFO.
+// kindPop is BLPOP/BRPOP: pop one element and reply [key, element]. kindMove is
+// BLMOVE/BRPOPLPUSH: move one element to a destination end and reply the moved
+// bulk. kindMpop is BLMPOP: pop up to count elements off one end and reply
+// [key, [elem, ...]]. The push-side serve reads the kind off whichever sibling
+// node is the served key's list head and branches on it.
+const (
+	kindPop  uint8 = 0
+	kindMove uint8 = 1
+	kindMpop uint8 = 2
+)
+
 // waitNode is one connection's parked interest in one key. prev and next are the
 // intrusive links within that key's FIFO list; sib is the circular ring across
 // the keys of a single multi-key waiter (a one-key waiter's sib points at
@@ -28,6 +44,12 @@ const nilIdx = ^uint32(0)
 // the armed timeout, nil when the waiter blocks forever; it is set on the
 // sibling-ring head only. live is the idempotency guard that keeps a serve and a
 // timeout from both firing the same waiter.
+//
+// kind, count, dstKey, and dstLeft carry the per-shape parameters the serve reads
+// off the list head. count is the BLMPOP element budget for one wake; dstKey and
+// dstLeft are the BLMOVE destination key and push end. park writes every one of
+// them on each call, since a recycled node holds a prior waiter's stale values (a
+// node that last served a kindMove still holds its dstKey until overwritten).
 type waitNode struct {
 	prev, next uint32
 	sib        uint32
@@ -35,8 +57,25 @@ type waitNode struct {
 	conn       *shard.Conn
 	seq        uint32
 	timer      shard.TimerHandle
+	kind       uint8
 	front      bool
+	dstLeft    bool
 	live       bool
+	count      int
+	dstKey     string
+}
+
+// waitSpec is the by-value bundle of one waiter's per-shape parameters, threaded
+// through park so every sibling node of a multi-key waiter carries the same kind,
+// end, count, and destination. It is stack-copied into each node, so a kindPop
+// spec (empty dstKey, zero count) parks with no allocation while a kindMove spec
+// pays only the one dstKey string copy the handler already made.
+type waitSpec struct {
+	kind    uint8
+	front   bool
+	count   int
+	dstKey  string
+	dstLeft bool
 }
 
 // waitPool is the per-shard node slab. nodes grows once to its working size and
@@ -76,16 +115,23 @@ type waitList struct {
 }
 
 // park appends a new waiter to the tail and returns its node index, the FIFO
-// order Redis serves blocked clients in. The caller fills conn, seq, front, and
-// the sibling ring; park sets the list links and the reply-shape fields it was
-// given.
-func (l *waitList) park(front bool, c *shard.Conn, seq uint32) uint32 {
+// order Redis serves blocked clients in. The caller fills the sibling ring; park
+// sets the list links and every reply-shape field from spec. It writes kind,
+// front, count, dstKey, and dstLeft on every call, never skipping one, because
+// the node may be recycled from a prior waiter of a different kind whose stale
+// fields would otherwise leak (dstKey="" is a header write, not an alloc, so a
+// kindPop park stays zero-alloc).
+func (l *waitList) park(spec waitSpec, c *shard.Conn, seq uint32) uint32 {
 	i := l.pool.alloc()
 	nd := &l.pool.nodes[i]
 	nd.wl = l
 	nd.conn = c
 	nd.seq = seq
-	nd.front = front
+	nd.kind = spec.kind
+	nd.front = spec.front
+	nd.count = spec.count
+	nd.dstKey = spec.dstKey
+	nd.dstLeft = spec.dstLeft
 	nd.timer = nil
 	nd.live = true
 	nd.prev = l.tail
@@ -134,12 +180,12 @@ func (l *waitList) peekHead() (uint32, bool) {
 // any one key can walk to and unlink all of them. Duplicate keys park twice on
 // the same list, which the sibling unlink cleans up, so the caller need not
 // dedupe.
-func parkWaiter(g *reg, keys [][]byte, front bool, c *shard.Conn, seq uint32) uint32 {
+func parkWaiter(g *reg, keys [][]byte, spec waitSpec, c *shard.Conn, seq uint32) uint32 {
 	first := nilIdx
 	prev := nilIdx
 	for _, key := range keys {
 		wl := g.waitListFor(key)
-		i := wl.park(front, c, seq)
+		i := wl.park(spec, c, seq)
 		if first == nilIdx {
 			first = i
 		} else {
@@ -179,14 +225,48 @@ func (g *reg) unlinkAll(cx *shard.Ctx, idx uint32) {
 }
 
 // serveWaiters hands freshly pushed elements to the clients blocked on key, in
-// waiter FIFO order, until either the list empties or no waiter remains. Each
-// served waiter pops from its own chosen end (front for BLPOP, back for BRPOP)
-// and receives a two-element [key, element] array delivered at its parked
-// sequence through CompleteBlocked, the deferred-reply seam. It runs on the
-// owner from the push handler, after the elements are in the list, and each
-// waiter's reply is built into its own fresh buffer because CompleteBlocked
-// copies it and the next waiter reuses none of it.
+// waiter FIFO order, until either the list empties or no waiter remains. It runs
+// on the owner from the push handler (and the LMOVE destination hook), after the
+// elements are in the list. Each waiter's reply is built into its own fresh
+// buffer because CompleteBlocked copies it and the next waiter reuses none of it.
+//
+// serveKey drains the pushed key. A served BLMOVE whose destination is a distinct
+// key pushes onto that key and queues it on g.ready, since its own blocked clients
+// may now be servable. The worklist drain then serves each queued key in turn,
+// which may queue further keys, so a chain A->B->C or a ping-pong A<->B is served
+// to completion in this one call. Termination is bounded: each kindMove serve
+// unlinks exactly one waiter, so the strictly decreasing parked-waiter count caps
+// the total moves, and a key is queued at most once per served move, so the total
+// pushes never exceed the number of parked waiters. The drain is an explicit LIFO
+// stack (O(1) depth, no recursion), and g.ready is truncated back to empty at the
+// end so a plain push that served no move keeps the slice nil and allocates none.
 func serveWaiters(cx *shard.Ctx, g *reg, key []byte, l *list) {
+	serveKey(cx, g, key, l)
+	for len(g.ready) > 0 {
+		k := g.ready[len(g.ready)-1]
+		g.ready = g.ready[:len(g.ready)-1]
+		l2 := g.m[k]
+		if l2 == nil {
+			continue
+		}
+		serveKey(cx, g, []byte(k), l2)
+		if l2.length() == 0 {
+			delete(g.m, k)
+		}
+	}
+	if cap(g.ready) > 0 {
+		g.ready = g.ready[:0]
+	}
+}
+
+// serveKey serves the waiters parked on one key against its list, in FIFO order,
+// until the list empties or no waiter remains. It branches on each head waiter's
+// kind: a BLPOP/BRPOP pops one element and replies [key, element]; a BLMPOP pops
+// up to its recorded count off its end and replies [key, [elem, ...]], consuming
+// only its own budget so the next waiter is served from what is left; a BLMOVE is
+// handed to serveMove, which pushes to the destination and may queue a chained
+// key. Every reply lands at the waiter's parked sequence through CompleteBlocked.
+func serveKey(cx *shard.Ctx, g *reg, key []byte, l *list) {
 	wl := g.waiters[string(key)]
 	if wl == nil {
 		return
@@ -197,16 +277,79 @@ func serveWaiters(cx *shard.Ctx, g *reg, key []byte, l *list) {
 			return
 		}
 		nd := &g.wpool.nodes[i]
-		conn := nd.conn
-		seq := nd.seq
-		var elem []byte
-		if nd.front {
-			elem = l.popFront()
-		} else {
-			elem = l.popBack()
+		switch nd.kind {
+		case kindPop:
+			conn := nd.conn
+			seq := nd.seq
+			elem := popOne(l, nd.front)
+			rep := appendReply(nil, key, elem)
+			g.unlinkAll(cx, i)
+			conn.CompleteBlocked(seq, rep)
+		case kindMpop:
+			conn := nd.conn
+			seq := nd.seq
+			front := nd.front
+			npop := nd.count
+			if npop > l.length() {
+				npop = l.length()
+			}
+			rep := resp.AppendArrayHeader(nil, 2)
+			rep = resp.AppendBulk(rep, key)
+			rep = resp.AppendArrayHeader(rep, npop)
+			for j := 0; j < npop; j++ {
+				rep = resp.AppendBulk(rep, popOne(l, front))
+			}
+			g.unlinkAll(cx, i)
+			conn.CompleteBlocked(seq, rep)
+		default: // kindMove
+			serveMove(cx, g, key, l, i, nd)
 		}
-		rep := appendReply(nil, key, elem)
-		g.unlinkAll(cx, i)
-		conn.CompleteBlocked(seq, rep)
 	}
+}
+
+// serveMove completes one blocked BLMOVE/BRPOPLPUSH waiter parked on key: pop the
+// source element off the waiter's end and push it onto its recorded destination
+// end, then reply the moved element as a bulk string. It is the deferred twin of
+// lmove()'s core, run when a push finally makes the source non-empty. Every
+// per-waiter field is read off the node before unlinkAll recycles it.
+//
+// A self-move (destination equals the served key) pushes the popped element back
+// onto the same list and is never queued: the enclosing serveKey loop re-observes
+// the still non-empty list on its own. A distinct destination's type is checked
+// first, at serve, not at park, the way Redis defers it: a wrong-typed destination
+// fails the client with WRONGTYPE and leaves the source element in place, because
+// the pop runs only after the check passes. Otherwise the element is cloned out
+// before the push (it aliases the source's chunk storage), the destination is
+// created on first insert, and its key is queued on g.ready so its own waiters are
+// served by the drain.
+func serveMove(cx *shard.Ctx, g *reg, key []byte, l *list, i uint32, nd *waitNode) {
+	conn := nd.conn
+	seq := nd.seq
+	front := nd.front
+	dstKey := nd.dstKey
+	dstLeft := nd.dstLeft
+	self := dstKey == string(key)
+	var dst *list
+	if !self {
+		d, wrong := g.lookup(cx, []byte(dstKey))
+		if wrong {
+			g.unlinkAll(cx, i)
+			conn.CompleteBlocked(seq, resp.AppendError(nil, wrongType))
+			return
+		}
+		dst = d
+	}
+	elem := cloneBytes(popOne(l, front))
+	if self {
+		pushEnd(l, elem, dstLeft)
+	} else {
+		if dst == nil {
+			dst = newList()
+			g.m[dstKey] = dst
+		}
+		pushEnd(dst, elem, dstLeft)
+		g.ready = append(g.ready, dstKey)
+	}
+	g.unlinkAll(cx, i)
+	conn.CompleteBlocked(seq, resp.AppendBulk(nil, elem))
 }

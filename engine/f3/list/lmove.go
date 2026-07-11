@@ -93,6 +93,23 @@ func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) 
 		g.m[string(dstKey)] = dst
 	}
 	pushEnd(dst, v, dstLeft)
+	// The push made the destination non-empty, so a BLPOP/BLMPOP/BLMOVE-source
+	// client blocked on it is now servable: signal it before the source drop, the
+	// same ready-signal Redis raises on an LMOVE destination. This is what turns a
+	// plain LMOVE/RPOPLPUSH (and an immediate BLMOVE, which reuses this core) into
+	// a serving push for a waiter parked on the destination. Only a distinct
+	// destination can carry waiters: a non-empty list holds none by the invariant,
+	// so the same-key rotation branch above (which needs a non-empty source) never
+	// reaches here, and LINSERT, which also only runs on a non-empty list, is left
+	// unhooked to match Redis not signalling ready on it. The cross-shard
+	// destination hop (lmovecross.go) does not yet serve its waiters; that is the
+	// documented PR 6 gap.
+	if len(g.waiters) != 0 {
+		serveWaiters(cx, g, dstKey, dst)
+		if dst.length() == 0 {
+			g.drop(dstKey)
+		}
+	}
 	// The pop emptied the source: Redis deletes an emptied list. The drop runs
 	// after the destination push so distinct keys never race, and the same-key
 	// case above already returned, so this never drops a key just pushed onto.
