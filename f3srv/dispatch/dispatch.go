@@ -302,15 +302,32 @@ func init() {
 	register("LTRIM", list.Ltrim, 3, 3, true)
 	register("LINSERT", list.Linsert, 4, 4, true)
 	register("LPOS", list.Lpos, 2, -1, true)
-	// LMOVE and RPOPLPUSH (spec 2064/f3/13 M3 slice 6) are two-key moves that now
-	// land same-shard here: keyed on the source (args[0], the first-argument route
-	// the pushes use), the whole move runs on that owner's registry while source
-	// and destination are co-located, the free single-shard case of doc 03 section
-	// 6.1. They take no cross/crossKeys path this slice; cross-shard LMOVE rides
-	// the F17 intent pair in slice 7. The blocking forms
-	// BLPOP/BRPOP/BLMPOP/BLMOVE and LMPOP stay deferred to later M3 slices.
+	// LMOVE and RPOPLPUSH (spec 2064/f3/13 M3 slices 6 and 7) are two-key moves.
+	// When source and destination are co-located they route on the source (args[0],
+	// the first-argument route the pushes use) and the whole move runs on that
+	// owner's registry, the free single-shard case of doc 03 section 6.1.
+	// Cross-shard (slice 7) they ride the F17 intent pair: DoTxn arms write intents
+	// on both keys and LmoveCross runs the doc 6.7 plan under the barrier, capturing
+	// the source end element across the hops (list/lmovecross.go). LMOVE parses its
+	// two direction tokens in the cross closure the same way Lmove does, so an
+	// invalid one is the syntax error before any key is touched; RPOPLPUSH is the
+	// fixed RIGHT LEFT move. The blocking forms BLPOP/BRPOP/BLMPOP/BLMOVE and LMPOP
+	// stay deferred to later M3 slices.
 	register("LMOVE", list.Lmove, 4, 4, true)
+	table["LMOVE"].cross = func(t *shard.Txn, a [][]byte) []byte {
+		from, ok1 := list.ParseDir(a[2])
+		to, ok2 := list.ParseDir(a[3])
+		if !ok1 || !ok2 {
+			return list.SyntaxError()
+		}
+		return list.LmoveCross(t, a[0], a[1], from, to)
+	}
+	table["LMOVE"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 	register("RPOPLPUSH", list.Rpoplpush, 2, 2, true)
+	table["RPOPLPUSH"].cross = func(t *shard.Txn, a [][]byte) []byte {
+		return list.RpoplpushCross(t, a[0], a[1])
+	}
+	table["RPOPLPUSH"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
