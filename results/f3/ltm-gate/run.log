@@ -1,0 +1,14 @@
+[2026-07-11T07:37:37Z] ltm-gate starting; aki 7688c00, aki-bench dd86538
+[2026-07-11T07:37:38Z] cell ecap_get_uniform start
+[2026-07-11T07:42:14Z] cell ecap_get_uniform end
+[2026-07-11T07:42:19Z] cell ecap_get_zipf start
+[2026-07-11T07:46:55Z] cell ecap_get_zipf end
+[2026-07-11T07:47:00Z] cell ecap_set_uniform start
+[2026-07-11T07:50:31Z] cell ecap_set_uniform end
+[2026-07-11T07:50:36Z] cell edata_get_uniform start
+[2026-07-11T07:55:11Z] cell edata_get_uniform end
+[2026-07-11T07:55:16Z] cell edata_get_zipf start
+[2026-07-11T07:59:52Z] cell edata_get_zipf end
+[2026-07-11T07:59:57Z] cell edata_set_uniform start
+[2026-07-11T08:03:29Z] cell edata_set_uniform end
+[2026-07-11T08:03:34Z] ltm-gate complete: 6 cells done

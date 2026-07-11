@@ -1,0 +1,33 @@
+aki posture: shards=4 arena_mib=256 resident_cap_mib=128 (total cap 512MiB) vlog=/root/f3gate/ltm-gate/tmp/a.0cRCU1/vlog
+rival posture: --maxmemory 512mb --maxmemory-policy allkeys-lfu io-threads=4
+vlog_fs ext2/ext3
+shards_banner with 4 shards
+cell LTM wl=get dist=uniform keys=2000000 value=1032B conns=64 pipeline=16 warm=3s dur=20s cov_sample=100000
+rss[launch] aki=8820kB redis=9184kB valkey=9120kB
+hwm[launch] aki=8820kB redis=9184kB valkey=9120kB
+used_memory[launch] aki=32912 redis=1292600 valkey=1523768
+dbsize[launch] aki=0 redis=0 valkey=0
+rival_info[pre-rep0][redis] evicted_keys:0 keyspace_hits:0 keyspace_misses:0 
+rival_info[pre-rep0][valkey] evicted_keys:0 keyspace_hits:0 keyspace_misses:0 
+COVERAGE rep0: aki dataset coverage: 100000/100000 retrievable (100.0%);redis dataset coverage: 20138/100000 retrievable (20.1%), 79862 missing;valkey dataset coverage: 20090/100000 retrievable (20.1%), 79910 missing;
+rss[post-rep0] aki=683208kB redis=590568kB valkey=682792kB
+hwm[post-rep0] aki=696400kB redis=608012kB valkey=703472kB
+used_memory[post-rep0] aki=573178648 redis=535457040 valkey=535658760
+dbsize[post-rep0] aki=2000000 redis=401397 valkey=402492
+rival_info[post-rep0][redis] evicted_keys:1598719 keyspace_hits:15381868 keyspace_misses:61314132 
+rival_info[post-rep0][valkey] evicted_keys:1597630 keyspace_hits:15017261 keyspace_misses:59579811 
+COVERAGE rep1: aki dataset coverage: 100000/100000 retrievable (100.0%);redis dataset coverage: 20111/100000 retrievable (20.1%), 79889 missing;valkey dataset coverage: 20138/100000 retrievable (20.1%), 79862 missing;
+rss[post-rep1] aki=673888kB redis=590028kB valkey=690496kB
+hwm[post-rep1] aki=772616kB redis=608196kB valkey=711552kB
+used_memory[post-rep1] aki=569708032 redis=535446312 valkey=535663336
+dbsize[post-rep1] aki=2000000 redis=401387 valkey=402497
+rival_info[post-rep1][redis] evicted_keys:3197447 keyspace_hits:30636366 keyspace_misses:122090162 
+rival_info[post-rep1][valkey] evicted_keys:3195255 keyspace_hits:30085736 keyspace_misses:119413832 
+COVERAGE rep2: aki dataset coverage: 100000/100000 retrievable (100.0%);redis dataset coverage: 20175/100000 retrievable (20.2%), 79825 missing;valkey dataset coverage: 20103/100000 retrievable (20.1%), 79897 missing;
+rss[post-rep2] aki=681200kB redis=590188kB valkey=683044kB
+hwm[post-rep2] aki=703108kB redis=608572kB valkey=704164kB
+used_memory[post-rep2] aki=570929920 redis=535441888 valkey=535667368
+dbsize[post-rep2] aki=2000000 redis=401377 valkey=402499
+rival_info[post-rep2][redis] evicted_keys:4796186 keyspace_hits:45815503 keyspace_misses:182564113 
+rival_info[post-rep2][valkey] evicted_keys:4792879 keyspace_hits:45056293 keyspace_misses:178833323 
+vlog_du 2.4G	/root/f3gate/ltm-gate/tmp/a.0cRCU1/vlog

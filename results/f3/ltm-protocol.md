@@ -2,8 +2,8 @@
 
 Issue tamnd/aki#542.
 This note redesigns the larger-than-memory (LTM) benchmark so it measures a fair thing, and it records the accounting the harness now carries to enforce it.
-It does not run on the gate box.
-The box is queued for other campaigns this slice, so the numbers here are a local plumbing smoke, marked below as not a result.
+The protocol landed first with only a local plumbing smoke, marked below as not a result.
+The box run happened on 2026-07-11 at aki 7688c00; its numbers are in the "Box run" section and the raw per-cell artifacts sit next to this note under results/f3/ltm-gate/.
 
 ## What the M0 LTM pair actually measured
 
@@ -59,10 +59,10 @@ Each cell also reports bytes per retrievable key: peak memory over the keys the 
 This is the fair memory-efficiency figure.
 A rival that evicted three quarters of the dataset looks cheap per stored key and expensive per retrievable key, because most of what it stored is gone.
 
-## Proposed gate (PROPOSAL, pending the box run)
+## Proposed gate (PROPOSAL, written before the box run)
 
 This section is a proposal, not a decision.
-It is written down so the box run has an explicit bar to check against, and it will be revised once real numbers land.
+It was written down so the box run had an explicit bar to check against; the run has now happened and the "Box run" section below checks against it.
 
 The equal-cap arm does not gate on a throughput ratio.
 It is a coverage-and-cost row: aki must serve materially higher coverage than an evicting rival at the same cap, and its bytes per retrievable key must be lower.
@@ -73,7 +73,7 @@ The proposed bar is that at 100 percent coverage on both sides, aki's data-beari
 The exact multipliers are left blank here on purpose; the vlog read path at 40k ops/s must first be fixed, and the numbers that set the bar have to come from the box, not from this note.
 Until the read path clears its own floor, the equal-data throughput arm is expected to fail, and that failure is the signal, not a surprise.
 
-## Exact box-run commands (do not run this slice)
+## Exact box-run commands (as run on 2026-07-11)
 
 Build the two binaries into the run directory, then launch the runner under a session that survives disconnect.
 
@@ -118,8 +118,69 @@ That is the M0 failure in miniature: throughput and hit rate look healthy while 
 The uncapped servers in the same run probed at 100 percent.
 VmHWM read as empty in this smoke because it is Linux-only and connect mode has no PID to read; the /proc parser is exercised by the target package's Linux test and by the box runner, and the nils-as-misses split is exercised by the load package's coverage tests.
 
-## Not in this slice
+## Box run (2026-07-11, aki 7688c00, aki-bench dd86538)
 
-No gate multipliers are set; the blanks above are deliberate and wait on the box.
-No box run happened.
-The vlog read-path fix and the resident-cap-does-not-bound-RSS fix are separate work; this slice only makes their effects measurable and fair to read.
+Gate box GamingPC, i9-13900K, 56 GiB RAM, WSL2 kernel 6.18.33.2, NVMe-backed ext4; redis 8.8.0 and valkey 9.1.0, io-threads 4; server pinned to cpus 0-7, generator to 8-15.
+Both arms ran, three interleaved reps per cell, aki-bench as the sole harness, coverage probe 100000 keys per rep.
+An earlier pass finished the same morning at aki 9591cd7, before the tip moved; it is archived on the box under ltm-gate/prepause-9591cd7 and nothing below quotes it.
+Raw artifacts (per-rep json and stdout, meta with per-rep VmRSS/VmHWM/used_memory/dbsize, 1s memory samples, run log, env) are committed under results/f3/ltm-gate/, with the reduced table in ltm-gate/summary.txt.
+
+Medians of the three reps; vops is data-bearing throughput, peak is max VmHWM across reps, B/retr key is peak bytes over retrievable keys.
+Ratios quoted for a verdict are the min across reps, not the median.
+
+```
+== equal-cap (all three at 512 MiB; rivals allkeys-lfu) ==
+cell              server      vops/sec   cov%   peak MB   B/retr key   p99 us
+get_uniform       aki          930,768  100.0       755          396   11,330
+                  redis        662,272   20.1       594        1,547      606
+                  valkey       651,796   20.1       695        1,812      530
+get_zipf          aki        2,010,514  100.0       738          387    1,078
+                  redis      1,247,722   20.0       598        1,571      617
+                  valkey     1,275,294   20.2       709        1,843      562
+set_uniform       aki          324,818   96.2       799          435   13,009
+                  redis      1,052,960   20.1       532        1,391    1,434
+                  valkey       925,127   20.2       925        2,402    1,631
+
+== equal-data (rivals 4096 MB noeviction; aki keeps the 512 MiB cap) ==
+cell              server      vops/sec   cov%   peak MB   B/retr key   p99 us
+get_uniform       aki          925,804  100.0       682          358   11,665
+                  redis      1,986,521  100.0     2,567        1,346      805
+                  valkey     1,948,882  100.0     2,575        1,350      774
+get_zipf          aki        1,989,225  100.0       683          358    1,088
+                  redis      2,313,289  100.0     2,567        1,346      770
+                  valkey     2,424,296  100.0     2,575        1,350      667
+set_uniform       aki          320,017   96.0       738          403   13,320
+                  redis      2,502,736  100.0     2,674        1,402      713
+                  valkey     2,080,171  100.0     2,718        1,425      754
+```
+
+The 96 percent aki coverage on the set cells is not data loss.
+The set workload draws keys uniformly for 20 seconds with no preload, so a server only holds the keys its own throughput managed to draw; aki at 320k ops/s makes about 6.4M draws over a 2M keyspace, and 1-exp(-6.4/2) predicts 96.1 percent, which is what the probe found and what aki's own dbsize (1.92M) confirms.
+The rivals make roughly 50M draws in the same window and cover everything.
+The probe misses are keys the generator never wrote to aki, not keys aki dropped.
+
+Equal-cap reading.
+This arm does not gate on throughput, per the proposal, and the coverage-and-cost row now has numbers.
+At the same 512 MiB ceiling the rivals kept 20 percent of the dataset and aki kept all of it, while aki also posted higher data-bearing GET throughput: min-of-reps 1.40x redis and 1.42x valkey on uniform, 1.56x and 1.57x on zipfian.
+Bytes per retrievable key is 387-435 for aki against 1,391-2,402 for the rivals, a 3.5x to 5.5x cost advantage.
+On SET aki is 0.30x redis min-of-reps, which is the write path under spill, priced honestly next to the coverage it buys.
+One honest flag: aki's peak resident set (738-799 MB) sits above the nominal 512 MiB cap and above redis's peak on two of three cells, because the index and connection buffers still live outside the cap.
+The overshoot is now about 1.5x the cap where M0 measured 4.4x (2.27 GB), but the cap still does not bound the process.
+
+Equal-data reading.
+Coverage is equal by construction, so the throughput ratio is clean.
+aki serves the full 2 GB dataset from a 682-738 MB peak against the rivals' 2,567-2,718 MB, which is 0.25x-0.27x the rivals' peak memory and 358-403 bytes per retrievable key against their 1,346-1,425.
+That clears the product-pitch memory bar (under 0.5x) with room.
+The throughput cost of that memory is workload-shaped: min-of-reps 0.82x valkey and 0.86x redis on zipfian GET, 0.46x-0.47x on uniform GET, and 0.12x-0.15x on SET.
+The vlog read path that measured 40k ops/s in M0 now posts 926k data-bearing uniform GETs per second, about 23x better, though its p99 (11.7 ms) is still an order of magnitude above the rivals' (0.8 ms).
+
+Verdict against the proposal.
+The equal-cap bar passes: materially higher coverage (100 vs 20 percent) at lower bytes per retrievable key on every cell.
+The equal-data arm was expected to fail on throughput until the read path cleared its floor; it no longer fails outright, and the observed floors are the numbers a future bar should be set from: zipfian GET at 0.8x rival throughput for 0.27x rival memory is a defensible trade today, uniform GET at 0.46x is close, and SET at 0.12x is the gap that owns the next slice.
+Candidate multipliers for review, not set here: equal-data GET at or above 0.75x zipfian and 0.5x uniform, SET at or above 0.5x, peak memory at or below 0.5x, and the equal-cap peak overshoot brought under the configured cap.
+
+## Follow-ups this run points at
+
+The write path under spill is the largest gap: 0.12x-0.33x across both arms while GET holds 0.8x-1.6x.
+The resident cap still does not bound total RSS; the overshoot shrank from 4.4x to about 1.5x but the ceiling claim wants the cap to be the ceiling.
+Uniform GET p99 at 11-12 ms is vlog read latency, and it caps the uniform arm at about 0.5x even after the 23x throughput recovery.
