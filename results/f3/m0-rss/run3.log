@@ -1,0 +1,16 @@
+[2026-07-11T01:22:34Z] rss matrix starting; NL=3
+[2026-07-11T01:22:35Z] lab20 start
+[2026-07-11T01:22:40Z] lab20 end
+[2026-07-11T01:22:40Z] cell get_64b_p16_c512 start
+[2026-07-11T01:31:33Z] cell get_64b_p16_c512 end
+[2026-07-11T01:31:38Z] cell set_64b_p16_c512 start
+[2026-07-11T01:39:59Z] cell set_64b_p16_c512 end
+[2026-07-11T01:40:04Z] cell get_1k_p16_c512 start
+[2026-07-11T01:49:33Z] cell get_1k_p16_c512 end
+[2026-07-11T01:49:38Z] cell set_1k_p16_c512 start
+[2026-07-11T01:57:32Z] cell set_1k_p16_c512 end
+[2026-07-11T01:57:37Z] cell get_64b_p1_c512 start
+[2026-07-11T02:06:19Z] cell get_64b_p1_c512 end
+[2026-07-11T02:06:24Z] cell set_64b_p1_c512 start
+[2026-07-11T02:14:27Z] cell set_64b_p1_c512 end
+[2026-07-11T02:14:32Z] rss matrix complete: 7 cells done
