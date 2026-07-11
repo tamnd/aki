@@ -228,6 +228,25 @@ func init() {
 	register("ZMPOP", zset.Zmpop, 3, -1, false)
 	table["ZMPOP"].keyAt = 1
 
+	// The multi-key algebra surface (spec 2064/f3/12 section 6.12). The read
+	// forms ZUNION, ZINTER, ZDIFF, and ZINTERCARD lead with numkeys, so they route
+	// on the first operand (keyAt=1), the post-count route SINTERCARD uses, and
+	// read every operand from that shard's registry (the co-located-operand
+	// convention). The STORE forms write the destination and so route on it
+	// (args[0], the first-argument route SADD uses); their minimum is a
+	// destination, a numkeys, and at least one source.
+	register("ZUNION", zset.Zunion, 2, -1, false)
+	table["ZUNION"].keyAt = 1
+	register("ZINTER", zset.Zinter, 2, -1, false)
+	table["ZINTER"].keyAt = 1
+	register("ZDIFF", zset.Zdiff, 2, -1, false)
+	table["ZDIFF"].keyAt = 1
+	register("ZINTERCARD", zset.Zintercard, 2, -1, false)
+	table["ZINTERCARD"].keyAt = 1
+	register("ZUNIONSTORE", zset.Zunionstore, 3, -1, true)
+	register("ZINTERSTORE", zset.Zinterstore, 3, -1, true)
+	register("ZDIFFSTORE", zset.Zdiffstore, 3, -1, true)
+
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
