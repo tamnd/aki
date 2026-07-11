@@ -14,11 +14,10 @@ import (
 // path, and it carries the encoding OBJECT ENCODING still reports as hashtable
 // for Redis parity.
 //
-// This slice builds the table, the records, the slab, and the draw vector's
-// storage. The exactly-uniform weighted draw over the vector (SPOP and
-// SRANDMEMBER, doc 11 sections 4.3 and 5) is the next slice; until it lands the
-// draw path reaches the vector through at() in insertion-then-swap order, which
-// is a legal draw order and needs no member sort.
+// The table, records, slab, and draw vector are built here; the exactly-uniform
+// draw over the vector (SPOP and SRANDMEMBER, doc 11 sections 4.3 and 5) lives in
+// draw.go and reaches the vector through at(). The vector order is
+// insertion-then-swap, which is a legal draw population and needs no member sort.
 
 // record is the fixed per-member cell, 12 bytes after alignment (doc 11 section
 // 2.2, on the memory diet). The record caches no member hash (diet step one,
