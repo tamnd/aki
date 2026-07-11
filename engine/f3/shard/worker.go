@@ -29,6 +29,15 @@ type worker struct {
 	intentPending atomic.Int64
 	keyQ          map[string]*keyList
 
+	// rt is the runtime this worker belongs to, fixed before Start: the intent
+	// coordinator and the donation offer walk the pool through it.
+	rt *Runtime
+
+	// donated is the worker-donation slot (donate.go): a coordinator fanning
+	// out read-only tasks CASes a job in here and the worker helps between its
+	// own batches. One relaxed load per pass when empty, like intentPending.
+	donated atomic.Pointer[donateJob]
+
 	// pin locks the worker goroutine to an OS thread for its whole life.
 	// Correctness never needs it: the single-owner invariant is goroutine
 	// affinity, one goroutine owning the shard, and that holds wherever the
@@ -84,6 +93,7 @@ type worker struct {
 func newWorker(id int, st *store.Store) *worker {
 	w := &worker{id: id, st: st, done: make(chan struct{})}
 	w.cx.St = st
+	w.cx.w = w
 	w.argv = make([][]byte, 0, 16)
 	w.wakes = make([]*Conn, 0, drainPassCap)
 	w.keyQ = make(map[string]*keyList)
@@ -110,6 +120,10 @@ func (w *worker) run() {
 		// that applied ops counts them so the loop stays awake to service the
 		// coordinator that posted them.
 		n += w.advanceIntents()
+		// Help a donated fan-out (donate.go): one relaxed load when no job is
+		// offered, and between-batches-only execution when one is, which is the
+		// section-6.5 fairness bound.
+		n += w.helpDonated()
 		if len(w.streams) > 0 {
 			w.pumpStreams()
 		}
@@ -412,17 +426,18 @@ func (w *worker) idle() {
 	// its own, swept apart from the connection writers' in lab 11; at the
 	// frozen value of zero the loop is skipped and the worker parks at once.
 	for i := 0; i < workerSpinIters; i++ {
-		if w.inbound.ready() || w.intentReady() || w.stop.Load() {
+		if w.inbound.ready() || w.intentReady() || w.donateReady() || w.stop.Load() {
 			w.wk.state.Store(stateRunning)
 			return
 		}
 	}
 	w.wk.state.Store(stateParked)
 	// The re-check after the parked store is the lost-wake guard, and it covers
-	// the intent queue too: an intent op posted before its wake either shows in
-	// this check or the posting producer's wake claims the park (postIntent
-	// wakes exactly like a hop producer).
-	if w.inbound.ready() || w.intentReady() || w.stop.Load() {
+	// the intent queue and the donation slot too: an intent op or a donated job
+	// posted before its wake either shows in this check or the posting
+	// producer's wake claims the park (postIntent and FanOut wake exactly like
+	// a hop producer).
+	if w.inbound.ready() || w.intentReady() || w.donateReady() || w.stop.Load() {
 		w.wk.unparkSelf()
 		return
 	}
