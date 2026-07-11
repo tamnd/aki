@@ -79,7 +79,7 @@ func makeKey(buf []byte, n uint64) []byte {
 func rss() (vmRSS, vmHWM uint64) {
 	f, err := os.Open("/proc/self/status")
 	if err == nil {
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		sc := bufio.NewScanner(f)
 		for sc.Scan() {
 			line := sc.Text()
