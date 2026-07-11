@@ -1,6 +1,9 @@
 package zset
 
 import (
+	"math"
+	"math/rand/v2"
+	"sort"
 	"testing"
 
 	"github.com/tamnd/aki/f3srv/resp"
@@ -130,4 +133,92 @@ func BenchmarkZIncrByNative(b *testing.B) {
 			z.update(m, 1.5, flags{incr: true})
 		}
 	})
+}
+
+// The ZRANK rows the M2 headline cell keys on (PRED-F3-M2-ZRANKZIPF): one member
+// hash probe plus one counted descent, at 10k and 1M members, under a uniform
+// draw and a zipfian draw that concentrates on the hot low ranks. buildNative
+// seats member i at rank i, so a drawn rank names its member directly. The bar
+// is the tree lab's 307.7ns counted descent at 1M plus the hash probe; the
+// zipfian row is the one that stuck at 1.86x/1.83x in v1, so it earns its own
+// benchmark against the uniform baseline.
+const drawCount = 8192
+
+func BenchmarkZRankNative(b *testing.B) {
+	for _, n := range []int{10_000, 1_000_000} {
+		z := buildNative(n)
+		for _, zipf := range []bool{false, true} {
+			name := itoa(n) + "/uniform"
+			if zipf {
+				name = itoa(n) + "/zipfian"
+			}
+			b.Run(name, func(b *testing.B) {
+				ranks := drawRanks(n, zipf, uint64(n))
+				members := make([][]byte, drawCount)
+				for i, r := range ranks {
+					members[i] = []byte("member:" + pad(r))
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_, _, sinkBool = z.rank(members[i&(drawCount-1)])
+				}
+			})
+		}
+	}
+}
+
+// ZRANGE by index at 1M over windows of 10, 100 and 10k, both directions
+// (PRED-F3-M2-ZRANGE): a counted select seek then a bounded leaf-chain walk,
+// streamed into a reused buffer. Divide ns/op by the window to read the
+// per-element cost the streaming reply is meant to flatten.
+func BenchmarkZRangeNative(b *testing.B) {
+	const n = 1_000_000
+	z := buildNative(n)
+	buf := make([]byte, 0, 1<<22)
+	for _, win := range []int{10, 100, 10_000} {
+		for _, rev := range []bool{false, true} {
+			dir := "fwd"
+			if rev {
+				dir = "rev"
+			}
+			b.Run(itoa(win)+"/"+dir, func(b *testing.B) {
+				lo, hi, _ := clampRange(n/2, n/2+win-1, z.card())
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					sinkBytes = z.rangeByIndex(buf[:0], lo, hi, rev, false)
+				}
+			})
+		}
+	}
+}
+
+// drawRanks precomputes drawCount rank samples over [0,n): uniform, or a zipfian
+// draw at exponent 0.99 (the PRED-F3-M2-ZRANKZIPF shape) that piles onto the low
+// ranks so the descents hammer one hot region of the tree.
+func drawRanks(n int, zipf bool, seed uint64) []int {
+	r := rand.New(rand.NewPCG(seed, 0x9e3779b9))
+	out := make([]int, drawCount)
+	if !zipf {
+		for i := range out {
+			out[i] = r.IntN(n)
+		}
+		return out
+	}
+	cdf := make([]float64, n)
+	sum := 0.0
+	for k := 0; k < n; k++ {
+		sum += 1.0 / math.Pow(float64(k+1), 0.99)
+		cdf[k] = sum
+	}
+	for i := range out {
+		x := r.Float64() * sum
+		k := sort.SearchFloat64s(cdf, x)
+		if k >= n {
+			k = n - 1
+		}
+		out[i] = k
+	}
+	return out
 }
