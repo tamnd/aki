@@ -1,0 +1,36 @@
+pins single=pid 60481's current affinity list: 0-7 uring=pid 60483's current affinity list: 0-7 redis=pid 60484's current affinity list: 0-7
+launch arena_mib=512 net_loops=3 warm=3s io_threads=4
+driver_stamp single=net_driver:goroutine reactor=net_driver:reactor uring=net_driver:uring
+rss[launch] single=8688kB reactor=8684kB uring=9176kB redis=9016kB valkey=9256kB
+hwm[launch] single=8688kB reactor=8684kB uring=9176kB redis=9016kB valkey=9256kB
+cell wl=get value=64 keys=1000000 dist=uniform conns=512 pipeline=16 arena_mib_per_shard=512 warm=3s dur=8s
+rss[post-ab-single-rep0] single=223452kB reactor=8820kB uring=9220kB redis=137492kB valkey=128416kB
+hwm[post-ab-single-rep0] single=223452kB reactor=8820kB uring=9220kB redis=144516kB valkey=128416kB
+rss[post-ab-reactor-rep0] single=129816kB reactor=215044kB uring=9300kB redis=137968kB valkey=128664kB
+hwm[post-ab-reactor-rep0] single=222380kB reactor=215044kB uring=9300kB redis=146824kB valkey=128664kB
+rss[post-ab-uring-rep0] single=129848kB reactor=121432kB uring=432792kB redis=138352kB valkey=128444kB
+hwm[post-ab-uring-rep0] single=222380kB reactor=213932kB uring=432792kB redis=146824kB valkey=128444kB
+rss[post-ab-single-rep1] single=223456kB reactor=121444kB uring=339112kB redis=138368kB valkey=128620kB
+hwm[post-ab-single-rep1] single=223456kB reactor=213932kB uring=431532kB redis=146824kB valkey=128620kB
+rss[post-ab-reactor-rep1] single=129832kB reactor=313280kB uring=339128kB redis=138368kB valkey=128272kB
+hwm[post-ab-reactor-rep1] single=222380kB reactor=313280kB uring=431532kB redis=146824kB valkey=128272kB
+rss[post-ab-uring-rep1] single=129908kB reactor=219604kB uring=514964kB redis=138056kB valkey=128308kB
+hwm[post-ab-uring-rep1] single=222380kB reactor=312064kB uring=514964kB redis=146824kB valkey=128308kB
+rss[post-ab-single-rep2] single=297184kB reactor=219616kB uring=421316kB redis=138480kB valkey=128524kB
+hwm[post-ab-single-rep2] single=297184kB reactor=312064kB uring=514048kB redis=146824kB valkey=128524kB
+rss[post-ab-reactor-rep2] single=203548kB reactor=217828kB uring=421332kB redis=138128kB valkey=128592kB
+hwm[post-ab-reactor-rep2] single=296092kB reactor=312064kB uring=514048kB redis=146824kB valkey=128592kB
+rss[post-ab-uring-rep2] single=203584kB reactor=124192kB uring=458984kB redis=138180kB valkey=127552kB
+hwm[post-ab-uring-rep2] single=296092kB reactor=312064kB uring=514048kB redis=146824kB valkey=128136kB
+rss[post-rb-single] single=391324kB reactor=124220kB uring=365364kB redis=14596kB valkey=63376kB
+hwm[post-rb-single] single=391324kB reactor=312064kB uring=514048kB redis=146824kB valkey=128136kB
+rss[post-rb-reactor] single=299296kB reactor=292748kB uring=365488kB redis=14592kB valkey=17188kB
+hwm[post-rb-reactor] single=390096kB reactor=312064kB uring=514048kB redis=146824kB valkey=128136kB
+rss[post-rb-uring] single=299308kB reactor=200708kB uring=436536kB redis=14584kB valkey=13660kB
+hwm[post-rb-uring] single=390096kB reactor=312064kB uring=514048kB redis=146824kB valkey=128136kB
+rss[post-rb-redis] single=299320kB reactor=200708kB uring=344520kB redis=147716kB valkey=13660kB
+hwm[post-rb-redis] single=390096kB reactor=312064kB uring=514048kB redis=153688kB valkey=128136kB
+rss[post-rb-valkey] single=299328kB reactor=200724kB uring=344540kB redis=23560kB valkey=129128kB
+hwm[post-rb-valkey] single=390096kB reactor=312064kB uring=514048kB redis=153688kB valkey=129128kB
+dbsize_end single=0 uring=0 redis=0
+uring_stats net_driver:uring net_conn_shape:single net_read_syscalls:17722431 net_write_syscalls:24237621 net_batches:17719247 net_commands:289320351 net_worker_wakes:596525 net_worker_parks:593035 net_conn_wakes:30310307 net_conn_parks:48022391 net_loop_wakes:3409687 net_disconnects_outbuf:0 
