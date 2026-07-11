@@ -228,6 +228,17 @@ func (n *nativeStore) each(fn func(m []byte, score float64)) {
 	})
 }
 
+// eachUntil visits every member in ascending zset order, stopping early when fn
+// returns false. It is the early-exit form each lacks, backing the algebra
+// probe and merge loops (section 6.12) and ZINTERCARD's LIMIT stop. Member bytes
+// alias the slab and are valid only until the next write.
+func (n *nativeStore) eachUntil(fn func(m []byte, s float64) bool) {
+	n.tree.Each(func(_ uint64, ref uint32) bool {
+		r := &n.recs[ref]
+		return fn(n.slab[r.loc:r.loc+r.mlen], math.Float64frombits(r.bits))
+	})
+}
+
 // rank returns the count of members sorting before m, its score, and whether m
 // is present, in a single member-hash probe plus one counted descent (section
 // 6.3). The probe yields the raw score bits, which decode to the float ZRANK

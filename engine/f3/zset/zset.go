@@ -269,6 +269,47 @@ func (z *zset) entries() []entryView {
 	return out
 }
 
+// forEach visits every member in ascending zset order, stopping early when fn
+// returns false. It allocates nothing: the inline band walks the blob in place
+// and the native band walks the tree, both handing member bytes that alias live
+// storage (valid until the next write on this owner). It backs the algebra
+// probe, merge, and diff loops (section 6.12), which read a source without
+// materializing an entry slice.
+func (z *zset) forEach(fn func(m []byte, s float64) bool) {
+	if z.enc == encListpack {
+		b := z.blob
+		for i := 0; i < len(b); {
+			m, s, next := decodeEntry(b, i)
+			if !fn(m, s) {
+				return
+			}
+			i = next
+		}
+		return
+	}
+	z.nat.eachUntil(fn)
+}
+
+// appendInlineSorted appends one entry at the tail of the blob for a bulk build
+// (algebra STORE, section 6.12) whose pairs already arrive in zset order. Unlike
+// listpackInsert it does no seek: the caller guarantees each entry sorts at or
+// after the last, so a straight append preserves order (section 4). A -0.0 score
+// collapses to +0.0, the listpack int-encoding Redis applies to an inline zero,
+// matching listpackInsert.
+func (z *zset) appendInlineSorted(m []byte, score float64) {
+	if score == 0 {
+		score = 0 // -0.0 collapses, matching Redis's listpack int encoding
+	}
+	off := len(z.blob)
+	entryLen := 2 + len(m) + 8
+	z.blob = append(z.blob, make([]byte, entryLen)...)
+	z.blob[off] = byte(len(m))
+	z.blob[off+1] = tagOf(m)
+	copy(z.blob[off+2:], m)
+	binary.BigEndian.PutUint64(z.blob[off+2+len(m):], math.Float64bits(score))
+	z.n++
+}
+
 // rank returns the number of members sorting before m, its score, and whether
 // it is present. Linear over the inline band (count while scanning, section
 // 6.3); the native band is one hash probe plus a counted descent (nat.rank).
