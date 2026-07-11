@@ -153,8 +153,7 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			return
 		}
 		var sc [64]byte
-		m := append(sc[:0], s.at(g.next(s.card()), sc[:])...)
-		s.rem(m)
+		m := s.popOne(g, sc[:])
 		if s.card() == 0 {
 			g.drop(key)
 		}
@@ -177,9 +176,7 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	out := resp.AppendArrayHeader(cx.Aux[:0], popped)
 	var sc [64]byte
 	for i := 0; i < popped; i++ {
-		m := append(sc[:0], s.at(g.next(s.card()), sc[:])...)
-		out = resp.AppendBulk(out, m)
-		s.rem(m)
+		out = resp.AppendBulk(out, s.popOne(g, sc[:]))
 	}
 	cx.Aux = out
 	r.Raw(out)
@@ -205,7 +202,7 @@ func Srandmember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			return
 		}
 		var sc [64]byte
-		r.Bulk(s.at(g.next(s.card()), sc[:]))
+		r.Bulk(s.drawOne(g, sc[:]))
 		return
 	}
 	count, ok := store.ParseInt(args[1])
@@ -221,38 +218,20 @@ func Srandmember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		// With replacement: exactly -count draws, repeats allowed.
 		want := int(-count)
 		out := resp.AppendArrayHeader(cx.Aux[:0], want)
-		var sc [64]byte
-		for i := 0; i < want; i++ {
-			out = resp.AppendBulk(out, s.at(g.next(s.card()), sc[:]))
-		}
+		s.sampleWithReplacement(g, want, func(m []byte) { out = resp.AppendBulk(out, m) })
 		cx.Aux = out
 		r.Raw(out)
 		return
 	}
-	// Distinct: up to count members, no repeats. A partial Fisher-Yates over a
-	// snapshot of the members gives an unbiased sample without disturbing the
-	// set. The snapshot is bounded by the set's cardinality.
+	// Distinct: up to count members, no repeats, each an exact uniform sample
+	// without replacement (doc 11 section 5.2). The header carries the delivered
+	// count, which caps at the cardinality.
 	want := int(count)
-	snap := snapshot(s)
-	if want > len(snap) {
-		want = len(snap)
-	}
-	for i := 0; i < want; i++ {
-		j := i + g.next(len(snap)-i)
-		snap[i], snap[j] = snap[j], snap[i]
+	if want > s.card() {
+		want = s.card()
 	}
 	out := resp.AppendArrayHeader(cx.Aux[:0], want)
-	for i := 0; i < want; i++ {
-		out = resp.AppendBulk(out, snap[i])
-	}
+	s.sampleDistinct(g, want, func(m []byte) { out = resp.AppendBulk(out, m) })
 	cx.Aux = out
 	r.Raw(out)
-}
-
-// snapshot returns a fresh copy of every member's bytes, so a caller can shuffle
-// and emit without touching the live set. Used only by the count draw forms.
-func snapshot(s *set) [][]byte {
-	out := make([][]byte, 0, s.card())
-	s.each(func(m []byte) { out = append(out, append([]byte(nil), m...)) })
-	return out
 }
