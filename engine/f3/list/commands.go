@@ -65,7 +65,19 @@ func pushCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front, create bool) {
 			l.pushBack(v)
 		}
 	}
-	r.Int(int64(l.length()))
+	// The reply is the length after the push, before any blocked client is
+	// served: Redis signals the key ready and returns the pushed length, then
+	// serves waiters as a separate step, so LPUSH into a key with a BLPOP waiter
+	// still reports the length it grew to. serveWaiters then hands elements to
+	// the parked clients in FIFO order and the key is dropped if they drain it.
+	n := l.length()
+	if len(g.waiters) != 0 {
+		serveWaiters(cx, g, key, l)
+		if l.length() == 0 {
+			g.drop(key)
+		}
+	}
+	r.Int(int64(n))
 }
 
 // Lpop answers LPOP key [count]; Rpop answers RPOP key [count]. Without a count

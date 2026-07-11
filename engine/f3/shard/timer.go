@@ -13,6 +13,15 @@ type timer struct {
 	heapPos    int
 }
 
+// TimerHandle is the handle a caller outside this package holds for an armed
+// timer. It aliases *timer so a slice like list can store an armed timeout on
+// its waiter node without the unexported timer type escaping the package, and
+// it stays nil-safe: ArmTimer returns a nil handle on a bare Ctx and CancelTimer
+// no-ops on nil, so a caller can declare the field and cancel unconditionally.
+// The alias is the whole cross-package surface; the timer type and its heap are
+// unchanged.
+type TimerHandle = *timer
+
 // timerHeap is a min-heap of armed timers keyed by absolute deadline in unix-ms.
 // It is owner-only like keyQ: exactly one goroutine (the shard worker) ever
 // touches it, so it holds no lock and every field below is a plain load. It is
