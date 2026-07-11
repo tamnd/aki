@@ -441,6 +441,8 @@ func (w *worker) executeCmd(b *hopBatch, i int) {
 		argv = append(argv, b.arg(i, k))
 	}
 	w.argv = argv
+	w.cx.curConn = b.conn // completion target for a Park; owner-local, per command
+	w.cx.curSeq = c.seq
 	h(&w.cx, argv, r)
 }
 
