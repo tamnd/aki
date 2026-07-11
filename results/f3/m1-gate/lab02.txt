@@ -1,0 +1,88 @@
+inline set threshold sweep: 4000000 iters x 5 reps, median ns/op (absent-member probe)
+
+## intset-class (sorted int64, binary search)
+    card      intset         map
+       1       1.52       2.49
+       2       1.53       2.92
+       4       2.16       3.91
+       8       2.95       5.40
+      16       3.27       3.85
+      32       3.49       4.88
+      64       3.96       4.86
+      96       3.94       4.72
+     128       4.32       4.27
+     192       4.33       4.90
+     256       4.64       4.29
+     384       4.61       5.79
+     512       5.00       4.37
+    1024       5.34       4.54  (past intset cap)
+
+## listpack-class (packed blob, linear scan, 8B members)
+    card    listpack         map
+       1       2.98       7.03
+       2       3.59       7.11
+       4       4.36       7.14
+       8       5.55       7.53
+      16       9.37       5.08
+      32      21.04       5.02
+      64      53.72       5.63
+      96      90.72       8.79
+     128     128.77       5.54
+     192     206.87       8.83  (past listpack cap)
+     256     280.81       5.37  (past listpack cap)
+     384     417.97       8.49  (past listpack cap)
+     512     560.01       5.61  (past listpack cap)
+    1024    1111.00       6.01  (past listpack cap)
+
+## listpack-class (packed blob, linear scan, 16B members)
+    card    listpack         map
+       1       4.01       8.18
+       2       4.60       8.60
+       4       5.38       8.41
+       8       6.28       8.69
+      16       9.62      10.17
+      32      21.01      10.23
+      64      54.22      10.63
+      96      91.06      12.22
+     128     129.88      10.71
+     192     207.06      11.92  (past listpack cap)
+     256     282.05      11.05  (past listpack cap)
+     384     421.19      12.12  (past listpack cap)
+     512     560.54      10.48  (past listpack cap)
+    1024    1112.12      12.63  (past listpack cap)
+
+## listpack-class (packed blob, linear scan, 32B members)
+    card    listpack         map
+       1       4.96       9.38
+       2       5.26       9.89
+       4       5.97       9.40
+       8       7.12       9.56
+      16      10.40      10.89
+      32      21.36      11.71
+      64      55.48      11.86
+      96      92.75      12.64
+     128     130.57      11.13
+     192     209.02      12.83  (past listpack cap)
+     256     284.24      11.22  (past listpack cap)
+     384     419.84      13.05  (past listpack cap)
+     512     561.62      11.28  (past listpack cap)
+    1024    1112.24      13.09  (past listpack cap)
+
+## listpack-class (packed blob, linear scan, 64B members)
+    card    listpack         map
+       1       5.91      10.39
+       2       6.55      10.37
+       4       7.43      10.88
+       8       8.22      10.74
+      16      11.16      11.87
+      32      22.63      11.68
+      64      58.51      11.71
+      96      89.59      13.84
+     128     133.94      12.13
+     192     209.56      14.08  (past listpack cap)
+     256     284.25      12.33  (past listpack cap)
+     384     424.25      13.93  (past listpack cap)
+     512     563.56      12.16  (past listpack cap)
+    1024    1137.16      14.17  (past listpack cap)
+
+caps under test: intset 512, listpack entries 128, listpack value 64B
