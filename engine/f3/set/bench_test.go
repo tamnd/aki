@@ -37,8 +37,8 @@ func buildHT(keys [][]byte) *set {
 func benchIsMember(b *testing.B, n int, hit bool) {
 	keys := members16(n)
 	s := buildHT(keys)
-	if s.enc != encHashtable {
-		b.Fatalf("enc = %s, want hashtable", s.enc)
+	if s.enc != encHashtable && s.enc != encPartitioned {
+		b.Fatalf("enc = %s, want hashtable or partitioned", s.enc)
 	}
 	probes := members16(n)
 	if !hit {
@@ -106,8 +106,8 @@ func benchReg() *reg {
 
 func benchSRandMember(b *testing.B, n int) {
 	s := buildHT(members16(n))
-	if s.enc != encHashtable {
-		b.Fatalf("enc = %s, want hashtable", s.enc)
+	if s.enc != encHashtable && s.enc != encPartitioned {
+		b.Fatalf("enc = %s, want hashtable or partitioned", s.enc)
 	}
 	g := benchReg()
 	var sc [64]byte
