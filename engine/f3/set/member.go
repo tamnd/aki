@@ -110,6 +110,21 @@ func (h *htable) add(m []byte) bool {
 	return true
 }
 
+// addRaw inserts m without ever engaging or maintaining the algebra arrays. It
+// is the bulk-dedup insert the algebra driver uses to build a transient union
+// table (driver.go) and the STORE forms will reuse to build a destination: the
+// table is thrown away or rebuilt after, so paying the sorted-array tax on it
+// would be pure waste. It is add() minus the algebra branch, byte for byte.
+func (h *htable) addRaw(m []byte) bool {
+	hash := store.Hash(m)
+	if _, ok := h.tbl.Find(hash, m, h); ok {
+		return false
+	}
+	ord := h.newRecord(m)
+	h.tbl.Insert(hash, ord, h)
+	return true
+}
+
 // newRecord seats m's bytes in the slab, takes a record ordinal (reusing a freed
 // one first), and appends it to the draw vector.
 func (h *htable) newRecord(m []byte) uint32 {
@@ -167,6 +182,18 @@ func (h *htable) each(fn func(m []byte)) {
 	for _, ord := range h.vec {
 		r := &h.recs[ord]
 		fn(h.slab[r.loc : r.loc+uint32(r.mlen)])
+	}
+}
+
+// eachUntil visits members in draw-vector order until fn returns false, the
+// early-stop enumeration SINTERCARD's LIMIT walk rides. The []byte aliases the
+// slab and is valid only for the call.
+func (h *htable) eachUntil(fn func(m []byte) bool) {
+	for _, ord := range h.vec {
+		r := &h.recs[ord]
+		if !fn(h.slab[r.loc : r.loc+uint32(r.mlen)]) {
+			return
+		}
 	}
 }
 
