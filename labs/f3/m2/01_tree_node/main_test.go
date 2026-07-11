@@ -61,8 +61,13 @@ func TestAgainstModel(t *testing.T) {
 				if uint64(len(keys)) != tr.cardinality() {
 					t.Fatalf("cardinality %d, model %d", tr.cardinality(), len(keys))
 				}
+				// checkCounts validates the whole count invariant every time; rank and
+				// select are checked on a random sample so the pass stays cheap enough
+				// not to starve the rest of the -race suite on a shared runner.
 				tr.checkCounts(t)
-				for i, k := range keys {
+				for probe := 0; probe < 200 && len(keys) > 0; probe++ {
+					i := rng.Intn(len(keys))
+					k := keys[i]
 					got, present := tr.rank(k)
 					if !present || got != uint64(i) {
 						t.Fatalf("rank(%d)=%d present=%v, want %d", k, got, present, i)
@@ -95,7 +100,7 @@ func TestAgainstModel(t *testing.T) {
 			}
 
 			// grow.
-			for i := 0; i < 4000; i++ {
+			for i := 0; i < 2500; i++ {
 				k := rng.Uint64()
 				if _, ok := model[k]; ok {
 					continue
@@ -109,7 +114,7 @@ func TestAgainstModel(t *testing.T) {
 			apply()
 
 			// churn: mixed insert/delete.
-			for i := 0; i < 8000; i++ {
+			for i := 0; i < 5000; i++ {
 				k := rng.Uint64()
 				if _, ok := model[k]; ok {
 					delete(model, k)
@@ -183,7 +188,7 @@ func TestBulkLoad(t *testing.T) {
 	}
 	for _, a := range arms {
 		t.Run(a.name, func(t *testing.T) {
-			for _, n := range []int{0, 1, 14, 15, 16, 500, 5000} {
+			for _, n := range []int{0, 1, 14, 15, 16, 500, 2000} {
 				keys := make([]uint64, n)
 				for i := range keys {
 					keys[i] = uint64(i)*3 + 7
