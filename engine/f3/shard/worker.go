@@ -306,6 +306,15 @@ func (w *worker) executeOne() int {
 		}
 	}
 
+	// A node holding commands deferred behind queued intents (txnroute.go)
+	// stays with the owner: its executed replies are written but the node
+	// cannot go back until every parked command has run, and runDeferred
+	// pushes it when the last one does. Streams of the executed commands were
+	// adopted above; deferred slots are still nil there.
+	if b.deferN > 0 {
+		return n
+	}
+
 	// Flush: the whole node goes back on the connection's outbound queue with
 	// one atomic push, and the writer is woken by the section 9.1 rule, with
 	// two coalescing refinements. The wake-skip invariant: a wake may be
@@ -387,10 +396,30 @@ func (w *worker) noteLoop(l LoopWaker) {
 	w.loops = append(w.loops, l)
 }
 
-// execute runs one command through the registered handler table. OpError is
-// the one shard builtin: it echoes the message the dispatcher routed, keeping
-// parse-side errors in pipeline order.
+// execute runs one command, after the two tier-two gates in front of the
+// handler table: OpTxnArm enqueues its intent in inbound order (txnroute.go),
+// and a keyed command touching a key with queued intents parks until they
+// release. A shard with no queued intents pays one map length check per keyed
+// command here and nothing else.
 func (w *worker) execute(b *hopBatch, i int) {
+	c := &b.cmds[i]
+	if c.op == OpTxnArm {
+		w.armIntent(b, i)
+		return
+	}
+	if len(w.keyQ) != 0 && c.keyed && w.deferForIntent(b, i) {
+		return
+	}
+	w.executeCmd(b, i)
+}
+
+// executeCmd runs one command through the registered handler table, with no
+// tier-two gates: execute calls it on the drain path and runDeferred calls it
+// when a parked command's awaited intents have released (re-checking would
+// re-park it behind transactions that armed after it arrived). OpError is the
+// one builtin here: it echoes the message the dispatcher routed, keeping
+// parse-side errors in pipeline order.
+func (w *worker) executeCmd(b *hopBatch, i int) {
 	c := &b.cmds[i]
 	r := Reply{b: b, i: i}
 	if c.op == OpError {
