@@ -20,13 +20,13 @@ import (
 // storeInter, storeUnion, storeDiff run the three STORE builds the handlers run,
 // returning the freshly built destination set (nil for an empty result).
 func storeInter(sets []*set) *set {
-	return storeResult(minCard(sets), func(e func([]byte)) { sinter(sets, e) })
+	return storeResult(minCard(sets), func(e func([]byte)) { sinter(nil, sets, e) })
 }
 func storeUnion(sets []*set) *set {
 	return storeResult(totalCard(sets), func(e func([]byte)) { unionInto(sets, e) })
 }
 func storeDiff(sets []*set) *set {
-	return storeResult(firstCard(sets), func(e func([]byte)) { sdiff(sets, e) })
+	return storeResult(firstCard(sets), func(e func([]byte)) { sdiff(nil, sets, e) })
 }
 
 // storeMembers returns the destination set's members sorted, nil for a deleted
@@ -123,11 +123,11 @@ func applyStore(t *testing.T, cx *shard.Ctx, g *reg, op string, dest string, src
 	var result *set
 	switch op {
 	case "inter":
-		result = storeResult(minCard(sets), func(e func([]byte)) { sinter(sets, e) })
+		result = storeResult(minCard(sets), func(e func([]byte)) { sinter(nil, sets, e) })
 	case "union":
 		result = storeResult(totalCard(sets), func(e func([]byte)) { unionInto(sets, e) })
 	case "diff":
-		result = storeResult(firstCard(sets), func(e func([]byte)) { sdiff(sets, e) })
+		result = storeResult(firstCard(sets), func(e func([]byte)) { sdiff(nil, sets, e) })
 	}
 	return place(cx, g, []byte(dest), result)
 }

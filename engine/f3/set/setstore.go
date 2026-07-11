@@ -150,7 +150,7 @@ func Sinterstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	// Presize from the smallest source: the intersection cannot exceed it
 	// (setmergecollect, doc 11 section 6.4).
-	result := storeResult(minCard(sets), func(emit func(m []byte)) { sinter(sets, emit) })
+	result := storeResult(minCard(sets), func(emit func(m []byte)) { sinter(cx, sets, emit) })
 	r.Int(int64(place(cx, g, args[0], result)))
 }
 
@@ -181,7 +181,7 @@ func Sdiffstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	// The diff cannot exceed the first source, which drives the walk.
-	result := storeResult(firstCard(sets), func(emit func(m []byte)) { sdiff(sets, emit) })
+	result := storeResult(firstCard(sets), func(emit func(m []byte)) { sdiff(cx, sets, emit) })
 	r.Int(int64(place(cx, g, args[0], result)))
 }
 

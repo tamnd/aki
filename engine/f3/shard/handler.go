@@ -43,6 +43,11 @@ type Ctx struct {
 	// the Coll comment anticipates; the keyspace-unification slice folds both
 	// into one shared holder. Owner-only, so no lock.
 	ZColl any
+
+	// w is the owning worker, the seam FanOut (donate.go) reaches the pool
+	// through. It is nil on a bare Ctx built outside a runtime (tests), where
+	// FanOut runs its tasks inline.
+	w *worker
 }
 
 // Handler executes one command against its shard. args are views into the hop
