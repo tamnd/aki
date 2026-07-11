@@ -153,9 +153,10 @@ func init() {
 	register("GETRANGE", str.GetRange, 3, 3, true)
 	register("SUBSTR", str.GetRange, 3, 3, true)
 
-	// The set surface (spec 2064/f3/11 M1, inline band). Point ops, draws,
-	// enumeration, and the inline SSCAN, plus OBJECT ENCODING for the
-	// differential encoding check. Handlers validate their own tails.
+	// The set surface (spec 2064/f3/11 M1). Point ops, draws, streamed
+	// SMEMBERS, the downward-cursor SSCAN over all three bands, plus OBJECT
+	// ENCODING for the differential encoding check. Handlers validate their
+	// own tails.
 	register("SADD", set.Sadd, 2, -1, true)
 	register("SREM", set.Srem, 2, -1, true)
 	register("SISMEMBER", set.Sismember, 2, 2, true)
