@@ -48,7 +48,27 @@ type Ctx struct {
 	// through. It is nil on a bare Ctx built outside a runtime (tests), where
 	// FanOut runs its tasks inline.
 	w *worker
+
+	// curConn and curSeq name the command the worker is running right now: its
+	// originating connection and its per-connection reply sequence. The worker
+	// sets them just before each handler call, so a command that decides to
+	// block reads its own completion target through CurConn and CurSeq and hands
+	// them to whatever later owner step (a serving push, a firing timer) finishes
+	// the reply. They are valid only for the duration of the handler call and
+	// only on the owner goroutine; nothing off the owner may read them.
+	curConn *Conn
+	curSeq  uint32
 }
+
+// CurConn is the connection the running command belongs to, the completion
+// target a blocking command captures for its later CompleteBlocked. Owner
+// goroutine only, valid only during the handler call.
+func (cx *Ctx) CurConn() *Conn { return cx.curConn }
+
+// CurSeq is the running command's per-connection reply sequence, the slot its
+// deferred reply must land at when a later owner step completes it. Owner
+// goroutine only, valid only during the handler call.
+func (cx *Ctx) CurSeq() uint32 { return cx.curSeq }
 
 // Handler executes one command against its shard. args are views into the hop
 // node, valid for the duration of the call; a keyed command's args[0] is its
@@ -108,3 +128,12 @@ func (r Reply) Null() {
 	r.b.rep = resp.AppendNull(r.b.rep)
 	r.span(off)
 }
+
+// Park declares this command produced no reply now: it decided to block, and a
+// later owner step (a serving push, a firing timer) delivers its reply at this
+// sequence through conn.CompleteBlocked. The slot is marked so DrainReplies
+// skips it without advancing the reorder cursor, stalling every later reply in
+// the ring until the parked sequence is completed. No span is recorded, so
+// reply(i) is never read for a parked slot. Owner goroutine only; exactly one of
+// Park or a reply-writing method per command.
+func (r Reply) Park() { r.b.setParked(r.i) }

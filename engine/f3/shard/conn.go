@@ -62,6 +62,15 @@ type Conn struct {
 	emitted atomic.Uint32 // writer's progress, read by the reader's throttle
 	closed  atomic.Bool
 
+	// blockAt arms the reader-side connection barrier: it holds one past the
+	// sequence of a blocking command the reader dispatched, or zero when none is
+	// outstanding. Blocked() compares it against the writer's emitted watermark, so
+	// the barrier disarms itself the moment that command's reply goes out, whether
+	// the command served immediately or its Park was completed later. Written by the
+	// reader (ArmBlock), read by the reader, which also reads emitted, the same
+	// cross-goroutine load CanEnqueue makes. Reader side.
+	blockAt atomic.Uint32
+
 	// published is the reader's issued-sequence watermark at its last publish:
 	// the value of seq the last time a node went onto a shard queue. Some
 	// commands below it may still sit in other shards' pending nodes at that
@@ -176,6 +185,22 @@ func (c *Conn) SetWriterBatchNotify(loop LoopWaker, mark func() bool) {
 func (c *Conn) CanEnqueue() bool {
 	return c.seq-c.emitted.Load() < uint32(len(c.ring))
 }
+
+// ArmBlock arms the reader-side barrier after a blocking verb has enqueued: the
+// dispatcher calls it once the command's Do has advanced c.seq, so the stored
+// value is one past the command's own sequence. Blocked() then reads that
+// barrier against the writer's emit watermark until the command's reply goes
+// out. Reader side only.
+func (c *Conn) ArmBlock() { c.blockAt.Store(c.seq) }
+
+// Blocked reports whether a blocking command the reader dispatched is still
+// waiting for its reply: the emit watermark has not yet reached the armed
+// barrier. The reader consults it where it consults CanEnqueue, and the barrier
+// disarms itself implicitly, because emitted crossing blockAt flips the compare
+// whether the command served immediately or its Park was completed later. The
+// comparison is the wrap-safe signed difference, the same idiom Owes uses.
+// Reader side only.
+func (c *Conn) Blocked() bool { return int32(c.blockAt.Load()-c.emitted.Load()) > 0 }
 
 // ParkWriter arms the writer-side wake for a notifier-driven consumer and
 // reports whether it parked clean: it stores parked, then re-checks the
@@ -493,6 +518,12 @@ func (c *Conn) DrainReplies(emit func([]byte)) int {
 			return n
 		}
 		for i := 0; i < int(b.n); i++ {
+			if b.blocked(i) {
+				// Parked (Reply.Park): no reply now, and c.next must NOT advance past this
+				// sequence. Its reply arrives later on a CompleteBlocked loopback node;
+				// until then every later reply parks in the ring behind it.
+				continue
+			}
 			if fc := b.fan(i); fc != nil {
 				n += c.mergeFan(fc, b.cmds[i].seq, b, i, emit)
 				continue
@@ -572,6 +603,25 @@ func (c *Conn) drainParked(emit func([]byte)) int {
 		}
 		c.next++
 		n++
+	}
+}
+
+// CompleteBlocked delivers a blocking command's deferred reply: a loopback node
+// carrying rep at the parked command's sequence goes onto the outbound queue,
+// where the writer reorders it like any owner-produced reply, so the reply that
+// Reply.Park held open lands at its original pipeline slot. It is the general
+// form of finishTxn (txnroute.go): the later owner step that serves the block (a
+// push that satisfies a BLPOP, a firing timeout) calls it with the seq and conn
+// the handler captured through CurSeq and CurConn. The free-list channel and the
+// outbound MPSC are both safe from that goroutine, and the wake-skip rule is the
+// same one every producer follows (see flushShard).
+func (c *Conn) CompleteBlocked(seq uint32, rep []byte) {
+	b := c.take()
+	b.add(opBlockDone, seq, false, nil)
+	r := Reply{b: b, i: 0}
+	r.Raw(rep)
+	if c.out.push(b) {
+		c.wk.wake()
 	}
 }
 

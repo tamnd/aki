@@ -11,6 +11,13 @@ import (
 // gives meaning to; the shard layer never interprets them.
 const OpError byte = 0xff
 
+// opBlockDone marks a blocking command's loopback reply node: CompleteBlocked
+// puts the finished bytes at the parked command's sequence, and the reorder ring
+// slots it exactly like an owner reply. It is the deferred-reply twin of
+// OpTxnArm and travels only on the outbound queue, where the op is never read; a
+// distinct byte from OpTxnArm keeps the two loopback paths separable.
+const opBlockDone byte = 0xfd
+
 // hopCmd is one routed command inside a batch node: the per-connection reply
 // sequence, the op, and the command's argument run inside the node's span
 // table. A keyed command's first argument is its key, which is what routing
@@ -69,6 +76,15 @@ type hopBatch struct {
 	streams   []*stream
 	hasStream bool
 
+	// parked marks which commands called Reply.Park: a true entry means the handler
+	// wrote no reply and DrainReplies must skip the slot without advancing the
+	// reorder cursor, so the reply the command's CompleteBlocked loopback node
+	// carries lands at its sequence. Same lazy-slice-plus-flag shape as fans and
+	// streams: nil until a connection's first park, hasParked keeps reset and the
+	// drain loop free on the point-op path.
+	parked    []bool
+	hasParked bool
+
 	// deferN counts this node's commands parked behind queued intents
 	// (txnroute.go). While it is non-zero the node stays with its owner;
 	// runDeferred pushes it to the connection when the count hits zero.
@@ -98,6 +114,12 @@ func (b *hopBatch) reset() {
 			b.streams[i] = nil
 		}
 		b.hasStream = false
+	}
+	if b.hasParked {
+		for i := range b.parked {
+			b.parked[i] = false
+		}
+		b.hasParked = false
 	}
 	b.n = 0
 	b.sn = 0
@@ -146,6 +168,26 @@ func (b *hopBatch) stream(i int) *stream {
 		return nil
 	}
 	return b.streams[i]
+}
+
+// setParked marks command i as blocked: it wrote no reply, and DrainReplies
+// skips its slot until a CompleteBlocked loopback node fills the sequence.
+func (b *hopBatch) setParked(i int) {
+	if b.parked == nil {
+		b.parked = make([]bool, batchCap)
+	}
+	b.parked[i] = true
+	b.hasParked = true
+}
+
+// blocked reports whether command i called Reply.Park, so the drain loop reads
+// it symmetric with fan(i) and stream(i). The hasParked gate keeps the check a
+// single flag load on the point-op path.
+func (b *hopBatch) blocked(i int) bool {
+	if !b.hasParked {
+		return false
+	}
+	return b.parked[i]
 }
 
 // add appends one command, copying its arguments into the node's data buffer.

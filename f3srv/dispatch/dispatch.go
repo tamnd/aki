@@ -37,6 +37,10 @@ type entry struct {
 	// must be the ASYNC or SYNC token, anything else is a syntax error.
 	flushOpt bool
 
+	// blocks is set on a blocking verb (BLPOP and kin) so the reader arms the
+	// connection barrier after enqueuing it; wired in the slice-8 blocking PR.
+	blocks bool
+
 	// cross is the tier-two cross-shard route (spec 2064/f3/03 section 6.7):
 	// a command whose keys land on different shards leaves the point path and
 	// runs cross under an intent transaction holding every key. Co-located
@@ -401,6 +405,12 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 		// The command never entered a node, so the error reply can take its
 		// pipeline slot and the connection lives on.
 		return oops(c, "ERR command too large")
+	}
+	if err == nil && e.blocks {
+		// A blocking verb enqueued: arm the reader-side barrier now that Do has
+		// advanced the sequence. No verb sets blocks in this slice, so this never
+		// fires; the wiring lands with BLPOP.
+		c.ArmBlock()
 	}
 	return err
 }
