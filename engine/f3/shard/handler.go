@@ -70,6 +70,31 @@ func (cx *Ctx) CurConn() *Conn { return cx.curConn }
 // goroutine only, valid only during the handler call.
 func (cx *Ctx) CurSeq() uint32 { return cx.curSeq }
 
+// ArmTimer schedules fire to run on this shard's owner at deadlineMs (unix-ms),
+// the deadline a blocking command with a finite timeout sets so its timeout
+// reply is delivered even if no serving push arrives. It returns a handle the
+// command cancels with CancelTimer when it is served first. Owner goroutine
+// only. On a bare Ctx built outside a runtime (cx.w == nil, the test-built Ctx)
+// it arms nothing and returns nil; the real driver always has cx.w set, and
+// CancelTimer is a no-op on a nil handle, so the contract stays total.
+func (cx *Ctx) ArmTimer(deadlineMs int64, fire func(cx *Ctx)) *timer {
+	if cx.w == nil {
+		return nil
+	}
+	return cx.w.timers.push(deadlineMs, fire)
+}
+
+// CancelTimer removes a timer the command armed, when the command is served
+// before its deadline. It is idempotent and nil-safe: a handle already fired or
+// already cancelled, or the nil ArmTimer returns on a bare Ctx, is a no-op.
+// Owner goroutine only.
+func (cx *Ctx) CancelTimer(t *timer) {
+	if cx.w == nil || t == nil {
+		return
+	}
+	cx.w.timers.remove(t)
+}
+
 // Handler executes one command against its shard. args are views into the hop
 // node, valid for the duration of the call; a keyed command's args[0] is its
 // key. Exactly one reply must be written through r.

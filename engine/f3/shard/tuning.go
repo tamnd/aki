@@ -78,6 +78,18 @@ const (
 	// deferred token.
 	drainPassCap = 32
 
+	// timerFireCap bounds one worker timer-fire pass: fireTimers runs at most
+	// this many due deadlines back to back before returning to command
+	// processing, the sibling of drainPassCap for the deadline heap. It is off
+	// the throughput path entirely (a worker fires a timer only when a blocking
+	// command's finite timeout elapses), so the cap is not a P1 term; it only
+	// caps how long a burst of simultaneous timeouts can hold the loop, and a
+	// pass that hits it leaves the rest for the next pass. The lab swept {16, 32,
+	// 64, 128}: past 64 the per-pass fire cost stops shrinking the tail delivery
+	// and only lengthens the single pass, so 64 is the knee. Lab:
+	// labs/f3/m3/05_timer_park.
+	timerFireCap = 64
+
 	// replyRing is a connection's pipeline window: the reply reorder ring holds
 	// this many in-flight replies, and a producer past the window blocks on the
 	// writer's progress. The doc 03 section 4.5 watermarks refine this into
