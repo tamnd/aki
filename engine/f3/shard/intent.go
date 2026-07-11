@@ -144,6 +144,11 @@ func (q *opQueue) pop() *intentOp {
 type keyList struct {
 	front     *intent
 	published *intent
+
+	// waiters are the point commands deferred behind this key's intents
+	// (txnroute.go): each parked against the intents present when it arrived
+	// and run by wakeDeferred when the last of them releases.
+	waiters []*defCmd
 }
 
 // intentDrainCap bounds how many intent ops a worker applies per loop turn, the
@@ -323,7 +328,15 @@ func (w *worker) releaseIntent(in *intent) {
 		q.published = nil
 	}
 	in.head.Store(false)
+	// Run the point commands this release unblocks before the next head
+	// publishes: a waiter whose await set empties here executes ahead of any
+	// lock the new head's transaction will post, so deferred traffic lands
+	// between critical sections, never inside one.
+	w.wakeDeferred(q, in)
 	if q.front == nil {
+		// Any waiter still parked awaits other keys' intents only (its await
+		// entries for this queue died with their releases) and is reachable
+		// through those keys' lists, so the entry can go.
 		delete(w.keyQ, in.key)
 		return
 	}
@@ -394,6 +407,19 @@ func (r *Runtime) nextTicket() uint64 {
 // the transaction still rides the substrate correctly, the single-shard
 // degenerate case the parser will later shortcut to a plain batch.
 func (r *Runtime) Begin(keys [][]byte) *Txn {
+	t := r.newTxn(keys)
+	for _, in := range t.intents {
+		r.workers[in.shard].postIntent(&intentOp{kind: opEnqueue, in: in})
+	}
+	return t
+}
+
+// newTxn builds the transaction without enqueueing anything: the ticket and
+// the shard-sorted intents. Begin posts the enqueues through the intent
+// control queues; DoTxn (txnroute.go) instead arms each intent through the
+// inbound hop path so the enqueue is ordered against the connection's point
+// traffic.
+func (r *Runtime) newTxn(keys [][]byte) *Txn {
 	t := &Txn{rt: r, ticket: r.nextTicket(), sig: make(chan struct{}, 1)}
 	seen := make(map[string]struct{}, len(keys))
 	for _, k := range keys {
@@ -413,9 +439,6 @@ func (r *Runtime) Begin(keys [][]byte) *Txn {
 	// and matches the deadlock-free schedule. A stable sort keeps distinct keys
 	// on one shard in their first-seen order.
 	sortByShard(t.intents)
-	for _, in := range t.intents {
-		r.workers[in.shard].postIntent(&intentOp{kind: opEnqueue, in: in})
-	}
 	return t
 }
 
