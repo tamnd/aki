@@ -71,3 +71,59 @@ func checkZero(t *testing.T, name string, fn func()) {
 		t.Errorf("%s allocated %v times per run, want 0", name, n)
 	}
 }
+
+// The native deque's edge ops must be allocation-free in steady state too (spec
+// 2064/f3/13 section 2.5): a push into an established end chunk is a uvarint
+// write plus a copy into the resident blob, and a pop advances a cursor and
+// reclaims the just-pushed frame, so a push/pop pair neither seals a chunk nor
+// pulls one off the freelist. The lists are warmed past the inline budget so
+// they carry many chunks, the shape the gate measures.
+
+// warmNativeTail builds a multi-chunk deque and settles its tail chunk with a
+// push/pop cycle so the measured RPUSH+RPOP pair runs over a stable end chunk.
+func warmNativeTail() *native {
+	nt := &native{}
+	for i := 0; i < 400; i++ {
+		nt.pushBack([]byte("elem"))
+	}
+	for i := 0; i < 8; i++ {
+		nt.pushBack([]byte("elem"))
+		nt.popBack()
+	}
+	return nt
+}
+
+// warmNativeHead establishes a head chunk with a buffer of elements so the
+// measured LPUSH+LPOP pair runs over a stable head chunk that never drains.
+func warmNativeHead() *native {
+	nt := &native{}
+	for i := 0; i < 400; i++ {
+		nt.pushBack([]byte("elem"))
+	}
+	for i := 0; i < 32; i++ {
+		nt.pushFront([]byte("elem"))
+	}
+	for i := 0; i < 8; i++ {
+		nt.pushFront([]byte("elem"))
+		nt.popFront()
+	}
+	return nt
+}
+
+func TestZeroAllocNativePushPopBack(t *testing.T) {
+	nt := warmNativeTail()
+	v := []byte("elem")
+	checkZero(t, "RPUSH+RPOP native", func() {
+		nt.pushBack(v)
+		sinkBytes = nt.popBack()
+	})
+}
+
+func TestZeroAllocNativePushPopFront(t *testing.T) {
+	nt := warmNativeHead()
+	v := []byte("elem")
+	checkZero(t, "LPUSH+LPOP native", func() {
+		nt.pushFront(v)
+		sinkBytes = nt.popFront()
+	})
+}

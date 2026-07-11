@@ -59,7 +59,7 @@ func (l *list) popBack() []byte {
 // next write.
 func (l *list) get(i int) []byte {
 	if l.nat != nil {
-		return l.nat.elems[i]
+		return l.nat.at(i)
 	}
 	return l.inlineAt(i)
 }
@@ -67,7 +67,7 @@ func (l *list) get(i int) []byte {
 // setAt overwrites the element at index i.
 func (l *list) setAt(i int, v []byte) {
 	if l.nat != nil {
-		l.nat.elems[i] = cloneBytes(v)
+		l.nat.setAt(i, v)
 		return
 	}
 	elems := l.inlineDecode()
@@ -109,9 +109,7 @@ func (l *list) insert(before bool, pivot, v []byte) bool {
 // match.
 func (l *list) remove(count int, v []byte) int {
 	if l.nat != nil {
-		kept, removed := removeMatches(l.nat.elems, count, v)
-		l.nat.elems = kept
-		return removed
+		return l.nat.remove(count, v)
 	}
 	elems := l.inlineDecode()
 	kept, removed := removeMatches(elems, count, v)
@@ -163,14 +161,8 @@ func removeMatches(elems [][]byte, count int, v []byte) ([][]byte, int) {
 // caller; an empty range clears the list.
 func (l *list) trim(start, stop int) int {
 	if l.nat != nil {
-		if start > stop {
-			l.nat.elems = l.nat.elems[:0]
-			return 0
-		}
-		kept := make([][]byte, stop-start+1)
-		copy(kept, l.nat.elems[start:stop+1])
-		l.nat.elems = kept
-		return len(l.nat.elems)
+		l.nat.trim(start, stop)
+		return l.nat.count
 	}
 	if start > stop {
 		l.reset()
@@ -186,9 +178,7 @@ func (l *list) trim(start, stop int) int {
 // by the whole-list replies (LRANGE 0 -1) and the differential harness.
 func (l *list) each(fn func(v []byte)) {
 	if l.nat != nil {
-		for _, e := range l.nat.elems {
-			fn(e)
-		}
+		l.nat.each(fn)
 		return
 	}
 	for _, e := range l.inlineDecode() {
