@@ -39,6 +39,16 @@ type htable struct {
 	vec  []uint32      // draw vector: live record ordinals, the swap-remove target
 	free []uint32      // ordinals of removed records, reused before the slab grows
 	dead int           // slab bytes behind removed records, drives compaction
+
+	// streams counts the SMEMBERS enumerations pumping off this table right
+	// now. A streamed reply reads member bytes straight from the live slab
+	// through a snapshot of the ordinals it took at command time (smembers.go),
+	// so while any stream is open the table must not move those bytes or reuse a
+	// freed record slot out from under it: record reuse and slab compaction both
+	// stand down until the last stream drains. This is the set's echo of the
+	// store's openStreams arena pin (doc 11 section 8.1), the only price the
+	// downward-vector enumeration pays for not copying the members.
+	streams int
 }
 
 // newHashtable builds an empty table sized for hint members, so a band
@@ -93,7 +103,10 @@ func (h *htable) newRecord(m []byte) uint32 {
 	h.slab = append(h.slab, m...)
 
 	var ord uint32
-	if n := len(h.free); n > 0 {
+	if n := len(h.free); n > 0 && h.streams == 0 {
+		// A freed slot is reused only when no enumeration is mid-flight: a
+		// streamed SMEMBERS may still be reading the member whose record this
+		// slot once was, so reuse waits for it to drain (see the streams field).
 		ord = h.free[n-1]
 		h.free = h.free[:n-1]
 		h.recs[ord] = record{loc: loc, vslot: uint32(len(h.vec)), mlen: uint16(len(m))}
@@ -144,12 +157,47 @@ func (h *htable) at(i int) []byte {
 	return h.slab[r.loc : r.loc+uint32(r.mlen)]
 }
 
+// vlen is the draw vector length, the high bound the SSCAN downward cursor and
+// the SMEMBERS snapshot both start from.
+func (h *htable) vlen() int { return len(h.vec) }
+
+// ordAt is the record ordinal at draw-vector index i, the stable handle the
+// SMEMBERS snapshot copies so a later swap-remove reordering the live vector
+// cannot disturb the enumeration.
+func (h *htable) ordAt(i int) uint32 { return h.vec[i] }
+
+// memberByOrd returns the bytes of the member at record ordinal ord, aliasing
+// the slab. It is how a streamed enumeration reads a snapshotted ordinal; the
+// streams pin keeps the slab and the record valid for the read.
+func (h *htable) memberByOrd(ord uint32) []byte {
+	r := &h.recs[ord]
+	return h.slab[r.loc : r.loc+uint32(r.mlen)]
+}
+
+// mlenByOrd is memberByOrd's length alone, for presizing a reply without
+// touching the member bytes.
+func (h *htable) mlenByOrd(ord uint32) int { return int(h.recs[ord].mlen) }
+
+// pinStream and unpinStream bracket an open enumeration (SMEMBERS stream): the
+// pin freezes record reuse and slab compaction, the unpin releases them when
+// the last stream drains. Both run on the owner goroutine, the pin at command
+// time and the unpin from the stream's Release on the pump.
+func (h *htable) pinStream()   { h.streams++ }
+func (h *htable) unpinStream() { h.streams-- }
+
 // maybeCompact rewrites the slab when removed members leave more dead bytes than
 // live ones, so churn cannot grow the slab without bound. The real hole-punching
 // arena is the store's job (doc 11 section 2.4); this keeps the standalone band
 // honest until that lands. Compaction is an amortized maintenance event, not a
 // steady-path cost.
 func (h *htable) maybeCompact() {
+	if h.streams > 0 {
+		// An open enumeration is reading loc offsets into the live slab; moving
+		// bytes now would slide them under it. Compaction resumes once the last
+		// stream drains, and the dead bytes it leaves are bounded by the window
+		// it stays open for.
+		return
+	}
 	if h.dead <= len(h.slab)/2 || h.dead < 4096 {
 		return
 	}
