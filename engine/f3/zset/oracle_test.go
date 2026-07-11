@@ -208,16 +208,36 @@ func TestRebuildReclaims(t *testing.T) {
 	}
 }
 
+// itoa formats an int, negatives included: live rows send arguments like
+// LIMIT 2 -1 and ZRANDMEMBER key -5, and a formatter that returned "" for a
+// negative would quietly put an empty argument on the wire and test nothing.
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
 	}
-	var b [12]byte
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [13]byte
 	i := len(b)
 	for n > 0 {
 		i--
 		b[i] = byte('0' + n%10)
 		n /= 10
 	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
 	return string(b[i:])
+}
+
+func TestItoa(t *testing.T) {
+	cases := map[int]string{0: "0", 7: "7", 42: "42", -1: "-1", -5: "-5", -1234: "-1234", 100000: "100000"}
+	for n, want := range cases {
+		if got := itoa(n); got != want {
+			t.Errorf("itoa(%d) = %q, want %q", n, got, want)
+		}
+	}
 }
