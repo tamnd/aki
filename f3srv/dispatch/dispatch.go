@@ -37,12 +37,15 @@ type entry struct {
 	flushOpt bool
 
 	// cross is the tier-two cross-shard route (spec 2064/f3/03 section 6.7):
-	// a two-key write whose keys land on different shards leaves the point
-	// path and runs cross under an intent transaction holding args[0] and
-	// args[1] of its tail. Co-located keys keep the point path, the free
-	// single-shard case. SMOVE is the first rider; RENAME, COPY, and LMOVE
-	// join with their slices.
-	cross func(t *shard.Txn, args [][]byte) []byte
+	// a command whose keys land on different shards leaves the point path and
+	// runs cross under an intent transaction holding every key. Co-located
+	// keys keep the point path, the free single-shard case. crossKeys extracts
+	// the command's keys from its argument tail for the co-location check and
+	// the transaction's intent list; nil from it (a malformed tail) keeps the
+	// point path, which answers the parse error in place. SMOVE and the set
+	// algebra reads ride this; RENAME, COPY, and LMOVE join with their slices.
+	cross     func(t *shard.Txn, args [][]byte) []byte
+	crossKeys func(args [][]byte) [][]byte
 }
 
 // maxVerb bounds the uppercase scratch for verb lookup; no Redis verb comes
@@ -176,15 +179,27 @@ func init() {
 	register("SRANDMEMBER", set.Srandmember, 1, 2, true)
 	register("SSCAN", set.Sscan, 2, -1, true)
 	// The multi-key algebra surface (spec 2064/f3/11 section 6). SINTER, SUNION,
-	// and SDIFF key on their first operand and read the rest from the same
-	// shard's registry. SINTERCARD leads with numkeys, so its routing key is the
-	// argument after it: keyAt=1 sends it to the first operand's shard, the same
-	// route OBJECT uses for its post-subcommand key.
+	// and SDIFF key on their first operand; co-located operands read from that
+	// shard's registry on the point path, and operands spanning shards take the
+	// F17 gather route under an intent transaction (set/gathercross.go).
+	// SINTERCARD leads with numkeys, so its routing key is the argument after
+	// it: keyAt=1 sends it to the first operand's shard, the same route OBJECT
+	// uses for its post-subcommand key; its cross keys come from the same tail
+	// parse the handler runs.
+	allKeys := func(a [][]byte) [][]byte { return a }
 	register("SINTER", set.Sinter, 1, -1, true)
+	table["SINTER"].cross = set.SinterCross
+	table["SINTER"].crossKeys = allKeys
 	register("SUNION", set.Sunion, 1, -1, true)
+	table["SUNION"].cross = set.SunionCross
+	table["SUNION"].crossKeys = allKeys
 	register("SDIFF", set.Sdiff, 1, -1, true)
+	table["SDIFF"].cross = set.SdiffCross
+	table["SDIFF"].crossKeys = allKeys
 	register("SINTERCARD", set.Sintercard, 2, -1, false)
 	table["SINTERCARD"].keyAt = 1
+	table["SINTERCARD"].cross = set.SintercardCross
+	table["SINTERCARD"].crossKeys = set.SintercardKeys
 	// The STORE forms (spec 2064/f3/11 section 7) write the result to the
 	// destination and read the sources, so they key on the destination (args[0])
 	// for routing, the same first-argument route SADD uses; the sources are read
@@ -205,6 +220,7 @@ func init() {
 	table["SMOVE"].cross = func(t *shard.Txn, a [][]byte) []byte {
 		return set.SmoveCross(t, a[0], a[1], a[2])
 	}
+	table["SMOVE"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 	// The zset surface (spec 2064/f3/12 M2 slice 1). Point ops, ZINCRBY, ZREM,
 	// rank, and ZRANGE by index over the inline band, all keyed on the first
 	// argument the same way SADD is. Handlers validate their own tails.
@@ -307,8 +323,10 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 	if e.fan != 0 && (e.fanOnly || n > 1) {
 		return dispatchFan(c, e, args)
 	}
-	if e.cross != nil && !c.SameShard(args[1], args[2]) {
-		return dispatchCross(c, e, args)
+	if e.cross != nil {
+		if keys := e.crossKeys(args[1:]); len(keys) > 1 && !colocated(c, keys) {
+			return dispatchCross(c, e, args)
+		}
 	}
 	if e.keyAt > 0 && n > e.keyAt {
 		// A verb whose routing key is not its first argument (OBJECT) goes to
@@ -367,9 +385,20 @@ func dispatchFan(c *shard.Conn, e *entry, args [][]byte) error {
 	return err
 }
 
-// dispatchCross routes one tier-two command whose two keys span shards: the
+// colocated reports whether every key routes to one shard, the check that
+// keeps a tier-two command on its free single-shard fast path.
+func colocated(c *shard.Conn, keys [][]byte) bool {
+	for _, k := range keys[1:] {
+		if !c.SameShard(keys[0], k) {
+			return false
+		}
+	}
+	return true
+}
+
+// dispatchCross routes one tier-two command whose keys span shards: the
 // argument tail is copied (the transaction body runs on its own goroutine
-// after these parser views die) and DoTxn arms intents on both keys, runs
+// after these parser views die) and DoTxn arms intents on every key, runs
 // e.cross under the barrier, and delivers the reply at this command's
 // pipeline slot. Cross-shard tier-two traffic is rare, so the copies are off
 // every hot path.
@@ -378,7 +407,7 @@ func dispatchCross(c *shard.Conn, e *entry, args [][]byte) error {
 	for i := range a {
 		a[i] = append([]byte(nil), args[i+1]...)
 	}
-	err := c.DoTxn([][]byte{a[0], a[1]}, func(t *shard.Txn) []byte {
+	err := c.DoTxn(e.crossKeys(a), func(t *shard.Txn) []byte {
 		return e.cross(t, a)
 	})
 	if err == shard.ErrTooBig {

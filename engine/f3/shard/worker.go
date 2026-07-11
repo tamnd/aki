@@ -398,16 +398,18 @@ func (w *worker) noteLoop(l LoopWaker) {
 
 // execute runs one command, after the two tier-two gates in front of the
 // handler table: OpTxnArm enqueues its intent in inbound order (txnroute.go),
-// and a keyed command touching a key with queued intents parks until they
-// release. A shard with no queued intents pays one map length check per keyed
-// command here and nothing else.
+// and a command touching a key with queued intents parks until they release.
+// Every command checks, keyed or not: DoAt-routed verbs (OBJECT, SINTERCARD)
+// and multi-key reads carry keys past argument zero, and a transaction's
+// exclusion has to cover them all (doc 03 section 6.7). A shard with no
+// queued intents pays one map length check per command here and nothing else.
 func (w *worker) execute(b *hopBatch, i int) {
 	c := &b.cmds[i]
 	if c.op == OpTxnArm {
 		w.armIntent(b, i)
 		return
 	}
-	if len(w.keyQ) != 0 && c.keyed && w.deferForIntent(b, i) {
+	if len(w.keyQ) != 0 && w.deferForIntent(b, i) {
 		return
 	}
 	w.executeCmd(b, i)

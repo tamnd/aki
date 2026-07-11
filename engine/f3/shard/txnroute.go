@@ -116,10 +116,13 @@ type defCmd struct {
 // reporting whether it deferred. The await set is the intents present right
 // now: the command arrived (in inbound order) after each of them armed, so it
 // must follow their critical sections, and nothing that arms later may cut in
-// front of it. A fan sub-command checks every argument, because its whole
-// argument run is same-shard keys by construction (values or position blobs
-// that collide with a queued key can only defer it needlessly, never corrupt
-// it). Owner goroutine only.
+// front of it. Every argument is checked, not just the routing key: DoAt
+// routes a verb whose key sits past argument zero (OBJECT, SINTERCARD), a
+// multi-key read carries every operand, and a fan sub-command's whole
+// argument run is same-shard keys by construction. Values or position blobs
+// that collide with a queued key can only defer a command needlessly, never
+// corrupt it, and the loop runs only while this shard has intents queued.
+// Owner goroutine only.
 func (w *worker) deferForIntent(b *hopBatch, i int) bool {
 	c := &b.cmds[i]
 	var dc *defCmd
@@ -142,12 +145,8 @@ func (w *worker) deferForIntent(b *hopBatch, i int) bool {
 		}
 		q.waiters = append(q.waiters, dc)
 	}
-	if b.fan(i) != nil {
-		for k := 0; k < int(c.argn); k++ {
-			attach(w.keyQ[string(b.arg(i, k))])
-		}
-	} else {
-		attach(w.keyQ[string(b.arg(i, 0))])
+	for k := 0; k < int(c.argn); k++ {
+		attach(w.keyQ[string(b.arg(i, k))])
 	}
 	if dc == nil {
 		return false
@@ -226,6 +225,13 @@ func (t *Txn) intentFor(key []byte) *intent {
 		}
 	}
 	return nil
+}
+
+// Shard reports the owner shard of key, so a consumer building a multi-hop
+// plan (the algebra gather) can group its per-owner work before issuing Do
+// hops. It is a pure hash; key need not be one the transaction holds.
+func (t *Txn) Shard(key []byte) int {
+	return t.rt.ShardOf(key)
 }
 
 // SameShard reports whether two keys route to the same shard, the dispatch
