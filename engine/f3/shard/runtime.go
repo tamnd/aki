@@ -3,6 +3,7 @@ package shard
 import (
 	"fmt"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/tamnd/aki/engine/f3/store"
 )
@@ -13,6 +14,12 @@ import (
 type Runtime struct {
 	workers []*worker
 	started bool
+
+	// txnTicket is the process-global tier-two ticket source (doc 03 section
+	// 6.1, intent.go): one atomic touched only by Begin, off the single-key path
+	// entirely. The total order it hands out is what makes the intent schedule
+	// deadlock-free.
+	txnTicket atomic.Uint64
 
 	// netInfo, when set, appends the transport's "# Net" lines to the INFO
 	// stats text (doc 08 section 9.5). The server layer owns the transport
