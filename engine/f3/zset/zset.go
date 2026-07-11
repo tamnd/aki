@@ -190,6 +190,76 @@ func (z *zset) rem(m []byte) bool {
 	return z.nat.rem(m)
 }
 
+// scanPage returns one ZSCAN page and the cursor to resume from, 0 when the scan
+// completes (spec 2064/f3/12 section 6.11). The native band rides the member
+// record downward cursor (skiplist.go); the inline band has no record array, so
+// it returns its whole ordered blob in one page with cursor 0, the listpack
+// parity of Redis answering a small zset in a single ZSCAN reply, and a replayed
+// nonzero cursor returns nothing. Each surviving member is handed to emit with its
+// raw score bits, which the caller formats for the reply.
+func (z *zset) scanPage(cursor uint64, count int, match []byte, emit func(m []byte, bits uint64)) uint64 {
+	if z.enc == encSkiplist {
+		return z.nat.scanPage(cursor, count, match, emit)
+	}
+	if cursor != 0 {
+		return 0
+	}
+	b := z.blob
+	for i := 0; i < len(b); {
+		m, s, next := decodeEntry(b, i)
+		if match == nil || globMatch(match, m) {
+			emit(m, math.Float64bits(s))
+		}
+		i = next
+	}
+	return 0
+}
+
+// removeRange deletes the members at the half-open forward-rank window [lo,
+// hiExcl) and returns how many left, the shared surgery ZREMRANGEBYRANK,
+// ZREMRANGEBYSCORE and ZREMRANGEBYLEX reduce to once their bounds resolve to a
+// window (spec 2064/f3/12 section 6.9). The native band deletes the window as a
+// bounded tree operation (skiplist.go removeRange); the inline band splices the
+// contiguous run out of its ordered blob. An empty or inverted window removes
+// nothing. Removal never changes the encoding: a shrinking native band stays
+// native (F4), matching Redis.
+func (z *zset) removeRange(lo, hiExcl int) int {
+	if hiExcl <= lo {
+		return 0
+	}
+	if z.enc == encSkiplist {
+		return z.nat.removeRange(lo, hiExcl)
+	}
+	return z.listpackRemoveRange(lo, hiExcl)
+}
+
+// listpackRemoveRange splices the entries at forward ranks [lo, hiExcl) out of the
+// ordered blob with one memmove. Entries are in fixed zset order, so a rank window
+// is a contiguous byte span: walk to the offset of rank lo and the offset of rank
+// hiExcl, then drop the bytes between. The caller guarantees 0 <= lo < hiExcl <=
+// card, so both offsets are well defined (hiExcl == card lands at the blob end).
+func (z *zset) listpackRemoveRange(lo, hiExcl int) int {
+	b := z.blob
+	start, end := len(b), len(b)
+	i, idx := 0, 0
+	for i < len(b) {
+		if idx == lo {
+			start = i
+		}
+		if idx == hiExcl {
+			end = i
+			break
+		}
+		_, _, next := decodeEntry(b, i)
+		i = next
+		idx++
+	}
+	z.blob = append(b[:start], b[end:]...)
+	removed := hiExcl - lo
+	z.n -= removed
+	return removed
+}
+
 // pop removes up to count members from an end of the set and hands each to emit
 // in pop order: ascending from the smallest when min, descending from the
 // largest otherwise (spec 2064/f3/12 section 6.7). It backs ZPOPMIN, ZPOPMAX,

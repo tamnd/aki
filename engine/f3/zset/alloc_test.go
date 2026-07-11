@@ -150,6 +150,21 @@ func TestZeroAllocRemNative(t *testing.T) {
 	})
 }
 
+// ZREMRANGEBY* over the native band deletes its rank window as a bounded run of
+// counted tree deletes plus member-hash deletes, bumping the dead counters in
+// place (section 6.9). The window here is small against a large set, so the
+// amortized reclaim rebuild never trips across the 200 measured runs and the hot
+// loop stands alone: it must not allocate. The removal shrinks the set each run,
+// so the window sits at the midpoint where a present band is always found.
+func TestZeroAllocRemoveRange(t *testing.T) {
+	z := buildNative(300_000)
+	const win = 8
+	checkZero(t, "native remove range", func() {
+		lo := z.card() / 2
+		sinkInt = z.removeRange(lo, lo+win)
+	})
+}
+
 var (
 	sinkBool  bool
 	sinkInt   int

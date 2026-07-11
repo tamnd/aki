@@ -215,6 +215,14 @@ func init() {
 	register("ZREVRANGEBYLEX", zset.Zrevrangebylex, 3, -1, true)
 	register("ZCOUNT", zset.Zcount, 3, 3, true)
 	register("ZLEXCOUNT", zset.Zlexcount, 3, 3, true)
+	// The range removals (spec 2064/f3/12 section 6.9): each resolves its bounds to
+	// a rank window and deletes it inline, keyed on the first argument.
+	register("ZREMRANGEBYRANK", zset.Zremrangebyrank, 3, 3, true)
+	register("ZREMRANGEBYSCORE", zset.Zremrangebyscore, 3, 3, true)
+	register("ZREMRANGEBYLEX", zset.Zremrangebylex, 3, 3, true)
+	// ZSCAN walks the member records under an opaque downward cursor (section
+	// 6.11), keyed on the first argument.
+	register("ZSCAN", zset.Zscan, 2, -1, true)
 
 	// The pops and random surface (spec 2064/f3/12 sections 6.7, 6.8): ZPOPMIN,
 	// ZPOPMAX, and ZRANDMEMBER key on the first argument the same way ZADD does.
