@@ -5,6 +5,7 @@
 package dispatch
 
 import (
+	"github.com/tamnd/aki/engine/f3/list"
 	"github.com/tamnd/aki/engine/f3/set"
 	"github.com/tamnd/aki/engine/f3/shard"
 	"github.com/tamnd/aki/engine/f3/str"
@@ -267,11 +268,34 @@ func init() {
 	register("ZINTERSTORE", zset.Zinterstore, 3, -1, true)
 	register("ZDIFFSTORE", zset.Zdiffstore, 3, -1, true)
 
+	// The list surface (spec 2064/f3/13 M3 slice 1): the inline listpack band and
+	// its one-way promotion to the native quicklist placeholder. The pushes, pops,
+	// LLEN, LINDEX, LRANGE, LSET, LREM, LTRIM, LINSERT, and LPOS all key on the
+	// first argument the same way SADD does and validate their own tails. The
+	// blocking forms BLPOP/BRPOP/BLMPOP/BLMOVE and the cross-key moves LMOVE/LMPOP
+	// are deferred to later M3 slices.
+	register("LPUSH", list.Lpush, 2, -1, true)
+	register("RPUSH", list.Rpush, 2, -1, true)
+	register("LPUSHX", list.Lpushx, 2, -1, true)
+	register("RPUSHX", list.Rpushx, 2, -1, true)
+	register("LPOP", list.Lpop, 1, 2, true)
+	register("RPOP", list.Rpop, 1, 2, true)
+	register("LLEN", list.Llen, 1, 1, true)
+	register("LINDEX", list.Lindex, 2, 2, true)
+	register("LRANGE", list.Lrange, 3, 3, true)
+	register("LSET", list.Lset, 3, 3, true)
+	register("LREM", list.Lrem, 3, 3, true)
+	register("LTRIM", list.Ltrim, 3, 3, true)
+	register("LINSERT", list.Linsert, 4, 4, true)
+	register("LPOS", list.Lpos, 2, -1, true)
+
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
-	// when a key is present, and OBJECT HELP with no key round-robins.
-	register("OBJECT", set.Object, 1, -1, false)
+	// when a key is present, and OBJECT HELP with no key round-robins. It routes
+	// through the list handler, which reports the list bands and then delegates
+	// every non-list key to the set OBJECT handler (set bands and string store).
+	register("OBJECT", list.Object, 1, -1, false)
 	table["OBJECT"].keyAt = 1
 }
 
