@@ -118,8 +118,12 @@ func benchSRandMember(b *testing.B, n int) {
 	}
 }
 
-func BenchmarkSRandMember10k(b *testing.B) { benchSRandMember(b, 10_000) }
-func BenchmarkSRandMember1M(b *testing.B)  { benchSRandMember(b, 1_000_000) }
+// The 100k cell is the exact shape of the f1 K11 port-lab draw bar (doc 11
+// sections 1.5 and 11.4: 4.8ns at 100k members); the 10k and 1M cells bracket
+// it, with 1M carrying the 12.2ns end of the same bar.
+func BenchmarkSRandMember10k(b *testing.B)  { benchSRandMember(b, 10_000) }
+func BenchmarkSRandMember100k(b *testing.B) { benchSRandMember(b, 100_000) }
+func BenchmarkSRandMember1M(b *testing.B)   { benchSRandMember(b, 1_000_000) }
 
 func benchSPop(b *testing.B, n int) {
 	keys := members16(n)
