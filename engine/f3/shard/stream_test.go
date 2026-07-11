@@ -119,6 +119,170 @@ func TestStreamWindowBounded(t *testing.T) {
 	}
 }
 
+// rawSource serves total bytes of self-framed RESP (a position pattern stands
+// in for the real array-and-bulks). It counts Next calls so the window bound
+// can be checked, the same way patSource does for the wrapped path.
+type rawSource struct {
+	total int64
+	pos   int64
+	nexts atomic.Int64
+}
+
+func (p *rawSource) Next(dst []byte) (int, error) {
+	p.nexts.Add(1)
+	n := p.total - p.pos
+	if n > int64(len(dst)) {
+		n = int64(len(dst))
+	}
+	for i := int64(0); i < n; i++ {
+		dst[i] = byte((p.pos+i)*17 + 3)
+	}
+	p.pos += n
+	return int(n), nil
+}
+
+// TestStreamRawWireShape drives a StreamRaw reply (SMEMBERS's path) and asserts
+// two things the raw mode owes: the writer emits the source bytes verbatim with
+// no $total bulk header and no trailing crlf, and the producer still honors the
+// ring window so a huge enumeration holds the window, not the whole reply. A
+// pipelined PING behind it must still land after the raw bytes, proving the
+// reorder cursor committed to total even without a header on the wire.
+func TestStreamRawWireShape(t *testing.T) {
+	const chunks = 40
+	total := int64(chunks * store.ChunkSize)
+	src := &rawSource{total: total}
+
+	h := testHandlers()
+	for len(h) <= int(opStream) {
+		h = append(h, nil)
+	}
+	h[opStream] = func(cx *Ctx, args [][]byte, r Reply) {
+		r.StreamRaw(total, src)
+	}
+	rt := New(1, testArena, testSeg)
+	rt.Use(h)
+	rt.Start()
+	defer rt.Stop()
+
+	c := rt.NewConn()
+	if err := c.Do(opStream, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Do(opPing, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.Flush()
+
+	var out []byte
+	consumed := int64(0)
+	emit := func(rep []byte) {
+		if len(rep) == store.ChunkSize {
+			consumed++
+			if ahead := src.nexts.Load() - consumed; ahead > streamWindow+1 {
+				t.Errorf("producer %d chunks ahead, window is %d", ahead, streamWindow)
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+		out = append(out, rep...)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	n := 0
+	for n < 2 {
+		n += c.DrainReplies(emit)
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out with %d of 2 replies", n)
+		}
+	}
+	if c.Failed() {
+		t.Fatal("connection failed on a healthy raw stream")
+	}
+	if out[0] != byte(3) {
+		t.Fatalf("raw reply starts %#x, want the source's first byte with no bulk header", out[0])
+	}
+	if !bytes.HasSuffix(out, []byte("+PONG\r\n")) {
+		t.Fatalf("reply tail = %q, want the pipelined PONG right after the raw bytes", out[max(0, len(out)-16):])
+	}
+	body := out[:len(out)-len("+PONG\r\n")]
+	if int64(len(body)) != total {
+		t.Fatalf("raw body is %d bytes, want %d with no trailer", len(body), total)
+	}
+	for i := range body {
+		if body[i] != byte(int64(i)*17+3) {
+			t.Fatalf("raw byte %d = %#x, want %#x", i, body[i], byte(int64(i)*17+3))
+		}
+	}
+}
+
+// TestStreamRawStepConsumer drives the raw stream through the reactor's step
+// consumer (SetStreamStep), the path production takes. It proves the step
+// completion emits no trailer for raw and the reorder cursor still advances to
+// the pipelined PONG once the raw bytes are out.
+func TestStreamRawStepConsumer(t *testing.T) {
+	const chunks = 16
+	total := int64(chunks * store.ChunkSize)
+	src := &rawSource{total: total}
+
+	h := testHandlers()
+	for len(h) <= int(opStream) {
+		h = append(h, nil)
+	}
+	h[opStream] = func(cx *Ctx, args [][]byte, r Reply) {
+		r.StreamRaw(total, src)
+	}
+	rt := New(1, testArena, testSeg)
+	rt.Use(h)
+	rt.Start()
+	defer rt.Stop()
+
+	nl := newNotifyLoop()
+	c := rt.NewConn()
+	c.SetStreamStep()
+	c.SetWriterNotify(nl.notify)
+	defer c.Close()
+
+	if err := c.Do(opStream, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Do(opPing, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.Flush()
+
+	var out []byte
+	emit := func(rep []byte) { out = append(out, rep...) }
+	deadline := time.Now().Add(20 * time.Second)
+	for c.Owes() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out with %d bytes of %d", len(out), total)
+		}
+		c.DrainReplies(emit)
+		for c.StreamReady() && !c.Failed() {
+			c.StreamStep(emit, store.ChunkSize)
+		}
+		if c.Failed() {
+			t.Fatal("connection failed on a healthy raw stream")
+		}
+		if !c.Owes() {
+			break
+		}
+		if c.ParkWriter() {
+			if !nl.wait(10 * time.Second) {
+				t.Fatal("no wake with the raw stream mid-flight")
+			}
+		}
+	}
+	if !bytes.HasSuffix(out, []byte("+PONG\r\n")) {
+		t.Fatalf("reply tail = %q, want the pipelined PONG right after the raw bytes", out[max(0, len(out)-16):])
+	}
+	body := out[:len(out)-len("+PONG\r\n")]
+	if int64(len(body)) != total {
+		t.Fatalf("raw body is %d bytes, want %d with no trailer", len(body), total)
+	}
+	if body[0] != byte(3) {
+		t.Fatalf("raw body starts %#x, want no bulk header", body[0])
+	}
+}
+
 func itoa(n int64) string {
 	if n == 0 {
 		return "0"
