@@ -206,6 +206,15 @@ func init() {
 	register("ZREVRANK", zset.Zrevrank, 2, 3, true)
 	register("ZRANGE", zset.Zrange, 3, -1, true)
 	register("ZREVRANGE", zset.Zrevrange, 3, -1, true)
+	// The by-bound range family (spec 2064/f3/12 sections 6.4, 6.5): score and
+	// lex bands and their reverse forms, plus the two count verbs. All key on the
+	// first argument and validate their own bound grammars and options.
+	register("ZRANGEBYSCORE", zset.Zrangebyscore, 3, -1, true)
+	register("ZREVRANGEBYSCORE", zset.Zrevrangebyscore, 3, -1, true)
+	register("ZRANGEBYLEX", zset.Zrangebylex, 3, -1, true)
+	register("ZREVRANGEBYLEX", zset.Zrevrangebylex, 3, -1, true)
+	register("ZCOUNT", zset.Zcount, 3, 3, true)
+	register("ZLEXCOUNT", zset.Zlexcount, 3, 3, true)
 
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked

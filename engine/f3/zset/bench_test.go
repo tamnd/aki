@@ -194,6 +194,75 @@ func BenchmarkZRangeNative(b *testing.B) {
 	}
 }
 
+// ZRANGEBYSCORE at 1M over score windows of 10, 100 and 10k, both directions
+// (PRED-F3-M2-ZRANGE, the headline cell). buildNative seats member i at score i,
+// so a window of w scores is a band of w members, resolved by two counted
+// descents then streamed. Divide ns/op by the window to read the per-element
+// cost the streaming reply flattens, the number to compare against #615's index
+// range.
+func BenchmarkZRangeByScoreNative(b *testing.B) {
+	const n = 1_000_000
+	z := buildNative(n)
+	buf := make([]byte, 0, 1<<22)
+	for _, win := range []int{10, 100, 10_000} {
+		for _, rev := range []bool{false, true} {
+			dir := "fwd"
+			if rev {
+				dir = "rev"
+			}
+			b.Run(itoa(win)+"/"+dir, func(b *testing.B) {
+				min := scoreBound{value: float64(n / 2)}
+				max := scoreBound{value: float64(n/2 + win - 1)}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					lo, hi := z.scoreWindow(min, max)
+					a, c, _ := applyLimit(lo, hi, rev, false, 0, 0)
+					sinkBytes = z.rangeByRankWindow(buf[:0], a, c, rev, false)
+				}
+			})
+		}
+	}
+}
+
+// ZCOUNT at 1M: two counted descents, no walk, so it is flat in the window
+// width (spec 2064/f3/12 section 6.4). The window here spans a tenth of the set
+// to show the count is independent of how many members it covers.
+func BenchmarkZCountNative(b *testing.B) {
+	const n = 1_000_000
+	z := buildNative(n)
+	min := scoreBound{value: float64(n / 2)}
+	max := scoreBound{value: float64(n/2 + n/10)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		lo, hi := z.scoreWindow(min, max)
+		sinkInt = hi - lo
+	}
+}
+
+// ZRANGEBYLEX in a 1M tied band (PRED gate row, section 3.2): every member at
+// one score, so the tree is keyed by member bytes and the seek routes through
+// the interior spill-slot tie-breaks. Windows of 10, 100 and 10k members.
+func BenchmarkZRangeByLexNative(b *testing.B) {
+	const n = 1_000_000
+	z := buildTiedNative(n)
+	buf := make([]byte, 0, 1<<22)
+	for _, win := range []int{10, 100, 10_000} {
+		b.Run(itoa(win), func(b *testing.B) {
+			min := lexBound{value: []byte("k" + pad(n/2))}
+			max := lexBound{value: []byte("k" + pad(n/2+win-1))}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				lo, hi := z.lexWindow(min, max)
+				a, c, _ := applyLimit(lo, hi, false, false, 0, 0)
+				sinkBytes = z.rangeByRankWindow(buf[:0], a, c, false, false)
+			}
+		})
+	}
+}
+
 // drawRanks precomputes drawCount rank samples over [0,n): uniform, or a zipfian
 // draw at exponent 0.99 (the PRED-F3-M2-ZRANKZIPF shape) that piles onto the low
 // ranks so the descents hammer one hot region of the tree.

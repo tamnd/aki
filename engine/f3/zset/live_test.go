@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/tamnd/aki/f3srv/resp"
@@ -297,6 +298,221 @@ func TestFlagMatrixAgainstRedis(t *testing.T) {
 			t.Fatalf("space %d: Redis encoding %q, zset %q", space, enc, z.enc.String())
 		}
 		c.cmd("DEL", key)
+	}
+}
+
+// TestRangeByBoundAgainstRedis replays random churn against a live Redis and
+// checks the whole by-bound range surface agrees byte for byte: ZRANGEBYSCORE
+// and ZREVRANGEBYSCORE over every combination of inclusive/exclusive/infinite
+// bounds, with and without WITHSCORES and LIMIT; ZCOUNT; the ZRANGE BYSCORE
+// form with REV; and the same for the lex family over a single tied band, which
+// is the only shape ZRANGEBYLEX is defined for. Two member spaces keep one run
+// inline and push the other into the native tree.
+func TestRangeByBoundAgainstRedis(t *testing.T) {
+	addr := os.Getenv("AKI_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("set AKI_REDIS_ADDR=host:port to replay by-bound ranges against a live Redis")
+	}
+	c, err := dialRedis(addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	defer c.close()
+
+	// Score bands over a churned zset with a small score space (tied bands).
+	for _, space := range []int{20, 400} {
+		key := "aki:zbyscore:" + itoa(space)
+		c.cmd("DEL", key)
+		z := newZset()
+		rng := rand.New(rand.NewPCG(31, uint64(space)))
+		for step := 0; step < 1500; step++ {
+			m := "m" + itoa(rng.IntN(space))
+			s := float64(rng.IntN(12) - 6)
+			z.update([]byte(m), s, flags{})
+			if _, err := c.cmd("ZADD", key, string(resp.FormatScore(nil, s)), m); err != nil {
+				t.Fatalf("ZADD: %v", err)
+			}
+		}
+
+		scoreArgs := []string{"-inf", "+inf", "-3", "(-3", "0", "(2", "5", "(5"}
+		for _, lo := range scoreArgs {
+			for _, hi := range scoreArgs {
+				for _, ws := range []bool{false, true} {
+					for _, lim := range [][2]int{{-1, -1}, {0, 3}, {1, 2}, {2, -1}} {
+						checkRangeCmd(t, c, z, "ZRANGEBYSCORE", key, lo, hi, false, ws, lim)
+						checkRangeCmd(t, c, z, "ZREVRANGEBYSCORE", key, hi, lo, true, ws, lim)
+					}
+				}
+				// ZCOUNT agreement.
+				rc, err := c.cmd("ZCOUNT", key, lo, hi)
+				if err != nil {
+					t.Fatalf("ZCOUNT %s %s: %v", lo, hi, err)
+				}
+				mn, _ := parseScoreBound([]byte(lo))
+				mx, _ := parseScoreBound([]byte(hi))
+				wlo, whi := z.scoreWindow(mn, mx)
+				if rc != itoa(whi-wlo) {
+					t.Fatalf("ZCOUNT %s %s: redis %q, zset %d", lo, hi, rc, whi-wlo)
+				}
+			}
+		}
+		c.cmd("DEL", key)
+	}
+
+	// Lex bands over a single tied score, the defined ZRANGEBYLEX shape.
+	for _, space := range []int{20, 400} {
+		key := "aki:zbylex:" + itoa(space)
+		c.cmd("DEL", key)
+		z := newZset()
+		rng := rand.New(rand.NewPCG(33, uint64(space)))
+		for step := 0; step < 1500; step++ {
+			m := "k" + itoa(rng.IntN(space))
+			z.update([]byte(m), 0, flags{})
+			if _, err := c.cmd("ZADD", key, "0", m); err != nil {
+				t.Fatalf("ZADD: %v", err)
+			}
+		}
+		lexArgs := []string{"-", "+", "[k1", "(k1", "[k2", "(k2", "[k", "(k9"}
+		for _, lo := range lexArgs {
+			for _, hi := range lexArgs {
+				for _, lim := range [][2]int{{-1, -1}, {0, 3}, {1, 2}} {
+					checkLexCmd(t, c, z, "ZRANGEBYLEX", key, lo, hi, false, lim)
+					checkLexCmd(t, c, z, "ZREVRANGEBYLEX", key, hi, lo, true, lim)
+				}
+				rc, err := c.cmd("ZLEXCOUNT", key, lo, hi)
+				if err != nil {
+					t.Fatalf("ZLEXCOUNT %s %s: %v", lo, hi, err)
+				}
+				mn, _ := parseLexBound([]byte(lo))
+				mx, _ := parseLexBound([]byte(hi))
+				wlo, whi := z.lexWindow(mn, mx)
+				if rc != itoa(whi-wlo) {
+					t.Fatalf("ZLEXCOUNT %s %s: redis %q, zset %d", lo, hi, rc, whi-wlo)
+				}
+			}
+		}
+		c.cmd("DEL", key)
+	}
+}
+
+// checkRangeCmd runs one score-range command against Redis and against the local
+// model and asserts the elements match. loArg and hiArg are the bounds in the
+// command's argument order (max first for the reverse form).
+func checkRangeCmd(t *testing.T, c *redisConn, z *zset, verb, key, loArg, hiArg string, rev, ws bool, lim [2]int) {
+	t.Helper()
+	args := []string{verb, key, loArg, hiArg}
+	if ws {
+		args = append(args, "WITHSCORES")
+	}
+	limit := lim[0] >= 0
+	if limit {
+		args = append(args, "LIMIT", itoa(lim[0]), itoa(lim[1]))
+	}
+	rElems, _, err := c.cmdArray(args...)
+	if err != nil {
+		t.Fatalf("%v: %v", args, err)
+	}
+	min, _ := parseScoreBound([]byte(minOf(loArg, hiArg, rev)))
+	max, _ := parseScoreBound([]byte(maxOf(loArg, hiArg, rev)))
+	want := modelByScore(sortedModel(mapOf(z)), min, max, rev, ws, limit, lim[0], lim[1])
+	if !eqStrings(rElems, want) {
+		t.Fatalf("%v:\n redis %v\n model %v", args, rElems, want)
+	}
+}
+
+func checkLexCmd(t *testing.T, c *redisConn, z *zset, verb, key, loArg, hiArg string, rev bool, lim [2]int) {
+	t.Helper()
+	args := []string{verb, key, loArg, hiArg}
+	limit := lim[0] >= 0
+	if limit {
+		args = append(args, "LIMIT", itoa(lim[0]), itoa(lim[1]))
+	}
+	rElems, _, err := c.cmdArray(args...)
+	if err != nil {
+		t.Fatalf("%v: %v", args, err)
+	}
+	minArg, maxArg := loArg, hiArg
+	if rev {
+		minArg, maxArg = hiArg, loArg
+	}
+	min, _ := parseLexBound([]byte(minArg))
+	max, _ := parseLexBound([]byte(maxArg))
+	want := modelByLex(sortedModel(mapOf(z)), min, max, rev, limit, lim[0], lim[1])
+	if !eqStrings(rElems, want) {
+		t.Fatalf("%v:\n redis %v\n model %v", args, rElems, want)
+	}
+}
+
+// minOf and maxOf pick the low and high score bound out of the command's
+// argument order: forward is (min, max), reverse is (max, min).
+func minOf(a, b string, rev bool) string {
+	if rev {
+		return b
+	}
+	return a
+}
+func maxOf(a, b string, rev bool) string {
+	if rev {
+		return a
+	}
+	return b
+}
+
+// mapOf drains a zset into a model map for the reference range.
+func mapOf(z *zset) map[string]float64 {
+	m := map[string]float64{}
+	for _, e := range z.entries() {
+		m[string(e.member)] = e.score
+	}
+	return m
+}
+
+// TestRangeErrorsAgainstRedis pins the exact error strings the by-bound ranges
+// reject with against a live Redis: bad score and lex bounds, and the illegal
+// option combinations. Redis clients match on these strings verbatim.
+func TestRangeErrorsAgainstRedis(t *testing.T) {
+	addr := os.Getenv("AKI_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("set AKI_REDIS_ADDR=host:port to check range error texts against a live Redis")
+	}
+	c, err := dialRedis(addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	defer c.close()
+	key := "aki:zerr"
+	c.cmd("DEL", key)
+	c.cmd("ZADD", key, "1", "a", "2", "b", "3", "c")
+	defer c.cmd("DEL", key)
+
+	cases := []struct {
+		args []string
+		want string // the exact error text this package emits, checked against Redis
+	}{
+		{[]string{"ZRANGEBYSCORE", key, "notafloat", "2"}, errScoreBound},
+		{[]string{"ZRANGEBYSCORE", key, "(", "2"}, errScoreBound},
+		{[]string{"ZRANGEBYSCORE", key, "1", "nan"}, errScoreBound},
+		{[]string{"ZCOUNT", key, "x", "2"}, errScoreBound},
+		{[]string{"ZRANGEBYLEX", key, "a", "[b"}, errLexBound},
+		{[]string{"ZRANGEBYLEX", key, "[a", "b"}, errLexBound},
+		{[]string{"ZRANGEBYLEX", key, "[a", "[b", "WITHSCORES"}, "ERR syntax error"},
+		{[]string{"ZLEXCOUNT", key, "+x", "-"}, errLexBound},
+		{[]string{"ZRANGE", key, "0", "-1", "LIMIT", "0", "5"}, errLimitOnly},
+		{[]string{"ZRANGE", key, "(1", "3", "BYSCORE", "BYLEX"}, "ERR syntax error"},
+		{[]string{"ZRANGE", key, "[a", "[b", "BYLEX", "WITHSCORES"}, errLexScores},
+		{[]string{"ZRANGEBYSCORE", key, "1", "2", "LIMIT", "0"}, "ERR syntax error"},
+	}
+	for _, tc := range cases {
+		_, rErr := c.cmd(tc.args...)
+		if rErr == nil {
+			t.Fatalf("%v: redis accepted, want error %q", tc.args, tc.want)
+		}
+		// c.cmd wraps the reply as "redis: <body>"; the body is Redis's exact
+		// error line, which must equal the string this package emits.
+		got := strings.TrimPrefix(rErr.Error(), "redis: ")
+		if got != tc.want {
+			t.Fatalf("%v: redis %q, zset emits %q", tc.args, got, tc.want)
+		}
 	}
 }
 
