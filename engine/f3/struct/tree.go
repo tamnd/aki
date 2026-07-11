@@ -62,6 +62,18 @@ type Tree struct {
 	rootIsLeaf bool
 	height     int // 1 == root is a leaf
 	entries    uint64
+
+	// Edge-leaf ordinal cache (lab 04, labs/f3/m2): the leftmost and rightmost
+	// leaf ordinals, 8 bytes for the whole tree, so a read that walks from an end
+	// skips the root-to-leaf descent. It is read-path only, never steering a
+	// mutation, and is lazily refilled (a fresh descent is 9-17ns), so it is
+	// invalidated wholesale on any split or merge that could allocate or free a
+	// leaf and left leafNone until the next end read repopulates it. edgeCache is
+	// the off switch the byte-identical cache-parity test flips; production always
+	// leaves it on.
+	minLeaf   uint32
+	maxLeaf   uint32
+	edgeCache bool
 }
 
 // Members turns a member reference back into its bytes for a tie-break compare.
@@ -93,6 +105,9 @@ const (
 	entrySz   = 16
 	ordSz     = 4
 	noSplit   = ^uint32(0)
+	// leafNone marks the edge-leaf cache as stale: no ordinal is known and the
+	// next end read must descend to refill it.
+	leafNone = ^uint32(0)
 )
 
 // ArityFor is the interior fanout as a pure function of the branch block size and
@@ -124,6 +139,9 @@ func newTreeSized(branchSz, leafSz, countW int) *Tree {
 		arity:    ArityFor(branchSz, countW),
 	}
 	t.sepMax = t.arity - 1
+	t.edgeCache = true
+	t.minLeaf = leafNone
+	t.maxLeaf = leafNone
 	t.root = t.allocLeaf()
 	t.rootIsLeaf = true
 	t.height = 1
@@ -412,6 +430,7 @@ func (t *Tree) leafShiftIn(o uint32, pos int, score uint64, ref uint32) {
 }
 
 func (t *Tree) splitLeaf(o uint32) uint32 {
+	t.invalidateEdges()
 	n := t.lNent(o)
 	half := n / 2
 	right := t.allocLeaf()
@@ -715,10 +734,37 @@ func (t *Tree) WalkFrom(score uint64, member []byte, m Members, fn func(score ui
 	}
 }
 
+// invalidateEdges drops the cached end-leaf ordinals; called on any split or
+// merge that could move which leaf sits at an end.
+func (t *Tree) invalidateEdges() {
+	t.minLeaf = leafNone
+	t.maxLeaf = leafNone
+}
+
 func (t *Tree) leftmostLeaf() uint32 {
+	if t.edgeCache && t.minLeaf != leafNone {
+		return t.minLeaf
+	}
 	ord := t.root
 	for level := t.height; level > 1; level-- {
 		ord = t.bChild(ord, 0)
+	}
+	if t.edgeCache {
+		t.minLeaf = ord
+	}
+	return ord
+}
+
+func (t *Tree) rightmostLeaf() uint32 {
+	if t.edgeCache && t.maxLeaf != leafNone {
+		return t.maxLeaf
+	}
+	ord := t.root
+	for level := t.height; level > 1; level-- {
+		ord = t.bChild(ord, t.bNkeys(ord))
+	}
+	if t.edgeCache {
+		t.maxLeaf = ord
 	}
 	return ord
 }
@@ -730,6 +776,14 @@ func (t *Tree) Delete(score uint64, member []byte, m Members) (uint32, bool) {
 	if removed {
 		t.entries--
 	}
+	t.collapseRoot()
+	return ref, removed
+}
+
+// collapseRoot drops a branch root that a merge left with a single child, the
+// height-shrinking step shared by every removal path (Delete and the fused
+// pops). A leaf root, or a branch root that still routes, is left alone.
+func (t *Tree) collapseRoot() {
 	if !t.rootIsLeaf && t.bNkeys(t.root) == 0 {
 		old := t.root
 		t.root = t.bChild(t.root, 0)
@@ -737,7 +791,6 @@ func (t *Tree) Delete(score uint64, member []byte, m Members) (uint32, bool) {
 		t.rootIsLeaf = t.height == 1
 		t.freeBranch(old)
 	}
-	return ref, removed
 }
 
 func (t *Tree) deleteFrom(ord uint32, level int, score uint64, member []byte, m Members) (uint32, bool) {
@@ -820,6 +873,7 @@ func (t *Tree) leafPrepend(o uint32, score uint64, ref uint32) {
 }
 
 func (t *Tree) mergeLeaves(parent uint32, c int) {
+	t.invalidateEdges()
 	left := t.bChild(parent, c)
 	right := t.bChild(parent, c+1)
 	ln := t.lNent(left)
@@ -951,6 +1005,7 @@ func (t *Tree) bulkLoad(entries []Entry) *Tree {
 	t.srefs = t.srefs[:0]
 	t.leafFree, t.branchFree = nil, nil
 	t.nLeaf, t.nBranch = 0, 0
+	t.invalidateEdges()
 	if len(entries) == 0 {
 		t.root = t.allocLeaf()
 		t.rootIsLeaf = true
