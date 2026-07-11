@@ -166,6 +166,16 @@ func init() {
 	register("SPOP", set.Spop, 1, 2, true)
 	register("SRANDMEMBER", set.Srandmember, 1, 2, true)
 	register("SSCAN", set.Sscan, 2, -1, true)
+	// The multi-key algebra surface (spec 2064/f3/11 section 6). SINTER, SUNION,
+	// and SDIFF key on their first operand and read the rest from the same
+	// shard's registry. SINTERCARD leads with numkeys, so its routing key is the
+	// argument after it: keyAt=1 sends it to the first operand's shard, the same
+	// route OBJECT uses for its post-subcommand key.
+	register("SINTER", set.Sinter, 1, -1, true)
+	register("SUNION", set.Sunion, 1, -1, true)
+	register("SDIFF", set.Sdiff, 1, -1, true)
+	register("SINTERCARD", set.Sintercard, 2, -1, false)
+	table["SINTERCARD"].keyAt = 1
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
