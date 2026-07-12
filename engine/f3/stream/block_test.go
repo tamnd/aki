@@ -42,6 +42,78 @@ func fieldsEqual(a, b []field) bool {
 	return true
 }
 
+func TestBlockTombstone(t *testing.T) {
+	b := newBlock()
+	// A mix of same-schema and general entries, so the tombstone scan's body skip
+	// is exercised against both frame shapes and must agree with the walk decode.
+	entries := []gotEntry{
+		{streamID{1, 0}, []field{f("a", "1"), f("b", "2")}},              // master
+		{streamID{1, 1}, []field{f("a", "3"), f("b", "4")}},              // same-schema
+		{streamID{1, 2}, []field{f("x", "9")}},                           // general
+		{streamID{2, 0}, []field{f("a", "5"), f("b", "6")}},              // same-schema
+		{streamID{2, 1}, []field{f("a", "7"), f("b", "8"), f("c", "0")}}, // general
+	}
+	for _, e := range entries {
+		if !b.appendEntry(e.id, e.fields) {
+			t.Fatalf("appendEntry(%s) rejected", e.id)
+		}
+	}
+	// Deleting a middle same-schema entry and a general entry drops exactly them.
+	if !b.tombstone(streamID{1, 1}) {
+		t.Fatal("tombstone 1-1 reported no deletion")
+	}
+	if !b.tombstone(streamID{2, 1}) {
+		t.Fatal("tombstone 2-1 reported no deletion")
+	}
+	// A re-delete and an absent id both remove nothing.
+	if b.tombstone(streamID{1, 1}) {
+		t.Fatal("re-tombstone of 1-1 deleted again")
+	}
+	if b.tombstone(streamID{9, 9}) {
+		t.Fatal("tombstone of an absent id deleted an entry")
+	}
+	if b.live() != 3 {
+		t.Fatalf("live=%d, want 3", b.live())
+	}
+	got := collect(b)
+	want := []gotEntry{
+		{streamID{1, 0}, []field{f("a", "1"), f("b", "2")}},
+		{streamID{1, 2}, []field{f("x", "9")}},
+		{streamID{2, 0}, []field{f("a", "5"), f("b", "6")}},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("walked %d live entries, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].id != want[i].id || !fieldsEqual(got[i].fields, want[i].fields) {
+			t.Fatalf("entry %d: got %s %v, want %s %v", i, got[i].id, got[i].fields, want[i].id, want[i].fields)
+		}
+	}
+}
+
+func TestBlockCovers(t *testing.T) {
+	b := newBlock()
+	b.appendEntry(streamID{5, 0}, []field{f("a", "1")})
+	b.appendEntry(streamID{9, 3}, []field{f("a", "2")})
+	for _, tc := range []struct {
+		id   streamID
+		want bool
+	}{
+		{streamID{5, 0}, true},
+		{streamID{7, 0}, true},
+		{streamID{9, 3}, true},
+		{streamID{4, 9}, false},
+		{streamID{9, 4}, false},
+	} {
+		if got := b.covers(tc.id); got != tc.want {
+			t.Fatalf("covers(%s) = %v, want %v", tc.id, got, tc.want)
+		}
+	}
+	if (&block{}).covers(streamID{1, 0}) {
+		t.Fatal("empty block covers nothing")
+	}
+}
+
 func TestBlockMasterThenSameSchemaRoundTrip(t *testing.T) {
 	b := newBlock()
 	want := []gotEntry{

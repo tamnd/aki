@@ -228,6 +228,80 @@ func (b *block) walk(scratch []field, fn func(id streamID, fields []field) bool)
 	}
 }
 
+// covers reports whether id falls in the block's [firstID, lastID] span, so a
+// linear seek can skip blocks that cannot hold it. The counted directory
+// replaces this scan with an O(log C) seekLE in slice 3.
+func (b *block) covers(id streamID) bool {
+	return b.count > 0 && id.cmp(b.first) >= 0 && id.cmp(b.last) <= 0
+}
+
+// tombstone flips the deleted flag on the entry with ID id, if it is present and
+// still live, and reports whether it deleted one. The block stays append-frozen;
+// only the one flags byte changes and the deleted counter bumps (section 6.5,
+// the tombstone side of the tombstone-vs-rewrite choice). Entries are ordered,
+// so the scan stops once it passes id.
+func (b *block) tombstone(id streamID) bool {
+	pos := 0
+	for i := 0; i < b.count; i++ {
+		flagsAt := pos
+		flags := b.blob[pos]
+		pos++
+		eid, n := readIDDelta(b.blob[pos:], b.first)
+		pos += n
+		pos = b.skipBody(pos, flags)
+		switch eid.cmp(id) {
+		case 0:
+			if flags&entryDeleted != 0 {
+				return false
+			}
+			b.blob[flagsAt] = flags | entryDeleted
+			b.deleted++
+			return true
+		case 1:
+			return false // ordered past id
+		}
+	}
+	return false
+}
+
+// skipBody advances past an entry body (value frames, plus names on a general
+// entry) starting just after the ID delta, and returns the offset of the next
+// entry. It mirrors the body layout walk decodes, so the two must stay in step;
+// a test tombstones then walks to pin that they agree.
+func (b *block) skipBody(pos int, flags byte) int {
+	if flags&entrySameSchema != 0 {
+		for range b.names {
+			vl, n := binary.Uvarint(b.blob[pos:])
+			pos += n + int(vl)
+		}
+		return pos
+	}
+	nf, n := binary.Uvarint(b.blob[pos:])
+	pos += n
+	for j := 0; j < int(nf); j++ {
+		nl, n := binary.Uvarint(b.blob[pos:])
+		pos += n + int(nl)
+		vl, n := binary.Uvarint(b.blob[pos:])
+		pos += n + int(vl)
+	}
+	return pos
+}
+
+// projectedFrame prices the bytes appendEntry would add for (id, fields), whether
+// this is the block's master or a later entry, so a band gate can decide before
+// committing (the inline-to-native threshold check, section 4.3).
+func (b *block) projectedFrame(id streamID, fields []field) int {
+	if b.count == 0 {
+		n := 1 + idDeltaLen(id, id) + uvlen(uint64(len(fields)))
+		for i := range fields {
+			n += uvlen(uint64(len(fields[i].name))) + len(fields[i].name)
+			n += uvlen(uint64(len(fields[i].value))) + len(fields[i].value)
+		}
+		return n
+	}
+	return b.frameLen(id, fields, b.sameSchema(fields))
+}
+
 // appendBytes writes a uvarint length prefix and the bytes, the frame form both
 // bands share (section 3.3).
 func appendBytes(dst, b []byte) []byte {
