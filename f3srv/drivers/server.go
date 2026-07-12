@@ -112,6 +112,13 @@ type Options struct {
 	// ReplyBufBytes overrides the per-connection reply writer buffer;
 	// non-positive takes replyBufSize. The knob exists for the lab sweep.
 	ReplyBufBytes int
+	// ReadBufBytes overrides a connection's initial read buffer;
+	// non-positive takes readBufSize. Like ReplyBufBytes this is a lab knob:
+	// the read buffer grows on demand for a command that outsizes it, so a
+	// smaller initial size only trims idle/point-op connections (the 64B
+	// memory-bar cell) and lets large-command connections grow as before.
+	// Lab 24 (labs/f3/m0/24_conn_buffers) sweeps it against the gate shapes.
+	ReadBufBytes int
 	// FlushEveryDrain restores the pre-boundary flush discipline: the writer
 	// flushes its socket buffer after every drain pass instead of waiting for
 	// the pipeline boundary. The knob exists for the labs/f3/m0/11_transport
@@ -166,6 +173,7 @@ type Server struct {
 	ln         net.Listener
 	pprofLn    net.Listener
 	replyBuf   int
+	readBuf    int
 	outLimit   int
 	flushEvery bool
 	shape      string
@@ -270,10 +278,14 @@ func Listen(o Options) (*Server, error) {
 	if o.ReplyBufBytes <= 0 {
 		o.ReplyBufBytes = replyBufSize
 	}
+	if o.ReadBufBytes <= 0 {
+		o.ReadBufBytes = readBufSize
+	}
 	s := &Server{
 		rt:         rt,
 		ln:         ln,
 		replyBuf:   o.ReplyBufBytes,
+		readBuf:    o.ReadBufBytes,
 		outLimit:   o.OutBufLimitBytes,
 		flushEvery: o.FlushEveryDrain,
 		shape:      o.ConnShape,
@@ -590,7 +602,7 @@ func (s *Server) handlePair(nc net.Conn) {
 // per parse iteration.
 func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary func() bool, unblock func() bool) {
 	var p resp.Parser
-	buf := make([]byte, readBufSize)
+	buf := make([]byte, s.readBuf)
 	n, pos := 0, 0
 	for {
 		if n == len(buf) {
@@ -659,8 +671,8 @@ func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary fu
 					pos, n = 0, 0
 					// A giant inbound bulk grew the buffer; once drained, shrink
 					// back so an idle connection does not pin megabytes.
-					if len(buf) > 16*readBufSize {
-						buf = make([]byte, readBufSize)
+					if len(buf) > 16*s.readBuf {
+						buf = make([]byte, s.readBuf)
 					}
 				} else if pos > 0 && n-pos <= compactMax {
 					n = copy(buf, buf[pos:n])

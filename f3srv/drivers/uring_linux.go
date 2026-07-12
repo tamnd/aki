@@ -523,7 +523,7 @@ func (l *uringLoop) ensureRecv(rc *uringConn) {
 		// A giant inbound bulk grew the buffer; once drained, drop it to the
 		// GC so a megabytes-wide buffer never lingers and never enters the
 		// free list. The lease below hands back a stock one.
-		if len(rc.rbuf) > 16*readBufSize {
+		if len(rc.rbuf) > 16*l.b.s.readBuf {
 			rc.rbuf = nil
 		}
 	} else if rc.pos > 0 && (rc.n-rc.pos <= compactMax || rc.n == len(rc.rbuf)) {
@@ -531,7 +531,7 @@ func (l *uringLoop) ensureRecv(rc *uringConn) {
 		rc.pos = 0
 	}
 	if rc.rbuf == nil {
-		rc.rbuf = make([]byte, readBufSize)
+		rc.rbuf = make([]byte, l.b.s.readBuf)
 	}
 	if rc.n == len(rc.rbuf) {
 		// One command larger than the buffer: grow, there is no other way to

@@ -550,7 +550,7 @@ func (l *reactorLoop) leaseRbuf() []byte {
 		l.rfree = l.rfree[:n-1]
 		return b
 	}
-	return make([]byte, readBufSize)
+	return make([]byte, l.b.s.readBuf)
 }
 
 // leaseOut is leaseRbuf for the reply buffer.
@@ -577,7 +577,7 @@ func (l *reactorLoop) releaseIdle(rc *reactorConn) {
 		return
 	}
 	if rc.rbuf != nil {
-		if len(rc.rbuf) == readBufSize && len(l.rfree) < loopBufFree {
+		if len(rc.rbuf) == l.b.s.readBuf && len(l.rfree) < loopBufFree {
 			l.rfree = append(l.rfree, rc.rbuf)
 		}
 		rc.rbuf = nil
@@ -807,7 +807,7 @@ func (l *reactorLoop) parsePass(rc *reactorConn) bool {
 		// A giant inbound bulk grew the buffer; once drained, drop it so a
 		// megabytes-wide buffer never lingers. The next read leases a stock
 		// one; a grown buffer never enters the free list.
-		if len(rc.rbuf) > 16*readBufSize {
+		if len(rc.rbuf) > 16*l.b.s.readBuf {
 			rc.rbuf = nil
 		}
 	} else if rc.pos > 0 && rc.n-rc.pos <= compactMax {
@@ -931,7 +931,7 @@ func (l *reactorLoop) closeConn(rc *reactorConn) {
 	// [0, n) before the parser sees a leased buffer again. Stock sizes only,
 	// same rule as releaseIdle.
 	if rc.rbuf != nil {
-		if len(rc.rbuf) == readBufSize && len(l.rfree) < loopBufFree {
+		if len(rc.rbuf) == l.b.s.readBuf && len(l.rfree) < loopBufFree {
 			l.rfree = append(l.rfree, rc.rbuf)
 		}
 		rc.rbuf = nil
