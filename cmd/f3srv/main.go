@@ -32,7 +32,12 @@ func main() {
 		"network driver: goroutine (the default, one shape-selected handler per connection), reactor (raw epoll event loops, Linux only), or uring (io_uring event loops, Linux with a probed kernel); where an event-loop driver cannot run it logs a notice and serves on the goroutine driver")
 	netLoops := flag.Int("net-loops", 0,
 		"event loops for the reactor and uring drivers; 0 takes the 2/5 network share of the core split (labs/f3/m0/19_loop_count; the goroutine driver ignores this)")
+	connSpinHighWater := flag.Int("conn-spin-highwater", 0,
+		"live connections at or above which a connection writer parks immediately instead of spinning (labs/f3/m0/22_conn_spin); 0 keeps the GOMAXPROCS*6 default, 1 always parks fast, a huge value restores unconditional spin")
 	flag.Parse()
+	if *connSpinHighWater > 0 {
+		shard.SetConnSpinHighWater(*connSpinHighWater)
+	}
 
 	srv, err := drivers.Listen(drivers.Options{
 		Addr:             *addr,

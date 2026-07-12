@@ -140,11 +140,15 @@ func (s *Server) NetStats() NetStats {
 	return ns
 }
 
-// register puts a connection into the live registry.
+// register puts a connection into the live registry. It also bumps the runtime
+// live-connection count that drives the connection-writer park-immediately
+// switch (shard.connSpinHighWater); every driver admits a connection through
+// here, so this is the one place the count needs to move on open.
 func (s *Server) register(cs *connState) {
 	s.netMu.Lock()
 	s.netLive[cs] = struct{}{}
 	s.netMu.Unlock()
+	s.rt.ConnOpened()
 }
 
 // unregister folds a finished connection's counters into the closed totals.
@@ -155,6 +159,7 @@ func (s *Server) unregister(cs *connState) {
 	delete(s.netLive, cs)
 	s.netDone.addConn(cs)
 	s.netMu.Unlock()
+	s.rt.ConnClosed()
 }
 
 // appendNetInfo renders the "# Net" INFO section from a fresh snapshot. It is
