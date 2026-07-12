@@ -468,6 +468,16 @@ func (nt *native) rangeInto(out []byte, lo, hi int) []byte {
 // written in place over the frame; a length change repacks the one chunk that
 // holds the element, splitting it when the new value overflows, the bounded
 // O(CAP) surgery the doc prices at parity (section 5.6), never an O(n) rebuild.
+//
+// The repack replaces one element with another, so the chunk's element count is
+// unchanged and every other chunk is untouched: the Fenwick directory still maps
+// every index correctly and needs no rebuild. The one exception is an overflow
+// split, which inserts a chunk and so grows the ring; only then is the directory
+// stale. Marking it stale unconditionally forced the next above-crossover locate
+// to rebuild the whole O(chunks) directory on every length-changing LSET, the
+// deep-LSET regression the M2/M3 gate measured at 0.028x (lab 08); guarding the
+// flag on an actual ring-length change restores the O(log chunks) seek LINDEX
+// already shows.
 func (nt *native) setAt(i int, v []byte) {
 	ci, ord := nt.locate(i)
 	c := nt.ring.at(ci)
@@ -488,8 +498,11 @@ func (nt *native) setAt(i int, v []byte) {
 		vals = append(vals, val)
 	}
 	nt.bytes += len(v) - len(old)
+	before := nt.ring.n
 	nt.spliceChunk(ci, vals)
-	nt.dir.stale = true
+	if nt.ring.n != before {
+		nt.dir.stale = true // a split added a chunk, renumbering the directory
+	}
 }
 
 // insert places v before or after the first pivot match (LINSERT) and reports

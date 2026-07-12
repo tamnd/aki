@@ -475,3 +475,85 @@ func TestLrangeCursorMatchesPerElement(t *testing.T) {
 		}
 	}
 }
+
+// locateFlat resolves k the way the flat scan does, reading the ring's live
+// counts directly and never touching the Fenwick tree, so it is an independent
+// oracle for the tree's answer.
+func locateFlat(nt *native, k int) (ci, ord int) {
+	for i := 0; i < nt.ring.n; i++ {
+		n := nt.ring.at(i).count()
+		if k < n {
+			return i, k
+		}
+		k -= n
+	}
+	panic("out of range")
+}
+
+// TestLsetNoSplitKeepsDirectoryValid pins the setAt fix: a length-changing LSET
+// that does not overflow its chunk leaves every chunk's element count unchanged,
+// so the Fenwick directory stays valid and must NOT be marked stale. Above the
+// crossover a spurious stale forced the next locate to rebuild the whole
+// O(chunks) directory, the deep-LSET regression. The test proves the directory
+// is left non-stale and still resolves every index against the flat oracle
+// WITHOUT a rebuild, and that a genuine overflow split does grow the ring and is
+// picked up.
+func TestLsetNoSplitKeepsDirectoryValid(t *testing.T) {
+	// Small elements so the 128-element cap fills a chunk long before the 4096-byte
+	// cap: each chunk carries chunkElemCap frames of ~9 bytes (~1152B), leaving
+	// ample blob headroom for a growth that does not split. ~200 chunks is well
+	// past flatMax so locate rides the Fenwick descent.
+	const chunks, perChunk, elemSize = 200, chunkElemCap, 8
+	vals := make([][]byte, chunks*perChunk)
+	for i := range vals {
+		vals[i] = sized(elemSize, i)
+	}
+	nt := buildNativeVals(vals)
+	if nt.ring.n <= flatMax {
+		t.Fatalf("need a ring past flatMax, got %d chunks", nt.ring.n)
+	}
+	// Prime the directory to a fresh, non-stale build.
+	nt.locate(0)
+	if nt.dir.stale {
+		t.Fatal("directory unexpectedly stale after a plain locate")
+	}
+	total := nt.count
+
+	// Grow one element in each of several deep chunks by 16 bytes (frameLen 65 ->
+	// 81), each staying under chunkBlobCap so no chunk splits.
+	touched := []int{total / 3, total / 2, 2 * total / 3, total - 40}
+	for step, idx := range touched {
+		grown := sized(elemSize+16, 100000+step)
+		ringBefore := nt.ring.n
+		nt.setAt(idx, grown)
+		if nt.ring.n != ringBefore {
+			t.Fatalf("step %d: unexpected split, ring %d -> %d (raise the headroom)",
+				step, ringBefore, nt.ring.n)
+		}
+		if nt.dir.stale {
+			t.Fatalf("step %d: directory marked stale after a no-split LSET", step)
+		}
+		// The still-live (never rebuilt) Fenwick tree must resolve every index
+		// exactly as the flat oracle does, and the grown value must read back.
+		for k := 0; k < nt.count; k++ {
+			gc, go_ := nt.dir.rank(k)
+			fc, fo := locateFlat(nt, k)
+			if gc != fc || go_ != fo {
+				t.Fatalf("step %d k=%d: fenwick=(%d,%d) flat=(%d,%d) without rebuild",
+					step, k, gc, go_, fc, fo)
+			}
+		}
+		if got := nt.at(idx); !bytes.Equal(got, grown) {
+			t.Fatalf("step %d: at(%d)=%q want %q", step, idx, got, grown)
+		}
+	}
+
+	// A genuine overflow split (an oversized lone frame) must grow the ring; the
+	// next locate then rebuilds off the length mismatch and still agrees.
+	ringBefore := nt.ring.n
+	nt.setAt(total/2, sized(5000, 7))
+	if nt.ring.n <= ringBefore {
+		t.Fatalf("oversized LSET did not split: ring %d -> %d", ringBefore, nt.ring.n)
+	}
+	checkLocateAgree(t, nt, "post-split")
+}
