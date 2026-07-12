@@ -10,6 +10,7 @@ import (
 	"github.com/tamnd/aki/engine/f3/set"
 	"github.com/tamnd/aki/engine/f3/shard"
 	"github.com/tamnd/aki/engine/f3/str"
+	"github.com/tamnd/aki/engine/f3/stream"
 	"github.com/tamnd/aki/engine/f3/zset"
 )
 
@@ -438,14 +439,22 @@ func init() {
 	register("HPEXPIRETIME", hash.Hpexpiretime, 4, -1, true)
 	register("HPERSIST", hash.Hpersist, 4, -1, true)
 
+	// Stream write path (M5 slice 2): the read path and groups follow. XADD keys
+	// on args[0]; its minimum well-formed form is key id field value.
+	register("XADD", stream.Xadd, 4, -1, true)
+	register("XLEN", stream.Xlen, 1, 1, true)
+	register("XDEL", stream.Xdel, 2, -1, true)
+	register("XSETID", stream.Xsetid, 2, -1, true)
+
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
 	// when a key is present, and OBJECT HELP with no key round-robins. It routes
-	// through the hash handler, which reports the hash bands and then delegates
-	// every non-hash key down the chain to the list handler, then set, then the
-	// string store, so one OBJECT verb answers for every type.
-	register("OBJECT", hash.Object, 1, -1, false)
+	// through the stream handler, which reports the stream encoding and then
+	// delegates every non-stream key down the chain to the hash handler, then
+	// list, then set, then the string store, so one OBJECT verb answers for every
+	// type.
+	register("OBJECT", stream.Object, 1, -1, false)
 	table["OBJECT"].keyAt = 1
 }
 

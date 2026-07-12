@@ -1,0 +1,49 @@
+package stream
+
+import (
+	"sync"
+
+	"github.com/tamnd/aki/engine/f3/shard"
+)
+
+// The stream type keeps its per-key objects in an owner-local registry, the same
+// seam the list and hash types use: a map from key to the stream, touched only by
+// the shard goroutine and hung off a sync.Map keyed by the shard's store pointer,
+// which is stable for the worker's life and unique per owner. The sync.Map guards
+// nothing but the first-touch creation race between shards; every entry is reached
+// and mutated only by its owning shard. Streams have no dedicated Ctx slot, so
+// they take this seam until the keyspace-unification slice folds every type into
+// one holder.
+type reg struct {
+	m map[string]*stream
+}
+
+var regs sync.Map // *store.Store -> *reg
+
+// registry returns the shard's stream registry, building it on first use.
+func registry(cx *shard.Ctx) *reg {
+	if v, ok := regs.Load(cx.St); ok {
+		return v.(*reg)
+	}
+	v, _ := regs.LoadOrStore(cx.St, &reg{m: make(map[string]*stream)})
+	return v.(*reg)
+}
+
+// lookup finds the stream for key. present is nil when no stream exists; wrong is
+// true when the key instead holds a string value, which every stream command
+// answers with WRONGTYPE. Cross-type collisions with the other collection
+// registries are not resolved in this slice, the same deferral those slices carry
+// until keyspace unification. An emptied stream (all entries XDEL'd) is kept, not
+// dropped: Redis leaves an empty stream in place (invariant that XLEN can read 0).
+func (g *reg) lookup(cx *shard.Ctx, key []byte) (s *stream, wrong bool) {
+	if s = g.m[string(key)]; s != nil {
+		return s, false
+	}
+	if cx.St.Exists(key, cx.NowMs) {
+		return nil, true
+	}
+	return nil, false
+}
+
+// wrongType is the shared WRONGTYPE reply text, Redis's exact wording.
+const wrongType = "WRONGTYPE Operation against a key holding the wrong kind of value"
