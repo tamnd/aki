@@ -50,6 +50,13 @@ const (
 // dstLeft are the BLMOVE destination key and push end. park writes every one of
 // them on each call, since a recycled node holds a prior waiter's stale values (a
 // node that last served a kindMove still holds its dstKey until overwritten).
+// claim and serving carry the cross-shard coordination a co-located waiter never
+// needs (blockcross.go). claim is the shared one-winner arbiter for a wait parked
+// across several owners, nil for a co-located wait, so the serve prologue's guard
+// is one nil-pointer load on the common path. serving marks a cross BLMOVE whose
+// remote destination hop is in flight on a spawned coordinator, so a second push
+// on the source does not launch a duplicate; it is owner-local, cleared or
+// unlinked back on the source owner.
 type waitNode struct {
 	prev, next uint32
 	sib        uint32
@@ -57,10 +64,12 @@ type waitNode struct {
 	conn       *shard.Conn
 	seq        uint32
 	timer      shard.TimerHandle
+	claim      *blockClaim
 	kind       uint8
 	front      bool
 	dstLeft    bool
 	live       bool
+	serving    bool
 	count      int
 	dstKey     string
 }
@@ -76,6 +85,7 @@ type waitSpec struct {
 	count   int
 	dstKey  string
 	dstLeft bool
+	claim   *blockClaim
 }
 
 // waitPool is the per-shard node slab. nodes grows once to its working size and
@@ -132,8 +142,10 @@ func (l *waitList) park(spec waitSpec, c *shard.Conn, seq uint32) uint32 {
 	nd.count = spec.count
 	nd.dstKey = spec.dstKey
 	nd.dstLeft = spec.dstLeft
+	nd.claim = spec.claim
 	nd.timer = nil
 	nd.live = true
+	nd.serving = false
 	nd.prev = l.tail
 	nd.next = nilIdx
 	nd.sib = i
@@ -279,15 +291,32 @@ func serveKey(cx *shard.Ctx, g *reg, key []byte, l *list) {
 		nd := &g.wpool.nodes[i]
 		switch nd.kind {
 		case kindPop:
+			// A cross-shard waiter (claim set) must win its shared claim before it
+			// serves: a lost claim means a racing push on another owner, or the
+			// timeout, already took this client, so drop only this dead local ring
+			// and move to the next waiter. A co-located waiter (nil claim) skips the
+			// CAS entirely and pays one nil-pointer load.
+			if nd.claim != nil && !nd.claim.tryClaim() {
+				g.unlinkAll(cx, i)
+				continue
+			}
 			conn := nd.conn
 			seq := nd.seq
-			elem := popOne(l, nd.front)
-			rep := appendReply(nil, key, elem)
+			bc := nd.claim
+			rep := appendReply(nil, key, popOne(l, nd.front))
 			g.unlinkAll(cx, i)
+			if bc != nil {
+				bc.fireCancels(cx, cx.ShardID())
+			}
 			conn.CompleteBlocked(seq, rep)
 		case kindMpop:
+			if nd.claim != nil && !nd.claim.tryClaim() {
+				g.unlinkAll(cx, i)
+				continue
+			}
 			conn := nd.conn
 			seq := nd.seq
+			bc := nd.claim
 			front := nd.front
 			npop := nd.count
 			if npop > l.length() {
@@ -300,6 +329,9 @@ func serveKey(cx *shard.Ctx, g *reg, key []byte, l *list) {
 				rep = resp.AppendBulk(rep, popOne(l, front))
 			}
 			g.unlinkAll(cx, i)
+			if bc != nil {
+				bc.fireCancels(cx, cx.ShardID())
+			}
 			conn.CompleteBlocked(seq, rep)
 		default: // kindMove
 			serveMove(cx, g, key, l, i, nd)
