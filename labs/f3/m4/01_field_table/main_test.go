@@ -103,14 +103,20 @@ func firstFullSlot(t *table) uint32 {
 	return 0
 }
 
-// TestQuickSweep runs the smoke path: the full sweep body at the -quick op
-// budget must complete and produce a cell per axis point without panicking, and
-// every cell must carry finite, non-negative numbers. This is the -quick check
-// the README's method paragraph names.
+// TestQuickSweep runs the smoke path: the full sweep body must complete and
+// produce a cell per axis point without panicking, and every cell must carry
+// finite, non-negative numbers. It drives the sweep over one small cardinality
+// at a tiny op budget so it stays under a second on a loaded CI runner; the 1M
+// arm the README reports is a memory-bandwidth measurement whose build and probe
+// code is the same this small cell exercises, and go run . covers it. Running
+// the reported cardinalities here would build ~944k-name tables per length and
+// scheme and time out the CI test binary.
 func TestQuickSweep(t *testing.T) {
-	cells := sweep(quickLookOps)
-	// 2 cardinalities x 3 length classes x 6 loads x 3 schemes.
-	if want := 2 * 3 * 6 * 3; len(cells) != want {
+	smokeCards := []card{{"smoke", 1 << 12}} // up to ~3.7k fields at load 0.9
+	const smokeLookOps = 2000
+	cells := sweep(smokeLookOps, smokeCards)
+	// 1 cardinality x 3 length classes x 6 loads x 3 schemes.
+	if want := 1 * 3 * 6 * 3; len(cells) != want {
 		t.Fatalf("sweep produced %d cells, want %d", len(cells), want)
 	}
 	for _, c := range cells {

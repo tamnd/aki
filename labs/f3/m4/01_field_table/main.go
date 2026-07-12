@@ -342,6 +342,17 @@ const (
 	quickLookOps = 300_000
 )
 
+// fullCards is the cardinality axis the README reports: a cache-resident 10k
+// cell and a DRAM-bound 1M cell. The 1M cell builds a ~944k-name table per
+// length and scheme, which is seconds on a fast box but minutes on a loaded CI
+// runner, so the smoke test drives the sweep over a small cardinality instead of
+// this one (see main_test.go). The 1M arm is a memory-bandwidth measurement, not
+// a correctness one; its build and probe code is the same the 10k arm exercises.
+var fullCards = []card{
+	{"10k", 1 << 14}, // up to ~14.7k fields at load 0.9
+	{"1M", 1 << 20},  // up to ~944k fields at load 0.9
+}
+
 func main() {
 	quick := flag.Bool("quick", false, "smaller op counts for a fast check")
 	flag.Parse()
@@ -350,17 +361,14 @@ func main() {
 	if *quick {
 		lookOps = quickLookOps
 	}
-	report(sweep(lookOps))
+	report(sweep(lookOps, fullCards))
 }
 
-// sweep runs every axis point at the given lookup budget and returns one cell
-// per (cardinality, length class, load, scheme). It is the whole experiment,
-// factored out so the smoke test can drive it at the quick budget.
-func sweep(lookOps int) []cell {
-	cards := []card{
-		{"10k", 1 << 14}, // up to ~14.7k fields at load 0.9
-		{"1M", 1 << 20},  // up to ~944k fields at load 0.9
-	}
+// sweep runs every axis point at the given lookup budget over the given
+// cardinality cells and returns one cell per (cardinality, length class, load,
+// scheme). It is the whole experiment, factored out so the smoke test can drive
+// it at a small cardinality and budget.
+func sweep(lookOps int, cards []card) []cell {
 	loads := []float64{0.50, 0.60, 0.70, 0.80, 0.875, 0.90}
 	schemes := []scheme{schLinear, schTriangular, schGroup}
 	lengths := []lenClass{{"short", 8}, {"medium", 24}, {"long", 64}}
