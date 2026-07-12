@@ -50,6 +50,16 @@ const (
 // dstLeft are the BLMOVE destination key and push end. park writes every one of
 // them on each call, since a recycled node holds a prior waiter's stale values (a
 // node that last served a kindMove still holds its dstKey until overwritten).
+// claim and serving carry the cross-shard coordination a co-located waiter never
+// needs (blockcross.go). claim is the shared one-winner arbiter for a wait parked
+// across several owners, nil for a co-located wait, so the serve prologue's guard
+// is one nil-pointer load on the common path. serving marks a cross BLMOVE whose
+// remote destination hop is in flight on a spawned coordinator, so a second push
+// on the source does not launch a duplicate; it is owner-local, cleared or
+// unlinked back on the source owner. deadline is the timeout instant in unix ms (0
+// for a wait that blocks forever), kept only so a cross BLMOVE whose spawned
+// coordinator finds the source drained again can re-arm the same timer it cancels
+// at serve, blockmovecross.go.
 type waitNode struct {
 	prev, next uint32
 	sib        uint32
@@ -57,10 +67,13 @@ type waitNode struct {
 	conn       *shard.Conn
 	seq        uint32
 	timer      shard.TimerHandle
+	claim      *blockClaim
+	deadline   int64
 	kind       uint8
 	front      bool
 	dstLeft    bool
 	live       bool
+	serving    bool
 	count      int
 	dstKey     string
 }
@@ -76,6 +89,7 @@ type waitSpec struct {
 	count   int
 	dstKey  string
 	dstLeft bool
+	claim   *blockClaim
 }
 
 // waitPool is the per-shard node slab. nodes grows once to its working size and
@@ -132,8 +146,11 @@ func (l *waitList) park(spec waitSpec, c *shard.Conn, seq uint32) uint32 {
 	nd.count = spec.count
 	nd.dstKey = spec.dstKey
 	nd.dstLeft = spec.dstLeft
+	nd.claim = spec.claim
 	nd.timer = nil
+	nd.deadline = 0
 	nd.live = true
+	nd.serving = false
 	nd.prev = l.tail
 	nd.next = nilIdx
 	nd.sib = i
@@ -279,15 +296,32 @@ func serveKey(cx *shard.Ctx, g *reg, key []byte, l *list) {
 		nd := &g.wpool.nodes[i]
 		switch nd.kind {
 		case kindPop:
+			// A cross-shard waiter (claim set) must win its shared claim before it
+			// serves: a lost claim means a racing push on another owner, or the
+			// timeout, already took this client, so drop only this dead local ring
+			// and move to the next waiter. A co-located waiter (nil claim) skips the
+			// CAS entirely and pays one nil-pointer load.
+			if nd.claim != nil && !nd.claim.tryClaim() {
+				g.unlinkAll(cx, i)
+				continue
+			}
 			conn := nd.conn
 			seq := nd.seq
-			elem := popOne(l, nd.front)
-			rep := appendReply(nil, key, elem)
+			bc := nd.claim
+			rep := appendReply(nil, key, popOne(l, nd.front))
 			g.unlinkAll(cx, i)
+			if bc != nil {
+				bc.fireCancels(cx, cx.ShardID())
+			}
 			conn.CompleteBlocked(seq, rep)
 		case kindMpop:
+			if nd.claim != nil && !nd.claim.tryClaim() {
+				g.unlinkAll(cx, i)
+				continue
+			}
 			conn := nd.conn
 			seq := nd.seq
+			bc := nd.claim
 			front := nd.front
 			npop := nd.count
 			if npop > l.length() {
@@ -300,11 +334,54 @@ func serveKey(cx *shard.Ctx, g *reg, key []byte, l *list) {
 				rep = resp.AppendBulk(rep, popOne(l, front))
 			}
 			g.unlinkAll(cx, i)
+			if bc != nil {
+				bc.fireCancels(cx, cx.ShardID())
+			}
 			conn.CompleteBlocked(seq, rep)
 		default: // kindMove
+			if serveMoveRemote(cx, g, key, i, nd) {
+				// The destination lives on another shard: a coordinator is now in
+				// flight for this head. Stop draining the key rather than looping on
+				// the still-parked head; the coordinator serves it (or re-parks it) and
+				// re-drives this key when it finishes.
+				return
+			}
 			serveMove(cx, g, key, l, i, nd)
 		}
 	}
+}
+
+// serveMoveRemote handles a BLMOVE/BRPOPLPUSH waiter whose destination lives on a
+// different shard than the source it parked on. The source owner cannot push onto
+// a key it does not own, so it hands the move to a spawned coordinator that
+// acquires both keys and runs the peek-push-pop under a fresh barrier
+// (blockmovecross.go). It cancels the waiter's timeout and marks the node serving
+// so a second push on the source does not launch a duplicate coordinator, then
+// returns true so the caller stops the serve loop: the head stays parked until the
+// coordinator completes it (or re-parks it on a source that drained in the window)
+// and re-drives this key. A co-located destination, or a bare Ctx with no runtime
+// (a unit test that never spans shards), returns false and serveMove runs inline
+// as before. Owner goroutine only.
+func serveMoveRemote(cx *shard.Ctx, g *reg, key []byte, i uint32, nd *waitNode) bool {
+	rt := cx.Runtime()
+	if rt == nil {
+		return false
+	}
+	if cx.ShardOf([]byte(nd.dstKey)) == cx.ShardID() {
+		return false
+	}
+	if nd.serving {
+		return true
+	}
+	nd.serving = true
+	if nd.timer != nil {
+		cx.CancelTimer(nd.timer)
+		nd.timer = nil
+	}
+	src := append([]byte(nil), key...)
+	dst := append([]byte(nil), nd.dstKey...)
+	go runMoveCross(rt, src, dst, i, nd.front, nd.dstLeft, nd.deadline)
+	return true
 }
 
 // serveMove completes one blocked BLMOVE/BRPOPLPUSH waiter parked on key: pop the

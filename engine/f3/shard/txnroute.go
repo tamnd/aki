@@ -73,6 +73,50 @@ func (c *Conn) DoTxn(keys [][]byte, run func(t *Txn) []byte) error {
 	return nil
 }
 
+// DoBlockCross enqueues one cross-shard blocking command: keys are its distinct
+// keys (duplicates collapse), and run is the body, called with the barrier held.
+// It is DoTxn with one difference: run may decide to block. When run serves the
+// command right away it returns the finished RESP reply, which lands at the
+// command's sequence exactly like DoTxn's. When run instead parks a waiter on
+// each key's owner it returns nil, and no reply is delivered now: a later owner
+// step (a serving push, a firing timeout) completes the sequence through
+// conn.CompleteBlocked, the general form finishTxn is a special case of. run
+// therefore takes conn and seq so it can hand its completion target to the
+// waiters it parks. Like DoTxn's body, run executes on a spawned coordinator
+// goroutine, so every byte it captures must be a stable copy.
+//
+// The park case leans on the same deferred-reply seam a co-located BLPOP uses.
+// The arm partials never emit (their fan record is a FanTxn), so the command's
+// reply slot stays open with nothing further needed here; the reorder ring holds
+// every later reply behind the open slot until CompleteBlocked fills it, and the
+// caller arms the reader barrier after this returns, one past seq, byte for byte
+// like the point path.
+func (c *Conn) DoBlockCross(keys [][]byte, run func(t *Txn, conn *Conn, seq uint32) []byte) error {
+	if c.seq-c.emitted.Load() >= uint32(len(c.ring)) {
+		if err := c.throttle(); err != nil {
+			return err
+		}
+	}
+	t := c.rt.newTxn(keys)
+	fc := &fanCmd{kind: FanTxn, pending: int32(len(t.intents)), txn: t}
+	for _, in := range t.intents {
+		if err := c.enqueueFan(in.shard, OpTxnArm, [][]byte{[]byte(in.key)}, fc); err != nil {
+			return err
+		}
+	}
+	seq := c.seq
+	c.seq++
+	go func() {
+		t.Acquire()
+		rep := run(t, c, seq)
+		t.Release()
+		if rep != nil {
+			c.finishTxn(seq, rep)
+		}
+	}()
+	return nil
+}
+
 // finishTxn delivers a transaction's reply: a loopback node with the finished
 // bytes at the command's sequence goes onto the outbound queue, where the
 // writer reorders it like any owner-produced reply. The free-list channel and

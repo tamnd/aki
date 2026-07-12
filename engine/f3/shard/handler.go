@@ -95,6 +95,41 @@ func (cx *Ctx) CancelTimer(t *timer) {
 	cx.w.timers.remove(t)
 }
 
+// Runtime is this shard's runtime, the seam a cross-shard blocking serve reaches
+// PostOwner and ShardOf through. It is nil on a bare Ctx built outside a runtime
+// (tests), the same total contract ArmTimer follows; a caller that may run on a
+// bare Ctx checks for nil (or routes through ShardOf, which reports the
+// single-shard degenerate answer). Owner goroutine only.
+func (cx *Ctx) Runtime() *Runtime {
+	if cx.w == nil {
+		return nil
+	}
+	return cx.w.rt
+}
+
+// ShardID is this owner's shard index, the source shard a cross-shard blocking
+// waiter records so a serving owner can skip its own cancel hop. It is -1 on a
+// bare Ctx (cx.w == nil), which no real shard index equals, so a nil-runtime
+// remote check reads false and the co-located path is taken. Owner goroutine
+// only.
+func (cx *Ctx) ShardID() int {
+	if cx.w == nil {
+		return -1
+	}
+	return cx.w.id
+}
+
+// ShardOf reports the owner shard of key, the dispatch hash a serving owner uses
+// to tell a co-located destination from a remote one. It is -1 on a bare Ctx, so
+// a remote check against ShardID (also -1 there) reads equal and stays on the
+// co-located path. Owner goroutine only.
+func (cx *Ctx) ShardOf(key []byte) int {
+	if cx.w == nil {
+		return -1
+	}
+	return cx.w.rt.ShardOf(key)
+}
+
 // Handler executes one command against its shard. args are views into the hop
 // node, valid for the duration of the call; a keyed command's args[0] is its
 // key. Exactly one reply must be written through r.
