@@ -25,10 +25,10 @@
 // The walk style is held constant (fused, no closures) across every arm so the
 // only variable is layout. Four arms, all emitting byte-identical RESP:
 //
-//   baseline   recs scattered, slab scattered  (today)
-//   slabRank   recs scattered, slab sequential  (architecture A: slab-only reorder)
-//   bothRank   recs sequential, slab sequential (architecture B: reorder recs too)
-//   leafLoc    recs never read, slab sequential (architecture C: loc carried in the leaf)
+//	baseline   recs scattered, slab scattered  (today)
+//	slabRank   recs scattered, slab sequential  (architecture A: slab-only reorder)
+//	bothRank   recs sequential, slab sequential (architecture B: reorder recs too)
+//	leafLoc    recs never read, slab sequential (architecture C: loc carried in the leaf)
 //
 // baseline-bothRank is the whole scatter penalty; baseline-slabRank is the part
 // architecture A captures; the ratio is the answer. leafLoc against bothRank
