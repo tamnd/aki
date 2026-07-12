@@ -67,6 +67,26 @@ Lowering it is a structural labs task (shared arena / tighter index / slab
 sizing / shard count), owed a labs/f3 microbench per the memory-bar rule. aki has
 2.5-3.4x throughput headroom to spend on memory and still clear 2x.
 
+### Memory lever located (labs 23-24, 2026-07-12)
+
+Lab 23 ruled the arena OUT: under the write-heavy gate the between-drain
+compaction holds dead slack at zero at every reclaim threshold, and the store
+alone rides ~128MB (96MB arena live + ~32MB heap), already under redis's 151MB.
+The overage is the connection fabric: a c512-vs-c50 probe (same server, same
+dataset) moved VmHWM 228,624 -> 144,940 kB.
+
+Lab 24 located it inside the connection: NOT the socket read/reply buffers (a
+box `-read/reply-buf-kib` sweep left VmHWM flat 222-232MB), but the per-connection
+hop transport. Each Conn pools hopBatch nodes carrying a data buffer
+(batchDataCap 8192) + reply buffer (repCap 10240), plus a replyRing(1024) reorder
+ring, all sized for batchCap=32 and separated-band values while the 64B cell
+fills ~640B of each. A rebuild shrinking batchDataCap 8192->1024, replyRing
+1024->128, freeListCap 64->8 dropped c512 VmHWM 231,616 -> 173,748 kB (58MB) with
+bit-identical throughput and green tests. 174MB is still 23MB over redis 151MB,
+so the caps are one stacking layer; the fix is to promote them to shard.Config
+fields and sweep (they grow on demand, so a smaller start is throughput-safe),
+with the arena record layout and GOGC as the further levers.
+
 ## Verdict
 
 The M0 headline THROUGHPUT gate PASSES at the mandated cell (SET 3.42x, GET
