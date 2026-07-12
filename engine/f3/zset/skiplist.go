@@ -42,6 +42,22 @@ type nativeStore struct {
 	deadBytes int // slab bytes behind removed records
 	deadRecs  int // removed record cells awaiting the rebuild
 
+	// scatteredInserts estimates how far the slab's insertion order has diverged
+	// from the tree's rank order: it counts the inserts and rescores since the
+	// last slab co-location, so a store built by incremental ZADD carries a full
+	// cardinality of divergence while one promoted in sorted order (seal) or just
+	// co-located starts at zero. maybeColocate reads it to decide when an ordered
+	// read should reorder the slab (see colocateSlab).
+	scatteredInserts int
+
+	// readElems accumulates the elements ordered reads have streamed since the
+	// last co-location. A reorder is O(card), so it fires only once reads have
+	// touched a cardinality's worth of elements, which caps the reorder at one
+	// sequential copy per read element amortized and keeps a write-heavy, rarely
+	// read store (few read elements) from ever paying for a reorder it will not
+	// recover. Reset with scatteredInserts on each co-location.
+	readElems int
+
 	// pending buffers the sorted entries of a band promotion between
 	// appendSorted calls and seal's bulk load, nil at any other time.
 	pending []structs.Entry
@@ -106,6 +122,7 @@ func (n *nativeStore) insert(m []byte, score float64) {
 	ord := n.newRecord(m, math.Float64bits(score))
 	n.tbl.Insert(hash, ord, n)
 	n.tree.Insert(scoreKey(score), m, ord, n)
+	n.scatteredInserts++ // slab appended out of rank order, one member diverged
 }
 
 // rescore moves an existing member to a new score: tree delete at the old key,
@@ -121,6 +138,7 @@ func (n *nativeStore) rescore(m []byte, score float64) {
 	n.tree.Delete(scoreKey(old), m, n)
 	n.recs[ord].bits = math.Float64bits(score)
 	n.tree.Insert(scoreKey(score), m, ord, n)
+	n.scatteredInserts++ // the member's rank moved; its slab position is now stale
 }
 
 // rem deletes m and reports whether it was present. The record cell and its
@@ -216,6 +234,7 @@ func (n *nativeStore) appendSorted(m []byte, score float64) {
 func (n *nativeStore) seal() {
 	n.tree = structs.BulkLoad(n.pending)
 	n.pending = nil
+	n.scatteredInserts = 0 // appendSorted laid the slab in sorted (rank) order
 }
 
 // each visits every member in ascending zset order. The member bytes alias the
@@ -255,12 +274,81 @@ func (n *nativeStore) rank(m []byte) (int, float64, bool) {
 	return int(r), sc, true
 }
 
+// colocateFloor is the cardinality below which the record and slab arrays fit in
+// cache, so the insertion-order scatter is free and reordering would only add its
+// transient without buying a sequential-read win: lab 09 (labs/f3/m2) measured
+// the scatter as a 1M-scale, memory-bound effect, with 10k and 100k within cache
+// noise. The GamingPC box A/B of the zrange cells tunes it.
+const colocateFloor = 1 << 16
+
+// colocateSlab rewrites the member slab in tree (rank) order and repoints each
+// record's loc at its new position, so an ordered walk reads member bytes
+// sequentially instead of chasing insertion-order offsets across cold memory.
+// This is architecture A of the ZRANGE co-location plan (spec 2064/f3
+// milestones/M2-zrange-colocation-plan.md, lab 09): it moves only slab bytes and
+// rec.loc fields, never a record ordinal, so ZSCAN's downward record cursor and
+// the tree's separator refs (which resolve a member through recs[ref].loc) stay
+// valid, and it adds no steady memory since the fresh slab is the same size. It
+// runs only with no dead records, so every live record appears in the tree
+// exactly once and there is nothing to compact (the churn rebuild owns that);
+// the transient second slab it allocates is the same shape as rebuild's. It is
+// owner-serial, so it needs no lock.
+func (n *nativeStore) colocateSlab() {
+	if n.deadRecs != 0 {
+		return
+	}
+	fresh := make([]byte, 0, len(n.slab))
+	n.tree.Each(func(_ uint64, ref uint32) bool {
+		r := &n.recs[ref]
+		loc := uint32(len(fresh))
+		fresh = append(fresh, n.slab[r.loc:r.loc+r.mlen]...)
+		r.loc = loc
+		return true
+	})
+	n.slab = fresh
+	n.scatteredInserts = 0
+	n.readElems = 0
+}
+
+// maybeColocate reorders the slab into rank order on an ordered read once the
+// insertion order has diverged enough for the scatter to bite and reads have paid
+// for the reorder. readElems is the number of elements the current read streams.
+// It fires when every one of these holds:
+//
+//   - the store has no dead records, since the churn rebuild owns the layout
+//     while removals are pending;
+//   - the zset is large enough for the scatter to leave cache (colocateFloor);
+//   - at least card/8 members have been inserted or rescored since the last
+//     reorder, so a single insert into a settled zset does not reorder a slab
+//     that is still almost entirely in place;
+//   - ordered reads have streamed at least a cardinality of elements since the
+//     last reorder, so the O(card) reorder is amortized to one sequential copy
+//     per read element and a write-heavy, rarely read store never pays for it.
+//
+// Called at the head of the ordered walks so the walk itself reads the
+// co-located slab.
+func (n *nativeStore) maybeColocate(readElems int) {
+	if n.deadRecs != 0 {
+		return
+	}
+	card := n.card()
+	if card < colocateFloor {
+		return
+	}
+	n.readElems += readElems
+	if 8*n.scatteredInserts < card || n.readElems < card {
+		return
+	}
+	n.colocateSlab()
+}
+
 // walkRange streams entries at forward ranks lo..hi inclusive in ascending
 // order, handing each member (aliasing the slab, valid until the next write)
 // and its raw score bits to fn. It seeks to lo with a counted select then
 // follows the leaf chain over just the window (section 6.4), so a far ZRANGE is
 // a seek plus a bounded walk, not a full scan, and it allocates nothing.
 func (n *nativeStore) walkRange(lo, hi int, fn func(m []byte, bits uint64)) {
+	n.maybeColocate(hi - lo + 1)
 	remaining := hi - lo + 1
 	n.tree.WalkFromRank(uint64(lo), func(_ uint64, ref uint32) bool {
 		r := &n.recs[ref]
@@ -274,6 +362,7 @@ func (n *nativeStore) walkRange(lo, hi int, fn func(m []byte, bits uint64)) {
 // the ZRANGE REV and ZREVRANGE walk. It descends to the high end and walks back
 // with the tree's reverse leaf walk, re-seeking at most once per leaf boundary.
 func (n *nativeStore) walkRangeRev(lo, hi int, fn func(m []byte, bits uint64)) {
+	n.maybeColocate(hi - lo + 1)
 	remaining := hi - lo + 1
 	n.tree.WalkFromRankRev(uint64(hi), func(_ uint64, ref uint32) bool {
 		r := &n.recs[ref]
@@ -412,6 +501,10 @@ func (n *nativeStore) rebuild(live int) {
 		return true
 	})
 	fresh.tree = structs.BulkLoad(entries)
+	// The fresh slab is in record (insertion) order, not rank order, so a later
+	// ordered read can re-co-locate it; mark it fully diverged. deadRecs is zero
+	// on the fresh store, so the next qualifying walk is free to reorder.
+	fresh.scatteredInserts = live
 	*n = *fresh
 }
 
