@@ -64,8 +64,8 @@ func TestInlinePointOps(t *testing.T) {
 	}
 }
 
-// The entry-count threshold: a hash stays inline through 128 fields and promotes
-// on the 129th (spec 2064/f3/10 sections 2.1 and 4.2).
+// The entry-count threshold: a hash stays inline through 512 fields and promotes
+// on the 513th (spec 2064/f3/10 sections 2.1 and 4.2).
 func TestEntryCountPromotion(t *testing.T) {
 	h := newHash()
 	for i := 0; i < maxListpackEntries; i++ {
@@ -76,7 +76,7 @@ func TestEntryCountPromotion(t *testing.T) {
 	}
 	h.set([]byte("one-more"), []byte("v"))
 	if h.enc != encHashtable {
-		t.Fatalf("129th field should promote to hashtable, got %s", h.enc)
+		t.Fatalf("the 513th field should promote to hashtable, got %s", h.enc)
 	}
 	if h.card() != maxListpackEntries+1 {
 		t.Fatalf("card after promotion = %d, want %d", h.card(), maxListpackEntries+1)
@@ -136,7 +136,7 @@ func TestValueWidthPromotion(t *testing.T) {
 // deleted field's slot is reused by a later insert.
 func TestNativeSwapRemove(t *testing.T) {
 	h := forceNative(newHash())
-	for i := 0; i < 300; i++ { // well past the 128 inline cap
+	for i := 0; i < 300; i++ { // forceNative already promoted; this fills the table
 		h.set([]byte("f"+strconv.Itoa(i)), []byte("v"+strconv.Itoa(i)))
 	}
 	if h.enc != encHashtable {

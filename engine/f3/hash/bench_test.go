@@ -13,7 +13,7 @@ import (
 // floor, and the gate rows key on the server numbers.
 
 // pairs returns n field-value pairs, all short enough to stay in the inline band
-// up to the 128-field cap, so the benchmarks never allocate keys inside the timed
+// up to the 512-field cap, so the benchmarks never allocate keys inside the timed
 // loop.
 func pairs(n int) [][2][]byte {
 	out := make([][2][]byte, n)
@@ -75,7 +75,7 @@ func BenchmarkHGetNative(b *testing.B) {
 	}
 }
 
-// BenchmarkConvertInlineToNative prices the one-way promotion replay at the 128
+// BenchmarkConvertInlineToNative prices the one-way promotion replay at the 512
 // entry cap: allocate the table, replay every blob entry, drop the blob.
 func BenchmarkConvertInlineToNative(b *testing.B) {
 	ps := pairs(maxListpackEntries)

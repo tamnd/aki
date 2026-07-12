@@ -1,5 +1,7 @@
 package hash
 
+import "encoding/binary"
+
 // The inline hash band (spec 2064/f3/10 section 4): a small hash is one packed
 // blob in the key's record and carries no table, no vector, and no per-field
 // allocation. A write whose result would breach either inline threshold converts
@@ -7,16 +9,18 @@ package hash
 // (F4). This slice carries the inline and native bands and the one-way transition
 // between them; the partitioned and cold bands are later work.
 //
-// The inline caps are Redis's own hash-max-listpack-entries (128) and
-// hash-max-listpack-value (64). aki hardcodes the Redis defaults here the same
-// way set.go hardcodes its listpack caps: there is no config plumb for them yet,
-// and sharing the thresholds is what keeps OBJECT ENCODING honest by construction
-// (spec 2064/f3/10 section 4.4). CONFIG SET on either knob would land with that
-// plumb, not here.
+// The inline caps are hash-max-listpack-entries and hash-max-listpack-value. The
+// binding rule of doc 4.4 is to share the rival's thresholds so OBJECT ENCODING
+// is honest by construction, and the tested rival is the redis 8.8.0 build, whose
+// defaults are 512 entries and 64 value bytes. The doc's parenthetical 128 is the
+// classic default, but 512 is what the live differential measures, so that is what
+// aki matches. aki hardcodes these the same way set.go hardcodes its listpack
+// caps: there is no config plumb yet, and CONFIG SET will read the real configured
+// value when the plumb lands, not here.
 const (
-	// maxListpackEntries is hash-max-listpack-entries: a hash past 128 fields
-	// leaves the inline band for the native table.
-	maxListpackEntries = 128
+	// maxListpackEntries is hash-max-listpack-entries: a hash past 512 fields
+	// leaves the inline band for the native table (redis 8.8.0 build default).
+	maxListpackEntries = 512
 	// maxListpackValue is hash-max-listpack-value: a field name or value past 64
 	// bytes forces the native band on its own.
 	maxListpackValue = 64
@@ -43,13 +47,15 @@ func (e encoding) String() string {
 type hash struct {
 	enc encoding
 
-	// inline band: one packed blob, laid out as [count:uint8][flags:uint8] then
-	// count entries of [flen:uint8][field][vlen:uint8][value] (spec 2064/f3/10
-	// section 4.1). Field names and values are both capped at 64 bytes inline, so
-	// a single length byte holds either. The flags byte reserves bit 0 for the
-	// ttl-present marker of the listpackex variant, which is always 0 this slice
-	// (field TTL is a later slice); it is written so the blob layout is already
-	// the one field TTL extends rather than a shape it has to migrate.
+	// inline band: one packed blob, laid out as [count:uint16-le][flags:uint8]
+	// then count entries of [flen:uint8][field][vlen:uint8][value] (spec
+	// 2064/f3/10 section 4.1). Field names and values are both capped at 64 bytes
+	// inline, so a single length byte holds either. The count is two bytes because
+	// the inline band now holds up to 512 fields, past what a single byte counts.
+	// The flags byte reserves bit 0 for the ttl-present marker of the listpackex
+	// variant, which is always 0 this slice (field TTL is a later slice); it is
+	// written so the blob layout is already the one field TTL extends rather than
+	// a shape it has to migrate.
 	blob []byte
 
 	// native band: the field table, built by inlineToNative and never converted
@@ -57,25 +63,34 @@ type hash struct {
 	ft *ftable
 }
 
-// blob header offsets: count in byte 0, flags in byte 1, first entry at byte 2.
+// blob header offsets: a uint16 little-endian count in bytes 0:2, the flags byte
+// at 2, the first entry at 3.
 const (
 	blobCountOff = 0
-	blobFlagsOff = 1
-	blobHeader   = 2
+	blobFlagsOff = 2
+	blobHeader   = 3
 )
 
 // newHash builds an empty inline hash. Every hash is born in the listpack band;
 // the first write that breaches a threshold promotes it (spec 2064/f3/10 section
 // 4.1, matching Redis's listpack-first hashes).
 func newHash() *hash {
-	return &hash{enc: encListpack, blob: []byte{0, 0}}
+	return &hash{enc: encListpack, blob: []byte{0, 0, 0}}
+}
+
+// inlineCount reads and writes the two-byte little-endian field count in the blob
+// header. Kept in one place so the append and delete paths stay in sync.
+func (h *hash) inlineCount() int { return int(binary.LittleEndian.Uint16(h.blob[blobCountOff:])) }
+
+func (h *hash) setInlineCount(n int) {
+	binary.LittleEndian.PutUint16(h.blob[blobCountOff:], uint16(n))
 }
 
 // card is the live field count, answering HLEN in O(1) on both bands: an inline
-// hash reads its count byte, a native hash reads the table header.
+// hash reads its two-byte count header, a native hash reads the table header.
 func (h *hash) card() int {
 	if h.enc == encListpack {
-		return int(h.blob[blobCountOff])
+		return h.inlineCount()
 	}
 	return h.ft.card()
 }
@@ -169,14 +184,14 @@ func (h *hash) del(field []byte) bool {
 	}
 	end := h.inlineEntryEnd(off)
 	h.blob = append(h.blob[:off], h.blob[end:]...)
-	h.blob[blobCountOff]--
+	h.setInlineCount(h.inlineCount() - 1)
 	return true
 }
 
 // mustPromote reports whether applying (field, value) to the inline band would
 // breach an inline threshold, which forces the one-way promotion to native: a
 // field name or value over 64 bytes, or a genuinely new field taking the count
-// past 128 (spec 2064/f3/10 sections 2.1 and 4.2).
+// past 512 (spec 2064/f3/10 sections 2.1 and 4.2).
 func (h *hash) mustPromote(field, value []byte, exists bool) bool {
 	if len(field) > maxListpackValue || len(value) > maxListpackValue {
 		return true
@@ -226,7 +241,7 @@ func (h *hash) inlineAppend(field, value []byte) {
 	h.blob = append(h.blob, field...)
 	h.blob = append(h.blob, byte(len(value)))
 	h.blob = append(h.blob, value...)
-	h.blob[blobCountOff]++
+	h.setInlineCount(h.inlineCount() + 1)
 }
 
 // inlineOverwrite replaces the value of the entry at off, splicing the blob when

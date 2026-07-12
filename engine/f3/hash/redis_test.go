@@ -150,9 +150,11 @@ func canonHarness(t *testing.T, raw []byte) string {
 // --- the vendored band ladder, replayed live ---------------------------------
 
 // hashEncodingCases carry the encoding real Redis reports for the same fields
-// under the default config (spec 2064/f3/10 section 4.4):
+// under the redis 8.8.0 build defaults (spec 2064/f3/10 section 4.4), verified
+// live: at 512 fields OBJECT ENCODING is listpack and at 513 it flips to
+// hashtable, and a 64-byte field or value stays listpack while 65 bytes converts:
 //
-//	hash-max-listpack-entries 128
+//	hash-max-listpack-entries 512
 //	hash-max-listpack-value   64
 //
 // The expectations are vendored so TestHashEncodingParity runs offline;
@@ -258,7 +260,7 @@ var pointScript = [][]string{
 	{"HMSET", "h", "odd", "1", "trailing"},      // arity error (handler-enforced)
 	{"OBJECT", "ENCODING", "h"},                 // $listpack
 	{"OBJECT", "ENCODING", "s"},                 // $int (string store, via the chain)
-	{"OBJECT", "ENCODING", "gone"},              // -ERR no such key
+	{"OBJECT", "ENCODING", "gone"},              // $-1 nil (redis 8.8.0, not an error)
 	// Promote by writing a value past the 64-byte cap, then re-probe the same
 	// fields on the native side to prove the boundary is invisible.
 	{"HSET", "h", "wide", strings.Repeat("z", maxListpackValue+1)}, // :1, promotes

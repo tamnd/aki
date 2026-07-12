@@ -8,10 +8,11 @@ import (
 // Object answers OBJECT ENCODING key (spec 2064/f3/11 section 3): the storage
 // encoding a set reports, which is what the differential test checks against
 // Redis. A set answers intset, listpack, or hashtable per its live band; a
-// key the string store owns gets a best-effort string encoding; a missing key
-// is the Redis "no such key" error. Only the ENCODING subcommand is wired in
-// this slice; the others (REFCOUNT, IDLETIME, FREQ) return the standard
-// unknown-subcommand error.
+// key the string store owns gets a best-effort string encoding; a key that
+// exists nowhere answers nil, which is what the redis 8.8.0 build returns for
+// OBJECT ENCODING on a missing key (a null bulk, not an error; verified live).
+// Only the ENCODING subcommand is wired in this slice; the others (REFCOUNT,
+// IDLETIME, FREQ) return the standard unknown-subcommand error.
 func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if !eqFold(args[0], "ENCODING") || len(args) != 2 {
 		r.Err("ERR Unknown OBJECT subcommand or wrong number of arguments. Try OBJECT HELP.")
@@ -32,7 +33,9 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	v, ok := cx.St.GetString(key, cx.NowMs, cx.Val)
 	cx.Val = v
 	if !ok {
-		r.Err("ERR no such key")
+		// The key exists in no store: redis 8.8.0 answers a null bulk here, not
+		// an error.
+		r.Null()
 		return
 	}
 	r.Bulk([]byte(stringEncoding(v)))

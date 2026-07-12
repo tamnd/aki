@@ -78,10 +78,11 @@ func TestHdelDropsKey(t *testing.T) {
 	wantInt(t, do(t, c, opHdel, "h", "a", "x", "b"), 2) // x absent
 	wantInt(t, do(t, c, opHlen, "h"), 1)
 	wantInt(t, do(t, c, opHdel, "h", "c"), 1)
-	// The key is gone: HLEN 0, HGET nil, and OBJECT reports no such key.
+	// The key is gone: HLEN 0, HGET nil, and OBJECT ENCODING answers nil (redis
+	// 8.8.0 returns a null bulk for a key that exists nowhere).
 	wantInt(t, do(t, c, opHlen, "h"), 0)
 	wantNil(t, do(t, c, opHget, "h", "c"))
-	wantErr(t, doAt(t, c, opObject, 1, "ENCODING", "h"), "ERR no such key")
+	wantNil(t, doAt(t, c, opObject, 1, "ENCODING", "h"))
 	// HDEL on a missing key is 0.
 	wantInt(t, do(t, c, opHdel, "nokey", "a"), 0)
 }
@@ -108,7 +109,8 @@ func TestObjectEncodingTransition(t *testing.T) {
 	c := newHarness(t).NewConn()
 	do(t, c, opHset, "h", "a", "1")
 	wantBulk(t, doAt(t, c, opObject, 1, "ENCODING", "h"), "listpack")
-	// Grow to the 128 cap, still listpack.
+	// Grow to the 512 entry cap, still listpack. The first HSET already seated one
+	// field, so one field short of the cap keeps it inline.
 	for i := 0; i < maxListpackEntries-1; i++ {
 		do(t, c, opHset, "h", "f"+strconv.Itoa(i), "v")
 	}
@@ -121,25 +123,52 @@ func TestObjectEncodingTransition(t *testing.T) {
 	do(t, c, opHset, "big", "f", strings.Repeat("x", maxListpackValue+1))
 	wantBulk(t, doAt(t, c, opObject, 1, "ENCODING", "big"), "hashtable")
 
-	// A key the string store owns reports its string encoding, and a missing key
-	// is the no-such-key error, both through the delegation chain.
+	// A key the string store owns reports its string encoding, and a key that
+	// exists nowhere answers nil (redis 8.8.0 returns a null bulk, not an error),
+	// both through the delegation chain.
 	do(t, c, opSet, "s", "12345")
 	wantBulk(t, doAt(t, c, opObject, 1, "ENCODING", "s"), "int")
-	wantErr(t, doAt(t, c, opObject, 1, "ENCODING", "gone"), "ERR no such key")
+	wantNil(t, doAt(t, c, opObject, 1, "ENCODING", "gone"))
+}
+
+// The inline band holds up to 512 fields, past what a single count byte can
+// hold, so the blob header is a two-byte count. This drives the inline band well
+// past 255 fields and checks that HLEN and the encoding stay correct: a one-byte
+// count would have wrapped at 256 and both the length and the conversion trigger
+// would have broken. Then one field past the cap flips it to native.
+func TestInlineCountBeyondByte(t *testing.T) {
+	c := newHarness(t).NewConn()
+	for i := 0; i < 400; i++ {
+		do(t, c, opHset, "h", "f"+strconv.Itoa(i), "v")
+	}
+	// 400 > 255: a uint8 count would report 400-256 = 144 here.
+	wantInt(t, do(t, c, opHlen, "h"), 400)
+	wantBulk(t, doAt(t, c, opObject, 1, "ENCODING", "h"), "listpack")
+	// Fill exactly to the 512 cap, still inline.
+	for i := 400; i < maxListpackEntries; i++ {
+		do(t, c, opHset, "h", "f"+strconv.Itoa(i), "v")
+	}
+	wantInt(t, do(t, c, opHlen, "h"), maxListpackEntries)
+	wantBulk(t, doAt(t, c, opObject, 1, "ENCODING", "h"), "listpack")
+	// Field 513 crosses the cap and promotes to the native table.
+	do(t, c, opHset, "h", "one-more", "v")
+	wantInt(t, do(t, c, opHlen, "h"), maxListpackEntries+1)
+	wantBulk(t, doAt(t, c, opObject, 1, "ENCODING", "h"), "hashtable")
 }
 
 // A hash driven all the way across the band boundary through the wire keeps
 // answering point commands correctly on the native side.
 func TestPointOpsAfterPromotion(t *testing.T) {
 	c := newHarness(t).NewConn()
-	for i := 0; i < 200; i++ { // past the 128 cap, so the hash is native
+	const n = 600 // past the 512 entry cap, so the hash is native
+	for i := 0; i < n; i++ {
 		do(t, c, opHset, "h", "f"+strconv.Itoa(i), "v"+strconv.Itoa(i))
 	}
 	wantBulk(t, doAt(t, c, opObject, 1, "ENCODING", "h"), "hashtable")
-	wantInt(t, do(t, c, opHlen, "h"), 200)
+	wantInt(t, do(t, c, opHlen, "h"), n)
 	wantBulk(t, do(t, c, opHget, "h", "f150"), "v150")
-	wantInt(t, do(t, c, opHexists, "h", "f199"), 1)
-	wantInt(t, do(t, c, opHexists, "h", "f200"), 0)
+	wantInt(t, do(t, c, opHexists, "h", "f599"), 1)
+	wantInt(t, do(t, c, opHexists, "h", "f600"), 0)
 	wantInt(t, do(t, c, opHstrlen, "h", "f150"), 4)
-	wantArray(t, do(t, c, opHmget, "h", "f0", "absent", "f199"), "v0", nilElem, "v199")
+	wantArray(t, do(t, c, opHmget, "h", "f0", "absent", "f599"), "v0", nilElem, "v599")
 }
