@@ -32,6 +32,15 @@ const (
 	opHkeys
 	opHvals
 	opObject
+	opHexpire
+	opHpexpire
+	opHexpireat
+	opHpexpireat
+	opHttl
+	opHpttl
+	opHexpiretime
+	opHpexpiretime
+	opHpersist
 	opSet // seed a string key to test WRONGTYPE and the OBJECT fallthrough
 	opLast
 )
@@ -55,6 +64,15 @@ func harnessHandlers() []shard.Handler {
 	h[opHkeys] = Hkeys
 	h[opHvals] = Hvals
 	h[opObject] = Object
+	h[opHexpire] = Hexpire
+	h[opHpexpire] = Hpexpire
+	h[opHexpireat] = Hexpireat
+	h[opHpexpireat] = Hpexpireat
+	h[opHttl] = Httl
+	h[opHpttl] = Hpttl
+	h[opHexpiretime] = Hexpiretime
+	h[opHpexpiretime] = Hpexpiretime
+	h[opHpersist] = Hpersist
 	h[opSet] = func(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		if err := cx.St.Set(args[0], args[1]); err != nil {
 			r.Err("ERR " + err.Error())

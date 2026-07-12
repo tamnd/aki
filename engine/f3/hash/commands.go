@@ -32,6 +32,11 @@ func Hset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	for i := 1; i < len(args); i += 2 {
 		if h.set(args[i], args[i+1]) {
 			added++
+		} else {
+			// Overwriting a field with HSET drops its TTL (verified against Redis 8.8:
+			// HSET clears the field TTL, HINCRBY keeps it). A no-op on a field without
+			// a TTL, and O(1) on a hash that never set one.
+			h.clearFieldExp(args[i])
 		}
 	}
 	r.Int(added)
@@ -50,7 +55,10 @@ func Hmset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	for i := 1; i < len(args); i += 2 {
-		h.set(args[i], args[i+1])
+		if !h.set(args[i], args[i+1]) {
+			// HMSET clears an overwritten field's TTL, the same as HSET.
+			h.clearFieldExp(args[i])
+		}
 	}
 	r.Status("OK")
 }
@@ -199,7 +207,14 @@ func Hdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 func getOrCreate(cx *shard.Ctx, key []byte) (h *hash, wrong bool) {
 	g := registry(cx)
 	if h = g.m[string(key)]; h != nil {
-		return h, false
+		// Reap fired fields first, the same lazy expiry lookup runs (reg.go). A hash
+		// reaped empty is dropped and recreated fresh below, so a write onto a hash
+		// whose fields all expired starts a new listpack, not a lingering listpackex.
+		h.reap(uint64(cx.NowMs))
+		if h.card() > 0 {
+			return h, false
+		}
+		delete(g.m, string(key))
 	}
 	if cx.St.Exists(key, cx.NowMs) {
 		return nil, true

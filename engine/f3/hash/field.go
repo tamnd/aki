@@ -48,6 +48,17 @@ type ftable struct {
 	// time, so moving bytes or repurposing a record's ordinal would slide the read
 	// (hgetall.go, the same pin set's htable takes for SMEMBERS).
 	streams int
+
+	// exp is the field-TTL column (spec 2064/f3/10 section 6): an absolute unix-ms
+	// expiry per record ordinal, held parallel to ents and indexed by ordinal, not
+	// by slab offset, so compaction moves bytes without disturbing it. It is nil
+	// until the first HEXPIRE-family setter touches this table, so a hash that
+	// never sets a field TTL carries no expiry bytes at all (the memory bar: TTL
+	// costs the eight inline bytes only for the fields that use it). A zero entry
+	// means the field has no expiry. The native band keeps reporting hashtable for
+	// OBJECT ENCODING with or without a TTL, matching Redis; only the inline band
+	// grows the listpackex sticky variant.
+	exp []uint64
 }
 
 // newFtable builds an empty table sized for hint fields, so the inline-to-native
@@ -173,9 +184,19 @@ func (f *ftable) newRecord(field, value []byte) uint32 {
 		ord = f.free[n-1]
 		f.free = f.free[:n-1]
 		f.ents[ord] = e
+		if f.exp != nil {
+			// A reused ordinal must not inherit the previous record's expiry; a fresh
+			// field is born without a TTL.
+			f.exp[ord] = 0
+		}
 	} else {
 		ord = uint32(len(f.ents))
 		f.ents = append(f.ents, e)
+		if f.exp != nil {
+			// Keep the expiry column the same length as ents so an ordinal always
+			// indexes both.
+			f.exp = append(f.exp, 0)
+		}
 	}
 	f.vec = append(f.vec, ord)
 	return ord
@@ -189,6 +210,15 @@ func (f *ftable) del(field []byte) bool {
 	if !ok {
 		return false
 	}
+	f.removeOrd(ord)
+	return true
+}
+
+// removeOrd is the swap-remove tail shared by del and the reap path: the record
+// has already left the table, so drop it from the dense draw vector (moving the
+// last ordinal into its slot and fixing that record's vslot), charge its bytes to
+// the dead count, free its ordinal, and clear its expiry so a reuse starts clean.
+func (f *ftable) removeOrd(ord uint32) {
 	e := &f.ents[ord]
 	v := e.vslot
 	last := len(f.vec) - 1
@@ -199,8 +229,10 @@ func (f *ftable) del(field []byte) bool {
 
 	f.dead += int(e.flen) + int(e.vlen)
 	f.free = append(f.free, ord)
+	if f.exp != nil {
+		f.exp[ord] = 0
+	}
 	f.maybeCompact()
-	return true
 }
 
 // at returns the field-value pair at draw-vector position idx, the native band's
@@ -289,6 +321,74 @@ func (f *ftable) vlenByOrd(ord uint32) int { return int(f.ents[ord].vlen) }
 // command time and the unpin from the stream's Release on the pump.
 func (f *ftable) pinStream()   { f.streams++ }
 func (f *ftable) unpinStream() { f.streams-- }
+
+// fieldExp returns the absolute unix-ms expiry of field, or 0 when the field is
+// absent or carries no TTL. Zero-cost on a table that never set a field TTL: the
+// nil column short-circuits before the probe.
+func (f *ftable) fieldExp(field []byte) uint64 {
+	if f.exp == nil {
+		return 0
+	}
+	ord, ok := f.tbl.Find(store.Hash(field), field, f)
+	if !ok {
+		return 0
+	}
+	return f.exp[ord]
+}
+
+// setFieldExp writes field's expiry to at (absolute unix ms; 0 clears it),
+// allocating the expiry column on first use, and reports whether the field was
+// present. The caller has already reaped, so an existing field is live.
+func (f *ftable) setFieldExp(field []byte, at uint64) bool {
+	ord, ok := f.tbl.Find(store.Hash(field), field, f)
+	if !ok {
+		return false
+	}
+	if f.exp == nil {
+		f.exp = make([]uint64, len(f.ents))
+	}
+	f.exp[ord] = at
+	return true
+}
+
+// clearFieldExp drops field's TTL if it has one, the HSET-overwrite and HPERSIST
+// path. A table with no expiry column has nothing to clear.
+func (f *ftable) clearFieldExp(field []byte) {
+	if f.exp == nil {
+		return
+	}
+	if ord, ok := f.tbl.Find(store.Hash(field), field, f); ok {
+		f.exp[ord] = 0
+	}
+}
+
+// reap deletes every field whose expiry is at or before now and returns the
+// smallest surviving expiry (0 when none remain), the value the hash caches as
+// its next-expire hint. It walks the draw vector once; a swap-remove during the
+// walk moves the last ordinal into the current slot, so the index is rechecked
+// rather than advanced on a delete. Only reached when the caller's hint says a
+// field is due, so the scan is not on the steady read path.
+func (f *ftable) reap(now uint64) uint64 {
+	if f.exp == nil {
+		return 0
+	}
+	var next uint64
+	for i := 0; i < len(f.vec); {
+		ord := f.vec[i]
+		at := f.exp[ord]
+		if at != 0 && at <= now {
+			field := f.slab[f.ents[ord].foff : f.ents[ord].foff+uint32(f.ents[ord].flen)]
+			f.tbl.Delete(store.Hash(field), field, f)
+			f.removeOrd(ord)
+			continue
+		}
+		if at != 0 && (next == 0 || at < next) {
+			next = at
+		}
+		i++
+	}
+	return next
+}
 
 // maybeCompact rewrites the slab when the dead bytes behind deleted and
 // overwritten records outgrow the live ones, so churn cannot grow the slab

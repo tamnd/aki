@@ -428,6 +428,15 @@ func init() {
 	register("HGETALL", hash.Hgetall, 1, 1, true)
 	register("HKEYS", hash.Hkeys, 1, 1, true)
 	register("HVALS", hash.Hvals, 1, 1, true)
+	register("HEXPIRE", hash.Hexpire, 5, -1, true)
+	register("HPEXPIRE", hash.Hpexpire, 5, -1, true)
+	register("HEXPIREAT", hash.Hexpireat, 5, -1, true)
+	register("HPEXPIREAT", hash.Hpexpireat, 5, -1, true)
+	register("HTTL", hash.Httl, 4, -1, true)
+	register("HPTTL", hash.Hpttl, 4, -1, true)
+	register("HEXPIRETIME", hash.Hexpiretime, 4, -1, true)
+	register("HPEXPIRETIME", hash.Hpexpiretime, 4, -1, true)
+	register("HPERSIST", hash.Hpersist, 4, -1, true)
 
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
