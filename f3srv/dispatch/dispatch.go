@@ -466,11 +466,15 @@ func init() {
 
 	// XREAD names its keys after the STREAMS token (past optional COUNT/BLOCK), so
 	// it routes through streamKeyAt to the first key's shard; crossKeys guards the
-	// co-location of a multi-key set. The multi-shard read snapshot is owed to the
-	// blocking slice.
+	// co-location of a multi-key set. blocks arms the reader barrier after enqueue
+	// so an XREAD BLOCK that parks holds its reply open until an XADD or the timeout
+	// completes it, the same seam BLPOP uses; a non-blocking XREAD disarms the
+	// barrier as soon as its immediate reply emits. The multi-shard read snapshot is
+	// owed to a later slice.
 	register("XREAD", stream.Xread, 3, -1, false)
 	table["XREAD"].crossKeys = stream.ReadKeys
 	table["XREAD"].streamKeyAt = stream.ReadKeyAt
+	table["XREAD"].blocks = true
 
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked

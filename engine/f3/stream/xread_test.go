@@ -7,8 +7,7 @@ import (
 // The XREAD suite (spec 2064/f3/14 section 6.3): the non-blocking forward read
 // over one and several streams, COUNT, the "$" and "+" special IDs, the
 // empty-result null array, and the routing-key extraction the dispatcher relies
-// on. Blocking (the BLOCK clause and the waiter sets) is a later slice; this one
-// refuses BLOCK rather than mishandling it.
+// on. The BLOCK clause and its waiter set are exercised in xread_block_test.go.
 
 // streamWant is one expected [key, entries] row of an XREAD reply.
 type streamWant struct {
@@ -149,13 +148,6 @@ func TestXreadMissingStream(t *testing.T) {
 		sw("s", e("1-0", "f", "v")))
 }
 
-func TestXreadBlockUnsupported(t *testing.T) {
-	c := newHarness(t).NewConn()
-	do(t, c, opXadd, "s", "1-0", "f", "v")
-	wantErr(t, do(t, c, opXread, "BLOCK", "100", "STREAMS", "s", "$"),
-		"ERR stream blocking is not supported yet")
-}
-
 func TestXreadSyntax(t *testing.T) {
 	c := newHarness(t).NewConn()
 	// No STREAMS token.
@@ -169,6 +161,15 @@ func TestXreadSyntax(t *testing.T) {
 	// COUNT with a non-integer.
 	wantErr(t, do(t, c, opXread, "COUNT", "x", "STREAMS", "s", "0"),
 		"ERR value is not an integer or out of range")
+	// COUNT with no value at all.
+	wantErr(t, do(t, c, opXread, "COUNT"), "ERR syntax error")
+	// BLOCK with no value.
+	wantErr(t, do(t, c, opXread, "BLOCK"), "ERR syntax error")
+	// A stray token where STREAMS should be.
+	wantErr(t, do(t, c, opXread, "COUNT", "5", "junk", "s", "0"), "ERR syntax error")
+	// COUNT and BLOCK in the reverse order still parse, so the missing STREAMS is
+	// the only error.
+	wantErr(t, do(t, c, opXread, "BLOCK", "5", "COUNT", "5"), "ERR syntax error")
 }
 
 func TestXreadWrongType(t *testing.T) {
