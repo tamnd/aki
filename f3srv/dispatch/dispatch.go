@@ -421,6 +421,8 @@ func init() {
 	register("HEXISTS", hash.Hexists, 2, 2, true)
 	register("HLEN", hash.Hlen, 1, 1, true)
 	register("HSTRLEN", hash.Hstrlen, 2, 2, true)
+	register("HINCRBY", hash.Hincrby, 3, 3, true)
+	register("HINCRBYFLOAT", hash.Hincrbyfloat, 3, 3, true)
 
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
