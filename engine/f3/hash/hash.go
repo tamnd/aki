@@ -61,7 +61,29 @@ type hash struct {
 	// native band: the field table, built by inlineToNative and never converted
 	// back (F4).
 	ft *ftable
+
+	// nextExp is the field-TTL next-expire hint (spec 2064/f3/10 section 6.1): the
+	// smallest absolute unix-ms expiry among the live fields, or 0 when no field
+	// carries a TTL. It is a lower bound, exact right after a reap and never larger
+	// than the true minimum, so a command reaps (deletes fired fields on the spot)
+	// only once now reaches it. A hash that never sets a field TTL keeps it 0 and
+	// pays one comparison per command for the whole machinery. Clearing a TTL
+	// (HPERSIST, an HSET overwrite) may leave it pointing at a field that no longer
+	// expires, which only costs one early scan that recomputes it; it is never left
+	// too high. The active sweep that reaps untouched keys on a timer is deferred to
+	// M9, so a fired field survives until the next command lands on its key.
+	nextExp uint64
 }
+
+// blob flags byte, at blobFlagsOff. Bit 0 is the listpackex marker: once a field
+// TTL is set on an inline hash it flips on, the blob grows an eight-byte expiry
+// slot per entry, and OBJECT ENCODING reports listpackex. It is sticky, cleared
+// only by promotion to the native band or the key's deletion, never by HPERSIST
+// (spec 2064/f3/10 section 6.4), matching Redis's listpackex encoding.
+const (
+	blobFlagEx    = 1 << 0
+	inlineExpSize = 8 // absolute unix-ms expiry, little-endian, trailing each entry
+)
 
 // blob header offsets: a uint16 little-endian count in bytes 0:2, the flags byte
 // at 2, the first entry at 3.
@@ -199,11 +221,23 @@ func (h *hash) mustPromote(field, value []byte, exists bool) bool {
 	return !exists && h.card()+1 > maxListpackEntries
 }
 
+// exStride is the trailing bytes each inline entry carries for its field TTL:
+// eight once the listpackex sticky bit is set, zero before. Every blob walk adds
+// it to step from one entry to the next; the field and value parsing is unchanged
+// because the expiry slot sits after the value.
+func (h *hash) exStride() int {
+	if h.blob[blobFlagsOff]&blobFlagEx != 0 {
+		return inlineExpSize
+	}
+	return 0
+}
+
 // inlineIndex returns the byte offset of field's entry (pointing at its flen
 // byte), or -1 when absent. The length is checked before the byte compare so most
 // misses cost one byte load.
 func (h *hash) inlineIndex(field []byte) int {
 	b := h.blob
+	ex := h.exStride()
 	for i := blobHeader; i < len(b); {
 		flen := int(b[i])
 		fstart := i + 1
@@ -211,7 +245,7 @@ func (h *hash) inlineIndex(field []byte) int {
 		if flen == len(field) && string(b[fstart:fstart+flen]) == string(field) {
 			return i
 		}
-		i = fstart + flen + 1 + vlen
+		i = fstart + flen + 1 + vlen + ex
 	}
 	return -1
 }
@@ -225,12 +259,13 @@ func (h *hash) inlineValueAt(off int) []byte {
 }
 
 // inlineEntryEnd returns the byte just past the entry at off, the splice point
-// for a delete or an overwrite.
+// for a delete. It includes the trailing expiry slot when the sticky bit is set,
+// so a delete removes the field's TTL along with it.
 func (h *hash) inlineEntryEnd(off int) int {
 	flen := int(h.blob[off])
 	voff := off + 1 + flen
 	vlen := int(h.blob[voff])
-	return voff + 1 + vlen
+	return voff + 1 + vlen + h.exStride()
 }
 
 // inlineAppend writes one new entry at the blob tail and bumps the count. The
@@ -241,6 +276,11 @@ func (h *hash) inlineAppend(field, value []byte) {
 	h.blob = append(h.blob, field...)
 	h.blob = append(h.blob, byte(len(value)))
 	h.blob = append(h.blob, value...)
+	if h.blob[blobFlagsOff]&blobFlagEx != 0 {
+		// The listpackex layout carries an eight-byte expiry slot per entry; a new
+		// field is born without a TTL, so the slot starts zero.
+		h.blob = append(h.blob, 0, 0, 0, 0, 0, 0, 0, 0)
+	}
 	h.setInlineCount(h.inlineCount() + 1)
 }
 
@@ -270,10 +310,136 @@ func (h *hash) inlineOverwrite(off int, value []byte) {
 // the write that breached the threshold.
 func (h *hash) inlineToNative() {
 	ft := newFtable(h.card() + 1)
-	h.eachInline(func(field, value []byte) { ft.set(field, value) })
+	h.eachInlineEx(func(field, value []byte, at uint64) {
+		ft.set(field, value)
+		if at != 0 {
+			ft.setFieldExp(field, at)
+		}
+	})
 	h.ft = ft
 	h.blob = nil
 	h.enc = encHashtable
+	// The sticky listpackex bit does not carry to the native band: OBJECT ENCODING
+	// reports hashtable once promoted, with or without field TTLs, matching Redis.
+	// nextExp carries over unchanged; the native reap recomputes it exactly.
+}
+
+// eachInlineEx visits every inline entry with its field TTL, the promotion replay
+// and reap walk. at is 0 when the entry carries no expiry, always so before the
+// sticky bit is set. The slices alias the blob and are valid only for the call.
+func (h *hash) eachInlineEx(fn func(field, value []byte, at uint64)) {
+	b := h.blob
+	ex := h.exStride()
+	for i := blobHeader; i < len(b); {
+		flen := int(b[i])
+		fstart := i + 1
+		field := b[fstart : fstart+flen]
+		voff := fstart + flen
+		vlen := int(b[voff])
+		value := b[voff+1 : voff+1+vlen]
+		var at uint64
+		if ex != 0 {
+			at = binary.LittleEndian.Uint64(b[voff+1+vlen:])
+		}
+		fn(field, value, at)
+		i = voff + 1 + vlen + ex
+	}
+}
+
+// makeInlineEx flips the inline hash to its listpackex form: it rewrites the blob
+// with an eight-byte zero expiry slot after every value and sets the sticky bit,
+// so the field-TTL setters have a slot to write into. A no-op once the bit is
+// already set. Runs on the first HEXPIRE-family setter that lands on an inline
+// hash, the one-time cost Redis pays converting listpack to listpackex.
+func (h *hash) makeInlineEx() {
+	if h.blob[blobFlagsOff]&blobFlagEx != 0 {
+		return
+	}
+	old := h.blob
+	nb := make([]byte, blobHeader, len(old)+inlineExpSize*h.inlineCount())
+	copy(nb, old[:blobHeader])
+	for i := blobHeader; i < len(old); {
+		flen := int(old[i])
+		voff := i + 1 + flen
+		vlen := int(old[voff])
+		end := voff + 1 + vlen
+		nb = append(nb, old[i:end]...)
+		nb = append(nb, 0, 0, 0, 0, 0, 0, 0, 0)
+		i = end
+	}
+	h.blob = nb
+	h.blob[blobFlagsOff] |= blobFlagEx
+}
+
+// inlineExpAt reads the expiry slot of the entry at off; the caller has confirmed
+// the sticky bit is set.
+func (h *hash) inlineExpAt(off int) uint64 {
+	flen := int(h.blob[off])
+	voff := off + 1 + flen
+	vlen := int(h.blob[voff])
+	return binary.LittleEndian.Uint64(h.blob[voff+1+vlen:])
+}
+
+// setInlineExpAt writes the expiry slot of the entry at off; the caller has
+// confirmed the sticky bit is set.
+func (h *hash) setInlineExpAt(off int, at uint64) {
+	flen := int(h.blob[off])
+	voff := off + 1 + flen
+	vlen := int(h.blob[voff])
+	binary.LittleEndian.PutUint64(h.blob[voff+1+vlen:], at)
+}
+
+// inlineFieldExp returns field's absolute-ms expiry, or 0 when it is absent or
+// carries no TTL.
+func (h *hash) inlineFieldExp(field []byte) uint64 {
+	if h.blob[blobFlagsOff]&blobFlagEx == 0 {
+		return 0
+	}
+	off := h.inlineIndex(field)
+	if off < 0 {
+		return 0
+	}
+	return h.inlineExpAt(off)
+}
+
+// inlineSetFieldExp writes field's expiry, flipping the sticky bit on first use,
+// and reports whether the field was present.
+func (h *hash) inlineSetFieldExp(field []byte, at uint64) bool {
+	h.makeInlineEx()
+	off := h.inlineIndex(field)
+	if off < 0 {
+		return false
+	}
+	h.setInlineExpAt(off, at)
+	return true
+}
+
+// inlineReap deletes every inline field whose expiry has fired at or before now
+// and returns the smallest surviving expiry (0 when none remain). A delete
+// splices the entry, so the cursor holds after one and steps only past a survivor.
+func (h *hash) inlineReap(now uint64) uint64 {
+	if h.blob[blobFlagsOff]&blobFlagEx == 0 {
+		return 0
+	}
+	var next uint64
+	for i := blobHeader; i < len(h.blob); {
+		b := h.blob
+		flen := int(b[i])
+		voff := i + 1 + flen
+		vlen := int(b[voff])
+		at := binary.LittleEndian.Uint64(b[voff+1+vlen:])
+		end := voff + 1 + vlen + inlineExpSize
+		if at != 0 && at <= now {
+			h.blob = append(b[:i], b[end:]...)
+			h.setInlineCount(h.inlineCount() - 1)
+			continue
+		}
+		if at != 0 && (next == 0 || at < next) {
+			next = at
+		}
+		i = end
+	}
+	return next
 }
 
 // eachInline visits every inline entry in blob order. The slices alias the blob
@@ -281,6 +447,7 @@ func (h *hash) inlineToNative() {
 // the native band's own walk is ftable.each.
 func (h *hash) eachInline(fn func(field, value []byte)) {
 	b := h.blob
+	ex := h.exStride()
 	for i := blobHeader; i < len(b); {
 		flen := int(b[i])
 		fstart := i + 1
@@ -289,7 +456,7 @@ func (h *hash) eachInline(fn func(field, value []byte)) {
 		vlen := int(b[voff])
 		value := b[voff+1 : voff+1+vlen]
 		fn(field, value)
-		i = voff + 1 + vlen
+		i = voff + 1 + vlen + ex
 	}
 }
 
@@ -306,6 +473,7 @@ func (h *hash) at(idx int) (field, value []byte) {
 		return h.ft.at(idx)
 	}
 	b := h.blob
+	ex := h.exStride()
 	for i := blobHeader; i < len(b); {
 		flen := int(b[i])
 		fstart := i + 1
@@ -315,7 +483,7 @@ func (h *hash) at(idx int) (field, value []byte) {
 			return b[fstart : fstart+flen], b[voff+1 : voff+1+vlen]
 		}
 		idx--
-		i = voff + 1 + vlen
+		i = voff + 1 + vlen + ex
 	}
 	return nil, nil
 }
@@ -329,4 +497,71 @@ func (h *hash) each(fn func(field, value []byte)) {
 		return
 	}
 	h.ft.each(fn)
+}
+
+// fieldExp returns field's absolute unix-ms expiry, or 0 when the field is absent
+// or carries no TTL, the read HTTL and its siblings resolve through.
+func (h *hash) fieldExp(field []byte) uint64 {
+	if h.enc == encHashtable {
+		return h.ft.fieldExp(field)
+	}
+	return h.inlineFieldExp(field)
+}
+
+// setFieldExp writes field's expiry (absolute unix ms; 0 clears it), flipping the
+// inline band to listpackex on first use, and folds the value into the next-expire
+// hint. Reports whether the field was present; the caller reaps first, so present
+// means live.
+func (h *hash) setFieldExp(field []byte, at uint64) bool {
+	var ok bool
+	if h.enc == encHashtable {
+		ok = h.ft.setFieldExp(field, at)
+	} else {
+		ok = h.inlineSetFieldExp(field, at)
+	}
+	if ok && at != 0 && (h.nextExp == 0 || at < h.nextExp) {
+		h.nextExp = at
+	}
+	return ok
+}
+
+// clearFieldExp drops field's TTL, the HPERSIST and HSET-overwrite path. It leaves
+// the sticky listpackex bit and the next-expire hint alone: the bit is sticky by
+// design, and the hint is a lower bound that a later reap recomputes.
+func (h *hash) clearFieldExp(field []byte) {
+	if h.enc == encHashtable {
+		h.ft.clearFieldExp(field)
+		return
+	}
+	if h.blob[blobFlagsOff]&blobFlagEx != 0 {
+		if off := h.inlineIndex(field); off >= 0 {
+			h.setInlineExpAt(off, 0)
+		}
+	}
+}
+
+// reap deletes every field whose TTL has fired at or before now and refreshes the
+// next-expire hint. Gated by the hint, so a hash with nothing due (the common
+// case, and every hash with no field TTL) returns after one comparison. Called at
+// command entry so every read and write sees a hash free of fired fields, the
+// lazy expiry that stands in for the active sweep deferred to M9.
+func (h *hash) reap(now uint64) {
+	if h.nextExp == 0 || now < h.nextExp {
+		return
+	}
+	if h.enc == encHashtable {
+		h.nextExp = h.ft.reap(now)
+	} else {
+		h.nextExp = h.inlineReap(now)
+	}
+}
+
+// encName is what OBJECT ENCODING reports: listpackex for an inline hash that has
+// taken a field TTL (the sticky bit), listpack before, and hashtable for the
+// native band regardless of field TTLs, matching the Redis 8.8 differential.
+func (h *hash) encName() string {
+	if h.enc == encListpack && h.blob[blobFlagsOff]&blobFlagEx != 0 {
+		return "listpackex"
+	}
+	return h.enc.String()
 }

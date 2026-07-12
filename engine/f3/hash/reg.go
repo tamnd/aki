@@ -92,6 +92,15 @@ func registry(cx *shard.Ctx) *reg {
 // until keyspace unification threads every type through one holder.
 func (g *reg) lookup(cx *shard.Ctx, key []byte) (h *hash, wrong bool) {
 	if h = g.m[string(key)]; h != nil {
+		// Lazy field-TTL expiry: reap fired fields before the command sees the hash,
+		// so every read and write operates on a hash free of expired fields (spec
+		// 2064/f3/10 section 6.1). A hash whose last field just expired is deleted,
+		// the same way Redis drops a hash the moment it empties.
+		h.reap(uint64(cx.NowMs))
+		if h.card() == 0 {
+			g.drop(key)
+			return nil, false
+		}
 		return h, false
 	}
 	if cx.St.Exists(key, cx.NowMs) {

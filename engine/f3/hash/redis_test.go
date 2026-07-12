@@ -324,6 +324,69 @@ var pointScript = [][]string{
 	{"HGETALL", "s"},          // WRONGTYPE (string key)
 	{"HKEYS", "s"},            // WRONGTYPE
 	{"HVALS", "s"},            // WRONGTYPE
+
+	// --- field TTL: the HEXPIRE family (spec 2064/f3/10 section 6) -------------
+	// Absolute-time setters and the expiretime queries are byte-comparable; the
+	// relative HTTL/HPTTL are clock-relative and live in the fixed-clock structural
+	// tests, except the fixed -2/-1 codes, which ride here. The absolute times are
+	// far enough out (year 2191) that a future expiry stays future and its stored
+	// value rounds back exactly, so every reply below is deterministic.
+	{"HEXPIRE", "nokey", "100", "FIELDS", "2", "a", "b"},         // missing key -> *2[:-2,:-2]
+	{"HTTL", "nokey", "FIELDS", "1", "a"},                        // *1[:-2]
+	{"HPERSIST", "nokey", "FIELDS", "1", "a"},                    // *1[:-2]
+	{"HSET", "hx", "a", "1", "b", "2", "c", "3"},                 // :3, inline
+	{"OBJECT", "ENCODING", "hx"},                                 // $listpack, no TTL yet
+	{"HEXPIREAT", "hx", "7000000000", "FIELDS", "2", "a", "zzz"}, // *2[:1,:-2]
+	{"OBJECT", "ENCODING", "hx"},                                 // $listpackex once a TTL rode in
+	{"HEXPIRETIME", "hx", "FIELDS", "3", "a", "b", "zzz"},        // *3[:7000000000,:-1,:-2]
+	{"HTTL", "hx", "FIELDS", "1", "b"},                           // present, no TTL -> *1[:-1]
+	// Conditions on the absolute setter, byte for byte.
+	{"HEXPIREAT", "hx", "7000000000", "NX", "FIELDS", "1", "a"}, // has TTL -> :0
+	{"HEXPIREAT", "hx", "8000000000", "XX", "FIELDS", "1", "a"}, // has TTL -> :1
+	{"HEXPIREAT", "hx", "7000000000", "GT", "FIELDS", "1", "a"}, // 7e9<8e9 -> :0
+	{"HEXPIREAT", "hx", "9000000000", "GT", "FIELDS", "1", "a"}, // 9e9>8e9 -> :1
+	{"HEXPIREAT", "hx", "9500000000", "LT", "FIELDS", "1", "a"}, // 9.5e9>9e9 -> :0
+	{"HEXPIREAT", "hx", "8500000000", "LT", "FIELDS", "1", "a"}, // 8.5e9<9e9 -> :1
+	{"HEXPIREAT", "hx", "7000000000", "NX", "FIELDS", "1", "c"}, // no TTL -> :1
+	{"HEXPIREAT", "hx", "7000000000", "GT", "FIELDS", "1", "b"}, // no TTL, GT refuses -> :0
+	{"HPERSIST", "hx", "FIELDS", "3", "a", "c", "zzz"},          // *3[:1,:1,:-2]
+	{"HEXPIRETIME", "hx", "FIELDS", "1", "a"},                   // *1[:-1] after persist
+	// HSET clears a field TTL, HINCRBY preserves it.
+	{"HEXPIREAT", "hx", "7000000000", "FIELDS", "1", "a"}, // :1
+	{"HSET", "hx", "a", "99"},                             // overwrite -> :0
+	{"HEXPIRETIME", "hx", "FIELDS", "1", "a"},             // *1[:-1] cleared
+	{"HSET", "hx", "n", "10"},                             // :1
+	{"HEXPIREAT", "hx", "7000000000", "FIELDS", "1", "n"}, // :1
+	{"HINCRBY", "hx", "n", "5"},                           // :15
+	{"HEXPIRETIME", "hx", "FIELDS", "1", "n"},             // *1[:7000000000] preserved
+	// Millisecond absolute round-trip.
+	{"HPEXPIREAT", "hx", "7000000000500", "FIELDS", "1", "b"}, // :1
+	{"HPEXPIRETIME", "hx", "FIELDS", "1", "b"},                // *1[:7000000000500]
+	// Set-to-the-past deletes the field on the spot.
+	{"HEXPIREAT", "hx", "1", "FIELDS", "1", "c"}, // past -> :2
+	{"HEXISTS", "hx", "c"},                       // :0
+	// Native band still reports hashtable with a field TTL.
+	{"HSET", "hn", "a", "1"}, // :1
+	{"HSET", "hn", "wide", strings.Repeat("z", maxListpackValue+1)}, // :1, promotes
+	{"HEXPIREAT", "hn", "7000000000", "FIELDS", "1", "a"},           // :1
+	{"OBJECT", "ENCODING", "hn"},                                    // $hashtable
+	{"HEXPIRETIME", "hn", "FIELDS", "1", "a"},                       // *1[:7000000000]
+	// Error paths outrank the key lookup, byte for byte.
+	{"HEXPIRE", "hx", "-5", "FIELDS", "1", "a"},                   // must be >= 0
+	{"HEXPIRE", "hx", "99999999999999999", "FIELDS", "1", "a"},    // over cap
+	{"HPEXPIREAT", "hx", "99999999999999999", "FIELDS", "1", "a"}, // over cap
+	{"HEXPIRE", "hx", "notanint", "FIELDS", "1", "a"},             // not an integer
+	{"HEXPIRE", "hx", "100", "FIELDS", "0", "a"},                  // numFields 0
+	{"HEXPIRE", "hx", "100", "FIELDS", "xx", "a"},                 // numFields not int
+	{"HEXPIRE", "hx", "100", "FIELDS", "3", "a"},                  // short count
+	{"HEXPIRE", "hx", "100", "FIELDS", "1", "a", "b"},             // long count -> unknown argument: b
+	{"HEXPIRE", "hx", "100", "a"},                                 // no FIELDS
+	{"HEXPIRE", "hx", "100", "ZZ", "FIELDS", "1", "a"},            // unknown token before FIELDS
+	{"HEXPIRE", "hx", "100", "NX", "XX", "FIELDS", "1", "a"},      // multiple conditions
+	{"HEXPIRE", "s", "100", "FIELDS", "1", "a"},                   // WRONGTYPE
+	{"HTTL", "s", "FIELDS", "1", "a"},                             // WRONGTYPE
+	{"HPERSIST", "s", "FIELDS", "1", "a"},                         // WRONGTYPE
+	{"HEXPIRETIME", "s", "FIELDS", "1", "a"},                      // WRONGTYPE
 }
 
 // verbOp routes a script verb to the harness op byte.
@@ -334,7 +397,12 @@ var verbOp = map[string]byte{
 	"HINCRBY": opHincrby, "HINCRBYFLOAT": opHincrbyfloat,
 	"HSCAN": opHscan, "HRANDFIELD": opHrandfield,
 	"HGETALL": opHgetall, "HKEYS": opHkeys, "HVALS": opHvals,
-	"OBJECT": opObject, "SET": opSet,
+	"HEXPIRE": opHexpire, "HPEXPIRE": opHpexpire,
+	"HEXPIREAT": opHexpireat, "HPEXPIREAT": opHpexpireat,
+	"HTTL": opHttl, "HPTTL": opHpttl,
+	"HEXPIRETIME": opHexpiretime, "HPEXPIRETIME": opHpexpiretime,
+	"HPERSIST": opHpersist,
+	"OBJECT":   opObject, "SET": opSet,
 }
 
 // runHarness dispatches one script command through the in-process handlers.
@@ -355,7 +423,7 @@ func TestPointOpsAgainstRedis(t *testing.T) {
 	rc := dialForDiff(t)
 	defer rc.close()
 	// Clear every key the script writes so a rerun starts clean.
-	rc.del("s", "h", "nokey", "gone", "hs", "missingkey")
+	rc.del("s", "h", "nokey", "gone", "hs", "missingkey", "hx", "hn")
 
 	hc := newHarness(t).NewConn()
 	for i, cmd := range pointScript {
