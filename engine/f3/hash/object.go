@@ -1,0 +1,42 @@
+package hash
+
+import (
+	"github.com/tamnd/aki/engine/f3/list"
+	"github.com/tamnd/aki/engine/f3/shard"
+)
+
+// Object answers OBJECT ENCODING key for a hash (spec 2064/f3/10 section 4.4):
+// the inline band reports listpack and the native band reports hashtable, which
+// is what the differential test checks against Redis. The listpackex sticky
+// variant is field-TTL only and a later slice, so it is never reported here. A
+// key this package does not own falls through to the list handler, which reports
+// the list bands and then delegates to the set handler for the set bands and the
+// string store, so the one OBJECT verb answers for every type in the dispatch
+// chain (hash then list then set then string).
+func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	if eqFold(args[0], "ENCODING") && len(args) == 2 {
+		if h := registry(cx).m[string(args[1])]; h != nil {
+			r.Bulk([]byte(h.enc.String()))
+			return
+		}
+	}
+	list.Object(cx, args, r)
+}
+
+// eqFold is a case-insensitive ASCII compare of b against the uppercase word s,
+// the subcommand token check without allocating a lowercase copy.
+func eqFold(b []byte, s string) bool {
+	if len(b) != len(s) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := b[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 32
+		}
+		if c != s[i] {
+			return false
+		}
+	}
+	return true
+}

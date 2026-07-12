@@ -5,6 +5,7 @@
 package dispatch
 
 import (
+	"github.com/tamnd/aki/engine/f3/hash"
 	"github.com/tamnd/aki/engine/f3/list"
 	"github.com/tamnd/aki/engine/f3/set"
 	"github.com/tamnd/aki/engine/f3/shard"
@@ -407,13 +408,28 @@ func init() {
 	table["BLMPOP"].blockCross = list.BlmpopCross
 	table["BLMPOP"].crossKeys = list.BlmpopKeys
 
+	// The hash surface (spec 2064/f3/10 M4 slice 1): the inline listpack band and
+	// its one-way promotion to the native field table, with the point commands.
+	// All key on the first argument the same way SADD does and validate their own
+	// tails.
+	register("HSET", hash.Hset, 3, -1, true)
+	register("HMSET", hash.Hmset, 3, -1, true)
+	register("HSETNX", hash.Hsetnx, 3, 3, true)
+	register("HGET", hash.Hget, 2, 2, true)
+	register("HMGET", hash.Hmget, 2, -1, true)
+	register("HDEL", hash.Hdel, 2, -1, true)
+	register("HEXISTS", hash.Hexists, 2, 2, true)
+	register("HLEN", hash.Hlen, 1, 1, true)
+	register("HSTRLEN", hash.Hstrlen, 2, 2, true)
+
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
 	// when a key is present, and OBJECT HELP with no key round-robins. It routes
-	// through the list handler, which reports the list bands and then delegates
-	// every non-list key to the set OBJECT handler (set bands and string store).
-	register("OBJECT", list.Object, 1, -1, false)
+	// through the hash handler, which reports the hash bands and then delegates
+	// every non-hash key down the chain to the list handler, then set, then the
+	// string store, so one OBJECT verb answers for every type.
+	register("OBJECT", hash.Object, 1, -1, false)
 	table["OBJECT"].keyAt = 1
 }
 
