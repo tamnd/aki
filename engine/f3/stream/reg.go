@@ -16,6 +16,11 @@ import (
 // one holder.
 type reg struct {
 	m map[string]*stream
+	// waiters holds the blocking-XREAD FIFO per key, and wpool the shared node
+	// slab behind them (waiter.go). Both stay empty until the first XREAD BLOCK
+	// parks, so a stream workload that never blocks carries only the map header.
+	waiters map[string]*waitList
+	wpool   waitPool
 }
 
 var regs sync.Map // *store.Store -> *reg
@@ -25,7 +30,10 @@ func registry(cx *shard.Ctx) *reg {
 	if v, ok := regs.Load(cx.St); ok {
 		return v.(*reg)
 	}
-	v, _ := regs.LoadOrStore(cx.St, &reg{m: make(map[string]*stream)})
+	v, _ := regs.LoadOrStore(cx.St, &reg{
+		m:       make(map[string]*stream),
+		waiters: make(map[string]*waitList),
+	})
 	return v.(*reg)
 }
 
@@ -43,6 +51,29 @@ func (g *reg) lookup(cx *shard.Ctx, key []byte) (s *stream, wrong bool) {
 		return nil, true
 	}
 	return nil, false
+}
+
+// waitListFor returns the blocking-XREAD FIFO for key, creating an empty one on
+// first block. It lazily initializes the map so a registry built directly in a
+// unit test can still park; the real registry() path pre-builds it.
+func (g *reg) waitListFor(key []byte) *waitList {
+	if g.waiters == nil {
+		g.waiters = make(map[string]*waitList)
+	}
+	wl := g.waiters[string(key)]
+	if wl == nil {
+		wl = &waitList{pool: &g.wpool, key: string(key), head: nilIdx, tail: nilIdx}
+		g.waiters[string(key)] = wl
+	}
+	return wl
+}
+
+// dropWaitersIfEmpty removes a waiter list from the registry once its last waiter
+// leaves, so a key blocked on and then served leaves nothing behind.
+func (g *reg) dropWaitersIfEmpty(wl *waitList) {
+	if wl.n == 0 {
+		delete(g.waiters, wl.key)
+	}
 }
 
 // wrongType is the shared WRONGTYPE reply text, Redis's exact wording.

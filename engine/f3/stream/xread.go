@@ -1,11 +1,13 @@
 package stream
 
 import (
+	"strconv"
+
 	"github.com/tamnd/aki/engine/f3/shard"
 	"github.com/tamnd/aki/f3srv/resp"
 )
 
-// XREAD, the non-blocking forward read (spec 2064/f3/14 section 6.3). Each named
+// XREAD, the forward read (spec 2064/f3/14 sections 6.3 and 6.4). Each named
 // stream carries an after-ID, an exclusive lower bound, and the read returns the
 // live entries above it, oldest first, capped by COUNT. This is XRANGE with an
 // open lower bound and an unbounded top, so it rides the same directory seek and
@@ -13,24 +15,21 @@ import (
 // directory descent (section 3.5), a deep one descends once.
 //
 // The special IDs resolve as Redis defines them: "$" is the stream's current
-// lastID, so a non-blocking read above it returns nothing (its purpose is the
-// blocking form, a later slice); "+" (the Redis 7.4 form) is the last live
-// entry. A stream that does not exist contributes nothing, and BLOCK is refused
-// here rather than silently ignored until the blocking slice wires the waiter
-// sets.
+// lastID, so a read above it returns nothing until a later XADD; "+" (the Redis
+// 7.4 form) is the last live entry. A stream that does not exist contributes
+// nothing. With BLOCK the command parks when no stream yields an entry now: the
+// waiter records each stream's resolved after-ID and a later XADD, or the timeout,
+// completes it (section 6.4).
 
-// Xread answers XREAD [COUNT n] STREAMS key [key ...] id [id ...]: for each key,
-// the live entries after its ID. The reply is an array of [key, entries] pairs,
-// one per stream that produced entries, or a null array when none did (the
-// non-blocking miss). Streams with no new entries are omitted, matching Redis.
+// Xread answers XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]: for
+// each key, the live entries after its ID. The reply is an array of [key, entries]
+// pairs, one per stream that produced entries, or a null array when none did (the
+// non-blocking miss, or a BLOCK timeout). Streams with no new entries are omitted,
+// matching Redis.
 func Xread(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	count, i, ok := parseReadCount(args)
-	if !ok {
-		r.Err("ERR value is not an integer or out of range")
-		return
-	}
-	if i < len(args) && eqFold(args[i], "BLOCK") {
-		r.Err("ERR stream blocking is not supported yet")
+	opts, i, msg := parseReadOpts(args)
+	if msg != "" {
+		r.Err(msg)
 		return
 	}
 	if i >= len(args) || !eqFold(args[i], "STREAMS") {
@@ -50,41 +49,92 @@ func Xread(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// Collect every stream's entries first, so the outer array header can carry
 	// the count of non-empty streams; the field views stay valid because no
 	// mutation runs between the collection and the emit on this owner goroutine.
+	// afters holds each stream's resolved lower bound, kept for a possible park so
+	// a woken read repeats exactly this scan.
 	results := make([]readResult, 0, nk)
+	afters := make([]streamID, nk)
 	for j := 0; j < nk; j++ {
 		s, wrong := g.lookup(cx, keys[j])
 		if wrong {
 			r.Err(wrongType)
 			return
 		}
-		entries, ok := readOne(s, ids[j], count)
+		after, ok := readAfterID(s, ids[j])
 		if !ok {
 			r.Err(errInvalidID)
 			return
 		}
-		if len(entries) > 0 {
+		afters[j] = after
+		if entries := immediateRead(s, ids[j], after, opts.count); len(entries) > 0 {
 			results = append(results, readResult{key: keys[j], entries: entries})
 		}
 	}
 
-	out := cx.Aux[:0]
-	if len(results) == 0 {
-		out = resp.AppendNullArray(out)
-		cx.Aux = out
-		r.Raw(out)
+	if len(results) == 0 && opts.block {
+		parkRead(cx, g, keys, afters, opts)
+		r.Park()
 		return
 	}
-	out = resp.AppendArrayHeader(out, len(results))
-	for _, rr := range results {
-		out = resp.AppendArrayHeader(out, 2)
-		out = resp.AppendBulk(out, rr.key)
-		out = resp.AppendArrayHeader(out, len(rr.entries))
-		for k := range rr.entries {
-			out = appendEntryReply(out, rr.entries[k].id, rr.entries[k].fields)
-		}
-	}
+
+	out := frameReadResults(cx.Aux[:0], results)
 	cx.Aux = out
 	r.Raw(out)
+}
+
+// frameReadResults appends the XREAD reply for the streams that produced entries:
+// the array of [key, entries] pairs, or the RESP2 null array when none did. Both
+// the immediate reply and a woken park share it, so the two paths never drift.
+func frameReadResults(dst []byte, results []readResult) []byte {
+	if len(results) == 0 {
+		return resp.AppendNullArray(dst)
+	}
+	dst = resp.AppendArrayHeader(dst, len(results))
+	for _, rr := range results {
+		dst = resp.AppendArrayHeader(dst, 2)
+		dst = resp.AppendBulk(dst, rr.key)
+		dst = resp.AppendArrayHeader(dst, len(rr.entries))
+		for k := range rr.entries {
+			dst = appendEntryReply(dst, rr.entries[k].id, rr.entries[k].fields)
+		}
+	}
+	return dst
+}
+
+// parkRead blocks the connection on every named stream. It clones the keys and
+// their resolved after-IDs into one shared request, parks a node per key, and arms
+// the timeout on the sibling-ring head for a finite BLOCK; BLOCK 0 blocks forever
+// and arms nothing. A later XADD on any key, or the timer, completes the deferred
+// reply through the waiter set.
+func parkRead(cx *shard.Ctx, g *reg, keys [][]byte, afters []streamID, opts readOpts) {
+	ck := make([][]byte, len(keys))
+	for j := range keys {
+		ck[j] = append([]byte(nil), keys[j]...)
+	}
+	ca := append([]streamID(nil), afters...)
+	req := &xreadWait{keys: ck, afters: ca, count: opts.count}
+	head := parkWaiter(g, req, cx.CurConn(), cx.CurSeq())
+	if opts.blockMs > 0 {
+		deadline := cx.NowMs + opts.blockMs
+		g.wpool.nodes[head].timer = cx.ArmTimer(deadline, makeReadFire(g, head))
+	}
+}
+
+// makeReadFire builds the timeout callback for the blocked read whose ring head is
+// head. It runs on the owner when the deadline passes with no serving XADD. The
+// live guard makes it idempotent against a serve that already tore the waiter down.
+// A timed-out XREAD replies the RESP2 null array (*-1), the shape Redis sends.
+func makeReadFire(g *reg, head uint32) func(*shard.Ctx) {
+	return func(cx *shard.Ctx) {
+		nd := &g.wpool.nodes[head]
+		if !nd.live {
+			return
+		}
+		conn := nd.conn
+		seq := nd.seq
+		nd.timer = nil // the firing timer is off the heap already
+		g.unlinkAll(cx, head)
+		conn.CompleteBlocked(seq, resp.AppendNullArray(nil))
+	}
 }
 
 // readResult pairs a stream's key with the entries a read produced, held until
@@ -142,54 +192,100 @@ func streamsAt(tail [][]byte) (int, bool) {
 	return 0, false
 }
 
-// parseReadCount reads the optional leading COUNT clause and returns the entry
-// cap (-1 for unbounded, including the Redis COUNT 0 which means no limit) and
-// the index of the first argument past it.
-func parseReadCount(args [][]byte) (count, next int, ok bool) {
-	if len(args) >= 1 && eqFold(args[0], "COUNT") {
-		if len(args) < 2 {
-			return 0, 0, false
-		}
-		n, nok := parseUint(args[1])
-		if !nok {
-			return 0, 0, false
-		}
-		c := int(n)
-		if c == 0 {
-			c = -1 // XREAD COUNT 0 is unbounded, unlike XRANGE
-		}
-		return c, 2, true
-	}
-	return -1, 0, true
+// readOpts is the parsed XREAD option prefix: the COUNT cap (-1 unbounded, the
+// Redis COUNT 0 meaning) and the BLOCK clause (block set, blockMs the timeout in
+// milliseconds, 0 for an unbounded wait).
+type readOpts struct {
+	count   int
+	block   bool
+	blockMs int64
 }
 
-// readOne resolves one stream's ID argument and gathers its entries. ok is false
-// only on a malformed explicit ID; a missing stream (s nil) or a "$"/"+" against
-// one contributes no entries without erroring.
-func readOne(s *stream, idArg []byte, count int) (entries []rangeEntry, ok bool) {
-	if len(idArg) == 1 {
-		switch idArg[0] {
-		case '$':
-			// Entries after the current tail: nothing without blocking.
-			if s != nil {
-				return s.readAfter(s.lastID, count), true
+// parseReadOpts reads the COUNT and BLOCK clauses that precede STREAMS, in either
+// order, and returns the options, the index of the first argument past them, and a
+// Redis error text (empty on success). It stops at the first token that is neither
+// clause, which the caller checks is STREAMS.
+func parseReadOpts(args [][]byte) (opts readOpts, next int, msg string) {
+	opts.count = -1
+	i := 0
+	for i < len(args) {
+		switch {
+		case eqFold(args[i], "COUNT"):
+			if i+1 >= len(args) {
+				return opts, i, "ERR syntax error"
 			}
-			return nil, true
-		case '+':
-			if s != nil {
-				return s.lastEntry(), true
+			n, ok := parseUint(args[i+1])
+			if !ok {
+				return opts, i, "ERR value is not an integer or out of range"
 			}
-			return nil, true
+			opts.count = int(n)
+			if opts.count == 0 {
+				opts.count = -1 // XREAD COUNT 0 is unbounded, unlike XRANGE
+			}
+			i += 2
+		case eqFold(args[i], "BLOCK"):
+			if i+1 >= len(args) {
+				return opts, i, "ERR syntax error"
+			}
+			ms, ok := parseBlockMs(args[i+1])
+			if !ok {
+				return opts, i, "ERR timeout is not an integer or out of range"
+			}
+			if ms < 0 {
+				return opts, i, "ERR timeout is negative"
+			}
+			opts.block = true
+			opts.blockMs = ms
+			i += 2
+		default:
+			return opts, i, ""
 		}
+	}
+	return opts, i, ""
+}
+
+// parseBlockMs parses a BLOCK timeout as a signed base-10 integer of milliseconds,
+// the grammar Redis's getTimeoutFromObject accepts for the integer form. A
+// negative value parses (the caller reports it separately); a non-integer does
+// not.
+func parseBlockMs(b []byte) (int64, bool) {
+	v, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// readAfterID resolves one stream's XREAD id argument to the exclusive lower bound
+// a read scans above. "$" and "+" resolve to the stream's current last ID (0-0 for
+// a missing or empty stream), so a read waits for the next XADD; an explicit ID
+// resolves to itself. ok is false only on a malformed explicit ID.
+func readAfterID(s *stream, idArg []byte) (after streamID, ok bool) {
+	if len(idArg) == 1 && (idArg[0] == '$' || idArg[0] == '+') {
+		if s != nil {
+			return s.lastID, true
+		}
+		return streamID{}, true
 	}
 	id, idok := parseStreamID(idArg)
 	if !idok {
-		return nil, false
+		return streamID{}, false
 	}
+	return id, true
+}
+
+// immediateRead gathers a stream's entries for the non-blocking answer. The "+"
+// form returns the single last live entry; every other form returns the live
+// entries above the resolved after-ID, capped by count. A missing stream yields
+// nothing.
+func immediateRead(s *stream, idArg []byte, after streamID, count int) []rangeEntry {
 	if s == nil {
-		return nil, true
+		return nil
 	}
-	return s.readAfter(id, count), true
+	if len(idArg) == 1 && idArg[0] == '+' {
+		return s.lastEntry()
+	}
+	return s.readAfter(after, count)
 }
 
 // readAfter returns up to count live entries with IDs strictly above afterID,

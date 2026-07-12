@@ -78,6 +78,14 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if trimSet {
 		s.trim(trim)
 	}
+	// The appended entry is a read event for any client blocked on this key: its
+	// ID exceeds every parked waiter's after-ID (they parked at or below the prior
+	// last ID), so serving wakes each with at least this entry. A trim that runs
+	// first never drops it, so the wake still delivers. Skipped when no XREAD has
+	// ever blocked, the common path, so a plain XADD touches no waiter state.
+	if len(g.waiters) != 0 {
+		serveWaiters(cx, g, args[0])
+	}
 
 	cx.Val = formatID(cx.Val[:0], id)
 	r.Bulk(cx.Val)
