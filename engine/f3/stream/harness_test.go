@@ -21,6 +21,7 @@ const (
 	opXsetid
 	opXrange
 	opXrevrange
+	opXread
 	opObject
 	opSet // seed a string key to test WRONGTYPE and the OBJECT fallthrough
 	opLast
@@ -34,6 +35,7 @@ func harnessHandlers() []shard.Handler {
 	h[opXsetid] = Xsetid
 	h[opXrange] = Xrange
 	h[opXrevrange] = Xrevrange
+	h[opXread] = Xread
 	h[opObject] = Object
 	h[opSet] = func(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		if err := cx.St.Set(args[0], args[1]); err != nil {
