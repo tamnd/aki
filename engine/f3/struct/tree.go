@@ -281,6 +281,50 @@ func (t *Tree) bSetCount(o uint32, i int, v uint64) {
 	}
 }
 
+// bCountPrefix sums the subtree counts of children [0,c) of branch o, the prefix
+// Rank accumulates at every interior level. It hoists the block slice and the
+// count-array base out of the per-child loop, and for the production u32 width it
+// sums two counts per u64 load in split 32-bit lanes, halving the loop trips on a
+// path that touches up to arity-1 counts per level. Lab 06 (labs/f3/m2) measured
+// the plain scalar hoist as noise (the compiler already lifts the offset
+// arithmetic) and the packed form as the real lever: 1.5x on the accumulation
+// kernel on a cache-resident descent, the zipf-ZRANK shape whose hot members keep
+// their descent blocks in L1 and turn the op compute-bound.
+//
+// The lane sum is exact for any valid tree, not just bounded counts: the low lane
+// is the sum of the even-index child counts and the high lane the odd-index ones,
+// each a sum of disjoint subtrees, so each lane is at most the node's subtree
+// total, at most t.entries, at most the count-width maximum (below 2^32 for u32,
+// the ceiling countW=4 exists to hold). The low lane therefore never carries out
+// of bit 31 into the high lane, so the packed add stays byte-identical to the
+// per-element sum. u16 and u64 keep the scalar loop; they are off the frozen
+// production path. Read-only, no layout change.
+func (t *Tree) bCountPrefix(o uint32, c int) uint64 {
+	p := t.branch(o)[t.countOff():]
+	var acc uint64
+	switch t.countW {
+	case 2:
+		for i := 0; i < c; i++ {
+			acc += uint64(binary.LittleEndian.Uint16(p[i*2:]))
+		}
+	case 8:
+		for i := 0; i < c; i++ {
+			acc += binary.LittleEndian.Uint64(p[i*8:])
+		}
+	default:
+		var packed uint64
+		i := 0
+		for ; i+2 <= c; i += 2 {
+			packed += binary.LittleEndian.Uint64(p[i*4:])
+		}
+		acc = (packed & 0xFFFFFFFF) + (packed >> 32)
+		if i < c {
+			acc += uint64(binary.LittleEndian.Uint32(p[i*4:]))
+		}
+	}
+	return acc
+}
+
 // subtreeCount is the number of live entries under a node.
 func (t *Tree) subtreeCount(o uint32, isLeaf bool) uint64 {
 	if isLeaf {
@@ -582,9 +626,7 @@ func (t *Tree) Rank(score uint64, member []byte, m Members) (uint64, bool) {
 	var acc uint64
 	for level > 1 {
 		c := t.route(ord, score, member, m)
-		for i := 0; i < c; i++ {
-			acc += t.bCount(ord, i)
-		}
+		acc += t.bCountPrefix(ord, c)
 		ord = t.bChild(ord, c)
 		level--
 	}
