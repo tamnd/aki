@@ -1,7 +1,0 @@
-launch                 rss=   7.7MB hwm=   7.7MB heapAlloc= 4096.2MB heapSys= 4103.6MB released=    7.0MB gc=  2 arenaUsed=   0.0MB ledger=   0.0MB
-rep0 post-fill         rss=1218.2MB hwm=1218.2MB heapAlloc= 4636.7MB heapSys= 4643.6MB released=    6.4MB gc=  3 arenaUsed= 667.4MB ledger= 676.5MB
-rep0 post-flush        rss= 550.8MB hwm=1217.9MB heapAlloc= 4636.7MB heapSys= 4643.6MB released=    6.3MB gc=  3 arenaUsed=   0.0MB ledger=   0.0MB
-rep1 post-fill         rss=1761.4MB hwm=1761.4MB heapAlloc= 5177.0MB heapSys= 5183.6MB released=    5.8MB gc=  3 arenaUsed= 667.6MB ledger= 676.8MB
-rep1 post-flush        rss=1093.7MB hwm=1761.0MB heapAlloc= 5177.0MB heapSys= 5183.6MB released=    5.8MB gc=  3 arenaUsed=   0.0MB ledger=   0.0MB
-rep2 post-fill         rss=2304.8MB hwm=2304.8MB heapAlloc= 5717.4MB heapSys= 5723.6MB released=    5.1MB gc=  3 arenaUsed= 668.1MB ledger= 677.2MB
-rep2 post-flush        rss=1636.7MB hwm=2304.4MB heapAlloc= 5717.5MB heapSys= 5723.6MB released=    5.0MB gc=  3 arenaUsed=   0.0MB ledger=   0.0MB
