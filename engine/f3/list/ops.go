@@ -1,6 +1,11 @@
 package list
 
-import "bytes"
+import (
+	"bytes"
+	"encoding/binary"
+
+	"github.com/tamnd/aki/f3srv/resp"
+)
 
 // The band-dispatching list operations the command handlers call. Each one
 // routes to the inline blob while the list is small and to the native
@@ -62,6 +67,36 @@ func (l *list) get(i int) []byte {
 		return l.nat.at(i)
 	}
 	return l.inlineAt(i)
+}
+
+// appendRange appends the elements at dense indexes lo..hi inclusive (the caller
+// has already normalized them into [0, length)) to out as RESP bulk strings,
+// walking one forward cursor instead of re-addressing every index. LRANGE used
+// to call get(i) per element, and get resolves an index through locate, which on
+// the native band above the flat crossover is an O(log chunks) Fenwick descent
+// (and on the inline band an O(i) frame walk from the head); a w-element window
+// therefore paid w directory descents. Here the native band locates lo once and
+// then advances (chunk, ordinal) by layout across chunk boundaries, and the
+// inline band walks its head cursor once, so the window costs one seek plus w
+// frame decodes. The bytes alias internal storage and are valid until the next
+// write, which is fine since out is copied out to the reply before then.
+func (l *list) appendRange(out []byte, lo, hi int) []byte {
+	if l.nat != nil {
+		return l.nat.rangeInto(out, lo, hi)
+	}
+	pos := l.head
+	for k := 0; k < lo; k++ {
+		vlen, w := binary.Uvarint(l.blob[pos:])
+		pos += w + int(vlen)
+	}
+	for k := lo; k <= hi; k++ {
+		vlen, w := binary.Uvarint(l.blob[pos:])
+		start := pos + w
+		end := start + int(vlen)
+		out = resp.AppendBulk(out, l.blob[start:end])
+		pos = end
+	}
+	return out
 }
 
 // setAt overwrites the element at index i.

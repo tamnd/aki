@@ -5,6 +5,8 @@ import (
 	"math/rand/v2"
 	"strconv"
 	"testing"
+
+	"github.com/tamnd/aki/f3srv/resp"
 )
 
 // The model-oracle differential for the chunked deque (spec 2064/f3/13 section
@@ -443,4 +445,33 @@ func modelLpos(m *listModel, target []byte, rank, limit int) []int {
 		}
 	}
 	return out
+}
+
+// TestLrangeCursorMatchesPerElement locks the LRANGE cursor walk (appendRange)
+// to the per-element get path it replaced, across the Fenwick locate threshold
+// (>flatMax*chunkElemCap elements), so the seek-once-then-advance walk never
+// drifts from repeated index resolution. The RESP encodings must be byte-equal.
+func TestLrangeCursorMatchesPerElement(t *testing.T) {
+	l := newList()
+	const n = 20000 // forces many chunks, above flatMax so locate rides the Fenwick descent
+	for i := 0; i < n; i++ {
+		l.pushBack([]byte(strconv.Itoa(i)))
+	}
+	if l.nat == nil {
+		t.Fatal("expected the native band at this length")
+	}
+	for _, w := range [][2]int{
+		{0, 9}, {0, n - 1}, {127, 129}, {128, 260},
+		{n / 2, n/2 + 100}, {n - 50, n - 1}, {5000, 5000},
+	} {
+		lo, hi := w[0], w[1]
+		got := l.appendRange(nil, lo, hi)
+		var want []byte
+		for i := lo; i <= hi; i++ {
+			want = resp.AppendBulk(want, l.get(i))
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("window [%d,%d]: cursor walk output != per-element get output", lo, hi)
+		}
+	}
 }
