@@ -356,6 +356,31 @@ func init() {
 	register("BRPOP", list.Brpop, 2, -1, true)
 	table["BRPOP"].blocks = true
 
+	// BLMOVE source destination <LEFT|RIGHT> <LEFT|RIGHT> timeout and its older
+	// spelling BRPOPLPUSH source destination timeout (spec 2064/f3/13 M3 slice 8)
+	// are the blocking two-key move. They route on the source (keyAt 0, the
+	// first-argument route LMOVE and the pushes use) and read both keys from that
+	// owner's registry, the co-located convention; a cross-shard destination hop is
+	// a later slice (PR 6), so the point path here assumes co-located keys the same
+	// way pre-slice-7 LMOVE did. blocks arms the reader barrier after enqueue so a
+	// command pipelined behind an unresolved park does not run until the reply goes
+	// out; an immediate serve still replies in place.
+	register("BLMOVE", list.Blmove, 5, 5, true)
+	table["BLMOVE"].blocks = true
+	register("BRPOPLPUSH", list.Brpoplpush, 3, 3, true)
+	table["BRPOPLPUSH"].blocks = true
+
+	// BLMPOP timeout numkeys key [key ...] <LEFT|RIGHT> [COUNT count] (spec
+	// 2064/f3/13 M3 slice 8) is the blocking LMPOP. It leads with a timeout and
+	// then numkeys, so its first key sits one argument further than LMPOP's:
+	// keyAt=2 routes it to the first key's shard (LMPOP uses keyAt=1), and it reads
+	// every listed key from that owner's registry, the co-located convention; a
+	// cross-shard key set is a later slice (PR 6). blocks arms the reader barrier
+	// after enqueue, delivered on the DoAt path below.
+	register("BLMPOP", list.Blmpop, 4, -1, false)
+	table["BLMPOP"].keyAt = 2
+	table["BLMPOP"].blocks = true
+
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
@@ -410,6 +435,13 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 		err := c.DoAt(e.op, e.keyAt, args[1:])
 		if err == shard.ErrTooBig {
 			return oops(c, "ERR command too large")
+		}
+		// A blocking verb whose routing key is not its first argument (BLMPOP)
+		// enqueues through DoAt and returns here, so its barrier must be armed on
+		// this path too, mirroring the c.Do path below. Without this a BLMPOP that
+		// parks would let a pipelined command behind it reply out of order.
+		if err == nil && e.blocks {
+			c.ArmBlock()
 		}
 		return err
 	}

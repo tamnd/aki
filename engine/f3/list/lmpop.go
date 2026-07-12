@@ -59,62 +59,68 @@ func lmpop(g *reg, cx *shard.Ctx, dst []byte, keys [][]byte, front bool, count i
 	return dst, false, false
 }
 
-// Lmpop answers LMPOP numkeys key [key ...] <LEFT|RIGHT> [COUNT count]. It mirrors
-// ZMPOP's arity and tail validation exactly: numkeys must be a positive integer,
-// then come exactly numkeys keys, then the LEFT or RIGHT token, then an optional
-// COUNT count whose count must be positive. Any malformed tail is the syntax
-// error.
-func Lmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	numkeys, ok := store.ParseInt(args[0])
+// parseLmpopTail parses the numkeys/keys/direction/COUNT tail shared by LMPOP and
+// BLMPOP: for LMPOP a is the whole argument list, for BLMPOP it is the arguments
+// after the leading timeout. It mirrors ZMPOP's validation exactly: numkeys must
+// be a positive integer, then come exactly numkeys keys, then the LEFT or RIGHT
+// token, then an optional COUNT count whose count must be positive. keys are the
+// key views, front is true for LEFT, count is 1 without COUNT, and emsg is "" on
+// success or one of the three exact Redis error texts. Factoring it out keeps the
+// two verbs byte-identical on every malformed tail (a differential test pins it).
+func parseLmpopTail(a [][]byte) (keys [][]byte, front bool, count int, emsg string) {
+	numkeys, ok := store.ParseInt(a[0])
 	if !ok || numkeys <= 0 {
-		r.Err("ERR numkeys should be greater than 0")
-		return
+		return nil, false, 0, "ERR numkeys should be greater than 0"
 	}
 	// After numkeys come exactly numkeys keys, then LEFT|RIGHT, then an optional
 	// COUNT. A numkeys past the argument tail leaves no room for the direction
 	// token, so it is a syntax error, the short-tail case ZMPOP rejects the same
-	// way; bounding it against len(args) first keeps the slice below in range.
-	if numkeys > int64(len(args)) {
-		r.Err(errSyntax)
-		return
+	// way; bounding it against len(a) first keeps the slice below in range.
+	if numkeys > int64(len(a)) {
+		return nil, false, 0, errSyntax
 	}
 	nk := int(numkeys)
-	if len(args) < 1+nk+1 {
-		r.Err(errSyntax)
-		return
+	if len(a) < 1+nk+1 {
+		return nil, false, 0, errSyntax
 	}
-	keys := args[1 : 1+nk]
-	tail := args[1+nk:]
-	var front bool
+	keys = a[1 : 1+nk]
+	tail := a[1+nk:]
 	switch {
 	case eqFold(tail[0], "LEFT"):
 		front = true
 	case eqFold(tail[0], "RIGHT"):
 		front = false
 	default:
-		r.Err(errSyntax)
-		return
+		return nil, false, 0, errSyntax
 	}
-	count := 1
+	count = 1
 	rest := tail[1:]
 	switch len(rest) {
 	case 0:
 	case 2:
 		if !eqFold(rest[0], "COUNT") {
-			r.Err(errSyntax)
-			return
+			return nil, false, 0, errSyntax
 		}
 		c, okc := store.ParseInt(rest[1])
 		if !okc || c <= 0 {
-			r.Err("ERR count should be greater than 0")
-			return
+			return nil, false, 0, "ERR count should be greater than 0"
 		}
 		count = int(c)
 	default:
-		r.Err(errSyntax)
+		return nil, false, 0, errSyntax
+	}
+	return keys, front, count, ""
+}
+
+// Lmpop answers LMPOP numkeys key [key ...] <LEFT|RIGHT> [COUNT count]. It is a
+// thin wrapper over parseLmpopTail and the lmpop core, sharing its tail parse
+// byte-for-byte with BLMPOP.
+func Lmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	keys, front, count, emsg := parseLmpopTail(args)
+	if emsg != "" {
+		r.Err(emsg)
 		return
 	}
-
 	g := registry(cx)
 	out, ok, wrong := lmpop(g, cx, cx.Aux[:0], keys, front, count)
 	if wrong {

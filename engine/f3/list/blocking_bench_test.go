@@ -16,11 +16,12 @@ func BenchmarkWaiterParkUnlink(b *testing.B) {
 	g := &reg{m: make(map[string]*list), waiters: make(map[string]*waitList)}
 	c := &shard.Conn{}
 	keys := [][]byte{[]byte("k")}
-	_ = parkWaiter(g, keys, true, c, 0) // anchor
+	spec := waitSpec{kind: kindPop, front: true}
+	_ = parkWaiter(g, keys, spec, c, 0) // anchor
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		g.unlinkAll(nil, parkWaiter(g, keys, true, c, 1))
+		g.unlinkAll(nil, parkWaiter(g, keys, spec, c, 1))
 	}
 }
 
@@ -28,12 +29,13 @@ func BenchmarkWaiterParkUnlinkMultiKey(b *testing.B) {
 	g := &reg{m: make(map[string]*list), waiters: make(map[string]*waitList)}
 	c := &shard.Conn{}
 	keys := [][]byte{[]byte("k1"), []byte("k2"), []byte("k3")}
+	spec := waitSpec{kind: kindPop, front: true}
 	for _, k := range keys { // anchor every list so none is created in the loop
-		_ = parkWaiter(g, [][]byte{k}, true, c, 0)
+		_ = parkWaiter(g, [][]byte{k}, spec, c, 0)
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		g.unlinkAll(nil, parkWaiter(g, keys, true, c, 1))
+		g.unlinkAll(nil, parkWaiter(g, keys, spec, c, 1))
 	}
 }
