@@ -139,7 +139,7 @@ func (c *Conn) DoFan(op byte, kind FanKind, keys, vals [][]byte) error {
 			if order[i] != sh {
 				continue
 			}
-			if kn > 0 && (kn >= maxFanKeys || bytes > batchDataCap) {
+			if kn > 0 && (kn >= maxFanKeys || bytes > c.rt.batchDataCap) {
 				flushSub()
 			}
 			argv = append(argv, keys[i])

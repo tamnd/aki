@@ -15,13 +15,21 @@ const (
 	// keeps the node small. Lab: hop batch cap (sweep {16, 32, 64}, PRED-X8).
 	batchCap = 32
 
-	// batchDataCap is a node's steady-state argument-byte capacity: a fuller
-	// node splits, and only a single command bigger than the cap grows an
-	// empty node's buffer. The M0 transport copies parsed arguments into the
-	// node; the zero-copy argument spans into the connection read buffer, with
-	// their buffer-generation lifetime rules (doc 03 section 4.4), land with
-	// the value-bands work.
-	batchDataCap = 8192
+	// batchDataCap is a node's steady-state argument-byte capacity and the
+	// default for Config.BatchDataCap: a fuller node splits, and only a single
+	// command bigger than the cap grows an empty node's buffer. The M0 transport
+	// copies parsed arguments into the node; the zero-copy argument spans into
+	// the connection read buffer, with their buffer-generation lifetime rules
+	// (doc 03 section 4.4), land with the value-bands work. labs/f3/m0/25_conn_caps
+	// swept it against the c512 memory bar and a 64B-to-4KiB value band: this is
+	// the M0 memory-bar lever (the pooled node buffers dominate resident
+	// footprint at high fan-out), and the box sweep put 4096 at the knee, 40MB
+	// off c512 VmHWM at the 64B gate cell with throughput flat to +3.7 percent
+	// across the band, where 8192 wasted half of every node at the gate and 2048
+	// lost 11 percent at 1KiB values by splitting a P16 run into one node per
+	// command. The gate's 64B cell drives it lower still through the Config
+	// override (paired with ReplyRing and FreeListCap) since nothing packs at 64B.
+	batchDataCap = 4096
 
 	// spanCap bounds a node's argument count across its commands, sized so
 	// the point surface never comes near it (SET with a full option run is
@@ -41,11 +49,11 @@ const (
 	// hundreds of megabytes on the free list.
 	keepNodeBytes = 1 << 20
 
-	// repCap is the starting capacity of a node's reply buffer, sized so the
-	// steady path never grows it: every point reply plus an echoed payload fits
-	// with headroom. A reply run past the cap grows the buffer once and the
-	// node keeps the larger buffer for its next life.
-	repCap = batchDataCap + 64*batchCap
+	// A node's reply buffer starts at batchDataCap + 64*batchCap: sized so the
+	// steady path never grows it (every point reply plus an echoed payload fits
+	// with headroom), and it tracks batchDataCap so a swept data cap keeps its
+	// matched reply headroom. resolveConnCaps derives it (Runtime.repCap) rather
+	// than a standalone const, since Config.BatchDataCap can move the base.
 
 	// spinWindow is how long an idle connection writer burns plain loads on
 	// its outbound queue before it parks (doc 03 section 9.2, provisional

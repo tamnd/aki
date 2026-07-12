@@ -37,6 +37,41 @@ type Runtime struct {
 	// under their registry lock); NewConn does not touch it, so a test that
 	// builds a bare Conn never perturbs the spin decision.
 	live atomic.Int64
+
+	// The per-connection hop-transport sizes, resolved once at construction from
+	// the tuning.go defaults or the Config overrides and read by NewConn and the
+	// batch pool. These are the M0 memory-bar lever (labs/f3/m0/24_conn_buffers
+	// located it, labs/f3/m0/25_conn_caps sweeps it): at high fan-out the pooled
+	// hopBatch data/reply buffers and the reply reorder ring dominate resident
+	// footprint, and they hold ~640B of each 8KiB+ buffer at the 64B gate cell.
+	// batchDataCap and repCap start each node's data and reply buffers; a bigger
+	// command grows them on demand (batch.go), so a smaller start only trims the
+	// steady 64B path. replyRing is the reply reorder window and freeListCap the
+	// per-connection node free list.
+	batchDataCap int
+	repCap       int
+	replyRing    int
+	freeListCap  int
+}
+
+// resolveConnCaps fills the per-connection hop-transport sizes from the Config
+// overrides, taking the tuning.go default for every field left non-positive.
+// repCap tracks batchDataCap by the same +64*batchCap headroom the const
+// carries, so a swept data cap keeps its matched reply headroom.
+func (r *Runtime) resolveConnCaps(c Config) {
+	r.batchDataCap = batchDataCap
+	if c.BatchDataCap > 0 {
+		r.batchDataCap = c.BatchDataCap
+	}
+	r.repCap = r.batchDataCap + 64*batchCap
+	r.replyRing = replyRing
+	if c.ReplyRing > 0 {
+		r.replyRing = c.ReplyRing
+	}
+	r.freeListCap = freeListCap
+	if c.FreeListCap > 0 {
+		r.freeListCap = c.FreeListCap
+	}
 }
 
 // ConnOpened records that a driver has begun serving a connection, and
@@ -58,6 +93,7 @@ func New(shards, arenaBytes, segBytes int) *Runtime {
 		shards = 1
 	}
 	r := &Runtime{workers: make([]*worker, shards)}
+	r.resolveConnCaps(Config{})
 	for i := range r.workers {
 		r.workers[i] = newWorker(i, store.New(arenaBytes, segBytes))
 		r.workers[i].rt = r
@@ -89,6 +125,18 @@ type Config struct {
 	// through the locked-M park/unpark handoff. The knob stays for boxes
 	// where thread residency measurably pays.
 	PinWorkers bool
+
+	// BatchDataCap, ReplyRing, and FreeListCap override the per-connection
+	// hop-transport sizes (tuning.go batchDataCap, replyRing, freeListCap); each
+	// non-positive field takes its tuning.go default. They are the M0 memory-bar
+	// lever swept by labs/f3/m0/25_conn_caps: at high fan-out the pooled hopBatch
+	// buffers and the reorder ring dominate resident footprint. BatchDataCap
+	// starts a node's data buffer (its reply buffer tracks it), and it grows on
+	// demand for a larger command, so a smaller start only trims the steady
+	// small-value path.
+	BatchDataCap int
+	ReplyRing    int
+	FreeListCap  int
 }
 
 // Open is New with the value-log configuration: each shard gets its own log
@@ -98,6 +146,7 @@ func Open(cfg Config) (*Runtime, error) {
 		cfg.Shards = 1
 	}
 	r := &Runtime{workers: make([]*worker, cfg.Shards)}
+	r.resolveConnCaps(cfg)
 	for i := range r.workers {
 		o := store.Options{ArenaBytes: cfg.ArenaBytes, SegBytes: cfg.SegBytes}
 		if cfg.VlogDir != "" {

@@ -38,6 +38,12 @@ func main() {
 		"initial per-connection read buffer KiB; 0 takes the 64KiB default. It grows on demand for a larger command, so a smaller value only trims idle/point-op connections (labs/f3/m0/24_conn_buffers)")
 	replyBufKiB := flag.Int("reply-buf-kib", 0,
 		"per-connection reply writer buffer KiB; 0 takes the 64KiB default. One pipeline round of replies should fit or the writer flushes mid-drain (labs/f3/m0/24_conn_buffers)")
+	batchDataCap := flag.Int("batch-data-cap", 0,
+		"per-hop-node starting data-buffer bytes; 0 takes the tuning.go default. It grows on demand for a bigger command, so a smaller start only trims the steady small-value path (labs/f3/m0/25_conn_caps)")
+	replyRing := flag.Int("reply-ring", 0,
+		"per-connection reply reorder window in commands; 0 takes the tuning.go default. It must cover the pipeline depth or the reader throttles (labs/f3/m0/25_conn_caps)")
+	freeListCap := flag.Int("free-list-cap", 0,
+		"per-connection hop-node free-list size; 0 takes the tuning.go default. It bounds the pooled idle nodes each connection retains (labs/f3/m0/25_conn_caps)")
 	flag.Parse()
 	if *connSpinHighWater > 0 {
 		shard.SetConnSpinHighWater(*connSpinHighWater)
@@ -56,6 +62,9 @@ func main() {
 		NetLoops:         *netLoops,
 		ReadBufBytes:     *readBufKiB << 10,
 		ReplyBufBytes:    *replyBufKiB << 10,
+		BatchDataCap:     *batchDataCap,
+		ReplyRing:        *replyRing,
+		FreeListCap:      *freeListCap,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "f3srv:", err)

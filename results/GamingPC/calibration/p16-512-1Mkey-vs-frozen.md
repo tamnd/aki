@@ -87,6 +87,27 @@ so the caps are one stacking layer; the fix is to promote them to shard.Config
 fields and sweep (they grow on demand, so a smaller start is throughput-safe),
 with the arena record layout and GOGC as the further levers.
 
+### Caps promoted and attributed (lab 25, 2026-07-12)
+
+Lab 25 made the three caps shard.Config fields (BatchDataCap, ReplyRing,
+FreeListCap) and swept them on the box, attributing the footprint and finding the
+batchDataCap throughput floor. At the 64B gate cell each cap contributes on its
+own (batchDataCap -69MB, replyRing -29MB, freeListCap -26MB), combining to -91MB
+with SET throughput UP 5.7% (13.35M -> 14.11M): less pooled-buffer memory traffic
+buys cache residency, so trimming the fabric is a throughput win, not a trade.
+The batchDataCap floor is value-size specific: it is a node split threshold, so at
+or below 2048 it loses ~11% on 1KiB values by splitting a P16 run into one node
+per command, but 4096 holds throughput flat to -3.7% across 64B-to-4KiB.
+
+Shipped: batchDataCap default 8192 -> 4096 (-40MB at the gate, no throughput cost
+across the value band), the sweep-backed default change. replyRing and
+freeListCap defaults stay put (their gate saving is real but only P16-proven; a
+global cut caps deep pipelines / risks alloc churn), so they stay swept knobs the
+gate sets via flag. The 64B memory cell runs
+`-batch-data-cap 1024 -reply-ring 128 -free-list-cap 8` (the all-three-small
+combo, lab 24 measured server-only at 173,748 kB), the way redis's gate runs
+io-threads=6. Still ~23MB over redis: the arena's ~96B/key record layout is next.
+
 ## Verdict
 
 The M0 headline THROUGHPUT gate PASSES at the mandated cell (SET 3.42x, GET
