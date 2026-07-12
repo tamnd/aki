@@ -236,10 +236,7 @@ func Lrange(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Raw(resp.AppendArrayHeader(cx.Aux[:0], 0))
 		return
 	}
-	out := resp.AppendArrayHeader(cx.Aux[:0], hi-lo+1)
-	for i := lo; i <= hi; i++ {
-		out = resp.AppendBulk(out, l.get(i))
-	}
+	out := l.appendRange(resp.AppendArrayHeader(cx.Aux[:0], hi-lo+1), lo, hi)
 	cx.Aux = out
 	r.Raw(out)
 }

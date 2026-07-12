@@ -1,6 +1,10 @@
 package list
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+
+	"github.com/tamnd/aki/f3srv/resp"
+)
 
 // native is the list's native band (spec 2064/f3/13 section 2, encoding
 // quicklist): an owner-local ring-backed byte deque. It replaces the slice
@@ -433,6 +437,31 @@ func (nt *native) at(i int) []byte {
 	c := nt.ring.at(ci)
 	v, _ := c.frameAt(int(c.dir[c.lo+ord]))
 	return v
+}
+
+// rangeInto appends the elements at dense indexes lo..hi inclusive (already
+// normalized into [0, count)) to out as RESP bulk strings, the cursor-walk
+// LRANGE rides. It locates lo once, then advances (chunk, ordinal) by layout:
+// it emits the rest of lo's chunk from ordinal ord, crosses to the next ring
+// chunk, and repeats until the window is spent, so the walk pays one seek plus a
+// frame decode per element, never the per-element locate at cost. Elements alias
+// the chunk blobs and stay valid only until the next write.
+func (nt *native) rangeInto(out []byte, lo, hi int) []byte {
+	ci, ord := nt.locate(lo)
+	remaining := hi - lo + 1
+	for remaining > 0 {
+		c := nt.ring.at(ci)
+		n := c.count()
+		for ord < n && remaining > 0 {
+			v, _ := c.frameAt(int(c.dir[c.lo+ord]))
+			out = resp.AppendBulk(out, v)
+			ord++
+			remaining--
+		}
+		ci++
+		ord = 0
+	}
+	return out
 }
 
 // setAt overwrites the element at dense index i (LSET). A same-length value is
