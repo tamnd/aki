@@ -56,13 +56,20 @@ type stream struct {
 	// for the tie-break compare. Owner-only and read once per compare, so one
 	// reused array is safe.
 	dirKey [8]byte
+	// base is the logical index of blocks[0], the count of front blocks XTRIM has
+	// dropped over the stream's life (section 6.6). Directory references are
+	// logical indices, so a dropped block does not shift every surviving block's
+	// stored reference: the physical slot is blocks[ref-base]. Rank, and thus
+	// floorBlock, still returns a physical position because the tree holds only
+	// surviving blocks, so only Member and dirInsert carry the offset.
+	base uint32
 }
 
 // Member resolves a directory reference (a block index) to its block firstID's
 // seq in big-endian bytes, the tie-break key the counted tree compares when two
 // blocks share a firstID ms. It satisfies structs.Members for the directory.
 func (s *stream) Member(ref uint32) []byte {
-	binary.BigEndian.PutUint64(s.dirKey[:], s.blocks[ref].first.seq)
+	binary.BigEndian.PutUint64(s.dirKey[:], s.blocks[ref-s.base].first.seq)
 	return s.dirKey[:]
 }
 
@@ -74,10 +81,12 @@ func seqKey(id streamID) []byte {
 	return b[:]
 }
 
-// dirInsert records a newly opened block in the directory at its slice index.
+// dirInsert records a newly opened block in the directory. idx is the physical
+// slot; the stored reference is the logical index idx+base, so it stays valid
+// after front blocks are dropped and the slice reslides.
 func (s *stream) dirInsert(idx int) {
 	b := s.blocks[idx]
-	s.dir.Insert(b.first.ms, seqKey(b.first), uint32(idx), s)
+	s.dir.Insert(b.first.ms, seqKey(b.first), uint32(idx)+s.base, s)
 }
 
 // floorBlock returns the index of the last block whose firstID is at or below id,

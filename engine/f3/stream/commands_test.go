@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"strconv"
 	"testing"
 )
 
@@ -83,10 +84,25 @@ func TestXaddNomkstream(t *testing.T) {
 	wantInt(t, do(t, c, opXlen, "s"), 2)
 }
 
-func TestXaddTrimUnsupported(t *testing.T) {
+func TestXaddTrimClause(t *testing.T) {
 	c := newHarness(t).NewConn()
-	wantErr(t, do(t, c, opXadd, "s", "MAXLEN", "100", "*", "f", "v"),
-		"ERR stream trimming is not supported yet")
+	// The trim runs after the append, so the new entry counts toward MAXLEN.
+	for i := 1; i <= 5; i++ {
+		id := strconv.Itoa(i) + "-0"
+		wantBulk(t, do(t, c, opXadd, "s", "MAXLEN", "3", id, "f", "v"), id)
+	}
+	// Only the newest three survive.
+	wantInt(t, do(t, c, opXlen, "s"), 3)
+	wantEntries(t, do(t, c, opXrange, "s", "-", "+"),
+		e("3-0", "f", "v"), e("4-0", "f", "v"), e("5-0", "f", "v"))
+	// A malformed clause fails the command and adds nothing.
+	wantErr(t, do(t, c, opXadd, "s", "MAXLEN", "x", "6-0", "f", "v"),
+		"ERR value is not an integer or out of range")
+	wantInt(t, do(t, c, opXlen, "s"), 3)
+	// LIMIT without ~ is refused, before the append.
+	wantErr(t, do(t, c, opXadd, "s", "MAXLEN", "2", "LIMIT", "1", "6-0", "f", "v"),
+		"ERR syntax error, LIMIT cannot be used without the special ~ option")
+	wantInt(t, do(t, c, opXlen, "s"), 3)
 }
 
 func TestXaddWrongType(t *testing.T) {

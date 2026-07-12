@@ -13,9 +13,9 @@ import (
 // Xadd answers XADD key [NOMKSTREAM] <id> field value [field value ...]: allocate
 // the entry ID (auto, partial, or explicit, section 3.6), append the entry, and
 // reply the assigned ID as a bulk string. NOMKSTREAM replies nil without creating
-// the key when it is absent. The trim clause (MAXLEN/MINID) and LIMIT arrive with
-// XTRIM in slice 4; a request carrying one is refused here rather than silently
-// ignored. A malformed or non-increasing ID is a client error and creates
+// the key when it is absent. An optional trim clause (MAXLEN/MINID [=|~] threshold
+// [LIMIT n]) runs after the append, so the new entry counts toward the threshold,
+// matching Redis. A malformed or non-increasing ID is a client error and creates
 // nothing.
 func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	i := 1
@@ -24,10 +24,16 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		nomkstream = true
 		i++
 	}
-	// The trim keywords are not parsed yet; reject rather than misread the ID.
-	if i < len(args) && (eqFold(args[i], "MAXLEN") || eqFold(args[i], "MINID") || eqFold(args[i], "LIMIT")) {
-		r.Err("ERR stream trimming is not supported yet")
-		return
+	var trimSet bool
+	var trim trimSpec
+	if i < len(args) && (eqFold(args[i], "MAXLEN") || eqFold(args[i], "MINID")) {
+		sp, next, msg := parseTrim(args[i:])
+		if msg != "" {
+			r.Err(msg)
+			return
+		}
+		trim, trimSet = sp, true
+		i += next
 	}
 	if i >= len(args) {
 		r.Err("ERR wrong number of arguments for 'xadd' command")
@@ -69,9 +75,39 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if newKey {
 		g.m[string(args[0])] = s
 	}
+	if trimSet {
+		s.trim(trim)
+	}
 
 	cx.Val = formatID(cx.Val[:0], id)
 	r.Bulk(cx.Val)
+}
+
+// Xtrim answers XTRIM key MAXLEN|MINID [=|~] threshold [LIMIT n]: drop entries
+// from the front to the threshold and reply the count removed (section 6.6). A
+// missing key removes nothing and replies 0. The whole-block drops touch the
+// directory once per block, not once per entry, and the surviving tail is never
+// rewritten.
+func Xtrim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	sp, next, msg := parseTrim(args[1:])
+	if msg != "" {
+		r.Err(msg)
+		return
+	}
+	if 1+next != len(args) {
+		r.Err("ERR syntax error")
+		return
+	}
+	s, wrong := registry(cx).lookup(cx, args[0])
+	if wrong {
+		r.Err(wrongType)
+		return
+	}
+	if s == nil {
+		r.Int(0)
+		return
+	}
+	r.Int(int64(s.trim(sp)))
 }
 
 // parseFields views the field-value tail as []field. The bytes are caller-owned

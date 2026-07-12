@@ -265,6 +265,35 @@ func (b *block) tombstone(id streamID) bool {
 	return false
 }
 
+// tombstoneWhile flips the deleted flag on live entries from the front while pred
+// holds, up to limit entries, and returns how many it tombstoned. It is the exact
+// XTRIM boundary path (section 6.6): the block stays append-frozen, only flags
+// bytes change and deleted bumps. pred defines a prefix of the ordered entries
+// (oldest-k passes a constant true bounded by limit, MINID passes id < threshold),
+// so the walk stops at the first live entry pred rejects.
+func (b *block) tombstoneWhile(limit int, pred func(id streamID) bool) int {
+	n := 0
+	pos := 0
+	for i := 0; i < b.count && n < limit; i++ {
+		flagsAt := pos
+		flags := b.blob[pos]
+		pos++
+		eid, m := readIDDelta(b.blob[pos:], b.first)
+		pos += m
+		pos = b.skipBody(pos, flags)
+		if flags&entryDeleted != 0 {
+			continue
+		}
+		if !pred(eid) {
+			break
+		}
+		b.blob[flagsAt] = flags | entryDeleted
+		b.deleted++
+		n++
+	}
+	return n
+}
+
 // skipBody advances past an entry body (value frames, plus names on a general
 // entry) starting just after the ID delta, and returns the offset of the next
 // entry. It mirrors the body layout walk decodes, so the two must stay in step;
