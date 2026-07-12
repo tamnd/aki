@@ -454,6 +454,9 @@ func init() {
 	register("XLEN", stream.Xlen, 1, 1, true)
 	register("XDEL", stream.Xdel, 2, -1, true)
 	register("XSETID", stream.Xsetid, 2, -1, true)
+	// XTRIM key MAXLEN|MINID [=|~] threshold [LIMIT n]: at least key and a
+	// two-token threshold clause, keyed on args[0].
+	register("XTRIM", stream.Xtrim, 3, -1, true)
 
 	// Stream read path (M5 slice 3): the counted directory seeks the window's
 	// first block, then entries decode contiguously. XRANGE is key start end

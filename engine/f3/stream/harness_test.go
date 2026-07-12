@@ -19,6 +19,7 @@ const (
 	opXlen
 	opXdel
 	opXsetid
+	opXtrim
 	opXrange
 	opXrevrange
 	opXread
@@ -33,6 +34,7 @@ func harnessHandlers() []shard.Handler {
 	h[opXlen] = Xlen
 	h[opXdel] = Xdel
 	h[opXsetid] = Xsetid
+	h[opXtrim] = Xtrim
 	h[opXrange] = Xrange
 	h[opXrevrange] = Xrevrange
 	h[opXread] = Xread
