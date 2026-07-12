@@ -476,6 +476,17 @@ func init() {
 	table["XREAD"].streamKeyAt = stream.ReadKeyAt
 	table["XREAD"].blocks = true
 
+	// Consumer groups (M5 slice 5). XGROUP CREATE/SETID/DESTROY/CREATECONSUMER/
+	// DELCONSUMER and the XINFO GROUPS read both name their key after the
+	// subcommand token (XGROUP CREATE key ..., XINFO GROUPS key), so they route on
+	// args[1] the way OBJECT routes on the key after its subcommand; the handler
+	// validates each subcommand's own tail. XREADGROUP, XACK, and the rest of XINFO
+	// follow with the delivery ledger.
+	register("XGROUP", stream.Xgroup, 1, -1, false)
+	table["XGROUP"].keyAt = 1
+	register("XINFO", stream.Xinfo, 1, -1, false)
+	table["XINFO"].keyAt = 1
+
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
