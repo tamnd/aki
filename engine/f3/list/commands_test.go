@@ -236,10 +236,9 @@ func TestObjectEncoding(t *testing.T) {
 	do(t, c, opSet, "s", "hello")
 	wantBulk(t, doAt(t, c, opObject, 1, "ENCODING", "s"), "embstr")
 
-	// A missing key delegates to the set OBJECT handler, which returns "no such
-	// key". Redis 8.8 answers nil here instead; that is a pre-existing OBJECT
-	// divergence the set slice owns (OBJECT routed through set.Object before this
-	// slice), tracked with the shared string/OBJECT shim, so this pins aki's
-	// current behavior rather than Redis's.
-	wantErr(t, doAt(t, c, opObject, 1, "ENCODING", "ghost"), "ERR no such key")
+	// A missing key delegates down the chain to the set OBJECT handler, which
+	// answers nil for a key that exists nowhere, matching the redis 8.8.0 build
+	// (verified live: OBJECT ENCODING on an absent key returns a null bulk, not an
+	// error).
+	wantNil(t, doAt(t, c, opObject, 1, "ENCODING", "ghost"))
 }

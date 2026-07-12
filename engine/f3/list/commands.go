@@ -417,9 +417,9 @@ func Lpos(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // Object answers OBJECT ENCODING key with the list band first (spec 2064/f3/13
 // section 4.4): listpack for the inline band, quicklist for the native band. A
 // key that is not a list delegates to the set OBJECT handler, which answers the
-// set bands, the string store's encoding, the "no such key" error, and the
-// unknown-subcommand error, so this one wiring reports every type. OBJECT is a
-// shared verb; routing it through the list here keeps the set slice untouched.
+// set bands, the string store's encoding, a nil for a key that exists nowhere,
+// and the unknown-subcommand error, so this one wiring reports every type. OBJECT
+// is a shared verb; routing it through the list here keeps the set slice untouched.
 func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if eqFold(args[0], "ENCODING") && len(args) == 2 {
 		if l := registry(cx).m[string(args[1])]; l != nil {
