@@ -446,6 +446,12 @@ func init() {
 	register("XDEL", stream.Xdel, 2, -1, true)
 	register("XSETID", stream.Xsetid, 2, -1, true)
 
+	// Stream read path (M5 slice 3): the counted directory seeks the window's
+	// first block, then entries decode contiguously. XRANGE is key start end
+	// [COUNT n]; XREVRANGE swaps the two bounds.
+	register("XRANGE", stream.Xrange, 3, -1, true)
+	register("XREVRANGE", stream.Xrevrange, 3, -1, true)
+
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
