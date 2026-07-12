@@ -35,10 +35,6 @@ const (
 	// slack, and a COUNT-100 cold window costs the minimum two preads.
 	blockBudget = 4096
 	blockCap    = 128
-	// blockHdrLen is the packed on-disk header width (section 3.2). The resident
-	// block keeps these as struct fields; the width is on the memory ledger and
-	// serialized at spill (M9).
-	blockHdrLen = 48
 )
 
 // Entry flags byte (section 3.3). Bit 0 marks a same-schema entry whose field
