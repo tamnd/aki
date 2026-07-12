@@ -1,0 +1,41 @@
+# CF16 rival io-threads calibration, GamingPC box, frozen 2026-07-12
+#
+# Spec 2064/f3/18 section 6.2: sweep each rival's io-threads on the box's
+# server mask and freeze the value that MAXIMIZES it. A rival left at its
+# single-threaded default is a strawman, and a 2x over a strawman is worth
+# nothing. This value is frozen for the whole campaign; per-cell tuning of a
+# rival is a labelled what-if only, never a gate config.
+#
+# Box: GamingPC (Win11 tailnet, WSL2 Ubuntu, 32 cores). Gate split: server on
+# cores 4-17 (14 cores), client on 18-31. Driver: redis-benchmark -t set,get
+# -c 50 -P 16 --threads 8 -d 64 -n 20000000 (n bumped from the spec's 2000000
+# because at 2M the run finishes in ~0.5s and the rps is timer-quantized; 20M
+# gives a 5-8s run and a stable number).
+
+redis   6
+valkey  4
+
+# Full sweep (ops/sec, SET / GET, median of the single 20M run per cell):
+#
+#   redis 8.8.0                         valkey 9.1.0
+#   io  SET        GET                  io  SET        GET
+#   1   1,452,855  1,630,922            1   1,289,158  1,453,066
+#   2   1,632,120  1,776,041            2   2,220,249  2,283,366
+#   4   3,330,558  3,633,721            4   2,960,332  4,206,984   <- valkey peak
+#   6   3,805,899  4,209,640  <- peak   6   2,755,960  3,996,004
+#   8   3,474,032  3,996,803            8   2,422,774  3,330,003
+#   11  3,074,086  3,475,239            11  2,284,409  2,757,860
+#
+# Both rivals rise steeply through io-threads then decline once the io-thread
+# count crowds the 14-core mask. Redis peaks at 6 (SET 3.81M, GET 4.21M),
+# valkey at 4 (SET 2.96M, GET 4.21M). Beyond the peak the extra io-threads
+# contend with the main thread on the fixed mask and throughput falls.
+#
+# CORRECTION THIS FREEZE FORCES: every M0-M3 gate ratio before 2026-07-12 ran
+# both rivals at --io-threads 4. For valkey that IS the peak (no change). For
+# redis, io-threads 4 gives SET 3.33M / GET 3.63M, ~14-16% below its io-threads
+# 6 peak, so redis was under-tuned and any ratio bound by redis was inflated by
+# that much. redis is the binding (faster) SET rival at P16/50c, so the SET
+# headline ratios in particular must be re-measured against redis --io-threads 6
+# before they can be called honest. GET at 50c/P16 is a tie at the peak (both
+# rivals 4.21M).
