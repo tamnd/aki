@@ -63,6 +63,14 @@ type stream struct {
 	// floorBlock, still returns a physical position because the tree holds only
 	// surviving blocks, so only Member and dirInsert carry the offset.
 	base uint32
+
+	// groups is the consumer-group table (section 7.2), nil until the first
+	// XGROUP CREATE. A stream that holds a group is always native (section 4.4),
+	// so this is populated only in the native band. The delivery ledger (the PEL
+	// tree-plus-hash over slabs) hangs off each group and fills as XREADGROUP
+	// delivers (slice 6); this slice carries the group and consumer records and
+	// their lifecycle.
+	groups map[string]*streamGroup
 }
 
 // Member resolves a directory reference (a block index) to its block firstID's
@@ -157,6 +165,19 @@ func (s *stream) upgrade() {
 	s.dir = structs.NewTree()
 	for i := range s.blocks {
 		s.dirInsert(i)
+	}
+}
+
+// ensureNative upgrades an inline stream to the native band so it can carry a
+// group table (section 4.4): the group ledger has no packed-blob form, and a
+// stream someone attaches a group to has declared itself a work queue, not a
+// tiny mailbox. A native stream is left untouched. A zero-entry inline stream
+// (XGROUP CREATE MKSTREAM on a fresh key) becomes a native stream with an empty
+// directory and no blocks, ~200 bytes, and every group code path can then assume
+// the native form.
+func (s *stream) ensureNative() {
+	if s.kind == bandInline {
+		s.upgrade()
 	}
 }
 
