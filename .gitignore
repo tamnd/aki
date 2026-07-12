@@ -26,3 +26,14 @@ aki-heap-*.prof
 # the built server binary at the repo root, anchored so it does not also
 # ignore the cmd/aki source directory
 /aki
+
+# f3 gate raw per-cell benchmark dumps: regenerable machine output from the box runs.
+# Keep only the summary notes (results/f3/*.md), cells.csv, summary.txt, env.txt,
+# binaries.sha256, and the summarizer/driver scripts. Re-run the box to regenerate raw cells.
+results/f3/**/cells/
+results/f3/**/matrix*/
+results/f3/**/*.rep*.csv
+results/f3/**/*.json
+results/f3/**/*.err
+results/f3/**/*.meta
+results/f3/**/*.samples
