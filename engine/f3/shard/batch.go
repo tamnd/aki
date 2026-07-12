@@ -57,6 +57,14 @@ type hopBatch struct {
 	spans [spanCap]span
 	data  []byte
 
+	// dataCap and repCap are the node's starting buffer sizes, carried from the
+	// runtime's resolved caps (Config.BatchDataCap and its matched reply
+	// headroom) so the fill/split threshold and the reset-time shrink use the
+	// swept value rather than the const. A single oversized command still grows
+	// past dataCap on an empty node; the fields only set the steady size.
+	dataCap int
+	repCap  int
+
 	// The reply side, written by the owning worker before the outbound push.
 	// rep is the node's reply arena: replies land in RESP wire form, in
 	// command order, located by reps.
@@ -92,10 +100,12 @@ type hopBatch struct {
 	deferN int
 }
 
-func newBatch() *hopBatch {
+func newBatch(dataCap, repCap int) *hopBatch {
 	return &hopBatch{
-		data: make([]byte, 0, batchDataCap),
-		rep:  make([]byte, 0, repCap),
+		data:    make([]byte, 0, dataCap),
+		rep:     make([]byte, 0, repCap),
+		dataCap: dataCap,
+		repCap:  repCap,
 	}
 }
 
@@ -129,10 +139,10 @@ func (b *hopBatch) reset() {
 	// A node that carried a giant chunked-band command must not pin its grown
 	// buffers forever; anything past the keep cap shrinks back.
 	if cap(b.data) > keepNodeBytes {
-		b.data = make([]byte, 0, batchDataCap)
+		b.data = make([]byte, 0, b.dataCap)
 	}
 	if cap(b.rep) > keepNodeBytes {
-		b.rep = make([]byte, 0, repCap)
+		b.rep = make([]byte, 0, b.repCap)
 	}
 }
 
@@ -207,7 +217,7 @@ func (b *hopBatch) add(op byte, seq uint32, keyed bool, args [][]byte) bool {
 	for _, a := range args {
 		need += len(a)
 	}
-	if len(b.data)+need > batchDataCap && b.n > 0 {
+	if len(b.data)+need > b.dataCap && b.n > 0 {
 		return false
 	}
 	if need > maxCmdBytes {

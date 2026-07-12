@@ -347,8 +347,8 @@ func (r *Runtime) NewConn() *Conn {
 	c := &Conn{
 		rt:      r,
 		pending: make([]*hopBatch, len(r.workers)),
-		free:    make(chan *hopBatch, freeListCap),
-		ring:    make([]parked, replyRing),
+		free:    make(chan *hopBatch, r.freeListCap),
+		ring:    make([]parked, r.replyRing),
 	}
 	c.out.init()
 	c.wk.init()
@@ -489,7 +489,7 @@ func (c *Conn) take() *hopBatch {
 	case b := <-c.free:
 		return b
 	default:
-		b := newBatch()
+		b := newBatch(c.rt.batchDataCap, c.rt.repCap)
 		b.conn = c
 		return b
 	}
