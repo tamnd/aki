@@ -228,9 +228,10 @@ func (b *block) walk(scratch []field, fn func(id streamID, fields []field) bool)
 	}
 }
 
-// covers reports whether id falls in the block's [firstID, lastID] span, so a
-// linear seek can skip blocks that cannot hold it. The counted directory
-// replaces this scan with an O(log C) seekLE in slice 3.
+// covers reports whether id falls in the block's [firstID, lastID] span. The
+// counted directory floor picks the one block that could hold id in O(log C);
+// covers then confirms id is not past its last live entry before a tombstone
+// scan.
 func (b *block) covers(id streamID) bool {
 	return b.count > 0 && id.cmp(b.first) >= 0 && id.cmp(b.last) <= 0
 }
