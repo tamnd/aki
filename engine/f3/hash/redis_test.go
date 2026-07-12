@@ -311,6 +311,19 @@ var pointScript = [][]string{
 	{"HRANDFIELD", "hs", "notanint"}, // -ERR value is not an integer or out of range
 	{"HRANDFIELD", "hs", "1", "FOO"}, // bad third token -> -ERR syntax error
 	{"HRANDFIELD", "s"},              // WRONGTYPE (string key)
+
+	// HGETALL/HKEYS/HVALS on the inline hash. The listpack band keeps insertion
+	// order, so the whole reply is byte-comparable; the native band's draw-vector
+	// order is not and lives in the structural tests instead.
+	{"HGETALL", "hs"},         // *6[user:1,a,user:2,b,post:1,c] insertion order
+	{"HKEYS", "hs"},           // *3[user:1,user:2,post:1]
+	{"HVALS", "hs"},           // *3[a,b,c]
+	{"HGETALL", "missingkey"}, // missing key -> *0[]
+	{"HKEYS", "missingkey"},   // *0[]
+	{"HVALS", "missingkey"},   // *0[]
+	{"HGETALL", "s"},          // WRONGTYPE (string key)
+	{"HKEYS", "s"},            // WRONGTYPE
+	{"HVALS", "s"},            // WRONGTYPE
 }
 
 // verbOp routes a script verb to the harness op byte.
@@ -320,6 +333,7 @@ var verbOp = map[string]byte{
 	"HEXISTS": opHexists, "HLEN": opHlen, "HSTRLEN": opHstrlen,
 	"HINCRBY": opHincrby, "HINCRBYFLOAT": opHincrbyfloat,
 	"HSCAN": opHscan, "HRANDFIELD": opHrandfield,
+	"HGETALL": opHgetall, "HKEYS": opHkeys, "HVALS": opHvals,
 	"OBJECT": opObject, "SET": opSet,
 }
 
