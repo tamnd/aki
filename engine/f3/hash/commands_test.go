@@ -101,6 +101,8 @@ func TestWrongType(t *testing.T) {
 	wantErr(t, do(t, c, opHexists, "s", "a"), wt)
 	wantErr(t, do(t, c, opHlen, "s"), wt)
 	wantErr(t, do(t, c, opHstrlen, "s", "a"), wt)
+	wantErr(t, do(t, c, opHincrby, "s", "a", "1"), wt)
+	wantErr(t, do(t, c, opHincrbyfloat, "s", "a", "1"), wt)
 }
 
 // OBJECT ENCODING tracks the band: listpack inline, hashtable after a threshold

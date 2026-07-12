@@ -256,11 +256,22 @@ var pointScript = [][]string{
 	{"HSETNX", "h", "a", "0"},                   // exists -> :0
 	{"HSETNX", "h", "fresh", "7"},               // new -> :1
 	{"HMSET", "h", "x", "10", "y", "20"},        // +OK
-	{"HSET", "h", "odd", "1", "trailing"},       // arity error (handler-enforced)
-	{"HMSET", "h", "odd", "1", "trailing"},      // arity error (handler-enforced)
-	{"OBJECT", "ENCODING", "h"},                 // $listpack
-	{"OBJECT", "ENCODING", "s"},                 // $int (string store, via the chain)
-	{"OBJECT", "ENCODING", "gone"},              // $-1 nil (redis 8.8.0, not an error)
+	// Arithmetic verbs: a missing field starts at zero, the rendering rides back.
+	{"HINCRBY", "h", "cnt", "5"},            // new field -> :5
+	{"HINCRBY", "h", "cnt", "-2"},           // :3
+	{"HINCRBY", "h", "a", "1"},              // "9" + 1 -> :10
+	{"HINCRBYFLOAT", "h", "cnt", "0.5"},     // "3" + 0.5 -> $3.5
+	{"HINCRBYFLOAT", "h", "f", "5.0e3"},     // new -> $5000
+	{"HINCRBY", "h", "e", "1"},              // "" empty field is not an int -> err
+	{"HINCRBYFLOAT", "h", "f", "notafloat"}, // err, unchanged
+	{"HINCRBYFLOAT", "h", "f", "inf"},       // infinite increment -> "value is NaN or Infinity"
+	{"HSET", "h", "huge", "1e308"},          // :1
+	{"HINCRBYFLOAT", "h", "huge", "1e308"},  // sum overflows -> "increment would produce ..."
+	{"HSET", "h", "odd", "1", "trailing"},   // arity error (handler-enforced)
+	{"HMSET", "h", "odd", "1", "trailing"},  // arity error (handler-enforced)
+	{"OBJECT", "ENCODING", "h"},             // $listpack
+	{"OBJECT", "ENCODING", "s"},             // $int (string store, via the chain)
+	{"OBJECT", "ENCODING", "gone"},          // $-1 nil (redis 8.8.0, not an error)
 	// Promote by writing a value past the 64-byte cap, then re-probe the same
 	// fields on the native side to prove the boundary is invisible.
 	{"HSET", "h", "wide", strings.Repeat("z", maxListpackValue+1)}, // :1, promotes
@@ -279,6 +290,7 @@ var verbOp = map[string]byte{
 	"HSET": opHset, "HMSET": opHmset, "HSETNX": opHsetnx,
 	"HGET": opHget, "HMGET": opHmget, "HDEL": opHdel,
 	"HEXISTS": opHexists, "HLEN": opHlen, "HSTRLEN": opHstrlen,
+	"HINCRBY": opHincrby, "HINCRBYFLOAT": opHincrbyfloat,
 	"OBJECT": opObject, "SET": opSet,
 }
 
