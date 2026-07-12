@@ -70,10 +70,12 @@ func blmoveDir(cx *shard.Ctx, src, dst []byte, srcLeft, dstLeft bool, timeoutArg
 	}
 	spec := waitSpec{kind: kindMove, front: srcLeft, dstKey: string(dst), dstLeft: dstLeft}
 	head := parkWaiter(g, [][]byte{src}, spec, cx.CurConn(), cx.CurSeq())
+	var deadline int64
 	if timeout > 0 {
-		deadline := cx.NowMs + int64(timeout*1000)
+		deadline = cx.NowMs + int64(timeout*1000)
 		g.wpool.nodes[head].timer = cx.ArmTimer(deadline, makeFire(g, head))
 	}
+	g.wpool.nodes[head].deadline = deadline
 	r.Park()
 }
 

@@ -56,7 +56,10 @@ const (
 // is one nil-pointer load on the common path. serving marks a cross BLMOVE whose
 // remote destination hop is in flight on a spawned coordinator, so a second push
 // on the source does not launch a duplicate; it is owner-local, cleared or
-// unlinked back on the source owner.
+// unlinked back on the source owner. deadline is the timeout instant in unix ms (0
+// for a wait that blocks forever), kept only so a cross BLMOVE whose spawned
+// coordinator finds the source drained again can re-arm the same timer it cancels
+// at serve, blockmovecross.go.
 type waitNode struct {
 	prev, next uint32
 	sib        uint32
@@ -65,6 +68,7 @@ type waitNode struct {
 	seq        uint32
 	timer      shard.TimerHandle
 	claim      *blockClaim
+	deadline   int64
 	kind       uint8
 	front      bool
 	dstLeft    bool
@@ -144,6 +148,7 @@ func (l *waitList) park(spec waitSpec, c *shard.Conn, seq uint32) uint32 {
 	nd.dstLeft = spec.dstLeft
 	nd.claim = spec.claim
 	nd.timer = nil
+	nd.deadline = 0
 	nd.live = true
 	nd.serving = false
 	nd.prev = l.tail
@@ -334,9 +339,49 @@ func serveKey(cx *shard.Ctx, g *reg, key []byte, l *list) {
 			}
 			conn.CompleteBlocked(seq, rep)
 		default: // kindMove
+			if serveMoveRemote(cx, g, key, i, nd) {
+				// The destination lives on another shard: a coordinator is now in
+				// flight for this head. Stop draining the key rather than looping on
+				// the still-parked head; the coordinator serves it (or re-parks it) and
+				// re-drives this key when it finishes.
+				return
+			}
 			serveMove(cx, g, key, l, i, nd)
 		}
 	}
+}
+
+// serveMoveRemote handles a BLMOVE/BRPOPLPUSH waiter whose destination lives on a
+// different shard than the source it parked on. The source owner cannot push onto
+// a key it does not own, so it hands the move to a spawned coordinator that
+// acquires both keys and runs the peek-push-pop under a fresh barrier
+// (blockmovecross.go). It cancels the waiter's timeout and marks the node serving
+// so a second push on the source does not launch a duplicate coordinator, then
+// returns true so the caller stops the serve loop: the head stays parked until the
+// coordinator completes it (or re-parks it on a source that drained in the window)
+// and re-drives this key. A co-located destination, or a bare Ctx with no runtime
+// (a unit test that never spans shards), returns false and serveMove runs inline
+// as before. Owner goroutine only.
+func serveMoveRemote(cx *shard.Ctx, g *reg, key []byte, i uint32, nd *waitNode) bool {
+	rt := cx.Runtime()
+	if rt == nil {
+		return false
+	}
+	if cx.ShardOf([]byte(nd.dstKey)) == cx.ShardID() {
+		return false
+	}
+	if nd.serving {
+		return true
+	}
+	nd.serving = true
+	if nd.timer != nil {
+		cx.CancelTimer(nd.timer)
+		nd.timer = nil
+	}
+	src := append([]byte(nil), key...)
+	dst := append([]byte(nil), nd.dstKey...)
+	go runMoveCross(rt, src, dst, i, nd.front, nd.dstLeft, nd.deadline)
+	return true
 }
 
 // serveMove completes one blocked BLMOVE/BRPOPLPUSH waiter parked on key: pop the

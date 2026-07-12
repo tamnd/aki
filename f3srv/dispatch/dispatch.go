@@ -374,17 +374,23 @@ func init() {
 
 	// BLMOVE source destination <LEFT|RIGHT> <LEFT|RIGHT> timeout and its older
 	// spelling BRPOPLPUSH source destination timeout (spec 2064/f3/13 M3 slice 8)
-	// are the blocking two-key move. They route on the source (keyAt 0, the
-	// first-argument route LMOVE and the pushes use) and read both keys from that
-	// owner's registry, the co-located convention; a cross-shard destination hop is
-	// a later slice (PR 6), so the point path here assumes co-located keys the same
-	// way pre-slice-7 LMOVE did. blocks arms the reader barrier after enqueue so a
-	// command pipelined behind an unresolved park does not run until the reply goes
-	// out; an immediate serve still replies in place.
+	// are the blocking two-key move. Co-located keys keep the point path, which
+	// routes on the source (keyAt 0, the first-argument route LMOVE and the pushes
+	// use) and reads both keys from that owner's registry. When source and
+	// destination span shards blockCross sends them through DoBlockCross so the
+	// command holds an intent on both across the serve-or-park decision; a serving
+	// push then spawns a coordinator for the cross destination hop (list/
+	// blockmovecross.go). crossKeys is the two keys. blocks arms the reader barrier
+	// after enqueue so a command pipelined behind an unresolved park does not run
+	// until the reply goes out; an immediate serve still replies in place.
 	register("BLMOVE", list.Blmove, 5, 5, true)
 	table["BLMOVE"].blocks = true
+	table["BLMOVE"].blockCross = list.BlmoveCross
+	table["BLMOVE"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 	register("BRPOPLPUSH", list.Brpoplpush, 3, 3, true)
 	table["BRPOPLPUSH"].blocks = true
+	table["BRPOPLPUSH"].blockCross = list.BrpoplpushCross
+	table["BRPOPLPUSH"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 
 	// BLMPOP timeout numkeys key [key ...] <LEFT|RIGHT> [COUNT count] (spec
 	// 2064/f3/13 M3 slice 8) is the blocking LMPOP. It leads with a timeout and
