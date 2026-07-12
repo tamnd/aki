@@ -640,13 +640,27 @@ func (c *Conn) Wait() bool {
 	}
 }
 
+// spinBudget is how many idle re-check iterations the writer runs before it
+// parks. Below the live-connection high-water it is the full calibrated
+// spinIters, which catches the next reply without a futex wake while cores sit
+// idle. At or above the high-water the box is saturated and the spin only steals
+// cores the shard workers need, so it collapses to 0 and the writer parks
+// immediately (see connSpinHighWater and labs/f3/m0/22_conn_spin).
+func (c *Conn) spinBudget() int {
+	if int(c.rt.live.Load()) >= connSpinHighWater {
+		return 0
+	}
+	return spinIters
+}
+
 // idleOnce is one spin-then-park turn of the writer's wait, the section 9.1
 // protocol with the same lost-wake guard the worker's idle carries.
 func (c *Conn) idleOnce() {
 	c.wk.state.Store(stateSpinning)
 	// Calibrated iteration count instead of a time.Now per turn; see
-	// spinIters in tuning.go.
-	for i := 0; i < spinIters; i++ {
+	// spinIters in tuning.go. spinBudget collapses to 0 once the box is
+	// saturated so the writer parks at once (the loop is skipped).
+	for i := 0; i < c.spinBudget(); i++ {
 		if c.out.ready() || c.closed.Load() {
 			c.wk.state.Store(stateRunning)
 			return

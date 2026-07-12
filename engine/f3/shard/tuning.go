@@ -129,6 +129,40 @@ var spinIters = spinItersFor(spinWindow)
 // windows differ (see workerSpinWindow), so each gets its own count.
 var workerSpinIters = spinItersFor(workerSpinWindow)
 
+// connSpinHighWater is the live-connection count at or above which a connection
+// writer stops spinning before it parks and parks at once. Below it a writer
+// burns spinWindow to catch the next reply without a futex wake, which pays when
+// cores sit idle at low fan-out. At or above it the box is saturated: every
+// microsecond a writer spins is a core stolen from the shard workers draining
+// the backlog, so it parks immediately and yields the core. The
+// labs/f3/m0/22_conn_spin sweep put the crossover near six connections per core
+// on the gate box (knee about 80 to 100 connections at GOMAXPROCS 14): the
+// median-of-3 verify lifted 512-conn SET from 1.24x (fixed spin) to 1.77x and
+// GET from 1.16x to 1.71x vs the slower rival when the writer parked at once,
+// while the low-conn cells were unchanged. It scales with GOMAXPROCS so the
+// switch tracks the core count rather than a fixed connection number.
+var connSpinHighWater = defaultConnSpinHighWater()
+
+func defaultConnSpinHighWater() int {
+	n := runtime.GOMAXPROCS(0) * 6
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// SetConnSpinHighWater overrides the connection-writer park-immediately
+// threshold; the labs/f3/m0/22_conn_spin sweep knob. A value of one parks every
+// writer immediately (the always-saturated arm); a very large value restores the
+// unconditional spin (the fixed-spin control). Call it only before
+// Runtime.Start, the writers read the count with plain loads.
+func SetConnSpinHighWater(n int) {
+	if n < 1 {
+		n = 1
+	}
+	connSpinHighWater = n
+}
+
 // SetWorkerSpinWindow recalibrates the worker spin-before-park window, with 0
 // meaning park immediately. It is the labs/f3/m0/11_transport sweep knob;
 // call it only before Runtime.Start, the workers read the count with plain

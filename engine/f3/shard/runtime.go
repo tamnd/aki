@@ -27,7 +27,28 @@ type Runtime struct {
 	// connection writer goroutines read the field with plain loads during an
 	// INFO gather, which the fixed-before-Start rule makes safe.
 	netInfo func([]byte) []byte
+
+	// live counts connections currently being served across every driver. The
+	// connection writers read it in idleOnce to decide whether to spin before
+	// they park (see connSpinHighWater): past the high-water the box is
+	// saturated, so a writer parks at once and leaves its core to the shard
+	// workers. A driver bumps it as it admits and drops a connection (through
+	// ConnOpened and ConnClosed, which its register and unregister already call
+	// under their registry lock); NewConn does not touch it, so a test that
+	// builds a bare Conn never perturbs the spin decision.
+	live atomic.Int64
 }
+
+// ConnOpened records that a driver has begun serving a connection, and
+// ConnClosed pairs with it when the connection is torn down. They maintain the
+// live count that drives the connSpinHighWater park-immediately switch; every
+// driver routes through register and unregister, so calling these there keeps
+// the count correct across the goroutine, reactor, and uring transports.
+func (r *Runtime) ConnOpened() { r.live.Add(1) }
+
+// ConnClosed records that a served connection has been torn down; see
+// ConnOpened.
+func (r *Runtime) ConnClosed() { r.live.Add(-1) }
 
 // New builds a runtime of shards workers, each with its own store of
 // arenaBytes tiled into segments of segBytes (non-positive segBytes takes the
