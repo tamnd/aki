@@ -20,6 +20,12 @@ type reg struct {
 	m       map[string]*list
 	waiters map[string]*waitList
 	wpool   waitPool
+	// ready is the serve-chain worklist: keys a served BLMOVE pushed onto whose
+	// own blocked waiters may now be servable. It stays nil until the first move
+	// serves (a plain push serving BLPOP/BLMPOP waiters never allocates it) and is
+	// truncated back to empty at the end of every serveWaiters call, so its grown
+	// capacity is reused across chains without holding keys between drains.
+	ready []string
 }
 
 var regs sync.Map // *store.Store -> *reg

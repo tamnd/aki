@@ -73,7 +73,7 @@ func blockpop(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 
 	// Park on every key. A finite timeout arms one timer on the sibling-ring
 	// head; a zero timeout blocks forever and arms nothing.
-	head := parkWaiter(g, keys, front, cx.CurConn(), cx.CurSeq())
+	head := parkWaiter(g, keys, waitSpec{kind: kindPop, front: front}, cx.CurConn(), cx.CurSeq())
 	if timeout > 0 {
 		deadline := cx.NowMs + int64(timeout*1000)
 		g.wpool.nodes[head].timer = cx.ArmTimer(deadline, makeFire(g, head))
@@ -85,7 +85,9 @@ func blockpop(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 // head. It runs on the owner when the deadline passes with no serving push. The
 // live guard makes it idempotent against a serve that already tore the waiter
 // down: a served waiter always cancels this timer first, so a live head here is
-// this waiter's own still-parked node, and the reply is the RESP2 null array.
+// this waiter's own still-parked node. The timeout reply shape is the waiter's:
+// BLMOVE/BRPOPLPUSH time out to the RESP2 null bulk ($-1), the shape Reply.Null
+// emits, and BLPOP/BRPOP/BLMPOP to the RESP2 null array (*-1).
 func makeFire(g *reg, head uint32) func(*shard.Ctx) {
 	return func(cx *shard.Ctx) {
 		nd := &g.wpool.nodes[head]
@@ -94,9 +96,14 @@ func makeFire(g *reg, head uint32) func(*shard.Ctx) {
 		}
 		conn := nd.conn
 		seq := nd.seq
+		kind := nd.kind
 		nd.timer = nil // the firing timer is off the heap already
 		g.unlinkAll(cx, head)
-		conn.CompleteBlocked(seq, resp.AppendNullArray(nil))
+		if kind == kindMove {
+			conn.CompleteBlocked(seq, resp.AppendNull(nil))
+		} else {
+			conn.CompleteBlocked(seq, resp.AppendNullArray(nil))
+		}
 	}
 }
 

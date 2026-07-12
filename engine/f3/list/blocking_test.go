@@ -31,6 +31,11 @@ const (
 	bkSet
 	bkBlpop
 	bkBrpop
+	bkBlmove
+	bkBrpoplpush
+	bkBlmpop
+	bkLmove
+	bkLmpop
 	bkLast
 )
 
@@ -44,6 +49,11 @@ func blockHandlers() []shard.Handler {
 	h[bkLrange] = Lrange
 	h[bkBlpop] = Blpop
 	h[bkBrpop] = Brpop
+	h[bkBlmove] = Blmove
+	h[bkBrpoplpush] = Brpoplpush
+	h[bkBlmpop] = Blmpop
+	h[bkLmove] = Lmove
+	h[bkLmpop] = Lmpop
 	h[bkSet] = func(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		if err := cx.St.Set(args[0], args[1]); err != nil {
 			r.Err("ERR " + err.Error())
@@ -303,12 +313,13 @@ func TestBlpopParkZeroAllocs(t *testing.T) {
 	g := &reg{m: make(map[string]*list), waiters: make(map[string]*waitList)}
 	c := &shard.Conn{}
 	keys := [][]byte{[]byte("k")}
-	_ = parkWaiter(g, keys, true, c, 0) // anchor: keeps the waiter list alive
+	spec := waitSpec{kind: kindPop, front: true}
+	_ = parkWaiter(g, keys, spec, c, 0) // anchor: keeps the waiter list alive
 	for i := 0; i < 8; i++ {            // warm the node slab and the free stack
-		g.unlinkAll(nil, parkWaiter(g, keys, true, c, 1))
+		g.unlinkAll(nil, parkWaiter(g, keys, spec, c, 1))
 	}
 	allocs := testing.AllocsPerRun(200, func() {
-		g.unlinkAll(nil, parkWaiter(g, keys, true, c, 1))
+		g.unlinkAll(nil, parkWaiter(g, keys, spec, c, 1))
 	})
 	if allocs != 0 {
 		t.Errorf("warm BLPOP park allocated %v times per run, want 0", allocs)
