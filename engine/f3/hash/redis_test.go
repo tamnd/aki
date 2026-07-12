@@ -283,6 +283,34 @@ var pointScript = [][]string{
 	// Drain the key one field at a time; the last HDEL drops it.
 	{"HDEL", "h", "a", "zzz", "b"}, // :2 (zzz absent)
 	{"HDEL", "nokey", "a"},         // :0
+
+	// HSCAN over a fresh inline hash. On the listpack band Redis returns the whole
+	// hash in one page with cursor 0 in insertion order, so every one of these is
+	// byte-comparable; the native band's cursor order and HRANDFIELD's randomness
+	// are not, and live in the structural tests instead.
+	{"HSET", "hs", "user:1", "a", "user:2", "b", "post:1", "c"}, // :3
+	{"HSCAN", "hs", "0"},                                // *2[$0,*6[pairs, insertion order]]
+	{"HSCAN", "hs", "0", "COUNT", "100"},                // COUNT is a hint: same full page
+	{"HSCAN", "hs", "0", "NOVALUES"},                    // *2[$0,*3[fields only]]
+	{"HSCAN", "hs", "0", "MATCH", "user:*"},             // *2[$0,*4[the two user pairs]]
+	{"HSCAN", "hs", "0", "MATCH", "user:*", "NOVALUES"}, // filtered, fields only
+	{"HSCAN", "hs", "99"},                               // listpack ignores the cursor -> full page, cursor 0
+	{"HSCAN", "missingkey", "0"},                        // missing key -> *2[$0,*0[]]
+	// HSCAN argument errors, byte for byte.
+	{"HSCAN", "hs", "notacursor"},      // -ERR invalid cursor
+	{"HSCAN", "hs", "0", "BOGUS"},      // -ERR syntax error
+	{"HSCAN", "hs", "0", "COUNT", "0"}, // -ERR syntax error (COUNT must be positive)
+	{"HSCAN", "hs", "0", "MATCH"},      // -ERR syntax error (dangling MATCH)
+	{"HSCAN", "s", "0"},                // WRONGTYPE (string key)
+
+	// HRANDFIELD deterministic paths only: the nil, the empty array, and the
+	// argument errors. The actual draws are random, so they are not replayed here.
+	{"HRANDFIELD", "nokey"},          // no count, absent key -> $-1
+	{"HRANDFIELD", "nokey", "5"},     // count, absent key -> *0[]
+	{"HRANDFIELD", "hs", "0"},        // count 0 -> *0[]
+	{"HRANDFIELD", "hs", "notanint"}, // -ERR value is not an integer or out of range
+	{"HRANDFIELD", "hs", "1", "FOO"}, // bad third token -> -ERR syntax error
+	{"HRANDFIELD", "s"},              // WRONGTYPE (string key)
 }
 
 // verbOp routes a script verb to the harness op byte.
@@ -291,6 +319,7 @@ var verbOp = map[string]byte{
 	"HGET": opHget, "HMGET": opHmget, "HDEL": opHdel,
 	"HEXISTS": opHexists, "HLEN": opHlen, "HSTRLEN": opHstrlen,
 	"HINCRBY": opHincrby, "HINCRBYFLOAT": opHincrbyfloat,
+	"HSCAN": opHscan, "HRANDFIELD": opHrandfield,
 	"OBJECT": opObject, "SET": opSet,
 }
 
@@ -312,7 +341,7 @@ func TestPointOpsAgainstRedis(t *testing.T) {
 	rc := dialForDiff(t)
 	defer rc.close()
 	// Clear every key the script writes so a rerun starts clean.
-	rc.del("s", "h", "nokey", "gone")
+	rc.del("s", "h", "nokey", "gone", "hs", "missingkey")
 
 	hc := newHarness(t).NewConn()
 	for i, cmd := range pointScript {

@@ -293,6 +293,33 @@ func (h *hash) eachInline(fn func(field, value []byte)) {
 	}
 }
 
+// at resolves the field-value pair at forward position idx to its bytes, the
+// HRANDFIELD draw's index-to-pair step. The native band indexes the dense draw
+// vector directly (ftable.at); the inline band walks its blob to the position.
+// Both slices alias internal storage and are valid only until the next mutation,
+// so the caller emits before drawing again. The caller guarantees idx is in
+// [0, card). Position order is not member order and carries no HSCAN guarantee;
+// it only has to be a stable bijection onto [0, card) for a uniform rank to land
+// on a uniform pair, which both bands are.
+func (h *hash) at(idx int) (field, value []byte) {
+	if h.enc == encHashtable {
+		return h.ft.at(idx)
+	}
+	b := h.blob
+	for i := blobHeader; i < len(b); {
+		flen := int(b[i])
+		fstart := i + 1
+		voff := fstart + flen
+		vlen := int(b[voff])
+		if idx == 0 {
+			return b[fstart : fstart+flen], b[voff+1 : voff+1+vlen]
+		}
+		idx--
+		i = voff + 1 + vlen
+	}
+	return nil, nil
+}
+
 // each visits every field-value pair regardless of band, the shared walk the
 // tests and future enumeration commands use. The slices alias internal storage
 // and are valid only for the call.
