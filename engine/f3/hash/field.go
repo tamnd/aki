@@ -193,6 +193,47 @@ func (f *ftable) del(field []byte) bool {
 	return true
 }
 
+// at returns the field-value pair at draw-vector position idx, the native band's
+// HRANDFIELD index step. Both slices alias the slab and are valid until the next
+// mutation. The caller guarantees idx is in [0, card).
+func (f *ftable) at(idx int) (field, value []byte) {
+	e := &f.ents[f.vec[idx]]
+	return f.slab[e.foff : e.foff+uint32(e.flen)], f.slab[e.voff : e.voff+e.vlen]
+}
+
+// scanPage is the hashtable band's downward HSCAN cursor, the field-table twin of
+// set's htable.scanPage (doc 11 section 8.2, doc 20's swap-remove correctness
+// proof carries because ftable.del swap-removes on the same dense vec). The cursor
+// is the boundary: draw-vector positions [b, len) were returned by earlier pages
+// and [0, b) remain. The page examines up to count positions downward from b and
+// returns the new lower boundary, or 0 at the bottom. A fresh scan (cursor 0)
+// opens with the whole vector unscanned; a resumed cursor is clamped to the
+// current length, since a mid-scan shrink can only have carried the old boundary
+// past the new end, and inserts land above the boundary where this walk never
+// revisits them. MATCH filters on the field name.
+func (f *ftable) scanPage(cursor uint64, count int, match []byte, emit func(field, value []byte)) uint64 {
+	n := uint64(len(f.vec))
+	if n == 0 {
+		return 0
+	}
+	b := n
+	if cursor != 0 && cursor < b {
+		b = cursor
+	}
+	lo := uint64(0)
+	if b > uint64(count) {
+		lo = b - uint64(count)
+	}
+	for i := b; i > lo; i-- {
+		e := &f.ents[f.vec[i-1]]
+		field := f.slab[e.foff : e.foff+uint32(e.flen)]
+		if match == nil || globMatch(match, field) {
+			emit(field, f.slab[e.voff:e.voff+e.vlen])
+		}
+	}
+	return lo
+}
+
 // each visits every field-value pair in draw-vector order. Both slices alias the
 // slab and are valid only for the call.
 func (f *ftable) each(fn func(field, value []byte)) {
