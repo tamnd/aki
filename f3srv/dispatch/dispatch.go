@@ -63,6 +63,15 @@ type entry struct {
 	// cross, never both. Co-located keys keep the point path, the free single-
 	// shard case, which is why a colocated key set never reaches here.
 	blockCross func(t *shard.Txn, conn *shard.Conn, seq uint32, args [][]byte) []byte
+
+	// streamKeyAt routes XREAD and its kin, whose key sits after the STREAMS
+	// token rather than at a fixed index: it returns the tail index of the first
+	// stream key (or -1 on a malformed tail), and the single-shard read routes
+	// there through DoAt. crossKeys supplies the full key set for the co-location
+	// guard; the multi-shard read snapshot (the F17 hop plan) is a later slice, so
+	// a key set spanning shards is refused for now rather than silently read from
+	// one owner.
+	streamKeyAt func(args [][]byte) int
 }
 
 // maxVerb bounds the uppercase scratch for verb lookup; no Redis verb comes
@@ -452,6 +461,14 @@ func init() {
 	register("XRANGE", stream.Xrange, 3, -1, true)
 	register("XREVRANGE", stream.Xrevrange, 3, -1, true)
 
+	// XREAD names its keys after the STREAMS token (past optional COUNT/BLOCK), so
+	// it routes through streamKeyAt to the first key's shard; crossKeys guards the
+	// co-location of a multi-key set. The multi-shard read snapshot is owed to the
+	// blocking slice.
+	register("XREAD", stream.Xread, 3, -1, false)
+	table["XREAD"].crossKeys = stream.ReadKeys
+	table["XREAD"].streamKeyAt = stream.ReadKeyAt
+
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
@@ -506,6 +523,9 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 			return dispatchBlockCross(c, e, args)
 		}
 	}
+	if e.streamKeyAt != nil {
+		return dispatchStreamRead(c, e, args)
+	}
 	if e.keyAt > 0 && n > e.keyAt {
 		// A verb whose routing key is not its first argument (OBJECT) goes to
 		// the shard owning args[keyAt]; without that key it falls through to the
@@ -533,6 +553,34 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 		// A blocking verb enqueued: arm the reader-side barrier now that Do has
 		// advanced the sequence. No verb sets blocks in this slice, so this never
 		// fires; the wiring lands with BLPOP.
+		c.ArmBlock()
+	}
+	return err
+}
+
+// dispatchStreamRead routes an XREAD-shaped command, whose routing key follows a
+// STREAMS token. The single-key and co-located forms, the overwhelming majority,
+// go to their one owner through DoAt at the computed key index. A key set that
+// spans shards is refused until the F17 read-snapshot hop plan lands. A malformed
+// tail routes keyless so the handler answers the exact parse error in place.
+func dispatchStreamRead(c *shard.Conn, e *entry, args [][]byte) error {
+	tail := args[1:]
+	if keys := e.crossKeys(tail); len(keys) > 1 && !colocated(c, keys) {
+		return oops(c, "ERR XREAD across shards is not supported yet")
+	}
+	idx := e.streamKeyAt(tail)
+	if idx < 0 {
+		err := c.Do(e.op, false, tail)
+		if err == shard.ErrTooBig {
+			return oops(c, "ERR command too large")
+		}
+		return err
+	}
+	err := c.DoAt(e.op, idx, tail)
+	if err == shard.ErrTooBig {
+		return oops(c, "ERR command too large")
+	}
+	if err == nil && e.blocks {
 		c.ArmBlock()
 	}
 	return err
