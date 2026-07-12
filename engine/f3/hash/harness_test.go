@@ -28,6 +28,9 @@ const (
 	opHincrbyfloat
 	opHrandfield
 	opHscan
+	opHgetall
+	opHkeys
+	opHvals
 	opObject
 	opSet // seed a string key to test WRONGTYPE and the OBJECT fallthrough
 	opLast
@@ -48,6 +51,9 @@ func harnessHandlers() []shard.Handler {
 	h[opHincrbyfloat] = Hincrbyfloat
 	h[opHrandfield] = Hrandfield
 	h[opHscan] = Hscan
+	h[opHgetall] = Hgetall
+	h[opHkeys] = Hkeys
+	h[opHvals] = Hvals
 	h[opObject] = Object
 	h[opSet] = func(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		if err := cx.St.Set(args[0], args[1]); err != nil {

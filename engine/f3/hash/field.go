@@ -41,6 +41,13 @@ type ftable struct {
 	vec  []uint32      // draw vector: live record ordinals, the swap-remove target
 	free []uint32      // ordinals of deleted records, reused before the slab grows
 	dead int           // slab bytes behind deleted or overwritten records, drives compaction
+
+	// streams counts the HGETALL/HKEYS/HVALS enumerations pumping off this table
+	// right now. While it is nonzero, slab compaction and free-slot reuse both
+	// stand down: an open stream is reading slab offsets snapshotted at command
+	// time, so moving bytes or repurposing a record's ordinal would slide the read
+	// (hgetall.go, the same pin set's htable takes for SMEMBERS).
+	streams int
 }
 
 // newFtable builds an empty table sized for hint fields, so the inline-to-native
@@ -159,7 +166,10 @@ func (f *ftable) newRecord(field, value []byte) uint32 {
 		vlen:  uint32(len(value)),
 	}
 	var ord uint32
-	if n := len(f.free); n > 0 {
+	if n := len(f.free); n > 0 && f.streams == 0 {
+		// A freed ordinal is reused only when no enumeration is mid-flight: a
+		// streamed HGETALL may still be reading the field or value whose record this
+		// slot once held, so reuse waits for it to drain (see the streams field).
 		ord = f.free[n-1]
 		f.free = f.free[:n-1]
 		f.ents[ord] = e
@@ -245,6 +255,41 @@ func (f *ftable) each(fn func(field, value []byte)) {
 	}
 }
 
+// drawLen is the draw-vector length, the high bound the HGETALL/HKEYS/HVALS
+// snapshot starts from.
+func (f *ftable) drawLen() int { return len(f.vec) }
+
+// ordAt is the record ordinal at draw-vector index i, the stable handle the
+// enumeration snapshot copies so a swap-remove reordering the live vector during
+// the stream cannot disturb it.
+func (f *ftable) ordAt(i int) uint32 { return f.vec[i] }
+
+// fieldByOrd and valueByOrd return the bytes of the field or value at record
+// ordinal ord, aliasing the slab. They are how a streamed enumeration reads a
+// snapshotted ordinal; the streams pin keeps the slab and the record valid for
+// the read.
+func (f *ftable) fieldByOrd(ord uint32) []byte {
+	e := &f.ents[ord]
+	return f.slab[e.foff : e.foff+uint32(e.flen)]
+}
+
+func (f *ftable) valueByOrd(ord uint32) []byte {
+	e := &f.ents[ord]
+	return f.slab[e.voff : e.voff+e.vlen]
+}
+
+// flenByOrd and vlenByOrd are the field and value lengths alone, for presizing a
+// reply frame without touching the bytes.
+func (f *ftable) flenByOrd(ord uint32) int { return int(f.ents[ord].flen) }
+func (f *ftable) vlenByOrd(ord uint32) int { return int(f.ents[ord].vlen) }
+
+// pinStream and unpinStream bracket an open enumeration (HGETALL/HKEYS/HVALS
+// stream): the pin freezes record reuse and slab compaction, the unpin releases
+// them when the last stream drains. Both run on the owner goroutine, the pin at
+// command time and the unpin from the stream's Release on the pump.
+func (f *ftable) pinStream()   { f.streams++ }
+func (f *ftable) unpinStream() { f.streams-- }
+
 // maybeCompact rewrites the slab when the dead bytes behind deleted and
 // overwritten records outgrow the live ones, so churn cannot grow the slab
 // without bound. This is an amortized maintenance event, not a steady-path cost;
@@ -252,6 +297,13 @@ func (f *ftable) each(fn func(field, value []byte)) {
 // 2064/f3/10 section 3.6), and this keeps the standalone band honest until it
 // lands.
 func (f *ftable) maybeCompact() {
+	if f.streams > 0 {
+		// An open enumeration is reading foff/voff offsets into the live slab;
+		// moving bytes now would slide them under it. Compaction resumes once the
+		// last stream drains, and the dead bytes it leaves are bounded by the window
+		// the stream stays open for.
+		return
+	}
 	if f.dead <= len(f.slab)/2 || f.dead < 4096 {
 		return
 	}
