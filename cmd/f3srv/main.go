@@ -34,6 +34,10 @@ func main() {
 		"event loops for the reactor and uring drivers; 0 takes the 2/5 network share of the core split (labs/f3/m0/19_loop_count; the goroutine driver ignores this)")
 	connSpinHighWater := flag.Int("conn-spin-highwater", 0,
 		"live connections at or above which a connection writer parks immediately instead of spinning (labs/f3/m0/22_conn_spin); 0 keeps the GOMAXPROCS*6 default, 1 always parks fast, a huge value restores unconditional spin")
+	readBufKiB := flag.Int("read-buf-kib", 0,
+		"initial per-connection read buffer KiB; 0 takes the 64KiB default. It grows on demand for a larger command, so a smaller value only trims idle/point-op connections (labs/f3/m0/24_conn_buffers)")
+	replyBufKiB := flag.Int("reply-buf-kib", 0,
+		"per-connection reply writer buffer KiB; 0 takes the 64KiB default. One pipeline round of replies should fit or the writer flushes mid-drain (labs/f3/m0/24_conn_buffers)")
 	flag.Parse()
 	if *connSpinHighWater > 0 {
 		shard.SetConnSpinHighWater(*connSpinHighWater)
@@ -50,6 +54,8 @@ func main() {
 		ConnShape:        *connShape,
 		NetDriver:        *netDriver,
 		NetLoops:         *netLoops,
+		ReadBufBytes:     *readBufKiB << 10,
+		ReplyBufBytes:    *replyBufKiB << 10,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "f3srv:", err)
