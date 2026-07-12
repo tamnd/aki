@@ -102,8 +102,8 @@ func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) 
 	// so the same-key rotation branch above (which needs a non-empty source) never
 	// reaches here, and LINSERT, which also only runs on a non-empty list, is left
 	// unhooked to match Redis not signalling ready on it. The cross-shard
-	// destination hop (lmovecross.go) does not yet serve its waiters; that is the
-	// documented PR 6 gap.
+	// destination hop (lmovecross.go) serves its waiters with the same call, so a
+	// cross LMOVE wakes a destination blocker exactly as this co-located branch does.
 	if len(g.waiters) != 0 {
 		serveWaiters(cx, g, dstKey, dst)
 		if dst.length() == 0 {

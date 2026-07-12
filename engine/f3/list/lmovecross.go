@@ -91,6 +91,25 @@ func LmoveCross(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) []byte {
 				g.m[string(dst)] = d
 			}
 			pushEnd(d, elem, dstLeft)
+			// Wake any client blocked on the destination, exactly as the co-located
+			// lmove distinct-key branch (lmove.go) and the blocking cross move
+			// (blockmovecross.go) do. This runs on the dst owner under the barrier, so
+			// a BLPOP or BLMPOP parked on dst is served the element right here; a dst
+			// with no waiters makes it a no-op, and a kindMove waiter whose own
+			// destination is remote takes the serveMoveRemote spawn path. Without this
+			// hook a cross LMOVE that pushes onto a key with a parked blocker leaves it
+			// hanging, a Redis-parity bug, since the co-located and blocking-cross forms
+			// both wake it. The final source pop hop is unchanged, so the transient
+			// stays element-in-both.
+			serveWaiters(cx, g, dst, d)
+			// A serve that consumed the moved element leaves the destination empty, so
+			// drop it: a cross LMOVE deletes an emptied destination exactly as the
+			// co-located lmove does (lmove.go), keeping EXISTS/TYPE/OBJECT ENCODING in
+			// step. g.drop touches only the list index; waiters still parked on dst live
+			// in the separate waiter set and stay for a future push.
+			if d.length() == 0 {
+				g.drop(dst)
+			}
 			moved = true
 		})
 	}

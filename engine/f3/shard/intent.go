@@ -45,6 +45,7 @@ const (
 	opUnlock                // release a lock taken during a failed acquire
 	opRun                   // run the critical-section work on the owner
 	opRelease               // remove the intent and advance its key's queue
+	opAsync                 // run a fire-and-forget owner-side closure (PostOwner)
 )
 
 // intent is one key's participation in a transaction. It lives in the owning
@@ -204,6 +205,8 @@ func (w *worker) applyIntentOp(o *intentOp) {
 		if o.done != nil {
 			close(o.done)
 		}
+	case opAsync:
+		o.fn(&w.cx)
 	}
 }
 
@@ -380,6 +383,20 @@ func (w *worker) postIntent(o *intentOp) {
 	w.intentPending.Add(1)
 	w.intentInbox.push(o)
 	w.wk.wake()
+}
+
+// PostOwner runs fn on the target shard's owner goroutine, off the intent
+// control queue, with no acknowledgement and no barrier. It is the cross-owner
+// side-hop a cross-shard blocking command uses at serve time: the owner that
+// serves the block posts a fire-and-forget closure to each other participating
+// owner to cancel its now-dead local waiter node. Because it rides the same MPSC
+// control queue Begin's enqueues ride, a closure posted after those enqueues
+// runs on the owner in that order, and any state the poster published before the
+// post is visible to fn. fn runs single-owner on the target shard, so it may
+// touch that shard's owner-only structures (its waiter set, its timers) exactly
+// like a handler. It never blocks and takes no locks.
+func (r *Runtime) PostOwner(shard int, fn func(*Ctx)) {
+	r.workers[shard].postIntent(&intentOp{kind: opAsync, fn: fn})
 }
 
 // Txn is a tier-two intent transaction: a ticket, one intent per distinct key

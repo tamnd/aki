@@ -51,6 +51,16 @@ type entry struct {
 	// algebra reads ride this; RENAME, COPY, and LMOVE join with their slices.
 	cross     func(t *shard.Txn, args [][]byte) []byte
 	crossKeys func(args [][]byte) [][]byte
+
+	// blockCross is the tier-two route for a blocking verb whose keys span
+	// shards (spec 2064/f3/13 M3 slice 8, PR 6): DoBlockCross holds an intent on
+	// every key across the serve-or-park decision, and the body serves the first
+	// non-empty key under the barrier or parks a waiter on each owner and leaves
+	// the reply open. It shares crossKeys with cross for the co-location check;
+	// a blocking verb sets blockCross where a non-blocking tier-two verb sets
+	// cross, never both. Co-located keys keep the point path, the free single-
+	// shard case, which is why a colocated key set never reaches here.
+	blockCross func(t *shard.Txn, conn *shard.Conn, seq uint32, args [][]byte) []byte
 }
 
 // maxVerb bounds the uppercase scratch for verb lookup; no Redis verb comes
@@ -344,42 +354,58 @@ func init() {
 	table["LMPOP"].keyAt = 1
 
 	// BLPOP/BRPOP key [key ...] timeout (spec 2064/f3/13 M3 slice 8) are the first
-	// blocking list verbs. They key on the first listed key (keyAt 0) and read
-	// every listed key from that shard's registry, the same co-located convention
-	// LMPOP uses; a cross-shard multi-key wait is a later slice. blocks arms the
-	// reader barrier after enqueue so a command pipelined behind an unresolved
-	// BLPOP does not run until its reply goes out. The immediate-serve path still
-	// replies in place; the barrier disarms itself either way once emitted crosses
-	// it. BLMOVE and BLMPOP join once the cross-shard claim lands.
+	// blocking list verbs. When the listed keys are co-located they key on the
+	// first (keyAt 0) and read every key from that one shard's registry, the free
+	// single-shard path LMPOP uses; when the keys span shards blockCross sends them
+	// through DoBlockCross, which holds an intent on every key across the serve-or-
+	// park decision and parks a shared-claim waiter on each owner (list/
+	// blockcross.go). blocks arms the reader barrier after enqueue so a command
+	// pipelined behind an unresolved BLPOP does not run until its reply goes out.
+	// The immediate-serve path still replies in place; the barrier disarms itself
+	// either way once emitted crosses it.
 	register("BLPOP", list.Blpop, 2, -1, true)
 	table["BLPOP"].blocks = true
+	table["BLPOP"].blockCross = list.BlpopCross
+	table["BLPOP"].crossKeys = list.BlpopKeys
 	register("BRPOP", list.Brpop, 2, -1, true)
 	table["BRPOP"].blocks = true
+	table["BRPOP"].blockCross = list.BrpopCross
+	table["BRPOP"].crossKeys = list.BlpopKeys
 
 	// BLMOVE source destination <LEFT|RIGHT> <LEFT|RIGHT> timeout and its older
 	// spelling BRPOPLPUSH source destination timeout (spec 2064/f3/13 M3 slice 8)
-	// are the blocking two-key move. They route on the source (keyAt 0, the
-	// first-argument route LMOVE and the pushes use) and read both keys from that
-	// owner's registry, the co-located convention; a cross-shard destination hop is
-	// a later slice (PR 6), so the point path here assumes co-located keys the same
-	// way pre-slice-7 LMOVE did. blocks arms the reader barrier after enqueue so a
-	// command pipelined behind an unresolved park does not run until the reply goes
-	// out; an immediate serve still replies in place.
+	// are the blocking two-key move. Co-located keys keep the point path, which
+	// routes on the source (keyAt 0, the first-argument route LMOVE and the pushes
+	// use) and reads both keys from that owner's registry. When source and
+	// destination span shards blockCross sends them through DoBlockCross so the
+	// command holds an intent on both across the serve-or-park decision; a serving
+	// push then spawns a coordinator for the cross destination hop (list/
+	// blockmovecross.go). crossKeys is the two keys. blocks arms the reader barrier
+	// after enqueue so a command pipelined behind an unresolved park does not run
+	// until the reply goes out; an immediate serve still replies in place.
 	register("BLMOVE", list.Blmove, 5, 5, true)
 	table["BLMOVE"].blocks = true
+	table["BLMOVE"].blockCross = list.BlmoveCross
+	table["BLMOVE"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 	register("BRPOPLPUSH", list.Brpoplpush, 3, 3, true)
 	table["BRPOPLPUSH"].blocks = true
+	table["BRPOPLPUSH"].blockCross = list.BrpoplpushCross
+	table["BRPOPLPUSH"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 
 	// BLMPOP timeout numkeys key [key ...] <LEFT|RIGHT> [COUNT count] (spec
 	// 2064/f3/13 M3 slice 8) is the blocking LMPOP. It leads with a timeout and
 	// then numkeys, so its first key sits one argument further than LMPOP's:
-	// keyAt=2 routes it to the first key's shard (LMPOP uses keyAt=1), and it reads
-	// every listed key from that owner's registry, the co-located convention; a
-	// cross-shard key set is a later slice (PR 6). blocks arms the reader barrier
-	// after enqueue, delivered on the DoAt path below.
+	// keyAt=2 routes a co-located key set to the first key's shard (LMPOP uses
+	// keyAt=1) and reads every key from that owner's registry. A key set spanning
+	// shards goes through blockCross with BlmpopKeys parsing the keys out of the
+	// numkeys tail, the same DoBlockCross park as BLPOP. blocks arms the reader
+	// barrier after enqueue, delivered on the DoAt path for the co-located case and
+	// in dispatchBlockCross for the cross case.
 	register("BLMPOP", list.Blmpop, 4, -1, false)
 	table["BLMPOP"].keyAt = 2
 	table["BLMPOP"].blocks = true
+	table["BLMPOP"].blockCross = list.BlmpopCross
+	table["BLMPOP"].crossKeys = list.BlmpopKeys
 
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
@@ -426,6 +452,11 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 	if e.cross != nil {
 		if keys := e.crossKeys(args[1:]); len(keys) > 1 && !colocated(c, keys) {
 			return dispatchCross(c, e, args)
+		}
+	}
+	if e.blockCross != nil {
+		if keys := e.crossKeys(args[1:]); len(keys) > 1 && !colocated(c, keys) {
+			return dispatchBlockCross(c, e, args)
 		}
 	}
 	if e.keyAt > 0 && n > e.keyAt {
@@ -516,10 +547,7 @@ func colocated(c *shard.Conn, keys [][]byte) bool {
 // pipeline slot. Cross-shard tier-two traffic is rare, so the copies are off
 // every hot path.
 func dispatchCross(c *shard.Conn, e *entry, args [][]byte) error {
-	a := make([][]byte, len(args)-1)
-	for i := range a {
-		a[i] = append([]byte(nil), args[i+1]...)
-	}
+	a := copyTail(args)
 	err := c.DoTxn(e.crossKeys(a), func(t *shard.Txn) []byte {
 		return e.cross(t, a)
 	})
@@ -527,6 +555,40 @@ func dispatchCross(c *shard.Conn, e *entry, args [][]byte) error {
 		return oops(c, "ERR command too large")
 	}
 	return err
+}
+
+// dispatchBlockCross routes one blocking tier-two command whose keys span
+// shards: like dispatchCross it copies the argument tail (the body runs on its
+// own goroutine after the parser views die) and DoBlockCross arms intents on
+// every key, but the body may park instead of replying. On a clean enqueue the
+// reader barrier is armed one past the command's sequence, byte for byte like the
+// point blocking path, so a command pipelined behind an unresolved park does not
+// reply out of order; an immediate serve inside the body still lands its reply at
+// this slot and the barrier disarms itself once emitted crosses it.
+func dispatchBlockCross(c *shard.Conn, e *entry, args [][]byte) error {
+	a := copyTail(args)
+	err := c.DoBlockCross(e.crossKeys(a), func(t *shard.Txn, conn *shard.Conn, seq uint32) []byte {
+		return e.blockCross(t, conn, seq, a)
+	})
+	if err == shard.ErrTooBig {
+		return oops(c, "ERR command too large")
+	}
+	if err == nil {
+		c.ArmBlock()
+	}
+	return err
+}
+
+// copyTail copies a command's argument tail (everything after the verb) into
+// fresh storage, the stable copy a tier-two body reads after the connection's
+// parser views are reused. Cross-shard tier-two traffic is rare, so the copy is
+// off every hot path.
+func copyTail(args [][]byte) [][]byte {
+	a := make([][]byte, len(args)-1)
+	for i := range a {
+		a[i] = append([]byte(nil), args[i+1]...)
+	}
+	return a
 }
 
 // flushToken reports whether arg is the ASYNC or SYNC option, case folded.
