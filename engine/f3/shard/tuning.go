@@ -136,10 +136,11 @@ var workerSpinIters = spinItersFor(workerSpinWindow)
 // microsecond a writer spins is a core stolen from the shard workers draining
 // the backlog, so it parks immediately and yields the core. The
 // labs/f3/m0/22_conn_spin sweep put the crossover near six connections per core
-// on the gate box (knee about 80 to 100 connections at GOMAXPROCS 14): 512-conn
-// point-op throughput rose from 1.19x to 1.75x vs redis when the writer parked
-// at once, while the low-conn cells were unchanged. It scales with GOMAXPROCS so
-// the switch tracks the core count rather than a fixed connection number.
+// on the gate box (knee about 80 to 100 connections at GOMAXPROCS 14): the
+// median-of-3 verify lifted 512-conn SET from 1.24x (fixed spin) to 1.77x and
+// GET from 1.16x to 1.71x vs the slower rival when the writer parked at once,
+// while the low-conn cells were unchanged. It scales with GOMAXPROCS so the
+// switch tracks the core count rather than a fixed connection number.
 var connSpinHighWater = defaultConnSpinHighWater()
 
 func defaultConnSpinHighWater() int {
