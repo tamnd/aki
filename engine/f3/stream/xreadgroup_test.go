@@ -243,8 +243,9 @@ func TestXreadgroupBlockEmptyRepliesNull(t *testing.T) {
 	c := newHarness(t).NewConn()
 	seedGroup(t, c, 1)
 	do(t, c, opXreadgroup, "GROUP", "g", "c", "STREAMS", "s", ">")
-	// BLOCK parses and validates; with nothing to deliver it replies nil now
-	// (parks are the next sub-slice).
+	// The one seeded entry is delivered, so a following `>` read finds the cursor at
+	// the tail and parks; a finite BLOCK times out to the null array. The blocking
+	// path itself is covered in xreadgroup_block_test.go.
 	if rep := readGroupReply(t, do(t, c, opXreadgroup, "GROUP", "g", "c", "BLOCK", "50", "STREAMS", "s", ">")); rep != nil {
 		t.Fatalf("blocked empty read = %v, want nil", rep)
 	}

@@ -21,6 +21,9 @@ type reg struct {
 	// parks, so a stream workload that never blocks carries only the map header.
 	waiters map[string]*waitList
 	wpool   waitPool
+	// serveOrder is the reusable FIFO-snapshot scratch serveWaiters walks, so a
+	// wake that unlinks nodes mid-walk keeps its place without a per-XADD alloc.
+	serveOrder []uint32
 }
 
 var regs sync.Map // *store.Store -> *reg
