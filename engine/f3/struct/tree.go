@@ -634,6 +634,25 @@ func (t *Tree) Rank(score uint64, member []byte, m Members) (uint64, bool) {
 	return acc + uint64(pos), present
 }
 
+// Find returns the reference stored at (score, member) and whether the key is
+// present: descend to its leaf and probe, O(log n) reading nothing but the one
+// leaf it lands in, never mutating and never allocating. It is the point lookup
+// XCLAIM and XNACK ride to reach a pending slab by ID without removing it, the
+// read twin of Delete: same descent, no motion.
+func (t *Tree) Find(score uint64, member []byte, m Members) (uint32, bool) {
+	ord := t.root
+	level := t.height
+	for level > 1 {
+		ord = t.bChild(ord, t.route(ord, score, member, m))
+		level--
+	}
+	pos, present := t.leafPos(ord, score, member, m)
+	if !present {
+		return 0, false
+	}
+	return t.lRef(ord, pos), true
+}
+
 // SelectAt returns the (score, ref) at rank r, 0-based, and whether r is in range:
 // descend subtracting child counts from r until it falls inside a child, the leaf
 // remainder is the offset, O(log n) with no member compare. This is what makes a

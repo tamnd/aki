@@ -126,6 +126,125 @@ func (grp *streamGroup) delConsumer(name []byte) int64 {
 	return removed
 }
 
+// claimResult reports what a single-ID claim did (section 7.7): claimed carries
+// the id the reply renders, deleted marks a pending entry whose log entry an XDEL
+// removed since (dropped from the PEL, never claimed, reported by XAUTOCLAIM), and
+// a zero value is a skip: the entry was not pending without FORCE, or not idle
+// enough to take.
+type claimResult struct {
+	id      streamID
+	claimed bool
+	deleted bool
+}
+
+// xclaimOpts is the parsed XCLAIM/XAUTOCLAIM option set (section 7.7). force
+// creates a pending slab for a not-yet-pending entry that still exists in the log;
+// justid suppresses the delivery-count bump and renders IDs only; the idle, time,
+// and retry overrides set the claimed entry's clock and RETRYCOUNT explicitly
+// instead of stamping now and incrementing.
+type xclaimOpts struct {
+	force    bool
+	justid   bool
+	hasIdle  bool
+	idleMs   int64
+	hasTime  bool
+	timeMs   int64
+	hasRetry bool
+	retry    int64
+}
+
+// claimOne applies a claim to one ID for the target consumer (section 7.7): a
+// point rewrite of the pending slab, never a scan, never a move between
+// structures. It resolves the entry's liveness once, creates the slab under FORCE
+// when the entry exists but is not pending, drops a pending entry whose log entry
+// is gone, gates on min-idle against the current delivery clock, then reassigns
+// ownership and stamps the delivery time and count. A missing group PEL is created
+// only when FORCE has something to add.
+func (grp *streamGroup) claimOne(s *stream, id streamID, to *streamConsumer, now, minIdle int64, opts xclaimOpts) claimResult {
+	_, live := s.entryAt(id)
+	var (
+		pe *pelEntry
+		ok bool
+	)
+	if grp.pel != nil {
+		pe, ok = grp.pel.find(id)
+	}
+	if !ok {
+		if !opts.force || !live {
+			return claimResult{}
+		}
+		if grp.pel == nil {
+			grp.pel = newPEL()
+		}
+		pe = grp.pel.insertClaimed(id)
+		grp.pelCount++
+	}
+	if !live {
+		// The pending entry outlived its log entry (XDEL'd since delivery): drop it
+		// from the PEL and report it deleted, never claiming a phantom.
+		if ord, dropped := grp.pel.ack(id); dropped {
+			grp.pelCount--
+			grp.decOwner(ord)
+		}
+		return claimResult{deleted: true, id: id}
+	}
+	// Idle gate against the current delivery clock; a just-created slab (epoch
+	// clock, no owner) always passes, matching Redis's force path.
+	if pe.consumerOrd != noOwner && now-pe.deliveryTime < minIdle {
+		return claimResult{}
+	}
+	if pe.consumerOrd == noOwner {
+		pe.consumerOrd = to.ord
+		to.pelCount++
+	} else if pe.consumerOrd != to.ord {
+		grp.decOwner(pe.consumerOrd)
+		pe.consumerOrd = to.ord
+		to.pelCount++
+	}
+	switch {
+	case opts.hasTime:
+		pe.deliveryTime = opts.timeMs
+	case opts.hasIdle:
+		pe.deliveryTime = now - opts.idleMs
+	default:
+		pe.deliveryTime = now
+	}
+	// RETRYCOUNT sets the count outright; otherwise a non-JUSTID claim counts one
+	// more delivery. The two are exclusive, as Redis does it: an explicit count is
+	// never then auto-incremented.
+	if opts.hasRetry {
+		pe.deliveryCount = clampRetry(opts.retry)
+	} else if !opts.justid {
+		pe.deliveryCount++
+	}
+	return claimResult{claimed: true, id: id}
+}
+
+// decOwner drops one from the consumer that owns ordinal ord, tolerating the nil
+// hole a DELCONSUMER leaves (a pending slab holds the ordinal by value, so a
+// removed consumer's ordinal can still surface on a claim of its old entry).
+func (grp *streamGroup) decOwner(ord uint32) {
+	if int(ord) < len(grp.consumerByOrd) {
+		if con := grp.consumerByOrd[ord]; con != nil {
+			con.pelCount--
+		}
+	}
+}
+
+// clampRetry fits an XCLAIM RETRYCOUNT into the slab's 2-byte delivery count
+// (section 7.4), flooring a negative to zero and saturating past the u16 ceiling,
+// a bound only a pathological argument reaches.
+func clampRetry(n int64) uint16 {
+	switch {
+	case n < 0:
+		return 0
+	case n > int64(^uint16(0)):
+		return ^uint16(0)
+	default:
+		return uint16(n)
+	}
+}
+
 // drainConsumer removes every pending entry owned by the consumer ordinal from the
 // group PEL and returns the count. It collects the IDs on one tree walk, then acks
 // each, so the tree is never mutated mid-walk. Bounded by the entries removed,
