@@ -198,6 +198,8 @@ func init() {
 	register("GETBIT", derived.GetBit, 2, 2, true)
 	register("BITCOUNT", derived.BitCount, 1, 4, true)
 	register("BITPOS", derived.BitPos, 2, 5, true)
+	register("BITFIELD", derived.BitField, 1, -1, true)
+	register("BITFIELD_RO", derived.BitFieldRO, 1, -1, true)
 
 	// The set surface (spec 2064/f3/11 M1). Point ops, draws, streamed
 	// SMEMBERS, the downward-cursor SSCAN over all three bands, plus OBJECT

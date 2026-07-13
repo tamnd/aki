@@ -90,6 +90,70 @@ func (s *Store) byteAt(addr uint64, i int64) byte {
 	return s.arena.buf[vs+uint64(i)]
 }
 
+// FieldGet reads the width-bit field (1 <= width <= 64) at bit offset off,
+// MSB-first per the 2.1 wire contract, zero-filled where the field runs past the
+// value end or the key is absent. A field spans at most nine covering bytes, so
+// this reads at most nine bytes through the band-aware byteAt, one or two chunks
+// for a chunked value, and never materializes the value whole. It returns the
+// raw field bits in the low width bits; the caller applies the signed or
+// unsigned reading.
+func (s *Store) FieldGet(key []byte, off int64, width uint, now int64) uint64 {
+	_, addr, _ := s.findLive(Hash(key), key, now)
+	var length int64
+	if addr != 0 {
+		length = int64(s.vlen(addr))
+	}
+	b0 := off >> 3
+	b1 := (off + int64(width) - 1) >> 3
+	firstBit := uint(off & 7)
+	var buf [9]byte
+	for j := int64(0); j <= b1-b0; j++ {
+		if bi := b0 + j; addr != 0 && bi < length {
+			buf[j] = s.byteAt(addr, bi)
+		}
+	}
+	var v uint64
+	for i := uint(0); i < width; i++ {
+		gb := firstBit + i
+		v = (v << 1) | uint64((buf[gb>>3]>>(7-(gb&7)))&1)
+	}
+	return v
+}
+
+// FieldSet writes the low width bits of val into the width-bit field at bit
+// offset off, MSB-first, zero-extending the value when the field runs past the
+// end. It reads the covering bytes, splices the field bits, and writes them back
+// through SetRange in one chunk-bounded patch, so a field write into a giant
+// value rewrites the one or two chunks it lands in, never the whole value.
+func (s *Store) FieldSet(key []byte, off int64, width uint, val uint64, now int64) error {
+	b0 := off >> 3
+	b1 := (off + int64(width) - 1) >> 3
+	n := b1 - b0 + 1
+	firstBit := uint(off & 7)
+	_, addr, _ := s.findLive(Hash(key), key, now)
+	var length int64
+	if addr != 0 {
+		length = int64(s.vlen(addr))
+	}
+	var buf [9]byte
+	for j := int64(0); j < n; j++ {
+		if bi := b0 + j; addr != 0 && bi < length {
+			buf[j] = s.byteAt(addr, bi)
+		}
+	}
+	for i := uint(0); i < width; i++ {
+		gb := firstBit + i
+		mask := byte(1) << (7 - (gb & 7))
+		if (val>>(width-1-i))&1 == 1 {
+			buf[gb>>3] |= mask
+		} else {
+			buf[gb>>3] &^= mask
+		}
+	}
+	_, err := s.SetRange(key, int(b0), buf[:n], now)
+	return err
+}
+
 // chunkByteAt reads byte i of a chunked value from its covering chunk. vs is
 // the record's value start, holding the directory pointer. An arena chunk is
 // indexed directly; a log chunk yields one byte through a single-byte read.

@@ -443,3 +443,54 @@ func TestBitmapRangeSurface(t *testing.T) {
 	send(t, nc, "BITPOS", "mykey", "2")
 	expect(t, br, "-ERR The bit argument must be 1 or 0.\r\n")
 }
+
+func TestBitfieldSurface(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// SET returns the old field value and writes the new one; GET reads it back.
+	send(t, nc, "BITFIELD", "bf", "SET", "u8", "0", "255")
+	expect(t, br, "*1\r\n:0\r\n")
+	send(t, nc, "BITFIELD", "bf", "GET", "u8", "0")
+	expect(t, br, "*1\r\n:255\r\n")
+
+	// INCRBY defaults to WRAP: 255+10 wraps to 9 in a u8.
+	send(t, nc, "BITFIELD", "bf", "INCRBY", "u8", "0", "10")
+	expect(t, br, "*1\r\n:9\r\n")
+	// OVERFLOW SAT clamps 9+300 to the u8 ceiling 255.
+	send(t, nc, "BITFIELD", "bf", "OVERFLOW", "SAT", "INCRBY", "u8", "0", "300")
+	expect(t, br, "*1\r\n:255\r\n")
+	// OVERFLOW FAIL returns null on 255+10 and writes nothing.
+	send(t, nc, "BITFIELD", "bf", "OVERFLOW", "FAIL", "INCRBY", "u8", "0", "10")
+	expect(t, br, "*1\r\n$-1\r\n")
+
+	// A signed read of 0xFF is -1; SET returns that old value, then GET sees -128.
+	send(t, nc, "BITFIELD", "bf", "SET", "i8", "0", "-128")
+	expect(t, br, "*1\r\n:-1\r\n")
+	send(t, nc, "BITFIELD", "bf", "GET", "i8", "0")
+	expect(t, br, "*1\r\n:-128\r\n")
+
+	// A '#'-prefixed offset scales by the type width: #1 of u8 is byte 1. Two
+	// sub-ops in one command return a two-element array.
+	send(t, nc, "BITFIELD", "bf", "SET", "u8", "#1", "200", "GET", "u8", "#1")
+	expect(t, br, "*2\r\n:0\r\n:200\r\n")
+
+	// BITFIELD_RO serves a GET: byte 0 is 0x80, read as u8 that is 128.
+	send(t, nc, "BITFIELD_RO", "bf", "GET", "u8", "0")
+	expect(t, br, "*1\r\n:128\r\n")
+
+	// Sub-ops chain left to right over a fresh key: INCRBY i5 to 1, then GET u4 0
+	// reads the low nibble, still 0.
+	send(t, nc, "BITFIELD", "k2", "INCRBY", "i5", "100", "1", "GET", "u4", "0")
+	expect(t, br, "*2\r\n:1\r\n:0\r\n")
+
+	// Error surfaces: u64 is not a valid type, BITFIELD_RO rejects SET, an unknown
+	// OVERFLOW mode and a truncated GET both fail before any write.
+	send(t, nc, "BITFIELD", "e", "GET", "u64", "0")
+	expect(t, br, "-ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.\r\n")
+	send(t, nc, "BITFIELD_RO", "bf", "SET", "u8", "0", "1")
+	expect(t, br, "-ERR BITFIELD_RO only supports the GET subcommand\r\n")
+	send(t, nc, "BITFIELD", "bf", "OVERFLOW", "BLAH")
+	expect(t, br, "-ERR Invalid OVERFLOW type specified\r\n")
+	send(t, nc, "BITFIELD", "bf", "GET", "u8")
+	expect(t, br, "-ERR syntax error\r\n")
+}
