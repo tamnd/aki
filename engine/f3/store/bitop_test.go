@@ -173,6 +173,94 @@ func TestBitOpSparseHoles(t *testing.T) {
 	}
 }
 
+// TestReadIntoBands checks the by-key chunk reader the cross-shard coordinator
+// uses: a chunk-aligned read returns the value's bytes at that offset zero-filled
+// past the value end, over every band and for a missing key, matching a slice of
+// the whole materialized value.
+func TestReadIntoBands(t *testing.T) {
+	s := New(64<<20, 1<<20)
+	chunk := int64(ChunkSize)
+	cases := []struct {
+		name string
+		val  []byte
+	}{
+		{"embedded", bytes.Repeat([]byte{0xA5}, 100)},
+		{"int-cell", []byte("1234567890")},
+		{"one-chunk", bytes.Repeat([]byte{0x3C}, int(chunk))},
+		{"chunked", bytes.Repeat([]byte{0x5A}, int(chunk)*2+777)},
+	}
+	for _, c := range cases {
+		key := []byte(c.name)
+		if err := s.Set(key, c.val); err != nil {
+			t.Fatalf("%s set: %v", c.name, err)
+		}
+		full, _ := s.Get(key, nil)
+		for off := int64(0); off <= int64(len(full))+chunk; off += chunk {
+			dst := make([]byte, chunk)
+			s.ReadInto(key, off, dst, 0)
+			want := make([]byte, chunk)
+			if off < int64(len(full)) {
+				copy(want, full[off:])
+			}
+			if !bytes.Equal(dst, want) {
+				t.Fatalf("%s off %d: read mismatch", c.name, off)
+			}
+		}
+	}
+	// A missing key reads as all zero.
+	dst := make([]byte, 64)
+	for i := range dst {
+		dst[i] = 0xFF
+	}
+	s.ReadInto([]byte("absent"), 0, dst, 0)
+	for i, b := range dst {
+		if b != 0 {
+			t.Fatalf("missing key byte %d = %#x, want 0", i, b)
+		}
+	}
+}
+
+// TestCombineChunk checks the exported chunk kernel the coordinator folds source
+// chunks with: it matches the byte oracle over equal-length inputs for every op,
+// reports all-zero correctly, and treats no sources as an all-zero result (the
+// AND short-circuit).
+func TestCombineChunk(t *testing.T) {
+	rng := rand.New(rand.NewPCG(0xc0de, 0x0b17))
+	ops := []int{BitAnd, BitOr, BitXor, BitNot}
+	for _, op := range ops {
+		for iter := 0; iter < 200; iter++ {
+			n := 1 + rng.IntN(200)
+			nsrc := 1 + rng.IntN(3)
+			if op == BitNot {
+				nsrc = 1
+			}
+			srcs := make([][]byte, nsrc)
+			for i := range srcs {
+				b := make([]byte, n)
+				fillRand(rng, b)
+				srcs[i] = b
+			}
+			want := refBitOp(op, srcs)
+			dst := make([]byte, n)
+			zero := CombineChunk(op, dst, srcs)
+			if !bytes.Equal(dst, want) {
+				t.Fatalf("op %d iter %d combine mismatch", op, iter)
+			}
+			if zero != allZero(want) {
+				t.Fatalf("op %d iter %d allZero: got %v want %v", op, iter, zero, allZero(want))
+			}
+		}
+	}
+	// No sources is an all-zero result, the AND short-circuit path.
+	dst := bytes.Repeat([]byte{0xFF}, 32)
+	if !CombineChunk(BitAnd, dst, nil) {
+		t.Fatalf("empty combine should report all zero")
+	}
+	if !allZero(dst) {
+		t.Fatalf("empty combine should zero dst")
+	}
+}
+
 // TestBitOpAllMissingDeletes pins that BITOP over only missing sources deletes
 // the destination and reports 0, even when the destination previously held a
 // value.

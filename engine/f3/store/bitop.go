@@ -141,6 +141,52 @@ func (s *Store) BitOp(op int, dest []byte, srcs [][]byte, now int64) (int64, err
 	return maxlen, nil
 }
 
+// ReadInto fills dst with the value at key over [off, off+len(dst)), zero-filled
+// past the value end or when the key is absent. off must be chunk-aligned, the
+// contract the coordinator reads sources under. It is the by-key entry to
+// fillRange for a cross-shard read hop, which holds a key rather than the resolved
+// address a co-located call already has. Any band is handled; a non-string key
+// reads as absent, the same no-foreign-guard rule the co-located path takes.
+func (s *Store) ReadInto(key []byte, off int64, dst []byte, now int64) {
+	_, addr, _ := s.findLive(Hash(key), key, now)
+	var length int64
+	if addr != 0 {
+		length = int64(s.vlen(addr))
+	}
+	s.fillRange(addr, length, off, dst)
+}
+
+// CombineChunk applies op over the source chunk views into dst and reports whether
+// the result is all zero, so a caller building a fresh destination can leave an
+// all-zero interior chunk as a directory hole. dst and every view are the same
+// length. NOT complements the single source; AND/OR/XOR fold the first source with
+// the rest. No views at all yields an all-zero dst, the AND short-circuit past the
+// shortest source the coordinator uses to skip a chunk's read hops. This keeps the
+// word kernels private to the store while the cross-shard coordinator drives the
+// hops.
+func CombineChunk(op int, dst []byte, srcs [][]byte) bool {
+	switch {
+	case len(srcs) == 0:
+		clear(dst)
+	case op == BitNot:
+		copy(dst, srcs[0])
+		notWords(dst)
+	default:
+		copy(dst, srcs[0])
+		for i := 1; i < len(srcs); i++ {
+			switch op {
+			case BitAnd:
+				andWords(dst, srcs[i])
+			case BitOr:
+				orWords(dst, srcs[i])
+			case BitXor:
+				xorWords(dst, srcs[i])
+			}
+		}
+	}
+	return allZero(dst)
+}
+
 // fillRange fills dst with the value's bytes at [off, off+len(dst)), zero-filled
 // where the range runs past the value length or the key is absent. off is
 // chunk-aligned by the BitOp loop, so a chunked value's range lands inside one

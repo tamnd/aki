@@ -559,3 +559,161 @@ func TestBitopSurface(t *testing.T) {
 	send(t, nc, "BITOP", "AND", "dand")
 	expect(t, br, "-ERR wrong number of arguments for 'bitop' command\r\n")
 }
+
+// TestBitopCrossSurface drives BITOP where the destination and sources span
+// shards, so the command takes the F17 cross-shard coordinator instead of the
+// co-located fast path. On the two-shard test server k1/k2/box/a2 hash to shard 0
+// and dand/dor/dxor/dnot/s2/a1 to shard 1, so each op below really does cross a
+// shard boundary. The results are byte-for-byte the co-located answers: the
+// coordinator streams the same algebra over hops.
+func TestBitopCrossSurface(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// k1, k2 both on shard 0; the destinations are on shard 1, so the write hop
+	// lands on a different owner than the source read hop.
+	send(t, nc, "SET", "k1", "\xff\xf0")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "SET", "k2", "\x0f\xff\xaa")
+	expect(t, br, "+OK\r\n")
+
+	send(t, nc, "BITOP", "AND", "dand", "k1", "k2")
+	expect(t, br, ":3\r\n")
+	send(t, nc, "GET", "dand")
+	expect(t, br, "$3\r\n\x0f\xf0\x00\r\n")
+
+	send(t, nc, "BITOP", "OR", "dor", "k1", "k2")
+	expect(t, br, ":3\r\n")
+	send(t, nc, "GET", "dor")
+	expect(t, br, "$3\r\n\xff\xff\xaa\r\n")
+
+	send(t, nc, "BITOP", "XOR", "dxor", "k1", "k2")
+	expect(t, br, ":3\r\n")
+	send(t, nc, "GET", "dxor")
+	expect(t, br, "$3\r\n\xf0\x0f\xaa\r\n")
+
+	send(t, nc, "BITOP", "NOT", "dnot", "k1")
+	expect(t, br, ":2\r\n")
+	send(t, nc, "GET", "dnot")
+	expect(t, br, "$2\r\n\x00\x0f\r\n")
+
+	// Sources on two different shards (k1 on 0, s2 on 1): the coordinator reads
+	// each with its own hop, one group per shard.
+	send(t, nc, "SET", "s2", "\x0f\xff\xaa")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "BITOP", "AND", "box", "k1", "s2")
+	expect(t, br, ":3\r\n")
+	send(t, nc, "GET", "box")
+	expect(t, br, "$3\r\n\x0f\xf0\x00\r\n")
+
+	// All sources missing across shards: the result is empty, the destination is
+	// deleted, the reply is 0.
+	send(t, nc, "BITOP", "OR", "a2", "res", "out")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "GET", "a2")
+	expect(t, br, "$-1\r\n")
+
+	// Aliasing across shards: the destination a1 (shard 1) is also a source, the
+	// other source k1 is on shard 0. Read-before-write per chunk keeps it correct.
+	send(t, nc, "SET", "a1", "\xf0\x0f")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "BITOP", "AND", "a1", "a1", "k1")
+	expect(t, br, ":2\r\n")
+	send(t, nc, "GET", "a1")
+	expect(t, br, "$2\r\n\xf0\x00\r\n")
+
+	// Error surfaces still fire on the cross path: NOT wants one source, an
+	// unknown op is a syntax error.
+	send(t, nc, "BITOP", "NOT", "dnot", "k1", "k2")
+	expect(t, br, "-ERR BITOP NOT must be called with a single source key.\r\n")
+	send(t, nc, "BITOP", "FOO", "dand", "k1")
+	expect(t, br, "-ERR syntax error\r\n")
+}
+
+// bitopOracle is the byte model for the multi-chunk cross test: the result is as
+// long as the longest source, shorter sources zero-pad, and NOT complements the
+// single source.
+func bitopOracle(op string, srcs ...[]byte) []byte {
+	if op == "NOT" {
+		out := make([]byte, len(srcs[0]))
+		for i := range out {
+			out[i] = ^srcs[0][i]
+		}
+		return out
+	}
+	ml := 0
+	for _, s := range srcs {
+		if len(s) > ml {
+			ml = len(s)
+		}
+	}
+	out := make([]byte, ml)
+	for i := 0; i < ml; i++ {
+		var acc byte
+		if op == "AND" {
+			acc = 0xFF
+		}
+		for _, s := range srcs {
+			var v byte
+			if i < len(s) {
+				v = s[i]
+			}
+			switch op {
+			case "AND":
+				acc &= v
+			case "OR":
+				acc |= v
+			case "XOR":
+				acc ^= v
+			}
+		}
+		out[i] = acc
+	}
+	return out
+}
+
+// TestBitopCrossMultiChunk drives cross-shard BITOP over sources that span
+// several chunks with different lengths, so the coordinator's streaming loop runs
+// many chunks, the AND short-circuit fires past the shorter source, and the
+// zero-pad carries the longer source through. The two sources sit on different
+// shards and the destinations on a third, so every chunk pays a read hop per
+// source shard and a write hop to the destination. The result is checked against
+// the byte oracle.
+func TestBitopCrossMultiChunk(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// k1 (shard 0) spans just over three chunks; s2 (shard 1) just under two, so
+	// AND short-circuits over the top chunk and OR/XOR carry k1 through.
+	k1 := make([]byte, 200000)
+	for i := range k1 {
+		k1[i] = byte(i*7 + 1)
+	}
+	s2 := make([]byte, 130000)
+	for i := range s2 {
+		s2[i] = byte(i*13 + 5)
+	}
+	send(t, nc, "SET", "k1", string(k1))
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "SET", "s2", string(s2))
+	expect(t, br, "+OK\r\n")
+
+	// dand and dor are on shard 1, the write-hop owner, distinct from k1's shard.
+	send(t, nc, "BITOP", "AND", "dand", "k1", "s2")
+	expect(t, br, ":200000\r\n")
+	send(t, nc, "GET", "dand")
+	expectBulk(t, br, bitopOracle("AND", k1, s2))
+
+	send(t, nc, "BITOP", "OR", "dor", "k1", "s2")
+	expect(t, br, ":200000\r\n")
+	send(t, nc, "GET", "dor")
+	expectBulk(t, br, bitopOracle("OR", k1, s2))
+
+	send(t, nc, "BITOP", "XOR", "dxor", "k1", "s2")
+	expect(t, br, ":200000\r\n")
+	send(t, nc, "GET", "dxor")
+	expectBulk(t, br, bitopOracle("XOR", k1, s2))
+
+	send(t, nc, "BITOP", "NOT", "dnot", "k1")
+	expect(t, br, ":200000\r\n")
+	send(t, nc, "GET", "dnot")
+	expectBulk(t, br, bitopOracle("NOT", k1))
+}
