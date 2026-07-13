@@ -231,16 +231,18 @@ func checkSignedOverflow(value, incr int64, bits uint, owtype int) (int, int64) 
 	maxincr := max - value
 	minincr := min - value
 	if value > max || (bits != 64 && incr > maxincr) || (value >= 0 && incr > 0 && incr > maxincr) {
-		if owtype == owWrap {
+		switch owtype {
+		case owWrap:
 			return 1, signedWrap(value, incr, bits)
-		} else if owtype == owSat {
+		case owSat:
 			return 1, max
 		}
 		return 1, 0
 	} else if value < min || (bits != 64 && incr < minincr) || (value < 0 && incr < 0 && incr < minincr) {
-		if owtype == owWrap {
+		switch owtype {
+		case owWrap:
 			return -1, signedWrap(value, incr, bits)
-		} else if owtype == owSat {
+		case owSat:
 			return -1, min
 		}
 		return -1, 0
@@ -277,17 +279,16 @@ func checkUnsignedOverflow(value uint64, incr int64, bits uint, owtype int) (int
 	maxincr := int64(max - value)
 	minincr := -int64(value)
 	if value > max || (incr > 0 && incr > maxincr) {
-		if owtype == owWrap {
+		switch owtype {
+		case owWrap:
 			return 1, unsignedWrap(value, incr, bits)
-		} else if owtype == owSat {
+		case owSat:
 			return 1, max
 		}
 		return 1, 0
 	} else if incr < 0 && incr < minincr {
 		if owtype == owWrap {
 			return -1, unsignedWrap(value, incr, bits)
-		} else if owtype == owSat {
-			return -1, 0
 		}
 		return -1, 0
 	}
