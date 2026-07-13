@@ -60,10 +60,10 @@ func TestGroupOnEmptyStream(t *testing.T) {
 
 func TestGroupConsumerLifecycle(t *testing.T) {
 	grp := newGroup(streamID{}, 0, true)
-	if !grp.createConsumer([]byte("c")) {
+	if !grp.createConsumer([]byte("c"), 0) {
 		t.Fatal("first createConsumer should report created")
 	}
-	if grp.createConsumer([]byte("c")) {
+	if grp.createConsumer([]byte("c"), 0) {
 		t.Fatal("second createConsumer should report already present")
 	}
 	if grp.consumer([]byte("c")) == nil {

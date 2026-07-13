@@ -158,7 +158,7 @@ func xgroupCreateConsumer(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if !ok {
 		return
 	}
-	if grp.createConsumer(con) {
+	if grp.createConsumer(con, cx.NowMs) {
 		r.Int(1)
 		return
 	}

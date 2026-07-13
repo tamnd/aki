@@ -55,9 +55,15 @@ func Xautoclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(nogroupGeneric(key, name))
 		return
 	}
-	con := grp.ensureConsumer(conName)
+	con := grp.ensureConsumer(conName, cx.NowMs)
+	con.seenTime = cx.NowMs
 
 	res := grp.autoClaim(s, start, con, cx.NowMs, minIdle, count, justid)
+	// A pass that transferred at least one entry is an active fetch for the target
+	// consumer; a pass that only dropped deleted entries or found nothing is not.
+	if len(res.claimed) > 0 {
+		con.activeTime = cx.NowMs
+	}
 	cx.Aux = frameAutoClaim(cx.Aux[:0], s, res, justid)
 	r.Raw(cx.Aux)
 }

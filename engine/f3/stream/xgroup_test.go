@@ -306,8 +306,8 @@ func TestXinfoGroupsWrongType(t *testing.T) {
 func TestXinfoUnknownSub(t *testing.T) {
 	c := newHarness(t).NewConn()
 	do(t, c, opXadd, "s", "1-0", "f", "v")
-	wantErr(t, do(t, c, opXinfo, "STREAM", "s"),
-		"ERR Unknown XINFO subcommand or wrong number of arguments for 'STREAM'")
+	wantErr(t, do(t, c, opXinfo, "BOGUS", "s"),
+		"ERR Unknown XINFO subcommand or wrong number of arguments for 'BOGUS'")
 }
 
 func TestXgroupMultipleGroupsSorted(t *testing.T) {
