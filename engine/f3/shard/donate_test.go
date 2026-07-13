@@ -52,6 +52,30 @@ func keyOnShard(t *testing.T, rt *Runtime, shard int) string {
 	return ""
 }
 
+// waitPoolIdle blocks until every worker in the pool has reached stateParked,
+// the settled-idle precondition a donation test needs before it can assert that
+// FanOut engages: only then are the donees observably idle at offer time. Once
+// parked with no traffic a worker stays parked (nothing wakes it), so the state
+// is stable once observed. It fails rather than hang if the pool never settles.
+func waitPoolIdle(t *testing.T, rt *Runtime) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		allParked := true
+		for _, w := range rt.workers {
+			if w.wk.state.Load() != stateParked {
+				allParked = false
+				break
+			}
+		}
+		if allParked {
+			return
+		}
+		time.Sleep(200 * time.Microsecond)
+	}
+	t.Fatal("pool never settled to idle")
+}
+
 func TestFanOutInlineBareCtx(t *testing.T) {
 	var cx Ctx
 	ran := make([]int, 16)
@@ -141,6 +165,15 @@ func TestFanOutUsesDonees(t *testing.T) {
 		<-release // hold the goroutine so the coordinator cannot drain serially
 	}, tasks)
 	c := rt.NewConn()
+	// FanOut offers the job only to workers it observes idle, and a worker's
+	// zero-value state is stateRunning until its goroutine first reaches the
+	// idle park. On a CPU-starved runner the donee goroutines may not have been
+	// scheduled that far when the command lands, so FanOut would see them all
+	// running, offer to none, and correctly degrade to serial: the test would
+	// then time out through no fault of the donation path. Wait for the pool to
+	// settle into parked so the "idle donees" premise this test asserts on
+	// actually holds before the command runs.
+	waitPoolIdle(t, rt)
 	if err := c.Do(opFan, true, args("k")); err != nil {
 		t.Fatal(err)
 	}
