@@ -214,6 +214,14 @@ func init() {
 	table["BITOP"].crossKeys = func(a [][]byte) [][]byte { return a[1:] }
 	table["BITOP"].cross = derived.BitOpCross
 
+	// The HLL surface (spec 2064/f3/15 section 7): a HyperLogLog is a HYLL-format
+	// string sketch, so PFADD and single-key PFCOUNT ride the same keyspace as
+	// SET. Multi-key PFCOUNT and PFMERGE need the register-merge fold and the F17
+	// hop plan of sections 8 and 9, so they land in the following slice; single-key
+	// PFCOUNT is the co-located-first half, the same split BITOP took.
+	register("PFADD", derived.PfAdd, 1, -1, true)
+	register("PFCOUNT", derived.PfCount, 1, 1, true)
+
 	// The set surface (spec 2064/f3/11 M1). Point ops, draws, streamed
 	// SMEMBERS, the downward-cursor SSCAN over all three bands, plus OBJECT
 	// ENCODING for the differential encoding check. Handlers validate their
