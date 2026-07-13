@@ -173,11 +173,19 @@ func hllAdd(blob, ele []byte) ([]byte, int) {
 	}
 }
 
-// PfCount answers single-key PFCOUNT key: the estimated cardinality, 0 for a
-// missing key. A clear cache bit returns the cached count at point-read cost; a
-// set bit recomputes over all 16384 registers, writes the count back into the
-// header, and clears the bit, which is the one path that makes PFCOUNT a write.
+// PfCount answers PFCOUNT key [key ...]: the estimated cardinality of one key,
+// or of the union of several. The single-key path keeps the cache fast path; a
+// clear cache bit returns the cached count at point-read cost, a set bit
+// recomputes over all 16384 registers, writes the count back into the header,
+// and clears the bit, the one path that makes PFCOUNT a write. The multi-key
+// path folds every co-located key into one register scratch and estimates from
+// it; the union count belongs to no single key's header, so nothing is cached
+// and nothing is written. A key set spanning shards routes to PfCountCross.
 func PfCount(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	if len(args) > 1 {
+		pfCountUnion(cx, args, r)
+		return
+	}
 	blob, ok := cx.St.GetString(args[0], cx.NowMs, nil)
 	if !ok {
 		r.Int(0)
