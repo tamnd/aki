@@ -443,6 +443,31 @@ func (z *zset) rangeByIndex(out []byte, lo, hi int, rev, withScores bool) []byte
 	return out
 }
 
+// forEachInScoreRange visits every member whose score falls in the half-open
+// band [loInc, hiExcl) in ascending order, handing each member (aliasing live
+// storage, valid until the next write) and its score to fn. It is the bounded
+// score-range walk GEOSEARCH runs per covering cell (spec 2064/f3/15 section
+// 11): the native band seeks to the window's low rank with a counted descent and
+// walks the leaf chain over just the window, and the inline band slices its
+// already score-ordered entries. The upper bound is exclusive because a geohash
+// cell's range is [align52(cell), align52(cell+1)), the next cell's floor.
+func (z *zset) forEachInScoreRange(loInc, hiExcl float64, fn func(m []byte, s float64)) {
+	lo, hi := z.scoreWindow(scoreBound{value: loInc}, scoreBound{value: hiExcl, exclusive: true})
+	if hi <= lo {
+		return
+	}
+	if z.enc == encSkiplist {
+		z.nat.walkRange(lo, hi-1, func(m []byte, bits uint64) {
+			fn(m, math.Float64frombits(bits))
+		})
+		return
+	}
+	ev := z.entries()
+	for j := lo; j < hi; j++ {
+		fn(ev[j].member, ev[j].score)
+	}
+}
+
 // scoreWindow returns the half-open forward-rank window [lo, hiExcl) of members
 // scored in [min, max], the span ZRANGEBYSCORE streams and ZCOUNT measures. The
 // native band answers with two counted descents (nat.scoreWindow); the inline

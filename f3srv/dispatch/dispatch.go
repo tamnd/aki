@@ -365,6 +365,12 @@ func init() {
 	register("GEODIST", zset.Geodist, 3, 4, true)
 	register("GEOHASH", zset.Geohash, 1, -1, true)
 
+	// GEOSEARCH reads a covering set of geohash ranges off the zset scores and
+	// exact-filters, so it is single-key and needs a center source plus a shape.
+	// The smallest valid call is the key, FROMMEMBER m, and BYRADIUS r unit, six
+	// arguments after the command; the handler validates the rest.
+	register("GEOSEARCH", zset.Geosearch, 6, -1, true)
+
 	// The list surface (spec 2064/f3/13 M3 slice 1): the inline listpack band and
 	// its one-way promotion to the native quicklist placeholder. The pushes, pops,
 	// LLEN, LINDEX, LRANGE, LSET, LREM, LTRIM, LINSERT, and LPOS all key on the
