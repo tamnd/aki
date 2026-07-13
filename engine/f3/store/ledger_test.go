@@ -54,6 +54,10 @@ func (s *Store) recomputeLedger() walkLedger {
 				charge(dirOff, uint64(dcap)*ptrSize)
 				for k := uint32(0); k < n; k++ {
 					cw, clen, cc := s.readPtr(dirOff + uint64(k)*ptrSize)
+					if cw == 0 {
+						// A hole (all-zero chunk) has no run and no log bytes.
+						continue
+					}
 					if cw&inLogBit != 0 {
 						w.logRuns++
 						w.logLive += uint64(clen)

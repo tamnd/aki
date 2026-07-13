@@ -86,14 +86,23 @@ func (s *Store) writeChunked(old []byte, offset int, val []byte, newLen int) (di
 	if !ok {
 		return 0, 0, ErrFull
 	}
+	end := offset + len(val)
 	for k := uint32(0); k < n; k++ {
 		base := int(k) * strChunkSize
 		clen := newLen - base
 		if clen > strChunkSize {
 			clen = strChunkSize
 		}
+		es := dirOff + uint64(k)*ptrSize
+		// A chunk with no old bytes the patch never reaches is all zeros; it
+		// stays a hole (a nil run word carrying the length) and consumes no
+		// bytes, so a SETBIT at a high offset stores only the live chunk.
+		if base >= len(old) && (end <= base || offset >= base+clen) {
+			s.writePtr(es, 0, uint32(clen), 0)
+			continue
+		}
 		var a []byte
-		if offset <= base && offset+len(val) >= base+clen {
+		if offset <= base && end >= base+clen {
 			// The chunk is wholly patch bytes: write straight from val, no
 			// staging copy.
 			a = val[base-offset : base-offset+clen]
@@ -104,12 +113,14 @@ func (s *Store) writeChunked(old []byte, offset int, val []byte, newLen int) (di
 		if werr != nil {
 			for j := uint32(0); j < k; j++ {
 				w, l, c := s.readPtr(dirOff + uint64(j)*ptrSize)
-				s.dropRun(w, l, c)
+				if w != 0 {
+					s.dropRun(w, l, c)
+				}
 			}
 			s.arena.unlink(dirOff, uint64(n)*ptrSize)
 			return 0, 0, werr
 		}
-		s.writePtr(dirOff+uint64(k)*ptrSize, word, uint32(clen), vcap)
+		s.writePtr(es, word, uint32(clen), vcap)
 	}
 	return dirOff, n, nil
 }
@@ -125,7 +136,9 @@ func (s *Store) dropChunks(addr uint64) {
 	dirOff := word & runAddrMask
 	for k := uint32(0); k < n; k++ {
 		w, l, c := s.readPtr(dirOff + uint64(k)*ptrSize)
-		s.dropRun(w, l, c)
+		if w != 0 {
+			s.dropRun(w, l, c)
+		}
 	}
 	s.arena.unlink(dirOff, uint64(dcap)*ptrSize)
 }
@@ -146,7 +159,9 @@ func (s *Store) readChunked(addr uint64, dst []byte) ([]byte, bool) {
 	for k := uint32(0); k < n; k++ {
 		w, l, _ := s.readPtr(dirOff + uint64(k)*ptrSize)
 		clen := int(l)
-		if w&inLogBit != 0 {
+		if w == 0 {
+			clear(dst[pos : pos+clen])
+		} else if w&inLogBit != 0 {
 			if err := s.vlog.readFill(w&runAddrMask, dst[pos:pos+clen]); err != nil {
 				return dst[:0], false
 			}
@@ -225,7 +240,11 @@ func (s *Store) updateChunked(addr uint64, offset int, val []byte, oldLen, newLe
 			// partial final chunk keeps append headroom under the separated
 			// growth rule, capped at the chunk width.
 			dst := s.stage()[:clen]
-			if cw&inLogBit != 0 {
+			if cw == 0 {
+				// The old chunk was a hole (all zeros, no run); the existing
+				// bytes are zero, and there is no run to read or drop.
+				clear(dst[:oldClen])
+			} else if cw&inLogBit != 0 {
 				if err := s.vlog.readFill(cw&runAddrMask, dst[:oldClen]); err != nil {
 					return err
 				}
@@ -249,11 +268,19 @@ func (s *Store) updateChunked(addr uint64, offset int, val []byte, oldLen, newLe
 				return err
 			}
 			ow, ol, oc := s.readPtr(es)
-			s.dropRun(ow, ol, oc)
+			if ow != 0 {
+				s.dropRun(ow, ol, oc)
+			}
 			s.writePtr(es, nw, uint32(clen), nc)
 			continue
 		}
-		// Fresh chunk past the old end.
+		// Fresh chunk past the old end. A gap chunk the patch never reaches is
+		// all zeros and stays a hole, so extending to a high offset stores only
+		// the live covering chunk.
+		if end <= base || offset >= base+clen {
+			s.writePtr(es, 0, uint32(clen), 0)
+			continue
+		}
 		var a []byte
 		if offset <= base && end >= base+clen {
 			a = val[base-offset : base-offset+clen]
@@ -338,7 +365,9 @@ func (cs *ChunkStream) Next(dst []byte) (int, error) {
 	}
 	r := cs.refs[cs.k]
 	clen := int(r.clen)
-	if r.word&inLogBit != 0 {
+	if r.word == 0 {
+		clear(dst[:clen])
+	} else if r.word&inLogBit != 0 {
 		if err := cs.l.readFill(r.word&runAddrMask, dst[:clen]); err != nil {
 			return 0, err
 		}
