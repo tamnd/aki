@@ -30,6 +30,7 @@ const (
 	opXpending
 	opXclaim
 	opXautoclaim
+	opXnack
 	opObject
 	opSet // seed a string key to test WRONGTYPE and the OBJECT fallthrough
 	opLast
@@ -52,6 +53,7 @@ func harnessHandlers() []shard.Handler {
 	h[opXpending] = Xpending
 	h[opXclaim] = Xclaim
 	h[opXautoclaim] = Xautoclaim
+	h[opXnack] = Xnack
 	h[opObject] = Object
 	h[opSet] = func(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		if err := cx.St.Set(args[0], args[1]); err != nil {
