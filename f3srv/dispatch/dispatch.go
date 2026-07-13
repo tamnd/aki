@@ -230,6 +230,12 @@ func init() {
 	register("PFMERGE", derived.PfMerge, 1, -1, true)
 	table["PFMERGE"].cross = derived.PfMergeCross
 	table["PFMERGE"].crossKeys = allHLLKeys
+	// PFDEBUG <sub> <key> introspects one sketch, so it routes on the key at tail
+	// index 1 (keyAt=1), past the subcommand; PFSELFTEST touches no key and runs
+	// its estimator check on any owner, so it is keyless like PING.
+	register("PFDEBUG", derived.PfDebug, 2, 2, true)
+	table["PFDEBUG"].keyAt = 1
+	register("PFSELFTEST", derived.PfSelfTest, 0, 0, false)
 
 	// The set surface (spec 2064/f3/11 M1). Point ops, draws, streamed
 	// SMEMBERS, the downward-cursor SSCAN over all three bands, plus OBJECT
