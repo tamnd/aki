@@ -44,13 +44,20 @@ func Xclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(nogroupGeneric(key, name))
 		return
 	}
-	con := grp.ensureConsumer(conName)
+	con := grp.ensureConsumer(conName, cx.NowMs)
+	con.seenTime = cx.NowMs
 
 	claimed := make([]streamID, 0, len(ids))
 	for _, id := range ids {
 		if res := grp.claimOne(s, id, con, cx.NowMs, minIdle, opts); res.claimed {
 			claimed = append(claimed, res.id)
 		}
+	}
+	// Taking at least one entry is an active operation for the target consumer, so it
+	// advances the active clock; a claim that took nothing leaves it, as Redis stamps
+	// active_time per claimed entry only.
+	if len(claimed) > 0 {
+		con.activeTime = cx.NowMs
 	}
 
 	cx.Aux = frameClaim(cx.Aux[:0], s, claimed, opts.justid)

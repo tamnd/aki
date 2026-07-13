@@ -46,12 +46,17 @@ type streamGroup struct {
 // consumer's name, which XPENDING reports as the owner of each pending entry; ord
 // is the ordinal the group assigns at creation, the value a pending slab stores to
 // name its owner; pelCount is the number of pending entries the consumer owns,
-// maintained by delivery and ack. The idle and active clocks join with XINFO
-// CONSUMERS, which reads them.
+// maintained by delivery and ack. seenTime and activeTime are the two clocks XINFO
+// CONSUMERS reads: seenTime is the last time any group command named the consumer
+// (its XINFO idle is now-seenTime), activeTime the last time it actually fetched or
+// claimed an entry (its XINFO inactive is now-activeTime). activeTime starts at -1,
+// the sentinel Redis reports as inactive for a consumer that has never been active.
 type streamConsumer struct {
-	name     []byte
-	ord      uint32
-	pelCount uint32
+	name       []byte
+	ord        uint32
+	pelCount   uint32
+	seenTime   int64
+	activeTime int64
 }
 
 // newGroup builds a group at the given start cursor. entriesRead and valid come
@@ -89,24 +94,33 @@ func (grp *streamGroup) consumer(name []byte) *streamConsumer {
 
 // ensureConsumer returns the named consumer, creating and ordinal-assigning it on
 // first sight. XREADGROUP lazily creates a consumer this way, and XGROUP
-// CREATECONSUMER creates one explicitly.
-func (grp *streamGroup) ensureConsumer(name []byte) *streamConsumer {
+// CREATECONSUMER creates one explicitly. A newly created consumer's seen clock is
+// stamped now and its active clock starts at the -1 never-active sentinel, matching
+// Redis's streamCreateConsumer; the caller re-stamps seenTime on an existing
+// consumer it names.
+func (grp *streamGroup) ensureConsumer(name []byte, now int64) *streamConsumer {
 	if con := grp.consumers[string(name)]; con != nil {
 		return con
 	}
-	con := &streamConsumer{name: append([]byte(nil), name...), ord: uint32(len(grp.consumerByOrd))}
+	con := &streamConsumer{
+		name:       append([]byte(nil), name...),
+		ord:        uint32(len(grp.consumerByOrd)),
+		seenTime:   now,
+		activeTime: -1,
+	}
 	grp.consumers[string(name)] = con
 	grp.consumerByOrd = append(grp.consumerByOrd, con)
 	return con
 }
 
 // createConsumer adds a consumer by name if it is absent and reports whether it
-// created one. A consumer starts owning no pending entries.
-func (grp *streamGroup) createConsumer(name []byte) bool {
+// created one. A consumer starts owning no pending entries, its seen clock at now
+// and its active clock at the never-active sentinel.
+func (grp *streamGroup) createConsumer(name []byte, now int64) bool {
 	if grp.consumers[string(name)] != nil {
 		return false
 	}
-	grp.ensureConsumer(name)
+	grp.ensureConsumer(name, now)
 	return true
 }
 
@@ -387,6 +401,44 @@ func (grp *streamGroup) nack(s *stream, id streamID, mode nackMode, retry int64,
 	nackSetCount(pe, mode, retry, hasRetry)
 	pe.deliveryTime = 0
 	return true
+}
+
+// nackedCount counts the group's unowned pending entries, the NACK-zone total XINFO
+// STREAM FULL reports as nacked-count. It walks the PEL, O(pending), the sole
+// full-PEL scan in the stream surface and only on that debug command; the far more
+// common owned/unowned states are read per entry as they are rendered, so nothing on
+// a delivery, ack, or claim path pays to maintain a separate counter.
+func (grp *streamGroup) nackedCount() int64 {
+	if grp.pel == nil {
+		return 0
+	}
+	var n int64
+	grp.pel.walkFrom(streamID{}, func(pe *pelEntry) bool {
+		if pe.consumerOrd == noOwner {
+			n++
+		}
+		return true
+	})
+	return n
+}
+
+// pelSample gathers up to limit pending entries in id order, optionally filtered by
+// keep, for an XINFO STREAM FULL dump. A limit of zero (COUNT 0) is unbounded, the
+// way Redis reads it; the cap is applied after the filter so a per-consumer sample
+// yields up to limit of that consumer's entries.
+func (grp *streamGroup) pelSample(limit int, keep func(*pelEntry) bool) []*pelEntry {
+	if grp.pel == nil {
+		return nil
+	}
+	var out []*pelEntry
+	grp.pel.walkFrom(streamID{}, func(pe *pelEntry) bool {
+		if keep != nil && !keep(pe) {
+			return true
+		}
+		out = append(out, pe)
+		return limit <= 0 || len(out) < limit
+	})
+	return out
 }
 
 // drainConsumer removes every pending entry owned by the consumer ordinal from the

@@ -47,7 +47,11 @@ func Xreadgroup(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			r.Err(nogroupRead(keys[j], grpName))
 			return
 		}
-		con := grp.ensureConsumer(conName)
+		con := grp.ensureConsumer(conName, cx.NowMs)
+		// Naming a consumer in a read stamps its seen clock whether or not the read
+		// delivers, the basis XINFO CONSUMERS idle reports; the active clock advances
+		// only on an actual `>` fetch, inside deliverNew.
+		con.seenTime = cx.NowMs
 		if isGreaterToken(ids[j]) {
 			if entries := grp.deliverNew(s, con, opts.count, opts.noack, cx.NowMs); len(entries) > 0 {
 				results = append(results, groupResult{key: keys[j], entries: entries})
@@ -123,7 +127,8 @@ func frameGroupPark(cx *shard.Ctx, g *reg, req *xreadWait) (reply []byte, served
 		if grp == nil {
 			continue
 		}
-		con := grp.ensureConsumer(gw.con)
+		con := grp.ensureConsumer(gw.con, cx.NowMs)
+		con.seenTime = cx.NowMs
 		if entries := grp.deliverNew(s, con, req.count, gw.noack, cx.NowMs); len(entries) > 0 {
 			results = append(results, groupResult{key: req.keys[j], entries: entries})
 		}
@@ -175,6 +180,12 @@ func (grp *streamGroup) deliverNew(s *stream, con *streamConsumer, count int, no
 		grp.pel.insert(entries[i].id, now, con.ord)
 		grp.pelCount++
 		con.pelCount++
+	}
+	// A `>` delivery that records pending entries is an active fetch, so it advances
+	// the consumer's active clock; a NOACK read delivers without owning anything and
+	// leaves the active clock alone, exactly as Redis gates active_time on `!noack`.
+	if !noack {
+		con.activeTime = now
 	}
 	grp.lastDeliveredID = entries[len(entries)-1].id
 	grp.entriesRead += uint64(len(entries))
