@@ -5,16 +5,15 @@ package stream
 // PEL, no cross-stream delivery registry, no shared claim queue (F2); the whole
 // ledger is per-key state exactly one shard ever touches.
 //
-// This slice lands the group and consumer records and their XGROUP lifecycle:
-// the `>` delivery cursor, the lag basis, and the consumer table. The
-// pending-entries list (the counted tree beside a hash over 32-byte slabs,
-// section 7.4) and the delivery, ack, and claim machinery that fill it arrive
-// with XREADGROUP (slice 6), so a group here carries its cursor and its consumer
-// table over an empty PEL.
+// This slice lands the group and consumer records, their XGROUP lifecycle, and
+// the pending-entries list the delivery path fills: XREADGROUP inserts a pending
+// entry per delivered ID, XACK removes one, XPENDING reads the range. The PEL
+// itself (the counted tree beside a hash over slabs, section 7.4) lives in pel.go
+// and hangs off each group, created on the first delivery.
 
 // streamGroup is one consumer group. lastDeliveredID is the `>` cursor; the
-// consumer table names the group's readers. The PEL structures and pelCount join
-// in slice 6, when a delivery first creates a pending entry.
+// consumer table names the group's readers; pel and pelCount hold the group's
+// pending entries.
 type streamGroup struct {
 	// lastDeliveredID is the cursor a `>` read advances past, the greatest ID the
 	// group has handed to any consumer. XGROUP CREATE and SETID set it directly.
@@ -24,22 +23,34 @@ type streamGroup struct {
 	// position has a known distance from the stream's history (id 0-0, id "$", an
 	// id at or past the tail, or an explicit ENTRIESREAD), which readValid
 	// records. A group started mid-stream at an explicit ID has an entriesRead the
-	// cursor machinery of slice 6 must price against the directory, so until then
-	// it reports entries-read and lag as nil, exactly as Redis does when it cannot
-	// track the value.
+	// cursor machinery must price against the directory, so until then it reports
+	// entries-read and lag as nil, exactly as Redis does when it cannot track the
+	// value. A `>` delivery advances entriesRead by the count delivered, which is
+	// exact whenever the basis was.
 	entriesRead uint64
 	readValid   bool
-	// consumers maps a consumer name to its record. Created empty on XGROUP
-	// CREATE; XGROUP CREATECONSUMER and (in slice 6) a delivering XREADGROUP add
-	// entries, XGROUP DELCONSUMER removes them.
-	consumers map[string]*streamConsumer
+	// pelCount is the group's total pending-entry count, the O(1) XPENDING summary
+	// and the field XINFO GROUPS reports; it tracks pel's size without a walk.
+	pelCount uint32
+	// consumers maps a consumer name to its record; consumerByOrd is the reverse,
+	// indexed by a consumer's ordinal so an ack or a pending walk resolves an
+	// owner ordinal back to its record. A DELCONSUMER leaves a nil hole rather
+	// than reindexing, since a pending slab holds the ordinal by value.
+	consumers     map[string]*streamConsumer
+	consumerByOrd []*streamConsumer
+	// pel is the pending-entries list, nil until the first delivery creates one.
+	pel *groupPEL
 }
 
-// streamConsumer is one named consumer in a group (section 7.3). pelCount is the
-// number of pending entries the consumer owns, maintained by delivery and ack in
-// slice 6; the idle and active clocks and the PEL ordinal join with the delivery
-// path that gives them meaning.
+// streamConsumer is one named consumer in a group (section 7.3). name is the
+// consumer's name, which XPENDING reports as the owner of each pending entry; ord
+// is the ordinal the group assigns at creation, the value a pending slab stores to
+// name its owner; pelCount is the number of pending entries the consumer owns,
+// maintained by delivery and ack. The idle and active clocks join with XINFO
+// CONSUMERS, which reads them.
 type streamConsumer struct {
+	name     []byte
+	ord      uint32
 	pelCount uint32
 }
 
@@ -76,27 +87,63 @@ func (grp *streamGroup) consumer(name []byte) *streamConsumer {
 	return grp.consumers[string(name)]
 }
 
+// ensureConsumer returns the named consumer, creating and ordinal-assigning it on
+// first sight. XREADGROUP lazily creates a consumer this way, and XGROUP
+// CREATECONSUMER creates one explicitly.
+func (grp *streamGroup) ensureConsumer(name []byte) *streamConsumer {
+	if con := grp.consumers[string(name)]; con != nil {
+		return con
+	}
+	con := &streamConsumer{name: append([]byte(nil), name...), ord: uint32(len(grp.consumerByOrd))}
+	grp.consumers[string(name)] = con
+	grp.consumerByOrd = append(grp.consumerByOrd, con)
+	return con
+}
+
 // createConsumer adds a consumer by name if it is absent and reports whether it
 // created one. A consumer starts owning no pending entries.
 func (grp *streamGroup) createConsumer(name []byte) bool {
-	if _, ok := grp.consumers[string(name)]; ok {
+	if grp.consumers[string(name)] != nil {
 		return false
 	}
-	grp.consumers[string(name)] = &streamConsumer{}
+	grp.ensureConsumer(name)
 	return true
 }
 
-// delConsumer removes the named consumer and reports the number of pending
-// entries it owned, which XGROUP DELCONSUMER returns. In this slice a consumer
-// owns no pending entries (the PEL fills in slice 6), so the count is its
-// maintained pelCount, zero until delivery exists; the drain of that ordinal's
-// PEL subset lands with the PEL structures. A missing consumer removes nothing.
+// delConsumer removes the named consumer, draining the pending entries it owned
+// from the group PEL first, and reports how many that was (the count XGROUP
+// DELCONSUMER returns). A missing consumer removes nothing.
 func (grp *streamGroup) delConsumer(name []byte) int64 {
 	con := grp.consumers[string(name)]
 	if con == nil {
 		return 0
 	}
-	pending := int64(con.pelCount)
+	removed := grp.drainConsumer(con.ord)
 	delete(grp.consumers, string(name))
-	return pending
+	if int(con.ord) < len(grp.consumerByOrd) {
+		grp.consumerByOrd[con.ord] = nil
+	}
+	return removed
+}
+
+// drainConsumer removes every pending entry owned by the consumer ordinal from the
+// group PEL and returns the count. It collects the IDs on one tree walk, then acks
+// each, so the tree is never mutated mid-walk. Bounded by the entries removed,
+// never by the stream length.
+func (grp *streamGroup) drainConsumer(ord uint32) int64 {
+	if grp.pel == nil {
+		return 0
+	}
+	var ids []streamID
+	grp.pel.walkFrom(streamID{}, func(e *pelEntry) bool {
+		if e.consumerOrd == ord {
+			ids = append(ids, e.id)
+		}
+		return true
+	})
+	for _, id := range ids {
+		grp.pel.ack(id)
+	}
+	grp.pelCount -= uint32(len(ids))
+	return int64(len(ids))
 }

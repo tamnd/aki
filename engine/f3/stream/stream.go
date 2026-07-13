@@ -77,15 +77,20 @@ type stream struct {
 // seq in big-endian bytes, the tie-break key the counted tree compares when two
 // blocks share a firstID ms. It satisfies structs.Members for the directory.
 func (s *stream) Member(ref uint32) []byte {
-	binary.BigEndian.PutUint64(s.dirKey[:], s.blocks[ref-s.base].first.seq)
+	putSeq(s.dirKey[:], s.blocks[ref-s.base].first.seq)
 	return s.dirKey[:]
 }
 
-// seqKey formats an ID's seq as the big-endian member key the directory orders
-// on within an ms, so bytes.Compare reproduces numeric seq order.
+// putSeq writes a seq as the big-endian member key the counted tree orders on
+// within an ms, so bytes.Compare reproduces numeric seq order. The directory and
+// the PEL both key on an ID's seq this way.
+func putSeq(dst []byte, seq uint64) { binary.BigEndian.PutUint64(dst, seq) }
+
+// seqKey formats an ID's seq as the big-endian member key, allocating a fresh
+// array for a one-shot compare (the Members callbacks reuse a scratch instead).
 func seqKey(id streamID) []byte {
 	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], id.seq)
+	putSeq(b[:], id.seq)
 	return b[:]
 }
 
