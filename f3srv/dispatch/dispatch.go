@@ -486,14 +486,17 @@ func init() {
 	register("XINFO", stream.Xinfo, 1, -1, false)
 	table["XINFO"].keyAt = 1
 
-	// Group delivery (M5 slice 6). XREADGROUP names its keys after STREAMS like
-	// XREAD (past the GROUP g c prefix and COUNT/BLOCK/NOACK), so it routes through
-	// streamKeyAt to the first key's shard with crossKeys guarding co-location;
-	// blocking parks are the next sub-slice, so it is not marked blocks yet. XACK
-	// and XPENDING key on args[0] the way the write path does.
+	// Group delivery (M5 slices 6 and 7). XREADGROUP names its keys after STREAMS
+	// like XREAD (past the GROUP g c prefix and COUNT/BLOCK/NOACK), so it routes
+	// through streamKeyAt to the first key's shard with crossKeys guarding
+	// co-location. blocks arms the reader barrier so an XREADGROUP `>` BLOCK that
+	// parks holds its reply open until an XADD delivers into its PEL or the timeout
+	// fires, the same seam XREAD uses. XACK and XPENDING key on args[0] the way the
+	// write path does.
 	register("XREADGROUP", stream.Xreadgroup, 4, -1, false)
 	table["XREADGROUP"].crossKeys = stream.GroupReadKeys
 	table["XREADGROUP"].streamKeyAt = stream.GroupReadKeyAt
+	table["XREADGROUP"].blocks = true
 	register("XACK", stream.Xack, 3, -1, true)
 	register("XPENDING", stream.Xpending, 2, -1, true)
 

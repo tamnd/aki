@@ -15,10 +15,12 @@ import (
 // pending ID to its live log entry, and returns `[id, nil]` where an XDEL has
 // since removed the entry the PEL still tracks.
 //
-// This slice serves the non-blocking forms. XREADGROUP BLOCK parks a `>` reader
-// the way XREAD does, but the wake path must deliver into the PEL on serve, so it
-// lands as its own sub-slice; a BLOCK given here parses and, when the read is
-// empty, replies the null array immediately rather than parking.
+// XREADGROUP BLOCK parks a `>` reader on the XREAD waiter set, but the wake is a
+// hand-off, not a fan-out: an XADD delivers the appended entry to one parked
+// consumer, whose delivery advances the group cursor and records the PEL entry, so a
+// second consumer parked on the same group finds nothing on wake and stays parked
+// (waiter.go serveWaiters). Only the `>` form blocks; an explicit-ID stream is
+// always present in the reply, so a read that names one never parks.
 
 // Xreadgroup answers XREADGROUP GROUP g c [COUNT n] [BLOCK ms] [NOACK] STREAMS
 // key [key ...] id [id ...]. The reply mirrors XREAD: an array of [key, entries]
@@ -61,12 +63,75 @@ func Xreadgroup(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 
 	if len(results) == 0 {
+		// Every stream read `>` and none advanced (an explicit-ID stream would have
+		// been appended, empty or not), the exact condition Redis blocks on. With
+		// BLOCK, park the consumer and let a later XADD or the timeout complete it.
+		if opts.block {
+			parkGroupRead(cx, g, grpName, conName, keys, opts)
+			r.Park()
+			return
+		}
 		cx.Aux = resp.AppendNullArray(cx.Aux[:0])
 		r.Raw(cx.Aux)
 		return
 	}
 	cx.Aux = frameGroupResults(cx.Aux[:0], results)
 	r.Raw(cx.Aux)
+}
+
+// parkGroupRead blocks the consumer on every named stream after an empty `>` read.
+// It clones the keys, the group and consumer names, and NOACK into one shared
+// request marked as a group waiter, parks a node per key, and arms the timeout on
+// the sibling-ring head for a finite BLOCK (BLOCK 0 waits forever, arming nothing).
+// A later XADD on any key delivers into the group PEL on wake through serveWaiters;
+// the timer, if any, completes the deferred reply with the null array.
+func parkGroupRead(cx *shard.Ctx, g *reg, grpName, conName []byte, keys [][]byte, opts groupReadOpts) {
+	ck := make([][]byte, len(keys))
+	for j := range keys {
+		ck[j] = append([]byte(nil), keys[j]...)
+	}
+	gw := &groupWait{
+		group: append([]byte(nil), grpName...),
+		con:   append([]byte(nil), conName...),
+		noack: opts.noack,
+	}
+	req := &xreadWait{keys: ck, afters: make([]streamID, len(keys)), count: opts.count, grp: gw}
+	head := parkWaiter(g, req, cx.CurConn(), cx.CurSeq())
+	if opts.blockMs > 0 {
+		deadline := cx.NowMs + opts.blockMs
+		g.wpool.nodes[head].timer = cx.ArmTimer(deadline, makeReadFire(g, head))
+	}
+}
+
+// frameGroupPark re-runs a parked XREADGROUP `>` on wake: for each named stream it
+// delivers the entries now above the group's live cursor to the parked consumer,
+// recording them in the PEL unless NOACK, and frames the [key, entries] reply. It
+// returns served false when no stream produced entries, which happens when an
+// earlier consumer on the same group already took the appended entry and advanced
+// the cursor, so the caller leaves this waiter parked. A stream whose key or group
+// vanished while parked (XGROUP DESTROY) contributes nothing rather than erroring,
+// so such a waiter simply waits for the next delivery or its timeout.
+func frameGroupPark(cx *shard.Ctx, g *reg, req *xreadWait) (reply []byte, served bool) {
+	gw := req.grp
+	results := make([]groupResult, 0, len(req.keys))
+	for j := range req.keys {
+		s := g.m[string(req.keys[j])]
+		if s == nil {
+			continue
+		}
+		grp := s.group(gw.group)
+		if grp == nil {
+			continue
+		}
+		con := grp.ensureConsumer(gw.con)
+		if entries := grp.deliverNew(s, con, req.count, gw.noack, cx.NowMs); len(entries) > 0 {
+			results = append(results, groupResult{key: req.keys[j], entries: entries})
+		}
+	}
+	if len(results) == 0 {
+		return nil, false
+	}
+	return frameGroupResults(nil, results), true
 }
 
 // deliveredEntry is one entry an XREADGROUP reply carries: its ID and, when the
@@ -164,10 +229,13 @@ func frameGroupResults(dst []byte, results []groupResult) []byte {
 }
 
 // groupReadOpts is the parsed XREADGROUP option prefix: the COUNT cap (-1
-// unbounded) and NOACK. BLOCK is parsed and validated but does not yet park.
+// unbounded), NOACK, and the BLOCK clause (block set, blockMs the timeout, 0 for an
+// unbounded wait).
 type groupReadOpts struct {
-	count int
-	noack bool
+	count   int
+	noack   bool
+	block   bool
+	blockMs int64
 }
 
 // parseGroupRead reads the GROUP g c prefix, the option clauses, and the STREAMS
@@ -200,6 +268,8 @@ func parseGroupRead(args [][]byte) (grp, con []byte, opts groupReadOpts, keys, i
 			if ms < 0 {
 				return nil, nil, opts, nil, nil, "ERR timeout is negative"
 			}
+			opts.block = true
+			opts.blockMs = ms
 			i += 2
 		case eqFold(args[i], "NOACK"):
 			opts.noack = true

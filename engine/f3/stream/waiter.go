@@ -15,27 +15,46 @@ import (
 // Cross-shard XREAD is refused at dispatch, so a blocked waiter's keys all live on
 // one owner and one goroutine serializes serve against timeout.
 //
-// Unlike the list waiter set, a stream serve is a fan-out, not a hand-off: an XADD
-// is a read event every blocked reader on that key observes, so serveKey completes
-// every waiter parked on the key rather than stopping once the value drains. And a
-// stream waiter never re-parks: the appended entry always has an ID above the
-// waiter's resolved after-ID (the after-ID was the stream's last ID at park, and
-// XADD only ever assigns a greater one), so a wake always produces entries.
+// A plain XREAD serve is a fan-out, not a hand-off: an XADD is a read event every
+// blocked reader on that key observes, so it completes every plain waiter parked on
+// the key rather than stopping once the value drains, and such a waiter never
+// re-parks (the appended entry always has an ID above the after-ID it resolved at
+// park, so a wake always produces entries).
+//
+// A blocking XREADGROUP `>` waiter (grp set on the request) is a hand-off instead:
+// the appended entry goes to exactly one consumer, and delivering advances the
+// group's shared cursor, so a second consumer parked on the same group finds
+// nothing on wake and stays parked. serveWaiters therefore snapshots the FIFO and,
+// for a group waiter, re-runs the delivery from the current cursor and completes it
+// only when it produced entries; when an earlier consumer already took them, the
+// waiter is left in place for the next XADD.
 
 // nilIdx is the sentinel index for an absent link, the arena's nil pointer.
 const nilIdx = ^uint32(0)
 
-// xreadWait is the shared request behind one blocked XREAD, pointed at by every
+// xreadWait is the shared request behind one blocked read, pointed at by every
 // sibling node of the waiter. keys and afters are the resolved read: keys[j]'s
 // entries above afters[j] (an exclusive lower bound, the stream's last ID at park
 // for "$"/"+", the explicit ID otherwise). count is the per-stream COUNT cap, -1
 // for unbounded. Both slices are cloned at park so they outlive the request args.
 // The struct is read once on wake to re-scan every key, so one copy serves the
-// whole ring.
+// whole ring. grp is nil for a plain XREAD and set for a blocking XREADGROUP `>`,
+// where the wake delivers into the group PEL from the live cursor rather than
+// scanning afters, so afters is unused (all `>`) on a group waiter.
 type xreadWait struct {
 	keys   [][]byte
 	afters []streamID
 	count  int
+	grp    *groupWait
+}
+
+// groupWait is the consumer-group context a blocking XREADGROUP `>` carries into
+// the waiter: the group and consumer names (cloned at park) and NOACK, everything
+// the wake needs to re-run deliverNew for this consumer on each named stream.
+type groupWait struct {
+	group []byte
+	con   []byte
+	noack bool
 }
 
 // waitNode is one connection's parked interest in one stream key. prev and next
@@ -186,39 +205,52 @@ func (g *reg) unlinkAll(cx *shard.Ctx, idx uint32) {
 	}
 }
 
-// serveWaiters completes every client blocked on key after an XADD appended to it.
-// It runs on the owner from the XADD handler, after the entry is in the stream, and
-// serves the whole FIFO because a stream read is a fan-out: each blocked reader sees
-// the new entry independently. For each waiter it re-scans the waiter's full key set
-// through readAfter, frames the same [key, entries] array a non-blocking XREAD
-// returns, and delivers it at the parked sequence through CompleteBlocked. The
-// appended entry's ID always exceeds the waiter's after-ID for this key, so every
-// served waiter produces at least that stream's entries and none re-parks.
+// serveWaiters completes the clients blocked on key after an XADD appended to it. It
+// runs on the owner from the XADD handler, after the entry is in the stream. It
+// walks the FIFO in order over a snapshot of the parked node indices, because a
+// served waiter unlinks itself and its siblings, and a group waiter another consumer
+// already drained stays parked, so the head is not always the next to remove. A dead
+// node in the snapshot (unlinked as a sibling of an earlier served waiter) is
+// skipped. A plain XREAD waiter is a fan-out, framed from readAfter and always
+// completed; a group `>` waiter is a hand-off, delivered from the live cursor and
+// completed only when it produced entries.
 func serveWaiters(cx *shard.Ctx, g *reg, key []byte) {
 	wl := g.waiters[string(key)]
 	if wl == nil {
 		return
 	}
-	for wl.n > 0 {
-		i, ok := peekHead(wl)
-		if !ok {
-			return
-		}
+	order := g.snapshotWaiters(wl)
+	for _, i := range order {
 		nd := &g.wpool.nodes[i]
-		conn := nd.conn
-		seq := nd.seq
-		rep := framePark(g, nd.req)
+		if !nd.live {
+			continue
+		}
+		if nd.req.grp == nil {
+			conn, seq := nd.conn, nd.seq
+			rep := framePark(g, nd.req)
+			g.unlinkAll(cx, i)
+			conn.CompleteBlocked(seq, rep)
+			continue
+		}
+		rep, served := frameGroupPark(cx, g, nd.req)
+		if !served {
+			continue // the entries went to an earlier consumer; stay parked
+		}
+		conn, seq := nd.conn, nd.seq
 		g.unlinkAll(cx, i)
 		conn.CompleteBlocked(seq, rep)
 	}
 }
 
-// peekHead returns the oldest waiter's index, or false when the list is empty.
-func peekHead(l *waitList) (uint32, bool) {
-	if l.head == nilIdx {
-		return 0, false
+// snapshotWaiters records the FIFO order of a key's parked nodes into a reusable
+// per-registry scratch, so serveWaiters can walk the order while unlinking nodes
+// mid-walk without losing its place. The slice is valid only until the next call.
+func (g *reg) snapshotWaiters(wl *waitList) []uint32 {
+	g.serveOrder = g.serveOrder[:0]
+	for i := wl.head; i != nilIdx; i = g.wpool.nodes[i].next {
+		g.serveOrder = append(g.serveOrder, i)
 	}
-	return l.head, true
+	return g.serveOrder
 }
 
 // framePark re-reads a blocked XREAD's streams and builds its reply, the array of
