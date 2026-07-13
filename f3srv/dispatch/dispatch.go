@@ -214,13 +214,22 @@ func init() {
 	table["BITOP"].crossKeys = func(a [][]byte) [][]byte { return a[1:] }
 	table["BITOP"].cross = derived.BitOpCross
 
-	// The HLL surface (spec 2064/f3/15 section 7): a HyperLogLog is a HYLL-format
-	// string sketch, so PFADD and single-key PFCOUNT ride the same keyspace as
-	// SET. Multi-key PFCOUNT and PFMERGE need the register-merge fold and the F17
-	// hop plan of sections 8 and 9, so they land in the following slice; single-key
-	// PFCOUNT is the co-located-first half, the same split BITOP took.
+	// The HLL surface (spec 2064/f3/15 sections 7 to 9): a HyperLogLog is a
+	// HYLL-format string sketch, so PFADD rides the same keyspace as SET. PFCOUNT
+	// counts one key or the union of several, and PFMERGE folds sources into a
+	// destination; both fold with the register-merge kernel of section 8. Their
+	// co-located key sets keep the point path (PfCount/PfMerge on the one owner);
+	// a key set spanning shards takes the F17 intent route of section 9, the same
+	// co-located-first split BITOP took. crossKeys is the full key set, so single
+	// keys never reach the cross path.
+	allHLLKeys := func(a [][]byte) [][]byte { return a }
 	register("PFADD", derived.PfAdd, 1, -1, true)
-	register("PFCOUNT", derived.PfCount, 1, 1, true)
+	register("PFCOUNT", derived.PfCount, 1, -1, true)
+	table["PFCOUNT"].cross = derived.PfCountCross
+	table["PFCOUNT"].crossKeys = allHLLKeys
+	register("PFMERGE", derived.PfMerge, 1, -1, true)
+	table["PFMERGE"].cross = derived.PfMergeCross
+	table["PFMERGE"].crossKeys = allHLLKeys
 
 	// The set surface (spec 2064/f3/11 M1). Point ops, draws, streamed
 	// SMEMBERS, the downward-cursor SSCAN over all three bands, plus OBJECT
