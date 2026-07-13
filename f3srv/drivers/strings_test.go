@@ -364,3 +364,82 @@ func TestBitmapPointSurface(t *testing.T) {
 	send(t, nc, "SETBIT", "k", "0", "x")
 	expect(t, br, "-ERR bit is not an integer or out of range\r\n")
 }
+
+// TestBitmapRangeSurface walks BITCOUNT and BITPOS over the socket against the
+// Redis documentation examples: the whole-value count, the BYTE and BIT ranged
+// forms with negative indices, the clear-bit past-end reply and the explicit
+// end that suppresses it, and the argument error surfaces.
+func TestBitmapRangeSurface(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// BITCOUNT, the documented "foobar" figures: whole value 26, byte 0 alone 4,
+	// byte 1 alone 6, and the 5..30 BIT window 17.
+	send(t, nc, "SET", "mykey", "foobar")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "BITCOUNT", "mykey")
+	expect(t, br, ":26\r\n")
+	send(t, nc, "BITCOUNT", "mykey", "0", "0")
+	expect(t, br, ":4\r\n")
+	send(t, nc, "BITCOUNT", "mykey", "1", "1")
+	expect(t, br, ":6\r\n")
+	send(t, nc, "BITCOUNT", "mykey", "1", "1", "BYTE")
+	expect(t, br, ":6\r\n")
+	send(t, nc, "BITCOUNT", "mykey", "5", "30", "BIT")
+	expect(t, br, ":17\r\n")
+
+	// Negative indices count from the end, and an empty range answers 0.
+	send(t, nc, "BITCOUNT", "mykey", "-2", "-1")
+	expect(t, br, ":7\r\n")
+	send(t, nc, "BITCOUNT", "mykey", "2", "1")
+	expect(t, br, ":0\r\n")
+
+	// A missing key counts 0.
+	send(t, nc, "BITCOUNT", "absent")
+	expect(t, br, ":0\r\n")
+
+	// BITPOS clear-bit search: the first 0 in 0xff 0xf0 0x00 is bit 12.
+	send(t, nc, "SET", "k0", "\xff\xf0\x00")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "BITPOS", "k0", "0")
+	expect(t, br, ":12\r\n")
+
+	// BITPOS set-bit search with a start byte, and the BIT-unit range.
+	send(t, nc, "SET", "k1", "\x00\xff\xf0")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "BITPOS", "k1", "1")
+	expect(t, br, ":8\r\n")
+	send(t, nc, "BITPOS", "k1", "1", "2")
+	expect(t, br, ":16\r\n")
+	send(t, nc, "BITPOS", "k1", "1", "0", "-1", "BIT")
+	expect(t, br, ":8\r\n")
+
+	// All-set value: a clear-bit search with no explicit end reports the first
+	// bit past the value; an explicit end suppresses that and answers -1.
+	send(t, nc, "SET", "k2", "\xff\xff\xff")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "BITPOS", "k2", "0")
+	expect(t, br, ":24\r\n")
+	send(t, nc, "BITPOS", "k2", "0", "0", "-1")
+	expect(t, br, ":-1\r\n")
+
+	// All-zero value: no set bit anywhere.
+	send(t, nc, "SET", "k3", "\x00\x00\x00")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "BITPOS", "k3", "1")
+	expect(t, br, ":-1\r\n")
+
+	// Missing key: -1 for a set bit, 0 for a clear bit.
+	send(t, nc, "BITPOS", "gone", "1")
+	expect(t, br, ":-1\r\n")
+	send(t, nc, "BITPOS", "gone", "0")
+	expect(t, br, ":0\r\n")
+
+	// Error surfaces: a bad unit token, a non-integer range, and a bit argument
+	// that is not 0 or 1.
+	send(t, nc, "BITCOUNT", "mykey", "0", "0", "NIBBLE")
+	expect(t, br, "-ERR syntax error\r\n")
+	send(t, nc, "BITCOUNT", "mykey", "x", "0")
+	expect(t, br, "-ERR value is not an integer or out of range\r\n")
+	send(t, nc, "BITPOS", "mykey", "2")
+	expect(t, br, "-ERR The bit argument must be 1 or 0.\r\n")
+}

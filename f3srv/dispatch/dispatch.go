@@ -196,6 +196,8 @@ func init() {
 	// the string store, so the point pair rides the same keyspace as SET.
 	register("SETBIT", derived.SetBit, 3, 3, true)
 	register("GETBIT", derived.GetBit, 2, 2, true)
+	register("BITCOUNT", derived.BitCount, 1, 4, true)
+	register("BITPOS", derived.BitPos, 2, 5, true)
 
 	// The set surface (spec 2064/f3/11 M1). Point ops, draws, streamed
 	// SMEMBERS, the downward-cursor SSCAN over all three bands, plus OBJECT

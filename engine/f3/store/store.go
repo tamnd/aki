@@ -88,8 +88,11 @@ type Store struct {
 	// cbuf is the chunk staging buffer, one chunk wide, allocated on the
 	// first chunked write so stores that never see a giant value never pay
 	// for it.
+	// zbuf is a chunk-wide all-zero buffer the bit-range walk yields for a
+	// hole chunk; it is never written, so the read path can alias it.
 	vbuf []byte
 	cbuf []byte
+	zbuf []byte
 }
 
 // Options configures a store beyond the arena geometry.
@@ -207,6 +210,7 @@ func (s *Store) Reset() {
 	s.chunkBytes = 0
 	s.vbuf = nil
 	s.cbuf = nil
+	s.zbuf = nil
 	s.demoteHand = 0
 	s.promotes = 0
 	s.demotes = 0
