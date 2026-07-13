@@ -298,3 +298,69 @@ func TestStringValueOps(t *testing.T) {
 	send(t, nc, "INCR", "n")
 	expect(t, br, ":11\r\n")
 }
+
+// TestBitmapPointSurface walks SETBIT and GETBIT over the socket: the previous
+// bit reply, the MSB-first byte contract a plain GET has to see, sparse growth,
+// the past-end and missing-key zero, the int-cell wrinkle, and the offset and
+// value error surfaces.
+func TestBitmapPointSurface(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// SETBIT returns the previous bit; the byte contract puts bit 0 at the MSB,
+	// so after SETBIT k 0 1 a GET reads 0x80.
+	send(t, nc, "SETBIT", "k", "0", "1")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "SETBIT", "k", "0", "1")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$1\r\n\x80\r\n")
+	send(t, nc, "GETBIT", "k", "0")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "GETBIT", "k", "7")
+	expect(t, br, ":0\r\n")
+
+	// A SETBIT past the end zero-extends; the addressed bit lands in a new byte
+	// and the gap reads back as zeros.
+	send(t, nc, "SETBIT", "k", "17", "1")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$3\r\n\x80\x00\x40\r\n")
+	send(t, nc, "GETBIT", "k", "17")
+	expect(t, br, ":1\r\n")
+
+	// Clearing a bit returns its old value and leaves a zero.
+	send(t, nc, "SETBIT", "k", "0", "0")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "GETBIT", "k", "0")
+	expect(t, br, ":0\r\n")
+
+	// GETBIT past the end and on a missing key answers 0 and never creates it.
+	send(t, nc, "GETBIT", "k", "99999")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "GETBIT", "missing", "0")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "EXISTS", "missing")
+	expect(t, br, ":0\r\n")
+
+	// The int-cell wrinkle: SET 255 reads bit for bit off the decimal text, so
+	// bit 0 (MSB of '2'=0x32) is 0 and bit 2 is 1.
+	send(t, nc, "SET", "n", "255")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "GETBIT", "n", "0")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "GETBIT", "n", "2")
+	expect(t, br, ":1\r\n")
+
+	// Error surfaces: a negative offset, an offset past the 4Gib bit ceiling,
+	// a non-integer offset, and a bit value that is not 0 or 1.
+	send(t, nc, "SETBIT", "k", "-1", "1")
+	expect(t, br, "-ERR bit offset is not an integer or out of range\r\n")
+	send(t, nc, "SETBIT", "k", "4294967296", "1")
+	expect(t, br, "-ERR bit offset is not an integer or out of range\r\n")
+	send(t, nc, "GETBIT", "k", "abc")
+	expect(t, br, "-ERR bit offset is not an integer or out of range\r\n")
+	send(t, nc, "SETBIT", "k", "0", "2")
+	expect(t, br, "-ERR bit is not an integer or out of range\r\n")
+	send(t, nc, "SETBIT", "k", "0", "x")
+	expect(t, br, "-ERR bit is not an integer or out of range\r\n")
+}
