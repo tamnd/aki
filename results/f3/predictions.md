@@ -44,3 +44,14 @@ PRED-F3-M2-ZSETMEM. Tree overhead at 2 to 3 bytes per entry per F14. Anything ov
 PRED-F3-M2-ZREMTAIL. ZREM against one hot key, P16. Floor 2x with p99 inside 125 percent of the best rival. v1's 7.6 to 8.1ms shoulder must be gone; lab 04 read the shoulder as a deferral artifact and the #619 delete path is inline.
 
 PRED-F3-M2-ZADD. Hold or improve K4's carried 5.49x to 7.03x. Any regression blocks.
+
+## M5
+
+Filed for issue #547 before the M5 gate run.
+Every stream slice is merged (#662 through #676, the labs at #661/#666/#675/#678 and labs 02/03 in-tree); v1 shipped zero stream code, so these are first-ever numbers and the floors are frozen before any gate cell runs on the GamingPC box.
+
+PRED-F3-M5-XADD. XADD of a 3-field entry against one hot stream, P16. Floor 2x over both rivals, and within 15 percent of the same box's SET number, since an append is one ID allocation off the coarse shard clock plus one master-delta encode into the open block, no tree touch until a block seals. A reading below the SET number by more than 15 percent means the block append or the per-batch clock cache is paying more than a string set's arena write, and the block-append path is the lever. Falsifier: any per-entry directory insert on the hot path (the directory takes one insert per sealed block, ~1 in 128 appends).
+
+PRED-F3-M5-XREADGROUP. The XREADGROUP `>` plus XACK loop against a 10k-entry stream, P16. Floor 2x against Redis 8.8's post-#14885 fast path, whose bar moved +83 percent when it rewrote the group cursor to a rax; the prediction names that raised bar and clears it anyway, because the f3 advantage is not the cursor (both are O(1) at steady state via the section 3.5 block memo) but the surrounding architecture: F1 shard parallelism, F6 batched execution, F19 replies, and the PEL write being one owner-local counted-tree insert (lab 03's tree-only PEL) rather than two rax insertions. Falsifier: a miss here with XADD and the tail read (S4/S5) passing isolates the PEL write path, and the PEL-pairing question re-opens.
+
+PRED-F3-M5-STREAMMEM. Native-band overhead 7 to 9 bytes per entry over the field payload, directory ~0.25 bytes per entry, both measured as (server RSS after load minus baseline) over entry count against the same load on both rivals. Lab 01 froze the 4096/128 block geometry at 7.36 B/entry overhead for the 64B fixed-schema entry, inside the 6-to-8 bar, with the directory at 0.25 B/entry over the counted tree; the ID field rides the delta codec lab 05 priced (shipped base-delta, ~2.5 B/entry on dense IDs, a switch to the ~0.5-to-1.2-B/entry-smaller successive base pending a follow-up slice). Anything over 10 B/entry native overhead blocks the milestone. The PEL is reported alongside at ~76 B per in-flight pending entry (lab 03's tree-only figure), not a battleground but carried for honesty against Redis's streamNACK-in-two-raxes.
