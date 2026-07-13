@@ -75,20 +75,40 @@ func TestNetCountersMoveUnderPipeline(t *testing.T) {
 		t.Fatal("net_worker_wakes did not move; the reader never woke a parked worker")
 	}
 
-	// Wakes and parks on the worker side are monotonic nonzero, not exact:
-	// the worker spin window is zero so an idle worker parks at once, and the
-	// connection writer parks after its spin window, but how many turns the
-	// traffic allowed is timing, and the worker-side counter adds land just
-	// after the wake tokens themselves. Poll past the settling.
+	// The park counters cannot be forced by a fast pipeline: when the worker
+	// keeps replies ready the reader spins them off without ever parking, which
+	// is the optimal path, not a bug, so polling for a park after a pipeline is
+	// a timing bet that loses on a runner where the worker outpaces the reader.
+	// Force the parks deterministically instead with a cross-connection blocking
+	// serve, the shape TestBlpopServedAcrossConns proves stable on every event
+	// loop: a BLPOP on this connection has no reply, so its reader parks owing
+	// the reply (conn park) and the shard worker parks waiting for the serve
+	// (worker park); an RPUSH on a second connection serves it.
+	c2, br2 := secondConn(t, srv)
+	writeCmd(t, nc, "BLPOP", "bk", "0")
+	time.Sleep(50 * time.Millisecond) // let the BLPOP park the reader and the worker
+	writeCmd(t, c2, "RPUSH", "bk", "v")
+	expect(t, br2, ":1\r\n")
+	expect(t, br, "*2\r\n$2\r\nbk\r\n$1\r\nv\r\n")
+
+	// net_conn_wakes is deliberately not asserted to move: it counts only the
+	// wakes a worker's reply flush issues after finding the writer already
+	// parked, the token the section 9.1 wake-skip rule is built to elide. With
+	// this handful of connections the writer's spin window never collapses (that
+	// is gated on connSpinHighWater), so the writer spins its reply off instead
+	// of parking and the flush rightly skips the wake. The counter moves under
+	// real connection load, not in a scripted test; its wiring into INFO is the
+	// job of TestInfoNetSection. The block above does guarantee both parks; only
+	// the counter adds can trail the wake tokens, so poll past that settling.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		d = netDelta(base, srv.NetStats())
-		if d.ConnWakes > 0 && d.WorkerParks > 0 && d.ConnParks > 0 {
+		if d.WorkerParks > 0 && d.ConnParks > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("wake/park counters never moved: conn wakes %d, worker parks %d, conn parks %d",
-				d.ConnWakes, d.WorkerParks, d.ConnParks)
+			t.Fatalf("park counters never moved: worker parks %d, conn parks %d",
+				d.WorkerParks, d.ConnParks)
 		}
 		time.Sleep(time.Millisecond)
 	}
