@@ -71,6 +71,13 @@ type stream struct {
 	// delivers (slice 6); this slice carries the group and consumer records and
 	// their lifecycle.
 	groups map[string]*streamGroup
+
+	// gcDirty marks that a tombstone has landed in a native sealed block since the
+	// last gc pass, so the owner's between-batches maintainer (gc.go) should visit
+	// this stream. It is set by the XDEL and exact-XTRIM handlers and cleared by the
+	// maintainer, both on the owner goroutine, and keeps the stream in the registry
+	// dirty list at most once between passes.
+	gcDirty bool
 }
 
 // Member resolves a directory reference (a block index) to its block firstID's

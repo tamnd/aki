@@ -173,6 +173,7 @@ func (w *worker) run() {
 				continue
 			}
 			w.maybeCompact()
+			w.runMaintainer()
 			w.idle()
 		}
 	}
