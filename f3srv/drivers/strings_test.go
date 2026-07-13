@@ -494,3 +494,68 @@ func TestBitfieldSurface(t *testing.T) {
 	send(t, nc, "BITFIELD", "bf", "GET", "u8")
 	expect(t, br, "-ERR syntax error\r\n")
 }
+
+// TestBitopSurface drives BITOP end to end over the RESP wire. The keys are
+// chosen to hash to one shard so the command takes the co-located fast path;
+// the cross-shard refusal is exercised in the cross slice. The masks 0xFFF0 and
+// 0x0FFFAA cover the zero-pad (the AND third byte, the OR/XOR carry) and the two
+// result lengths, and the destination reads back byte for byte.
+func TestBitopSurface(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// bk1 (2 bytes) and bk3 (3 bytes): the result length is the longer source,
+	// the shorter one zero-pads past its end.
+	send(t, nc, "SET", "bk1", "\xff\xf0")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "SET", "bk3", "\x0f\xff\xaa")
+	expect(t, br, "+OK\r\n")
+
+	// AND: ff&0f=0f, f0&ff=f0, (missing)&aa=00.
+	send(t, nc, "BITOP", "AND", "dand", "bk1", "bk3")
+	expect(t, br, ":3\r\n")
+	send(t, nc, "GET", "dand")
+	expect(t, br, "$3\r\n\x0f\xf0\x00\r\n")
+
+	// OR: the shorter source carries the longer one's tail through.
+	send(t, nc, "BITOP", "OR", "dor", "bk1", "bk3")
+	expect(t, br, ":3\r\n")
+	send(t, nc, "GET", "dor")
+	expect(t, br, "$3\r\n\xff\xff\xaa\r\n")
+
+	// XOR: ff^0f=f0, f0^ff=0f, 00^aa=aa.
+	send(t, nc, "BITOP", "XOR", "dxor", "bk1", "bk3")
+	expect(t, br, ":3\r\n")
+	send(t, nc, "GET", "dxor")
+	expect(t, br, "$3\r\n\xf0\x0f\xaa\r\n")
+
+	// NOT is the single-source complement at that source's length.
+	send(t, nc, "BITOP", "NOT", "dnot", "bk1")
+	expect(t, br, ":2\r\n")
+	send(t, nc, "GET", "dnot")
+	expect(t, br, "$2\r\n\x00\x0f\r\n")
+
+	// All sources missing: the result is empty, the destination is deleted, the
+	// reply is 0.
+	send(t, nc, "BITOP", "OR", "gone", "res", "out")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "GET", "gone")
+	expect(t, br, "$-1\r\n")
+
+	// Aliasing: the destination is also a source. The result at each chunk depends
+	// only on the sources at that chunk, so an aliased destination stays correct.
+	send(t, nc, "SET", "bor", "\xff\xf0")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "BITOP", "AND", "bor", "bor", "bk3")
+	expect(t, br, ":3\r\n")
+	send(t, nc, "GET", "bor")
+	expect(t, br, "$3\r\n\x0f\xf0\x00\r\n")
+
+	// Error surfaces: NOT wants exactly one source, an unknown op is a syntax
+	// error, and a source-less BITOP fails arity before it routes.
+	send(t, nc, "BITOP", "NOT", "dnot", "bk1", "bk3")
+	expect(t, br, "-ERR BITOP NOT must be called with a single source key.\r\n")
+	send(t, nc, "BITOP", "FOO", "dand", "bk1")
+	expect(t, br, "-ERR syntax error\r\n")
+	send(t, nc, "BITOP", "AND", "dand")
+	expect(t, br, "-ERR wrong number of arguments for 'bitop' command\r\n")
+}
