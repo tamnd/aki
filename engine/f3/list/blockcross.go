@@ -164,26 +164,42 @@ func groupByShardInOrder(t *shard.Txn, keys [][]byte) []shardGroup {
 // parkPopCross parks one cross-shard pop waiter: a fresh blockClaim shared by
 // every owner, one sibling ring per owner, and one timer on the first owner when
 // the timeout is finite. It runs on the coordinator goroutine with every intent
-// held, so by the time it returns bc.owners is complete and no serving push (a
-// push on a held key defers until release) can have read it half-built.
+// held, so a serving push (which defers on a held key until release) cannot read
+// bc.owners half-built. The timeout is the exception: it fires from the owner's
+// fireTimers step, which the held intents do not gate, so an armed timer can run
+// while this function is still building the slice. So the timer is not armed
+// until a second pass, after the first pass has finished bc.owners: the callback
+// reads a complete, then-immutable slice, never one an append is still growing.
 func parkPopCross(t *shard.Txn, conn *shard.Conn, seq uint32, keys [][]byte, spec waitSpec, timeout float64) {
 	bc := &blockClaim{conn: conn, seq: seq}
 	spec.claim = bc
-	first := true
-	for _, grp := range groupByShardInOrder(t, keys) {
+	groups := groupByShardInOrder(t, keys)
+	// Pass 1: park every owner's sibling ring, no timer yet, so bc.owners is
+	// finished before anything that reads it can exist.
+	for _, grp := range groups {
 		grp := grp
-		armTimer := first && timeout > 0
 		var head uint32
 		t.Do(grp.keys[0], func(cx *shard.Ctx) {
 			g := registry(cx)
 			head = parkWaiter(g, grp.keys, spec, conn, seq)
-			if armTimer {
-				deadline := cx.NowMs + int64(timeout*1000)
-				g.wpool.nodes[head].timer = cx.ArmTimer(deadline, makeCrossFire(g, head, bc))
-			}
 		})
 		bc.owners = append(bc.owners, blockSite{shard: grp.shard, head: head})
-		first = false
+	}
+	// Pass 2: with bc.owners final, arm the timeout on the first owner. The arm
+	// runs on that owner and the fire runs on the same owner later, so the
+	// callback sees the completed slice through the arm's ordering. The live and
+	// claim guards skip a node a push served between the passes.
+	if timeout > 0 && len(groups) > 0 {
+		head0 := bc.owners[0].head
+		t.Do(groups[0].keys[0], func(cx *shard.Ctx) {
+			g := registry(cx)
+			nd := &g.wpool.nodes[head0]
+			if !nd.live || nd.claim != bc {
+				return
+			}
+			deadline := cx.NowMs + int64(timeout*1000)
+			nd.timer = cx.ArmTimer(deadline, makeCrossFire(g, head0, bc))
+		})
 	}
 }
 
