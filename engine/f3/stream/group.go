@@ -245,6 +245,76 @@ func clampRetry(n int64) uint16 {
 	}
 }
 
+// autoClaimResult is what one XAUTOCLAIM pass produced (section 7.7): claimed lists
+// the ids transferred to the target consumer in id order, deleted lists the pending
+// ids whose log entry an XDEL removed since (dropped from the PEL, reported in the
+// reply's third element), and cursor is the id to resume the scan from, the zero id
+// when the walk reached the end.
+type autoClaimResult struct {
+	claimed []streamID
+	deleted []streamID
+	cursor  streamID
+}
+
+// autoClaim scans the group PEL from start in id order, transferring up to count
+// qualifying entries to the target consumer and lazily dropping entries whose log
+// entry an XDEL removed since (section 7.7). It mirrors Redis's twin budget: every
+// entry examined spends one of the count*10 scan attempts, and every claim or drop
+// spends one of the count result slots, so a PEL where idle entries are sparse still
+// returns in bounded work and the cursor lets a recovery loop drain a large stuck
+// PEL in slices. A claim is the same in-place slab rewrite XCLAIM does, never a move
+// between structures. Deleted entries are collected on the walk and removed after it,
+// so the tree is never mutated mid-scan.
+func (grp *streamGroup) autoClaim(s *stream, start streamID, to *streamConsumer, now, minIdle int64, count int, justid bool) autoClaimResult {
+	var res autoClaimResult
+	if grp.pel == nil {
+		return res
+	}
+	attempts := count * 10
+	remaining := count
+	var dropped []streamID
+	// res.cursor stays the zero id when the walk ends naturally (0-0 means "done"),
+	// and is set to the next unscanned id only when a budget stops the walk early.
+	grp.pel.walkFrom(start, func(pe *pelEntry) bool {
+		if attempts == 0 || remaining == 0 {
+			res.cursor = pe.id
+			return false
+		}
+		attempts--
+		id := pe.id
+		if _, live := s.entryAt(id); !live {
+			// The pending entry outlived its log entry: drop it and report the id, the
+			// only way XAUTOCLAIM surfaces a deletion the owner never acked.
+			dropped = append(dropped, id)
+			res.deleted = append(res.deleted, id)
+			remaining--
+			return true
+		}
+		if minIdle > 0 && now-pe.deliveryTime < minIdle {
+			return true
+		}
+		if pe.consumerOrd != to.ord {
+			grp.decOwner(pe.consumerOrd)
+			pe.consumerOrd = to.ord
+			to.pelCount++
+		}
+		pe.deliveryTime = now
+		if !justid {
+			pe.deliveryCount++
+		}
+		res.claimed = append(res.claimed, id)
+		remaining--
+		return true
+	})
+	for _, id := range dropped {
+		if ord, ok := grp.pel.ack(id); ok {
+			grp.pelCount--
+			grp.decOwner(ord)
+		}
+	}
+	return res
+}
+
 // drainConsumer removes every pending entry owned by the consumer ordinal from the
 // group PEL and returns the count. It collects the IDs on one tree walk, then acks
 // each, so the tree is never mutated mid-walk. Bounded by the entries removed,

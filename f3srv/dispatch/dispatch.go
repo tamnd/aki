@@ -502,6 +502,9 @@ func init() {
 	// XCLAIM key group consumer min-idle id [id ...] [opts], keyed on args[0]: an
 	// in-place PEL rewrite that reassigns pending entries to a live consumer.
 	register("XCLAIM", stream.Xclaim, 5, -1, true)
+	// XAUTOCLAIM key group consumer min-idle start [COUNT n] [JUSTID], keyed on
+	// args[0]: the scanning form that drains a stuck PEL in cursor-bounded slices.
+	register("XAUTOCLAIM", stream.Xautoclaim, 5, -1, true)
 
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
