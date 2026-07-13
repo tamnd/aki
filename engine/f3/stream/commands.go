@@ -76,7 +76,14 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		g.m[string(args[0])] = s
 	}
 	if trimSet {
-		s.trim(trim)
+		removed := s.trim(trim)
+		// Exact trim tombstones the boundary block's overshoot in place, leaving a
+		// partially-dead sealed block for the gc pass; approximate trim only drops
+		// whole front blocks, already reclaimed. Mark the stream dirty only in the
+		// exact case, so the maintainer visits it.
+		if removed > 0 && !trim.approx && s.kind == bandNative {
+			g.markDirty(s)
+		}
 	}
 	// The appended entry is a read event for any client blocked on this key: its
 	// ID exceeds every parked waiter's after-ID (they parked at or below the prior
@@ -106,7 +113,8 @@ func Xtrim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err("ERR syntax error")
 		return
 	}
-	s, wrong := registry(cx).lookup(cx, args[0])
+	g := registry(cx)
+	s, wrong := g.lookup(cx, args[0])
 	if wrong {
 		r.Err(wrongType)
 		return
@@ -115,7 +123,13 @@ func Xtrim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Int(0)
 		return
 	}
-	r.Int(int64(s.trim(sp)))
+	removed := s.trim(sp)
+	// Exact trim leaves a partially-dead boundary block for the gc pass (see Xadd);
+	// approximate trim reclaims whole blocks and leaves nothing to collect.
+	if removed > 0 && !sp.approx && s.kind == bandNative {
+		g.markDirty(s)
+	}
+	r.Int(int64(removed))
 }
 
 // parseFields views the field-value tail as []field. The bytes are caller-owned
@@ -158,7 +172,8 @@ func Xdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 		ids = append(ids, id)
 	}
-	s, wrong := registry(cx).lookup(cx, args[0])
+	g := registry(cx)
+	s, wrong := g.lookup(cx, args[0])
 	if wrong {
 		r.Err(wrongType)
 		return
@@ -172,6 +187,12 @@ func Xdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		if s.delete(id) {
 			n++
 		}
+	}
+	// A tombstone in a native sealed block accrues dead bytes the gc pass reclaims;
+	// mark the stream so the owner's maintainer visits it. The inline band compacts
+	// on trim, so it needs no gc.
+	if n > 0 && s.kind == bandNative {
+		g.markDirty(s)
 	}
 	r.Int(n)
 }
