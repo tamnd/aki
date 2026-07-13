@@ -315,6 +315,80 @@ func (grp *streamGroup) autoClaim(s *stream, start streamID, to *streamConsumer,
 	return res
 }
 
+// nackMode is the delivery-count policy XNACK applies to a nacked entry (Redis
+// 8.8, section 7.6). SILENT undoes the delivery increment (decrement by one,
+// floored at zero); FAIL leaves the count as the delivery left it; FATAL saturates
+// it so any retry-count ceiling treats the entry as poison.
+type nackMode uint8
+
+const (
+	nackSilent nackMode = iota
+	nackFail
+	nackFatal
+)
+
+// nackSetCount rewrites a pending entry's delivery count for XNACK. An explicit
+// RETRYCOUNT overrides the mode outright (clamped to the slab's 2-byte field);
+// otherwise the mode decides. FATAL sets the u16 ceiling, Redis's LLONG_MAX capped
+// to the slab width the same way clampRetry saturates.
+func nackSetCount(pe *pelEntry, mode nackMode, retry int64, hasRetry bool) {
+	if hasRetry {
+		pe.deliveryCount = clampRetry(retry)
+		return
+	}
+	switch mode {
+	case nackSilent:
+		if pe.deliveryCount > 0 {
+			pe.deliveryCount--
+		}
+	case nackFatal:
+		pe.deliveryCount = ^uint16(0)
+	}
+}
+
+// nack releases one id back to the group PEL without acking it (section 7.6, Redis
+// 8.8): a found pending entry is disowned (the owning consumer's count dropped, the
+// slab moved to the unowned NACK zone with its idle clock reset to the epoch) and
+// its delivery count rewritten per the mode or an explicit RETRYCOUNT, so the next
+// XCLAIM or XAUTOCLAIM min-idle predicate matches it immediately. Under FORCE an id
+// that is not pending but still exists in the log is created as an unowned NACK from
+// a zero baseline; without FORCE, or for an id whose log entry is gone, it is a skip.
+// It reports whether the id was nacked, the count the reply sums. It is a point
+// rewrite of one slab, never a scan.
+func (grp *streamGroup) nack(s *stream, id streamID, mode nackMode, retry int64, hasRetry, force bool) bool {
+	var (
+		pe *pelEntry
+		ok bool
+	)
+	if grp.pel != nil {
+		pe, ok = grp.pel.find(id)
+	}
+	if !ok {
+		if !force {
+			return false
+		}
+		if _, live := s.entryAt(id); !live {
+			return false
+		}
+		if grp.pel == nil {
+			grp.pel = newPEL()
+		}
+		// insertClaimed lands the slab unowned with a zero count and an epoch clock,
+		// exactly the clean baseline Redis resets a FORCE-created NACK to.
+		pe = grp.pel.insertClaimed(id)
+		grp.pelCount++
+		nackSetCount(pe, mode, retry, hasRetry)
+		return true
+	}
+	if pe.consumerOrd != noOwner {
+		grp.decOwner(pe.consumerOrd)
+		pe.consumerOrd = noOwner
+	}
+	nackSetCount(pe, mode, retry, hasRetry)
+	pe.deliveryTime = 0
+	return true
+}
+
 // drainConsumer removes every pending entry owned by the consumer ordinal from the
 // group PEL and returns the count. It collects the IDs on one tree walk, then acks
 // each, so the tree is never mutated mid-walk. Bounded by the entries removed,

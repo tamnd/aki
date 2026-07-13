@@ -113,7 +113,10 @@ func xpendingExtended(cx *shard.Ctx, s *stream, grp *streamGroup, rest [][]byte,
 			if filterOrd && pe.consumerOrd != onlyOrd {
 				return true
 			}
-			if cx.NowMs-pe.deliveryTime < f.minIdle {
+			// The min-idle floor gates owned entries only; an unowned NACK (XNACK,
+			// section 7.6) is always reported, matching Redis's `nack->consumer &&
+			// minidle` guard.
+			if pe.consumerOrd != noOwner && cx.NowMs-pe.deliveryTime < f.minIdle {
 				return true
 			}
 			rows = append(rows, pe)
@@ -125,8 +128,15 @@ func xpendingExtended(cx *shard.Ctx, s *stream, grp *streamGroup, rest [][]byte,
 	for _, pe := range rows {
 		out = resp.AppendArrayHeader(out, 4)
 		out = appendIDBulk(out, pe.id)
-		out = resp.AppendBulk(out, grp.consumerByOrd[pe.consumerOrd].name)
-		out = resp.AppendInt(out, cx.NowMs-pe.deliveryTime)
+		// An unowned NACK renders an empty consumer name and a -1 idle, the sentinel
+		// Redis reports for an entry no consumer holds.
+		if pe.consumerOrd == noOwner {
+			out = resp.AppendBulk(out, nil)
+			out = resp.AppendInt(out, -1)
+		} else {
+			out = resp.AppendBulk(out, grp.consumerByOrd[pe.consumerOrd].name)
+			out = resp.AppendInt(out, cx.NowMs-pe.deliveryTime)
+		}
 		out = resp.AppendInt(out, int64(pe.deliveryCount))
 	}
 	cx.Aux = out
