@@ -599,3 +599,41 @@ func buildDistinct(countW int, scores []uint64) *Tree {
 	}
 	return tr
 }
+
+// TestFindPointLookup pins the point lookup XCLAIM and XNACK ride: a hit returns
+// the exact reference stored at the key, and same-score member ties resolve to the
+// right reference through the Members callback (scores are taken mod 8 so many
+// distinct members share a score). A miss, whether an absent member within a
+// present score or an absent score, returns ok=false. It fills far past a single
+// leaf so the descent crosses interior nodes, the path a range seek takes. Each
+// member is unique and used as both the tie-break key and the ref payload, so the
+// bytes Find compares match what Member returns, the invariant the PEL upholds.
+func TestFindPointLookup(t *testing.T) {
+	ms := newMemStore()
+	tr := NewTree()
+	model := map[key]uint32{}
+	for i := 0; i < 2000; i++ {
+		k := key{score: uint64(i % 8), member: fmt.Sprintf("m%d", i)}
+		ref := ms.ref(k.member)
+		tr.Insert(k.score, []byte(k.member), ref, ms)
+		model[k] = ref
+	}
+	for k, want := range model {
+		got, ok := tr.Find(k.score, []byte(k.member), ms)
+		if !ok || got != want {
+			t.Fatalf("Find(%d,%q)=(%d,%v), want (%d,true)", k.score, k.member, got, ok, want)
+		}
+	}
+	// A member absent within a present score misses.
+	if _, ok := tr.Find(3, []byte("nope"), ms); ok {
+		t.Fatal("Find of an absent member within a present score reported present")
+	}
+	// A score no entry carries misses.
+	if _, ok := tr.Find(999, []byte("m0"), ms); ok {
+		t.Fatal("Find of an absent score reported present")
+	}
+	// The empty tree misses.
+	if _, ok := NewTree().Find(1, []byte("m0"), ms); ok {
+		t.Fatal("Find on an empty tree reported present")
+	}
+}

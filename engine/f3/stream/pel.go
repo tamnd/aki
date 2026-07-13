@@ -27,6 +27,10 @@ import (
 // the stored reference is the slab ordinal, which the Members callback turns back
 // into the ID's seq bytes for a same-ms compare.
 
+// noOwner marks a pending slab that no consumer owns yet, the transient state a
+// FORCE claim leaves between creating the slab and assigning its consumer.
+const noOwner = ^uint32(0)
+
 // pelEntry is one pending entry, the 32-byte slab the tree references by ordinal
 // (section 7.4). id is the delivered entry's ID; deliveryTime is the unix ms of the
 // last delivery, the idle clock XPENDING and the claim min-idle read; deliveryCount
@@ -97,6 +101,30 @@ func (p *groupPEL) ack(id streamID) (consumerOrd uint32, ok bool) {
 	owner := p.slabs[ord].consumerOrd
 	p.free = append(p.free, ord)
 	return owner, true
+}
+
+// find returns the slab for id and whether it is pending, a point lookup that
+// leaves the tree untouched so a claim or a nack can rewrite the record in place
+// (sections 7.6, 7.7). The returned pointer is into the arena, valid until the
+// next alloc grows it, which a single claim never does mid-use.
+func (p *groupPEL) find(id streamID) (*pelEntry, bool) {
+	ref, ok := p.tree.Find(id.ms, seqKey(id), p)
+	if !ok {
+		return nil, false
+	}
+	return &p.slabs[ref], true
+}
+
+// insertClaimed records id as pending with no owner yet, an idle clock at the
+// epoch, and a zero delivery count, the slab a FORCE claim of a not-yet-pending
+// entry creates before the claim assigns its consumer and stamps its times
+// (section 7.7). It returns the slab so the caller fills it; the epoch clock makes
+// the claim's min-idle gate pass unconditionally, as Redis's force path does.
+func (p *groupPEL) insertClaimed(id streamID) *pelEntry {
+	ord := p.alloc()
+	p.slabs[ord] = pelEntry{id: id, consumerOrd: noOwner}
+	p.tree.Insert(id.ms, seqKey(id), ord, p)
+	return &p.slabs[ord]
 }
 
 // walkFrom visits the pending entries with IDs at or above start in ID order,

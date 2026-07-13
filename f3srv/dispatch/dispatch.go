@@ -499,6 +499,9 @@ func init() {
 	table["XREADGROUP"].blocks = true
 	register("XACK", stream.Xack, 3, -1, true)
 	register("XPENDING", stream.Xpending, 2, -1, true)
+	// XCLAIM key group consumer min-idle id [id ...] [opts], keyed on args[0]: an
+	// in-place PEL rewrite that reassigns pending entries to a live consumer.
+	register("XCLAIM", stream.Xclaim, 5, -1, true)
 
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
