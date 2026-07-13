@@ -145,7 +145,7 @@ func hllTau(x float64) float64 {
 		x = math.Sqrt(x)
 		zPrime := z
 		y *= 0.5
-		z -= math.Pow(1-x, 2) * y
+		z -= (1 - x) * (1 - x) * y
 		if zPrime == z {
 			return z / 3
 		}
