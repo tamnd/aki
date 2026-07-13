@@ -206,7 +206,7 @@ func residentModel(nsrc, ml int) (streaming, materialize int) {
 	return (nsrc + 1) * chunkSize, (nsrc + 1) * ml
 }
 
-func mib(n int) float64  { return float64(n) / (1 << 20) }
+func mib(n int) float64     { return float64(n) / (1 << 20) }
 func mibU(n uint64) float64 { return float64(n) / (1 << 20) }
 
 // size names one point on the bitmap-length sweep.
