@@ -200,6 +200,19 @@ func init() {
 	register("BITPOS", derived.BitPos, 2, 5, true)
 	register("BITFIELD", derived.BitField, 1, -1, true)
 	register("BITFIELD_RO", derived.BitFieldRO, 1, -1, true)
+	// BITOP <AND|OR|XOR|NOT> destkey srckey [srckey ...] (spec 2064/f3/15
+	// section 5) is the one bitmap command touching more than one key. The tail
+	// is the operation token, the destination, then the sources, so the routing
+	// key is the destination at tail index 1 (keyAt) and the co-location check
+	// spans destination plus sources (crossKeys drops the operation token). The
+	// co-located case, the {tag}-hashed and single-shard norm, runs the whole
+	// streaming algebra on the destination's owner through the store; keys that
+	// span shards route to the F17 hop coordinator, which lands next slice and
+	// until then refuses cleanly.
+	register("BITOP", derived.BitOp, 3, -1, true)
+	table["BITOP"].keyAt = 1
+	table["BITOP"].crossKeys = func(a [][]byte) [][]byte { return a[1:] }
+	table["BITOP"].cross = derived.BitOpCross
 
 	// The set surface (spec 2064/f3/11 M1). Point ops, draws, streamed
 	// SMEMBERS, the downward-cursor SSCAN over all three bands, plus OBJECT
