@@ -480,12 +480,22 @@ func init() {
 	// DELCONSUMER and the XINFO GROUPS read both name their key after the
 	// subcommand token (XGROUP CREATE key ..., XINFO GROUPS key), so they route on
 	// args[1] the way OBJECT routes on the key after its subcommand; the handler
-	// validates each subcommand's own tail. XREADGROUP, XACK, and the rest of XINFO
-	// follow with the delivery ledger.
+	// validates each subcommand's own tail.
 	register("XGROUP", stream.Xgroup, 1, -1, false)
 	table["XGROUP"].keyAt = 1
 	register("XINFO", stream.Xinfo, 1, -1, false)
 	table["XINFO"].keyAt = 1
+
+	// Group delivery (M5 slice 6). XREADGROUP names its keys after STREAMS like
+	// XREAD (past the GROUP g c prefix and COUNT/BLOCK/NOACK), so it routes through
+	// streamKeyAt to the first key's shard with crossKeys guarding co-location;
+	// blocking parks are the next sub-slice, so it is not marked blocks yet. XACK
+	// and XPENDING key on args[0] the way the write path does.
+	register("XREADGROUP", stream.Xreadgroup, 4, -1, false)
+	table["XREADGROUP"].crossKeys = stream.GroupReadKeys
+	table["XREADGROUP"].streamKeyAt = stream.GroupReadKeyAt
+	register("XACK", stream.Xack, 3, -1, true)
+	register("XPENDING", stream.Xpending, 2, -1, true)
 
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked

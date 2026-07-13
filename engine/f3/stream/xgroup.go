@@ -21,9 +21,15 @@ const (
 )
 
 // nogroup builds the NOGROUP error naming the group and key, the reply every
-// group subcommand gives when the named group is absent.
+// XGROUP subcommand gives when the named group is absent.
 func nogroup(name, key []byte) string {
 	return "NOGROUP No such consumer group '" + string(name) + "' for key name '" + string(key) + "'"
+}
+
+// nogroupGeneric builds the NOGROUP error XACK and XPENDING give for a missing key
+// or group, key first then group, the plain form Redis uses outside XREADGROUP.
+func nogroupGeneric(key, name []byte) string {
+	return "NOGROUP No such key '" + string(key) + "' or consumer group '" + string(name) + "'"
 }
 
 // Xgroup dispatches the XGROUP subcommands. args[0] is the subcommand token; the

@@ -73,9 +73,9 @@ func xinfoGroups(cx *shard.Ctx, key []byte, r shard.Reply) {
 	r.Raw(out)
 }
 
-// pending is the group's total pending-entry count, maintained O(1). The PEL that
-// carries it fills in slice 6, so this reports 0 until delivery exists.
-func (grp *streamGroup) pending() int { return 0 }
+// pending is the group's total pending-entry count, the maintained pelCount read
+// O(1) without a PEL walk.
+func (grp *streamGroup) pending() int { return int(grp.pelCount) }
 
 // appendIDBulk appends id as a bulk string in Redis's "ms-seq" form.
 func appendIDBulk(dst []byte, id streamID) []byte {

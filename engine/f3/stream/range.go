@@ -137,6 +137,29 @@ func cloneFields(fields []field) []field {
 	return append([]field(nil), fields...)
 }
 
+// entryAt returns the live entry with exactly id and ok=true, or ok=false when no
+// live entry has that id (it was never added, or an XDEL tombstoned it). The group
+// re-read path joins a pending ID to its log entry this way, framing [id, nil] for
+// a pending entry whose log entry is gone since the PEL outlives it (section 7.5).
+func (s *stream) entryAt(id streamID) (fields []field, ok bool) {
+	if s == nil {
+		return nil, false
+	}
+	b := s.blockFor(id)
+	if b == nil || !b.covers(id) {
+		return nil, false
+	}
+	var scratch []field
+	b.walk(scratch, func(eid streamID, ef []field) bool {
+		if eid == id {
+			fields, ok = cloneFields(ef), true
+			return false
+		}
+		return eid.cmp(id) < 0 // stop once the walk climbs past id
+	})
+	return fields, ok
+}
+
 // Xrange answers XRANGE key start end [COUNT n]: the live entries with IDs in
 // [start, end], oldest first, as an array of [id, [field value ...]] pairs
 // (section 6.3). Xrevrange answers XREVRANGE key end start [COUNT n], the same
