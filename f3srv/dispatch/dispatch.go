@@ -5,6 +5,7 @@
 package dispatch
 
 import (
+	"github.com/tamnd/aki/engine/f3/derived"
 	"github.com/tamnd/aki/engine/f3/hash"
 	"github.com/tamnd/aki/engine/f3/list"
 	"github.com/tamnd/aki/engine/f3/set"
@@ -190,6 +191,11 @@ func init() {
 	register("SETRANGE", str.SetRange, 3, 3, true)
 	register("GETRANGE", str.GetRange, 3, 3, true)
 	register("SUBSTR", str.GetRange, 3, 3, true)
+
+	// The bit surface (spec 2064/f3/15 M6): a bitmap is a bit-level view over
+	// the string store, so the point pair rides the same keyspace as SET.
+	register("SETBIT", derived.SetBit, 3, 3, true)
+	register("GETBIT", derived.GetBit, 2, 2, true)
 
 	// The set surface (spec 2064/f3/11 M1). Point ops, draws, streamed
 	// SMEMBERS, the downward-cursor SSCAN over all three bands, plus OBJECT
