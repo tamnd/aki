@@ -355,6 +355,16 @@ func init() {
 	register("ZINTERSTORE", zset.Zinterstore, 3, -1, true)
 	register("ZDIFFSTORE", zset.Zdiffstore, 3, -1, true)
 
+	// The geo surface (spec 2064/f3/15 section 10): a geo set is a zset whose
+	// score is a 52-bit geohash, so the point commands are all single-key and key
+	// on the geo set argument the way ZADD does. GEOADD takes at least one triple
+	// after its NX/XX/CH flags; GEOPOS and GEOHASH take a key and zero or more
+	// members; GEODIST takes two members and an optional unit.
+	register("GEOADD", zset.Geoadd, 4, -1, true)
+	register("GEOPOS", zset.Geopos, 1, -1, true)
+	register("GEODIST", zset.Geodist, 3, 4, true)
+	register("GEOHASH", zset.Geohash, 1, -1, true)
+
 	// The list surface (spec 2064/f3/13 M3 slice 1): the inline listpack band and
 	// its one-way promotion to the native quicklist placeholder. The pushes, pops,
 	// LLEN, LINDEX, LRANGE, LSET, LREM, LTRIM, LINSERT, and LPOS all key on the
