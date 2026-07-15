@@ -49,13 +49,16 @@ func (s *Server) handleConn(c net.Conn) {
 	defer c.Close()
 	buf := make([]byte, 0, 16<<10)
 	reply := make([]byte, 0, 4<<10)
+	args := make([][]byte, 0, 8)
 	for {
 		// Parse everything buffered, then write all replies in one call, so
 		// a pipelined burst costs one read and one write.
 		reply = reply[:0]
 		consumed := 0
 		for {
-			args, n, err := ParseCommand(buf[consumed:])
+			var n int
+			var err error
+			args, n, err = ParseCommand(buf[consumed:], args[:0])
 			if errors.Is(err, ErrIncomplete) {
 				break
 			}
