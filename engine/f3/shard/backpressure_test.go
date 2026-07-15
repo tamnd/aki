@@ -224,19 +224,20 @@ func TestBackpressureNoDropUnderDrain(t *testing.T) {
 		w.st.ReclaimSafe(w.ep.safe())
 		w.retryFull()
 	}
-	// Phase one: with the I/O goroutine live, stage drains off the owner, run the
-	// completions (phase 2 flips records cold and lists emptied segments), and
-	// reclaim after each. Drain each pass's completions to a fixpoint so a loaded
-	// runner cannot leave staged drains unprocessed and exit this phase having
-	// migrated too little; the loop runs while the write is parked and the
-	// migrator still has resident charge to move.
-	for pass := 0; pass < 2000 && len(w.fullWaiters) > 0 && s.NeedsColdDrain(); pass++ {
+	// Phase one: with the I/O goroutine live, keep draining off the owner while
+	// the write is parked. drainCold takes the deep backpressure trigger while a
+	// write is parked (worker.go, the F9 rail): it stays engaged past the
+	// migrator's low-water until a whole segment frees and the retry serves the
+	// write, rather than stopping at the low-water with the write still parked.
+	// Each pass runs its completions to a fixpoint (phase 2 flips records cold and
+	// lists the emptied segments) and reclaims before the retry.
+	for pass := 0; pass < 4000 && len(w.fullWaiters) > 0; pass++ {
 		w.drainCold()
 		for w.advanceIntents() > 0 {
 		}
 		reclaimRetry()
 	}
-	// Join the I/O goroutine so every staged drain has posted its completion,
+	// Join the I/O goroutine so any last staged drain has posted its completion,
 	// then run all of them to a fixpoint and reclaim to a fixpoint before the
 	// final retry. No drainCold here: the jobs channel is closed. Reclaiming
 	// fully before the retry keeps the coarse stall bound, a guard against a

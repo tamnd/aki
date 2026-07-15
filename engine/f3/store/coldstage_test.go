@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 )
 
@@ -216,4 +217,149 @@ func TestColdDrainNoPressureNil(t *testing.T) {
 	if d := s.StageColdDrain(make([]byte, 0, 128<<10)); d != nil {
 		t.Fatalf("staged a drain under the cap: %d flips", len(d.flips))
 	}
+}
+
+// tightArenaStore opens a store with a small fixed arena behind a resident cap
+// far larger than the arena, the shape where the low-water migrator never
+// engages (live can never reach cap-cap/8) yet the arena still fills with live
+// records. It is the deterministic form of the backpressure wedge: a write that
+// cannot allocate has no low-water drain to free it a segment.
+func tightArenaStore(t *testing.T, arenaBytes, segBytes int, capBytes uint64) *Store {
+	t.Helper()
+	dir := t.TempDir()
+	s, err := Open(Options{
+		ArenaBytes:       arenaBytes,
+		SegBytes:         segBytes,
+		VlogPath:         filepath.Join(dir, "vlog"),
+		ColdPath:         filepath.Join(dir, "cold"),
+		ResidentCapBytes: capBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// driveDeepDrain runs one backpressure drain cycle the way the shard worker does
+// while a write is parked: phase 1 past the low-water (StageColdDrainDeep), the
+// off-owner pwrite, phase 2, then the retire-and-reclaim that hands any emptied
+// segment back to the free list. It stamps the retire at ep and reclaims one past
+// it, standing in for the F6 owner bracket the shard test drives directly. It
+// returns whether the pass staged anything, so the caller can stop at
+// convergence.
+func driveDeepDrain(t *testing.T, s *Store, buf []byte, ep uint64) bool {
+	t.Helper()
+	d := s.StageColdDrainDeep(buf)
+	if d == nil || len(d.Buf()) == 0 {
+		return false
+	}
+	nw, err := s.ColdWriteAt(d.Off(), d.Buf())
+	if err != nil || nw != len(d.Buf()) {
+		t.Fatalf("cold write: n=%d err=%v, want n=%d", nw, err, len(d.Buf()))
+	}
+	s.CompleteColdDrain(d, true)
+	for _, si := range s.TakeColdDrained() {
+		if !s.RetireSegment(si, ep) {
+			t.Fatalf("retire of drained segment %d refused", si)
+		}
+	}
+	s.ReclaimSafe(ep + 1)
+	return true
+}
+
+// TestColdDrainDeepServesParkedWritePastLowWater is the F9 rail regression
+// (spec 2064/f3/06 section 8): a full arena under a resident cap so generous the
+// low-water migrator never engages leaves a write with no way to allocate and no
+// low-water drain to free it a segment, the wedge the CI backpressure flake hit.
+// The deep drain past the low-water (StageColdDrainDeep, reached while a write is
+// parked) frees a segment, so the write that took ErrFull is served rather than
+// stalled out, and every key still answers from its cold frame.
+func TestColdDrainDeepServesParkedWritePastLowWater(t *testing.T) {
+	// 4 MiB arena, 256 KiB segments (16), 64 MiB resident cap: the low-water sits
+	// at 56 MiB, far above anything a 4 MiB arena can hold live, so NeedsColdDrain
+	// is false however full the arena gets.
+	s := tightArenaStore(t, 4<<20, 256<<10, 64<<20)
+
+	// Fill with distinct small keys (no overwrite, so the arena fills with live
+	// records) until a write cannot allocate.
+	var keys [][]byte
+	var i int
+	for ; i < 1<<20; i++ {
+		k := fmt.Appendf(nil, "k:%08d", i)
+		v := fmt.Appendf(nil, "val-%d", i)
+		err := s.Set(k, v)
+		if err == ErrFull {
+			break
+		}
+		if err != nil {
+			t.Fatalf("set %d: %v", i, err)
+		}
+		keys = append(keys, k)
+	}
+	if i >= 1<<20 {
+		t.Fatal("arena never filled")
+	}
+	if s.arena.freeSegCount() != 0 {
+		t.Fatalf("arena reported full but %d free segments remain", s.arena.freeSegCount())
+	}
+
+	// The low-water migrator is quiet: nothing to drain, nothing staged. Without
+	// the deep path a parked write here has no route to a free segment.
+	if s.NeedsColdDrain() {
+		t.Fatal("NeedsColdDrain true under a cap far above the arena")
+	}
+	if d := s.StageColdDrain(make([]byte, 0, 128<<10)); d != nil {
+		t.Fatalf("low-water drain staged %d flips past its floor", len(d.flips))
+	}
+	if !s.NeedsColdDrainDeep() {
+		t.Fatal("NeedsColdDrainDeep false with a full arena of live records")
+	}
+
+	// The parked write: it cannot allocate, exactly what backpressure parks on.
+	parkKey := fmt.Appendf(nil, "k:%08d", i)
+	parkVal := fmt.Appendf(nil, "val-%d", i)
+	if err := s.Set(parkKey, parkVal); err != ErrFull {
+		t.Fatalf("probe write err = %v, want ErrFull (the arena is full)", err)
+	}
+
+	// Drive the deep drain until a segment comes back, the F9 rail freeing room
+	// for the parked write. Bounded passes; the store must reach a free segment
+	// well before this cap.
+	buf := make([]byte, 0, 128<<10)
+	ep := uint64(2)
+	for pass := 0; s.arena.freeSegCount() == 0 && pass < 4096; pass++ {
+		if !driveDeepDrain(t, s, buf, ep) {
+			break
+		}
+		ep += 2
+	}
+	if s.arena.freeSegCount() == 0 {
+		t.Fatalf("deep drain freed no segment: live=%d cold=%d", s.arena.live(), s.Cold().Records)
+	}
+
+	// The write that took ErrFull now allocates: block-not-drop served it.
+	if err := s.Set(parkKey, parkVal); err != nil {
+		t.Fatalf("parked write still refused after the deep drain: %v", err)
+	}
+	if s.Cold().Records == 0 {
+		t.Fatal("nothing went cold on the deep drain")
+	}
+
+	// Every key answers, resident or cold, including the one that was parked.
+	var dst []byte
+	for _, k := range keys {
+		var j int
+		if _, err := fmt.Sscanf(string(k), "k:%d", &j); err != nil {
+			t.Fatalf("parse key %q: %v", k, err)
+		}
+		got, ok := s.GetString(k, 0, dst)
+		if !ok || string(got) != fmt.Sprintf("val-%d", j) {
+			t.Fatalf("key %q = %q,%v, want val-%d", k, got, ok, j)
+		}
+	}
+	if got, ok := s.GetString(parkKey, 0, dst); !ok || string(got) != string(parkVal) {
+		t.Fatalf("served write %q = %q,%v, want %q", parkKey, got, ok, parkVal)
+	}
+	assertCensus(t, s)
 }
