@@ -1,0 +1,4 @@
+ba1151b7e4e01c8647c769deb6cb0c187e6e975e796975a909d3b5fc2a0f3e1e  /root/f3gate/m0-gate-20260714/bin/f3srv
+3bea75409d8182add0459b2765cd62cd5962ffbcf8adb8ccf637205e70cbadb0  /root/bin/redis-server
+3ee5b35da0bd9916c7058c83221972d06fe69182e0790029a183ca8ffd0cf4af  /root/bin/valkey-server
+6c5be4074733eaf19ceb212633dd9b0c699f5f17315fb61fa7ea50f74491babb  /root/bin/redis-benchmark
