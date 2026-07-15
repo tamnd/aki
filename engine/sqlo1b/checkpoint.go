@@ -67,6 +67,12 @@ type Checkpointer struct {
 	crash func(step int) error
 }
 
+// SetCrashPoint installs the step failpoint: fn runs after each
+// numbered step and a non-nil return abandons the checkpoint exactly
+// there. Harness use only; the B1 crash matrix in cmd/sqlo1crash
+// drives it. Nil clears it.
+func (c *Checkpointer) SetCrashPoint(fn func(step int) error) { c.crash = fn }
+
 func (c *Checkpointer) boundary(step int) error {
 	if c.crash == nil {
 		return nil
