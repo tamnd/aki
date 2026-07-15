@@ -8,6 +8,15 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
+func newChunk(t *testing.T, chunkNo uint64, windowBase uint8) *Chunk {
+	t.Helper()
+	c, err := NewChunk(chunkNo, windowBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
 func TestChunkArithmetic(t *testing.T) {
 	if chunkHdrSize+ChunkCap*chunkEntSize != ChunkSize {
 		t.Fatalf("chunk layout %d+%d*%d != %d", chunkHdrSize, ChunkCap, chunkEntSize, ChunkSize)
@@ -21,7 +30,7 @@ func TestChunkArithmetic(t *testing.T) {
 // at their offsets, entry 0 at byte 8, entry 1 at byte 20, all
 // little-endian.
 func TestChunkLayoutGolden(t *testing.T) {
-	c := NewChunk(0xAABB_0000_0042)
+	c := newChunk(t, 0xAABB_0000_0042, 7)
 	if err := c.InsertEntry(0x1234, 0x51, 0x0102030405060708); err != nil {
 		t.Fatal(err)
 	}
@@ -32,8 +41,8 @@ func TestChunkLayoutGolden(t *testing.T) {
 	if got := binary.LittleEndian.Uint16(b[0:2]); got != 2 {
 		t.Errorf("count %d, want 2", got)
 	}
-	if b[2] != 0 || b[3] != 0 {
-		t.Errorf("cflags %#x reserved %#x, want zero", b[2], b[3])
+	if b[2] != 0 || b[3] != 7 {
+		t.Errorf("cflags %#x window_base %d, want 0 and 7", b[2], b[3])
 	}
 	if got := binary.LittleEndian.Uint32(b[4:8]); got != 0x0000_0042 {
 		t.Errorf("chunk_no_lo %#x, want the low 32 bits 0x42", got)
@@ -54,7 +63,7 @@ func TestChunkLayoutGolden(t *testing.T) {
 
 func TestChunkRoundtrip(t *testing.T) {
 	const chunkNo = uint64(7_000_000_001)
-	c := NewChunk(chunkNo)
+	c := newChunk(t, chunkNo, 0)
 	type ent struct {
 		fp, meta uint16
 		vptr     uint64
@@ -93,7 +102,7 @@ func TestChunkRoundtrip(t *testing.T) {
 // sharing the probed fingerprint is a candidate, yielded in slot
 // order, and the caller stops the scan by returning false.
 func TestChunkProbeCandidates(t *testing.T) {
-	c := NewChunk(1)
+	c := newChunk(t, 1, 0)
 	for i, fp := range []uint16{9, 700, 9, 41, 9} {
 		if err := c.InsertEntry(fp, 0, uint64(i)); err != nil {
 			t.Fatal(err)
@@ -122,7 +131,7 @@ func TestChunkProbeCandidates(t *testing.T) {
 }
 
 func TestChunkCapacity(t *testing.T) {
-	c := NewChunk(3)
+	c := newChunk(t, 3, 0)
 	for i := range ChunkCap {
 		if err := c.InsertEntry(uint16(i), 0, uint64(i)); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
@@ -139,7 +148,7 @@ func TestChunkCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ch := NewChunk(3)
+	ch := newChunk(t, 3, 0)
 	for i := range ChunkChainCap {
 		if err := ch.InsertEntry(uint16(i), 0, uint64(i)); err != nil {
 			t.Fatal(err)
@@ -154,7 +163,7 @@ func TestChunkCapacity(t *testing.T) {
 }
 
 func TestChunkChain(t *testing.T) {
-	overflow := NewChunk(5)
+	overflow := newChunk(t, 5, 12)
 	if err := overflow.InsertEntry(1, 0, 2); err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +173,7 @@ func TestChunkChain(t *testing.T) {
 	}
 	check := ChunkCheck32(overflow.Bytes())
 
-	c := NewChunk(5)
+	c := newChunk(t, 5, 12)
 	if err := c.SetChain(pos, check); err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +215,7 @@ func TestChunkChain(t *testing.T) {
 }
 
 func TestChunkRemoveUpdate(t *testing.T) {
-	c := NewChunk(2)
+	c := newChunk(t, 2, 0)
 	for i := range 5 {
 		if err := c.InsertEntry(uint16(100+i), 0, uint64(i)); err != nil {
 			t.Fatal(err)
@@ -236,17 +245,11 @@ func TestChunkRemoveUpdate(t *testing.T) {
 	if err := c.SetEntry(9, 0, 0); err == nil {
 		t.Fatal("updated an entry past count")
 	}
-	if err := c.SetEntry(0, 1<<7, 0); err == nil {
-		t.Fatal("reserved meta bits accepted by SetEntry")
-	}
-	if err := c.InsertEntry(0, 1<<9, 0); err == nil {
-		t.Fatal("reserved meta bits accepted by InsertEntry")
-	}
 }
 
 func TestChunkParseRejects(t *testing.T) {
 	base := func() []byte {
-		c := NewChunk(77)
+		c := newChunk(t, 77, 3)
 		for i := range 3 {
 			if err := c.InsertEntry(uint16(i), 0, uint64(i)); err != nil {
 				t.Fatal(err)
@@ -265,9 +268,8 @@ func TestChunkParseRejects(t *testing.T) {
 			binary.LittleEndian.PutUint16(b[0:2], 42)
 		}, 77},
 		{"unknown cflags", func(b []byte) { b[2] |= 1 << 3 }, 77},
-		{"reserved header byte", func(b []byte) { b[3] = 1 }, 77},
+		{"window base past 47", func(b []byte) { b[3] = maxWindowBase + 1 }, 77},
 		{"chunk number mismatch", func(b []byte) {}, 78},
-		{"reserved meta bits", func(b []byte) { b[chunkHdrSize+2] |= 1 << 7 }, 77},
 		{"garbage past live region", func(b []byte) { b[chunkHdrSize+5*chunkEntSize] = 9 }, 77},
 		{"garbage in unchained chain slot", func(b []byte) { b[ChunkSize-1] = 1 }, 77},
 		{"chain pointer slot past 7", func(b []byte) {
@@ -309,6 +311,72 @@ func TestEntryMetaRejects(t *testing.T) {
 	}
 }
 
+// TestSplitWindow pins the split-window contract: meta bits 7..15
+// hold hash bits base..base+8, and WindowBit answers for exactly the
+// nine levels the window covers.
+func TestSplitWindow(t *testing.T) {
+	h := uint64(0b1_0110_1101) << 12 // window at base 12 is 0x16D
+	w, err := SplitWindow(h, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w != 0x16D {
+		t.Fatalf("window %#x, want 0x16D", w)
+	}
+	meta, err := MakeEntryMeta(5, ExpClassNear, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err = MetaWithWindow(meta, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if MetaSplitWindow(meta) != w {
+		t.Fatalf("window roundtrip got %#x, want %#x", MetaSplitWindow(meta), w)
+	}
+	if MetaTypeTag(meta) != 5 || MetaExpiryClass(meta) != ExpClassNear || !MetaRoot(meta) {
+		t.Fatalf("window write clobbered low meta bits: %#x", meta)
+	}
+	for level := uint8(12); level < 21; level++ {
+		bit, ok := WindowBit(meta, 12, level)
+		if !ok {
+			t.Fatalf("level %d not covered by base 12", level)
+		}
+		if want := uint8(h>>level) & 1; bit != want {
+			t.Fatalf("level %d bit %d, want %d", level, bit, want)
+		}
+	}
+	if _, ok := WindowBit(meta, 12, 11); ok {
+		t.Fatal("level below base answered")
+	}
+	if _, ok := WindowBit(meta, 12, 21); ok {
+		t.Fatal("level past window answered")
+	}
+	if _, err := SplitWindow(h, maxWindowBase+1); err == nil {
+		t.Error("window base 48 accepted by SplitWindow")
+	}
+	if _, err := MetaWithWindow(0, windowMask+1); err == nil {
+		t.Error("ten-bit window accepted")
+	}
+	if _, err := NewChunk(1, maxWindowBase+1); err == nil {
+		t.Error("window base 48 accepted by NewChunk")
+	}
+	c := newChunk(t, 6, 44)
+	if c.WindowBase() != 44 {
+		t.Fatalf("WindowBase %d, want 44", c.WindowBase())
+	}
+	if err := c.InsertEntry(1, meta, 2); err != nil {
+		t.Fatal(err)
+	}
+	p, err := ParseChunk(c.Bytes(), 6)
+	if err != nil {
+		t.Fatalf("legal window_base and window meta rejected: %v", err)
+	}
+	if p.WindowBase() != 44 {
+		t.Fatalf("parsed WindowBase %d, want 44", p.WindowBase())
+	}
+}
+
 // TestFingerprintPlacementDisjoint pins the doc 8.3 bit split: the
 // fingerprint is exactly bits 63..48 and placement exactly 47..0, so
 // together they reconstruct the hash and neither leaks into the
@@ -332,7 +400,7 @@ func TestFingerprintPlacementDisjoint(t *testing.T) {
 // image and catch any flip, because the chunk carries no checksum of
 // its own.
 func TestChunkFullPtrIntegration(t *testing.T) {
-	c := NewChunk(9)
+	c := newChunk(t, 9, 0)
 	if err := c.InsertEntry(1, 2, 3); err != nil {
 		t.Fatal(err)
 	}
