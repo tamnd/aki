@@ -17,7 +17,17 @@
 // under W2 and W4 (segment post-image per HSET, root post-image only
 // when the fence changed) because the aki WAL is not SQLite's. An oracle
 // test pins the model against a reference map, including split coverage
-// and root count exactness, through the SQL readback path.
+// and root count exactness, through the store readback path.
+//
+// B3 re-points the suite at Track B: the same segmented-hash model
+// drives either arm through a narrow store surface, selected by -store.
+// The A arm is the SQLite row schema below; the B arm (store_b.go) maps
+// segments to subkey records under a minted rooth and the root to a
+// plain record under the user key, turns a flush into one DrainBatch,
+// and points the checkpoint cadence at the store's own checkpoint, so
+// one sweep prices seg_max on the backend that will actually carry it.
+// The W2/W4 WAL column stays modeled arithmetic, identical on both
+// arms.
 package main
 
 import (
@@ -56,11 +66,13 @@ INSERT OR IGNORE INTO meta (id, hw) VALUES (0, 0);`
 	segPutSQL  = `INSERT INTO seg (k, segid, v) VALUES (?1, ?2, ?3) ON CONFLICT (k, segid) DO UPDATE SET v = excluded.v`
 	segGetSQL  = `SELECT v FROM seg WHERE k = ?1 AND segid = ?2`
 	rootPutSQL = `INSERT INTO kv (k, t, exp, gen, v, crc) VALUES (?1, 4, 0, 0, ?2, 0) ON CONFLICT (k) DO UPDATE SET v = excluded.v`
+	rootGetSQL = `SELECT v FROM kv WHERE k = ?1`
 	setHWSQL   = `UPDATE meta SET hw = ?1 WHERE id = 0`
 )
 
 type config struct {
 	dir       string
+	store     string
 	segMax    int
 	fdist     string
 	setpct    int
@@ -72,17 +84,65 @@ type config struct {
 	ckpt      int
 }
 
+// store is the backend arm under the hash model: Track A rows or Track
+// B records, one narrow surface so the shared model above prices both.
+// The hashes are fully resident, so the read half of the surface is the
+// oracle test's readback (segGet for stored segment blobs, rootGet for
+// the stored root payload); flush lands one drain-shaped write set, and
+// checkpoint is whatever the arm's WAL trim verb is.
+type store interface {
+	segGet(ki int, segid uint64) ([]byte, error)
+	rootGet(ki int) ([]byte, error)
+	flush(fs *flushSet) error
+	checkpoint() error
+	dataMB() float64
+	walMB() float64
+	close() error
+}
+
+// flushSet is one drain cycle as the model hands it down: encoded dirty
+// segments, encoded dirty roots, and the high-water sequence that must
+// land atomically with them.
+type flushSet struct {
+	seq   int64
+	segs  []segRow
+	roots []rootRow
+}
+
+type segRow struct {
+	ki    int
+	segid uint64
+	row   []byte
+}
+
+type rootRow struct {
+	ki  int
+	row []byte
+}
+
+func openStore(cfg config, path string, keys [][]byte) (store, error) {
+	switch cfg.store {
+	case "a":
+		return openA(path, keys)
+	case "b":
+		return openB(path, keys)
+	}
+	return nil, fmt.Errorf("unknown store arm %q", cfg.store)
+}
+
 type db struct {
 	conn  *sqlite3.Conn
 	path  string
+	keys  [][]byte
 	sput  *sqlite3.Stmt
 	sget  *sqlite3.Stmt
 	rput  *sqlite3.Stmt
+	rget  *sqlite3.Stmt
 	hw1   *sqlite3.Stmt
 	stmts []*sqlite3.Stmt
 }
 
-func openDB(path string) (*db, error) {
+func openA(path string, keys [][]byte) (*db, error) {
 	conn, err := sqlite3.Open(path)
 	if err != nil {
 		return nil, err
@@ -108,7 +168,7 @@ func openDB(path string) (*db, error) {
 		conn.Close()
 		return nil, err
 	}
-	d := &db{conn: conn, path: path}
+	d := &db{conn: conn, path: path, keys: keys}
 	for _, s := range []struct {
 		dst **sqlite3.Stmt
 		sql string
@@ -116,6 +176,7 @@ func openDB(path string) (*db, error) {
 		{&d.sput, segPutSQL},
 		{&d.sget, segGetSQL},
 		{&d.rput, rootPutSQL},
+		{&d.rget, rootGetSQL},
 		{&d.hw1, setHWSQL},
 	} {
 		stmt, _, err := conn.Prepare(s.sql)
@@ -144,6 +205,92 @@ func stepReset(s *sqlite3.Stmt) (found bool, err error) {
 	}
 	return found, err
 }
+
+// segGet reads one stored segment blob for the oracle readback; a
+// missing row comes back nil. The copy is deliberate: the blob
+// column's bytes die at Reset.
+func (d *db) segGet(ki int, segid uint64) ([]byte, error) {
+	if err := d.sget.BindBlob(1, d.keys[ki]); err != nil {
+		return nil, err
+	}
+	if err := d.sget.BindInt64(2, int64(segid)); err != nil {
+		return nil, err
+	}
+	var v []byte
+	if d.sget.Step() {
+		v = slices.Clone(d.sget.ColumnBlob(0, nil))
+	}
+	err := d.sget.Err()
+	if rerr := d.sget.Reset(); err == nil {
+		err = rerr
+	}
+	return v, err
+}
+
+// rootGet reads the stored root payload, nil when the row is missing.
+func (d *db) rootGet(ki int) ([]byte, error) {
+	if err := d.rget.BindBlob(1, d.keys[ki]); err != nil {
+		return nil, err
+	}
+	var v []byte
+	if d.rget.Step() {
+		v = slices.Clone(d.rget.ColumnBlob(0, nil))
+	}
+	err := d.rget.Err()
+	if rerr := d.rget.Reset(); err == nil {
+		err = rerr
+	}
+	return v, err
+}
+
+// flush is one drain-shaped transaction: encoded segment rows, encoded
+// root rows, and the high-water row, committed together.
+func (d *db) flush(fs *flushSet) error {
+	txn, err := d.conn.BeginImmediate()
+	if err != nil {
+		return err
+	}
+	fail := func(err error) error { txn.Rollback(); return err }
+	for _, s := range fs.segs {
+		if err := d.sput.BindBlob(1, d.keys[s.ki]); err != nil {
+			return fail(err)
+		}
+		if err := d.sput.BindInt64(2, int64(s.segid)); err != nil {
+			return fail(err)
+		}
+		if err := d.sput.BindBlob(3, s.row); err != nil {
+			return fail(err)
+		}
+		if _, err := stepReset(d.sput); err != nil {
+			return fail(err)
+		}
+	}
+	for _, rt := range fs.roots {
+		if err := d.rput.BindBlob(1, d.keys[rt.ki]); err != nil {
+			return fail(err)
+		}
+		if err := d.rput.BindBlob(2, rt.row); err != nil {
+			return fail(err)
+		}
+		if _, err := stepReset(d.rput); err != nil {
+			return fail(err)
+		}
+	}
+	if err := d.hw1.BindInt64(1, fs.seq); err != nil {
+		return fail(err)
+	}
+	if _, err := stepReset(d.hw1); err != nil {
+		return fail(err)
+	}
+	return txn.Commit()
+}
+
+func (d *db) checkpoint() error {
+	return d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+}
+
+func (d *db) dataMB() float64 { return fileMB(d.path) }
+func (d *db) walMB() float64  { return fileMB(d.path + "-wal") }
 
 // fh is the field-space partitioning hash: FNV-1a folded through a
 // splitmix64 finalizer so short ascii field names still spread across
@@ -228,11 +375,13 @@ func (s *segment) find(f uint64, field []byte) (int, bool) {
 	return i, false
 }
 
-// store owns the resident hashes and the drain bookkeeping: dirty bytes
+// model owns the resident hashes and the drain bookkeeping: dirty bytes
 // against the engine threshold, logical and flushed bytes for WA, and
-// the modeled WAL bill under rules W2 and W4.
-type store struct {
-	d   *db
+// the modeled WAL bill under rules W2 and W4. The WAL bill is
+// arithmetic on both arms; only real flushes, checkpoints, and readback
+// probes go through the store seam.
+type model struct {
+	st  store
 	cfg config
 	hs  []*hash
 
@@ -250,8 +399,8 @@ type store struct {
 // hset inserts or replaces one field and bills the WAL model: the
 // touched segment's full post-image, plus both halves and the root
 // post-image when the write split the segment (fence change, rule W2).
-func (st *store) hset(ki int, field, value []byte) {
-	h := st.hs[ki]
+func (m *model) hset(ki int, field, value []byte) {
+	h := m.hs[ki]
 	f := fh(field)
 	s := h.seg(f)
 	i, found := s.find(f, field)
@@ -260,37 +409,37 @@ func (st *store) hset(ki int, field, value []byte) {
 		delta := len(value) - len(old.value)
 		s.size += delta
 		if s.dirty {
-			st.dirtyBytes += delta
+			m.dirtyBytes += delta
 		}
 		old.value = value
 	} else {
 		s.entries = slices.Insert(s.entries, i, entry{fh: f, field: field, value: value})
 		s.size += entrySize(s.entries[i])
 		if s.dirty {
-			st.dirtyBytes += entrySize(s.entries[i])
+			m.dirtyBytes += entrySize(s.entries[i])
 		}
 		h.count++
 		h.rootDirty = true // rule W1: cardinality change pins the root
 	}
 	if !s.dirty {
 		s.dirty = true
-		st.dirtyBytes += s.size
+		m.dirtyBytes += s.size
 	}
-	st.logical += int64(len(field) + len(value))
-	if s.size > st.cfg.segMax {
-		if ns := st.split(h, s); ns != nil {
-			st.walBytes += int64(s.size + ns.size + h.rootSize())
+	m.logical += int64(len(field) + len(value))
+	if s.size > m.cfg.segMax {
+		if ns := m.split(h, s); ns != nil {
+			m.walBytes += int64(s.size + ns.size + h.rootSize())
 			return
 		}
 	}
-	st.walBytes += int64(s.size)
+	m.walBytes += int64(s.size)
 }
 
 // split cuts s at its entry-median fh, keeps the lower half in place,
 // and fences in a new segment for the upper half. A run of identical fh
 // values at the median cannot split, which a 64-bit fh never produces in
 // practice; the guard just refuses rather than corrupt the fence.
-func (st *store) split(h *hash, s *segment) *segment {
+func (m *model) split(h *hash, s *segment) *segment {
 	mid := len(s.entries) / 2
 	newLo := s.entries[mid].fh
 	for mid > 0 && s.entries[mid-1].fh == newLo {
@@ -315,13 +464,13 @@ func (st *store) split(h *hash, s *segment) *segment {
 	h.rootDirty = true
 	// The dirty pool held s at its pre-split size; the split only adds
 	// one new segment header on top of the same entry bytes.
-	st.dirtyBytes += segHdrSize
-	st.splits++
+	m.dirtyBytes += segHdrSize
+	m.splits++
 	return ns
 }
 
-func (st *store) hget(ki int, field []byte) []byte {
-	h := st.hs[ki]
+func (m *model) hget(ki int, field []byte) []byte {
+	h := m.hs[ki]
 	f := fh(field)
 	s := h.seg(f)
 	if i, found := s.find(f, field); found {
@@ -365,96 +514,52 @@ func encodeRoot(h *hash) []byte {
 	return buf
 }
 
-// flush drains every dirty segment and root in one transaction, moving
+// flush drains every dirty segment and root in one write set, moving
 // the high-water mark with the batch; the root drains whenever dirty
 // (count or fence changed) per rule W1, coalesced to one write per
-// drain per rule W4.
-func (st *store) flush() error {
+// drain per rule W4. Encoding stays inside the timed window because
+// the production drain pays it too.
+func (m *model) flush() error {
 	t0 := time.Now()
-	any := false
-	var txn sqlite3.Txn
-	for _, h := range st.hs {
+	fs := flushSet{seq: m.seq + 1}
+	for ki, h := range m.hs {
+		// Preload flushes can fire before the later hashes exist.
+		if h == nil {
+			continue
+		}
 		for _, s := range h.segs {
 			if !s.dirty {
 				continue
 			}
-			if !any {
-				var err error
-				if txn, err = st.d.conn.BeginImmediate(); err != nil {
-					return err
-				}
-				any = true
-			}
 			row := encodeSeg(s)
-			if err := st.d.sput.BindBlob(1, h.key); err != nil {
-				txn.Rollback()
-				return err
-			}
-			if err := st.d.sput.BindInt64(2, int64(s.id)); err != nil {
-				txn.Rollback()
-				return err
-			}
-			if err := st.d.sput.BindBlob(3, row); err != nil {
-				txn.Rollback()
-				return err
-			}
-			if _, err := stepReset(st.d.sput); err != nil {
-				txn.Rollback()
-				return err
-			}
-			st.flushed += int64(len(row))
+			fs.segs = append(fs.segs, segRow{ki: ki, segid: s.id, row: row})
+			m.flushed += int64(len(row))
 			s.dirty = false
 		}
 		if h.rootDirty {
-			if !any {
-				var err error
-				if txn, err = st.d.conn.BeginImmediate(); err != nil {
-					return err
-				}
-				any = true
-			}
 			row := encodeRoot(h)
-			if err := st.d.rput.BindBlob(1, h.key); err != nil {
-				txn.Rollback()
-				return err
-			}
-			if err := st.d.rput.BindBlob(2, row); err != nil {
-				txn.Rollback()
-				return err
-			}
-			if _, err := stepReset(st.d.rput); err != nil {
-				txn.Rollback()
-				return err
-			}
-			st.flushed += int64(len(row))
+			fs.roots = append(fs.roots, rootRow{ki: ki, row: row})
+			m.flushed += int64(len(row))
 			h.rootDirty = false
 		}
 	}
-	if !any {
+	if len(fs.segs) == 0 && len(fs.roots) == 0 {
 		return nil
 	}
-	st.seq++
-	if err := st.d.hw1.BindInt64(1, st.seq); err != nil {
-		txn.Rollback()
+	if err := m.st.flush(&fs); err != nil {
 		return err
 	}
-	if _, err := stepReset(st.d.hw1); err != nil {
-		txn.Rollback()
-		return err
+	m.seq++
+	m.dirtyBytes = 0
+	if wm := m.st.walMB(); wm > m.walMaxMB {
+		m.walMaxMB = wm
 	}
-	if err := txn.Commit(); err != nil {
-		return err
-	}
-	st.dirtyBytes = 0
-	if wm := fileMB(st.d.path + "-wal"); wm > st.walMaxMB {
-		st.walMaxMB = wm
-	}
-	if st.flushes++; st.flushes%st.cfg.ckpt == 0 {
-		if err := st.d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+	if m.flushes++; m.flushes%m.cfg.ckpt == 0 {
+		if err := m.st.checkpoint(); err != nil {
 			return err
 		}
 	}
-	st.flushDur = append(st.flushDur, time.Since(t0))
+	m.flushDur = append(m.flushDur, time.Since(t0))
 	return nil
 }
 
@@ -477,6 +582,7 @@ func main() {
 	var cfg config
 	quick := flag.Bool("quick", false, "shrink counts for smoke runs")
 	flag.StringVar(&cfg.dir, "dir", "", "working directory (default: a temp dir)")
+	flag.StringVar(&cfg.store, "store", "a", "backend arm: a (SQLite rows) or b (Track B records)")
 	flag.IntVar(&cfg.segMax, "seg", 4032, "encoded segment split threshold in bytes")
 	flag.StringVar(&cfg.fdist, "fdist", "med", "field size distribution: small, med, large")
 	flag.IntVar(&cfg.setpct, "setpct", 50, "HSET percentage of the mix (rest HGET)")
@@ -522,18 +628,22 @@ func runAll(cfg config, out io.Writer) error {
 		defer os.RemoveAll(dir)
 		cfg.dir = dir
 	}
-	path := filepath.Join(cfg.dir, fmt.Sprintf("hseg-s%d-%s.db", cfg.segMax, cfg.fdist))
-	os.Remove(path)
-	os.Remove(path + "-wal")
-	os.Remove(path + "-shm")
+	path := filepath.Join(cfg.dir, fmt.Sprintf("hseg-%s-s%d-%s.db", cfg.store, cfg.segMax, cfg.fdist))
+	for _, p := range []string{path, path + "-wal", path + "-shm", path + ".aki-wal"} {
+		os.Remove(p)
+	}
 
-	d, err := openDB(path)
+	keys := make([][]byte, cfg.keys)
+	for i := range keys {
+		keys[i] = fmt.Appendf(nil, "h:%04d", i)
+	}
+	st, err := openStore(cfg, path, keys)
 	if err != nil {
 		return err
 	}
-	defer d.close()
+	defer st.close()
 
-	st := &store{d: d, cfg: cfg, hs: make([]*hash, cfg.keys)}
+	m := &model{st: st, cfg: cfg, hs: make([]*hash, cfg.keys)}
 	fields := make([][][]byte, cfg.keys)
 	rng := rand.New(rand.NewSource(43))
 	fmin, fmax, vmin, vmax := fieldSizes(cfg.fdist)
@@ -549,8 +659,8 @@ func runAll(cfg config, out io.Writer) error {
 	// the way slice 2 will do them; the measured mix then overwrites in
 	// place, which is the steady state the sweep prices.
 	start := time.Now()
-	for ki := range st.hs {
-		st.hs[ki] = newHash(fmt.Appendf(nil, "h:%04d", ki))
+	for ki := range m.hs {
+		m.hs[ki] = newHash(keys[ki])
 		fields[ki] = make([][]byte, cfg.fields)
 		for i := range fields[ki] {
 			name := fmt.Appendf(nil, "f%04d:%08d:", ki, i)
@@ -558,30 +668,30 @@ func runAll(cfg config, out io.Writer) error {
 				name = append(name, byte('a'+rng.Intn(26)))
 			}
 			fields[ki][i] = name
-			st.hset(ki, name, newValue())
-			if st.dirtyBytes >= cfg.threshold {
-				if err := st.flush(); err != nil {
+			m.hset(ki, name, newValue())
+			if m.dirtyBytes >= cfg.threshold {
+				if err := m.flush(); err != nil {
 					return err
 				}
 			}
 		}
 	}
-	if err := st.flush(); err != nil {
+	if err := m.flush(); err != nil {
 		return err
 	}
-	if err := d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+	if err := st.checkpoint(); err != nil {
 		return err
 	}
 	segCount := 0
-	for _, h := range st.hs {
+	for _, h := range m.hs {
 		segCount += len(h.segs)
 	}
 	fmt.Fprintf(os.Stderr, "hseg: preload %d splits, %d segments, %.1f fields/segment\n",
-		st.splits, segCount, float64(cfg.keys*cfg.fields)/float64(segCount))
+		m.splits, segCount, float64(cfg.keys*cfg.fields)/float64(segCount))
 	emit(cfg, out, row{workload: "load", ops: cfg.keys * cfg.fields,
-		dur: time.Since(start), fileMB: fileMB(path)})
-	st.logical, st.flushed, st.walBytes, st.splits = 0, 0, 0, 0
-	st.flushDur, st.walMaxMB = nil, 0
+		dur: time.Since(start), fileMB: st.dataMB()})
+	m.logical, m.flushed, m.walBytes, m.splits = 0, 0, 0, 0
+	m.flushDur, m.walMaxMB = nil, 0
 
 	// The measured mix: HSET and HGET per setpct over the preloaded
 	// field universe, per-op cost timed into its class, the flush row
@@ -596,13 +706,13 @@ func runAll(cfg config, out io.Writer) error {
 		if rng.Intn(100) < cfg.setpct {
 			v := newValue()
 			t0 := time.Now()
-			st.hset(ki, field, v)
+			m.hset(ki, field, v)
 			wLat = append(wLat, time.Since(t0))
 			wDur += wLat[len(wLat)-1]
 			writes++
 		} else {
 			t0 := time.Now()
-			v := st.hget(ki, field)
+			v := m.hget(ki, field)
 			lat := time.Since(t0)
 			if v == nil {
 				return fmt.Errorf("hget missed a preloaded field %q", field)
@@ -611,22 +721,22 @@ func runAll(cfg config, out io.Writer) error {
 			rDur += lat
 			reads++
 		}
-		if st.dirtyBytes >= cfg.threshold {
-			if err := st.flush(); err != nil {
+		if m.dirtyBytes >= cfg.threshold {
+			if err := m.flush(); err != nil {
 				return err
 			}
 		}
 	}
-	if err := st.flush(); err != nil {
+	if err := m.flush(); err != nil {
 		return err
 	}
 
 	wa, walPerOp := 0.0, 0.0
-	if st.logical > 0 {
-		wa = float64(st.flushed) / float64(st.logical)
+	if m.logical > 0 {
+		wa = float64(m.flushed) / float64(m.logical)
 	}
 	if writes > 0 {
-		walPerOp = float64(st.walBytes) / float64(writes)
+		walPerOp = float64(m.walBytes) / float64(writes)
 	}
 	p50, p99, maxLat := percentiles(wLat)
 	emit(cfg, out, row{workload: "hset", ops: writes, dur: wDur,
@@ -635,14 +745,14 @@ func runAll(cfg config, out io.Writer) error {
 	emit(cfg, out, row{workload: "hget", ops: reads, dur: rDur,
 		p50: p50, p99: p99, maxLat: maxLat})
 	var fTotal, fWorst time.Duration
-	for _, fd := range st.flushDur {
+	for _, fd := range m.flushDur {
 		fTotal += fd
 		if fd > fWorst {
 			fWorst = fd
 		}
 	}
-	emit(cfg, out, row{workload: "flush", ops: len(st.flushDur), dur: fTotal,
-		maxLat: fWorst, fileMB: fileMB(path), walMB: st.walMaxMB, vmhwmMB: vmhwmMB()})
+	emit(cfg, out, row{workload: "flush", ops: len(m.flushDur), dur: fTotal,
+		maxLat: fWorst, fileMB: st.dataMB(), walMB: m.walMaxMB, vmhwmMB: vmhwmMB()})
 	return nil
 }
 
@@ -698,8 +808,8 @@ func vmhwmMB() float64 {
 func emit(cfg config, out io.Writer, r row) {
 	nsPerOp := float64(r.dur.Nanoseconds()) / float64(max(r.ops, 1))
 	opsPerS := float64(r.ops) / max(r.dur.Seconds(), 1e-9)
-	fmt.Fprintf(out, "%d,%s,%d,%s,%d,%d,%s,%d,%.0f,%.0f,%d,%d,%d,%.1f,%.0f,%.1f,%.1f,%.1f\n",
-		cfg.segMax, cfg.fdist, cfg.setpct, cfg.dist, cfg.keys, cfg.fields,
+	fmt.Fprintf(out, "%s,%d,%s,%d,%s,%d,%d,%s,%d,%.0f,%.0f,%d,%d,%d,%.1f,%.0f,%.1f,%.1f,%.1f\n",
+		cfg.store, cfg.segMax, cfg.fdist, cfg.setpct, cfg.dist, cfg.keys, cfg.fields,
 		r.workload, r.ops, nsPerOp, opsPerS,
 		r.p50.Nanoseconds(), r.p99.Nanoseconds(), r.maxLat.Nanoseconds(),
 		r.wa, r.walPerOp, r.fileMB, r.walMB, r.vmhwmMB)
