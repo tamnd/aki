@@ -127,20 +127,50 @@ func (t *HotTable) Len() int {
 	return t.live
 }
 
+// expired reports whether hd's key is past its coarse expiry. This is
+// the hot-tier layer of lazy expiry (E-I1): an expired key is invisible
+// from its tick regardless of reaper progress, and the record-exact
+// expire_ms check arrives with the record format milestone.
+func (t *HotTable) expired(hd *hdr) bool {
+	return hd.expireLo != 0 && hd.expireLo <= t.tick
+}
+
 // Get returns the value for key, aliasing the arena until the next write.
 // A dirty tombstone is a miss: the key is gone, its header just has not
-// drained yet.
+// drained yet. An expired key is a miss too; the wheel reaps it later.
 func (t *HotTable) Get(key []byte) ([]byte, bool) {
 	s, ok := t.lookup(maphash.Bytes(t.seed, key), key)
 	if !ok {
 		return nil, false
 	}
 	hd := &t.hdrs[s]
-	if hd.valRef == 0 {
+	if hd.valRef == 0 || t.expired(hd) {
 		return nil, false
 	}
 	t.touchRead(hd)
 	return t.vals.data(hd.valRef), true
+}
+
+// setExpire stamps the coarse expiry projection on key's header; at 0
+// is PERSIST. It reports the slot for wheel filing, whether the stamp
+// changed (an unchanged stamp must not file a duplicate entry), and
+// whether the key was there to stamp: tombstones and expired-unreaped
+// keys are already gone. The WAL frame for expiry edits arrives with
+// the WAL slice; this is the RAM projection only.
+func (t *HotTable) setExpire(key []byte, at uint32) (slot uint32, changed, ok bool) {
+	s, ok := t.lookup(maphash.Bytes(t.seed, key), key)
+	if !ok {
+		return 0, false, false
+	}
+	hd := &t.hdrs[s]
+	if hd.valRef == 0 || t.expired(hd) {
+		return 0, false, false
+	}
+	if hd.expireLo == at {
+		return s, false, true
+	}
+	hd.expireLo = at
+	return s, true, true
 }
 
 // Put inserts or overwrites key and marks it dirty. It reports false
@@ -154,6 +184,13 @@ func (t *HotTable) Put(key, val []byte, tag uint8) bool {
 	h := maphash.Bytes(t.seed, key)
 	if s, ok := t.lookup(h, key); ok {
 		hd := &t.hdrs[s]
+		if hd.valRef != 0 && t.expired(hd) {
+			// The old life is over and this write starts a new one, so
+			// the dead expiry must not ride along. A live key's expiry
+			// survives writes; command-level rules like SET clearing the
+			// TTL belong to the command layer.
+			hd.expireLo = 0
+		}
 		switch hd.valRef {
 		case 0:
 			// Reviving a tombstone: the header never left, so this is
@@ -266,6 +303,7 @@ func (t *HotTable) Del(key []byte) bool {
 	}
 	t.vals.release(hd.valRef)
 	hd.valRef = 0
+	hd.expireLo = 0
 	hd.state = stateDirty
 	t.touchWrite(hd)
 	t.enqueueDirty(s)
