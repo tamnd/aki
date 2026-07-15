@@ -21,6 +21,22 @@ if [ -n "$bad" ]; then
 	exit 1
 fi
 
+# The A1 driver freeze (results/sqlo1/drivershoot.md): sqlo1a speaks the
+# ncruces native API and nothing else. database/sql must stay out of the
+# sqlo1 import graphs, and the losing drivers must stay out of the module.
+frozen=$(go list -deps ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv ./cmd/sqlo1crash |
+	grep -E '^database/sql($|/)|^modernc\.org/|^zombiezen\.com/' || true)
+if [ -n "$frozen" ]; then
+	echo "the sqlo1 driver freeze forbids these imports (see results/sqlo1/drivershoot.md):"
+	echo "$frozen"
+	exit 1
+fi
+if grep -Eq 'modernc\.org/sqlite|zombiezen\.com' go.mod; then
+	echo "the losing drivershoot drivers must not enter the module graph:"
+	grep -E 'modernc\.org/sqlite|zombiezen\.com' go.mod
+	exit 1
+fi
+
 dirs=$(find engine/sqlo1 engine/sqlo1a engine/sqlo1b cmd/sqlo1srv cmd/sqlo1crash labs/sqlo1 -type d -name internal)
 if [ -n "$dirs" ]; then
 	echo "internal/ directories are not allowed in the sqlo1 trees:"
