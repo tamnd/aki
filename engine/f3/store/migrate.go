@@ -91,10 +91,12 @@ func (s *Store) migratePass(want uint64) int {
 
 // migrateBucket demotes every eligible resident record in one bucket, adding
 // each record's arena bytes to moved, and reports the count. A cold or
-// non-demotable entry is skipped. Unlike the residency hand this pass has no
-// second-chance bit: the whole-record tier is the last-resort valve, so a
-// record it reaches under pressure goes cold rather than earning a reprieve;
-// the write bring-up returns any record that turns hot again to the arena.
+// non-demotable entry is skipped. The hand runs the SIEVE second chance the
+// demotion-policy lab settled (labs/f3/m7/03, doc 06 section 4.2): a demotable
+// record whose index-word visited bit is set survives one pass with the bit
+// cleared, so a read-hot write-cold record is not sunk to then pay a pread per
+// read; an unvisited record sinks. The bit is set by reads (touchSlot) and
+// re-earned after a demote, so a record must be read again to keep its reprieve.
 func (s *Store) migrateBucket(b *bucket, scanned, moved *uint64) int {
 	n := 0
 	for i := 0; i < slotsPerBucket; i++ {
@@ -107,6 +109,10 @@ func (s *Store) migrateBucket(b *bucket, scanned, moved *uint64) int {
 		if !s.demotable(addr) {
 			continue
 		}
+		if slotVisited(w) {
+			b.slots[i] = clearHeat(w) // second chance, re-earned by the next read
+			continue
+		}
 		rb := s.recBytes(addr)
 		if s.demoteAt(&b.slots[i], w) {
 			n++
@@ -114,4 +120,16 @@ func (s *Store) migrateBucket(b *bucket, scanned, moved *uint64) int {
 		}
 	}
 	return n
+}
+
+// touchSlot sets the index-word visited bit on a resident read, the SIEVE mark
+// the whole-record migrator (migrateBucket, stageBucket) honors. It is gated on
+// ltmOn so a store with no cold tier engaged never dirties the index word, the L9
+// no-pressure contract: with LTM off this is one bool load. Check-then-set so a
+// hot slot's cache line is not re-dirtied on every read, mirroring touchResident.
+// Owner-only, called from the read path with the slot the probe already resolved.
+func (s *Store) touchSlot(slot *uint64) {
+	if s.ltmOn && !slotVisited(*slot) {
+		*slot |= heatVisited
+	}
 }

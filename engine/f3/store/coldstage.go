@@ -257,6 +257,10 @@ func (s *Store) stageBucket(b *bucket, d *coldDrain, scanned, moved *uint64) {
 		if !s.demotable(addr) {
 			continue
 		}
+		if slotVisited(w) {
+			b.slots[i] = clearHeat(w) // SIEVE second chance, mirrors migrateBucket
+			continue
+		}
 		*moved += s.recBytes(addr)
 		s.stageRecord(d, addr)
 	}
@@ -315,10 +319,13 @@ func (s *Store) CompleteColdDrain(d *coldDrain, ok bool) int {
 			continue
 		}
 		// Still the staged record, unchanged, and its frame is on disk: flip the
-		// slot to the cold offset in place, keeping tag and heat, and charge the
-		// arena bytes dead. The mark rode along in the record's flags, not the
-		// frame, so the band census reads the clean flags.
-		w := *slot
+		// slot to the cold offset in place, keeping the tag, clearing the heat, and
+		// charge the arena bytes dead. Heat clears because a cold entry carries
+		// doorkeeper state, not a visited bit, and a bring-up re-earns it; a read
+		// that raced the drain and set the bit is spent here, not carried cold. The
+		// mark rode along in the record's flags, not the frame, so the band census
+		// reads the clean flags.
+		w := clearHeat(*slot)
 		*slot = (w &^ (addrMask | tierMask<<tierShift)) | tierCold<<tierShift | f.coldOff
 		s.noteDrop(s.recFlags(addr) &^ flagMigrating)
 		s.coldRecs++

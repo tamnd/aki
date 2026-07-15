@@ -213,6 +213,7 @@ func (s *Store) GetString(key []byte, now int64, dst []byte) ([]byte, bool) {
 		// (the promotion doorkeeper on cold reads is a later slice).
 		return s.coldRead(addr, dst)
 	}
+	s.touchSlot(slot)
 	return s.readValue(addr, dst)
 }
 
@@ -275,6 +276,7 @@ func (s *Store) StrLen(key []byte, now int64) (int64, bool) {
 	if slotCold(*slot) {
 		return int64(s.coldVlen(addr)), true
 	}
+	s.touchSlot(slot)
 	return int64(s.vlen(addr)), true
 }
 

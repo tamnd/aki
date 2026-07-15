@@ -154,9 +154,10 @@ func (s *Store) demoteAt(slot *uint64, w uint64) bool {
 	if err != nil {
 		return false
 	}
-	// Keep tag and heat, clear the address and tier fields, set tier cold and
-	// the cold-region offset.
-	*slot = (w &^ (addrMask | tierMask<<tierShift)) | tierCold<<tierShift | off
+	// Keep the tag, clear the address, tier, and heat fields, set tier cold and
+	// the cold-region offset. Heat clears because a cold entry carries doorkeeper
+	// state, not a visited bit, and a later bring-up re-earns its heat.
+	*slot = (w &^ (addrMask | tierMask<<tierShift | heatMask<<heatShift)) | tierCold<<tierShift | off
 	s.noteDrop(s.recFlags(addr))
 	s.coldRecs++
 	s.arena.unlink(addr, s.recBytes(addr))
