@@ -15,6 +15,16 @@
 // the leaf-local prefix. The -layout flag builds the same store both ways
 // and the delta tells T1 slice 7 whether the shipped schema needs pc
 // moved ahead of the blob.
+//
+// B3 re-points the suite at Track B: the same count paths drive either
+// arm through a narrow store surface, selected by -store. The A arm is
+// the SQLite schema above; the B arm (store_b.go) maps chunks to
+// segment subkey records under a minted rooth and keeps the popcount
+// in the doc 05 section 3.2 kind 2 cache segments written in the same
+// DrainBatch, so cache mode reads cache segments plus edge chunks and
+// scan mode reads every chunk record. Column order is a SQLite
+// question, so -store b accepts only the default layout, and one sweep
+// prices the cache on the backend that will actually carry it.
 package main
 
 import (
@@ -67,6 +77,7 @@ INSERT OR IGNORE INTO meta (id, hw) VALUES (0, 0);`
 
 type config struct {
 	dir     string
+	store   string
 	chunk   int
 	layout  string
 	sizeMB  int
@@ -74,9 +85,52 @@ type config struct {
 	hotReps int
 }
 
+// store is the backend arm under the count paths: Track A rows or
+// Track B records, one narrow surface so the shared model prices both.
+// chunkGet feeds the edge reads, sumPC is the cache-mode interior read
+// over chunks [c0, c1] inclusive, scanChunks visits every stored chunk
+// in cid order for scan mode (img is only valid during the visit),
+// flush lands one preload write set, and checkpoint is whatever the
+// arm's WAL trim verb is.
+type store interface {
+	chunkGet(cid int64) ([]byte, error)
+	sumPC(c0, c1 int64) (int64, error)
+	scanChunks(c0, c1 int64, visit func(cid int64, img []byte) error) error
+	flush(fs *flushSet) error
+	checkpoint() error
+	close() error
+}
+
+// flushSet is one preload batch as the model hands it down: chunk rows
+// with their pc and the high-water sequence that must land atomically
+// with them. The model advances seq by the chunk count per flush.
+type flushSet struct {
+	seq    int64
+	chunks []chunkRow
+}
+
+type chunkRow struct {
+	cid int64
+	row []byte
+	pc  int64
+}
+
+// openStore picks the arm; create matters only to the b arm, whose
+// open verb differs between a fresh file and a cold-rep reopen.
+func openStore(cfg config, path string, key []byte, create bool) (store, error) {
+	switch cfg.store {
+	case "a":
+		return openA(path, cfg.layout, key)
+	case "b":
+		return openB(path, create)
+	}
+	return nil, fmt.Errorf("unknown store arm %q", cfg.store)
+}
+
 type db struct {
 	conn  *sqlite3.Conn
 	path  string
+	key   []byte
 	cput  *sqlite3.Stmt
 	cget  *sqlite3.Stmt
 	sum1  *sqlite3.Stmt
@@ -85,7 +139,7 @@ type db struct {
 	stmts []*sqlite3.Stmt
 }
 
-func openDB(path, layout string) (*db, error) {
+func openA(path, layout string, key []byte) (*db, error) {
 	conn, err := sqlite3.Open(path)
 	if err != nil {
 		return nil, err
@@ -115,7 +169,7 @@ func openDB(path, layout string) (*db, error) {
 		conn.Close()
 		return nil, err
 	}
-	d := &db{conn: conn, path: path}
+	d := &db{conn: conn, path: path, key: key}
 	for _, s := range []struct {
 		dst **sqlite3.Stmt
 		sql string
@@ -153,8 +207,8 @@ func stepReset(s *sqlite3.Stmt) (found bool, err error) {
 	return found, err
 }
 
-func (d *db) chunkGet(key []byte, cid int64) ([]byte, error) {
-	if err := d.cget.BindBlob(1, key); err != nil {
+func (d *db) chunkGet(cid int64) ([]byte, error) {
+	if err := d.cget.BindBlob(1, d.key); err != nil {
 		return nil, err
 	}
 	if err := d.cget.BindInt64(2, cid); err != nil {
@@ -171,13 +225,101 @@ func (d *db) chunkGet(key []byte, cid int64) ([]byte, error) {
 	return v, err
 }
 
-// cacheCount is the doc 05 shape: sum(pc) over interior chunks, the one
-// or two edge chunks read raw and popcounted over the addressed bytes.
-// The byte range is [b0, b1).
-func (d *db) cacheCount(key []byte, chunk int, b0, b1 int64) (int64, error) {
+// sumPC sums the pc column over chunks [c0, c1], the cache-mode
+// interior read.
+func (d *db) sumPC(c0, c1 int64) (int64, error) {
+	if err := d.sum1.BindBlob(1, d.key); err != nil {
+		return 0, err
+	}
+	if err := d.sum1.BindInt64(2, c0); err != nil {
+		return 0, err
+	}
+	if err := d.sum1.BindInt64(3, c1); err != nil {
+		return 0, err
+	}
+	var total int64
+	if d.sum1.Step() {
+		total = d.sum1.ColumnInt64(0)
+	}
+	err := d.sum1.Err()
+	if rerr := d.sum1.Reset(); err == nil {
+		err = rerr
+	}
+	return total, err
+}
+
+// scanChunks walks stored chunks [c0, c1] in cid order; img aliases the
+// statement's blob column and dies at Reset, so a visit must consume it
+// before returning.
+func (d *db) scanChunks(c0, c1 int64, visit func(cid int64, img []byte) error) error {
+	if err := d.scan1.BindBlob(1, d.key); err != nil {
+		return err
+	}
+	if err := d.scan1.BindInt64(2, c0); err != nil {
+		return err
+	}
+	if err := d.scan1.BindInt64(3, c1); err != nil {
+		return err
+	}
+	var verr error
+	for verr == nil && d.scan1.Step() {
+		verr = visit(d.scan1.ColumnInt64(0), d.scan1.ColumnBlob(1, nil))
+	}
+	err := d.scan1.Err()
+	if rerr := d.scan1.Reset(); err == nil {
+		err = rerr
+	}
+	if verr != nil {
+		return verr
+	}
+	return err
+}
+
+// flush is one preload transaction: chunk rows and the high-water row
+// committed together, the same shape a drain writes.
+func (d *db) flush(fs *flushSet) error {
+	txn, err := d.conn.BeginImmediate()
+	if err != nil {
+		return err
+	}
+	fail := func(err error) error { txn.Rollback(); return err }
+	for _, c := range fs.chunks {
+		if err := d.cput.BindBlob(1, d.key); err != nil {
+			return fail(err)
+		}
+		if err := d.cput.BindInt64(2, c.cid); err != nil {
+			return fail(err)
+		}
+		if err := d.cput.BindBlob(3, c.row); err != nil {
+			return fail(err)
+		}
+		if err := d.cput.BindInt64(4, c.pc); err != nil {
+			return fail(err)
+		}
+		if _, err := stepReset(d.cput); err != nil {
+			return fail(err)
+		}
+	}
+	if err := d.hw1.BindInt64(1, fs.seq); err != nil {
+		return fail(err)
+	}
+	if _, err := stepReset(d.hw1); err != nil {
+		return fail(err)
+	}
+	return txn.Commit()
+}
+
+func (d *db) checkpoint() error {
+	return d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+}
+
+// cacheCount is the doc 05 shape: the cache read over interior chunks,
+// the one or two edge chunks read raw and popcounted over the addressed
+// bytes. The byte range is [b0, b1).
+func cacheCount(st store, chunk int, b0, b1 int64) (int64, error) {
 	c0, c1 := b0/int64(chunk), (b1-1)/int64(chunk)
 	edge := func(cid, lo, hi int64) (int64, error) {
-		img, err := d.chunkGet(key, cid)
+		img, err := st.chunkGet(cid)
 		if err != nil {
 			return 0, err
 		}
@@ -201,46 +343,21 @@ func (d *db) cacheCount(key []byte, chunk int, b0, b1 int64) (int64, error) {
 	}
 	total += last
 	if c0+1 <= c1-1 {
-		if err := d.sum1.BindBlob(1, key); err != nil {
-			return 0, err
-		}
-		if err := d.sum1.BindInt64(2, c0+1); err != nil {
-			return 0, err
-		}
-		if err := d.sum1.BindInt64(3, c1-1); err != nil {
-			return 0, err
-		}
-		if d.sum1.Step() {
-			total += d.sum1.ColumnInt64(0)
-		}
-		err := d.sum1.Err()
-		if rerr := d.sum1.Reset(); err == nil {
-			err = rerr
-		}
+		interior, err := st.sumPC(c0+1, c1-1)
 		if err != nil {
 			return 0, err
 		}
+		total += interior
 	}
 	return total, nil
 }
 
-// scanCount is the cache-off arm: every overlapping chunk blob read and
+// scanCount is the cache-off arm: every overlapping chunk read and
 // popcounted, edges trimmed to the addressed bytes.
-func (d *db) scanCount(key []byte, chunk int, b0, b1 int64) (int64, error) {
+func scanCount(st store, chunk int, b0, b1 int64) (int64, error) {
 	c0, c1 := b0/int64(chunk), (b1-1)/int64(chunk)
-	if err := d.scan1.BindBlob(1, key); err != nil {
-		return 0, err
-	}
-	if err := d.scan1.BindInt64(2, c0); err != nil {
-		return 0, err
-	}
-	if err := d.scan1.BindInt64(3, c1); err != nil {
-		return 0, err
-	}
 	var total int64
-	for d.scan1.Step() {
-		cid := d.scan1.ColumnInt64(0)
-		img := d.scan1.ColumnBlob(1, nil)
+	err := st.scanChunks(c0, c1, func(cid int64, img []byte) error {
 		lo, hi := int64(0), int64(len(img))
 		if cid == c0 {
 			lo = min(b0-c0*int64(chunk), hi)
@@ -251,11 +368,8 @@ func (d *db) scanCount(key []byte, chunk int, b0, b1 int64) (int64, error) {
 		if lo < hi {
 			total += int64(popcount(img[lo:hi]))
 		}
-	}
-	err := d.scan1.Err()
-	if rerr := d.scan1.Reset(); err == nil {
-		err = rerr
-	}
+		return nil
+	})
 	return total, err
 }
 
@@ -276,6 +390,7 @@ func main() {
 	quick := flag.Bool("quick", false, "shrink counts for smoke runs")
 	chunkKiB := flag.Int("chunk", 32, "rope chunk size in KiB")
 	flag.StringVar(&cfg.dir, "dir", "", "working directory (default: a temp dir)")
+	flag.StringVar(&cfg.store, "store", "a", "backend arm: a (SQLite rows) or b (Track B records)")
 	flag.StringVar(&cfg.layout, "layout", "pclast", "chunk column order: pclast (shipped schema) or pcfirst")
 	flag.IntVar(&cfg.sizeMB, "size", 128, "bitmap size in MiB")
 	flag.IntVar(&cfg.reps, "reps", 5, "cold reps per cell (each behind a fresh open)")
@@ -287,6 +402,10 @@ func main() {
 	}
 	if cfg.layout != "pclast" && cfg.layout != "pcfirst" {
 		fmt.Fprintln(os.Stderr, "bitcount: -layout must be pclast or pcfirst")
+		os.Exit(1)
+	}
+	if cfg.store == "b" && cfg.layout != "pclast" {
+		fmt.Fprintln(os.Stderr, "bitcount: -layout is a SQLite column-order question; -store b runs the default pclast only")
 		os.Exit(1)
 	}
 	if err := runAll(cfg, os.Stdout); err != nil {
@@ -314,77 +433,57 @@ func runAll(cfg config, out io.Writer) error {
 		defer os.RemoveAll(dir)
 		cfg.dir = dir
 	}
-	path := filepath.Join(cfg.dir, fmt.Sprintf("bitcount-%s-%dmb.db", cfg.layout, cfg.sizeMB))
-	os.Remove(path)
-	os.Remove(path + "-wal")
-	os.Remove(path + "-shm")
+	path := filepath.Join(cfg.dir, fmt.Sprintf("bitcount-%s-%s-%dmb.db", cfg.store, cfg.layout, cfg.sizeMB))
+	for _, p := range []string{path, path + "-wal", path + "-shm", path + ".aki-wal"} {
+		os.Remove(p)
+	}
 
-	d, err := openDB(path, cfg.layout)
+	key := []byte("b:0000")
+	st, err := openStore(cfg, path, key, true)
 	if err != nil {
 		return err
 	}
-	key := []byte("b:0000")
 	size := int64(cfg.sizeMB) << 20
 	nChunks := size / int64(cfg.chunk)
 
 	// Preload: random bytes so popcounts are unpredictable, pc computed
-	// per chunk exactly as a drain would, batched transactions, one
+	// per chunk exactly as a drain would, batched write sets, one
 	// checkpoint at the end so the measured file is the settled shape.
 	start := time.Now()
 	rng := rand.New(rand.NewSource(41))
-	img := make([]byte, cfg.chunk)
 	var expected int64
 	const batch = 512
 	batches := 0
 	for cid := int64(0); cid < nChunks; {
-		txn, err := d.conn.BeginImmediate()
-		if err != nil {
-			return err
-		}
-		fail := func(err error) error { txn.Rollback(); return err }
+		fs := flushSet{}
 		for range batch {
 			if cid >= nChunks {
 				break
 			}
-			rng.Read(img)
-			pc := int64(popcount(img))
+			row := make([]byte, cfg.chunk)
+			rng.Read(row)
+			pc := int64(popcount(row))
 			expected += pc
-			if err := d.cput.BindBlob(1, key); err != nil {
-				return fail(err)
-			}
-			if err := d.cput.BindInt64(2, cid); err != nil {
-				return fail(err)
-			}
-			if err := d.cput.BindBlob(3, img); err != nil {
-				return fail(err)
-			}
-			if err := d.cput.BindInt64(4, pc); err != nil {
-				return fail(err)
-			}
-			if _, err := stepReset(d.cput); err != nil {
-				return fail(err)
-			}
+			fs.chunks = append(fs.chunks, chunkRow{cid: cid, row: row, pc: pc})
 			cid++
 		}
-		if err := d.hw1.BindInt64(1, cid); err != nil {
-			return fail(err)
-		}
-		if _, err := stepReset(d.hw1); err != nil {
-			return fail(err)
-		}
-		if err := txn.Commit(); err != nil {
+		fs.seq = cid
+		if err := st.flush(&fs); err != nil {
+			st.close()
 			return err
 		}
 		if batches++; batches%8 == 0 {
-			if err := d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			if err := st.checkpoint(); err != nil {
+				st.close()
 				return err
 			}
 		}
 	}
-	if err := d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+	if err := st.checkpoint(); err != nil {
+		st.close()
 		return err
 	}
-	if err := d.close(); err != nil {
+	if err := st.close(); err != nil {
 		return err
 	}
 	emit(cfg, out, row{workload: "load", ops: int(nChunks), dur: time.Since(start),
@@ -402,37 +501,40 @@ func runAll(cfg config, out io.Writer) error {
 	}
 	arms := []struct {
 		name  string
-		count func(*db, int64, int64) (int64, error)
+		count func(store, int64, int64) (int64, error)
 	}{
-		{"cache", func(d *db, b0, b1 int64) (int64, error) { return d.cacheCount(key, cfg.chunk, b0, b1) }},
-		{"scan", func(d *db, b0, b1 int64) (int64, error) { return d.scanCount(key, cfg.chunk, b0, b1) }},
+		{"cache", func(st store, b0, b1 int64) (int64, error) { return cacheCount(st, cfg.chunk, b0, b1) }},
+		{"scan", func(st store, b0, b1 int64) (int64, error) { return scanCount(st, cfg.chunk, b0, b1) }},
 	}
 
 	answers := map[string]int64{}
 	for _, shape := range shapes {
 		for _, arm := range arms {
-			// Cold: every rep behind a fresh open, so the SQLite page
-			// cache starts empty (the OS cache caveat from apragma
-			// applies; cross-arm ratios are the read).
+			// Cold: every rep behind a fresh open. On arm a that empties
+			// the SQLite page cache (the apragma OS-cache caveat applies;
+			// cross-arm ratios are the read). On arm b the store was
+			// closed after the load checkpoint, so each reopen rebuilds
+			// its state from the settled file instead of reading the
+			// writer's dirty RAM, the closest honest analog.
 			var lats []time.Duration
 			var total time.Duration
 			for range cfg.reps {
-				d, err := openDB(path, cfg.layout)
+				st, err := openStore(cfg, path, key, false)
 				if err != nil {
 					return err
 				}
 				t0 := time.Now()
-				got, err := arm.count(d, shape.b0, shape.b1)
+				got, err := arm.count(st, shape.b0, shape.b1)
 				lat := time.Since(t0)
 				if err != nil {
-					d.close()
+					st.close()
 					return fmt.Errorf("%s-%s cold: %w", shape.name, arm.name, err)
 				}
 				if err := checkAnswer(answers, shape.name, arm.name, got, expected); err != nil {
-					d.close()
+					st.close()
 					return err
 				}
-				if err := d.close(); err != nil {
+				if err := st.close(); err != nil {
 					return err
 				}
 				lats = append(lats, lat)
@@ -442,32 +544,32 @@ func runAll(cfg config, out io.Writer) error {
 			emit(cfg, out, row{workload: shape.name + "-" + arm.name + "-cold", ops: cfg.reps,
 				dur: total, p50: p50, p99: p99, maxLat: maxLat, fileMB: fileMB(path)})
 
-			// Hot: one connection, one warm pass, then the timed reps.
-			d, err := openDB(path, cfg.layout)
+			// Hot: one open store, one warm pass, then the timed reps.
+			st, err := openStore(cfg, path, key, false)
 			if err != nil {
 				return err
 			}
-			if _, err := arm.count(d, shape.b0, shape.b1); err != nil {
-				d.close()
+			if _, err := arm.count(st, shape.b0, shape.b1); err != nil {
+				st.close()
 				return err
 			}
 			lats, total = nil, 0
 			for range cfg.hotReps {
 				t0 := time.Now()
-				got, err := arm.count(d, shape.b0, shape.b1)
+				got, err := arm.count(st, shape.b0, shape.b1)
 				lat := time.Since(t0)
 				if err != nil {
-					d.close()
+					st.close()
 					return fmt.Errorf("%s-%s hot: %w", shape.name, arm.name, err)
 				}
 				if err := checkAnswer(answers, shape.name, arm.name, got, expected); err != nil {
-					d.close()
+					st.close()
 					return err
 				}
 				lats = append(lats, lat)
 				total += lat
 			}
-			if err := d.close(); err != nil {
+			if err := st.close(); err != nil {
 				return err
 			}
 			p50, p99, maxLat = percentiles(lats)
@@ -535,8 +637,8 @@ func vmhwmMB() float64 {
 func emit(cfg config, out io.Writer, r row) {
 	nsPerOp := float64(r.dur.Nanoseconds()) / float64(max(r.ops, 1))
 	opsPerS := float64(r.ops) / max(r.dur.Seconds(), 1e-9)
-	fmt.Fprintf(out, "%d,%s,%d,%s,%d,%.0f,%.0f,%d,%d,%d,%.1f,%.1f\n",
-		cfg.chunk>>10, cfg.layout, cfg.sizeMB,
+	fmt.Fprintf(out, "%s,%d,%s,%d,%s,%d,%.0f,%.0f,%d,%d,%d,%.1f,%.1f\n",
+		cfg.store, cfg.chunk>>10, cfg.layout, cfg.sizeMB,
 		r.workload, r.ops, nsPerOp, opsPerS,
 		r.p50.Nanoseconds(), r.p99.Nanoseconds(), r.maxLat.Nanoseconds(),
 		r.fileMB, r.vmhwmMB)
