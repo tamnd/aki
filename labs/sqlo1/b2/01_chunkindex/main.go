@@ -41,7 +41,7 @@ import (
 )
 
 // Chunk geometry under test (doc 03 section 8.2): 8 header bytes plus
-// 42 entries of 12 bytes is exactly 512, four chunks to a group. A
+// 42 entries of 12 bytes is exactly 512, eight chunks to a group. A
 // chained chunk gives its last entry slot to the overflow pointer.
 const (
 	chunkBytes  = 512
