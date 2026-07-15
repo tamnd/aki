@@ -17,6 +17,8 @@ A new hot path joins by adding a probe: a closure owning its preallocated state 
 
 Registered with the header-table slice: GET hits, in-place and cross-class overwrites, and delete-reinsert cycles over a warm HotTable.
 A warm table recycles header slots, arena size classes, and map cells, so none of these touch the Go allocator.
+Since the record-states slice, delete-reinsert exercises the tombstone-and-revive path, because Del now writes a dirty tombstone instead of freeing the slot.
+The state transitions themselves (drain, evict to cold or ghost, tombstone drain) are unexported engine internals this lab cannot call, so their zero-alloc assertion lives in-package as TestTransitionCycleZeroAlloc in engine/sqlo1, holding the same allocs/op == 0 bar in the same CI run.
 
 ## Gated: the wire path
 

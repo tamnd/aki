@@ -151,8 +151,14 @@ func TestHotTableFull(t *testing.T) {
 	if !ht.Put([]byte("k0"), []byte("vv"), TagString) {
 		t.Fatal("overwrite refused at capacity")
 	}
-	if !ht.Del([]byte("k1")) || !ht.Put([]byte("k4"), []byte("v"), TagString) {
-		t.Fatal("slot not reusable after delete")
+	if !ht.Del([]byte("k1")) || ht.Put([]byte("k4"), []byte("v"), TagString) {
+		t.Fatal("tombstone must hold its slot until it drains")
+	}
+	if !ht.drained(slotOf(t, ht, []byte("k1")), 0) {
+		t.Fatal("tombstone drain refused")
+	}
+	if !ht.Put([]byte("k4"), []byte("v"), TagString) {
+		t.Fatal("slot not reusable after tombstone drain")
 	}
 }
 
