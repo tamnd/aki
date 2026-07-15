@@ -24,6 +24,7 @@ type DB struct {
 	mu   sync.Mutex
 	conn *sqlite3.Conn
 	st   *stmts
+	path string
 
 	// now is the expiry clock in wall milliseconds, swappable in tests.
 	// Reads gate on it lazily (an expired row is a miss); the reaper slice
@@ -72,7 +73,12 @@ func Open(path string) (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
-	return &DB{conn: conn, st: st, now: func() int64 { return time.Now().UnixMilli() }}, nil
+	return &DB{
+		conn: conn,
+		st:   st,
+		path: path,
+		now:  func() int64 { return time.Now().UnixMilli() },
+	}, nil
 }
 
 // Close finalizes the prepared statements before closing the connection;

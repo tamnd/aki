@@ -43,6 +43,31 @@ const (
 	// zero-length key is a legal Redis key and k > x'' would skip it; a
 	// fresh scan must not need a cursor smaller than every key.
 	sqlKVScanFirst = `SELECT k, t, exp, gen, v, crc FROM kv ORDER BY k LIMIT ?1`
+
+	// sqlKVCount backs Stats.Keys. It counts every kv row including gated
+	// ones, which is the honest INFO-level number until the reaper slice
+	// keeps expired rows from accumulating.
+	sqlKVCount = `SELECT count(*) FROM kv`
+
+	// sqlMetaHW and sqlMetaSetHW read and move the drain high-water mark.
+	// The row exists from schema creation (seeded in schemaSQL), so the
+	// read has no missing-row case and the write is always an UPDATE.
+	sqlMetaHW    = `SELECT hw FROM meta WHERE id = 0`
+	sqlMetaSetHW = `UPDATE meta SET hw = ?1 WHERE id = 0`
+
+	// The elem-root deletes are the gen-sweep shape ApplyBatch batches
+	// into a drain transaction when a root key is deleted: every elem
+	// table clears the root's rows by primary-key prefix. Pacing against
+	// large collections is the per-type slices' problem, priced by the
+	// batchdrain lab; at the flat seam these are index seeks on empty
+	// tables.
+	sqlHElemDelRoot = `DELETE FROM helem WHERE k = ?1`
+	sqlSElemDelRoot = `DELETE FROM selem WHERE k = ?1`
+	sqlZMemDelRoot  = `DELETE FROM zmem WHERE k = ?1`
+	sqlLElemDelRoot = `DELETE FROM lelem WHERE k = ?1`
+	sqlChunkDelRoot = `DELETE FROM chunk WHERE k = ?1`
+	sqlXEntDelRoot  = `DELETE FROM xent WHERE k = ?1`
+	sqlXPelDelRoot  = `DELETE FROM xpel WHERE k = ?1`
 )
 
 // stmts is one connection's prepared form of the catalog. Prepared eagerly
@@ -55,6 +80,13 @@ type stmts struct {
 	kvDel       *sqlite3.Stmt
 	kvScan      *sqlite3.Stmt
 	kvScanFirst *sqlite3.Stmt
+	kvCount     *sqlite3.Stmt
+	metaHW      *sqlite3.Stmt
+	metaSetHW   *sqlite3.Stmt
+
+	// elemDelRoot holds the per-elem-table root deletes ApplyBatch loops
+	// over for a deleted key, in schemaSQL declaration order.
+	elemDelRoot []*sqlite3.Stmt
 
 	all []*sqlite3.Stmt
 }
@@ -70,6 +102,9 @@ func prepareStmts(conn *sqlite3.Conn) (*stmts, error) {
 		{sqlKVDel, &s.kvDel},
 		{sqlKVScan, &s.kvScan},
 		{sqlKVScanFirst, &s.kvScanFirst},
+		{sqlKVCount, &s.kvCount},
+		{sqlMetaHW, &s.metaHW},
+		{sqlMetaSetHW, &s.metaSetHW},
 	} {
 		stmt, _, err := conn.Prepare(p.sql)
 		if err != nil {
@@ -77,6 +112,18 @@ func prepareStmts(conn *sqlite3.Conn) (*stmts, error) {
 			return nil, err
 		}
 		*p.dst = stmt
+		s.all = append(s.all, stmt)
+	}
+	for _, sql := range []string{
+		sqlHElemDelRoot, sqlSElemDelRoot, sqlZMemDelRoot, sqlLElemDelRoot,
+		sqlChunkDelRoot, sqlXEntDelRoot, sqlXPelDelRoot,
+	} {
+		stmt, _, err := conn.Prepare(sql)
+		if err != nil {
+			s.close()
+			return nil, err
+		}
+		s.elemDelRoot = append(s.elemDelRoot, stmt)
 		s.all = append(s.all, stmt)
 	}
 	return s, nil
