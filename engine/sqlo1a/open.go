@@ -54,6 +54,10 @@ func Open(path string) (*DB, error) {
 		conn.Close()
 		return nil, fmt.Errorf("sqlo1a: %s has page_size %d, the freeze is %d", path, got, PageSize)
 	}
+	if err := ensureSchema(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	return &DB{conn: conn}, nil
 }
 
