@@ -658,6 +658,10 @@ func (w *worker) executeCmd(b *hopBatch, i int) {
 	if w.cx.parkFull && !w.cx.retrying {
 		w.cx.parkFull = false
 		w.parkOnFull(b, i)
+		// parkOnFull captured the resume cursor onto the waiter; clear it so the
+		// next fresh command on this owner starts at 0 rather than inheriting this
+		// parked write's cursor. The retry path resets it in retryFull instead.
+		w.cx.resume = 0
 	}
 }
 

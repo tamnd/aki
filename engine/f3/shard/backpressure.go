@@ -47,6 +47,13 @@ const bpStallWindow = 64
 type fullWaiter struct {
 	b *hopBatch
 	i int
+	// resume is the argument index a re-run of this write restarts at: 0 for a
+	// single-key write and for a multi-key write that parked before committing any
+	// pair, or the first unwritten pair's index for one that parked part-way
+	// (handler.go ParkFullAt). The worker seeds Ctx.resume with it before each
+	// retry. Because it is here the retryFull loop cannot use a struct conversion
+	// to Reply anymore; it builds the Reply from b and i by name.
+	resume int
 }
 
 // parkOnFull registers a write that could not allocate on the shard's full-waiter
@@ -56,7 +63,7 @@ type fullWaiter struct {
 // together until retryFull re-runs the command and it either allocates or stalls
 // out. Owner goroutine only.
 func (w *worker) parkOnFull(b *hopBatch, i int) {
-	w.fullWaiters = append(w.fullWaiters, fullWaiter{b: b, i: i})
+	w.fullWaiters = append(w.fullWaiters, fullWaiter{b: b, i: i, resume: w.cx.resume})
 	b.deferN++
 	w.bpWaits++
 }
@@ -80,14 +87,20 @@ func (w *worker) retryFull() {
 	kept := w.fullWaiters[:0]
 	for _, fw := range w.fullWaiters {
 		w.cx.parkFull = false
+		w.cx.resume = fw.resume
 		w.executeCmd(fw.b, fw.i)
 		if w.cx.parkFull {
-			// Still full: keep the waiter, its batch stays held.
+			// Still full: keep the waiter, its batch stays held. A multi-key write
+			// that committed more pairs before re-parking advanced Ctx.resume, so
+			// carry the new cursor forward and the next retry resumes past the pairs
+			// this pass just wrote.
+			fw.resume = w.cx.resume
 			kept = append(kept, fw)
 			continue
 		}
-		// Allocated: the reply is in the slot now, release the batch's hold and
-		// push the node if this was the last command holding it.
+		// Allocated: the reply (or partial, for a fan sub-command) is in the slot
+		// now, release the batch's hold and push the node if this was the last
+		// command holding it.
 		w.releaseHold(fw.b)
 	}
 	for i := len(kept); i < len(w.fullWaiters); i++ {
@@ -96,6 +109,7 @@ func (w *worker) retryFull() {
 	w.fullWaiters = kept
 	w.cx.parkFull = false
 	w.cx.retrying = false
+	w.cx.resume = 0
 	w.ep.exit()
 	if len(w.fullWaiters) == 0 {
 		w.bpStall = 0
@@ -143,7 +157,16 @@ func (w *worker) stallCheck() {
 func (w *worker) stallOut() {
 	msg := "ERR " + store.ErrFull.Error() + " (" + w.st.StallReason() + ")"
 	for _, fw := range w.fullWaiters {
-		Reply(fw).Err(msg)
+		r := Reply{b: fw.b, i: fw.i}
+		if fw.b.fan(fw.i) != nil {
+			// A fan sub-command returns its outcome as a partial the coordinator
+			// folds (fan.go mergeFan), not a framed reply: write the stall text as a
+			// FanOK error partial so the gather frames it once into the MSET's
+			// reply. A framed Err here would be double-framed by AppendErrorBytes.
+			r.FanErrString(msg)
+		} else {
+			r.Err(msg)
+		}
 		w.releaseHold(fw.b)
 		w.bpStalls++
 	}
