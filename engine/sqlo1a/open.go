@@ -20,6 +20,7 @@ const PageSize = 8192
 // shape of the file it produces.
 type DB struct {
 	conn *sqlite3.Conn
+	st   *stmts
 }
 
 // Open opens or creates the store file at path. The creation-time pragmas
@@ -58,10 +59,24 @@ func Open(path string) (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
-	return &DB{conn: conn}, nil
+	st, err := prepareStmts(conn)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return &DB{conn: conn, st: st}, nil
 }
 
-func (d *DB) Close() error { return d.conn.Close() }
+// Close finalizes the prepared statements before closing the connection;
+// ncruces treats a close with live statements as an error, and it is right
+// to, so the ordering here is a contract, not a courtesy.
+func (d *DB) Close() error {
+	err := d.st.close()
+	if cerr := d.conn.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
 
 func pragmaInt(conn *sqlite3.Conn, sql string) (int, error) {
 	stmt, _, err := conn.Prepare(sql)

@@ -37,6 +37,25 @@ if grep -Eq 'modernc\.org/sqlite|zombiezen\.com' go.mod; then
 	exit 1
 fi
 
+# The A2 statement catalog (milestone 03-A2 slice 2): every query sqlo1a
+# runs is a named prepared statement in engine/sqlo1a/stmt.go. A query verb
+# in a string literal anywhere else in the package means someone is writing
+# SQL outside the catalog, and Sprintf near a query verb means someone is
+# building SQL at runtime. Tests are exempt; they poke fixtures.
+loose=$(grep -rn --include='*.go' -E '["`](SELECT|INSERT|UPDATE|DELETE|REPLACE)[ \n]' engine/sqlo1a |
+	grep -Ev '_test\.go:|/stmt\.go:' || true)
+if [ -n "$loose" ]; then
+	echo "sqlo1a query literals must live in engine/sqlo1a/stmt.go:"
+	echo "$loose"
+	exit 1
+fi
+built=$(grep -rn --include='*.go' -E 'Sprintf\(.*(SELECT|INSERT|UPDATE|DELETE|REPLACE|WHERE |FROM )' engine/sqlo1a || true)
+if [ -n "$built" ]; then
+	echo "sqlo1a must not build SQL at runtime:"
+	echo "$built"
+	exit 1
+fi
+
 dirs=$(find engine/sqlo1 engine/sqlo1a engine/sqlo1b cmd/sqlo1srv cmd/sqlo1crash labs/sqlo1 -type d -name internal)
 if [ -n "$dirs" ]; then
 	echo "internal/ directories are not allowed in the sqlo1 trees:"
