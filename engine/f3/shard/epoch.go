@@ -44,6 +44,18 @@ func (e *epoch) exit() {
 	e.owner.Store(0)
 }
 
+// bump advances the global epoch and returns the stamp that was current before
+// the advance: the epoch a segment retired "now" carries. The reclaimer's half
+// of the F6 contract is retire-at-stamp-then-advance, so this one call does the
+// advance and hands back the stamp to retire under (store.ReclaimSafe frees a
+// retired segment once safe passes strictly beyond its stamp). Every future
+// bracket now publishes an epoch past the stamp, so once the brackets live at
+// retirement drain, safe clears it. Owner-only, like enter and exit; the
+// reclaimer runs on the owner between batches.
+func (e *epoch) bump() uint64 {
+	return e.global.Add(1) - 1
+}
+
 // safe is the newest epoch every in-flight bracket has moved past: anything
 // retired strictly below it is unreachable and free to reclaim. This is the
 // M7 reclamation hook; segment retire, the global bump, and the actual free
