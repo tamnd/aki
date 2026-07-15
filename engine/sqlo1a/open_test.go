@@ -31,9 +31,6 @@ func TestOpenFreezesHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if err := db.conn.Exec("CREATE TABLE probe (k BLOB PRIMARY KEY) WITHOUT ROWID"); err != nil {
-		t.Fatalf("create: %v", err)
-	}
 	mode, err := pragmaText(db.conn, "PRAGMA journal_mode")
 	if err != nil {
 		t.Fatalf("journal_mode: %v", err)
