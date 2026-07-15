@@ -260,3 +260,72 @@ func TestBackpressureNoDropUnderDrain(t *testing.T) {
 		t.Fatalf("parked key %d = %q,%v, want %q", parkedAt, got, ok, val(parkedAt))
 	}
 }
+
+// TestBackpressureReclaimPendingHoldsOffStall isolates the progress signal the
+// cold-cursor-only stall check of slice 5a missed. It drives a shard into the
+// exact window that flakes: a drain has moved records cold and stopped (the cold
+// cursor is static and no drain is in flight), but the emptied segments are still
+// queued for epoch-gated reclaim (ReclaimPending). A parked write's room is one
+// reclaim pass away, so the coarse stall bound must not advance however many retry
+// passes land in that window. Before the ReclaimPending signal the bound climbed
+// here and OOM'd a recoverable write once it crossed the window, the L17 drop F9
+// forbids.
+func TestBackpressureReclaimPendingHoldsOffStall(t *testing.T) {
+	c, w, s := bpColdWorker(t, 512<<10, 64<<10, 128<<10)
+	key := func(i int) []byte { return fmt.Appendf(nil, "k:%07d", i) }
+	val := func(i int) []byte { return fmt.Appendf(nil, "v-%d", i) }
+
+	// Flood distinct keys until a write parks on a full arena.
+	for i := 0; i < 300000 && len(w.fullWaiters) == 0; i++ {
+		if err := c.Do(opBpSet, true, [][]byte{key(i), val(i)}); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+		c.Flush()
+		for w.drainAndExecute() > 0 {
+		}
+		_ = drainAvail(c)
+	}
+	if len(w.fullWaiters) == 0 {
+		t.Fatal("arena never filled: no write parked, fixture too roomy")
+	}
+
+	// Stage drains and run their phase-2 flips, but never retire or reclaim the
+	// emptied segments, so they pile up in the drained queue (ReclaimPending) while
+	// the resident charge falls back under the cap (ColdDraining goes false). This
+	// is the post-drain reclaim window reproduced without the timing that makes it
+	// rare in CI.
+	for pass := 0; pass < 600 && s.ColdDraining(); pass++ {
+		w.drainCold()
+		for i := 0; i < 200 && w.io.pool.out > 0; i++ {
+			w.advanceIntents()
+		}
+	}
+	w.io.stop()
+	for i := 0; i < 400 && w.io.pool.out > 0; i++ {
+		w.advanceIntents()
+	}
+
+	if s.ColdDraining() {
+		t.Skip("shard still draining after the drain loop; window not reached on this run")
+	}
+	if !s.ReclaimPending() {
+		t.Fatal("no emptied segments queued: the drain freed nothing, cannot exercise the window")
+	}
+	if len(w.fullWaiters) == 0 {
+		t.Fatal("the parked write cleared during draining; nothing left to stall")
+	}
+
+	// The isolate: cold cursor static, no drain in flight, reclamation pending.
+	// stallCheck must reset the bound every pass, so no stall fires across more than
+	// a full window of passes.
+	w.bpProg = s.ColdProgress()
+	for i := 0; i < bpStallWindow*3; i++ {
+		w.stallCheck()
+		if w.bpStall != 0 {
+			t.Fatalf("stall bound advanced to %d while reclamation was pending", w.bpStall)
+		}
+	}
+	if w.bpStalls != 0 {
+		t.Fatalf("stalled out %d writes while their room was queued for reclaim", w.bpStalls)
+	}
+}
