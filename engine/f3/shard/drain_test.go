@@ -59,12 +59,16 @@ func TestDrainColdAsyncMigrates(t *testing.T) {
 		w.drainCold()
 		w.advanceIntents()
 	}
-	// Flush any completions still in flight from the last submits.
-	drainCompletions(t, w, func() bool { return !s.NeedsColdDrain() || s.Cold().Records > 0 })
-	for i := 0; i < 8; i++ {
-		w.advanceIntents()
-	}
+	// stop joins the I/O goroutine, so every submitted drain has run its pwrite
+	// and posted its completion to the owner queue. Draining that queue then flips
+	// or drops every staged run and returns its buffer to the pool, deterministic
+	// without leaning on the goroutine's timing.
 	w.io.stop()
+	for i := 0; i < 64 && w.io.pool.out > 0; i++ {
+		if w.advanceIntents() == 0 {
+			break
+		}
+	}
 
 	if s.Cold().Records == 0 {
 		t.Fatal("no records migrated cold through the async path")
