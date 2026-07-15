@@ -44,6 +44,11 @@ type evictor struct {
 	ht    *HotTable
 	rng   *rand.Rand
 	cands []evictCand
+	// evictions and evictedBytes count policy victims. Only clean
+	// residents are candidates, so these double as the clean-first
+	// measurement: every unit counted here was clean and cost no IO.
+	evictions    int64
+	evictedBytes int64
 }
 
 func newEvictor(ht *HotTable, seed uint64) *evictor {
@@ -108,7 +113,10 @@ func (e *evictor) evict(need int) int {
 			if hd.state != stateResident {
 				continue // the sample drew this slot twice
 			}
-			freed += hdrSize + int(hd.klen) + len(e.ht.vals.data(hd.valRef))
+			n := hdrSize + int(hd.klen) + len(e.ht.vals.data(hd.valRef))
+			freed += n
+			e.evictions++
+			e.evictedBytes += int64(n)
 			e.ht.evict(c.slot, true)
 		}
 	}
