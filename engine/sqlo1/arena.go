@@ -33,6 +33,33 @@ const (
 	arenaMaxRefs = 1 << 16
 )
 
+// arenaBudget is a hard byte cap shared by the arenas it is wired to
+// (doc 04 section 15 gives keys and values one combined share). reserved
+// counts chunk bytes actually held from the Go heap; freelist churn does
+// not move it, only chunk acquisition and oversize release do. A nil
+// budget means uncapped, which only tests use.
+type arenaBudget struct {
+	limit    int64
+	reserved int64
+}
+
+func (b *arenaBudget) reserve(n int64) bool {
+	if b == nil {
+		return true
+	}
+	if b.reserved+n > b.limit {
+		return false
+	}
+	b.reserved += n
+	return true
+}
+
+func (b *arenaBudget) unreserve(n int64) {
+	if b != nil {
+		b.reserved -= n
+	}
+}
+
 type arena struct {
 	chunks [][]byte
 	// freeChunks holds chunk indexes released by oversize frees.
@@ -40,7 +67,8 @@ type arena struct {
 	cur        uint32 // chunk currently bump-allocated
 	curOff     uint32
 	// free holds refs recycled per size class.
-	free [arenaClasses][]uint32
+	free   [arenaClasses][]uint32
+	budget *arenaBudget
 }
 
 // classFor returns the size-class footprint and index for a payload of n
@@ -61,12 +89,17 @@ func (a *arena) chunkAt(ref uint32) ([]byte, int) {
 	return a.chunks[ref>>16], int(ref&0xFFFF) * arenaAlign
 }
 
-// alloc copies v into the arena and returns its ref.
+// alloc copies v into the arena and returns its ref, or 0 when the
+// budget refuses the chunk bytes it would take; a failed alloc changes
+// nothing, so the caller can surface the refusal as a full table.
 func (a *arena) alloc(v []byte) uint32 {
 	if len(a.chunks) == 0 {
 		// Chunk 0 is always a standard bump chunk with its first slot
 		// reserved, so ref 0 is never a live allocation on any path,
 		// including an oversize first alloc.
+		if !a.budget.reserve(arenaChunkSize) {
+			return 0
+		}
 		a.chunks = append(a.chunks, make([]byte, arenaChunkSize))
 		a.cur = 0
 		a.curOff = arenaAlign
@@ -83,6 +116,9 @@ func (a *arena) alloc(v []byte) uint32 {
 	default:
 		ref = a.bump(f)
 	}
+	if ref == 0 {
+		return 0
+	}
 	c, off := a.chunkAt(ref)
 	binary.LittleEndian.PutUint32(c[off:], uint32(len(v)))
 	copy(c[off+arenaAlign:], v)
@@ -96,7 +132,11 @@ func (a *arena) alloc(v []byte) uint32 {
 // bumped into.
 func (a *arena) bump(f uint32) uint32 {
 	if a.curOff+f > arenaChunkSize {
-		a.cur = a.newChunk(arenaChunkSize)
+		ci, ok := a.newChunk(arenaChunkSize)
+		if !ok {
+			return 0
+		}
+		a.cur = ci
 		a.curOff = 0
 	}
 	ref := a.cur<<16 | a.curOff/arenaAlign
@@ -107,26 +147,34 @@ func (a *arena) bump(f uint32) uint32 {
 }
 
 func (a *arena) allocOversize(n int) uint32 {
-	ci := a.newChunk(n + arenaAlign)
+	ci, ok := a.newChunk(n + arenaAlign)
+	if !ok {
+		return 0
+	}
 	c := a.chunks[ci]
 	binary.LittleEndian.PutUint32(c[4:], uint32(n))
 	return ci << 16
 }
 
-func (a *arena) newChunk(size int) uint32 {
+// newChunk acquires a chunk of size bytes against the budget; a recycled
+// oversize slot reserves again because its release unreserved.
+func (a *arena) newChunk(size int) (uint32, bool) {
+	if !a.budget.reserve(int64(size)) {
+		return 0, false
+	}
 	if n := len(a.freeChunks); n > 0 {
 		ci := a.freeChunks[n-1]
 		a.freeChunks = a.freeChunks[:n-1]
 		a.chunks[ci] = make([]byte, size)
-		return ci
+		return ci, true
 	}
 	if len(a.chunks) >= arenaMaxRefs {
-		// The budget-caps slice bounds arenas long before this; the panic
+		// The arena budget bounds chunk count long before this; the panic
 		// is the honest backstop for a missing cap, not a code path.
 		panic("sqlo1: arena chunk space exhausted")
 	}
 	a.chunks = append(a.chunks, make([]byte, size))
-	return uint32(len(a.chunks) - 1)
+	return uint32(len(a.chunks) - 1), true
 }
 
 // data returns the live payload for ref, aliasing the chunk.
@@ -157,6 +205,7 @@ func (a *arena) release(ref uint32) {
 	if !std || f != capacity+arenaAlign {
 		a.chunks[ref>>16] = nil
 		a.freeChunks = append(a.freeChunks, ref>>16)
+		a.budget.unreserve(int64(capacity) + arenaAlign)
 		return
 	}
 	a.free[ci] = append(a.free[ci], ref)

@@ -58,12 +58,13 @@ const maxKlen = 1<<16 - 1
 // the header slice is full until eviction (a later slice) makes room.
 func NewHotTable(capacity int) *HotTable {
 	return &HotTable{
-		seed:   maphash.MakeSeed(),
-		index:  make(map[uint64]uint32, capacity),
-		dups:   make(map[uint64][]uint32),
-		hdrs:   make([]hdr, 0, capacity),
-		ghosts: newGhostRing(capacity / 16),
-		dirty:  make([]uint32, max(capacity, 8)),
+		seed:      maphash.MakeSeed(),
+		index:     make(map[uint64]uint32, capacity),
+		dups:      make(map[uint64][]uint32),
+		hdrs:      make([]hdr, 0, capacity),
+		freeSlots: make([]uint32, 0, capacity),
+		ghosts:    newGhostRing(capacity / 16),
+		dirty:     make([]uint32, max(capacity, 8)),
 	}
 }
 
@@ -143,7 +144,9 @@ func (t *HotTable) Get(key []byte) ([]byte, bool) {
 }
 
 // Put inserts or overwrites key and marks it dirty. It reports false
-// when the table is full or the key is longer than klen reaches.
+// when the table is full, the arena budget refuses the bytes, or the key
+// is longer than klen reaches; a failed Put changes nothing, not even a
+// stamp, so the caller can evict and retry.
 func (t *HotTable) Put(key, val []byte, tag uint8) bool {
 	if len(key) > maxKlen {
 		return false
@@ -156,18 +159,30 @@ func (t *HotTable) Put(key, val []byte, tag uint8) bool {
 			// Reviving a tombstone: the header never left, so this is
 			// an overwrite that happens to bring the key back to life.
 			// The tombstone was dirty, so only the value bytes are new.
-			hd.valRef = t.vals.alloc(val)
+			ref := t.vals.alloc(val)
+			if ref == 0 {
+				return false
+			}
+			hd.valRef = ref
 			t.live++
 			t.dirtyBytes += len(val)
 		default:
+			oldLen := len(t.vals.data(hd.valRef))
+			if !t.vals.update(hd.valRef, val) {
+				// Alloc before release so a budget refusal leaves the
+				// old value standing; only a grow lands here, so the old
+				// slot's smaller class could not have served val anyway.
+				ref := t.vals.alloc(val)
+				if ref == 0 {
+					return false
+				}
+				t.vals.release(hd.valRef)
+				hd.valRef = ref
+			}
 			if hd.state == stateDirty {
-				t.dirtyBytes += len(val) - len(t.vals.data(hd.valRef))
+				t.dirtyBytes += len(val) - oldLen
 			} else {
 				t.dirtyBytes += int(hd.klen) + len(val)
-			}
-			if !t.vals.update(hd.valRef, val) {
-				t.vals.release(hd.valRef)
-				hd.valRef = t.vals.alloc(val)
 			}
 		}
 		hd.state = stateDirty
@@ -177,20 +192,36 @@ func (t *HotTable) Put(key, val []byte, tag uint8) bool {
 		return true
 	}
 
+	// Pick the slot without taking it, then fund the arena bytes; the
+	// slot is only claimed once both allocs stand, so failure unwinds to
+	// nothing.
 	var s uint32
+	fromFree := len(t.freeSlots) > 0
 	switch {
-	case len(t.freeSlots) > 0:
+	case fromFree:
 		s = t.freeSlots[len(t.freeSlots)-1]
-		t.freeSlots = t.freeSlots[:len(t.freeSlots)-1]
 	case len(t.hdrs) < cap(t.hdrs):
-		t.hdrs = t.hdrs[:len(t.hdrs)+1]
-		s = uint32(len(t.hdrs) - 1)
+		s = uint32(len(t.hdrs))
 	default:
 		return false
 	}
+	keyRef := t.keys.alloc(key)
+	if keyRef == 0 {
+		return false
+	}
+	valRef := t.vals.alloc(val)
+	if valRef == 0 {
+		t.keys.release(keyRef)
+		return false
+	}
+	if fromFree {
+		t.freeSlots = t.freeSlots[:len(t.freeSlots)-1]
+	} else {
+		t.hdrs = t.hdrs[:len(t.hdrs)+1]
+	}
 	t.hdrs[s] = hdr{
-		keyRef:  t.keys.alloc(key),
-		valRef:  t.vals.alloc(val),
+		keyRef:  keyRef,
+		valRef:  valRef,
 		klen:    uint16(len(key)),
 		state:   stateDirty,
 		typeTag: tag,
