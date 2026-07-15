@@ -27,6 +27,9 @@ func incrErr(err error) string {
 func incrBy(cx *shard.Ctx, key []byte, delta int64, r shard.Reply) {
 	n, err := cx.St.IncrBy(key, delta, cx.NowMs)
 	if err != nil {
+		if cx.ParkFull(err) {
+			return
+		}
 		r.Err(incrErr(err))
 		return
 	}
@@ -99,6 +102,9 @@ func IncrByFloat(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	var nb [40]byte
 	out := resp.FormatScore(nb[:0], sum)
 	if err := cx.St.SetString(key, out, cx.NowMs, 0, true); err != nil {
+		if cx.ParkFull(err) {
+			return
+		}
 		r.Err(storeErr(err))
 		return
 	}
@@ -111,6 +117,9 @@ func IncrByFloat(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 func Append(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	n, err := cx.St.Append(args[0], args[1], cx.NowMs)
 	if err != nil {
+		if cx.ParkFull(err) {
+			return
+		}
 		r.Err(storeErr(err))
 		return
 	}
@@ -142,6 +151,9 @@ func SetRange(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	n, err := cx.St.SetRange(args[0], int(offset), val, cx.NowMs)
 	if err != nil {
+		if cx.ParkFull(err) {
+			return
+		}
 		r.Err(storeErr(err))
 		return
 	}

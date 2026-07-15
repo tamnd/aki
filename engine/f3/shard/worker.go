@@ -106,6 +106,21 @@ type worker struct {
 	// It starts on the first submit and stays dark until the M7 migrator drains
 	// a segment, so a store under its resident cap never pays for it.
 	io ioworker
+
+	// The block-not-drop backpressure state (backpressure.go, spec 2064/f3/06
+	// section 8). fullWaiters is the per-shard FIFO of writes parked on a full
+	// arena, each holding its batch through the batch's defer count until a drain
+	// frees room; it is nil and untouched until the first write parks, so a store
+	// under its resident cap never allocates it. bpProg snapshots the cold append
+	// cursor between retry passes and bpStall counts consecutive passes without an
+	// advance, the coarse stall bound that surfaces the OOM reply when no progress
+	// is possible. bpWaits and bpStalls are the cumulative park and stall-out
+	// counts INFO surfaces in slice 5b.
+	fullWaiters []fullWaiter
+	bpProg      uint64
+	bpStall     int
+	bpWaits     uint64
+	bpStalls    uint64
 }
 
 func newWorker(id int, st *store.Store) *worker {
@@ -189,6 +204,10 @@ func (w *worker) run() {
 			// retires its first segment; wired from the first batch so the
 			// contract runs before a real reader depends on it.
 			w.st.ReclaimSafe(w.ep.safe())
+			// Retry any writes parked on a full arena against the space this
+			// boundary just reclaimed (backpressure.go). No-op with no waiter, one
+			// length check on the no-pressure path (L9).
+			w.retryFull()
 		}
 		if n == 0 {
 			if w.stop.Load() {
@@ -203,6 +222,16 @@ func (w *worker) run() {
 			}
 			w.maybeCompact()
 			w.runMaintainer()
+			if len(w.fullWaiters) > 0 && !w.st.ColdDraining() {
+				// Writes are parked but no drain is in flight or pending, so no
+				// completion will wake the worker to retry them: spin the boundary
+				// toward the stall window instead of parking (maybeCompact above
+				// advanced the stall counter, and it fires the OOM reply once the
+				// window is crossed). A drain in flight (ColdDraining) posts a
+				// completion that wakes a parked worker, so that case parks below.
+				runtime.Gosched()
+				continue
+			}
 			w.idle()
 		}
 	}
@@ -236,6 +265,10 @@ func (w *worker) maybeCompact() {
 	// bracket long exited, so safe has advanced past any bracket that could
 	// have named a retired segment. Empty-list cheap until the migrator lands.
 	w.st.ReclaimSafe(w.ep.safe())
+	// Retry any writes parked on a full arena at the idle boundary too, so a
+	// shard that quiesced with a completion still in flight serves its waiters
+	// once the drain lands. No-op with no waiter (backpressure.go).
+	w.retryFull()
 }
 
 // drainCold stages a two-phase cold migration and hands it to the I/O worker
@@ -596,6 +629,15 @@ func (w *worker) executeCmd(b *hopBatch, i int) {
 	w.cx.curConn = b.conn // completion target for a Park; owner-local, per command
 	w.cx.curSeq = c.seq
 	h(&w.cx, argv, r)
+	// Block-not-drop: a write handler that could not allocate set parkFull through
+	// ParkFull instead of writing a reply. One bool load, zero cost when unset; on
+	// the normal path it registers the command on the full-waiter FIFO, and the
+	// retry driver clears retrying so a re-park during a retry is read there rather
+	// than double-registered here (backpressure.go).
+	if w.cx.parkFull && !w.cx.retrying {
+		w.cx.parkFull = false
+		w.parkOnFull(b, i)
+	}
 }
 
 // idle is the spin-then-park protocol (doc 03 section 9.1): store spinning,
