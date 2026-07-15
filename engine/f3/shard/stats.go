@@ -29,6 +29,8 @@ const (
 	StatVlogReads
 	StatPromotes
 	StatDemotes
+	StatBackpressureWaits
+	StatBackpressureStalls
 	NumStats
 )
 
@@ -50,6 +52,9 @@ var statNames = [NumStats]string{
 	StatVlogReads:     "vlog_reads",
 	StatPromotes:      "ltm_promotes",
 	StatDemotes:       "ltm_demotes",
+
+	StatBackpressureWaits:  "backpressure_waits",
+	StatBackpressureStalls: "backpressure_stalls",
 }
 
 // appendStat writes one name:value INFO line.

@@ -38,6 +38,8 @@ func InfoShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	put(shard.StatVlogReads, rs.LogReads)
 	put(shard.StatPromotes, rs.Promotes)
 	put(shard.StatDemotes, rs.Demotes)
+	put(shard.StatBackpressureWaits, cx.BackpressureWaits())
+	put(shard.StatBackpressureStalls, cx.BackpressureStalls())
 	r.Raw(b[:])
 }
 
