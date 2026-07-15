@@ -208,9 +208,13 @@ func (s *Store) GetString(key []byte, now int64, dst []byte) ([]byte, bool) {
 		return dst[:0], false
 	}
 	if slotCold(*slot) {
-		// Served straight from the cold frame, one pread, no promotion: a read
-		// keeps a cold key cold so the migrator's work is not undone by traffic
-		// (the promotion doorkeeper on cold reads is a later slice).
+		// A cold hit consults the doorkeeper: a first sighting serves the frame
+		// and keeps the key cold, a second promotes it back to the arena so a
+		// repeatedly read cold key stops paying a pread. First sighting is the
+		// common case, one filter test and a mark over the pread already due.
+		if s.ltmOn && s.promoteOnColdRead(h, slot, addr) {
+			return s.readValue(*slot&addrMask, dst)
+		}
 		return s.coldRead(addr, dst)
 	}
 	s.touchSlot(slot)
