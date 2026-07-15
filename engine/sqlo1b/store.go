@@ -97,6 +97,12 @@ type Store struct {
 	garbage uint64
 	hw      int64
 
+	// garbageExt is the per-extent side of the garbage counter, the
+	// compaction debt feed (doc 03 section 9). It is advisory runtime
+	// state: reopen starts it empty and supersessions rebuild it, so
+	// correctness never depends on it.
+	garbageExt map[uint64]uint64
+
 	// dirty holds every bucket chain touched since the last durable
 	// checkpoint; RAM is authoritative for these. pending maps the
 	// in-flight batch's vlog positions to encoded records, covering
@@ -510,17 +516,24 @@ func (s *Store) BatchGet(ctx context.Context, keys [][]byte) ([]sqlo1.Record, er
 // lookup resolves key through the dirty chains first, then the cold
 // index. A nil record is a miss.
 func (s *Store) lookup(key []byte) (*Record, error) {
+	rec, _, err := s.lookupPos(key)
+	return rec, err
+}
+
+// lookupPos is lookup keeping the position the index entry names,
+// which is what compaction's liveness probe compares against.
+func (s *Store) lookupPos(key []byte) (*Record, Pos, error) {
 	h := KeyHash(key)
 	bucket := BucketOf(PlacementBits(h), s.level, s.split)
 	if chain, ok := s.dirty[bucket]; ok {
-		_, _, rec, found, err := s.findInChain(chain, Fingerprint(h), key)
+		_, _, rec, pos, found, err := s.findInChain(chain, Fingerprint(h), key)
 		if err != nil || !found {
-			return nil, err
+			return nil, 0, err
 		}
-		return rec, nil
+		return rec, pos, nil
 	}
-	rec, _, err := s.rd.Lookup(key, PackHashEpoch(s.split, s.level))
-	return rec, err
+	rec, pos, err := s.rd.Lookup(key, PackHashEpoch(s.split, s.level))
+	return rec, pos, err
 }
 
 func (s *Store) expiredRec(rec *Record) bool {
@@ -730,7 +743,7 @@ func (s *Store) indexPut(rec *Record, pos Pos) error {
 		return err
 	}
 	fp := Fingerprint(h)
-	ci, ei, old, found, err := s.findInChain(chain, fp, rec.Key)
+	ci, ei, old, oldPos, found, err := s.findInChain(chain, fp, rec.Key)
 	if err != nil {
 		return err
 	}
@@ -742,7 +755,7 @@ func (s *Store) indexPut(rec *Record, pos Pos) error {
 		if err := chain[ci].SetEntry(ei, meta, uint64(pos)); err != nil {
 			return err
 		}
-		s.garbage += uint64(old.EncodedLen())
+		s.noteGarbage(oldPos, old)
 		return nil
 	}
 	return s.insertNew(bucket, chain, fp, rec, h, pos)
@@ -800,7 +813,7 @@ func (s *Store) applyGenbump(key []byte, newgen uint32) error {
 		return err
 	}
 	fp := Fingerprint(h)
-	ci, ei, old, found, err := s.findInChain(chain, fp, key)
+	ci, ei, old, oldPos, found, err := s.findInChain(chain, fp, key)
 	if err != nil {
 		return err
 	}
@@ -830,7 +843,7 @@ func (s *Store) applyGenbump(key []byte, newgen uint32) error {
 		if err := chain[ci].SetEntry(ei, meta, uint64(pos)); err != nil {
 			return err
 		}
-		s.garbage += uint64(old.EncodedLen())
+		s.noteGarbage(oldPos, old)
 		return nil
 	}
 	return s.insertNew(bucket, chain, fp, rec, h, pos)
@@ -846,7 +859,7 @@ func (s *Store) applyDel(key []byte) error {
 	if err != nil {
 		return err
 	}
-	ci, ei, old, found, err := s.findInChain(chain, Fingerprint(h), key)
+	ci, ei, old, oldPos, found, err := s.findInChain(chain, Fingerprint(h), key)
 	if err != nil {
 		return err
 	}
@@ -857,7 +870,7 @@ func (s *Store) applyDel(key []byte) error {
 		return err
 	}
 	s.entries--
-	s.garbage += uint64(old.EncodedLen())
+	s.noteGarbage(oldPos, old)
 	return nil
 }
 
@@ -925,6 +938,11 @@ func (s *Store) RootLive(rooth uint64, rootgen uint32) (bool, error) {
 	if s.broken != nil {
 		return false, s.broken
 	}
+	return s.rootLive(rooth, rootgen)
+}
+
+// rootLive is RootLive's unlocked core, shared with compaction.
+func (s *Store) rootLive(rooth uint64, rootgen uint32) (bool, error) {
 	rec, err := s.lookup(GenKey(rooth))
 	if err != nil {
 		return false, err
@@ -959,8 +977,9 @@ func entryMetaFor(rec *Record, h uint64, base uint8) (uint16, error) {
 }
 
 // findInChain resolves fingerprint candidates in chain order and
-// returns the entry whose record key matches.
-func (s *Store) findInChain(chain []*Chunk, fp uint16, key []byte) (ci, ei int, rec *Record, found bool, err error) {
+// returns the entry whose record key matches, along with the vlog
+// position its vptr names.
+func (s *Store) findInChain(chain []*Chunk, fp uint16, key []byte) (ci, ei int, rec *Record, pos Pos, found bool, err error) {
 	for i, c := range chain {
 		var herr error
 		c.Probe(fp, func(j int, meta uint16, vptr uint64) bool {
@@ -970,19 +989,38 @@ func (s *Store) findInChain(chain []*Chunk, fp uint16, key []byte) (ci, ei int, 
 				return false
 			}
 			if bytes.Equal(r.Key, key) {
-				ci, ei, rec, found = i, j, r, true
+				ci, ei, rec, pos, found = i, j, r, Pos(vptr), true
 				return false
 			}
 			return true
 		})
 		if herr != nil {
-			return 0, 0, nil, false, herr
+			return 0, 0, nil, 0, false, herr
 		}
 		if found {
-			return ci, ei, rec, true, nil
+			return ci, ei, rec, pos, true, nil
 		}
 	}
-	return 0, 0, nil, false, nil
+	return 0, 0, nil, 0, false, nil
+}
+
+// noteGarbage credits a superseded or deleted record's bytes to the
+// extent holding its dead copy. The total feeds the superblock; the
+// per-extent side is what the compaction debt controller selects by.
+func (s *Store) noteGarbage(pos Pos, rec *Record) {
+	n := uint64(rec.EncodedLen())
+	s.garbage += n
+	if s.garbageExt == nil {
+		s.garbageExt = map[uint64]uint64{}
+	}
+	s.garbageExt[pos.Extent()] += n
+}
+
+// ExtentGarbage reports one extent's advisory dead-byte estimate.
+func (s *Store) ExtentGarbage(ext uint64) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.garbageExt[ext]
 }
 
 // resolveAt reads the record behind a vptr, checking the in-flight
