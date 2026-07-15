@@ -233,6 +233,8 @@ func OpenStoreOn(f StoreFile, walPath string, walSegSize int64) (*Store, error) 
 			s.hw = op.markSeq
 		case op.del:
 			err = s.applyDel(op.key)
+		case op.genbump:
+			err = s.applyGenbump(op.key, op.newgen)
 		default:
 			err = s.applyPut(op.rec)
 		}
@@ -317,7 +319,9 @@ func (s *Store) initCursors() {
 type tailOp struct {
 	del     bool
 	mark    bool
+	genbump bool
 	markSeq int64
+	newgen  uint32
 	key     []byte
 	rec     *Record
 }
@@ -351,8 +355,14 @@ func (t *replayTail) ApplyData(fr sqlo1.WALFrame) error {
 			return err
 		}
 		t.ops = append(t.ops, tailOp{del: true, key: bytes.Clone(key)})
+	case sqlo1.WALOpGenbump:
+		key, newgen, err := DecodeGenbumpPayload(fr.Payload)
+		if err != nil {
+			return err
+		}
+		t.ops = append(t.ops, tailOp{genbump: true, key: bytes.Clone(key), newgen: newgen})
 	default:
-		return fmt.Errorf("sqlo1b: replayed data op %d, this store emits only PUT and DEL", fr.Op)
+		return fmt.Errorf("sqlo1b: replayed data op %d, this store emits only PUT, DEL, and GENBUMP", fr.Op)
 	}
 	return nil
 }
@@ -464,7 +474,7 @@ func (s *Store) Get(ctx context.Context, key []byte) (sqlo1.Record, error) {
 	if err != nil {
 		return sqlo1.Record{}, err
 	}
-	if rec == nil || s.expiredRec(rec) {
+	if rec == nil || rec.RType == RecMeta || s.expiredRec(rec) {
 		return sqlo1.Record{}, sqlo1.ErrNotFound
 	}
 	return seamOut(rec), nil
@@ -487,7 +497,7 @@ func (s *Store) BatchGet(ctx context.Context, keys [][]byte) ([]sqlo1.Record, er
 		if err != nil {
 			return nil, err
 		}
-		if rec == nil || s.expiredRec(rec) {
+		if rec == nil || rec.RType == RecMeta || s.expiredRec(rec) {
 			continue
 		}
 		out[i] = seamOut(rec)
@@ -661,6 +671,12 @@ func (s *Store) applyPut(rec *Record) error {
 		s.garbage += uint64(old.EncodedLen())
 		return nil
 	}
+	return s.insertNew(bucket, chain, fp, rec, h, pos)
+}
+
+// insertNew appends a fresh entry to bucket's chain and runs any due
+// splits. The caller has already ruled out an existing entry.
+func (s *Store) insertNew(bucket uint64, chain []*Chunk, fp uint16, rec *Record, h uint64, pos Pos) error {
 	last := chain[len(chain)-1]
 	if last.Count() == ChunkCap {
 		// The full final chunk cannot take a chain pointer, so shift
@@ -699,6 +715,53 @@ func (s *Store) applyPut(rec *Record) error {
 	return nil
 }
 
+// applyGenbump upserts a generation record, keeping generations
+// monotonic: a bump at or below the recorded one is a no-op, which
+// makes WAL replay idempotent without a high-water mark.
+func (s *Store) applyGenbump(key []byte, newgen uint32) error {
+	h := KeyHash(key)
+	bucket := BucketOf(PlacementBits(h), s.level, s.split)
+	chain, err := s.mutableChain(bucket)
+	if err != nil {
+		return err
+	}
+	fp := Fingerprint(h)
+	ci, ei, old, found, err := s.findInChain(chain, fp, key)
+	if err != nil {
+		return err
+	}
+	if found {
+		oldgen, err := genOf(old)
+		if err != nil {
+			return err
+		}
+		if newgen <= oldgen {
+			return nil
+		}
+	}
+	rec := genRecord(key, newgen)
+	enc, err := rec.Encode()
+	if err != nil {
+		return err
+	}
+	pos, err := s.appendVlog(enc)
+	if err != nil {
+		return err
+	}
+	if found {
+		meta, err := entryMetaFor(rec, h, chain[ci].WindowBase())
+		if err != nil {
+			return err
+		}
+		if err := chain[ci].SetEntry(ei, meta, uint64(pos)); err != nil {
+			return err
+		}
+		s.garbage += uint64(old.EncodedLen())
+		return nil
+	}
+	return s.insertNew(bucket, chain, fp, rec, h, pos)
+}
+
 // applyDel removes key's index entry. Deleting an absent key is a
 // no-op at the seam. No vlog tombstone in v0: the WAL DEL frame and
 // the checkpointed index carry the fact.
@@ -732,6 +795,72 @@ func (s *Store) finishApply() error {
 	}
 	clear(s.pending)
 	return nil
+}
+
+// GenBump durably bumps rooth's generation: the O(1) side of
+// deleting or type-overwriting a collection (doc 03 section 6.3).
+// Segments minted under an older generation stay bytes on disk but
+// fail RootLive, and compaction drops them at B3. The frame needs no
+// high-water mark because the apply is monotonic and replaying it is
+// a no-op.
+func (s *Store) GenBump(ctx context.Context, rooth uint64, newgen uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broken != nil {
+		return s.broken
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key := GenKey(rooth)
+	pay, err := EncodeGenbumpPayload(key, newgen)
+	if err != nil {
+		return err
+	}
+	if _, err := s.wal.Append(0, sqlo1.WALOpGenbump, 0, pay); err != nil {
+		return err
+	}
+	if err := s.wal.Flush(); err != nil {
+		return err
+	}
+	if err := s.wal.Sync(); err != nil {
+		return err
+	}
+	// Durability point, same discipline as ApplyBatch: a failure past
+	// here poisons the store and reopening replays into a clean state.
+	if err := s.applyGenbump(key, newgen); err != nil {
+		s.broken = err
+		return err
+	}
+	if err := s.finishApply(); err != nil {
+		s.broken = err
+		return err
+	}
+	return nil
+}
+
+// RootLive is the liveness probe compaction runs on segment records
+// (doc 04 section 10): a segment is dead only when a durable bump
+// went past its rootgen. A rooth with no generation record was never
+// bumped, so creation costs nothing.
+func (s *Store) RootLive(rooth uint64, rootgen uint32) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broken != nil {
+		return false, s.broken
+	}
+	rec, err := s.lookup(GenKey(rooth))
+	if err != nil {
+		return false, err
+	}
+	if rec == nil {
+		return true, nil
+	}
+	g, err := genOf(rec)
+	if err != nil {
+		return false, err
+	}
+	return rootgen >= g, nil
 }
 
 // entryMetaFor packs the chunk entry meta for a record landing in a
@@ -963,7 +1092,7 @@ func (s *Store) Scan(ctx context.Context, cur sqlo1.Cursor, fn func(sqlo1.Record
 				if err != nil {
 					return nil, err
 				}
-				if rec.HasExpiry() && int64(rec.ExpireMS) <= now {
+				if rec.RType == RecMeta || (rec.HasExpiry() && int64(rec.ExpireMS) <= now) {
 					continue
 				}
 				if !fn(seamOut(rec)) {
@@ -978,8 +1107,10 @@ func (s *Store) Scan(ctx context.Context, cur sqlo1.Cursor, fn func(sqlo1.Record
 }
 
 // Stats reports the store's own accounting. Keys counts index
-// entries, so expired-but-unreaped records are included until a
-// delete or compaction removes them.
+// entries, so expired-but-unreaped records and generation records are
+// included until a delete or compaction removes them. Get, BatchGet,
+// and Scan hide both; the filter lives at the seam rather than in
+// lookup because RootLive resolves generation records through lookup.
 func (s *Store) Stats() sqlo1.StoreStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()

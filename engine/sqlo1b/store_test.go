@@ -20,6 +20,7 @@ type storeRig struct {
 	s    *Store
 	path string
 	sh   map[string]sqlo1.Record
+	gens map[uint64]uint32
 	seq  int64
 	now  int64
 }
@@ -31,7 +32,7 @@ func newStoreRig(t *testing.T) *storeRig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &storeRig{s: s, path: path, sh: map[string]sqlo1.Record{}, now: 1_000_000}
+	r := &storeRig{s: s, path: path, sh: map[string]sqlo1.Record{}, gens: map[uint64]uint32{}, now: 1_000_000}
 	s.nowMS = func() int64 { return r.now }
 	t.Cleanup(func() { s.Close() })
 	return r
@@ -79,6 +80,29 @@ func delOp(key string) sqlo1.Op {
 	return sqlo1.Op{Del: true, Rec: sqlo1.Record{Key: []byte(key)}}
 }
 
+// genbump mirrors GenBump into the rig's shadow generation table so
+// verify can account for the generation records in Stats.Keys.
+func (r *storeRig) genbump(t *testing.T, rooth uint64, newgen uint32) {
+	t.Helper()
+	if err := r.s.GenBump(context.Background(), rooth, newgen); err != nil {
+		t.Fatalf("genbump %#x to %d: %v", rooth, newgen, err)
+	}
+	if newgen > r.gens[rooth] {
+		r.gens[rooth] = newgen
+	}
+}
+
+func (r *storeRig) checkLive(t *testing.T, rooth uint64, rootgen uint32, want bool) {
+	t.Helper()
+	got, err := r.s.RootLive(rooth, rootgen)
+	if err != nil {
+		t.Fatalf("rootlive %#x gen %d: %v", rooth, rootgen, err)
+	}
+	if got != want {
+		t.Fatalf("rootlive %#x gen %d: got %v, want %v", rooth, rootgen, got, want)
+	}
+}
+
 // verify checks every shadow key through Get, one guaranteed miss,
 // and the stats counters.
 func (r *storeRig) verify(t *testing.T) {
@@ -104,8 +128,8 @@ func (r *storeRig) verify(t *testing.T) {
 		t.Fatalf("miss: got %v, want ErrNotFound", err)
 	}
 	st := r.s.Stats()
-	if st.Keys != int64(len(r.sh)) {
-		t.Fatalf("stats keys %d, shadow holds %d", st.Keys, len(r.sh))
+	if st.Keys != int64(len(r.sh)+len(r.gens)) {
+		t.Fatalf("stats keys %d, shadow holds %d plus %d generation records", st.Keys, len(r.sh), len(r.gens))
 	}
 	if st.HighWater != r.seq {
 		t.Fatalf("stats high-water %d, want %d", st.HighWater, r.seq)
@@ -593,4 +617,158 @@ func TestStorePutDelPayloadCodecs(t *testing.T) {
 	if _, _, err := MarkSeq(&Record{RType: RecMeta, Key: []byte("mystery"), Value: []byte("x")}); err == nil {
 		t.Fatal("unknown meta key accepted")
 	}
+}
+
+// TestStoreGenbumpPayloadCodec pins the doc 03 section 12.2 op 4
+// shape: klen u16, newgen u32, key, with generation 0 rejected on
+// both sides.
+func TestStoreGenbumpPayloadCodec(t *testing.T) {
+	key := GenKey(0x1122334455667788)
+	pay, err := EncodeGenbumpPayload(key, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, gen, err := DecodeGenbumpPayload(pay)
+	if err != nil || gen != 9 || !bytes.Equal(back, key) {
+		t.Fatalf("GENBUMP roundtrip: key %x gen %d err %v", back, gen, err)
+	}
+	if _, _, err := DecodeGenbumpPayload(pay[:len(pay)-1]); err == nil {
+		t.Fatal("truncated GENBUMP payload decoded")
+	}
+	if _, _, err := DecodeGenbumpPayload(pay[:5]); err == nil {
+		t.Fatal("headerless GENBUMP payload decoded")
+	}
+	if _, err := EncodeGenbumpPayload(key, 0); err == nil {
+		t.Fatal("GENBUMP to generation 0 encoded")
+	}
+	if _, err := EncodeGenbumpPayload(nil, 1); err == nil {
+		t.Fatal("GENBUMP with an empty key encoded")
+	}
+	zeroed := bytes.Clone(pay)
+	for i := 2; i < 6; i++ {
+		zeroed[i] = 0
+	}
+	if _, _, err := DecodeGenbumpPayload(zeroed); err == nil {
+		t.Fatal("GENBUMP frame carrying generation 0 decoded")
+	}
+}
+
+// TestStoreGenBump drives the liveness model of doc 03 section 6.3:
+// a rooth with no generation record is live at any rootgen, a bump
+// kills everything below it, bumps are monotonic, and generation
+// records never leak through Get, BatchGet, or Scan.
+func TestStoreGenBump(t *testing.T) {
+	r := newStoreRig(t)
+	ctx := context.Background()
+	r1, err := MintRooth(0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := MintRooth(0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seg := func(rooth uint64, segid uint64) []byte {
+		sk, err := NewSubkey(rooth, SubkindSeg, segid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sk.Encode()
+	}
+	r.apply(t,
+		sqlo1.Op{Rec: sqlo1.Record{Key: seg(r1, 1), Value: []byte("r1 seg"), Gen: 1}},
+		sqlo1.Op{Rec: sqlo1.Record{Key: seg(r2, 1), Value: []byte("r2 seg"), Gen: 1}},
+		putOp("plain", []byte("v"), 0),
+	)
+	r.checkLive(t, r1, 1, true) // never bumped
+
+	r.genbump(t, r1, 2)
+	r.checkLive(t, r1, 1, false)
+	r.checkLive(t, r1, 2, true)
+	r.checkLive(t, r2, 1, true)
+
+	// Re-delivering the same bump and delivering a lower one are the
+	// monotonic no-ops replay depends on.
+	r.genbump(t, r1, 2)
+	r.genbump(t, r1, 1)
+	r.checkLive(t, r1, 1, false)
+	r.checkLive(t, r1, 2, true)
+
+	if err := r.s.GenBump(ctx, r1, 0); err == nil {
+		t.Fatal("bump to generation 0 accepted")
+	}
+
+	// The generation record is index state, not seam state.
+	if _, err := r.s.Get(ctx, GenKey(r1)); !errors.Is(err, sqlo1.ErrNotFound) {
+		t.Fatalf("get of a generation record: %v", err)
+	}
+	out, err := r.s.BatchGet(ctx, [][]byte{GenKey(r1), []byte("plain")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out[0].Key != nil {
+		t.Fatal("batchget delivered a generation record")
+	}
+	if !bytes.Equal(out[1].Value, []byte("v")) {
+		t.Fatal("batchget hit next to the hidden record came back wrong")
+	}
+	r.verify(t)
+	r.verifyScan(t) // scanAll == liveShadow proves Scan skips it
+
+	// Bumps interleaved with real traffic, across splits.
+	mixedTraffic(t, r, 0, 2_000, 300)
+	r.genbump(t, r2, 5)
+	r.checkLive(t, r2, 4, false)
+	r.checkLive(t, r2, 5, true)
+	r.checkLive(t, r1, 2, true)
+	r.verify(t)
+	r.verifyScan(t)
+}
+
+// TestStoreGenBumpReopen carries generation records across recovery:
+// once from a pure WAL replay, once from a checkpointed base with
+// bumps in the tail, exercising the cold-load found path.
+func TestStoreGenBumpReopen(t *testing.T) {
+	r := newStoreRig(t)
+	r1, err := MintRooth(1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := MintRooth(1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mixedTraffic(t, r, 0, 600, 150)
+	r.genbump(t, r1, 3)
+
+	r.reopen(t) // no checkpoint: the bump survives on WAL replay alone
+	r.verify(t)
+	r.verifyScan(t)
+	r.checkLive(t, r1, 2, false)
+	r.checkLive(t, r1, 3, true)
+	r.checkLive(t, r2, 7, true)
+
+	if err := r.s.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	r.genbump(t, r1, 4) // found path through a cold-loaded chain
+	r.genbump(t, r2, 2) // fresh insert past the checkpoint
+	mixedTraffic(t, r, 600, 300, 100)
+
+	r.reopen(t) // checkpointed base plus a tail holding both bumps
+	r.verify(t)
+	r.verifyScan(t)
+	r.checkLive(t, r1, 3, false)
+	r.checkLive(t, r1, 4, true)
+	r.checkLive(t, r2, 1, false)
+	r.checkLive(t, r2, 2, true)
+
+	if err := r.s.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	r.reopen(t) // generation records ride the checkpoint like any record
+	r.verify(t)
+	r.verifyScan(t)
+	r.checkLive(t, r1, 4, true)
+	r.checkLive(t, r2, 2, true)
 }

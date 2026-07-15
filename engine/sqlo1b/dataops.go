@@ -91,6 +91,73 @@ func DecodeDelPayload(b []byte) ([]byte, error) {
 	return b[2:], nil
 }
 
+// EncodeGenbumpPayload lays out a GENBUMP frame payload (doc 03
+// section 12.2, op 4): klen u16, newgen u32, key. Generations start
+// at 1 and only rise, so 0 never rides a frame.
+func EncodeGenbumpPayload(key []byte, newgen uint32) ([]byte, error) {
+	if len(key) == 0 || len(key) > math.MaxUint16 {
+		return nil, fmt.Errorf("sqlo1b: GENBUMP key of %d bytes, want 1..%d", len(key), math.MaxUint16)
+	}
+	if newgen == 0 {
+		return nil, fmt.Errorf("sqlo1b: GENBUMP to generation 0")
+	}
+	b := make([]byte, 6+len(key))
+	binary.LittleEndian.PutUint16(b, uint16(len(key)))
+	binary.LittleEndian.PutUint32(b[2:], newgen)
+	copy(b[6:], key)
+	return b, nil
+}
+
+// DecodeGenbumpPayload parses a GENBUMP frame payload. The key
+// aliases b.
+func DecodeGenbumpPayload(b []byte) ([]byte, uint32, error) {
+	if len(b) < 6 {
+		return nil, 0, fmt.Errorf("sqlo1b: GENBUMP payload of %d bytes", len(b))
+	}
+	klen := int(binary.LittleEndian.Uint16(b))
+	if klen == 0 || 6+klen != len(b) {
+		return nil, 0, fmt.Errorf("sqlo1b: GENBUMP payload of %d bytes carries klen %d", len(b), klen)
+	}
+	newgen := binary.LittleEndian.Uint32(b[2:])
+	if newgen == 0 {
+		return nil, 0, fmt.Errorf("sqlo1b: GENBUMP payload carries generation 0")
+	}
+	return b[6:], newgen, nil
+}
+
+// Generation records: the durable side of GENBUMP. A root's current
+// generation lives in the index as an rtype-meta record under the
+// subkey plane's reserved kind 0, so it checkpoints, splits, and
+// replays like any record with zero extra machinery. A rooth with no
+// generation record was never bumped, which keeps collection
+// creation free; compaction may drop a generation record only when
+// no segment minted under its rooth survives.
+const genValueSize = 4
+
+// GenKey returns the index key of rooth's generation record: rooth
+// in the subkey layout with kind 0 and a zero segid. NewSubkey and
+// DecodeSubkey reject kind 0, so no per-type segment can collide.
+func GenKey(rooth uint64) []byte {
+	b := make([]byte, SubkeySize)
+	binary.LittleEndian.PutUint64(b, rooth)
+	return b
+}
+
+// genRecord builds the generation record for a GENBUMP key.
+func genRecord(key []byte, gen uint32) *Record {
+	v := make([]byte, genValueSize)
+	binary.LittleEndian.PutUint32(v, gen)
+	return &Record{RType: RecMeta, Key: key, Value: v}
+}
+
+// genOf reads the generation out of a generation record.
+func genOf(rec *Record) (uint32, error) {
+	if rec.RType != RecMeta || len(rec.Value) != genValueSize {
+		return 0, fmt.Errorf("sqlo1b: generation record with rtype %d and %d value bytes", rec.RType, len(rec.Value))
+	}
+	return binary.LittleEndian.Uint32(rec.Value), nil
+}
+
 // The batch high-water mark (doc 03 section 12.2): the last frame of
 // every ApplyBatch is a PUT carrying an rtype-meta record with key hw
 // and the batch seq as an 8-byte LE value. Replay folds it into the
