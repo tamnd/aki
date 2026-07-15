@@ -1,0 +1,192 @@
+package sqlo1_test
+
+// The slice's namesake test: the Tiered runtime over the real Track B
+// store. The white-box suite in tiered_test.go pins the mechanics over
+// the placeholder store; this file proves the wiring end to end against
+// sqlo1b, including a WAL-replay reopen, because "works over MemStore"
+// says nothing about a backend with real durability points. It lives in
+// the external test package: engine/sqlo1b imports engine/sqlo1, so the
+// reverse import is test-only by construction.
+
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"path/filepath"
+	"testing"
+
+	"github.com/tamnd/aki/engine/sqlo1"
+	"github.com/tamnd/aki/engine/sqlo1b"
+)
+
+const bWalSeg = 1 << 20
+
+func newTieredOverB(t *testing.T, db *sqlo1b.Store, entries int, promoteP float64, seed uint64) *sqlo1.Tiered {
+	t.Helper()
+	return sqlo1.NewTiered(db, sqlo1.TieredConfig{
+		Budget:   sqlo1.Budget{Entries: entries, Arenas: 64 << 20},
+		PromoteP: promoteP,
+		Seed:     seed,
+	})
+}
+
+func TestTieredOverSqlo1b(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tiered.aki")
+	db, err := sqlo1b.CreateStore(path, bWalSeg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { db.Close() }()
+
+	// Small tier over a bigger keyspace, so the traffic below constantly
+	// drains, evicts, cold-reads, and promotes against the real format.
+	tr := newTieredOverB(t, db, 64, 0.5, 42)
+	rng := rand.New(rand.NewSource(42))
+	shadow := map[string]string{}
+	keys := make([]string, 400)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("bkey%03d", i)
+	}
+
+	for op := range 6000 {
+		k := keys[rng.Intn(len(keys))]
+		switch rng.Intn(10) {
+		case 0:
+			got, err := tr.Del(ctx, []byte(k))
+			if err != nil {
+				t.Fatalf("op %d: Del(%s): %v", op, k, err)
+			}
+			if _, want := shadow[k]; got != want {
+				t.Fatalf("op %d: Del(%s) = %v, want %v", op, k, got, want)
+			}
+			delete(shadow, k)
+		case 1, 2, 3:
+			v := fmt.Sprintf("val-%d-%s", op, k)
+			if err := tr.Set(ctx, []byte(k), []byte(v), sqlo1.TagString); err != nil {
+				t.Fatalf("op %d: Set(%s): %v", op, k, err)
+			}
+			shadow[k] = v
+		default:
+			v, ok, err := tr.Get(ctx, []byte(k))
+			if err != nil {
+				t.Fatalf("op %d: Get(%s): %v", op, k, err)
+			}
+			want, wantOK := shadow[k]
+			if ok != wantOK || (ok && string(v) != want) {
+				t.Fatalf("op %d: Get(%s) = %q %v, want %q %v", op, k, v, ok, want, wantOK)
+			}
+		}
+		if op%1499 == 0 {
+			if err := tr.Flush(ctx); err != nil {
+				t.Fatalf("op %d: Flush: %v", op, err)
+			}
+			if op%2998 == 0 {
+				if err := db.Checkpoint(); err != nil {
+					t.Fatalf("op %d: Checkpoint: %v", op, err)
+				}
+			}
+		}
+	}
+	if err := tr.Flush(ctx); err != nil {
+		t.Fatalf("final Flush: %v", err)
+	}
+	st := tr.Stats()
+	if st.ColdHits == 0 || st.Promotions == 0 || st.BatchReads == 0 {
+		t.Fatalf("traffic never exercised the cold path: %+v", st)
+	}
+	if st.DirtyBytes != 0 {
+		t.Fatalf("flushed tier still dirty: %+v", st)
+	}
+
+	// An MGET-shaped read across the whole keyspace: hot hits, one
+	// coalesced cold round for everything else, all against the shadow.
+	all := make([][]byte, len(keys))
+	for i, k := range keys {
+		all[i] = []byte(k)
+	}
+	out, err := tr.BatchGet(ctx, all, nil)
+	if err != nil {
+		t.Fatalf("BatchGet: %v", err)
+	}
+	for i, k := range keys {
+		want, wantOK := shadow[k]
+		got, gotOK := string(out[i]), out[i] != nil
+		if gotOK != wantOK || (gotOK && got != want) {
+			t.Fatalf("batch %s = %q %v, want %q %v", k, got, gotOK, want, wantOK)
+		}
+	}
+
+	// Reopen from disk: half the traffic is in the checkpointed index,
+	// the rest replays from the WAL tail. A fresh tier over the reopened
+	// store must see exactly the shadow, first cold, then promoted.
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	db2, err := sqlo1b.OpenStore(path, bWalSeg)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer db2.Close()
+	if got, want := db2.Stats().Keys, int64(len(shadow)); got != want {
+		t.Fatalf("reopened store holds %d keys, shadow %d", got, want)
+	}
+	tr2 := newTieredOverB(t, db2, 64, 1.0, 43)
+	for _, k := range keys {
+		v, ok, err := tr2.Get(ctx, []byte(k))
+		if err != nil {
+			t.Fatalf("reopened Get(%s): %v", k, err)
+		}
+		want, wantOK := shadow[k]
+		if ok != wantOK || (ok && string(v) != want) {
+			t.Fatalf("reopened Get(%s) = %q %v, want %q %v", k, v, ok, want, wantOK)
+		}
+	}
+	st2 := tr2.Stats()
+	if st2.ColdHits != int64(len(shadow)) {
+		t.Fatalf("reopened sweep cold hits %d, want %d", st2.ColdHits, len(shadow))
+	}
+	if st2.HotKeys == 0 {
+		t.Fatal("always-promote sweep left the tier empty")
+	}
+}
+
+func TestTieredOverSqlo1bExpiry(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "texp.aki")
+	db, err := sqlo1b.CreateStore(path, bWalSeg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	now := int64(1) << 41
+	tr := sqlo1.NewTiered(db, sqlo1.TieredConfig{
+		Budget:   sqlo1.Budget{Entries: 8, Arenas: 4 << 20},
+		PromoteP: 1.0,
+		Seed:     7,
+		NowMs:    func() int64 { return now },
+	})
+
+	// A volatile record drained through the tier keeps its expiry in the
+	// real format and dies on the cold path once it is due.
+	if err := tr.Set(ctx, []byte("v"), []byte("x"), sqlo1.TagString); err != nil {
+		t.Fatal(err)
+	}
+	tr.SetExpireForTest([]byte("v"), uint32(uint64(now+30_000+1023)>>10))
+	if err := tr.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tr.EvictAllForTest()
+	if _, ok, _ := tr.Get(ctx, []byte("v")); !ok {
+		t.Fatal("volatile key missing before due time")
+	}
+	tr.EvictAllForTest()
+	now += 60_000
+	if err := tr.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := tr.Get(ctx, []byte("v")); ok {
+		t.Fatal("expired record served from the real cold path")
+	}
+}
