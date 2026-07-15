@@ -12,6 +12,7 @@ on:
       - 'engine/sqlo1a/**'
       - 'engine/sqlo1b/**'
       - 'cmd/sqlo1srv/**'
+      - 'cmd/sqlo1crash/**'
       - 'scripts/sqlo1-import-boundary.sh'
       - '.github/workflows/sqlo1.yml'
   pull_request:
@@ -20,6 +21,7 @@ on:
       - 'engine/sqlo1a/**'
       - 'engine/sqlo1b/**'
       - 'cmd/sqlo1srv/**'
+      - 'cmd/sqlo1crash/**'
       - 'scripts/sqlo1-import-boundary.sh'
       - '.github/workflows/sqlo1.yml'
 
@@ -42,19 +44,19 @@ jobs:
           cache: true
       - name: gofmt
         run: |
-          unformatted=$(gofmt -l engine/sqlo1 engine/sqlo1a engine/sqlo1b cmd/sqlo1srv)
+          unformatted=$(gofmt -l engine/sqlo1 engine/sqlo1a engine/sqlo1b cmd/sqlo1srv cmd/sqlo1crash)
           if [ -n "$unformatted" ]; then
             echo "These files need gofmt -s -w:"
             echo "$unformatted"
             exit 1
           fi
       - name: go vet
-        run: go vet ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv
+        run: go vet ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv ./cmd/sqlo1crash
       - name: import boundary
         run: ./scripts/sqlo1-import-boundary.sh
       - name: build
-        run: go build ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv
+        run: go build ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv ./cmd/sqlo1crash
       - name: test
-        run: go test -race -count=1 ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv/...
+        run: go test -race -count=1 ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv/... ./cmd/sqlo1crash/...
       - name: fuzz burn
         run: go test -run='^$' -fuzz=FuzzParseCommand -fuzztime=20s ./engine/sqlo1
