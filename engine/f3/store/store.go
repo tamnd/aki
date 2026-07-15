@@ -235,6 +235,29 @@ func (s *Store) ArenaBytes() (used, total uint64) {
 	return s.arena.used(), uint64(len(s.arena.buf))
 }
 
+// ColdProgress reports the cold region's logical append cursor, the block-not-
+// drop progress signal (spec 2064/f3/06 section 8.2). It advances at every
+// reserve and append into the cold log, so a change since a parked write's
+// snapshot is the earliest evidence that bytes are leaving RAM and the write is
+// worth retrying. Zero without a cold region, where no drain runs and no write
+// ever parks on fullness. One relaxed load on the owner goroutine.
+func (s *Store) ColdProgress() uint64 {
+	if s.cold == nil {
+		return 0
+	}
+	return s.cold.tail
+}
+
+// ColdDraining reports whether the cold migrator has work in flight or pending:
+// a staged drain not yet flipped (migrating > 0) or resident charge still past
+// the low-water mark (NeedsColdDrain). Block-not-drop reads it to tell a stalled
+// shard, where neither holds and the cold cursor is static, from one still
+// reclaiming, so it only surfaces ErrFull when no progress is possible. Owner
+// goroutine only.
+func (s *Store) ColdDraining() bool {
+	return s.migrating > 0 || s.NeedsColdDrain()
+}
+
 // Get copies the value for key into dst (reusing its capacity) and reports
 // whether the key is present. Clockless form of GetString: it never reaps, so
 // it is for callers with no expiry semantics.
