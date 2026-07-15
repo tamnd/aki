@@ -215,6 +215,29 @@ func (s *Store) bringUp(h uint64, slot *uint64, off uint64) uint64 {
 	return noff
 }
 
+// promoteOnColdRead runs the cold-read doorkeeper (colddoor.go) for a value read
+// that resolved to the cold frame at off. A first sighting marks the key and
+// returns false, so the caller serves the frame and the key stays cold; a second
+// sighting within the window promotes the frame back to the arena and returns
+// true, so the caller reads the now-resident record. Promotion is skipped when
+// the fill sits at the cap: a read never pushes past it, the boundary demotion
+// owns crossing (the maybePromote rule). Writes never reach here; a write's
+// bring-up is unconditional (findResident). The caller guarantees ltmOn.
+func (s *Store) promoteOnColdRead(h uint64, slot *uint64, off uint64) bool {
+	if s.door == nil {
+		return false
+	}
+	if !s.door.test(h) {
+		s.door.mark(h)
+		return false
+	}
+	if s.spillNow(0) {
+		return false
+	}
+	s.bringUp(h, slot, off)
+	return !slotCold(*slot)
+}
+
 // dropColdEntry retires a cold key: the slot is already cleared by the caller,
 // so the frame is unreferenced and its bytes fall to the cold region's eventual
 // compaction. No pread and no dead charge, matching doc 06 section 7.3: cold

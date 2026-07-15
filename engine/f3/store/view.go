@@ -32,12 +32,30 @@ import (
 // the view (Reply.Bulk and AppendFanValue copy immediately) before its next
 // store call.
 func (s *Store) GetView(key []byte, now int64) ([]byte, bool) {
-	slot, addr, _ := s.findResident(Hash(key), key, now)
+	h := Hash(key)
+	slot, addr, _ := s.findLive(h, key, now)
 	if addr == 0 {
 		return nil, false
 	}
+	if slotCold(*slot) {
+		return s.coldViewRef(h, slot, addr)
+	}
 	s.touchSlot(slot)
 	return s.readValueRef(addr)
+}
+
+// coldViewRef serves a cold value as a view and runs the read doorkeeper. On a
+// promoting second sighting the record is resident, so it returns an arena view
+// of the brought-up record; otherwise it returns the frame bytes in the cold
+// scratch, valid under the same GetView lifetime rule as the log-resident view
+// readValueRef returns. A read no longer promotes a cold key unconditionally the
+// way a bring-up would; the doorkeeper decides, so a one-hit cold GET leaves the
+// working set in place.
+func (s *Store) coldViewRef(h uint64, slot *uint64, off uint64) ([]byte, bool) {
+	if s.ltmOn && s.promoteOnColdRead(h, slot, off) {
+		return s.readValueRef(*slot & addrMask)
+	}
+	return s.coldValue(off)
 }
 
 // GetViewStream is GetView with the chunked band split out for streaming,
@@ -45,9 +63,16 @@ func (s *Store) GetView(key []byte, now int64) ([]byte, bool) {
 // a ChunkStream and no bytes, everything else through readValueRef under the
 // GetView lifetime rule.
 func (s *Store) GetViewStream(key []byte, now int64) ([]byte, *ChunkStream, bool) {
-	slot, addr, _ := s.findResident(Hash(key), key, now)
+	h := Hash(key)
+	slot, addr, _ := s.findLive(h, key, now)
 	if addr == 0 {
 		return nil, nil, false
+	}
+	if slotCold(*slot) {
+		// Only the self-contained bands demote, so a cold hit is never chunked:
+		// serve it through the same doorkeeper-gated view as GetView.
+		v, ok := s.coldViewRef(h, slot, addr)
+		return v, nil, ok
 	}
 	s.touchSlot(slot)
 	if s.recFlags(addr)&flagChunked != 0 {

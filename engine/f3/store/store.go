@@ -42,6 +42,10 @@ type Store struct {
 	coldRecs uint64
 	coldBuf  []byte
 	frameBuf []byte
+	// door is the cold-read doorkeeper (colddoor.go): nil without a cold region,
+	// so the resident path never touches it. A cold read that misses the arena
+	// consults it, and only a second sighting promotes the frame back.
+	door *coldDoor
 
 	// coldHand is the whole-record migrator's clock position (migrate.go), the
 	// directory index its bounded pass resumes from. Separate from demoteHand:
@@ -200,6 +204,7 @@ func Open(o Options) (*Store, error) {
 			return nil, err
 		}
 		s.cold = c
+		s.door = newColdDoor(coldDoorBits)
 		s.reserveColdNull()
 	}
 	return s, nil
@@ -323,5 +328,8 @@ func (s *Store) Reset() {
 		s.cold.werr = nil
 		s.cold.dead = 0
 		s.reserveColdNull()
+	}
+	if s.door != nil {
+		s.door.reset()
 	}
 }
