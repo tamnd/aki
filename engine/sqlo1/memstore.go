@@ -55,7 +55,13 @@ func (s *MemStore) ApplyBatch(ctx context.Context, b *DrainBatch) error {
 			delete(s.recs, string(op.Rec.Key))
 			continue
 		}
-		s.recs[string(op.Rec.Key)] = op.Rec
+		// The batch memory belongs to the caller (it may alias arena
+		// bytes the next write rewrites), so a store that keeps records
+		// in RAM clones what it keeps.
+		rec := op.Rec
+		rec.Key = append([]byte(nil), op.Rec.Key...)
+		rec.Value = append([]byte(nil), op.Rec.Value...)
+		s.recs[string(rec.Key)] = rec
 	}
 	s.highWater = b.Seq
 	return nil
