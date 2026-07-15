@@ -31,8 +31,14 @@ aki-heap-*.prof
 # Keep only the summary notes (results/f3/*.md), cells.csv, summary.txt, env.txt,
 # binaries.sha256, and the summarizer/driver scripts. Re-run the box to regenerate raw cells.
 results/f3/**/cells/
+results/f3/**/raw/
 results/f3/**/matrix*/
 results/f3/**/*.rep*.csv
+results/f3/**/*rep*-a.csv
+results/f3/**/*rep*-b.csv
+results/f3/**/*.memory.txt
+results/f3/**/*.server.log
+results/f3/**/*.affinity.txt
 results/f3/**/*.json
 results/f3/**/*.err
 results/f3/**/*.meta
