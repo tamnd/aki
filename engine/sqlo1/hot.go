@@ -139,16 +139,27 @@ func (t *HotTable) expired(hd *hdr) bool {
 // A dirty tombstone is a miss: the key is gone, its header just has not
 // drained yet. An expired key is a miss too; the wheel reaps it later.
 func (t *HotTable) Get(key []byte) ([]byte, bool) {
+	v, hit, _ := t.probeRead(key)
+	return v, hit
+}
+
+// probeRead is the tiered read path's hot step. A live key answers with
+// its value and a read-stamp touch. A tombstone or an expired key answers
+// definitively with no value: the key is gone, and whatever the store
+// still holds under it is stale or already dead, so the caller must not
+// go cold. Only a key the table has never heard of leaves the question
+// open (definitive false), and that is the cold-miss door.
+func (t *HotTable) probeRead(key []byte) (val []byte, hit, definitive bool) {
 	s, ok := t.lookup(maphash.Bytes(t.seed, key), key)
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
 	hd := &t.hdrs[s]
 	if hd.valRef == 0 || t.expired(hd) {
-		return nil, false
+		return nil, false, true
 	}
 	t.touchRead(hd)
-	return t.vals.data(hd.valRef), true
+	return t.vals.data(hd.valRef), true, true
 }
 
 // setExpire stamps the coarse expiry projection on key's header; at 0
@@ -229,41 +240,13 @@ func (t *HotTable) Put(key, val []byte, tag uint8) bool {
 		return true
 	}
 
-	// Pick the slot without taking it, then fund the arena bytes; the
-	// slot is only claimed once both allocs stand, so failure unwinds to
-	// nothing.
-	var s uint32
-	fromFree := len(t.freeSlots) > 0
-	switch {
-	case fromFree:
-		s = t.freeSlots[len(t.freeSlots)-1]
-	case len(t.hdrs) < cap(t.hdrs):
-		s = uint32(len(t.hdrs))
-	default:
+	s, ok := t.claimSlot(key, val, false)
+	if !ok {
 		return false
-	}
-	keyRef := t.keys.alloc(key)
-	if keyRef == 0 {
-		return false
-	}
-	valRef := t.vals.alloc(val)
-	if valRef == 0 {
-		t.keys.release(keyRef)
-		return false
-	}
-	if fromFree {
-		t.freeSlots = t.freeSlots[:len(t.freeSlots)-1]
-	} else {
-		t.hdrs = t.hdrs[:len(t.hdrs)+1]
-	}
-	t.hdrs[s] = hdr{
-		keyRef:  keyRef,
-		valRef:  valRef,
-		klen:    uint16(len(key)),
-		state:   stateDirty,
-		typeTag: tag,
 	}
 	hd := &t.hdrs[s]
+	hd.state = stateDirty
+	hd.typeTag = tag
 	if g, ok := t.ghosts.take(h); ok {
 		// The key was evicted recently enough for its ghost to survive:
 		// restore its stamps so the evictor sees its real history, not a
@@ -276,11 +259,133 @@ func (t *HotTable) Put(key, val []byte, tag uint8) bool {
 	t.live++
 	t.dirtyBytes += len(key) + len(val)
 	t.enqueueDirty(s)
+	t.fileIndex(h, s)
+	return true
+}
+
+// claimSlot picks a free header slot without taking it, then funds the
+// arena bytes; the slot is only claimed once every alloc stands, so
+// failure unwinds to nothing. A tomb claim takes no value bytes at all,
+// which is distinct from an empty value. The header comes back filled
+// with the refs, klen, and a zero state the caller completes; the index
+// is not touched.
+func (t *HotTable) claimSlot(key, val []byte, tomb bool) (uint32, bool) {
+	var s uint32
+	fromFree := len(t.freeSlots) > 0
+	switch {
+	case fromFree:
+		s = t.freeSlots[len(t.freeSlots)-1]
+	case len(t.hdrs) < cap(t.hdrs):
+		s = uint32(len(t.hdrs))
+	default:
+		return 0, false
+	}
+	keyRef := t.keys.alloc(key)
+	if keyRef == 0 {
+		return 0, false
+	}
+	var valRef uint32
+	if !tomb {
+		valRef = t.vals.alloc(val)
+		if valRef == 0 {
+			t.keys.release(keyRef)
+			return 0, false
+		}
+	}
+	if fromFree {
+		t.freeSlots = t.freeSlots[:len(t.freeSlots)-1]
+	} else {
+		t.hdrs = t.hdrs[:len(t.hdrs)+1]
+	}
+	t.hdrs[s] = hdr{
+		keyRef: keyRef,
+		valRef: valRef,
+		klen:   uint16(len(key)),
+	}
+	return s, true
+}
+
+// fileIndex maps h to slot s, spilling to the dup side table when another
+// key already holds the primary entry.
+func (t *HotTable) fileIndex(h uint64, s uint32) {
 	if _, occupied := t.index[h]; occupied {
 		t.dups[h] = append(t.dups[h], s)
 	} else {
 		t.index[h] = s
 	}
+}
+
+// promote inserts key as resident, doc 04 section 4's cold-to-resident
+// transition: the store's copy stays authoritative, the RAM copy is a
+// free-to-evict cache, and nothing here dirties, enqueues, or counts
+// toward drain. The ghost ring hands back the key's stamps when it
+// remembers them, and the promotion itself is a read, so the read stamp
+// touches. It reports false when the table or arenas refuse; the caller
+// treats that as promotion skipped, never as pressure. A key already
+// live in the table (a duplicate cold miss inside one batch) is a
+// touch-and-succeed; a tombstone wins over any promotion, because the
+// deletion just has not drained yet.
+func (t *HotTable) promote(key, val []byte, tag uint8, gen uint32, expireLo uint32) bool {
+	if len(key) > maxKlen {
+		return false
+	}
+	h := maphash.Bytes(t.seed, key)
+	if s, ok := t.lookup(h, key); ok {
+		hd := &t.hdrs[s]
+		if hd.valRef == 0 {
+			return false
+		}
+		t.touchRead(hd)
+		return true
+	}
+	s, ok := t.claimSlot(key, val, false)
+	if !ok {
+		return false
+	}
+	hd := &t.hdrs[s]
+	// vptr 1 is "the store holds this record": the seam hands out no disk
+	// positions, and the state machine only needs nonzero-when-clean.
+	// Real positions arrive with the drain-to-extents slice.
+	hd.vptr = 1
+	hd.state = stateResident
+	hd.typeTag = tag
+	hd.gen = gen
+	hd.expireLo = expireLo
+	if g, ok := t.ghosts.take(h); ok {
+		hd.lastRead = g.lastRead
+		hd.lastWrite = g.lastWrite
+	}
+	t.touchRead(hd)
+	t.live++
+	t.fileIndex(h, s)
+	return true
+}
+
+// delCold files a dirty tombstone for a key the table does not hold but
+// the store does, so a deletion of a cold key drains exactly like any
+// other write. The caller has already established cold existence; a key
+// the table does hold is its own Del's business, and delCold refuses it.
+// Any surviving ghost is dropped: the deleted life's history must not
+// warm a future reinsert.
+func (t *HotTable) delCold(key []byte) bool {
+	if len(key) > maxKlen {
+		return false
+	}
+	h := maphash.Bytes(t.seed, key)
+	if _, ok := t.lookup(h, key); ok {
+		return false
+	}
+	s, ok := t.claimSlot(key, nil, true)
+	if !ok {
+		return false
+	}
+	hd := &t.hdrs[s]
+	hd.state = stateDirty
+	t.ghosts.take(h)
+	t.touchWrite(hd)
+	t.dirtyBytes += len(key)
+	t.enqueueDirty(s)
+	t.fileIndex(h, s)
 	return true
 }
 

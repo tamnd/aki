@@ -35,6 +35,12 @@ func (g *ghostRing) put(h uint64, lastRead, lastWrite uint32) {
 	g.slots[h%uint64(len(g.slots))] = ghostEntry{hash: h, lastRead: lastRead, lastWrite: lastWrite}
 }
 
+// peek reports whether a ghost for h survives, without clearing it; the
+// promotion decision looks before the insert path takes.
+func (g *ghostRing) peek(h uint64) bool {
+	return h != 0 && g.slots[h%uint64(len(g.slots))].hash == h
+}
+
 // take returns and clears the ghost for h, if one survived.
 func (g *ghostRing) take(h uint64) (ghostEntry, bool) {
 	if h == 0 {

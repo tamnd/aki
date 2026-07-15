@@ -15,3 +15,20 @@ const (
 	WalOpPutForTest = walOpPut
 	WalOpDelForTest = walOpDel
 )
+
+// SetExpireForTest stamps the coarse expiry projection on a hot key; the
+// real expiry surface arrives when doc 11 wires the wheel into Tiered,
+// and the sqlo1b integration test needs the stamp before that.
+func (t *Tiered) SetExpireForTest(key []byte, at uint32) {
+	t.ht.setExpire(key, at)
+}
+
+// EvictAllForTest drops every resident header, forcing the next reads
+// through the cold path.
+func (t *Tiered) EvictAllForTest() {
+	for s := range t.ht.hdrs {
+		if t.ht.hdrs[s].state == stateResident {
+			t.ht.evict(uint32(s), true)
+		}
+	}
+}
