@@ -343,9 +343,9 @@ func (t *HotTable) promote(key, val []byte, tag uint8, gen uint32, expireLo uint
 		return false
 	}
 	hd := &t.hdrs[s]
-	// vptr 1 is "the store holds this record": the seam hands out no disk
-	// positions, and the state machine only needs nonzero-when-clean.
-	// Real positions arrive with the drain-to-extents slice.
+	// vptr 1 is "the store holds this record": disk positions never
+	// cross the seam, and the state machine only needs
+	// nonzero-when-clean; cold reads go back through BatchGet.
 	hd.vptr = 1
 	hd.state = stateResident
 	hd.typeTag = tag

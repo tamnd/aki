@@ -5,9 +5,10 @@ import "context"
 // Drain defaults, doc 04 section 7. The threshold is the dirty-bytes
 // high-water mark that asks for a drain cycle; the per-cycle op cap
 // bounds one cycle's batch so the owner loop never disappears into a
-// single giant ApplyBatch. Real 4 KiB group buffers with size-class
-// sorting arrive with the Track B format; against the placeholder Store
-// the batch is just the oldest dirty records in order.
+// single giant ApplyBatch. The batch carries the oldest dirty records
+// in dirtied order; placement into 4 KiB groups, collection packing,
+// and size-class sorting happen below the seam (sqlo1b's ApplyBatch
+// does them, Track A has no notion of placement).
 const (
 	drainThreshold = 8 << 20
 	drainMaxOps    = 1024
@@ -102,9 +103,9 @@ func (d *drainer) drain(ctx context.Context) (int, error) {
 	}
 	d.seq = seq
 	for _, s := range d.slots {
-		// vptr is the batch Seq for now: the placeholder Store has no
-		// disk positions, and the state machine only needs "assigned".
-		// Track B's group buffers hand out real positions here.
+		// vptr is the batch Seq: disk positions never cross the seam
+		// (Track A has none to give), and the state machine only needs
+		// nonzero-when-clean; cold reads go back through BatchGet.
 		if !d.ht.drained(s, uint64(seq)) {
 			panic("sqlo1: collected slot left dirty state mid-cycle")
 		}
