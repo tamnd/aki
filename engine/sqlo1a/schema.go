@@ -100,8 +100,7 @@ func ensureSchema(conn *sqlite3.Conn) error {
 }
 
 func listTables(conn *sqlite3.Conn) ([]string, error) {
-	stmt, _, err := conn.Prepare(
-		`SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
+	stmt, _, err := conn.Prepare(sqlSchemaTables)
 	if err != nil {
 		return nil, err
 	}
