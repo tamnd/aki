@@ -86,6 +86,21 @@ const (
 	// deferred token.
 	drainPassCap = 32
 
+	// stageBufBytes is the starting capacity of one drain staging buffer, sized
+	// to the migration quantum (doc 06 section 10, ~1 MiB): phase 1 frames up to
+	// a quantum of records into it before handing it to the I/O worker. A single
+	// record wider than this grows the buffer, and put keeps the grown capacity
+	// for reuse. Lab-sweepable with the quantum; the cap/4 shared budget across
+	// all cold pools wires in when the quantum lands (slice-1 PR 4).
+	stageBufBytes = 1 << 20
+
+	// stagePoolMax bounds a shard's outstanding staging buffers, and with them
+	// its in-flight cold drains: the owner's get returns nil at the bound and
+	// defers the drain, the admission control on per-shard cold I/O concurrency
+	// (doc 06 section 10). The cap/4 ceiling across all cold pools refines this
+	// count once the quantum wires the shared budget.
+	stagePoolMax = 4
+
 	// timerFireCap bounds one worker timer-fire pass: fireTimers runs at most
 	// this many due deadlines back to back before returning to command
 	// processing, the sibling of drainPassCap for the deadline heap. It is off

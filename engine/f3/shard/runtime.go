@@ -219,6 +219,12 @@ func (r *Runtime) Stop() {
 	for _, w := range r.workers {
 		<-w.done
 	}
+	// The owners are gone, so no more drains can be submitted: shut each shard's
+	// I/O worker down (a no-op on a shard that never drained). This joins before
+	// the store close so an in-flight pwrite finishes against a live file.
+	for _, w := range r.workers {
+		w.io.stop()
+	}
 	// The workers are gone; releasing the value logs here is single-owner by
 	// exhaustion.
 	for _, w := range r.workers {

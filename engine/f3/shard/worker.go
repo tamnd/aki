@@ -100,6 +100,12 @@ type worker struct {
 	// see Runtime.NetWakes.
 	connWakes eventCounter
 	parks     eventCounter
+
+	// io is the shard's off-owner I/O worker (ioworker.go): the goroutine that
+	// pwrites a staged cold drain and posts the completion back to this owner.
+	// It starts on the first submit and stays dark until the M7 migrator drains
+	// a segment, so a store under its resident cap never pays for it.
+	io ioworker
 }
 
 func newWorker(id int, st *store.Store) *worker {
@@ -113,6 +119,7 @@ func newWorker(id int, st *store.Store) *worker {
 	w.ep.init()
 	w.inbound.init()
 	w.intentInbox.init()
+	w.io.init(w)
 	return w
 }
 
