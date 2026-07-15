@@ -53,8 +53,13 @@ type TieredStats struct {
 	// BatchReads counts Store.BatchGet rounds, the coalescing proof: an
 	// N-key read with M cold misses is one round, not M.
 	BatchReads int64
-	HotKeys    int
-	DirtyBytes int
+	// Evictions and EvictedBytes count eviction policy victims. Only
+	// clean residents are candidates (R-I3), so none of these cost a
+	// store write or any other IO (R-I5).
+	Evictions    int64
+	EvictedBytes int64
+	HotKeys      int
+	DirtyBytes   int
 }
 
 // Tiered is the shard runtime composite, doc 04 sections 4 through 8 wired
@@ -263,6 +268,8 @@ func (t *Tiered) Flush(ctx context.Context) error {
 // Stats snapshots the counters plus the tier's live shape.
 func (t *Tiered) Stats() TieredStats {
 	s := t.stats
+	s.Evictions = t.ev.evictions
+	s.EvictedBytes = t.ev.evictedBytes
 	s.HotKeys = t.ht.Len()
 	s.DirtyBytes = t.ht.dirtyBytes
 	return s

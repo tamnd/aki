@@ -8,19 +8,26 @@ import (
 	"testing"
 )
 
-// countingStore wraps a Store and counts BatchGet rounds, so the tests
-// can see coalescing and definitive misses instead of trusting counters
-// the code under test maintains itself.
+// countingStore wraps a Store and counts BatchGet rounds and ApplyBatch
+// calls, so the tests can see coalescing, definitive misses, and drain
+// activity instead of trusting counters the code under test maintains
+// itself.
 type countingStore struct {
 	Store
-	batchGets int
-	batchKeys int
+	batchGets    int
+	batchKeys    int
+	applyBatches int
 }
 
 func (c *countingStore) BatchGet(ctx context.Context, keys [][]byte) ([]Record, error) {
 	c.batchGets++
 	c.batchKeys += len(keys)
 	return c.Store.BatchGet(ctx, keys)
+}
+
+func (c *countingStore) ApplyBatch(ctx context.Context, b *DrainBatch) error {
+	c.applyBatches++
+	return c.Store.ApplyBatch(ctx, b)
 }
 
 // tieredRig is a Tiered over a counting MemStore with an owned clock and
