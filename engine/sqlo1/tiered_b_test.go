@@ -10,6 +10,7 @@ package sqlo1_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"path/filepath"
@@ -188,5 +189,91 @@ func TestTieredOverSqlo1bExpiry(t *testing.T) {
 	}
 	if _, ok, _ := tr.Get(ctx, []byte("v")); ok {
 		t.Fatal("expired record served from the real cold path")
+	}
+}
+
+// TestTieredWalRungOverB drives real drained writes past a tiny
+// checkpoint cadence and lets Tick take the due checkpoint: the WAL
+// rung end to end, gauge up on traffic and back down on the timer.
+func TestTieredWalRungOverB(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "twal.aki")
+	db, err := sqlo1b.CreateStore(path, bWalSeg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetCheckpointPolicy(sqlo1b.CheckpointPolicy{Bytes: 8 << 10})
+
+	tr := newTieredOverB(t, db, 256, -1, 11)
+	val := make([]byte, 1<<10)
+	for i := range 64 {
+		if err := tr.Set(ctx, fmt.Appendf(nil, "wal%03d", i), val, sqlo1.TagString); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tr.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p := db.Pressure(); p.Wal < 1 {
+		t.Fatalf("64 KiB of drained frames against an 8 KiB cadence reads %.3f, want >= 1", p.Wal)
+	}
+	if err := tr.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p := db.Pressure(); p.Wal >= 1 {
+		t.Fatalf("tick left the lag at %.3f, the due checkpoint never ran", p.Wal)
+	}
+}
+
+// TestTieredShedOverB fills a byte-capped store with unique keys, so
+// no garbage exists and compaction cannot help: writes must shed with
+// ErrShed at the hard minimum, reads and deletes must keep working,
+// and raising the cap must resume writes without a restart.
+func TestTieredShedOverB(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tshed.aki")
+	// 8 MiB WAL segments: a full drain batch of 2 KiB values buffers
+	// about 2 MiB of frames, and one batch must fit one segment.
+	db, err := sqlo1b.CreateStore(path, 8<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxBytes(16 << 20)
+
+	tr := newTieredOverB(t, db, 16384, -1, 13)
+	val := make([]byte, 2<<10)
+	var shedErr error
+	shedAt := -1
+	for i := range 20000 {
+		if err := tr.Set(ctx, fmt.Appendf(nil, "shed%05d", i), val, sqlo1.TagString); err != nil {
+			shedErr, shedAt = err, i
+			break
+		}
+	}
+	if shedErr == nil {
+		t.Fatal("40 MiB of unique writes against a 16 MiB cap never shed")
+	}
+	if !errors.Is(shedErr, sqlo1.ErrShed) {
+		t.Fatalf("write %d failed with %v, want ErrShed", shedAt, shedErr)
+	}
+
+	// The honest-failure contract: the store is full, not broken.
+	if v, ok, err := tr.Get(ctx, []byte("shed00000")); err != nil || !ok || len(v) != len(val) {
+		t.Fatalf("Get under shed: ok=%v err=%v", ok, err)
+	}
+	if gone, err := tr.Del(ctx, []byte("shed00000")); err != nil || !gone {
+		t.Fatalf("Del under shed: gone=%v err=%v, deletes stay exempt", gone, err)
+	}
+
+	// More budget is the operator's other exit, and it needs no
+	// restart: the very next write goes through.
+	db.SetMaxBytes(1 << 30)
+	if err := tr.Set(ctx, []byte("after"), val, sqlo1.TagString); err != nil {
+		t.Fatalf("Set after raising the cap: %v", err)
+	}
+	if v, ok, err := tr.Get(ctx, []byte("after")); err != nil || !ok || len(v) != len(val) {
+		t.Fatalf("Get after recovery: ok=%v err=%v", ok, err)
 	}
 }

@@ -68,6 +68,20 @@ func (g *Grid) ExtentCount() uint64 { return uint64(len(g.states)) }
 // State reports one extent's lifecycle position.
 func (g *Grid) State(ext uint64) ExtentState { return g.states[ext] }
 
+// FreeCount counts free extents by scanning the states. The pressure
+// gauge calls it only on byte-capped stores; if the scan ever shows on
+// a profile at scale, the fix is a running counter maintained at the
+// state transitions.
+func (g *Grid) FreeCount() uint64 {
+	var n uint64
+	for _, st := range g.states {
+		if st == StateFree {
+			n++
+		}
+	}
+	return n
+}
+
 // Grow appends n free extents (the file grows by whole extents and
 // never shrinks in v0).
 func (g *Grid) Grow(n uint64) {

@@ -84,6 +84,10 @@ type wal struct {
 	cur     int
 	nextSeq uint64
 	trimSeq uint64
+	// sinceTrim gauges checkpoint lag for the backpressure ladder:
+	// frame bytes appended past the trim barrier. SetTrim resets it
+	// and Replay rebuilds it, so the gauge survives a reopen.
+	sinceTrim int64
 	// buf accumulates appended frames until Flush, which is the group
 	// commit barrier: one command's frames go in one batch, so they
 	// never straddle it.
@@ -250,6 +254,7 @@ func (w *wal) Append(shard uint16, op, oflags uint8, payload []byte) (uint64, er
 	b[27] = oflags
 	binary.LittleEndian.PutUint32(b[4:8], crc32.Checksum(b[8:], walCastagnoli))
 	w.pending++
+	w.sinceTrim += int64(flen)
 	return seq, nil
 }
 
@@ -295,8 +300,20 @@ func (w *wal) LastSeq() uint64 { return w.nextSeq - 1 }
 
 // SetTrim advances the trim barrier: frames at or below seq are
 // subsumed by checkpointed state, and segments wholly below it become
-// recyclable the next time the ring advances.
-func (w *wal) SetTrim(seq uint64) { w.trimSeq = seq }
+// recyclable the next time the ring advances. The lag gauge resets
+// here; a frame appended before the trim but sequenced after it (the
+// CKPT frame) goes uncounted, which under-reports by a few bytes and
+// can only delay the next checkpoint, never force a spurious one.
+func (w *wal) SetTrim(seq uint64) {
+	w.trimSeq = seq
+	w.sinceTrim = 0
+}
+
+// SinceTrim reports frame bytes appended past the trim barrier, the
+// WAL rung's checkpoint-lag signal. After a reopen it covers the
+// replayed tail, so a crash-looping process that never checkpoints
+// still feels the pressure.
+func (w *wal) SinceTrim() int64 { return w.sinceTrim }
 
 // advance seals the current segment (a zero flen sentinel ends its
 // chain) and moves writing to a recycled segment when one is wholly
@@ -339,6 +356,14 @@ func (w *wal) addSegment() error {
 // the first torn frame, and cost is O(live WAL), never O(data), which
 // is principle P6.
 func (w *wal) Replay(fn func(walFrame) error) error {
+	w.sinceTrim = 0
+	counted := func(fr walFrame) error {
+		w.sinceTrim += int64(walHdrSize + len(fr.Payload))
+		if fn == nil {
+			return nil
+		}
+		return fn(fr)
+	}
 	order := w.liveOrder()
 	after := uint64(0)
 	for _, i := range order {
@@ -348,7 +373,7 @@ func (w *wal) Replay(fn func(walFrame) error) error {
 			continue
 		}
 		seg := w.segs[i]
-		if err := w.scanSegment(&seg, after, fn); err != nil {
+		if err := w.scanSegment(&seg, after, counted); err != nil {
 			return err
 		}
 		if seg.lastSeq == 0 || (after != 0 && seg.firstSeq != after+1) {
