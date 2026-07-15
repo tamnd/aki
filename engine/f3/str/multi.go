@@ -31,9 +31,20 @@ func MGetShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // empty on success; on a store error it carries the wire message and the
 // gather side reports the first one. Pairs before a failing pair stay
 // written: per-key atomicity, not command atomicity.
+//
+// Under memory pressure a pair that cannot allocate parks the sub-command
+// instead of dropping it (block-not-drop, F9): ParkFullAt records the failing
+// pair's index and the worker retries the sub-command when a drain frees room,
+// resuming at that pair (ResumeIndex) so the committed prefix is not re-applied.
+// The parked slot writes no partial; the retry writes FanOK on success or, past a
+// genuine stall, the OOM partial the worker frames. Only store.ErrFull parks; any
+// other store error still reports through the partial at once.
 func MSetShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	for i := 0; i+1 < len(args); i += 2 {
+	for i := cx.ResumeIndex(); i+1 < len(args); i += 2 {
 		if err := cx.St.SetString(args[i], args[i+1], cx.NowMs, 0, false); err != nil {
+			if cx.ParkFullAt(err, i) {
+				return
+			}
 			r.FanErrString(storeErr(err))
 			return
 		}

@@ -68,6 +68,18 @@ type Ctx struct {
 	// driver rather than self-registering a second time.
 	parkFull bool
 	retrying bool
+
+	// resume is the argument index a retried multi-key write picks up from
+	// (backpressure.go). A fan sub-command that parks part-way through its pairs
+	// records how far it committed through ParkFullAt; the worker seeds this before
+	// the retry re-runs the handler, so MSetShard restarts at the first unwritten
+	// pair instead of re-applying the committed prefix. Re-applying a committed pair
+	// would write a fresh record and strand the old one as dead bytes, re-consuming
+	// the very space the drain just freed and starving the failing pair forever, so
+	// resume-from-first-unwritten is a liveness requirement, not just an
+	// optimization. A fresh call runs at 0; single-key writes never set it. Owner
+	// goroutine only.
+	resume int
 }
 
 // ParkFull declares a write cannot allocate right now and parks it for retry
@@ -80,12 +92,28 @@ type Ctx struct {
 // handler with no owner to park at falls back to writing the error, keeping the
 // contract total. Owner goroutine only.
 func (cx *Ctx) ParkFull(err error) bool {
+	return cx.ParkFullAt(err, 0)
+}
+
+// ParkFullAt is ParkFull for a multi-key write that has already committed some of
+// its pairs before it ran out of room: resume is the argument index the retry
+// must restart at, so the committed prefix is not re-applied. It parks only on
+// store.ErrFull; any other error (or nil), or a bare Ctx with no owner, returns
+// false so the handler writes its own reply. The single-key ParkFull is this with
+// resume 0. Owner goroutine only.
+func (cx *Ctx) ParkFullAt(err error, resume int) bool {
 	if err != store.ErrFull || cx.w == nil {
 		return false
 	}
 	cx.parkFull = true
+	cx.resume = resume
 	return true
 }
+
+// ResumeIndex is the argument index a retried multi-key write resumes from, 0 on
+// a fresh call (the resume field). A fan sub-command reads it to skip the pairs it
+// committed before it parked. Owner goroutine only.
+func (cx *Ctx) ResumeIndex() int { return cx.resume }
 
 // BackpressureWaits is the cumulative number of writes this shard has parked on a
 // full arena (backpressure.go), the count INFO surfaces as backpressure_waits.

@@ -18,7 +18,154 @@ const (
 	opBpEcho
 	opBpParkAlways
 	opBpSet
+	opBpMSet
+	opBpMSetStall
 )
+
+// msetProbe backs a synthetic MSET sub-command that mirrors str.MSetShard's park
+// and resume shape (loop from ResumeIndex, ParkFullAt the failing pair, FanOK on
+// completion), so the rail's fan-sub park path can be driven deterministically
+// without a real store crossing its resident cap mid-command.
+type msetProbe struct {
+	writes      map[string]int // key -> times committed, to catch a re-applied prefix
+	parkAt      int            // arg index at which the first pass parks
+	parked      bool           // whether it has parked once already
+	parkResume  int            // ResumeIndex observed on the parking pass
+	doneResume  int            // ResumeIndex observed on the completing pass
+	doneReached bool
+}
+
+// msetHandler runs the probe: it commits each pair into writes, parks once at
+// parkAt on store.ErrFull recording where it resumed from, and answers FanOK when
+// it reaches the end.
+func msetHandler(p *msetProbe) Handler {
+	return func(cx *Ctx, a [][]byte, r Reply) {
+		start := cx.ResumeIndex()
+		for i := start; i+1 < len(a); i += 2 {
+			if i == p.parkAt && !p.parked {
+				p.parked = true
+				p.parkResume = start
+				cx.ParkFullAt(store.ErrFull, i)
+				return
+			}
+			p.writes[string(a[i])]++
+		}
+		p.doneResume = start
+		p.doneReached = true
+		r.FanOK()
+	}
+}
+
+// TestBackpressureFanParkResumesAndFolds parks a multi-key fan sub-command
+// part-way through its pairs and completes it on retry, the slice-2b rail. Three
+// properties: the parked sub produces no folded reply while it waits; the retry
+// resumes at the pair it parked on, not from zero, so the committed prefix is
+// written exactly once (a re-applied prefix would strand dead bytes and re-consume
+// the freed space); and the delayed partial folds through mergeFan into the single
+// +OK the coordinator emits.
+func TestBackpressureFanParkResumesAndFolds(t *testing.T) {
+	p := &msetProbe{writes: map[string]int{}, parkAt: 4}
+	rt := New(1, testArena, testSeg)
+	rt.Use([]Handler{opBpMSet: msetHandler(p)})
+	c := rt.NewConn()
+	w := rt.workers[0]
+
+	keys := args("k0", "k1", "k2", "k3", "k4", "k5")
+	vals := args("v0", "v1", "v2", "v3", "v4", "v5")
+	if err := c.DoFan(opBpMSet, FanOK, keys, vals); err != nil {
+		t.Fatal(err)
+	}
+	c.Flush()
+	w.drainAndExecute()
+
+	// The sub-command parked mid-pairs: one waiter, its batch held, and nothing
+	// delivered, so the coordinator has folded no partial yet.
+	if len(w.fullWaiters) != 1 {
+		t.Fatalf("fullWaiters = %d, want 1", len(w.fullWaiters))
+	}
+	if got := drainAvail(c); len(got) != 0 {
+		t.Fatalf("delivered %d replies while the fan sub was parked, want 0", len(got))
+	}
+	if p.parkResume != 0 {
+		t.Fatalf("first pass resumed at %d, want 0 (a fresh sub starts at pair 0)", p.parkResume)
+	}
+	// The prefix before parkAt is committed; the parked pair and its suffix are not.
+	for _, k := range []string{"k0", "k1"} {
+		if p.writes[k] != 1 {
+			t.Fatalf("prefix key %s committed %d times before park, want 1", k, p.writes[k])
+		}
+	}
+	if p.writes["k2"] != 0 {
+		t.Fatalf("parked pair k2 committed %d times before retry, want 0", p.writes["k2"])
+	}
+
+	// Retry: the sub resumes at the parked pair, finishes the suffix, and folds.
+	w.retryFull()
+	if len(w.fullWaiters) != 0 {
+		t.Fatalf("fullWaiters = %d after retry, want 0", len(w.fullWaiters))
+	}
+	if !p.doneReached {
+		t.Fatal("sub-command never reached its FanOK after retry")
+	}
+	if p.doneResume != p.parkAt {
+		t.Fatalf("retry resumed at %d, want %d (the parked pair)", p.doneResume, p.parkAt)
+	}
+	if w.bpStalls != 0 {
+		t.Fatalf("bpStalls = %d, want 0 (the sub completed, never stalled)", w.bpStalls)
+	}
+	// Every pair committed exactly once: the resume skipped the committed prefix.
+	for _, k := range []string{"k0", "k1", "k2", "k3", "k4", "k5"} {
+		if p.writes[k] != 1 {
+			t.Fatalf("key %s committed %d times across park+retry, want exactly 1", k, p.writes[k])
+		}
+	}
+	// The delayed partial folded into one +OK, framed once by the gather.
+	got := collect(t, c, 1)
+	if !bytes.Equal(got[0], []byte("+OK\r\n")) {
+		t.Fatalf("folded MSET reply = %q, want +OK", got[0])
+	}
+}
+
+// TestBackpressureFanStallErrorsWholeCommand surfaces the OOM reply through the
+// fan gather when a sub-command can never allocate: stallOut writes the taxonomy
+// text as a FanOK error partial, not a framed reply, so mergeFan frames it exactly
+// once into the command's error. A framed Err at the waiter would be double-framed
+// here, so the single leading dash is the property under test.
+func TestBackpressureFanStallErrorsWholeCommand(t *testing.T) {
+	rt := New(1, testArena, testSeg)
+	rt.Use([]Handler{
+		opBpMSetStall: func(cx *Ctx, a [][]byte, r Reply) { cx.ParkFullAt(store.ErrFull, 0) },
+	})
+	c := rt.NewConn()
+	w := rt.workers[0]
+
+	if err := c.DoFan(opBpMSetStall, FanOK, args("k0", "k1"), args("v0", "v1")); err != nil {
+		t.Fatal(err)
+	}
+	c.Flush()
+	w.drainAndExecute()
+	if len(w.fullWaiters) != 1 {
+		t.Fatalf("fullWaiters = %d, want 1", len(w.fullWaiters))
+	}
+
+	for passes := 0; len(w.fullWaiters) > 0; passes++ {
+		if passes > bpStallWindow+4 {
+			t.Fatalf("fan sub still parked after %d passes, window is %d", passes, bpStallWindow)
+		}
+		w.retryFull()
+	}
+	if w.bpStalls != 1 {
+		t.Fatalf("bpStalls = %d, want 1", w.bpStalls)
+	}
+	got := collect(t, c, 1)
+	want := []byte("-ERR " + store.ErrFull.Error() + " (no larger-than-memory tier)\r\n")
+	if !bytes.Equal(got[0], want) {
+		t.Fatalf("stalled MSET reply = %q, want %q", got[0], want)
+	}
+	if len(got[0]) > 1 && got[0][1] == '-' {
+		t.Fatalf("stall partial was double-framed: %q", got[0])
+	}
+}
 
 // drainAvail takes whatever replies are ready on c right now, without waiting.
 func drainAvail(c *Conn) [][]byte {
