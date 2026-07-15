@@ -19,7 +19,7 @@ func TestParseCommandMultibulk(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			args, n, err := ParseCommand([]byte(tc.in))
+			args, n, err := ParseCommand([]byte(tc.in), nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -46,18 +46,18 @@ func TestParseCommandIncremental(t *testing.T) {
 	firstLen := len("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nvv\r\n")
 
 	for i := range firstLen {
-		if _, _, err := ParseCommand(full[:i]); !errors.Is(err, ErrIncomplete) {
+		if _, _, err := ParseCommand(full[:i], nil); !errors.Is(err, ErrIncomplete) {
 			t.Fatalf("prefix of %d bytes: err = %v, want ErrIncomplete", i, err)
 		}
 	}
-	args, n, err := ParseCommand(full)
+	args, n, err := ParseCommand(full, nil)
 	if err != nil || n != firstLen {
 		t.Fatalf("first command: n = %d err = %v, want %d nil", n, err, firstLen)
 	}
 	if string(args[0]) != "SET" {
 		t.Fatalf("first command args = %q", args)
 	}
-	args, n, err = ParseCommand(full[firstLen:])
+	args, n, err = ParseCommand(full[firstLen:], nil)
 	if err != nil || n != len(full)-firstLen {
 		t.Fatalf("second command: n = %d err = %v", n, err)
 	}
@@ -67,16 +67,16 @@ func TestParseCommandIncremental(t *testing.T) {
 }
 
 func TestParseCommandInline(t *testing.T) {
-	args, n, err := ParseCommand([]byte("PING\r\n"))
+	args, n, err := ParseCommand([]byte("PING\r\n"), nil)
 	if err != nil || n != 6 || len(args) != 1 || string(args[0]) != "PING" {
 		t.Fatalf("inline PING: args %q n %d err %v", args, n, err)
 	}
-	args, n, err = ParseCommand([]byte("SET  k   v\n"))
+	args, n, err = ParseCommand([]byte("SET  k   v\n"), nil)
 	if err != nil || n != 11 || len(args) != 3 {
 		t.Fatalf("inline with runs of spaces: args %q n %d err %v", args, n, err)
 	}
 	// A bare newline is consumed as an empty command.
-	args, n, err = ParseCommand([]byte("\r\n"))
+	args, n, err = ParseCommand([]byte("\r\n"), nil)
 	if err != nil || n != 2 || len(args) != 0 {
 		t.Fatalf("empty inline: args %q n %d err %v", args, n, err)
 	}
@@ -97,7 +97,7 @@ func TestParseCommandProtocolErrors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var pe *ProtoError
-			_, _, err := ParseCommand([]byte(tc.in))
+			_, _, err := ParseCommand([]byte(tc.in), nil)
 			if !errors.As(err, &pe) {
 				t.Fatalf("err = %v, want a ProtoError", err)
 			}
@@ -108,10 +108,37 @@ func TestParseCommandProtocolErrors(t *testing.T) {
 func TestParseCommandEmptyMultibulk(t *testing.T) {
 	// *0 and negative counts are consumed as empty commands, like Redis.
 	for _, in := range []string{"*0\r\n", "*-1\r\n"} {
-		args, n, err := ParseCommand([]byte(in))
+		args, n, err := ParseCommand([]byte(in), nil)
 		if err != nil || n != len(in) || len(args) != 0 {
 			t.Fatalf("%q: args %q n %d err %v", in, args, n, err)
 		}
+	}
+}
+
+func TestParseCommandReusesArgs(t *testing.T) {
+	// The connection loop passes args[:0] every command; the slice must
+	// come back on every path, including errors, so its capacity is never
+	// lost, and a second parse must fully overwrite the first.
+	args, _, err := ParseCommand([]byte("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nhello\r\n"), nil)
+	if err != nil || len(args) != 3 {
+		t.Fatalf("first parse: args %q err %v", args, err)
+	}
+	got := cap(args)
+
+	args, _, err = ParseCommand([]byte("*2\r\n$3\r\n"), args[:0])
+	if !errors.Is(err, ErrIncomplete) {
+		t.Fatalf("partial parse err = %v, want ErrIncomplete", err)
+	}
+	if cap(args) != got {
+		t.Fatalf("capacity after ErrIncomplete = %d, want %d kept", cap(args), got)
+	}
+
+	args, _, err = ParseCommand([]byte("*2\r\n$3\r\nGET\r\n$1\r\nx\r\n"), args[:0])
+	if err != nil || len(args) != 2 || string(args[0]) != "GET" || string(args[1]) != "x" {
+		t.Fatalf("reused parse: args %q err %v", args, err)
+	}
+	if cap(args) != got {
+		t.Fatalf("capacity after reuse = %d, want %d kept", cap(args), got)
 	}
 }
 
@@ -175,7 +202,7 @@ func FuzzParseCommand(f *testing.F) {
 	f.Add(bytes.Repeat([]byte("a"), 70000))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		args, n, err := ParseCommand(data)
+		args, n, err := ParseCommand(data, nil)
 		if err != nil {
 			if n != 0 {
 				t.Fatalf("error path consumed %d bytes", n)
@@ -196,7 +223,7 @@ func FuzzParseCommand(f *testing.F) {
 		// Round trip: re-encode as multibulk and parse again; the argument
 		// vectors must match byte for byte.
 		enc := encodeCommand(args)
-		args2, n2, err := ParseCommand(enc)
+		args2, n2, err := ParseCommand(enc, nil)
 		if err != nil || n2 != len(enc) {
 			t.Fatalf("re-encoded command failed to parse: n %d err %v", n2, err)
 		}
