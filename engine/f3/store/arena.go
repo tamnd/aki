@@ -274,6 +274,18 @@ func (a *arena) deadOf(si uint64) uint64 {
 	return f - uint64(l)
 }
 
+// fullyDead reports whether segment si holds no live bytes and is a legal
+// retire or free target: it has been handed out from (its cursor moved past
+// base), every record it held has since unlinked (live is zero), it is not the
+// current bump segment, and it is not already parked for reclamation. The
+// migrator's phase 2 reads it after an unlink to decide whether the flip it
+// just made emptied a segment, so the drain can hand it to the epoch path
+// instead of leaving it for the compactor.
+func (a *arena) fullyDead(si uint64) bool {
+	seg := &a.segs[si]
+	return si != a.cur && !seg.retired && seg.alloc > seg.base && seg.live == 0
+}
+
 // freeSegCount is how many whole segments the allocator can still bring in:
 // the free list plus the never-used headroom. The tightness check reads it,
 // so it is O(1) on purpose.
