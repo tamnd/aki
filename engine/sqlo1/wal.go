@@ -289,6 +289,10 @@ func (w *wal) Flush() error {
 // decides when to call it lives in the server loop.
 func (w *wal) Sync() error { return w.f.Sync() }
 
+// LastSeq reports the seq of the last appended frame, zero when the
+// WAL has never carried one; checkpoint freezes its target here.
+func (w *wal) LastSeq() uint64 { return w.nextSeq - 1 }
+
 // SetTrim advances the trim barrier: frames at or below seq are
 // subsumed by checkpointed state, and segments wholly below it become
 // recyclable the next time the ring advances.
