@@ -41,13 +41,14 @@ import (
 // F5, recovery O(WAL tail) plus O(1) root reads: TestRecoverReadsAreO1
 // proves it by construction with a counting reader.
 //
-// F6, every record self-verifies and self-describes: rcrc and the
-// full-key envelope are the B2 record envelope slice (milestone doc
-// 08-B2), which owns this invariant's direct test. B1 establishes the
-// bounds the envelope sits in: slot tables rejecting structural
-// damage (TestGroupBuildParseRoundtrip, TestParseGroupRejects,
-// TestTornSlots) and referencer checksums over the containing extent
-// (TestFullPtrVerify, TestScrubSweep).
+// F6, every record self-verifies and self-describes: rcrc over the
+// whole envelope and the mandatory full key or subkey are pinned
+// directly by TestRecordLayoutGolden, TestRecordCorruptionSweep, and
+// the two record fuzzers (FuzzRecordDecode canonical re-encode,
+// FuzzRecordRoundtrip). Around the record, slot tables reject
+// structural damage (TestGroupBuildParseRoundtrip,
+// TestParseGroupRejects, TestTornSlots) and referencer checksums
+// cover the containing extent (TestFullPtrVerify, TestScrubSweep).
 //
 // F7, record and index agree with the record authoritative: the cold
 // index is B2 work and its slices own the agreement test. The B1
