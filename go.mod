@@ -2,7 +2,10 @@ module github.com/tamnd/aki
 
 go 1.26
 
-require github.com/ncruces/go-sqlite3 v0.35.2
+require (
+	github.com/cespare/xxhash/v2 v2.3.0
+	github.com/ncruces/go-sqlite3 v0.35.2
+)
 
 require (
 	github.com/ncruces/go-sqlite3-wasm/v3 v3.2.35303 // indirect
