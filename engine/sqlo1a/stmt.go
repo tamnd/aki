@@ -61,6 +61,18 @@ const (
 	// large collections is the per-type slices' problem, priced by the
 	// batchdrain lab; at the flat seam these are index seeks on empty
 	// tables.
+	// sqlKVExpired feeds the reaper the next batch of due roots. The
+	// explicit exp > 0 term is what lets the planner use the kv_exp
+	// partial index; exp <= now matches the read path's gate boundary
+	// exactly, so a row this returns is one Get already refuses.
+	sqlKVExpired = `SELECT k FROM kv WHERE exp > 0 AND exp <= ?1 LIMIT ?2`
+
+	// sqlHElemReap drops due hash fields through the helem_exp partial
+	// index in one bounded statement. The row-value subquery stands in
+	// for DELETE ... LIMIT, which needs a nonstandard compile-time flag.
+	sqlHElemReap = `DELETE FROM helem WHERE (k, f) IN
+		(SELECT k, f FROM helem WHERE exp > 0 AND exp <= ?1 LIMIT ?2)`
+
 	sqlHElemDelRoot = `DELETE FROM helem WHERE k = ?1`
 	sqlSElemDelRoot = `DELETE FROM selem WHERE k = ?1`
 	sqlZMemDelRoot  = `DELETE FROM zmem WHERE k = ?1`
@@ -81,6 +93,8 @@ type stmts struct {
 	kvScan      *sqlite3.Stmt
 	kvScanFirst *sqlite3.Stmt
 	kvCount     *sqlite3.Stmt
+	kvExpired   *sqlite3.Stmt
+	helemReap   *sqlite3.Stmt
 	metaHW      *sqlite3.Stmt
 	metaSetHW   *sqlite3.Stmt
 
@@ -103,6 +117,8 @@ func prepareStmts(conn *sqlite3.Conn) (*stmts, error) {
 		{sqlKVScan, &s.kvScan},
 		{sqlKVScanFirst, &s.kvScanFirst},
 		{sqlKVCount, &s.kvCount},
+		{sqlKVExpired, &s.kvExpired},
+		{sqlHElemReap, &s.helemReap},
 		{sqlMetaHW, &s.metaHW},
 		{sqlMetaSetHW, &s.metaSetHW},
 	} {

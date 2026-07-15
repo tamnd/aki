@@ -62,19 +62,7 @@ func (d *DB) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 // crc the read path will verify.
 func (d *DB) applyOpLocked(op *sqlo1.Op) error {
 	if op.Del {
-		if err := bindExec(d.st.kvDel, func(s *sqlite3.Stmt) error {
-			return s.BindBlob(1, op.Rec.Key)
-		}); err != nil {
-			return fmt.Errorf("sqlo1a: delete key %x: %w", op.Rec.Key, err)
-		}
-		for _, del := range d.st.elemDelRoot {
-			if err := bindExec(del, func(s *sqlite3.Stmt) error {
-				return s.BindBlob(1, op.Rec.Key)
-			}); err != nil {
-				return fmt.Errorf("sqlo1a: sweep root %x: %w", op.Rec.Key, err)
-			}
-		}
-		return nil
+		return d.delRootLocked(op.Rec.Key)
 	}
 	rec := &op.Rec
 	crc := rowCRC(rec.Key, recordTag, rec.ExpireMs, int64(rec.Gen), rec.Value)
@@ -94,6 +82,25 @@ func (d *DB) applyOpLocked(op *sqlo1.Op) error {
 		return nil
 	}); err != nil {
 		return fmt.Errorf("sqlo1a: put key %x: %w", rec.Key, err)
+	}
+	return nil
+}
+
+// delRootLocked clears the kv row and every elem table's rows under one
+// root key, inside the caller's transaction. Drain deletes and reaped
+// expiries share it: both mean this root and everything under it is gone.
+func (d *DB) delRootLocked(key []byte) error {
+	if err := bindExec(d.st.kvDel, func(s *sqlite3.Stmt) error {
+		return s.BindBlob(1, key)
+	}); err != nil {
+		return fmt.Errorf("sqlo1a: delete key %x: %w", key, err)
+	}
+	for _, del := range d.st.elemDelRoot {
+		if err := bindExec(del, func(s *sqlite3.Stmt) error {
+			return s.BindBlob(1, key)
+		}); err != nil {
+			return fmt.Errorf("sqlo1a: sweep root %x: %w", key, err)
+		}
 	}
 	return nil
 }
