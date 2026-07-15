@@ -27,6 +27,10 @@ aki-heap-*.prof
 # ignore the cmd/aki source directory
 /aki
 
+# a lab binary a `go build` leaves in its own directory, named after it; the
+# source and README are what we track, not the compiled output
+/labs/f3/m7/02_async_drain_owner_cost/02_async_drain_owner_cost
+
 # f3 gate raw per-cell benchmark dumps: regenerable machine output from the box runs.
 # Keep only the summary notes (results/f3/*.md), cells.csv, summary.txt, env.txt,
 # binaries.sha256, and the summarizer/driver scripts. Re-run the box to regenerate raw cells.
