@@ -129,7 +129,10 @@ func TestBackpressureStallsToOOM(t *testing.T) {
 		t.Fatalf("bpStalls = %d, want 1", w.bpStalls)
 	}
 	got := collect(t, c, 1)
-	want := []byte("-ERR " + store.ErrFull.Error() + "\r\n")
+	// The store here has no cold region, so the taxonomy names the tier absent:
+	// the reply is ErrFull's text with the cause appended (backpressure.go
+	// stallOut, store.StallReason).
+	want := []byte("-ERR " + store.ErrFull.Error() + " (no larger-than-memory tier)\r\n")
 	if !bytes.Equal(got[0], want) {
 		t.Fatalf("stall reply = %q, want %q", got[0], want)
 	}

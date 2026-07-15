@@ -133,13 +133,15 @@ func (w *worker) stallCheck() {
 
 // stallOut surfaces the OOM reply to every remaining parked write and releases
 // their batches, the terminal answer when no drain progress is possible. The
-// message is store.ErrFull's own text, so a genuine stall is wire-identical to
-// the pre-block-not-drop ErrFull path a client already handles as an
-// out-of-memory refusal. It never acknowledges a write and then drops it: a
-// parked write ends in exactly one of a real reply after a drain or this OOM
-// reply after a genuine stall. Owner goroutine only.
+// message is store.ErrFull's own text with the stall taxonomy's cause appended in
+// parentheses (store.StallReason, doc 06 section 8.3): the same out-of-memory
+// class a client already handles as a refusal, now carrying why the migrator
+// could not free room (a full cold device, a cold I/O error, a stream pinning
+// migration, no tier, or an exhausted arena). It never acknowledges a write and
+// then drops it: a parked write ends in exactly one of a real reply after a drain
+// or this OOM reply after a genuine stall. Owner goroutine only.
 func (w *worker) stallOut() {
-	msg := "ERR " + store.ErrFull.Error()
+	msg := "ERR " + store.ErrFull.Error() + " (" + w.st.StallReason() + ")"
 	for _, fw := range w.fullWaiters {
 		Reply(fw).Err(msg)
 		w.releaseHold(fw.b)
