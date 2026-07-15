@@ -19,6 +19,16 @@
 // while the clock runs. RAM per key is reported as measured root and
 // fence bytes, which is what a resident hash pins beyond its hot
 // segments.
+//
+// B3 re-points the suite at Track B: the same ladder, preload, and
+// lookup drive either arm through a narrow store surface, selected by
+// -store. The A arm is the SQLite schema below; the B arm
+// (store_b.go) keeps the root as a plain record under the user key,
+// maps segments and fence pages to subkey records under a minted
+// rooth, turns a preload write set into one DrainBatch, and points
+// the checkpoint cadence and the cold boundary at the store's own
+// verbs, so the flatness curve is drawn on the backend that will
+// actually carry it.
 package main
 
 import (
@@ -75,6 +85,7 @@ const (
 
 type config struct {
 	dir         string
+	store       string
 	fields      int64
 	segMax      int
 	inlineMax   int
@@ -147,9 +158,53 @@ func segFields(cfg config, l layout, s int64) int64 {
 	return l.fps
 }
 
+// store is the backend arm under the ladder: Track A rows or Track B
+// records, one narrow surface so the shared model prices both. The
+// three getters are the cold path's three probes and the count the
+// per-op ceiling holds against on either arm, flush lands one preload
+// write set, checkpoint is the arm's WAL trim verb, and reopen is the
+// arm's cold boundary (each arm documents what that drops).
+type store interface {
+	rootGet() ([]byte, error)
+	pageGet(page int64) ([]byte, error)
+	segGet(segid int64) ([]byte, error)
+	flush(fs *flushSet) error
+	checkpoint() error
+	reopen() error
+	dataMB() float64
+	close() error
+}
+
+// flushSet is one preload write set as the model hands it down:
+// segment rows, fence page rows, the root when the batch carries it,
+// and the sequence the b arm lands as its high-water mark.
+type flushSet struct {
+	seq   int64
+	bytes int
+	segs  []idRow
+	pages []idRow
+	root  []byte
+}
+
+type idRow struct {
+	id  int64
+	row []byte
+}
+
+func openStore(cfg config, path string, key []byte) (store, error) {
+	switch cfg.store {
+	case "a":
+		return openA(path, key)
+	case "b":
+		return openB(path, key)
+	}
+	return nil, fmt.Errorf("unknown store arm %q", cfg.store)
+}
+
 type db struct {
 	conn  *sqlite3.Conn
 	path  string
+	key   []byte
 	rget  *sqlite3.Stmt
 	rput  *sqlite3.Stmt
 	sget  *sqlite3.Stmt
@@ -160,7 +215,7 @@ type db struct {
 	stmts []*sqlite3.Stmt
 }
 
-func openDB(path string) (*db, error) {
+func openA(path string, key []byte) (*db, error) {
 	conn, err := sqlite3.Open(path)
 	if err != nil {
 		return nil, err
@@ -186,7 +241,7 @@ func openDB(path string) (*db, error) {
 		conn.Close()
 		return nil, err
 	}
-	d := &db{conn: conn, path: path}
+	d := &db{conn: conn, path: path, key: key}
 	for _, s := range []struct {
 		dst **sqlite3.Stmt
 		sql string
@@ -259,6 +314,59 @@ func (d *db) getBlob2(stmt *sqlite3.Stmt, key []byte, id int64) ([]byte, error) 
 	return v, err
 }
 
+func (d *db) rootGet() ([]byte, error)           { return d.getBlob1(d.rget, d.key) }
+func (d *db) pageGet(page int64) ([]byte, error) { return d.getBlob2(d.pget, d.key, page) }
+func (d *db) segGet(segid int64) ([]byte, error) { return d.getBlob2(d.sget, d.key, segid) }
+
+// flush lands one preload write set in a single transaction: segment
+// rows, fence page rows, and the root when the batch carries it. The
+// meta hw row stays untouched, as before B3: this lab never replays.
+func (d *db) flush(fs *flushSet) error {
+	txn, err := d.conn.BeginImmediate()
+	if err != nil {
+		return err
+	}
+	fail := func(err error) error { txn.Rollback(); return err }
+	for _, s := range fs.segs {
+		if err := putBlob2(d.sput, d.key, s.id, s.row); err != nil {
+			return fail(err)
+		}
+	}
+	for _, p := range fs.pages {
+		if err := putBlob2(d.pput, d.key, p.id, p.row); err != nil {
+			return fail(err)
+		}
+	}
+	if fs.root != nil {
+		if err := putRoot(d, d.key, fs.root); err != nil {
+			return fail(err)
+		}
+	}
+	return txn.Commit()
+}
+
+func (d *db) checkpoint() error {
+	return d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+}
+
+// reopen is the cold boundary on this arm: a fresh connection, so the
+// next lookup's record reads are real B-tree descents with no page
+// cache. The model calls it before every cold rep and once before the
+// hot arm.
+func (d *db) reopen() error {
+	if err := d.close(); err != nil {
+		return err
+	}
+	nd, err := openA(d.path, d.key)
+	if err != nil {
+		return err
+	}
+	*d = *nd
+	return nil
+}
+
+func (d *db) dataMB() float64 { return fileMB(d.path) }
+
 func encodeSegAt(cfg config, l layout, s int64) []byte {
 	n := segFields(cfg, l, s)
 	buf := make([]byte, 0, segHdrSize+n*entSize)
@@ -277,10 +385,31 @@ func encodeSegAt(cfg config, l layout, s int64) []byte {
 	return buf
 }
 
-// preload writes the ladder for the configured field count: segments in
-// batched transactions, then fence pages, then the root, checkpointing
-// as it goes so the WAL never holds the dataset.
-func preload(d *db, cfg config, l layout, key []byte) (rootB int, fenceB int64, err error) {
+// flushCap caps one preload write set in bytes: the b arm applies each
+// set as a single DrainBatch that must stay well under its 64 MiB WAL
+// segment. At the default segment size the 512-row boundary in preload
+// closes sets first, so the a arm keeps its pre-B3 transaction shape.
+const flushCap = 32 << 20
+
+// preload writes the ladder for the configured field count through the
+// store: segments in batched write sets, then fence pages and the root
+// riding the final set, checkpointing as it goes so the WAL never
+// holds the dataset.
+func preload(st store, cfg config, l layout) (rootB int, fenceB int64, err error) {
+	txns := 0
+	seq := int64(0)
+	flush := func(fs *flushSet) error {
+		seq++
+		fs.seq = seq
+		if err := st.flush(fs); err != nil {
+			return err
+		}
+		if txns++; txns%cfg.ckpt == 0 {
+			return st.checkpoint()
+		}
+		return nil
+	}
+
 	if l.mode == "inline" {
 		root := make([]byte, 0, rootHdrSize+cfg.fields*entSize)
 		root = append(root, 1, 0, 0, 0)
@@ -291,51 +420,22 @@ func preload(d *db, cfg config, l layout, key []byte) (rootB int, fenceB int64, 
 		root = binary.LittleEndian.AppendUint32(root, 0)
 		body := encodeSegAt(cfg, l, 0)
 		root = append(root, body[segHdrSize:]...)
-		if err := putRoot(d, key, root); err != nil {
+		if err := flush(&flushSet{root: root}); err != nil {
 			return 0, 0, err
 		}
-		return len(root), 0, d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		return len(root), 0, st.checkpoint()
 	}
 
-	txns := 0
-	var txn sqlite3.Txn
-	inTxn := false
-	begin := func() error {
-		var err error
-		txn, err = d.conn.BeginImmediate()
-		inTxn = err == nil
-		return err
-	}
-	commit := func() error {
-		inTxn = false
-		if err := txn.Commit(); err != nil {
-			return err
-		}
-		if txns++; txns%cfg.ckpt == 0 {
-			return d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
-		}
-		return nil
-	}
-	fail := func(err error) error {
-		if inTxn {
-			txn.Rollback()
-		}
-		return err
-	}
-	if err := begin(); err != nil {
-		return 0, 0, err
-	}
+	fs := &flushSet{}
 	for s := int64(0); s < l.segs; s++ {
-		if err := putBlob2(d.sput, key, s, encodeSegAt(cfg, l, s)); err != nil {
-			return 0, 0, fail(err)
-		}
-		if (s+1)%512 == 0 {
-			if err := commit(); err != nil {
-				return 0, 0, fail(err)
-			}
-			if err := begin(); err != nil {
+		row := encodeSegAt(cfg, l, s)
+		fs.segs = append(fs.segs, idRow{id: s, row: row})
+		fs.bytes += len(row)
+		if len(fs.segs) >= 512 || fs.bytes >= flushCap {
+			if err := flush(fs); err != nil {
 				return 0, 0, err
 			}
+			fs = &flushSet{}
 		}
 	}
 
@@ -370,21 +470,25 @@ func preload(d *db, cfg config, l layout, key []byte) (rootB int, fenceB int64, 
 			for s := first; s < last; s++ {
 				page = fenceEnt(page, s)
 			}
-			if err := putBlob2(d.pput, key, p, page); err != nil {
-				return 0, 0, fail(err)
-			}
+			fs.pages = append(fs.pages, idRow{id: p, row: page})
 			fenceB += int64(len(page))
+			if fs.bytes += len(page); fs.bytes >= flushCap {
+				if err := flush(fs); err != nil {
+					return 0, 0, err
+				}
+				fs = &flushSet{}
+			}
 			root = binary.LittleEndian.AppendUint64(root, l.rangeW*uint64(first))
 			root = binary.LittleEndian.AppendUint64(root, uint64(p))
 		}
 	}
-	if err := putRoot(d, key, root); err != nil {
-		return 0, 0, fail(err)
+	// The root rides the final set with the tail segments and pages,
+	// the same single-transaction tail as before B3.
+	fs.root = root
+	if err := flush(fs); err != nil {
+		return 0, 0, err
 	}
-	if err := commit(); err != nil {
-		return 0, 0, fail(err)
-	}
-	return len(root), fenceB, d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	return len(root), fenceB, st.checkpoint()
 }
 
 func putRoot(d *db, key, v []byte) error {
@@ -423,9 +527,10 @@ func searchEnts(buf []byte, off, n int, f uint64) int {
 
 // lookup is the cold point path under measurement: root, fence page if
 // paged, segment, then an in-segment scan, returning the value and the
-// record reads it took.
-func lookup(d *db, key []byte, f uint64, field []byte) ([]byte, int, error) {
-	root, err := d.getBlob1(d.rget, key)
+// record reads it took. The counting is model-side, so the per-op
+// ceiling holds identically on both arms: three probes, never more.
+func lookup(st store, f uint64, field []byte) ([]byte, int, error) {
+	root, err := st.rootGet()
 	if err != nil {
 		return nil, 1, fmt.Errorf("root read: %w", err)
 	}
@@ -446,7 +551,7 @@ func lookup(d *db, key []byte, f uint64, field []byte) ([]byte, int, error) {
 		nPages := int(binary.LittleEndian.Uint32(root[rootHdrSize:]))
 		pi := searchEnts(root, rootHdrSize+4, nPages, f)
 		pageNo := binary.LittleEndian.Uint64(root[rootHdrSize+4+pi*fenceEntSize+8:])
-		page, err := d.getBlob2(d.pget, key, int64(pageNo))
+		page, err := st.pageGet(int64(pageNo))
 		if err != nil {
 			return nil, reads, fmt.Errorf("fence page %d read: %w", pageNo, err)
 		}
@@ -458,7 +563,7 @@ func lookup(d *db, key []byte, f uint64, field []byte) ([]byte, int, error) {
 		i := searchEnts(page, pageHdrSize, n, f)
 		segid = binary.LittleEndian.Uint64(page[pageHdrSize+i*fenceEntSize+8:]) & (1<<48 - 1)
 	}
-	seg, err := d.getBlob2(d.sget, key, int64(segid))
+	seg, err := st.segGet(int64(segid))
 	if err != nil {
 		return nil, reads, fmt.Errorf("segment %d read: %w", segid, err)
 	}
@@ -485,6 +590,7 @@ func main() {
 	var cfg config
 	quick := flag.Bool("quick", false, "shrink counts for smoke runs")
 	flag.StringVar(&cfg.dir, "dir", "", "working directory (default: a temp dir)")
+	flag.StringVar(&cfg.store, "store", "a", "backend arm: a (SQLite rows) or b (Track B records)")
 	flag.Int64Var(&cfg.fields, "fields", 1_000_000, "field count (the sweep axis, 1e2 to 1e9)")
 	flag.IntVar(&cfg.segMax, "seg", 4032, "encoded segment size in bytes")
 	flag.IntVar(&cfg.inlineMax, "inlinemax", 2048, "inline root payload cap in bytes")
@@ -530,26 +636,26 @@ func runAll(cfg config, out io.Writer) error {
 		defer os.RemoveAll(dir)
 		cfg.dir = dir
 	}
-	path := filepath.Join(cfg.dir, fmt.Sprintf("hfence-f%d.db", cfg.fields))
-	os.Remove(path)
-	os.Remove(path + "-wal")
-	os.Remove(path + "-shm")
+	path := filepath.Join(cfg.dir, fmt.Sprintf("hfence-%s-f%d.db", cfg.store, cfg.fields))
+	for _, p := range []string{path, path + "-wal", path + "-shm", path + ".aki-wal"} {
+		os.Remove(p)
+	}
 
 	key := []byte("h:fence")
-	d, err := openDB(path)
+	st, err := openStore(cfg, path, key)
 	if err != nil {
 		return err
 	}
+	defer st.close()
 	start := time.Now()
-	rootB, fenceB, err := preload(d, cfg, l, key)
+	rootB, fenceB, err := preload(st, cfg, l)
 	if err != nil {
-		d.close()
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "hfence: fields=%d mode=%s segs=%d pages=%d root=%dB fence=%dB\n",
 		cfg.fields, l.mode, l.segs, l.pages, rootB, fenceB)
 	emit(cfg, out, l, row{workload: "load", ops: int(l.segs), dur: time.Since(start),
-		rootB: rootB, fenceMB: float64(fenceB) / (1 << 20), fileMB: fileMB(path)})
+		rootB: rootB, fenceMB: float64(fenceB) / (1 << 20), fileMB: st.dataMB()})
 
 	// pick returns a random preloaded field with its expected value
 	// regenerated from the layout arithmetic.
@@ -569,25 +675,23 @@ func runAll(cfg config, out io.Writer) error {
 		return nil
 	}
 
-	// Cold arm: every lookup on a fresh connection, so each record read
-	// is a real B-tree descent with no page cache; the open itself is
-	// outside the clock.
+	// Cold arm: every timed lookup runs behind the arm's cold boundary,
+	// with the reopen outside the clock. On a that boundary is a fresh
+	// connection per lookup, so each record read is a real B-tree
+	// descent with no page cache; on b it is one checkpoint, close, and
+	// reopen of the store before the phase (store_b.go says what that
+	// drops and why per-lookup has no honest analog there).
 	lats := make([]time.Duration, 0, cfg.reps)
 	totalReads := 0
 	var dur time.Duration
-	if err := d.close(); err != nil {
-		return err
-	}
 	for range cfg.reps {
-		cd, err := openDB(path)
-		if err != nil {
+		if err := st.reopen(); err != nil {
 			return err
 		}
 		f, field, want := pick()
 		t0 := time.Now()
-		v, reads, err := lookup(cd, key, f, field)
+		v, reads, err := lookup(st, f, field)
 		lat := time.Since(t0)
-		cd.close()
 		if err != nil {
 			return err
 		}
@@ -603,19 +707,19 @@ func runAll(cfg config, out io.Writer) error {
 		p50: p50, p99: p99, maxLat: maxLat,
 		recReads: float64(totalReads) / float64(max(cfg.reps, 1))})
 
-	// Hot arm: one warm connection; the engine proper would also keep
+	// Hot arm: one warm handle. On a the reopen swaps in the single
+	// warm connection as before B3; on b it is a no-op and the store
+	// stays as the cold arm left it. The engine proper would also keep
 	// the root resident and skip even the first read, so this is the
 	// upper bound on a hot point op.
-	hd, err := openDB(path)
-	if err != nil {
+	if err := st.reopen(); err != nil {
 		return err
 	}
-	defer hd.close()
 	lats, totalReads, dur = lats[:0], 0, 0
 	for range cfg.hotreps {
 		f, field, want := pick()
 		t0 := time.Now()
-		v, reads, err := lookup(hd, key, f, field)
+		v, reads, err := lookup(st, f, field)
 		lat := time.Since(t0)
 		if err != nil {
 			return err
@@ -632,7 +736,7 @@ func runAll(cfg config, out io.Writer) error {
 		p50: p50, p99: p99, maxLat: maxLat,
 		recReads: float64(totalReads) / float64(max(cfg.hotreps, 1)),
 		rootB:    rootB, fenceMB: float64(fenceB) / (1 << 20),
-		fileMB: fileMB(path), vmhwmMB: vmhwmMB()})
+		fileMB: st.dataMB(), vmhwmMB: vmhwmMB()})
 	return nil
 }
 
@@ -677,8 +781,8 @@ func vmhwmMB() float64 {
 func emit(cfg config, out io.Writer, l layout, r row) {
 	nsPerOp := float64(r.dur.Nanoseconds()) / float64(max(r.ops, 1))
 	opsPerS := float64(r.ops) / max(r.dur.Seconds(), 1e-9)
-	fmt.Fprintf(out, "%d,%s,%s,%d,%.0f,%.0f,%d,%d,%d,%.2f,%d,%.2f,%.1f,%.1f\n",
-		cfg.fields, l.mode, r.workload, r.ops, nsPerOp, opsPerS,
+	fmt.Fprintf(out, "%s,%d,%s,%s,%d,%.0f,%.0f,%d,%d,%d,%.2f,%d,%.2f,%.1f,%.1f\n",
+		cfg.store, cfg.fields, l.mode, r.workload, r.ops, nsPerOp, opsPerS,
 		r.p50.Nanoseconds(), r.p99.Nanoseconds(), r.maxLat.Nanoseconds(),
 		r.recReads, r.rootB, r.fenceMB, r.fileMB, r.vmhwmMB)
 }

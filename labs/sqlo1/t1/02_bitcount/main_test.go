@@ -9,15 +9,18 @@ import (
 	"testing"
 )
 
-// TestRunAllSmoke runs both layouts at tiny counts and checks the CSV
-// shape: twelve columns, load plus every shape-arm-temperature row, and
-// the numeric fields parse. The answer assertions inside runAll do the
-// correctness half.
+// TestRunAllSmoke runs tiny counts on both arms (both layouts on a,
+// the column-order question being SQLite-only) and checks the CSV
+// shape: thirteen columns, load plus every shape-arm-temperature row,
+// and the numeric fields parse. The answer assertions inside runAll do
+// the correctness half.
 func TestRunAllSmoke(t *testing.T) {
-	for _, layout := range []string{"pclast", "pcfirst"} {
-		t.Run(layout, func(t *testing.T) {
+	for _, tc := range []struct{ store, layout string }{
+		{"a", "pclast"}, {"a", "pcfirst"}, {"b", "pclast"},
+	} {
+		t.Run(tc.store+"/"+tc.layout, func(t *testing.T) {
 			cfg := config{
-				dir: t.TempDir(), chunk: 8 << 10, layout: layout,
+				dir: t.TempDir(), store: tc.store, chunk: 8 << 10, layout: tc.layout,
 				sizeMB: 1, reps: 2, hotReps: 3,
 			}
 			var out bytes.Buffer
@@ -34,13 +37,16 @@ func TestRunAllSmoke(t *testing.T) {
 			}
 			for line := range strings.SplitSeq(strings.TrimSpace(out.String()), "\n") {
 				fields := strings.Split(line, ",")
-				if len(fields) != 12 {
-					t.Fatalf("row has %d fields, want 12: %q", len(fields), line)
+				if len(fields) != 13 {
+					t.Fatalf("row has %d fields, want 13: %q", len(fields), line)
 				}
-				if _, ok := want[fields[3]]; ok {
-					want[fields[3]] = true
+				if fields[0] != tc.store {
+					t.Fatalf("row carries store %q, want %q: %q", fields[0], tc.store, line)
 				}
-				for _, idx := range []int{5, 6, 7, 8, 9, 10, 11} {
+				if _, ok := want[fields[4]]; ok {
+					want[fields[4]] = true
+				}
+				for _, idx := range []int{6, 7, 8, 9, 10, 11, 12} {
 					if _, err := strconv.ParseFloat(fields[idx], 64); err != nil {
 						t.Fatalf("field %d not numeric in %q: %v", idx, line, err)
 					}
@@ -55,49 +61,41 @@ func TestRunAllSmoke(t *testing.T) {
 	}
 }
 
-// TestRangeOracle pins the range decomposition: a small bitmap kept flat
-// in RAM, stored chunked with pc, then hundreds of random byte ranges
-// where cacheCount, scanCount, and a naive popcount over the flat copy
-// must all agree, including single-chunk ranges, chunk-aligned edges,
-// and spans ending at the last byte.
+// TestRangeOracle pins the range decomposition on both arms: a small
+// bitmap kept flat in RAM, stored chunked with pc through the store's
+// own flush, then hundreds of random byte ranges where cacheCount,
+// scanCount, and a naive popcount over the flat copy must all agree,
+// including single-chunk ranges, chunk-aligned edges, and spans ending
+// at the last byte. cacheCount reads the stored pc state (pc column on
+// a, kind 2 cache segments on b), so a wrong stored popcount fails here.
 func TestRangeOracle(t *testing.T) {
+	for _, arm := range []string{"a", "b"} {
+		t.Run(arm, func(t *testing.T) { rangeOracle(t, arm) })
+	}
+}
+
+func rangeOracle(t *testing.T, arm string) {
 	const chunk = 4 << 10
 	const size = int64(7*chunk + 123)
+	cfg := config{store: arm, layout: "pclast", chunk: chunk}
 	path := filepath.Join(t.TempDir(), "oracle.db")
-	d, err := openDB(path, "pclast")
+	st, err := openStore(cfg, path, []byte("b:0000"), true)
 	if err != nil {
-		t.Fatalf("openDB: %v", err)
+		t.Fatalf("openStore: %v", err)
 	}
-	defer d.close()
+	defer st.close()
 
-	key := []byte("b:0000")
 	rng := rand.New(rand.NewSource(11))
 	flat := make([]byte, size)
 	rng.Read(flat)
-	txn, err := d.conn.BeginImmediate()
-	if err != nil {
-		t.Fatal(err)
-	}
+	var fs flushSet
 	for cid := int64(0); cid*chunk < size; cid++ {
 		row := flat[cid*chunk : min((cid+1)*chunk, size)]
-		if err := d.cput.BindBlob(1, key); err != nil {
-			t.Fatal(err)
-		}
-		if err := d.cput.BindInt64(2, cid); err != nil {
-			t.Fatal(err)
-		}
-		if err := d.cput.BindBlob(3, row); err != nil {
-			t.Fatal(err)
-		}
-		if err := d.cput.BindInt64(4, int64(popcount(row))); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := stepReset(d.cput); err != nil {
-			t.Fatal(err)
-		}
+		fs.chunks = append(fs.chunks, chunkRow{cid: cid, row: row, pc: int64(popcount(row))})
+		fs.seq = cid + 1
 	}
-	if err := txn.Commit(); err != nil {
-		t.Fatal(err)
+	if err := st.flush(&fs); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
 
 	ranges := [][2]int64{
@@ -113,14 +111,14 @@ func TestRangeOracle(t *testing.T) {
 	for _, rr := range ranges {
 		b0, b1 := rr[0], rr[1]
 		want := int64(popcount(flat[b0:b1]))
-		got, err := d.cacheCount(key, chunk, b0, b1)
+		got, err := cacheCount(st, chunk, b0, b1)
 		if err != nil {
 			t.Fatalf("cacheCount(%d, %d): %v", b0, b1, err)
 		}
 		if got != want {
 			t.Fatalf("cacheCount(%d, %d) = %d, want %d", b0, b1, got, want)
 		}
-		got, err = d.scanCount(key, chunk, b0, b1)
+		got, err = scanCount(st, chunk, b0, b1)
 		if err != nil {
 			t.Fatalf("scanCount(%d, %d): %v", b0, b1, err)
 		}
