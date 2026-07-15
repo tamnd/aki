@@ -12,9 +12,17 @@
 //
 // Hot runs with every touched key resident, which is where the shadow
 // can win; cold runs a capped resident model over a much larger
-// keyspace, where the SQL read on every miss should drown the parse and
-// the shadow should buy nothing. If the hot delta is small too, slice 4
-// ships without the shadow and its invalidation rules.
+// keyspace, where the store read on every miss should drown the parse
+// and the shadow should buy nothing. If the hot delta is small too,
+// slice 4 ships without the shadow and its invalidation rules.
+//
+// B3 re-points the suite at Track B: the same counters model drives
+// either arm through a narrow store surface, selected by -store. The
+// A arm is the SQLite path as before; the B arm (store_b.go) keeps
+// each counter as a plain record under its user key with the decimal
+// bytes as the value, turns a flush into one DrainBatch, and points
+// the checkpoint cadence at the store's own checkpoint, so one sweep
+// prices the shadow on the backend that will actually carry it.
 package main
 
 import (
@@ -48,6 +56,7 @@ INSERT OR IGNORE INTO meta (id, hw) VALUES (0, 0);`
 
 type config struct {
 	dir      string
+	store    string
 	arm      string
 	dist     string
 	keys     int
@@ -58,16 +67,54 @@ type config struct {
 	flushAt  int
 }
 
+// store is the backend arm under the counters: Track A rows or Track B
+// records, one narrow surface so the shared model above prices both.
+// get feeds the cold miss path and the oracle readback, flush lands one
+// drain-shaped write set, and checkpoint is whatever the arm's WAL trim
+// verb is.
+type store interface {
+	get(ki int) (v []byte, found bool, err error)
+	flush(fs *flushSet) error
+	checkpoint() error
+	dataMB() float64
+	close() error
+}
+
+// flushSet is one drain cycle as the model hands it down: dirty
+// counters as their decimal bytes and the high-water sequence that
+// must land atomically with them. Values may alias model buffers, so
+// an arm must not retain them past flush.
+type flushSet struct {
+	seq  int64
+	vals []valRow
+}
+
+type valRow struct {
+	ki  int
+	val []byte
+}
+
+func openStore(cfg config, path string, keys [][]byte) (store, error) {
+	switch cfg.store {
+	case "a":
+		return openA(path, keys)
+	case "b":
+		return openB(path, keys)
+	}
+	return nil, fmt.Errorf("unknown store arm %q", cfg.store)
+}
+
 type db struct {
 	conn  *sqlite3.Conn
 	path  string
+	keys  [][]byte
 	get1  *sqlite3.Stmt
 	put1  *sqlite3.Stmt
 	hw1   *sqlite3.Stmt
 	stmts []*sqlite3.Stmt
 }
 
-func openDB(path string) (*db, error) {
+func openA(path string, keys [][]byte) (*db, error) {
 	conn, err := sqlite3.Open(path)
 	if err != nil {
 		return nil, err
@@ -93,7 +140,7 @@ func openDB(path string) (*db, error) {
 		conn.Close()
 		return nil, err
 	}
-	d := &db{conn: conn, path: path}
+	d := &db{conn: conn, path: path, keys: keys}
 	for _, s := range []struct {
 		dst **sqlite3.Stmt
 		sql string
@@ -129,8 +176,10 @@ func stepReset(s *sqlite3.Stmt) (found bool, err error) {
 	return found, err
 }
 
-func (d *db) get(key []byte) ([]byte, bool, error) {
-	if err := d.get1.BindBlob(1, key); err != nil {
+// get returns the stored decimal bytes, false for a missing key. The
+// copy is deliberate: the blob column's bytes die at Reset.
+func (d *db) get(ki int) ([]byte, bool, error) {
+	if err := d.get1.BindBlob(1, d.keys[ki]); err != nil {
 		return nil, false, err
 	}
 	var v []byte
@@ -145,6 +194,40 @@ func (d *db) get(key []byte) ([]byte, bool, error) {
 	return v, found, err
 }
 
+// flush is one drain-shaped transaction: every dirty counter's decimal
+// bytes and the high-water row, committed together.
+func (d *db) flush(fs *flushSet) error {
+	txn, err := d.conn.BeginImmediate()
+	if err != nil {
+		return err
+	}
+	fail := func(err error) error { txn.Rollback(); return err }
+	for _, v := range fs.vals {
+		if err := d.put1.BindBlob(1, d.keys[v.ki]); err != nil {
+			return fail(err)
+		}
+		if err := d.put1.BindBlob(2, v.val); err != nil {
+			return fail(err)
+		}
+		if _, err := stepReset(d.put1); err != nil {
+			return fail(err)
+		}
+	}
+	if err := d.hw1.BindInt64(1, fs.seq); err != nil {
+		return fail(err)
+	}
+	if _, err := stepReset(d.hw1); err != nil {
+		return fail(err)
+	}
+	return txn.Commit()
+}
+
+func (d *db) checkpoint() error {
+	return d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+}
+
+func (d *db) dataMB() float64 { return fileMB(d.path) }
+
 // entry is one resident key. The shadow arm keeps the counter as an
 // int64 and formats at drain; the noshadow arm keeps the canonical
 // decimal bytes and reparses them on every INCR, which is exactly the
@@ -158,23 +241,25 @@ type entry struct {
 // counters is the resident model over the store: uncapped for the hot
 // phase, capped with random clean eviction (dirty entries pinned until
 // their flush) for the cold phase, the same shape sqlocache pinned.
+// seq continues from wherever the preload left the high-water mark,
+// because the store treats a stale sequence as an already-applied
+// batch.
 type counters struct {
-	d       *db
+	st      store
 	arm     string
 	m       map[int]*entry
-	keys    [][]byte
 	cap     int
 	dirty   int
 	flushAt int
 
-	seq      int64
-	flushes  int
-	flushDur []time.Duration
-	sqlReads int
+	seq        int64
+	flushes    int
+	flushDur   []time.Duration
+	storeReads int
 }
 
-func newCounters(d *db, arm string, keys [][]byte, capN, flushAt int) *counters {
-	return &counters{d: d, arm: arm, m: map[int]*entry{}, keys: keys, cap: capN, flushAt: flushAt}
+func newCounters(st store, arm string, capN, flushAt int, seq int64) *counters {
+	return &counters{st: st, arm: arm, m: map[int]*entry{}, cap: capN, flushAt: flushAt, seq: seq}
 }
 
 func (c *counters) evictOne() {
@@ -191,14 +276,14 @@ func (c *counters) evictOne() {
 func (c *counters) incr(ki int) error {
 	e, ok := c.m[ki]
 	if !ok {
-		v, found, err := c.d.get(c.keys[ki])
+		v, found, err := c.st.get(ki)
 		if err != nil {
 			return err
 		}
 		if !found {
 			return fmt.Errorf("key %d missing from store", ki)
 		}
-		c.sqlReads++
+		c.storeReads++
 		n, err := strconv.ParseInt(string(v), 10, 64)
 		if err != nil {
 			return fmt.Errorf("key %d not an integer: %w", ki, err)
@@ -228,18 +313,14 @@ func (c *counters) incr(ki int) error {
 	return nil
 }
 
-// flush drains every dirty counter as its decimal string in one
-// transaction; the shadow arm pays its one format per key here.
+// flush drains every dirty counter as its decimal string in one write
+// set; the shadow arm pays its one format per key here.
 func (c *counters) flush() error {
 	if c.dirty == 0 {
 		return nil
 	}
 	t0 := time.Now()
-	txn, err := c.d.conn.BeginImmediate()
-	if err != nil {
-		return err
-	}
-	fail := func(err error) error { txn.Rollback(); return err }
+	fs := flushSet{seq: c.seq + 1}
 	for ki, e := range c.m {
 		if !e.dirty {
 			continue
@@ -247,30 +328,16 @@ func (c *counters) flush() error {
 		if c.arm == "shadow" {
 			e.str = strconv.AppendInt(e.str[:0], e.shadow, 10)
 		}
-		if err := c.d.put1.BindBlob(1, c.keys[ki]); err != nil {
-			return fail(err)
-		}
-		if err := c.d.put1.BindBlob(2, e.str); err != nil {
-			return fail(err)
-		}
-		if _, err := stepReset(c.d.put1); err != nil {
-			return fail(err)
-		}
+		fs.vals = append(fs.vals, valRow{ki: ki, val: e.str})
 		e.dirty = false
 	}
-	c.seq++
-	if err := c.d.hw1.BindInt64(1, c.seq); err != nil {
-		return fail(err)
-	}
-	if _, err := stepReset(c.d.hw1); err != nil {
-		return fail(err)
-	}
-	if err := txn.Commit(); err != nil {
+	if err := c.st.flush(&fs); err != nil {
 		return err
 	}
+	c.seq++
 	c.dirty = 0
 	if c.flushes++; c.flushes%8 == 0 {
-		if err := c.d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		if err := c.st.checkpoint(); err != nil {
 			return err
 		}
 	}
@@ -282,6 +349,7 @@ func main() {
 	var cfg config
 	quick := flag.Bool("quick", false, "shrink counts for smoke runs")
 	flag.StringVar(&cfg.dir, "dir", "", "working directory (default: a temp dir)")
+	flag.StringVar(&cfg.store, "store", "a", "backend arm: a (SQLite rows) or b (Track B records)")
 	flag.StringVar(&cfg.arm, "arm", "shadow", "arm: shadow or noshadow")
 	flag.StringVar(&cfg.dist, "dist", "zipf", "key distribution: zipf or uniform")
 	flag.IntVar(&cfg.keys, "keys", 1000000, "preloaded key count (cold keyspace)")
@@ -324,73 +392,54 @@ func runAll(cfg config, out io.Writer) error {
 		defer os.RemoveAll(dir)
 		cfg.dir = dir
 	}
-	path := filepath.Join(cfg.dir, fmt.Sprintf("intshadow-%s.db", cfg.arm))
-	os.Remove(path)
-	os.Remove(path + "-wal")
-	os.Remove(path + "-shm")
-
-	d, err := openDB(path)
-	if err != nil {
-		return err
+	path := filepath.Join(cfg.dir, fmt.Sprintf("intshadow-%s-%s.db", cfg.store, cfg.arm))
+	for _, p := range []string{path, path + "-wal", path + "-shm", path + ".aki-wal"} {
+		os.Remove(p)
 	}
-	defer d.close()
 
 	keys := make([][]byte, cfg.keys)
 	for i := range keys {
 		keys[i] = fmt.Appendf(nil, "n:%09d", i)
 	}
+	st, err := openStore(cfg, path, keys)
+	if err != nil {
+		return err
+	}
+	defer st.close()
 
 	// Preload every key with a random counter so the parse under test
-	// works on realistic digit counts, not "0".
+	// works on realistic digit counts, not "0". The counters models
+	// below continue from this sequence.
 	start := time.Now()
 	rng := rand.New(rand.NewSource(67))
-	var buf []byte
 	const batch = 4096
 	seq := int64(0)
 	for off := 0; off < cfg.keys; off += batch {
-		txn, err := d.conn.BeginImmediate()
-		if err != nil {
-			return err
-		}
-		fail := func(err error) error { txn.Rollback(); return err }
-		for i := off; i < min(off+batch, cfg.keys); i++ {
-			buf = strconv.AppendInt(buf[:0], rng.Int63n(1_000_000_000), 10)
-			if err := d.put1.BindBlob(1, keys[i]); err != nil {
-				return fail(err)
-			}
-			if err := d.put1.BindBlob(2, buf); err != nil {
-				return fail(err)
-			}
-			if _, err := stepReset(d.put1); err != nil {
-				return fail(err)
-			}
-		}
 		seq++
-		if err := d.hw1.BindInt64(1, seq); err != nil {
-			return fail(err)
+		fs := flushSet{seq: seq}
+		for i := off; i < min(off+batch, cfg.keys); i++ {
+			fs.vals = append(fs.vals,
+				valRow{ki: i, val: strconv.AppendInt(nil, rng.Int63n(1_000_000_000), 10)})
 		}
-		if _, err := stepReset(d.hw1); err != nil {
-			return fail(err)
-		}
-		if err := txn.Commit(); err != nil {
+		if err := st.flush(&fs); err != nil {
 			return err
 		}
 		if (off/batch)%8 == 7 {
-			if err := d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			if err := st.checkpoint(); err != nil {
 				return err
 			}
 		}
 	}
-	if err := d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+	if err := st.checkpoint(); err != nil {
 		return err
 	}
 	emit(cfg, out, row{workload: "load", ops: cfg.keys, dur: time.Since(start),
-		fileMB: fileMB(path)})
+		fileMB: st.dataMB()})
 
 	// Hot phase: every touched key resident (warmed first), ops timed in
 	// blocks of 1024 because a hot INCR is tens of nanoseconds and per-op
 	// clock reads would drown it. Flush stalls land in the block tail.
-	c := newCounters(d, cfg.arm, keys, 0, cfg.flushAt)
+	c := newCounters(st, cfg.arm, 0, cfg.flushAt, seq)
 	hotPick := picker(cfg.dist, cfg.hotKeys, 89)
 	for ki := range cfg.hotKeys {
 		if err := c.incr(ki); err != nil {
@@ -421,12 +470,12 @@ func runAll(cfg config, out io.Writer) error {
 	p50, p99, maxLat := percentiles(blockLat)
 	emit(cfg, out, row{workload: "hot-incr", ops: cfg.hotOps, dur: hotWall,
 		p50: p50, p99: p99, maxLat: maxLat})
-	emitFlush(cfg, out, "hot-flush", c, path)
+	emitFlush(cfg, out, "hot-flush", c, st)
 
 	// Cold phase: a capped resident model over the whole keyspace, so
-	// most INCRs pay the SQL read and parse before the add. Per-op
+	// most INCRs pay the store read and parse before the add. Per-op
 	// timing is fine at microsecond scale.
-	c = newCounters(d, cfg.arm, keys, cfg.resident, cfg.flushAt)
+	c = newCounters(st, cfg.arm, cfg.resident, cfg.flushAt, c.seq)
 	coldPick := picker(cfg.dist, cfg.keys, 97)
 	var lats []time.Duration
 	start = time.Now()
@@ -444,12 +493,12 @@ func runAll(cfg config, out io.Writer) error {
 	p50, p99, maxLat = percentiles(lats)
 	emit(cfg, out, row{workload: "cold-incr", ops: cfg.coldOps, dur: coldWall,
 		p50: p50, p99: p99, maxLat: maxLat})
-	fmt.Fprintf(os.Stderr, "cold sql reads: %d of %d ops\n", c.sqlReads, cfg.coldOps)
-	emitFlush(cfg, out, "cold-flush", c, path)
+	fmt.Fprintf(os.Stderr, "cold store reads: %d of %d ops\n", c.storeReads, cfg.coldOps)
+	emitFlush(cfg, out, "cold-flush", c, st)
 	return nil
 }
 
-func emitFlush(cfg config, out io.Writer, name string, c *counters, path string) {
+func emitFlush(cfg config, out io.Writer, name string, c *counters, st store) {
 	var total, worst time.Duration
 	for _, fd := range c.flushDur {
 		total += fd
@@ -458,7 +507,7 @@ func emitFlush(cfg config, out io.Writer, name string, c *counters, path string)
 		}
 	}
 	emit(cfg, out, row{workload: name, ops: len(c.flushDur), dur: total,
-		maxLat: worst, fileMB: fileMB(path), vmhwmMB: vmhwmMB()})
+		maxLat: worst, fileMB: st.dataMB(), vmhwmMB: vmhwmMB()})
 }
 
 func picker(dist string, n int, seed int64) func() int {
@@ -512,8 +561,8 @@ func vmhwmMB() float64 {
 func emit(cfg config, out io.Writer, r row) {
 	nsPerOp := float64(r.dur.Nanoseconds()) / float64(max(r.ops, 1))
 	opsPerS := float64(r.ops) / max(r.dur.Seconds(), 1e-9)
-	fmt.Fprintf(out, "%s,%s,%d,%s,%d,%.0f,%.0f,%d,%d,%d,%.1f,%.1f\n",
-		cfg.arm, cfg.dist, cfg.keys,
+	fmt.Fprintf(out, "%s,%s,%s,%d,%s,%d,%.0f,%.0f,%d,%d,%d,%.1f,%.1f\n",
+		cfg.store, cfg.arm, cfg.dist, cfg.keys,
 		r.workload, r.ops, nsPerOp, opsPerS,
 		r.p50.Nanoseconds(), r.p99.Nanoseconds(), r.maxLat.Nanoseconds(),
 		r.fileMB, r.vmhwmMB)
