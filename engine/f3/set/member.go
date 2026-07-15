@@ -205,6 +205,26 @@ func (h *htable) at(i int) []byte {
 	return h.slab[r.loc : r.loc+uint32(r.mlen)]
 }
 
+// recordBytes is the fixed per-member record cell width, 12 bytes after
+// alignment (doc 11 section 2.2): loc and vslot four each, mlen two, the
+// band-and-tier byte one, padded to a four-byte boundary.
+const recordBytes = 12
+
+// residentBytes is the native band's live heap footprint: the member slab, the
+// record cells, the draw vector, the free list, and the table's control-and-
+// ordinal slots (member.go and structs.Table). It is the set-side term of the
+// collection resident-byte estimate (spec 2064/f3/06 section 6.3), measured
+// against the real capacities so it tracks a slab grow and the amortized
+// compaction that follows a churn of removes.
+func (h *htable) residentBytes() uint64 {
+	n := uint64(cap(h.slab))
+	n += uint64(cap(h.recs)) * recordBytes
+	n += uint64(cap(h.vec)) * 4
+	n += uint64(cap(h.free)) * 4
+	n += uint64(h.tbl.Bytes())
+	return n
+}
+
 // vlen is the draw vector length, the high bound the SSCAN downward cursor and
 // the SMEMBERS snapshot both start from.
 func (h *htable) vlen() int { return len(h.vec) }

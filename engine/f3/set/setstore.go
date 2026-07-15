@@ -132,7 +132,16 @@ func place(cx *shard.Ctx, g *reg, key []byte, result *set) int {
 		g.drop(key)
 		return 0
 	}
+	// A destination that already held a set is replaced wholesale: take its bytes
+	// out of the running total before the swap, then post the freshly built
+	// result's own footprint (drop unaccounts the old set, note accounts the new).
+	// Guarded on acctOn so the swap stays a plain overwrite when the cold tier is
+	// off, the L9 zero-delta path.
+	if g.acctOn && g.m[string(key)] != nil {
+		g.drop(key)
+	}
 	g.m[string(key)] = result
+	g.note(result)
 	return result.card()
 }
 

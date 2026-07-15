@@ -62,6 +62,8 @@ func smove(g *reg, cx *shard.Ctx, srcKey, dstKey, member []byte) (moved, wrong b
 	// registry never holds an empty set.
 	if src.card() == 0 {
 		g.drop(srcKey)
+	} else {
+		g.note(src)
 	}
 	// Create the destination on first insert, its band chosen from the member's
 	// shape exactly as SADD's create path does (an integer member opens an intset);
@@ -72,6 +74,7 @@ func smove(g *reg, cx *shard.Ctx, srcKey, dstKey, member []byte) (moved, wrong b
 		g.m[string(dstKey)] = dst
 	}
 	dst.add(member)
+	g.note(dst)
 	return true, false
 }
 

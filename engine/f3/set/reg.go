@@ -33,6 +33,18 @@ type reg struct {
 	// pickScratch holds the indexes already chosen by the small-sample distinct
 	// draw so its rejection loop can skip repeats without a map.
 	pickScratch []int
+
+	// resident is the running sum of every live set's resident-byte footprint
+	// (set.residentBytes), the figure the shard reads to weigh a collection's RAM
+	// against the store's arena under memory pressure (spec 2064/f3/06 section 6).
+	// It is kept exact by note and drop across the map's inserts and removes, so
+	// the shard never walks the registry to size it. Maintained only when acctOn.
+	resident uint64
+	// acctOn gates the accounting: it is true only when the shard's store runs the
+	// cold tier (ColdConfigured). With no cold region to demote a set into the
+	// figure would drive nothing, so the registry keeps none and note is one bool
+	// load, holding the L9 zero-delta contract for a store with no resident cap.
+	acctOn bool
 }
 
 // setSeed hands each shard's registry a distinct PCG stream. The counter is
@@ -52,7 +64,11 @@ func freshPCG() rand.PCG {
 // on one command is there for the next.
 func registry(cx *shard.Ctx) *reg {
 	if cx.Coll == nil {
-		cx.Coll = &reg{m: make(map[string]*set), rng: freshPCG()}
+		cx.Coll = &reg{
+			m:      make(map[string]*set),
+			rng:    freshPCG(),
+			acctOn: cx.St != nil && cx.St.ColdConfigured(),
+		}
 	}
 	return cx.Coll.(*reg)
 }
@@ -90,6 +106,49 @@ func (g *reg) lookup(cx *shard.Ctx, key []byte) (s *set, wrong bool) {
 // wrongType is the shared WRONGTYPE reply text, Redis's exact wording.
 const wrongType = "WRONGTYPE Operation against a key holding the wrong kind of value"
 
-// drop removes an emptied set from the registry: Redis deletes a set the
-// moment its last member leaves.
-func (g *reg) drop(key []byte) { delete(g.m, string(key)) }
+// note reconciles s's footprint into the running total: it posts the delta since
+// the last note, so the total stays the exact sum of every live set's footprint.
+// A mutating command calls it before returning on any set that survives the
+// command (an emptied set goes through drop instead), which keeps the total exact
+// at every command boundary, the only point the shard reads it. It is a single
+// bool load when accounting is off. Owner goroutine only.
+func (g *reg) note(s *set) {
+	if !g.acctOn {
+		return
+	}
+	nb := s.residentBytes()
+	g.resident += nb - s.acct
+	s.acct = nb
+}
+
+// drop removes a set from the registry: Redis deletes a set the moment its last
+// member leaves, and the STORE and DEL paths drop a replaced or deleted key. It
+// takes the set's last-posted footprint back out of the running total, so the
+// total never carries a gone set's bytes.
+func (g *reg) drop(key []byte) {
+	if g.acctOn {
+		if s := g.m[string(key)]; s != nil {
+			g.resident -= s.acct
+		}
+	}
+	delete(g.m, string(key))
+}
+
+// ResidentBytes is the running sum of every live set's resident-byte footprint on
+// this shard, the collection half of the store's memory-pressure figure (spec
+// 2064/f3/06 section 6). It is zero when the store runs no cold tier. The shard
+// reads it at a demote boundary; the trigger that consumes it lands with the set
+// demotion slice. Owner goroutine only.
+func (g *reg) ResidentBytes() uint64 { return g.resident }
+
+// ResidentBytes exposes the shard's set-registry resident-byte total to the
+// worker's demote loop through the owner-local Coll slot, without the shard
+// package reaching into the set registry's shape. It is zero before any set
+// command has built a registry on this shard, or when the store runs no cold
+// tier. Owner goroutine only.
+func ResidentBytes(cx *shard.Ctx) uint64 {
+	if g, ok := cx.Coll.(*reg); ok {
+		return g.ResidentBytes()
+	}
+	return 0
+}
