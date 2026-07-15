@@ -164,7 +164,15 @@ func (w *worker) run() {
 			// tight state left dead into freed segments whose pages go back
 			// to the OS, which is what keeps the cap an RSS bound and not
 			// just a placement rule.
-			if w.st.MaybeDemote() > 0 || w.st.ArenaTight() || w.st.ResidentOver() {
+			// MaybeDemote moves cold separated runs to the log; MigrateCold is
+			// the whole-record valve that follows it, moving int and embedded
+			// records the run demotion cannot touch out to the cold region when
+			// the resident set is still over the mark. Both have side effects
+			// and must run every boundary, so they land in locals before the
+			// compaction decision rather than short-circuiting inside it.
+			demoted := w.st.MaybeDemote() > 0
+			migrated := w.st.MigrateCold() > 0
+			if demoted || migrated || w.st.ArenaTight() || w.st.ResidentOver() {
 				w.st.CompactArena()
 			}
 			// Return any epoch-retired segments this boundary's exited bracket

@@ -43,6 +43,13 @@ type Store struct {
 	coldBuf  []byte
 	frameBuf []byte
 
+	// coldHand is the whole-record migrator's clock position (migrate.go), the
+	// directory index its bounded pass resumes from. Separate from demoteHand:
+	// the residency hand moves separated value runs to the log, this hand moves
+	// whole int and embedded records out of the arena into the cold region, and
+	// the two walk independently.
+	coldHand uint64
+
 	// The residency machinery (resid.go). ltmOn folds the whole
 	// configuration check into one load for the read path; residMode is the
 	// promotion policy (labs override it); markAlways is lab 15's
@@ -247,6 +254,7 @@ func (s *Store) Reset() {
 	s.logRuns = 0
 	s.chunkBytes = 0
 	s.coldRecs = 0
+	s.coldHand = 0
 	s.vbuf = nil
 	s.cbuf = nil
 	s.zbuf = nil
