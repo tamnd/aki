@@ -1,0 +1,60 @@
+name: sqlo1
+
+# The sqlo1 trees are new code with no edge into the rest of the module, so
+# they get their own fast lane: lint, boundary, tests, and a short fuzz burn
+# on just the sqlo1 packages. The main ci workflow ignores these paths.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/sqlo1/**'
+      - 'engine/sqlo1a/**'
+      - 'engine/sqlo1b/**'
+      - 'cmd/sqlo1srv/**'
+      - 'scripts/sqlo1-import-boundary.sh'
+      - '.github/workflows/sqlo1.yml'
+  pull_request:
+    paths:
+      - 'engine/sqlo1/**'
+      - 'engine/sqlo1a/**'
+      - 'engine/sqlo1b/**'
+      - 'cmd/sqlo1srv/**'
+      - 'scripts/sqlo1-import-boundary.sh'
+      - '.github/workflows/sqlo1.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sqlo1-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l engine/sqlo1 engine/sqlo1a engine/sqlo1b cmd/sqlo1srv)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt -s -w:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv
+      - name: import boundary
+        run: ./scripts/sqlo1-import-boundary.sh
+      - name: build
+        run: go build ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv
+      - name: test
+        run: go test -race -count=1 ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv/...
+      - name: fuzz burn
+        run: go test -run='^$' -fuzz=FuzzParseCommand -fuzztime=20s ./engine/sqlo1
