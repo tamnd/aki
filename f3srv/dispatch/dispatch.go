@@ -383,6 +383,23 @@ func init() {
 	table["GEOSEARCHSTORE"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 	table["GEOSEARCHSTORE"].cross = zset.GeosearchstoreCross
 
+	// GEORADIUS and GEORADIUSBYMEMBER are the deprecated wrappers over the same
+	// engine, keyed on the source at args[0]. They read by default and turn into
+	// a two-key write when STORE or STOREDIST names a destination, so their
+	// crossKeys parses the tail for that destination and the F17 hop coordinator
+	// handles the shard-spanning store. The smallest read is key, lon, lat,
+	// radius, unit (five) for GEORADIUS and key, member, radius, unit (four) for
+	// the BYMEMBER form. GEORADIUS_RO and GEORADIUSBYMEMBER_RO refuse STORE, so
+	// they stay single-key and need no hop.
+	register("GEORADIUS", zset.Georadius, 5, -1, true)
+	table["GEORADIUS"].crossKeys = zset.GeoradiusKeys
+	table["GEORADIUS"].cross = zset.GeoradiusCross
+	register("GEORADIUS_RO", zset.GeoradiusRo, 5, -1, true)
+	register("GEORADIUSBYMEMBER", zset.Georadiusbymember, 4, -1, true)
+	table["GEORADIUSBYMEMBER"].crossKeys = zset.GeoradiusbymemberKeys
+	table["GEORADIUSBYMEMBER"].cross = zset.GeoradiusbymemberCross
+	register("GEORADIUSBYMEMBER_RO", zset.GeoradiusbymemberRo, 4, -1, true)
+
 	// The list surface (spec 2064/f3/13 M3 slice 1): the inline listpack band and
 	// its one-way promotion to the native quicklist placeholder. The pushes, pops,
 	// LLEN, LINDEX, LRANGE, LSET, LREM, LTRIM, LINSERT, and LPOS all key on the
