@@ -2,6 +2,8 @@ package sqlo1a
 
 import (
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/ncruces/go-sqlite3"
 )
@@ -19,8 +21,14 @@ const PageSize = 8192
 // the freeze only pins which driver this is (ncruces, native API) and the
 // shape of the file it produces.
 type DB struct {
+	mu   sync.Mutex
 	conn *sqlite3.Conn
 	st   *stmts
+
+	// now is the expiry clock in wall milliseconds, swappable in tests.
+	// Reads gate on it lazily (an expired row is a miss); the reaper slice
+	// owns actually deleting what it passes over.
+	now func() int64
 }
 
 // Open opens or creates the store file at path. The creation-time pragmas
@@ -64,7 +72,7 @@ func Open(path string) (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
-	return &DB{conn: conn, st: st}, nil
+	return &DB{conn: conn, st: st, now: func() int64 { return time.Now().UnixMilli() }}, nil
 }
 
 // Close finalizes the prepared statements before closing the connection;

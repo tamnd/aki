@@ -35,10 +35,14 @@ const (
 	// exactly-once contract wants.
 	sqlKVDel = `DELETE FROM kv WHERE k = ?1`
 
-	// sqlKVScan walks kv in key order from an exclusive cursor. The
-	// cursor is the last key of the previous page, so k > ?1 resumes
-	// without overlap and an empty blob starts from the beginning.
+	// sqlKVScan walks kv in key order from an exclusive cursor, the last
+	// key of the previous page, so pages resume without overlap.
 	sqlKVScan = `SELECT k, t, exp, gen, v, crc FROM kv WHERE k > ?1 ORDER BY k LIMIT ?2`
+
+	// sqlKVScanFirst starts a scan from the top. It exists because the
+	// zero-length key is a legal Redis key and k > x'' would skip it; a
+	// fresh scan must not need a cursor smaller than every key.
+	sqlKVScanFirst = `SELECT k, t, exp, gen, v, crc FROM kv ORDER BY k LIMIT ?1`
 )
 
 // stmts is one connection's prepared form of the catalog. Prepared eagerly
@@ -46,10 +50,11 @@ const (
 // compilation, and finalized before the connection closes because ncruces
 // refuses to close a connection with live statements.
 type stmts struct {
-	kvGet  *sqlite3.Stmt
-	kvPut  *sqlite3.Stmt
-	kvDel  *sqlite3.Stmt
-	kvScan *sqlite3.Stmt
+	kvGet       *sqlite3.Stmt
+	kvPut       *sqlite3.Stmt
+	kvDel       *sqlite3.Stmt
+	kvScan      *sqlite3.Stmt
+	kvScanFirst *sqlite3.Stmt
 
 	all []*sqlite3.Stmt
 }
@@ -64,6 +69,7 @@ func prepareStmts(conn *sqlite3.Conn) (*stmts, error) {
 		{sqlKVPut, &s.kvPut},
 		{sqlKVDel, &s.kvDel},
 		{sqlKVScan, &s.kvScan},
+		{sqlKVScanFirst, &s.kvScanFirst},
 	} {
 		stmt, _, err := conn.Prepare(p.sql)
 		if err != nil {
