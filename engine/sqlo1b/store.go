@@ -103,6 +103,19 @@ type Store struct {
 	// correctness never depends on it.
 	garbageExt map[uint64]uint64
 
+	// Write amplification telemetry, runtime-only like garbageExt.
+	// logicalBytes counts encoded record bytes the store accepted
+	// (batch puts, replayed puts, gen records); dataBytes counts
+	// physical vlog group and blob run writes including the open
+	// group's tear-safe rewrites; indexBytes counts chunk, directory,
+	// and allocmap group images; relocatedBytes and compactions come
+	// from the compactor.
+	logicalBytes   uint64
+	dataBytes      uint64
+	indexBytes     uint64
+	relocatedBytes uint64
+	compactions    uint64
+
 	// dirty holds every bucket chain touched since the last durable
 	// checkpoint; RAM is authoritative for these. pending maps the
 	// in-flight batch's vlog positions to encoded records, covering
@@ -691,6 +704,7 @@ func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 			s.broken = err
 			return err
 		}
+		s.logicalBytes += uint64(len(enc))
 		if fr.pos, err = s.appendVlog(enc); err != nil {
 			s.broken = err
 			return err
@@ -727,6 +741,7 @@ func (s *Store) applyPut(rec *Record) error {
 	if err != nil {
 		return err
 	}
+	s.logicalBytes += uint64(len(enc))
 	pos, err := s.appendVlog(enc)
 	if err != nil {
 		return err
@@ -831,6 +846,7 @@ func (s *Store) applyGenbump(key []byte, newgen uint32) error {
 	if err != nil {
 		return err
 	}
+	s.logicalBytes += uint64(len(enc))
 	pos, err := s.appendVlog(enc)
 	if err != nil {
 		return err
@@ -1602,6 +1618,7 @@ func (s *Store) writeVlogGroup(img []byte) error {
 	if _, err := s.f.WriteAt(img, off); err != nil {
 		return fmt.Errorf("sqlo1b: vlog group %d/%d: %w", s.gbExt, s.gbGrp, err)
 	}
+	s.dataBytes += uint64(len(img))
 	return nil
 }
 
@@ -1637,6 +1654,7 @@ func (s *Store) appendBlobRec(enc []byte) (Pos, error) {
 	if _, err := s.f.WriteAt(s.blobSlab[lo:hi], off); err != nil {
 		return 0, fmt.Errorf("sqlo1b: blob run at %d/%d: %w", s.blob.ext, start, err)
 	}
+	s.dataBytes += uint64(hi - lo)
 	s.blob.groups += next - start
 	s.blob.payload += uint32(len(enc))
 	s.blob.next = next
@@ -1772,6 +1790,7 @@ func (s *Store) writeGroupImage(ext uint64, grp uint16, img []byte) error {
 	if _, err := s.f.WriteAt(img, off); err != nil {
 		return fmt.Errorf("sqlo1b: group %d/%d: %w", ext, grp, err)
 	}
+	s.indexBytes += uint64(len(img))
 	return nil
 }
 

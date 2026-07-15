@@ -50,11 +50,15 @@ type CompactStats struct {
 }
 
 // CompactExtent compacts one sealed vlog extent and quarantines it.
-// Extent selection and pacing are the debt controller's job; this is
-// the mechanism only.
+// Extent selection and pacing are the debt controller's job (see
+// CompactStep); this is the mechanism only.
 func (s *Store) CompactExtent(ctx context.Context, ext uint64) (CompactStats, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.compactExtent(ctx, ext)
+}
+
+func (s *Store) compactExtent(ctx context.Context, ext uint64) (CompactStats, error) {
 	var cs CompactStats
 	if s.broken != nil {
 		return cs, s.broken
@@ -79,79 +83,61 @@ func (s *Store) CompactExtent(ctx context.Context, ext uint64) (CompactStats, er
 	if hdr.Kind != KindVlog {
 		return cs, fmt.Errorf("sqlo1b: compact extent %d holds kind %d, only vlog extents compact in v0", ext, hdr.Kind)
 	}
-	if hdr.EFlags&EFlagBlob != 0 {
-		return cs, fmt.Errorf("sqlo1b: compact extent %d is a blob extent; blob relocation lands with the debt controller", ext)
-	}
 
 	// Mutations begin below. From here an error poisons the store,
 	// the ApplyBatch discipline: the index may hold a mix of old and
 	// new positions that only stays coherent while this owner is the
 	// sole writer, and a reopen recovers the checkpointed state.
 	var deadBytes uint64
-	fg := fileGroups{s.f, s.sb.ExtentSize}
 	fail := func(err error) (CompactStats, error) {
 		s.broken = err
 		return cs, err
 	}
-	for grp := uint16(0); grp < hdr.GroupCount; grp++ {
-		img, err := fg.ReadGroup(ext, grp)
-		if err != nil {
-			return fail(err)
+	if hdr.EFlags&EFlagBlob != 0 {
+		// Blob runs pack contiguously from group 0, so every occupied
+		// group belongs to some run and the walk steps run by run.
+		for grp := uint16(0); grp < hdr.GroupCount; {
+			rec, raw, err := s.readBlobRun(ext, grp)
+			if err != nil {
+				return fail(err)
+			}
+			pos, err := NewBlobPos(ext, grp)
+			if err != nil {
+				return fail(err)
+			}
+			if err := s.compactRecord(rec, raw, pos, &cs, &deadBytes); err != nil {
+				return fail(err)
+			}
+			grp += uint16(BlobRunGroups(grp, len(raw)))
 		}
-		view, err := ParseGroup(img)
-		if err != nil {
-			return fail(err)
-		}
-		for slot := range uint16(view.Records()) {
-			raw, err := view.Record(slot)
+	} else {
+		fg := fileGroups{s.f, s.sb.ExtentSize}
+		for grp := uint16(0); grp < hdr.GroupCount; grp++ {
+			img, err := fg.ReadGroup(ext, grp)
 			if err != nil {
 				return fail(err)
 			}
-			rec, err := DecodeRecord(raw)
+			view, err := ParseGroup(img)
 			if err != nil {
 				return fail(err)
 			}
-			pos, err := NewPos(ext, grp, slot)
-			if err != nil {
-				return fail(err)
-			}
-			_, at, err := s.lookupPos(rec.Key)
-			if err != nil {
-				return fail(err)
-			}
-			if at != pos {
-				// Superseded, deleted, or never the index's copy; a
-				// miss reads as position zero, which is never a vlog
-				// slot in an allocatable extent.
-				cs.Superseded++
-				deadBytes += uint64(len(raw))
-				continue
-			}
-			if s.expiredRec(rec) {
-				if err := s.dropEntry(rec.Key); err != nil {
-					return fail(err)
-				}
-				cs.Expired++
-				continue
-			}
-			if rec.RType == RecSeg || rec.RType == RecFence {
-				live, err := s.rootLive(binary.LittleEndian.Uint64(rec.Key), rec.Rootgen)
+			for slot := range uint16(view.Records()) {
+				raw, err := view.Record(slot)
 				if err != nil {
 					return fail(err)
 				}
-				if !live {
-					if err := s.dropEntry(rec.Key); err != nil {
-						return fail(err)
-					}
-					cs.DeadSegments++
-					continue
+				rec, err := DecodeRecord(raw)
+				if err != nil {
+					return fail(err)
+				}
+				pos, err := NewPos(ext, grp, slot)
+				if err != nil {
+					return fail(err)
+				}
+				if err := s.compactRecord(rec, raw, pos, &cs, &deadBytes); err != nil {
+					return fail(err)
 				}
 			}
-			if err := s.relocate(rec, raw); err != nil {
-				return fail(err)
-			}
-			cs.Relocated++
-			cs.RelocatedBytes += len(raw)
 		}
 	}
 	if err := s.finishApply(); err != nil {
@@ -162,7 +148,77 @@ func (s *Store) CompactExtent(ctx context.Context, ext uint64) (CompactStats, er
 	}
 	delete(s.garbageExt, ext)
 	s.garbage -= min(s.garbage, deadBytes)
+	s.relocatedBytes += uint64(cs.RelocatedBytes)
+	s.compactions++
 	return cs, nil
+}
+
+// compactRecord runs one record through the liveness probes and
+// either skips, drops, or relocates it.
+func (s *Store) compactRecord(rec *Record, raw []byte, pos Pos, cs *CompactStats, deadBytes *uint64) error {
+	_, at, err := s.lookupPos(rec.Key)
+	if err != nil {
+		return err
+	}
+	if at != pos {
+		// Superseded, deleted, or never the index's copy; a miss
+		// reads as position zero, which is never a vlog slot in an
+		// allocatable extent.
+		cs.Superseded++
+		*deadBytes += uint64(len(raw))
+		return nil
+	}
+	if s.expiredRec(rec) {
+		if err := s.dropEntry(rec.Key); err != nil {
+			return err
+		}
+		cs.Expired++
+		return nil
+	}
+	if rec.RType == RecSeg || rec.RType == RecFence {
+		live, err := s.rootLive(binary.LittleEndian.Uint64(rec.Key), rec.Rootgen)
+		if err != nil {
+			return err
+		}
+		if !live {
+			if err := s.dropEntry(rec.Key); err != nil {
+				return err
+			}
+			cs.DeadSegments++
+			return nil
+		}
+	}
+	if err := s.relocate(rec, raw); err != nil {
+		return err
+	}
+	cs.Relocated++
+	cs.RelocatedBytes += len(raw)
+	return nil
+}
+
+// readBlobRun reads one whole blob run off the file: the rlen word
+// sizes the run, then the record decodes from the full read. The raw
+// bytes come back too because relocation moves them verbatim.
+func (s *Store) readBlobRun(ext uint64, grp uint16) (*Record, []byte, error) {
+	off := blobOffset(grp)
+	base := int64(ext)*int64(s.sb.ExtentSize) + int64(off)
+	var head [4]byte
+	if _, err := s.f.ReadAt(head[:], base); err != nil {
+		return nil, nil, fmt.Errorf("sqlo1b: blob run head at %d/%d: %w", ext, grp, err)
+	}
+	rlen := binary.LittleEndian.Uint32(head[:])
+	if rlen <= BlobThreshold || uint64(off)+uint64(rlen) > uint64(s.sb.ExtentSize) {
+		return nil, nil, fmt.Errorf("sqlo1b: blob run at %d/%d has rlen %d", ext, grp, rlen)
+	}
+	raw := make([]byte, rlen)
+	if _, err := s.f.ReadAt(raw, base); err != nil {
+		return nil, nil, fmt.Errorf("sqlo1b: blob run at %d/%d: %w", ext, grp, err)
+	}
+	rec, err := DecodeRecord(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	return rec, raw, nil
 }
 
 // dropEntry removes a key's index entry during compaction. Unlike
