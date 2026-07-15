@@ -102,6 +102,42 @@ func (l *vlog) append(val []byte) (uint64, error) {
 	return off, nil
 }
 
+// reserve claims n bytes at the log tail for an out-of-band writer: the shard's
+// I/O worker pwrites a staged cold-drain buffer here off the owner (coldstage.go
+// phase 1), instead of the owner buffering the bytes through append. It flushes
+// any pending bytes so the reserved range starts on a clean file boundary, then
+// advances both the logical and the flushed tail past the range so a later read
+// of the range routes to the file, not the drained pending buffer. The bytes are
+// not written here; the caller hands (off, buffer) to the I/O worker via
+// writeAt. Until that write lands the range is an unwritten hole, but no index
+// entry names it (phase 2 flips a slot to the cold offset only on the write's
+// completion), so no read ever reaches the hole. A prior flush failure refuses
+// the reservation, like append.
+func (l *vlog) reserve(n int) (uint64, error) {
+	if l.werr != nil {
+		return 0, errLogBroken
+	}
+	if err := l.flush(); err != nil {
+		return 0, err
+	}
+	off := l.tail
+	l.tail += uint64(n)
+	l.wtail = l.tail
+	return off, nil
+}
+
+// writeAt pwrites b at off, the off-owner half of a reserved cold drain. It runs
+// on the I/O worker goroutine, so it touches only the file handle (positioned
+// pwrite, safe alongside the owner's positioned preads and against a concurrent
+// writeAt at a disjoint offset) and never the owner-only tail, wtail, or pending
+// fields the reservation already advanced. A nil or broken file refuses.
+func (l *vlog) writeAt(off int64, b []byte) (int, error) {
+	if l.f == nil || l.werr != nil {
+		return 0, errLogBroken
+	}
+	return l.f.WriteAt(b, off)
+}
+
 // flush pwrites the whole pending buffer at the flushed tail. On failure the
 // buffer is kept, werr goes sticky, and every offset already handed out keeps
 // reading from memory: a failing disk degrades to a resident-only store, not

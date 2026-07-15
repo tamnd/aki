@@ -142,6 +142,15 @@ func (s *Store) findResident(h uint64, key []byte, now int64) (slot *uint64, add
 	slot, addr, inOverflow = s.findLive(h, key, now)
 	if addr != 0 && slotCold(*slot) {
 		addr = s.bringUp(h, slot, addr)
+	} else if addr != 0 && s.migrating != 0 {
+		// A resident record found for a write that is also staged in an in-flight
+		// cold drain: cancel its migration in place (coldstage.go). The write is
+		// about to change the record (in place at the same address, or by
+		// republishing it), and phase 2 must not flip the stale frame it already
+		// wrote. cancelMigrate bumps the record's version so phase 2's compare
+		// misses and drops the frame. Guarded by the migrating counter, so a
+		// store with no drain in flight never runs it.
+		s.cancelMigrate(addr)
 	}
 	return slot, addr, inOverflow
 }

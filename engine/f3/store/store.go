@@ -50,6 +50,14 @@ type Store struct {
 	// the two walk independently.
 	coldHand uint64
 
+	// migrating counts the records the async migrator (coldstage.go) has staged
+	// into in-flight cold drains but not yet flipped or dropped. It gates the
+	// findResident stale-flip interlock: at zero, a foreground write skips the
+	// flagMigrating check entirely, so the no-pressure path pays one field
+	// compare and nothing more. Phase 1 adds a staged record, phase 2 removes it
+	// whether it flipped, dropped, or was cancelled by a racing write.
+	migrating int
+
 	// The residency machinery (resid.go). ltmOn folds the whole
 	// configuration check into one load for the read path; residMode is the
 	// promotion policy (labs override it); markAlways is lab 15's
@@ -255,6 +263,7 @@ func (s *Store) Reset() {
 	s.chunkBytes = 0
 	s.coldRecs = 0
 	s.coldHand = 0
+	s.migrating = 0
 	s.vbuf = nil
 	s.cbuf = nil
 	s.zbuf = nil

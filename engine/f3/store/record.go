@@ -42,6 +42,17 @@ const (
 	// other header bit.
 	flagVisited = 1 << 6
 
+	// flagMigrating marks a record the async migrator has staged into an
+	// in-flight cold drain but not yet flipped (coldstage.go). It stays resident
+	// and fully readable through the phase-1-to-phase-2 window; the bit exists so
+	// a foreground write that reaches the record before the drain completes can
+	// cancel the migration in place (findResident bumps the record's version and
+	// clears this bit), which is what turns doc 06 section 3.1's stale-flip check
+	// into a version compare the in-place-overwrite path cannot fool. Owner-only,
+	// set nowhere unless a drain is in flight, so the L9 no-pressure path never
+	// sees it.
+	flagMigrating = 1 << 7
+
 	// kindString is the plain string key record. Non-zero on purpose: a
 	// zero kind byte in a reused, unscrubbed arena offset must never read as a
 	// valid record kind.
