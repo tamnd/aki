@@ -27,3 +27,23 @@ The falsehit arm rides along: with 16-bit fingerprints and about 35 occupied slo
 
 Both predictions are measured by labs/sqlo1/b2/01_chunkindex before the cold-index slice bakes the 512 B chunk layout, the 42-entry packing, or a split policy.
 A failed prediction does not get re-run until the causal story is written down next to the failing number in this directory.
+
+## Outcomes (verdict run 2026-07-16, seed 1, b2-chunkindex.csv)
+
+PRED-SQLO1-B2-INDEXRAM: CONFIRMED.
+Doc policy at 10^8 measured 0.4650 heap B per key, inside the predicted 0.45 to 0.60; all policies at all scales landed 0.40 to 0.52, under 1 B with 2x room, and the exact-mode oracle matched counts mode within 0.1% on buckets.
+
+PRED-SQLO1-B2-READPATH: FAILED, both clauses, and the failures are structural, not noise.
+
+Clause one said chain2 stays under 0.1% of buckets at every sweep point under the doc policy; measured 0.128% at 1e6 and 1.316% at 1e7.
+Causal story: the Poisson arithmetic behind the bound assumed a design load of 0.75 to 0.85, but overflow-driven splitting has no design load.
+Fill sweeps 0.82 to 0.97 across every doubling cycle (measured directly: 0.825 at the 1e8 point, 0.967 at the 1e7 point, same policy, same protocol), and the chain tail is superlinear in fill, so any bound quoted at design load is wrong for the part of the cycle a store is actually in.
+The failure kills the doc 8.5 overflow-only default rather than the red line: lf85 holds chain2 at or under 0.043% at every sweep point, and the cold-index slice bakes lf85.
+
+Clause two said lf85 cuts the single-link chain rate below 10%; measured 18 to 27%.
+Causal story: chains come from bucket-size dispersion, not aggregate load, and repeated coin-flip halvings leave bucket sizes far wider than the Poisson intuition (p95 bucket size 65 against mean 36 at lf85, 1e9), so the mass past 42 entries stays in the tens of percent at any affordable fill.
+Reaching a sub-10% chained rate needs a load-factor target near 0.65 and 0.59 B/key, and buys nothing because the probe must handle chains anyway; the verdict prices the single-link read (base fingerprints first, link only on base miss) instead of paying RAM to make it rare.
+The 3-group-read ceiling clause itself is untouched: it holds for unchained buckets by construction, a chained probe is exactly 4, and the IO-count test in the read-path slice asserts both.
+
+The falsehit rider landed: 0.0625% absent and 0.0661% present against 0.0620% predicted.
+Verdict note: b2-chunkindex.md.

@@ -337,8 +337,12 @@ func main() {
 	probes := flag.Uint64("probes", 1_000_000, "falsehit probes")
 	seed := flag.Uint64("seed", 1, "rng seed")
 	quick := flag.Bool("quick", false, "smoke run at 1e5 keys")
-	header := flag.Bool("header", true, "print the csv header")
+	header := flag.Bool("header", false, "print the occupancy csv header and exit")
 	flag.Parse()
+	if *header {
+		fmt.Printf("arm,n,policy,mode,buckets,chain_links,fill_mean,fill_p50,fill_p95,fill_max,chained_pct,chain2_pct,splits,max_split_window,dir_b_per_key,disk_b_per_key,heap_dir_b_per_key,elapsed_s\n")
+		return
+	}
 	if *quick {
 		*n = 100_000
 	}
@@ -352,9 +356,6 @@ func main() {
 		runFalseHit(*n, *probes, *seed)
 	case "occupancy":
 		r := runSim(*n, *policy, *seed, exact)
-		if *header {
-			fmt.Printf("arm,n,policy,mode,buckets,chain_links,fill_mean,fill_p50,fill_p95,fill_max,chained_pct,chain2_pct,splits,max_split_window,dir_b_per_key,disk_b_per_key,heap_dir_b_per_key,elapsed_s\n")
-		}
 		fmt.Printf("occupancy,%d,%s,%s,%d,%d,%.4f,%d,%d,%d,%.4f,%.4f,%d,%d,%.4f,%.1f,%.4f,%.1f\n",
 			r.n, *policy, *mode, r.buckets, r.chainLinks, r.fillMean, r.fillP50, r.fillP95, r.fillMax,
 			r.chainedPct, r.chain2Pct, r.splits, r.maxWindow,
