@@ -164,15 +164,18 @@ func (w *worker) run() {
 			// tight state left dead into freed segments whose pages go back
 			// to the OS, which is what keeps the cap an RSS bound and not
 			// just a placement rule.
-			// MaybeDemote moves cold separated runs to the log; MigrateCold is
-			// the whole-record valve that follows it, moving int and embedded
-			// records the run demotion cannot touch out to the cold region when
-			// the resident set is still over the mark. Both have side effects
-			// and must run every boundary, so they land in locals before the
-			// compaction decision rather than short-circuiting inside it.
+			// MaybeDemote moves cold separated runs to the log; drainCold is the
+			// whole-record valve that follows it, staging int and embedded records
+			// the run demotion cannot touch for the off-owner cold write when the
+			// resident set is still over the mark. The demotion has side effects and
+			// must run every boundary, so it lands in a local before the compaction
+			// decision rather than short-circuiting inside it. The cold drain frees
+			// no arena bytes here (its flip lands on a later completion boundary), so
+			// the compaction decision leans on the arena-pressure checks, which hold
+			// while the staged records still charge the arena.
 			demoted := w.st.MaybeDemote() > 0
-			migrated := w.st.MigrateCold() > 0
-			if demoted || migrated || w.st.ArenaTight() || w.st.ResidentOver() {
+			w.drainCold()
+			if demoted || w.st.ArenaTight() || w.st.ResidentOver() {
 				w.st.CompactArena()
 			}
 			// Return any epoch-retired segments this boundary's exited bracket
@@ -224,6 +227,46 @@ func (w *worker) maybeCompact() {
 	// bracket long exited, so safe has advanced past any bracket that could
 	// have named a retired segment. Empty-list cheap until the migrator lands.
 	w.st.ReclaimSafe(w.ep.safe())
+}
+
+// drainCold stages a two-phase cold migration and hands it to the I/O worker
+// (ioworker.go), the off-owner half of the M7 migrator. Phase 1 runs here on the
+// owner: it checks a staging buffer out of the cap/4 pool and asks the store to
+// frame a run of cold-bound records into it and reserve their cold-region span.
+// The buffer and its offset go to the I/O worker, which pwrites them off the
+// owner and posts a completion where phase 2 flips the slots. A store with no
+// cold region or no pressure stages nothing and returns the buffer at once, so a
+// shard under its resident cap never starts the goroutine. When the pool is at
+// its in-flight bound the drain defers to a later boundary, the admission control
+// on per-shard cold I/O concurrency.
+func (w *worker) drainCold() {
+	if !w.st.NeedsColdDrain() {
+		return
+	}
+	// Wire the pwrite seam to the store's cold region on first use only. The
+	// assignment must precede the first submit (which starts the goroutine), and
+	// never repeat once the goroutine is running and reading the seam, or the two
+	// race; the nil check keeps it to exactly one owner-side store before the
+	// goroutine exists, which the go statement in submit publishes.
+	if w.io.write == nil {
+		w.io.write = w.st.ColdWriteAt
+	}
+	buf := w.io.pool.get()
+	if buf == nil {
+		return
+	}
+	d := w.st.StageColdDrain(buf)
+	if d == nil || len(d.Buf()) == 0 {
+		w.io.pool.put(buf)
+		return
+	}
+	w.io.submit(ioJob{
+		buf: d.Buf(),
+		off: d.Off(),
+		onDone: func(cx *Ctx, res ioResult) {
+			w.st.CompleteColdDrain(d, res.err == nil)
+		},
+	})
 }
 
 // pumpStreams runs one producer pass over the in-flight streams, dropping the
