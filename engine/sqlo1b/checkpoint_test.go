@@ -104,6 +104,7 @@ func newCkptRig(t *testing.T) *ckptRig {
 			Stats:        FullPtr{Pos: 104, Sum: 204},
 			RecordCount:  7,
 			GarbageBytes: 9,
+			HighWater:    11,
 		},
 	}}
 }
@@ -144,7 +145,7 @@ func TestCheckpointRun(t *testing.T) {
 		t.Fatalf("next seq %d trim %d", next.Seq, next.WALTrimSeq)
 	}
 	if next.DirRoot != r.src.roots.Dir || next.StatsRoot != r.src.roots.Stats ||
-		next.RecordCount != 7 || next.GarbageBytes != 9 {
+		next.RecordCount != 7 || next.GarbageBytes != 9 || next.HighWater != 11 {
 		t.Fatal("roots did not land in the superblock")
 	}
 

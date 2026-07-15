@@ -25,9 +25,13 @@ import (
 // allocation. That is why step 5 is the only commit point.
 
 // Roots is what steps 3 and 4 produce for the new superblock.
+// HighWater is the drain batch mark frozen with T: batches applied
+// after the freeze land in WAL frames past T and replay after this
+// checkpoint's trim barrier.
 type Roots struct {
 	Dir, Allocmap, Dict, Stats FullPtr
 	RecordCount, GarbageBytes  uint64
+	HighWater                  int64
 }
 
 // CheckpointSource is the store side of the protocol; the format
@@ -118,6 +122,7 @@ func (c *Checkpointer) Run(cur *Superblock, src CheckpointSource) (*Superblock, 
 	next.StatsRoot = roots.Stats
 	next.RecordCount = roots.RecordCount
 	next.GarbageBytes = roots.GarbageBytes
+	next.HighWater = roots.HighWater
 	if err := CommitSuperblock(c.File, &next); err != nil {
 		return nil, fmt.Errorf("sqlo1b: checkpoint superblock: %w", err)
 	}

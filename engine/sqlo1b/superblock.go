@@ -48,7 +48,9 @@ type FullPtr struct {
 }
 
 // Superblock is the decoded root. The advisory fields (RecordCount,
-// GarbageBytes) carry no correctness weight; everything else does.
+// GarbageBytes) carry no correctness weight; everything else does,
+// including HighWater: the store seam's exactly-once mark, which must
+// survive the WAL trim that discards the frames that carried it.
 type Superblock struct {
 	Version      uint32
 	IOUnit       uint32
@@ -65,6 +67,7 @@ type Superblock struct {
 	StatsRoot    FullPtr
 	RecordCount  uint64
 	GarbageBytes uint64
+	HighWater    int64
 }
 
 // NewSuperblock returns the creation-time root: seq 1, v0 geometry,
@@ -125,6 +128,7 @@ func (sb *Superblock) Encode() []byte {
 	putPtr(b[128:], sb.StatsRoot)
 	binary.LittleEndian.PutUint64(b[144:], sb.RecordCount)
 	binary.LittleEndian.PutUint64(b[152:], sb.GarbageBytes)
+	binary.LittleEndian.PutUint64(b[160:], uint64(sb.HighWater))
 	binary.LittleEndian.PutUint64(b[4080:], sb.Seq)
 	binary.LittleEndian.PutUint64(b[4088:], xxhash.Sum64(b[:4088]))
 	return b
@@ -162,6 +166,7 @@ func DecodeSuperblock(b []byte) (*Superblock, error) {
 		StatsRoot:    getPtr(b[128:]),
 		RecordCount:  binary.LittleEndian.Uint64(b[144:]),
 		GarbageBytes: binary.LittleEndian.Uint64(b[152:]),
+		HighWater:    int64(binary.LittleEndian.Uint64(b[160:])),
 	}
 	if sb.Version != FormatVersion {
 		return nil, fmt.Errorf("sqlo1b: format version %d, this build reads %d", sb.Version, FormatVersion)
