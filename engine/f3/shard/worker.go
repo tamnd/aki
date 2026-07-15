@@ -175,6 +175,11 @@ func (w *worker) run() {
 			// while the staged records still charge the arena.
 			demoted := w.st.MaybeDemote() > 0
 			w.drainCold()
+			// Park the segments this boundary's drains emptied on the epoch
+			// retire list before the compactor runs, so it leaves them alone
+			// (a retired segment is skipped) and their bytes outlive any bracket
+			// in flight rather than freeing outright.
+			w.retireDrained()
 			if demoted || w.st.ArenaTight() || w.st.ResidentOver() {
 				w.st.CompactArena()
 			}
@@ -220,6 +225,10 @@ func (w *worker) maybeCompact() {
 	// Demote before the arena trigger reads the dead figures: a demotion pass
 	// creates exactly the dead bytes the compaction that follows reclaims.
 	demoted := w.st.MaybeDemote()
+	// Retire any segments a prior boundary's drains emptied before the compactor
+	// runs, same as the active-boundary path: the compactor skips a retired
+	// segment, so this hands the drained ones to the epoch path instead.
+	w.retireDrained()
 	if demoted > 0 || w.st.ArenaReclaimable() >= arenaCompactMinDead {
 		w.st.CompactArena()
 	}
@@ -267,6 +276,36 @@ func (w *worker) drainCold() {
 			w.st.CompleteColdDrain(d, res.err == nil)
 		},
 	})
+}
+
+// retireDrained parks the segments the migrator's phase 2 emptied since the last
+// boundary on the epoch retire list, the first caller of the F6 reclamation
+// machinery (epoch.go, store reclaim.go). It is the "segment fully drained ->
+// retire at the current batch boundary" half of the migration quantum (doc 06
+// section 3.1): the store detected each empty segment on the flip that unlinked
+// its last record, and this stamps them with the epoch current now and hands them
+// to RetireSegment, so the compactor leaves them and ReclaimSafe frees them only
+// once every bracket in flight at retirement has exited. bump both advances the
+// global epoch and returns the stamp to retire under, so a segment retired here
+// frees at a later boundary, never the one that emptied it while a batch that read
+// its bytes could still be in flight. Empty list (no drain emptied a segment) is
+// one length check and no bump, so the epoch clock only moves when a segment
+// actually retires.
+//
+// This covers only the segments the migrator itself evacuates whole. The
+// compactor's relocation empties segments too and still frees them outright; a
+// follow-on slice routes that path through the epoch to close reader-safety for
+// it. Until then the store is reader-safe for the migrator-emptied case, which is
+// the one this slice's own machinery produces.
+func (w *worker) retireDrained() {
+	dead := w.st.TakeColdDrained()
+	if len(dead) == 0 {
+		return
+	}
+	stamp := w.ep.bump()
+	for _, si := range dead {
+		w.st.RetireSegment(si, stamp)
+	}
 }
 
 // pumpStreams runs one producer pass over the in-flight streams, dropping the

@@ -275,6 +275,15 @@ func (s *Store) CompleteColdDrain(d *coldDrain, ok bool) int {
 		s.noteDrop(s.recFlags(addr) &^ flagMigrating)
 		s.coldRecs++
 		s.arena.unlink(addr, s.recBytes(addr))
+		// A flip that unlinked the last live record of its segment leaves the
+		// segment fully dead. Note it so the worker retires it through the epoch
+		// path at the boundary: a segment the migrator drained is exactly the
+		// segment a future off-owner reader (a parked cold read, a cross-shard
+		// hop) could still name, so its bytes must outlive the bracket in flight,
+		// not free the instant the compactor next runs.
+		if si, ok := s.arena.segOf(addr); ok && s.arena.fullyDead(si) {
+			s.markDrained(si)
+		}
 		n++
 	}
 	return n

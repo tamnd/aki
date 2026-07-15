@@ -93,6 +93,40 @@ func (s *Store) RetireSegment(si, atEpoch uint64) bool {
 	return s.arena.retireSegment(si, atEpoch)
 }
 
+// markDrained notes that segment si went fully dead on a migrator phase-2 flip,
+// deduping against the segments already noted this boundary. The list is small
+// (at most the segments one boundary's drains empty) so the linear scan is
+// cheap, and the dedup keeps a segment two flips emptied in the same pass from
+// appearing twice. Owner-only, called from CompleteColdDrain after the unlink
+// that drove the segment's live charge to zero.
+func (s *Store) markDrained(si uint64) {
+	for _, x := range s.drained {
+		if x == si {
+			return
+		}
+	}
+	s.drained = append(s.drained, si)
+}
+
+// TakeColdDrained returns the segments the migrator emptied since the last call
+// and clears the list. The shard worker takes them at the boundary to stamp and
+// retire each through the epoch path; an empty return (the common case, no drain
+// emptied a segment) is one length check. Owner-only.
+func (s *Store) TakeColdDrained() []uint64 {
+	d := s.drained
+	s.drained = s.drained[:0]
+	return d
+}
+
+// RetiredSegs is the count of segments currently parked for epoch-gated
+// reclamation, introspection the migrator's shard-level tests read to prove a
+// drain retired a segment and a later boundary reclaimed it. Owner-only.
+func (s *Store) RetiredSegs() int { return len(s.arena.retired) }
+
+// PendingDrained is the count of migrator-emptied segments the store has noted
+// but the worker has not yet retired, introspection for the same tests. Owner-only.
+func (s *Store) PendingDrained() int { return len(s.drained) }
+
 // ReclaimSafe hands every epoch-retired segment the safe epoch has cleared
 // back to the free list and reports how many. The worker calls it at the batch
 // boundary with epoch.safe() (engine/f3/shard), after it has exited the batch's

@@ -58,6 +58,16 @@ type Store struct {
 	// whether it flipped, dropped, or was cancelled by a racing write.
 	migrating int
 
+	// drained lists the arena segments the async migrator's phase 2 emptied
+	// this boundary: a flip that unlinked the last live record of a segment
+	// appends its index here (markDrained, deduped). The shard worker takes the
+	// list at the boundary, stamps each with the current epoch, and retires it
+	// through the F6 reclamation path (RetireSegment) rather than letting the
+	// compactor free it outright, so a segment a batch in flight could still name
+	// waits the bracket out. Nil and untouched until the migrator empties its
+	// first segment, so the resident path never allocates it.
+	drained []uint64
+
 	// The residency machinery (resid.go). ltmOn folds the whole
 	// configuration check into one load for the read path; residMode is the
 	// promotion policy (labs override it); markAlways is lab 15's
@@ -264,6 +274,7 @@ func (s *Store) Reset() {
 	s.coldRecs = 0
 	s.coldHand = 0
 	s.migrating = 0
+	s.drained = s.drained[:0]
 	s.vbuf = nil
 	s.cbuf = nil
 	s.zbuf = nil
