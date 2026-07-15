@@ -18,8 +18,8 @@ const promoteDefaultP = 0.125
 
 // errHotFull is a write the hot tier could not house even after eviction
 // and a forced drain: everything left is dirty and the store refused to
-// take it, or the tier is sized to nothing. The backpressure slice turns
-// this into the err-shed rung; until then it surfaces as a plain error.
+// take it, or the tier is sized to nothing. This is a RAM-side refusal;
+// the disk-side refusal is ErrShed at the write door.
 var errHotFull = errors.New("sqlo1: hot tier full")
 
 // TieredConfig sizes a Tiered runtime. Budget rows the hot tier consumes
@@ -104,12 +104,16 @@ func NewTiered(st Store, cfg TieredConfig) *Tiered {
 	ht := NewBudgetedHotTable(cfg.Budget)
 	dr := newDrainer(ht, st)
 	ev := newEvictor(ht, cfg.Seed)
+	// A store that feels disk-side pressure exposes Maintainer and the
+	// ladder's WAL and free-extent rungs come alive; MemStore does not,
+	// and those rungs read zero.
+	mt, _ := st.(Maintainer)
 	t := &Tiered{
 		ht:    ht,
 		st:    st,
 		dr:    dr,
 		ev:    ev,
-		lad:   newLadder(ht, dr, ev),
+		lad:   newLadder(ht, dr, ev, mt),
 		coin:  rand.New(rand.NewPCG(cfg.Seed^0xa5a5a5a5a5a5a5a5, cfg.Seed+1)),
 		prob:  prob,
 		nowMs: now,
@@ -118,12 +122,16 @@ func NewTiered(st Store, cfg TieredConfig) *Tiered {
 	return t
 }
 
-// Tick advances the coarse clock and spends drain quanta if dirty pressure
-// asks for them; the server calls it about once a second.
+// Tick advances the coarse clock, spends drain quanta if dirty pressure
+// asks for them, and runs the timer half of the maintenance rungs: a due
+// checkpoint and any foreground compaction happen here, off the command
+// path. The server calls it about once a second.
 func (t *Tiered) Tick(ctx context.Context) error {
 	t.ht.SetTick(uint32(uint64(t.nowMs()) >> 10))
-	_, err := t.lad.step(ctx)
-	return err
+	if _, err := t.lad.step(ctx); err != nil {
+		return err
+	}
+	return t.lad.tick(ctx)
 }
 
 // Get reads one key through the tiers. The value aliases hot-tier arenas
@@ -204,7 +212,16 @@ func (t *Tiered) BatchGet(ctx context.Context, keys [][]byte, out [][]byte) ([][
 // Set writes key through the hot tier: the record is dirty until drain
 // cools it. A refused write makes room by evicting clean residents, then
 // by forcing a drain cycle; only a tier with nothing left to give errors.
+// A store at its disk hard minimum bounces the write with ErrShed before
+// it dirties anything, after one repair pass; Del stays exempt because
+// deletions are how the user creates the garbage compaction reclaims,
+// and shedding them would wedge a full store for good.
 func (t *Tiered) Set(ctx context.Context, key, val []byte, tag uint8) error {
+	if shed, err := t.lad.shed(ctx); err != nil {
+		return err
+	} else if shed {
+		return ErrShed
+	}
 	if !t.ht.Put(key, val, tag) {
 		if err := t.makeRoomFor(ctx, len(key)+len(val)); err != nil {
 			return err

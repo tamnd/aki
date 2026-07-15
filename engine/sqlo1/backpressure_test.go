@@ -12,7 +12,7 @@ func newTestLadder(capacity, threshold int) (*HotTable, *ladder) {
 	ht.SetTick(1)
 	d := newDrainer(ht, NewMemStore())
 	d.threshold = threshold
-	return ht, newLadder(ht, d, newEvictor(ht, 21))
+	return ht, newLadder(ht, d, newEvictor(ht, 21), nil)
 }
 
 func TestDirtyPressureSignal(t *testing.T) {
@@ -25,7 +25,7 @@ func TestDirtyPressureSignal(t *testing.T) {
 		t.Fatalf("pressure %f, want 1.5", p)
 	}
 	if l.walPressure() != 0 || l.extentPressure() != 0 {
-		t.Fatal("stub rungs must read zero until their milestones land")
+		t.Fatal("maintenance rungs must read zero without a Maintainer")
 	}
 }
 
@@ -74,7 +74,7 @@ func TestMakeRoomForcesDrainWhenAllDirty(t *testing.T) {
 	ht := NewBudgetedHotTable(b)
 	ht.SetTick(1)
 	d := newDrainer(ht, NewMemStore())
-	l := newLadder(ht, d, newEvictor(ht, 22))
+	l := newLadder(ht, d, newEvictor(ht, 22), nil)
 
 	val := bytes.Repeat([]byte("v"), 4<<10)
 	filled := 0
@@ -119,7 +119,7 @@ func TestLadderStepZeroAlloc(t *testing.T) {
 	ht.SetTick(1)
 	d := newDrainer(ht, nullStore{})
 	d.threshold = 64
-	l := newLadder(ht, d, newEvictor(ht, 23))
+	l := newLadder(ht, d, newEvictor(ht, 23), nil)
 	keys := [][]byte{[]byte("bp-0"), []byte("bp-1")}
 	val := bytes.Repeat([]byte("v"), 64)
 

@@ -116,6 +116,13 @@ type Store struct {
 	relocatedBytes uint64
 	compactions    uint64
 
+	// Pressure gauge parameters (pressure.go): ckptPolicy.Bytes is
+	// the WAL rung's denominator, and maxBytes caps the file for the
+	// free-extent rung, 0 meaning unbounded, which reads that rung's
+	// signals as zero.
+	ckptPolicy CheckpointPolicy
+	maxBytes   int64
+
 	// dirty holds every bucket chain touched since the last durable
 	// checkpoint; RAM is authoritative for these. pending maps the
 	// in-flight batch's vlog positions to encoded records, covering
@@ -200,14 +207,15 @@ func CreateStoreOn(f StoreFile, walPath string, walSegSize int64) (*Store, error
 		return nil, err
 	}
 	s := &Store{
-		f:       f,
-		wal:     w,
-		sb:      sb,
-		grid:    NewGrid(sb.ExtentCount),
-		dir:     NewDirectory(FullPtr{}),
-		dirty:   map[uint64][]*Chunk{0: {base}},
-		pending: map[Pos][]byte{},
-		nowMS:   wallMS,
+		f:          f,
+		wal:        w,
+		sb:         sb,
+		grid:       NewGrid(sb.ExtentCount),
+		dir:        NewDirectory(FullPtr{}),
+		dirty:      map[uint64][]*Chunk{0: {base}},
+		pending:    map[Pos][]byte{},
+		nowMS:      wallMS,
+		ckptPolicy: DefaultCheckpointPolicy(),
 	}
 	s.initCursors()
 	s.rd = &IndexReader{Dir: s.dir, Groups: fileGroups{s.f, s.sb.ExtentSize}, Blob: s.readBlobPos}
@@ -284,18 +292,19 @@ func restoreStore(f StoreFile, rec *Recovery) (*Store, error) {
 	}
 	split, level := UnpackHashEpoch(sb.HashEpoch)
 	s := &Store{
-		f:       f,
-		wal:     rec.WAL,
-		sb:      sb,
-		grid:    grid,
-		level:   level,
-		split:   split,
-		entries: sb.RecordCount,
-		garbage: sb.GarbageBytes,
-		hw:      sb.HighWater,
-		dirty:   map[uint64][]*Chunk{},
-		pending: map[Pos][]byte{},
-		nowMS:   wallMS,
+		f:          f,
+		wal:        rec.WAL,
+		sb:         sb,
+		grid:       grid,
+		level:      level,
+		split:      split,
+		entries:    sb.RecordCount,
+		garbage:    sb.GarbageBytes,
+		hw:         sb.HighWater,
+		dirty:      map[uint64][]*Chunk{},
+		pending:    map[Pos][]byte{},
+		nowMS:      wallMS,
+		ckptPolicy: DefaultCheckpointPolicy(),
 	}
 	s.initCursors()
 	if sb.DirRoot == (FullPtr{}) {
