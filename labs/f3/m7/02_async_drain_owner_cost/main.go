@@ -138,22 +138,23 @@ func measure(dir string) measured {
 	const frameRecs = 200_000
 
 	// Frame CPU: build a large drain twice (warm the allocator) and take the
-	// per-record cost of the second.
-	buildDrain(frameRecs)
+	// per-record cost of the second. The warm-up result is touched so the build
+	// is not elided.
+	warmup := buildDrain(frameRecs)
+	_ = warmup[0]
 	start := time.Now()
 	buf := buildDrain(frameRecs)
 	frameRec := float64(time.Since(start).Nanoseconds()) / float64(frameRecs)
-	sink(buf)
 
 	f, err := os.OpenFile(filepath.Join(dir, "drain"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		panic(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Warm buffered write: the cheap floor, the page-cache copy with no writeback
 	// wait. Best of several, so the floor is a floor.
-	var warm float64 = 1e18
+	warm := 1e18
 	for r := 0; r < 8; r++ {
 		start = time.Now()
 		if _, err := f.WriteAt(buf, int64(r)*int64(len(buf))); err != nil {
@@ -168,7 +169,7 @@ func measure(dir string) measured {
 	// Blocking write: WriteAt plus fsync, a real durable-write cost, the kind of
 	// stall the owner must not sit inside. Median of several.
 	small := buildDrain(1024)
-	var fs float64 = 1e18
+	fs := 1e18
 	for r := 0; r < 8; r++ {
 		start = time.Now()
 		if _, err := f.WriteAt(small, int64(r)*int64(len(small))); err != nil {
@@ -199,15 +200,13 @@ func measure(dir string) measured {
 	slots := make([]uint64, 1024)
 	const flips = 2_000_000
 	start = time.Now()
-	var acc uint64
 	for i := 0; i < flips; i++ {
 		binary.LittleEndian.PutUint64(key[:8], uint64(i))
 		h := maphash.Bytes(seed, key[:])
 		slots[h&1023] = h
-		acc += h
 	}
 	flipRec := float64(time.Since(start).Nanoseconds()) / float64(flips)
-	sinkU(acc)
+	_ = slots[0] // touch the slots so the flip loop is not elided
 
 	return measured{frameRec: frameRec, warmPerRec: warmPerRec, fsyncPerCall: fs, submit: submit, flipRec: flipRec}
 }
@@ -222,7 +221,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	m := measure(dir)
 
 	base := costs{frameRec: m.frameRec, submit: m.submit, flipRec: m.flipRec}
@@ -277,13 +276,6 @@ func main() {
 }
 
 const serveNs = 80.0 // a served command's owner time, a plain point op
-
-// sink and sinkU keep the compiler from folding the measured work away.
-var sinkBuf []byte
-var sinkAcc uint64
-
-func sink(b []byte)  { sinkBuf = b }
-func sinkU(u uint64) { sinkAcc = u }
 
 func dur(ns float64) string {
 	switch {
