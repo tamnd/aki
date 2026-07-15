@@ -29,6 +29,13 @@ type aseg struct {
 	base  uint64
 	alloc uint64
 	live  int64
+	// retired marks a segment parked for epoch-gated reclamation: fully dead
+	// and unlinked from the index, but not yet on the free list because an
+	// off-owner reader may still name its bytes (retireSegment). The
+	// compaction and full-arena passes skip a retired segment so nothing frees
+	// it ahead of its epoch; reclaimSafe clears the mark when it returns the
+	// segment to the free list.
+	retired bool
 }
 
 type arena struct {
@@ -46,6 +53,21 @@ type arena struct {
 	// list.
 	highWater uint64
 	cur       uint64
+	// retired lists the segments handed to retireSegment and awaiting an
+	// epoch: each carries the epoch stamp that was current at retirement, and
+	// reclaimSafe returns those whose stamp the safe epoch has passed. Nil and
+	// walked never until the M7 migrator retires its first drained segment, so
+	// the resident path pays nothing for it.
+	retired []retiredSeg
+}
+
+// retiredSeg is one segment parked for epoch-gated reclamation: its index and
+// the epoch stamp current when retireSegment took it. reclaimSafe frees it once
+// the safe epoch moves strictly past the stamp, which is exactly when no
+// bracket that was in flight at retirement can still name its bytes.
+type retiredSeg struct {
+	si    uint64
+	epoch uint64
 }
 
 // newArena tiles arenaBytes into segments of segBytes. Offset 0 is reserved so
@@ -160,6 +182,52 @@ func (a *arena) freeSegment(si uint64) {
 	a.freeSegs = append(a.freeSegs, si)
 }
 
+// retireSegment parks segment si for epoch-gated reclamation at stamp atEpoch
+// instead of freeing it outright. Like freeSegment, the caller must have
+// unlinked every record the segment held from the index, so the segment is
+// fully dead; unlike freeSegment, its bytes stay resident and it stays off the
+// free list until reclaimSafe clears the epoch. That window is what lets an
+// off-owner reader (the M7 migrator's phase-2 flip, a parked cold read) finish
+// with an address it captured before the retire. The segment is marked so the
+// compaction and full-arena passes leave it alone until then. Retiring the
+// current segment is a caller error, refused the same as freeSegment.
+func (a *arena) retireSegment(si, atEpoch uint64) bool {
+	if si == a.cur || a.segs[si].retired {
+		return false
+	}
+	a.segs[si].retired = true
+	a.retired = append(a.retired, retiredSeg{si: si, epoch: atEpoch})
+	return true
+}
+
+// reclaimSafe returns every retired segment whose epoch stamp is strictly below
+// safe to the free list, freeing its pages, and reports how many it took back.
+// A stamp strictly below safe means every bracket that could have named the
+// segment at retirement has since exited (the F6 contract, engine/f3/shard/
+// epoch.go): safe is the newest epoch every in-flight bracket has moved past,
+// so a stamp under it is unreachable. Retired segments are fully dead by
+// retireSegment's contract, so the free is the plain freeSegment path with no
+// relocation. Owner-only, run at the batch boundary where the worker has just
+// exited its bracket.
+func (a *arena) reclaimSafe(safe uint64) int {
+	if len(a.retired) == 0 {
+		return 0
+	}
+	freed := 0
+	kept := a.retired[:0]
+	for _, r := range a.retired {
+		if r.epoch < safe {
+			a.segs[r.si].retired = false
+			a.freeSegment(r.si)
+			freed++
+			continue
+		}
+		kept = append(kept, r)
+	}
+	a.retired = kept
+	return freed
+}
+
 // reset rewinds every segment to empty, the arena half of a flush. The caller
 // owns the index and must have dropped it too. The pages behind every touched
 // segment go back to the OS, same as freeSegment: a flush that only rewound
@@ -174,8 +242,10 @@ func (a *arena) reset() {
 	for i := range a.segs {
 		a.segs[i].alloc = a.segs[i].base
 		a.segs[i].live = 0
+		a.segs[i].retired = false
 	}
 	a.freeSegs = a.freeSegs[:0]
+	a.retired = a.retired[:0]
 	a.highWater = 1
 	a.cur = 0
 	a.releasePages(0, touched)

@@ -57,7 +57,7 @@ func (s *Store) ArenaReclaimable() uint64 {
 	var n uint64
 	for si := range s.arena.segs {
 		u := uint64(si)
-		if u == s.arena.cur {
+		if u == s.arena.cur || s.arena.segs[si].retired {
 			continue
 		}
 		fill := s.arena.fillOf(u)
@@ -78,6 +78,31 @@ func (s *Store) ArenaReclaimable() uint64 {
 // compaction pass at the next batch boundary rather than ErrFull.
 func (s *Store) ArenaTight() bool {
 	return s.arena.freeSegCount() < 2
+}
+
+// RetireSegment parks a fully drained segment for epoch-gated reclamation at
+// stamp atEpoch and reports whether it took it (false if the segment is the
+// current bump target or already retired). The M7 migration quantum
+// (engine/f3/shard worker) calls it in phase 2 after every record in the
+// segment has flipped cold and unlinked from the index, so the segment is dead
+// but its bytes stay resident for any bracket that captured an address before
+// the flip; ReclaimSafe frees it once the safe epoch passes the stamp. The
+// fully-dead precondition is the caller's, exactly as for the internal free
+// path.
+func (s *Store) RetireSegment(si, atEpoch uint64) bool {
+	return s.arena.retireSegment(si, atEpoch)
+}
+
+// ReclaimSafe hands every epoch-retired segment the safe epoch has cleared
+// back to the free list and reports how many. The worker calls it at the batch
+// boundary with epoch.safe() (engine/f3/shard), after it has exited the batch's
+// bracket, so a segment retired while a still-open bracket could name it waits
+// for that bracket to drain. Until the M7 migrator retires its first segment
+// the retire list is empty and this is one length check; it is wired from the
+// first batch so the reclamation contract is exercised before a real reader
+// depends on it. Owner-only, same as CompactArena.
+func (s *Store) ReclaimSafe(safe uint64) int {
+	return s.arena.reclaimSafe(safe)
 }
 
 // CompactArena reclaims dead arena bytes: every fully dead segment is freed
@@ -140,7 +165,7 @@ func (s *Store) compactPass(moveBudget uint64) (freed int, moved uint64) {
 	for si := range s.arena.segs {
 		victims[si] = false
 		u := uint64(si)
-		if u == s.arena.cur {
+		if u == s.arena.cur || s.arena.segs[si].retired {
 			continue
 		}
 		fill := s.arena.fillOf(u)
@@ -225,7 +250,7 @@ func (s *Store) reclaimOnFull() bool {
 	freed := false
 	for si := range s.arena.segs {
 		u := uint64(si)
-		if u == s.arena.cur {
+		if u == s.arena.cur || s.arena.segs[si].retired {
 			continue
 		}
 		if fill := s.arena.fillOf(u); fill > 0 && s.arena.segs[si].live == 0 {

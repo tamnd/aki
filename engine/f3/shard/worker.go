@@ -160,6 +160,12 @@ func (w *worker) run() {
 			if w.st.MaybeDemote() > 0 || w.st.ArenaTight() || w.st.ResidentOver() {
 				w.st.CompactArena()
 			}
+			// Return any epoch-retired segments this boundary's exited bracket
+			// has cleared (M7 reclamation): the pass above exited its batch
+			// bracket, so safe reflects it. A length check until the migrator
+			// retires its first segment; wired from the first batch so the
+			// contract runs before a real reader depends on it.
+			w.st.ReclaimSafe(w.ep.safe())
 		}
 		if n == 0 {
 			if w.stop.Load() {
@@ -199,6 +205,10 @@ func (w *worker) maybeCompact() {
 	if demoted > 0 || w.st.ArenaReclaimable() >= arenaCompactMinDead {
 		w.st.CompactArena()
 	}
+	// The idle-boundary half of M7 reclamation: the queue is drained and the
+	// bracket long exited, so safe has advanced past any bracket that could
+	// have named a retired segment. Empty-list cheap until the migrator lands.
+	w.st.ReclaimSafe(w.ep.safe())
 }
 
 // pumpStreams runs one producer pass over the in-flight streams, dropping the
