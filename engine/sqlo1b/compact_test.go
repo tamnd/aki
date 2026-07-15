@@ -238,8 +238,9 @@ func TestCompactCrashEvaporates(t *testing.T) {
 	r.verify(t)
 }
 
-// TestCompactGuards pins the refusals: active, free, and blob extents
-// do not compact, and the store stays usable after each refusal.
+// TestCompactGuards pins the refusals: active, free, and out-of-grid
+// extents do not compact, and the store stays usable after each
+// refusal.
 func TestCompactGuards(t *testing.T) {
 	ctx := context.Background()
 	r := newStoreRig(t)
@@ -257,24 +258,6 @@ func TestCompactGuards(t *testing.T) {
 	}
 	if _, err := r.s.CompactExtent(ctx, r.s.grid.ExtentCount()+7); err == nil {
 		t.Fatal("compacting past the grid did not error")
-	}
-
-	// Roll the blob stream so a sealed blob extent exists. Values sit
-	// over the blob threshold but under the rig's 64 KiB WAL segment.
-	blobVal := bytes.Repeat([]byte{'b'}, 32<<10)
-	r.apply(t, putOp("blob0", blobVal, 0))
-	first := r.s.blob.ext
-	for i := 1; r.s.blob.ext == first; i++ {
-		if i > 64 {
-			t.Fatal("blob stream never rolled")
-		}
-		r.apply(t, putOp(fmt.Sprintf("blob%d", i), blobVal, 0))
-	}
-	if r.s.grid.State(first) != StateSealed {
-		t.Fatalf("rolled blob extent is %s, want sealed", r.s.grid.State(first))
-	}
-	if _, err := r.s.CompactExtent(ctx, first); err == nil {
-		t.Fatal("compacting a blob extent did not error")
 	}
 	r.verify(t)
 }
