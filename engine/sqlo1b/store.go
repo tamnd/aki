@@ -2,6 +2,7 @@ package sqlo1b
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"github.com/tamnd/aki/engine/sqlo1"
 
 	"encoding/binary"
+	"math/bits"
 )
 
 // Store wires the format core into the sqlo1.Store seam: one shard,
@@ -554,13 +556,34 @@ func seamRecord(r *sqlo1.Record) *Record {
 }
 
 // plannedFrame is one WAL frame of a batch, encoded before anything
-// is emitted so a bad op rejects the whole batch cleanly.
+// is emitted so a bad op rejects the whole batch cleanly. pos is the
+// vlog position the placement pass assigned to a put.
 type plannedFrame struct {
 	op  uint8
 	pay []byte
 	del bool
 	key []byte
 	rec *Record
+	pos Pos
+}
+
+// placementRooth groups a put for vlog placement: records living under
+// a subkey sort on their rooth so one collection's records land next
+// to each other in the extent (scan locality, doc 04 section 7), and
+// everything else sorts on 0, packing plain records by size class
+// alone.
+func placementRooth(rec *Record) uint64 {
+	if (rec.RType == RecSeg || rec.RType == RecFence) && len(rec.Key) == SubkeySize {
+		return binary.LittleEndian.Uint64(rec.Key)
+	}
+	return 0
+}
+
+// placementClass is the power-of-two size class of the encoded record;
+// packing neighbors of one class caps a group's tail waste near one
+// class step instead of one max-size record.
+func placementClass(rec *Record) int {
+	return bits.Len(uint(rec.EncodedLen()))
 }
 
 // ApplyBatch drains one batch: encode and validate every op, emit the
@@ -569,6 +592,20 @@ type plannedFrame struct {
 // batch at or below the high-water mark is the exactly-once no-op the
 // seam requires. No op memory is retained: payloads and group buffers
 // are copies, chunks hold positions.
+//
+// Placement and apply are separate passes. Puts place into vlog groups
+// in packing order, sorted by collection then size class (doc 04
+// section 7); index updates then apply in batch order, so op semantics
+// never depend on where a record landed. The open group carries across
+// batches and only closes when full, which is what keeps a run of
+// small drain cycles from padding out one group each.
+//
+// WAL framing follows doc 06 rule W2 degenerately at this layer: every
+// seam record is either a segment post-image (Gen above zero) or an
+// inline-mode root (a plain record is its own root), and W2 frames
+// both in full. Root-frame elision and the W3 replay reconciliation
+// only apply to RecRoot images, which the per-type layer introduces;
+// none cross the seam yet.
 func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -618,13 +655,42 @@ func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 	// Durability point. A failure past here leaves RAM half-applied
 	// with no way back inside this process, so it poisons the store;
 	// reopening replays the WAL into a clean state.
-	for _, fr := range frames {
+	puts := make([]int, 0, len(frames))
+	for i := range frames {
+		if frames[i].rec != nil {
+			puts = append(puts, i)
+		}
+	}
+	slices.SortFunc(puts, func(a, b int) int {
+		ra, rb := frames[a].rec, frames[b].rec
+		if c := cmp.Compare(placementRooth(ra), placementRooth(rb)); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(placementClass(ra), placementClass(rb)); c != 0 {
+			return c
+		}
+		return cmp.Compare(a, b)
+	})
+	for _, i := range puts {
+		fr := &frames[i]
+		enc, err := fr.rec.Encode()
+		if err != nil {
+			s.broken = err
+			return err
+		}
+		if fr.pos, err = s.appendVlog(enc); err != nil {
+			s.broken = err
+			return err
+		}
+	}
+	for i := range frames {
+		fr := &frames[i]
 		var err error
 		switch {
 		case fr.del:
 			err = s.applyDel(fr.key)
 		case fr.rec != nil:
-			err = s.applyPut(fr.rec)
+			err = s.indexPut(fr.rec, fr.pos)
 		}
 		if err != nil {
 			s.broken = err
@@ -639,7 +705,10 @@ func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 	return nil
 }
 
-// applyPut writes one record to the vlog and upserts its index entry.
+// applyPut writes one record to the vlog and upserts its index entry;
+// the recovery replay path uses it op-at-a-time. ApplyBatch runs the
+// two halves as separate passes so placement order and apply order can
+// differ.
 func (s *Store) applyPut(rec *Record) error {
 	enc, err := rec.Encode()
 	if err != nil {
@@ -649,6 +718,11 @@ func (s *Store) applyPut(rec *Record) error {
 	if err != nil {
 		return err
 	}
+	return s.indexPut(rec, pos)
+}
+
+// indexPut upserts the index entry for a record already placed at pos.
+func (s *Store) indexPut(rec *Record, pos Pos) error {
 	h := KeyHash(rec.Key)
 	bucket := BucketOf(PlacementBits(h), s.level, s.split)
 	chain, err := s.mutableChain(bucket)
@@ -787,10 +861,12 @@ func (s *Store) applyDel(key []byte) error {
 	return nil
 }
 
-// finishApply closes the batch's open vlog group and drops the
-// pending map: every position is now resolvable from the file.
+// finishApply write-throughs the open vlog group and drops the pending
+// map: every position is now resolvable from the file. The group stays
+// open, so the next batch keeps filling it and rewrites a fuller image
+// in place; only a full group closes for good (appendVlog does it).
 func (s *Store) finishApply() error {
-	if err := s.closeBatchGroup(); err != nil {
+	if err := s.flushBatchGroup(); err != nil {
 		return err
 	}
 	clear(s.pending)
@@ -1430,8 +1506,9 @@ func (s *Store) appendVlog(enc []byte) (Pos, error) {
 	return pos, nil
 }
 
-// openBatchGroup starts the next vlog group. Groups are per batch and
-// never reopened: a closed group is on disk for good.
+// openBatchGroup starts the next vlog group. The open group carries
+// across batches, write-through at each batch end; a closed group is
+// on disk for good.
 func (s *Store) openBatchGroup() error {
 	if !s.vlog.active {
 		if err := s.allocStream(&s.vlog); err != nil {
@@ -1451,12 +1528,35 @@ func (s *Store) openBatchGroup() error {
 	return nil
 }
 
-// closeBatchGroup pads and writes the open vlog group.
+// closeBatchGroup pads and writes the open vlog group and ends it: the
+// stream accounting advances and the next put starts a fresh group.
 func (s *Store) closeBatchGroup() error {
 	if s.gb == nil {
 		return nil
 	}
 	img := s.gb.Close()
+	if err := s.writeVlogGroup(img); err != nil {
+		return err
+	}
+	s.vlog.next++
+	s.vlog.groups++
+	s.vlog.payload += uint32(len(img))
+	s.gb = nil
+	return nil
+}
+
+// flushBatchGroup writes the open group's current image in place
+// without ending it. Rewriting settled records is tear-safe (their
+// bytes are identical at identical offsets), and anything newer that a
+// torn write could garble is WAL-covered and re-drains on replay.
+func (s *Store) flushBatchGroup() error {
+	if s.gb == nil {
+		return nil
+	}
+	return s.writeVlogGroup(s.gb.Image())
+}
+
+func (s *Store) writeVlogGroup(img []byte) error {
 	off := int64(s.gbExt)*int64(s.sb.ExtentSize) + int64(s.gbGrp)*GroupSize
 	if s.gbGrp == 0 {
 		off += ExtentHeaderSize
@@ -1464,10 +1564,6 @@ func (s *Store) closeBatchGroup() error {
 	if _, err := s.f.WriteAt(img, off); err != nil {
 		return fmt.Errorf("sqlo1b: vlog group %d/%d: %w", s.gbExt, s.gbGrp, err)
 	}
-	s.vlog.next++
-	s.vlog.groups++
-	s.vlog.payload += uint32(len(img))
-	s.gb = nil
 	return nil
 }
 

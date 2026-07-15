@@ -57,11 +57,17 @@ func (g *GroupBuilder) Append(rec []byte) (uint16, error) {
 // Records reports how many records the group holds.
 func (g *GroupBuilder) Records() int { return len(g.slots) }
 
-// Close pads the tail, writes the slot table, and returns the group
-// image at exactly its capacity. A gap of one to three bytes is too
-// small for the marker and stays zero; the slot table still bounds
-// the records, so only sequential scans lean on the marker.
-func (g *GroupBuilder) Close() []byte {
+// Image pads the tail, writes the slot table, and returns the group
+// image at exactly its capacity, without ending the group: the caller
+// may keep appending and take a fuller image later. Rewriting a fuller
+// image over an earlier one on disk is tear-safe, because a settled
+// record's bytes rewrite identically at the same offsets; only records
+// appended since the last image can be garbled by a torn write, and
+// those are WAL-covered. A gap of one to three bytes is too small for
+// the marker and stays zero; the slot table still bounds the records,
+// so only sequential scans lean on the marker.
+func (g *GroupBuilder) Image() []byte {
+	clear(g.buf[g.used:])
 	tstart := len(g.buf) - tableLen(len(g.slots))
 	if tstart-g.used >= 4 {
 		binary.LittleEndian.PutUint32(g.buf[g.used:], PadMarker)
@@ -72,6 +78,10 @@ func (g *GroupBuilder) Close() []byte {
 	binary.LittleEndian.PutUint16(g.buf[len(g.buf)-2:], uint16(len(g.slots)))
 	return g.buf
 }
+
+// Close is Image at the moment the group ends; the vlog layer stops
+// appending once it closes a group.
+func (g *GroupBuilder) Close() []byte { return g.Image() }
 
 // GroupView reads a closed group image through its slot table.
 type GroupView struct {
