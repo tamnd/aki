@@ -1,6 +1,9 @@
 package drivers
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 // The Sicily corpus over the wire (spec 2064/f3/15 section 10): the same golden
 // coordinates the codec unit tests pin, driven through the dispatch and the zset
@@ -130,10 +133,10 @@ func TestGeoSearchErrors(t *testing.T) {
 	send(t, nc, "GEOADD", "Sicily", "15.087269", "37.502669", "Catania")
 	expect(t, br, ":1\r\n")
 
-	// A center with no shape is a syntax error (padded past the arity floor with
-	// annotation flags so it reaches the handler's own validation).
+	// A center with no shape names the missing shape (padded past the arity floor
+	// with annotation flags so it reaches the handler's own validation).
 	send(t, nc, "GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "WITHCOORD", "WITHDIST")
-	expect(t, br, "-ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH\r\n")
+	expect(t, br, "-ERR exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH\r\n")
 
 	// An unknown unit is rejected.
 	send(t, nc, "GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "parsecs")
@@ -146,6 +149,116 @@ func TestGeoSearchErrors(t *testing.T) {
 	// A missing key is an empty array, not an error.
 	send(t, nc, "GEOSEARCH", "nokey", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "km")
 	expect(t, br, "*0\r\n")
+}
+
+// TestGeoSearchStore drives GEOSEARCHSTORE on co-located keys: STORE keeps the
+// original geohash score so the destination is a geo set again, STOREDIST keeps
+// the distance so it is a plain distance-ranked set, and an empty result deletes
+// the destination.
+func TestGeoSearchStore(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	send(t, nc, "GEOADD", "{s}Sicily", "13.361389", "38.115556", "Palermo",
+		"15.087269", "37.502669", "Catania")
+	expect(t, br, ":2\r\n")
+
+	// STORE writes both members and replies the stored cardinality. The
+	// destination is a geo set: GEOSEARCH decodes it to the same members.
+	send(t, nc, "GEOSEARCHSTORE", "{s}dest", "{s}Sicily", "FROMLONLAT", "15", "37",
+		"BYRADIUS", "200", "km", "ASC")
+	expect(t, br, ":2\r\n")
+	send(t, nc, "GEOSEARCH", "{s}dest", "FROMLONLAT", "15", "37",
+		"BYRADIUS", "200", "km", "ASC")
+	expect(t, br, "*2\r\n$7\r\nCatania\r\n$7\r\nPalermo\r\n")
+
+	// The stored scores are the original geohashes, so GEOHASH on the copy
+	// renders the same interop strings the source does.
+	send(t, nc, "GEOHASH", "{s}dest", "Palermo", "Catania")
+	expect(t, br, "*2\r\n$11\r\nsqc8b49rny0\r\n$11\r\nsqdtr74hyu0\r\n")
+
+	// STOREDIST keeps the distance in the requested unit as the score, so the
+	// destination ranks by distance: ZRANGE returns Catania before Palermo.
+	send(t, nc, "GEOSEARCHSTORE", "{s}dist", "{s}Sicily", "FROMLONLAT", "15", "37",
+		"BYRADIUS", "200", "km", "ASC", "STOREDIST")
+	expect(t, br, ":2\r\n")
+	send(t, nc, "ZRANGE", "{s}dist", "0", "-1")
+	expect(t, br, "*2\r\n$7\r\nCatania\r\n$7\r\nPalermo\r\n")
+
+	// COUNT cuts the stored set to the nearest.
+	send(t, nc, "GEOSEARCHSTORE", "{s}one", "{s}Sicily", "FROMLONLAT", "15", "37",
+		"BYRADIUS", "200", "km", "COUNT", "1")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "ZRANGE", "{s}one", "0", "-1")
+	expect(t, br, "*1\r\n$7\r\nCatania\r\n")
+
+	// An empty result deletes a pre-existing destination and replies zero. The
+	// destination starts as a real geo set, and ZCARD sees it drop to nothing
+	// (EXISTS is not yet wired to the zset keyspace, so ZCARD is the probe).
+	send(t, nc, "GEOADD", "{s}gone", "15.087269", "37.502669", "Catania")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "GEOSEARCHSTORE", "{s}gone", "{s}Sicily", "FROMLONLAT", "15", "37",
+		"BYRADIUS", "1", "m")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "ZCARD", "{s}gone")
+	expect(t, br, ":0\r\n")
+
+	// A wrong-type source is rejected before any write.
+	send(t, nc, "SET", "{s}str", "x")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "GEOSEARCHSTORE", "{s}dest", "{s}str", "FROMLONLAT", "15", "37",
+		"BYRADIUS", "1", "km")
+	expect(t, br, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+}
+
+// TestGeoSearchStoreCrossShard drives GEOSEARCHSTORE with the destination and
+// source on different shards, so the reply comes back through the F17 intent
+// route rather than the co-located fast path.
+func TestGeoSearchStoreCrossShard(t *testing.T) {
+	srv, nc, br := startServer(t)
+
+	keyOn := func(sh int, prefix string) string {
+		for i := 0; ; i++ {
+			k := prefix + strconv.Itoa(i)
+			if srv.rt.ShardOf([]byte(k)) == sh {
+				return k
+			}
+		}
+	}
+	src := keyOn(0, "gsrc")
+	dst := keyOn(1, "gdst")
+
+	send(t, nc, "GEOADD", src, "13.361389", "38.115556", "Palermo",
+		"15.087269", "37.502669", "Catania")
+	expect(t, br, ":2\r\n")
+
+	// Cross-shard STORE: the search runs on the source owner, the placement on
+	// the destination owner, both inside the intent that holds the two keys.
+	send(t, nc, "GEOSEARCHSTORE", dst, src, "FROMLONLAT", "15", "37",
+		"BYRADIUS", "200", "km", "ASC")
+	expect(t, br, ":2\r\n")
+	send(t, nc, "GEOSEARCH", dst, "FROMLONLAT", "15", "37",
+		"BYRADIUS", "200", "km", "ASC")
+	expect(t, br, "*2\r\n$7\r\nCatania\r\n$7\r\nPalermo\r\n")
+
+	// STOREDIST over the cross route ranks by distance too.
+	send(t, nc, "GEOSEARCHSTORE", dst, src, "FROMLONLAT", "15", "37",
+		"BYRADIUS", "200", "km", "STOREDIST")
+	expect(t, br, ":2\r\n")
+	send(t, nc, "ZRANGE", dst, "0", "-1")
+	expect(t, br, "*2\r\n$7\r\nCatania\r\n$7\r\nPalermo\r\n")
+
+	// A wrong-type source is caught on the cross path before the destination is
+	// touched.
+	strKey := keyOn(0, "gstr")
+	send(t, nc, "SET", strKey, "x")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "GEOSEARCHSTORE", dst, strKey, "FROMLONLAT", "15", "37",
+		"BYRADIUS", "1", "km")
+	expect(t, br, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	// The earlier destination survives the rejected call (ZCARD probes the zset
+	// keyspace, which EXISTS does not yet reach).
+	send(t, nc, "ZCARD", dst)
+	expect(t, br, ":2\r\n")
 }
 
 // TestGeoMissingKey checks the read commands answer a missing key without an

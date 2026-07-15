@@ -105,6 +105,46 @@ func TestGeoSearchBox(t *testing.T) {
 	}
 }
 
+// TestGeoStorePairs checks the store scoring: STORE keeps each survivor's
+// original geohash score, STOREDIST keeps its distance from the center in the
+// requested unit, and both come out score sorted so buildDest installs them.
+func TestGeoStorePairs(t *testing.T) {
+	z := geoSetSicily()
+	sh := geoShape{lon: 15, lat: 37, radiusM: 200000, toMeters: 1}
+	hits := geoSearchHits(z, sh)
+
+	// STORE: the pair score is the raw geohash, matching the source scores.
+	store := geoStorePairs(hits, geoSearchOpts{}, sh.toMeters)
+	byName := map[string]float64{}
+	for _, p := range store {
+		byName[string(p.member)] = p.score
+	}
+	if got, want := byName["Palermo"], float64(geoEncode(palermoLon, palermoLat)); got != want {
+		t.Errorf("stored Palermo score = %v, want %v", got, want)
+	}
+	if got, want := byName["Catania"], float64(geoEncode(cataniaLon, cataniaLat)); got != want {
+		t.Errorf("stored Catania score = %v, want %v", got, want)
+	}
+
+	// STOREDIST with a km unit divides the meters by 1000; the pairs sort by that
+	// distance, so Catania at ~56 km precedes Palermo at ~190 km.
+	dist := geoStorePairs(hits, geoSearchOpts{storeDist: true}, 1000)
+	if len(dist) != 2 || string(dist[0].member) != "Catania" || string(dist[1].member) != "Palermo" {
+		t.Fatalf("stored dist order = %v, want [Catania Palermo]", hitNames(hits))
+	}
+	if d := dist[0].score; d < 56.441 || d > 56.442 {
+		t.Errorf("stored Catania distance = %.4f km, want ~56.4413", d)
+	}
+	if d := dist[1].score; d < 190.442 || d > 190.443 {
+		t.Errorf("stored Palermo distance = %.4f km, want ~190.4424", d)
+	}
+
+	// An empty survivor list stores nothing, which place turns into a delete.
+	if geoStorePairs(nil, geoSearchOpts{}, 1) != nil {
+		t.Fatal("empty survivors must build no pairs")
+	}
+}
+
 // TestGeoCoveringUsesNeighbors checks the cover keeps its center cell and only
 // prunes neighbors when the step is fine enough for the exclusion, so a coarse
 // large-radius search never zeroes the center.

@@ -371,6 +371,18 @@ func init() {
 	// arguments after the command; the handler validates the rest.
 	register("GEOSEARCH", zset.Geosearch, 6, -1, true)
 
+	// GEOSEARCHSTORE writes the search result into a destination geo set, so it is
+	// the one geo command touching two keys. The tail is the destination then the
+	// source, so the routing key is the destination at args[0] (keyAt default) and
+	// the co-location check spans both (crossKeys). Co-located keys run the whole
+	// search-and-store on the destination's owner through the store; a destination
+	// and source that span shards route to the F17 hop coordinator. The smallest
+	// call is destination, source, FROMMEMBER m, and BYRADIUS r unit, seven
+	// arguments after the command.
+	register("GEOSEARCHSTORE", zset.Geosearchstore, 7, -1, true)
+	table["GEOSEARCHSTORE"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
+	table["GEOSEARCHSTORE"].cross = zset.GeosearchstoreCross
+
 	// The list surface (spec 2064/f3/13 M3 slice 1): the inline listpack band and
 	// its one-way promotion to the native quicklist placeholder. The pushes, pops,
 	// LLEN, LINDEX, LRANGE, LSET, LREM, LTRIM, LINSERT, and LPOS all key on the

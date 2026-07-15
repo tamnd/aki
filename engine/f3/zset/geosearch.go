@@ -363,15 +363,18 @@ func geoSearchHits(z *zset, sh geoShape) []geoHit {
 	return hits
 }
 
-// geoSearchOpts is the parsed GEOSEARCH tail beyond the center and shape.
+// geoSearchOpts is the parsed GEOSEARCH tail beyond the center and shape. The
+// WITH flags belong to the reading GEOSEARCH; storeDist belongs to the writing
+// GEOSEARCHSTORE, which the parser keeps mutually exclusive.
 type geoSearchOpts struct {
-	sortAsc  bool
-	sortDesc bool
-	count    int
-	any      bool
-	withCord bool
-	withDist bool
-	withHash bool
+	sortAsc   bool
+	sortDesc  bool
+	count     int
+	any       bool
+	withCord  bool
+	withDist  bool
+	withHash  bool
+	storeDist bool
 }
 
 // Geosearch answers GEOSEARCH key <FROMMEMBER m | FROMLONLAT lon lat> <BYRADIUS r
@@ -386,7 +389,7 @@ func Geosearch(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	sh, opts, errMsg := parseGeoSearch(z, args[1:])
+	sh, opts, errMsg := parseGeoSearch(z, args[1:], false)
 	if errMsg != "" {
 		r.Err(errMsg)
 		return
@@ -398,11 +401,14 @@ func Geosearch(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	geoReply(cx, r, hits, opts, sh.toMeters)
 }
 
-// parseGeoSearch parses a GEOSEARCH tail (the arguments after the key) against
-// the geo set z (needed to resolve FROMMEMBER) and returns the resolved shape,
-// the options, and a non-empty Redis error on a malformed request. It requires
-// exactly one center source and exactly one shape.
-func parseGeoSearch(z *zset, tail [][]byte) (geoShape, geoSearchOpts, string) {
+// parseGeoSearch parses a GEOSEARCH or GEOSEARCHSTORE tail (the arguments after
+// the key, or after the destination and source) against the geo set z (needed to
+// resolve FROMMEMBER) and returns the resolved shape, the options, and a
+// non-empty Redis error on a malformed request. It requires exactly one center
+// source and exactly one shape. When store is set the WITH flags are rejected and
+// STOREDIST is accepted; when it is clear the reverse holds, so the reading and
+// writing commands cannot borrow each other's annotations.
+func parseGeoSearch(z *zset, tail [][]byte, store bool) (geoShape, geoSearchOpts, string) {
 	var (
 		sh          geoShape
 		opts        geoSearchOpts
@@ -493,13 +499,28 @@ func parseGeoSearch(z *zset, tail [][]byte) (geoShape, geoSearchOpts, string) {
 				i++
 			}
 		case eqFold(tail[i], "WITHCOORD"):
+			if store {
+				return sh, opts, "ERR syntax error"
+			}
 			opts.withCord = true
 			i++
 		case eqFold(tail[i], "WITHDIST"):
+			if store {
+				return sh, opts, "ERR syntax error"
+			}
 			opts.withDist = true
 			i++
 		case eqFold(tail[i], "WITHHASH"):
+			if store {
+				return sh, opts, "ERR syntax error"
+			}
 			opts.withHash = true
+			i++
+		case eqFold(tail[i], "STOREDIST"):
+			if !store {
+				return sh, opts, "ERR syntax error"
+			}
+			opts.storeDist = true
 			i++
 		default:
 			return sh, opts, "ERR syntax error"
@@ -511,8 +532,15 @@ func parseGeoSearch(z *zset, tail [][]byte) (geoShape, geoSearchOpts, string) {
 	if opts.sortAsc && opts.sortDesc {
 		return sh, opts, "ERR syntax error"
 	}
-	if !haveCenter || !haveShape {
-		return sh, opts, "ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH"
+	cmd := "GEOSEARCH"
+	if store {
+		cmd = "GEOSEARCHSTORE"
+	}
+	if !haveCenter {
+		return sh, opts, "ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for " + cmd
+	}
+	if !haveShape {
+		return sh, opts, "ERR exactly one of BYRADIUS and BYBOX can be specified for " + cmd
 	}
 	if fromMember != nil {
 		if z == nil {
@@ -541,12 +569,11 @@ const (
 	errGeoNoMember = "ERR could not decode requested zset member"
 )
 
-// geoReply sorts, cuts, and emits the survivor set. GEOSEARCH sorts only when
-// ASC or DESC is asked, except that a COUNT without ANY sorts ascending so the
-// nearest n are returned deterministically. With no WITH option each element is
-// a member bulk string; with any, each is an array of the member then, in Redis
-// order, the distance, the raw hash, and the [lon, lat] pair.
-func geoReply(cx *shard.Ctx, r shard.Reply, hits []geoHit, opts geoSearchOpts, toMeters float64) {
+// geoOrderCut sorts the survivors by distance and cuts to COUNT, the ordering
+// step GEOSEARCH and GEOSEARCHSTORE share. The set sorts only when ASC or DESC is
+// asked, except that a COUNT without ANY sorts ascending so the nearest n are the
+// deterministic ones kept; ANY takes the first n the walk found in cell order.
+func geoOrderCut(hits []geoHit, opts geoSearchOpts) []geoHit {
 	if opts.sortAsc || opts.sortDesc || (opts.count > 0 && !opts.any) {
 		desc := opts.sortDesc
 		sort.SliceStable(hits, func(i, j int) bool {
@@ -559,6 +586,16 @@ func geoReply(cx *shard.Ctx, r shard.Reply, hits []geoHit, opts geoSearchOpts, t
 	if opts.count > 0 && len(hits) > opts.count {
 		hits = hits[:opts.count]
 	}
+	return hits
+}
+
+// geoReply sorts, cuts, and emits the survivor set. GEOSEARCH sorts only when
+// ASC or DESC is asked, except that a COUNT without ANY sorts ascending so the
+// nearest n are returned deterministically. With no WITH option each element is
+// a member bulk string; with any, each is an array of the member then, in Redis
+// order, the distance, the raw hash, and the [lon, lat] pair.
+func geoReply(cx *shard.Ctx, r shard.Reply, hits []geoHit, opts geoSearchOpts, toMeters float64) {
+	hits = geoOrderCut(hits, opts)
 
 	withAny := opts.withCord || opts.withDist || opts.withHash
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(hits))
