@@ -94,9 +94,11 @@ type hopBatch struct {
 	hasParked bool
 
 	// deferN counts this node's commands parked behind queued intents
-	// (txnroute.go). While it is non-zero the node stays with its owner;
-	// runDeferred pushes it to the connection when the count hits zero.
-	// Owner-goroutine only.
+	// (txnroute.go) or on a full arena (backpressure.go): each hold raises it,
+	// and while it is non-zero the node stays with its owner. runDeferred pushes
+	// it to the connection when an intent release clears the last hold, and
+	// retryFull does the same when a reclaimed arena completes the last parked
+	// write. Owner-goroutine only.
 	deferN int
 }
 

@@ -58,6 +58,33 @@ type Ctx struct {
 	// only on the owner goroutine; nothing off the owner may read them.
 	curConn *Conn
 	curSeq  uint32
+
+	// parkFull and retrying carry the block-not-drop backpressure decision across
+	// the handler boundary (backpressure.go). A write handler that cannot allocate
+	// calls ParkFull, which sets parkFull; the worker reads it once after every
+	// handler returns (one bool load, zero cost when unset) and registers the
+	// command on the shard's full-waiter FIFO instead of pushing a reply. retrying
+	// is set while the FIFO is being re-run so a re-park is reported to the retry
+	// driver rather than self-registering a second time.
+	parkFull bool
+	retrying bool
+}
+
+// ParkFull declares a write cannot allocate right now and parks it for retry
+// when the cold migrator frees room (spec 2064/f3/06 section 8): the command
+// produces no reply now, and the worker holds its batch until a later boundary
+// re-runs the handler against a reclaimed arena or a genuine stall surfaces the
+// OOM reply. It parks only on store.ErrFull; any other error (or nil) returns
+// false so the handler writes its own reply as before. On a bare Ctx built
+// outside a runtime (cx.w == nil, the test-built Ctx) it returns false too, so a
+// handler with no owner to park at falls back to writing the error, keeping the
+// contract total. Owner goroutine only.
+func (cx *Ctx) ParkFull(err error) bool {
+	if err != store.ErrFull || cx.w == nil {
+		return false
+	}
+	cx.parkFull = true
+	return true
 }
 
 // CurConn is the connection the running command belongs to, the completion
