@@ -32,10 +32,11 @@ import (
 // the view (Reply.Bulk and AppendFanValue copy immediately) before its next
 // store call.
 func (s *Store) GetView(key []byte, now int64) ([]byte, bool) {
-	_, addr, _ := s.findResident(Hash(key), key, now)
+	slot, addr, _ := s.findResident(Hash(key), key, now)
 	if addr == 0 {
 		return nil, false
 	}
+	s.touchSlot(slot)
 	return s.readValueRef(addr)
 }
 
@@ -44,10 +45,11 @@ func (s *Store) GetView(key []byte, now int64) ([]byte, bool) {
 // a ChunkStream and no bytes, everything else through readValueRef under the
 // GetView lifetime rule.
 func (s *Store) GetViewStream(key []byte, now int64) ([]byte, *ChunkStream, bool) {
-	_, addr, _ := s.findResident(Hash(key), key, now)
+	slot, addr, _ := s.findResident(Hash(key), key, now)
 	if addr == 0 {
 		return nil, nil, false
 	}
+	s.touchSlot(slot)
 	if s.recFlags(addr)&flagChunked != 0 {
 		return nil, s.chunkStreamAt(addr), true
 	}
