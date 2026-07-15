@@ -13,12 +13,27 @@ import (
 //
 //	u16  count       live entries, 0..42
 //	u8   cflags      bit0 overflow-continues
-//	u8   reserved
+//	u8   window_base first hash bit the entry split windows cover
 //	u32  chunk_no_lo low 32 bits of the chunk number
 //	entry[42]:
 //	  u16 fp         key hash bits 63..48
-//	  u16 meta       bits 0..3 type tag, 4..5 expiry class, 6 root flag
+//	  u16 meta       bits 0..3 type tag, 4..5 expiry class, 6 root
+//	                 flag, 7..15 split window
 //	  u64 vptr       packed record position
+//
+// The split window solves the redistribution problem: a split of
+// bucket S at level L sends each entry left or right on hash bit L,
+// but the entry stores only the fingerprint (bits 63..48) and the
+// key sits in a record on disk. Without stored bits every split
+// reads its whole bucket, about one record read per insert during
+// growth. So meta bits 7..15 carry hash bits window_base..
+// window_base+8, written from the full hash whenever the inserter
+// holds the key, and a split consumes the window bit at position
+// L-window_base. Only when a chunk's window no longer covers L
+// (once per nine levels a chunk survives, because window_base
+// rebases to the current level on refresh) does the split read the
+// bucket's records, batched, cutting split IO about 9x to roughly
+// 0.11 record reads per insert during growth.
 //
 // The chunk carries no checksum of its own: the directory's full
 // pointer covers it, and chunk_no_lo catches directory slips. When a
@@ -68,15 +83,24 @@ func Fingerprint(hash uint64) uint16 { return uint16(hash >> 48) }
 func PlacementBits(hash uint64) uint64 { return hash & placementMask }
 
 // Entry meta layout: bits 0..3 type tag, 4..5 expiry class, 6 root
-// flag, 7..15 reserved and zero. The type tag namespace is bound by
-// the store slice; the codec only sizes the field.
+// flag, 7..15 split window. The type tag namespace is bound by the
+// store slice; the codec only sizes the field.
 const (
 	ExpClassNone = 0
 	ExpClassNear = 1
 	ExpClassMid  = 2
 	ExpClassFar  = 3
 
-	metaKnown = 0x7F
+	// WindowBits is the split window width: hash bits window_base
+	// through window_base+8 in meta bits 7..15.
+	WindowBits = 9
+
+	windowMask = 1<<WindowBits - 1
+
+	// maxWindowBase bounds window_base: placement is 48 bits, so no
+	// split ever consumes a bit past 47 and no refresh rebases past
+	// it.
+	maxWindowBase = 47
 )
 
 // MakeEntryMeta packs an entry's meta field.
@@ -103,6 +127,38 @@ func MetaExpiryClass(meta uint16) uint8 { return uint8(meta>>4) & 3 }
 // MetaRoot reports the root flag.
 func MetaRoot(meta uint16) bool { return meta&(1<<6) != 0 }
 
+// SplitWindow extracts the 9-bit split window for a chunk base from
+// a full key hash: hash bits base..base+8. Only inserters holding
+// the key call this; a split that no longer holds the key consumes
+// stored windows instead.
+func SplitWindow(hash uint64, base uint8) (uint16, error) {
+	if base > maxWindowBase {
+		return 0, fmt.Errorf("sqlo1b: window base %d past placement bit %d", base, maxWindowBase)
+	}
+	return uint16(hash>>base) & windowMask, nil
+}
+
+// MetaSplitWindow unpacks the stored split window.
+func MetaSplitWindow(meta uint16) uint16 { return meta >> 7 }
+
+// MetaWithWindow packs a split window into a meta field.
+func MetaWithWindow(meta, window uint16) (uint16, error) {
+	if window > windowMask {
+		return 0, fmt.Errorf("sqlo1b: split window %#x exceeds %d bits", window, WindowBits)
+	}
+	return meta&0x7F | window<<7, nil
+}
+
+// WindowBit reads hash bit level out of an entry's stored window
+// under the chunk's base. ok is false when the window does not
+// cover the level and the split must refresh from records.
+func WindowBit(meta uint16, base, level uint8) (bit uint8, ok bool) {
+	if level < base || level-base >= WindowBits {
+		return 0, false
+	}
+	return uint8(MetaSplitWindow(meta)>>(level-base)) & 1, true
+}
+
 // ChunkCheck32 is the truncated check word a chain pointer stores
 // for its overflow chunk: the low 32 bits of xxhash64 over the
 // chunk's 512 bytes.
@@ -116,17 +172,23 @@ type Chunk struct {
 }
 
 // NewChunk allocates an empty chunk for the given chunk number.
-func NewChunk(chunkNo uint64) *Chunk {
+// windowBase is 0 for initial chunks, inherited from the parent on
+// an ordinary split, and the current level after a refresh.
+func NewChunk(chunkNo uint64, windowBase uint8) (*Chunk, error) {
+	if windowBase > maxWindowBase {
+		return nil, fmt.Errorf("sqlo1b: window base %d past placement bit %d", windowBase, maxWindowBase)
+	}
 	c := &Chunk{b: make([]byte, ChunkSize)}
+	c.b[3] = windowBase
 	binary.LittleEndian.PutUint32(c.b[4:8], uint32(chunkNo))
-	return c
+	return c, nil
 }
 
 // ParseChunk validates a chunk image against the chunk number the
 // caller resolved it under. The parse is strict: unknown cflags, a
-// nonzero reserved byte, reserved meta bits in a live entry, or any
-// nonzero byte outside the live region is a format error, so every
-// legal chunk has exactly one encoding.
+// window base past the placement bits, or any nonzero byte outside
+// the live region is a format error, so every legal chunk has
+// exactly one encoding.
 func ParseChunk(b []byte, chunkNo uint64) (*Chunk, error) {
 	if len(b) != ChunkSize {
 		return nil, fmt.Errorf("sqlo1b: chunk image is %d bytes, want %d", len(b), ChunkSize)
@@ -136,8 +198,8 @@ func ParseChunk(b []byte, chunkNo uint64) (*Chunk, error) {
 	if cflags&^cflagsKnown != 0 {
 		return nil, fmt.Errorf("sqlo1b: unknown cflags bits %#x", cflags&^cflagsKnown)
 	}
-	if b[3] != 0 {
-		return nil, fmt.Errorf("sqlo1b: reserved chunk header byte %#x", b[3])
+	if b[3] > maxWindowBase {
+		return nil, fmt.Errorf("sqlo1b: window base %d past placement bit %d", b[3], maxWindowBase)
 	}
 	if got, want := binary.LittleEndian.Uint32(b[4:8]), uint32(chunkNo); got != want {
 		return nil, fmt.Errorf("sqlo1b: chunk_no_lo %#x, resolved as chunk %#x", got, want)
@@ -149,13 +211,6 @@ func ParseChunk(b []byte, chunkNo uint64) (*Chunk, error) {
 	}
 	if int(count) > limit {
 		return nil, fmt.Errorf("sqlo1b: chunk count %d over capacity %d", count, limit)
-	}
-	for i := range int(count) {
-		off := chunkHdrSize + i*chunkEntSize
-		meta := binary.LittleEndian.Uint16(b[off+2 : off+4])
-		if meta&^metaKnown != 0 {
-			return nil, fmt.Errorf("sqlo1b: entry %d reserved meta bits %#x", i, meta&^metaKnown)
-		}
 	}
 	from := chunkHdrSize + int(count)*chunkEntSize
 	upto := ChunkSize
@@ -186,6 +241,10 @@ func (c *Chunk) Chained() bool { return c.b[2]&CFlagChained != 0 }
 // ChunkNoLo returns the stored low 32 bits of the chunk number.
 func (c *Chunk) ChunkNoLo() uint32 { return binary.LittleEndian.Uint32(c.b[4:8]) }
 
+// WindowBase returns the first hash bit the chunk's entry split
+// windows cover.
+func (c *Chunk) WindowBase() uint8 { return c.b[3] }
+
 func (c *Chunk) capacity() int {
 	if c.Chained() {
 		return ChunkChainCap
@@ -207,11 +266,9 @@ func (c *Chunk) EntryAt(i int) (fp, meta uint16, vptr uint64) {
 }
 
 // InsertEntry appends an entry. The caller resolves duplicates
-// before inserting; the codec only enforces capacity and meta shape.
+// before inserting and packs the split window into meta; the codec
+// only enforces capacity.
 func (c *Chunk) InsertEntry(fp, meta uint16, vptr uint64) error {
-	if meta&^metaKnown != 0 {
-		return fmt.Errorf("sqlo1b: reserved meta bits %#x", meta&^metaKnown)
-	}
 	n := c.Count()
 	if n >= c.capacity() {
 		return fmt.Errorf("sqlo1b: chunk full at %d entries (chained %v)", n, c.Chained())
@@ -247,9 +304,6 @@ func (c *Chunk) RemoveEntry(i int) error {
 func (c *Chunk) SetEntry(i int, meta uint16, vptr uint64) error {
 	if i >= c.Count() {
 		return fmt.Errorf("sqlo1b: set entry %d of %d", i, c.Count())
-	}
-	if meta&^metaKnown != 0 {
-		return fmt.Errorf("sqlo1b: reserved meta bits %#x", meta&^metaKnown)
 	}
 	off := c.entryOff(i)
 	binary.LittleEndian.PutUint16(c.b[off+2:off+4], meta)
