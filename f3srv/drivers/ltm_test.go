@@ -97,6 +97,29 @@ func TestInfoMemoryOnly(t *testing.T) {
 	}
 }
 
+// TestInfoBackpressureCounters checks the block-not-drop counters ride the INFO
+// fan (backpressure.go, M7 slice 5b). A server that never crossed its resident
+// cap parked no write, so both counters must render and read zero, the L9
+// no-pressure account: the fields are present for a client to poll, not omitted,
+// and no write parked on a store with room to spare.
+func TestInfoBackpressureCounters(t *testing.T) {
+	_, nc, br := startServer(t)
+	send(t, nc, "SET", "k", "v")
+	expect(t, br, "+OK\r\n")
+
+	stats := readInfo(t, nc, br)
+	if _, ok := stats["backpressure_waits"]; !ok {
+		t.Fatalf("backpressure_waits missing from INFO: %v", stats)
+	}
+	if _, ok := stats["backpressure_stalls"]; !ok {
+		t.Fatalf("backpressure_stalls missing from INFO: %v", stats)
+	}
+	if stats["backpressure_waits"] != 0 || stats["backpressure_stalls"] != 0 {
+		t.Fatalf("counters nonzero on a store that never filled: waits=%d stalls=%d",
+			stats["backpressure_waits"], stats["backpressure_stalls"])
+	}
+}
+
 // TestInfoRAMExceeded is the string LTM evidence run of doc 09 section 8: with
 // a resident cap far under the working set, separated-band values must land
 // in the per-shard value logs and INFO must show it, while every value still

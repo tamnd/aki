@@ -87,6 +87,27 @@ func (cx *Ctx) ParkFull(err error) bool {
 	return true
 }
 
+// BackpressureWaits is the cumulative number of writes this shard has parked on a
+// full arena (backpressure.go), the count INFO surfaces as backpressure_waits.
+// Zero on a bare Ctx with no worker. Owner goroutine only.
+func (cx *Ctx) BackpressureWaits() uint64 {
+	if cx.w == nil {
+		return 0
+	}
+	return cx.w.bpWaits
+}
+
+// BackpressureStalls is the cumulative number of parked writes this shard has
+// failed with the OOM reply after a genuine stall (backpressure.go), the count
+// INFO surfaces as backpressure_stalls. Zero on a bare Ctx with no worker. Owner
+// goroutine only.
+func (cx *Ctx) BackpressureStalls() uint64 {
+	if cx.w == nil {
+		return 0
+	}
+	return cx.w.bpStalls
+}
+
 // CurConn is the connection the running command belongs to, the completion
 // target a blocking command captures for its later CompleteBlocked. Owner
 // goroutine only, valid only during the handler call.
