@@ -1,9 +1,25 @@
 name: ci
 
+# sqlo1-only changes skip this workflow and run the fast sqlo1 one instead;
+# a PR touching both trees still runs both.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'engine/sqlo1/**'
+      - 'engine/sqlo1a/**'
+      - 'engine/sqlo1b/**'
+      - 'cmd/sqlo1srv/**'
+      - 'scripts/sqlo1-import-boundary.sh'
+      - '.github/workflows/sqlo1.yml'
   pull_request:
+    paths-ignore:
+      - 'engine/sqlo1/**'
+      - 'engine/sqlo1a/**'
+      - 'engine/sqlo1b/**'
+      - 'cmd/sqlo1srv/**'
+      - 'scripts/sqlo1-import-boundary.sh'
+      - '.github/workflows/sqlo1.yml'
 
 permissions:
   contents: read
@@ -43,8 +59,6 @@ jobs:
         run: go build ./...
       - name: f3 import boundary
         run: ./scripts/f3-import-boundary.sh
-      - name: sqlo1 import boundary
-        run: ./scripts/sqlo1-import-boundary.sh
       - name: test
         run: go test -race -count=1 -coverprofile=coverage.out ./...
       # Rerun the network-facing suites on the epoll reactor driver. AKI_NET
