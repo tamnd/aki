@@ -11,9 +11,9 @@
 set -eu
 
 mod=$(go list -m)
-bad=$(go list -deps ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv ./cmd/sqlo1crash |
+bad=$(go list -deps ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv ./cmd/sqlo1crash ./labs/sqlo1/... |
 	grep "^$mod/" |
-	grep -Ev "^$mod/(engine/sqlo1|engine/sqlo1a|engine/sqlo1b|cmd/sqlo1srv|cmd/sqlo1crash)(/|$)" || true)
+	grep -Ev "^$mod/(engine/sqlo1|engine/sqlo1a|engine/sqlo1b|cmd/sqlo1srv|cmd/sqlo1crash|labs/sqlo1)(/|$)" || true)
 
 if [ -n "$bad" ]; then
 	echo "sqlo1 packages must not import other packages in this module:"
@@ -21,7 +21,7 @@ if [ -n "$bad" ]; then
 	exit 1
 fi
 
-dirs=$(find engine/sqlo1 engine/sqlo1a engine/sqlo1b cmd/sqlo1srv cmd/sqlo1crash -type d -name internal)
+dirs=$(find engine/sqlo1 engine/sqlo1a engine/sqlo1b cmd/sqlo1srv cmd/sqlo1crash labs/sqlo1 -type d -name internal)
 if [ -n "$dirs" ]; then
 	echo "internal/ directories are not allowed in the sqlo1 trees:"
 	echo "$dirs"
