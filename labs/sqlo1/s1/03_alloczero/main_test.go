@@ -13,3 +13,14 @@ func TestWirePathZeroAlloc(t *testing.T) {
 		}
 	}
 }
+
+// TestHotTierZeroAlloc gates the header-table point ops the same way:
+// a warm table recycles header slots, arena classes, and map cells, so
+// hits, overwrites, and delete-reinsert cycles never allocate.
+func TestHotTierZeroAlloc(t *testing.T) {
+	for _, p := range hotProbes() {
+		if allocs := testing.AllocsPerRun(1000, p.f); allocs != 0 {
+			t.Errorf("%s: %.1f allocs/op, want 0", p.name, allocs)
+		}
+	}
+}

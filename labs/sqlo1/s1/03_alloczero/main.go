@@ -104,11 +104,61 @@ func wireProbes() []probe {
 	}
 }
 
+// hotProbes builds the gated hot-tier point ops: hits, in-place and
+// cross-class overwrites, and delete-reinsert cycles over a warm table,
+// where every structure (header slots, arena classes, map cells) is
+// recycled rather than reallocated.
+func hotProbes() []probe {
+	ht := sqlo1.NewHotTable(1024)
+	val16 := bytes.Repeat([]byte("v"), 16)
+	val150 := bytes.Repeat([]byte("w"), 150)
+	keys := make([][]byte, 512)
+	for i := range keys {
+		keys[i] = fmt.Appendf(nil, "hot-key-%04d", i)
+		if !ht.Put(keys[i], val16, sqlo1.TagString) {
+			panic("warm put refused")
+		}
+	}
+	grow := false
+
+	return []probe{
+		{"hot GET hit", func() {
+			v, ok := ht.Get(keys[7])
+			if !ok || len(v) != 16 {
+				panic("hot get missed")
+			}
+		}},
+		{"hot SET overwrite in place", func() {
+			if !ht.Put(keys[8], val16, sqlo1.TagString) {
+				panic("overwrite refused")
+			}
+		}},
+		{"hot SET realloc across classes", func() {
+			v := val16
+			if grow {
+				v = val150
+			}
+			grow = !grow
+			if !ht.Put(keys[9], v, sqlo1.TagString) {
+				panic("realloc put refused")
+			}
+		}},
+		{"hot DEL + reinsert", func() {
+			if !ht.Del(keys[10]) {
+				panic("del missed")
+			}
+			if !ht.Put(keys[10], val16, sqlo1.TagString) {
+				panic("reinsert refused")
+			}
+		}},
+	}
+}
+
 func main() {
 	fmt.Println("alloczero: allocs/op on the gated hot paths (the gate is 0 on every row)")
 	fmt.Println("| op | allocs/op |")
 	fmt.Println("|---|---|")
-	for _, p := range wireProbes() {
+	for _, p := range append(wireProbes(), hotProbes()...) {
 		fmt.Printf("| %s | %.0f |\n", p.name, testing.AllocsPerRun(2000, p.f))
 	}
 }
