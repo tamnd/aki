@@ -17,7 +17,7 @@ import (
 // chunked value touches one chunk, an int cell is read from its inline word.
 func (s *Store) GetBit(key []byte, bitOffset int64, now int64) int {
 	byteIdx := bitOffset >> 3
-	_, addr, _ := s.findLive(Hash(key), key, now)
+	_, addr, _ := s.findResident(Hash(key), key, now)
 	if addr == 0 || byteIdx >= int64(s.vlen(addr)) {
 		return 0
 	}
@@ -34,7 +34,7 @@ func (s *Store) GetBit(key []byte, bitOffset int64, now int64) int {
 func (s *Store) SetBit(key []byte, bitOffset int64, bit int, now int64) (int, error) {
 	byteIdx := bitOffset >> 3
 	mask := byte(1) << (7 - uint(bitOffset&7))
-	_, addr, _ := s.findLive(Hash(key), key, now)
+	_, addr, _ := s.findResident(Hash(key), key, now)
 	inRange := addr != 0 && byteIdx < int64(s.vlen(addr))
 	var cur byte
 	if inRange {
@@ -98,7 +98,7 @@ func (s *Store) byteAt(addr uint64, i int64) byte {
 // raw field bits in the low width bits; the caller applies the signed or
 // unsigned reading.
 func (s *Store) FieldGet(key []byte, off int64, width uint, now int64) uint64 {
-	_, addr, _ := s.findLive(Hash(key), key, now)
+	_, addr, _ := s.findResident(Hash(key), key, now)
 	var length int64
 	if addr != 0 {
 		length = int64(s.vlen(addr))
@@ -130,7 +130,7 @@ func (s *Store) FieldSet(key []byte, off int64, width uint, val uint64, now int6
 	b1 := (off + int64(width) - 1) >> 3
 	n := b1 - b0 + 1
 	firstBit := uint(off & 7)
-	_, addr, _ := s.findLive(Hash(key), key, now)
+	_, addr, _ := s.findResident(Hash(key), key, now)
 	var length int64
 	if addr != 0 {
 		length = int64(s.vlen(addr))

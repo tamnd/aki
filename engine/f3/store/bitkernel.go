@@ -138,7 +138,7 @@ func (s *Store) eachByteRange(addr uint64, lo, hi int64, fn func(base int64, seg
 // reads, so nothing outside the range is counted and the value is never
 // materialized whole.
 func (s *Store) BitCount(key []byte, lo, hi int64, firstMask, lastMask byte, now int64) int64 {
-	_, addr, _ := s.findLive(Hash(key), key, now)
+	_, addr, _ := s.findResident(Hash(key), key, now)
 	if addr == 0 {
 		return 0
 	}
@@ -164,7 +164,7 @@ func (s *Store) BitCount(key []byte, lo, hi int64, firstMask, lastMask byte, now
 // to the opposite value so they never match. The past-end semantics of a 0
 // search are the caller's, not the range's.
 func (s *Store) BitPos(key []byte, bit int, lo, hi int64, firstMask, lastMask byte, now int64) int64 {
-	_, addr, _ := s.findLive(Hash(key), key, now)
+	_, addr, _ := s.findResident(Hash(key), key, now)
 	if addr == 0 {
 		return -1
 	}

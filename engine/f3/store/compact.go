@@ -118,8 +118,8 @@ func (s *Store) CompactLog() error {
 func (s *Store) compactBucket(b *bucket, old, nl *vlog, buf *[]byte, moves []repoint) ([]repoint, error) {
 	for i := 0; i < slotsPerBucket; i++ {
 		w := b.slots[i]
-		if w == 0 {
-			continue
+		if w == 0 || slotCold(w) {
+			continue // empty, or a cold frame whose bytes CompactLog does not own
 		}
 		addr := w & addrMask
 		f := s.recFlags(addr)

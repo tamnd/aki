@@ -386,7 +386,7 @@ func (cs *ChunkStream) Next(dst []byte) (int, error) {
 // giant band accepts.
 func (s *Store) GetStream(key []byte, now int64, dst []byte) ([]byte, *ChunkStream, bool) {
 	h := Hash(key)
-	_, addr, _ := s.findLive(h, key, now)
+	_, addr, _ := s.findResident(h, key, now)
 	if addr == 0 {
 		return dst[:0], nil, false
 	}

@@ -46,6 +46,14 @@ type MemLedger struct {
 	// ChunkedBytes is the live chunked-band value bytes, summed over records
 	// against their value length, wherever the chunks sit (arena or log).
 	ChunkedBytes uint64
+
+	// ColdRecords is the live cold-tier record count and ColdTotalBytes the
+	// cold region's appended bytes. Like the value log the region is disk, not
+	// memory, so its bytes stay out of UsedMemory: the tier's contribution to
+	// the resident figure is the arena bytes a demotion already unlinked, which
+	// ArenaAllocBytes reflects once a boundary reclaims the drained segment.
+	ColdRecords    uint64
+	ColdTotalBytes uint64
 }
 
 // UsedMemory is the shard's allocator-held memory: index tables plus the
@@ -75,6 +83,7 @@ func (m MemLedger) UsedMemory() uint64 {
 // store read.
 func (s *Store) Mem() MemLedger {
 	lt, ld := s.LogBytes()
+	cold := s.Cold()
 	return MemLedger{
 		Keys:            uint64(s.count),
 		IndexBytes:      s.idx.bytes(),
@@ -84,6 +93,8 @@ func (s *Store) Mem() MemLedger {
 		VlogTotalBytes:  lt,
 		VlogLiveBytes:   lt - ld,
 		ChunkedBytes:    s.chunkBytes,
+		ColdRecords:     cold.Records,
+		ColdTotalBytes:  cold.RegionSize,
 	}
 }
 

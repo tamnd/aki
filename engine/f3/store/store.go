@@ -32,6 +32,17 @@ type Store struct {
 	vlog        *vlog
 	residentCap uint64
 
+	// The cold tier (doc 06 sections 2 and 7, cold.go): nil without a cold
+	// region. cold is the per-shard append log of whole-record cold frames the
+	// migrator demotes out of the arena; coldRecs is the live cold-record
+	// count, the census figure the arena band counts exclude (a demoted record
+	// leaves its resident band and joins this count). coldBuf and frameBuf are
+	// the owner-only scratch the cold read, compare, and frame paths reuse.
+	cold     *vlog
+	coldRecs uint64
+	coldBuf  []byte
+	frameBuf []byte
+
 	// The residency machinery (resid.go). ltmOn folds the whole
 	// configuration check into one load for the read path; residMode is the
 	// promotion policy (labs override it); markAlways is lab 15's
@@ -107,6 +118,11 @@ type Options struct {
 	// ResidentCapBytes is the resident byte budget; 0 means uncapped. Only
 	// meaningful with a value log.
 	ResidentCapBytes uint64
+
+	// ColdPath enables the per-shard cold region at this path (created,
+	// truncating any prior file). Without it the migrator has nowhere to
+	// demote and DemoteCold is a no-op.
+	ColdPath string
 }
 
 // New builds a store whose arena holds arenaBytes, tiled into segments of
@@ -146,16 +162,38 @@ func Open(o Options) (*Store, error) {
 		s.dkDen = residDoorkeeperDen
 		s.dkRng = 0x9e3779b97f4a7c15
 	}
+	if o.ColdPath != "" {
+		// The cold region is an append log identical in mechanism to the value
+		// log (append, pread, random-advise); its framing and liveness are the
+		// migrator's, defined in cold.go, not CompactLog's. A separate instance
+		// so a value-log rewrite never touches a cold frame.
+		c, err := openVlog(o.ColdPath)
+		if err != nil {
+			if s.vlog != nil {
+				_ = s.vlog.close()
+			}
+			return nil, err
+		}
+		s.cold = c
+		s.reserveColdNull()
+	}
 	return s, nil
 }
 
-// Close releases the value log, if any. The arena is plain memory.
+// Close releases the value log and the cold region, if any. The arena is plain
+// memory.
 func (s *Store) Close() error {
-	if s.vlog == nil {
-		return nil
+	var err error
+	if s.vlog != nil {
+		err = s.vlog.close()
+		s.vlog = nil
 	}
-	err := s.vlog.close()
-	s.vlog = nil
+	if s.cold != nil {
+		if cerr := s.cold.close(); err == nil {
+			err = cerr
+		}
+		s.cold = nil
+	}
 	return err
 }
 
@@ -208,9 +246,12 @@ func (s *Store) Reset() {
 	s.bands = [4]uint64{}
 	s.logRuns = 0
 	s.chunkBytes = 0
+	s.coldRecs = 0
 	s.vbuf = nil
 	s.cbuf = nil
 	s.zbuf = nil
+	s.coldBuf = nil
+	s.frameBuf = nil
 	s.demoteHand = 0
 	s.promotes = 0
 	s.demotes = 0
@@ -222,5 +263,14 @@ func (s *Store) Reset() {
 		s.vlog.pending = nil
 		s.vlog.werr = nil
 		s.vlog.dead = 0
+	}
+	if s.cold != nil {
+		_ = s.cold.f.Truncate(0)
+		s.cold.tail = 0
+		s.cold.wtail = 0
+		s.cold.pending = nil
+		s.cold.werr = nil
+		s.cold.dead = 0
+		s.reserveColdNull()
 	}
 }

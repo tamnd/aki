@@ -138,7 +138,7 @@ func (s *Store) findEntry(h uint64, key []byte) (slot *uint64, addr uint64, inOv
 	for {
 		for i := 0; i < slotsPerBucket; i++ {
 			w := b.slots[i]
-			if w != 0 && w>>tagShift == tag && s.recordMatches(w&addrMask, key) {
+			if w != 0 && w>>tagShift == tag && s.entryMatches(w, key) {
 				return &b.slots[i], w & addrMask, overflow
 			}
 		}
@@ -148,6 +148,38 @@ func (s *Store) findEntry(h uint64, key []byte) (slot *uint64, addr uint64, inOv
 		b = &seg.overflow[b.link-1]
 		overflow = true
 	}
+}
+
+// entryMatches reports whether the entry word w carries this key, resolving by
+// tier: a resident entry compares the arena record (the hot path, no pread), a
+// cold entry compares the frame key with one pooled pread. It runs only after a
+// tag hit, so the pread is off the common probe.
+func (s *Store) entryMatches(w uint64, key []byte) bool {
+	if slotCold(w) {
+		return s.coldKeyMatches(w&addrMask, key)
+	}
+	return s.recordMatches(w&addrMask, key)
+}
+
+// entryKeyHash returns the hash of the key the entry word w names, resolving by
+// tier: a resident entry hashes the arena key, a cold entry hashes the frame
+// key read with one pooled pread. splitSegment uses it so a cold entry
+// redistributes to the right child without touching the arena.
+func (s *Store) entryKeyHash(w uint64) uint64 {
+	if slotCold(w) {
+		off := w & addrMask
+		_, klen, _, _, err := s.coldHeader(off)
+		if err != nil {
+			return 0
+		}
+		buf, err := s.cold.readInto(off+coldHdr, klen, s.coldBuf)
+		s.coldBuf = buf[:cap(buf)][:0]
+		if err != nil {
+			return 0
+		}
+		return Hash(buf)
+	}
+	return Hash(s.keyAt(w & addrMask))
 }
 
 // insertEntry places a new entry word, splitting the target segment as many
@@ -306,7 +338,7 @@ func (s *Store) splitSegment(ord uint32) {
 			if w == 0 {
 				continue
 			}
-			h := Hash(s.keyAt(w & addrMask))
+			h := s.entryKeyHash(w)
 			s.insertEntry(h, w)
 		}
 	}

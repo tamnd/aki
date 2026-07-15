@@ -44,7 +44,7 @@ func (s *Store) BitOp(op int, dest []byte, srcs [][]byte, now int64) (int64, err
 	var maxlen int64
 	minlen := int64(-1)
 	for i, k := range srcs {
-		_, addr, _ := s.findLive(Hash(k), k, now)
+		_, addr, _ := s.findResident(Hash(k), k, now)
 		addrs[i] = addr
 		if addr != 0 {
 			lens[i] = int64(s.vlen(addr))
@@ -148,7 +148,7 @@ func (s *Store) BitOp(op int, dest []byte, srcs [][]byte, now int64) (int64, err
 // address a co-located call already has. Any band is handled; a non-string key
 // reads as absent, the same no-foreign-guard rule the co-located path takes.
 func (s *Store) ReadInto(key []byte, off int64, dst []byte, now int64) {
-	_, addr, _ := s.findLive(Hash(key), key, now)
+	_, addr, _ := s.findResident(Hash(key), key, now)
 	var length int64
 	if addr != 0 {
 		length = int64(s.vlen(addr))
