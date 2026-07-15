@@ -105,15 +105,22 @@ func (w *worker) retryFull() {
 }
 
 // stallCheck advances the coarse stall bound after a retry pass left writes
-// parked. A cold-cursor advance since the last pass, or a drain in flight or
-// pending, is progress: it resets the counter, because the drain that will free
-// the arena is alive. Otherwise the counter climbs, and crossing the window means
-// the cold tail cannot move (disk full, an I/O error, no migratable residue, or a
-// leaked epoch, the section 8.3 taxonomy slice 5b names), so every remaining
-// waiter takes the OOM reply. Owner goroutine only.
+// parked. Any of three signals is progress and resets the counter: the cold
+// cursor advanced since the last pass, a drain is in flight or pending
+// (ColdDraining), or the migrator has cold space queued to return to the arena
+// (ReclaimPending, segments a flip emptied but the epoch has not freed yet). The
+// last one closes the window slice 5a's cold-cursor-only check left open: after a
+// drain moves records cold and stops, the arena still needs a few boundaries to
+// hand the emptied segments back through the epoch, and during those the cold tail
+// is static and no drain is in flight, so a retry loop would wrongly count them as
+// stalls and OOM a write whose room was one reclaim pass away. Only when none of
+// the three holds does the counter climb, and crossing the window means the arena
+// truly cannot free room (disk full, an I/O error, no migratable residue, or a
+// leaked epoch that never releases a retired segment, the section 8.3 taxonomy
+// names), so every remaining waiter takes the OOM reply. Owner goroutine only.
 func (w *worker) stallCheck() {
 	prog := w.st.ColdProgress()
-	if prog != w.bpProg || w.st.ColdDraining() {
+	if prog != w.bpProg || w.st.ColdDraining() || w.st.ReclaimPending() {
 		w.bpProg = prog
 		w.bpStall = 0
 		return

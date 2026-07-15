@@ -127,6 +127,17 @@ func (s *Store) RetiredSegs() int { return len(s.arena.retired) }
 // but the worker has not yet retired, introspection for the same tests. Owner-only.
 func (s *Store) PendingDrained() int { return len(s.drained) }
 
+// ReclaimPending reports whether the async migrator has cold space queued to
+// return to the arena: segments a phase-2 flip emptied but the worker has not
+// retired yet, or segments retired and waiting on the epoch to clear their last
+// bracket. It is the block-not-drop progress signal for the window after the
+// cold cursor stops moving but before the freed segments reach the free list
+// (backpressure.go stallCheck): while it holds, a parked write's room is on the
+// way, so the stall bound must not advance. Owner-only.
+func (s *Store) ReclaimPending() bool {
+	return len(s.drained) > 0 || len(s.arena.retired) > 0
+}
+
 // ReclaimSafe hands every epoch-retired segment the safe epoch has cleared
 // back to the free list and reports how many. The worker calls it at the batch
 // boundary with epoch.safe() (engine/f3/shard), after it has exited the batch's
