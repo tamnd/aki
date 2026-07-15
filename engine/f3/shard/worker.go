@@ -224,13 +224,20 @@ func (w *worker) run() {
 			w.runMaintainer()
 			if len(w.fullWaiters) > 0 && !w.st.ColdDraining() {
 				// Writes are parked but no drain is in flight or pending, so no
-				// completion will wake the worker to retry them: spin the boundary
-				// toward the stall window instead of parking (maybeCompact above
-				// advanced the stall counter, and it fires the OOM reply once the
-				// window is crossed). A drain in flight (ColdDraining) posts a
-				// completion that wakes a parked worker, so that case parks below.
-				runtime.Gosched()
-				continue
+				// completion would wake the worker to retry them. Try a backpressure
+				// drain first: while a write is parked drainCold takes the deeper
+				// trigger and stages past the low-water toward a freed segment (the
+				// F9 rail, backpressure.go). If it stages one, ColdDraining turns
+				// true and its completion will wake the worker to retry, so fall
+				// through to idle() and wait. Only when no migratable residue remains
+				// does the boundary spin toward the stall window instead of parking
+				// (maybeCompact above advanced the stall counter, and it fires the
+				// OOM reply once the window is crossed).
+				w.drainCold()
+				if !w.st.ColdDraining() {
+					runtime.Gosched()
+					continue
+				}
 			}
 			w.idle()
 		}
@@ -282,7 +289,17 @@ func (w *worker) maybeCompact() {
 // its in-flight bound the drain defers to a later boundary, the admission control
 // on per-shard cold I/O concurrency.
 func (w *worker) drainCold() {
-	if !w.st.NeedsColdDrain() {
+	// A write parked on a full arena needs a whole segment freed, and migration
+	// stops at the low-water NeedsColdDrain gates on, which can sit above the
+	// point where the last live records vacate a segment. While a write is parked
+	// the drain follows the deeper backpressure trigger (NeedsColdDrainDeep, which
+	// drains past the low-water toward an empty resident set) so a servable write
+	// is always served rather than stalled out (backpressure.go, the F9 rail).
+	// The moment the retry allocates, fullWaiters empties and the path drops back
+	// to the low-water trigger, so the deep drain evicts only what the parked
+	// write needs. With no write parked this is one NeedsColdDrain load (L9).
+	parked := len(w.fullWaiters) > 0
+	if !parked && !w.st.NeedsColdDrain() {
 		return
 	}
 	// Wire the pwrite seam to the store's cold region on first use only. The
@@ -297,7 +314,11 @@ func (w *worker) drainCold() {
 	if buf == nil {
 		return
 	}
-	d := w.st.StageColdDrain(buf)
+	stage := w.st.StageColdDrain
+	if parked {
+		stage = w.st.StageColdDrainDeep
+	}
+	d := stage(buf)
 	if d == nil || len(d.Buf()) == 0 {
 		w.io.pool.put(buf)
 		return

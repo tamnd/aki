@@ -109,17 +109,40 @@ func (s *Store) cancelMigrate(addr uint64) {
 	s.bumpVer(addr)
 }
 
+// coldDrainReachable reports whether a cold drain can run at all: a reachable
+// cold region, LTM engaged, no open stream pinning migration, and no prior write
+// error. It is the guard both drain triggers share; NeedsColdDrain adds the
+// low-water compare on top of it, and the backpressure path (NeedsColdDrainDeep)
+// pairs it with a live-charge check instead.
+func (s *Store) coldDrainReachable() bool {
+	return s.cold != nil && s.ltmOn && s.openStreams == 0 && s.cold.werr == nil
+}
+
 // NeedsColdDrain reports whether the resident live charge sits past the migrator's
 // low-water mark with a reachable cold region, the cheap gate the shard worker
 // checks before it draws a staging buffer. It shares the synchronous migrator's
 // trigger exactly: a store under its cap answers false on one relaxed live-charge
 // read and a compare, so the L9 no-pressure boundary pays that and no pool churn.
 func (s *Store) NeedsColdDrain() bool {
-	if s.cold == nil || !s.ltmOn || s.openStreams > 0 || s.cold.werr != nil {
+	if !s.coldDrainReachable() {
 		return false
 	}
 	low := s.residentCap - s.residentCap/residSlackDen
 	return s.arena.live() > low
+}
+
+// NeedsColdDrainDeep reports whether a backpressure drain can make progress: a
+// reachable cold region and any migratable resident charge at all, ignoring the
+// low-water mark. It is the gate the worker checks while a write is parked
+// (backpressure.go). Once migration has drawn the resident set below the
+// low-water NeedsColdDrain goes quiet, but a write parked on a full arena still
+// needs a whole segment freed to allocate, and the low-water floor can sit above
+// the point where the last live records vacate a segment. This keeps the drain
+// engaged past that floor so a servable write is always served rather than
+// stalled out (spec 2064/f3/06 section 8, the F9 block-not-drop rail). It only
+// ever fires with a write parked, so the L9 no-pressure path never reaches it.
+func (s *Store) NeedsColdDrainDeep() bool {
+	return s.coldDrainReachable() && s.arena.live() > 0
 }
 
 // StageColdDrain is phase 1: it frames a run of cold-bound records into buf,
@@ -136,8 +159,33 @@ func (s *Store) StageColdDrain(buf []byte) *coldDrain {
 		return nil
 	}
 	low := s.residentCap - s.residentCap/residSlackDen
+	return s.stageDrain(buf, s.arena.live()-low)
+}
+
+// StageColdDrainDeep is phase 1 on the backpressure path: it stages toward an
+// empty resident set (want is the whole live charge) so the drain keeps freeing
+// segments past the low-water while a write is parked, until a segment vacates
+// and the parked write allocates or no migratable record remains and the write
+// takes the honest OOM. It self-limits: the caller only draws it while a write is
+// parked, and the moment the retry allocates it stops, so it evicts only as much
+// resident charge as the parked write needs, one pass budget at a time. It shares
+// StageColdDrain's framing and reservation, differing only in the want target.
+func (s *Store) StageColdDrainDeep(buf []byte) *coldDrain {
+	if !s.NeedsColdDrainDeep() {
+		return nil
+	}
+	return s.stageDrain(buf, s.arena.live())
+}
+
+// stageDrain frames a run of cold-bound records into buf toward want arena bytes,
+// reserves the cold-region span they will occupy, and returns the drain for the
+// I/O worker to pwrite. It returns a drain with an empty flip list when the pass
+// framed nothing (the caller returns the buffer to the pool) and nil when the
+// cold region refuses the reservation. The staged records stay resident until
+// phase 2; buf is the caller's pool buffer and may be returned grown.
+func (s *Store) stageDrain(buf []byte, want uint64) *coldDrain {
 	d := &coldDrain{buf: buf[:0], soft: cap(buf) * stageFillNum / stageFillDen}
-	s.stagePass(d, s.arena.live()-low)
+	s.stagePass(d, want)
 	if len(d.flips) == 0 {
 		return d
 	}
