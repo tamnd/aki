@@ -62,3 +62,12 @@ jobs:
         run: go test -race -count=1 ./engine/sqlo1/... ./engine/sqlo1a/... ./engine/sqlo1b/... ./cmd/sqlo1srv/... ./cmd/sqlo1crash/... ./labs/sqlo1/...
       - name: fuzz burn
         run: go test -run='^$' -fuzz=FuzzParseCommand -fuzztime=20s ./engine/sqlo1
+      - name: drivershoot lab (nested module, one binary per driver tag)
+        working-directory: labs/sqlo1/a1/01_drivershoot
+        run: |
+          go vet .
+          go test -count=1 .
+          for tag in drv_modernc drv_zombiezen drv_ncruces; do
+            go vet -tags "$tag" .
+            go test -race -tags "$tag" -count=1 .
+          done
