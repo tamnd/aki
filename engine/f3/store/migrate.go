@@ -19,13 +19,14 @@ package store
 // real resident-footprint bound across every value band, which is the memory
 // bar the milestone is measured on.
 //
-// This slice runs the migration synchronously on the owner: demoteAt frames the
+// This form runs the migration synchronously on the owner: demoteAt frames the
 // record and appends it to the cold region in the owner's buffer, then flips the
-// slot in place. The two-phase off-owner variant (stage in phase 1, pwrite on
-// the I/O worker, flip on completion) is the next PR; it removes the cold write
-// from the owner's critical path and is the first epoch consumer. The read-back
-// path and the write bring-up are already in place from the cold data plane, so
-// engaging the migrator changes only where records live, never how they answer.
+// slot in place. Its two-phase off-owner sibling (coldstage.go: stage in phase 1,
+// pwrite on the I/O worker, flip on completion) is what the shard worker engages
+// now, so it keeps the cold write off the critical path; MigrateCold stays as the
+// synchronous store-level driver the migrator tests drive. Both share this hand
+// and this trigger and differ only in when the write and the flip happen, so
+// either changes only where records live, never how they answer.
 const (
 	// migratePassBudget caps the arena bytes one migration pass frees, so the
 	// pause it adds to a boundary stays bounded like a demotion or compaction
