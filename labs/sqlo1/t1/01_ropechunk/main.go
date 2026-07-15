@@ -20,6 +20,15 @@
 // timed per class, so each CSV row is an intrinsic cost (write ops in
 // RAM, read ops through overlay then SQL, flushes carrying the IO bill)
 // and write amplification is flushed bytes over logical bytes written.
+//
+// B3 re-points the suite at Track B: the same rope drives either arm
+// through a narrow store surface, selected by -store. The A arm is the
+// SQLite schema above; the B arm (store_b.go) maps chunks to segment
+// subkey records under a minted rooth, keeps the popcount in the doc
+// 05 kind 2 cache segments drained alongside the chunks, turns a flush
+// into one DrainBatch, and points the checkpoint cadence at the
+// store's own checkpoint, so one sweep prices the chunk size on the
+// backend that will actually carry it.
 package main
 
 import (
@@ -56,14 +65,16 @@ CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY CHECK (id = 0),
   hw INTEGER) WITHOUT ROWID;
 INSERT OR IGNORE INTO meta (id, hw) VALUES (0, 0);`
 
-	chunkGetSQL = `SELECT v FROM chunk WHERE k = ?1 AND cid = ?2`
-	chunkPutSQL = `INSERT INTO chunk (k, cid, v, pc) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (k, cid) DO UPDATE SET v = excluded.v, pc = excluded.pc`
-	rootPutSQL  = `INSERT INTO kv (k, t, exp, gen, v, crc) VALUES (?1, 0, 0, 0, ?2, 0) ON CONFLICT (k) DO UPDATE SET v = excluded.v`
-	setHWSQL    = `UPDATE meta SET hw = ?1 WHERE id = 0`
+	chunkGetSQL   = `SELECT v FROM chunk WHERE k = ?1 AND cid = ?2`
+	chunkProbeSQL = `SELECT v, pc FROM chunk WHERE k = ?1 AND cid = ?2`
+	chunkPutSQL   = `INSERT INTO chunk (k, cid, v, pc) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (k, cid) DO UPDATE SET v = excluded.v, pc = excluded.pc`
+	rootPutSQL    = `INSERT INTO kv (k, t, exp, gen, v, crc) VALUES (?1, 0, 0, 0, ?2, 0) ON CONFLICT (k) DO UPDATE SET v = excluded.v`
+	setHWSQL      = `UPDATE meta SET hw = ?1 WHERE id = 0`
 )
 
 type config struct {
 	dir       string
+	store     string
 	chunk     int
 	mix       string
 	dist      string
@@ -76,17 +87,66 @@ type config struct {
 	ckpt      int
 }
 
+// store is the backend arm under the rope: Track A rows or Track B
+// records, one narrow surface so the shared model above prices both.
+// chunkGet feeds the hot read path, chunkProbe is the oracle test's
+// stored-row readback (row bytes plus the pc the arm keeps), flush
+// lands one drain-shaped write set, and checkpoint is whatever the
+// arm's WAL trim verb is.
+type store interface {
+	chunkGet(ki int, cid int64) ([]byte, error)
+	chunkProbe(ki int, cid int64) (row []byte, pc int64, err error)
+	flush(fs *flushSet) error
+	checkpoint() error
+	dataMB() float64
+	walMB() float64
+	close() error
+}
+
+// flushSet is one drain cycle as the model hands it down: trimmed
+// chunk rows with their pc, dirty root lengths, and the high-water
+// sequence that must land atomically with them.
+type flushSet struct {
+	seq    int64
+	chunks []chunkRow
+	roots  []rootRow
+}
+
+type chunkRow struct {
+	ki  int
+	cid int64
+	row []byte
+	pc  int64
+}
+
+type rootRow struct {
+	ki  int
+	len int64
+}
+
+func openStore(cfg config, path string, keys [][]byte) (store, error) {
+	switch cfg.store {
+	case "a":
+		return openA(path, keys)
+	case "b":
+		return openB(path, keys, cfg.mix == "setbit")
+	}
+	return nil, fmt.Errorf("unknown store arm %q", cfg.store)
+}
+
 type db struct {
 	conn  *sqlite3.Conn
 	path  string
+	keys  [][]byte
 	cget  *sqlite3.Stmt
+	pget  *sqlite3.Stmt
 	cput  *sqlite3.Stmt
 	rput  *sqlite3.Stmt
 	hw1   *sqlite3.Stmt
 	stmts []*sqlite3.Stmt
 }
 
-func openDB(path string) (*db, error) {
+func openA(path string, keys [][]byte) (*db, error) {
 	conn, err := sqlite3.Open(path)
 	if err != nil {
 		return nil, err
@@ -112,12 +172,13 @@ func openDB(path string) (*db, error) {
 		conn.Close()
 		return nil, err
 	}
-	d := &db{conn: conn, path: path}
+	d := &db{conn: conn, path: path, keys: keys}
 	for _, s := range []struct {
 		dst **sqlite3.Stmt
 		sql string
 	}{
 		{&d.cget, chunkGetSQL},
+		{&d.pget, chunkProbeSQL},
 		{&d.cput, chunkPutSQL},
 		{&d.rput, rootPutSQL},
 		{&d.hw1, setHWSQL},
@@ -151,8 +212,8 @@ func stepReset(s *sqlite3.Stmt) (found bool, err error) {
 
 // chunkGet returns the stored chunk row or nil for a lazy gap. The copy
 // is deliberate: the blob column's bytes die at Reset.
-func (d *db) chunkGet(key []byte, cid int64) ([]byte, error) {
-	if err := d.cget.BindBlob(1, key); err != nil {
+func (d *db) chunkGet(ki int, cid int64) ([]byte, error) {
+	if err := d.cget.BindBlob(1, d.keys[ki]); err != nil {
 		return nil, err
 	}
 	if err := d.cget.BindInt64(2, cid); err != nil {
@@ -169,13 +230,89 @@ func (d *db) chunkGet(key []byte, cid int64) ([]byte, error) {
 	return v, err
 }
 
+// chunkProbe reads the stored row and its pc column for the oracle
+// readback; a missing row comes back nil with pc zero.
+func (d *db) chunkProbe(ki int, cid int64) ([]byte, int64, error) {
+	if err := d.pget.BindBlob(1, d.keys[ki]); err != nil {
+		return nil, 0, err
+	}
+	if err := d.pget.BindInt64(2, cid); err != nil {
+		return nil, 0, err
+	}
+	var v []byte
+	var pc int64
+	if d.pget.Step() {
+		v = slices.Clone(d.pget.ColumnBlob(0, nil))
+		pc = d.pget.ColumnInt64(1)
+	}
+	err := d.pget.Err()
+	if rerr := d.pget.Reset(); err == nil {
+		err = rerr
+	}
+	return v, pc, err
+}
+
+// flush is one drain-shaped transaction: dirty chunk rows, dirty
+// roots, and the high-water row, committed together.
+func (d *db) flush(fs *flushSet) error {
+	txn, err := d.conn.BeginImmediate()
+	if err != nil {
+		return err
+	}
+	fail := func(err error) error { txn.Rollback(); return err }
+	for _, c := range fs.chunks {
+		if err := d.cput.BindBlob(1, d.keys[c.ki]); err != nil {
+			return fail(err)
+		}
+		if err := d.cput.BindInt64(2, c.cid); err != nil {
+			return fail(err)
+		}
+		if err := d.cput.BindBlob(3, c.row); err != nil {
+			return fail(err)
+		}
+		if err := d.cput.BindInt64(4, c.pc); err != nil {
+			return fail(err)
+		}
+		if _, err := stepReset(d.cput); err != nil {
+			return fail(err)
+		}
+	}
+	var rootBuf [8]byte
+	for _, rt := range fs.roots {
+		binary.LittleEndian.PutUint64(rootBuf[:], uint64(rt.len))
+		if err := d.rput.BindBlob(1, d.keys[rt.ki]); err != nil {
+			return fail(err)
+		}
+		if err := d.rput.BindBlob(2, rootBuf[:]); err != nil {
+			return fail(err)
+		}
+		if _, err := stepReset(d.rput); err != nil {
+			return fail(err)
+		}
+	}
+	if err := d.hw1.BindInt64(1, fs.seq); err != nil {
+		return fail(err)
+	}
+	if _, err := stepReset(d.hw1); err != nil {
+		return fail(err)
+	}
+	return txn.Commit()
+}
+
+func (d *db) checkpoint() error {
+	return d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+}
+
+func (d *db) dataMB() float64 { return fileMB(d.path) }
+func (d *db) walMB() float64  { return fileMB(d.path + "-wal") }
+
 // rope is the doc 05 rope model over the store: fixed-size chunks
 // addressed by arithmetic, a coalescing dirty overlay standing in for
 // the hot tier, and drain-shaped flush transactions. Overlay images are
 // always full chunk size; totalLen decides how much of the last one is
 // real, and the flush trims the last row to the logical length.
 type rope struct {
-	d        *db
+	st       store
 	cfg      config
 	keys     [][]byte
 	totalLen []int64
@@ -193,9 +330,9 @@ type rope struct {
 	countPC  bool
 }
 
-func newRope(d *db, cfg config, keys [][]byte) *rope {
+func newRope(st store, cfg config, keys [][]byte) *rope {
 	return &rope{
-		d: d, cfg: cfg, keys: keys,
+		st: st, cfg: cfg, keys: keys,
 		totalLen:  make([]int64, len(keys)),
 		overlay:   map[uint64][]byte{},
 		rootDirty: map[int]bool{},
@@ -215,7 +352,7 @@ func (r *rope) writable(ki int, cid int64) ([]byte, error) {
 		return img, nil
 	}
 	img := make([]byte, r.cfg.chunk)
-	row, err := r.d.chunkGet(r.keys[ki], cid)
+	row, err := r.st.chunkGet(ki, cid)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +367,7 @@ func (r *rope) readChunk(ki int, cid int64) ([]byte, error) {
 	if img, ok := r.overlay[okey(ki, cid)]; ok {
 		return img, nil
 	}
-	return r.d.chunkGet(r.keys[ki], cid)
+	return r.st.chunkGet(ki, cid)
 }
 
 func (r *rope) setRange(ki int, off int64, data []byte) error {
@@ -317,7 +454,7 @@ func (r *rope) getBit(ki int, bitOff int64) (bool, error) {
 	return img[lo]&(1<<(7-bitOff&7)) != 0, nil
 }
 
-// flush drains every dirty chunk and root in one transaction, the last
+// flush drains every dirty chunk and root in one write set, the last
 // chunk trimmed to the logical length, pc recomputed for the bitmap mix,
 // and the high-water mark moved with the batch. The overlay empties
 // afterward, so the next rewrite pulls its base from the store again,
@@ -327,11 +464,7 @@ func (r *rope) flush() error {
 		return nil
 	}
 	t0 := time.Now()
-	txn, err := r.d.conn.BeginImmediate()
-	if err != nil {
-		return err
-	}
-	fail := func(err error) error { txn.Rollback(); return err }
+	fs := flushSet{seq: r.seq + 1}
 	for k, img := range r.overlay {
 		ki, cid := int(k>>32), int64(k&0xffffffff)
 		rowLen := min(int64(r.cfg.chunk), r.totalLen[ki]-cid*int64(r.cfg.chunk))
@@ -343,55 +476,25 @@ func (r *rope) flush() error {
 		if r.countPC {
 			pc = int64(popcount(row))
 		}
-		if err := r.d.cput.BindBlob(1, r.keys[ki]); err != nil {
-			return fail(err)
-		}
-		if err := r.d.cput.BindInt64(2, cid); err != nil {
-			return fail(err)
-		}
-		if err := r.d.cput.BindBlob(3, row); err != nil {
-			return fail(err)
-		}
-		if err := r.d.cput.BindInt64(4, pc); err != nil {
-			return fail(err)
-		}
-		if _, err := stepReset(r.d.cput); err != nil {
-			return fail(err)
-		}
+		fs.chunks = append(fs.chunks, chunkRow{ki: ki, cid: cid, row: row, pc: pc})
 		r.flushed += rowLen
 	}
-	var rootBuf [8]byte
 	for ki := range r.rootDirty {
-		binary.LittleEndian.PutUint64(rootBuf[:], uint64(r.totalLen[ki]))
-		if err := r.d.rput.BindBlob(1, r.keys[ki]); err != nil {
-			return fail(err)
-		}
-		if err := r.d.rput.BindBlob(2, rootBuf[:]); err != nil {
-			return fail(err)
-		}
-		if _, err := stepReset(r.d.rput); err != nil {
-			return fail(err)
-		}
+		fs.roots = append(fs.roots, rootRow{ki: ki, len: r.totalLen[ki]})
 		r.flushed += 8 + int64(len(r.keys[ki]))
 	}
-	r.seq++
-	if err := r.d.hw1.BindInt64(1, r.seq); err != nil {
-		return fail(err)
-	}
-	if _, err := stepReset(r.d.hw1); err != nil {
-		return fail(err)
-	}
-	if err := txn.Commit(); err != nil {
+	if err := r.st.flush(&fs); err != nil {
 		return err
 	}
+	r.seq++
 	clear(r.overlay)
 	clear(r.rootDirty)
 	r.dirtyBytes = 0
-	if wm := fileMB(r.d.path + "-wal"); wm > r.walMaxMB {
+	if wm := r.st.walMB(); wm > r.walMaxMB {
 		r.walMaxMB = wm
 	}
 	if r.flushes++; r.flushes%r.cfg.ckpt == 0 {
-		if err := r.d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		if err := r.st.checkpoint(); err != nil {
 			return err
 		}
 	}
@@ -417,6 +520,7 @@ func main() {
 	var cfg config
 	quick := flag.Bool("quick", false, "shrink counts for smoke runs")
 	flag.StringVar(&cfg.dir, "dir", "", "working directory (default: a temp dir)")
+	flag.StringVar(&cfg.store, "store", "a", "backend arm: a (SQLite rows) or b (Track B records)")
 	chunkKiB := flag.Int("chunk", 32, "rope chunk size in KiB (power of two)")
 	flag.StringVar(&cfg.mix, "mix", "setrange", "operator mix: setrange, append, setbit, getrange")
 	flag.StringVar(&cfg.dist, "dist", "uniform", "offset distribution: uniform or zipf over chunks")
@@ -463,22 +567,21 @@ func runAll(cfg config, out io.Writer) error {
 		defer os.RemoveAll(dir)
 		cfg.dir = dir
 	}
-	path := filepath.Join(cfg.dir, fmt.Sprintf("ropechunk-c%d-%s.db", cfg.chunk, cfg.mix))
-	os.Remove(path)
-	os.Remove(path + "-wal")
-	os.Remove(path + "-shm")
-
-	d, err := openDB(path)
-	if err != nil {
-		return err
+	path := filepath.Join(cfg.dir, fmt.Sprintf("ropechunk-%s-c%d-%s.db", cfg.store, cfg.chunk, cfg.mix))
+	for _, p := range []string{path, path + "-wal", path + "-shm", path + ".aki-wal"} {
+		os.Remove(p)
 	}
-	defer d.close()
 
 	keys := make([][]byte, cfg.keys)
 	for i := range keys {
 		keys[i] = fmt.Appendf(nil, "r:%04d", i)
 	}
-	r := newRope(d, cfg, keys)
+	st, err := openStore(cfg, path, keys)
+	if err != nil {
+		return err
+	}
+	defer st.close()
+	r := newRope(st, cfg, keys)
 
 	// Preload: full values for the in-place mixes, one chunk per key for
 	// the append mix so the growth path is what gets measured.
@@ -507,11 +610,11 @@ func runAll(cfg config, out io.Writer) error {
 	if err := r.flush(); err != nil {
 		return err
 	}
-	if err := d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+	if err := st.checkpoint(); err != nil {
 		return err
 	}
 	emit(cfg, out, row{workload: "load", ops: cfg.keys, dur: time.Since(start),
-		fileMB: fileMB(path)})
+		fileMB: st.dataMB()})
 	r.logical, r.flushed, r.flushDur, r.walMaxMB = 0, 0, nil, 0
 
 	// The measured mix: 90% the heavy op, 10% the light one, per-op cost
@@ -581,7 +684,7 @@ func runAll(cfg config, out io.Writer) error {
 		}
 	}
 	emit(cfg, out, row{workload: "flush", ops: len(r.flushDur), dur: fTotal,
-		maxLat: fWorst, fileMB: fileMB(path), walMB: r.walMaxMB, vmhwmMB: vmhwmMB()})
+		maxLat: fWorst, fileMB: st.dataMB(), walMB: r.walMaxMB, vmhwmMB: vmhwmMB()})
 	return nil
 }
 
@@ -648,8 +751,8 @@ func vmhwmMB() float64 {
 func emit(cfg config, out io.Writer, r row) {
 	nsPerOp := float64(r.dur.Nanoseconds()) / float64(max(r.ops, 1))
 	opsPerS := float64(r.ops) / max(r.dur.Seconds(), 1e-9)
-	fmt.Fprintf(out, "%d,%s,%s,%d,%d,%s,%d,%.0f,%.0f,%d,%d,%d,%.1f,%.1f,%.1f,%.1f\n",
-		cfg.chunk>>10, cfg.mix, cfg.dist, cfg.keys, cfg.valMB,
+	fmt.Fprintf(out, "%s,%d,%s,%s,%d,%d,%s,%d,%.0f,%.0f,%d,%d,%d,%.1f,%.1f,%.1f,%.1f\n",
+		cfg.store, cfg.chunk>>10, cfg.mix, cfg.dist, cfg.keys, cfg.valMB,
 		r.workload, r.ops, nsPerOp, opsPerS,
 		r.p50.Nanoseconds(), r.p99.Nanoseconds(), r.maxLat.Nanoseconds(),
 		r.wa, r.fileMB, r.walMB, r.vmhwmMB)
