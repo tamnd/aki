@@ -43,6 +43,8 @@ jobs:
         run: go build ./...
       - name: f3 import boundary
         run: ./scripts/f3-import-boundary.sh
+      - name: sqlo1 import boundary
+        run: ./scripts/sqlo1-import-boundary.sh
       - name: test
         run: go test -race -count=1 -coverprofile=coverage.out ./...
       # Rerun the network-facing suites on the epoll reactor driver. AKI_NET
