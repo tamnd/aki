@@ -13,15 +13,20 @@ import "unsafe"
 // on it, and the paths that need it away from a live lookup (eviction
 // dropping the index entry, ghost-ring insert) still hold the key bytes
 // in the arena and can rehash. Dropping it lands the struct at exactly
-// 48 with four spare bytes for a future field; doc 04 is amended
-// accordingly.
+// 48 with spare bytes for future fields (the queued flag below took the
+// first); doc 04 is amended accordingly.
 type hdr struct {
-	vptr      uint64 // disk position when clean; 0 when dirty-only
-	keyRef    uint32 // key arena ref
-	valRef    uint32 // value arena ref
-	klen      uint16
-	state     uint8
-	typeTag   uint8
+	vptr    uint64 // disk position when clean; 0 when dirty-only
+	keyRef  uint32 // key arena ref
+	valRef  uint32 // value arena ref
+	klen    uint16
+	state   uint8
+	typeTag uint8
+	// queued means the write-behind queue holds an entry for this slot,
+	// which is what keeps the queue duplicate-free under re-dirtying
+	// (the coalescing rule: five writes between drains, one queue entry).
+	// It took one of the header's spare bytes.
+	queued    uint8
 	lastRead  uint32 // coarse ticks, 1s resolution
 	lastWrite uint32
 	prevRead  uint32 // WATT-lite second timestamp

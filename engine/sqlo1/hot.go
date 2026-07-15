@@ -36,6 +36,17 @@ type HotTable struct {
 	// second; live counts keys visible to reads, so tombstones are out.
 	tick uint32
 	live int
+	// The write-behind queue: slot indices in first-dirtied order, a
+	// ring preallocated to capacity. The header's queued flag keeps
+	// entries unique, so re-dirtying a dirty key never re-enqueues it
+	// (that is the coalescing rule made structural) and the ring only
+	// grows if transitions happen outside the drain scheduler (tests).
+	// dirtyBytes tracks key plus value bytes across all dirty slots,
+	// the doc 04 section 7 drain trigger quantity.
+	dirty      []uint32
+	dirtyHead  int
+	dirtyN     int
+	dirtyBytes int
 }
 
 // maxKlen is the klen field's reach. Longer keys are legal in Redis but
@@ -52,7 +63,43 @@ func NewHotTable(capacity int) *HotTable {
 		dups:   make(map[uint64][]uint32),
 		hdrs:   make([]hdr, 0, capacity),
 		ghosts: newGhostRing(capacity / 16),
+		dirty:  make([]uint32, max(capacity, 8)),
 	}
+}
+
+// enqueueDirty files slot s in the write-behind queue on its transition
+// into dirty; a slot already queued stays where it is, which is what
+// keeps drain order first-dirtied-first under overwrite churn.
+func (t *HotTable) enqueueDirty(s uint32) {
+	hd := &t.hdrs[s]
+	if hd.queued != 0 {
+		return
+	}
+	hd.queued = 1
+	if t.dirtyN == len(t.dirty) {
+		grown := make([]uint32, 2*len(t.dirty))
+		for i := range t.dirtyN {
+			grown[i] = t.dirty[(t.dirtyHead+i)%len(t.dirty)]
+		}
+		t.dirty, t.dirtyHead = grown, 0
+	}
+	t.dirty[(t.dirtyHead+t.dirtyN)%len(t.dirty)] = s
+	t.dirtyN++
+}
+
+// popDirty hands the drain scheduler the oldest queue entry and clears
+// its queued flag. The caller must check the slot is still dirty: an
+// entry goes stale when its slot was drained directly or freed and
+// reused, and a stale entry is a skip, never an error.
+func (t *HotTable) popDirty() (uint32, bool) {
+	if t.dirtyN == 0 {
+		return 0, false
+	}
+	s := t.dirty[t.dirtyHead]
+	t.dirtyHead = (t.dirtyHead + 1) % len(t.dirty)
+	t.dirtyN--
+	t.hdrs[s].queued = 0
+	return s, true
 }
 
 // SetTick moves the coarse clock the stamps record. Stamps shift last
@@ -104,19 +151,29 @@ func (t *HotTable) Put(key, val []byte, tag uint8) bool {
 	h := maphash.Bytes(t.seed, key)
 	if s, ok := t.lookup(h, key); ok {
 		hd := &t.hdrs[s]
-		switch {
-		case hd.valRef == 0:
+		switch hd.valRef {
+		case 0:
 			// Reviving a tombstone: the header never left, so this is
 			// an overwrite that happens to bring the key back to life.
+			// The tombstone was dirty, so only the value bytes are new.
 			hd.valRef = t.vals.alloc(val)
 			t.live++
-		case !t.vals.update(hd.valRef, val):
-			t.vals.release(hd.valRef)
-			hd.valRef = t.vals.alloc(val)
+			t.dirtyBytes += len(val)
+		default:
+			if hd.state == stateDirty {
+				t.dirtyBytes += len(val) - len(t.vals.data(hd.valRef))
+			} else {
+				t.dirtyBytes += int(hd.klen) + len(val)
+			}
+			if !t.vals.update(hd.valRef, val) {
+				t.vals.release(hd.valRef)
+				hd.valRef = t.vals.alloc(val)
+			}
 		}
 		hd.state = stateDirty
 		hd.typeTag = tag
 		t.touchWrite(hd)
+		t.enqueueDirty(s)
 		return true
 	}
 
@@ -149,6 +206,8 @@ func (t *HotTable) Put(key, val []byte, tag uint8) bool {
 	}
 	t.touchWrite(hd)
 	t.live++
+	t.dirtyBytes += len(key) + len(val)
+	t.enqueueDirty(s)
 	if _, occupied := t.index[h]; occupied {
 		t.dups[h] = append(t.dups[h], s)
 	} else {
@@ -169,10 +228,16 @@ func (t *HotTable) Del(key []byte) bool {
 	if hd.valRef == 0 {
 		return false
 	}
+	if hd.state == stateDirty {
+		t.dirtyBytes -= len(t.vals.data(hd.valRef))
+	} else {
+		t.dirtyBytes += int(hd.klen)
+	}
 	t.vals.release(hd.valRef)
 	hd.valRef = 0
 	hd.state = stateDirty
 	t.touchWrite(hd)
+	t.enqueueDirty(s)
 	t.live--
 	return true
 }
@@ -189,9 +254,11 @@ func (t *HotTable) drained(s uint32, vptr uint64) bool {
 		return false
 	}
 	if hd.valRef == 0 {
+		t.dirtyBytes -= int(hd.klen)
 		t.removeSlot(maphash.Bytes(t.seed, t.keys.data(hd.keyRef)), s)
 		return true
 	}
+	t.dirtyBytes -= int(hd.klen) + len(t.vals.data(hd.valRef))
 	hd.state = stateResident
 	hd.vptr = vptr
 	return true

@@ -56,6 +56,11 @@ type StoreStats struct {
 // Get returns ErrNotFound for a missing key. BatchGet returns one Record
 // per requested key in order, with a nil Key marking a miss; it exists so
 // a backend can turn a cold-miss batch into one IO round instead of N.
+// ApplyBatch must not retain any op memory after it returns: the drain
+// scheduler passes slices aliasing the hot tier's arenas, which the next
+// write may rewrite. Both real backends copy by construction (SQLite
+// binds, Track B fills group buffers); a store that keeps bytes in RAM
+// must clone them.
 // Scan visits records until fn returns false or the store is exhausted,
 // in an order that is stable while the store is quiescent, and returns the
 // cursor to resume from.

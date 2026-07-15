@@ -365,6 +365,20 @@ func TestStateMachineProperty(t *testing.T) {
 		if occupied != len(shadow) {
 			t.Fatalf("op %d: %d occupied headers, shadow holds %d", op, occupied, len(shadow))
 		}
+		sumDirty := 0
+		for i := range ht.hdrs {
+			hd := &ht.hdrs[i]
+			if hd.state != stateDirty {
+				continue
+			}
+			sumDirty += int(hd.klen)
+			if hd.valRef != 0 {
+				sumDirty += len(ht.vals.data(hd.valRef))
+			}
+		}
+		if sumDirty != ht.dirtyBytes {
+			t.Fatalf("op %d: dirtyBytes %d, headers sum to %d", op, ht.dirtyBytes, sumDirty)
+		}
 	}
 
 	// Drain everything out, evict everything cold: the table must empty.
