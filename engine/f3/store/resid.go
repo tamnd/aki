@@ -261,8 +261,8 @@ func (s *Store) demoteBucket(b *bucket, scanned *uint64) uint64 {
 	var freed uint64
 	for i := 0; i < slotsPerBucket; i++ {
 		w := b.slots[i]
-		if w == 0 {
-			continue
+		if w == 0 || slotCold(w) {
+			continue // empty, or already cold: no arena run for the hand to move
 		}
 		*scanned++
 		addr := w & addrMask

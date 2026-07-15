@@ -50,6 +50,24 @@ const (
 	tagShift  = 52 // bits 52..63: the probe's fast reject
 )
 
+// The tier field (bits 48..49) says where the entry's record lives. Resident
+// is the byte-identical hot path: the address is an arena offset. Cold means
+// the record was demoted to the shard's cold region (cold.go) and the address
+// is a cold-frame offset there, resolved by one pread. 10 and 11 stay reserved.
+const (
+	tierMask     = uint64(3)
+	tierResident = uint64(0)
+	tierCold     = uint64(1)
+)
+
+// tierOf reads an entry word's tier field.
+func tierOf(w uint64) uint64 { return (w >> tierShift) & tierMask }
+
+// slotCold reports whether an entry word names a cold-region frame rather than
+// an arena record. Every path that would dereference w&addrMask as an arena
+// offset tests this first: a cold word's address is meaningless in the arena.
+func slotCold(w uint64) bool { return tierOf(w) == tierCold }
+
 // tagOf takes the high 12 bits of the hash for the entry tag, the fast reject
 // that skips a slot without touching the arena. The |1 keeps it non-zero so a
 // live entry word can never read as the empty-slot sentinel even at address

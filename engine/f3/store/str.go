@@ -117,13 +117,31 @@ func (s *Store) setExpireAt(off uint64, at int64) {
 // paths), which skips the check.
 func (s *Store) findLive(h uint64, key []byte, now int64) (slot *uint64, addr uint64, inOverflow bool) {
 	slot, addr, inOverflow = s.findEntry(h, key)
-	if addr != 0 && now != 0 {
+	// A cold entry carries no expiry (the migrator demotes only TTL-free
+	// records this slice) and its address is a cold-frame offset, so the arena
+	// expiry read is both unnecessary and wrong for it. addr is the cold offset;
+	// the caller serves it through the frame or brings it up.
+	if addr != 0 && now != 0 && !slotCold(*slot) {
 		if at := s.expireAt(addr); at != 0 && at <= now {
 			s.deleteAt(h, slot, inOverflow)
 			s.dropRecord(addr)
 			s.count--
 			return nil, 0, false
 		}
+	}
+	return slot, addr, inOverflow
+}
+
+// findResident is findLive with cold bring-up: a cold hit is promoted back to a
+// resident record so the returned address is always an arena address. Every
+// path that dereferences the arena directly (the write commands, and the read
+// commands this slice does not yet serve from the frame) goes through it, so a
+// cold key is never handed to a caller as a raw arena offset. A resident hit
+// costs one extra tier-bit test.
+func (s *Store) findResident(h uint64, key []byte, now int64) (slot *uint64, addr uint64, inOverflow bool) {
+	slot, addr, inOverflow = s.findLive(h, key, now)
+	if addr != 0 && slotCold(*slot) {
+		addr = s.bringUp(h, slot, addr)
 	}
 	return slot, addr, inOverflow
 }
@@ -176,9 +194,15 @@ func (s *Store) publish(h uint64, slot *uint64, oldAddr, off uint64) {
 // value materializes whole here; the streaming read path is GetStream.
 func (s *Store) GetString(key []byte, now int64, dst []byte) ([]byte, bool) {
 	h := Hash(key)
-	_, addr, _ := s.findLive(h, key, now)
+	slot, addr, _ := s.findLive(h, key, now)
 	if addr == 0 {
 		return dst[:0], false
+	}
+	if slotCold(*slot) {
+		// Served straight from the cold frame, one pread, no promotion: a read
+		// keeps a cold key cold so the migrator's work is not undone by traffic
+		// (the promotion doorkeeper on cold reads is a later slice).
+		return s.coldRead(addr, dst)
 	}
 	return s.readValue(addr, dst)
 }
@@ -235,9 +259,12 @@ func (s *Store) Exists(key []byte, now int64) bool {
 // StrLen reports the value's byte length (an int cell's digit count) and
 // presence.
 func (s *Store) StrLen(key []byte, now int64) (int64, bool) {
-	_, addr, _ := s.findLive(Hash(key), key, now)
+	slot, addr, _ := s.findLive(Hash(key), key, now)
 	if addr == 0 {
 		return 0, false
+	}
+	if slotCold(*slot) {
+		return int64(s.coldVlen(addr)), true
 	}
 	return int64(s.vlen(addr)), true
 }
@@ -249,6 +276,14 @@ func (s *Store) Del(key []byte, now int64) bool {
 	slot, addr, inOverflow := s.findLive(h, key, now)
 	if addr == 0 {
 		return false
+	}
+	if slotCold(*slot) {
+		// The frame is unreferenced once the slot clears; no pread, no arena
+		// drop, its bytes fall to the cold region's later compaction.
+		s.deleteAt(h, slot, inOverflow)
+		s.dropColdEntry()
+		s.count--
+		return true
 	}
 	s.deleteAt(h, slot, inOverflow)
 	s.dropRecord(addr)
@@ -270,7 +305,7 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 		return ErrTooBig
 	}
 	h := Hash(key)
-	slot, addr, _ := s.findLive(h, key, now)
+	slot, addr, _ := s.findResident(h, key, now)
 
 	at := expireAt
 	if keepTTL && addr != 0 {
@@ -425,7 +460,7 @@ func (s *Store) IncrBy(key []byte, delta, now int64) (int64, error) {
 		return 0, ErrTooBig
 	}
 	h := Hash(key)
-	slot, addr, _ := s.findLive(h, key, now)
+	slot, addr, _ := s.findResident(h, key, now)
 	if addr == 0 {
 		off, err := s.allocString(key, 8, flagInt, 0)
 		if err != nil {
@@ -588,7 +623,7 @@ func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 		return 0, ErrTooBig
 	}
 	h := Hash(key)
-	slot, addr, _ := s.findLive(h, key, now)
+	slot, addr, _ := s.findResident(h, key, now)
 	if addr == 0 {
 		if len(add) > maxValueLen {
 			return 0, ErrTooBig
@@ -719,7 +754,7 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 		return 0, ErrTooBig
 	}
 	h := Hash(key)
-	slot, addr, _ := s.findLive(h, key, now)
+	slot, addr, _ := s.findResident(h, key, now)
 	buf := s.arena.buf
 	if addr == 0 {
 		if end >= strChunkMin {

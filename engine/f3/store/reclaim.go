@@ -316,8 +316,8 @@ func (s *Store) relocateLive(victims []bool) {
 func (s *Store) relocateBucket(b *bucket, victims []bool) bool {
 	for i := 0; i < slotsPerBucket; i++ {
 		w := b.slots[i]
-		if w == 0 {
-			continue
+		if w == 0 || slotCold(w) {
+			continue // empty, or a cold frame that owns no arena record to move
 		}
 		addr := w & addrMask
 		naddr, ok := s.relocateRecord(addr, victims)
