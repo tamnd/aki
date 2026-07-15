@@ -217,6 +217,9 @@ func Set(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 
 	if err := cx.St.SetString(key, val, cx.NowMs, atMs, flags&setKeepTTL != 0); err != nil {
+		if cx.ParkFull(err) {
+			return
+		}
 		r.Err(storeErr(err))
 		return
 	}
