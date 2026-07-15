@@ -19,7 +19,11 @@ const schemaVersion = 1
 // gen implements rootgen (collection DEL bumps gen in kv, a background
 // sweep reclaims elem rows), crc is sqlo1's own crc32c row checksum since
 // SQLite mainline has no page checksums. Inline collections below the doc
-// 05-10 thresholds stay as one kv blob.
+// 05-10 thresholds stay as one kv blob. meta is the single-row home of the
+// drain high-water mark; it cannot live in kv because kv's primary key is
+// the bare user key and any reserved key would be one user SET away from
+// clobbering the mark. The seed insert makes the row's existence a schema
+// invariant, so the high-water read never has a missing-row case.
 const schemaSQL = `
 CREATE TABLE kv (
   k BLOB PRIMARY KEY, t INTEGER, exp INTEGER, gen INTEGER,
@@ -48,6 +52,10 @@ CREATE TABLE xent (k BLOB, ms INTEGER, seq INTEGER, data BLOB,
 CREATE TABLE xpel (k BLOB, grp BLOB, ms INTEGER, seq INTEGER,
   c INTEGER, dc INTEGER, dt INTEGER,
   PRIMARY KEY (k, grp, ms, seq)) WITHOUT ROWID;
+
+CREATE TABLE meta (id INTEGER PRIMARY KEY CHECK (id = 0),
+  hw INTEGER) WITHOUT ROWID;
+INSERT INTO meta (id, hw) VALUES (0, 0);
 `
 
 // schemaTables is what a generation-1 store must contain, exactly. The
@@ -55,7 +63,7 @@ CREATE TABLE xpel (k BLOB, grp BLOB, ms INTEGER, seq INTEGER,
 // hand-edited file, an extra one means something else has been writing
 // into the store, and either way running on top of it hides the problem.
 var schemaTables = []string{
-	"chunk", "helem", "kv", "lelem", "selem", "xent", "xpel", "zmem",
+	"chunk", "helem", "kv", "lelem", "meta", "selem", "xent", "xpel", "zmem",
 }
 
 // ensureSchema brings a freshly opened connection to the current schema
