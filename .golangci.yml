@@ -8,6 +8,15 @@ version: "2"
 
 linters:
   exclusions:
+    # The sqlo1 trees are a separate driver with their own fast CI lane
+    # (.github/workflows/sqlo1.yml) and no import edge into the rest of the
+    # module. The main ci workflow already ignores these paths at the workflow
+    # level, so a non-sqlo1 PR never gates on that code through its own lane;
+    # skip the paths here too so the shared lint job stays consistent with that
+    # split instead of failing a non-sqlo1 PR on the sqlo1 lane's code.
+    paths:
+      - engine/sqlo1
+      - cmd/sqlo1
     rules:
       - path: _test\.go
         linters:
