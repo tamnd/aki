@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -95,13 +96,30 @@ func main() {
 	}
 
 	fmt.Println()
-	fmt.Println("family        f3_mean    obs1_mean  ratio  f3_spread  obs1_spread")
+	fmt.Println("family        f3_mean    obs1_mean  ratio  f3_med     obs1_med   med_ratio  f3_spread  obs1_spread")
 	for _, fam := range families {
 		f3m, f3s := meanSpread(perFam["f3"][fam.name])
 		o1m, o1s := meanSpread(perFam["obs1"][fam.name])
-		fmt.Printf("%-12s %10.0f %10.0f  %5.3f     %5.1f%%       %5.1f%%\n",
-			fam.name, f3m, o1m, o1m/f3m, f3s*100, o1s*100)
+		f3md, o1md := median(perFam["f3"][fam.name]), median(perFam["obs1"][fam.name])
+		fmt.Printf("%-12s %10.0f %10.0f  %5.3f %10.0f %10.0f      %5.3f     %5.1f%%       %5.1f%%\n",
+			fam.name, f3m, o1m, o1m/f3m, f3md, o1md, o1md/f3md, f3s*100, o1s*100)
 	}
+}
+
+// median is the rep statistic the prediction is scored on: a shared dev
+// box mixes in slow outlier reps that a mean drags around, and the
+// median of alternating-order reps is what the underlying rate looks
+// like between them.
+func median(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	s := append([]float64(nil), xs...)
+	sort.Float64s(s)
+	if len(s)%2 == 1 {
+		return s[len(s)/2]
+	}
+	return (s[len(s)/2-1] + s[len(s)/2]) / 2
 }
 
 // meanSpread returns the mean and the (max-min)/mean spread, the noise

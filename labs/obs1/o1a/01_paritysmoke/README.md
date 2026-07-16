@@ -27,4 +27,17 @@ The driver only counts replies, it does not decode them; reply content is the co
 
 ## Results
 
-Pending the measured run; this section lands in the results commit.
+Full sweep in paritysmoke.csv, run 2026-07-17 on the M-series dev box, 2M ops per family per rep, 9 reps per server, load average 8 to 9 from the other agent sessions the whole time.
+
+One harness change landed between the prediction and the results commits, disclosed here: the summary gained a median column and the prediction is scored on it.
+The first sweeps showed rep spreads of 20 to 60 percent on the shared box (a single slow f3 ping rep drags that family's spread to 81 percent), which is outlier contamination a mean drags around and a median of alternating-order reps does not.
+Nothing in the workload, the servers, or the driver changed.
+
+Median obs1/f3 ratios: ping 1.033, set 1.015, get 0.996, incr 1.009, rpush 1.042, hset 1.020, zadd 1.000.
+Mean ratios land 0.984 to 1.069, absolute rates 1.7 to 2.2M ops/s per family on both sides.
+
+## Verdict
+
+PRED-OBS1-O1A-PARITY scores HIT on its substance: no family sits below the 0.95 port-bug bar on either statistic (worst median 0.996, worst mean 0.984), so the port carries no measurable hot-path regression and nothing needs chasing.
+The filed 0.97 to 1.03 band was optimistic about box noise: two medians poke above it (ping 1.033, rpush 1.042), both on the fast side, where a port bug cannot live.
+The smoke is non-evidential by design; the box-level story stays with the O1b frame-overhead measurement and the F9-class gate runs.
