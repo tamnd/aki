@@ -66,8 +66,15 @@ func (f *File) AppendGroup(group []Pending) ([]uint64, error) {
 // payload CRC. A torn segment returns ErrChecksum with the parsed header so a
 // caller can see how far it got; a clean read returns a copy of the payload.
 func (f *File) ReadSegmentAt(off uint64) (*SegHeader, []byte, error) {
+	return readSegmentAt(f.dev, f.prefix.ChecksumKind, off)
+}
+
+// readSegmentAt is the device-level segment read the File method and the recovery
+// walker share: read and validate the header, then read and verify the payload
+// under the file's checksum kind.
+func readSegmentAt(dev Device, kind uint32, off uint64) (*SegHeader, []byte, error) {
 	hb := make([]byte, SegHeaderLen)
-	if _, err := f.dev.ReadAt(hb, int64(off)); err != nil {
+	if _, err := dev.ReadAt(hb, int64(off)); err != nil {
 		return nil, nil, err
 	}
 	h, err := ParseSegHeader(hb)
@@ -75,10 +82,10 @@ func (f *File) ReadSegmentAt(off uint64) (*SegHeader, []byte, error) {
 		return nil, nil, err
 	}
 	payload := make([]byte, h.PayloadLen)
-	if _, err := f.dev.ReadAt(payload, int64(off)+SegHeaderLen); err != nil {
+	if _, err := dev.ReadAt(payload, int64(off)+SegHeaderLen); err != nil {
 		return h, nil, err
 	}
-	if err := h.VerifyPayload(payload, f.prefix.ChecksumKind); err != nil {
+	if err := h.VerifyPayload(payload, kind); err != nil {
 		return h, nil, err
 	}
 	return h, payload, nil
