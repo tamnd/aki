@@ -261,3 +261,68 @@ func TestCompactGuards(t *testing.T) {
 	}
 	r.verify(t)
 }
+
+// TestCompactRelocatesLoneBigRecords pins the relocation trim: a
+// slotted record alone in its group comes back from GroupView.Record
+// as the whole slice up to the slot table, 4092 bytes of pad tail
+// included, so relocating the untrimmed slice crosses BlobThreshold
+// and misroutes a slotted record to the blob path. Found by the
+// tiered crash suite's preflight (seed 4000001, wide value band).
+func TestCompactRelocatesLoneBigRecords(t *testing.T) {
+	ctx := context.Background()
+	r := newStoreRig(t)
+	// 3000-byte values encode past half a group's payload, so every
+	// record sits alone in its group with an rlen far under the
+	// threshold and a slot slice far over it.
+	val := bytes.Repeat([]byte{'b'}, 3000)
+	r.apply(t, putOp("lone-seed", val, 0))
+	first := r.s.vlog.ext
+	keys := []string{"lone-seed"}
+	for n := 0; r.s.vlog.ext == first; n++ {
+		if n >= 400 {
+			t.Fatalf("vlog extent never rolled after %d records", n)
+		}
+		k := fmt.Sprintf("lone%05d", n)
+		keys = append(keys, k)
+		r.apply(t, putOp(k, val, 0))
+	}
+	var in []string
+	for _, k := range keys {
+		if r.posOf(t, k).Extent() == first {
+			in = append(in, k)
+		}
+	}
+	if len(in) < 4 {
+		t.Fatalf("only %d records landed in the sealed extent", len(in))
+	}
+	var ops []sqlo1.Op
+	for i, k := range in {
+		if i%2 == 0 {
+			ops = append(ops, delOp(k))
+		}
+	}
+	r.apply(t, ops...)
+
+	cs, err := r.s.CompactExtent(ctx, first)
+	if err != nil {
+		t.Fatalf("compacting lone big records: %v", err)
+	}
+	if want := len(in) - len(ops); cs.Relocated != want {
+		t.Fatalf("compact stats %+v, want %d relocated", cs, want)
+	}
+	for i, k := range in {
+		if i%2 == 0 {
+			continue
+		}
+		rec, err := r.s.Get(ctx, []byte(k))
+		if err != nil {
+			t.Fatalf("Get(%s) after relocation: %v", k, err)
+		}
+		if !bytes.Equal(rec.Value, val) {
+			t.Fatalf("Get(%s) came back %d bytes, want %d", k, len(rec.Value), len(val))
+		}
+	}
+	r.verify(t)
+	r.reopen(t)
+	r.verify(t)
+}
