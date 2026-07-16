@@ -125,3 +125,61 @@ func ReplayTail(dev Device, prefix *Prefix, from, size uint64, visit func(off ui
 	}
 	return cursor, nil
 }
+
+// IndexRebuilder folds a shard's index back from a full checkpoint and the delta
+// chain layered over it (spec 2064/f3/07 section 5). Recovery loads the base full
+// dump, applies each delta forward, and is left with the live index as of the
+// last checkpoint's log position, from which ReplayTail catches the tail. The
+// rebuilder keys entries by key_hash, the identity the store also keys on; a
+// verify-on-read resolves any hash collision the checkpoint could not.
+type IndexRebuilder struct {
+	entries map[uint64]CkptEntry
+	// LogPos is the global_seq the last applied checkpoint is consistent up to, the
+	// offset tail replay resumes from. SeqHigh is the highest shard record sequence
+	// it reflects, a cross-check against the replayed tail.
+	LogPos  uint64
+	SeqHigh uint64
+}
+
+// NewIndexRebuilder starts an empty rebuild. The first Apply is expected to be a
+// full checkpoint, but a delta over the empty index is equally valid.
+func NewIndexRebuilder() *IndexRebuilder {
+	return &IndexRebuilder{entries: make(map[uint64]CkptEntry)}
+}
+
+// Apply layers one checkpoint payload over the accumulated index and returns its
+// parsed header. A full dump replaces the accumulator (every live entry, no
+// tombstones); a delta applies over it, removing tombstoned keys and inserting or
+// overwriting the rest. LogPos and SeqHigh advance to the applied checkpoint, so
+// the caller resolves the chain oldest-first and replays the tail from LogPos
+// once the newest delta is in.
+func (r *IndexRebuilder) Apply(payload []byte) (CkptHeader, error) {
+	h, err := ParseCkptHeader(payload)
+	if err != nil {
+		return CkptHeader{}, err
+	}
+	entries, err := CkptEntries(payload, h)
+	if err != nil {
+		return CkptHeader{}, err
+	}
+	if h.FullOrDelta == CkptFull {
+		r.entries = make(map[uint64]CkptEntry, len(entries))
+	}
+	for _, e := range entries {
+		if h.FullOrDelta == CkptDelta && e.Flags&CkptTombstone != 0 {
+			delete(r.entries, e.KeyHash)
+			continue
+		}
+		r.entries[e.KeyHash] = e
+	}
+	r.LogPos = h.CkptLogPos
+	r.SeqHigh = h.SeqHigh
+	return h, nil
+}
+
+// Entries is the live index as of the last applied checkpoint, keyed by key_hash.
+// The map is the rebuilder's own; a caller that mutates it is on its own.
+func (r *IndexRebuilder) Entries() map[uint64]CkptEntry { return r.entries }
+
+// Len is the number of live index entries accumulated so far.
+func (r *IndexRebuilder) Len() int { return len(r.entries) }

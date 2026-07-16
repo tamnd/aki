@@ -250,3 +250,97 @@ func writeMeta(t *testing.T, dev *memDevice, prefix *Prefix, off uint64, m *Meta
 		t.Fatalf("write meta: %v", err)
 	}
 }
+
+// ckptPayload frames a checkpoint payload from a header and its entries, the bytes
+// an index_ckpt segment would carry.
+func ckptPayload(h CkptHeader, entries []CkptEntry) []byte {
+	h.EntryCount = uint64(len(entries))
+	b := AppendCkptHeader(nil, h)
+	for _, e := range entries {
+		b = AppendCkptEntry(b, e)
+	}
+	return b
+}
+
+// TestIndexRebuilderFullThenDeltas loads a full dump, then two deltas that add,
+// overwrite, and tombstone keys, and confirms the accumulated index is the live
+// set with the newest addresses and the last checkpoint's log position.
+func TestIndexRebuilderFullThenDeltas(t *testing.T) {
+	full := ckptPayload(CkptHeader{FullOrDelta: CkptFull, CkptLogPos: 10, SeqHigh: 3}, []CkptEntry{
+		{KeyHash: 1, RecordAddr: 0x100, Slot: 1},
+		{KeyHash: 2, RecordAddr: 0x200, Slot: 2},
+		{KeyHash: 3, RecordAddr: 0x300, Slot: 3},
+	})
+	d1 := ckptPayload(CkptHeader{FullOrDelta: CkptDelta, CkptLogPos: 20, BaseCkptOff: 4096, SeqHigh: 5}, []CkptEntry{
+		{KeyHash: 2, RecordAddr: 0x2222, Slot: 2}, // overwrite key 2
+		{KeyHash: 4, RecordAddr: 0x400, Slot: 4},  // insert key 4
+		{KeyHash: 1, Flags: CkptTombstone},        // delete key 1
+	})
+	d2 := ckptPayload(CkptHeader{FullOrDelta: CkptDelta, CkptLogPos: 30, BaseCkptOff: 8192, SeqHigh: 7}, []CkptEntry{
+		{KeyHash: 4, Flags: CkptTombstone}, // delete key 4
+	})
+
+	r := NewIndexRebuilder()
+	for i, p := range [][]byte{full, d1, d2} {
+		if _, err := r.Apply(p); err != nil {
+			t.Fatalf("apply %d: %v", i, err)
+		}
+	}
+
+	if r.LogPos != 30 || r.SeqHigh != 7 {
+		t.Fatalf("log pos %d seq high %d, want 30/7", r.LogPos, r.SeqHigh)
+	}
+	// Live: key 2 (overwritten), key 3 (from full); 1 and 4 tombstoned.
+	want := map[uint64]uint64{2: 0x2222, 3: 0x300}
+	if r.Len() != len(want) {
+		t.Fatalf("index has %d live entries, want %d", r.Len(), len(want))
+	}
+	for kh, addr := range want {
+		if e, ok := r.Entries()[kh]; !ok || e.RecordAddr != addr {
+			t.Fatalf("key %d = %v/%v, want addr %#x", kh, e, ok, addr)
+		}
+	}
+	if _, ok := r.Entries()[1]; ok {
+		t.Fatalf("tombstoned key 1 is still live")
+	}
+	if _, ok := r.Entries()[4]; ok {
+		t.Fatalf("tombstoned key 4 is still live")
+	}
+}
+
+// TestIndexRebuilderFullResetsAccumulator applies a full over an already-populated
+// index and confirms the earlier entries are gone: a full is the whole live set,
+// not an addition.
+func TestIndexRebuilderFullResetsAccumulator(t *testing.T) {
+	r := NewIndexRebuilder()
+	if _, err := r.Apply(ckptPayload(CkptHeader{FullOrDelta: CkptFull, CkptLogPos: 1}, []CkptEntry{
+		{KeyHash: 9, RecordAddr: 0x900},
+	})); err != nil {
+		t.Fatalf("first full: %v", err)
+	}
+	if _, err := r.Apply(ckptPayload(CkptHeader{FullOrDelta: CkptFull, CkptLogPos: 2}, []CkptEntry{
+		{KeyHash: 7, RecordAddr: 0x700},
+	})); err != nil {
+		t.Fatalf("second full: %v", err)
+	}
+	if r.Len() != 1 {
+		t.Fatalf("index has %d entries, want 1 (the second full replaced the first)", r.Len())
+	}
+	if _, ok := r.Entries()[9]; ok {
+		t.Fatalf("key 9 from the first full survived a replacing full")
+	}
+}
+
+// TestIndexRebuilderRejectsCorruptCheckpoint stops on a malformed payload rather
+// than folding garbage into the index.
+func TestIndexRebuilderRejectsCorruptCheckpoint(t *testing.T) {
+	r := NewIndexRebuilder()
+	// A header claiming more entries than the payload carries: CkptEntries bounds it.
+	bad := AppendCkptHeader(nil, CkptHeader{FullOrDelta: CkptFull, EntryCount: 5})
+	if _, err := r.Apply(bad); err != ErrLength {
+		t.Fatalf("err = %v, want ErrLength", err)
+	}
+	if r.Len() != 0 {
+		t.Fatalf("corrupt checkpoint left %d entries", r.Len())
+	}
+}
