@@ -59,60 +59,104 @@ func (e WALIndexEntry) SectionSpan() (off, n int64) {
 	return int64(e.Offset), walSectionHdr + int64(e.StoredLen) + 4
 }
 
+// RawSection is one group's already-encoded run of frames, the flusher's
+// zero-reparse path: owners encoded frames straight into the group buffer
+// on the hot path, and the counts and seq range were tracked as they
+// appended. AppendWALRaw writes those facts as given; ParseWAL recomputes
+// and cross-checks every one of them at read time, so a bookkeeping lie
+// here is a parse error there, never a silent preference.
+type RawSection struct {
+	Group    uint16
+	Epoch    uint32
+	Frames   []byte
+	NFrames  uint32
+	FirstSeq uint64
+	LastSeq  uint64
+}
+
+// appendWALFrame encodes one frame in the doc 03 section 4 layout.
+func appendWALFrame(b []byte, f WALFrame) ([]byte, error) {
+	if len(f.Key) > 0xFFFF {
+		return nil, fmt.Errorf("obs1: WAL frame key is %d bytes, the format caps keys at 65535", len(f.Key))
+	}
+	flen := walFrameFixed + len(f.Key) + len(f.Payload)
+	if int64(flen) > 0xFFFFFFFF {
+		return nil, fmt.Errorf("obs1: WAL frame is %d bytes, the format caps frames at 4 GiB", flen)
+	}
+	b = binary.LittleEndian.AppendUint32(b, uint32(flen))
+	b = append(b, f.Kind, f.Flags)
+	b = binary.LittleEndian.AppendUint16(b, f.Slot)
+	b = binary.LittleEndian.AppendUint64(b, f.Seq)
+	b = binary.LittleEndian.AppendUint16(b, uint16(len(f.Key)))
+	b = append(b, f.Key...)
+	return append(b, f.Payload...), nil
+}
+
 // AppendWAL appends a complete WAL object: header, sections back to back,
 // footer, tail. Sections must be non-empty and frame seqs strictly
 // increasing within each section, because first_seq and last_seq are
 // derived, never trusted from the caller.
 func AppendWAL(b []byte, writer uint64, sections []WALSection) ([]byte, error) {
-	if len(sections) == 0 {
-		return nil, fmt.Errorf("obs1: a WAL object needs at least one section")
-	}
-	start := len(b)
-	b = AppendHeader(b, Header{Format: FormatWAL, FVersion: 1, Writer: writer})
-	index := make([]WALIndexEntry, 0, len(sections))
+	raw := make([]RawSection, len(sections))
 	for si, s := range sections {
 		if len(s.Frames) == 0 {
 			return nil, fmt.Errorf("obs1: WAL section %d (group %d) has no frames", si, s.Group)
 		}
-		off := len(b) - start
-		b = binary.LittleEndian.AppendUint16(b, s.Group)
-		b = binary.LittleEndian.AppendUint32(b, s.Epoch)
-		b = append(b, 0, 0, 0, 0) // comp 0, reserved
-		lenAt := len(b)
-		b = append(b, 0, 0, 0, 0, 0, 0, 0, 0) // rawlen, storedlen backfilled
-		b = binary.LittleEndian.AppendUint64(b, s.Frames[0].Seq)
-		b = binary.LittleEndian.AppendUint64(b, s.Frames[len(s.Frames)-1].Seq)
-		framesAt := len(b)
+		var fb []byte
 		last := uint64(0)
 		for fi, f := range s.Frames {
 			if fi > 0 && f.Seq <= last {
 				return nil, fmt.Errorf("obs1: WAL section %d seq %d after %d, must be strictly increasing", si, f.Seq, last)
 			}
 			last = f.Seq
-			if len(f.Key) > 0xFFFF {
-				return nil, fmt.Errorf("obs1: WAL frame key is %d bytes, the format caps keys at 65535", len(f.Key))
+			var err error
+			if fb, err = appendWALFrame(fb, f); err != nil {
+				return nil, err
 			}
-			flen := walFrameFixed + len(f.Key) + len(f.Payload)
-			if int64(flen) > 0xFFFFFFFF {
-				return nil, fmt.Errorf("obs1: WAL frame is %d bytes, the format caps frames at 4 GiB", flen)
-			}
-			b = binary.LittleEndian.AppendUint32(b, uint32(flen))
-			b = append(b, f.Kind, f.Flags)
-			b = binary.LittleEndian.AppendUint16(b, f.Slot)
-			b = binary.LittleEndian.AppendUint64(b, f.Seq)
-			b = binary.LittleEndian.AppendUint16(b, uint16(len(f.Key)))
-			b = append(b, f.Key...)
-			b = append(b, f.Payload...)
 		}
-		raw := uint32(len(b) - framesAt)
-		binary.LittleEndian.PutUint32(b[lenAt:], raw)
-		binary.LittleEndian.PutUint32(b[lenAt+4:], raw) // storedlen == rawlen at comp 0
-		b = binary.LittleEndian.AppendUint32(b, crc32c(b[framesAt:]))
+		raw[si] = RawSection{
+			Group: s.Group, Epoch: s.Epoch, Frames: fb,
+			NFrames:  uint32(len(s.Frames)),
+			FirstSeq: s.Frames[0].Seq, LastSeq: s.Frames[len(s.Frames)-1].Seq,
+		}
+	}
+	out, _, err := AppendWALRaw(b, writer, raw)
+	return out, err
+}
+
+// AppendWALRaw appends a complete WAL object from already-encoded frame
+// bytes and returns the footer index, which the flusher hands to the
+// commit record so the chain repeats it.
+func AppendWALRaw(b []byte, writer uint64, sections []RawSection) ([]byte, []WALIndexEntry, error) {
+	if len(sections) == 0 {
+		return nil, nil, fmt.Errorf("obs1: a WAL object needs at least one section")
+	}
+	start := len(b)
+	b = AppendHeader(b, Header{Format: FormatWAL, FVersion: 1, Writer: writer})
+	index := make([]WALIndexEntry, 0, len(sections))
+	for si, s := range sections {
+		if len(s.Frames) == 0 || s.NFrames == 0 {
+			return nil, nil, fmt.Errorf("obs1: WAL section %d (group %d) has no frames", si, s.Group)
+		}
+		if int64(len(s.Frames)) > 0xFFFFFFFF {
+			return nil, nil, fmt.Errorf("obs1: WAL section %d is %d bytes, the format caps sections at 4 GiB", si, len(s.Frames))
+		}
+		off := len(b) - start
+		raw := uint32(len(s.Frames))
+		b = binary.LittleEndian.AppendUint16(b, s.Group)
+		b = binary.LittleEndian.AppendUint32(b, s.Epoch)
+		b = append(b, 0, 0, 0, 0) // comp 0, reserved
+		b = binary.LittleEndian.AppendUint32(b, raw)
+		b = binary.LittleEndian.AppendUint32(b, raw) // storedlen == rawlen at comp 0
+		b = binary.LittleEndian.AppendUint64(b, s.FirstSeq)
+		b = binary.LittleEndian.AppendUint64(b, s.LastSeq)
+		b = append(b, s.Frames...)
+		b = binary.LittleEndian.AppendUint32(b, crc32c(s.Frames))
 		index = append(index, WALIndexEntry{
 			Group: s.Group, Epoch: s.Epoch,
 			Offset: uint64(off), StoredLen: raw, RawLen: raw,
-			NFrames:  uint32(len(s.Frames)),
-			FirstSeq: s.Frames[0].Seq, LastSeq: s.Frames[len(s.Frames)-1].Seq,
+			NFrames:  s.NFrames,
+			FirstSeq: s.FirstSeq, LastSeq: s.LastSeq,
 		})
 	}
 	footerOff := uint64(len(b) - start)
@@ -130,7 +174,7 @@ func AppendWAL(b []byte, writer uint64, sections []WALSection) ([]byte, error) {
 	footerLen := uint64(len(b)-start) - footerOff
 	b = binary.LittleEndian.AppendUint32(b, crc32c(b[start+int(footerOff):]))
 	footerLen += 4
-	return appendTail(b, footerOff, uint32(footerLen)), nil
+	return appendTail(b, footerOff, uint32(footerLen)), index, nil
 }
 
 // ParseWALFooter reads the footer bytes (crc included) into the index.
