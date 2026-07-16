@@ -1,0 +1,82 @@
+name: obs1
+
+# The obs1 trees are new code with no edge into the rest of the module, so
+# they get their own fast lane: fmt, vet, boundary, build, race tests, and a
+# scoped lint on just the obs1 packages. The main ci workflow ignores these
+# paths, and this lane never builds or tests anything outside them, which is
+# what keeps an obs1 PR's feedback loop in minutes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/obs1/**'
+      - 'obs1srv/**'
+      - 'cmd/obs1srv/**'
+      - 'labs/obs1/**'
+      - 'results/obs1/**'
+      - 'scripts/obs1-import-boundary.sh'
+      - '.github/workflows/obs1.yml'
+      - '.golangci.obs1.yml'
+  pull_request:
+    paths:
+      - 'engine/obs1/**'
+      - 'obs1srv/**'
+      - 'cmd/obs1srv/**'
+      - 'labs/obs1/**'
+      - 'results/obs1/**'
+      - 'scripts/obs1-import-boundary.sh'
+      - '.github/workflows/obs1.yml'
+      - '.golangci.obs1.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: obs1-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l engine/obs1 obs1srv cmd/obs1srv labs/obs1)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt -s -w:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./engine/obs1/... ./obs1srv/... ./cmd/obs1srv ./labs/obs1/...
+      - name: import boundary
+        run: ./scripts/obs1-import-boundary.sh
+      - name: build
+        run: go build ./engine/obs1/... ./obs1srv/... ./cmd/obs1srv ./labs/obs1/...
+      - name: test
+        run: go test -race -count=1 ./engine/obs1/... ./obs1srv/... ./cmd/obs1srv/... ./labs/obs1/...
+
+  # The shared lint lane skips the obs1 paths (they would otherwise gate
+  # non-obs1 PRs on this tree), so this job turns the same linter set back
+  # on with the obs1-scoped config. Without it the tree would have no lint
+  # at all, which is exactly how the labs/sqlo1 errcheck slip happened.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          args: --config=.golangci.obs1.yml ./engine/obs1/... ./obs1srv/... ./cmd/obs1srv/... ./labs/obs1/...

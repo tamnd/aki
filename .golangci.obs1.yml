@@ -1,0 +1,13 @@
+# golangci-lint configuration for the obs1 fast lane. The root .golangci.yml
+# excludes the obs1 paths so the shared lint job never gates a non-obs1 PR on
+# this tree; this config exists so the obs1 workflow can run the same default
+# linter set over the tree anyway. Same carve-out as the root config: errcheck
+# stays quiet in _test.go files.
+version: "2"
+
+linters:
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
