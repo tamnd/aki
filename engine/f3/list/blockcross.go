@@ -232,6 +232,8 @@ func blockPopCross(t *shard.Txn, conn *shard.Conn, seq uint32, keys [][]byte, ti
 			out = appendReply(nil, key, popOne(l, front))
 			if l.length() == 0 {
 				g.drop(key)
+			} else {
+				g.note(l)
 			}
 			have = true
 		})
@@ -300,6 +302,8 @@ func BlmpopCross(t *shard.Txn, conn *shard.Conn, seq uint32, a [][]byte) []byte 
 			}
 			if l.length() == 0 {
 				g.drop(key)
+			} else {
+				g.note(l)
 			}
 			have = true
 		})

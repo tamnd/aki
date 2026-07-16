@@ -268,7 +268,9 @@ func serveWaiters(cx *shard.Ctx, g *reg, key []byte, l *list) {
 		}
 		serveKey(cx, g, []byte(k), l2)
 		if l2.length() == 0 {
-			delete(g.m, k)
+			g.drop([]byte(k))
+		} else {
+			g.note(l2)
 		}
 	}
 	if cap(g.ready) > 0 {

@@ -109,6 +109,8 @@ func LmoveCross(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) []byte {
 			// in the separate waiter set and stay for a future push.
 			if d.length() == 0 {
 				g.drop(dst)
+			} else {
+				g.note(d)
 			}
 			moved = true
 		})
@@ -125,6 +127,8 @@ func LmoveCross(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) []byte {
 			popEnd(s, srcLeft)
 			if s.length() == 0 {
 				g.drop(src)
+			} else {
+				g.note(s)
 			}
 		})
 	}

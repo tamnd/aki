@@ -202,6 +202,27 @@ type native struct {
 	scratch []byte   // reused repack buffer for interior surgery, so a chunk rewrite does not allocate per call
 }
 
+// chunkFootprint is the resident-byte cost of one standard chunk's backing
+// arrays: the full blob budget plus the uint16 offset directory. Every normal
+// chunk allocates its blob at chunkBlobCap and its directory at chunkElemCap
+// regardless of how full it is (getChunk), so this fixed cost is exact for a
+// standard chunk; a lone oversized chunk's wider blob is undercounted, a rare and
+// conservative deviation the estimate accepts.
+const chunkFootprint = chunkBlobCap + chunkElemCap*2
+
+// residentBytes estimates the native band's resident footprint in O(1): the
+// resident chunks in the ring, the recycled slabs held on the freelist (still
+// resident RAM), and the ring, Fenwick directory, and repack scratch overhead.
+// It reads counts and capacities only, never a chunk's contents, so it preads
+// nothing and never walks the ring. Owner goroutine only.
+func (nt *native) residentBytes() uint64 {
+	total := nt.ring.n*chunkFootprint + len(nt.free)*chunkFootprint
+	total += cap(nt.ring.buf) * 8
+	total += cap(nt.dir.tree) * 8
+	total += cap(nt.scratch)
+	return uint64(total)
+}
+
 // --- slab allocation and recycling ---------------------------------------
 
 // getChunk returns a slab able to hold a frame of f bytes. A frame within the

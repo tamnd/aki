@@ -74,6 +74,29 @@ type list struct {
 	nat *native
 
 	everLarge bool
+
+	// acct is the footprint this list last posted into the registry's running
+	// resident-byte total (reg.note). It lets note post a delta instead of a fresh
+	// sum, so the total stays exact across a mutation without rewalking the
+	// registry. It is meaningful only when the store runs a cold tier; a store
+	// with no cold region never accounts and leaves it zero.
+	acct uint64
+}
+
+// residentBytes estimates the list's resident-byte footprint, the figure the
+// registry sums to weigh the shard's list heap against the resident cap (spec
+// 2064/f3/06 section 6). An inline listpack list is its packed blob's capacity; a
+// native list is its ring of chunk slabs plus the ring, directory, and scratch
+// overhead. A native chunk's blob is always allocated at the full chunk budget
+// regardless of fill, so counting a fixed budget per resident chunk is exact for
+// the common all-standard-chunk list and a small conservative estimate when a lone
+// oversized element takes a wider slab, the same estimate shape the set and zset
+// registries carry. Zero preads, O(1). Owner goroutine only.
+func (l *list) residentBytes() uint64 {
+	if l.nat != nil {
+		return l.nat.residentBytes()
+	}
+	return uint64(cap(l.blob))
 }
 
 // newList builds an empty inline list. The first push decides nothing about the

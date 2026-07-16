@@ -64,6 +64,8 @@ func blockpop(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 		elem := popOne(l, front)
 		if l.length() == 0 {
 			g.drop(key)
+		} else {
+			g.note(l)
 		}
 		out := appendReply(cx.Aux[:0], key, elem)
 		cx.Aux = out

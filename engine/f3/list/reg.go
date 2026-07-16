@@ -26,6 +26,19 @@ type reg struct {
 	// truncated back to empty at the end of every serveWaiters call, so its grown
 	// capacity is reused across chains without holding keys between drains.
 	ready []string
+
+	// resident is the running sum of every live list's resident-byte footprint
+	// (list.residentBytes), the figure the shard reads to weigh the list heap
+	// against the store's resident cap at a demote boundary (spec 2064/f3/06
+	// section 6). It is maintained by note and drop so the shard never walks the
+	// registry to size it. Maintained only when acctOn.
+	resident uint64
+	// acctOn gates the accounting: it is true only when the shard's store runs the
+	// cold tier (ColdConfigured). With no cold region to demote a list into, there
+	// is nothing to weigh, so note and drop skip the bookkeeping entirely and the
+	// push path stays byte-identical to M0, holding the L9 zero-delta contract for
+	// a store with no resident cap.
+	acctOn bool
 }
 
 var regs sync.Map // *store.Store -> *reg
@@ -40,6 +53,7 @@ func registry(cx *shard.Ctx) *reg {
 	v, _ := regs.LoadOrStore(cx.St, &reg{
 		m:       make(map[string]*list),
 		waiters: make(map[string]*waitList),
+		acctOn:  cx.St != nil && cx.St.ColdConfigured(),
 	})
 	return v.(*reg)
 }
@@ -59,9 +73,51 @@ func (g *reg) lookup(cx *shard.Ctx, key []byte) (l *list, wrong bool) {
 	return nil, false
 }
 
+// note reconciles l's footprint into the running resident total: it posts the
+// delta since the last note, so the total stays the exact sum of every live
+// list's footprint. A mutating command calls it before returning on any list that
+// survives the command (an emptied list goes through drop instead), which keeps
+// the total exact at every command boundary, the only point the shard reads it. It
+// is a single bool load when accounting is off. Owner goroutine only.
+func (g *reg) note(l *list) {
+	if !g.acctOn {
+		return
+	}
+	nb := l.residentBytes()
+	g.resident += nb - l.acct
+	l.acct = nb
+}
+
 // drop removes an emptied list from the registry: Redis deletes a list the
-// moment its last element leaves.
-func (g *reg) drop(key []byte) { delete(g.m, string(key)) }
+// moment its last element leaves. It takes the list's last-posted footprint back
+// out of the running total, so the total never carries a gone list's bytes.
+func (g *reg) drop(key []byte) {
+	if g.acctOn {
+		if l := g.m[string(key)]; l != nil {
+			g.resident -= l.acct
+		}
+	}
+	delete(g.m, string(key))
+}
+
+// ResidentBytes is the running sum of every live list's resident-byte footprint on
+// this shard, the collection contribution to the store's memory-pressure figure
+// (spec 2064/f3/06 section 6). It is zero when the store runs no cold tier. The
+// shard reads it at a demote boundary; the trigger that consumes it lands with the
+// list demotion slice. Owner goroutine only.
+func (g *reg) ResidentBytes() uint64 { return g.resident }
+
+// ResidentBytes exposes the shard's list-registry resident-byte total to the
+// worker's demote loop. The list registry hangs off the shared regs map keyed by
+// the shard's store, not a Ctx slot, so this reads that map without building a
+// registry on a shard that never ran a list command: it is zero before the first
+// list command, or when the store runs no cold tier. Owner goroutine only.
+func ResidentBytes(cx *shard.Ctx) uint64 {
+	if v, ok := regs.Load(cx.St); ok {
+		return v.(*reg).ResidentBytes()
+	}
+	return 0
+}
 
 // waitListFor returns the waiter FIFO for key, creating an empty one on first
 // block. It lazily initializes the map so a registry built directly in a unit
