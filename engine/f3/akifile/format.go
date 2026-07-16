@@ -102,6 +102,9 @@ var (
 	// ErrReadOnly is a write through a read-only device: an inspect tool opens the
 	// file for reading only, so any attempt to mutate it is a bug, not I/O.
 	ErrReadOnly = errors.New("akifile: read-only device")
+	// ErrSegStats is a seg-stats header that is malformed: an unknown full-or-delta
+	// kind, or a full table carrying a nonzero base offset.
+	ErrSegStats = errors.New("akifile: malformed seg-stats header")
 )
 
 var (
