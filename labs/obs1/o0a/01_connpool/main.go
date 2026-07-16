@@ -144,7 +144,7 @@ func run(arm, endpoint, user, pass string, conc, pool, ops, size int) {
 				if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 					fatal(err)
 				}
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				if resp.StatusCode != 200 {
 					fatal(fmt.Errorf("GET %s: http %d", url, resp.StatusCode))
 				}
@@ -188,7 +188,7 @@ func setupMinio(endpoint, bucket, key string, size int, creds credentials) {
 		if err != nil {
 			fatal(err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != 200 {
 			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 			fatal(fmt.Errorf("PUT %s: http %d %s", url, resp.StatusCode, msg))
