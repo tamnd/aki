@@ -1203,9 +1203,14 @@ func (h *Hash) HLen(ctx context.Context, key []byte) (int64, error) {
 }
 
 // Encoding is the OBJECT ENCODING answer for hash keys: listpack for
-// the inline tier, hashtable past it, doc 06 section 1's parity rule.
+// the inline tier, listpackex when the inline tier holds a field TTL,
+// hashtable past it, doc 06 section 1's parity rule. The listpackex
+// answer probes the live min rather than remembering a conversion, so
+// unlike Redis it reverts to listpack when the last TTL is persisted
+// away; the compat manifest records that corner as a standing
+// divergence.
 func (h *Hash) Encoding(ctx context.Context, key []byte) (string, bool, error) {
-	st, _, _, err := h.stateOf(ctx, key)
+	st, hi, _, err := h.stateOf(ctx, key)
 	if err != nil {
 		return "", false, err
 	}
@@ -1214,6 +1219,9 @@ func (h *Hash) Encoding(ctx context.Context, key []byte) (string, bool, error) {
 		return "", false, nil
 	case hashSegState:
 		return "hashtable", true, nil
+	}
+	if hi.minExpMs != 0 {
+		return "listpackex", true, nil
 	}
 	return "listpack", true, nil
 }

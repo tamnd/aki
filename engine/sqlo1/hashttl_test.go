@@ -674,7 +674,9 @@ func TestServerHashFieldTTLWire(t *testing.T) {
 	want(do("HPEXPIREAT", "h", fmt.Sprint(hfeMaxAbsTimeMs+1), "FIELDS", "1", "f"),
 		"-ERR invalid expire time in 'hpexpireat' command\r\n")
 	want(do("HEXPIRE", "h", "100", "BADCOND", "FIELDS", "1", "f"),
-		"-ERR Mandatory argument FIELDS is missing or not at the right position\r\n")
+		"-ERR unknown argument: BADCOND\r\n")
+	want(do("HEXPIRE", "h", "100", "NX", "NOTFIELDS", "1", "f"),
+		"-ERR unknown argument: NOTFIELDS\r\n")
 	want(do("HTTL", "h", "NOTFIELDS", "1", "f"),
 		"-ERR Mandatory argument FIELDS is missing or not at the right position\r\n")
 	want(do("HEXPIRE", "h", "100", "FIELDS", "0", "f"),
@@ -686,7 +688,7 @@ func TestServerHashFieldTTLWire(t *testing.T) {
 	want(do("HPERSIST", "h", "FIELDS", "x", "f"),
 		"-ERR Number of fields must be a positive integer\r\n")
 	want(do("HEXPIRE", "h", "100", "FIELDS", "2", "f1"),
-		"-ERR The `numfields` parameter must match the number of arguments\r\n")
+		"-ERR wrong number of arguments\r\n")
 	want(do("HTTL", "h", "FIELDS", "1", "f1", "f2"),
 		"-ERR The `numfields` parameter must match the number of arguments\r\n")
 }

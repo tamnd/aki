@@ -313,6 +313,201 @@ def main():
     c("PFDEBUG", "ENCODING", "h:a")
     c("TYPE", "h:a")
 
+    # ---------------------------------------------------------------
+    section("HASH")
+
+    # Point surface: create/update counts, misses, arity.
+    c("HSET", "hs:k", "f1", "v1")
+    c("HSET", "hs:k", "f1", "w", "f2", "v2")
+    c("HGET", "hs:k", "f1")
+    c("HGET", "hs:k", "nofield")
+    c("HGET", "hs:missing", "f")
+    c("HSET", "hs:k")
+    c("HSET", "hs:k", "f1")
+    c("HSETNX", "hs:k", "f1", "x")
+    c("HGET", "hs:k", "f1")
+    c("HSETNX", "hs:k", "f3", "v3")
+    c("HMSET", "hs:k", "f4", "v4", "f5", "v5")
+    c("HMGET", "hs:k", "f1", "f4", "nofield")
+    c("HMGET", "hs:missing", "a", "b")
+    c("HEXISTS", "hs:k", "f1")
+    c("HEXISTS", "hs:k", "nofield")
+    c("HEXISTS", "hs:missing", "f")
+    c("HSTRLEN", "hs:k", "f1")
+    c("HSTRLEN", "hs:k", "nofield")
+    c("HSTRLEN", "hs:missing", "f")
+    c("HLEN", "hs:k")
+    c("HLEN", "hs:missing")
+    c("HDEL", "hs:k", "f4", "f5", "nofield")
+    c("HLEN", "hs:k")
+    c("TYPE", "hs:k")
+    c("OBJECT", "ENCODING", "hs:k")
+
+    # Deleting the last field kills the key.
+    c("HSET", "hs:d", "a", "1", "b", "2")
+    c("HDEL", "hs:d", "a", "b")
+    c("HLEN", "hs:d")
+    c("TYPE", "hs:d")
+
+    # Empty field and value are legal.
+    c("HSET", "hs:e", "", "")
+    c("HGET", "hs:e", "")
+    c("HSTRLEN", "hs:e", "")
+    c("HDEL", "hs:e", "")
+
+    # Counters.
+    c("HSET", "hs:n", "cnt", "10")
+    c("HINCRBY", "hs:n", "cnt", "5")
+    c("HINCRBY", "hs:n", "cnt", "-20")
+    c("HINCRBY", "hs:n", "fresh", "3")
+    c("HINCRBY", "hs:newn", "f", "2")
+    c("HGET", "hs:newn", "f")
+    c("HSET", "hs:n", "txt", "abc")
+    c("HINCRBY", "hs:n", "txt", "1")
+    c("HINCRBY", "hs:n", "cnt", "notanum")
+    c("HSET", "hs:n", "big", "9223372036854775807")
+    c("HINCRBY", "hs:n", "big", "1")
+    c("HINCRBYFLOAT", "hs:n", "fl", "10.5")
+    c("HINCRBYFLOAT", "hs:n", "fl", "0.25")
+    c("HINCRBYFLOAT", "hs:n", "fl", "-0.75")
+    c("HINCRBYFLOAT", "hs:n", "fl", "5.0e3")
+    c("HINCRBYFLOAT", "hs:n", "txt", "1")
+    c("HINCRBYFLOAT", "hs:n", "fl", "notanum")
+
+    # Iteration order on the listpack tier: insertion order, updates
+    # keep position, re-adds append.
+    c("HSET", "hs:it", "a", "1", "b", "2", "c", "3")
+    c("HGETALL", "hs:it")
+    c("HKEYS", "hs:it")
+    c("HVALS", "hs:it")
+    c("HGETALL", "hs:missing")
+    c("HKEYS", "hs:missing")
+    c("HVALS", "hs:missing")
+    c("HSET", "hs:it", "a", "9")
+    c("HGETALL", "hs:it")
+    c("HDEL", "hs:it", "b")
+    c("HGETALL", "hs:it")
+    c("HSET", "hs:it", "b", "5")
+    c("HGETALL", "hs:it")
+
+    # HRANDFIELD, deterministic rows only: misses, count 0, and a
+    # one-field hash where every draw is forced.
+    c("HRANDFIELD", "hs:missing")
+    c("HRANDFIELD", "hs:missing", "3")
+    c("HSET", "hs:one", "solo", "val")
+    c("HRANDFIELD", "hs:one")
+    c("HRANDFIELD", "hs:one", "5")
+    c("HRANDFIELD", "hs:one", "-3")
+    c("HRANDFIELD", "hs:one", "2", "WITHVALUES")
+    c("HRANDFIELD", "hs:one", "0")
+
+    # HSCAN on the listpack tier answers any cursor with everything.
+    c("HSCAN", "hs:it", "0")
+    c("HSCAN", "hs:it", "0", "NOVALUES")
+    c("HSCAN", "hs:it", "0", "MATCH", "a*")
+    c("HSCAN", "hs:it", "0", "COUNT", "100")
+    c("HSCAN", "hs:it", "42")
+    c("HSCAN", "hs:missing", "0")
+
+    # A big hash crosses the encoding boundary through the value-size
+    # wall, which both sides share in spirit: values over 64 B kick
+    # redis to hashtable, and 30 of them blow sqlo1's 2 KiB inline
+    # byte cap. The count threshold is deliberately not asserted here;
+    # sqlo1 segments at 129 fields while redis 8.8's default listpack
+    # cap is 512, a documented standing divergence (see README).
+    big = ["HSET", "hs:big"]
+    for i in range(30):
+        big += ["f%03d" % i, ("v%03d" % i) + "x" * 97]
+    c(*big)
+    c("OBJECT", "ENCODING", "hs:big")
+    c("HLEN", "hs:big")
+    c("HGET", "hs:big", "f010")
+
+    # HGETEX and HGETDEL. Absolute stamps keep the replies
+    # deterministic; the relative HTTL readback rounds to seconds.
+    c("HSET", "hs:x", "a", "va", "b", "vb")
+    c("HGETEX", "hs:x", "FIELDS", "2", "a", "nofield")
+    c("HGETEX", "hs:x", "PXAT", "9999999999000", "FIELDS", "1", "a")
+    c("HPEXPIRETIME", "hs:x", "FIELDS", "2", "a", "b")
+    c("HGETEX", "hs:x", "PERSIST", "FIELDS", "1", "a")
+    c("HTTL", "hs:x", "FIELDS", "1", "a")
+    c("HGETEX", "hs:x", "EX", "100", "FIELDS", "1", "a")
+    c("HTTL", "hs:x", "FIELDS", "1", "a")
+    c("HGETEX", "hs:x", "EX", "notanum", "FIELDS", "1", "a")
+    c("HGETDEL", "hs:x", "FIELDS", "2", "b", "nofield")
+    c("HEXISTS", "hs:x", "b")
+    c("HGETDEL", "hs:x", "FIELDS", "1", "a")
+    c("TYPE", "hs:x")
+
+    # The HEXPIRE family. Missing key, missing field, the condition
+    # table over absolute stamps, past-time deletes, key death.
+    c("HSET", "hs:t", "f1", "v1", "f2", "v2")
+    c("HEXPIRE", "hs:missing", "100", "FIELDS", "1", "f")
+    c("HTTL", "hs:missing", "FIELDS", "1", "f")
+    c("HPERSIST", "hs:missing", "FIELDS", "1", "f")
+    c("HEXPIRE", "hs:t", "100", "FIELDS", "2", "f1", "nofield")
+    c("HTTL", "hs:t", "FIELDS", "3", "f1", "f2", "nofield")
+    c("HPTTL", "hs:t", "FIELDS", "2", "f2", "nofield")
+    c("OBJECT", "ENCODING", "hs:t")
+    c("HPERSIST", "hs:t", "FIELDS", "2", "f1", "f2")
+    c("HEXPIREAT", "hs:t", "9999999999", "FIELDS", "1", "f1")
+    c("HEXPIRETIME", "hs:t", "FIELDS", "2", "f1", "f2")
+    c("HPEXPIREAT", "hs:t", "9999999999000", "FIELDS", "1", "f1")
+    c("HPEXPIRETIME", "hs:t", "FIELDS", "1", "f1")
+    c("HEXPIRE", "hs:t", "100", "NX", "FIELDS", "2", "f1", "f2")
+    c("HPERSIST", "hs:t", "FIELDS", "1", "f2")
+    c("HPEXPIREAT", "hs:t", "9999999999500", "XX", "FIELDS", "2", "f1", "f2")
+    c("HPEXPIREAT", "hs:t", "9999999999000", "GT", "FIELDS", "1", "f1")
+    c("HPEXPIREAT", "hs:t", "9999999999500", "GT", "FIELDS", "1", "f1")
+    c("HPEXPIREAT", "hs:t", "9999999999900", "GT", "FIELDS", "1", "f1")
+    c("HPEXPIREAT", "hs:t", "9999999999900", "LT", "FIELDS", "1", "f1")
+    c("HPEXPIREAT", "hs:t", "9999999999000", "LT", "FIELDS", "1", "f1")
+    c("HEXPIRE", "hs:t", "100", "GT", "FIELDS", "1", "f2")
+    c("HEXPIRE", "hs:t", "100", "LT", "FIELDS", "1", "f2")
+    c("HPEXPIREAT", "hs:t", "1", "FIELDS", "1", "f2")
+    c("HEXISTS", "hs:t", "f2")
+    c("HEXPIRE", "hs:t", "0", "FIELDS", "1", "f1")
+    c("TYPE", "hs:t")
+
+    # A TTL on the hashtable tier.
+    c("HEXPIRE", "hs:big", "100", "FIELDS", "1", "f000")
+    c("HTTL", "hs:big", "FIELDS", "1", "f000")
+    c("OBJECT", "ENCODING", "hs:big")
+
+    # The grammar's error table.
+    c("HSET", "hs:err", "f", "v")
+    c("HEXPIRE", "hs:err", "100")
+    c("HEXPIRE", "hs:err", "100", "FIELDS", "1")
+    c("HTTL", "hs:err", "FIELDS", "1")
+    c("HPERSIST", "hs:err", "FIELDS", "1")
+    c("HEXPIRE", "hs:err", "notanum", "FIELDS", "1", "f")
+    c("HEXPIRE", "hs:err", "-1", "FIELDS", "1", "f")
+    c("HEXPIRE", "hs:err", "70368744177664", "FIELDS", "1", "f")
+    c("HPEXPIREAT", "hs:err", "70368744177664", "FIELDS", "1", "f")
+    c("HEXPIRE", "hs:err", "100", "BADCOND", "FIELDS", "1", "f")
+    c("HEXPIRE", "hs:err", "100", "NX", "NOTFIELDS", "1", "f")
+    c("HTTL", "hs:err", "NOTFIELDS", "1", "f")
+    c("HEXPIRE", "hs:err", "100", "FIELDS", "0", "f")
+    c("HEXPIRE", "hs:err", "100", "FIELDS", "x", "f")
+    c("HTTL", "hs:err", "FIELDS", "0", "f")
+    c("HPERSIST", "hs:err", "FIELDS", "x", "f")
+    c("HEXPIRE", "hs:err", "100", "FIELDS", "2", "f")
+    c("HTTL", "hs:err", "FIELDS", "1", "f", "g")
+
+    # Type walls both ways.
+    c("SET", "hs:str", "v")
+    c("HGET", "hs:str", "f")
+    c("HSET", "hs:str", "f", "v")
+    c("HDEL", "hs:str", "f")
+    c("HGETALL", "hs:str")
+    c("HRANDFIELD", "hs:str")
+    c("HSCAN", "hs:str", "0")
+    c("HEXPIRE", "hs:str", "100", "FIELDS", "1", "f")
+    c("HTTL", "hs:str", "FIELDS", "1", "f")
+    c("HGETEX", "hs:str", "FIELDS", "1", "f")
+    c("HGETDEL", "hs:str", "FIELDS", "1", "f")
+    c("GET", "hs:k")
+
     print("\n".join(lines))
 
 
