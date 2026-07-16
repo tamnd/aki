@@ -104,14 +104,14 @@ func (r *setRig) encoding(key string) string {
 // loudly.
 func TestSetEntryCodec(t *testing.T) {
 	var region []byte
-	region = appendHashEntry(region, []byte("alpha"), nil, 0, true)
-	region = appendHashEntry(region, []byte(""), nil, 0, true)
-	region = appendHashEntry(region, []byte("42"), nil, 0, true)
+	region = appendHashEntry(region, []byte("alpha"), nil, 0, encSet)
+	region = appendHashEntry(region, []byte(""), nil, 0, encSet)
+	region = appendHashEntry(region, []byte("42"), nil, 0, encSet)
 	if want := 3*setEntryHdrLen + 5 + 0 + 2; len(region) != want {
 		t.Fatalf("encoded region is %d bytes, want %d", len(region), want)
 	}
 
-	it := hashEntryIter{p: region, valless: true}
+	it := hashEntryIter{p: region, enc: encSet}
 	for _, want := range []string{"alpha", "", "42"} {
 		f, v, exp, ok, err := it.next()
 		if err != nil || !ok {
@@ -127,13 +127,13 @@ func TestSetEntryCodec(t *testing.T) {
 
 	bad := append([]byte{}, region...)
 	bad[0] = 0x01
-	it = hashEntryIter{p: bad, valless: true}
+	it = hashEntryIter{p: bad, enc: encSet}
 	if _, _, _, _, err := it.next(); err == nil {
 		t.Fatal("reserved eflags bits decoded without error")
 	}
 
 	short := region[:len(region)-1]
-	it = hashEntryIter{p: short, valless: true}
+	it = hashEntryIter{p: short, enc: encSet}
 	var err error
 	for err == nil {
 		var ok bool
@@ -143,8 +143,8 @@ func TestSetEntryCodec(t *testing.T) {
 		}
 	}
 
-	if got := hashEntrySize(5, 0, 0, true); got != setEntryHdrLen+5 {
-		t.Fatalf("hashEntrySize valless = %d, want %d", got, setEntryHdrLen+5)
+	if got := hashEntrySize(5, 0, 0, encSet); got != setEntryHdrLen+5 {
+		t.Fatalf("hashEntrySize encSet = %d, want %d", got, setEntryHdrLen+5)
 	}
 }
 
@@ -381,7 +381,7 @@ func TestSetReconcileAcceptance(t *testing.T) {
 	// A valueless segment payload feeds SegCounts through the same
 	// 12-byte header.
 	entries := []hashSegEntry{{fh: 1, field: []byte("a")}, {fh: 2, field: []byte("b")}}
-	seg := appendHashSegPayload(nil, entries, true)
+	seg := appendHashSegPayload(nil, entries, encSet)
 	n, minExp, ok := SegCounts(seg)
 	if !ok || n != 2 || minExp != 0 {
 		t.Fatalf("SegCounts(set seg) = (%d, %d, %v), want (2, 0, true)", n, minExp, ok)

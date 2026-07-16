@@ -62,6 +62,30 @@ const (
 
 	// setSubInline is the inline set root.
 	setSubInline = inlineSubBase | TagSet
+
+	// zsetSubSeg is the segmented zset root layout: doc 09's member
+	// side rides the doc 06 machinery with the entry value fixed at
+	// the 8-byte sortable score, under the type tag slot like the set.
+	zsetSubSeg = TagZset
+
+	// zsetSubInline is the inline zset root.
+	zsetSubInline = inlineSubBase | TagZset
+)
+
+// hashEnc selects the entry codec of a segment family, the second
+// axis of the ladder's type parameterization beside the tag and subs:
+// the doc 06 hash entry (variable value, optional field TTL), the doc
+// 08 set entry (no value slot, no TTL), or the doc 09 zset member
+// entry (the set header and member followed by the fixed 8-byte
+// sortable score, no TTL). The two valueless-header codecs share
+// every byte except the score trailer, so the set machinery carries
+// the member side wholesale.
+type hashEnc uint8
+
+const (
+	encHash hashEnc = iota
+	encSet
+	encZMem
 )
 
 // The inline ladder rung's thresholds, doc 06 section 1: a hash stays
@@ -103,6 +127,12 @@ const (
 	hashEntryHdrLen  = 7
 	setEntryHdrLen   = 3
 
+	// zmemScoreLen is the zset member entry's fixed value: the 8-byte
+	// big-endian sortable score image (zscore.go), the same bytes the
+	// score runs fence on, so a score crosses the two families of doc
+	// 09 without re-encoding.
+	zmemScoreLen = 8
+
 	hflagAnyTTL = 1 << 1
 	hflagAllInt = 1 << 2
 	eflagHasTTL = 1 << 0
@@ -123,6 +153,8 @@ func sniffRoot(v []byte) (tag uint8, planeless bool, err error) {
 		return TagHash, false, nil
 	case sub == setSubSeg:
 		return TagSet, false, nil
+	case sub == zsetSubSeg:
+		return TagZset, false, nil
 	case sub&0xF0 == inlineSubBase:
 		t := sub & 0x0F
 		if t >= TagString && t <= TagStream {
@@ -133,18 +165,21 @@ func sniffRoot(v []byte) (tag uint8, planeless bool, err error) {
 }
 
 // appendHashEntry encodes one field entry onto dst; expMs 0 means no
-// field TTL. valless takes the doc 08 set encoding: no vlen slot, and
+// field TTL. encSet takes the doc 08 set encoding: no vlen slot, and
 // val and expMs must be absent (sets have no per-member payload or
-// TTL, and the callers are structured so they never pass one). The
-// caller has already bounded flen and vlen (the inline size guard does
-// it structurally: an oversized field cannot fit the inline payload,
-// and the segment slice owns its own guard).
-func appendHashEntry(dst []byte, field, val []byte, expMs int64, valless bool) []byte {
-	if valless {
+// TTL, and the callers are structured so they never pass one). encZMem
+// is the same header with val the fixed zmemScoreLen score after the
+// member, expMs likewise absent. The caller has already bounded flen
+// and vlen (the inline size guard does it structurally: an oversized
+// field cannot fit the inline payload, and the segment slice owns its
+// own guard).
+func appendHashEntry(dst []byte, field, val []byte, expMs int64, enc hashEnc) []byte {
+	if enc != encHash {
 		var h [setEntryHdrLen]byte
 		binary.LittleEndian.PutUint16(h[1:], uint16(len(field)))
 		dst = append(dst, h[:]...)
-		return append(dst, field...)
+		dst = append(dst, field...)
+		return append(dst, val...)
 	}
 	var eflags uint8
 	if expMs != 0 {
@@ -166,10 +201,13 @@ func appendHashEntry(dst []byte, field, val []byte, expMs int64, valless bool) [
 }
 
 // hashEntrySize is the encoded size appendHashEntry produces, for the
-// packers that budget a segment before encoding it.
-func hashEntrySize(flen, vlen int, expMs int64, valless bool) int {
-	if valless {
-		return setEntryHdrLen + flen
+// packers that budget a segment before encoding it. The valueless
+// codecs share one arithmetic because their vlen is structural: 0 for
+// encSet, zmemScoreLen for encZMem, and the caller passes the length
+// of the value it holds either way.
+func hashEntrySize(flen, vlen int, expMs int64, enc hashEnc) int {
+	if enc != encHash {
+		return setEntryHdrLen + flen + vlen
 	}
 	n := hashEntryHdrLen + flen + vlen
 	if expMs != 0 {
@@ -178,19 +216,21 @@ func hashEntrySize(flen, vlen int, expMs int64, valless bool) int {
 	return n
 }
 
-// hashEntryIter walks an encoded entry region; valless walks the set
-// encoding (val always nil, expMs always 0). next returns aliases
-// into the region; the caller owns their lifetime.
+// hashEntryIter walks an encoded entry region; encSet walks the set
+// encoding (val always nil, expMs always 0), encZMem the member
+// encoding (val always the zmemScoreLen score bytes, expMs always 0).
+// next returns aliases into the region; the caller owns their
+// lifetime.
 type hashEntryIter struct {
-	p       []byte
-	valless bool
+	p   []byte
+	enc hashEnc
 }
 
 func (it *hashEntryIter) next() (field, val []byte, expMs int64, ok bool, err error) {
 	if len(it.p) == 0 {
 		return nil, nil, 0, false, nil
 	}
-	if it.valless {
+	if it.enc != encHash {
 		if len(it.p) < setEntryHdrLen {
 			return nil, nil, 0, false, fmt.Errorf("sqlo1: set entry header short: %d bytes", len(it.p))
 		}
@@ -199,12 +239,18 @@ func (it *hashEntryIter) next() (field, val []byte, expMs int64, ok bool, err er
 		}
 		mlen := int(binary.LittleEndian.Uint16(it.p[1:]))
 		n := setEntryHdrLen + mlen
+		if it.enc == encZMem {
+			n += zmemScoreLen
+		}
 		if len(it.p) < n {
 			return nil, nil, 0, false, fmt.Errorf("sqlo1: set entry of %d bytes overruns its region (%d left)", n, len(it.p))
 		}
-		field = it.p[setEntryHdrLen:n]
+		field = it.p[setEntryHdrLen : setEntryHdrLen+mlen]
+		if it.enc == encZMem {
+			val = it.p[setEntryHdrLen+mlen : n]
+		}
 		it.p = it.p[n:]
-		return field, nil, 0, true, nil
+		return field, val, 0, true, nil
 	}
 	if len(it.p) < hashEntryHdrLen {
 		return nil, nil, 0, false, fmt.Errorf("sqlo1: hash entry header short: %d bytes", len(it.p))
@@ -272,10 +318,11 @@ func appendHashInlineHdr(dst []byte, sub uint8, count int, minExpMs int64, allIn
 // of the given sub: the entry walk checks every header, and the entry
 // count and region must agree exactly, so corruption fails at the root
 // read instead of as a wrong scan later. The walk is O(payload), which
-// the inline cap bounds at 2 KiB. valless picks the set entry codec
+// the inline cap bounds at 2 KiB. encSet picks the set entry codec
 // and admits the all-integer flag; a hash payload carrying it is
-// corruption, as is a set payload carrying a TTL.
-func decodeHashInline(p []byte, sub uint8, valless bool) (hashInline, error) {
+// corruption, as is a set payload carrying a TTL. encZMem admits no
+// flags at all: no TTLs, and the intset bit is a set-only answer.
+func decodeHashInline(p []byte, sub uint8, enc hashEnc) (hashInline, error) {
 	if len(p) < hashInlineHdrLen {
 		return hashInline{}, fmt.Errorf("sqlo1: inline root of %d bytes, header needs %d", len(p), hashInlineHdrLen)
 	}
@@ -283,8 +330,11 @@ func decodeHashInline(p []byte, sub uint8, valless bool) (hashInline, error) {
 		return hashInline{}, fmt.Errorf("sqlo1: root sub %d is not the inline sub %d", p[0], sub)
 	}
 	legal := uint8(hflagAnyTTL)
-	if valless {
+	switch enc {
+	case encSet:
 		legal = hflagAllInt
+	case encZMem:
+		legal = 0
 	}
 	if p[1]&^legal != 0 {
 		return hashInline{}, fmt.Errorf("sqlo1: inline root flags %#x has reserved bits set", p[1])
@@ -304,7 +354,7 @@ func decodeHashInline(p []byte, sub uint8, valless bool) (hashInline, error) {
 	if len(p) > hashInlineMax {
 		return hashInline{}, fmt.Errorf("sqlo1: inline root payload of %d bytes exceeds %d", len(p), hashInlineMax)
 	}
-	it := hashEntryIter{p: h.entries, valless: valless}
+	it := hashEntryIter{p: h.entries, enc: enc}
 	seen := 0
 	minExp := int64(0)
 	for {
@@ -354,7 +404,7 @@ type Hash struct {
 	tag       uint8
 	subSeg    uint8
 	subInline uint8
-	valless   bool
+	enc       hashEnc
 
 	// The current mint lease: counters [leaseNext, leaseEnd) are ours.
 	leaseNext uint64
@@ -380,8 +430,11 @@ type Hash struct {
 
 	// segRoot is the decoded root stateOf leaves behind at
 	// hashSegState; its fence rides the fence scratch. Valid until
-	// the next stateOf.
+	// the next stateOf. tailBuf holds the copied-out zset tail so the
+	// decoded root survives the segment reads that recycle the arena
+	// bytes the decode aliased.
 	segRoot hashSegRoot
+	tailBuf []byte
 
 	// valBuf carries a point op's value copy across the mutation that
 	// would recycle the arena bytes it read (HGETDEL, HGETEX, the
@@ -520,9 +573,13 @@ func (h *Hash) stateOf(ctx context.Context, key []byte) (hashState, hashInline, 
 		}
 		h.fence = h.segRoot.fence
 		h.pidx = h.segRoot.pidx
+		if len(h.segRoot.tail) > 0 {
+			h.tailBuf = append(h.tailBuf[:0], h.segRoot.tail...)
+			h.segRoot.tail = h.tailBuf
+		}
 		return hashSegState, hashInline{}, expMs, nil
 	}
-	hi, err := decodeHashInline(v, h.subInline, h.valless)
+	hi, err := decodeHashInline(v, h.subInline, h.enc)
 	if err != nil {
 		return hashAbsent, hashInline{}, 0, err
 	}
@@ -541,7 +598,7 @@ func (h *Hash) readSeg(ctx context.Context, segid uint64) (hashSeg, error) {
 	if !ok {
 		return hashSeg{}, fmt.Errorf("sqlo1: hash segment %d of rooth %#x is missing", segid, h.segRoot.rooth)
 	}
-	return decodeHashSeg(v, h.valless)
+	return decodeHashSeg(v, h.enc)
 }
 
 // writeSeg writes a segment image under the current root's plane.
@@ -669,9 +726,9 @@ func (h *Hash) hset(ctx context.Context, key, field, val []byte, entryExp int64)
 		}
 		return created, err
 	case hashAbsent:
-		allInt := h.valless && isCanonicalInt(field)
+		allInt := h.enc == encSet && isCanonicalInt(field)
 		h.rootBuf = appendHashInlineHdr(h.rootBuf[:0], h.subInline, 1, entryExp, allInt)
-		h.rootBuf = appendHashEntry(h.rootBuf, field, val, entryExp, h.valless)
+		h.rootBuf = appendHashEntry(h.rootBuf, field, val, entryExp, h.enc)
 		if len(h.rootBuf) > hashInlineMax {
 			created, err := h.upgrade(ctx, key, h.rootBuf[hashInlineHdrLen:], true, expMs)
 			if err == nil {
@@ -691,7 +748,7 @@ func (h *Hash) hset(ctx context.Context, key, field, val []byte, entryExp int64)
 	// The header slot is filled last, when count and min_expire are
 	// known.
 	h.rootBuf = grow(h.rootBuf, hashInlineHdrLen)
-	it := hashEntryIter{p: hi.entries, valless: h.valless}
+	it := hashEntryIter{p: hi.entries, enc: h.enc}
 	now := h.t.Now()
 	created := true
 	revived := false
@@ -706,7 +763,7 @@ func (h *Hash) hset(ctx context.Context, key, field, val []byte, entryExp int64)
 			break
 		}
 		if bytes.Equal(f, field) {
-			h.rootBuf = appendHashEntry(h.rootBuf, field, val, entryExp, h.valless)
+			h.rootBuf = appendHashEntry(h.rootBuf, field, val, entryExp, h.enc)
 			created = false
 			revived = eExp != 0 && eExp <= now
 			continue
@@ -721,7 +778,7 @@ func (h *Hash) hset(ctx context.Context, key, field, val []byte, entryExp int64)
 	}
 	count := hi.count
 	if created {
-		h.rootBuf = appendHashEntry(h.rootBuf, field, val, entryExp, h.valless)
+		h.rootBuf = appendHashEntry(h.rootBuf, field, val, entryExp, h.enc)
 		count++
 	}
 	if count > hashInlineMaxCount || len(h.rootBuf) > hashInlineMax {
@@ -752,7 +809,7 @@ func (h *Hash) hset(ctx context.Context, key, field, val []byte, entryExp int64)
 // root over a plane nothing references yet, the setRope rule.
 func (h *Hash) upgrade(ctx context.Context, key []byte, region []byte, created bool, expMs int64) (bool, error) {
 	var err error
-	h.ents, err = parseHashSegEntries(h.ents[:0], region, h.valless)
+	h.ents, err = parseHashSegEntries(h.ents[:0], region, h.enc)
 	if err != nil {
 		return false, err
 	}
@@ -773,7 +830,7 @@ func (h *Hash) upgrade(ctx context.Context, key []byte, region []byte, created b
 	size := hashSegHdrLen
 	start := 0
 	for i, e := range h.ents {
-		es := hashEntrySize(len(e.field), len(e.val), e.expMs, h.valless)
+		es := hashEntrySize(len(e.field), len(e.val), e.expMs, h.enc)
 		if i > start && size+es > hashSegMax && e.fh != h.ents[i-1].fh {
 			cuts = append(cuts, i)
 			start = i
@@ -788,7 +845,7 @@ func (h *Hash) upgrade(ctx context.Context, key []byte, region []byte, created b
 	start = 0
 	for _, end := range cuts {
 		seg := h.ents[start:end]
-		h.segBuf = appendHashSegPayload(h.segBuf, seg, h.valless)
+		h.segBuf = appendHashSegPayload(h.segBuf, seg, h.enc)
 		if err := h.writeSeg(ctx, h.segRoot.nextSegid, h.segBuf); err != nil {
 			return false, err
 		}
@@ -850,7 +907,7 @@ func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs, entry
 		r.minExpMs = segMin
 	}
 	if len(out) > hashSegMax {
-		h.ents, err = parseHashSegEntries(h.ents[:0], out[hashSegHdrLen:], h.valless)
+		h.ents, err = parseHashSegEntries(h.ents[:0], out[hashSegHdrLen:], h.enc)
 		if err != nil {
 			return false, err
 		}
@@ -957,7 +1014,7 @@ func (h *Hash) splitSeg(ctx context.Context, key []byte, i, mid int, boundary ui
 	}
 
 	newSegid := r.nextSegid
-	h.segBuf2 = appendHashSegPayload(h.segBuf2, h.ents[mid:], h.valless)
+	h.segBuf2 = appendHashSegPayload(h.segBuf2, h.ents[mid:], h.enc)
 	if err := h.writeSeg(ctx, newSegid, h.segBuf2); err != nil {
 		return false, err
 	}
@@ -1035,7 +1092,7 @@ func (h *Hash) splitSeg(ctx context.Context, key []byte, i, mid int, boundary ui
 		}
 	}
 
-	h.segBuf2 = appendHashSegPayload(h.segBuf2[:0], h.ents[:mid], h.valless)
+	h.segBuf2 = appendHashSegPayload(h.segBuf2[:0], h.ents[:mid], h.enc)
 	if err := h.writeSeg(ctx, survivor, h.segBuf2); err != nil {
 		return false, err
 	}
@@ -1135,7 +1192,7 @@ func (h *Hash) tryMergeSeg(ctx context.Context, key []byte, i int, out []byte) (
 		if other == lo {
 			lop, hip = nb, out
 		}
-		h.segBuf2, err = mergeHashSegs(h.segBuf2, lop, hip, h.valless)
+		h.segBuf2, err = mergeHashSegs(h.segBuf2, lop, hip, h.enc)
 		if err != nil {
 			return false, err
 		}
@@ -1212,7 +1269,7 @@ func (h *Hash) getEntryRaw(ctx context.Context, key, field []byte) ([]byte, int6
 		}
 		return hashSegGet(s, f, field)
 	}
-	it := hashEntryIter{p: hi.entries, valless: h.valless}
+	it := hashEntryIter{p: hi.entries, enc: h.enc}
 	for {
 		f, v, eExp, ok, err := it.next()
 		if err != nil || !ok {
@@ -1240,7 +1297,7 @@ func (h *Hash) HDel(ctx context.Context, key, field []byte) (bool, error) {
 		return h.hdelSeg(ctx, key, field, expMs)
 	}
 	h.rootBuf = grow(h.rootBuf, hashInlineHdrLen)
-	it := hashEntryIter{p: hi.entries, valless: h.valless}
+	it := hashEntryIter{p: hi.entries, enc: h.enc}
 	now := h.t.Now()
 	found := false
 	minExp := int64(0)

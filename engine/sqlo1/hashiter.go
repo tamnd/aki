@@ -37,7 +37,7 @@ func (h *Hash) HIterate(ctx context.Context, key []byte, begin func(count int), 
 		return nil
 	case hashInlineState:
 		begin(hi.count)
-		it := hashEntryIter{p: hi.entries, valless: h.valless}
+		it := hashEntryIter{p: hi.entries, enc: h.enc}
 		for {
 			f, v, _, ok, err := it.next()
 			if err != nil {
@@ -100,11 +100,11 @@ func (h *Hash) iterSegEntries(ctx context.Context, emit func(field, val []byte))
 				if h.mgVals[j] == nil {
 					return emitted, fmt.Errorf("sqlo1: hash segment %d of rooth %#x is missing", r.fence[base+j].segid, r.rooth)
 				}
-				seg, err := decodeHashSeg(h.mgVals[j], h.valless)
+				seg, err := decodeHashSeg(h.mgVals[j], h.enc)
 				if err != nil {
 					return emitted, err
 				}
-				it := hashEntryIter{p: seg.entries, valless: seg.valless}
+				it := hashEntryIter{p: seg.entries, enc: seg.enc}
 				for {
 					f, v, _, ok, err := it.next()
 					if err != nil {
@@ -146,7 +146,7 @@ func (h *Hash) HScan(ctx context.Context, key []byte, cursor uint64, count int64
 	case hashAbsent:
 		return 0, nil
 	case hashInlineState:
-		it := hashEntryIter{p: hi.entries, valless: h.valless}
+		it := hashEntryIter{p: hi.entries, enc: h.enc}
 		for {
 			f, v, eExp, ok, err := it.next()
 			if err != nil {
@@ -188,7 +188,7 @@ func (h *Hash) HScan(ctx context.Context, key []byte, cursor uint64, count int64
 			if err != nil {
 				return 0, err
 			}
-			it := hashEntryIter{p: seg.entries, valless: seg.valless}
+			it := hashEntryIter{p: seg.entries, enc: seg.enc}
 			for {
 				f, v, eExp, ok, err := it.next()
 				if err != nil {

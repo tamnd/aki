@@ -132,6 +132,13 @@ type hashSegRoot struct {
 	paged     bool
 	pidx      []hashPageEnt
 	pi        int
+
+	// tail is the bytes past the member-side fence area, legal only
+	// on a zset root: doc 09 hangs the score-run fence there, opaque
+	// to the member-side machinery, which decodes it out and writes it
+	// back untouched. On decode it aliases the payload (stateOf copies
+	// it out before the next read); hash and set roots reject a tail.
+	tail []byte
 }
 
 // appendHashSegRoot encodes r onto dst[:0]. A paged root writes the
@@ -162,7 +169,7 @@ func appendHashSegRoot(dst []byte, r *hashSegRoot) []byte {
 			binary.LittleEndian.PutUint64(b[8:], e.pageid|uint64(e.weight)<<48)
 			out = append(out, b[:]...)
 		}
-		return out
+		return append(out, r.tail...)
 	}
 	binary.LittleEndian.PutUint32(out[40:], uint32(len(r.fence)))
 	for _, e := range r.fence {
@@ -171,7 +178,7 @@ func appendHashSegRoot(dst []byte, r *hashSegRoot) []byte {
 		binary.LittleEndian.PutUint64(b[8:], e.segid|uint64(e.meta)<<48)
 		out = append(out, b[:]...)
 	}
-	return out
+	return append(out, r.tail...)
 }
 
 // decodeHashSegRoot parses and validates a segmented root payload,
@@ -183,8 +190,8 @@ func decodeHashSegRoot(p []byte, fence []hashFenceEnt, pidx []hashPageEnt) (hash
 	if len(p) < hashSegRootHdrLen {
 		return hashSegRoot{}, fmt.Errorf("sqlo1: segmented hash root of %d bytes, header needs %d", len(p), hashSegRootHdrLen)
 	}
-	if p[0] != hashSubSeg && p[0] != setSubSeg {
-		return hashSegRoot{}, fmt.Errorf("sqlo1: root sub %d is not a segmented hash or set", p[0])
+	if p[0] != hashSubSeg && p[0] != setSubSeg && p[0] != zsetSubSeg {
+		return hashSegRoot{}, fmt.Errorf("sqlo1: root sub %d is not a segmented hash, set, or zset", p[0])
 	}
 	if p[1]&^uint8(hflagAnyTTL|hflagFencePaged) != 0 {
 		return hashSegRoot{}, fmt.Errorf("sqlo1: segmented hash flags %#x has reserved bits set", p[1])
@@ -216,7 +223,13 @@ func decodeHashSegRoot(p []byte, fence []hashFenceEnt, pidx []hashPageEnt) (hash
 		if segCount == 0 || segCount > hashFencePageIdxMax {
 			return hashSegRoot{}, fmt.Errorf("sqlo1: paged hash index of %d entries outside [1, %d]", segCount, hashFencePageIdxMax)
 		}
-		if want := hashSegRootHdrLen + segCount*hashFenceEntLen; len(p) != want {
+		want := hashSegRootHdrLen + segCount*hashFenceEntLen
+		if r.sub == zsetSubSeg {
+			if len(p) < want {
+				return hashSegRoot{}, fmt.Errorf("sqlo1: paged zset root of %d bytes, %d index entries need %d", len(p), segCount, want)
+			}
+			r.tail = p[want:]
+		} else if len(p) != want {
 			return hashSegRoot{}, fmt.Errorf("sqlo1: paged hash root of %d bytes, %d index entries need %d", len(p), segCount, want)
 		}
 		pidx = pidx[:0]
@@ -251,7 +264,13 @@ func decodeHashSegRoot(p []byte, fence []hashFenceEnt, pidx []hashPageEnt) (hash
 	if segCount == 0 || segCount > hashFenceMaxSegs {
 		return hashSegRoot{}, fmt.Errorf("sqlo1: segmented hash fence of %d entries outside [1, %d]", segCount, hashFenceMaxSegs)
 	}
-	if want := hashSegRootHdrLen + segCount*hashFenceEntLen; len(p) != want {
+	want := hashSegRootHdrLen + segCount*hashFenceEntLen
+	if r.sub == zsetSubSeg {
+		if len(p) < want {
+			return hashSegRoot{}, fmt.Errorf("sqlo1: segmented zset root of %d bytes, %d fence entries need %d", len(p), segCount, want)
+		}
+		r.tail = p[want:]
+	} else if len(p) != want {
 		return hashSegRoot{}, fmt.Errorf("sqlo1: segmented hash root of %d bytes, %d fence entries need %d", len(p), segCount, want)
 	}
 	fence = fence[:0]

@@ -59,7 +59,7 @@ func (s *Set) algHash(i int) (*Hash, error) {
 			return nil, err
 		}
 		h.tag, h.subSeg, h.subInline = TagSet, setSubSeg, setSubInline
-		h.valless = true
+		h.enc = encSet
 		s.alg = append(s.alg, h)
 	}
 	return s.alg[i], nil
@@ -99,7 +99,7 @@ func (s *Set) loadSrcs(ctx context.Context, keys [][]byte, stopOnAbsent bool) ([
 			// aliases already handed out; the entry region bounds the
 			// member bytes.
 			sc.inArena = grow(sc.inArena, len(hi.entries))[:0]
-			it := hashEntryIter{p: hi.entries, valless: true}
+			it := hashEntryIter{p: hi.entries, enc: encSet}
 			for {
 				m, _, _, ok, err := it.next()
 				if err != nil {
@@ -303,11 +303,11 @@ func (s *Set) algWalk(ctx context.Context, d *algSrc, rest []*algSrc, keepHits b
 			s.winMem = s.winMem[:0]
 			s.winFH = s.winFH[:0]
 			for j := range n {
-				seg, err := decodeHashSeg(h.mgVals[j], true)
+				seg, err := decodeHashSeg(h.mgVals[j], encSet)
 				if err != nil {
 					return emitted, err
 				}
-				it := hashEntryIter{p: seg.entries, valless: true}
+				it := hashEntryIter{p: seg.entries, enc: encSet}
 				for {
 					m, _, _, ok, err := it.next()
 					if err != nil {
@@ -428,7 +428,7 @@ func (s *Set) filterWindow(ctx context.Context, src *algSrc, keepHits bool) erro
 			if h.mgVals[j] == nil {
 				return fmt.Errorf("sqlo1: set segment %d of rooth %#x is missing", s.grpSeg[base+j], r.rooth)
 			}
-			seg, err := decodeHashSeg(h.mgVals[j], true)
+			seg, err := decodeHashSeg(h.mgVals[j], encSet)
 			if err != nil {
 				return err
 			}

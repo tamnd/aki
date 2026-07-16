@@ -386,7 +386,7 @@ func TestSPopWholeSegment(t *testing.T) {
 		t.Fatalf("readSeg: %v", err)
 	}
 	var members []string
-	it := hashEntryIter{p: seg.entries, valless: seg.valless}
+	it := hashEntryIter{p: seg.entries, enc: seg.enc}
 	for {
 		f, _, _, ok, err := it.next()
 		if err != nil {
