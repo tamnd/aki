@@ -577,6 +577,48 @@ func TestRecoverWiresAuxiliaryTables(t *testing.T) {
 	}
 }
 
+// TestRecoverWiresGlobalRoots checks that Recover surfaces the file-global TTL index
+// and free map the live meta slot points at, so a reopening writer resumes allocation
+// and the expiry pass has its reclaim list without a second open.
+func TestRecoverWiresGlobalRoots(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	fmOff := appendFreeMap(t, f, []FreeExtent{
+		{StartOff: 0x40000, Length: 0x8000},
+		{StartOff: 0x50000, Length: 0x1000, Flags: FreeMapPending},
+	})
+	// Write the TTL index as a bare root past the free-map segment, so the two roots
+	// do not overlap in the append space.
+	ttlBytes := encodeTTLIndex([]TTLClass{
+		{Class: 1, ExpiryUpperUnix: 1000, Segments: []uint64{0x1000, 0x2000}},
+	})
+	ttlOff := f.Cursor()
+	if _, err := dev.WriteAt(ttlBytes, int64(ttlOff)); err != nil {
+		t.Fatalf("write ttl: %v", err)
+	}
+
+	m := &MetaSlot{
+		CommitSeq: 3, FileSize: f.Cursor(), CleanShutdown: 1,
+		TTLIndexOff: ttlOff, TTLIndexLen: uint32(len(ttlBytes)), FreeMapOff: fmOff,
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if len(rec.TTLClasses) != 1 || len(rec.TTLClasses[0].Segments) != 2 {
+		t.Fatalf("recovered TTL classes = %+v, want 1 class of 2 segments", rec.TTLClasses)
+	}
+	free, pending := FreeMapTotals(rec.FreeMap)
+	if free != 0x8000 || pending != 0x1000 {
+		t.Fatalf("recovered free map = free %d / pending %d, want %d/%d", free, pending, 0x8000, 0x1000)
+	}
+}
+
 // TestRecoverCleanSkipsTail recovers a cleanly-closed file with checkpoints: the
 // index rebuilds from the roots and the tail replay finds nothing, since a clean
 // shutdown checkpointed everything.
