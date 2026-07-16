@@ -292,6 +292,23 @@ type Hash struct {
 	// hashSegState; its fence rides the fence scratch. Valid until
 	// the next stateOf.
 	segRoot hashSegRoot
+
+	// valBuf carries a point op's value copy across the mutation that
+	// would recycle the arena bytes it read (HGETDEL, HGETEX, the
+	// INCR family's formatted result).
+	valBuf []byte
+
+	// HMGET scratch: per-field fence indexes, the field-to-slot dedupe
+	// over the fence, the unique segment subkeys and their backing
+	// bytes, the batch outputs, and the decoded segments.
+	mgIdx    []int
+	mgNeed   []int
+	mgKeys   [][]byte
+	mgKeyBuf []byte
+	mgVals   [][]byte
+	mgRoots  []bool
+	mgExps   []int64
+	mgSegs   []hashSeg
 }
 
 // NewHash builds the hash layer over t.
@@ -424,16 +441,25 @@ func (h *Hash) writeSegRoot(ctx context.Context, key []byte, delta bool) error {
 // is Redis's HSET rule. The write that pushes the hash past the
 // inline thresholds upgrades it to segments.
 func (h *Hash) HSet(ctx context.Context, key, field, val []byte) (bool, error) {
+	return h.hset(ctx, key, field, val, 0)
+}
+
+// hset is the shared field write under every point mutator: entryExp
+// is the field TTL the written entry ends up with, 0 for none. HSET
+// passes 0 (its clear-the-TTL rule), the INCR family passes the old
+// entry's expiry through (Redis preserves field TTLs across HINCRBY),
+// and HGETEX passes the new one.
+func (h *Hash) hset(ctx context.Context, key, field, val []byte, entryExp int64) (bool, error) {
 	st, hi, expMs, err := h.stateOf(ctx, key)
 	if err != nil {
 		return false, err
 	}
 	switch st {
 	case hashSegState:
-		return h.hsetSeg(ctx, key, field, val, expMs)
+		return h.hsetSeg(ctx, key, field, val, expMs, entryExp)
 	case hashAbsent:
-		h.rootBuf = appendHashInlineHdr(h.rootBuf[:0], 1, 0)
-		h.rootBuf = appendHashEntry(h.rootBuf, field, val, 0)
+		h.rootBuf = appendHashInlineHdr(h.rootBuf[:0], 1, entryExp)
+		h.rootBuf = appendHashEntry(h.rootBuf, field, val, entryExp)
 		if len(h.rootBuf) > hashInlineMax {
 			return h.upgrade(ctx, key, h.rootBuf[hashInlineHdrLen:], true, expMs)
 		}
@@ -461,7 +487,7 @@ func (h *Hash) HSet(ctx context.Context, key, field, val []byte) (bool, error) {
 			break
 		}
 		if bytes.Equal(f, field) {
-			h.rootBuf = appendHashEntry(h.rootBuf, field, val, 0)
+			h.rootBuf = appendHashEntry(h.rootBuf, field, val, entryExp)
 			created = false
 			continue
 		}
@@ -470,9 +496,12 @@ func (h *Hash) HSet(ctx context.Context, key, field, val []byte) (bool, error) {
 			minExp = eExp
 		}
 	}
+	if entryExp != 0 && (minExp == 0 || entryExp < minExp) {
+		minExp = entryExp
+	}
 	count := hi.count
 	if created {
-		h.rootBuf = appendHashEntry(h.rootBuf, field, val, 0)
+		h.rootBuf = appendHashEntry(h.rootBuf, field, val, entryExp)
 		count++
 	}
 	if count > hashInlineMaxCount || len(h.rootBuf) > hashInlineMax {
@@ -567,9 +596,10 @@ func (h *Hash) upgrade(ctx context.Context, key []byte, region []byte, created b
 // hsetSeg writes one field of a segmented hash: the covering segment
 // rebuilds around the field, and the root is touched only when the
 // write changed the count (rule W1: cardinality change pins the
-// root), so the steady-state update costs one segment record. A
-// rebuild past seg_max splits.
-func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs int64) (bool, error) {
+// root) or moved something the root header carries, so the
+// steady-state update costs one segment record. A rebuild past
+// seg_max splits.
+func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs, entryExp int64) (bool, error) {
 	r := &h.segRoot
 	f := hashFH(field)
 	i := hashFenceFind(r.fence, f)
@@ -577,11 +607,19 @@ func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs int64)
 	if err != nil {
 		return false, err
 	}
-	out, created, err := hashSegSet(h.segBuf, s, f, field, val, 0)
+	out, created, err := hashSegSet(h.segBuf, s, f, field, val, entryExp)
 	if err != nil {
 		return false, err
 	}
 	h.segBuf = out
+	// The root min_expire is lower-only from the segment post-image
+	// (H-I6: stale-early is legal, stale-late is not). Lowering before
+	// the split check means a split's root write carries it too.
+	segMin := int64(binary.LittleEndian.Uint64(out[4:]))
+	minLowered := segMin != 0 && (r.minExpMs == 0 || segMin < r.minExpMs)
+	if minLowered {
+		r.minExpMs = segMin
+	}
 	if len(out) > hashSegMax {
 		h.ents, err = parseHashSegEntries(h.ents[:0], out[hashSegHdrLen:])
 		if err != nil {
@@ -597,12 +635,23 @@ func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs int64)
 		return false, err
 	}
 	if !created {
-		// A pure update touches no root and no user-key header, so
-		// there is no expiry to restamp either.
-		return false, nil
+		meta := hashSegMeta(int(binary.LittleEndian.Uint16(out)), segMin)
+		if meta == r.fence[i].meta && !minLowered {
+			// A pure update touches no root and no user-key header,
+			// so there is no expiry to restamp either.
+			return false, nil
+		}
+		// A TTL edit moved the fence meta or the root min: skipping
+		// the root here would leave min_expire stale-late, so this
+		// write pins it like a cardinality change would (rule W1).
+		r.fence[i].meta = meta
+		if err := h.writeSegRoot(ctx, key, true); err != nil {
+			return false, err
+		}
+		return false, h.restamp(ctx, key, expMs)
 	}
 	r.count++
-	r.fence[i].meta = hashSegMeta(int(binary.LittleEndian.Uint16(out)), int64(binary.LittleEndian.Uint64(out[4:])))
+	r.fence[i].meta = hashSegMeta(int(binary.LittleEndian.Uint16(out)), segMin)
 	if err := h.writeSegRoot(ctx, key, true); err != nil {
 		return false, err
 	}
@@ -777,30 +826,37 @@ func (h *Hash) tryMergeSeg(ctx context.Context, key []byte, i int, out []byte) (
 // HGet reads one field. The returned bytes alias internal buffers and
 // are valid until the next call.
 func (h *Hash) HGet(ctx context.Context, key, field []byte) ([]byte, bool, error) {
+	v, _, ok, err := h.getEntry(ctx, key, field)
+	return v, ok, err
+}
+
+// getEntry is HGet with the field TTL beside the value: the read half
+// of every point op that must preserve or edit an entry expiry. The
+// value aliases internal buffers and dies on the next Tiered call.
+func (h *Hash) getEntry(ctx context.Context, key, field []byte) ([]byte, int64, bool, error) {
 	st, hi, _, err := h.stateOf(ctx, key)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 	switch st {
 	case hashAbsent:
-		return nil, false, nil
+		return nil, 0, false, nil
 	case hashSegState:
 		f := hashFH(field)
 		s, err := h.readSeg(ctx, h.segRoot.fence[hashFenceFind(h.segRoot.fence, f)].segid)
 		if err != nil {
-			return nil, false, err
+			return nil, 0, false, err
 		}
-		v, _, ok, err := hashSegGet(s, f, field)
-		return v, ok, err
+		return hashSegGet(s, f, field)
 	}
 	it := hashEntryIter{p: hi.entries}
 	for {
-		f, v, _, ok, err := it.next()
+		f, v, eExp, ok, err := it.next()
 		if err != nil || !ok {
-			return nil, false, err
+			return nil, 0, false, err
 		}
 		if bytes.Equal(f, field) {
-			return v, true, nil
+			return v, eExp, true, nil
 		}
 	}
 }
