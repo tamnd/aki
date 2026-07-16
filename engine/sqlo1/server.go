@@ -586,6 +586,11 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return arityErr(reply, cmd)
 		}
 		return s.pfdebugCmd(ctx, reply, args)
+	case "LCS":
+		if len(args) < 3 {
+			return arityErr(reply, cmd)
+		}
+		return s.lcsCmd(ctx, reply, args)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
@@ -973,6 +978,86 @@ func (s *Server) pfdebugCmd(ctx context.Context, reply []byte, args [][]byte) []
 		return AppendInt(reply, 0)
 	}
 	return AppendError(reply, fmt.Sprintf("ERR Unknown PFDEBUG subcommand '%s'", args[1]))
+}
+
+// lcsCmd parses the LCS options and shapes the reply like Redis 8.8:
+// a bulk string by default, an integer under LEN, and under IDX the
+// RESP2 rendering of a two-entry map, a four-item array holding
+// "matches" with the ranges in backtrack order and "len" with the
+// total. Options are case-insensitive and order-free.
+func (s *Server) lcsCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	var getLen, getIdx, withMatchLen bool
+	var minMatchLen int64
+	for i := 3; i < len(args); i++ {
+		switch strings.ToUpper(string(args[i])) {
+		case "IDX":
+			getIdx = true
+		case "LEN":
+			getLen = true
+		case "WITHMATCHLEN":
+			withMatchLen = true
+		case "MINMATCHLEN":
+			if i+1 >= len(args) {
+				return syntaxErr(reply)
+			}
+			n, err := strconv.ParseInt(string(args[i+1]), 10, 64)
+			if err != nil {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			if n < 0 {
+				n = 0
+			}
+			minMatchLen = n
+			i++
+		default:
+			return syntaxErr(reply)
+		}
+	}
+	if getLen && getIdx {
+		return AppendError(reply, "ERR If you want both the length and indexes, please just use IDX.")
+	}
+	a, b, err := s.s.LcsRead(ctx, args[1], args[2])
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	total, result, matches, err := lcsRun(a, b, getLen, getIdx, minMatchLen)
+	if err != nil {
+		switch {
+		case errors.Is(err, errLcsTooLong):
+			return AppendError(reply, "ERR String too long for LCS")
+		case errors.Is(err, errLcsAlloc):
+			return AppendError(reply, "ERR Insufficient memory, transient memory for LCS exceeds proto-max-bulk-len")
+		}
+		return storeErr(reply, err)
+	}
+	switch {
+	case getIdx:
+		reply = AppendArray(reply, 4)
+		reply = AppendBulk(reply, []byte("matches"))
+		reply = AppendArray(reply, len(matches))
+		for _, m := range matches {
+			if withMatchLen {
+				reply = AppendArray(reply, 3)
+			} else {
+				reply = AppendArray(reply, 2)
+			}
+			reply = AppendArray(reply, 2)
+			reply = AppendInt(reply, int64(m.aStart))
+			reply = AppendInt(reply, int64(m.aEnd))
+			reply = AppendArray(reply, 2)
+			reply = AppendInt(reply, int64(m.bStart))
+			reply = AppendInt(reply, int64(m.bEnd))
+			if withMatchLen {
+				reply = AppendInt(reply, int64(m.aEnd-m.aStart+1))
+			}
+		}
+		reply = AppendBulk(reply, []byte("len"))
+		return AppendInt(reply, int64(total))
+	case getLen:
+		return AppendInt(reply, int64(total))
+	default:
+		return AppendBulk(reply, result)
+	}
 }
 
 // parseBitOffset accepts what string2ll accepts, bounded to the bit

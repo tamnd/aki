@@ -142,6 +142,10 @@ type Str struct {
 	// HLL scratch: the whole-value copy every PF read-modify-write
 	// runs on, bounded by the 12304-byte dense size.
 	hllBuf []byte
+
+	// LCS scratch: the first key's whole value, copied because Get's
+	// bytes die on the second key's read.
+	lcsBuf []byte
 }
 
 // NewStr builds the string layer over t.
