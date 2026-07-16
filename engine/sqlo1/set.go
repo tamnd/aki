@@ -149,6 +149,46 @@ func (s *Set) SScan(ctx context.Context, key []byte, cursor uint64, count int64,
 	})
 }
 
+// SRandMember is the no-count SRANDMEMBER: one uniform-ish draw, ok
+// false on a missing key. The draw is HRandField's fill-class-weighted
+// machinery, whose distance from exact uniform the hrand lab guards.
+// The returned bytes alias internal buffers and die on the next call.
+func (s *Set) SRandMember(ctx context.Context, key []byte) ([]byte, bool, error) {
+	f, _, ok, err := s.h.HRandField(ctx, key)
+	return f, ok, err
+}
+
+// SRandMemberCount is the count form of SRANDMEMBER, HRandFieldCount's
+// contract verbatim: count is the magnitude of the wire argument and
+// withReplacement its sign (Redis's negative count draws count times
+// with replacement, positive returns min(count, SCARD) distinct
+// members). begin runs exactly once, before any emit, with the exact
+// number of members that will be emitted; emitted bytes are only valid
+// inside the emit call.
+func (s *Set) SRandMemberCount(ctx context.Context, key []byte, count int64, withReplacement bool, begin func(n int64), emit func(member []byte)) error {
+	return s.h.HRandFieldCount(ctx, key, count, withReplacement, begin, func(f, _ []byte) {
+		emit(f)
+	})
+}
+
+// SPop is the no-count SPOP: one uniform member, removed. The draw is
+// HRandField's and the removal rides HDel, so the single pop inherits
+// the lazy merge and the last-member key delete for free; the member
+// is copied out first because the removal recycles the read the draw
+// aliases. The returned bytes are valid until the next call on this
+// layer. ok false means the key was absent.
+func (s *Set) SPop(ctx context.Context, key []byte) ([]byte, bool, error) {
+	f, _, ok, err := s.h.HRandField(ctx, key)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	s.h.valBuf = append(s.h.valBuf[:0], f...)
+	if _, err := s.h.HDel(ctx, key, s.h.valBuf); err != nil {
+		return nil, false, err
+	}
+	return s.h.valBuf, true, nil
+}
+
 // Encoding answers OBJECT ENCODING for sets: intset for an inline
 // all-integer set, listpack for any other inline set, hashtable once
 // segmented. intset is compat surface only; there is one inline

@@ -159,3 +159,135 @@ func TestServerSetIteration(t *testing.T) {
 	send("SSCAN", "str", "0")
 	expect(t, r, wrong)
 }
+
+func TestServerSetSampling(t *testing.T) {
+	c, r := startServer(t)
+	send := func(args ...string) {
+		t.Helper()
+		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Absent keys: null bulk without a count, empty arrays with one.
+	send("SRANDMEMBER")
+	expect(t, r, "-ERR wrong number of arguments for 'srandmember' command\r\n")
+	send("SRANDMEMBER", "ghost")
+	expect(t, r, "$-1\r\n")
+	send("SRANDMEMBER", "ghost", "5")
+	expect(t, r, "*0\r\n")
+	send("SRANDMEMBER", "ghost", "-5")
+	expect(t, r, "*0\r\n")
+	send("SPOP")
+	expect(t, r, "-ERR wrong number of arguments for 'spop' command\r\n")
+	send("SPOP", "ghost")
+	expect(t, r, "$-1\r\n")
+	send("SPOP", "ghost", "3")
+	expect(t, r, "*0\r\n")
+
+	// The count grammar, Redis's doors and texts.
+	send("SRANDMEMBER", "ghost", "abc")
+	expect(t, r, "-ERR value is not an integer or out of range\r\n")
+	send("SRANDMEMBER", "ghost", "-9223372036854775808")
+	expect(t, r, "-ERR value is out of range\r\n")
+	send("SRANDMEMBER", "ghost", "3", "extra")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("SPOP", "ghost", "-1")
+	expect(t, r, "-ERR value is out of range, must be positive\r\n")
+	send("SPOP", "ghost", "abc")
+	expect(t, r, "-ERR value is out of range, must be positive\r\n")
+	send("SPOP", "ghost", "3", "extra")
+	expect(t, r, "-ERR syntax error\r\n")
+
+	// Cross-type doors, both forms.
+	wrong := "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+	send("SET", "str", "v")
+	expect(t, r, "+OK\r\n")
+	send("SRANDMEMBER", "str")
+	expect(t, r, wrong)
+	send("SRANDMEMBER", "str", "3")
+	expect(t, r, wrong)
+	send("SPOP", "str")
+	expect(t, r, wrong)
+	send("SPOP", "str", "3")
+	expect(t, r, wrong)
+
+	// Draws off a live set, checked by membership since the picks are
+	// random.
+	universe := map[string]bool{"a": true, "b": true, "c": true, "d": true, "e": true}
+	send("SADD", "s", "a", "b", "c", "d", "e")
+	expect(t, r, ":5\r\n")
+	send("SRANDMEMBER", "s")
+	if m := readBulk(t, r); !universe[m] {
+		t.Fatalf("SRANDMEMBER drew %q", m)
+	}
+	send("SRANDMEMBER", "s", "3")
+	if n := readArrayLen(t, r); n != 3 {
+		t.Fatalf("count 3 answered %d members", n)
+	}
+	seen := map[string]bool{}
+	for range 3 {
+		m := readBulk(t, r)
+		if !universe[m] || seen[m] {
+			t.Fatalf("distinct draw repeated or invented %q", m)
+		}
+		seen[m] = true
+	}
+	send("SRANDMEMBER", "s", "10")
+	if n := readArrayLen(t, r); n != 5 {
+		t.Fatalf("overcount answered %d members, want the whole set", n)
+	}
+	for range 5 {
+		readBulk(t, r)
+	}
+	send("SRANDMEMBER", "s", "-8")
+	if n := readArrayLen(t, r); n != 8 {
+		t.Fatalf("negative count answered %d members, want exactly 8", n)
+	}
+	for range 8 {
+		if m := readBulk(t, r); !universe[m] {
+			t.Fatalf("with-replacement draw invented %q", m)
+		}
+	}
+	send("SRANDMEMBER", "s", "0")
+	expect(t, r, "*0\r\n")
+	send("SCARD", "s")
+	expect(t, r, ":5\r\n")
+
+	// Pops: the single form removes what it answers, the count form
+	// drains, count 0 touches nothing, an overpop deletes the key.
+	send("SPOP", "s")
+	popped := readBulk(t, r)
+	if !universe[popped] {
+		t.Fatalf("SPOP drew %q", popped)
+	}
+	send("SISMEMBER", "s", popped)
+	expect(t, r, ":0\r\n")
+	send("SCARD", "s")
+	expect(t, r, ":4\r\n")
+	send("SPOP", "s", "0")
+	expect(t, r, "*0\r\n")
+	send("SCARD", "s")
+	expect(t, r, ":4\r\n")
+	send("SPOP", "s", "2")
+	if n := readArrayLen(t, r); n != 2 {
+		t.Fatalf("SPOP count 2 answered %d members", n)
+	}
+	for range 2 {
+		m := readBulk(t, r)
+		if !universe[m] || m == popped {
+			t.Fatalf("SPOP count drew %q", m)
+		}
+	}
+	send("SCARD", "s")
+	expect(t, r, ":2\r\n")
+	send("SPOP", "s", "99")
+	if n := readArrayLen(t, r); n != 2 {
+		t.Fatalf("overpop answered %d members, want the 2 left", n)
+	}
+	for range 2 {
+		readBulk(t, r)
+	}
+	send("TYPE", "s")
+	expect(t, r, "+none\r\n")
+}
