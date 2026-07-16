@@ -105,6 +105,10 @@ var (
 	// ErrSegStats is a seg-stats header that is malformed: an unknown full-or-delta
 	// kind, or a full table carrying a nonzero base offset.
 	ErrSegStats = errors.New("akifile: malformed seg-stats header")
+	// ErrChunkDir is a chunk-directory header or descriptor that is malformed: an
+	// unknown full-or-delta kind, a full directory carrying a nonzero base offset, or
+	// a descriptor whose discriminator length exceeds the inline bound.
+	ErrChunkDir = errors.New("akifile: malformed chunk-directory")
 )
 
 var (
