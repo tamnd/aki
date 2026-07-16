@@ -183,3 +183,33 @@ func (r *IndexRebuilder) Entries() map[uint64]CkptEntry { return r.entries }
 
 // Len is the number of live index entries accumulated so far.
 func (r *IndexRebuilder) Len() int { return len(r.entries) }
+
+// ReadSRT reads the shard root table the live meta root points at, the per-shard
+// map from a checkpoint to its replay entry point that a 128-byte meta slot has no
+// room for (spec 2064/f3/07 sections 3 and 6). It completes the three-way
+// shard-count agreement recovery requires: the prefix, the meta slot's
+// SRTShardCount (checked in ReadOpenState), and the SRT's own row count must all
+// match, or the table is a torn swap or a wrong-geometry open and recovery refuses
+// it with ErrShardCount.
+//
+// A file with no checkpoints yet (a fresh clean file, or a scan fallback with no
+// trusted root) has no table: the meta is nil or its SRTLen is zero, and ReadSRT
+// returns a nil table and no error, which the driver reads as "no roots, replay
+// from the header page".
+func ReadSRT(dev Device, prefix *Prefix, meta *MetaSlot) (*SRT, error) {
+	if meta == nil || meta.SRTLen == 0 {
+		return nil, nil
+	}
+	buf := make([]byte, meta.SRTLen)
+	if _, err := dev.ReadAt(buf, int64(meta.SRTOff)); err != nil {
+		return nil, err
+	}
+	srt, err := ParseSRT(buf, prefix.ChecksumKind)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(srt.Rows)) != uint64(prefix.ShardCount) {
+		return nil, ErrShardCount
+	}
+	return srt, nil
+}

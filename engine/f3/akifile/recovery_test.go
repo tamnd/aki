@@ -251,6 +251,119 @@ func writeMeta(t *testing.T, dev *memDevice, prefix *Prefix, off uint64, m *Meta
 	}
 }
 
+// TestReadSRTFreshFileHasNoTable returns a nil table with no error for a freshly
+// created file: no checkpoint has been taken, so there are no roots to read and
+// the driver replays from the header page.
+func TestReadSRTFreshFileHasNoTable(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	st, err := ReadOpenState(dev)
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	srt, err := ReadSRT(dev, f.Prefix(), st.Meta)
+	if err != nil || srt != nil {
+		t.Fatalf("fresh SRT = %v/%v, want nil/nil", srt, err)
+	}
+}
+
+// TestReadSRTRoundTrip writes a shard root table into free space, points the live
+// meta root at it, and reads back every shard's checkpoint roots.
+func TestReadSRTRoundTrip(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	for i := range rows {
+		rows[i] = SRTRow{
+			IndexCkptOff: uint64(0x10000 * (i + 1)),
+			CkptLogPos:   uint64(100 + i),
+			FirstTailSeg: uint64(0x20000 * (i + 1)),
+			LiveRecords:  uint64(i * 7),
+		}
+	}
+	srtOff := writeSRT(t, dev, prefix, &SRT{Gen: 4, Rows: rows})
+
+	m := &MetaSlot{
+		CommitSeq: 3, FileSize: PageSize, CleanShutdown: 1,
+		SRTOff: srtOff, SRTLen: uint32(SRTHeaderLen + len(rows)*SRTRowSize), SRTShardCount: prefix.ShardCount,
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	st, err := ReadOpenState(dev)
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	srt, err := ReadSRT(dev, prefix, st.Meta)
+	if err != nil {
+		t.Fatalf("read srt: %v", err)
+	}
+	if srt.Gen != 4 || len(srt.Rows) != int(prefix.ShardCount) {
+		t.Fatalf("srt gen %d rows %d, want 4/%d", srt.Gen, len(srt.Rows), prefix.ShardCount)
+	}
+	for i, r := range srt.Rows {
+		if r.IndexCkptOff != rows[i].IndexCkptOff || r.FirstTailSeg != rows[i].FirstTailSeg {
+			t.Fatalf("row %d = %+v, want %+v", i, r, rows[i])
+		}
+	}
+}
+
+// TestReadSRTRowCountMismatch refuses a table whose row count disagrees with the
+// prefix shard count, the third leg of the three-way agreement.
+func TestReadSRTRowCountMismatch(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	// One row too few: a torn SRT swap or the wrong shard geometry.
+	rows := make([]SRTRow, prefix.ShardCount-1)
+	srtOff := writeSRT(t, dev, prefix, &SRT{Gen: 1, Rows: rows})
+
+	meta := &MetaSlot{
+		SRTOff: srtOff, SRTLen: uint32(SRTHeaderLen + len(rows)*SRTRowSize), SRTShardCount: prefix.ShardCount,
+	}
+	if _, err := ReadSRT(dev, prefix, meta); err != ErrShardCount {
+		t.Fatalf("err = %v, want ErrShardCount", err)
+	}
+}
+
+// TestReadSRTCatchesTornTable returns ErrChecksum when the table bytes are torn:
+// the SRT crc covers the header prefix and every row.
+func TestReadSRTCatchesTornTable(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	srtOff := writeSRT(t, dev, prefix, &SRT{Gen: 1, Rows: rows})
+	dev.buf[srtOff+SRTHeaderLen+3] ^= 0xff // corrupt a row byte
+
+	meta := &MetaSlot{
+		SRTOff: srtOff, SRTLen: uint32(SRTHeaderLen + len(rows)*SRTRowSize), SRTShardCount: prefix.ShardCount,
+	}
+	if _, err := ReadSRT(dev, prefix, meta); err != ErrChecksum {
+		t.Fatalf("err = %v, want ErrChecksum", err)
+	}
+}
+
+// writeSRT marshals a shard root table into the device just past the header page
+// and returns the offset it landed at.
+func writeSRT(t *testing.T, dev *memDevice, prefix *Prefix, srt *SRT) uint64 {
+	t.Helper()
+	b, err := srt.Marshal(prefix.ChecksumKind)
+	if err != nil {
+		t.Fatalf("marshal srt: %v", err)
+	}
+	off := uint64(PageSize)
+	if _, err := dev.WriteAt(b, int64(off)); err != nil {
+		t.Fatalf("write srt: %v", err)
+	}
+	return off
+}
+
 // ckptPayload frames a checkpoint payload from a header and its entries, the bytes
 // an index_ckpt segment would carry.
 func ckptPayload(h CkptHeader, entries []CkptEntry) []byte {
