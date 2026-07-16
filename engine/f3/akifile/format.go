@@ -109,6 +109,15 @@ var (
 	// unknown full-or-delta kind, a full directory carrying a nonzero base offset, or
 	// a descriptor whose discriminator length exceeds the inline bound.
 	ErrChunkDir = errors.New("akifile: malformed chunk-directory")
+	// ErrBarrier is a barrier that is not a genuine cut: its segment global_seq
+	// disagrees with the recorded Wbar, or a shard seq outruns the watermark, which
+	// the single writer's total order cannot produce. A snapshot restore refuses such
+	// a barrier rather than cutting a torn image.
+	ErrBarrier = errors.New("akifile: inconsistent barrier")
+	// ErrNoBarrier is a scan that reached the durable tail without finding a barrier at
+	// the requested watermark: the snapshot was never written, or the file was
+	// truncated before it.
+	ErrNoBarrier = errors.New("akifile: no barrier at watermark")
 )
 
 var (
