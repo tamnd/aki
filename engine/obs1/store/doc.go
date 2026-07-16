@@ -22,4 +22,19 @@
 // fold milestone. The MaybeDemote, ResidentOver, and spillCold seams in
 // resid.go are the hooks that milestone wires; they arrive intact and
 // unwired here.
+//
+// The demotion and promotion policy rides the same copy: the SIEVE hand
+// (resid.go, migrate.go, and the second-chance pass in coldstage.go)
+// picks what leaves the resident tier, and the two-generation Bloom
+// doorkeeper (colddoor.go) decides what a cold read brings back on its
+// second sighting. obs1 re-aims both rather than replacing them: the
+// hand's selection order becomes the fold pass's selection order, so
+// what folds first is what the hot tier wants to evict first (2064/obs1
+// doc 06 section 1.4), and the doorkeeper's two-touch discipline guards
+// GET dollars instead of pread counts once cold reads go to the bucket
+// (doc 05 section 4). In the diskless serving shape both are inert by
+// construction: no cold path is configured, ltmOn stays false,
+// MaybeDemote declines at its first check, and the doorkeeper is never
+// consulted, which is the O1a persistence-off contract the shard tests
+// pin (engine/obs1/shard/foldpolicy_test.go).
 package store
