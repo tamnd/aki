@@ -411,7 +411,9 @@ func TestServerStringPointCommands(t *testing.T) {
 			t.Fatalf("OBJECT ENCODING %s = %q, want %q", c[0], got, c[1])
 		}
 	}
-	if got := do("OBJECT", "ENCODING", "missing"); got != "-ERR no such key\r\n" {
+	// Redis 8.8 replies null bulk for a missing key, not the older
+	// "no such key" error (pinned live in the compat fixtures).
+	if got := do("OBJECT", "ENCODING", "missing"); got != "$-1\r\n" {
 		t.Fatal(got)
 	}
 

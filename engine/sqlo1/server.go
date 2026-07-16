@@ -612,7 +612,9 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 				return storeErr(reply, err)
 			}
 			if !ok {
-				return AppendError(reply, "ERR no such key")
+				// Redis 8.8 replies null bulk here, not the "no
+				// such key" error older versions used.
+				return AppendNullBulk(reply)
 			}
 			return AppendBulk(reply, []byte(enc))
 		}

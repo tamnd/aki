@@ -418,7 +418,9 @@ func clampRange(start, end, n int64) (lo, hi int64, some bool) {
 		start = max(n+start, 0)
 	}
 	if end < 0 {
-		end = n + end
+		// Still-negative ends clamp to byte 0, not to an empty
+		// window; GETRANGE v -100 -50 is v's first byte in Redis.
+		end = max(n+end, 0)
 	}
 	end = min(end, n-1)
 	if n == 0 || start > end {
