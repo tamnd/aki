@@ -105,6 +105,27 @@ jobs:
         if: env.AKI_OBS1_R2_ENDPOINT != ''
         run: go test -count=1 -run TestR2Probe -v ./engine/obs1/
 
+  # A short real-fuzz smoke on every doc 03 parser. The deterministic
+  # truncation and corruption corpora run inside the test job on every
+  # PR; this job lets coverage-guided mutation explore past them for a
+  # few seconds per target, runs in parallel with the test job, and
+  # keeps the lane's wall clock where it is.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: fuzz smoke
+        run: |
+          for target in FuzzParseHeader FuzzParseRoot FuzzParseWAL FuzzParseSegment \
+                        FuzzParseManifest FuzzParseChainBatch FuzzParseCheckpoint FuzzParseAny; do
+            go test ./engine/obs1 -run='^$' -fuzz="^${target}\$" -fuzztime=8s
+          done
+
   # The shared lint lane skips the obs1 paths (they would otherwise gate
   # non-obs1 PRs on this tree), so this job turns the same linter set back
   # on with the obs1-scoped config. Without it the tree would have no lint
