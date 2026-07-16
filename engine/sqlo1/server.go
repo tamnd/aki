@@ -22,9 +22,10 @@ const serverMemCap = 64 << 20
 // the runtime assumes (R1), so command execution is serial; the shard
 // fan-out that makes that scale is the doc 04 section 2 server work.
 type Server struct {
-	t *Tiered
-	s *Str
-	h *Hash
+	t  *Tiered
+	s  *Str
+	h  *Hash
+	se *Set
 
 	mu sync.Mutex // serializes command execution against the runtime
 
@@ -78,7 +79,11 @@ func NewServer(st Store) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	srv.t, srv.s, srv.h = t, str, hash
+	set, err := NewSet(t, HashConfig{})
+	if err != nil {
+		return nil, err
+	}
+	srv.t, srv.s, srv.h, srv.se = t, str, hash, set
 	return srv, nil
 }
 
@@ -766,6 +771,79 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.hexpireCmd(ctx, reply, args, now, cmd)
 	case "HTTL", "HPTTL", "HEXPIRETIME", "HPEXPIRETIME":
 		return s.httlCmd(ctx, reply, args, now, cmd)
+	case "SADD", "SREM":
+		if len(args) < 3 {
+			return arityErr(reply, cmd)
+		}
+		n := int64(0)
+		for _, m := range args[2:] {
+			var changed bool
+			var err error
+			if cmd == "SADD" {
+				changed, err = s.se.SAdd(ctx, args[1], m)
+			} else {
+				changed, err = s.se.SRem(ctx, args[1], m)
+			}
+			if err != nil {
+				return storeErr(reply, err)
+			}
+			if changed {
+				n++
+			}
+		}
+		return AppendInt(reply, n)
+	case "SISMEMBER":
+		if len(args) != 3 {
+			return arityErr(reply, cmd)
+		}
+		ok, err := s.se.SIsMember(ctx, args[1], args[2])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if ok {
+			return AppendInt(reply, 1)
+		}
+		return AppendInt(reply, 0)
+	case "SMISMEMBER":
+		if len(args) < 3 {
+			return arityErr(reply, cmd)
+		}
+		mark := len(reply)
+		reply = AppendArray(reply, len(args)-2)
+		err := s.se.SMIsMember(ctx, args[1], args[2:], func(ok bool) {
+			if ok {
+				reply = AppendInt(reply, 1)
+			} else {
+				reply = AppendInt(reply, 0)
+			}
+		})
+		if err != nil {
+			// A partial array is already in the buffer; truncate back
+			// to the mark so the error is the whole reply.
+			return storeErr(reply[:mark], err)
+		}
+		return reply
+	case "SCARD":
+		if len(args) != 2 {
+			return arityErr(reply, cmd)
+		}
+		n, err := s.se.SCard(ctx, args[1])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, n)
+	case "SMOVE":
+		if len(args) != 4 {
+			return arityErr(reply, cmd)
+		}
+		moved, err := s.se.SMove(ctx, args[1], args[2], args[3])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if moved {
+			return AppendInt(reply, 1)
+		}
+		return AppendInt(reply, 0)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":
@@ -784,8 +862,11 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			if err != nil {
 				return storeErr(reply, err)
 			}
-			if tag == TagHash {
+			switch tag {
+			case TagHash:
 				return AppendSimple(reply, "hash")
+			case TagSet:
+				return AppendSimple(reply, "set")
 			}
 		}
 		return AppendSimple(reply, "string")
@@ -805,8 +886,18 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 				if err != nil {
 					return storeErr(reply, err)
 				}
-				if tag == TagHash {
+				switch tag {
+				case TagHash:
 					enc, ok, err := s.h.Encoding(ctx, args[2])
+					if err != nil {
+						return storeErr(reply, err)
+					}
+					if !ok {
+						return AppendNullBulk(reply)
+					}
+					return AppendBulk(reply, []byte(enc))
+				case TagSet:
+					enc, ok, err := s.se.Encoding(ctx, args[2])
 					if err != nil {
 						return storeErr(reply, err)
 					}

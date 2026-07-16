@@ -1,6 +1,9 @@
 package sqlo1
 
-import "context"
+import (
+	"bytes"
+	"context"
+)
 
 // Set is the set layer over Tiered: the doc 08 model, which is the
 // doc 06 hash machinery with no values. It rides the same Hash type
@@ -47,6 +50,79 @@ func (s *Set) SIsMember(ctx context.Context, key, member []byte) (bool, error) {
 // header and segmented counts are patched by W3 reconciliation.
 func (s *Set) SCard(ctx context.Context, key []byte) (int64, error) {
 	return s.h.HLen(ctx, key)
+}
+
+// SMIsMember answers membership for a batch of members through the
+// hash's batched read: on a segmented set every needed segment is
+// fetched in one LookupBatch round, so a burst of members probing one
+// segment costs one record read. emit runs once per member in order.
+func (s *Set) SMIsMember(ctx context.Context, key []byte, members [][]byte, emit func(ok bool)) error {
+	return s.h.HMGet(ctx, key, members, func(_ []byte, ok bool) {
+		emit(ok)
+	})
+}
+
+// SMove moves member from src to dst, reporting whether it happened
+// (false means member was not in src). Both keys type-gate before any
+// write, so a wrong-typed dst never leaves src half-moved.
+//
+// The crash story is doc 08's frame group, built from the write order
+// and one guard. The add to dst goes first and the remove from src
+// second, so the member is in at least one set at every drain batch
+// boundary; a torn tail can leave it in both (the command replays as
+// not-yet-finished) but can never lose it. The guard is the one
+// setRangeRope uses: a record the remove will coalesce into (src root
+// or the member's segment) that is already dirty holds a drain-queue
+// position ahead of the add's fresh entries, and a batch cut there
+// would commit the remove before the add, so the tier flushes first.
+// dst-side dirt only moves the add earlier, the safe direction, but
+// it is checked too so the pair's frames stay contiguous in the WAL.
+func (s *Set) SMove(ctx context.Context, src, dst, member []byte) (bool, error) {
+	h := s.h
+	st, _, _, err := h.stateOf(ctx, src)
+	if err != nil {
+		return false, err
+	}
+	dirty := h.t.ht.dirtyKey(src)
+	if st == hashSegState {
+		i, err := h.fenceIdx(ctx, hashFH(member))
+		if err != nil {
+			return false, err
+		}
+		putHashSegKey(h.kbuf[:], h.segRoot.rooth, h.segRoot.fence[i].segid)
+		dirty = dirty || h.t.ht.dirtyKey(h.kbuf[:])
+	}
+	dstSt, _, _, err := h.stateOf(ctx, dst)
+	if err != nil {
+		return false, err
+	}
+	dirty = dirty || h.t.ht.dirtyKey(dst)
+	if dstSt == hashSegState {
+		i, err := h.fenceIdx(ctx, hashFH(member))
+		if err != nil {
+			return false, err
+		}
+		putHashSegKey(h.kbuf[:], h.segRoot.rooth, h.segRoot.fence[i].segid)
+		dirty = dirty || h.t.ht.dirtyKey(h.kbuf[:])
+	}
+	if _, _, ok, err := h.getEntry(ctx, src, member); err != nil || !ok {
+		return false, err
+	}
+	if bytes.Equal(src, dst) {
+		return true, nil
+	}
+	if dirty {
+		if err := h.t.Flush(ctx); err != nil {
+			return false, err
+		}
+	}
+	if _, err := h.hset(ctx, dst, member, nil, 0); err != nil {
+		return false, err
+	}
+	if _, err := h.HDel(ctx, src, member); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Encoding answers OBJECT ENCODING for sets: intset for an inline
