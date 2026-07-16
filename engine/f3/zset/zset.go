@@ -157,6 +157,13 @@ type flags struct {
 func (z *zset) update(m []byte, score float64, fl flags) (added, changed bool, newScore float64, applied, nan bool) {
 	old, present := z.score(m)
 	if present {
+		if z.enc == encSkiplist {
+			// Confirming the member read its cold chunk (score above preads a cold
+			// member to Match it), so bring the whole chunk resident before the write
+			// lands. A no-op when the band has demoted nothing, so the hot re-add is
+			// unchanged (the L9 zero-delta contract).
+			z.nat.promoteOnWrite(m)
+		}
 		if fl.nx {
 			return false, false, old, false, false
 		}
