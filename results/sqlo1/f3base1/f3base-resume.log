@@ -1,0 +1,2705 @@
+== building aki-bench ==
+== building f3srv from /root/sqlo1bench/aki ==
+== sqlo1 core suite: 12 cells x 2 reps, akislot=f3, out /root/sqlo1bench/f3base1-cap-r10b ==
+--- cap-r10-v512-uniform-1x-rep1 (order aki,redis,valkey, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       991979   991979    100.0  100.0  523.7   891.4   3684.4  6840.3   -       -       
+redis   redis 8.8.0   1945368  1920366   98.7   86.2   1014.7  404.7   2492.4  4063.2   -       -       250033 nil
+valkey  valkey 9.1.0  1838471  1815898   98.8   88.4   959.4   444.7   3418.1  6000.6   -       -       225757 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=3387499 hits=2551385 misses=377277
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=3060882 hits=2406823 misses=340151
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 1725/2000 retrievable (86.2%), 275 missing
+valkey dataset coverage: 1768/2000 retrievable (88.4%), 232 missing
+speedup vs redis:  0.52x
+speedup vs valkey: 0.55x
+gate (2.0x): FAIL, aki is 0.52x Redis, below the 2.0x bar
+--- cap-r10-v512-uniform-1x-rep2 (order valkey,redis,aki, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       983579   983579    100.0  100.0  519.2  905.2   3592.2  6524.9   -       -       
+redis   redis 8.8.0   1885684  1861546   98.7   86.0   983.6  417.8   2529.3  4188.2   -       -       241398 nil
+valkey  valkey 9.1.0  1823222  1800780   98.8   86.5   951.4  451.3   3362.8  5775.4   -       -       224436 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=3249281 hits=2452053 misses=361527
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=3032083 hits=2387982 misses=338516
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 1720/2000 retrievable (86.0%), 280 missing
+valkey dataset coverage: 1730/2000 retrievable (86.5%), 270 missing
+speedup vs redis:  0.53x
+speedup vs valkey: 0.55x
+gate (2.0x): FAIL, aki is 0.53x Redis, below the 2.0x bar
+--- cap-r10-v512-uniform-4x-rep1 (order aki,redis,valkey, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       467492   467492    100.0  100.0  247.1  2121.7  3543.0  4116.5   -       -       
+redis   redis 8.8.0   1197430  1104480   92.2   21.7   587.3  828.9   2000.9  2814.0   -       -       929617 nil
+valkey  valkey 9.1.0  1081410  997716    92.3   20.9   530.5  901.1   2042.9  3180.5   -       -       837017 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=12534324 hits=399383 misses=1400045
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=11309157 hits=363866 misses=1264144
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 434/2000 retrievable (21.7%), 1566 missing
+valkey dataset coverage: 418/2000 retrievable (20.9%), 1582 missing
+speedup vs redis:  0.42x
+speedup vs valkey: 0.47x
+gate (2.0x): FAIL, aki is 0.42x Redis, below the 2.0x bar
+--- cap-r10-v512-uniform-4x-rep2 (order valkey,redis,aki, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       469305   469305    100.0  100.0  248.1  2115.6  3502.1  4190.2   -       -       
+redis   redis 8.8.0   1160561  1070539   92.2   21.8   569.2  856.6   2059.3  2943.0   -       -       900313 nil
+valkey  valkey 9.1.0  1087850  1003487   92.2   21.7   533.6  889.3   2097.2  3323.9   -       -       843756 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=12126314 hits=386816 misses=1354848
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=11330136 hits=362417 misses=1265487
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 436/2000 retrievable (21.8%), 1564 missing
+valkey dataset coverage: 434/2000 retrievable (21.7%), 1566 missing
+speedup vs redis:  0.44x
+speedup vs valkey: 0.47x
+gate (2.0x): FAIL, aki is 0.44x Redis, below the 2.0x bar
+--- cap-r10-v512-uniform-16x-rep1 (order aki,redis,valkey, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%  cov%  MB/s   p50 us   p99 us   p999 us   rss MB  hwm MB  note
+aki     unknown       16322    8907      54.6  52.6  8.6    63340.5  66027.5  109379.6  -       -       7575 nil, 66941 refused
+redis   redis 8.8.0   1107343  1003612   90.6  5.9   535.3  886.3    2033.7   2840.6    -       -       1037417 nil
+valkey  valkey 9.1.0  998546   905104    90.6  5.1   482.8  972.8    2081.8   3268.6    -       -       934482 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=13930199 hits=100716 misses=1561612
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=12606739 hits=92169 misses=1414707
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 118/2000 retrievable (5.9%), 1882 missing
+valkey dataset coverage: 102/2000 retrievable (5.1%), 1898 missing
+speedup vs redis:  0.01x
+speedup vs valkey: 0.01x
+gate (2.0x): FAIL, aki is 0.01x Redis, below the 2.0x bar
+--- cap-r10-v512-uniform-16x-rep2 (order valkey,redis,aki, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%  cov%  MB/s   p50 us   p99 us   p999 us  rss MB  hwm MB  note
+aki     unknown       16510    9007      54.6  52.6  8.7    63569.9  66093.1  71827.5  -       -       7660 nil, 67754 refused
+redis   redis 8.8.0   1083206  981419    90.6  6.3   523.5  906.2    2060.3   2908.2   -       -       1018023 nil
+valkey  valkey 9.1.0  983319   891292    90.6  5.2   475.4  996.4    1966.1   2910.2   -       -       920368 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=13672044 hits=95205 misses=1528057
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=12374680 hits=90233 misses=1389253
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 127/2000 retrievable (6.3%), 1873 missing
+valkey dataset coverage: 105/2000 retrievable (5.2%), 1895 missing
+speedup vs redis:  0.01x
+speedup vs valkey: 0.01x
+gate (2.0x): FAIL, aki is 0.01x Redis, below the 2.0x bar
+--- cap-r10-v512-zipfian-1x-rep1 (order aki,redis,valkey, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1005614  1005614   100.0  100.0  528.1   876.0   3692.5  6479.9   -       -       
+redis   redis 8.8.0   2289973  2286432   99.8   86.9   1201.0  339.2   2684.9  4730.9   -       -       35416 nil
+valkey  valkey 9.1.0  2163749  2160518   99.9   86.1   1134.8  341.0   3862.5  6770.7   -       -       32304 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=499693 hits=3376061 misses=56183
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=471037 hits=3178742 misses=52960
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 1737/2000 retrievable (86.9%), 263 missing
+valkey dataset coverage: 1721/2000 retrievable (86.1%), 279 missing
+speedup vs redis:  0.44x
+speedup vs valkey: 0.47x
+gate (2.0x): FAIL, aki is 0.44x Redis, below the 2.0x bar
+--- cap-r10-v512-zipfian-1x-rep2 (order valkey,redis,aki, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       988234   988234    100.0  100.0  519.0   894.0   3665.9  6557.7   -       -       
+redis   redis 8.8.0   2212504  2209102   99.8   86.1   1160.3  352.0   2752.5  5021.7   -       -       34020 nil
+valkey  valkey 9.1.0  2158054  2154805   99.8   85.5   1131.8  339.7   4003.8  6856.7   -       -       32488 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=482298 hits=3242835 misses=54025
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=471474 hits=3161777 misses=52755
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 1722/2000 retrievable (86.1%), 278 missing
+valkey dataset coverage: 1711/2000 retrievable (85.5%), 289 missing
+speedup vs redis:  0.45x
+speedup vs valkey: 0.46x
+gate (2.0x): FAIL, aki is 0.45x Redis, below the 2.0x bar
+--- cap-r10-v512-zipfian-4x-rep1 (order aki,redis,valkey, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       446664   446664    100.0  100.0  234.8  2181.1  3704.8  4714.5   -       -       
+redis   redis 8.8.0   1888116  1861697   98.6   21.9   979.4  415.0   2512.9  4094.0   -       -       264230 nil
+valkey  valkey 9.1.0  1791241  1766080   98.6   22.0   929.1  461.1   3242.0  5505.0   -       -       251633 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=3677605 hits=2401792 misses=412604
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=3497241 hits=2279994 misses=392892
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 439/2000 retrievable (21.9%), 1561 missing
+valkey dataset coverage: 440/2000 retrievable (22.0%), 1560 missing
+speedup vs redis:  0.24x
+speedup vs valkey: 0.25x
+gate (2.0x): FAIL, aki is 0.24x Redis, below the 2.0x bar
+--- cap-r10-v512-zipfian-4x-rep2 (order valkey,redis,aki, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       443210   443210    100.0  100.0  232.9  2193.4  3768.3  4751.4   -       -       
+redis   redis 8.8.0   1803811  1778382   98.6   22.7   935.5  437.8   2549.8  4169.7   -       -       254314 nil
+valkey  valkey 9.1.0  1770105  1745199   98.6   23.4   918.1  470.0   3215.4  5636.1   -       -       249074 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=3544120 hits=2292458 misses=398352
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=3444635 hits=2244035 misses=387279
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 453/2000 retrievable (22.7%), 1547 missing
+valkey dataset coverage: 467/2000 retrievable (23.4%), 1533 missing
+speedup vs redis:  0.25x
+speedup vs valkey: 0.25x
+gate (2.0x): FAIL, aki is 0.25x Redis, below the 2.0x bar
+--- cap-r10-v512-zipfian-16x-rep1 (order aki,redis,valkey, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%  cov%  MB/s   p50 us  p99 us   p999 us  rss MB  hwm MB  note
+aki     unknown       39608    37953     95.8  52.6  20.8   2027.5  65077.2  66650.1  -       -       1749 nil, 14898 refused
+redis   redis 8.8.0   1692525  1653772   97.7  5.3   871.2  486.7   2371.6   3575.8   -       -       387567 nil
+valkey  valkey 9.1.0  1580540  1544306   97.7  5.1   813.5  551.4   2963.5   5132.3   -       -       362361 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=5318690 hits=1916240 misses=597888
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=4997377 hits=1783736 misses=562028
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 106/2000 retrievable (5.3%), 1894 missing
+valkey dataset coverage: 102/2000 retrievable (5.1%), 1898 missing
+speedup vs redis:  0.02x
+speedup vs valkey: 0.02x
+gate (2.0x): FAIL, aki is 0.02x Redis, below the 2.0x bar
+--- cap-r10-v512-zipfian-16x-rep2 (order valkey,redis,aki, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%  cov%  MB/s   p50 us  p99 us   p999 us  rss MB  hwm MB  note
+aki     unknown       43902    42064     95.8  52.6  23.1   1929.2  65536.0  86245.4  -       -       1915 nil, 16548 refused
+redis   redis 8.8.0   1647024  1609313   97.7  5.1   847.8  504.8   2381.8   3586.0   -       -       377147 nil
+valkey  valkey 9.1.0  1563023  1527245   97.7  5.1   804.5  557.1   2986.0   5238.8   -       -       357825 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=5166436 hits=1860141 misses=580947
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=4947054 hits=1767808 misses=556398
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 101/2000 retrievable (5.1%), 1899 missing
+valkey dataset coverage: 102/2000 retrievable (5.1%), 1898 missing
+speedup vs redis:  0.03x
+speedup vs valkey: 0.03x
+gate (2.0x): FAIL, aki is 0.03x Redis, below the 2.0x bar
+--- cap-r10-v4096-uniform-1x-rep1 (order aki,redis,valkey, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       863056   863056    100.0  100.0  3405.2  662.0   4759.6  6512.6   -       -       
+redis   redis 8.8.0   1032320  1010083   97.8   78.3   3986.1  447.7   4898.8  8196.1   -       -       222394 nil
+valkey  valkey 9.1.0  1304715  1276772   97.9   77.8   5038.5  311.0   5492.7  9592.8   -       -       279463 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=2997340 hits=1216079 misses=334085
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=3718405 hits=1517810 misses=413498
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 1566/2000 retrievable (78.3%), 434 missing
+valkey dataset coverage: 1557/2000 retrievable (77.8%), 443 missing
+speedup vs redis:  0.85x
+speedup vs valkey: 0.68x
+gate (2.0x): FAIL, aki is 0.85x Redis, below the 2.0x bar
+--- cap-r10-v4096-uniform-1x-rep2 (order valkey,redis,aki, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       862499   862499    100.0  100.0  3403.0  663.0   4812.8  6717.4   -       -       
+redis   redis 8.8.0   996315   974922    97.9   79.2   3847.3  463.4   5189.6  8560.6   -       -       213960 nil
+valkey  valkey 9.1.0  1295009  1267356   97.9   77.6   5001.3  313.1   5472.3  9330.7   -       -       276574 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=2862554 hits=1161150 misses=318132
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=3693952 hits=1509951 misses=410515
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 1584/2000 retrievable (79.2%), 416 missing
+valkey dataset coverage: 1552/2000 retrievable (77.6%), 448 missing
+speedup vs redis:  0.88x
+speedup vs valkey: 0.68x
+gate (2.0x): FAIL, aki is 0.88x Redis, below the 2.0x bar
+--- cap-r10-v4096-uniform-4x-rep1 (order aki,redis,valkey, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us   p999 us  rss MB  hwm MB  note
+aki     unknown       411449   411449    100.0  100.0  1623.6  868.4   43974.7  60850.2  -       -       
+redis   redis 8.8.0   915473   842132    92.0   19.4   3325.8  495.9   5173.2   7995.4   -       -       733467 nil
+valkey  valkey 9.1.0  1036957  953844    92.0   19.7   3767.0  425.7   5636.1   9388.0   -       -       831220 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=9915439 hits=272944 misses=1105032
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=11203270 hits=308253 misses=1247681
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 388/2000 retrievable (19.4%), 1612 missing
+valkey dataset coverage: 394/2000 retrievable (19.7%), 1606 missing
+speedup vs redis:  0.49x
+speedup vs valkey: 0.43x
+gate (2.0x): FAIL, aki is 0.49x Redis, below the 2.0x bar
+--- cap-r10-v4096-uniform-4x-rep2 (order valkey,redis,aki, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us   p999 us  rss MB  hwm MB  note
+aki     unknown       423958   423958    100.0  100.0  1673.0  860.2   43384.8  55443.5  -       -       
+redis   redis 8.8.0   885592   814582    92.0   20.0   3217.0  513.3   5476.4   8912.9   -       -       710188 nil
+valkey  valkey 9.1.0  1026538  944282    92.0   19.4   3729.3  430.3   5648.4   9437.2   -       -       822663 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=9580827 hits=262843 misses=1068575
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=11087426 hits=305427 misses=1234857
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 399/2000 retrievable (20.0%), 1601 missing
+valkey dataset coverage: 389/2000 retrievable (19.4%), 1611 missing
+speedup vs redis:  0.52x
+speedup vs valkey: 0.45x
+gate (2.0x): FAIL, aki is 0.52x Redis, below the 2.0x bar
+--- cap-r10-v4096-uniform-16x-rep1 (order aki,redis,valkey, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us   rss MB  hwm MB  note
+aki     unknown       415634   415634    100.0  100.0  1640.7  768.5   5300.2  251396.1  -       -       
+redis   redis 8.8.0   928307   840164    90.5   4.5    3319.7  490.0   5169.2  8101.9    -       -       881562 nil
+valkey  valkey 9.1.0  978640   885688    90.5   5.1    3499.6  454.4   5632.0  9093.1    -       -       929662 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=11889523 hits=70137 misses=1324631
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=12550172 hits=73722 misses=1398296
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 89/2000 retrievable (4.5%), 1911 missing
+valkey dataset coverage: 103/2000 retrievable (5.1%), 1897 missing
+speedup vs redis:  0.49x
+speedup vs valkey: 0.47x
+gate (2.0x): FAIL, aki is 0.49x Redis, below the 2.0x bar
+--- cap-r10-v4096-uniform-16x-rep2 (order valkey,redis,aki, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us   rss MB  hwm MB  note
+aki     unknown       395254   395254    100.0  100.0  1560.2  820.2   5849.1  311951.4  -       -       
+redis   redis 8.8.0   883108   799265    90.5   4.5    3158.1  505.6   5619.7  9216.0    -       -       838536 nil
+valkey  valkey 9.1.0  977731   884889    90.5   4.5    3496.4  441.3   5767.2  9322.5    -       -       928561 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=11317751 hits=66628 misses=1261472
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=12510422 hits=73554 misses=1393598
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 90/2000 retrievable (4.5%), 1910 missing
+valkey dataset coverage: 91/2000 retrievable (4.5%), 1909 missing
+speedup vs redis:  0.49x
+speedup vs valkey: 0.45x
+gate (2.0x): FAIL, aki is 0.49x Redis, below the 2.0x bar
+--- cap-r10-v4096-zipfian-1x-rep1 (order aki,redis,valkey, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1343882  1343882   100.0  100.0  5299.8  489.0   3885.1  6246.4   -       -       
+redis   redis 8.8.0   1179505  1175931   99.7   78.5   4637.6  363.3   5054.5  8798.2   -       -       35749 nil
+valkey  valkey 9.1.0  1448456  1444148   99.7   78.2   5695.4  263.2   5382.1  9379.8   -       -       43083 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=492986 hits=1710498 misses=55544
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=591162 hits=2073604 misses=66278
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 1569/2000 retrievable (78.5%), 431 missing
+valkey dataset coverage: 1564/2000 retrievable (78.2%), 436 missing
+speedup vs redis:  1.14x
+speedup vs valkey: 0.93x
+gate (2.0x): FAIL, aki is 1.14x Redis, below the 2.0x bar
+--- cap-r10-v4096-zipfian-1x-rep2 (order valkey,redis,aki, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1340166  1340166   100.0  100.0  5285.2  494.3   3909.6  6332.4   -       -       
+redis   redis 8.8.0   1137917  1134516   99.7   76.0   4474.3  373.2   5394.4  9134.1   -       -       34008 nil
+valkey  valkey 9.1.0  1423003  1418727   99.7   80.8   5595.1  274.2   5382.1  9592.8   -       -       42757 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=472623 hits=1643136 misses=52912
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=579960 hits=2037684 misses=65324
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 1520/2000 retrievable (76.0%), 480 missing
+valkey dataset coverage: 1616/2000 retrievable (80.8%), 384 missing
+speedup vs redis:  1.18x
+speedup vs valkey: 0.94x
+gate (2.0x): FAIL, aki is 1.18x Redis, below the 2.0x bar
+--- cap-r10-v4096-zipfian-4x-rep1 (order aki,redis,valkey, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       748716   748716    100.0  100.0  2952.9  607.7   5177.3  48627.7  -       -       
+redis   redis 8.8.0   1059411  1042156   98.4   19.2   4110.8  435.5   4911.1  7946.2   -       -       172559 nil
+valkey  valkey 9.1.0  1349478  1327714   98.4   19.8   5237.2  302.6   5406.7  9338.9   -       -       217666 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=2388362 hits=1324031 misses=267209
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=2987760 hits=1681006 misses=333834
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 385/2000 retrievable (19.2%), 1615 missing
+valkey dataset coverage: 395/2000 retrievable (19.8%), 1605 missing
+speedup vs redis:  0.72x
+speedup vs valkey: 0.56x
+gate (2.0x): FAIL, aki is 0.72x Redis, below the 2.0x bar
+--- cap-r10-v4096-zipfian-4x-rep2 (order valkey,redis,aki, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       864147   864147    100.0  100.0  3408.2  603.6   5296.1  45973.5  -       -       
+redis   redis 8.8.0   1021361  1004728   98.4   20.9   3963.2  454.4   5124.1  8781.8   -       -       166342 nil
+valkey  valkey 9.1.0  1336674  1315034   98.4   18.0   5187.2  307.2   5341.2  9224.2   -       -       216422 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=2297835 hits=1273278 misses=257006
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=2966303 hits=1664862 misses=331630
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 418/2000 retrievable (20.9%), 1582 missing
+valkey dataset coverage: 360/2000 retrievable (18.0%), 1640 missing
+speedup vs redis:  0.86x
+speedup vs valkey: 0.66x
+gate (2.0x): FAIL, aki is 0.86x Redis, below the 2.0x bar
+--- cap-r10-v4096-zipfian-16x-rep1 (order aki,redis,valkey, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us   rss MB  hwm MB  note
+aki     unknown       781683   781683    100.0  100.0  3083.2  639.0   4390.9  206307.3  -       -       
+redis   redis 8.8.0   1014161  987977    97.4   5.1    3897.8  466.2   4767.7  7893.0    -       -       261869 nil
+valkey  valkey 9.1.0  1284137  1251039   97.4   4.8    4935.7  327.7   5414.9  9142.3    -       -       331017 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=3587260 hits=1117645 misses=400289
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=4517822 hits=1412482 misses=503798
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 102/2000 retrievable (5.1%), 1898 missing
+valkey dataset coverage: 95/2000 retrievable (4.8%), 1905 missing
+speedup vs redis:  0.79x
+speedup vs valkey: 0.62x
+gate (2.0x): FAIL, aki is 0.79x Redis, below the 2.0x bar
+--- cap-r10-v4096-zipfian-16x-rep2 (order valkey,redis,aki, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us   rss MB  hwm MB  note
+aki     unknown       780642   780642    100.0  100.0  3079.1  638.0   4489.2  202637.3  -       -       
+redis   redis 8.8.0   964000   939121    97.4   5.0    3705.1  489.0   5132.3  8855.6    -       -       248819 nil
+valkey  valkey 9.1.0  1272642  1239918   97.4   5.3    4891.8  331.0   5414.9  9003.0    -       -       327281 nil
+redis server window: maxmemory=128 MB policy=allkeys-lfu evicted=3411314 hits=1063109 misses=380951
+valkey server window: maxmemory=128 MB policy=allkeys-lfu evicted=4475603 hits=1402141 misses=498837
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 100/2000 retrievable (5.0%), 1900 missing
+valkey dataset coverage: 107/2000 retrievable (5.3%), 1893 missing
+speedup vs redis:  0.83x
+speedup vs valkey: 0.63x
+gate (2.0x): FAIL, aki is 0.83x Redis, below the 2.0x bar
+== done: /root/sqlo1bench/f3base1-cap-r10b/results.csv, manifest and per-cell JSON beside it ==
+== building aki-bench ==
+== building f3srv from /root/sqlo1bench/aki ==
+== sqlo1 core suite: 24 cells x 2 reps, akislot=f3, out /root/sqlo1bench/f3base1-data-r90 ==
+--- data-r90-v16-uniform-1x-rep1 (order aki,redis,valkey, 1157049 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=1157049 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1757401  1757401   100.0  100.0  89.6   389.9   3510.3  6058.0   -       -       
+redis   redis 8.8.0   2710984  2710984   100.0  100.0  138.2  262.1   2922.5  5455.9   -       -       
+valkey  valkey 9.1.0  3142076  3142076   100.0  100.0  160.2  195.3   3950.6  7331.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=36421296 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=42367134 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.65x
+speedup vs valkey: 0.56x
+gate (2.0x): FAIL, aki is 0.65x Redis, below the 2.0x bar
+--- data-r90-v16-uniform-1x-rep2 (order valkey,redis,aki, 1157049 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=1157049 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1771716  1771716   100.0  100.0  90.3   382.2   3512.3  6107.1   -       -       
+redis   redis 8.8.0   2623247  2623247   100.0  100.0  133.7  272.9   2943.0  5333.0   -       -       
+valkey  valkey 9.1.0  3158117  3158117   100.0  100.0  161.0  194.4   3938.3  7249.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=35115372 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=42571528 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.68x
+speedup vs valkey: 0.56x
+gate (2.0x): FAIL, aki is 0.68x Redis, below the 2.0x bar
+--- data-r90-v16-uniform-4x-rep1 (order aki,redis,valkey, 4628197 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=4628197 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1750474  1750474   100.0  100.0  90.5   394.5   3459.1  5963.8   -       -       
+redis   redis 8.8.0   2662629  2662629   100.0  100.0  137.7  271.1   2926.6  5087.2   -       -       
+valkey  valkey 9.1.0  3123886  3123886   100.0  100.0  161.6  200.7   3878.9  7008.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=35139564 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=42019584 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.66x
+speedup vs valkey: 0.56x
+gate (2.0x): FAIL, aki is 0.66x Redis, below the 2.0x bar
+--- data-r90-v16-uniform-4x-rep2 (order valkey,redis,aki, 4628197 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=4628197 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1756063  1756063   100.0  100.0  90.8   390.7   3467.3  6156.3   -       -       
+redis   redis 8.8.0   2617773  2617773   100.0  100.0  135.4  277.0   2955.3  5398.5   -       -       
+valkey  valkey 9.1.0  3121021  3121021   100.0  100.0  161.4  201.9   3872.8  7049.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=34345412 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=42070036 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.67x
+speedup vs valkey: 0.56x
+gate (2.0x): FAIL, aki is 0.67x Redis, below the 2.0x bar
+--- data-r90-v16-uniform-16x-rep1 (order aki,redis,valkey, 18512790 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=18512790 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1727610  1727610   100.0  100.0  90.4   400.6   3536.9  6377.5   -       -       
+redis   redis 8.8.0   2582652  2582652   100.0  100.0  135.2  282.6   2877.4  5230.6   -       -       
+valkey  valkey 9.1.0  3003295  3003295   100.0  100.0  157.2  214.5   3846.1  7122.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=31091784 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=40477040 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.67x
+speedup vs valkey: 0.58x
+gate (2.0x): FAIL, aki is 0.67x Redis, below the 2.0x bar
+--- data-r90-v16-uniform-16x-rep2 (order valkey,redis,aki, 18512790 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=18512790 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1765780  1765780   100.0  100.0  92.4   387.3   3450.9  5988.4   -       -       
+redis   redis 8.8.0   2573512  2573512   100.0  100.0  134.7  283.6   2938.9  5197.8   -       -       
+valkey  valkey 9.1.0  3013897  3013897   100.0  100.0  157.8  214.1   3889.2  7147.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=30992908 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=40528148 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.69x
+speedup vs valkey: 0.59x
+gate (2.0x): FAIL, aki is 0.69x Redis, below the 2.0x bar
+--- data-r90-v16-zipfian-1x-rep1 (order aki,redis,valkey, 1157049 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=1157049 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1760147  1760147   100.0  100.0  84.2   385.0   3495.9  6168.6   -       -       
+redis   redis 8.8.0   2643626  2643626   100.0  100.0  126.5  262.7   3000.3  5312.5   -       -       
+valkey  valkey 9.1.0  3077840  3077840   100.0  100.0  147.3  199.2   3846.1  6959.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=35613620 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=41451632 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.67x
+speedup vs valkey: 0.57x
+gate (2.0x): FAIL, aki is 0.67x Redis, below the 2.0x bar
+--- data-r90-v16-zipfian-1x-rep2 (order valkey,redis,aki, 1157049 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=1157049 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1765540  1765540   100.0  100.0  84.5   381.7   3491.8  6168.6   -       -       
+redis   redis 8.8.0   2532295  2532295   100.0  100.0  121.2  276.2   3139.6  5476.4   -       -       
+valkey  valkey 9.1.0  3072601  3072601   100.0  100.0  147.1  197.9   3917.8  7184.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=34110834 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=41382002 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.70x
+speedup vs valkey: 0.57x
+gate (2.0x): FAIL, aki is 0.70x Redis, below the 2.0x bar
+--- data-r90-v16-zipfian-4x-rep1 (order aki,redis,valkey, 4628197 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=4628197 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1755596  1755596   100.0  100.0  84.7   391.2   3424.3  5824.5   -       -       
+redis   redis 8.8.0   2606090  2606090   100.0  100.0  125.7  272.4   2924.5  5210.1   -       -       
+valkey  valkey 9.1.0  3039391  3039391   100.0  100.0  146.6  201.2   3901.4  7286.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=34470716 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=40970100 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.67x
+speedup vs valkey: 0.58x
+gate (2.0x): FAIL, aki is 0.67x Redis, below the 2.0x bar
+--- data-r90-v16-zipfian-4x-rep2 (order valkey,redis,aki, 4628197 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=4628197 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1759679  1759679   100.0  100.0  84.9   386.3   3481.6  6107.1   -       -       
+redis   redis 8.8.0   2544581  2544581   100.0  100.0  122.8  278.8   2963.5  5312.5   -       -       
+valkey  valkey 9.1.0  3017379  3017379   100.0  100.0  145.6  205.7   3831.8  7061.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=33447682 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=40651734 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.69x
+speedup vs valkey: 0.58x
+gate (2.0x): FAIL, aki is 0.69x Redis, below the 2.0x bar
+--- data-r90-v16-zipfian-16x-rep1 (order aki,redis,valkey, 18512790 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=18512790 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1782913  1782913   100.0  100.0  86.7   372.5   3477.5  6049.8   -       -       
+redis   redis 8.8.0   2518865  2518865   100.0  100.0  122.4  285.4   2897.9  5218.3   -       -       
+valkey  valkey 9.1.0  2937443  2937443   100.0  100.0  142.8  219.3   3788.8  6688.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=30006394 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=39616110 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.61x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r90-v16-zipfian-16x-rep2 (order valkey,redis,aki, 18512790 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=18512790 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1741857  1741857   100.0  100.0  84.7   397.3   3403.8  5799.9   -       -       
+redis   redis 8.8.0   2500756  2500756   100.0  100.0  121.5  286.5   2979.8  5173.2   -       -       
+valkey  valkey 9.1.0  2904657  2904657   100.0  100.0  141.2  222.3   3741.7  6938.6   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=29822496 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=39171720 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.70x
+speedup vs valkey: 0.60x
+gate (2.0x): FAIL, aki is 0.70x Redis, below the 2.0x bar
+--- data-r90-v128-uniform-1x-rep1 (order aki,redis,valkey, 588674 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=588674 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1759532  1759532   100.0  100.0  278.8  390.7   3475.5  6172.7   -       -       
+redis   redis 8.8.0   2507904  2507904   100.0  100.0  397.4  304.6   2721.8  4927.5   -       -       
+valkey  valkey 9.1.0  3022515  3022515   100.0  100.0  478.9  207.9   3950.6  7352.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=33817504 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=40806006 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.70x
+speedup vs valkey: 0.58x
+gate (2.0x): FAIL, aki is 0.70x Redis, below the 2.0x bar
+--- data-r90-v128-uniform-1x-rep2 (order valkey,redis,aki, 588674 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=588674 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1763027  1763027   100.0  100.0  279.3  387.8   3522.6  6246.4   -       -       
+redis   redis 8.8.0   2425919  2425919   100.0  100.0  384.4  312.6   2869.2  5214.2   -       -       
+valkey  valkey 9.1.0  3015359  3015359   100.0  100.0  477.8  208.9   3956.7  7290.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=32676536 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=40684156 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.58x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r90-v128-uniform-4x-rep1 (order aki,redis,valkey, 2354696 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=2354696 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1748415  1748415   100.0  100.0  278.4  395.8   3481.6  6352.9   -       -       
+redis   redis 8.8.0   2363873  2363873   100.0  100.0  376.4  335.1   2680.8  4706.3   -       -       
+valkey  valkey 9.1.0  2918243  2918243   100.0  100.0  464.7  221.2   3905.5  7368.7   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=31544632 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=39384446 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.74x
+speedup vs valkey: 0.60x
+gate (2.0x): FAIL, aki is 0.74x Redis, below the 2.0x bar
+--- data-r90-v128-uniform-4x-rep2 (order valkey,redis,aki, 2354696 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=2354696 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1749362  1749362   100.0  100.0  278.6  393.5   3485.7  6357.0   -       -       
+redis   redis 8.8.0   2305716  2305716   100.0  100.0  367.2  342.0   2740.2  4956.2   -       -       
+valkey  valkey 9.1.0  2905537  2905537   100.0  100.0  462.7  221.8   3881.0  7159.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=30762870 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=39229642 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.76x
+speedup vs valkey: 0.60x
+gate (2.0x): FAIL, aki is 0.76x Redis, below the 2.0x bar
+--- data-r90-v128-uniform-16x-rep1 (order aki,redis,valkey, 9418787 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=9418787 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1085881  749716    69.0   72.5   137.1  859.1   2934.8  4313.1   -       -       3025879 nil, 336011 refused
+redis   redis 8.8.0   2266111  2266111   100.0  100.0  361.7  354.6   2637.8  4792.3   -       -       
+valkey  valkey 9.1.0  2709296  2709296   100.0  100.0  432.5  255.4   3833.9  6881.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=28511006 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=36479208 misses=0
+aki dataset coverage: 1449/2000 retrievable (72.5%), 551 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.33x
+speedup vs valkey: 0.28x
+gate (2.0x): FAIL, aki is 0.33x Redis, below the 2.0x bar
+--- data-r90-v128-uniform-16x-rep2 (order valkey,redis,aki, 9418787 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=9418787 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1077311  743811    69.0   72.5   136.0  867.3   2965.5  4329.5   -       -       3001966 nil, 333410 refused
+redis   redis 8.8.0   2257373  2257373   100.0  100.0  360.3  357.4   2654.2  4571.1   -       -       
+valkey  valkey 9.1.0  2716442  2716442   100.0  100.0  433.6  254.0   3881.0  7159.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=28367024 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=36656952 misses=0
+aki dataset coverage: 1449/2000 retrievable (72.5%), 551 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.33x
+speedup vs valkey: 0.27x
+gate (2.0x): FAIL, aki is 0.33x Redis, below the 2.0x bar
+--- data-r90-v128-zipfian-1x-rep1 (order aki,redis,valkey, 588674 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=588674 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1762003  1762003   100.0  100.0  273.9  382.2   3483.6  6012.9   -       -       
+redis   redis 8.8.0   2533935  2533935   100.0  100.0  393.9  293.4   2748.4  4902.9   -       -       
+valkey  valkey 9.1.0  2958109  2958109   100.0  100.0  459.8  207.4   3962.9  7221.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=34134632 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=39898232 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.70x
+speedup vs valkey: 0.60x
+gate (2.0x): FAIL, aki is 0.70x Redis, below the 2.0x bar
+--- data-r90-v128-zipfian-1x-rep2 (order valkey,redis,aki, 588674 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=588674 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1789247  1789247   100.0  100.0  278.1  365.1   3567.6  6352.9   -       -       
+redis   redis 8.8.0   2435130  2435130   100.0  100.0  378.5  305.2   2875.4  5070.8   -       -       
+valkey  valkey 9.1.0  2984027  2984027   100.0  100.0  463.9  209.0   3909.6  7147.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=32546580 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=40279214 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.60x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r90-v128-zipfian-4x-rep1 (order aki,redis,valkey, 2354696 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=2354696 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1764266  1764266   100.0  100.0  274.9  388.9   3358.7  5808.1   -       -       
+redis   redis 8.8.0   2449507  2449507   100.0  100.0  381.7  308.5   2740.2  4956.2   -       -       
+valkey  valkey 9.1.0  2887877  2887877   100.0  100.0  450.0  219.6   3938.3  7237.6   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=32708084 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=38993236 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.72x
+speedup vs valkey: 0.61x
+gate (2.0x): FAIL, aki is 0.72x Redis, below the 2.0x bar
+--- data-r90-v128-zipfian-4x-rep2 (order valkey,redis,aki, 2354696 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=2354696 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1748238  1748238   100.0  100.0  272.4  389.4   3455.0  6000.6   -       -       
+redis   redis 8.8.0   2349705  2349705   100.0  100.0  366.2  324.1   2834.4  5099.5   -       -       
+valkey  valkey 9.1.0  2890130  2890130   100.0  100.0  450.4  219.4   3928.1  7000.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=31281808 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=38970856 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.74x
+speedup vs valkey: 0.60x
+gate (2.0x): FAIL, aki is 0.74x Redis, below the 2.0x bar
+--- data-r90-v128-zipfian-16x-rep1 (order aki,redis,valkey, 9418787 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=9418787 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1399061  1365294   97.6   72.5   214.9  610.8   2836.5  4816.9   -       -       304371 nil, 33331 refused
+redis   redis 8.8.0   2343372  2343372   100.0  100.0  366.0  332.0   2678.8  4825.1   -       -       
+valkey  valkey 9.1.0  2709298  2709298   100.0  100.0  423.1  248.8   3817.5  6983.7   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=29447928 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=36542240 misses=0
+aki dataset coverage: 1449/2000 retrievable (72.5%), 551 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.58x
+speedup vs valkey: 0.50x
+gate (2.0x): FAIL, aki is 0.58x Redis, below the 2.0x bar
+--- data-r90-v128-zipfian-16x-rep2 (order valkey,redis,aki, 9418787 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=9418787 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1394143  1360485   97.6   72.5   214.1  615.9   2795.5  4497.4   -       -       303393 nil, 33210 refused
+redis   redis 8.8.0   2332669  2332669   100.0  100.0  364.3  334.1   2672.6  4833.3   -       -       
+valkey  valkey 9.1.0  2721145  2721145   100.0  100.0  425.0  249.5   3811.3  6926.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=29260536 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=36728116 misses=0
+aki dataset coverage: 1449/2000 retrievable (72.5%), 551 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.58x
+speedup vs valkey: 0.50x
+gate (2.0x): FAIL, aki is 0.58x Redis, below the 2.0x bar
+--- data-r90-v512-uniform-1x-rep1 (order aki,redis,valkey, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1722616  1722616   100.0  100.0  902.8   399.4   3522.6  6168.6   -       -       
+redis   redis 8.8.0   2371996  2371996   100.0  100.0  1243.1  326.1   2740.2  4984.8   -       -       
+valkey  valkey 9.1.0  2382359  2382359   100.0  100.0  1248.5  306.9   3813.4  7077.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=32030872 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=32273322 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.72x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r90-v512-uniform-1x-rep2 (order valkey,redis,aki, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1738873  1738873   100.0  100.0  911.3   399.6   3403.8  6213.6   -       -       
+redis   redis 8.8.0   2284836  2284836   100.0  100.0  1197.4  335.6   2910.2  5140.5   -       -       
+valkey  valkey 9.1.0  2384115  2384115   100.0  100.0  1249.5  307.2   3911.7  7139.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=30750144 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=32203032 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.76x
+speedup vs valkey: 0.73x
+gate (2.0x): FAIL, aki is 0.76x Redis, below the 2.0x bar
+--- data-r90-v512-uniform-4x-rep1 (order aki,redis,valkey, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1722620  1722620   100.0  100.0  904.0   408.3   3375.1  6189.1   -       -       
+redis   redis 8.8.0   2289044  2289044   100.0  100.0  1201.2  342.5   2797.6  4956.2   -       -       
+valkey  valkey 9.1.0  2285932  2285932   100.0  100.0  1199.6  325.9   3799.0  7057.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=30895888 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=30923526 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.75x
+speedup vs valkey: 0.75x
+gate (2.0x): FAIL, aki is 0.75x Redis, below the 2.0x bar
+--- data-r90-v512-uniform-4x-rep2 (order valkey,redis,aki, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1719178  1719178   100.0  100.0  902.2   409.6   3334.1  6037.5   -       -       
+redis   redis 8.8.0   2232376  2232376   100.0  100.0  1171.5  349.4   2869.2  5251.1   -       -       
+valkey  valkey 9.1.0  2280085  2280085   100.0  100.0  1196.5  329.5   3776.5  6926.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=30121524 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=30850890 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.77x
+speedup vs valkey: 0.75x
+gate (2.0x): FAIL, aki is 0.77x Redis, below the 2.0x bar
+--- data-r90-v512-uniform-16x-rep1 (order aki,redis,valkey, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1054881  574974    54.5   52.6   344.5   874.0   3045.4  4210.7   -       -       4320476 nil, 479339 refused
+redis   redis 8.8.0   2145343  2145343   100.0  100.0  1127.6  379.4   2666.5  4784.1   -       -       
+valkey  valkey 9.1.0  2033224  2033224   100.0  100.0  1068.7  390.7   3579.9  6406.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=28941532 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=27401216 misses=0
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.27x
+speedup vs valkey: 0.28x
+gate (2.0x): FAIL, aki is 0.27x Redis, below the 2.0x bar
+--- data-r90-v512-uniform-16x-rep2 (order valkey,redis,aki, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1057677  576487    54.5   52.6   345.4   871.4   3022.8  4227.1   -       -       4331730 nil, 480451 refused
+redis   redis 8.8.0   2122735  2122735   100.0  100.0  1115.8  379.1   2811.9  5070.8   -       -       
+valkey  valkey 9.1.0  2050176  2050176   100.0  100.0  1077.6  386.0   3571.7  6574.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=28580280 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=27605156 misses=0
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.27x
+speedup vs valkey: 0.28x
+gate (2.0x): FAIL, aki is 0.27x Redis, below the 2.0x bar
+--- data-r90-v512-zipfian-1x-rep1 (order aki,redis,valkey, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1743783  1743783   100.0  100.0  909.2   393.2   3436.5  6357.0   -       -       
+redis   redis 8.8.0   2447503  2447503   100.0  100.0  1276.1  304.4   2793.5  5111.8   -       -       
+valkey  valkey 9.1.0  2666785  2666785   100.0  100.0  1390.4  254.6   3786.8  7131.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=33127628 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=36020746 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.65x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r90-v512-zipfian-1x-rep2 (order valkey,redis,aki, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1739983  1739983   100.0  100.0  907.2   398.6   3405.8  6123.5   -       -       
+redis   redis 8.8.0   2367441  2367441   100.0  100.0  1234.3  313.1   2930.7  5226.5   -       -       
+valkey  valkey 9.1.0  2655452  2655452   100.0  100.0  1384.5  254.7   3835.9  7467.0   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=31921442 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=35844790 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.66x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r90-v512-zipfian-4x-rep1 (order aki,redis,valkey, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1735084  1735084   100.0  100.0  905.3   404.2   3336.2  5914.6   -       -       
+redis   redis 8.8.0   2388681  2388681   100.0  100.0  1246.3  319.0   2740.2  5140.5   -       -       
+valkey  valkey 9.1.0  2530285  2530285   100.0  100.0  1320.2  278.5   3835.9  7209.0   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=32302080 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=34205642 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.69x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r90-v512-zipfian-4x-rep2 (order valkey,redis,aki, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1709805  1709805   100.0  100.0  892.1   407.3   3418.1  6058.0   -       -       
+redis   redis 8.8.0   2305900  2305900   100.0  100.0  1203.1  330.2   2854.9  5156.9   -       -       
+valkey  valkey 9.1.0  2517764  2517764   100.0  100.0  1313.7  278.8   3868.7  7082.0   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=31123372 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=34021954 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.74x
+speedup vs valkey: 0.68x
+gate (2.0x): FAIL, aki is 0.74x Redis, below the 2.0x bar
+--- data-r90-v512-zipfian-16x-rep1 (order aki,redis,valkey, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1308001  1253391   95.8   52.6   659.1   696.8   2662.4  4304.9   -       -       491714 nil, 54406 refused
+redis   redis 8.8.0   2268298  2268298   100.0  100.0  1184.4  342.0   2775.0  5062.7   -       -       
+valkey  valkey 9.1.0  2388507  2388507   100.0  100.0  1247.2  305.9   3825.7  7118.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=30682816 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=32319458 misses=0
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.55x
+speedup vs valkey: 0.52x
+gate (2.0x): FAIL, aki is 0.55x Redis, below the 2.0x bar
+--- data-r90-v512-zipfian-16x-rep2 (order valkey,redis,aki, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1313913  1259053   95.8   52.6   662.1   689.2   2699.3  4493.3   -       -       493964 nil, 54691 refused
+redis   redis 8.8.0   2238993  2238993   100.0  100.0  1169.1  349.2   2768.9  5029.9   -       -       
+valkey  valkey 9.1.0  2362663  2362663   100.0  100.0  1233.7  309.5   3805.2  6828.0   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=30121802 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=31931008 misses=0
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.56x
+speedup vs valkey: 0.53x
+gate (2.0x): FAIL, aki is 0.56x Redis, below the 2.0x bar
+--- data-r90-v4096-uniform-1x-rep1 (order aki,redis,valkey, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1429690  1429690   100.0  100.0  5635.4  555.5   3002.4  5357.6   -       -       
+redis   redis 8.8.0   1412667  1412667   100.0  100.0  5568.3  532.5   2740.2  4726.8   -       -       
+valkey  valkey 9.1.0  1322236  1322236   100.0  100.0  5211.8  607.7   3371.0  6660.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19053632 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17787760 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.01x
+speedup vs valkey: 1.08x
+gate (2.0x): FAIL, aki is 1.01x Redis, below the 2.0x bar
+--- data-r90-v4096-uniform-1x-rep2 (order valkey,redis,aki, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1429377  1429377   100.0  100.0  5634.2  561.2   2826.2  5402.6   -       -       
+redis   redis 8.8.0   1358040  1358040   100.0  100.0  5353.0  554.5   2809.9  4853.8   -       -       
+valkey  valkey 9.1.0  1328915  1328915   100.0  100.0  5238.2  600.6   3491.8  6778.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18091864 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17877668 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.05x
+speedup vs valkey: 1.08x
+gate (2.0x): FAIL, aki is 1.05x Redis, below the 2.0x bar
+--- data-r90-v4096-uniform-4x-rep1 (order aki,redis,valkey, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1421390  1421390   100.0  100.0  5603.6  573.4   2818.0  4948.0   -       -       
+redis   redis 8.8.0   1325437  1325437   100.0  100.0  5225.3  577.0   2637.8  4567.0   -       -       
+valkey  valkey 9.1.0  1242459  1242459   100.0  100.0  4898.2  661.0   3199.0  5849.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17893232 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16839116 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.07x
+speedup vs valkey: 1.14x
+gate (2.0x): FAIL, aki is 1.07x Redis, below the 2.0x bar
+--- data-r90-v4096-uniform-4x-rep2 (order valkey,redis,aki, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1414315  1414315   100.0  100.0  5575.7  568.8   2940.9  5410.8   -       -       
+redis   redis 8.8.0   1275785  1275785   100.0  100.0  5029.6  596.5   2768.9  4775.9   -       -       
+valkey  valkey 9.1.0  1228688  1228688   100.0  100.0  4843.9  673.8   3182.6  5681.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17234536 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16604602 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.11x
+speedup vs valkey: 1.15x
+gate (2.0x): FAIL, aki is 1.11x Redis, below the 2.0x bar
+--- data-r90-v4096-uniform-16x-rep1 (order aki,redis,valkey, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       990402   486003    49.1   47.4   2132.8  926.7   3246.1  4505.6   -       -       4540813 nil, 504051 refused
+redis   redis 8.8.0   1292534  1292534   100.0  100.0  5097.1  596.5   2568.2  4288.5   -       -       
+valkey  valkey 9.1.0  1239922  1239922   100.0  100.0  4889.7  662.5   3270.7  6115.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17470204 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16670004 misses=0
+aki dataset coverage: 948/2000 retrievable (47.4%), 1052 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.38x
+speedup vs valkey: 0.39x
+gate (2.0x): FAIL, aki is 0.38x Redis, below the 2.0x bar
+--- data-r90-v4096-uniform-16x-rep2 (order valkey,redis,aki, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       986760   484218    49.1   47.4   2125.0  933.9   3219.5  4300.8   -       -       4523688 nil, 502195 refused
+redis   redis 8.8.0   1251055  1251055   100.0  100.0  4933.6  609.3   2768.9  4763.6   -       -       
+valkey  valkey 9.1.0  1237727  1237727   100.0  100.0  4881.0  666.1   3242.0  5730.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16868998 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16676194 misses=0
+aki dataset coverage: 948/2000 retrievable (47.4%), 1052 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.39x
+speedup vs valkey: 0.39x
+gate (2.0x): FAIL, aki is 0.39x Redis, below the 2.0x bar
+--- data-r90-v4096-zipfian-1x-rep1 (order aki,redis,valkey, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1481362  1481362   100.0  100.0  5836.3  525.3   2908.2  5181.4   -       -       
+redis   redis 8.8.0   1587733  1587733   100.0  100.0  6255.4  468.5   2660.4  4747.3   -       -       
+valkey  valkey 9.1.0  1548178  1548178   100.0  100.0  6099.6  489.5   3500.0  7020.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=21392746 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=20886256 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.93x
+speedup vs valkey: 0.96x
+gate (2.0x): FAIL, aki is 0.93x Redis, below the 2.0x bar
+--- data-r90-v4096-zipfian-1x-rep2 (order valkey,redis,aki, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1476792  1476792   100.0  100.0  5818.3  527.4   2897.9  5255.2   -       -       
+redis   redis 8.8.0   1498961  1498961   100.0  100.0  5905.7  504.1   2750.5  4825.1   -       -       
+valkey  valkey 9.1.0  1552647  1552647   100.0  100.0  6117.2  487.7   3577.9  6754.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=20056524 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=20879588 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.99x
+speedup vs valkey: 0.95x
+gate (2.0x): FAIL, aki is 0.99x Redis, below the 2.0x bar
+--- data-r90-v4096-zipfian-4x-rep1 (order aki,redis,valkey, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1461030  1461030   100.0  100.0  5756.7  537.6   2938.9  5287.9   -       -       
+redis   redis 8.8.0   1510346  1510346   100.0  100.0  5951.0  495.6   2680.8  4984.8   -       -       
+valkey  valkey 9.1.0  1440234  1440234   100.0  100.0  5674.7  536.6   3596.3  6963.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=20342626 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19483238 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.97x
+speedup vs valkey: 1.01x
+gate (2.0x): FAIL, aki is 0.97x Redis, below the 2.0x bar
+--- data-r90-v4096-zipfian-4x-rep2 (order valkey,redis,aki, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1458557  1458557   100.0  100.0  5746.9  536.6   2875.4  5169.2   -       -       
+redis   redis 8.8.0   1429114  1429114   100.0  100.0  5630.9  528.9   2762.8  4816.9   -       -       
+valkey  valkey 9.1.0  1445399  1445399   100.0  100.0  5695.1  535.0   3514.4  7012.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19382342 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19549272 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.02x
+speedup vs valkey: 1.01x
+gate (2.0x): FAIL, aki is 1.02x Redis, below the 2.0x bar
+--- data-r90-v4096-zipfian-16x-rep1 (order aki,redis,valkey, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1135987  1073151   94.5   47.4   4255.4  794.1   2834.4  4526.1   -       -       565968 nil, 62459 refused
+redis   redis 8.8.0   1449560  1449560   100.0  100.0  5712.1  518.9   2701.3  4825.1   -       -       
+valkey  valkey 9.1.0  1388680  1388680   100.0  100.0  5472.2  565.2   3485.7  6664.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19530108 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18787740 misses=0
+aki dataset coverage: 948/2000 retrievable (47.4%), 1052 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.74x
+speedup vs valkey: 0.77x
+gate (2.0x): FAIL, aki is 0.74x Redis, below the 2.0x bar
+--- data-r90-v4096-zipfian-16x-rep2 (order valkey,redis,aki, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1141378  1078244   94.5   47.4   4275.6  789.5   2809.9  4481.0   -       -       568611 nil, 62779 refused
+redis   redis 8.8.0   1408576  1408576   100.0  100.0  5550.6  536.6   2744.3  4866.0   -       -       
+valkey  valkey 9.1.0  1384032  1384032   100.0  100.0  5453.8  571.4   3385.3  6295.6   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19039780 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18679298 misses=0
+aki dataset coverage: 948/2000 retrievable (47.4%), 1052 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.77x
+speedup vs valkey: 0.78x
+gate (2.0x): FAIL, aki is 0.77x Redis, below the 2.0x bar
+== done: /root/sqlo1bench/f3base1-data-r90/results.csv, manifest and per-cell JSON beside it ==
+== building aki-bench ==
+== building f3srv from /root/sqlo1bench/aki ==
+== sqlo1 core suite: 24 cells x 2 reps, akislot=f3, out /root/sqlo1bench/f3base1-data-r50 ==
+--- data-r50-v16-uniform-1x-rep1 (order aki,redis,valkey, 1157049 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=1157049 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1756567  1756567   100.0  100.0  92.9   392.7   3479.6  6533.1   -       -       
+redis   redis 8.8.0   2637131  2637131   100.0  100.0  139.5  277.2   2852.9  5136.4   -       -       
+valkey  valkey 9.1.0  2870661  2870661   100.0  100.0  151.8  228.2   3962.9  7204.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19633154 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=21507932 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.67x
+speedup vs valkey: 0.61x
+gate (2.0x): FAIL, aki is 0.67x Redis, below the 2.0x bar
+--- data-r50-v16-uniform-1x-rep2 (order valkey,redis,aki, 1157049 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=1157049 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1759287  1759287   100.0  100.0  93.0   392.2   3459.1  6152.2   -       -       
+redis   redis 8.8.0   2521074  2521074   100.0  100.0  133.3  290.8   2971.6  5263.4   -       -       
+valkey  valkey 9.1.0  2895414  2895414   100.0  100.0  153.1  229.4   3903.5  7049.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18750234 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=21667242 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.70x
+speedup vs valkey: 0.61x
+gate (2.0x): FAIL, aki is 0.70x Redis, below the 2.0x bar
+--- data-r50-v16-uniform-4x-rep1 (order aki,redis,valkey, 4628197 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=4628197 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1748912  1748912   100.0  100.0  93.8   391.4   3541.0  6393.9   -       -       
+redis   redis 8.8.0   2547639  2547639   100.0  100.0  136.6  291.6   2891.8  5095.4   -       -       
+valkey  valkey 9.1.0  2865611  2865611   100.0  100.0  153.7  231.9   3833.9  6807.6   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18645450 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=21443344 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.69x
+speedup vs valkey: 0.61x
+gate (2.0x): FAIL, aki is 0.69x Redis, below the 2.0x bar
+--- data-r50-v16-uniform-4x-rep2 (order valkey,redis,aki, 4628197 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=4628197 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1748760  1748760   100.0  100.0  93.8   397.3   3510.3  6185.0   -       -       
+redis   redis 8.8.0   2494252  2494252   100.0  100.0  133.8  297.7   2947.1  5394.4   -       -       
+valkey  valkey 9.1.0  2814065  2814065   100.0  100.0  150.9  235.5   3952.6  7335.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18169262 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=21169646 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.70x
+speedup vs valkey: 0.62x
+gate (2.0x): FAIL, aki is 0.70x Redis, below the 2.0x bar
+--- data-r50-v16-uniform-16x-rep1 (order aki,redis,valkey, 18512790 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=18512790 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1729227  1729227   100.0  100.0  93.8   403.7   3475.5  5984.3   -       -       
+redis   redis 8.8.0   2365509  2365509   100.0  100.0  128.3  323.3   2885.6  5070.8   -       -       
+valkey  valkey 9.1.0  2615382  2615382   100.0  100.0  141.9  267.5   3860.5  7147.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=15750108 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19595126 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.66x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r50-v16-uniform-16x-rep2 (order valkey,redis,aki, 18512790 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=18512790 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1730577  1730577   100.0  100.0  93.9   401.9   3502.1  5939.2   -       -       
+redis   redis 8.8.0   2359211  2359211   100.0  100.0  128.0  323.6   2865.2  5074.9   -       -       
+valkey  valkey 9.1.0  2643351  2643351   100.0  100.0  143.4  265.5   3862.5  6991.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=15721814 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19789898 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.65x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r50-v16-zipfian-1x-rep1 (order aki,redis,valkey, 1157049 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=1157049 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1770028  1770028   100.0  100.0  88.1   381.2   3448.8  6430.7   -       -       
+redis   redis 8.8.0   2580526  2580526   100.0  100.0  128.4  277.5   2928.6  5283.8   -       -       
+valkey  valkey 9.1.0  2885410  2885410   100.0  100.0  143.6  224.1   3930.1  7266.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19263418 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=21631300 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.69x
+speedup vs valkey: 0.61x
+gate (2.0x): FAIL, aki is 0.69x Redis, below the 2.0x bar
+--- data-r50-v16-zipfian-1x-rep2 (order valkey,redis,aki, 1157049 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=1157049 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1769638  1769638   100.0  100.0  88.1   381.7   3565.6  6041.6   -       -       
+redis   redis 8.8.0   2487602  2487602   100.0  100.0  123.8  289.3   3006.5  5419.0   -       -       
+valkey  valkey 9.1.0  2832806  2832806   100.0  100.0  141.0  226.8   3921.9  7045.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18590324 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=21218318 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.62x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r50-v16-zipfian-4x-rep1 (order aki,redis,valkey, 4628197 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=4628197 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1738774  1738774   100.0  100.0  87.2   395.0   3471.4  6082.6   -       -       
+redis   redis 8.8.0   2523879  2523879   100.0  100.0  126.6  287.5   2916.4  5230.6   -       -       
+valkey  valkey 9.1.0  2754878  2754878   100.0  100.0  138.2  240.0   3868.7  7041.0   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18454972 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=20670284 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.69x
+speedup vs valkey: 0.63x
+gate (2.0x): FAIL, aki is 0.69x Redis, below the 2.0x bar
+--- data-r50-v16-zipfian-4x-rep2 (order valkey,redis,aki, 4628197 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=4628197 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1758182  1758182   100.0  100.0  88.2   392.4   3385.3  6037.5   -       -       
+redis   redis 8.8.0   2467956  2467956   100.0  100.0  123.8  295.4   2977.8  5312.5   -       -       
+valkey  valkey 9.1.0  2763854  2763854   100.0  100.0  138.6  240.1   3838.0  6959.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18002372 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=20652412 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.64x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r50-v16-zipfian-16x-rep1 (order aki,redis,valkey, 18512790 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=18512790 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1728178  1728178   100.0  100.0  87.3   402.4   3469.3  5955.6   -       -       
+redis   redis 8.8.0   2368502  2368502   100.0  100.0  119.6  316.9   2779.1  4927.5   -       -       
+valkey  valkey 9.1.0  2629112  2629112   100.0  100.0  132.8  261.6   3772.4  6815.7   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=15621006 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19744856 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.66x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r50-v16-zipfian-16x-rep2 (order valkey,redis,aki, 18512790 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=18512790 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1729366  1729366   100.0  100.0  87.4   404.5   3401.7  5570.6   -       -       
+redis   redis 8.8.0   2365372  2365372   100.0  100.0  119.5  313.1   2877.4  5177.3   -       -       
+valkey  valkey 9.1.0  2641590  2641590   100.0  100.0  133.4  261.4   3690.5  6721.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=15585794 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19884806 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.65x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r50-v128-uniform-1x-rep1 (order aki,redis,valkey, 588674 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=588674 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1760969  1760969   100.0  100.0  282.4  390.1   3479.6  6078.5   -       -       
+redis   redis 8.8.0   2468677  2468677   100.0  100.0  395.9  313.3   2697.2  4927.5   -       -       
+valkey  valkey 9.1.0  2626692  2626692   100.0  100.0  421.2  257.9   4007.9  7114.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18535268 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19682024 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.67x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r50-v128-uniform-1x-rep2 (order valkey,redis,aki, 588674 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=588674 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1757768  1757768   100.0  100.0  281.9  391.2   3487.7  6115.3   -       -       
+redis   redis 8.8.0   2354084  2354084   100.0  100.0  377.5  330.5   2814.0  5115.9   -       -       
+valkey  valkey 9.1.0  2628577  2628577   100.0  100.0  421.5  254.7   4098.0  7225.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17588254 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19721610 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.75x
+speedup vs valkey: 0.67x
+gate (2.0x): FAIL, aki is 0.75x Redis, below the 2.0x bar
+--- data-r50-v128-uniform-4x-rep1 (order aki,redis,valkey, 2354696 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=2354696 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1753470  1753470   100.0  100.0  282.6  396.0   3465.2  6045.7   -       -       
+redis   redis 8.8.0   2342295  2342295   100.0  100.0  377.5  341.0   2664.4  4788.2   -       -       
+valkey  valkey 9.1.0  2568668  2568668   100.0  100.0  414.0  265.5   3995.6  7270.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17347232 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19295222 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.75x
+speedup vs valkey: 0.68x
+gate (2.0x): FAIL, aki is 0.75x Redis, below the 2.0x bar
+--- data-r50-v128-uniform-4x-rep2 (order valkey,redis,aki, 2354696 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=2354696 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1746013  1746013   100.0  100.0  281.4  396.3   3485.7  5955.6   -       -       
+redis   redis 8.8.0   2288425  2288425   100.0  100.0  368.8  346.1   2762.8  5070.8   -       -       
+valkey  valkey 9.1.0  2555612  2555612   100.0  100.0  411.9  269.6   3964.9  7065.6   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16936758 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19203058 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.76x
+speedup vs valkey: 0.68x
+gate (2.0x): FAIL, aki is 0.76x Redis, below the 2.0x bar
+--- data-r50-v128-uniform-16x-rep1 (order aki,redis,valkey, 9418787 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=9418787 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       837134   577980    69.0   72.5   125.0  1028.1  3309.6  4137.0   -       -       1296330 nil, 1295360 refused
+redis   redis 8.8.0   2244136  2244136   100.0  100.0  362.5  362.2   2601.0  4653.1   -       -       
+valkey  valkey 9.1.0  2380489  2380489   100.0  100.0  384.5  305.7   3854.3  6828.0   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=15761688 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17811174 misses=0
+aki dataset coverage: 1449/2000 retrievable (72.5%), 551 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.26x
+speedup vs valkey: 0.24x
+gate (2.0x): FAIL, aki is 0.26x Redis, below the 2.0x bar
+--- data-r50-v128-uniform-16x-rep2 (order valkey,redis,aki, 9418787 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=9418787 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       834611   576249    69.0   72.5   124.6  1038.3  3299.3  4089.9   -       -       1292516 nil, 1291453 refused
+redis   redis 8.8.0   2247878  2247878   100.0  100.0  363.1  362.0   2562.0  4550.7   -       -       
+valkey  valkey 9.1.0  2351009  2351009   100.0  100.0  379.7  310.5   3827.7  6762.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=15768266 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17628498 misses=0
+aki dataset coverage: 1449/2000 retrievable (72.5%), 551 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.26x
+speedup vs valkey: 0.25x
+gate (2.0x): FAIL, aki is 0.26x Redis, below the 2.0x bar
+--- data-r50-v128-zipfian-1x-rep1 (order aki,redis,valkey, 588674 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=588674 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1757379  1757379   100.0  100.0  276.5  385.0   3502.1  6021.1   -       -       
+redis   redis 8.8.0   2486287  2486287   100.0  100.0  391.2  302.8   2734.1  4915.2   -       -       
+valkey  valkey 9.1.0  2671983  2671983   100.0  100.0  420.5  245.8   4050.9  7335.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18620726 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=20092144 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.66x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r50-v128-zipfian-1x-rep2 (order valkey,redis,aki, 588674 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=588674 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1777509  1777509   100.0  100.0  279.7  390.4   3313.7  5857.3   -       -       
+redis   redis 8.8.0   2384044  2384044   100.0  100.0  375.1  317.4   2859.0  4972.5   -       -       
+valkey  valkey 9.1.0  2661443  2661443   100.0  100.0  418.8  250.1   3928.1  7073.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17771826 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19951120 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.75x
+speedup vs valkey: 0.67x
+gate (2.0x): FAIL, aki is 0.75x Redis, below the 2.0x bar
+--- data-r50-v128-zipfian-4x-rep1 (order aki,redis,valkey, 2354696 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=2354696 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1755868  1755868   100.0  100.0  277.0  395.0   3356.7  5926.9   -       -       
+redis   redis 8.8.0   2402207  2402207   100.0  100.0  378.9  320.0   2711.6  4870.1   -       -       
+valkey  valkey 9.1.0  2596435  2596435   100.0  100.0  409.6  263.2   3860.5  6840.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17781832 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19465104 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.68x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r50-v128-zipfian-4x-rep2 (order valkey,redis,aki, 2354696 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=2354696 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1747678  1747678   100.0  100.0  275.7  393.7   3373.1  6344.7   -       -       
+redis   redis 8.8.0   2326592  2326592   100.0  100.0  367.0  331.8   2766.8  5025.8   -       -       
+valkey  valkey 9.1.0  2570221  2570221   100.0  100.0  405.4  263.7   3964.9  6975.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17231128 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=19337964 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.75x
+speedup vs valkey: 0.68x
+gate (2.0x): FAIL, aki is 0.75x Redis, below the 2.0x bar
+--- data-r50-v128-zipfian-16x-rep1 (order aki,redis,valkey, 9418787 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=9418787 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1170954  1142659   97.6   72.5   184.0  818.2   2564.1  3942.4   -       -       142073 nil, 140921 refused
+redis   redis 8.8.0   2290129  2290129   100.0  100.0  362.0  346.6   2590.7  4612.1   -       -       
+valkey  valkey 9.1.0  2428964  2428964   100.0  100.0  384.0  293.4   3844.1  6922.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=15950200 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18223174 misses=0
+aki dataset coverage: 1449/2000 retrievable (72.5%), 551 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.50x
+speedup vs valkey: 0.47x
+gate (2.0x): FAIL, aki is 0.50x Redis, below the 2.0x bar
+--- data-r50-v128-zipfian-16x-rep2 (order valkey,redis,aki, 9418787 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=9418787 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1182075  1153510   97.6   72.5   185.7  812.0   2512.9  3868.7   -       -       143442 nil, 142232 refused
+redis   redis 8.8.0   2284156  2284156   100.0  100.0  361.1  346.1   2656.3  4792.3   -       -       
+valkey  valkey 9.1.0  2446328  2446328   100.0  100.0  386.7  289.0   3823.6  6910.0   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=15938870 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18362408 misses=0
+aki dataset coverage: 1449/2000 retrievable (72.5%), 551 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.51x
+speedup vs valkey: 0.47x
+gate (2.0x): FAIL, aki is 0.51x Redis, below the 2.0x bar
+--- data-r50-v512-uniform-1x-rep1 (order aki,redis,valkey, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1730519  1730519   100.0  100.0  910.2   395.3   3547.1  6410.2   -       -       
+redis   redis 8.8.0   2432744  2432744   100.0  100.0  1279.6  313.9   2826.2  5058.6   -       -       
+valkey  valkey 9.1.0  2347887  2347887   100.0  100.0  1235.0  303.6   4016.1  7241.7   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18261374 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17522198 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.74x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r50-v512-uniform-1x-rep2 (order valkey,redis,aki, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1736143  1736143   100.0  100.0  913.2   399.9   3432.4  6127.6   -       -       
+redis   redis 8.8.0   2346763  2346763   100.0  100.0  1234.4  327.9   2809.9  5218.3   -       -       
+valkey  valkey 9.1.0  2346649  2346649   100.0  100.0  1234.3  303.9   4022.3  7098.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17477016 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17518486 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.74x
+speedup vs valkey: 0.74x
+gate (2.0x): FAIL, aki is 0.74x Redis, below the 2.0x bar
+--- data-r50-v512-uniform-4x-rep1 (order aki,redis,valkey, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1720148  1720148   100.0  100.0  906.0   402.7   3536.9  6004.7   -       -       
+redis   redis 8.8.0   2363479  2363479   100.0  100.0  1244.8  329.2   2715.6  5013.5   -       -       
+valkey  valkey 9.1.0  2260969  2260969   100.0  100.0  1190.8  324.1   3952.6  7020.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17735438 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16963678 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.76x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r50-v512-uniform-4x-rep2 (order valkey,redis,aki, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1716131  1716131   100.0  100.0  903.8   404.2   3518.5  5853.2   -       -       
+redis   redis 8.8.0   2277834  2277834   100.0  100.0  1199.7  340.2   2854.9  5263.4   -       -       
+valkey  valkey 9.1.0  2234238  2234238   100.0  100.0  1176.7  328.2   3954.7  6971.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17095642 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16744602 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.75x
+speedup vs valkey: 0.77x
+gate (2.0x): FAIL, aki is 0.75x Redis, below the 2.0x bar
+--- data-r50-v512-uniform-16x-rep1 (order aki,redis,valkey, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       787929   429504    54.5   52.6   335.8   1119.2  3268.6  3989.5   -       -       1793716 nil, 1791045 refused
+redis   redis 8.8.0   2217587  2217587   100.0  100.0  1169.8  364.0   2650.1  4767.7   -       -       
+valkey  valkey 9.1.0  2023274  2023274   100.0  100.0  1067.3  385.8   3653.6  6578.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16656706 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=15202826 misses=0
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.19x
+speedup vs valkey: 0.21x
+gate (2.0x): FAIL, aki is 0.19x Redis, below the 2.0x bar
+--- data-r50-v512-uniform-16x-rep2 (order valkey,redis,aki, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       800563   436390    54.5   52.6   341.2   1100.8  3225.6  3967.0   -       -       1822347 nil, 1819887 refused
+redis   redis 8.8.0   2195552  2195552   100.0  100.0  1158.2  364.0   2791.4  4935.7   -       -       
+valkey  valkey 9.1.0  2010730  2010730   100.0  100.0  1060.7  386.6   3725.3  6418.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16408774 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=15113658 misses=0
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.20x
+speedup vs valkey: 0.22x
+gate (2.0x): FAIL, aki is 0.20x Redis, below the 2.0x bar
+--- data-r50-v512-zipfian-1x-rep1 (order aki,redis,valkey, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1740049  1740049   100.0  100.0  910.6   393.7   3473.4  6123.5   -       -       
+redis   redis 8.8.0   2464209  2464209   100.0  100.0  1289.5  305.7   2756.6  4976.6   -       -       
+valkey  valkey 9.1.0  2483428  2483428   100.0  100.0  1299.6  278.0   3950.6  7114.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18475510 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18642984 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.70x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r50-v512-zipfian-1x-rep2 (order valkey,redis,aki, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1739823  1739823   100.0  100.0  910.4   396.0   3414.0  5984.3   -       -       
+redis   redis 8.8.0   2358833  2358833   100.0  100.0  1234.4  319.7   2881.5  5165.1   -       -       
+valkey  valkey 9.1.0  2459374  2459374   100.0  100.0  1287.0  281.1   3956.7  7376.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17686002 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18424606 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.74x
+speedup vs valkey: 0.71x
+gate (2.0x): FAIL, aki is 0.74x Redis, below the 2.0x bar
+--- data-r50-v512-zipfian-4x-rep1 (order aki,redis,valkey, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1725837  1725837   100.0  100.0  903.8   406.5   3418.1  6021.1   -       -       
+redis   redis 8.8.0   2402405  2402405   100.0  100.0  1258.1  316.4   2787.3  4972.5   -       -       
+valkey  valkey 9.1.0  2382429  2382429   100.0  100.0  1247.6  295.7   3997.7  7356.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=18046784 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17906206 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.72x
+speedup vs valkey: 0.72x
+gate (2.0x): FAIL, aki is 0.72x Redis, below the 2.0x bar
+--- data-r50-v512-zipfian-4x-rep2 (order valkey,redis,aki, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1727631  1727631   100.0  100.0  904.7   402.9   3440.6  6455.3   -       -       
+redis   redis 8.8.0   2318434  2318434   100.0  100.0  1214.1  329.5   2828.3  5230.6   -       -       
+valkey  valkey 9.1.0  2358150  2358150   100.0  100.0  1234.9  300.8   3926.0  7090.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17368452 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17706922 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.75x
+speedup vs valkey: 0.73x
+gate (2.0x): FAIL, aki is 0.75x Redis, below the 2.0x bar
+--- data-r50-v512-zipfian-16x-rep1 (order aki,redis,valkey, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1117457  1070798   95.8   52.6   575.2   866.3   2574.3  3856.4   -       -       233673 nil, 232994 refused
+redis   redis 8.8.0   2284202  2284202   100.0  100.0  1197.0  342.8   2711.6  4882.4   -       -       
+valkey  valkey 9.1.0  2233282  2233282   100.0  100.0  1170.4  326.1   3954.7  6901.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=17166722 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16749104 misses=0
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.47x
+speedup vs valkey: 0.48x
+gate (2.0x): FAIL, aki is 0.47x Redis, below the 2.0x bar
+--- data-r50-v512-zipfian-16x-rep2 (order valkey,redis,aki, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1119528  1072789   95.8   52.6   576.3   857.6   2639.9  3889.2   -       -       233999 nil, 233404 refused
+redis   redis 8.8.0   2261821  2261821   100.0  100.0  1185.3  345.9   2738.2  4923.4   -       -       
+valkey  valkey 9.1.0  2225572  2225572   100.0  100.0  1166.3  328.7   3889.2  6885.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16902076 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=16731702 misses=0
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.47x
+speedup vs valkey: 0.48x
+gate (2.0x): FAIL, aki is 0.47x Redis, below the 2.0x bar
+--- data-r50-v4096-uniform-1x-rep1 (order aki,redis,valkey, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1445653  1445653   100.0  100.0  5701.1  505.3   3156.0  5759.0   -       -       
+redis   redis 8.8.0   1334602  1334602   100.0  100.0  5263.1  378.4   4243.5  7401.5   -       -       
+valkey  valkey 9.1.0  1497339  1497339   100.0  100.0  5904.9  323.1   5062.7  9396.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=9910716 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=11045360 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.08x
+speedup vs valkey: 0.97x
+gate (2.0x): FAIL, aki is 1.08x Redis, below the 2.0x bar
+--- data-r50-v4096-uniform-1x-rep2 (order valkey,redis,aki, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1442911  1442911   100.0  100.0  5690.2  506.9   3137.5  5976.1   -       -       
+redis   redis 8.8.0   1244888  1244888   100.0  100.0  4909.3  404.7   4575.2  8036.4   -       -       
+valkey  valkey 9.1.0  1456170  1456170   100.0  100.0  5742.5  332.5   5173.2  9748.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=9267900 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=10807720 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.16x
+speedup vs valkey: 0.99x
+gate (2.0x): FAIL, aki is 1.16x Redis, below the 2.0x bar
+--- data-r50-v4096-uniform-4x-rep1 (order aki,redis,valkey, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1425990  1425990   100.0  100.0  5624.5  508.7   3278.8  5799.9   -       -       
+redis   redis 8.8.0   1289008  1289008   100.0  100.0  5084.2  386.3   4411.4  7847.9   -       -       
+valkey  valkey 9.1.0  1394325  1394325   100.0  100.0  5499.6  355.1   5058.6  9543.7   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=9633270 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=10346192 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.11x
+speedup vs valkey: 1.02x
+gate (2.0x): FAIL, aki is 1.11x Redis, below the 2.0x bar
+--- data-r50-v4096-uniform-4x-rep2 (order valkey,redis,aki, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1428559  1428559   100.0  100.0  5634.6  510.2   3203.1  5763.1   -       -       
+redis   redis 8.8.0   1229201  1229201   100.0  100.0  4848.3  414.7   4481.0  7577.6   -       -       
+valkey  valkey 9.1.0  1391766  1391766   100.0  100.0  5489.5  351.2   5230.6  9535.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=9160284 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=10345896 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.16x
+speedup vs valkey: 1.03x
+gate (2.0x): FAIL, aki is 1.16x Redis, below the 2.0x bar
+--- data-r50-v4096-uniform-16x-rep1 (order aki,redis,valkey, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       730539   358466    49.1   47.4   2163.1  1112.1  3469.3  4612.1   -       -       1861415 nil, 1859972 refused
+redis   redis 8.8.0   1261213  1261213   100.0  100.0  4976.0  397.3   4362.2  7680.0   -       -       
+valkey  valkey 9.1.0  1304437  1304437   100.0  100.0  5146.6  383.5   5197.8  9322.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=9361068 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=9709682 misses=0
+aki dataset coverage: 948/2000 retrievable (47.4%), 1052 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.28x
+speedup vs valkey: 0.27x
+gate (2.0x): FAIL, aki is 0.28x Redis, below the 2.0x bar
+--- data-r50-v4096-uniform-16x-rep2 (order valkey,redis,aki, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       726273   356385    49.1   47.4   2150.5  1116.2  3479.6  4763.6   -       -       1850488 nil, 1848979 refused
+redis   redis 8.8.0   1194613  1194613   100.0  100.0  4713.3  423.2   4542.5  8069.1   -       -       
+valkey  valkey 9.1.0  1316514  1316514   100.0  100.0  5194.2  374.8   5308.4  9502.7   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=8909368 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=9826882 misses=0
+aki dataset coverage: 948/2000 retrievable (47.4%), 1052 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.30x
+speedup vs valkey: 0.27x
+gate (2.0x): FAIL, aki is 0.30x Redis, below the 2.0x bar
+--- data-r50-v4096-zipfian-1x-rep1 (order aki,redis,valkey, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1485419  1485419   100.0  100.0  5855.1  493.8   3129.3  5705.7   -       -       
+redis   redis 8.8.0   1379705  1379705   100.0  100.0  5438.4  361.0   4300.8  7442.4   -       -       
+valkey  valkey 9.1.0  1600888  1600888   100.0  100.0  6310.3  305.4   4841.5  9248.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=10263334 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=11833688 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.08x
+speedup vs valkey: 0.93x
+gate (2.0x): FAIL, aki is 1.08x Redis, below the 2.0x bar
+--- data-r50-v4096-zipfian-1x-rep2 (order valkey,redis,aki, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1496641  1496641   100.0  100.0  5899.4  489.2   3133.4  5886.0   -       -       
+redis   redis 8.8.0   1310411  1310411   100.0  100.0  5165.3  386.3   4419.6  7942.1   -       -       
+valkey  valkey 9.1.0  1592897  1592897   100.0  100.0  6278.8  300.3   4993.0  9814.0   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=9730682 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=11815492 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.14x
+speedup vs valkey: 0.94x
+gate (2.0x): FAIL, aki is 1.14x Redis, below the 2.0x bar
+--- data-r50-v4096-zipfian-4x-rep1 (order aki,redis,valkey, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1474001  1474001   100.0  100.0  5810.6  496.1   3156.0  5582.8   -       -       
+redis   redis 8.8.0   1337063  1337063   100.0  100.0  5270.8  373.5   4341.8  7643.1   -       -       
+valkey  valkey 9.1.0  1503814  1503814   100.0  100.0  5928.1  325.1   4956.2  8921.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=9998268 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=11171952 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.10x
+speedup vs valkey: 0.98x
+gate (2.0x): FAIL, aki is 1.10x Redis, below the 2.0x bar
+--- data-r50-v4096-zipfian-4x-rep2 (order valkey,redis,aki, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1487662  1487662   100.0  100.0  5864.4  496.1   3026.9  5443.6   -       -       
+redis   redis 8.8.0   1275665  1275665   100.0  100.0  5028.7  397.6   4522.0  8065.0   -       -       
+valkey  valkey 9.1.0  1504630  1504630   100.0  100.0  5931.3  325.1   5054.5  9519.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=9518722 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=11202264 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.17x
+speedup vs valkey: 0.99x
+gate (2.0x): FAIL, aki is 1.17x Redis, below the 2.0x bar
+--- data-r50-v4096-zipfian-16x-rep1 (order aki,redis,valkey, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       983072   928716    94.5   47.4   3770.6  917.5   3014.7  4321.3   -       -       272069 nil, 271525 refused
+redis   redis 8.8.0   1303350  1303350   100.0  100.0  5138.4  384.5   4350.0  7610.4   -       -       
+valkey  valkey 9.1.0  1446346  1446346   100.0  100.0  5702.2  343.3   5034.0  9257.0   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=9722022 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=10783546 misses=0
+aki dataset coverage: 948/2000 retrievable (47.4%), 1052 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.64x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r50-v4096-zipfian-16x-rep2 (order valkey,redis,aki, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       974503   920609    94.5   47.4   3737.7  922.1   3053.6  4337.7   -       -       269815 nil, 269198 refused
+redis   redis 8.8.0   1238922  1238922   100.0  100.0  4884.4  411.1   4444.2  7782.4   -       -       
+valkey  valkey 9.1.0  1437284  1437284   100.0  100.0  5666.4  341.8   5103.6  9420.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=9270626 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=10745246 misses=0
+aki dataset coverage: 948/2000 retrievable (47.4%), 1052 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.74x
+speedup vs valkey: 0.64x
+gate (2.0x): FAIL, aki is 0.74x Redis, below the 2.0x bar
+== done: /root/sqlo1bench/f3base1-data-r50/results.csv, manifest and per-cell JSON beside it ==
+== building aki-bench ==
+== building f3srv from /root/sqlo1bench/aki ==
+== sqlo1 core suite: 24 cells x 2 reps, akislot=f3, out /root/sqlo1bench/f3base1-data-r10 ==
+--- data-r10-v16-uniform-1x-rep1 (order aki,redis,valkey, 1157049 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=1157049 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1757292  1757292   100.0  100.0  96.3   391.2   3498.0  6410.2   -       -       
+redis   redis 8.8.0   2535673  2535673   100.0  100.0  138.9  293.9   2871.3  5173.2   -       -       
+valkey  valkey 9.1.0  2675119  2675119   100.0  100.0  146.6  255.2   3981.3  7225.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3784850 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=4008934 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.69x
+speedup vs valkey: 0.66x
+gate (2.0x): FAIL, aki is 0.69x Redis, below the 2.0x bar
+--- data-r10-v16-uniform-1x-rep2 (order valkey,redis,aki, 1157049 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=1157049 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1753794  1753794   100.0  100.0  96.1   389.4   3549.2  6529.0   -       -       
+redis   redis 8.8.0   2460601  2460601   100.0  100.0  134.8  304.6   2918.4  5185.5   -       -       
+valkey  valkey 9.1.0  2635671  2635671   100.0  100.0  144.4  265.0   3819.5  6819.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3670108 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3956978 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.67x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r10-v16-uniform-4x-rep1 (order aki,redis,valkey, 4628197 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=4628197 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1736599  1736599   100.0  100.0  96.5   398.1   3485.7  6086.7   -       -       
+redis   redis 8.8.0   2439030  2439030   100.0  100.0  135.5  312.6   2861.1  5124.1   -       -       
+valkey  valkey 9.1.0  2607083  2607083   100.0  100.0  144.8  265.5   3934.2  7196.7   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3556254 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3911884 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.67x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r10-v16-uniform-4x-rep2 (order valkey,redis,aki, 4628197 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=4628197 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1735062  1735062   100.0  100.0  96.4   395.5   3565.6  6172.7   -       -       
+redis   redis 8.8.0   2399024  2399024   100.0  100.0  133.2  318.2   2891.8  5177.3   -       -       
+valkey  valkey 9.1.0  2587005  2587005   100.0  100.0  143.7  272.9   3815.4  6881.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3494500 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3883212 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.72x
+speedup vs valkey: 0.67x
+gate (2.0x): FAIL, aki is 0.72x Redis, below the 2.0x bar
+--- data-r10-v16-uniform-16x-rep1 (order aki,redis,valkey, 18512790 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=18512790 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1734842  1734842   100.0  100.0  97.4   402.9   3403.8  6098.9   -       -       
+redis   redis 8.8.0   2207794  2207794   100.0  100.0  124.0  356.1   2879.5  5029.9   -       -       
+valkey  valkey 9.1.0  2412188  2412188   100.0  100.0  135.5  301.8   3743.7  6758.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2948228 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3617204 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.79x
+speedup vs valkey: 0.72x
+gate (2.0x): FAIL, aki is 0.79x Redis, below the 2.0x bar
+--- data-r10-v16-uniform-16x-rep2 (order valkey,redis,aki, 18512790 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=18512790 members=0 value=16B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1731616  1731616   100.0  100.0  97.3   402.2   3424.3  6139.9   -       -       
+redis   redis 8.8.0   2196854  2196854   100.0  100.0  123.4  358.1   2836.5  4939.8   -       -       
+valkey  valkey 9.1.0  2390957  2390957   100.0  100.0  134.3  304.4   3809.3  6791.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2933766 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3586104 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.79x
+speedup vs valkey: 0.72x
+gate (2.0x): FAIL, aki is 0.79x Redis, below the 2.0x bar
+--- data-r10-v16-zipfian-1x-rep1 (order aki,redis,valkey, 1157049 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=1157049 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1769564  1769564   100.0  100.0  91.4   386.3   3432.4  6103.0   -       -       
+redis   redis 8.8.0   2509078  2509078   100.0  100.0  129.7  293.1   2891.8  5169.2   -       -       
+valkey  valkey 9.1.0  2640309  2640309   100.0  100.0  136.4  256.4   3856.4  7053.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3742688 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3951556 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.67x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r10-v16-zipfian-1x-rep2 (order valkey,redis,aki, 1157049 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=1157049 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1758859  1758859   100.0  100.0  90.9   386.6   3508.2  6123.5   -       -       
+redis   redis 8.8.0   2417862  2417862   100.0  100.0  124.9  304.4   3004.4  5308.4   -       -       
+valkey  valkey 9.1.0  2646567  2646567   100.0  100.0  136.8  257.4   3895.3  7114.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3605438 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3960182 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.66x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r10-v16-zipfian-4x-rep1 (order aki,redis,valkey, 4628197 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=4628197 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1745432  1745432   100.0  100.0  90.9   393.2   3405.8  5943.3   -       -       
+redis   redis 8.8.0   2434480  2434480   100.0  100.0  126.7  305.9   2881.5  5238.8   -       -       
+valkey  valkey 9.1.0  2555857  2555857   100.0  100.0  133.1  272.6   3874.8  7086.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3549038 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3826342 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.72x
+speedup vs valkey: 0.68x
+gate (2.0x): FAIL, aki is 0.72x Redis, below the 2.0x bar
+--- data-r10-v16-zipfian-4x-rep2 (order valkey,redis,aki, 4628197 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=4628197 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1751544  1751544   100.0  100.0  91.2   395.8   3369.0  5984.3   -       -       
+redis   redis 8.8.0   2402408  2402408   100.0  100.0  125.1  309.5   2959.4  5230.6   -       -       
+valkey  valkey 9.1.0  2561220  2561220   100.0  100.0  133.3  269.6   3827.7  6783.0   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3490408 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3842724 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.68x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r10-v16-zipfian-16x-rep1 (order aki,redis,valkey, 18512790 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=18512790 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1725629  1725629   100.0  100.0  90.5   403.2   3409.9  5906.4   -       -       
+redis   redis 8.8.0   2207640  2207640   100.0  100.0  115.7  347.1   2846.7  4993.0   -       -       
+valkey  valkey 9.1.0  2386888  2386888   100.0  100.0  125.1  302.8   3786.8  6803.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2916052 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3588408 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.78x
+speedup vs valkey: 0.72x
+gate (2.0x): FAIL, aki is 0.78x Redis, below the 2.0x bar
+--- data-r10-v16-zipfian-16x-rep2 (order valkey,redis,aki, 18512790 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=18512790 members=0 value=16B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1736168  1736168   100.0  100.0  91.0   401.9   3332.1  5935.1   -       -       
+redis   redis 8.8.0   2229896  2229896   100.0  100.0  116.9  344.1   2809.9  4997.1   -       -       
+valkey  valkey 9.1.0  2399930  2399930   100.0  100.0  125.8  300.3   3743.7  6709.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2943938 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3601658 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.78x
+speedup vs valkey: 0.72x
+gate (2.0x): FAIL, aki is 0.78x Redis, below the 2.0x bar
+--- data-r10-v128-uniform-1x-rep1 (order aki,redis,valkey, 588674 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=588674 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1765208  1765208   100.0  100.0  286.4  386.3   3516.4  6176.8   -       -       
+redis   redis 8.8.0   2459828  2459828   100.0  100.0  399.1  319.0   2578.4  4837.4   -       -       
+valkey  valkey 9.1.0  2418052  2418052   100.0  100.0  392.4  287.5   4108.3  7340.0   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3679442 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3622074 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.72x
+speedup vs valkey: 0.73x
+gate (2.0x): FAIL, aki is 0.72x Redis, below the 2.0x bar
+--- data-r10-v128-uniform-1x-rep2 (order valkey,redis,aki, 588674 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=588674 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1757643  1757643   100.0  100.0  285.2  388.4   3606.5  6246.4   -       -       
+redis   redis 8.8.0   2384185  2384185   100.0  100.0  386.9  326.7   2750.5  5128.2   -       -       
+valkey  valkey 9.1.0  2411209  2411209   100.0  100.0  391.2  291.3   4038.7  7217.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3559470 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3611868 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.74x
+speedup vs valkey: 0.73x
+gate (2.0x): FAIL, aki is 0.74x Redis, below the 2.0x bar
+--- data-r10-v128-uniform-4x-rep1 (order aki,redis,valkey, 2354696 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=2354696 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1738005  1738005   100.0  100.0  283.4  398.3   3532.8  5976.1   -       -       
+redis   redis 8.8.0   2349310  2349310   100.0  100.0  383.1  339.7   2613.2  4763.6   -       -       
+valkey  valkey 9.1.0  2303090  2303090   100.0  100.0  375.6  313.6   3995.6  7008.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3486982 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3455736 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.74x
+speedup vs valkey: 0.75x
+gate (2.0x): FAIL, aki is 0.74x Redis, below the 2.0x bar
+--- data-r10-v128-uniform-4x-rep2 (order valkey,redis,aki, 2354696 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=2354696 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1742058  1742058   100.0  100.0  284.1  390.1   3602.4  6283.3   -       -       
+redis   redis 8.8.0   2304026  2304026   100.0  100.0  375.7  344.6   2734.1  4960.3   -       -       
+valkey  valkey 9.1.0  2291122  2291122   100.0  100.0  373.6  314.6   4020.2  7192.6   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3412814 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3448200 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.76x
+speedup vs valkey: 0.76x
+gate (2.0x): FAIL, aki is 0.76x Redis, below the 2.0x bar
+--- data-r10-v128-uniform-16x-rep1 (order aki,redis,valkey, 9418787 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=9418787 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       690830   476968    69.0   72.5   119.0  1521.7  2770.9  3389.4   -       -       213577 nil, 1925160 refused
+redis   redis 8.8.0   2257661  2257661   100.0  100.0  369.0  360.2   2551.8  4624.4   -       -       
+valkey  valkey 9.1.0  2127079  2127079   100.0  100.0  347.6  354.3   3878.9  6860.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3176756 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3198732 misses=0
+aki dataset coverage: 1449/2000 retrievable (72.5%), 551 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.21x
+speedup vs valkey: 0.22x
+gate (2.0x): FAIL, aki is 0.21x Redis, below the 2.0x bar
+--- data-r10-v128-uniform-16x-rep2 (order valkey,redis,aki, 9418787 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=9418787 members=0 value=128B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       693182   478586    69.0   72.5   119.5  1520.6  2758.7  3387.4   -       -       214338 nil, 1931934 refused
+redis   redis 8.8.0   2252432  2252432   100.0  100.0  368.1  361.2   2560.0  4747.3   -       -       
+valkey  valkey 9.1.0  2111658  2111658   100.0  100.0  345.1  358.4   3794.9  6901.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3174990 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3183498 misses=0
+aki dataset coverage: 1449/2000 retrievable (72.5%), 551 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.21x
+speedup vs valkey: 0.23x
+gate (2.0x): FAIL, aki is 0.21x Redis, below the 2.0x bar
+--- data-r10-v128-zipfian-1x-rep1 (order aki,redis,valkey, 588674 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=588674 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1765166  1765166   100.0  100.0  281.1  388.4   3438.6  5914.6   -       -       
+redis   redis 8.8.0   2456055  2456055   100.0  100.0  391.2  310.0   2779.1  4993.0   -       -       
+valkey  valkey 9.1.0  2379089  2379089   100.0  100.0  378.9  291.6   4053.0  7086.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3681562 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3572384 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.72x
+speedup vs valkey: 0.74x
+gate (2.0x): FAIL, aki is 0.72x Redis, below the 2.0x bar
+--- data-r10-v128-zipfian-1x-rep2 (order valkey,redis,aki, 588674 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=588674 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1760323  1760323   100.0  100.0  280.4  384.0   3530.8  6135.8   -       -       
+redis   redis 8.8.0   2375203  2375203   100.0  100.0  378.3  323.1   2773.0  4993.0   -       -       
+valkey  valkey 9.1.0  2393178  2393178   100.0  100.0  381.1  287.7   4079.6  7147.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3544350 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3590690 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.74x
+speedup vs valkey: 0.74x
+gate (2.0x): FAIL, aki is 0.74x Redis, below the 2.0x bar
+--- data-r10-v128-zipfian-4x-rep1 (order aki,redis,valkey, 2354696 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=2354696 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1752473  1752473   100.0  100.0  279.8  393.7   3422.2  6160.4   -       -       
+redis   redis 8.8.0   2384285  2384285   100.0  100.0  380.6  328.4   2639.9  4718.6   -       -       
+valkey  valkey 9.1.0  2336860  2336860   100.0  100.0  373.1  302.1   3946.5  6897.7   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3529152 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3511122 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.74x
+speedup vs valkey: 0.75x
+gate (2.0x): FAIL, aki is 0.74x Redis, below the 2.0x bar
+--- data-r10-v128-zipfian-4x-rep2 (order valkey,redis,aki, 2354696 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=2354696 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1757332  1757332   100.0  100.0  280.6  391.2   3432.4  6025.2   -       -       
+redis   redis 8.8.0   2287765  2287765   100.0  100.0  365.2  339.7   2752.5  4997.1   -       -       
+valkey  valkey 9.1.0  2318619  2318619   100.0  100.0  370.2  302.1   4003.8  7163.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3394000 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3483040 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.77x
+speedup vs valkey: 0.76x
+gate (2.0x): FAIL, aki is 0.77x Redis, below the 2.0x bar
+--- data-r10-v128-zipfian-16x-rep1 (order aki,redis,valkey, 9418787 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=9418787 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1105093  1078393   97.6   72.5   177.6  869.9   2603.0  3774.5   -       -       26868 nil, 240153 refused
+redis   redis 8.8.0   2275638  2275638   100.0  100.0  364.1  351.0   2570.2  4739.1   -       -       
+valkey  valkey 9.1.0  2201832  2201832   100.0  100.0  352.3  332.5   3932.2  6893.6   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3173290 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3307810 misses=0
+aki dataset coverage: 1449/2000 retrievable (72.5%), 551 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.47x
+speedup vs valkey: 0.49x
+gate (2.0x): FAIL, aki is 0.47x Redis, below the 2.0x bar
+--- data-r10-v128-zipfian-16x-rep2 (order valkey,redis,aki, 9418787 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=9418787 members=0 value=128B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s   p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1112912  1086026   97.6   72.5   178.8  863.7   2601.0  3852.3   -       -       27058 nil, 241825 refused
+redis   redis 8.8.0   2260487  2260487   100.0  100.0  361.7  352.5   2615.3  4669.4   -       -       
+valkey  valkey 9.1.0  2205354  2205354   100.0  100.0  352.8  330.8   3909.6  6873.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3149038 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3317016 misses=0
+aki dataset coverage: 1449/2000 retrievable (72.5%), 551 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.48x
+speedup vs valkey: 0.49x
+gate (2.0x): FAIL, aki is 0.48x Redis, below the 2.0x bar
+--- data-r10-v512-uniform-1x-rep1 (order aki,redis,valkey, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1739092  1739092   100.0  100.0  918.1   398.3   3473.4  6090.8   -       -       
+redis   redis 8.8.0   2473447  2473447   100.0  100.0  1305.7  307.2   2834.4  5095.4   -       -       
+valkey  valkey 9.1.0  2287641  2287641   100.0  100.0  1207.6  312.1   3993.6  7077.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3707730 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3426932 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.70x
+speedup vs valkey: 0.76x
+gate (2.0x): FAIL, aki is 0.70x Redis, below the 2.0x bar
+--- data-r10-v512-uniform-1x-rep2 (order valkey,redis,aki, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1746158  1746158   100.0  100.0  921.8   394.5   3471.4  6025.2   -       -       
+redis   redis 8.8.0   2379899  2379899   100.0  100.0  1256.3  322.0   2887.7  5185.5   -       -       
+valkey  valkey 9.1.0  2250785  2250785   100.0  100.0  1188.2  315.9   4028.4  6918.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3555754 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3366786 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.78x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r10-v512-uniform-4x-rep1 (order aki,redis,valkey, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1731473  1731473   100.0  100.0  915.2   401.7   3412.0  6205.4   -       -       
+redis   redis 8.8.0   2404437  2404437   100.0  100.0  1270.9  323.1   2713.6  5038.1   -       -       
+valkey  valkey 9.1.0  2214283  2214283   100.0  100.0  1170.4  325.1   3997.7  7266.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3603248 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3318700 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.72x
+speedup vs valkey: 0.78x
+gate (2.0x): FAIL, aki is 0.72x Redis, below the 2.0x bar
+--- data-r10-v512-uniform-4x-rep2 (order valkey,redis,aki, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1725104  1725104   100.0  100.0  911.9   402.7   3463.2  5918.7   -       -       
+redis   redis 8.8.0   2310617  2310617   100.0  100.0  1221.4  336.6   2803.7  5144.6   -       -       
+valkey  valkey 9.1.0  2166266  2166266   100.0  100.0  1145.1  335.9   3997.7  6897.7   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3465948 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3250706 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.75x
+speedup vs valkey: 0.80x
+gate (2.0x): FAIL, aki is 0.75x Redis, below the 2.0x bar
+--- data-r10-v512-uniform-16x-rep1 (order aki,redis,valkey, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       624183   340198    54.5   52.6   328.2   1700.9  2801.7  3262.5   -       -       284253 nil, 2556006 refused
+redis   redis 8.8.0   2249495  2249495   100.0  100.0  1191.0  360.2   2592.8  4816.9   -       -       
+valkey  valkey 9.1.0  1972250  1972250   100.0  100.0  1044.2  392.4   3704.8  6459.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3381594 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2967730 misses=0
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.15x
+speedup vs valkey: 0.17x
+gate (2.0x): FAIL, aki is 0.15x Redis, below the 2.0x bar
+--- data-r10-v512-uniform-16x-rep2 (order valkey,redis,aki, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       623922   340051    54.5   52.6   328.1   1702.9  2793.5  3244.0   -       -       284118 nil, 2554865 refused
+redis   redis 8.8.0   2215968  2215968   100.0  100.0  1173.2  364.3   2633.7  4845.6   -       -       
+valkey  valkey 9.1.0  1954492  1954492   100.0  100.0  1034.8  393.2   3848.2  6885.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3313756 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2946372 misses=0
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.15x
+speedup vs valkey: 0.17x
+gate (2.0x): FAIL, aki is 0.15x Redis, below the 2.0x bar
+--- data-r10-v512-zipfian-1x-rep1 (order aki,redis,valkey, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1749030  1749030   100.0  100.0  918.6   393.5   3407.9  6000.6   -       -       
+redis   redis 8.8.0   2468149  2468149   100.0  100.0  1296.3  306.4   2809.9  4845.6   -       -       
+valkey  valkey 9.1.0  2363171  2363171   100.0  100.0  1241.1  290.0   4132.9  7532.5   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3700098 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3548134 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.71x
+speedup vs valkey: 0.74x
+gate (2.0x): FAIL, aki is 0.71x Redis, below the 2.0x bar
+--- data-r10-v512-zipfian-1x-rep2 (order valkey,redis,aki, 219310 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=219310 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1752927  1752927   100.0  100.0  920.6   393.2   3422.2  5984.3   -       -       
+redis   redis 8.8.0   2346930  2346930   100.0  100.0  1232.6  323.1   2877.4  5296.1   -       -       
+valkey  valkey 9.1.0  2303888  2303888   100.0  100.0  1210.0  302.3   4057.1  7122.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3512178 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3461160 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.75x
+speedup vs valkey: 0.76x
+gate (2.0x): FAIL, aki is 0.75x Redis, below the 2.0x bar
+--- data-r10-v512-zipfian-4x-rep1 (order aki,redis,valkey, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1772834  1772834   100.0  100.0  931.8   376.6   3545.1  6172.7   -       -       
+redis   redis 8.8.0   2383351  2383351   100.0  100.0  1252.6  323.3   2746.4  5034.0   -       -       
+valkey  valkey 9.1.0  2268721  2268721   100.0  100.0  1192.4  311.0   4040.7  7016.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3571516 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3401994 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.74x
+speedup vs valkey: 0.78x
+gate (2.0x): FAIL, aki is 0.74x Redis, below the 2.0x bar
+--- data-r10-v512-zipfian-4x-rep2 (order valkey,redis,aki, 877240 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=877240 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1740605  1740605   100.0  100.0  914.8   402.7   3293.2  5918.7   -       -       
+redis   redis 8.8.0   2300418  2300418   100.0  100.0  1209.0  333.8   2863.1  5234.7   -       -       
+valkey  valkey 9.1.0  2231259  2231259   100.0  100.0  1172.7  316.7   4036.6  7131.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3458346 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3348718 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.76x
+speedup vs valkey: 0.78x
+gate (2.0x): FAIL, aki is 0.76x Redis, below the 2.0x bar
+--- data-r10-v512-zipfian-16x-rep1 (order aki,redis,valkey, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1044438  1000824   95.8   52.6   549.0   912.4   2734.1  3876.9   -       -       43780 nil, 392392 refused
+redis   redis 8.8.0   2275952  2275952   100.0  100.0  1197.1  347.4   2703.4  4931.6   -       -       
+valkey  valkey 9.1.0  2119825  2119825   100.0  100.0  1115.0  348.2   3850.2  6860.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3416686 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3188826 misses=0
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.44x
+speedup vs valkey: 0.47x
+gate (2.0x): FAIL, aki is 0.44x Redis, below the 2.0x bar
+--- data-r10-v512-zipfian-16x-rep2 (order valkey,redis,aki, 3508960 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=3508960 members=0 value=512B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1043352  999789    95.8   52.6   548.4   914.9   2713.6  3770.4   -       -       43721 nil, 391932 refused
+redis   redis 8.8.0   2244162  2244162   100.0  100.0  1180.3  350.0   2811.9  4972.5   -       -       
+valkey  valkey 9.1.0  2092413  2092413   100.0  100.0  1100.5  355.6   3905.5  6778.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3351984 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=3149870 misses=0
+aki dataset coverage: 1052/2000 retrievable (52.6%), 948 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.45x
+speedup vs valkey: 0.48x
+gate (2.0x): FAIL, aki is 0.45x Redis, below the 2.0x bar
+--- data-r10-v4096-uniform-1x-rep1 (order aki,redis,valkey, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1450927  1450927   100.0  100.0  5724.6  470.5   3383.3  5832.7   -       -       
+redis   redis 8.8.0   1209907  1209907   100.0  100.0  4773.7  347.9   5206.0  8716.3   -       -       
+valkey  valkey 9.1.0  1441635  1441635   100.0  100.0  5688.0  257.2   5541.9  9633.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1816760 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2132518 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.20x
+speedup vs valkey: 1.01x
+gate (2.0x): FAIL, aki is 1.20x Redis, below the 2.0x bar
+--- data-r10-v4096-uniform-1x-rep2 (order valkey,redis,aki, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1472496  1472496   100.0  100.0  5809.7  463.9   3321.9  5926.9   -       -       
+redis   redis 8.8.0   1176005  1176005   100.0  100.0  4639.9  361.7   5320.7  9289.7   -       -       
+valkey  valkey 9.1.0  1439432  1439432   100.0  100.0  5679.3  261.4   5431.3  9429.0   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1755110 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2128058 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.25x
+speedup vs valkey: 1.02x
+gate (2.0x): FAIL, aki is 1.25x Redis, below the 2.0x bar
+--- data-r10-v4096-uniform-4x-rep1 (order aki,redis,valkey, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1442057  1442057   100.0  100.0  5690.6  470.0   3262.5  6037.5   -       -       
+redis   redis 8.8.0   1185012  1185012   100.0  100.0  4676.3  364.0   5050.4  8560.6   -       -       
+valkey  valkey 9.1.0  1387472  1387472   100.0  100.0  5475.2  275.2   5505.0  9404.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1777614 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2057716 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.22x
+speedup vs valkey: 1.04x
+gate (2.0x): FAIL, aki is 1.22x Redis, below the 2.0x bar
+--- data-r10-v4096-uniform-4x-rep2 (order valkey,redis,aki, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1433230  1433230   100.0  100.0  5655.8  474.1   3330.0  6021.1   -       -       
+redis   redis 8.8.0   1146300  1146300   100.0  100.0  4523.5  373.8   5460.0  9068.5   -       -       
+valkey  valkey 9.1.0  1376957  1376957   100.0  100.0  5433.7  278.8   5492.7  9330.7   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1710914 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2046376 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.25x
+speedup vs valkey: 1.04x
+gate (2.0x): FAIL, aki is 1.25x Redis, below the 2.0x bar
+--- data-r10-v4096-uniform-16x-rep1 (order aki,redis,valkey, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       576916   283037    49.1   47.4   2174.4  1665.0  3188.7  4407.3   -       -       294168 nil, 2644797 refused
+redis   redis 8.8.0   1152467  1152467   100.0  100.0  4549.2  381.2   5083.1  8446.0   -       -       
+valkey  valkey 9.1.0  1326679  1326679   100.0  100.0  5236.9  297.0   5533.7  9207.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1708592 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1940832 misses=0
+aki dataset coverage: 948/2000 retrievable (47.4%), 1052 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.25x
+speedup vs valkey: 0.21x
+gate (2.0x): FAIL, aki is 0.25x Redis, below the 2.0x bar
+--- data-r10-v4096-uniform-16x-rep2 (order valkey,redis,aki, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=uniform P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       578051   283594    49.1   47.4   2178.6  1653.8  3201.0  4382.7   -       -       294785 nil, 2649984 refused
+redis   redis 8.8.0   1110151  1110151   100.0  100.0  4382.1  394.5   5349.4  9175.0   -       -       
+valkey  valkey 9.1.0  1322032  1322032   100.0  100.0  5218.5  294.4   5529.6  9822.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1649760 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1949824 misses=0
+aki dataset coverage: 948/2000 retrievable (47.4%), 1052 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.26x
+speedup vs valkey: 0.21x
+gate (2.0x): FAIL, aki is 0.26x Redis, below the 2.0x bar
+--- data-r10-v4096-zipfian-1x-rep1 (order aki,redis,valkey, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1505877  1505877   100.0  100.0  5938.7  453.1   3371.0  6012.9   -       -       
+redis   redis 8.8.0   1239729  1239729   100.0  100.0  4889.1  335.9   5165.1  8888.3   -       -       
+valkey  valkey 9.1.0  1476219  1476219   100.0  100.0  5821.7  254.6   5414.9  9723.9   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1864446 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2193206 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.21x
+speedup vs valkey: 1.02x
+gate (2.0x): FAIL, aki is 1.21x Redis, below the 2.0x bar
+--- data-r10-v4096-zipfian-1x-rep2 (order valkey,redis,aki, 31987 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=31987 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1424860  1424860   100.0  100.0  5619.2  481.0   3512.3  6570.0   -       -       
+redis   redis 8.8.0   1171005  1171005   100.0  100.0  4618.0  357.1   5574.7  9551.9   -       -       
+valkey  valkey 9.1.0  1489010  1489010   100.0  100.0  5872.1  253.6   5320.7  9207.8   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1770392 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2209246 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.22x
+speedup vs valkey: 0.96x
+gate (2.0x): FAIL, aki is 1.22x Redis, below the 2.0x bar
+--- data-r10-v4096-zipfian-4x-rep1 (order aki,redis,valkey, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1484726  1484726   100.0  100.0  5855.7  463.4   3360.8  6123.5   -       -       
+redis   redis 8.8.0   1217114  1217114   100.0  100.0  4800.2  352.3   5070.8  8486.9   -       -       
+valkey  valkey 9.1.0  1446461  1446461   100.0  100.0  5704.8  262.1   5472.3  9191.4   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1820870 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2147718 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.22x
+speedup vs valkey: 1.03x
+gate (2.0x): FAIL, aki is 1.22x Redis, below the 2.0x bar
+--- data-r10-v4096-zipfian-4x-rep2 (order valkey,redis,aki, 127948 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=127948 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       1493772  1493772   100.0  100.0  5891.4  461.8   3323.9  5730.3   -       -       
+redis   redis 8.8.0   1172742  1172742   100.0  100.0  4625.2  364.0   5304.3  9052.2   -       -       
+valkey  valkey 9.1.0  1444034  1444034   100.0  100.0  5695.2  265.0   5398.5  9560.1   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1750428 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2139600 misses=0
+aki dataset coverage: 2000/2000 retrievable (100.0%)
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  1.27x
+speedup vs valkey: 1.03x
+gate (2.0x): FAIL, aki is 1.27x Redis, below the 2.0x bar
+--- data-r10-v4096-zipfian-16x-rep1 (order aki,redis,valkey, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       913411   862878    94.5   47.4   3585.1  965.6   3000.3  4171.8   -       -       50768 nil, 454648 refused
+redis   redis 8.8.0   1181776  1181776   100.0  100.0  4661.3  371.7   4988.9  8302.6   -       -       
+valkey  valkey 9.1.0  1374341  1374341   100.0  100.0  5420.9  283.9   5460.0  9355.3   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1766392 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2033620 misses=0
+aki dataset coverage: 948/2000 retrievable (47.4%), 1052 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.73x
+speedup vs valkey: 0.63x
+gate (2.0x): FAIL, aki is 0.73x Redis, below the 2.0x bar
+--- data-r10-v4096-zipfian-16x-rep2 (order valkey,redis,aki, 511793 keys) ---
+aki-bench: load-generator gogc=2000
+workload: mixed
+cell: keys=511793 members=0 value=4096B dist=zipfian s=0.99 P16 c64
+target  version       ops/sec  vops/sec  hit%   cov%   MB/s    p50 us  p99 us  p999 us  rss MB  hwm MB  note
+aki     unknown       913970   863414    94.5   47.4   3587.3  954.9   3008.5  4169.7   -       -       50783 nil, 454844 refused
+redis   redis 8.8.0   1133276  1133276   100.0  100.0  4470.0  384.8   5378.0  8847.4   -       -       
+valkey  valkey 9.1.0  1379425  1379425   100.0  100.0  5440.9  280.6   5455.9  9011.2   -       -       
+redis server window: maxmemory=unlimited policy=noeviction evicted=0 hits=1691422 misses=0
+valkey server window: maxmemory=unlimited policy=noeviction evicted=0 hits=2051362 misses=0
+aki dataset coverage: 948/2000 retrievable (47.4%), 1052 missing
+redis dataset coverage: 2000/2000 retrievable (100.0%)
+valkey dataset coverage: 2000/2000 retrievable (100.0%)
+speedup vs redis:  0.76x
+speedup vs valkey: 0.63x
+gate (2.0x): FAIL, aki is 0.76x Redis, below the 2.0x bar
+== done: /root/sqlo1bench/f3base1-data-r10/results.csv, manifest and per-cell JSON beside it ==
+F3BASE-RESUME DONE
