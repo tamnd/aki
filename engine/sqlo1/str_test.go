@@ -29,9 +29,13 @@ type recordingStore struct {
 	chunkReads int
 	pcReads    int
 	otherReads int
+	// readRounds counts BatchGet calls, the IO-round meter the
+	// iteration prefetch asserts against.
+	readRounds int
 }
 
 func (r *recordingStore) BatchGet(ctx context.Context, keys [][]byte) ([]Record, error) {
+	r.readRounds++
 	for _, k := range keys {
 		switch {
 		case len(k) == SubkeySize && k[8] == chunkKind:
