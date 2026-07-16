@@ -274,6 +274,56 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return strSizeErr(reply, err)
 		}
 		return AppendInt(reply, n)
+	case "INCR", "DECR", "INCRBY", "DECRBY":
+		var delta int64
+		switch cmd {
+		case "INCR", "DECR":
+			if len(args) != 2 {
+				return arityErr(reply, cmd)
+			}
+			delta = 1
+			if cmd == "DECR" {
+				delta = -1
+			}
+		default:
+			if len(args) != 3 {
+				return arityErr(reply, cmd)
+			}
+			// string2ll strictness: Redis rejects "+1" and "01" as
+			// increments, so the delta takes the canonical parser the
+			// values themselves go through.
+			n, ok := parseCanonicalInt(args[2])
+			if !ok {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			if cmd == "DECRBY" {
+				// -MinInt64 has no int64 form; Redis words this one
+				// differently from the value-overflow error.
+				if n == math.MinInt64 {
+					return AppendError(reply, "ERR decrement would overflow")
+				}
+				n = -n
+			}
+			delta = n
+		}
+		n, err := s.s.IncrBy(ctx, args[1], delta)
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, n)
+	case "INCRBYFLOAT":
+		if len(args) != 3 {
+			return arityErr(reply, cmd)
+		}
+		f, err := strconv.ParseFloat(string(args[2]), 64)
+		if err != nil || math.IsNaN(f) {
+			return AppendError(reply, "ERR value is not a valid float")
+		}
+		v, err := s.s.IncrByFloat(ctx, args[1], f)
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendBulk(reply, v)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)

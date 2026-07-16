@@ -50,6 +50,14 @@ type HotTable struct {
 	dirtyHead  int
 	dirtyN     int
 	dirtyBytes int
+	// intShadow holds the parsed int64 behind headers flagged
+	// tagIntShadow, keyed by slot: doc 05's integer fast path pays its
+	// 8 bytes only on keys that have actually seen INCR-family ops, so
+	// the value lives in a side map instead of a header field. The map
+	// is allocated on first arm. Entry lifetime follows the flag bit:
+	// dropShadow retires both together, and PutGen, Del, and removeSlot
+	// are the only places a flagged slot's value or identity can change.
+	intShadow map[uint32]int64
 }
 
 // maxKlen is the klen field's reach. Longer keys are legal in Redis but
@@ -281,6 +289,7 @@ func (t *HotTable) PutGen(key, val []byte, tag uint8, gen uint32) bool {
 			// TTL belong to the command layer.
 			hd.expireLo, hd.expireRem = 0, 0
 		}
+		t.dropShadow(s)
 		switch hd.valRef {
 		case 0:
 			// Reviving a tombstone: the header never left, so this is
@@ -487,6 +496,7 @@ func (t *HotTable) Del(key []byte) bool {
 	} else {
 		t.dirtyBytes += int(hd.klen)
 	}
+	t.dropShadow(s)
 	t.vals.release(hd.valRef)
 	hd.valRef = 0
 	hd.expireLo, hd.expireRem = 0, 0
@@ -536,10 +546,64 @@ func (t *HotTable) evict(s uint32, toGhost bool) bool {
 	return true
 }
 
+// dropShadow retires slot s's int shadow, flag bit and map entry
+// together. Every writer that lands on a flagged slot must pass
+// through here (or through PutGen's wholesale typeTag assignment,
+// which pairs with the explicit call just before it) so the map never
+// outlives the value it mirrors.
+func (t *HotTable) dropShadow(s uint32) {
+	hd := &t.hdrs[s]
+	if hd.typeTag&tagIntShadow != 0 {
+		hd.typeTag &^= tagIntShadow
+		delete(t.intShadow, s)
+	}
+}
+
+// armIntShadow caches n as key's parsed integer value. Only the INCR
+// family calls it, right after the canonical decimal string landed via
+// Set, so a flagged header always mirrors arena bytes that
+// strconv.AppendInt produced for n. Arming a key that is not a live
+// plain string is refused rather than an error: the shadow is an
+// optimization, never state.
+func (t *HotTable) armIntShadow(key []byte, n int64) {
+	s, ok := t.lookup(maphash.Bytes(t.seed, key), key)
+	if !ok {
+		return
+	}
+	hd := &t.hdrs[s]
+	if hd.valRef == 0 || t.expired(hd) || hd.typeTag&^tagIntShadow != TagString {
+		return
+	}
+	if t.intShadow == nil {
+		t.intShadow = make(map[uint32]int64)
+	}
+	hd.typeTag |= tagIntShadow
+	t.intShadow[s] = n
+}
+
+// intShadowOf answers key's cached int64 and exact expire_ms when the
+// shadow is armed and the key is still live and unexpired. A miss
+// means nothing: the caller falls back to reading and parsing the
+// bytes. The expiry rides along because the header is already in
+// hand and the caller's restamp rule needs it either way.
+func (t *HotTable) intShadowOf(key []byte) (n, expMs int64, ok bool) {
+	s, ok := t.lookup(maphash.Bytes(t.seed, key), key)
+	if !ok {
+		return 0, 0, false
+	}
+	hd := &t.hdrs[s]
+	if hd.typeTag&tagIntShadow == 0 || hd.valRef == 0 || t.expired(hd) {
+		return 0, 0, false
+	}
+	n, ok = t.intShadow[s]
+	return n, expMsOf(hd), ok
+}
+
 // removeSlot frees a header slot and its arena bytes and repairs the
 // index, promoting a dup when the primary occupant goes.
 func (t *HotTable) removeSlot(h uint64, s uint32) {
 	hd := &t.hdrs[s]
+	t.dropShadow(s)
 	t.keys.release(hd.keyRef)
 	if hd.valRef != 0 {
 		t.vals.release(hd.valRef)

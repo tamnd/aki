@@ -27,11 +27,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 )
 
 // ErrValueTooLong rejects a write past the 512 MiB Redis value cap.
 var ErrValueTooLong = errors.New("sqlo1: string value exceeds 512 MiB")
+
+// The INCR family's sentinel errors carry Redis's wording without the
+// "ERR " prefix, because storeErr prepends it; the command layer maps
+// them one to one onto wire errors.
+var (
+	ErrNotInt   = errors.New("value is not an integer or out of range")
+	ErrOverflow = errors.New("increment or decrement would overflow")
+	ErrNotFloat = errors.New("value is not a valid float")
+	ErrNaNInf   = errors.New("increment would produce NaN or Infinity")
+)
 
 // inlineCap bounds what the ladder will store as one record: Track
 // B's blob run must fit inside one 1 MiB extent behind its 64-byte
@@ -153,7 +164,7 @@ func (s *Str) metaOf(ctx context.Context, key []byte) (strMeta, error) {
 	if err != nil {
 		return strMeta{}, err
 	}
-	return strMeta{exists: true, rope: true, root: r}, nil
+	return strMeta{exists: true, rope: true, expMs: expMs, root: r}, nil
 }
 
 // retire registers the generation bump that kills a rope's plane,
@@ -428,11 +439,43 @@ const embstrMax = 44
 // int64, which is what Redis requires before it reports the int
 // encoding ("0123" and "+1" are raw bytes, not integers).
 func intShaped(v []byte) bool {
-	if len(v) == 0 || len(v) > 20 {
-		return false
+	_, ok := parseCanonicalInt(v)
+	return ok
+}
+
+// parseCanonicalInt parses v as the canonical decimal form of an
+// int64, Redis's string2ll: digits only, an optional leading minus, no
+// plus sign, no leading zeros ("0" itself is fine, "-0" is not), and
+// no overflow. It allocates nothing, which is what lets the INCR
+// family's cold path stay off the heap.
+func parseCanonicalInt(v []byte) (int64, bool) {
+	d := v
+	neg := len(d) > 0 && d[0] == '-'
+	if neg {
+		d = d[1:]
 	}
-	n, err := strconv.ParseInt(string(v), 10, 64)
-	return err == nil && strconv.FormatInt(n, 10) == string(v)
+	// 19 digits reach past MaxInt64/10 so the loop's overflow guard
+	// handles the rest; 20 digits always overflow.
+	if len(d) == 0 || len(d) > 19 || (d[0] == '0' && (neg || len(d) > 1)) {
+		return 0, false
+	}
+	var n uint64
+	for _, c := range d {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + uint64(c-'0')
+	}
+	if neg {
+		if n > 1<<63 {
+			return 0, false
+		}
+		return -int64(n), true
+	}
+	if n > math.MaxInt64 {
+		return 0, false
+	}
+	return int64(n), true
 }
 
 // Del removes key, retiring its plane first when it is a rope so the
@@ -761,6 +804,94 @@ func (s *Str) nextRooth(ctx context.Context) (uint64, error) {
 	c := s.leaseNext
 	s.leaseNext++
 	return MintRooth(s.cfg.Shard, c)
+}
+
+// IncrBy adds delta to key's integer value and returns the result,
+// doc 05's integer fast path. A missing key counts from zero; a rope
+// or a non-canonical value is ErrNotInt (numbers are short, so the
+// INCR family meets plain records only by construction). The hot loop
+// reads the header-cached int64 shadow instead of parsing: a shadow
+// hit means the key sits hot and live, so the write below runs
+// through PutGen's expiry-preserving overwrite and needs no restamp.
+// The canonical decimal string stays the single source of truth; the
+// shadow is re-armed after every store and any byte-level writer
+// invalidates it through the typeTag choke point in hot.go.
+func (s *Str) IncrBy(ctx context.Context, key []byte, delta int64) (int64, error) {
+	cur, expMs, hot := s.t.ht.intShadowOf(key)
+	if !hot {
+		v, root, e, ok, err := s.t.LookupEntry(ctx, key)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			if root {
+				return 0, ErrNotInt
+			}
+			n, canonical := parseCanonicalInt(v)
+			if !canonical {
+				return 0, ErrNotInt
+			}
+			cur, expMs = n, e
+		}
+	}
+	if (delta > 0 && cur > math.MaxInt64-delta) || (delta < 0 && cur < math.MinInt64-delta) {
+		return 0, ErrOverflow
+	}
+	n := cur + delta
+	s.val = strconv.AppendInt(s.val[:0], n, 10)
+	if err := s.t.Set(ctx, key, s.val, TagString); err != nil {
+		return 0, err
+	}
+	if err := s.restamp(ctx, key, expMs); err != nil {
+		return 0, err
+	}
+	s.t.ht.armIntShadow(key, n)
+	return n, nil
+}
+
+// IncrByFloat adds delta to key's float value and returns the exact
+// reply bytes, valid until the next call. No shadow: the float path
+// is rare and its formatting, not its parsing, is the compat surface.
+// The caller has already rejected a NaN delta.
+func (s *Str) IncrByFloat(ctx context.Context, key []byte, delta float64) ([]byte, error) {
+	var cur float64
+	v, root, expMs, ok, err := s.t.LookupEntry(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		if root {
+			return nil, ErrNotFloat
+		}
+		f, err := strconv.ParseFloat(string(v), 64)
+		if err != nil || math.IsNaN(f) {
+			return nil, ErrNotFloat
+		}
+		cur = f
+	}
+	n := cur + delta
+	if math.IsNaN(n) || math.IsInf(n, 0) {
+		return nil, ErrNaNInf
+	}
+	s.val = appendRedisFloat(s.val[:0], n)
+	if err := s.t.Set(ctx, key, s.val, TagString); err != nil {
+		return nil, err
+	}
+	if err := s.restamp(ctx, key, expMs); err != nil {
+		return nil, err
+	}
+	return s.val, nil
+}
+
+// appendRedisFloat formats f the way Redis replies to INCRBYFLOAT:
+// fixed notation, no exponent, no trailing zeros, no trailing dot.
+// Redis trims %.17Lf of a long double; the shortest round-trip form
+// of a float64 lands on the same string for every value a float64
+// represents exactly enough to print, and where the two diverge it is
+// long double precision we do not have, not a formatting choice.
+func appendRedisFloat(dst []byte, f float64) []byte {
+	b := strconv.AppendFloat(dst, f, 'f', -1, 64)
+	return b
 }
 
 // grow returns b with length n, reallocating only to gain capacity;

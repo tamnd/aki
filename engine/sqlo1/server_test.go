@@ -628,3 +628,132 @@ func TestServerRangeRope(t *testing.T) {
 		t.Fatal("full GET did not match the oracle")
 	}
 }
+
+// TestServerIncrFamily covers INCR, DECR, INCRBY, DECRBY, and
+// INCRBYFLOAT through dispatch: replies, Redis error texts including
+// the DECRBY MinInt64 special case, string2ll strictness on the
+// increment argument, TTL survival, and the int encoding answer.
+func TestServerIncrFamily(t *testing.T) {
+	do, clockp := dispatchServer(t)
+
+	if got := do("INCR", "n"); got != ":1\r\n" {
+		t.Fatalf("INCR missing = %q", got)
+	}
+	if got := do("INCRBY", "n", "41"); got != ":42\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("DECR", "n"); got != ":41\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("DECRBY", "n", "40"); got != ":1\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("DECR", "n"); got != ":0\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("DECR", "n"); got != ":-1\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("GET", "n"); got != "$2\r\n-1\r\n" {
+		t.Fatalf("stored bytes after DECR = %q", got)
+	}
+	if got := do("OBJECT", "ENCODING", "n"); got != "$3\r\nint\r\n" {
+		t.Fatalf("encoding after INCR family = %q", got)
+	}
+
+	// Non-integer values and non-canonical increments.
+	do("SET", "s", "abc")
+	wantNotInt := "-ERR value is not an integer or out of range\r\n"
+	if got := do("INCR", "s"); got != wantNotInt {
+		t.Fatalf("INCR on text = %q", got)
+	}
+	do("SET", "z", "0123")
+	if got := do("INCR", "z"); got != wantNotInt {
+		t.Fatalf("INCR on leading-zero value = %q", got)
+	}
+	for _, bad := range []string{"+1", "01", "1.5", "abc", ""} {
+		if got := do("INCRBY", "n", bad); got != wantNotInt {
+			t.Fatalf("INCRBY %q = %q", bad, got)
+		}
+	}
+
+	// Overflow in both directions, and the value stands.
+	do("SET", "big", "9223372036854775807")
+	wantOver := "-ERR increment or decrement would overflow\r\n"
+	if got := do("INCR", "big"); got != wantOver {
+		t.Fatalf("INCR at MaxInt64 = %q", got)
+	}
+	if got := do("GET", "big"); got != "$19\r\n9223372036854775807\r\n" {
+		t.Fatalf("value after refused INCR = %q", got)
+	}
+	do("SET", "small", "-9223372036854775808")
+	if got := do("DECR", "small"); got != wantOver {
+		t.Fatalf("DECR at MinInt64 = %q", got)
+	}
+	if got := do("DECRBY", "n", "-9223372036854775808"); got != "-ERR decrement would overflow\r\n" {
+		t.Fatalf("DECRBY MinInt64 = %q", got)
+	}
+	if got := do("INCRBY", "n", "-9223372036854775808"); got != wantOver {
+		t.Fatalf("INCRBY MinInt64 lands on value overflow = %q", got)
+	}
+
+	// TTL survives the INCR family.
+	do("SET", "t", "10", "EX", "100")
+	do("INCR", "t")
+	if got := do("TTL", "t"); got != ":100\r\n" {
+		t.Fatalf("TTL after INCR = %q", got)
+	}
+	do("INCRBYFLOAT", "t", "0.5")
+	if got := do("TTL", "t"); got != ":100\r\n" {
+		t.Fatalf("TTL after INCRBYFLOAT = %q", got)
+	}
+
+	// An INCR on a key mid-expiry counts from zero once the clock is
+	// past the deadline, millisecond-exact like every read.
+	do("SET", "dying", "500", "PX", "1000")
+	*clockp += 999
+	if got := do("INCR", "dying"); got != ":501\r\n" {
+		t.Fatalf("INCR 1ms before expiry = %q", got)
+	}
+	do("SET", "dying2", "500", "PX", "1000")
+	*clockp += 1000
+	if got := do("INCR", "dying2"); got != ":1\r\n" {
+		t.Fatalf("INCR after expiry = %q", got)
+	}
+
+	// INCRBYFLOAT: reply is a bulk string, formatting is trimmed
+	// fixed notation, and the error doors carry Redis's words.
+	if got := do("INCRBYFLOAT", "f", "10.5"); got != "$4\r\n10.5\r\n" {
+		t.Fatalf("INCRBYFLOAT missing = %q", got)
+	}
+	if got := do("INCRBYFLOAT", "f", "0.1"); got != "$4\r\n10.6\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("INCRBYFLOAT", "f", "-10.6"); got != "$1\r\n0\r\n" {
+		t.Fatalf("INCRBYFLOAT to zero = %q", got)
+	}
+	if got := do("INCRBYFLOAT", "f", "5e3"); got != "$4\r\n5000\r\n" {
+		t.Fatalf("INCRBYFLOAT exponent delta = %q", got)
+	}
+	wantNotFloat := "-ERR value is not a valid float\r\n"
+	if got := do("INCRBYFLOAT", "f", "abc"); got != wantNotFloat {
+		t.Fatal(got)
+	}
+	if got := do("INCRBYFLOAT", "f", "nan"); got != wantNotFloat {
+		t.Fatalf("NaN increment = %q", got)
+	}
+	if got := do("INCRBYFLOAT", "s", "1"); got != wantNotFloat {
+		t.Fatalf("INCRBYFLOAT on text value = %q", got)
+	}
+	if got := do("INCRBYFLOAT", "f", "inf"); got != "-ERR increment would produce NaN or Infinity\r\n" {
+		t.Fatalf("Inf increment = %q", got)
+	}
+
+	// Arity errors name the command in lowercase.
+	if got := do("INCR"); got != "-ERR wrong number of arguments for 'incr' command\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("INCRBY", "n"); got != "-ERR wrong number of arguments for 'incrby' command\r\n" {
+		t.Fatal(got)
+	}
+}
