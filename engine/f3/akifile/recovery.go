@@ -622,3 +622,32 @@ func ReadExtentTable(dev Device, meta *MetaSlot) ([]Extent, error) {
 	}
 	return ParseExtents(buf)
 }
+
+// ReadTTLIndex reads the TTL reclaim index the live meta root points at (spec
+// 2064/f3/07 section 3), the per-class expiry-bound map recovery step 11 and active
+// expiry consult to reclaim wholly-expired segments without scanning them. Like the
+// extent map it is a bare marshaled root the meta slot points straight at
+// (TTLIndexOff/TTLIndexLen), read without walking a segment header.
+//
+// It is an accelerator, not a source of truth: the authoritative expiry is each
+// record's own TTL in the tail, so a torn index only costs the fast path and recovery
+// falls back to the per-segment scan. The payload carries the TTL3 magic and every
+// length is bounds-checked, so a torn index surfaces as ErrMagic or ErrLength rather
+// than a bad reclaim; the caller decides whether to degrade or refuse.
+//
+// A file with no TTL index (a fresh file, or a scan fallback with no trusted root)
+// returns a nil slice and no error: the meta is nil or its TTLIndexLen is zero.
+func ReadTTLIndex(dev Device, meta *MetaSlot) ([]TTLClass, error) {
+	if meta == nil || meta.TTLIndexLen == 0 {
+		return nil, nil
+	}
+	buf := make([]byte, meta.TTLIndexLen)
+	if _, err := dev.ReadAt(buf, int64(meta.TTLIndexOff)); err != nil {
+		return nil, err
+	}
+	h, err := ParseTTLIndexHeader(buf)
+	if err != nil {
+		return nil, err
+	}
+	return TTLClasses(buf, h)
+}
