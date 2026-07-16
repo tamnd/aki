@@ -2,6 +2,7 @@ package sqlo1a
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 
@@ -43,6 +44,12 @@ func (d *DB) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 		if err := d.applyOpLocked(&b.Ops[i]); err != nil {
 			txn.Rollback()
 			return err
+		}
+	}
+	for i := range b.Bumps {
+		if err := d.applyBumpLocked(&b.Bumps[i]); err != nil {
+			txn.Rollback()
+			return fmt.Errorf("sqlo1a: batch %d bump %d: %w", b.Seq, i, err)
 		}
 	}
 	if err := bindExec(d.st.metaSetHW, func(s *sqlite3.Stmt) error {
@@ -93,6 +100,80 @@ func (d *DB) applyOpLocked(op *sqlo1.Op) error {
 		return fmt.Errorf("sqlo1a: put key %x: %w", rec.Key, err)
 	}
 	return nil
+}
+
+// applyBumpLocked upserts rooth's generation row inside the batch
+// transaction: a kv row under the shared GenKey bytes with genTag and
+// the generation in both the gen column (the future sweep's filter)
+// and a 4-byte value mirroring Track B's generation record. Monotonic
+// like Track B's apply, so a replayed or stale bump is a no-op, and it
+// refuses to clobber a row that is not a generation row, the same loud
+// aliasing failure Track B's genOf raises.
+func (d *DB) applyBumpLocked(bp *sqlo1.Bump) error {
+	if bp.NewGen == 0 {
+		return fmt.Errorf("bump of rooth %#x to generation 0", bp.Rooth)
+	}
+	key := sqlo1.GenKey(bp.Rooth)
+	tag, gen, found, err := d.rowTagGenLocked(key)
+	if err != nil {
+		return err
+	}
+	if found {
+		if tag != genTag {
+			return fmt.Errorf("generation row for rooth %#x holds tag %d", bp.Rooth, tag)
+		}
+		if int64(bp.NewGen) <= gen {
+			return nil
+		}
+	}
+	v := make([]byte, 4)
+	binary.LittleEndian.PutUint32(v, bp.NewGen)
+	crc := rowCRC(key, genTag, 0, int64(bp.NewGen), v)
+	if err := bindExec(d.st.kvPut, func(s *sqlite3.Stmt) error {
+		for _, err := range []error{
+			s.BindBlob(1, key),
+			s.BindInt64(2, genTag),
+			s.BindInt64(3, 0),
+			s.BindInt64(4, int64(bp.NewGen)),
+			s.BindBlob(5, v),
+			s.BindInt64(6, int64(crc)),
+		} {
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("bump rooth %#x to %d: %w", bp.Rooth, bp.NewGen, err)
+	}
+	return nil
+}
+
+// rowTagGenLocked reads one kv row's tag and gen columns without the
+// read path's foreign-tag gating, crc still verified; the bump apply
+// uses it to see generation rows the seam reads hide.
+func (d *DB) rowTagGenLocked(key []byte) (tag, gen int64, found bool, err error) {
+	s := d.st.kvGet
+	defer func() {
+		if rerr := s.Reset(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
+	if err := s.BindBlob(1, key); err != nil {
+		return 0, 0, false, err
+	}
+	if !s.Step() {
+		return 0, 0, false, s.Err()
+	}
+	tag = s.ColumnInt64(0)
+	exp := s.ColumnInt64(1)
+	gen = s.ColumnInt64(2)
+	v := append([]byte(nil), s.ColumnRawBlob(3)...)
+	crc := uint32(s.ColumnInt64(4))
+	if got := rowCRC(key, tag, exp, gen, v); got != crc {
+		return 0, 0, false, fmt.Errorf("%w: key %x has crc %08x, row hashes to %08x", ErrCorrupt, key, crc, got)
+	}
+	return tag, gen, true, nil
 }
 
 // delRootLocked clears the kv row and every elem table's rows under one

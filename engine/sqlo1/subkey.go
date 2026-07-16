@@ -98,6 +98,18 @@ func MintRooth(shard uint16, counter uint64) (uint64, error) {
 	return splitmix64(uint64(shard)<<48 | counter), nil
 }
 
+// GenKey returns the reserved key under which a backend records
+// rooth's current generation: rooth in the subkey layout with kind 0
+// and a zero segid. NewSubkey and DecodeSubkey reject kind 0, so no
+// per-type segment can collide. Both tracks store generation state
+// under the same bytes, which keeps the drain batch's Bumps
+// backend-agnostic.
+func GenKey(rooth uint64) []byte {
+	b := make([]byte, SubkeySize)
+	binary.LittleEndian.PutUint64(b, rooth)
+	return b
+}
+
 // LeaseEnd validates a mint lease of n counters starting at start and
 // returns the new lease mark, start+n. A mark counts counters ever
 // leased, so the space is spent when the mark reaches the 48-bit

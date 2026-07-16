@@ -197,3 +197,63 @@ func TestMemStoreMintLease(t *testing.T) {
 		t.Fatalf("lease after rejects: start %d, err %v, want 150", start, err)
 	}
 }
+
+func TestMemStoreBumps(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemStore()
+	live := func(rooth uint64, gen uint32) bool {
+		ok, err := s.RootLive(rooth, gen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+
+	if !live(7, 1) {
+		t.Fatal("unbumped rooth reported dead")
+	}
+	b := &DrainBatch{
+		Seq:   1,
+		Ops:   []Op{{Rec: Record{Key: []byte("r"), Value: []byte("img"), Root: true}}},
+		Bumps: []Bump{{Rooth: 7, NewGen: 2}},
+	}
+	if err := s.ApplyBatch(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	if live(7, 1) || !live(7, 2) {
+		t.Fatal("bump to 2 did not retire gen 1 and keep gen 2 live")
+	}
+	if _, err := s.Get(ctx, []byte("r")); err != nil {
+		t.Fatalf("op sharing the batch with a bump not applied: %v", err)
+	}
+
+	// A lower or equal bump is a no-op, and a replayed Seq applies nothing.
+	if err := s.ApplyBatch(ctx, &DrainBatch{Seq: 2, Bumps: []Bump{{Rooth: 7, NewGen: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if !live(7, 2) {
+		t.Fatal("stale bump lowered the generation")
+	}
+	if err := s.ApplyBatch(ctx, &DrainBatch{Seq: 1, Bumps: []Bump{{Rooth: 7, NewGen: 9}}}); err != nil {
+		t.Fatal(err)
+	}
+	if !live(7, 2) {
+		t.Fatal("replayed batch applied its bump")
+	}
+
+	// A zero bump rejects the whole batch with nothing applied.
+	bad := &DrainBatch{
+		Seq:   3,
+		Ops:   []Op{{Rec: Record{Key: []byte("x"), Value: []byte("v")}}},
+		Bumps: []Bump{{Rooth: 7, NewGen: 0}},
+	}
+	if err := s.ApplyBatch(ctx, bad); err == nil {
+		t.Fatal("bump to generation 0 accepted")
+	}
+	if _, err := s.Get(ctx, []byte("x")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rejected batch partially applied: %v", err)
+	}
+	if hw := s.Stats().HighWater; hw != 2 {
+		t.Fatalf("high-water %d after the rejected batch, want 2", hw)
+	}
+}

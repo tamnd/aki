@@ -16,12 +16,15 @@ var ErrCorrupt = errors.New("sqlo1a: row checksum mismatch")
 
 // recordTag is the kv.t value for flat Store-seam records and rootTag
 // the value for root images (seam Record.Root: the value is a per-type
-// root payload, doc 05 onward). Any other tag on a row means it belongs
-// to logic above this seam, and the seam reports the key as absent
-// rather than leaking another model's encoding as a plain value.
+// root payload, doc 05 onward). genTag rows carry root generations for
+// the drain batch's Bumps, keyed by the shared GenKey bytes and never
+// visible through reads. Any other tag on a row means it belongs to
+// logic above this seam, and the seam reports the key as absent rather
+// than leaking another model's encoding as a plain value.
 const (
 	recordTag = 0
 	rootTag   = 1
+	genTag    = 2
 )
 
 // scanPage is how many rows Scan pulls per statement execution. Pages keep

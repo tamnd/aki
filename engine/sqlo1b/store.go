@@ -616,12 +616,13 @@ func seamRecord(r *sqlo1.Record) *Record {
 // is emitted so a bad op rejects the whole batch cleanly. pos is the
 // vlog position the placement pass assigned to a put.
 type plannedFrame struct {
-	op  uint8
-	pay []byte
-	del bool
-	key []byte
-	rec *Record
-	pos Pos
+	op   uint8
+	pay  []byte
+	del  bool
+	key  []byte
+	rec  *Record
+	bump *sqlo1.Bump
+	pos  Pos
 }
 
 // placementRooth groups a put for vlog placement: records living under
@@ -693,6 +694,14 @@ func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 		}
 		frames = append(frames, plannedFrame{op: sqlo1.WALOpPut, pay: pay, rec: rec})
 	}
+	for i := range b.Bumps {
+		bp := &b.Bumps[i]
+		pay, err := EncodeGenbumpPayload(sqlo1.GenKey(bp.Rooth), bp.NewGen)
+		if err != nil {
+			return fmt.Errorf("sqlo1b: batch %d bump %d: %w", b.Seq, i, err)
+		}
+		frames = append(frames, plannedFrame{op: sqlo1.WALOpGenbump, pay: pay, bump: bp})
+	}
 	mark, err := EncodeMarkPayload(b.Seq)
 	if err != nil {
 		return err
@@ -747,6 +756,8 @@ func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 		switch {
 		case fr.del:
 			err = s.applyDel(fr.key)
+		case fr.bump != nil:
+			err = s.applyGenbump(sqlo1.GenKey(fr.bump.Rooth), fr.bump.NewGen)
 		case fr.rec != nil:
 			err = s.indexPut(fr.rec, fr.pos)
 		}

@@ -232,6 +232,104 @@ func TestDrainCarriesRootFlag(t *testing.T) {
 	}
 }
 
+// TestBumpRidesRootBatch: a registered bump leaves in the same DrainBatch
+// as its root key's op, and only that one; a bump whose root has not been
+// dirtied yet stays registered for a later cycle.
+func TestBumpRidesRootBatch(t *testing.T) {
+	ctx := context.Background()
+	ht := NewHotTable(64)
+	ms := NewMemStore()
+	d := newDrainer(ht, ms)
+
+	d.addBump([]byte("hot-root"), 7, 2)
+	d.addBump([]byte("hot-root"), 7, 3)
+	d.addBump([]byte("cold-root"), 9, 5)
+	ht.Put([]byte("hot-root"), []byte("img"), TagString|TagRoot)
+	if n, err := d.drain(ctx); err != nil || n != 1 {
+		t.Fatalf("drain = %d %v", n, err)
+	}
+	if live, _ := ms.RootLive(7, 2); live {
+		t.Fatal("both bumps for the drained root did not ride its batch")
+	}
+	if live, _ := ms.RootLive(9, 4); !live {
+		t.Fatal("bump for an undirtied root left the drainer early")
+	}
+	if _, ok := d.pending["hot-root"]; ok {
+		t.Fatal("carried bump still registered after a successful drain")
+	}
+	if _, ok := d.pending["cold-root"]; !ok {
+		t.Fatal("uncarried bump dropped from the drainer")
+	}
+
+	ht.Put([]byte("cold-root"), []byte("img"), TagString|TagRoot)
+	if n, err := d.drain(ctx); err != nil || n != 1 {
+		t.Fatalf("second drain = %d %v", n, err)
+	}
+	if live, _ := ms.RootLive(9, 4); live {
+		t.Fatal("held bump did not ride its root's later batch")
+	}
+	if len(d.pending) != 0 {
+		t.Fatalf("%d bumps still registered after both roots drained", len(d.pending))
+	}
+}
+
+// TestBumpSurvivesFailedDrain: a store error keeps the bump registered,
+// and the retry re-attaches it under the reused Seq.
+func TestBumpSurvivesFailedDrain(t *testing.T) {
+	ctx := context.Background()
+	ht := NewHotTable(64)
+	fs := &failStore{MemStore: *NewMemStore(), fail: true}
+	d := newDrainer(ht, fs)
+
+	d.addBump([]byte("r"), 7, 2)
+	ht.Put([]byte("r"), []byte("img"), TagString|TagRoot)
+	if _, err := d.drain(ctx); err == nil {
+		t.Fatal("injected failure did not surface")
+	}
+	if _, ok := d.pending["r"]; !ok {
+		t.Fatal("failed drain dropped the registered bump")
+	}
+	fs.fail = false
+	if n, err := d.drain(ctx); err != nil || n != 1 {
+		t.Fatalf("retry drain = %d %v", n, err)
+	}
+	if live, _ := fs.RootLive(7, 1); live {
+		t.Fatal("retried batch did not carry the bump")
+	}
+	if len(fs.seqs) != 2 || fs.seqs[0] != fs.seqs[1] {
+		t.Fatalf("retry must reuse the Seq: %v", fs.seqs)
+	}
+	if len(d.pending) != 0 {
+		t.Fatal("bump still registered after the successful retry")
+	}
+}
+
+// TestTieredBumpReachesStore: the type layer's entry point, register
+// through Tiered.Bump then dirty the root, lands the bump in the store
+// with the root's image on a Flush.
+func TestTieredBumpReachesStore(t *testing.T) {
+	ctx := context.Background()
+	r := newTieredRig(t, 64, 1, 1)
+
+	key := []byte("root")
+	r.t.Bump(key, 7, 2)
+	if err := r.t.Set(ctx, key, []byte("img"), TagString|TagRoot); err != nil {
+		t.Fatal(err)
+	}
+	if live, _ := r.ms.RootLive(7, 1); !live {
+		t.Fatal("bump reached the store before its root drained")
+	}
+	if err := r.t.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if live, _ := r.ms.RootLive(7, 1); live {
+		t.Fatal("flushed root batch did not carry the bump")
+	}
+	if live, _ := r.ms.RootLive(7, 2); !live {
+		t.Fatal("bump retired the generation it installed")
+	}
+}
+
 // TestMemStoreRejectsRootGen: the seam contract says a root's generation
 // lives in its payload; a Root op with a seam gen must reject the whole
 // batch with nothing applied.

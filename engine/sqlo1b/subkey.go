@@ -17,4 +17,5 @@ var (
 	NewSubkey    = sqlo1.NewSubkey
 	DecodeSubkey = sqlo1.DecodeSubkey
 	MintRooth    = sqlo1.MintRooth
+	GenKey       = sqlo1.GenKey
 )

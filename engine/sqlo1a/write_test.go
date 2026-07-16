@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/ncruces/go-sqlite3"
@@ -255,4 +256,107 @@ func TestApplyBatchRootRecords(t *testing.T) {
 	if hw := db.Stats().HighWater; hw != 1 {
 		t.Fatalf("HighWater after rejected batch = %d, want 1", hw)
 	}
+}
+
+// genRow asserts the row under GenKey(rooth) is a genTag row holding
+// want, through the raw read the bump apply itself uses.
+func genRow(t *testing.T, db *DB, rooth uint64, want int64) {
+	t.Helper()
+	tag, gen, found, err := db.rowTagGenLocked(sqlo1.GenKey(rooth))
+	if err != nil {
+		t.Fatalf("gen row for %#x: %v", rooth, err)
+	}
+	if !found || tag != genTag || gen != want {
+		t.Fatalf("gen row for %#x: tag %d gen %d found %v, want genTag gen %d", rooth, tag, gen, found, want)
+	}
+}
+
+// TestApplyBatchBumps: seam Bumps land as genTag rows in the batch
+// transaction, invisible to reads, monotonic, replayed exactly once,
+// persistent across a reopen, and both a zero-generation bump and a
+// user record squatting on the GenKey bytes reject the whole batch.
+func TestApplyBatchBumps(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bumps.sqlo1")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+
+	err = db.ApplyBatch(ctx, &sqlo1.DrainBatch{
+		Seq:   1,
+		Ops:   []sqlo1.Op{{Rec: sqlo1.Record{Key: []byte("wide"), Value: []byte("img"), Root: true}}},
+		Bumps: []sqlo1.Bump{{Rooth: 7, NewGen: 2}},
+	})
+	if err != nil {
+		t.Fatalf("ApplyBatch: %v", err)
+	}
+	genRow(t, db, 7, 2)
+	if _, err := db.Get(ctx, sqlo1.GenKey(7)); !errors.Is(err, sqlo1.ErrNotFound) {
+		t.Fatalf("gen row leaked through Get: %v", err)
+	}
+	if _, err := db.Scan(ctx, nil, func(r sqlo1.Record) bool {
+		if bytes.Equal(r.Key, sqlo1.GenKey(7)) {
+			t.Fatal("gen row leaked through Scan")
+		}
+		return true
+	}); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	// Lower bump in a later batch is a monotonic no-op; a replayed Seq
+	// applies nothing at all.
+	if err := db.ApplyBatch(ctx, &sqlo1.DrainBatch{Seq: 2, Bumps: []sqlo1.Bump{{Rooth: 7, NewGen: 1}}}); err != nil {
+		t.Fatalf("stale bump: %v", err)
+	}
+	genRow(t, db, 7, 2)
+	if err := db.ApplyBatch(ctx, &sqlo1.DrainBatch{Seq: 2, Bumps: []sqlo1.Bump{{Rooth: 7, NewGen: 9}}}); err != nil {
+		t.Fatalf("replayed batch: %v", err)
+	}
+	genRow(t, db, 7, 2)
+
+	// A zero-generation bump rolls the whole batch back.
+	err = db.ApplyBatch(ctx, &sqlo1.DrainBatch{
+		Seq:   3,
+		Ops:   []sqlo1.Op{{Rec: sqlo1.Record{Key: []byte("early"), Value: []byte("x")}}},
+		Bumps: []sqlo1.Bump{{Rooth: 7, NewGen: 0}},
+	})
+	if err == nil {
+		t.Fatal("bump to generation 0 applied")
+	}
+	if _, err := db.Get(ctx, []byte("early")); !errors.Is(err, sqlo1.ErrNotFound) {
+		t.Fatalf("rejected batch left an op behind: %v", err)
+	}
+
+	// A user record occupying the GenKey bytes is the loud aliasing
+	// failure, not a silent clobber, and it rolls the batch back too.
+	rawPut(t, db, sqlo1.GenKey(9), recordTag, 0, 0, []byte("squatter"), false)
+	err = db.ApplyBatch(ctx, &sqlo1.DrainBatch{
+		Seq:   3,
+		Ops:   []sqlo1.Op{{Rec: sqlo1.Record{Key: []byte("early"), Value: []byte("x")}}},
+		Bumps: []sqlo1.Bump{{Rooth: 9, NewGen: 1}},
+	})
+	if err == nil {
+		t.Fatal("bump clobbered a non-generation row")
+	}
+	if _, err := db.Get(ctx, []byte("early")); !errors.Is(err, sqlo1.ErrNotFound) {
+		t.Fatalf("aliasing reject left an op behind: %v", err)
+	}
+	if hw := db.Stats().HighWater; hw != 2 {
+		t.Fatalf("HighWater after rejects = %d, want 2", hw)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	db, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	genRow(t, db, 7, 2)
+	if err := db.ApplyBatch(ctx, &sqlo1.DrainBatch{Seq: 3, Bumps: []sqlo1.Bump{{Rooth: 7, NewGen: 3}}}); err != nil {
+		t.Fatalf("bump after reopen: %v", err)
+	}
+	genRow(t, db, 7, 3)
 }

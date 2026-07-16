@@ -134,15 +134,6 @@ func DecodeGenbumpPayload(b []byte) ([]byte, uint32, error) {
 // no segment minted under its rooth survives.
 const genValueSize = 4
 
-// GenKey returns the index key of rooth's generation record: rooth
-// in the subkey layout with kind 0 and a zero segid. NewSubkey and
-// DecodeSubkey reject kind 0, so no per-type segment can collide.
-func GenKey(rooth uint64) []byte {
-	b := make([]byte, SubkeySize)
-	binary.LittleEndian.PutUint64(b, rooth)
-	return b
-}
-
 // genRecord builds the generation record for a GENBUMP key.
 func genRecord(key []byte, gen uint32) *Record {
 	v := make([]byte, genValueSize)

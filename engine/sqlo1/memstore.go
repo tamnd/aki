@@ -15,6 +15,7 @@ import (
 type MemStore struct {
 	mu        sync.Mutex
 	recs      map[string]Record
+	gens      map[uint64]uint32
 	highWater int64
 	mintMark  uint64
 }
@@ -23,7 +24,7 @@ var _ Minter = (*MemStore)(nil)
 
 // NewMemStore returns an empty placeholder store.
 func NewMemStore() *MemStore {
-	return &MemStore{recs: make(map[string]Record)}
+	return &MemStore{recs: make(map[string]Record), gens: make(map[uint64]uint32)}
 }
 
 func (s *MemStore) Get(ctx context.Context, key []byte) (Record, error) {
@@ -62,6 +63,11 @@ func (s *MemStore) ApplyBatch(ctx context.Context, b *DrainBatch) error {
 			return fmt.Errorf("sqlo1: batch %d op %d: root record %x with seam gen %d", b.Seq, i, op.Rec.Key, op.Rec.Gen)
 		}
 	}
+	for i := range b.Bumps {
+		if b.Bumps[i].NewGen == 0 {
+			return fmt.Errorf("sqlo1: batch %d bump %d: rooth %#x to generation 0", b.Seq, i, b.Bumps[i].Rooth)
+		}
+	}
 	for _, op := range b.Ops {
 		if op.Del {
 			delete(s.recs, string(op.Rec.Key))
@@ -75,8 +81,22 @@ func (s *MemStore) ApplyBatch(ctx context.Context, b *DrainBatch) error {
 		rec.Value = append([]byte(nil), op.Rec.Value...)
 		s.recs[string(rec.Key)] = rec
 	}
+	for _, bp := range b.Bumps {
+		if bp.NewGen > s.gens[bp.Rooth] {
+			s.gens[bp.Rooth] = bp.NewGen
+		}
+	}
 	s.highWater = b.Seq
 	return nil
+}
+
+// RootLive mirrors the Track B liveness probe so tests above the seam
+// can observe bumps through the placeholder: a record minted under
+// rooth is live unless a durable bump went past its generation.
+func (s *MemStore) RootLive(rooth uint64, rootgen uint32) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return rootgen >= s.gens[rooth], nil
 }
 
 // Scan walks records in key order. The cursor is the last visited key; the
