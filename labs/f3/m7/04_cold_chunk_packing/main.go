@@ -94,6 +94,65 @@ const (
 	hashVecBytes = 4  // hash/field.go vec: one uint32 draw-vector slot per field
 )
 
+// Stream encoding constants, copied from the packages they mirror. A stream's native
+// band is already an append log of packed blocks, and a block's blob is byte-for-byte
+// the master-delta wire form a cold read decodes, so a demote spills the whole blob
+// through store.AppendChunk with no repack at all (stream/cold.go demote). This gives
+// the tightest packing of the series: the factor is 1.0 by construction (the payload
+// IS the resident blob), so the only on-disk overhead is the cold frame header plus
+// the key and the 16-byte first-id discriminator. A block demotes whole, so it keeps
+// no per-entry resident record; the resident cost after a demote is the block's header
+// cell and its master schema, kept so covers and the directory floor resolve a cold
+// block without a pread, plus its share of one demote-sequence descriptor. So the
+// stream frees the blob (~96% of a byte-bound block) rather than the list's whole
+// ~98.9%: it trades a slightly larger resident residue for pread-free block resolution.
+// A narrow-value block seals on the 128-entry cap and under-fills the 4 KiB budget, so
+// its fixed header cell is a larger share and it frees a touch less; the freed fraction
+// climbs toward ~96% as a wider value fills the byte budget.
+const (
+	streamBlockBudget = 4096 // block.go blockBudget: the per-block blob byte budget
+	streamBlockCap    = 128  // block.go blockCap: the per-block entry ceiling
+	streamDiscBytes   = 16   // stream/cold.go discID: a 16-byte first id (ms || seq), on disk
+	streamHeaderBytes = 96   // stream.go blockHeaderBytes: the resident cell per block
+	streamDescBytes   = 48   // tier/directory.go: one resident demote-sequence descriptor per shed block
+	streamNameLen     = 1    // the single field name the master carries once for a same-schema block
+)
+
+// streamMasterLen prices the master (first) entry of a block: the flag byte, the
+// zero id delta (uvarint 0 plus signed-varint 0), the field count, the one field name
+// with its length prefix, and the value with its length prefix (block.go appendMaster).
+func streamMasterLen(width int) int {
+	return 1 + uvarintLen(0) + 1 + uvarintLen(1) + uvarintLen(streamNameLen) + streamNameLen + uvarintLen(width) + width
+}
+
+// streamEntryLen prices the i-th same-schema entry of a block (i counts from the
+// master at 0): the flag byte, the id delta against the block first id (consecutive
+// ms so the ms delta is uvarint(i), seq 0 so the signed seq delta is one byte), and
+// the value with its length prefix. The field name is implied by the master, so a
+// same-schema entry carries none (block.go appendEntry, same branch).
+func streamEntryLen(i, width int) int {
+	return 1 + uvarintLen(i) + 1 + uvarintLen(width) + width
+}
+
+// streamBlockPack models one block's fill for a fixed value width, sealing on
+// whichever binds first, the 4 KiB blob budget or the 128-entry cap (block.go
+// appendEntry rejects an entry that would breach either, so the blob stays at or
+// under the budget). It returns the entries the block holds and its blob byte count,
+// which is exactly the cold payload since the demote spills the blob verbatim.
+func streamBlockPack(width int) (entries, payloadBytes int) {
+	payloadBytes = streamMasterLen(width)
+	entries = 1
+	for entries < streamBlockCap {
+		next := streamEntryLen(entries, width)
+		if payloadBytes+next > streamBlockBudget {
+			break
+		}
+		payloadBytes += next
+		entries++
+	}
+	return entries, payloadBytes
+}
+
 // uvarintLen is the byte width binary.AppendUvarint writes for n, the length prefix
 // each packed member carries.
 func uvarintLen(n int) int {
@@ -249,6 +308,46 @@ func measureHash(width, keyLen int) hashRow {
 	}
 }
 
+// streamRow is one value-width point in the stream sweep. It shares the frame shape
+// of the other rows but models the whole-block demote of an already-packed blob: no
+// per-entry resident record, no offset table, and no repack, so the payload is the
+// resident blob verbatim (packing factor 1.0) and the resident cost after a demote is
+// only the block header cell plus the chunk's share of one demote-sequence descriptor.
+type streamRow struct {
+	width     int
+	members   int     // entries packed into one block
+	payload   int     // blob bytes those entries occupy, the cold payload verbatim
+	frame     int     // whole on-disk frame bytes (header + key + first-id disc + payload)
+	overhead  float64 // frame overhead as a fraction of the frame
+	metaPerEl float64 // resident cold metadata bytes per cold entry (descriptor share)
+	amortize  float64 // element-per-row resident cost over the block's, the packing win
+	hotPerEl  float64 // fully-resident bytes per entry (blob share + block header cell)
+	coldPerEl float64 // resident bytes per entry after a whole-block demote
+	freedFrac float64 // resident fraction a demote frees to disk (the blob bytes)
+}
+
+func measureStream(width, keyLen int) streamRow {
+	members, payload := streamBlockPack(width)
+	frame := chunkHdr + keyLen + streamDiscBytes + payload
+	metaPerEl := float64(streamDescBytes) / float64(members)
+	// A resident block keeps its blob (payload share per entry) plus the fixed header
+	// cell; a cold block keeps only the header cell and its descriptor share.
+	hotPerEl := float64(payload+streamHeaderBytes) / float64(members)
+	coldPerEl := float64(streamHeaderBytes)/float64(members) + metaPerEl
+	return streamRow{
+		width:     width,
+		members:   members,
+		payload:   payload,
+		frame:     frame,
+		overhead:  float64(frame-payload) / float64(frame),
+		metaPerEl: metaPerEl,
+		amortize:  elementPerRowResident / metaPerEl,
+		hotPerEl:  hotPerEl,
+		coldPerEl: coldPerEl,
+		freedFrac: (hotPerEl - coldPerEl) / hotPerEl,
+	}
+}
+
 func main() {
 	quick := flag.Bool("quick", false, "run the reduced width sweep")
 	keyLen := flag.Int("keylen", 16, "collection key byte length (on-disk frame only)")
@@ -351,4 +450,36 @@ func main() {
 		hverdict.metaPerEl, hverdict.amortize)
 	fmt.Printf("  a demote frees %.0f%% of a field's footprint to disk, the value bytes (%.0f B -> %.0f B resident; the field stays resident for a zero-pread probe)\n",
 		hverdict.freedFrac*100, hverdict.hotPerEl, hverdict.coldPerEl)
+
+	// The stream column: a stream block's blob is already the wire form, so a demote
+	// spills it whole with no repack (packing factor 1.0, the tightest packing of the
+	// series) and keeps only the block header cell, its master schema, and one
+	// descriptor per shed block. It frees ~96% of a byte-bound block, a touch below the
+	// list's whole-chunk demote, the price of pread-free block resolution.
+	fmt.Printf("\nstream cold chunk packing, whole-block demote of an already-packed blob (payload = blob verbatim, factor 1.0)\n\n")
+	fmt.Printf(hdr, "value", "entries/", "payload", "frame", "frame", "resident meta", "vs element", "resident", "freed to")
+	fmt.Printf(hdr, "bytes", "block", "bytes", "bytes", "overhead", "B/entry", "per-row", "B/entry", "disk")
+	fmt.Printf(hdr, "------", "--------", "-------", "-----", "--------", "-------------", "----------", "--------", "--------")
+
+	var sverdict streamRow
+	for _, width := range widths {
+		r := measureStream(width, *keyLen)
+		if width == 20 {
+			sverdict = r
+		}
+		fmt.Printf("%-8d %-9d %-8d %-7d %-9s %-14.3f %-11s %-9.3f %-8s\n",
+			r.width, r.members, r.payload, r.frame,
+			fmt.Sprintf("%.2f%%", r.overhead*100), r.metaPerEl,
+			fmt.Sprintf("%.0fx", r.amortize), r.coldPerEl,
+			fmt.Sprintf("%.1f%%", r.freedFrac*100))
+	}
+	if sverdict.members == 0 {
+		sverdict = measureStream(20, *keyLen)
+	}
+	fmt.Printf("\nStream verdict point (20-byte value, single field):\n")
+	fmt.Printf("  %d entries per block, blob spilled verbatim as the cold payload (packing factor 1.0, the tightest of the series)\n", sverdict.members)
+	fmt.Printf("  frame overhead %.2f%% (cold frame header only, no repack), resident cold metadata %.3f B/entry, %.0fx below element-per-row\n",
+		sverdict.overhead*100, sverdict.metaPerEl, sverdict.amortize)
+	fmt.Printf("  a whole-block demote frees %.1f%% of the block's resident footprint to disk (%.1f B -> %.2f B resident per entry; the header cell and master schema stay resident for pread-free block resolution)\n",
+		sverdict.freedFrac*100, sverdict.hotPerEl, sverdict.coldPerEl)
 }

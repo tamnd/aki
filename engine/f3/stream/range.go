@@ -70,7 +70,8 @@ func (s *stream) collectForward(lo, hi bound, limit int) []rangeEntry {
 	var scratch []field
 	for i := start; i < len(s.blocks); i++ {
 		stop := false
-		s.blocks[i].walk(scratch, func(id streamID, fields []field) bool {
+		clone := blockClone(s.blocks[i])
+		s.walkBlock(s.blocks[i], scratch, func(id streamID, fields []field) bool {
 			if !aboveLo(id, lo) {
 				return true // still below the window, keep scanning
 			}
@@ -78,7 +79,7 @@ func (s *stream) collectForward(lo, hi bound, limit int) []rangeEntry {
 				stop = true // past the window; entries only climb from here
 				return false
 			}
-			out = append(out, rangeEntry{id: id, fields: cloneFields(fields)})
+			out = append(out, rangeEntry{id: id, fields: clone(fields)})
 			if limit > 0 && len(out) >= limit {
 				stop = true
 				return false
@@ -102,8 +103,9 @@ func (s *stream) collectReverse(lo, hi bound, limit int) []rangeEntry {
 	var scratch []field
 	for i := start; i >= 0; i-- {
 		blockEntries = blockEntries[:0]
-		s.blocks[i].walk(scratch, func(id streamID, fields []field) bool {
-			blockEntries = append(blockEntries, rangeEntry{id: id, fields: cloneFields(fields)})
+		clone := blockClone(s.blocks[i])
+		s.walkBlock(s.blocks[i], scratch, func(id streamID, fields []field) bool {
+			blockEntries = append(blockEntries, rangeEntry{id: id, fields: clone(fields)})
 			return true
 		})
 		stop := false
@@ -129,12 +131,56 @@ func (s *stream) collectReverse(lo, hi bound, limit int) []rangeEntry {
 	return out
 }
 
+// walkBlock decodes block b's live entries in order the same way b.walk does, but
+// preads the payload first when b is cold so a range read crosses a demoted block
+// transparently (cold.go, M7). A resident block walks its own blob with no pread; a
+// cold block reads its payload once into the stream's shared scratch and walks that
+// with the block's resident master schema (the names offsets index into the payload,
+// byte-identical to the shed blob). A torn cold frame yields no entries, the
+// empty-block reading a broken cold region degrades to.
+func (s *stream) walkBlock(b *block, scratch []field, fn func(id streamID, fields []field) bool) {
+	if !b.cold() {
+		b.walk(scratch, fn)
+		return
+	}
+	b.walkIn(s.cold.payload(b.coldOff), scratch, fn)
+}
+
+// blockClone picks the field-copy a gather from block b must use. A cold block's
+// walk yields views into the shared pread scratch, which the next cold block's pread
+// clobbers, so a gathered cold entry must deep-copy its name and value bytes; a
+// resident block's views alias its stable blob and keep the cheap header-only clone.
+// Only a read that actually crosses a cold block pays the deep copy.
+func blockClone(b *block) func([]field) []field {
+	if b.cold() {
+		return deepCloneFields
+	}
+	return cloneFields
+}
+
 // cloneFields copies the field headers the block walk reuses per entry, so a
 // gathered entry keeps its own view slice across later walk steps. The name and
 // value bytes are not copied, only the slice headers pointing into the stable
 // blob.
 func cloneFields(fields []field) []field {
 	return append([]field(nil), fields...)
+}
+
+// deepCloneFields copies each field's name and value bytes, not just the slice
+// headers, so a gathered entry survives the next cold block's pread reusing the
+// shared scratch buffer. It is the cold-path clone: a resident walk keeps
+// cloneFields since its blob is stable, but a cold walk's views alias scratch, which
+// the walk of the next cold block overwrites. Only the cold range paths pay this
+// copy, so the resident hot path is unchanged.
+func deepCloneFields(fields []field) []field {
+	out := make([]field, len(fields))
+	for i := range fields {
+		out[i] = field{
+			name:  append([]byte(nil), fields[i].name...),
+			value: append([]byte(nil), fields[i].value...),
+		}
+	}
+	return out
 }
 
 // entryAt returns the live entry with exactly id and ok=true, or ok=false when no
@@ -150,9 +196,10 @@ func (s *stream) entryAt(id streamID) (fields []field, ok bool) {
 		return nil, false
 	}
 	var scratch []field
-	b.walk(scratch, func(eid streamID, ef []field) bool {
+	clone := blockClone(b)
+	s.walkBlock(b, scratch, func(eid streamID, ef []field) bool {
 		if eid == id {
-			fields, ok = cloneFields(ef), true
+			fields, ok = clone(ef), true
 			return false
 		}
 		return eid.cmp(id) < 0 // stop once the walk climbs past id

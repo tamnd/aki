@@ -196,3 +196,70 @@ func TestHashChunkFitsLocatorCeiling(t *testing.T) {
 		}
 	}
 }
+
+// TestStreamPayloadIsBlobVerbatim pins the stream column's headline: the demote spills
+// the block blob with no repack, so the cold payload is exactly the resident blob and
+// the frame carries only the fixed header, key, and discriminator over it, at every
+// width regardless of the block's fill (the packing factor is 1.0 by construction).
+func TestStreamPayloadIsBlobVerbatim(t *testing.T) {
+	for _, width := range []int{8, 20, 64, 256} {
+		r := measureStream(width, keyLen)
+		if got := r.frame - r.payload; got != chunkHdr+keyLen+streamDiscBytes {
+			t.Fatalf("width %d: frame carries %d B over the blob, want the fixed %d-B header (payload not verbatim)",
+				width, got, chunkHdr+keyLen+streamDiscBytes)
+		}
+	}
+	// A byte-bound block (a wide value fills the 4 KiB budget) amortizes that fixed
+	// header to near 1%, the same frame tax the set and hash rows pay. A narrow value
+	// seals on the 128-entry cap and under-fills, so its overhead is higher, an
+	// entry-cap property, not a packing-factor one.
+	if r := measureStream(64, keyLen); r.overhead > 0.02 {
+		t.Fatalf("byte-bound stream frame overhead %.3f above ~1%%", r.overhead)
+	}
+}
+
+// TestStreamWholeBlockFreesLargeMajority pins the memory pitch: a whole-block demote
+// frees the large majority of the block footprint, keeping only the fixed header cell,
+// the master schema, and one descriptor share, so a read resolves a cold block without
+// a pread. The freed fraction climbs with the value width toward ~96%: a narrow value
+// seals the block on the entry cap and under-fills the byte budget, so the fixed header
+// cell is a larger share; the stream frees a touch less than the list's ~0.99 because
+// it keeps that header cell resident where the list keeps only a descriptor.
+func TestStreamWholeBlockFreesLargeMajority(t *testing.T) {
+	for _, width := range []int{8, 20, 64, 256} {
+		if r := measureStream(width, keyLen); r.freedFrac < 0.90 {
+			t.Fatalf("width %d: stream demote freed %.4f, want the large majority of the block footprint", width, r.freedFrac)
+		}
+	}
+	small := measureStream(8, keyLen)
+	large := measureStream(256, keyLen)
+	if large.freedFrac <= small.freedFrac {
+		t.Fatalf("stream freed %.4f at width 256 not above %.4f at width 8, want it to climb with width", large.freedFrac, small.freedFrac)
+	}
+	if large.freedFrac < 0.95 {
+		t.Fatalf("byte-bound stream demote freed %.4f, want ~0.96", large.freedFrac)
+	}
+}
+
+// TestStreamKeepsNoOffsetTable pins the structural saving: a cold stream block, like a
+// cold list chunk, keeps only its demote-sequence descriptor resident and no
+// offset-table slot, because a read rides the block handle's cold offset rather than a
+// directory slot. So a cold stream block's resident metadata is at or below the set's
+// descriptor-plus-offset cost.
+func TestStreamKeepsNoOffsetTable(t *testing.T) {
+	if streamDescBytes >= descBytes+offsBytes {
+		t.Fatalf("cold stream block keeps %d resident B, not below the set's %d (descriptor + offset slot)",
+			streamDescBytes, descBytes+offsBytes)
+	}
+}
+
+// TestStreamBlockFitsCap pins that the model never packs more than the block entry cap
+// (block.go blockCap): a narrow value hits the 128-entry cap before the 4 KiB byte
+// budget, the geometry the block encoding fixes.
+func TestStreamBlockFitsCap(t *testing.T) {
+	for _, width := range []int{1, 8, 16, 20, 32} {
+		if r := measureStream(width, keyLen); r.members > streamBlockCap {
+			t.Fatalf("width %d packs %d entries, over the block cap %d", width, r.members, streamBlockCap)
+		}
+	}
+}

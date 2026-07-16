@@ -69,6 +69,14 @@ type block struct {
 	count   int // entries written, live or deleted
 	deleted int // XDEL tombstones (set in a later slice)
 	names   []nameRef
+	// coldOff is the cold-region offset of the block's spilled blob once a demote
+	// pass has shed it (cold.go, M7). A demote releases blob and sets coldOff, so a
+	// nil blob with a non-zero offset is the cold marker; the store burns cold offset
+	// 0, so a resident block (offset 0, blob non-nil) is byte-identical to M0 (L9).
+	// The header fields (first, last, count, deleted) and the names schema stay
+	// resident, so covers and the directory floor resolve a cold block without a
+	// pread, and a cold read walks the preaded payload with the resident names.
+	coldOff uint64
 }
 
 // newBlock returns an empty, open block. Its first appendEntry becomes the
@@ -182,6 +190,11 @@ func (b *block) frameLen(id streamID, fields []field, same bool) int {
 	return n
 }
 
+// cold reports whether a demote pass has shed this block's blob to the cold
+// region (cold.go): a nil blob with a non-zero cold offset. The store burns cold
+// offset 0, so the offset is a reliable marker and a resident block reads not cold.
+func (b *block) cold() bool { return b.blob == nil && b.coldOff != 0 }
+
 // walk decodes the block's live entries in order and yields each as (id,
 // fields), stopping early if fn returns false. scratch is a caller-owned []field
 // reused across entries to keep the walk allocation-free; the field name and
@@ -189,32 +202,40 @@ func (b *block) frameLen(id streamID, fields []field, same bool) int {
 // next block mutation. Tombstoned entries are decoded (to advance past them) and
 // skipped.
 func (b *block) walk(scratch []field, fn func(id streamID, fields []field) bool) {
+	b.walkIn(b.blob, scratch, fn)
+}
+
+// walkIn is walk over an explicit blob rather than the block's own, so a cold
+// read can walk a preaded payload with the resident master schema (the names
+// offsets index into the payload, which is byte-identical to the shed blob). The
+// resident walk is walkIn over b.blob. The yielded field views alias blob.
+func (b *block) walkIn(blob []byte, scratch []field, fn func(id streamID, fields []field) bool) {
 	pos := 0
 	for i := 0; i < b.count; i++ {
-		flags := b.blob[pos]
+		flags := blob[pos]
 		pos++
-		id, n := readIDDelta(b.blob[pos:], b.first)
+		id, n := readIDDelta(blob[pos:], b.first)
 		pos += n
 		fields := scratch[:0]
 		if flags&entrySameSchema != 0 {
 			for _, nr := range b.names {
-				vl, n := binary.Uvarint(b.blob[pos:])
+				vl, n := binary.Uvarint(blob[pos:])
 				pos += n
-				val := b.blob[pos : pos+int(vl)]
+				val := blob[pos : pos+int(vl)]
 				pos += int(vl)
-				fields = append(fields, field{name: b.blob[nr.off : nr.off+nr.n], value: val})
+				fields = append(fields, field{name: blob[nr.off : nr.off+nr.n], value: val})
 			}
 		} else {
-			nf, n := binary.Uvarint(b.blob[pos:])
+			nf, n := binary.Uvarint(blob[pos:])
 			pos += n
 			for j := 0; j < int(nf); j++ {
-				nl, n := binary.Uvarint(b.blob[pos:])
+				nl, n := binary.Uvarint(blob[pos:])
 				pos += n
-				name := b.blob[pos : pos+int(nl)]
+				name := blob[pos : pos+int(nl)]
 				pos += int(nl)
-				vl, n := binary.Uvarint(b.blob[pos:])
+				vl, n := binary.Uvarint(blob[pos:])
 				pos += n
-				val := b.blob[pos : pos+int(vl)]
+				val := blob[pos : pos+int(vl)]
 				pos += int(vl)
 				fields = append(fields, field{name: name, value: val})
 			}
