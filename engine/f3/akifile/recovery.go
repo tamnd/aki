@@ -80,3 +80,48 @@ func ReadOpenState(dev Device) (*OpenState, error) {
 	}
 	return &OpenState{Prefix: prefix, Meta: live, Which: which, Outcome: outcome}, nil
 }
+
+// ReplayTail walks the append space forward from a 4KiB-aligned start, validating
+// each segment in full (header magic and CRC, then the payload length and CRC) and
+// handing every intact one to visit in file order. It stops at the first segment
+// that fails to parse or verify: the durable tail, past which lies a torn or
+// never-synced write. It returns the offset just past the last intact segment, the
+// cursor the writer resumes at.
+//
+// This is the primitive both recovery paths share (spec 2064/f3/07 section 6). A
+// crashed open replays from the live root's checkpoint log position to catch the
+// segments appended since the last checkpoint; the scan fallback replays from the
+// header page to rebuild the whole index from the segments themselves. A visit
+// that returns an error stops the walk at that segment and propagates the error,
+// so a consumer that cannot apply a durable segment fails recovery rather than
+// dropping committed data.
+func ReplayTail(dev Device, prefix *Prefix, from, size uint64, visit func(off uint64, h *SegHeader, payload []byte) error) (uint64, error) {
+	cursor := from
+	for cursor+SegHeaderLen <= size {
+		hb := make([]byte, SegHeaderLen)
+		if _, err := dev.ReadAt(hb, int64(cursor)); err != nil {
+			break
+		}
+		h, err := ParseSegHeader(hb)
+		if err != nil {
+			break
+		}
+		if cursor+SegHeaderLen+h.PayloadLen > size {
+			break
+		}
+		payload := make([]byte, h.PayloadLen)
+		if _, err := dev.ReadAt(payload, int64(cursor)+SegHeaderLen); err != nil {
+			break
+		}
+		if h.VerifyPayload(payload, prefix.ChecksumKind) != nil {
+			break
+		}
+		if visit != nil {
+			if err := visit(cursor, h, payload); err != nil {
+				return cursor, err
+			}
+		}
+		cursor += SegmentSpan(h.PayloadLen)
+	}
+	return cursor, nil
+}
