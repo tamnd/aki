@@ -224,6 +224,43 @@ func TestMinIOBatchAndRange(t *testing.T) {
 	}
 }
 
+// TestMinIOProbe is doc 01 section 12 item 2, the matrix probe form: the
+// scripted CAS sequence against a real MinIO must come back fully capable.
+// MinIO before RELEASE.2025-09-07 fails the create step (conditional PUT
+// on a missing key answered 404), which is exactly what this catches; the
+// floor is pinned in CI.
+func TestMinIOProbe(t *testing.T) {
+	endpoint := os.Getenv("AKI_OBS1_S3")
+	if endpoint == "" {
+		t.Skip("AKI_OBS1_S3 not set")
+	}
+	user := envOr("AKI_OBS1_S3_USER", "minioadmin")
+	pass := envOr("AKI_OBS1_S3_PASS", "minioadmin")
+	bucket := fmt.Sprintf("obs1-test-%d", time.Now().UnixNano())
+
+	createBucket(t, endpoint, bucket, user, pass)
+
+	c, err := NewClient(ClientConfig{
+		Endpoint:  endpoint,
+		Region:    "us-east-1",
+		Bucket:    bucket,
+		AccessKey: user,
+		SecretKey: pass,
+		PathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	caps, err := ProbeCAS(context.Background(), c, "probe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("minio caps: %+v", caps)
+	if !caps.CASCreate || !caps.CASReplace {
+		t.Fatalf("MinIO below the 2025-09-07 floor or CAS regressed: %+v", caps)
+	}
+}
+
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v

@@ -74,6 +74,11 @@ func (s *condStore) handler(t *testing.T) http.HandlerFunc {
 			if _, err := w.Write(b); err != nil {
 				t.Error(err)
 			}
+		case http.MethodDelete:
+			delete(s.obj, key)
+			delete(s.etag, key)
+			delete(s.meta, key)
+			w.WriteHeader(204)
 		}
 	}
 }

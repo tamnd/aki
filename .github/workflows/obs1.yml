@@ -1,10 +1,11 @@
 name: obs1
 
 # The obs1 trees are new code with no edge into the rest of the module, so
-# they get their own fast lane: fmt, vet, boundary, build, race tests, and a
-# scoped lint on just the obs1 packages. The main ci workflow ignores these
-# paths, and this lane never builds or tests anything outside them, which is
-# what keeps an obs1 PR's feedback loop in minutes.
+# they get their own fast lane: fmt, vet, boundary, build, race tests against
+# a real pinned MinIO, and a scoped lint on just the obs1 packages. The main
+# ci workflow ignores these paths, and this lane never builds or tests
+# anything outside them, which is what keeps an obs1 PR's feedback loop in
+# minutes.
 
 on:
   push:
@@ -39,6 +40,11 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      AKI_OBS1_R2_ENDPOINT: ${{ secrets.AKI_OBS1_R2_ENDPOINT }}
+      AKI_OBS1_R2_KEY: ${{ secrets.AKI_OBS1_R2_KEY }}
+      AKI_OBS1_R2_SECRET: ${{ secrets.AKI_OBS1_R2_SECRET }}
+      AKI_OBS1_R2_BUCKET: ${{ secrets.AKI_OBS1_R2_BUCKET }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -60,8 +66,44 @@ jobs:
         run: ./scripts/obs1-import-boundary.sh
       - name: build
         run: go build ./engine/obs1/... ./obs1srv/... ./cmd/obs1srv ./labs/obs1/...
+      # A real MinIO so the live-server tests (TestMinIO*) run on every PR,
+      # not just on a laptop that happens to have one up. The release is
+      # pinned and RELEASE.2025-09-07 is a hard floor: earlier builds answer
+      # 404 to If-None-Match creates on missing keys, which breaks the CAS
+      # create primitive obs1 stands on. Never lower this pin.
+      - name: minio binary cache
+        id: minio-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/minio-bin
+          key: minio-RELEASE.2025-09-07T16-13-09Z-linux-amd64
+      - name: minio download
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/minio-bin
+          # dl.min.io answers with a 302; without -L curl saves the redirect
+          # page and the "binary" is a one-line html file.
+          curl -sSfL -o ~/minio-bin/minio https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z
+          head -c 4 ~/minio-bin/minio | grep -q ELF
+          chmod +x ~/minio-bin/minio
+      - name: minio start
+        run: |
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            ~/minio-bin/minio server /tmp/obs1-minio --address 127.0.0.1:19000 &
+          for i in $(seq 1 100); do
+            curl -sf -o /dev/null http://127.0.0.1:19000/minio/health/live && exit 0
+            sleep 0.2
+          done
+          echo "minio did not come up" && exit 1
       - name: test
+        env:
+          AKI_OBS1_S3: http://127.0.0.1:19000
         run: go test -race -count=1 ./engine/obs1/... ./obs1srv/... ./cmd/obs1srv/... ./labs/obs1/...
+      # R2 CAS fidelity (doc 01 section 12 item 1) runs only where the
+      # secrets exist: pushes to main and same-repo PRs. Forks skip it.
+      - name: r2 probe
+        if: env.AKI_OBS1_R2_ENDPOINT != ''
+        run: go test -count=1 -run TestR2Probe -v ./engine/obs1/
 
   # The shared lint lane skips the obs1 paths (they would otherwise gate
   # non-obs1 PRs on this tree), so this job turns the same linter set back
