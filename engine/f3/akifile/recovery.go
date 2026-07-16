@@ -392,6 +392,128 @@ func RebuildShardSegStats(dev Device, prefix *Prefix, segStatsOff uint64) (*SegS
 	return r, nil
 }
 
+// ChunkDirRebuilder folds a shard's cold-chunk directory back from a full chunk_dir
+// checkpoint and the delta chain layered over it (spec 2064/f3/07 section 4, "Cold
+// chunks and the value log"). Without it a restart would have to scan every cold chunk
+// to answer a membership or rank query on a cold collection; with it a reopened store
+// rebuilds the resident directory from the checkpoints plus tail replay and reads no
+// cold bytes until a query needs the real element. Recovery loads the base full
+// directory, applies each delta forward, and is left with the directory as of the last
+// checkpoint's log position; the tail replay past LogPos re-derives the deltas since.
+// The rebuilder keys collections by key_hash, the directory's own lookup key.
+type ChunkDirRebuilder struct {
+	collections map[uint64]ChunkDirCollection
+	// LogPos is the global_seq the last applied chunk_dir checkpoint is consistent up
+	// to, the offset the tail replay resumes the directory re-derivation from.
+	LogPos uint64
+}
+
+// NewChunkDirRebuilder starts an empty rebuild. The first Apply is expected to be a
+// full directory, but a delta over the empty directory is equally valid.
+func NewChunkDirRebuilder() *ChunkDirRebuilder {
+	return &ChunkDirRebuilder{collections: make(map[uint64]ChunkDirCollection)}
+}
+
+// Apply layers one chunk_dir payload over the accumulated directory and returns its
+// parsed header. A full directory replaces the accumulator; a delta applies over it,
+// dropping collections flagged ChunkDirTombstone (promoted back to the hot tier or
+// deleted) and inserting or overwriting the rest. LogPos advances to the applied
+// checkpoint, so the caller resolves the chain oldest-first and replays the tail from
+// LogPos once the newest delta is in.
+func (r *ChunkDirRebuilder) Apply(payload []byte) (ChunkDirHeader, error) {
+	h, err := ParseChunkDirHeader(payload)
+	if err != nil {
+		return ChunkDirHeader{}, err
+	}
+	cols, err := ChunkDirCollections(payload, h)
+	if err != nil {
+		return ChunkDirHeader{}, err
+	}
+	if h.FullOrDelta == ChunkDirFull {
+		r.collections = make(map[uint64]ChunkDirCollection, len(cols))
+	}
+	for _, c := range cols {
+		if h.FullOrDelta == ChunkDirDelta && c.Flags&ChunkDirTombstone != 0 {
+			delete(r.collections, c.KeyHash)
+			continue
+		}
+		r.collections[c.KeyHash] = c
+	}
+	r.LogPos = h.CkptLogPos
+	return h, nil
+}
+
+// Collections is the live cold-chunk directory as of the last applied checkpoint, keyed
+// by key_hash. The map is the rebuilder's own.
+func (r *ChunkDirRebuilder) Collections() map[uint64]ChunkDirCollection { return r.collections }
+
+// Len is the number of cold collections accumulated so far.
+func (r *ChunkDirRebuilder) Len() int { return len(r.collections) }
+
+// TotalLiveBytes sums the live-byte counts across every chunk of every collection, the
+// cold-tier residency a reopened store reads to size its cold footprint without a scan.
+func (r *ChunkDirRebuilder) TotalLiveBytes() uint64 {
+	var n uint64
+	for _, c := range r.collections {
+		for i := range c.Chunks {
+			n += c.Chunks[i].ChunkLiveBytes
+		}
+	}
+	return n
+}
+
+// RebuildShardChunkDir reconstructs one shard's cold-chunk directory from its chunk_dir
+// checkpoint chain, the same walk RebuildShardIndex runs for the index. The SRT names
+// the shard's newest chunk_dir segment (chunkdir_off); that segment is a full directory
+// or a delta whose header names the base it extends, back to a full or a delta over the
+// empty directory. It walks the chain to its base, then applies the checkpoints
+// oldest-first into a ChunkDirRebuilder.
+//
+// A zero chunkdir_off means the shard has no cold chunks checkpointed: it returns an
+// empty rebuilder and any cold directory comes from the tail replay. A segment that is
+// not a chunk_dir, or a back-pointer that revisits a segment already in the chain, is a
+// corrupt root and returns ErrChunkDir.
+func RebuildShardChunkDir(dev Device, prefix *Prefix, chunkdirOff uint64) (*ChunkDirRebuilder, error) {
+	r := NewChunkDirRebuilder()
+	if chunkdirOff == 0 {
+		return r, nil
+	}
+	type link struct {
+		off     uint64
+		payload []byte
+	}
+	var chain []link
+	seen := make(map[uint64]bool)
+	for off := chunkdirOff; ; {
+		if seen[off] {
+			return nil, ErrChunkDir
+		}
+		seen[off] = true
+		h, payload, err := readSegmentAt(dev, prefix.ChecksumKind, off)
+		if err != nil {
+			return nil, err
+		}
+		if h.Kind != KindChunkDir {
+			return nil, ErrChunkDir
+		}
+		ch, err := ParseChunkDirHeader(payload)
+		if err != nil {
+			return nil, err
+		}
+		chain = append(chain, link{off, payload})
+		if ch.FullOrDelta == ChunkDirFull || ch.BaseCkptOff == 0 {
+			break
+		}
+		off = ch.BaseCkptOff
+	}
+	for i := len(chain) - 1; i >= 0; i-- {
+		if _, err := r.Apply(chain[i].payload); err != nil {
+			return nil, err
+		}
+	}
+	return r, nil
+}
+
 // Recovery is the structural result of opening a file: the picked open state, the
 // shard root table (nil when no checkpoint has been taken), and each shard's index
 // rebuilt from its checkpoint chain (nil on a scan fallback, where there is no
