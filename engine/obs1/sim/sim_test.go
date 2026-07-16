@@ -99,8 +99,11 @@ func TestSimRangeAndBatch(t *testing.T) {
 	if _, err := s.Put(ctx, "seg/00/empty", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.GetTail(ctx, "seg/00/empty", 4); !errors.Is(err, obs1.ErrRange) {
-		t.Fatalf("tail of empty object: want ErrRange, got %v", err)
+	// The tail of an empty object is zero bytes, the client's normalized
+	// contract (AWS 416s the suffix range there, MinIO 200s it; the wire
+	// client folds both to an empty read).
+	if b, _, err := s.GetTail(ctx, "seg/00/empty", 4); err != nil || len(b) != 0 {
+		t.Fatalf("tail of empty object: want empty read, got %q %v", b, err)
 	}
 	if _, _, err := s.GetRange(ctx, "seg/00/missing", 0, 4); !errors.Is(err, obs1.ErrNotFound) {
 		t.Fatalf("range on missing key: want ErrNotFound, got %v", err)
@@ -179,8 +182,10 @@ func TestSimMultipart(t *testing.T) {
 	if err := s.AbortMultipart(ctx, "seg/00/3", id2); err != nil {
 		t.Fatalf("abort: %v", err)
 	}
-	if err := s.AbortMultipart(ctx, "seg/00/3", id2); !errors.Is(err, obs1.ErrNotFound) {
-		t.Fatalf("re-abort: want ErrNotFound, got %v", err)
+	// Abort means ensure-gone: re-aborting succeeds (MinIO 204s it, the
+	// wire client folds AWS's 404 NoSuchUpload to nil).
+	if err := s.AbortMultipart(ctx, "seg/00/3", id2); err != nil {
+		t.Fatalf("re-abort: %v", err)
 	}
 }
 

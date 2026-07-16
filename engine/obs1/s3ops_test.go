@@ -27,6 +27,11 @@ func rangeHandler(t *testing.T, body []byte) http.HandlerFunc {
 		spec := strings.TrimPrefix(rng, "bytes=")
 		var lo, hi int64
 		if after, ok := strings.CutPrefix(spec, "-"); ok {
+			// The AWS shape: a suffix range of an empty object is 416.
+			if len(body) == 0 {
+				w.WriteHeader(416)
+				return
+			}
 			n, _ := strconv.ParseInt(after, 10, 64)
 			lo, hi = max(int64(len(body))-n, 0), int64(len(body))-1
 		} else {
@@ -72,6 +77,17 @@ func TestGetRange(t *testing.T) {
 	}
 	if _, _, err := c.GetRange(ctx, "seg", -1, 4); err == nil {
 		t.Fatal("negative offset must error client-side")
+	}
+
+	// The tail of an empty object is an empty read, not ErrRange: the fake
+	// answers the AWS shape (416 for a suffix range of a zero-byte object)
+	// and the client folds it; MinIO answers 200 empty for the same case,
+	// pinned by the differential suite.
+	empty := httptest.NewServer(rangeHandler(t, nil))
+	defer empty.Close()
+	ce := testClient(t, empty)
+	if b, _, err := ce.GetTail(ctx, "seg", 4); err != nil || len(b) != 0 {
+		t.Fatalf("tail of empty object: want empty read, got %q %v", b, err)
 	}
 }
 
