@@ -24,6 +24,7 @@ const serverMemCap = 64 << 20
 type Server struct {
 	t *Tiered
 	s *Str
+	h *Hash
 
 	mu sync.Mutex // serializes command execution against the runtime
 
@@ -65,7 +66,11 @@ func NewServer(st Store) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	srv.t, srv.s = t, str
+	hash, err := NewHash(t, HashConfig{})
+	if err != nil {
+		return nil, err
+	}
+	srv.t, srv.s, srv.h = t, str, hash
 	return srv, nil
 }
 
@@ -591,29 +596,189 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return arityErr(reply, cmd)
 		}
 		return s.lcsCmd(ctx, reply, args)
+	case "HSET", "HMSET":
+		if len(args) < 4 || len(args)%2 != 0 {
+			return arityErr(reply, cmd)
+		}
+		created := int64(0)
+		for i := 2; i < len(args); i += 2 {
+			c, err := s.h.HSet(ctx, args[1], args[i], args[i+1])
+			if err != nil {
+				return storeErr(reply, err)
+			}
+			if c {
+				created++
+			}
+		}
+		if cmd == "HMSET" {
+			return AppendSimple(reply, "OK")
+		}
+		return AppendInt(reply, created)
+	case "HSETNX":
+		if len(args) != 4 {
+			return arityErr(reply, cmd)
+		}
+		set, err := s.h.HSetNX(ctx, args[1], args[2], args[3])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if set {
+			return AppendInt(reply, 1)
+		}
+		return AppendInt(reply, 0)
+	case "HGET":
+		if len(args) != 3 {
+			return arityErr(reply, cmd)
+		}
+		v, ok, err := s.h.HGet(ctx, args[1], args[2])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if !ok {
+			return AppendNullBulk(reply)
+		}
+		return AppendBulk(reply, v)
+	case "HMGET":
+		if len(args) < 3 {
+			return arityErr(reply, cmd)
+		}
+		mark := len(reply)
+		reply = AppendArray(reply, len(args)-2)
+		err := s.h.HMGet(ctx, args[1], args[2:], func(v []byte, ok bool) {
+			if ok {
+				reply = AppendBulk(reply, v)
+			} else {
+				reply = AppendNullBulk(reply)
+			}
+		})
+		if err != nil {
+			// A partial array is already in the buffer; truncate back
+			// to the mark so the error is the whole reply.
+			return storeErr(reply[:mark], err)
+		}
+		return reply
+	case "HDEL":
+		if len(args) < 3 {
+			return arityErr(reply, cmd)
+		}
+		n := int64(0)
+		for _, f := range args[2:] {
+			removed, err := s.h.HDel(ctx, args[1], f)
+			if err != nil {
+				return storeErr(reply, err)
+			}
+			if removed {
+				n++
+			}
+		}
+		return AppendInt(reply, n)
+	case "HEXISTS", "HSTRLEN":
+		if len(args) != 3 {
+			return arityErr(reply, cmd)
+		}
+		v, ok, err := s.h.HGet(ctx, args[1], args[2])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		switch {
+		case cmd == "HSTRLEN":
+			return AppendInt(reply, int64(len(v)))
+		case ok:
+			return AppendInt(reply, 1)
+		}
+		return AppendInt(reply, 0)
+	case "HLEN":
+		if len(args) != 2 {
+			return arityErr(reply, cmd)
+		}
+		n, err := s.h.HLen(ctx, args[1])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, n)
+	case "HINCRBY":
+		if len(args) != 4 {
+			return arityErr(reply, cmd)
+		}
+		delta, ok := parseCanonicalInt(args[3])
+		if !ok {
+			return AppendError(reply, "ERR value is not an integer or out of range")
+		}
+		n, err := s.h.HIncrBy(ctx, args[1], args[2], delta)
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, n)
+	case "HINCRBYFLOAT":
+		if len(args) != 4 {
+			return arityErr(reply, cmd)
+		}
+		f, err := strconv.ParseFloat(string(args[3]), 64)
+		if err != nil || math.IsNaN(f) {
+			return AppendError(reply, "ERR value is not a valid float")
+		}
+		v, err := s.h.HIncrByFloat(ctx, args[1], args[2], f)
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendBulk(reply, v)
+	case "HGETEX":
+		return s.hgetexCmd(ctx, reply, args, now)
+	case "HGETDEL":
+		return s.hgetdelCmd(ctx, reply, args)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
 		}
-		exists, _, err := s.s.Entry(ctx, args[1])
+		v, root, _, ok, err := s.t.LookupEntry(ctx, args[1])
 		if err != nil {
 			return storeErr(reply, err)
 		}
-		if !exists {
+		if !ok {
 			return AppendSimple(reply, "none")
 		}
-		// The only type in T1; the answer routes through the header tag
-		// when the collection types land.
+		if root {
+			tag, _, err := sniffRoot(v)
+			if err != nil {
+				return storeErr(reply, err)
+			}
+			if tag == TagHash {
+				return AppendSimple(reply, "hash")
+			}
+		}
 		return AppendSimple(reply, "string")
 	case "OBJECT":
 		if len(args) == 3 && strings.EqualFold(string(args[1]), "ENCODING") {
-			enc, ok, err := s.s.Encoding(ctx, args[2])
+			v, root, _, ok, err := s.t.LookupEntry(ctx, args[2])
 			if err != nil {
 				return storeErr(reply, err)
 			}
 			if !ok {
 				// Redis 8.8 replies null bulk here, not the "no
 				// such key" error older versions used.
+				return AppendNullBulk(reply)
+			}
+			if root {
+				tag, _, err := sniffRoot(v)
+				if err != nil {
+					return storeErr(reply, err)
+				}
+				if tag == TagHash {
+					enc, ok, err := s.h.Encoding(ctx, args[2])
+					if err != nil {
+						return storeErr(reply, err)
+					}
+					if !ok {
+						return AppendNullBulk(reply)
+					}
+					return AppendBulk(reply, []byte(enc))
+				}
+			}
+			enc, ok, err := s.s.Encoding(ctx, args[2])
+			if err != nil {
+				return storeErr(reply, err)
+			}
+			if !ok {
 				return AppendNullBulk(reply)
 			}
 			return AppendBulk(reply, []byte(enc))
@@ -866,6 +1031,135 @@ func (s *Server) getexCmd(ctx context.Context, reply []byte, args [][]byte, now 
 		return storeErr(reply, err)
 	}
 	return AppendBulk(reply, s.old)
+}
+
+// hgetexCmd is HGETEX key [EX n | PX n | EXAT n | PXAT n | PERSIST]
+// FIELDS numfields field...: a read with an optional field-TTL edit,
+// at most one option, mirroring getexCmd's parse. A past EXAT or PXAT
+// deletes the field after the read, GETEX's key-level rule applied
+// per field, which is HGETDEL's observable behavior exactly.
+func (s *Server) hgetexCmd(ctx context.Context, reply []byte, args [][]byte, now int64) []byte {
+	if len(args) < 5 {
+		return arityErr(reply, "HGETEX")
+	}
+	var persist, hasExp bool
+	var expAt int64
+	i := 2
+loop:
+	for i < len(args) {
+		switch opt := strings.ToUpper(string(args[i])); opt {
+		case "PERSIST":
+			if persist || hasExp {
+				return syntaxErr(reply)
+			}
+			persist = true
+			i++
+		case "EX", "PX", "EXAT", "PXAT":
+			if persist || hasExp || i+1 == len(args) {
+				return syntaxErr(reply)
+			}
+			n, err := strconv.ParseInt(string(args[i+1]), 10, 64)
+			if err != nil {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			var ok bool
+			switch opt {
+			case "EX":
+				expAt, ok = expireFrom(now, n, 1000)
+				ok = ok && n > 0
+			case "PX":
+				expAt, ok = expireFrom(now, n, 1)
+				ok = ok && n > 0
+			case "EXAT":
+				expAt, ok = expireFrom(0, n, 1000)
+			case "PXAT":
+				expAt, ok = n, true
+			}
+			if !ok {
+				return invalidExpire(reply, "HGETEX")
+			}
+			hasExp = true
+			i += 2
+		default:
+			break loop
+		}
+	}
+	fields, errText := fieldsBlock(args[i:])
+	if errText != "" {
+		return AppendError(reply, errText)
+	}
+	edit := persist || hasExp
+	mark := len(reply)
+	reply = AppendArray(reply, len(fields))
+	for _, f := range fields {
+		var v []byte
+		var ok bool
+		var err error
+		if hasExp && expAt <= now {
+			v, ok, err = s.h.HGetDel(ctx, args[1], f)
+		} else {
+			v, ok, err = s.h.HGetEx(ctx, args[1], f, edit, expAt)
+		}
+		if err != nil {
+			return storeErr(reply[:mark], err)
+		}
+		if ok {
+			reply = AppendBulk(reply, v)
+		} else {
+			reply = AppendNullBulk(reply)
+		}
+	}
+	return reply
+}
+
+// hgetdelCmd is HGETDEL key FIELDS numfields field...: read and
+// remove, one reply entry per field.
+func (s *Server) hgetdelCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 5 {
+		return arityErr(reply, "HGETDEL")
+	}
+	fields, errText := fieldsBlock(args[2:])
+	if errText != "" {
+		return AppendError(reply, errText)
+	}
+	mark := len(reply)
+	reply = AppendArray(reply, len(fields))
+	for _, f := range fields {
+		v, ok, err := s.h.HGetDel(ctx, args[1], f)
+		if err != nil {
+			return storeErr(reply[:mark], err)
+		}
+		if ok {
+			reply = AppendBulk(reply, v)
+		} else {
+			reply = AppendNullBulk(reply)
+		}
+	}
+	return reply
+}
+
+// fieldsBlock parses the FIELDS numfields field... run that ends
+// HGETEX and HGETDEL, with Redis's exact error texts. The non-empty
+// return string is the whole error reply.
+func fieldsBlock(args [][]byte) ([][]byte, string) {
+	if len(args) < 2 || !strings.EqualFold(string(args[0]), "FIELDS") {
+		return nil, "ERR Mandatory keyword FIELDS is missing or not at the right position"
+	}
+	n, err := strconv.ParseInt(string(args[1]), 10, 64)
+	if err != nil {
+		return nil, "ERR value is not an integer or out of range"
+	}
+	if n <= 0 {
+		return nil, "ERR Parameter `numFields` should be greater than 0"
+	}
+	rest := int64(len(args) - 2)
+	if n > rest {
+		return nil, "ERR Parameter `numFields` is more than number of arguments"
+	}
+	if n < rest {
+		return nil, "ERR syntax error"
+	}
+	return args[2:], ""
 }
 
 // expireFrom computes base + n*unit milliseconds, reporting false on
