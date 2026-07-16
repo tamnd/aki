@@ -666,3 +666,141 @@ func TestSetSegRootHotTag(t *testing.T) {
 		t.Fatalf("hot root tag = %#x, want TagSet|TagRoot = %#x", tag, TagSet|TagRoot)
 	}
 }
+
+// TestSMembers pins the streaming contract: begin runs once with the
+// exact count before any member, inline sets stream in insertion
+// order, segmented sets stream every member exactly once, and an
+// absent key is begin(0).
+func TestSMembers(t *testing.T) {
+	r := newSetRig(t)
+	ctx := context.Background()
+
+	members := func(key string) (int, []string) {
+		t.Helper()
+		count := -1
+		var got []string
+		err := r.se.SMembers(ctx, []byte(key), func(n int) {
+			if count != -1 {
+				t.Fatal("begin ran twice")
+			}
+			if len(got) != 0 {
+				t.Fatal("begin ran after an emit")
+			}
+			count = n
+		}, func(m []byte) {
+			got = append(got, string(m))
+		})
+		if err != nil {
+			t.Fatalf("SMembers(%q): %v", key, err)
+		}
+		return count, got
+	}
+
+	if n, got := members("ghost"); n != 0 || len(got) != 0 {
+		t.Fatalf("absent key = (%d, %d members), want (0, 0)", n, len(got))
+	}
+
+	r.sadd("inl", "c")
+	r.sadd("inl", "a")
+	r.sadd("inl", "b")
+	n, got := members("inl")
+	if n != 3 || fmt.Sprint(got) != "[c a b]" {
+		t.Fatalf("inline members = (%d, %v), want insertion order [c a b]", n, got)
+	}
+
+	total := hashInlineMaxCount + 40
+	want := map[string]bool{}
+	for i := range total {
+		m := fmt.Sprintf("m%04d", i)
+		r.sadd("seg", m)
+		want[m] = true
+	}
+	n, got = members("seg")
+	if n != total || len(got) != total {
+		t.Fatalf("segmented members = (%d, %d emitted), want %d", n, len(got), total)
+	}
+	seen := map[string]bool{}
+	for _, m := range got {
+		if seen[m] {
+			t.Fatalf("member %q emitted twice", m)
+		}
+		seen[m] = true
+		if !want[m] {
+			t.Fatalf("member %q was never added", m)
+		}
+	}
+
+	if err := r.s.Set(ctx, []byte("str"), []byte("v")); err != nil {
+		t.Fatalf("Str.Set: %v", err)
+	}
+	if err := r.se.SMembers(ctx, []byte("str"), func(int) {}, func([]byte) {}); !errors.Is(err, ErrWrongType) {
+		t.Fatalf("SMembers(str) error = %v, want ErrWrongType", err)
+	}
+}
+
+// TestSScan drives the fh cursor: an inline set answers any cursor
+// with everything and a zero next cursor, and a segmented walk in
+// small steps visits every member at least once with no fabrications,
+// the Redis scan guarantee.
+func TestSScan(t *testing.T) {
+	r := newSetRig(t)
+	ctx := context.Background()
+
+	r.sadd("inl", "a")
+	r.sadd("inl", "b")
+	var got []string
+	next, err := r.se.SScan(ctx, []byte("inl"), 12345, 1, func(m []byte) {
+		got = append(got, string(m))
+	})
+	if err != nil || next != 0 || len(got) != 2 {
+		t.Fatalf("inline SScan = (next %d, %v, %v), want the whole set and cursor 0", next, got, err)
+	}
+
+	// Enough members for several segments (hashSegMax 4032 holds about
+	// 500 of these), so the small-count walk must take many steps.
+	total := 1200
+	want := map[string]bool{}
+	for i := range total {
+		m := fmt.Sprintf("m%04d", i)
+		r.sadd("seg", m)
+		want[m] = true
+	}
+	if r.encoding("seg") != "hashtable" {
+		t.Fatalf("seg encodes %q, want hashtable", r.encoding("seg"))
+	}
+	seen := map[string]bool{}
+	steps := 0
+	cursor := uint64(0)
+	for {
+		next, err := r.se.SScan(ctx, []byte("seg"), cursor, 16, func(m []byte) {
+			if !want[string(m)] {
+				t.Fatalf("SScan emitted %q, never added", m)
+			}
+			seen[string(m)] = true
+		})
+		if err != nil {
+			t.Fatalf("SScan step %d: %v", steps, err)
+		}
+		steps++
+		if next == 0 {
+			break
+		}
+		if next <= cursor {
+			t.Fatalf("cursor went backwards: %d after %d", next, cursor)
+		}
+		cursor = next
+	}
+	if len(seen) != total {
+		t.Fatalf("scan saw %d members, want %d", len(seen), total)
+	}
+	if steps < 2 {
+		t.Fatalf("segmented scan finished in %d step(s); count 16 over %d members should take several", steps, total)
+	}
+
+	if err := r.s.Set(ctx, []byte("str"), []byte("v")); err != nil {
+		t.Fatalf("Str.Set: %v", err)
+	}
+	if _, err := r.se.SScan(ctx, []byte("str"), 0, 10, func([]byte) {}); !errors.Is(err, ErrWrongType) {
+		t.Fatalf("SScan(str) error = %v, want ErrWrongType", err)
+	}
+}
