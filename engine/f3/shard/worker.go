@@ -64,6 +64,17 @@ type worker struct {
 	// Start. The worker looks handlers up by op byte and never interprets one.
 	handlers []Handler
 
+	// demoteColl is the collection-demotion hook Runtime.UseDemoter registered,
+	// fixed before Start, nil on a string-only runtime. The demote loop calls it
+	// once per boundary beside the arena's own MaybeDemote so memory pressure
+	// weighs a shard's native collection heap (the set registry's owner-local
+	// footprint) alongside the arena; the hook self-gates and sheds nothing when
+	// the shard is under its resident budget or the store runs no cold tier, so a
+	// nil hook or a no-pressure boundary costs one branch (spec 2064/f3/06 section
+	// 6). The shard cannot import the collection packages, so the policy lives
+	// behind this func the way the handlers table lives behind Use.
+	demoteColl func(*Ctx) int
+
 	// cx is the worker's handler context, one per shard for its whole life:
 	// the store, the per-batch clock, and the value scratch whose grown
 	// capacity carries across commands so the steady path allocates nothing.
@@ -189,6 +200,14 @@ func (w *worker) run() {
 			// the compaction decision leans on the arena-pressure checks, which hold
 			// while the staged records still charge the arena.
 			demoted := w.st.MaybeDemote() > 0
+			// Shed one collection quantum when the shard's native collection heap
+			// pushes it past the resident cap. The hook self-gates on the combined
+			// budget, so this is a nil check plus one predicted branch on the
+			// no-pressure path; the bytes it frees are Go heap the GC reclaims, not
+			// arena bytes, so it does not feed the arena-compaction decision below.
+			if w.demoteColl != nil {
+				w.demoteColl(&w.cx)
+			}
 			w.drainCold()
 			// Park the segments this boundary's drains emptied on the epoch
 			// retire list before the compactor runs, so it leaves them alone

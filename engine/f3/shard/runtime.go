@@ -180,6 +180,21 @@ func (r *Runtime) Use(handlers []Handler) {
 	}
 }
 
+// UseDemoter registers the collection-demotion hook every worker's demote loop
+// calls at a boundary under memory pressure (spec 2064/f3/06 section 6). The
+// server layer, which imports the collection packages the shard cannot, passes
+// the type's demote entry (set.DemoteQuantum); a string-only runtime leaves the
+// hook nil and the loop skips it. Fixed before Start like Use, so the worker reads
+// it with no synchronization on the hot path.
+func (r *Runtime) UseDemoter(fn func(*Ctx) int) {
+	if r.started {
+		panic("shard: UseDemoter after Start")
+	}
+	for _, w := range r.workers {
+		w.demoteColl = fn
+	}
+}
+
 // Shards reports the shard count.
 func (r *Runtime) Shards() int { return len(r.workers) }
 

@@ -616,6 +616,13 @@ func init() {
 // Handlers returns the op-indexed handler vector for Runtime.Use.
 func Handlers() []shard.Handler { return handlers }
 
+// Demoter returns the collection-demotion hook for Runtime.UseDemoter, the entry
+// the worker's demote loop calls under memory pressure to shed a native
+// collection quantum to the cold tier (spec 2064/f3/06 section 6). The set type
+// is the first collection with a cold form; as the other types grow theirs this
+// is where their demoters compose into one hook.
+func Demoter() func(*shard.Ctx) int { return set.DemoteQuantum }
+
 // Dispatch routes one parsed command: uppercase the verb into a stack
 // scratch, look it up, check arity, and enqueue on the connection. args are
 // parser views; Do copies them into the hop node before returning, so the

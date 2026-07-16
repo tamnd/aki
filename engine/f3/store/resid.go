@@ -191,6 +191,20 @@ func (s *Store) ResidentOver() bool {
 	return s.vlog != nil && s.residentCap > 0 && s.arena.used() > s.residentCap
 }
 
+// ResidentOverBy reports whether the arena fill plus extra bytes sits past the
+// resident cap, the combined-budget trigger a collection type uses to weigh its
+// own owner-local heap against the shared cap (spec 2064/f3/06 section 6). The
+// native collection structures live outside the arena, so their footprint is
+// resident RSS the cap must bound alongside the arena; passing the registry's
+// resident total as extra makes the one cap the store already carries the total
+// resident bound the memory bar rests on, rather than a second, separate budget.
+// It is the same fill-based test as ResidentOver, only shifted up by extra, so a
+// store with no cold tier or no cap answers false and the collection stays
+// resident. O(segments), boundary-rate only.
+func (s *Store) ResidentOverBy(extra uint64) bool {
+	return s.vlog != nil && s.residentCap > 0 && s.arena.used()+extra > s.residentCap
+}
+
 // MaybeDemote runs one bounded demotion pass when the resident live charge
 // sits past the low-water mark, and reports the arena bytes it freed.
 // Owner-only, and only at a boundary where no caller holds an arena address,
