@@ -85,32 +85,42 @@ func (h *Hash) HMGet(ctx context.Context, key []byte, fields [][]byte, emit func
 	}
 
 	// Segmented: route every field through the fence, then read each
-	// needed segment once. mgNeed maps fence index to batch slot.
+	// needed segment once. The dedupe keys on segid, not fence index,
+	// because a paged root's indexes are page-relative; the linear
+	// scan over the unique list is fine at HMGET burst sizes. On a
+	// paged root the fenceIdx calls load covering pages before the
+	// segment batch, one page cached at a time, so a burst inside one
+	// page still costs one page read plus one segment round.
 	r := &h.segRoot
 	h.mgIdx = h.mgIdx[:0]
-	h.mgNeed = h.mgNeed[:0]
-	for range r.fence {
-		h.mgNeed = append(h.mgNeed, -1)
-	}
-	uniq := 0
+	h.mgUniq = h.mgUniq[:0]
 	for _, f := range fields {
-		i := hashFenceFind(r.fence, hashFH(f))
-		h.mgIdx = append(h.mgIdx, i)
-		if h.mgNeed[i] < 0 {
-			h.mgNeed[i] = uniq
-			uniq++
+		i, err := h.fenceIdx(ctx, hashFH(f))
+		if err != nil {
+			return err
 		}
+		id := r.fence[i].segid
+		slot := -1
+		for k, u := range h.mgUniq {
+			if u == id {
+				slot = k
+				break
+			}
+		}
+		if slot < 0 {
+			slot = len(h.mgUniq)
+			h.mgUniq = append(h.mgUniq, id)
+		}
+		h.mgIdx = append(h.mgIdx, slot)
 	}
+	uniq := len(h.mgUniq)
 	// The subkeys share one backing buffer, sized up front so appends
 	// cannot move it under the aliases already handed out.
 	h.mgKeyBuf = grow(h.mgKeyBuf, uniq*SubkeySize)
 	h.mgKeys = slices.Grow(h.mgKeys[:0], uniq)[:uniq]
-	for i, slot := range h.mgNeed {
-		if slot < 0 {
-			continue
-		}
+	for slot, id := range h.mgUniq {
 		k := h.mgKeyBuf[slot*SubkeySize : (slot+1)*SubkeySize]
-		putHashSegKey(k, r.rooth, r.fence[i].segid)
+		putHashSegKey(k, r.rooth, id)
 		h.mgKeys[slot] = k
 	}
 	h.mgVals, h.mgRoots, h.mgExps, err = h.t.LookupBatch(ctx, h.mgKeys, h.mgVals, h.mgRoots, h.mgExps)
@@ -118,12 +128,9 @@ func (h *Hash) HMGet(ctx context.Context, key []byte, fields [][]byte, emit func
 		return err
 	}
 	h.mgSegs = slices.Grow(h.mgSegs[:0], uniq)[:uniq]
-	for i, slot := range h.mgNeed {
-		if slot < 0 {
-			continue
-		}
+	for slot, id := range h.mgUniq {
 		if h.mgVals[slot] == nil {
-			return fmt.Errorf("sqlo1: hash segment %d of rooth %#x is missing", r.fence[i].segid, r.rooth)
+			return fmt.Errorf("sqlo1: hash segment %d of rooth %#x is missing", id, r.rooth)
 		}
 		h.mgSegs[slot], err = decodeHashSeg(h.mgVals[slot])
 		if err != nil {
@@ -131,7 +138,7 @@ func (h *Hash) HMGet(ctx context.Context, key []byte, fields [][]byte, emit func
 		}
 	}
 	for fi, f := range fields {
-		v, _, ok, err := hashSegGet(h.mgSegs[h.mgNeed[h.mgIdx[fi]]], hashFH(f), f)
+		v, _, ok, err := hashSegGet(h.mgSegs[h.mgIdx[fi]], hashFH(f), f)
 		if err != nil {
 			return err
 		}

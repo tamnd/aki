@@ -61,7 +61,7 @@ func legalRecords() []*Record {
 		{RType: RecSeg, RFlags: RFlagRootgen | RFlagDict, Key: subkey(1, 2, 0), Value: []byte("z"), Rootgen: 1 << 30},
 		{RType: RecTomb, Key: []byte("gone")},
 		{RType: RecTomb, RFlags: RFlagExpiry, Key: []byte("gone2"), ExpireMS: 5},
-		{RType: RecFence, Key: subkey(9, 3, 1), Value: []byte("fence page")},
+		{RType: RecFence, RFlags: RFlagRootgen, Key: subkey(9, 3, 1), Value: []byte("fence page"), Rootgen: 2},
 		{RType: RecMeta, Key: []byte{0xFF}, Value: []byte("internal")},
 	}
 }
@@ -125,7 +125,8 @@ func TestRecordEncodeRejects(t *testing.T) {
 		{"tomb with dict bit", &Record{RType: RecTomb, RFlags: RFlagDict, Key: []byte("k")}},
 		{"seg without rootgen", &Record{RType: RecSeg, Key: subkey(1, 1, 1)}},
 		{"seg with short subkey", &Record{RType: RecSeg, RFlags: RFlagRootgen, Key: []byte("short")}},
-		{"fence with long subkey", &Record{RType: RecFence, Key: make([]byte, SubkeySize+1)}},
+		{"fence with long subkey", &Record{RType: RecFence, RFlags: RFlagRootgen, Key: make([]byte, SubkeySize+1), Rootgen: 1}},
+		{"fence without rootgen", &Record{RType: RecFence, Key: subkey(9, 3, 1)}},
 		{"rootgen on string", &Record{RType: RecString, RFlags: RFlagRootgen, Key: []byte("k")}},
 		{"rootgen on root", &Record{RType: RecRoot, RFlags: RFlagRootgen, Key: []byte("k")}},
 	}

@@ -30,7 +30,7 @@ const (
 // rflags bits (doc 03 section 6.1). Reserved bits must be zero.
 const (
 	RFlagExpiry  uint8 = 1 << 0 // expire_ms field present
-	RFlagRootgen uint8 = 1 << 1 // rootgen field present, segment records only
+	RFlagRootgen uint8 = 1 << 1 // rootgen field present, segment and fence records only
 	RFlagDict    uint8 = 1 << 2 // value compressed against a catalog dictionary
 
 	rflagsKnown = RFlagExpiry | RFlagRootgen | RFlagDict
@@ -99,6 +99,9 @@ func validateEnvelope(rtype, rflags uint8, klen, vlen uint64) error {
 		if klen != SubkeySize {
 			return fmt.Errorf("sqlo1b: fence record subkey is %d bytes, want %d", klen, SubkeySize)
 		}
+		if rflags&RFlagRootgen == 0 {
+			return fmt.Errorf("sqlo1b: fence record without rootgen")
+		}
 	case RecTomb:
 		if vlen != 0 {
 			return fmt.Errorf("sqlo1b: tomb record with %d value bytes", vlen)
@@ -107,8 +110,8 @@ func validateEnvelope(rtype, rflags uint8, klen, vlen uint64) error {
 			return fmt.Errorf("sqlo1b: tomb record with the dict bit set")
 		}
 	}
-	if rtype != RecSeg && rflags&RFlagRootgen != 0 {
-		return fmt.Errorf("sqlo1b: rootgen on rtype %d, segment records only", rtype)
+	if rtype != RecSeg && rtype != RecFence && rflags&RFlagRootgen != 0 {
+		return fmt.Errorf("sqlo1b: rootgen on rtype %d, segment and fence records only", rtype)
 	}
 	total := uint64(recHdrSize+optLen(rflags)+recTailSize) + klen + vlen
 	if total > math.MaxUint32 {

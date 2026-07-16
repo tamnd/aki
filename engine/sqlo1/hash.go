@@ -283,7 +283,9 @@ type Hash struct {
 	// rebuild finishes before the store call), segBuf and segBuf2 the
 	// segment images an op writes, kbuf and kbuf2 the segment subkeys,
 	// ents the parsed entries of a split or upgrade, fence the decoded
-	// fence of the root under operation.
+	// fence of the root under operation (paged: the one loaded page's
+	// entries), pidx a paged root's page index, pageBuf the fence page
+	// image a paged write lands.
 	rootBuf []byte
 	segBuf  []byte
 	segBuf2 []byte
@@ -291,6 +293,8 @@ type Hash struct {
 	kbuf2   [SubkeySize]byte
 	ents    []hashSegEntry
 	fence   []hashFenceEnt
+	pidx    []hashPageEnt
+	pageBuf []byte
 
 	// segRoot is the decoded root stateOf leaves behind at
 	// hashSegState; its fence rides the fence scratch. Valid until
@@ -302,11 +306,11 @@ type Hash struct {
 	// INCR family's formatted result).
 	valBuf []byte
 
-	// HMGET scratch: per-field fence indexes, the field-to-slot dedupe
-	// over the fence, the unique segment subkeys and their backing
-	// bytes, the batch outputs, and the decoded segments.
+	// HMGET scratch: per-field batch slots, the unique segids in
+	// first-need order, the segment subkeys and their backing bytes,
+	// the batch outputs, and the decoded segments.
 	mgIdx    []int
-	mgNeed   []int
+	mgUniq   []uint64
 	mgKeys   [][]byte
 	mgKeyBuf []byte
 	mgVals   [][]byte
@@ -401,11 +405,12 @@ func (h *Hash) stateOf(ctx context.Context, key []byte) (hashState, hashInline, 
 		return hashAbsent, hashInline{}, 0, ErrWrongType
 	}
 	if v[0] == hashSubSeg {
-		h.segRoot, err = decodeHashSegRoot(v, h.fence[:0])
+		h.segRoot, err = decodeHashSegRoot(v, h.fence[:0], h.pidx[:0])
 		if err != nil {
 			return hashAbsent, hashInline{}, 0, err
 		}
 		h.fence = h.segRoot.fence
+		h.pidx = h.segRoot.pidx
 		return hashSegState, hashInline{}, expMs, nil
 	}
 	hi, err := decodeHashInline(v)
@@ -451,6 +456,78 @@ func (h *Hash) writeSegRoot(ctx context.Context, key []byte, delta bool) error {
 		tag |= TagDelta
 	}
 	return h.t.Set(ctx, key, h.rootBuf, tag)
+}
+
+// loadPage makes page j of a paged root the loaded page: r.fence (and
+// h.fence, the same slice) become the page's entries and r.pi its
+// index. A no-op on a flat root or when j is already loaded, so the
+// page cache is one page wide and lives within one op. The decode
+// copies out of the read, so the entries stay valid across the
+// segment reads that follow. Entries at or past the next page's lo
+// are clipped: a page split trims the low page after the root lands,
+// so a crash can leave a stale tail the index already routes to the
+// high page, the same dead-bytes rule a split segment's untrimmed
+// image rides.
+func (h *Hash) loadPage(ctx context.Context, j int) error {
+	r := &h.segRoot
+	if !r.paged || r.pi == j {
+		return nil
+	}
+	e := r.pidx[j]
+	putHashFenceKey(h.kbuf[:], r.rooth, e.pageid)
+	v, ok, err := h.t.Get(ctx, h.kbuf[:])
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("sqlo1: hash fence page %d of rooth %#x is missing", e.pageid, r.rooth)
+	}
+	ents, err := decodeHashFencePage(v, h.fence[:0], r.nextSegid)
+	if err != nil {
+		return err
+	}
+	if ents[0].lo != e.lo {
+		return fmt.Errorf("sqlo1: hash fence page %d starts at %#x, index says %#x", e.pageid, ents[0].lo, e.lo)
+	}
+	if j+1 < len(r.pidx) {
+		hi := r.pidx[j+1].lo
+		for len(ents) > 0 && ents[len(ents)-1].lo >= hi {
+			ents = ents[:len(ents)-1]
+		}
+	}
+	if len(ents) == 0 {
+		return fmt.Errorf("sqlo1: hash fence page %d of rooth %#x is empty after clipping", e.pageid, r.rooth)
+	}
+	h.fence = ents
+	r.fence = ents
+	r.pi = j
+	return nil
+}
+
+// fenceIdx resolves the fence entry covering fh, loading the covering
+// page first on a paged root. The returned index is into r.fence: the
+// whole fence flat, the loaded page's entries paged.
+func (h *Hash) fenceIdx(ctx context.Context, fh uint64) (int, error) {
+	r := &h.segRoot
+	if r.paged {
+		if err := h.loadPage(ctx, hashPageFind(r.pidx, fh)); err != nil {
+			return 0, err
+		}
+	}
+	return hashFenceFind(r.fence, fh), nil
+}
+
+// writeFencePage lands the loaded page's current entries and
+// refreshes its index weight, so the root write that follows carries
+// the fresh weight. Callers order it before that root write; the two
+// ride one drain batch (no Flush between), which is what lets replay
+// treat page frames as neutral.
+func (h *Hash) writeFencePage(ctx context.Context) error {
+	r := &h.segRoot
+	h.pageBuf = appendHashFencePage(h.pageBuf[:0], r.fence)
+	putHashFenceKey(h.kbuf2[:], r.rooth, r.pidx[r.pi].pageid)
+	r.pidx[r.pi].weight = hashPageWeight(r.fence)
+	return h.t.SetGen(ctx, h.kbuf2[:], h.pageBuf, TagHash|TagFence, r.rootgen)
 }
 
 // HSet writes one field and reports whether it was created (false for
@@ -620,7 +697,10 @@ func (h *Hash) upgrade(ctx context.Context, key []byte, region []byte, created b
 func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs, entryExp int64) (bool, error) {
 	r := &h.segRoot
 	f := hashFH(field)
-	i := hashFenceFind(r.fence, f)
+	i, err := h.fenceIdx(ctx, f)
+	if err != nil {
+		return false, err
+	}
 	s, err := h.readSeg(ctx, r.fence[i].segid)
 	if err != nil {
 		return false, err
@@ -662,18 +742,40 @@ func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs, entry
 		// A TTL edit moved the fence meta or the root min: skipping
 		// the root here would leave min_expire stale-late, so this
 		// write pins it like a cardinality change would (rule W1).
-		r.fence[i].meta = meta
+		if err := h.setFenceMeta(ctx, i, meta); err != nil {
+			return false, err
+		}
 		if err := h.writeSegRoot(ctx, key, true); err != nil {
 			return false, err
 		}
 		return false, h.restamp(ctx, key, expMs)
 	}
 	r.count++
-	r.fence[i].meta = hashSegMeta(int(binary.LittleEndian.Uint16(out)), segMin)
+	if err := h.setFenceMeta(ctx, i, hashSegMeta(int(binary.LittleEndian.Uint16(out)), segMin)); err != nil {
+		return false, err
+	}
 	if err := h.writeSegRoot(ctx, key, true); err != nil {
 		return false, err
 	}
 	return true, h.restamp(ctx, key, expMs)
+}
+
+// setFenceMeta updates fence entry i's metadata, landing the loaded
+// page's image first when the edit actually moved it on a paged root
+// (about one create in sixteen crosses a fill-class step). The fence
+// meta is advisory, so a root whose page write was skipped is still
+// exact where it matters; the page and root that do land ride one
+// batch and stay a delta pair under rule W2.
+func (h *Hash) setFenceMeta(ctx context.Context, i int, meta uint16) error {
+	r := &h.segRoot
+	if r.fence[i].meta == meta {
+		return nil
+	}
+	r.fence[i].meta = meta
+	if !r.paged {
+		return nil
+	}
+	return h.writeFencePage(ctx)
 }
 
 // splitSeg lands the split of fence entry i, whose post-write entries
@@ -685,12 +787,32 @@ func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs, entry
 // the fence routes around (point reads go through the fence, so a
 // crash prefix never reads them; iteration range-filters when it
 // lands).
+//
+// The fence edit is where the paging ladder climbs, doc 06 section
+// 2.3. A flat fence at hashFenceMaxSegs transitions: the whole fence
+// (with the new entry) becomes page 0, which lands and flushes before
+// the root that flips paged mode, so a crash prefix reads the flat
+// root and the page sits orphaned until compaction. A full page
+// splits the same way a segment does: the high half lands under a
+// fresh pageid and flushes before the root whose index gains the
+// entry, and the low half's trim lands after the root, dead bytes
+// loadPage clips. A split inside a page with room writes the page
+// beside the root in one batch, no barrier needed. Every one of these
+// writes a full (non-delta) root: they all mint from nextSegid, which
+// replay reconciliation can never patch, so the frame must be the
+// root's own.
 func (h *Hash) splitSeg(ctx context.Context, key []byte, i, mid int, boundary uint64, created bool, expMs int64) (bool, error) {
 	r := &h.segRoot
-	if len(r.fence) >= hashFenceMaxSegs {
-		return false, errHashFencePaged
+	transition := !r.paged && len(r.fence) >= hashFenceMaxSegs
+	pageSplit := r.paged && len(r.fence) >= hashFencePageMax
+	if pageSplit && len(r.pidx) >= hashFencePageIdxMax {
+		return false, errHashFenceThirdLevel
 	}
-	if r.nextSegid > hashFenceSegidMax {
+	ids := uint64(1)
+	if transition || pageSplit {
+		ids = 2
+	}
+	if r.nextSegid+ids-1 > hashFenceSegidMax {
 		return false, fmt.Errorf("sqlo1: hash segid space of rooth %#x is spent", r.rooth)
 	}
 	segMin := func(ents []hashSegEntry) int64 {
@@ -723,12 +845,67 @@ func (h *Hash) splitSeg(ctx context.Context, key []byte, i, mid int, boundary ui
 		meta:  hashSegMeta(len(h.ents)-mid, segMin(h.ents[mid:])),
 	})
 	h.fence = r.fence
+	// The trimmed low-seg image below needs the surviving entry's
+	// segid; a page split may cut r.fence before it happens.
+	survivor := r.fence[i].segid
+
+	trimTo := -1
+	switch {
+	case transition:
+		pageid := r.nextSegid
+		r.nextSegid++
+		h.pageBuf = appendHashFencePage(h.pageBuf[:0], r.fence)
+		putHashFenceKey(h.kbuf2[:], r.rooth, pageid)
+		if err := h.t.SetGen(ctx, h.kbuf2[:], h.pageBuf, TagHash|TagFence, r.rootgen); err != nil {
+			return false, err
+		}
+		if err := h.t.Flush(ctx); err != nil {
+			return false, err
+		}
+		h.pidx = append(h.pidx[:0], hashPageEnt{pageid: pageid, weight: hashPageWeight(r.fence)})
+		r.pidx = h.pidx
+		r.paged = true
+		r.pi = 0
+	case pageSplit:
+		pm := len(r.fence) / 2
+		pageid := r.nextSegid
+		r.nextSegid++
+		h.pageBuf = appendHashFencePage(h.pageBuf[:0], r.fence[pm:])
+		putHashFenceKey(h.kbuf2[:], r.rooth, pageid)
+		if err := h.t.SetGen(ctx, h.kbuf2[:], h.pageBuf, TagHash|TagFence, r.rootgen); err != nil {
+			return false, err
+		}
+		if err := h.t.Flush(ctx); err != nil {
+			return false, err
+		}
+		r.pidx = slices.Insert(r.pidx, r.pi+1, hashPageEnt{
+			lo:     r.fence[pm].lo,
+			pageid: pageid,
+			weight: hashPageWeight(r.fence[pm:]),
+		})
+		h.pidx = r.pidx
+		r.pidx[r.pi].weight = hashPageWeight(r.fence[:pm])
+		trimTo = pm
+	case r.paged:
+		if err := h.writeFencePage(ctx); err != nil {
+			return false, err
+		}
+	}
 	if err := h.writeSegRoot(ctx, key, false); err != nil {
 		return false, err
 	}
+	if trimTo >= 0 {
+		// The low page's trim mirrors the low segment's: after the
+		// root, dead entries loadPage clips until then.
+		r.fence = r.fence[:trimTo]
+		h.fence = r.fence
+		if err := h.writeFencePage(ctx); err != nil {
+			return false, err
+		}
+	}
 
 	h.segBuf2 = appendHashSegPayload(h.segBuf2[:0], h.ents[:mid])
-	if err := h.writeSeg(ctx, r.fence[i].segid, h.segBuf2); err != nil {
+	if err := h.writeSeg(ctx, survivor, h.segBuf2); err != nil {
 		return false, err
 	}
 	return created, h.restamp(ctx, key, expMs)
@@ -742,7 +919,10 @@ func (h *Hash) splitSeg(ctx context.Context, key []byte, i, mid int, boundary ui
 func (h *Hash) hdelSeg(ctx context.Context, key, field []byte, expMs int64) (bool, error) {
 	r := &h.segRoot
 	f := hashFH(field)
-	i := hashFenceFind(r.fence, f)
+	i, err := h.fenceIdx(ctx, f)
+	if err != nil {
+		return false, err
+	}
 	s, err := h.readSeg(ctx, r.fence[i].segid)
 	if err != nil {
 		return false, err
@@ -774,7 +954,10 @@ func (h *Hash) hdelSeg(ctx context.Context, key, field []byte, expMs int64) (boo
 	if err := h.writeSeg(ctx, r.fence[i].segid, out); err != nil {
 		return false, err
 	}
-	r.fence[i].meta = hashSegMeta(int(binary.LittleEndian.Uint16(out)), int64(binary.LittleEndian.Uint64(out[4:])))
+	meta := hashSegMeta(int(binary.LittleEndian.Uint16(out)), int64(binary.LittleEndian.Uint64(out[4:])))
+	if err := h.setFenceMeta(ctx, i, meta); err != nil {
+		return false, err
+	}
 	if err := h.writeSegRoot(ctx, key, true); err != nil {
 		return false, err
 	}
@@ -789,7 +972,10 @@ func (h *Hash) hdelSeg(ctx context.Context, key, field []byte, expMs int64) (boo
 // entries past the low entry's fence range, dead bytes point reads
 // route around), then the root that drops the high entry, then the
 // high subkey's delete (a crash before it leaves a bounded orphan the
-// plane retire cleans).
+// plane retire cleans). On a paged root the neighbor bounds are the
+// loaded page's, so merges never cross a page boundary: the first
+// entry of a page keeps its slack against the previous page's last,
+// bounded v0 looseness the fill classes already tolerate.
 func (h *Hash) tryMergeSeg(ctx context.Context, key []byte, i int, out []byte) (bool, error) {
 	r := &h.segRoot
 	try := func(lo, hi int) (bool, error) {
@@ -826,6 +1012,14 @@ func (h *Hash) tryMergeSeg(ctx context.Context, key []byte, i int, out []byte) (
 		r.fence[lo].meta = hashSegMeta(int(binary.LittleEndian.Uint16(h.segBuf2)), int64(binary.LittleEndian.Uint64(h.segBuf2[4:])))
 		r.fence = append(r.fence[:hi], r.fence[hi+1:]...)
 		h.fence = r.fence
+		if r.paged {
+			// The shrunken page rides the root's batch, like the
+			// in-page split: the root is full-frame, so replay never
+			// needs to reconcile across the pair.
+			if err := h.writeFencePage(ctx); err != nil {
+				return false, err
+			}
+		}
 		if err := h.writeSegRoot(ctx, key, false); err != nil {
 			return false, err
 		}
@@ -861,7 +1055,11 @@ func (h *Hash) getEntry(ctx context.Context, key, field []byte) ([]byte, int64, 
 		return nil, 0, false, nil
 	case hashSegState:
 		f := hashFH(field)
-		s, err := h.readSeg(ctx, h.segRoot.fence[hashFenceFind(h.segRoot.fence, f)].segid)
+		i, err := h.fenceIdx(ctx, f)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		s, err := h.readSeg(ctx, h.segRoot.fence[i].segid)
 		if err != nil {
 			return nil, 0, false, err
 		}

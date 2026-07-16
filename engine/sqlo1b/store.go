@@ -470,6 +470,18 @@ type planeSegOp struct {
 	min   int64
 }
 
+// tailPageImg is one tail image of a fence page: where it sits in the
+// tail, the batch it rode in, and the payload it wrote there, nil for
+// a delete. The walk collects these per page subkey so a paged root's
+// fenced set can pick the image that was current at its root frame,
+// and so a plane rollback can drop the page frames of the rolled-back
+// batches alongside their segments.
+type tailPageImg struct {
+	idx   int
+	batch int
+	val   []byte
+}
+
 // reconcileTail is rule W3's replay side (doc 06 section 5): walk the
 // truncated tail before anything applies and settle, per plane, the
 // window of segment frames past the last durable root image. A window
@@ -492,8 +504,20 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 	wins := map[uint64][]planeSegOp{} // rooth -> window past its last root frame
 	rootRecs := map[string]*Record{}  // user key -> latest tail root image, nil = deleted
 	rootKeys := map[uint64][]byte{}   // rooth -> user key, from tail rootkey records
+	// Fence pages are neutral in the walk: never evidence, never
+	// counted, always applied. The walk only remembers their tail
+	// images so a paged root's fenced set can resolve each page as of
+	// the root frame it patches (a later tail page image may belong to
+	// a split whose own root frame the crash took, and reading it
+	// would misclassify that split's window). A nil val is a tail
+	// delete of the page.
+	fpages := map[string][]tailPageImg{} // fence subkey bytes -> tail images, walk order
+	rootAt := map[uint64]int{}           // rooth -> op index of its last full root frame
 	isSeg := func(k []byte) bool {
 		return len(k) == SubkeySize && k[8] == sqlo1.SubkindSeg
+	}
+	isFence := func(k []byte) bool {
+		return len(k) == SubkeySize && k[8] == sqlo1.SubkindFence
 	}
 	segPre := func(key []byte) (int, error) {
 		if n, ok := segs[string(key)]; ok {
@@ -532,6 +556,8 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 					idx: i, batch: batch, segid: segid(op.key), del: true,
 				})
 				segs[string(op.key)] = 0
+			} else if isFence(op.key) {
+				fpages[string(op.key)] = append(fpages[string(op.key)], tailPageImg{idx: i, batch: batch})
 			} else {
 				rootRecs[string(op.key)] = nil
 			}
@@ -542,6 +568,8 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 				continue
 			}
 			switch {
+			case rec.RType == RecFence && isFence(rec.Key):
+				fpages[string(rec.Key)] = append(fpages[string(rec.Key)], tailPageImg{idx: i, batch: batch, val: rec.Value})
 			case rec.RType == RecSeg && isSeg(rec.Key):
 				post, postMin, ok := sqlo1.SegCounts(rec.Value)
 				if !ok {
@@ -563,6 +591,7 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 					// A full root frame is exact as of this point;
 					// only segments past it can drift the plane.
 					delete(wins, rooth)
+					rootAt[rooth] = i
 				}
 			}
 		}
@@ -606,13 +635,57 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 		if rr, ok := sqlo1.ReconcileRef(root.Value); !ok || rr != rooth {
 			continue // stale mapping, the key was recreated
 		}
-		fence, ok := sqlo1.ReconcileFence(root.Value)
-		if !ok {
-			return nil, nil, fmt.Errorf("root %q under rooth %x does not decode", ukey, rooth)
-		}
 		fenced := map[uint64]bool{}
-		for _, id := range fence {
-			fenced[id] = true
+		pageids, paged, perr := sqlo1.ReconcilePages(root.Value)
+		if perr != nil {
+			return nil, nil, fmt.Errorf("root %q under rooth %x does not decode: %w", ukey, rooth, perr)
+		}
+		if paged {
+			// The fenced set is the union of segids across the root's
+			// pages, each resolved to the image current at the root
+			// frame: the latest tail image at or before rootAt when the
+			// root came from the tail, else the committed record. Later
+			// tail page images belong to writes past the root frame and
+			// must not classify this window.
+			limit, inTail := rootAt[rooth]
+			for _, pid := range pageids {
+				pkey := sqlo1.Subkey{Rooth: rooth, Kind: sqlo1.SubkindFence, Segid: pid}.Encode()
+				var pval []byte
+				found := false
+				if inTail {
+					for _, img := range fpages[string(pkey)] {
+						if img.idx > limit {
+							break
+						}
+						pval, found = img.val, img.val != nil
+					}
+				}
+				if !found {
+					rec, err := s.lookup(pkey)
+					if err != nil {
+						return nil, nil, err
+					}
+					if rec == nil {
+						return nil, nil, fmt.Errorf("root %q under rooth %x references fence page %d, which neither the tail nor the data file holds", ukey, rooth, pid)
+					}
+					pval = rec.Value
+				}
+				ids, err := sqlo1.FencePageSegids(pval)
+				if err != nil {
+					return nil, nil, fmt.Errorf("root %q under rooth %x, fence page %d: %w", ukey, rooth, pid, err)
+				}
+				for _, id := range ids {
+					fenced[id] = true
+				}
+			}
+		} else {
+			fence, ok := sqlo1.ReconcileFence(root.Value)
+			if !ok {
+				return nil, nil, fmt.Errorf("root %q under rooth %x does not decode", ukey, rooth)
+			}
+			for _, id := range fence {
+				fenced[id] = true
+			}
 		}
 		// The kept prefix ends at the batch with the first structural
 		// evidence; everything from that batch on rolls back.
@@ -628,6 +701,28 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 		}
 		for _, o := range win[keep:] {
 			dropped[o.idx] = true
+		}
+		if keep < len(win) {
+			// A rolled-back plane drops its fence-page frames from the
+			// rollback batch onward too: a page image from an un-rooted
+			// split must not overwrite the committed page the surviving
+			// root still references. Frames at or before the last root
+			// frame stay, the root that landed depends on them.
+			cutBatch := win[keep].batch
+			lastRoot := -1
+			if at, ok := rootAt[rooth]; ok {
+				lastRoot = at
+			}
+			for k, imgs := range fpages {
+				if binary.LittleEndian.Uint64([]byte(k)) != rooth {
+					continue
+				}
+				for _, img := range imgs {
+					if img.idx > lastRoot && img.batch >= cutBatch {
+						dropped[img.idx] = true
+					}
+				}
+			}
 		}
 		var dn, minExp int64
 		for _, o := range win[:keep] {
@@ -818,12 +913,14 @@ func seamOut(rec *Record) sqlo1.Record {
 }
 
 // seamRecord maps a flat seam record onto the vlog envelope. Only
-// segment records carry a rootgen (doc 03 section 6), so a nonzero
-// Gen must arrive on a 16-byte subkey minted by the per-type layer,
-// and a root's own generation lives in its payload, never in the
-// envelope; either way the validation at encode enforces it, so a
+// segment and fence records carry a rootgen (doc 03 section 6), so a
+// nonzero Gen must arrive on a 16-byte subkey minted by the per-type
+// layer, and a root's own generation lives in its payload, never in
+// the envelope; either way the validation at encode enforces it, so a
 // Root op with a nonzero Gen rejects the batch loudly instead of
-// dropping the generation.
+// dropping the generation. A Fence op maps to rtype 5 and needs a
+// nonzero Gen too; ApplyBatch pre-checks both Fence combinations so
+// the reject is loud rather than an encode failure downstream.
 func seamRecord(r *sqlo1.Record) *Record {
 	rec := &Record{Key: r.Key, Value: r.Value}
 	switch {
@@ -833,6 +930,10 @@ func seamRecord(r *sqlo1.Record) *Record {
 			rec.RFlags |= RFlagRootgen
 			rec.Rootgen = r.Gen
 		}
+	case r.Fence:
+		rec.RType = RecFence
+		rec.RFlags |= RFlagRootgen
+		rec.Rootgen = r.Gen
 	case r.Gen > 0:
 		rec.RType = RecSeg
 		rec.RFlags |= RFlagRootgen
@@ -931,6 +1032,12 @@ func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 		}
 		if op.Rec.Delta && !op.Rec.Root {
 			return fmt.Errorf("sqlo1b: batch %d op %d: delta flag on non-root record %x", b.Seq, i, op.Rec.Key)
+		}
+		if op.Rec.Fence && op.Rec.Root {
+			return fmt.Errorf("sqlo1b: batch %d op %d: fence flag on root record %x", b.Seq, i, op.Rec.Key)
+		}
+		if op.Rec.Fence && op.Rec.Gen == 0 {
+			return fmt.Errorf("sqlo1b: batch %d op %d: fence record %x without a generation", b.Seq, i, op.Rec.Key)
 		}
 		rec := seamRecord(&op.Rec)
 		if rec.RType == RecRoot {

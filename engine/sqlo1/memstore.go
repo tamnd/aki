@@ -66,6 +66,12 @@ func (s *MemStore) ApplyBatch(ctx context.Context, b *DrainBatch) error {
 		if !op.Del && op.Rec.Delta && !op.Rec.Root {
 			return fmt.Errorf("sqlo1: batch %d op %d: delta flag on non-root record %x", b.Seq, i, op.Rec.Key)
 		}
+		if !op.Del && op.Rec.Fence && op.Rec.Root {
+			return fmt.Errorf("sqlo1: batch %d op %d: fence flag on root record %x", b.Seq, i, op.Rec.Key)
+		}
+		if !op.Del && op.Rec.Fence && op.Rec.Gen == 0 {
+			return fmt.Errorf("sqlo1: batch %d op %d: fence record %x without a generation", b.Seq, i, op.Rec.Key)
+		}
 	}
 	for i := range b.Bumps {
 		if b.Bumps[i].NewGen == 0 {

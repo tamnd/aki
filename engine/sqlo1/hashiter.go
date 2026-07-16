@@ -65,44 +65,55 @@ func (h *Hash) HIterate(ctx context.Context, key []byte, begin func(count int), 
 // iterSegEntries streams every entry of the current segRoot in fence
 // order, hashIterBatchSegs per LookupBatch round; each round is
 // fetched only after the previous round's entries were emitted, which
-// keeps the aliases legal and the RAM bound at one round. The caller
-// has run stateOf to hashSegState. Returns the entries emitted.
+// keeps the aliases legal and the RAM bound at one round. A paged
+// root walks its pages in index order, one loaded at a time, so the
+// RAM bound gains one page, not the whole fence. The caller has run
+// stateOf to hashSegState. Returns the entries emitted.
 func (h *Hash) iterSegEntries(ctx context.Context, emit func(field, val []byte)) (uint64, error) {
 	r := &h.segRoot
 	emitted := uint64(0)
-	for base := 0; base < len(r.fence); base += hashIterBatchSegs {
-		n := min(hashIterBatchSegs, len(r.fence)-base)
-		h.mgKeyBuf = grow(h.mgKeyBuf, n*SubkeySize)
-		h.mgKeys = h.mgKeys[:0]
-		for j := range n {
-			k := h.mgKeyBuf[j*SubkeySize : (j+1)*SubkeySize]
-			putHashSegKey(k, r.rooth, r.fence[base+j].segid)
-			h.mgKeys = append(h.mgKeys, k)
-		}
-		var err error
-		h.mgVals, h.mgRoots, h.mgExps, err = h.t.LookupBatch(ctx, h.mgKeys, h.mgVals, h.mgRoots, h.mgExps)
-		if err != nil {
+	pages := 1
+	if r.paged {
+		pages = len(r.pidx)
+	}
+	for p := range pages {
+		if err := h.loadPage(ctx, p); err != nil {
 			return emitted, err
 		}
-		for j := range n {
-			if h.mgVals[j] == nil {
-				return emitted, fmt.Errorf("sqlo1: hash segment %d of rooth %#x is missing", r.fence[base+j].segid, r.rooth)
+		for base := 0; base < len(r.fence); base += hashIterBatchSegs {
+			n := min(hashIterBatchSegs, len(r.fence)-base)
+			h.mgKeyBuf = grow(h.mgKeyBuf, n*SubkeySize)
+			h.mgKeys = h.mgKeys[:0]
+			for j := range n {
+				k := h.mgKeyBuf[j*SubkeySize : (j+1)*SubkeySize]
+				putHashSegKey(k, r.rooth, r.fence[base+j].segid)
+				h.mgKeys = append(h.mgKeys, k)
 			}
-			seg, err := decodeHashSeg(h.mgVals[j])
+			var err error
+			h.mgVals, h.mgRoots, h.mgExps, err = h.t.LookupBatch(ctx, h.mgKeys, h.mgVals, h.mgRoots, h.mgExps)
 			if err != nil {
 				return emitted, err
 			}
-			it := hashEntryIter{p: seg.entries}
-			for {
-				f, v, _, ok, err := it.next()
+			for j := range n {
+				if h.mgVals[j] == nil {
+					return emitted, fmt.Errorf("sqlo1: hash segment %d of rooth %#x is missing", r.fence[base+j].segid, r.rooth)
+				}
+				seg, err := decodeHashSeg(h.mgVals[j])
 				if err != nil {
 					return emitted, err
 				}
-				if !ok {
-					break
+				it := hashEntryIter{p: seg.entries}
+				for {
+					f, v, _, ok, err := it.next()
+					if err != nil {
+						return emitted, err
+					}
+					if !ok {
+						break
+					}
+					emit(f, v)
+					emitted++
 				}
-				emit(f, v)
-				emitted++
 			}
 		}
 	}
@@ -145,33 +156,46 @@ func (h *Hash) HScan(ctx context.Context, key []byte, cursor uint64, count int64
 	r := &h.segRoot
 	scanned := int64(0)
 	var lastFH uint64
-	for i := hashFenceFind(r.fence, cursor); i < len(r.fence); i++ {
-		if scanned >= count {
-			// lastFH sits below this fence entry's lo, so the resume
-			// cursor cannot wrap and cannot skip anything: the next
-			// step lands back on segment i at its first entry.
-			return lastFH + 1, nil
-		}
-		seg, err := h.readSeg(ctx, r.fence[i].segid)
-		if err != nil {
+	p, pages := 0, 1
+	if r.paged {
+		p = hashPageFind(r.pidx, cursor)
+		pages = len(r.pidx)
+	}
+	for ; p < pages; p++ {
+		if err := h.loadPage(ctx, p); err != nil {
 			return 0, err
 		}
-		it := hashEntryIter{p: seg.entries}
-		for {
-			f, v, _, ok, err := it.next()
+		// Only the cursor's own page can start mid-page; later pages'
+		// entries all sit above the cursor, where hashFenceFind says
+		// -1 and the walk starts at their first entry.
+		for i := max(hashFenceFind(r.fence, cursor), 0); i < len(r.fence); i++ {
+			if scanned >= count {
+				// lastFH sits below this fence entry's lo, so the resume
+				// cursor cannot wrap and cannot skip anything: the next
+				// step lands back on segment i at its first entry.
+				return lastFH + 1, nil
+			}
+			seg, err := h.readSeg(ctx, r.fence[i].segid)
 			if err != nil {
 				return 0, err
 			}
-			if !ok {
-				break
+			it := hashEntryIter{p: seg.entries}
+			for {
+				f, v, _, ok, err := it.next()
+				if err != nil {
+					return 0, err
+				}
+				if !ok {
+					break
+				}
+				fh := hashFH(f)
+				if fh < cursor {
+					continue
+				}
+				emit(f, v)
+				scanned++
+				lastFH = fh
 			}
-			fh := hashFH(f)
-			if fh < cursor {
-				continue
-			}
-			emit(f, v)
-			scanned++
-			lastFH = fh
 		}
 	}
 	return 0, nil

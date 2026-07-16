@@ -81,7 +81,8 @@ const TagRoot uint8 = 1 << 7
 // is what makes the invalidation rule structural: every byte-level
 // write replaces the tag and the bit dies with it, so a stale shadow
 // cannot survive any writer that did not deliberately re-arm it. The
-// bit never crosses the seam; drain only reads TagRoot and TagDelta.
+// bit never crosses the seam; drain only reads TagRoot, TagDelta,
+// and TagFence.
 const tagIntShadow uint8 = 1 << 6
 
 // TagDelta is a flag bit beside TagRoot: this root post-image differs
@@ -94,6 +95,15 @@ const tagIntShadow uint8 = 1 << 6
 // writes and leaves it off structural ones (upgrade, split, merge,
 // paging), and drain carries it across the seam as Record.Delta.
 const TagDelta uint8 = 1 << 5
+
+// TagFence is a flag bit beside TagRoot: this record is a fence page
+// of a paged collection root (doc 06 section 2.3), a plane-scoped
+// data record that carries its rootgen in Gen like a segment does.
+// Drain carries it across the seam as Record.Fence so a backend with
+// record types can map it (Track B rtype 5) and probe its liveness
+// through the same rootgen door as segments. It never combines with
+// TagRoot: a fence page is not a root image.
+const TagFence uint8 = 1 << 4
 
 // The queued byte's bits. queuedBit means the write-behind queue holds
 // an entry for this slot; queuedDefer means that entry must re-file at

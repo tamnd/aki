@@ -33,6 +33,14 @@ type Record struct {
 	// itself is always exact. Meaningless without Root; backends
 	// reject the combination.
 	Delta bool
+	// Fence marks a fence page of a paged collection root, doc 06
+	// section 2.3: a plane-scoped record on a 16-byte subkey that
+	// carries its rootgen in Gen exactly like a segment, so Gen must
+	// be nonzero and Root unset when Fence is set; backends reject
+	// both combinations. A backend with record types maps the flag to
+	// its fence representation (Track B rtype 5) and retires the page
+	// with its plane through the same generation door as segments.
+	Fence bool
 }
 
 // Op is one mutation inside a DrainBatch: a record put, or a delete when

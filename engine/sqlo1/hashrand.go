@@ -51,14 +51,23 @@ func (h *Hash) rvGet(s rvSlot) (f, v []byte) {
 	return f, v
 }
 
-// buildFenceWeights fills h.wsum with the cumulative fill-class
-// weights of the current fence and returns the total. Weight zero
-// cannot happen (an empty segment still weighs 1), so the total is
-// always positive when a fence exists.
-func (h *Hash) buildFenceWeights() uint64 {
+// buildDrawWeights fills h.wsum with the cumulative draw weights one
+// weighted draw searches: per fence entry flat (2*fillclass+1), per
+// page paged (the index's stored per-page sums of the same weights).
+// Returns the total. Weight zero cannot happen (an empty segment
+// still weighs 1 and decode rejects a zero page weight), so the total
+// is always positive when a fence exists.
+func (h *Hash) buildDrawWeights() uint64 {
 	r := &h.segRoot
 	h.wsum = h.wsum[:0]
 	total := uint64(0)
+	if r.paged {
+		for _, e := range r.pidx {
+			total += uint64(e.weight)
+			h.wsum = append(h.wsum, total)
+		}
+		return total
+	}
 	for _, e := range r.fence {
 		total += 2*uint64(e.meta&hashMetaFillMask) + 1
 		h.wsum = append(h.wsum, total)
@@ -66,11 +75,39 @@ func (h *Hash) buildFenceWeights() uint64 {
 	return total
 }
 
-// drawSegIdx picks a fence index with probability proportional to its
-// fill-class weight. buildFenceWeights has run.
-func (h *Hash) drawSegIdx(total uint64) int {
+// drawFenceIdx picks a fence index with probability proportional to
+// its fill-class weight; buildDrawWeights has run. Flat is one search
+// over the prebuilt sums. Paged draws twice: a page proportional to
+// its stored weight sum, then an entry within the loaded page by a
+// linear weighted walk over its live metas (at most hashFencePageMax
+// of them, recomputed per draw because the loaded page changes under
+// the draws). The stored page weight can trail the live metas by the
+// skipped advisory writes, which skews the draw no further than the
+// fill classes already do. The returned index is into r.fence, which
+// holds the drawn page's entries until the next page load.
+func (h *Hash) drawFenceIdx(ctx context.Context, total uint64) (int, error) {
+	r := &h.segRoot
 	x := h.rand64() % total
-	return sort.Search(len(h.wsum), func(i int) bool { return h.wsum[i] > x })
+	j := sort.Search(len(h.wsum), func(i int) bool { return h.wsum[i] > x })
+	if !r.paged {
+		return j, nil
+	}
+	if err := h.loadPage(ctx, j); err != nil {
+		return 0, err
+	}
+	pt := uint64(0)
+	for _, e := range r.fence {
+		pt += 2*uint64(e.meta&hashMetaFillMask) + 1
+	}
+	y := h.rand64() % pt
+	acc := uint64(0)
+	for i, e := range r.fence {
+		acc += 2*uint64(e.meta&hashMetaFillMask) + 1
+		if acc > y {
+			return i, nil
+		}
+	}
+	return len(r.fence) - 1, nil
 }
 
 // hashEntryAt walks region to entry idx. The caller has bounded idx
@@ -94,15 +131,20 @@ func hashEntryAt(region []byte, idx int) (f, v []byte, err error) {
 // drawSegEntry is the weighted primitive: one uniform-ish entry of
 // the segmented hash under the current root. Empty segments (weight 1
 // until the lazy merge folds them) redraw; a run of empty draws falls
-// back to the first non-empty segment in fence order, which exists
-// because a segmented root's count is positive. Returns the fence
-// index and entry index alongside the bytes so distinct sampling can
-// key its dedupe. The bytes alias the segment read and die at the
-// next Tiered call.
+// back to the first non-empty segment in fence order, page by page on
+// a paged root. The fallback terminates because a segmented root's
+// count is positive. Returns the fence index and entry index
+// alongside the bytes so distinct sampling can key its dedupe; on
+// return r.fence still holds the page containing fi, so the caller
+// can read r.fence[fi].segid before the next draw. The bytes alias
+// the segment read and die at the next Tiered call.
 func (h *Hash) drawSegEntry(ctx context.Context, total uint64) (fi, ei int, f, v []byte, err error) {
 	r := &h.segRoot
 	for range 32 {
-		i := h.drawSegIdx(total)
+		i, err := h.drawFenceIdx(ctx, total)
+		if err != nil {
+			return 0, 0, nil, nil, err
+		}
 		seg, err := h.readSeg(ctx, r.fence[i].segid)
 		if err != nil {
 			return 0, 0, nil, nil, err
@@ -117,20 +159,29 @@ func (h *Hash) drawSegEntry(ctx context.Context, total uint64) (fi, ei int, f, v
 		}
 		return i, j, f, v, nil
 	}
-	for i := range r.fence {
-		seg, err := h.readSeg(ctx, r.fence[i].segid)
-		if err != nil {
+	pages := 1
+	if r.paged {
+		pages = len(r.pidx)
+	}
+	for p := range pages {
+		if err := h.loadPage(ctx, p); err != nil {
 			return 0, 0, nil, nil, err
 		}
-		if seg.n == 0 {
-			continue
+		for i := range r.fence {
+			seg, err := h.readSeg(ctx, r.fence[i].segid)
+			if err != nil {
+				return 0, 0, nil, nil, err
+			}
+			if seg.n == 0 {
+				continue
+			}
+			j := int(h.rand64() % uint64(seg.n))
+			f, v, err := hashEntryAt(seg.entries, j)
+			if err != nil {
+				return 0, 0, nil, nil, err
+			}
+			return i, j, f, v, nil
 		}
-		j := int(h.rand64() % uint64(seg.n))
-		f, v, err := hashEntryAt(seg.entries, j)
-		if err != nil {
-			return 0, 0, nil, nil, err
-		}
-		return i, j, f, v, nil
 	}
 	return 0, 0, nil, nil, fmt.Errorf("sqlo1: segmented hash rooth %#x claims %d fields, all segments empty", r.rooth, r.count)
 }
@@ -154,7 +205,7 @@ func (h *Hash) HRandField(ctx context.Context, key []byte) (field, val []byte, o
 		}
 		return f, v, true, nil
 	}
-	total := h.buildFenceWeights()
+	total := h.buildDrawWeights()
 	_, _, f, v, err := h.drawSegEntry(ctx, total)
 	if err != nil {
 		return nil, nil, false, err
@@ -253,7 +304,7 @@ func (h *Hash) randInline(hi hashInline, count int64, withReplacement bool, begi
 // primitive; each draw is one segment read and the emit consumes the
 // aliases before the next one.
 func (h *Hash) randSegReplace(ctx context.Context, count int64, begin func(n int64), emit func(field, val []byte)) error {
-	total := h.buildFenceWeights()
+	total := h.buildDrawWeights()
 	begin(count)
 	for range count {
 		_, _, f, v, err := h.drawSegEntry(ctx, total)
@@ -291,7 +342,7 @@ func (h *Hash) randSegDistinct(ctx context.Context, count int64, begin func(n in
 		return h.randSegReservoir(ctx, count, begin, emit)
 	}
 
-	total := h.buildFenceWeights()
+	total := h.buildDrawWeights()
 	if h.picked == nil {
 		h.picked = make(map[uint64]struct{}, count)
 	}
@@ -329,31 +380,41 @@ func (h *Hash) randSegDistinct(ctx context.Context, count int64, begin func(n in
 
 // fenceFill is the rejection sampler's valve: it finishes a distinct
 // quota deterministically, emitting the first entries in fence order
-// whose dedupe key is not already in picked. Returns what it could
-// not fill, which is zero unless the root count lied.
+// whose dedupe key is not already in picked, page by page on a paged
+// root. Returns what it could not fill, which is zero unless the root
+// count lied.
 func (h *Hash) fenceFill(ctx context.Context, remaining int64, emit func(field, val []byte)) (int64, error) {
 	r := &h.segRoot
-	for i := 0; i < len(r.fence) && remaining > 0; i++ {
-		seg, err := h.readSeg(ctx, r.fence[i].segid)
-		if err != nil {
+	pages := 1
+	if r.paged {
+		pages = len(r.pidx)
+	}
+	for p := 0; p < pages && remaining > 0; p++ {
+		if err := h.loadPage(ctx, p); err != nil {
 			return remaining, err
 		}
-		it := hashEntryIter{p: seg.entries}
-		for j := 0; remaining > 0; j++ {
-			f, v, _, ok, err := it.next()
+		for i := 0; i < len(r.fence) && remaining > 0; i++ {
+			seg, err := h.readSeg(ctx, r.fence[i].segid)
 			if err != nil {
 				return remaining, err
 			}
-			if !ok {
-				break
+			it := hashEntryIter{p: seg.entries}
+			for j := 0; remaining > 0; j++ {
+				f, v, _, ok, err := it.next()
+				if err != nil {
+					return remaining, err
+				}
+				if !ok {
+					break
+				}
+				k := r.fence[i].segid*4096 + uint64(j)
+				if _, dup := h.picked[k]; dup {
+					continue
+				}
+				h.picked[k] = struct{}{}
+				emit(f, v)
+				remaining--
 			}
-			k := r.fence[i].segid*4096 + uint64(j)
-			if _, dup := h.picked[k]; dup {
-				continue
-			}
-			h.picked[k] = struct{}{}
-			emit(f, v)
-			remaining--
 		}
 	}
 	return remaining, nil
