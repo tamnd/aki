@@ -100,6 +100,25 @@ func (g *reg) drop(key []byte) {
 	delete(g.m, string(key))
 }
 
+// demote sheds a bounded run of key's interior chunks into the cold region and
+// returns how many it shed, then reconciles the freed bytes into the running total.
+// It is a no-op (returns 0) when the key is absent, still inline (a listpack is
+// below one chunk's worth, nothing to demote), or its interior is already cold. The
+// trigger that decides which key to demote when the shard overshoots its resident
+// cap lands with the dispatch slice; this is the per-key pass it drives. Owner
+// goroutine only.
+func (g *reg) demote(cx *shard.Ctx, key []byte) int {
+	l := g.m[string(key)]
+	if l == nil || l.nat == nil {
+		return 0
+	}
+	n := l.nat.demote(cx.St, key)
+	if n > 0 {
+		g.note(l)
+	}
+	return n
+}
+
 // ResidentBytes is the running sum of every live list's resident-byte footprint on
 // this shard, the collection contribution to the store's memory-pressure figure
 // (spec 2064/f3/06 section 6). It is zero when the store runs no cold tier. The

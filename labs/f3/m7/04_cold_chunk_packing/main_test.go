@@ -84,3 +84,57 @@ func TestChunkFitsLocatorCeiling(t *testing.T) {
 		}
 	}
 }
+
+// TestListWholeChunkFreesNearlyAll pins the list column's headline: a list demotes a
+// whole chunk and keeps no per-element resident record, only one descriptor per shed
+// chunk, so a demote frees essentially the entire chunk footprint at every member
+// width. Unlike the set, whose freed fraction grows with the member, the list's holds
+// near-constant because both the freed footprint and the retained descriptor scale
+// with the same 1/members.
+func TestListWholeChunkFreesNearlyAll(t *testing.T) {
+	for _, width := range []int{8, 20, 64, 256} {
+		if r := measureList(width, keyLen); r.freedFrac < 0.98 {
+			t.Fatalf("width %d: list demote freed %.4f, want ~0.99 of the chunk footprint", width, r.freedFrac)
+		}
+	}
+	small := measureList(20, keyLen)
+	large := measureList(256, keyLen)
+	if d := large.freedFrac - small.freedFrac; d < -0.01 || d > 0.01 {
+		t.Fatalf("list freed fraction drifted %.4f across widths, want near-constant", d)
+	}
+}
+
+// TestListChunkMetaUnderSet pins the structural saving of the whole-chunk demote: a
+// cold list chunk keeps only its directory descriptor resident, where the set keeps
+// the descriptor plus an offset-table slot per chunk, because the list rides the ring
+// handle's cold offset for a read and needs no directory slot. The saving is per
+// chunk; per member it depends on the packing, which the elem-cap ceiling makes
+// coarser for a list, so this pins the per-chunk fact the encoding actually fixes.
+func TestListChunkMetaUnderSet(t *testing.T) {
+	if listDescBytes >= descBytes+offsBytes {
+		t.Fatalf("cold list chunk keeps %d resident B, not below the set's %d (descriptor + offset slot)",
+			listDescBytes, descBytes+offsBytes)
+	}
+}
+
+// TestListChunkFitsElemCap pins that the model never packs more than the native
+// element ceiling into one list chunk (native.go chunkElemCap): a narrow member hits
+// the 128-element cap well before the byte budget, the geometry that lifts the list
+// frame overhead above the set's for small members.
+func TestListChunkFitsElemCap(t *testing.T) {
+	for _, width := range []int{1, 8, 16, 20, 32} {
+		if r := measureList(width, keyLen); r.members > listElemCap {
+			t.Fatalf("width %d packs %d frames, over the native element cap %d", width, r.members, listElemCap)
+		}
+	}
+}
+
+// TestListFootprintMatchesSource pins the mirrored native chunk footprint against the
+// value native.go derives (chunkBlobCap + chunkElemCap*2), so a change to either
+// source constant this lab does not track surfaces here rather than in a silently
+// wrong freed fraction.
+func TestListFootprintMatchesSource(t *testing.T) {
+	if listFootprint != 4096+128*2 {
+		t.Fatalf("list footprint %d != chunkBlobCap + chunkElemCap*2", listFootprint)
+	}
+}

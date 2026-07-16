@@ -226,16 +226,21 @@ const chunkFootprint = chunkBlobCap + chunkElemCap*2
 // demoted chunk released its blob and directory, so it drops out of the count; the
 // demote loop reads this figure falling as it sheds chunks, the whole point of the
 // pass. It reads counts and capacities only, never a chunk's contents, so it preads
-// nothing and never walks the ring. The cold state's own overhead (its directory)
-// lands with the demote slice; the pread scratch is left out on purpose, the same
-// bounded per-read buffer the set and zset forms exclude to keep the running total
-// from drifting between command boundaries. Owner goroutine only.
+// nothing and never walks the ring. The cold state adds back only its demote-sequence
+// directory, so a shed chunk nets out to a footprint drop; the pread scratch is left
+// out on purpose, the same bounded per-read buffer the set and zset forms exclude to
+// keep the running total from drifting between command boundaries. Owner goroutine
+// only.
 func (nt *native) residentBytes() uint64 {
 	total := (nt.ring.n-nt.coldN)*chunkFootprint + len(nt.free)*chunkFootprint
 	total += cap(nt.ring.buf) * 8
 	total += cap(nt.dir.tree) * 8
 	total += cap(nt.scratch)
-	return uint64(total)
+	rb := uint64(total)
+	if nt.cold != nil {
+		rb += nt.cold.residentBytes()
+	}
+	return rb
 }
 
 // --- slab allocation and recycling ---------------------------------------
