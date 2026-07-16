@@ -2,7 +2,6 @@ package sqlo1
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -18,7 +17,7 @@ func (r *hashRig) segRootOf(key string) hashSegRoot {
 	if err != nil || !ok || !root {
 		r.t.Fatalf("Lookup(%q): ok=%v root=%v err=%v", key, ok, root, err)
 	}
-	sr, err := decodeHashSegRoot(v, nil)
+	sr, err := decodeHashSegRoot(v, nil, nil)
 	if err != nil {
 		r.t.Fatalf("segmented root of %q: %v", key, err)
 	}
@@ -259,7 +258,7 @@ func TestHashSegRootCodecCorrupt(t *testing.T) {
 	if _, err := decodeHashSegRoot(appendHashSegRoot(nil, &hashSegRoot{
 		rootgen: 1, rooth: 7, count: 1, nextSegid: 1,
 		fence: []hashFenceEnt{{lo: 0, segid: 0}},
-	}), nil); err != nil {
+	}), nil, nil); err != nil {
 		t.Fatalf("minimal root rejected: %v", err)
 	}
 
@@ -271,7 +270,10 @@ func TestHashSegRootCodecCorrupt(t *testing.T) {
 			p[0] = ropeSub
 			return p
 		},
-		"fence paged bit": func() []byte {
+		"paged bit over zero-weight entries": func() []byte {
+			// Flipping the paged bit reinterprets the fence entries as
+			// index entries; the first one's meta of 0 becomes a page
+			// weight of 0, which no real page can have.
 			r := base()
 			p := appendHashSegRoot(nil, &r)
 			p[1] |= hflagFencePaged
@@ -327,76 +329,150 @@ func TestHashSegRootCodecCorrupt(t *testing.T) {
 		},
 	}
 	for name, build := range corrupt {
-		if _, err := decodeHashSegRoot(build(), nil); err == nil {
+		if _, err := decodeHashSegRoot(build(), nil, nil); err == nil {
 			t.Errorf("%s: corrupt segmented root decoded cleanly", name)
 		}
 	}
 
-	// The fence cap is exact: 128 entries decode, 129 do not.
+	// The flat fence cap is exact: 128 entries decode, 129 do not (a
+	// 129th segment pages the fence instead of growing it).
 	full := hashSegRoot{rootgen: 1, rooth: 7, nextSegid: hashFenceMaxSegs + 1, count: 1}
 	for i := range hashFenceMaxSegs {
 		full.fence = append(full.fence, hashFenceEnt{lo: uint64(i) << 50, segid: uint64(i)})
 	}
-	if _, err := decodeHashSegRoot(appendHashSegRoot(nil, &full), nil); err != nil {
+	if _, err := decodeHashSegRoot(appendHashSegRoot(nil, &full), nil, nil); err != nil {
 		t.Fatalf("root at the fence cap rejected: %v", err)
 	}
 	full.fence = append(full.fence, hashFenceEnt{lo: uint64(hashFenceMaxSegs) << 50, segid: hashFenceMaxSegs})
 	full.nextSegid++
-	if _, err := decodeHashSegRoot(appendHashSegRoot(nil, &full), nil); err == nil {
+	if _, err := decodeHashSegRoot(appendHashSegRoot(nil, &full), nil, nil); err == nil {
 		t.Fatal("root past the fence cap decoded cleanly")
 	}
 }
 
-// TestHashFencePagedBoundary grows one hash until its fence would
-// outgrow the root and checks the crossing write fails with the
-// paging sentinel while the hash stays intact.
-func TestHashFencePagedBoundary(t *testing.T) {
-	if testing.Short() {
-		t.Skip("grows a 128-segment hash")
+// TestHashPagedRootCodec is the decode table for paged roots and the
+// fence page payload: the valid shapes round-trip and everything
+// checkable without the pages themselves fails at the root read.
+func TestHashPagedRootCodec(t *testing.T) {
+	base := func() hashSegRoot {
+		return hashSegRoot{
+			rootgen: 2, rooth: 0xfeed, count: 600, nextSegid: 131, paged: true,
+			pidx: []hashPageEnt{
+				{lo: 0, pageid: 129, weight: 40},
+				{lo: 1 << 41, pageid: 130, weight: 25},
+			},
+		}
 	}
-	r := newHashRig(t)
-	ctx := context.Background()
+	r := base()
+	sr, err := decodeHashSegRoot(appendHashSegRoot(nil, &r), nil, nil)
+	if err != nil {
+		t.Fatalf("valid paged root rejected: %v", err)
+	}
+	if !sr.paged || sr.pi != -1 || len(sr.fence) != 0 {
+		t.Fatalf("paged decode state: paged=%v pi=%d fence=%d", sr.paged, sr.pi, len(sr.fence))
+	}
+	if len(sr.pidx) != 2 || sr.pidx[0] != (hashPageEnt{0, 129, 40}) || sr.pidx[1] != (hashPageEnt{1 << 41, 130, 25}) {
+		t.Fatalf("page index round-trip: %+v", sr.pidx)
+	}
 
-	wide := strings.Repeat("w", 220)
-	var paged bool
-	var fields int
-	for i := range 40000 {
-		f := fmt.Sprintf("field-%05d", i)
-		_, err := r.h.HSet(ctx, []byte("cap"), []byte(f), []byte(wide))
-		if err != nil {
-			if !errors.Is(err, errHashFencePaged) {
-				t.Fatalf("HSET %d: %v", i, err)
+	corrupt := map[string]func() []byte{
+		"empty page index": func() []byte {
+			r := base()
+			r.pidx = nil
+			return appendHashSegRoot(nil, &r)
+		},
+		"index first lo nonzero": func() []byte {
+			r := base()
+			r.pidx[0].lo = 9
+			return appendHashSegRoot(nil, &r)
+		},
+		"index out of order": func() []byte {
+			r := base()
+			r.pidx[1].lo = 0
+			return appendHashSegRoot(nil, &r)
+		},
+		"pageid at mint": func() []byte {
+			r := base()
+			r.pidx[1].pageid = r.nextSegid
+			return appendHashSegRoot(nil, &r)
+		},
+		"zero page weight": func() []byte {
+			r := base()
+			r.pidx[1].weight = 0
+			return appendHashSegRoot(nil, &r)
+		},
+		"truncated index": func() []byte {
+			r := base()
+			p := appendHashSegRoot(nil, &r)
+			return p[:len(p)-4]
+		},
+		"index past the cap": func() []byte {
+			r := base()
+			r.pidx = r.pidx[:0]
+			for i := range hashFencePageIdxMax + 1 {
+				r.pidx = append(r.pidx, hashPageEnt{lo: uint64(i) << 40, pageid: uint64(i), weight: 1})
 			}
-			paged = true
-			fields = i
-			break
+			r.nextSegid = uint64(hashFencePageIdxMax) + 2
+			return appendHashSegRoot(nil, &r)
+		},
+	}
+	for name, build := range corrupt {
+		if _, err := decodeHashSegRoot(build(), nil, nil); err == nil {
+			t.Errorf("%s: corrupt paged root decoded cleanly", name)
 		}
 	}
-	if !paged {
-		t.Fatal("40000 wide fields never hit the fence cap")
+}
+
+// TestHashFencePageCodec is the decode table for the rtype 5 page
+// payload itself.
+func TestHashFencePageCodec(t *testing.T) {
+	ents := []hashFenceEnt{
+		{lo: 3, segid: 4, meta: 2},
+		{lo: 1 << 30, segid: 9, meta: 0x12},
 	}
-	sr := r.segRootOf("cap")
-	if len(sr.fence) != hashFenceMaxSegs {
-		t.Fatalf("fence at the refusal holds %d entries, want %d", len(sr.fence), hashFenceMaxSegs)
+	got, err := decodeHashFencePage(appendHashFencePage(nil, ents), nil, 10)
+	if err != nil {
+		t.Fatalf("valid fence page rejected: %v", err)
 	}
-	if sr.count != uint64(fields) {
-		t.Fatalf("count after the refusal = %d, want %d", sr.count, fields)
+	if len(got) != 2 || got[0] != ents[0] || got[1] != ents[1] {
+		t.Fatalf("fence page round-trip: %+v", got)
 	}
-	// The refused write did not land, everything before it did.
-	if _, ok := r.hget("cap", fmt.Sprintf("field-%05d", fields)); ok {
-		t.Fatal("the refused field is readable")
+	// A page's first lo is not forced to zero: only page 0 covers from
+	// zero, and loadPage checks the head against the index instead.
+	if _, err := decodeHashFencePage(appendHashFencePage(nil, ents), nil, 0); err != nil {
+		t.Fatalf("segid bound not skipped at nextSegid 0: %v", err)
 	}
-	for _, i := range []int{0, fields / 2, fields - 1} {
-		f := fmt.Sprintf("field-%05d", i)
-		if v, ok := r.hget("cap", f); !ok || v != wide {
-			t.Fatalf("field %q lost after the refusal: ok=%v", f, ok)
+	if _, err := decodeHashFencePage(appendHashFencePage(nil, ents), nil, 9); err == nil {
+		t.Fatal("segid at the mint counter decoded cleanly")
+	}
+
+	corrupt := map[string]func() []byte{
+		"short header": func() []byte { return []byte{1, 0} },
+		"reserved bytes": func() []byte {
+			p := appendHashFencePage(nil, ents)
+			p[2] = 1
+			return p
+		},
+		"zero entries": func() []byte { return appendHashFencePage(nil, nil) },
+		"length mismatch": func() []byte {
+			p := appendHashFencePage(nil, ents)
+			return p[:len(p)-4]
+		},
+		"out of order": func() []byte {
+			bad := []hashFenceEnt{{lo: 5, segid: 1}, {lo: 5, segid: 2}}
+			return appendHashFencePage(nil, bad)
+		},
+		"past the page cap": func() []byte {
+			var big []hashFenceEnt
+			for i := range hashFencePageMax + 1 {
+				big = append(big, hashFenceEnt{lo: uint64(i), segid: uint64(i)})
+			}
+			return appendHashFencePage(nil, big)
+		},
+	}
+	for name, build := range corrupt {
+		if _, err := decodeHashFencePage(build(), nil, 0); err == nil {
+			t.Errorf("%s: corrupt fence page decoded cleanly", name)
 		}
-	}
-	// Updates of existing fields still work at the cap.
-	if created, err := r.h.HSet(ctx, []byte("cap"), []byte("field-00000"), []byte("small")); err != nil || created {
-		t.Fatalf("update at the cap = %v, %v", created, err)
-	}
-	if v, ok := r.hget("cap", "field-00000"); !ok || v != "small" {
-		t.Fatalf("update at the cap did not land: (%q, %v)", v, ok)
 	}
 }

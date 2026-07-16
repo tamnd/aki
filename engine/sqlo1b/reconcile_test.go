@@ -525,3 +525,224 @@ func TestReplayUnderflowFailsRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The paged rungs: a paged root keeps its fence in rtype 5 page
+// records, so the fenced-set classification resolves each page to the
+// image that was current at the root frame, and a plane rollback
+// takes the rolled-back batches' page frames with it.
+
+// w3PagedRoot builds a paged segmented root (doc 06 section 2.3)
+// whose index references pageids, weight 1 each. nextSegid clears the
+// largest of pageids and segids so page payloads built with w3Page
+// stay consistent with it.
+func w3PagedRoot(rooth, count uint64, pageids []uint64, segids []uint64) []byte {
+	b := make([]byte, 44+16*len(pageids))
+	b[0] = 2                                // hashSubSeg
+	b[1] = 1                                // hflagFencePaged
+	binary.LittleEndian.PutUint32(b[4:], 1) // rootgen
+	binary.LittleEndian.PutUint64(b[8:], rooth)
+	binary.LittleEndian.PutUint64(b[16:], count)
+	next := uint64(0)
+	for _, id := range pageids {
+		next = max(next, id+1)
+	}
+	for _, id := range segids {
+		next = max(next, id+1)
+	}
+	binary.LittleEndian.PutUint64(b[24:], next)
+	binary.LittleEndian.PutUint32(b[40:], uint32(len(pageids)))
+	for i, id := range pageids {
+		off := 44 + 16*i
+		binary.LittleEndian.PutUint64(b[off:], uint64(i)<<32)
+		binary.LittleEndian.PutUint64(b[off+8:], id|1<<48) // weight 1
+	}
+	if len(pageids) > 0 {
+		binary.LittleEndian.PutUint64(b[44:], 0)
+	}
+	return b
+}
+
+// w3Page builds a fence page payload referencing segids, one entry
+// per segid with rising lo values.
+func w3Page(segids ...uint64) []byte {
+	b := make([]byte, 4+16*len(segids))
+	binary.LittleEndian.PutUint16(b, uint16(len(segids)))
+	for i, id := range segids {
+		off := 4 + 16*i
+		binary.LittleEndian.PutUint64(b[off:], uint64(i)<<32)
+		binary.LittleEndian.PutUint64(b[off+8:], id)
+	}
+	return b
+}
+
+func w3FenceKey(t *testing.T, rooth, pageid uint64) []byte {
+	t.Helper()
+	sk, err := sqlo1.NewSubkey(rooth, sqlo1.SubkindFence, pageid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sk.Encode()
+}
+
+func fenceOp(key, val []byte) sqlo1.Op {
+	return sqlo1.Op{Rec: sqlo1.Record{Key: key, Value: val, Gen: 1, Fence: true}}
+}
+
+func TestReplayPatchesPagedRootAcrossBatchSplit(t *testing.T) {
+	// The W1 window over a paged root: the count-only segment frame
+	// past the root patches through the page-resolved fenced set.
+	r := newStoreRig(t)
+	const rooth = 0x88bb
+	seg := w3SegKey(t, rooth, 1)
+	page := w3FenceKey(t, rooth, 2)
+	r.apply(t,
+		segOp(seg, w3Seg(10, 0)),
+		fenceOp(page, w3Page(1)),
+		rootOp("h", w3PagedRoot(rooth, 10, []uint64{2}, []uint64{1}), false),
+	)
+	r.apply(t, segOp(seg, w3Seg(16, 5000)))
+	r.reopen(t)
+	if got := r.rootCount(t, "h"); got != 16 {
+		t.Fatalf("patched paged root count %d, want 16", got)
+	}
+	// Repeat recoveries are idempotent here too.
+	r.reopen(t)
+	if got := r.rootCount(t, "h"); got != 16 {
+		t.Fatalf("second recovery drifted the count to %d", got)
+	}
+}
+
+func TestReplayRollsBackPagedUnfencedSegid(t *testing.T) {
+	// A frame for a segid no resolved page references is structural
+	// evidence: the plane rolls back instead of patching.
+	r := newStoreRig(t)
+	const rooth = 0x66dd
+	seg1 := w3SegKey(t, rooth, 1)
+	seg3 := w3SegKey(t, rooth, 3)
+	page := w3FenceKey(t, rooth, 2)
+	r.apply(t,
+		segOp(seg1, w3Seg(10, 0)),
+		fenceOp(page, w3Page(1)),
+		rootOp("h", w3PagedRoot(rooth, 10, []uint64{2}, []uint64{1, 3}), false),
+	)
+	r.apply(t, segOp(seg3, w3Seg(4, 0)))
+	r.reopen(t)
+	if got := r.rootCount(t, "h"); got != 10 {
+		t.Fatalf("rolled-back paged root count %d, want the rooted 10", got)
+	}
+	orphan, err := r.s.lookup(seg3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orphan != nil {
+		t.Fatal("unfenced segment applied through the rollback")
+	}
+}
+
+func TestReplayPagedResolvesPageAsOfRootFrame(t *testing.T) {
+	// An in-page split cut between its page frame and its root frame:
+	// the tail's newer page image lists the new segid, but the root
+	// that survived is the committed one, so classification must use
+	// the committed page. The new segid is unfenced, the plane rolls
+	// back, and the rolled-back batch's page frame is dropped with it,
+	// leaving the committed page image in place.
+	r := newStoreRig(t)
+	const rooth = 0x55ee
+	seg1 := w3SegKey(t, rooth, 1)
+	seg3 := w3SegKey(t, rooth, 3)
+	page := w3FenceKey(t, rooth, 2)
+	committed := w3Page(1)
+	r.apply(t,
+		segOp(seg1, w3Seg(10, 0)),
+		fenceOp(page, committed),
+		rootOp("h", w3PagedRoot(rooth, 10, []uint64{2}, []uint64{1, 3}), false),
+	)
+	if err := r.s.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	// The torn split: new segment and the page rewrite land, the root
+	// frame does not.
+	r.apply(t,
+		segOp(seg3, w3Seg(4, 0)),
+		fenceOp(page, w3Page(1, 3)),
+	)
+	r.reopen(t)
+	if got := r.rootCount(t, "h"); got != 10 {
+		t.Fatalf("root count %d after the torn split, want 10", got)
+	}
+	orphan, err := r.s.lookup(seg3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orphan != nil {
+		t.Fatal("torn split's segment applied")
+	}
+	rec, err := r.s.lookup(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec == nil || !bytes.Equal(rec.Value, committed) {
+		t.Fatal("torn split's page frame overwrote the committed page")
+	}
+	// Repeat recovery settles to the same state.
+	r.reopen(t)
+	if got := r.rootCount(t, "h"); got != 10 {
+		t.Fatalf("second recovery drifted the count to %d", got)
+	}
+}
+
+func TestReplayPagedMissingPageFails(t *testing.T) {
+	// A paged root whose page neither the tail nor the data file holds
+	// cannot classify its window; recovery must fail loudly.
+	r := newStoreRig(t)
+	const rooth = 0x33ff
+	seg := w3SegKey(t, rooth, 1)
+	r.apply(t,
+		segOp(seg, w3Seg(10, 0)),
+		rootOp("h", w3PagedRoot(rooth, 10, []uint64{2}, []uint64{1}), false),
+	)
+	r.apply(t, segOp(seg, w3Seg(16, 0)))
+	if err := r.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := OpenStore(r.path, 1<<16)
+	if err == nil {
+		t.Fatal("recovery classified a window without the fence page")
+	}
+	if !strings.Contains(err.Error(), "fence page") {
+		t.Fatalf("unexpected recovery error: %v", err)
+	}
+	r.s, err = CreateStore(r.path+".fresh", 1<<16)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReplayNeutralPageFrames(t *testing.T) {
+	// Page frames are never evidence: a tail carrying only a page
+	// rewrite (an advisory weight refresh) patches nothing and rolls
+	// back nothing, and the frame itself applies.
+	r := newStoreRig(t)
+	const rooth = 0x2277
+	seg := w3SegKey(t, rooth, 1)
+	page := w3FenceKey(t, rooth, 2)
+	r.apply(t,
+		segOp(seg, w3Seg(10, 0)),
+		fenceOp(page, w3Page(1)),
+		rootOp("h", w3PagedRoot(rooth, 10, []uint64{2}, []uint64{1}), false),
+	)
+	refreshed := w3Page(1)
+	refreshed[4+8+6] = 0x08 // meta high bits: a different fill class
+	r.apply(t, fenceOp(page, refreshed))
+	r.reopen(t)
+	if got := r.rootCount(t, "h"); got != 10 {
+		t.Fatalf("neutral page frame moved the count to %d", got)
+	}
+	rec, err := r.s.lookup(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec == nil || !bytes.Equal(rec.Value, refreshed) {
+		t.Fatal("the advisory page frame did not apply")
+	}
+}
