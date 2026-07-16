@@ -619,8 +619,8 @@ func Handlers() []shard.Handler { return handlers }
 // Demoter returns the collection-demotion hook for Runtime.UseDemoter, the entry
 // the worker's demote loop calls under memory pressure to shed a native
 // collection quantum to the cold tier (spec 2064/f3/06 section 6). The set, the
-// zset, the list, and the hash each keep their own owner-local registry and
-// footprint, so the hook fans to all four, and each weighs the other three heaps
+// zset, the list, the hash, and the stream each keep their own owner-local registry
+// and footprint, so the hook fans to all five, and each weighs the other four heaps
 // against the shared resident cap: the set's quantum runs over the arena plus every
 // collection registry, then the zset's runs over the arena plus its own registry
 // plus the others' now-shed totals, and so on down the fan. Reading each earlier
@@ -629,16 +629,17 @@ func Handlers() []shard.Handler { return handlers }
 // resident cap is a true RSS bound across the collection types rather than each type
 // overrunning it by the size of the others' heaps. The list sheds before the hash
 // because its interior-only policy makes it the safest to demote (it provably never
-// touches a hot end), and the hash sheds last because it keeps its field bytes
-// resident and frees the least per quantum; the order is a lab knob, not a
-// correctness constraint. As the remaining types grow their cold forms they join the
-// same fan-in.
+// touches a hot end), the hash sheds after because it keeps its field bytes resident
+// and frees the least per quantum, and the stream sheds last, its whole-block demote
+// spilling the coldest front of the log; the order is a lab knob, not a correctness
+// constraint. As the remaining types grow their cold forms they join the same fan-in.
 func Demoter() func(*shard.Ctx) int {
 	return func(cx *shard.Ctx) int {
-		n := set.DemoteQuantumOver(cx, zset.ResidentBytes(cx)+list.ResidentBytes(cx)+hash.ResidentBytes(cx))
-		n += zset.DemoteQuantumOver(cx, set.ResidentBytes(cx)+list.ResidentBytes(cx)+hash.ResidentBytes(cx))
-		n += list.DemoteQuantumOver(cx, set.ResidentBytes(cx)+zset.ResidentBytes(cx)+hash.ResidentBytes(cx))
-		n += hash.DemoteQuantumOver(cx, set.ResidentBytes(cx)+zset.ResidentBytes(cx)+list.ResidentBytes(cx))
+		n := set.DemoteQuantumOver(cx, zset.ResidentBytes(cx)+list.ResidentBytes(cx)+hash.ResidentBytes(cx)+stream.ResidentBytes(cx))
+		n += zset.DemoteQuantumOver(cx, set.ResidentBytes(cx)+list.ResidentBytes(cx)+hash.ResidentBytes(cx)+stream.ResidentBytes(cx))
+		n += list.DemoteQuantumOver(cx, set.ResidentBytes(cx)+zset.ResidentBytes(cx)+hash.ResidentBytes(cx)+stream.ResidentBytes(cx))
+		n += hash.DemoteQuantumOver(cx, set.ResidentBytes(cx)+zset.ResidentBytes(cx)+list.ResidentBytes(cx)+stream.ResidentBytes(cx))
+		n += stream.DemoteQuantumOver(cx, set.ResidentBytes(cx)+zset.ResidentBytes(cx)+list.ResidentBytes(cx)+hash.ResidentBytes(cx))
 		return n
 	}
 }
