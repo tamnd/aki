@@ -10,6 +10,8 @@ on:
       - 'engine/sqlo1a/**'
       - 'engine/sqlo1b/**'
       - 'cmd/sqlo1srv/**'
+      - 'cmd/sqlo1crash/**'
+      - 'labs/sqlo1/**'
       - 'scripts/sqlo1-import-boundary.sh'
       - '.github/workflows/sqlo1.yml'
   pull_request:
@@ -18,6 +20,8 @@ on:
       - 'engine/sqlo1a/**'
       - 'engine/sqlo1b/**'
       - 'cmd/sqlo1srv/**'
+      - 'cmd/sqlo1crash/**'
+      - 'labs/sqlo1/**'
       - 'scripts/sqlo1-import-boundary.sh'
       - '.github/workflows/sqlo1.yml'
 
@@ -98,9 +102,12 @@ jobs:
       - name: test with debug assertions
         run: go test -tags debug -race -count=1 ./...
 
-  # Keep the no-cgo, zero-dependency stance honest. The whole point of aki is a
-  # single static binary you can scp anywhere, so a stray import "C" or a go.sum
-  # creeping in should fail the build, not get noticed at release time.
+  # Keep the no-cgo, static-binary stance honest. The whole point of the f-series
+  # servers is a single static binary you can scp anywhere, so a stray import "C"
+  # or an external module creeping into their graph should fail the build, not get
+  # noticed at release time. The zero-dependency check used to be "no go.sum at
+  # all", but the sqlo1 driver brought its SQLite driver into the module, so the
+  # stance is per tree now: the f-series import graph stays standard library only.
   purego:
     runs-on: ubuntu-latest
     steps:
@@ -120,14 +127,16 @@ jobs:
             echo "$hits"
             exit 1
           fi
-      - name: no external dependencies
+      - name: f-series stays on the standard library
         run: |
-          if [ -f go.sum ]; then
-            echo "go.sum exists, aki must stay on the standard library only"
-            exit 1
-          fi
-          if grep -q '^require' go.mod; then
-            echo "go.mod has a require block, aki must stay on the standard library only"
+          # An external module path has a dot in its first element (github.com,
+          # golang.org); stdlib packages never do. Anything left after dropping
+          # this module's own packages is a dependency that slipped in.
+          mod=$(go list -m)
+          ext=$(go list -deps ./engine/f1raw/... ./engine/f2raw/... ./engine/f3/... ./f1srv/... ./f2srv/... ./f3srv/... ./cmd/f1srv ./cmd/f2srv ./cmd/f3srv | grep -v "^$mod" | grep -E '^[^/]*\.[^/]*/' || true)
+          if [ -n "$ext" ]; then
+            echo "the f-series import graph must stay standard library only:"
+            echo "$ext"
             exit 1
           fi
       - name: builds with cgo disabled

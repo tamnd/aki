@@ -20,15 +20,13 @@ const (
 	// 06 section 5.2 sizing (~0.5 MiB tracks a million distinct cold touches).
 	// The lab sweep tunes it against the promotion-after-cold-read rate.
 	coldDoorBits = 1 << 20
-	// coldDoorHashes is the bits a mark sets and a test checks per generation.
-	coldDoorHashes = 2
 	// coldDoorGolden mixes a second independent position out of the same
 	// fingerprint, the odd multiplier from the wyhash family.
 	coldDoorGolden = 0x9e3779b97f4a7c15
 )
 
-// coldDoor is a two-generation Bloom doorkeeper. A mark sets coldDoorHashes bits
-// in the current half; a test passes when all those bits are set in either half,
+// coldDoor is a two-generation Bloom doorkeeper. A mark sets two bits in the
+// current half; a test passes when both bits are set in either half,
 // so a key stays a member for up to two windows. When the current half has taken
 // window marks, the other half is zeroed and becomes current, sliding the window
 // without a decay pass (the TinyLFU rotation). Owner-local, no atomics.
@@ -56,7 +54,7 @@ func newColdDoor(bits uint64) *coldDoor {
 	}
 }
 
-// pos derives the coldDoorHashes bit indices for a key fingerprint.
+// pos derives the two bit indices for a key fingerprint.
 func (d *coldDoor) pos(fp uint64) (uint64, uint64) {
 	return fp & d.mask, (fp * coldDoorGolden) & d.mask
 }
