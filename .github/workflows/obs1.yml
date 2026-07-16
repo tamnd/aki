@@ -145,7 +145,8 @@ jobs:
       - name: fuzz smoke
         run: |
           for target in FuzzParseHeader FuzzParseRoot FuzzParseWAL FuzzParseSegment \
-                        FuzzParseManifest FuzzParseChainBatch FuzzParseCheckpoint FuzzParseAny; do
+                        FuzzParseManifest FuzzParseChainBatch FuzzParseCheckpoint FuzzParseAny \
+                        FuzzDecodeOp; do
             go test ./engine/obs1 -run='^$' -fuzz="^${target}\$" -fuzztime=8s
           done
 
