@@ -23,9 +23,11 @@ const hashIterBatchSegs = 16
 // header down and stream the rest. Emitted bytes alias the current IO
 // round and die at the next Tiered call, so emit must consume them
 // before returning. An absent key is begin(0); another type is
-// ErrWrongType.
+// ErrWrongType. The read goes through stateOfLive: a due root reaps
+// first, so the count the header carries is exact live and the walk
+// below needs no expiry filter.
 func (h *Hash) HIterate(ctx context.Context, key []byte, begin func(count int), emit func(field, val []byte)) error {
-	st, hi, _, err := h.stateOf(ctx, key)
+	st, hi, _, err := h.stateOfLive(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -130,24 +132,31 @@ func (h *Hash) iterSegEntries(ctx context.Context, emit func(field, val []byte))
 // in, so the cut lands between segments and the resume point cannot
 // bisect a run of equal fh values. Inline hashes answer any cursor
 // with the whole set and a zero next cursor, the listpack behavior.
-// Emitted bytes die at the next Tiered call, like HIterate's.
+// Emitted bytes die at the next Tiered call, like HIterate's. A scan
+// step has no count contract, so it filters dead entries in the walk
+// instead of reaping first, keeping the step's cost at the segments
+// it touches.
 func (h *Hash) HScan(ctx context.Context, key []byte, cursor uint64, count int64, emit func(field, val []byte)) (uint64, error) {
 	st, hi, _, err := h.stateOf(ctx, key)
 	if err != nil {
 		return 0, err
 	}
+	now := h.t.Now()
 	switch st {
 	case hashAbsent:
 		return 0, nil
 	case hashInlineState:
 		it := hashEntryIter{p: hi.entries}
 		for {
-			f, v, _, ok, err := it.next()
+			f, v, eExp, ok, err := it.next()
 			if err != nil {
 				return 0, err
 			}
 			if !ok {
 				return 0, nil
+			}
+			if eExp != 0 && eExp <= now {
+				continue
 			}
 			emit(f, v)
 		}
@@ -181,7 +190,7 @@ func (h *Hash) HScan(ctx context.Context, key []byte, cursor uint64, count int64
 			}
 			it := hashEntryIter{p: seg.entries}
 			for {
-				f, v, _, ok, err := it.next()
+				f, v, eExp, ok, err := it.next()
 				if err != nil {
 					return 0, err
 				}
@@ -190,6 +199,13 @@ func (h *Hash) HScan(ctx context.Context, key []byte, cursor uint64, count int64
 				}
 				fh := hashFH(f)
 				if fh < cursor {
+					continue
+				}
+				if eExp != 0 && eExp <= now {
+					// A dead entry still advances the cursor: it was
+					// never observable, but its fh is real resume
+					// ground and skipping it forward loses nothing.
+					lastFH = fh
 					continue
 				}
 				emit(f, v)

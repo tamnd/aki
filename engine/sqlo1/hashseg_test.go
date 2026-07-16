@@ -154,7 +154,7 @@ func TestHashSegPointOps(t *testing.T) {
 			if next(4) == 0 {
 				expMs = int64(1000 + next(9000))
 			}
-			out, created, err := hashSegSet(scratch, s, hashFH(f), f, []byte(val), expMs)
+			out, created, _, err := hashSegSet(scratch, s, hashFH(f), f, []byte(val), expMs, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -165,7 +165,7 @@ func TestHashSegPointOps(t *testing.T) {
 			ref[field] = fv{val: val, expMs: expMs}
 			scratch, cur = cur, out
 		case 2:
-			out, removed, err := hashSegDel(scratch, s, hashFH(f), f)
+			out, removed, err := hashSegDel(scratch, s, hashFH(f), f, 0)
 			if err != nil {
 				t.Fatal(err)
 			}

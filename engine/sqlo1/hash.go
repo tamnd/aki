@@ -327,6 +327,22 @@ type Hash struct {
 	picked   map[uint64]struct{}
 	rvSlots  []rvSlot
 	rvArena  []byte
+
+	// ExpireHook, when set, fires after a write landed a hash root
+	// whose min_expire differs from the previous root's, with the new
+	// value (0 means no field TTLs remain, including the key dying).
+	// This is the doc 11 registration door: the expiry loop files the
+	// key into its wheel here, keyed by the root min, and Reap walks
+	// the due segments through ReapDue. key aliases the caller's
+	// argument and is only valid during the call.
+	ExpireHook func(key []byte, minExpMs int64)
+}
+
+// fireMin runs the registration hook on a root min_expire change.
+func (h *Hash) fireMin(key []byte, pre, post int64) {
+	if h.ExpireHook != nil && pre != post {
+		h.ExpireHook(key, post)
+	}
 }
 
 // NewHash builds the hash layer over t.
@@ -543,7 +559,9 @@ func (h *Hash) HSet(ctx context.Context, key, field, val []byte) (bool, error) {
 // is the field TTL the written entry ends up with, 0 for none. HSET
 // passes 0 (its clear-the-TTL rule), the INCR family passes the old
 // entry's expiry through (Redis preserves field TTLs across HINCRBY),
-// and HGETEX passes the new one.
+// and HGETEX passes the new one. Replacing an entry that already
+// expired answers created (the dead field was never observable) while
+// the count treats it as an update, since the dead entry was counted.
 func (h *Hash) hset(ctx context.Context, key, field, val []byte, entryExp int64) (bool, error) {
 	st, hi, expMs, err := h.stateOf(ctx, key)
 	if err != nil {
@@ -551,16 +569,26 @@ func (h *Hash) hset(ctx context.Context, key, field, val []byte, entryExp int64)
 	}
 	switch st {
 	case hashSegState:
-		return h.hsetSeg(ctx, key, field, val, expMs, entryExp)
+		pre := h.segRoot.minExpMs
+		created, err := h.hsetSeg(ctx, key, field, val, expMs, entryExp)
+		if err == nil {
+			h.fireMin(key, pre, h.segRoot.minExpMs)
+		}
+		return created, err
 	case hashAbsent:
 		h.rootBuf = appendHashInlineHdr(h.rootBuf[:0], 1, entryExp)
 		h.rootBuf = appendHashEntry(h.rootBuf, field, val, entryExp)
 		if len(h.rootBuf) > hashInlineMax {
-			return h.upgrade(ctx, key, h.rootBuf[hashInlineHdrLen:], true, expMs)
+			created, err := h.upgrade(ctx, key, h.rootBuf[hashInlineHdrLen:], true, expMs)
+			if err == nil {
+				h.fireMin(key, 0, h.segRoot.minExpMs)
+			}
+			return created, err
 		}
 		if err := h.t.Set(ctx, key, h.rootBuf, TagHash|TagRoot); err != nil {
 			return false, err
 		}
+		h.fireMin(key, 0, entryExp)
 		return true, h.restamp(ctx, key, expMs)
 	}
 	// Rebuild the payload around the one field. The region is walked
@@ -570,7 +598,9 @@ func (h *Hash) hset(ctx context.Context, key, field, val []byte, entryExp int64)
 	// known.
 	h.rootBuf = grow(h.rootBuf, hashInlineHdrLen)
 	it := hashEntryIter{p: hi.entries}
+	now := h.t.Now()
 	created := true
+	revived := false
 	minExp := int64(0)
 	for {
 		before := it.p
@@ -584,6 +614,7 @@ func (h *Hash) hset(ctx context.Context, key, field, val []byte, entryExp int64)
 		if bytes.Equal(f, field) {
 			h.rootBuf = appendHashEntry(h.rootBuf, field, val, entryExp)
 			created = false
+			revived = eExp != 0 && eExp <= now
 			continue
 		}
 		h.rootBuf = append(h.rootBuf, before[:len(before)-len(it.p)]...)
@@ -600,13 +631,18 @@ func (h *Hash) hset(ctx context.Context, key, field, val []byte, entryExp int64)
 		count++
 	}
 	if count > hashInlineMaxCount || len(h.rootBuf) > hashInlineMax {
-		return h.upgrade(ctx, key, h.rootBuf[hashInlineHdrLen:], created, expMs)
+		wire, err := h.upgrade(ctx, key, h.rootBuf[hashInlineHdrLen:], created || revived, expMs)
+		if err == nil {
+			h.fireMin(key, hi.minExpMs, h.segRoot.minExpMs)
+		}
+		return wire, err
 	}
 	putHashInlineHdr(h.rootBuf, count, minExp)
 	if err := h.t.Set(ctx, key, h.rootBuf, TagHash|TagRoot); err != nil {
 		return false, err
 	}
-	return created, h.restamp(ctx, key, expMs)
+	h.fireMin(key, hi.minExpMs, minExp)
+	return created || revived, h.restamp(ctx, key, expMs)
 }
 
 // upgrade moves a hash from the inline tier to segments. region is
@@ -705,7 +741,7 @@ func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs, entry
 	if err != nil {
 		return false, err
 	}
-	out, created, err := hashSegSet(h.segBuf, s, f, field, val, entryExp)
+	out, created, revived, err := hashSegSet(h.segBuf, s, f, field, val, entryExp, h.t.Now())
 	if err != nil {
 		return false, err
 	}
@@ -724,7 +760,7 @@ func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs, entry
 			return false, err
 		}
 		if mid, boundary, ok := splitHashSegEntries(h.ents, r.fence[i].lo); ok {
-			return h.splitSeg(ctx, key, i, mid, boundary, created, expMs)
+			return h.splitSeg(ctx, key, i, mid, boundary, created, revived, expMs)
 		}
 		// No legal cut (an fh-collision run): the segment stays
 		// oversized, which the codec allows.
@@ -737,7 +773,7 @@ func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs, entry
 		if meta == r.fence[i].meta && !minLowered {
 			// A pure update touches no root and no user-key header,
 			// so there is no expiry to restamp either.
-			return false, nil
+			return revived, nil
 		}
 		// A TTL edit moved the fence meta or the root min: skipping
 		// the root here would leave min_expire stale-late, so this
@@ -748,7 +784,7 @@ func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs, entry
 		if err := h.writeSegRoot(ctx, key, true); err != nil {
 			return false, err
 		}
-		return false, h.restamp(ctx, key, expMs)
+		return revived, h.restamp(ctx, key, expMs)
 	}
 	r.count++
 	if err := h.setFenceMeta(ctx, i, hashSegMeta(int(binary.LittleEndian.Uint16(out)), segMin)); err != nil {
@@ -801,7 +837,7 @@ func (h *Hash) setFenceMeta(ctx context.Context, i int, meta uint16) error {
 // writes a full (non-delta) root: they all mint from nextSegid, which
 // replay reconciliation can never patch, so the frame must be the
 // root's own.
-func (h *Hash) splitSeg(ctx context.Context, key []byte, i, mid int, boundary uint64, created bool, expMs int64) (bool, error) {
+func (h *Hash) splitSeg(ctx context.Context, key []byte, i, mid int, boundary uint64, created, revived bool, expMs int64) (bool, error) {
 	r := &h.segRoot
 	transition := !r.paged && len(r.fence) >= hashFenceMaxSegs
 	pageSplit := r.paged && len(r.fence) >= hashFencePageMax
@@ -908,7 +944,7 @@ func (h *Hash) splitSeg(ctx context.Context, key []byte, i, mid int, boundary ui
 	if err := h.writeSeg(ctx, survivor, h.segBuf2); err != nil {
 		return false, err
 	}
-	return created, h.restamp(ctx, key, expMs)
+	return created || revived, h.restamp(ctx, key, expMs)
 }
 
 // hdelSeg removes one field of a segmented hash. Every removal
@@ -927,7 +963,7 @@ func (h *Hash) hdelSeg(ctx context.Context, key, field []byte, expMs int64) (boo
 	if err != nil {
 		return false, err
 	}
-	out, removed, err := hashSegDel(h.segBuf, s, f, field)
+	out, removed, err := hashSegDel(h.segBuf, s, f, field, h.t.Now())
 	if err != nil {
 		return false, err
 	}
@@ -941,6 +977,9 @@ func (h *Hash) hdelSeg(ctx context.Context, key, field []byte, expMs int64) (boo
 		// the retired segments can never be misread.
 		h.t.Bump(key, r.rooth, r.rootgen+1)
 		_, err := h.t.Del(ctx, key)
+		if err == nil {
+			h.fireMin(key, r.minExpMs, 0)
+		}
 		return true, err
 	}
 	r.count--
@@ -1043,9 +1082,22 @@ func (h *Hash) HGet(ctx context.Context, key, field []byte) ([]byte, bool, error
 }
 
 // getEntry is HGet with the field TTL beside the value: the read half
-// of every point op that must preserve or edit an entry expiry. The
-// value aliases internal buffers and dies on the next Tiered call.
+// of every point op that must preserve or edit an entry expiry. An
+// entry past its expire_ms is absent (lazy expiry, doc 06 section 4);
+// the bytes stay in place for the reaper, but no read path returns
+// them. The value aliases internal buffers and dies on the next
+// Tiered call.
 func (h *Hash) getEntry(ctx context.Context, key, field []byte) ([]byte, int64, bool, error) {
+	v, eExp, ok, err := h.getEntryRaw(ctx, key, field)
+	if ok && eExp != 0 && eExp <= h.t.Now() {
+		return nil, 0, false, nil
+	}
+	return v, eExp, ok, err
+}
+
+// getEntryRaw is getEntry without the expiry filter: the reap and TTL
+// paths that must see a dead entry's bytes read through here.
+func (h *Hash) getEntryRaw(ctx context.Context, key, field []byte) ([]byte, int64, bool, error) {
 	st, hi, _, err := h.stateOf(ctx, key)
 	if err != nil {
 		return nil, 0, false, err
@@ -1077,8 +1129,10 @@ func (h *Hash) getEntry(ctx context.Context, key, field []byte) ([]byte, int64, 
 	}
 }
 
-// HDel removes one field and reports whether it was there. Deleting
-// the last field deletes the key, which is Redis's empty-hash rule.
+// HDel removes one field and reports whether it was there; a field
+// past its expiry was never there (lazy expiry), so it answers false
+// and stays for the reaper. Deleting the last field deletes the key,
+// which is Redis's empty-hash rule.
 func (h *Hash) HDel(ctx context.Context, key, field []byte) (bool, error) {
 	st, hi, expMs, err := h.stateOf(ctx, key)
 	if err != nil {
@@ -1092,6 +1146,7 @@ func (h *Hash) HDel(ctx context.Context, key, field []byte) (bool, error) {
 	}
 	h.rootBuf = grow(h.rootBuf, hashInlineHdrLen)
 	it := hashEntryIter{p: hi.entries}
+	now := h.t.Now()
 	found := false
 	minExp := int64(0)
 	for {
@@ -1103,7 +1158,7 @@ func (h *Hash) HDel(ctx context.Context, key, field []byte) (bool, error) {
 		if !ok {
 			break
 		}
-		if bytes.Equal(f, field) {
+		if bytes.Equal(f, field) && (eExp == 0 || eExp > now) {
 			found = true
 			continue
 		}
@@ -1117,12 +1172,16 @@ func (h *Hash) HDel(ctx context.Context, key, field []byte) (bool, error) {
 	}
 	if hi.count == 1 {
 		_, err := h.t.Del(ctx, key)
+		if err == nil {
+			h.fireMin(key, hi.minExpMs, 0)
+		}
 		return true, err
 	}
 	putHashInlineHdr(h.rootBuf, hi.count-1, minExp)
 	if err := h.t.Set(ctx, key, h.rootBuf, TagHash|TagRoot); err != nil {
 		return false, err
 	}
+	h.fireMin(key, hi.minExpMs, minExp)
 	return true, h.restamp(ctx, key, expMs)
 }
 
