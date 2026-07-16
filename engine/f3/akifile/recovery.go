@@ -1,5 +1,7 @@
 package akifile
 
+import "errors"
+
 // The recovery open sequence (spec 2064/f3/07 section 6, steps 3-4): read the
 // immutable prefix, pick the live meta root from the two slots, cross-check the
 // shard geometry, and classify the open into one of three outcomes. This is the
@@ -701,4 +703,57 @@ func ReadFreeMap(dev Device, prefix *Prefix, meta *MetaSlot) ([]FreeExtent, erro
 		return nil, err
 	}
 	return FreeExtents(payload, fh)
+}
+
+// errStopScan halts a ReplayTail walk early once a scan has found what it wants. It
+// is not a recovery failure: FindBarrier returns it from its visit to stop at the
+// matched barrier and unwraps it back to success.
+var errStopScan = errors.New("akifile: stop scan")
+
+// FindBarrier scans the append space for the snapshot barrier at watermark wbar and
+// returns its cut: the header, every shard's tail position, and the segment offset a
+// restore replays up to. A barrier has no meta pointer, it is a one-shot event in the
+// stream (spec 2064/f3/07 section 5), so a restore locates it by walking the stream
+// the way recovery does and matching the recorded Wbar. The walk reuses ReplayTail, so
+// it validates every segment's CRC and stops at the durable tail, never reading past a
+// torn segment.
+//
+// The barrier it returns is a genuine cut: the segment's own global_seq equals the
+// recorded Wbar (the writer assigns both in one append), and every shard seq is at or
+// below Wbar (BarrierConsistent). A barrier whose Wbar matches but fails either check
+// is ErrBarrier, a corrupt or forged cut a restore must refuse rather than replay. A
+// walk that reaches the tail with no matching barrier is ErrNoBarrier.
+func FindBarrier(dev Device, prefix *Prefix, from, size, wbar uint64) (BarrierHeader, []BarrierShard, uint64, error) {
+	var (
+		found  bool
+		hdr    BarrierHeader
+		shards []BarrierShard
+		at     uint64
+		bad    error
+	)
+	_, err := ReplayTail(dev, prefix, from, size, func(off uint64, h *SegHeader, payload []byte) error {
+		if h.Kind != KindBarrier {
+			return nil
+		}
+		bh, perr := ParseBarrierHeader(payload)
+		if perr != nil || bh.Wbar != wbar {
+			return nil // a torn or unrelated barrier; keep scanning for the target
+		}
+		rows, serr := BarrierShards(payload, bh)
+		if serr != nil || h.GlobalSeq != bh.Wbar || !BarrierConsistent(bh, rows) {
+			bad = ErrBarrier
+			return errStopScan
+		}
+		hdr, shards, at, found = bh, rows, off, true
+		return errStopScan
+	})
+	switch {
+	case bad != nil:
+		return BarrierHeader{}, nil, 0, bad
+	case err != nil && err != errStopScan:
+		return BarrierHeader{}, nil, 0, err
+	case !found:
+		return BarrierHeader{}, nil, 0, ErrNoBarrier
+	}
+	return hdr, shards, at, nil
 }
