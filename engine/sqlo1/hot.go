@@ -150,16 +150,32 @@ func (t *HotTable) Get(key []byte) ([]byte, bool) {
 // go cold. Only a key the table has never heard of leaves the question
 // open (definitive false), and that is the cold-miss door.
 func (t *HotTable) probeRead(key []byte) (val []byte, hit, definitive bool) {
+	val, _, hit, definitive = t.probeReadTag(key)
+	return val, hit, definitive
+}
+
+// probeReadTag is probeRead with the header's type tag alongside, the
+// hot half of Tiered.Lookup: the root bit in the tag is how the type
+// layer recognizes a promoted root payload.
+func (t *HotTable) probeReadTag(key []byte) (val []byte, tag uint8, hit, definitive bool) {
 	s, ok := t.lookup(maphash.Bytes(t.seed, key), key)
 	if !ok {
-		return nil, false, false
+		return nil, 0, false, false
 	}
 	hd := &t.hdrs[s]
 	if hd.valRef == 0 || t.expired(hd) {
-		return nil, false, true
+		return nil, 0, false, true
 	}
 	t.touchRead(hd)
-	return t.vals.data(hd.valRef), true, true
+	return t.vals.data(hd.valRef), hd.typeTag, true, true
+}
+
+// dirtyKey reports whether key currently sits dirty in the table, so
+// the type layer can see when a root still holds a drain-queue
+// position from an earlier write.
+func (t *HotTable) dirtyKey(key []byte) bool {
+	s, ok := t.lookup(maphash.Bytes(t.seed, key), key)
+	return ok && t.hdrs[s].state == stateDirty
 }
 
 // setExpire stamps the coarse expiry projection on key's header; at 0
@@ -189,6 +205,13 @@ func (t *HotTable) setExpire(key []byte, at uint32) (slot uint32, changed, ok bo
 // is longer than klen reaches; a failed Put changes nothing, not even a
 // stamp, so the caller can evict and retry.
 func (t *HotTable) Put(key, val []byte, tag uint8) bool {
+	return t.PutGen(key, val, tag, 0)
+}
+
+// PutGen is Put carrying the record generation for segment records;
+// the drain hands it to the store as Record.Gen. User records and
+// roots write gen 0 through Put.
+func (t *HotTable) PutGen(key, val []byte, tag uint8, gen uint32) bool {
 	if len(key) > maxKlen {
 		return false
 	}
@@ -235,6 +258,7 @@ func (t *HotTable) Put(key, val []byte, tag uint8) bool {
 		}
 		hd.state = stateDirty
 		hd.typeTag = tag
+		hd.gen = gen
 		t.touchWrite(hd)
 		t.enqueueDirty(s)
 		return true
@@ -247,6 +271,7 @@ func (t *HotTable) Put(key, val []byte, tag uint8) bool {
 	hd := &t.hdrs[s]
 	hd.state = stateDirty
 	hd.typeTag = tag
+	hd.gen = gen
 	if g, ok := t.ghosts.take(h); ok {
 		// The key was evicted recently enough for its ghost to survive:
 		// restore its stamps so the evictor sees its real history, not a
