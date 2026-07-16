@@ -34,7 +34,11 @@ func newHashRig(t *testing.T) *hashRig {
 	if err != nil {
 		t.Fatalf("NewStr: %v", err)
 	}
-	return &hashRig{t: t, rs: rs, tr: tr, h: NewHash(tr), s: s}
+	h, err := NewHash(tr, HashConfig{})
+	if err != nil {
+		t.Fatalf("NewHash: %v", err)
+	}
+	return &hashRig{t: t, rs: rs, tr: tr, h: h, s: s}
 }
 
 // reopen builds a fresh runtime over the same store, the cold view a
@@ -47,7 +51,11 @@ func (r *hashRig) reopen() *Hash {
 		Seed:     12,
 		NowMs:    func() int64 { return 1 << 41 },
 	})
-	return NewHash(tr)
+	h, err := NewHash(tr, HashConfig{})
+	if err != nil {
+		r.t.Fatalf("NewHash: %v", err)
+	}
+	return h
 }
 
 func (r *hashRig) hset(key, field, val string) bool {
@@ -256,26 +264,37 @@ func TestHashInlineThresholds(t *testing.T) {
 	r := newHashRig(t)
 	ctx := context.Background()
 
-	// Count threshold: 128 small fields fit, the 129th trips.
+	// Count threshold: 128 small fields stay inline, the 129th
+	// upgrades the hash to segments.
 	for i := range hashInlineMaxCount {
 		if !r.hset("counts", fmt.Sprintf("f%03d", i), "v") {
 			t.Fatalf("field %d not created", i)
 		}
 	}
-	if n, _ := r.h.HLen(ctx, []byte("counts")); n != hashInlineMaxCount {
-		t.Fatalf("HLEN = %d, want %d", n, hashInlineMaxCount)
+	if enc, _, _ := r.h.Encoding(ctx, []byte("counts")); enc != "listpack" {
+		t.Fatalf("encoding at the count ceiling = %q, want listpack", enc)
 	}
-	_, err := r.h.HSet(ctx, []byte("counts"), []byte("f-one-more"), []byte("v"))
-	if !errors.Is(err, errHashSegmented) {
-		t.Fatalf("field 129 = %v, want the segment sentinel", err)
-	}
-	// An update of an existing field still fits.
+	// An update of an existing field still fits inline.
 	if r.hset("counts", "f000", "v-bigger") {
 		t.Fatal("update at the count ceiling reported created")
+	}
+	if !r.hset("counts", "f-one-more", "v") {
+		t.Fatal("field 129 not created")
+	}
+	if enc, _, _ := r.h.Encoding(ctx, []byte("counts")); enc != "hashtable" {
+		t.Fatalf("encoding after the count upgrade = %q, want hashtable", enc)
+	}
+	if n, _ := r.h.HLen(ctx, []byte("counts")); n != hashInlineMaxCount+1 {
+		t.Fatalf("HLEN after the count upgrade = %d, want %d", n, hashInlineMaxCount+1)
+	}
+	if v, ok := r.hget("counts", "f000"); !ok || v != "v-bigger" {
+		t.Fatalf("f000 = %q, %v after the upgrade", v, ok)
 	}
 
 	// Size threshold, pinned to the byte: grow a two-field hash so the
 	// payload lands exactly on hashInlineMax, then push one byte over.
+	// The crossing write is an update, so it must report created=false
+	// through the upgrade.
 	pad := hashInlineMax - hashInlineHdrLen - 2*(hashEntryHdrLen+1) - 1
 	if !r.hset("sizes", "a", strings.Repeat("x", pad)) {
 		t.Fatal("padding field not created")
@@ -283,19 +302,31 @@ func TestHashInlineThresholds(t *testing.T) {
 	if !r.hset("sizes", "b", "1") {
 		t.Fatal("boundary field not created at exactly the cap")
 	}
-	_, err = r.h.HSet(ctx, []byte("sizes"), []byte("b"), []byte("22"))
-	if !errors.Is(err, errHashSegmented) {
-		t.Fatalf("one byte past the cap = %v, want the segment sentinel", err)
+	if enc, _, _ := r.h.Encoding(ctx, []byte("sizes")); enc != "listpack" {
+		t.Fatalf("encoding at exactly the cap = %q, want listpack", enc)
 	}
-	// The refused write left the hash intact.
-	if v, ok := r.hget("sizes", "b"); !ok || v != "1" {
-		t.Fatalf("b = %q, %v after the refused write", v, ok)
+	if r.hset("sizes", "b", "22") {
+		t.Fatal("size-crossing update reported created")
+	}
+	if enc, _, _ := r.h.Encoding(ctx, []byte("sizes")); enc != "hashtable" {
+		t.Fatalf("encoding after the size upgrade = %q, want hashtable", enc)
+	}
+	if v, ok := r.hget("sizes", "b"); !ok || v != "22" {
+		t.Fatalf("b = %q, %v after the size upgrade", v, ok)
+	}
+	if v, ok := r.hget("sizes", "a"); !ok || v != strings.Repeat("x", pad) {
+		t.Fatalf("padding field lost across the upgrade: ok=%v len=%d", ok, len(v))
 	}
 
 	// A fresh key with one oversized value skips inline entirely.
-	_, err = r.h.HSet(ctx, []byte("fresh"), []byte("f"), bytes.Repeat([]byte{'x'}, hashInlineMax))
-	if !errors.Is(err, errHashSegmented) {
-		t.Fatalf("oversized fresh field = %v, want the segment sentinel", err)
+	if !r.hset("fresh", "f", strings.Repeat("x", hashInlineMax)) {
+		t.Fatal("oversized fresh field not created")
+	}
+	if enc, _, _ := r.h.Encoding(ctx, []byte("fresh")); enc != "hashtable" {
+		t.Fatalf("fresh oversized encoding = %q, want hashtable", enc)
+	}
+	if n, _ := r.h.HLen(ctx, []byte("fresh")); n != 1 {
+		t.Fatalf("fresh oversized HLEN = %d, want 1", n)
 	}
 }
 
@@ -397,31 +428,12 @@ func TestHashEncoding(t *testing.T) {
 		t.Fatalf("inline encoding = %q, %v, want listpack", enc, ok)
 	}
 
-	// A segmented root (hand-built header; the layout lands with the
-	// segment slice, the sniffer only needs byte 0) answers hashtable,
-	// and the inline ops step aside for the segment slice.
-	seg := make([]byte, 48)
-	seg[0] = hashSubSeg
-	if err := r.tr.Set(ctx, []byte("wide"), seg, TagHash|TagRoot); err != nil {
-		t.Fatal(err)
+	// A real segmented hash answers hashtable.
+	if !r.hset("wide", "f", strings.Repeat("x", hashInlineMax)) {
+		t.Fatal("oversized field not created")
 	}
 	if enc, ok, _ := r.h.Encoding(ctx, []byte("wide")); !ok || enc != "hashtable" {
 		t.Fatalf("segmented encoding = %q, %v, want hashtable", enc, ok)
-	}
-	if _, err := r.h.HLen(ctx, []byte("wide")); !errors.Is(err, errHashSegmented) {
-		t.Fatalf("HLEN on a segmented root = %v, want the segment sentinel", err)
-	}
-	if _, err := r.h.HSet(ctx, []byte("wide"), []byte("f"), []byte("v")); !errors.Is(err, errHashSegmented) {
-		t.Fatalf("HSET on a segmented root = %v, want the segment sentinel", err)
-	}
-
-	// A segmented root has a plane, so the takeover doors wait for the
-	// generic retire.
-	if err := r.s.Set(ctx, []byte("wide"), []byte("x")); !errors.Is(err, errHashSegmented) {
-		t.Fatalf("SET over a segmented root = %v, want the segment sentinel", err)
-	}
-	if _, err := r.s.Del(ctx, []byte("wide")); !errors.Is(err, errHashSegmented) {
-		t.Fatalf("DEL of a segmented root = %v, want the segment sentinel", err)
 	}
 }
 

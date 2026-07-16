@@ -23,18 +23,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // ErrWrongType is the cross-type guard: an operation met a key holding
 // another type. It carries Redis's exact wire text (no ERR prefix), so
 // the command layer maps it verbatim.
 var ErrWrongType = errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")
-
-// errHashSegmented marks the paths the segment slice takes over: an
-// inline hash that outgrew its tier, or an op meeting an already
-// segmented root. Nothing user-visible can reach it until then; the
-// threshold tests pin exactly where it trips.
-var errHashSegmented = errors.New("sqlo1: hash outgrew the inline tier, segments land in the next slice")
 
 // Root payload sub values live in one global namespace across the
 // per-type docs, because the store seam's Record carries only the Root
@@ -259,21 +254,75 @@ func decodeHashInline(p []byte) (hashInline, error) {
 	return h, nil
 }
 
-// Hash is the hash ladder over one Tiered. The segment slices add the
-// minter dependency when the segmented rung arrives; the inline tier
-// mints nothing.
-type Hash struct {
-	t *Tiered
+// HashConfig sizes a Hash. Zero values take the defaults.
+type HashConfig struct {
+	// Shard namespaces the rooth mint, doc 03 section 6.3.
+	Shard uint16
+	// LeaseN is the mint lease size. Default defaultLeaseN.
+	LeaseN uint64
+}
 
-	// rootBuf builds the replacement inline payload; the old payload
-	// aliases an arena that the write recycles, so every rebuild
-	// finishes before the store call.
+// Hash is the hash ladder over one Tiered. Construction requires the
+// Minter capability, because segmented hashes cannot exist without
+// durable rooth leases.
+type Hash struct {
+	t    *Tiered
+	mint Minter
+	cfg  HashConfig
+
+	// The current mint lease: counters [leaseNext, leaseEnd) are ours.
+	leaseNext uint64
+	leaseEnd  uint64
+
+	// Reusable scratch. rootBuf builds replacement root payloads (the
+	// old payload aliases an arena the write recycles, so every
+	// rebuild finishes before the store call), segBuf and segBuf2 the
+	// segment images an op writes, kbuf and kbuf2 the segment subkeys,
+	// ents the parsed entries of a split or upgrade, fence the decoded
+	// fence of the root under operation.
 	rootBuf []byte
+	segBuf  []byte
+	segBuf2 []byte
+	kbuf    [SubkeySize]byte
+	kbuf2   [SubkeySize]byte
+	ents    []hashSegEntry
+	fence   []hashFenceEnt
+
+	// segRoot is the decoded root stateOf leaves behind at
+	// hashSegState; its fence rides the fence scratch. Valid until
+	// the next stateOf.
+	segRoot hashSegRoot
 }
 
 // NewHash builds the hash layer over t.
-func NewHash(t *Tiered) *Hash {
-	return &Hash{t: t}
+func NewHash(t *Tiered, cfg HashConfig) (*Hash, error) {
+	mint, ok := t.st.(Minter)
+	if !ok {
+		return nil, fmt.Errorf("sqlo1: store %T lacks the Minter capability the hash ladder needs", t.st)
+	}
+	if cfg.LeaseN == 0 {
+		cfg.LeaseN = defaultLeaseN
+	}
+	return &Hash{t: t, mint: mint, cfg: cfg}, nil
+}
+
+// nextRooth mints one rooth, taking a fresh durable lease when the
+// current one is spent.
+func (h *Hash) nextRooth(ctx context.Context) (uint64, error) {
+	if h.leaseNext == h.leaseEnd {
+		start, err := h.mint.MintLease(ctx, h.cfg.LeaseN)
+		if err != nil {
+			return 0, err
+		}
+		end, err := LeaseEnd(start, h.cfg.LeaseN)
+		if err != nil {
+			return 0, err
+		}
+		h.leaseNext, h.leaseEnd = start, end
+	}
+	c := h.leaseNext
+	h.leaseNext++
+	return MintRooth(h.cfg.Shard, c)
 }
 
 // restamp mirrors Str.restamp: puts a key's expiry back after a write
@@ -297,7 +346,10 @@ const (
 )
 
 // stateOf reads key and classifies it for the hash ops. The decoded
-// inline view aliases the read; it dies on the next Tiered call.
+// inline view aliases the read; it dies on the next Tiered call. At
+// hashSegState the decoded root lands in h.segRoot instead, which
+// does not alias the read (the fence is copied out on decode) and
+// stays valid across the segment reads the op does next.
 func (h *Hash) stateOf(ctx context.Context, key []byte) (hashState, hashInline, int64, error) {
 	v, root, expMs, ok, err := h.t.LookupEntry(ctx, key)
 	if err != nil || !ok {
@@ -314,6 +366,11 @@ func (h *Hash) stateOf(ctx context.Context, key []byte) (hashState, hashInline, 
 		return hashAbsent, hashInline{}, 0, ErrWrongType
 	}
 	if v[0] == hashSubSeg {
+		h.segRoot, err = decodeHashSegRoot(v, h.fence[:0])
+		if err != nil {
+			return hashAbsent, hashInline{}, 0, err
+		}
+		h.fence = h.segRoot.fence
 		return hashSegState, hashInline{}, expMs, nil
 	}
 	hi, err := decodeHashInline(v)
@@ -323,12 +380,38 @@ func (h *Hash) stateOf(ctx context.Context, key []byte) (hashState, hashInline, 
 	return hashInlineState, hi, expMs, nil
 }
 
+// readSeg reads the segment record at segid under the current root's
+// plane into a decoded view. The view aliases the read and dies on
+// the next Tiered call.
+func (h *Hash) readSeg(ctx context.Context, segid uint64) (hashSeg, error) {
+	putHashSegKey(h.kbuf[:], h.segRoot.rooth, segid)
+	v, ok, err := h.t.Get(ctx, h.kbuf[:])
+	if err != nil {
+		return hashSeg{}, err
+	}
+	if !ok {
+		return hashSeg{}, fmt.Errorf("sqlo1: hash segment %d of rooth %#x is missing", segid, h.segRoot.rooth)
+	}
+	return decodeHashSeg(v)
+}
+
+// writeSeg writes a segment image under the current root's plane.
+func (h *Hash) writeSeg(ctx context.Context, segid uint64, payload []byte) error {
+	putHashSegKey(h.kbuf[:], h.segRoot.rooth, segid)
+	return h.t.SetGen(ctx, h.kbuf[:], payload, TagHash, h.segRoot.rootgen)
+}
+
+// writeSegRoot encodes h.segRoot and lands it under key.
+func (h *Hash) writeSegRoot(ctx context.Context, key []byte) error {
+	h.rootBuf = appendHashSegRoot(h.rootBuf[:0], &h.segRoot)
+	return h.t.Set(ctx, key, h.rootBuf, TagHash|TagRoot)
+}
+
 // HSet writes one field and reports whether it was created (false for
 // an update of an existing field). An update keeps the field's
 // position, listpack-style, and clears any field TTL it carried, which
-// is Redis's HSET rule. The write that would push the hash past the
-// inline thresholds upgrades to segments; until that slice lands it
-// returns errHashSegmented.
+// is Redis's HSET rule. The write that pushes the hash past the
+// inline thresholds upgrades it to segments.
 func (h *Hash) HSet(ctx context.Context, key, field, val []byte) (bool, error) {
 	st, hi, expMs, err := h.stateOf(ctx, key)
 	if err != nil {
@@ -336,12 +419,12 @@ func (h *Hash) HSet(ctx context.Context, key, field, val []byte) (bool, error) {
 	}
 	switch st {
 	case hashSegState:
-		return false, errHashSegmented
+		return h.hsetSeg(ctx, key, field, val, expMs)
 	case hashAbsent:
 		h.rootBuf = appendHashInlineHdr(h.rootBuf[:0], 1, 0)
 		h.rootBuf = appendHashEntry(h.rootBuf, field, val, 0)
 		if len(h.rootBuf) > hashInlineMax {
-			return false, errHashSegmented
+			return h.upgrade(ctx, key, h.rootBuf[hashInlineHdrLen:], true, expMs)
 		}
 		if err := h.t.Set(ctx, key, h.rootBuf, TagHash|TagRoot); err != nil {
 			return false, err
@@ -382,13 +465,302 @@ func (h *Hash) HSet(ctx context.Context, key, field, val []byte) (bool, error) {
 		count++
 	}
 	if count > hashInlineMaxCount || len(h.rootBuf) > hashInlineMax {
-		return false, errHashSegmented
+		return h.upgrade(ctx, key, h.rootBuf[hashInlineHdrLen:], created, expMs)
 	}
 	putHashInlineHdr(h.rootBuf, count, minExp)
 	if err := h.t.Set(ctx, key, h.rootBuf, TagHash|TagRoot); err != nil {
 		return false, err
 	}
 	return created, h.restamp(ctx, key, expMs)
+}
+
+// upgrade moves a hash from the inline tier to segments. region is
+// the finished inline entry region already carrying the write that
+// crossed a threshold (it sits in h.rootBuf); created is that write's
+// answer and rides through unchanged. Entries are parsed, sorted into
+// segment order, packed into segments, and the plane lands before the
+// root that references it: every crash prefix reads the old inline
+// root over a plane nothing references yet, the setRope rule.
+func (h *Hash) upgrade(ctx context.Context, key []byte, region []byte, created bool, expMs int64) (bool, error) {
+	var err error
+	h.ents, err = parseHashSegEntries(h.ents[:0], region)
+	if err != nil {
+		return false, err
+	}
+	sortHashSegEntries(h.ents)
+
+	rooth, err := h.nextRooth(ctx)
+	if err != nil {
+		return false, err
+	}
+	h.segRoot = hashSegRoot{rootgen: 1, rooth: rooth, count: uint64(len(h.ents))}
+
+	// Pack sorted entries into segments up to seg_max, never cutting
+	// between equal fh values (the fence could not separate them).
+	// The upgrade image is barely past the inline cap so this is one
+	// segment in practice, but the packer is general. cuts[i] ends
+	// segment i.
+	cuts := make([]int, 0, 2)
+	size := hashSegHdrLen
+	start := 0
+	for i, e := range h.ents {
+		es := hashEntryHdrLen + len(e.field) + len(e.val)
+		if e.expMs != 0 {
+			es += 8
+		}
+		if i > start && size+es > hashSegMax && e.fh != h.ents[i-1].fh {
+			cuts = append(cuts, i)
+			start = i
+			size = hashSegHdrLen
+		}
+		size += es
+	}
+	cuts = append(cuts, len(h.ents))
+
+	h.fence = h.fence[:0]
+	minExp := int64(0)
+	start = 0
+	for _, end := range cuts {
+		seg := h.ents[start:end]
+		h.segBuf = appendHashSegPayload(h.segBuf, seg)
+		if err := h.writeSeg(ctx, h.segRoot.nextSegid, h.segBuf); err != nil {
+			return false, err
+		}
+		segMin := int64(binary.LittleEndian.Uint64(h.segBuf[4:]))
+		lo := uint64(0)
+		if len(h.fence) > 0 {
+			lo = seg[0].fh
+		}
+		h.fence = append(h.fence, hashFenceEnt{
+			lo:    lo,
+			segid: h.segRoot.nextSegid,
+			meta:  hashSegMeta(len(seg), segMin),
+		})
+		h.segRoot.nextSegid++
+		if segMin != 0 && (minExp == 0 || segMin < minExp) {
+			minExp = segMin
+		}
+		start = end
+	}
+	if err := h.t.Flush(ctx); err != nil {
+		return false, err
+	}
+	h.segRoot.minExpMs = minExp
+	h.segRoot.fence = h.fence
+	if err := h.writeSegRoot(ctx, key); err != nil {
+		return false, err
+	}
+	return created, h.restamp(ctx, key, expMs)
+}
+
+// hsetSeg writes one field of a segmented hash: the covering segment
+// rebuilds around the field, and the root is touched only when the
+// write changed the count (rule W1: cardinality change pins the
+// root), so the steady-state update costs one segment record. A
+// rebuild past seg_max splits.
+func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs int64) (bool, error) {
+	r := &h.segRoot
+	f := hashFH(field)
+	i := hashFenceFind(r.fence, f)
+	s, err := h.readSeg(ctx, r.fence[i].segid)
+	if err != nil {
+		return false, err
+	}
+	out, created, err := hashSegSet(h.segBuf, s, f, field, val, 0)
+	if err != nil {
+		return false, err
+	}
+	h.segBuf = out
+	if len(out) > hashSegMax {
+		h.ents, err = parseHashSegEntries(h.ents[:0], out[hashSegHdrLen:])
+		if err != nil {
+			return false, err
+		}
+		if mid, boundary, ok := splitHashSegEntries(h.ents, r.fence[i].lo); ok {
+			return h.splitSeg(ctx, key, i, mid, boundary, created, expMs)
+		}
+		// No legal cut (an fh-collision run): the segment stays
+		// oversized, which the codec allows.
+	}
+	if err := h.writeSeg(ctx, r.fence[i].segid, out); err != nil {
+		return false, err
+	}
+	if !created {
+		// A pure update touches no root and no user-key header, so
+		// there is no expiry to restamp either.
+		return false, nil
+	}
+	r.count++
+	r.fence[i].meta = hashSegMeta(int(binary.LittleEndian.Uint16(out)), int64(binary.LittleEndian.Uint64(out[4:])))
+	if err := h.writeSegRoot(ctx, key); err != nil {
+		return false, err
+	}
+	return true, h.restamp(ctx, key, expMs)
+}
+
+// splitSeg lands the split of fence entry i, whose post-write entries
+// sit parsed in h.ents (aliasing h.segBuf) with the cut at mid and
+// the new range starting at boundary. The order is the crash rule:
+// the new segment's image lands and flushes before the root that
+// references it, and the surviving segment's trimmed image lands
+// after the root, because until then its extra entries are dead bytes
+// the fence routes around (point reads go through the fence, so a
+// crash prefix never reads them; iteration range-filters when it
+// lands).
+func (h *Hash) splitSeg(ctx context.Context, key []byte, i, mid int, boundary uint64, created bool, expMs int64) (bool, error) {
+	r := &h.segRoot
+	if len(r.fence) >= hashFenceMaxSegs {
+		return false, errHashFencePaged
+	}
+	if r.nextSegid > hashFenceSegidMax {
+		return false, fmt.Errorf("sqlo1: hash segid space of rooth %#x is spent", r.rooth)
+	}
+	segMin := func(ents []hashSegEntry) int64 {
+		m := int64(0)
+		for _, e := range ents {
+			if e.expMs != 0 && (m == 0 || e.expMs < m) {
+				m = e.expMs
+			}
+		}
+		return m
+	}
+
+	newSegid := r.nextSegid
+	h.segBuf2 = appendHashSegPayload(h.segBuf2, h.ents[mid:])
+	if err := h.writeSeg(ctx, newSegid, h.segBuf2); err != nil {
+		return false, err
+	}
+	if err := h.t.Flush(ctx); err != nil {
+		return false, err
+	}
+
+	r.nextSegid++
+	if created {
+		r.count++
+	}
+	r.fence[i].meta = hashSegMeta(mid, segMin(h.ents[:mid]))
+	r.fence = slices.Insert(r.fence, i+1, hashFenceEnt{
+		lo:    boundary,
+		segid: newSegid,
+		meta:  hashSegMeta(len(h.ents)-mid, segMin(h.ents[mid:])),
+	})
+	h.fence = r.fence
+	if err := h.writeSegRoot(ctx, key); err != nil {
+		return false, err
+	}
+
+	h.segBuf2 = appendHashSegPayload(h.segBuf2[:0], h.ents[:mid])
+	if err := h.writeSeg(ctx, r.fence[i].segid, h.segBuf2); err != nil {
+		return false, err
+	}
+	return created, h.restamp(ctx, key, expMs)
+}
+
+// hdelSeg removes one field of a segmented hash. Every removal
+// changes the count, so the root is always written (rule W1); the
+// removal that empties the whole hash deletes the key and retires the
+// plane in O(1), exactly like a cross-type overwrite. A removal that
+// shrinks the segment enough tries the lazy merge with a neighbor.
+func (h *Hash) hdelSeg(ctx context.Context, key, field []byte, expMs int64) (bool, error) {
+	r := &h.segRoot
+	f := hashFH(field)
+	i := hashFenceFind(r.fence, f)
+	s, err := h.readSeg(ctx, r.fence[i].segid)
+	if err != nil {
+		return false, err
+	}
+	out, removed, err := hashSegDel(h.segBuf, s, f, field)
+	if err != nil {
+		return false, err
+	}
+	if !removed {
+		return false, nil
+	}
+	h.segBuf = out
+	if r.count == 1 {
+		// Last field: the key dies and the plane retires whole, doc 06
+		// section 3. A recreate starts inline under a fresh rootgen, so
+		// the retired segments can never be misread.
+		h.t.Bump(key, r.rooth, r.rootgen+1)
+		_, err := h.t.Del(ctx, key)
+		return true, err
+	}
+	r.count--
+	merged, err := h.tryMergeSeg(ctx, key, i, out)
+	if err != nil {
+		return false, err
+	}
+	if merged {
+		return true, h.restamp(ctx, key, expMs)
+	}
+	if err := h.writeSeg(ctx, r.fence[i].segid, out); err != nil {
+		return false, err
+	}
+	r.fence[i].meta = hashSegMeta(int(binary.LittleEndian.Uint16(out)), int64(binary.LittleEndian.Uint64(out[4:])))
+	if err := h.writeSegRoot(ctx, key); err != nil {
+		return false, err
+	}
+	return true, h.restamp(ctx, key, expMs)
+}
+
+// tryMergeSeg is the lazy merge, doc 06 section 2.1: segment i just
+// shrank (its unwritten post-image is out, aliasing h.segBuf), and if
+// the merged encoding with a neighbor stays under seg_min the two
+// fold into the lower side's segment. The crash order needs no
+// barrier: merged image to the low subkey first (a crash here leaves
+// entries past the low entry's fence range, dead bytes point reads
+// route around), then the root that drops the high entry, then the
+// high subkey's delete (a crash before it leaves a bounded orphan the
+// plane retire cleans).
+func (h *Hash) tryMergeSeg(ctx context.Context, key []byte, i int, out []byte) (bool, error) {
+	r := &h.segRoot
+	try := func(lo, hi int) (bool, error) {
+		if lo < 0 || hi >= len(r.fence) {
+			return false, nil
+		}
+		other := lo
+		if other == i {
+			other = hi
+		}
+		putHashSegKey(h.kbuf2[:], r.rooth, r.fence[other].segid)
+		nb, ok, err := h.t.Get(ctx, h.kbuf2[:])
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, fmt.Errorf("sqlo1: hash segment %d of rooth %#x is missing", r.fence[other].segid, r.rooth)
+		}
+		if !shouldMergeHashSegs(len(out), len(nb)) {
+			return false, nil
+		}
+		lop, hip := out, nb
+		if other == lo {
+			lop, hip = nb, out
+		}
+		h.segBuf2, err = mergeHashSegs(h.segBuf2, lop, hip)
+		if err != nil {
+			return false, err
+		}
+		if err := h.writeSeg(ctx, r.fence[lo].segid, h.segBuf2); err != nil {
+			return false, err
+		}
+		hiSegid := r.fence[hi].segid
+		r.fence[lo].meta = hashSegMeta(int(binary.LittleEndian.Uint16(h.segBuf2)), int64(binary.LittleEndian.Uint64(h.segBuf2[4:])))
+		r.fence = append(r.fence[:hi], r.fence[hi+1:]...)
+		h.fence = r.fence
+		if err := h.writeSegRoot(ctx, key); err != nil {
+			return false, err
+		}
+		putHashSegKey(h.kbuf2[:], r.rooth, hiSegid)
+		if _, err := h.t.Del(ctx, h.kbuf2[:]); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if done, err := try(i, i+1); done || err != nil {
+		return done, err
+	}
+	return try(i-1, i)
 }
 
 // HGet reads one field. The returned bytes alias internal buffers and
@@ -402,7 +774,13 @@ func (h *Hash) HGet(ctx context.Context, key, field []byte) ([]byte, bool, error
 	case hashAbsent:
 		return nil, false, nil
 	case hashSegState:
-		return nil, false, errHashSegmented
+		f := hashFH(field)
+		s, err := h.readSeg(ctx, h.segRoot.fence[hashFenceFind(h.segRoot.fence, f)].segid)
+		if err != nil {
+			return nil, false, err
+		}
+		v, _, ok, err := hashSegGet(s, f, field)
+		return v, ok, err
 	}
 	it := hashEntryIter{p: hi.entries}
 	for {
@@ -427,7 +805,7 @@ func (h *Hash) HDel(ctx context.Context, key, field []byte) (bool, error) {
 	case hashAbsent:
 		return false, nil
 	case hashSegState:
-		return false, errHashSegmented
+		return h.hdelSeg(ctx, key, field, expMs)
 	}
 	h.rootBuf = grow(h.rootBuf, hashInlineHdrLen)
 	it := hashEntryIter{p: hi.entries}
@@ -477,7 +855,7 @@ func (h *Hash) HLen(ctx context.Context, key []byte) (int64, error) {
 	case hashAbsent:
 		return 0, nil
 	case hashSegState:
-		return 0, errHashSegmented
+		return int64(h.segRoot.count), nil
 	}
 	return int64(hi.count), nil
 }
