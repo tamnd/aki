@@ -235,7 +235,7 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return storeErr(reply, err)
 		}
 		return AppendInt(reply, n)
-	case "SUBSTR":
+	case "SUBSTR", "GETRANGE":
 		if len(args) != 4 {
 			return arityErr(reply, cmd)
 		}
@@ -249,6 +249,31 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return storeErr(reply, err)
 		}
 		return AppendBulk(reply, v)
+	case "APPEND":
+		if len(args) != 3 {
+			return arityErr(reply, cmd)
+		}
+		n, err := s.s.Append(ctx, args[1], args[2])
+		if err != nil {
+			return strSizeErr(reply, err)
+		}
+		return AppendInt(reply, n)
+	case "SETRANGE":
+		if len(args) != 4 {
+			return arityErr(reply, cmd)
+		}
+		off, err := strconv.ParseInt(string(args[2]), 10, 64)
+		if err != nil {
+			return AppendError(reply, "ERR value is not an integer or out of range")
+		}
+		if off < 0 {
+			return AppendError(reply, "ERR offset is out of range")
+		}
+		n, err := s.s.SetRange(ctx, args[1], off, args[3])
+		if err != nil {
+			return strSizeErr(reply, err)
+		}
+		return AppendInt(reply, n)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
@@ -552,4 +577,13 @@ func invalidExpire(reply []byte, cmd string) []byte {
 
 func storeErr(reply []byte, err error) []byte {
 	return AppendError(reply, "ERR "+err.Error())
+}
+
+// strSizeErr maps the ladder's value cap onto Redis's wording for the
+// growing string commands (APPEND, SETRANGE).
+func strSizeErr(reply []byte, err error) []byte {
+	if errors.Is(err, ErrValueTooLong) {
+		return AppendError(reply, "ERR string exceeds maximum allowed size (proto-max-bulk-len)")
+	}
+	return storeErr(reply, err)
 }

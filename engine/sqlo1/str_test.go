@@ -598,3 +598,153 @@ func TestTieredLookupAndSetGen(t *testing.T) {
 		t.Errorf("cold Lookup(missing): ok=%v err=%v, want false nil", ok, err)
 	}
 }
+
+// oracleSetRange is the eager reference: zero-extend, overlay.
+func oracleSetRange(o []byte, off int, patch []byte) []byte {
+	if end := off + len(patch); end > len(o) {
+		o = append(o, make([]byte, end-len(o))...)
+	}
+	copy(o[off:], patch)
+	return o
+}
+
+// TestStrSetRangeOracle walks one key through every SetRange shape the
+// ladder has: create, overwrite, grow inside plain, the sparse write
+// that crosses the rope boundary, blind interior chunks, partial-chunk
+// merges, a merge against an absent gap chunk, tail growth, and far
+// growth, each checked against the eager oracle.
+func TestStrSetRangeOracle(t *testing.T) {
+	r := newStrRig(t)
+	ctx := context.Background()
+	key := []byte("k")
+
+	var want []byte
+	seed := byte(0)
+	apply := func(off, n int) {
+		t.Helper()
+		seed++
+		p := pat(n, seed)
+		got, err := r.s.SetRange(ctx, key, int64(off), p)
+		if err != nil {
+			t.Fatalf("SetRange(%d, %d bytes): %v", off, n, err)
+		}
+		want = oracleSetRange(want, off, p)
+		if got != int64(len(want)) {
+			t.Fatalf("SetRange(%d, %d bytes) = %d, want %d", off, n, got, len(want))
+		}
+		r.want(r.s, "k", want)
+		sl, _, err := r.s.Strlen(ctx, key)
+		if err != nil || sl != int64(len(want)) {
+			t.Fatalf("Strlen = %d, %v, want %d", sl, err, len(want))
+		}
+	}
+
+	apply(3, 3)      // create plain: zeros then patch
+	apply(0, 2)      // overwrite the head
+	apply(4090, 20)  // grow inside plain
+	apply(8100, 200) // sparse cross of the rope boundary, gap chunks absent
+	if _, isRope := func() (ropeRoot, bool) { r.flush(); return r.storedRoot("k") }(); !isRope {
+		t.Fatal("boundary cross did not store a rope")
+	}
+	apply(2048, 2048) // blind interior chunks
+	apply(1500, 100)  // partial merge inside one chunk
+	apply(5500, 100)  // merge against an absent gap chunk
+	apply(1030, 10)   // partial with first chunk == last chunk
+	apply(8250, 2000) // grow across the old tail
+	apply(20000, 50)  // far grow, a fresh gap
+	apply(0, 1024)    // blind write of exactly the first chunk
+
+	// An empty patch reports the length and writes nothing.
+	if n, err := r.s.SetRange(ctx, key, 1<<30, nil); err != nil || n != int64(len(want)) {
+		t.Fatalf("empty patch = %d, %v, want %d", n, err, len(want))
+	}
+	r.want(r.s, "k", want)
+
+	// Cold pass: a fresh tier over the drained store sees the same
+	// bytes, and cold RMW paths keep matching the oracle.
+	r.flush()
+	s2 := r.reopen()
+	r.want(s2, "k", want)
+	for _, op := range [][2]int{{1025, 200}, {12000, 100}, {30000, 30}} {
+		seed++
+		p := pat(op[1], seed)
+		if _, err := s2.SetRange(ctx, key, int64(op[0]), p); err != nil {
+			t.Fatalf("cold SetRange(%d): %v", op[0], err)
+		}
+		want = oracleSetRange(want, op[0], p)
+		r.want(s2, "k", want)
+	}
+}
+
+// TestStrSetRangeLazyChunks pins S-I1 for the range surface: a far
+// offset on a missing key creates only the chunks the patch
+// addresses, never the gap's.
+func TestStrSetRangeLazyChunks(t *testing.T) {
+	r := newStrRig(t)
+	ctx := context.Background()
+
+	n, err := r.s.SetRange(ctx, []byte("far"), 100<<10, pat(500, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantLen := int64(100<<10 + 500); n != wantLen {
+		t.Fatalf("length = %d, want %d", n, wantLen)
+	}
+	r.flush()
+	// 100 KiB of gap at 1 KiB chunks would be 100 eager chunks; the
+	// lazy plane writes exactly the one chunk the patch lands in.
+	if r.rs.chunkPuts != 1 || r.rs.rootPuts != 1 {
+		t.Fatalf("drained %d chunk puts and %d root puts, want 1 and 1", r.rs.chunkPuts, r.rs.rootPuts)
+	}
+	root, ok := r.storedRoot("far")
+	if !ok {
+		t.Fatal("far write did not store a rope")
+	}
+	if root.totalLen != 100<<10+500 || root.chunkCount != 101 {
+		t.Fatalf("root = %d bytes over %d chunks, want %d over 101", root.totalLen, root.chunkCount, 100<<10+500)
+	}
+	want := oracleSetRange(nil, 100<<10, pat(500, 3))
+	r.want(r.reopen(), "far", want)
+}
+
+// TestStrRangeWritesKeepTTL pins the restamp rule: Append and SetRange
+// on a cold, unpromoted key keep its expiry. PutGen only preserves the
+// stamp when the key already sits hot; without the restamp, the fresh
+// header these writes create would drain with expire_ms zero and the
+// TTL would silently die.
+func TestStrRangeWritesKeepTTL(t *testing.T) {
+	r := newStrRig(t)
+	ctx := context.Background()
+	at := int64(1<<41) + 60_000 // rig clock is a constant 1<<41
+
+	r.set("p", pat(64, 1))
+	r.set("r", pat(16<<10, 2))
+	for _, k := range []string{"p", "r"} {
+		if _, err := r.s.ExpireAt(ctx, []byte(k), at); err != nil {
+			t.Fatalf("ExpireAt(%q): %v", k, err)
+		}
+	}
+	r.flush()
+
+	// A fresh tier reads everything cold, and PromoteP -1 means the
+	// lookups inside Append and SetRange never promote.
+	s2 := r.reopen()
+	if _, err := s2.Append(ctx, []byte("p"), []byte("tail")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s2.SetRange(ctx, []byte("r"), 17<<10, pat(100, 3)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.t.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"p", "r"} {
+		rec, err := r.rs.MemStore.Get(ctx, []byte(k))
+		if err != nil {
+			t.Fatalf("store Get(%q): %v", k, err)
+		}
+		if rec.ExpireMs != at {
+			t.Fatalf("%q drained with expire_ms %d, want %d", k, rec.ExpireMs, at)
+		}
+	}
+}

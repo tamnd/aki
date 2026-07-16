@@ -126,23 +126,25 @@ func (s *Str) needsRope(key []byte, valLen int) bool {
 }
 
 // strMeta is what Set, Del, and Append need to know about a key's
-// current representation: whether it exists, and if it is a rope, the
-// decoded root (copied out of the aliased read before the next call).
+// current representation: whether it exists, its exact expire_ms (0
+// for none), and if it is a rope, the decoded root (copied out of the
+// aliased read before the next call).
 type strMeta struct {
 	exists bool
 	rope   bool
+	expMs  int64
 	root   ropeRoot
 }
 
 // metaOf reads key's representation. The value bytes it looked at are
 // dead after the next Tiered call; only the decoded struct survives.
 func (s *Str) metaOf(ctx context.Context, key []byte) (strMeta, error) {
-	v, root, ok, err := s.t.Lookup(ctx, key)
+	v, root, expMs, ok, err := s.t.LookupEntry(ctx, key)
 	if err != nil || !ok {
 		return strMeta{}, err
 	}
 	if !root {
-		return strMeta{exists: true}, nil
+		return strMeta{exists: true, expMs: expMs}, nil
 	}
 	// The only root payload a string key can hold in T1 is a rope;
 	// cross-type overwrites learn to sniff the shared root header
@@ -161,7 +163,23 @@ func (s *Str) retire(key []byte, r ropeRoot) {
 	s.t.Bump(key, r.rooth, r.rootgen+1)
 }
 
-// Set writes key's full value through the ladder.
+// restamp puts a key's expiry back after a write that may have gone
+// through a fresh hot header. PutGen preserves a live key's expiry
+// only when the key already sits hot; a rewrite of a cold key starts
+// from a clean header, and without this the TTL would silently die
+// when that header drains. When the hot path did preserve the stamp
+// this is a no-change setExpireMs, which costs nothing.
+func (s *Str) restamp(ctx context.Context, key []byte, expMs int64) error {
+	if expMs == 0 {
+		return nil
+	}
+	_, err := s.t.ExpireAt(ctx, key, expMs)
+	return err
+}
+
+// Set writes key's full value through the ladder. A live key's expiry
+// survives, like every non-SET write path; the command layer owns
+// SET's discard-the-TTL rule.
 func (s *Str) Set(ctx context.Context, key, val []byte) error {
 	if len(val) > MaxValueLen {
 		return ErrValueTooLong
@@ -174,9 +192,15 @@ func (s *Str) Set(ctx context.Context, key, val []byte) error {
 		if m.rope {
 			s.retire(key, m.root)
 		}
-		return s.t.Set(ctx, key, val, TagString)
+		if err := s.t.Set(ctx, key, val, TagString); err != nil {
+			return err
+		}
+		return s.restamp(ctx, key, m.expMs)
 	}
-	return s.setRope(ctx, key, val, m)
+	if err := s.setRope(ctx, key, val, m); err != nil {
+		return err
+	}
+	return s.restamp(ctx, key, m.expMs)
 }
 
 // setRope writes val as a fresh rope plane and lands the root last.
@@ -432,7 +456,7 @@ func (s *Str) Del(ctx context.Context, key []byte) (bool, error) {
 // new chunks the suffix fills, and the root. A missing key appends to
 // the empty string, per Redis.
 func (s *Str) Append(ctx context.Context, key, suffix []byte) (int64, error) {
-	v, root, ok, err := s.t.Lookup(ctx, key)
+	v, root, expMs, ok, err := s.t.LookupEntry(ctx, key)
 	if err != nil {
 		return 0, err
 	}
@@ -451,15 +475,208 @@ func (s *Str) Append(ctx context.Context, key, suffix []byte) (int64, error) {
 		// write can recycle it.
 		s.val = append(append(s.val[:0], v...), suffix...)
 		if !s.needsRope(key, newLen) {
-			return int64(newLen), s.t.Set(ctx, key, s.val, TagString)
+			if err := s.t.Set(ctx, key, s.val, TagString); err != nil {
+				return 0, err
+			}
+		} else if err := s.setRope(ctx, key, s.val, strMeta{}); err != nil {
+			return 0, err
 		}
-		return int64(newLen), s.setRope(ctx, key, s.val, strMeta{})
+		return int64(newLen), s.restamp(ctx, key, expMs)
 	}
 	r, err := decodeRopeRoot(v)
 	if err != nil {
 		return 0, err
 	}
-	return s.appendRope(ctx, key, r, suffix)
+	n, err := s.appendRope(ctx, key, r, suffix)
+	if err != nil {
+		return 0, err
+	}
+	return n, s.restamp(ctx, key, expMs)
+}
+
+// SetRange overlays patch at byte offset off, growing the value when
+// the patch reaches past its end, and returns the new length. The gap
+// a far offset opens between the old length and off reads as zeros;
+// on the rope rung the zeros are lazy, meaning only the chunks the
+// patch addresses are written and the gap's chunks never exist
+// (S-I1), which is what keeps a far-offset SETRANGE O(patch) instead
+// of O(offset). An empty patch reports the current length and writes
+// nothing, per Redis, so a missing key stays missing. The caller
+// guarantees off is non-negative.
+func (s *Str) SetRange(ctx context.Context, key []byte, off int64, patch []byte) (int64, error) {
+	if len(patch) == 0 {
+		n, _, err := s.Strlen(ctx, key)
+		return n, err
+	}
+	if off > MaxValueLen || off+int64(len(patch)) > MaxValueLen {
+		return 0, ErrValueTooLong
+	}
+	end := off + int64(len(patch))
+	v, root, expMs, ok, err := s.t.LookupEntry(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	if ok && root {
+		r, err := decodeRopeRoot(v)
+		if err != nil {
+			return 0, err
+		}
+		n, err := s.setRangeRope(ctx, key, r, uint64(off), patch)
+		if err != nil {
+			return 0, err
+		}
+		return n, s.restamp(ctx, key, expMs)
+	}
+	var old []byte
+	if ok {
+		old = v
+	}
+	newLen := max(end, int64(len(old)))
+	if !s.needsRope(key, int(newLen)) {
+		// One record either way: the image is the old value zero-extended
+		// to off with the patch on top. old aliases the arena, so the
+		// image is built before the write can recycle it.
+		s.val = grow(s.val, int(newLen))
+		n := copy(s.val, old)
+		clear(s.val[n:])
+		copy(s.val[off:], patch)
+		if err := s.t.Set(ctx, key, s.val, TagString); err != nil {
+			return 0, err
+		}
+		return newLen, s.restamp(ctx, key, expMs)
+	}
+	// The result crosses the rope boundary from a plain or missing key.
+	// old still aliases the arena and setRangeFresh writes chunks, so it
+	// moves to owned bytes first; it is bounded by the boundary itself.
+	s.val = append(s.val[:0], old...)
+	if err := s.setRangeFresh(ctx, key, s.val, uint64(off), patch); err != nil {
+		return 0, err
+	}
+	return newLen, s.restamp(ctx, key, expMs)
+}
+
+// setRangeFresh builds the rope plane for a SETRANGE whose result
+// crosses the boundary from a plain or missing key: chunks for the
+// old bytes, chunks for the patch window, one merged chunk where the
+// two meet, and nothing at all for the gap a far offset opens. The
+// plane lands like setRope: chunks first, flush barrier, root last.
+func (s *Str) setRangeFresh(ctx context.Context, key, old []byte, off uint64, patch []byte) error {
+	rooth, err := s.nextRooth(ctx)
+	if err != nil {
+		return err
+	}
+	cs := uint64(1) << s.cfg.Log2Chunk
+	end := off + uint64(len(patch))
+	newLen := max(end, uint64(len(old)))
+	write := func(c uint64) error {
+		cstart := c * cs
+		l := uint64(0)
+		if uint64(len(old)) > cstart {
+			l = min(uint64(len(old))-cstart, cs)
+		}
+		if po, pe := max(off, cstart), min(end, cstart+cs); pe > po {
+			l = max(l, pe-cstart)
+		}
+		s.chunkScratch = grow(s.chunkScratch, int(l))
+		clear(s.chunkScratch)
+		if uint64(len(old)) > cstart {
+			copy(s.chunkScratch, old[cstart:min(uint64(len(old)), cstart+cs)])
+		}
+		if po, pe := max(off, cstart), min(end, cstart+cs); pe > po {
+			copy(s.chunkScratch[po-cstart:], patch[po-off:pe-off])
+		}
+		putChunkKey(s.kbuf[:], rooth, c)
+		return s.t.SetGen(ctx, s.kbuf[:], s.chunkScratch, TagString, 1)
+	}
+	oldChunks := (uint64(len(old)) + cs - 1) / cs
+	for c := range oldChunks {
+		if err := write(c); err != nil {
+			return err
+		}
+	}
+	for c := max(off/cs, oldChunks); c < (end+cs-1)/cs; c++ {
+		if err := write(c); err != nil {
+			return err
+		}
+	}
+	if err := s.t.Flush(ctx); err != nil {
+		return err
+	}
+	s.rootBuf = appendRopeRoot(s.rootBuf[:0], ropeRoot{
+		log2chunk:  s.cfg.Log2Chunk,
+		rootgen:    1,
+		rooth:      rooth,
+		totalLen:   newLen,
+		chunkCount: (newLen + cs - 1) >> s.cfg.Log2Chunk,
+	})
+	return s.t.Set(ctx, key, s.rootBuf, TagString|TagRoot)
+}
+
+// setRangeRope patches [off, off+len(patch)) of an existing rope in
+// place: the boundary chunks read-modify-write, interior chunks write
+// blind, chunks past the old tail come into being holding only their
+// covered bytes, and the root is rewritten only when the patch grows
+// the value. In-place writes are what keep SETRANGE O(patch) at any
+// offset, at the cost that a crash mid-patch can leave a torn window
+// inside the old length; the WAL command fencing of doc 05 section 5
+// is where that atomicity story lands, the same note appendRope
+// carries.
+func (s *Str) setRangeRope(ctx context.Context, key []byte, r ropeRoot, off uint64, patch []byte) (int64, error) {
+	end := off + uint64(len(patch))
+	newLen := max(end, r.totalLen)
+	if newLen > r.totalLen && s.t.ht.dirtyKey(key) {
+		// Same guard as appendRope: a dirty root holds a drain-queue
+		// position ahead of the chunks written below, and a batch split
+		// there would commit the new length before its bytes.
+		if err := s.t.Flush(ctx); err != nil {
+			return 0, err
+		}
+	}
+	cs := r.chunkSize()
+	for c := off >> r.log2chunk; c < ((end-1)>>r.log2chunk)+1; c++ {
+		cstart := c << r.log2chunk
+		po, pe := max(off, cstart), min(end, cstart+cs)
+		putChunkKey(s.kbuf[:], r.rooth, c)
+		if po == cstart && pe == cstart+cs {
+			if err := s.t.SetGen(ctx, s.kbuf[:], patch[po-off:pe-off], TagString, r.rootgen); err != nil {
+				return 0, err
+			}
+			continue
+		}
+		// Partial coverage: merge over the stored chunk, which may be
+		// short or absent. The merged length keeps every stored byte
+		// and reaches the patch's end; zeros between the stored length
+		// and the patch start become explicit, zeros beyond stay lazy.
+		s.chunkKeys = append(s.chunkKeys[:0], s.kbuf[:])
+		out, err := s.t.BatchGet(ctx, s.chunkKeys, s.chunkVals)
+		s.chunkVals = out[:0]
+		if err != nil {
+			return 0, err
+		}
+		cv := out[0]
+		if uint64(len(cv)) > cs {
+			return 0, fmt.Errorf("sqlo1: rope chunk %d holds %d bytes, chunk size %d", c, len(cv), cs)
+		}
+		l := max(uint64(len(cv)), pe-cstart)
+		s.chunkScratch = grow(s.chunkScratch, int(l))
+		n := copy(s.chunkScratch, cv)
+		clear(s.chunkScratch[n:])
+		copy(s.chunkScratch[po-cstart:], patch[po-off:pe-off])
+		putChunkKey(s.kbuf[:], r.rooth, c)
+		if err := s.t.SetGen(ctx, s.kbuf[:], s.chunkScratch, TagString, r.rootgen); err != nil {
+			return 0, err
+		}
+	}
+	if newLen == r.totalLen {
+		return int64(newLen), nil
+	}
+	r.totalLen = newLen
+	r.chunkCount = (newLen + cs - 1) >> r.log2chunk
+	s.rootBuf = appendRopeRoot(s.rootBuf[:0], r)
+	if err := s.t.Set(ctx, key, s.rootBuf, TagString|TagRoot); err != nil {
+		return 0, err
+	}
+	return int64(newLen), nil
 }
 
 // appendRope grows an existing rope in place: fill the tail chunk,

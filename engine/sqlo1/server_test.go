@@ -491,3 +491,140 @@ func TestServerRopePointSurface(t *testing.T) {
 func intArg(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
+
+// TestServerRangeSurface covers APPEND, SETRANGE, and GETRANGE through
+// dispatch, including the TTL survival rule for the growing writes.
+func TestServerRangeSurface(t *testing.T) {
+	do, _ := dispatchServer(t)
+
+	if got := do("APPEND", "k", "Hello"); got != ":5\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("APPEND", "k", " World"); got != ":11\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("GET", "k"); got != "$11\r\nHello World\r\n" {
+		t.Fatal(got)
+	}
+
+	if got := do("GETRANGE", "k", "0", "4"); got != "$5\r\nHello\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("GETRANGE", "k", "-5", "-1"); got != "$5\r\nWorld\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("GETRANGE", "missing", "0", "-1"); got != "$0\r\n\r\n" {
+		t.Fatal(got)
+	}
+
+	if got := do("SETRANGE", "k", "6", "Redis"); got != ":11\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("GET", "k"); got != "$11\r\nHello Redis\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("SETRANGE", "k", "11", "!!"); got != ":13\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("GET", "k"); got != "$13\r\nHello Redis!!\r\n" {
+		t.Fatal(got)
+	}
+
+	// A far offset on a missing key zero-fills the gap.
+	if got := do("SETRANGE", "z", "5", "x"); got != ":6\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("GET", "z"); got != "$6\r\n\x00\x00\x00\x00\x00x\r\n" {
+		t.Fatalf("gap not zero-filled: %q", got)
+	}
+
+	// An empty patch writes nothing: no key created, length reported.
+	if got := do("SETRANGE", "none", "0", ""); got != ":0\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("TYPE", "none"); got != "+none\r\n" {
+		t.Fatalf("empty SETRANGE created the key: %q", got)
+	}
+	if got := do("SETRANGE", "k", "100", ""); got != ":13\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("STRLEN", "k"); got != ":13\r\n" {
+		t.Fatal(got)
+	}
+
+	if got := do("SETRANGE", "k", "-1", "x"); got != "-ERR offset is out of range\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("SETRANGE", "k", "abc", "x"); got != "-ERR value is not an integer or out of range\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("SETRANGE", "k", "536870912", "x"); got != "-ERR string exceeds maximum allowed size (proto-max-bulk-len)\r\n" {
+		t.Fatal(got)
+	}
+
+	// APPEND and SETRANGE keep the TTL, unlike SET.
+	do("SET", "t", "v", "EX", "100")
+	do("APPEND", "t", "v")
+	if got := do("TTL", "t"); got != ":100\r\n" {
+		t.Fatalf("APPEND touched the TTL: %q", got)
+	}
+	do("SETRANGE", "t", "0", "x")
+	if got := do("TTL", "t"); got != ":100\r\n" {
+		t.Fatalf("SETRANGE touched the TTL: %q", got)
+	}
+}
+
+// TestServerRangeRope runs the range surface across the rope boundary
+// at the server's production chunk size, mirrored against an oracle
+// byte slice.
+func TestServerRangeRope(t *testing.T) {
+	do, _ := dispatchServer(t)
+
+	want := pat(DefaultRopeMin+3000, 21)
+	if got := do("SET", "big", string(want)); got != "+OK\r\n" {
+		t.Fatal(got)
+	}
+
+	// Patch crossing an 8 KiB chunk boundary, then a far grow that
+	// opens a lazy gap, then an append on the grown rope.
+	p1 := pat(20, 22)
+	if got := do("SETRANGE", "big", "8190", string(p1)); got != fmt.Sprintf(":%d\r\n", len(want)) {
+		t.Fatal(got)
+	}
+	want = oracleSetRange(want, 8190, p1)
+
+	p2 := pat(100, 23)
+	off2 := len(want) + 40_000
+	want = oracleSetRange(want, off2, p2)
+	if got := do("SETRANGE", "big", intArg(int64(off2)), string(p2)); got != fmt.Sprintf(":%d\r\n", len(want)) {
+		t.Fatal(got)
+	}
+
+	p3 := pat(50, 24)
+	want = append(want, p3...)
+	if got := do("APPEND", "big", string(p3)); got != fmt.Sprintf(":%d\r\n", len(want)) {
+		t.Fatal(got)
+	}
+
+	if got := do("STRLEN", "big"); got != fmt.Sprintf(":%d\r\n", len(want)) {
+		t.Fatal(got)
+	}
+	if got := do("OBJECT", "ENCODING", "big"); got != "$4\r\nrope\r\n" {
+		t.Fatal(got)
+	}
+	for _, w := range [][2]int{
+		{8180, 8230},                                   // across the patched boundary
+		{len(want) - 60, len(want) - 1},                // the appended tail
+		{off2 - 50, off2 + 50},                         // gap edge into the far patch
+		{DefaultRopeMin, off2 - 40_100},                // inside the pre-grow tail
+		{DefaultRopeMin + 2990, DefaultRopeMin + 3010}, // old tail into the gap zeros
+	} {
+		wantReply := string(AppendBulk(nil, want[w[0]:w[1]+1]))
+		if got := do("GETRANGE", "big", intArg(int64(w[0])), intArg(int64(w[1]))); got != wantReply {
+			t.Fatalf("GETRANGE %d %d mismatch", w[0], w[1])
+		}
+	}
+	if got := do("GET", "big"); got != string(AppendBulk(nil, want)) {
+		t.Fatal("full GET did not match the oracle")
+	}
+}
