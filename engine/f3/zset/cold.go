@@ -265,3 +265,86 @@ func (n *nativeStore) demote(st *store.Store, key []byte, quantum int) int {
 	n.maybeRebuild()
 	return demoted
 }
+
+// promoteOnWrite brings a cold member's whole chunk resident when a write confirms
+// the member, the bring-up of spec 2064/f3/06 sections 6.5 and 7.3. A ZADD or
+// ZINCRBY that finds an existing member had to pread its chunk to confirm it (the
+// hash probe's Match reads a cold member's bytes), which signals the chunk's
+// neighbors are hot, so the whole chunk lands resident rather than one member at a
+// time. It is a no-op when the band has demoted nothing (cold is nil), keeping a
+// zset with no cold tier on the exact M0 write path (the L9 zero-delta contract).
+func (n *nativeStore) promoteOnWrite(m []byte) {
+	if n.cold == nil {
+		return
+	}
+	ord, ok := n.tbl.Find(store.Hash(m), m, n)
+	if !ok {
+		return
+	}
+	if n.recs[ord].loc&tierCold != 0 {
+		n.promote(ord)
+	}
+}
+
+// promote brings the whole cold chunk owning the record at ord back into the native
+// band, the write-path bring-up of spec 2064/f3/06 sections 6.5 and 7.3. In-place
+// chunk patching is ruled out because it would make cold frames mutable, which
+// recovery and compaction depend on staying immutable (section 6.5), so the whole
+// chunk is re-seated at once.
+//
+// The retier-free record survives the round trip untouched on the same table probe
+// and the same tree ref: promotion only preads the chunk once, re-seats each of its
+// live members' bytes back into the slab, clears each record's cold tier bit, and
+// drops the chunk's directory descriptor (its frame is now dead space the compactor
+// reclaims). It walks the tree, so a member removed from the band while cold is
+// skipped for free (its ordinal left the tree); its stale locator dies with its
+// ordinal at the next rebuild. It reports whether the chunk was promoted, false when
+// the record is not cold, its locator is out of range, the pread tore, or the
+// directory and the offset table have drifted.
+func (n *nativeStore) promote(ord uint32) bool {
+	r := &n.recs[ord]
+	if r.loc&tierCold == 0 {
+		return false
+	}
+	cc := n.cold
+	slot := int(locSlot(r.loc))
+	if slot >= len(cc.offs) {
+		return false
+	}
+	off := cc.offs[slot]
+	ck, buf, ok := cc.st.ReadChunk(off, cc.scratch)
+	cc.scratch = buf
+	if !ok {
+		return false
+	}
+	// Locate the chunk's descriptor by its first discriminator: chunks cover
+	// disjoint score bands, so a Floor on the chunk's own first (score, member)
+	// lands on it exactly. Guard on the offset matching so a drifted directory aborts
+	// the promotion rather than dropping the wrong descriptor.
+	idx, found := cc.dir.Floor(ck.Disc)
+	if !found {
+		return false
+	}
+	if dOff, _, _ := cc.dir.At(idx); dOff != off {
+		return false
+	}
+	// Re-seat every live member that points into this chunk. The locator carries the
+	// entry index, so the packed payload is read positionally with no score decode and
+	// no table probe; the appended slab bytes copy out of the pread buffer, which the
+	// slab append never aliases (a distinct buffer), so a later entry reads it intact.
+	n.tree.Each(func(_ uint64, ref uint32) bool {
+		rr := &n.recs[ref]
+		if rr.loc&tierCold == 0 || int(locSlot(rr.loc)) != slot {
+			return true
+		}
+		mm, ok := chunkEntry(ck.Payload, int(locEntry(rr.loc)))
+		if !ok {
+			return true // a torn entry stays cold; its read path still preads it
+		}
+		rr.loc = uint32(len(n.slab))
+		n.slab = append(n.slab, mm...)
+		return true
+	})
+	cc.dir.Remove(idx)
+	return true
+}
