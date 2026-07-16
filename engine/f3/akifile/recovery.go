@@ -340,3 +340,25 @@ func Recover(dev Device) (*Recovery, error) {
 	}
 	return rec, nil
 }
+
+// ReadExtentTable reads the coarse extent map the live meta root points at (spec
+// 2064/f3/07 section 3). The map records the file's regions (the header page, the
+// append space, free runs) so a tool or a fresh open sees the file's shape without
+// a scan; it is a hint, not a source of truth. Recovery reaches segments through
+// SRT roots and per-shard chains, never through this map, so a torn extent table
+// only costs the shape hint, not the data.
+//
+// A file with no extent table (a fresh file, or a scan fallback with no trusted
+// root) returns a nil slice and no error: the meta is nil or its ExtentTableLen is
+// zero. A length that is not a whole number of extents is a torn table, returned
+// as ErrLength.
+func ReadExtentTable(dev Device, meta *MetaSlot) ([]Extent, error) {
+	if meta == nil || meta.ExtentTableLen == 0 {
+		return nil, nil
+	}
+	buf := make([]byte, meta.ExtentTableLen)
+	if _, err := dev.ReadAt(buf, int64(meta.ExtentTableOff)); err != nil {
+		return nil, err
+	}
+	return ParseExtents(buf)
+}
