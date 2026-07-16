@@ -44,6 +44,9 @@ type listCold struct {
 	dir     tier.Directory
 	seq     uint64
 	scratch []byte
+	frames  [][]byte // reused decode buffer for the scan cold branches, so a scan
+	// crossing several cold chunks allocates nothing; excluded from residentBytes
+	// like scratch, since it grows on read not mutation.
 }
 
 // residentBytes is the cold state's own resident footprint: the demote-sequence
@@ -177,4 +180,105 @@ func (nt *native) demote(st *store.Store, key []byte) int {
 	}
 	nt.cold.seq += uint64(len(runs))
 	return len(runs)
+}
+
+// promote brings the cold chunk at ring index ci back resident: it preads the
+// packed frames, re-materializes a resident blob and offset directory on the same
+// handle so the ring position and the Fenwick counts over the chunk's live window
+// are untouched, clears the cold marker, and drops the demote descriptor. It is the
+// unconditional bring-up of section 7.3, the response to a write or a drain that
+// reaches a cold chunk; a resident chunk is a no-op. A torn cold frame leaves the
+// chunk cold (its read path still preads it), so promote never publishes a partial
+// chunk. Owner goroutine only.
+func (nt *native) promote(ci int) {
+	c := nt.ring.at(ci)
+	if !c.cold() {
+		return
+	}
+	off := c.coldOff
+	ck, buf, ok := nt.cold.st.ReadChunk(off, nt.cold.scratch)
+	nt.cold.scratch = buf
+	if !ok {
+		return
+	}
+	// Decode the packed frames as value slices aliasing the pread scratch. A demoted
+	// chunk holds at most chunkElemCap frames (an oversized lone frame is one), so the
+	// stack array never overflows and the decode allocates nothing.
+	var fs [chunkElemCap][]byte
+	vals := fs[:0]
+	off2 := 0
+	for i := 0; i < ck.Count; i++ {
+		vlen, w := binary.Uvarint(ck.Payload[off2:])
+		off2 += w
+		vals = append(vals, ck.Payload[off2:off2+int(vlen)])
+		off2 += int(vlen)
+	}
+	// Re-materialize a resident slab on the handle. A lone oversized chunk keeps its
+	// wider blob. loadChunk stages through the separate repack scratch, so packing
+	// vals (which alias the pread scratch) into the fresh blob is a safe copy.
+	blobCap := chunkBlobCap
+	if len(ck.Payload) > blobCap {
+		blobCap = len(ck.Payload)
+	}
+	c.blob = make([]byte, blobCap)
+	c.dir = make([]uint16, chunkElemCap)
+	c.coldOff = 0
+	nt.loadChunk(c, vals)
+	nt.coldN--
+	// Drop the descriptor: chunks partition the demote sequence with no overlap, so a
+	// Floor on this chunk's own first discriminator lands on it exactly. Guard on the
+	// offset matching so a drifted directory aborts the drop rather than removing the
+	// wrong descriptor.
+	if idx, found := nt.cold.dir.Floor(ck.Disc); found {
+		if dOff, _, _ := nt.cold.dir.At(idx); dOff == off {
+			nt.cold.dir.Remove(idx)
+		}
+	}
+}
+
+// promoteIfCold brings the chunk at ring index ci resident when it is cold, the
+// guard the interior mutators and the end drains use before they touch a chunk that
+// a demote pass may have shed. It is a plain no-op on a resident chunk.
+func (nt *native) promoteIfCold(ci int) {
+	if nt.ring.at(ci).cold() {
+		nt.promote(ci)
+	}
+}
+
+// coldValues decodes the live frames of cold chunk c into the reused decode buffer
+// as value slices aliasing the shared cold scratch, valid until the next cold read
+// on this list. It is the cold-safe frame accessor the ring scans (each, lpos,
+// findPivot) fall to when a chunk is demoted; a resident chunk never reaches here.
+// The buffer is reused across chunks so a scan crossing several cold chunks
+// allocates nothing.
+func (nt *native) coldValues(c *chunk) [][]byte {
+	p := nt.cold.payload(c.coldOff)
+	fs := nt.cold.frames[:0]
+	off := 0
+	for i := c.count(); i > 0; i-- {
+		vlen, w := binary.Uvarint(p[off:])
+		off += w
+		fs = append(fs, p[off:off+int(vlen)])
+		off += int(vlen)
+	}
+	nt.cold.frames = fs
+	return fs
+}
+
+// coldHasMatch reports whether cold chunk c holds a frame equal to v, the check
+// LREM makes before it promotes: a scan that crosses a cold chunk without a hit
+// leaves it cold, and only a chunk a removal actually lands in is brought resident.
+// It streams the payload without materializing the frames.
+func (nt *native) coldHasMatch(c *chunk, v []byte) bool {
+	p := nt.cold.payload(c.coldOff)
+	off := 0
+	for i := c.count(); i > 0; i-- {
+		vlen, w := binary.Uvarint(p[off:])
+		off += w
+		if bytesEqual(p[off:off+int(vlen)], v) {
+			return true
+		}
+		off += int(vlen)
+	}
+	return false
 }

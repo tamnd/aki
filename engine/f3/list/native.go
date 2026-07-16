@@ -329,6 +329,11 @@ func (nt *native) pushFront(v []byte) {
 // frame physically written (the steady LPUSH+LPOP shape), so churn at the head
 // does not grow the blob (section 2.2, 2.5).
 func (nt *native) popFront() []byte {
+	// The demote pass keeps a margin resident at each end, but a run of pops drains
+	// that margin and can expose a chunk that was interior (and so cold) when the pass
+	// ran. Bring it resident before the pop reads its directory: the steady balanced
+	// push/pop shape never reaches here, so this is off the L9 path.
+	nt.promoteIfCold(0)
 	c := nt.ring.front()
 	off := int(c.dir[c.lo])
 	v, flen := c.frameAt(off)
@@ -348,6 +353,7 @@ func (nt *native) popFront() []byte {
 
 // popBack removes and returns the tail element (RPOP), symmetric to popFront.
 func (nt *native) popBack() []byte {
+	nt.promoteIfCold(nt.ring.n - 1) // a tail-side drain can expose a cold chunk (see popFront)
 	c := nt.ring.tail()
 	c.hi--
 	off := int(c.dir[c.hi])
@@ -553,6 +559,7 @@ func (nt *native) rangeInto(out []byte, lo, hi int) []byte {
 // already shows.
 func (nt *native) setAt(i int, v []byte) {
 	ci, ord := nt.locate(i)
+	nt.promoteIfCold(ci) // a write into a cold chunk brings the whole chunk resident (section 7.3)
 	c := nt.ring.at(ci)
 	off := int(c.dir[c.lo+ord])
 	old, _ := c.frameAt(off)
@@ -592,6 +599,7 @@ func (nt *native) insert(before bool, pivot, v []byte) bool {
 	if !before {
 		at++
 	}
+	nt.promoteIfCold(ci) // the pivot landed in a cold chunk; bring it resident before the splice
 	c := nt.ring.at(ci)
 	n := c.count()
 	vals := make([][]byte, 0, n+1)
@@ -619,6 +627,14 @@ func (nt *native) insert(before bool, pivot, v []byte) bool {
 func (nt *native) findPivot(pivot []byte) (ci, ord int, found bool) {
 	for i := 0; i < nt.ring.n; i++ {
 		c := nt.ring.at(i)
+		if c.cold() {
+			for j, val := range nt.coldValues(c) {
+				if bytesEqual(val, pivot) {
+					return i, j, true
+				}
+			}
+			continue
+		}
 		for p := c.lo; p < c.hi; p++ {
 			val, _ := c.frameAt(int(c.dir[p]))
 			if bytesEqual(val, pivot) {
@@ -680,6 +696,17 @@ func (nt *native) remove(count int, v []byte) int {
 // unlinked and recycled). A chunk left non-empty is repacked to drop the frames.
 func (nt *native) dropInChunk(i int, v []byte, backward bool, budget int) (int, bool) {
 	c := nt.ring.at(i)
+	if c.cold() {
+		// Scan the cold payload first: a chunk the removal never lands in stays cold,
+		// so LREM streaming across a cold interior preads without promoting it. Only a
+		// chunk that holds a match is brought resident, then the removal runs the
+		// resident path below over the now-materialized frames.
+		if !nt.coldHasMatch(c, v) {
+			return 0, false
+		}
+		nt.promote(i)
+		c = nt.ring.at(i)
+	}
 	n := c.count()
 	var drop [chunkElemCap]bool
 	dropped, droppedBytes := 0, 0
@@ -742,19 +769,27 @@ func (nt *native) trim(start, stop int) {
 	sci, sord := nt.locate(start)
 	eci, eord := nt.locate(stop)
 	same := sci == eci
+	// A dropped or boundary chunk may be cold; bring it resident so the whole-chunk
+	// drop can read its live bytes and the boundary window trim can move its cursors.
+	// Every chunk trim touches is off the resident head or tail region by construction
+	// (an all-resident list never enters these cold branches), so this is off the L9
+	// path.
 	for nt.ring.n-1 > eci {
+		nt.promoteIfCold(nt.ring.n - 1)
 		c := nt.ring.tail()
 		nt.bytes -= chunkLiveBytes(c)
 		nt.recycle(c)
 		nt.ring.popTail()
 	}
 	for k := 0; k < sci; k++ {
+		nt.promoteIfCold(0)
 		c := nt.ring.front()
 		nt.bytes -= chunkLiveBytes(c)
 		nt.recycle(c)
 		nt.ring.popHead()
 	}
 	if same {
+		nt.promoteIfCold(0)
 		c := nt.ring.front()
 		for c.count()-1 > eord {
 			c.hi--
@@ -767,12 +802,14 @@ func (nt *native) trim(start, stop int) {
 			c.lo++
 		}
 	} else {
+		nt.promoteIfCold(0)
 		fc := nt.ring.front()
 		for k := 0; k < sord; k++ {
 			val, _ := fc.frameAt(int(fc.dir[fc.lo]))
 			nt.bytes -= len(val)
 			fc.lo++
 		}
+		nt.promoteIfCold(nt.ring.n - 1)
 		tc := nt.ring.tail()
 		for tc.count()-1 > eord {
 			tc.hi--
@@ -885,6 +922,12 @@ func splitVals(vals [][]byte) [][][]byte {
 func (nt *native) each(fn func(v []byte)) {
 	for i := 0; i < nt.ring.n; i++ {
 		c := nt.ring.at(i)
+		if c.cold() {
+			for _, v := range nt.coldValues(c) {
+				fn(v)
+			}
+			continue
+		}
 		for p := c.lo; p < c.hi; p++ {
 			v, _ := c.frameAt(int(c.dir[p]))
 			fn(v)
@@ -934,6 +977,15 @@ func (nt *native) lpos(target []byte, rank, limit, maxlen int) []int {
 		abs := 0
 		for i := 0; i < nt.ring.n; i++ {
 			c := nt.ring.at(i)
+			if c.cold() {
+				for _, val := range nt.coldValues(c) {
+					if !visit(abs, val) {
+						return out
+					}
+					abs++
+				}
+				continue
+			}
 			for p := c.lo; p < c.hi; p++ {
 				val, _ := c.frameAt(int(c.dir[p]))
 				if !visit(abs, val) {
@@ -946,6 +998,16 @@ func (nt *native) lpos(target []byte, rank, limit, maxlen int) []int {
 		abs := nt.count - 1
 		for i := nt.ring.n - 1; i >= 0; i-- {
 			c := nt.ring.at(i)
+			if c.cold() {
+				vs := nt.coldValues(c)
+				for j := len(vs) - 1; j >= 0; j-- {
+					if !visit(abs, vs[j]) {
+						return out
+					}
+					abs--
+				}
+				continue
+			}
 			for p := c.hi - 1; p >= c.lo; p-- {
 				val, _ := c.frameAt(int(c.dir[p]))
 				if !visit(abs, val) {
