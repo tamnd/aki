@@ -32,27 +32,28 @@ func (t WriteTag) headers(h map[string]string) map[string]string {
 	return h
 }
 
-// PutIfAbsent creates key only if nothing is there (If-None-Match: *).
-// An object already present is ErrPrecondition; a concurrent conditional
-// write still settling is ErrConflict, and the caller re-reads instead of
-// replaying; a cut wire is ErrAmbiguous, resolved with Recheck.
+// PutIfAbsent creates key only if nothing is there (If-None-Match: * in
+// the S3 dialect). An object already present is ErrPrecondition; a
+// concurrent conditional write still settling is ErrConflict, and the
+// caller re-reads instead of replaying; a cut wire is ErrAmbiguous,
+// resolved with Recheck.
 func (c *Client) PutIfAbsent(ctx context.Context, key string, body []byte, tag WriteTag) (ObjectInfo, error) {
-	h := tag.headers(map[string]string{"If-None-Match": "*"})
+	h := tag.headers(c.dialect.Create())
 	return c.put(ctx, key, body, h)
 }
 
-// PutIfMatch replaces key only while its ETag still matches, the swap half
-// of CAS. Pass the ETag exactly as a read or write returned it, quotes and
-// all. A lost race is ErrPrecondition.
-func (c *Client) PutIfMatch(ctx context.Context, key string, body []byte, etag string, tag WriteTag) (ObjectInfo, error) {
-	h := tag.headers(map[string]string{"If-Match": etag})
+// PutIfMatch replaces key only while its CAS token still matches, the swap
+// half of CAS. Pass the token exactly as a read or write returned it in
+// Info.ETag, quotes and all. A lost race is ErrPrecondition.
+func (c *Client) PutIfMatch(ctx context.Context, key string, body []byte, token string, tag WriteTag) (ObjectInfo, error) {
+	h := tag.headers(c.dialect.Replace(token))
 	return c.put(ctx, key, body, h)
 }
 
 func (c *Client) put(ctx context.Context, key string, body []byte, h map[string]string) (ObjectInfo, error) {
 	var info ObjectInfo
 	err := c.do(ctx, s3req{method: http.MethodPut, key: key, body: body, extra: h}, func(resp *http.Response) error {
-		info = objectInfo(resp, int64(len(body)))
+		info = c.objectInfo(resp, int64(len(body)))
 		return nil
 	})
 	return info, err

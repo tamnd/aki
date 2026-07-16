@@ -39,6 +39,10 @@ type ClientConfig struct {
 	// HTTPClient is shared across Clients in tests and labs; nil gets a
 	// dedicated one with sane pool limits for a node's fan-out.
 	HTTPClient *http.Client
+
+	// Dialect spells the provider's CAS headers and token; the zero value
+	// means DialectS3.
+	Dialect Dialect
 }
 
 // Client talks to one bucket. It is safe for concurrent use; all state is
@@ -51,10 +55,13 @@ type Client struct {
 	retry          RetryPolicy
 	attemptTimeout time.Duration
 	http           *http.Client
+	dialect        Dialect
 	now            func() time.Time // test hook for deterministic signing
 }
 
-// ObjectInfo is what a read reveals about the object it hit. Tag is the
+// ObjectInfo is what a read reveals about the object it hit. ETag is the
+// provider's CAS token in the dialect's spelling (the ETag on S3, the
+// generation on GCS), opaque and never an integrity check. Tag is the
 // writer's self-recognition mark if the write carried one.
 type ObjectInfo struct {
 	ETag string
@@ -63,9 +70,9 @@ type ObjectInfo struct {
 }
 
 // objectInfo lifts the common response fields.
-func objectInfo(resp *http.Response, size int64) ObjectInfo {
+func (c *Client) objectInfo(resp *http.Response, size int64) ObjectInfo {
 	return ObjectInfo{
-		ETag: resp.Header.Get("ETag"),
+		ETag: c.dialect.Token(resp.Header),
 		Size: size,
 		Tag: WriteTag{
 			Writer: resp.Header.Get(writerHeader),
@@ -90,7 +97,11 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		retry:          cfg.Retry,
 		attemptTimeout: cfg.AttemptTimeout,
 		http:           cfg.HTTPClient,
+		dialect:        cfg.Dialect,
 		now:            time.Now,
+	}
+	if c.dialect.Name == "" {
+		c.dialect = DialectS3
 	}
 	if cfg.PathStyle {
 		c.pathPrefix = "/" + cfg.Bucket
@@ -143,7 +154,7 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, ObjectInfo, error
 			return &transportError{err} // a cut mid-body is retryable on a read
 		}
 		body = b
-		info = objectInfo(resp, int64(len(b)))
+		info = c.objectInfo(resp, int64(len(b)))
 		return nil
 	})
 	return body, info, err

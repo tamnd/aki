@@ -125,7 +125,7 @@ func (c *Client) CompleteMultipart(ctx context.Context, key, uploadID string, pa
 		if res.XMLName.Local == "Error" {
 			return storeErr(http.StatusInternalServerError, rb, resp.Header.Get("x-amz-request-id"))
 		}
-		info = objectInfo(resp, 0)
+		info = c.objectInfo(resp, 0)
 		if res.ETag != "" {
 			info.ETag = res.ETag
 		}

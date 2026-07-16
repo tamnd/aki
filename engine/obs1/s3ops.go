@@ -51,7 +51,7 @@ func (c *Client) getRange(ctx context.Context, key, rng string) ([]byte, ObjectI
 			return &transportError{err}
 		}
 		body = b
-		info = objectInfo(resp, int64(len(b)))
+		info = c.objectInfo(resp, int64(len(b)))
 		return nil
 	})
 	return body, info, err
