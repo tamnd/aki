@@ -41,6 +41,24 @@ type Op struct {
 type DrainBatch struct {
 	Seq int64
 	Ops []Op
+	// Bumps are the root-generation bumps riding this batch. A bump
+	// retires every record minted under Rooth with a generation below
+	// NewGen; it lands in the same durability unit as the ops and
+	// replays with the same exactly-once discipline, plus one of its
+	// own: the apply is monotonic per rooth, so a bump at or below the
+	// recorded generation is a no-op. Generations start at 1; a zero
+	// NewGen rejects the batch.
+	Bumps []Bump
+}
+
+// Bump is one root-generation bump. It rides the drain batch that
+// carries its root's replacement image (the tombstone or the new root
+// record of a collection DEL or type overwrite), so a crash can never
+// separate a retired generation from the image that retired it: both
+// land, or recovery replays both.
+type Bump struct {
+	Rooth  uint64
+	NewGen uint32
 }
 
 // Cursor is an opaque scan resume token. A nil Cursor starts a scan; a nil

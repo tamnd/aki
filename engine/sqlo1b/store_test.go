@@ -81,6 +81,34 @@ func delOp(key string) sqlo1.Op {
 	return sqlo1.Op{Del: true, Rec: sqlo1.Record{Key: []byte(key)}}
 }
 
+// applyBumps is apply with seam Bumps riding the batch, shadowed into
+// the rig's generation table the same way genbump shadows GenBump.
+func (r *storeRig) applyBumps(t *testing.T, ops []sqlo1.Op, bumps ...sqlo1.Bump) {
+	t.Helper()
+	r.seq++
+	if err := r.s.ApplyBatch(context.Background(), &sqlo1.DrainBatch{Seq: r.seq, Ops: ops, Bumps: bumps}); err != nil {
+		t.Fatalf("batch %d: %v", r.seq, err)
+	}
+	for _, op := range ops {
+		if op.Del {
+			delete(r.sh, string(op.Rec.Key))
+			continue
+		}
+		r.sh[string(op.Rec.Key)] = sqlo1.Record{
+			Key:      bytes.Clone(op.Rec.Key),
+			Value:    bytes.Clone(op.Rec.Value),
+			ExpireMs: op.Rec.ExpireMs,
+			Gen:      op.Rec.Gen,
+			Root:     op.Rec.Root,
+		}
+	}
+	for _, bp := range bumps {
+		if bp.NewGen > r.gens[bp.Rooth] {
+			r.gens[bp.Rooth] = bp.NewGen
+		}
+	}
+}
+
 // genbump mirrors GenBump into the rig's shadow generation table so
 // verify can account for the generation records in Stats.Keys.
 func (r *storeRig) genbump(t *testing.T, rooth uint64, newgen uint32) {
@@ -828,6 +856,81 @@ func TestStoreRootRecords(t *testing.T) {
 	if err != nil || !got.Root {
 		t.Fatalf("after reopen: root=%v err=%v", got.Root, err)
 	}
+	r.verify(t)
+}
+
+// TestBatchBumps drives seam Bumps through ApplyBatch: GENBUMP frames
+// share the batch's ops and its one durability point, stay monotonic,
+// replay exactly once under a reused Seq, survive both a WAL-tail
+// reopen and a checkpoint, and a zero-generation bump rejects its
+// whole batch at plan time, leaving the store usable.
+func TestBatchBumps(t *testing.T) {
+	r := newStoreRig(t)
+	ctx := context.Background()
+	r1, err := MintRooth(3, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := MintRooth(3, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r.applyBumps(t,
+		[]sqlo1.Op{
+			{Rec: sqlo1.Record{Key: []byte("wide"), Value: []byte("root image"), Root: true}},
+			putOp("plain", []byte("v"), 0),
+		},
+		sqlo1.Bump{Rooth: r1, NewGen: 2}, sqlo1.Bump{Rooth: r2, NewGen: 3},
+	)
+	r.checkLive(t, r1, 1, false)
+	r.checkLive(t, r1, 2, true)
+	r.checkLive(t, r2, 2, false)
+	r.checkLive(t, r2, 3, true)
+	r.verify(t)
+	r.verifyScan(t) // generation records stay invisible to the seam
+
+	// Lower and equal bumps riding a later batch are monotonic no-ops.
+	r.applyBumps(t, []sqlo1.Op{putOp("more", []byte("w"), 0)},
+		sqlo1.Bump{Rooth: r1, NewGen: 1}, sqlo1.Bump{Rooth: r2, NewGen: 3})
+	r.checkLive(t, r1, 2, true)
+	r.checkLive(t, r2, 3, true)
+
+	// A replayed Seq applies nothing, bumps included.
+	replay := &sqlo1.DrainBatch{Seq: r.seq, Bumps: []sqlo1.Bump{{Rooth: r1, NewGen: 9}}}
+	if err := r.s.ApplyBatch(ctx, replay); err != nil {
+		t.Fatal(err)
+	}
+	r.checkLive(t, r1, 2, true)
+
+	// A zero-generation bump rejects at plan time: no WAL frame, no op
+	// applied, store still usable.
+	bad := &sqlo1.DrainBatch{
+		Seq:   r.seq + 1,
+		Ops:   []sqlo1.Op{putOp("bad", []byte("x"), 0)},
+		Bumps: []sqlo1.Bump{{Rooth: r1, NewGen: 0}},
+	}
+	if err := r.s.ApplyBatch(ctx, bad); err == nil {
+		t.Fatal("bump to generation 0 accepted")
+	}
+	if _, err := r.s.Get(ctx, []byte("bad")); !errors.Is(err, sqlo1.ErrNotFound) {
+		t.Fatalf("rejected batch left an op behind: %v", err)
+	}
+	r.verify(t)
+
+	r.reopen(t) // GENBUMP frames replay from the WAL tail
+	r.checkLive(t, r1, 1, false)
+	r.checkLive(t, r1, 2, true)
+	r.checkLive(t, r2, 3, true)
+	r.verify(t)
+	r.verifyScan(t)
+
+	if err := r.s.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	r.reopen(t) // batch-carried generation records ride the checkpoint
+	r.checkLive(t, r1, 2, true)
+	r.checkLive(t, r2, 3, true)
 	r.verify(t)
 }
 

@@ -31,6 +31,14 @@ type drainer struct {
 	ops   []Op
 	slots []uint32
 	batch DrainBatch
+	// pending holds registered generation bumps keyed by the root key
+	// whose next op must carry them; bumps and bumpKeys are the reused
+	// per-cycle collections. The map is empty except in the window
+	// between a collection DEL or type overwrite and the drain cycle
+	// that carries the root's post-image out.
+	pending  map[string][]Bump
+	bumps    []Bump
+	bumpKeys []string
 }
 
 func newDrainer(ht *HotTable, store Store) *drainer {
@@ -42,7 +50,18 @@ func newDrainer(ht *HotTable, store Store) *drainer {
 		maxOps:    drainMaxOps,
 		ops:       make([]Op, 0, drainMaxOps),
 		slots:     make([]uint32, 0, drainMaxOps),
+		pending:   map[string][]Bump{},
 	}
+}
+
+// addBump registers a generation bump to ride the drain batch that
+// carries key's next op. Callers register the bump before the mutation
+// that retires the generation dirties the root, so the bump can never
+// miss the batch carrying the root's post-image; landing the two in
+// one batch is what keeps a crash from separating a retired generation
+// from the image that retired it.
+func (d *drainer) addBump(key []byte, rooth uint64, newgen uint32) {
+	d.pending[string(key)] = append(d.pending[string(key)], Bump{Rooth: rooth, NewGen: newgen})
 }
 
 // needsDrain reports whether dirty bytes crossed the threshold. The
@@ -61,6 +80,8 @@ func (d *drainer) needsDrain() bool {
 func (d *drainer) drain(ctx context.Context) (int, error) {
 	d.ops = d.ops[:0]
 	d.slots = d.slots[:0]
+	d.bumps = d.bumps[:0]
+	d.bumpKeys = d.bumpKeys[:0]
 	for len(d.ops) < d.maxOps {
 		s, ok := d.ht.popDirty()
 		if !ok {
@@ -87,6 +108,12 @@ func (d *drainer) drain(ctx context.Context) (int, error) {
 		}
 		d.ops = append(d.ops, op)
 		d.slots = append(d.slots, s)
+		if len(d.pending) != 0 {
+			if bs, ok := d.pending[string(op.Rec.Key)]; ok {
+				d.bumps = append(d.bumps, bs...)
+				d.bumpKeys = append(d.bumpKeys, string(op.Rec.Key))
+			}
+		}
 	}
 	if len(d.ops) == 0 {
 		return 0, nil
@@ -95,13 +122,20 @@ func (d *drainer) drain(ctx context.Context) (int, error) {
 	seq := d.seq + 1
 	d.batch.Seq = seq
 	d.batch.Ops = d.ops
+	d.batch.Bumps = d.bumps
 	if err := d.store.ApplyBatch(ctx, &d.batch); err != nil {
+		// The pending bumps stay registered: the slots re-enter the
+		// queue, so the retry collects the same roots and re-attaches
+		// the same bumps under the reused Seq.
 		for _, s := range d.slots {
 			d.ht.enqueueDirty(s)
 		}
 		return 0, err
 	}
 	d.seq = seq
+	for _, k := range d.bumpKeys {
+		delete(d.pending, k)
+	}
 	for _, s := range d.slots {
 		// vptr is the batch Seq: disk positions never cross the seam
 		// (Track A has none to give), and the state machine only needs

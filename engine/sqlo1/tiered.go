@@ -269,6 +269,15 @@ func (t *Tiered) Del(ctx context.Context, key []byte) (bool, error) {
 	return true, err
 }
 
+// Bump schedules a root-generation bump to ride the drain batch that
+// carries key's next op. The type layer calls this before the mutation
+// that retires the generation (the collection DEL or type overwrite),
+// so the bump and the root's post-image can never land in different
+// batches; the store applies them in one durability unit.
+func (t *Tiered) Bump(key []byte, rooth uint64, newgen uint32) {
+	t.dr.addBump(key, rooth, newgen)
+}
+
 // Flush drains until nothing is dirty; shutdown and tests use it.
 func (t *Tiered) Flush(ctx context.Context) error {
 	for {
