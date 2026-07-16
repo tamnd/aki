@@ -133,6 +133,97 @@ func TestMinIOConditional(t *testing.T) {
 	}
 }
 
+// TestMinIOBatchAndRange exercises slice 4 against a real server: ranged
+// and tail reads, the 416 mapping, a DeleteObjects batch, and a two-part
+// multipart upload whose create-time tag survives onto the final object.
+func TestMinIOBatchAndRange(t *testing.T) {
+	endpoint := os.Getenv("AKI_OBS1_S3")
+	if endpoint == "" {
+		t.Skip("AKI_OBS1_S3 not set")
+	}
+	user := envOr("AKI_OBS1_S3_USER", "minioadmin")
+	pass := envOr("AKI_OBS1_S3_PASS", "minioadmin")
+	bucket := fmt.Sprintf("obs1-test-%d", time.Now().UnixNano())
+
+	createBucket(t, endpoint, bucket, user, pass)
+
+	c, err := NewClient(ClientConfig{
+		Endpoint:  endpoint,
+		Region:    "us-east-1",
+		Bucket:    bucket,
+		AccessKey: user,
+		SecretKey: pass,
+		PathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	if _, err := c.Put(ctx, "seg/00/1", []byte("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := c.GetRange(ctx, "seg/00/1", 2, 4)
+	if err != nil || string(got) != "2345" {
+		t.Fatalf("range: %q %v", got, err)
+	}
+	got, _, err = c.GetTail(ctx, "seg/00/1", 3)
+	if err != nil || string(got) != "789" {
+		t.Fatalf("tail: %q %v", got, err)
+	}
+	if _, _, err := c.GetRange(ctx, "seg/00/1", 10, 1); !errors.Is(err, ErrRange) {
+		t.Fatalf("past-end range: want ErrRange, got %v", err)
+	}
+
+	keys := []string{"tomb/a", "tomb/b", "tomb/odd +~()", "tomb/missing"}
+	for _, k := range keys[:3] {
+		if _, err := c.Put(ctx, k, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.DeleteObjects(ctx, keys); err != nil {
+		t.Fatalf("batch delete: %v", err)
+	}
+	for _, k := range keys[:3] {
+		if _, _, err := c.Get(ctx, k); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("%s survived the batch: %v", k, err)
+		}
+	}
+
+	// Multipart with two minimum-size parts; the create-time tag must land
+	// on the final object so Recheck works after an ambiguous complete.
+	tag := WriteTag{Writer: "folder-1", Batch: "seg-2"}
+	id, err := c.CreateMultipart(ctx, "seg/00/2", tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part := make([]byte, MinPartSize)
+	for i := range part {
+		part[i] = byte('a' + i%26)
+	}
+	var parts []Part
+	for n := 1; n <= 2; n++ {
+		etag, err := c.UploadPart(ctx, "seg/00/2", id, n, part)
+		if err != nil {
+			t.Fatalf("part %d: %v", n, err)
+		}
+		parts = append(parts, Part{N: n, ETag: etag})
+	}
+	if _, err := c.CompleteMultipart(ctx, "seg/00/2", id, parts); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	out, tinfo, err := c.GetTail(ctx, "seg/00/2", 4)
+	if err != nil || len(out) != 4 {
+		t.Fatalf("tail of stitched object: %q %v", out, err)
+	}
+	if tinfo.Tag != tag {
+		t.Fatalf("tag on multipart object: %+v", tinfo.Tag)
+	}
+	if err := c.DeleteObjects(ctx, []string{"seg/00/1", "seg/00/2"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v

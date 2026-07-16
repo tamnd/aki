@@ -36,6 +36,11 @@ var (
 	// outcome is unknown and the caller must re-read; doc 02 section 2.4
 	// makes that re-check mandatory for chain appends.
 	ErrAmbiguous = errors.New("obs1: outcome unknown")
+
+	// ErrRange: the requested byte range starts at or past the end of the
+	// object (416). Ranges are planned from manifests and footers, so this
+	// means the plan and the object disagree; never retried.
+	ErrRange = errors.New("obs1: range not satisfiable")
 )
 
 // StoreErr is a definitive error response from the object store, wrapping
@@ -81,6 +86,8 @@ func storeErr(status int, body []byte, requestID string) *StoreErr {
 		e.sentinel = ErrPrecondition
 	case status == 409 && doc.Code == "ConditionalRequestConflict":
 		e.sentinel = ErrConflict
+	case status == 416:
+		e.sentinel = ErrRange
 	case doc.Code == "SlowDown" || doc.Code == "RequestLimitExceeded":
 		e.sentinel = ErrSlowDown
 	}

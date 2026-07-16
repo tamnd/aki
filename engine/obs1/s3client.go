@@ -137,7 +137,7 @@ func escapeKey(key string) string {
 func (c *Client) Get(ctx context.Context, key string) ([]byte, ObjectInfo, error) {
 	var body []byte
 	var info ObjectInfo
-	err := c.do(ctx, http.MethodGet, key, nil, nil, func(resp *http.Response) error {
+	err := c.do(ctx, s3req{method: http.MethodGet, key: key, replay: true}, func(resp *http.Response) error {
 		b, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return &transportError{err} // a cut mid-body is retryable on a read
@@ -159,7 +159,7 @@ func (c *Client) Put(ctx context.Context, key string, body []byte) (ObjectInfo, 
 
 // Delete removes a key. Deleting a missing key succeeds, matching S3.
 func (c *Client) Delete(ctx context.Context, key string) error {
-	return c.do(ctx, http.MethodDelete, key, nil, nil, func(*http.Response) error { return nil })
+	return c.do(ctx, s3req{method: http.MethodDelete, key: key, replay: true}, func(*http.Response) error { return nil })
 }
 
 // transportError marks an attempt that died on the wire, so the loop can
@@ -169,15 +169,22 @@ type transportError struct{ err error }
 func (e *transportError) Error() string { return e.err.Error() }
 func (e *transportError) Unwrap() error { return e.err }
 
-// do runs one operation through the retry loop. extra carries condition
-// and metadata headers; onOK consumes a 2xx response while its body is
-// still open.
-func (c *Client) do(ctx context.Context, method, key string, body []byte, extra map[string]string, onOK func(*http.Response) error) error {
-	// Only PUT outcomes are ambiguous on a cut wire: a replayed GET is a
-	// read and a replayed DELETE of a gone key still succeeds (S3 delete
-	// is idempotent), but a PUT that may have landed needs the caller's
-	// self-recognition pass before anything is sent again.
-	mutation := method == http.MethodPut
+// s3req is one operation for the retry loop. replay says a cut wire may
+// be blindly retried: true for reads, deletes, and idempotent part
+// uploads; false for anything that creates an object whose outcome the
+// caller must self-recognize (doc 02 section 2.4).
+type s3req struct {
+	method string
+	key    string
+	query  url.Values
+	body   []byte
+	extra  map[string]string
+	replay bool
+}
+
+// do runs one operation through the retry loop. onOK consumes a 2xx
+// response while its body is still open.
+func (c *Client) do(ctx context.Context, r s3req, onOK func(*http.Response) error) error {
 	var lastErr error
 	for attempt := 0; attempt < c.retry.Attempts; attempt++ {
 		if attempt > 0 {
@@ -186,46 +193,48 @@ func (c *Client) do(ctx context.Context, method, key string, body []byte, extra 
 				return err
 			}
 		}
-		lastErr = c.attempt(ctx, method, key, body, extra, onOK)
+		lastErr = c.attempt(ctx, r, onOK)
 		switch {
 		case lastErr == nil:
 			return nil
 		case isTransport(lastErr):
-			if mutation {
+			if !r.replay {
 				// The request may have taken effect; only the caller can
 				// re-read and decide, so surface it instead of replaying.
-				return fmt.Errorf("%w: %s %s: %w", ErrAmbiguous, method, key, lastErr)
+				return fmt.Errorf("%w: %s %s: %w", ErrAmbiguous, r.method, r.key, lastErr)
 			}
-			continue // reads are safe to replay
+			continue
 		case retryable(lastErr):
 			continue
 		default:
 			return lastErr
 		}
 	}
-	return fmt.Errorf("obs1: %s %s: attempts exhausted: %w", method, key, lastErr)
+	return fmt.Errorf("obs1: %s %s: attempts exhausted: %w", r.method, r.key, lastErr)
 }
 
 // attempt is one signed HTTP exchange.
-func (c *Client) attempt(ctx context.Context, method, key string, body []byte, extra map[string]string, onOK func(*http.Response) error) error {
+func (c *Client) attempt(ctx context.Context, r s3req, onOK func(*http.Response) error) error {
 	actx, cancel := context.WithTimeout(ctx, c.attemptTimeout)
 	defer cancel()
 
 	payloadHash := emptySHA256
 	var reader io.Reader
-	if body != nil {
-		sum := sha256.Sum256(body)
+	if r.body != nil {
+		sum := sha256.Sum256(r.body)
 		payloadHash = hex.EncodeToString(sum[:])
-		reader = bytes.NewReader(body)
+		reader = bytes.NewReader(r.body)
 	}
-	req, err := http.NewRequestWithContext(actx, method, c.urlFor(key).String(), reader)
+	u := c.urlFor(r.key)
+	u.RawQuery = r.query.Encode()
+	req, err := http.NewRequestWithContext(actx, r.method, u.String(), reader)
 	if err != nil {
 		return err
 	}
-	if body != nil {
-		req.ContentLength = int64(len(body))
+	if r.body != nil {
+		req.ContentLength = int64(len(r.body))
 	}
-	for k, v := range extra {
+	for k, v := range r.extra {
 		req.Header.Set(k, v)
 	}
 	signV4(req, c.creds, c.region, "s3", payloadHash, c.now())

@@ -51,7 +51,7 @@ func (c *Client) PutIfMatch(ctx context.Context, key string, body []byte, etag s
 
 func (c *Client) put(ctx context.Context, key string, body []byte, h map[string]string) (ObjectInfo, error) {
 	var info ObjectInfo
-	err := c.do(ctx, http.MethodPut, key, body, h, func(resp *http.Response) error {
+	err := c.do(ctx, s3req{method: http.MethodPut, key: key, body: body, extra: h}, func(resp *http.Response) error {
 		info = objectInfo(resp, int64(len(body)))
 		return nil
 	})
