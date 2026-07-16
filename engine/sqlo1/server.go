@@ -37,6 +37,9 @@ type Server struct {
 	// mkeys and mvals split MSET and MSETNX argument pairs.
 	mkeys [][]byte
 	mvals [][]byte
+
+	// bfOps holds one BITFIELD command's parsed subcommands.
+	bfOps []BitfieldOp
 }
 
 // splitPairs fills mkeys and mvals from an even-length key-value
@@ -389,6 +392,57 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return storeErr(reply, err)
 		}
 		return AppendBulk(reply, v)
+	case "SETBIT":
+		if len(args) != 4 {
+			return arityErr(reply, cmd)
+		}
+		off, ok := parseBitOffset(args[2])
+		if !ok {
+			return AppendError(reply, "ERR bit offset is not an integer or out of range")
+		}
+		b, ok := parseCanonicalInt(args[3])
+		if !ok || (b != 0 && b != 1) {
+			return AppendError(reply, "ERR bit is not an integer or out of range")
+		}
+		old, err := s.s.SetBit(ctx, args[1], off, int(b))
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, int64(old))
+	case "GETBIT":
+		if len(args) != 3 {
+			return arityErr(reply, cmd)
+		}
+		off, ok := parseBitOffset(args[2])
+		if !ok {
+			return AppendError(reply, "ERR bit offset is not an integer or out of range")
+		}
+		bit, err := s.s.GetBit(ctx, args[1], off)
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, int64(bit))
+	case "BITFIELD", "BITFIELD_RO":
+		if len(args) < 2 {
+			return arityErr(reply, cmd)
+		}
+		ops, errText := s.parseBitfieldOps(args[2:], cmd == "BITFIELD_RO")
+		if errText != "" {
+			return AppendError(reply, errText)
+		}
+		res, nulls, err := s.s.Bitfield(ctx, args[1], ops)
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		reply = AppendArray(reply, len(res))
+		for i := range res {
+			if nulls[i] {
+				reply = AppendNullBulk(reply)
+			} else {
+				reply = AppendInt(reply, res[i])
+			}
+		}
+		return reply
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
@@ -692,6 +746,136 @@ func invalidExpire(reply []byte, cmd string) []byte {
 
 func storeErr(reply []byte, err error) []byte {
 	return AppendError(reply, "ERR "+err.Error())
+}
+
+// parseBitOffset accepts what string2ll accepts, bounded to the bit
+// offsets a value at the 512 MiB cap can hold, for SETBIT and GETBIT.
+func parseBitOffset(a []byte) (int64, bool) {
+	n, ok := parseCanonicalInt(a)
+	if !ok || n < 0 || n>>3 >= MaxValueLen {
+		return 0, false
+	}
+	return n, true
+}
+
+const bitfieldTypeErr = "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is."
+
+// parseBitfieldOps turns BITFIELD's token stream into ops, validating
+// everything before the first op executes, as Redis does: any bad
+// token means no write happens. OVERFLOW applies to the subcommands
+// after it; the default is WRAP. The non-empty return string is the
+// exact error reply.
+func (s *Server) parseBitfieldOps(args [][]byte, ro bool) ([]BitfieldOp, string) {
+	ops := s.bfOps[:0]
+	ovf := byte('w')
+	for i := 0; i < len(args); {
+		var kind byte
+		switch tok := strings.ToUpper(string(args[i])); tok {
+		case "GET":
+			kind = 'g'
+		case "SET":
+			kind = 's'
+		case "INCRBY":
+			kind = 'i'
+		case "OVERFLOW":
+			if ro {
+				return nil, "ERR BITFIELD_RO only supports the GET subcommand"
+			}
+			if i+1 >= len(args) {
+				return nil, "ERR syntax error"
+			}
+			switch strings.ToUpper(string(args[i+1])) {
+			case "WRAP":
+				ovf = 'w'
+			case "SAT":
+				ovf = 's'
+			case "FAIL":
+				ovf = 'f'
+			default:
+				return nil, "ERR Invalid OVERFLOW type specified"
+			}
+			i += 2
+			continue
+		default:
+			return nil, "ERR syntax error"
+		}
+		if ro && kind != 'g' {
+			return nil, "ERR BITFIELD_RO only supports the GET subcommand"
+		}
+		need := 3
+		if kind == 'g' {
+			need = 2
+		}
+		if i+need >= len(args) {
+			return nil, "ERR syntax error"
+		}
+		signed, w, ok := parseBitfieldType(args[i+1])
+		if !ok {
+			return nil, bitfieldTypeErr
+		}
+		off, ok := parseBitfieldOffset(args[i+2], w)
+		if !ok {
+			return nil, "ERR bit offset is not an integer or out of range"
+		}
+		op := BitfieldOp{Kind: kind, Signed: signed, Bits: w, Ovf: ovf, Off: off}
+		if kind != 'g' {
+			arg, ok := parseCanonicalInt(args[i+3])
+			if !ok {
+				return nil, "ERR value is not an integer or out of range"
+			}
+			op.Arg = arg
+		}
+		ops = append(ops, op)
+		i += need + 1
+	}
+	s.bfOps = ops
+	return ops, ""
+}
+
+// parseBitfieldType reads i1..i64 or u1..u63, case-insensitive on the
+// letter; the width goes through string2ll so "u08" fails like Redis.
+func parseBitfieldType(a []byte) (signed bool, w uint8, ok bool) {
+	if len(a) < 2 {
+		return false, 0, false
+	}
+	switch a[0] {
+	case 'i', 'I':
+		signed = true
+	case 'u', 'U':
+	default:
+		return false, 0, false
+	}
+	n, ok := parseCanonicalInt(a[1:])
+	if !ok || n < 1 || n > 64 || (!signed && n > 63) {
+		return false, 0, false
+	}
+	return signed, uint8(n), true
+}
+
+// parseBitfieldOffset reads a BITFIELD offset, resolving the '#'
+// typed-index form, and bounds the field's last byte to the value
+// cap.
+func parseBitfieldOffset(a []byte, w uint8) (uint64, bool) {
+	hash := false
+	if len(a) > 0 && a[0] == '#' {
+		hash = true
+		a = a[1:]
+	}
+	n, ok := parseCanonicalInt(a)
+	if !ok || n < 0 {
+		return 0, false
+	}
+	off := uint64(n)
+	if hash {
+		if off > uint64(math.MaxInt64)/uint64(w) {
+			return 0, false
+		}
+		off *= uint64(w)
+	}
+	if (off+uint64(w)-1)>>3 >= MaxValueLen {
+		return 0, false
+	}
+	return off, true
 }
 
 // strSizeErr maps the ladder's value cap onto Redis's wording for the
