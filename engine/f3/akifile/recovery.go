@@ -271,3 +271,72 @@ func RebuildShardIndex(dev Device, prefix *Prefix, indexCkptOff uint64) (*IndexR
 	}
 	return r, nil
 }
+
+// Recovery is the structural result of opening a file: the picked open state, the
+// shard root table (nil when no checkpoint has been taken), and each shard's index
+// rebuilt from its checkpoint chain (nil on a scan fallback, where there is no
+// trusted root to name the checkpoints). TailFrom is the offset the caller starts
+// the tail replay at; the caller applies the tail's log segments, which carry
+// records the akifile layer cannot interpret, over the rebuilt indexes to reach
+// the live state.
+type Recovery struct {
+	State    *OpenState
+	SRT      *SRT
+	Indexes  []*IndexRebuilder
+	TailFrom uint64
+}
+
+// Recover runs the whole open sequence and assembles the structural recovery
+// (spec 2064/f3/07 section 6): pick the live root, read the shard root table, and
+// rebuild each shard's index from its checkpoint chain. It stops at the boundary
+// the akifile format owns: the tail replay past TailFrom is the caller's, because
+// turning a log segment back into index entries is store knowledge this layer does
+// not hold.
+//
+// The tail-replay start depends on the outcome. A scan fallback has no root, so it
+// replays the whole append space from the header page. A file with no checkpoints
+// yet likewise starts from the header page. A crashed open replays from the
+// earliest shard's first un-checkpointed segment, the point before which every
+// segment is already in a checkpoint. A clean open checkpointed everything on the
+// way down, so there is nothing past the roots and TailFrom is the file size.
+func Recover(dev Device) (*Recovery, error) {
+	st, err := ReadOpenState(dev)
+	if err != nil {
+		return nil, err
+	}
+	rec := &Recovery{State: st}
+	if st.Outcome == OpenScanFallback {
+		rec.TailFrom = PageSize
+		return rec, nil
+	}
+
+	srt, err := ReadSRT(dev, st.Prefix, st.Meta)
+	if err != nil {
+		return nil, err
+	}
+	rec.SRT = srt
+	if srt == nil {
+		// No checkpoint has been taken: the whole index comes from the tail replay.
+		rec.TailFrom = PageSize
+		return rec, nil
+	}
+
+	rec.Indexes = make([]*IndexRebuilder, len(srt.Rows))
+	tailFrom := st.Meta.FileSize
+	for i := range srt.Rows {
+		idx, err := RebuildShardIndex(dev, st.Prefix, srt.Rows[i].IndexCkptOff)
+		if err != nil {
+			return nil, err
+		}
+		rec.Indexes[i] = idx
+		if ft := srt.Rows[i].FirstTailSeg; ft != 0 && ft < tailFrom {
+			tailFrom = ft
+		}
+	}
+	if st.Outcome == OpenClean {
+		rec.TailFrom = st.Meta.FileSize
+	} else {
+		rec.TailFrom = tailFrom
+	}
+	return rec, nil
+}

@@ -450,6 +450,155 @@ func TestRebuildShardIndexRejectsCycle(t *testing.T) {
 	}
 }
 
+// TestRecoverFreshFile recovers a freshly created file: a clean open with no
+// checkpoints, so no roots to read and the tail replay starts at the header page.
+func TestRecoverFreshFile(t *testing.T) {
+	dev := &memDevice{}
+	newTestFile(t, dev, SyncNo, nil)
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if rec.State.Outcome != OpenClean {
+		t.Fatalf("outcome = %d, want OpenClean", rec.State.Outcome)
+	}
+	if rec.SRT != nil || rec.Indexes != nil {
+		t.Fatalf("fresh file carries srt=%v indexes=%v, want nil", rec.SRT, rec.Indexes)
+	}
+	if rec.TailFrom != PageSize {
+		t.Fatalf("tail from %d, want the header page %d", rec.TailFrom, PageSize)
+	}
+}
+
+// TestRecoverCrashedRebuildsShards recovers a crashed file with per-shard
+// checkpoints: it rebuilds each shard's index and starts the tail replay at the
+// earliest shard's first un-checkpointed segment.
+func TestRecoverCrashedRebuildsShards(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	off0 := appendCkpt(t, f, CkptHeader{FullOrDelta: CkptFull, CkptLogPos: 5}, []CkptEntry{
+		{KeyHash: 1, RecordAddr: 0x100}, {KeyHash: 2, RecordAddr: 0x200},
+	})
+	off1 := appendCkpt(t, f, CkptHeader{FullOrDelta: CkptFull, CkptLogPos: 6}, []CkptEntry{
+		{KeyHash: 3, RecordAddr: 0x300}, {KeyHash: 4, RecordAddr: 0x400}, {KeyHash: 5, RecordAddr: 0x500},
+	})
+	fileSize := f.Cursor()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	rows[0] = SRTRow{IndexCkptOff: off0, FirstTailSeg: off0, CkptLogPos: 5}
+	rows[1] = SRTRow{IndexCkptOff: off1, FirstTailSeg: off1, CkptLogPos: 6}
+	// shards 2 and 3 never checkpointed: zero rows.
+	srtOff := writeSRTAt(t, dev, prefix, fileSize, &SRT{Gen: 1, Rows: rows})
+
+	m := &MetaSlot{
+		CommitSeq: 9, FileSize: fileSize, CleanShutdown: 0,
+		SRTOff: srtOff, SRTLen: uint32(SRTHeaderLen + len(rows)*SRTRowSize), SRTShardCount: prefix.ShardCount,
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if rec.State.Outcome != OpenCrashed {
+		t.Fatalf("outcome = %d, want OpenCrashed", rec.State.Outcome)
+	}
+	if len(rec.Indexes) != int(prefix.ShardCount) {
+		t.Fatalf("rebuilt %d shard indexes, want %d", len(rec.Indexes), prefix.ShardCount)
+	}
+	if rec.Indexes[0].Len() != 2 || rec.Indexes[1].Len() != 3 {
+		t.Fatalf("shard index sizes = %d/%d, want 2/3", rec.Indexes[0].Len(), rec.Indexes[1].Len())
+	}
+	if rec.Indexes[2].Len() != 0 || rec.Indexes[3].Len() != 0 {
+		t.Fatalf("uncheckpointed shards carry %d/%d entries, want 0/0", rec.Indexes[2].Len(), rec.Indexes[3].Len())
+	}
+	// Replay starts at the earliest shard's first tail segment, off0 < off1.
+	if rec.TailFrom != off0 {
+		t.Fatalf("tail from %d, want the earliest first-tail-seg %d", rec.TailFrom, off0)
+	}
+}
+
+// TestRecoverCleanSkipsTail recovers a cleanly-closed file with checkpoints: the
+// index rebuilds from the roots and the tail replay finds nothing, since a clean
+// shutdown checkpointed everything.
+func TestRecoverCleanSkipsTail(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	off0 := appendCkpt(t, f, CkptHeader{FullOrDelta: CkptFull, CkptLogPos: 5}, []CkptEntry{
+		{KeyHash: 1, RecordAddr: 0x100},
+	})
+	fileSize := f.Cursor()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	rows[0] = SRTRow{IndexCkptOff: off0, CkptLogPos: 5}
+	srtOff := writeSRTAt(t, dev, prefix, fileSize, &SRT{Gen: 1, Rows: rows})
+
+	m := &MetaSlot{
+		CommitSeq: 4, FileSize: fileSize, CleanShutdown: 1,
+		SRTOff: srtOff, SRTLen: uint32(SRTHeaderLen + len(rows)*SRTRowSize), SRTShardCount: prefix.ShardCount,
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if rec.State.Outcome != OpenClean {
+		t.Fatalf("outcome = %d, want OpenClean", rec.State.Outcome)
+	}
+	if rec.Indexes[0].Len() != 1 {
+		t.Fatalf("shard 0 index has %d entries, want 1", rec.Indexes[0].Len())
+	}
+	if rec.TailFrom != fileSize {
+		t.Fatalf("tail from %d, want the file size %d (nothing past the roots)", rec.TailFrom, fileSize)
+	}
+}
+
+// TestRecoverScanFallback recovers a file whose meta slots are both torn: no root
+// to trust, so it replays the whole append space from the header page.
+func TestRecoverScanFallback(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	dev.buf[prefix.MetaSlotAOff+3] ^= 0xff
+	dev.buf[prefix.MetaSlotBOff+3] ^= 0xff
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if rec.State.Outcome != OpenScanFallback {
+		t.Fatalf("outcome = %d, want OpenScanFallback", rec.State.Outcome)
+	}
+	if rec.SRT != nil || rec.Indexes != nil {
+		t.Fatalf("scan fallback carries srt=%v indexes=%v, want nil", rec.SRT, rec.Indexes)
+	}
+	if rec.TailFrom != PageSize {
+		t.Fatalf("tail from %d, want the header page %d", rec.TailFrom, PageSize)
+	}
+}
+
+// writeSRTAt marshals a shard root table at a chosen offset and returns it.
+func writeSRTAt(t *testing.T, dev *memDevice, prefix *Prefix, off uint64, srt *SRT) uint64 {
+	t.Helper()
+	b, err := srt.Marshal(prefix.ChecksumKind)
+	if err != nil {
+		t.Fatalf("marshal srt: %v", err)
+	}
+	if _, err := dev.WriteAt(b, int64(off)); err != nil {
+		t.Fatalf("write srt: %v", err)
+	}
+	return off
+}
+
 // appendCkpt frames a checkpoint payload and appends it as an index_ckpt segment,
 // returning the segment offset the base pointers reference.
 func appendCkpt(t *testing.T, f *File, h CkptHeader, entries []CkptEntry) uint64 {
