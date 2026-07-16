@@ -18,18 +18,28 @@ import "github.com/tamnd/aki/engine/f3/shard"
 // refinement over this same seam; it changes only which key demoteVictim returns,
 // not the trigger or the pack.
 
-// DemoteQuantum drives one quantum of collection demotion when the shard's
-// resident footprint, the arena plus this registry's own owner-local heap, sits
-// past the store's resident cap. It returns the members it moved to the cold tier,
-// zero when there is no cold tier, no registry yet, the shard is under its budget,
-// or every set is already fully cold. Owner goroutine only, called at a demote
-// boundary where no handler holds an arena address.
-func DemoteQuantum(cx *shard.Ctx) int {
+// DemoteQuantum drives one quantum of set demotion against the set registry's own
+// resident budget alone. It is the single-type entry a set-only deployment and the
+// set trigger's own tests use; a shard that also runs other native collections
+// composes the combined budget through DemoteQuantumOver instead.
+func DemoteQuantum(cx *shard.Ctx) int { return DemoteQuantumOver(cx, 0) }
+
+// DemoteQuantumOver drives one quantum of collection demotion when the shard's
+// resident footprint, the arena plus this registry's own owner-local heap plus the
+// extra other collection registries report, sits past the store's resident cap. The
+// extra is what makes the one resident cap a true RSS bound across every native
+// collection type: the set and the zset each weigh their own heap against the budget
+// only after adding the other's, so neither type sheds a byte while the combined
+// footprint fits and both do once it does not. It returns the members it moved to
+// the cold tier, zero when there is no cold tier, no registry yet, the shard is
+// under the combined budget, or every set is already fully cold. Owner goroutine
+// only, called at a demote boundary where no handler holds an arena address.
+func DemoteQuantumOver(cx *shard.Ctx, extra uint64) int {
 	g, ok := cx.Coll.(*reg)
 	if !ok || !g.acctOn {
 		return 0
 	}
-	if !cx.St.ResidentOverBy(g.resident) {
+	if !cx.St.ResidentOverBy(g.resident + extra) {
 		return 0
 	}
 	key := g.demoteVictim()
