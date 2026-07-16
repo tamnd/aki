@@ -862,6 +862,10 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return reply
 	case "SSCAN":
 		return s.sscanCmd(ctx, reply, args)
+	case "SRANDMEMBER":
+		return s.srandCmd(ctx, reply, args)
+	case "SPOP":
+		return s.spopCmd(ctx, reply, args)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":
@@ -1401,6 +1405,88 @@ func (s *Server) sscanCmd(ctx context.Context, reply []byte, args [][]byte) []by
 	reply = AppendBulk(reply, strconv.AppendUint(cbuf[:0], next, 10))
 	reply = AppendArray(reply, elems)
 	return append(reply, s.scanBuf...)
+}
+
+// srandCmd is SRANDMEMBER key [count], Redis's grammar: no count is
+// one draw with a nil bulk on a missing key, a negative count draws
+// with replacement, and anything after the count is a syntax error
+// checked before the count parses.
+func (s *Server) srandCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 2 {
+		return arityErr(reply, "SRANDMEMBER")
+	}
+	if len(args) == 2 {
+		m, ok, err := s.se.SRandMember(ctx, args[1])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if !ok {
+			return AppendNullBulk(reply)
+		}
+		return AppendBulk(reply, m)
+	}
+	if len(args) > 3 {
+		return syntaxErr(reply)
+	}
+	l, ok := parseCanonicalInt(args[2])
+	if !ok {
+		return AppendError(reply, "ERR value is not an integer or out of range")
+	}
+	if l == math.MinInt64 {
+		return AppendError(reply, "ERR value is out of range")
+	}
+	count, withReplacement := l, false
+	if l < 0 {
+		count, withReplacement = -l, true
+	}
+	mark := len(reply)
+	err := s.se.SRandMemberCount(ctx, args[1], count, withReplacement, func(n int64) {
+		reply = AppendArray(reply, int(n))
+	}, func(m []byte) {
+		reply = AppendBulk(reply, m)
+	})
+	if err != nil {
+		return storeErr(reply[:mark], err)
+	}
+	return reply
+}
+
+// spopCmd is SPOP key [count]: one popped member as a bulk (nil on a
+// missing key) without the count, an array with it. The count parse is
+// Redis's exact door: a non-integer and a negative both answer
+// out-of-range-must-be-positive, and a count of zero is an empty array
+// with nothing removed.
+func (s *Server) spopCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 2 {
+		return arityErr(reply, "SPOP")
+	}
+	if len(args) == 2 {
+		m, ok, err := s.se.SPop(ctx, args[1])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if !ok {
+			return AppendNullBulk(reply)
+		}
+		return AppendBulk(reply, m)
+	}
+	if len(args) > 3 {
+		return syntaxErr(reply)
+	}
+	l, ok := parseCanonicalInt(args[2])
+	if !ok || l < 0 {
+		return AppendError(reply, "ERR value is out of range, must be positive")
+	}
+	mark := len(reply)
+	err := s.se.SPopCount(ctx, args[1], l, func(n int64) {
+		reply = AppendArray(reply, int(n))
+	}, func(m []byte) {
+		reply = AppendBulk(reply, m)
+	})
+	if err != nil {
+		return storeErr(reply[:mark], err)
+	}
+	return reply
 }
 
 // hrandCmd is HRANDFIELD key [count [WITHVALUES]], Redis's exact
