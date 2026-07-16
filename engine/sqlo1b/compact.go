@@ -130,6 +130,13 @@ func (s *Store) compactExtent(ctx context.Context, ext uint64) (CompactStats, er
 				if err != nil {
 					return fail(err)
 				}
+				// The slot slice runs to the next record or the slot
+				// table, pad tail included on the last one, and a lone
+				// big record's slice is nearly the whole group. Trim to
+				// the encoded record before relocation or the padded
+				// slice crosses BlobThreshold and misroutes to the blob
+				// path. DecodeRecord already validated rlen.
+				raw = raw[:binary.LittleEndian.Uint32(raw)]
 				pos, err := NewPos(ext, grp, slot)
 				if err != nil {
 					return fail(err)
