@@ -364,6 +364,121 @@ func writeSRT(t *testing.T, dev *memDevice, prefix *Prefix, srt *SRT) uint64 {
 	return off
 }
 
+// TestRebuildShardIndexChain writes a full checkpoint segment and two delta
+// segments chained by their base pointers, then rebuilds the shard index from the
+// newest and confirms it is the live set with the newest addresses.
+func TestRebuildShardIndexChain(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	fullOff := appendCkpt(t, f, CkptHeader{FullOrDelta: CkptFull, CkptLogPos: 10}, []CkptEntry{
+		{KeyHash: 1, RecordAddr: 0x100},
+		{KeyHash: 2, RecordAddr: 0x200},
+		{KeyHash: 3, RecordAddr: 0x300},
+	})
+	d1Off := appendCkpt(t, f, CkptHeader{FullOrDelta: CkptDelta, CkptLogPos: 20, BaseCkptOff: fullOff}, []CkptEntry{
+		{KeyHash: 2, RecordAddr: 0x2222},
+		{KeyHash: 1, Flags: CkptTombstone},
+	})
+	d2Off := appendCkpt(t, f, CkptHeader{FullOrDelta: CkptDelta, CkptLogPos: 30, BaseCkptOff: d1Off}, []CkptEntry{
+		{KeyHash: 4, RecordAddr: 0x400},
+	})
+
+	r, err := RebuildShardIndex(dev, f.Prefix(), d2Off)
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if r.LogPos != 30 {
+		t.Fatalf("log pos %d, want 30", r.LogPos)
+	}
+	want := map[uint64]uint64{2: 0x2222, 3: 0x300, 4: 0x400} // 1 tombstoned
+	if r.Len() != len(want) {
+		t.Fatalf("index has %d entries, want %d", r.Len(), len(want))
+	}
+	for kh, addr := range want {
+		if e, ok := r.Entries()[kh]; !ok || e.RecordAddr != addr {
+			t.Fatalf("key %d = %v/%v, want addr %#x", kh, e, ok, addr)
+		}
+	}
+}
+
+// TestRebuildShardIndexNoCheckpoint returns an empty index for a shard that has
+// never been checkpointed: the whole index comes from the tail replay.
+func TestRebuildShardIndexNoCheckpoint(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	r, err := RebuildShardIndex(dev, f.Prefix(), 0)
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if r.Len() != 0 {
+		t.Fatalf("empty-checkpoint index has %d entries, want 0", r.Len())
+	}
+}
+
+// TestRebuildShardIndexRejectsNonCheckpoint refuses a root that points at a
+// segment that is not an index_ckpt.
+func TestRebuildShardIndexRejectsNonCheckpoint(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	offs, err := f.AppendGroup([]Pending{{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("not a checkpoint")}})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if _, err := RebuildShardIndex(dev, f.Prefix(), offs[0]); err != ErrCheckpoint {
+		t.Fatalf("err = %v, want ErrCheckpoint", err)
+	}
+}
+
+// TestRebuildShardIndexRejectsCycle catches a back-pointer cycle: two delta
+// segments whose bases point at each other never reach a base full.
+func TestRebuildShardIndexRejectsCycle(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	// Two checkpoint segments on the 4KiB grid, each naming the other as its base.
+	offA := uint64(PageSize)
+	offB := uint64(PageSize + SegmentAlign)
+	writeCkptSegment(t, dev, prefix, offA, CkptHeader{FullOrDelta: CkptDelta, BaseCkptOff: offB}, nil)
+	writeCkptSegment(t, dev, prefix, offB, CkptHeader{FullOrDelta: CkptDelta, BaseCkptOff: offA}, nil)
+
+	if _, err := RebuildShardIndex(dev, prefix, offA); err != ErrCheckpoint {
+		t.Fatalf("err = %v, want ErrCheckpoint", err)
+	}
+}
+
+// appendCkpt frames a checkpoint payload and appends it as an index_ckpt segment,
+// returning the segment offset the base pointers reference.
+func appendCkpt(t *testing.T, f *File, h CkptHeader, entries []CkptEntry) uint64 {
+	t.Helper()
+	offs, err := f.AppendGroup([]Pending{{Shard: 0, Kind: KindIndexCkpt, ShardSeq: 1, Payload: ckptPayload(h, entries)}})
+	if err != nil {
+		t.Fatalf("append checkpoint: %v", err)
+	}
+	return offs[0]
+}
+
+// writeCkptSegment lays a validly-framed index_ckpt segment at a chosen offset, so
+// a test can hand-build a chain shape (like a cycle) the append writer cannot.
+func writeCkptSegment(t *testing.T, dev *memDevice, prefix *Prefix, off uint64, h CkptHeader, entries []CkptEntry) {
+	t.Helper()
+	payload := ckptPayload(h, entries)
+	sh := &SegHeader{Shard: 0, Kind: KindIndexCkpt, ShardSeq: 1}
+	hb, err := sh.Marshal(prefix.ChecksumKind, payload)
+	if err != nil {
+		t.Fatalf("marshal segment: %v", err)
+	}
+	if _, err := dev.WriteAt(hb, int64(off)); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	if _, err := dev.WriteAt(payload, int64(off)+SegHeaderLen); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+}
+
 // ckptPayload frames a checkpoint payload from a header and its entries, the bytes
 // an index_ckpt segment would carry.
 func ckptPayload(h CkptHeader, entries []CkptEntry) []byte {

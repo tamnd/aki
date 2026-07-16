@@ -213,3 +213,61 @@ func ReadSRT(dev Device, prefix *Prefix, meta *MetaSlot) (*SRT, error) {
 	}
 	return srt, nil
 }
+
+// RebuildShardIndex reconstructs one shard's index from its checkpoint chain. The
+// SRT names the shard's newest checkpoint segment (index_ckpt_off); that segment
+// is either a full dump or a delta whose header names the base it extends
+// (base_ckpt_off), and so on back to a full or to a delta over the empty index.
+// RebuildShardIndex walks that chain back to its base, then applies the
+// checkpoints oldest-first into an IndexRebuilder, leaving the live index as of
+// the newest checkpoint's log position. A caller then replays the tail past
+// IndexRebuilder.LogPos to catch the records written since.
+//
+// A zero index_ckpt_off means the shard has never been checkpointed: it returns
+// an empty rebuilder and the whole index comes from the tail replay. A segment
+// that is not an index_ckpt, or a back-pointer that revisits a segment already in
+// the chain, is a corrupt root and returns ErrCheckpoint.
+func RebuildShardIndex(dev Device, prefix *Prefix, indexCkptOff uint64) (*IndexRebuilder, error) {
+	r := NewIndexRebuilder()
+	if indexCkptOff == 0 {
+		return r, nil
+	}
+	// Walk the delta chain back to its base, newest first, caching each payload so
+	// the apply pass does not re-read. The seen set catches a back-pointer cycle.
+	type link struct {
+		off     uint64
+		payload []byte
+	}
+	var chain []link
+	seen := make(map[uint64]bool)
+	for off := indexCkptOff; ; {
+		if seen[off] {
+			return nil, ErrCheckpoint
+		}
+		seen[off] = true
+		h, payload, err := readSegmentAt(dev, prefix.ChecksumKind, off)
+		if err != nil {
+			return nil, err
+		}
+		if h.Kind != KindIndexCkpt {
+			return nil, ErrCheckpoint
+		}
+		ch, err := ParseCkptHeader(payload)
+		if err != nil {
+			return nil, err
+		}
+		chain = append(chain, link{off, payload})
+		// A full dump or a delta over the empty index (base zero) is the base of the
+		// chain: stop walking and apply forward from here.
+		if ch.FullOrDelta == CkptFull || ch.BaseCkptOff == 0 {
+			break
+		}
+		off = ch.BaseCkptOff
+	}
+	for i := len(chain) - 1; i >= 0; i-- {
+		if _, err := r.Apply(chain[i].payload); err != nil {
+			return nil, err
+		}
+	}
+	return r, nil
+}
