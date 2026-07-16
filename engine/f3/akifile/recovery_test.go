@@ -1,6 +1,9 @@
 package akifile
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // TestReadOpenStateClean opens a freshly created file: both slots are valid and
 // carry clean_shutdown, so the state is OpenClean off slot A with the header-page
@@ -99,6 +102,141 @@ func TestReadOpenStateBadPrefix(t *testing.T) {
 
 	if _, err := ReadOpenState(dev); err != ErrMagic {
 		t.Fatalf("err = %v, want ErrMagic", err)
+	}
+}
+
+// TestReplayTailVisitsEverySegment appends three segments and confirms the replay
+// walk hands each intact one to the visitor in file order, then stops at the
+// durable tail (the append cursor).
+func TestReplayTailVisitsEverySegment(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	group := []Pending{
+		{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("one")},
+		{Shard: 1, Kind: KindLog, ShardSeq: 1, Payload: []byte("two")},
+		{Shard: 0, Kind: KindLog, ShardSeq: 2, Payload: []byte("three")},
+	}
+	offs, err := f.AppendGroup(group)
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	var seen []uint64
+	var seqs []uint64
+	size, _ := dev.Size()
+	end, err := ReplayTail(dev, f.Prefix(), PageSize, uint64(size), func(off uint64, h *SegHeader, _ []byte) error {
+		seen = append(seen, off)
+		seqs = append(seqs, h.GlobalSeq)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(seen) != len(group) {
+		t.Fatalf("visited %d segments, want %d", len(seen), len(group))
+	}
+	for i := range offs {
+		if seen[i] != offs[i] {
+			t.Fatalf("segment %d off = %d, want %d", i, seen[i], offs[i])
+		}
+		if seqs[i] != uint64(i+1) {
+			t.Fatalf("segment %d seq = %d, want %d", i, seqs[i], i+1)
+		}
+	}
+	if end != f.Cursor() {
+		t.Fatalf("replay end %d, want cursor %d", end, f.Cursor())
+	}
+}
+
+// TestReplayTailStopsAtTornSegment corrupts the second segment's payload and
+// confirms the walk stops there: the first segment is replayed, the torn one and
+// everything past it is the un-durable tail.
+func TestReplayTailStopsAtTornSegment(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	offs, err := f.AppendGroup([]Pending{
+		{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("durable")},
+		{Shard: 0, Kind: KindLog, ShardSeq: 2, Payload: []byte("torn-tail")},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	dev.buf[offs[1]+SegHeaderLen+1] ^= 0xff // corrupt the second payload
+
+	count := 0
+	size, _ := dev.Size()
+	end, err := ReplayTail(dev, f.Prefix(), PageSize, uint64(size), func(_ uint64, _ *SegHeader, _ []byte) error {
+		count++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("visited %d segments, want 1 (stop at the torn tail)", count)
+	}
+	if end != offs[1] {
+		t.Fatalf("replay end %d, want the torn segment offset %d", end, offs[1])
+	}
+}
+
+// TestReplayTailPropagatesVisitError stops the walk when a visitor cannot apply a
+// segment and returns the error at the offending offset: recovery fails rather
+// than dropping a durable segment it could not replay.
+func TestReplayTailPropagatesVisitError(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	offs, err := f.AppendGroup([]Pending{
+		{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("first")},
+		{Shard: 0, Kind: KindLog, ShardSeq: 2, Payload: []byte("second")},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	boom := errors.New("cannot apply")
+	size, _ := dev.Size()
+	end, err := ReplayTail(dev, f.Prefix(), PageSize, uint64(size), func(off uint64, _ *SegHeader, _ []byte) error {
+		if off == offs[1] {
+			return boom
+		}
+		return nil
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the visit error", err)
+	}
+	if end != offs[1] {
+		t.Fatalf("replay stopped at %d, want the failing segment %d", end, offs[1])
+	}
+}
+
+// TestReplayTailFromCheckpoint starts the walk past the first segment, the crashed
+// open replaying only the tail appended since the last checkpoint.
+func TestReplayTailFromCheckpoint(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	offs, err := f.AppendGroup([]Pending{
+		{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("before-ckpt")},
+		{Shard: 0, Kind: KindLog, ShardSeq: 2, Payload: []byte("after-ckpt")},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	var seen []uint64
+	size, _ := dev.Size()
+	if _, err := ReplayTail(dev, f.Prefix(), offs[1], uint64(size), func(off uint64, _ *SegHeader, _ []byte) error {
+		seen = append(seen, off)
+		return nil
+	}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(seen) != 1 || seen[0] != offs[1] {
+		t.Fatalf("replayed %v, want only the post-checkpoint segment at %d", seen, offs[1])
 	}
 }
 

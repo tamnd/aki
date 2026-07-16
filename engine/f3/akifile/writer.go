@@ -117,37 +117,17 @@ func (f *File) doSync() error {
 	return nil
 }
 
-// scanTail walks the append space from the header page forward on the 4KiB grid
-// and returns the offset just past the last intact segment plus the highest
-// global_seq seen. It stops at the first header that fails to parse or a payload
-// that does not verify: the durable tail, past which lies a torn or never-synced
-// write. Full per-shard parallel recovery (slice 5) generalizes this; here it
-// bootstraps the writer's cursor and seq on open.
+// scanTail finds the durable append tail on open and the highest global_seq seen,
+// so the writer resumes past the last intact segment with a monotonic seq. It is
+// the recovery tail-replay (ReplayTail) run from the header page with a visitor
+// that only tracks the seq: the cursor bootstrap is the same forward scan the full
+// recovery does, minus the index rebuild.
 func scanTail(dev Device, prefix *Prefix, size uint64) (cursor, seq uint64) {
-	cursor = uint64(prefix.PageSize)
-	for cursor+SegHeaderLen <= size {
-		hb := make([]byte, SegHeaderLen)
-		if _, err := dev.ReadAt(hb, int64(cursor)); err != nil {
-			break
-		}
-		h, err := ParseSegHeader(hb)
-		if err != nil {
-			break
-		}
-		if cursor+SegHeaderLen+h.PayloadLen > size {
-			break
-		}
-		payload := make([]byte, h.PayloadLen)
-		if _, err := dev.ReadAt(payload, int64(cursor)+SegHeaderLen); err != nil {
-			break
-		}
-		if h.VerifyPayload(payload, prefix.ChecksumKind) != nil {
-			break
-		}
+	cursor, _ = ReplayTail(dev, prefix, uint64(prefix.PageSize), size, func(_ uint64, h *SegHeader, _ []byte) error {
 		if h.GlobalSeq > seq {
 			seq = h.GlobalSeq
 		}
-		cursor += SegmentSpan(h.PayloadLen)
-	}
+		return nil
+	})
 	return cursor, seq
 }
