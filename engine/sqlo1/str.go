@@ -115,6 +115,10 @@ type Str struct {
 	batchOffs  []int
 	batchRopes []ropeRoot
 	batchMetas []strMeta
+
+	// Bitfield result scratch, one entry per subcommand.
+	bfRes  []int64
+	bfNull []bool
 }
 
 // NewStr builds the string layer over t.
