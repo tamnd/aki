@@ -1,0 +1,13 @@
+date: 2026-07-16T01:05:26Z
+box: GamingPC / Linux 6.18.33.2-microsoft-standard-WSL2 x86_64
+cpus: 32
+aki-bench: 632f6b9858872bf91642a393fc66343c8af272a9
+aki checkout: 2a207b34719310c1c5a986f0c70eb4b64395e077
+akislot: f3
+redis: /root/bin/redis-server v8.8.0 (pinned 8.8)
+valkey: /root/bin/valkey-server v9.1.0 (pinned 9.1)
+cap_mib: 128  key_overhead: 100  maxkeys: 30000000
+arms: cap  mixes: 10  sizes: 512 4096  dists: uniform zipfian  scales: 1 4 16  reps: 2
+duration: 10s  warm: 5s  conns: 64  pipe: 16  io_threads: 4
+rep_timeout_base_s: 240 (times the cell's scale)
+f3srv: shards 4 arena_mib 256
