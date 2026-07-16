@@ -1,6 +1,7 @@
 package akifile
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -171,6 +172,89 @@ func TestFindingsTornRoot(t *testing.T) {
 	fs := rep.Findings()
 	if len(fs) != 1 || !strings.Contains(fs[0], "shard root table") {
 		t.Fatalf("findings = %v, want one for the torn root", fs)
+	}
+}
+
+// TestWriteReportCleanFile prints a fresh file: the format header, both slots valid
+// with slot A live, no roots yet, and no findings.
+func TestWriteReportCleanFile(t *testing.T) {
+	dev := &memDevice{}
+	newTestFile(t, dev, SyncNo, nil)
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	var buf bytes.Buffer
+	WriteReport(&buf, rep)
+	out := buf.String()
+
+	for _, want := range []string{
+		"format: aki store v3.0", "checksum crc32c",
+		"meta slot A", "meta slot B", "(live)",
+		"shard root table: none", "extent map: none", "findings: none",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("report missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+// TestWriteReportWithRoots prints a checkpointed file: the roots the live slot names
+// and the segment population read back by name.
+func TestWriteReportWithRoots(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	if _, err := f.AppendGroup([]Pending{{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("data")}}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	rows := make([]SRTRow, prefix.ShardCount)
+	extents := []Extent{{Kind: ExtentHeader, StartOff: 0, Length: PageSize}}
+	if err := f.Checkpoint(&SRT{Gen: 5, Rows: rows}, extents, CheckpointStats{Clean: true}); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	var buf bytes.Buffer
+	WriteReport(&buf, rep)
+	out := buf.String()
+
+	for _, want := range []string{
+		"shard root table: gen 5,", "extent map: 1 extents",
+		"log ", "srt ", "extent_table ", "findings: none",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("report missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+// TestWriteReportShowsFindings prints a torn slot as a finding: the slot line reads
+// torn and the findings section counts it.
+func TestWriteReportShowsFindings(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+	dev.buf[prefix.MetaSlotBOff+3] ^= 0xff // tear slot B
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	var buf bytes.Buffer
+	WriteReport(&buf, rep)
+	out := buf.String()
+
+	if !strings.Contains(out, "meta slot B @") || !strings.Contains(out, "torn:") {
+		t.Fatalf("report missing the torn slot line:\n%s", out)
+	}
+	if !strings.Contains(out, "findings: 1") || !strings.Contains(out, "meta slot B did not validate") {
+		t.Fatalf("report missing the finding:\n%s", out)
 	}
 }
 

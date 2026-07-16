@@ -1,6 +1,10 @@
 package akifile
 
-import "fmt"
+import (
+	"fmt"
+	"io"
+	"sort"
+)
 
 // SlotReport is one meta slot's state as a verify tool sees it: where it sits,
 // whether its checksum validates, and the fields a reader compares to pick the
@@ -140,6 +144,137 @@ func slotName(i int) string {
 		return "B"
 	}
 	return "A"
+}
+
+// WriteReport prints a Report as the aki file-info output: the format header, both
+// meta slots with which one is live, the roots the live slot names, the segment
+// population by kind, and the verify findings last. It is the human face of Inspect
+// and, like Inspect, changes not a byte of the file. Segment kinds print in a fixed
+// order so the same file always renders the same report. It returns the first write
+// error and then stops, so a broken pipe surfaces instead of scrolling past.
+func WriteReport(w io.Writer, r *Report) error {
+	ew := &errWriter{w: w}
+	p := r.Prefix
+	ew.printf("format: aki store v%d.%d  shards %d  checksum %s\n",
+		p.FormatMajor, p.FormatMinor, p.ShardCount, checksumName(p.ChecksumKind))
+
+	for i, s := range r.Slots {
+		live := ""
+		if r.Live == i {
+			live = "  (live)"
+		}
+		if !s.Valid {
+			ew.printf("meta slot %s @%d: torn: %v\n", slotName(i), s.Off, s.Err)
+			continue
+		}
+		state := "crashed"
+		if s.CleanShutdown {
+			state = "clean"
+		}
+		ew.printf("meta slot %s @%d: valid  commit_seq %d  %s%s\n",
+			slotName(i), s.Off, s.CommitSeq, state, live)
+	}
+
+	switch {
+	case r.SRT != nil:
+		ew.printf("shard root table: gen %d, %d rows\n", r.SRT.Gen, len(r.SRT.Rows))
+	case r.SRTErr != nil:
+		ew.printf("shard root table: unreadable: %v\n", r.SRTErr)
+	default:
+		ew.printf("shard root table: none\n")
+	}
+
+	switch {
+	case r.Extents != nil:
+		ew.printf("extent map: %d extents\n", len(r.Extents))
+	case r.ExtErr != nil:
+		ew.printf("extent map: unreadable: %v\n", r.ExtErr)
+	default:
+		ew.printf("extent map: none\n")
+	}
+
+	ew.printf("segments: %d total, durable tail @%d\n", r.Segments.Total, r.Segments.DurableTail)
+	kinds := make([]int, 0, len(r.Segments.ByKind))
+	for k := range r.Segments.ByKind {
+		kinds = append(kinds, int(k))
+	}
+	sort.Ints(kinds)
+	for _, k := range kinds {
+		ew.printf("  %-12s %d\n", kindName(uint16(k)), r.Segments.ByKind[uint16(k)])
+	}
+
+	fs := r.Findings()
+	if len(fs) == 0 {
+		ew.printf("findings: none\n")
+		return ew.err
+	}
+	ew.printf("findings: %d\n", len(fs))
+	for _, f := range fs {
+		ew.printf("  - %s\n", f)
+	}
+	return ew.err
+}
+
+// errWriter is a sticky-error writer: once a write fails it holds the error and
+// skips the rest, so a report body reads as a run of prints with the error checked
+// once at the end rather than on every line.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errWriter) printf(format string, a ...any) {
+	if e.err != nil {
+		return
+	}
+	_, e.err = fmt.Fprintf(e.w, format, a...)
+}
+
+// checksumName is the human label for a checksum kind.
+func checksumName(kind uint32) string {
+	switch kind {
+	case ChecksumCRC32C:
+		return "crc32c"
+	case ChecksumXXH3:
+		return "xxh3-64"
+	default:
+		return fmt.Sprintf("unknown(%d)", kind)
+	}
+}
+
+// kindName is the human label for a segment kind, so a report reads by name rather
+// than by the on-disk number.
+func kindName(k uint16) string {
+	switch k {
+	case KindLog:
+		return "log"
+	case KindColdChunk:
+		return "cold_chunk"
+	case KindValueLog:
+		return "value_log"
+	case KindIndexCkpt:
+		return "index_ckpt"
+	case KindChunkDir:
+		return "chunk_dir"
+	case KindSegStats:
+		return "seg_stats"
+	case KindSRT:
+		return "srt"
+	case KindExtentTable:
+		return "extent_table"
+	case KindFreeMap:
+		return "free_map"
+	case KindBarrier:
+		return "barrier"
+	case KindTTLIndex:
+		return "ttl_index"
+	case KindMetaKV:
+		return "meta_kv"
+	case KindFree:
+		return "free"
+	default:
+		return fmt.Sprintf("kind(%d)", k)
+	}
 }
 
 // SegmentTally is the segment population a grid walk found: a count per kind, the
