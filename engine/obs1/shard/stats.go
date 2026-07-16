@@ -31,6 +31,12 @@ const (
 	StatDemotes
 	StatBackpressureWaits
 	StatBackpressureStalls
+	StatParkWaitsResident
+	StatParkWaitsFlushlag
+	StatParkWaitsLease
+	StatParkStallsResident
+	StatParkStallsFlushlag
+	StatParkStallsLease
 	NumStats
 )
 
@@ -55,6 +61,16 @@ var statNames = [NumStats]string{
 
 	StatBackpressureWaits:  "backpressure_waits",
 	StatBackpressureStalls: "backpressure_stalls",
+
+	// The doc 04 section 6 park-reason split (park.go): waits and stalls per
+	// reason, summing to the two totals above. Only the resident rows can move
+	// until the WAL and lease slices raise the other two reasons.
+	StatParkWaitsResident:  "backpressure_waits_resident",
+	StatParkWaitsFlushlag:  "backpressure_waits_flushlag",
+	StatParkWaitsLease:     "backpressure_waits_lease",
+	StatParkStallsResident: "backpressure_stalls_resident",
+	StatParkStallsFlushlag: "backpressure_stalls_flushlag",
+	StatParkStallsLease:    "backpressure_stalls_lease",
 }
 
 // appendStat writes one name:value INFO line.

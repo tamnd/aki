@@ -126,12 +126,15 @@ type worker struct {
 	// cursor between retry passes and bpStall counts consecutive passes without an
 	// advance, the coarse stall bound that surfaces the OOM reply when no progress
 	// is possible. bpWaits and bpStalls are the cumulative park and stall-out
-	// counts INFO surfaces in slice 5b.
-	fullWaiters []fullWaiter
-	bpProg      uint64
-	bpStall     int
-	bpWaits     uint64
-	bpStalls    uint64
+	// counts INFO surfaces in slice 5b; bpReasonWaits and bpReasonStalls split
+	// both by the doc 04 section 6 park reason (park.go).
+	fullWaiters    []fullWaiter
+	bpProg         uint64
+	bpStall        int
+	bpWaits        uint64
+	bpStalls       uint64
+	bpReasonWaits  [numParkReasons]uint64
+	bpReasonStalls [numParkReasons]uint64
 }
 
 func newWorker(id int, st *store.Store) *worker {

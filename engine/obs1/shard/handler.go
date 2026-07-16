@@ -69,6 +69,12 @@ type Ctx struct {
 	parkFull bool
 	retrying bool
 
+	// parkReason names why the current park was raised (park.go, doc 04
+	// section 6). ParkFullAt sets it to ParkResident, the only reason with a
+	// raise site today; the WAL and lease slices add entry points that set
+	// their own. Read by parkOnFull when it registers the waiter.
+	parkReason ParkReason
+
 	// resume is the argument index a retried multi-key write picks up from
 	// (backpressure.go). A fan sub-command that parks part-way through its pairs
 	// records how far it committed through ParkFullAt; the worker seeds this before
@@ -106,6 +112,7 @@ func (cx *Ctx) ParkFullAt(err error, resume int) bool {
 		return false
 	}
 	cx.parkFull = true
+	cx.parkReason = ParkResident
 	cx.resume = resume
 	return true
 }
