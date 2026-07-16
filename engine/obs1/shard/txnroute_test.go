@@ -158,11 +158,16 @@ func TestPointOpsDeferDuringTxn(t *testing.T) {
 	rt.Start()
 	defer rt.Stop()
 	k1, k2 := twoShardKeys(t, rt)
-	free := keyOnShard(t, rt, 0)
-	for free == k1 {
-		free += "x"
-		if rt.ShardOf([]byte(free)) != 0 {
-			free = keyOnShard(t, rt, 0)
+	// A shard-0 key distinct from k1. The f3 original appended "x" and
+	// rescanned on a route miss, but keyOnShard always returns the same
+	// first match, so that loop only terminated because wyhash happened
+	// to keep k1+"x" on shard 0; slot routing does not, so scan honestly.
+	var free string
+	for i := 0; ; i++ {
+		k := fmt.Sprintf("f%d", i)
+		if k != k1 && rt.ShardOf([]byte(k)) == 0 {
+			free = k
+			break
 		}
 	}
 

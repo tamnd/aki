@@ -15,6 +15,12 @@ type Runtime struct {
 	workers []*worker
 	started bool
 
+	// groups is G, the slot-group count the route in slot.go divides the
+	// 16384 hash slots into (doc 02 section 1.2). Fixed at construction
+	// like the shard count; it must match the served database's root
+	// object.
+	groups int
+
 	// txnTicket is the process-global tier-two ticket source (doc 03 section
 	// 6.1, intent.go): one atomic touched only by Begin, off the single-key path
 	// entirely. The total order it hands out is what makes the intent schedule
@@ -92,7 +98,7 @@ func New(shards, arenaBytes, segBytes int) *Runtime {
 	if shards < 1 {
 		shards = 1
 	}
-	r := &Runtime{workers: make([]*worker, shards)}
+	r := &Runtime{workers: make([]*worker, shards), groups: DefaultSlotGroups}
 	r.resolveConnCaps(Config{})
 	for i := range r.workers {
 		r.workers[i] = newWorker(i, store.New(arenaBytes, segBytes))
@@ -108,6 +114,11 @@ type Config struct {
 	Shards     int
 	ArenaBytes int
 	SegBytes   int
+
+	// SlotGroups is G, the slot-group count of the served database (doc
+	// 02 section 1.2), recorded in its root object at creation.
+	// Non-positive takes DefaultSlotGroups.
+	SlotGroups int
 
 	// VlogDir, when set, gives every shard its own value log under this
 	// directory (one file per shard, fresh-start semantics). Without it the
@@ -145,7 +156,11 @@ func Open(cfg Config) (*Runtime, error) {
 	if cfg.Shards < 1 {
 		cfg.Shards = 1
 	}
-	r := &Runtime{workers: make([]*worker, cfg.Shards)}
+	groups := cfg.SlotGroups
+	if groups < 1 {
+		groups = DefaultSlotGroups
+	}
+	r := &Runtime{workers: make([]*worker, cfg.Shards), groups: groups}
 	r.resolveConnCaps(cfg)
 	for i := range r.workers {
 		o := store.Options{ArenaBytes: cfg.ArenaBytes, SegBytes: cfg.SegBytes}
@@ -198,13 +213,13 @@ func (r *Runtime) UseDemoter(fn func(*Ctx) int) {
 // Shards reports the shard count.
 func (r *Runtime) Shards() int { return len(r.workers) }
 
-// ShardOf routes a key to its owner: wyhash mod S, the hash computed once and
-// shared with the owner's index probe. The CRC16 slot table with hash-tag
-// semantics (doc 03 section 2.1) replaces this route when the multi-key
-// slices need slot-honest co-location; nothing below the route decision sees
+// ShardOf routes a key to its owner: hash slot to contiguous slot group
+// to group id mod S (slot.go). This is the slot-honest route the f3
+// wyhash comment promised; keys sharing a hash tag share a slot, so they
+// share a group and a shard, and nothing below the route decision sees
 // the difference.
 func (r *Runtime) ShardOf(key []byte) int {
-	return int(store.Hash(key) % uint64(len(r.workers)))
+	return r.GroupOf(key) % len(r.workers)
 }
 
 // Start launches every worker goroutine.
