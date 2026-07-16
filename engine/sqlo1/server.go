@@ -46,6 +46,9 @@ type Server struct {
 	// element count only after the walk, so the inner array header
 	// cannot go down first the way HGETALL's does.
 	scanBuf []byte
+
+	// ttlBuf holds one HEXPIRE-family command's per-field codes.
+	ttlBuf []int64
 }
 
 // splitPairs fills mkeys and mvals from an even-length key-value
@@ -759,6 +762,12 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.hscanCmd(ctx, reply, args)
 	case "HRANDFIELD":
 		return s.hrandCmd(ctx, reply, args)
+	case "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT":
+		return s.hexpireCmd(ctx, reply, args, now, cmd)
+	case "HTTL", "HPTTL", "HEXPIRETIME", "HPEXPIRETIME":
+		return s.httlCmd(ctx, reply, args, now, cmd)
+	case "HPERSIST":
+		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
@@ -1284,6 +1293,166 @@ func (s *Server) hrandCmd(ctx context.Context, reply []byte, args [][]byte) []by
 		return storeErr(reply[:mark], err)
 	}
 	return reply
+}
+
+// hfeMaxAbsTimeMs bounds every absolute field expiry, Redis's
+// HFE_MAX_ABS_TIME_MSEC: the listpackEx TTL field steals two bits, so
+// the ceiling is (2^48 - 1) >> 2. Ours has no such packing, but the
+// bound is wire behavior the compat section diffs.
+const hfeMaxAbsTimeMs = int64(1)<<46 - 1
+
+// hexpireCmd is HEXPIRE/HPEXPIRE/HEXPIREAT/HPEXPIREAT key time
+// [NX|XX|GT|LT] FIELDS numfields field..., Redis 8's exact grammar
+// and check order: type first, then the expire parse, then the
+// optional condition, then the FIELDS block, and a missing key is a
+// -2 array only after all of that.
+func (s *Server) hexpireCmd(ctx context.Context, reply []byte, args [][]byte, now int64, cmd string) []byte {
+	if len(args) < 6 {
+		return arityErr(reply, cmd)
+	}
+	if _, err := s.h.HLen(ctx, args[1]); err != nil {
+		return storeErr(reply, err)
+	}
+	unit, base := int64(1000), now
+	switch cmd {
+	case "HPEXPIRE":
+		unit = 1
+	case "HEXPIREAT":
+		base = 0
+	case "HPEXPIREAT":
+		unit, base = 1, 0
+	}
+	atMs, errReply := hfeExpireAt(reply, args[2], cmd, unit, base)
+	if errReply != nil {
+		return errReply
+	}
+	cond, fieldsAt := HExpireNone, 3
+	switch strings.ToUpper(string(args[3])) {
+	case "NX":
+		cond, fieldsAt = HExpireNX, 4
+	case "XX":
+		cond, fieldsAt = HExpireXX, 4
+	case "GT":
+		cond, fieldsAt = HExpireGT, 4
+	case "LT":
+		cond, fieldsAt = HExpireLT, 4
+	}
+	fields, errText := hfeFields(args[fieldsAt:], "ERR Parameter `numFields` should be greater than 0")
+	if errText != "" {
+		return AppendError(reply, errText)
+	}
+	res, err := s.h.HExpire(ctx, args[1], atMs, cond, fields, s.ttlBuf[:0])
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	s.ttlBuf = res
+	reply = AppendArray(reply, len(res))
+	for _, code := range res {
+		reply = AppendInt(reply, code)
+	}
+	return reply
+}
+
+// httlCmd is HTTL/HPTTL/HEXPIRETIME/HPEXPIRETIME key FIELDS numfields
+// field...: the engine answers absolute expire milliseconds and this
+// layer owns Redis's four conversions, remaining seconds rounding up.
+func (s *Server) httlCmd(ctx context.Context, reply []byte, args [][]byte, now int64, cmd string) []byte {
+	if len(args) < 5 {
+		return arityErr(reply, cmd)
+	}
+	if _, err := s.h.HLen(ctx, args[1]); err != nil {
+		return storeErr(reply, err)
+	}
+	fields, errText := hfeFields(args[2:], "ERR Number of fields must be a positive integer")
+	if errText != "" {
+		return AppendError(reply, errText)
+	}
+	res, err := s.h.HTtl(ctx, args[1], fields, s.ttlBuf[:0])
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	s.ttlBuf = res
+	reply = AppendArray(reply, len(res))
+	for _, e := range res {
+		if e > 0 {
+			switch cmd {
+			case "HTTL":
+				e = (e + 999 - now) / 1000
+			case "HPTTL":
+				e -= now
+			case "HEXPIRETIME":
+				e = (e + 999) / 1000
+			}
+		}
+		reply = AppendInt(reply, e)
+	}
+	return reply
+}
+
+// hpersistCmd is HPERSIST key FIELDS numfields field...
+func (s *Server) hpersistCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 5 {
+		return arityErr(reply, "HPERSIST")
+	}
+	if _, err := s.h.HLen(ctx, args[1]); err != nil {
+		return storeErr(reply, err)
+	}
+	fields, errText := hfeFields(args[2:], "ERR Number of fields must be a positive integer")
+	if errText != "" {
+		return AppendError(reply, errText)
+	}
+	res, err := s.h.HPersist(ctx, args[1], fields, s.ttlBuf[:0])
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	s.ttlBuf = res
+	reply = AppendArray(reply, len(res))
+	for _, code := range res {
+		reply = AppendInt(reply, code)
+	}
+	return reply
+}
+
+// hfeExpireAt is Redis's parseExpireTime: the value must be a
+// non-negative integer, and neither the seconds-to-ms conversion nor
+// the base add may cross hfeMaxAbsTimeMs. A non-nil errReply is the
+// whole reply.
+func hfeExpireAt(reply []byte, arg []byte, cmd string, unit, base int64) (atMs int64, errReply []byte) {
+	val, err := strconv.ParseInt(string(arg), 10, 64)
+	if err != nil {
+		return 0, AppendError(reply, "ERR value is not an integer or out of range")
+	}
+	if val < 0 {
+		return 0, AppendError(reply, "ERR invalid expire time, must be >= 0")
+	}
+	if unit == 1000 {
+		if val > hfeMaxAbsTimeMs/1000 {
+			return 0, invalidExpire(reply, cmd)
+		}
+		val *= 1000
+	}
+	if val > hfeMaxAbsTimeMs-base {
+		return 0, invalidExpire(reply, cmd)
+	}
+	return base + val, nil
+}
+
+// hfeFields parses the FIELDS numfields field... run that ends the
+// HEXPIRE family's commands. Same shape as fieldsBlock but with this
+// family's own error texts (Redis grew the two grammars separately);
+// numErrText is the family's bad-numfields reply.
+func hfeFields(args [][]byte, numErrText string) ([][]byte, string) {
+	if !strings.EqualFold(string(args[0]), "FIELDS") {
+		return nil, "ERR Mandatory argument FIELDS is missing or not at the right position"
+	}
+	n, err := strconv.ParseInt(string(args[1]), 10, 64)
+	if err != nil || n < 1 {
+		return nil, numErrText
+	}
+	if n != int64(len(args)-2) {
+		return nil, "ERR The `numfields` parameter must match the number of arguments"
+	}
+	return args[2:], ""
 }
 
 // fieldsBlock parses the FIELDS numfields field... run that ends

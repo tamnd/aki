@@ -188,9 +188,11 @@ func (h *Hash) drawSegEntry(ctx context.Context, total uint64) (fi, ei int, f, v
 
 // HRandField is the no-count form: one uniform-ish draw, ok false on
 // an absent key. The returned bytes alias internal buffers until the
-// next call on this layer, the HGet rule.
+// next call on this layer, the HGet rule. Draws read through
+// stateOfLive (a due root reaps first), so a dead entry can never be
+// drawn and the count the draws trust is exact live.
 func (h *Hash) HRandField(ctx context.Context, key []byte) (field, val []byte, ok bool, err error) {
-	st, hi, _, err := h.stateOf(ctx, key)
+	st, hi, _, err := h.stateOfLive(ctx, key)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -219,9 +221,11 @@ func (h *Hash) HRandField(ctx context.Context, key []byte) (field, val []byte, o
 // min(count, HLEN) distinct fields. begin runs exactly once, before
 // any emit, with the exact number of entries that will be emitted, so
 // a RESP writer can put the array header down first. Emitted bytes
-// are only valid inside the emit call.
+// are only valid inside the emit call. Like HRandField, the read goes
+// through stateOfLive, so the begin(n) arithmetic and every draw path
+// below run over live entries only.
 func (h *Hash) HRandFieldCount(ctx context.Context, key []byte, count int64, withReplacement bool, begin func(n int64), emit func(field, val []byte)) error {
-	st, hi, _, err := h.stateOf(ctx, key)
+	st, hi, _, err := h.stateOfLive(ctx, key)
 	if err != nil {
 		return err
 	}

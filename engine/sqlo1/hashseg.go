@@ -148,10 +148,13 @@ func hashSegGet(s hashSeg, fh uint64, field []byte) (val []byte, expMs int64, ok
 }
 
 // hashSegSet rebuilds a segment payload with one field written, into
-// dst[:0]. created is false for an update. expMs is the field TTL the
-// written entry carries (0 for none); HSET's clear-on-update rule is
-// the caller passing 0.
-func hashSegSet(dst []byte, s hashSeg, fh uint64, field, val []byte, expMs int64) (out []byte, created bool, err error) {
+// dst[:0]. created is false for an update; revived means the replaced
+// entry was already expired at nowMs, so the write is a create on the
+// wire (the dead field was never observable) while the count is an
+// update (the dead entry was still counted). expMs is the field TTL
+// the written entry carries (0 for none); HSET's clear-on-update rule
+// is the caller passing 0.
+func hashSegSet(dst []byte, s hashSeg, fh uint64, field, val []byte, expMs, nowMs int64) (out []byte, created, revived bool, err error) {
 	out = grow(dst, hashSegHdrLen)
 	it := hashEntryIter{p: s.entries}
 	created = true
@@ -161,7 +164,7 @@ func hashSegSet(dst []byte, s hashSeg, fh uint64, field, val []byte, expMs int64
 		before := it.p
 		f, _, eExp, ok, err := it.next()
 		if err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 		if !ok {
 			break
@@ -172,6 +175,7 @@ func hashSegSet(dst []byte, s hashSeg, fh uint64, field, val []byte, expMs int64
 				out = appendHashEntry(out, field, val, expMs)
 				placed = true
 				created = false
+				revived = eExp != 0 && eExp <= nowMs
 				continue
 			}
 			if hashSegKeyLess(fh, field, efh, f) {
@@ -192,15 +196,18 @@ func hashSegSet(dst []byte, s hashSeg, fh uint64, field, val []byte, expMs int64
 		n++
 	}
 	putHashSegHdr(out, n, minExp)
-	return out, created, nil
+	return out, created, revived, nil
 }
 
 // hashSegDel rebuilds a segment payload with one field removed, into
 // dst[:0]. removed is false when the field was not there, and out is
-// nil in that case. A delete that empties the segment returns the
-// bare header; the fence layer keeps the empty segment until the lazy
-// merge folds it into a neighbor.
-func hashSegDel(dst []byte, s hashSeg, fh uint64, field []byte) (out []byte, removed bool, err error) {
+// nil in that case; an entry already expired at nowMs counts as not
+// there (lazy expiry: the dead field was never observable, so HDEL
+// answers 0, and the entry itself waits for the reaper). A delete
+// that empties the segment returns the bare header; the fence layer
+// keeps the empty segment until the lazy merge folds it into a
+// neighbor.
+func hashSegDel(dst []byte, s hashSeg, fh uint64, field []byte, nowMs int64) (out []byte, removed bool, err error) {
 	out = grow(dst, hashSegHdrLen)
 	it := hashEntryIter{p: s.entries}
 	minExp := int64(0)
@@ -213,7 +220,7 @@ func hashSegDel(dst []byte, s hashSeg, fh uint64, field []byte) (out []byte, rem
 		if !ok {
 			break
 		}
-		if !removed && hashFH(f) == fh && bytes.Equal(f, field) {
+		if !removed && hashFH(f) == fh && bytes.Equal(f, field) && (eExp == 0 || eExp > nowMs) {
 			removed = true
 			continue
 		}
