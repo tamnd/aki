@@ -5,6 +5,8 @@
 package dispatch
 
 import (
+	"sort"
+
 	"github.com/tamnd/aki/engine/obs1/derived"
 	"github.com/tamnd/aki/engine/obs1/hash"
 	"github.com/tamnd/aki/engine/obs1/list"
@@ -615,6 +617,19 @@ func init() {
 
 // Handlers returns the op-indexed handler vector for Runtime.Use.
 func Handlers() []shard.Handler { return handlers }
+
+// Commands returns every registered verb, sorted. The cmd/obs1srv
+// conformance corpus checks itself against this list, so a verb added to
+// the table without a corpus entry fails that suite instead of silently
+// shipping unexercised.
+func Commands() []string {
+	out := make([]string, 0, len(table))
+	for name := range table {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // Demoter returns the collection-demotion hook for Runtime.UseDemoter, the entry
 // the worker's demote loop calls under memory pressure to shed a native
