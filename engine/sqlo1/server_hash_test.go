@@ -423,3 +423,127 @@ func TestServerHashIterSurface(t *testing.T) {
 		}
 	}
 }
+
+func TestServerHashRandSurface(t *testing.T) {
+	c, r := startServer(t)
+	send := func(args ...string) {
+		t.Helper()
+		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Absent keys: null bulk without a count, empty array with one.
+	send("HRANDFIELD")
+	expect(t, r, "-ERR wrong number of arguments for 'hrandfield' command\r\n")
+	send("HRANDFIELD", "ghost")
+	expect(t, r, "$-1\r\n")
+	send("HRANDFIELD", "ghost", "5")
+	expect(t, r, "*0\r\n")
+	send("HRANDFIELD", "ghost", "-5", "WITHVALUES")
+	expect(t, r, "*0\r\n")
+
+	// The count grammar, Redis's exact door order and texts.
+	send("HRANDFIELD", "ghost", "abc")
+	expect(t, r, "-ERR value is not an integer or out of range\r\n")
+	send("HRANDFIELD", "ghost", "-9223372036854775808")
+	expect(t, r, "-ERR value is out of range\r\n")
+	send("HRANDFIELD", "ghost", "3", "WITHVALUES", "extra")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("HRANDFIELD", "ghost", "3", "BOGUS")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("HRANDFIELD", "ghost", "4611686018427387904", "WITHVALUES")
+	expect(t, r, "-ERR value is out of range\r\n")
+	send("HRANDFIELD", "ghost", "-4611686018427387904", "WITHVALUES")
+	expect(t, r, "-ERR value is out of range\r\n")
+
+	// Cross-type doors, both forms.
+	send("SET", "str", "v")
+	expect(t, r, "+OK\r\n")
+	wrong := "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+	send("HRANDFIELD", "str")
+	expect(t, r, wrong)
+	send("HRANDFIELD", "str", "3")
+	expect(t, r, wrong)
+	send("HRANDFIELD", "str", "0")
+	expect(t, r, wrong)
+
+	// Inline hash: a count at or above HLEN answers the whole hash in
+	// entry order, which makes the reply exact.
+	send("HSET", "h", "b", "2", "a", "1", "c", "3")
+	expect(t, r, ":3\r\n")
+	send("HRANDFIELD", "h", "0")
+	expect(t, r, "*0\r\n")
+	send("HRANDFIELD", "h", "10")
+	expect(t, r, "*3\r\n$1\r\nb\r\n$1\r\na\r\n$1\r\nc\r\n")
+	send("HRANDFIELD", "h", "3", "WITHVALUES")
+	expect(t, r, "*6\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nc\r\n$1\r\n3\r\n")
+
+	want := map[string]string{"a": "1", "b": "2", "c": "3"}
+	send("HRANDFIELD", "h")
+	if f := readBulk(t, r); want[f] == "" {
+		t.Fatalf("single draw returned %q", f)
+	}
+	send("HRANDFIELD", "h", "2")
+	if n := readArrayLen(t, r); n != 2 {
+		t.Fatalf("count 2 answered %d elements", n)
+	}
+	f1, f2 := readBulk(t, r), readBulk(t, r)
+	if want[f1] == "" || want[f2] == "" || f1 == f2 {
+		t.Fatalf("count 2 drew %q, %q", f1, f2)
+	}
+	send("HRANDFIELD", "h", "-7", "WITHVALUES")
+	if n := readArrayLen(t, r); n != 14 {
+		t.Fatalf("count -7 WITHVALUES answered %d elements", n)
+	}
+	for range 7 {
+		f, v := readBulk(t, r), readBulk(t, r)
+		if want[f] != v {
+			t.Fatalf("replacement draw %q=%q is not a member pair", f, v)
+		}
+	}
+
+	// Segmented hash: every distinct ladder rung plus replacement.
+	fields := map[string]string{}
+	for i := range 150 {
+		f := fmt.Sprintf("w%03d", i)
+		v := fmt.Sprintf("v-%d-%s", i, strings.Repeat("y", 100))
+		fields[f] = v
+		send("HSET", "big", f, v)
+		expect(t, r, ":1\r\n")
+	}
+
+	drawDistinct := func(count string, wantN int) {
+		t.Helper()
+		send("HRANDFIELD", "big", count)
+		if n := readArrayLen(t, r); n != wantN {
+			t.Fatalf("HRANDFIELD big %s answered %d elements, want %d", count, n, wantN)
+		}
+		seen := map[string]bool{}
+		for range wantN {
+			f := readBulk(t, r)
+			if fields[f] == "" || seen[f] {
+				t.Fatalf("HRANDFIELD big %s drew %q (dup or non-member)", count, f)
+			}
+			seen[f] = true
+		}
+	}
+	drawDistinct("200", 150) // emit-all rung
+	drawDistinct("100", 100) // reservoir rung
+	drawDistinct("20", 20)   // rejection rung
+
+	send("HRANDFIELD", "big", "-30", "WITHVALUES")
+	if n := readArrayLen(t, r); n != 60 {
+		t.Fatalf("count -30 WITHVALUES answered %d elements", n)
+	}
+	for range 30 {
+		f, v := readBulk(t, r), readBulk(t, r)
+		if fields[f] != v {
+			t.Fatalf("segmented replacement draw %q=%q is not a member pair", f, v)
+		}
+	}
+	send("HRANDFIELD", "big")
+	if f := readBulk(t, r); fields[f] == "" {
+		t.Fatalf("segmented single draw returned %q", f)
+	}
+}

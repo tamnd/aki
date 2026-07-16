@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 )
 
 // ErrWrongType is the cross-type guard: an operation met a key holding
@@ -260,6 +261,9 @@ type HashConfig struct {
 	Shard uint16
 	// LeaseN is the mint lease size. Default defaultLeaseN.
 	LeaseN uint64
+	// Seed seeds HRANDFIELD's generator; zero takes a clock seed.
+	// Tests that want reproducible draws set it.
+	Seed uint64
 }
 
 // Hash is the hash ladder over one Tiered. Construction requires the
@@ -309,6 +313,16 @@ type Hash struct {
 	mgRoots  []bool
 	mgExps   []int64
 	mgSegs   []hashSeg
+
+	// HRANDFIELD state: the splitmix64 walk, the cumulative fence
+	// weights of one draw batch, the distinct-sample bookkeeping, and
+	// the reservoir's copy arena (emitted bytes must not alias IO
+	// rounds the pass has already left behind).
+	rngState uint64
+	wsum     []uint64
+	picked   map[uint64]struct{}
+	rvSlots  []rvSlot
+	rvArena  []byte
 }
 
 // NewHash builds the hash layer over t.
@@ -320,7 +334,11 @@ func NewHash(t *Tiered, cfg HashConfig) (*Hash, error) {
 	if cfg.LeaseN == 0 {
 		cfg.LeaseN = defaultLeaseN
 	}
-	return &Hash{t: t, mint: mint, cfg: cfg}, nil
+	seed := cfg.Seed
+	if seed == 0 {
+		seed = uint64(time.Now().UnixNano())
+	}
+	return &Hash{t: t, mint: mint, cfg: cfg, rngState: seed}, nil
 }
 
 // nextRooth mints one rooth, taking a fresh durable lease when the

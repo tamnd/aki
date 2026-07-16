@@ -757,6 +757,8 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return reply
 	case "HSCAN":
 		return s.hscanCmd(ctx, reply, args)
+	case "HRANDFIELD":
+		return s.hrandCmd(ctx, reply, args)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
@@ -1227,6 +1229,61 @@ func (s *Server) hscanCmd(ctx context.Context, reply []byte, args [][]byte) []by
 	reply = AppendBulk(reply, strconv.AppendUint(cbuf[:0], next, 10))
 	reply = AppendArray(reply, elems)
 	return append(reply, s.scanBuf...)
+}
+
+// hrandCmd is HRANDFIELD key [count [WITHVALUES]], Redis's exact
+// grammar: the count parses first with a -LONG_MAX..LONG_MAX range
+// check, anything after it other than a lone WITHVALUES is a syntax
+// error, and WITHVALUES halves the legal range so the doubled reply
+// length cannot overflow. A negative count draws with replacement.
+func (s *Server) hrandCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 2 {
+		return arityErr(reply, "HRANDFIELD")
+	}
+	if len(args) == 2 {
+		f, _, ok, err := s.h.HRandField(ctx, args[1])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if !ok {
+			return AppendNullBulk(reply)
+		}
+		return AppendBulk(reply, f)
+	}
+	l, ok := parseCanonicalInt(args[2])
+	if !ok {
+		return AppendError(reply, "ERR value is not an integer or out of range")
+	}
+	if l == math.MinInt64 {
+		return AppendError(reply, "ERR value is out of range")
+	}
+	if len(args) > 4 || (len(args) == 4 && !strings.EqualFold(string(args[3]), "WITHVALUES")) {
+		return syntaxErr(reply)
+	}
+	withValues := len(args) == 4
+	if withValues && (l < -(math.MaxInt64/2) || l > math.MaxInt64/2) {
+		return AppendError(reply, "ERR value is out of range")
+	}
+	count, withReplacement := l, false
+	if l < 0 {
+		count, withReplacement = -l, true
+	}
+	mark := len(reply)
+	err := s.h.HRandFieldCount(ctx, args[1], count, withReplacement, func(n int64) {
+		if withValues {
+			n *= 2
+		}
+		reply = AppendArray(reply, int(n))
+	}, func(f, v []byte) {
+		reply = AppendBulk(reply, f)
+		if withValues {
+			reply = AppendBulk(reply, v)
+		}
+	})
+	if err != nil {
+		return storeErr(reply[:mark], err)
+	}
+	return reply
 }
 
 // fieldsBlock parses the FIELDS numfields field... run that ends
