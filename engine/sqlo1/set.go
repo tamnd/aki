@@ -7,7 +7,7 @@ import (
 
 // Set is the set layer over Tiered: the doc 08 model, which is the
 // doc 06 hash machinery with no values. It rides the same Hash type
-// with the valless codec dimension on, so the representation ladder
+// with the encSet codec dimension, so the representation ladder
 // (inline root, member segments, fence paging), the fh partitioning,
 // and the W1-W4 write rules are all the hash's, byte discipline
 // included. Members are hash fields; there is no value and no field
@@ -43,7 +43,7 @@ func NewSet(t *Tiered, cfg HashConfig) (*Set, error) {
 		return nil, err
 	}
 	h.tag, h.subSeg, h.subInline = TagSet, setSubSeg, setSubInline
-	h.valless = true
+	h.enc = encSet
 	return &Set{h: h}, nil
 }
 

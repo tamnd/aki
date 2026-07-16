@@ -42,12 +42,12 @@ func segFromPairs(t *testing.T, pairs ...any) []byte {
 		})
 	}
 	sortHashSegEntries(entries)
-	return appendHashSegPayload(nil, entries, false)
+	return appendHashSegPayload(nil, entries, encHash)
 }
 
 func TestHashSegCodec(t *testing.T) {
 	p := segFromPairs(t, "a", "1", 0, "b", "2", 900, "c", "3", 500)
-	s, err := decodeHashSeg(p, false)
+	s, err := decodeHashSeg(p, encHash)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -55,11 +55,11 @@ func TestHashSegCodec(t *testing.T) {
 		t.Fatalf("decoded n=%d minExp=%d, want 3, 500", s.n, s.minExpMs)
 	}
 
-	empty := appendHashSegPayload(nil, nil, false)
+	empty := appendHashSegPayload(nil, nil, encHash)
 	if len(empty) != hashSegHdrLen {
 		t.Fatalf("empty segment payload is %d bytes, want %d", len(empty), hashSegHdrLen)
 	}
-	if s, err := decodeHashSeg(empty, false); err != nil || s.n != 0 || s.minExpMs != 0 {
+	if s, err := decodeHashSeg(empty, encHash); err != nil || s.n != 0 || s.minExpMs != 0 {
 		t.Fatalf("empty segment decode: n=%d minExp=%d err=%v", s.n, s.minExpMs, err)
 	}
 
@@ -68,7 +68,7 @@ func TestHashSegCodec(t *testing.T) {
 	misordered := func(fields ...string) []byte {
 		b := make([]byte, hashSegHdrLen)
 		for _, f := range fields {
-			b = appendHashEntry(b, []byte(f), []byte("v"), 0, false)
+			b = appendHashEntry(b, []byte(f), []byte("v"), 0, encHash)
 		}
 		putHashSegHdr(b, len(fields), 0)
 		return b
@@ -92,7 +92,7 @@ func TestHashSegCodec(t *testing.T) {
 		"min_expire wrong": badMin,
 	}
 	for name, p := range corrupt {
-		if _, err := decodeHashSeg(p, false); err == nil {
+		if _, err := decodeHashSeg(p, encHash); err == nil {
 			t.Errorf("%s: corrupt segment decoded cleanly", name)
 		}
 	}
@@ -106,7 +106,7 @@ func TestHashSegPointOps(t *testing.T) {
 		expMs int64
 	}
 	ref := map[string]fv{}
-	cur := appendHashSegPayload(nil, nil, false)
+	cur := appendHashSegPayload(nil, nil, encHash)
 	var scratch []byte
 
 	rng := uint64(0x9e3779b97f4a7c15)
@@ -119,7 +119,7 @@ func TestHashSegPointOps(t *testing.T) {
 
 	check := func(field string) {
 		t.Helper()
-		s, err := decodeHashSeg(cur, false)
+		s, err := decodeHashSeg(cur, encHash)
 		if err != nil {
 			t.Fatalf("payload invalid after write: %v", err)
 		}
@@ -143,7 +143,7 @@ func TestHashSegPointOps(t *testing.T) {
 	for i := range 4000 {
 		field := fmt.Sprintf("f%02d", next(48))
 		f := []byte(field)
-		s, err := decodeHashSeg(cur, false)
+		s, err := decodeHashSeg(cur, encHash)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -193,12 +193,12 @@ func TestHashSegSplitMerge(t *testing.T) {
 		})
 	}
 	sortHashSegEntries(entries)
-	whole := appendHashSegPayload(nil, entries, false)
+	whole := appendHashSegPayload(nil, entries, encHash)
 	if len(whole) <= hashSegMax {
 		t.Fatalf("test segment is %d bytes, wanted past seg_max %d", len(whole), hashSegMax)
 	}
 
-	parsed, err := parseHashSegEntries(nil, whole[hashSegHdrLen:], false)
+	parsed, err := parseHashSegEntries(nil, whole[hashSegHdrLen:], encHash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,23 +221,23 @@ func TestHashSegSplitMerge(t *testing.T) {
 		t.Fatalf("boundary %#x is not the first right entry's fh %#x", boundary, parsed[mid].fh)
 	}
 
-	lop := appendHashSegPayload(nil, parsed[:mid], false)
-	hip := appendHashSegPayload(nil, parsed[mid:], false)
-	if _, err := decodeHashSeg(lop, false); err != nil {
+	lop := appendHashSegPayload(nil, parsed[:mid], encHash)
+	hip := appendHashSegPayload(nil, parsed[mid:], encHash)
+	if _, err := decodeHashSeg(lop, encHash); err != nil {
 		t.Fatalf("left half: %v", err)
 	}
-	if _, err := decodeHashSeg(hip, false); err != nil {
+	if _, err := decodeHashSeg(hip, encHash); err != nil {
 		t.Fatalf("right half: %v", err)
 	}
 
-	merged, err := mergeHashSegs(nil, lop, hip, false)
+	merged, err := mergeHashSegs(nil, lop, hip, encHash)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(merged, whole) {
 		t.Fatal("merge of the two halves does not reproduce the original payload")
 	}
-	if _, err := mergeHashSegs(nil, hip, lop, false); err == nil {
+	if _, err := mergeHashSegs(nil, hip, lop, encHash); err == nil {
 		t.Fatal("merge accepted halves in the wrong range order")
 	}
 
@@ -257,11 +257,11 @@ func TestHashSegSplitMerge(t *testing.T) {
 	if hashSegKeyLess(hashFH([]byte("b")), []byte("b"), hashFH([]byte("a")), []byte("a")) {
 		lo, hi = th, tl
 	}
-	mergedTTL, err := mergeHashSegs(nil, lo, hi, false)
+	mergedTTL, err := mergeHashSegs(nil, lo, hi, encHash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ms, err := decodeHashSeg(mergedTTL, false)
+	ms, err := decodeHashSeg(mergedTTL, encHash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,17 +292,17 @@ func TestHashSegSplitGuards(t *testing.T) {
 // holding the same fields.
 func TestHashSegUpgradeOrder(t *testing.T) {
 	var region []byte
-	region = appendHashEntry(region, []byte("zeta"), []byte("1"), 0, false)
-	region = appendHashEntry(region, []byte("alpha"), []byte("2"), 400, false)
-	region = appendHashEntry(region, []byte("mid"), []byte("3"), 0, false)
+	region = appendHashEntry(region, []byte("zeta"), []byte("1"), 0, encHash)
+	region = appendHashEntry(region, []byte("alpha"), []byte("2"), 400, encHash)
+	region = appendHashEntry(region, []byte("mid"), []byte("3"), 0, encHash)
 
-	entries, err := parseHashSegEntries(nil, region, false)
+	entries, err := parseHashSegEntries(nil, region, encHash)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sortHashSegEntries(entries)
-	p := appendHashSegPayload(nil, entries, false)
-	s, err := decodeHashSeg(p, false)
+	p := appendHashSegPayload(nil, entries, encHash)
+	s, err := decodeHashSeg(p, encHash)
 	if err != nil {
 		t.Fatalf("upgraded segment invalid: %v", err)
 	}

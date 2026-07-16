@@ -61,7 +61,7 @@ func (h *Hash) HMGet(ctx context.Context, key []byte, fields [][]byte, emit func
 		// at 2 KiB and no Tiered call happens before the emits, so the
 		// values alias the root read safely.
 		for _, f := range fields {
-			it := hashEntryIter{p: hi.entries, valless: h.valless}
+			it := hashEntryIter{p: hi.entries, enc: h.enc}
 			hit := false
 			for {
 				ef, ev, _, ok, err := it.next()
@@ -132,7 +132,7 @@ func (h *Hash) HMGet(ctx context.Context, key []byte, fields [][]byte, emit func
 		if h.mgVals[slot] == nil {
 			return fmt.Errorf("sqlo1: hash segment %d of rooth %#x is missing", id, r.rooth)
 		}
-		h.mgSegs[slot], err = decodeHashSeg(h.mgVals[slot], h.valless)
+		h.mgSegs[slot], err = decodeHashSeg(h.mgVals[slot], h.enc)
 		if err != nil {
 			return err
 		}

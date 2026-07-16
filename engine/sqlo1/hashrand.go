@@ -112,8 +112,8 @@ func (h *Hash) drawFenceIdx(ctx context.Context, total uint64) (int, error) {
 
 // hashEntryAt walks region to entry idx. The caller has bounded idx
 // by the entry count, so running out is a corruption error.
-func hashEntryAt(region []byte, idx int, valless bool) (f, v []byte, err error) {
-	it := hashEntryIter{p: region, valless: valless}
+func hashEntryAt(region []byte, idx int, enc hashEnc) (f, v []byte, err error) {
+	it := hashEntryIter{p: region, enc: enc}
 	for k := 0; ; k++ {
 		f, v, _, ok, err := it.next()
 		if err != nil {
@@ -153,7 +153,7 @@ func (h *Hash) drawSegEntry(ctx context.Context, total uint64) (fi, ei int, f, v
 			continue
 		}
 		j := int(h.rand64() % uint64(seg.n))
-		f, v, err := hashEntryAt(seg.entries, j, seg.valless)
+		f, v, err := hashEntryAt(seg.entries, j, seg.enc)
 		if err != nil {
 			return 0, 0, nil, nil, err
 		}
@@ -176,7 +176,7 @@ func (h *Hash) drawSegEntry(ctx context.Context, total uint64) (fi, ei int, f, v
 				continue
 			}
 			j := int(h.rand64() % uint64(seg.n))
-			f, v, err := hashEntryAt(seg.entries, j, seg.valless)
+			f, v, err := hashEntryAt(seg.entries, j, seg.enc)
 			if err != nil {
 				return 0, 0, nil, nil, err
 			}
@@ -201,7 +201,7 @@ func (h *Hash) HRandField(ctx context.Context, key []byte) (field, val []byte, o
 		return nil, nil, false, nil
 	case hashInlineState:
 		idx := int(h.rand64() % uint64(hi.count))
-		f, v, err := hashEntryAt(hi.entries, idx, h.valless)
+		f, v, err := hashEntryAt(hi.entries, idx, h.enc)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -250,7 +250,7 @@ func (h *Hash) randInline(hi hashInline, count int64, withReplacement bool, begi
 	if withReplacement {
 		begin(count)
 		for range count {
-			f, v, err := hashEntryAt(hi.entries, int(h.rand64()%uint64(n)), h.valless)
+			f, v, err := hashEntryAt(hi.entries, int(h.rand64()%uint64(n)), h.enc)
 			if err != nil {
 				return err
 			}
@@ -260,7 +260,7 @@ func (h *Hash) randInline(hi hashInline, count int64, withReplacement bool, begi
 	}
 	if count >= int64(n) {
 		begin(int64(n))
-		it := hashEntryIter{p: hi.entries, valless: h.valless}
+		it := hashEntryIter{p: hi.entries, enc: h.enc}
 		for {
 			f, v, _, ok, err := it.next()
 			if err != nil {
@@ -289,7 +289,7 @@ func (h *Hash) randInline(hi hashInline, count int64, withReplacement bool, begi
 		sel[i] = true
 	}
 	begin(count)
-	it := hashEntryIter{p: hi.entries, valless: h.valless}
+	it := hashEntryIter{p: hi.entries, enc: h.enc}
 	for k := 0; ; k++ {
 		f, v, _, ok, err := it.next()
 		if err != nil {
@@ -402,7 +402,7 @@ func (h *Hash) fenceFill(ctx context.Context, remaining int64, emit func(field, 
 			if err != nil {
 				return remaining, err
 			}
-			it := hashEntryIter{p: seg.entries, valless: seg.valless}
+			it := hashEntryIter{p: seg.entries, enc: seg.enc}
 			for j := 0; remaining > 0; j++ {
 				f, v, _, ok, err := it.next()
 				if err != nil {

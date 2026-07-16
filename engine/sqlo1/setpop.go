@@ -85,7 +85,7 @@ func (s *Set) popInline(ctx context.Context, key []byte, hi hashInline, expMs in
 	n := hi.count
 	if count >= int64(n) {
 		begin(int64(n))
-		it := hashEntryIter{p: hi.entries, valless: h.valless}
+		it := hashEntryIter{p: hi.entries, enc: h.enc}
 		for {
 			f, _, _, ok, err := it.next()
 			if err != nil {
@@ -114,7 +114,7 @@ func (s *Set) popInline(ctx context.Context, key []byte, hi hashInline, expMs in
 	}
 	begin(count)
 	h.rootBuf = grow(h.rootBuf, hashInlineHdrLen)
-	it := hashEntryIter{p: hi.entries, valless: h.valless}
+	it := hashEntryIter{p: hi.entries, enc: h.enc}
 	for k := 0; ; k++ {
 		before := it.p
 		f, _, _, ok, err := it.next()
@@ -244,7 +244,7 @@ func (s *Set) popFill(ctx context.Context, picks []popPick, remaining int64) ([]
 			if err != nil {
 				return picks, remaining, err
 			}
-			it := hashEntryIter{p: seg.entries, valless: seg.valless}
+			it := hashEntryIter{p: seg.entries, enc: seg.enc}
 			for j := 0; remaining > 0; j++ {
 				f, _, _, ok, err := it.next()
 				if err != nil {
@@ -293,7 +293,7 @@ func (s *Set) popSeg(ctx context.Context, picks []popPick) error {
 		for _, p := range picks {
 			drop[p.ei] = true
 		}
-		it := hashEntryIter{p: seg.entries, valless: seg.valless}
+		it := hashEntryIter{p: seg.entries, enc: seg.enc}
 		for k := 0; ; k++ {
 			before := it.p
 			_, _, _, ok, err := it.next()
@@ -394,11 +394,11 @@ func (s *Set) popRebuild(ctx context.Context, key []byte, expMs int64, count int
 			return
 		}
 		fh := hashFH(f)
-		if segN > 0 && len(pack)-segOff+hashEntrySize(len(f), 0, 0, true) > hashSegMax && fh != prevFH {
+		if segN > 0 && len(pack)-segOff+hashEntrySize(len(f), 0, 0, encSet) > hashSegMax && fh != prevFH {
 			closeSeg()
 			openSeg(fh)
 		}
-		pack = appendHashEntry(pack, f, nil, 0, true)
+		pack = appendHashEntry(pack, f, nil, 0, encSet)
 		segN++
 		prevFH = fh
 	})

@@ -110,11 +110,11 @@ func (c *algCursor) refill(ctx context.Context) error {
 		}
 		c.arena = grow(c.arena, need)[:0]
 		for j := range n {
-			seg, err := decodeHashSeg(h.mgVals[j], true)
+			seg, err := decodeHashSeg(h.mgVals[j], encSet)
 			if err != nil {
 				return err
 			}
-			it := hashEntryIter{p: seg.entries, valless: true}
+			it := hashEntryIter{p: seg.entries, enc: encSet}
 			for {
 				m, _, _, ok, err := it.next()
 				if err != nil {
@@ -234,10 +234,10 @@ func (s *Set) beginBuild() *setBuilder {
 }
 
 func (b *setBuilder) add(ctx context.Context, m []byte, fh uint64) error {
-	es := hashEntrySize(len(m), 0, 0, true)
+	es := hashEntrySize(len(m), 0, 0, encSet)
 	if b.inline {
 		if b.count < hashInlineMaxCount && len(b.rootBuf)+es <= hashInlineMax {
-			b.rootBuf = appendHashEntry(b.rootBuf, m, nil, 0, true)
+			b.rootBuf = appendHashEntry(b.rootBuf, m, nil, 0, encSet)
 			b.allInt = b.allInt && isCanonicalInt(m)
 			b.count++
 			return nil
@@ -250,13 +250,13 @@ func (b *setBuilder) add(ctx context.Context, m []byte, fh uint64) error {
 			return err
 		}
 		b.h.segRoot = hashSegRoot{sub: b.h.subSeg, rootgen: 1, rooth: rooth, pi: -1}
-		b.pend, err = parseHashSegEntries(b.pend[:0], b.rootBuf[hashInlineHdrLen:], true)
+		b.pend, err = parseHashSegEntries(b.pend[:0], b.rootBuf[hashInlineHdrLen:], encSet)
 		if err != nil {
 			return err
 		}
 		b.pendSize = hashSegHdrLen
 		for _, e := range b.pend {
-			b.pendSize += hashEntrySize(len(e.field), 0, 0, true)
+			b.pendSize += hashEntrySize(len(e.field), 0, 0, encSet)
 		}
 		if n := len(b.pend); n > 0 {
 			b.lastFH = b.pend[n-1].fh
@@ -283,7 +283,7 @@ func (b *setBuilder) add(ctx context.Context, m []byte, fh uint64) error {
 // out of an unsorted inline driver, which the sort repairs.
 func (b *setBuilder) cut(ctx context.Context) error {
 	sortHashSegEntries(b.pend)
-	b.segBuf = appendHashSegPayload(b.segBuf, b.pend, true)
+	b.segBuf = appendHashSegPayload(b.segBuf, b.pend, encSet)
 	r := &b.h.segRoot
 	segid := r.nextSegid
 	if err := b.h.writeSeg(ctx, segid, b.segBuf); err != nil {
