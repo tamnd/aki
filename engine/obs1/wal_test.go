@@ -64,7 +64,7 @@ func TestWALRoundTrip(t *testing.T) {
 // from its index entry's span, no whole-object parse involved.
 func TestWALRangedPath(t *testing.T) {
 	b := mustWAL(t, 7, sampleWAL())
-	footerOff, footerLen, err := ParseWALTail(b[len(b)-16:])
+	footerOff, footerLen, err := ParseTail(b[len(b)-16:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func TestWALParseRejects(t *testing.T) {
 	flip("frame byte", HeaderSize+walSectionHdr+4)  // section crc
 	flip("tail crc", len(good)-1)                   // tail crc
 	flip("footer offset in tail", len(good)-16)     // tail crc covers it
-	footerOff, _, err := ParseWALTail(good[len(good)-16:])
+	footerOff, _, err := ParseTail(good[len(good)-16:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestWALSectionShapeRejects(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		footerOff, footerLen, _ := ParseWALTail(obj[len(obj)-16:])
+		footerOff, footerLen, _ := ParseTail(obj[len(obj)-16:])
 		index, _ := ParseWALFooter(obj[footerOff : footerOff+uint64(footerLen)])
 		e := index[0]
 		off, n := e.SectionSpan()
