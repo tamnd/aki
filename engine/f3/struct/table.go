@@ -232,3 +232,9 @@ func (t *Table) Delete(h uint64, key []byte, s Set) (uint32, bool) {
 // CapSlots is the allocated slot count, exported for the memory-accounting test
 // so the bucket term is measured against the real table, not a model.
 func (t *Table) CapSlots() int { return int(t.cap) }
+
+// Bytes is the table's resident heap footprint: one control byte per slot plus a
+// four-byte record ordinal per slot. It backs the collection resident-byte
+// estimate the cold-tier accounting keeps (spec 2064/f3/06 section 6.3), so a
+// native set's table term is measured against the real allocation, not modeled.
+func (t *Table) Bytes() int { return len(t.ctrl) + len(t.ords)*4 }

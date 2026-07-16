@@ -263,6 +263,15 @@ func (s *Store) ColdDraining() bool {
 	return s.migrating > 0 || s.NeedsColdDrain()
 }
 
+// ColdConfigured reports whether this store runs the long-term tiering machinery:
+// a resident cap is set (ltmOn) and a cold region is attached. It is the gate a
+// native-heap collection reads to decide whether to maintain its resident-byte
+// accounting (spec 2064/f3/06 section 6): with no cold tier to demote into, the
+// figure would drive nothing, so the collection keeps none and its mutators pay
+// one bool load. One relaxed read on the owner goroutine, fixed for the store's
+// life since both terms are set once at Open.
+func (s *Store) ColdConfigured() bool { return s.cold != nil && s.ltmOn }
+
 // Get copies the value for key into dst (reusing its capacity) and reports
 // whether the key is present. Clockless form of GetString: it never reaps, so
 // it is for callers with no expiry semantics.

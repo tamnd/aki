@@ -45,6 +45,7 @@ func SmoveCross(t *shard.Txn, src, dst, member []byte) []byte {
 			g.m[string(dst)] = d
 		}
 		d.add(member)
+		g.note(d)
 		moved = true
 	})
 	if moved {
@@ -54,6 +55,8 @@ func SmoveCross(t *shard.Txn, src, dst, member []byte) []byte {
 			s.rem(member)
 			if s.card() == 0 {
 				g.drop(src)
+			} else {
+				g.note(s)
 			}
 		})
 	}

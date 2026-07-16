@@ -34,6 +34,7 @@ func Sadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			added++
 		}
 	}
+	g.note(s)
 	r.Int(added)
 }
 
@@ -58,6 +59,8 @@ func Srem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	if s.card() == 0 {
 		g.drop(args[0])
+	} else {
+		g.note(s)
 	}
 	r.Int(removed)
 }
@@ -170,6 +173,8 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		m := s.popOne(g, sc[:])
 		if s.card() == 0 {
 			g.drop(key)
+		} else {
+			g.note(s)
 		}
 		r.Bulk(m)
 		return
@@ -203,6 +208,8 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Raw(out)
 	if s.card() == 0 {
 		g.drop(key)
+	} else {
+		g.note(s)
 	}
 }
 

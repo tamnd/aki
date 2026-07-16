@@ -75,6 +75,34 @@ type set struct {
 	// engaged when the native table crosses the partition threshold. Set only when
 	// enc is encPartitioned; a set never converts back out of the band (F4).
 	part *partitioned
+
+	// acct is this set's resident-byte footprint as last posted to the registry
+	// running total (reg.go, spec 2064/f3/06 section 6). The registry keeps
+	// sum(acct) over its live sets so the shard reads a collection's resident cost
+	// without walking; a mutating command reconciles this against residentBytes
+	// before it returns, so the total is exact at every command boundary. It stays
+	// zero, and is never touched, unless the store runs the cold tier (acctOn).
+	acct uint64
+}
+
+// residentBytes estimates the set's live heap footprint from its backing
+// allocations, the O(1) figure the registry sums for the shard's collection
+// resident signal (spec 2064/f3/06 section 6.3). It counts the capacity that
+// actually holds RAM (the intset slice, the listpack blob, or the native table's
+// slab, records, draw vector, and control bytes), which is what grows with adds
+// and shrinks with removes; the small fixed per-set and per-map overheads are
+// left out because they do not move the demotion decision.
+func (s *set) residentBytes() uint64 {
+	switch s.enc {
+	case encIntset:
+		return uint64(cap(s.ints)) * 8
+	case encListpack:
+		return uint64(cap(s.blob))
+	case encPartitioned:
+		return s.part.residentBytes()
+	default:
+		return s.ht.residentBytes()
+	}
 }
 
 // newSet builds an empty set whose first member decides intset versus

@@ -191,6 +191,20 @@ func (pt *partitioned) has(m []byte) bool {
 	return pt.parts[partOf(store.Hash(m), len(pt.parts))].has(m)
 }
 
+// residentBytes sums the sub-tables' footprints plus the routing slices (the
+// parts pointers and the per-partition counts), the partitioned band's term of
+// the collection resident-byte estimate (spec 2064/f3/06 section 6.3). The F13
+// escalation groups, off by default, are not counted; they engage only under the
+// execution model's draw-heavy hot-key path and never move the demotion decision.
+func (pt *partitioned) residentBytes() uint64 {
+	n := uint64(cap(pt.parts)) * 8
+	n += uint64(cap(pt.counts)) * 8
+	for _, h := range pt.parts {
+		n += h.residentBytes()
+	}
+	return n
+}
+
 func (pt *partitioned) card() int { return int(pt.total) }
 
 // each visits every member across the partitions in index order. Order is
