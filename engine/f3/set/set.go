@@ -83,6 +83,14 @@ type set struct {
 	// before it returns, so the total is exact at every command boundary. It stays
 	// zero, and is never touched, unless the store runs the cold tier (acctOn).
 	acct uint64
+
+	// cold is the set's cold-tier state (cold.go): the resident directory over its
+	// cold chunks, the offset table its records' locators index, and the pread
+	// scratch. It is nil until the demotion pass packs a member into the cold
+	// region, and only the native and partitioned bands can demote (an inline set is
+	// too small to be worth a chunk). A partitioned set's sub-tables all share this
+	// one handle, so the directory spans the whole set.
+	cold *coldChunks
 }
 
 // residentBytes estimates the set's live heap footprint from its backing
@@ -93,16 +101,24 @@ type set struct {
 // and shrinks with removes; the small fixed per-set and per-map overheads are
 // left out because they do not move the demotion decision.
 func (s *set) residentBytes() uint64 {
+	var n uint64
 	switch s.enc {
 	case encIntset:
-		return uint64(cap(s.ints)) * 8
+		n = uint64(cap(s.ints)) * 8
 	case encListpack:
-		return uint64(cap(s.blob))
+		n = uint64(cap(s.blob))
 	case encPartitioned:
-		return s.part.residentBytes()
+		n = s.part.residentBytes()
 	default:
-		return s.ht.residentBytes()
+		n = s.ht.residentBytes()
 	}
+	if s.cold != nil {
+		// A demoted set freed slab bytes into the cold region but keeps the chunk
+		// directory, the offset table, and the pread scratch resident; count them so
+		// the figure the demote loop reads is the true remaining footprint.
+		n += s.cold.residentBytes()
+	}
+	return n
 }
 
 // newSet builds an empty set whose first member decides intset versus

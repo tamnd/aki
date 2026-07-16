@@ -25,11 +25,18 @@ import (
 // control byte), which is what takes the native ledger from ~26-28 to ~21-23
 // bytes per member (section 11.1).
 type record struct {
-	loc   uint32 // slab offset of this member's bytes
+	loc   uint32 // resident: slab offset of the member's bytes; cold: chunk locator
 	vslot uint32 // this member's index in the draw vector, kept current by swap-remove
 	mlen  uint16 // member byte length
-	_     uint8  // band and tier bits, reserved for the algebra and LTM slices
+	band  uint8  // band and tier bits: tierCold marks a demoted member (cold.go)
 }
+
+// tierCold is the record band bit the LTM demotion pass sets when a member's bytes
+// leave the native slab for a cold chunk (cold.go, spec 2064/f3/06 section 6). A
+// cold record's loc no longer points into the slab; it is a chunk locator the cold
+// read path resolves. The bit is never set unless the store runs the cold tier, so
+// every M0-M6 read stays the resident branch below (the L9 zero-delta contract).
+const tierCold uint8 = 0x01
 
 // htable is the native band for one set. It is owner-local, so nothing locks.
 type htable struct {
@@ -55,6 +62,15 @@ type htable struct {
 	// so while the flag is off this pointer stays nil and add/rem carry one
 	// never-taken branch (doc 11 section 6.3).
 	alg *sortedIndex
+
+	// cold is the set's shared cold-tier state (cold.go), nil until the demotion
+	// pass packs one of this set's members into a chunk. Once set it resolves a
+	// cold record's locator to the packed member bytes. A partitioned set's
+	// sub-tables share one *coldChunks, so the directory and offset table span the
+	// whole set. It stays nil unless the store runs the cold tier, so the resident
+	// read paths never dereference it (the tierCold branches gate on the record
+	// bit, which is never set with the cold tier off).
+	cold *coldChunks
 }
 
 // newHashtable builds an empty table sized for hint members, so a band
@@ -69,17 +85,46 @@ func newHashtable(hint int) *htable {
 }
 
 // Match confirms a tag hit: the stored member at ord must equal key. It is the
-// structs.Set half the table probes through, and it allocates nothing.
+// structs.Set half the table probes through, and it allocates nothing on the
+// resident branch. A cold record's bytes are pread from its chunk (cold.go); the
+// table probe is unchanged by demotion, so a cold member is found and confirmed on
+// the same path a resident one is.
 func (h *htable) Match(ord uint32, key []byte) bool {
 	r := &h.recs[ord]
+	if r.band&tierCold != 0 {
+		m, ok := h.cold.member(r.loc)
+		return ok && bytes.Equal(m, key)
+	}
 	return bytes.Equal(h.slab[r.loc:r.loc+uint32(r.mlen)], key)
 }
 
 // Rehash recomputes a member's hash from its bytes for a table resize, since the
-// record caches none.
+// record caches none. A cold record's bytes are pread; a resize that rehashes a
+// cold member is rare (it needs a resident insert into a partly cold table), so
+// the pread cost sits off the steady path.
 func (h *htable) Rehash(ord uint32) uint64 {
 	r := &h.recs[ord]
+	if r.band&tierCold != 0 {
+		if m, ok := h.cold.member(r.loc); ok {
+			return store.Hash(m)
+		}
+		return 0
+	}
 	return store.Hash(h.slab[r.loc : r.loc+uint32(r.mlen)])
+}
+
+// bytesOf returns a member's bytes, resident from the slab or cold from its chunk.
+// A cold read aliases the shared cold scratch and is valid only until the next
+// cold read, the same single-call lifetime the slab alias already carries, so
+// every enumeration consumes each member before it asks for the next. With the
+// cold tier off no record is ever cold, so this is the plain slab slice after one
+// predicted-away branch.
+func (h *htable) bytesOf(r *record) []byte {
+	if r.band&tierCold != 0 {
+		m, _ := h.cold.member(r.loc)
+		return m
+	}
+	return h.slab[r.loc : r.loc+uint32(r.mlen)]
 }
 
 func (h *htable) card() int { return h.tbl.Len() }
@@ -170,39 +215,43 @@ func (h *htable) rem(m []byte) bool {
 		// (doc 11 section 6.3). SPOP reaches this same path through popOne.
 		h.alg.onRemove(hash, ord)
 	}
-	h.dead += int(r.mlen)
+	if r.band&tierCold != 0 {
+		// A cold member's bytes live in a chunk, not the slab, so its removal owes
+		// nothing to slab dead accounting; it dirties the owning chunk instead, which
+		// the promotion-and-repack pass reconciles (spec 2064/f3/06 section 6.5).
+		h.cold.markDirty(hash)
+	} else {
+		h.dead += int(r.mlen)
+	}
 	h.free = append(h.free, ord)
 	h.maybeCompact()
 	return true
 }
 
-// each visits every member in draw-vector order. The []byte aliases the slab and
-// is valid only for the call.
+// each visits every member in draw-vector order. The []byte aliases the slab (or
+// the cold scratch for a demoted member) and is valid only for the call.
 func (h *htable) each(fn func(m []byte)) {
 	for _, ord := range h.vec {
-		r := &h.recs[ord]
-		fn(h.slab[r.loc : r.loc+uint32(r.mlen)])
+		fn(h.bytesOf(&h.recs[ord]))
 	}
 }
 
 // eachUntil visits members in draw-vector order until fn returns false, the
 // early-stop enumeration SINTERCARD's LIMIT walk rides. The []byte aliases the
-// slab and is valid only for the call.
+// slab (or the cold scratch) and is valid only for the call.
 func (h *htable) eachUntil(fn func(m []byte) bool) {
 	for _, ord := range h.vec {
-		r := &h.recs[ord]
-		if !fn(h.slab[r.loc : r.loc+uint32(r.mlen)]) {
+		if !fn(h.bytesOf(&h.recs[ord])) {
 			return
 		}
 	}
 }
 
-// at returns the member at draw index i, aliasing the slab. The uniform draw
-// picks i; this slice walks the vector directly, and the next slice layers the
-// exactly-uniform weighted draw on the same vector.
+// at returns the member at draw index i, aliasing the slab (or the cold scratch).
+// The uniform draw picks i; this slice walks the vector directly, and the next
+// slice layers the exactly-uniform weighted draw on the same vector.
 func (h *htable) at(i int) []byte {
-	r := &h.recs[h.vec[i]]
-	return h.slab[r.loc : r.loc+uint32(r.mlen)]
+	return h.bytesOf(&h.recs[h.vec[i]])
 }
 
 // recordBytes is the fixed per-member record cell width, 12 bytes after
@@ -235,11 +284,12 @@ func (h *htable) vlen() int { return len(h.vec) }
 func (h *htable) ordAt(i int) uint32 { return h.vec[i] }
 
 // memberByOrd returns the bytes of the member at record ordinal ord, aliasing
-// the slab. It is how a streamed enumeration reads a snapshotted ordinal; the
-// streams pin keeps the slab and the record valid for the read.
+// the slab (or the cold scratch for a demoted member). It is how a streamed
+// enumeration reads a snapshotted ordinal; the streams pin keeps the slab and the
+// record valid for the read, and a cold read is copied to the wire before the next
+// ordinal reuses the scratch.
 func (h *htable) memberByOrd(ord uint32) []byte {
-	r := &h.recs[ord]
-	return h.slab[r.loc : r.loc+uint32(r.mlen)]
+	return h.bytesOf(&h.recs[ord])
 }
 
 // mlenByOrd is memberByOrd's length alone, for presizing a reply without
@@ -272,6 +322,9 @@ func (h *htable) maybeCompact() {
 	packed := make([]byte, 0, len(h.slab)-h.dead)
 	for _, ord := range h.vec {
 		r := &h.recs[ord]
+		if r.band&tierCold != 0 {
+			continue // a cold member is not in the slab; its loc is a chunk locator
+		}
 		loc := uint32(len(packed))
 		packed = append(packed, h.slab[r.loc:r.loc+uint32(r.mlen)]...)
 		r.loc = loc
