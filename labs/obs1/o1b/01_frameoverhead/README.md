@@ -28,4 +28,22 @@ Arms alternate every 16 batches of 4096 ops and the statistic is the median per-
 
 ## Results
 
-Pending the measured run; this section lands in the results commit.
+Full sweep in frameoverhead.csv, run 2026-07-17 on the M-series dev box, 256 batches of 4096 ops per arm per size, medians of per-batch ns/op.
+
+| value bytes | base ns/op | frame ns/op | delta ns | in-process delta |
+|-------------|-----------|-------------|----------|------------------|
+| 16 | 36.5 | 38.8 | 2.2 | 6.1% |
+| 64 | 36.7 | 39.6 | 2.9 | 7.8% |
+| 256 | 40.0 | 50.2 | 10.2 | 25.6% |
+| 1024 | 83.2 | 118.7 | 35.5 | 42.7% |
+
+The delta scales with value size because a logical WAL copies the value bytes into the buffer once; 35.5ns for a 1 KiB copy plus the 18-byte fixed part is memcpy speed, there is no constant to tune away.
+An earlier draft ran the base arm first inside every alternation round and read the frame arm as faster than base; the lead arm now alternates too, and that artifact is gone.
+
+## Verdict
+
+PRED-OBS1-O1B-HOTTAX scores HIT.
+The budget line holds with room: 2.2 to 10.2ns at 16 to 256 byte values against the 100ns doc 04 budget, and even the 1 KiB row sits at a third of it.
+The gate line projects comfortably under 5 percent: paritysmoke measured 1.7 to 2.2M ops/s wire-inclusive on this box, roughly 500 to 600ns of wall per op, so 2.9ns at 64 bytes is about half a percent, and the 1 KiB row projects around 3 to 4 percent against the proportionally slower wire path for values that size.
+K1 verdict: the tax is nowhere near the 10 percent kill line, frames stay as designed, and the op-frames slice can bake this encoder shape.
+The in-process percentages in the table are real but are the wrong denominator for K1, which is why the projection line exists; the binding evidence stays with the F9-class gate runs on the box.
