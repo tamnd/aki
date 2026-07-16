@@ -93,6 +93,9 @@ var (
 	ErrShort = errors.New("akifile: buffer too short")
 	// ErrLength is a payload length that disagrees with its framed length.
 	ErrLength = errors.New("akifile: length mismatch")
+	// ErrCheckpoint is a checkpoint header that is malformed: an unknown
+	// full-or-delta kind, or a full dump carrying a nonzero base offset.
+	ErrCheckpoint = errors.New("akifile: malformed checkpoint header")
 )
 
 var (
