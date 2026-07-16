@@ -32,6 +32,22 @@ type nativeStore struct {
 	slab []byte        // member bytes, appended; holes left by rem until rebuild
 	tree *structs.Tree // counted B+ tree keyed (sortable score, member by ref)
 
+	// cold is the demoted-member chunk state (cold.go), nil until the demote pass
+	// retiers the first member. A demoted record keeps its cell, its hash slot, and
+	// its tree ref (the score stays resident in bits), but its loc turns from a slab
+	// offset into a chunk locator with the tierCold high bit set, and its member
+	// bytes leave the slab for a cold chunk. bytesOf routes a cold record's byte
+	// reads through a pread; every other record reads the slab exactly as before, so
+	// a zset with no cold tier (cold == nil, no loc carries tierCold) is
+	// byte-identical to the M0-M6 native band.
+	cold *coldChunks
+
+	// stable buffers a cold member's bytes when a delete path must pass them into a
+	// hash or tree probe: the probe's own Match preads other candidates into the
+	// shared cold scratch, which would clobber a member that aliased it, so a cold
+	// delete copies the member here first. Owner-local, reused across deletes.
+	stable []byte
+
 	// Removed records are never reused and their bytes never move in place: a
 	// tree separator is a copy of a boundary key and legitimately outlives the
 	// entry it was copied from, so its ref must keep resolving to the original
@@ -82,25 +98,65 @@ func newNativeStore(hint int) *nativeStore {
 	return n
 }
 
+// bytesOf resolves a record to its member bytes, the one tier-aware accessor every
+// read path funnels through: a resident record aliases the slab as before, a cold
+// record preads its owning chunk into the shared cold scratch. The returned bytes
+// are valid only until the next write or the next cold read, the same single-call
+// lifetime the slab alias always carried. A torn cold frame yields an empty slice,
+// which a membership compare reads as a miss. The tierCold check is one bit test, so
+// a store with no cold tier keeps the exact slab read it had before.
+func (n *nativeStore) bytesOf(r *natRecord) []byte {
+	if r.loc&tierCold != 0 {
+		m, _ := n.cold.member(r.loc)
+		return m
+	}
+	return n.slab[r.loc : r.loc+r.mlen]
+}
+
+// stableBytes returns a member's bytes safe to pass into a hash or tree probe: a
+// resident member aliases the slab (probes never touch the slab), a cold member is
+// copied into n.stable so the probe's own cold preads cannot clobber it mid-compare.
+// The delete paths use it because they resolve a member from the store and then hand
+// it back to tbl.Delete and tree.Delete, whose Match tie-breaks pread other cold
+// members through the same scratch.
+func (n *nativeStore) stableBytes(r *natRecord) []byte {
+	if r.loc&tierCold != 0 {
+		m, _ := n.cold.member(r.loc)
+		n.stable = append(n.stable[:0], m...)
+		return n.stable
+	}
+	return n.slab[r.loc : r.loc+r.mlen]
+}
+
+// dropBytes accounts a just-removed member's storage: a resident member leaves dead
+// slab bytes for the churn rebuild to reclaim, a cold member leaves a dead entry in
+// its chunk that the promotion repack reclaims, marked on the directory so a later
+// pass finds it. The record cell itself is counted dead by the caller either way.
+func (n *nativeStore) dropBytes(r *natRecord, m []byte) {
+	if r.loc&tierCold != 0 {
+		n.cold.markDirty(discOf(scoreKey(math.Float64frombits(r.bits)), m))
+		return
+	}
+	n.deadBytes += int(r.mlen)
+}
+
 // Match confirms a tag hit: the member stored at ord must equal key. It is the
-// structs.Set half the table probes through, and it allocates nothing.
+// structs.Set half the table probes through, and it allocates nothing for a
+// resident member.
 func (n *nativeStore) Match(ord uint32, key []byte) bool {
-	r := &n.recs[ord]
-	return bytes.Equal(n.slab[r.loc:r.loc+r.mlen], key)
+	return bytes.Equal(n.bytesOf(&n.recs[ord]), key)
 }
 
 // Rehash recomputes a member's hash from its bytes for a table resize, since
 // the record caches none.
 func (n *nativeStore) Rehash(ord uint32) uint64 {
-	r := &n.recs[ord]
-	return store.Hash(n.slab[r.loc : r.loc+r.mlen])
+	return store.Hash(n.bytesOf(&n.recs[ord]))
 }
 
 // Member resolves a tree ref back to its member bytes, the tie-break callback
 // the tree invokes only when two keys share a score.
 func (n *nativeStore) Member(ref uint32) []byte {
-	r := &n.recs[ref]
-	return n.slab[r.loc : r.loc+r.mlen]
+	return n.bytesOf(&n.recs[ref])
 }
 
 func (n *nativeStore) card() int { return n.tbl.Len() }
@@ -153,7 +209,7 @@ func (n *nativeStore) rem(m []byte) bool {
 	}
 	r := &n.recs[ord]
 	n.tree.Delete(scoreKey(math.Float64frombits(r.bits)), m, n)
-	n.deadBytes += int(r.mlen)
+	n.dropBytes(r, m)
 	n.deadRecs++
 	n.maybeRebuild()
 	return true
@@ -185,10 +241,10 @@ func (n *nativeStore) pop(min bool, count int, emit func(m []byte, score float64
 			break
 		}
 		r := &n.recs[ref]
-		m := n.slab[r.loc : r.loc+r.mlen]
+		m := n.stableBytes(r)
 		emit(m, math.Float64frombits(r.bits))
 		n.tbl.Delete(store.Hash(m), m, n)
-		n.deadBytes += int(r.mlen)
+		n.dropBytes(r, m)
 		n.deadRecs++
 		popped++
 	}
@@ -205,7 +261,7 @@ func (n *nativeStore) pop(min bool, count int, emit func(m []byte, score float64
 func (n *nativeStore) at(idx int) ([]byte, uint64) {
 	_, ref, _ := n.tree.SelectAt(uint64(idx))
 	r := &n.recs[ref]
-	return n.slab[r.loc : r.loc+r.mlen], r.bits
+	return n.bytesOf(r), r.bits
 }
 
 // newRecord seats m's bytes in the slab and takes a fresh record ordinal.
@@ -242,7 +298,7 @@ func (n *nativeStore) seal() {
 func (n *nativeStore) each(fn func(m []byte, score float64)) {
 	n.tree.Each(func(_ uint64, ref uint32) bool {
 		r := &n.recs[ref]
-		fn(n.slab[r.loc:r.loc+r.mlen], math.Float64frombits(r.bits))
+		fn(n.bytesOf(r), math.Float64frombits(r.bits))
 		return true
 	})
 }
@@ -254,7 +310,7 @@ func (n *nativeStore) each(fn func(m []byte, score float64)) {
 func (n *nativeStore) eachUntil(fn func(m []byte, s float64) bool) {
 	n.tree.Each(func(_ uint64, ref uint32) bool {
 		r := &n.recs[ref]
-		return fn(n.slab[r.loc:r.loc+r.mlen], math.Float64frombits(r.bits))
+		return fn(n.bytesOf(r), math.Float64frombits(r.bits))
 	})
 }
 
@@ -300,6 +356,9 @@ func (n *nativeStore) colocateSlab() {
 	fresh := make([]byte, 0, len(n.slab))
 	n.tree.Each(func(_ uint64, ref uint32) bool {
 		r := &n.recs[ref]
+		if r.loc&tierCold != 0 {
+			return true // cold member has no slab bytes; its locator stays put
+		}
 		loc := uint32(len(fresh))
 		fresh = append(fresh, n.slab[r.loc:r.loc+r.mlen]...)
 		r.loc = loc
@@ -352,7 +411,7 @@ func (n *nativeStore) walkRange(lo, hi int, fn func(m []byte, bits uint64)) {
 	remaining := hi - lo + 1
 	n.tree.WalkFromRank(uint64(lo), func(_ uint64, ref uint32) bool {
 		r := &n.recs[ref]
-		fn(n.slab[r.loc:r.loc+r.mlen], r.bits)
+		fn(n.bytesOf(r), r.bits)
 		remaining--
 		return remaining > 0
 	})
@@ -366,7 +425,7 @@ func (n *nativeStore) walkRangeRev(lo, hi int, fn func(m []byte, bits uint64)) {
 	remaining := hi - lo + 1
 	n.tree.WalkFromRankRev(uint64(hi), func(_ uint64, ref uint32) bool {
 		r := &n.recs[ref]
-		fn(n.slab[r.loc:r.loc+r.mlen], r.bits)
+		fn(n.bytesOf(r), r.bits)
 		remaining--
 		return remaining > 0
 	})
@@ -477,7 +536,10 @@ func (n *nativeStore) rebuild(live int) {
 		return true
 	})
 	remap := make([]uint32, len(n.recs))
-	fresh := &nativeStore{tbl: structs.MakeTable(live)}
+	// The fresh store shares the cold chunk state: a demoted member survives a
+	// rebuild still cold, its record cell relocated but its chunk locator and its
+	// packed bytes untouched, so the reclaim never drags the cold tier resident.
+	fresh := &nativeStore{tbl: structs.MakeTable(live), cold: n.cold}
 	if live > 0 {
 		fresh.recs = make([]natRecord, 0, live)
 		fresh.slab = make([]byte, 0, len(n.slab)-n.deadBytes)
@@ -487,9 +549,18 @@ func (n *nativeStore) rebuild(live int) {
 			continue
 		}
 		r := n.recs[old]
-		m := n.slab[r.loc : r.loc+r.mlen]
 		newOrd := uint32(len(fresh.recs))
 		remap[old] = newOrd
+		if r.loc&tierCold != 0 {
+			// A cold member keeps its chunk locator; only its record cell moves. Its
+			// bytes are preadd once for the fresh hash slot and never copied to the
+			// slab, so a cold-heavy zset rebuilds without materializing its cold bytes.
+			m := n.bytesOf(&r)
+			fresh.recs = append(fresh.recs, natRecord{loc: r.loc, mlen: r.mlen, bits: r.bits})
+			fresh.tbl.Insert(store.Hash(m), newOrd, fresh)
+			continue
+		}
+		m := n.slab[r.loc : r.loc+r.mlen]
 		loc := uint32(len(fresh.slab))
 		fresh.slab = append(fresh.slab, m...)
 		fresh.recs = append(fresh.recs, natRecord{loc: loc, mlen: r.mlen, bits: r.bits})
@@ -535,7 +606,7 @@ func (n *nativeStore) scanPage(cursor uint64, count int, match []byte, emit func
 	for i := b; i > lo; i-- {
 		ord := uint32(i - 1)
 		r := &n.recs[ord]
-		m := n.slab[r.loc : r.loc+r.mlen]
+		m := n.stableBytes(r)
 		if !n.liveAt(ord, m) {
 			continue
 		}
@@ -576,9 +647,9 @@ func (n *nativeStore) removeRange(lo, hiExcl int) int {
 			break
 		}
 		rec := &n.recs[ref]
-		m := n.slab[rec.loc : rec.loc+rec.mlen]
+		m := n.stableBytes(rec)
 		n.tbl.Delete(store.Hash(m), m, n)
-		n.deadBytes += int(rec.mlen)
+		n.dropBytes(rec, m)
 		n.deadRecs++
 		removed++
 	}
@@ -593,5 +664,9 @@ func (n *nativeStore) removeRange(lo, hiExcl int) int {
 // member slab. The tests subtract the live member bytes and the 8B score per
 // entry, which are data in every engine, to read the overhead.
 func (n *nativeStore) bytes() int {
-	return n.tree.Bytes() + n.tbl.CapSlots()*5 + cap(n.recs)*16 + cap(n.slab)
+	b := n.tree.Bytes() + n.tbl.CapSlots()*5 + cap(n.recs)*16 + cap(n.slab)
+	if n.cold != nil {
+		b += int(n.cold.residentBytes())
+	}
+	return b
 }
