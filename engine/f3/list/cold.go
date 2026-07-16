@@ -182,6 +182,23 @@ func (nt *native) demote(st *store.Store, key []byte) int {
 	return len(runs)
 }
 
+// hasResidentInterior reports whether the ring holds a resident interior chunk the
+// demote pass could shed: a chunk between the two end margins that still carries its
+// blob. It is the list analogue of the zset's hasResident, the demotable predicate
+// the trigger's victim pick reads. It early-returns on the first resident interior
+// chunk, so a list with a hot interior costs one probe; only a fully-cold interior
+// walks the whole span, and that is off the steady no-pressure path. A ring with no
+// interior (at or below both margins) reads not demotable, the empty-loop result.
+// Owner goroutine only.
+func (nt *native) hasResidentInterior() bool {
+	for i := demoteMargin; i < nt.ring.n-demoteMargin; i++ {
+		if !nt.ring.at(i).cold() {
+			return true
+		}
+	}
+	return false
+}
+
 // promote brings the cold chunk at ring index ci back resident: it preads the
 // packed frames, re-materializes a resident blob and offset directory on the same
 // handle so the ring position and the Fenwick counts over the chunk's live window
