@@ -874,6 +874,12 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.setAlgebraCmd(ctx, reply, args, cmd, s.se.SDiff)
 	case "SINTERCARD":
 		return s.sintercardCmd(ctx, reply, args)
+	case "SINTERSTORE":
+		return s.setStoreCmd(ctx, reply, args, cmd, s.se.SInterStore)
+	case "SUNIONSTORE":
+		return s.setStoreCmd(ctx, reply, args, cmd, s.se.SUnionStore)
+	case "SDIFFSTORE":
+		return s.setStoreCmd(ctx, reply, args, cmd, s.se.SDiffStore)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":
@@ -1515,6 +1521,21 @@ func (s *Server) setAlgebraCmd(ctx context.Context, reply []byte, args [][]byte,
 	}
 	reply = AppendArray(reply, elems)
 	return append(reply, s.scanBuf...)
+}
+
+// setStoreCmd runs one of the algebra STORE variants (SINTERSTORE,
+// SUNIONSTORE, SDIFFSTORE share the grammar: the command, the
+// destination, and at least one source key) and answers the stored
+// cardinality.
+func (s *Server) setStoreCmd(ctx context.Context, reply []byte, args [][]byte, name string, store func(ctx context.Context, dest []byte, keys [][]byte) (int64, error)) []byte {
+	if len(args) < 3 {
+		return arityErr(reply, name)
+	}
+	n, err := store(ctx, args[1], args[2:])
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	return AppendInt(reply, n)
 }
 
 // sintercardCmd is SINTERCARD numkeys key [key ...] [LIMIT limit],

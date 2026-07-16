@@ -17,19 +17,23 @@ type Set struct {
 
 	// Algebra scratch, setalgebra.go: the aux ladders holding each
 	// source key's root, the loaded sources, the window (one IO round
-	// of driver members, copied), the routing groups, the probe
-	// flags, and SUNION's digest salt.
-	alg       []*Hash
-	srcs      []algSrc
-	rest      []*algSrc
-	winArena  []byte
-	winMem    [][]byte
-	winFH     []uint64
-	grpSeg    []uint64
-	grpStart  []int
-	hitBuf    []bool
-	salt      [8]byte
-	saltReady bool
+	// of driver members, copied), the routing groups, and the probe
+	// flags.
+	alg      []*Hash
+	srcs     []algSrc
+	rest     []*algSrc
+	winArena []byte
+	winMem   [][]byte
+	winFH    []uint64
+	grpSeg   []uint64
+	grpStart []int
+	hitBuf   []bool
+
+	// Union and STORE scratch, setstore.go: the merge cursors, the
+	// previous emit the merge dedupes against, and the bulk builder.
+	curs     []algCursor
+	prevEmit []byte
+	bld      setBuilder
 }
 
 // NewSet builds the set layer over t.

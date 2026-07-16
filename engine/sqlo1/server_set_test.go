@@ -407,3 +407,97 @@ func TestServerSetAlgebra(t *testing.T) {
 	send("SINTERCARD", "2")
 	expect(t, r, "-ERR wrong number of arguments for 'sintercard' command\r\n")
 }
+
+func TestServerSetStore(t *testing.T) {
+	c, r := startServer(t)
+	send := func(args ...string) {
+		t.Helper()
+		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readSet := func() map[string]bool {
+		t.Helper()
+		got := map[string]bool{}
+		n := readArrayLen(t, r)
+		for range n {
+			m := readBulk(t, r)
+			if got[m] {
+				t.Fatalf("member %q answered twice", m)
+			}
+			got[m] = true
+		}
+		return got
+	}
+	wantMembers := func(got map[string]bool, want ...string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("got %d members, want %d", len(got), len(want))
+		}
+		for _, m := range want {
+			if !got[m] {
+				t.Fatalf("member %q missing", m)
+			}
+		}
+	}
+
+	send("SADD", "s1", "a", "b", "c")
+	expect(t, r, ":3\r\n")
+	send("SADD", "s2", "b", "c", "d")
+	expect(t, r, ":3\r\n")
+	send("SET", "str", "v")
+	expect(t, r, "+OK\r\n")
+
+	// The three commands answer the stored cardinality and the
+	// destination reads back as a set.
+	send("SINTERSTORE", "d", "s1", "s2")
+	expect(t, r, ":2\r\n")
+	send("SMEMBERS", "d")
+	wantMembers(readSet(), "b", "c")
+	send("SUNIONSTORE", "d", "s1", "s2")
+	expect(t, r, ":4\r\n")
+	send("SMEMBERS", "d")
+	wantMembers(readSet(), "a", "b", "c", "d")
+	send("SDIFFSTORE", "d", "s1", "s2")
+	expect(t, r, ":1\r\n")
+	send("SMEMBERS", "d")
+	wantMembers(readSet(), "a")
+	send("TYPE", "d")
+	expect(t, r, "+set\r\n")
+
+	// An empty result deletes the destination; the SINTERSTORE absent
+	// short circuit masks a later wrong type on the way.
+	send("SINTERSTORE", "d", "s1", "ghost", "str")
+	expect(t, r, ":0\r\n")
+	send("TYPE", "d")
+	expect(t, r, "+none\r\n")
+
+	// Wrong types error where the read commands error, destination
+	// untouched, and a string destination is overwritten.
+	send("SUNIONSTORE", "d", "s1", "str")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	send("SDIFFSTORE", "d", "str", "s1")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	send("SUNIONSTORE", "str", "s1")
+	expect(t, r, ":3\r\n")
+	send("SMEMBERS", "str")
+	wantMembers(readSet(), "a", "b", "c")
+
+	// A stored destination drops the TTL it carried.
+	send("SADD", "ttl", "x")
+	expect(t, r, ":1\r\n")
+	send("EXPIRE", "ttl", "600")
+	expect(t, r, ":1\r\n")
+	send("SUNIONSTORE", "ttl", "s1")
+	expect(t, r, ":3\r\n")
+	send("TTL", "ttl")
+	expect(t, r, ":-1\r\n")
+
+	// Arity doors.
+	send("SINTERSTORE", "d")
+	expect(t, r, "-ERR wrong number of arguments for 'sinterstore' command\r\n")
+	send("SUNIONSTORE")
+	expect(t, r, "-ERR wrong number of arguments for 'sunionstore' command\r\n")
+	send("SDIFFSTORE", "d")
+	expect(t, r, "-ERR wrong number of arguments for 'sdiffstore' command\r\n")
+}
