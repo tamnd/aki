@@ -586,6 +586,84 @@ func TestRecoverScanFallback(t *testing.T) {
 	}
 }
 
+// TestReadExtentTableFresh returns a nil map for a fresh file: no extent table has
+// been written, so there is no shape hint and a tool falls back to a scan.
+func TestReadExtentTableFresh(t *testing.T) {
+	dev := &memDevice{}
+	newTestFile(t, dev, SyncNo, nil)
+
+	st, err := ReadOpenState(dev)
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	es, err := ReadExtentTable(dev, st.Meta)
+	if err != nil || es != nil {
+		t.Fatalf("fresh extent table = %v/%v, want nil/nil", es, err)
+	}
+}
+
+// TestReadExtentTableRoundTrip writes an extent map into free space, points the
+// live meta root at it, and reads back every region.
+func TestReadExtentTableRoundTrip(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	want := []Extent{
+		{Kind: ExtentHeader, StartOff: 0, Length: PageSize},
+		{Kind: ExtentAppend, StartOff: PageSize, Length: 0x40000},
+		{Kind: ExtentFree, StartOff: 0x40000 + PageSize, Length: 0x10000},
+	}
+	b := MarshalExtents(want)
+	extOff := uint64(PageSize)
+	if _, err := dev.WriteAt(b, int64(extOff)); err != nil {
+		t.Fatalf("write extents: %v", err)
+	}
+
+	m := &MetaSlot{
+		CommitSeq: 1, FileSize: PageSize, CleanShutdown: 1,
+		ExtentTableOff: extOff, ExtentTableLen: uint32(len(b)),
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	st, err := ReadOpenState(dev)
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	es, err := ReadExtentTable(dev, st.Meta)
+	if err != nil {
+		t.Fatalf("read extents: %v", err)
+	}
+	if len(es) != len(want) {
+		t.Fatalf("read %d extents, want %d", len(es), len(want))
+	}
+	for i := range want {
+		if es[i] != want[i] {
+			t.Fatalf("extent %d = %+v, want %+v", i, es[i], want[i])
+		}
+	}
+}
+
+// TestReadExtentTableTornLength rejects a table whose byte length is not a whole
+// number of extents: a torn or truncated write.
+func TestReadExtentTableTornLength(t *testing.T) {
+	dev := &memDevice{}
+	newTestFile(t, dev, SyncNo, nil)
+
+	b := MarshalExtents([]Extent{{Kind: ExtentAppend, StartOff: PageSize, Length: 0x1000}})
+	extOff := uint64(PageSize)
+	if _, err := dev.WriteAt(b, int64(extOff)); err != nil {
+		t.Fatalf("write extents: %v", err)
+	}
+
+	// One byte short of a whole extent: ParseExtents refuses to decode a torn row.
+	m := &MetaSlot{ExtentTableOff: extOff, ExtentTableLen: uint32(len(b)) - 1}
+	if _, err := ReadExtentTable(dev, m); err != ErrLength {
+		t.Fatalf("err = %v, want ErrLength", err)
+	}
+}
+
 // writeSRTAt marshals a shard root table at a chosen offset and returns it.
 func writeSRTAt(t *testing.T, dev *memDevice, prefix *Prefix, off uint64, srt *SRT) uint64 {
 	t.Helper()
