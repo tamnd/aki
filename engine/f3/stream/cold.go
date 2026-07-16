@@ -92,6 +92,21 @@ func discID(id streamID) [16]byte {
 	return d
 }
 
+// dropDescriptor removes the demote descriptor for the block whose firstID is first
+// and whose cold frame sits at off, the resident-directory side of both a promote (the
+// block comes resident) and a whole-block drop (the block leaves the log). Blocks
+// partition the demote space by firstID with no overlap, so a Floor on the block's own
+// firstID lands on its descriptor exactly; the offset guard aborts on a drifted
+// directory rather than removing the wrong one. Resident-only, no pread.
+func (sc *streamCold) dropDescriptor(first streamID, off uint64) {
+	disc := discID(first)
+	if idx, found := sc.dir.Floor(disc[:]); found {
+		if dOff, _, _ := sc.dir.At(idx); dOff == off {
+			sc.dir.Remove(idx)
+		}
+	}
+}
+
 // demote spills a bounded run of the log's oldest resident blocks into the cold
 // region, releases their resident blobs, and returns how many blocks it shed. It
 // keeps demoteTailMargin newest blocks resident (including the open tail), sweeps
@@ -178,14 +193,28 @@ func (s *stream) promote(i int) {
 	b.blob = append([]byte(nil), ck.Payload...)
 	b.coldOff = 0
 	s.resBlob += uint64(len(b.blob))
-	// Drop the descriptor: blocks partition the demote space by firstID with no
-	// overlap, so a search on this block's own firstID lands on it exactly. Guard on
-	// the offset matching so a drifted directory aborts the drop rather than removing
-	// the wrong descriptor.
-	disc := discID(b.first)
-	if idx, found := s.cold.dir.Floor(disc[:]); found {
-		if dOff, _, _ := s.cold.dir.At(idx); dOff == off {
-			s.cold.dir.Remove(idx)
-		}
+	s.cold.dropDescriptor(b.first, off)
+}
+
+// promoteIfCold brings the block at log index i resident when a demote pass has shed
+// it, the guard the write paths run before they mutate a block's blob in place: an
+// XDEL or an exact-XTRIM boundary tombstone flips a flag byte the cold block no longer
+// holds resident, so the block must come up first (section 7.3). A resident block is a
+// plain no-op, so an all-resident stream never enters the cold branch (L9).
+func (s *stream) promoteIfCold(i int) {
+	if s.blocks[i].cold() {
+		s.promote(i)
 	}
+}
+
+// forgetCold drops a cold block's demote descriptor when the block leaves the log
+// whole, an approximate XTRIM front drop releasing the handle. The cold frame itself
+// becomes an orphan the compactor reclaims (section 6.6, the dead-space rule), so this
+// preads nothing: the block keeps its firstID header resident, enough to find and drop
+// the descriptor. A resident block holds no descriptor and is a no-op.
+func (s *stream) forgetCold(b *block) {
+	if !b.cold() {
+		return
+	}
+	s.cold.dropDescriptor(b.first, b.coldOff)
 }

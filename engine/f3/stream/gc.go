@@ -57,6 +57,12 @@ func (s *stream) gc() gcStats {
 	dropped := false
 	for i := 0; i < tail; i++ {
 		b := s.blocks[i]
+		// A demoted block holds no resident bytes to reclaim, so gc leaves it cold: its
+		// dead entries cost nothing resident, and a write reaching one promotes it first
+		// (cold.go, section 7.3), so a cold block never carries a fresh tombstone here.
+		if b.cold() {
+			continue
+		}
 		if b.deleted == 0 {
 			continue // no tombstones, nothing to reclaim
 		}
@@ -120,7 +126,11 @@ func (s *stream) dropDeadSealedBlocks() int {
 	dst := 0
 	dropped := 0
 	for i, b := range s.blocks {
-		if i < tail && b.count > 0 && b.live() == 0 {
+		// A cold block is skipped: its dead entries hold no resident bytes and dropping
+		// it whole would leave a live demote descriptor, so gc keeps it and an approximate
+		// XTRIM front drop (trim.go) reclaims it by handle. In practice a block goes fully
+		// dead while resident and is dropped the same pass, so this is a defensive guard.
+		if i < tail && b.count > 0 && b.live() == 0 && !b.cold() {
 			dropped++
 			s.resBlob -= uint64(len(b.blob))
 			continue
