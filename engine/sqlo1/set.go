@@ -125,6 +125,30 @@ func (s *Set) SMove(ctx context.Context, src, dst, member []byte) (bool, error) 
 	return true, nil
 }
 
+// SMembers streams every member of key: begin runs exactly once with
+// the exact live count before any emit, so a RESP writer can put the
+// array header down and stream the rest. The walk is HIterate's, in
+// segment fence order with cold segments prefetched in IO batches;
+// emitted bytes alias the current IO round and die at the next Tiered
+// call. An absent key is begin(0).
+func (s *Set) SMembers(ctx context.Context, key []byte, begin func(count int), emit func(member []byte)) error {
+	return s.h.HIterate(ctx, key, begin, func(f, _ []byte) {
+		emit(f)
+	})
+}
+
+// SScan is one cursor step on the shared fh cursor, HScan's contract
+// verbatim: members emit from cursor upward in fh order, the returned
+// cursor is the last fh plus one (zero when done), and the step always
+// finishes the segment it is in so the resume point cannot bisect a
+// run of equal fh values. Inline sets answer any cursor with the whole
+// set and a zero next cursor.
+func (s *Set) SScan(ctx context.Context, key []byte, cursor uint64, count int64, emit func(member []byte)) (uint64, error) {
+	return s.h.HScan(ctx, key, cursor, count, func(f, _ []byte) {
+		emit(f)
+	})
+}
+
 // Encoding answers OBJECT ENCODING for sets: intset for an inline
 // all-integer set, listpack for any other inline set, hashtable once
 // segmented. intset is compat surface only; there is one inline

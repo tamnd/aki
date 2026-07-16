@@ -106,3 +106,56 @@ func TestServerSetSurface(t *testing.T) {
 	send("GET", "s")
 	expect(t, r, wrong)
 }
+
+func TestServerSetIteration(t *testing.T) {
+	c, r := startServer(t)
+	send := func(args ...string) {
+		t.Helper()
+		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send("SADD", "s", "cherry", "apple", "banana")
+	expect(t, r, ":3\r\n")
+
+	// SMEMBERS streams an inline set in insertion order.
+	send("SMEMBERS", "s")
+	expect(t, r, "*3\r\n$6\r\ncherry\r\n$5\r\napple\r\n$6\r\nbanana\r\n")
+	send("SMEMBERS", "ghost")
+	expect(t, r, "*0\r\n")
+	send("SMEMBERS", "s", "stray")
+	expect(t, r, "-ERR wrong number of arguments for 'smembers' command\r\n")
+
+	// SSCAN on an inline set answers any cursor with everything and a
+	// zero next cursor, the listpack behavior.
+	send("SSCAN", "s", "0")
+	expect(t, r, "*2\r\n$1\r\n0\r\n*3\r\n$6\r\ncherry\r\n$5\r\napple\r\n$6\r\nbanana\r\n")
+	send("SSCAN", "s", "99999")
+	expect(t, r, "*2\r\n$1\r\n0\r\n*3\r\n$6\r\ncherry\r\n$5\r\napple\r\n$6\r\nbanana\r\n")
+	send("SSCAN", "s", "0", "MATCH", "*an*")
+	expect(t, r, "*2\r\n$1\r\n0\r\n*1\r\n$6\r\nbanana\r\n")
+	send("SSCAN", "s", "0", "COUNT", "100")
+	expect(t, r, "*2\r\n$1\r\n0\r\n*3\r\n$6\r\ncherry\r\n$5\r\napple\r\n$6\r\nbanana\r\n")
+	send("SSCAN", "ghost", "0")
+	expect(t, r, "*2\r\n$1\r\n0\r\n*0\r\n")
+
+	// Option grammar: bad cursor, bad count, unknown token.
+	send("SSCAN", "s", "notacursor")
+	expect(t, r, "-ERR invalid cursor\r\n")
+	send("SSCAN", "s", "0", "COUNT", "0")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("SSCAN", "s", "0", "NOVALUES")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("SSCAN", "s")
+	expect(t, r, "-ERR wrong number of arguments for 'sscan' command\r\n")
+
+	// Cross-type doors.
+	wrong := "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+	send("SET", "str", "v")
+	expect(t, r, "+OK\r\n")
+	send("SMEMBERS", "str")
+	expect(t, r, wrong)
+	send("SSCAN", "str", "0")
+	expect(t, r, wrong)
+}

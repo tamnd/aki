@@ -844,6 +844,24 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return AppendInt(reply, 1)
 		}
 		return AppendInt(reply, 0)
+	case "SMEMBERS":
+		if len(args) != 2 {
+			return arityErr(reply, cmd)
+		}
+		mark := len(reply)
+		err := s.se.SMembers(ctx, args[1], func(n int) {
+			reply = AppendArray(reply, n)
+		}, func(m []byte) {
+			reply = AppendBulk(reply, m)
+		})
+		if err != nil {
+			// A partial array is already in the buffer; truncate back
+			// to the mark so the error is the whole reply.
+			return storeErr(reply[:mark], err)
+		}
+		return reply
+	case "SSCAN":
+		return s.sscanCmd(ctx, reply, args)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":
@@ -1320,6 +1338,60 @@ func (s *Server) hscanCmd(ctx context.Context, reply []byte, args [][]byte) []by
 			s.scanBuf = AppendBulk(s.scanBuf, v)
 			elems++
 		}
+	})
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	var cbuf [20]byte
+	reply = AppendArray(reply, 2)
+	reply = AppendBulk(reply, strconv.AppendUint(cbuf[:0], next, 10))
+	reply = AppendArray(reply, elems)
+	return append(reply, s.scanBuf...)
+}
+
+// sscanCmd is SSCAN key cursor [MATCH pattern] [COUNT count], HSCAN's
+// grammar without NOVALUES: options repeat with last-wins, COUNT below
+// one is a syntax error, anything unknown is too. The step's members
+// stage in scanBuf because MATCH decides the element count only after
+// the walk.
+func (s *Server) sscanCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 3 {
+		return arityErr(reply, "SSCAN")
+	}
+	cursor, err := strconv.ParseUint(string(args[2]), 10, 64)
+	if err != nil {
+		return AppendError(reply, "ERR invalid cursor")
+	}
+	count := int64(10)
+	var match []byte
+	hasMatch := false
+	for i := 3; i < len(args); i++ {
+		switch {
+		case strings.EqualFold(string(args[i]), "COUNT") && i+1 < len(args):
+			n, ok := parseCanonicalInt(args[i+1])
+			if !ok {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			if n < 1 {
+				return syntaxErr(reply)
+			}
+			count = n
+			i++
+		case strings.EqualFold(string(args[i]), "MATCH") && i+1 < len(args):
+			match, hasMatch = args[i+1], true
+			i++
+		default:
+			return syntaxErr(reply)
+		}
+	}
+	s.scanBuf = s.scanBuf[:0]
+	elems := 0
+	next, err := s.se.SScan(ctx, args[1], cursor, count, func(m []byte) {
+		if hasMatch && !globMatch(match, m) {
+			return
+		}
+		s.scanBuf = AppendBulk(s.scanBuf, m)
+		elems++
 	})
 	if err != nil {
 		return storeErr(reply, err)
