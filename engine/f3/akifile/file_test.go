@@ -2,6 +2,7 @@ package akifile
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -175,5 +176,74 @@ func TestCreateOpenRoundTripOnDisk(t *testing.T) {
 	}
 	if !bytes.Equal(payload, []byte("durable")) {
 		t.Fatalf("payload = %q, want durable", payload)
+	}
+}
+
+// TestInspectPathReadsFile inspects a real on-disk file read-only: a fresh file
+// with a durable segment reports both slots valid, the segment tallied, and no
+// findings, all without opening the file for write.
+func TestInspectPathReadsFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inspect.aki")
+	f, err := Create(path, CreateOptions{ShardCount: 3, Sync: SyncAlways})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := f.AppendGroup([]Pending{{Kind: KindLog, Payload: []byte("durable")}}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	rep, err := InspectPath(path)
+	if err != nil {
+		t.Fatalf("inspect path: %v", err)
+	}
+	if !rep.Slots[0].Valid || !rep.Slots[1].Valid || rep.Live != 0 {
+		t.Fatalf("slots = %+v live %d, want both valid with slot A live", rep.Slots, rep.Live)
+	}
+	if rep.Segments.ByKind[KindLog] != 1 {
+		t.Fatalf("segments = %+v, want 1 log", rep.Segments)
+	}
+	if fs := rep.Findings(); len(fs) != 0 {
+		t.Fatalf("findings = %v, want none on a clean file", fs)
+	}
+}
+
+// TestInspectPathMissing returns the open error for a path that does not exist,
+// rather than a partial report.
+func TestInspectPathMissing(t *testing.T) {
+	if _, err := InspectPath(filepath.Join(t.TempDir(), "nope.aki")); err == nil {
+		t.Fatal("inspect of a missing file succeeded, want an open error")
+	}
+}
+
+// TestReadOnlyDeviceRefusesWrites confirms the inspect device cannot mutate the
+// file: every write path returns ErrReadOnly while reads and Size still work.
+func TestReadOnlyDeviceRefusesWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ro.aki")
+	if f, err := Create(path, CreateOptions{ShardCount: 1}); err != nil {
+		t.Fatalf("create: %v", err)
+	} else if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	fh, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer fh.Close()
+	dev := roDevice{fh}
+
+	if _, err := dev.WriteAt([]byte("x"), 0); err != ErrReadOnly {
+		t.Fatalf("WriteAt err = %v, want ErrReadOnly", err)
+	}
+	if err := dev.Sync(); err != ErrReadOnly {
+		t.Fatalf("Sync err = %v, want ErrReadOnly", err)
+	}
+	if err := dev.Truncate(0); err != ErrReadOnly {
+		t.Fatalf("Truncate err = %v, want ErrReadOnly", err)
+	}
+	if sz, err := dev.Size(); err != nil || sz != PageSize {
+		t.Fatalf("Size = %d/%v, want the header page and no error", sz, err)
 	}
 }
