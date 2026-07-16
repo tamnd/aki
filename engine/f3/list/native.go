@@ -58,13 +58,21 @@ const (
 // (section 2.2). A tail chunk grows hi upward on RPUSH; a head chunk grows lo
 // downward on LPUSH, so a push-heavy end never memmoves.
 type chunk struct {
-	blob      []byte   // packed frames; cap is the slab budget (chunkBlobCap, larger for a lone oversized frame)
-	dir       []uint16 // per-element blob offsets; the live window is dir[lo:hi]
+	blob      []byte   // packed frames; cap is the slab budget (chunkBlobCap, larger for a lone oversized frame); nil once demoted
+	dir       []uint16 // per-element blob offsets; the live window is dir[lo:hi]; nil once demoted
 	lo, hi    int      // live directory window
 	bytesUsed int      // append high-water into blob, dead bytes included until recycle
+	coldOff   uint64   // cold-region offset of the packed frame once demoted; 0 while resident
 }
 
 func (c *chunk) count() int { return c.hi - c.lo }
+
+// cold reports whether the chunk has been demoted: the demote pass releases the
+// blob and directory and sets coldOff, so a nil blob is the cold marker (the plan
+// keeps a resident chunk byte-identical to M0 by adding only the offset field).
+// A cold chunk keeps its live window, canonicalized to lo == 0, so count and the
+// Fenwick directory over counts read it with no change.
+func (c *chunk) cold() bool { return c.blob == nil }
 
 // budget is the chunk's blob byte ceiling: cap(blob), which is chunkBlobCap for
 // a normal chunk and the frame length for a lone oversized chunk, so the same
@@ -197,9 +205,11 @@ type native struct {
 	ring    chunkRing
 	count   int
 	bytes   int
-	free    []*chunk // recycled slabs for reuse, bounded by freeCap
-	dir     chunkDir // Fenwick chunk directory for the above-crossover seek (2.4)
-	scratch []byte   // reused repack buffer for interior surgery, so a chunk rewrite does not allocate per call
+	free    []*chunk  // recycled slabs for reuse, bounded by freeCap
+	dir     chunkDir  // Fenwick chunk directory for the above-crossover seek (2.4)
+	scratch []byte    // reused repack buffer for interior surgery, so a chunk rewrite does not allocate per call
+	cold    *listCold // cold-tier state, nil until the first demote (cold.go)
+	coldN   int       // demoted chunks currently in the ring; only demote and promote move it, so residentBytes stays O(1) without a walk
 }
 
 // chunkFootprint is the resident-byte cost of one standard chunk's backing
@@ -212,11 +222,16 @@ const chunkFootprint = chunkBlobCap + chunkElemCap*2
 
 // residentBytes estimates the native band's resident footprint in O(1): the
 // resident chunks in the ring, the recycled slabs held on the freelist (still
-// resident RAM), and the ring, Fenwick directory, and repack scratch overhead.
-// It reads counts and capacities only, never a chunk's contents, so it preads
-// nothing and never walks the ring. Owner goroutine only.
+// resident RAM), and the ring, Fenwick directory, and repack scratch overhead. A
+// demoted chunk released its blob and directory, so it drops out of the count; the
+// demote loop reads this figure falling as it sheds chunks, the whole point of the
+// pass. It reads counts and capacities only, never a chunk's contents, so it preads
+// nothing and never walks the ring. The cold state's own overhead (its directory)
+// lands with the demote slice; the pread scratch is left out on purpose, the same
+// bounded per-read buffer the set and zset forms exclude to keep the running total
+// from drifting between command boundaries. Owner goroutine only.
 func (nt *native) residentBytes() uint64 {
-	total := nt.ring.n*chunkFootprint + len(nt.free)*chunkFootprint
+	total := (nt.ring.n-nt.coldN)*chunkFootprint + len(nt.free)*chunkFootprint
 	total += cap(nt.ring.buf) * 8
 	total += cap(nt.dir.tree) * 8
 	total += cap(nt.scratch)
@@ -452,12 +467,24 @@ func (nt *native) locate(k int) (ci, ord int) {
 	panic("list: locate index out of range")
 }
 
-// at returns the element at dense index i (LINDEX), aliasing the blob.
-func (nt *native) at(i int) []byte {
-	ci, ord := nt.locate(i)
-	c := nt.ring.at(ci)
+// frameOf returns the value of the ord-th live element of chunk c, the tier-aware
+// read LINDEX rides. A resident chunk aliases the blob; a demoted chunk preads its
+// packed frame into the cold scratch and walks it, the bytes then aliasing the
+// scratch until the next cold read. The ring walk that reached c already resolved
+// the ordinal, so a cold read never touches a directory.
+func (nt *native) frameOf(c *chunk, ord int) []byte {
+	if c.cold() {
+		return coldFrameAt(nt.cold.payload(c.coldOff), ord)
+	}
 	v, _ := c.frameAt(int(c.dir[c.lo+ord]))
 	return v
+}
+
+// at returns the element at dense index i (LINDEX), aliasing the blob or, for a
+// demoted chunk, the cold scratch.
+func (nt *native) at(i int) []byte {
+	ci, ord := nt.locate(i)
+	return nt.frameOf(nt.ring.at(ci), ord)
 }
 
 // rangeInto appends the elements at dense indexes lo..hi inclusive (already
@@ -473,11 +500,31 @@ func (nt *native) rangeInto(out []byte, lo, hi int) []byte {
 	for remaining > 0 {
 		c := nt.ring.at(ci)
 		n := c.count()
-		for ord < n && remaining > 0 {
-			v, _ := c.frameAt(int(c.dir[c.lo+ord]))
-			out = resp.AppendBulk(out, v)
-			ord++
-			remaining--
+		if c.cold() {
+			// A demoted chunk preads once and the walk resumes from ord in the
+			// packed payload, so LRANGE crossing a cold chunk pays one pread for the
+			// chunk, not one per element.
+			p := nt.cold.payload(c.coldOff)
+			off := 0
+			for k := 0; k < ord; k++ {
+				vlen, w := binary.Uvarint(p[off:])
+				off += w + int(vlen)
+			}
+			for ord < n && remaining > 0 {
+				vlen, w := binary.Uvarint(p[off:])
+				off += w
+				out = resp.AppendBulk(out, p[off:off+int(vlen)])
+				off += int(vlen)
+				ord++
+				remaining--
+			}
+		} else {
+			for ord < n && remaining > 0 {
+				v, _ := c.frameAt(int(c.dir[c.lo+ord]))
+				out = resp.AppendBulk(out, v)
+				ord++
+				remaining--
+			}
 		}
 		ci++
 		ord = 0
