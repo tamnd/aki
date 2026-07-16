@@ -121,6 +121,82 @@ func TestColdChunkReadsMatchResident(t *testing.T) {
 	}
 }
 
+// TestDemotePassShedsInterior drives the real demote pass end to end through the
+// registry wrapper: it sheds every interior chunk in one quantum, keeps the head and
+// tail chunks resident, drops the footprint, reconciles the running total, and leaves
+// every element readable in order through the cold-aware reads. A second pass finds
+// the interior already cold and sheds nothing more.
+func TestDemotePassShedsInterior(t *testing.T) {
+	cx, g := coldCtx(t)
+	nt, want := coldTestNative(400, 40)
+	if nt.ring.n < 4 {
+		t.Fatalf("need several chunks for an interior demote, got %d", nt.ring.n)
+	}
+	// Hang the native band off a registry-backed list so the demote runs the whole
+	// wrapper path (lookup and note reconciliation), the way the trigger will call it.
+	l := &list{nat: nt, everLarge: true}
+	g.m["k"] = l
+	g.note(l)
+	head, tail := nt.ring.front(), nt.ring.tail()
+	interior := nt.ring.n - 2*demoteMargin
+
+	before := nt.residentBytes()
+	n := g.demote(cx, []byte("k"))
+	if n != interior {
+		t.Fatalf("demoted %d chunks, want the %d interior", n, interior)
+	}
+	if nt.coldN != n {
+		t.Fatalf("coldN %d, want %d", nt.coldN, n)
+	}
+	// note reconciled the freed bytes: the running total is the shrunk footprint.
+	if g.resident != nt.residentBytes() {
+		t.Fatalf("running total %d != post-demote footprint %d", g.resident, nt.residentBytes())
+	}
+
+	// The margin chunks stay resident; every interior chunk sheds its blob.
+	if head.cold() || tail.cold() {
+		t.Fatal("a margin chunk was demoted")
+	}
+	for i := demoteMargin; i < nt.ring.n-demoteMargin; i++ {
+		if !nt.ring.at(i).cold() {
+			t.Fatalf("interior chunk %d stayed resident", i)
+		}
+	}
+
+	// The shed blobs dwarf the small demote directory, so the footprint falls.
+	if after := nt.residentBytes(); after >= before {
+		t.Fatalf("footprint %d did not fall below %d after demote", after, before)
+	}
+
+	// LLEN is unchanged and every element still reads in order across the cold gap.
+	if nt.count != len(want) {
+		t.Fatalf("count %d != %d after demote", nt.count, len(want))
+	}
+	for i := range want {
+		if got := nt.at(i); !bytes.Equal(got, want[i]) {
+			t.Fatalf("at(%d) = %q, want %q", i, got, want[i])
+		}
+	}
+	got := nt.rangeInto(nil, 0, nt.count-1)
+	var full []byte
+	for _, v := range want {
+		full = resp.AppendBulk(full, v)
+	}
+	if !bytes.Equal(got, full) {
+		t.Fatal("full LRANGE over the demoted interior != RESP of the original values")
+	}
+
+	// The demote descriptor count matches the chunks shed, one per demote sequence.
+	if nt.cold.dir.Len() != n {
+		t.Fatalf("cold directory holds %d descriptors, want %d", nt.cold.dir.Len(), n)
+	}
+
+	// A second pass finds the interior already cold and sheds nothing more.
+	if again := g.demote(cx, []byte("k")); again != 0 {
+		t.Fatalf("second demote shed %d, want 0 (interior already cold)", again)
+	}
+}
+
 // TestColdChunkResidentBytesDrops pins the accounting win: demoting one standard
 // interior chunk releases its blob and directory, so the native footprint falls by
 // exactly one chunkFootprint and nothing else moves.

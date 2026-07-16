@@ -56,6 +56,28 @@ const (
 	elementPerRowResident = 13.0
 )
 
+// List encoding constants, copied from the packages they mirror. A list demotes a
+// whole ring chunk rather than gathering members: its blob and directory are already
+// contiguous, so the pass copies the live frames straight into one cold frame keyed
+// by the per-list demote sequence (list/cold.go demote), keeps no per-element
+// resident record (a list carries position by layout, not per-member records), and
+// keeps no offset table (a read rides the ring handle's cold offset, not a directory
+// slot). The one resident cost a demoted chunk leaves is its directory descriptor.
+const (
+	listBlobCap  = 4096 // native.go chunkBlobCap: the list chunk blob budget
+	listElemCap  = 128  // native.go chunkElemCap: the per-chunk element ceiling
+	listDirBytes = 2    // native.go dir []uint16: two resident bytes per element slot
+	// listFootprint mirrors native.go chunkFootprint: a resident list chunk's fixed
+	// backing arrays, the blob budget plus the full uint16 directory, allocated at
+	// full width regardless of fill. The whole of it leaves on a demote.
+	listFootprint = listBlobCap + listElemCap*listDirBytes
+	// listDescBytes is the one resident descriptor a demoted list chunk keeps, keyed
+	// by the demote sequence (list/cold.go listCold.dir, one Insert per shed chunk).
+	// Unlike the set there is no offset-table slot, so the descriptor is the whole
+	// resident cost of a cold list chunk.
+	listDescBytes = 48
+)
+
 // uvarintLen is the byte width binary.AppendUvarint writes for n, the length prefix
 // each packed member carries.
 func uvarintLen(n int) int {
@@ -114,6 +136,54 @@ func measure(width, keyLen int) row {
 	}
 }
 
+// listRow is one member-width point in the list sweep. It shares the frame and
+// packing shape of a set row but models the whole-chunk demote: no per-element
+// resident record, no offset table, so the resident cost after a demote is only the
+// chunk's share of one directory descriptor.
+type listRow struct {
+	width     int
+	members   int     // frames packed into one list chunk
+	payload   int     // payload bytes those frames occupy
+	frame     int     // whole on-disk frame bytes (header + key + demote-seq + payload)
+	overhead  float64 // frame overhead as a fraction of the frame
+	metaPerEl float64 // resident cold metadata bytes per cold frame (descriptor share)
+	amortize  float64 // element-per-row resident cost over the chunk's, the packing win
+	hotPerEl  float64 // fully-resident bytes per frame (chunk footprint share)
+	coldPerEl float64 // resident bytes per frame after a whole-chunk demote
+	freedFrac float64 // resident fraction a demote frees to disk
+}
+
+// listPack models one list chunk's fill for a fixed member width. A list chunk seals
+// on whichever binds first, the blob byte budget or the element cap (native.go
+// canAppendTail), so a narrow member hits the 128-element ceiling well before 4 KiB.
+func listPack(width int) (members, payloadBytes int) {
+	entry := uvarintLen(width) + width
+	members = listBlobCap / entry
+	if members > listElemCap {
+		members = listElemCap
+	}
+	return members, members * entry
+}
+
+func measureList(width, keyLen int) listRow {
+	members, payload := listPack(width)
+	frame := chunkHdr + keyLen + discBytes + payload
+	metaPerEl := float64(listDescBytes) / float64(members)
+	hotPerEl := float64(listFootprint) / float64(members)
+	return listRow{
+		width:     width,
+		members:   members,
+		payload:   payload,
+		frame:     frame,
+		overhead:  float64(frame-payload) / float64(frame),
+		metaPerEl: metaPerEl,
+		amortize:  elementPerRowResident / metaPerEl,
+		hotPerEl:  hotPerEl,
+		coldPerEl: metaPerEl,
+		freedFrac: (hotPerEl - metaPerEl) / hotPerEl,
+	}
+}
+
 func main() {
 	quick := flag.Bool("quick", false, "run the reduced width sweep")
 	keyLen := flag.Int("keylen", 16, "collection key byte length (on-disk frame only)")
@@ -155,4 +225,35 @@ func main() {
 		verdict.metaPerEl, verdict.amortize, elementPerRowResident)
 	fmt.Printf("  a demote frees %.0f%% of a member's resident footprint to disk (%.0f B -> %.0f B resident)\n",
 		verdict.freedFrac*100, verdict.hotPerEl, verdict.coldPerEl)
+
+	// The list column: a list demotes a whole chunk, so it keeps no per-element
+	// resident record and no offset table, only one directory descriptor per shed
+	// chunk. Its packing shares the frame shape but its freed fraction is the pitch.
+	fmt.Printf("\nlist cold chunk packing, whole-chunk demote (one descriptor per chunk, no offset table)\n\n")
+	fmt.Printf(hdr, "member", "frames/", "payload", "frame", "frame", "resident meta", "vs element", "resident", "freed to")
+	fmt.Printf(hdr, "bytes", "chunk", "bytes", "bytes", "overhead", "B/member", "per-row", "B/member", "disk")
+	fmt.Printf(hdr, "------", "--------", "-------", "-----", "--------", "-------------", "----------", "--------", "--------")
+
+	var lverdict listRow
+	for _, width := range widths {
+		r := measureList(width, *keyLen)
+		if width == 20 {
+			lverdict = r
+		}
+		fmt.Printf("%-8d %-9d %-8d %-7d %-9s %-14.3f %-11s %-9.3f %-8s\n",
+			r.width, r.members, r.payload, r.frame,
+			fmt.Sprintf("%.2f%%", r.overhead*100), r.metaPerEl,
+			fmt.Sprintf("%.0fx", r.amortize), r.coldPerEl,
+			fmt.Sprintf("%.1f%%", r.freedFrac*100))
+	}
+	if lverdict.members == 0 {
+		lverdict = measureList(20, *keyLen)
+	}
+	fmt.Printf("\nList verdict point (20-byte member):\n")
+	fmt.Printf("  %d frames per chunk (the %d-element cap binds before the 4 KiB byte target for a narrow member)\n",
+		lverdict.members, listElemCap)
+	fmt.Printf("  resident cold metadata %.3f B/member (descriptor only, no offset table), %.0fx below element-per-row\n",
+		lverdict.metaPerEl, lverdict.amortize)
+	fmt.Printf("  a whole-chunk demote frees %.1f%% of the chunk's resident footprint at every width (%.1f B -> %.2f B resident per member)\n",
+		lverdict.freedFrac*100, lverdict.hotPerEl, lverdict.coldPerEl)
 }
