@@ -185,7 +185,11 @@ func place(cx *shard.Ctx, g *reg, key []byte, result *zset) int {
 		g.drop(key)
 		return 0
 	}
+	if g.acctOn && g.m[string(key)] != nil {
+		g.drop(key)
+	}
 	g.m[string(key)] = result
+	g.note(result)
 	return result.card()
 }
 

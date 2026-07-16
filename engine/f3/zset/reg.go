@@ -35,6 +35,18 @@ type reg struct {
 	// pickScratch holds the indexes already chosen by the small-sample distinct
 	// draw so its rejection loop can skip repeats without a map.
 	pickScratch []int
+
+	// resident is the running sum of every live zset's resident-byte footprint
+	// (zset.residentBytes), the figure the shard reads to weigh a collection's RAM
+	// against the store's arena under memory pressure (spec 2064/f3/06 section 6).
+	// It is kept exact by note and drop across the map's inserts and removes, so
+	// the shard never walks the registry to size it. Maintained only when acctOn.
+	resident uint64
+	// acctOn gates the accounting: it is true only when the shard's store runs the
+	// cold tier (ColdConfigured). With no cold region to demote a zset into the
+	// figure would drive nothing, so the registry keeps none and note is one bool
+	// load, holding the L9 zero-delta contract for a store with no resident cap.
+	acctOn bool
 }
 
 // zsetSeed hands each shard's registry a distinct PCG stream. The counter is
@@ -52,7 +64,11 @@ func freshPCG() rand.PCG {
 // command is there for the next.
 func registry(cx *shard.Ctx) *reg {
 	if cx.ZColl == nil {
-		cx.ZColl = &reg{m: make(map[string]*zset), rng: freshPCG()}
+		cx.ZColl = &reg{
+			m:      make(map[string]*zset),
+			rng:    freshPCG(),
+			acctOn: cx.St != nil && cx.St.ColdConfigured(),
+		}
 	}
 	return cx.ZColl.(*reg)
 }
@@ -86,6 +102,49 @@ func (g *reg) lookup(cx *shard.Ctx, key []byte) (z *zset, wrong bool) {
 	return nil, false
 }
 
+// note reconciles z's footprint into the running total: it posts the delta since
+// the last note, so the total stays the exact sum of every live zset's footprint.
+// A mutating command calls it before returning on any zset that survives the
+// command (an emptied zset goes through drop instead), which keeps the total exact
+// at every command boundary, the only point the shard reads it. It is a single
+// bool load when accounting is off. Owner goroutine only.
+func (g *reg) note(z *zset) {
+	if !g.acctOn {
+		return
+	}
+	nb := z.residentBytes()
+	g.resident += nb - z.acct
+	z.acct = nb
+}
+
 // drop removes an emptied zset: Redis deletes a zset the moment its last member
-// leaves.
-func (g *reg) drop(key []byte) { delete(g.m, string(key)) }
+// leaves, and the STORE path drops a replaced or emptied destination. It takes the
+// zset's last-posted footprint back out of the running total, so the total never
+// carries a gone zset's bytes.
+func (g *reg) drop(key []byte) {
+	if g.acctOn {
+		if z := g.m[string(key)]; z != nil {
+			g.resident -= z.acct
+		}
+	}
+	delete(g.m, string(key))
+}
+
+// ResidentBytes is the running sum of every live zset's resident-byte footprint on
+// this shard, the collection half of the store's memory-pressure figure (spec
+// 2064/f3/06 section 6). It is zero when the store runs no cold tier. The shard
+// reads it at a demote boundary; the trigger that consumes it lands with the zset
+// demotion slice. Owner goroutine only.
+func (g *reg) ResidentBytes() uint64 { return g.resident }
+
+// ResidentBytes exposes the shard's zset-registry resident-byte total to the
+// worker's demote loop through the owner-local ZColl slot, without the shard
+// package reaching into the zset registry's shape. It is zero before any zset
+// command has built a registry on this shard, or when the store runs no cold tier.
+// Owner goroutine only.
+func ResidentBytes(cx *shard.Ctx) uint64 {
+	if g, ok := cx.ZColl.(*reg); ok {
+		return g.ResidentBytes()
+	}
+	return 0
+}

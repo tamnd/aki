@@ -66,6 +66,26 @@ type zset struct {
 	// skiplist-class: the native band (skiplist.go). Built by listpackToNative
 	// and never converted back (F4).
 	nat *nativeStore
+
+	// acct is the footprint this zset last posted into the registry's running
+	// total (reg.note), so a mutating command can post only the delta since the
+	// last note instead of rewalking the total. Meaningful only when the registry
+	// accounts (acctOn); zero on a store with no cold tier.
+	acct uint64
+}
+
+// residentBytes estimates this zset's live resident-byte footprint from its
+// backing capacities, the figure the registry sums for the demote loop (spec
+// 2064/f3/06 section 6). The listpack band is its packed blob; the native band is
+// the tree arenas, the member hash, the record cells, and the member slab
+// (nativeStore.bytes), the allocation that grows with adds and is sticky on
+// remove until a rebuild. The small fixed per-zset and per-map overheads are left
+// out because they do not move the demotion decision.
+func (z *zset) residentBytes() uint64 {
+	if z.enc == encListpack {
+		return uint64(cap(z.blob))
+	}
+	return uint64(z.nat.bytes())
 }
 
 // newZset builds an empty listpack-class zset. Redis has no intset analogue for

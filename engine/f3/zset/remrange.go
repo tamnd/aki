@@ -41,6 +41,8 @@ func Zremrangebyrank(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	removed := z.removeRange(lo, hi+1)
 	if z.card() == 0 {
 		g.drop(args[0])
+	} else if removed > 0 {
+		g.note(z)
 	}
 	r.Int(int64(removed))
 }
@@ -68,6 +70,8 @@ func Zremrangebyscore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	removed := z.removeRange(lo, hiExcl)
 	if z.card() == 0 {
 		g.drop(args[0])
+	} else if removed > 0 {
+		g.note(z)
 	}
 	r.Int(int64(removed))
 }
@@ -95,6 +99,8 @@ func Zremrangebylex(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	removed := z.removeRange(lo, hiExcl)
 	if z.card() == 0 {
 		g.drop(args[0])
+	} else if removed > 0 {
+		g.note(z)
 	}
 	r.Int(int64(removed))
 }
