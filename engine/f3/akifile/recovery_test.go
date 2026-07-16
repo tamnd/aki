@@ -522,6 +522,61 @@ func TestRecoverCrashedRebuildsShards(t *testing.T) {
 	}
 }
 
+// TestRecoverWiresAuxiliaryTables checks that Recover rebuilds a shard's dead-byte
+// accounting and cold-chunk directory alongside its index, from the seg_stats and
+// chunk_dir roots the SRT row names, and leaves an uncheckpointed shard with empty (not
+// nil) tables so a consumer can always index the slice.
+func TestRecoverWiresAuxiliaryTables(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	idxOff := appendCkpt(t, f, CkptHeader{FullOrDelta: CkptFull, CkptLogPos: 5}, []CkptEntry{
+		{KeyHash: 1, RecordAddr: 0x100}, {KeyHash: 2, RecordAddr: 0x200},
+	})
+	ssOff := appendSegStats(t, f, SegStatsHeader{FullOrDelta: SegStatsFull, CkptLogPos: 5}, []SegStatsEntry{
+		{SegOff: 0x1000, LiveBytes: 900, DeadBytes: 100},
+		{SegOff: 0x2000, LiveBytes: 700, DeadBytes: 300},
+	})
+	cdOff := appendChunkDir(t, f, ChunkDirHeader{FullOrDelta: ChunkDirFull, CkptLogPos: 5}, []ChunkDirCollection{
+		{KeyHash: 0xA1, Chunks: []ChunkDirRow{{FirstDisc: []byte("aaa"), ElementCount: 40, ChunkOff: 0x3000, ChunkLiveBytes: 500}}},
+	})
+	fileSize := f.Cursor()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	rows[0] = SRTRow{IndexCkptOff: idxOff, SegstatsOff: ssOff, ChunkdirOff: cdOff, FirstTailSeg: idxOff, CkptLogPos: 5}
+	// shards 1..3 never checkpointed any table: zero rows.
+	srtOff := writeSRTAt(t, dev, prefix, fileSize, &SRT{Gen: 1, Rows: rows})
+
+	m := &MetaSlot{
+		CommitSeq: 9, FileSize: fileSize, CleanShutdown: 0,
+		SRTOff: srtOff, SRTLen: uint32(SRTHeaderLen + len(rows)*SRTRowSize), SRTShardCount: prefix.ShardCount,
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if len(rec.SegStats) != int(prefix.ShardCount) || len(rec.ChunkDirs) != int(prefix.ShardCount) {
+		t.Fatalf("aux slices sized %d/%d, want %d", len(rec.SegStats), len(rec.ChunkDirs), prefix.ShardCount)
+	}
+	if rec.Indexes[0].Len() != 2 {
+		t.Fatalf("shard 0 index has %d entries, want 2", rec.Indexes[0].Len())
+	}
+	if rec.SegStats[0].Len() != 2 || rec.SegStats[0].TotalDeadBytes() != 400 {
+		t.Fatalf("shard 0 seg-stats = %d entries / %d dead, want 2/400", rec.SegStats[0].Len(), rec.SegStats[0].TotalDeadBytes())
+	}
+	if rec.ChunkDirs[0].Len() != 1 || rec.ChunkDirs[0].TotalLiveBytes() != 500 {
+		t.Fatalf("shard 0 chunk-dir = %d collections / %d live, want 1/500", rec.ChunkDirs[0].Len(), rec.ChunkDirs[0].TotalLiveBytes())
+	}
+	// An uncheckpointed shard carries empty rebuilders, never nil.
+	if rec.SegStats[1] == nil || rec.SegStats[1].Len() != 0 || rec.ChunkDirs[1] == nil || rec.ChunkDirs[1].Len() != 0 {
+		t.Fatalf("uncheckpointed shard 1 aux tables = %v/%v, want empty non-nil", rec.SegStats[1], rec.ChunkDirs[1])
+	}
+}
+
 // TestRecoverCleanSkipsTail recovers a cleanly-closed file with checkpoints: the
 // index rebuilds from the roots and the tail replay finds nothing, since a clean
 // shutdown checkpointed everything.
