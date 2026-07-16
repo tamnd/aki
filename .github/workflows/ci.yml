@@ -1,7 +1,7 @@
 name: ci
 
-# sqlo1-only changes skip this workflow and run the fast sqlo1 one instead;
-# a PR touching both trees still runs both.
+# Driver-only changes skip this workflow and run their fast lane instead
+# (sqlo1.yml, obs1.yml); a PR touching both trees still runs both.
 on:
   push:
     branches: [main]
@@ -14,6 +14,14 @@ on:
       - 'labs/sqlo1/**'
       - 'scripts/sqlo1-import-boundary.sh'
       - '.github/workflows/sqlo1.yml'
+      - 'engine/obs1/**'
+      - 'obs1srv/**'
+      - 'cmd/obs1srv/**'
+      - 'labs/obs1/**'
+      - 'results/obs1/**'
+      - 'scripts/obs1-import-boundary.sh'
+      - '.github/workflows/obs1.yml'
+      - '.golangci.obs1.yml'
   pull_request:
     paths-ignore:
       - 'engine/sqlo1/**'
@@ -24,6 +32,14 @@ on:
       - 'labs/sqlo1/**'
       - 'scripts/sqlo1-import-boundary.sh'
       - '.github/workflows/sqlo1.yml'
+      - 'engine/obs1/**'
+      - 'obs1srv/**'
+      - 'cmd/obs1srv/**'
+      - 'labs/obs1/**'
+      - 'results/obs1/**'
+      - 'scripts/obs1-import-boundary.sh'
+      - '.github/workflows/obs1.yml'
+      - '.golangci.obs1.yml'
 
 permissions:
   contents: read

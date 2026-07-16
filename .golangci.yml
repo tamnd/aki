@@ -8,16 +8,22 @@ version: "2"
 
 linters:
   exclusions:
-    # The sqlo1 trees are a separate driver with their own fast CI lane
-    # (.github/workflows/sqlo1.yml) and no import edge into the rest of the
-    # module. The main ci workflow already ignores these paths at the workflow
-    # level, so a non-sqlo1 PR never gates on that code through its own lane;
-    # skip the paths here too so the shared lint job stays consistent with that
-    # split instead of failing a non-sqlo1 PR on the sqlo1 lane's code.
+    # The sqlo1 and obs1 trees are separate drivers with their own fast CI
+    # lanes (.github/workflows/sqlo1.yml, obs1.yml) and no import edge into
+    # the rest of the module. The main ci workflow already ignores these
+    # paths at the workflow level, so a PR outside a driver never gates on
+    # that driver's code through its own lane; skip the paths here too so the
+    # shared lint job stays consistent with that split. The obs1 lane runs
+    # its own lint with .golangci.obs1.yml, so excluding it here does not
+    # leave the tree unlinted (the labs/sqlo1 errcheck slip).
     paths:
       - engine/sqlo1
       - cmd/sqlo1
       - labs/sqlo1
+      - engine/obs1
+      - obs1srv
+      - cmd/obs1srv
+      - labs/obs1
     rules:
       - path: _test\.go
         linters:
