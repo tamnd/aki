@@ -89,27 +89,39 @@ func schedule(offset time.Duration, rate float64, partition, runFor time.Duratio
 	lastRenewPos, _ := foldT.LastRenewal(group)
 	var grantAt time.Duration = -1 // real time T's takeover landed
 	var lastAckAt time.Duration = -1
+	demoted := false
 
 	for t := time.Duration(0); t < runFor; t += dt {
 		partitioned := partition > 0 && t >= partition
 		// H: heartbeat cadence on its own clock.
-		if hClock(t).Sub(hClock(0)) >= nextHB {
+		if !demoted && hClock(t).Sub(hClock(0)) >= nextHB {
 			nextHB += hb
 			if !partitioned {
 				if _, err := aH.Append(ctx, []obs1.ChainRecord{obs1.HeartbeatRecord{}}); err == nil {
-					guard.Renewed(group, hClock(t))
+					// The append's catch-up folded the tail into H's own
+					// fold; doc 02 section 3.3 says a holder that sees a
+					// foreign grant demotes on the spot. Without this the
+					// harness models a broken node, not a mis-clocked
+					// one, and the first sweep proved it inflates the
+					// window on cadence-starved arms.
+					if n, _, ok := foldH.Holder(group); ok && n == 7 {
+						guard.Renewed(group, hClock(t))
+					} else {
+						guard.Drop(group)
+						demoted = true
+					}
 				}
 			}
 		}
 		// H: ack a client write into RAM if the lease is believed alive.
 		// A partitioned H that still acks after T's grant is the zombie.
-		if !guard.Suspended(group, hClock(t)) {
+		if !demoted && !guard.Suspended(group, hClock(t)) {
 			r.acks++
 			lastAckAt = t
 			if grantAt >= 0 {
 				r.zombieAcks++
 			}
-		} else if !r.suspended {
+		} else if !r.suspended && !demoted {
 			r.suspended = true
 		}
 		// T: watch arrivals on its own clock, take over past the bound.
