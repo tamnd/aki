@@ -81,7 +81,10 @@ jobs:
         if: steps.minio-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/minio-bin
-          curl -sSf -o ~/minio-bin/minio https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z
+          # dl.min.io answers with a 302; without -L curl saves the redirect
+          # page and the "binary" is a one-line html file.
+          curl -sSfL -o ~/minio-bin/minio https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z
+          head -c 4 ~/minio-bin/minio | grep -q ELF
           chmod +x ~/minio-bin/minio
       - name: minio start
         run: |
