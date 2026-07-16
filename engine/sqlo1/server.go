@@ -443,6 +443,80 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			}
 		}
 		return reply
+	case "BITCOUNT":
+		if len(args) < 2 {
+			return arityErr(reply, cmd)
+		}
+		var br bitRange
+		switch len(args) {
+		case 2:
+		case 4, 5:
+			start, ok1 := parseCanonicalInt(args[2])
+			end, ok2 := parseCanonicalInt(args[3])
+			if !ok1 || !ok2 {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			br = bitRange{start: start, end: end, ranged: true, endGiven: true}
+			if len(args) == 5 {
+				switch strings.ToUpper(string(args[4])) {
+				case "BYTE":
+				case "BIT":
+					br.bitUnit = true
+				default:
+					return AppendError(reply, "ERR syntax error")
+				}
+			}
+		default:
+			return AppendError(reply, "ERR syntax error")
+		}
+		n, err := s.s.BitCount(ctx, args[1], br)
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, n)
+	case "BITPOS":
+		if len(args) < 3 {
+			return arityErr(reply, cmd)
+		}
+		if len(args) > 6 {
+			return AppendError(reply, "ERR syntax error")
+		}
+		bit, ok := parseCanonicalInt(args[2])
+		if !ok {
+			return AppendError(reply, "ERR value is not an integer or out of range")
+		}
+		if bit != 0 && bit != 1 {
+			return AppendError(reply, "ERR The bit argument must be 1 or 0.")
+		}
+		br := bitRange{end: -1}
+		if len(args) >= 4 {
+			start, ok := parseCanonicalInt(args[3])
+			if !ok {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			br.start, br.ranged = start, true
+		}
+		if len(args) >= 5 {
+			end, ok := parseCanonicalInt(args[4])
+			if !ok {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			br.end, br.endGiven = end, true
+		}
+		if len(args) == 6 {
+			switch strings.ToUpper(string(args[5])) {
+			case "BYTE":
+			case "BIT":
+				br.bitUnit = true
+			default:
+				return AppendError(reply, "ERR syntax error")
+			}
+		}
+		pos, err := s.s.BitPos(ctx, args[1], int(bit), br)
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, pos)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
