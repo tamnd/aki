@@ -89,6 +89,107 @@ func TestCommitRootsSurvivesTornSlot(t *testing.T) {
 	}
 }
 
+// TestCheckpointRoundTrips writes roots to free space and commits them, then
+// recovers the file and reads back the shard root table, the extent map, and the
+// accounting: a clean checkpoint the open sequence trusts without a replay.
+func TestCheckpointRoundTrips(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	if _, err := f.AppendGroup([]Pending{{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("data")}}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// IndexCkptOff stays zero: these shards have no checkpoint chain, so recovery
+	// leaves each index empty. The checkpoint's own round trip is what is under test.
+	rows := make([]SRTRow, prefix.ShardCount)
+	for i := range rows {
+		rows[i] = SRTRow{FirstTailSeg: uint64(0x20000 * (i + 1))}
+	}
+	extents := []Extent{{Kind: ExtentHeader, StartOff: 0, Length: PageSize}}
+
+	if err := f.Checkpoint(&SRT{Gen: 3, Rows: rows}, extents, CheckpointStats{RecordCount: 7, Clean: true}); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if rec.State.Outcome != OpenClean {
+		t.Fatalf("outcome = %d, want OpenClean", rec.State.Outcome)
+	}
+	if rec.State.Meta.RecordCount != 7 {
+		t.Fatalf("record count = %d, want 7", rec.State.Meta.RecordCount)
+	}
+	if rec.SRT == nil || rec.SRT.Gen != 3 || len(rec.SRT.Rows) != int(prefix.ShardCount) {
+		t.Fatalf("recovered SRT = %+v, want gen 3 with %d rows", rec.SRT, prefix.ShardCount)
+	}
+	if rec.SRT.Rows[1].FirstTailSeg != rows[1].FirstTailSeg {
+		t.Fatalf("SRT row 1 tail seg = %#x, want %#x", rec.SRT.Rows[1].FirstTailSeg, rows[1].FirstTailSeg)
+	}
+
+	es, err := ReadExtentTable(dev, rec.State.Meta)
+	if err != nil {
+		t.Fatalf("read extents: %v", err)
+	}
+	if len(es) != 1 || es[0] != extents[0] {
+		t.Fatalf("recovered extents = %+v, want %+v", es, extents)
+	}
+}
+
+// TestCheckpointRootsRideTheGrid confirms the roots land as segments a grid walk
+// counts and skips: the shard root table and extent map are owner-less segments,
+// so the durable tail sits past them, not on them.
+func TestCheckpointRootsRideTheGrid(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	if err := f.Checkpoint(&SRT{Gen: 1, Rows: rows}, []Extent{{Kind: ExtentAppend, StartOff: PageSize, Length: 0x1000}}, CheckpointStats{}); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	size, _ := dev.Size()
+	tally, err := ScanSegments(dev, prefix, PageSize, uint64(size))
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if tally.ByKind[KindSRT] != 1 || tally.ByKind[KindExtentTable] != 1 {
+		t.Fatalf("tally = %v, want 1 SRT and 1 extent-table segment", tally.ByKind)
+	}
+	if tally.DurableTail != f.Cursor() {
+		t.Fatalf("durable tail = %d, want past the root segments at %d", tally.DurableTail, f.Cursor())
+	}
+}
+
+// TestCheckpointWithoutExtents omits the extent map and confirms the root commits
+// with no extent pointer: a checkpoint does not have to carry a shape hint.
+func TestCheckpointWithoutExtents(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	if err := f.Checkpoint(&SRT{Gen: 1, Rows: rows}, nil, CheckpointStats{Clean: true}); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	st, err := ReadOpenState(dev)
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	if st.Meta.ExtentTableLen != 0 {
+		t.Fatalf("extent len = %d, want 0 (no extents committed)", st.Meta.ExtentTableLen)
+	}
+	es, err := ReadExtentTable(dev, st.Meta)
+	if err != nil || es != nil {
+		t.Fatalf("extents = %v/%v, want nil/nil", es, err)
+	}
+}
+
 // TestOpenReseedsCommitSeq reopens a committed file and confirms the next commit
 // continues the sequence: Open reads the live root's commit_seq so a flip does not
 // resurrect an old slot.
