@@ -138,3 +138,61 @@ func TestListFootprintMatchesSource(t *testing.T) {
 		t.Fatalf("list footprint %d != chunkBlobCap + chunkElemCap*2", listFootprint)
 	}
 }
+
+// TestHashRowPacksPairs pins the hash row: a chunk packs field-and-value pairs to the
+// byte target, so a 20-byte field and value pair packs a healthy count and the frame
+// overhead stays near 1% like the set.
+func TestHashRowPacksPairs(t *testing.T) {
+	r := measureHash(20, keyLen)
+	if r.members < 90 {
+		t.Fatalf("20-byte pair packs only %d per chunk, want a healthy fill", r.members)
+	}
+	if r.overhead > 0.02 {
+		t.Fatalf("hash frame overhead %.3f above ~1%%", r.overhead)
+	}
+}
+
+// TestHashKeepsFieldResident pins the design crux: the hash keeps the field bytes
+// resident, so a demote frees strictly less than the set frees for the same width,
+// because the set sheds the whole member while the hash sheds only the value. This is
+// the price of a zero-pread probe, and the model must show it.
+func TestHashKeepsFieldResident(t *testing.T) {
+	for _, width := range []int{8, 20, 64, 256} {
+		h := measureHash(width, keyLen)
+		s := measure(width, keyLen)
+		if h.freedFrac >= s.freedFrac {
+			t.Fatalf("width %d: hash freed %.3f not below set's %.3f (field must stay resident)",
+				width, h.freedFrac, s.freedFrac)
+		}
+		// The resident-after figure must still carry the field bytes.
+		if h.coldPerEl < float64(fentryBytes+hashVecBytes+width) {
+			t.Fatalf("width %d: hash resident %.1f B dropped the field bytes", width, h.coldPerEl)
+		}
+	}
+}
+
+// TestHashFreedGrowsWithWidth pins that the shed still pays off more as the value
+// widens: a wider value is a larger share of the pair's footprint, so the freed
+// fraction climbs, even though the resident field caps it below the set's.
+func TestHashFreedGrowsWithWidth(t *testing.T) {
+	small := measureHash(20, keyLen)
+	large := measureHash(256, keyLen)
+	if small.freedFrac <= 0 {
+		t.Fatalf("20-byte hash demote freed %.3f, want a positive saving", small.freedFrac)
+	}
+	if large.freedFrac <= small.freedFrac {
+		t.Fatalf("256-byte hash freed %.3f not above 20-byte %.3f", large.freedFrac, small.freedFrac)
+	}
+}
+
+// TestHashChunkFitsLocatorCeiling pins that no field-and-value width packs more pairs
+// into one chunk than the locator's 12-bit entry index can address (hash/cold.go
+// maxChunkEntry), so the byte target flushes well before the entry ceiling.
+func TestHashChunkFitsLocatorCeiling(t *testing.T) {
+	const maxChunkEntry = 1 << 12
+	for _, width := range []int{1, 8, 16, 20} {
+		if r := measureHash(width, keyLen); r.members > maxChunkEntry {
+			t.Fatalf("width %d packs %d pairs, over the locator's %d ceiling", width, r.members, maxChunkEntry)
+		}
+	}
+}

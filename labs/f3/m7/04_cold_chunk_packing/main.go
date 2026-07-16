@@ -78,6 +78,22 @@ const (
 	listDescBytes = 48
 )
 
+// Hash encoding constants, copied from the packages they mirror. A hash is key-value,
+// so its demote is the collection analog of the string band's value-log split: it
+// keeps the field bytes resident (the probe key) and sheds only the value bytes to a
+// cold chunk (hash/cold.go demote). So the packed payload is the field-and-value PAIR
+// (hash/cold.go appendEntry, uvarint(flen)+field+uvarint(vlen)+value), the field
+// riding along for the M8 recovery walk, and the demoted record stays resident with
+// its field bytes still in the slab, only its value read routed through a pread. The
+// resident cost after a demote is the record cell, its draw-vector slot, the field
+// bytes it keeps, and its share of one directory descriptor and one offset slot. The
+// freed fraction is the value bytes alone, lower than the set's whole-member shed, the
+// price the hash pays to keep HEXISTS, HKEYS, and HSTRLEN zero preads.
+const (
+	fentryBytes  = 20 // hash/field.go fentry: foff+voff+vslot+flen+band+vlen, padded
+	hashVecBytes = 4  // hash/field.go vec: one uint32 draw-vector slot per field
+)
+
 // uvarintLen is the byte width binary.AppendUvarint writes for n, the length prefix
 // each packed member carries.
 func uvarintLen(n int) int {
@@ -184,6 +200,55 @@ func measureList(width, keyLen int) listRow {
 	}
 }
 
+// hashRow is one width point in the hash sweep. The width is both the field and the
+// value byte length: a chunk packs field-and-value pairs, but only the value leaves
+// resident memory, so the freed fraction is the value's share of the pair's footprint.
+type hashRow struct {
+	width     int
+	members   int     // field-value pairs packed into one 4 KiB chunk
+	payload   int     // payload bytes those pairs occupy
+	frame     int     // whole on-disk frame bytes (header + key + disc + payload)
+	overhead  float64 // frame overhead as a fraction of the frame
+	metaPerEl float64 // resident cold metadata bytes per cold field (descriptor + offset share)
+	amortize  float64 // element-per-row resident cost over the chunk's, the packing win
+	hotPerEl  float64 // fully-resident bytes per field (record + vec + field + value)
+	coldPerEl float64 // resident bytes per field after a demote (record + vec + field kept + meta)
+	freedFrac float64 // resident fraction a demote frees to disk (the value bytes)
+}
+
+// hashPack models one hash chunk's fill for a fixed field and value width. Each pair
+// costs the two length prefixes and the two byte runs (hash/cold.go appendEntry), and
+// the chunk overruns the byte target by at most one pair, the same fill-then-check
+// flush the set takes.
+func hashPack(width int) (members, payloadBytes int) {
+	entry := uvarintLen(width) + width + uvarintLen(width) + width
+	for payloadBytes < chunkByteTarget {
+		payloadBytes += entry
+		members++
+	}
+	return members, payloadBytes
+}
+
+func measureHash(width, keyLen int) hashRow {
+	members, payload := hashPack(width)
+	frame := chunkHdr + keyLen + discBytes + payload
+	metaPerEl := float64(descBytes+offsBytes) / float64(members)
+	hotPerEl := float64(fentryBytes + hashVecBytes + width + width)
+	coldPerEl := float64(fentryBytes+hashVecBytes+width) + metaPerEl
+	return hashRow{
+		width:     width,
+		members:   members,
+		payload:   payload,
+		frame:     frame,
+		overhead:  float64(frame-payload) / float64(frame),
+		metaPerEl: metaPerEl,
+		amortize:  elementPerRowResident / metaPerEl,
+		hotPerEl:  hotPerEl,
+		coldPerEl: coldPerEl,
+		freedFrac: (hotPerEl - coldPerEl) / hotPerEl,
+	}
+}
+
 func main() {
 	quick := flag.Bool("quick", false, "run the reduced width sweep")
 	keyLen := flag.Int("keylen", 16, "collection key byte length (on-disk frame only)")
@@ -256,4 +321,34 @@ func main() {
 		lverdict.metaPerEl, lverdict.amortize)
 	fmt.Printf("  a whole-chunk demote frees %.1f%% of the chunk's resident footprint at every width (%.1f B -> %.2f B resident per member)\n",
 		lverdict.freedFrac*100, lverdict.hotPerEl, lverdict.coldPerEl)
+
+	// The hash column: a hash packs field-and-value pairs but keeps the field bytes
+	// resident, so its freed fraction is the value's share alone, the price of a
+	// zero-pread probe. The width labels the field and the value byte length together.
+	fmt.Printf("\nhash cold chunk packing, field-and-value pairs, fields kept resident (only values shed)\n\n")
+	fmt.Printf(hdr, "f+v", "pairs/", "payload", "frame", "frame", "resident meta", "vs element", "resident", "freed to")
+	fmt.Printf(hdr, "bytes", "chunk", "bytes", "bytes", "overhead", "B/field", "per-row", "B/field", "disk")
+	fmt.Printf(hdr, "------", "--------", "-------", "-----", "--------", "-------------", "----------", "--------", "--------")
+
+	var hverdict hashRow
+	for _, width := range widths {
+		r := measureHash(width, *keyLen)
+		if width == 20 {
+			hverdict = r
+		}
+		fmt.Printf("%-8d %-9d %-8d %-7d %-9s %-14.3f %-11s %-9.0f %-8s\n",
+			r.width, r.members, r.payload, r.frame,
+			fmt.Sprintf("%.2f%%", r.overhead*100), r.metaPerEl,
+			fmt.Sprintf("%.0fx", r.amortize), r.coldPerEl,
+			fmt.Sprintf("%.0f%%", r.freedFrac*100))
+	}
+	if hverdict.members == 0 {
+		hverdict = measureHash(20, *keyLen)
+	}
+	fmt.Printf("\nHash verdict point (20-byte field and value):\n")
+	fmt.Printf("  %d pairs per 4 KiB chunk, frame overhead %.2f%%\n", hverdict.members, hverdict.overhead*100)
+	fmt.Printf("  resident cold metadata %.3f B/field (descriptor + offset), %.0fx below element-per-row\n",
+		hverdict.metaPerEl, hverdict.amortize)
+	fmt.Printf("  a demote frees %.0f%% of a field's footprint to disk, the value bytes (%.0f B -> %.0f B resident; the field stays resident for a zero-pread probe)\n",
+		hverdict.freedFrac*100, hverdict.hotPerEl, hverdict.coldPerEl)
 }

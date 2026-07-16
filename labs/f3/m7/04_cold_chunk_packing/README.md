@@ -1,6 +1,6 @@
-# Lab 04: set and list cold chunk packing factor
+# Lab 04: set, list, and hash cold chunk packing factor
 
-Part of issue #549, the M7 LTM milestone, lab 04, the chunk packing factor per type the spec lists as a lab knob (doc 06 sections 6.2 and 6.3). It is the per-perf-change lab the demotion packs owe: the set slices PR D2 and PR E were the first to pack real members into cold chunks, and the list demote pass (PR D2 of the list cold-chunk row) packs whole chunks; the per-perf-change rule wants each memory-density claim measured, not asserted.
+Part of issue #549, the M7 LTM milestone, lab 04, the chunk packing factor per type the spec lists as a lab knob (doc 06 sections 6.2 and 6.3). It is the per-perf-change lab the demotion packs owe: the set slices PR D2 and PR E were the first to pack real members into cold chunks, the list demote pass (PR D2 of the list cold-chunk row) packs whole chunks, and the hash demote pass (PR D2 of the hash cold-chunk row) packs field-and-value pairs while keeping the fields resident; the per-perf-change rule wants each memory-density claim measured, not asserted.
 
 ## Question
 
@@ -23,7 +23,9 @@ In-process, no server, no wire, no engine import, the lab-local model the other 
 
 The list model mirrors list/cold.go `demote` the same way: a `w`-byte frame packs as `uvarintLen(w)+w` payload bytes (the same frame the resident blob stores), a chunk seals on the 4 KiB blob budget or the 128-element cap whichever binds first (native.go `canAppendTail`), the cold frame carries the same 16-byte header plus key plus an 8-byte demote sequence, and the only resident cost a demoted chunk leaves is a 48-byte directory descriptor (list/cold.go `listCold.residentBytes`), with no offset table and no per-element record. The `listFootprint` constant mirrors native.go `chunkFootprint`, and a test pins it against the source derivation.
 
-The constants are copied from the packages they mirror, and the test asserts the derived numbers against the spec's table, so a drift between a mirrored constant and its source surfaces as a failing invariant rather than a silently wrong verdict. `go run .` runs both width sweeps; `-quick` shrinks them for the shared runner. `TestSetRowMeetsSpec`, `TestOverheadStaysLowAcrossWidths`, `TestMetadataInSpecBand`, `TestFreedFractionGrowsWithWidth`, `TestChunkFitsLocatorCeiling`, `TestListWholeChunkFreesNearlyAll`, `TestListChunkMetaUnderSet`, `TestListChunkFitsElemCap`, and `TestListFootprintMatchesSource` are what CI drives.
+The hash model mirrors hash/cold.go `ftable.demote`: a hash is key-value, so the demote sheds only the value and keeps the field bytes resident for a zero-pread probe. An entry packs the pair as `uvarint(flen)+field+uvarint(vlen)+value` (hash/cold.go `appendEntry`), so a `w`-byte field and `w`-byte value cost `2*(uvarintLen(w)+w)` payload bytes; a chunk fills until the running payload reaches the 4 KiB target and overruns by at most one pair. The resident cost per field is the same 48-byte descriptor plus an 8-byte offset slot the set keeps (the hash directory is byte-lex over the field hash, so it needs the offset table a read seeks by), but the resident-after figure still carries the field bytes and the 20-byte field entry plus the 4-byte vector slot, because only the value leaves. That is the design crux the model has to show: the hash frees strictly less than the set for the same width, the price of keeping the probe resident.
+
+The constants are copied from the packages they mirror, and the test asserts the derived numbers against the spec's table, so a drift between a mirrored constant and its source surfaces as a failing invariant rather than a silently wrong verdict. `go run .` runs all three width sweeps; `-quick` shrinks them for the shared runner. `TestSetRowMeetsSpec`, `TestOverheadStaysLowAcrossWidths`, `TestMetadataInSpecBand`, `TestFreedFractionGrowsWithWidth`, `TestChunkFitsLocatorCeiling`, `TestListWholeChunkFreesNearlyAll`, `TestListChunkMetaUnderSet`, `TestListChunkFitsElemCap`, `TestListFootprintMatchesSource`, `TestHashRowPacksPairs`, `TestHashKeepsFieldResident`, `TestHashFreedGrowsWithWidth`, and `TestHashChunkFitsLocatorCeiling` are what CI drives.
 
 ## Results
 
@@ -65,8 +67,28 @@ Model output, deterministic, 4096-byte payload target, 16-byte key:
 
 The freed fraction is 98.9% at every width, a flat line where the set's climbs from 33% to 93%. The reason is structural: a list demote keeps no per-element resident state, so the resident cost after a demote is only the descriptor's 1/members share, and the freed footprint is the chunk's 1/members share, so their ratio is a constant `(4352 - 48) / 4352` independent of the member width. Where the set frees the slab but keeps the record and the draw-vector slot resident, the list frees the whole chunk and keeps a descriptor. Per chunk the list also keeps less resident metadata than the set (48 bytes, the descriptor alone, against the set's 56 bytes of descriptor plus offset slot), because the offset table is gone.
 
+## Hash column
+
+A hash is key-value, not a bag of members, so its demote cannot shed the whole record the way the set does. The field is the probe key and the value is the weight the native band exists to hold (a value outgrew the 64-byte inline cap, the collection analog of f3's string-band value-log split), so the pass keeps every field byte resident and sheds only the value into the cold chunk (hash/cold.go `ftable.demote`). That keeps HEXISTS, HKEYS, HSTRLEN, and the field-table probe at zero preads; only HGET and HVALS pread the owning chunk. The cold frame still packs the field-and-value pair, so an M8 recovery walk can rebuild the field table from the cold region alone, which means the field is duplicated: resident in the slab, and on disk in the frame.
+
+Model output, deterministic, 4096-byte payload target, 16-byte key. The width column is the field-and-value pair width (both the same), so the pair is twice the set member at the same width:
+
+| f+v bytes | pairs/chunk | frame overhead | resident meta B/field | vs element-per-row | resident B/field | freed to disk |
+|---|---|---|---|---|---|---|
+| 8 | 228 | 0.97% | 0.246 | 53x | 32 | 19% |
+| 16 | 121 | 0.96% | 0.463 | 28x | 40 | 28% |
+| 20 | 98 | 0.96% | 0.571 | 23x | 45 | 30% |
+| 32 | 63 | 0.95% | 0.889 | 15x | 57 | 35% |
+| 64 | 32 | 0.95% | 1.750 | 7x | 90 | 41% |
+| 128 | 16 | 0.95% | 3.500 | 4x | 156 | 44% |
+| 256 | 8 | 0.96% | 7.000 | 2x | 287 | 46% |
+
+The freed fraction is the hash's honest trade. At 20 bytes it frees 30%, where the set at the same member width frees 55%: the set moves the whole 20-byte member to disk, the hash moves only the 20-byte value and keeps the 20-byte field plus the field entry resident for the zero-pread probe. The freed fraction still climbs with width (a wider value is a larger share of the pair, so 256 bytes frees 46% against 8 bytes' 19%), but it stays capped below the set at every width, the price of the resident probe. Frame overhead holds at about 0.96%, on the set's mark, because the pair is packed to the same 4 KiB payload. Per-field resident metadata is coarser than the set's per-member (0.571 against 0.286 at 20 bytes) only because a pair is twice a member, so a chunk holds half as many entries and the same 56-byte descriptor-plus-offset share splits over fewer of them.
+
 ## Verdict
 
 The shipped set cold chunk encoding meets or beats every packing target the spec sizes against. At the 20-byte design point it packs 196 members per 4 KiB chunk (above the ~170 target) at 0.96% frame overhead (on the ~1% target), holds resident cold metadata to 0.286 bytes per member (inside the 0.16-0.32 band, 46x under element-per-row's 13 bytes), and frees 55% of a member's resident footprint to disk on demote. The memory bar the product pitch rests on is met: a demoted set costs less RAM for the same data, and the wider the members the larger the saving. The per-type payload knob stays open for the wide-element bands (128 bytes and up), where the fixed 4 KiB payload amortizes less and a bigger payload or value-log separation is the lever, exactly as the spec defers it to each type's doc.
 
 The list whole-chunk demote is the leaner of the two. Because it keeps no per-element resident record and no offset table, only one descriptor per chunk, it frees 98.9% of a chunk's resident footprint at every member width, a flat saving where the set's grows from a third to most of the footprint. The trade is a coarser element cap (128 frames per chunk when a narrow member hits the ceiling before the byte target), which lifts the small-member frame overhead to a few percent, still a rounding error against the resident saving. For the list the memory bar is met with room to spare: a demoted list chunk is essentially free of resident cost, holding a fraction of a byte per element.
+
+The hash demote is the deliberate middle. It frees less than either the set or the list, 30% at the 20-byte design point against the set's 55%, because it keeps the field bytes resident so the field-table probe, HEXISTS, HKEYS, and HSTRLEN stay at zero preads. That is the trade the type wants: a hash is read by field far more than by value, so paying resident field bytes to keep the probe local while shedding the value the band exists to hold is the right cut. Frame overhead sits on the set's 0.96% mark and the freed fraction still grows with the value width (19% at 8 bytes to 46% at 256), so the wider the value the more the shed earns. The memory bar is met on the axis that matters for a hash: the value bytes leave RAM for disk while the resident probe stays fast, and a run of wide-valued fields frees a growing share as the values widen.

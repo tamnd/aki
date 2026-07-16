@@ -2,7 +2,9 @@ package hash
 
 import (
 	"encoding/binary"
+	"sort"
 
+	"github.com/tamnd/aki/engine/f3/shard"
 	"github.com/tamnd/aki/engine/f3/store"
 	"github.com/tamnd/aki/engine/f3/tier"
 )
@@ -185,4 +187,141 @@ func chunkEntry(payload []byte, idx int) (field, value []byte, ok bool) {
 			return f, v, true
 		}
 	}
+}
+
+// demote packs the hash at key into the cold region and returns the fields whose
+// values were shed. It is the directly-callable core the worker's demote loop drives
+// (PR F) and the retier test exercises: it dispatches on the encoding, and reconciles
+// the running total on a shed. An inline listpack hash is below one chunk's worth, so
+// it never demotes; only the native band sheds. It returns 0 when the key is absent,
+// the band is inline, the table holds no resident values, or the cold region refused
+// the append.
+func (g *reg) demote(cx *shard.Ctx, key []byte) int {
+	h := g.m[string(key)]
+	if h == nil {
+		return 0
+	}
+	n := h.demote(cx.St, key)
+	if n > 0 {
+		g.note(h)
+	}
+	return n
+}
+
+// demote sheds the native band's values into cold chunks. The inline band stays
+// resident; the native band demotes its one table. A hash sheds its whole table in a
+// pass, the same shape the set's single native table takes, since a hash carries no
+// partitioned band to sweep one piece at a time.
+func (h *hash) demote(st *store.Store, key []byte) int {
+	if h.enc != encHashtable {
+		return 0
+	}
+	return h.ft.demote(st, key)
+}
+
+// demote sheds this table's resident values into cold chunks, retiers their records,
+// and rebuilds the slab to hold only the field bytes. It is the crux of the hash cold
+// form: unlike the set, which packs whole members and drops the slab, a hash keeps
+// its field bytes resident (the probe key) and packs the field-and-value pair while
+// shedding only the value bytes. So it gathers every record whose value is still
+// resident, in field-hash order, fills chunks to the byte target (or the entry
+// ceiling), appends each to the cold region, and only on a clean append of every
+// chunk commits the directory descriptors and the record retier. A refused append
+// leaves the table fully resident (the orphan frames the append-only region already
+// holds are dead space the compactor reclaims), so demotion degrades to a no-op
+// rather than a torn hash.
+func (f *ftable) demote(st *store.Store, key []byte) int {
+	type entry struct {
+		hash uint64
+		ord  uint32
+	}
+	var ents []entry
+	for _, ord := range f.vec {
+		e := &f.ents[ord]
+		if e.band&tierCold != 0 {
+			continue // already cold from an earlier pass
+		}
+		ents = append(ents, entry{store.Hash(f.slab[e.foff : e.foff+uint32(e.flen)]), ord})
+	}
+	if len(ents) == 0 {
+		return 0
+	}
+	sort.Slice(ents, func(i, j int) bool { return ents[i].hash < ents[j].hash })
+
+	if f.cold == nil {
+		f.cold = &coldChunks{st: st}
+	}
+	cc := f.cold
+
+	// Pack and append every chunk first, collecting the placements; only commit the
+	// directory and the retier once all appends succeed. firstHash is the
+	// discriminator of the chunk currently filling.
+	type placed struct {
+		off  uint64
+		disc []byte
+		ords []uint32
+	}
+	var chunks []placed
+	var payload []byte
+	var ords []uint32
+	var firstHash uint64
+	for i, e := range ents {
+		if len(cc.offs)+len(chunks)+1 > maxColdSlot {
+			break // offset-table ceiling: leave the rest resident for the next pass
+		}
+		if len(ords) == 0 {
+			firstHash = e.hash
+		}
+		r := &f.ents[e.ord]
+		payload = appendEntry(payload, f.slab[r.foff:r.foff+uint32(r.flen)], f.slab[r.voff:r.voff+r.vlen])
+		ords = append(ords, e.ord)
+		full := len(payload) >= chunkByteTarget || len(ords) >= maxChunkEntry
+		if full || i == len(ents)-1 {
+			off, ok := st.AppendChunk(kindHash, 0, uint16(len(ords)), key, discOf(firstHash), payload)
+			if !ok {
+				return 0 // broken region: abandon, the table stays fully resident
+			}
+			chunks = append(chunks, placed{off: off, disc: discOf(firstHash), ords: append([]uint32(nil), ords...)})
+			payload = payload[:0]
+			ords = ords[:0]
+		}
+	}
+
+	// Commit: add a descriptor and offset-table slot per chunk, and retier every
+	// packed record so its value reads from the chunk. The field bytes stay resident,
+	// so voff becomes the locator while foff is left for the slab rebuild below.
+	n := 0
+	for _, c := range chunks {
+		slot := uint32(len(cc.offs))
+		cc.offs = append(cc.offs, c.off)
+		cc.dir.Insert(c.disc, uint32(len(c.ords)), c.off)
+		for j, ord := range c.ords {
+			e := &f.ents[ord]
+			e.band |= tierCold
+			e.voff = packLoc(slot, uint32(j))
+			n++
+		}
+	}
+
+	// Rebuild the slab to hold only the field bytes: the shed values are unreachable
+	// now, so a fresh slab of just the fields reclaims their space and leaves the
+	// probe intact. Size the fresh slab to the field bytes exactly (not the old
+	// field-and-value length) so its capacity, the figure residentBytes counts,
+	// reflects the shed. Walk the draw vector so every live record's foff is
+	// repointed, including records already cold from an earlier pass (their fields
+	// never left).
+	fieldBytes := 0
+	for _, ord := range f.vec {
+		fieldBytes += int(f.ents[ord].flen)
+	}
+	packed := make([]byte, 0, fieldBytes)
+	for _, ord := range f.vec {
+		e := &f.ents[ord]
+		foff := uint32(len(packed))
+		packed = append(packed, f.slab[e.foff:e.foff+uint32(e.flen)]...)
+		e.foff = foff
+	}
+	f.slab = packed
+	f.dead = 0
+	return n
 }
