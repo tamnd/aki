@@ -165,11 +165,12 @@ func EncodeMarkPayload(seq int64) ([]byte, error) {
 }
 
 // MarkSeq reports whether a replayed PUT record is the high-water
-// mark and returns the batch seq it carries. The mint-lease record is
-// the one other meta key allowed through (LeaseMark decodes it); any
-// other rtype-meta key is an error, nothing else emits one.
+// mark and returns the batch seq it carries. The mint-lease and
+// rootkey records are the other meta keys allowed through (LeaseMark
+// and RootkeyRef decode them); any other rtype-meta key is an error,
+// nothing else emits one.
 func MarkSeq(rec *Record) (int64, bool, error) {
-	if rec.RType != RecMeta || bytes.Equal(rec.Key, leaseKey) {
+	if rec.RType != RecMeta || bytes.Equal(rec.Key, leaseKey) || isRootkeyKey(rec.Key) {
 		return 0, false, nil
 	}
 	if !bytes.Equal(rec.Key, markKey) {
@@ -230,4 +231,46 @@ func LeaseMark(rec *Record) (uint64, bool, error) {
 		return 0, false, err
 	}
 	return mark, true, nil
+}
+
+// Rootkey records: the durable rooth-to-user-key mapping rule W3's
+// replay reconciliation resolves patched roots through. The index is
+// keyed by hash of the key bytes, so a rooth alone cannot find the
+// root record it belongs to; this record closes that gap. ApplyBatch
+// writes one alongside every full-frame reconcilable root, so the
+// mapping is durable from the plane's first structural frame (the
+// upgrade) and refreshes on every split and merge, which also keeps
+// it current if a later slice moves a root to a new user key. Delta
+// roots never emit one: their frames are elided and the mapping they
+// would refresh already exists. Like generation records it lives on
+// the kind-0 subkey plane; the segid bytes spell rootkey, which
+// GenKey (all zero past the rooth) and the mint lease (zero rooth)
+// can never produce.
+var rootkeyTag = []byte("rootkey")
+
+// RootkeyKey builds the rootkey record's index key for a rooth.
+func RootkeyKey(rooth uint64) []byte {
+	b := make([]byte, SubkeySize)
+	binary.LittleEndian.PutUint64(b, rooth)
+	copy(b[9:], rootkeyTag)
+	return b
+}
+
+func isRootkeyKey(k []byte) bool {
+	return len(k) == SubkeySize && k[8] == 0 && bytes.Equal(k[9:], rootkeyTag)
+}
+
+// rootkeyRecord builds the rootkey record mapping rooth to userKey.
+func rootkeyRecord(rooth uint64, userKey []byte) *Record {
+	return &Record{RType: RecMeta, Key: RootkeyKey(rooth), Value: userKey}
+}
+
+// RootkeyRef reports whether a replayed PUT record is a rootkey
+// record and returns the mapping it carries. The user key aliases the
+// record's value.
+func RootkeyRef(rec *Record) (rooth uint64, userKey []byte, ok bool) {
+	if rec.RType != RecMeta || !isRootkeyKey(rec.Key) {
+		return 0, nil, false
+	}
+	return binary.LittleEndian.Uint64(rec.Key), rec.Value, true
 }

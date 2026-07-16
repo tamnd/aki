@@ -251,12 +251,24 @@ func OpenStoreOn(f StoreFile, walPath string, walSegSize int64) (*Store, error) 
 		rec.WAL.Close()
 		return nil, err
 	}
+	ops := truncateTail(tail.ops)
+	patches, dropped, err := s.reconcileTail(ops)
+	if err != nil {
+		rec.WAL.Close()
+		return nil, fmt.Errorf("sqlo1b: replay reconciliation: %w", err)
+	}
 	// Re-apply the buffered tail through the normal write path with
 	// WAL emission suppressed: those frames are already durable, only
 	// the RAM index and fresh vlog copies need rebuilding. Records
 	// re-drained this way abandon their pre-crash extents; the old
-	// copies are garbage until compaction.
-	for _, op := range tail.ops {
+	// copies are garbage until compaction. Ops reconciliation rolled
+	// back (a structural window that lost its root frame) are skipped;
+	// the plane recovers to its last rooted batch instead.
+	ops = append(ops, patches...)
+	for i, op := range ops {
+		if dropped[i] {
+			continue
+		}
 		switch {
 		case op.mark:
 			s.hw = op.markSeq
@@ -414,6 +426,229 @@ func cloneRecord(r *Record) *Record {
 	c.Key = bytes.Clone(r.Key)
 	c.Value = bytes.Clone(r.Value)
 	return &c
+}
+
+// truncateTail drops PUT and DEL frames past the last high-water mark.
+// ApplyBatch syncs a batch's data frames and its trailing mark as one
+// durability point, so data frames after the last mark belong to a
+// batch whose ApplyBatch never returned: nothing above the store ever
+// learned of them, and a torn multi-frame batch applied as a prefix
+// can be worse than lost, because a structural batch's early frames
+// (a trimmed segment, say) are only correct together with its later
+// ones (the split-off segment and the root that maps it). Dropping
+// the whole unacknowledged suffix lands recovery on the last
+// acknowledged batch boundary. GENBUMP and mint-lease frames stay:
+// GenBump and MintLease sync them standalone at command time, their
+// applies are monotonic, and they reference nothing in the dropped
+// puts, so a trailing genbump is a durable acknowledged delete and a
+// trailing lease merely advances the mint counter.
+func truncateTail(ops []tailOp) []tailOp {
+	last := -1
+	for i := range ops {
+		if ops[i].mark {
+			last = i
+		}
+	}
+	out := ops[:0]
+	for i := range ops {
+		if i <= last || ops[i].genbump || ops[i].lease {
+			out = append(out, ops[i])
+		}
+	}
+	return out
+}
+
+// planeSegOp is one tail segment frame in a plane's unrooted window:
+// its position in the tail, the batch it rode in, and the count and
+// min_expire drift its post-image carries over its pre-image.
+type planeSegOp struct {
+	idx   int
+	batch int
+	segid uint64
+	del   bool
+	dn    int64
+	min   int64
+}
+
+// reconcileTail is rule W3's replay side (doc 06 section 5): walk the
+// truncated tail before anything applies and settle, per plane, the
+// window of segment frames past the last durable root image. A window
+// confined to segids the root's fence references is count-only (the
+// root frame was W2-elided or lost to the batch split W1 allows), and
+// the walk diffs each segment post-image against its pre-replay image
+// and emits a patched root that appends after the tail, wins by
+// order, lands in the vlog like any replayed put, and rides the next
+// checkpoint forward. A window carrying a segment delete or an
+// unfenced segid is a structural change whose root frame the crash
+// took: no count repair can make the stale fence route reads to the
+// relaid segments, so the plane rolls back instead, dropping its
+// window ops from the batch with the first structural evidence
+// onward, which recovers the plane to its last rooted batch. The walk
+// runs against the committed state the checkpoint left behind, raw
+// lookups with no expiry gating, so the result is a pure function of
+// the data file and the tail and repeat recoveries are idempotent.
+func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
+	segs := map[string]int{}          // subkey bytes -> latest known entry count
+	wins := map[uint64][]planeSegOp{} // rooth -> window past its last root frame
+	rootRecs := map[string]*Record{}  // user key -> latest tail root image, nil = deleted
+	rootKeys := map[uint64][]byte{}   // rooth -> user key, from tail rootkey records
+	isSeg := func(k []byte) bool {
+		return len(k) == SubkeySize && k[8] == sqlo1.SubkindSeg
+	}
+	segPre := func(key []byte) (int, error) {
+		if n, ok := segs[string(key)]; ok {
+			return n, nil
+		}
+		rec, err := s.lookup(key)
+		if err != nil || rec == nil {
+			return 0, err
+		}
+		n, _, ok := sqlo1.SegCounts(rec.Value)
+		if !ok {
+			return 0, nil
+		}
+		return n, nil
+	}
+	segid := func(k []byte) uint64 {
+		var seg [8]byte
+		copy(seg[:7], k[9:])
+		return binary.LittleEndian.Uint64(seg[:])
+	}
+	batch := 0
+	for i := range ops {
+		op := &ops[i]
+		switch {
+		case op.lease:
+		case op.mark:
+			batch++
+		case op.genbump:
+			// The plane retired; whatever its count was is moot, and
+			// its rootkey record may soon point at a recreated key.
+			delete(wins, binary.LittleEndian.Uint64(op.key))
+		case op.del:
+			if isSeg(op.key) {
+				rooth := binary.LittleEndian.Uint64(op.key)
+				wins[rooth] = append(wins[rooth], planeSegOp{
+					idx: i, batch: batch, segid: segid(op.key), del: true,
+				})
+				segs[string(op.key)] = 0
+			} else {
+				rootRecs[string(op.key)] = nil
+			}
+		default:
+			rec := op.rec
+			if rooth, ukey, ok := RootkeyRef(rec); ok {
+				rootKeys[rooth] = ukey
+				continue
+			}
+			switch {
+			case rec.RType == RecSeg && isSeg(rec.Key):
+				post, postMin, ok := sqlo1.SegCounts(rec.Value)
+				if !ok {
+					break // no countable header, contributes nothing
+				}
+				pre, err := segPre(rec.Key)
+				if err != nil {
+					return nil, nil, err
+				}
+				rooth := binary.LittleEndian.Uint64(rec.Key)
+				wins[rooth] = append(wins[rooth], planeSegOp{
+					idx: i, batch: batch, segid: segid(rec.Key),
+					dn: int64(post - pre), min: postMin,
+				})
+				segs[string(rec.Key)] = post
+			case rec.RType == RecRoot:
+				rootRecs[string(rec.Key)] = rec
+				if rooth, ok := sqlo1.ReconcileRef(rec.Value); ok {
+					// A full root frame is exact as of this point;
+					// only segments past it can drift the plane.
+					delete(wins, rooth)
+				}
+			}
+		}
+	}
+	rooths := make([]uint64, 0, len(wins))
+	for rooth := range wins {
+		rooths = append(rooths, rooth)
+	}
+	slices.Sort(rooths)
+	var patches []tailOp
+	dropped := map[int]bool{}
+	for _, rooth := range rooths {
+		win := wins[rooth]
+		ukey := rootKeys[rooth]
+		if ukey == nil {
+			rec, err := s.lookup(RootkeyKey(rooth))
+			if err != nil {
+				return nil, nil, err
+			}
+			if rec == nil {
+				// No durable mapping: the plane's first root frame is
+				// past the crash, so nothing references these
+				// segments and they sit harmlessly until compaction.
+				continue
+			}
+			ukey = bytes.Clone(rec.Value)
+		}
+		var root *Record
+		if r, seen := rootRecs[string(ukey)]; seen {
+			root = r // nil here means the tail deleted the key
+		} else {
+			r, err := s.lookup(ukey)
+			if err != nil {
+				return nil, nil, err
+			}
+			root = r
+		}
+		if root == nil || root.RType != RecRoot {
+			continue
+		}
+		if rr, ok := sqlo1.ReconcileRef(root.Value); !ok || rr != rooth {
+			continue // stale mapping, the key was recreated
+		}
+		fence, ok := sqlo1.ReconcileFence(root.Value)
+		if !ok {
+			return nil, nil, fmt.Errorf("root %q under rooth %x does not decode", ukey, rooth)
+		}
+		fenced := map[uint64]bool{}
+		for _, id := range fence {
+			fenced[id] = true
+		}
+		// The kept prefix ends at the batch with the first structural
+		// evidence; everything from that batch on rolls back.
+		keep := len(win)
+		for j, o := range win {
+			if o.del || !fenced[o.segid] {
+				keep = j
+				for keep > 0 && win[keep-1].batch == o.batch {
+					keep--
+				}
+				break
+			}
+		}
+		for _, o := range win[keep:] {
+			dropped[o.idx] = true
+		}
+		var dn, minExp int64
+		for _, o := range win[:keep] {
+			dn += o.dn
+			if o.min != 0 && (minExp == 0 || o.min < minExp) {
+				minExp = o.min
+			}
+		}
+		if dn == 0 && minExp == 0 {
+			continue
+		}
+		patched, err := sqlo1.ReconcileRoot(root.Value, dn, minExp)
+		if err != nil {
+			return nil, nil, fmt.Errorf("root %q under rooth %x: %w", ukey, rooth, err)
+		}
+		pr := *root
+		pr.Key = bytes.Clone(root.Key)
+		pr.Value = patched
+		patches = append(patches, tailOp{rec: &pr})
+	}
+	return patches, dropped, nil
 }
 
 // loadStoreGrid rebuilds the grid from the committed allocmap
@@ -658,14 +893,19 @@ func placementClass(rec *Record) int {
 // batches and only closes when full, which is what keeps a run of
 // small drain cycles from padding out one group each.
 //
-// WAL framing follows doc 06 rule W2 conservatively: segment
-// post-images and inline-mode roots frame in full as W2 says, and a
-// RecRoot image arriving with the seam's Delta flag (an elidable
-// count-only image) frames in full too, because elision is only sound
-// once the W3 replay reconciliation can rebuild the root from segment
-// frames, and that lands with the recovery slice. The flag is
-// validated here (Delta without Root rejects the batch) so the type
-// layer's discipline is load-bearing before the elision cashes it in.
+// WAL framing follows doc 06 rule W2: segment post-images and
+// inline-mode roots frame in full, and a reconcilable root arriving
+// with the seam's Delta flag (a count-only image) skips its WAL frame
+// entirely, because the W3 replay reconciliation rebuilds it from the
+// batch's segment frames. The elision is gated twice: the type layer
+// must claim Delta, and ReconcileRef must recognize the payload, so a
+// future type that claims the flag before teaching the reconciler its
+// layout still frames in full. An elided root skips only the WAL; it
+// places into the vlog and indexes like every other put, so
+// checkpoints carry it and only the crash window needs the rebuild.
+// Structural (non-Delta) reconcilable roots additionally frame a
+// rootkey record ahead of themselves, the durable rooth-to-user-key
+// mapping replay resolves patched roots through.
 func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -693,6 +933,22 @@ func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 			return fmt.Errorf("sqlo1b: batch %d op %d: delta flag on non-root record %x", b.Seq, i, op.Rec.Key)
 		}
 		rec := seamRecord(&op.Rec)
+		if rec.RType == RecRoot {
+			if rooth, ok := sqlo1.ReconcileRef(rec.Value); ok {
+				if op.Rec.Delta {
+					// W2 elision: no WAL frame, replay rebuilds this
+					// image from the segment frames it rode in with.
+					frames = append(frames, plannedFrame{rec: rec})
+					continue
+				}
+				rk := rootkeyRecord(rooth, rec.Key)
+				rkPay, err := EncodePutPayload(rk)
+				if err != nil {
+					return fmt.Errorf("sqlo1b: batch %d op %d rootkey: %w", b.Seq, i, err)
+				}
+				frames = append(frames, plannedFrame{op: sqlo1.WALOpPut, pay: rkPay, rec: rk})
+			}
+		}
 		pay, err := EncodePutPayload(rec)
 		if err != nil {
 			return fmt.Errorf("sqlo1b: batch %d op %d: %w", b.Seq, i, err)
@@ -713,6 +969,9 @@ func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 	}
 	frames = append(frames, plannedFrame{op: sqlo1.WALOpPut, pay: mark})
 	for _, fr := range frames {
+		if fr.pay == nil {
+			continue // elided delta root, W2
+		}
 		if _, err := s.wal.Append(0, fr.op, 0, fr.pay); err != nil {
 			return err
 		}
@@ -1044,10 +1303,11 @@ var _ sqlo1.Minter = (*Store)(nil)
 // MintLease durably reserves the next n rooth counters and returns
 // the first (the seam Minter contract): the new mark is WAL-framed
 // and synced before the range is handed out, so a restart can never
-// re-issue a counter whose rooth may already own live records. The
-// frame is a plain PUT of the lease record and, like GENBUMP, needs
-// no high-water mark: the apply is monotonic and replaying it is a
-// no-op. Counters a crash strands in a lease are abandoned; the mint
+// re-issue a counter whose rooth may own durable records. The frame
+// is a plain PUT of the lease record and, like GENBUMP, needs no
+// high-water mark: the apply is monotonic, replaying it is a no-op,
+// and replay truncation keeps it even when it trails the last marked
+// batch. Counters a crash strands in a lease are abandoned; the mint
 // is a bijection, so holes waste only address space.
 func (s *Store) MintLease(ctx context.Context, n uint64) (uint64, error) {
 	s.mu.Lock()
