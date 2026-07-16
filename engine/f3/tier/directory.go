@@ -160,3 +160,14 @@ func (dir *Directory) Remove(idx int) {
 	copy(dir.descs[idx:], dir.descs[idx+1:])
 	dir.descs = dir.descs[:len(dir.descs)-1]
 }
+
+// descBytes is one descriptor's heap cell width: the 32-byte inline discriminator,
+// the eight-byte offset, the four-byte count, and the two one-byte fields, padded
+// to a struct that a []desc packs at 48 bytes on a 64-bit target.
+const descBytes = 48
+
+// Bytes is the directory's resident heap footprint: the descriptor array's
+// capacity times the per-descriptor cell width. It is the directory's term of a
+// cold collection's resident-byte estimate (spec 2064/f3/06 section 6.3), so a
+// demoted set counts the metadata it keeps resident against the slab it freed.
+func (dir *Directory) Bytes() int { return cap(dir.descs) * descBytes }
