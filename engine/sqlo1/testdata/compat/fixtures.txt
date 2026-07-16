@@ -346,3 +346,139 @@ C ["HTTL", "hs:str", "FIELDS", "1", "f"] -> "-WRONGTYPE Operation against a key 
 C ["HGETEX", "hs:str", "FIELDS", "1", "f"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
 C ["HGETDEL", "hs:str", "FIELDS", "1", "f"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
 C ["GET", "hs:k"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+S SET
+C ["SADD", "st:k", "a"] -> ":1"
+C ["SADD", "st:k", "a", "b", "c"] -> ":2"
+C ["SADD", "st:k", "b"] -> ":0"
+C ["SCARD", "st:k"] -> ":3"
+C ["SCARD", "st:missing"] -> ":0"
+C ["SADD", "st:k"] -> "-ERR wrong number of arguments for 'sadd' command"
+C ["SISMEMBER", "st:k", "a"] -> ":1"
+C ["SISMEMBER", "st:k", "nope"] -> ":0"
+C ["SISMEMBER", "st:missing", "a"] -> ":0"
+C ["SMISMEMBER", "st:k", "a", "nope", "b"] -> [":1", ":0", ":1"]
+C ["SMISMEMBER", "st:missing", "a", "b"] -> [":0", ":0"]
+C ["SMISMEMBER", "st:k"] -> "-ERR wrong number of arguments for 'smismember' command"
+C ["SREM", "st:k", "c", "nope"] -> ":1"
+C ["SREM", "st:missing", "a"] -> ":0"
+C ["SCARD", "st:k"] -> ":2"
+C ["TYPE", "st:k"] -> "+set"
+C ["SADD", "st:d", "x"] -> ":1"
+C ["SREM", "st:d", "x"] -> ":1"
+C ["SCARD", "st:d"] -> ":0"
+C ["TYPE", "st:d"] -> "+none"
+C ["SADD", "st:e", ""] -> ":1"
+C ["SISMEMBER", "st:e", ""] -> ":1"
+C ["SREM", "st:e", ""] -> ":1"
+C ["SADD", "st:it", "one", "two", "three"] -> ":3"
+C ["SMEMBERS", "st:it"] -> ["$one", "$two", "$three"]
+C ["SREM", "st:it", "two"] -> ":1"
+C ["SMEMBERS", "st:it"] -> ["$one", "$three"]
+C ["SADD", "st:it", "two"] -> ":1"
+C ["SMEMBERS", "st:it"] -> ["$one", "$three", "$two"]
+C ["SMEMBERS", "st:missing"] -> []
+C ["OBJECT", "ENCODING", "st:it"] -> "$listpack"
+C ["SADD", "st:int", "1", "2", "30"] -> ":3"
+C ["OBJECT", "ENCODING", "st:int"] -> "$intset"
+C ["SMEMBERS", "st:int"] -> ["$1", "$2", "$30"]
+C ["SADD", "st:int2", "7", "011"] -> ":2"
+C ["OBJECT", "ENCODING", "st:int2"] -> "$listpack"
+C ["SMEMBERS", "st:int2"] -> ["$7", "$011"]
+C ["SADD", "st:big", "m000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m001xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m002xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m003xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m004xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m005xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m006xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m007xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m008xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m009xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m010xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m011xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m012xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m013xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m014xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m015xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m016xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m017xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m018xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m019xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m020xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m021xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m022xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m023xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m024xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m025xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m026xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m027xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m028xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "m029xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"] -> ":30"
+C ["OBJECT", "ENCODING", "st:big"] -> "$hashtable"
+C ["SCARD", "st:big"] -> ":30"
+C ["SISMEMBER", "st:big", "m010xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"] -> ":1"
+C ["SPOP", "st:missing"] -> "$-1"
+C ["SPOP", "st:missing", "3"] -> []
+C ["SRANDMEMBER", "st:missing"] -> "$-1"
+C ["SRANDMEMBER", "st:missing", "3"] -> []
+C ["SADD", "st:one", "solo"] -> ":1"
+C ["SRANDMEMBER", "st:one"] -> "$solo"
+C ["SRANDMEMBER", "st:one", "5"] -> ["$solo"]
+C ["SRANDMEMBER", "st:one", "-3"] -> ["$solo", "$solo", "$solo"]
+C ["SRANDMEMBER", "st:one", "0"] -> []
+C ["SPOP", "st:one", "0"] -> []
+C ["SPOP", "st:one"] -> "$solo"
+C ["TYPE", "st:one"] -> "+none"
+C ["SADD", "st:one2", "solo"] -> ":1"
+C ["SPOP", "st:one2", "99"] -> ["$solo"]
+C ["TYPE", "st:one2"] -> "+none"
+C ["SPOP", "st:k", "-1"] -> "-ERR value is out of range, must be positive"
+C ["SPOP", "st:k", "x"] -> "-ERR value is out of range, must be positive"
+C ["SRANDMEMBER", "st:k", "x"] -> "-ERR value is not an integer or out of range"
+C ["SADD", "st:src", "m", "n"] -> ":2"
+C ["SADD", "st:dst", "n"] -> ":1"
+C ["SMOVE", "st:src", "st:dst", "m"] -> ":1"
+C ["SISMEMBER", "st:src", "m"] -> ":0"
+C ["SISMEMBER", "st:dst", "m"] -> ":1"
+C ["SMOVE", "st:src", "st:dst", "n"] -> ":1"
+C ["SCARD", "st:dst"] -> ":2"
+C ["TYPE", "st:src"] -> "+none"
+C ["SMOVE", "st:missing", "st:dst", "m"] -> ":0"
+C ["SMOVE", "st:dst", "st:dst", "m"] -> ":1"
+C ["SMOVE", "st:dst", "st:dst", "ghost"] -> ":0"
+C ["SMOVE", "st:dst", "st:fresh", "m"] -> ":1"
+C ["SMEMBERS", "st:fresh"] -> ["$m"]
+C ["SADD", "st:a1", "a", "b", "c"] -> ":3"
+C ["SADD", "st:a2", "b", "c", "d"] -> ":3"
+C ["SADD", "st:a3", "c", "d", "e"] -> ":3"
+C ["SINTER", "st:a1", "st:a2", "st:a3"] -> ["$c"]
+C ["SINTER", "st:a1", "st:missing"] -> []
+C ["SINTER", "st:missing", "st:a1"] -> []
+C ["SDIFF", "st:a1", "st:a2"] -> ["$a"]
+C ["SDIFF", "st:missing", "st:a1"] -> []
+C ["SUNION", "st:missing", "st:missing2"] -> []
+C ["SINTER"] -> "-ERR wrong number of arguments for 'sinter' command"
+C ["SUNION"] -> "-ERR wrong number of arguments for 'sunion' command"
+C ["SDIFF"] -> "-ERR wrong number of arguments for 'sdiff' command"
+C ["SINTERCARD", "2", "st:a1", "st:a2"] -> ":2"
+C ["SINTERCARD", "2", "st:a1", "st:a2", "LIMIT", "1"] -> ":1"
+C ["SINTERCARD", "2", "st:a1", "st:a2", "LIMIT", "0"] -> ":2"
+C ["SINTERCARD", "0", "st:a1"] -> "-ERR numkeys should be greater than 0"
+C ["SINTERCARD", "2", "st:a1", "st:a2", "LIMIT", "-1"] -> "-ERR LIMIT can't be negative"
+C ["SINTERCARD", "2", "st:a1"] -> "-ERR Number of keys can't be greater than number of args"
+C ["SINTERSTORE", "st:di", "st:a1", "st:a2"] -> ":2"
+C ["SMISMEMBER", "st:di", "a", "b", "c", "d"] -> [":0", ":1", ":1", ":0"]
+C ["SUNIONSTORE", "st:du", "st:a1", "st:a3"] -> ":5"
+C ["SCARD", "st:du"] -> ":5"
+C ["SMISMEMBER", "st:du", "a", "b", "c", "d", "e", "f"] -> [":1", ":1", ":1", ":1", ":1", ":0"]
+C ["SDIFFSTORE", "st:dd", "st:a1", "st:a3"] -> ":2"
+C ["SMISMEMBER", "st:dd", "a", "b", "c"] -> [":1", ":1", ":0"]
+C ["TYPE", "st:di"] -> "+set"
+C ["OBJECT", "ENCODING", "st:di"] -> "$listpack"
+C ["SINTERSTORE", "st:di", "st:a1", "st:missing"] -> ":0"
+C ["TYPE", "st:di"] -> "+none"
+C ["SCARD", "st:di"] -> ":0"
+C ["SADD", "st:ttl", "x"] -> ":1"
+C ["EXPIRE", "st:ttl", "600"] -> ":1"
+C ["SUNIONSTORE", "st:ttl", "st:a1"] -> ":3"
+C ["TTL", "st:ttl"] -> ":-1"
+C ["SET", "st:sdest", "v"] -> "+OK"
+C ["SUNIONSTORE", "st:sdest", "st:a1"] -> ":3"
+C ["TYPE", "st:sdest"] -> "+set"
+C ["SINTERSTORE", "st:x"] -> "-ERR wrong number of arguments for 'sinterstore' command"
+C ["SUNIONSTORE", "st:x"] -> "-ERR wrong number of arguments for 'sunionstore' command"
+C ["SDIFFSTORE", "st:x"] -> "-ERR wrong number of arguments for 'sdiffstore' command"
+C ["SADD", "st:sc", "only"] -> ":1"
+C ["SSCAN", "st:sc", "0"] -> ["$0", ["$only"]]
+C ["SSCAN", "st:sc", "0", "MATCH", "z*"] -> ["$0", []]
+C ["SSCAN", "st:sc", "0", "MATCH", "on*"] -> ["$0", ["$only"]]
+C ["SSCAN", "st:sc", "0", "COUNT", "100"] -> ["$0", ["$only"]]
+C ["SSCAN", "st:sc", "42"] -> ["$0", ["$only"]]
+C ["SSCAN", "st:missing", "0"] -> ["$0", []]
+C ["SSCAN", "st:sc", "0", "NOVALUES"] -> "-ERR NOVALUES option can only be used in HSCAN"
+C ["SET", "st:str", "v"] -> "+OK"
+C ["SADD", "st:str", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["SREM", "st:str", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["SCARD", "st:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["SISMEMBER", "st:str", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["SMISMEMBER", "st:str", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["SMEMBERS", "st:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["SPOP", "st:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["SRANDMEMBER", "st:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["SSCAN", "st:str", "0"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["SMOVE", "st:str", "st:k", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["SMOVE", "st:k", "st:str", "a"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["SINTER", "st:str", "st:k"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["SINTERSTORE", "st:d2", "st:str", "st:k"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["GET", "st:k"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"

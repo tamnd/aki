@@ -1369,9 +1369,11 @@ func (s *Server) hscanCmd(ctx context.Context, reply []byte, args [][]byte) []by
 
 // sscanCmd is SSCAN key cursor [MATCH pattern] [COUNT count], HSCAN's
 // grammar without NOVALUES: options repeat with last-wins, COUNT below
-// one is a syntax error, anything unknown is too. The step's members
-// stage in scanBuf because MATCH decides the element count only after
-// the walk.
+// one is a syntax error, anything unknown is too, except that Redis
+// parses NOVALUES here and rejects it with its own text (the scan
+// grammar is shared, the option is gated after parsing). The step's
+// members stage in scanBuf because MATCH decides the element count
+// only after the walk.
 func (s *Server) sscanCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
 	if len(args) < 3 {
 		return arityErr(reply, "SSCAN")
@@ -1398,6 +1400,8 @@ func (s *Server) sscanCmd(ctx context.Context, reply []byte, args [][]byte) []by
 		case strings.EqualFold(string(args[i]), "MATCH") && i+1 < len(args):
 			match, hasMatch = args[i+1], true
 			i++
+		case strings.EqualFold(string(args[i]), "NOVALUES"):
+			return AppendError(reply, "ERR NOVALUES option can only be used in HSCAN")
 		default:
 			return syntaxErr(reply)
 		}
