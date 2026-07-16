@@ -72,6 +72,67 @@ func TestMinIORoundTrip(t *testing.T) {
 	}
 }
 
+// TestMinIOConditional proves the CAS surface against a real server: the
+// If-None-Match create, the If-Match swap, and the metadata round trip the
+// self-recognition pass depends on. This is doc 01 section 12 item 2's
+// first data point; the provider-seam slice turns it into a matrix probe.
+func TestMinIOConditional(t *testing.T) {
+	endpoint := os.Getenv("AKI_OBS1_S3")
+	if endpoint == "" {
+		t.Skip("AKI_OBS1_S3 not set")
+	}
+	user := envOr("AKI_OBS1_S3_USER", "minioadmin")
+	pass := envOr("AKI_OBS1_S3_PASS", "minioadmin")
+	bucket := fmt.Sprintf("obs1-test-%d", time.Now().UnixNano())
+
+	createBucket(t, endpoint, bucket, user, pass)
+
+	c, err := NewClient(ClientConfig{
+		Endpoint:  endpoint,
+		Region:    "us-east-1",
+		Bucket:    bucket,
+		AccessKey: user,
+		SecretKey: pass,
+		PathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ours := WriteTag{Writer: "node-a", Batch: "42"}
+
+	info, err := c.PutIfAbsent(ctx, "chain/00/42", []byte("batch"), ours)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := c.PutIfAbsent(ctx, "chain/00/42", []byte("rival"), WriteTag{Writer: "node-b", Batch: "42"}); !errors.Is(err, ErrPrecondition) {
+		t.Fatalf("second create: want ErrPrecondition, got %v", err)
+	}
+
+	// The self-recognition pass sees our tag on a real server.
+	out, body, _, err := c.Recheck(ctx, "chain/00/42", ours)
+	if err != nil || out != RecheckOurs || string(body) != "batch" {
+		t.Fatalf("recheck ours: %v %q %v", out, body, err)
+	}
+	out, _, _, err = c.Recheck(ctx, "chain/00/42", WriteTag{Writer: "node-b", Batch: "42"})
+	if err != nil || out != RecheckOther {
+		t.Fatalf("recheck other: %v %v", out, err)
+	}
+
+	// Swap with the live ETag wins; the now-stale one loses.
+	info2, err := c.PutIfMatch(ctx, "chain/00/42", []byte("v2"), info.ETag, ours)
+	if err != nil {
+		t.Fatalf("swap: %v", err)
+	}
+	if _, err := c.PutIfMatch(ctx, "chain/00/42", []byte("v3"), info.ETag, ours); !errors.Is(err, ErrPrecondition) {
+		t.Fatalf("stale swap: want ErrPrecondition, got %v", err)
+	}
+	got, cur, err := c.Get(ctx, "chain/00/42")
+	if err != nil || string(got) != "v2" || cur.ETag != info2.ETag {
+		t.Fatalf("winner: %q %+v %v", got, cur, err)
+	}
+}
+
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
