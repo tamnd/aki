@@ -31,8 +31,11 @@ Read the sweep as: GETRANGE cost falls with chunk size (fewer row probes per spa
 
 ## Results
 
-Pending: runs on the gate box after the A2 queue frees it.
+Local provisional run 2026-07-16 on the dev Mac, both arms, full grid: results/sqlo1/t1-ropechunk-local.csv, read in results/sqlo1/t1-ropechunk-local.md.
+Gate-box confirmation still pending behind the A2 queue; it owns VmHWM and should extend the sweep with a 4 KiB arm.
 
 ## Verdict
 
-Pending.
+Provisional: log2chunk defaults to 13 (8 KiB), rejecting the doc 05 prior of 15.
+8 KiB won every mix on both arms with no knee in range: per-op cost and p99 rise 1.6 to 1.9x per chunk doubling, WA doubles per doubling by arithmetic, the zipf coalescing discount runs the wrong way for big chunks (35% at 8 KiB, 12% at 64 KiB), and the 4 KiB GETRANGE span never rewards bigger chunks with fewer probes.
+The default stays a lab-movable constant behind the superblock field; the box run can move it back up if the 4x segment count prices the memory bar down.
