@@ -1,0 +1,17 @@
+arm,offset_ms,rate,partition,acks,zombie_acks,window_ms,suspended,takeover,violations
+offset,0,1.000,true,750,0,0,true,true,0
+offset,250,1.000,true,750,0,0,true,true,0
+offset,-2000,1.000,true,750,0,0,true,true,0
+offset,10000,1.000,true,750,0,0,true,true,0
+offset,-10000,1.000,true,750,0,0,true,true,0
+rate,0,1.000,true,750,0,0,true,true,0
+rate,0,0.900,true,834,0,0,true,true,0
+rate,0,0.800,true,813,0,0,true,true,0
+rate,0,0.714,true,912,0,0,true,true,0
+rate,0,0.600,true,1084,65,650,true,true,0
+rate,0,0.400,true,1375,273,2730,true,true,0
+rate,0,0.100,true,1000,648,6480,false,true,0
+frozen,0,0.000,true,4000,3648,36480,false,true,0
+healthy,0,1.000,false,2000,0,0,false,false,0
+healthy,-5000,0.500,false,2000,0,0,false,false,0
+healthy,5000,2.000,false,2000,0,0,false,false,0
