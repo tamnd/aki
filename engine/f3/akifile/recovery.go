@@ -272,6 +272,126 @@ func RebuildShardIndex(dev Device, prefix *Prefix, indexCkptOff uint64) (*IndexR
 	return r, nil
 }
 
+// SegStatsRebuilder folds a shard's dead-byte accounting table back from a full
+// seg-stats checkpoint and the delta chain layered over it (spec 2064/f3/07 section
+// 6, "Dead-byte accounting that survives restart"). It is the durable half of the O10
+// fix: without it a restart zeroes the per-segment (live, dead) counters and the
+// store under-triggers compaction until organic churn rediscovers the garbage.
+// Recovery loads the base full table, applies each delta forward, and is left with
+// the accounting as of the last checkpoint's log position; the tail replay past
+// LogPos re-derives the deltas since. The rebuilder keys entries by seg_off, the
+// segment's identity.
+type SegStatsRebuilder struct {
+	entries map[uint64]SegStatsEntry
+	// LogPos is the global_seq the last applied seg-stats checkpoint is consistent up
+	// to, the offset the tail replay resumes the dead-byte re-derivation from.
+	LogPos uint64
+}
+
+// NewSegStatsRebuilder starts an empty rebuild. The first Apply is expected to be a
+// full table, but a delta over the empty table is equally valid.
+func NewSegStatsRebuilder() *SegStatsRebuilder {
+	return &SegStatsRebuilder{entries: make(map[uint64]SegStatsEntry)}
+}
+
+// Apply layers one seg-stats payload over the accumulated table and returns its
+// parsed header. A full table replaces the accumulator; a delta applies over it,
+// dropping segments flagged SegStatsFreed (compacted away) and inserting or
+// overwriting the rest. LogPos advances to the applied checkpoint, so the caller
+// resolves the chain oldest-first and replays the tail from LogPos once the newest
+// delta is in.
+func (r *SegStatsRebuilder) Apply(payload []byte) (SegStatsHeader, error) {
+	h, err := ParseSegStatsHeader(payload)
+	if err != nil {
+		return SegStatsHeader{}, err
+	}
+	entries, err := SegStatsEntries(payload, h)
+	if err != nil {
+		return SegStatsHeader{}, err
+	}
+	if h.FullOrDelta == SegStatsFull {
+		r.entries = make(map[uint64]SegStatsEntry, len(entries))
+	}
+	for _, e := range entries {
+		if h.FullOrDelta == SegStatsDelta && e.Flags&SegStatsFreed != 0 {
+			delete(r.entries, e.SegOff)
+			continue
+		}
+		r.entries[e.SegOff] = e
+	}
+	r.LogPos = h.CkptLogPos
+	return h, nil
+}
+
+// Entries is the live accounting table as of the last applied checkpoint, keyed by
+// seg_off. The map is the rebuilder's own.
+func (r *SegStatsRebuilder) Entries() map[uint64]SegStatsEntry { return r.entries }
+
+// Len is the number of tracked segments accumulated so far.
+func (r *SegStatsRebuilder) Len() int { return len(r.entries) }
+
+// TotalDeadBytes sums the dead-byte counts across the table, the compaction trigger's
+// fuel a reopened store reads to decide which segments to reclaim without a scan.
+func (r *SegStatsRebuilder) TotalDeadBytes() uint64 {
+	var n uint64
+	for _, e := range r.entries {
+		n += e.DeadBytes
+	}
+	return n
+}
+
+// RebuildShardSegStats reconstructs one shard's dead-byte accounting from its
+// seg-stats checkpoint chain, the same walk RebuildShardIndex runs for the index. The
+// SRT names the shard's newest seg-stats segment (segstats_off); that segment is a
+// full table or a delta whose header names the base it extends, back to a full or a
+// delta over the empty table. It walks the chain to its base, then applies the
+// checkpoints oldest-first into a SegStatsRebuilder.
+//
+// A zero segstats_off means the shard has never checkpointed its accounting: it
+// returns an empty rebuilder and the whole table comes from the tail replay. A
+// segment that is not a seg_stats, or a back-pointer that revisits a segment already
+// in the chain, is a corrupt root and returns ErrSegStats.
+func RebuildShardSegStats(dev Device, prefix *Prefix, segStatsOff uint64) (*SegStatsRebuilder, error) {
+	r := NewSegStatsRebuilder()
+	if segStatsOff == 0 {
+		return r, nil
+	}
+	type link struct {
+		off     uint64
+		payload []byte
+	}
+	var chain []link
+	seen := make(map[uint64]bool)
+	for off := segStatsOff; ; {
+		if seen[off] {
+			return nil, ErrSegStats
+		}
+		seen[off] = true
+		h, payload, err := readSegmentAt(dev, prefix.ChecksumKind, off)
+		if err != nil {
+			return nil, err
+		}
+		if h.Kind != KindSegStats {
+			return nil, ErrSegStats
+		}
+		sh, err := ParseSegStatsHeader(payload)
+		if err != nil {
+			return nil, err
+		}
+		chain = append(chain, link{off, payload})
+		if sh.FullOrDelta == SegStatsFull || sh.BaseCkptOff == 0 {
+			break
+		}
+		off = sh.BaseCkptOff
+	}
+	for i := len(chain) - 1; i >= 0; i-- {
+		if _, err := r.Apply(chain[i].payload); err != nil {
+			return nil, err
+		}
+	}
+	return r, nil
+}
+
 // Recovery is the structural result of opening a file: the picked open state, the
 // shard root table (nil when no checkpoint has been taken), and each shard's index
 // rebuilt from its checkpoint chain (nil on a scan fallback, where there is no
