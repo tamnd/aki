@@ -17,6 +17,12 @@ type Record struct {
 	Value    []byte
 	ExpireMs int64  // wall milliseconds, 0 means no expiry
 	Gen      uint32 // rootgen generation, doc 03 section 7
+	// Root marks a collection or rope root image: the value is a
+	// per-type root payload, and a backend maps the flag to its root
+	// representation (Track B rtype 2, Track A the root kv tag). A
+	// root's own generation lives inside that payload, so Gen must be
+	// zero when Root is set; backends reject the combination.
+	Root bool
 }
 
 // Op is one mutation inside a DrainBatch: a record put, or a delete when

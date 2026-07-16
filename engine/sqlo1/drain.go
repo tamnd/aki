@@ -70,7 +70,7 @@ func (d *drainer) drain(ctx context.Context) (int, error) {
 		if hd.state != stateDirty {
 			continue // stale entry: drained directly or slot reused
 		}
-		op := Op{Rec: Record{Key: d.ht.keys.data(hd.keyRef), Gen: hd.gen}}
+		op := Op{Rec: Record{Key: d.ht.keys.data(hd.keyRef), Gen: hd.gen, Root: hd.typeTag&TagRoot != 0}}
 		if hd.valRef == 0 {
 			op.Del = true
 		} else {

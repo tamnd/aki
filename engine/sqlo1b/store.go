@@ -563,7 +563,7 @@ func (s *Store) expiredRec(rec *Record) bool {
 }
 
 func seamOut(rec *Record) sqlo1.Record {
-	out := sqlo1.Record{Key: rec.Key, Value: rec.Value, Gen: rec.Rootgen}
+	out := sqlo1.Record{Key: rec.Key, Value: rec.Value, Gen: rec.Rootgen, Root: rec.RType == RecRoot}
 	if rec.HasExpiry() {
 		out.ExpireMs = int64(rec.ExpireMS)
 	}
@@ -572,15 +572,25 @@ func seamOut(rec *Record) sqlo1.Record {
 
 // seamRecord maps a flat seam record onto the vlog envelope. Only
 // segment records carry a rootgen (doc 03 section 6), so a nonzero
-// Gen must arrive on a 16-byte subkey minted by the per-type layer;
-// the envelope validation at encode enforces it.
+// Gen must arrive on a 16-byte subkey minted by the per-type layer,
+// and a root's own generation lives in its payload, never in the
+// envelope; either way the validation at encode enforces it, so a
+// Root op with a nonzero Gen rejects the batch loudly instead of
+// dropping the generation.
 func seamRecord(r *sqlo1.Record) *Record {
 	rec := &Record{Key: r.Key, Value: r.Value}
-	if r.Gen > 0 {
+	switch {
+	case r.Root:
+		rec.RType = RecRoot
+		if r.Gen > 0 {
+			rec.RFlags |= RFlagRootgen
+			rec.Rootgen = r.Gen
+		}
+	case r.Gen > 0:
 		rec.RType = RecSeg
 		rec.RFlags |= RFlagRootgen
 		rec.Rootgen = r.Gen
-	} else {
+	default:
 		rec.RType = RecString
 	}
 	if r.ExpireMs > 0 {

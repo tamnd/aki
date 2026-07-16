@@ -68,6 +68,7 @@ func (r *storeRig) apply(t *testing.T, ops ...sqlo1.Op) {
 			Value:    bytes.Clone(op.Rec.Value),
 			ExpireMs: op.Rec.ExpireMs,
 			Gen:      op.Rec.Gen,
+			Root:     op.Rec.Root,
 		}
 	}
 }
@@ -119,9 +120,9 @@ func (r *storeRig) verify(t *testing.T) {
 		if err != nil {
 			t.Fatalf("get %q: %v", k, err)
 		}
-		if !bytes.Equal(got.Value, want.Value) || got.ExpireMs != want.ExpireMs || got.Gen != want.Gen {
-			t.Fatalf("get %q: got (%d bytes, exp %d, gen %d), want (%d bytes, exp %d, gen %d)",
-				k, len(got.Value), got.ExpireMs, got.Gen, len(want.Value), want.ExpireMs, want.Gen)
+		if !bytes.Equal(got.Value, want.Value) || got.ExpireMs != want.ExpireMs || got.Gen != want.Gen || got.Root != want.Root {
+			t.Fatalf("get %q: got (%d bytes, exp %d, gen %d, root %v), want (%d bytes, exp %d, gen %d, root %v)",
+				k, len(got.Value), got.ExpireMs, got.Gen, got.Root, len(want.Value), want.ExpireMs, want.Gen, want.Root)
 		}
 	}
 	if _, err := r.s.Get(ctx, []byte("no such key anywhere")); !errors.Is(err, sqlo1.ErrNotFound) {
@@ -771,4 +772,61 @@ func TestStoreGenBumpReopen(t *testing.T) {
 	r.verifyScan(t)
 	r.checkLive(t, r1, 4, true)
 	r.checkLive(t, r2, 2, true)
+}
+
+// TestStoreRootRecords drives the seam Root flag end to end: a Root op
+// lands as an rtype-2 root image whose entry meta carries the root bit,
+// reads back with the flag through Get and Scan, survives a reopen, and
+// a Root op smuggling a seam gen rejects its whole batch at plan time,
+// before the WAL sees a frame, leaving the store usable.
+func TestStoreRootRecords(t *testing.T) {
+	r := newStoreRig(t)
+	ctx := context.Background()
+	r.apply(t,
+		sqlo1.Op{Rec: sqlo1.Record{Key: []byte("wide"), Value: []byte("root payload bytes"), Root: true}},
+		putOp("plain", []byte("v"), 0),
+	)
+	got, err := r.s.Get(ctx, []byte("wide"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Root || got.Gen != 0 {
+		t.Fatalf("root read back root=%v gen=%d", got.Root, got.Gen)
+	}
+	if plain, err := r.s.Get(ctx, []byte("plain")); err != nil || plain.Root {
+		t.Fatalf("plain read back root=%v err=%v", plain.Root, err)
+	}
+	rootSeen := false
+	if _, err := r.s.Scan(ctx, nil, func(rec sqlo1.Record) bool {
+		if string(rec.Key) == "wide" {
+			rootSeen = rec.Root
+		} else if rec.Root {
+			t.Fatalf("scan flagged %q as root", rec.Key)
+		}
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !rootSeen {
+		t.Fatal("scan dropped the root flag")
+	}
+
+	bad := &sqlo1.DrainBatch{Seq: r.seq + 1, Ops: []sqlo1.Op{
+		{Rec: sqlo1.Record{Key: []byte("bad"), Value: []byte("p"), Root: true, Gen: 3}},
+	}}
+	if err := r.s.ApplyBatch(ctx, bad); err == nil {
+		t.Fatal("root op with a seam gen applied")
+	}
+	if _, err := r.s.Get(ctx, []byte("bad")); !errors.Is(err, sqlo1.ErrNotFound) {
+		t.Fatalf("rejected op left a record: %v", err)
+	}
+	r.apply(t, putOp("after", []byte("v2"), 0))
+	r.verify(t)
+
+	r.reopen(t)
+	got, err = r.s.Get(ctx, []byte("wide"))
+	if err != nil || !got.Root {
+		t.Fatalf("after reopen: root=%v err=%v", got.Root, err)
+	}
+	r.verify(t)
 }
