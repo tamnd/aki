@@ -52,10 +52,11 @@ func Hincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	sum := cur + delta
 	if h == nil {
-		h, _ = getOrCreate(cx, args[0])
+		_, h, _ = getOrCreate(cx, args[0])
 	}
 	var nb [20]byte
 	h.set(args[1], strconv.AppendInt(nb[:0], sum, 10))
+	g.note(h)
 	r.Int(sum)
 }
 
@@ -104,8 +105,9 @@ func Hincrbyfloat(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	var nb [40]byte
 	out := resp.FormatScore(nb[:0], sum)
 	if h == nil {
-		h, _ = getOrCreate(cx, args[0])
+		_, h, _ = getOrCreate(cx, args[0])
 	}
 	h.set(args[1], out)
+	g.note(h)
 	r.Bulk(out)
 }

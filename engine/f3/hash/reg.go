@@ -29,6 +29,19 @@ type reg struct {
 	// pickScratch holds the indexes already chosen by the small-sample distinct
 	// draw so its rejection loop can skip repeats without a map.
 	pickScratch []int
+
+	// resident is the running sum of every live hash's resident-byte footprint
+	// (hash.residentBytes), the figure the shard reads to weigh the hash heap
+	// against the store's resident cap at a demote boundary (spec 2064/f3/06
+	// section 6). It is maintained by note and drop so the shard never walks the
+	// registry to size it. Maintained only when acctOn.
+	resident uint64
+	// acctOn gates the accounting: it is true only when the shard's store runs the
+	// cold tier (ColdConfigured). With no cold region to demote a hash into, there
+	// is nothing to weigh, so note and drop skip the bookkeeping entirely and the
+	// write path stays byte-identical to M0, holding the L9 zero-delta contract for
+	// a store with no resident cap.
+	acctOn bool
 }
 
 var regs sync.Map // *store.Store -> *reg
@@ -81,8 +94,46 @@ func registry(cx *shard.Ctx) *reg {
 	if v, ok := regs.Load(cx.St); ok {
 		return v.(*reg)
 	}
-	v, _ := regs.LoadOrStore(cx.St, &reg{m: make(map[string]*hash), rng: freshPCG()})
+	v, _ := regs.LoadOrStore(cx.St, &reg{
+		m:      make(map[string]*hash),
+		rng:    freshPCG(),
+		acctOn: cx.St != nil && cx.St.ColdConfigured(),
+	})
 	return v.(*reg)
+}
+
+// note reconciles h's footprint into the running resident total: it posts the
+// delta since the last note, so the total stays the exact sum of every live hash's
+// footprint. A mutating command calls it before returning on any hash that survives
+// the command (an emptied hash goes through drop instead), which keeps the total
+// exact at every command boundary, the only point the shard reads it. It is a
+// single bool load when accounting is off. Owner goroutine only.
+func (g *reg) note(h *hash) {
+	if !g.acctOn {
+		return
+	}
+	nb := h.residentBytes()
+	g.resident += nb - h.acct
+	h.acct = nb
+}
+
+// ResidentBytes is the running sum of every live hash's resident-byte footprint on
+// this shard, the collection contribution to the store's memory-pressure figure
+// (spec 2064/f3/06 section 6). It is zero when the store runs no cold tier. The
+// shard reads it at a demote boundary; the trigger that consumes it lands with the
+// hash demotion slice. Owner goroutine only.
+func (g *reg) ResidentBytes() uint64 { return g.resident }
+
+// ResidentBytes exposes the shard's hash-registry resident-byte total to the
+// worker's demote loop. The hash registry hangs off the shared regs map keyed by
+// the shard's store, not a Ctx slot, so this reads that map without building a
+// registry on a shard that never ran a hash command: it is zero before the first
+// hash command, or when the store runs no cold tier. Owner goroutine only.
+func ResidentBytes(cx *shard.Ctx) uint64 {
+	if v, ok := regs.Load(cx.St); ok {
+		return v.(*reg).ResidentBytes()
+	}
+	return 0
 }
 
 // lookup finds the hash for key. present is nil when no hash exists; wrong is true
@@ -110,8 +161,16 @@ func (g *reg) lookup(cx *shard.Ctx, key []byte) (h *hash, wrong bool) {
 }
 
 // drop removes an emptied hash from the registry: Redis deletes a hash the moment
-// its last field leaves.
-func (g *reg) drop(key []byte) { delete(g.m, string(key)) }
+// its last field leaves. It takes the hash's last-posted footprint back out of the
+// running total, so the total never carries a gone hash's bytes.
+func (g *reg) drop(key []byte) {
+	if g.acctOn {
+		if h := g.m[string(key)]; h != nil {
+			g.resident -= h.acct
+		}
+	}
+	delete(g.m, string(key))
+}
 
 // wrongType is the shared WRONGTYPE reply text, Redis's exact wording.
 const wrongType = "WRONGTYPE Operation against a key holding the wrong kind of value"

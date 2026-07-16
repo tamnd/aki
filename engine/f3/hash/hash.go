@@ -73,6 +73,25 @@ type hash struct {
 	// too high. The active sweep that reaps untouched keys on a timer is deferred to
 	// M9, so a fired field survives until the next command lands on its key.
 	nextExp uint64
+
+	// acct is the hash's footprint as last posted to the registry running sum, so
+	// note can post only the delta since the last mutation and the total stays the
+	// exact walked sum without rewalking the registry (spec 2064/f3/06 section 6).
+	// It is meaningful only when the store runs a cold tier; a store with no cold
+	// region never accounts and leaves it zero.
+	acct uint64
+}
+
+// residentBytes estimates the hash's resident-byte footprint, the figure the
+// registry sums to weigh the shard's hash heap against the resident cap (spec
+// 2064/f3/06 section 6). An inline listpack hash is its packed blob's capacity; a
+// native hashtable is its field table's slab, records, vectors, and TTL column
+// (ftable.residentBytes). Zero preads, O(1). Owner goroutine only.
+func (h *hash) residentBytes() uint64 {
+	if h.enc == encHashtable {
+		return h.ft.residentBytes()
+	}
+	return uint64(cap(h.blob))
 }
 
 // blob flags byte, at blobFlagsOff. Bit 0 is the listpackex marker: once a field
