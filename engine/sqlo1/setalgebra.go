@@ -25,12 +25,8 @@ package sqlo1
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"sort"
-	"time"
-
-	"github.com/cespare/xxhash/v2"
 )
 
 // algBatchSegs is the segment fetch width of the algebra walks,
@@ -146,7 +142,10 @@ func (s *Set) SInter(ctx context.Context, keys [][]byte, emit func(member []byte
 			s.rest = append(s.rest, &srcs[i])
 		}
 	}
-	_, err = s.algWalk(ctx, &srcs[d], s.rest, true, 0, emit)
+	_, err = s.algWalk(ctx, &srcs[d], s.rest, true, 0, func(m []byte, _ uint64) error {
+		emit(m)
+		return nil
+	})
 	return err
 }
 
@@ -186,74 +185,32 @@ func (s *Set) SDiff(ctx context.Context, keys [][]byte, emit func(member []byte)
 	for i := 1; i < len(srcs); i++ {
 		s.rest = append(s.rest, &srcs[i])
 	}
-	_, err = s.algWalk(ctx, &srcs[0], s.rest, false, 0, emit)
+	_, err = s.algWalk(ctx, &srcs[0], s.rest, false, 0, func(m []byte, _ uint64) error {
+		emit(m)
+		return nil
+	})
 	return err
 }
 
 // SUnion streams the union of the sets at keys, each member once, in
-// source order with duplicates dropped by a digest table. The digest
-// is 128 bits because a collision silently drops a distinct member:
-// the lab's birthday math puts 64 bits at corruption-grade odds by
-// 10^9 uniques and 128 bits at 1.5e-21. The first lane is the fh the
-// segments are already partitioned by; the second is keyed by a boot
-// salt, so colliding both lanes needs the salt. The table is the one
-// unbounded buffer in the algebra family (doc 08's SE-I3 spill bound
-// is the store slice's work, where results can exceed RAM); replies
-// this size already stage in the server's reply buffer. Emitted bytes
-// alias the current IO round and die when emit returns.
+// ascending (fh, member) order out of the k-way merge in setstore.go.
+// Every source already ascends individually (segments are internally
+// sorted, the fence partitions by fh, inline sets sort at cursor
+// init), so equal members surface adjacent and the dedupe is one
+// comparison against the previous emit: exact where the earlier
+// digest table was probabilistic, and bounded at one IO round per
+// source where the table grew with the result. Union order is
+// unspecified for Redis sets, so the order change is free. Emitted
+// bytes alias a cursor arena and die when emit returns.
 func (s *Set) SUnion(ctx context.Context, keys [][]byte, emit func(member []byte)) error {
 	srcs, _, err := s.loadSrcs(ctx, keys, false)
 	if err != nil {
 		return err
 	}
-	if !s.saltReady {
-		n := uint64(time.Now().UnixNano())
-		n += 0x9e3779b97f4a7c15
-		n = (n ^ (n >> 30)) * 0xbf58476d1ce4e5b9
-		n = (n ^ (n >> 27)) * 0x94d049bb133111eb
-		binary.LittleEndian.PutUint64(s.salt[:], n^(n>>31))
-		s.saltReady = true
-	}
-	total := 0
-	for i := range srcs {
-		total += int(srcs[i].count)
-	}
-	seen := make(map[[2]uint64]struct{}, min(total, 1<<20))
-	var dig xxhash.Digest
-	add := func(m []byte) bool {
-		dig.Reset()
-		dig.Write(s.salt[:])
-		dig.Write(m)
-		k := [2]uint64{hashFH(m), dig.Sum64()}
-		if _, dup := seen[k]; dup {
-			return false
-		}
-		seen[k] = struct{}{}
-		return true
-	}
-	for i := range srcs {
-		sc := &srcs[i]
-		switch sc.st {
-		case hashInlineState:
-			for _, m := range sc.inMembers {
-				if add(m) {
-					emit(m)
-				}
-			}
-		case hashSegState:
-			// The root is still loaded on sc.h from loadSrcs; the walk
-			// is HIterate's segment streamer, and the dedupe does no
-			// Tiered calls, so the emits stay inside their round.
-			if _, err := sc.h.iterSegEntries(ctx, func(m, _ []byte) {
-				if add(m) {
-					emit(m)
-				}
-			}); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return s.mergeUnion(ctx, srcs, func(m []byte, _ uint64) error {
+		emit(m)
+		return nil
+	})
 }
 
 // algWalk drives SINTER, SINTERCARD, and SDIFF: the driver's members
@@ -263,8 +220,10 @@ func (s *Set) SUnion(ctx context.Context, keys [][]byte, emit func(member []byte
 // set, and the survivors emit. keepHits true keeps members every rest
 // set holds, false keeps members no rest set holds; the two folds are
 // the intersection and the difference. limit > 0 stops the walk at
-// that many survivors and is the return value's cap; emit may be nil.
-func (s *Set) algWalk(ctx context.Context, d *algSrc, rest []*algSrc, keepHits bool, limit int64, emit func(member []byte)) (int64, error) {
+// that many survivors and is the return value's cap; emit may be nil,
+// gets each survivor with its fh (the STORE builder wants both), and
+// an emit error aborts the walk.
+func (s *Set) algWalk(ctx context.Context, d *algSrc, rest []*algSrc, keepHits bool, limit int64, emit func(member []byte, fh uint64) error) (int64, error) {
 	emitted := int64(0)
 	// flush filters the current window and emits the survivors,
 	// reporting whether the limit was reached.
@@ -277,12 +236,14 @@ func (s *Set) algWalk(ctx context.Context, d *algSrc, rest []*algSrc, keepHits b
 				return false, err
 			}
 		}
-		for _, m := range s.winMem {
+		for k, m := range s.winMem {
 			if limit > 0 && emitted >= limit {
 				return true, nil
 			}
 			if emit != nil {
-				emit(m)
+				if err := emit(m, s.winFH[k]); err != nil {
+					return false, err
+				}
 			}
 			emitted++
 		}
@@ -491,16 +452,23 @@ func (s *Set) filterWindow(ctx context.Context, src *algSrc, keepHits bool) erro
 	return nil
 }
 
-// winSorter orders a window's members and fhs together by fh. The
-// member tiebreak does not matter: the routing only groups by
-// segment, and equal fhs share one.
+// winSorter orders a window's members and fhs together by (fh,
+// member). The routing only groups by segment, so it needs the fh
+// order alone; the byte tiebreak is for the union cursors and the
+// STORE builder, whose merge and segment packing want the full
+// segment-internal order.
 type winSorter struct {
 	mem [][]byte
 	fh  []uint64
 }
 
-func (w *winSorter) Len() int           { return len(w.fh) }
-func (w *winSorter) Less(i, j int) bool { return w.fh[i] < w.fh[j] }
+func (w *winSorter) Len() int { return len(w.fh) }
+func (w *winSorter) Less(i, j int) bool {
+	if w.fh[i] != w.fh[j] {
+		return w.fh[i] < w.fh[j]
+	}
+	return bytes.Compare(w.mem[i], w.mem[j]) < 0
+}
 func (w *winSorter) Swap(i, j int) {
 	w.mem[i], w.mem[j] = w.mem[j], w.mem[i]
 	w.fh[i], w.fh[j] = w.fh[j], w.fh[i]
