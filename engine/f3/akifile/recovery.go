@@ -525,19 +525,27 @@ func RebuildShardChunkDir(dev Device, prefix *Prefix, chunkdirOff uint64) (*Chun
 // k's rebuilt index, SegStats[k] its dead-byte accounting, ChunkDirs[k] its cold-chunk
 // directory. A shard that never checkpointed a given table carries an empty rebuilder
 // there, not a nil, so a consumer folds the tail over a table it can always index.
+//
+// TTLClasses and FreeMap are the file-global roots the live meta slot points at: the
+// TTL reclaim index the expiry pass consults and the free map the writer resumes
+// allocation from. Both are nil when the file has none (a fresh file, or a scan
+// fallback with no trusted root).
 type Recovery struct {
-	State     *OpenState
-	SRT       *SRT
-	Indexes   []*IndexRebuilder
-	SegStats  []*SegStatsRebuilder
-	ChunkDirs []*ChunkDirRebuilder
-	TailFrom  uint64
+	State      *OpenState
+	SRT        *SRT
+	Indexes    []*IndexRebuilder
+	SegStats   []*SegStatsRebuilder
+	ChunkDirs  []*ChunkDirRebuilder
+	TTLClasses []TTLClass
+	FreeMap    []FreeExtent
+	TailFrom   uint64
 }
 
 // Recover runs the whole open sequence and assembles the structural recovery
-// (spec 2064/f3/07 section 6): pick the live root, read the shard root table, and
-// rebuild each shard's index, dead-byte accounting, and cold-chunk directory from
-// their checkpoint chains. It stops at the boundary the akifile format owns: the tail
+// (spec 2064/f3/07 section 6): pick the live root, read the shard root table and the
+// file-global TTL index and free map, and rebuild each shard's index, dead-byte
+// accounting, and cold-chunk directory from their checkpoint chains. It stops at the
+// boundary the akifile format owns: the tail
 // replay past TailFrom is the caller's, because turning a log segment back into index
 // entries is store knowledge this layer does not hold.
 //
@@ -563,6 +571,18 @@ func Recover(dev Device) (*Recovery, error) {
 		return nil, err
 	}
 	rec.SRT = srt
+
+	// The file-global roots hang off the live meta slot, independent of whether any
+	// shard has checkpointed, so read them before the no-SRT early return.
+	rec.TTLClasses, err = ReadTTLIndex(dev, st.Meta)
+	if err != nil {
+		return nil, err
+	}
+	rec.FreeMap, err = ReadFreeMap(dev, st.Prefix, st.Meta)
+	if err != nil {
+		return nil, err
+	}
+
 	if srt == nil {
 		// No checkpoint has been taken: the whole index comes from the tail replay.
 		rec.TailFrom = PageSize
