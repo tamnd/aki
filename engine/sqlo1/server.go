@@ -895,6 +895,11 @@ func invalidExpire(reply []byte, cmd string) []byte {
 }
 
 func storeErr(reply []byte, err error) []byte {
+	// ErrWrongType carries its full wire text, WRONGTYPE prefix and
+	// all; everything else is an ERR.
+	if errors.Is(err, ErrWrongType) {
+		return AppendError(reply, err.Error())
+	}
 	return AppendError(reply, "ERR "+err.Error())
 }
 

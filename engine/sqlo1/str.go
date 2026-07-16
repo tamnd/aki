@@ -183,12 +183,18 @@ func (s *Str) needsRope(key []byte, valLen int) bool {
 // strMeta is what Set, Del, and Append need to know about a key's
 // current representation: whether it exists, its exact expire_ms (0
 // for none), and if it is a rope, the decoded root (copied out of the
-// aliased read before the next call).
+// aliased read before the next call). A root of another type shows up
+// as otherType, with planeless saying whether an overwrite has
+// anything to retire (an inline collection root has no minted plane;
+// a segmented one does, and retiring it generically lands with the
+// segment slice).
 type strMeta struct {
-	exists bool
-	rope   bool
-	expMs  int64
-	root   ropeRoot
+	exists    bool
+	rope      bool
+	otherType bool
+	planeless bool
+	expMs     int64
+	root      ropeRoot
 }
 
 // metaOf reads key's representation. The value bytes it looked at are
@@ -201,9 +207,20 @@ func (s *Str) metaOf(ctx context.Context, key []byte) (strMeta, error) {
 	if !root {
 		return strMeta{exists: true, expMs: expMs}, nil
 	}
-	// The only root payload a string key can hold in T1 is a rope;
-	// cross-type overwrites learn to sniff the shared root header
-	// when the collection types land.
+	return s.rootMeta(v, expMs)
+}
+
+// rootMeta classifies a root payload for the write doors: a rope
+// decodes, another type's root records what an overwrite needs to
+// know, corruption errors.
+func (s *Str) rootMeta(v []byte, expMs int64) (strMeta, error) {
+	tag, planeless, err := sniffRoot(v)
+	if err != nil {
+		return strMeta{}, err
+	}
+	if tag != TagString {
+		return strMeta{exists: true, otherType: true, planeless: planeless, expMs: expMs}, nil
+	}
 	r, err := decodeRopeRoot(v)
 	if err != nil {
 		return strMeta{}, err
@@ -249,6 +266,13 @@ func (s *Str) Set(ctx context.Context, key, val []byte) error {
 // setWithMeta is Set below the representation read, for callers that
 // already hold the key's meta (MSet reads a whole batch in one round).
 func (s *Str) setWithMeta(ctx context.Context, key, val []byte, m strMeta) error {
+	// SET overwrites any type, per Redis. A planeless collection root
+	// is one record and dies under the new image like a plain value;
+	// retiring a segmented collection's plane generically arrives with
+	// the segment slice.
+	if m.otherType && !m.planeless {
+		return errHashSegmented
+	}
 	if !s.needsRope(key, len(val)) {
 		if m.rope {
 			s.retire(key, m.root)
@@ -474,6 +498,11 @@ func (s *Str) Encoding(ctx context.Context, key []byte) (string, bool, error) {
 	}
 	switch {
 	case root:
+		// The string layer answers only for string keys; the server's
+		// encoding dispatch routes other types to their own layers.
+		if tag, _, err := sniffRoot(v); err == nil && tag != TagString {
+			return "", false, ErrWrongType
+		}
 		return "rope", true, nil
 	case intShaped(v):
 		return "int", true, nil
@@ -536,6 +565,11 @@ func (s *Str) Del(ctx context.Context, key []byte) (bool, error) {
 	m, err := s.metaOf(ctx, key)
 	if err != nil || !m.exists {
 		return false, err
+	}
+	// DEL takes any type. Planeless roots are one tombstone; the
+	// segmented types' O(1) DEL (their genbump) lands with them.
+	if m.otherType && !m.planeless {
+		return false, errHashSegmented
 	}
 	if m.rope {
 		s.retire(key, m.root)
@@ -906,6 +940,11 @@ func (s *Str) IncrBy(ctx context.Context, key []byte, delta int64) (int64, error
 		}
 		if ok {
 			if root {
+				// A huge string is not an integer; another type is
+				// a wrongtype error, which Redis ranks first.
+				if tag, _, err := sniffRoot(v); err == nil && tag != TagString {
+					return 0, ErrWrongType
+				}
 				return 0, ErrNotInt
 			}
 			n, canonical := parseCanonicalInt(v)
@@ -942,6 +981,9 @@ func (s *Str) IncrByFloat(ctx context.Context, key []byte, delta float64) ([]byt
 	}
 	if ok {
 		if root {
+			if tag, _, err := sniffRoot(v); err == nil && tag != TagString {
+				return nil, ErrWrongType
+			}
 			return nil, ErrNotFloat
 		}
 		f, err := strconv.ParseFloat(string(v), 64)
@@ -993,6 +1035,13 @@ func (s *Str) MGet(ctx context.Context, keys [][]byte, emit func(v []byte, ok bo
 	ropes := 0
 	for i := range keys {
 		if s.batchVals[i] != nil && s.batchRoots[i] {
+			// MGET never raises a type error, per Redis: another
+			// type's key emits nil like a miss.
+			if tag, _, err := sniffRoot(s.batchVals[i]); err == nil && tag != TagString {
+				s.batchVals[i] = nil
+				s.batchRoots[i] = false
+				continue
+			}
 			ropes++
 		}
 	}
@@ -1079,11 +1128,11 @@ func (s *Str) MSet(ctx context.Context, keys, vals [][]byte) error {
 		switch {
 		case v == nil:
 		case s.batchRoots[i]:
-			r, err := decodeRopeRoot(v)
+			var err error
+			m, err = s.rootMeta(v, s.batchExps[i])
 			if err != nil {
 				return err
 			}
-			m = strMeta{exists: true, rope: true, expMs: s.batchExps[i], root: r}
 		default:
 			m = strMeta{exists: true, expMs: s.batchExps[i]}
 		}
