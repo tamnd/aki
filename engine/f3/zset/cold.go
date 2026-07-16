@@ -2,6 +2,7 @@ package zset
 
 import (
 	"encoding/binary"
+	"math"
 
 	"github.com/tamnd/aki/engine/f3/store"
 	"github.com/tamnd/aki/engine/f3/tier"
@@ -60,8 +61,15 @@ const (
 	coldEntryMask = maxChunkEntry - 1
 	// The locator lives in loc bits 0..30; bit 31 is tierCold, so the slot field is
 	// the 19 bits between the entry field and the flag, an offset-table ceiling of
-	// ~512K chunks per zset. The demote pass (D2) enforces both ceilings when it
-	// packs; this slice defines the split the locator codec reads back.
+	// ~512K chunks per zset. The demote pass enforces both ceilings when it packs;
+	// the codec above reads the split back.
+	maxColdSlot = 1 << (31 - coldEntryBits) // offset-table ceiling, ~512K chunks per zset
+
+	// chunkByteTarget is the payload fill the demote pass packs a chunk to before
+	// flushing, so a chunk amortizes its frame header and directory slot over many
+	// members. A member that would overshoot still lands (the check is post-append),
+	// so the target is a floor on the fill, not a hard cap on the frame.
+	chunkByteTarget = 4096
 )
 
 func packLoc(slot, entry uint32) uint32 { return slot<<coldEntryBits | entry }
@@ -158,4 +166,102 @@ func chunkEntry(payload []byte, idx int) ([]byte, bool) {
 		}
 		p = p[n:]
 	}
+}
+
+// demote packs the coldest resident members of the native band into cold chunks,
+// retiers their records to chunk locators, and marks their slab bytes dead for the
+// churn rebuild to reclaim. The quantum is a contiguous rank window from the low-rank
+// (coldest by the first-cut policy) end: it walks the tree in score order, gathers up
+// to quantum resident members, packs them into chunks filled to the byte target in
+// that same order, appends every chunk to the cold region, and only on a clean append
+// of all of them commits the directory descriptors and the record retier. Packing in
+// rank order makes each chunk a contiguous score band, so the directory's Floor and
+// RankBefore locate a cold member by score or rank in one search. A refused append
+// leaves the band fully resident (the orphan frames the append-only region holds are
+// dead space the compactor reclaims), so demotion degrades to a no-op rather than a
+// torn band. It returns the number of members demoted.
+func (n *nativeStore) demote(st *store.Store, key []byte, quantum int) int {
+	if quantum <= 0 {
+		return 0
+	}
+	if n.cold == nil {
+		n.cold = &coldChunks{st: st}
+	}
+	cc := n.cold
+
+	// Gather the coldest resident members in score order, skipping any already cold
+	// from an earlier quantum, up to the quantum. The walk yields records by rank and
+	// never compares keys, so it preads nothing.
+	type slot struct {
+		ord  uint32
+		bits uint64
+	}
+	var ents []slot
+	n.tree.WalkFromRank(0, func(_ uint64, ref uint32) bool {
+		r := &n.recs[ref]
+		if r.loc&tierCold != 0 {
+			return true // already cold, keep scanning for a resident member
+		}
+		ents = append(ents, slot{ord: ref, bits: r.bits})
+		return len(ents) < quantum
+	})
+	if len(ents) == 0 {
+		return 0
+	}
+
+	// Pack and append every chunk first, collecting the placements; commit the
+	// directory and the retier only after all appends succeed. The first member of a
+	// chunk supplies the discriminator, the score key plus member bytes, so the
+	// directory orders the chunks by (score, member). discOf and appendEntry both copy
+	// their input, so the placements stay valid after the retier rewrites loc below.
+	type placed struct {
+		off  uint64
+		disc []byte
+		ords []uint32
+	}
+	var chunks []placed
+	var payload []byte
+	var ords []uint32
+	var disc []byte
+	for i, e := range ents {
+		if len(chunks)+1 > maxColdSlot {
+			break // offset-table ceiling: leave the rest resident for the next quantum
+		}
+		r := &n.recs[e.ord]
+		m := n.slab[r.loc : r.loc+r.mlen]
+		if len(ords) == 0 {
+			disc = discOf(scoreKey(math.Float64frombits(e.bits)), m)
+		}
+		payload = appendEntry(payload, m)
+		ords = append(ords, e.ord)
+		full := len(payload) >= chunkByteTarget || len(ords) >= maxChunkEntry
+		if full || i == len(ents)-1 {
+			off, ok := cc.st.AppendChunk(kindZset, 0, uint16(len(ords)), key, disc, payload)
+			if !ok {
+				return 0 // broken region: abandon, the band stays fully resident
+			}
+			chunks = append(chunks, placed{off: off, disc: disc, ords: append([]uint32(nil), ords...)})
+			payload = payload[:0]
+			ords = ords[:0]
+		}
+	}
+
+	// Commit: one directory descriptor and offset-table slot per chunk, retier every
+	// packed record to its locator with the cold bit set, and mark its slab bytes dead
+	// so the churn rebuild compacts them out. The record keeps its ordinal, so the
+	// tree ref and the hash slot stay valid; only loc changes.
+	demoted := 0
+	for _, c := range chunks {
+		s := uint32(len(cc.offs))
+		cc.offs = append(cc.offs, c.off)
+		cc.dir.Insert(c.disc, uint32(len(c.ords)), c.off)
+		for j, ord := range c.ords {
+			r := &n.recs[ord]
+			n.deadBytes += int(r.mlen)
+			r.loc = packLoc(s, uint32(j)) | tierCold
+			demoted++
+		}
+	}
+	n.maybeRebuild()
+	return demoted
 }
