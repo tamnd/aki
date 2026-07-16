@@ -66,6 +66,8 @@ func zpopImpl(cx *shard.Ctx, args [][]byte, r shard.Reply, min bool) {
 	cx.Aux = out
 	if z.card() == 0 {
 		g.drop(args[0])
+	} else {
+		g.note(z)
 	}
 	r.Raw(out)
 }
@@ -145,6 +147,8 @@ func Zmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		cx.Aux = out
 		if z.card() == 0 {
 			g.drop(key)
+		} else {
+			g.note(z)
 		}
 		r.Raw(out)
 		return

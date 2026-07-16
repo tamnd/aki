@@ -71,8 +71,11 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			if created && z.card() == 0 {
 				// XX/NX/GT/LT suppressed the only write; do not leave an empty key.
 				g.drop(key)
-			} else if created {
-				g.m[string(key)] = z
+			} else {
+				if created {
+					g.m[string(key)] = z
+				}
+				g.note(z)
 			}
 			if !applied {
 				r.Null()
@@ -88,8 +91,11 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		if !created {
 			g.drop(key)
 		}
-	} else if created {
-		g.m[string(key)] = z
+	} else {
+		if created {
+			g.m[string(key)] = z
+		}
+		g.note(z)
 	}
 	if fl.ch {
 		r.Int(added + changed)
@@ -169,6 +175,7 @@ func Zincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if created {
 		g.m[string(key)] = z
 	}
+	g.note(z)
 	var sc [40]byte
 	r.Bulk(resp.FormatScore(sc[:0], newScore))
 }
@@ -259,6 +266,8 @@ func Zrem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	if z.card() == 0 {
 		g.drop(args[0])
+	} else if removed > 0 {
+		g.note(z)
 	}
 	r.Int(removed)
 }

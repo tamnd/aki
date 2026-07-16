@@ -243,8 +243,11 @@ flagsLoop:
 		if !created {
 			g.drop(key)
 		}
-	} else if created {
-		g.m[string(key)] = z
+	} else {
+		if created {
+			g.m[string(key)] = z
+		}
+		g.note(z)
 	}
 	if fl.ch {
 		r.Int(added + changed)
