@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"hash/crc32"
 	"math"
+
+	"github.com/tamnd/aki/engine/sqlo1"
 )
 
 // Value-log records (doc 03 section 6). The envelope is fixed here;
@@ -36,7 +38,7 @@ const (
 
 // SubkeySize is the synthetic key length for segment and fence
 // records: u64 rooth, u8 kind, 7-byte segid (doc 03 section 6.3).
-const SubkeySize = 16
+const SubkeySize = sqlo1.SubkeySize
 
 const (
 	recHdrSize  = 12 // rlen, rtype, rflags, klen, vlen
