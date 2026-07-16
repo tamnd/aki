@@ -866,6 +866,14 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.srandCmd(ctx, reply, args)
 	case "SPOP":
 		return s.spopCmd(ctx, reply, args)
+	case "SINTER":
+		return s.setAlgebraCmd(ctx, reply, args, cmd, s.se.SInter)
+	case "SUNION":
+		return s.setAlgebraCmd(ctx, reply, args, cmd, s.se.SUnion)
+	case "SDIFF":
+		return s.setAlgebraCmd(ctx, reply, args, cmd, s.se.SDiff)
+	case "SINTERCARD":
+		return s.sintercardCmd(ctx, reply, args)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":
@@ -1487,6 +1495,63 @@ func (s *Server) spopCmd(ctx context.Context, reply []byte, args [][]byte) []byt
 		return storeErr(reply[:mark], err)
 	}
 	return reply
+}
+
+// setAlgebraCmd runs one of the algebra streamers (SINTER, SUNION,
+// SDIFF share the grammar: the command and at least one key) over
+// args[1:]. The members stage in scanBuf because the element count is
+// known only after the walk.
+func (s *Server) setAlgebraCmd(ctx context.Context, reply []byte, args [][]byte, name string, walk func(ctx context.Context, keys [][]byte, emit func(member []byte)) error) []byte {
+	if len(args) < 2 {
+		return arityErr(reply, name)
+	}
+	s.scanBuf = s.scanBuf[:0]
+	elems := 0
+	if err := walk(ctx, args[1:], func(m []byte) {
+		s.scanBuf = AppendBulk(s.scanBuf, m)
+		elems++
+	}); err != nil {
+		return storeErr(reply, err)
+	}
+	reply = AppendArray(reply, elems)
+	return append(reply, s.scanBuf...)
+}
+
+// sintercardCmd is SINTERCARD numkeys key [key ...] [LIMIT limit],
+// Redis's exact doors in Redis's order: a numkeys that does not parse
+// or is below one answers greater-than-0, a numkeys past the argument
+// count answers the number-of-args text (counted against all
+// remaining arguments, LIMIT tokens included, Redis's quirk), the
+// tail must be empty or exactly LIMIT n with n >= 0, and LIMIT 0
+// means unlimited.
+func (s *Server) sintercardCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 3 {
+		return arityErr(reply, "SINTERCARD")
+	}
+	nk, ok := parseCanonicalInt(args[1])
+	if !ok || nk < 1 {
+		return AppendError(reply, "ERR numkeys should be greater than 0")
+	}
+	if nk > int64(len(args)-2) {
+		return AppendError(reply, "ERR Number of keys can't be greater than number of args")
+	}
+	limit := int64(0)
+	switch {
+	case int64(len(args)) == nk+2:
+	case int64(len(args)) == nk+4 && strings.EqualFold(string(args[nk+2]), "LIMIT"):
+		l, ok := parseCanonicalInt(args[nk+3])
+		if !ok || l < 0 {
+			return AppendError(reply, "ERR LIMIT can't be negative")
+		}
+		limit = l
+	default:
+		return syntaxErr(reply)
+	}
+	card, err := s.se.SInterCard(ctx, args[2:2+nk], limit)
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	return AppendInt(reply, card)
 }
 
 // hrandCmd is HRANDFIELD key [count [WITHVALUES]], Redis's exact
