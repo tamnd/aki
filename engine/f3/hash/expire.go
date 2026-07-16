@@ -100,6 +100,11 @@ func expireGeneric(cx *shard.Ctx, args [][]byte, r shard.Reply, cmd string, unit
 		// The last field expired on the spot (a set-to-the-past); Redis drops the
 		// hash the moment it empties.
 		g.drop(args[0])
+	} else {
+		// A set-to-the-past deleted a field, or the first field TTL flipped an inline
+		// hash to its wider listpackex blob; either way the footprint may have moved,
+		// so reconcile the surviving hash.
+		g.note(h)
 	}
 	r.Raw(out)
 }

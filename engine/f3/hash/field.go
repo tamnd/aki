@@ -89,6 +89,31 @@ func (f *ftable) Rehash(ord uint32) uint64 {
 // card is the live field count, straight off the table header (O(1) HLEN).
 func (f *ftable) card() int { return f.tbl.Len() }
 
+// fentryBytes is the fixed per-field record cell width. A fentry is foff, voff,
+// and vslot four bytes each, flen two, and vlen four, which Go aligns to a
+// four-byte boundary at twenty bytes; counting a fixed cell per record tracks the
+// ents slice exactly, the same shape set's recordBytes term takes.
+const fentryBytes = 20
+
+// residentBytes is the native band's live heap footprint: the field-and-value
+// slab, the record cells, the draw vector, the free list, the field-TTL column
+// when one exists, and the table's control-and-ordinal slots (field.go and
+// structs.Table). It is the hash-side term of the collection resident-byte
+// estimate (spec 2064/f3/06 section 6), measured against the real capacities so it
+// tracks a slab grow and the amortized compaction that follows a churn of deletes.
+// The field-TTL column costs nothing until the first HEXPIRE-family setter
+// allocates it, so a hash that never sets a field TTL carries no expiry bytes here.
+// Zero preads, O(1).
+func (f *ftable) residentBytes() uint64 {
+	n := uint64(cap(f.slab))
+	n += uint64(cap(f.ents)) * fentryBytes
+	n += uint64(cap(f.vec)) * 4
+	n += uint64(cap(f.free)) * 4
+	n += uint64(cap(f.exp)) * 8
+	n += uint64(f.tbl.Bytes())
+	return n
+}
+
 // get returns the value bytes of field and whether it is present. The slice
 // aliases the slab and is valid only until the next mutation.
 func (f *ftable) get(field []byte) ([]byte, bool) {

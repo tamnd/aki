@@ -23,7 +23,7 @@ func Hset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err("ERR wrong number of arguments for 'hset' command")
 		return
 	}
-	h, wrong := getOrCreate(cx, args[0])
+	g, h, wrong := getOrCreate(cx, args[0])
 	if wrong {
 		r.Err(wrongType)
 		return
@@ -39,6 +39,7 @@ func Hset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			h.clearFieldExp(args[i])
 		}
 	}
+	g.note(h)
 	r.Int(added)
 }
 
@@ -49,7 +50,7 @@ func Hmset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err("ERR wrong number of arguments for 'hmset' command")
 		return
 	}
-	h, wrong := getOrCreate(cx, args[0])
+	g, h, wrong := getOrCreate(cx, args[0])
 	if wrong {
 		r.Err(wrongType)
 		return
@@ -60,6 +61,7 @@ func Hmset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			h.clearFieldExp(args[i])
 		}
 	}
+	g.note(h)
 	r.Status("OK")
 }
 
@@ -69,12 +71,13 @@ func Hsetnx(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// A refused HSETNX means the field already exists, which can only happen on a
 	// hash that already held fields, so getOrCreate never leaves a stray empty
 	// hash behind here: a freshly created hash is empty and always accepts the set.
-	h, wrong := getOrCreate(cx, args[0])
+	g, h, wrong := getOrCreate(cx, args[0])
 	if wrong {
 		r.Err(wrongType)
 		return
 	}
 	if h.setNX(args[1], args[2]) {
+		g.note(h)
 		r.Int(1)
 		return
 	}
@@ -196,30 +199,33 @@ func Hdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	if h.card() == 0 {
 		g.drop(args[0])
+	} else {
+		g.note(h)
 	}
 	r.Int(removed)
 }
 
 // getOrCreate returns the hash for key, creating an empty one when the key is
-// absent. wrong is true when the string store owns the key, which the caller
-// answers with WRONGTYPE. Callers only reach it on a write that adds at least one
-// field, so a created hash never stays empty.
-func getOrCreate(cx *shard.Ctx, key []byte) (h *hash, wrong bool) {
-	g := registry(cx)
+// absent, and the registry the caller reconciles the footprint into. wrong is true
+// when the string store owns the key, which the caller answers with WRONGTYPE.
+// Callers only reach it on a write that adds at least one field, so a created hash
+// never stays empty; the caller notes it into the resident total before returning.
+func getOrCreate(cx *shard.Ctx, key []byte) (g *reg, h *hash, wrong bool) {
+	g = registry(cx)
 	if h = g.m[string(key)]; h != nil {
 		// Reap fired fields first, the same lazy expiry lookup runs (reg.go). A hash
 		// reaped empty is dropped and recreated fresh below, so a write onto a hash
 		// whose fields all expired starts a new listpack, not a lingering listpackex.
 		h.reap(uint64(cx.NowMs))
 		if h.card() > 0 {
-			return h, false
+			return g, h, false
 		}
-		delete(g.m, string(key))
+		g.drop(key)
 	}
 	if cx.St.Exists(key, cx.NowMs) {
-		return nil, true
+		return g, nil, true
 	}
 	h = newHash()
 	g.m[string(key)] = h
-	return h, false
+	return g, h, false
 }
