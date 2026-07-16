@@ -291,3 +291,119 @@ func TestServerSetSampling(t *testing.T) {
 	send("TYPE", "s")
 	expect(t, r, "+none\r\n")
 }
+
+func TestServerSetAlgebra(t *testing.T) {
+	c, r := startServer(t)
+	send := func(args ...string) {
+		t.Helper()
+		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readSet := func() map[string]bool {
+		t.Helper()
+		got := map[string]bool{}
+		n := readArrayLen(t, r)
+		for range n {
+			m := readBulk(t, r)
+			if got[m] {
+				t.Fatalf("member %q answered twice", m)
+			}
+			got[m] = true
+		}
+		return got
+	}
+	wantMembers := func(got map[string]bool, want ...string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("got %d members, want %d", len(got), len(want))
+		}
+		for _, m := range want {
+			if !got[m] {
+				t.Fatalf("member %q missing", m)
+			}
+		}
+	}
+
+	send("SADD", "s1", "a", "b", "c")
+	expect(t, r, ":3\r\n")
+	send("SADD", "s2", "b", "c", "d")
+	expect(t, r, ":3\r\n")
+	send("SADD", "s3", "c", "d", "e")
+	expect(t, r, ":3\r\n")
+	send("SET", "str", "v")
+	expect(t, r, "+OK\r\n")
+
+	// SINTER: order-free member sets, the absent-key short circuit,
+	// and its wrong-type masking.
+	send("SINTER", "s1", "s2", "s3")
+	wantMembers(readSet(), "c")
+	send("SINTER", "s1", "s2")
+	wantMembers(readSet(), "b", "c")
+	send("SINTER", "s1")
+	wantMembers(readSet(), "a", "b", "c")
+	send("SINTER", "s1", "ghost", "s2")
+	expect(t, r, "*0\r\n")
+	send("SINTER", "ghost", "str")
+	expect(t, r, "*0\r\n")
+	send("SINTER", "str", "s1")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	send("SINTER")
+	expect(t, r, "-ERR wrong number of arguments for 'sinter' command\r\n")
+
+	// SUNION: dedupe across sources, absent keys as empty sets, no
+	// wrong-type masking.
+	send("SUNION", "s1", "s2")
+	wantMembers(readSet(), "a", "b", "c", "d")
+	send("SUNION", "ghost", "ghost2")
+	expect(t, r, "*0\r\n")
+	send("SUNION", "ghost", "str")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	send("SUNION")
+	expect(t, r, "-ERR wrong number of arguments for 'sunion' command\r\n")
+
+	// SDIFF: first set drives, absent first set is empty, absent rest
+	// sets remove nothing.
+	send("SDIFF", "s1", "s2")
+	wantMembers(readSet(), "a")
+	send("SDIFF", "s1", "ghost")
+	wantMembers(readSet(), "a", "b", "c")
+	send("SDIFF", "ghost", "s1")
+	expect(t, r, "*0\r\n")
+	send("SDIFF", "ghost", "str")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	send("SDIFF")
+	expect(t, r, "-ERR wrong number of arguments for 'sdiff' command\r\n")
+
+	// SINTERCARD: values, the LIMIT clamp, and Redis's exact doors.
+	send("SINTERCARD", "2", "s1", "s2")
+	expect(t, r, ":2\r\n")
+	send("SINTERCARD", "2", "s1", "s2", "LIMIT", "1")
+	expect(t, r, ":1\r\n")
+	send("SINTERCARD", "2", "s1", "s2", "LIMIT", "0")
+	expect(t, r, ":2\r\n")
+	send("SINTERCARD", "2", "s1", "ghost")
+	expect(t, r, ":0\r\n")
+	send("SINTERCARD", "2", "ghost", "str")
+	expect(t, r, ":0\r\n")
+	send("SINTERCARD", "2", "str", "s1")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	send("SINTERCARD", "0", "s1")
+	expect(t, r, "-ERR numkeys should be greater than 0\r\n")
+	send("SINTERCARD", "-1", "s1")
+	expect(t, r, "-ERR numkeys should be greater than 0\r\n")
+	send("SINTERCARD", "abc", "s1")
+	expect(t, r, "-ERR numkeys should be greater than 0\r\n")
+	send("SINTERCARD", "3", "s1", "s2")
+	expect(t, r, "-ERR Number of keys can't be greater than number of args\r\n")
+	send("SINTERCARD", "2", "s1", "s2", "LIMIT", "-1")
+	expect(t, r, "-ERR LIMIT can't be negative\r\n")
+	send("SINTERCARD", "2", "s1", "s2", "LIMIT", "abc")
+	expect(t, r, "-ERR LIMIT can't be negative\r\n")
+	send("SINTERCARD", "2", "s1", "s2", "EXTRA", "1")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("SINTERCARD", "2", "s1", "s2", "LIMIT", "1", "x")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("SINTERCARD", "2")
+	expect(t, r, "-ERR wrong number of arguments for 'sintercard' command\r\n")
+}

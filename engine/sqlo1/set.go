@@ -14,6 +14,22 @@ import (
 // TTL, so a set entry is eflags, mlen, member and nothing else.
 type Set struct {
 	h *Hash
+
+	// Algebra scratch, setalgebra.go: the aux ladders holding each
+	// source key's root, the loaded sources, the window (one IO round
+	// of driver members, copied), the routing groups, the probe
+	// flags, and SUNION's digest salt.
+	alg       []*Hash
+	srcs      []algSrc
+	rest      []*algSrc
+	winArena  []byte
+	winMem    [][]byte
+	winFH     []uint64
+	grpSeg    []uint64
+	grpStart  []int
+	hitBuf    []bool
+	salt      [8]byte
+	saltReady bool
 }
 
 // NewSet builds the set layer over t.
