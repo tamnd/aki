@@ -347,6 +347,7 @@ func Listen(o Options) (*Server, error) {
 		go func() { _ = http.Serve(pln, mux) }()
 	}
 	s.rt.Use(dispatch.Handlers())
+	s.rt.UseDemoter(dispatch.Demoter())
 	s.rt.Start()
 	return s, nil
 }
