@@ -618,10 +618,20 @@ func Handlers() []shard.Handler { return handlers }
 
 // Demoter returns the collection-demotion hook for Runtime.UseDemoter, the entry
 // the worker's demote loop calls under memory pressure to shed a native
-// collection quantum to the cold tier (spec 2064/f3/06 section 6). The set type
-// is the first collection with a cold form; as the other types grow theirs this
-// is where their demoters compose into one hook.
-func Demoter() func(*shard.Ctx) int { return set.DemoteQuantum }
+// collection quantum to the cold tier (spec 2064/f3/06 section 6). The set and the
+// zset each keep their own owner-local registry and footprint, so the hook fans to
+// both, and each weighs the other's heap against the shared resident cap: the set's
+// quantum runs over the arena plus both registries, then the zset's runs over the
+// arena plus its own registry plus the set's now-shed total. That combined budget
+// is what makes the one resident cap a true RSS bound across the collection types,
+// rather than each type overrunning it by the size of the other's heap. As the
+// remaining types grow their cold forms they join the same fan-in.
+func Demoter() func(*shard.Ctx) int {
+	return func(cx *shard.Ctx) int {
+		n := set.DemoteQuantumOver(cx, zset.ResidentBytes(cx))
+		return n + zset.DemoteQuantumOver(cx, set.ResidentBytes(cx))
+	}
+}
 
 // Dispatch routes one parsed command: uppercase the verb into a stack
 // scratch, look it up, check arity, and enqueue on the connection. args are

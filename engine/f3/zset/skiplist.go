@@ -161,6 +161,15 @@ func (n *nativeStore) Member(ref uint32) []byte {
 
 func (n *nativeStore) card() int { return n.tbl.Len() }
 
+// hasResident reports whether the band still holds a member whose bytes live in the
+// slab, the demote trigger's cheap "anything left to shed" probe. A cold member
+// contributes no live slab bytes (demote marks them dead, the rebuild frees them),
+// so the live slab, the slab length past its dead bytes, is exactly the resident
+// members' bytes; a positive live slab means one demote quantum can still move
+// bytes to the cold tier. O(1), so demoteVictim can weigh every zset at an
+// over-budget boundary without a walk.
+func (n *nativeStore) hasResident() bool { return len(n.slab) > n.deadBytes }
+
 // score is the ZSCORE read: one hash probe, the raw bits decoded to a float,
 // zero allocation. The tree is never touched.
 func (n *nativeStore) score(m []byte) (float64, bool) {
