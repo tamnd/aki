@@ -10,6 +10,7 @@ package obs1
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -134,14 +135,19 @@ func (c *Client) CompleteMultipart(ctx context.Context, key, uploadID string, pa
 	return info, err
 }
 
-// AbortMultipart drops an upload and its parts. Aborting an unknown or
-// already-completed upload id is ErrNotFound; the sweeper treats that as
-// done.
+// AbortMultipart drops an upload and its parts. Abort means ensure-gone,
+// so an unknown or already-gone upload id succeeds: providers disagree on
+// the wire (AWS answers 404 NoSuchUpload, MinIO answers 204) and the
+// sweeper only needs gone, so the client folds the 404 to nil here.
 func (c *Client) AbortMultipart(ctx context.Context, key, uploadID string) error {
-	return c.do(ctx, s3req{
+	err := c.do(ctx, s3req{
 		method: http.MethodDelete,
 		key:    key,
 		query:  url.Values{"uploadId": {uploadID}},
 		replay: true,
 	}, func(*http.Response) error { return nil })
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	return err
 }

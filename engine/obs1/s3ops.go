@@ -8,6 +8,7 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,12 +30,22 @@ func (c *Client) GetRange(ctx context.Context, key string, off, n int64) ([]byte
 }
 
 // GetTail fetches the last n bytes of an object (bytes=-n), the footer
-// read a taking-over node issues before it knows a segment's size.
+// read a taking-over node issues before it knows a segment's size. The tail
+// of an empty object is zero bytes, not an error: providers disagree on the
+// wire (AWS answers 416 for a suffix range of a zero-byte object, MinIO
+// answers 200 with an empty body), so the client folds the 416 to an empty
+// read here. Info may be zero on that path; callers check len, an empty
+// object has no footer either way.
 func (c *Client) GetTail(ctx context.Context, key string, n int64) ([]byte, ObjectInfo, error) {
 	if n <= 0 {
 		return nil, ObjectInfo{}, fmt.Errorf("obs1: bad tail %d for %s", n, key)
 	}
-	return c.getRange(ctx, key, fmt.Sprintf("bytes=-%d", n))
+	b, info, err := c.getRange(ctx, key, fmt.Sprintf("bytes=-%d", n))
+	if errors.Is(err, ErrRange) {
+		// A suffix range can only be unsatisfiable when the object is empty.
+		return nil, ObjectInfo{}, nil
+	}
+	return b, info, err
 }
 
 func (c *Client) getRange(ctx context.Context, key, rng string) ([]byte, ObjectInfo, error) {

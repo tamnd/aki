@@ -183,9 +183,11 @@ func TestMultipartAbort(t *testing.T) {
 	if err := c.AbortMultipart(ctx, "seg/00/10", id); err != nil {
 		t.Fatal(err)
 	}
-	// Aborting an unknown id is ErrNotFound; the sweeper treats it as done.
-	if err := c.AbortMultipart(ctx, "seg/00/10", id); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("re-abort: want ErrNotFound, got %v", err)
+	// The fake answers the AWS shape, 404 NoSuchUpload, for an unknown id;
+	// the client folds it to nil because abort means ensure-gone (MinIO
+	// answers 204 for the same case, pinned by the differential suite).
+	if err := c.AbortMultipart(ctx, "seg/00/10", id); err != nil {
+		t.Fatalf("re-abort: %v", err)
 	}
 }
 

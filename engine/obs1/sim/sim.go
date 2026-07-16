@@ -177,15 +177,15 @@ func (s *Sim) GetRange(ctx context.Context, key string, off, n int64) ([]byte, o
 }
 
 // GetTail fetches the last n bytes, the footer read a taking-over node
-// does before it has a manifest.
+// does before it has a manifest. The tail of an empty object is zero
+// bytes, not obs1.ErrRange, matching the client's normalized contract
+// (the wire client folds AWS's 416 on that case to an empty read, MinIO
+// answers 200 with an empty body natively).
 func (s *Sim) GetTail(ctx context.Context, key string, n int64) ([]byte, obs1.ObjectInfo, error) {
 	if n <= 0 {
 		return nil, obs1.ObjectInfo{}, fmt.Errorf("sim: bad tail %d for %s", n, key)
 	}
 	return s.getRange(ctx, key, func(size int64) (int64, int64, bool) {
-		if size == 0 {
-			return 0, 0, false
-		}
 		return max(0, size-n), size, true
 	})
 }
@@ -438,8 +438,10 @@ func (s *Sim) CompleteMultipart(ctx context.Context, key, uploadID string, parts
 	return commit()
 }
 
-// AbortMultipart drops an upload; unknown ids are obs1.ErrNotFound, which
-// the sweeper treats as done.
+// AbortMultipart drops an upload. Abort means ensure-gone, so an unknown
+// or already-gone upload id succeeds, matching the client's normalized
+// contract (the wire client folds AWS's 404 NoSuchUpload to nil, MinIO
+// answers 204 natively).
 func (s *Sim) AbortMultipart(ctx context.Context, key, uploadID string) error {
 	f, err := s.begin(ctx, OpAbortMultipart, key, false)
 	if err != nil {
@@ -451,10 +453,8 @@ func (s *Sim) AbortMultipart(ctx context.Context, key, uploadID string) error {
 	if f != nil && f.Err != nil {
 		return f.Err
 	}
-	u, ok := s.up[uploadID]
-	if !ok || u.key != key {
-		return fmt.Errorf("sim: AbortMultipart %s %s: %w", key, uploadID, obs1.ErrNotFound)
+	if u, ok := s.up[uploadID]; ok && u.key == key {
+		delete(s.up, uploadID)
 	}
-	delete(s.up, uploadID)
 	return nil
 }
