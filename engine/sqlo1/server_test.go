@@ -757,3 +757,83 @@ func TestServerIncrFamily(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// TestServerMultiKey pins the MGET, MSET, and MSETNX wire surface:
+// reply shapes, ordering with nulls for misses, MSET's TTL discard,
+// MSETNX's all-or-nothing gate, and the even-argument arity errors.
+func TestServerMultiKey(t *testing.T) {
+	do, clock := dispatchServer(t)
+
+	if got := do("MSET", "a", "one", "b", "two"); got != "+OK\r\n" {
+		t.Fatalf("MSET: %q", got)
+	}
+	big := strings.Repeat("r", 9<<10)
+	if got := do("SET", "big", big); got != "+OK\r\n" {
+		t.Fatalf("SET big: %q", got)
+	}
+
+	want := "*4\r\n$3\r\none\r\n$-1\r\n$" + strconv.Itoa(len(big)) + "\r\n" + big + "\r\n$3\r\ntwo\r\n"
+	if got := do("MGET", "a", "missing", "big", "b"); got != want {
+		t.Fatalf("MGET: got %d bytes, want %d bytes\nhead: %.60q", len(got), len(want), got)
+	}
+	if got := do("MGET", "nope"); got != "*1\r\n$-1\r\n" {
+		t.Fatalf("MGET miss: %q", got)
+	}
+
+	// MSET is a plain SET per key: it discards an existing TTL.
+	if got := do("EXPIRE", "a", "5"); got != ":1\r\n" {
+		t.Fatalf("EXPIRE: %q", got)
+	}
+	if got := do("TTL", "a"); got != ":5\r\n" {
+		t.Fatalf("TTL armed: %q", got)
+	}
+	if got := do("MSET", "a", "three"); got != "+OK\r\n" {
+		t.Fatalf("MSET overwrite: %q", got)
+	}
+	if got := do("TTL", "a"); got != ":-1\r\n" {
+		t.Fatalf("TTL after MSET: %q", got)
+	}
+	if got := do("GET", "a"); got != "$5\r\nthree\r\n" {
+		t.Fatalf("GET after MSET: %q", got)
+	}
+
+	// MSETNX writes all or nothing.
+	if got := do("MSETNX", "x", "1", "y", "2"); got != ":1\r\n" {
+		t.Fatalf("MSETNX fresh: %q", got)
+	}
+	if got := do("MSETNX", "z", "3", "x", "clobber"); got != ":0\r\n" {
+		t.Fatalf("MSETNX blocked: %q", got)
+	}
+	if got := do("GET", "z"); got != "$-1\r\n" {
+		t.Fatalf("MSETNX partial write leaked: GET z = %q", got)
+	}
+	if got := do("GET", "x"); got != "$1\r\n1\r\n" {
+		t.Fatalf("MSETNX clobbered x: %q", got)
+	}
+
+	// An expired key reads as missing mid-MGET and is free for MSETNX.
+	do("SET", "gone", "v", "PX", "100")
+	*clock += 101
+	if got := do("MGET", "x", "gone", "y"); got != "*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n2\r\n" {
+		t.Fatalf("MGET expired: %q", got)
+	}
+	if got := do("MSETNX", "gone", "back"); got != ":1\r\n" {
+		t.Fatalf("MSETNX over expired: %q", got)
+	}
+
+	for _, bad := range [][]string{
+		{"MSET"},
+		{"MSET", "k"},
+		{"MSET", "k", "v", "k2"},
+		{"MSETNX"},
+		{"MSETNX", "k"},
+		{"MSETNX", "k", "v", "k2"},
+		{"MGET"},
+	} {
+		lower := strings.ToLower(bad[0])
+		want := "-ERR wrong number of arguments for '" + lower + "' command\r\n"
+		if got := do(bad...); got != want {
+			t.Fatalf("%v: %q, want %q", bad, got, want)
+		}
+	}
+}

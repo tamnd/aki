@@ -33,6 +33,20 @@ type Server struct {
 	// old carries a reply value across the mutation that would recycle
 	// its arena bytes (SET GET, GETDEL, GETEX).
 	old []byte
+
+	// mkeys and mvals split MSET and MSETNX argument pairs.
+	mkeys [][]byte
+	mvals [][]byte
+}
+
+// splitPairs fills mkeys and mvals from an even-length key-value
+// argument run; the caller has already checked the arity.
+func (s *Server) splitPairs(pairs [][]byte) {
+	s.mkeys, s.mvals = s.mkeys[:0], s.mvals[:0]
+	for i := 0; i < len(pairs); i += 2 {
+		s.mkeys = append(s.mkeys, pairs[i])
+		s.mvals = append(s.mvals, pairs[i+1])
+	}
 }
 
 // NewServer wires the command surface over st. The store must expose
@@ -311,6 +325,57 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return storeErr(reply, err)
 		}
 		return AppendInt(reply, n)
+	case "MGET":
+		if len(args) < 2 {
+			return arityErr(reply, cmd)
+		}
+		mark := len(reply)
+		reply = AppendArray(reply, len(args)-1)
+		err := s.s.MGet(ctx, args[1:], func(v []byte, ok bool) {
+			if ok {
+				reply = AppendBulk(reply, v)
+			} else {
+				reply = AppendNullBulk(reply)
+			}
+		})
+		if err != nil {
+			// A partial array is already in the buffer; truncate back
+			// to the mark so the error is the whole reply.
+			return storeErr(reply[:mark], err)
+		}
+		return reply
+	case "MSET":
+		if len(args) < 3 || len(args)%2 == 0 {
+			return arityErr(reply, cmd)
+		}
+		s.splitPairs(args[1:])
+		if err := s.s.MSet(ctx, s.mkeys, s.mvals); err != nil {
+			return storeErr(reply, err)
+		}
+		// MSET is SET without options key by key, so each key's TTL
+		// is discarded the way setCmd discards it.
+		for _, k := range s.mkeys {
+			if _, err := s.s.ExpireAt(ctx, k, 0); err != nil {
+				return storeErr(reply, err)
+			}
+		}
+		return AppendSimple(reply, "OK")
+	case "MSETNX":
+		if len(args) < 3 || len(args)%2 == 0 {
+			return arityErr(reply, cmd)
+		}
+		s.splitPairs(args[1:])
+		any, err := s.s.ExistsAny(ctx, s.mkeys)
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if any {
+			return AppendInt(reply, 0)
+		}
+		if err := s.s.MSet(ctx, s.mkeys, s.mvals); err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, 1)
 	case "INCRBYFLOAT":
 		if len(args) != 3 {
 			return arityErr(reply, cmd)

@@ -1054,3 +1054,169 @@ func TestParseCanonicalInt(t *testing.T) {
 		}
 	}
 }
+
+// TestStrMGet pins the batch read door: emission order and values
+// across hot, cold, missing, empty, and rope keys, the one-round
+// coalescing claim for cold plain misses, and the copy-before-rope
+// rule that keeps cold plain values alive when ropes in the same
+// batch recycle the read buffers.
+func TestStrMGet(t *testing.T) {
+	r := newStrRig(t)
+	ctx := context.Background()
+
+	mget := func(s *Str, keys ...string) ([][]byte, []bool) {
+		t.Helper()
+		bs := make([][]byte, len(keys))
+		for i, k := range keys {
+			bs[i] = []byte(k)
+		}
+		var vals [][]byte
+		var oks []bool
+		err := s.MGet(ctx, bs, func(v []byte, ok bool) {
+			// The value is valid only inside emit, so the test copies,
+			// exactly like the reply builder consumes it.
+			vals = append(vals, append([]byte(nil), v...))
+			oks = append(oks, ok)
+		})
+		if err != nil {
+			t.Fatalf("MGet(%q): %v", keys, err)
+		}
+		if len(vals) != len(keys) {
+			t.Fatalf("MGet emitted %d values for %d keys", len(vals), len(keys))
+		}
+		return vals, oks
+	}
+
+	rope1 := pat(9<<10, 1)
+	rope2 := pat(12<<10+37, 2)
+	r.set("a", []byte("alpha"))
+	r.set("empty", nil)
+	r.set("r1", rope1)
+	r.set("b", pat(600, 3))
+	r.set("r2", rope2)
+	r.set("c", []byte("charlie"))
+
+	// Hot pass, ropes on both sides of plain values and a missing key
+	// in the middle.
+	vals, oks := mget(r.s, "a", "r1", "missing", "b", "r2", "empty", "c")
+	wantVals := [][]byte{[]byte("alpha"), rope1, nil, pat(600, 3), rope2, {}, []byte("charlie")}
+	wantOks := []bool{true, true, false, true, true, true, true}
+	for i := range wantVals {
+		if oks[i] != wantOks[i] || !bytes.Equal(vals[i], wantVals[i]) {
+			t.Fatalf("hot MGet[%d]: (%d bytes, %v), want (%d bytes, %v)", i, len(vals[i]), oks[i], len(wantVals[i]), wantOks[i])
+		}
+	}
+
+	// Cold pass: same answers through the store, and the plain misses
+	// coalesce into exactly one BatchGet round. The ropes cost their
+	// own assembly rounds on top, so the delta is pinned against a
+	// plain-only batch.
+	r.flush()
+	s2 := r.reopen()
+	before := s2.t.Stats().BatchReads
+	vals, oks = mget(s2, "a", "missing", "b", "empty", "c")
+	if got := s2.t.Stats().BatchReads - before; got != 1 {
+		t.Fatalf("cold plain MGET cost %d BatchGet rounds, want 1", got)
+	}
+	wantVals = [][]byte{[]byte("alpha"), nil, pat(600, 3), {}, []byte("charlie")}
+	wantOks = []bool{true, false, true, true, true}
+	for i := range wantVals {
+		if oks[i] != wantOks[i] || !bytes.Equal(vals[i], wantVals[i]) {
+			t.Fatalf("cold MGet[%d]: (%d bytes, %v), want (%d bytes, %v)", i, len(vals[i]), oks[i], len(wantVals[i]), wantOks[i])
+		}
+	}
+
+	// Cold pass with ropes interleaved: the rope assemblies recycle
+	// the round's buffers, so correct plain values here prove the
+	// copy-before-assembly rule.
+	s3 := r.reopen()
+	vals, oks = mget(s3, "c", "r1", "a", "r2", "b")
+	wantVals = [][]byte{[]byte("charlie"), rope1, []byte("alpha"), rope2, pat(600, 3)}
+	for i := range wantVals {
+		if !oks[i] || !bytes.Equal(vals[i], wantVals[i]) {
+			t.Fatalf("cold rope MGet[%d]: (%d bytes, %v), want %d bytes", i, len(vals[i]), oks[i], len(wantVals[i]))
+		}
+	}
+
+	// An expired key is a miss mid-batch.
+	r.set("dying", []byte("x"))
+	if _, err := r.s.ExpireAt(ctx, []byte("dying"), 1<<41-1); err != nil {
+		t.Fatal(err)
+	}
+	vals, oks = mget(r.s, "a", "dying", "c")
+	if oks[0] != true || oks[1] != false || oks[2] != true || vals[1] != nil {
+		t.Fatalf("expired key mid-batch: oks %v", oks)
+	}
+}
+
+// TestStrMSet pins the batch write door: values across the ladder,
+// the one-round meta prefetch, TTL survival on cold overwrites, rope
+// plane retirement, and the repeated-key rule that rereads a meta the
+// batch's own earlier write made stale.
+func TestStrMSet(t *testing.T) {
+	r := newStrRig(t)
+	ctx := context.Background()
+
+	keys := func(ss ...string) [][]byte {
+		bs := make([][]byte, len(ss))
+		for i, s := range ss {
+			bs[i] = []byte(s)
+		}
+		return bs
+	}
+
+	// Create across the ladder in one call.
+	if err := r.s.MSet(ctx, keys("a", "r", "empty"), [][]byte{[]byte("one"), pat(9<<10, 1), nil}); err != nil {
+		t.Fatal(err)
+	}
+	r.want(r.s, "a", []byte("one"))
+	r.want(r.s, "r", pat(9<<10, 1))
+	r.want(r.s, "empty", []byte{})
+
+	// Cold overwrite: metas prefetch in one round, TTLs survive the
+	// Str layer (the command layer owns MSET's discard), and the rope
+	// to plain shrink retires the plane.
+	at := int64(1<<41) + 60_000
+	for _, k := range []string{"a", "r"} {
+		if _, err := r.s.ExpireAt(ctx, []byte(k), at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.flush()
+	s2 := r.reopen()
+	before := s2.t.Stats().BatchReads
+	if err := s2.MSet(ctx, keys("a", "r", "fresh"), [][]byte{[]byte("two"), []byte("small"), []byte("new")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s2.t.Stats().BatchReads - before; got != 1 {
+		t.Fatalf("cold MSET meta prefetch cost %d BatchGet rounds, want 1", got)
+	}
+	if err := s2.t.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[string]int64{"a": at, "r": at, "fresh": 0} {
+		rec, err := r.rs.MemStore.Get(ctx, []byte(k))
+		if err != nil {
+			t.Fatalf("store Get(%q): %v", k, err)
+		}
+		if rec.ExpireMs != want {
+			t.Fatalf("%q drained with expire_ms %d, want %d", k, rec.ExpireMs, want)
+		}
+		if rec.Root {
+			t.Fatalf("%q still a root after plain MSET overwrite", k)
+		}
+	}
+
+	// A key repeated in one MSET: the first write builds a rope, the
+	// second shrinks it back, and the stale prefetched meta must not
+	// leak the plane or resurrect the rope.
+	if err := r.s.MSet(ctx, keys("dup", "dup"), [][]byte{pat(10<<10, 4), []byte("final")}); err != nil {
+		t.Fatal(err)
+	}
+	r.want(r.s, "dup", []byte("final"))
+	r.flush()
+	if _, isRoot := r.storedRoot("dup"); isRoot {
+		t.Fatal("dup key drained as a rope root after the shrink")
+	}
+	r.want(r.reopen(), "dup", []byte("final"))
+}
