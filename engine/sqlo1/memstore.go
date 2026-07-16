@@ -16,7 +16,10 @@ type MemStore struct {
 	mu        sync.Mutex
 	recs      map[string]Record
 	highWater int64
+	mintMark  uint64
 }
+
+var _ Minter = (*MemStore)(nil)
 
 // NewMemStore returns an empty placeholder store.
 func NewMemStore() *MemStore {
@@ -101,6 +104,21 @@ func (s *MemStore) Scan(ctx context.Context, cur Cursor, fn func(Record) bool) (
 		}
 	}
 	return nil, nil
+}
+
+// MintLease implements the Minter capability at MemStore's durability
+// level, which is none: the mark is as volatile as every record it
+// holds, so "durable before return" is honored trivially.
+func (s *MemStore) MintLease(ctx context.Context, n uint64) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mark, err := LeaseEnd(s.mintMark, n)
+	if err != nil {
+		return 0, err
+	}
+	start := s.mintMark
+	s.mintMark = mark
+	return start, nil
 }
 
 func (s *MemStore) Stats() StoreStats {

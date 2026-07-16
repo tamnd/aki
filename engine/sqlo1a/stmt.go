@@ -55,6 +55,13 @@ const (
 	sqlMetaHW    = `SELECT hw FROM meta WHERE id = 0`
 	sqlMetaSetHW = `UPDATE meta SET hw = ?1 WHERE id = 0`
 
+	// sqlMetaLease and sqlMetaSetLease read and move the rooth mint-lease
+	// mark, the seam Minter capability's durable counter. Same single-row
+	// discipline as the high-water mark: seeded at schema creation, so the
+	// write is always an UPDATE.
+	sqlMetaLease    = `SELECT lease FROM meta WHERE id = 0`
+	sqlMetaSetLease = `UPDATE meta SET lease = ?1 WHERE id = 0`
+
 	// The elem-root deletes are the gen-sweep shape ApplyBatch batches
 	// into a drain transaction when a root key is deleted: every elem
 	// table clears the root's rows by primary-key prefix. Pacing against
@@ -87,16 +94,18 @@ const (
 // compilation, and finalized before the connection closes because ncruces
 // refuses to close a connection with live statements.
 type stmts struct {
-	kvGet       *sqlite3.Stmt
-	kvPut       *sqlite3.Stmt
-	kvDel       *sqlite3.Stmt
-	kvScan      *sqlite3.Stmt
-	kvScanFirst *sqlite3.Stmt
-	kvCount     *sqlite3.Stmt
-	kvExpired   *sqlite3.Stmt
-	helemReap   *sqlite3.Stmt
-	metaHW      *sqlite3.Stmt
-	metaSetHW   *sqlite3.Stmt
+	kvGet        *sqlite3.Stmt
+	kvPut        *sqlite3.Stmt
+	kvDel        *sqlite3.Stmt
+	kvScan       *sqlite3.Stmt
+	kvScanFirst  *sqlite3.Stmt
+	kvCount      *sqlite3.Stmt
+	kvExpired    *sqlite3.Stmt
+	helemReap    *sqlite3.Stmt
+	metaHW       *sqlite3.Stmt
+	metaSetHW    *sqlite3.Stmt
+	metaLease    *sqlite3.Stmt
+	metaSetLease *sqlite3.Stmt
 
 	// elemDelRoot holds the per-elem-table root deletes ApplyBatch loops
 	// over for a deleted key, in schemaSQL declaration order.
@@ -121,6 +130,8 @@ func prepareStmts(conn *sqlite3.Conn) (*stmts, error) {
 		{sqlHElemReap, &s.helemReap},
 		{sqlMetaHW, &s.metaHW},
 		{sqlMetaSetHW, &s.metaSetHW},
+		{sqlMetaLease, &s.metaLease},
+		{sqlMetaSetLease, &s.metaSetLease},
 	} {
 		stmt, _, err := conn.Prepare(p.sql)
 		if err != nil {

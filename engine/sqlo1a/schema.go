@@ -11,8 +11,10 @@ import (
 // schemaVersion is the sqlo1a schema generation, stamped into the SQLite
 // user_version header field. Open refuses any nonzero value it does not
 // know: a newer generation means a newer sqlo1a wrote this file, and
-// guessing at its tables would corrupt it politely.
-const schemaVersion = 1
+// guessing at its tables would corrupt it politely. Pre-1.0 the bump is
+// also the whole migration story, older generations refuse and get
+// recreated; generation 2 added the mint-lease column to meta.
+const schemaVersion = 2
 
 // schemaSQL is doc 02 section 4 verbatim. All tables WITHOUT ROWID so the
 // clustered PK is the only B-tree, keys BLOB, times INTEGER milliseconds.
@@ -20,10 +22,11 @@ const schemaVersion = 1
 // sweep reclaims elem rows), crc is sqlo1's own crc32c row checksum since
 // SQLite mainline has no page checksums. Inline collections below the doc
 // 05-10 thresholds stay as one kv blob. meta is the single-row home of the
-// drain high-water mark; it cannot live in kv because kv's primary key is
-// the bare user key and any reserved key would be one user SET away from
-// clobbering the mark. The seed insert makes the row's existence a schema
-// invariant, so the high-water read never has a missing-row case.
+// drain high-water mark and the rooth mint-lease mark; neither can live in
+// kv because kv's primary key is the bare user key and any reserved key
+// would be one user SET away from clobbering them. The seed insert makes
+// the row's existence a schema invariant, so neither read ever has a
+// missing-row case.
 const schemaSQL = `
 CREATE TABLE kv (
   k BLOB PRIMARY KEY, t INTEGER, exp INTEGER, gen INTEGER,
@@ -54,11 +57,11 @@ CREATE TABLE xpel (k BLOB, grp BLOB, ms INTEGER, seq INTEGER,
   PRIMARY KEY (k, grp, ms, seq)) WITHOUT ROWID;
 
 CREATE TABLE meta (id INTEGER PRIMARY KEY CHECK (id = 0),
-  hw INTEGER) WITHOUT ROWID;
-INSERT INTO meta (id, hw) VALUES (0, 0);
+  hw INTEGER, lease INTEGER) WITHOUT ROWID;
+INSERT INTO meta (id, hw, lease) VALUES (0, 0, 0);
 `
 
-// schemaTables is what a generation-1 store must contain, exactly. The
+// schemaTables is what a generation-2 store must contain, exactly. The
 // guard checks the set both ways: a missing table means a truncated or
 // hand-edited file, an extra one means something else has been writing
 // into the store, and either way running on top of it hides the problem.

@@ -264,6 +264,8 @@ func OpenStoreOn(f StoreFile, walPath string, walSegSize int64) (*Store, error) 
 			err = s.applyDel(op.key)
 		case op.genbump:
 			err = s.applyGenbump(op.key, op.newgen)
+		case op.lease:
+			err = s.applyLease(op.leaseMark)
 		default:
 			err = s.applyPut(op.rec)
 		}
@@ -347,13 +349,15 @@ func (s *Store) initCursors() {
 
 // tailOp is one buffered data frame from the recovery replay.
 type tailOp struct {
-	del     bool
-	mark    bool
-	genbump bool
-	markSeq int64
-	newgen  uint32
-	key     []byte
-	rec     *Record
+	del       bool
+	mark      bool
+	genbump   bool
+	lease     bool
+	markSeq   int64
+	newgen    uint32
+	leaseMark uint64
+	key       []byte
+	rec       *Record
 }
 
 // replayTail buffers decoded data frames during Recover. Buffering
@@ -376,6 +380,14 @@ func (t *replayTail) ApplyData(fr sqlo1.WALFrame) error {
 		}
 		if isMark {
 			t.ops = append(t.ops, tailOp{mark: true, markSeq: seq})
+			return nil
+		}
+		mark, isLease, err := LeaseMark(rec)
+		if err != nil {
+			return err
+		}
+		if isLease {
+			t.ops = append(t.ops, tailOp{lease: true, leaseMark: mark})
 			return nil
 		}
 		t.ops = append(t.ops, tailOp{rec: cloneRecord(rec)})
@@ -884,6 +896,54 @@ func (s *Store) applyGenbump(key []byte, newgen uint32) error {
 	return s.insertNew(bucket, chain, fp, rec, h, pos)
 }
 
+// applyLease upserts the mint-lease record, keeping the mark
+// monotonic: a mark at or below the recorded one is a no-op, which
+// makes WAL replay idempotent without a high-water mark.
+func (s *Store) applyLease(mark uint64) error {
+	h := KeyHash(leaseKey)
+	bucket := BucketOf(PlacementBits(h), s.level, s.split)
+	chain, err := s.mutableChain(bucket)
+	if err != nil {
+		return err
+	}
+	fp := Fingerprint(h)
+	ci, ei, old, oldPos, found, err := s.findInChain(chain, fp, leaseKey)
+	if err != nil {
+		return err
+	}
+	if found {
+		oldMark, err := leaseOf(old)
+		if err != nil {
+			return err
+		}
+		if mark <= oldMark {
+			return nil
+		}
+	}
+	rec := leaseRecord(mark)
+	enc, err := rec.Encode()
+	if err != nil {
+		return err
+	}
+	s.logicalBytes += uint64(len(enc))
+	pos, err := s.appendVlog(enc)
+	if err != nil {
+		return err
+	}
+	if found {
+		meta, err := entryMetaFor(rec, h, chain[ci].WindowBase())
+		if err != nil {
+			return err
+		}
+		if err := chain[ci].SetEntry(ei, meta, uint64(pos)); err != nil {
+			return err
+		}
+		s.noteGarbage(oldPos, old)
+		return nil
+	}
+	return s.insertNew(bucket, chain, fp, rec, h, pos)
+}
+
 // applyDel removes key's index entry. Deleting an absent key is a
 // no-op at the seam. No vlog tombstone in v0: the WAL DEL frame and
 // the checkpointed index carry the fact.
@@ -961,6 +1021,72 @@ func (s *Store) GenBump(ctx context.Context, rooth uint64, newgen uint32) error 
 		return err
 	}
 	return nil
+}
+
+var _ sqlo1.Minter = (*Store)(nil)
+
+// MintLease durably reserves the next n rooth counters and returns
+// the first (the seam Minter contract): the new mark is WAL-framed
+// and synced before the range is handed out, so a restart can never
+// re-issue a counter whose rooth may already own live records. The
+// frame is a plain PUT of the lease record and, like GENBUMP, needs
+// no high-water mark: the apply is monotonic and replaying it is a
+// no-op. Counters a crash strands in a lease are abandoned; the mint
+// is a bijection, so holes waste only address space.
+func (s *Store) MintLease(ctx context.Context, n uint64) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broken != nil {
+		return 0, s.broken
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	start, err := s.currentLease()
+	if err != nil {
+		return 0, err
+	}
+	mark, err := sqlo1.LeaseEnd(start, n)
+	if err != nil {
+		return 0, err
+	}
+	pay, err := EncodeLeasePayload(mark)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := s.wal.Append(0, sqlo1.WALOpPut, 0, pay); err != nil {
+		return 0, err
+	}
+	if err := s.wal.Flush(); err != nil {
+		return 0, err
+	}
+	if err := s.wal.Sync(); err != nil {
+		return 0, err
+	}
+	// Durability point, same discipline as ApplyBatch: a failure past
+	// here poisons the store and reopening replays into a clean state.
+	if err := s.applyLease(mark); err != nil {
+		s.broken = err
+		return 0, err
+	}
+	if err := s.finishApply(); err != nil {
+		s.broken = err
+		return 0, err
+	}
+	return start, nil
+}
+
+// currentLease reads the recorded lease mark, zero when nothing was
+// ever leased.
+func (s *Store) currentLease() (uint64, error) {
+	rec, err := s.lookup(leaseKey)
+	if err != nil {
+		return 0, err
+	}
+	if rec == nil {
+		return 0, nil
+	}
+	return leaseOf(rec)
 }
 
 // RootLive is the liveness probe compaction runs on segment records

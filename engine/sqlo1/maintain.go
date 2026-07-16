@@ -41,6 +41,20 @@ type Maintainer interface {
 	CompactOnce(ctx context.Context) (bool, error)
 }
 
+// Minter is the optional Store capability behind rooth minting. The
+// type layer never mints straight off a RAM counter: it takes a lease
+// of n counters, durable before MintLease returns, and mints from the
+// leased range, so a restart can never re-issue a counter whose rooth
+// may already own live records on disk. Counters a crash strands in a
+// lease are abandoned; MintRooth is a bijection, so holes cost address
+// space and nothing else. MemStore implements it with a volatile mark,
+// which is exactly as durable as everything else it holds.
+type Minter interface {
+	// MintLease reserves the next n rooth counters and returns the
+	// first, so the caller owns [start, start+n).
+	MintLease(ctx context.Context, n uint64) (start uint64, err error)
+}
+
 // ErrShed rejects a write at the disk hard minimum. This is the
 // honest failure mode: Redis errors at maxmemory, sqlo1 errors at
 // disk-full, and the bench protocol records both identically. Reads

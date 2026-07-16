@@ -175,3 +175,25 @@ func TestMemStoreScanOrder(t *testing.T) {
 		t.Fatalf("MemStore scan not in key order: %v", got)
 	}
 }
+
+func TestMemStoreMintLease(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemStore()
+	start, err := s.MintLease(ctx, 100)
+	if err != nil || start != 0 {
+		t.Fatalf("first lease: start %d, err %v", start, err)
+	}
+	if _, err := s.MintLease(ctx, 0); err == nil {
+		t.Fatal("zero-counter lease accepted")
+	}
+	start, err = s.MintLease(ctx, 50)
+	if err != nil || start != 100 {
+		t.Fatalf("second lease: start %d, err %v, want 100", start, err)
+	}
+	if _, err := s.MintLease(ctx, 1<<48); err == nil {
+		t.Fatal("lease past the counter space accepted")
+	}
+	if start, err = s.MintLease(ctx, 1); err != nil || start != 150 {
+		t.Fatalf("lease after rejects: start %d, err %v, want 150", start, err)
+	}
+}
