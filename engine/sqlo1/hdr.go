@@ -74,3 +74,12 @@ const (
 // carries it across the seam as Record.Root. The low bits stay the
 // type tag.
 const TagRoot uint8 = 1 << 7
+
+// tagIntShadow marks a hot string whose parsed int64 sits in the
+// HotTable's shadow map (doc 05 section 2's integer fast path). Only
+// the INCR family arms it, and PutGen's wholesale typeTag assignment
+// is what makes the invalidation rule structural: every byte-level
+// write replaces the tag and the bit dies with it, so a stale shadow
+// cannot survive any writer that did not deliberately re-arm it. The
+// bit never crosses the seam; drain only reads TagRoot.
+const tagIntShadow uint8 = 1 << 6

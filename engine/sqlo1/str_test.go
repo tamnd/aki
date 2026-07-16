@@ -3,7 +3,11 @@ package sqlo1
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"hash/maphash"
+	"math"
+	"strconv"
 	"testing"
 )
 
@@ -745,6 +749,308 @@ func TestStrRangeWritesKeepTTL(t *testing.T) {
 		}
 		if rec.ExpireMs != at {
 			t.Fatalf("%q drained with expire_ms %d, want %d", k, rec.ExpireMs, at)
+		}
+	}
+}
+
+// TestStrIncrShadowByteWriterInvalidation is the T1 milestone's
+// invalidation-by-byte-writer test: once INCR arms the int shadow,
+// every byte-level writer must kill it, and the next INCR must answer
+// from the bytes the writer left, never the stale cached integer. The
+// shadow itself is observed through the hot-tier door so the test
+// fails loudly if a writer leaves a stale entry behind, not just if
+// the stale value happens to surface.
+func TestStrIncrShadowByteWriterInvalidation(t *testing.T) {
+	r := newStrRig(t)
+	ctx := context.Background()
+	k := []byte("n")
+
+	shadow := func() (int64, bool) {
+		t.Helper()
+		n, _, ok := r.tr.ht.intShadowOf(k)
+		return n, ok
+	}
+	incr := func(delta, want int64) {
+		t.Helper()
+		got, err := r.s.IncrBy(ctx, k, delta)
+		if err != nil {
+			t.Fatalf("IncrBy(%d): %v", delta, err)
+		}
+		if got != want {
+			t.Fatalf("IncrBy(%d) = %d, want %d", delta, got, want)
+		}
+		if n, ok := shadow(); !ok || n != want {
+			t.Fatalf("shadow after IncrBy = (%d, %v), want (%d, true)", n, ok, want)
+		}
+	}
+
+	// INCR on a missing key counts from zero and arms the shadow.
+	incr(1, 1)
+	incr(41, 42)
+
+	// Set: the shadow dies and INCR reads the new bytes.
+	r.set("n", []byte("100"))
+	if _, ok := shadow(); ok {
+		t.Fatal("shadow survived Set")
+	}
+	incr(1, 101)
+
+	// SetRange: patching the first digit is exactly the byte-level
+	// desync the shadow must never survive.
+	if _, err := r.s.SetRange(ctx, k, 0, []byte("9")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := shadow(); ok {
+		t.Fatal("shadow survived SetRange")
+	}
+	incr(1, 902) // "901" + 1, not 102
+
+	// Append: "902" grows to "9020".
+	if _, err := r.s.Append(ctx, k, []byte("0")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := shadow(); ok {
+		t.Fatal("shadow survived Append")
+	}
+	incr(1, 9021)
+
+	// Del: the tombstone drops the shadow and a revive counts fresh.
+	if _, err := r.s.Del(ctx, k); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := shadow(); ok {
+		t.Fatal("shadow survived Del")
+	}
+	incr(5, 5)
+
+	// TTL edits touch no value bytes, so the shadow survives them.
+	if _, err := r.s.ExpireAt(ctx, k, int64(1<<41)+60_000); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := shadow(); !ok || n != 5 {
+		t.Fatalf("shadow after ExpireAt = (%d, %v), want (5, true)", n, ok)
+	}
+
+	// Drain cools dirty to resident with the value untouched, so the
+	// shadow survives a flush too.
+	r.flush()
+	if n, ok := shadow(); !ok || n != 5 {
+		t.Fatalf("shadow after flush = (%d, %v), want (5, true)", n, ok)
+	}
+	incr(1, 6)
+
+	// Eviction retires the slot through removeSlot, which must drop
+	// the map entry with it; the next INCR parses cold.
+	r.flush()
+	s, ok := r.tr.ht.lookup(maphash.Bytes(r.tr.ht.seed, k), k)
+	if !ok {
+		t.Fatal("key not hot after flush")
+	}
+	if !r.tr.ht.evict(s, false) {
+		t.Fatal("evict refused a resident slot")
+	}
+	if _, ok := shadow(); ok {
+		t.Fatal("shadow survived eviction")
+	}
+	if len(r.tr.ht.intShadow) != 0 {
+		t.Fatalf("shadow map holds %d stale entries after eviction", len(r.tr.ht.intShadow))
+	}
+	incr(1, 7)
+}
+
+// TestStrIncrValues walks INCR semantics against an int64 oracle and
+// the whole rejection matrix: non-canonical bytes, ropes, overflow in
+// both directions with the value left standing.
+func TestStrIncrValues(t *testing.T) {
+	r := newStrRig(t)
+	ctx := context.Background()
+
+	var oracle int64
+	for _, d := range []int64{1, -1, 100, -42, 1 << 40, -(1 << 39), 7} {
+		oracle += d
+		got, err := r.s.IncrBy(ctx, []byte("c"), d)
+		if err != nil {
+			t.Fatalf("IncrBy(%d): %v", d, err)
+		}
+		if got != oracle {
+			t.Fatalf("IncrBy(%d) = %d, want %d", d, got, oracle)
+		}
+	}
+	// The stored bytes are the canonical decimal string.
+	r.want(r.s, "c", []byte(strconv.FormatInt(oracle, 10)))
+
+	// Values Redis's string2ll rejects are not integers here either.
+	for _, bad := range []string{"", "abc", "1.5", "0123", "+1", "-0", " 1", "1 ", "9223372036854775808", "-9223372036854775809", "123456789012345678901"} {
+		r.set("bad", []byte(bad))
+		if _, err := r.s.IncrBy(ctx, []byte("bad"), 1); !errors.Is(err, ErrNotInt) {
+			t.Fatalf("IncrBy on %q: err = %v, want ErrNotInt", bad, err)
+		}
+	}
+	// The int64 poles themselves are canonical and reachable.
+	r.set("edge", []byte("9223372036854775806"))
+	if got, err := r.s.IncrBy(ctx, []byte("edge"), 1); err != nil || got != math.MaxInt64 {
+		t.Fatalf("IncrBy to MaxInt64 = (%d, %v)", got, err)
+	}
+	if _, err := r.s.IncrBy(ctx, []byte("edge"), 1); !errors.Is(err, ErrOverflow) {
+		t.Fatalf("IncrBy past MaxInt64: err = %v, want ErrOverflow", err)
+	}
+	r.want(r.s, "edge", []byte("9223372036854775807"))
+	r.set("edge", []byte("-9223372036854775808"))
+	if _, err := r.s.IncrBy(ctx, []byte("edge"), -1); !errors.Is(err, ErrOverflow) {
+		t.Fatalf("IncrBy past MinInt64: err = %v, want ErrOverflow", err)
+	}
+	r.want(r.s, "edge", []byte("-9223372036854775808"))
+
+	// A rope is never an integer, whatever its bytes hold.
+	r.set("rope", bytes.Repeat([]byte("1"), 9<<10))
+	if _, err := r.s.IncrBy(ctx, []byte("rope"), 1); !errors.Is(err, ErrNotInt) {
+		t.Fatalf("IncrBy on rope: err = %v, want ErrNotInt", err)
+	}
+
+	// Cold pass: a reopened tier parses from the store and counts on.
+	r.flush()
+	s2 := r.reopen()
+	if got, err := s2.IncrBy(ctx, []byte("c"), 3); err != nil || got != oracle+3 {
+		t.Fatalf("cold IncrBy = (%d, %v), want %d", got, err, oracle+3)
+	}
+}
+
+// TestStrIncrKeepsTTL pins the restamp rule on the INCR family: a
+// cold key's expiry survives IncrBy and IncrByFloat, a hot armed
+// key's expiry survives repeated INCR through a drain, and the metaOf
+// fix keeps a cold rope's expiry through a full-value Set.
+func TestStrIncrKeepsTTL(t *testing.T) {
+	r := newStrRig(t)
+	ctx := context.Background()
+	at := int64(1<<41) + 60_000
+
+	r.set("i", []byte("10"))
+	r.set("f", []byte("1.5"))
+	r.set("rope", pat(16<<10, 2))
+	for _, k := range []string{"i", "f", "rope"} {
+		if _, err := r.s.ExpireAt(ctx, []byte(k), at); err != nil {
+			t.Fatalf("ExpireAt(%q): %v", k, err)
+		}
+	}
+	r.flush()
+
+	s2 := r.reopen()
+	if got, err := s2.IncrBy(ctx, []byte("i"), 5); err != nil || got != 15 {
+		t.Fatalf("cold IncrBy = (%d, %v)", got, err)
+	}
+	if v, err := s2.IncrByFloat(ctx, []byte("f"), 0.25); err != nil || string(v) != "1.75" {
+		t.Fatalf("cold IncrByFloat = (%q, %v)", v, err)
+	}
+	// The metaOf fix: Set over a cold rope carries the root's expiry.
+	if err := s2.Set(ctx, []byte("rope"), []byte("small")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.t.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"i", "f", "rope"} {
+		rec, err := r.rs.MemStore.Get(ctx, []byte(k))
+		if err != nil {
+			t.Fatalf("store Get(%q): %v", k, err)
+		}
+		if rec.ExpireMs != at {
+			t.Fatalf("%q drained with expire_ms %d, want %d", k, rec.ExpireMs, at)
+		}
+	}
+
+	// Hot armed path: INCR under an armed shadow through a drain.
+	if _, err := r.s.IncrBy(ctx, []byte("hot"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.s.ExpireAt(ctx, []byte("hot"), at); err != nil {
+		t.Fatal(err)
+	}
+	r.flush()
+	if _, err := r.s.IncrBy(ctx, []byte("hot"), 1); err != nil {
+		t.Fatal(err)
+	}
+	r.flush()
+	rec, err := r.rs.MemStore.Get(ctx, []byte("hot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.ExpireMs != at {
+		t.Fatalf("hot INCR drained with expire_ms %d, want %d", rec.ExpireMs, at)
+	}
+}
+
+// TestStrIncrByFloat pins the float path: arithmetic against Redis
+// replies, formatting with no exponent and no trailing zeros, and the
+// rejection matrix including the Inf and NaN doors.
+func TestStrIncrByFloat(t *testing.T) {
+	r := newStrRig(t)
+	ctx := context.Background()
+
+	steps := []struct {
+		delta float64
+		want  string
+	}{
+		{10.5, "10.5"},
+		{0.1, "10.6"},
+		{-5.6, "5"},
+		{2, "7"},
+		{0.25, "7.25"},
+	}
+	for _, st := range steps {
+		got, err := r.s.IncrByFloat(ctx, []byte("f"), st.delta)
+		if err != nil {
+			t.Fatalf("IncrByFloat(%v): %v", st.delta, err)
+		}
+		if string(got) != st.want {
+			t.Fatalf("IncrByFloat(%v) = %q, want %q", st.delta, got, st.want)
+		}
+	}
+	// Exponent-form and int-shaped current values both parse.
+	r.set("e", []byte("3.0e3"))
+	if got, err := r.s.IncrByFloat(ctx, []byte("e"), 200); err != nil || string(got) != "3200" {
+		t.Fatalf("IncrByFloat over 3.0e3 = (%q, %v)", got, err)
+	}
+
+	for _, bad := range []string{"", "abc", "1..2", " 1.5", "nan"} {
+		r.set("bad", []byte(bad))
+		if _, err := r.s.IncrByFloat(ctx, []byte("bad"), 1); !errors.Is(err, ErrNotFloat) {
+			t.Fatalf("IncrByFloat on %q: err = %v, want ErrNotFloat", bad, err)
+		}
+	}
+	r.set("rope", bytes.Repeat([]byte("1"), 9<<10))
+	if _, err := r.s.IncrByFloat(ctx, []byte("rope"), 1); !errors.Is(err, ErrNotFloat) {
+		t.Fatalf("IncrByFloat on rope: err = %v, want ErrNotFloat", err)
+	}
+
+	// An inf current value parses (Redis accepts it) but any result
+	// that lands on NaN or Inf is refused and the value stands.
+	r.set("inf", []byte("inf"))
+	if _, err := r.s.IncrByFloat(ctx, []byte("inf"), 1); !errors.Is(err, ErrNaNInf) {
+		t.Fatalf("IncrByFloat on inf: err = %v, want ErrNaNInf", err)
+	}
+	r.set("big", []byte("1.7e308"))
+	if _, err := r.s.IncrByFloat(ctx, []byte("big"), 1.7e308); !errors.Is(err, ErrNaNInf) {
+		t.Fatalf("IncrByFloat overflow to Inf: err = %v, want ErrNaNInf", err)
+	}
+	r.want(r.s, "big", []byte("1.7e308"))
+}
+
+// TestParseCanonicalInt pins the string2ll shape: exactly the strings
+// strconv round-trips are accepted, nothing else.
+func TestParseCanonicalInt(t *testing.T) {
+	good := []int64{0, 1, -1, 9, 10, -10, math.MaxInt64, math.MinInt64, 1 << 40, -(1 << 52)}
+	for _, n := range good {
+		s := strconv.FormatInt(n, 10)
+		got, ok := parseCanonicalInt([]byte(s))
+		if !ok || got != n {
+			t.Fatalf("parseCanonicalInt(%q) = (%d, %v), want (%d, true)", s, got, ok, n)
+		}
+	}
+	bad := []string{"", "-", "+1", "01", "-0", "-01", "1a", "a1", " 1", "1 ", "1.0",
+		"9223372036854775808", "-9223372036854775809", "99999999999999999999", "-99999999999999999999", "123456789012345678901"}
+	for _, s := range bad {
+		if n, ok := parseCanonicalInt([]byte(s)); ok {
+			t.Fatalf("parseCanonicalInt(%q) = (%d, true), want rejection", s, n)
 		}
 	}
 }
