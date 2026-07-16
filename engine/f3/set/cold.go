@@ -269,3 +269,68 @@ func (h *htable) demote(cc *coldChunks, key []byte) int {
 	h.dead = 0
 	return n
 }
+
+// promote brings the whole cold chunk owning the record at ord back into the
+// native structure, the write-path bring-up of spec 2064/f3/06 sections 6.5 and
+// 7.3. A write that had to read a cold chunk to confirm a member (a re-added
+// member whose record is cold) signals its neighbors are hot, so the whole chunk
+// lands resident rather than one member at a time; in-place chunk patching is
+// ruled out because it would make cold frames mutable, which recovery and
+// compaction depend on staying immutable (section 6.5).
+//
+// The retier-free record survives the round trip untouched on the same table
+// probe: promotion only preads the chunk once, re-seats each of its live members'
+// bytes back into the slab, clears each record's cold tier bit, and drops the
+// chunk's directory descriptor (its frame is now dead space the compactor
+// reclaims). It walks the draw vector, so a member SREM removed from the table
+// while cold is skipped for free (its ordinal left the vector); its stale locator
+// stays until the ordinal is reused. It reports whether the chunk was promoted,
+// false when the record is not cold, its locator is out of range, the pread tore,
+// or the directory and the offset table have drifted.
+func (h *htable) promote(ord uint32) bool {
+	r := &h.recs[ord]
+	if r.band&tierCold == 0 {
+		return false
+	}
+	cc := h.cold
+	slot := int(locSlot(r.loc))
+	if slot >= len(cc.offs) {
+		return false
+	}
+	off := cc.offs[slot]
+	ck, buf, ok := cc.st.ReadChunk(off, cc.scratch)
+	cc.scratch = buf
+	if !ok {
+		return false
+	}
+	// Locate the chunk's descriptor by its first discriminator: chunks partition
+	// the hash space with no overlap, so a Floor on the chunk's own first member
+	// lands on it exactly. Guard on the offset matching so a drifted directory
+	// aborts the promotion rather than dropping the wrong descriptor.
+	idx, found := cc.dir.Floor(ck.Disc)
+	if !found {
+		return false
+	}
+	if dOff, _, _ := cc.dir.At(idx); dOff != off {
+		return false
+	}
+	// Re-seat every live member that points into this chunk. The locator carries
+	// the entry index, so the packed payload is read positionally with no re-hash
+	// and no table probe; the appended slab bytes copy out of the pread buffer
+	// before the next entry reads it.
+	for _, o := range h.vec {
+		rr := &h.recs[o]
+		if rr.band&tierCold == 0 || int(locSlot(rr.loc)) != slot {
+			continue
+		}
+		m, ok := chunkEntry(ck.Payload, int(locEntry(rr.loc)))
+		if !ok {
+			continue // a torn entry stays cold; its read path still preads it
+		}
+		rr.loc = uint32(len(h.slab))
+		h.slab = append(h.slab, m...)
+		rr.band &^= tierCold
+	}
+	cc.dir.Remove(idx)
+	return true
+}

@@ -139,7 +139,15 @@ func (h *htable) has(m []byte) bool {
 // or the table, which are the excepted growth events.
 func (h *htable) add(m []byte) bool {
 	hash := store.Hash(m)
-	if _, ok := h.tbl.Find(hash, m, h); ok {
+	if ord, ok := h.tbl.Find(hash, m, h); ok {
+		if h.recs[ord].band&tierCold != 0 {
+			// The add is a no-op (m is already present), but confirming it read a
+			// cold chunk, which signals the chunk's neighbors are hot: bring the whole
+			// chunk resident (cold.go, spec 2064/f3/06 sections 6.5 and 7.3). The
+			// branch is never taken with the cold tier off, so the hot add is
+			// unchanged (the L9 zero-delta contract).
+			h.promote(ord)
+		}
 		return false
 	}
 	ord := h.newRecord(m)
