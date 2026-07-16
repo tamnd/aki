@@ -138,6 +138,10 @@ type Str struct {
 	// stream test pins.
 	bitopAcc  []byte
 	bitopSrcs []bitopSrc
+
+	// HLL scratch: the whole-value copy every PF read-modify-write
+	// runs on, bounded by the 12304-byte dense size.
+	hllBuf []byte
 }
 
 // NewStr builds the string layer over t.

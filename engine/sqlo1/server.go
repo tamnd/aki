@@ -547,6 +547,45 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return storeErr(reply, err)
 		}
 		return AppendInt(reply, n)
+	case "PFADD":
+		if len(args) < 2 {
+			return arityErr(reply, cmd)
+		}
+		n, err := s.s.PfAdd(ctx, args[1], args[2:])
+		if err != nil {
+			return hllErr(reply, err)
+		}
+		return AppendInt(reply, n)
+	case "PFCOUNT":
+		if len(args) < 2 {
+			return arityErr(reply, cmd)
+		}
+		n, err := s.s.PfCount(ctx, args[1:])
+		if err != nil {
+			return hllErr(reply, err)
+		}
+		return AppendInt(reply, n)
+	case "PFMERGE":
+		if len(args) < 2 {
+			return arityErr(reply, cmd)
+		}
+		if err := s.s.PfMerge(ctx, args[1], args[2:]); err != nil {
+			return hllErr(reply, err)
+		}
+		return AppendSimple(reply, "OK")
+	case "PFSELFTEST":
+		if len(args) != 1 {
+			return arityErr(reply, cmd)
+		}
+		if err := hllSelfTest(); err != nil {
+			return AppendError(reply, err.Error())
+		}
+		return AppendSimple(reply, "OK")
+	case "PFDEBUG":
+		if len(args) != 3 {
+			return arityErr(reply, cmd)
+		}
+		return s.pfdebugCmd(ctx, reply, args)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
@@ -850,6 +889,90 @@ func invalidExpire(reply []byte, cmd string) []byte {
 
 func storeErr(reply []byte, err error) []byte {
 	return AppendError(reply, "ERR "+err.Error())
+}
+
+// hllErr maps the HLL layer's sentinels onto Redis's exact wire
+// texts; anything else routes through storeErr.
+func hllErr(reply []byte, err error) []byte {
+	switch {
+	case errors.Is(err, errNotHLL):
+		return AppendError(reply, "WRONGTYPE Key is not a valid HyperLogLog string value.")
+	case errors.Is(err, errCorruptHLL):
+		return AppendError(reply, "INVALIDOBJ Corrupted HLL object detected")
+	}
+	return storeErr(reply, err)
+}
+
+// pfdebugCmd mirrors Redis's pfdebugCommand: the key resolves before
+// the subcommand's own arity check, and every error text matches.
+func (s *Server) pfdebugCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	sub := strings.ToLower(string(args[1]))
+	v, ok, err := s.s.PfGet(ctx, args[2])
+	if err != nil {
+		return hllErr(reply, err)
+	}
+	if !ok {
+		return AppendError(reply, "ERR The specified key does not exist")
+	}
+	switch sub {
+	case "getreg":
+		if v[4] == hllEncSparse {
+			if _, _, err := s.s.PfToDense(ctx, args[2]); err != nil {
+				return hllErr(reply, err)
+			}
+			if v, _, err = s.s.PfGet(ctx, args[2]); err != nil {
+				return hllErr(reply, err)
+			}
+		}
+		reply = AppendArray(reply, hllRegisters)
+		regs := v[hllHdrSize:]
+		for i := range hllRegisters {
+			reply = AppendInt(reply, int64(hllDenseGet(regs, i)))
+		}
+		return reply
+	case "decode":
+		if v[4] != hllEncSparse {
+			return AppendError(reply, "ERR HLL encoding is not sparse")
+		}
+		var out []byte
+		p := hllHdrSize
+		for p < len(v) {
+			switch {
+			case hllSparseIsZero(v[p]):
+				out = fmt.Appendf(out, "z:%d ", hllSparseZeroLen(v[p]))
+				p++
+			case hllSparseIsXZero(v[p]):
+				if p+1 >= len(v) {
+					p = len(v)
+					continue
+				}
+				out = fmt.Appendf(out, "Z:%d ", hllSparseXZeroLen(v[p], v[p+1]))
+				p += 2
+			default:
+				out = fmt.Appendf(out, "v:%d,%d ", hllSparseValValue(v[p]), hllSparseValLen(v[p]))
+				p++
+			}
+		}
+		if len(out) > 0 {
+			out = out[:len(out)-1]
+		}
+		return AppendBulk(reply, out)
+	case "encoding":
+		if v[4] == hllEncDense {
+			return AppendSimple(reply, "dense")
+		}
+		return AppendSimple(reply, "sparse")
+	case "todense":
+		conv, _, err := s.s.PfToDense(ctx, args[2])
+		if err != nil {
+			return hllErr(reply, err)
+		}
+		if conv {
+			return AppendInt(reply, 1)
+		}
+		return AppendInt(reply, 0)
+	}
+	return AppendError(reply, fmt.Sprintf("ERR Unknown PFDEBUG subcommand '%s'", args[1]))
 }
 
 // parseBitOffset accepts what string2ll accepts, bounded to the bit
