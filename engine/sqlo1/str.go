@@ -119,6 +119,18 @@ type Str struct {
 	// Bitfield result scratch, one entry per subcommand.
 	bfRes  []int64
 	bfNull []bool
+
+	// Popcount cache scratch: a segment subkey, one RMW segment
+	// image, one round of segment subkeys backed by pcKeyBuf, and
+	// the decoded entries of a query window. pcKeys/pcVals are kept
+	// separate from chunkKeys/chunkVals because cache maintenance
+	// runs inside the chunk-write loops that own those.
+	pckbuf    [SubkeySize]byte
+	pcScratch []byte
+	pcKeys    [][]byte
+	pcVals    [][]byte
+	pcKeyBuf  []byte
+	pcEntries []uint32
 }
 
 // NewStr builds the string layer over t.
@@ -686,7 +698,10 @@ func (s *Str) setRangeFresh(ctx context.Context, key, old []byte, off uint64, pa
 // offset, at the cost that a crash mid-patch can leave a torn window
 // inside the old length; the WAL command fencing of doc 05 section 5
 // is where that atomicity story lands, the same note appendRope
-// carries.
+// carries. A rope that carries a popcount cache keeps it exact here:
+// each chunk write updates its entry in the same command, and the
+// chunk-entry pair shares the torn-window caveat until the fencing
+// lands.
 func (s *Str) setRangeRope(ctx context.Context, key []byte, r ropeRoot, off uint64, patch []byte) (int64, error) {
 	end := off + uint64(len(patch))
 	newLen := max(end, r.totalLen)
@@ -706,6 +721,11 @@ func (s *Str) setRangeRope(ctx context.Context, key []byte, r ropeRoot, off uint
 		if po == cstart && pe == cstart+cs {
 			if err := s.t.SetGen(ctx, s.kbuf[:], patch[po-off:pe-off], TagString, r.rootgen); err != nil {
 				return 0, err
+			}
+			if r.pcSegCount > 0 {
+				if err := s.pcUpdate(ctx, r, c, uint32(popcountBytes(patch[po-off:pe-off]))); err != nil {
+					return 0, err
+				}
 			}
 			continue
 		}
@@ -732,12 +752,20 @@ func (s *Str) setRangeRope(ctx context.Context, key []byte, r ropeRoot, off uint
 		if err := s.t.SetGen(ctx, s.kbuf[:], s.chunkScratch, TagString, r.rootgen); err != nil {
 			return 0, err
 		}
+		if r.pcSegCount > 0 {
+			if err := s.pcUpdate(ctx, r, c, uint32(popcountBytes(s.chunkScratch))); err != nil {
+				return 0, err
+			}
+		}
 	}
 	if newLen == r.totalLen {
 		return int64(newLen), nil
 	}
 	r.totalLen = newLen
 	r.chunkCount = (newLen + cs - 1) >> r.log2chunk
+	if r.pcSegCount > 0 {
+		r.pcSegCount = (r.chunkCount + pcChunksPerSeg - 1) / pcChunksPerSeg
+	}
 	s.rootBuf = appendRopeRoot(s.rootBuf[:0], r)
 	if err := s.t.Set(ctx, key, s.rootBuf, TagString|TagRoot); err != nil {
 		return 0, err
@@ -792,6 +820,11 @@ func (s *Str) appendRope(ctx context.Context, key []byte, r ropeRoot, suffix []b
 		if err := s.t.SetGen(ctx, s.kbuf[:], s.chunkScratch, TagString, r.rootgen); err != nil {
 			return 0, err
 		}
+		if r.pcSegCount > 0 {
+			if err := s.pcUpdate(ctx, r, last, uint32(popcountBytes(s.chunkScratch))); err != nil {
+				return 0, err
+			}
+		}
 	}
 	for i := last + 1; len(rem) > 0; i++ {
 		take := min(cs, uint64(len(rem)))
@@ -799,10 +832,18 @@ func (s *Str) appendRope(ctx context.Context, key []byte, r ropeRoot, suffix []b
 		if err := s.t.SetGen(ctx, s.kbuf[:], rem[:take], TagString, r.rootgen); err != nil {
 			return 0, err
 		}
+		if r.pcSegCount > 0 {
+			if err := s.pcUpdate(ctx, r, i, uint32(popcountBytes(rem[:take]))); err != nil {
+				return 0, err
+			}
+		}
 		rem = rem[take:]
 	}
 	r.totalLen = newLen
 	r.chunkCount = (newLen + cs - 1) >> r.log2chunk
+	if r.pcSegCount > 0 {
+		r.pcSegCount = (r.chunkCount + pcChunksPerSeg - 1) / pcChunksPerSeg
+	}
 	s.rootBuf = appendRopeRoot(s.rootBuf[:0], r)
 	if err := s.t.Set(ctx, key, s.rootBuf, TagString|TagRoot); err != nil {
 		return 0, err

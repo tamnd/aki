@@ -118,6 +118,9 @@ func decodeRopeRoot(p []byte) (ropeRoot, error) {
 	if r.chunkCount > maxSegid {
 		return ropeRoot{}, fmt.Errorf("sqlo1: rope chunk count %d exceeds the segid space", r.chunkCount)
 	}
+	if want := (r.chunkCount + pcChunksPerSeg - 1) / pcChunksPerSeg; r.pcSegCount != 0 && r.pcSegCount != want {
+		return ropeRoot{}, fmt.Errorf("sqlo1: rope of %d chunks claims %d popcount segments, want 0 or %d", r.chunkCount, r.pcSegCount, want)
+	}
 	return r, nil
 }
 

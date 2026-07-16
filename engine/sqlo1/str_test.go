@@ -20,9 +20,29 @@ import (
 type recordingStore struct {
 	*MemStore
 	batches   []DrainBatch
-	chunkPuts int // segment-subkey put ops
+	chunkPuts int // chunk-subkey put ops
+	pcPuts    int // popcount-segment put ops
 	rootPuts  int // Root-flagged put ops
 	plainPuts int // everything else
+	// Cold reads by key class: only misses the hot tier forwards land
+	// here, which is what the S-I3 read-cost asserts want to see.
+	chunkReads int
+	pcReads    int
+	otherReads int
+}
+
+func (r *recordingStore) BatchGet(ctx context.Context, keys [][]byte) ([]Record, error) {
+	for _, k := range keys {
+		switch {
+		case len(k) == SubkeySize && k[8] == chunkKind:
+			r.chunkReads++
+		case len(k) == SubkeySize && k[8] == pcKind:
+			r.pcReads++
+		default:
+			r.otherReads++
+		}
+	}
+	return r.MemStore.BatchGet(ctx, keys)
 }
 
 func newRecordingStore() *recordingStore {
@@ -49,6 +69,8 @@ func (r *recordingStore) ApplyBatch(ctx context.Context, b *DrainBatch) error {
 			r.rootPuts++
 		case len(op.Rec.Key) == SubkeySize && op.Rec.Key[8] == chunkKind:
 			r.chunkPuts++
+		case len(op.Rec.Key) == SubkeySize && op.Rec.Key[8] == pcKind:
+			r.pcPuts++
 		default:
 			r.plainPuts++
 		}
