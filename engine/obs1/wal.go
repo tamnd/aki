@@ -51,7 +51,6 @@ const (
 	walSectionHdr = 2 + 4 + 1 + 3 + 4 + 4 + 8 + 8 // group..last_seq
 	walFrameFixed = 4 + 1 + 1 + 2 + 8 + 2         // flen..klen
 	walIndexEntry = 2 + 4 + 8 + 4 + 4 + 4 + 8 + 8
-	walTailSize   = 16
 )
 
 // SectionSpan is the byte range a ranged GET needs for the entry's whole
@@ -131,22 +130,7 @@ func AppendWAL(b []byte, writer uint64, sections []WALSection) ([]byte, error) {
 	footerLen := uint64(len(b)-start) - footerOff
 	b = binary.LittleEndian.AppendUint32(b, crc32c(b[start+int(footerOff):]))
 	footerLen += 4
-	tailAt := len(b)
-	b = binary.LittleEndian.AppendUint64(b, footerOff)
-	b = binary.LittleEndian.AppendUint32(b, uint32(footerLen))
-	return binary.LittleEndian.AppendUint32(b, crc32c(b[tailAt:])), nil
-}
-
-// ParseWALTail reads the 16-byte tail every multi-part obs1 object ends
-// with and returns where the footer lives.
-func ParseWALTail(tail []byte) (footerOff uint64, footerLen uint32, err error) {
-	if len(tail) != walTailSize {
-		return 0, 0, fmt.Errorf("obs1: tail is %d bytes, want %d", len(tail), walTailSize)
-	}
-	if got, want := crc32c(tail[:12]), binary.LittleEndian.Uint32(tail[12:]); got != want {
-		return 0, 0, fmt.Errorf("obs1: tail crc 0x%08x, computed 0x%08x", want, got)
-	}
-	return binary.LittleEndian.Uint64(tail[0:8]), binary.LittleEndian.Uint32(tail[8:12]), nil
+	return appendTail(b, footerOff, uint32(footerLen)), nil
 }
 
 // ParseWALFooter reads the footer bytes (crc included) into the index.
@@ -263,14 +247,14 @@ func ParseWAL(b []byte) ([]WALSection, Header, error) {
 	if h.FVersion != 1 {
 		return nil, Header{}, fmt.Errorf("obs1: WAL fversion %d, this build reads 1", h.FVersion)
 	}
-	if len(b) < HeaderSize+walTailSize {
+	if len(b) < HeaderSize+TailSize {
 		return nil, Header{}, fmt.Errorf("obs1: WAL object is %d bytes, too short for a tail", len(b))
 	}
-	footerOff, footerLen, err := ParseWALTail(b[len(b)-walTailSize:])
+	footerOff, footerLen, err := ParseTail(b[len(b)-TailSize:])
 	if err != nil {
 		return nil, Header{}, err
 	}
-	end := uint64(len(b) - walTailSize)
+	end := uint64(len(b) - TailSize)
 	if footerOff < HeaderSize || footerOff+uint64(footerLen) != end {
 		return nil, Header{}, fmt.Errorf("obs1: WAL footer at %d+%d does not reach the tail at %d", footerOff, footerLen, end)
 	}
