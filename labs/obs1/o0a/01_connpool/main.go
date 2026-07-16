@@ -13,6 +13,7 @@ import (
 	"net/http/httptrace"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,7 +33,7 @@ func main() {
 	flag.Parse()
 
 	if *header {
-		fmt.Println("arm,conc,pool,size,ops,ops_per_s,p50_us,p99_us,max_us,reused_frac,dials")
+		fmt.Println("arm,conc,pool,size,ops,ops_per_s,p50_us,p99_us,max_us,reused_frac,dials,dial_stalls")
 		return
 	}
 	if *quick {
@@ -98,7 +99,7 @@ func run(arm, endpoint, user, pass string, conc, pool, ops, size int) {
 		fatal(fmt.Errorf("unknown arm %q", arm))
 	}
 
-	var reused, dials atomic.Int64
+	var reused, dials, stalls atomic.Int64
 	lat := make([][]int64, conc)
 	perWorker := ops / conc
 	start := time.Now()
@@ -126,6 +127,17 @@ func run(arm, endpoint, user, pass string, conc, pool, ops, size int) {
 				}
 				t0 := time.Now()
 				resp, err := client.Do(req)
+				// Ephemeral-port exhaustion is the one transient this
+				// harness absorbs instead of dying: connection churn
+				// (pool below fan-out, or keep-alive off) piles closed
+				// sockets into TIME_WAIT until dials fail. The stall is
+				// real client-side queuing, so it stays in the latency
+				// sample and gets its own counter.
+				for retries := 0; err != nil && strings.Contains(err.Error(), "can't assign requested address") && retries < 100; retries++ {
+					stalls.Add(1)
+					time.Sleep(100 * time.Millisecond)
+					resp, err = client.Do(req)
+				}
 				if err != nil {
 					fatal(err)
 				}
@@ -151,9 +163,9 @@ func run(arm, endpoint, user, pass string, conc, pool, ops, size int) {
 	n := len(all)
 	opsPerS := float64(n) / total.Seconds()
 	reusedFrac := float64(reused.Load()) / float64(reused.Load()+dials.Load())
-	fmt.Printf("%s,%d,%d,%d,%d,%.0f,%d,%d,%d,%.4f,%d\n",
+	fmt.Printf("%s,%d,%d,%d,%d,%.0f,%d,%d,%d,%.4f,%d,%d\n",
 		arm, conc, pool, size, n, opsPerS,
-		all[n/2], all[n*99/100], all[n-1], reusedFrac, dials.Load())
+		all[n/2], all[n*99/100], all[n-1], reusedFrac, dials.Load(), stalls.Load())
 }
 
 // setupMinio creates the lab's bucket and object with signed raw requests.
