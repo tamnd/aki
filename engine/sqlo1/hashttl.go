@@ -219,7 +219,7 @@ func (h *Hash) ReapDue(ctx context.Context, key []byte) (int, error) {
 // entries), so a due min always names at least one dead entry.
 func (h *Hash) reapInline(ctx context.Context, key []byte, hi hashInline, expMs int64) (int, error) {
 	h.rootBuf = grow(h.rootBuf, hashInlineHdrLen)
-	it := hashEntryIter{p: hi.entries}
+	it := hashEntryIter{p: hi.entries, valless: h.valless}
 	now := h.t.Now()
 	live := 0
 	minExp := int64(0)
@@ -252,8 +252,8 @@ func (h *Hash) reapInline(ctx context.Context, key []byte, hi hashInline, expMs 
 		h.fireMin(key, hi.minExpMs, 0)
 		return dropped, nil
 	}
-	putHashInlineHdr(h.rootBuf, live, minExp)
-	if err := h.t.Set(ctx, key, h.rootBuf, TagHash|TagRoot); err != nil {
+	putHashInlineHdr(h.rootBuf, h.subInline, live, minExp, hi.allInt)
+	if err := h.t.Set(ctx, key, h.rootBuf, h.tag|TagRoot); err != nil {
 		return 0, err
 	}
 	h.fireMin(key, hi.minExpMs, minExp)
@@ -299,7 +299,7 @@ func (h *Hash) reapSeg(ctx context.Context, key []byte, expMs int64) (int, error
 				continue
 			}
 			h.segBuf = grow(h.segBuf, hashSegHdrLen)
-			it := hashEntryIter{p: s.entries}
+			it := hashEntryIter{p: s.entries, valless: s.valless}
 			live := 0
 			segMin := int64(0)
 			for {

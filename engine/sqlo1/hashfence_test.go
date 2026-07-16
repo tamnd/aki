@@ -248,6 +248,7 @@ func TestHashSegmentedTakeover(t *testing.T) {
 func TestHashSegRootCodecCorrupt(t *testing.T) {
 	base := func() hashSegRoot {
 		return hashSegRoot{
+			sub:       hashSubSeg,
 			rootgen:   3,
 			rooth:     0xabcdef,
 			count:     10,
@@ -256,6 +257,7 @@ func TestHashSegRootCodecCorrupt(t *testing.T) {
 		}
 	}
 	if _, err := decodeHashSegRoot(appendHashSegRoot(nil, &hashSegRoot{
+		sub:     hashSubSeg,
 		rootgen: 1, rooth: 7, count: 1, nextSegid: 1,
 		fence: []hashFenceEnt{{lo: 0, segid: 0}},
 	}), nil, nil); err != nil {
@@ -336,7 +338,7 @@ func TestHashSegRootCodecCorrupt(t *testing.T) {
 
 	// The flat fence cap is exact: 128 entries decode, 129 do not (a
 	// 129th segment pages the fence instead of growing it).
-	full := hashSegRoot{rootgen: 1, rooth: 7, nextSegid: hashFenceMaxSegs + 1, count: 1}
+	full := hashSegRoot{sub: hashSubSeg, rootgen: 1, rooth: 7, nextSegid: hashFenceMaxSegs + 1, count: 1}
 	for i := range hashFenceMaxSegs {
 		full.fence = append(full.fence, hashFenceEnt{lo: uint64(i) << 50, segid: uint64(i)})
 	}
@@ -356,6 +358,7 @@ func TestHashSegRootCodecCorrupt(t *testing.T) {
 func TestHashPagedRootCodec(t *testing.T) {
 	base := func() hashSegRoot {
 		return hashSegRoot{
+			sub:     hashSubSeg,
 			rootgen: 2, rooth: 0xfeed, count: 600, nextSegid: 131, paged: true,
 			pidx: []hashPageEnt{
 				{lo: 0, pageid: 129, weight: 40},

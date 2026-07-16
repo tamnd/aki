@@ -15,6 +15,7 @@ import (
 func reconTestRoot(t *testing.T, count uint64, minExpMs int64) []byte {
 	t.Helper()
 	r := &hashSegRoot{
+		sub:       hashSubSeg,
 		rootgen:   1,
 		rooth:     0xfeedbeefcafe,
 		count:     count,
@@ -37,7 +38,7 @@ func TestReconcileRef(t *testing.T) {
 	if !ok || rooth != 0xfeedbeefcafe {
 		t.Fatalf("ReconcileRef(segmented) = %x, %v", rooth, ok)
 	}
-	inline := appendHashInlineHdr(nil, 1, 0)
+	inline := appendHashInlineHdr(nil, hashSubInline, 1, 0, false)
 	if _, ok := ReconcileRef(inline); ok {
 		t.Fatal("ReconcileRef accepted an inline root")
 	}
@@ -134,7 +135,7 @@ func TestReconcileRootRejects(t *testing.T) {
 	if _, err := ReconcileRoot(root, -11, 0); err == nil {
 		t.Fatal("ReconcileRoot allowed a negative count")
 	}
-	inline := appendHashInlineHdr(nil, 1, 0)
+	inline := appendHashInlineHdr(nil, hashSubInline, 1, 0, false)
 	if _, err := ReconcileRoot(inline, 1, 0); err == nil {
 		t.Fatal("ReconcileRoot patched an inline root")
 	}
@@ -150,6 +151,7 @@ func TestReconcileRootRejects(t *testing.T) {
 func reconTestPagedRoot(t *testing.T, count uint64, minExpMs int64) []byte {
 	t.Helper()
 	r := &hashSegRoot{
+		sub:       hashSubSeg,
 		rootgen:   3,
 		rooth:     0xfeedbeefcafe,
 		count:     count,
@@ -175,7 +177,7 @@ func TestReconcilePages(t *testing.T) {
 	if _, paged, err := ReconcilePages(reconTestRoot(t, 7, 0)); err != nil || paged {
 		t.Fatalf("ReconcilePages(flat) = %v, %v", paged, err)
 	}
-	if _, _, err := ReconcilePages(appendHashInlineHdr(nil, 1, 0)); err == nil {
+	if _, _, err := ReconcilePages(appendHashInlineHdr(nil, hashSubInline, 1, 0, false)); err == nil {
 		t.Fatal("ReconcilePages accepted an inline root")
 	}
 	// The flat root answers through ReconcileFence, the paged one does

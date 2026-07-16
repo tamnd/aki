@@ -30,7 +30,7 @@ import (
 // subkeys. Not-ok means the payload is an inline root or a type that
 // has not claimed reconciliation, and its frames must stay full.
 func ReconcileRef(rootValue []byte) (rooth uint64, ok bool) {
-	if len(rootValue) < hashSegRootHdrLen || rootValue[0] != hashSubSeg {
+	if len(rootValue) < hashSegRootHdrLen || (rootValue[0] != hashSubSeg && rootValue[0] != setSubSeg) {
 		return 0, false
 	}
 	return binary.LittleEndian.Uint64(rootValue[8:]), true
