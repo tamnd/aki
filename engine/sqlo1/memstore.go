@@ -2,6 +2,7 @@ package sqlo1
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 )
@@ -49,6 +50,14 @@ func (s *MemStore) ApplyBatch(ctx context.Context, b *DrainBatch) error {
 	defer s.mu.Unlock()
 	if b.Seq <= s.highWater {
 		return nil // replayed batch, already applied
+	}
+	for i := range b.Ops {
+		// Validate before touching anything so a bad op cannot leave the
+		// batch half-applied; the real backends reject at their own plan
+		// or bind step for the same reason.
+		if op := &b.Ops[i]; !op.Del && op.Rec.Root && op.Rec.Gen > 0 {
+			return fmt.Errorf("sqlo1: batch %d op %d: root record %x with seam gen %d", b.Seq, i, op.Rec.Key, op.Rec.Gen)
+		}
 	}
 	for _, op := range b.Ops {
 		if op.Del {

@@ -491,3 +491,38 @@ func TestTieredMixedTrafficShadow(t *testing.T) {
 		}
 	}
 }
+
+// TestPromotionKeepsRootBit: a cold-read root record promotes with
+// TagRoot still on its header, so the type layer can tell a promoted
+// root payload from a plain value without decoding it.
+func TestPromotionKeepsRootBit(t *testing.T) {
+	r := newTieredRig(t, 64, 1, 1) // PromoteP 1: Float64() < 1 always, every cold hit promotes
+	r.preload(t,
+		Record{Key: []byte("root"), Value: []byte("root payload"), Root: true},
+		Record{Key: []byte("plain"), Value: []byte("v")},
+	)
+	for _, k := range []string{"root", "plain"} {
+		if _, ok := r.get(t, k); !ok {
+			t.Fatalf("cold read of %q missed", k)
+		}
+	}
+	if got := r.t.Stats().Promotions; got != 2 {
+		t.Fatalf("promotions = %d, want 2", got)
+	}
+	for _, tc := range []struct {
+		key  string
+		want uint8
+	}{
+		{"root", TagString | TagRoot},
+		{"plain", TagString},
+	} {
+		key := []byte(tc.key)
+		s, ok := r.t.ht.lookup(maphash.Bytes(r.t.ht.seed, key), key)
+		if !ok {
+			t.Fatalf("%q not in the hot tier after promotion", tc.key)
+		}
+		if tag := r.t.ht.hdrs[s].typeTag; tag != tc.want {
+			t.Fatalf("%q promoted with tag %#02x, want %#02x", tc.key, tag, tc.want)
+		}
+	}
+}

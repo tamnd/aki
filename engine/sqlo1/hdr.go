@@ -62,3 +62,9 @@ const (
 	TagZset   uint8 = 5
 	TagStream uint8 = 6
 )
+
+// TagRoot is a flag bit ORed onto a type tag, not a tag value: the
+// header's record is a collection or rope root image, and drain
+// carries it across the seam as Record.Root. The low bits stay the
+// type tag.
+const TagRoot uint8 = 1 << 7

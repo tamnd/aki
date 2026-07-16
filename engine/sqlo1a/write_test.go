@@ -200,3 +200,59 @@ func TestApplyBatchRetainsNoOpMemory(t *testing.T) {
 		t.Fatalf("value after scribble = %q, want arena-val", rec.Value)
 	}
 }
+
+// TestApplyBatchRootRecords: a Root op lands under rootTag, reads back
+// with the flag through Get and Scan, and a Root op carrying a seam gen
+// rejects its whole batch with the transaction rolled back.
+func TestApplyBatchRootRecords(t *testing.T) {
+	db := openTest(t)
+	ctx := context.Background()
+
+	err := db.ApplyBatch(ctx, &sqlo1.DrainBatch{Seq: 1, Ops: []sqlo1.Op{
+		{Rec: sqlo1.Record{Key: []byte("wide"), Value: []byte("root payload"), Root: true}},
+		{Rec: sqlo1.Record{Key: []byte("plain"), Value: []byte("v")}},
+	}})
+	if err != nil {
+		t.Fatalf("ApplyBatch: %v", err)
+	}
+	rec, err := db.Get(ctx, []byte("wide"))
+	if err != nil {
+		t.Fatalf("get wide: %v", err)
+	}
+	if !rec.Root || rec.Gen != 0 || !bytes.Equal(rec.Value, []byte("root payload")) {
+		t.Fatalf("wide = %+v", rec)
+	}
+	if rec, err = db.Get(ctx, []byte("plain")); err != nil || rec.Root {
+		t.Fatalf("plain = %+v, err %v", rec, err)
+	}
+	rootSeen := false
+	if _, err := db.Scan(ctx, nil, func(r sqlo1.Record) bool {
+		if string(r.Key) == "wide" {
+			rootSeen = r.Root
+		} else if r.Root {
+			t.Fatalf("scan flagged %q as root", r.Key)
+		}
+		return true
+	}); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !rootSeen {
+		t.Fatal("scan dropped the root flag")
+	}
+
+	err = db.ApplyBatch(ctx, &sqlo1.DrainBatch{Seq: 2, Ops: []sqlo1.Op{
+		{Rec: sqlo1.Record{Key: []byte("early"), Value: []byte("x")}},
+		{Rec: sqlo1.Record{Key: []byte("bad"), Value: []byte("p"), Root: true, Gen: 3}},
+	}})
+	if err == nil {
+		t.Fatal("root op with a seam gen applied")
+	}
+	for _, k := range []string{"early", "bad"} {
+		if _, err := db.Get(ctx, []byte(k)); !errors.Is(err, sqlo1.ErrNotFound) {
+			t.Fatalf("rejected batch left %q behind: %v", k, err)
+		}
+	}
+	if hw := db.Stats().HighWater; hw != 1 {
+		t.Fatalf("HighWater after rejected batch = %d, want 1", hw)
+	}
+}

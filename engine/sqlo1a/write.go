@@ -58,18 +58,27 @@ func (d *DB) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 // the kv row and every elem table's rows under the same root key: that is
 // the gen-sweep work riding the drain transaction, and at the flat seam,
 // where nothing writes elem rows yet, each of those deletes is one index
-// seek on an empty tree. A put stores the record under recordTag with the
-// crc the read path will verify.
+// seek on an empty tree. A put stores the record under recordTag, or
+// rootTag for a root image, with the crc the read path will verify.
 func (d *DB) applyOpLocked(op *sqlo1.Op) error {
 	if op.Del {
 		return d.delRootLocked(op.Rec.Key)
 	}
 	rec := &op.Rec
-	crc := rowCRC(rec.Key, recordTag, rec.ExpireMs, int64(rec.Gen), rec.Value)
+	t := int64(recordTag)
+	if rec.Root {
+		if rec.Gen > 0 {
+			// A root's generation lives in its payload; storing one in
+			// the gen column would invent a second authority.
+			return fmt.Errorf("sqlo1a: root record %x with seam gen %d", rec.Key, rec.Gen)
+		}
+		t = rootTag
+	}
+	crc := rowCRC(rec.Key, t, rec.ExpireMs, int64(rec.Gen), rec.Value)
 	if err := bindExec(d.st.kvPut, func(s *sqlite3.Stmt) error {
 		for _, err := range []error{
 			s.BindBlob(1, rec.Key),
-			s.BindInt64(2, recordTag),
+			s.BindInt64(2, t),
 			s.BindInt64(3, rec.ExpireMs),
 			s.BindInt64(4, int64(rec.Gen)),
 			s.BindBlob(5, rec.Value),

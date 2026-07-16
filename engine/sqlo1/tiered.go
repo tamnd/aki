@@ -312,14 +312,21 @@ func (t *Tiered) maybePromote(key []byte, rec Record, canEvict bool) {
 		expireLo = uint32(uint64(rec.ExpireMs+1023) >> 10)
 	}
 	// TagString is the whole surface until the per-type docs plug in;
-	// the seam's Record carries no tag, and the per-type integration
-	// re-derives it from the record encoding when that lands.
+	// the seam's Record carries no type tag, and the per-type
+	// integration re-derives it from the record encoding when that
+	// lands. The root bit does cross the seam, and the header keeps it
+	// so the type layer can tell a promoted root payload from a plain
+	// value without decoding.
+	tag := TagString
+	if rec.Root {
+		tag |= TagRoot
+	}
 	val := nonNilValue(rec.Value)
-	if !t.ht.promote(key, val, TagString, rec.Gen, expireLo) {
+	if !t.ht.promote(key, val, tag, rec.Gen, expireLo) {
 		if canEvict {
 			t.ev.evict(hdrSize + len(key) + len(val))
 		}
-		if !canEvict || !t.ht.promote(key, val, TagString, rec.Gen, expireLo) {
+		if !canEvict || !t.ht.promote(key, val, tag, rec.Gen, expireLo) {
 			t.stats.PromoteSkips++
 			return
 		}

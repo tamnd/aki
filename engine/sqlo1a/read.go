@@ -14,12 +14,15 @@ import (
 // the scrub slice sweeps for the same condition in the background.
 var ErrCorrupt = errors.New("sqlo1a: row checksum mismatch")
 
-// recordTag is the kv.t value for flat Store-seam records. The per-type
-// models (docs 05-10) claim other tags for collection roots when their
-// slices land; until then a foreign tag on a row means it belongs to logic
-// above this seam, and the seam reports the key as absent rather than
-// leaking another model's encoding as a plain value.
-const recordTag = 0
+// recordTag is the kv.t value for flat Store-seam records and rootTag
+// the value for root images (seam Record.Root: the value is a per-type
+// root payload, doc 05 onward). Any other tag on a row means it belongs
+// to logic above this seam, and the seam reports the key as absent
+// rather than leaking another model's encoding as a plain value.
+const (
+	recordTag = 0
+	rootTag   = 1
+)
 
 // scanPage is how many rows Scan pulls per statement execution. Pages keep
 // a long scan from pinning the read statement across the whole keyspace;
@@ -93,7 +96,7 @@ func (d *DB) getLocked(key []byte) (rec sqlo1.Record, err error) {
 	if got := rowCRC(key, t, exp, gen, v); got != crc {
 		return sqlo1.Record{}, fmt.Errorf("%w: key %x has crc %08x, row hashes to %08x", ErrCorrupt, key, crc, got)
 	}
-	if t != recordTag || expired(exp, d.now()) {
+	if (t != recordTag && t != rootTag) || expired(exp, d.now()) {
 		return sqlo1.Record{}, sqlo1.ErrNotFound
 	}
 	return sqlo1.Record{
@@ -101,6 +104,7 @@ func (d *DB) getLocked(key []byte) (rec sqlo1.Record, err error) {
 		Value:    v,
 		ExpireMs: exp,
 		Gen:      uint32(gen),
+		Root:     t == rootTag,
 	}, nil
 }
 
@@ -184,11 +188,11 @@ func (d *DB) scanPageLocked(fresh bool, after []byte) (rows []pageRow, err error
 		if got := rowCRC(k, t, exp, gen, v); got != crc {
 			return nil, fmt.Errorf("%w: key %x has crc %08x, row hashes to %08x", ErrCorrupt, k, crc, got)
 		}
-		if t != recordTag || expired(exp, now) {
+		if (t != recordTag && t != rootTag) || expired(exp, now) {
 			rows = append(rows, pageRow{rec: sqlo1.Record{Key: k}, skip: true})
 			continue
 		}
-		rows = append(rows, pageRow{rec: sqlo1.Record{Key: k, Value: v, ExpireMs: exp, Gen: uint32(gen)}})
+		rows = append(rows, pageRow{rec: sqlo1.Record{Key: k, Value: v, ExpireMs: exp, Gen: uint32(gen), Root: t == rootTag}})
 	}
 	if err := s.Err(); err != nil {
 		return nil, err

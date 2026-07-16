@@ -208,3 +208,47 @@ func TestDrainCycleZeroAlloc(t *testing.T) {
 		t.Errorf("drain cycle: %.1f allocs/op, want 0", allocs)
 	}
 }
+
+// TestDrainCarriesRootFlag: the TagRoot header bit crosses the seam as
+// Record.Root, and only for the keys that carry it.
+func TestDrainCarriesRootFlag(t *testing.T) {
+	ctx := context.Background()
+	ht := NewHotTable(64)
+	ms := NewMemStore()
+	d := newDrainer(ht, ms)
+
+	ht.Put([]byte("root"), []byte("root payload"), TagString|TagRoot)
+	ht.Put([]byte("plain"), []byte("v"), TagString)
+	if n, err := d.drain(ctx); err != nil || n != 2 {
+		t.Fatalf("drain = %d %v", n, err)
+	}
+	rec, err := ms.Get(ctx, []byte("root"))
+	if err != nil || !rec.Root {
+		t.Fatalf("root record: root=%v err=%v", rec.Root, err)
+	}
+	rec, err = ms.Get(ctx, []byte("plain"))
+	if err != nil || rec.Root {
+		t.Fatalf("plain record: root=%v err=%v", rec.Root, err)
+	}
+}
+
+// TestMemStoreRejectsRootGen: the seam contract says a root's generation
+// lives in its payload; a Root op with a seam gen must reject the whole
+// batch with nothing applied.
+func TestMemStoreRejectsRootGen(t *testing.T) {
+	ctx := context.Background()
+	ms := NewMemStore()
+	b := &DrainBatch{Seq: 1, Ops: []Op{
+		{Rec: Record{Key: []byte("a"), Value: []byte("v")}},
+		{Rec: Record{Key: []byte("r"), Value: []byte("p"), Root: true, Gen: 2}},
+	}}
+	if err := ms.ApplyBatch(ctx, b); err == nil {
+		t.Fatal("root op with a seam gen applied")
+	}
+	if _, err := ms.Get(ctx, []byte("a")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("batch was partially applied: %v", err)
+	}
+	if hw := ms.Stats().HighWater; hw != 0 {
+		t.Fatalf("high-water moved to %d on a rejected batch", hw)
+	}
+}
