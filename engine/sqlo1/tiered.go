@@ -164,6 +164,36 @@ func (t *Tiered) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 	return nonNilValue(rec.Value), true, nil
 }
 
+// Lookup is Get plus the root bit: the type layer's read door. The
+// seam's Record carries no type tag, but the root bit crosses it, so
+// this is how per-type code tells a root payload from a plain value
+// without decoding anything (the hot header keeps the bit for
+// promoted records). Aliasing rules match Get.
+func (t *Tiered) Lookup(ctx context.Context, key []byte) (val []byte, root, ok bool, err error) {
+	if v, tag, hit, definitive := t.ht.probeReadTag(key); definitive {
+		if hit {
+			t.stats.HotHits++
+			return v, tag&TagRoot != 0, true, nil
+		}
+		t.stats.Misses++
+		return nil, false, false, nil
+	}
+	t.missKeys = append(t.missKeys[:0], key)
+	t.stats.BatchReads++
+	recs, err := t.st.BatchGet(ctx, t.missKeys)
+	if err != nil {
+		return nil, false, false, err
+	}
+	rec := recs[0]
+	if rec.Key == nil || t.expiredRec(rec) {
+		t.stats.Misses++
+		return nil, false, false, nil
+	}
+	t.stats.ColdHits++
+	t.maybePromote(key, rec, true)
+	return nonNilValue(rec.Value), rec.Root, true, nil
+}
+
 // BatchGet reads keys in order, appending one entry per key to out (reuse
 // the returned slice across calls): the value for a hit, nil for a miss.
 // All cold misses coalesce into a single Store.BatchGet round. Values
@@ -217,16 +247,25 @@ func (t *Tiered) BatchGet(ctx context.Context, keys [][]byte, out [][]byte) ([][
 // deletions are how the user creates the garbage compaction reclaims,
 // and shedding them would wedge a full store for good.
 func (t *Tiered) Set(ctx context.Context, key, val []byte, tag uint8) error {
+	return t.SetGen(ctx, key, val, tag, 0)
+}
+
+// SetGen is Set for segment records, which carry their root's
+// generation so the store's liveness probe can retire them wholesale
+// on a bump. User records and roots write through Set: their gen is
+// zero at the seam (a root's own generation lives inside its
+// payload, doc 03 section 6.3).
+func (t *Tiered) SetGen(ctx context.Context, key, val []byte, tag uint8, gen uint32) error {
 	if shed, err := t.lad.shed(ctx); err != nil {
 		return err
 	} else if shed {
 		return ErrShed
 	}
-	if !t.ht.Put(key, val, tag) {
+	if !t.ht.PutGen(key, val, tag, gen) {
 		if err := t.makeRoomFor(ctx, len(key)+len(val)); err != nil {
 			return err
 		}
-		if !t.ht.Put(key, val, tag) {
+		if !t.ht.PutGen(key, val, tag, gen) {
 			return errHotFull
 		}
 	}

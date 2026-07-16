@@ -9,6 +9,7 @@ package sqlo1_test
 // reverse import is test-only by construction.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -223,6 +224,110 @@ func TestTieredWalRungOverB(t *testing.T) {
 	}
 	if p := db.Pressure(); p.Wal >= 1 {
 		t.Fatalf("tick left the lag at %.3f, the due checkpoint never ran", p.Wal)
+	}
+}
+
+// TestStrOverSqlo1b drives the string ladder end to end against the
+// real format: rope create, read, rewrite, append, plane retirement
+// visible through the store's generation probe, and a WAL-replay
+// reopen serving the rope cold.
+func TestStrOverSqlo1b(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tstr.aki")
+	db, err := sqlo1b.CreateStore(path, bWalSeg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { db.Close() }()
+
+	tr := newTieredOverB(t, db, 256, -1, 21)
+	cfg := sqlo1.StrConfig{RopeMin: 8 << 10, Log2Chunk: 10}
+	s, err := sqlo1.NewStr(tr, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bpat := func(n int, seed byte) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte(i)*31 ^ seed ^ byte(i>>9)
+		}
+		return b
+	}
+	check := func(str *sqlo1.Str, key string, want []byte) {
+		t.Helper()
+		got, ok, err := str.Get(ctx, []byte(key))
+		if err != nil || !ok {
+			t.Fatalf("Get(%q): ok=%v err=%v", key, ok, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("Get(%q): %d bytes, want %d", key, len(got), len(want))
+		}
+	}
+
+	// One value per rung, plus a rope that gets rewritten and appended.
+	inline := bpat(700, 1)
+	rope1 := bpat(12<<10, 2)
+	rope2 := bpat(20<<10, 3)
+	suffix := bpat(3000, 4)
+	for k, v := range map[string][]byte{"small": inline, "big": rope1} {
+		if err := s.Set(ctx, []byte(k), v); err != nil {
+			t.Fatalf("Set(%s): %v", k, err)
+		}
+	}
+	check(s, "small", inline)
+	check(s, "big", rope1)
+	if err := s.Set(ctx, []byte("big"), rope2); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	grown := append(append([]byte(nil), rope2...), suffix...)
+	if n, err := s.Append(ctx, []byte("big"), suffix); err != nil || n != int64(len(grown)) {
+		t.Fatalf("Append: n=%d err=%v, want %d", n, err, len(grown))
+	}
+	check(s, "big", grown)
+	if err := tr.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The rewrite retired rope1's plane; the fresh rooth per image means
+	// generation 1 planes die at gen 2, and the store's probe agrees.
+	rec, err := db.Get(ctx, []byte("big"))
+	if err != nil || !rec.Root {
+		t.Fatalf("big is not a root record on disk: %v", err)
+	}
+
+	// A rope DEL kills its plane through the same probe.
+	if err := s.Set(ctx, []byte("gone"), bpat(9<<10, 5)); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := s.Del(ctx, []byte("gone")); err != nil || !gone {
+		t.Fatalf("Del: gone=%v err=%v", gone, err)
+	}
+	if err := tr.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.Get(ctx, []byte("gone")); ok {
+		t.Fatal("deleted rope still readable")
+	}
+
+	// Reopen from disk: a fresh tier and ladder serve everything cold,
+	// the rope reassembled from real extents after WAL replay.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db2, err := sqlo1b.OpenStore(path, bWalSeg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	tr2 := newTieredOverB(t, db2, 256, -1, 22)
+	s2, err := sqlo1.NewStr(tr2, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(s2, "small", inline)
+	check(s2, "big", grown)
+	if _, ok, _ := s2.Get(ctx, []byte("gone")); ok {
+		t.Fatal("deleted rope readable after reopen")
 	}
 }
 
