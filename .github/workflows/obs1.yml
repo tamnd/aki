@@ -38,13 +38,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The engine race suites and the live-MinIO differential used to share
+  # one job, and once the f3 port grew the tree the parallel race binaries
+  # starved MinIO on the shared runner: PUTs died on the wire, the client
+  # rightly called them ambiguous, and the differential's replay-then-fail-
+  # loud rule (three fresh buckets, then give up) tripped on every run.
+  # The live tests now get a runner to themselves in the live job below,
+  # and this job races everything else with no server on the box.
   test:
     runs-on: ubuntu-latest
-    env:
-      AKI_OBS1_R2_ENDPOINT: ${{ secrets.AKI_OBS1_R2_ENDPOINT }}
-      AKI_OBS1_R2_KEY: ${{ secrets.AKI_OBS1_R2_KEY }}
-      AKI_OBS1_R2_SECRET: ${{ secrets.AKI_OBS1_R2_SECRET }}
-      AKI_OBS1_R2_BUCKET: ${{ secrets.AKI_OBS1_R2_BUCKET }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -66,11 +68,32 @@ jobs:
         run: ./scripts/obs1-import-boundary.sh
       - name: build
         run: go build ./engine/obs1/... ./obs1srv/... ./cmd/obs1srv ./labs/obs1/...
-      # A real MinIO so the live-server tests (TestMinIO*) run on every PR,
-      # not just on a laptop that happens to have one up. The release is
-      # pinned and RELEASE.2025-09-07 is a hard floor: earlier builds answer
-      # 404 to If-None-Match creates on missing keys, which breaks the CAS
-      # create primitive obs1 stands on. Never lower this pin.
+      - name: test
+        # Every obs1 package except the engine/obs1 root, which runs in
+        # the live job against a real MinIO.
+        run: go test -race -count=1 $(go list ./engine/obs1/... | grep -v 'engine/obs1$') ./obs1srv/... ./cmd/obs1srv/... ./labs/obs1/...
+
+  # The engine/obs1 root package on a runner of its own: the live-server
+  # tests (TestMinIO*, the sim-vs-MinIO differential) plus the package's
+  # plain unit tests. A real MinIO so the live tests run on every PR, not
+  # just on a laptop that happens to have one up. The release is pinned
+  # and RELEASE.2025-09-07 is a hard floor: earlier builds answer 404 to
+  # If-None-Match creates on missing keys, which breaks the CAS create
+  # primitive obs1 stands on. Never lower this pin.
+  live:
+    runs-on: ubuntu-latest
+    env:
+      AKI_OBS1_R2_ENDPOINT: ${{ secrets.AKI_OBS1_R2_ENDPOINT }}
+      AKI_OBS1_R2_KEY: ${{ secrets.AKI_OBS1_R2_KEY }}
+      AKI_OBS1_R2_SECRET: ${{ secrets.AKI_OBS1_R2_SECRET }}
+      AKI_OBS1_R2_BUCKET: ${{ secrets.AKI_OBS1_R2_BUCKET }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
       - name: minio binary cache
         id: minio-cache
         uses: actions/cache@v4
@@ -98,7 +121,7 @@ jobs:
       - name: test
         env:
           AKI_OBS1_S3: http://127.0.0.1:19000
-        run: go test -race -count=1 ./engine/obs1/... ./obs1srv/... ./cmd/obs1srv/... ./labs/obs1/...
+        run: go test -race -count=1 ./engine/obs1
       # R2 CAS fidelity (doc 01 section 12 item 1) runs only where the
       # secrets exist: pushes to main and same-repo PRs. Forks skip it.
       - name: r2 probe

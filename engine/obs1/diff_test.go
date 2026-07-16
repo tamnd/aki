@@ -49,9 +49,13 @@ func outcome(err error) string {
 	case errors.Is(err, obs1.ErrRange):
 		return "range"
 	case errors.Is(err, obs1.ErrAmbiguous):
-		return "ambiguous"
+		// The raw error rides along so a blip log names its cause, not
+		// just its class. Safe for the comparison: a trace with either
+		// blip class is discarded before any step is compared, and the
+		// faultless sim never produces one.
+		return fmt.Sprintf("ambiguous (%v)", err)
 	case errors.Is(err, obs1.ErrSlowDown):
-		return "slowdown"
+		return fmt.Sprintf("slowdown (%v)", err)
 	}
 	return "reject"
 }
