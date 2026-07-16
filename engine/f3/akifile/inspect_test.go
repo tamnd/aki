@@ -1,6 +1,9 @@
 package akifile
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestInspectFreshFile reports a fresh file: both slots valid and clean, slot A
 // live, no roots yet, and an empty segment population.
@@ -85,6 +88,89 @@ func TestInspectRecordsTornRoot(t *testing.T) {
 	}
 	if rep.Prefix == nil || rep.Live != 0 {
 		t.Fatalf("report dropped the prefix or live root on a torn SRT")
+	}
+}
+
+// TestFindingsCleanFile reports no findings for a fresh file: both slots valid and
+// no root torn, so a verify pass would exit clean.
+func TestFindingsCleanFile(t *testing.T) {
+	dev := &memDevice{}
+	newTestFile(t, dev, SyncNo, nil)
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if fs := rep.Findings(); len(fs) != 0 {
+		t.Fatalf("findings = %v, want none on a clean file", fs)
+	}
+}
+
+// TestFindingsTornSlot flags the torn slot by name while the file still has a live
+// root: a verify pass reports the incomplete commit but the file is recoverable.
+func TestFindingsTornSlot(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+	dev.buf[prefix.MetaSlotBOff+3] ^= 0xff // tear slot B's body
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	fs := rep.Findings()
+	if len(fs) != 1 || !strings.Contains(fs[0], "meta slot B") {
+		t.Fatalf("findings = %v, want one naming slot B", fs)
+	}
+}
+
+// TestFindingsBothSlotsTorn reports the no-trusted-root case: both slots tore, so a
+// verify pass flags the fall back to a full segment scan on top of each slot.
+func TestFindingsBothSlotsTorn(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+	dev.buf[prefix.MetaSlotAOff+3] ^= 0xff
+	dev.buf[prefix.MetaSlotBOff+3] ^= 0xff
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	fs := rep.Findings()
+	if len(fs) != 3 {
+		t.Fatalf("findings = %v, want both slots plus the no-trusted-root note", fs)
+	}
+	if !strings.Contains(fs[2], "no trusted meta slot") {
+		t.Fatalf("findings = %v, want the no-trusted-root finding last", fs)
+	}
+}
+
+// TestFindingsTornRoot flags a torn shard root table: the slot is valid but the SRT
+// it names did not read, so a verify pass reports the unreadable root.
+func TestFindingsTornRoot(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	srtOff := writeSRT(t, dev, prefix, &SRT{Gen: 1, Rows: rows})
+	dev.buf[srtOff+SRTHeaderLen+3] ^= 0xff // corrupt a row byte
+
+	m := &MetaSlot{
+		CommitSeq: 2, FileSize: PageSize, CleanShutdown: 1,
+		SRTOff: srtOff, SRTLen: uint32(SRTHeaderLen + len(rows)*SRTRowSize), SRTShardCount: prefix.ShardCount,
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	fs := rep.Findings()
+	if len(fs) != 1 || !strings.Contains(fs[0], "shard root table") {
+		t.Fatalf("findings = %v, want one for the torn root", fs)
 	}
 }
 

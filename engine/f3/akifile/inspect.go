@@ -1,5 +1,7 @@
 package akifile
 
+import "fmt"
+
 // SlotReport is one meta slot's state as a verify tool sees it: where it sits,
 // whether its checksum validates, and the fields a reader compares to pick the
 // live root. Err is why a slot did not validate (a torn write, media rot), left
@@ -102,6 +104,42 @@ func Inspect(dev Device) (*Report, error) {
 	}
 	rep.Segments = seg
 	return rep, nil
+}
+
+// Findings lists the integrity problems a verify pass reports, in file order: a
+// meta slot that did not validate, the both-slots-torn case where the file has no
+// trusted root at all, and a live root (the shard root table or the extent map)
+// that did not read back. An empty slice means the file verifies clean: both
+// slots valid and every root the live slot names read without error.
+//
+// The segment tail is deliberately not a finding. A never-synced or half-written
+// tail is a normal state a scan simply stops at (the durable tail), so it costs
+// only the un-acked segments past it, not the file's integrity.
+func (r *Report) Findings() []string {
+	var fs []string
+	for i, s := range r.Slots {
+		if !s.Valid {
+			fs = append(fs, fmt.Sprintf("meta slot %s did not validate: %v", slotName(i), s.Err))
+		}
+	}
+	if r.Live < 0 {
+		fs = append(fs, "no trusted meta slot: both tore, recovery falls back to a full segment scan")
+	}
+	if r.SRTErr != nil {
+		fs = append(fs, fmt.Sprintf("shard root table did not read: %v", r.SRTErr))
+	}
+	if r.ExtErr != nil {
+		fs = append(fs, fmt.Sprintf("extent map did not read: %v", r.ExtErr))
+	}
+	return fs
+}
+
+// slotName is the human label for a meta slot index: 0 is A, 1 is B.
+func slotName(i int) string {
+	if i == 1 {
+		return "B"
+	}
+	return "A"
 }
 
 // SegmentTally is the segment population a grid walk found: a count per kind, the
