@@ -86,11 +86,21 @@ func appendRopeRoot(dst []byte, r ropeRoot) []byte {
 // root fails loudly at the root read instead of as a wrong-sized
 // assembly later.
 func decodeRopeRoot(p []byte) (ropeRoot, error) {
+	if len(p) == 0 || p[0] != ropeSub {
+		// Another type's root is not corruption, it is the caller
+		// operating on the wrong kind of key; the sub namespace is
+		// global (hash.go), so the sniff settles which before the
+		// length check can mistake a foreign payload for a torn rope.
+		if tag, _, err := sniffRoot(p); err == nil && tag != TagString {
+			return ropeRoot{}, ErrWrongType
+		}
+		if len(p) == 0 {
+			return ropeRoot{}, fmt.Errorf("sqlo1: empty root payload")
+		}
+		return ropeRoot{}, fmt.Errorf("sqlo1: string root sub %d is not a rope", p[0])
+	}
 	if len(p) != ropeRootLen {
 		return ropeRoot{}, fmt.Errorf("sqlo1: rope root payload of %d bytes, want %d", len(p), ropeRootLen)
-	}
-	if p[0] != ropeSub {
-		return ropeRoot{}, fmt.Errorf("sqlo1: string root sub %d is not a rope", p[0])
 	}
 	if p[2] != 0 || p[3] != 0 {
 		return ropeRoot{}, fmt.Errorf("sqlo1: rope root reserved bytes are set")
