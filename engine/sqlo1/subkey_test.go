@@ -103,3 +103,30 @@ func TestMintRoothCollisionFree(t *testing.T) {
 		t.Error("counter past 48 bits minted")
 	}
 }
+
+func TestLeaseEnd(t *testing.T) {
+	const space = uint64(1) << 48
+	ok := []struct{ start, n, want uint64 }{
+		{0, 5, 5},
+		{5, 3, 8},
+		{space - 1, 1, space},
+		{0, space, space},
+	}
+	for _, c := range ok {
+		got, err := LeaseEnd(c.start, c.n)
+		if err != nil || got != c.want {
+			t.Errorf("LeaseEnd(%d, %d) = %d, %v, want %d", c.start, c.n, got, err, c.want)
+		}
+	}
+	bad := []struct{ start, n uint64 }{
+		{0, 0},
+		{space, 1},
+		{1, space},
+		{^uint64(0), 2},
+	}
+	for _, c := range bad {
+		if _, err := LeaseEnd(c.start, c.n); err == nil {
+			t.Errorf("LeaseEnd(%d, %d) accepted", c.start, c.n)
+		}
+	}
+}

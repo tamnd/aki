@@ -98,6 +98,23 @@ func MintRooth(shard uint16, counter uint64) (uint64, error) {
 	return splitmix64(uint64(shard)<<48 | counter), nil
 }
 
+// LeaseEnd validates a mint lease of n counters starting at start and
+// returns the new lease mark, start+n. A mark counts counters ever
+// leased, so the space is spent when the mark reaches the 48-bit
+// counter ceiling. Every Minter backend hands this its recorded mark
+// and the caller's n and stores the result, which keeps the range
+// arithmetic and its overflow care in one place.
+func LeaseEnd(start, n uint64) (uint64, error) {
+	const space = maxRoothCounter + 1
+	if n == 0 {
+		return 0, fmt.Errorf("sqlo1: mint lease of zero counters")
+	}
+	if start > space || n > space-start {
+		return 0, fmt.Errorf("sqlo1: mint lease of %d at mark %d passes the 48-bit counter space", n, start)
+	}
+	return start + n, nil
+}
+
 // splitmix64 is the Steele-Lea-Flood mix. The reference generator
 // from seed 0 emits splitmix64(k*gamma) for k = 0, 1, 2, ..., which
 // the golden test pins; the mint feeds it plain packed integers, the

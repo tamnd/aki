@@ -174,10 +174,11 @@ func EncodeMarkPayload(seq int64) ([]byte, error) {
 }
 
 // MarkSeq reports whether a replayed PUT record is the high-water
-// mark and returns the batch seq it carries. A meta record with any
-// other key is an error: nothing else emits rtype meta yet.
+// mark and returns the batch seq it carries. The mint-lease record is
+// the one other meta key allowed through (LeaseMark decodes it); any
+// other rtype-meta key is an error, nothing else emits one.
 func MarkSeq(rec *Record) (int64, bool, error) {
-	if rec.RType != RecMeta {
+	if rec.RType != RecMeta || bytes.Equal(rec.Key, leaseKey) {
 		return 0, false, nil
 	}
 	if !bytes.Equal(rec.Key, markKey) {
@@ -187,4 +188,55 @@ func MarkSeq(rec *Record) (int64, bool, error) {
 		return 0, false, fmt.Errorf("sqlo1b: high-water mark value is %d bytes, want 8", len(rec.Value))
 	}
 	return int64(binary.LittleEndian.Uint64(rec.Value)), true, nil
+}
+
+// The mint lease: the durable side of rooth minting (the seam Minter
+// capability). The lease mark, a count of rooth counters ever leased,
+// lives in the index as an rtype-meta record like generation records,
+// so it checkpoints, splits, and replays with zero extra machinery.
+// Its WAL frame is a plain PUT and needs no high-water mark, same as
+// GENBUMP: the apply is monotonic, so replaying it is a no-op.
+const leaseValueSize = 8
+
+// leaseKey is the mint-lease record's index key, on the kind-0 subkey
+// plane generation records reserve. Its segid bytes are ones no
+// GenKey can produce (GenKey zeroes everything past the rooth) and no
+// subkey can carry (kind 0 is rejected), so nothing collides.
+var leaseKey = func() []byte {
+	b := make([]byte, SubkeySize)
+	copy(b[9:], "lease")
+	return b
+}()
+
+// leaseRecord builds the mint-lease record for mark.
+func leaseRecord(mark uint64) *Record {
+	v := make([]byte, leaseValueSize)
+	binary.LittleEndian.PutUint64(v, mark)
+	return &Record{RType: RecMeta, Key: leaseKey, Value: v}
+}
+
+// leaseOf reads the mark out of a mint-lease record.
+func leaseOf(rec *Record) (uint64, error) {
+	if rec.RType != RecMeta || len(rec.Value) != leaseValueSize {
+		return 0, fmt.Errorf("sqlo1b: mint-lease record with rtype %d and %d value bytes", rec.RType, len(rec.Value))
+	}
+	return binary.LittleEndian.Uint64(rec.Value), nil
+}
+
+// EncodeLeasePayload builds the mint-lease PUT frame payload.
+func EncodeLeasePayload(mark uint64) ([]byte, error) {
+	return EncodePutPayload(leaseRecord(mark))
+}
+
+// LeaseMark reports whether a replayed PUT record is the mint-lease
+// record and returns the mark it carries.
+func LeaseMark(rec *Record) (uint64, bool, error) {
+	if rec.RType != RecMeta || !bytes.Equal(rec.Key, leaseKey) {
+		return 0, false, nil
+	}
+	mark, err := leaseOf(rec)
+	if err != nil {
+		return 0, false, err
+	}
+	return mark, true, nil
 }

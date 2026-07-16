@@ -830,3 +830,46 @@ func TestStoreRootRecords(t *testing.T) {
 	}
 	r.verify(t)
 }
+
+// TestMintLease covers the Minter capability end to end: disjoint
+// ranges, seam invisibility of the lease record, a rejected lease
+// leaving the store usable, and the mark surviving both a WAL-tail
+// reopen and a reopen after the post-crash mint.
+func TestMintLease(t *testing.T) {
+	r := newStoreRig(t)
+	ctx := context.Background()
+	start, err := r.s.MintLease(ctx, 100)
+	if err != nil || start != 0 {
+		t.Fatalf("first lease: start %d, err %v", start, err)
+	}
+	r.apply(t, putOp("user", []byte("v"), 0))
+	start, err = r.s.MintLease(ctx, 50)
+	if err != nil || start != 100 {
+		t.Fatalf("second lease: start %d, err %v, want 100", start, err)
+	}
+	if _, err := r.s.Get(ctx, leaseKey); !errors.Is(err, sqlo1.ErrNotFound) {
+		t.Fatalf("lease record leaked through Get: %v", err)
+	}
+	if got := r.scanAll(t); len(got) != 1 || got["user"] == nil {
+		t.Fatalf("scan sees %d records, want the one user key", len(got))
+	}
+	if _, err := r.s.MintLease(ctx, 0); err == nil {
+		t.Fatal("zero-counter lease accepted")
+	}
+	r.reopen(t)
+	start, err = r.s.MintLease(ctx, 1)
+	if err != nil || start != 150 {
+		t.Fatalf("lease after reopen: start %d, err %v, want 150", start, err)
+	}
+	r.reopen(t)
+	start, err = r.s.MintLease(ctx, 1)
+	if err != nil || start != 151 {
+		t.Fatalf("lease after second reopen: start %d, err %v, want 151", start, err)
+	}
+	if rec, err := r.s.Get(ctx, []byte("user")); err != nil || !bytes.Equal(rec.Value, []byte("v")) {
+		t.Fatalf("user record after reopens: %v", err)
+	}
+	if _, err := r.s.MintLease(ctx, 1<<48); err == nil {
+		t.Fatal("lease past the counter space accepted")
+	}
+}
