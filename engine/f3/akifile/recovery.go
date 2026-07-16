@@ -651,3 +651,34 @@ func ReadTTLIndex(dev Device, meta *MetaSlot) ([]TTLClass, error) {
 	}
 	return TTLClasses(buf, h)
 }
+
+// ReadFreeMap reads the free map the live meta root points at (spec 2064/f3/07
+// sections 2-3), the writer's record of the reclaimed runs it allocates from before
+// growing the file. Unlike the SRT and extent map, the free map has no length in the
+// meta slot: FreeMapOff names a whole free_map segment, so the reader walks its 64-byte
+// header for the payload length and reads the segment self-describingly. That also
+// buys it the segment's payload CRC, which the bare roots forgo, so a torn free map is
+// caught as ErrChecksum rather than read as a bad allocation set.
+//
+// FreeMapTotals then splits the runs into allocatable and pending-free bytes; the free
+// total is the forward-progress signal a writer blocked on a full disk waits on. A
+// segment at the pointer that is not a free_map is a misdirected or corrupt root,
+// returned as ErrMagic. A file with no free map (a fresh file, or a scan fallback with
+// no trusted root) returns a nil slice and no error.
+func ReadFreeMap(dev Device, prefix *Prefix, meta *MetaSlot) ([]FreeExtent, error) {
+	if meta == nil || meta.FreeMapOff == 0 {
+		return nil, nil
+	}
+	h, payload, err := readSegmentAt(dev, prefix.ChecksumKind, meta.FreeMapOff)
+	if err != nil {
+		return nil, err
+	}
+	if h.Kind != KindFreeMap {
+		return nil, ErrMagic
+	}
+	fh, err := ParseFreeMapHeader(payload)
+	if err != nil {
+		return nil, err
+	}
+	return FreeExtents(payload, fh)
+}
