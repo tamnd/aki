@@ -61,6 +61,7 @@ func (r *recordingStore) ApplyBatch(ctx context.Context, b *DrainBatch) error {
 			ExpireMs: op.Rec.ExpireMs,
 			Gen:      op.Rec.Gen,
 			Root:     op.Rec.Root,
+			Delta:    op.Rec.Delta,
 		}
 		cp.Ops = append(cp.Ops, Op{Del: op.Del, Rec: rec})
 		switch {

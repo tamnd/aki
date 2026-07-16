@@ -59,8 +59,12 @@ func (s *MemStore) ApplyBatch(ctx context.Context, b *DrainBatch) error {
 		// Validate before touching anything so a bad op cannot leave the
 		// batch half-applied; the real backends reject at their own plan
 		// or bind step for the same reason.
-		if op := &b.Ops[i]; !op.Del && op.Rec.Root && op.Rec.Gen > 0 {
+		op := &b.Ops[i]
+		if !op.Del && op.Rec.Root && op.Rec.Gen > 0 {
 			return fmt.Errorf("sqlo1: batch %d op %d: root record %x with seam gen %d", b.Seq, i, op.Rec.Key, op.Rec.Gen)
+		}
+		if !op.Del && op.Rec.Delta && !op.Rec.Root {
+			return fmt.Errorf("sqlo1: batch %d op %d: delta flag on non-root record %x", b.Seq, i, op.Rec.Key)
 		}
 	}
 	for i := range b.Bumps {

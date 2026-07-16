@@ -248,13 +248,31 @@ func TestApplyBatchRootRecords(t *testing.T) {
 	if err == nil {
 		t.Fatal("root op with a seam gen applied")
 	}
-	for _, k := range []string{"early", "bad"} {
+	err = db.ApplyBatch(ctx, &sqlo1.DrainBatch{Seq: 2, Ops: []sqlo1.Op{
+		{Rec: sqlo1.Record{Key: []byte("bare"), Value: []byte("p"), Delta: true}},
+	}})
+	if err == nil {
+		t.Fatal("delta op without the root flag applied")
+	}
+	for _, k := range []string{"early", "bad", "bare"} {
 		if _, err := db.Get(ctx, []byte(k)); !errors.Is(err, sqlo1.ErrNotFound) {
 			t.Fatalf("rejected batch left %q behind: %v", k, err)
 		}
 	}
 	if hw := db.Stats().HighWater; hw != 1 {
-		t.Fatalf("HighWater after rejected batch = %d, want 1", hw)
+		t.Fatalf("HighWater after rejected batches = %d, want 1", hw)
+	}
+
+	// Delta is advisory and Track A has no frame to elide: a delta
+	// root stores exactly like any root.
+	err = db.ApplyBatch(ctx, &sqlo1.DrainBatch{Seq: 2, Ops: []sqlo1.Op{
+		{Rec: sqlo1.Record{Key: []byte("wide2"), Value: []byte("delta image"), Root: true, Delta: true}},
+	}})
+	if err != nil {
+		t.Fatalf("delta root refused: %v", err)
+	}
+	if rec, err := db.Get(ctx, []byte("wide2")); err != nil || !rec.Root || !bytes.Equal(rec.Value, []byte("delta image")) {
+		t.Fatalf("delta root read back %+v, err %v", rec, err)
 	}
 }
 

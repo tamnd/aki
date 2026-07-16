@@ -95,6 +95,10 @@ func (d *drainer) drain(ctx context.Context) (int, error) {
 		if hd.valRef == 0 {
 			op.Del = true
 		} else {
+			// Delta needs both bits: a tombstone revival or a window that
+			// mixed in a structural write already lost the flag in PutGen,
+			// and a bare TagDelta without TagRoot cannot exist above.
+			op.Rec.Delta = hd.typeTag&(TagRoot|TagDelta) == TagRoot|TagDelta
 			op.Rec.Value = d.ht.vals.data(hd.valRef)
 			// The header carries the exact expire_ms split into the
 			// wheel projection and the remainder, so the record gets

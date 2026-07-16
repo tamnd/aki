@@ -81,13 +81,29 @@ func NewHotTable(capacity int) *HotTable {
 
 // enqueueDirty files slot s in the write-behind queue on its transition
 // into dirty; a slot already queued stays where it is, which is what
-// keeps drain order first-dirtied-first under overwrite churn.
+// keeps drain order first-dirtied-first under overwrite churn. Roots
+// are the one exception, rule W1 of doc 06 section 5: a re-dirtied
+// root marks itself for deferral, and popDirty re-files it at the tail
+// instead of handing it out from its old position. A root's image
+// summarizes segment records that later commands enqueue behind it, so
+// holding its early position could drain the summary in a batch before
+// the segments it counts; deferral makes the root land with or after
+// every segment it summarizes, and the with-or-after gap is exactly
+// the crash window rule W3's replay reconciliation covers.
 func (t *HotTable) enqueueDirty(s uint32) {
 	hd := &t.hdrs[s]
-	if hd.queued != 0 {
+	if hd.queued&queuedBit != 0 {
+		if hd.typeTag&TagRoot != 0 {
+			hd.queued |= queuedDefer
+		}
 		return
 	}
-	hd.queued = 1
+	hd.queued = queuedBit
+	t.pushDirty(s)
+}
+
+// pushDirty appends s to the queue ring, growing it when full.
+func (t *HotTable) pushDirty(s uint32) {
 	if t.dirtyN == len(t.dirty) {
 		grown := make([]uint32, 2*len(t.dirty))
 		for i := range t.dirtyN {
@@ -100,18 +116,29 @@ func (t *HotTable) enqueueDirty(s uint32) {
 }
 
 // popDirty hands the drain scheduler the oldest queue entry and clears
-// its queued flag. The caller must check the slot is still dirty: an
-// entry goes stale when its slot was drained directly or freed and
-// reused, and a stale entry is a skip, never an error.
+// its queued flag. An entry marked for deferral re-files at the tail
+// with the mark cleared instead of popping, so it hands out after
+// everything queued before this moment; the loop terminates because
+// each pass either returns or clears one deferral mark, and nothing
+// sets marks while the drain scheduler runs (single-owner). The caller
+// must check the slot is still dirty: an entry goes stale when its
+// slot was drained directly or freed and reused, and a stale entry is
+// a skip, never an error.
 func (t *HotTable) popDirty() (uint32, bool) {
-	if t.dirtyN == 0 {
-		return 0, false
+	for t.dirtyN > 0 {
+		s := t.dirty[t.dirtyHead]
+		t.dirtyHead = (t.dirtyHead + 1) % len(t.dirty)
+		t.dirtyN--
+		hd := &t.hdrs[s]
+		if hd.queued&queuedDefer != 0 {
+			hd.queued = queuedBit
+			t.pushDirty(s)
+			continue
+		}
+		hd.queued = 0
+		return s, true
 	}
-	s := t.dirty[t.dirtyHead]
-	t.dirtyHead = (t.dirtyHead + 1) % len(t.dirty)
-	t.dirtyN--
-	t.hdrs[s].queued = 0
-	return s, true
+	return 0, false
 }
 
 // SetTick moves the coarse clock the stamps record. Stamps shift last
@@ -282,6 +309,16 @@ func (t *HotTable) PutGen(key, val []byte, tag uint8, gen uint32) bool {
 	h := maphash.Bytes(t.seed, key)
 	if s, ok := t.lookup(h, key); ok {
 		hd := &t.hdrs[s]
+		// Delta describes the whole dirty window, not just this write:
+		// the drained frame coalesces every write since the last drain,
+		// so the flag survives only onto a window that has been delta
+		// writes throughout. Joining a window that holds a structural
+		// root write, a non-root value, or a tombstone strips it; a
+		// clean slot starts a fresh window and keeps the caller's bit.
+		if tag&TagDelta != 0 && hd.state == stateDirty &&
+			(hd.valRef == 0 || hd.typeTag&(TagRoot|TagDelta) != TagRoot|TagDelta) {
+			tag &^= TagDelta
+		}
 		if hd.valRef != 0 && t.expired(hd) {
 			// The old life is over and this write starts a new one, so
 			// the dead expiry must not ride along. A live key's expiry
@@ -526,6 +563,11 @@ func (t *HotTable) drained(s uint32, vptr uint64) bool {
 	t.dirtyBytes -= int(hd.klen) + len(t.vals.data(hd.valRef))
 	hd.state = stateResident
 	hd.vptr = vptr
+	// Delta is a dirty-window property and the drain just consumed the
+	// window; a resident header must not carry it into the next one
+	// (setExpireMs re-dirties without reassigning the tag, and an
+	// expiry edit is exactly what segment replay cannot reconstruct).
+	hd.typeTag &^= TagDelta
 	return true
 }
 
