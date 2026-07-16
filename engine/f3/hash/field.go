@@ -27,9 +27,10 @@ import (
 // minus the TTL slot and the value-log pointer, which are later slices).
 type fentry struct {
 	foff  uint32 // slab offset of the field bytes
-	voff  uint32 // slab offset of the value bytes
+	voff  uint32 // slab offset of the value bytes, or the chunk locator when cold
 	vslot uint32 // index in the draw vector, kept current by swap-remove
 	flen  uint16 // field byte length
+	band  uint8  // tierCold once the value is shed to a cold chunk, else 0
 	vlen  uint32 // value byte length
 }
 
@@ -59,6 +60,12 @@ type ftable struct {
 	// OBJECT ENCODING with or without a TTL, matching Redis; only the inline band
 	// grows the listpackex sticky variant.
 	exp []uint64
+
+	// cold is the table's cold-tier state, nil until the first demote sheds a value
+	// to the cold region (cold.go). While it is nil every read serves from the slab
+	// and the path is byte-identical to a store with no cold tier (L9); once set, a
+	// record tagged tierCold reads its value through a chunk pread.
+	cold *coldChunks
 }
 
 // newFtable builds an empty table sized for hint fields, so the inline-to-native
@@ -111,17 +118,39 @@ func (f *ftable) residentBytes() uint64 {
 	n += uint64(cap(f.free)) * 4
 	n += uint64(cap(f.exp)) * 8
 	n += uint64(f.tbl.Bytes())
+	if f.cold != nil {
+		// A demote sheds value bytes from the slab (dropping cap(slab) after the
+		// repack) and leaves the cold directory and offset table as the only resident
+		// cost of the shed values, so fold them in for the demote loop's honest total.
+		n += f.cold.residentBytes()
+	}
 	return n
 }
 
 // get returns the value bytes of field and whether it is present. The slice
-// aliases the slab and is valid only until the next mutation.
+// aliases the slab (or, for a demoted field, the shared pread scratch) and is valid
+// only until the next mutation or cold read. The probe itself is zero preads: the
+// field bytes stay resident through a demote, so a hit resolves the ordinal on the
+// same table walk a fully-resident hash takes, and only the value read below preads
+// when the field is cold.
 func (f *ftable) get(field []byte) ([]byte, bool) {
 	ord, ok := f.tbl.Find(store.Hash(field), field, f)
 	if !ok {
 		return nil, false
 	}
+	return f.valueOf(ord)
+}
+
+// valueOf returns the value bytes of the record at ord, preading the owning cold
+// chunk when the value has been shed to the cold region and serving from the slab
+// otherwise. The slice aliases either the live slab or the shared pread scratch and
+// is valid only until the next mutation or cold read. It reports false only when a
+// cold pread tears or the locator is out of range, which a caller treats as a miss.
+func (f *ftable) valueOf(ord uint32) ([]byte, bool) {
 	e := &f.ents[ord]
+	if e.band&tierCold != 0 {
+		return f.cold.value(e.voff)
+	}
 	return f.slab[e.voff : e.voff+e.vlen], true
 }
 
@@ -264,8 +293,11 @@ func (f *ftable) removeOrd(ord uint32) {
 // HRANDFIELD index step. Both slices alias the slab and are valid until the next
 // mutation. The caller guarantees idx is in [0, card).
 func (f *ftable) at(idx int) (field, value []byte) {
-	e := &f.ents[f.vec[idx]]
-	return f.slab[e.foff : e.foff+uint32(e.flen)], f.slab[e.voff : e.voff+e.vlen]
+	ord := f.vec[idx]
+	e := &f.ents[ord]
+	field = f.slab[e.foff : e.foff+uint32(e.flen)]
+	value, _ = f.valueOf(ord)
+	return field, value
 }
 
 // scanPage is the hashtable band's downward HSCAN cursor, the field-table twin of
@@ -292,10 +324,12 @@ func (f *ftable) scanPage(cursor uint64, count int, match []byte, emit func(fiel
 		lo = b - uint64(count)
 	}
 	for i := b; i > lo; i-- {
-		e := &f.ents[f.vec[i-1]]
+		ord := f.vec[i-1]
+		e := &f.ents[ord]
 		field := f.slab[e.foff : e.foff+uint32(e.flen)]
 		if match == nil || globMatch(match, field) {
-			emit(field, f.slab[e.voff:e.voff+e.vlen])
+			value, _ := f.valueOf(ord)
+			emit(field, value)
 		}
 	}
 	return lo
@@ -307,7 +341,7 @@ func (f *ftable) each(fn func(field, value []byte)) {
 	for _, ord := range f.vec {
 		e := &f.ents[ord]
 		field := f.slab[e.foff : e.foff+uint32(e.flen)]
-		value := f.slab[e.voff : e.voff+e.vlen]
+		value, _ := f.valueOf(ord)
 		fn(field, value)
 	}
 }
@@ -331,8 +365,8 @@ func (f *ftable) fieldByOrd(ord uint32) []byte {
 }
 
 func (f *ftable) valueByOrd(ord uint32) []byte {
-	e := &f.ents[ord]
-	return f.slab[e.voff : e.voff+e.vlen]
+	v, _ := f.valueOf(ord)
+	return v
 }
 
 // flenByOrd and vlenByOrd are the field and value lengths alone, for presizing a
