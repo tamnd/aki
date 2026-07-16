@@ -270,10 +270,20 @@ func (s *stream) appendNative(id streamID, fields []field) {
 // directory (O(log C), section 6.5); the inline band has the one block. A block
 // whose span does not cover id holds nothing to delete.
 func (s *stream) delete(id streamID) bool {
-	b := s.blockFor(id)
-	if b == nil || !b.covers(id) {
+	i := s.blockIndexFor(id)
+	if i < 0 {
 		return false
 	}
+	b := s.blocks[i]
+	if !b.covers(id) {
+		return false
+	}
+	// A tombstone rewrites the block's flag byte in place, so a demoted block must come
+	// resident first (section 7.3): an XDEL reaching back into cold history brings the
+	// whole block up, and it stays resident until a later demote finds it front-cold
+	// again. A resident block is untouched, so the common XDEL near the tail preads
+	// nothing.
+	s.promoteIfCold(i)
 	if b.tombstone(id) {
 		s.length--
 		if id.cmp(s.maxDeletedID) > 0 {
@@ -294,4 +304,17 @@ func (s *stream) blockFor(id streamID) *block {
 		return s.blocks[s.floorBlock(id)]
 	}
 	return s.blocks[0]
+}
+
+// blockIndexFor is blockFor by log index, returning -1 for an empty stream: the write
+// paths that must promote a demoted block before they mutate it in place need the
+// index promoteIfCold takes, not just the handle.
+func (s *stream) blockIndexFor(id streamID) int {
+	if len(s.blocks) == 0 {
+		return -1
+	}
+	if s.dir != nil {
+		return s.floorBlock(id)
+	}
+	return 0
 }

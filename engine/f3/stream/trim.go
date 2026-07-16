@@ -152,6 +152,11 @@ func (s *stream) trimNative(sp trimSpec) int {
 		for i := 0; i < dropCount; i++ {
 			db := s.blocks[i]
 			s.dir.Delete(db.first.ms, seqKey(db.first), s)
+			// A demoted front block drops by handle with no pread: forget its demote
+			// descriptor (a no-op when resident), leaving the cold frame an orphan the
+			// compactor reclaims. resBlob already lost its bytes at demote, so the
+			// subtraction below is zero for a cold block and its length otherwise.
+			s.forgetCold(db)
 			s.resBlob -= uint64(len(db.blob))
 		}
 		// A fresh slice so the abandoned front slots do not pin their blocks or
@@ -172,14 +177,24 @@ func (s *stream) trimNative(sp trimSpec) int {
 		case trimMaxlen:
 			if s.length > sp.maxlen {
 				over := int(s.length - sp.maxlen)
+				// tombstoneWhile rewrites flag bytes in place; bring a demoted boundary block
+				// resident first (section 7.3), the same bring-up XDEL does. promote keeps the
+				// same handle, so b now walks its own resident blob.
+				s.promoteIfCold(0)
 				t := b.tombstoneWhile(over, func(streamID) bool { return true })
 				s.length -= uint64(t)
 				removed += t
 			}
 		case trimMinid:
-			t := b.tombstoneWhile(maxInt, sp.below)
-			s.length -= uint64(t)
-			removed += t
+			// Only the front block can hold entries below the threshold. When its firstID is
+			// already at or above it nothing tombstones, so skip the walk (and the pread a
+			// cold boundary block would cost); otherwise bring it resident and tombstone.
+			if b.first.cmp(sp.minid) < 0 {
+				s.promoteIfCold(0)
+				t := b.tombstoneWhile(maxInt, sp.below)
+				s.length -= uint64(t)
+				removed += t
+			}
 		}
 	}
 	return removed
