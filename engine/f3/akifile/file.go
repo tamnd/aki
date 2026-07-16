@@ -30,6 +30,37 @@ func (d osDevice) Size() (int64, error) {
 	return fi.Size(), nil
 }
 
+// roDevice adapts an *os.File opened read-only to Device: ReadAt, Size, and Close
+// work, while the mutating methods return ErrReadOnly. An inspect tool reads the
+// file but must never change it, so a write through this device is a bug caught
+// here rather than a silent modification of a live or damaged file.
+type roDevice struct{ *os.File }
+
+func (roDevice) WriteAt([]byte, int64) (int, error) { return 0, ErrReadOnly }
+func (roDevice) Sync() error                        { return ErrReadOnly }
+func (roDevice) Truncate(int64) error               { return ErrReadOnly }
+
+func (d roDevice) Size() (int64, error) {
+	fi, err := d.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+// InspectPath opens the .aki file at path read-only and assembles a Report. It is
+// the entry point the file-info and verify tools call: the file is opened for
+// reading only, so a tool can run against a live or damaged file without any risk
+// of changing a byte.
+func InspectPath(path string) (*Report, error) {
+	fh, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fh.Close() }()
+	return Inspect(roDevice{fh})
+}
+
 // SyncPolicy controls when the writer forces a group of segments to stable media
 // after it lays them down (spec 2064/f3/07 section 8, appendfsync).
 type SyncPolicy uint8

@@ -99,6 +99,9 @@ var (
 	// ErrShardCount is a live root whose SRT shard count disagrees with the
 	// prefix: a torn SRT swap or a file opened under the wrong shard geometry.
 	ErrShardCount = errors.New("akifile: shard count disagreement")
+	// ErrReadOnly is a write through a read-only device: an inspect tool opens the
+	// file for reading only, so any attempt to mutate it is a bug, not I/O.
+	ErrReadOnly = errors.New("akifile: read-only device")
 )
 
 var (
