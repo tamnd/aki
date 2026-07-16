@@ -78,6 +78,46 @@ type stream struct {
 	// maintainer, both on the owner goroutine, and keeps the stream in the registry
 	// dirty list at most once between passes.
 	gcDirty bool
+
+	// resBlob is the running sum of len(blob) over the stream's resident blocks, the
+	// dominant term of residentBytes and the figure a demote later drops as it spills
+	// a whole block cold (spec 2064/f3/06 section 6). It is kept incrementally at the
+	// few sites that grow, drop, or replace a block's blob (append, trim, gc), so
+	// residentBytes stays O(1) per command rather than a walk of every block. A
+	// tombstone flips a flag in place and leaves the blob length unchanged, so it does
+	// not move this figure until gc reclaims the block.
+	resBlob uint64
+	// acct is the stream's footprint as last posted to the registry running sum, so
+	// note can post only the delta since the last mutation and the total stays the
+	// exact sum without rewalking the registry. It is meaningful only when the store
+	// runs a cold tier; a store with no cold region never accounts and leaves it zero.
+	acct uint64
+}
+
+// blockHeaderBytes is the resident overhead charged per block beyond its entry
+// blob: the block struct (the blob and names slice headers, the two IDs, and the
+// live and deleted counts) plus the *block pointer the blocks slice holds for it.
+// A rough fixed cell, dwarfed by a full block's ~4 KiB blob, so it need not track
+// the names slab exactly; it keeps the estimate from reading zero for a stream of
+// many tiny blocks.
+const blockHeaderBytes = 96
+
+// residentBytes estimates the stream's resident-byte footprint, the figure the
+// registry sums to weigh the shard's stream heap against the resident cap (spec
+// 2064/f3/06 section 6): the entry bytes across resident blocks (resBlob), a fixed
+// cell per block for the block structs, the native directory tree, and each
+// consumer group's pending-entries ledger. Zero preads, O(groups). Owner goroutine
+// only.
+func (s *stream) residentBytes() uint64 {
+	n := s.resBlob
+	n += uint64(len(s.blocks)) * blockHeaderBytes
+	if s.dir != nil {
+		n += uint64(s.dir.Bytes())
+	}
+	for _, grp := range s.groups {
+		n += grp.residentBytes()
+	}
+	return n
 }
 
 // Member resolves a directory reference (a block index) to its block firstID's
@@ -165,7 +205,9 @@ func (s *stream) appendInline(id streamID, fields []field) {
 		s.appendNative(id, fields)
 		return
 	}
+	n0 := len(b.blob)
 	b.appendEntry(id, fields)
+	s.resBlob += uint64(len(b.blob) - n0)
 }
 
 // upgrade flips the stream to the native band (section 4.3). The inline block is
@@ -198,12 +240,17 @@ func (s *stream) ensureNative() {
 // masters a new block. A single fat entry masters its own block regardless of
 // size (the master always lands), which is the section 3.7 solo-block path.
 func (s *stream) appendNative(id streamID, fields []field) {
-	if b := s.tail(); b != nil && b.appendEntry(id, fields) {
-		return
+	if b := s.tail(); b != nil {
+		n0 := len(b.blob)
+		if b.appendEntry(id, fields) {
+			s.resBlob += uint64(len(b.blob) - n0)
+			return
+		}
 	}
 	nb := newBlock()
 	nb.appendEntry(id, fields)
 	s.blocks = append(s.blocks, nb)
+	s.resBlob += uint64(len(nb.blob))
 	s.dirInsert(len(s.blocks) - 1)
 }
 

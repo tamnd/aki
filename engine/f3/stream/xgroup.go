@@ -96,6 +96,9 @@ func xgroupCreate(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if created {
 		g.m[string(key)] = s
 	}
+	// A new group upgrades an inline stream to native and adds the group cell, so the
+	// footprint moves; reconcile it into the running sum at the boundary.
+	g.note(s)
 	r.Status("OK")
 }
 
@@ -132,7 +135,8 @@ func xgroupSetID(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // existed. The key must exist.
 func xgroupDestroy(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	key, name := args[1], args[2]
-	s, wrong := registry(cx).lookup(cx, key)
+	g := registry(cx)
+	s, wrong := g.lookup(cx, key)
 	if wrong {
 		r.Err(wrongType)
 		return
@@ -146,6 +150,9 @@ func xgroupDestroy(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	delete(s.groups, string(name))
+	// Dropping the group frees its consumer cells and pending ledger, so the
+	// footprint falls; reconcile the drop into the running sum.
+	g.note(s)
 	r.Int(1)
 }
 
@@ -154,11 +161,13 @@ func xgroupDestroy(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // existed. The key and group must exist.
 func xgroupCreateConsumer(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	key, name, con := args[1], args[2], args[3]
-	_, grp, ok := resolveGroup(cx, registry(cx), key, name, r)
+	g := registry(cx)
+	s, grp, ok := resolveGroup(cx, g, key, name, r)
 	if !ok {
 		return
 	}
 	if grp.createConsumer(con, cx.NowMs) {
+		g.note(s)
 		r.Int(1)
 		return
 	}
@@ -170,11 +179,16 @@ func xgroupCreateConsumer(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // must exist; a missing consumer removes nothing and replies 0.
 func xgroupDelConsumer(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	key, name, con := args[1], args[2], args[3]
-	_, grp, ok := resolveGroup(cx, registry(cx), key, name, r)
+	g := registry(cx)
+	s, grp, ok := resolveGroup(cx, g, key, name, r)
 	if !ok {
 		return
 	}
-	r.Int(grp.delConsumer(con))
+	n := grp.delConsumer(con)
+	// A consumer removal frees its cell and reassigns its pending entries; reconcile
+	// the footprint change into the running sum.
+	g.note(s)
+	r.Int(n)
 }
 
 // resolveGroup looks up the stream and its named group for a subcommand that

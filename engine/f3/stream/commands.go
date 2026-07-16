@@ -94,6 +94,10 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		serveWaiters(cx, g, args[0])
 	}
 
+	// Reconcile the stream's footprint into the registry running sum: the append
+	// grew a block (and a trim may have dropped some), so the resident total moves
+	// here at the command boundary the shard reads it. A no-op when accounting is off.
+	g.note(s)
 	cx.Val = formatID(cx.Val[:0], id)
 	r.Bulk(cx.Val)
 }
@@ -129,6 +133,7 @@ func Xtrim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if removed > 0 && !sp.approx && s.kind == bandNative {
 		g.markDirty(s)
 	}
+	g.note(s)
 	r.Int(int64(removed))
 }
 
@@ -194,6 +199,10 @@ func Xdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if n > 0 && s.kind == bandNative {
 		g.markDirty(s)
 	}
+	// A tombstone leaves the blob length unchanged, so the footprint holds until the
+	// gc pass reclaims the block; note keeps the running total exact at the boundary
+	// regardless, and picks up any auxiliary change the command made.
+	g.note(s)
 	r.Int(n)
 }
 

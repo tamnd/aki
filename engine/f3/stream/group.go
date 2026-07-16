@@ -59,6 +59,32 @@ type streamConsumer struct {
 	activeTime int64
 }
 
+// pelEntryBytes is the resident cost of one pending-entries slab, the 32-byte
+// record the PEL tree references by ordinal (pel.go). consumerBytes is a fixed cell
+// per consumer for its record and the two index slots (the map entry and the
+// consumerByOrd pointer), a rough figure dwarfed by the pending slabs a busy
+// consumer accrues.
+const (
+	pelEntryBytes = 32
+	consumerBytes = 80
+)
+
+// residentBytes is the group's resident-byte footprint, the stream-side auxiliary
+// heap the consumer-group machinery holds beyond the entry blocks: the consumer
+// records and, once the group has delivered, the pending-entries list (its slab
+// arena, the freed-ordinal list, and the id-ordered tree). A group that only reads
+// with `>` and never leaves an entry pending carries no PEL, so it costs only its
+// consumer cells here. Zero preads, O(1).
+func (grp *streamGroup) residentBytes() uint64 {
+	n := uint64(len(grp.consumerByOrd)) * consumerBytes
+	if grp.pel != nil {
+		n += uint64(cap(grp.pel.slabs)) * pelEntryBytes
+		n += uint64(cap(grp.pel.free)) * 4
+		n += uint64(grp.pel.tree.Bytes())
+	}
+	return n
+}
+
 // newGroup builds a group at the given start cursor. entriesRead and valid come
 // from groupStartID (or an explicit ENTRIESREAD override), and the consumer table
 // starts empty.

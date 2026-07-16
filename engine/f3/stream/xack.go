@@ -18,7 +18,8 @@ import (
 func Xack(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	key, name, ids := args[0], args[1], args[2:]
 
-	s, wrong := registry(cx).lookup(cx, key)
+	g := registry(cx)
+	s, wrong := g.lookup(cx, key)
 	if wrong {
 		r.Err(wrongType)
 		return
@@ -47,6 +48,9 @@ func Xack(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			acked++
 		}
 	}
+	// Retiring pending entries shrinks the group's ledger tree; reconcile the
+	// footprint into the running sum at the boundary.
+	g.note(s)
 	r.Int(acked)
 }
 

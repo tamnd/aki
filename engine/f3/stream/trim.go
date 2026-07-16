@@ -152,6 +152,7 @@ func (s *stream) trimNative(sp trimSpec) int {
 		for i := 0; i < dropCount; i++ {
 			db := s.blocks[i]
 			s.dir.Delete(db.first.ms, seqKey(db.first), s)
+			s.resBlob -= uint64(len(db.blob))
 		}
 		// A fresh slice so the abandoned front slots do not pin their blocks or
 		// leak the backing array's head capacity across repeated trims.
@@ -227,6 +228,10 @@ func (s *stream) trimInline(sp trimSpec) int {
 	for _, e := range live[drop:] {
 		nb.appendEntry(e.id, e.fields)
 	}
+	// The rebuilt block replaces the old one: add its bytes before subtracting the
+	// old's so the unsigned running total never dips below zero mid-swap.
+	s.resBlob += uint64(len(nb.blob))
+	s.resBlob -= uint64(len(s.blocks[0].blob))
 	s.blocks[0] = nb
 	s.length -= uint64(drop)
 	return drop

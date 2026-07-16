@@ -29,7 +29,8 @@ const idsMax = int64(1<<31 - 1)
 func Xnack(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	key, name := args[0], args[1]
 
-	s, wrong := registry(cx).lookup(cx, key)
+	g := registry(cx)
+	s, wrong := g.lookup(cx, key)
 	if wrong {
 		r.Err(wrongType)
 		return
@@ -70,6 +71,9 @@ func Xnack(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			nacked++
 		}
 	}
+	// A FORCE nack can add a pending slab for a not-yet-pending entry; reconcile the
+	// footprint into the running sum.
+	g.note(s)
 	r.Int(nacked)
 }
 
