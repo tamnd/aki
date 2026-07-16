@@ -65,6 +65,7 @@ func hashSegKeyLess(af uint64, afield []byte, bf uint64, bfield []byte) bool {
 type hashSeg struct {
 	n        int
 	minExpMs int64
+	valless  bool
 	entries  []byte
 }
 
@@ -84,7 +85,7 @@ func putHashSegHdr(b []byte, n int, minExpMs int64) {
 // because a segment legitimately exceeds seg_max between the write
 // that grew it and the split, and forever if an fh-collision run
 // refuses the split.
-func decodeHashSeg(p []byte) (hashSeg, error) {
+func decodeHashSeg(p []byte, valless bool) (hashSeg, error) {
 	if len(p) < hashSegHdrLen {
 		return hashSeg{}, fmt.Errorf("sqlo1: hash segment of %d bytes, header needs %d", len(p), hashSegHdrLen)
 	}
@@ -94,9 +95,10 @@ func decodeHashSeg(p []byte) (hashSeg, error) {
 	s := hashSeg{
 		n:        int(binary.LittleEndian.Uint16(p)),
 		minExpMs: int64(binary.LittleEndian.Uint64(p[4:])),
+		valless:  valless,
 		entries:  p[hashSegHdrLen:],
 	}
-	it := hashEntryIter{p: s.entries}
+	it := hashEntryIter{p: s.entries, valless: valless}
 	seen := 0
 	minExp := int64(0)
 	var prevFH uint64
@@ -131,7 +133,7 @@ func decodeHashSeg(p []byte) (hashSeg, error) {
 // hashSegGet finds one field in a decoded segment, early-exiting on
 // the sort order. Returned bytes alias the region.
 func hashSegGet(s hashSeg, fh uint64, field []byte) (val []byte, expMs int64, ok bool, err error) {
-	it := hashEntryIter{p: s.entries}
+	it := hashEntryIter{p: s.entries, valless: s.valless}
 	for {
 		f, v, eExp, ok, err := it.next()
 		if err != nil || !ok {
@@ -156,7 +158,7 @@ func hashSegGet(s hashSeg, fh uint64, field []byte) (val []byte, expMs int64, ok
 // is the caller passing 0.
 func hashSegSet(dst []byte, s hashSeg, fh uint64, field, val []byte, expMs, nowMs int64) (out []byte, created, revived bool, err error) {
 	out = grow(dst, hashSegHdrLen)
-	it := hashEntryIter{p: s.entries}
+	it := hashEntryIter{p: s.entries, valless: s.valless}
 	created = true
 	placed := false
 	minExp := expMs
@@ -172,14 +174,14 @@ func hashSegSet(dst []byte, s hashSeg, fh uint64, field, val []byte, expMs, nowM
 		efh := hashFH(f)
 		if !placed {
 			if efh == fh && bytes.Equal(f, field) {
-				out = appendHashEntry(out, field, val, expMs)
+				out = appendHashEntry(out, field, val, expMs, s.valless)
 				placed = true
 				created = false
 				revived = eExp != 0 && eExp <= nowMs
 				continue
 			}
 			if hashSegKeyLess(fh, field, efh, f) {
-				out = appendHashEntry(out, field, val, expMs)
+				out = appendHashEntry(out, field, val, expMs, s.valless)
 				placed = true
 			}
 		}
@@ -189,7 +191,7 @@ func hashSegSet(dst []byte, s hashSeg, fh uint64, field, val []byte, expMs, nowM
 		}
 	}
 	if !placed {
-		out = appendHashEntry(out, field, val, expMs)
+		out = appendHashEntry(out, field, val, expMs, s.valless)
 	}
 	n := s.n
 	if created {
@@ -209,7 +211,7 @@ func hashSegSet(dst []byte, s hashSeg, fh uint64, field, val []byte, expMs, nowM
 // neighbor.
 func hashSegDel(dst []byte, s hashSeg, fh uint64, field []byte, nowMs int64) (out []byte, removed bool, err error) {
 	out = grow(dst, hashSegHdrLen)
-	it := hashEntryIter{p: s.entries}
+	it := hashEntryIter{p: s.entries, valless: s.valless}
 	minExp := int64(0)
 	for {
 		before := it.p
@@ -247,9 +249,9 @@ type hashSegEntry struct {
 }
 
 // parseHashSegEntries parses a raw entry region into dst[:0].
-func parseHashSegEntries(dst []hashSegEntry, region []byte) ([]hashSegEntry, error) {
+func parseHashSegEntries(dst []hashSegEntry, region []byte, valless bool) ([]hashSegEntry, error) {
 	dst = dst[:0]
-	it := hashEntryIter{p: region}
+	it := hashEntryIter{p: region, valless: valless}
 	for {
 		f, v, expMs, ok, err := it.next()
 		if err != nil {
@@ -278,11 +280,11 @@ func sortHashSegEntries(entries []hashSegEntry) {
 
 // appendHashSegPayload encodes sorted entries as a full segment
 // payload onto dst[:0], computing the header from the entries.
-func appendHashSegPayload(dst []byte, entries []hashSegEntry) []byte {
+func appendHashSegPayload(dst []byte, entries []hashSegEntry, valless bool) []byte {
 	out := grow(dst, hashSegHdrLen)
 	minExp := int64(0)
 	for _, e := range entries {
-		out = appendHashEntry(out, e.field, e.val, e.expMs)
+		out = appendHashEntry(out, e.field, e.val, e.expMs, valless)
 		if e.expMs != 0 && (minExp == 0 || e.expMs < minExp) {
 			minExp = e.expMs
 		}
@@ -323,19 +325,19 @@ func shouldMergeHashSegs(loPayloadLen, hiPayloadLen int) bool {
 // owns the lower fh range, hip the upper; the regions concatenate
 // without re-encoding because every lop key orders below every hip
 // key, which the boundary check enforces before any bytes move.
-func mergeHashSegs(dst, lop, hip []byte) ([]byte, error) {
-	los, err := decodeHashSeg(lop)
+func mergeHashSegs(dst, lop, hip []byte, valless bool) ([]byte, error) {
+	los, err := decodeHashSeg(lop, valless)
 	if err != nil {
 		return nil, err
 	}
-	his, err := decodeHashSeg(hip)
+	his, err := decodeHashSeg(hip, valless)
 	if err != nil {
 		return nil, err
 	}
 	if los.n > 0 && his.n > 0 {
 		var lastFH uint64
 		var lastField []byte
-		it := hashEntryIter{p: los.entries}
+		it := hashEntryIter{p: los.entries, valless: valless}
 		for {
 			f, _, _, ok, err := it.next()
 			if err != nil {
@@ -346,7 +348,7 @@ func mergeHashSegs(dst, lop, hip []byte) ([]byte, error) {
 			}
 			lastFH, lastField = hashFH(f), f
 		}
-		it = hashEntryIter{p: his.entries}
+		it = hashEntryIter{p: his.entries, valless: valless}
 		first, _, _, _, err := it.next()
 		if err != nil {
 			return nil, err

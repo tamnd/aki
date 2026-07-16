@@ -122,6 +122,7 @@ func hashPageWeight(ents []hashFenceEnt) uint16 {
 // Paged mode: pidx holds the page index, and fence holds the one
 // loaded page's entries (pi is its index, -1 until loadPage runs).
 type hashSegRoot struct {
+	sub       uint8
 	rootgen   uint32
 	rooth     uint64
 	count     uint64
@@ -138,7 +139,7 @@ type hashSegRoot struct {
 // records the caller lands separately.
 func appendHashSegRoot(dst []byte, r *hashSegRoot) []byte {
 	out := grow(dst, hashSegRootHdrLen)
-	out[0] = hashSubSeg
+	out[0] = r.sub
 	out[1] = 0
 	if r.minExpMs != 0 {
 		out[1] = hflagAnyTTL
@@ -182,8 +183,8 @@ func decodeHashSegRoot(p []byte, fence []hashFenceEnt, pidx []hashPageEnt) (hash
 	if len(p) < hashSegRootHdrLen {
 		return hashSegRoot{}, fmt.Errorf("sqlo1: segmented hash root of %d bytes, header needs %d", len(p), hashSegRootHdrLen)
 	}
-	if p[0] != hashSubSeg {
-		return hashSegRoot{}, fmt.Errorf("sqlo1: root sub %d is not a segmented hash", p[0])
+	if p[0] != hashSubSeg && p[0] != setSubSeg {
+		return hashSegRoot{}, fmt.Errorf("sqlo1: root sub %d is not a segmented hash or set", p[0])
 	}
 	if p[1]&^uint8(hflagAnyTTL|hflagFencePaged) != 0 {
 		return hashSegRoot{}, fmt.Errorf("sqlo1: segmented hash flags %#x has reserved bits set", p[1])
@@ -192,6 +193,7 @@ func decodeHashSegRoot(p []byte, fence []hashFenceEnt, pidx []hashPageEnt) (hash
 		return hashSegRoot{}, fmt.Errorf("sqlo1: segmented hash root reserved bytes are set")
 	}
 	r := hashSegRoot{
+		sub:       p[0],
 		rootgen:   binary.LittleEndian.Uint32(p[4:]),
 		rooth:     binary.LittleEndian.Uint64(p[8:]),
 		count:     binary.LittleEndian.Uint64(p[16:]),

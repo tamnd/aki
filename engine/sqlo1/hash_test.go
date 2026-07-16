@@ -84,7 +84,7 @@ func (r *hashRig) fields(key string) []string {
 	if err != nil || !ok || !root {
 		r.t.Fatalf("Lookup(%q): ok=%v root=%v err=%v", key, ok, root, err)
 	}
-	hi, err := decodeHashInline(v)
+	hi, err := decodeHashInline(v, hashSubInline, false)
 	if err != nil {
 		r.t.Fatalf("decode inline payload of %q: %v", key, err)
 	}
@@ -104,10 +104,10 @@ func (r *hashRig) fields(key string) []string {
 
 func TestHashEntryCodec(t *testing.T) {
 	var region []byte
-	region = appendHashEntry(region, []byte("plain"), []byte("value"), 0)
-	region = appendHashEntry(region, []byte(""), []byte("empty-field"), 0)
-	region = appendHashEntry(region, []byte("ttl"), []byte("v"), 12345)
-	region = appendHashEntry(region, []byte("big"), bytes.Repeat([]byte{0xAB}, 300), 0)
+	region = appendHashEntry(region, []byte("plain"), []byte("value"), 0, false)
+	region = appendHashEntry(region, []byte(""), []byte("empty-field"), 0, false)
+	region = appendHashEntry(region, []byte("ttl"), []byte("v"), 12345, false)
+	region = appendHashEntry(region, []byte("big"), bytes.Repeat([]byte{0xAB}, 300), 0, false)
 
 	type want struct {
 		f, v  string
@@ -148,10 +148,10 @@ func TestHashEntryCodec(t *testing.T) {
 }
 
 func TestHashInlineRootCodec(t *testing.T) {
-	p := appendHashInlineHdr(nil, 2, 500)
-	p = appendHashEntry(p, []byte("a"), []byte("1"), 0)
-	p = appendHashEntry(p, []byte("b"), []byte("2"), 500)
-	hi, err := decodeHashInline(p)
+	p := appendHashInlineHdr(nil, hashSubInline, 2, 500, false)
+	p = appendHashEntry(p, []byte("a"), []byte("1"), 0, false)
+	p = appendHashEntry(p, []byte("b"), []byte("2"), 500, false)
+	hi, err := decodeHashInline(p, hashSubInline, false)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -159,33 +159,33 @@ func TestHashInlineRootCodec(t *testing.T) {
 		t.Fatalf("decoded count=%d minExp=%d, want 2, 500", hi.count, hi.minExpMs)
 	}
 
-	entry := func(f, v string, exp int64) []byte { return appendHashEntry(nil, []byte(f), []byte(v), exp) }
-	oversize := appendHashInlineHdr(nil, 1, 0)
-	oversize = appendHashEntry(oversize, []byte("f"), bytes.Repeat([]byte{'x'}, hashInlineMax), 0)
+	entry := func(f, v string, exp int64) []byte { return appendHashEntry(nil, []byte(f), []byte(v), exp, false) }
+	oversize := appendHashInlineHdr(nil, hashSubInline, 1, 0, false)
+	oversize = appendHashEntry(oversize, []byte("f"), bytes.Repeat([]byte{'x'}, hashInlineMax), 0, false)
 	corrupt := map[string][]byte{
 		"short payload": {hashSubInline, 0, 1},
 		"wrong sub": func() []byte {
-			b := appendHashInlineHdr(nil, 1, 0)
+			b := appendHashInlineHdr(nil, hashSubInline, 1, 0, false)
 			b[0] = ropeSub
 			return append(b, entry("a", "1", 0)...)
 		}(),
 		"reserved hflags": func() []byte {
-			b := appendHashInlineHdr(nil, 1, 0)
+			b := appendHashInlineHdr(nil, hashSubInline, 1, 0, false)
 			b[1] = 0x04
 			return append(b, entry("a", "1", 0)...)
 		}(),
-		"count mismatch": append(appendHashInlineHdr(nil, 3, 0), entry("a", "1", 0)...),
-		"zero count":     appendHashInlineHdr(nil, 0, 0),
+		"count mismatch": append(appendHashInlineHdr(nil, hashSubInline, 3, 0, false), entry("a", "1", 0)...),
+		"zero count":     appendHashInlineHdr(nil, hashSubInline, 0, 0, false),
 		"ttl flag disagree": func() []byte {
-			b := appendHashInlineHdr(nil, 1, 0)
+			b := appendHashInlineHdr(nil, hashSubInline, 1, 0, false)
 			b[1] = hflagAnyTTL
 			return append(b, entry("a", "1", 0)...)
 		}(),
-		"min_expire wrong": append(appendHashInlineHdr(nil, 1, 999), entry("a", "1", 500)...),
+		"min_expire wrong": append(appendHashInlineHdr(nil, hashSubInline, 1, 999, false), entry("a", "1", 500)...),
 		"oversize payload": oversize,
 	}
 	for name, p := range corrupt {
-		if _, err := decodeHashInline(p); err == nil {
+		if _, err := decodeHashInline(p, hashSubInline, false); err == nil {
 			t.Errorf("%s: corrupt inline root decoded cleanly", name)
 		}
 	}
