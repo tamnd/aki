@@ -34,4 +34,23 @@ Each cell runs 10s virtual warmup plus 120s measured; zero-latency unit tests pi
 
 ## Results
 
-Pending the scored run; this section lands in the results commit.
+Full sweep in strictlatency.csv, run 2026-07-17, 10s warm plus 120s measured virtual time per cell.
+
+| placement | load | flushes/s | acks/flush | ack p50/p90/p99 ms | request $/month |
+|-----------|------|-----------|------------|--------------------|-----------------|
+| standard | light | 10.0 | 1.0 | 99 / 236 / 476 | 247 |
+| standard | medium | 78.7 | 12.7 | 185 / 363 / 799 | 1190 |
+| standard | heavy | 77.7 | 257.4 | 178 / 342 / 614 | 1188 |
+| express | light | 10.0 | 1.0 | 13 / 23 / 38 | 59 |
+| express | medium | 200.0 | 5.0 | 20 / 32 / 49 | 922 |
+| express | heavy | 200.0 | 100.0 | 20 / 32 / 48 | 921 |
+
+## Verdict
+
+PRED-OBS1-O1B-STRICT: the milestone band scores HIT on Standard (p50 99ms inside 90 to 140) and misses Express by 2ms on the fast side (13ms against the band's 15 bottom); the mechanism refinement filed above half-hit, and the miss is the interesting part.
+The barrier floor wins as mechanism, exactly as called: light-load waits for the swap are near zero, heavy Express strict runs floor-bound at 200.0 flushes/s, and the zero-latency unit test pins the arithmetic; the flush-age/2 term never shows up.
+But the filed 75 to 85ms Standard band was sum-of-medians arithmetic, and the median of a SUM of two right-skewed PUT-class draws sits well above the sum of their medians: measured 99ms against 35 plus 35 plus floor.
+So doc 04 section 3.2's formula got the right number range on Standard through the wrong mechanism, and the correction when the strict slice bakes constants is to keep the 90 to 140 Standard row, restate it as floor plus PUT plus append with the skew premium named, and move Express to 13 to 20ms p50.
+Degradation-to-cadence is proven, not just claimed: heavy strict load rides 257 acks per flush on Standard and 100 on Express with latency roughly flat against medium load, so strict throughput follows the flusher, never per-op PUTs.
+Head-of-line blocking shows again under pipeline saturation (standard medium p99 799ms), the same seq-ordered-commit property the cadence lab flagged for the commit-records slice.
+One placement economics note for doc 09: at floor cadence Express serves 310 req/s for $921 a month while Standard serves 90 req/s for $1188, so barrier-heavy strict workloads are cheaper AND 8x faster on Express; it stays a latency product for storage, but for strict request traffic it is also the cost winner.

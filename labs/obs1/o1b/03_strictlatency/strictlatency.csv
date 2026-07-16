@@ -1,0 +1,7 @@
+placement,load,flushes_s,acks_per_flush,req_s,ack_p50_ms,ack_p90_ms,ack_p99_ms,parks,req_usd_month
+standard,light,10.0,1.0,18.8,99,236,476,0,247
+standard,medium,78.7,12.7,90.6,185,363,799,0,1190
+standard,heavy,77.7,257.4,90.4,178,342,614,0,1188
+express,light,10.0,1.0,20.0,13,23,38,0,59
+express,medium,200.0,5.0,310.5,20,32,49,0,922
+express,heavy,200.0,100.0,310.0,20,32,48,0,921
