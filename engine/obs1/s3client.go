@@ -54,10 +54,24 @@ type Client struct {
 	now            func() time.Time // test hook for deterministic signing
 }
 
-// ObjectInfo is what a read reveals about the object it hit.
+// ObjectInfo is what a read reveals about the object it hit. Tag is the
+// writer's self-recognition mark if the write carried one.
 type ObjectInfo struct {
 	ETag string
 	Size int64
+	Tag  WriteTag
+}
+
+// objectInfo lifts the common response fields.
+func objectInfo(resp *http.Response, size int64) ObjectInfo {
+	return ObjectInfo{
+		ETag: resp.Header.Get("ETag"),
+		Size: size,
+		Tag: WriteTag{
+			Writer: resp.Header.Get(writerHeader),
+			Batch:  resp.Header.Get(batchHeader),
+		},
+	}
 }
 
 // NewClient validates cfg and builds a Client.
@@ -123,34 +137,29 @@ func escapeKey(key string) string {
 func (c *Client) Get(ctx context.Context, key string) ([]byte, ObjectInfo, error) {
 	var body []byte
 	var info ObjectInfo
-	err := c.do(ctx, http.MethodGet, key, nil, func(resp *http.Response) error {
+	err := c.do(ctx, http.MethodGet, key, nil, nil, func(resp *http.Response) error {
 		b, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return &transportError{err} // a cut mid-body is retryable on a read
 		}
 		body = b
-		info = ObjectInfo{ETag: resp.Header.Get("ETag"), Size: int64(len(b))}
+		info = objectInfo(resp, int64(len(b)))
 		return nil
 	})
 	return body, info, err
 }
 
 // Put writes a whole object, unconditionally (last writer wins). The
-// conditional variants land in the next slice. An ambiguous outcome is
+// conditional variants live in condwrite.go. An ambiguous outcome is
 // returned as ErrAmbiguous, never retried blindly: the caller knows how to
 // re-read and self-recognize (doc 02 section 2.4).
 func (c *Client) Put(ctx context.Context, key string, body []byte) (ObjectInfo, error) {
-	var info ObjectInfo
-	err := c.do(ctx, http.MethodPut, key, body, func(resp *http.Response) error {
-		info = ObjectInfo{ETag: resp.Header.Get("ETag"), Size: int64(len(body))}
-		return nil
-	})
-	return info, err
+	return c.put(ctx, key, body, nil)
 }
 
 // Delete removes a key. Deleting a missing key succeeds, matching S3.
 func (c *Client) Delete(ctx context.Context, key string) error {
-	return c.do(ctx, http.MethodDelete, key, nil, func(*http.Response) error { return nil })
+	return c.do(ctx, http.MethodDelete, key, nil, nil, func(*http.Response) error { return nil })
 }
 
 // transportError marks an attempt that died on the wire, so the loop can
@@ -160,9 +169,10 @@ type transportError struct{ err error }
 func (e *transportError) Error() string { return e.err.Error() }
 func (e *transportError) Unwrap() error { return e.err }
 
-// do runs one operation through the retry loop. onOK consumes a 2xx
-// response while its body is still open.
-func (c *Client) do(ctx context.Context, method, key string, body []byte, onOK func(*http.Response) error) error {
+// do runs one operation through the retry loop. extra carries condition
+// and metadata headers; onOK consumes a 2xx response while its body is
+// still open.
+func (c *Client) do(ctx context.Context, method, key string, body []byte, extra map[string]string, onOK func(*http.Response) error) error {
 	// Only PUT outcomes are ambiguous on a cut wire: a replayed GET is a
 	// read and a replayed DELETE of a gone key still succeeds (S3 delete
 	// is idempotent), but a PUT that may have landed needs the caller's
@@ -176,7 +186,7 @@ func (c *Client) do(ctx context.Context, method, key string, body []byte, onOK f
 				return err
 			}
 		}
-		lastErr = c.attempt(ctx, method, key, body, onOK)
+		lastErr = c.attempt(ctx, method, key, body, extra, onOK)
 		switch {
 		case lastErr == nil:
 			return nil
@@ -197,7 +207,7 @@ func (c *Client) do(ctx context.Context, method, key string, body []byte, onOK f
 }
 
 // attempt is one signed HTTP exchange.
-func (c *Client) attempt(ctx context.Context, method, key string, body []byte, onOK func(*http.Response) error) error {
+func (c *Client) attempt(ctx context.Context, method, key string, body []byte, extra map[string]string, onOK func(*http.Response) error) error {
 	actx, cancel := context.WithTimeout(ctx, c.attemptTimeout)
 	defer cancel()
 
@@ -214,6 +224,9 @@ func (c *Client) attempt(ctx context.Context, method, key string, body []byte, o
 	}
 	if body != nil {
 		req.ContentLength = int64(len(body))
+	}
+	for k, v := range extra {
+		req.Header.Set(k, v)
 	}
 	signV4(req, c.creds, c.region, "s3", payloadHash, c.now())
 
