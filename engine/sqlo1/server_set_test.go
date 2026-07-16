@@ -146,7 +146,7 @@ func TestServerSetIteration(t *testing.T) {
 	send("SSCAN", "s", "0", "COUNT", "0")
 	expect(t, r, "-ERR syntax error\r\n")
 	send("SSCAN", "s", "0", "NOVALUES")
-	expect(t, r, "-ERR syntax error\r\n")
+	expect(t, r, "-ERR NOVALUES option can only be used in HSCAN\r\n")
 	send("SSCAN", "s")
 	expect(t, r, "-ERR wrong number of arguments for 'sscan' command\r\n")
 

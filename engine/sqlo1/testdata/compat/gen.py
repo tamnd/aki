@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate fixtures.txt: the T1 compat sections, every STRING,
-BITMAP, and HLL manifest row from spec doc 12 exercised against a real
-redis-server and recorded reply by reply. The Go test replays the file
-through the sqlo1 dispatch path, so each fixture line is one diffed
-manifest row: same args, same wire reply, error texts included.
+"""Generate fixtures.txt: the compat sections, every STRING, BITMAP,
+HLL, HASH, and SET manifest row from spec doc 12 exercised against a
+real redis-server and recorded reply by reply. The Go test replays the
+file through the sqlo1 dispatch path, so each fixture line is one
+diffed manifest row: same args, same wire reply, error texts included.
 
 Usage: start a throwaway server, then run this script.
 
@@ -507,6 +507,198 @@ def main():
     c("HGETEX", "hs:str", "FIELDS", "1", "f")
     c("HGETDEL", "hs:str", "FIELDS", "1", "f")
     c("GET", "hs:k")
+
+    # ---------------------------------------------------------------
+    section("SET")
+    # Sets are unordered, and the two sides genuinely emit different
+    # orders where the representations differ (redis walks its
+    # listpack or sorted intset, sqlo1 emits in fh order once
+    # segmented and in insertion order inline), so multi-member
+    # replies are pinned only where the orders provably agree:
+    # listpack-tier insertion order, intsets inserted ascending, and
+    # single-member results. Everything wider goes through the
+    # integer commands, the STORE variants, and SMISMEMBER probes.
+
+    # Point surface: create counts, dup handling, misses, arity.
+    c("SADD", "st:k", "a")
+    c("SADD", "st:k", "a", "b", "c")
+    c("SADD", "st:k", "b")
+    c("SCARD", "st:k")
+    c("SCARD", "st:missing")
+    c("SADD", "st:k")
+    c("SISMEMBER", "st:k", "a")
+    c("SISMEMBER", "st:k", "nope")
+    c("SISMEMBER", "st:missing", "a")
+    c("SMISMEMBER", "st:k", "a", "nope", "b")
+    c("SMISMEMBER", "st:missing", "a", "b")
+    c("SMISMEMBER", "st:k")
+    c("SREM", "st:k", "c", "nope")
+    c("SREM", "st:missing", "a")
+    c("SCARD", "st:k")
+    c("TYPE", "st:k")
+
+    # Removing the last member kills the key.
+    c("SADD", "st:d", "x")
+    c("SREM", "st:d", "x")
+    c("SCARD", "st:d")
+    c("TYPE", "st:d")
+
+    # The empty member is legal.
+    c("SADD", "st:e", "")
+    c("SISMEMBER", "st:e", "")
+    c("SREM", "st:e", "")
+
+    # SMEMBERS order on the listpack tier: insertion order, removals
+    # keep it, re-adds append. Both sides share the rule.
+    c("SADD", "st:it", "one", "two", "three")
+    c("SMEMBERS", "st:it")
+    c("SREM", "st:it", "two")
+    c("SMEMBERS", "st:it")
+    c("SADD", "st:it", "two")
+    c("SMEMBERS", "st:it")
+    c("SMEMBERS", "st:missing")
+    c("OBJECT", "ENCODING", "st:it")
+
+    # intset rows insert ascending so the orders agree: redis stores
+    # an intset numerically sorted while sqlo1 keeps insertion order
+    # (see the README). "011" is not canonical, so it breaks the
+    # intset the same way on both sides.
+    c("SADD", "st:int", "1", "2", "30")
+    c("OBJECT", "ENCODING", "st:int")
+    c("SMEMBERS", "st:int")
+    c("SADD", "st:int2", "7", "011")
+    c("OBJECT", "ENCODING", "st:int2")
+    c("SMEMBERS", "st:int2")
+
+    # The hashtable tier through the member-size wall, which both
+    # sides share in spirit: members over 64 B kick redis out of its
+    # listpack, and 30 of them blow sqlo1's 2 KiB inline byte cap.
+    # The count threshold is deliberately not asserted; sqlo1
+    # segments at 129 members while redis 8.8's defaults are 512 for
+    # both intsets and listpacks, a documented standing divergence.
+    big = ["SADD", "st:big"]
+    for i in range(30):
+        big.append(("m%03d" % i) + "x" * 97)
+    c(*big)
+    c("OBJECT", "ENCODING", "st:big")
+    c("SCARD", "st:big")
+    c("SISMEMBER", "st:big", "m010" + "x" * 97)
+
+    # SPOP and SRANDMEMBER, deterministic rows only: misses, count 0,
+    # and one-member sets where every draw is forced. Distribution
+    # lives in the spop lab.
+    c("SPOP", "st:missing")
+    c("SPOP", "st:missing", "3")
+    c("SRANDMEMBER", "st:missing")
+    c("SRANDMEMBER", "st:missing", "3")
+    c("SADD", "st:one", "solo")
+    c("SRANDMEMBER", "st:one")
+    c("SRANDMEMBER", "st:one", "5")
+    c("SRANDMEMBER", "st:one", "-3")
+    c("SRANDMEMBER", "st:one", "0")
+    c("SPOP", "st:one", "0")
+    c("SPOP", "st:one")
+    c("TYPE", "st:one")
+    c("SADD", "st:one2", "solo")
+    c("SPOP", "st:one2", "99")
+    c("TYPE", "st:one2")
+    c("SPOP", "st:k", "-1")
+    c("SPOP", "st:k", "x")
+    c("SRANDMEMBER", "st:k", "x")
+
+    # SMOVE doors: the move, the dup landing, misses, self-move, and
+    # the source dying with its last member.
+    c("SADD", "st:src", "m", "n")
+    c("SADD", "st:dst", "n")
+    c("SMOVE", "st:src", "st:dst", "m")
+    c("SISMEMBER", "st:src", "m")
+    c("SISMEMBER", "st:dst", "m")
+    c("SMOVE", "st:src", "st:dst", "n")
+    c("SCARD", "st:dst")
+    c("TYPE", "st:src")
+    c("SMOVE", "st:missing", "st:dst", "m")
+    c("SMOVE", "st:dst", "st:dst", "m")
+    c("SMOVE", "st:dst", "st:dst", "ghost")
+    c("SMOVE", "st:dst", "st:fresh", "m")
+    c("SMEMBERS", "st:fresh")
+
+    # Algebra: integer replies and single-member results pin byte for
+    # byte; wider results go through the STORE variants and
+    # membership probes.
+    c("SADD", "st:a1", "a", "b", "c")
+    c("SADD", "st:a2", "b", "c", "d")
+    c("SADD", "st:a3", "c", "d", "e")
+    c("SINTER", "st:a1", "st:a2", "st:a3")
+    c("SINTER", "st:a1", "st:missing")
+    c("SINTER", "st:missing", "st:a1")
+    c("SDIFF", "st:a1", "st:a2")
+    c("SDIFF", "st:missing", "st:a1")
+    c("SUNION", "st:missing", "st:missing2")
+    c("SINTER")
+    c("SUNION")
+    c("SDIFF")
+    c("SINTERCARD", "2", "st:a1", "st:a2")
+    c("SINTERCARD", "2", "st:a1", "st:a2", "LIMIT", "1")
+    c("SINTERCARD", "2", "st:a1", "st:a2", "LIMIT", "0")
+    c("SINTERCARD", "0", "st:a1")
+    c("SINTERCARD", "2", "st:a1", "st:a2", "LIMIT", "-1")
+    c("SINTERCARD", "2", "st:a1")
+
+    c("SINTERSTORE", "st:di", "st:a1", "st:a2")
+    c("SMISMEMBER", "st:di", "a", "b", "c", "d")
+    c("SUNIONSTORE", "st:du", "st:a1", "st:a3")
+    c("SCARD", "st:du")
+    c("SMISMEMBER", "st:du", "a", "b", "c", "d", "e", "f")
+    c("SDIFFSTORE", "st:dd", "st:a1", "st:a3")
+    c("SMISMEMBER", "st:dd", "a", "b", "c")
+    c("TYPE", "st:di")
+    c("OBJECT", "ENCODING", "st:di")
+
+    # An empty result deletes the destination; the SINTERSTORE absent
+    # short circuit reaches it before later keys.
+    c("SINTERSTORE", "st:di", "st:a1", "st:missing")
+    c("TYPE", "st:di")
+    c("SCARD", "st:di")
+
+    # A stored destination drops its TTL and overwrites any type.
+    c("SADD", "st:ttl", "x")
+    c("EXPIRE", "st:ttl", "600")
+    c("SUNIONSTORE", "st:ttl", "st:a1")
+    c("TTL", "st:ttl")
+    c("SET", "st:sdest", "v")
+    c("SUNIONSTORE", "st:sdest", "st:a1")
+    c("TYPE", "st:sdest")
+    c("SINTERSTORE", "st:x")
+    c("SUNIONSTORE", "st:x")
+    c("SDIFFSTORE", "st:x")
+
+    # SSCAN answers any cursor with everything on the small tiers;
+    # one-member sets keep the reply order-free.
+    c("SADD", "st:sc", "only")
+    c("SSCAN", "st:sc", "0")
+    c("SSCAN", "st:sc", "0", "MATCH", "z*")
+    c("SSCAN", "st:sc", "0", "MATCH", "on*")
+    c("SSCAN", "st:sc", "0", "COUNT", "100")
+    c("SSCAN", "st:sc", "42")
+    c("SSCAN", "st:missing", "0")
+    c("SSCAN", "st:sc", "0", "NOVALUES")
+
+    # Type walls both ways.
+    c("SET", "st:str", "v")
+    c("SADD", "st:str", "m")
+    c("SREM", "st:str", "m")
+    c("SCARD", "st:str")
+    c("SISMEMBER", "st:str", "m")
+    c("SMISMEMBER", "st:str", "m")
+    c("SMEMBERS", "st:str")
+    c("SPOP", "st:str")
+    c("SRANDMEMBER", "st:str")
+    c("SSCAN", "st:str", "0")
+    c("SMOVE", "st:str", "st:k", "m")
+    c("SMOVE", "st:k", "st:str", "a")
+    c("SINTER", "st:str", "st:k")
+    c("SINTERSTORE", "st:d2", "st:str", "st:k")
+    c("GET", "st:k")
 
     print("\n".join(lines))
 
