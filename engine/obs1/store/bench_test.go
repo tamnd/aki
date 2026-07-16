@@ -1,0 +1,154 @@
+package store
+
+import (
+	"encoding/binary"
+	"testing"
+)
+
+// The benchmarks measure the single-owner ceiling: the cost of a probe, a Get,
+// a Set, and a raw arena append with no wire, no RESP, no queue hop, and no
+// atomic anywhere. They mirror the f1 harness shapes (16-byte fixed keys,
+// 64-byte values, a 1M-key working set) so the numbers compare directly and
+// the delta is the coordination tax removed, not a workload change.
+
+const benchKeys = 1 << 20
+
+// makeKey writes a fixed-width 16-byte key for n into buf. Fixed width keeps
+// the hash and compare cost constant so the benchmark times the store, not key
+// formatting.
+func makeKey(buf []byte, n uint64) []byte {
+	binary.LittleEndian.PutUint64(buf[0:8], n)
+	binary.LittleEndian.PutUint64(buf[8:16], n*0x9e3779b97f4a7c15)
+	return buf[:16]
+}
+
+// benchRecSize is the arena charge of a plain record (no expiry slot), the
+// sizing arithmetic allocString runs.
+func benchRecSize(klen, vlen int) uint64 {
+	return hdrSize + align8(uint64(klen)) + align8(uint64(vlen))
+}
+
+func filledStore(keys, valLen int) *Store {
+	rec := int(benchRecSize(16, valLen))
+	s := New(keys*rec+keys*rec/4+(16<<20), 0)
+	val := make([]byte, valLen)
+	var kb [16]byte
+	for i := 0; i < keys; i++ {
+		if err := s.Set(makeKey(kb[:], uint64(i)), val); err != nil {
+			panic(err)
+		}
+	}
+	return s
+}
+
+// BenchmarkProbe times the index walk alone: hash to entry word, tag reject,
+// key verify, no value copy. This is the number the 12-bit tag and the
+// one-line bucket are accountable to.
+func BenchmarkProbe(b *testing.B) {
+	s := filledStore(benchKeys, 64)
+	var kb [16]byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := makeKey(kb[:], uint64(i)&(benchKeys-1))
+		_, addr, _ := s.findEntry(Hash(k), k)
+		if addr == 0 {
+			b.Fatal("miss")
+		}
+	}
+}
+
+func BenchmarkGet(b *testing.B) {
+	s := filledStore(benchKeys, 64)
+	var kb [16]byte
+	var dst []byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := makeKey(kb[:], uint64(i)&(benchKeys-1))
+		var ok bool
+		dst, ok = s.Get(k, dst)
+		if !ok {
+			b.Fatal("miss")
+		}
+	}
+}
+
+// BenchmarkGetResident is BenchmarkGet on the LTM read path: separated
+// values under a resident cap with headroom, so every hit runs the
+// visited-bit mark (touchResident) that plain BenchmarkGet never reaches.
+// The number prices the residency machinery's whole read-path addition;
+// lab 16 (labs/f3/m0/16_visited_mark) holds the sweep across mark variants.
+func BenchmarkGetResident(b *testing.B) {
+	const keys = 1 << 18
+	const valLen = 1032 // separated band
+	s, err := Open(Options{
+		ArenaBytes:       1 << 30,
+		VlogPath:         b.TempDir() + "/vlog",
+		ResidentCapBytes: 1 << 30, // everything stays resident: the mark, no demotion
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	val := make([]byte, valLen)
+	var kb [16]byte
+	for i := 0; i < keys; i++ {
+		if err := s.Set(makeKey(kb[:], uint64(i)), val); err != nil {
+			b.Fatal(err)
+		}
+	}
+	var dst []byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := makeKey(kb[:], uint64(i)&(keys-1))
+		var ok bool
+		dst, ok = s.Get(k, dst)
+		if !ok {
+			b.Fatal("miss")
+		}
+	}
+}
+
+func BenchmarkSet(b *testing.B) {
+	// Pre-fill so every Set is an in-place update on the bounded arena (the
+	// sustained write path); a fresh-key Set would measure the bump allocator,
+	// which BenchmarkArenaAppend does on its own.
+	s := filledStore(benchKeys, 64)
+	val := make([]byte, 64)
+	var kb [16]byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := makeKey(kb[:], uint64(i)&(benchKeys-1))
+		if err := s.Set(k, val); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkArenaAppend times the raw allocate-and-frame path: one plain-add
+// bump plus the header and byte stores, no index. The arena rewinds when it
+// fills, so the steady state includes the once-per-segment advance at its
+// real frequency.
+func BenchmarkArenaAppend(b *testing.B) {
+	s := New(256<<20, 0)
+	var kb [16]byte
+	val := make([]byte, 64)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := makeKey(kb[:], uint64(i))
+		off, err := s.allocString(k, align8(64), 0, 0)
+		if err != nil {
+			s.arena.reset()
+			off, err = s.allocString(k, align8(64), 0, 0)
+			if err != nil {
+				b.Fatal("alloc failed on a fresh arena")
+			}
+		}
+		copy(s.arena.buf[s.valueStart(off):], val)
+		s.setVlen(off, uint32(len(val)))
+	}
+}
