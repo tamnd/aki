@@ -30,6 +30,19 @@ type reg struct {
 	// boundary through the shard maintainer seam, drains it. Owner-goroutine-only,
 	// so it needs no lock; it stays empty for a stream workload that never deletes.
 	dirty []*stream
+
+	// resident is the running sum of every live stream's resident-byte footprint
+	// (stream.residentBytes), the figure the shard reads to weigh the stream heap
+	// against the store's resident cap at a demote boundary (spec 2064/f3/06
+	// section 6). note maintains it so the shard never walks the registry to size
+	// it. Maintained only when acctOn.
+	resident uint64
+	// acctOn gates the accounting: it is true only when the shard's store runs the
+	// cold tier (ColdConfigured). With no cold region to spill a block into, there is
+	// nothing to weigh, so note skips the bookkeeping entirely and the write path
+	// stays byte-identical to M0, holding the L9 zero-delta contract for a store with
+	// no resident cap.
+	acctOn bool
 }
 
 var regs sync.Map // *store.Store -> *reg
@@ -42,6 +55,7 @@ func registry(cx *shard.Ctx) *reg {
 	g := &reg{
 		m:       make(map[string]*stream),
 		waiters: make(map[string]*waitList),
+		acctOn:  cx.St != nil && cx.St.ColdConfigured(),
 	}
 	v, loaded := regs.LoadOrStore(cx.St, g)
 	if !loaded {
@@ -78,8 +92,48 @@ func (g *reg) maintain() {
 	for _, s := range g.dirty {
 		s.gc()
 		s.gcDirty = false
+		// gc rewrote or dropped sealed blocks, shrinking the resident block bytes;
+		// reconcile the freed bytes into the running total at the idle boundary.
+		g.note(s)
 	}
 	g.dirty = g.dirty[:0]
+}
+
+// note reconciles s's footprint into the running resident total: it posts the
+// delta since the last note, so the total stays the exact sum of every live
+// stream's footprint. A mutating command calls it before returning on the stream
+// it touched, which keeps the total exact at every command boundary, the only
+// point the shard reads it. It is a single bool load when accounting is off. A
+// stream is never dropped from the registry once created (an emptied stream is
+// kept, section 4.5, and DEL routing is owed to keyspace unification), so unlike
+// the other collection registries this one carries no drop counterpart yet; the
+// unification slice that removes a stream key will take its acct back out here.
+// Owner goroutine only.
+func (g *reg) note(s *stream) {
+	if !g.acctOn {
+		return
+	}
+	nb := s.residentBytes()
+	g.resident += nb - s.acct
+	s.acct = nb
+}
+
+// ResidentBytes is the running sum of every live stream's resident-byte footprint
+// on this shard, the collection contribution to the store's memory-pressure figure
+// (spec 2064/f3/06 section 6). It is zero when the store runs no cold tier. The
+// shard reads it at a demote boundary. Owner goroutine only.
+func (g *reg) ResidentBytes() uint64 { return g.resident }
+
+// ResidentBytes exposes the shard's stream-registry resident-byte total to the
+// worker's demote loop. The stream registry hangs off the shared regs map keyed by
+// the shard's store, not a Ctx slot, so this reads that map without building a
+// registry on a shard that never ran a stream command: it is zero before the first
+// stream command, or when the store runs no cold tier. Owner goroutine only.
+func ResidentBytes(cx *shard.Ctx) uint64 {
+	if v, ok := regs.Load(cx.St); ok {
+		return v.(*reg).ResidentBytes()
+	}
+	return 0
 }
 
 // lookup finds the stream for key. present is nil when no stream exists; wrong is

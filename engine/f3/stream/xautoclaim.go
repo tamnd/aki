@@ -45,7 +45,8 @@ func Xautoclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 
-	s, wrong := registry(cx).lookup(cx, key)
+	g := registry(cx)
+	s, wrong := g.lookup(cx, key)
 	if wrong {
 		r.Err(wrongType)
 		return
@@ -64,6 +65,9 @@ func Xautoclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if len(res.claimed) > 0 {
 		con.activeTime = cx.NowMs
 	}
+	// The pass reassigns pending slabs to the target consumer and prunes deleted
+	// entries; reconcile the footprint into the running sum.
+	g.note(s)
 	cx.Aux = frameAutoClaim(cx.Aux[:0], s, res, justid)
 	r.Raw(cx.Aux)
 }

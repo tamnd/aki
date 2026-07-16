@@ -68,6 +68,7 @@ func (s *stream) gc() gcStats {
 			continue // below the ratio: the reclaim would not pay for the copy
 		}
 		nb := s.rewriteBlock(b)
+		s.resBlob -= uint64(b.size() - nb.size())
 		st.reclaimed += b.size() - nb.size()
 		st.rewritten++
 		// A rewrite re-masters against the first surviving entry, so the block's
@@ -121,6 +122,7 @@ func (s *stream) dropDeadSealedBlocks() int {
 	for i, b := range s.blocks {
 		if i < tail && b.count > 0 && b.live() == 0 {
 			dropped++
+			s.resBlob -= uint64(len(b.blob))
 			continue
 		}
 		s.blocks[dst] = b

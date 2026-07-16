@@ -34,7 +34,8 @@ func Xclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 
-	s, wrong := registry(cx).lookup(cx, key)
+	g := registry(cx)
+	s, wrong := g.lookup(cx, key)
 	if wrong {
 		r.Err(wrongType)
 		return
@@ -60,6 +61,9 @@ func Xclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		con.activeTime = cx.NowMs
 	}
 
+	// A claim can create the target consumer and, under FORCE, add a pending slab for
+	// a not-yet-pending entry; reconcile the footprint into the running sum.
+	g.note(s)
 	cx.Aux = frameClaim(cx.Aux[:0], s, claimed, opts.justid)
 	r.Raw(cx.Aux)
 }

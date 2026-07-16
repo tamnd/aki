@@ -56,6 +56,10 @@ func Xreadgroup(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			if entries := grp.deliverNew(s, con, opts.count, opts.noack, cx.NowMs); len(entries) > 0 {
 				results = append(results, groupResult{key: keys[j], entries: entries})
 			}
+			// A `>` delivery records the entries in the group PEL (unless NOACK) and may
+			// have created the consumer, both of which grow the stream's footprint;
+			// reconcile it into the running sum.
+			g.note(s)
 			continue
 		}
 		start, ok := parseStreamID(ids[j])
@@ -64,6 +68,7 @@ func Xreadgroup(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			return
 		}
 		results = append(results, groupResult{key: keys[j], entries: grp.history(s, con, start, opts.count)})
+		g.note(s)
 	}
 
 	if len(results) == 0 {
@@ -132,6 +137,9 @@ func frameGroupPark(cx *shard.Ctx, g *reg, req *xreadWait) (reply []byte, served
 		if entries := grp.deliverNew(s, con, req.count, gw.noack, cx.NowMs); len(entries) > 0 {
 			results = append(results, groupResult{key: req.keys[j], entries: entries})
 		}
+		// A wake delivers into the PEL just as the inline path does; reconcile the
+		// stream's footprint into the running sum on the owner goroutine that runs it.
+		g.note(s)
 	}
 	if len(results) == 0 {
 		return nil, false
