@@ -387,3 +387,282 @@ func TestSetReconcileAcceptance(t *testing.T) {
 		t.Fatalf("SegCounts(set seg) = (%d, %d, %v), want (2, 0, true)", n, minExp, ok)
 	}
 }
+
+func (r *setRig) smove(src, dst, member string) bool {
+	r.t.Helper()
+	moved, err := r.se.SMove(context.Background(), []byte(src), []byte(dst), []byte(member))
+	if err != nil {
+		r.t.Fatalf("SMove(%q, %q, %q): %v", src, dst, member, err)
+	}
+	return moved
+}
+
+// TestSMoveSemantics pins the Redis answers on inline sets: a missing
+// member moves nothing and creates nothing, a present member lands in
+// dst exactly once, src==dst answers by membership alone, and both
+// keys type-gate before any write.
+func TestSMoveSemantics(t *testing.T) {
+	r := newSetRig(t)
+	ctx := context.Background()
+
+	r.sadd("src", "a")
+	r.sadd("src", "b")
+	if r.smove("src", "dst", "nope") {
+		t.Fatal("SMove moved a member src does not hold")
+	}
+	if r.encoding("dst") != "" {
+		t.Fatal("a no-op SMove created the dst key")
+	}
+
+	if !r.smove("src", "dst", "a") {
+		t.Fatal("SMove did not move a held member")
+	}
+	if r.sismember("src", "a") || !r.sismember("src", "b") || !r.sismember("dst", "a") {
+		t.Fatal("membership after the move is wrong")
+	}
+	if r.scard("src") != 1 || r.scard("dst") != 1 {
+		t.Fatalf("cards after the move = (%d, %d), want (1, 1)", r.scard("src"), r.scard("dst"))
+	}
+
+	// Member already in dst: src drops it, dst count holds.
+	r.sadd("dst", "b")
+	if !r.smove("src", "dst", "b") {
+		t.Fatal("SMove onto an existing dst member answered false")
+	}
+	if r.encoding("src") != "" {
+		t.Fatal("src key should be gone at zero members")
+	}
+	if r.scard("dst") != 2 {
+		t.Fatalf("dst card = %d, want 2", r.scard("dst"))
+	}
+
+	// src == dst answers by membership and changes nothing.
+	if !r.smove("dst", "dst", "a") {
+		t.Fatal("SMove(dst, dst) with a held member answered false")
+	}
+	if r.smove("dst", "dst", "zz") {
+		t.Fatal("SMove(dst, dst) with an absent member answered true")
+	}
+	if r.scard("dst") != 2 {
+		t.Fatalf("dst card changed on src==dst to %d", r.scard("dst"))
+	}
+
+	// Wrong types raise before any write, even when the member is
+	// absent from src, so a bad dst never leaves src half-moved.
+	if err := r.s.Set(ctx, []byte("str"), []byte("plain")); err != nil {
+		t.Fatalf("Str.Set: %v", err)
+	}
+	if _, err := r.se.SMove(ctx, []byte("dst"), []byte("str"), []byte("zz")); !errors.Is(err, ErrWrongType) {
+		t.Fatalf("SMove to a string dst error = %v, want ErrWrongType", err)
+	}
+	if _, err := r.se.SMove(ctx, []byte("str"), []byte("dst"), []byte("a")); !errors.Is(err, ErrWrongType) {
+		t.Fatalf("SMove from a string src error = %v, want ErrWrongType", err)
+	}
+	if _, err := r.h.HSet(ctx, []byte("hash"), []byte("f"), []byte("v")); err != nil {
+		t.Fatalf("HSet: %v", err)
+	}
+	if _, err := r.se.SMove(ctx, []byte("dst"), []byte("hash"), []byte("zz")); !errors.Is(err, ErrWrongType) {
+		t.Fatalf("SMove to a hash dst error = %v, want ErrWrongType", err)
+	}
+	if r.scard("dst") != 2 {
+		t.Fatalf("dst card = %d after rejected moves, want 2", r.scard("dst"))
+	}
+}
+
+// TestSMoveSegmented exercises both directions across the inline and
+// segmented rungs, plus the cold view after a flush.
+func TestSMoveSegmented(t *testing.T) {
+	r := newSetRig(t)
+	ctx := context.Background()
+
+	n := hashInlineMaxCount + 40
+	for i := range n {
+		r.sadd("big", fmt.Sprintf("m%04d", i))
+	}
+	if r.encoding("big") != "hashtable" {
+		t.Fatalf("big encodes %q, want hashtable", r.encoding("big"))
+	}
+
+	// Out of a segmented set into a fresh inline one.
+	if !r.smove("big", "side", "m0007") {
+		t.Fatal("SMove out of a segmented set answered false")
+	}
+	if r.sismember("big", "m0007") || !r.sismember("side", "m0007") {
+		t.Fatal("membership after the segmented move is wrong")
+	}
+	if r.scard("big") != int64(n-1) || r.scard("side") != 1 {
+		t.Fatalf("cards = (%d, %d), want (%d, 1)", r.scard("big"), r.scard("side"), n-1)
+	}
+
+	// And back into the segmented set.
+	if !r.smove("side", "big", "m0007") {
+		t.Fatal("SMove into a segmented set answered false")
+	}
+	if r.encoding("side") != "" {
+		t.Fatal("side key should be gone at zero members")
+	}
+	if r.scard("big") != int64(n) {
+		t.Fatalf("big card = %d, want %d", r.scard("big"), n)
+	}
+
+	if err := r.tr.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	se2 := r.reopen()
+	ok, err := se2.SIsMember(ctx, []byte("big"), []byte("m0007"))
+	if err != nil || !ok {
+		t.Fatalf("cold SIsMember = (%v, %v), want member present", ok, err)
+	}
+	cnt, err := se2.SCard(ctx, []byte("big"))
+	if err != nil || cnt != int64(n) {
+		t.Fatalf("cold SCard = (%d, %v), want %d", cnt, err, n)
+	}
+}
+
+// smoveMemberAt reads the moved member's location in the state a crash
+// after batch p recovers to.
+func smoveMemberAt(t *testing.T, r *setRig, p int, member string) (inSrc, inDst bool) {
+	t.Helper()
+	ms := r.rs.replayPrefix(t, p)
+	tr := NewTiered(ms, TieredConfig{
+		Budget:   Budget{Entries: 1024, Arenas: 64 << 20},
+		PromoteP: -1,
+		Seed:     uint64(p) + 300,
+		NowMs:    func() int64 { return 1 << 41 },
+	})
+	se, err := NewSet(tr, HashConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	inSrc, err = se.SIsMember(ctx, []byte("src"), []byte(member))
+	if err != nil {
+		t.Fatalf("prefix %d: SIsMember(src): %v", p, err)
+	}
+	inDst, err = se.SIsMember(ctx, []byte("dst"), []byte(member))
+	if err != nil {
+		t.Fatalf("prefix %d: SIsMember(dst): %v", p, err)
+	}
+	return inSrc, inDst
+}
+
+// TestSMoveCrashPrefix is the frame-group test under the worst cut the
+// drain can make: one-op batches put the add to dst and the remove
+// from src in separate batches, and every prefix must still hold the
+// member in at least one set. Add-first ordering is what makes a torn
+// tail leave the member in both (the command replays as unfinished),
+// never in neither.
+func TestSMoveCrashPrefix(t *testing.T) {
+	r := newSetRig(t)
+	ctx := context.Background()
+
+	r.sadd("src", "m")
+	r.sadd("src", "keep")
+	r.sadd("dst", "other")
+	if err := r.tr.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	setup := len(r.rs.batches) // prefixes before this predate the member
+
+	r.tr.dr.maxOps = 1
+	if !r.smove("src", "dst", "m") {
+		t.Fatal("SMove answered false")
+	}
+	if err := r.tr.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	sawBoth := false
+	for p := setup; p <= len(r.rs.batches); p++ {
+		inSrc, inDst := smoveMemberAt(t, r, p, "m")
+		if !inSrc && !inDst {
+			t.Fatalf("prefix %d: member lost by a batch cut inside the move", p)
+		}
+		if inSrc && inDst {
+			sawBoth = true
+		}
+	}
+	if !sawBoth {
+		t.Fatal("no prefix held the member in both sets; the one-op walk should visit the mid-move state")
+	}
+	inSrc, inDst := smoveMemberAt(t, r, len(r.rs.batches), "m")
+	if inSrc || !inDst {
+		t.Fatalf("full replay holds member (src=%v, dst=%v), want dst only", inSrc, inDst)
+	}
+}
+
+// TestSMoveDirtyGuard forces the hazard the guard exists for: a dirty
+// src root holds an early drain-queue position the remove would
+// coalesce into, which under a batch cut commits the remove before the
+// add. The guard must flush first, and the pair's post-images must
+// then share one drain batch.
+func TestSMoveDirtyGuard(t *testing.T) {
+	r := newSetRig(t)
+	ctx := context.Background()
+
+	r.sadd("src", "m")
+	r.sadd("dst", "other")
+	if err := r.tr.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	setup := len(r.rs.batches)
+
+	r.sadd("src", "early") // dirty src root with an old queue position
+	before := len(r.rs.batches)
+	if !r.smove("src", "dst", "m") {
+		t.Fatal("SMove answered false")
+	}
+	guardEnd := len(r.rs.batches)
+	if guardEnd == before {
+		t.Fatal("SMove did not flush the dirty src root before writing")
+	}
+	if err := r.tr.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	shared := false
+	for _, b := range r.rs.batches[guardEnd:] {
+		hasSrc, hasDst := false, false
+		for _, op := range b.Ops {
+			switch string(op.Rec.Key) {
+			case "src":
+				hasSrc = true
+			case "dst":
+				hasDst = true
+			}
+		}
+		if hasSrc != hasDst {
+			t.Fatal("the move's src and dst root images split across drain batches")
+		}
+		if hasSrc && hasDst {
+			shared = true
+		}
+	}
+	if !shared {
+		t.Fatal("no drain batch carries both root images of the move")
+	}
+	for p := setup; p <= len(r.rs.batches); p++ {
+		if inSrc, inDst := smoveMemberAt(t, r, p, "m"); !inSrc && !inDst {
+			t.Fatalf("prefix %d: member lost", p)
+		}
+	}
+}
+
+// TestSetSegRootHotTag pins the writeSegRoot fix: a segmented set's
+// root sits in the hot tier under its own type tag, not the hash's.
+func TestSetSegRootHotTag(t *testing.T) {
+	r := newSetRig(t)
+	for i := range hashInlineMaxCount + 40 {
+		r.sadd("s", fmt.Sprintf("m%04d", i))
+	}
+	if r.encoding("s") != "hashtable" {
+		t.Fatalf("s encodes %q, want hashtable", r.encoding("s"))
+	}
+	_, tag, hit, _ := r.tr.ht.probeReadTag([]byte("s"))
+	if !hit {
+		t.Fatal("segmented set root not resident in the hot tier")
+	}
+	if tag != TagSet|TagRoot {
+		t.Fatalf("hot root tag = %#x, want TagSet|TagRoot = %#x", tag, TagSet|TagRoot)
+	}
+}

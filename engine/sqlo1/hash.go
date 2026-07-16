@@ -560,7 +560,7 @@ func (h *Hash) writeSeg(ctx context.Context, segid uint64, payload []byte) error
 // coalesces over a structural write still waiting to drain.
 func (h *Hash) writeSegRoot(ctx context.Context, key []byte, delta bool) error {
 	h.rootBuf = appendHashSegRoot(h.rootBuf[:0], &h.segRoot)
-	tag := TagHash | TagRoot
+	tag := h.tag | TagRoot
 	if delta {
 		tag |= TagDelta
 	}
