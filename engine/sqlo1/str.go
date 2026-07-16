@@ -186,8 +186,8 @@ func (s *Str) needsRope(key []byte, valLen int) bool {
 // aliased read before the next call). A root of another type shows up
 // as otherType, with planeless saying whether an overwrite has
 // anything to retire (an inline collection root has no minted plane;
-// a segmented one does, and retiring it generically lands with the
-// segment slice).
+// a segmented one does, read generically off the shared root prefix
+// into root.rooth and root.rootgen).
 type strMeta struct {
 	exists    bool
 	rope      bool
@@ -219,7 +219,17 @@ func (s *Str) rootMeta(v []byte, expMs int64) (strMeta, error) {
 		return strMeta{}, err
 	}
 	if tag != TagString {
-		return strMeta{exists: true, otherType: true, planeless: planeless, expMs: expMs}, nil
+		m := strMeta{exists: true, otherType: true, planeless: planeless, expMs: expMs}
+		if !planeless {
+			// A planed root of any type carries rootgen and rooth in
+			// the shared prefix (see hashfence.go), which is all an
+			// overwrite needs to retire the foreign plane.
+			m.root.rooth, m.root.rootgen, err = planedRootInfo(v)
+			if err != nil {
+				return strMeta{}, err
+			}
+		}
+		return m, nil
 	}
 	r, err := decodeRopeRoot(v)
 	if err != nil {
@@ -267,11 +277,12 @@ func (s *Str) Set(ctx context.Context, key, val []byte) error {
 // already hold the key's meta (MSet reads a whole batch in one round).
 func (s *Str) setWithMeta(ctx context.Context, key, val []byte, m strMeta) error {
 	// SET overwrites any type, per Redis. A planeless collection root
-	// is one record and dies under the new image like a plain value;
-	// retiring a segmented collection's plane generically arrives with
-	// the segment slice.
+	// is one record and dies under the new image like a plain value; a
+	// planed one retires its plane through the shared root prefix, so
+	// the takeover is O(1) at any collection size and the bump rides
+	// the batch of the write below.
 	if m.otherType && !m.planeless {
-		return errHashSegmented
+		s.retire(key, m.root)
 	}
 	if !s.needsRope(key, len(val)) {
 		if m.rope {
@@ -566,12 +577,10 @@ func (s *Str) Del(ctx context.Context, key []byte) (bool, error) {
 	if err != nil || !m.exists {
 		return false, err
 	}
-	// DEL takes any type. Planeless roots are one tombstone; the
-	// segmented types' O(1) DEL (their genbump) lands with them.
-	if m.otherType && !m.planeless {
-		return false, errHashSegmented
-	}
-	if m.rope {
+	// DEL takes any type. Planeless roots are one tombstone; a planed
+	// root of any type retires through the shared prefix, its bump
+	// riding the tombstone exactly like a rope's.
+	if m.rope || (m.otherType && !m.planeless) {
 		s.retire(key, m.root)
 	}
 	return s.t.Del(ctx, key)
