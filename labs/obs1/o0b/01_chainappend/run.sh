@@ -13,8 +13,10 @@ go build -o /tmp/obs1-chainappend .
 
 /tmp/obs1-chainappend -header > "$out"
 
-# Policy sweep at the doc 02 worst case: 16 nodes, design rate.
-for policy in none spec fixed; do
+# Policy sweep at the doc 02 worst case: 16 nodes, design rate. Probe is
+# not a backoff; it GETs the target before each contended PUT to see what
+# that does to the burned-PUT bill.
+for policy in none spec fixed probe; do
 	/tmp/obs1-chainappend -policy $policy -contenders 16 -rate 20 >> "$out"
 done
 
@@ -29,6 +31,13 @@ for rate in 80 320; do
 	/tmp/obs1-chainappend -policy spec -contenders 16 -rate $rate >> "$out"
 done
 
+# Steady state: the 10s runs end while batches are still growing, so
+# these arms generate for 60s to see whether coalescing stabilizes at
+# design load or the backlog grows without bound.
+for policy in none probe; do
+	/tmp/obs1-chainappend -policy $policy -contenders 16 -rate 20 -dur 60s >> "$out"
+done
+
 # Live cross-check on MinIO, fresh bucket per invocation so reruns never
 # collide with an existing chain.
 if [ -n "${AKI_OBS1_S3:-}" ]; then
@@ -39,7 +48,9 @@ if [ -n "${AKI_OBS1_S3:-}" ]; then
 	for c in 1 4 16; do
 		/tmp/obs1-chainappend -store minio -bucket "$bucket" -policy spec -contenders $c -rate 20 >> "$out"
 	done
-	/tmp/obs1-chainappend -store minio -bucket "$bucket" -policy none -contenders 16 -rate 20 >> "$out"
+	for policy in none probe; do
+		/tmp/obs1-chainappend -store minio -bucket "$bucket" -policy $policy -contenders 16 -rate 20 >> "$out"
+	done
 else
 	echo "AKI_OBS1_S3 unset, skipping the minio arms" >&2
 fi

@@ -33,7 +33,7 @@ import (
 
 func main() {
 	store := flag.String("store", "sim", "sim | minio")
-	policy := flag.String("policy", "spec", "none | spec | fixed")
+	policy := flag.String("policy", "spec", "none | spec | fixed | probe")
 	contenders := flag.Int("contenders", 16, "nodes appending to one chain")
 	rate := flag.Float64("rate", 20, "records per second per node")
 	dur := flag.Duration("dur", 10*time.Second, "run length")
@@ -104,13 +104,14 @@ type metrics struct {
 
 // backoff sleeps per policy. Attempt 1 is the first PUT; the doc 02
 // suggestion is nothing on the first retry (the loser just caught up and
-// should go again immediately) and jittered 5 to 25ms after that.
+// should go again immediately) and jittered 5 to 25ms after that. The
+// probe policy never sleeps; its lever is in appendOnce instead.
 func backoff(policy string, attempt int, rng *rand.Rand) {
 	if attempt < 3 {
 		return
 	}
 	switch policy {
-	case "none":
+	case "none", "probe":
 	case "spec":
 		time.Sleep(5*time.Millisecond + time.Duration(rng.Int63n(int64(20*time.Millisecond))))
 	case "fixed":
@@ -145,6 +146,22 @@ func appendOnce(ctx context.Context, s obs1.Store, prefix string, tail *uint64, 
 	tag := obs1.WriteTag{Writer: fmt.Sprintf("%016x", writer), Batch: fmt.Sprintf("%016d", batchID)}
 	for attempt := 1; ; attempt++ {
 		seq := *tail + 1
+		// The probe policy pays a GET before every contended PUT: once one
+		// 412 proves a race, checking the target first turns most further
+		// losses into cheap reads (a GET is 12.5x cheaper than a PUT on S3
+		// and faster on the latency model). The blind first PUT keeps the
+		// uncontended fast path at one round trip.
+		if policy == "probe" && attempt > 1 {
+			m.gets++
+			_, _, gerr := s.Get(ctx, chainSeqKey(prefix, seq))
+			if gerr == nil {
+				*tail = seq
+				continue
+			}
+			if !errors.Is(gerr, obs1.ErrNotFound) {
+				return gerr
+			}
+		}
 		m.puts++
 		_, err := s.PutIfAbsent(ctx, chainSeqKey(prefix, seq), body, tag)
 		switch {
