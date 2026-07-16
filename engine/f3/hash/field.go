@@ -201,6 +201,12 @@ func (f *ftable) setNX(field, value []byte) bool {
 // and the record repointed, the old bytes charged to the dead count (spec
 // 2064/f3/10 section 3.6).
 func (f *ftable) overwrite(ord uint32, value []byte) {
+	if f.ents[ord].band&tierCold != 0 {
+		// A confirming write to a cold field signals the region turned hot, so bring
+		// its chunk's values back into the slab before overwriting: voff is a chunk
+		// locator while cold, not a slab offset (spec 2064/f3/06 section 7.3).
+		f.promote(ord)
+	}
 	e := &f.ents[ord]
 	if uint32(len(value)) <= e.vlen {
 		f.dead += int(e.vlen) - len(value)
@@ -281,7 +287,16 @@ func (f *ftable) removeOrd(ord uint32) {
 	f.ents[moved].vslot = v
 	f.vec = f.vec[:last]
 
-	f.dead += int(e.flen) + int(e.vlen)
+	if e.band&tierCold != 0 {
+		// The value never lived in the slab, so only the resident field bytes are dead
+		// here; the value's frame bytes stay packed in the cold chunk until a later
+		// repack, and the owning chunk is flagged dirty to drive it (spec 2064/f3/06
+		// section 7.4). Deleting a cold field must not promote its chunk.
+		f.dead += int(e.flen)
+		f.cold.markDirty(store.Hash(f.slab[e.foff : e.foff+uint32(e.flen)]))
+	} else {
+		f.dead += int(e.flen) + int(e.vlen)
+	}
 	f.free = append(f.free, ord)
 	if f.exp != nil {
 		f.exp[ord] = 0
@@ -471,9 +486,14 @@ func (f *ftable) maybeCompact() {
 		e := &f.ents[ord]
 		foff := uint32(len(packed))
 		packed = append(packed, f.slab[e.foff:e.foff+uint32(e.flen)]...)
+		e.foff = foff
+		if e.band&tierCold != 0 {
+			// The value is on disk and voff is a chunk locator, not a slab offset, so
+			// only the field bytes move; leave the locator and the cold band untouched.
+			continue
+		}
 		voff := uint32(len(packed))
 		packed = append(packed, f.slab[e.voff:e.voff+e.vlen]...)
-		e.foff = foff
 		e.voff = voff
 	}
 	f.slab = packed

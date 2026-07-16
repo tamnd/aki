@@ -325,3 +325,58 @@ func (f *ftable) demote(st *store.Store, key []byte) int {
 	f.dead = 0
 	return n
 }
+
+// promote brings the chunk owning the record at ord back into the resident slab:
+// one pread of the owning chunk, then every live record whose value is packed in
+// that chunk has its value re-seated at the slab tail and its cold band cleared, and
+// the chunk's directory descriptor is dropped. It is the confirming-write bring-up
+// (spec 2064/f3/06 section 7.3): an HSET or HINCRBY that lands on a cold field
+// signals the region turned hot, so the whole chunk's values return to RAM until a
+// later demote finds the table cold again under pressure. The field bytes never left
+// the slab, so only the value is re-seated; foff, flen, and vlen stay as they were.
+// A torn pread or an out-of-range locator leaves the records cold, which a later read
+// or promote retries; the caller treats a promote as best-effort and never blocks on
+// it. It is a no-op on a resident record (band 0), so a confirming write to a hot
+// field costs one band check.
+func (f *ftable) promote(ord uint32) {
+	if f.ents[ord].band&tierCold == 0 {
+		return
+	}
+	cc := f.cold
+	slot := locSlot(f.ents[ord].voff)
+	if int(slot) >= len(cc.offs) {
+		return
+	}
+	off := cc.offs[slot]
+	ck, buf, ok := cc.st.ReadChunk(off, cc.scratch)
+	cc.scratch = buf
+	if !ok {
+		return
+	}
+	// Re-seat every live record whose value is packed in this chunk. Walk the draw
+	// vector so a record deleted while cold (its ordinal on the free list) is skipped,
+	// its stale locator dying with the ordinal. The re-seated value bytes alias the
+	// pread scratch, which the slab append copies, so no aliasing survives the loop.
+	for _, o := range f.vec {
+		r := &f.ents[o]
+		if r.band&tierCold == 0 || locSlot(r.voff) != slot {
+			continue
+		}
+		_, val, ok := chunkEntry(ck.Payload, int(locEntry(r.voff)))
+		if !ok {
+			continue
+		}
+		r.voff = uint32(len(f.slab))
+		f.slab = append(f.slab, val...)
+		r.vlen = uint32(len(val))
+		r.band &^= tierCold
+	}
+	// Drop the chunk's directory descriptor; its offset-table slot becomes a tombstone
+	// (no record points at it now), reclaimed with the cold region at M8. The frame is
+	// left immutable for recovery, so the promotion never rewrites it.
+	if idx, ok := cc.dir.Floor(ck.Disc); ok {
+		if dOff, _, _ := cc.dir.At(idx); dOff == off {
+			cc.dir.Remove(idx)
+		}
+	}
+}
