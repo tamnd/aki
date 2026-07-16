@@ -40,6 +40,14 @@ func InfoShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	put(shard.StatDemotes, rs.Demotes)
 	put(shard.StatBackpressureWaits, cx.BackpressureWaits())
 	put(shard.StatBackpressureStalls, cx.BackpressureStalls())
+	// The obs1 park-reason split (engine/obs1/shard park.go, doc 04 section
+	// 6): waits and stalls per reason, summing to the two totals above.
+	put(shard.StatParkWaitsResident, cx.ParkWaits(shard.ParkResident))
+	put(shard.StatParkWaitsFlushlag, cx.ParkWaits(shard.ParkFlushlag))
+	put(shard.StatParkWaitsLease, cx.ParkWaits(shard.ParkLease))
+	put(shard.StatParkStallsResident, cx.ParkStalls(shard.ParkResident))
+	put(shard.StatParkStallsFlushlag, cx.ParkStalls(shard.ParkFlushlag))
+	put(shard.StatParkStallsLease, cx.ParkStalls(shard.ParkLease))
 	r.Raw(b[:])
 }
 
