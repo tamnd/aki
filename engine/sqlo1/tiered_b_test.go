@@ -175,7 +175,7 @@ func TestTieredOverSqlo1bExpiry(t *testing.T) {
 	if err := tr.Set(ctx, []byte("v"), []byte("x"), sqlo1.TagString); err != nil {
 		t.Fatal(err)
 	}
-	tr.SetExpireForTest([]byte("v"), uint32(uint64(now+30_000+1023)>>10))
+	tr.SetExpireForTest([]byte("v"), now+30_000)
 	if err := tr.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}

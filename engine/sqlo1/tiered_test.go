@@ -400,9 +400,9 @@ func TestTieredExpiryAcrossTheTiers(t *testing.T) {
 func TestTieredDrainCarriesExpiry(t *testing.T) {
 	r := newTieredRig(t, 64, 1.0, 9)
 	r.set(t, "k", "v")
-	at := uint32(uint64(r.now+60_000+1023) >> 10)
-	if _, changed, ok := r.t.ht.setExpire([]byte("k"), at); !ok || !changed {
-		t.Fatal("setExpire refused a live dirty key")
+	atMs := r.now + 60_000 + 777 // off the tick grid on purpose
+	if _, changed, ok := r.t.ht.setExpireMs([]byte("k"), atMs); !ok || !changed {
+		t.Fatal("setExpireMs refused a live dirty key")
 	}
 	r.flush(t)
 
@@ -410,22 +410,20 @@ func TestTieredDrainCarriesExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store get: %v", err)
 	}
-	if want := int64(at) << 10; rec.ExpireMs != want {
-		t.Fatalf("drained ExpireMs = %d, want %d", rec.ExpireMs, want)
-	}
-	if rec.ExpireMs < r.now+60_000 {
-		t.Fatal("ceil projection let the record expire early")
+	if rec.ExpireMs != atMs {
+		t.Fatalf("drained ExpireMs = %d, want the exact %d", rec.ExpireMs, atMs)
 	}
 
-	// The round trip is a fixed point: evict, re-promote, re-stamp.
+	// The round trip is a fixed point: evict, re-promote, re-stamp the
+	// same millisecond.
 	s, _ := r.t.ht.lookup(maphash.Bytes(r.t.ht.seed, []byte("k")), []byte("k"))
 	r.t.ht.evict(s, false)
 	if _, ok := r.get(t, "k"); !ok {
 		t.Fatal("cold read of volatile key missed")
 	}
 	s, _ = r.t.ht.lookup(maphash.Bytes(r.t.ht.seed, []byte("k")), []byte("k"))
-	if got := r.t.ht.hdrs[s].expireLo; got != at {
-		t.Fatalf("re-promoted expireLo = %d, want %d", got, at)
+	if got := expMsOf(&r.t.ht.hdrs[s]); got != atMs {
+		t.Fatalf("re-promoted expire_ms = %d, want %d", got, atMs)
 	}
 }
 

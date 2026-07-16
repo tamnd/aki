@@ -97,13 +97,15 @@ func (w *wheel) file(e wheelEntry) {
 	}
 }
 
-// expire stamps key with an absolute coarse-tick expiry and files the
-// wheel entry; at 0 is PERSIST and files nothing (the old entry, if
-// any, drains lazily). It reports whether the key was there to stamp.
-func (w *wheel) expire(key []byte, at uint32) bool {
-	s, changed, ok := w.ht.setExpire(key, at)
-	if ok && changed && at != 0 {
-		w.file(wheelEntry{slot: s, expireLo: at})
+// expire stamps key with an absolute expire_ms and files the wheel
+// entry under its projection tick; atMs 0 is PERSIST and files nothing
+// (the old entry, if any, drains lazily). It reports whether the key
+// was there to stamp.
+func (w *wheel) expire(key []byte, atMs int64) bool {
+	s, changed, ok := w.ht.setExpireMs(key, atMs)
+	if ok && changed && atMs > 0 {
+		lo, _ := splitExpMs(atMs)
+		w.file(wheelEntry{slot: s, expireLo: lo})
 	}
 	return ok
 }
@@ -172,6 +174,16 @@ func (w *wheel) reap(max int) int {
 			continue
 		}
 		hd := &w.ht.hdrs[e.slot]
+		if !w.ht.expired(hd) {
+			// The projection tick fired but the millisecond has not
+			// passed: doc 11's exact confirm on the boundary tick. Park
+			// the entry in the next tick's bucket, where the confirm
+			// cannot fail (the projection is a floor, so the true death
+			// is inside the trigger tick).
+			i := (w.now + 1) & (wheelBuckets - 1)
+			w.levels[0][i] = append(w.levels[0][i], e)
+			continue
+		}
 		if w.ht.Del(w.ht.keys.data(hd.keyRef)) {
 			n++
 		}

@@ -96,15 +96,11 @@ func (d *drainer) drain(ctx context.Context) (int, error) {
 			op.Del = true
 		} else {
 			op.Rec.Value = d.ht.vals.data(hd.valRef)
-			if hd.expireLo != 0 {
-				// The header holds the coarse projection only; the record
-				// gets it back at 1024 ms grain. Stamps are made by ceil
-				// division, so the reconstruction never expires early and
-				// the round trip through a drain is a fixed point. Exact
-				// PEXPIRE plumbing rides the WAL's pexpire frames when doc
-				// 11 wires the wheel into this runtime.
-				op.Rec.ExpireMs = int64(hd.expireLo) << 10
-			}
+			// The header carries the exact expire_ms split into the
+			// wheel projection and the remainder, so the record gets
+			// the millisecond back and the round trip through a drain
+			// is exact.
+			op.Rec.ExpireMs = expMsOf(hd)
 		}
 		d.ops = append(d.ops, op)
 		d.slots = append(d.slots, s)
