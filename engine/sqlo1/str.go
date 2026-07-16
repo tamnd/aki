@@ -131,6 +131,13 @@ type Str struct {
 	pcVals    [][]byte
 	pcKeyBuf  []byte
 	pcEntries []uint32
+
+	// BITOP scratch: the stripe accumulator and the per-source metas
+	// of the running op. bitopAcc is bounded by one stripe, never the
+	// result length; that bound is the constant-memory contract the
+	// stream test pins.
+	bitopAcc  []byte
+	bitopSrcs []bitopSrc
 }
 
 // NewStr builds the string layer over t.

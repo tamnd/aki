@@ -517,6 +517,36 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return storeErr(reply, err)
 		}
 		return AppendInt(reply, pos)
+	case "BITOP":
+		if len(args) < 4 {
+			return arityErr(reply, cmd)
+		}
+		var op int
+		switch strings.ToUpper(string(args[1])) {
+		case "AND":
+			op = bitopAnd
+		case "OR":
+			op = bitopOr
+		case "XOR":
+			op = bitopXor
+		case "NOT":
+			op = bitopNot
+			if len(args) != 4 {
+				return AppendError(reply, "ERR BITOP NOT must be called with a single source key.")
+			}
+		default:
+			return syntaxErr(reply)
+		}
+		n, err := s.s.BitOp(ctx, op, args[2], args[3:])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		// BITOP is a store into dest, so like SET and MSET the
+		// destination's old TTL is discarded.
+		if _, err := s.s.ExpireAt(ctx, args[2], 0); err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, n)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
