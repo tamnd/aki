@@ -24,6 +24,7 @@ package sqlo1
 // values alias internal buffers only until the next call.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -102,6 +103,18 @@ type Str struct {
 	kbuf         [SubkeySize]byte
 	chunkKeys    [][]byte
 	chunkVals    [][]byte
+
+	// Batch scratch for the multi-key doors: one LookupBatch round of
+	// values and root flags, plain values copied out when a rope in
+	// the same MGET would recycle their buffers (batchBuf indexed by
+	// batchOffs), decoded roots and prefetched metas.
+	batchVals  [][]byte
+	batchRoots []bool
+	batchExps  []int64
+	batchBuf   []byte
+	batchOffs  []int
+	batchRopes []ropeRoot
+	batchMetas []strMeta
 }
 
 // NewStr builds the string layer over t.
@@ -199,6 +212,12 @@ func (s *Str) Set(ctx context.Context, key, val []byte) error {
 	if err != nil {
 		return err
 	}
+	return s.setWithMeta(ctx, key, val, m)
+}
+
+// setWithMeta is Set below the representation read, for callers that
+// already hold the key's meta (MSet reads a whole batch in one round).
+func (s *Str) setWithMeta(ctx context.Context, key, val []byte, m strMeta) error {
 	if !s.needsRope(key, len(val)) {
 		if m.rope {
 			s.retire(key, m.root)
@@ -892,6 +911,139 @@ func (s *Str) IncrByFloat(ctx context.Context, key []byte, delta float64) ([]byt
 func appendRedisFloat(dst []byte, f float64) []byte {
 	b := strconv.AppendFloat(dst, f, 'f', -1, 64)
 	return b
+}
+
+// MGet reads keys in order and calls emit exactly once per key: the
+// value and true for a hit, nil and false for a miss. Every plain
+// cold miss shares one BatchGet round (the point of the door: an
+// N-key MGET against cold keys is one store round trip, not N). The
+// emitted value is valid only inside the emit call. Ropes are
+// assembled one at a time during emission, and assembly recycles
+// every read buffer, so when the batch holds a rope the plain values
+// are copied out and the roots decoded before the first assembly;
+// an all-plain batch (the common shape) emits straight aliases.
+func (s *Str) MGet(ctx context.Context, keys [][]byte, emit func(v []byte, ok bool)) error {
+	var err error
+	s.batchVals, s.batchRoots, s.batchExps, err = s.t.LookupBatch(ctx, keys, s.batchVals, s.batchRoots, s.batchExps)
+	if err != nil {
+		return err
+	}
+	ropes := 0
+	for i := range keys {
+		if s.batchVals[i] != nil && s.batchRoots[i] {
+			ropes++
+		}
+	}
+	if ropes == 0 {
+		for _, v := range s.batchVals {
+			emit(v, v != nil)
+		}
+		return nil
+	}
+	s.batchBuf = s.batchBuf[:0]
+	s.batchOffs = append(s.batchOffs[:0], 0)
+	s.batchRopes = s.batchRopes[:0]
+	for i, v := range s.batchVals {
+		switch {
+		case v == nil:
+		case s.batchRoots[i]:
+			r, err := decodeRopeRoot(v)
+			if err != nil {
+				return err
+			}
+			s.batchRopes = append(s.batchRopes, r)
+		default:
+			s.batchBuf = append(s.batchBuf, v...)
+		}
+		s.batchOffs = append(s.batchOffs, len(s.batchBuf))
+	}
+	rope := 0
+	for i, v := range s.batchVals {
+		switch {
+		case v == nil:
+			emit(nil, false)
+		case s.batchRoots[i]:
+			rv, _, err := s.readRope(ctx, s.batchRopes[rope])
+			rope++
+			if err != nil {
+				return err
+			}
+			emit(rv, true)
+		default:
+			emit(s.batchBuf[s.batchOffs[i]:s.batchOffs[i+1]], true)
+		}
+	}
+	return nil
+}
+
+// ExistsAny reports whether any of keys is live, in one LookupBatch
+// round: MSETNX's all-or-nothing gate without assembling any value.
+func (s *Str) ExistsAny(ctx context.Context, keys [][]byte) (bool, error) {
+	var err error
+	s.batchVals, s.batchRoots, s.batchExps, err = s.t.LookupBatch(ctx, keys, s.batchVals, s.batchRoots, s.batchExps)
+	if err != nil {
+		return false, err
+	}
+	for _, v := range s.batchVals {
+		if v != nil {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// MSet writes each key-value pair like Set, with the current
+// representations read in one LookupBatch round instead of one
+// lookup per key; the metas are decoded and copied before the first
+// write recycles the round's buffers. A key repeated later in the
+// same MSET rereads its meta fresh, because the earlier write already
+// made the prefetched one stale (the retire rule needs the live
+// root, not the prefetch). Like Set, a live key's expiry survives
+// here; MSET's discard-the-TTL rule belongs to the command layer.
+func (s *Str) MSet(ctx context.Context, keys, vals [][]byte) error {
+	for _, v := range vals {
+		if len(v) > MaxValueLen {
+			return ErrValueTooLong
+		}
+	}
+	var err error
+	s.batchVals, s.batchRoots, s.batchExps, err = s.t.LookupBatch(ctx, keys, s.batchVals, s.batchRoots, s.batchExps)
+	if err != nil {
+		return err
+	}
+	s.batchMetas = s.batchMetas[:0]
+	for i, v := range s.batchVals {
+		var m strMeta
+		switch {
+		case v == nil:
+		case s.batchRoots[i]:
+			r, err := decodeRopeRoot(v)
+			if err != nil {
+				return err
+			}
+			m = strMeta{exists: true, rope: true, expMs: s.batchExps[i], root: r}
+		default:
+			m = strMeta{exists: true, expMs: s.batchExps[i]}
+		}
+		s.batchMetas = append(s.batchMetas, m)
+	}
+	for i, key := range keys {
+		m := s.batchMetas[i]
+		for j := range i {
+			if bytes.Equal(keys[j], key) {
+				fresh, err := s.metaOf(ctx, key)
+				if err != nil {
+					return err
+				}
+				m = fresh
+				break
+			}
+		}
+		if err := s.setWithMeta(ctx, key, vals[i], m); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // grow returns b with length n, reallocating only to gain capacity;

@@ -303,6 +303,64 @@ func (t *Tiered) BatchGet(ctx context.Context, keys [][]byte, out [][]byte) ([][
 	return out, nil
 }
 
+// LookupBatch is BatchGet with the root bit and exact expire_ms
+// beside each value: the type layer's batch read door, so multi-key
+// commands can tell a root payload from a plain value and preserve
+// expiries without decoding anything. vals gets one entry per key
+// (nil for a miss), roots and exps the matching flags and stamps;
+// reuse all three returned slices across calls. Coalescing and
+// aliasing rules match BatchGet: all cold misses share one
+// Store.BatchGet round, and promotion during the round never evicts,
+// so an earlier hot hit's arena bytes cannot be recycled under it.
+func (t *Tiered) LookupBatch(ctx context.Context, keys [][]byte, vals [][]byte, roots []bool, exps []int64) ([][]byte, []bool, []int64, error) {
+	vals = vals[:0]
+	roots = roots[:0]
+	exps = exps[:0]
+	t.missKeys = t.missKeys[:0]
+	t.missPos = t.missPos[:0]
+	for i, k := range keys {
+		v, tag, exp, hit, definitive := t.ht.probeEntry(k)
+		switch {
+		case hit:
+			t.stats.HotHits++
+			vals = append(vals, v)
+			roots = append(roots, tag&TagRoot != 0)
+			exps = append(exps, exp)
+		case definitive:
+			t.stats.Misses++
+			vals = append(vals, nil)
+			roots = append(roots, false)
+			exps = append(exps, 0)
+		default:
+			vals = append(vals, nil)
+			roots = append(roots, false)
+			exps = append(exps, 0)
+			t.missKeys = append(t.missKeys, k)
+			t.missPos = append(t.missPos, i)
+		}
+	}
+	if len(t.missKeys) == 0 {
+		return vals, roots, exps, nil
+	}
+	t.stats.BatchReads++
+	recs, err := t.st.BatchGet(ctx, t.missKeys)
+	if err != nil {
+		return vals, roots, exps, err
+	}
+	for j, rec := range recs {
+		if rec.Key == nil || t.expiredRec(rec) {
+			t.stats.Misses++
+			continue
+		}
+		t.stats.ColdHits++
+		vals[t.missPos[j]] = nonNilValue(rec.Value)
+		roots[t.missPos[j]] = rec.Root
+		exps[t.missPos[j]] = rec.ExpireMs
+		t.maybePromote(t.missKeys[j], rec, false)
+	}
+	return vals, roots, exps, nil
+}
+
 // Set writes key through the hot tier: the record is dirty until drain
 // cools it. A refused write makes room by evicting clean residents, then
 // by forcing a drain cycle; only a tier with nothing left to give errors.
