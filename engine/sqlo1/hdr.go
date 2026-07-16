@@ -81,5 +81,27 @@ const TagRoot uint8 = 1 << 7
 // is what makes the invalidation rule structural: every byte-level
 // write replaces the tag and the bit dies with it, so a stale shadow
 // cannot survive any writer that did not deliberately re-arm it. The
-// bit never crosses the seam; drain only reads TagRoot.
+// bit never crosses the seam; drain only reads TagRoot and TagDelta.
 const tagIntShadow uint8 = 1 << 6
+
+// TagDelta is a flag bit beside TagRoot: this root post-image differs
+// from its predecessor only in ways segment replay can reconstruct,
+// count, min_expire, and fence meta, never the fence shape itself.
+// That is rule W2 of doc 06 section 5: a store whose replay reconciles
+// roots from segment frames (rule W3) may elide this image's WAL frame
+// and halve the hot path's root framing; a store that cannot must
+// frame it like any root. The type layer sets it on count-only root
+// writes and leaves it off structural ones (upgrade, split, merge,
+// paging), and drain carries it across the seam as Record.Delta.
+const TagDelta uint8 = 1 << 5
+
+// The queued byte's bits. queuedBit means the write-behind queue holds
+// an entry for this slot; queuedDefer means that entry must re-file at
+// the queue tail when it pops, which is how rule W1 keeps a re-dirtied
+// root from draining in a batch before segments a later command wrote
+// under it (the root's image summarizes them, so landing it first
+// would let an eviction expose an overcounting on-disk root).
+const (
+	queuedBit   uint8 = 1 << 0
+	queuedDefer uint8 = 1 << 1
+)

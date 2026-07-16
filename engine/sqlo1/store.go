@@ -23,6 +23,16 @@ type Record struct {
 	// root's own generation lives inside that payload, so Gen must be
 	// zero when Root is set; backends reject the combination.
 	Root bool
+	// Delta qualifies a Root image per doc 06 rule W2: it differs from
+	// the previous durable image of the same key only in ways segment
+	// replay can reconstruct (count, min_expire, fence meta, never the
+	// fence shape), and the whole dirty window it coalesces was such
+	// writes. A backend whose recovery reconciles roots from segment
+	// frames (rule W3) may elide this image's WAL frame; one that
+	// cannot must frame it in full. Advisory either way: the image
+	// itself is always exact. Meaningless without Root; backends
+	// reject the combination.
+	Delta bool
 }
 
 // Op is one mutation inside a DrainBatch: a record put, or a delete when

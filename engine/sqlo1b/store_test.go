@@ -848,6 +848,21 @@ func TestStoreRootRecords(t *testing.T) {
 	if _, err := r.s.Get(ctx, []byte("bad")); !errors.Is(err, sqlo1.ErrNotFound) {
 		t.Fatalf("rejected op left a record: %v", err)
 	}
+	bare := &sqlo1.DrainBatch{Seq: r.seq + 1, Ops: []sqlo1.Op{
+		{Rec: sqlo1.Record{Key: []byte("bare"), Value: []byte("p"), Delta: true}},
+	}}
+	if err := r.s.ApplyBatch(ctx, bare); err == nil {
+		t.Fatal("delta op without the root flag applied")
+	}
+	if _, err := r.s.Get(ctx, []byte("bare")); !errors.Is(err, sqlo1.ErrNotFound) {
+		t.Fatalf("rejected delta op left a record: %v", err)
+	}
+	// A delta root frames and stores like any root until the W3
+	// reconciliation earns the elision.
+	r.apply(t, sqlo1.Op{Rec: sqlo1.Record{Key: []byte("wide2"), Value: []byte("delta image"), Root: true, Delta: true}})
+	if got, err := r.s.Get(ctx, []byte("wide2")); err != nil || !got.Root {
+		t.Fatalf("delta root read back root=%v err=%v", got.Root, err)
+	}
 	r.apply(t, putOp("after", []byte("v2"), 0))
 	r.verify(t)
 

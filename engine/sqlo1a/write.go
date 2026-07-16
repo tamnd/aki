@@ -73,12 +73,18 @@ func (d *DB) applyOpLocked(op *sqlo1.Op) error {
 	}
 	rec := &op.Rec
 	t := int64(recordTag)
+	if rec.Delta && !rec.Root {
+		return fmt.Errorf("sqlo1a: delta flag on non-root record %x", rec.Key)
+	}
 	if rec.Root {
 		if rec.Gen > 0 {
 			// A root's generation lives in its payload; storing one in
 			// the gen column would invent a second authority.
 			return fmt.Errorf("sqlo1a: root record %x with seam gen %d", rec.Key, rec.Gen)
 		}
+		// Delta is advisory and Track A has nothing to elide: the SQL
+		// transaction is the durability unit, there is no per-record
+		// frame, so a delta root stores exactly like any root.
 		t = rootTag
 	}
 	crc := rowCRC(rec.Key, t, rec.ExpireMs, int64(rec.Gen), rec.Value)

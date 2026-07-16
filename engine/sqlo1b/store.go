@@ -658,12 +658,14 @@ func placementClass(rec *Record) int {
 // batches and only closes when full, which is what keeps a run of
 // small drain cycles from padding out one group each.
 //
-// WAL framing follows doc 06 rule W2 degenerately at this layer: every
-// seam record is either a segment post-image (Gen above zero) or an
-// inline-mode root (a plain record is its own root), and W2 frames
-// both in full. Root-frame elision and the W3 replay reconciliation
-// only apply to RecRoot images, which the per-type layer introduces;
-// none cross the seam yet.
+// WAL framing follows doc 06 rule W2 conservatively: segment
+// post-images and inline-mode roots frame in full as W2 says, and a
+// RecRoot image arriving with the seam's Delta flag (an elidable
+// count-only image) frames in full too, because elision is only sound
+// once the W3 replay reconciliation can rebuild the root from segment
+// frames, and that lands with the recovery slice. The flag is
+// validated here (Delta without Root rejects the batch) so the type
+// layer's discipline is load-bearing before the elision cashes it in.
 func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -686,6 +688,9 @@ func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 			}
 			frames = append(frames, plannedFrame{op: sqlo1.WALOpDel, pay: pay, del: true, key: op.Rec.Key})
 			continue
+		}
+		if op.Rec.Delta && !op.Rec.Root {
+			return fmt.Errorf("sqlo1b: batch %d op %d: delta flag on non-root record %x", b.Seq, i, op.Rec.Key)
 		}
 		rec := seamRecord(&op.Rec)
 		pay, err := EncodePutPayload(rec)

@@ -401,10 +401,21 @@ func (h *Hash) writeSeg(ctx context.Context, segid uint64, payload []byte) error
 	return h.t.SetGen(ctx, h.kbuf[:], payload, TagHash, h.segRoot.rootgen)
 }
 
-// writeSegRoot encodes h.segRoot and lands it under key.
-func (h *Hash) writeSegRoot(ctx context.Context, key []byte) error {
+// writeSegRoot encodes h.segRoot and lands it under key. delta is the
+// rule W2 claim: this image moved only count, min_expire, or fence
+// meta, never the fence shape, so a store whose replay reconciles
+// roots from segment frames may skip its WAL frame. Count-only paths
+// (hsetSeg's create, hdelSeg's plain removal) pass true; anything that
+// edits fence entries structurally (upgrade, split, merge) passes
+// false. The hot tier downgrades the claim itself if the image
+// coalesces over a structural write still waiting to drain.
+func (h *Hash) writeSegRoot(ctx context.Context, key []byte, delta bool) error {
 	h.rootBuf = appendHashSegRoot(h.rootBuf[:0], &h.segRoot)
-	return h.t.Set(ctx, key, h.rootBuf, TagHash|TagRoot)
+	tag := TagHash | TagRoot
+	if delta {
+		tag |= TagDelta
+	}
+	return h.t.Set(ctx, key, h.rootBuf, tag)
 }
 
 // HSet writes one field and reports whether it was created (false for
@@ -547,7 +558,7 @@ func (h *Hash) upgrade(ctx context.Context, key []byte, region []byte, created b
 	}
 	h.segRoot.minExpMs = minExp
 	h.segRoot.fence = h.fence
-	if err := h.writeSegRoot(ctx, key); err != nil {
+	if err := h.writeSegRoot(ctx, key, false); err != nil {
 		return false, err
 	}
 	return created, h.restamp(ctx, key, expMs)
@@ -592,7 +603,7 @@ func (h *Hash) hsetSeg(ctx context.Context, key, field, val []byte, expMs int64)
 	}
 	r.count++
 	r.fence[i].meta = hashSegMeta(int(binary.LittleEndian.Uint16(out)), int64(binary.LittleEndian.Uint64(out[4:])))
-	if err := h.writeSegRoot(ctx, key); err != nil {
+	if err := h.writeSegRoot(ctx, key, true); err != nil {
 		return false, err
 	}
 	return true, h.restamp(ctx, key, expMs)
@@ -645,7 +656,7 @@ func (h *Hash) splitSeg(ctx context.Context, key []byte, i, mid int, boundary ui
 		meta:  hashSegMeta(len(h.ents)-mid, segMin(h.ents[mid:])),
 	})
 	h.fence = r.fence
-	if err := h.writeSegRoot(ctx, key); err != nil {
+	if err := h.writeSegRoot(ctx, key, false); err != nil {
 		return false, err
 	}
 
@@ -697,7 +708,7 @@ func (h *Hash) hdelSeg(ctx context.Context, key, field []byte, expMs int64) (boo
 		return false, err
 	}
 	r.fence[i].meta = hashSegMeta(int(binary.LittleEndian.Uint16(out)), int64(binary.LittleEndian.Uint64(out[4:])))
-	if err := h.writeSegRoot(ctx, key); err != nil {
+	if err := h.writeSegRoot(ctx, key, true); err != nil {
 		return false, err
 	}
 	return true, h.restamp(ctx, key, expMs)
@@ -748,7 +759,7 @@ func (h *Hash) tryMergeSeg(ctx context.Context, key []byte, i int, out []byte) (
 		r.fence[lo].meta = hashSegMeta(int(binary.LittleEndian.Uint16(h.segBuf2)), int64(binary.LittleEndian.Uint64(h.segBuf2[4:])))
 		r.fence = append(r.fence[:hi], r.fence[hi+1:]...)
 		h.fence = r.fence
-		if err := h.writeSegRoot(ctx, key); err != nil {
+		if err := h.writeSegRoot(ctx, key, false); err != nil {
 			return false, err
 		}
 		putHashSegKey(h.kbuf2[:], r.rooth, hiSegid)
