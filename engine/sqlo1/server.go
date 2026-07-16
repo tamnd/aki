@@ -1337,7 +1337,12 @@ func (s *Server) hexpireCmd(ctx context.Context, reply []byte, args [][]byte, no
 	case "LT":
 		cond, fieldsAt = HExpireLT, 4
 	}
-	fields, errText := hfeFields(args[fieldsAt:], "ERR Parameter `numFields` should be greater than 0")
+	if !strings.EqualFold(string(args[fieldsAt]), "FIELDS") {
+		return AppendError(reply, "ERR unknown argument: "+string(args[fieldsAt]))
+	}
+	fields, errText := hfeFields(args[fieldsAt:],
+		"ERR Parameter `numFields` should be greater than 0",
+		"ERR wrong number of arguments")
 	if errText != "" {
 		return AppendError(reply, errText)
 	}
@@ -1363,7 +1368,9 @@ func (s *Server) httlCmd(ctx context.Context, reply []byte, args [][]byte, now i
 	if _, err := s.h.HLen(ctx, args[1]); err != nil {
 		return storeErr(reply, err)
 	}
-	fields, errText := hfeFields(args[2:], "ERR Number of fields must be a positive integer")
+	fields, errText := hfeFields(args[2:],
+		"ERR Number of fields must be a positive integer",
+		"ERR The `numfields` parameter must match the number of arguments")
 	if errText != "" {
 		return AppendError(reply, errText)
 	}
@@ -1397,7 +1404,9 @@ func (s *Server) hpersistCmd(ctx context.Context, reply []byte, args [][]byte) [
 	if _, err := s.h.HLen(ctx, args[1]); err != nil {
 		return storeErr(reply, err)
 	}
-	fields, errText := hfeFields(args[2:], "ERR Number of fields must be a positive integer")
+	fields, errText := hfeFields(args[2:],
+		"ERR Number of fields must be a positive integer",
+		"ERR The `numfields` parameter must match the number of arguments")
 	if errText != "" {
 		return AppendError(reply, errText)
 	}
@@ -1439,9 +1448,12 @@ func hfeExpireAt(reply []byte, arg []byte, cmd string, unit, base int64) (atMs i
 
 // hfeFields parses the FIELDS numfields field... run that ends the
 // HEXPIRE family's commands. Same shape as fieldsBlock but with this
-// family's own error texts (Redis grew the two grammars separately);
-// numErrText is the family's bad-numfields reply.
-func hfeFields(args [][]byte, numErrText string) ([][]byte, string) {
+// family's own error texts, and 8.8 grew the set and read families
+// apart (pinned live in the compat fixtures): the set family answers
+// "unknown argument" for a misplaced FIELDS (its caller checks before
+// calling here) and a plain "wrong number of arguments" on a
+// numfields mismatch, while the read family kept the 8.0 texts.
+func hfeFields(args [][]byte, numErrText, mismatchText string) ([][]byte, string) {
 	if !strings.EqualFold(string(args[0]), "FIELDS") {
 		return nil, "ERR Mandatory argument FIELDS is missing or not at the right position"
 	}
@@ -1450,7 +1462,7 @@ func hfeFields(args [][]byte, numErrText string) ([][]byte, string) {
 		return nil, numErrText
 	}
 	if n != int64(len(args)-2) {
-		return nil, "ERR The `numfields` parameter must match the number of arguments"
+		return nil, mismatchText
 	}
 	return args[2:], ""
 }

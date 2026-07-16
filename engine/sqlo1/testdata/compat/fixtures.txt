@@ -191,3 +191,158 @@ C ["PFCOUNT", "h:plain"] -> "-WRONGTYPE Key is not a valid HyperLogLog string va
 C ["PFADD", "h:plain", "x"] -> "-WRONGTYPE Key is not a valid HyperLogLog string value."
 C ["PFDEBUG", "ENCODING", "h:a"] -> "+sparse"
 C ["TYPE", "h:a"] -> "+string"
+S HASH
+C ["HSET", "hs:k", "f1", "v1"] -> ":1"
+C ["HSET", "hs:k", "f1", "w", "f2", "v2"] -> ":1"
+C ["HGET", "hs:k", "f1"] -> "$w"
+C ["HGET", "hs:k", "nofield"] -> "$-1"
+C ["HGET", "hs:missing", "f"] -> "$-1"
+C ["HSET", "hs:k"] -> "-ERR wrong number of arguments for 'hset' command"
+C ["HSET", "hs:k", "f1"] -> "-ERR wrong number of arguments for 'hset' command"
+C ["HSETNX", "hs:k", "f1", "x"] -> ":0"
+C ["HGET", "hs:k", "f1"] -> "$w"
+C ["HSETNX", "hs:k", "f3", "v3"] -> ":1"
+C ["HMSET", "hs:k", "f4", "v4", "f5", "v5"] -> "+OK"
+C ["HMGET", "hs:k", "f1", "f4", "nofield"] -> ["$w", "$v4", "$-1"]
+C ["HMGET", "hs:missing", "a", "b"] -> ["$-1", "$-1"]
+C ["HEXISTS", "hs:k", "f1"] -> ":1"
+C ["HEXISTS", "hs:k", "nofield"] -> ":0"
+C ["HEXISTS", "hs:missing", "f"] -> ":0"
+C ["HSTRLEN", "hs:k", "f1"] -> ":1"
+C ["HSTRLEN", "hs:k", "nofield"] -> ":0"
+C ["HSTRLEN", "hs:missing", "f"] -> ":0"
+C ["HLEN", "hs:k"] -> ":5"
+C ["HLEN", "hs:missing"] -> ":0"
+C ["HDEL", "hs:k", "f4", "f5", "nofield"] -> ":2"
+C ["HLEN", "hs:k"] -> ":3"
+C ["TYPE", "hs:k"] -> "+hash"
+C ["OBJECT", "ENCODING", "hs:k"] -> "$listpack"
+C ["HSET", "hs:d", "a", "1", "b", "2"] -> ":2"
+C ["HDEL", "hs:d", "a", "b"] -> ":2"
+C ["HLEN", "hs:d"] -> ":0"
+C ["TYPE", "hs:d"] -> "+none"
+C ["HSET", "hs:e", "", ""] -> ":1"
+C ["HGET", "hs:e", ""] -> "$"
+C ["HSTRLEN", "hs:e", ""] -> ":0"
+C ["HDEL", "hs:e", ""] -> ":1"
+C ["HSET", "hs:n", "cnt", "10"] -> ":1"
+C ["HINCRBY", "hs:n", "cnt", "5"] -> ":15"
+C ["HINCRBY", "hs:n", "cnt", "-20"] -> ":-5"
+C ["HINCRBY", "hs:n", "fresh", "3"] -> ":3"
+C ["HINCRBY", "hs:newn", "f", "2"] -> ":2"
+C ["HGET", "hs:newn", "f"] -> "$2"
+C ["HSET", "hs:n", "txt", "abc"] -> ":1"
+C ["HINCRBY", "hs:n", "txt", "1"] -> "-ERR hash value is not an integer"
+C ["HINCRBY", "hs:n", "cnt", "notanum"] -> "-ERR value is not an integer or out of range"
+C ["HSET", "hs:n", "big", "9223372036854775807"] -> ":1"
+C ["HINCRBY", "hs:n", "big", "1"] -> "-ERR increment or decrement would overflow"
+C ["HINCRBYFLOAT", "hs:n", "fl", "10.5"] -> "$10.5"
+C ["HINCRBYFLOAT", "hs:n", "fl", "0.25"] -> "$10.75"
+C ["HINCRBYFLOAT", "hs:n", "fl", "-0.75"] -> "$10"
+C ["HINCRBYFLOAT", "hs:n", "fl", "5.0e3"] -> "$5010"
+C ["HINCRBYFLOAT", "hs:n", "txt", "1"] -> "-ERR hash value is not a float"
+C ["HINCRBYFLOAT", "hs:n", "fl", "notanum"] -> "-ERR value is not a valid float"
+C ["HSET", "hs:it", "a", "1", "b", "2", "c", "3"] -> ":3"
+C ["HGETALL", "hs:it"] -> ["$a", "$1", "$b", "$2", "$c", "$3"]
+C ["HKEYS", "hs:it"] -> ["$a", "$b", "$c"]
+C ["HVALS", "hs:it"] -> ["$1", "$2", "$3"]
+C ["HGETALL", "hs:missing"] -> []
+C ["HKEYS", "hs:missing"] -> []
+C ["HVALS", "hs:missing"] -> []
+C ["HSET", "hs:it", "a", "9"] -> ":0"
+C ["HGETALL", "hs:it"] -> ["$a", "$9", "$b", "$2", "$c", "$3"]
+C ["HDEL", "hs:it", "b"] -> ":1"
+C ["HGETALL", "hs:it"] -> ["$a", "$9", "$c", "$3"]
+C ["HSET", "hs:it", "b", "5"] -> ":1"
+C ["HGETALL", "hs:it"] -> ["$a", "$9", "$c", "$3", "$b", "$5"]
+C ["HRANDFIELD", "hs:missing"] -> "$-1"
+C ["HRANDFIELD", "hs:missing", "3"] -> []
+C ["HSET", "hs:one", "solo", "val"] -> ":1"
+C ["HRANDFIELD", "hs:one"] -> "$solo"
+C ["HRANDFIELD", "hs:one", "5"] -> ["$solo"]
+C ["HRANDFIELD", "hs:one", "-3"] -> ["$solo", "$solo", "$solo"]
+C ["HRANDFIELD", "hs:one", "2", "WITHVALUES"] -> ["$solo", "$val"]
+C ["HRANDFIELD", "hs:one", "0"] -> []
+C ["HSCAN", "hs:it", "0"] -> ["$0", ["$a", "$9", "$c", "$3", "$b", "$5"]]
+C ["HSCAN", "hs:it", "0", "NOVALUES"] -> ["$0", ["$a", "$c", "$b"]]
+C ["HSCAN", "hs:it", "0", "MATCH", "a*"] -> ["$0", ["$a", "$9"]]
+C ["HSCAN", "hs:it", "0", "COUNT", "100"] -> ["$0", ["$a", "$9", "$c", "$3", "$b", "$5"]]
+C ["HSCAN", "hs:it", "42"] -> ["$0", ["$a", "$9", "$c", "$3", "$b", "$5"]]
+C ["HSCAN", "hs:missing", "0"] -> ["$0", []]
+C ["HSET", "hs:big", "f000", "v000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f001", "v001xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f002", "v002xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f003", "v003xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f004", "v004xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f005", "v005xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f006", "v006xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f007", "v007xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f008", "v008xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f009", "v009xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f010", "v010xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f011", "v011xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f012", "v012xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f013", "v013xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f014", "v014xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f015", "v015xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f016", "v016xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f017", "v017xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f018", "v018xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f019", "v019xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f020", "v020xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f021", "v021xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f022", "v022xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f023", "v023xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f024", "v024xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f025", "v025xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f026", "v026xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f027", "v027xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f028", "v028xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "f029", "v029xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"] -> ":30"
+C ["OBJECT", "ENCODING", "hs:big"] -> "$hashtable"
+C ["HLEN", "hs:big"] -> ":30"
+C ["HGET", "hs:big", "f010"] -> "$v010xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+C ["HSET", "hs:x", "a", "va", "b", "vb"] -> ":2"
+C ["HGETEX", "hs:x", "FIELDS", "2", "a", "nofield"] -> ["$va", "$-1"]
+C ["HGETEX", "hs:x", "PXAT", "9999999999000", "FIELDS", "1", "a"] -> ["$va"]
+C ["HPEXPIRETIME", "hs:x", "FIELDS", "2", "a", "b"] -> [":9999999999000", ":-1"]
+C ["HGETEX", "hs:x", "PERSIST", "FIELDS", "1", "a"] -> ["$va"]
+C ["HTTL", "hs:x", "FIELDS", "1", "a"] -> [":-1"]
+C ["HGETEX", "hs:x", "EX", "100", "FIELDS", "1", "a"] -> ["$va"]
+C ["HTTL", "hs:x", "FIELDS", "1", "a"] -> [":100"]
+C ["HGETEX", "hs:x", "EX", "notanum", "FIELDS", "1", "a"] -> "-ERR value is not an integer or out of range"
+C ["HGETDEL", "hs:x", "FIELDS", "2", "b", "nofield"] -> ["$vb", "$-1"]
+C ["HEXISTS", "hs:x", "b"] -> ":0"
+C ["HGETDEL", "hs:x", "FIELDS", "1", "a"] -> ["$va"]
+C ["TYPE", "hs:x"] -> "+none"
+C ["HSET", "hs:t", "f1", "v1", "f2", "v2"] -> ":2"
+C ["HEXPIRE", "hs:missing", "100", "FIELDS", "1", "f"] -> [":-2"]
+C ["HTTL", "hs:missing", "FIELDS", "1", "f"] -> [":-2"]
+C ["HPERSIST", "hs:missing", "FIELDS", "1", "f"] -> [":-2"]
+C ["HEXPIRE", "hs:t", "100", "FIELDS", "2", "f1", "nofield"] -> [":1", ":-2"]
+C ["HTTL", "hs:t", "FIELDS", "3", "f1", "f2", "nofield"] -> [":100", ":-1", ":-2"]
+C ["HPTTL", "hs:t", "FIELDS", "2", "f2", "nofield"] -> [":-1", ":-2"]
+C ["OBJECT", "ENCODING", "hs:t"] -> "$listpackex"
+C ["HPERSIST", "hs:t", "FIELDS", "2", "f1", "f2"] -> [":1", ":-1"]
+C ["HEXPIREAT", "hs:t", "9999999999", "FIELDS", "1", "f1"] -> [":1"]
+C ["HEXPIRETIME", "hs:t", "FIELDS", "2", "f1", "f2"] -> [":9999999999", ":-1"]
+C ["HPEXPIREAT", "hs:t", "9999999999000", "FIELDS", "1", "f1"] -> [":1"]
+C ["HPEXPIRETIME", "hs:t", "FIELDS", "1", "f1"] -> [":9999999999000"]
+C ["HEXPIRE", "hs:t", "100", "NX", "FIELDS", "2", "f1", "f2"] -> [":0", ":1"]
+C ["HPERSIST", "hs:t", "FIELDS", "1", "f2"] -> [":1"]
+C ["HPEXPIREAT", "hs:t", "9999999999500", "XX", "FIELDS", "2", "f1", "f2"] -> [":1", ":0"]
+C ["HPEXPIREAT", "hs:t", "9999999999000", "GT", "FIELDS", "1", "f1"] -> [":0"]
+C ["HPEXPIREAT", "hs:t", "9999999999500", "GT", "FIELDS", "1", "f1"] -> [":0"]
+C ["HPEXPIREAT", "hs:t", "9999999999900", "GT", "FIELDS", "1", "f1"] -> [":1"]
+C ["HPEXPIREAT", "hs:t", "9999999999900", "LT", "FIELDS", "1", "f1"] -> [":0"]
+C ["HPEXPIREAT", "hs:t", "9999999999000", "LT", "FIELDS", "1", "f1"] -> [":1"]
+C ["HEXPIRE", "hs:t", "100", "GT", "FIELDS", "1", "f2"] -> [":0"]
+C ["HEXPIRE", "hs:t", "100", "LT", "FIELDS", "1", "f2"] -> [":1"]
+C ["HPEXPIREAT", "hs:t", "1", "FIELDS", "1", "f2"] -> [":2"]
+C ["HEXISTS", "hs:t", "f2"] -> ":0"
+C ["HEXPIRE", "hs:t", "0", "FIELDS", "1", "f1"] -> [":2"]
+C ["TYPE", "hs:t"] -> "+none"
+C ["HEXPIRE", "hs:big", "100", "FIELDS", "1", "f000"] -> [":1"]
+C ["HTTL", "hs:big", "FIELDS", "1", "f000"] -> [":100"]
+C ["OBJECT", "ENCODING", "hs:big"] -> "$hashtable"
+C ["HSET", "hs:err", "f", "v"] -> ":1"
+C ["HEXPIRE", "hs:err", "100"] -> "-ERR wrong number of arguments for 'hexpire' command"
+C ["HEXPIRE", "hs:err", "100", "FIELDS", "1"] -> "-ERR wrong number of arguments for 'hexpire' command"
+C ["HTTL", "hs:err", "FIELDS", "1"] -> "-ERR wrong number of arguments for 'httl' command"
+C ["HPERSIST", "hs:err", "FIELDS", "1"] -> "-ERR wrong number of arguments for 'hpersist' command"
+C ["HEXPIRE", "hs:err", "notanum", "FIELDS", "1", "f"] -> "-ERR value is not an integer or out of range"
+C ["HEXPIRE", "hs:err", "-1", "FIELDS", "1", "f"] -> "-ERR invalid expire time, must be >= 0"
+C ["HEXPIRE", "hs:err", "70368744177664", "FIELDS", "1", "f"] -> "-ERR invalid expire time in 'hexpire' command"
+C ["HPEXPIREAT", "hs:err", "70368744177664", "FIELDS", "1", "f"] -> "-ERR invalid expire time in 'hpexpireat' command"
+C ["HEXPIRE", "hs:err", "100", "BADCOND", "FIELDS", "1", "f"] -> "-ERR unknown argument: BADCOND"
+C ["HEXPIRE", "hs:err", "100", "NX", "NOTFIELDS", "1", "f"] -> "-ERR unknown argument: NOTFIELDS"
+C ["HTTL", "hs:err", "NOTFIELDS", "1", "f"] -> "-ERR Mandatory argument FIELDS is missing or not at the right position"
+C ["HEXPIRE", "hs:err", "100", "FIELDS", "0", "f"] -> "-ERR Parameter `numFields` should be greater than 0"
+C ["HEXPIRE", "hs:err", "100", "FIELDS", "x", "f"] -> "-ERR Parameter `numFields` should be greater than 0"
+C ["HTTL", "hs:err", "FIELDS", "0", "f"] -> "-ERR Number of fields must be a positive integer"
+C ["HPERSIST", "hs:err", "FIELDS", "x", "f"] -> "-ERR Number of fields must be a positive integer"
+C ["HEXPIRE", "hs:err", "100", "FIELDS", "2", "f"] -> "-ERR wrong number of arguments"
+C ["HTTL", "hs:err", "FIELDS", "1", "f", "g"] -> "-ERR The `numfields` parameter must match the number of arguments"
+C ["SET", "hs:str", "v"] -> "+OK"
+C ["HGET", "hs:str", "f"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["HSET", "hs:str", "f", "v"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["HDEL", "hs:str", "f"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["HGETALL", "hs:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["HRANDFIELD", "hs:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["HSCAN", "hs:str", "0"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["HEXPIRE", "hs:str", "100", "FIELDS", "1", "f"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["HTTL", "hs:str", "FIELDS", "1", "f"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["HGETEX", "hs:str", "FIELDS", "1", "f"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["HGETDEL", "hs:str", "FIELDS", "1", "f"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["GET", "hs:k"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
