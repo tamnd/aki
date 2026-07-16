@@ -54,6 +54,10 @@ type fullWaiter struct {
 	// retry. Because it is here the retryFull loop cannot use a struct conversion
 	// to Reply anymore; it builds the Reply from b and i by name.
 	resume int
+	// reason names why the write parked (park.go, doc 04 section 6): resident
+	// for the arena-full park below, flushlag and lease when their slices raise
+	// them. A stall-out counts the waiter under its reason.
+	reason ParkReason
 }
 
 // parkOnFull registers a write that could not allocate on the shard's full-waiter
@@ -63,9 +67,10 @@ type fullWaiter struct {
 // together until retryFull re-runs the command and it either allocates or stalls
 // out. Owner goroutine only.
 func (w *worker) parkOnFull(b *hopBatch, i int) {
-	w.fullWaiters = append(w.fullWaiters, fullWaiter{b: b, i: i, resume: w.cx.resume})
+	w.fullWaiters = append(w.fullWaiters, fullWaiter{b: b, i: i, resume: w.cx.resume, reason: w.cx.parkReason})
 	b.deferN++
 	w.bpWaits++
+	w.bpReasonWaits[w.cx.parkReason]++
 }
 
 // retryFull re-runs every parked write against the arena a boundary just
@@ -153,7 +158,11 @@ func (w *worker) stallCheck() {
 // could not free room (a full cold device, a cold I/O error, a stream pinning
 // migration, no tier, or an exhausted arena). It never acknowledges a write and
 // then drops it: a parked write ends in exactly one of a real reply after a drain
-// or this OOM reply after a genuine stall. Owner goroutine only.
+// or this OOM reply after a genuine stall. Every waiter today parked as
+// ParkResident, whose doc 04 section 6 stall reply is exactly this f3 string;
+// the flushlag reply ("ERR store: flush stalled") and the lease resolution (the
+// doc 07 MOVED redirect, not an error) land with the slices that first raise
+// those reasons. Owner goroutine only.
 func (w *worker) stallOut() {
 	msg := "ERR " + store.ErrFull.Error() + " (" + w.st.StallReason() + ")"
 	for _, fw := range w.fullWaiters {
@@ -169,6 +178,7 @@ func (w *worker) stallOut() {
 		}
 		w.releaseHold(fw.b)
 		w.bpStalls++
+		w.bpReasonStalls[fw.reason]++
 	}
 	for i := range w.fullWaiters {
 		w.fullWaiters[i] = fullWaiter{}
