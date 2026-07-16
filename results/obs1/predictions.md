@@ -26,4 +26,4 @@ missed, and a K4-relevant miss freezes gating until the simulator refit.
 
 | ID | Claim | Prediction | Scored |
 |----|-------|------------|--------|
-| PRED-OBS1-O0A-POOL | warm stdlib pool, one process, doc 01 latency model | sustains 5,000 GET/s per node without client-side queuing; local lab shows reuse fraction > 0.99 once pool >= concurrency, and no throughput cliff through 512-way fan-out | pending |
+| PRED-OBS1-O0A-POOL | warm stdlib pool, one process, doc 01 latency model | sustains 5,000 GET/s per node without client-side queuing; local lab shows reuse fraction > 0.99 once pool >= concurrency, and no throughput cliff through 512-way fan-out | HIT 2026-07-16, sim rung (labs/obs1/o0a/02_poolrate, S3Standard seed 1, M-series dev box): 5,000/s at pool 256 peaks 172 in flight with max slot wait 12us over 50k requests, measured ceiling 8,629/s (Little's law says 8,797), queuing signature confirmed reachable past the ceiling and at pool 128; local rung was #875; O5 E-cloud re-scores live after the model refit |
