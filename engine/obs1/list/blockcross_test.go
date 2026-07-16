@@ -291,18 +291,25 @@ func TestBlmpopCrossImmediateServeDifferential(t *testing.T) {
 		{name: "wrongtype first", strs: [3]bool{true, false, false}, dir: "LEFT"},
 		{name: "empty then wrongtype", strs: [3]bool{false, true, false}, dir: "LEFT", count: "3"},
 	}
+	// The harness routes the co-located BLMPOP by its first argument, the
+	// timeout "0", so the co keys must live on whatever shard that string
+	// routes to. The f3 original hardcoded shard 3 because wyhash happened to
+	// put "0" there with four shards; under slot routing "0" lands elsewhere,
+	// and a hardcoded 3 parks the pop forever on a shard that never saw the
+	// keys. Deriving the shard keeps the test honest under any routing.
+	coShard := rt.ShardOf([]byte("0"))
 	for ci, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			p := fmt.Sprintf("mp%d", ci)
 			co := [3]string{
-				keyOnShard(t, rt, 3, p+"co0"),
-				keyOnShard(t, rt, 3, p+"co1"),
-				keyOnShard(t, rt, 3, p+"co2"),
+				keyOnShard(t, rt, coShard, p+"co0"),
+				keyOnShard(t, rt, coShard, p+"co1"),
+				keyOnShard(t, rt, coShard, p+"co2"),
 			}
 			x := [3]string{
-				keyOnShard(t, rt, 0, p+"x0"),
-				keyOnShard(t, rt, 1, p+"x1"),
-				keyOnShard(t, rt, 2, p+"x2"),
+				keyOnShard(t, rt, (coShard+1)%4, p+"x0"),
+				keyOnShard(t, rt, (coShard+2)%4, p+"x1"),
+				keyOnShard(t, rt, (coShard+3)%4, p+"x2"),
 			}
 			for i := 0; i < 3; i++ {
 				seedPop(t, c, co[i], x[i], tc.vals[i], tc.strs[i])
