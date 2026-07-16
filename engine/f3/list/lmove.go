@@ -84,6 +84,9 @@ func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) 
 	// onto it and never drop the key, since the list still holds the element.
 	if string(srcKey) == string(dstKey) {
 		pushEnd(src, v, dstLeft)
+		// One list object rotated in place: it survives with the same element count
+		// but a possibly changed byte layout, so note its footprint.
+		g.note(src)
 		return v, true, false
 	}
 	// Create the destination on first insert exactly as the push path does; a list
@@ -106,15 +109,21 @@ func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) 
 	// cross LMOVE wakes a destination blocker exactly as this co-located branch does.
 	if len(g.waiters) != 0 {
 		serveWaiters(cx, g, dstKey, dst)
-		if dst.length() == 0 {
-			g.drop(dstKey)
-		}
+	}
+	// Reconcile the destination: a drain may have emptied it, otherwise it survives
+	// with the pushed element.
+	if dst.length() == 0 {
+		g.drop(dstKey)
+	} else {
+		g.note(dst)
 	}
 	// The pop emptied the source: Redis deletes an emptied list. The drop runs
 	// after the destination push so distinct keys never race, and the same-key
 	// case above already returned, so this never drops a key just pushed onto.
 	if src.length() == 0 {
 		g.drop(srcKey)
+	} else {
+		g.note(src)
 	}
 	return v, true, false
 }

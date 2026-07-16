@@ -53,6 +53,8 @@ func lmpop(g *reg, cx *shard.Ctx, dst []byte, keys [][]byte, front bool, count i
 		}
 		if l.length() == 0 {
 			g.drop(key)
+		} else {
+			g.note(l)
 		}
 		return out, true, false
 	}

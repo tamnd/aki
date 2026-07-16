@@ -73,9 +73,14 @@ func pushCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front, create bool) {
 	n := l.length()
 	if len(g.waiters) != 0 {
 		serveWaiters(cx, g, key, l)
-		if l.length() == 0 {
-			g.drop(key)
-		}
+	}
+	// The push grew the list; a waiter drain may have emptied it again. Reconcile
+	// the footprint at the command boundary: drop an emptied key, note a surviving
+	// one, so the resident total stays exact.
+	if l.length() == 0 {
+		g.drop(key)
+	} else {
+		g.note(l)
 	}
 	r.Int(int64(n))
 }
@@ -108,6 +113,8 @@ func popCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 		v := popOne(l, front)
 		if l.length() == 0 {
 			g.drop(key)
+		} else {
+			g.note(l)
 		}
 		r.Bulk(v)
 		return
@@ -134,6 +141,8 @@ func popCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 	r.Raw(out)
 	if l.length() == 0 {
 		g.drop(key)
+	} else {
+		g.note(l)
 	}
 }
 
@@ -209,6 +218,9 @@ func Lset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	l.setAt(i, args[2])
+	// LSET can never empty a list, so the key always survives; note its new
+	// footprint (an element rewrite can grow or shrink the packed bytes).
+	g.note(l)
 	r.Status("OK")
 }
 
@@ -269,6 +281,8 @@ func Ltrim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	if l.length() == 0 {
 		g.drop(key)
+	} else {
+		g.note(l)
 	}
 	r.Status("OK")
 }
@@ -295,6 +309,8 @@ func Lrem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	removed := l.remove(int(count), args[2])
 	if l.length() == 0 {
 		g.drop(key)
+	} else if removed > 0 {
+		g.note(l)
 	}
 	r.Int(int64(removed))
 }
@@ -327,6 +343,10 @@ func Linsert(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Int(-1)
 		return
 	}
+	// LINSERT never empties a list; on a successful insert (pivot found) the key
+	// survives with a grown footprint. A pivot-absent insert returned above without
+	// mutating, so it posts no delta.
+	g.note(l)
 	r.Int(int64(l.length()))
 }
 

@@ -82,6 +82,8 @@ func moveCrossOnce(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) (rep []
 		// parked on dst live in the separate waiter set and stay for a future push.
 		if d.length() == 0 {
 			g.drop(dst)
+		} else {
+			g.note(d)
 		}
 	})
 	if dstWrong {
@@ -93,6 +95,8 @@ func moveCrossOnce(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) (rep []
 		popEnd(s, srcLeft)
 		if s.length() == 0 {
 			g.drop(src)
+		} else {
+			g.note(s)
 		}
 	})
 	return resp.AppendBulk(nil, elem), false
@@ -218,6 +222,8 @@ func runMoveCross(rt *shard.Runtime, src, dst []byte, head uint32, srcLeft, dstL
 		// parked on dst live in the separate waiter set and stay for a future push.
 		if d.length() == 0 {
 			g.drop(dst)
+		} else {
+			g.note(d)
 		}
 	})
 
@@ -241,8 +247,15 @@ func runMoveCross(rt *shard.Runtime, src, dst []byte, head uint32, srcLeft, dstL
 		if s, _ := g.lookup(cx, src); s != nil && s.length() > 0 {
 			// The served head is gone; drive the next waiter behind it off whatever the
 			// source still holds, the re-drive serveKey deferred when it stopped for the
-			// spawned coordinator.
+			// spawned coordinator. That re-drive can drain the source further, so
+			// reconcile its footprint once after: drop it if the deferred waiters emptied
+			// it, otherwise note the settled byte count.
 			serveWaiters(cx, g, src, s)
+			if s.length() == 0 {
+				g.drop(src)
+			} else {
+				g.note(s)
+			}
 		}
 	})
 	tx.Release()
