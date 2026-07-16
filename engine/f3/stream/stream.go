@@ -92,6 +92,14 @@ type stream struct {
 	// exact sum without rewalking the registry. It is meaningful only when the store
 	// runs a cold tier; a store with no cold region never accounts and leaves it zero.
 	acct uint64
+
+	// cold is the stream's cold-tier state (cold.go, M7), nil until a demote pass first
+	// sheds a front block. Once built it holds the store handle, the demote-sequence
+	// directory, and the shared pread scratch; a demote flips front blocks to the cold
+	// marker and drops their blobs from resBlob, and a range read routed through
+	// walkBlock preads a cold block transparently. Nil keeps a stream with no cold data
+	// byte-identical to M0 (L9).
+	cold *streamCold
 }
 
 // blockHeaderBytes is the resident overhead charged per block beyond its entry
@@ -113,6 +121,9 @@ func (s *stream) residentBytes() uint64 {
 	n += uint64(len(s.blocks)) * blockHeaderBytes
 	if s.dir != nil {
 		n += uint64(s.dir.Bytes())
+	}
+	if s.cold != nil {
+		n += s.cold.residentBytes()
 	}
 	for _, grp := range s.groups {
 		n += grp.residentBytes()
