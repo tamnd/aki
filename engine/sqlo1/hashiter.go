@@ -49,12 +49,26 @@ func (h *Hash) HIterate(ctx context.Context, key []byte, begin func(count int), 
 	}
 
 	// Segmented: the root count is exact under rule W1, so the header
-	// goes down before the first segment read. Segments then stream in
-	// fence order, hashIterBatchSegs per LookupBatch round; each round
-	// is fetched only after the previous round's entries were emitted,
-	// which keeps the aliases legal and the RAM bound at one round.
+	// goes down before the first segment read.
 	r := &h.segRoot
 	begin(int(r.count))
+	emitted, err := h.iterSegEntries(ctx, emit)
+	if err != nil {
+		return err
+	}
+	if emitted != r.count {
+		return fmt.Errorf("sqlo1: segmented hash root claims %d fields, segments hold %d", r.count, emitted)
+	}
+	return nil
+}
+
+// iterSegEntries streams every entry of the current segRoot in fence
+// order, hashIterBatchSegs per LookupBatch round; each round is
+// fetched only after the previous round's entries were emitted, which
+// keeps the aliases legal and the RAM bound at one round. The caller
+// has run stateOf to hashSegState. Returns the entries emitted.
+func (h *Hash) iterSegEntries(ctx context.Context, emit func(field, val []byte)) (uint64, error) {
+	r := &h.segRoot
 	emitted := uint64(0)
 	for base := 0; base < len(r.fence); base += hashIterBatchSegs {
 		n := min(hashIterBatchSegs, len(r.fence)-base)
@@ -65,23 +79,24 @@ func (h *Hash) HIterate(ctx context.Context, key []byte, begin func(count int), 
 			putHashSegKey(k, r.rooth, r.fence[base+j].segid)
 			h.mgKeys = append(h.mgKeys, k)
 		}
+		var err error
 		h.mgVals, h.mgRoots, h.mgExps, err = h.t.LookupBatch(ctx, h.mgKeys, h.mgVals, h.mgRoots, h.mgExps)
 		if err != nil {
-			return err
+			return emitted, err
 		}
 		for j := range n {
 			if h.mgVals[j] == nil {
-				return fmt.Errorf("sqlo1: hash segment %d of rooth %#x is missing", r.fence[base+j].segid, r.rooth)
+				return emitted, fmt.Errorf("sqlo1: hash segment %d of rooth %#x is missing", r.fence[base+j].segid, r.rooth)
 			}
 			seg, err := decodeHashSeg(h.mgVals[j])
 			if err != nil {
-				return err
+				return emitted, err
 			}
 			it := hashEntryIter{p: seg.entries}
 			for {
 				f, v, _, ok, err := it.next()
 				if err != nil {
-					return err
+					return emitted, err
 				}
 				if !ok {
 					break
@@ -91,10 +106,7 @@ func (h *Hash) HIterate(ctx context.Context, key []byte, begin func(count int), 
 			}
 		}
 	}
-	if emitted != r.count {
-		return fmt.Errorf("sqlo1: segmented hash root claims %d fields, segments hold %d", r.count, emitted)
-	}
-	return nil
+	return emitted, nil
 }
 
 // HScan is one cursor step: it emits fields from cursor upward in fh
