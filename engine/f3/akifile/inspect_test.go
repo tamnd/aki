@@ -2,6 +2,92 @@ package akifile
 
 import "testing"
 
+// TestInspectFreshFile reports a fresh file: both slots valid and clean, slot A
+// live, no roots yet, and an empty segment population.
+func TestInspectFreshFile(t *testing.T) {
+	dev := &memDevice{}
+	newTestFile(t, dev, SyncNo, nil)
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if !rep.Slots[0].Valid || !rep.Slots[1].Valid {
+		t.Fatalf("slots = %+v, want both valid", rep.Slots)
+	}
+	if !rep.Slots[0].CleanShutdown || rep.Live != 0 {
+		t.Fatalf("live = %d clean = %v, want slot 0 clean", rep.Live, rep.Slots[0].CleanShutdown)
+	}
+	if rep.SRT != nil || rep.Extents != nil || rep.SRTErr != nil || rep.ExtErr != nil {
+		t.Fatalf("fresh roots = srt %v/%v ext %v/%v, want all nil", rep.SRT, rep.SRTErr, rep.Extents, rep.ExtErr)
+	}
+	if rep.Segments.Total != 0 || rep.Segments.DurableTail != PageSize {
+		t.Fatalf("segments = %+v, want empty with tail at the header page", rep.Segments)
+	}
+}
+
+// TestInspectReportsTornSlot judges each slot on its own: a torn slot B is flagged
+// while slot A stays the live root, and the segment population is still tallied.
+func TestInspectReportsTornSlot(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	if _, err := f.AppendGroup([]Pending{
+		{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("live")},
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	dev.buf[prefix.MetaSlotBOff+3] ^= 0xff // tear slot B's body
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if !rep.Slots[0].Valid {
+		t.Fatalf("slot A = %+v, want valid", rep.Slots[0])
+	}
+	if rep.Slots[1].Valid || rep.Slots[1].Err != ErrChecksum {
+		t.Fatalf("slot B = %+v, want invalid with ErrChecksum", rep.Slots[1])
+	}
+	if rep.Live != 0 {
+		t.Fatalf("live = %d, want slot 0 (the intact slot)", rep.Live)
+	}
+	if rep.Segments.Total != 1 || rep.Segments.ByKind[KindLog] != 1 {
+		t.Fatalf("segments = %+v, want 1 log tallied past a torn slot", rep.Segments)
+	}
+}
+
+// TestInspectRecordsTornRoot surfaces a torn SRT as a finding rather than failing:
+// the report still carries the prefix, slots, and segment population.
+func TestInspectRecordsTornRoot(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	srtOff := writeSRT(t, dev, prefix, &SRT{Gen: 1, Rows: rows})
+	dev.buf[srtOff+SRTHeaderLen+3] ^= 0xff // corrupt a row byte
+
+	m := &MetaSlot{
+		CommitSeq: 2, FileSize: PageSize, CleanShutdown: 1,
+		SRTOff: srtOff, SRTLen: uint32(SRTHeaderLen + len(rows)*SRTRowSize), SRTShardCount: prefix.ShardCount,
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect should not fail on a torn root: %v", err)
+	}
+	if rep.SRTErr != ErrChecksum || rep.SRT != nil {
+		t.Fatalf("srt = %v/%v, want nil with ErrChecksum finding", rep.SRT, rep.SRTErr)
+	}
+	if rep.Prefix == nil || rep.Live != 0 {
+		t.Fatalf("report dropped the prefix or live root on a torn SRT")
+	}
+}
+
 // TestScanSegmentsTalliesByKind appends a mixed group and confirms the walk counts
 // every intact segment by kind and reports the durable tail at the append cursor.
 func TestScanSegmentsTalliesByKind(t *testing.T) {

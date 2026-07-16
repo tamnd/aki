@@ -1,5 +1,109 @@
 package akifile
 
+// SlotReport is one meta slot's state as a verify tool sees it: where it sits,
+// whether its checksum validates, and the fields a reader compares to pick the
+// live root. Err is why a slot did not validate (a torn write, media rot), left
+// nil when the slot is good.
+type SlotReport struct {
+	Off           uint64
+	Valid         bool
+	CommitSeq     uint64
+	CleanShutdown bool
+	Err           error
+}
+
+// Report is the whole file as a read-only tool sees it (the aki file-info and
+// verify output, spec 2064/f3/07 section 6): the immutable prefix, both meta
+// slots, which one is live, the roots the live slot names, and the segment
+// population. A torn root (SRT or extent map) is recorded as a finding, not a
+// hard failure, so a tool can still print the rest of the file's shape. Live is
+// the live slot index (0 or 1), or -1 when both slots are torn.
+type Report struct {
+	Prefix   *Prefix
+	Slots    [2]SlotReport
+	Live     int
+	SRT      *SRT
+	SRTErr   error
+	Extents  []Extent
+	ExtErr   error
+	Segments SegmentTally
+}
+
+// Inspect reads a file end to end and assembles a Report without changing a byte:
+// the prefix, both meta slots (each judged on its own so a tool sees exactly which
+// one tore), the live root, the SRT and extent map the live root names, and the
+// segment population from a grid walk. It fails only on what a tool cannot work
+// around: an unreadable or wrong-format prefix, or a device it cannot size or
+// walk. A torn root is left in SRTErr or ExtErr for the caller to report.
+func Inspect(dev Device) (*Report, error) {
+	hb := make([]byte, PrefixSize)
+	if _, err := dev.ReadAt(hb, 0); err != nil {
+		return nil, err
+	}
+	prefix, err := ParsePrefix(hb)
+	if err != nil {
+		return nil, err
+	}
+	rep := &Report{Prefix: prefix, Live: -1}
+
+	// Judge each slot on its own so the report shows which sector tore, then pick
+	// the live root the way recovery does: the valid slot with the higher commit_seq,
+	// ties to slot A.
+	offs := [2]uint64{prefix.MetaSlotAOff, prefix.MetaSlotBOff}
+	var slots [2]*MetaSlot
+	for i, off := range offs {
+		rep.Slots[i].Off = off
+		buf := make([]byte, MetaSlotSize)
+		if _, err := dev.ReadAt(buf, int64(off)); err != nil {
+			rep.Slots[i].Err = err
+			continue
+		}
+		m, err := ParseMetaSlot(buf, prefix.ChecksumKind)
+		if err != nil {
+			rep.Slots[i].Err = err
+			continue
+		}
+		slots[i] = m
+		rep.Slots[i].Valid = true
+		rep.Slots[i].CommitSeq = m.CommitSeq
+		rep.Slots[i].CleanShutdown = m.CleanShutdown == 1
+	}
+
+	var live *MetaSlot
+	switch {
+	case slots[0] != nil && slots[1] != nil:
+		if slots[1].CommitSeq > slots[0].CommitSeq {
+			rep.Live, live = 1, slots[1]
+		} else {
+			rep.Live, live = 0, slots[0]
+		}
+	case slots[0] != nil:
+		rep.Live, live = 0, slots[0]
+	case slots[1] != nil:
+		rep.Live, live = 1, slots[1]
+	}
+
+	// The roots the live slot names, best effort: a torn root is a finding a tool
+	// prints, not a reason to abandon the whole report.
+	if live != nil {
+		rep.SRT, rep.SRTErr = ReadSRT(dev, prefix, live)
+		rep.Extents, rep.ExtErr = ReadExtentTable(dev, live)
+	}
+
+	// The segment population is always walkable from the header page, even with no
+	// trusted root.
+	size, err := dev.Size()
+	if err != nil {
+		return nil, err
+	}
+	seg, err := ScanSegments(dev, prefix, PageSize, uint64(size))
+	if err != nil {
+		return nil, err
+	}
+	rep.Segments = seg
+	return rep, nil
+}
+
 // SegmentTally is the segment population a grid walk found: a count per kind, the
 // total, and the durable tail the walk stopped at (spec 2064/f3/07 section 6). It
 // carries no payload, only the shape of what is on disk.
