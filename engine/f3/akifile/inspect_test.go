@@ -25,6 +25,9 @@ func TestInspectFreshFile(t *testing.T) {
 	if rep.SRT != nil || rep.Extents != nil || rep.SRTErr != nil || rep.ExtErr != nil {
 		t.Fatalf("fresh roots = srt %v/%v ext %v/%v, want all nil", rep.SRT, rep.SRTErr, rep.Extents, rep.ExtErr)
 	}
+	if rep.TTL != nil || rep.TTLErr != nil || rep.FreeMap != nil || rep.FreeMapErr != nil {
+		t.Fatalf("fresh globals = ttl %v/%v free %v/%v, want all nil", rep.TTL, rep.TTLErr, rep.FreeMap, rep.FreeMapErr)
+	}
 	if rep.Segments.Total != 0 || rep.Segments.DurableTail != PageSize {
 		t.Fatalf("segments = %+v, want empty with tail at the header page", rep.Segments)
 	}
@@ -192,7 +195,8 @@ func TestWriteReportCleanFile(t *testing.T) {
 	for _, want := range []string{
 		"format: aki store v3.0", "checksum crc32c",
 		"meta slot A", "meta slot B", "(live)",
-		"shard root table: none", "extent map: none", "findings: none",
+		"shard root table: none", "extent map: none",
+		"ttl index: none", "free map: none", "findings: none",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("report missing %q in:\n%s", want, out)
@@ -231,6 +235,88 @@ func TestWriteReportWithRoots(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("report missing %q in:\n%s", want, out)
 		}
+	}
+}
+
+// TestInspectReportsGlobals surfaces the two file-global roots a slot names: the TTL
+// index (a bare accelerator) and the free map (a self-describing segment). Both read
+// back into the report and render by count.
+func TestInspectReportsGlobals(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	fmOff := appendFreeMap(t, f, []FreeExtent{
+		{StartOff: 0x10000, Length: 0x2000},
+		{StartOff: 0x20000, Length: 0x1000, Flags: FreeMapPending},
+	})
+	ttl := encodeTTLIndex([]TTLClass{
+		{Class: 1, ExpiryUpperUnix: 1000, Segments: []uint64{0x1000, 0x2000}},
+		{Class: 2, ExpiryUpperUnix: 2000, Segments: []uint64{0x3000}},
+	})
+	ttlOff := f.Cursor()
+	if _, err := dev.WriteAt(ttl, int64(ttlOff)); err != nil {
+		t.Fatalf("write ttl index: %v", err)
+	}
+
+	m := &MetaSlot{
+		CommitSeq: 1, FileSize: ttlOff + uint64(len(ttl)), CleanShutdown: 1,
+		FreeMapOff:  fmOff,
+		TTLIndexOff: ttlOff, TTLIndexLen: uint32(len(ttl)),
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if len(rep.TTL) != 2 || rep.TTLErr != nil {
+		t.Fatalf("ttl = %v/%v, want 2 classes", rep.TTL, rep.TTLErr)
+	}
+	if len(rep.FreeMap) != 2 || rep.FreeMapErr != nil {
+		t.Fatalf("free map = %v/%v, want 2 runs", rep.FreeMap, rep.FreeMapErr)
+	}
+	if fs := rep.Findings(); len(fs) != 0 {
+		t.Fatalf("findings = %v, want none on intact globals", fs)
+	}
+
+	var buf bytes.Buffer
+	WriteReport(&buf, rep)
+	out := buf.String()
+	for _, want := range []string{"ttl index: 2 classes", "free map: 2 runs, 8192 free, 4096 pending"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("report missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+// TestFindingsTornFreeMap flags a free map the live slot names but that does not read:
+// a misdirected pointer surfaces as a finding, not a hard failure.
+func TestFindingsTornFreeMap(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	// Point the free-map root at a log segment: a misdirected root reads as ErrMagic.
+	offs, err := f.AppendGroup([]Pending{{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("not a free map")}})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	m := &MetaSlot{CommitSeq: 1, FileSize: f.Cursor(), CleanShutdown: 1, FreeMapOff: offs[0]}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if rep.FreeMapErr != ErrMagic {
+		t.Fatalf("free map err = %v, want ErrMagic", rep.FreeMapErr)
+	}
+	fs := rep.Findings()
+	if len(fs) != 1 || !strings.Contains(fs[0], "free map did not read") {
+		t.Fatalf("findings = %v, want one for the torn free map", fs)
 	}
 }
 

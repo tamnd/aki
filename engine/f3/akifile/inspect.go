@@ -25,14 +25,18 @@ type SlotReport struct {
 // hard failure, so a tool can still print the rest of the file's shape. Live is
 // the live slot index (0 or 1), or -1 when both slots are torn.
 type Report struct {
-	Prefix   *Prefix
-	Slots    [2]SlotReport
-	Live     int
-	SRT      *SRT
-	SRTErr   error
-	Extents  []Extent
-	ExtErr   error
-	Segments SegmentTally
+	Prefix     *Prefix
+	Slots      [2]SlotReport
+	Live       int
+	SRT        *SRT
+	SRTErr     error
+	Extents    []Extent
+	ExtErr     error
+	TTL        []TTLClass
+	TTLErr     error
+	FreeMap    []FreeExtent
+	FreeMapErr error
+	Segments   SegmentTally
 }
 
 // Inspect reads a file end to end and assembles a Report without changing a byte:
@@ -94,6 +98,8 @@ func Inspect(dev Device) (*Report, error) {
 	if live != nil {
 		rep.SRT, rep.SRTErr = ReadSRT(dev, prefix, live)
 		rep.Extents, rep.ExtErr = ReadExtentTable(dev, live)
+		rep.TTL, rep.TTLErr = ReadTTLIndex(dev, live)
+		rep.FreeMap, rep.FreeMapErr = ReadFreeMap(dev, prefix, live)
 	}
 
 	// The segment population is always walkable from the header page, even with no
@@ -134,6 +140,12 @@ func (r *Report) Findings() []string {
 	}
 	if r.ExtErr != nil {
 		fs = append(fs, fmt.Sprintf("extent map did not read: %v", r.ExtErr))
+	}
+	if r.TTLErr != nil {
+		fs = append(fs, fmt.Sprintf("ttl index did not read: %v", r.TTLErr))
+	}
+	if r.FreeMapErr != nil {
+		fs = append(fs, fmt.Sprintf("free map did not read: %v", r.FreeMapErr))
 	}
 	return fs
 }
@@ -191,6 +203,25 @@ func WriteReport(w io.Writer, r *Report) error {
 		ew.printf("extent map: unreadable: %v\n", r.ExtErr)
 	default:
 		ew.printf("extent map: none\n")
+	}
+
+	switch {
+	case r.TTL != nil:
+		ew.printf("ttl index: %d classes\n", len(r.TTL))
+	case r.TTLErr != nil:
+		ew.printf("ttl index: unreadable: %v\n", r.TTLErr)
+	default:
+		ew.printf("ttl index: none\n")
+	}
+
+	switch {
+	case r.FreeMap != nil:
+		free, pending := FreeMapTotals(r.FreeMap)
+		ew.printf("free map: %d runs, %d free, %d pending\n", len(r.FreeMap), free, pending)
+	case r.FreeMapErr != nil:
+		ew.printf("free map: unreadable: %v\n", r.FreeMapErr)
+	default:
+		ew.printf("free map: none\n")
 	}
 
 	ew.printf("segments: %d total, durable tail @%d\n", r.Segments.Total, r.Segments.DurableTail)
