@@ -219,6 +219,22 @@ func (h *hash) demote(st *store.Store, key []byte) int {
 	return h.ft.demote(st, key)
 }
 
+// hasResident reports whether the table still holds a record whose value a demote
+// can move to the cold tier: a record whose value is not already cold. A hash whose
+// every value has left for the cold tier keeps its field bytes resident forever (the
+// probe key never leaves), so its footprint stays positive, but a demote would shed
+// nothing; the trigger uses this to skip it as a victim so a fully-cold hash never
+// wins the pick and stalls the loop. It early-returns on the first resident record,
+// so a hash with any resident value costs one record's band check.
+func (f *ftable) hasResident() bool {
+	for _, ord := range f.vec {
+		if f.ents[ord].band&tierCold == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // demote sheds this table's resident values into cold chunks, retiers their records,
 // and rebuilds the slab to hold only the field bytes. It is the crux of the hash cold
 // form: unlike the set, which packs whole members and drops the slab, a hash keeps
