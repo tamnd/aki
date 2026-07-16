@@ -37,7 +37,11 @@ func main() {
 	// port 0 can find the port.
 	fmt.Printf("sqlo1srv listening on %s\n", l.Addr())
 
-	if err := sqlo1.NewServer(st).Serve(l); err != nil {
+	srv, err := sqlo1.NewServer(st)
+	if err != nil {
+		log.Fatalf("sqlo1srv: %v", err)
+	}
+	if err := srv.Serve(l); err != nil {
 		log.Fatalf("sqlo1srv: %v", err)
 	}
 }

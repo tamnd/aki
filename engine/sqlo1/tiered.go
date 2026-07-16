@@ -118,8 +118,19 @@ func NewTiered(st Store, cfg TieredConfig) *Tiered {
 		prob:  prob,
 		nowMs: now,
 	}
-	t.ht.SetTick(uint32(uint64(now()) >> 10))
+	t.ht.SetNow(now())
 	return t
+}
+
+// Now re-stamps the hot tier's exact clock and returns the millisecond.
+// The server calls it at the top of every command, which is what makes
+// lazy expiry millisecond-exact (doc 11 section 2): the hot probe's
+// confirm check compares against this stamp, and Tick alone only moves
+// it about once a second.
+func (t *Tiered) Now() int64 {
+	ms := t.nowMs()
+	t.ht.SetNow(ms)
+	return ms
 }
 
 // Tick advances the coarse clock, spends drain quanta if dirty pressure
@@ -127,7 +138,7 @@ func NewTiered(st Store, cfg TieredConfig) *Tiered {
 // checkpoint and any foreground compaction happen here, off the command
 // path. The server calls it about once a second.
 func (t *Tiered) Tick(ctx context.Context) error {
-	t.ht.SetTick(uint32(uint64(t.nowMs()) >> 10))
+	t.ht.SetNow(t.nowMs())
 	if _, err := t.lad.step(ctx); err != nil {
 		return err
 	}
@@ -170,28 +181,81 @@ func (t *Tiered) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 // without decoding anything (the hot header keeps the bit for
 // promoted records). Aliasing rules match Get.
 func (t *Tiered) Lookup(ctx context.Context, key []byte) (val []byte, root, ok bool, err error) {
-	if v, tag, hit, definitive := t.ht.probeReadTag(key); definitive {
+	val, root, _, ok, err = t.LookupEntry(ctx, key)
+	return val, root, ok, err
+}
+
+// LookupEntry is Lookup plus the exact expire_ms (0 for none): the
+// command layer's read door when it needs the expiry beside the value,
+// which is TTL answers, KEEPTTL, and GETEX. Aliasing rules match Get.
+func (t *Tiered) LookupEntry(ctx context.Context, key []byte) (val []byte, root bool, expMs int64, ok bool, err error) {
+	if v, tag, exp, hit, definitive := t.ht.probeEntry(key); definitive {
 		if hit {
 			t.stats.HotHits++
-			return v, tag&TagRoot != 0, true, nil
+			return v, tag&TagRoot != 0, exp, true, nil
 		}
 		t.stats.Misses++
-		return nil, false, false, nil
+		return nil, false, 0, false, nil
 	}
 	t.missKeys = append(t.missKeys[:0], key)
 	t.stats.BatchReads++
 	recs, err := t.st.BatchGet(ctx, t.missKeys)
 	if err != nil {
-		return nil, false, false, err
+		return nil, false, 0, false, err
 	}
 	rec := recs[0]
 	if rec.Key == nil || t.expiredRec(rec) {
 		t.stats.Misses++
-		return nil, false, false, nil
+		return nil, false, 0, false, nil
 	}
 	t.stats.ColdHits++
 	t.maybePromote(key, rec, true)
-	return nonNilValue(rec.Value), rec.Root, true, nil
+	return nonNilValue(rec.Value), rec.Root, rec.ExpireMs, true, nil
+}
+
+// ExpireAt stamps an absolute expire_ms on key and reports whether the
+// key was there to stamp; atMs 0 is PERSIST, and a past atMs is legal
+// (the key goes invisible lazily, like Redis storing an already-dead
+// expiry). The stamp is durable by the re-dirty rule: a resident header
+// re-dirties inside setExpireMs so the edit drains with the record
+// image, and a cold key is pulled in as a dirty copy first. Like Del,
+// ExpireAt skips the shed gate: TTL edits are how the user creates the
+// garbage that relieves disk pressure.
+func (t *Tiered) ExpireAt(ctx context.Context, key []byte, atMs int64) (bool, error) {
+	if _, _, _, hit, definitive := t.ht.probeEntry(key); definitive {
+		if !hit {
+			return false, nil
+		}
+		t.ht.setExpireMs(key, atMs)
+		_, err := t.lad.step(ctx)
+		return true, err
+	}
+	t.missKeys = append(t.missKeys[:0], key)
+	t.stats.BatchReads++
+	recs, err := t.st.BatchGet(ctx, t.missKeys)
+	if err != nil {
+		return false, err
+	}
+	rec := recs[0]
+	if rec.Key == nil || t.expiredRec(rec) {
+		return false, nil
+	}
+	tag := TagString
+	if rec.Root {
+		tag |= TagRoot
+	}
+	val := nonNilValue(rec.Value)
+	if !t.ht.PutGen(key, val, tag, rec.Gen) {
+		if err := t.makeRoomFor(ctx, len(key)+len(val)); err != nil {
+			return false, err
+		}
+		if !t.ht.PutGen(key, val, tag, rec.Gen) {
+			return false, errHotFull
+		}
+	}
+	t.ht.setExpireMs(key, atMs)
+	_, err = t.lad.step(ctx)
+	return true, err
 }
 
 // BatchGet reads keys in order, appending one entry per key to out (reuse
@@ -352,13 +416,6 @@ func (t *Tiered) maybePromote(key []byte, rec Record, canEvict bool) {
 	if !ghost && t.coin.Float64() >= t.prob {
 		return
 	}
-	var expireLo uint32
-	if rec.ExpireMs > 0 {
-		// Ceil, so the hot copy never expires before the record; the
-		// drain-side reconstruction below the seam is expireLo<<10, and
-		// ceil makes that round trip a fixed point.
-		expireLo = uint32(uint64(rec.ExpireMs+1023) >> 10)
-	}
 	// TagString is the whole surface until the per-type docs plug in;
 	// the seam's Record carries no type tag, and the per-type
 	// integration re-derives it from the record encoding when that
@@ -370,11 +427,11 @@ func (t *Tiered) maybePromote(key []byte, rec Record, canEvict bool) {
 		tag |= TagRoot
 	}
 	val := nonNilValue(rec.Value)
-	if !t.ht.promote(key, val, tag, rec.Gen, expireLo) {
+	if !t.ht.promote(key, val, tag, rec.Gen, rec.ExpireMs) {
 		if canEvict {
 			t.ev.evict(hdrSize + len(key) + len(val))
 		}
-		if !canEvict || !t.ht.promote(key, val, tag, rec.Gen, expireLo) {
+		if !canEvict || !t.ht.promote(key, val, tag, rec.Gen, rec.ExpireMs) {
 			t.stats.PromoteSkips++
 			return
 		}

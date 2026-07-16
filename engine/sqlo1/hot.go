@@ -32,10 +32,13 @@ type HotTable struct {
 	keys      arena
 	vals      arena
 	ghosts    ghostRing
-	// tick is the coarse stamp clock, advanced by the server once a
-	// second; live counts keys visible to reads, so tombstones are out.
-	tick uint32
-	live int
+	// tick is the coarse stamp clock and nowMs the exact wall clock
+	// behind it, both moved by SetNow (SetTick projects nowMs to the
+	// tick's end for tick-driven tests); live counts keys visible to
+	// reads, so tombstones are out.
+	tick  uint32
+	nowMs int64
+	live  int
 	// The write-behind queue: slot indices in first-dirtied order, a
 	// ring preallocated to capacity. The header's queued flag keeps
 	// entries unique, so re-dirtying a dirty key never re-enqueues it
@@ -106,7 +109,22 @@ func (t *HotTable) popDirty() (uint32, bool) {
 // SetTick moves the coarse clock the stamps record. Stamps shift last
 // into prev only when the tick has moved, so repeated touches within one
 // tick cost one compare (the WATT-lite two-stamp rule, hotclock lab).
-func (t *HotTable) SetTick(tick uint32) { t.tick = tick }
+// The wall clock is projected to the end of the tick, so tick-driven
+// tests keep the old "expired at its tick" reading; the runtime calls
+// SetNow with real milliseconds for the exact confirm.
+func (t *HotTable) SetTick(tick uint32) {
+	t.tick = tick
+	t.nowMs = int64(tick)<<10 | 1023
+}
+
+// SetNow moves both clocks from wall milliseconds: the coarse tick the
+// stamps and the wheel use, and the exact time the expiry confirm
+// checks. The runtime refreshes it on Tick and the server refreshes it
+// per dispatch, so lazy expiry is millisecond-exact at command time.
+func (t *HotTable) SetNow(ms int64) {
+	t.tick = uint32(uint64(ms) >> 10)
+	t.nowMs = ms
+}
 
 func (t *HotTable) touchRead(hd *hdr) {
 	if hd.lastRead != t.tick {
@@ -127,12 +145,23 @@ func (t *HotTable) Len() int {
 	return t.live
 }
 
-// expired reports whether hd's key is past its coarse expiry. This is
-// the hot-tier layer of lazy expiry (E-I1): an expired key is invisible
-// from its tick regardless of reaper progress, and the record-exact
-// expire_ms check arrives with the record format milestone.
+// expired reports whether hd's key is past its expiry: the coarse
+// projection triggers, the exact millisecond confirms, per doc 11 (the
+// projection stamps floor, so the trigger can fire up to a second
+// before the true death and the confirm holds the line). This is the
+// hot-tier layer of lazy expiry (E-I1): an expired key is invisible
+// from the millisecond it expires regardless of reaper progress.
 func (t *HotTable) expired(hd *hdr) bool {
-	return hd.expireLo != 0 && hd.expireLo <= t.tick
+	return hd.expireLo != 0 && hd.expireLo <= t.tick && expMsOf(hd) <= t.nowMs
+}
+
+// expMsOf reconstructs a header's exact expire_ms from the projection
+// and the remainder; 0 means no expiry.
+func expMsOf(hd *hdr) int64 {
+	if hd.expireLo == 0 {
+		return 0
+	}
+	return int64(hd.expireLo)<<10 | int64(hd.expireRem)
 }
 
 // Get returns the value for key, aliasing the arena until the next write.
@@ -158,16 +187,24 @@ func (t *HotTable) probeRead(key []byte) (val []byte, hit, definitive bool) {
 // hot half of Tiered.Lookup: the root bit in the tag is how the type
 // layer recognizes a promoted root payload.
 func (t *HotTable) probeReadTag(key []byte) (val []byte, tag uint8, hit, definitive bool) {
+	val, tag, _, hit, definitive = t.probeEntry(key)
+	return val, tag, hit, definitive
+}
+
+// probeEntry is the widest hot probe: value, tag, and the exact
+// expire_ms, the hot half of Tiered.LookupEntry. The command layer
+// needs the expiry beside the value for TTL answers and KEEPTTL.
+func (t *HotTable) probeEntry(key []byte) (val []byte, tag uint8, expMs int64, hit, definitive bool) {
 	s, ok := t.lookup(maphash.Bytes(t.seed, key), key)
 	if !ok {
-		return nil, 0, false, false
+		return nil, 0, 0, false, false
 	}
 	hd := &t.hdrs[s]
 	if hd.valRef == 0 || t.expired(hd) {
-		return nil, 0, false, true
+		return nil, 0, 0, false, true
 	}
 	t.touchRead(hd)
-	return t.vals.data(hd.valRef), hd.typeTag, true, true
+	return t.vals.data(hd.valRef), hd.typeTag, expMsOf(hd), true, true
 }
 
 // dirtyKey reports whether key currently sits dirty in the table, so
@@ -178,13 +215,16 @@ func (t *HotTable) dirtyKey(key []byte) bool {
 	return ok && t.hdrs[s].state == stateDirty
 }
 
-// setExpire stamps the coarse expiry projection on key's header; at 0
-// is PERSIST. It reports the slot for wheel filing, whether the stamp
-// changed (an unchanged stamp must not file a duplicate entry), and
-// whether the key was there to stamp: tombstones and expired-unreaped
-// keys are already gone. The WAL frame for expiry edits arrives with
-// the WAL slice; this is the RAM projection only.
-func (t *HotTable) setExpire(key []byte, at uint32) (slot uint32, changed, ok bool) {
+// setExpireMs stamps the exact expiry on key's header, split into the
+// coarse projection and the millisecond remainder; atMs 0 is PERSIST.
+// It reports the slot for wheel filing, whether the stamp changed (an
+// unchanged stamp must not file a duplicate entry), and whether the
+// key was there to stamp: tombstones and expired-unreaped keys are
+// already gone. A stamp reaches the store only when the record drains,
+// so a changed stamp on a resident header re-dirties it and the edit
+// rides the next cycle with the record image (doc 11's PEXPIRE WAL
+// frame later makes this cheaper than a full rewrite).
+func (t *HotTable) setExpireMs(key []byte, atMs int64) (slot uint32, changed, ok bool) {
 	s, ok := t.lookup(maphash.Bytes(t.seed, key), key)
 	if !ok {
 		return 0, false, false
@@ -193,11 +233,27 @@ func (t *HotTable) setExpire(key []byte, at uint32) (slot uint32, changed, ok bo
 	if hd.valRef == 0 || t.expired(hd) {
 		return 0, false, false
 	}
-	if hd.expireLo == at {
+	lo, rem := splitExpMs(atMs)
+	if hd.expireLo == lo && hd.expireRem == rem {
 		return s, false, true
 	}
-	hd.expireLo = at
+	hd.expireLo, hd.expireRem = lo, rem
+	t.touchWrite(hd)
+	if hd.state == stateResident {
+		hd.state = stateDirty
+		t.dirtyBytes += int(hd.klen) + len(t.vals.data(hd.valRef))
+		t.enqueueDirty(s)
+	}
 	return s, true, true
+}
+
+// splitExpMs splits an exact expire_ms into the header's projection
+// and remainder; 0 stays the no-expiry sentinel.
+func splitExpMs(atMs int64) (lo uint32, rem uint16) {
+	if atMs <= 0 {
+		return 0, 0
+	}
+	return uint32(uint64(atMs) >> 10), uint16(atMs & 1023)
 }
 
 // Put inserts or overwrites key and marks it dirty. It reports false
@@ -223,7 +279,7 @@ func (t *HotTable) PutGen(key, val []byte, tag uint8, gen uint32) bool {
 			// the dead expiry must not ride along. A live key's expiry
 			// survives writes; command-level rules like SET clearing the
 			// TTL belong to the command layer.
-			hd.expireLo = 0
+			hd.expireLo, hd.expireRem = 0, 0
 		}
 		switch hd.valRef {
 		case 0:
@@ -350,7 +406,7 @@ func (t *HotTable) fileIndex(h uint64, s uint32) {
 // live in the table (a duplicate cold miss inside one batch) is a
 // touch-and-succeed; a tombstone wins over any promotion, because the
 // deletion just has not drained yet.
-func (t *HotTable) promote(key, val []byte, tag uint8, gen uint32, expireLo uint32) bool {
+func (t *HotTable) promote(key, val []byte, tag uint8, gen uint32, expMs int64) bool {
 	if len(key) > maxKlen {
 		return false
 	}
@@ -375,7 +431,7 @@ func (t *HotTable) promote(key, val []byte, tag uint8, gen uint32, expireLo uint
 	hd.state = stateResident
 	hd.typeTag = tag
 	hd.gen = gen
-	hd.expireLo = expireLo
+	hd.expireLo, hd.expireRem = splitExpMs(expMs)
 	if g, ok := t.ghosts.take(h); ok {
 		hd.lastRead = g.lastRead
 		hd.lastWrite = g.lastWrite
@@ -433,7 +489,7 @@ func (t *HotTable) Del(key []byte) bool {
 	}
 	t.vals.release(hd.valRef)
 	hd.valRef = 0
-	hd.expireLo = 0
+	hd.expireLo, hd.expireRem = 0, 0
 	hd.state = stateDirty
 	t.touchWrite(hd)
 	t.enqueueDirty(s)

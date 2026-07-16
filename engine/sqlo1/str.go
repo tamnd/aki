@@ -27,6 +27,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 )
 
 // ErrValueTooLong rejects a write past the 512 MiB Redis value cap.
@@ -236,22 +237,34 @@ func (s *Str) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 	return s.readRope(ctx, r)
 }
 
-// readRope assembles a rope into s.val, one BatchGet round of chunks
-// at a time. An absent chunk, or the tail a short chunk does not
-// cover, reads as zeros: full-value writes never produce either, but
-// the lazy zero-fill of the range surface (doc 05 section 2) does,
-// and the assembly is defined once for both.
+// readRope assembles a whole rope into s.val.
 func (s *Str) readRope(ctx context.Context, r ropeRoot) ([]byte, bool, error) {
+	return s.readRopeRange(ctx, r, 0, r.totalLen)
+}
+
+// readRopeRange assembles bytes [lo, hi) of a rope into s.val, one
+// BatchGet round of chunks at a time, touching only the chunks the
+// window overlaps (S-I1). The caller clamps hi to totalLen. An absent
+// chunk, or the tail a short chunk does not cover, reads as zeros:
+// full-value writes never produce either, but the lazy zero-fill of
+// the range surface (doc 05 section 2) does, and the assembly is
+// defined once for both.
+func (s *Str) readRopeRange(ctx context.Context, r ropeRoot, lo, hi uint64) ([]byte, bool, error) {
 	cs := r.chunkSize()
-	s.val = grow(s.val, int(r.totalLen))
+	s.val = grow(s.val, int(hi-lo))
+	if hi == lo {
+		return s.val[:0], true, nil
+	}
 	if cap(s.chunkKeys) < strReadRound {
 		s.chunkKeys = make([][]byte, strReadRound)
 		for i := range s.chunkKeys {
 			s.chunkKeys[i] = make([]byte, SubkeySize)
 		}
 	}
-	for base := uint64(0); base < r.chunkCount; base += strReadRound {
-		n := min(strReadRound, r.chunkCount-base)
+	c0 := lo >> r.log2chunk
+	c1 := ((hi - 1) >> r.log2chunk) + 1
+	for base := c0; base < c1; base += strReadRound {
+		n := min(strReadRound, c1-base)
 		keys := s.chunkKeys[:n]
 		for j := range keys {
 			putChunkKey(keys[j], r.rooth, base+uint64(j))
@@ -269,13 +282,133 @@ func (s *Str) readRope(ctx context.Context, r ropeRoot) ([]byte, bool, error) {
 			// error: an append lands its chunks before the root whose
 			// total_len commits them, so a crash between the two
 			// legally leaves extra bytes past the logical length.
-			lo := (base + uint64(j)) << r.log2chunk
-			span := s.val[lo : lo+min(cs, r.totalLen-lo)]
-			copied := copy(span, cv)
+			cstart := (base + uint64(j)) << r.log2chunk
+			a, b := max(cstart, lo), min(cstart+cs, hi)
+			span := s.val[a-lo : b-lo]
+			var src []byte
+			if skip := a - cstart; uint64(len(cv)) > skip {
+				src = cv[skip:]
+			}
+			copied := copy(span, src)
 			clear(span[copied:])
 		}
 	}
-	return s.val[:r.totalLen], true, nil
+	return s.val[:hi-lo], true, nil
+}
+
+// Range returns the SUBSTR and GETRANGE window of key's value: start
+// and end are inclusive byte offsets, negative counts from the end,
+// and both clamp to the value the way Redis clamps. A missing key or
+// an empty window is the empty string. Rope keys read only the chunks
+// the window overlaps.
+func (s *Str) Range(ctx context.Context, key []byte, start, end int64) ([]byte, error) {
+	v, root, ok, err := s.t.Lookup(ctx, key)
+	if err != nil || !ok {
+		return nil, err
+	}
+	if !root {
+		lo, hi, some := clampRange(start, end, int64(len(v)))
+		if !some {
+			return nil, nil
+		}
+		return v[lo:hi], nil
+	}
+	r, err := decodeRopeRoot(v)
+	if err != nil {
+		return nil, err
+	}
+	lo, hi, some := clampRange(start, end, int64(r.totalLen))
+	if !some {
+		return nil, nil
+	}
+	out, _, err := s.readRopeRange(ctx, r, uint64(lo), uint64(hi))
+	return out, err
+}
+
+// clampRange resolves Redis range arguments against a value of n bytes
+// into a half-open [lo, hi) window; some is false when the window is
+// empty.
+func clampRange(start, end, n int64) (lo, hi int64, some bool) {
+	if start < 0 {
+		start = max(n+start, 0)
+	}
+	if end < 0 {
+		end = n + end
+	}
+	end = min(end, n-1)
+	if n == 0 || start > end {
+		return 0, 0, false
+	}
+	return start, end + 1, true
+}
+
+// Strlen answers without assembling rope values: the root already
+// carries total_len (S-I2's point).
+func (s *Str) Strlen(ctx context.Context, key []byte) (int64, bool, error) {
+	v, root, ok, err := s.t.Lookup(ctx, key)
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	if !root {
+		return int64(len(v)), true, nil
+	}
+	r, err := decodeRopeRoot(v)
+	if err != nil {
+		return 0, false, err
+	}
+	return int64(r.totalLen), true, nil
+}
+
+// Entry reports existence and the exact expire_ms (0 for none) without
+// assembling rope values; the TTL family and SET's NX, XX, and KEEPTTL
+// checks live on it.
+func (s *Str) Entry(ctx context.Context, key []byte) (exists bool, expMs int64, err error) {
+	_, _, expMs, ok, err := s.t.LookupEntry(ctx, key)
+	return ok, expMs, err
+}
+
+// ExpireAt stamps an absolute expire_ms on key (0 is PERSIST) and
+// reports whether the key existed. A rope's expiry lives on its root
+// record, so this is one stamp for every representation; the chunks a
+// root leaves behind when it expires are the doc 11 lazy-bump gap
+// noted in the T1 milestone.
+func (s *Str) ExpireAt(ctx context.Context, key []byte, atMs int64) (bool, error) {
+	return s.t.ExpireAt(ctx, key, atMs)
+}
+
+// Encoding is the OBJECT ENCODING answer: int, embstr, raw, or rope,
+// per doc 05 section 2. The int and embstr reads come from the value
+// bytes for now; the intshadow slice moves the int answer to a header
+// flag stamped at write time, which is what S-I2 ultimately wants.
+func (s *Str) Encoding(ctx context.Context, key []byte) (string, bool, error) {
+	v, root, ok, err := s.t.Lookup(ctx, key)
+	if err != nil || !ok {
+		return "", false, err
+	}
+	switch {
+	case root:
+		return "rope", true, nil
+	case intShaped(v):
+		return "int", true, nil
+	case len(v) <= embstrMax:
+		return "embstr", true, nil
+	}
+	return "raw", true, nil
+}
+
+// embstrMax is Redis's embedded-string boundary; values at or under it
+// report embstr, longer plain values report raw.
+const embstrMax = 44
+
+// intShaped reports whether v is the canonical decimal form of an
+// int64, which is what Redis requires before it reports the int
+// encoding ("0123" and "+1" are raw bytes, not integers).
+func intShaped(v []byte) bool {
+	if len(v) == 0 || len(v) > 20 {
+		return false
+	}
+	n, err := strconv.ParseInt(string(v), 10, 64)
+	return err == nil && strconv.FormatInt(n, 10) == string(v)
 }
 
 // Del removes key, retiring its plane first when it is a rope so the

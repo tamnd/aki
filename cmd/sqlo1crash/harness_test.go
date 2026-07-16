@@ -33,7 +33,12 @@ func TestHelperServer(t *testing.T) {
 		os.Exit(1)
 	}
 	fmt.Printf("sqlo1crash helper listening on %s\n", l.Addr())
-	sqlo1.NewServer(sqlo1.NewMemStore()).Serve(l)
+	srv, err := sqlo1.NewServer(sqlo1.NewMemStore())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "helper: %v\n", err)
+		os.Exit(1)
+	}
+	srv.Serve(l)
 }
 
 // TestCrashLoopAgainstMemStore is the skeleton's end to end proof: two full

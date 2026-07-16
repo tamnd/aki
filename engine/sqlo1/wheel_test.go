@@ -34,6 +34,13 @@ func advanceTo(ht *HotTable, w *wheel, tick uint32) {
 	w.advance()
 }
 
+// tickMs is the millisecond at the start of tick at: the wheel tests
+// reason in ticks, and the start-of-tick stamp keeps the expireLo
+// projection equal to at so entry assertions stay in tick units.
+func tickMs(at uint32) int64 {
+	return int64(at) << 10
+}
+
 func TestWheelLevelsAndCascade(t *testing.T) {
 	ht := NewHotTable(64)
 	ht.SetTick(1)
@@ -46,7 +53,7 @@ func TestWheelLevelsAndCascade(t *testing.T) {
 		at uint32
 	}{{"l0", 6}, {"l1", 300}, {"l2", 70000}}
 	for _, kv := range keys {
-		if !ht.Put([]byte(kv.k), []byte("v"), TagString) || !w.expire([]byte(kv.k), kv.at) {
+		if !ht.Put([]byte(kv.k), []byte("v"), TagString) || !w.expire([]byte(kv.k), tickMs(kv.at)) {
 			t.Fatalf("seeding %s failed", kv.k)
 		}
 	}
@@ -79,8 +86,8 @@ func TestWheelLazyInvalidation(t *testing.T) {
 	key := []byte("moved")
 
 	ht.Put(key, []byte("v"), TagString)
-	w.expire(key, 10)
-	w.expire(key, 20) // GT-style rewrite; the entry for 10 stays filed
+	w.expire(key, tickMs(10))
+	w.expire(key, tickMs(20)) // GT-style rewrite; the entry for 10 stays filed
 
 	advanceTo(ht, w, 10)
 	if n := w.reap(1 << 30); n != 0 {
@@ -96,8 +103,8 @@ func TestWheelLazyInvalidation(t *testing.T) {
 
 	// Refiling the same expiry must not file a duplicate entry.
 	ht.Put(key, []byte("v"), TagString)
-	w.expire(key, 30)
-	w.expire(key, 30)
+	w.expire(key, tickMs(30))
+	w.expire(key, tickMs(30))
 	s := slotOf(t, ht, key)
 	n := 0
 	for _, e := range w.levels[0][30&(wheelBuckets-1)] {
@@ -116,12 +123,12 @@ func TestWheelPersistAndDelInvalidate(t *testing.T) {
 	w := newWheel(ht)
 
 	ht.Put([]byte("kept"), []byte("v"), TagString)
-	w.expire([]byte("kept"), 10)
+	w.expire([]byte("kept"), tickMs(10))
 	if !w.expire([]byte("kept"), 0) {
 		t.Fatal("persist refused")
 	}
 	ht.Put([]byte("gone"), []byte("v"), TagString)
-	w.expire([]byte("gone"), 10)
+	w.expire([]byte("gone"), tickMs(10))
 	ht.Del([]byte("gone"))
 	// The tombstone must not inherit the TTL on revive.
 	ht.Put([]byte("gone"), []byte("v2"), TagString)
@@ -145,7 +152,7 @@ func TestWheelOverflowParksAndRefiles(t *testing.T) {
 	at := uint32(1 + wheelHorizon + 10)
 
 	ht.Put(key, []byte("v"), TagString)
-	w.expire(key, at)
+	w.expire(key, tickMs(at))
 	if len(w.overflow) != 1 {
 		t.Fatalf("beyond-horizon expiry filed %d overflow entries, want 1", len(w.overflow))
 	}
@@ -171,7 +178,7 @@ func TestWheelReapBatchBounded(t *testing.T) {
 	for i := range 200 {
 		k := fmt.Appendf(nil, "due-%03d", i)
 		ht.Put(k, []byte("v"), TagString)
-		w.expire(k, 5)
+		w.expire(k, tickMs(5))
 	}
 
 	advanceTo(ht, w, 5)
@@ -223,7 +230,7 @@ func TestWheelMembershipProperty(t *testing.T) {
 			ht.Put(key, []byte("value"), TagString)
 			if rng.IntN(2) == 0 {
 				at := ht.tick + 1 + uint32(rng.IntN(3000))
-				if w.expire(key, at) && at > maxAt {
+				if w.expire(key, tickMs(at)) && at > maxAt {
 					maxAt = at
 				}
 			}
@@ -278,7 +285,7 @@ func TestWheelCycleZeroAlloc(t *testing.T) {
 		if !ht.Put(key, val, TagString) {
 			panic("put refused")
 		}
-		if !w.expire(key, ht.tick+1) {
+		if !w.expire(key, tickMs(ht.tick+1)) {
 			panic("expire refused")
 		}
 		ht.SetTick(ht.tick + 1)

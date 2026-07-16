@@ -26,12 +26,18 @@ type hdr struct {
 	// which is what keeps the queue duplicate-free under re-dirtying
 	// (the coalescing rule: five writes between drains, one queue entry).
 	// It took one of the header's spare bytes.
-	queued    uint8
+	queued uint8
+	// expireRem is the low 10 bits of expire_ms, so the header carries
+	// the exact expiry: expireLo is the doc 11 wheel projection (floor,
+	// so the trigger tick never fires late) and lo<<10|rem reconstructs
+	// the millisecond for the confirm check and the drain. It took the
+	// header's last two spare bytes.
+	expireRem uint16
 	lastRead  uint32 // coarse ticks, 1s resolution
 	lastWrite uint32
 	prevRead  uint32 // WATT-lite second timestamp
 	prevWrite uint32
-	expireLo  uint32 // low 32 bits of expire_ms/1024, 0 if none
+	expireLo  uint32 // expire_ms>>10, 0 if none
 	gen       uint32 // collection root generation, else 0
 }
 
