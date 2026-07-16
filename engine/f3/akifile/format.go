@@ -96,6 +96,9 @@ var (
 	// ErrCheckpoint is a checkpoint header that is malformed: an unknown
 	// full-or-delta kind, or a full dump carrying a nonzero base offset.
 	ErrCheckpoint = errors.New("akifile: malformed checkpoint header")
+	// ErrShardCount is a live root whose SRT shard count disagrees with the
+	// prefix: a torn SRT swap or a file opened under the wrong shard geometry.
+	ErrShardCount = errors.New("akifile: shard count disagreement")
 )
 
 var (
