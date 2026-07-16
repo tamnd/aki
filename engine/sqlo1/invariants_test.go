@@ -46,7 +46,20 @@ func TestTieredOwnerOnlyNoGoroutines(t *testing.T) {
 	if err := r.t.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if after := runtime.NumGoroutine(); after != before {
+	// runtime.NumGoroutine is process-global, so a GC or finalizer worker
+	// that happens to be up at the sample instant lifts it a notch above the
+	// composite's own steady state, and one that has just exited drops it a
+	// notch below. R-I1 is about the composite holding no workers of its own,
+	// so a lasting growth is the violation, not a passing blip and not a
+	// shrink. Settle a few rounds and keep the low-water mark before judging.
+	after := runtime.NumGoroutine()
+	for try := 0; try < 100 && after > before; try++ {
+		runtime.Gosched()
+		if n := runtime.NumGoroutine(); n < after {
+			after = n
+		}
+	}
+	if after > before {
 		t.Fatalf("goroutines grew %d -> %d across the churn", before, after)
 	}
 	if st := r.t.Stats(); st.Evictions == 0 || r.cs.applyBatches == 0 {
