@@ -77,6 +77,12 @@ type File struct {
 	cursor    uint64
 	globalSeq uint64
 
+	// The two meta slots take turns: commitSeq is the live root's commit sequence,
+	// liveSlot the slot it lives in (0=A, 1=B). A commit stamps the next sequence
+	// into the stale slot and flips liveSlot to it.
+	commitSeq uint64
+	liveSlot  int
+
 	sync     SyncPolicy
 	interval time.Duration
 	now      func() time.Time
@@ -127,7 +133,9 @@ func CreateOnDevice(dev Device, opts CreateOptions) (*File, error) {
 	if err := dev.Sync(); err != nil {
 		return nil, err
 	}
-	return newFile(dev, prefix, opts.Sync, opts.SyncInterval, opts.Now, PageSize, 0), nil
+	// Both slots carry commit_seq 0 and slot A wins the tie, so the fresh file opens
+	// with slot A live.
+	return newFile(dev, prefix, opts.Sync, opts.SyncInterval, opts.Now, PageSize, 0, 0, 0), nil
 }
 
 // Open reopens an existing .aki file for append. It validates the prefix, then
@@ -161,11 +169,26 @@ func OpenOnDevice(dev Device, opts OpenOptions) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Seed the commit counter from the live root so the next commit flips the stale
+	// slot with the right sequence. Both slots torn is a file with no trusted root:
+	// the writer refuses it and the caller runs the full recovery path (Recover).
+	a := make([]byte, MetaSlotSize)
+	if _, err := dev.ReadAt(a, int64(prefix.MetaSlotAOff)); err != nil {
+		return nil, err
+	}
+	b := make([]byte, MetaSlotSize)
+	if _, err := dev.ReadAt(b, int64(prefix.MetaSlotBOff)); err != nil {
+		return nil, err
+	}
+	live, which, err := MetaLive(a, b, prefix.ChecksumKind)
+	if err != nil {
+		return nil, err
+	}
 	cursor, seq := scanTail(dev, prefix, uint64(size))
-	return newFile(dev, prefix, opts.Sync, opts.SyncInterval, opts.Now, cursor, seq), nil
+	return newFile(dev, prefix, opts.Sync, opts.SyncInterval, opts.Now, cursor, seq, live.CommitSeq, which), nil
 }
 
-func newFile(dev Device, prefix *Prefix, sync SyncPolicy, interval time.Duration, now func() time.Time, cursor, seq uint64) *File {
+func newFile(dev Device, prefix *Prefix, sync SyncPolicy, interval time.Duration, now func() time.Time, cursor, seq, commitSeq uint64, liveSlot int) *File {
 	if now == nil {
 		now = time.Now
 	}
@@ -177,6 +200,8 @@ func newFile(dev Device, prefix *Prefix, sync SyncPolicy, interval time.Duration
 		prefix:    prefix,
 		cursor:    cursor,
 		globalSeq: seq,
+		commitSeq: commitSeq,
+		liveSlot:  liveSlot,
 		sync:      sync,
 		interval:  interval,
 		now:       now,
