@@ -130,6 +130,22 @@ func (g *reg) drop(key []byte) {
 	delete(g.m, string(key))
 }
 
+// demote packs a quantum of the named zset's coldest members into cold chunks and
+// reconciles the footprint it freed back into the running total. It is the registry
+// entry the demote trigger drives (the trigger wiring and the victim pick land in PR
+// F); a missing zset or a listpack band is a no-op. Owner goroutine only.
+func (g *reg) demote(cx *shard.Ctx, key []byte, quantum int) int {
+	z := g.m[string(key)]
+	if z == nil {
+		return 0
+	}
+	n := z.demote(cx.St, key, quantum)
+	if n > 0 {
+		g.note(z)
+	}
+	return n
+}
+
 // ResidentBytes is the running sum of every live zset's resident-byte footprint on
 // this shard, the collection half of the store's memory-pressure figure (spec
 // 2064/f3/06 section 6). It is zero when the store runs no cold tier. The shard

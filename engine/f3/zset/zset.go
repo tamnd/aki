@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"math"
 
+	"github.com/tamnd/aki/engine/f3/store"
 	"github.com/tamnd/aki/f3srv/resp"
 )
 
@@ -86,6 +87,17 @@ func (z *zset) residentBytes() uint64 {
 		return uint64(cap(z.blob))
 	}
 	return uint64(z.nat.bytes())
+}
+
+// demote packs a quantum of this zset's coldest members into cold chunks and
+// reports how many left the slab. The listpack band stays resident (a blob is below
+// one chunk's worth, the same reason the set leaves its inline bands resident); only
+// the native band demotes, packing a contiguous rank window per quantum.
+func (z *zset) demote(st *store.Store, key []byte, quantum int) int {
+	if z.enc != encSkiplist {
+		return 0
+	}
+	return z.nat.demote(st, key, quantum)
 }
 
 // newZset builds an empty listpack-class zset. Redis has no intset analogue for
