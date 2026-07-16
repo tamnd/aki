@@ -1,6 +1,10 @@
 package set
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/tamnd/aki/engine/f3/store"
+)
 
 // The set demotion pack (spec 2064/f3/06 sections 6 and 7). Demoting a set walks a
 // native sub-table in member-hash order, packs its members into cold chunks, adds a
@@ -118,6 +122,146 @@ func TestSetDemotePartitionSweep(t *testing.T) {
 	for _, m := range members {
 		if !s.has([]byte(m)) {
 			t.Fatalf("member %q lost after the partition sweep", m)
+		}
+	}
+	wantExact(t, g)
+}
+
+// TestSetColdReadsAreTransparent demotes a whole native set and then drives every
+// read command over the fully cold set: membership hits and misses, the count, a
+// full enumeration, and a draining draw. Each answer is byte-for-byte what a
+// resident set would give, because the demoted records stay on the same table
+// probe and the read paths pread the owning chunk to recover the member bytes
+// (spec 2064/f3/06 section 6.4).
+func TestSetColdReadsAreTransparent(t *testing.T) {
+	cx, g := coldCtx(t)
+
+	members := gen("m", 0, 1000, 12)
+	addKey(g, "k", members...)
+	if n := g.demote(cx, []byte("k")); n != len(members) {
+		t.Fatalf("demoted %d members, want %d", n, len(members))
+	}
+	s := g.m["k"]
+	if s.ht.slab != nil {
+		t.Fatal("slab held bytes after demoting every member")
+	}
+
+	// Membership: every member hits, a never-added member misses, all through the
+	// confirm pread against the chunk.
+	for _, m := range members {
+		if !s.has([]byte(m)) {
+			t.Fatalf("cold member %q missed", m)
+		}
+	}
+	if s.has([]byte("stranger")) {
+		t.Fatal("a never-added member hit against the cold tier")
+	}
+	if got := s.card(); got != len(members) {
+		t.Fatalf("cold card %d, want %d", got, len(members))
+	}
+
+	// Full enumeration: SMEMBERS over the cold set yields the exact member set,
+	// each member read from its chunk.
+	want := map[string]bool{}
+	for _, m := range members {
+		want[m] = true
+	}
+	got := map[string]bool{}
+	s.each(func(m []byte) { got[string(m)] = true })
+	if len(got) != len(want) {
+		t.Fatalf("enumerated %d distinct members, want %d", len(got), len(want))
+	}
+	for m := range want {
+		if !got[m] {
+			t.Fatalf("enumeration dropped cold member %q", m)
+		}
+	}
+
+	// Draining draw: repeated SPOP over the cold set returns every member once and
+	// empties it, the uniform draw riding the tier-tagged vector and preading each
+	// cold winner's bytes.
+	seen := map[string]bool{}
+	var sc [64]byte
+	for s.card() > 0 {
+		m := s.popOne(g, sc[:])
+		if seen[string(m)] {
+			t.Fatalf("SPOP returned %q twice", m)
+		}
+		seen[string(m)] = true
+	}
+	if len(seen) != len(members) {
+		t.Fatalf("SPOP drained %d members, want %d", len(seen), len(members))
+	}
+}
+
+// TestSetPromoteOnConfirmingAdd holds the write-path bring-up (spec 2064/f3/06
+// sections 6.5 and 7.3): a re-add of a member whose record is cold promotes its
+// whole chunk resident. After the add the touched member's record is resident and
+// its bytes are back in the slab, the directory lost exactly that one chunk, its
+// still-cold neighbors read back unchanged, and the running total stays exact.
+func TestSetPromoteOnConfirmingAdd(t *testing.T) {
+	cx, g := coldCtx(t)
+
+	members := gen("m", 0, 1000, 12)
+	addKey(g, "k", members...)
+	if n := g.demote(cx, []byte("k")); n != len(members) {
+		t.Fatalf("demoted %d members, want %d", n, len(members))
+	}
+	s := g.m["k"]
+	chunksBefore := s.cold.dir.Len()
+	if chunksBefore < 2 {
+		t.Fatalf("directory holds %d chunks, want the pack to split into several", chunksBefore)
+	}
+	totalBefore := s.cold.dir.Total()
+
+	// Pick a member that is genuinely cold, and record its chunk's element count so
+	// the directory drop can be checked exactly.
+	target := members[len(members)/2]
+	ord, ok := s.ht.tbl.Find(store.Hash([]byte(target)), []byte(target), s.ht)
+	if !ok {
+		t.Fatalf("target member %q not in the table", target)
+	}
+	if s.ht.recs[ord].band&tierCold == 0 {
+		t.Fatalf("target member %q was not cold before the re-add", target)
+	}
+	slot := locSlot(s.ht.recs[ord].loc)
+	idx, _ := s.ht.cold.dir.Floor(discOf(store.Hash([]byte(target))))
+	_, chunkCount, _ := s.ht.cold.dir.At(idx)
+
+	// Re-add the cold member: the add is a no-op on the count, but it promotes the
+	// chunk.
+	addKey(g, "k", target)
+
+	if s.ht.recs[ord].band&tierCold != 0 {
+		t.Fatal("re-added member stayed cold, the chunk did not promote")
+	}
+	if s.card() != len(members) {
+		t.Fatalf("card %d after a no-op re-add, want %d", s.card(), len(members))
+	}
+	if !s.has([]byte(target)) {
+		t.Fatal("promoted member missing after the re-add")
+	}
+	if got := s.cold.dir.Len(); got != chunksBefore-1 {
+		t.Fatalf("directory holds %d chunks after promotion, want %d", got, chunksBefore-1)
+	}
+	if got := s.cold.dir.Total(); got != totalBefore-uint64(chunkCount) {
+		t.Fatalf("directory total %d after promotion, want %d", got, totalBefore-uint64(chunkCount))
+	}
+
+	// Every promoted member is now resident on its old slot; every other member
+	// still reads back, cold or promoted.
+	promoted := 0
+	for _, o := range s.ht.vec {
+		if locSlot(s.ht.recs[o].loc) == slot && s.ht.recs[o].band&tierCold == 0 {
+			promoted++
+		}
+	}
+	if promoted == 0 {
+		t.Fatal("no member of the target chunk landed resident")
+	}
+	for _, m := range members {
+		if !s.has([]byte(m)) {
+			t.Fatalf("member %q lost after the promotion", m)
 		}
 	}
 	wantExact(t, g)
