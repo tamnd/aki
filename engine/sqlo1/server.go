@@ -41,6 +41,11 @@ type Server struct {
 
 	// bfOps holds one BITFIELD command's parsed subcommands.
 	bfOps []BitfieldOp
+
+	// scanBuf stages one HSCAN step's elements: MATCH decides the
+	// element count only after the walk, so the inner array header
+	// cannot go down first the way HGETALL's does.
+	scanBuf []byte
 }
 
 // splitPairs fills mkeys and mvals from an even-length key-value
@@ -726,6 +731,32 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.hgetexCmd(ctx, reply, args, now)
 	case "HGETDEL":
 		return s.hgetdelCmd(ctx, reply, args)
+	case "HGETALL", "HKEYS", "HVALS":
+		if len(args) != 2 {
+			return arityErr(reply, cmd)
+		}
+		mark := len(reply)
+		err := s.h.HIterate(ctx, args[1], func(n int) {
+			if cmd == "HGETALL" {
+				n *= 2
+			}
+			reply = AppendArray(reply, n)
+		}, func(f, v []byte) {
+			if cmd != "HVALS" {
+				reply = AppendBulk(reply, f)
+			}
+			if cmd != "HKEYS" {
+				reply = AppendBulk(reply, v)
+			}
+		})
+		if err != nil {
+			// A partial array is already in the buffer; truncate back
+			// to the mark so the error is the whole reply.
+			return storeErr(reply[:mark], err)
+		}
+		return reply
+	case "HSCAN":
+		return s.hscanCmd(ctx, reply, args)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
@@ -1136,6 +1167,66 @@ func (s *Server) hgetdelCmd(ctx context.Context, reply []byte, args [][]byte) []
 		}
 	}
 	return reply
+}
+
+// hscanCmd is HSCAN key cursor [MATCH pattern] [COUNT count]
+// [NOVALUES], Redis's option grammar: options repeat with last-wins,
+// COUNT below one is a syntax error, anything unknown is too. The
+// step's elements stage in scanBuf because MATCH decides the element
+// count only after the walk.
+func (s *Server) hscanCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 3 {
+		return arityErr(reply, "HSCAN")
+	}
+	cursor, err := strconv.ParseUint(string(args[2]), 10, 64)
+	if err != nil {
+		return AppendError(reply, "ERR invalid cursor")
+	}
+	count := int64(10)
+	var match []byte
+	hasMatch, noValues := false, false
+	for i := 3; i < len(args); i++ {
+		switch {
+		case strings.EqualFold(string(args[i]), "COUNT") && i+1 < len(args):
+			n, ok := parseCanonicalInt(args[i+1])
+			if !ok {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			if n < 1 {
+				return syntaxErr(reply)
+			}
+			count = n
+			i++
+		case strings.EqualFold(string(args[i]), "MATCH") && i+1 < len(args):
+			match, hasMatch = args[i+1], true
+			i++
+		case strings.EqualFold(string(args[i]), "NOVALUES"):
+			noValues = true
+		default:
+			return syntaxErr(reply)
+		}
+	}
+	s.scanBuf = s.scanBuf[:0]
+	elems := 0
+	next, err := s.h.HScan(ctx, args[1], cursor, count, func(f, v []byte) {
+		if hasMatch && !globMatch(match, f) {
+			return
+		}
+		s.scanBuf = AppendBulk(s.scanBuf, f)
+		elems++
+		if !noValues {
+			s.scanBuf = AppendBulk(s.scanBuf, v)
+			elems++
+		}
+	})
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	var cbuf [20]byte
+	reply = AppendArray(reply, 2)
+	reply = AppendBulk(reply, strconv.AppendUint(cbuf[:0], next, 10))
+	reply = AppendArray(reply, elems)
+	return append(reply, s.scanBuf...)
 }
 
 // fieldsBlock parses the FIELDS numfields field... run that ends

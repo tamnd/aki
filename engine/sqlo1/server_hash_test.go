@@ -1,7 +1,10 @@
 package sqlo1
 
 import (
+	"bufio"
 	"fmt"
+	"io"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -187,4 +190,236 @@ func TestServerHashSurface(t *testing.T) {
 	expect(t, r, "+none\r\n")
 	send("HLEN", "h")
 	expect(t, r, ":0\r\n")
+}
+
+// readArrayLen reads a * header line off the reply stream.
+func readArrayLen(t *testing.T, r *bufio.Reader) int {
+	t.Helper()
+	line, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading array header: %v", err)
+	}
+	if len(line) < 4 || line[0] != '*' {
+		t.Fatalf("reply %q is not an array header", line)
+	}
+	n, err := strconv.Atoi(strings.TrimSuffix(line[1:], "\r\n"))
+	if err != nil {
+		t.Fatalf("array header %q: %v", line, err)
+	}
+	return n
+}
+
+// readBulk reads one bulk string off the reply stream.
+func readBulk(t *testing.T, r *bufio.Reader) string {
+	t.Helper()
+	line, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading bulk header: %v", err)
+	}
+	if len(line) < 4 || line[0] != '$' {
+		t.Fatalf("reply %q is not a bulk header", line)
+	}
+	n, err := strconv.Atoi(strings.TrimSuffix(line[1:], "\r\n"))
+	if err != nil || n < 0 {
+		t.Fatalf("bulk header %q: %v", line, err)
+	}
+	buf := make([]byte, n+2)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		t.Fatalf("reading bulk body: %v", err)
+	}
+	return string(buf[:n])
+}
+
+func TestServerHashIterSurface(t *testing.T) {
+	c, r := startServer(t)
+	send := func(args ...string) {
+		t.Helper()
+		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Empty keys answer empty aggregates, cursor zero for HSCAN.
+	send("HGETALL", "ghost")
+	expect(t, r, "*0\r\n")
+	send("HKEYS", "ghost")
+	expect(t, r, "*0\r\n")
+	send("HVALS", "ghost")
+	expect(t, r, "*0\r\n")
+	send("HSCAN", "ghost", "0")
+	expect(t, r, "*2\r\n$1\r\n0\r\n*0\r\n")
+
+	// Inline hash: insertion order makes the replies exact.
+	send("HSET", "h", "b", "2", "a", "1", "c", "3")
+	expect(t, r, ":3\r\n")
+	send("HGETALL", "h")
+	expect(t, r, "*6\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nc\r\n$1\r\n3\r\n")
+	send("HKEYS", "h")
+	expect(t, r, "*3\r\n$1\r\nb\r\n$1\r\na\r\n$1\r\nc\r\n")
+	send("HVALS", "h")
+	expect(t, r, "*3\r\n$1\r\n2\r\n$1\r\n1\r\n$1\r\n3\r\n")
+
+	// Inline HSCAN answers any cursor with everything and cursor 0.
+	send("HSCAN", "h", "0")
+	expect(t, r, "*2\r\n$1\r\n0\r\n*6\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nc\r\n$1\r\n3\r\n")
+	send("HSCAN", "h", "999")
+	expect(t, r, "*2\r\n$1\r\n0\r\n*6\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nc\r\n$1\r\n3\r\n")
+	send("HSCAN", "h", "0", "NOVALUES")
+	expect(t, r, "*2\r\n$1\r\n0\r\n*3\r\n$1\r\nb\r\n$1\r\na\r\n$1\r\nc\r\n")
+	send("HSCAN", "h", "0", "MATCH", "[ab]", "NOVALUES")
+	expect(t, r, "*2\r\n$1\r\n0\r\n*2\r\n$1\r\nb\r\n$1\r\na\r\n")
+	send("HSCAN", "h", "0", "COUNT", "100", "MATCH", "nope*")
+	expect(t, r, "*2\r\n$1\r\n0\r\n*0\r\n")
+
+	// Option grammar doors.
+	send("HSCAN", "h")
+	expect(t, r, "-ERR wrong number of arguments for 'hscan' command\r\n")
+	send("HSCAN", "h", "abc")
+	expect(t, r, "-ERR invalid cursor\r\n")
+	send("HSCAN", "h", "-1")
+	expect(t, r, "-ERR invalid cursor\r\n")
+	send("HSCAN", "h", "0", "COUNT", "0")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("HSCAN", "h", "0", "COUNT", "abc")
+	expect(t, r, "-ERR value is not an integer or out of range\r\n")
+	send("HSCAN", "h", "0", "COUNT")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("HSCAN", "h", "0", "MATCH")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("HSCAN", "h", "0", "BOGUS")
+	expect(t, r, "-ERR syntax error\r\n")
+
+	// Cross-type doors.
+	send("SET", "str", "v")
+	expect(t, r, "+OK\r\n")
+	send("HGETALL", "str")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	send("HKEYS", "str")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	send("HVALS", "str")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	send("HSCAN", "str", "0")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+
+	// Segmented: 150 fields flip the encoding; the streams and the
+	// cursor walk must reproduce the hash exactly, order unspecified.
+	args := []string{"HSET", "big"}
+	want := map[string]string{}
+	for i := range 150 {
+		f := fmt.Sprintf("w%03d", i)
+		v := fmt.Sprintf("val-%d", i)
+		want[f] = v
+		args = append(args, f, v)
+	}
+	send(args...)
+	expect(t, r, ":150\r\n")
+	send("OBJECT", "ENCODING", "big")
+	expect(t, r, "$9\r\nhashtable\r\n")
+
+	send("HGETALL", "big")
+	if n := readArrayLen(t, r); n != 300 {
+		t.Fatalf("HGETALL array of %d elements, want 300", n)
+	}
+	got := map[string]string{}
+	for range 150 {
+		f := readBulk(t, r)
+		got[f] = readBulk(t, r)
+	}
+	for f, v := range want {
+		if got[f] != v {
+			t.Fatalf("HGETALL field %s = %q, want %q", f, got[f], v)
+		}
+	}
+
+	send("HKEYS", "big")
+	if n := readArrayLen(t, r); n != 150 {
+		t.Fatalf("HKEYS array of %d elements, want 150", n)
+	}
+	keys := map[string]bool{}
+	for range 150 {
+		keys[readBulk(t, r)] = true
+	}
+	for f := range want {
+		if !keys[f] {
+			t.Fatalf("HKEYS missed field %s", f)
+		}
+	}
+
+	send("HVALS", "big")
+	if n := readArrayLen(t, r); n != 150 {
+		t.Fatalf("HVALS array of %d elements, want 150", n)
+	}
+	vals := map[string]bool{}
+	for range 150 {
+		vals[readBulk(t, r)] = true
+	}
+	for _, v := range want {
+		if !vals[v] {
+			t.Fatalf("HVALS missed value %s", v)
+		}
+	}
+
+	// The full HSCAN walk: small COUNT so the cursor steps through
+	// segments, every field seen at least once, walk terminates.
+	seen := map[string]string{}
+	cursor := "0"
+	for step := 0; ; step++ {
+		if step > 200 {
+			t.Fatal("HSCAN walk did not complete in 200 steps")
+		}
+		send("HSCAN", "big", cursor, "COUNT", "10")
+		if n := readArrayLen(t, r); n != 2 {
+			t.Fatalf("HSCAN reply array of %d elements, want 2", n)
+		}
+		cursor = readBulk(t, r)
+		n := readArrayLen(t, r)
+		if n%2 != 0 {
+			t.Fatalf("HSCAN element array of %d entries is odd", n)
+		}
+		for range n / 2 {
+			f := readBulk(t, r)
+			seen[f] = readBulk(t, r)
+		}
+		if cursor == "0" {
+			break
+		}
+	}
+	if len(seen) != 150 {
+		t.Fatalf("HSCAN walk saw %d distinct fields, want 150", len(seen))
+	}
+	for f, v := range want {
+		if seen[f] != v {
+			t.Fatalf("HSCAN field %s = %q, want %q", f, seen[f], v)
+		}
+	}
+
+	// MATCH over the segmented walk filters fields, not the cursor.
+	seen = map[string]string{}
+	cursor = "0"
+	for step := 0; ; step++ {
+		if step > 200 {
+			t.Fatal("filtered HSCAN walk did not complete in 200 steps")
+		}
+		send("HSCAN", "big", cursor, "COUNT", "10", "MATCH", "w01*")
+		if n := readArrayLen(t, r); n != 2 {
+			t.Fatalf("HSCAN reply array of %d elements, want 2", n)
+		}
+		cursor = readBulk(t, r)
+		n := readArrayLen(t, r)
+		for range n / 2 {
+			f := readBulk(t, r)
+			seen[f] = readBulk(t, r)
+		}
+		if cursor == "0" {
+			break
+		}
+	}
+	if len(seen) != 10 {
+		t.Fatalf("filtered walk saw %d fields, want the 10 w01x ones", len(seen))
+	}
+	for i := 10; i < 20; i++ {
+		if f := fmt.Sprintf("w%03d", i); seen[f] != want[f] {
+			t.Fatalf("filtered walk missed %s", f)
+		}
+	}
 }
