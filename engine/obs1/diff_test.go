@@ -13,6 +13,7 @@ import (
 	"hash/fnv"
 	"math/rand/v2"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,6 +86,13 @@ func runScript(t *testing.T, s obs1.Store, script []stepFn) []string {
 
 // diff runs the script against the sim and, when AKI_OBS1_S3 offers one, a
 // real MinIO, then compares the traces step by step.
+//
+// The faultless sim never answers ambiguous or slowdown, so either class
+// in the live trace means the wire or the server hiccuped, not that the
+// semantics diverged; and once one write's outcome is unknown, every later
+// step on that key compares garbage. Such a run is discarded and replayed
+// on a fresh bucket, a few attempts before giving up, so the suite stays
+// strict about semantics without flaking on busy CI runners.
 func diff(t *testing.T, script []stepFn) {
 	t.Helper()
 	endpoint := os.Getenv("AKI_OBS1_S3")
@@ -93,27 +101,48 @@ func diff(t *testing.T, script []stepFn) {
 	}
 	user := envOrDiff("AKI_OBS1_S3_USER", "minioadmin")
 	pass := envOrDiff("AKI_OBS1_S3_PASS", "minioadmin")
-	bucket := fmt.Sprintf("obs1-diff-%d", time.Now().UnixNano())
-	obs1.CreateTestBucket(t, endpoint, bucket, user, pass)
-	c, err := obs1.NewClient(obs1.ClientConfig{
-		Endpoint:  endpoint,
-		Region:    "us-east-1",
-		Bucket:    bucket,
-		AccessKey: user,
-		SecretKey: pass,
-		PathStyle: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	simTrace := runScript(t, sim.New(sim.Config{}), script)
-	realTrace := runScript(t, c, script)
-	for i := range script {
-		if simTrace[i] != realTrace[i] {
-			t.Errorf("step %d diverged:\n  sim   %s\n  minio %s", i, simTrace[i], realTrace[i])
+	const attempts = 3
+	for a := range attempts {
+		bucket := fmt.Sprintf("obs1-diff-%d", time.Now().UnixNano())
+		obs1.CreateTestBucket(t, endpoint, bucket, user, pass)
+		c, err := obs1.NewClient(obs1.ClientConfig{
+			Endpoint:  endpoint,
+			Region:    "us-east-1",
+			Bucket:    bucket,
+			AccessKey: user,
+			SecretKey: pass,
+			PathStyle: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		realTrace := runScript(t, c, script)
+		if i := firstBlip(realTrace); i >= 0 {
+			t.Logf("attempt %d: infrastructure blip at step %d (%s), replaying on a fresh bucket", a+1, i, realTrace[i])
+			continue
+		}
+		simTrace := runScript(t, sim.New(sim.Config{}), script)
+		for i := range script {
+			if simTrace[i] != realTrace[i] {
+				t.Errorf("step %d diverged:\n  sim   %s\n  minio %s", i, simTrace[i], realTrace[i])
+			}
+		}
+		return
+	}
+	t.Fatalf("no clean run in %d attempts; the server at %s is too unhealthy to compare against", attempts, endpoint)
+}
+
+// firstBlip finds the first live-side outcome the faultless sim can never
+// produce, or -1. Outcomes sit after the "-> " every step builder writes.
+func firstBlip(trace []string) int {
+	for i, s := range trace {
+		if strings.Contains(s, "-> ambiguous") || strings.Contains(s, "-> slowdown") {
+			return i
 		}
 	}
+	return -1
 }
 
 func envOrDiff(k, def string) string {
