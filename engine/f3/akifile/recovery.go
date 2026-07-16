@@ -515,25 +515,31 @@ func RebuildShardChunkDir(dev Device, prefix *Prefix, chunkdirOff uint64) (*Chun
 }
 
 // Recovery is the structural result of opening a file: the picked open state, the
-// shard root table (nil when no checkpoint has been taken), and each shard's index
-// rebuilt from its checkpoint chain (nil on a scan fallback, where there is no
-// trusted root to name the checkpoints). TailFrom is the offset the caller starts
-// the tail replay at; the caller applies the tail's log segments, which carry
-// records the akifile layer cannot interpret, over the rebuilt indexes to reach
-// the live state.
+// shard root table (nil when no checkpoint has been taken), and each shard's auxiliary
+// tables rebuilt from their checkpoint chains (all nil on a scan fallback, where there
+// is no trusted root to name the checkpoints). TailFrom is the offset the caller starts
+// the tail replay at; the caller applies the tail's log segments, which carry records
+// the akifile layer cannot interpret, over the rebuilt tables to reach the live state.
+//
+// The three per-shard slices are index-aligned with the SRT rows: Indexes[k] is shard
+// k's rebuilt index, SegStats[k] its dead-byte accounting, ChunkDirs[k] its cold-chunk
+// directory. A shard that never checkpointed a given table carries an empty rebuilder
+// there, not a nil, so a consumer folds the tail over a table it can always index.
 type Recovery struct {
-	State    *OpenState
-	SRT      *SRT
-	Indexes  []*IndexRebuilder
-	TailFrom uint64
+	State     *OpenState
+	SRT       *SRT
+	Indexes   []*IndexRebuilder
+	SegStats  []*SegStatsRebuilder
+	ChunkDirs []*ChunkDirRebuilder
+	TailFrom  uint64
 }
 
 // Recover runs the whole open sequence and assembles the structural recovery
 // (spec 2064/f3/07 section 6): pick the live root, read the shard root table, and
-// rebuild each shard's index from its checkpoint chain. It stops at the boundary
-// the akifile format owns: the tail replay past TailFrom is the caller's, because
-// turning a log segment back into index entries is store knowledge this layer does
-// not hold.
+// rebuild each shard's index, dead-byte accounting, and cold-chunk directory from
+// their checkpoint chains. It stops at the boundary the akifile format owns: the tail
+// replay past TailFrom is the caller's, because turning a log segment back into index
+// entries is store knowledge this layer does not hold.
 //
 // The tail-replay start depends on the outcome. A scan fallback has no root, so it
 // replays the whole append space from the header page. A file with no checkpoints
@@ -564,6 +570,8 @@ func Recover(dev Device) (*Recovery, error) {
 	}
 
 	rec.Indexes = make([]*IndexRebuilder, len(srt.Rows))
+	rec.SegStats = make([]*SegStatsRebuilder, len(srt.Rows))
+	rec.ChunkDirs = make([]*ChunkDirRebuilder, len(srt.Rows))
 	tailFrom := st.Meta.FileSize
 	for i := range srt.Rows {
 		idx, err := RebuildShardIndex(dev, st.Prefix, srt.Rows[i].IndexCkptOff)
@@ -571,6 +579,16 @@ func Recover(dev Device) (*Recovery, error) {
 			return nil, err
 		}
 		rec.Indexes[i] = idx
+		ss, err := RebuildShardSegStats(dev, st.Prefix, srt.Rows[i].SegstatsOff)
+		if err != nil {
+			return nil, err
+		}
+		rec.SegStats[i] = ss
+		cd, err := RebuildShardChunkDir(dev, st.Prefix, srt.Rows[i].ChunkdirOff)
+		if err != nil {
+			return nil, err
+		}
+		rec.ChunkDirs[i] = cd
 		if ft := srt.Rows[i].FirstTailSeg; ft != 0 && ft < tailFrom {
 			tailFrom = ft
 		}
