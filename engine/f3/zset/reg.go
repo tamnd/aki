@@ -141,6 +141,25 @@ func Len(cx *shard.Ctx) int {
 	return len(cx.ZColl.(*reg).m)
 }
 
+// VolatileLen counts the zsets on this shard carrying a key-level TTL, the zset
+// contribution to INFO's Keyspace expires field. It walks the registry map
+// counting a non-zero deadline whether or not it has passed, matching the
+// map-size basis of Len (a lazily-expired-but-unreaped zset still shows in both
+// totals until a read drops it). INFO is a cold path, so the O(keys) walk is off
+// every command's critical path. It builds no registry when none exists.
+func VolatileLen(cx *shard.Ctx) uint64 {
+	if cx.ZColl == nil {
+		return 0
+	}
+	var n uint64
+	for _, z := range cx.ZColl.(*reg).m {
+		if z.expireAt != 0 {
+			n++
+		}
+	}
+	return n
+}
+
 // RangeKeys calls fn with every zset key on this shard, the zset contribution to
 // the unified KEYS and SCAN walk. It builds no registry when none exists, so a
 // shard that ran no zset command yields nothing. It returns false when fn asked

@@ -47,6 +47,43 @@ func (s *Store) rangeSegment(seg *indexSegment, now int64, fn func(key []byte) b
 	return true
 }
 
+// VolatileKeys counts the string keys carrying an expiry deadline, the
+// string-store contribution to INFO's Keyspace expires field. It walks the
+// index the same read-only way RangeKeys does, mutating nothing and reaping
+// nothing, so it is perf-neutral and leaves the residency clock untouched; INFO
+// is a cold path, so the O(keys) walk is off every command's critical path.
+// Only resident records are examined: a cold record carries no deadline (the
+// migrator demotes only TTL-free records), so it never counts. A deadline is
+// counted whether or not it has passed, matching the map-size basis of the key
+// count (a lazily-expired-but-unreaped key still shows in both totals until a
+// keyed read drops it). It runs on the owner goroutine at a command boundary.
+func (s *Store) VolatileKeys() uint64 {
+	var n uint64
+	for _, seg := range s.idx.segs {
+		if seg == nil {
+			continue
+		}
+		count := func(b *bucket) {
+			for i := 0; i < slotsPerBucket; i++ {
+				w := b.slots[i]
+				if w == 0 || slotCold(w) {
+					continue
+				}
+				if s.expireAt(w&addrMask) != 0 {
+					n++
+				}
+			}
+		}
+		for i := range seg.buckets {
+			count(&seg.buckets[i])
+		}
+		for i := range seg.overflow {
+			count(&seg.overflow[i])
+		}
+	}
+	return n
+}
+
 // rangeBucket decodes each non-zero slot in one bucket and hands its key to fn.
 // A zero word is an empty slot. A resident word's address is an arena offset
 // whose key bytes read directly; an expired resident record is skipped without

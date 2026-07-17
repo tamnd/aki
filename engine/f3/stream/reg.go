@@ -248,6 +248,27 @@ func Len(cx *shard.Ctx) int {
 	return len(v.(*reg).m)
 }
 
+// VolatileLen counts the streams on this shard carrying a key-level TTL, the
+// stream contribution to INFO's Keyspace expires field. An emptied-but-kept
+// stream (XLEN reads 0) is a live key that counts here only when it carries a
+// deadline. It walks the registry map counting a non-zero deadline whether or
+// not it has passed, matching the map-size basis of Len. INFO is a cold path, so
+// the O(keys) walk is off every command's critical path. It builds no registry
+// when none exists.
+func VolatileLen(cx *shard.Ctx) uint64 {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return 0
+	}
+	var n uint64
+	for _, s := range v.(*reg).m {
+		if s.expireAt != 0 {
+			n++
+		}
+	}
+	return n
+}
+
 // RangeKeys calls fn with every stream key on this shard, the stream
 // contribution to the unified KEYS and SCAN walk. An emptied-but-kept stream is
 // a live key (XLEN reads 0), so it shows like any other. It reaches the registry

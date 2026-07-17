@@ -1573,7 +1573,9 @@ func dbsizeShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 func infoShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	extra := uint64(set.Len(cx)) + uint64(zset.Len(cx)) + uint64(hash.Len(cx)) +
 		uint64(list.Len(cx)) + uint64(stream.Len(cx))
-	str.WriteInfoBlob(cx, extra, r)
+	vol := set.VolatileLen(cx) + zset.VolatileLen(cx) + hash.VolatileLen(cx) +
+		list.VolatileLen(cx) + stream.VolatileLen(cx)
+	str.WriteInfoBlob(cx, extra, vol, r)
 }
 
 // parseScan reads a SCAN tail: args[0] is the cursor, then any of MATCH pattern,

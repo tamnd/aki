@@ -19,16 +19,18 @@ import (
 // WriteInfoBlob to fold in the collection keyspaces the keys count would
 // otherwise miss.
 func InfoShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	WriteInfoBlob(cx, 0, r)
+	WriteInfoBlob(cx, 0, 0, r)
 }
 
 // WriteInfoBlob builds and writes one shard's FanStats blob. extraKeys is added
 // to the string store's own key count so the gathered keys:N line counts every
-// keyspace, not just strings; the dispatch INFO handler supplies the collection
-// key totals because the type packages cannot be imported here without a cycle.
-// The blob stays on the stack: r.Raw copies it into the fan buffer before this
-// returns, so nothing escapes.
-func WriteInfoBlob(cx *shard.Ctx, extraKeys uint64, r shard.Reply) {
+// keyspace, not just strings, and extraVolatile likewise folds the collection
+// key-level TTL counts into the volatile total the Keyspace expires field reads;
+// the dispatch INFO handler supplies both collection totals because the type
+// packages cannot be imported here without a cycle. The string store's own
+// volatile count comes from VolatileKeys. The blob stays on the stack: r.Raw
+// copies it into the fan buffer before this returns, so nothing escapes.
+func WriteInfoBlob(cx *shard.Ctx, extraKeys, extraVolatile uint64, r shard.Reply) {
 	var b [shard.NumStats * 8]byte
 	put := func(i int, v uint64) { binary.LittleEndian.PutUint64(b[i*8:], v) }
 	st := cx.St
@@ -54,5 +56,6 @@ func WriteInfoBlob(cx *shard.Ctx, extraKeys uint64, r shard.Reply) {
 	put(shard.StatDemotes, rs.Demotes)
 	put(shard.StatBackpressureWaits, cx.BackpressureWaits())
 	put(shard.StatBackpressureStalls, cx.BackpressureStalls())
+	put(shard.StatVolatileKeys, st.VolatileKeys()+extraVolatile)
 	r.Raw(b[:])
 }
