@@ -52,31 +52,40 @@ func (p ChainPos) Before(q ChainPos) bool {
 	return p.Seq < q.Seq
 }
 
-// ManifestSeg is one live segment's row.
+// ManifestSeg is one live segment's row. FooterOff and FooterLen are the
+// #1102 open plan: with them a cold open is two exact GETs, the manifest
+// and the footer, no speculative tail read.
 type ManifestSeg struct {
-	SegSeq   uint64
-	Level    uint8
-	TTLClass uint8
-	Size     uint64 // object size in the bucket
-	NRecords uint64
-	RawBytes uint64
-	MinExpMS uint64
-	MaxExpMS uint64
-	DeadFrac uint16 // per-mille dead-record estimate (doc 06)
+	SegSeq    uint64
+	Level     uint8
+	TTLClass  uint8
+	Size      uint64 // object size in the bucket
+	NRecords  uint64
+	RawBytes  uint64
+	MinExpMS  uint64
+	MaxExpMS  uint64
+	DeadFrac  uint16 // per-mille dead-record estimate (doc 06)
+	FooterOff uint64
+	FooterLen uint32
 }
 
-// Manifest is one complete statement of a group's fold state.
+// Manifest is one complete statement of a group's fold state. FoldPos and
+// FoldSeq together are the replay floor: boot replays the chain from
+// FoldPos and applies only frames with seq above FoldSeq, because a commit
+// section can span the fold cursor mid-section, so the chain position
+// alone cannot say which of its frames the segments already hold.
 type Manifest struct {
 	Group   uint16
 	Epoch   uint32 // folder's lease epoch at write time
 	ManSeq  uint64
 	FoldPos ChainPos // chain position through which WAL frames are folded
+	FoldSeq uint64   // highest frame seq the live segments cover
 	Segs    []ManifestSeg
 }
 
 const (
-	manFixed = 2 + 4 + 8 + 8 + 4 // group..nsegs
-	manSeg   = 8 + 1 + 1 + 8 + 8 + 8 + 8 + 8 + 2
+	manFixed = 2 + 4 + 8 + 8 + 8 + 4 // group..nsegs
+	manSeg   = 8 + 1 + 1 + 8 + 8 + 8 + 8 + 8 + 2 + 8 + 4
 )
 
 // manifestKey renders man/g<ggg>/<seq16> under the database prefix.
@@ -110,6 +119,12 @@ func AppendManifest(b []byte, writer uint64, m Manifest) ([]byte, error) {
 		if s.DeadFrac > 1000 {
 			return nil, fmt.Errorf("obs1: manifest seg %d deadfrac %d per-mille", i, s.DeadFrac)
 		}
+		if s.FooterOff+uint64(s.FooterLen) > s.Size {
+			return nil, fmt.Errorf("obs1: manifest seg %d footer %d+%d runs past size %d", i, s.FooterOff, s.FooterLen, s.Size)
+		}
+		if s.FooterLen == 0 && s.Size != 0 {
+			return nil, fmt.Errorf("obs1: manifest seg %d has a size but no footer", i)
+		}
 	}
 	b = AppendHeader(b, Header{Format: FormatManifest, FVersion: 1, Writer: writer})
 	p := len(b)
@@ -117,6 +132,7 @@ func AppendManifest(b []byte, writer uint64, m Manifest) ([]byte, error) {
 	b = binary.LittleEndian.AppendUint32(b, m.Epoch)
 	b = binary.LittleEndian.AppendUint64(b, m.ManSeq)
 	b = binary.LittleEndian.AppendUint64(b, packed)
+	b = binary.LittleEndian.AppendUint64(b, m.FoldSeq)
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(m.Segs)))
 	for _, s := range m.Segs {
 		b = binary.LittleEndian.AppendUint64(b, s.SegSeq)
@@ -127,6 +143,8 @@ func AppendManifest(b []byte, writer uint64, m Manifest) ([]byte, error) {
 		b = binary.LittleEndian.AppendUint64(b, s.MinExpMS)
 		b = binary.LittleEndian.AppendUint64(b, s.MaxExpMS)
 		b = binary.LittleEndian.AppendUint16(b, s.DeadFrac)
+		b = binary.LittleEndian.AppendUint64(b, s.FooterOff)
+		b = binary.LittleEndian.AppendUint32(b, s.FooterLen)
 	}
 	return binary.LittleEndian.AppendUint32(b, crc32c(b[p:])), nil
 }
@@ -154,7 +172,8 @@ func ParseManifest(b []byte) (Manifest, Header, error) {
 	m.Epoch = binary.LittleEndian.Uint32(body[2:6])
 	m.ManSeq = binary.LittleEndian.Uint64(body[6:14])
 	m.FoldPos = UnpackChainPos(binary.LittleEndian.Uint64(body[14:22]))
-	nsegs := int(binary.LittleEndian.Uint32(body[22:26]))
+	m.FoldSeq = binary.LittleEndian.Uint64(body[22:30])
+	nsegs := int(binary.LittleEndian.Uint32(body[30:34]))
 	if len(body) != manFixed+nsegs*manSeg {
 		return m, Header{}, fmt.Errorf("obs1: manifest with %d segs wants %d payload bytes, has %d", nsegs, manFixed+nsegs*manSeg+4, len(p))
 	}
@@ -164,15 +183,17 @@ func ParseManifest(b []byte) (Manifest, Header, error) {
 	for i := range m.Segs {
 		r := body[manFixed+i*manSeg:]
 		m.Segs[i] = ManifestSeg{
-			SegSeq:   binary.LittleEndian.Uint64(r[0:8]),
-			Level:    r[8],
-			TTLClass: r[9],
-			Size:     binary.LittleEndian.Uint64(r[10:18]),
-			NRecords: binary.LittleEndian.Uint64(r[18:26]),
-			RawBytes: binary.LittleEndian.Uint64(r[26:34]),
-			MinExpMS: binary.LittleEndian.Uint64(r[34:42]),
-			MaxExpMS: binary.LittleEndian.Uint64(r[42:50]),
-			DeadFrac: binary.LittleEndian.Uint16(r[50:52]),
+			SegSeq:    binary.LittleEndian.Uint64(r[0:8]),
+			Level:     r[8],
+			TTLClass:  r[9],
+			Size:      binary.LittleEndian.Uint64(r[10:18]),
+			NRecords:  binary.LittleEndian.Uint64(r[18:26]),
+			RawBytes:  binary.LittleEndian.Uint64(r[26:34]),
+			MinExpMS:  binary.LittleEndian.Uint64(r[34:42]),
+			MaxExpMS:  binary.LittleEndian.Uint64(r[42:50]),
+			DeadFrac:  binary.LittleEndian.Uint16(r[50:52]),
+			FooterOff: binary.LittleEndian.Uint64(r[52:60]),
+			FooterLen: binary.LittleEndian.Uint32(r[60:64]),
 		}
 	}
 	if again, err := AppendManifest(nil, h.Writer, m); err != nil {

@@ -15,7 +15,7 @@ func TestManifestOnSim(t *testing.T) {
 
 	m0 := obs1.Manifest{Group: 2, Epoch: 7, ManSeq: 0, FoldPos: obs1.ChainPos{Seq: 10}}
 	m1 := obs1.Manifest{Group: 2, Epoch: 7, ManSeq: 1, FoldPos: obs1.ChainPos{DD: 1, Seq: 4}, Segs: []obs1.ManifestSeg{
-		{SegSeq: 1, Size: 100, NRecords: 2, RawBytes: 64},
+		{SegSeq: 1, Size: 100, NRecords: 2, RawBytes: 64, FooterOff: 60, FooterLen: 24},
 	}}
 	if err := obs1.PutManifest(ctx, s, "db/a", 9, m0); err != nil {
 		t.Fatal(err)
