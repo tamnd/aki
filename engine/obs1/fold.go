@@ -79,6 +79,11 @@ type FoldConfig struct {
 	// FoldAge overrides the age trigger's bound, zero for the 15s doc 06
 	// default; negative disables the cadence for tests that cut explicitly.
 	FoldAge time.Duration
+
+	// Seed carries each group's winning manifest from boot recovery, so
+	// SegSeq continues past every published slot instead of restarting at
+	// one and colliding with live rows. At most one manifest per group.
+	Seed []Manifest
 }
 
 // FoldedSegment is one ledger row: a segment durably in the bucket whose
@@ -187,6 +192,21 @@ func NewFolder(cfg FoldConfig) (*Folder, error) {
 	}
 	if f.chTarget <= 0 {
 		f.chTarget = foldChunkTarget
+	}
+	for _, m := range cfg.Seed {
+		if _, ok := f.groups[m.Group]; ok {
+			return nil, fmt.Errorf("obs1: two seed manifests for group %d", m.Group)
+		}
+		seq := uint64(1)
+		for _, s := range m.Segs {
+			if s.SegSeq >= seq {
+				seq = s.SegSeq + 1
+			}
+		}
+		f.groups[m.Group] = &foldGroup{
+			epoch: m.Epoch, seq: seq,
+			recIdx: make(map[string]int), chIdx: make(map[string]int),
+		}
 	}
 	f.cond = sync.NewCond(&f.mu)
 	f.ctx, f.cancel = context.WithCancel(context.Background())
