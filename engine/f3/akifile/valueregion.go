@@ -67,6 +67,54 @@ func (f *File) ReadValueAt(p ValuePointer, dst []byte) ([]byte, error) {
 	return dst, nil
 }
 
+// CompactValues re-homes a set of still-live values into one fresh value_log
+// segment, the reclaim step the store's value-log compaction drives: a segment
+// whose dead fraction is high is rewritten by handing its live pointers here,
+// and the returned pointers replace the old ones in their records so the old
+// segment's whole span, live bytes and dead alike, becomes free. It reads each
+// live value through its pointer (so a torn or superseded blob fails the copy
+// instead of migrating rot forward), frames the run into one payload, and cuts a
+// single value_log segment owned by shard. The returned pointers are in the same
+// order as live, so the caller maps old to new by index. An empty set writes no
+// segment. The read scratch is reused across values, so the whole batch costs one
+// growing buffer, not one per value.
+func (f *File) CompactValues(shard uint16, shardSeq uint64, live []ValuePointer) ([]ValuePointer, error) {
+	if len(live) == 0 {
+		return nil, nil
+	}
+	var payload, scratch []byte
+	frames := make([]ValueFrame, len(live))
+	for i, p := range live {
+		val, err := f.ReadValueAt(p, scratch)
+		if err != nil {
+			return nil, err
+		}
+		payload, frames[i] = AppendValueFrame(payload, val)
+		// AppendValueFrame copied val into payload, so the scratch is free to hold
+		// the next read.
+		scratch = val[:0]
+	}
+	offs, err := f.AppendGroup([]Pending{{
+		Shard:    shard,
+		Kind:     KindValueLog,
+		ShardSeq: shardSeq,
+		Payload:  payload,
+	}})
+	if err != nil {
+		return nil, err
+	}
+	base := offs[0] + SegHeaderLen
+	ptrs := make([]ValuePointer, len(live))
+	for i, fr := range frames {
+		ptrs[i] = ValuePointer{
+			ValueOff: base + fr.ValueOff,
+			ValueLen: fr.ValueLen,
+			ValueCRC: fr.CRC,
+		}
+	}
+	return ptrs, nil
+}
+
 // ReadValueFrameAt reads a value the caller located by only its offset and length,
 // verifying the torn-blob guard off the frame's own trailing CRC32C instead of a
 // stored one. It reads value_len bytes plus the four CRC bytes the frame trails

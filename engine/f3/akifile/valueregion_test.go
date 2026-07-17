@@ -158,6 +158,81 @@ func TestReadValueFrameAtCatchesTornBlob(t *testing.T) {
 	}
 }
 
+// TestCompactValuesRehomesLiveSubset appends a batch, then re-homes only the
+// live subset into a fresh segment past the old one and confirms every new
+// pointer resolves to its value, the reclaim the store's value-log compaction
+// drives.
+func TestCompactValuesRehomesLiveSubset(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	vals := [][]byte{[]byte("keep-a"), []byte("dead-1"), bytes.Repeat([]byte("k"), 3000), []byte("dead-2"), []byte("keep-b")}
+	ptrs, err := f.AppendValues(0, 1, vals)
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// Indices 1 and 3 are dead; the rest are live and get re-homed.
+	liveIdx := []int{0, 2, 4}
+	live := make([]ValuePointer, len(liveIdx))
+	for i, j := range liveIdx {
+		live[i] = ptrs[j]
+	}
+
+	start := f.Cursor()
+	got, err := f.CompactValues(0, 2, live)
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if len(got) != len(live) {
+		t.Fatalf("got %d pointers, want %d", len(got), len(live))
+	}
+	// The rewrite lands past every original value.
+	for i, p := range got {
+		if p.ValueOff < start {
+			t.Fatalf("re-homed pointer %d off %d not past the old region start %d", i, p.ValueOff, start)
+		}
+		v, err := f.ReadValueAt(p, nil)
+		if err != nil {
+			t.Fatalf("read re-homed %d: %v", i, err)
+		}
+		if !bytes.Equal(v, vals[liveIdx[i]]) {
+			t.Fatalf("re-homed %d = %q, want %q", i, v, vals[liveIdx[i]])
+		}
+	}
+}
+
+// TestCompactValuesEmptyWritesNothing leaves the file untouched for an empty
+// live set: a segment with nothing live reclaims to nothing.
+func TestCompactValuesEmptyWritesNothing(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	start := f.Cursor()
+	got, err := f.CompactValues(0, 1, nil)
+	if err != nil || got != nil {
+		t.Fatalf("empty compact = %v/%v, want nil/nil", got, err)
+	}
+	if f.Cursor() != start {
+		t.Fatalf("cursor moved to %d on an empty compact", f.Cursor())
+	}
+}
+
+// TestCompactValuesFailsClosedOnTornSource tears a source value and confirms the
+// compaction refuses rather than migrating rot into the fresh segment.
+func TestCompactValuesFailsClosedOnTornSource(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	ptrs, err := f.AppendValues(0, 1, [][]byte{[]byte("intact"), []byte("will-tear")})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	dev.buf[ptrs[1].ValueOff+1] ^= 0xff
+	if _, err := f.CompactValues(0, 2, ptrs); err != ErrChecksum {
+		t.Fatalf("compact of a torn source = %v, want ErrChecksum", err)
+	}
+}
+
 // TestAppendValuesSurvivesReopen writes values, reopens the file so the cursor
 // bootstraps from a tail scan, appends more, and reads pointers from both eras:
 // the value_log segments are real segments a scan resumes past.
