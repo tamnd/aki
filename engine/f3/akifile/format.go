@@ -22,7 +22,7 @@ const (
 
 	PrefixSize   = 100 // fixed prefix fields; the reserved tail runs on to slot A
 	MetaSlotSize = 128
-	SRTHeaderLen = 24 // magic(4) shard_count(4) gen(8) crc(8)
+	SRTHeaderLen = 40 // magic(4) shard_count(4) gen(8) snap_wbar(8) flags(4) reserved(4) crc(8)
 	SRTRowSize   = 80
 	SegHeaderLen = 64
 	ExtentSize   = 24 // kind(4) flags(4) start(8) length(8)

@@ -13,7 +13,7 @@ func TestFixedSizesStayFrozen(t *testing.T) {
 		{"magic", len(Magic), 16},
 		{"prefix", PrefixSize, 100},
 		{"meta slot", MetaSlotSize, 128},
-		{"srt header", SRTHeaderLen, 24},
+		{"srt header", SRTHeaderLen, 40},
 		{"srt row", SRTRowSize, 80},
 		{"seg header", SegHeaderLen, 64},
 		{"extent", ExtentSize, 24},
