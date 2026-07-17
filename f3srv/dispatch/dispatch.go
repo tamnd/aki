@@ -162,15 +162,15 @@ func init() {
 	register("EXISTS", existsCmd, 1, -1, true)
 	register("DEL", set.Del, 1, -1, true)
 	register("UNLINK", set.Del, 1, -1, true)
-	// The read-only expiry queries still span only the set-plus-string
-	// keyspace, so the set package owns them; threading them through the other
-	// collection registries lands with a later keyspace slice, as TYPE and
-	// single-key EXISTS already have.
-	register("TTL", set.Ttl, 1, 1, true)
-	register("PTTL", set.Pttl, 1, 1, true)
-	register("EXPIRETIME", set.Expiretime, 1, 1, true)
-	register("PEXPIRETIME", set.Pexpiretime, 1, 1, true)
-	register("PERSIST", set.Persist, 1, 1, true)
+	// The read-only expiry queries and PERSIST span every keyspace, so their
+	// handlers live here alongside TYPE and EXISTS: a collection key reads as
+	// live with no deadline (-1) rather than the missing-key -2 the set-only
+	// path used to give a hash, list, zset, or stream key.
+	register("TTL", ttlCmd, 1, 1, true)
+	register("PTTL", pttlCmd, 1, 1, true)
+	register("EXPIRETIME", expiretimeCmd, 1, 1, true)
+	register("PEXPIRETIME", pexpiretimeCmd, 1, 1, true)
+	register("PERSIST", persistCmd, 1, 1, true)
 	register("MGET", nil, 1, -1, true)
 	register("MSET", nil, 2, -1, true)
 	registerFan("EXISTS", shard.FanCount, exists, false, false)
@@ -1022,6 +1022,89 @@ func existsCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		hash.Has(cx, key) ||
 		list.Has(cx, key) ||
 		stream.Has(cx, key) {
+		r.Int(1)
+		return
+	}
+	r.Int(0)
+}
+
+// keyDeadline resolves a key's absolute unix-ms expiry across every keyspace,
+// the way TTL and its siblings all need it: (-2, _) for an absent key, (-1, _)
+// for a live key with no deadline, and (0, ms) for a live key that expires at
+// ms. The string store carries the only key-level deadlines f3 keeps today, so
+// it answers first; a key absent from the store but present in any collection
+// registry is live with no deadline. This spans all types where the earlier
+// set-only helper reported a hash, list, zset, or stream key as missing.
+func keyDeadline(cx *shard.Ctx, key []byte) (state int, at int64) {
+	if at, ok := cx.St.Deadline(key, cx.NowMs); ok {
+		if at == 0 {
+			return -1, 0
+		}
+		return 0, at
+	}
+	if set.Has(cx, key) ||
+		zset.Has(cx, key) ||
+		hash.Has(cx, key) ||
+		list.Has(cx, key) ||
+		stream.Has(cx, key) {
+		return -1, 0
+	}
+	return -2, 0
+}
+
+// ttlCmd answers TTL key: the remaining lifetime in whole seconds, -2 for a
+// missing key, -1 for a key with no deadline. Seconds round to nearest, Redis's
+// (ttl+500)/1000.
+func ttlCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	state, at := keyDeadline(cx, args[0])
+	if state != 0 {
+		r.Int(int64(state))
+		return
+	}
+	r.Int((at - cx.NowMs + 500) / 1000)
+}
+
+// pttlCmd answers PTTL key: the remaining lifetime in milliseconds, with the
+// same -2 and -1 sentinels as TTL.
+func pttlCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	state, at := keyDeadline(cx, args[0])
+	if state != 0 {
+		r.Int(int64(state))
+		return
+	}
+	r.Int(at - cx.NowMs)
+}
+
+// expiretimeCmd answers EXPIRETIME key: the absolute unix time in seconds at
+// which the key expires, with the same -2 and -1 sentinels. Seconds floor the ms
+// deadline, Redis's expire/1000.
+func expiretimeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	state, at := keyDeadline(cx, args[0])
+	if state != 0 {
+		r.Int(int64(state))
+		return
+	}
+	r.Int(at / 1000)
+}
+
+// pexpiretimeCmd answers PEXPIRETIME key: the absolute unix time in milliseconds
+// at which the key expires, with the same -2 and -1 sentinels.
+func pexpiretimeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	state, at := keyDeadline(cx, args[0])
+	if state != 0 {
+		r.Int(int64(state))
+		return
+	}
+	r.Int(at)
+}
+
+// persistCmd answers PERSIST key: remove the key's deadline, replying 1 when one
+// was removed and 0 otherwise. Only the string store carries a key-level
+// deadline today, so a collection key of any type has none to remove and reads a
+// correct 0, the same answer an absent key gives. The write side of EXPIRE for a
+// collection key stays owed, since there is nowhere to store the deadline yet.
+func persistCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	if cx.St.Persist(args[0], cx.NowMs) {
 		r.Int(1)
 		return
 	}
