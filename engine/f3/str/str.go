@@ -323,6 +323,44 @@ func Setnx(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Int(1)
 }
 
+// setex is the shared body of SETEX and PSETEX: SET key value with a mandatory
+// positive expiry, in seconds or milliseconds. It overwrites unconditionally,
+// like a plain SET with an expiry. A non-integer or non-positive time errors
+// under the command's own name before anything is written, matching Redis's
+// setexCommand.
+func setex(cx *shard.Ctx, args [][]byte, r shard.Reply, unit int, name string) {
+	n, ok := store.ParseInt(args[1])
+	if !ok {
+		r.Err("ERR value is not an integer or out of range")
+		return
+	}
+	at, ok := deadline(cx.NowMs, unit, n)
+	if !ok {
+		r.Err("ERR invalid expire time in '" + name + "' command")
+		return
+	}
+	if err := cx.St.SetString(args[0], args[2], cx.NowMs, at, false); err != nil {
+		if cx.ParkFull(err) {
+			return
+		}
+		r.Err(storeErr(err))
+		return
+	}
+	r.Status("OK")
+}
+
+// Setex answers SETEX key seconds value: SET with a mandatory positive
+// second-granularity expiry.
+func Setex(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	setex(cx, args, r, unitEXsec, "setex")
+}
+
+// Psetex answers PSETEX key milliseconds value: SETEX with millisecond
+// granularity.
+func Psetex(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	setex(cx, args, r, unitPXms, "psetex")
+}
+
 // Getex answers GETEX key [EX s|PX ms|EXAT s|PXAT ms|PERSIST]: return the value
 // like GET and, when an option is given, set or clear the key's deadline in the
 // same step. No option leaves the TTL untouched, PERSIST clears it, and an

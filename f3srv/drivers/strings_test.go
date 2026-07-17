@@ -155,6 +155,49 @@ func TestSetnx(t *testing.T) {
 	expect(t, br, "$5\r\nthree\r\n")
 }
 
+// TestSetex walks SETEX and PSETEX: each writes the value with a mandatory
+// positive expiry, overwrites unconditionally, and errors on a non-positive or
+// non-integer time without writing.
+func TestSetex(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// SETEX writes the value and a second-granularity deadline.
+	send(t, nc, "SETEX", "k", "100", "hello")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$5\r\nhello\r\n")
+	if ttl := readInt(t, nc, br, "TTL", "k"); ttl < 96 || ttl > 100 {
+		t.Fatalf("TTL after SETEX = %d, want within (96,100]", ttl)
+	}
+
+	// It overwrites an existing value and resets the deadline.
+	send(t, nc, "SETEX", "k", "50", "again")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$5\r\nagain\r\n")
+	if ttl := readInt(t, nc, br, "TTL", "k"); ttl < 46 || ttl > 50 {
+		t.Fatalf("TTL after overwrite = %d, want within (46,50]", ttl)
+	}
+
+	// PSETEX is the millisecond form.
+	send(t, nc, "PSETEX", "p", "100000", "ms")
+	expect(t, br, "+OK\r\n")
+	if pttl := readInt(t, nc, br, "PTTL", "p"); pttl < 95001 || pttl > 100000 {
+		t.Fatalf("PTTL after PSETEX = %d, want within (95000,100000]", pttl)
+	}
+
+	// A non-positive or non-integer time errors under the command's own name
+	// and leaves the key untouched.
+	send(t, nc, "SETEX", "k", "0", "no")
+	expect(t, br, "-ERR invalid expire time in 'setex' command\r\n")
+	send(t, nc, "PSETEX", "k", "-1", "no")
+	expect(t, br, "-ERR invalid expire time in 'psetex' command\r\n")
+	send(t, nc, "SETEX", "k", "abc", "no")
+	expect(t, br, "-ERR value is not an integer or out of range\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$5\r\nagain\r\n")
+}
+
 // TestGenericExpiryRead walks the read-only expiry queries TTL, PTTL,
 // EXPIRETIME, and PEXPIRETIME across the three states each reports: a missing
 // key answers -2, a key with no deadline answers -1, and a key with a deadline
