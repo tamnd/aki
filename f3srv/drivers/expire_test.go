@@ -116,7 +116,7 @@ func TestExpireFlags(t *testing.T) {
 }
 
 // TestExpireErrorsAndCollection checks the argument errors and the honest
-// not-yet answer for a collection key, which cannot carry a key TTL yet.
+// not-yet answer for a collection type that cannot carry a key TTL yet.
 func TestExpireErrorsAndCollection(t *testing.T) {
 	_, nc, br := startServer(t)
 
@@ -127,10 +127,55 @@ func TestExpireErrorsAndCollection(t *testing.T) {
 	send(t, nc, "EXPIRE", "k", "100", "BOGUS")
 	expect(t, br, "-ERR Unsupported option BOGUS\r\n")
 
-	// A set key is present but cannot hold a TTL yet: an honest not-yet error,
-	// never a 0 that would falsely mean the key is absent.
-	send(t, nc, "SADD", "s", "m")
+	// A list key is present but cannot hold a TTL yet: an honest not-yet error,
+	// never a 0 that would falsely mean the key is absent. Set keys are supported
+	// now, so the interim error is tested against a type that still is not.
+	send(t, nc, "RPUSH", "l", "m")
 	expect(t, br, ":1\r\n")
+	send(t, nc, "EXPIRE", "l", "100")
+	expect(t, br, "-ERR EXPIRE on a list key is not supported yet\r\n")
+}
+
+// TestExpireSetKey drives the EXPIRE family over a set key end to end: the
+// inline deadline reads back through TTL, PERSIST clears it, the flags gate the
+// same way strings do, and a past instant deletes the set.
+func TestExpireSetKey(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	send(t, nc, "SADD", "s", "a", "b")
+	expect(t, br, ":2\r\n")
+	send(t, nc, "TTL", "s")
+	expect(t, br, ":-1\r\n")
+
+	// EXPIRE installs a deadline TTL then reports; the members survive it.
 	send(t, nc, "EXPIRE", "s", "100")
-	expect(t, br, "-ERR EXPIRE on a set key is not supported yet\r\n")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "s")
+	expect(t, br, ":100\r\n")
+	send(t, nc, "SCARD", "s")
+	expect(t, br, ":2\r\n")
+
+	// GT only raises the deadline; a lower one is refused, a higher one takes.
+	send(t, nc, "EXPIRE", "s", "50", "GT")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "EXPIRE", "s", "300", "GT")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "s")
+	expect(t, br, ":300\r\n")
+
+	// PERSIST clears the deadline, then XX (needs a TTL) refuses.
+	send(t, nc, "PERSIST", "s")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "s")
+	expect(t, br, ":-1\r\n")
+	send(t, nc, "EXPIRE", "s", "100", "XX")
+	expect(t, br, ":0\r\n")
+
+	// A past instant deletes the set and still returns 1.
+	send(t, nc, "PEXPIREAT", "s", "1000")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "EXISTS", "s")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "TTL", "s")
+	expect(t, br, ":-2\r\n")
 }

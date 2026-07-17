@@ -1121,8 +1121,16 @@ func keyDeadline(cx *shard.Ctx, key []byte) (state int, at int64) {
 		}
 		return 0, at
 	}
-	if set.Has(cx, key) ||
-		zset.Has(cx, key) ||
+	// A set now carries its own inline deadline, so ask it directly; at==0 means a
+	// live set with no TTL. The other collection types have no key-level deadline
+	// yet, so a key present in one of them is live with no expiry.
+	if at, ok := set.Deadline(cx, key); ok {
+		if at == 0 {
+			return -1, 0
+		}
+		return 0, at
+	}
+	if zset.Has(cx, key) ||
 		hash.Has(cx, key) ||
 		list.Has(cx, key) ||
 		stream.Has(cx, key) {
@@ -1178,26 +1186,26 @@ func pexpiretimeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 }
 
 // persistCmd answers PERSIST key: remove the key's deadline, replying 1 when one
-// was removed and 0 otherwise. Only the string store carries a key-level
-// deadline today, so a collection key of any type has none to remove and reads a
-// correct 0, the same answer an absent key gives. The write side of EXPIRE for a
-// collection key stays owed, since there is nowhere to store the deadline yet.
+// was removed and 0 otherwise. The string store and the set keyspace both carry
+// key-level deadlines now, so each is asked in turn; the other collection types
+// have none to remove and reach neither branch, reading a correct 0, the same
+// answer an absent key gives. Their write side of EXPIRE stays owed until they
+// gain an inline deadline (rollout plan M-expiry-generic-key-ttl-plan.md).
 func persistCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	if cx.St.Persist(args[0], cx.NowMs) {
+	if cx.St.Persist(args[0], cx.NowMs) || set.Persist(cx, args[0]) {
 		r.Int(1)
 		return
 	}
 	r.Int(0)
 }
 
-// collectionKind reports the type name of a collection key, or "" when the key
-// holds no collection on this shard. It is the presence half of the unified TYPE
-// probe, used by the EXPIRE router to tell a collection key apart from an absent
-// or string key without building any registry.
-func collectionKind(cx *shard.Ctx, key []byte) string {
+// pendingExpireKind reports the type name of a collection key that cannot carry a
+// key-level TTL yet, or "" when the key is absent, a string, or a set. Set is
+// omitted because it now has an inline deadline and is routed before this probe;
+// the remaining four collection types stay owed until their own deadline slice
+// (rollout plan M-expiry-generic-key-ttl-plan.md). It builds no registry.
+func pendingExpireKind(cx *shard.Ctx, key []byte) string {
 	switch {
-	case set.Has(cx, key):
-		return "set"
 	case zset.Has(cx, key):
 		return "zset"
 	case hash.Has(cx, key):
@@ -1210,14 +1218,20 @@ func collectionKind(cx *shard.Ctx, key []byte) string {
 	return ""
 }
 
-// expireRoute answers an EXPIRE-family command across every keyspace. A string
-// key sets its inline deadline through str.Expire. A collection key cannot carry
-// a key-level TTL yet (the per-type header deadline is the next expiry slice,
-// Spec/2064/f3/milestones/M-expiry-generic-key-ttl-plan.md), so rather than lie
-// with the 0 that means "no such key", it answers an honest not-yet error that
-// names the type, the same discipline the deferred SORT rows use.
+// expireRoute answers an EXPIRE-family command across every keyspace. A set or
+// string key sets its inline deadline through its own backend. The other four
+// collection types cannot carry a key-level TTL yet, so rather than lie with the
+// 0 that means "no such key", they answer an honest not-yet error that names the
+// type, the same discipline the deferred SORT rows use. That error path shrinks
+// by one type per expiry slice until it is empty and this router collapses into
+// plain keyed dispatch (rollout plan M-expiry-generic-key-ttl-plan.md).
 func expireRoute(cx *shard.Ctx, args [][]byte, r shard.Reply, verb string) {
-	if kind := collectionKind(cx, args[0]); kind != "" {
+	key := args[0]
+	if set.Has(cx, key) {
+		set.Expire(cx, args, r, verb)
+		return
+	}
+	if kind := pendingExpireKind(cx, key); kind != "" {
 		r.Err("ERR " + verb + " on a " + kind + " key is not supported yet")
 		return
 	}

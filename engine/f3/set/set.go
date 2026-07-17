@@ -57,6 +57,15 @@ func (e encoding) String() string {
 type set struct {
 	enc encoding
 
+	// expireAt is the key's deadline in unix milliseconds, 0 when the set has no
+	// TTL (spec 2064/f3/16 section 2). It lives inline in the per-key header rather
+	// than in a side expires dict, so a volatile set costs one int64, not a second
+	// hash table and key copy (the memory-bar rationale in the rollout plan
+	// Spec/2064/f3/milestones/M-expiry-generic-key-ttl-plan.md). A set whose
+	// deadline has passed is dropped lazily the next time a command funnels through
+	// live (reg.go), so it is absent to every command in the same epoch.
+	expireAt int64
+
 	// intset-class: sorted ascending, unique.
 	ints []int64
 
