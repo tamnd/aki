@@ -37,6 +37,11 @@ const (
 	// doc 08 section 1 4-32KiB band.
 	foldChunkTarget = 16 << 10
 
+	// foldAgeDefault is the age trigger's bound (doc 06 section 1.4): an
+	// accumulator holding bytes older than this cuts on the next cadence
+	// tick even when it never reaches the segment target.
+	foldAgeDefault = 15 * time.Second
+
 	// The PUT retry backoff, the flusher's shape on the same store.
 	foldRetryBase = 20 * time.Millisecond
 	foldRetryCap  = time.Second
@@ -70,6 +75,10 @@ type FoldConfig struct {
 	// zero for the defaults. Tests shrink them.
 	SegTargetBytes   int
 	ChunkTargetBytes int
+
+	// FoldAge overrides the age trigger's bound, zero for the 15s doc 06
+	// default; negative disables the cadence for tests that cut explicitly.
+	FoldAge time.Duration
 }
 
 // FoldedSegment is one ledger row: a segment durably in the bucket whose
@@ -123,6 +132,7 @@ type foldGroup struct {
 	seq     uint64 // next SegSeq
 	covered uint64 // max eligibility mark over contributors
 	bytes   int
+	since   time.Time // when the accumulator went non-empty, zero while empty
 	recs    []foldRec
 	recIdx  map[string]int
 	chunks  []SegmentChunk
@@ -155,9 +165,10 @@ type Folder struct {
 	ledger []FoldedSegment
 	stats  FolderStats
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	done   chan struct{}
+	ctx     context.Context
+	cancel  context.CancelFunc
+	done    chan struct{}
+	cadDone chan struct{} // nil when the age cadence is disabled
 }
 
 // NewFolder builds and starts a Folder.
@@ -181,7 +192,40 @@ func NewFolder(cfg FoldConfig) (*Folder, error) {
 	f.ctx, f.cancel = context.WithCancel(context.Background())
 	f.done = make(chan struct{})
 	go f.run()
+	if age := cfg.FoldAge; age >= 0 {
+		if age == 0 {
+			age = foldAgeDefault
+		}
+		f.cadDone = make(chan struct{})
+		go f.cadence(age)
+	}
 	return f, nil
+}
+
+// cadence is the age trigger (doc 06 section 1.4): every quarter of the age
+// bound it cuts any accumulator whose oldest bytes have waited the full
+// bound, so a quiet group's cooled data reaches the bucket without needing
+// the size trigger or an explicit Flush.
+func (f *Folder) cadence(age time.Duration) {
+	defer close(f.cadDone)
+	tick := max(age/4, time.Millisecond)
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-f.ctx.Done():
+			return
+		case <-t.C:
+		}
+		now := time.Now()
+		f.mu.Lock()
+		for group, g := range f.groups {
+			if !g.since.IsZero() && now.Sub(g.since) >= age {
+				f.cutLocked(group, g)
+			}
+		}
+		f.mu.Unlock()
+	}
 }
 
 // Add ingests one staged drain buffer, the fold tap's target: it walks the
@@ -241,8 +285,16 @@ func (f *Folder) Add(frames []byte) {
 	for group, g := range touched {
 		if g.bytes >= f.segTarget {
 			f.cutLocked(group, g)
+		} else if g.bytes > 0 && g.since.IsZero() {
+			f.age(g)
 		}
 	}
+}
+
+// age arms the group's age trigger: the oldest pending bytes' arrival time,
+// kept until a cut empties the accumulator.
+func (f *Folder) age(g *foldGroup) {
+	g.since = time.Now()
 }
 
 // Delete accumulates one tombstone for a committed delete of key (doc 06
@@ -275,6 +327,8 @@ func (f *Folder) Delete(key []byte) {
 	f.stats.Tombstones++
 	if g.bytes >= f.segTarget {
 		f.cutLocked(group, g)
+	} else if g.since.IsZero() {
+		f.age(g)
 	}
 }
 
@@ -309,8 +363,9 @@ func (f *Folder) putRec(g *foldGroup, r foldRec) bool {
 	return true
 }
 
-// Flush cuts every non-empty accumulator now, the age and shutdown
-// trigger's entry point until the manifest slice wires a cadence.
+// Flush cuts every non-empty accumulator now: the shutdown entry point and
+// the pressure trigger's target (Runtime.SetFoldKick wires it, doc 06
+// section 1.4); the age trigger runs on the folder's own cadence goroutine.
 func (f *Folder) Flush() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -330,6 +385,7 @@ func (f *Folder) cutLocked(group uint16, g *foldGroup) {
 	})
 	g.covered = 0
 	g.bytes = 0
+	g.since = time.Time{}
 	g.recs, g.chunks = nil, nil
 	g.recIdx, g.chIdx = make(map[string]int), make(map[string]int)
 	f.stats.SegmentsCut++
@@ -359,6 +415,9 @@ func (f *Folder) Close() {
 	f.cond.Broadcast()
 	f.mu.Unlock()
 	<-f.done
+	if f.cadDone != nil {
+		<-f.cadDone
+	}
 }
 
 // run is the folder's off-owner half: it builds and PUTs cut segments one
