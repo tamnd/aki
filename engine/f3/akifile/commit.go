@@ -54,6 +54,23 @@ type CheckpointStats struct {
 	Clean        bool
 }
 
+// CheckpointGlobals names the two file-global roots a checkpoint stamps into the new
+// meta slot alongside the SRT and extent map: the TTL reclaim index (a bare marshaled
+// root, so it carries a length) and the free map (a self-describing segment the meta
+// slot points at by offset alone). Both are produced by their own subsystems, active
+// expiry and the allocator, and handed to the checkpoint already written to free space
+// the way the per-shard roots are assembled into the SRT rows before the commit.
+//
+// The offsets are absolute file offsets a reader reads straight from: TTLIndexOff is
+// the bare marshaled root, FreeMapOff is the free_map segment header. A zero offset
+// names no root, so a checkpoint stamps exactly the globals it is given, the way a
+// checkpoint with no extents leaves the extent map unnamed.
+type CheckpointGlobals struct {
+	TTLIndexOff uint64
+	TTLIndexLen uint32
+	FreeMapOff  uint64
+}
+
 // Checkpoint writes the current roots to free space and commits them (spec
 // 2064/f3/07 section 5). It appends the shard root table and, if any, the extent
 // map as owner-less segments past the append tail, then stamps a new meta slot
@@ -64,6 +81,15 @@ type CheckpointStats struct {
 // (their payload CRC guards them and a scan skips them), while the meta slot points
 // straight at each payload so recovery reads a root without walking a header.
 func (f *File) Checkpoint(srt *SRT, extents []Extent, stats CheckpointStats) error {
+	return f.CheckpointWithGlobals(srt, extents, stats, CheckpointGlobals{})
+}
+
+// CheckpointWithGlobals is Checkpoint with the file-global roots stamped too: the same
+// SRT and extent map append, plus the TTL index and free map offsets the caller has
+// already written to free space (spec 2064/f3/07 section 5). The globals ride the same
+// meta slot flip, so recovery reads them back atomically with the SRT and extents from
+// the one live root. A zero-valued CheckpointGlobals is exactly Checkpoint.
+func (f *File) CheckpointWithGlobals(srt *SRT, extents []Extent, stats CheckpointStats, globals CheckpointGlobals) error {
 	srtBytes, err := srt.Marshal(f.prefix.ChecksumKind)
 	if err != nil {
 		return err
@@ -83,6 +109,9 @@ func (f *File) Checkpoint(srt *SRT, extents []Extent, stats CheckpointStats) err
 		SRTOff:        offs[0] + SegHeaderLen,
 		SRTLen:        uint32(len(srtBytes)),
 		SRTShardCount: uint32(len(srt.Rows)),
+		TTLIndexOff:   globals.TTLIndexOff,
+		TTLIndexLen:   globals.TTLIndexLen,
+		FreeMapOff:    globals.FreeMapOff,
 		LiveBytes:     stats.LiveBytes,
 		DeadBytes:     stats.DeadBytes,
 		RecordCount:   stats.RecordCount,
