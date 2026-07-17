@@ -73,7 +73,12 @@ func Geosearchstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(errMsg)
 		return
 	}
-	r.Int(int64(place(cx, g, args[0], buildDest(pairs))))
+	n, err := place(cx, g, args[0], buildDest(pairs))
+	if err != nil {
+		r.Err(err.Error())
+		return
+	}
+	r.Int(int64(n))
 }
 
 // GeosearchstoreCross is the F17 route for a destination and source on different
@@ -93,9 +98,15 @@ func GeosearchstoreCross(t *shard.Txn, args [][]byte) []byte {
 	if errMsg != "" {
 		return resp.AppendError(nil, errMsg)
 	}
-	var n int
+	var (
+		n      int
+		logErr error
+	)
 	t.Do(dest, func(cx *shard.Ctx) {
-		n = place(cx, registry(cx), dest, buildDest(pairs))
+		n, logErr = place(cx, registry(cx), dest, buildDest(pairs))
 	})
+	if logErr != nil {
+		return resp.AppendError(nil, logErr.Error())
+	}
 	return resp.AppendInt(nil, int64(n))
 }

@@ -14,6 +14,37 @@ import (
 // p99 (lab 04 priced v1's ZREM p99 shoulder to exactly such a deferral). An empty
 // window removes nothing; the key is deleted the moment its last member leaves.
 
+// remRangeFinish deletes the resolved forward-rank window [lo, hiExcl),
+// frames the removal, and replies the count, the tail all three commands
+// share. removeRange reports only a count and invalidates every alias
+// into the storage it tears down, so with a log wired the window's
+// members are copied out first; the decision is already final at that
+// point, the window is exactly what the surgery removes.
+func remRangeFinish(cx *shard.Ctx, g *reg, key []byte, z *zset, lo, hiExcl int, r shard.Reply) {
+	var memb [][]byte
+	if cx.Log != nil && hiExcl > lo {
+		memb = make([][]byte, 0, hiExcl-lo)
+		for i := lo; i < hiExcl; i++ {
+			m, _ := z.at(i)
+			memb = append(memb, append([]byte(nil), m...))
+		}
+	}
+	removed := z.removeRange(lo, hiExcl)
+	dropped := z.card() == 0
+	if dropped {
+		g.drop(key)
+	} else if removed > 0 {
+		g.note(z)
+	}
+	if len(memb) > 0 {
+		if err := cx.LogZSetRem(key, memb, dropped); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
+	r.Int(int64(removed))
+}
+
 // Zremrangebyrank answers ZREMRANGEBYRANK key start stop: delete the members at
 // the inclusive rank window and reply the count removed.
 func Zremrangebyrank(cx *shard.Ctx, args [][]byte, r shard.Reply) {
@@ -38,13 +69,7 @@ func Zremrangebyrank(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Int(0)
 		return
 	}
-	removed := z.removeRange(lo, hi+1)
-	if z.card() == 0 {
-		g.drop(args[0])
-	} else if removed > 0 {
-		g.note(z)
-	}
-	r.Int(int64(removed))
+	remRangeFinish(cx, g, args[0], z, lo, hi+1, r)
 }
 
 // Zremrangebyscore answers ZREMRANGEBYSCORE key min max: delete the members whose
@@ -67,13 +92,7 @@ func Zremrangebyscore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	lo, hiExcl := z.scoreWindow(min, max)
-	removed := z.removeRange(lo, hiExcl)
-	if z.card() == 0 {
-		g.drop(args[0])
-	} else if removed > 0 {
-		g.note(z)
-	}
-	r.Int(int64(removed))
+	remRangeFinish(cx, g, args[0], z, lo, hiExcl, r)
 }
 
 // Zremrangebylex answers ZREMRANGEBYLEX key min max: delete the members in the lex
@@ -96,11 +115,5 @@ func Zremrangebylex(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	lo, hiExcl := z.lexWindow(min, max)
-	removed := z.removeRange(lo, hiExcl)
-	if z.card() == 0 {
-		g.drop(args[0])
-	} else if removed > 0 {
-		g.note(z)
-	}
-	r.Int(int64(removed))
+	remRangeFinish(cx, g, args[0], z, lo, hiExcl, r)
 }

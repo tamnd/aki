@@ -89,6 +89,18 @@ func (f *fakeLog) SetMove(src, dst, member []byte, srcDropped, dstCreated bool) 
 	return dg, ds, sg, ss, err
 }
 
+func (f *fakeLog) ZSetAdd(key []byte, created bool, scores []float64, members [][]byte) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) ZSetRem(key []byte, members [][]byte, dropped bool) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) ZSetStore(key []byte, delString, hadZSet bool, scores []float64, members [][]byte) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
 func (f *fakeLog) NotifyCommitted(group uint16, seq uint64, fn func()) {
 	f.pending = append(f.pending, fakeNotify{group: group, seq: seq, fn: fn})
 }

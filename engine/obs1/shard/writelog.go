@@ -97,6 +97,31 @@ type WriteLog interface {
 	// caller marks what did land.
 	SetMove(src, dst, member []byte, srcDropped, dstCreated bool) (dstGroup uint16, dstSeq uint64, srcGroup uint16, srcSeq uint64, err error)
 
+	// ZSetAdd records applied sorted-set upserts as one colldelta zadd,
+	// preceded by a collnew when the write created the sorted set. scores
+	// parallels members (the seam speaks universe types), each pair
+	// post-decision: the score the member now holds, so a ZADD flag miss
+	// or a same-score write contributes no pair and an all-miss call
+	// frames nothing (the caller gates). GEOADD lands here with geohash
+	// scores.
+	ZSetAdd(key []byte, created bool, scores []float64, members [][]byte) (group uint16, seq uint64, err error)
+
+	// ZSetRem records removed sorted-set members as one colldelta zrem,
+	// followed by a colldrop when the removal emptied the sorted set. The
+	// pop family and the ZREMRANGEBY* verbs land here as the zrems they
+	// are, members post-decision.
+	ZSetRem(key []byte, members [][]byte, dropped bool) (group uint16, seq uint64, err error)
+
+	// ZSetStore records a STORE form's wholesale replacement of its
+	// destination as one atomic run, the sorted-set twin of SetStore: a
+	// keydel when the string store held the key, then for a non-empty
+	// result a collnew (replaying as reset-to-empty over a sorted set the
+	// destination already held) and the result pairs as one zadd, or for
+	// an empty result a colldrop when a sorted set was there to drop. The
+	// caller gates the no-effect case, an empty result over an absent
+	// destination.
+	ZSetStore(key []byte, delString, hadZSet bool, scores []float64, members [][]byte) (group uint16, seq uint64, err error)
+
 	// NotifyCommitted runs fn once a chain commit covering the marked
 	// frame has landed and folded live (doc 04 section 3.2): it registers
 	// on the committed watermark and raises barrier demand, so a pending
@@ -249,6 +274,49 @@ func (cx *Ctx) LogSetMove(src, dst, member []byte, srcDropped, dstCreated bool) 
 		cx.noteMark(sg, ss)
 	}
 	return err
+}
+
+// LogZSetAdd emits a sorted-set write's effect frames when a log is
+// wired, and is free when none is. See WriteLog.ZSetAdd for the contract.
+func (cx *Ctx) LogZSetAdd(key []byte, created bool, scores []float64, members [][]byte) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.ZSetAdd(key, created, scores, members)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogZSetRem emits a sorted-set removal's effect frames when a log is
+// wired, and is free when none is. See WriteLog.ZSetRem for the contract.
+func (cx *Ctx) LogZSetRem(key []byte, members [][]byte, dropped bool) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.ZSetRem(key, members, dropped)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogZSetStore emits a STORE form's destination replacement when a log
+// is wired, and is free when none is. See WriteLog.ZSetStore for the
+// contract.
+func (cx *Ctx) LogZSetStore(key []byte, delString, hadZSet bool, scores []float64, members [][]byte) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.ZSetStore(key, delString, hadZSet, scores, members)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
 }
 
 // LogStrReadBack frames a write whose resulting string lives only in the

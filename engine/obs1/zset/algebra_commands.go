@@ -177,20 +177,41 @@ func emitScored(cx *shard.Ctx, r shard.Reply, pairs []scoredMember, withScores b
 // place installs a freshly built result as the destination key, replacing
 // whatever it held and discarding any TTL (a STORE destination is a new object).
 // An empty result (nil) deletes the destination. It returns the result
-// cardinality, the STORE reply. It runs after the result is fully built off the
-// sources, so an aliasing STORE (destination is also a source) needs no clone.
-func place(cx *shard.Ctx, g *reg, key []byte, result *zset) int {
-	cx.St.Del(key, cx.NowMs)
+// cardinality, the STORE reply, and any emission failure, whose text is the
+// wire reply. It runs after the result is fully built off the sources, so an
+// aliasing STORE (destination is also a source) needs no clone; for the same
+// reason the emission walks the installed result directly, its member bytes
+// stable in the result's own storage through the synchronous encode.
+func place(cx *shard.Ctx, g *reg, key []byte, result *zset) (int, error) {
+	hadZSet := g.m[string(key)] != nil
+	delString := cx.St.Del(key, cx.NowMs)
 	if result == nil {
 		g.drop(key)
-		return 0
+		if !hadZSet && !delString {
+			// Nothing was there and nothing arrives: no effect, no frames.
+			return 0, nil
+		}
+		return 0, cx.LogZSetStore(key, delString, hadZSet, nil, nil)
 	}
-	if g.acctOn && g.m[string(key)] != nil {
+	if g.acctOn && hadZSet {
 		g.drop(key)
 	}
 	g.m[string(key)] = result
 	g.note(result)
-	return result.card()
+	if cx.Log != nil {
+		n := result.card()
+		scores := make([]float64, 0, n)
+		members := make([][]byte, 0, n)
+		result.forEach(func(m []byte, s float64) bool {
+			scores = append(scores, s)
+			members = append(members, m)
+			return true
+		})
+		if err := cx.LogZSetStore(key, delString, hadZSet, scores, members); err != nil {
+			return 0, err
+		}
+	}
+	return result.card(), nil
 }
 
 // Zunion answers ZUNION numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...]
@@ -304,7 +325,12 @@ func Zunionstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	r.Int(int64(place(cx, g, args[0], buildDest(union(ops, spec.mode)))))
+	n, err := place(cx, g, args[0], buildDest(union(ops, spec.mode)))
+	if err != nil {
+		r.Err(err.Error())
+		return
+	}
+	r.Int(int64(n))
 }
 
 // Zinterstore answers ZINTERSTORE destination numkeys key [key ...] [WEIGHTS ...]
@@ -322,7 +348,12 @@ func Zinterstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	r.Int(int64(place(cx, g, args[0], buildDest(intersect(ops, spec.mode)))))
+	n, err := place(cx, g, args[0], buildDest(intersect(ops, spec.mode)))
+	if err != nil {
+		r.Err(err.Error())
+		return
+	}
+	r.Int(int64(n))
 }
 
 // Zdiffstore answers ZDIFFSTORE destination numkeys key [key ...]: the members
@@ -340,5 +371,10 @@ func Zdiffstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	r.Int(int64(place(cx, g, args[0], buildDest(diff(ops)))))
+	n, err := place(cx, g, args[0], buildDest(diff(ops)))
+	if err != nil {
+		r.Err(err.Error())
+		return
+	}
+	r.Int(int64(n))
 }
