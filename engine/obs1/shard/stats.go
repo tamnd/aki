@@ -112,6 +112,9 @@ func (r *Runtime) renderStats(dst []byte, stats []uint64) []byte {
 		}
 		text = appendStat(text, statNames[i], stats[i])
 	}
+	if r.walInfo != nil {
+		text = r.walInfo(text)
+	}
 	if r.netInfo != nil {
 		text = r.netInfo(text)
 	}
