@@ -206,7 +206,9 @@ func init() {
 	// INFO scatters keyless to every shard: each answers the fixed-width
 	// counter blob and the gather sums the fields and renders the text. The
 	// optional section argument is accepted and ignored; there is one section.
-	info := registerShard(str.InfoShard)
+	// It goes through infoShardAll so the keys count spans every keyspace, the
+	// way DBSIZE does, not just the string store.
+	info := registerShard(infoShardAll)
 	register("INFO", nil, 0, 1, false)
 	registerFan("INFO", shard.FanStats, info, false, true)
 
@@ -1486,6 +1488,19 @@ func dbsizeShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	n += int64(list.Len(cx))
 	n += int64(stream.Len(cx))
 	r.FanCount(n)
+}
+
+// infoShardAll answers one shard's INFO counter blob with the keys field folded
+// across every keyspace, not just the string store. str.WriteInfoBlob owns the
+// blob layout and knows only its own store, so the collection key counts are
+// summed here where every type package is in reach and passed in as the extra,
+// mirroring dbsizeShardAll. Before this the keys line counted string keys alone,
+// so a set, zset, hash, list, or stream key was missing from the INFO total that
+// the memory-bar accounting divides resident bytes by.
+func infoShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	extra := uint64(set.Len(cx)) + uint64(zset.Len(cx)) + uint64(hash.Len(cx)) +
+		uint64(list.Len(cx)) + uint64(stream.Len(cx))
+	str.WriteInfoBlob(cx, extra, r)
 }
 
 // parseScan reads a SCAN tail: args[0] is the cursor, then any of MATCH pattern,
