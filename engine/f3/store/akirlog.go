@@ -84,6 +84,15 @@ func (l *akiRlog) flush() ([]uint64, error) {
 	return addrs, nil
 }
 
+// seqHigh reports the highest segment sequence this shard has cut, the cross-check
+// a checkpoint header stamps so recovery can confirm the dump reflects every
+// durable segment.
+func (l *akiRlog) seqHigh() uint64 { return l.seq }
+
+// globalSeq reports the file's highest assigned global sequence, the log position a
+// full checkpoint declares itself consistent up to.
+func (l *akiRlog) globalSeq() uint64 { return l.f.GlobalSeq() }
+
 // walkShard replays this shard's record log from the start of the append space,
 // calling visit for each framed record this shard cut in append order. It skips
 // every other shard's segments, so a per-shard recovery reapplies only its own
