@@ -3,6 +3,7 @@ package sqlo1
 import (
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -272,4 +273,175 @@ func TestServerBListBlocking(t *testing.T) {
 	send(pusher, "SET", "turnstr", "v")
 	expect(t, pr, "+OK\r\n")
 	expect(t, r4, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+}
+
+// TestServerListPositionalSurface is the inline-tier wire surface for
+// LLEN, LINDEX, LSET, and LRANGE: the index and clamp grammar, the two
+// LSET error doors, and the shared parser and type doors.
+func TestServerListPositionalSurface(t *testing.T) {
+	c, r := startServer(t)
+	send := func(args ...string) {
+		t.Helper()
+		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send("RPUSH", "l", "a", "b", "c", "d", "e")
+	expect(t, r, ":5\r\n")
+	send("LLEN", "l")
+	expect(t, r, ":5\r\n")
+	send("LLEN", "nope")
+	expect(t, r, ":0\r\n")
+
+	// LINDEX both signs; out of range either way is the nil bulk.
+	send("LINDEX", "l", "0")
+	expect(t, r, "$1\r\na\r\n")
+	send("LINDEX", "l", "4")
+	expect(t, r, "$1\r\ne\r\n")
+	send("LINDEX", "l", "-1")
+	expect(t, r, "$1\r\ne\r\n")
+	send("LINDEX", "l", "-5")
+	expect(t, r, "$1\r\na\r\n")
+	send("LINDEX", "l", "5")
+	expect(t, r, "$-1\r\n")
+	send("LINDEX", "l", "-6")
+	expect(t, r, "$-1\r\n")
+	send("LINDEX", "nope", "0")
+	expect(t, r, "$-1\r\n")
+
+	// LRANGE clamp grammar: full, windows, negatives, inverted and
+	// past-the-end empties, and the over-wide clamp.
+	send("LRANGE", "l", "0", "-1")
+	expect(t, r, respArr("a", "b", "c", "d", "e"))
+	send("LRANGE", "l", "1", "3")
+	expect(t, r, respArr("b", "c", "d"))
+	send("LRANGE", "l", "-2", "-1")
+	expect(t, r, respArr("d", "e"))
+	send("LRANGE", "l", "3", "1")
+	expect(t, r, "*0\r\n")
+	send("LRANGE", "l", "5", "10")
+	expect(t, r, "*0\r\n")
+	send("LRANGE", "l", "-100", "100")
+	expect(t, r, respArr("a", "b", "c", "d", "e"))
+	send("LRANGE", "nope", "0", "-1")
+	expect(t, r, "*0\r\n")
+
+	// LSET both signs, then its two error doors.
+	send("LSET", "l", "1", "B")
+	expect(t, r, "+OK\r\n")
+	send("LSET", "l", "-1", "E")
+	expect(t, r, "+OK\r\n")
+	send("LRANGE", "l", "0", "-1")
+	expect(t, r, respArr("a", "B", "c", "d", "E"))
+	send("LSET", "l", "5", "x")
+	expect(t, r, "-ERR index out of range\r\n")
+	send("LSET", "l", "-6", "x")
+	expect(t, r, "-ERR index out of range\r\n")
+	send("LSET", "nope", "0", "x")
+	expect(t, r, "-ERR no such key\r\n")
+
+	// The parser doors: non-integer indexes and the arities.
+	send("LINDEX", "l", "x")
+	expect(t, r, "-ERR value is not an integer or out of range\r\n")
+	send("LSET", "l", "x", "v")
+	expect(t, r, "-ERR value is not an integer or out of range\r\n")
+	send("LRANGE", "l", "0", "x")
+	expect(t, r, "-ERR value is not an integer or out of range\r\n")
+	send("LLEN", "l", "x")
+	expect(t, r, "-ERR wrong number of arguments for 'llen' command\r\n")
+	send("LINDEX", "l")
+	expect(t, r, "-ERR wrong number of arguments for 'lindex' command\r\n")
+	send("LSET", "l", "0")
+	expect(t, r, "-ERR wrong number of arguments for 'lset' command\r\n")
+	send("LRANGE", "l", "0")
+	expect(t, r, "-ERR wrong number of arguments for 'lrange' command\r\n")
+
+	// WRONGTYPE across the four.
+	send("SET", "str", "v")
+	expect(t, r, "+OK\r\n")
+	for _, cmd := range [][]string{
+		{"LLEN", "str"}, {"LINDEX", "str", "0"},
+		{"LSET", "str", "0", "v"}, {"LRANGE", "str", "0", "-1"},
+	} {
+		send(cmd...)
+		expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	}
+}
+
+// TestServerListPositionalNoded runs the positional family over a
+// 3000-element noded list: about 24 nodes, so the full-range walk
+// crosses the 16-node prefetch round and the windows land mid-node.
+func TestServerListPositionalNoded(t *testing.T) {
+	c, r := startServer(t)
+	send := func(args ...string) {
+		t.Helper()
+		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const n = 3000
+	elems := make([]string, n)
+	for i := range elems {
+		elems[i] = fmt.Sprintf("e%04d", i)
+	}
+	send(append([]string{"RPUSH", "big"}, elems...)...)
+	expect(t, r, fmt.Sprintf(":%d\r\n", n))
+	send("OBJECT", "ENCODING", "big")
+	expect(t, r, "$9\r\nquicklist\r\n")
+	send("LLEN", "big")
+	expect(t, r, fmt.Sprintf(":%d\r\n", n))
+
+	// Indexes across the node span, both signs, and the out-of-range
+	// nil.
+	send("LINDEX", "big", "0")
+	expect(t, r, "$5\r\ne0000\r\n")
+	send("LINDEX", "big", "1500")
+	expect(t, r, "$5\r\ne1500\r\n")
+	send("LINDEX", "big", "2999")
+	expect(t, r, "$5\r\ne2999\r\n")
+	send("LINDEX", "big", "-1")
+	expect(t, r, "$5\r\ne2999\r\n")
+	send("LINDEX", "big", "-3000")
+	expect(t, r, "$5\r\ne0000\r\n")
+	send("LINDEX", "big", "3000")
+	expect(t, r, "$-1\r\n")
+
+	// A mid-node window, a clamped tail window, and the full walk
+	// across two prefetch rounds.
+	send("LRANGE", "big", "130", "134")
+	expect(t, r, respArr("e0130", "e0131", "e0132", "e0133", "e0134"))
+	send("LRANGE", "big", "2995", "4000")
+	expect(t, r, respArr("e2995", "e2996", "e2997", "e2998", "e2999"))
+	send("LRANGE", "big", "0", "-1")
+	expect(t, r, respArr(elems...))
+
+	// LSET mid-list with a far larger element: the touched node grows
+	// in place, the neighbors and the count hold.
+	big := strings.Repeat("B", 500)
+	send("LSET", "big", "1500", big)
+	expect(t, r, "+OK\r\n")
+	send("LINDEX", "big", "1500")
+	expect(t, r, fmt.Sprintf("$%d\r\n%s\r\n", len(big), big))
+	send("LRANGE", "big", "1499", "1501")
+	expect(t, r, respArr("e1499", big, "e1501"))
+	send("LLEN", "big")
+	expect(t, r, fmt.Sprintf(":%d\r\n", n))
+
+	// An inline list whose LSET replacement is too big for the inline
+	// root upgrades to quicklist with everything else in place.
+	send("RPUSH", "up", "a", "b", "c")
+	expect(t, r, ":3\r\n")
+	send("OBJECT", "ENCODING", "up")
+	expect(t, r, "$8\r\nlistpack\r\n")
+	huge := strings.Repeat("H", 2100)
+	send("LSET", "up", "1", huge)
+	expect(t, r, "+OK\r\n")
+	send("OBJECT", "ENCODING", "up")
+	expect(t, r, "$9\r\nquicklist\r\n")
+	send("LRANGE", "up", "0", "-1")
+	expect(t, r, respArr("a", huge, "c"))
+	send("LLEN", "up")
+	expect(t, r, ":3\r\n")
 }

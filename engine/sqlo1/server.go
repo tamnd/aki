@@ -1098,6 +1098,21 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.blpopCmd(ctx, reply, args, cmd, false)
 	case "BLMPOP":
 		return s.blmpopCmd(ctx, reply, args)
+	case "LLEN":
+		if len(args) != 2 {
+			return arityErr(reply, cmd)
+		}
+		n, err := s.l.Len(ctx, args[1])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, n)
+	case "LINDEX":
+		return s.lindexCmd(ctx, reply, args)
+	case "LSET":
+		return s.lsetCmd(ctx, reply, args)
+	case "LRANGE":
+		return s.lrangeCmd(ctx, reply, args)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)

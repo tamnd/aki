@@ -167,6 +167,14 @@ type List struct {
 	cuts []int
 	cutN []int
 
+	// mgKeyBuf, mgKeys, mgVals, mgRoots, and mgExps carry one range
+	// walk's prefetch round, hashiter's shape.
+	mgKeyBuf []byte
+	mgKeys   [][]byte
+	mgVals   [][]byte
+	mgRoots  []bool
+	mgExps   []int64
+
 	// spans holds one op's element spans into the read payload; valBuf
 	// and vals carry a pop's reply, copied out before the write that
 	// would recycle the read's arena bytes. valOff records the spans
