@@ -43,6 +43,14 @@ type Store struct {
 	// never closes it.
 	akivlog *akiVlog
 
+	// akispill is the batch bookkeeping over akivlog (akispill.go): it holds
+	// writeRun's synchronous return-a-word contract against the .aki writer's
+	// offset-assigned-at-flush reality by handing back a provisional word the read
+	// path resolves from the staged buffer until the group cut publishes the
+	// absolute offset. Constructed alongside akivlog and equally inert: nothing
+	// stages through it until the writeRun flip routes the spill onto it.
+	akispill *akiSpill
+
 	// The cold tier (doc 06 sections 2 and 7, cold.go): nil without a cold
 	// region. cold is the per-shard append log of whole-record cold frames the
 	// migrator demotes out of the arena; coldRecs is the live cold-record
@@ -232,6 +240,7 @@ func Open(o Options) (*Store, error) {
 		// this only builds the per-shard accumulator over it. Inert until the
 		// spill path is flipped onto it.
 		s.akivlog = newAkiVlog(o.AkiValueLog, o.Shard)
+		s.akispill = newAkiSpill(s.akivlog)
 	}
 	return s, nil
 }
