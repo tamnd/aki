@@ -3,6 +3,7 @@ package drivers
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -294,12 +295,27 @@ func TestGroupDurabilityStrictAck(t *testing.T) {
 	}
 	defer nc2.Close()
 	r2 := br(nc2)
-	// The relaxed reader sees the group at once: the create ran in RAM and
-	// only the strict creator's output waits on the gated chain.
-	send(t, nc2, "XGROUP", "CREATECONSUMER", "gk", "g", "c")
-	expect(t, r2, ":1\r\n")
-
+	// The relaxed reader sees the group while the strict creator's output
+	// waits on the gated chain. The creator's reply is held, so nothing
+	// orders nc2 behind the create; on a slow box nc2's command can reach
+	// the shard first and land in the NOGROUP window, so retry through it.
 	deadline := time.Now().Add(10 * time.Second)
+	for {
+		send(t, nc2, "XGROUP", "CREATECONSUMER", "gk", "g", "c")
+		line, err := r2.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == ":1\r\n" {
+			break
+		}
+		if !strings.HasPrefix(line, "-NOGROUP") || time.Now().After(deadline) {
+			t.Fatalf("createconsumer reply = %q", line)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	deadline = time.Now().Add(10 * time.Second)
 	for readInfo(t, nc2, r2)["wal_barrier_flushes"] == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("no barrier flush while a strict XGROUP CREATE was pending")
