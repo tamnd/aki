@@ -528,10 +528,11 @@ func RebuildShardChunkDir(dev Device, prefix *Prefix, chunkdirOff uint64) (*Chun
 // directory. A shard that never checkpointed a given table carries an empty rebuilder
 // there, not a nil, so a consumer folds the tail over a table it can always index.
 //
-// TTLClasses and FreeMap are the file-global roots the live meta slot points at: the
-// TTL reclaim index the expiry pass consults and the free map the writer resumes
-// allocation from. Both are nil when the file has none (a fresh file, or a scan
-// fallback with no trusted root).
+// TTLClasses, FreeMap, and MetaKV are the file-global roots the live meta slot points
+// at: the TTL reclaim index the expiry pass consults, the free map the writer resumes
+// allocation from, and the meta_kv config and provenance a reopen reads back (import
+// source, the checksum kind, shard geometry). All are nil when the file has none (a
+// fresh file, or a scan fallback with no trusted root).
 type Recovery struct {
 	State      *OpenState
 	SRT        *SRT
@@ -540,12 +541,13 @@ type Recovery struct {
 	ChunkDirs  []*ChunkDirRebuilder
 	TTLClasses []TTLClass
 	FreeMap    []FreeExtent
+	MetaKV     []MetaKVPair
 	TailFrom   uint64
 }
 
 // Recover runs the whole open sequence and assembles the structural recovery
 // (spec 2064/f3/07 section 6): pick the live root, read the shard root table and the
-// file-global TTL index and free map, and rebuild each shard's index, dead-byte
+// file-global TTL index, free map, and meta_kv, and rebuild each shard's index, dead-byte
 // accounting, and cold-chunk directory from their checkpoint chains. It stops at the
 // boundary the akifile format owns: the tail
 // replay past TailFrom is the caller's, because turning a log segment back into index
@@ -581,6 +583,10 @@ func Recover(dev Device) (*Recovery, error) {
 		return nil, err
 	}
 	rec.FreeMap, err = ReadFreeMap(dev, st.Prefix, st.Meta)
+	if err != nil {
+		return nil, err
+	}
+	rec.MetaKV, err = ReadMetaKV(dev, st.Prefix, st.Meta)
 	if err != nil {
 		return nil, err
 	}

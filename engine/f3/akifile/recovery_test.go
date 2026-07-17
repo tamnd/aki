@@ -577,9 +577,10 @@ func TestRecoverWiresAuxiliaryTables(t *testing.T) {
 	}
 }
 
-// TestRecoverWiresGlobalRoots checks that Recover surfaces the file-global TTL index
-// and free map the live meta slot points at, so a reopening writer resumes allocation
-// and the expiry pass has its reclaim list without a second open.
+// TestRecoverWiresGlobalRoots checks that Recover surfaces the file-global TTL index,
+// free map, and meta_kv the live meta slot points at, so a reopening writer resumes
+// allocation, the expiry pass has its reclaim list, and the file's config and provenance
+// read back without a second open.
 func TestRecoverWiresGlobalRoots(t *testing.T) {
 	dev := &memDevice{}
 	f := newTestFile(t, dev, SyncNo, nil)
@@ -589,8 +590,12 @@ func TestRecoverWiresGlobalRoots(t *testing.T) {
 		{StartOff: 0x40000, Length: 0x8000},
 		{StartOff: 0x50000, Length: 0x1000, Flags: FreeMapPending},
 	})
-	// Write the TTL index as a bare root past the free-map segment, so the two roots
-	// do not overlap in the append space.
+	kvOff := appendMetaKV(t, f, []MetaKVPair{
+		{Key: []byte("import.source"), Value: []byte("RDB v12")},
+		{Key: []byte("config.maxmemory"), Value: []byte("512mb")},
+	})
+	// Write the TTL index as a bare root past the segments, so the roots do not overlap
+	// in the append space.
 	ttlBytes := encodeTTLIndex([]TTLClass{
 		{Class: 1, ExpiryUpperUnix: 1000, Segments: []uint64{0x1000, 0x2000}},
 	})
@@ -601,7 +606,7 @@ func TestRecoverWiresGlobalRoots(t *testing.T) {
 
 	m := &MetaSlot{
 		CommitSeq: 3, FileSize: f.Cursor(), CleanShutdown: 1,
-		TTLIndexOff: ttlOff, TTLIndexLen: uint32(len(ttlBytes)), FreeMapOff: fmOff,
+		TTLIndexOff: ttlOff, TTLIndexLen: uint32(len(ttlBytes)), FreeMapOff: fmOff, MetaKVOff: kvOff,
 	}
 	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
 	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
@@ -616,6 +621,12 @@ func TestRecoverWiresGlobalRoots(t *testing.T) {
 	free, pending := FreeMapTotals(rec.FreeMap)
 	if free != 0x8000 || pending != 0x1000 {
 		t.Fatalf("recovered free map = free %d / pending %d, want %d/%d", free, pending, 0x8000, 0x1000)
+	}
+	if len(rec.MetaKV) != 2 {
+		t.Fatalf("recovered meta kv = %+v, want 2 pairs", rec.MetaKV)
+	}
+	if v, ok := MetaKVLookup(rec.MetaKV, "import.source"); !ok || string(v) != "RDB v12" {
+		t.Fatalf("recovered import.source = %q/%v, want RDB v12", v, ok)
 	}
 }
 
