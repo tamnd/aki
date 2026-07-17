@@ -188,6 +188,15 @@ func init() {
 	register("EXPIRETIME", expiretimeCmd, 1, 1, true)
 	register("PEXPIRETIME", pexpiretimeCmd, 1, 1, true)
 	register("PERSIST", persistCmd, 1, 1, true)
+	// The EXPIRE family sets a key's deadline. It routes through expireRoute so a
+	// collection key gets an honest not-yet answer instead of the string path's
+	// "no such key" 0: collections cannot carry a key-level TTL until the per-type
+	// header-deadline slice lands (Spec/2064/f3/milestones/
+	// M-expiry-generic-key-ttl-plan.md). String keys are fully supported here.
+	register("EXPIRE", expireCmd, 2, -1, true)
+	register("PEXPIRE", pexpireCmd, 2, -1, true)
+	register("EXPIREAT", expireatCmd, 2, -1, true)
+	register("PEXPIREAT", pexpireatCmd, 2, -1, true)
 	// SORT and its read-only twin span list, set, and zset, so they live here
 	// with the other cross-type keyspace verbs. Only the plain numeric/ALPHA and
 	// BY-nosort rows are wired; the fan-wave BY-pattern/GET/STORE rows are their
@@ -1179,6 +1188,47 @@ func persistCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	r.Int(0)
+}
+
+// collectionKind reports the type name of a collection key, or "" when the key
+// holds no collection on this shard. It is the presence half of the unified TYPE
+// probe, used by the EXPIRE router to tell a collection key apart from an absent
+// or string key without building any registry.
+func collectionKind(cx *shard.Ctx, key []byte) string {
+	switch {
+	case set.Has(cx, key):
+		return "set"
+	case zset.Has(cx, key):
+		return "zset"
+	case hash.Has(cx, key):
+		return "hash"
+	case list.Has(cx, key):
+		return "list"
+	case stream.Has(cx, key):
+		return "stream"
+	}
+	return ""
+}
+
+// expireRoute answers an EXPIRE-family command across every keyspace. A string
+// key sets its inline deadline through str.Expire. A collection key cannot carry
+// a key-level TTL yet (the per-type header deadline is the next expiry slice,
+// Spec/2064/f3/milestones/M-expiry-generic-key-ttl-plan.md), so rather than lie
+// with the 0 that means "no such key", it answers an honest not-yet error that
+// names the type, the same discipline the deferred SORT rows use.
+func expireRoute(cx *shard.Ctx, args [][]byte, r shard.Reply, verb string) {
+	if kind := collectionKind(cx, args[0]); kind != "" {
+		r.Err("ERR " + verb + " on a " + kind + " key is not supported yet")
+		return
+	}
+	str.Expire(cx, args, r, verb)
+}
+
+func expireCmd(cx *shard.Ctx, args [][]byte, r shard.Reply)   { expireRoute(cx, args, r, "EXPIRE") }
+func pexpireCmd(cx *shard.Ctx, args [][]byte, r shard.Reply)  { expireRoute(cx, args, r, "PEXPIRE") }
+func expireatCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) { expireRoute(cx, args, r, "EXPIREAT") }
+func pexpireatCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	expireRoute(cx, args, r, "PEXPIREAT")
 }
 
 const sortWrongType = "WRONGTYPE Operation against a key holding the wrong kind of value"
