@@ -159,6 +159,60 @@ func TestReadValueFrameAtCatchesTornBlob(t *testing.T) {
 	}
 }
 
+// TestReadValueRangeAtServesSubRange reads windows inside a published value by
+// absolute offset, the partial read the bitmap and chunked bands take: it must
+// return exactly the bytes at value_off+i without regard to the frame's varint or
+// trailing CRC, so a probe of any window lands on the value's own bytes.
+func TestReadValueRangeAtServesSubRange(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	val := []byte("0123456789abcdef")
+	ptrs, err := f.AppendValues(0, 1, [][]byte{val})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	off := ptrs[0].ValueOff
+
+	// A window in the middle, a single byte, and the whole span all resolve to the
+	// value's own bytes at value_off+i.
+	for _, c := range []struct {
+		i, n int
+	}{{0, 4}, {6, 5}, {10, 1}, {0, len(val)}} {
+		into := make([]byte, c.n)
+		if err := f.ReadValueRangeAt(off+uint64(c.i), into); err != nil {
+			t.Fatalf("range [%d:%d]: %v", c.i, c.i+c.n, err)
+		}
+		if want := val[c.i : c.i+c.n]; !bytes.Equal(into, want) {
+			t.Fatalf("range [%d:%d] = %q, want %q", c.i, c.i+c.n, into, want)
+		}
+	}
+}
+
+// TestReadValueRangeAtSkipsChecksum tears a value byte and confirms a sub-range
+// read past it still returns the (now-corrupt) bytes rather than ErrChecksum: the
+// partial read trades the frame CRC for the scratch log's plain-read speed, so the
+// torn-blob guard lives only on the whole-value read path.
+func TestReadValueRangeAtSkipsChecksum(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	ptrs, err := f.AppendValues(0, 1, [][]byte{[]byte("plain-subrange-read")})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	off := ptrs[0].ValueOff
+	dev.buf[off+2] ^= 0xff
+
+	into := make([]byte, 4)
+	if err := f.ReadValueRangeAt(off, into); err != nil {
+		t.Fatalf("range read over torn value: %v", err)
+	}
+	if into[2] != ('a' ^ 0xff) {
+		t.Fatalf("range read did not return the torn byte, got %q", into)
+	}
+}
+
 // TestCompactValuesRehomesLiveSubset appends a batch, then re-homes only the
 // live subset into a fresh segment past the old one and confirms every new
 // pointer resolves to its value, the reclaim the store's value-log compaction

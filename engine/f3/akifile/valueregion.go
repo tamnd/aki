@@ -178,3 +178,26 @@ func (f *File) ReadValueFrameAt(off uint64, valLen uint32, dst []byte) ([]byte, 
 	}
 	return val, nil
 }
+
+// ReadValueRangeAt reads len(into) bytes at absolute offset off, a sub-range of a
+// value the caller already located. It is the partial read the bitmap and chunked
+// bands take: a record's value bytes start at a value_off, and a bit probe or a
+// chunk read wants k bytes from value_off+i, not the whole value. off is that
+// absolute file offset (the pointer's value_off plus the in-value position), and
+// the read must stay inside the value's own [value_off, value_off+value_len) span,
+// which the caller owns exactly as it did against the per-shard scratch log.
+//
+// Unlike ReadValueFrameAt this verifies no checksum: a k-byte sub-range cannot
+// carry the frame's whole-value CRC, and the bit paths read a byte at a time in a
+// loop, so re-reading and re-summing the whole frame per probe would be quadratic.
+// The frame's trailing CRC still guards every whole-value read (GET, a promotion, a
+// compaction copy) through ReadValueFrameAt and ReadValue; a sub-range read trades
+// that guard for the scratch log's plain-read speed, the same posture the scratch
+// vlog held with no CRC at all. This is the read-surface parity the value-log
+// re-home needs before the hot path can route the bit and chunk probes here; the
+// LTM page-cache discipline (advise the range away so spilled bytes do not linger)
+// lands with that flip, since the Device interface models no advise today.
+func (f *File) ReadValueRangeAt(off uint64, into []byte) error {
+	_, err := f.dev.ReadAt(into, int64(off))
+	return err
+}
