@@ -139,6 +139,11 @@ func init() {
 	register("SETEX", str.Setex, 3, 3, true)
 	register("PSETEX", str.Psetex, 3, 3, true)
 	register("STRLEN", str.Strlen, 1, 1, true)
+	// LCS reads two string keys. Co-located it runs on their shared owner; a
+	// split pair takes the F17 route, reading each value on its own owner.
+	register("LCS", str.Lcs, 2, -1, true)
+	table["LCS"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
+	table["LCS"].cross = str.LcsCross
 	// TYPE spans the string store and the set registry, so the set package
 	// owns its point handler; the same holds for the single-key EXISTS and DEL
 	// paths registered below.
