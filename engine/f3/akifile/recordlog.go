@@ -72,6 +72,14 @@ const RecFlagTombstone uint32 = 1 << 0
 // the word. Bit one of the row flags.
 const RecFlagInline uint32 = 1 << 1
 
+// RecFlagChunked marks a row whose value is a multi-chunk run, so its word names
+// a chunk-extent table rather than a single value-log run a one-shot read
+// resolves. Replay follows the chunk directory to reassemble the value; a reader
+// that only handles single-run values refuses a chunked row rather than misreading
+// its word as a run offset. Bit two of the row flags. A separated value carries
+// neither this nor RecFlagInline: its word is a lone value-log run.
+const RecFlagChunked uint32 = 1 << 2
+
 // RecordFrame locates one framed record inside a `log` payload: the frame start
 // where the varint length sits and where a walk anchors, the body start where a
 // point read decodes from, the body length, and the body CRC. Offsets are

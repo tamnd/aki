@@ -59,6 +59,11 @@ func (s *Store) recordRow(off uint64) akifile.RecordRow {
 	if f&(flagSep|flagChunked) != 0 {
 		row.ValueWord, _, _ = s.readPtr(vs)
 		row.ValueLen = uint32(s.vlen(off))
+		if f&flagChunked != 0 {
+			// A chunked value's word names a chunk-extent table, not a single run, so
+			// mark it for replay to reassemble rather than read as one offset.
+			row.Flags |= akifile.RecFlagChunked
+		}
 		return row
 	}
 	row.Flags |= akifile.RecFlagInline
@@ -89,7 +94,7 @@ func (s *Store) inlineValue(off uint64, f byte, vs uint64) []byte {
 // before the command's caller sees success; a cut failure surfaces as the
 // command's error, the same way a value-log spill failure already does.
 func (s *Store) logRecord(off uint64) error {
-	if s.akirlog == nil {
+	if s.akirlog == nil || s.replaying {
 		return nil
 	}
 	s.akirlog.stage(s.recordRow(off))
@@ -119,7 +124,7 @@ func (s *Store) logRecordSticky(off uint64) {
 // surface. The dead-byte accounting is not this call's: the caller's dropRecord
 // already charged the superseded bytes.
 func (s *Store) logTombstone(key []byte) {
-	if s.akirlog == nil {
+	if s.akirlog == nil || s.replaying {
 		return
 	}
 	s.akirlog.stage(akifile.RecordRow{Flags: akifile.RecFlagTombstone, Key: key})
