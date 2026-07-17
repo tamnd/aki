@@ -135,6 +135,21 @@ type worker struct {
 	bpStalls       uint64
 	bpReasonWaits  [numParkReasons]uint64
 	bpReasonStalls [numParkReasons]uint64
+
+	// The flushlag half of the stall accounting (backpressure.go). writeOps
+	// is the op-indexed write bits UseWriteOps installed, nil on a runtime
+	// that never wired them, read with plain loads like handlers; the
+	// executeCmd gate consults it before running a handler. bpFlushSeen
+	// snapshots the log's flush count between checks and bpFlushStall counts
+	// fruitless checks, paced by bpFlushCheckMs because retry passes at an
+	// idle boundary spin at Gosched speed while a WAL PUT takes milliseconds:
+	// counting passes would cross any window before a single flush could
+	// land, so a check only advances the counter every bpFlushPollMs of the
+	// batch clock. Owner goroutine only.
+	writeOps       []bool
+	bpFlushStall   int
+	bpFlushSeen    uint64
+	bpFlushCheckMs int64
 }
 
 func newWorker(id int, st *store.Store) *worker {
@@ -254,7 +269,11 @@ func (w *worker) run() {
 				// through to idle() and wait. Only when no migratable residue remains
 				// does the boundary spin toward the stall window instead of parking
 				// (maybeCompact above advanced the stall counter, and it fires the
-				// OOM reply once the window is crossed).
+				// OOM reply once the window is crossed). A flushlag waiter spins
+				// here too: nothing wakes the worker when a flush completes, so the
+				// boundary loop keeps retrying until the lag clears or the paced
+				// flushlag window (bpFlushPollMs) stalls it out; the spin lasts at
+				// most one flush latency on a live pipeline.
 				w.drainCold()
 				if !w.st.ColdDraining() {
 					runtime.Gosched()
@@ -320,7 +339,10 @@ func (w *worker) drainCold() {
 	// The moment the retry allocates, fullWaiters empties and the path drops back
 	// to the low-water trigger, so the deep drain evicts only what the parked
 	// write needs. With no write parked this is one NeedsColdDrain load (L9).
-	parked := len(w.fullWaiters) > 0
+	// Only a resident waiter arms the deep trigger: a flushlag waiter is
+	// waiting on the flusher, and evicting resident records would not free
+	// what it needs (backpressure.go residentParked).
+	parked := w.residentParked()
 	if !parked && !w.st.NeedsColdDrain() {
 		return
 	}
@@ -671,7 +693,21 @@ func (w *worker) executeCmd(b *hopBatch, i int) {
 	w.argv = argv
 	w.cx.curConn = b.conn // completion target for a Park; owner-local, per command
 	w.cx.curSeq = c.seq
-	h(&w.cx, argv, r)
+	// The flushlag gate (backpressure.go, doc 04 section 6): a write handler
+	// must not run while the WAL buffer sits over its cap, because by the time
+	// it emits, the mutation has already happened and can neither be re-run
+	// (INCR is not idempotent) nor held aside (per-group seq order). So the
+	// gate parks the command before its handler, on the same full-waiter FIFO
+	// the resident park uses, and the retry runs the handler for the first
+	// time only once the lag clears. Reads and a volatile runtime never take
+	// the branch: one bounds check and a bool load, then an atomic load only
+	// for a write with a log wired.
+	if int(c.op) < len(w.writeOps) && w.writeOps[c.op] && w.cx.Log != nil && w.cx.Log.FlushLagged() {
+		w.cx.parkFull = true
+		w.cx.parkReason = ParkFlushlag
+	} else {
+		h(&w.cx, argv, r)
+	}
 	// Block-not-drop first: a write handler that could not allocate set parkFull
 	// through ParkFull instead of writing a reply. One bool load, zero cost when
 	// unset. Any marks the handler accumulated before parking are the committed

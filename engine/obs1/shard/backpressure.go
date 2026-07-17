@@ -40,6 +40,18 @@ import (
 // four-case taxonomy and a calibrated poll constant.
 const bpStallWindow = 64
 
+// bpFlushPollMs paces the flushlag half of the stall window on the batch
+// clock: a fruitless flush-progress check only advances the counter when at
+// least this many milliseconds passed since the last one. The resident check
+// needs no pacing because its retry passes are driven by drain completions,
+// but an idle boundary with a parked write spins retry passes at Gosched
+// speed while a WAL PUT takes milliseconds, so counting raw passes would
+// cross the window before a single flush could possibly land. 64 checks at
+// this pace give a flush pipeline over three seconds of genuine silence
+// before a parked write takes the stall reply, and any completed flush
+// inside that window resets it.
+const bpFlushPollMs = 50
+
 // fullWaiter is one write parked on a full arena: its batch node and the command
 // slot within it. The pair is enough to re-run the command against a reclaimed
 // arena (executeCmd rebuilds the argument views from the node) and to write the
@@ -112,8 +124,12 @@ func (w *worker) retryFull() {
 			// Still full: keep the waiter, its batch stays held. A multi-key write
 			// that committed more pairs before re-parking advanced Ctx.resume and
 			// grew the mark set, so carry both forward and the next retry resumes
-			// past the pairs this pass just wrote.
+			// past the pairs this pass just wrote. The reason travels too: a write
+			// that parked on flushlag can re-park on resident once the lag clears
+			// and its handler finally runs into a full arena (or the other way
+			// around), and the stall accounting must count it where it waits now.
 			fw.resume = w.cx.resume
+			fw.reason = w.cx.parkReason
 			fw.marks = append(fw.marks[:0], w.cx.marks...)
 			kept = append(kept, fw)
 			continue
@@ -134,54 +150,104 @@ func (w *worker) retryFull() {
 	w.ep.exit()
 	if len(w.fullWaiters) == 0 {
 		w.bpStall = 0
+		w.bpFlushStall = 0
 		return
 	}
 	w.stallCheck()
 }
 
-// stallCheck advances the coarse stall bound after a retry pass left writes
-// parked. Any of three signals is progress and resets the counter: the cold
-// cursor advanced since the last pass, a drain is in flight or pending
-// (ColdDraining), or the migrator has cold space queued to return to the arena
-// (ReclaimPending, segments a flip emptied but the epoch has not freed yet). The
-// last one closes the window slice 5a's cold-cursor-only check left open: after a
-// drain moves records cold and stops, the arena still needs a few boundaries to
-// hand the emptied segments back through the epoch, and during those the cold tail
-// is static and no drain is in flight, so a retry loop would wrongly count them as
-// stalls and OOM a write whose room was one reclaim pass away. Only when none of
-// the three holds does the counter climb, and crossing the window means the arena
-// truly cannot free room (disk full, an I/O error, no migratable residue, or a
-// leaked epoch that never releases a retired segment, the section 8.3 taxonomy
-// names), so every remaining waiter takes the OOM reply. Owner goroutine only.
+// stallCheck advances the stall bounds after a retry pass left writes parked,
+// one window per park reason (doc 04 section 6), each with its own progress
+// signal, so a flushlag storm can never stall out a resident waiter or the
+// other way around.
+//
+// For resident waiters any of three signals is progress and resets the
+// counter: the cold cursor advanced since the last pass, a drain is in flight
+// or pending (ColdDraining), or the migrator has cold space queued to return
+// to the arena (ReclaimPending, segments a flip emptied but the epoch has not
+// freed yet). The last one closes the window slice 5a's cold-cursor-only
+// check left open: after a drain moves records cold and stops, the arena
+// still needs a few boundaries to hand the emptied segments back through the
+// epoch, and during those the cold tail is static and no drain is in flight,
+// so a retry loop would wrongly count them as stalls and OOM a write whose
+// room was one reclaim pass away. Only when none of the three holds does the
+// counter climb, and crossing the window means the arena truly cannot free
+// room (disk full, an I/O error, no migratable residue, or a leaked epoch
+// that never releases a retired segment, the section 8.3 taxonomy names), so
+// every resident waiter takes the OOM reply.
+//
+// For flushlag waiters progress is a completed WAL flush (FlushCount moved),
+// and a flushlag waiter still parked after a retry pass implies the lag flag
+// was up during the pass, because a clear flag would have run its handler and
+// resolved it. The counter is paced by bpFlushPollMs (see the constant) and
+// crossing the window means flushing has genuinely stopped, the bucket
+// refusing PUTs past the retry backoff, so every flushlag waiter takes the
+// flush-stalled reply. A reason with no waiters gets its counter reset so a
+// later park starts a fresh window. Owner goroutine only.
 func (w *worker) stallCheck() {
-	prog := w.st.ColdProgress()
-	if prog != w.bpProg || w.st.ColdDraining() || w.st.ReclaimPending() {
-		w.bpProg = prog
+	var resident, flushlag bool
+	for i := range w.fullWaiters {
+		if w.fullWaiters[i].reason == ParkFlushlag {
+			flushlag = true
+		} else {
+			resident = true
+		}
+	}
+	if !resident {
 		w.bpStall = 0
+	} else {
+		prog := w.st.ColdProgress()
+		if prog != w.bpProg || w.st.ColdDraining() || w.st.ReclaimPending() {
+			w.bpProg = prog
+			w.bpStall = 0
+		} else if w.bpStall++; w.bpStall >= bpStallWindow {
+			w.stallOutReason(ParkResident, "ERR "+store.ErrFull.Error()+" ("+w.st.StallReason()+")")
+			w.bpStall = 0
+		}
+	}
+	if !flushlag {
+		w.bpFlushStall = 0
+		w.bpFlushCheckMs = 0
 		return
 	}
-	w.bpStall++
-	if w.bpStall >= bpStallWindow {
-		w.stallOut()
+	if fc := w.cx.Log.FlushCount(); fc != w.bpFlushSeen {
+		w.bpFlushSeen = fc
+		w.bpFlushStall = 0
+		w.bpFlushCheckMs = w.cx.NowMs
+		return
+	}
+	if w.cx.NowMs-w.bpFlushCheckMs < bpFlushPollMs {
+		return
+	}
+	w.bpFlushCheckMs = w.cx.NowMs
+	w.bpFlushStall++
+	if w.bpFlushStall >= bpStallWindow {
+		w.stallOutReason(ParkFlushlag, "ERR store: flush stalled")
+		w.bpFlushStall = 0
 	}
 }
 
-// stallOut surfaces the OOM reply to every remaining parked write and releases
-// their batches, the terminal answer when no drain progress is possible. The
-// message is store.ErrFull's own text with the stall taxonomy's cause appended in
+// stallOutReason surfaces msg to every parked write waiting under reason and
+// releases their batches, the terminal answer when that reason's progress has
+// genuinely stopped; waiters parked under any other reason stay in the FIFO
+// with their own window still running. For resident the message is
+// store.ErrFull's own text with the stall taxonomy's cause appended in
 // parentheses (store.StallReason, doc 06 section 8.3): the same out-of-memory
 // class a client already handles as a refusal, now carrying why the migrator
 // could not free room (a full cold device, a cold I/O error, a stream pinning
-// migration, no tier, or an exhausted arena). It never acknowledges a write and
-// then drops it: a parked write ends in exactly one of a real reply after a drain
-// or this OOM reply after a genuine stall. Every waiter today parked as
-// ParkResident, whose doc 04 section 6 stall reply is exactly this f3 string;
-// the flushlag reply ("ERR store: flush stalled") and the lease resolution (the
-// doc 07 MOVED redirect, not an error) land with the slices that first raise
-// those reasons. Owner goroutine only.
-func (w *worker) stallOut() {
-	msg := "ERR " + store.ErrFull.Error() + " (" + w.st.StallReason() + ")"
+// migration, no tier, or an exhausted arena). For flushlag it is the doc 04
+// section 6 flush-stalled string. It never acknowledges a write and then
+// drops it: a parked write ends in exactly one of a real reply after its
+// reason's progress resumes or this reply after a genuine stall. The lease
+// resolution (the doc 07 MOVED redirect, not an error) lands with the slice
+// that first raises that reason. Owner goroutine only.
+func (w *worker) stallOutReason(reason ParkReason, msg string) {
+	kept := w.fullWaiters[:0]
 	for _, fw := range w.fullWaiters {
+		if fw.reason != reason {
+			kept = append(kept, fw)
+			continue
+		}
 		r := Reply{b: fw.b, i: fw.i}
 		if fw.b.fan(fw.i) != nil {
 			// A fan sub-command returns its outcome as a partial the coordinator
@@ -204,11 +270,26 @@ func (w *worker) stallOut() {
 		w.bpStalls++
 		w.bpReasonStalls[fw.reason]++
 	}
-	for i := range w.fullWaiters {
+	for i := len(kept); i < len(w.fullWaiters); i++ {
 		w.fullWaiters[i] = fullWaiter{}
 	}
-	w.fullWaiters = w.fullWaiters[:0]
-	w.bpStall = 0
+	w.fullWaiters = kept
+}
+
+// residentParked reports whether any parked write waits under the resident
+// reason. drainCold keys its deeper backpressure trigger on it rather than on
+// the FIFO being non-empty: a flushlag waiter is waiting on the flusher, not
+// the arena, and draining resident records toward an empty arena would evict
+// hot data for nothing. Owner goroutine only; the FIFO is small (bounded by
+// parked commands), so the scan is cheap and only runs while something is
+// parked.
+func (w *worker) residentParked() bool {
+	for i := range w.fullWaiters {
+		if w.fullWaiters[i].reason == ParkResident {
+			return true
+		}
+	}
+	return false
 }
 
 // releaseHold drops one hold a parked write placed on its batch and pushes the

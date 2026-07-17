@@ -15,8 +15,12 @@ package shard
 //     fold cursor.
 //   - flushlag: the WAL buffer exceeds its cap, which in practice means the
 //     bucket is refusing PUTs or the chain is refusing appends. Progress
-//     signal: a successful flush. Stall reply: "ERR store: flush stalled".
-//     Registered here, raised by nothing until the WAL lands (O1b).
+//     signal: a successful flush (WriteLog.FlushCount). Stall reply:
+//     "ERR store: flush stalled". Raised by the executeCmd gate: a write
+//     handler must not run while the buffer is over cap, because its
+//     mutation cannot be re-run or held aside afterwards, so the park
+//     happens before the handler and the retry runs it for the first time
+//     once the lag clears (worker.go, backpressure.go).
 //   - lease: the group self-suspended (doc 02 section 3.5). Progress signal:
 //     a successful chain append under the same epoch, or demotion, in which
 //     case parked writers fail over with the doc 07 MOVED redirect rather
@@ -25,18 +29,19 @@ package shard
 //
 // Registration means the names exist, every park and stall-out is counted
 // under its reason, and the per-reason counters render in INFO through the
-// stats schema (stats.go), so the flushlag and lease rows sit at zero in every
-// INFO until their slices raise them and the park-storm lab can read the split
-// without a schema change.
+// stats schema (stats.go); the lease rows sit at zero until the lease guard
+// is wired into serving, and the park-storm lab reads the split without a
+// schema change.
 
 // ParkReason names why a write parked (doc 04 section 6).
 type ParkReason uint8
 
 const (
 	// ParkResident is the resident-budget park, the f3 arena-full park under
-	// its obs1 name; the only reason raised until the WAL and lease slices.
+	// its obs1 name.
 	ParkResident ParkReason = iota
-	// ParkFlushlag is the WAL-buffer-over-cap park; registered, not yet raised.
+	// ParkFlushlag is the WAL-buffer-over-cap park, raised by the executeCmd
+	// gate before a write handler runs.
 	ParkFlushlag
 	// ParkLease is the self-suspended-group park; registered, not yet raised.
 	ParkLease
