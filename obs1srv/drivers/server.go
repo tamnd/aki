@@ -162,6 +162,17 @@ type Options struct {
 	// so the loop count follows the core budget, not the shard count, and
 	// both readings of doc 08 section 4.2 lose their tie to shards.
 	NetLoops int
+	// WriteLog, when set, is the durability seam: string-keyspace write
+	// handlers emit their post-decision effect frame through it after the
+	// store mutation and before the reply (doc 04 sections 2 and 3.1), which
+	// is the relaxed ack point. Nil keeps the runtime volatile, byte-for-byte
+	// the f3 behavior.
+	WriteLog shard.WriteLog
+	// WALInfo, when set, extends INFO with the node-level durability rows
+	// (the # Durability section). The flusher and committer are node
+	// singletons, so their counters ride this hook instead of the per-shard
+	// stats blob.
+	WALInfo func([]byte) []byte
 	// OutBufLimitBytes is the hard cap on one connection's pending reply
 	// bytes buffered driver-side (the client-output-buffer-limit lineage,
 	// doc 08 section 3.5): a client whose unread backlog passes it is
@@ -348,6 +359,12 @@ func Listen(o Options) (*Server, error) {
 	}
 	s.rt.Use(dispatch.Handlers())
 	s.rt.UseDemoter(dispatch.Demoter())
+	if o.WriteLog != nil {
+		s.rt.SetWriteLog(o.WriteLog)
+	}
+	if o.WALInfo != nil {
+		s.rt.SetWALInfo(o.WALInfo)
+	}
 	s.rt.Start()
 	return s, nil
 }
