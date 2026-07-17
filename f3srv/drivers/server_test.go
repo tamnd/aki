@@ -2,9 +2,12 @@ package drivers
 
 import (
 	"bufio"
+	"io"
 	"net"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -108,6 +111,71 @@ func TestSmokePingEcho(t *testing.T) {
 		t.Fatal(err)
 	}
 	expect(t, br, "$3\r\nmsg\r\n")
+}
+
+// TestTime round-trips TIME: a two element array whose first bulk is a plausible
+// unix second and whose second is the microseconds within that second, and whose
+// argument tail is rejected for arity.
+func TestTime(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	if _, err := nc.Write([]byte("*1\r\n$4\r\nTIME\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	els := readArrayBulks(t, br, 2)
+	secs, err := strconv.Atoi(els[0])
+	if err != nil {
+		t.Fatalf("seconds %q not an integer: %v", els[0], err)
+	}
+	// Any run of this test is well after 2020, so the clock is at least this far.
+	if secs < 1577836800 {
+		t.Fatalf("seconds %d implausibly early", secs)
+	}
+	micros, err := strconv.Atoi(els[1])
+	if err != nil {
+		t.Fatalf("microseconds %q not an integer: %v", els[1], err)
+	}
+	if micros < 0 || micros > 999999 {
+		t.Fatalf("microseconds %d out of range", micros)
+	}
+
+	if _, err := nc.Write([]byte("*2\r\n$4\r\nTIME\r\n$1\r\nx\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	expect(t, br, "-ERR wrong number of arguments for 'time' command\r\n")
+}
+
+// readArrayBulks reads a RESP array header of exactly n elements and returns each
+// bulk element's payload as a string.
+func readArrayBulks(t *testing.T, br *bufio.Reader, n int) []string {
+	t.Helper()
+	head, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read array header: %v", err)
+	}
+	if want := "*" + strconv.Itoa(n) + "\r\n"; head != want {
+		t.Fatalf("array header = %q, want %q", head, want)
+	}
+	out := make([]string, n)
+	for i := range out {
+		hdr, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read bulk header: %v", err)
+		}
+		if len(hdr) == 0 || hdr[0] != '$' {
+			t.Fatalf("bulk header = %q", hdr)
+		}
+		blen, err := strconv.Atoi(strings.TrimSuffix(hdr[1:], "\r\n"))
+		if err != nil {
+			t.Fatalf("bulk length %q: %v", hdr, err)
+		}
+		buf := make([]byte, blen+2) // payload plus CRLF
+		if _, err := io.ReadFull(br, buf); err != nil {
+			t.Fatalf("read bulk payload: %v", err)
+		}
+		out[i] = string(buf[:blen])
+	}
+	return out
 }
 
 // TestSmokePipeline sends one write with several commands and expects the

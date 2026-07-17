@@ -5,6 +5,8 @@
 package dispatch
 
 import (
+	"strconv"
+
 	"github.com/tamnd/aki/engine/f3/derived"
 	"github.com/tamnd/aki/engine/f3/hash"
 	"github.com/tamnd/aki/engine/f3/list"
@@ -13,6 +15,7 @@ import (
 	"github.com/tamnd/aki/engine/f3/str"
 	"github.com/tamnd/aki/engine/f3/stream"
 	"github.com/tamnd/aki/engine/f3/zset"
+	"github.com/tamnd/aki/f3srv/resp"
 )
 
 // entry is one command's table row. op doubles as the handler's index in the
@@ -122,6 +125,7 @@ func registerFan(name string, kind shard.FanKind, fanOp byte, paired, fanOnly bo
 func init() {
 	register("PING", ping, 0, 1, false)
 	register("ECHO", echo, 1, 1, false)
+	register("TIME", timeCmd, 0, 0, false)
 
 	// The string point surface. SET's tail is option soup, so the handler
 	// validates it.
@@ -905,4 +909,17 @@ func ping(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 
 func echo(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Bulk(args[0])
+}
+
+// timeCmd answers TIME: a two element array of the current unix time as seconds
+// and the microseconds within that second. f3 reads the per-batch millisecond
+// clock, so the microsecond field lands on a millisecond boundary (its low three
+// digits are zero), the resolution the cached clock carries.
+func timeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	var scratch [24]byte
+	out := resp.AppendArrayHeader(cx.Aux[:0], 2)
+	out = resp.AppendBulk(out, strconv.AppendInt(scratch[:0], cx.NowMs/1000, 10))
+	out = resp.AppendBulk(out, strconv.AppendInt(scratch[:0], cx.NowMs%1000*1000, 10))
+	cx.Aux = out
+	r.Raw(out)
 }
