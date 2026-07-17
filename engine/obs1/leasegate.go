@@ -76,16 +76,23 @@ func (g *LeaseGate) recalcHorizon() {
 // Demoted before Suspended, so a late renewal that raced a foreign grant
 // cannot resurrect a demoted group; only the explicit re-grant path (O3a)
 // clears it through Regrant.
+// The count moves before the deadline becomes visible: a worker that saw
+// the group un-suspend and delivered a held reply must find the count
+// already moved, or an observer sequenced behind the reply reads a stale
+// count. The stall window only needs movement, so counting a hair early
+// is harmless in the other direction.
 func (g *LeaseGate) Renewed(group uint16, at time.Time) {
+	g.renewals.Add(1)
 	g.guard.Renewed(group, at)
 	g.recalcHorizon()
-	g.renewals.Add(1)
 }
 
 // OnAppended is the committer hook (CommitterConfig.OnAppended): a batch of
 // commit records landed on the chain, so every group in it renewed at now.
-// One renewal count per batch, matching one append per batch.
+// One renewal count per batch, matching one append per batch. The count
+// moves first for the Renewed reason above.
 func (g *LeaseGate) OnAppended(groups []uint16) {
+	g.renewals.Add(1)
 	now := time.Now()
 	g.guard.mu.Lock()
 	for _, gr := range groups {
@@ -93,7 +100,6 @@ func (g *LeaseGate) OnAppended(groups []uint16) {
 	}
 	g.guard.mu.Unlock()
 	g.recalcHorizon()
-	g.renewals.Add(1)
 }
 
 // Demote hands the group to a taker a foreign grant named: the belief is
