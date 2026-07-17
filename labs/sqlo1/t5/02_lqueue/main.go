@@ -22,10 +22,10 @@
 // order, and at any width the drain at the end must find exactly the
 // elements the ledger says are left.
 //
-// Until the fence paging slice lands, a 200 B queue caps at ~3000
-// elements (167 fence nodes at ~19 elements each); the harness
-// surfaces the refusal loudly rather than working around it, and the
-// full depth sweep queues behind that slice.
+// With fence paging landed the fence spills into page records past
+// 167 nodes, so the full depth sweep to 10^7 is reachable; the page
+// index caps the two-level layout around 3.4B small elements, far
+// past anything this lab drives.
 package main
 
 import (

@@ -42,32 +42,56 @@ const (
 	// Noded root layout:
 	//
 	//	u8   sub        // listSubNoded
-	//	u8   lflags     // bit0 fence-paged (the paging slice's)
+	//	u8   lflags     // bit0 fence-paged
 	//	u16  reserved
 	//	u32  rootgen
 	//	u64  rooth      // shared planed prefix, offset 8
 	//	u64  count
 	//	u64  next_segid
-	//	u32  node_count
+	//	u32  node_count // page_count when paged
 	//	fence: node_count x { u64 segid_lo48|meta_hi16, u32 count }
+	//
+	// A paged root holds the page index in the entry area instead of
+	// the fence: each entry names a fence page record (subkey kind 3
+	// under the same plane, pageids minted from next_segid like nodes)
+	// and carries the page's element total, so positional seeks
+	// prefix-sum two levels, root then page, and land in 3 records.
 	listNodeRootHdrLen = 36
 	listFenceEntLen    = 12
 
-	// listFenceMaxNodes bounds the inline fence to the same root
-	// budget the inline tier used; a fence past it is the paging
-	// slice's layout.
-	listFenceMaxNodes = (listInlineMax - listNodeRootHdrLen) / listFenceEntLen
+	// listPageHdrLen is the fence page payload header: u16 n, u16
+	// reserved, then n fence entries in list order.
+	listPageHdrLen = 4
 
-	// lflagFencePaged marks a paged fence; nothing writes it before
-	// the paging slice lands.
+	// lflagFencePaged marks a paged fence, the one-way second rung of
+	// the fence ladder; a paged root never goes back to flat.
 	lflagFencePaged = 1 << 0
 )
 
-// errListFencePaged marks a path the fence paging slice owns: a fence
-// grown past listFenceMaxNodes, or a root already carrying the paged
-// flag. Nothing writes a paged root yet, so only fence growth reaches
-// it, and a refused write is side-effect free.
-var errListFencePaged = errors.New("sqlo1: list fence is past the inline cap; the fence paging slice owns this path")
+// The fence fanouts. Vars, not consts, so the paged ladder (the flat
+// cap, page splits, the third-level refusal) is reachable in
+// test-sized lists; nothing outside tests writes them.
+var (
+	// listFenceMaxNodes bounds the flat fence to the same root budget
+	// the inline tier used; a push past it pages the fence.
+	listFenceMaxNodes = (listInlineMax - listNodeRootHdrLen) / listFenceEntLen
+
+	// listFencePageMax is the doc 07 page fanout: entries per fence
+	// page, sized so a page rides one drain frame comfortably.
+	listFencePageMax = 330
+
+	// listFencePageIdxMax bounds the root's page index. The lqueue
+	// marquee needs ~1600 pages at depth 10^7 on 200 B elements, so
+	// the bound sits at 4096, a ~49 KiB root at worst, which drain
+	// coalescing frames once per window, not per op.
+	listFencePageIdxMax = 4096
+)
+
+// errListFenceThirdLevel is the ladder's end: a list whose page index
+// cannot take another page. At production fanouts that is ~54 billion
+// one-element nodes, far past doc 02's per-key ambitions; a refused
+// write is side-effect free.
+var errListFenceThirdLevel = errors.New("sqlo1: list fence page index is full")
 
 // listFenceEnt is one fence slot: the node's segid, its advisory meta
 // (reserved zero for now), and its element count. Fence counts are
@@ -79,30 +103,25 @@ type listFenceEnt struct {
 	count uint32
 }
 
-// listNodeRoot is the decoded noded root. The fence is copied out of
-// the read on decode, so it survives the segment reads an op does
-// next.
+// listNodeRoot is the decoded noded root. The fence (flat) or the page
+// index (paged) is copied out of the read on decode, so it survives
+// the segment reads an op does next. Exactly one of fence and pidx is
+// populated, by the paged bit.
 type listNodeRoot struct {
 	lflags    uint8
+	paged     bool
 	rootgen   uint32
 	rooth     uint64
 	count     uint64
 	nextSegid uint64
 	fence     []listFenceEnt
+	pidx      []listFenceEnt
 }
 
-// appendListNodeRoot encodes r onto dst.
-func appendListNodeRoot(dst []byte, r *listNodeRoot) []byte {
-	var h [listNodeRootHdrLen]byte
-	h[0] = listSubNoded
-	h[1] = r.lflags
-	binary.LittleEndian.PutUint32(h[4:], r.rootgen)
-	binary.LittleEndian.PutUint64(h[8:], r.rooth)
-	binary.LittleEndian.PutUint64(h[16:], r.count)
-	binary.LittleEndian.PutUint64(h[24:], r.nextSegid)
-	binary.LittleEndian.PutUint32(h[32:], uint32(len(r.fence)))
-	dst = append(dst, h[:]...)
-	for _, e := range r.fence {
+// appendListFenceEnts encodes an entry array, the shared shape of the
+// flat fence, the page index, and the page payload body.
+func appendListFenceEnts(dst []byte, ents []listFenceEnt) []byte {
+	for _, e := range ents {
 		var b [listFenceEntLen]byte
 		binary.LittleEndian.PutUint64(b[:], e.segid|uint64(e.meta)<<48)
 		binary.LittleEndian.PutUint32(b[8:], e.count)
@@ -111,24 +130,72 @@ func appendListNodeRoot(dst []byte, r *listNodeRoot) []byte {
 	return dst
 }
 
-// decodeListNodeRoot validates everything and copies the fence into
-// the caller's scratch, so the returned root does not alias v and
-// stays valid across the node reads that follow.
-func decodeListNodeRoot(v []byte, fence []listFenceEnt) (listNodeRoot, error) {
+// appendListNodeRoot encodes r onto dst.
+func appendListNodeRoot(dst []byte, r *listNodeRoot) []byte {
+	ents := r.fence
+	flags := r.lflags &^ uint8(lflagFencePaged)
+	if r.paged {
+		ents = r.pidx
+		flags |= lflagFencePaged
+	}
+	var h [listNodeRootHdrLen]byte
+	h[0] = listSubNoded
+	h[1] = flags
+	binary.LittleEndian.PutUint32(h[4:], r.rootgen)
+	binary.LittleEndian.PutUint64(h[8:], r.rooth)
+	binary.LittleEndian.PutUint64(h[16:], r.count)
+	binary.LittleEndian.PutUint64(h[24:], r.nextSegid)
+	binary.LittleEndian.PutUint32(h[32:], uint32(len(ents)))
+	dst = append(dst, h[:]...)
+	return appendListFenceEnts(dst, ents)
+}
+
+// decodeListFenceEnts walks n encoded entries, validating each against
+// nextSegid and the no-empty rule, and appends them onto ents. what
+// names the array in errors. The running element sum comes back for
+// the caller's cross-check.
+func decodeListFenceEnts(p []byte, n int, nextSegid uint64, what string, ents []listFenceEnt) ([]listFenceEnt, uint64, error) {
+	sum := uint64(0)
+	for i := range n {
+		x := binary.LittleEndian.Uint64(p)
+		e := listFenceEnt{
+			segid: x & (1<<48 - 1),
+			meta:  uint16(x >> 48),
+			count: binary.LittleEndian.Uint32(p[8:]),
+		}
+		if e.segid >= nextSegid {
+			return nil, 0, fmt.Errorf("sqlo1: %s entry %d has segid %d at or past next_segid %d", what, i, e.segid, nextSegid)
+		}
+		if e.count == 0 {
+			return nil, 0, fmt.Errorf("sqlo1: %s entry %d has count 0; empty nodes and pages drop whole", what, i)
+		}
+		sum += uint64(e.count)
+		ents = append(ents, e)
+		p = p[listFenceEntLen:]
+	}
+	return ents, sum, nil
+}
+
+// decodeListNodeRoot validates everything and copies the entry array
+// into the caller's scratch (fence flat, pidx paged), so the returned
+// root does not alias v and stays valid across the node and page reads
+// that follow.
+func decodeListNodeRoot(v []byte, fence, pidx []listFenceEnt) (listNodeRoot, error) {
 	if len(v) < listNodeRootHdrLen {
 		return listNodeRoot{}, fmt.Errorf("sqlo1: noded list root of %d bytes has no header", len(v))
 	}
 	if v[0] != listSubNoded {
 		return listNodeRoot{}, fmt.Errorf("sqlo1: noded list root has sub %d", v[0])
 	}
-	if v[1] != 0 {
-		return listNodeRoot{}, fmt.Errorf("sqlo1: noded list root has lflags %#x; only the flat fence lands before the paging slice", v[1])
+	if v[1]&^uint8(lflagFencePaged) != 0 {
+		return listNodeRoot{}, fmt.Errorf("sqlo1: noded list root has unknown lflags %#x", v[1])
 	}
 	if v[2] != 0 || v[3] != 0 {
 		return listNodeRoot{}, errors.New("sqlo1: noded list root has nonzero reserved bytes")
 	}
 	r := listNodeRoot{
 		lflags:    v[1],
+		paged:     v[1]&lflagFencePaged != 0,
 		rootgen:   binary.LittleEndian.Uint32(v[4:]),
 		rooth:     binary.LittleEndian.Uint64(v[8:]),
 		count:     binary.LittleEndian.Uint64(v[16:]),
@@ -141,36 +208,58 @@ func decodeListNodeRoot(v []byte, fence []listFenceEnt) (listNodeRoot, error) {
 		return listNodeRoot{}, errors.New("sqlo1: noded list root has count 0; an empty list is a deleted key")
 	}
 	n := int(binary.LittleEndian.Uint32(v[32:]))
-	if n == 0 || n > listFenceMaxNodes {
-		return listNodeRoot{}, fmt.Errorf("sqlo1: noded list root has node_count %d out of range", n)
+	bound, what := listFenceMaxNodes, "fence"
+	if r.paged {
+		bound, what = listFencePageIdxMax, "page index"
+	}
+	if n == 0 || n > bound {
+		return listNodeRoot{}, fmt.Errorf("sqlo1: noded list root has %s count %d out of range", what, n)
 	}
 	if len(v) != listNodeRootHdrLen+n*listFenceEntLen {
-		return listNodeRoot{}, fmt.Errorf("sqlo1: noded list root of %d bytes does not fit %d fence entries", len(v), n)
+		return listNodeRoot{}, fmt.Errorf("sqlo1: noded list root of %d bytes does not fit %d %s entries", len(v), n, what)
 	}
-	sum := uint64(0)
-	p := v[listNodeRootHdrLen:]
-	for i := range n {
-		x := binary.LittleEndian.Uint64(p)
-		e := listFenceEnt{
-			segid: x & (1<<48 - 1),
-			meta:  uint16(x >> 48),
-			count: binary.LittleEndian.Uint32(p[8:]),
-		}
-		if e.segid >= r.nextSegid {
-			return listNodeRoot{}, fmt.Errorf("sqlo1: fence entry %d has segid %d at or past next_segid %d", i, e.segid, r.nextSegid)
-		}
-		if e.count == 0 {
-			return listNodeRoot{}, fmt.Errorf("sqlo1: fence entry %d has count 0; edge pops drop empty nodes whole", i)
-		}
-		sum += uint64(e.count)
-		fence = append(fence, e)
-		p = p[listFenceEntLen:]
+	ents, sum, err := decodeListFenceEnts(v[listNodeRootHdrLen:], n, r.nextSegid, what, fence)
+	if err != nil {
+		return listNodeRoot{}, err
 	}
 	if sum != r.count {
-		return listNodeRoot{}, fmt.Errorf("sqlo1: fence counts sum to %d, root count says %d", sum, r.count)
+		return listNodeRoot{}, fmt.Errorf("sqlo1: %s counts sum to %d, root count says %d", what, sum, r.count)
 	}
-	r.fence = fence
+	if r.paged {
+		r.pidx = append(pidx, ents...)
+	} else {
+		r.fence = ents
+	}
 	return r, nil
+}
+
+// appendListFencePage encodes a fence page payload: u16 n, u16
+// reserved, then the entries.
+func appendListFencePage(dst []byte, ents []listFenceEnt) []byte {
+	var h [listPageHdrLen]byte
+	binary.LittleEndian.PutUint16(h[:], uint16(len(ents)))
+	dst = append(dst, h[:]...)
+	return appendListFenceEnts(dst, ents)
+}
+
+// decodeListFencePage validates a page payload and copies its entries
+// into the caller's scratch. The caller cross-checks the returned sum
+// against the parent index entry's total, the two-level invariant.
+func decodeListFencePage(v []byte, nextSegid uint64, ents []listFenceEnt) ([]listFenceEnt, uint64, error) {
+	if len(v) < listPageHdrLen {
+		return nil, 0, fmt.Errorf("sqlo1: list fence page of %d bytes has no header", len(v))
+	}
+	n := int(binary.LittleEndian.Uint16(v))
+	if n == 0 || n > listFencePageMax {
+		return nil, 0, fmt.Errorf("sqlo1: list fence page count %d out of range", n)
+	}
+	if binary.LittleEndian.Uint16(v[2:]) != 0 {
+		return nil, 0, errors.New("sqlo1: list fence page has nonzero reserved bytes")
+	}
+	if len(v) != listPageHdrLen+n*listFenceEntLen {
+		return nil, 0, fmt.Errorf("sqlo1: list fence page of %d bytes does not fit %d entries", len(v), n)
+	}
+	return decodeListFenceEnts(v[listPageHdrLen:], n, nextSegid, "fence page", ents)
 }
 
 // listNode is a decoded node: the element count and the raw element

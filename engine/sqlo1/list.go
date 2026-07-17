@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"slices"
 )
 
 // The doc 07 list model. A short list lives whole in its root value,
@@ -188,6 +189,18 @@ type List struct {
 	// moveBuf carries Move's element across the pop and push that
 	// recycle every read view and the pop reply buffers.
 	moveBuf []byte
+
+	// The paged-fence scratch: pidxBuf backs the decoded page index,
+	// pidxS stages fresh index entries a spill mints, pkbuf and
+	// pageBuf carry page reads and writes, pi is the loaded page's
+	// index position (-1 none, reset every stateOf), and deadPages
+	// collects pageids whose deletes land after the root.
+	pidxBuf   []listFenceEnt
+	pidxS     []listFenceEnt
+	pkbuf     [SubkeySize]byte
+	pageBuf   []byte
+	pi        int
+	deadPages []uint64
 }
 
 // NewList builds the list layer over t. The store must carry the
@@ -262,11 +275,17 @@ func (l *List) stateOf(ctx context.Context, key []byte) (listState, listInline, 
 		return listAbsent, listInline{}, 0, ErrWrongType
 	}
 	if v[0] == listSubNoded {
-		l.nodeRoot, err = decodeListNodeRoot(v, l.fence[:0])
+		l.nodeRoot, err = decodeListNodeRoot(v, l.fence[:0], l.pidxBuf[:0])
 		if err != nil {
 			return listAbsent, listInline{}, 0, err
 		}
-		l.fence = l.nodeRoot.fence
+		l.pi = -1
+		if l.nodeRoot.paged {
+			l.pidxBuf = l.nodeRoot.pidx
+			l.fence = l.fence[:0]
+		} else {
+			l.fence = l.nodeRoot.fence
+		}
 		return listNodedState, listInline{}, expMs, nil
 	}
 	li, err := decodeListInline(v)
@@ -381,8 +400,8 @@ func (l *List) upgrade(ctx context.Context, key []byte, region []byte, count int
 		off += es
 	}
 	l.cuts, l.cutN = append(l.cuts, off), append(l.cutN, n)
-	if len(l.cuts) > listFenceMaxNodes {
-		return 0, errListFencePaged
+	if len(l.cuts) > listFenceMaxNodes && pageChunks(len(l.cuts)) > listFencePageIdxMax {
+		return 0, errListFenceThirdLevel
 	}
 
 	rooth, err := l.nextRooth(ctx)
@@ -391,6 +410,7 @@ func (l *List) upgrade(ctx context.Context, key []byte, region []byte, count int
 	}
 	r := &l.nodeRoot
 	*r = listNodeRoot{rootgen: 1, rooth: rooth, count: uint64(count)}
+	l.pi = -1
 	l.fence = l.fence[:0]
 	start := 0
 	for i, end := range l.cuts {
@@ -404,10 +424,19 @@ func (l *List) upgrade(ctx context.Context, key []byte, region []byte, count int
 		r.nextSegid++
 		start = end
 	}
+	if len(l.fence) > listFenceMaxNodes {
+		// An upgrade that overshoots the flat cap pages straight away;
+		// the pages join the nodes under the flush below, all of it
+		// unreferenced until the root lands.
+		if err := l.pageFence(ctx, l.fence, false); err != nil {
+			return 0, err
+		}
+	} else {
+		r.fence = l.fence
+	}
 	if err := l.t.Flush(ctx); err != nil {
 		return 0, err
 	}
-	r.fence = l.fence
 	if err := l.writeNodeRoot(ctx, key); err != nil {
 		return 0, err
 	}
@@ -416,15 +445,28 @@ func (l *List) upgrade(ctx context.Context, key []byte, region []byte, count int
 
 // pushNoded appends elems at an edge of a noded list: the edge node
 // amends until full, then fresh nodes cut off it, batch by batch. The
-// cuts are simulated before any write, so a push the fence cannot take
-// is refused side-effect free.
+// cuts are simulated before any write, so a push the format cannot
+// take is refused side-effect free. A flat fence grown past its cap
+// transitions to pages, and a full edge page spills its overflow into
+// fresh pages; both follow listpage.go's ordering, staging the edge
+// amendment until after the fresh records flush.
 func (l *List) pushNoded(ctx context.Context, key []byte, left bool, elems [][]byte, expMs int64) (int64, error) {
 	r := &l.nodeRoot
+	if r.paged {
+		pj := len(r.pidx) - 1
+		if left {
+			pj = 0
+		}
+		if err := l.loadPage(ctx, pj); err != nil {
+			return 0, err
+		}
+	}
 	ei := len(l.fence) - 1
 	if left {
 		ei = 0
 	}
-	node, err := l.readNode(ctx, l.fence[ei].segid)
+	edgeSegid := l.fence[ei].segid
+	node, err := l.readNode(ctx, edgeSegid)
 	if err != nil {
 		return 0, err
 	}
@@ -443,13 +485,30 @@ func (l *List) pushNoded(ctx context.Context, key []byte, left bool, elems [][]b
 		n++
 	}
 	l.cuts = append(l.cuts, len(elems))
-	if len(l.fence)+len(l.cuts)-1 > listFenceMaxNodes {
-		return 0, errListFencePaged
+	newEnts := len(l.cuts) - 1
+
+	// Capacity, before any write: a flat fence past its cap
+	// transitions, a full page spills, and a full page index is the
+	// ladder's end.
+	transition := false
+	if !r.paged {
+		if len(l.fence)+newEnts > listFenceMaxNodes {
+			transition = true
+			if pageChunks(len(l.fence)+newEnts) > listFencePageIdxMax {
+				return 0, errListFenceThirdLevel
+			}
+		}
+	} else if over := len(l.fence) + newEnts - listFencePageMax; over > 0 {
+		if len(r.pidx)+pageChunks(over) > listFencePageIdxMax {
+			return 0, errListFenceThirdLevel
+		}
 	}
 
-	// Amend the edge node first: nodeBuf copies the region out of the
-	// read before the write recycles it. A left push lands its batch
-	// reversed ahead of the old region, one-at-a-time semantics.
+	// Stage the amended edge payload out of the read now: the fresh
+	// node and page writes below recycle the view, and the amended
+	// image must ride the batch that carries the root, never a flush
+	// ahead of it. A left push lands its batch reversed ahead of the
+	// old region, one-at-a-time semantics.
 	b0 := l.cuts[0]
 	if b0 > 0 {
 		l.nodeBuf = grow(l.nodeBuf, listNodeHdrLen)
@@ -465,16 +524,19 @@ func (l *List) pushNoded(ctx context.Context, key []byte, left bool, elems [][]b
 			}
 		}
 		putListNodeHdr(l.nodeBuf, node.n+b0)
-		if err := l.writeNode(ctx, l.fence[ei].segid, l.nodeBuf); err != nil {
-			return 0, err
-		}
 		l.fence[ei].count += uint32(b0)
 	}
 
-	// Fresh nodes. On a left push each later batch sits closer to the
-	// head, so the new fence entries land ahead of the old fence in
-	// reverse creation order.
+	// Fresh nodes, safe ahead of any flush because nothing durable
+	// references their segids until the root lands. fence2 builds the
+	// combined entry order: on a left push each later batch sits
+	// closer to the head, so the new entries land ahead of the old
+	// ones in reverse creation order.
 	l.fence2 = l.fence2[:0]
+	if !left {
+		l.fence2 = append(l.fence2, l.fence...)
+	}
+	newBase := len(l.fence2)
 	start := b0
 	for _, end := range l.cuts[1:] {
 		l.segBuf = grow(l.segBuf, listNodeHdrLen)
@@ -495,18 +557,75 @@ func (l *List) pushNoded(ctx context.Context, key []byte, left bool, elems [][]b
 		r.nextSegid++
 		start = end
 	}
-	if len(l.fence2) > 0 {
+	if left {
+		for i, j := newBase, len(l.fence2)-1; i < j; i, j = i+1, j-1 {
+			l.fence2[i], l.fence2[j] = l.fence2[j], l.fence2[i]
+		}
+		l.fence2 = append(l.fence2, l.fence...)
+	}
+
+	switch {
+	case transition:
+		// The whole combined fence becomes pages, flushed with the
+		// fresh nodes before the root that flips the paged bit.
+		if err := l.pageFence(ctx, l.fence2, left); err != nil {
+			return 0, err
+		}
+		if err := l.t.Flush(ctx); err != nil {
+			return 0, err
+		}
+	case r.paged && len(l.fence2) > listFencePageMax:
+		// Spill: the edge page keeps the entries nearest the old ones,
+		// and the overflow, all freshly cut, chunks into fresh pages
+		// on the pushed side, landed and flushed before the root whose
+		// index gains them; the partial chunk faces the pushed end so
+		// the new edge page has room.
+		spill := len(l.fence2) - listFencePageMax
+		var kept, over []listFenceEnt
 		if left {
-			for i, j := 0, len(l.fence2)-1; i < j; i, j = i+1, j-1 {
-				l.fence2[i], l.fence2[j] = l.fence2[j], l.fence2[i]
-			}
-			l.fence2 = append(l.fence2, l.fence...)
-			l.fence, l.fence2 = l.fence2, l.fence
+			over, kept = l.fence2[:spill], l.fence2[spill:]
 		} else {
-			l.fence = append(l.fence, l.fence2...)
+			kept, over = l.fence2[:listFencePageMax], l.fence2[listFencePageMax:]
+		}
+		l.pidxS = l.pidxS[:0]
+		for i := range pageChunks(spill) {
+			pe, err := l.writeFreshPage(ctx, chunkEnts(over, i, left))
+			if err != nil {
+				return 0, err
+			}
+			l.pidxS = append(l.pidxS, pe)
+		}
+		if err := l.t.Flush(ctx); err != nil {
+			return 0, err
+		}
+		at := len(r.pidx)
+		if left {
+			at = 0
+		}
+		r.pidx = slices.Insert(r.pidx, at, l.pidxS...)
+		l.pidxBuf = r.pidx
+		l.fence = append(l.fence[:0], kept...)
+		if left {
+			l.pi += len(l.pidxS)
+		}
+		if err := l.writeFencePage(ctx); err != nil {
+			return 0, err
+		}
+	case r.paged:
+		l.fence = append(l.fence[:0], l.fence2...)
+		if err := l.writeFencePage(ctx); err != nil {
+			return 0, err
+		}
+	default:
+		l.fence, l.fence2 = l.fence2, l.fence
+		r.fence = l.fence
+	}
+
+	if b0 > 0 {
+		if err := l.writeNode(ctx, edgeSegid, l.nodeBuf); err != nil {
+			return 0, err
 		}
 	}
-	r.fence = l.fence
 	r.count += uint64(len(elems))
 	if err := l.writeNodeRoot(ctx, key); err != nil {
 		return 0, err
@@ -651,19 +770,35 @@ func (l *List) popNoded(ctx context.Context, key []byte, left bool, count int, e
 
 	if uint64(count) >= r.count {
 		// The whole list drains: every node reads and copies out in
-		// pop order, then the key dies and the plane retires whole
-		// under a generation bump, so the retired nodes can never be
+		// pop order, page by page when paged, then the key dies and
+		// the plane retires whole under a generation bump, nodes and
+		// fence pages alike, so the retired records can never be
 		// misread. A recreate starts inline under a fresh rootgen.
-		for i := range l.fence {
-			fi := i
-			if !left {
-				fi = len(l.fence) - 1 - i
+		npages := 1
+		if r.paged {
+			npages = len(r.pidx)
+		}
+		for p := range npages {
+			if r.paged {
+				pj := p
+				if !left {
+					pj = npages - 1 - p
+				}
+				if err := l.loadPage(ctx, pj); err != nil {
+					return nil, false, err
+				}
 			}
-			node, err := l.readNode(ctx, l.fence[fi].segid)
-			if err != nil {
-				return nil, false, err
+			for i := range l.fence {
+				fi := i
+				if !left {
+					fi = len(l.fence) - 1 - i
+				}
+				node, err := l.readNode(ctx, l.fence[fi].segid)
+				if err != nil {
+					return nil, false, err
+				}
+				l.copyNodeVals(node, !left, node.n)
 			}
-			l.copyNodeVals(node, !left, node.n)
 		}
 		l.t.Bump(key, r.rooth, r.rootgen+1)
 		if _, err := l.t.Del(ctx, key); err != nil {
@@ -674,7 +809,17 @@ func (l *List) popNoded(ctx context.Context, key []byte, left bool, count int, e
 	}
 
 	remaining := count
+	l.deadPages = l.deadPages[:0]
 	for remaining > 0 {
+		if r.paged {
+			pj := 0
+			if !left {
+				pj = len(r.pidx) - 1
+			}
+			if err := l.loadPage(ctx, pj); err != nil {
+				return nil, false, err
+			}
+		}
 		ei := 0
 		if !left {
 			ei = len(l.fence) - 1
@@ -695,6 +840,17 @@ func (l *List) popNoded(ctx context.Context, key []byte, left bool, count int, e
 				l.fence = l.fence[:len(l.fence)-1]
 			}
 			remaining -= int(ent.count)
+			if r.paged && len(l.fence) == 0 {
+				// The edge page drained whole; its record dies after
+				// the root that drops it from the index.
+				l.deadPages = append(l.deadPages, r.pidx[l.pi].segid)
+				if left {
+					r.pidx = r.pidx[1:]
+				} else {
+					r.pidx = r.pidx[:len(r.pidx)-1]
+				}
+				l.pi = -1
+			}
 			continue
 		}
 		// The final node shrinks in place: the kept elements are one
@@ -714,10 +870,26 @@ func (l *List) popNoded(ctx context.Context, key []byte, left bool, count int, e
 		l.fence[ei].count -= uint32(remaining)
 		remaining = 0
 	}
-	r.fence = l.fence
+	if r.paged {
+		// A surviving loaded page always took an entry drop or a
+		// count shrink; a pop that ended exactly on a page boundary
+		// left nothing loaded.
+		if l.pi >= 0 {
+			if err := l.writeFencePage(ctx); err != nil {
+				return nil, false, err
+			}
+		}
+	} else {
+		r.fence = l.fence
+	}
 	r.count -= uint64(count)
 	if err := l.writeNodeRoot(ctx, key); err != nil {
 		return nil, false, err
+	}
+	for _, pid := range l.deadPages {
+		if err := l.delPage(ctx, pid); err != nil {
+			return nil, false, err
+		}
 	}
 	l.finishVals()
 	return l.vals, true, l.restamp(ctx, key, expMs)

@@ -67,7 +67,7 @@ func (r *listRig) nodedRoot(key string) listNodeRoot {
 	if err != nil || !ok || !root {
 		r.t.Fatalf("LookupEntry(%q) = root=%v ok=%v err=%v", key, root, ok, err)
 	}
-	nr, err := decodeListNodeRoot(v, nil)
+	nr, err := decodeListNodeRoot(v, nil, nil)
 	if err != nil {
 		r.t.Fatalf("decode noded root %q: %v", key, err)
 	}
@@ -711,11 +711,11 @@ func TestListNodedPushBatching(t *testing.T) {
 	}
 }
 
-func TestListFenceOverflow(t *testing.T) {
+func TestListFenceTransition(t *testing.T) {
 	r := newListRig(t)
 	ctx := context.Background()
 
-	// Elements sized to own a node each fill the fence to its cap.
+	// Elements sized to own a node each fill the fence to its flat cap.
 	e := strings.Repeat("x", listNodeMax-listNodeHdrLen-listElemHdrLen)
 	for i := range listFenceMaxNodes {
 		if _, err := r.l.Push(ctx, []byte("q"), false, false, []byte(e)); err != nil {
@@ -723,32 +723,43 @@ func TestListFenceOverflow(t *testing.T) {
 		}
 	}
 	nr := r.nodedRoot("q")
-	if len(nr.fence) != listFenceMaxNodes {
-		t.Fatalf("fence holds %d nodes, want %d", len(nr.fence), listFenceMaxNodes)
+	if nr.paged || len(nr.fence) != listFenceMaxNodes {
+		t.Fatalf("fence holds %d nodes paged=%v, want %d flat", len(nr.fence), nr.paged, listFenceMaxNodes)
 	}
 
-	// The push that would cut past the cap is refused side-effect
-	// free: the fence paging slice owns that layout.
-	if _, err := r.l.Push(ctx, []byte("q"), false, false, []byte(e)); !errors.Is(err, errListFencePaged) {
-		t.Fatalf("overflow push = %v, want errListFencePaged", err)
+	// The push that cuts past the cap moves the fence into pages, the
+	// one-way second rung. The paging oracle owns the layout details;
+	// this pins the ladder step at the real caps.
+	if _, err := r.l.Push(ctx, []byte("q"), false, false, []byte(e)); err != nil {
+		t.Fatalf("transition push: %v", err)
 	}
-	if n, err := r.l.Len(ctx, []byte("q")); err != nil || n != int64(listFenceMaxNodes) {
-		t.Fatalf("Len after the refused push = %d, %v", n, err)
+	nr = r.nodedRoot("q")
+	if !nr.paged || len(nr.pidx) != pageChunks(listFenceMaxNodes+1) {
+		t.Fatalf("root after the transition: paged=%v pages=%d", nr.paged, len(nr.pidx))
 	}
-	if len(r.nodedRoot("q").fence) != listFenceMaxNodes {
-		t.Fatal("refused push touched the fence")
+	want := int64(listFenceMaxNodes + 1)
+	if n, err := r.l.Len(ctx, []byte("q")); err != nil || n != want {
+		t.Fatalf("Len after the transition = %d, %v, want %d", n, err, want)
+	}
+	for i := range want {
+		if got := r.pop("q", true, 1); len(got) != 1 || got[0] != e {
+			t.Fatalf("pop %d diverged after the transition", i)
+		}
+	}
+	if exists, _, err := r.s.Entry(ctx, []byte("q")); err != nil || exists {
+		t.Fatalf("drained transitioned list still exists: %v, %v", exists, err)
 	}
 
-	// The upgrade path refuses the same way, and the key stays absent.
+	// The upgrade path overshooting the flat cap pages the same way.
 	huge := make([][]byte, listFenceMaxNodes+1)
 	for i := range huge {
 		huge[i] = []byte(e)
 	}
-	if _, err := r.l.Push(ctx, []byte("fresh"), false, false, huge...); !errors.Is(err, errListFencePaged) {
-		t.Fatalf("overflowing fresh push = %v, want errListFencePaged", err)
+	if _, err := r.l.Push(ctx, []byte("fresh"), false, false, huge...); err != nil {
+		t.Fatalf("overshooting fresh push: %v", err)
 	}
-	if exists, _, err := r.s.Entry(ctx, []byte("fresh")); err != nil || exists {
-		t.Fatalf("refused fresh push created the key: %v, %v", exists, err)
+	if !r.nodedRoot("fresh").paged {
+		t.Fatal("fresh overshoot did not page")
 	}
 }
 
@@ -768,7 +779,7 @@ func TestListNodedRootCodec(t *testing.T) {
 	if len(enc) != listNodeRootHdrLen+3*listFenceEntLen {
 		t.Fatalf("encoded root is %d bytes", len(enc))
 	}
-	dec, err := decodeListNodeRoot(enc, nil)
+	dec, err := decodeListNodeRoot(enc, nil, nil)
 	if err != nil {
 		t.Fatalf("round trip: %v", err)
 	}
@@ -782,25 +793,62 @@ func TestListNodedRootCodec(t *testing.T) {
 		return b
 	}
 	corrupt := map[string][]byte{
-		"empty":                                {},
-		"short hdr":                            enc[:listNodeRootHdrLen-1],
-		"bad sub":                              mut(func(b []byte) { b[0] = listSubInline }),
-		"paged lflags before the paging slice": mut(func(b []byte) { b[1] = lflagFencePaged }),
-		"reserved bytes":                       mut(func(b []byte) { b[2] = 1 }),
-		"rootgen zero":                         mut(func(b []byte) { binary.LittleEndian.PutUint32(b[4:], 0) }),
-		"count zero":                           mut(func(b []byte) { binary.LittleEndian.PutUint64(b[16:], 0) }),
-		"node_count zero":                      mut(func(b []byte) { binary.LittleEndian.PutUint32(b[32:], 0) }),
-		"node_count over the cap":              mut(func(b []byte) { binary.LittleEndian.PutUint32(b[32:], listFenceMaxNodes+1) }),
-		"size mismatch":                        enc[:len(enc)-1],
-		"segid at next_segid":                  mut(func(b []byte) { binary.LittleEndian.PutUint64(b[24:], 2) }),
+		"empty":                   {},
+		"short hdr":               enc[:listNodeRootHdrLen-1],
+		"bad sub":                 mut(func(b []byte) { b[0] = listSubInline }),
+		"unknown lflags":          mut(func(b []byte) { b[1] = 2 }),
+		"reserved bytes":          mut(func(b []byte) { b[2] = 1 }),
+		"rootgen zero":            mut(func(b []byte) { binary.LittleEndian.PutUint32(b[4:], 0) }),
+		"count zero":              mut(func(b []byte) { binary.LittleEndian.PutUint64(b[16:], 0) }),
+		"node_count zero":         mut(func(b []byte) { binary.LittleEndian.PutUint32(b[32:], 0) }),
+		"node_count over the cap": mut(func(b []byte) { binary.LittleEndian.PutUint32(b[32:], uint32(listFenceMaxNodes+1)) }),
+		"size mismatch":           enc[:len(enc)-1],
+		"segid at next_segid":     mut(func(b []byte) { binary.LittleEndian.PutUint64(b[24:], 2) }),
 		"fence entry count zero": mut(func(b []byte) {
 			binary.LittleEndian.PutUint32(b[listNodeRootHdrLen+8:], 0)
 		}),
 		"count sum mismatch": mut(func(b []byte) { binary.LittleEndian.PutUint64(b[16:], 11) }),
 	}
 	for name, p := range corrupt {
-		if _, err := decodeListNodeRoot(p, nil); err == nil {
+		if _, err := decodeListNodeRoot(p, nil, nil); err == nil {
 			t.Errorf("%s: corrupt noded root decoded cleanly", name)
+		}
+	}
+
+	// The paged form round-trips the page index instead of the fence.
+	prt := listNodeRoot{
+		rootgen:   4,
+		rooth:     0xabcdef,
+		count:     9,
+		nextSegid: 40,
+		paged:     true,
+		pidx: []listFenceEnt{
+			{segid: 30, count: 4},
+			{segid: 31, count: 5},
+		},
+	}
+	penc := appendListNodeRoot(nil, &prt)
+	pdec, err := decodeListNodeRoot(penc, nil, nil)
+	if err != nil {
+		t.Fatalf("paged round trip: %v", err)
+	}
+	if !pdec.paged || pdec.count != prt.count || pdec.nextSegid != prt.nextSegid ||
+		!slices.Equal(pdec.pidx, prt.pidx) || len(pdec.fence) != 0 {
+		t.Fatalf("paged round trip = %+v, want %+v", pdec, prt)
+	}
+	pmut := func(f func(b []byte)) []byte {
+		b := slices.Clone(penc)
+		f(b)
+		return b
+	}
+	pcorrupt := map[string][]byte{
+		"paged sum mismatch":         pmut(func(b []byte) { binary.LittleEndian.PutUint64(b[16:], 10) }),
+		"paged pageid at next_segid": pmut(func(b []byte) { binary.LittleEndian.PutUint64(b[24:], 31) }),
+		"paged size mismatch":        penc[:len(penc)-1],
+	}
+	for name, p := range pcorrupt {
+		if _, err := decodeListNodeRoot(p, nil, nil); err == nil {
+			t.Errorf("%s: corrupt paged root decoded cleanly", name)
 		}
 	}
 }
