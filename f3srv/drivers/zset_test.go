@@ -103,8 +103,11 @@ func TestZsetRankRangeNative(t *testing.T) {
 	}
 
 	// The key is well past the 128-entry cap, so it runs on the native counted
-	// tree; OBJECT ENCODING still routes to the string store until the keyspace
-	// unification slice, so the band is asserted through the zset package tests.
+	// tree, which OBJECT ENCODING now reports directly: the zset band is threaded
+	// into the single OBJECT chain, so the encoding no longer routes to the string
+	// store.
+	send(t, nc, "OBJECT", "ENCODING", "big")
+	expect(t, br, bulk("skiplist"))
 
 	// ZRANK equals the member's own index (score == index, member sorts with it).
 	send(t, nc, "ZRANK", "big", member(0))
