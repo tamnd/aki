@@ -226,6 +226,14 @@ var hotCorpus = []step{
 	c("embstr", "OBJECT", "ENCODING", "k"),
 	c("~used_memory", "INFO"),
 
+	// Durability: the conformance binary runs persistence off, so the
+	// node is volatile. The bare query reports relaxed, RELAXED is an
+	// accepted no-op, and STRICT is refused because there is no commit
+	// chain to wait on.
+	c("relaxed", "AKI.DURABILITY"),
+	c("OK", "AKI.DURABILITY", "RELAXED"),
+	c("ERR DURABILITY STRICT is not available on a volatile node", "AKI.DURABILITY", "STRICT"),
+
 	// The shared error shapes, one of each.
 	c("ERR unknown command 'NOPE'", "NOPE"),
 	c("ERR wrong number of arguments for 'get' command", "GET"),
