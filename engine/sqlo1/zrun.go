@@ -696,81 +696,7 @@ func (z *ZSet) zrunDelSeg(ctx context.Context, key []byte, s uint64, member []by
 
 	if n == 0 {
 		z.zbumpLoaded(-1)
-		sentinel := ri == 0 && (!z.zpaged || (z.zui == 0 && z.zli == 0))
-		if sentinel {
-			e.count = 0
-			return true, z.zfenceCommit(ctx, key)
-		}
-		deadSegid := e.segid
-		if !z.zpaged {
-			z.zfence = append(z.zfence[:ri], z.zfence[ri+1:]...)
-			if err := z.writeZRoot(ctx, key); err != nil {
-				return false, err
-			}
-			putZRunKey(z.zkbuf[:], z.h.segRoot.rooth, deadSegid)
-			if _, err := z.h.t.Del(ctx, z.zkbuf[:]); err != nil {
-				return false, err
-			}
-			return true, nil
-		}
-		if len(z.zfence) > 1 {
-			z.zfence = append(z.zfence[:ri], z.zfence[ri+1:]...)
-			z.zrunsBump(-1)
-			if ri == 0 {
-				// The leaf's first run died: its separator climbs to
-				// the new first run's, and the parents that carry it
-				// re-stamp so every load cross-check stays exact.
-				z.zupper[z.zli].lo = z.zfence[0].lo
-				if z.zli == 0 {
-					z.zridx[z.zui].lo = z.zupper[0].lo
-				}
-			}
-			if err := z.zfenceCommit(ctx, key); err != nil {
-				return false, err
-			}
-			putZRunKey(z.zkbuf[:], z.h.segRoot.rooth, deadSegid)
-			if _, err := z.h.t.Del(ctx, z.zkbuf[:]); err != nil {
-				return false, err
-			}
-			return true, nil
-		}
-		// The run was its leaf's last: the leaf dies with it, and an
-		// upper emptied by that dies too. The sentinel path above
-		// keeps leaf 0 of upper 0 alive, so the removals never leave
-		// a level empty.
-		oldLeaf := z.zupper[z.zli].pageid
-		if len(z.zupper) > 1 {
-			z.zupper = append(z.zupper[:z.zli], z.zupper[z.zli+1:]...)
-			z.zridx[z.zui].runs--
-			if z.zli == 0 {
-				z.zridx[z.zui].lo = z.zupper[0].lo
-			}
-			if err := z.writeZUpperPage(ctx); err != nil {
-				return false, err
-			}
-			if err := z.writeZRoot(ctx, key); err != nil {
-				return false, err
-			}
-			z.zli = -1
-		} else {
-			oldUpper := z.zridx[z.zui].pageid
-			z.zridx = append(z.zridx[:z.zui], z.zridx[z.zui+1:]...)
-			if err := z.writeZRoot(ctx, key); err != nil {
-				return false, err
-			}
-			if err := z.delZPage(ctx, oldUpper); err != nil {
-				return false, err
-			}
-			z.zui, z.zli = -1, -1
-		}
-		if err := z.delZPage(ctx, oldLeaf); err != nil {
-			return false, err
-		}
-		putZRunKey(z.zkbuf[:], z.h.segRoot.rooth, deadSegid)
-		if _, err := z.h.t.Del(ctx, z.zkbuf[:]); err != nil {
-			return false, err
-		}
-		return true, nil
+		return true, z.zrunDie(ctx, key, ri)
 	}
 
 	z.zbumpLoaded(-1)
@@ -783,6 +709,87 @@ func (z *ZSet) zrunDelSeg(ctx context.Context, key []byte, s uint64, member []by
 	}
 	e.count--
 	return true, z.zfenceCommit(ctx, key)
+}
+
+// zrunDie retires the emptied fence entry at ri whole, its record
+// included; the count bumps are the caller's, already applied for
+// however many entries died with the run. In paged mode the death
+// climbs the ladder splits climb, downward: the fence entry leaves
+// its leaf, an emptied leaf leaves its upper, an emptied upper leaves
+// the root, each level root-first so a crash prefix never routes to a
+// dead record. The sentinel run, leaf, and upper never die; the
+// sentinel entry stays at count 0.
+func (z *ZSet) zrunDie(ctx context.Context, key []byte, ri int) error {
+	e := &z.zfence[ri]
+	sentinel := ri == 0 && (!z.zpaged || (z.zui == 0 && z.zli == 0))
+	if sentinel {
+		e.count = 0
+		return z.zfenceCommit(ctx, key)
+	}
+	deadSegid := e.segid
+	if !z.zpaged {
+		z.zfence = append(z.zfence[:ri], z.zfence[ri+1:]...)
+		if err := z.writeZRoot(ctx, key); err != nil {
+			return err
+		}
+		putZRunKey(z.zkbuf[:], z.h.segRoot.rooth, deadSegid)
+		_, err := z.h.t.Del(ctx, z.zkbuf[:])
+		return err
+	}
+	if len(z.zfence) > 1 {
+		z.zfence = append(z.zfence[:ri], z.zfence[ri+1:]...)
+		z.zrunsBump(-1)
+		if ri == 0 {
+			// The leaf's first run died: its separator climbs to
+			// the new first run's, and the parents that carry it
+			// re-stamp so every load cross-check stays exact.
+			z.zupper[z.zli].lo = z.zfence[0].lo
+			if z.zli == 0 {
+				z.zridx[z.zui].lo = z.zupper[0].lo
+			}
+		}
+		if err := z.zfenceCommit(ctx, key); err != nil {
+			return err
+		}
+		putZRunKey(z.zkbuf[:], z.h.segRoot.rooth, deadSegid)
+		_, err := z.h.t.Del(ctx, z.zkbuf[:])
+		return err
+	}
+	// The run was its leaf's last: the leaf dies with it, and an
+	// upper emptied by that dies too. The sentinel path above
+	// keeps leaf 0 of upper 0 alive, so the removals never leave
+	// a level empty.
+	oldLeaf := z.zupper[z.zli].pageid
+	if len(z.zupper) > 1 {
+		z.zupper = append(z.zupper[:z.zli], z.zupper[z.zli+1:]...)
+		z.zridx[z.zui].runs--
+		if z.zli == 0 {
+			z.zridx[z.zui].lo = z.zupper[0].lo
+		}
+		if err := z.writeZUpperPage(ctx); err != nil {
+			return err
+		}
+		if err := z.writeZRoot(ctx, key); err != nil {
+			return err
+		}
+		z.zli = -1
+	} else {
+		oldUpper := z.zridx[z.zui].pageid
+		z.zridx = append(z.zridx[:z.zui], z.zridx[z.zui+1:]...)
+		if err := z.writeZRoot(ctx, key); err != nil {
+			return err
+		}
+		if err := z.delZPage(ctx, oldUpper); err != nil {
+			return err
+		}
+		z.zui, z.zli = -1, -1
+	}
+	if err := z.delZPage(ctx, oldLeaf); err != nil {
+		return err
+	}
+	putZRunKey(z.zkbuf[:], z.h.segRoot.rooth, deadSegid)
+	_, err := z.h.t.Del(ctx, z.zkbuf[:])
+	return err
 }
 
 // tryMergeRun folds the shrunken run at ri (post-image in z.zrbuf, n

@@ -238,6 +238,38 @@ func hashSegDel(dst []byte, s hashSeg, fh uint64, field []byte, nowMs int64) (ou
 	return out, true, nil
 }
 
+// hashSegDelMulti is hashSegDel over a batch: one pass rebuilds the
+// segment payload with every field in batch removed, so a range trim
+// rewrites each touched segment once however many members it loses.
+// An entry already expired at nowMs counts as not there, hashSegDel's
+// lazy-expiry rule, and stays in place for the reaper; a batch that
+// empties the segment returns the bare header.
+func hashSegDelMulti(dst []byte, s hashSeg, batch map[string]bool, nowMs int64) (out []byte, removed int, err error) {
+	out = grow(dst, hashSegHdrLen)
+	it := hashEntryIter{p: s.entries, enc: s.enc}
+	minExp := int64(0)
+	for {
+		before := it.p
+		f, _, eExp, ok, err := it.next()
+		if err != nil {
+			return nil, 0, err
+		}
+		if !ok {
+			break
+		}
+		if batch[string(f)] && (eExp == 0 || eExp > nowMs) {
+			removed++
+			continue
+		}
+		out = append(out, before[:len(before)-len(it.p)]...)
+		if eExp != 0 && (minExp == 0 || eExp < minExp) {
+			minExp = eExp
+		}
+	}
+	putHashSegHdr(out, s.n-removed, minExp)
+	return out, removed, nil
+}
+
 // hashSegEntry is one parsed segment entry with its fh materialized,
 // the working form for split, merge sorting, and the upgrade path.
 // field and val alias the payload they were parsed from.

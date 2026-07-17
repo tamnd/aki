@@ -1171,6 +1171,83 @@ func (h *Hash) hdelSeg(ctx context.Context, key, field []byte, expMs int64) (boo
 	return true, h.restamp(ctx, key, expMs)
 }
 
+// hdelSegBatch removes a batch of fields from a segmented hash, every
+// one of which must be live: the range-trim path collected them from
+// the walked window, so a miss is corruption. Fields sort by fh so
+// the fields of one segment are contiguous, and each touched segment
+// rewrites once; every group resolves its fence index fresh, so a
+// lazy merge behind one group can never shift the next. The caller
+// owns the deferred root, guarantees the batch never empties the
+// hash, and lands the root and restamp with its flush.
+func (h *Hash) hdelSegBatch(ctx context.Context, key []byte, fields [][]byte) error {
+	r := &h.segRoot
+	if uint64(len(fields)) >= r.count {
+		return fmt.Errorf("sqlo1: batch delete of %d fields would empty rooth %#x", len(fields), r.rooth)
+	}
+	slices.SortFunc(fields, func(a, b []byte) int {
+		fa, fb := hashFH(a), hashFH(b)
+		switch {
+		case fa < fb:
+			return -1
+		case fa > fb:
+			return 1
+		}
+		return bytes.Compare(a, b)
+	})
+	for i := 0; i < len(fields); {
+		si, err := h.fenceIdx(ctx, hashFH(fields[i]))
+		if err != nil {
+			return err
+		}
+		j := i + 1
+		for ; j < len(fields); j++ {
+			sj, err := h.fenceIdx(ctx, hashFH(fields[j]))
+			if err != nil {
+				return err
+			}
+			if sj != si {
+				break
+			}
+		}
+		batch := make(map[string]bool, j-i)
+		for _, f := range fields[i:j] {
+			batch[string(f)] = true
+		}
+		s, err := h.readSeg(ctx, r.fence[si].segid)
+		if err != nil {
+			return err
+		}
+		out, removed, err := hashSegDelMulti(h.segBuf, s, batch, h.t.Now())
+		if err != nil {
+			return err
+		}
+		if removed != j-i {
+			return fmt.Errorf("sqlo1: batch delete found %d of %d fields in segment %d of rooth %#x",
+				removed, j-i, r.fence[si].segid, r.rooth)
+		}
+		h.segBuf = out
+		r.count -= uint64(removed)
+		merged, err := h.tryMergeSeg(ctx, key, si, out)
+		if err != nil {
+			return err
+		}
+		if !merged {
+			if err := h.writeSeg(ctx, r.fence[si].segid, out); err != nil {
+				return err
+			}
+			meta := hashSegMeta(int(binary.LittleEndian.Uint16(out)), int64(binary.LittleEndian.Uint64(out[4:])))
+			if err := h.setFenceMeta(ctx, si, meta); err != nil {
+				return err
+			}
+			if err := h.writeSegRoot(ctx, key, true); err != nil {
+				return err
+			}
+		}
+		i = j
+	}
+	return nil
+}
+
 // tryMergeSeg is the lazy merge, doc 06 section 2.1: segment i just
 // shrank (its unwritten post-image is out, aliasing h.segBuf), and if
 // the merged encoding with a neighbor stays under seg_min the two
