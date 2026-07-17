@@ -19,7 +19,7 @@ import (
 func Sadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
 	key := args[0]
-	s := g.m[string(key)]
+	s := g.live(cx, key)
 	if s == nil {
 		if cx.St.Exists(key, cx.NowMs) {
 			r.Err(wrongType)

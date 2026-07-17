@@ -24,7 +24,7 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// an empty set registry on a shard that never ran a set command; a read-only
 	// OBJECT must leave no residency state.
 	if cx.Coll != nil {
-		if s := cx.Coll.(*reg).m[string(key)]; s != nil {
+		if s := cx.Coll.(*reg).live(cx, key); s != nil {
 			r.Bulk([]byte(s.enc.String()))
 			return
 		}

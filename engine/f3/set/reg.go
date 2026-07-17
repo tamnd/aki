@@ -114,7 +114,7 @@ func Delete(cx *shard.Ctx, key []byte) bool {
 		return false
 	}
 	g := cx.Coll.(*reg)
-	if g.m[string(key)] == nil {
+	if g.live(cx, key) == nil {
 		return false
 	}
 	g.drop(key)
@@ -154,7 +154,14 @@ func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
 	if cx.Coll == nil {
 		return true
 	}
-	for k := range cx.Coll.(*reg).m {
+	now := cx.NowMs
+	for k, s := range cx.Coll.(*reg).m {
+		// Skip a lazily-expired set so KEYS and SCAN never surface a key EXISTS
+		// would report absent. The skip is read-only (no drop) to match the string
+		// store's expiry-aware walk, which reaps nothing during a scan.
+		if s.expireAt != 0 && s.expireAt <= now {
+			continue
+		}
 		if !fn([]byte(k)) {
 			return false
 		}
@@ -162,11 +169,30 @@ func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
 	return true
 }
 
-// lookup finds the set for key. present is false when no set exists; wrong is
-// true when the key instead holds a value in the string store, which every set
-// command answers with WRONGTYPE.
+// live returns the set at key, or nil when none exists or the set has lazily
+// expired. A set whose deadline has passed is dropped here and treated as absent,
+// so an expired set is dead to this command and every later one in the epoch
+// (spec 2064/f3/16 section 2). This is the one funnel every read, mutate, create,
+// and probe path routes through, so the expiry check lives in exactly one place.
+// The deadline compare is a single field load against cx.NowMs, predicted away
+// for the common set that carries no TTL.
+func (g *reg) live(cx *shard.Ctx, key []byte) *set {
+	s := g.m[string(key)]
+	if s == nil {
+		return nil
+	}
+	if s.expireAt != 0 && s.expireAt <= cx.NowMs {
+		g.drop(key)
+		return nil
+	}
+	return s
+}
+
+// lookup finds the set for key. present is false when no set exists or it has
+// lazily expired; wrong is true when the key instead holds a value in the string
+// store, which every set command answers with WRONGTYPE.
 func (g *reg) lookup(cx *shard.Ctx, key []byte) (s *set, wrong bool) {
-	if s = g.m[string(key)]; s != nil {
+	if s = g.live(cx, key); s != nil {
 		return s, false
 	}
 	if cx.St.Exists(key, cx.NowMs) {
