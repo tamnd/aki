@@ -308,6 +308,43 @@ func TestGetex(t *testing.T) {
 	}
 }
 
+// TestPersist walks PERSIST: it removes a key's deadline and reports 1, and
+// reports 0 for a missing key, a key with no deadline, and a set (which carries
+// no key-level TTL).
+func TestPersist(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// A missing key has nothing to persist.
+	send(t, nc, "PERSIST", "missing")
+	expect(t, br, ":0\r\n")
+
+	// A key with a deadline is persisted once, then reports 0.
+	send(t, nc, "SET", "k", "v", "EX", "100")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "PERSIST", "k")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "k")
+	expect(t, br, ":-1\r\n")
+	send(t, nc, "PERSIST", "k")
+	expect(t, br, ":0\r\n")
+
+	// A key that never had a deadline reports 0 and stays put.
+	send(t, nc, "SET", "n", "v")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "PERSIST", "n")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "GET", "n")
+	expect(t, br, "$1\r\nv\r\n")
+
+	// A set exists but has no key-level deadline, so PERSIST reports a correct 0.
+	if _, err := nc.Write([]byte(cmd("SADD", "s", "m"))); err != nil {
+		t.Fatal(err)
+	}
+	expect(t, br, ":1\r\n")
+	send(t, nc, "PERSIST", "s")
+	expect(t, br, ":0\r\n")
+}
+
 // TestSetOptions exercises the NX/XX/GET/KEEPTTL/expiry option matrix against
 // the Redis answers.
 func TestSetOptions(t *testing.T) {

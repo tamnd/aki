@@ -155,6 +155,7 @@ func init() {
 	register("PTTL", set.Pttl, 1, 1, true)
 	register("EXPIRETIME", set.Expiretime, 1, 1, true)
 	register("PEXPIRETIME", set.Pexpiretime, 1, 1, true)
+	register("PERSIST", set.Persist, 1, 1, true)
 	register("MGET", nil, 1, -1, true)
 	register("MSET", nil, 2, -1, true)
 	registerFan("EXISTS", shard.FanCount, exists, false, false)
