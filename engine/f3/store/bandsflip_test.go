@@ -108,6 +108,50 @@ func TestWriteRunFlipsChunkedToAkiRegion(t *testing.T) {
 	}
 }
 
+// TestChunkStreamReadsFromAkiRegion streams a chunked value whose chunks spilled
+// to the .aki value region: the streaming reply path resolves each log chunk
+// through the read seam, so a value that never materializes whole still serves
+// from the shared region.
+func TestChunkStreamReadsFromAkiRegion(t *testing.T) {
+	s := newFlipStore(t)
+
+	val := bytes.Repeat([]byte("wxyz"), 50000) // 200000 bytes, four chunks
+	if err := s.Set([]byte("stream"), val); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	body, cs, ok := s.GetStream([]byte("stream"), 0, nil)
+	if !ok {
+		t.Fatal("GetStream missed the chunked key")
+	}
+	if cs == nil {
+		t.Fatal("GetStream returned no stream for a chunked value")
+	}
+	if len(body) != 0 {
+		t.Fatalf("GetStream returned %d inline bytes for a chunked value", len(body))
+	}
+	if cs.Total() != int64(len(val)) {
+		t.Fatalf("stream total = %d, want %d", cs.Total(), len(val))
+	}
+	defer cs.Release()
+
+	got := make([]byte, 0, len(val))
+	buf := make([]byte, ChunkSize)
+	for {
+		n, err := cs.Next(buf)
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if n == 0 {
+			break
+		}
+		got = append(got, buf[:n]...)
+	}
+	if !bytes.Equal(got, val) {
+		t.Fatalf("streamed %d bytes, want %d", len(got), len(val))
+	}
+}
+
 // TestWriteRunDropAccountsDeadInAkiRegion overwrites a spilled separated value
 // and checks the superseded run's bytes land in the region's dead counter
 // through the drop seam, the accounting a later region compaction reads.
