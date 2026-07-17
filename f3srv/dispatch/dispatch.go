@@ -46,6 +46,11 @@ type entry struct {
 	// must be the ASYNC or SYNC token, anything else is a syntax error.
 	flushOpt bool
 
+	// scanOpts marks the SCAN tail: a cursor followed by MATCH/COUNT/TYPE
+	// options the fan validates once before scattering, so a bad cursor or a
+	// malformed option answers a single error rather than one partial per shard.
+	scanOpts bool
+
 	// blocks is set on a blocking verb (BLPOP and kin) so the reader arms the
 	// connection barrier after enqueuing it; wired in the slice-8 blocking PR.
 	blocks bool
@@ -214,6 +219,20 @@ func init() {
 	randomkey := registerShard(randomkeyShardAll)
 	register("RANDOMKEY", nil, 0, 0, false)
 	registerFan("RANDOMKEY", shard.FanRandom, randomkey, false, true)
+
+	// SCAN scatters its cursor and options keyless to every shard: each owner
+	// walks every keyspace it holds, filters by the MATCH glob and the TYPE
+	// option, and answers a length-prefixed run of matches, and the gather
+	// concatenates them under SCAN's two-element cursor envelope. f3 answers the
+	// whole keyspace in one page with a terminal "0" cursor, so COUNT is honored
+	// as a hint that bounds nothing and a client's cursor loop makes one pass.
+	// The cursor and options are validated once here before the scatter, so a
+	// bad cursor answers a single error rather than one per shard.
+	scan := registerShard(scanShardAll)
+	register("SCAN", nil, 1, -1, false)
+	registerFan("SCAN", shard.FanScan, scan, false, true)
+	table["SCAN"].fanArgs = true
+	table["SCAN"].scanOpts = true
 
 	// FLUSHALL scatters a reset intent to every shard; each owner rebuilds
 	// its store empty and the gather answers +OK only after every shard has
@@ -817,6 +836,11 @@ func dispatchFan(c *shard.Conn, e *entry, args [][]byte) error {
 		if e.flushOpt && len(args) == 2 && !flushToken(args[1]) {
 			return oops(c, "ERR syntax error")
 		}
+		if e.scanOpts {
+			if _, _, msg := parseScan(args[1:]); msg != "" {
+				return oops(c, msg)
+			}
+		}
 		var err error
 		if e.fanArgs {
 			// A keyless fan that still carries an argument (KEYS hands every shard
@@ -1264,6 +1288,92 @@ func dbsizeShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	n += int64(list.Len(cx))
 	n += int64(stream.Len(cx))
 	r.FanCount(n)
+}
+
+// parseScan reads a SCAN tail: args[0] is the cursor, then any of MATCH pattern,
+// COUNT count, and TYPE type in any order. It returns the MATCH glob (nil when
+// omitted) and the TYPE name (nil when omitted); the cursor value itself is only
+// validated, since f3's SCAN answers the whole keyspace in one page regardless
+// of the cursor a client replays. msg is a non-empty error string when the tail
+// is malformed: a non-numeric cursor is "ERR invalid cursor", every other fault
+// (a dangling option, a non-positive COUNT, an unknown keyword) is the syntax
+// error Redis reports. The fan validates once with this before scattering, and
+// each shard's handler reuses it to recover the match and type filters.
+func parseScan(args [][]byte) (match, typ []byte, msg string) {
+	if _, err := strconv.ParseUint(string(args[0]), 10, 64); err != nil {
+		return nil, nil, "ERR invalid cursor"
+	}
+	for i := 1; i < len(args); i++ {
+		switch {
+		case tokenIs(args[i], "MATCH"):
+			if i+1 >= len(args) {
+				return nil, nil, "ERR syntax error"
+			}
+			match = args[i+1]
+			i++
+		case tokenIs(args[i], "COUNT"):
+			if i+1 >= len(args) {
+				return nil, nil, "ERR syntax error"
+			}
+			if n, err := strconv.Atoi(string(args[i+1])); err != nil || n < 1 {
+				return nil, nil, "ERR syntax error"
+			}
+			i++
+		case tokenIs(args[i], "TYPE"):
+			if i+1 >= len(args) {
+				return nil, nil, "ERR syntax error"
+			}
+			typ = args[i+1]
+			i++
+		default:
+			return nil, nil, "ERR syntax error"
+		}
+	}
+	return match, typ, ""
+}
+
+// scanShardAll answers a SCAN sub-command: it walks every keyspace this shard
+// holds, the string store and the five collection registries, keeps the keys
+// matching the MATCH glob, and, when a TYPE option is present, restricts the
+// walk to the one keyspace of that type. It appends the matches as the same
+// length-prefixed run KEYS uses, and the FanScan gather concatenates every
+// shard's run under SCAN's cursor envelope. The cursor and options were
+// validated in dispatch before the scatter, so the parse here cannot fail and
+// its error return is ignored. Like KEYS the walk answers the whole keyspace in
+// one page; COUNT bounds nothing. Each keyspace iterates through its read-only
+// RangeKeys, so the walk sets no residency state, and a cold key is copied into
+// the partial as it is seen, before the walk moves past the cold scratch.
+func scanShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	match, typ, _ := parseScan(args)
+	var part []byte
+	emit := func(key []byte) bool {
+		if match == nil || globMatch(match, key) {
+			part = shard.AppendFanValue(part, key, true)
+		}
+		return true
+	}
+	// tokenIs compares case-insensitively against an uppercase word, so the type
+	// names are spelled uppercase here though Redis's canonical names and most
+	// clients are lowercase.
+	if typ == nil || tokenIs(typ, "STRING") {
+		cx.St.RangeKeys(cx.NowMs, emit)
+	}
+	if typ == nil || tokenIs(typ, "SET") {
+		set.RangeKeys(cx, emit)
+	}
+	if typ == nil || tokenIs(typ, "ZSET") {
+		zset.RangeKeys(cx, emit)
+	}
+	if typ == nil || tokenIs(typ, "HASH") {
+		hash.RangeKeys(cx, emit)
+	}
+	if typ == nil || tokenIs(typ, "LIST") {
+		list.RangeKeys(cx, emit)
+	}
+	if typ == nil || tokenIs(typ, "STREAM") {
+		stream.RangeKeys(cx, emit)
+	}
+	r.Raw(part)
 }
 
 // keysShardAll answers a KEYS sub-command: it walks every keyspace this shard
