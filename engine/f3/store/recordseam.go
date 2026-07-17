@@ -1,6 +1,11 @@
 package store
 
-import "github.com/tamnd/aki/engine/f3/akifile"
+import (
+	"encoding/binary"
+	"strconv"
+
+	"github.com/tamnd/aki/engine/f3/akifile"
+)
 
 // The record-log seam: the store side of durable append, the coupled core of the
 // M8 arc. The value-log flip (#1067) made a separated value's bytes durable, but
@@ -22,40 +27,58 @@ import "github.com/tamnd/aki/engine/f3/akifile"
 //
 // Scope: the string type's three commit points (a fresh or replaced record, and
 // the two in-place overwrite branches). It is default off, so a store with no
-// .aki handle keeps the pure in-memory index unchanged and pays nothing. Recovery
-// is not wired yet, so a logged row is written but never read back until PR 6
-// consumes it; that is why an inline value's locator can still be a volatile arena
-// offset here without consequence (a durable capture of inline bytes is recovery's
-// obligation to confront, not this slice's). Delete and expiry tombstones, the
-// other collection types, and reopen are the sibling slices this one clears the
-// path for.
+// .aki handle keeps the pure in-memory index unchanged and pays nothing. A row
+// now carries a durable copy of its value: a separated or chunked value's run
+// pointer word, log-resident and derefable after a crash, or an embedded or int
+// value's bytes inline, since the arena those bytes live in does not survive a
+// restart. Recovery is not wired yet, so a logged row is written but not read back
+// until the recovery consumer walks the log, but every row it will meet is now
+// self-sufficient. Delete and expiry tombstones, the other collection types, and
+// reopen are the sibling slices this one clears the path for.
 
 // recordRow reads the durable-relevant fields of the record at off into a row the
-// record log frames: its value locator, current value length, absolute expiry,
-// and key. A separated or chunked record's locator is the payload pointer word
-// (durable when the run is log-resident); an inline or int record's is the arena
-// value offset, a volatile locator recovery replaces with a durable capture. The
-// key aliases the arena, which is safe because stage copies it into the frame the
-// instant it returns.
+// record log frames: its value locator or bytes, absolute expiry, and key. The
+// two bands split on where the durable copy of the value lives.
+//
+// A separated or chunked record's bytes already live in the value log, so the row
+// carries the run pointer word (durable when the run is log-resident) and no
+// inline value; replay derefs the word. An embedded string or int record's bytes
+// live in the volatile arena, whose offset a crash invalidates, so the row carries
+// the value bytes themselves under RecFlagInline and replay reinserts them. The
+// key and, for an embedded string, the value both alias the arena, which is safe
+// because stage copies them into the frame the instant it returns; the int band
+// renders its cell to rlogScratch instead, since its 8-byte cell is not the value
+// text.
 func (s *Store) recordRow(off uint64) akifile.RecordRow {
 	f := s.recFlags(off)
 	vs := s.valueStart(off)
-	var word uint64
-	if f&(flagSep|flagChunked) != 0 {
-		word, _, _ = s.readPtr(vs)
-	} else {
-		word = vs
-	}
-	var at uint64
+	row := akifile.RecordRow{Key: s.keyAt(off)}
 	if f&flagHasTTL != 0 {
-		at = uint64(s.expireAt(off))
+		row.ExpireAt = uint64(s.expireAt(off))
 	}
-	return akifile.RecordRow{
-		ValueWord: word,
-		ValueLen:  uint32(s.vlen(off)),
-		ExpireAt:  at,
-		Key:       s.keyAt(off),
+	if f&(flagSep|flagChunked) != 0 {
+		row.ValueWord, _, _ = s.readPtr(vs)
+		row.ValueLen = uint32(s.vlen(off))
+		return row
 	}
+	row.Flags |= akifile.RecFlagInline
+	row.Value = s.inlineValue(off, f, vs)
+	row.ValueLen = uint32(len(row.Value))
+	return row
+}
+
+// inlineValue returns the value bytes an inline record row carries. An embedded
+// string aliases the arena run directly, no copy; an int cell renders to its
+// decimal text in rlogScratch, the value form a replayed SET re-derives the cell
+// from. Both are valid only until the next recordRow, which is exactly the window
+// stage copies them in.
+func (s *Store) inlineValue(off uint64, f byte, vs uint64) []byte {
+	if f&flagInt != 0 {
+		n := int64(binary.LittleEndian.Uint64(s.arena.buf[vs:]))
+		s.rlogScratch = strconv.AppendInt(s.rlogScratch[:0], n, 10)
+		return s.rlogScratch
+	}
+	return s.arena.buf[vs : vs+s.vlen(off)]
 }
 
 // logRecord durably appends the record at off to the shared .aki record log, the

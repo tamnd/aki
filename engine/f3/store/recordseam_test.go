@@ -71,8 +71,35 @@ func TestSetStringLogsRecord(t *testing.T) {
 	if rows[0].ExpireAt != 0 {
 		t.Fatalf("logged expiry = %d, want 0", rows[0].ExpireAt)
 	}
-	if rows[0].Flags != 0 {
-		t.Fatalf("logged flags = %d, want 0 for a live record", rows[0].Flags)
+	if rows[0].Flags != akifile.RecFlagInline {
+		t.Fatalf("logged flags = %d, want the inline bit for an embedded string", rows[0].Flags)
+	}
+	if string(rows[0].Value) != "hello" {
+		t.Fatalf("logged inline value = %q, want hello", rows[0].Value)
+	}
+}
+
+// TestSetStringIntLogsInlineText confirms an integer-valued string logs its
+// decimal text inline, not the volatile 8-byte cell, so a replay reinserts the
+// value and re-derives the int band from the text the way the original SET did.
+func TestSetStringIntLogsInlineText(t *testing.T) {
+	s, f := newRecordSeamStore(t)
+
+	if err := s.SetString([]byte("n"), []byte("12345"), 0, 0, false); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	rows := walkSeam(t, f)
+	if len(rows) != 1 {
+		t.Fatalf("got %d logged rows, want 1", len(rows))
+	}
+	if rows[0].Flags&akifile.RecFlagInline == 0 {
+		t.Fatalf("int row flags = %d, want the inline bit", rows[0].Flags)
+	}
+	if string(rows[0].Value) != "12345" {
+		t.Fatalf("int row inline value = %q, want the decimal text 12345", rows[0].Value)
+	}
+	if rows[0].ValueLen != 5 {
+		t.Fatalf("int row value len = %d, want 5", rows[0].ValueLen)
 	}
 }
 
@@ -165,6 +192,12 @@ func TestSetStringSeparatedLogsDurableWord(t *testing.T) {
 	}
 	if rows[0].ValueLen != uint32(len(big)) {
 		t.Fatalf("logged value len = %d, want %d", rows[0].ValueLen, len(big))
+	}
+	if rows[0].Flags&akifile.RecFlagInline != 0 {
+		t.Fatalf("separated row carries the inline bit; its word is the durable copy")
+	}
+	if rows[0].Value != nil {
+		t.Fatalf("separated row carries inline bytes %q, want none", rows[0].Value)
 	}
 }
 
