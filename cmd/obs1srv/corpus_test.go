@@ -234,6 +234,14 @@ var hotCorpus = []step{
 	c("OK", "AKI.DURABILITY", "RELAXED"),
 	c("ERR DURABILITY STRICT is not available on a volatile node", "AKI.DURABILITY", "STRICT"),
 
+	// The barriers on a volatile node: WAIT's ask of nothing answers the
+	// achieved 0 in place, WAITAOF's ask of nothing answers the honest
+	// [0, 0], and a numlocal ask is refused in Redis's words. Positive
+	// asks park, so the corpus stays on the immediate shapes.
+	c("0", "WAIT", "0", "0"),
+	c("[0 0]", "WAITAOF", "0", "0", "0"),
+	c("ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.", "WAITAOF", "1", "0", "0"),
+
 	// The shared error shapes, one of each.
 	c("ERR unknown command 'NOPE'", "NOPE"),
 	c("ERR wrong number of arguments for 'get' command", "GET"),
