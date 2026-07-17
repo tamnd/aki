@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/tamnd/aki/engine/obs1/store"
 )
@@ -499,5 +500,64 @@ func TestBackpressureReclaimPendingHoldsOffStall(t *testing.T) {
 	}
 	if w.bpStalls != 0 {
 		t.Fatalf("stalled out %d writes while their room was queued for reclaim", w.bpStalls)
+	}
+}
+
+// TestBackpressureFoldSignals pins the obs1 halves of the resident window:
+// a fold cursor that keeps advancing (SetFoldProgress) resets the stall
+// counter every pass so the parked write never takes the OOM reply, the
+// pressure kick (SetFoldKick) fires while the write waits but paced, and
+// freezing the cursor lets the window cross in bpStallWindow fruitless
+// passes exactly as before the seams existed.
+func TestBackpressureFoldSignals(t *testing.T) {
+	rt := New(1, testArena, testSeg)
+	rt.Use([]Handler{
+		opBpParkAlways: func(cx *Ctx, args [][]byte, r Reply) {
+			cx.ParkFull(store.ErrFull)
+		},
+	})
+	var cursor uint64
+	kicks := 0
+	rt.SetFoldProgress(func() uint64 { return cursor })
+	rt.SetFoldKick(func() { kicks++ })
+	c := rt.NewConn()
+	w := rt.workers[0]
+
+	if err := c.Do(opBpParkAlways, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.Flush()
+	w.drainAndExecute()
+	if len(w.fullWaiters) != 1 {
+		t.Fatalf("fullWaiters = %d, want 1", len(w.fullWaiters))
+	}
+
+	// The cursor advances before every pass: twice the window's worth of
+	// passes and the write is still parked, not stalled out.
+	start := time.Now()
+	for range 2 * bpStallWindow {
+		cursor++
+		w.retryFull()
+	}
+	if w.bpStalls != 0 || len(w.fullWaiters) != 1 {
+		t.Fatalf("stalls = %d waiters = %d after advancing passes, want 0 and 1", w.bpStalls, len(w.fullWaiters))
+	}
+	if kicks == 0 {
+		t.Fatal("the pressure kick never fired while a resident write was parked")
+	}
+	if allowed := int(time.Since(start).Milliseconds())/bpFoldKickPollMs + 1; kicks > allowed {
+		t.Fatalf("kicks = %d over %v, want at most %d (one per %dms)", kicks, time.Since(start), allowed, bpFoldKickPollMs)
+	}
+
+	// Frozen cursor: with no other progress signal the window crosses and
+	// the waiter takes the OOM reply.
+	for passes := 0; len(w.fullWaiters) > 0; passes++ {
+		if passes > bpStallWindow+4 {
+			t.Fatalf("write still parked after %d frozen passes, window is %d", passes, bpStallWindow)
+		}
+		w.retryFull()
+	}
+	if w.bpStalls != 1 {
+		t.Fatalf("bpStalls = %d, want 1", w.bpStalls)
 	}
 }
