@@ -270,6 +270,21 @@ func (s *Store) Exists(key []byte, now int64) bool {
 	return addr != 0
 }
 
+// ExpireAt reports key's absolute expiry deadline in unix ms, 0 when the key
+// is absent or carries none. A cold record always reads 0: the migrator
+// demotes only TTL-free records, so the answer is exact without a frame read.
+// The obs1 write log reads the deadline back after a TTL-preserving write
+// (INCR, APPEND, SETRANGE, SET KEEPTTL) so the effect frame records the
+// absolute deadline the key still rides under (spec 2064/obs1 doc 04
+// section 2).
+func (s *Store) ExpireAt(key []byte, now int64) int64 {
+	slot, addr, _ := s.findLive(Hash(key), key, now)
+	if addr == 0 || slotCold(*slot) {
+		return 0
+	}
+	return s.expireAt(addr)
+}
+
 // StrLen reports the value's byte length (an int cell's digit count) and
 // presence.
 func (s *Store) StrLen(key []byte, now int64) (int64, bool) {
