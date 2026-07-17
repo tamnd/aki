@@ -1,12 +1,28 @@
 package shard
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"sync/atomic"
+	"time"
 
+	"github.com/tamnd/aki/engine/f3/akifile"
 	"github.com/tamnd/aki/engine/f3/store"
 )
+
+// akiWriterRing is the per-shard in-flight bound on the shared file's group-commit
+// writer. It is sized generously so a submit an owner makes rarely finds the ring
+// full: the design note (M8-group-commit-writer.md) keeps the first slices wide and
+// exposes writer saturation as owner backpressure for the lab to find the knee,
+// rather than tuning the ring down before a number demands it.
+const akiWriterRing = 64
+
+// akiSepThreshold is the separation threshold stamped into a freshly created .aki
+// prefix. It is metadata a reader reports; the store's own band decision runs off
+// ResidentCapBytes, so this only records the geometry the file was made with.
+const akiSepThreshold = 64
 
 // Runtime is the shard topology: S workers, each a single goroutine owning
 // one store (and optionally locked to an OS thread), fixed at startup. Shards never split, merge, or rebalance
@@ -14,6 +30,16 @@ import (
 type Runtime struct {
 	workers []*worker
 	started bool
+
+	// aki and gw back a durable runtime with the one shared .aki file and its one
+	// group-commit writer (Config.AkiPath), the M8 durable arc's runtime seam. Every
+	// worker's store borrows the file and routes its record-log cuts through the one
+	// writer, so no two shards race the single-writer append cursor. Both are nil on
+	// the default scratch-vlog path, which owns per-shard files and needs neither.
+	// The runtime owns their lifetime: Stop joins the writer and closes the file
+	// after the owners are gone.
+	aki *akifile.File
+	gw  *akifile.GroupWriter
 
 	// txnTicket is the process-global tier-two ticket source (doc 03 section
 	// 6.1, intent.go): one atomic touched only by Begin, off the single-key path
@@ -114,6 +140,16 @@ type Config struct {
 	// stores are memory-only and ResidentCapBytes is ignored.
 	VlogDir string
 
+	// AkiPath, when set, backs the whole runtime with the one shared .aki durable
+	// file at this path instead of per-shard scratch logs (the M8 durable arc). One
+	// file and one group-commit writer serve every shard: a shard stages its record
+	// rows and separated values into the shared file and cuts them through the one
+	// writer that owns the append cursor. An existing file is recovered on open, so
+	// a restart rebuilds every shard's index from the durable log; a missing file is
+	// created fresh. It is mutually exclusive with VlogDir (AkiPath wins). Opt-in:
+	// without it the runtime keeps the scratch-vlog path unchanged.
+	AkiPath string
+
 	// ResidentCapBytes is each shard's resident byte budget; past it a
 	// separated or chunked value's bytes spill to the shard's log. 0 means
 	// uncapped.
@@ -140,13 +176,20 @@ type Config struct {
 }
 
 // Open is New with the value-log configuration: each shard gets its own log
-// file so the single-owner contract extends to the disk tier.
+// file so the single-owner contract extends to the disk tier. With Config.AkiPath
+// set the whole runtime shares one durable .aki file instead (openAkiStores).
 func Open(cfg Config) (*Runtime, error) {
 	if cfg.Shards < 1 {
 		cfg.Shards = 1
 	}
 	r := &Runtime{workers: make([]*worker, cfg.Shards)}
 	r.resolveConnCaps(cfg)
+	if cfg.AkiPath != "" {
+		if err := r.openAkiStores(cfg); err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
 	for i := range r.workers {
 		o := store.Options{ArenaBytes: cfg.ArenaBytes, SegBytes: cfg.SegBytes}
 		if cfg.VlogDir != "" {
@@ -165,6 +208,84 @@ func Open(cfg Config) (*Runtime, error) {
 		r.workers[i].pin = cfg.PinWorkers
 	}
 	return r, nil
+}
+
+// openAkiStores builds the durable runtime: it opens or creates the one shared .aki
+// file, stands up the one group-commit writer over it, and opens every shard's store
+// borrowing that file and that writer. An existing file is recovered before any store
+// serves a command, so a restart rebuilds each shard's index from the durable record
+// log; a freshly created file has nothing to recover. On any failure it unwinds what
+// it built (stores, then the writer, then the file) so a half-open runtime never
+// leaks the file handle or the writer goroutine.
+func (r *Runtime) openAkiStores(cfg Config) error {
+	f, existed, err := openOrCreateAki(cfg.AkiPath, len(r.workers))
+	if err != nil {
+		return err
+	}
+	r.aki = f
+	r.gw = akifile.NewGroupWriter(f, len(r.workers), akiWriterRing)
+
+	var rec *akifile.Recovery
+	if existed {
+		if rec, err = f.Recover(); err != nil {
+			r.gw.Stop()
+			_ = f.Close()
+			return fmt.Errorf("shard: recover %s: %w", cfg.AkiPath, err)
+		}
+	}
+	now := time.Now().UnixMilli()
+	for i := range r.workers {
+		st, err := store.Open(store.Options{
+			ArenaBytes:       cfg.ArenaBytes,
+			SegBytes:         cfg.SegBytes,
+			AkiValueLog:      f,
+			Shard:            uint16(i),
+			AkiGroupWriter:   r.gw,
+			ResidentCapBytes: cfg.ResidentCapBytes,
+		})
+		if err == nil && rec != nil {
+			err = st.RecoverIndex(rec, now)
+		}
+		if err != nil {
+			if st != nil {
+				_ = st.Close()
+			}
+			for j := 0; j < i; j++ {
+				_ = r.workers[j].st.Close()
+			}
+			r.gw.Stop()
+			_ = f.Close()
+			return fmt.Errorf("shard: open shard %d over %s: %w", i, cfg.AkiPath, err)
+		}
+		r.workers[i] = newWorker(i, st)
+		r.workers[i].rt = r
+		r.workers[i].pin = cfg.PinWorkers
+	}
+	return nil
+}
+
+// openOrCreateAki opens the shared .aki at path, or creates it fresh when it does
+// not exist yet. It returns the file, whether it already existed (so the caller
+// knows to recover), and any error. A path that exists but does not open (a torn or
+// wrong-format file) is a hard error, not a silent re-create, so a damaged file is
+// never overwritten.
+func openOrCreateAki(path string, shards int) (*akifile.File, bool, error) {
+	f, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncEverySec})
+	if err == nil {
+		return f, true, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return nil, false, fmt.Errorf("shard: open %s: %w", path, err)
+	}
+	f, err = akifile.Create(path, akifile.CreateOptions{
+		ShardCount:   uint32(shards),
+		SepThreshold: akiSepThreshold,
+		Sync:         akifile.SyncEverySec,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("shard: create %s: %w", path, err)
+	}
+	return f, false, nil
 }
 
 // Use registers the op-indexed handler table on every worker: the handler for
@@ -244,5 +365,15 @@ func (r *Runtime) Stop() {
 	// exhaustion.
 	for _, w := range r.workers {
 		_ = w.st.Close()
+	}
+	// On the shared-.aki path the runtime owns the one writer and the one file. The
+	// owners have quiesced, so no Submit can race the drain: join the writer (it
+	// commits whatever was queued one last time), then close the file it wrote to.
+	// The stores borrowed the handle, so their Close above left it open for this.
+	if r.gw != nil {
+		r.gw.Stop()
+	}
+	if r.aki != nil {
+		_ = r.aki.Close()
 	}
 }
