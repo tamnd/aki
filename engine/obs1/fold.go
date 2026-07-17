@@ -1,0 +1,524 @@
+// The fold pass (spec 2064/obs1 doc 06 section 1): packing cooled data out
+// of RAM into immutable bucket segments. The Folder never re-reads WAL
+// objects; its input is the store's staged cold drains, delivered through
+// the fold tap on the shard owner's goroutine, which is the #1111 finding
+// made structural: selection and pacing are the stage machinery's SIEVE
+// hand and budgets, and the folder adds one frame-serialization copy on
+// the owner plus block building and PUTs off it.
+//
+// Eligibility (doc 06 section 1.2) needs no per-record seq: the tap fires
+// on the goroutine that emits the group's WAL frames, so the group's last
+// emitted seq at tap time covers every mutation the staged frames reflect.
+// The segment PUTs eagerly and publishes to the ledger only once the
+// committed watermark reaches that seq; a record mutated after staging has
+// a later seq, so replay above the fold cursor shadows the stale copy the
+// segment holds.
+package obs1
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/tamnd/aki/engine/obs1/store"
+)
+
+const (
+	// foldSegTarget is the level-0 segment cut threshold (doc 06 section
+	// 1.4): an accumulator past it closes its segment on the next tap.
+	foldSegTarget = 64 << 20
+
+	// foldChunkTarget is the run-chunk payload target, the middle of the
+	// doc 08 section 1 4-32KiB band.
+	foldChunkTarget = 16 << 10
+
+	// The PUT retry backoff, the flusher's shape on the same store.
+	foldRetryBase = 20 * time.Millisecond
+	foldRetryCap  = time.Second
+)
+
+// FoldConfig configures one node's Folder.
+type FoldConfig struct {
+	// Store, Prefix, and Node are the PUT target and identity, the same
+	// values the node's flusher carries.
+	Store  Store
+	Prefix string
+	Node   uint64
+
+	// MapKey maps a key to its hash slot and group, the dispatcher's route.
+	MapKey func(key []byte) (slot uint16, group uint16)
+
+	// Mark is the eligibility snapshot, WriteLog.GroupMark: the group's
+	// lease epoch and last emitted seq, read on the owner goroutine that
+	// is feeding the tap.
+	Mark func(group uint16) (epoch uint32, last uint64)
+
+	// Marks is the committed-watermark surface the publish gate parks on,
+	// WriteLog.Marks().
+	Marks *Watermarks
+
+	// OnPublish, when set, hears every segment as it publishes, after the
+	// watermark covers it. Called off the owner; the manifest slice's seam.
+	OnPublish func(FoldedSegment)
+
+	// SegTargetBytes and ChunkTargetBytes override the cut thresholds,
+	// zero for the defaults. Tests shrink them.
+	SegTargetBytes   int
+	ChunkTargetBytes int
+}
+
+// FoldedSegment is one ledger row: a segment durably in the bucket whose
+// covered seq the committed watermark has reached. FooterOff and
+// FooterLen are the #1102 manifest fields: a cold open ranged-GETs the
+// footer directly instead of walking from the tail.
+type FoldedSegment struct {
+	Group      uint16
+	Epoch      uint32
+	SegSeq     uint64
+	Key        string
+	Size       int64
+	FooterOff  uint64
+	FooterLen  uint32
+	NRecords   uint64
+	RawBytes   uint64
+	CoveredSeq uint64
+}
+
+// FolderStats counts the folder's work for tests and the INFO surface.
+type FolderStats struct {
+	Records        uint64 // whole-record frames accumulated
+	Chunks         uint64 // collection chunk frames accumulated
+	Replaced       uint64 // re-staged records that replaced an accumulated copy
+	PointerSkipped uint64 // pointer-band frames left to the separated-band route
+	NoEpoch        uint64 // frames dropped for want of a group epoch
+	SegmentsCut    uint64
+	SegmentsPut    uint64
+	Published      uint64
+	PutRetries     uint64
+	WalkErrs       uint64
+	BuildErrs      uint64
+}
+
+// foldRec is one accumulated whole-record frame, copied out of the tap
+// buffer. fp is the key fingerprint (the bloom's first hash), the run
+// order doc 08 section 2 packs by.
+type foldRec struct {
+	kind  byte
+	fp    uint64
+	key   []byte
+	frame []byte
+}
+
+// foldGroup is one group's accumulator. recs and chunks are deduped by
+// identity so a record staged twice (a failed pwrite re-stages it later)
+// folds once, at its newest state.
+type foldGroup struct {
+	epoch   uint32
+	seq     uint64 // next SegSeq
+	covered uint64 // max eligibility mark over contributors
+	bytes   int
+	recs    []foldRec
+	recIdx  map[string]int
+	chunks  []SegmentChunk
+	chIdx   map[string]int
+}
+
+// segJob is one cut segment on its way to the bucket.
+type segJob struct {
+	group   uint16
+	epoch   uint32
+	seq     uint64
+	covered uint64
+	recs    []foldRec
+	chunks  []SegmentChunk
+}
+
+// Folder packs staged cold frames into segments and PUTs them. Add runs
+// on shard owner goroutines under one mutex (drains are boundary-paced,
+// so contention is a non-event); building and PUTs run on the folder's own
+// goroutine.
+type Folder struct {
+	cfg       FoldConfig
+	segTarget int
+	chTarget  int
+
+	mu     sync.Mutex
+	cond   *sync.Cond
+	groups map[uint16]*foldGroup
+	queue  []*segJob
+	ledger []FoldedSegment
+	stats  FolderStats
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// NewFolder builds and starts a Folder.
+func NewFolder(cfg FoldConfig) (*Folder, error) {
+	if cfg.Store == nil || cfg.MapKey == nil || cfg.Mark == nil || cfg.Marks == nil {
+		return nil, fmt.Errorf("obs1: FoldConfig needs Store, MapKey, Mark, and Marks")
+	}
+	f := &Folder{
+		cfg:       cfg,
+		segTarget: cfg.SegTargetBytes,
+		chTarget:  cfg.ChunkTargetBytes,
+		groups:    make(map[uint16]*foldGroup),
+	}
+	if f.segTarget <= 0 {
+		f.segTarget = foldSegTarget
+	}
+	if f.chTarget <= 0 {
+		f.chTarget = foldChunkTarget
+	}
+	f.cond = sync.NewCond(&f.mu)
+	f.ctx, f.cancel = context.WithCancel(context.Background())
+	f.done = make(chan struct{})
+	go f.run()
+	return f, nil
+}
+
+// Add ingests one staged drain buffer, the fold tap's target: it walks the
+// frames, routes each to its group's accumulator with the eligibility mark
+// taken now, and cuts any accumulator past the segment target. Pointer-band
+// frames are skipped and counted; their bytes live in the local value log
+// and fold by their own route in a later slice (#1111). The buffer is the
+// store's and recycles after the drain, so everything kept is copied here.
+func (f *Folder) Add(frames []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	touched := make(map[uint16]*foldGroup)
+	err := store.WalkStagedFrames(frames, func(fr store.FoldFrame) error {
+		if fr.Pointer {
+			f.stats.PointerSkipped++
+			return nil
+		}
+		_, group := f.cfg.MapKey(fr.Key)
+		epoch, last := f.cfg.Mark(group)
+		if epoch == 0 {
+			f.stats.NoEpoch++
+			return nil
+		}
+		g := f.groups[group]
+		if g == nil {
+			g = &foldGroup{seq: 1, recIdx: make(map[string]int), chIdx: make(map[string]int)}
+			f.groups[group] = g
+		}
+		g.epoch = epoch
+		if last > g.covered {
+			g.covered = last
+		}
+		touched[group] = g
+		if fr.Chunk {
+			id := string([]byte{fr.Kind}) + string(fr.Key) + "\x00" + string(fr.Disc)
+			data := append([]byte(nil), fr.Frame...)
+			c := SegmentChunk{
+				Key: append([]byte(nil), fr.Key...), Kind: fr.Kind,
+				FirstDisc: disc64(fr.Disc), Count: fr.Count, LiveHint: fr.Count,
+				Data: data,
+			}
+			if i, ok := g.chIdx[id]; ok {
+				g.bytes += len(data) - len(g.chunks[i].Data)
+				g.chunks[i] = c
+				f.stats.Replaced++
+			} else {
+				g.chIdx[id] = len(g.chunks)
+				g.chunks = append(g.chunks, c)
+				g.bytes += len(data)
+				f.stats.Chunks++
+			}
+			return nil
+		}
+		key := append([]byte(nil), fr.Key...)
+		h1, _ := bloomHash(key)
+		r := foldRec{kind: fr.Kind, fp: h1, key: key, frame: append([]byte(nil), fr.Frame...)}
+		if i, ok := g.recIdx[string(key)]; ok {
+			g.bytes += len(r.frame) - len(g.recs[i].frame)
+			g.recs[i] = r
+			f.stats.Replaced++
+		} else {
+			g.recIdx[string(key)] = len(g.recs)
+			g.recs = append(g.recs, r)
+			g.bytes += len(r.frame)
+			f.stats.Records++
+		}
+		return nil
+	})
+	if err != nil {
+		f.stats.WalkErrs++
+	}
+	for group, g := range touched {
+		if g.bytes >= f.segTarget {
+			f.cutLocked(group, g)
+		}
+	}
+}
+
+// Flush cuts every non-empty accumulator now, the age and shutdown
+// trigger's entry point until the manifest slice wires a cadence.
+func (f *Folder) Flush() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for group, g := range f.groups {
+		f.cutLocked(group, g)
+	}
+}
+
+// cutLocked closes the group's accumulator into a PUT job and resets it.
+func (f *Folder) cutLocked(group uint16, g *foldGroup) {
+	if len(g.recs) == 0 && len(g.chunks) == 0 {
+		return
+	}
+	f.queue = append(f.queue, &segJob{
+		group: group, epoch: g.epoch, covered: g.covered,
+		recs: g.recs, chunks: g.chunks,
+	})
+	g.covered = 0
+	g.bytes = 0
+	g.recs, g.chunks = nil, nil
+	g.recIdx, g.chIdx = make(map[string]int), make(map[string]int)
+	f.stats.SegmentsCut++
+	f.cond.Signal()
+}
+
+// Ledger returns the published segments in publish order, a copy.
+func (f *Folder) Ledger() []FoldedSegment {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]FoldedSegment(nil), f.ledger...)
+}
+
+// Stats returns a snapshot of the folder's counters.
+func (f *Folder) Stats() FolderStats {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stats
+}
+
+// Close stops the folder. Queued segments not yet PUT are abandoned: the
+// WAL still holds their data above the fold cursor, so nothing is lost,
+// and the next incarnation folds it again.
+func (f *Folder) Close() {
+	f.cancel()
+	f.mu.Lock()
+	f.cond.Broadcast()
+	f.mu.Unlock()
+	<-f.done
+}
+
+// run is the folder's off-owner half: it builds and PUTs cut segments one
+// at a time, in cut order.
+func (f *Folder) run() {
+	defer close(f.done)
+	for {
+		f.mu.Lock()
+		for len(f.queue) == 0 && f.ctx.Err() == nil {
+			f.cond.Wait()
+		}
+		if f.ctx.Err() != nil {
+			f.mu.Unlock()
+			return
+		}
+		job := f.queue[0]
+		f.queue = f.queue[1:]
+		f.mu.Unlock()
+		f.putSegment(job)
+	}
+}
+
+// buildSegment packs the job into a Segment: collection chunk frames pass
+// through verbatim, whole-record frames sort by (kind, fingerprint) and
+// pack into homogeneous run chunks (doc 08 section 2) at the chunk target,
+// and the blocks take the #1085 default size with comp 0 until the codec
+// milestone (#1097).
+func (f *Folder) buildSegment(job *segJob) (*Segment, error) {
+	sort.Slice(job.recs, func(i, j int) bool {
+		a, b := &job.recs[i], &job.recs[j]
+		if a.kind != b.kind {
+			return a.kind < b.kind
+		}
+		if a.fp != b.fp {
+			return a.fp < b.fp
+		}
+		return string(a.key) < string(b.key)
+	})
+	chunks := make([]SegmentChunk, 0, len(job.chunks)+1)
+	memberKeys := make([][]byte, 0, len(job.recs)+len(job.chunks))
+	var payload []byte
+	var run []foldRec
+	cut := func() {
+		if len(run) == 0 {
+			return
+		}
+		first := run[0]
+		var disc [8]byte
+		binary.LittleEndian.PutUint64(disc[:], first.fp)
+		data := store.AppendRunChunk(nil, first.kind|store.ChunkKindBit, 0,
+			uint16(len(run)), first.key, disc[:], payload)
+		chunks = append(chunks, SegmentChunk{
+			Key: first.key, Kind: first.kind | store.ChunkKindBit,
+			FirstDisc: first.fp, Count: uint16(len(run)), LiveHint: uint16(len(run)),
+			Data: data,
+		})
+		payload, run = nil, nil
+	}
+	for i := range job.recs {
+		r := &job.recs[i]
+		if len(run) > 0 && (run[0].kind != r.kind || len(payload) >= f.chTarget || len(run) == 0xFFFF) {
+			cut()
+		}
+		run = append(run, *r)
+		payload = append(payload, r.frame...)
+		memberKeys = append(memberKeys, r.key)
+	}
+	cut()
+	for i := range job.chunks {
+		memberKeys = append(memberKeys, job.chunks[i].Key)
+	}
+	chunks = append(chunks, job.chunks...)
+	footer := SegmentFooter{
+		Group: job.group, Epoch: job.epoch, SegSeq: job.seq, Level: 0,
+		// Cold frames carry no expiry word, so level-0 segments are TTL
+		// class 0 until the fold route carries deadlines (doc 03 section
+		// 5.1, recorded gap).
+		TTLClass: 0,
+	}
+	return BuildSegment(footer, chunks, memberKeys, 0)
+}
+
+// putSegment encodes and PUTs one job, the flusher's retry shape on a
+// CAS-create key. RecheckOther on seg/<group>/<seq> is not fencing failure
+// here: a prior incarnation of this group's folder can have landed that
+// seq, so the folder advances to the next slot; the boot recovery slice
+// seeds the counter from the manifest instead. The seq is drawn from the
+// group counter here, not at cut time, and written back only on success:
+// jobs run serially on the one putter goroutine, so no two segments can
+// alias a slot, which the ambiguity recheck relies on (a stable per-slot
+// batch tag must never name two different segments).
+func (f *Folder) putSegment(job *segJob) {
+	f.mu.Lock()
+	job.seq = f.groups[job.group].seq
+	f.mu.Unlock()
+	backoff := foldRetryBase
+	for {
+		seg, err := f.buildSegment(job)
+		if err == nil && len(seg.Footer.Chunks) == 0 {
+			err = fmt.Errorf("obs1: fold cut an empty segment")
+		}
+		if err != nil {
+			f.mu.Lock()
+			f.stats.BuildErrs++
+			f.mu.Unlock()
+			return
+		}
+		obj, err := AppendSegment(nil, f.cfg.Node, seg)
+		if err != nil {
+			f.mu.Lock()
+			f.stats.BuildErrs++
+			f.mu.Unlock()
+			return
+		}
+		key := segKey(f.cfg.Prefix, job.group, job.seq)
+		tag := WriteTag{
+			Writer: fmt.Sprintf("%016x", f.cfg.Node),
+			Batch:  fmt.Sprintf("seg-%03d-%s", job.group, seq16(job.seq)),
+		}
+		_, perr := f.cfg.Store.PutIfAbsent(f.ctx, key, obj, tag)
+		if perr == nil {
+			f.finishPut(job, obj, key)
+			return
+		}
+		if f.ctx.Err() != nil {
+			return
+		}
+		if isCASRace(perr) {
+			out, _, _, rerr := f.cfg.Store.Recheck(f.ctx, key, tag)
+			switch {
+			case rerr != nil:
+				if f.ctx.Err() != nil {
+					return
+				}
+			case out == RecheckOurs:
+				f.finishPut(job, obj, key)
+				return
+			case out == RecheckOther:
+				job.seq++
+				continue
+			}
+			// RecheckAbsent: the PUT never landed, same bytes go again.
+		}
+		f.mu.Lock()
+		f.stats.PutRetries++
+		f.mu.Unlock()
+		sleep := backoff/2 + rand.N(backoff/2+1)
+		select {
+		case <-f.ctx.Done():
+			return
+		case <-time.After(sleep):
+		}
+		if backoff *= 2; backoff > foldRetryCap {
+			backoff = foldRetryCap
+		}
+	}
+}
+
+// finishPut books a durable segment and arms its publish gate: the ledger
+// row appears once the committed watermark covers the job's mark.
+func (f *Folder) finishPut(job *segJob, obj []byte, key string) {
+	footerOff, footerLen, err := ParseTail(obj[len(obj)-TailSize:])
+	var footer SegmentFooter
+	if err == nil {
+		footer, err = ParseSegmentFooter(obj[footerOff : uint64(len(obj))-TailSize])
+	}
+	if err != nil {
+		// Unreachable for bytes AppendSegment just built; count and drop.
+		f.mu.Lock()
+		f.stats.BuildErrs++
+		f.mu.Unlock()
+		return
+	}
+	entry := FoldedSegment{
+		Group: job.group, Epoch: job.epoch, SegSeq: job.seq, Key: key,
+		Size: int64(len(obj)), FooterOff: footerOff, FooterLen: footerLen,
+		NRecords: footer.NRecords, RawBytes: footer.RawBytes, CoveredSeq: job.covered,
+	}
+	f.mu.Lock()
+	f.groups[job.group].seq = job.seq + 1
+	f.stats.SegmentsPut++
+	f.mu.Unlock()
+	f.cfg.Marks.Notify(job.group, job.covered, func() {
+		f.mu.Lock()
+		f.ledger = append(f.ledger, entry)
+		f.stats.Published++
+		cb := f.cfg.OnPublish
+		f.mu.Unlock()
+		if cb != nil {
+			cb(entry)
+		}
+	})
+}
+
+// disc64 lifts a chunk discriminator's leading bytes into the footer's
+// u64 FirstDisc, little-endian, zero-padded when shorter.
+func disc64(disc []byte) uint64 {
+	var b [8]byte
+	copy(b[:], disc)
+	return binary.LittleEndian.Uint64(b[:])
+}
+
+// segKey names a segment object (doc 03 section 1): per-group prefixes so
+// cold-read throughput scales with group count.
+func segKey(prefix string, group uint16, seq uint64) string {
+	return dbKey(prefix, fmt.Sprintf("seg/g%03d/%s", group, seq16(seq)))
+}
+
+// isCASRace reports the PUT outcomes that warrant a recheck rather than a
+// blind retry, the append.go taxonomy.
+func isCASRace(err error) bool {
+	return errors.Is(err, ErrPrecondition) || errors.Is(err, ErrConflict) || errors.Is(err, ErrAmbiguous)
+}

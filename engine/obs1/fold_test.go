@@ -1,0 +1,345 @@
+package obs1_test
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/tamnd/aki/engine/obs1"
+	"github.com/tamnd/aki/engine/obs1/sim"
+	"github.com/tamnd/aki/engine/obs1/store"
+)
+
+// kindString is the store's string record kind byte, pinned here the way
+// the format tests pin wire bytes: a fold segment's chunk kinds are format,
+// so a silent renumber must fail a test.
+const kindString = 0x01
+
+// foldFixture is a Folder over the simulator with a fixed group route:
+// every key maps to group 3, the mark returns epoch 7 and the seq the test
+// sets, and the watermark surface is a fresh one the test advances.
+type foldFixture struct {
+	sim    *sim.Sim
+	marks  *obs1.Watermarks
+	folder *obs1.Folder
+	last   uint64
+}
+
+func newFoldFixture(t *testing.T, chunkTarget int) *foldFixture {
+	t.Helper()
+	fx := &foldFixture{sim: sim.New(sim.Config{Seed: 1}), marks: obs1.NewWatermarks()}
+	f, err := obs1.NewFolder(obs1.FoldConfig{
+		Store:  fx.sim,
+		Prefix: "db/t",
+		Node:   0xA1,
+		MapKey: func(key []byte) (uint16, uint16) { return 9, 3 },
+		Mark:   func(group uint16) (uint32, uint64) { return 7, fx.last },
+		Marks:  fx.marks,
+
+		ChunkTargetBytes: chunkTarget,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.folder = f
+	t.Cleanup(f.Close)
+	return fx
+}
+
+// frames builds a staged buffer of embedded string records.
+func frames(kv ...string) []byte {
+	if len(kv)%2 != 0 {
+		panic("frames wants key value pairs")
+	}
+	var buf []byte
+	for i := 0; i < len(kv); i += 2 {
+		buf = store.AppendRecordFrame(buf, kindString, 0, uint32(len(kv[i+1])), []byte(kv[i]), []byte(kv[i+1]))
+	}
+	return buf
+}
+
+// waitFor polls until cond holds or the deadline passes.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// segRecords parses a segment object and returns every whole record in it
+// by unpacking each run chunk's payload, plus the raw collection chunks.
+func segRecords(t *testing.T, obj []byte) (map[string]string, []store.FoldFrame) {
+	t.Helper()
+	seg, _, err := obs1.ParseSegment(obj)
+	if err != nil {
+		t.Fatalf("parse segment: %v", err)
+	}
+	recs := make(map[string]string)
+	var colls []store.FoldFrame
+	for _, e := range seg.Footer.Chunks {
+		data := seg.BlockData[e.Block][e.OffInBlock:]
+		total := binary.LittleEndian.Uint32(data[0:4])
+		var outer store.FoldFrame
+		if err := store.WalkStagedFrames(data[:total], func(f store.FoldFrame) error {
+			outer = f
+			return nil
+		}); err != nil {
+			t.Fatalf("chunk at block %d off %d did not parse: %v", e.Block, e.OffInBlock, err)
+		}
+		if outer.Kind != e.Kind || outer.Count != e.Count {
+			t.Fatalf("chunk entry disagrees with its frame: entry %+v frame kind 0x%02x count %d", e, outer.Kind, outer.Count)
+		}
+		if outer.Kind == kindString|store.ChunkKindBit {
+			if werr := store.WalkStagedFrames(outer.Payload, func(r store.FoldFrame) error {
+				recs[string(r.Key)] = string(r.Payload)
+				return nil
+			}); werr != nil {
+				t.Fatalf("run payload walk: %v", werr)
+			}
+		} else {
+			colls = append(colls, outer)
+		}
+	}
+	return recs, colls
+}
+
+// TestFolderSegmentRoundTrip drives the whole slice on the simulator: a
+// staged buffer of records plus one collection chunk folds into a segment,
+// the segment lands under the doc 03 key, publishes at once (the mark is
+// already covered), and the object round-trips: whole-object parse, every
+// record at its staged value, the collection chunk verbatim, and the
+// ledger's footer fields opening the footer by ranged read (#1102).
+func TestFolderSegmentRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	fx := newFoldFixture(t, 64) // small run target so the ten records span chunks
+
+	buf := frames(
+		"k0", "v0", "k1", "v1", "k2", "v2", "k3", "v3", "k4", "v4",
+		"k5", "v5", "k6", "v6", "k7", "v7", "k8", "v8", "k9", "v9",
+	)
+	buf = store.AppendRunChunk(buf, 0x03|store.ChunkKindBit, 0, 7, []byte("coll"), []byte("disc8bYt"), []byte("packed-blob"))
+	fx.folder.Add(buf)
+	fx.folder.Flush()
+	waitFor(t, "publish", func() bool { return len(fx.folder.Ledger()) == 1 })
+
+	led := fx.folder.Ledger()[0]
+	wantKey := "db/t/seg/g003/0000000000000001"
+	if led.Key != wantKey || led.Group != 3 || led.Epoch != 7 || led.SegSeq != 1 || led.NRecords != 17 {
+		t.Fatalf("ledger row %+v", led)
+	}
+	obj, _, err := fx.sim.Get(ctx, wantKey)
+	if err != nil {
+		t.Fatalf("get segment: %v", err)
+	}
+	if int64(len(obj)) != led.Size {
+		t.Fatalf("object is %d bytes, ledger says %d", len(obj), led.Size)
+	}
+
+	recs, colls := segRecords(t, obj)
+	if len(recs) != 10 {
+		t.Fatalf("segment holds %d records, want 10", len(recs))
+	}
+	for i := range 10 {
+		k := fmt.Sprintf("k%d", i)
+		if recs[k] != fmt.Sprintf("v%d", i) {
+			t.Fatalf("record %s = %q", k, recs[k])
+		}
+	}
+	if len(colls) != 1 || colls[0].Count != 7 || string(colls[0].Key) != "coll" || string(colls[0].Payload) != "packed-blob" {
+		t.Fatalf("collection chunk did not pass through: %+v", colls)
+	}
+
+	// The #1102 cold open: tail, then one ranged GET of the footer.
+	tail, _, err := fx.sim.GetTail(ctx, wantKey, obs1.TailSize)
+	if err != nil {
+		t.Fatalf("get tail: %v", err)
+	}
+	footerOff, footerLen, err := obs1.ParseTail(tail)
+	if err != nil {
+		t.Fatalf("parse tail: %v", err)
+	}
+	if footerOff != led.FooterOff || footerLen != led.FooterLen {
+		t.Fatalf("ledger footer (%d,%d) vs tail (%d,%d)", led.FooterOff, led.FooterLen, footerOff, footerLen)
+	}
+	fslice, _, err := fx.sim.GetRange(ctx, wantKey, int64(footerOff), int64(footerLen))
+	if err != nil {
+		t.Fatalf("ranged footer get: %v", err)
+	}
+	footer, err := obs1.ParseSegmentFooter(fslice)
+	if err != nil {
+		t.Fatalf("parse ranged footer: %v", err)
+	}
+	if footer.Group != 3 || footer.Epoch != 7 || footer.SegSeq != 1 || footer.Level != 0 || footer.TTLClass != 0 {
+		t.Fatalf("ranged footer %+v", footer)
+	}
+	st := fx.folder.Stats()
+	if st.Records != 10 || st.Chunks != 1 || st.SegmentsCut != 1 || st.SegmentsPut != 1 || st.Published != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+// TestFolderWatermarkGate pins eligibility: a segment whose mark is ahead
+// of the committed watermark PUTs eagerly but stays out of the ledger
+// until a commit verdict covers the mark.
+func TestFolderWatermarkGate(t *testing.T) {
+	fx := newFoldFixture(t, 0)
+	fx.last = 42
+
+	fx.folder.Add(frames("k", "v"))
+	fx.folder.Flush()
+	waitFor(t, "put", func() bool { return fx.folder.Stats().SegmentsPut == 1 })
+	if got := fx.folder.Ledger(); len(got) != 0 {
+		t.Fatalf("published %d segments before the watermark covered seq 42", len(got))
+	}
+
+	if err := fx.marks.ApplyVerdict(obs1.CommitVerdict{
+		Commit: obs1.CommitRecord{Sections: []obs1.CommitSection{{Group: 3, Epoch: 7, FirstSeq: 1, LastSeq: 42}}},
+		Live:   []bool{true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "gated publish", func() bool { return len(fx.folder.Ledger()) == 1 })
+	if led := fx.folder.Ledger()[0]; led.CoveredSeq != 42 {
+		t.Fatalf("ledger covered seq %d, want 42", led.CoveredSeq)
+	}
+}
+
+// TestFolderSegSeqCollision pins the CAS-create policy: a seq slot held by
+// another writer (a prior incarnation's segment) advances the folder past
+// it rather than fencing it out, and the next cut keeps counting from
+// there.
+func TestFolderSegSeqCollision(t *testing.T) {
+	ctx := context.Background()
+	fx := newFoldFixture(t, 0)
+	if _, err := fx.sim.PutIfAbsent(ctx, "db/t/seg/g003/0000000000000001", []byte("held"),
+		obs1.WriteTag{Writer: "another-node", Batch: "b1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	fx.folder.Add(frames("k1", "v1"))
+	fx.folder.Flush()
+	waitFor(t, "first publish", func() bool { return len(fx.folder.Ledger()) == 1 })
+	if led := fx.folder.Ledger()[0]; led.SegSeq != 2 || led.Key != "db/t/seg/g003/0000000000000002" {
+		t.Fatalf("collision landed at %+v", led)
+	}
+
+	fx.folder.Add(frames("k2", "v2"))
+	fx.folder.Flush()
+	waitFor(t, "second publish", func() bool { return len(fx.folder.Ledger()) == 2 })
+	if led := fx.folder.Ledger()[1]; led.SegSeq != 3 {
+		t.Fatalf("post-collision cut landed at seq %d, want 3", led.SegSeq)
+	}
+}
+
+// TestFolderDedupeRestaged pins the accumulator's identity rule: a record
+// staged twice before the cut (a failed pwrite re-stages it) folds once,
+// at its newest state.
+func TestFolderDedupeRestaged(t *testing.T) {
+	ctx := context.Background()
+	fx := newFoldFixture(t, 0)
+
+	fx.folder.Add(frames("k", "old", "other", "x"))
+	fx.folder.Add(frames("k", "new"))
+	fx.folder.Flush()
+	waitFor(t, "publish", func() bool { return len(fx.folder.Ledger()) == 1 })
+
+	obj, _, err := fx.sim.Get(ctx, fx.folder.Ledger()[0].Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs, _ := segRecords(t, obj)
+	if len(recs) != 2 || recs["k"] != "new" || recs["other"] != "x" {
+		t.Fatalf("deduped records %v", recs)
+	}
+	if st := fx.folder.Stats(); st.Records != 2 || st.Replaced != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+// TestFolderRealDrainRoundTrip is the integration half: a real store under
+// resident pressure feeds the folder through the fold tap while its drains
+// complete normally, and every record the segments hold reads back at the
+// value the store was given. This is the slice's proof that the fold
+// consumes the migrator's actual bytes, not a synthetic imitation.
+func TestFolderRealDrainRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s, err := store.Open(store.Options{
+		ArenaBytes:       16 << 20,
+		SegBytes:         256 << 10,
+		VlogPath:         filepath.Join(dir, "vlog"),
+		ColdPath:         filepath.Join(dir, "cold"),
+		ResidentCapBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	fx := newFoldFixture(t, 0)
+	s.SetFoldTap(fx.folder.Add)
+
+	const n = 30000
+	for i := range n {
+		k := fmt.Appendf(nil, "k:%07d", i)
+		v := fmt.Appendf(nil, "v-%d", i)
+		if err := s.Set(k, v); err != nil {
+			t.Fatalf("set %d: %v", i, err)
+		}
+	}
+	if !s.NeedsColdDrain() {
+		t.Fatal("fixture did not cross the cap")
+	}
+	buf := make([]byte, 0, 256<<10)
+	for pass := 0; pass < 64 && s.NeedsColdDrain(); pass++ {
+		d := s.StageColdDrain(buf)
+		if d == nil || len(d.Buf()) == 0 {
+			break
+		}
+		if _, werr := s.ColdWriteAt(d.Off(), d.Buf()); werr != nil {
+			t.Fatalf("cold write: %v", werr)
+		}
+		s.CompleteColdDrain(d, true)
+	}
+	fx.folder.Flush()
+	waitFor(t, "publish", func() bool {
+		st := fx.folder.Stats()
+		return st.SegmentsCut > 0 && uint64(len(fx.folder.Ledger())) == st.SegmentsCut
+	})
+
+	folded := 0
+	for _, led := range fx.folder.Ledger() {
+		obj, _, gerr := fx.sim.Get(ctx, led.Key)
+		if gerr != nil {
+			t.Fatalf("get %s: %v", led.Key, gerr)
+		}
+		recs, _ := segRecords(t, obj)
+		for k, v := range recs {
+			var i int
+			if _, serr := fmt.Sscanf(k, "k:%d", &i); serr != nil {
+				t.Fatalf("unexpected folded key %q", k)
+			}
+			if want := fmt.Sprintf("v-%d", i); v != want {
+				t.Fatalf("folded %s = %q, want %q", k, v, want)
+			}
+			folded++
+		}
+	}
+	st := fx.folder.Stats()
+	if uint64(folded) != st.Records {
+		t.Fatalf("segments hold %d records, folder accumulated %d", folded, st.Records)
+	}
+	if folded == 0 {
+		t.Fatal("the drain folded nothing")
+	}
+	if st.WalkErrs != 0 || st.BuildErrs != 0 || st.NoEpoch != 0 {
+		t.Fatalf("fold errors: %+v", st)
+	}
+}
