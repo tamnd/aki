@@ -64,7 +64,7 @@ func TestSmoveAgainstRedis(t *testing.T) {
 			if d := setFrom(tc.dst); d != nil {
 				g.m[dst] = d
 			}
-			moved, wrong := smove(g, cx, []byte(src), []byte(dst), []byte(tc.member))
+			moved, wrong, _ := smove(g, cx, []byte(src), []byte(dst), []byte(tc.member))
 			if wrong {
 				t.Fatalf("local unexpected WRONGTYPE")
 			}

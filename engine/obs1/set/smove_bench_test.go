@@ -33,9 +33,9 @@ func benchSmove(b *testing.B, n int) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if i&1 == 0 {
-			sink, _ = smove(g, cx, a, bkey, shuttle)
+			sink, _, _ = smove(g, cx, a, bkey, shuttle)
 		} else {
-			sink, _ = smove(g, cx, bkey, a, shuttle)
+			sink, _, _ = smove(g, cx, bkey, a, shuttle)
 		}
 	}
 }
