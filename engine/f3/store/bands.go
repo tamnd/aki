@@ -115,7 +115,7 @@ func (s *Store) writeRun(a, b []byte, capB uint64) (word uint64, vcap uint32, er
 		if _, err := s.vlog.append(b); err != nil {
 			// The a bytes are already appended; they become dead space the
 			// next compaction drops.
-			s.vlog.dead += uint64(len(a))
+			s.logUnlink(uint64(len(a)))
 			return 0, 0, err
 		}
 	}
@@ -129,7 +129,7 @@ func (s *Store) writeRun(a, b []byte, capB uint64) (word uint64, vcap uint32, er
 // every placement and release site.
 func (s *Store) dropRun(word uint64, vlen, vcap uint32) {
 	if word&inLogBit != 0 {
-		s.vlog.dead += uint64(vlen)
+		s.logUnlink(uint64(vlen))
 		s.logRuns--
 		return
 	}

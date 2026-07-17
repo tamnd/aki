@@ -171,7 +171,7 @@ func (s *Store) maybePromote(addr, vs uint64, vlen uint32, v []byte) {
 		return
 	}
 	copy(s.arena.buf[off:off+uint64(vlen)], v)
-	s.vlog.dead += uint64(vlen)
+	s.logUnlink(uint64(vlen))
 	s.logRuns--
 	s.writePtr(vs, off, vlen, uint32(need))
 	if f&flagVisited == 0 {

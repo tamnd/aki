@@ -21,3 +21,11 @@ func (s *Store) logReadInto(off uint64, n int, dst []byte) ([]byte, error) {
 func (s *Store) logReadFill(off uint64, b []byte) error {
 	return s.vlog.readFill(off, b)
 }
+
+// logUnlink marks n value-log bytes dead: an overwrite, a delete, an expiry, or
+// a demote no longer references them, so a later compaction of the log knows it
+// can reclaim them. Every drop and re-home site that supersedes a spilled value
+// funnels through here for the same reason the reads do, so the value-log
+// re-home points the dead-byte accounting at akiVlog.unlink in one place rather
+// than at each drop site. The tail side of the accounting stays in LogBytes.
+func (s *Store) logUnlink(n uint64) { s.vlog.dead += n }

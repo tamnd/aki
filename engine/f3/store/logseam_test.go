@@ -36,3 +36,26 @@ func TestLogSeamForwardsToScratchLog(t *testing.T) {
 		t.Fatalf("logReadFill = %q, want %q", win, want)
 	}
 }
+
+// TestLogSeamUnlinkMovesDead marks value-log bytes dead through the seam and
+// confirms LogBytes reports them, the drop-accounting half of the write seam
+// the re-home points at akiVlog.unlink.
+func TestLogSeamUnlinkMovesDead(t *testing.T) {
+	s := newLogStore(t, 1<<20)
+
+	val := bytes.Repeat([]byte("x"), 2048)
+	if _, err := s.vlog.append(val); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := s.vlog.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if _, dead := s.LogBytes(); dead != 0 {
+		t.Fatalf("fresh log has dead=%d, want 0", dead)
+	}
+
+	s.logUnlink(uint64(len(val)))
+	if _, dead := s.LogBytes(); dead != uint64(len(val)) {
+		t.Fatalf("after unlink dead=%d, want %d", dead, len(val))
+	}
+}
