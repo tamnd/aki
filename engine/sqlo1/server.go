@@ -56,6 +56,14 @@ type Server struct {
 	// parse before any write, so a bad float later in the list cannot
 	// leave a half-applied command.
 	zscores []float64
+
+	// REV range scratch: emitted members alias run reads that die as
+	// the walk advances, so a reversed reply buffers copies here and
+	// replays them backward. zlexbuf builds a lex bound's successor
+	// member (member plus a low byte).
+	zrarena []byte
+	zrpairs []zbuildPair
+	zlexbuf []byte
 }
 
 // splitPairs fills mkeys and mvals from an even-length key-value
@@ -967,6 +975,24 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.zrankCmd(ctx, reply, args, cmd, s.z.ZRank)
 	case "ZREVRANK":
 		return s.zrankCmd(ctx, reply, args, cmd, s.z.ZRevRank)
+	case "ZRANGE":
+		return s.zrangeCmd(ctx, reply, args)
+	case "ZREVRANGE":
+		return s.zrevrangeCmd(ctx, reply, args)
+	case "ZRANGEBYSCORE":
+		return s.zrangebyscoreCmd(ctx, reply, args, cmd, false)
+	case "ZREVRANGEBYSCORE":
+		return s.zrangebyscoreCmd(ctx, reply, args, cmd, true)
+	case "ZRANGEBYLEX":
+		return s.zrangebylexCmd(ctx, reply, args, cmd, false)
+	case "ZREVRANGEBYLEX":
+		return s.zrangebylexCmd(ctx, reply, args, cmd, true)
+	case "ZCOUNT":
+		return s.zcountCmd(ctx, reply, args)
+	case "ZLEXCOUNT":
+		return s.zlexcountCmd(ctx, reply, args)
+	case "ZRANGESTORE":
+		return s.zrangestoreCmd(ctx, reply, args)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":

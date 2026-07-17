@@ -49,6 +49,10 @@ type ZSet struct {
 	zli    int
 	zpbuf  []byte
 	zkbuf2 [SubkeySize]byte
+
+	// Bulk build scratch, zstore.go: the STORE-family builder's arenas
+	// and fences, reused across commands.
+	zbld zBuilder
 }
 
 // NewZSet builds the zset layer over t.
