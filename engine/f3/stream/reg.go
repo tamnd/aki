@@ -214,6 +214,26 @@ func Len(cx *shard.Ctx) int {
 	return len(v.(*reg).m)
 }
 
+// RangeKeys calls fn with every stream key on this shard, the stream
+// contribution to the unified KEYS and SCAN walk. An emptied-but-kept stream is
+// a live key (XLEN reads 0), so it shows like any other. It reaches the registry
+// through regs.Load so a shard that ran no stream command builds nothing and
+// yields nothing. It returns false when fn asked to stop, halting the outer walk
+// for a bounded scan. The slice fn receives is the map key's bytes, valid only
+// for that call; fn copies what it keeps.
+func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return true
+	}
+	for k := range v.(*reg).m {
+		if !fn([]byte(k)) {
+			return false
+		}
+	}
+	return true
+}
+
 // undirty takes a stream off the gc worklist, swapping the tail into its slot
 // since the worklist order carries no meaning. It is used only by Delete, so a
 // stream removed from the registry never reaches the maintainer.
