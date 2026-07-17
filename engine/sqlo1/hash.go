@@ -151,6 +151,8 @@ func sniffRoot(v []byte) (tag uint8, planeless bool, err error) {
 		return TagString, false, nil
 	case sub == hashSubSeg:
 		return TagHash, false, nil
+	case sub == listSubNoded:
+		return TagList, false, nil
 	case sub == setSubSeg:
 		return TagSet, false, nil
 	case sub == zsetSubSeg:

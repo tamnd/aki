@@ -27,6 +27,7 @@ type Server struct {
 	h  *Hash
 	se *Set
 	z  *ZSet
+	l  *List
 
 	mu sync.Mutex // serializes command execution against the runtime
 
@@ -119,6 +120,7 @@ func NewServer(st Store) (*Server, error) {
 		return nil, err
 	}
 	srv.t, srv.s, srv.h, srv.se, srv.z = t, str, hash, set, zset
+	srv.l = NewList(t)
 	return srv, nil
 }
 
@@ -1095,6 +1097,8 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 				return AppendSimple(reply, "set")
 			case TagZset:
 				return AppendSimple(reply, "zset")
+			case TagList:
+				return AppendSimple(reply, "list")
 			}
 		}
 		return AppendSimple(reply, "string")
@@ -1135,6 +1139,15 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 					return AppendBulk(reply, []byte(enc))
 				case TagZset:
 					enc, ok, err := s.z.Encoding(ctx, args[2])
+					if err != nil {
+						return storeErr(reply, err)
+					}
+					if !ok {
+						return AppendNullBulk(reply)
+					}
+					return AppendBulk(reply, []byte(enc))
+				case TagList:
+					enc, ok, err := s.l.Encoding(ctx, args[2])
 					if err != nil {
 						return storeErr(reply, err)
 					}
