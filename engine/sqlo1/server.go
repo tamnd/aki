@@ -1113,6 +1113,8 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.lsetCmd(ctx, reply, args)
 	case "LRANGE":
 		return s.lrangeCmd(ctx, reply, args)
+	case "LTRIM":
+		return s.ltrimCmd(ctx, reply, args)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
