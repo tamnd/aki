@@ -64,6 +64,24 @@ func (w *RecordLogWriter) ReadStaged(idx int) (RecordRow, error) {
 	return ParseRecordBody(w.pending[fr.BodyOff : fr.BodyOff+uint64(fr.BodyLen)])
 }
 
+// Seal hands the accumulated batch off to an external committer instead of cutting
+// it here: it returns the framed payload and the per-record frame table and resets
+// the accumulator, so a shared group-commit writer can lay the segment down and
+// resolve the addresses on the caller's behalf. Ownership of the returned slices
+// transfers to the caller and the accumulator starts fresh, so a later Stage never
+// mutates bytes a committer still holds. An empty batch returns nil, nil, the same
+// no-op boundary Flush takes. This is the multi-shard path: Flush calls AppendGroup
+// directly, which only one writer may do at a time, so a store sharing one file with
+// other shards seals here and submits to the one writer that owns AppendGroup.
+func (w *RecordLogWriter) Seal() ([]byte, []RecordFrame) {
+	if len(w.frames) == 0 {
+		return nil, nil
+	}
+	payload, frames := w.pending, w.frames
+	w.pending, w.frames = nil, nil
+	return payload, frames
+}
+
 // Flush cuts one `log` segment for the whole staged batch, resolves each staged
 // record to its absolute frame address, resets the accumulator, and returns the
 // addresses in stage order. An empty batch writes no segment and returns nil, so
