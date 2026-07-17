@@ -50,6 +50,37 @@ func TestReconcileRef(t *testing.T) {
 	}
 }
 
+func TestRollbackRef(t *testing.T) {
+	r := &hashSegRoot{
+		sub:       zsetSubSeg,
+		rootgen:   1,
+		rooth:     0xfeedbeefcafe,
+		count:     7,
+		nextSegid: 3,
+		fence:     []hashFenceEnt{{lo: 0, segid: 1, meta: hashSegMeta(7, 0)}},
+		tail:      appendZTail(nil, []zFenceEnt{{lo: 0, segid: 2, count: 7}}),
+	}
+	root := appendHashSegRoot(nil, r)
+	rooth, ok := RollbackRef(root)
+	if !ok || rooth != 0xfeedbeefcafe {
+		t.Fatalf("RollbackRef(segmented zset) = %x, %v", rooth, ok)
+	}
+	if _, ok := ReconcileRef(root); ok {
+		t.Fatal("a zset root claimed both replay refs")
+	}
+	hash := reconTestRoot(t, 7, 0)
+	if _, ok := RollbackRef(hash); ok {
+		t.Fatal("RollbackRef accepted a segmented hash root")
+	}
+	inline := appendHashInlineHdr(nil, zsetSubInline, 1, 0, false)
+	if _, ok := RollbackRef(inline); ok {
+		t.Fatal("RollbackRef accepted an inline zset root")
+	}
+	if _, ok := RollbackRef(root[:hashSegRootHdrLen-1]); ok {
+		t.Fatal("RollbackRef accepted a short payload")
+	}
+}
+
 func TestSegCounts(t *testing.T) {
 	n, minExp, ok := SegCounts(reconTestSeg(37, 5000))
 	if !ok || n != 37 || minExp != 5000 {
