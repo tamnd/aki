@@ -2,6 +2,7 @@ package akifile
 
 import (
 	"fmt"
+	"io"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -159,6 +160,136 @@ func TestGroupWriterPublishesAfterDurable(t *testing.T) {
 	}
 	if string(row.Key) != "durable" {
 		t.Fatalf("durable record key %q, want durable", row.Key)
+	}
+}
+
+// gateDevice is an in-memory device whose Sync blocks until the test releases it,
+// so a test can hold the writer inside a group's fsync while it queues more records
+// behind it. It counts fsyncs and announces each one on entered before blocking on
+// release, which lets a test drive the exact interleaving the coalescing claim needs.
+type gateDevice struct {
+	buf     []byte
+	syncs   int32
+	armed   atomic.Bool
+	entered chan int32
+	release chan struct{}
+}
+
+func (d *gateDevice) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 || off >= int64(len(d.buf)) {
+		return 0, io.EOF
+	}
+	n := copy(p, d.buf[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (d *gateDevice) WriteAt(p []byte, off int64) (int, error) {
+	if end := off + int64(len(p)); end > int64(len(d.buf)) {
+		grown := make([]byte, end)
+		copy(grown, d.buf)
+		d.buf = grown
+	}
+	copy(d.buf[off:], p)
+	return len(p), nil
+}
+
+// Sync gates only once armed, so the fsyncs CreateOnDevice issues while setting up
+// the file pass straight through (the test arms the gate after creation). Once
+// armed, each fsync announces its number on entered and blocks on release, and the
+// count reflects only the armed fsyncs, so the first gated group is fsync 1.
+func (d *gateDevice) Sync() error {
+	if !d.armed.Load() {
+		return nil
+	}
+	n := atomic.AddInt32(&d.syncs, 1)
+	d.entered <- n
+	<-d.release
+	return nil
+}
+
+func (d *gateDevice) Truncate(size int64) error {
+	grown := make([]byte, size)
+	copy(grown, d.buf)
+	d.buf = grown
+	return nil
+}
+
+func (d *gateDevice) Size() (int64, error) { return int64(len(d.buf)), nil }
+func (d *gateDevice) Close() error         { return nil }
+
+// TestGroupWriterFsyncIsTheWindow is the engine proof behind the design decision to
+// ship no explicit group timer: the fsync itself is the coalescing window. It holds
+// the writer inside the first group's fsync, submits three more records behind it,
+// and asserts all three ride the single next group, so four records cost two fsyncs
+// rather than four. Each completion records the fsync count it observed, which pins
+// the grouping deterministically with no wall-clock: the first record rode fsync 1,
+// the three queued behind it all rode fsync 2. If a later change split the queued
+// records across groups this test fails, which is the guard the no-timer decision
+// leans on.
+func TestGroupWriterFsyncIsTheWindow(t *testing.T) {
+	dev := &gateDevice{entered: make(chan int32), release: make(chan struct{})}
+	f, err := CreateOnDevice(dev, CreateOptions{ShardCount: 1, Sync: SyncAlways})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	gw := NewGroupWriter(f, 1, 16)
+	dev.armed.Store(true) // creation fsyncs are done; gate every fsync from here
+
+	type obs struct {
+		key    string
+		atSync int32
+	}
+	seen := make(chan obs, 4)
+	submit := func(seq uint64, key string) {
+		payload, frames := oneRecord(sampleRow(key, seq))
+		k := key
+		if !gw.Submit(0, seq, payload, frames, func(_ []uint64, err error) {
+			if err != nil {
+				t.Errorf("completion %s: %v", k, err)
+			}
+			seen <- obs{k, atomic.LoadInt32(&dev.syncs)}
+		}) {
+			t.Errorf("submit %s rejected", k)
+		}
+	}
+
+	// First record: the writer drains it, enters fsync 1, and blocks there.
+	submit(1, "first")
+	if n := <-dev.entered; n != 1 {
+		t.Fatalf("first fsync numbered %d, want 1", n)
+	}
+	// While the writer is stuck in fsync 1, queue three more. They cannot be cut
+	// until the writer returns from the fsync and drains again.
+	submit(2, "a")
+	submit(3, "b")
+	submit(4, "c")
+	// Let fsync 1 finish: the first record's completion fires at sync count 1.
+	dev.release <- struct{}{}
+	// The writer now drains all three queued records in one pass and enters fsync 2.
+	if n := <-dev.entered; n != 2 {
+		t.Fatalf("second fsync numbered %d, want 2", n)
+	}
+	dev.release <- struct{}{}
+	gw.Stop()
+
+	got := make(map[string]int32, 4)
+	for i := 0; i < 4; i++ {
+		o := <-seen
+		got[o.key] = o.atSync
+	}
+	if got["first"] != 1 {
+		t.Fatalf("first rode fsync %d, want 1", got["first"])
+	}
+	for _, k := range []string{"a", "b", "c"} {
+		if got[k] != 2 {
+			t.Fatalf("%s rode fsync %d, want 2 (the one group the queued records coalesced into)", k, got[k])
+		}
+	}
+	if total := atomic.LoadInt32(&dev.syncs); total != 2 {
+		t.Fatalf("four records cost %d fsyncs, want 2", total)
 	}
 }
 
