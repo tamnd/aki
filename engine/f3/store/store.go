@@ -3,6 +3,8 @@ package store
 import (
 	"errors"
 	"runtime"
+
+	"github.com/tamnd/aki/engine/f3/akifile"
 )
 
 // ErrFull is returned by Set when no arena segment has room for a new record.
@@ -31,6 +33,15 @@ type Store struct {
 	// bytes spill to the log.
 	vlog        *vlog
 	residentCap uint64
+
+	// akivlog re-homes the spill path onto the shared .aki value region
+	// (akivlog.go): nil unless Options carries an akifile handle. It is the
+	// re-home's opt-in target, constructed at Open but not yet wired into any
+	// read or write path, so a store built with it behaves exactly like the
+	// scratch-log store until a later slice flips the spill onto it. The File it
+	// wraps is borrowed from the shard runtime (one .aki across shards), so Close
+	// never closes it.
+	akivlog *akiVlog
 
 	// The cold tier (doc 06 sections 2 and 7, cold.go): nil without a cold
 	// region. cold is the per-shard append log of whole-record cold frames the
@@ -152,6 +163,15 @@ type Options struct {
 	// truncating any prior file). Without it the migrator has nowhere to
 	// demote and DemoteCold is a no-op.
 	ColdPath string
+
+	// AkiValueLog, when set, backs the store's value log with this shared .aki
+	// file's value region instead of a scratch file. The store borrows the
+	// handle (the shard runtime owns and closes it) and stages spills for Shard.
+	// Opt-in: without it the store keeps the scratch VlogPath path. It is the
+	// re-home's construction seam, inert until a later slice routes the spill
+	// through it.
+	AkiValueLog *akifile.File
+	Shard       uint16
 }
 
 // New builds a store whose arena holds arenaBytes, tiled into segments of
@@ -206,6 +226,12 @@ func Open(o Options) (*Store, error) {
 		s.cold = c
 		s.door = newColdDoor(coldDoorBits)
 		s.reserveColdNull()
+	}
+	if o.AkiValueLog != nil {
+		// Borrowed handle: the shard runtime owns the .aki and its lifetime, so
+		// this only builds the per-shard accumulator over it. Inert until the
+		// spill path is flipped onto it.
+		s.akivlog = newAkiVlog(o.AkiValueLog, o.Shard)
 	}
 	return s, nil
 }
