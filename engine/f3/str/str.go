@@ -261,6 +261,24 @@ func Del(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Int(0)
 }
 
+// Getdel answers GETDEL key: return the value and delete the key in one step,
+// or nil when the key is absent (or expired, which a read reaps). The read
+// copies the value into the reply buffer before the delete frees the record, so
+// the returned bytes outlive the record they came from, the same copy-then-write
+// order SET GET relies on. It mirrors GET's keyspace reach: a value another type
+// owns is not in the string keyspace, so it reads as absent here just as GET
+// does, not as WRONGTYPE.
+func Getdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	val, ok := cx.St.GetString(args[0], cx.NowMs, cx.Val)
+	if !ok {
+		r.Null()
+		return
+	}
+	cx.Val = val
+	cx.St.Del(args[0], cx.NowMs)
+	r.Bulk(val)
+}
+
 // Type answers TYPE key. Only string records exist in this slice, so the
 // answer is "string" or "none".
 func Type(cx *shard.Ctx, args [][]byte, r shard.Reply) {
