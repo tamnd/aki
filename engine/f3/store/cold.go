@@ -52,7 +52,7 @@ func (s *Store) reserveColdNull() {
 // pread only when it needs the bytes.
 func (s *Store) coldHeader(off uint64) (total, klen int, flags byte, vlen uint32, err error) {
 	var h [coldHdr]byte
-	if _, err = s.cold.readInto(off, coldHdr, h[:]); err != nil {
+	if _, err = s.coldReadInto(off, coldHdr, h[:]); err != nil {
 		return 0, 0, 0, 0, err
 	}
 	total = int(binary.LittleEndian.Uint32(h[0:]))
@@ -70,7 +70,7 @@ func (s *Store) coldHeader(off uint64) (total, klen int, flags byte, vlen uint32
 // store cannot reach.
 func (s *Store) coldKeyMatches(off uint64, key []byte) bool {
 	n := coldHdr + len(key)
-	buf, err := s.cold.readInto(off, n, s.coldBuf)
+	buf, err := s.coldReadInto(off, n, s.coldBuf)
 	s.coldBuf = buf[:cap(buf)][:0]
 	if err != nil {
 		return false
@@ -92,7 +92,7 @@ func (s *Store) coldKeyAt(off uint64) ([]byte, bool) {
 	if err != nil {
 		return nil, false
 	}
-	buf, err := s.cold.readInto(off+coldHdr, klen, s.coldBuf)
+	buf, err := s.coldReadInto(off+coldHdr, klen, s.coldBuf)
 	s.coldBuf = buf[:cap(buf)][:0]
 	if err != nil {
 		return nil, false
@@ -122,7 +122,7 @@ func (s *Store) coldValue(off uint64) ([]byte, bool) {
 	}
 	vstart := off + coldHdr + uint64(klen)
 	vlenBytes := total - coldHdr - klen
-	buf, err := s.cold.readInto(vstart, vlenBytes, s.coldBuf)
+	buf, err := s.coldReadInto(vstart, vlenBytes, s.coldBuf)
 	s.coldBuf = buf[:cap(buf)][:0]
 	if err != nil {
 		return nil, false
@@ -169,7 +169,7 @@ func (s *Store) demotable(addr uint64) bool {
 func (s *Store) demoteAt(slot *uint64, w uint64) bool {
 	addr := w & addrMask
 	s.frameBuf = s.frameRecord(addr, s.frameBuf[:0])
-	off, err := s.cold.append(s.frameBuf)
+	off, err := s.coldAppend(s.frameBuf)
 	if err != nil {
 		return false
 	}
@@ -197,7 +197,7 @@ func (s *Store) bringUp(h uint64, slot *uint64, off uint64) uint64 {
 	if err != nil {
 		return off
 	}
-	frame, err := s.cold.readInto(off, total, s.coldBuf)
+	frame, err := s.coldReadInto(off, total, s.coldBuf)
 	s.coldBuf = frame[:cap(frame)][:0]
 	if err != nil {
 		return off
@@ -273,7 +273,7 @@ func (s *Store) dropColdEntry() {
 // segment visited once through the seen marks, buckets then overflow. A cold
 // region that is nil or broken demotes nothing.
 func (s *Store) DemoteCold() int {
-	if s.cold == nil || s.cold.werr != nil {
+	if !s.hasCold() || s.coldBroken() {
 		return 0
 	}
 	if cap(s.seen) < len(s.idx.segs) {
@@ -324,7 +324,7 @@ func (s *Store) demoteBucketCold(b *bucket) int {
 // returns false when the key is absent, already cold, or not demotable, or when
 // the cold append fails.
 func (s *Store) DemoteKey(key []byte) bool {
-	if s.cold == nil {
+	if !s.hasCold() {
 		return false
 	}
 	h := Hash(key)
@@ -347,8 +347,8 @@ type ColdStats struct {
 // Cold reports the cold tier counters. A store with no cold region reports
 // zero.
 func (s *Store) Cold() ColdStats {
-	if s.cold == nil {
+	if !s.hasCold() {
 		return ColdStats{}
 	}
-	return ColdStats{Records: s.coldRecs, RegionSize: s.cold.tail}
+	return ColdStats{Records: s.coldRecs, RegionSize: s.coldRegionSize()}
 }
