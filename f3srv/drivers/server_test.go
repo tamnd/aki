@@ -199,6 +199,47 @@ func TestSelect(t *testing.T) {
 	expect(t, br, "-ERR value is not an integer or out of range\r\n")
 }
 
+// TestLolwut checks LOLWUT answers a non-empty bulk both bare and with the
+// optional VERSION tail, which it accepts and ignores rather than erroring.
+func TestLolwut(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	if _, err := nc.Write([]byte("*1\r\n$6\r\nLOLWUT\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if got := readBulk(t, br); len(got) == 0 {
+		t.Fatalf("LOLWUT bulk = %q, want non-empty", got)
+	}
+
+	if _, err := nc.Write([]byte("*3\r\n$6\r\nLOLWUT\r\n$7\r\nVERSION\r\n$1\r\n5\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if got := readBulk(t, br); len(got) == 0 {
+		t.Fatalf("LOLWUT VERSION 5 bulk = %q, want non-empty", got)
+	}
+}
+
+// readBulk reads a single RESP bulk string reply and returns its payload.
+func readBulk(t *testing.T, br *bufio.Reader) string {
+	t.Helper()
+	hdr, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read bulk header: %v", err)
+	}
+	if len(hdr) == 0 || hdr[0] != '$' {
+		t.Fatalf("bulk header = %q", hdr)
+	}
+	blen, err := strconv.Atoi(strings.TrimSuffix(hdr[1:], "\r\n"))
+	if err != nil {
+		t.Fatalf("bulk length %q: %v", hdr, err)
+	}
+	buf := make([]byte, blen+2) // payload plus CRLF
+	if _, err := io.ReadFull(br, buf); err != nil {
+		t.Fatalf("read bulk payload: %v", err)
+	}
+	return string(buf[:blen])
+}
+
 // TestSmokePipeline sends one write with several commands and expects the
 // replies back in request order.
 func TestSmokePipeline(t *testing.T) {

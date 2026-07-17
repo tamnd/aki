@@ -127,6 +127,7 @@ func init() {
 	register("ECHO", echo, 1, 1, false)
 	register("TIME", timeCmd, 0, 0, false)
 	register("SELECT", selectDB, 1, 1, false)
+	register("LOLWUT", lolwut, 0, -1, false)
 
 	// The string point surface. SET's tail is option soup, so the handler
 	// validates it.
@@ -954,4 +955,13 @@ func timeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	out = resp.AppendBulk(out, strconv.AppendInt(scratch[:0], cx.NowMs%1000*1000, 10))
 	cx.Aux = out
 	r.Raw(out)
+}
+
+// lolwut answers LOLWUT: in Redis a piece of version art, a cosmetic bulk with
+// no contract beyond being human readable. f3 draws no art and returns a one
+// line greeting naming the server. Any arguments (the optional VERSION token and
+// its number, or anything else) are accepted and ignored, matching Redis, which
+// never errors on LOLWUT's tail.
+func lolwut(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	r.Bulk([]byte("aki\n"))
 }
