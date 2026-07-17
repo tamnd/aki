@@ -279,6 +279,31 @@ func Getdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Bulk(val)
 }
 
+// Getset answers GETSET key value: write value and return the old value, or nil
+// when the key had none. Like a plain SET it drops any existing TTL. It reads the
+// old value into the reply buffer before the write overwrites the record, the
+// same copy-then-write order SET GET uses, so the returned bytes are a copy that
+// survives the overwrite. Superseded by SET ... GET but still part of the
+// surface.
+func Getset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	old, had := cx.St.GetString(args[0], cx.NowMs, cx.Val)
+	if had {
+		cx.Val = old
+	}
+	if err := cx.St.SetString(args[0], args[1], cx.NowMs, 0, false); err != nil {
+		if cx.ParkFull(err) {
+			return
+		}
+		r.Err(storeErr(err))
+		return
+	}
+	if had {
+		r.Bulk(old)
+		return
+	}
+	r.Null()
+}
+
 // Type answers TYPE key. Only string records exist in this slice, so the
 // answer is "string" or "none".
 func Type(cx *shard.Ctx, args [][]byte, r shard.Reply) {
