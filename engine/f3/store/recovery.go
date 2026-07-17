@@ -49,28 +49,84 @@ func (s *Store) ReplayRecords(now int64) error {
 
 	var vbuf []byte
 	return s.akirlog.walkShard(func(addr uint64, row akifile.RecordRow) error {
-		switch {
-		case row.Flags&akifile.RecFlagTombstone != 0:
+		if row.Flags&akifile.RecFlagTombstone != 0 {
 			s.Del(row.Key, now)
 			return nil
-		case row.Flags&akifile.RecFlagChunked != 0:
-			return fmt.Errorf("store: replay of chunked record at %#x is not supported yet", addr)
-		case row.Flags&akifile.RecFlagInline != 0:
-			return s.SetString(row.Key, row.Value, now, int64(row.ExpireAt), false)
-		default:
-			// Separated: the durable bytes are the log-resident run its word names.
-			// An arena-resident word points at bytes a restart already dropped, so
-			// it cannot be reapplied and stops the replay rather than reinserting a
-			// stale or empty value.
-			if row.ValueWord&inLogBit == 0 {
-				return fmt.Errorf("store: replay of arena-resident record at %#x has no durable value", addr)
-			}
-			v, err := s.logReadInto(row.ValueWord&runAddrMask, int(row.ValueLen), vbuf)
-			if err != nil {
-				return err
-			}
-			vbuf = v
-			return s.SetString(row.Key, v, now, int64(row.ExpireAt), false)
 		}
+		var err error
+		vbuf, err = s.applyValueRow(addr, row, now, vbuf)
+		return err
 	})
+}
+
+// ReplayFromCheckpoint rebuilds this store's index from a full index checkpoint
+// (BuildIndexCheckpoint) rather than a log walk: it derefs each entry's record
+// address, decodes the frame, and reapplies the value, so a restart pays a read
+// per live key instead of a scan of every record ever logged. It is the fast path
+// a bounded recovery takes, and the caller replays only the tail past the
+// checkpoint's log position afterward.
+//
+// A checkpoint carries no tombstones, the producer folded every delete out, so a
+// tombstone-flagged frame under a checkpoint address is a corrupt or mismatched
+// dump and stops the load. now stamps the reapplied writes' lazy-expiry checks,
+// the same as the walk path. On a store with no record log it is a no-op.
+func (s *Store) ReplayFromCheckpoint(payload []byte, now int64) error {
+	if s.akirlog == nil {
+		return nil
+	}
+	hdr, err := akifile.ParseCkptHeader(payload)
+	if err != nil {
+		return err
+	}
+	entries, err := akifile.CkptEntries(payload, hdr)
+	if err != nil {
+		return err
+	}
+	s.replaying = true
+	defer func() { s.replaying = false }()
+
+	var vbuf []byte
+	for _, e := range entries {
+		row, err := s.akirlog.readAt(e.RecordAddr)
+		if err != nil {
+			return err
+		}
+		if row.Flags&akifile.RecFlagTombstone != 0 {
+			return fmt.Errorf("store: checkpoint entry at %#x points at a tombstone", e.RecordAddr)
+		}
+		if vbuf, err = s.applyValueRow(e.RecordAddr, row, now, vbuf); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyValueRow reinserts one value record during recovery, shared by the log walk
+// and the checkpoint load. An inline row's value bytes ride the frame, so it
+// reinserts them directly; a separated row's bytes live in the durable value log,
+// so it derefs the word and reads them back through the value seam, reusing vbuf.
+// It routes through SetString so the rebuilt record matches a live commit's band
+// selection, dead-byte accounting, and expiry layout. It returns vbuf, grown when
+// a separated read needed more room.
+//
+// A chunked row, or a separated row whose word never reached the value log, is
+// deferred and fails closed: a multi-chunk value needs the chunk-directory walk a
+// later slice adds, and an arena-resident run did not survive the restart to be
+// read back. addr names the frame in the error so a bad record is locatable.
+func (s *Store) applyValueRow(addr uint64, row akifile.RecordRow, now int64, vbuf []byte) ([]byte, error) {
+	switch {
+	case row.Flags&akifile.RecFlagChunked != 0:
+		return vbuf, fmt.Errorf("store: replay of chunked record at %#x is not supported yet", addr)
+	case row.Flags&akifile.RecFlagInline != 0:
+		return vbuf, s.SetString(row.Key, row.Value, now, int64(row.ExpireAt), false)
+	default:
+		if row.ValueWord&inLogBit == 0 {
+			return vbuf, fmt.Errorf("store: replay of arena-resident record at %#x has no durable value", addr)
+		}
+		v, err := s.logReadInto(row.ValueWord&runAddrMask, int(row.ValueLen), vbuf)
+		if err != nil {
+			return vbuf, err
+		}
+		return v, s.SetString(row.Key, v, now, int64(row.ExpireAt), false)
+	}
 }
