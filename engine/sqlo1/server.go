@@ -1078,6 +1078,26 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.georadiusCmd(ctx, reply, args, cmd, true, true)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
+	case "LPUSH":
+		return s.lpushCmd(ctx, reply, args, cmd, true, false)
+	case "RPUSH":
+		return s.lpushCmd(ctx, reply, args, cmd, false, false)
+	case "LPUSHX":
+		return s.lpushCmd(ctx, reply, args, cmd, true, true)
+	case "RPUSHX":
+		return s.lpushCmd(ctx, reply, args, cmd, false, true)
+	case "LPOP":
+		return s.lpopCmd(ctx, reply, args, cmd, true)
+	case "RPOP":
+		return s.lpopCmd(ctx, reply, args, cmd, false)
+	case "LMPOP":
+		return s.lmpopCmd(ctx, reply, args)
+	case "BLPOP":
+		return s.blpopCmd(ctx, reply, args, cmd, true)
+	case "BRPOP":
+		return s.blpopCmd(ctx, reply, args, cmd, false)
+	case "BLMPOP":
+		return s.blmpopCmd(ctx, reply, args)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
