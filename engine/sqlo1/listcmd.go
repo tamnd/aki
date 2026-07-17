@@ -123,6 +123,66 @@ func (s *Server) blpopCmd(ctx context.Context, reply []byte, args [][]byte, cmd 
 	})
 }
 
+// lindexCmd is LINDEX key index: the element or the nil bulk for a
+// missing key or an out-of-range index.
+func (s *Server) lindexCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) != 3 {
+		return arityErr(reply, "LINDEX")
+	}
+	idx, ok := parseCanonicalInt(args[2])
+	if !ok {
+		return AppendError(reply, "ERR value is not an integer or out of range")
+	}
+	e, found, err := s.l.Index(ctx, args[1], idx)
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	if !found {
+		return AppendNullBulk(reply)
+	}
+	return AppendBulk(reply, e)
+}
+
+// lsetCmd is LSET key index element: OK, or the layer's no-such-key
+// and index-range errors through storeErr's ERR prefix.
+func (s *Server) lsetCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) != 4 {
+		return arityErr(reply, "LSET")
+	}
+	idx, ok := parseCanonicalInt(args[2])
+	if !ok {
+		return AppendError(reply, "ERR value is not an integer or out of range")
+	}
+	if err := s.l.Set(ctx, args[1], idx, args[3]); err != nil {
+		return storeErr(reply, err)
+	}
+	return AppendSimple(reply, "OK")
+}
+
+// lrangeCmd is LRANGE key start stop, streamed: the exact-count begin
+// puts the array header down and the emits follow node by node. An
+// error after the header truncates back to the mark, HGETALL's rule.
+func (s *Server) lrangeCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) != 4 {
+		return arityErr(reply, "LRANGE")
+	}
+	start, ok1 := parseCanonicalInt(args[2])
+	stop, ok2 := parseCanonicalInt(args[3])
+	if !ok1 || !ok2 {
+		return AppendError(reply, "ERR value is not an integer or out of range")
+	}
+	mark := len(reply)
+	err := s.l.Range(ctx, args[1], start, stop, func(n int) {
+		reply = AppendArray(reply, n)
+	}, func(e []byte) {
+		reply = AppendBulk(reply, e)
+	})
+	if err != nil {
+		return storeErr(reply[:mark], err)
+	}
+	return reply
+}
+
 // blmpopCmd is BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT
 // count]: LMPOP's reply behind the blocking loop.
 func (s *Server) blmpopCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
