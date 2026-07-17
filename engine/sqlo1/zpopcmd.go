@@ -52,10 +52,12 @@ func (s *Server) zpopCmd(ctx context.Context, reply []byte, args [][]byte, cmd s
 	return reply
 }
 
-// parseZMPopTail parses the shared ZMPOP and BZMPOP tail starting at
-// numkeys: numkeys, the keys, MIN or MAX, and an optional COUNT. A
-// non-empty errMsg is the wire error, Redis's doors in Redis's order.
-func parseZMPopTail(args [][]byte) (keys [][]byte, maxSide bool, count int64, errMsg string) {
+// parseMPopTail parses the tail every MPOP form shares, starting at
+// numkeys: numkeys, the keys, a direction token, and an optional
+// COUNT. ZMPOP passes MIN and MAX, LMPOP passes LEFT and RIGHT, and hi
+// reports the second token. A non-empty errMsg is the wire error,
+// Redis's doors in Redis's order.
+func parseMPopTail(args [][]byte, loTok, hiTok string) (keys [][]byte, hi bool, count int64, errMsg string) {
 	nk, ok := parseCanonicalInt(args[0])
 	if !ok || nk <= 0 {
 		return nil, false, 0, "ERR numkeys should be greater than 0"
@@ -65,9 +67,9 @@ func parseZMPopTail(args [][]byte) (keys [][]byte, maxSide bool, count int64, er
 	}
 	keys = args[1 : 1+nk]
 	switch strings.ToUpper(string(args[1+nk])) {
-	case "MIN":
-	case "MAX":
-		maxSide = true
+	case loTok:
+	case hiTok:
+		hi = true
 	default:
 		return nil, false, 0, "ERR syntax error"
 	}
@@ -84,7 +86,7 @@ func parseZMPopTail(args [][]byte) (keys [][]byte, maxSide bool, count int64, er
 	default:
 		return nil, false, 0, "ERR syntax error"
 	}
-	return keys, maxSide, count, ""
+	return keys, hi, count, ""
 }
 
 // zmpopServe tries one ZMPOP-shaped pop on key: served is false on an
@@ -120,7 +122,7 @@ func (s *Server) zmpopCmd(ctx context.Context, reply []byte, args [][]byte) []by
 	if len(args) < 4 {
 		return arityErr(reply, "ZMPOP")
 	}
-	keys, maxSide, count, errMsg := parseZMPopTail(args[1:])
+	keys, maxSide, count, errMsg := parseMPopTail(args[1:], "MIN", "MAX")
 	if errMsg != "" {
 		return AppendError(reply, errMsg)
 	}
@@ -266,7 +268,7 @@ func (s *Server) bzmpopCmd(ctx context.Context, reply []byte, args [][]byte) []b
 	if errMsg != "" {
 		return AppendError(reply, errMsg)
 	}
-	keys, maxSide, count, errMsg := parseZMPopTail(args[2:])
+	keys, maxSide, count, errMsg := parseMPopTail(args[2:], "MIN", "MAX")
 	if errMsg != "" {
 		return AppendError(reply, errMsg)
 	}
