@@ -33,6 +33,12 @@ type WriteLog struct {
 	mapKey func(key []byte) (slot uint16, group uint16)
 	groups []wlGroup
 
+	// onKeyDel, when set, hears every successful keydel emission on the
+	// owner goroutine, right after the frame's seq is drawn: the folder's
+	// tombstone feed (SetKeyDelFeed). The key is borrowed; the callee
+	// copies what it keeps.
+	onKeyDel func(key []byte)
+
 	// The doc 04 section 10 error taxonomy, atomics because INFO reads
 	// them off-owner. They only move on error paths, so the hot gate
 	// stays free of shared writes.
@@ -93,6 +99,12 @@ type WriteLogConfig struct {
 	// doc 06 fold-accounting seam passed through to the committer.
 	OnCommitted func(walSeq uint64, pos ChainPos)
 
+	// OnVerdict, when set, hears every commit verdict before the watermarks
+	// apply it: the manifest publisher's coverage feed
+	// (ManifestPublisher.OnVerdict), which must observe the covering
+	// position before ApplyVerdict can release a fold's publish gate.
+	OnVerdict func(CommitVerdict) error
+
 	// Gate, when set, is the node's lease gate: the committer's append hook
 	// renews the groups each landed batch carried, so a serving gate's
 	// deadlines extend exactly when the doc 02 section 3.5 progress rule
@@ -117,7 +129,16 @@ func NewWriteLog(cfg WriteLogConfig) (*WriteLog, error) {
 		return nil, fmt.Errorf("obs1: write log needs a key mapper")
 	}
 	marks := NewWatermarks()
-	cfg.Fold.OnCommit = marks.ApplyVerdict
+	if onVerdict := cfg.OnVerdict; onVerdict != nil {
+		cfg.Fold.OnCommit = func(v CommitVerdict) error {
+			if err := onVerdict(v); err != nil {
+				return err
+			}
+			return marks.ApplyVerdict(v)
+		}
+	} else {
+		cfg.Fold.OnCommit = marks.ApplyVerdict
+	}
 	ccfg := CommitterConfig{
 		Chain:       cfg.Chain,
 		Node:        cfg.Node,
@@ -208,8 +229,18 @@ func (l *WriteLog) KeyDel(key []byte) (uint16, uint64, error) {
 	}
 	seq := g.next
 	g.next++
+	if l.onKeyDel != nil {
+		// Fed after the seq draw so a mark the folder takes now covers
+		// this delete (Folder.Delete's contract, doc 06 section 1.3).
+		l.onKeyDel(key)
+	}
 	return group, seq, nil
 }
+
+// SetKeyDelFeed registers fn to hear every successful keydel emission,
+// normally Folder.Delete. Fixed after construction and before any owner
+// serves writes, the SetGroup publication rule.
+func (l *WriteLog) SetKeyDelFeed(fn func(key []byte)) { l.onKeyDel = fn }
 
 // keyedOp pairs an op with the key and slot it applies to, for a run
 // whose frames span two keys in one group (SMOVE's co-located form).
