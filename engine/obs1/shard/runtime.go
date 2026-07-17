@@ -102,6 +102,28 @@ func (r *Runtime) SetFoldTap(fn func(frames []byte)) {
 	}
 }
 
+// SetFoldProgress registers fn as the resident stall window's fold-cursor
+// signal (doc 04 section 6): a parked write's window resets while the value
+// advances, because a moving fold cursor means eviction is being handed the
+// floor it needs. Fixed before Start under the same rule as SetWriteLog; fn
+// is called off the folder's own synchronization, so it must be safe from
+// every owner goroutine.
+func (r *Runtime) SetFoldProgress(fn func() uint64) {
+	for _, w := range r.workers {
+		w.foldProg = fn
+	}
+}
+
+// SetFoldKick registers fn as the fold pressure trigger (doc 06 section
+// 1.4): while resident-parked writes wait, each shard calls it, paced, so
+// the folder cuts what it holds now instead of waiting for size or age.
+// Fixed before Start; fn synchronizes internally like the fold tap.
+func (r *Runtime) SetFoldKick(fn func()) {
+	for _, w := range r.workers {
+		w.foldKick = fn
+	}
+}
+
 // ConnOpened records that a driver has begun serving a connection, and
 // ConnClosed pairs with it when the connection is torn down. They maintain the
 // live count that drives the connSpinHighWater park-immediately switch; every
@@ -147,6 +169,15 @@ type Config struct {
 	// stores are memory-only and ResidentCapBytes is ignored.
 	VlogDir string
 
+	// ColdDir, when set, gives every shard a cold region under this
+	// directory and engages the staged-drain migrator once the resident
+	// charge crosses ResidentCapBytes: whole records move cold and every
+	// staged buffer feeds the fold tap. Without it drains never run, so a
+	// diskless node folds only what the delete feed hands it until the
+	// eviction-inversion slice stages against the bucket directly
+	// (doc 05, recorded gap).
+	ColdDir string
+
 	// ResidentCapBytes is each shard's resident byte budget; past it a
 	// separated or chunked value's bytes spill to the shard's log. 0 means
 	// uncapped.
@@ -188,6 +219,10 @@ func Open(cfg Config) (*Runtime, error) {
 		o := store.Options{ArenaBytes: cfg.ArenaBytes, SegBytes: cfg.SegBytes}
 		if cfg.VlogDir != "" {
 			o.VlogPath = filepath.Join(cfg.VlogDir, fmt.Sprintf("shard-%03d.vlog", i))
+			o.ResidentCapBytes = cfg.ResidentCapBytes
+		}
+		if cfg.ColdDir != "" {
+			o.ColdPath = filepath.Join(cfg.ColdDir, fmt.Sprintf("shard-%03d.cold", i))
 			o.ResidentCapBytes = cfg.ResidentCapBytes
 		}
 		st, err := store.Open(o)

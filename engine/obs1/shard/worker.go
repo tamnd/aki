@@ -129,6 +129,13 @@ type worker struct {
 	// is possible. bpWaits and bpStalls are the cumulative park and stall-out
 	// counts INFO surfaces in slice 5b; bpReasonWaits and bpReasonStalls split
 	// both by the doc 04 section 6 park reason (park.go).
+	// foldProg and foldKick are the obs1 fold seams (Runtime.SetFoldProgress,
+	// SetFoldKick), both nil on a runtime without a folder: foldProg reads the
+	// group fold cursor's advance (doc 04 section 6, the resident reason's
+	// progress signal once only folded records are evictable) and bpFoldSeen
+	// snapshots it between passes; foldKick is the doc 06 section 1.4 pressure
+	// trigger, paced by bpKickMs so boundary-speed retry passes cannot spin
+	// the folder's lock.
 	fullWaiters    []fullWaiter
 	bpProg         uint64
 	bpStall        int
@@ -136,6 +143,10 @@ type worker struct {
 	bpStalls       uint64
 	bpReasonWaits  [numParkReasons]uint64
 	bpReasonStalls [numParkReasons]uint64
+	foldProg       func() uint64
+	foldKick       func()
+	bpFoldSeen     uint64
+	bpKickMs       int64
 
 	// The flushlag half of the stall accounting (backpressure.go). writeOps
 	// is the op-indexed write bits UseWriteOps installed, nil on a runtime

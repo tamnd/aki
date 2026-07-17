@@ -461,3 +461,42 @@ func TestFolderRealDrainRoundTrip(t *testing.T) {
 		t.Fatalf("fold errors: %+v", st)
 	}
 }
+
+// TestFoldAgeCadence pins the doc 06 section 1.4 age trigger: bytes far
+// below the segment target cut on the folder's own cadence, no explicit
+// Flush, and publish once the watermark covers them.
+func TestFoldAgeCadence(t *testing.T) {
+	fx := &foldFixture{sim: sim.New(sim.Config{Seed: 1}), marks: obs1.NewWatermarks()}
+	f, err := obs1.NewFolder(obs1.FoldConfig{
+		Store:  fx.sim,
+		Prefix: "db/t",
+		Node:   0xA1,
+		MapKey: func(key []byte) (uint16, uint16) { return 9, 3 },
+		Mark:   func(group uint16) (uint32, uint64) { return 7, fx.last },
+		Marks:  fx.marks,
+
+		FoldAge: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.folder = f
+	t.Cleanup(f.Close)
+
+	fx.last = 5
+	if err := fx.marks.ApplyVerdict(obs1.CommitVerdict{
+		Commit: obs1.CommitRecord{Sections: []obs1.CommitSection{{Group: 3, Epoch: 7, FirstSeq: 1, LastSeq: 5}}},
+		Live:   []bool{true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.Add(frames("aged", "v"))
+	waitFor(t, "aged cut to publish", func() bool { return len(f.Ledger()) == 1 })
+	led := f.Ledger()[0]
+	if led.CoveredSeq != 5 || led.NRecords != 1 {
+		t.Fatalf("aged segment = %+v", led)
+	}
+	if st := f.Stats(); st.SegmentsCut != 1 {
+		t.Fatalf("cuts = %d, want 1 (the age trigger, not the size one)", st.SegmentsCut)
+	}
+}

@@ -60,6 +60,12 @@ const bpFlushPollMs = 50
 // CLUSTERDOWN reply; a renewal inside the window resets it.
 const bpLeasePollMs = 50
 
+// bpFoldKickPollMs paces the fold pressure trigger (doc 06 section 1.4): while
+// resident writes are parked the worker kicks the folder to cut what it holds,
+// but retry passes run at boundary speed while a cut is a mutex hop into the
+// folder, so the kick fires at most once per this many milliseconds per shard.
+const bpFoldKickPollMs = 50
+
 // fullWaiter is one write parked on a full arena: its batch node and the command
 // slot within it. The pair is enough to re-run the command against a reclaimed
 // arena (executeCmd rebuilds the argument views from the node) and to write the
@@ -172,11 +178,16 @@ func (w *worker) retryFull() {
 // signal, so a flushlag storm can never stall out a resident waiter or the
 // other way around.
 //
-// For resident waiters any of three signals is progress and resets the
+// For resident waiters any of four signals is progress and resets the
 // counter: the cold cursor advanced since the last pass, a drain is in flight
-// or pending (ColdDraining), or the migrator has cold space queued to return
+// or pending (ColdDraining), the migrator has cold space queued to return
 // to the arena (ReclaimPending, segments a flip emptied but the epoch has not
-// freed yet). The last one closes the window slice 5a's cold-cursor-only
+// freed yet), or the fold cursor advanced (SetFoldProgress, the doc 04
+// section 6 signal for the obs1 tier where only folded records are
+// evictable). While the resident window runs, the fold pressure trigger
+// (SetFoldKick) fires at most once per bpFoldKickPollMs so the folder cuts
+// what it holds instead of waiting for size or age, which is doc 06 section
+// 1.4's pressure promotion. The last one closes the window slice 5a's cold-cursor-only
 // check left open: after a drain moves records cold and stops, the arena
 // still needs a few boundaries to hand the emptied segments back through the
 // epoch, and during those the cold tail is static and no drain is in flight,
@@ -219,9 +230,18 @@ func (w *worker) stallCheck() {
 	if !resident {
 		w.bpStall = 0
 	} else {
+		if w.foldKick != nil && w.cx.NowMs-w.bpKickMs >= bpFoldKickPollMs {
+			w.bpKickMs = w.cx.NowMs
+			w.foldKick()
+		}
 		prog := w.st.ColdProgress()
-		if prog != w.bpProg || w.st.ColdDraining() || w.st.ReclaimPending() {
+		var fold uint64
+		if w.foldProg != nil {
+			fold = w.foldProg()
+		}
+		if prog != w.bpProg || fold != w.bpFoldSeen || w.st.ColdDraining() || w.st.ReclaimPending() {
 			w.bpProg = prog
+			w.bpFoldSeen = fold
 			w.bpStall = 0
 		} else if w.bpStall++; w.bpStall >= bpStallWindow {
 			w.stallOutReason(ParkResident, "ERR "+store.ErrFull.Error()+" ("+w.st.StallReason()+")")
