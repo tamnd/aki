@@ -694,6 +694,102 @@ func TestRecoverScanFallback(t *testing.T) {
 	}
 }
 
+// TestCrossCheckAgreesWithCheckpoints reconciles SRT rows whose live_records and
+// shard_seq_high match the checkpoints they name, plus uncheckpointed zero rows over
+// empty indexes, and finds no drift.
+func TestCrossCheckAgreesWithCheckpoints(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	off0 := appendCkpt(t, f, CkptHeader{FullOrDelta: CkptFull, CkptLogPos: 5, SeqHigh: 42}, []CkptEntry{
+		{KeyHash: 1, RecordAddr: 0x100}, {KeyHash: 2, RecordAddr: 0x200},
+	})
+	off1 := appendCkpt(t, f, CkptHeader{FullOrDelta: CkptFull, CkptLogPos: 6, SeqHigh: 57}, []CkptEntry{
+		{KeyHash: 3, RecordAddr: 0x300}, {KeyHash: 4, RecordAddr: 0x400}, {KeyHash: 5, RecordAddr: 0x500},
+	})
+	fileSize := f.Cursor()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	rows[0] = SRTRow{IndexCkptOff: off0, CkptLogPos: 5, LiveRecords: 2, ShardSeqHigh: 42}
+	rows[1] = SRTRow{IndexCkptOff: off1, CkptLogPos: 6, LiveRecords: 3, ShardSeqHigh: 57}
+	// shards 2 and 3 never checkpointed: zero rows over empty indexes.
+	srtOff := writeSRTAt(t, dev, prefix, fileSize, &SRT{Gen: 1, Rows: rows})
+
+	m := &MetaSlot{
+		CommitSeq: 9, FileSize: fileSize, CleanShutdown: 1,
+		SRTOff: srtOff, SRTLen: uint32(SRTHeaderLen + len(rows)*SRTRowSize), SRTShardCount: prefix.ShardCount,
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if drift := rec.CrossCheck(); len(drift) != 0 {
+		t.Fatalf("cross-check found drift over consistent rows: %+v", drift)
+	}
+}
+
+// TestCrossCheckReportsDrift catches an SRT row whose live_records overcounts its
+// checkpoint and another whose shard_seq_high disagrees, reporting one drift each and
+// naming the claimed-versus-actual figures, without aborting recovery.
+func TestCrossCheckReportsDrift(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	off0 := appendCkpt(t, f, CkptHeader{FullOrDelta: CkptFull, CkptLogPos: 5, SeqHigh: 42}, []CkptEntry{
+		{KeyHash: 1, RecordAddr: 0x100}, {KeyHash: 2, RecordAddr: 0x200},
+	})
+	off1 := appendCkpt(t, f, CkptHeader{FullOrDelta: CkptFull, CkptLogPos: 6, SeqHigh: 57}, []CkptEntry{
+		{KeyHash: 3, RecordAddr: 0x300}, {KeyHash: 4, RecordAddr: 0x400}, {KeyHash: 5, RecordAddr: 0x500},
+	})
+	fileSize := f.Cursor()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	rows[0] = SRTRow{IndexCkptOff: off0, CkptLogPos: 5, LiveRecords: 5, ShardSeqHigh: 42} // overcounts entries
+	rows[1] = SRTRow{IndexCkptOff: off1, CkptLogPos: 6, LiveRecords: 3, ShardSeqHigh: 99} // wrong seq_high
+	srtOff := writeSRTAt(t, dev, prefix, fileSize, &SRT{Gen: 1, Rows: rows})
+
+	m := &MetaSlot{
+		CommitSeq: 9, FileSize: fileSize, CleanShutdown: 1,
+		SRTOff: srtOff, SRTLen: uint32(SRTHeaderLen + len(rows)*SRTRowSize), SRTShardCount: prefix.ShardCount,
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	drift := rec.CrossCheck()
+	if len(drift) != 2 {
+		t.Fatalf("cross-check found %d drifts, want 2: %+v", len(drift), drift)
+	}
+	if drift[0] != (SRTRowDrift{Shard: 0, RowLiveRecords: 5, CkptEntries: 2, RowSeqHigh: 42, CkptSeqHigh: 42}) {
+		t.Fatalf("shard 0 drift = %+v", drift[0])
+	}
+	if drift[1] != (SRTRowDrift{Shard: 1, RowLiveRecords: 3, CkptEntries: 3, RowSeqHigh: 99, CkptSeqHigh: 57}) {
+		t.Fatalf("shard 1 drift = %+v", drift[1])
+	}
+}
+
+// TestCrossCheckNoSRT reconciles a recovery with no shard root table, a fresh file or
+// a scan fallback: there is nothing to reconcile, so it reports no drift.
+func TestCrossCheckNoSRT(t *testing.T) {
+	dev := &memDevice{}
+	newTestFile(t, dev, SyncNo, nil)
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if drift := rec.CrossCheck(); drift != nil {
+		t.Fatalf("cross-check over a rootless recovery = %+v, want nil", drift)
+	}
+}
+
 // TestReadExtentTableFresh returns a nil map for a fresh file: no extent table has
 // been written, so there is no shape hint and a tool falls back to a scan.
 func TestReadExtentTableFresh(t *testing.T) {
