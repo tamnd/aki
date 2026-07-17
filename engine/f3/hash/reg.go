@@ -185,6 +185,17 @@ func Flush(cx *shard.Ctx) {
 	g.resident = 0
 }
 
+// Len is the number of hashes this shard holds, the hash contribution to DBSIZE.
+// A dropped hash leaves the map, so the map size is the live count; it reads zero
+// before any hash command has built a registry on this shard.
+func Len(cx *shard.Ctx) int {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return 0
+	}
+	return len(v.(*reg).m)
+}
+
 // lookup finds the hash for key. present is nil when no hash exists; wrong is true
 // when the key instead holds a value in the string store, which every hash command
 // answers with WRONGTYPE. Cross-type collisions with the set, zset, and list
