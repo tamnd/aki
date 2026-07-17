@@ -36,6 +36,8 @@ type Report struct {
 	TTLErr     error
 	FreeMap    []FreeExtent
 	FreeMapErr error
+	MetaKV     []MetaKVPair
+	MetaKVErr  error
 	Segments   SegmentTally
 }
 
@@ -100,6 +102,7 @@ func Inspect(dev Device) (*Report, error) {
 		rep.Extents, rep.ExtErr = ReadExtentTable(dev, live)
 		rep.TTL, rep.TTLErr = ReadTTLIndex(dev, live)
 		rep.FreeMap, rep.FreeMapErr = ReadFreeMap(dev, prefix, live)
+		rep.MetaKV, rep.MetaKVErr = ReadMetaKV(dev, prefix, live)
 	}
 
 	// The segment population is always walkable from the header page, even with no
@@ -146,6 +149,9 @@ func (r *Report) Findings() []string {
 	}
 	if r.FreeMapErr != nil {
 		fs = append(fs, fmt.Sprintf("free map did not read: %v", r.FreeMapErr))
+	}
+	if r.MetaKVErr != nil {
+		fs = append(fs, fmt.Sprintf("meta kv did not read: %v", r.MetaKVErr))
 	}
 	return fs
 }
@@ -222,6 +228,18 @@ func WriteReport(w io.Writer, r *Report) error {
 		ew.printf("free map: unreadable: %v\n", r.FreeMapErr)
 	default:
 		ew.printf("free map: none\n")
+	}
+
+	switch {
+	case r.MetaKV != nil:
+		ew.printf("meta kv: %d pairs\n", len(r.MetaKV))
+		for _, kv := range r.MetaKV {
+			ew.printf("  %s = %s\n", kv.Key, kv.Value)
+		}
+	case r.MetaKVErr != nil:
+		ew.printf("meta kv: unreadable: %v\n", r.MetaKVErr)
+	default:
+		ew.printf("meta kv: none\n")
 	}
 
 	ew.printf("segments: %d total, durable tail @%d\n", r.Segments.Total, r.Segments.DurableTail)
