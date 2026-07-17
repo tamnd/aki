@@ -24,7 +24,7 @@ func TestStreamDurabilityRoundTrip(t *testing.T) {
 
 	seqs := map[uint16]uint64{}
 	emit := func(key string, n uint64) {
-		_, g := clusterMapKey([]byte(key))
+		_, g := ClusterMapKey([]byte(key))
 		seqs[g] += n
 	}
 
@@ -239,7 +239,7 @@ func TestStreamDurabilityStrictAck(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if _, g := clusterMapKey([]byte("sk")); wl.Marks().Committed(g) != 0 {
+	if _, g := ClusterMapKey([]byte("sk")); wl.Marks().Committed(g) != 0 {
 		t.Fatal("the gated chain committed")
 	}
 	if err := nc.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {

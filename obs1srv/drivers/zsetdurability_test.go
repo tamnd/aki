@@ -23,7 +23,7 @@ func TestZSetDurabilityRoundTrip(t *testing.T) {
 
 	seqs := map[uint16]uint64{}
 	emit := func(key string, n uint64) {
-		_, g := clusterMapKey([]byte(key))
+		_, g := ClusterMapKey([]byte(key))
 		seqs[g] += n
 	}
 

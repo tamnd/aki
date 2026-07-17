@@ -39,7 +39,7 @@ func startLeasedServer(t *testing.T) (*obs1.WriteLog, *obs1.LeaseGate, net.Conn,
 	gate := obs1.NewLeaseGate(time.Hour, time.Minute)
 	wl, err := obs1.NewWriteLog(obs1.WriteLogConfig{
 		Store: store, Prefix: "p", Node: node, Chain: ap, Fold: fold,
-		Groups: shard.DefaultSlotGroups, MapKey: clusterMapKey,
+		Groups: shard.DefaultSlotGroups, MapKey: ClusterMapKey,
 		FlushAge: time.Hour, Gate: gate,
 	})
 	if err != nil {
@@ -89,7 +89,7 @@ func startLeasedServer(t *testing.T) (*obs1.WriteLog, *obs1.LeaseGate, net.Conn,
 // progress signal literally is the node's own chain append.
 func TestLeaseParkAndRenewEndToEnd(t *testing.T) {
 	wl, gate, nc, r, dial := startLeasedServer(t)
-	_, group := clusterMapKey([]byte("k1"))
+	_, group := ClusterMapKey([]byte("k1"))
 
 	// The first write flows (every group renewed at boot) and leaves one
 	// dirty frame in group k1's WAL buffer, the fuel for the release.
@@ -142,7 +142,7 @@ func TestLeaseParkAndRenewEndToEnd(t *testing.T) {
 // key in a still-held group keeps writing.
 func TestLeaseDemotedRedirectsEndToEnd(t *testing.T) {
 	_, gate, nc, r, _ := startLeasedServer(t)
-	slot, group := clusterMapKey([]byte("k2"))
+	slot, group := ClusterMapKey([]byte("k2"))
 	gate.Demote(group, "10.0.0.9:7000")
 
 	send(t, nc, "SET", "k2", "x")
@@ -150,7 +150,7 @@ func TestLeaseDemotedRedirectsEndToEnd(t *testing.T) {
 
 	// A key in another group still writes; find one mapping elsewhere.
 	other := "k1"
-	if _, g := clusterMapKey([]byte(other)); g == group {
+	if _, g := ClusterMapKey([]byte(other)); g == group {
 		t.Fatalf("fixture keys k1 and k2 share group %d", g)
 	}
 	send(t, nc, "SET", other, "y")

@@ -26,13 +26,6 @@ func (g *gateChain) Append(ctx context.Context, recs []obs1.ChainRecord) (obs1.C
 	return g.inner.Append(ctx, recs)
 }
 
-// clusterMapKey is the production route: cluster hash slot to slot
-// group, the same mapping dispatch uses.
-func clusterMapKey(key []byte) (uint16, uint16) {
-	slot := shard.HashSlot(key)
-	return uint16(slot), uint16(shard.GroupOfSlot(slot, shard.DefaultSlotGroups))
-}
-
 // startLoggedServer is startServer with the durability pipeline wired:
 // a write log over the sim store and a chain appender, every group
 // granted to this node at epoch 1, the INFO hook registered. With
@@ -69,7 +62,7 @@ func startLoggedServer(t *testing.T, gated bool) (*obs1.WriteLog, *sim.Sim, net.
 	}
 	wl, err := obs1.NewWriteLog(obs1.WriteLogConfig{
 		Store: store, Prefix: "p", Node: node, Chain: chain, Fold: fold,
-		Groups: shard.DefaultSlotGroups, MapKey: clusterMapKey,
+		Groups: shard.DefaultSlotGroups, MapKey: ClusterMapKey,
 		FlushAge: time.Hour,
 	})
 	if err != nil {
@@ -141,7 +134,7 @@ func TestDurabilityRoundTrip(t *testing.T) {
 	// by replaying the production route client-side.
 	seqs := map[uint16]uint64{}
 	emit := func(key string) {
-		_, g := clusterMapKey([]byte(key))
+		_, g := ClusterMapKey([]byte(key))
 		seqs[g]++
 	}
 
@@ -286,7 +279,7 @@ func TestDurabilityRelaxedAck(t *testing.T) {
 	send(t, nc, "SET", "k", "v")
 	expect(t, r, "+OK\r\n")
 
-	_, g := clusterMapKey([]byte("k"))
+	_, g := ClusterMapKey([]byte("k"))
 	if got := wl.Marks().Committed(g); got != 0 {
 		t.Fatalf("Committed = %d at ack time with the chain gated", got)
 	}
@@ -316,7 +309,7 @@ func TestDurabilityStrictAckCoversCommit(t *testing.T) {
 	expect(t, r, "+OK\r\n")
 	send(t, nc, "SET", "k", "v")
 	expect(t, r, "+OK\r\n")
-	_, g := clusterMapKey([]byte("k"))
+	_, g := ClusterMapKey([]byte("k"))
 	if got := wl.Marks().Committed(g); got < 1 {
 		t.Fatalf("Committed = %d at strict ack time, the ack must cover the commit", got)
 	}
@@ -366,7 +359,7 @@ func TestDurabilityStrictHoldsPipeline(t *testing.T) {
 	}
 	send(t, nc2, "GET", "k")
 	expectBulk(t, r2, []byte("v"))
-	if _, g := clusterMapKey([]byte("k")); wl.Marks().Committed(g) != 0 {
+	if _, g := ClusterMapKey([]byte("k")); wl.Marks().Committed(g) != 0 {
 		t.Fatal("the gated chain committed")
 	}
 	if err := nc.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
@@ -397,7 +390,7 @@ func TestDurabilityStrictFanCoversCommit(t *testing.T) {
 
 	seqs := map[uint16]uint64{}
 	emit := func(key string) {
-		_, g := clusterMapKey([]byte(key))
+		_, g := ClusterMapKey([]byte(key))
 		seqs[g]++
 	}
 	send(t, nc, "MSET", "a", "1", "b", "2")
@@ -454,7 +447,7 @@ func TestDurabilityStrictFanHoldsPipeline(t *testing.T) {
 	expectBulk(t, r2, []byte("1"))
 	send(t, nc2, "GET", "b")
 	expectBulk(t, r2, []byte("2"))
-	if _, g := clusterMapKey([]byte("a")); wl.Marks().Committed(g) != 0 {
+	if _, g := ClusterMapKey([]byte("a")); wl.Marks().Committed(g) != 0 {
 		t.Fatal("the gated chain committed")
 	}
 	if err := nc.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
@@ -487,7 +480,7 @@ func TestDurabilityBitAndHLLFrames(t *testing.T) {
 
 	seqs := map[uint16]uint64{}
 	emit := func(key string) {
-		_, g := clusterMapKey([]byte(key))
+		_, g := ClusterMapKey([]byte(key))
 		seqs[g]++
 	}
 
