@@ -22,6 +22,7 @@ const (
 	opHmget
 	opHdel
 	opHgetdel
+	opHgetex
 	opHexists
 	opHlen
 	opHstrlen
@@ -55,6 +56,7 @@ func harnessHandlers() []shard.Handler {
 	h[opHmget] = Hmget
 	h[opHdel] = Hdel
 	h[opHgetdel] = Hgetdel
+	h[opHgetex] = Hgetex
 	h[opHexists] = Hexists
 	h[opHlen] = Hlen
 	h[opHstrlen] = Hstrlen

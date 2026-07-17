@@ -110,6 +110,33 @@ func TestHgetdel(t *testing.T) {
 		"ERR wrong number of arguments for 'hgetdel' command")
 }
 
+// HGETEX returns field values like HMGET and, under a TTL option, resets or clears
+// each read field's expiry in the same step.
+func TestHgetex(t *testing.T) {
+	c := newHarness(t).NewConn()
+	do(t, c, opHset, "h", "a", "1", "b", "2", "c", "3")
+	// No option: a plain read that leaves every TTL untouched.
+	wantArray(t, do(t, c, opHgetex, "h", "FIELDS", "2", "a", "x"), "1", nilElem)
+	wantArray(t, do(t, c, opHttl, "h", "FIELDS", "1", "a"), "-1")
+	// An absolute PXAT sets the field's expiry to that exact millisecond.
+	wantArray(t, do(t, c, opHgetex, "h", "PXAT", "60000000000000", "FIELDS", "1", "a"), "1")
+	wantArray(t, do(t, c, opHpexpiretime, "h", "FIELDS", "1", "a"), "60000000000000")
+	// PERSIST clears the TTL it just set, and still answers the value.
+	wantArray(t, do(t, c, opHgetex, "h", "PERSIST", "FIELDS", "1", "a"), "1")
+	wantArray(t, do(t, c, opHttl, "h", "FIELDS", "1", "a"), "-1")
+	// A set-to-the-past answers the value it held, then deletes the field.
+	wantArray(t, do(t, c, opHgetex, "h", "PXAT", "1", "FIELDS", "1", "b"), "2")
+	wantInt(t, do(t, c, opHexists, "h", "b"), 0)
+	// A missing key answers all-nil, same length as the request.
+	wantArray(t, do(t, c, opHgetex, "nokey", "FIELDS", "2", "a", "b"), nilElem, nilElem)
+	// A bad expire argument is refused before the key is touched.
+	wantErr(t, do(t, c, opHgetex, "h", "EX", "notanint", "FIELDS", "1", "a"),
+		"ERR value is not an integer or out of range")
+	// A malformed clause is an arity error, not a silent empty reply.
+	wantErr(t, do(t, c, opHgetex, "h", "a"),
+		"ERR wrong number of arguments for 'hgetex' command")
+}
+
 // Every point verb answers WRONGTYPE on a key the string store owns.
 func TestWrongType(t *testing.T) {
 	c := newHarness(t).NewConn()
@@ -122,6 +149,7 @@ func TestWrongType(t *testing.T) {
 	wantErr(t, do(t, c, opHmget, "s", "a"), wt)
 	wantErr(t, do(t, c, opHdel, "s", "a"), wt)
 	wantErr(t, do(t, c, opHgetdel, "s", "FIELDS", "1", "a"), wt)
+	wantErr(t, do(t, c, opHgetex, "s", "FIELDS", "1", "a"), wt)
 	wantErr(t, do(t, c, opHexists, "s", "a"), wt)
 	wantErr(t, do(t, c, opHlen, "s"), wt)
 	wantErr(t, do(t, c, opHstrlen, "s", "a"), wt)
