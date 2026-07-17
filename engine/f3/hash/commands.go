@@ -130,6 +130,49 @@ func Hmget(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Raw(out)
 }
 
+// Hgetdel answers HGETDEL key FIELDS numfields field [field ...]: return each
+// field's value, nil when it is absent, and delete the present ones in the same
+// step. The key is dropped when its last field leaves. Each value is copied into
+// the reply before its field is deleted, so a listpackex record freed by the
+// delete cannot alter bytes already framed (spec 2064/f3/10 section 7.4).
+func Hgetdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	fields, _, ferr := parseFieldsClause("hgetdel", args[1:], false)
+	if ferr != "" {
+		r.Err(ferr)
+		return
+	}
+	g := registry(cx)
+	h, wrong := g.lookup(cx, args[0])
+	if wrong {
+		r.Err(wrongType)
+		return
+	}
+	out := resp.AppendArrayHeader(cx.Aux[:0], len(fields))
+	if h == nil {
+		for range fields {
+			out = resp.AppendNull(out)
+		}
+		cx.Aux = out
+		r.Raw(out)
+		return
+	}
+	for _, f := range fields {
+		if v, ok := h.get(f); ok {
+			out = resp.AppendBulk(out, v)
+			h.del(f)
+		} else {
+			out = resp.AppendNull(out)
+		}
+	}
+	cx.Aux = out
+	if h.card() == 0 {
+		g.drop(args[0])
+	} else {
+		g.note(h)
+	}
+	r.Raw(out)
+}
+
 // Hexists answers HEXISTS key field: 1 when present, 0 otherwise.
 func Hexists(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
