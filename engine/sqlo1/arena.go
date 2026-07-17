@@ -62,7 +62,13 @@ func (b *arenaBudget) unreserve(n int64) {
 
 type arena struct {
 	chunks [][]byte
-	// freeChunks holds chunk indexes released by oversize frees.
+	// liveFp tracks the live slot footprint per chunk, prefix bytes
+	// included, so reclaim can tell a fully-free chunk from one that
+	// still owns data. Chunk 0's reserved pad slot counts as live, which
+	// is what keeps ref 0 dead forever.
+	liveFp []int64
+	// freeChunks holds chunk indexes released by oversize frees and by
+	// reclaim.
 	freeChunks []uint32
 	cur        uint32 // chunk currently bump-allocated
 	curOff     uint32
@@ -101,6 +107,7 @@ func (a *arena) alloc(v []byte) uint32 {
 			return 0
 		}
 		a.chunks = append(a.chunks, make([]byte, arenaChunkSize))
+		a.liveFp = append(a.liveFp, arenaAlign)
 		a.cur = 0
 		a.curOff = arenaAlign
 	}
@@ -109,12 +116,19 @@ func (a *arena) alloc(v []byte) uint32 {
 	switch {
 	case !std:
 		ref = a.allocOversize(len(v))
+		if ref == 0 && a.reclaim() {
+			ref = a.allocOversize(len(v))
+		}
 	case len(a.free[ci]) > 0:
 		last := len(a.free[ci]) - 1
 		ref = a.free[ci][last]
 		a.free[ci] = a.free[ci][:last]
+		a.liveFp[ref>>16] += int64(f)
 	default:
 		ref = a.bump(f)
+		if ref == 0 && a.reclaim() {
+			ref = a.bump(f)
+		}
 	}
 	if ref == 0 {
 		return 0
@@ -143,6 +157,7 @@ func (a *arena) bump(f uint32) uint32 {
 	c := a.chunks[a.cur]
 	binary.LittleEndian.PutUint32(c[a.curOff+4:], f-arenaAlign)
 	a.curOff += f
+	a.liveFp[a.cur] += int64(f)
 	return ref
 }
 
@@ -153,6 +168,7 @@ func (a *arena) allocOversize(n int) uint32 {
 	}
 	c := a.chunks[ci]
 	binary.LittleEndian.PutUint32(c[4:], uint32(n))
+	a.liveFp[ci] = int64(n) + arenaAlign
 	return ci << 16
 }
 
@@ -166,6 +182,7 @@ func (a *arena) newChunk(size int) (uint32, bool) {
 		ci := a.freeChunks[n-1]
 		a.freeChunks = a.freeChunks[:n-1]
 		a.chunks[ci] = make([]byte, size)
+		a.liveFp[ci] = 0
 		return ci, true
 	}
 	if len(a.chunks) >= arenaMaxRefs {
@@ -174,6 +191,7 @@ func (a *arena) newChunk(size int) (uint32, bool) {
 		panic("sqlo1: arena chunk space exhausted")
 	}
 	a.chunks = append(a.chunks, make([]byte, size))
+	a.liveFp = append(a.liveFp, 0)
 	return uint32(len(a.chunks) - 1), true
 }
 
@@ -204,9 +222,78 @@ func (a *arena) release(ref uint32) {
 	f, ci, std := classFor(int(capacity))
 	if !std || f != capacity+arenaAlign {
 		a.chunks[ref>>16] = nil
+		a.liveFp[ref>>16] = 0
 		a.freeChunks = append(a.freeChunks, ref>>16)
 		a.budget.unreserve(int64(capacity) + arenaAlign)
 		return
 	}
+	a.liveFp[ref>>16] -= int64(f)
 	a.free[ci] = append(a.free[ci], ref)
+}
+
+// slotFootprint returns ref's whole-slot footprint, prefix included.
+func (a *arena) slotFootprint(ref uint32) int64 {
+	c, off := a.chunkAt(ref)
+	return int64(binary.LittleEndian.Uint32(c[off+4:])) + arenaAlign
+}
+
+// headroom is the budget's unreserved remainder; nil budget is uncapped.
+func (a *arena) headroom() int64 {
+	if a.budget == nil {
+		return int64(arenaMaxRefs) * arenaChunkSize
+	}
+	return a.budget.limit - a.budget.reserved
+}
+
+// canAlloc reports whether alloc for an n-byte payload would find its
+// bytes right now: a recycled slot of the class, room in the bump chunk,
+// or budget headroom for a fresh chunk. It is the exit condition of the
+// vacate loop, so it must never say no when alloc would succeed.
+func (a *arena) canAlloc(n int) bool {
+	f, ci, std := classFor(n)
+	if !std {
+		need := int64(n) + arenaAlign
+		if len(a.chunks) == 0 {
+			need += arenaChunkSize // chunk 0 comes first on any first alloc
+		}
+		return a.headroom() >= need
+	}
+	if len(a.chunks) > 0 && (len(a.free[ci]) > 0 || a.curOff+f <= arenaChunkSize) {
+		return true
+	}
+	return a.headroom() >= arenaChunkSize
+}
+
+// reclaim retires every standard chunk whose slots are all free,
+// returning their bytes to the budget, and reports whether it retired
+// any. Class freelists recycle within a class, so a saturated budget
+// can starve the first allocation of a class the workload has not used
+// yet while other classes sit on free slots; reclaim is how those slots
+// turn back into budget. Refs into a retired chunk are purged from the
+// freelists eagerly because newChunk reuses retired indexes. The bump
+// chunk stays: its tail is still allocatable and curOff points into it.
+func (a *arena) reclaim() bool {
+	retired := false
+	for ci := range a.chunks {
+		if a.chunks[ci] == nil || len(a.chunks[ci]) != arenaChunkSize ||
+			uint32(ci) == a.cur || a.liveFp[ci] != 0 {
+			continue
+		}
+		a.chunks[ci] = nil
+		a.freeChunks = append(a.freeChunks, uint32(ci))
+		a.budget.unreserve(arenaChunkSize)
+		retired = true
+	}
+	if retired {
+		for ci := range a.free {
+			kept := a.free[ci][:0]
+			for _, ref := range a.free[ci] {
+				if a.chunks[ref>>16] != nil {
+					kept = append(kept, ref)
+				}
+			}
+			a.free[ci] = kept
+		}
+	}
+	return retired
 }

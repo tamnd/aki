@@ -55,6 +55,10 @@ type HotTable struct {
 	// shard discipline, single owner, one command in flight.
 	pinSlot uint32
 	pinOK   bool
+	// vacates counts chunk-vacate passes, the class-migration deadlock
+	// breaker below; the stats surface it so a workload paying this cost
+	// is visible.
+	vacates int64
 	// intShadow holds the parsed int64 behind headers flagged
 	// tagIntShadow, keyed by slot: doc 05's integer fast path pays its
 	// 8 bytes only on keys that have actually seen INCR-family ops, so
@@ -678,6 +682,93 @@ func (t *HotTable) intShadowOf(key []byte) (n, expMs int64, ok bool) {
 	}
 	n, ok = t.intShadow[s]
 	return n, expMsOf(hd), ok
+}
+
+// canPut reports whether PutGen (or delCold when tomb) would find the
+// slot and arena bytes it needs right now, mirroring the claim paths
+// exactly: an existing slot updates in place when the value fits its
+// capacity and reallocates otherwise, a new key needs a header slot,
+// key bytes, and value bytes. The vacate loop uses this as its exit
+// condition, so it must never say no when the write would succeed.
+func (t *HotTable) canPut(key, val []byte, tomb bool) bool {
+	if s, ok := t.lookup(maphash.Bytes(t.seed, key), key); ok {
+		if tomb {
+			return true // delCold refuses a held key; nothing to allocate
+		}
+		hd := &t.hdrs[s]
+		if hd.valRef != 0 && t.vals.slotFootprint(hd.valRef) >= int64(len(val))+arenaAlign {
+			return true
+		}
+		return t.vals.canAlloc(len(val))
+	}
+	if len(t.freeSlots) == 0 && len(t.hdrs) >= cap(t.hdrs) {
+		return false
+	}
+	if !t.keys.canAlloc(len(key)) {
+		return false
+	}
+	return tomb || t.vals.canAlloc(len(val))
+}
+
+// vacateValChunk breaks the arena class-migration deadlock: freelists
+// recycle slots within a size class and never return budget, so once
+// the budget saturates, the first allocation in a class the workload
+// has not touched can starve while other classes sit on plenty of free
+// slots (a paged stream root growing across a class boundary is the
+// natural trigger). It picks the standard value chunk with the least
+// live payload whose live slots are all clean residents, evicts exactly
+// those residents, and reclaims the then-empty chunk back to the shared
+// budget. Dirty never evicts (R-I3), so a chunk holding any dirty slot
+// is skipped; the caller drains first to make chunks eligible. It
+// reports whether a chunk was retired.
+func (t *HotTable) vacateValChunk() bool {
+	n := len(t.vals.chunks)
+	if n == 0 {
+		return false
+	}
+	resident := make([]int64, n)
+	tainted := make([]bool, n)
+	for i := range t.hdrs {
+		hd := &t.hdrs[i]
+		if hd.keyRef == 0 || hd.valRef == 0 {
+			continue
+		}
+		ci := hd.valRef >> 16
+		if hd.state != stateResident {
+			tainted[ci] = true
+			continue
+		}
+		resident[ci] += t.vals.slotFootprint(hd.valRef)
+	}
+	target := -1
+	for ci := range t.vals.chunks {
+		if t.vals.chunks[ci] == nil || len(t.vals.chunks[ci]) != arenaChunkSize ||
+			uint32(ci) == t.vals.cur || tainted[ci] || t.vals.liveFp[ci] == 0 {
+			continue
+		}
+		// Only a chunk whose live footprint is fully explained by clean
+		// residents can go empty; chunk 0's reserved pad never matches,
+		// which keeps ref 0 dead.
+		if resident[ci] != t.vals.liveFp[ci] {
+			continue
+		}
+		if target < 0 || resident[ci] < resident[target] {
+			target = ci
+		}
+	}
+	if target < 0 {
+		return false
+	}
+	for i := range t.hdrs {
+		hd := &t.hdrs[i]
+		if hd.keyRef != 0 && hd.valRef != 0 && hd.state == stateResident &&
+			hd.valRef>>16 == uint32(target) {
+			t.evict(uint32(i), true)
+		}
+	}
+	t.vacates++
+	t.keys.reclaim()
+	return t.vals.reclaim()
 }
 
 // removeSlot frees a header slot and its arena bytes and repairs the

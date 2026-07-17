@@ -58,6 +58,12 @@ type TieredStats struct {
 	// store write or any other IO (R-I5).
 	Evictions    int64
 	EvictedBytes int64
+	// ChunkVacates counts class-migration deadlock breaks: passes that
+	// force-evicted one value chunk's clean residents so its bytes could
+	// rejoin the arena budget and serve a class the freelists had never
+	// seen. A steadily climbing count means the budget is too tight for
+	// the workload's value-size drift.
+	ChunkVacates int64
 	HotKeys      int
 	DirtyBytes   int
 }
@@ -245,13 +251,8 @@ func (t *Tiered) ExpireAt(ctx context.Context, key []byte, atMs int64) (bool, er
 		tag |= TagRoot
 	}
 	val := nonNilValue(rec.Value)
-	if !t.ht.PutGen(key, val, tag, rec.Gen) {
-		if err := t.makeRoomFor(ctx, len(key)+len(val)); err != nil {
-			return false, err
-		}
-		if !t.ht.PutGen(key, val, tag, rec.Gen) {
-			return false, errHotFull
-		}
+	if err := t.putPressured(ctx, key, val, tag, rec.Gen); err != nil {
+		return false, err
 	}
 	t.ht.setExpireMs(key, atMs)
 	_, err = t.lad.step(ctx)
@@ -383,16 +384,36 @@ func (t *Tiered) SetGen(ctx context.Context, key, val []byte, tag uint8, gen uin
 	} else if shed {
 		return ErrShed
 	}
-	if !t.ht.PutGen(key, val, tag, gen) {
-		if err := t.makeRoomFor(ctx, len(key)+len(val)); err != nil {
-			return err
-		}
-		if !t.ht.PutGen(key, val, tag, gen) {
-			return errHotFull
-		}
+	if err := t.putPressured(ctx, key, val, tag, gen); err != nil {
+		return err
 	}
 	_, err := t.lad.step(ctx)
 	return err
+}
+
+// putPressured is PutGen with the full pressure ladder behind a
+// refusal: byte-counted room first (evict, then drain), and when the
+// write is still refused because it needs a size class the saturated
+// arena has never served, the chunk-vacate stage rebudgets whole value
+// chunks until the write's exact needs fit. Only a tier with truly
+// nothing to give returns errHotFull.
+func (t *Tiered) putPressured(ctx context.Context, key, val []byte, tag uint8, gen uint32) error {
+	if t.ht.PutGen(key, val, tag, gen) {
+		return nil
+	}
+	if err := t.makeRoomFor(ctx, len(key)+len(val)); err != nil {
+		return err
+	}
+	if t.ht.PutGen(key, val, tag, gen) {
+		return nil
+	}
+	if err := t.lad.vacateFor(ctx, key, val, false); err != nil {
+		return err
+	}
+	if !t.ht.PutGen(key, val, tag, gen) {
+		return errHotFull
+	}
+	return nil
 }
 
 // Del removes key and reports whether it existed. A hot live key gets a
@@ -423,7 +444,12 @@ func (t *Tiered) Del(ctx context.Context, key []byte) (bool, error) {
 			return false, err
 		}
 		if !t.ht.delCold(key) {
-			return false, errHotFull
+			if err := t.lad.vacateFor(ctx, key, nil, true); err != nil {
+				return false, err
+			}
+			if !t.ht.delCold(key) {
+				return false, errHotFull
+			}
 		}
 	}
 	_, err = t.lad.step(ctx)
@@ -457,6 +483,7 @@ func (t *Tiered) Stats() TieredStats {
 	s := t.stats
 	s.Evictions = t.ev.evictions
 	s.EvictedBytes = t.ev.evictedBytes
+	s.ChunkVacates = t.ht.vacates
 	s.HotKeys = t.ht.Len()
 	s.DirtyBytes = t.ht.dirtyBytes
 	return s

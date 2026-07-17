@@ -163,3 +163,37 @@ func (l *ladder) makeRoom(ctx context.Context, need int) (int, error) {
 	}
 	return freed, nil
 }
+
+// vacateFor breaks the refusal makeRoom cannot: a write refused for a
+// size class, not for bytes. Eviction returns slots to their own class
+// freelists and never moves the budget, so byte-counted room does not
+// help a first-time allocation in a new class once the budget is
+// saturated. This stage drains everything cool, lets reclaim retire any
+// naturally empty chunks, and then vacates value chunks one at a time
+// until the write's exact needs fit or nothing vacatable remains. Each
+// round retires at least one chunk, so the loop is bounded by the chunk
+// count; a run that ends without room falls through to the caller's
+// honest hot-full error.
+func (l *ladder) vacateFor(ctx context.Context, key, val []byte, tomb bool) error {
+	ht := l.e.ht
+	for !ht.canPut(key, val, tomb) {
+		for {
+			n, err := l.d.drain(ctx)
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				break
+			}
+		}
+		ht.keys.reclaim()
+		ht.vals.reclaim()
+		if ht.canPut(key, val, tomb) {
+			return nil
+		}
+		if !ht.vacateValChunk() {
+			return nil
+		}
+	}
+	return nil
+}
