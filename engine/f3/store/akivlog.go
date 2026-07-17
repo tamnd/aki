@@ -83,6 +83,31 @@ func (l *akiVlog) readAt(off uint64, n int, dst []byte) ([]byte, error) {
 	return l.f.ReadValueFrameAt(off, uint32(n), dst)
 }
 
+// readFill reads exactly len(b) bytes at off into b, the partial sub-range read the
+// bitmap and chunked bands take (bit.go, bitkernel.go, bitop.go, chunks.go): a byte
+// or a window at value_off+i, not the whole value. It is the parity of the scratch
+// log's readFill, off being the same absolute offset those sites already form from
+// a run word's low bits plus the in-value position. No checksum, like the scratch
+// log: the frame CRC guards the whole-value read, a per-probe sum would be
+// quadratic. The caller keeps off inside the value's own span.
+func (l *akiVlog) readFill(off uint64, b []byte) error {
+	return l.f.ReadValueRangeAt(off, b)
+}
+
+// readInto reads n bytes at off, sizing dst when it is short and reusing its
+// capacity when it fits, the parity of the scratch log's readInto for a caller that
+// wants the bytes back as a slice rather than filling its own buffer.
+func (l *akiVlog) readInto(off uint64, n int, dst []byte) ([]byte, error) {
+	if cap(dst) < n {
+		dst = make([]byte, n)
+	}
+	dst = dst[:n]
+	if err := l.f.ReadValueRangeAt(off, dst); err != nil {
+		return dst[:0], err
+	}
+	return dst, nil
+}
+
 // unlink records n bytes an overwrite, a delete, or an expiry reap no longer
 // references, so a later compaction of the value region knows what it can
 // reclaim. It must fire at every site that supersedes a logged value, the way

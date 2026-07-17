@@ -67,6 +67,38 @@ func TestAkiVlogStageReadFlushResolves(t *testing.T) {
 	}
 }
 
+// TestAkiVlogReadFillAndInto stages a value, flushes it, and reads sub-ranges of
+// the published bytes by absolute offset through readFill and readInto: the partial
+// read the bitmap and chunked bands take against the re-homed value log, parity with
+// the scratch log's readFill/readInto.
+func TestAkiVlogReadFillAndInto(t *testing.T) {
+	l := newTestAkiVlog(t, 3)
+
+	val := []byte("0123456789abcdef")
+	l.stage(val)
+	ptrs, err := l.flush()
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	off := ptrs[0].ValueOff
+
+	// readFill fills a caller buffer with a window; readInto returns the bytes.
+	fill := make([]byte, 5)
+	if err := l.readFill(off+6, fill); err != nil {
+		t.Fatalf("readFill: %v", err)
+	}
+	if want := val[6:11]; !bytes.Equal(fill, want) {
+		t.Fatalf("readFill = %q, want %q", fill, want)
+	}
+	got, err := l.readInto(off, 4, nil)
+	if err != nil {
+		t.Fatalf("readInto: %v", err)
+	}
+	if want := val[:4]; !bytes.Equal(got, want) {
+		t.Fatalf("readInto = %q, want %q", got, want)
+	}
+}
+
 // TestAkiVlogLogBytesAccounting checks total counts every flushed value byte and
 // unlink moves the dead subset, the pair a value-region compaction weighs.
 func TestAkiVlogLogBytesAccounting(t *testing.T) {
