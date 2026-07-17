@@ -38,6 +38,7 @@ type entry struct {
 	fanOp   byte
 	paired  bool // MSET-shaped tail: alternating key value
 	fanOnly bool // no point op; a single key still fans
+	fanArgs bool // keyless fan that still carries its argument tail (KEYS)
 
 	// flushOpt marks the FLUSHALL/FLUSHDB tail: the one optional argument
 	// must be the ASYNC or SYNC token, anything else is a syntax error.
@@ -192,6 +193,16 @@ func init() {
 	dbsize := registerShard(dbsizeShardAll)
 	register("DBSIZE", nil, 0, 0, false)
 	registerFan("DBSIZE", shard.FanCount, dbsize, false, true)
+
+	// KEYS scatters its match pattern keyless to every shard: each owner walks
+	// every keyspace it holds (the string store and the five collection
+	// registries), glob-filters, and answers a length-prefixed run of its
+	// matches, and the gather concatenates them into one unordered bulk array.
+	// It fans even for the single pattern argument, so fanArgs carries the tail.
+	keys := registerShard(keysShardAll)
+	register("KEYS", nil, 1, 1, false)
+	registerFan("KEYS", shard.FanKeys, keys, false, true)
+	table["KEYS"].fanArgs = true
 
 	// FLUSHALL scatters a reset intent to every shard; each owner rebuilds
 	// its store empty and the gather answers +OK only after every shard has
@@ -795,7 +806,14 @@ func dispatchFan(c *shard.Conn, e *entry, args [][]byte) error {
 		if e.flushOpt && len(args) == 2 && !flushToken(args[1]) {
 			return oops(c, "ERR syntax error")
 		}
-		err := c.DoFanAll(e.fanOp, e.fan)
+		var err error
+		if e.fanArgs {
+			// A keyless fan that still carries an argument (KEYS hands every shard
+			// its match pattern) scatters the tail verbatim to every owner.
+			err = c.DoFanAllArgs(e.fanOp, e.fan, args[1:])
+		} else {
+			err = c.DoFanAll(e.fanOp, e.fan)
+		}
 		if err == shard.ErrTooBig {
 			return oops(c, "ERR command too large")
 		}
@@ -1235,4 +1253,121 @@ func dbsizeShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	n += int64(list.Len(cx))
 	n += int64(stream.Len(cx))
 	r.FanCount(n)
+}
+
+// keysShardAll answers a KEYS sub-command: it walks every keyspace this shard
+// holds, the string store and the five collection registries, glob-filters each
+// key against the pattern in args[0], and appends the matches as a length-
+// prefixed run the gather concatenates into one bulk array. It lives here where
+// every type package is in reach, the same as the other cross-keyspace fan
+// handlers, and iterates each keyspace through its read-only RangeKeys so the
+// walk sets no residency state. The string store skips an expired resident key
+// against the batch clock; the collection keys carry no key-level deadline.
+// KEYS is unbounded (Redis's own caveat is not to run it on a live keyspace), so
+// the walk never stops early and the partial holds every match. A cold key's
+// bytes alias the store's cold scratch only until the next cold read, so each
+// match is copied into the partial as it is seen, before the walk moves on.
+func keysShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	pattern := args[0]
+	var part []byte
+	emit := func(key []byte) bool {
+		if globMatch(pattern, key) {
+			part = shard.AppendFanValue(part, key, true)
+		}
+		return true
+	}
+	cx.St.RangeKeys(cx.NowMs, emit)
+	set.RangeKeys(cx, emit)
+	zset.RangeKeys(cx, emit)
+	hash.RangeKeys(cx, emit)
+	list.RangeKeys(cx, emit)
+	stream.RangeKeys(cx, emit)
+	r.Raw(part)
+}
+
+// globMatch reports whether str matches the glob pattern, the same operators
+// Redis's stringmatchlen implements: * any run, ? one byte, [...] a class with
+// ranges and a leading ^ negation, and \ escaping the next byte. Byte-oriented
+// and case sensitive, matching KEYS. It mirrors the per-type SCAN copies
+// (zset/scan.go and its siblings) rather than sharing a package, keeping the
+// keyspace walk independent of any one type's band.
+func globMatch(pattern, str []byte) bool {
+	p, sIdx := 0, 0
+	for p < len(pattern) {
+		switch pattern[p] {
+		case '*':
+			for p+1 < len(pattern) && pattern[p+1] == '*' {
+				p++
+			}
+			if p+1 == len(pattern) {
+				return true
+			}
+			for i := sIdx; i <= len(str); i++ {
+				if globMatch(pattern[p+1:], str[i:]) {
+					return true
+				}
+			}
+			return false
+		case '?':
+			if sIdx == len(str) {
+				return false
+			}
+			sIdx++
+			p++
+		case '[':
+			if sIdx == len(str) {
+				return false
+			}
+			p++
+			neg := false
+			if p < len(pattern) && pattern[p] == '^' {
+				neg = true
+				p++
+			}
+			match := false
+			for p < len(pattern) && pattern[p] != ']' {
+				if pattern[p] == '\\' && p+1 < len(pattern) {
+					p++
+					if pattern[p] == str[sIdx] {
+						match = true
+					}
+				} else if p+2 < len(pattern) && pattern[p+1] == '-' && pattern[p+2] != ']' {
+					lo, hi := pattern[p], pattern[p+2]
+					if lo > hi {
+						lo, hi = hi, lo
+					}
+					if str[sIdx] >= lo && str[sIdx] <= hi {
+						match = true
+					}
+					p += 2
+				} else if pattern[p] == str[sIdx] {
+					match = true
+				}
+				p++
+			}
+			if p < len(pattern) {
+				p++ // consume ']'
+			}
+			if match == neg {
+				return false
+			}
+			sIdx++
+		case '\\':
+			if p+1 < len(pattern) {
+				p++
+			}
+			if sIdx == len(str) || pattern[p] != str[sIdx] {
+				return false
+			}
+			sIdx++
+			p++
+		default:
+			if sIdx == len(str) || pattern[p] != str[sIdx] {
+				return false
+			}
+			sIdx++
+			p++
+		}
+	}
+	return sIdx == len(str)
 }

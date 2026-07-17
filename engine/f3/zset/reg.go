@@ -141,6 +141,23 @@ func Len(cx *shard.Ctx) int {
 	return len(cx.ZColl.(*reg).m)
 }
 
+// RangeKeys calls fn with every zset key on this shard, the zset contribution to
+// the unified KEYS and SCAN walk. It builds no registry when none exists, so a
+// shard that ran no zset command yields nothing. It returns false when fn asked
+// to stop, halting the outer walk for a bounded scan. The slice fn receives is
+// the map key's bytes, valid only for that call; fn copies what it keeps.
+func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
+	if cx.ZColl == nil {
+		return true
+	}
+	for k := range cx.ZColl.(*reg).m {
+		if !fn([]byte(k)) {
+			return false
+		}
+	}
+	return true
+}
+
 // lookup finds the zset for key. present is false when no zset exists; wrong is
 // true when the key instead holds a value in the string store, which every zset
 // command answers with WRONGTYPE.

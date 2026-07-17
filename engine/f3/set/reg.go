@@ -145,6 +145,23 @@ func Len(cx *shard.Ctx) int {
 	return len(cx.Coll.(*reg).m)
 }
 
+// RangeKeys calls fn with every set key on this shard, the set contribution to
+// the unified KEYS and SCAN walk. It builds no registry when none exists, so a
+// shard that ran no set command yields nothing. It returns false when fn asked
+// to stop, halting the outer walk for a bounded scan. The slice fn receives is
+// the map key's bytes, valid only for that call; fn copies what it keeps.
+func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
+	if cx.Coll == nil {
+		return true
+	}
+	for k := range cx.Coll.(*reg).m {
+		if !fn([]byte(k)) {
+			return false
+		}
+	}
+	return true
+}
+
 // lookup finds the set for key. present is false when no set exists; wrong is
 // true when the key instead holds a value in the string store, which every set
 // command answers with WRONGTYPE.

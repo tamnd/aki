@@ -43,6 +43,13 @@ const (
 	// transaction's loopback node at the same sequence, once the barrier work
 	// has run.
 	FanTxn
+
+	// FanKeys concatenates each shard's matched keys into one flat bulk array:
+	// KEYS. Each partial is a run of length-prefixed keys (the AppendFanValue
+	// framing: a 4-byte little-endian length then the bytes), and the gather
+	// appends every shard's keys into one array in arrival order, which KEYS
+	// leaves unordered like Redis.
+	FanKeys
 )
 
 // maxFanKeys caps the keys one sub-command carries, so a sub-command's
@@ -186,6 +193,29 @@ func (c *Conn) DoFanAll(op byte, kind FanKind) error {
 	return nil
 }
 
+// DoFanAllArgs is DoFanAll with a shared argument list every shard's
+// sub-command carries: the keyless scatter for a command that still takes an
+// argument, KEYS handing every shard its match pattern. The argv is the same
+// for every shard and read-only in the owner (the pattern), so it is enqueued
+// verbatim once per shard; enqueueFan copies its bytes into each node's span
+// table, so sharing the slice across shards is safe.
+func (c *Conn) DoFanAllArgs(op byte, kind FanKind, argv [][]byte) error {
+	if c.seq-c.emitted.Load() >= uint32(len(c.ring)) {
+		if err := c.throttle(); err != nil {
+			return err
+		}
+	}
+	// The countdown is final before the first enqueue; see DoFan.
+	fc := &fanCmd{kind: kind, pending: int32(len(c.rt.workers))}
+	for sh := range c.rt.workers {
+		if err := c.enqueueFan(sh, op, argv, fc); err != nil {
+			return err
+		}
+	}
+	c.seq++
+	return nil
+}
+
 // enqueueFan is Do's node handling for one sub-command: same node, same
 // spill-to-fresh-node rule, plus the coordinator pointer in the command's
 // slot. Every sub-command of one fan shares the connection's current
@@ -246,6 +276,16 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 		for k := 0; k+8 <= len(part) && k/8 < len(fc.stats); k += 8 {
 			fc.stats[k/8] += binary.LittleEndian.Uint64(part[k:])
 		}
+	case FanKeys:
+		for len(part) >= 4 {
+			n := binary.LittleEndian.Uint32(part)
+			part = part[4:]
+			if n == fanNil || int(n) > len(part) {
+				break
+			}
+			fc.vals = append(fc.vals, append([]byte(nil), part[:n]...))
+			part = part[n:]
+		}
 	}
 	fc.pending--
 	if fc.pending > 0 {
@@ -277,6 +317,11 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 		}
 	case FanStats:
 		fc.out = c.rt.renderStats(fc.out, fc.stats)
+	case FanKeys:
+		fc.out = resp.AppendArrayHeader(fc.out, len(fc.vals))
+		for _, v := range fc.vals {
+			fc.out = resp.AppendBulk(fc.out, v)
+		}
 	}
 	return c.deliver(seq, fc.out, emit)
 }
