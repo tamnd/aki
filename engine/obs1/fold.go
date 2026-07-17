@@ -93,7 +93,8 @@ type FoldedSegment struct {
 type FolderStats struct {
 	Records        uint64 // whole-record frames accumulated
 	Chunks         uint64 // collection chunk frames accumulated
-	Replaced       uint64 // re-staged records that replaced an accumulated copy
+	Tombstones     uint64 // delete claims accumulated
+	Replaced       uint64 // accumulated entries displaced by a newer state for the same key
 	PointerSkipped uint64 // pointer-band frames left to the separated-band route
 	NoEpoch        uint64 // frames dropped for want of a group epoch
 	SegmentsCut    uint64
@@ -204,15 +205,7 @@ func (f *Folder) Add(frames []byte) {
 			f.stats.NoEpoch++
 			return nil
 		}
-		g := f.groups[group]
-		if g == nil {
-			g = &foldGroup{seq: 1, recIdx: make(map[string]int), chIdx: make(map[string]int)}
-			f.groups[group] = g
-		}
-		g.epoch = epoch
-		if last > g.covered {
-			g.covered = last
-		}
+		g := f.groupFor(group, epoch, last)
 		touched[group] = g
 		if fr.Chunk {
 			id := string([]byte{fr.Kind}) + string(fr.Key) + "\x00" + string(fr.Disc)
@@ -237,14 +230,7 @@ func (f *Folder) Add(frames []byte) {
 		key := append([]byte(nil), fr.Key...)
 		h1, _ := bloomHash(key)
 		r := foldRec{kind: fr.Kind, fp: h1, key: key, frame: append([]byte(nil), fr.Frame...)}
-		if i, ok := g.recIdx[string(key)]; ok {
-			g.bytes += len(r.frame) - len(g.recs[i].frame)
-			g.recs[i] = r
-			f.stats.Replaced++
-		} else {
-			g.recIdx[string(key)] = len(g.recs)
-			g.recs = append(g.recs, r)
-			g.bytes += len(r.frame)
+		if f.putRec(g, r) {
 			f.stats.Records++
 		}
 		return nil
@@ -257,6 +243,70 @@ func (f *Folder) Add(frames []byte) {
 			f.cutLocked(group, g)
 		}
 	}
+}
+
+// Delete accumulates one tombstone for a committed delete of key (doc 06
+// section 1.3). Call it on the owner goroutine right after the WriteLog
+// delete emission, the same contract as the tap: the mark taken here then
+// covers the delete's seq, and the segment carrying the tombstone publishes
+// only once the watermark commits it. Within the accumulating segment the
+// tombstone displaces any pending copy of the key and a later re-set
+// displaces the tombstone; across segments a higher SegSeq claim shadows
+// every lower one. Emission is unfiltered until the keymap slice can tell
+// a never-folded key from a folded one; the extra tombstones shadow nothing
+// and rewrites drop them, so the cost is bytes, not correctness.
+func (f *Folder) Delete(key []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, group := f.cfg.MapKey(key)
+	epoch, last := f.cfg.Mark(group)
+	if epoch == 0 {
+		f.stats.NoEpoch++
+		return
+	}
+	g := f.groupFor(group, epoch, last)
+	k := append([]byte(nil), key...)
+	h1, _ := bloomHash(k)
+	r := foldRec{
+		kind: store.KindTombstone, fp: h1, key: k,
+		frame: store.AppendTombstoneFrame(nil, k),
+	}
+	f.putRec(g, r)
+	f.stats.Tombstones++
+	if g.bytes >= f.segTarget {
+		f.cutLocked(group, g)
+	}
+}
+
+// groupFor returns the group's accumulator, created on first touch, with
+// the eligibility snapshot folded in.
+func (f *Folder) groupFor(group uint16, epoch uint32, last uint64) *foldGroup {
+	g := f.groups[group]
+	if g == nil {
+		g = &foldGroup{seq: 1, recIdx: make(map[string]int), chIdx: make(map[string]int)}
+		f.groups[group] = g
+	}
+	g.epoch = epoch
+	if last > g.covered {
+		g.covered = last
+	}
+	return g
+}
+
+// putRec inserts one record or tombstone into the accumulator, newest state
+// per key winning. It reports whether the key was fresh; a displacement
+// counts as Replaced instead.
+func (f *Folder) putRec(g *foldGroup, r foldRec) bool {
+	if i, ok := g.recIdx[string(r.key)]; ok {
+		g.bytes += len(r.frame) - len(g.recs[i].frame)
+		g.recs[i] = r
+		f.stats.Replaced++
+		return false
+	}
+	g.recIdx[string(r.key)] = len(g.recs)
+	g.recs = append(g.recs, r)
+	g.bytes += len(r.frame)
+	return true
 }
 
 // Flush cuts every non-empty accumulator now, the age and shutdown

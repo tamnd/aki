@@ -74,14 +74,16 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 // segRecords parses a segment object and returns every whole record in it
-// by unpacking each run chunk's payload, plus the raw collection chunks.
-func segRecords(t *testing.T, obj []byte) (map[string]string, []store.FoldFrame) {
+// by unpacking each run chunk's payload, the tombstone keys from tombstone
+// run chunks, plus the raw collection chunks.
+func segRecords(t *testing.T, obj []byte) (map[string]string, map[string]bool, []store.FoldFrame) {
 	t.Helper()
 	seg, _, err := obs1.ParseSegment(obj)
 	if err != nil {
 		t.Fatalf("parse segment: %v", err)
 	}
 	recs := make(map[string]string)
+	tombs := make(map[string]bool)
 	var colls []store.FoldFrame
 	for _, e := range seg.Footer.Chunks {
 		data := seg.BlockData[e.Block][e.OffInBlock:]
@@ -96,18 +98,32 @@ func segRecords(t *testing.T, obj []byte) (map[string]string, []store.FoldFrame)
 		if outer.Kind != e.Kind || outer.Count != e.Count {
 			t.Fatalf("chunk entry disagrees with its frame: entry %+v frame kind 0x%02x count %d", e, outer.Kind, outer.Count)
 		}
-		if outer.Kind == kindString|store.ChunkKindBit {
+		switch outer.Kind {
+		case kindString | store.ChunkKindBit:
 			if werr := store.WalkStagedFrames(outer.Payload, func(r store.FoldFrame) error {
 				recs[string(r.Key)] = string(r.Payload)
 				return nil
 			}); werr != nil {
 				t.Fatalf("run payload walk: %v", werr)
 			}
-		} else {
+		case store.KindTombstone | store.ChunkKindBit:
+			if !outer.Tombstone {
+				t.Fatalf("tombstone run chunk not classified: %+v", outer)
+			}
+			if werr := store.WalkStagedFrames(outer.Payload, func(r store.FoldFrame) error {
+				if !r.Tombstone || len(r.Payload) != 0 {
+					t.Fatalf("tombstone frame misread: %+v", r)
+				}
+				tombs[string(r.Key)] = true
+				return nil
+			}); werr != nil {
+				t.Fatalf("tombstone payload walk: %v", werr)
+			}
+		default:
 			colls = append(colls, outer)
 		}
 	}
-	return recs, colls
+	return recs, tombs, colls
 }
 
 // TestFolderSegmentRoundTrip drives the whole slice on the simulator: a
@@ -142,7 +158,7 @@ func TestFolderSegmentRoundTrip(t *testing.T) {
 		t.Fatalf("object is %d bytes, ledger says %d", len(obj), led.Size)
 	}
 
-	recs, colls := segRecords(t, obj)
+	recs, _, colls := segRecords(t, obj)
 	if len(recs) != 10 {
 		t.Fatalf("segment holds %d records, want 10", len(recs))
 	}
@@ -254,12 +270,114 @@ func TestFolderDedupeRestaged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recs, _ := segRecords(t, obj)
+	recs, _, _ := segRecords(t, obj)
 	if len(recs) != 2 || recs["k"] != "new" || recs["other"] != "x" {
 		t.Fatalf("deduped records %v", recs)
 	}
 	if st := fx.folder.Stats(); st.Records != 2 || st.Replaced != 1 {
 		t.Fatalf("stats %+v", st)
+	}
+}
+
+// TestFolderTombstoneInterleave pins the within-segment story of doc 06
+// section 1.3: a delete displaces the pending copy of its key, a re-set
+// displaces a pending tombstone, an unseen key's delete still emits (the
+// keymap slice adds the never-folded filter), the tombstones pack into
+// their own run chunk, and the segment publishes only once the watermark
+// covers the marks the deletes were taken under.
+func TestFolderTombstoneInterleave(t *testing.T) {
+	ctx := context.Background()
+	fx := newFoldFixture(t, 0)
+	fx.last = 5
+
+	fx.folder.Add(frames("k1", "v1", "k2", "v2"))
+	fx.folder.Delete([]byte("k1"))
+	fx.folder.Delete([]byte("k3"))
+	fx.folder.Add(frames("k3", "v3"))
+	fx.folder.Flush()
+
+	waitFor(t, "put", func() bool { return fx.folder.Stats().SegmentsPut == 1 })
+	if got := fx.folder.Ledger(); len(got) != 0 {
+		t.Fatalf("published %d segments before the watermark covered the delete marks", len(got))
+	}
+	if err := fx.marks.ApplyVerdict(obs1.CommitVerdict{
+		Commit: obs1.CommitRecord{Sections: []obs1.CommitSection{{Group: 3, Epoch: 7, FirstSeq: 1, LastSeq: 5}}},
+		Live:   []bool{true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "publish", func() bool { return len(fx.folder.Ledger()) == 1 })
+
+	led := fx.folder.Ledger()[0]
+	if led.CoveredSeq != 5 || led.NRecords != 3 {
+		t.Fatalf("ledger row %+v", led)
+	}
+	obj, _, err := fx.sim.Get(ctx, led.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs, tombs, _ := segRecords(t, obj)
+	if len(recs) != 2 || recs["k2"] != "v2" || recs["k3"] != "v3" {
+		t.Fatalf("records %v", recs)
+	}
+	if len(tombs) != 1 || !tombs["k1"] {
+		t.Fatalf("tombstones %v", tombs)
+	}
+	st := fx.folder.Stats()
+	if st.Records != 2 || st.Tombstones != 2 || st.Replaced != 2 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+// TestFolderCrossSegmentShadow drives the shadowing rule across three
+// published segments: value, tombstone, re-set. The claims resolve by
+// SegSeq alone, order-independent: through the second segment the key is
+// absent, through the third it holds the newest value.
+func TestFolderCrossSegmentShadow(t *testing.T) {
+	ctx := context.Background()
+	fx := newFoldFixture(t, 0)
+
+	fx.folder.Add(frames("k", "v1"))
+	fx.folder.Flush()
+	waitFor(t, "first publish", func() bool { return len(fx.folder.Ledger()) == 1 })
+	fx.folder.Delete([]byte("k"))
+	fx.folder.Flush()
+	waitFor(t, "second publish", func() bool { return len(fx.folder.Ledger()) == 2 })
+	fx.folder.Add(frames("k", "v2"))
+	fx.folder.Flush()
+	waitFor(t, "third publish", func() bool { return len(fx.folder.Ledger()) == 3 })
+
+	var claims []obs1.ShadowEntry
+	for _, led := range fx.folder.Ledger() {
+		obj, _, err := fx.sim.Get(ctx, led.Key)
+		if err != nil {
+			t.Fatalf("get %s: %v", led.Key, err)
+		}
+		recs, tombs, _ := segRecords(t, obj)
+		switch {
+		case tombs["k"]:
+			claims = append(claims, obs1.ShadowEntry{SegSeq: led.SegSeq, Tombstone: true})
+		case recs["k"] != "":
+			claims = append(claims, obs1.ShadowEntry{SegSeq: led.SegSeq, Frame: []byte(recs["k"])})
+		default:
+			t.Fatalf("segment %d holds no claim about k", led.SegSeq)
+		}
+	}
+	if len(claims) != 3 || claims[0].SegSeq != 1 || claims[1].SegSeq != 2 || claims[2].SegSeq != 3 {
+		t.Fatalf("claims %+v", claims)
+	}
+
+	if got, ok := obs1.ResolveShadow(claims[:2]); ok {
+		t.Fatalf("k resolved to %q through the tombstone", got)
+	}
+	// Order independence: the newest claim wins from either end.
+	rev := []obs1.ShadowEntry{claims[2], claims[0], claims[1]}
+	got, ok := obs1.ResolveShadow(rev)
+	if !ok || string(got) != "v2" {
+		t.Fatalf("k resolved to %q %v, want v2 true", got, ok)
+	}
+	if _, ok := obs1.ResolveShadow(nil); ok {
+		t.Fatal("no claims resolved to present")
 	}
 }
 
@@ -320,7 +438,7 @@ func TestFolderRealDrainRoundTrip(t *testing.T) {
 		if gerr != nil {
 			t.Fatalf("get %s: %v", led.Key, gerr)
 		}
-		recs, _ := segRecords(t, obj)
+		recs, _, _ := segRecords(t, obj)
 		for k, v := range recs {
 			var i int
 			if _, serr := fmt.Sscanf(k, "k:%d", &i); serr != nil {
