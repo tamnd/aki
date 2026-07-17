@@ -134,6 +134,22 @@ func (f *fakeLog) ListMove(src, dst []byte, srcFront, dstFront bool, value []byt
 	return dg, ds, sg, ss, err
 }
 
+func (f *fakeLog) StreamAdd(key []byte, created bool, idMs, idSeq uint64, fieldsValues [][]byte, trimmed uint64) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) StreamTrim(key []byte, removed uint64) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) StreamDel(key []byte, ms, seqs []uint64) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) StreamSetID(key []byte, lastMs, lastSeq, entriesAdded, maxDelMs, maxDelSeq uint64) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
 func (f *fakeLog) NotifyCommitted(group uint16, seq uint64, fn func()) {
 	f.pending = append(f.pending, fakeNotify{group: group, seq: seq, fn: fn})
 }
