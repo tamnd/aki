@@ -517,7 +517,7 @@ func BenchmarkLMPOP(b *testing.B) {
 			g.m["a"] = seedList(bigVals("a", 4096)...) // native band, ~ a few hundred chunks
 			b.StartTimer()
 		}
-		out, _, _ := lmpop(g, cx, buf[:0], keys, true, 1)
+		out, _, _, _ := lmpop(g, cx, buf[:0], keys, true, 1)
 		buf = out
 	}
 }
