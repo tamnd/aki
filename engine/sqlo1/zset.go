@@ -22,6 +22,15 @@ type ZSet struct {
 
 	// sbuf holds the encoded score image of the current point write.
 	sbuf [zmemScoreLen]byte
+
+	// Score-side scratch, zrun.go: the decoded fence of the root
+	// under operation, the tail image a root write lands, the run
+	// images an op builds, and the run subkey.
+	zfence []zFenceEnt
+	ztail  []byte
+	zrbuf  []byte
+	zrbuf2 []byte
+	zkbuf  [SubkeySize]byte
 }
 
 // NewZSet builds the zset layer over t.
