@@ -196,6 +196,27 @@ func Len(cx *shard.Ctx) int {
 	return len(v.(*reg).m)
 }
 
+// VolatileLen counts the hashes on this shard carrying a key-level TTL, the hash
+// contribution to INFO's Keyspace expires field. It counts the whole-key
+// deadline (EXPIRE), not the per-field HEXPIRE TTLs, which belong to the
+// Keyspace subexpiry census owed to a later slice. It walks the registry map
+// counting a non-zero key deadline whether or not it has passed, matching the
+// map-size basis of Len. INFO is a cold path, so the O(keys) walk is off every
+// command's critical path. It builds no registry when none exists.
+func VolatileLen(cx *shard.Ctx) uint64 {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return 0
+	}
+	var n uint64
+	for _, h := range v.(*reg).m {
+		if h.expireAt != 0 {
+			n++
+		}
+	}
+	return n
+}
+
 // RangeKeys calls fn with every hash key on this shard, the hash contribution to
 // the unified KEYS and SCAN walk. It reaches the registry through regs.Load so a
 // shard that ran no hash command builds nothing and yields nothing. It returns

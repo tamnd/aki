@@ -31,6 +31,7 @@ const (
 	StatDemotes
 	StatBackpressureWaits
 	StatBackpressureStalls
+	StatVolatileKeys
 	NumStats
 )
 
@@ -55,6 +56,7 @@ var statNames = [NumStats]string{
 
 	StatBackpressureWaits:  "backpressure_waits",
 	StatBackpressureStalls: "backpressure_stalls",
+	StatVolatileKeys:       "volatile_keys",
 }
 
 // appendStat writes one name:value INFO line.
@@ -95,6 +97,23 @@ func (r *Runtime) renderStats(dst []byte, stats []uint64) []byte {
 			continue
 		}
 		text = appendStat(text, statNames[i], stats[i])
+	}
+	// The Keyspace section reports one db line the way redis does, folded from
+	// the summed counters: keys is the whole-keyspace live count (StatKeys, every
+	// type), expires the count carrying a key-level TTL (StatVolatileKeys). The
+	// header always shows, matching redis; the db0 line shows only when the db
+	// holds keys, so a fresh server renders the header with no db line, as redis
+	// does. avg_ttl stays 0 (redis reports the active-cycle running estimate,
+	// which f3's lazy-only expiry does not sample yet) and subexpiry 0 (the
+	// per-field HEXPIRE census is owed to a later slice); both are honest zeros a
+	// redis client parses without complaint.
+	text = append(text, "\r\n# Keyspace\r\n"...)
+	if keys := get(StatKeys); keys != 0 {
+		text = append(text, "db0:keys="...)
+		text = strconv.AppendUint(text, keys, 10)
+		text = append(text, ",expires="...)
+		text = strconv.AppendUint(text, get(StatVolatileKeys), 10)
+		text = append(text, ",avg_ttl=0,subexpiry=0\r\n"...)
 	}
 	if r.netInfo != nil {
 		text = r.netInfo(text)
