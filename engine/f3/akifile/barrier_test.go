@@ -3,11 +3,7 @@ package akifile
 import "testing"
 
 func encodeBarrier(h BarrierHeader, shards []BarrierShard) []byte {
-	payload := AppendBarrierHeader(nil, h)
-	for _, s := range shards {
-		payload = AppendBarrierShard(payload, s)
-	}
-	return payload
+	return MarshalBarrier(h, shards)
 }
 
 // TestBarrierRoundTrip builds a barrier over four shards and reads back the watermark
