@@ -83,6 +83,13 @@ type Store struct {
 	// materializes here. Owner goroutine only, valid until the next recordRow.
 	rlogScratch []byte
 
+	// replaying suppresses the record log while recovery reapplies the log to
+	// rebuild the index (recovery.go): a replayed SET or DEL must not re-log the
+	// row it is reading back, which would double the log and mis-count its dead
+	// bytes. It is set only for the duration of ReplayRecords, so the steady-state
+	// commit path never tests it under load beyond a single branch.
+	replaying bool
+
 	// spillLedger records where each provisional word from the current batch was
 	// written (spillledger.go): one entry per staged run, the value-area offset
 	// vs of the record's run pointer and the run's stage index. resolveSpill
