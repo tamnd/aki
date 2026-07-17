@@ -448,6 +448,98 @@ func TestScanSegmentsStopsAtTornTail(t *testing.T) {
 	}
 }
 
+// TestPersistenceDerivesFromLiveRoot reads the INFO persistence fields straight off the
+// live checkpoint with no scan: the byte accounting comes from the meta slot, the shard
+// count from the prefix, the replay backlog from the earliest shard checkpoint against the
+// durable tail, and the next ttl drop from the reclaim index.
+func TestPersistenceDerivesFromLiveRoot(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	offs, err := f.AppendGroup([]Pending{
+		{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("first")},
+		{Shard: 0, Kind: KindLog, ShardSeq: 2, Payload: []byte("second")},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	tail := f.Cursor() // the scan stops at the SRT bytes we lay down next
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	for i := range rows {
+		rows[i].FirstTailSeg = offs[0] // earliest un-checkpointed segment, at the head page
+	}
+	srtOff := tail
+	srtLen := SRTHeaderLen + len(rows)*SRTRowSize
+	writeSRTAt(t, dev, prefix, srtOff, &SRT{Gen: 3, Rows: rows})
+
+	ttl := encodeTTLIndex([]TTLClass{
+		{Class: 1, ExpiryUpperUnix: 5000, Segments: []uint64{0x1000}},
+		{Class: 2, ExpiryUpperUnix: 3000, Segments: []uint64{0x2000}},
+	})
+	ttlOff := srtOff + uint64(srtLen)
+	if _, err := dev.WriteAt(ttl, int64(ttlOff)); err != nil {
+		t.Fatalf("write ttl index: %v", err)
+	}
+
+	m := &MetaSlot{
+		CommitSeq: 7, CleanShutdown: 1,
+		FileSize:  ttlOff + uint64(len(ttl)),
+		LiveBytes: 1600, DeadBytes: 400, RecordCount: 3, LastCkptUnix: 12345,
+		SRTOff: srtOff, SRTLen: uint32(srtLen), SRTShardCount: prefix.ShardCount,
+		TTLIndexOff: ttlOff, TTLIndexLen: uint32(len(ttl)),
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	pi := rep.Persistence()
+
+	if pi.FileSizeLogical != m.FileSize || pi.FileSizePhysical != rep.PhysicalSize {
+		t.Fatalf("sizes = logical %d physical %d, want %d/%d", pi.FileSizeLogical, pi.FileSizePhysical, m.FileSize, rep.PhysicalSize)
+	}
+	if pi.LiveBytes != 1600 || pi.DeadBytes != 400 || pi.RecordCount != 3 {
+		t.Fatalf("accounting = live %d dead %d records %d, want 1600/400/3", pi.LiveBytes, pi.DeadBytes, pi.RecordCount)
+	}
+	if pi.DeadFraction != 0.2 {
+		t.Fatalf("dead fraction = %v, want 0.2", pi.DeadFraction)
+	}
+	if pi.ShardCount != prefix.ShardCount {
+		t.Fatalf("shard count = %d, want %d", pi.ShardCount, prefix.ShardCount)
+	}
+	if pi.CkptLagBytes != tail-offs[0] {
+		t.Fatalf("ckpt lag = %d, want the tail past the head-page checkpoint %d", pi.CkptLagBytes, tail-offs[0])
+	}
+	if pi.LastCkptUnix != 12345 {
+		t.Fatalf("last ckpt = %d, want 12345", pi.LastCkptUnix)
+	}
+	if pi.TTLNextDropUnix != 3000 {
+		t.Fatalf("next ttl drop = %d, want the soonest class bound 3000", pi.TTLNextDropUnix)
+	}
+}
+
+// TestPersistenceNoRootIsZero returns the zero value when both slots tore: the file has no
+// trusted root to report from, so INFO persistence has nothing to derive.
+func TestPersistenceNoRootIsZero(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+	dev.buf[prefix.MetaSlotAOff+3] ^= 0xff
+	dev.buf[prefix.MetaSlotBOff+3] ^= 0xff
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if pi := rep.Persistence(); pi != (PersistenceInfo{}) {
+		t.Fatalf("persistence = %+v, want the zero value with no trusted root", pi)
+	}
+}
+
 // TestScanSegmentsEmptyFile tallies nothing on a fresh file and reports the durable
 // tail at the header page: the whole append space is empty.
 func TestScanSegmentsEmptyFile(t *testing.T) {

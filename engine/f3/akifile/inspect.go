@@ -25,20 +25,22 @@ type SlotReport struct {
 // hard failure, so a tool can still print the rest of the file's shape. Live is
 // the live slot index (0 or 1), or -1 when both slots are torn.
 type Report struct {
-	Prefix     *Prefix
-	Slots      [2]SlotReport
-	Live       int
-	SRT        *SRT
-	SRTErr     error
-	Extents    []Extent
-	ExtErr     error
-	TTL        []TTLClass
-	TTLErr     error
-	FreeMap    []FreeExtent
-	FreeMapErr error
-	MetaKV     []MetaKVPair
-	MetaKVErr  error
-	Segments   SegmentTally
+	Prefix       *Prefix
+	Slots        [2]SlotReport
+	Live         int
+	LiveMeta     *MetaSlot // the live slot's decoded fields, nil when both slots tore
+	PhysicalSize uint64    // the device size, the physical footprint on disk
+	SRT          *SRT
+	SRTErr       error
+	Extents      []Extent
+	ExtErr       error
+	TTL          []TTLClass
+	TTLErr       error
+	FreeMap      []FreeExtent
+	FreeMapErr   error
+	MetaKV       []MetaKVPair
+	MetaKVErr    error
+	Segments     SegmentTally
 }
 
 // Inspect reads a file end to end and assembles a Report without changing a byte:
@@ -95,6 +97,8 @@ func Inspect(dev Device) (*Report, error) {
 		rep.Live, live = 1, slots[1]
 	}
 
+	rep.LiveMeta = live
+
 	// The roots the live slot names, best effort: a torn root is a finding a tool
 	// prints, not a reason to abandon the whole report.
 	if live != nil {
@@ -111,12 +115,84 @@ func Inspect(dev Device) (*Report, error) {
 	if err != nil {
 		return nil, err
 	}
+	rep.PhysicalSize = uint64(size)
 	seg, err := ScanSegments(dev, prefix, PageSize, uint64(size))
 	if err != nil {
 		return nil, err
 	}
 	rep.Segments = seg
 	return rep, nil
+}
+
+// PersistenceInfo is what INFO persistence reports from the meta slot and SRT with no scan
+// (spec 2064/f3/07 section 9). The bytes come from the live checkpoint's accounting, so a
+// reopened server answers straight from the root it just picked; these are the fields
+// 18-benchmark-methodology reads before publishing an LTM memory ratio, so a false regime
+// cannot be mistaken for a win (L26).
+type PersistenceInfo struct {
+	FileSizeLogical  uint64  // the durable committed extent the live root stamped
+	FileSizePhysical uint64  // the device footprint, at or past logical after a crash tail
+	LiveBytes        uint64  // bytes still referenced by a live index entry
+	DeadBytes        uint64  // superseded bytes, the compaction trigger's fuel
+	DeadFraction     float64 // dead / (live + dead), zero when the file holds nothing
+	RecordCount      uint64  // live records the checkpoint counted
+	ShardCount       uint32
+	CkptLagBytes     uint64 // durable tail past the earliest shard checkpoint, the replay backlog
+	LastCkptUnix     uint64 // when the live checkpoint was cut (Redis LASTSAVE)
+	TTLNextDropUnix  uint64 // the soonest ttl class bound, zero when no class is tracked
+}
+
+// Persistence derives the INFO persistence fields from the report's live root, no scan
+// (spec 2064/f3/07 section 9). It reads the byte accounting off the live meta slot, the
+// shard count off the prefix, the checkpoint lag off the SRT rows against the durable tail,
+// and the next ttl drop off the reclaim index. With no trusted root (both slots torn) it
+// returns a zero value: the file has no root to report from, which is itself the finding.
+func (r *Report) Persistence() PersistenceInfo {
+	if r.LiveMeta == nil {
+		return PersistenceInfo{}
+	}
+	m := r.LiveMeta
+	info := PersistenceInfo{
+		FileSizeLogical:  m.FileSize,
+		FileSizePhysical: r.PhysicalSize,
+		LiveBytes:        m.LiveBytes,
+		DeadBytes:        m.DeadBytes,
+		RecordCount:      m.RecordCount,
+		ShardCount:       r.Prefix.ShardCount,
+		LastCkptUnix:     m.LastCkptUnix,
+	}
+	if total := m.LiveBytes + m.DeadBytes; total > 0 {
+		info.DeadFraction = float64(m.DeadBytes) / float64(total)
+	}
+	// The replay backlog is the durable tail past the earliest shard checkpoint: the shard
+	// whose first un-checkpointed segment sits earliest has the most tail to replay.
+	tail := r.Segments.DurableTail
+	earliest := uint64(0)
+	if r.SRT != nil {
+		for i := range r.SRT.Rows {
+			ft := r.SRT.Rows[i].FirstTailSeg
+			if ft == 0 || ft > tail {
+				continue
+			}
+			if earliest == 0 || ft < earliest {
+				earliest = ft
+			}
+		}
+	}
+	if earliest != 0 {
+		info.CkptLagBytes = tail - earliest
+	}
+	// The next ttl drop is the soonest class bound across the reclaim index.
+	for i := range r.TTL {
+		u := r.TTL[i].ExpiryUpperUnix
+		if u == 0 {
+			continue
+		}
+		if info.TTLNextDropUnix == 0 || u < info.TTLNextDropUnix {
+			info.TTLNextDropUnix = u
+		}
+	}
+	return info
 }
 
 // Findings lists the integrity problems a verify pass reports, in file order: a
@@ -250,6 +326,13 @@ func WriteReport(w io.Writer, r *Report) error {
 	sort.Ints(kinds)
 	for _, k := range kinds {
 		ew.printf("  %-12s %d\n", kindName(uint16(k)), r.Segments.ByKind[uint16(k)])
+	}
+
+	if r.LiveMeta != nil {
+		pi := r.Persistence()
+		ew.printf("persistence: logical %d  physical %d  live %d  dead %d (%.1f%%)  records %d  ckpt_lag %d\n",
+			pi.FileSizeLogical, pi.FileSizePhysical, pi.LiveBytes, pi.DeadBytes,
+			pi.DeadFraction*100, pi.RecordCount, pi.CkptLagBytes)
 	}
 
 	fs := r.Findings()
