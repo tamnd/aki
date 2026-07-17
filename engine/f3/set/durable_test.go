@@ -168,6 +168,140 @@ func TestSetEffectLogRecovers(t *testing.T) {
 	}
 }
 
+// TestSetSnapshotRecovers is the slice-3 round trip across a checkpoint boundary
+// (spec 2064/f3/M8-collection-durability-plan slice 3): build sets with effects, fold
+// them to snapshot frames the way the checkpoint dumper does, then mutate past the
+// snapshot, close, reopen, and recover. The reopen must rebuild each set from its
+// snapshot and replay only the effect tail cut after it, so the recovered state is
+// the composition of the snapshot and the later effects, and a key TTL taken at
+// snapshot time survives. It also proves a snapshot-restored key an effect empties is
+// dropped, and that the pre-snapshot effects do not leak past the snapshot reset.
+func TestSetSnapshotRecovers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "setsnap.aki")
+	create := func() *akifile.File {
+		f, err := akifile.Create(path, akifile.CreateOptions{ShardCount: 4, Sync: akifile.SyncNo})
+		if err != nil {
+			t.Fatalf("create aki: %v", err)
+		}
+		return f
+	}
+	openStore := func(f *akifile.File) *store.Store {
+		s, err := store.Open(store.Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20, AkiValueLog: f, Shard: 1})
+		if err != nil {
+			t.Fatalf("open aki store: %v", err)
+		}
+		return s
+	}
+
+	// First run: build sets with effects, give one a TTL, fold to snapshots, then
+	// mutate past the snapshot so recovery must compose the snapshot with a tail.
+	f := create()
+	s := openStore(f)
+	cx := &shard.Ctx{St: s, NowMs: 1}
+	g := registry(cx)
+
+	saddD(cx, g, "colors", "red", "green", "blue")
+	saddD(cx, g, "nums", "1", "2", "3")
+	saddD(cx, g, "gone", "x", "y")
+	const ttl = int64(5_000_000) // far past NowMs, so the set is live at snapshot and recovery
+	g.m["colors"].expireAt = ttl
+
+	Snapshot(cx) // fold every live set to a snapshot frame, the checkpoint dumper
+
+	// Effects after the snapshot: colors loses green and gains yellow, nums swaps a
+	// member, and gone is emptied so its snapshot-restored form must drop on replay.
+	sremD(cx, g, "colors", "green")
+	saddD(cx, g, "colors", "yellow")
+	sremD(cx, g, "nums", "2")
+	saddD(cx, g, "nums", "9")
+	sremD(cx, g, "gone", "x", "y")
+
+	wantColors := members(g.m["colors"]) // [blue red yellow]
+	wantNums := members(g.m["nums"])     // [1 3 9]
+	if _, ok := g.m["gone"]; ok {
+		t.Fatal("gone should be empty in the first run")
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	// Second run: reopen into a fresh store and empty registry, then recover from the
+	// snapshot base plus the effect tail.
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	s2 := openStore(f2)
+	t.Cleanup(func() { _ = s2.Close(); _ = f2.Close() })
+	cx2 := &shard.Ctx{St: s2, NowMs: 1}
+
+	if err := Recover(cx2); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	g2 := registry(cx2)
+
+	if got := members(g2.m["colors"]); !reflect.DeepEqual(got, wantColors) {
+		t.Fatalf("colors after recovery = %v, want %v", got, wantColors)
+	}
+	if got := members(g2.m["nums"]); !reflect.DeepEqual(got, wantNums) {
+		t.Fatalf("nums after recovery = %v, want %v", got, wantNums)
+	}
+	if _, ok := g2.m["gone"]; ok {
+		t.Fatal("gone came back after recovery, snapshot restored a key the tail emptied")
+	}
+	if got := g2.m["colors"].expireAt; got != ttl {
+		t.Fatalf("colors TTL after recovery = %d, want %d (snapshot header must carry it)", got, ttl)
+	}
+}
+
+// TestSetSnapshotOnlyRecovers proves the snapshot alone rebuilds a set with no effect
+// tail after it, the bounded path a clean shutdown followed by a reopen takes: the
+// checkpoint holds the whole set, the effect log past it is empty, and recovery reads
+// the set back from the snapshot frame only.
+func TestSetSnapshotOnlyRecovers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "setsnaponly.aki")
+	f, err := akifile.Create(path, akifile.CreateOptions{ShardCount: 4, Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	s, err := store.Open(store.Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20, AkiValueLog: f, Shard: 1})
+	if err != nil {
+		t.Fatalf("open aki store: %v", err)
+	}
+	cx := &shard.Ctx{St: s, NowMs: 1}
+	g := registry(cx)
+	saddD(cx, g, "s", "a", "b", "c")
+	Snapshot(cx)
+	want := members(g.m["s"])
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	s2, err := store.Open(store.Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20, AkiValueLog: f2, Shard: 1})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close(); _ = f2.Close() })
+	cx2 := &shard.Ctx{St: s2, NowMs: 1}
+	if err := Recover(cx2); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if got := members(registry(cx2).m["s"]); !reflect.DeepEqual(got, want) {
+		t.Fatalf("set after snapshot-only recovery = %v, want %v", got, want)
+	}
+}
+
 // TestSetEffectLogNoopWithoutFile proves the log helpers and Recover are inert on a
 // plain in-memory store with no .aki handle: the mutations still land in the
 // registry, nothing is logged, and Recover walks nothing and rebuilds nothing.

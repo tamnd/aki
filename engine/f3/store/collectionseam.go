@@ -54,29 +54,72 @@ func (s *Store) LogCollectionOp(key []byte, kind akifile.CollKind, op uint8, sub
 	}
 }
 
-// WalkCollectionOps replays this shard's collection effect frames for one kind in
-// append order, decoding each payload and handing the collection key and the decoded
-// op to visit. It skips string records, tombstones, snapshots, and the other types'
-// collection frames, so each type's recovery reapplies only its own mutations. On a
-// store with no record log it is a no-op. The key and the payload slices alias the
-// segment for the visit's duration, so a visit that keeps them copies. A decode
-// error on a CRC-clean but malformed payload stops the walk, the fail-closed cut a
-// recovering reader wants.
-func (s *Store) WalkCollectionOps(kind akifile.CollKind, visit func(key []byte, row akifile.CollOpRow) error) error {
+// LogCollectionSnap durably appends a whole-collection snapshot to the shared .aki
+// record log: the collection key rides the frame's key slot and the snapshot payload
+// (kind, header, element run) rides its value slot under RecFlagCollectionSnap. It is
+// the base a reopen rebuilds a collection from before it replays the effect tail cut
+// after it, the collection sibling of the string index checkpoint. Like
+// LogCollectionOp it no-ops on a store with no record log or mid-replay, stages and
+// cuts eagerly, and holds a cut failure in rlogErr for the ack-barrier path.
+func (s *Store) LogCollectionSnap(key []byte, kind akifile.CollKind, header, elementRun []byte) {
+	if s.akirlog == nil || s.replaying {
+		return
+	}
+	s.collScratch = akifile.AppendCollSnap(s.collScratch[:0], akifile.CollSnapRow{
+		Kind:       kind,
+		Header:     header,
+		ElementRun: elementRun,
+	})
+	s.akirlog.stage(akifile.RecordRow{
+		Flags:    akifile.RecFlagCollectionSnap,
+		ValueLen: uint32(len(s.collScratch)),
+		Value:    s.collScratch,
+		Key:      key,
+	})
+	if _, err := s.akirlog.flush(); err != nil && s.rlogErr == nil {
+		s.rlogErr = err
+	}
+}
+
+// WalkCollection replays this shard's collection frames for one kind in append
+// order, routing each to onSnap or onOp by whether it is a snapshot or an effect. A
+// snapshot frame resets its key and every later effect for that key applies on top,
+// so a recovery that resets on onSnap and mutates on onOp rebuilds the collection
+// from the last snapshot plus its effect tail, the bounded path the string index
+// recovery already takes. It skips string records, tombstones, and the other types'
+// collection frames. On a store with no record log it is a no-op. The key and the
+// payload slices alias the segment for the callback's duration, so a callback that
+// keeps them copies. A decode error on a CRC-clean but malformed payload stops the
+// walk, the fail-closed cut a recovering reader wants.
+func (s *Store) WalkCollection(
+	kind akifile.CollKind,
+	onSnap func(key []byte, row akifile.CollSnapRow) error,
+	onOp func(key []byte, row akifile.CollOpRow) error,
+) error {
 	if s.akirlog == nil {
 		return nil
 	}
 	return s.akirlog.walkShard(func(_ uint64, rec akifile.RecordRow) error {
-		if rec.Flags&akifile.RecFlagCollectionOp == 0 {
-			return nil
+		switch {
+		case rec.Flags&akifile.RecFlagCollectionSnap != 0:
+			snap, err := akifile.ParseCollSnap(rec.Value)
+			if err != nil {
+				return err
+			}
+			if snap.Kind != kind {
+				return nil
+			}
+			return onSnap(rec.Key, snap)
+		case rec.Flags&akifile.RecFlagCollectionOp != 0:
+			op, err := akifile.ParseCollOp(rec.Value)
+			if err != nil {
+				return err
+			}
+			if op.Kind != kind {
+				return nil
+			}
+			return onOp(rec.Key, op)
 		}
-		op, err := akifile.ParseCollOp(rec.Value)
-		if err != nil {
-			return err
-		}
-		if op.Kind != kind {
-			return nil
-		}
-		return visit(rec.Key, op)
+		return nil
 	})
 }
