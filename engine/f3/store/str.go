@@ -304,7 +304,7 @@ func (s *Store) SetExpire(key, val []byte, at, now int64) (bool, error) {
 	}
 	if !slotCold(*slot) && s.recFlags(addr)&flagHasTTL != 0 {
 		s.setExpireAt(addr, at)
-		return true, nil
+		return true, s.logRecord(addr)
 	}
 	if at == 0 {
 		return true, nil
@@ -329,6 +329,7 @@ func (s *Store) Persist(key []byte, now int64) bool {
 		return false
 	}
 	s.setExpireAt(addr, 0)
+	s.logRecordSticky(addr)
 	return true
 }
 
