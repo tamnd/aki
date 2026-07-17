@@ -95,6 +95,13 @@ type WriteLogConfig struct {
 	BarrierFloor time.Duration
 	CapBytes     int
 
+	// StartSeq is the first WAL object seq the flusher writes,
+	// Recovery.NextWALSeq on a same-node restart; zero means 1, the
+	// fresh-node shape. Reusing an occupied seq is unsafe: the PUT hits
+	// our own tag on the previous incarnation's object and the recheck
+	// silently adopts the old content (#1074's recorded hazard).
+	StartSeq uint64
+
 	// OnCommitted, when set, hears every committed WAL seq in order, the
 	// doc 06 fold-accounting seam passed through to the committer.
 	OnCommitted func(walSeq uint64, pos ChainPos)
@@ -161,6 +168,7 @@ func NewWriteLog(cfg WriteLogConfig) (*WriteLog, error) {
 		FlushAge:     cfg.FlushAge,
 		BarrierFloor: cfg.BarrierFloor,
 		CapBytes:     cfg.CapBytes,
+		StartSeq:     cfg.StartSeq,
 	})
 	if err != nil {
 		_ = cm.Close()

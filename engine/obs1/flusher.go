@@ -440,7 +440,7 @@ func (fl *Flusher) failLocked(err error) {
 }
 
 func (fl *Flusher) walKey(seq uint64) string {
-	return dbKey(fl.cfg.Prefix, fmt.Sprintf("wal/%016x/%s", fl.cfg.Node, seq16(seq)))
+	return walObjectKey(fl.cfg.Prefix, fl.cfg.Node, seq)
 }
 
 // run is the flusher goroutine: swap when a trigger fires and a
