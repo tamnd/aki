@@ -36,7 +36,7 @@ func Hincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	var cur int64
+	var cur, keepAt int64
 	if h != nil {
 		if v, ok := h.get(args[1]); ok {
 			cur, ok = store.ParseInt(v)
@@ -44,6 +44,9 @@ func Hincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 				r.Err("ERR hash value is not an integer")
 				return
 			}
+			// HINCRBY preserves the field's TTL where HSET clears it, so the
+			// emission restores the deadline behind the hset frame it writes.
+			keepAt = int64(h.fieldExp(args[1]))
 		}
 	}
 	if (delta > 0 && cur > math.MaxInt64-delta) || (delta < 0 && cur < math.MinInt64-delta) {
@@ -51,12 +54,18 @@ func Hincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	sum := cur + delta
+	created := false
 	if h == nil {
-		_, h, _ = getOrCreate(cx, args[0])
+		_, h, created, _ = getOrCreate(cx, args[0])
 	}
 	var nb [20]byte
-	h.set(args[1], strconv.AppendInt(nb[:0], sum, 10))
+	out := strconv.AppendInt(nb[:0], sum, 10)
+	h.set(args[1], out)
 	g.note(h)
+	if err := cx.LogHashSet(args[0], created, [][]byte{args[1], out}, keepAt); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	r.Int(sum)
 }
 
@@ -88,6 +97,7 @@ func Hincrbyfloat(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	var cur float64
+	var keepAt int64
 	if h != nil {
 		if v, ok := h.get(args[1]); ok {
 			cur, ok = store.ParseRedisFloat(v)
@@ -95,6 +105,8 @@ func Hincrbyfloat(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 				r.Err("ERR hash value is not a float")
 				return
 			}
+			// HINCRBYFLOAT preserves the field's TTL, the same restore HINCRBY emits.
+			keepAt = int64(h.fieldExp(args[1]))
 		}
 	}
 	sum := cur + incr
@@ -104,10 +116,15 @@ func Hincrbyfloat(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	var nb [40]byte
 	out := resp.FormatScore(nb[:0], sum)
+	created := false
 	if h == nil {
-		_, h, _ = getOrCreate(cx, args[0])
+		_, h, created, _ = getOrCreate(cx, args[0])
 	}
 	h.set(args[1], out)
 	g.note(h)
+	if err := cx.LogHashSet(args[0], created, [][]byte{args[1], out}, keepAt); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	r.Bulk(out)
 }
