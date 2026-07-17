@@ -672,26 +672,40 @@ func (w *worker) executeCmd(b *hopBatch, i int) {
 	w.cx.curConn = b.conn // completion target for a Park; owner-local, per command
 	w.cx.curSeq = c.seq
 	h(&w.cx, argv, r)
-	// Strict acks: a write that emitted WAL frames on a strict connection holds
-	// its reply until the covering chain commit (strict.go). Marks only
-	// accumulate on a strict connection with a log wired, so every other path
-	// pays one length load here.
-	if len(w.cx.marks) != 0 {
-		w.strictHold(b, i)
-		w.cx.marks = w.cx.marks[:0]
+	// Block-not-drop first: a write handler that could not allocate set parkFull
+	// through ParkFull instead of writing a reply. One bool load, zero cost when
+	// unset. Any marks the handler accumulated before parking are the committed
+	// prefix of a multi-key write (MSetShard pairs before the full one); the
+	// waiter carries them so the retry that completes the command still waits on
+	// them (strict.go). A re-park during a retry keeps its waiter: retryFull
+	// reads parkFull after this returns and carries the resume cursor and the
+	// marks forward itself, which is why neither is cleared on that path.
+	if w.cx.parkFull {
+		if !w.cx.retrying {
+			w.cx.parkFull = false
+			w.parkOnFull(b, i)
+			// parkOnFull captured the resume cursor and the marks onto the
+			// waiter; clear both so the next fresh command on this owner
+			// starts clean. The retry path resets them in retryFull instead.
+			w.cx.resume = 0
+			w.cx.marks = w.cx.marks[:0]
+		}
+		return
 	}
-	// Block-not-drop: a write handler that could not allocate set parkFull through
-	// ParkFull instead of writing a reply. One bool load, zero cost when unset; on
-	// the normal path it registers the command on the full-waiter FIFO, and the
-	// retry driver clears retrying so a re-park during a retry is read there rather
-	// than double-registered here (backpressure.go).
-	if w.cx.parkFull && !w.cx.retrying {
-		w.cx.parkFull = false
-		w.parkOnFull(b, i)
-		// parkOnFull captured the resume cursor onto the waiter; clear it so the
-		// next fresh command on this owner starts at 0 rather than inheriting this
-		// parked write's cursor. The retry path resets it in retryFull instead.
-		w.cx.resume = 0
+	// Strict acks: a write that emitted WAL frames on a strict connection holds
+	// its reply until the covering chain commit. Marks only accumulate on a
+	// strict connection with a log wired, so every other path pays one length
+	// load here. A point command parks its own slot at the owner (strict.go
+	// strictHold); a fan sub-command's partial merges on the connection writer,
+	// so its marks ride the node to the gather and the assembled reply parks
+	// there instead (fan.go mergeFan, strict.go holdFan).
+	if len(w.cx.marks) != 0 {
+		if b.fan(i) != nil {
+			b.setFanMarks(i, w.cx.marks)
+		} else {
+			w.strictHold(b, i)
+		}
+		w.cx.marks = w.cx.marks[:0]
 	}
 }
 

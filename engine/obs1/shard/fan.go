@@ -65,6 +65,13 @@ type fanCmd struct {
 	errMsg  []byte
 	out     []byte
 
+	// marks accumulates the WAL marks the sub-commands' partials carried
+	// (batch.go fanMarks), coalesced per group at the group's highest seq.
+	// Non-empty only for a strict connection's fan write; the gathered
+	// reply then parks on the covering commits (strict.go holdFan) instead
+	// of delivering.
+	marks []WALMark
+
 	// txn is the FanTxn coordinator's transaction: the arm builtin reads it
 	// on the owner to find the intent its key enqueues. Set before the first
 	// enqueue and immutable afterwards, so the owner-side read is ordered by
@@ -247,6 +254,12 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 			fc.stats[k/8] += binary.LittleEndian.Uint64(part[k:])
 		}
 	}
+	if ms := b.fanMark(i); len(ms) != 0 {
+		// Two sub-commands can mark the same group (a chunked shard, or the
+		// log's slot-to-group fold), so the merge coalesces exactly as
+		// noteMark does: per-group seqs are monotone, the highest covers all.
+		fc.marks = mergeMarks(fc.marks, ms)
+	}
 	fc.pending--
 	if fc.pending > 0 {
 		return 0
@@ -254,6 +267,8 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 	if fc.kind == FanTxn {
 		// The arms have all executed; the reply comes later on the
 		// transaction's loopback node, so there is nothing to emit here.
+		// No tier-two arm emits WAL frames today; when one does, its marks
+		// must ride the loopback reply, not this coordinator.
 		return 0
 	}
 	fc.out = fc.out[:0]
@@ -277,6 +292,16 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 		}
 	case FanStats:
 		fc.out = c.rt.renderStats(fc.out, fc.stats)
+	}
+	if len(fc.marks) != 0 {
+		// A strict fan write parks its assembled reply on the covering
+		// commits: the sequence stays unemitted so the reorder cursor stalls
+		// exactly as a point hold does, and the commit callbacks bring the
+		// bytes back through the CompleteBlocked loopback. An error reply
+		// (a failing pair after committed ones) holds the same way, so no
+		// reply on a strict connection ever races the frames it follows.
+		c.holdFan(seq, fc)
+		return 0
 	}
 	return c.deliver(seq, fc.out, emit)
 }
