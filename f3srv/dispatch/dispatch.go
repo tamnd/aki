@@ -5,6 +5,8 @@
 package dispatch
 
 import (
+	"encoding/binary"
+	"math/rand/v2"
 	"strconv"
 
 	"github.com/tamnd/aki/engine/f3/derived"
@@ -203,6 +205,15 @@ func init() {
 	register("KEYS", nil, 1, 1, false)
 	registerFan("KEYS", shard.FanKeys, keys, false, true)
 	table["KEYS"].fanArgs = true
+
+	// RANDOMKEY scatters keyless to every shard: each owner draws one uniform
+	// key from every keyspace it holds and answers it with its key count, and
+	// the gather reservoir-picks across the shards weighted by count, so the
+	// draw is uniform over the whole keyspace and returns a key whenever one
+	// exists on any shard. An empty keyspace answers the null bulk.
+	randomkey := registerShard(randomkeyShardAll)
+	register("RANDOMKEY", nil, 0, 0, false)
+	registerFan("RANDOMKEY", shard.FanRandom, randomkey, false, true)
 
 	// FLUSHALL scatters a reset intent to every shard; each owner rebuilds
 	// its store empty and the gather answers +OK only after every shard has
@@ -1283,6 +1294,38 @@ func keysShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	list.RangeKeys(cx, emit)
 	stream.RangeKeys(cx, emit)
 	r.Raw(part)
+}
+
+// randomkeyShardAll answers a RANDOMKEY sub-command: it reservoir-samples one
+// key uniformly across every keyspace this shard holds, the string store and the
+// five collection registries, and answers an 8-byte little-endian key count
+// followed by the drawn candidate. The gather weights each shard's candidate by
+// that count, so the whole-keyspace draw is uniform and returns a key whenever
+// any shard has one. A shard with no keys answers a zero count and no candidate.
+// It walks each keyspace through its read-only RangeKeys, so the draw sets no
+// residency state; a cold candidate's bytes are copied into the reservoir as
+// they are seen, before the walk moves past the cold scratch.
+func randomkeyShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	var chosen []byte
+	var count int64
+	pick := func(key []byte) bool {
+		count++
+		// Reservoir: the nth key seen becomes the held candidate with
+		// probability 1/n, so the candidate is uniform over this shard's keys.
+		if rand.Int64N(count) == 0 {
+			chosen = append(chosen[:0], key...)
+		}
+		return true
+	}
+	cx.St.RangeKeys(cx.NowMs, pick)
+	set.RangeKeys(cx, pick)
+	zset.RangeKeys(cx, pick)
+	hash.RangeKeys(cx, pick)
+	list.RangeKeys(cx, pick)
+	stream.RangeKeys(cx, pick)
+	var head [8]byte
+	binary.LittleEndian.PutUint64(head[:], uint64(count))
+	r.Raw(append(head[:], chosen...))
 }
 
 // globMatch reports whether str matches the glob pattern, the same operators
