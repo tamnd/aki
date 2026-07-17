@@ -103,6 +103,32 @@ func TestGetdel(t *testing.T) {
 	expect(t, br, "$-1\r\n")
 }
 
+// TestGetset walks GETSET: it writes the new value and returns the old one, or
+// nil when the key had none, reaching only the string keyspace like GET.
+func TestGetset(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// A first GETSET on a missing key returns nil and writes the value.
+	send(t, nc, "GETSET", "k", "one")
+	expect(t, br, "$-1\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$3\r\none\r\n")
+
+	// A second returns the old value and overwrites it.
+	send(t, nc, "GETSET", "k", "two")
+	expect(t, br, "$3\r\none\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$3\r\ntwo\r\n")
+
+	// An int-cell old value round-trips byte-identical.
+	send(t, nc, "SET", "n", "-42")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "GETSET", "n", "7")
+	expect(t, br, "$3\r\n-42\r\n")
+	send(t, nc, "GET", "n")
+	expect(t, br, "$1\r\n7\r\n")
+}
+
 // TestSetOptions exercises the NX/XX/GET/KEEPTTL/expiry option matrix against
 // the Redis answers.
 func TestSetOptions(t *testing.T) {
