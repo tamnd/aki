@@ -101,6 +101,23 @@ func Has(cx *shard.Ctx, key []byte) bool {
 	return z != nil
 }
 
+// Delete removes key when it holds a zset on this shard and reports whether it
+// did: the zset arm of the unified single-key DEL. It builds no registry when
+// none exists, so a DEL over a key of another type touches nothing here. Cold
+// chunks a demoted zset left behind are not reclaimed yet, the same deferral
+// every collection carries until the cold-reclamation slice threads DEL.
+func Delete(cx *shard.Ctx, key []byte) bool {
+	if cx.ZColl == nil {
+		return false
+	}
+	g := cx.ZColl.(*reg)
+	if g.m[string(key)] == nil {
+		return false
+	}
+	g.drop(key)
+	return true
+}
+
 // lookup finds the zset for key. present is false when no zset exists; wrong is
 // true when the key instead holds a value in the string store, which every zset
 // command answers with WRONGTYPE.

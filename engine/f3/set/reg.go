@@ -12,10 +12,10 @@ import (
 // the shard's Ctx.Coll (spec 2064/f3/11): one map from key to the inline set,
 // touched only by the shard goroutine, so it holds no lock. The string store
 // and this registry are separate keyspaces for now; the WRONGTYPE guard below
-// keeps a set command off a key the string store owns, and single-key set.Del
-// spans both. TYPE and single-key EXISTS have moved on to span every type
-// (their unified handlers consult set.Has here); full cross-type unification (a
-// SET overwriting a set, multi-key DEL over sets) lands with the keyspace slice;
+// keeps a set command off a key the string store owns. TYPE, single-key EXISTS,
+// and single-key DEL have moved on to span every type (their unified handlers
+// consult set.Has and set.Delete here); full cross-type unification (a SET
+// overwriting a set, multi-key DEL over sets) lands with the keyspace slice;
 // this slice keeps the set surface self-consistent and refuses the cross-type
 // collisions it cannot yet resolve.
 
@@ -102,6 +102,23 @@ func Has(cx *shard.Ctx, key []byte) bool {
 	}
 	s, _ := cx.Coll.(*reg).lookup(cx, key)
 	return s != nil
+}
+
+// Delete removes key when it holds a set on this shard and reports whether it
+// did: the set arm of the unified single-key DEL. It builds no registry when
+// none exists, so a DEL over a key of another type touches nothing here. Cold
+// chunks a demoted set left behind are not reclaimed yet, the same deferral
+// every collection carries until the cold-reclamation slice threads DEL.
+func Delete(cx *shard.Ctx, key []byte) bool {
+	if cx.Coll == nil {
+		return false
+	}
+	g := cx.Coll.(*reg)
+	if g.m[string(key)] == nil {
+		return false
+	}
+	g.drop(key)
+	return true
 }
 
 // lookup finds the set for key. present is false when no set exists; wrong is
