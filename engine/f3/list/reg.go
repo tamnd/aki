@@ -89,6 +89,22 @@ func Delete(cx *shard.Ctx, key []byte) bool {
 	return true
 }
 
+// Flush drops every list on this shard, the list arm of FLUSHALL and FLUSHDB. It
+// clears the map and zeroes the resident-byte total, so a flush leaves the
+// registry empty and weighing nothing, matching the store the flush just reset.
+// The blocking-pop waiters are kept: FLUSHALL does not unblock a parked BLPOP or
+// BLMOVE client (Redis leaves blocked clients blocked), so a later RPUSH to the
+// key serves them just as it would have. It builds no registry when none exists.
+func Flush(cx *shard.Ctx) {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return
+	}
+	g := v.(*reg)
+	g.m = make(map[string]*list)
+	g.resident = 0
+}
+
 // lookup finds the list for key. wrong is true when the key instead holds a
 // value in the string store, which every list command answers with WRONGTYPE.
 // Cross-type collisions with the set and zset registries are not resolved in

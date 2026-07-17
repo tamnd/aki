@@ -121,6 +121,20 @@ func Delete(cx *shard.Ctx, key []byte) bool {
 	return true
 }
 
+// Flush drops every set on this shard, the set arm of FLUSHALL and FLUSHDB. It
+// clears the map and zeroes the resident-byte total, so a flush leaves the
+// registry empty and weighing nothing, matching the store the flush just reset.
+// The draw PRNG and the scratch slices are kept, since a flush replaces the keys,
+// not the shard's registry object. It builds no registry when none exists.
+func Flush(cx *shard.Ctx) {
+	if cx.Coll == nil {
+		return
+	}
+	g := cx.Coll.(*reg)
+	g.m = make(map[string]*set)
+	g.resident = 0
+}
+
 // lookup finds the set for key. present is false when no set exists; wrong is
 // true when the key instead holds a value in the string store, which every set
 // command answers with WRONGTYPE.
