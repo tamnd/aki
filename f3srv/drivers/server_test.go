@@ -178,6 +178,27 @@ func readArrayBulks(t *testing.T, br *bufio.Reader, n int) []string {
 	return out
 }
 
+// TestSelect checks the single-keyspace SELECT: index 0 succeeds, any other index
+// is out of range, and a non-integer index is refused.
+func TestSelect(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	if _, err := nc.Write([]byte("*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	expect(t, br, "+OK\r\n")
+
+	if _, err := nc.Write([]byte("*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	expect(t, br, "-ERR DB index is out of range\r\n")
+
+	if _, err := nc.Write([]byte("*2\r\n$6\r\nSELECT\r\n$3\r\nabc\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	expect(t, br, "-ERR value is not an integer or out of range\r\n")
+}
+
 // TestSmokePipeline sends one write with several commands and expects the
 // replies back in request order.
 func TestSmokePipeline(t *testing.T) {

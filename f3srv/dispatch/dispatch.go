@@ -126,6 +126,7 @@ func init() {
 	register("PING", ping, 0, 1, false)
 	register("ECHO", echo, 1, 1, false)
 	register("TIME", timeCmd, 0, 0, false)
+	register("SELECT", selectDB, 1, 1, false)
 
 	// The string point surface. SET's tail is option soup, so the handler
 	// validates it.
@@ -909,6 +910,23 @@ func ping(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 
 func echo(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Bulk(args[0])
+}
+
+// selectDB answers SELECT index: f3 keeps a single keyspace with no numbered
+// database and no per-connection db state, so it accepts index 0 and refuses any
+// other, the honest answer for a server that offers one database. FLUSHDB and
+// FLUSHALL are aliases for the same reason.
+func selectDB(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	n, err := strconv.ParseInt(string(args[0]), 10, 64)
+	if err != nil {
+		r.Err("ERR value is not an integer or out of range")
+		return
+	}
+	if n != 0 {
+		r.Err("ERR DB index is out of range")
+		return
+	}
+	r.Status("OK")
 }
 
 // timeCmd answers TIME: a two element array of the current unix time as seconds
