@@ -425,6 +425,151 @@ func TestCommitCheckpointRecoversEveryShard(t *testing.T) {
 	}
 }
 
+// TestRecoverIndexRebuildsEveryShard drives the whole open sequence through the one
+// RecoverIndex call a runtime would make: it commits a two-shard root with a tail
+// record past shard 0's checkpoint, reopens, recovers the file structure once, and
+// hands each shard's store the recovery to rebuild itself. It is
+// TestCommitCheckpointRecoversEveryShard with the manual ReplayFromCheckpoint plus
+// ReplayTail pair replaced by the single entry point, so the shard's caller never
+// reads a segment or picks a tail offset by hand.
+func TestRecoverIndexRebuildsEveryShard(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recoveridx.aki")
+	openShard := func(f *akifile.File, shard uint16) *Store {
+		s, err := Open(Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20, AkiValueLog: f, Shard: shard})
+		if err != nil {
+			t.Fatalf("open shard %d: %v", shard, err)
+		}
+		return s
+	}
+
+	f, err := akifile.Create(path, akifile.CreateOptions{ShardCount: 4, SepThreshold: 64, Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	s0 := openShard(f, 0)
+	s1 := openShard(f, 1)
+
+	if err := s0.SetString([]byte("a"), []byte("a1"), 0, 0, false); err != nil {
+		t.Fatalf("s0 set a: %v", err)
+	}
+	if err := s0.SetString([]byte("b"), []byte("b1"), 0, 0, false); err != nil {
+		t.Fatalf("s0 set b: %v", err)
+	}
+	if err := s1.SetString([]byte("x"), []byte("x1"), 0, 0, false); err != nil {
+		t.Fatalf("s1 set x: %v", err)
+	}
+	if err := s1.SetString([]byte("y"), []byte("y1"), 0, 0, false); err != nil {
+		t.Fatalf("s1 set y: %v", err)
+	}
+	row0, err := s0.WriteIndexCheckpoint()
+	if err != nil {
+		t.Fatalf("s0 write checkpoint: %v", err)
+	}
+	row1, err := s1.WriteIndexCheckpoint()
+	if err != nil {
+		t.Fatalf("s1 write checkpoint: %v", err)
+	}
+	if err := s0.SetString([]byte("a"), []byte("a2"), 0, 0, false); err != nil {
+		t.Fatalf("s0 overwrite a: %v", err)
+	}
+
+	rows := make([]akifile.SRTRow, 4)
+	rows[0] = row0
+	rows[1] = row1
+	stats := akifile.CheckpointStats{RecordCount: row0.LiveRecords + row1.LiveRecords}
+	if err := CommitCheckpoint(f, rows, stats); err != nil {
+		t.Fatalf("commit checkpoint: %v", err)
+	}
+	if err := s0.Close(); err != nil {
+		t.Fatalf("close s0: %v", err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("close s1: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	t.Cleanup(func() { _ = f2.Close() })
+	rec, err := f2.Recover()
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	want := []map[string]string{
+		0: {"a": "a2", "b": "b1"},
+		1: {"x": "x1", "y": "y1"},
+	}
+	for shard := uint16(0); shard < 2; shard++ {
+		r := openShard(f2, shard)
+		if err := r.RecoverIndex(rec, 0); err != nil {
+			t.Fatalf("shard %d recover index: %v", shard, err)
+		}
+		for key, val := range want[shard] {
+			got, ok := r.GetString([]byte(key), 0, nil)
+			if !ok || string(got) != val {
+				t.Fatalf("shard %d key %q read back (%q, %v), want (%q, true)", shard, key, got, ok, val)
+			}
+		}
+		_ = r.Close()
+	}
+}
+
+// TestRecoverIndexWalksLogWithoutCheckpoint confirms the fallback path: a file whose
+// records were logged but never committed as a checkpoint root has no SRT to load,
+// so RecoverIndex walks the whole log rather than taking a bounded path off a root
+// that does not exist. This is the shape a shard that crashed before its first
+// checkpoint takes.
+func TestRecoverIndexWalksLogWithoutCheckpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nockpt.aki")
+	f, err := akifile.Create(path, akifile.CreateOptions{ShardCount: 1, SepThreshold: 64, Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	s, err := Open(Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20, AkiValueLog: f, Shard: 0})
+	if err != nil {
+		t.Fatalf("open shard: %v", err)
+	}
+	if err := s.SetString([]byte("k"), []byte("v1"), 0, 0, false); err != nil {
+		t.Fatalf("set k: %v", err)
+	}
+	if err := s.SetString([]byte("k"), []byte("v2"), 0, 0, false); err != nil {
+		t.Fatalf("overwrite k: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	t.Cleanup(func() { _ = f2.Close() })
+	rec, err := f2.Recover()
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	r, err := Open(Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20, AkiValueLog: f2, Shard: 0})
+	if err != nil {
+		t.Fatalf("open recovered shard: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	if err := r.RecoverIndex(rec, 0); err != nil {
+		t.Fatalf("recover index: %v", err)
+	}
+	got, ok := r.GetString([]byte("k"), 0, nil)
+	if !ok || string(got) != "v2" {
+		t.Fatalf("key k read back (%q, %v), want (%q, true)", got, ok, "v2")
+	}
+}
+
 // TestWriteIndexCheckpointNoHandle confirms a store with no record log returns a
 // zero row rather than erroring, so the volatile-only configuration takes a clean
 // no-op through the persist path.

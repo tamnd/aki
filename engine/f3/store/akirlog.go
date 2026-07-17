@@ -136,6 +136,16 @@ func (l *akiRlog) writeCheckpoint(payload []byte) (uint64, error) {
 // rot.
 func (l *akiRlog) readAt(addr uint64) (akifile.RecordRow, error) { return l.f.ReadRecordAt(addr) }
 
+// readCheckpoint reads back the checkpoint payload writeCheckpoint appended, given
+// the segment header offset an SRT row names in IndexCkptOff. It reads the segment
+// at that header and returns its payload, the dump ReplayFromCheckpoint folds. The
+// read verifies the segment's own CRC, so a torn checkpoint fails closed here rather
+// than feeding a rebuild rot.
+func (l *akiRlog) readCheckpoint(off uint64) ([]byte, error) {
+	_, payload, err := l.f.ReadSegmentAt(off)
+	return payload, err
+}
+
 // unlink records n bytes a supersession, a delete, or an expiry reap no longer
 // references, so a later compaction of the log region knows what it can reclaim.
 // It must fire at every site that supersedes a logged record, the way the value
