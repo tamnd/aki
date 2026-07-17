@@ -131,6 +131,16 @@ func Flush(cx *shard.Ctx) {
 	g.resident = 0
 }
 
+// Len is the number of zsets this shard holds, the zset contribution to DBSIZE. A
+// dropped zset leaves the map, so the map size is the live count; it reads zero
+// before any zset command has built a registry on this shard.
+func Len(cx *shard.Ctx) int {
+	if cx.ZColl == nil {
+		return 0
+	}
+	return len(cx.ZColl.(*reg).m)
+}
+
 // lookup finds the zset for key. present is false when no zset exists; wrong is
 // true when the key instead holds a value in the string store, which every zset
 // command answers with WRONGTYPE.

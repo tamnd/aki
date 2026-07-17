@@ -202,6 +202,18 @@ func Flush(cx *shard.Ctx) {
 	g.resident = 0
 }
 
+// Len is the number of streams this shard holds, the stream contribution to
+// DBSIZE. An emptied stream is kept in the map (Redis leaves an empty stream as a
+// live key), so the map size is the key count; it reads zero before any stream
+// command has built a registry on this shard.
+func Len(cx *shard.Ctx) int {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return 0
+	}
+	return len(v.(*reg).m)
+}
+
 // undirty takes a stream off the gc worklist, swapping the tail into its slot
 // since the worklist order carries no meaning. It is used only by Delete, so a
 // stream removed from the registry never reaches the maintainer.

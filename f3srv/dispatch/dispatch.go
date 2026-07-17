@@ -189,7 +189,7 @@ func init() {
 
 	// DBSIZE is the same keyless scatter with the count gather: every shard
 	// answers its key count and the sum is the reply.
-	dbsize := registerShard(str.DBSizeShard)
+	dbsize := registerShard(dbsizeShardAll)
 	register("DBSIZE", nil, 0, 0, false)
 	registerFan("DBSIZE", shard.FanCount, dbsize, false, true)
 
@@ -1218,4 +1218,21 @@ func flushShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	list.Flush(cx)
 	stream.Flush(cx)
 	r.FanOK()
+}
+
+// dbsizeShardAll answers a DBSIZE sub-command over every keyspace: one shard's
+// live key count summed across the string store and all five collection
+// registries, as a FanCount partial the gather sums into the single integer
+// reply. Before this the sub-handler counted the string store alone, so a set,
+// zset, hash, list, or stream key was invisible to DBSIZE. It stays O(shards),
+// never a scan: each arm reads its registry's map size. It lives here where every
+// type package is in reach, the same as the other cross-keyspace fan handlers.
+func dbsizeShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	n := int64(cx.St.Len())
+	n += int64(set.Len(cx))
+	n += int64(zset.Len(cx))
+	n += int64(hash.Len(cx))
+	n += int64(list.Len(cx))
+	n += int64(stream.Len(cx))
+	r.FanCount(n)
 }

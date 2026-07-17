@@ -105,6 +105,17 @@ func Flush(cx *shard.Ctx) {
 	g.resident = 0
 }
 
+// Len is the number of lists this shard holds, the list contribution to DBSIZE. A
+// dropped list leaves the map, so the map size is the live count; it reads zero
+// before any list command has built a registry on this shard.
+func Len(cx *shard.Ctx) int {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return 0
+	}
+	return len(v.(*reg).m)
+}
+
 // lookup finds the list for key. wrong is true when the key instead holds a
 // value in the string store, which every list command answers with WRONGTYPE.
 // Cross-type collisions with the set and zset registries are not resolved in

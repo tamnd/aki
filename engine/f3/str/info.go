@@ -42,11 +42,3 @@ func InfoShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	put(shard.StatBackpressureStalls, cx.BackpressureStalls())
 	r.Raw(b[:])
 }
-
-// DBSizeShard answers a DBSIZE sub-command: one shard's live key count as a
-// FanCount partial; the gather sums the shards into the single integer reply,
-// so DBSIZE is O(shards), never a scan. With used_memory this is the
-// bytes-per-key denominator the benchmark harness reads.
-func DBSizeShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	r.FanCount(int64(cx.St.Len()))
-}

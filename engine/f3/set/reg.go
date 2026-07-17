@@ -135,6 +135,16 @@ func Flush(cx *shard.Ctx) {
 	g.resident = 0
 }
 
+// Len is the number of sets this shard holds, the set contribution to DBSIZE. A
+// dropped set leaves the map, so the map size is the live count; it reads zero
+// before any set command has built a registry on this shard.
+func Len(cx *shard.Ctx) int {
+	if cx.Coll == nil {
+		return 0
+	}
+	return len(cx.Coll.(*reg).m)
+}
+
 // lookup finds the set for key. present is false when no set exists; wrong is
 // true when the key instead holds a value in the string store, which every set
 // command answers with WRONGTYPE.
