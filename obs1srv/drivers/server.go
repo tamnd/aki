@@ -105,6 +105,10 @@ type Options struct {
 	// VlogDir, when set, gives every shard its own value-log file under this
 	// directory; empty keeps the stores memory-only.
 	VlogDir string
+	// ColdDir, when set, gives every shard a cold region under this
+	// directory and engages the staged-drain migrator past the resident
+	// cap; the staged buffers are what FoldTap hears (shard.Config.ColdDir).
+	ColdDir string
 	// ResidentCapBytes is each shard's resident byte budget when VlogDir is
 	// set; past it, separated and chunked value bytes spill to the shard's
 	// log. 0 means uncapped.
@@ -181,6 +185,21 @@ type Options struct {
 	// singletons, so their counters ride this hook instead of the per-shard
 	// stats blob.
 	WALInfo func([]byte) []byte
+	// FoldTap, when set, hears every staged cold drain buffer on the owner
+	// goroutine that staged it, normally Folder.Add: the fold input seam
+	// (Runtime.SetFoldTap). Nil leaves cooled data in the local tier only.
+	FoldTap func(frames []byte)
+	// FoldProgress, when set, is the resident stall window's fold-cursor
+	// signal (Runtime.SetFoldProgress), normally the manifest publisher's
+	// published count: a resident-parked write keeps waiting while it
+	// advances, because the fold cursor moving is what frees the arena a
+	// floor to evict against (doc 04 section 6).
+	FoldProgress func() uint64
+	// FoldKick, when set, is the fold pressure trigger
+	// (Runtime.SetFoldKick), normally Folder.Flush: resident-parked shards
+	// call it, paced, so the folder cuts early under pressure (doc 06
+	// section 1.4).
+	FoldKick func()
 	// OutBufLimitBytes is the hard cap on one connection's pending reply
 	// bytes buffered driver-side (the client-output-buffer-limit lineage,
 	// doc 08 section 3.5): a client whose unread backlog passes it is
@@ -297,6 +316,7 @@ func Listen(o Options) (*Server, error) {
 		ArenaBytes:       o.ArenaBytes,
 		SegBytes:         o.SegBytes,
 		VlogDir:          o.VlogDir,
+		ColdDir:          o.ColdDir,
 		ResidentCapBytes: o.ResidentCapBytes,
 		PinWorkers:       o.PinWorkers,
 		BatchDataCap:     o.BatchDataCap,
@@ -376,6 +396,15 @@ func Listen(o Options) (*Server, error) {
 	}
 	if o.WALInfo != nil {
 		s.rt.SetWALInfo(o.WALInfo)
+	}
+	if o.FoldTap != nil {
+		s.rt.SetFoldTap(o.FoldTap)
+	}
+	if o.FoldProgress != nil {
+		s.rt.SetFoldProgress(o.FoldProgress)
+	}
+	if o.FoldKick != nil {
+		s.rt.SetFoldKick(o.FoldKick)
 	}
 	s.rt.Start()
 	return s, nil
