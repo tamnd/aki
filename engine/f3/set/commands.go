@@ -32,6 +32,7 @@ func Sadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	for _, m := range args[1:] {
 		if s.add(m) {
 			added++
+			logAdd(cx, key, m)
 		}
 	}
 	g.note(s)
@@ -55,6 +56,7 @@ func Srem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	for _, m := range args[1:] {
 		if s.rem(m) {
 			removed++
+			logRemove(cx, args[0], m)
 		}
 	}
 	if s.card() == 0 {
@@ -171,6 +173,7 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 		var sc [64]byte
 		m := s.popOne(g, sc[:])
+		logRemove(cx, key, m)
 		if s.card() == 0 {
 			g.drop(key)
 		} else {
@@ -197,11 +200,16 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		// The escalated aggregate (drawfan.go): indices drawn serially on the
 		// owner, the resolve fanned to donated workers, removal back on the
 		// owner. Exact uniform without replacement either way (F15).
-		popFan(cx, g, s, popped, func(m []byte) { out = resp.AppendBulk(out, m) })
+		popFan(cx, g, s, popped, func(m []byte) {
+			out = resp.AppendBulk(out, m)
+			logRemove(cx, key, m)
+		})
 	} else {
 		var sc [64]byte
 		for i := 0; i < popped; i++ {
-			out = resp.AppendBulk(out, s.popOne(g, sc[:]))
+			m := s.popOne(g, sc[:])
+			out = resp.AppendBulk(out, m)
+			logRemove(cx, key, m)
 		}
 	}
 	cx.Aux = out
