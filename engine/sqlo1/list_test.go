@@ -35,7 +35,11 @@ func newListRig(t *testing.T) *listRig {
 	if err != nil {
 		t.Fatalf("NewStr: %v", err)
 	}
-	return &listRig{t: t, rs: rs, tr: tr, l: NewList(tr), s: s}
+	l, err := NewList(tr, ListConfig{})
+	if err != nil {
+		t.Fatalf("NewList: %v", err)
+	}
+	return &listRig{t: t, rs: rs, tr: tr, l: l, s: s}
 }
 
 // reopen builds a fresh runtime over the same store, the cold view a
@@ -48,7 +52,26 @@ func (r *listRig) reopen() *List {
 		Seed:     12,
 		NowMs:    func() int64 { return 1 << 41 },
 	})
-	return NewList(tr)
+	l, err := NewList(tr, ListConfig{})
+	if err != nil {
+		r.t.Fatalf("NewList: %v", err)
+	}
+	return l
+}
+
+// nodedRoot decodes key's root as a noded list root, for tests that
+// pin fence shapes.
+func (r *listRig) nodedRoot(key string) listNodeRoot {
+	r.t.Helper()
+	v, root, _, ok, err := r.tr.LookupEntry(context.Background(), []byte(key))
+	if err != nil || !ok || !root {
+		r.t.Fatalf("LookupEntry(%q) = root=%v ok=%v err=%v", key, root, ok, err)
+	}
+	nr, err := decodeListNodeRoot(v, nil)
+	if err != nil {
+		r.t.Fatalf("decode noded root %q: %v", key, err)
+	}
+	return nr
 }
 
 func (r *listRig) push(key string, left bool, elems ...string) int64 {
@@ -269,32 +292,41 @@ func TestListInlineDequeOps(t *testing.T) {
 	}
 }
 
-func TestListInlineThresholds(t *testing.T) {
+func TestListUpgradeThresholds(t *testing.T) {
 	r := newListRig(t)
 	ctx := context.Background()
 
-	// Count threshold: 128 elements stay inline, the 129th is the
-	// noded slice's seam.
+	// Count threshold: 128 elements stay inline, the 129th upgrades to
+	// the noded layout and the data survives the move in order.
+	want := []string{}
 	for i := range listInlineMaxCount {
-		r.push("counts", false, fmt.Sprintf("e%03d", i))
+		e := fmt.Sprintf("e%03d", i)
+		r.push("counts", false, e)
+		want = append(want, e)
 	}
 	if enc, _, _ := r.l.Encoding(ctx, []byte("counts")); enc != "listpack" {
 		t.Fatalf("encoding at the count ceiling = %q, want listpack", enc)
 	}
-	if _, err := r.l.Push(ctx, []byte("counts"), false, false, []byte("one-more")); !errors.Is(err, errListNoded) {
-		t.Fatalf("element 129 = %v, want errListNoded", err)
+	if n := r.push("counts", false, "one-more"); n != listInlineMaxCount+1 {
+		t.Fatalf("element 129 = %d, want %d", n, listInlineMaxCount+1)
 	}
-	// The refused push wrote nothing.
-	if n, err := r.l.Len(ctx, []byte("counts")); err != nil || n != listInlineMaxCount {
-		t.Fatalf("Len after the refused push = %d, %v, want %d", n, err, listInlineMaxCount)
+	want = append(want, "one-more")
+	if enc, _, _ := r.l.Encoding(ctx, []byte("counts")); enc != "quicklist" {
+		t.Fatalf("encoding past the count ceiling = %q, want quicklist", enc)
 	}
-	if got := r.pop("counts", false, 1); !slices.Equal(got, []string{"e127"}) {
-		t.Fatalf("tail after the refused push = %v", got)
+	if n, err := r.l.Len(ctx, []byte("counts")); err != nil || n != int64(len(want)) {
+		t.Fatalf("Len after the upgrade = %d, %v, want %d", n, err, len(want))
+	}
+	if got := r.pop("counts", true, len(want)); !slices.Equal(got, want) {
+		t.Fatalf("drain after the upgrade = %v, want %v", got, want)
+	}
+	if exists, _, err := r.s.Entry(ctx, []byte("counts")); err != nil || exists {
+		t.Fatalf("drained list still exists: %v, %v", exists, err)
 	}
 
 	// Size threshold, pinned to the byte: one element lands the payload
-	// exactly on listInlineMax, and the smallest possible second push
-	// (an empty element, four header bytes) goes over.
+	// exactly on listInlineMax and stays inline; the smallest possible
+	// second push (an empty element, four header bytes) upgrades.
 	exact := strings.Repeat("x", listInlineMax-listInlineHdrLen-listElemHdrLen)
 	if n := r.push("sizes", false, exact); n != 1 {
 		t.Fatalf("boundary push = %d, want 1", n)
@@ -302,21 +334,76 @@ func TestListInlineThresholds(t *testing.T) {
 	if enc, _, _ := r.l.Encoding(ctx, []byte("sizes")); enc != "listpack" {
 		t.Fatalf("encoding at exactly the cap = %q, want listpack", enc)
 	}
-	if _, err := r.l.Push(ctx, []byte("sizes"), false, false, []byte("")); !errors.Is(err, errListNoded) {
-		t.Fatalf("size-crossing push = %v, want errListNoded", err)
+	if n := r.push("sizes", false, ""); n != 2 {
+		t.Fatalf("size-crossing push = %d, want 2", n)
+	}
+	if enc, _, _ := r.l.Encoding(ctx, []byte("sizes")); enc != "quicklist" {
+		t.Fatalf("encoding past the byte cap = %q, want quicklist", enc)
+	}
+	if got := r.pop("sizes", false, 1); !slices.Equal(got, []string{""}) {
+		t.Fatalf("RPOP after the byte-cap upgrade = %v", got)
 	}
 	if got := r.pop("sizes", true, 1); !slices.Equal(got, []string{exact}) {
-		t.Fatalf("boundary element damaged by the refused push")
+		t.Fatalf("boundary element damaged by the upgrade")
+	}
+	if exists, _, err := r.s.Entry(ctx, []byte("sizes")); err != nil || exists {
+		t.Fatalf("drained list still exists: %v, %v", exists, err)
 	}
 
-	// A fresh key with one oversized element skips inline entirely, so
-	// it is the noded slice's seam too, and the key stays absent.
-	big := [][]byte{bytes.Repeat([]byte{'x'}, listInlineMax)}
-	if _, err := r.l.Push(ctx, []byte("fresh"), false, false, big...); !errors.Is(err, errListNoded) {
-		t.Fatalf("oversized fresh push = %v, want errListNoded", err)
+	// A fresh key with one oversized element skips inline entirely and
+	// lands noded in one write.
+	big := strings.Repeat("y", listInlineMax)
+	if n := r.push("fresh", false, big); n != 1 {
+		t.Fatalf("oversized fresh push = %d, want 1", n)
 	}
-	if exists, _, err := r.s.Entry(ctx, []byte("fresh")); err != nil || exists {
-		t.Fatalf("refused fresh push created the key: %v, %v", exists, err)
+	if enc, _, _ := r.l.Encoding(ctx, []byte("fresh")); enc != "quicklist" {
+		t.Fatalf("oversized fresh encoding = %q, want quicklist", enc)
+	}
+	if got := r.pop("fresh", false, 1); !slices.Equal(got, []string{big}) {
+		t.Fatalf("oversized element damaged by the fresh upgrade")
+	}
+}
+
+// TestListNodeCuts pins the node cut rule to the byte: a node packs to
+// exactly listNodeMax without cutting, and the next element cuts.
+func TestListNodeCuts(t *testing.T) {
+	r := newListRig(t)
+
+	// One element sized so header plus two entries is exactly
+	// listNodeMax, then an empty element: 4 + (4+4020) + (4+0) = 4032.
+	a := strings.Repeat("a", listNodeMax-listNodeHdrLen-2*listElemHdrLen)
+	if n := r.push("q", false, a, ""); n != 2 {
+		t.Fatalf("push = %d, want 2", n)
+	}
+	nr := r.nodedRoot("q")
+	if len(nr.fence) != 1 || nr.fence[0].count != 2 {
+		t.Fatalf("exactly-full node split: fence = %+v", nr.fence)
+	}
+
+	// The node is exactly full, so the smallest push cuts a fresh one.
+	r.push("q", false, "")
+	nr = r.nodedRoot("q")
+	if len(nr.fence) != 2 || nr.fence[0].count != 2 || nr.fence[1].count != 1 {
+		t.Fatalf("cut off a full node: fence = %+v", nr.fence)
+	}
+	if nr.count != 3 {
+		t.Fatalf("root count = %d, want 3", nr.count)
+	}
+
+	// An element over listNodeMax gets a node of its own.
+	huge := strings.Repeat("h", listNodeMax+100)
+	r.push("q", false, huge)
+	nr = r.nodedRoot("q")
+	if len(nr.fence) != 3 || nr.fence[2].count != 1 {
+		t.Fatalf("oversize element node: fence = %+v", nr.fence)
+	}
+	if got := r.pop("q", false, 1); !slices.Equal(got, []string{huge}) {
+		t.Fatalf("oversize element damaged: got %d bytes", len(got[0]))
+	}
+	// Dropping the oversize element drops its node whole.
+	nr = r.nodedRoot("q")
+	if len(nr.fence) != 2 || nr.count != 3 {
+		t.Fatalf("fence after the oversize pop = %+v, count %d", nr.fence, nr.count)
 	}
 }
 
@@ -388,17 +475,6 @@ func TestListWrongType(t *testing.T) {
 	}
 }
 
-// nodedListStub hand-builds a root with the noded sub and the shared
-// planed prefix; the layout lands with the noded slice, but the
-// sniffer, the encoding answer, and the takeover door see it today.
-func nodedListStub(rooth uint64) []byte {
-	b := make([]byte, 32)
-	b[0] = listSubNoded
-	binary.LittleEndian.PutUint32(b[4:], 1)
-	binary.LittleEndian.PutUint64(b[8:], rooth)
-	return b
-}
-
 func TestListEncoding(t *testing.T) {
 	r := newListRig(t)
 	ctx := context.Background()
@@ -411,31 +487,35 @@ func TestListEncoding(t *testing.T) {
 		t.Fatalf("inline encoding = %q, %v, want listpack", enc, ok)
 	}
 
-	// A noded root answers quicklist, and every list op on it is the
-	// noded slice's seam.
-	if err := r.tr.Set(ctx, []byte("noded"), nodedListStub(0x1234), TagList|TagRoot); err != nil {
-		t.Fatal(err)
+	// Past the thresholds a real noded list answers quicklist, and it
+	// never downgrades: Redis converts a shrunk quicklist back to
+	// listpack, this ladder does not, the compat section's divergence.
+	for i := range listInlineMaxCount + 1 {
+		r.push("noded", false, fmt.Sprintf("e%03d", i))
 	}
 	if enc, ok, _ := r.l.Encoding(ctx, []byte("noded")); !ok || enc != "quicklist" {
 		t.Fatalf("noded encoding = %q, %v, want quicklist", enc, ok)
 	}
-	if _, err := r.l.Push(ctx, []byte("noded"), true, false, []byte("e")); !errors.Is(err, errListNoded) {
-		t.Fatalf("Push on a noded root = %v, want errListNoded", err)
-	}
-	if _, _, err := r.l.Pop(ctx, []byte("noded"), true, 1); !errors.Is(err, errListNoded) {
-		t.Fatalf("Pop on a noded root = %v, want errListNoded", err)
-	}
-	if _, err := r.l.Len(ctx, []byte("noded")); !errors.Is(err, errListNoded) {
-		t.Fatalf("Len on a noded root = %v, want errListNoded", err)
+	r.pop("noded", true, listInlineMaxCount)
+	if enc, ok, _ := r.l.Encoding(ctx, []byte("noded")); !ok || enc != "quicklist" {
+		t.Fatalf("shrunk noded encoding = %q, %v, want quicklist (no downgrade)", enc, ok)
 	}
 
 	// The takeover door reads the shared planed prefix and retires the
-	// plane, so SET over a noded root already works.
+	// plane, so SET over a noded root works; the recreate starts
+	// inline under the fresh rootgen.
 	if err := r.s.Set(ctx, []byte("noded"), []byte("taken")); err != nil {
 		t.Fatalf("SET over a noded root: %v", err)
 	}
 	if v, ok, err := r.s.Get(ctx, []byte("noded")); err != nil || !ok || string(v) != "taken" {
 		t.Fatalf("GET after noded takeover = %q, %v, %v", v, ok, err)
+	}
+	if dead, err := r.s.Del(ctx, []byte("noded")); err != nil || !dead {
+		t.Fatalf("DEL after takeover = %v, %v", dead, err)
+	}
+	r.push("noded", false, "fresh")
+	if enc, ok, _ := r.l.Encoding(ctx, []byte("noded")); !ok || enc != "listpack" {
+		t.Fatalf("recreate encoding = %q, %v, want listpack", enc, ok)
 	}
 }
 
@@ -468,5 +548,302 @@ func TestListKeyTTLSurvivesWrites(t *testing.T) {
 	}
 	if _, _, expMs, ok, err := r.tr.LookupEntry(ctx, []byte("q")); err != nil || !ok || expMs != at {
 		t.Fatalf("expiry after pop = %d, %v, %v, want %d", expMs, ok, err, at)
+	}
+
+	// The stamp survives the upgrade to nodes and noded writes.
+	bs := make([][]byte, listInlineMaxCount+10)
+	for i := range bs {
+		bs[i] = []byte(fmt.Sprintf("u%03d", i))
+	}
+	if _, err := r.l.Push(ctx, []byte("q"), false, false, bs...); err != nil {
+		t.Fatalf("upgrading push: %v", err)
+	}
+	if _, _, expMs, ok, err := r.tr.LookupEntry(ctx, []byte("q")); err != nil || !ok || expMs != at {
+		t.Fatalf("expiry after the upgrade = %d, %v, %v, want %d", expMs, ok, err, at)
+	}
+	r.pop("q", false, 3)
+	if _, _, expMs, ok, err := r.tr.LookupEntry(ctx, []byte("q")); err != nil || !ok || expMs != at {
+		t.Fatalf("expiry after a noded pop = %d, %v, %v, want %d", expMs, ok, err, at)
+	}
+}
+
+// listModel is the reference deque the noded tests compare against.
+type listModel []string
+
+func (m *listModel) push(left bool, elems ...string) {
+	for _, e := range elems {
+		if left {
+			*m = append(listModel{e}, *m...)
+		} else {
+			*m = append(*m, e)
+		}
+	}
+}
+
+func (m *listModel) pop(left bool, count int) []string {
+	k := min(count, len(*m))
+	out := make([]string, 0, k)
+	for range k {
+		if left {
+			out = append(out, (*m)[0])
+			*m = (*m)[1:]
+		} else {
+			out = append(out, (*m)[len(*m)-1])
+			*m = (*m)[:len(*m)-1]
+		}
+	}
+	return out
+}
+
+func TestListNodedDeque(t *testing.T) {
+	r := newListRig(t)
+	ctx := context.Background()
+	var m listModel
+
+	// Build a list spanning several nodes, one push per element the
+	// way a queue producer would.
+	for i := range 300 {
+		e := fmt.Sprintf("e%04d", i)
+		r.push("q", false, e)
+		m.push(false, e)
+	}
+	if enc, _, _ := r.l.Encoding(ctx, []byte("q")); enc != "quicklist" {
+		t.Fatalf("encoding = %q, want quicklist", enc)
+	}
+	nr := r.nodedRoot("q")
+	if len(nr.fence) < 3 {
+		t.Fatalf("300 elements landed only %d nodes", len(nr.fence))
+	}
+	if n, err := r.l.Len(ctx, []byte("q")); err != nil || n != 300 {
+		t.Fatalf("Len = %d, %v, want 300", n, err)
+	}
+
+	// Edge pops from both ends, then a pop spanning whole nodes plus a
+	// partial one.
+	if got := r.pop("q", true, 5); !slices.Equal(got, m.pop(true, 5)) {
+		t.Fatalf("LPOP 5 = %v", got)
+	}
+	if got := r.pop("q", false, 3); !slices.Equal(got, m.pop(false, 3)) {
+		t.Fatalf("RPOP 3 = %v", got)
+	}
+	if got := r.pop("q", true, 200); !slices.Equal(got, m.pop(true, 200)) {
+		t.Fatalf("multi-node LPOP 200 diverged from the model")
+	}
+	nr = r.nodedRoot("q")
+	if nr.count != uint64(len(m)) {
+		t.Fatalf("root count = %d, model %d", nr.count, len(m))
+	}
+
+	// Cold path and a reopened runtime; the reopen check runs before
+	// any cold mutation, which would sit hot in this runtime only.
+	if err := r.tr.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r.tr.EvictAllForTest()
+	if n, err := r.l.Len(ctx, []byte("q")); err != nil || n != int64(len(m)) {
+		t.Fatalf("cold Len = %d, %v, want %d", n, err, len(m))
+	}
+	l2 := r.reopen()
+	if n, err := l2.Len(ctx, []byte("q")); err != nil || n != int64(len(m)) {
+		t.Fatalf("reopened Len = %d, %v, want %d", n, err, len(m))
+	}
+	if got := r.pop("q", false, 40); !slices.Equal(got, m.pop(false, 40)) {
+		t.Fatalf("cold RPOP 40 diverged from the model")
+	}
+
+	// The drain empties the list, deletes the key, and the recreate
+	// starts inline.
+	if got := r.pop("q", true, 1000); !slices.Equal(got, m.pop(true, 1000)) {
+		t.Fatalf("draining LPOP diverged from the model")
+	}
+	if exists, _, err := r.s.Entry(ctx, []byte("q")); err != nil || exists {
+		t.Fatalf("drained list still exists: %v, %v", exists, err)
+	}
+	r.push("q", false, "again")
+	if enc, _, _ := r.l.Encoding(ctx, []byte("q")); enc != "listpack" {
+		t.Fatalf("recreate encoding = %q, want listpack", enc)
+	}
+}
+
+func TestListNodedPushBatching(t *testing.T) {
+	r := newListRig(t)
+
+	big := make([]string, 300)
+	for i := range big {
+		big[i] = fmt.Sprintf("b%04d", i)
+	}
+
+	// One right push of 300 elements upgrades straight into several
+	// nodes and keeps argument order.
+	var m listModel
+	r.push("r", false, big...)
+	m.push(false, big...)
+	if got := r.pop("r", true, 300); !slices.Equal(got, []string(m)) {
+		t.Fatalf("multi-node RPUSH drain diverged")
+	}
+
+	// One left push of 300 lands one at a time, so it reads back
+	// reversed, across the amendment and every cut.
+	m = nil
+	r.push("l", true, big...)
+	m.push(true, big...)
+	if got := r.pop("l", true, 300); !slices.Equal(got, []string(m)) {
+		t.Fatalf("multi-node LPUSH drain diverged")
+	}
+
+	// Batched pushes onto an existing noded list: the edge node amends
+	// until full, then fresh nodes cut, on both edges.
+	m = nil
+	for i := range 200 {
+		e := fmt.Sprintf("s%04d", i)
+		r.push("q", false, e)
+		m.push(false, e)
+	}
+	r.push("q", false, big[:150]...)
+	m.push(false, big[:150]...)
+	r.push("q", true, big[150:]...)
+	m.push(true, big[150:]...)
+	if n, err := r.l.Len(context.Background(), []byte("q")); err != nil || n != int64(len(m)) {
+		t.Fatalf("Len = %d, %v, want %d", n, err, len(m))
+	}
+	if got := r.pop("q", true, len(m)); !slices.Equal(got, []string(m)) {
+		t.Fatalf("batched noded pushes diverged from the model")
+	}
+}
+
+func TestListFenceOverflow(t *testing.T) {
+	r := newListRig(t)
+	ctx := context.Background()
+
+	// Elements sized to own a node each fill the fence to its cap.
+	e := strings.Repeat("x", listNodeMax-listNodeHdrLen-listElemHdrLen)
+	for i := range listFenceMaxNodes {
+		if _, err := r.l.Push(ctx, []byte("q"), false, false, []byte(e)); err != nil {
+			t.Fatalf("push %d: %v", i, err)
+		}
+	}
+	nr := r.nodedRoot("q")
+	if len(nr.fence) != listFenceMaxNodes {
+		t.Fatalf("fence holds %d nodes, want %d", len(nr.fence), listFenceMaxNodes)
+	}
+
+	// The push that would cut past the cap is refused side-effect
+	// free: the fence paging slice owns that layout.
+	if _, err := r.l.Push(ctx, []byte("q"), false, false, []byte(e)); !errors.Is(err, errListFencePaged) {
+		t.Fatalf("overflow push = %v, want errListFencePaged", err)
+	}
+	if n, err := r.l.Len(ctx, []byte("q")); err != nil || n != int64(listFenceMaxNodes) {
+		t.Fatalf("Len after the refused push = %d, %v", n, err)
+	}
+	if len(r.nodedRoot("q").fence) != listFenceMaxNodes {
+		t.Fatal("refused push touched the fence")
+	}
+
+	// The upgrade path refuses the same way, and the key stays absent.
+	huge := make([][]byte, listFenceMaxNodes+1)
+	for i := range huge {
+		huge[i] = []byte(e)
+	}
+	if _, err := r.l.Push(ctx, []byte("fresh"), false, false, huge...); !errors.Is(err, errListFencePaged) {
+		t.Fatalf("overflowing fresh push = %v, want errListFencePaged", err)
+	}
+	if exists, _, err := r.s.Entry(ctx, []byte("fresh")); err != nil || exists {
+		t.Fatalf("refused fresh push created the key: %v, %v", exists, err)
+	}
+}
+
+func TestListNodedRootCodec(t *testing.T) {
+	rt := listNodeRoot{
+		rootgen:   3,
+		rooth:     0xabcdef,
+		count:     10,
+		nextSegid: 7,
+		fence: []listFenceEnt{
+			{segid: 2, meta: 0x7f, count: 4},
+			{segid: 0, count: 5},
+			{segid: 6, meta: 1, count: 1},
+		},
+	}
+	enc := appendListNodeRoot(nil, &rt)
+	if len(enc) != listNodeRootHdrLen+3*listFenceEntLen {
+		t.Fatalf("encoded root is %d bytes", len(enc))
+	}
+	dec, err := decodeListNodeRoot(enc, nil)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	if dec.rootgen != rt.rootgen || dec.rooth != rt.rooth || dec.count != rt.count || dec.nextSegid != rt.nextSegid || !slices.Equal(dec.fence, rt.fence) {
+		t.Fatalf("round trip = %+v, want %+v", dec, rt)
+	}
+
+	mut := func(f func(b []byte)) []byte {
+		b := slices.Clone(enc)
+		f(b)
+		return b
+	}
+	corrupt := map[string][]byte{
+		"empty":                                {},
+		"short hdr":                            enc[:listNodeRootHdrLen-1],
+		"bad sub":                              mut(func(b []byte) { b[0] = listSubInline }),
+		"paged lflags before the paging slice": mut(func(b []byte) { b[1] = lflagFencePaged }),
+		"reserved bytes":                       mut(func(b []byte) { b[2] = 1 }),
+		"rootgen zero":                         mut(func(b []byte) { binary.LittleEndian.PutUint32(b[4:], 0) }),
+		"count zero":                           mut(func(b []byte) { binary.LittleEndian.PutUint64(b[16:], 0) }),
+		"node_count zero":                      mut(func(b []byte) { binary.LittleEndian.PutUint32(b[32:], 0) }),
+		"node_count over the cap":              mut(func(b []byte) { binary.LittleEndian.PutUint32(b[32:], listFenceMaxNodes+1) }),
+		"size mismatch":                        enc[:len(enc)-1],
+		"segid at next_segid":                  mut(func(b []byte) { binary.LittleEndian.PutUint64(b[24:], 2) }),
+		"fence entry count zero": mut(func(b []byte) {
+			binary.LittleEndian.PutUint32(b[listNodeRootHdrLen+8:], 0)
+		}),
+		"count sum mismatch": mut(func(b []byte) { binary.LittleEndian.PutUint64(b[16:], 11) }),
+	}
+	for name, p := range corrupt {
+		if _, err := decodeListNodeRoot(p, nil); err == nil {
+			t.Errorf("%s: corrupt noded root decoded cleanly", name)
+		}
+	}
+}
+
+func TestListNodeCodec(t *testing.T) {
+	b := grow(nil, listNodeHdrLen)
+	for _, e := range []string{"", "abc", strings.Repeat("z", 700)} {
+		b = appendListElem(b, []byte(e))
+	}
+	putListNodeHdr(b, 3)
+	node, err := decodeListNode(b)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	if node.n != 3 {
+		t.Fatalf("n = %d, want 3", node.n)
+	}
+	it := listElemIter{p: node.elems}
+	for _, want := range []string{"", "abc", strings.Repeat("z", 700)} {
+		e, ok := it.next()
+		if !ok || string(e) != want {
+			t.Fatalf("element = %q, %v, want %q", e, ok, want)
+		}
+	}
+
+	mut := func(f func(b []byte)) []byte {
+		c := slices.Clone(b)
+		f(c)
+		return c
+	}
+	corrupt := map[string][]byte{
+		"empty":        {},
+		"short hdr":    b[:2],
+		"n zero":       mut(func(b []byte) { binary.LittleEndian.PutUint16(b, 0) }),
+		"n over ecap":  mut(func(b []byte) { binary.LittleEndian.PutUint16(b, listNodeMaxElems+1) }),
+		"reserved":     mut(func(b []byte) { b[2] = 1 }),
+		"n mismatch":   mut(func(b []byte) { binary.LittleEndian.PutUint16(b, 2) }),
+		"torn header":  b[:listNodeHdrLen+2],
+		"torn element": b[:len(b)-1],
+	}
+	for name, p := range corrupt {
+		if _, err := decodeListNode(p); err == nil {
+			t.Errorf("%s: corrupt node decoded cleanly", name)
+		}
 	}
 }
