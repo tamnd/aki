@@ -436,6 +436,18 @@ type Hash struct {
 	segRoot hashSegRoot
 	tailBuf []byte
 
+	// deferRoot is the zset dual write's one-root-per-command switch:
+	// while set, writeSegRoot records rootPend instead of landing an
+	// image, and the command wrapper writes the root once at the end,
+	// full-frame. The zset claims rollback replay (RollbackRef), whose
+	// commit point is the plane's last root frame, so a dual command
+	// must emit exactly one root frame and emit it after every record
+	// it references; the hot tier's re-dirtied-root deferral makes the
+	// after hold in drain order. Never set on hash or set ladders,
+	// whose W1-W3 discipline prices each root write individually.
+	deferRoot bool
+	rootPend  bool
+
 	// valBuf carries a point op's value copy across the mutation that
 	// would recycle the arena bytes it read (HGETDEL, HGETEX, the
 	// INCR family's formatted result).
@@ -616,6 +628,10 @@ func (h *Hash) writeSeg(ctx context.Context, segid uint64, payload []byte) error
 // false. The hot tier downgrades the claim itself if the image
 // coalesces over a structural write still waiting to drain.
 func (h *Hash) writeSegRoot(ctx context.Context, key []byte, delta bool) error {
+	if h.deferRoot {
+		h.rootPend = true
+		return nil
+	}
 	h.rootBuf = appendHashSegRoot(h.rootBuf[:0], &h.segRoot)
 	tag := h.tag | TagRoot
 	if delta {

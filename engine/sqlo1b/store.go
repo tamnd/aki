@@ -502,11 +502,14 @@ type tailPageImg struct {
 //
 // Planes whose root claims RollbackRef instead settle by the other
 // discipline: the root frame is the command's commit point, so every
-// plane put frame past the last root frame drops whole, segments,
-// auxiliary records, and fence pages alike. Deletes still apply: a
-// rollback plane's deletes ride behind the root frame that stopped
-// referencing them and segids are never reused, so a delete past the
-// last root frame always had its commanding root land.
+// plane frame past the last root frame drops whole, puts and deletes
+// alike, segments, auxiliary records, and fence pages. Deletes drop
+// because the drain queue's deferred-root refile floats the root to
+// the queue tail, so a co-command record delete can drain a batch
+// ahead of its commanding root; applying such a delete would dangle
+// a reference the last durable root still holds, while dropping it
+// leaves at worst an orphan record the plane retire cleans, the same
+// story as an un-rooted put.
 func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 	segs := map[string]int{}          // subkey bytes -> latest known entry count
 	wins := map[uint64][]planeSegOp{} // rooth -> window past its last root frame
@@ -578,8 +581,11 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 				fpages[string(op.key)] = append(fpages[string(op.key)], tailPageImg{idx: i, batch: batch})
 			} else if isAux(op.key) {
 				// An auxiliary delete is a plane record dying, not a
-				// user key: neutral to the walk, and rollback settle
-				// always lets it apply.
+				// user key: neutral to reconcile settle, dropped past
+				// the last root frame by rollback settle like any
+				// other plane frame.
+				rooth := binary.LittleEndian.Uint64(op.key)
+				aux[rooth] = append(aux[rooth], i)
 			} else {
 				rootRecs[string(op.key)] = nil
 			}
@@ -693,12 +699,10 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 			}
 			// Roll the plane back to its last root frame: the window
 			// maps were cleared at every root frame, so whatever they
-			// still hold sits past the last one and its puts drop
-			// whole. Deletes apply, per the rule above.
+			// still hold sits past the last one and drops whole, puts
+			// and deletes alike, per the rule above.
 			for _, o := range win {
-				if !o.del {
-					dropped[o.idx] = true
-				}
+				dropped[o.idx] = true
 			}
 			for _, idx := range aux[rooth] {
 				dropped[idx] = true
@@ -712,7 +716,7 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 					continue
 				}
 				for _, img := range imgs {
-					if img.idx > lastRoot && img.val != nil {
+					if img.idx > lastRoot {
 						dropped[img.idx] = true
 					}
 				}
