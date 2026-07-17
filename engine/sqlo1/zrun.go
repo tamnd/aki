@@ -308,7 +308,9 @@ func (z *ZSet) runFirst(ctx context.Context, e zFenceEnt) (uint64, []byte, error
 // on the fence (or index) alone; a chain of runs sharing the
 // separator binary-searches their first entries, log2(chain) point
 // reads. The chain may span pages, so the paged search runs over
-// global run positions.
+// global run positions. A pair below the whole collection routes to
+// run 0: no run holds it, but an insertion-rank seek lands there at
+// index 0.
 func (z *ZSet) zrunRoute(ctx context.Context, s uint64, member []byte) (int, error) {
 	if z.zpaged {
 		j, err := z.zlastLE(ctx, s)
@@ -336,6 +338,9 @@ func (z *ZSet) zrunRoute(ctx context.Context, s uint64, member []byte) (int, err
 				hi = mid - 1
 			}
 		}
+		if ans < 0 {
+			ans = 0
+		}
 		return z.zseek(ctx, ans)
 	}
 	f := z.zfence
@@ -356,6 +361,9 @@ func (z *ZSet) zrunRoute(ctx context.Context, s uint64, member []byte) (int, err
 		} else {
 			hi = mid - 1
 		}
+	}
+	if ans < 0 {
+		ans = 0
 	}
 	return ans, nil
 }

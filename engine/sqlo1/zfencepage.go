@@ -564,9 +564,10 @@ func (z *ZSet) zlastLE(ctx context.Context, s uint64) (int, error) {
 // descent follows the last subtree with lo < s, whose interior may
 // still hold separators at s; when the leaf runs out the answer is
 // the next subtree's first run, which the global index arithmetic
-// yields for free.
+// yields for free. An s at or below the sentinel separator has no
+// such subtree and descends the first one, where the answer is run 0.
 func (z *ZSet) zfirstGE(ctx context.Context, s uint64) (int, error) {
-	ui := zidxLastLT(z.zridx, s)
+	ui := max(zidxLastLT(z.zridx, s), 0)
 	g := 0
 	for i := range ui {
 		g += int(z.zridx[i].runs)
@@ -574,7 +575,7 @@ func (z *ZSet) zfirstGE(ctx context.Context, s uint64) (int, error) {
 	if err := z.loadZUpper(ctx, ui); err != nil {
 		return 0, err
 	}
-	li := zidxLastLT(z.zupper, s)
+	li := max(zidxLastLT(z.zupper, s), 0)
 	for i := range li {
 		g += int(z.zupper[i].runs)
 	}
