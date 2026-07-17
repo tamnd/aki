@@ -139,9 +139,9 @@ func TestCheckpointRoundTrips(t *testing.T) {
 	}
 }
 
-// TestCheckpointGlobalsRoundTrip writes the two file-global roots to free space, stamps
-// their offsets into the commit, and recovers the file: the TTL index and free map read
-// back off the one live root alongside the SRT, the round trip a hand-built meta slot
+// TestCheckpointGlobalsRoundTrip writes the file-global roots to free space, stamps their
+// offsets into the commit, and recovers the file: the TTL index, free map, and meta_kv
+// read back off the one live root alongside the SRT, the round trip a hand-built meta slot
 // only stood in for until now.
 func TestCheckpointGlobalsRoundTrip(t *testing.T) {
 	dev := &memDevice{}
@@ -153,6 +153,11 @@ func TestCheckpointGlobalsRoundTrip(t *testing.T) {
 	fmOff := appendFreeMap(t, f, []FreeExtent{
 		{StartOff: 0x10000, Length: 0x4000},
 		{StartOff: 0x20000, Length: 0x1000, Flags: FreeMapPending},
+	})
+	// The config and import path's meta_kv also lands as a self-describing segment.
+	kvOff := appendMetaKV(t, f, []MetaKVPair{
+		{Key: []byte("import.source"), Value: []byte("RDB v12")},
+		{Key: []byte("config.maxmemory"), Value: []byte("512mb")},
 	})
 	// Active expiry's TTL index rides the grid like the SRT; the meta slot names its
 	// payload offset and length for a bare read.
@@ -170,6 +175,7 @@ func TestCheckpointGlobalsRoundTrip(t *testing.T) {
 		TTLIndexOff: ttlOffs[0] + SegHeaderLen,
 		TTLIndexLen: uint32(len(ttlBytes)),
 		FreeMapOff:  fmOff,
+		MetaKVOff:   kvOff,
 	}
 	if err := f.CheckpointWithGlobals(&SRT{Gen: 4, Rows: rows}, nil, CheckpointStats{Clean: true}, globals); err != nil {
 		t.Fatalf("checkpoint: %v", err)
@@ -189,11 +195,17 @@ func TestCheckpointGlobalsRoundTrip(t *testing.T) {
 	if free != 0x4000 || pending != 0x1000 {
 		t.Fatalf("free map totals = free %d / pending %d, want %d/%d", free, pending, 0x4000, 0x1000)
 	}
+	if len(rec.MetaKV) != 2 {
+		t.Fatalf("recovered meta kv = %+v, want 2 pairs", rec.MetaKV)
+	}
+	if v, ok := MetaKVLookup(rec.MetaKV, "import.source"); !ok || string(v) != "RDB v12" {
+		t.Fatalf("recovered import.source = %q/%v, want RDB v12", v, ok)
+	}
 }
 
 // TestCheckpointLeavesGlobalsUnstamped confirms a plain Checkpoint names no global
-// roots: a file with no TTL index or free map commits with both pointers zero, so a
-// reader reports neither.
+// roots: a file with no TTL index, free map, or meta_kv commits with every pointer zero,
+// so a reader reports none of them.
 func TestCheckpointLeavesGlobalsUnstamped(t *testing.T) {
 	dev := &memDevice{}
 	f := newTestFile(t, dev, SyncNo, nil)
@@ -208,8 +220,9 @@ func TestCheckpointLeavesGlobalsUnstamped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open state: %v", err)
 	}
-	if st.Meta.TTLIndexOff != 0 || st.Meta.TTLIndexLen != 0 || st.Meta.FreeMapOff != 0 {
-		t.Fatalf("globals = ttl %#x/%d free %#x, want all zero", st.Meta.TTLIndexOff, st.Meta.TTLIndexLen, st.Meta.FreeMapOff)
+	if st.Meta.TTLIndexOff != 0 || st.Meta.TTLIndexLen != 0 || st.Meta.FreeMapOff != 0 || st.Meta.MetaKVOff != 0 {
+		t.Fatalf("globals = ttl %#x/%d free %#x meta_kv %#x, want all zero",
+			st.Meta.TTLIndexOff, st.Meta.TTLIndexLen, st.Meta.FreeMapOff, st.Meta.MetaKVOff)
 	}
 }
 

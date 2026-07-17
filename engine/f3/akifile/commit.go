@@ -54,21 +54,23 @@ type CheckpointStats struct {
 	Clean        bool
 }
 
-// CheckpointGlobals names the two file-global roots a checkpoint stamps into the new
-// meta slot alongside the SRT and extent map: the TTL reclaim index (a bare marshaled
-// root, so it carries a length) and the free map (a self-describing segment the meta
-// slot points at by offset alone). Both are produced by their own subsystems, active
-// expiry and the allocator, and handed to the checkpoint already written to free space
+// CheckpointGlobals names the file-global roots a checkpoint stamps into the new meta
+// slot alongside the SRT and extent map: the TTL reclaim index (a bare marshaled root,
+// so it carries a length), the free map (a self-describing segment the meta slot points
+// at by offset alone), and the meta_kv config and provenance (also a self-describing
+// segment). They are produced by their own subsystems, active expiry, the allocator, and
+// the config and import path, and handed to the checkpoint already written to free space
 // the way the per-shard roots are assembled into the SRT rows before the commit.
 //
-// The offsets are absolute file offsets a reader reads straight from: TTLIndexOff is
-// the bare marshaled root, FreeMapOff is the free_map segment header. A zero offset
-// names no root, so a checkpoint stamps exactly the globals it is given, the way a
-// checkpoint with no extents leaves the extent map unnamed.
+// The offsets are absolute file offsets a reader reads straight from: TTLIndexOff is the
+// bare marshaled root, FreeMapOff and MetaKVOff are segment headers. A zero offset names
+// no root, so a checkpoint stamps exactly the globals it is given, the way a checkpoint
+// with no extents leaves the extent map unnamed.
 type CheckpointGlobals struct {
 	TTLIndexOff uint64
 	TTLIndexLen uint32
 	FreeMapOff  uint64
+	MetaKVOff   uint64
 }
 
 // Checkpoint writes the current roots to free space and commits them (spec
@@ -85,8 +87,8 @@ func (f *File) Checkpoint(srt *SRT, extents []Extent, stats CheckpointStats) err
 }
 
 // CheckpointWithGlobals is Checkpoint with the file-global roots stamped too: the same
-// SRT and extent map append, plus the TTL index and free map offsets the caller has
-// already written to free space (spec 2064/f3/07 section 5). The globals ride the same
+// SRT and extent map append, plus the TTL index, free map, and meta_kv offsets the caller
+// has already written to free space (spec 2064/f3/07 section 5). The globals ride the same
 // meta slot flip, so recovery reads them back atomically with the SRT and extents from
 // the one live root. A zero-valued CheckpointGlobals is exactly Checkpoint.
 func (f *File) CheckpointWithGlobals(srt *SRT, extents []Extent, stats CheckpointStats, globals CheckpointGlobals) error {
@@ -112,6 +114,7 @@ func (f *File) CheckpointWithGlobals(srt *SRT, extents []Extent, stats Checkpoin
 		TTLIndexOff:   globals.TTLIndexOff,
 		TTLIndexLen:   globals.TTLIndexLen,
 		FreeMapOff:    globals.FreeMapOff,
+		MetaKVOff:     globals.MetaKVOff,
 		LiveBytes:     stats.LiveBytes,
 		DeadBytes:     stats.DeadBytes,
 		RecordCount:   stats.RecordCount,
