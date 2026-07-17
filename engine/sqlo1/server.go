@@ -1115,6 +1115,12 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.lrangeCmd(ctx, reply, args)
 	case "LTRIM":
 		return s.ltrimCmd(ctx, reply, args)
+	case "LINSERT":
+		return s.linsertCmd(ctx, reply, args)
+	case "LREM":
+		return s.lremCmd(ctx, reply, args)
+	case "LPOS":
+		return s.lposCmd(ctx, reply, args)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
