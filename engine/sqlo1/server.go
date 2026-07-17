@@ -119,8 +119,12 @@ func NewServer(st Store) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	list, err := NewList(t, ListConfig{})
+	if err != nil {
+		return nil, err
+	}
 	srv.t, srv.s, srv.h, srv.se, srv.z = t, str, hash, set, zset
-	srv.l = NewList(t)
+	srv.l = list
 	return srv, nil
 }
 
