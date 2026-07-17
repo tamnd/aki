@@ -12,12 +12,12 @@ import (
 // the shard's Ctx.Coll (spec 2064/f3/11): one map from key to the inline set,
 // touched only by the shard goroutine, so it holds no lock. The string store
 // and this registry are separate keyspaces for now; the WRONGTYPE guard below
-// keeps a set command off a key the string store owns, and the single-key
-// keyspace commands set.Exists and set.Del span both. TYPE has moved on to span
-// every type (its unified handler consults set.Has here); full cross-type
-// unification (a SET overwriting a set, multi-key DEL over sets) lands with the
-// keyspace slice; this slice keeps the set surface self-consistent and refuses
-// the cross-type collisions it cannot yet resolve.
+// keeps a set command off a key the string store owns, and single-key set.Del
+// spans both. TYPE and single-key EXISTS have moved on to span every type
+// (their unified handlers consult set.Has here); full cross-type unification (a
+// SET overwriting a set, multi-key DEL over sets) lands with the keyspace slice;
+// this slice keeps the set surface self-consistent and refuses the cross-type
+// collisions it cannot yet resolve.
 
 // reg is the shard's set registry plus its draw state. The PRNG is owner-local
 // (doc 11 section 5.6): SPOP and SRANDMEMBER draw from a per-shard PCG that is

@@ -159,11 +159,13 @@ func init() {
 	mset := registerShard(str.MSetShard)
 	del := registerShard(str.DelShard)
 	exists := registerShard(str.ExistsShard)
-	register("EXISTS", set.Exists, 1, -1, true)
+	register("EXISTS", existsCmd, 1, -1, true)
 	register("DEL", set.Del, 1, -1, true)
 	register("UNLINK", set.Del, 1, -1, true)
-	// The read-only expiry queries span the same set-plus-string keyspace as
-	// TYPE and single-key EXISTS, so the set package owns them too.
+	// The read-only expiry queries still span only the set-plus-string
+	// keyspace, so the set package owns them; threading them through the other
+	// collection registries lands with a later keyspace slice, as TYPE and
+	// single-key EXISTS already have.
 	register("TTL", set.Ttl, 1, 1, true)
 	register("PTTL", set.Pttl, 1, 1, true)
 	register("EXPIRETIME", set.Expiretime, 1, 1, true)
@@ -1004,4 +1006,24 @@ func typeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	default:
 		r.Status("none")
 	}
+}
+
+// existsCmd answers the single-key EXISTS point path, spanning every keyspace
+// f3 keeps rather than only the string store and the set registry. A key present
+// in any one keyspace counts as 1. The multi-key form still fans through the
+// string-only sub-handler, so a hash, list, zset, or stream key stays invisible
+// to EXISTS over two or more keys until the fan slice threads the registries;
+// this closes only the single-key gap, the one that shares TYPE's shape.
+func existsCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	key := args[0]
+	if cx.St.Exists(key, cx.NowMs) ||
+		set.Has(cx, key) ||
+		zset.Has(cx, key) ||
+		hash.Has(cx, key) ||
+		list.Has(cx, key) ||
+		stream.Has(cx, key) {
+		r.Int(1)
+		return
+	}
+	r.Int(0)
 }
