@@ -124,6 +124,24 @@ func (s *Store) WriteIndexCheckpoint() (akifile.SRTRow, error) {
 	}, nil
 }
 
+// CommitCheckpoint installs a set of per-shard index checkpoints as the file's live
+// root in one meta flip. rows is indexed by shard: rows[i] is the SRT row
+// WriteIndexCheckpoint returned for shard i, and a shard with nothing to checkpoint
+// takes a zero row. It is the coordinator step of the checkpoint commit: the one
+// meta slot names every shard's roots together, so the rows gather into one SRT and
+// commit once rather than a shard flipping the slot on its own and stranding the
+// others.
+//
+// stats is the file-global accounting the new root records, the live and dead bytes
+// and record count a reopen reads back to seed compaction without a rescan; the
+// caller aggregates it across shards and stamps the checkpoint time, which this
+// layer has no clock for. After it returns the committed root names each shard's
+// index_ckpt and its tail, so a plain reopen recovers through Recover without the
+// rows being handed in.
+func CommitCheckpoint(f *akifile.File, rows []akifile.SRTRow, stats akifile.CheckpointStats) error {
+	return f.CheckpointWithGlobals(&akifile.SRT{Rows: rows}, nil, stats, akifile.CheckpointGlobals{})
+}
+
 // pow2ceil is the smallest power of two at least n, the bucket-count rounding a
 // checkpoint header carries. It is defined here rather than inlined so the loader
 // side can share the same rounding when it lands.
