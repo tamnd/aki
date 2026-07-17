@@ -123,3 +123,52 @@ func (f *File) ReadRecordAt(addr uint64) (RecordRow, error) {
 	}
 	return row, nil
 }
+
+// CompactRecords re-homes a set of still-live records into one fresh `log`
+// segment, the record-log counterpart of CompactValues (valueregion.go) and the
+// reclaim step the store's log compaction drives: a log region whose dead fraction
+// is high is rewritten by handing its live record addresses here, and the returned
+// addresses replace the index entries so the old segments' whole span, live frames
+// and superseded alike, becomes free through the free map. It reads each live
+// record through ReadRecordAt, so a torn or superseded frame fails the copy instead
+// of migrating rot forward, re-frames the run into one payload, and cuts a single
+// `log` segment owned by shard. The returned addresses are frame starts in the same
+// order as live, so the caller maps old to new by index. An empty set writes no
+// segment.
+//
+// It re-frames each row verbatim, the value word included: record-log compaction
+// rewrites only the record frames, not the value log a separated word points at, so
+// a pointer row's word stays valid and an inline row's bytes ride the new frame the
+// same way they rode the old one. The caller owns liveness, exactly as CompactValues
+// leaves it: this copies whatever addresses it is handed, so a tombstone or a
+// superseded frame in the set would be migrated forward, and the store's compaction
+// driver is what filters the set to the live index first.
+func (f *File) CompactRecords(shard uint16, shardSeq uint64, live []uint64) ([]uint64, error) {
+	if len(live) == 0 {
+		return nil, nil
+	}
+	var payload []byte
+	frames := make([]RecordFrame, len(live))
+	for i, addr := range live {
+		row, err := f.ReadRecordAt(addr)
+		if err != nil {
+			return nil, err
+		}
+		payload, frames[i] = AppendRecordFrame(payload, row)
+	}
+	offs, err := f.AppendGroup([]Pending{{
+		Shard:    shard,
+		Kind:     KindLog,
+		ShardSeq: shardSeq,
+		Payload:  payload,
+	}})
+	if err != nil {
+		return nil, err
+	}
+	base := offs[0] + SegHeaderLen
+	addrs := make([]uint64, len(live))
+	for i, fr := range frames {
+		addrs[i] = base + fr.FrameOff
+	}
+	return addrs, nil
+}
