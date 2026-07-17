@@ -746,3 +746,274 @@ func TestReplayNeutralPageFrames(t *testing.T) {
 		t.Fatal("the advisory page frame did not apply")
 	}
 }
+
+// The rollback discipline (doc 09 section 3): a zset root claims
+// RollbackRef, never elides, frames a rootkey mapping ahead of
+// itself, and at replay the plane's put frames past its last root
+// frame drop whole while deletes still apply. Handcrafted plane
+// images again; the end-to-end matrix over the real zset operators
+// lands with the dual-side mutation slice.
+
+// zRoot builds a segmented zset root payload: the doc 06 header under
+// the doc 09 sub byte. RollbackRef reads only the sub byte and the
+// rooth, so the score-run tail stays off and rootCount keeps working.
+func zRoot(rooth uint64, count uint64, segids ...uint64) []byte {
+	b := w3Root(rooth, count, 0, segids...)
+	b[0] = 5 // zsetSubSeg, the TagZset slot
+	return b
+}
+
+// zRunKey builds a score-run subkey, kind 2 under the zset plane's
+// rooth (the kind byte is type-namespaced, doc 03 section 6.3).
+func zRunKey(t *testing.T, rooth, segid uint64) []byte {
+	t.Helper()
+	sk, err := sqlo1.NewSubkey(rooth, 2, segid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sk.Encode()
+}
+
+func TestZsetRootFramesRootkeyAndNeverElides(t *testing.T) {
+	r := newStoreRig(t)
+	const rooth = 0xe1e1
+	seg := w3SegKey(t, rooth, 1)
+	run := zRunKey(t, rooth, 2)
+	r.apply(t,
+		segOp(seg, w3Seg(3, 0)),
+		segOp(run, []byte("run-v1")),
+		rootOp("z", zRoot(rooth, 3, 1), false),
+	)
+	// Even a Delta-flagged zset root frames in full: no
+	// reconciliation exists to rebuild an elided frame from.
+	r.apply(t,
+		segOp(seg, w3Seg(4, 0)),
+		rootOp("z", zRoot(rooth, 4, 1), true),
+	)
+	recs, _ := walFrames(t, r)
+	roots, rootkeys := 0, 0
+	for _, rec := range recs {
+		if rec == nil {
+			continue
+		}
+		if rec.RType == RecRoot {
+			roots++
+		}
+		if rh, ukey, ok := RootkeyRef(rec); ok {
+			rootkeys++
+			if rh != rooth || !bytes.Equal(ukey, []byte("z")) {
+				t.Fatalf("rootkey maps %x to %q", rh, ukey)
+			}
+		}
+	}
+	if roots != 2 {
+		t.Fatalf("%d root frames in the WAL, want both zset roots framed", roots)
+	}
+	if rootkeys != 2 {
+		t.Fatalf("%d rootkey frames, want one ahead of every zset root", rootkeys)
+	}
+}
+
+func TestReplayRollsBackZsetPutsPastRoot(t *testing.T) {
+	r := newStoreRig(t)
+	const rooth = 0xa5a5
+	seg := w3SegKey(t, rooth, 1)
+	run := zRunKey(t, rooth, 2)
+	orphanRun := zRunKey(t, rooth, 3)
+	r.apply(t,
+		segOp(seg, w3Seg(10, 0)),
+		segOp(run, []byte("run-v1")),
+		rootOp("z", zRoot(rooth, 10, 1), false),
+	)
+	// The torn window: both sides' post-images and a freshly minted
+	// run land in acknowledged batches and the crash takes the batch
+	// with the command's root frame.
+	r.apply(t,
+		segOp(seg, w3Seg(11, 0)),
+		segOp(run, []byte("run-v2")),
+		segOp(orphanRun, []byte("run-minted")),
+	)
+	r.reopen(t)
+	if got := r.rootCount(t, "z"); got != 10 {
+		t.Fatalf("rolled-back root count %d, want the rooted 10", got)
+	}
+	rec, err := r.s.lookup(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _, _ := sqlo1.SegCounts(rec.Value); n != 10 {
+		t.Fatalf("member segment count %d, want the rooted 10", n)
+	}
+	rec, err = r.s.lookup(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rec.Value, []byte("run-v1")) {
+		t.Fatalf("score run = %q, want the rooted run-v1", rec.Value)
+	}
+	orphan, err := r.s.lookup(orphanRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orphan != nil {
+		t.Fatal("the un-rooted minted run applied despite the rollback")
+	}
+	// Repeat recoveries roll back to the same image.
+	r.reopen(t)
+	rec, err = r.s.lookup(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rec.Value, []byte("run-v1")) {
+		t.Fatalf("second recovery drifted the run to %q", rec.Value)
+	}
+}
+
+func TestZsetDeletePastRootApplies(t *testing.T) {
+	// Run deaths ride behind the root frame that stopped referencing
+	// them (root first, then the record), so a delete past the last
+	// root frame always had its commanding root land and must apply.
+	r := newStoreRig(t)
+	const rooth = 0xb7b7
+	seg := w3SegKey(t, rooth, 1)
+	run2 := zRunKey(t, rooth, 2)
+	run3 := zRunKey(t, rooth, 3)
+	r.apply(t,
+		segOp(seg, w3Seg(10, 0)),
+		segOp(run2, []byte("run2-v1")),
+		segOp(run3, []byte("run3-dying")),
+		rootOp("z", zRoot(rooth, 10, 1), false),
+	)
+	r.apply(t, delOp(string(run3)))
+	r.reopen(t)
+	dead, err := r.s.lookup(run3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dead != nil {
+		t.Fatal("the acknowledged run delete was dropped")
+	}
+	rec, err := r.s.lookup(run2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec == nil || !bytes.Equal(rec.Value, []byte("run2-v1")) {
+		t.Fatal("the fenced run did not survive the delete's replay")
+	}
+	if got := r.rootCount(t, "z"); got != 10 {
+		t.Fatalf("root count %d, want 10", got)
+	}
+}
+
+func TestZsetFencePagePastRootRollsBack(t *testing.T) {
+	r := newStoreRig(t)
+	const rooth = 0xc9c9
+	pkey := sqlo1.Subkey{Rooth: rooth, Kind: sqlo1.SubkindFence, Segid: 9}.Encode()
+	pageOp := func(v []byte) sqlo1.Op {
+		return sqlo1.Op{Rec: sqlo1.Record{Key: pkey, Value: v, Fence: true, Gen: 1}}
+	}
+	r.apply(t,
+		pageOp([]byte("page-v1")),
+		rootOp("z", zRoot(rooth, 10, 1), false),
+	)
+	r.apply(t, pageOp([]byte("page-v2")))
+	r.reopen(t)
+	rec, err := r.s.lookup(pkey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec == nil || !bytes.Equal(rec.Value, []byte("page-v1")) {
+		t.Fatalf("fence page = %q, want the rooted page-v1", rec.Value)
+	}
+}
+
+func TestZsetOrphanFramesWithoutMappingApply(t *testing.T) {
+	// No zset root ever framed, so no rootkey mapping exists: the
+	// plane's frames apply as harmless orphans, the same posture the
+	// reconcilable planes take.
+	r := newStoreRig(t)
+	const rooth = 0xd4d4
+	seg := w3SegKey(t, rooth, 1)
+	run := zRunKey(t, rooth, 2)
+	r.apply(t,
+		segOp(seg, w3Seg(5, 0)),
+		segOp(run, []byte("run-orphan")),
+	)
+	r.reopen(t)
+	rec, err := r.s.lookup(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec == nil || !bytes.Equal(rec.Value, []byte("run-orphan")) {
+		t.Fatal("orphan run frame did not apply")
+	}
+}
+
+func TestZsetStaleMappingSkipsRollback(t *testing.T) {
+	// The key moves on after the plane rooted: deleted, recreated as
+	// a plain string. The mapping points at a record that is no zset
+	// root, so the trailing plane frames apply as orphans instead of
+	// rolling anything back.
+	r := newStoreRig(t)
+	const rooth = 0xf2f2
+	seg := w3SegKey(t, rooth, 1)
+	run := zRunKey(t, rooth, 2)
+	r.apply(t,
+		segOp(seg, w3Seg(10, 0)),
+		segOp(run, []byte("run-v1")),
+		rootOp("z", zRoot(rooth, 10, 1), false),
+	)
+	r.apply(t, delOp("z"))
+	r.apply(t, putOp("z", []byte("plain again"), 0))
+	r.apply(t, segOp(run, []byte("run-v2")))
+	r.reopen(t)
+	got, err := r.s.Get(context.Background(), []byte("z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Value, []byte("plain again")) {
+		t.Fatalf("recreated key = %q", got.Value)
+	}
+	rec, err := r.s.lookup(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec == nil || !bytes.Equal(rec.Value, []byte("run-v2")) {
+		t.Fatalf("run = %q, the stale mapping rolled a dead plane back", rec.Value)
+	}
+}
+
+func TestZsetGenbumpClearsRollbackWindow(t *testing.T) {
+	// A genbump retires the plane mid-tail: the window collected so
+	// far is moot and later frames belong to whatever comes next, so
+	// nothing rolls back across the bump.
+	r := newStoreRig(t)
+	const rooth = 0x9a9a
+	seg := w3SegKey(t, rooth, 1)
+	run := zRunKey(t, rooth, 2)
+	r.apply(t,
+		segOp(seg, w3Seg(10, 0)),
+		segOp(run, []byte("run-v1")),
+		rootOp("z", zRoot(rooth, 10, 1), false),
+	)
+	r.apply(t,
+		segOp(seg, w3Seg(12, 0)),
+		segOp(run, []byte("run-v2")),
+	)
+	r.genbump(t, rooth, 2)
+	r.reopen(t)
+	rec, err := r.s.lookup(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec == nil || !bytes.Equal(rec.Value, []byte("run-v2")) {
+		t.Fatalf("run = %q, the retired plane's frames were dropped", rec.Value)
+	}
+	rec, err = r.s.lookup(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _, _ := sqlo1.SegCounts(rec.Value); n != 12 {
+		t.Fatalf("segment count %d, want the applied 12", n)
+	}
+}

@@ -20,10 +20,17 @@ import (
 // segment payload leads with the doc 06 section 2.4 header (u16 entry
 // count, u16 reserved, u64 min_expire_ms) and the segmented root
 // carries count at offset 16 and min_expire_ms at offset 32 per
-// section 2.2. The segmented hash is the only claimant today; a type
-// that is not listed here must never see its root frames elided, and
-// the store guards that by framing any root ReconcileRef does not
+// section 2.2. The segmented hash and set are the claimants today; a
+// type that is not listed here must never see its root frames elided,
+// and the store guards that by framing any root ReconcileRef does not
 // recognize in full.
+//
+// The segmented zset opts out of reconciliation and claims the other
+// replay discipline instead, RollbackRef: its root tail carries exact
+// per-run fence counts (doc 09 section 2.2) that no segment diff can
+// rebuild, so every zset root frames in full and replay treats the
+// last root frame as the plane's commit point, dropping the plane's
+// put frames past it.
 
 // ReconcileRef reports whether a root payload participates in W3
 // reconciliation and returns the rooth its segments carry in their
@@ -31,6 +38,26 @@ import (
 // has not claimed reconciliation, and its frames must stay full.
 func ReconcileRef(rootValue []byte) (rooth uint64, ok bool) {
 	if len(rootValue) < hashSegRootHdrLen || (rootValue[0] != hashSubSeg && rootValue[0] != setSubSeg) {
+		return 0, false
+	}
+	return binary.LittleEndian.Uint64(rootValue[8:]), true
+}
+
+// RollbackRef reports whether a root payload claims whole-plane
+// rollback at replay and returns its rooth. The segmented zset is the
+// claimant: its member segments pair with score runs whose exact
+// fence counts live in the root tail, so a torn tail cannot be
+// repaired by count patching and the root frame is the one commit
+// point a command has (doc 09 section 3). The store frames a rootkey
+// record ahead of every such root so replay can resolve the plane,
+// and never elides the root frame itself, Delta flag or not. At
+// settle, replay drops the plane's subkey put frames past its last
+// root frame; deletes still apply, because a zset plane's deletes
+// ride behind the root that stopped referencing them and segids are
+// never reused. A payload can never claim both refs, the sub bytes
+// are disjoint.
+func RollbackRef(rootValue []byte) (rooth uint64, ok bool) {
+	if len(rootValue) < hashSegRootHdrLen || rootValue[0] != zsetSubSeg {
 		return 0, false
 	}
 	return binary.LittleEndian.Uint64(rootValue[8:]), true

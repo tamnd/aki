@@ -499,9 +499,18 @@ type tailPageImg struct {
 // runs against the committed state the checkpoint left behind, raw
 // lookups with no expiry gating, so the result is a pure function of
 // the data file and the tail and repeat recoveries are idempotent.
+//
+// Planes whose root claims RollbackRef instead settle by the other
+// discipline: the root frame is the command's commit point, so every
+// plane put frame past the last root frame drops whole, segments,
+// auxiliary records, and fence pages alike. Deletes still apply: a
+// rollback plane's deletes ride behind the root frame that stopped
+// referencing them and segids are never reused, so a delete past the
+// last root frame always had its commanding root land.
 func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 	segs := map[string]int{}          // subkey bytes -> latest known entry count
 	wins := map[uint64][]planeSegOp{} // rooth -> window past its last root frame
+	aux := map[uint64][]int{}         // rooth -> put frames of other subkey kinds
 	rootRecs := map[string]*Record{}  // user key -> latest tail root image, nil = deleted
 	rootKeys := map[uint64][]byte{}   // rooth -> user key, from tail rootkey records
 	// Fence pages are neutral in the walk: never evidence, never
@@ -518,6 +527,14 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 	}
 	isFence := func(k []byte) bool {
 		return len(k) == SubkeySize && k[8] == sqlo1.SubkindFence
+	}
+	// The remaining subkey kinds are type-namespaced auxiliaries
+	// (popcount caches under strings, score runs under zsets); which
+	// plane owns one resolves at settle through the durable root, so
+	// the walk only remembers where their put frames sit.
+	isAux := func(k []byte) bool {
+		return len(k) == SubkeySize && k[8] != 0 &&
+			k[8] != sqlo1.SubkindSeg && k[8] != sqlo1.SubkindFence
 	}
 	segPre := func(key []byte) (int, error) {
 		if n, ok := segs[string(key)]; ok {
@@ -549,6 +566,7 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 			// The plane retired; whatever its count was is moot, and
 			// its rootkey record may soon point at a recreated key.
 			delete(wins, binary.LittleEndian.Uint64(op.key))
+			delete(aux, binary.LittleEndian.Uint64(op.key))
 		case op.del:
 			if isSeg(op.key) {
 				rooth := binary.LittleEndian.Uint64(op.key)
@@ -558,6 +576,10 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 				segs[string(op.key)] = 0
 			} else if isFence(op.key) {
 				fpages[string(op.key)] = append(fpages[string(op.key)], tailPageImg{idx: i, batch: batch})
+			} else if isAux(op.key) {
+				// An auxiliary delete is a plane record dying, not a
+				// user key: neutral to the walk, and rollback settle
+				// always lets it apply.
 			} else {
 				rootRecs[string(op.key)] = nil
 			}
@@ -585,6 +607,9 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 					dn: int64(post - pre), min: postMin,
 				})
 				segs[string(rec.Key)] = post
+			case rec.RType == RecSeg && isAux(rec.Key):
+				rooth := binary.LittleEndian.Uint64(rec.Key)
+				aux[rooth] = append(aux[rooth], i)
 			case rec.RType == RecRoot:
 				rootRecs[string(rec.Key)] = rec
 				if rooth, ok := sqlo1.ReconcileRef(rec.Value); ok {
@@ -592,13 +617,43 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 					// only segments past it can drift the plane.
 					delete(wins, rooth)
 					rootAt[rooth] = i
+				} else if rooth, ok := sqlo1.RollbackRef(rec.Value); ok {
+					// A rollback plane's commit point: everything the
+					// frame describes landed at or before it, so the
+					// window past it starts empty here.
+					delete(wins, rooth)
+					delete(aux, rooth)
+					rootAt[rooth] = i
 				}
 			}
 		}
 	}
-	rooths := make([]uint64, 0, len(wins))
+	rooths := make([]uint64, 0, len(wins)+len(aux))
 	for rooth := range wins {
 		rooths = append(rooths, rooth)
+	}
+	for rooth := range aux {
+		if _, dup := wins[rooth]; !dup {
+			rooths = append(rooths, rooth)
+		}
+	}
+	// A rollback plane's tail can carry nothing but fence-page frames
+	// past its root, so those rooths settle too; for reconcilable
+	// planes a page-only tail stays what it always was, neutral, and
+	// the settle loop skips them right after the rollback branch.
+	pageOnly := map[uint64]bool{}
+	for k := range fpages {
+		rooth := binary.LittleEndian.Uint64([]byte(k))
+		if _, dup := wins[rooth]; dup {
+			continue
+		}
+		if _, dup := aux[rooth]; dup {
+			continue
+		}
+		if !pageOnly[rooth] {
+			pageOnly[rooth] = true
+			rooths = append(rooths, rooth)
+		}
 	}
 	slices.Sort(rooths)
 	var patches []tailOp
@@ -631,6 +686,41 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 		}
 		if root == nil || root.RType != RecRoot {
 			continue
+		}
+		if rb, ok := sqlo1.RollbackRef(root.Value); ok {
+			if rb != rooth {
+				continue // stale mapping, the key was recreated
+			}
+			// Roll the plane back to its last root frame: the window
+			// maps were cleared at every root frame, so whatever they
+			// still hold sits past the last one and its puts drop
+			// whole. Deletes apply, per the rule above.
+			for _, o := range win {
+				if !o.del {
+					dropped[o.idx] = true
+				}
+			}
+			for _, idx := range aux[rooth] {
+				dropped[idx] = true
+			}
+			lastRoot := -1
+			if at, ok := rootAt[rooth]; ok {
+				lastRoot = at
+			}
+			for k, imgs := range fpages {
+				if binary.LittleEndian.Uint64([]byte(k)) != rooth {
+					continue
+				}
+				for _, img := range imgs {
+					if img.idx > lastRoot && img.val != nil {
+						dropped[img.idx] = true
+					}
+				}
+			}
+			continue
+		}
+		if pageOnly[rooth] {
+			continue // fence pages alone never reconcile a plane
 		}
 		if rr, ok := sqlo1.ReconcileRef(root.Value); !ok || rr != rooth {
 			continue // stale mapping, the key was recreated
@@ -1048,6 +1138,18 @@ func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 					frames = append(frames, plannedFrame{rec: rec})
 					continue
 				}
+				rk := rootkeyRecord(rooth, rec.Key)
+				rkPay, err := EncodePutPayload(rk)
+				if err != nil {
+					return fmt.Errorf("sqlo1b: batch %d op %d rootkey: %w", b.Seq, i, err)
+				}
+				frames = append(frames, plannedFrame{op: sqlo1.WALOpPut, pay: rkPay, rec: rk})
+			} else if rooth, ok := sqlo1.RollbackRef(rec.Value); ok {
+				// A rollback plane's root frame is its replay commit
+				// point: never elided, Delta flag or not, because no
+				// reconciliation can rebuild its fence counts from
+				// segment frames. The mapping frames ahead of every
+				// one so replay can resolve the plane it settles.
 				rk := rootkeyRecord(rooth, rec.Key)
 				rkPay, err := EncodePutPayload(rk)
 				if err != nil {
