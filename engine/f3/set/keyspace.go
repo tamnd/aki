@@ -9,16 +9,6 @@ import "github.com/tamnd/aki/engine/f3/shard"
 // the fan sub-handlers; a set key is invisible to a multi-key EXISTS or DEL
 // for now, which is recorded as owed, not designed.
 
-// Exists answers single-key EXISTS: 1 when the key holds a set or a string
-// value, 0 otherwise.
-func Exists(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	if registry(cx).m[string(args[0])] != nil || cx.St.Exists(args[0], cx.NowMs) {
-		r.Int(1)
-		return
-	}
-	r.Int(0)
-}
-
 // Del answers single-key DEL and UNLINK: remove the key from whichever
 // keyspace holds it and report 1 when something was removed. Reclamation is
 // owner-local and immediate, so UNLINK shares the path.
