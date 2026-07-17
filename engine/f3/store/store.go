@@ -67,6 +67,15 @@ type Store struct {
 	// region's dead-byte accounting a checkpoint persists across restart.
 	akirlog *akiRlog
 
+	// rlogErr holds the first durability fault a delete or expiry tombstone cut
+	// raised (recordseam.go). Those paths report a boolean, not an error, because
+	// Del's presence answer is load-bearing across every type, so a failed
+	// tombstone cut cannot return through them; it is held here instead until the
+	// ack-barrier path, which can fail a command, reads and clears it through
+	// TakeRecordLogErr. The publish path surfaces its own cut error synchronously
+	// and never touches this. Nil on any store without a record log.
+	rlogErr error
+
 	// spillLedger records where each provisional word from the current batch was
 	// written (spillledger.go): one entry per staged run, the value-area offset
 	// vs of the record's run pointer and the run's stage index. resolveSpill
@@ -379,6 +388,7 @@ func (s *Store) Reset() {
 	s.bands = [4]uint64{}
 	s.logRuns = 0
 	s.spillLedger = s.spillLedger[:0]
+	s.rlogErr = nil
 	s.chunkBytes = 0
 	s.coldRecs = 0
 	s.coldHand = 0

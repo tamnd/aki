@@ -168,6 +168,51 @@ func TestSetStringSeparatedLogsDurableWord(t *testing.T) {
 	}
 }
 
+// TestDelLogsTombstone confirms a delete cuts a tombstone row carrying the key
+// and the tombstone flag, so a replay clears the entry instead of resurrecting the
+// value the SET before it logged.
+func TestDelLogsTombstone(t *testing.T) {
+	s, f := newRecordSeamStore(t)
+
+	key := []byte("gone")
+	if err := s.SetString(key, []byte("v"), 0, 0, false); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if !s.Del(key, 0) {
+		t.Fatal("del reported absent for a live key")
+	}
+	rows := walkSeam(t, f)
+	if len(rows) != 2 {
+		t.Fatalf("got %d logged rows, want 2 (a set then a tombstone)", len(rows))
+	}
+	tomb := rows[1]
+	if tomb.Flags&akifile.RecFlagTombstone == 0 {
+		t.Fatalf("second row flags = %d, want the tombstone bit", tomb.Flags)
+	}
+	if string(tomb.Key) != "gone" {
+		t.Fatalf("tombstone key = %q, want gone", tomb.Key)
+	}
+	if tomb.ValueLen != 0 || tomb.ExpireAt != 0 {
+		t.Fatalf("tombstone carried value len %d expiry %d, want zero", tomb.ValueLen, tomb.ExpireAt)
+	}
+	if err := s.TakeRecordLogErr(); err != nil {
+		t.Fatalf("durability fault after a clean delete: %v", err)
+	}
+}
+
+// TestDelAbsentLogsNothing confirms a delete of a missing key cuts no tombstone,
+// so the log records only real supersessions.
+func TestDelAbsentLogsNothing(t *testing.T) {
+	s, f := newRecordSeamStore(t)
+
+	if s.Del([]byte("nope"), 0) {
+		t.Fatal("del reported present for a missing key")
+	}
+	if rows := walkSeam(t, f); len(rows) != 0 {
+		t.Fatalf("got %d logged rows for a no-op delete, want 0", len(rows))
+	}
+}
+
 // TestSetStringNoHandleLogsNothing confirms the default volatile store never
 // touches a record log, so the durable path adds nothing when it is off.
 func TestSetStringNoHandleLogsNothing(t *testing.T) {

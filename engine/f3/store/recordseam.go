@@ -73,3 +73,33 @@ func (s *Store) logRecord(off uint64) error {
 	_, err := s.akirlog.flush()
 	return err
 }
+
+// logTombstone durably appends a clear record for key, so a replay that meets it
+// removes the entry instead of resurrecting the deleted value: without it the log
+// records every SET but no delete, and replay lands on a key the client dropped. A
+// tombstone carries only the key and the tombstone flag, no value or expiry. On a
+// store with no record log it is a no-op.
+//
+// The delete and expiry paths answer with a boolean, not an error, so a failed cut
+// cannot return through them; it is held in rlogErr for the ack-barrier path to
+// surface. The dead-byte accounting is not this call's: the caller's dropRecord
+// already charged the superseded bytes.
+func (s *Store) logTombstone(key []byte) {
+	if s.akirlog == nil {
+		return
+	}
+	s.akirlog.stage(akifile.RecordRow{Flags: akifile.RecFlagTombstone, Key: key})
+	if _, err := s.akirlog.flush(); err != nil && s.rlogErr == nil {
+		s.rlogErr = err
+	}
+}
+
+// TakeRecordLogErr returns and clears the first durability fault a tombstone cut
+// raised, or nil. The ack-barrier path reads it before releasing a durability-
+// requiring ack, so a delete whose tombstone never reached the disk fails the
+// command rather than acking a loss. Owner goroutine only.
+func (s *Store) TakeRecordLogErr() error {
+	err := s.rlogErr
+	s.rlogErr = nil
+	return err
+}
