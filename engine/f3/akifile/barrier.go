@@ -65,6 +65,18 @@ func AppendBarrierShard(dst []byte, s BarrierShard) []byte {
 	return append(dst, b[:]...)
 }
 
+// MarshalBarrier frames a whole barrier payload: the header followed by one tail row per
+// shard in shard order, the bytes a barrier segment carries. It is the emit-side inverse
+// of ParseBarrierHeader plus BarrierShards, so the coordinator frames a cut with one call
+// the way MarshalExtents frames the extent map.
+func MarshalBarrier(h BarrierHeader, shards []BarrierShard) []byte {
+	payload := AppendBarrierHeader(nil, h)
+	for _, s := range shards {
+		payload = AppendBarrierShard(payload, s)
+	}
+	return payload
+}
+
 // ParseBarrierHeader decodes and validates a barrier header: only the magic, since
 // the header carries no invariant beyond its watermark and count.
 func ParseBarrierHeader(b []byte) (BarrierHeader, error) {
