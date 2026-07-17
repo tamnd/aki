@@ -112,6 +112,19 @@ func (z *ZSet) memDel(ctx context.Context, key, member []byte) (bool, error) {
 	return z.h.HDel(ctx, key, member)
 }
 
+// ZScan is one cursor step on the shared fh cursor, HScan's contract
+// verbatim over the member family: members emit from cursor upward in
+// fh order with their scores decoded from the entry's sortable bytes,
+// the returned cursor is the last fh plus one (zero when done), and
+// the step always finishes the segment it is in so the resume point
+// cannot bisect a run of equal fh values. Inline zsets answer any
+// cursor with everything and a zero next cursor, the listpack rule.
+func (z *ZSet) ZScan(ctx context.Context, key []byte, cursor uint64, count int64, emit func(member []byte, score float64)) (uint64, error) {
+	return z.h.HScan(ctx, key, cursor, count, func(f, v []byte) {
+		emit(f, zScoreFromSortable(binary.BigEndian.Uint64(v)))
+	})
+}
+
 // ErrZSetNaN is the increment overflow rule of ZINCRBY and ZADD INCR:
 // an increment whose result is NaN (inf plus -inf) leaves the zset
 // untouched. The text is Redis's wire error without the ERR prefix.
