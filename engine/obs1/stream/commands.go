@@ -75,8 +75,9 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if newKey {
 		g.m[string(args[0])] = s
 	}
+	var removed int
 	if trimSet {
-		removed := s.trim(trim)
+		removed = s.trim(trim)
 		// Exact trim tombstones the boundary block's overshoot in place, leaving a
 		// partially-dead sealed block for the gc pass; approximate trim only drops
 		// whole front blocks, already reclaimed. Mark the stream dirty only in the
@@ -84,6 +85,16 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		if removed > 0 && !trim.approx && s.kind == bandNative {
 			g.markDirty(s)
 		}
+	}
+	// One command, one run: collnew when the key is new, the entry at its
+	// assigned id, and the trim clause's removals when it dropped any. A
+	// refused emission skips the serves below, the pushCmd rule: a liveness
+	// cost, never a correctness one, since XREAD serves are pure reads and
+	// frame nothing themselves.
+	if err := cx.LogStreamAdd(args[0], newKey, id.ms, id.seq, args[i:], uint64(removed)); err != nil {
+		g.note(s)
+		r.Err(err.Error())
+		return
 	}
 	// The appended entry is a read event for any client blocked on this key: its
 	// ID exceeds every parked waiter's after-ID (they parked at or below the prior
@@ -134,6 +145,14 @@ func Xtrim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		g.markDirty(s)
 	}
 	g.note(s)
+	// A trim that removed nothing frames nothing; one that did frames its
+	// count, and never a colldrop, since a trim never drops the stream.
+	if removed > 0 {
+		if err := cx.LogStreamTrim(args[0], uint64(removed)); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
 	r.Int(int64(removed))
 }
 
@@ -187,10 +206,19 @@ func Xdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Int(0)
 		return
 	}
+	// The frame carries only the ids that actually removed, in argument
+	// order; collecting them is gated on a wired log so the unlogged path
+	// stays allocation-free.
+	logging := cx.Log != nil
+	var delMs, delSeq []uint64
 	var n int64
 	for _, id := range ids {
 		if s.delete(id) {
 			n++
+			if logging {
+				delMs = append(delMs, id.ms)
+				delSeq = append(delSeq, id.seq)
+			}
 		}
 	}
 	// A tombstone in a native sealed block accrues dead bytes the gc pass reclaims;
@@ -203,6 +231,15 @@ func Xdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// gc pass reclaims the block; note keeps the running total exact at the boundary
 	// regardless, and picks up any auxiliary change the command made.
 	g.note(s)
+	// An XDEL that removed nothing frames nothing, and one that emptied the
+	// stream frames no colldrop: the stream persists and lastID never moves
+	// back.
+	if n > 0 {
+		if err := cx.LogStreamDel(args[0], delMs, delSeq); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
 	r.Int(n)
 }
 
@@ -245,6 +282,13 @@ func Xsetid(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	if maxDeleted.set {
 		s.maxDeletedID = maxDeleted.id
+	}
+	// The frame carries all three resulting values unconditionally, the
+	// optional-argument merge already done, so replay assigns without flags.
+	// The key must exist, so a collnew never leads.
+	if err := cx.LogStreamSetID(args[0], s.lastID.ms, s.lastID.seq, s.entriesAdded, s.maxDeletedID.ms, s.maxDeletedID.seq); err != nil {
+		r.Err(err.Error())
+		return
 	}
 	r.Status("OK")
 }
