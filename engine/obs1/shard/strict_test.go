@@ -159,6 +159,38 @@ func (f *fakeLog) StreamSetID(key []byte, lastMs, lastSeq, entriesAdded, maxDelM
 	return f.emit(key)
 }
 
+func (f *fakeLog) StreamGroupNew(key []byte, createdStream bool, group []byte, lastMs, lastSeq, entriesRead uint64, readValid bool) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) StreamGroupSetID(key, group []byte, lastMs, lastSeq, entriesRead uint64, readValid bool) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) StreamGroupDrop(key, group []byte) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) StreamConsumerNew(key, group, consumer []byte, seenMs int64) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) StreamConsumerDel(key, group, consumer []byte) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) StreamAck(key, group []byte, ms, seqs []uint64) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) StreamDeliver(key, group, consumer []byte, noAck bool, timeMs int64, ms, seqs []uint64) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) StreamClaim(key, group, consumer []byte, unowned bool, ms, seqs []uint64, times []int64, counts []uint16, dropMs, dropSeqs []uint64) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
 func (f *fakeLog) NotifyCommitted(group uint16, seq uint64, fn func()) {
 	f.pending = append(f.pending, fakeNotify{group: group, seq: seq, fn: fn})
 }
