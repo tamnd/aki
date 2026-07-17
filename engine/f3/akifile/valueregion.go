@@ -66,3 +66,28 @@ func (f *File) ReadValueAt(p ValuePointer, dst []byte) ([]byte, error) {
 	}
 	return dst, nil
 }
+
+// ReadValueFrameAt reads a value the caller located by only its offset and length,
+// verifying the torn-blob guard off the frame's own trailing CRC32C instead of a
+// stored one. It reads value_len bytes plus the four CRC bytes the frame trails
+// them with, checks the sum, and returns just the value. This is the read the value
+// log's re-home leans on: the store's in-record pointer is a 48-bit offset with the
+// length carried beside it and no room for a CRC, so it cannot form a full
+// ValuePointer; the frame carrying its own CRC is what lets a bare (off, len) still
+// fail closed on a value that tore or was superseded rather than hand back rot. dst
+// is reused when it has the room. A mismatch is ErrChecksum.
+func (f *File) ReadValueFrameAt(off uint64, valLen uint32, dst []byte) ([]byte, error) {
+	need := int(valLen) + 4
+	if cap(dst) < need {
+		dst = make([]byte, need)
+	}
+	dst = dst[:need]
+	if _, err := f.dev.ReadAt(dst, int64(off)); err != nil {
+		return nil, err
+	}
+	val := dst[:valLen]
+	if crc32c(val) != le.Uint32(dst[valLen:need]) {
+		return nil, ErrChecksum
+	}
+	return val, nil
+}

@@ -116,6 +116,48 @@ func TestReadValueAtCatchesTornBlob(t *testing.T) {
 	}
 }
 
+// TestReadValueFrameAtResolvesBarePointer reads each value back from only its
+// offset and length, the shape the value log's re-home hands the store: no stored
+// CRC, the frame's own trailing sum is the guard.
+func TestReadValueFrameAtResolvesBarePointer(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	vals := [][]byte{[]byte("a"), bytes.Repeat([]byte("z"), 3000), []byte("tail")}
+	ptrs, err := f.AppendValues(0, 1, vals)
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	var buf []byte
+	for i, p := range ptrs {
+		got, err := f.ReadValueFrameAt(p.ValueOff, p.ValueLen, buf)
+		if err != nil {
+			t.Fatalf("read value %d: %v", i, err)
+		}
+		if !bytes.Equal(got, vals[i]) {
+			t.Fatalf("value %d = %q, want %q", i, got, vals[i])
+		}
+		buf = got[:0]
+	}
+}
+
+// TestReadValueFrameAtCatchesTornBlob tears a value byte and confirms the frame's
+// trailing CRC catches it, so a bare (off, len) pointer fails closed like a full
+// ValuePointer would.
+func TestReadValueFrameAtCatchesTornBlob(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	ptrs, err := f.AppendValues(0, 1, [][]byte{[]byte("integrity-checked")})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	dev.buf[ptrs[0].ValueOff+2] ^= 0xff
+	if _, err := f.ReadValueFrameAt(ptrs[0].ValueOff, ptrs[0].ValueLen, nil); err != ErrChecksum {
+		t.Fatalf("torn read err = %v, want ErrChecksum", err)
+	}
+}
+
 // TestAppendValuesSurvivesReopen writes values, reopens the file so the cursor
 // bootstraps from a tail scan, appends more, and reads pointers from both eras:
 // the value_log segments are real segments a scan resumes past.
