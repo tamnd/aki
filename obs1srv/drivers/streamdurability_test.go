@@ -213,12 +213,26 @@ func TestStreamDurabilityStrictAck(t *testing.T) {
 	}
 	defer nc2.Close()
 	r2 := br(nc2)
-	// The relaxed reader sees the entry at once: the write ran in RAM and
-	// only the strict writer's output waits on the gated chain.
-	send(t, nc2, "XLEN", "sk")
-	expect(t, r2, ":1\r\n")
-
+	// The relaxed reader sees the entry once the write lands in RAM; only
+	// the strict writer's output waits on the gated chain. Nothing orders
+	// this fresh connection behind the XADD's apply, so poll for it.
 	deadline := time.Now().Add(10 * time.Second)
+	for {
+		send(t, nc2, "XLEN", "sk")
+		line, err := r2.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == ":1\r\n" {
+			break
+		}
+		if line != ":0\r\n" || time.Now().After(deadline) {
+			t.Fatalf("xlen reply = %q", line)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	deadline = time.Now().Add(10 * time.Second)
 	for readInfo(t, nc2, r2)["wal_barrier_flushes"] == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("no barrier flush while a strict XADD was pending")
