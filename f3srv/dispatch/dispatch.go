@@ -532,6 +532,7 @@ func init() {
 	register("HGET", hash.Hget, 2, 2, true)
 	register("HMGET", hash.Hmget, 2, -1, true)
 	register("HDEL", hash.Hdel, 2, -1, true)
+	register("HGETDEL", hash.Hgetdel, 4, -1, true)
 	register("HEXISTS", hash.Hexists, 2, 2, true)
 	register("HLEN", hash.Hlen, 1, 1, true)
 	register("HSTRLEN", hash.Hstrlen, 2, 2, true)

@@ -87,6 +87,29 @@ func TestHdelDropsKey(t *testing.T) {
 	wantInt(t, do(t, c, opHdel, "nokey", "a"), 0)
 }
 
+// HGETDEL returns each field's value, nil for the absent, and removes the
+// present ones, dropping the key when its last field leaves.
+func TestHgetdel(t *testing.T) {
+	c := newHarness(t).NewConn()
+	do(t, c, opHset, "h", "a", "1", "b", "2", "c", "3")
+	// Present fields answer their value and go; absent fields answer nil.
+	wantArray(t, do(t, c, opHgetdel, "h", "FIELDS", "3", "a", "x", "b"),
+		"1", nilElem, "2")
+	wantInt(t, do(t, c, opHexists, "h", "a"), 0)
+	wantInt(t, do(t, c, opHexists, "h", "b"), 0)
+	wantInt(t, do(t, c, opHlen, "h"), 1)
+	// A missing key answers all-nil, same length as the request.
+	wantArray(t, do(t, c, opHgetdel, "nokey", "FIELDS", "2", "a", "b"),
+		nilElem, nilElem)
+	// Taking the last field drops the key.
+	wantArray(t, do(t, c, opHgetdel, "h", "FIELDS", "1", "c"), "3")
+	wantInt(t, do(t, c, opHlen, "h"), 0)
+	wantNil(t, doAt(t, c, opObject, 1, "ENCODING", "h"))
+	// A malformed clause is an arity error, not a silent empty reply.
+	wantErr(t, do(t, c, opHgetdel, "h", "a", "b"),
+		"ERR wrong number of arguments for 'hgetdel' command")
+}
+
 // Every point verb answers WRONGTYPE on a key the string store owns.
 func TestWrongType(t *testing.T) {
 	c := newHarness(t).NewConn()
@@ -98,6 +121,7 @@ func TestWrongType(t *testing.T) {
 	wantErr(t, do(t, c, opHget, "s", "a"), wt)
 	wantErr(t, do(t, c, opHmget, "s", "a"), wt)
 	wantErr(t, do(t, c, opHdel, "s", "a"), wt)
+	wantErr(t, do(t, c, opHgetdel, "s", "FIELDS", "1", "a"), wt)
 	wantErr(t, do(t, c, opHexists, "s", "a"), wt)
 	wantErr(t, do(t, c, opHlen, "s"), wt)
 	wantErr(t, do(t, c, opHstrlen, "s", "a"), wt)
