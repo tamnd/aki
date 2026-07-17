@@ -58,6 +58,12 @@ type fullWaiter struct {
 	// for the arena-full park below, flushlag and lease when their slices raise
 	// them. A stall-out counts the waiter under its reason.
 	reason ParkReason
+	// marks holds the WAL marks the write emitted before it parked, the
+	// committed prefix of a multi-key write on a strict connection. Each retry
+	// is seeded with them so the marks the completing pass hands to the gather
+	// cover every pair the command ever committed, not just the last pass's
+	// (strict fan acks, doc 04 section 3.2). Nil on a relaxed connection.
+	marks []WALMark
 }
 
 // parkOnFull registers a write that could not allocate on the shard's full-waiter
@@ -67,7 +73,11 @@ type fullWaiter struct {
 // together until retryFull re-runs the command and it either allocates or stalls
 // out. Owner goroutine only.
 func (w *worker) parkOnFull(b *hopBatch, i int) {
-	w.fullWaiters = append(w.fullWaiters, fullWaiter{b: b, i: i, resume: w.cx.resume, reason: w.cx.parkReason})
+	fw := fullWaiter{b: b, i: i, resume: w.cx.resume, reason: w.cx.parkReason}
+	if len(w.cx.marks) != 0 {
+		fw.marks = append([]WALMark(nil), w.cx.marks...)
+	}
+	w.fullWaiters = append(w.fullWaiters, fw)
 	b.deferN++
 	w.bpWaits++
 	w.bpReasonWaits[w.cx.parkReason]++
@@ -93,13 +103,18 @@ func (w *worker) retryFull() {
 	for _, fw := range w.fullWaiters {
 		w.cx.parkFull = false
 		w.cx.resume = fw.resume
+		// Seed the marks the earlier passes captured: noteMark coalesces the
+		// pairs this pass commits on top of them, so a completing pass hands
+		// the union to the hold, never just its own suffix.
+		w.cx.marks = append(w.cx.marks[:0], fw.marks...)
 		w.executeCmd(fw.b, fw.i)
 		if w.cx.parkFull {
 			// Still full: keep the waiter, its batch stays held. A multi-key write
-			// that committed more pairs before re-parking advanced Ctx.resume, so
-			// carry the new cursor forward and the next retry resumes past the pairs
-			// this pass just wrote.
+			// that committed more pairs before re-parking advanced Ctx.resume and
+			// grew the mark set, so carry both forward and the next retry resumes
+			// past the pairs this pass just wrote.
 			fw.resume = w.cx.resume
+			fw.marks = append(fw.marks[:0], w.cx.marks...)
 			kept = append(kept, fw)
 			continue
 		}
@@ -115,6 +130,7 @@ func (w *worker) retryFull() {
 	w.cx.parkFull = false
 	w.cx.retrying = false
 	w.cx.resume = 0
+	w.cx.marks = w.cx.marks[:0]
 	w.ep.exit()
 	if len(w.fullWaiters) == 0 {
 		w.bpStall = 0
@@ -172,8 +188,16 @@ func (w *worker) stallOut() {
 			// folds (fan.go mergeFan), not a framed reply: write the stall text as a
 			// FanOK error partial so the gather frames it once into the MSET's
 			// reply. A framed Err here would be double-framed by AppendErrorBytes.
+			// The waiter's marks still ride: the pairs behind them committed and
+			// framed, so even this error reply holds until they are covered.
 			r.FanErrString(msg)
+			if len(fw.marks) != 0 {
+				fw.b.setFanMarks(fw.i, fw.marks)
+			}
 		} else {
+			// A point write parks before it emits anything (a single pair either
+			// allocates or parks whole), so a stalled point waiter never carries
+			// marks and the error takes the slot at once.
 			r.Err(msg)
 		}
 		w.releaseHold(fw.b)

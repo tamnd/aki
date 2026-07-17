@@ -84,6 +84,16 @@ type hopBatch struct {
 	streams   []*stream
 	hasStream bool
 
+	// fanMarks carries a fan sub-command's emitted WAL marks to the gather
+	// (doc 04 section 3.2, the fan half): a sub-command's partial merges on
+	// the connection writer, so its reply cannot park at the owner the way a
+	// point command's does, and the marks ride the node instead. mergeFan
+	// folds them into the coordinator and the assembled reply parks there.
+	// Same lazy-slice-plus-flag shape as fans; only a strict connection's
+	// fan writes ever set an entry.
+	fanMarks   [][]WALMark
+	hasFanMark bool
+
 	// parked marks which commands called Reply.Park: a true entry means the handler
 	// wrote no reply and DrainReplies must skip the slot without advancing the
 	// reorder cursor, so the reply the command's CompleteBlocked loopback node
@@ -127,6 +137,12 @@ func (b *hopBatch) reset() {
 		}
 		b.hasStream = false
 	}
+	if b.hasFanMark {
+		for i := range b.fanMarks {
+			b.fanMarks[i] = nil
+		}
+		b.hasFanMark = false
+	}
 	if b.hasParked {
 		for i := range b.parked {
 			b.parked[i] = false
@@ -163,6 +179,25 @@ func (b *hopBatch) fan(i int) *fanCmd {
 		return nil
 	}
 	return b.fans[i]
+}
+
+// setFanMarks records the WAL marks command i's emissions accumulated, copied
+// so the caller may truncate its scratch immediately.
+func (b *hopBatch) setFanMarks(i int, ms []WALMark) {
+	if b.fanMarks == nil {
+		b.fanMarks = make([][]WALMark, batchCap)
+	}
+	b.fanMarks[i] = append([]WALMark(nil), ms...)
+	b.hasFanMark = true
+}
+
+// fanMark returns command i's riding marks, nil for every command on a
+// relaxed connection and for every read.
+func (b *hopBatch) fanMark(i int) []WALMark {
+	if !b.hasFanMark {
+		return nil
+	}
+	return b.fanMarks[i]
 }
 
 // setStream marks command i as answered by a streamed reply.

@@ -13,22 +13,11 @@ import "sync/atomic"
 // later commands are free to run and only their output waits.
 
 // strictHold parks command i's reply on its emitted marks' chain commit.
-// Called from executeCmd only when the command accumulated marks, which
-// implies a wired log and a strict connection at emission time.
+// Called from executeCmd only when the command accumulated marks and neither
+// parked on backpressure nor scattered as a fan sub-command (the worker
+// routes those two first), which implies a wired log, a strict connection at
+// emission time, and a written reply in the slot.
 func (w *worker) strictHold(b *hopBatch, i int) {
-	if w.cx.parkFull {
-		// The handler parked on backpressure and wrote no reply; the retry
-		// that completes the command re-runs the handler and lands back here
-		// with the retry's own marks.
-		return
-	}
-	if b.fan(i) != nil {
-		// A fan sub-command's partial merges on the connection writer, so
-		// holding the slot here would stall the gather forever. Strict fan
-		// acks land in the next slice; until then a fan write on a strict
-		// connection acks relaxed, disclosed in the slice notes.
-		return
-	}
 	if b.blocked(i) || b.stream(i) != nil {
 		// No held bytes to deliver: the handler parked itself or streamed.
 		// No registered write handler does either after emitting; this is a
@@ -60,4 +49,54 @@ func (w *worker) strictHold(b *hopBatch, i int) {
 			}
 		})
 	}
+}
+
+// holdFan parks a gathered fan reply on the coordinator's accumulated marks,
+// the fan half of the strict contract: the sub-commands' partials merged on
+// this writer goroutine, so the hold happens here, when the last partial has
+// landed and the reply is assembled. The sequence stays unemitted, stalling
+// the reorder cursor exactly as a point hold does, and the covering commits
+// deliver the bytes through the same CompleteBlocked loopback. An
+// already-covered mark fires inline on this goroutine; the loopback node it
+// pushes lands on the outbound queue the current drain pass is still
+// popping, so the reply still arrives in this pass. The coordinator is
+// dropped after this call and only the closures keep its reply alive.
+func (c *Conn) holdFan(seq uint32, fc *fanCmd) {
+	rep := fc.out
+	marks := fc.marks
+	log := c.rt.wlog
+	if len(marks) == 1 {
+		log.NotifyCommitted(marks[0].Group, marks[0].Seq, func() {
+			c.CompleteBlocked(seq, rep)
+		})
+		return
+	}
+	left := new(atomic.Int32)
+	left.Store(int32(len(marks)))
+	for _, m := range marks {
+		log.NotifyCommitted(m.Group, m.Seq, func() {
+			if left.Add(-1) == 0 {
+				c.CompleteBlocked(seq, rep)
+			}
+		})
+	}
+}
+
+// mergeMarks folds src into dst with noteMark's coalescing rule: one mark
+// per group, at the group's highest seq. Both sides are tiny (one entry per
+// touched WAL group), so the scan beats any map.
+func mergeMarks(dst, src []WALMark) []WALMark {
+outer:
+	for _, m := range src {
+		for j := range dst {
+			if dst[j].Group == m.Group {
+				if m.Seq > dst[j].Seq {
+					dst[j].Seq = m.Seq
+				}
+				continue outer
+			}
+		}
+		dst = append(dst, m)
+	}
+	return dst
 }

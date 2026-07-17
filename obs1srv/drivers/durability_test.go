@@ -381,6 +381,94 @@ func TestDurabilityStrictHoldsPipeline(t *testing.T) {
 	expectBulk(t, r, []byte("v"))
 }
 
+// TestDurabilityStrictFanCoversCommit proves the fan half's positive
+// contract with no gating: a multi-key write's single reply arrives only
+// once every touched group's committed watermark covers its frames. Same
+// one-hour flush age as the point test, so the replies arriving at all
+// prove the held gather demanded the barrier flush.
+func TestDurabilityStrictFanCoversCommit(t *testing.T) {
+	wl, _, nc, r, _ := startLoggedServer(t, false)
+
+	send(t, nc, "AKI.DURABILITY", "strict")
+	expect(t, r, "+OK\r\n")
+
+	seqs := map[uint16]uint64{}
+	emit := func(key string) {
+		_, g := clusterMapKey([]byte(key))
+		seqs[g]++
+	}
+	send(t, nc, "MSET", "a", "1", "b", "2")
+	expect(t, r, "+OK\r\n")
+	emit("a")
+	emit("b")
+	for g, want := range seqs {
+		if got := wl.Marks().Committed(g); got < want {
+			t.Fatalf("Committed group %d = %d at strict MSET ack time, want at least %d", g, got, want)
+		}
+	}
+	// The fan keydel frames ride the same contract.
+	send(t, nc, "DEL", "a", "b")
+	expect(t, r, ":2\r\n")
+	emit("a")
+	emit("b")
+	for g, want := range seqs {
+		if got := wl.Marks().Committed(g); got < want {
+			t.Fatalf("Committed group %d = %d after the strict DEL ack, want at least %d", g, got, want)
+		}
+	}
+	// A fan write with no effect emits nothing and has nothing to wait for.
+	send(t, nc, "DEL", "nosuch", "nosuch2")
+	expect(t, r, ":0\r\n")
+}
+
+// TestDurabilityStrictFanHoldsPipeline gates the chain and proves the fan
+// half's negative contract over the socket: the MSET executes on every
+// shard (a second connection reads both values) but the gathered reply and
+// everything pipelined behind it stay unanswered until the commit lands,
+// then arrive in order.
+func TestDurabilityStrictFanHoldsPipeline(t *testing.T) {
+	wl, _, nc, r, release := startLoggedServer(t, true)
+
+	send(t, nc, "AKI.DURABILITY", "strict")
+	expect(t, r, "+OK\r\n")
+	send(t, nc, "MSET", "a", "1", "b", "2")
+	send(t, nc, "GET", "a")
+
+	nc2, err := net.Dial("tcp", nc.RemoteAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc2.Close()
+	r2 := br(nc2)
+	deadline := time.Now().Add(10 * time.Second)
+	for readInfo(t, nc2, r2)["wal_barrier_flushes"] == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no barrier flush while a strict fan ack was pending")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	send(t, nc2, "GET", "a")
+	expectBulk(t, r2, []byte("1"))
+	send(t, nc2, "GET", "b")
+	expectBulk(t, r2, []byte("2"))
+	if _, g := clusterMapKey([]byte("a")); wl.Marks().Committed(g) != 0 {
+		t.Fatal("the gated chain committed")
+	}
+	if err := nc.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Peek(1); err == nil {
+		t.Fatal("a strict fan reply arrived with the chain gated")
+	}
+	if err := nc.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+
+	release()
+	expect(t, r, "+OK\r\n")
+	expectBulk(t, r, []byte("1"))
+}
+
 // TestDurabilityVolatileNode proves the toggle's guard rails on a server
 // with no pipeline: strict is refused (a strict write would hang, not be
 // stricter), relaxed is accepted, and the argument grammar answers in
