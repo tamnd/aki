@@ -125,6 +125,48 @@ func (s *Store) ReplayFromCheckpoint(payload []byte, now int64) error {
 	return nil
 }
 
+// RecoverIndex rebuilds this shard's whole index at open from a file recovery, the
+// store half of the open sequence akifile.Recover leaves to the caller. Recover
+// picks the live root, rebuilds the file-structural roots, and hands back the SRT
+// and the tail offset; this turns that into the shard's live keyspace. When the
+// root names an index checkpoint for this shard it takes the bounded path, loading
+// the dump with ReplayFromCheckpoint and replaying only the tail past it with
+// ReplayTail, so a restart never rescans the records the checkpoint already folded.
+// When no root, or no checkpoint for this shard, covers the keyspace it falls back
+// to the full log walk, the honest recovery of a shard that never checkpointed or a
+// file with no committed root at all.
+//
+// rec.TailFrom is the file-global minimum first-tail offset across every shard that
+// checkpointed, so a shard whose own checkpoint sat later than the minimum replays a
+// few pre-checkpoint records twice: harmless, because append order makes the last
+// write win and the dump already holds that same last write. now stamps the
+// reapplied writes' lazy-expiry checks. On a store with no record log it is a no-op.
+func (s *Store) RecoverIndex(rec *akifile.Recovery, now int64) error {
+	if s.akirlog == nil {
+		return nil
+	}
+	// No trusted root, or no row for this shard: the whole keyspace comes from the
+	// log, so walk it from the start of the append space.
+	if rec == nil || rec.SRT == nil || int(s.akirlog.shard) >= len(rec.SRT.Rows) {
+		return s.ReplayRecords(now)
+	}
+	row := rec.SRT.Rows[s.akirlog.shard]
+	// A zero IndexCkptOff is a shard that never cut a checkpoint: its records are all
+	// in the tail the global TailFrom may start past, so a bounded replay would miss
+	// them. Walk the full log instead.
+	if row.IndexCkptOff == 0 {
+		return s.ReplayRecords(now)
+	}
+	payload, err := s.akirlog.readCheckpoint(row.IndexCkptOff)
+	if err != nil {
+		return err
+	}
+	if err := s.ReplayFromCheckpoint(payload, now); err != nil {
+		return err
+	}
+	return s.ReplayTail(rec.TailFrom, now)
+}
+
 // applyValueRow reinserts one value record during recovery, shared by the log walk
 // and the checkpoint load. An inline row's value bytes ride the frame, so it
 // reinserts them directly; a separated row's bytes live in the durable value log,
