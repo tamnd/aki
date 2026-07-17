@@ -2,6 +2,7 @@ package shard
 
 import (
 	"encoding/binary"
+	"math/rand/v2"
 
 	"github.com/tamnd/aki/f3srv/resp"
 )
@@ -50,6 +51,13 @@ const (
 	// appends every shard's keys into one array in arrival order, which KEYS
 	// leaves unordered like Redis.
 	FanKeys
+
+	// FanRandom picks one key uniformly across every shard: RANDOMKEY. Each
+	// partial is an 8-byte little-endian key count then that shard's own
+	// uniformly-drawn candidate, and the gather reservoir-selects across the
+	// shards weighted by count, so every key in the whole keyspace is equally
+	// likely. An all-empty keyspace draws a null bulk.
+	FanRandom
 )
 
 // maxFanKeys caps the keys one sub-command carries, so a sub-command's
@@ -70,6 +78,7 @@ type fanCmd struct {
 	present []bool
 	stats   []uint64
 	errMsg  []byte
+	chosen  []byte // FanRandom's running reservoir winner
 	out     []byte
 
 	// txn is the FanTxn coordinator's transaction: the arm builtin reads it
@@ -286,6 +295,19 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 			fc.vals = append(fc.vals, append([]byte(nil), part[:n]...))
 			part = part[n:]
 		}
+	case FanRandom:
+		if len(part) >= 8 {
+			count := int64(binary.LittleEndian.Uint64(part))
+			if count > 0 {
+				fc.sum += count
+				// Weighted reservoir: the shard's candidate replaces the running
+				// winner with probability count/sum, so after every partial the
+				// held key is uniform over all keys seen so far.
+				if rand.Int64N(fc.sum) < count {
+					fc.chosen = append(fc.chosen[:0], part[8:]...)
+				}
+			}
+		}
 	}
 	fc.pending--
 	if fc.pending > 0 {
@@ -321,6 +343,14 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 		fc.out = resp.AppendArrayHeader(fc.out, len(fc.vals))
 		for _, v := range fc.vals {
 			fc.out = resp.AppendBulk(fc.out, v)
+		}
+	case FanRandom:
+		// sum stays zero only when every shard was empty; then RANDOMKEY is
+		// the null bulk. Otherwise the reservoir winner is set.
+		if fc.sum == 0 {
+			fc.out = resp.AppendNull(fc.out)
+		} else {
+			fc.out = resp.AppendBulk(fc.out, fc.chosen)
 		}
 	}
 	return c.deliver(seq, fc.out, emit)
