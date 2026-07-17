@@ -222,6 +222,24 @@ func zrunPos(img []byte, count uint32, s uint64, member []byte) (pos int, found 
 	return pos, found, off, nil
 }
 
+// zrunIdx answers the live-entry index of (s, member) inside a run
+// image, the in-run half of a rank: zrunPos in entries instead of
+// bytes.
+func zrunIdx(img []byte, count uint32, s uint64, member []byte) (int, bool, error) {
+	off := zRunHdrLen
+	for i := uint32(0); i < count; i++ {
+		es, em, next, err := zRunEntAt(img, off)
+		if err != nil {
+			return 0, false, err
+		}
+		if es == s && bytes.Equal(em, member) {
+			return int(i), true, nil
+		}
+		off = next
+	}
+	return 0, false, nil
+}
+
 // zscoreState reads key, requires the segmented rung, and decodes the
 // score fence into z.zfence. The inline rung keeps its pairs in the
 // root and has no runs; slice 4's upgrade builds both families, so an

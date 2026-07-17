@@ -59,17 +59,9 @@ func (z *ZSet) memSet(ctx context.Context, key, member []byte, score float64) (b
 	return z.h.hset(ctx, key, member, z.sbuf[:], 0)
 }
 
-// memScore answers member's score, the ZSCORE read path: root plus at
-// most one segment hot, the doc 09 two-record cold bound.
+// memScore is ZScore under its historical score-side-test name.
 func (z *ZSet) memScore(ctx context.Context, key, member []byte) (float64, bool, error) {
-	v, _, ok, err := z.h.getEntry(ctx, key, member)
-	if err != nil || !ok {
-		return 0, false, err
-	}
-	if len(v) != zmemScoreLen {
-		return 0, false, fmt.Errorf("sqlo1: zset member score of %d bytes, want %d", len(v), zmemScoreLen)
-	}
-	return zScoreFromSortable(binary.BigEndian.Uint64(v)), true, nil
+	return z.ZScore(ctx, key, member)
 }
 
 // memDel removes member from the member side, reporting whether it

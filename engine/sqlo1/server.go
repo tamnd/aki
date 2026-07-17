@@ -921,6 +921,52 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			}
 		}
 		return AppendInt(reply, n)
+	case "ZSCORE":
+		if len(args) != 3 {
+			return arityErr(reply, cmd)
+		}
+		v, ok, err := s.z.ZScore(ctx, args[1], args[2])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if !ok {
+			return AppendNullBulk(reply)
+		}
+		var sb [32]byte
+		return AppendBulk(reply, appendScore(sb[:0], v))
+	case "ZMSCORE":
+		if len(args) < 3 {
+			return arityErr(reply, cmd)
+		}
+		mark := len(reply)
+		reply = AppendArray(reply, len(args)-2)
+		err := s.z.ZMScore(ctx, args[1], args[2:], func(score float64, ok bool) {
+			if ok {
+				var sb [32]byte
+				reply = AppendBulk(reply, appendScore(sb[:0], score))
+			} else {
+				reply = AppendNullBulk(reply)
+			}
+		})
+		if err != nil {
+			// A partial array is already in the buffer; truncate back
+			// to the mark so the error is the whole reply.
+			return storeErr(reply[:mark], err)
+		}
+		return reply
+	case "ZCARD":
+		if len(args) != 2 {
+			return arityErr(reply, cmd)
+		}
+		n, err := s.z.ZCard(ctx, args[1])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, n)
+	case "ZRANK":
+		return s.zrankCmd(ctx, reply, args, cmd, s.z.ZRank)
+	case "ZREVRANK":
+		return s.zrankCmd(ctx, reply, args, cmd, s.z.ZRevRank)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":
@@ -1085,6 +1131,37 @@ func appendScore(dst []byte, f float64) []byte {
 		return strconv.AppendInt(dst, int64(f), 10)
 	}
 	return strconv.AppendFloat(dst, f, 'g', -1, 64)
+}
+
+// zrankCmd is ZRANK and ZREVRANK behind their shared walk: an
+// integer rank, or [rank, score] under WITHSCORE, with the nil shape
+// following the reply shape (null bulk plain, null array WITHSCORE),
+// Redis's zrankGenericCommand surface.
+func (s *Server) zrankCmd(ctx context.Context, reply []byte, args [][]byte, cmd string, rank func(context.Context, []byte, []byte) (int64, float64, bool, error)) []byte {
+	if len(args) < 3 {
+		return arityErr(reply, cmd)
+	}
+	withScore := len(args) == 4 && strings.EqualFold(string(args[3]), "WITHSCORE")
+	if len(args) > 3 && !withScore {
+		return AppendError(reply, "ERR syntax error")
+	}
+	r, score, ok, err := rank(ctx, args[1], args[2])
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	if !ok {
+		if withScore {
+			return AppendNullArray(reply)
+		}
+		return AppendNullBulk(reply)
+	}
+	if !withScore {
+		return AppendInt(reply, r)
+	}
+	reply = AppendArray(reply, 2)
+	reply = AppendInt(reply, r)
+	var sb [32]byte
+	return AppendBulk(reply, appendScore(sb[:0], score))
 }
 
 // zaddCmd is ZADD with the full option surface: NX, XX, GT, LT, CH,
