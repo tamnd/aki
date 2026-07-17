@@ -81,6 +81,25 @@ func (s *Store) coldKeyMatches(off uint64, key []byte) bool {
 	return string(buf[coldHdr:n]) == string(key)
 }
 
+// coldKeyAt reads a cold frame's key bytes into the shared compare scratch and
+// returns them, the read-only key peek RangeKeys uses for a cold entry. It reads
+// the header for the key length, then the key with one pooled pread. The
+// returned slice aliases the scratch and is valid only until the next cold read.
+// A read error reads as absent, the safe answer for a frame the store cannot
+// reach.
+func (s *Store) coldKeyAt(off uint64) ([]byte, bool) {
+	_, klen, _, _, err := s.coldHeader(off)
+	if err != nil {
+		return nil, false
+	}
+	buf, err := s.cold.readInto(off+coldHdr, klen, s.coldBuf)
+	s.coldBuf = buf[:cap(buf)][:0]
+	if err != nil {
+		return nil, false
+	}
+	return buf, true
+}
+
 // coldVlen reports a cold record's logical value length, the STRLEN answer for
 // a cold key. One header pread, no value bytes.
 func (s *Store) coldVlen(off uint64) uint32 {
