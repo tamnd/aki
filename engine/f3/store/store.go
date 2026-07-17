@@ -258,6 +258,16 @@ func Open(o Options) (*Store, error) {
 		s.akivlog = newAkiVlog(o.AkiValueLog, o.Shard)
 		s.akispill = newAkiSpill(s.akivlog)
 		s.akicold = newAkiCold(o.AkiValueLog, o.Shard)
+		// The .aki value region is a spill target like the scratch log, so a
+		// resident cap gates admission to it the same way: past the cap a
+		// separated or chunked value's bytes go to the shared region instead of
+		// the arena. Without this the aki store would never spill. The doorkeeper
+		// seeds match the scratch-log path so the promotion sampler on a spilled
+		// read has a nonzero denominator, the same LTM store either way.
+		s.residentCap = o.ResidentCapBytes
+		s.ltmOn = s.residentCap > 0
+		s.dkDen = residDoorkeeperDen
+		s.dkRng = 0x9e3779b97f4a7c15
 	}
 	return s, nil
 }

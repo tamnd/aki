@@ -11,14 +11,22 @@ package store
 // the read must route there, and this is the single place that decision lands.
 
 // logReadInto reads n bytes of a spilled value at off, reusing dst's capacity
-// when it fits, for a caller that wants the bytes back as a slice.
+// when it fits, for a caller that wants the bytes back as a slice. When the store
+// opened over an .aki value region the offset addresses that region, so the read
+// routes to the adapter; otherwise it is a scratch-log offset.
 func (s *Store) logReadInto(off uint64, n int, dst []byte) ([]byte, error) {
+	if s.akivlog != nil {
+		return s.akivlog.readInto(off, n, dst)
+	}
 	return s.vlog.readInto(off, n, dst)
 }
 
 // logReadFill reads exactly len(b) bytes of a spilled value at off into b, the
 // partial sub-range read the bitmap and chunked bands take at value_off+i.
 func (s *Store) logReadFill(off uint64, b []byte) error {
+	if s.akivlog != nil {
+		return s.akivlog.readFill(off, b)
+	}
 	return s.vlog.readFill(off, b)
 }
 
@@ -28,4 +36,10 @@ func (s *Store) logReadFill(off uint64, b []byte) error {
 // funnels through here for the same reason the reads do, so the value-log
 // re-home points the dead-byte accounting at akiVlog.unlink in one place rather
 // than at each drop site. The tail side of the accounting stays in LogBytes.
-func (s *Store) logUnlink(n uint64) { s.vlog.dead += n }
+func (s *Store) logUnlink(n uint64) {
+	if s.akivlog != nil {
+		s.akivlog.unlink(n)
+		return
+	}
+	s.vlog.dead += n
+}
