@@ -40,8 +40,28 @@ Dollars go through sim.S3StandardPrices.Bill so the O5 E-cloud refit moves this 
 
 ## Results
 
-Pending the scored run.
+Full sweep in zstdworth.csv, run 2026-07-17, zstd CLI 1.5.7, 32 MiB corpora, two-second reps per level.
+Segment blocks at 128 KiB, zstd level 1:
+
+| corpus | ratio | stored frac | comp MB/s | decomp MB/s | $/raw GB-month | decode us/block |
+|--------|-------|-------------|-----------|-------------|----------------|-----------------|
+| jsonsess | 6.31 | 0.158 | 1509 | 2995 | 0.0036 | 44 |
+| text2k | 2.80 | 0.357 | 378 | 1203 | 0.0082 | 109 |
+| numser | 2.27 | 0.442 | 1450 | 2459 | 0.0102 | 53 |
+| randbin | 1.00 | 1.0001 | 11735 | 45727 | 0.0230 | 3 |
+| mixed | 2.54 | 0.393 | 907 | 1973 | 0.0090 | 66 |
+
+Levels beyond 1 never earn their CPU: on jsonsess and numser they lose ratio outright (level 3 stores 11% and 7% more than level 1), on text2k level 9's best case buys 10% more ratio at 8.5x the compress CPU, and on mixed level 9 buys 3% at 9.7x.
+WAL sections on the mixed corpus at zstd-1: ratio 1.92 at 4 KiB, 2.08 at 64 KiB, 2.09 at 1 MiB, so the window saturates at 64 KiB and even the 1 MiB section reaches only 82% of the segment ratio; on jsonsess the gap is wider, 3.69 at 1 MiB against 6.31 for segments, 58%, because the per-frame random key and CRC break the cross-record matches the segment ratio lives on.
+randbin expands at every level and unit, storing at 1.0001x for segments, which is the row the doc 03 comp-0 fallback exists for.
 
 ## Verdict
 
-Pending the scored run.
+PRED-OBS1-O1C-ZSTD scores MIXED on bands, HIT on every gate-level claim, and the gate answer is unambiguous.
+Band misses, all disclosed: mixed's segment ratio landed under the 2.7 to 3.7x band at 2.54x, since interleaving families costs about 20% against the ideal harmonic blend; text2k compresses at 378 MB/s against the predicted 900 and up, and its decode tax at 109 us grazes past the 65 us claim while staying under 1% of a cold GET; the level-ordering spread ran wider than the predicted 3% in both directions; and the 1 MiB WAL cells landed far outside the within-15%-of-segment claim at 58% on jsonsess, a miss whose direction strengthens the WAL verdict.
+Gate outcome, segment blocks: default comp 1, zstd level 1.
+It stores the mixed corpus at 39% of raw, cutting the storage line from $0.023 to $0.0090 per raw GB-month with CG2's 1.35x garbage multiplier scaling down with it, costs 0.7 to 2.8 vCPU-s per folded GiB, under 0.3% of one core at doc 09 example A ingest, and adds 44 to 109 us of decode to a cold read, under 1% of the GET it rides on.
+Levels 3 and 9 are declined as defaults: nowhere in the sweep do they buy more than 10% ratio and on two of five corpora they lose ratio, while costing 1.5 to 26x the CPU.
+Gate outcome, WAL sections: default comp 0.
+The storage saving is transient because WAL objects die at the fold, S3 Standard prices PUTs per request so upload bytes are a bandwidth story rather than a dollar one, tight cadences produce small sections that hold only half the mixed ratio anyway, and even large sections cap at 58 to 82% of the segment ratio because frame keys and CRCs sit in the match window.
+The comp field keeps its byte for the O4 revisit, which should only flip it if measured cadence batches sections past 64 KiB and upload bandwidth is the binding constraint.
