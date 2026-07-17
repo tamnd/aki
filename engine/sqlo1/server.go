@@ -166,6 +166,18 @@ func (s *Server) Serve(l net.Listener) error {
 	}
 }
 
+// Flush drains the hot tier to the store until nothing is dirty. The
+// durable seam sits at the store: an acked write lives only in the hot
+// tier until a drain carries it down, so an embedder that closes the
+// store without this call keeps only the last drained prefix, exactly
+// the crash contract. Clean shutdown is listener close, Serve return,
+// Flush, then store close.
+func (s *Server) Flush(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.t.Flush(ctx)
+}
+
 func (s *Server) handleConn(c net.Conn) {
 	defer c.Close()
 	buf := make([]byte, 0, 16<<10)
