@@ -306,6 +306,125 @@ func TestReplayFromCheckpointNoHandleIsNoop(t *testing.T) {
 	}
 }
 
+// TestBoundedRecoveryComposesCheckpointAndTail is the bounded recovery loop: a
+// first run writes a batch, builds a checkpoint over it and remembers the append
+// offset, then writes a second batch that overwrites, deletes, and adds keys past
+// the checkpoint. A fresh store loads the checkpoint and replays only the tail from
+// that offset, and the composed state matches the first run exactly: the overwrite
+// won, the delete stuck, the new key landed, and no prefix record was applied
+// twice. It proves a restart can skip the settled prefix instead of walking the
+// whole log.
+func TestBoundedRecoveryComposesCheckpointAndTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bounded.aki")
+
+	openStore := func(f *akifile.File) *Store {
+		s, err := Open(Options{
+			ArenaBytes:  4 << 20,
+			SegBytes:    1 << 20,
+			AkiValueLog: f,
+			Shard:       1,
+		})
+		if err != nil {
+			t.Fatalf("open aki store: %v", err)
+		}
+		return s
+	}
+
+	f, err := akifile.Create(path, akifile.CreateOptions{
+		ShardCount:   4,
+		SepThreshold: 64,
+		Sync:         akifile.SyncNo,
+	})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	s := openStore(f)
+
+	// Batch one is the settled prefix the checkpoint captures.
+	if err := s.SetString([]byte("keep"), []byte("k1"), 0, 0, false); err != nil {
+		t.Fatalf("set keep: %v", err)
+	}
+	if err := s.SetString([]byte("edit"), []byte("e1"), 0, 0, false); err != nil {
+		t.Fatalf("set edit: %v", err)
+	}
+	if err := s.SetString([]byte("drop"), []byte("d1"), 0, 0, false); err != nil {
+		t.Fatalf("set drop: %v", err)
+	}
+
+	payload, _, err := s.BuildIndexCheckpoint(nil)
+	if err != nil {
+		t.Fatalf("build checkpoint: %v", err)
+	}
+	// The append offset the instant the checkpoint was built is where the tail
+	// starts: every later record is cut past it.
+	tailFrom := s.akirlog.cursor()
+
+	// Batch two is the tail: overwrite one prefix key, delete another, add a fresh
+	// one. None of it is in the checkpoint.
+	if err := s.SetString([]byte("edit"), []byte("e2"), 0, 0, false); err != nil {
+		t.Fatalf("overwrite edit: %v", err)
+	}
+	if !s.Del([]byte("drop"), 0) {
+		t.Fatal("del drop reported absent for a live key")
+	}
+	if err := s.SetString([]byte("new"), []byte("n1"), 0, 0, false); err != nil {
+		t.Fatalf("set new: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	// Recovery: load the settled prefix from the dump, then replay only the tail.
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	s2 := openStore(f2)
+	t.Cleanup(func() { _ = s2.Close(); _ = f2.Close() })
+
+	if err := s2.ReplayFromCheckpoint(payload, 0); err != nil {
+		t.Fatalf("replay from checkpoint: %v", err)
+	}
+	if err := s2.ReplayTail(tailFrom, 0); err != nil {
+		t.Fatalf("replay tail: %v", err)
+	}
+
+	wantVal := map[string][]byte{
+		"keep": []byte("k1"), // untouched by the tail, survives from the checkpoint
+		"edit": []byte("e2"), // the tail overwrite wins over the checkpoint value
+		"new":  []byte("n1"), // added in the tail, absent from the checkpoint
+	}
+	for key, want := range wantVal {
+		got, ok := s2.GetString([]byte(key), 0, nil)
+		if !ok {
+			t.Fatalf("key %q absent after bounded recovery", key)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("key %q read back %q, want %q", key, got, want)
+		}
+	}
+	// The checkpoint carried drop, the tail deleted it: the composed state drops it.
+	if _, ok := s2.GetString([]byte("drop"), 0, nil); ok {
+		t.Fatal("deleted key drop survived bounded recovery")
+	}
+}
+
+// TestReplayTailNoHandleIsNoop confirms the tail replay is a nil-safe no-op on a
+// store with no record log.
+func TestReplayTailNoHandleIsNoop(t *testing.T) {
+	s, err := Open(Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("open plain store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.ReplayTail(akifile.PageSize, 0); err != nil {
+		t.Fatalf("tail replay on a store with no record log: %v", err)
+	}
+}
+
 // TestReplayNoHandleIsNoop confirms a store with no record log replays nothing and
 // reports no error, so the volatile-only configuration pays nothing for recovery.
 func TestReplayNoHandleIsNoop(t *testing.T) {

@@ -98,8 +98,22 @@ func (l *akiRlog) globalSeq() uint64 { return l.f.GlobalSeq() }
 // every other shard's segments, so a per-shard recovery reapplies only its own
 // records. The row's Key aliases the segment payload for the visit's duration.
 func (l *akiRlog) walkShard(visit func(addr uint64, row akifile.RecordRow) error) error {
-	return l.f.WalkShardRecords(l.shard, akifile.PageSize, visit)
+	return l.walkShardFrom(akifile.PageSize, visit)
 }
+
+// walkShardFrom is walkShard bounded to the records this shard cut at or past from,
+// the tail a checkpoint-driven recovery replays after loading the settled prefix
+// from the dump. from is a byte offset into the append space, the position a
+// checkpoint records as its first tail segment so recovery resumes exactly where
+// the dump stopped being authoritative.
+func (l *akiRlog) walkShardFrom(from uint64, visit func(addr uint64, row akifile.RecordRow) error) error {
+	return l.f.WalkShardRecords(l.shard, from, visit)
+}
+
+// cursor reports the file's append offset, the position past which every later
+// record is cut. Captured the instant a checkpoint is built, it is the tail start
+// a checkpoint-driven recovery resumes the log walk from.
+func (l *akiRlog) cursor() uint64 { return l.f.Cursor() }
 
 // readAt decodes a published record from its absolute frame address, the deref the
 // index entry and a checkpoint's record_addr take, verifying the frame's own

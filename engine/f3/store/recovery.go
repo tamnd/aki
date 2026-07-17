@@ -44,11 +44,35 @@ func (s *Store) ReplayRecords(now int64) error {
 	if s.akirlog == nil {
 		return nil
 	}
+	return s.replayFrom(akifile.PageSize, now)
+}
+
+// ReplayTail rebuilds the tail of this store's index by walking only the records
+// this shard cut at or past fromOff, the records a checkpoint's dump did not cover.
+// It is the second half of a bounded recovery: ReplayFromCheckpoint loads the
+// settled prefix from a dump, then this replays the log past the point the dump was
+// consistent up to, so a restart never rescans the records the checkpoint already
+// folded. fromOff is the append offset captured when the checkpoint was built. On a
+// store with no record log it is a no-op.
+func (s *Store) ReplayTail(fromOff uint64, now int64) error {
+	if s.akirlog == nil {
+		return nil
+	}
+	return s.replayFrom(fromOff, now)
+}
+
+// replayFrom walks this shard's record log from fromOff and reapplies each framed
+// record in append order, a tombstone as a clear and a value row through
+// applyValueRow. It holds the replaying guard for the walk so a reapplied write
+// does not re-log the row it is reading back. It is the shared body of the full-log
+// ReplayRecords and the tail-only ReplayTail, which differ only in where the walk
+// starts.
+func (s *Store) replayFrom(fromOff uint64, now int64) error {
 	s.replaying = true
 	defer func() { s.replaying = false }()
 
 	var vbuf []byte
-	return s.akirlog.walkShard(func(addr uint64, row akifile.RecordRow) error {
+	return s.akirlog.walkShardFrom(fromOff, func(addr uint64, row akifile.RecordRow) error {
 		if row.Flags&akifile.RecFlagTombstone != 0 {
 			s.Del(row.Key, now)
 			return nil
