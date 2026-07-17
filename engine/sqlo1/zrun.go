@@ -46,8 +46,8 @@ import (
 // batch with the root, atomic at the store seam.
 
 const (
-	// zRunKind is the subkey kind of score-run records; doc 09 gives
-	// kind 4 to score fence pages, a later slice.
+	// zRunKind is the subkey kind of score-run records; kind 4 is the
+	// score fence pages, zfencepage.go.
 	zRunKind = 2
 
 	// Run split threshold and lazy-merge floor in encoded bytes, the
@@ -67,22 +67,16 @@ const (
 	zRunEntHdrLen = 10
 
 	// The root tail: u8 zflags, u8 zero, u16 run count, then the
-	// fence entries. 20 bytes per run holds roughly a hundred runs
-	// before the tail needs its own paging ladder, doc 09's ~100.
-	zTailHdrLen   = 4
-	zFenceEntLen  = 20
-	zFenceMaxRuns = 100
+	// fence entries flat, or with zflagFencePaged set the kind 4 page
+	// index (zfencepage.go); the split past zFenceMaxRuns runs is the
+	// paging transition.
+	zTailHdrLen  = 4
+	zFenceEntLen = 20
 
-	// zflagFencePaged flips when the score fence moves to kind 4
-	// pages; reserved until that slice lands.
+	// zflagFencePaged marks a root tail holding the paged index
+	// instead of the fence itself.
 	zflagFencePaged = 1 << 0
 )
-
-// errZFenceFull is the standing edge of the flat score fence: past
-// zFenceMaxRuns the fence needs its paging slice, and until that
-// lands the insert that would split fails loudly and leaves the zset
-// untouched.
-var errZFenceFull = errors.New("sqlo1: zset score fence is full, fence paging is a later slice")
 
 // zFenceEnt is one decoded score-fence entry: the sortable-score
 // separator (0 on the sentinel first run), the run's segid, reserved
@@ -133,7 +127,7 @@ func decodeZTail(p []byte, dst []zFenceEnt) ([]zFenceEnt, error) {
 		return nil, fmt.Errorf("sqlo1: zset score section of %d bytes, header needs %d", len(p), zTailHdrLen)
 	}
 	if p[0]&zflagFencePaged != 0 {
-		return nil, errors.New("sqlo1: zset score fence claims paged mode, which no slice writes yet")
+		return nil, errors.New("sqlo1: paged zset score section reached the flat decoder")
 	}
 	if p[0]&^byte(zflagFencePaged) != 0 || p[1] != 0 {
 		return nil, fmt.Errorf("sqlo1: zset score section flags %#x unknown", p[0])
@@ -241,9 +235,9 @@ func zrunIdx(img []byte, count uint32, s uint64, member []byte) (int, bool, erro
 }
 
 // zscoreState reads key, requires the segmented rung, and decodes the
-// score fence into z.zfence. The inline rung keeps its pairs in the
-// root and has no runs; slice 4's upgrade builds both families, so an
-// inline root here is a caller error.
+// score section (flat fence or paged index). The inline rung keeps
+// its pairs in the root and has no runs; slice 4's upgrade builds
+// both families, so an inline root here is a caller error.
 func (z *ZSet) zscoreState(ctx context.Context, key []byte) (int64, error) {
 	st, _, expMs, err := z.h.stateOf(ctx, key)
 	if err != nil {
@@ -252,8 +246,7 @@ func (z *ZSet) zscoreState(ctx context.Context, key []byte) (int64, error) {
 	if st != hashSegState {
 		return 0, fmt.Errorf("sqlo1: zset score runs need a segmented root, key is %v", st)
 	}
-	z.zfence, err = decodeZTail(z.h.segRoot.tail, z.zfence)
-	return expMs, err
+	return expMs, z.zloadTail()
 }
 
 // readRun reads the run record at segid. The image aliases the read
@@ -276,13 +269,23 @@ func (z *ZSet) writeRun(ctx context.Context, segid uint64, img []byte) error {
 	return z.h.t.SetGen(ctx, z.zkbuf[:], img, z.h.tag, z.h.segRoot.rootgen)
 }
 
-// writeZRoot re-encodes the score fence into the root tail and lands
-// the root. Score fence edits are never W2 delta-safe: replay
+// zencodeTail re-encodes the score section into the root tail: the
+// flat fence, or the paged root index.
+func (z *ZSet) zencodeTail() {
+	if z.zpaged {
+		z.ztail = appendZTailPaged(z.ztail[:0], z.zridx)
+	} else {
+		z.ztail = appendZTail(z.ztail[:0], z.zfence)
+	}
+	z.h.segRoot.tail = z.ztail
+}
+
+// writeZRoot re-encodes the score section into the root tail and
+// lands the root. Score fence edits are never W2 delta-safe: replay
 // reconciliation cannot rebuild exact run counts from skipped frames,
 // so the root frame is always its own.
 func (z *ZSet) writeZRoot(ctx context.Context, key []byte) error {
-	z.ztail = appendZTail(z.ztail[:0], z.zfence)
-	z.h.segRoot.tail = z.ztail
+	z.zencodeTail()
 	return z.h.writeSegRoot(ctx, key, false)
 }
 
@@ -300,11 +303,41 @@ func (z *ZSet) runFirst(ctx context.Context, e zFenceEnt) (uint64, []byte, error
 	return s, m, err
 }
 
-// zrunRoute answers the fence index of the run covering (s, member).
-// Distinct scores resolve on the fence alone; a chain of runs sharing
-// the separator binary-searches their first entries, log2(chain)
-// point reads.
+// zrunRoute answers the loaded-fence index of the run covering (s,
+// member), loading its pages in paged mode. Distinct scores resolve
+// on the fence (or index) alone; a chain of runs sharing the
+// separator binary-searches their first entries, log2(chain) point
+// reads. The chain may span pages, so the paged search runs over
+// global run positions.
 func (z *ZSet) zrunRoute(ctx context.Context, s uint64, member []byte) (int, error) {
+	if z.zpaged {
+		j, err := z.zlastLE(ctx, s)
+		if err != nil {
+			return 0, err
+		}
+		k, err := z.zfirstGE(ctx, s)
+		if err != nil {
+			return 0, err
+		}
+		ans, lo, hi := k-1, k, j
+		for lo <= hi {
+			mid := (lo + hi) / 2
+			e, err := z.zentGlobal(ctx, mid)
+			if err != nil {
+				return 0, err
+			}
+			fs, fm, err := z.runFirst(ctx, e)
+			if err != nil {
+				return 0, err
+			}
+			if fs < s || (fs == s && bytes.Compare(fm, member) <= 0) {
+				ans, lo = mid, mid+1
+			} else {
+				hi = mid - 1
+			}
+		}
+		return z.zseek(ctx, ans)
+	}
 	f := z.zfence
 	j := sort.Search(len(f), func(i int) bool { return f[i].lo > s }) - 1
 	k := sort.Search(len(f), func(i int) bool { return f[i].lo >= s })
@@ -351,7 +384,7 @@ func (z *ZSet) zrunAddSeg(ctx context.Context, key []byte, s uint64, member []by
 	h := z.h
 	r := &h.segRoot
 
-	if len(z.zfence) == 0 {
+	if !z.zpaged && len(z.zfence) == 0 {
 		if r.nextSegid > hashFenceSegidMax {
 			return false, fmt.Errorf("sqlo1: zset segid space of rooth %#x is spent", r.rooth)
 		}
@@ -404,31 +437,52 @@ func (z *ZSet) zrunAddSeg(ctx context.Context, key []byte, s uint64, member []by
 	}
 
 	if len(z.zrbuf) > zRunMax && n >= 2 {
+		z.zbumpLoaded(1)
 		return true, z.zrunSplit(ctx, key, ri, n)
 	}
 	if err := z.writeRun(ctx, e.segid, z.zrbuf); err != nil {
 		return false, err
 	}
 	e.count++
-	return true, z.writeZRoot(ctx, key)
+	z.zbumpLoaded(1)
+	return true, z.zfenceCommit(ctx, key)
 }
 
 // zrunSplit cuts the oversize post-insert image in z.zrbuf at its
-// median entry, splitSeg's write order: the new high run lands and
-// flushes before the root that routes to it, the trimmed low image
-// rides the root's batch as dead bytes until it lands.
+// median entry, splitSeg's write order: every freshly minted record
+// (the high run, and whatever pages the fence insert forces) lands
+// and flushes before the frame batch that references it, the trimmed
+// low image rides last as dead bytes until it lands. The fence entry
+// insert climbs the paging ladder as far as it must: flat with room
+// edits the root alone, the insert past zFenceMaxRuns is the paging
+// transition (the whole flat fence becomes leaf 0 under a one-entry
+// upper and root), a full leaf halves under fresh pageids, a full
+// upper halves the same way, and a full root is the format's edge.
+// Page splits mint rather than rewrite in place because a root
+// carrying the new pageids must never see a torn half; the replaced
+// records die after the root, bounded orphans the plane retire
+// cleans.
 func (z *ZSet) zrunSplit(ctx context.Context, key []byte, ri, n int) error {
-	if len(z.zfence) >= zFenceMaxRuns {
-		return errZFenceFull
-	}
 	h := z.h
 	r := &h.segRoot
-	if r.nextSegid > hashFenceSegidMax {
+	transition := !z.zpaged && len(z.zfence) >= zFenceMaxRuns
+	leafSplit := z.zpaged && len(z.zfence) >= zFenceLeafMax
+	upperSplit := leafSplit && len(z.zupper) >= zFenceUpperMax
+	if upperSplit && len(z.zridx) >= zFenceRootMax {
+		return errZFenceThirdLevel
+	}
+	mint := uint64(1)
+	switch {
+	case upperSplit:
+		mint = 5
+	case transition, leafSplit:
+		mint = 3
+	}
+	if r.nextSegid > hashFenceSegidMax-(mint-1) {
 		return fmt.Errorf("sqlo1: zset segid space of rooth %#x is spent", r.rooth)
 	}
 	mid := n / 2
 	off := zRunHdrLen
-	var sep uint64
 	for i := 0; i < mid; i++ {
 		_, _, next, err := zRunEntAt(z.zrbuf, off)
 		if err != nil {
@@ -442,24 +496,136 @@ func (z *ZSet) zrunSplit(ctx context.Context, key []byte, ri, n int) error {
 	}
 
 	newSegid := r.nextSegid
+	r.nextSegid++
 	z.zrbuf2 = append(z.zrbuf2[:0], make([]byte, zRunHdrLen)...)
 	putZRunHdr(z.zrbuf2, n-mid)
 	z.zrbuf2 = append(z.zrbuf2, z.zrbuf[off:]...)
 	if err := z.writeRun(ctx, newSegid, z.zrbuf2); err != nil {
 		return err
 	}
-	if err := h.t.Flush(ctx); err != nil {
-		return err
-	}
-	r.nextSegid++
 
 	z.zfence[ri].count = uint32(mid)
 	z.zfence = slices.Insert(z.zfence, ri+1, zFenceEnt{lo: sep, segid: newSegid, count: uint32(n - mid)})
-	if err := z.writeZRoot(ctx, key); err != nil {
-		return err
+	survivor := z.zfence[ri].segid
+
+	switch {
+	case transition:
+		leafID, upperID := r.nextSegid, r.nextSegid+1
+		r.nextSegid += 2
+		z.zpbuf = appendZLeafPage(z.zpbuf[:0], z.zfence)
+		if err := z.writeZPageRaw(ctx, leafID, z.zpbuf); err != nil {
+			return err
+		}
+		runs, count := uint16(len(z.zfence)), zfenceSum(z.zfence)
+		z.zupper = append(z.zupper[:0], zIdxEnt{lo: 0, pageid: leafID, runs: runs, count: count})
+		z.zpbuf = appendZUpperPage(z.zpbuf[:0], z.zupper)
+		if err := z.writeZPageRaw(ctx, upperID, z.zpbuf); err != nil {
+			return err
+		}
+		if err := h.t.Flush(ctx); err != nil {
+			return err
+		}
+		z.zridx = append(z.zridx[:0], zIdxEnt{lo: 0, pageid: upperID, runs: runs, count: count})
+		z.zpaged, z.zui, z.zli = true, 0, 0
+		if err := z.writeZRoot(ctx, key); err != nil {
+			return err
+		}
+
+	case upperSplit:
+		lm := len(z.zfence) / 2
+		lowLeaf, highLeaf := r.nextSegid, r.nextSegid+1
+		lowUpper, highUpper := r.nextSegid+2, r.nextSegid+3
+		r.nextSegid += 4
+		z.zpbuf = appendZLeafPage(z.zpbuf[:0], z.zfence[:lm])
+		if err := z.writeZPageRaw(ctx, lowLeaf, z.zpbuf); err != nil {
+			return err
+		}
+		z.zpbuf = appendZLeafPage(z.zpbuf[:0], z.zfence[lm:])
+		if err := z.writeZPageRaw(ctx, highLeaf, z.zpbuf); err != nil {
+			return err
+		}
+		oldLeaf := z.zupper[z.zli].pageid
+		z.zupper[z.zli] = zIdxEnt{lo: z.zupper[z.zli].lo, pageid: lowLeaf, runs: uint16(lm), count: zfenceSum(z.zfence[:lm])}
+		z.zupper = slices.Insert(z.zupper, z.zli+1,
+			zIdxEnt{lo: z.zfence[lm].lo, pageid: highLeaf, runs: uint16(len(z.zfence) - lm), count: zfenceSum(z.zfence[lm:])})
+		um := len(z.zupper) / 2
+		z.zpbuf = appendZUpperPage(z.zpbuf[:0], z.zupper[:um])
+		if err := z.writeZPageRaw(ctx, lowUpper, z.zpbuf); err != nil {
+			return err
+		}
+		z.zpbuf = appendZUpperPage(z.zpbuf[:0], z.zupper[um:])
+		if err := z.writeZPageRaw(ctx, highUpper, z.zpbuf); err != nil {
+			return err
+		}
+		if err := h.t.Flush(ctx); err != nil {
+			return err
+		}
+		oldUpper := z.zridx[z.zui].pageid
+		lr, lc := zidxSum(z.zupper[:um])
+		hr, hc := zidxSum(z.zupper[um:])
+		z.zridx[z.zui] = zIdxEnt{lo: z.zridx[z.zui].lo, pageid: lowUpper, runs: uint16(lr), count: lc}
+		z.zridx = slices.Insert(z.zridx, z.zui+1, zIdxEnt{lo: z.zupper[um].lo, pageid: highUpper, runs: uint16(hr), count: hc})
+		if err := z.writeZRoot(ctx, key); err != nil {
+			return err
+		}
+		if err := z.delZPage(ctx, oldLeaf); err != nil {
+			return err
+		}
+		if err := z.delZPage(ctx, oldUpper); err != nil {
+			return err
+		}
+		z.zui, z.zli = -1, -1
+
+	case leafSplit:
+		lm := len(z.zfence) / 2
+		lowLeaf, highLeaf := r.nextSegid, r.nextSegid+1
+		r.nextSegid += 2
+		z.zpbuf = appendZLeafPage(z.zpbuf[:0], z.zfence[:lm])
+		if err := z.writeZPageRaw(ctx, lowLeaf, z.zpbuf); err != nil {
+			return err
+		}
+		z.zpbuf = appendZLeafPage(z.zpbuf[:0], z.zfence[lm:])
+		if err := z.writeZPageRaw(ctx, highLeaf, z.zpbuf); err != nil {
+			return err
+		}
+		if err := h.t.Flush(ctx); err != nil {
+			return err
+		}
+		oldLeaf := z.zupper[z.zli].pageid
+		z.zupper[z.zli] = zIdxEnt{lo: z.zupper[z.zli].lo, pageid: lowLeaf, runs: uint16(lm), count: zfenceSum(z.zfence[:lm])}
+		z.zupper = slices.Insert(z.zupper, z.zli+1,
+			zIdxEnt{lo: z.zfence[lm].lo, pageid: highLeaf, runs: uint16(len(z.zfence) - lm), count: zfenceSum(z.zfence[lm:])})
+		z.zridx[z.zui].runs++
+		if err := z.writeZUpperPage(ctx); err != nil {
+			return err
+		}
+		if err := z.writeZRoot(ctx, key); err != nil {
+			return err
+		}
+		if err := z.delZPage(ctx, oldLeaf); err != nil {
+			return err
+		}
+		z.zli = -1
+
+	case z.zpaged:
+		z.zrunsBump(1)
+		if err := h.t.Flush(ctx); err != nil {
+			return err
+		}
+		if err := z.zfenceCommit(ctx, key); err != nil {
+			return err
+		}
+
+	default:
+		if err := h.t.Flush(ctx); err != nil {
+			return err
+		}
+		if err := z.writeZRoot(ctx, key); err != nil {
+			return err
+		}
 	}
 	putZRunHdr(z.zrbuf, mid)
-	return z.writeRun(ctx, z.zfence[ri].segid, z.zrbuf[:off])
+	return z.writeRun(ctx, survivor, z.zrbuf[:off])
 }
 
 // zrunDel removes (score, member) from the score side, reporting
@@ -481,17 +647,21 @@ func (z *ZSet) zrunDel(ctx context.Context, key []byte, score float64, member []
 }
 
 // zrunDelSeg removes a sortable (score, member) pair with the root
-// and fence already loaded, zrunAddSeg's mirror.
+// and fence already loaded, zrunAddSeg's mirror. In paged mode an
+// emptied run's death climbs the same ladder splits do, downward: the
+// fence entry leaves its leaf, an emptied leaf leaves its upper, an
+// emptied upper leaves the root, each level root-first so a crash
+// prefix never routes to a dead record. The sentinel run, leaf, and
+// upper never die.
 func (z *ZSet) zrunDelSeg(ctx context.Context, key []byte, s uint64, member []byte) (bool, error) {
-	if len(z.zfence) == 0 {
+	if !z.zpaged && len(z.zfence) == 0 {
 		return false, nil
 	}
 	ri, err := z.zrunRoute(ctx, s, member)
 	if err != nil {
 		return false, err
 	}
-	f := z.zfence
-	e := &f[ri]
+	e := &z.zfence[ri]
 	if e.count == 0 {
 		return false, nil
 	}
@@ -517,13 +687,75 @@ func (z *ZSet) zrunDelSeg(ctx context.Context, key []byte, s uint64, member []by
 	z.zrbuf = append(z.zrbuf, img[entEnd:liveEnd]...)
 
 	if n == 0 {
-		if ri == 0 {
+		z.zbumpLoaded(-1)
+		sentinel := ri == 0 && (!z.zpaged || (z.zui == 0 && z.zli == 0))
+		if sentinel {
 			e.count = 0
-			return true, z.writeZRoot(ctx, key)
+			return true, z.zfenceCommit(ctx, key)
 		}
 		deadSegid := e.segid
-		z.zfence = append(f[:ri], f[ri+1:]...)
-		if err := z.writeZRoot(ctx, key); err != nil {
+		if !z.zpaged {
+			z.zfence = append(z.zfence[:ri], z.zfence[ri+1:]...)
+			if err := z.writeZRoot(ctx, key); err != nil {
+				return false, err
+			}
+			putZRunKey(z.zkbuf[:], z.h.segRoot.rooth, deadSegid)
+			if _, err := z.h.t.Del(ctx, z.zkbuf[:]); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		if len(z.zfence) > 1 {
+			z.zfence = append(z.zfence[:ri], z.zfence[ri+1:]...)
+			z.zrunsBump(-1)
+			if ri == 0 {
+				// The leaf's first run died: its separator climbs to
+				// the new first run's, and the parents that carry it
+				// re-stamp so every load cross-check stays exact.
+				z.zupper[z.zli].lo = z.zfence[0].lo
+				if z.zli == 0 {
+					z.zridx[z.zui].lo = z.zupper[0].lo
+				}
+			}
+			if err := z.zfenceCommit(ctx, key); err != nil {
+				return false, err
+			}
+			putZRunKey(z.zkbuf[:], z.h.segRoot.rooth, deadSegid)
+			if _, err := z.h.t.Del(ctx, z.zkbuf[:]); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		// The run was its leaf's last: the leaf dies with it, and an
+		// upper emptied by that dies too. The sentinel path above
+		// keeps leaf 0 of upper 0 alive, so the removals never leave
+		// a level empty.
+		oldLeaf := z.zupper[z.zli].pageid
+		if len(z.zupper) > 1 {
+			z.zupper = append(z.zupper[:z.zli], z.zupper[z.zli+1:]...)
+			z.zridx[z.zui].runs--
+			if z.zli == 0 {
+				z.zridx[z.zui].lo = z.zupper[0].lo
+			}
+			if err := z.writeZUpperPage(ctx); err != nil {
+				return false, err
+			}
+			if err := z.writeZRoot(ctx, key); err != nil {
+				return false, err
+			}
+			z.zli = -1
+		} else {
+			oldUpper := z.zridx[z.zui].pageid
+			z.zridx = append(z.zridx[:z.zui], z.zridx[z.zui+1:]...)
+			if err := z.writeZRoot(ctx, key); err != nil {
+				return false, err
+			}
+			if err := z.delZPage(ctx, oldUpper); err != nil {
+				return false, err
+			}
+			z.zui, z.zli = -1, -1
+		}
+		if err := z.delZPage(ctx, oldLeaf); err != nil {
 			return false, err
 		}
 		putZRunKey(z.zkbuf[:], z.h.segRoot.rooth, deadSegid)
@@ -533,6 +765,7 @@ func (z *ZSet) zrunDelSeg(ctx context.Context, key []byte, s uint64, member []by
 		return true, nil
 	}
 
+	z.zbumpLoaded(-1)
 	merged, err := z.tryMergeRun(ctx, key, ri, n)
 	if err != nil || merged {
 		return merged, err
@@ -541,13 +774,16 @@ func (z *ZSet) zrunDelSeg(ctx context.Context, key []byte, s uint64, member []by
 		return false, err
 	}
 	e.count--
-	return true, z.writeZRoot(ctx, key)
+	return true, z.zfenceCommit(ctx, key)
 }
 
 // tryMergeRun folds the shrunken run at ri (post-image in z.zrbuf, n
 // live entries) into a fence neighbor when the merged encoding stays
-// under zRunMin: merged image to the low side's segid, the root drops
-// the high entry, then the high record dies, tryMergeSeg's order.
+// under zRunMin: merged image to the low side's segid, the fence
+// drops the high entry, then the high record dies, tryMergeSeg's
+// order. In paged mode the neighborhood is the loaded leaf, so a
+// merge never crosses a page boundary; edge runs keep their slack, a
+// bounded compromise the hash fence's lazy merge already accepts.
 func (z *ZSet) tryMergeRun(ctx context.Context, key []byte, ri, n int) (bool, error) {
 	if len(z.zrbuf) >= zRunMin {
 		return false, nil
@@ -590,7 +826,8 @@ func (z *ZSet) tryMergeRun(ctx context.Context, key []byte, ri, n int) (bool, er
 		deadSegid := f[hi].segid
 		f[lo].count = uint32(n) + f[other].count
 		z.zfence = append(f[:hi], f[hi+1:]...)
-		if err := z.writeZRoot(ctx, key); err != nil {
+		z.zrunsBump(-1)
+		if err := z.zfenceCommit(ctx, key); err != nil {
 			return false, err
 		}
 		putZRunKey(z.zkbuf[:], z.h.segRoot.rooth, deadSegid)
@@ -613,23 +850,42 @@ func (z *ZSet) zrunWalk(ctx context.Context, key []byte, emit func(sortable uint
 	if _, err := z.zscoreState(ctx, key); err != nil {
 		return err
 	}
-	for i := range z.zfence {
-		e := z.zfence[i]
-		if e.count == 0 {
-			continue
-		}
-		img, err := z.readRun(ctx, e.segid)
-		if err != nil {
-			return err
-		}
-		off := zRunHdrLen
-		for j := uint32(0); j < e.count; j++ {
-			s, m, next, err := zRunEntAt(img, off)
+	walkLeaf := func() error {
+		for i := range z.zfence {
+			e := z.zfence[i]
+			if e.count == 0 {
+				continue
+			}
+			img, err := z.readRun(ctx, e.segid)
 			if err != nil {
 				return err
 			}
-			emit(s, m)
-			off = next
+			off := zRunHdrLen
+			for j := uint32(0); j < e.count; j++ {
+				s, m, next, err := zRunEntAt(img, off)
+				if err != nil {
+					return err
+				}
+				emit(s, m)
+				off = next
+			}
+		}
+		return nil
+	}
+	if !z.zpaged {
+		return walkLeaf()
+	}
+	for ui := range z.zridx {
+		if err := z.loadZUpper(ctx, ui); err != nil {
+			return err
+		}
+		for li := 0; li < len(z.zupper); li++ {
+			if err := z.loadZLeaf(ctx, ui, li); err != nil {
+				return err
+			}
+			if err := walkLeaf(); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

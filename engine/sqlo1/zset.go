@@ -29,13 +29,26 @@ type ZSet struct {
 	sbuf [zmemScoreLen]byte
 
 	// Score-side scratch, zrun.go: the decoded fence of the root
-	// under operation, the tail image a root write lands, the run
-	// images an op builds, and the run subkey.
+	// under operation (paged mode: the loaded leaf's entries), the
+	// tail image a root write lands, the run images an op builds, and
+	// the run subkey.
 	zfence []zFenceEnt
 	ztail  []byte
 	zrbuf  []byte
 	zrbuf2 []byte
 	zkbuf  [SubkeySize]byte
+
+	// Paged score fence state, zfencepage.go: whether the root under
+	// operation pages, its decoded root index, the loaded upper page's
+	// entries, the loaded positions (-1 until loaded), and the page
+	// scratch. zloadTail resets all of it per op.
+	zpaged bool
+	zridx  []zIdxEnt
+	zupper []zIdxEnt
+	zui    int
+	zli    int
+	zpbuf  []byte
+	zkbuf2 [SubkeySize]byte
 }
 
 // NewZSet builds the zset layer over t.
@@ -264,6 +277,8 @@ func (z *ZSet) zupgrade(ctx context.Context, key []byte, expMs int64) error {
 	}
 	r := &h.segRoot
 	z.zfence = z.zfence[:0]
+	z.zpaged, z.zridx = false, z.zridx[:0]
+	z.zui, z.zli = -1, -1
 	z.zrbuf = append(z.zrbuf[:0], make([]byte, zRunHdrLen)...)
 	runN := 0
 	runLo := uint64(0)
@@ -324,9 +339,7 @@ func (z *ZSet) zupgrade(ctx context.Context, key []byte, expMs int64) error {
 // lands one full root frame, after all of them.
 func (z *ZSet) zaddSeg(ctx context.Context, key, member []byte, score float64, f ZAddFlags, expMs int64) (bool, bool, float64, bool, error) {
 	h := z.h
-	var err error
-	z.zfence, err = decodeZTail(h.segRoot.tail, z.zfence)
-	if err != nil {
+	if err := z.zloadTail(); err != nil {
 		return false, false, 0, false, err
 	}
 	fh := hashFH(member)
@@ -363,6 +376,12 @@ func (z *ZSet) zaddSeg(ctx context.Context, key, member []byte, score float64, f
 			return false, false, zScoreFromSortable(sNew), true, nil
 		}
 	}
+	// The capacity probe runs before either family writes: a spent
+	// two-level fence must reject the command whole, never tear the
+	// dual write (Z-I1).
+	if err := z.zaddRoom(ctx, sNew, member); err != nil {
+		return false, false, 0, false, err
+	}
 
 	h.deferRoot = true
 	h.t.ht.pinRoot(key)
@@ -394,15 +413,14 @@ func (z *ZSet) zaddSeg(ctx context.Context, key, member []byte, score float64, f
 }
 
 // zflushRoot ends a dual command on the segmented rung: the score
-// fence re-encodes into the tail and the root lands as one full
+// section re-encodes into the tail and the root lands as one full
 // frame, always written even when the image matches the last one,
 // because the root frame is the plane's replay commit point and every
 // dual command must own one.
 func (z *ZSet) zflushRoot(ctx context.Context, key []byte, expMs int64) error {
 	h := z.h
 	h.deferRoot, h.rootPend = false, false
-	z.ztail = appendZTail(z.ztail[:0], z.zfence)
-	h.segRoot.tail = z.ztail
+	z.zencodeTail()
 	if err := h.writeSegRoot(ctx, key, false); err != nil {
 		return err
 	}
@@ -434,8 +452,7 @@ func (z *ZSet) ZRem(ctx context.Context, key, member []byte) (bool, error) {
 		// member is not the one.
 		return h.hdelSeg(ctx, key, member, expMs)
 	}
-	z.zfence, err = decodeZTail(h.segRoot.tail, z.zfence)
-	if err != nil {
+	if err := z.zloadTail(); err != nil {
 		return false, err
 	}
 	fh := hashFH(member)

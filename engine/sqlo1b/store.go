@@ -598,6 +598,14 @@ func (s *Store) reconcileTail(ops []tailOp) ([]tailOp, map[int]bool, error) {
 			switch {
 			case rec.RType == RecFence && isFence(rec.Key):
 				fpages[string(rec.Key)] = append(fpages[string(rec.Key)], tailPageImg{idx: i, batch: batch, val: rec.Value})
+			case rec.RType == RecFence && isAux(rec.Key):
+				// A fence page on a type-namespaced kind (the zset's
+				// score fence pages): a plane record like any other
+				// auxiliary, so rollback settle drops it past the last
+				// root frame. Only kind-3 pages carry a reconcilable
+				// root's fenced set and need the image tracking above.
+				rooth := binary.LittleEndian.Uint64(rec.Key)
+				aux[rooth] = append(aux[rooth], i)
 			case rec.RType == RecSeg && isSeg(rec.Key):
 				post, postMin, ok := sqlo1.SegCounts(rec.Value)
 				if !ok {

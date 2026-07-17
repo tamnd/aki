@@ -359,10 +359,10 @@ func TestZRunEqualScoreChain(t *testing.T) {
 	zrunCheck(t, r.z, "lex", reborn)
 }
 
-// TestZRunFenceCap drives the flat fence to its run limit with fat
-// members: the split that would pass zFenceMaxRuns answers
-// errZFenceFull before touching the store, the prior state still
-// walks clean, and inserts that fit without splitting still land.
+// TestZRunFenceCap drives the flat fence past its run limit with fat
+// members: the split past zFenceMaxRuns is the paging transition, so
+// every insert lands, the fence comes out paged, and the walk still
+// streams the whole board in order, hot and cold.
 func TestZRunFenceCap(t *testing.T) {
 	r := newZsetRig(t)
 	ctx := context.Background()
@@ -378,44 +378,53 @@ func TestZRunFenceCap(t *testing.T) {
 		}
 	}
 
-	added := 0
-	var capErr error
-	for i := 0; i < 600; i++ {
+	const n = 600
+	for i := 0; i < n; i++ {
 		created, err := r.z.zrunAdd(ctx, []byte("cap"), float64(i+1), fat(i))
-		if err != nil {
-			capErr = err
-			break
+		if err != nil || !created {
+			t.Fatalf("zrunAdd(%d) = (%v, %v)", i, created, err)
 		}
-		if !created {
-			t.Fatalf("zrunAdd(%d) not created", i)
-		}
-		added++
 	}
-	if !errors.Is(capErr, errZFenceFull) {
-		t.Fatalf("fence cap error = %v (after %d adds), want errZFenceFull", capErr, added)
+	if _, err := r.z.zscoreState(ctx, []byte("cap")); err != nil {
+		t.Fatalf("zscoreState: %v", err)
+	}
+	if !r.z.zpaged {
+		t.Fatalf("fence still flat after %d fat adds, the transition never fired", n)
+	}
+	if len(r.z.zridx) != 1 {
+		t.Fatalf("root index holds %d entries, want 1 upper at this size", len(r.z.zridx))
+	}
+	runs, count := zidxSum(r.z.zridx)
+	if runs <= zFenceMaxRuns || count != n {
+		t.Fatalf("root index sums (%d runs, %d members), want past the %d flat cap and %d members", runs, count, zFenceMaxRuns, n)
 	}
 
 	got := zrunCollect(t, r.z, "cap")
-	if len(got) != added {
-		t.Fatalf("walk emits %d entries after the cap error, %d adds landed", len(got), added)
+	if len(got) != n {
+		t.Fatalf("walk emits %d entries, %d adds landed", len(got), n)
 	}
 	for i := 1; i < len(got); i++ {
 		if got[i-1].s > got[i].s || (got[i-1].s == got[i].s && got[i-1].m >= got[i].m) {
-			t.Fatalf("walk out of order at entry %d after the cap error", i)
+			t.Fatalf("walk out of order at entry %d after the transition", i)
 		}
 	}
-	if len(r.z.zfence) != zFenceMaxRuns {
-		t.Fatalf("fence holds %d runs, want the %d cap", len(r.z.zfence), zFenceMaxRuns)
-	}
 
-	// A splitless insert still lands: 0.5 routes below every fat
-	// score into the sentinel run, which has room.
+	// A splitless insert still lands paged: 0.5 routes below every
+	// fat score into the sentinel run, which has room.
 	created, err := r.z.zrunAdd(ctx, []byte("cap"), 0.5, []byte("tiny"))
 	if err != nil || !created {
-		t.Fatalf("post-cap zrunAdd = (%v, %v)", created, err)
+		t.Fatalf("paged zrunAdd = (%v, %v)", created, err)
 	}
-	if got := zrunCollect(t, r.z, "cap"); len(got) != added+1 || got[0].m != "tiny" {
-		t.Fatalf("post-cap walk emits %d entries with head %q, want %d and tiny", len(got), got[0].m, added+1)
+	if got := zrunCollect(t, r.z, "cap"); len(got) != n+1 || got[0].m != "tiny" {
+		t.Fatalf("paged walk emits %d entries with head %q, want %d and tiny", len(got), got[0].m, n+1)
+	}
+
+	if err := r.tr.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	cold := r.reopen()
+	if got := zrunCollect(t, cold, "cap"); len(got) != n+1 || got[0].m != "tiny" {
+		t.Fatalf("cold paged walk emits %d entries with head %q, want %d and tiny", len(got), got[0].m, n+1)
 	}
 }
 

@@ -11,10 +11,11 @@ import (
 // the score fence counts plus its index inside the covering run, so
 // the whole ask is one member-segment read for the score, bounded
 // fence arithmetic, and one run read (Z-I3), at any zset size. The
-// flat fence keeps the counts in the root; the paged fence keeps
-// per-page totals so the sum stays bounded scans (the zrank lab's
-// two-level 250/250 verdict, #1014), and this surface reads through
-// z.zfence either way once that slice lands.
+// flat fence keeps the counts in the root; the paged fence carries
+// subtree totals in its index entries (the zrank lab's two-level
+// 250/250 verdict, #1014), so the sum stays three bounded scans and
+// the cold walk stays five records: root, upper, leaf, member
+// segment, run.
 
 // ZScore answers member's score, the ZSCORE surface: root plus at
 // most one member segment, hot or cold.
@@ -116,17 +117,14 @@ func (z *ZSet) zrankOf(ctx context.Context, key, member []byte) (rank, total int
 	s = binary.BigEndian.Uint64(v)
 	total = int64(h.segRoot.count)
 
-	z.zfence, err = decodeZTail(h.segRoot.tail, z.zfence)
-	if err != nil {
+	if err := z.zloadTail(); err != nil {
 		return 0, 0, 0, false, err
 	}
 	ri, err := z.zrunRoute(ctx, s, member)
 	if err != nil {
 		return 0, 0, 0, false, err
 	}
-	for k := range ri {
-		rank += int64(z.zfence[k].count)
-	}
+	rank += z.zprefixLoaded(ri)
 	e := z.zfence[ri]
 	img, err := z.readRun(ctx, e.segid)
 	if err != nil {
