@@ -172,6 +172,28 @@ type WriteLog interface {
 	// the caller marks what did land.
 	ListMove(src, dst []byte, srcFront, dstFront bool, value []byte, srcDropped, dstCreated bool) (dstGroup uint16, dstSeq uint64, srcGroup uint16, srcSeq uint64, err error)
 
+	// StreamAdd records one appended stream entry at the id the owner
+	// assigned, as an xadd of the flat field-value pairs, with a collnew
+	// ahead when the write created the stream and an xtrim of trimmed
+	// behind when XADD's trim clause removed entries, one atomic run.
+	StreamAdd(key []byte, created bool, idMs, idSeq uint64, fieldsValues [][]byte, trimmed uint64) (group uint16, seq uint64, err error)
+
+	// StreamTrim records XTRIM's removals as one xtrim of the dropped
+	// count; trims only ever remove a prefix of the oldest live entries
+	// in id order, and never drop the stream, so no colldrop arm.
+	StreamTrim(key []byte, removed uint64) (group uint16, seq uint64, err error)
+
+	// StreamDel records XDEL's tombstones as one xdel of the ids that
+	// actually removed, ms paralleling seqs in argument order; an emptied
+	// stream persists, so no colldrop arm here either.
+	StreamDel(key []byte, ms, seqs []uint64) (group uint16, seq uint64, err error)
+
+	// StreamSetID records XSETID's resulting state as one xsetid of all
+	// three values the stream now holds, the optional-argument merge
+	// already done; the command requires the key, so a collnew never
+	// leads.
+	StreamSetID(key []byte, lastMs, lastSeq, entriesAdded, maxDelMs, maxDelSeq uint64) (group uint16, seq uint64, err error)
+
 	// NotifyCommitted runs fn once a chain commit covering the marked
 	// frame has landed and folded live (doc 04 section 3.2): it registers
 	// on the committed watermark and raises barrier demand, so a pending
@@ -489,6 +511,63 @@ func (cx *Ctx) LogListMoveServe(src, dst []byte, srcFront, dstFront bool, value 
 		marks = append(marks, WALMark{Group: sg, Seq: ss})
 	}
 	return marks, err
+}
+
+// LogStreamAdd emits a stream append's effect frames when a log is
+// wired, and is free when none is. See WriteLog.StreamAdd for the
+// contract.
+func (cx *Ctx) LogStreamAdd(key []byte, created bool, idMs, idSeq uint64, fieldsValues [][]byte, trimmed uint64) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.StreamAdd(key, created, idMs, idSeq, fieldsValues, trimmed)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogStreamTrim emits XTRIM's effect frame when a log is wired, and is
+// free when none is. See WriteLog.StreamTrim for the contract.
+func (cx *Ctx) LogStreamTrim(key []byte, removed uint64) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.StreamTrim(key, removed)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogStreamDel emits XDEL's effect frame when a log is wired, and is
+// free when none is. See WriteLog.StreamDel for the contract.
+func (cx *Ctx) LogStreamDel(key []byte, ms, seqs []uint64) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.StreamDel(key, ms, seqs)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogStreamSetID emits XSETID's effect frame when a log is wired, and is
+// free when none is. See WriteLog.StreamSetID for the contract.
+func (cx *Ctx) LogStreamSetID(key []byte, lastMs, lastSeq, entriesAdded, maxDelMs, maxDelSeq uint64) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.StreamSetID(key, lastMs, lastSeq, entriesAdded, maxDelMs, maxDelSeq)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
 }
 
 // CompleteServed completes a served waiter's parked reply under the

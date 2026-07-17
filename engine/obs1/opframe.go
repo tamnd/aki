@@ -64,7 +64,9 @@ const (
 // Colldelta sub-kinds (doc 04 section 2's named set; hexpire filled the
 // hash-field-expiry gap the table left open, #1023's next-slice item;
 // lrem and lins fill the interior-surgery gap the same way, since LREM
-// and LINSERT resolve positions no push or pop sub-op can express).
+// and LINSERT resolve positions no push or pop sub-op can express;
+// xdel, xtrim, and xsetid complete the stream entry surface, the
+// consumer-group vocabulary is its own later slice per doc 08).
 const (
 	SubHSet    = 0x01
 	SubHDel    = 0x02
@@ -81,6 +83,9 @@ const (
 	SubHExpire = 0x0D
 	SubLRem    = 0x0E
 	SubLIns    = 0x0F
+	SubXDel    = 0x10
+	SubXTrim   = 0x11
+	SubXSetID  = 0x12
 )
 
 // Op is one doc 04 op: exactly one of the eight kinds.
@@ -325,6 +330,36 @@ type HExpire struct {
 	Fields [][]byte
 }
 
+// XDel tombstones the stream entries whose ids actually removed;
+// XDEL's post-decision form. Ids follow argument order and are unique
+// (a second delete of the same id returns false and never lands here),
+// with no ordering constraint since tombstoning is order-independent.
+type XDel struct {
+	IDMs  []uint64
+	IDSeq []uint64
+}
+
+// XTrim removes the Count oldest live entries in id order; the
+// post-decision form of XTRIM and XADD's trim clause. Both trim bands
+// only ever drop a prefix of the live sequence, so a count fully
+// determines replay the way a pop count does, and doc 08's range
+// tombstones are the fold layer's rendering of it, not this frame's.
+type XTrim struct {
+	Count uint64
+}
+
+// XSetID records the three resulting values XSETID leaves behind, all
+// unconditionally: last id, entries-added, and max-deleted id. The
+// owner already merged the optional arguments into the stream's state,
+// so replay assigns without flags.
+type XSetID struct {
+	LastMs       uint64
+	LastSeq      uint64
+	EntriesAdded uint64
+	MaxDelMs     uint64
+	MaxDelSeq    uint64
+}
+
 func (HSet) subKind() uint8    { return SubHSet }
 func (HDel) subKind() uint8    { return SubHDel }
 func (SAdd) subKind() uint8    { return SubSAdd }
@@ -340,6 +375,9 @@ func (XAdd) subKind() uint8    { return SubXAdd }
 func (HExpire) subKind() uint8 { return SubHExpire }
 func (LRem) subKind() uint8    { return SubLRem }
 func (LIns) subKind() uint8    { return SubLIns }
+func (XDel) subKind() uint8    { return SubXDel }
+func (XTrim) subKind() uint8   { return SubXTrim }
+func (XSetID) subKind() uint8  { return SubXSetID }
 
 func (o HSet) appendBody(b []byte) ([]byte, error)  { return appendPairList(b, o.Pairs) }
 func (o HDel) appendBody(b []byte) ([]byte, error)  { return appendByteList(b, o.Fields) }
@@ -417,6 +455,36 @@ func (o LIns) appendBody(b []byte) ([]byte, error) {
 	}
 	b = binary.LittleEndian.AppendUint64(b, uint64(o.Index))
 	return append(b, o.Value...), nil
+}
+
+func (o XDel) appendBody(b []byte) ([]byte, error) {
+	if len(o.IDMs) == 0 {
+		return nil, fmt.Errorf("obs1: an xdel sub-op records no effects")
+	}
+	if len(o.IDMs) != len(o.IDSeq) {
+		return nil, fmt.Errorf("obs1: xdel id halves are %d and %d long", len(o.IDMs), len(o.IDSeq))
+	}
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(o.IDMs)))
+	for i := range o.IDMs {
+		b = binary.LittleEndian.AppendUint64(b, o.IDMs[i])
+		b = binary.LittleEndian.AppendUint64(b, o.IDSeq[i])
+	}
+	return b, nil
+}
+
+func (o XTrim) appendBody(b []byte) ([]byte, error) {
+	if o.Count == 0 {
+		return nil, fmt.Errorf("obs1: an xtrim sub-op records no effects")
+	}
+	return binary.LittleEndian.AppendUint64(b, o.Count), nil
+}
+
+func (o XSetID) appendBody(b []byte) ([]byte, error) {
+	b = binary.LittleEndian.AppendUint64(b, o.LastMs)
+	b = binary.LittleEndian.AppendUint64(b, o.LastSeq)
+	b = binary.LittleEndian.AppendUint64(b, o.EntriesAdded)
+	b = binary.LittleEndian.AppendUint64(b, o.MaxDelMs)
+	return binary.LittleEndian.AppendUint64(b, o.MaxDelSeq), nil
 }
 
 // appendItem writes one u32-length-prefixed item.
@@ -678,9 +746,44 @@ func parseCollDelta(p []byte) (Op, error) {
 			Index: idx,
 			Value: append([]byte(nil), body[8:]...),
 		}}, nil
+	case SubXDel:
+		n, b, err := parseCount(body, 16)
+		if err != nil {
+			return nil, err
+		}
+		if len(b) != 16*n {
+			return nil, fmt.Errorf("obs1: xdel id list is %d bytes, want %d", len(b), 16*n)
+		}
+		ms := make([]uint64, n)
+		seq := make([]uint64, n)
+		for i := range ms {
+			ms[i] = binary.LittleEndian.Uint64(b[16*i:])
+			seq[i] = binary.LittleEndian.Uint64(b[16*i+8:])
+		}
+		return CollDelta{Sub: XDel{IDMs: ms, IDSeq: seq}}, nil
+	case SubXTrim:
+		if err := exact(8); err != nil {
+			return nil, err
+		}
+		count := binary.LittleEndian.Uint64(body)
+		if count == 0 {
+			return nil, fmt.Errorf("obs1: an xtrim sub-op records no effects")
+		}
+		return CollDelta{Sub: XTrim{Count: count}}, nil
+	case SubXSetID:
+		if err := exact(40); err != nil {
+			return nil, err
+		}
+		return CollDelta{Sub: XSetID{
+			LastMs:       binary.LittleEndian.Uint64(body[0:8]),
+			LastSeq:      binary.LittleEndian.Uint64(body[8:16]),
+			EntriesAdded: binary.LittleEndian.Uint64(body[16:24]),
+			MaxDelMs:     binary.LittleEndian.Uint64(body[24:32]),
+			MaxDelSeq:    binary.LittleEndian.Uint64(body[32:40]),
+		}}, nil
 	}
 	// Unknown sub-kinds are rejected, not skipped: replay dispatches on
-	// them, and a sixteenth arrives with an fversion bump.
+	// them, and a nineteenth arrives with an fversion bump.
 	return nil, fmt.Errorf("obs1: colldelta sub-kind 0x%02x is not a doc 04 sub-kind", sub)
 }
 

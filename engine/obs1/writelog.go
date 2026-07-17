@@ -595,6 +595,62 @@ func (l *WriteLog) ListMove(src, dst []byte, srcFront, dstFront bool, value []by
 	return dg, ds, sg, ss, nil
 }
 
+// StreamAdd implements the shard seam: one appended entry at the id the
+// owner assigned, as an xadd carrying the flat field-value pairs, with a
+// collnew ahead of it when the write created the stream and an xtrim of
+// trimmed entries behind it when XADD's trim clause removed any, all one
+// atomic run since they are one command's effect.
+func (l *WriteLog) StreamAdd(key []byte, created bool, idMs, idSeq uint64, fieldsValues [][]byte, trimmed uint64) (uint16, uint64, error) {
+	if len(fieldsValues) == 0 || len(fieldsValues)%2 != 0 {
+		return 0, 0, l.classify(fmt.Errorf("obs1: a stream add emission needs field-value pairs, got %d items", len(fieldsValues)))
+	}
+	pairs := make([]FieldValue, len(fieldsValues)/2)
+	for i := range pairs {
+		pairs[i] = FieldValue{Field: fieldsValues[2*i], Value: fieldsValues[2*i+1]}
+	}
+	ops := make([]Op, 0, 3)
+	if created {
+		ops = append(ops, CollNew{Type: CollStream})
+	}
+	ops = append(ops, CollDelta{Sub: XAdd{IDMs: idMs, IDSeq: idSeq, Pairs: pairs}})
+	if trimmed > 0 {
+		ops = append(ops, CollDelta{Sub: XTrim{Count: trimmed}})
+	}
+	return l.emitOps(key, ops...)
+}
+
+// StreamTrim implements the shard seam: XTRIM's removals as one xtrim of
+// the count of dropped entries. Both trim bands only ever remove a
+// prefix of the oldest live entries in id order, so the count is the
+// whole post-decision effect. A trim never drops the stream, so there is
+// no colldrop arm.
+func (l *WriteLog) StreamTrim(key []byte, removed uint64) (uint16, uint64, error) {
+	return l.emitOps(key, CollDelta{Sub: XTrim{Count: removed}})
+}
+
+// StreamDel implements the shard seam: XDEL's tombstones as one xdel of
+// the ids that actually removed, ms paralleling seqs in argument order.
+// An emptied stream persists (lastID never moves back), so there is no
+// colldrop arm here either.
+func (l *WriteLog) StreamDel(key []byte, ms, seqs []uint64) (uint16, uint64, error) {
+	return l.emitOps(key, CollDelta{Sub: XDel{IDMs: ms, IDSeq: seqs}})
+}
+
+// StreamSetID implements the shard seam: XSETID's resulting state as one
+// xsetid carrying all three values the stream now holds, last id,
+// entries-added, and max-deleted id, the optional-argument merge already
+// done by the owner. The command requires the key to exist, so a collnew
+// never leads.
+func (l *WriteLog) StreamSetID(key []byte, lastMs, lastSeq, entriesAdded, maxDelMs, maxDelSeq uint64) (uint16, uint64, error) {
+	return l.emitOps(key, CollDelta{Sub: XSetID{
+		LastMs:       lastMs,
+		LastSeq:      lastSeq,
+		EntriesAdded: entriesAdded,
+		MaxDelMs:     maxDelMs,
+		MaxDelSeq:    maxDelSeq,
+	}})
+}
+
 // NotifyCommitted implements the shard seam: fn runs once the group's
 // committed watermark covers seq (Watermarks.Notify, inline when it
 // already does). Registering also raises barrier demand, the doc 04

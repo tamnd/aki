@@ -51,6 +51,9 @@ func opCorpus(t testing.TB) []struct {
 		{"hpersist", key, CollDelta{Sub: HExpire{AtMs: 0, Fields: [][]byte{[]byte("f1")}}}},
 		{"lrem", key, CollDelta{Sub: LRem{Indices: []uint32{0, 3, 7}}}},
 		{"lins", key, CollDelta{Sub: LIns{Index: 2, Value: []byte("v")}}},
+		{"xdel", key, CollDelta{Sub: XDel{IDMs: []uint64{1700000000000, 1699999999999}, IDSeq: []uint64{2, 0}}}},
+		{"xtrim", key, CollDelta{Sub: XTrim{Count: 5}}},
+		{"xsetid", key, CollDelta{Sub: XSetID{LastMs: 1700000000000, LastSeq: 7, EntriesAdded: 12, MaxDelMs: 1699999999999, MaxDelSeq: 4}}},
 	}
 }
 
@@ -198,7 +201,7 @@ func TestOpStructuralRejects(t *testing.T) {
 			t.Fatalf("op kind 0x%02x decoded", kind)
 		}
 	}
-	for _, sub := range []uint8{0x00, 0x10, 0xFF} {
+	for _, sub := range []uint8{0x00, 0x13, 0xFF} {
 		if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: []byte{sub, 1, 0, 0, 0}}); err == nil {
 			t.Fatalf("colldelta sub-kind 0x%02x decoded", sub)
 		}
@@ -280,8 +283,35 @@ func TestOpSizeRejects(t *testing.T) {
 	if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: append([]byte{SubLIns}, make([]byte, 7)...)}); err == nil {
 		t.Fatal("lins truncated at its index decoded")
 	}
+	if _, err := EncodeOp(0, 1, key, CollDelta{Sub: XDel{}}); err == nil {
+		t.Fatal("empty xdel encoded")
+	}
+	if _, err := EncodeOp(0, 1, key, CollDelta{Sub: XDel{IDMs: []uint64{1, 2}, IDSeq: []uint64{0}}}); err == nil {
+		t.Fatal("xdel with mismatched id halves encoded")
+	}
+	if _, err := EncodeOp(0, 1, key, CollDelta{Sub: XTrim{}}); err == nil {
+		t.Fatal("xtrim of zero encoded")
+	}
+	shortDel := binary.LittleEndian.AppendUint32([]byte{SubXDel}, 2)
+	shortDel = binary.LittleEndian.AppendUint64(shortDel, 5)
+	shortDel = binary.LittleEndian.AppendUint64(shortDel, 1)
+	if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: shortDel}); err == nil {
+		t.Fatal("xdel truncated inside its id list decoded")
+	}
+	if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: append([]byte{SubXTrim}, make([]byte, 8)...)}); err == nil {
+		t.Fatal("xtrim of zero decoded")
+	}
+	if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: append([]byte{SubXTrim}, make([]byte, 7)...)}); err == nil {
+		t.Fatal("7-byte xtrim decoded")
+	}
+	if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: append([]byte{SubXSetID}, make([]byte, 39)...)}); err == nil {
+		t.Fatal("39-byte xsetid decoded")
+	}
+	if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: append([]byte{SubXSetID}, make([]byte, 41)...)}); err == nil {
+		t.Fatal("41-byte xsetid decoded")
+	}
 	zero := []byte{0, 0, 0, 0}
-	for _, sub := range []uint8{SubSAdd, SubLPop, SubRPop, SubLRem} {
+	for _, sub := range []uint8{SubSAdd, SubLPop, SubRPop, SubLRem, SubXDel} {
 		if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: append([]byte{sub}, zero...)}); err == nil {
 			t.Fatalf("sub-kind 0x%02x with zero count decoded", sub)
 		}
