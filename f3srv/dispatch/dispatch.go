@@ -146,10 +146,11 @@ func init() {
 	register("LCS", str.Lcs, 2, -1, true)
 	table["LCS"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 	table["LCS"].cross = str.LcsCross
-	// TYPE spans the string store and the set registry, so the set package
-	// owns its point handler; the same holds for the single-key EXISTS and DEL
-	// paths registered below.
-	register("TYPE", set.Type, 1, 1, true)
+	// TYPE spans every keyspace f3 keeps (the string store and all five
+	// collection registries), so its handler lives here where every type
+	// package is in reach. Single-key EXISTS and DEL still span only set plus
+	// string below, owed to the fan-threading slice.
+	register("TYPE", typeCmd, 1, 1, true)
 
 	// The tier-one multi-key commands: a single key keeps the point path,
 	// more keys scatter through the fan-out; MGET and MSET always fan. The
@@ -975,4 +976,32 @@ func lolwut(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // feature set is the +RESET acknowledgement itself.
 func reset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Status("RESET")
+}
+
+// typeCmd answers TYPE key, spanning every keyspace f3 keeps: the string store
+// and the five collection registries. A key lives in exactly one of them, so the
+// probes are mutually exclusive and their order is only cosmetic; each collection
+// probe is the non-creating Has form, so a TYPE against an absent key builds no
+// registry and (for streams) registers no maintainer. An absent key reports
+// "none", Redis's answer for a key of no type. This supersedes the set-only
+// handler the earlier slice registered, which reported "none" for a hash, list,
+// zset, or stream key.
+func typeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	key := args[0]
+	switch {
+	case cx.St.Exists(key, cx.NowMs):
+		r.Status("string")
+	case set.Has(cx, key):
+		r.Status("set")
+	case zset.Has(cx, key):
+		r.Status("zset")
+	case hash.Has(cx, key):
+		r.Status("hash")
+	case list.Has(cx, key):
+		r.Status("list")
+	case stream.Has(cx, key):
+		r.Status("stream")
+	default:
+		r.Status("none")
+	}
 }

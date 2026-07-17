@@ -136,6 +136,20 @@ func ResidentBytes(cx *shard.Ctx) uint64 {
 	return 0
 }
 
+// Has reports whether key holds a hash on this shard, without building the
+// registry when none exists yet: the presence probe the unified TYPE consults
+// across the collection types. Like lookup it reaps expired fields first, so a
+// hash emptied by field expiry reads as absent. A string value or another
+// collection at key reads false, leaving the type to the caller's other probes.
+func Has(cx *shard.Ctx, key []byte) bool {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return false
+	}
+	h, _ := v.(*reg).lookup(cx, key)
+	return h != nil
+}
+
 // lookup finds the hash for key. present is nil when no hash exists; wrong is true
 // when the key instead holds a value in the string store, which every hash command
 // answers with WRONGTYPE. Cross-type collisions with the set, zset, and list

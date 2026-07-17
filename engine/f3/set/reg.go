@@ -12,8 +12,9 @@ import (
 // the shard's Ctx.Coll (spec 2064/f3/11): one map from key to the inline set,
 // touched only by the shard goroutine, so it holds no lock. The string store
 // and this registry are separate keyspaces for now; the WRONGTYPE guard below
-// keeps a set command off a key the string store owns, and the keyspace
-// commands set.Type, set.Exists, and set.Del span both. Full cross-type
+// keeps a set command off a key the string store owns, and the single-key
+// keyspace commands set.Exists and set.Del span both. TYPE has moved on to span
+// every type (its unified handler consults set.Has here); full cross-type
 // unification (a SET overwriting a set, multi-key DEL over sets) lands with the
 // keyspace slice; this slice keeps the set surface self-consistent and refuses
 // the cross-type collisions it cannot yet resolve.
@@ -88,6 +89,19 @@ func (g *reg) next(n int) int {
 		}
 	}
 	return int(hi)
+}
+
+// Has reports whether key holds a set on this shard, without building the
+// registry when none exists yet. It is the presence probe the unified TYPE
+// consults across the collection types: a string value or another collection at
+// key is not a set, so Has reads false for those and leaves the type to the
+// caller's other probes.
+func Has(cx *shard.Ctx, key []byte) bool {
+	if cx.Coll == nil {
+		return false
+	}
+	s, _ := cx.Coll.(*reg).lookup(cx, key)
+	return s != nil
 }
 
 // lookup finds the set for key. present is false when no set exists; wrong is

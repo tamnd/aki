@@ -58,6 +58,19 @@ func registry(cx *shard.Ctx) *reg {
 	return v.(*reg)
 }
 
+// Has reports whether key holds a list on this shard, without building the
+// registry when none exists yet: the presence probe the unified TYPE consults
+// across the collection types. A string value or another collection at key reads
+// false, leaving the type to the caller's other probes.
+func Has(cx *shard.Ctx, key []byte) bool {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return false
+	}
+	l, _ := v.(*reg).lookup(cx, key)
+	return l != nil
+}
+
 // lookup finds the list for key. wrong is true when the key instead holds a
 // value in the string store, which every list command answers with WRONGTYPE.
 // Cross-type collisions with the set and zset registries are not resolved in

@@ -136,6 +136,22 @@ func ResidentBytes(cx *shard.Ctx) uint64 {
 	return 0
 }
 
+// Has reports whether key holds a stream on this shard, without building the
+// registry when none exists yet: the presence probe the unified TYPE consults
+// across the collection types. Reaching the registry through regs.Load rather
+// than registry() also keeps a bare TYPE probe from registering the stream
+// maintainer on a shard that never ran a stream command. A string value or
+// another collection at key reads false, leaving the type to the caller's other
+// probes.
+func Has(cx *shard.Ctx, key []byte) bool {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return false
+	}
+	s, _ := v.(*reg).lookup(cx, key)
+	return s != nil
+}
+
 // lookup finds the stream for key. present is nil when no stream exists; wrong is
 // true when the key instead holds a string value, which every stream command
 // answers with WRONGTYPE. Cross-type collisions with the other collection

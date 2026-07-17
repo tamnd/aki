@@ -9,20 +9,6 @@ import "github.com/tamnd/aki/engine/f3/shard"
 // the fan sub-handlers; a set key is invisible to a multi-key EXISTS or DEL
 // for now, which is recorded as owed, not designed.
 
-// Type answers TYPE key: "set" for a set, "string" for a string-store value,
-// "none" when the key is absent.
-func Type(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	if registry(cx).m[string(args[0])] != nil {
-		r.Status("set")
-		return
-	}
-	if cx.St.Exists(args[0], cx.NowMs) {
-		r.Status("string")
-		return
-	}
-	r.Status("none")
-}
-
 // Exists answers single-key EXISTS: 1 when the key holds a set or a string
 // value, 0 otherwise.
 func Exists(cx *shard.Ctx, args [][]byte, r shard.Reply) {

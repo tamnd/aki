@@ -89,6 +89,18 @@ func (g *reg) next(n int) int {
 	return int(hi)
 }
 
+// Has reports whether key holds a zset on this shard, without building the
+// registry when none exists yet: the presence probe the unified TYPE consults
+// across the collection types. A string value or another collection at key reads
+// false, leaving the type to the caller's other probes.
+func Has(cx *shard.Ctx, key []byte) bool {
+	if cx.ZColl == nil {
+		return false
+	}
+	z, _ := cx.ZColl.(*reg).lookup(cx, key)
+	return z != nil
+}
+
 // lookup finds the zset for key. present is false when no zset exists; wrong is
 // true when the key instead holds a value in the string store, which every zset
 // command answers with WRONGTYPE.
