@@ -215,7 +215,9 @@ flagsLoop:
 	}
 
 	g := registry(cx)
-	z := g.m[string(key)]
+	// See Zadd: GEOADD is a ZADD over an encoded score, so the create funnel drops
+	// an expired zset before building a fresh one with no stale TTL.
+	z := g.live(cx, key)
 	created := false
 	if z == nil {
 		if cx.St.Exists(key, cx.NowMs) {

@@ -179,3 +179,48 @@ func TestExpireSetKey(t *testing.T) {
 	send(t, nc, "TTL", "s")
 	expect(t, br, ":-2\r\n")
 }
+
+// TestExpireZsetKey drives the EXPIRE family over a zset key end to end, the same
+// shape as the set case: the inline deadline reads back through TTL, PERSIST
+// clears it, the flags gate the same way strings do, and a past instant deletes
+// the zset.
+func TestExpireZsetKey(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	send(t, nc, "ZADD", "z", "1", "a", "2", "b")
+	expect(t, br, ":2\r\n")
+	send(t, nc, "TTL", "z")
+	expect(t, br, ":-1\r\n")
+
+	// EXPIRE installs a deadline TTL then reports; the members survive it.
+	send(t, nc, "EXPIRE", "z", "100")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "z")
+	expect(t, br, ":100\r\n")
+	send(t, nc, "ZCARD", "z")
+	expect(t, br, ":2\r\n")
+
+	// GT only raises the deadline; a lower one is refused, a higher one takes.
+	send(t, nc, "EXPIRE", "z", "50", "GT")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "EXPIRE", "z", "300", "GT")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "z")
+	expect(t, br, ":300\r\n")
+
+	// PERSIST clears the deadline, then XX (needs a TTL) refuses.
+	send(t, nc, "PERSIST", "z")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "z")
+	expect(t, br, ":-1\r\n")
+	send(t, nc, "EXPIRE", "z", "100", "XX")
+	expect(t, br, ":0\r\n")
+
+	// A past instant deletes the zset and still returns 1.
+	send(t, nc, "PEXPIREAT", "z", "1000")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "EXISTS", "z")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "TTL", "z")
+	expect(t, br, ":-2\r\n")
+}

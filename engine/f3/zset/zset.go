@@ -73,6 +73,15 @@ type zset struct {
 	// last note instead of rewalking the total. Meaningful only when the registry
 	// accounts (acctOn); zero on a store with no cold tier.
 	acct uint64
+
+	// expireAt is the key's absolute deadline in unix ms, 0 for a zset with no
+	// TTL (spec 2064/f3/16 section 2). The deadline lives inline in the header,
+	// not in a side "expires" dict: a second dict would cost a second htable, a
+	// copy of every volatile key, and a pointer per entry, straight against the
+	// memory bar. It is not counted in residentBytes (a fixed per-zset field, like
+	// acct), so carrying a TTL does not move the cold-tier footprint. The live
+	// funnel drops a zset once cx.NowMs reaches this deadline.
+	expireAt int64
 }
 
 // residentBytes estimates this zset's live resident-byte footprint from its
