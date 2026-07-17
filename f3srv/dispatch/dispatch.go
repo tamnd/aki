@@ -128,6 +128,7 @@ func init() {
 	register("SET", str.Set, 2, -1, true)
 	register("GET", str.Get, 1, 1, true)
 	register("GETDEL", str.Getdel, 1, 1, true)
+	register("GETEX", str.Getex, 1, -1, true)
 	register("GETSET", str.Getset, 2, 2, true)
 	register("SETNX", str.Setnx, 2, 2, true)
 	register("STRLEN", str.Strlen, 1, 1, true)

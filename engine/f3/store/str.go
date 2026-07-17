@@ -287,6 +287,34 @@ func (s *Store) Deadline(key []byte, now int64) (int64, bool) {
 	return s.expireAt(addr), true
 }
 
+// SetExpire sets key's absolute unix-ms deadline to at, or clears it when at is
+// 0, and reports whether the key was live. A record that already carries an
+// expiry slot is updated in place. A slotless record that needs one is rebuilt
+// by re-storing val, the caller's copy of the current value, so the rewrite can
+// hit the arena cap and returns SetString's error; clearing a slotless record
+// is a no-op. A cold record carries no slot, so clearing leaves it cold and
+// setting one goes through the re-store, whose findResident brings it up. The
+// cold-frame address is never read as an arena header because slotCold is
+// checked first.
+func (s *Store) SetExpire(key, val []byte, at, now int64) (bool, error) {
+	h := Hash(key)
+	slot, addr, _ := s.findLive(h, key, now)
+	if addr == 0 {
+		return false, nil
+	}
+	if !slotCold(*slot) && s.recFlags(addr)&flagHasTTL != 0 {
+		s.setExpireAt(addr, at)
+		return true, nil
+	}
+	if at == 0 {
+		return true, nil
+	}
+	if err := s.SetString(key, val, now, at, false); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 // StrLen reports the value's byte length (an int cell's digit count) and
 // presence.
 func (s *Store) StrLen(key []byte, now int64) (int64, bool) {

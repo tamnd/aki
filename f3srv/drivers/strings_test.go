@@ -202,6 +202,69 @@ func TestGenericExpiryRead(t *testing.T) {
 	}
 }
 
+// TestGetex walks GETEX: it returns the value like GET while optionally setting
+// or clearing the deadline in the same step, and errors on a bad option without
+// touching the key.
+func TestGetex(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// A missing key is nil for every form.
+	send(t, nc, "GETEX", "missing")
+	expect(t, br, "$-1\r\n")
+	send(t, nc, "GETEX", "missing", "PERSIST")
+	expect(t, br, "$-1\r\n")
+
+	// No option returns the value and leaves the TTL untouched.
+	send(t, nc, "SET", "k", "hello")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "GETEX", "k")
+	expect(t, br, "$5\r\nhello\r\n")
+	send(t, nc, "TTL", "k")
+	expect(t, br, ":-1\r\n")
+
+	// EX on a slotless key returns the value and adds a deadline, which the
+	// record had to be rebuilt to carry.
+	send(t, nc, "GETEX", "k", "EX", "100")
+	expect(t, br, "$5\r\nhello\r\n")
+	if ttl := readInt(t, nc, br, "TTL", "k"); ttl < 96 || ttl > 100 {
+		t.Fatalf("TTL after GETEX EX = %d, want within (96,100]", ttl)
+	}
+
+	// PERSIST returns the value and clears the deadline in place.
+	send(t, nc, "GETEX", "k", "PERSIST")
+	expect(t, br, "$5\r\nhello\r\n")
+	send(t, nc, "TTL", "k")
+	expect(t, br, ":-1\r\n")
+
+	// PX sets a millisecond deadline; PXAT sets an absolute one and the two
+	// agree on the same key when it is re-armed.
+	send(t, nc, "GETEX", "k", "PX", "100000")
+	expect(t, br, "$5\r\nhello\r\n")
+	if pttl := readInt(t, nc, br, "PTTL", "k"); pttl < 95001 || pttl > 100000 {
+		t.Fatalf("PTTL after GETEX PX = %d, want within (95000,100000]", pttl)
+	}
+
+	// An int-cell value round-trips byte-identical through GETEX.
+	send(t, nc, "SET", "n", "-42")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "GETEX", "n", "EX", "50")
+	expect(t, br, "$3\r\n-42\r\n")
+	if ttl := readInt(t, nc, br, "TTL", "n"); ttl < 46 || ttl > 50 {
+		t.Fatalf("TTL after GETEX EX on int = %d, want within (46,50]", ttl)
+	}
+
+	// A bad expiry and a bad option both error, and neither changes the key.
+	send(t, nc, "GETEX", "k", "EX", "0")
+	expect(t, br, "-ERR invalid expire time in 'getex' command\r\n")
+	send(t, nc, "GETEX", "k", "PERSIST", "EX", "5")
+	expect(t, br, "-ERR syntax error\r\n")
+	send(t, nc, "GETEX", "k", "BOGUS")
+	expect(t, br, "-ERR syntax error\r\n")
+	if pttl := readInt(t, nc, br, "PTTL", "k"); pttl < 95001 || pttl > 100000 {
+		t.Fatalf("PTTL after failed GETEX = %d, want the PX deadline unchanged", pttl)
+	}
+}
+
 // TestSetOptions exercises the NX/XX/GET/KEEPTTL/expiry option matrix against
 // the Redis answers.
 func TestSetOptions(t *testing.T) {
