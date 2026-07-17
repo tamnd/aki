@@ -49,6 +49,8 @@ func opCorpus(t testing.TB) []struct {
 		{"xadd", key, CollDelta{Sub: XAdd{IDMs: 1700000000000, IDSeq: 3, Pairs: []FieldValue{{[]byte("f"), []byte("v")}}}}},
 		{"hexpire", key, CollDelta{Sub: HExpire{AtMs: 1700000000000, Fields: [][]byte{[]byte("f1"), []byte("f2")}}}},
 		{"hpersist", key, CollDelta{Sub: HExpire{AtMs: 0, Fields: [][]byte{[]byte("f1")}}}},
+		{"lrem", key, CollDelta{Sub: LRem{Indices: []uint32{0, 3, 7}}}},
+		{"lins", key, CollDelta{Sub: LIns{Index: 2, Value: []byte("v")}}},
 	}
 }
 
@@ -106,7 +108,7 @@ func TestOpDecodeTyped(t *testing.T) {
 			t.Fatalf("%s: %v", c.name, err)
 		}
 		switch c.name {
-		case "strset", "expire", "collnew", "txn-begin", "txn-end", "hdel", "zrem", "lpop", "rpop", "xadd", "hexpire", "hpersist":
+		case "strset", "expire", "collnew", "txn-begin", "txn-end", "hdel", "zrem", "lpop", "rpop", "xadd", "hexpire", "hpersist", "lrem", "lins":
 			if !reflect.DeepEqual(op, c.op) {
 				t.Fatalf("%s: decoded %#v, want %#v", c.name, op, c.op)
 			}
@@ -196,7 +198,7 @@ func TestOpStructuralRejects(t *testing.T) {
 			t.Fatalf("op kind 0x%02x decoded", kind)
 		}
 	}
-	for _, sub := range []uint8{0x00, 0x0E, 0xFF} {
+	for _, sub := range []uint8{0x00, 0x10, 0xFF} {
 		if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: []byte{sub, 1, 0, 0, 0}}); err == nil {
 			t.Fatalf("colldelta sub-kind 0x%02x decoded", sub)
 		}
@@ -252,8 +254,34 @@ func TestOpSizeRejects(t *testing.T) {
 	if _, err := EncodeOp(0, 1, key, CollDelta{Sub: ZAdd{Entries: []ScoreMember{{Score: math.NaN()}}}}); err == nil {
 		t.Fatal("NaN score encoded")
 	}
+	if _, err := EncodeOp(0, 1, key, CollDelta{Sub: LRem{}}); err == nil {
+		t.Fatal("empty lrem encoded")
+	}
+	if _, err := EncodeOp(0, 1, key, CollDelta{Sub: LRem{Indices: []uint32{3, 3}}}); err == nil {
+		t.Fatal("lrem with a repeated index encoded")
+	}
+	if _, err := EncodeOp(0, 1, key, CollDelta{Sub: LRem{Indices: []uint32{3, 1}}}); err == nil {
+		t.Fatal("lrem with descending indices encoded")
+	}
+	if _, err := EncodeOp(0, 1, key, CollDelta{Sub: LIns{Index: -1, Value: []byte("v")}}); err == nil {
+		t.Fatal("lins with a negative index encoded")
+	}
+	shortRem := binary.LittleEndian.AppendUint32([]byte{SubLRem}, 2)
+	shortRem = binary.LittleEndian.AppendUint32(shortRem, 0)
+	if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: shortRem}); err == nil {
+		t.Fatal("lrem truncated inside its index list decoded")
+	}
+	descRem := binary.LittleEndian.AppendUint32([]byte{SubLRem}, 2)
+	descRem = binary.LittleEndian.AppendUint32(descRem, 3)
+	descRem = binary.LittleEndian.AppendUint32(descRem, 1)
+	if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: descRem}); err == nil {
+		t.Fatal("lrem with descending wire indices decoded")
+	}
+	if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: append([]byte{SubLIns}, make([]byte, 7)...)}); err == nil {
+		t.Fatal("lins truncated at its index decoded")
+	}
 	zero := []byte{0, 0, 0, 0}
-	for _, sub := range []uint8{SubSAdd, SubLPop, SubRPop} {
+	for _, sub := range []uint8{SubSAdd, SubLPop, SubRPop, SubLRem} {
 		if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: append([]byte{sub}, zero...)}); err == nil {
 			t.Fatalf("sub-kind 0x%02x with zero count decoded", sub)
 		}

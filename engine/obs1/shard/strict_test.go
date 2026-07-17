@@ -101,6 +101,39 @@ func (f *fakeLog) ZSetStore(key []byte, delString, hadZSet bool, scores []float6
 	return f.emit(key)
 }
 
+func (f *fakeLog) ListPush(key []byte, created, front bool, values [][]byte) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) ListPop(key []byte, front bool, count int, dropped bool) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) ListSet(key []byte, index int64, value []byte) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) ListTrim(key []byte, dropHead, dropTail int, dropped bool) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) ListRem(key []byte, indices []uint32, dropped bool) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) ListInsert(key []byte, index int64, value []byte) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) ListMove(src, dst []byte, srcFront, dstFront bool, value []byte, srcDropped, dstCreated bool) (uint16, uint64, uint16, uint64, error) {
+	dg, ds, err := f.emit(dst)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	sg, ss, err := f.emit(src)
+	return dg, ds, sg, ss, err
+}
+
 func (f *fakeLog) NotifyCommitted(group uint16, seq uint64, fn func()) {
 	f.pending = append(f.pending, fakeNotify{group: group, seq: seq, fn: fn})
 }

@@ -138,7 +138,7 @@ func TestLmoveOracle(t *testing.T) {
 					"d": append([]string(nil), sd.dst...),
 				}
 				wantMoved, wantOk := lmoveModel(model, "s", "d", dir.srcLeft, dir.dstLeft)
-				gotMoved, ok, wrong := lmove(g, cx, []byte("s"), []byte("d"), dir.srcLeft, dir.dstLeft)
+				gotMoved, ok, wrong, _ := lmove(g, cx, []byte("s"), []byte("d"), dir.srcLeft, dir.dstLeft)
 				if wrong {
 					t.Fatal("unexpected WRONGTYPE")
 				}
@@ -182,7 +182,7 @@ func TestLmoveSameKeyRotation(t *testing.T) {
 				}
 				model := map[string][]string{"k": append([]string(nil), band.vals...)}
 				wantMoved, _ := lmoveModel(model, "k", "k", dir.srcLeft, dir.dstLeft)
-				gotMoved, ok, wrong := lmove(g, cx, []byte("k"), []byte("k"), dir.srcLeft, dir.dstLeft)
+				gotMoved, ok, wrong, _ := lmove(g, cx, []byte("k"), []byte("k"), dir.srcLeft, dir.dstLeft)
 				if wrong || !ok {
 					t.Fatalf("ok=%v wrong=%v, want a move", ok, wrong)
 				}
@@ -205,7 +205,7 @@ func TestLmoveSameKeyRotation(t *testing.T) {
 func TestLmoveMissingSource(t *testing.T) {
 	g, cx := newMoveReg()
 	g.m["d"] = seedList("x", "y")
-	moved, ok, wrong := lmove(g, cx, []byte("missing"), []byte("d"), false, true)
+	moved, ok, wrong, _ := lmove(g, cx, []byte("missing"), []byte("d"), false, true)
 	if wrong {
 		t.Fatal("unexpected WRONGTYPE")
 	}
@@ -223,7 +223,7 @@ func TestLmoveMissingSource(t *testing.T) {
 func TestLmoveDrainsSource(t *testing.T) {
 	g, cx := newMoveReg()
 	g.m["s"] = seedList("only")
-	moved, ok, wrong := lmove(g, cx, []byte("s"), []byte("d"), false, true)
+	moved, ok, wrong, _ := lmove(g, cx, []byte("s"), []byte("d"), false, true)
 	if wrong || !ok || string(moved) != "only" {
 		t.Fatalf("moved %q ok=%v wrong=%v", moved, ok, wrong)
 	}
@@ -241,7 +241,7 @@ func TestLmoveDrainsSource(t *testing.T) {
 func TestLmoveCreatesDestination(t *testing.T) {
 	g, cx := newMoveReg()
 	g.m["s"] = seedList("a", "b", "c")
-	moved, ok, wrong := lmove(g, cx, []byte("s"), []byte("d"), true, true)
+	moved, ok, wrong, _ := lmove(g, cx, []byte("s"), []byte("d"), true, true)
 	if wrong || !ok || string(moved) != "a" {
 		t.Fatalf("moved %q ok=%v wrong=%v", moved, ok, wrong)
 	}
@@ -269,7 +269,7 @@ func TestLmovePromotesDestination(t *testing.T) {
 	}
 	g.m["d"] = dst
 	g.m["s"] = seedList(val) // one more 80-byte element to push across the budget
-	if _, ok, _ := lmove(g, cx, []byte("s"), []byte("d"), false, false); !ok {
+	if _, ok, _, _ := lmove(g, cx, []byte("s"), []byte("d"), false, false); !ok {
 		t.Fatal("expected a move")
 	}
 	if g.m["d"].encoding() != encQuicklist {
@@ -300,7 +300,7 @@ func TestLmoveWrongType(t *testing.T) {
 			t.Fatalf("seed string: %v", err)
 		}
 		g.m["d"] = seedList("1")
-		_, _, wrong := lmove(g, cx, []byte("s"), []byte("d"), false, true)
+		_, _, wrong, _ := lmove(g, cx, []byte("s"), []byte("d"), false, true)
 		if !wrong {
 			t.Fatal("expected WRONGTYPE for a string source")
 		}
@@ -311,7 +311,7 @@ func TestLmoveWrongType(t *testing.T) {
 		if err := cx.St.Set([]byte("d"), []byte("astring")); err != nil {
 			t.Fatalf("seed string: %v", err)
 		}
-		_, _, wrong := lmove(g, cx, []byte("s"), []byte("d"), false, true)
+		_, _, wrong, _ := lmove(g, cx, []byte("s"), []byte("d"), false, true)
 		if !wrong {
 			t.Fatal("expected WRONGTYPE for a string destination")
 		}
@@ -325,7 +325,7 @@ func TestLmoveWrongType(t *testing.T) {
 		}
 		// Redis stops at the missing source and replies the null bulk, never
 		// checking the destination type, so this is not a WRONGTYPE.
-		_, ok, wrong := lmove(g, cx, []byte("s"), []byte("d"), false, true)
+		_, ok, wrong, _ := lmove(g, cx, []byte("s"), []byte("d"), false, true)
 		if wrong {
 			t.Fatal("a missing source must not report WRONGTYPE on the destination")
 		}

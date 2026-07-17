@@ -50,6 +50,7 @@ func pushCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front, create bool) {
 		r.Err(wrongType)
 		return
 	}
+	created := false
 	if l == nil {
 		if !create {
 			r.Int(0)
@@ -57,6 +58,7 @@ func pushCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front, create bool) {
 		}
 		l = newList()
 		g.m[string(key)] = l
+		created = true
 	}
 	for _, v := range args[1:] {
 		if front {
@@ -64,6 +66,16 @@ func pushCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front, create bool) {
 		} else {
 			l.pushBack(v)
 		}
+	}
+	// The push frames before any waiter is served, so the WAL order is the
+	// command order: the push, then the serves' pops. A refused emission
+	// fails the command and skips the serves; the elements stay in the
+	// list, so a parked client just waits for the next push, liveness not
+	// correctness.
+	if err := cx.LogListPush(key, created, front, args[1:]); err != nil {
+		g.note(l)
+		r.Err(err.Error())
+		return
 	}
 	// The reply is the length after the push, before any blocked client is
 	// served: Redis signals the key ready and returns the pushed length, then
@@ -111,10 +123,15 @@ func popCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 			return
 		}
 		v := popOne(l, front)
-		if l.length() == 0 {
+		dropped := l.length() == 0
+		if dropped {
 			g.drop(key)
 		} else {
 			g.note(l)
+		}
+		if err := cx.LogListPop(key, front, 1, dropped); err != nil {
+			r.Err(err.Error())
+			return
 		}
 		r.Bulk(v)
 		return
@@ -138,12 +155,19 @@ func popCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 		out = resp.AppendBulk(out, popOne(l, front))
 	}
 	cx.Aux = out
-	r.Raw(out)
-	if l.length() == 0 {
+	dropped := l.length() == 0
+	if dropped {
 		g.drop(key)
 	} else {
 		g.note(l)
 	}
+	if popped > 0 {
+		if err := cx.LogListPop(key, front, popped, dropped); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
+	r.Raw(out)
 }
 
 func popOne(l *list, front bool) []byte {
@@ -221,6 +245,12 @@ func Lset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// LSET can never empty a list, so the key always survives; note its new
 	// footprint (an element rewrite can grow or shrink the packed bytes).
 	g.note(l)
+	// The frame carries the resolved non-negative index, so replay never
+	// re-normalizes a signed argument.
+	if err := cx.LogListSet(args[0], int64(i), args[2]); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	r.Status("OK")
 }
 
@@ -273,16 +303,30 @@ func Ltrim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Status("OK")
 		return
 	}
-	lo, hi, ok := clampRange(int(start), int(stop), l.length())
+	n := l.length()
+	var dropHead, dropTail int
+	cleared := false
+	lo, hi, ok := clampRange(int(start), int(stop), n)
 	if !ok {
 		l.trim(1, 0) // empty range, clears the list
+		cleared = true
 	} else {
 		l.trim(lo, hi)
+		dropHead, dropTail = lo, n-1-hi
 	}
 	if l.length() == 0 {
 		g.drop(key)
 	} else {
 		g.note(l)
+	}
+	// LTRIM frames as the end cuts it is, or one bare colldrop when the
+	// clamp-fail form cleared the list; a trim that kept everything
+	// frames nothing.
+	if cleared || dropHead > 0 || dropTail > 0 {
+		if err := cx.LogListTrim(key, dropHead, dropTail, cleared); err != nil {
+			r.Err(err.Error())
+			return
+		}
 	}
 	r.Status("OK")
 }
@@ -306,11 +350,41 @@ func Lrem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Int(0)
 		return
 	}
+	// The frame wants the removed positions in the pre-removal list, so a
+	// logged runtime scans them first with the LPOS walk under the same
+	// count-sign rule remove applies: a positive count takes the first
+	// matches head to tail, a negative one tail to head (reversed to
+	// ascending for the frame), zero takes them all.
+	logging := cx.Log != nil
+	var indices []uint32
+	if logging {
+		rank, limit := 1, int(count)
+		if count < 0 {
+			rank, limit = -1, -limit
+		}
+		hits := lposScan(l, args[2], rank, limit, 0)
+		if rank < 0 {
+			for i, j := 0, len(hits)-1; i < j; i, j = i+1, j-1 {
+				hits[i], hits[j] = hits[j], hits[i]
+			}
+		}
+		indices = make([]uint32, len(hits))
+		for i, h := range hits {
+			indices[i] = uint32(h)
+		}
+	}
 	removed := l.remove(int(count), args[2])
-	if l.length() == 0 {
+	dropped := l.length() == 0
+	if dropped {
 		g.drop(key)
 	} else if removed > 0 {
 		g.note(l)
+	}
+	if logging && removed > 0 {
+		if err := cx.LogListRem(key, indices, dropped); err != nil {
+			r.Err(err.Error())
+			return
+		}
 	}
 	r.Int(int64(removed))
 }
@@ -339,6 +413,16 @@ func Linsert(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Int(0)
 		return
 	}
+	// The frame wants the resolved position, so a logged runtime finds the
+	// first pivot match before the insert shifts it: the value lands at the
+	// match for BEFORE and one past it for AFTER.
+	logging := cx.Log != nil
+	pos := -1
+	if logging {
+		if hits := lposScan(l, args[2], 1, 1, 0); len(hits) != 0 {
+			pos = hits[0]
+		}
+	}
 	if !l.insert(before, args[2], args[3]) {
 		r.Int(-1)
 		return
@@ -347,6 +431,16 @@ func Linsert(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// survives with a grown footprint. A pivot-absent insert returned above without
 	// mutating, so it posts no delta.
 	g.note(l)
+	if logging {
+		at := pos
+		if !before {
+			at = pos + 1
+		}
+		if err := cx.LogListInsert(args[0], int64(at), args[3]); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
 	r.Int(int64(l.length()))
 }
 

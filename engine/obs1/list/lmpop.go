@@ -32,11 +32,11 @@ import (
 // Each popped element is appended to dst as it leaves the list, so it is copied
 // into the reply before the next pop can overwrite the storage it aliased, the
 // same one-pass shape ZMPOP builds.
-func lmpop(g *reg, cx *shard.Ctx, dst []byte, keys [][]byte, front bool, count int) (out []byte, ok, wrong bool) {
+func lmpop(g *reg, cx *shard.Ctx, dst []byte, keys [][]byte, front bool, count int) (out []byte, ok, wrong bool, err error) {
 	for _, key := range keys {
 		l, w := g.lookup(cx, key)
 		if w {
-			return dst, false, true
+			return dst, false, true, nil
 		}
 		if l == nil || l.length() == 0 {
 			continue
@@ -51,14 +51,18 @@ func lmpop(g *reg, cx *shard.Ctx, dst []byte, keys [][]byte, front bool, count i
 		for i := 0; i < npop; i++ {
 			out = resp.AppendBulk(out, popOne(l, front))
 		}
-		if l.length() == 0 {
+		dropped := l.length() == 0
+		if dropped {
 			g.drop(key)
 		} else {
 			g.note(l)
 		}
-		return out, true, false
+		if err := cx.LogListPop(key, front, npop, dropped); err != nil {
+			return dst, false, false, err
+		}
+		return out, true, false, nil
 	}
-	return dst, false, false
+	return dst, false, false, nil
 }
 
 // parseLmpopTail parses the numkeys/keys/direction/COUNT tail shared by LMPOP and
@@ -124,9 +128,13 @@ func Lmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	g := registry(cx)
-	out, ok, wrong := lmpop(g, cx, cx.Aux[:0], keys, front, count)
+	out, ok, wrong, err := lmpop(g, cx, cx.Aux[:0], keys, front, count)
 	if wrong {
 		r.Err(wrongType)
+		return
+	}
+	if err != nil {
+		r.Err(err.Error())
 		return
 	}
 	if !ok {

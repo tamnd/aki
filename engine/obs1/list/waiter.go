@@ -310,12 +310,22 @@ func serveKey(cx *shard.Ctx, g *reg, key []byte, l *list) {
 			conn := nd.conn
 			seq := nd.seq
 			bc := nd.claim
-			rep := appendReply(nil, key, popOne(l, nd.front))
+			front := nd.front
+			rep := appendReply(nil, key, popOne(l, front))
+			// The serve frames its pop and the waiter's reply completes under
+			// the waiter's own ack mode, not the pusher's: CompleteServed
+			// parks a strict waiter's reply on the marks. A refused emission
+			// fails this waiter with the error text and the loop moves on.
+			marks, lerr := cx.LogListPopServe(key, front, 1, l.length() == 0)
 			g.unlinkAll(cx, i)
 			if bc != nil {
 				bc.fireCancels(cx, cx.ShardID())
 			}
-			conn.CompleteBlocked(seq, rep)
+			if lerr != nil {
+				conn.CompleteBlocked(seq, resp.AppendError(nil, lerr.Error()))
+				continue
+			}
+			cx.CompleteServed(conn, seq, rep, marks)
 		case kindMpop:
 			if nd.claim != nil && !nd.claim.tryClaim() {
 				g.unlinkAll(cx, i)
@@ -335,11 +345,16 @@ func serveKey(cx *shard.Ctx, g *reg, key []byte, l *list) {
 			for j := 0; j < npop; j++ {
 				rep = resp.AppendBulk(rep, popOne(l, front))
 			}
+			marks, lerr := cx.LogListPopServe(key, front, npop, l.length() == 0)
 			g.unlinkAll(cx, i)
 			if bc != nil {
 				bc.fireCancels(cx, cx.ShardID())
 			}
-			conn.CompleteBlocked(seq, rep)
+			if lerr != nil {
+				conn.CompleteBlocked(seq, resp.AppendError(nil, lerr.Error()))
+				continue
+			}
+			cx.CompleteServed(conn, seq, rep, marks)
 		default: // kindMove
 			if serveMoveRemote(cx, g, key, i, nd) {
 				// The destination lives on another shard: a coordinator is now in
@@ -419,16 +434,25 @@ func serveMove(cx *shard.Ctx, g *reg, key []byte, l *list, i uint32, nd *waitNod
 		dst = d
 	}
 	elem := cloneBytes(popOne(l, front))
+	created := false
 	if self {
 		pushEnd(l, elem, dstLeft)
 	} else {
 		if dst == nil {
 			dst = newList()
 			g.m[dstKey] = dst
+			created = true
 		}
 		pushEnd(dst, elem, dstLeft)
 		g.ready = append(g.ready, dstKey)
 	}
+	// The served move frames like the immediate one and the reply completes
+	// under this waiter's own ack mode through CompleteServed.
+	marks, lerr := cx.LogListMoveServe(key, []byte(dstKey), front, dstLeft, elem, !self && l.length() == 0, created)
 	g.unlinkAll(cx, i)
-	conn.CompleteBlocked(seq, resp.AppendBulk(nil, elem))
+	if lerr != nil {
+		conn.CompleteBlocked(seq, resp.AppendError(nil, lerr.Error()))
+		return
+	}
+	cx.CompleteServed(conn, seq, resp.AppendBulk(nil, elem), marks)
 }

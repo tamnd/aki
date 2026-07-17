@@ -49,6 +49,7 @@ func peekEnd(l *list, left bool) []byte {
 func LmoveCross(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) []byte {
 	var srcWrong, dstWrong, have, moved bool
 	var elem []byte
+	var logErr error
 	t.Do(src, func(cx *shard.Ctx) {
 		s, w := registry(cx).lookup(cx, src)
 		if w {
@@ -86,11 +87,31 @@ func LmoveCross(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) []byte {
 			// the phantom-hole analog the P9/L15 lesson warns against (lmove.go). The
 			// destination is created on first insert exactly as the push path does; a
 			// list is always born listpack and only the byte budget moves it native.
+			created := false
 			if d == nil {
 				d = newList()
 				g.m[string(dst)] = d
+				created = true
 			}
 			pushEnd(d, elem, dstLeft)
+			// Each hop frames its own side, the disclosed cross non-atomicity:
+			// the destination push here, the source pop in the final hop, so a
+			// tail cut between them duplicates the element rather than losing
+			// it. Tier-two hops emit relaxed-only (the intent Ctx carries no
+			// conn), so the frames never gate the reply. A refused push
+			// emission skips the serves, the pushCmd rule, and suppresses the
+			// source pop frame: replay then keeps the element in the source,
+			// duplication not loss.
+			if err := cx.LogListPush(dst, created, dstLeft, [][]byte{elem}); err != nil {
+				logErr = err
+				if d.length() == 0 {
+					g.drop(dst)
+				} else {
+					g.note(d)
+				}
+				moved = true
+				return
+			}
 			// Wake any client blocked on the destination, exactly as the co-located
 			// lmove distinct-key branch (lmove.go) and the blocking cross move
 			// (blockmovecross.go) do. This runs on the dst owner under the barrier, so
@@ -125,16 +146,24 @@ func LmoveCross(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) []byte {
 			// exactly as the co-located lmove deletes it (Redis deletes an emptied
 			// list).
 			popEnd(s, srcLeft)
-			if s.length() == 0 {
+			dropped := s.length() == 0
+			if dropped {
 				g.drop(src)
 			} else {
 				g.note(s)
+			}
+			if logErr == nil {
+				if err := cx.LogListPop(src, srcLeft, 1, dropped); err != nil {
+					logErr = err
+				}
 			}
 		})
 	}
 	switch {
 	case srcWrong || dstWrong:
 		return resp.AppendError(nil, wrongType)
+	case logErr != nil:
+		return resp.AppendError(nil, logErr.Error())
 	case moved:
 		return resp.AppendBulk(nil, elem)
 	default:

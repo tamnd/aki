@@ -1,6 +1,9 @@
 package shard
 
-import "errors"
+import (
+	"errors"
+	"sync/atomic"
+)
 
 // The durability seam (spec 2064/obs1 doc 04 sections 1 and 3.1). A write
 // handler applies to RAM through the store as before, then emits the op's
@@ -121,6 +124,53 @@ type WriteLog interface {
 	// caller gates the no-effect case, an empty result over an absent
 	// destination.
 	ZSetStore(key []byte, delString, hadZSet bool, scores []float64, members [][]byte) (group uint16, seq uint64, err error)
+
+	// ListPush records pushed list values as one sided push (front picks
+	// LPUSH's side), preceded by a collnew when the push created the list.
+	// Post-decision: LPUSHX and RPUSHX emit only a push that happened (the
+	// caller gates the miss).
+	ListPush(key []byte, created, front bool, values [][]byte) (group uint16, seq uint64, err error)
+
+	// ListPop records count removals from one end as a sided pop, followed
+	// by a colldrop when the pop emptied the list. The frame carries only
+	// the count: replay knows the elements it removes, so the values the
+	// client saw never hit the WAL. A blocking serve lands here as the pop
+	// it is.
+	ListPop(key []byte, front bool, count int, dropped bool) (group uint16, seq uint64, err error)
+
+	// ListSet records an element overwrite as one lset at the resolved
+	// non-negative index; the handler normalizes a negative argument before
+	// emitting.
+	ListSet(key []byte, index int64, value []byte) (group uint16, seq uint64, err error)
+
+	// ListTrim records LTRIM as the end cuts it is: an lpop of dropHead
+	// and an rpop of dropTail as one run, or one bare colldrop when the
+	// trim cleared the list (dropped, the clamp-fail form, in which case
+	// the counts are ignored). The caller gates the no-effect trim.
+	ListTrim(key []byte, dropHead, dropTail int, dropped bool) (group uint16, seq uint64, err error)
+
+	// ListRem records LREM's removals as one lrem of the removed
+	// positions, strictly ascending in the pre-removal list, followed by a
+	// colldrop when the removal emptied it. Positions rather than the
+	// value-count pair because replay applies overlay tombstones by
+	// position (doc 08) and never rescans cold chunks for matches.
+	ListRem(key []byte, indices []uint32, dropped bool) (group uint16, seq uint64, err error)
+
+	// ListInsert records LINSERT as one lins carrying the resolved
+	// position the value holds in the resulting list; the pivot search
+	// happened in the handler and never hits the WAL.
+	ListInsert(key []byte, index int64, value []byte) (group uint16, seq uint64, err error)
+
+	// ListMove records LMOVE's two-key effect: a sided push on dst, a
+	// sided pop on src. The same-key rotation is one run of pop then push
+	// in command order. Distinct keys in one group ride one atomic run
+	// destination first with srcSeq 0, the dst mark covering the run;
+	// otherwise the destination run buffers first, then the source run, so
+	// a tail cut between them duplicates the value rather than losing it,
+	// the disclosed cross-group non-atomicity. A zero seq means that side
+	// buffered nothing; a non-zero dstSeq rides even an errored call so
+	// the caller marks what did land.
+	ListMove(src, dst []byte, srcFront, dstFront bool, value []byte, srcDropped, dstCreated bool) (dstGroup uint16, dstSeq uint64, srcGroup uint16, srcSeq uint64, err error)
 
 	// NotifyCommitted runs fn once a chain commit covering the marked
 	// frame has landed and folded live (doc 04 section 3.2): it registers
@@ -317,6 +367,161 @@ func (cx *Ctx) LogZSetStore(key []byte, delString, hadZSet bool, scores []float6
 	}
 	cx.noteMark(group, seq)
 	return nil
+}
+
+// LogListPush emits a list push's effect frames when a log is wired, and
+// is free when none is. See WriteLog.ListPush for the contract.
+func (cx *Ctx) LogListPush(key []byte, created, front bool, values [][]byte) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.ListPush(key, created, front, values)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogListPop emits a list pop's effect frames when a log is wired, and is
+// free when none is. See WriteLog.ListPop for the contract.
+func (cx *Ctx) LogListPop(key []byte, front bool, count int, dropped bool) error {
+	_, err := cx.LogListPopServe(key, front, count, dropped)
+	return err
+}
+
+// LogListPopServe is LogListPop returning the marks the pop drew, for a
+// blocking serve whose reply completes on the waiter's own connection: a
+// strict waiter's reply must wait for these frames through CompleteServed,
+// and the marks also land on the running command's Ctx, the uniform rule
+// that a pusher's strict reply covers every frame its execution emitted.
+func (cx *Ctx) LogListPopServe(key []byte, front bool, count int, dropped bool) ([]WALMark, error) {
+	if cx.Log == nil {
+		return nil, nil
+	}
+	group, seq, err := cx.Log.ListPop(key, front, count, dropped)
+	if err != nil {
+		return nil, err
+	}
+	cx.noteMark(group, seq)
+	return []WALMark{{Group: group, Seq: seq}}, nil
+}
+
+// LogListSet emits an element overwrite's effect frame when a log is
+// wired, and is free when none is. See WriteLog.ListSet for the contract.
+func (cx *Ctx) LogListSet(key []byte, index int64, value []byte) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.ListSet(key, index, value)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogListTrim emits a trim's effect frames when a log is wired, and is
+// free when none is. See WriteLog.ListTrim for the contract.
+func (cx *Ctx) LogListTrim(key []byte, dropHead, dropTail int, dropped bool) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.ListTrim(key, dropHead, dropTail, dropped)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogListRem emits LREM's effect frames when a log is wired, and is free
+// when none is. See WriteLog.ListRem for the contract.
+func (cx *Ctx) LogListRem(key []byte, indices []uint32, dropped bool) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.ListRem(key, indices, dropped)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogListInsert emits LINSERT's effect frame when a log is wired, and is
+// free when none is. See WriteLog.ListInsert for the contract.
+func (cx *Ctx) LogListInsert(key []byte, index int64, value []byte) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.ListInsert(key, index, value)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogListMove emits LMOVE's two-key effect when a log is wired, and is
+// free when none is. See WriteLog.ListMove for the contract.
+func (cx *Ctx) LogListMove(src, dst []byte, srcFront, dstFront bool, value []byte, srcDropped, dstCreated bool) error {
+	_, err := cx.LogListMoveServe(src, dst, srcFront, dstFront, value, srcDropped, dstCreated)
+	return err
+}
+
+// LogListMoveServe is LogListMove returning the marks the move drew, the
+// serve-side twin of LogListPopServe for a waiter completed through a
+// move. Marks land per side that buffered, even on an error, the
+// LogSetMove rule.
+func (cx *Ctx) LogListMoveServe(src, dst []byte, srcFront, dstFront bool, value []byte, srcDropped, dstCreated bool) ([]WALMark, error) {
+	if cx.Log == nil {
+		return nil, nil
+	}
+	dg, ds, sg, ss, err := cx.Log.ListMove(src, dst, srcFront, dstFront, value, srcDropped, dstCreated)
+	var marks []WALMark
+	if ds != 0 {
+		cx.noteMark(dg, ds)
+		marks = append(marks, WALMark{Group: dg, Seq: ds})
+	}
+	if ss != 0 {
+		cx.noteMark(sg, ss)
+		marks = append(marks, WALMark{Group: sg, Seq: ss})
+	}
+	return marks, err
+}
+
+// CompleteServed completes a served waiter's parked reply under the
+// waiter's own ack mode: the command that woke it runs on some other
+// connection's Ctx, so the pusher's marks say nothing about how strictly
+// this reply may land. A relaxed waiter, an unlogged runtime, or a serve
+// that framed nothing completes immediately; a strict waiter's reply
+// parks on every mark through NotifyCommitted and lands when the last
+// covering commit folds live. The reply bytes are copied before parking
+// because serve loops reuse their buffers; the waiter's timer is already
+// cancelled by the time a serve completes, so the deferred completion
+// cannot race a timeout.
+func (cx *Ctx) CompleteServed(conn *Conn, seq uint32, rep []byte, marks []WALMark) {
+	if len(marks) == 0 || cx.Log == nil || !conn.strictAck.Load() {
+		conn.CompleteBlocked(seq, rep)
+		return
+	}
+	held := append([]byte(nil), rep...)
+	if len(marks) == 1 {
+		cx.Log.NotifyCommitted(marks[0].Group, marks[0].Seq, func() {
+			conn.CompleteBlocked(seq, held)
+		})
+		return
+	}
+	pending := new(atomic.Int32)
+	pending.Store(int32(len(marks)))
+	for _, m := range marks {
+		cx.Log.NotifyCommitted(m.Group, m.Seq, func() {
+			if pending.Add(-1) == 0 {
+				conn.CompleteBlocked(seq, held)
+			}
+		})
+	}
 }
 
 // LogStrReadBack frames a write whose resulting string lives only in the

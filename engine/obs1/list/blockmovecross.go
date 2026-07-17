@@ -63,6 +63,7 @@ func moveCrossOnce(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) (rep []
 		return nil, true
 	}
 	var dstWrong bool
+	var logErr error
 	t.Do(dst, func(cx *shard.Ctx) {
 		g := registry(cx)
 		d, w := g.lookup(cx, dst)
@@ -70,11 +71,26 @@ func moveCrossOnce(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) (rep []
 			dstWrong = true
 			return
 		}
+		created := false
 		if d == nil {
 			d = newList()
 			g.m[string(dst)] = d
+			created = true
 		}
 		pushEnd(d, elem, dstLeft)
+		// Each hop frames its own side, the LmoveCross rule: a tail cut
+		// between the runs duplicates the element rather than losing it. A
+		// refused push emission skips the serves and suppresses the source
+		// pop frame, so replay keeps the element in the source.
+		if err := cx.LogListPush(dst, created, dstLeft, [][]byte{elem}); err != nil {
+			logErr = err
+			if d.length() == 0 {
+				g.drop(dst)
+			} else {
+				g.note(d)
+			}
+			return
+		}
 		serveWaiters(cx, g, dst, d)
 		// A serve that consumed the moved element leaves the destination empty, so
 		// drop it, matching the co-located lmove (lmove.go) so EXISTS/TYPE/OBJECT
@@ -93,12 +109,21 @@ func moveCrossOnce(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) (rep []
 		g := registry(cx)
 		s, _ := g.lookup(cx, src)
 		popEnd(s, srcLeft)
-		if s.length() == 0 {
+		dropped := s.length() == 0
+		if dropped {
 			g.drop(src)
 		} else {
 			g.note(s)
 		}
+		if logErr == nil {
+			if err := cx.LogListPop(src, srcLeft, 1, dropped); err != nil {
+				logErr = err
+			}
+		}
 	})
+	if logErr != nil {
+		return resp.AppendError(nil, logErr.Error()), false
+	}
 	return resp.AppendBulk(nil, elem), false
 }
 
@@ -163,7 +188,13 @@ func blockMoveCross(t *shard.Txn, conn *shard.Conn, seq uint32, src, dst []byte,
 // the final source hop pops, unlinks the node, and re-drives the source so the next
 // waiter behind this one is served. head is the node index on the source owner;
 // deadline is its stored timeout instant, re-armed if the source drained in the
-// window between the serve decision and this acquisition.
+// window between the serve decision and this acquisition. Each hop frames its own
+// side, moveCrossOnce's rule, but here the waiter's reply must gate on both frames
+// under strict ack, so the hops capture their marks off cx.Log directly (the
+// coordinator's Ctx carries no conn, so the plain helpers would discard them) and
+// the final source hop completes through CompleteServed instead of a bare
+// CompleteBlocked after release. The timer was cancelled at the serve decision, so
+// a deferred completion cannot race a firing timeout.
 func runMoveCross(rt *shard.Runtime, src, dst []byte, head uint32, srcLeft, dstLeft bool, deadline int64) {
 	tx := rt.Begin([][]byte{src, dst})
 	tx.Acquire()
@@ -203,6 +234,8 @@ func runMoveCross(rt *shard.Runtime, src, dst []byte, head uint32, srcLeft, dstL
 	}
 
 	var dstWrong bool
+	var logErr error
+	var marks []shard.WALMark
 	tx.Do(dst, func(cx *shard.Ctx) {
 		g := registry(cx)
 		d, w := g.lookup(cx, dst)
@@ -210,11 +243,27 @@ func runMoveCross(rt *shard.Runtime, src, dst []byte, head uint32, srcLeft, dstL
 			dstWrong = true
 			return
 		}
+		created := false
 		if d == nil {
 			d = newList()
 			g.m[string(dst)] = d
+			created = true
 		}
 		pushEnd(d, elem, dstLeft)
+		// Frame the push before the serves so a waiter consuming this element
+		// appends its pop behind it, and capture the mark for the parked
+		// reply's strict gate. A refused emission skips the serves and
+		// suppresses the source pop frame, so replay keeps the element in the
+		// source, duplication not loss.
+		if cx.Log != nil {
+			group, fseq, err := cx.Log.ListPush(dst, created, dstLeft, [][]byte{elem})
+			if err != nil {
+				logErr = err
+				g.note(d)
+				return
+			}
+			marks = append(marks, shard.WALMark{Group: group, Seq: fseq})
+		}
 		serveWaiters(cx, g, dst, d)
 		// A serve that consumed the moved element leaves the destination empty, so
 		// drop it, matching the co-located lmove (lmove.go) so EXISTS/TYPE/OBJECT
@@ -227,22 +276,35 @@ func runMoveCross(rt *shard.Runtime, src, dst []byte, head uint32, srcLeft, dstL
 		}
 	})
 
-	var rep []byte
 	tx.Do(src, func(cx *shard.Ctx) {
 		g := registry(cx)
 		if dstWrong {
 			// A wrong-typed destination fails the client and leaves the source element
-			// in place, exactly as serveMove does at the co-located serve.
+			// in place, exactly as serveMove does at the co-located serve. Nothing was
+			// framed, so the reply completes immediately.
 			g.unlinkAll(cx, head)
-			rep = resp.AppendError(nil, wrongType)
+			conn.CompleteBlocked(seq, resp.AppendError(nil, wrongType))
 		} else {
 			s, _ := g.lookup(cx, src)
 			popEnd(s, srcLeft)
-			if s.length() == 0 {
+			dropped := s.length() == 0
+			if dropped {
 				g.drop(src)
 			}
+			if logErr == nil && cx.Log != nil {
+				group, fseq, err := cx.Log.ListPop(src, srcLeft, 1, dropped)
+				if err != nil {
+					logErr = err
+				} else {
+					marks = append(marks, shard.WALMark{Group: group, Seq: fseq})
+				}
+			}
 			g.unlinkAll(cx, head)
-			rep = resp.AppendBulk(nil, elem)
+			if logErr != nil {
+				conn.CompleteBlocked(seq, resp.AppendError(nil, logErr.Error()))
+			} else {
+				cx.CompleteServed(conn, seq, resp.AppendBulk(nil, elem), marks)
+			}
 		}
 		if s, _ := g.lookup(cx, src); s != nil && s.length() > 0 {
 			// The served head is gone; drive the next waiter behind it off whatever the
@@ -259,5 +321,4 @@ func runMoveCross(rt *shard.Runtime, src, dst []byte, head uint32, srcLeft, dstL
 		}
 	})
 	tx.Release()
-	conn.CompleteBlocked(seq, rep)
 }

@@ -57,10 +57,10 @@ import (
 // wrong-typed destination behind a missing source is never reported (Redis
 // replies nil there), and whenever a move actually happens both types were
 // validated before any mutation, so a wrong-typed pair never half-moves.
-func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) (moved []byte, ok, wrong bool) {
+func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) (moved []byte, ok, wrong bool, err error) {
 	src, w := g.lookup(cx, srcKey)
 	if w {
-		return nil, false, true
+		return nil, false, true, nil
 	}
 	// A missing or empty source moves nothing and replies the null bulk. Redis
 	// stops here before it looks at the destination, so the destination type is
@@ -68,11 +68,11 @@ func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) 
 	// (an emptied list is dropped from the registry), but the length guard mirrors
 	// Redis's defensive branch.
 	if src == nil || src.length() == 0 {
-		return nil, false, false
+		return nil, false, false, nil
 	}
 	dst, w := g.lookup(cx, dstKey)
 	if w {
-		return nil, false, true
+		return nil, false, true, nil
 	}
 	// The popped bytes alias the source's internal chunk storage, which the push
 	// can overwrite (the same-key case pushes back onto this very blob) or a
@@ -87,15 +87,38 @@ func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) 
 		// One list object rotated in place: it survives with the same element count
 		// but a possibly changed byte layout, so note its footprint.
 		g.note(src)
-		return v, true, false
+		if err := cx.LogListMove(srcKey, dstKey, srcLeft, dstLeft, v, false, false); err != nil {
+			return nil, false, false, err
+		}
+		return v, true, false, nil
 	}
 	// Create the destination on first insert exactly as the push path does; a list
 	// is always born listpack and only the byte budget moves it to the native band.
+	created := false
 	if dst == nil {
 		dst = newList()
 		g.m[string(dstKey)] = dst
+		created = true
 	}
 	pushEnd(dst, v, dstLeft)
+	// The move frames before any destination waiter is served, the pushCmd
+	// order rule: the WAL sees the move, then the serves' pops. A refused
+	// emission fails the command with the element already moved in RAM; the
+	// reply is the error and the frames that did buffer are marked, the
+	// owner-never-acks-what-it-could-not-frame rule.
+	if err := cx.LogListMove(srcKey, dstKey, srcLeft, dstLeft, v, src.length() == 0, created); err != nil {
+		if dst.length() == 0 {
+			g.drop(dstKey)
+		} else {
+			g.note(dst)
+		}
+		if src.length() == 0 {
+			g.drop(srcKey)
+		} else {
+			g.note(src)
+		}
+		return nil, false, false, err
+	}
 	// The push made the destination non-empty, so a BLPOP/BLMPOP/BLMOVE-source
 	// client blocked on it is now servable: signal it before the source drop, the
 	// same ready-signal Redis raises on an LMOVE destination. This is what turns a
@@ -125,7 +148,7 @@ func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) 
 	} else {
 		g.note(src)
 	}
-	return v, true, false
+	return v, true, false, nil
 }
 
 // popEnd pops the head when left is true and the tail otherwise. The list must
@@ -164,9 +187,13 @@ func parseDir(tok []byte) (left, ok bool) {
 // the null bulk when nothing moved, or the moved element as a bulk string.
 func moveReply(cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool, r shard.Reply) {
 	g := registry(cx)
-	moved, ok, wrong := lmove(g, cx, srcKey, dstKey, srcLeft, dstLeft)
+	moved, ok, wrong, err := lmove(g, cx, srcKey, dstKey, srcLeft, dstLeft)
 	if wrong {
 		r.Err(wrongType)
+		return
+	}
+	if err != nil {
+		r.Err(err.Error())
 		return
 	}
 	if !ok {

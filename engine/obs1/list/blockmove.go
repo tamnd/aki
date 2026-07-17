@@ -59,9 +59,13 @@ func blmoveDir(cx *shard.Ctx, src, dst []byte, srcLeft, dstLeft bool, timeoutArg
 		return
 	}
 	g := registry(cx)
-	moved, ok, wrong := lmove(g, cx, src, dst, srcLeft, dstLeft)
+	moved, ok, wrong, err := lmove(g, cx, src, dst, srcLeft, dstLeft)
 	if wrong {
 		r.Err(wrongType)
+		return
+	}
+	if err != nil {
+		r.Err(err.Error())
 		return
 	}
 	if ok {
@@ -102,9 +106,13 @@ func Blmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	g := registry(cx)
-	out, ok, wrong := lmpop(g, cx, cx.Aux[:0], keys, front, count)
+	out, ok, wrong, err := lmpop(g, cx, cx.Aux[:0], keys, front, count)
 	if wrong {
 		r.Err(wrongType)
+		return
+	}
+	if err != nil {
+		r.Err(err.Error())
 		return
 	}
 	if ok {

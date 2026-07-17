@@ -121,7 +121,7 @@ func TestLmpopOracle(t *testing.T) {
 // runLmpop drives the core and decodes its reply into the chosen key and the
 // popped elements, so a test can compare against the model without touching RESP.
 func runLmpop(g *reg, cx *shard.Ctx, keys [][]byte, front bool, count int) (key string, popped []string, ok, wrong bool) {
-	out, ok, wrong := lmpop(g, cx, nil, keys, front, count)
+	out, ok, wrong, _ := lmpop(g, cx, nil, keys, front, count)
 	if !ok || wrong {
 		return "", nil, ok, wrong
 	}
@@ -174,7 +174,7 @@ func TestLmpopDropsEmptiedKey(t *testing.T) {
 		t.Run(band.name, func(t *testing.T) {
 			g, cx := newMoveReg()
 			g.m["k"] = seedList(band.seed...)
-			_, ok, wrong := lmpop(g, cx, nil, [][]byte{[]byte("k")}, true, len(band.seed))
+			_, ok, wrong, _ := lmpop(g, cx, nil, [][]byte{[]byte("k")}, true, len(band.seed))
 			if !ok || wrong {
 				t.Fatalf("ok=%v wrong=%v, want a full pop", ok, wrong)
 			}
@@ -198,7 +198,7 @@ func TestLmpopWrongType(t *testing.T) {
 			t.Fatalf("seed string: %v", err)
 		}
 		g.m["b"] = seedList("x")
-		_, _, wrong := lmpop(g, cx, nil, [][]byte{[]byte("s"), []byte("b")}, true, 1)
+		_, _, wrong, _ := lmpop(g, cx, nil, [][]byte{[]byte("s"), []byte("b")}, true, 1)
 		if !wrong {
 			t.Fatal("expected WRONGTYPE for a string probed first")
 		}

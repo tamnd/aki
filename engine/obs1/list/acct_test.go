@@ -200,7 +200,7 @@ func TestResidentAccountingMovePath(t *testing.T) {
 	wantExact(t, g)
 
 	// LMOVE src dst RIGHT LEFT: pop the source tail, push the destination head.
-	if _, ok, wrong := lmove(g, cx, []byte("src"), []byte("dst"), false, true); !ok || wrong {
+	if _, ok, wrong, _ := lmove(g, cx, []byte("src"), []byte("dst"), false, true); !ok || wrong {
 		t.Fatalf("lmove c: ok=%v wrong=%v", ok, wrong)
 	}
 	wantExact(t, g)
@@ -208,7 +208,7 @@ func TestResidentAccountingMovePath(t *testing.T) {
 	// Move the last two elements out of src: the final one empties and drops it,
 	// so only dst's bytes remain and the total still matches the walk.
 	for i := 0; i < 2; i++ {
-		if _, ok, _ := lmove(g, cx, []byte("src"), []byte("dst"), false, true); !ok {
+		if _, ok, _, _ := lmove(g, cx, []byte("src"), []byte("dst"), false, true); !ok {
 			t.Fatalf("lmove drain step %d did not move", i)
 		}
 	}

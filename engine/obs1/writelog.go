@@ -1,6 +1,7 @@
 package obs1
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strconv"
@@ -463,6 +464,135 @@ func (l *WriteLog) ZSetStore(key []byte, delString, hadZSet bool, scores []float
 		return 0, 0, l.classify(fmt.Errorf("obs1: a zset store emission with nothing to frame"))
 	}
 	return l.emitOps(key, ops...)
+}
+
+// pushDelta picks the sided push sub-op for one value list.
+func pushDelta(front bool, values [][]byte) Op {
+	if front {
+		return CollDelta{Sub: LPush{Values: values}}
+	}
+	return CollDelta{Sub: RPush{Values: values}}
+}
+
+// popDelta picks the sided pop sub-op for a count of removals.
+func popDelta(front bool, count uint32) Op {
+	if front {
+		return CollDelta{Sub: LPop{Count: count}}
+	}
+	return CollDelta{Sub: RPop{Count: count}}
+}
+
+// ListPush implements the shard seam: the pushed values as one sided
+// push, with a collnew ahead of it when the write created the list. The
+// collnew carries no hint bytes yet; doc 08 owns that vocabulary and the
+// encoding-hint slice fills them in.
+func (l *WriteLog) ListPush(key []byte, created, front bool, values [][]byte) (uint16, uint64, error) {
+	if created {
+		return l.emitOps(key, CollNew{Type: CollList}, pushDelta(front, values))
+	}
+	return l.emitOps(key, pushDelta(front, values))
+}
+
+// ListPop implements the shard seam: count removals from one end as a
+// sided pop, with a colldrop behind it when the pop emptied the list.
+// The frame carries only the count because replay knows the elements it
+// is removing; the values the client saw never hit the WAL.
+func (l *WriteLog) ListPop(key []byte, front bool, count int, dropped bool) (uint16, uint64, error) {
+	if dropped {
+		return l.emitOps(key, popDelta(front, uint32(count)), CollDrop{})
+	}
+	return l.emitOps(key, popDelta(front, uint32(count)))
+}
+
+// ListSet implements the shard seam: one lset carrying the resolved
+// non-negative index and the value it now holds.
+func (l *WriteLog) ListSet(key []byte, index int64, value []byte) (uint16, uint64, error) {
+	return l.emitOps(key, CollDelta{Sub: LSet{Index: index, Value: value}})
+}
+
+// ListTrim implements the shard seam: LTRIM as the end cuts it is, an
+// lpop run for the head drop and an rpop for the tail drop (doc 04
+// section 2, no trim sub-kind). A trim that clears the list, the
+// clamp-fail form, frames one bare colldrop instead; a kept range always
+// keeps at least one element, so pops and the drop never mix. The caller
+// gates the no-effect trim, so an empty op list here is the encode bug
+// row.
+func (l *WriteLog) ListTrim(key []byte, dropHead, dropTail int, dropped bool) (uint16, uint64, error) {
+	if dropped {
+		return l.emitOps(key, CollDrop{})
+	}
+	ops := make([]Op, 0, 2)
+	if dropHead > 0 {
+		ops = append(ops, popDelta(true, uint32(dropHead)))
+	}
+	if dropTail > 0 {
+		ops = append(ops, popDelta(false, uint32(dropTail)))
+	}
+	if len(ops) == 0 {
+		return 0, 0, l.classify(fmt.Errorf("obs1: a list trim emission with nothing to frame"))
+	}
+	return l.emitOps(key, ops...)
+}
+
+// ListRem implements the shard seam: the removed positions as one lrem,
+// indices strictly ascending in the pre-removal list, with a colldrop
+// behind it when the removal emptied the list.
+func (l *WriteLog) ListRem(key []byte, indices []uint32, dropped bool) (uint16, uint64, error) {
+	if dropped {
+		return l.emitOps(key, CollDelta{Sub: LRem{Indices: indices}}, CollDrop{})
+	}
+	return l.emitOps(key, CollDelta{Sub: LRem{Indices: indices}})
+}
+
+// ListInsert implements the shard seam: one lins carrying the resolved
+// position the value holds in the resulting list; the pivot search
+// happened in the handler and never hits the WAL.
+func (l *WriteLog) ListInsert(key []byte, index int64, value []byte) (uint16, uint64, error) {
+	return l.emitOps(key, CollDelta{Sub: LIns{Index: index, Value: value}})
+}
+
+// ListMove implements the shard seam: LMOVE's two-key effect, a push
+// side on dst and a pop side on src, each sided by its own flag. The
+// same-key rotation is one run of the source pop then the destination
+// push, pop first because both frames rewrite one list and replay must
+// see them in command order. Distinct keys in one group ride one atomic
+// run destination first and srcSeq is 0, the dst mark covering the whole
+// run. When the groups differ the destination run goes first, then the
+// source run, each atomic alone: a tail cut between them replays the
+// value into both lists rather than into neither, the disclosed
+// cross-group non-atomicity. On a source-side error the destination
+// frames are already buffered, so dstSeq rides the error for the caller
+// to mark.
+func (l *WriteLog) ListMove(src, dst []byte, srcFront, dstFront bool, value []byte, srcDropped, dstCreated bool) (dstGroup uint16, dstSeq uint64, srcGroup uint16, srcSeq uint64, err error) {
+	one := [][]byte{value}
+	if bytes.Equal(src, dst) {
+		g, seq, err := l.emitOps(src, popDelta(srcFront, 1), pushDelta(dstFront, one))
+		return g, seq, 0, 0, err
+	}
+	sslot, sgroup := l.mapKey(src)
+	dslot, dgroup := l.mapKey(dst)
+	if sgroup == dgroup {
+		items := make([]keyedOp, 0, 4)
+		if dstCreated {
+			items = append(items, keyedOp{slot: dslot, key: dst, op: CollNew{Type: CollList}})
+		}
+		items = append(items, keyedOp{slot: dslot, key: dst, op: pushDelta(dstFront, one)})
+		items = append(items, keyedOp{slot: sslot, key: src, op: popDelta(srcFront, 1)})
+		if srcDropped {
+			items = append(items, keyedOp{slot: sslot, key: src, op: CollDrop{}})
+		}
+		g, seq, err := l.emitKeyed(dgroup, items)
+		return g, seq, 0, 0, err
+	}
+	dg, ds, err := l.ListPush(dst, dstCreated, dstFront, one)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	sg, ss, err := l.ListPop(src, srcFront, 1, srcDropped)
+	if err != nil {
+		return dg, ds, 0, 0, err
+	}
+	return dg, ds, sg, ss, nil
 }
 
 // NotifyCommitted implements the shard seam: fn runs once the group's
