@@ -75,6 +75,16 @@ type list struct {
 
 	everLarge bool
 
+	// expireAt is the key-level TTL deadline in ms since the epoch, 0 when the list
+	// has no expiry (spec 2064/f3/16 section 2). It rides inline on the list rather
+	// than in a side "expires" dict the way Redis keeps one: a second dict would be a
+	// second htable plus a copy of every volatile key plus a pointer per entry, the
+	// opposite of the memory bar this build holds against redis and valkey. The lazy
+	// live funnel in reg.go drops the whole list once cx.NowMs passes this. It is not
+	// counted in residentBytes: an int64 on a struct the registry already sizes is
+	// below the estimate's granularity, the same call set/zset/hash make.
+	expireAt int64
+
 	// acct is the footprint this list last posted into the registry's running
 	// resident-byte total (reg.note). It lets note post a delta instead of a fresh
 	// sum, so the total stays exact across a mutation without rewalking the
