@@ -72,6 +72,54 @@ func TestSRTChecksumCoversHeader(t *testing.T) {
 	}
 }
 
+// TestSRTSnapshotRootRoundTrip carries the snapshot cut through a marshal and back:
+// the flag and the barrier watermark survive, and IsSnapshotRoot reports it.
+func TestSRTSnapshotRootRoundTrip(t *testing.T) {
+	s := sampleSRT(3)
+	s.Flags = SRTSnapshotRoot
+	s.SnapWbar = 0x00C0FFEE
+	b, err := s.Marshal(ChecksumCRC32C)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got, err := ParseSRT(b, ChecksumCRC32C)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !got.IsSnapshotRoot() {
+		t.Fatalf("snapshot root flag lost")
+	}
+	if got.SnapWbar != s.SnapWbar || got.Flags != s.Flags {
+		t.Fatalf("snapshot fields = wbar %d flags %d, want %d/%d", got.SnapWbar, got.Flags, s.SnapWbar, s.Flags)
+	}
+}
+
+// TestSRTOrdinaryTableIsNotSnapshotRoot confirms a table marshalled without the flag
+// reads back as an ordinary root with a zero watermark.
+func TestSRTOrdinaryTableIsNotSnapshotRoot(t *testing.T) {
+	b, _ := sampleSRT(2).Marshal(ChecksumCRC32C)
+	got, err := ParseSRT(b, ChecksumCRC32C)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got.IsSnapshotRoot() || got.SnapWbar != 0 {
+		t.Fatalf("ordinary table reads as snapshot root: flags %d wbar %d", got.Flags, got.SnapWbar)
+	}
+}
+
+// TestSRTChecksumCoversSnapWbar tampers with the snapshot watermark, which sits in the
+// header before the crc field, to prove the widened checksum span still guards it.
+func TestSRTChecksumCoversSnapWbar(t *testing.T) {
+	s := sampleSRT(4)
+	s.Flags = SRTSnapshotRoot
+	s.SnapWbar = 900
+	b, _ := s.Marshal(ChecksumCRC32C)
+	b[16] ^= 0xFF // first byte of snap_wbar
+	if _, err := ParseSRT(b, ChecksumCRC32C); !errors.Is(err, ErrChecksum) {
+		t.Fatalf("err = %v, want ErrChecksum", err)
+	}
+}
+
 // TestSRTTruncatedRows models a table whose declared row count runs past the
 // buffer.
 func TestSRTTruncatedRows(t *testing.T) {
