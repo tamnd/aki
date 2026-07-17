@@ -42,6 +42,13 @@ type entry struct {
 	// must be the ASYNC or SYNC token, anything else is a syntax error.
 	flushOpt bool
 
+	// durability marks AKI.DURABILITY (spec 2064/obs1 doc 04 section 3.2):
+	// the set form flips the connection's ack mode reader-side, before the
+	// command enqueues, so every command dispatched after it observes the
+	// new mode with certainty; the handler only answers. See
+	// dispatchDurability.
+	durability bool
+
 	// blocks is set on a blocking verb (BLPOP and kin) so the reader arms the
 	// connection barrier after enqueuing it; wired in the slice-8 blocking PR.
 	blocks bool
@@ -165,6 +172,13 @@ func init() {
 	dbsize := registerShard(str.DBSizeShard)
 	register("DBSIZE", nil, 0, 0, false)
 	registerFan("DBSIZE", shard.FanCount, dbsize, false, true)
+
+	// AKI.DURABILITY [STRICT|RELAXED] (spec 2064/obs1 doc 04 section 3.2, doc
+	// 07): the obs1 ack-mode toggle, namespaced so it can never collide with
+	// upstream. The set form answers +OK, the bare form reports the mode as a
+	// bulk string; the flip itself happens reader-side in dispatchDurability.
+	register("AKI.DURABILITY", durability, 0, 1, false)
+	table["AKI.DURABILITY"].durability = true
 
 	// FLUSHALL scatters a reset intent to every shard; each owner rebuilds
 	// its store empty and the gather answers +OK only after every shard has
@@ -685,6 +699,9 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 	if n < e.minArgs || (e.maxArgs >= 0 && n > e.maxArgs) {
 		return oops(c, "ERR wrong number of arguments for '"+e.name+"' command")
 	}
+	if e.durability {
+		return dispatchDurability(c, e, args)
+	}
 	if e.fan != 0 && (e.fanOnly || n > 1) {
 		return dispatchFan(c, e, args)
 	}
@@ -905,4 +922,58 @@ func ping(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 
 func echo(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Bulk(args[0])
+}
+
+// dispatchDurability routes AKI.DURABILITY. The set form flips the
+// connection's ack mode here on the reader, before the command enqueues:
+// the reader dispatches this connection's commands in order, so every
+// later command is emitted under the new mode with certainty, which is
+// the direction that matters (a strict request must never miss). A write
+// already queued on an owner may observe the flip early and take the new
+// mode one command sooner; a client that needs the exact cutover awaits
+// the +OK before pipelining on, the same contract CLIENT REPLY has. The
+// reply still rides the normal hop so it answers in pipeline order.
+func dispatchDurability(c *shard.Conn, e *entry, args [][]byte) error {
+	if len(args) == 2 {
+		mode := args[1]
+		var mb [8]byte
+		if len(mode) > len(mb) {
+			return oops(c, "ERR DURABILITY mode must be STRICT or RELAXED")
+		}
+		for i := 0; i < len(mode); i++ {
+			mb[i] = mode[i] | 0x20
+		}
+		switch string(mb[:len(mode)]) {
+		case "strict":
+			if !c.WriteLogged() {
+				// With no pipeline there is no commit to wait for: a strict
+				// write would hang, not be stricter. Refuse loudly instead.
+				return oops(c, "ERR DURABILITY STRICT is not available on a volatile node")
+			}
+			c.SetStrictAck(true)
+		case "relaxed":
+			c.SetStrictAck(false)
+		default:
+			return oops(c, "ERR DURABILITY mode must be STRICT or RELAXED")
+		}
+	}
+	err := c.Do(e.op, false, args[1:])
+	if err == shard.ErrTooBig {
+		return oops(c, "ERR command too large")
+	}
+	return err
+}
+
+// durability answers AKI.DURABILITY: +OK for the set form (the flip
+// already happened reader-side), the current mode for the bare query.
+func durability(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	if len(args) != 0 {
+		r.Status("OK")
+		return
+	}
+	if c := cx.CurConn(); c != nil && c.StrictAck() {
+		r.Bulk([]byte("strict"))
+		return
+	}
+	r.Bulk([]byte("relaxed"))
 }
