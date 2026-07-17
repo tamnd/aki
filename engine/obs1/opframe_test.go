@@ -54,6 +54,16 @@ func opCorpus(t testing.TB) []struct {
 		{"xdel", key, CollDelta{Sub: XDel{IDMs: []uint64{1700000000000, 1699999999999}, IDSeq: []uint64{2, 0}}}},
 		{"xtrim", key, CollDelta{Sub: XTrim{Count: 5}}},
 		{"xsetid", key, CollDelta{Sub: XSetID{LastMs: 1700000000000, LastSeq: 7, EntriesAdded: 12, MaxDelMs: 1699999999999, MaxDelSeq: 4}}},
+		{"gnew", key, GroupDelta{Sub: GNew{Group: []byte("g1"), LastMs: 1700000000000, LastSeq: 5, EntriesRead: 9, ReadValid: true}}},
+		{"gsetid", key, GroupDelta{Sub: GSetID{Group: []byte("g1"), LastMs: 0, LastSeq: 0, EntriesRead: 0, ReadValid: false}}},
+		{"gdrop", key, GroupDelta{Sub: GDrop{Group: []byte("g1")}}},
+		{"gconsumernew", key, GroupDelta{Sub: GConsumerNew{Group: []byte("g1"), Consumer: []byte("c1"), SeenMs: 1700000000001}}},
+		{"gconsumerdel", key, GroupDelta{Sub: GConsumerDel{Group: []byte("g1"), Consumer: nil}}},
+		{"gack", key, GroupDelta{Sub: GAck{Group: []byte("g1"), IDMs: []uint64{1700000000000, 1700000000002}, IDSeq: []uint64{0, 3}}}},
+		{"gdeliver", key, GroupDelta{Sub: GDeliver{Group: []byte("g1"), Consumer: []byte("c1"), NoAck: false, TimeMs: 1700000000005, IDMs: []uint64{1700000000000}, IDSeq: []uint64{1}}}},
+		{"gdeliver-noack", key, GroupDelta{Sub: GDeliver{Group: []byte("g1"), Consumer: []byte("c2"), NoAck: true, TimeMs: 1700000000006, IDMs: []uint64{1700000000001, 1700000000001}, IDSeq: []uint64{0, 1}}}},
+		{"gclaim", key, GroupDelta{Sub: GClaim{Group: []byte("g1"), Consumer: []byte("c1"), IDMs: []uint64{1700000000000}, IDSeq: []uint64{2}, TimeMs: []int64{1700000000007}, Counts: []uint16{4}}}},
+		{"gclaim-unowned", key, GroupDelta{Sub: GClaim{Group: []byte("g1"), Consumer: nil, Unowned: true, IDMs: []uint64{1700000000000, 1700000000003}, IDSeq: []uint64{2, 0}, TimeMs: []int64{1700000000008, 0}, Counts: []uint16{0, 65535}}}},
 	}
 }
 
