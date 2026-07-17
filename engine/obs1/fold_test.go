@@ -500,3 +500,40 @@ func TestFoldAgeCadence(t *testing.T) {
 		t.Fatalf("cuts = %d, want 1 (the age trigger, not the size one)", st.SegmentsCut)
 	}
 }
+
+func TestFolderSeedContinuesSegSeq(t *testing.T) {
+	fx := &foldFixture{sim: sim.New(sim.Config{Seed: 1}), marks: obs1.NewWatermarks()}
+	f, err := obs1.NewFolder(obs1.FoldConfig{
+		Store:  fx.sim,
+		Prefix: "db/t",
+		Node:   0xA1,
+		MapKey: func(key []byte) (uint16, uint16) { return 9, 3 },
+		Mark:   func(group uint16) (uint32, uint64) { return 7, fx.last },
+		Marks:  fx.marks,
+
+		FoldAge: -1,
+		Seed: []obs1.Manifest{{
+			Group: 3, Epoch: 7, ManSeq: 2, FoldSeq: 4,
+			Segs: []obs1.ManifestSeg{{SegSeq: 2}, {SegSeq: 5}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.folder = f
+	t.Cleanup(f.Close)
+
+	fx.last = 6
+	if err := fx.marks.ApplyVerdict(obs1.CommitVerdict{
+		Commit: obs1.CommitRecord{Sections: []obs1.CommitSection{{Group: 3, Epoch: 7, FirstSeq: 1, LastSeq: 6}}},
+		Live:   []bool{true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.Add(frames("seeded", "v"))
+	f.Flush()
+	waitFor(t, "seeded cut to publish", func() bool { return len(f.Ledger()) == 1 })
+	if led := f.Ledger()[0]; led.SegSeq != 6 {
+		t.Fatalf("seeded segment took SegSeq %d, want 6, one past the manifest's highest row", led.SegSeq)
+	}
+}
