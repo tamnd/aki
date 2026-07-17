@@ -38,8 +38,24 @@ The build cells keep 2 KiB records, since the encoder does not care where the st
 
 ## Results
 
-Pending the scored run.
+Full sweep in foldthroughput.csv (12 stage cells, 160 MiB staged each, plus 2 build cells).
+
+Stage stall rate (MiB per owner-second inside StageColdDrain): 441 to 454 at 16 B values, 1855 to 2031 at 200 B, 3960 to 4182 at 1000 B.
+Owner fold tax at 100 MiB/s ingest: 22.0 to 22.7% at 16 B, 4.9 to 5.4% at 200 B, 2.4 to 2.5% at 1000 B.
+The headline structural fact: steady-state passes never approach the buffer budget. The store's own pacing caps a pass at 25 KiB (16 B) to 570 KiB (1000 B), so p50 stalls are 0.033 to 0.118 ms and p99 stays under 2 ms at every budget, and the pass-budget column barely moves anything: 1019 to 1077 passes at 200 B whether the buffer is 1 or 16 MiB.
+Dry passes: zero in all 12 cells.
+Build: 2763 MiB/s per core at 200 B records, 3371 at 2 KiB, comp 0.
+
+Scoring: predictions 1 (all three bands, including the amended 1000 B band), 4, and 6 HIT; the composed one-pool-core claim in 5 HIT (harmonic of 2763 with the #1097 zstd-1 rates is roughly 700 to 975 MiB/s).
+Prediction 2's numeric stall bands are VOID rather than missed: the multi-ms 8 MiB synchronous pass they priced never occurs, because the carried f3 pacing already yields at sub-ms granularity; the claim's direction (the budget must be an aggregate, not one burst) is what the machinery itself enforces.
+Prediction 3 MIXED: budgets move sustained throughput under 6% at 16 B and 200 B, but the 1000 B cells spread 30% non-monotonically (403 to 543 MiB/s), which reads as fill and page-cache noise, not a budget effect.
+Prediction 5's 200 B build band MISSED low: the band was calibrated on the smoke's single cold segment (1135 MiB/s) and the warm 4-segment rate is 2.4x that.
+The cold-write column (713 to 5652 MiB/s) is page-cache noise and was declared ungated.
 
 ## Verdict
 
-Pending the scored run.
+Fold's owner tax is small in the embedded band and the small-record wall is real but bounded: at 100 MiB/s of ingest the owner spends about 5% of its time staging 200 B records, 2.4% at 1000 B, and 22% at 16 B.
+The doc 06 pass budget needs no new sub-slicing work in the fold slice: StageColdDrain's inherited pacing already bounds a pass to sub-ms stalls, so the 8 MiB figure is an aggregate per-tick cap the machinery honors naturally, and hot-path interference is p99-invisible (a command arriving mid-pass waits at most ~2 ms in the worst observed pass and typically ~0.1 ms).
+The stage path covers the embedded band only: values over 1 KiB are separated into the vlog by construction and never enter StageColdDrain, so the fold slice must fold separated and chunked values by their own route, and a separated-dominated store leaves the drain trigger latched while staging frames nothing (the shard worker survives this by returning on an empty drain, paying one fruitless hand revolution per tick).
+The I/O-pool side is never the constraint: one core builds segments at 2.7 to 3.4 GiB/s comp 0, and composed with #1097's zstd-1 rates one pool core still clears roughly 0.7 to 1 GiB/s, several times any single-node design ingest.
+Net gate input for the fold slice and PRED-OBS1-O1C-FOLDKEEP: fold keeps up with the flusher at design ingest with owner headroom to spare, provided the slice reuses the stage machinery's pacing rather than inventing a synchronous pass.
