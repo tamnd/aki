@@ -31,8 +31,21 @@ No smoke of the sweep ran before these predictions; the unit tests exercised the
 
 ## Results
 
-Pending the scored run.
+Full sweep in coldlatency.csv (10 point cells, 15 load cells).
+
+Standard at 128 KiB unhedged: p50 22.01 ms, p99 151.64 ms, tail ratio 6.89x.
+Standard p50 across 32 to 512 KiB: 20.52 to 28.01 ms, a 7.49 ms transfer-arithmetic span; Express p50 spans 6.51 to 14.04 ms over the same blocks.
+Express at 128 KiB: p50 8.01 ms, p99 27.11 ms, tail ratio 3.39x.
+Load cells at 128 KiB Standard, measured mean service 31.08 ms (Little ceilings 515, 2059, and 8236 per second at caps 16, 64, 256): cap 64 holds e2e p99 within 1.04x of unloaded through utilization 0.95 (1956/s) and p50 within 1.27x; cap 256 is flat everywhere; cap 16 reaches p99 218.74 ms (1.44x unloaded) and p50 49.04 ms (2.2x) at 0.95.
+Decode is 0.28% of the Standard p50.
+
+Scoring: predictions 1, 3, and 5 HIT on every band; prediction 2 HIT (the Express p50 floor came in at 6.51 ms against the roughly-6.6 edge, inside the stated roughness).
+Prediction 4 MIXED: the rate and ceiling claims hit (the 64-cap default carries 1850/s at healthy tails, ceiling 2059/s, cap 256 buys 4x for zero request dollars), but the predicted knee shape is wrong.
+The e2e p99 never blows past 2x unloaded at any cap or utilization swept, because the service tail dominates the p99 until waits reach the same 150 ms scale; the in-flight cap taxes the MEDIAN first (cap 16 at 0.95: p50 2.2x, p99 1.44x), and the tail ratio actually compresses under load (6.89x down to 4.46x) as mean-scale waits pad the p50.
 
 ## Verdict
 
-Pending the scored run.
+The unhedged first cut lands where doc 05 needs it: cold point p50 22 ms at the default block, on the fast side of the section 9 band, one GET, and decode and transfer are noise against the first-byte envelope.
+The 2.5x p99 row is unreachable without hedging from either placement: the O4a hedge has to close 6.9x on Standard and 3.4x even on Express, which quantifies exactly what the section 6 machinery must buy.
+Block size stays settled by the block-size lab's dollar argument on Standard (2 ms of p50 between 32 and 128 KiB is immaterial), but on Express block size is a genuine latency knob (p50 6.5 to 14 ms across the sweep), so an Express deployment that cares about cold p50 wants the small end; flagged for O4a.
+The pool-cap finding for the async-cold-read slice: saturation shows up as median inflation and wait growth, not p99 blowup, so pool health monitoring should watch p50 drift and wait quantiles rather than e2e p99, and the 64-cap default is comfortable at design cold-read rates (1850/s per node) with cap 256 a free 4x if a workload ever needs it.
