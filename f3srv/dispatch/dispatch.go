@@ -373,6 +373,15 @@ func init() {
 	register("ZINTERSTORE", zset.Zinterstore, 3, -1, true)
 	register("ZDIFFSTORE", zset.Zdiffstore, 3, -1, true)
 
+	// ZRANGESTORE writes a ZRANGE selection into a destination sorted set, the two
+	// keys being the destination then the source. Like GEOSEARCHSTORE it routes on
+	// the destination and co-locates the whole selection-and-store on one owner,
+	// falling back to the F17 hop coordinator when the two keys span shards. The
+	// smallest call is destination, source, min, and max.
+	register("ZRANGESTORE", zset.Zrangestore, 4, -1, true)
+	table["ZRANGESTORE"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
+	table["ZRANGESTORE"].cross = zset.ZrangestoreCross
+
 	// The geo surface (spec 2064/f3/15 section 10): a geo set is a zset whose
 	// score is a 52-bit geohash, so the point commands are all single-key and key
 	// on the geo set argument the way ZADD does. GEOADD takes at least one triple
