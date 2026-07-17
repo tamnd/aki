@@ -53,7 +53,7 @@ func startFoldedServer(t *testing.T, residentCap uint64) *foldedServer {
 	}
 	fs.wl, err = obs1.NewWriteLog(obs1.WriteLogConfig{
 		Store: fs.store, Prefix: "p", Node: node, Chain: ap, Fold: fold,
-		Groups: shard.DefaultSlotGroups, MapKey: clusterMapKey,
+		Groups: shard.DefaultSlotGroups, MapKey: ClusterMapKey,
 		FlushAge:  5 * time.Millisecond,
 		OnVerdict: fs.pub.OnVerdict,
 	})
@@ -62,7 +62,7 @@ func startFoldedServer(t *testing.T, residentCap uint64) *foldedServer {
 	}
 	fs.folder, err = obs1.NewFolder(obs1.FoldConfig{
 		Store: fs.store, Prefix: "p", Node: node,
-		MapKey:    clusterMapKey,
+		MapKey:    ClusterMapKey,
 		Mark:      fs.wl.GroupMark,
 		Marks:     fs.wl.Marks(),
 		OnPublish: fs.pub.OnFolded,
@@ -141,7 +141,7 @@ func TestFoldWiringDeleteToManifest(t *testing.T) {
 	send(t, fs.nc, "DEL", "k")
 	expect(t, fs.r, ":1\r\n")
 
-	_, group := clusterMapKey([]byte("k"))
+	_, group := ClusterMapKey([]byte("k"))
 	ctx := context.Background()
 	var mans []obs1.Manifest
 	pollFor(t, "the delete's manifest", func() bool {

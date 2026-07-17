@@ -38,7 +38,7 @@ func startLaggedServer(t *testing.T) (*obs1.WriteLog, net.Conn, *bufio.Reader, f
 	}
 	wl, err := obs1.NewWriteLog(obs1.WriteLogConfig{
 		Store: store, Prefix: "p", Node: node, Chain: ap, Fold: fold,
-		Groups: shard.DefaultSlotGroups, MapKey: clusterMapKey,
+		Groups: shard.DefaultSlotGroups, MapKey: ClusterMapKey,
 		FlushSize: 1 << 20, FlushAge: time.Hour, CapBytes: 64,
 	})
 	if err != nil {
