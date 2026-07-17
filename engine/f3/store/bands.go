@@ -78,8 +78,14 @@ func (s *Store) writePtr(vs uint64, word uint64, vlen, vcap uint32) {
 // the owner boundaries (ResidentOver fires on fill), so the cap still bounds
 // the touched pages, it just does not let garbage crowd out the working set.
 func (s *Store) spillNow(n uint64) bool {
-	return s.vlog != nil && s.residentCap > 0 && s.arena.live()+n > s.residentCap
+	return s.hasLog() && s.residentCap > 0 && s.arena.live()+n > s.residentCap
 }
+
+// hasLog reports whether a spill target exists: the per-shard scratch value log
+// or the shared .aki value region reached through the akivlog adapter. writeRun
+// falls back to whichever is present when the arena cannot take a run, and
+// refuses the write only when neither is.
+func (s *Store) hasLog() bool { return s.vlog != nil || s.akivlog != nil }
 
 // writeRun places a value run of a and then b (b may be nil), reserving capB
 // bytes of capacity in the arena case; a log run is immutable so its capacity
@@ -98,12 +104,43 @@ func (s *Store) writeRun(a, b []byte, capB uint64) (word uint64, vcap uint32, er
 			copy(s.arena.buf[off+uint64(len(a)):], b)
 			return off, uint32(capB), nil
 		}
-		if s.vlog == nil {
+		if !s.hasLog() {
 			return 0, 0, ErrFull
 		}
 	}
-	if s.vlog == nil {
+	if !s.hasLog() {
 		return 0, 0, ErrFull
+	}
+	return s.spillRun(a, b, n)
+}
+
+// spillRun places a value run outside the arena, in whichever log the store
+// owns. n is len(a)+len(b), the run's exact length, which is also its reserved
+// capacity because a log run is immutable.
+//
+// On an .aki-backed store the run spills to the shared value region through the
+// akivlog adapter. akifile assigns a value_log segment's offset only when the
+// group is cut, so the batch bookkeeping (akispill) stages the frame and returns
+// a provisional word, then resolve cuts one segment and hands back the absolute
+// word. This interim flips eagerly, one stage plus one resolve per run, so the
+// word writeRun returns is already absolute (inLogBit|offset) and a provisional
+// word never escapes to the read seam. The batched form, staging a whole group
+// and resolving once at the reactor's group-commit boundary through the spill
+// ledger, is the reactor-side perf follow-up; it needs a group-commit hook the
+// store cannot reach on its own.
+//
+// Absent an .aki region it takes the scratch path byte for byte: two contiguous
+// appends (single owner, no interleaving appender exists), with the a bytes
+// unlinked to dead space if the b append fails after a already landed.
+func (s *Store) spillRun(a, b []byte, n uint64) (word uint64, vcap uint32, err error) {
+	if s.akivlog != nil {
+		s.akispill.stageRun(a, b)
+		words, err := s.akispill.resolve()
+		if err != nil {
+			return 0, 0, err
+		}
+		s.logRuns++
+		return words[0], uint32(n), nil
 	}
 	off, err := s.vlog.append(a)
 	if err != nil {

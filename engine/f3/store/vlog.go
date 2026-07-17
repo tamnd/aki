@@ -221,6 +221,9 @@ func (l *vlog) close() error {
 // LogBytes reports the value log's total appended bytes and the dead subset.
 // live = total - dead is what a compaction keeps; dead is what it reclaims.
 func (s *Store) LogBytes() (total, dead uint64) {
+	if s.akivlog != nil {
+		return s.akivlog.logBytes()
+	}
 	if s.vlog == nil {
 		return 0, 0
 	}
