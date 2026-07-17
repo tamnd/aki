@@ -661,6 +661,63 @@ func (l *WriteLog) StreamSetID(key []byte, lastMs, lastSeq, entriesAdded, maxDel
 	}})
 }
 
+// StreamGroupNew implements the shard seam: XGROUP CREATE's resulting
+// cursor and lag basis, with a collnew ahead of it when MKSTREAM created
+// the stream, one atomic run since they are one command's effect.
+func (l *WriteLog) StreamGroupNew(key []byte, createdStream bool, group []byte, lastMs, lastSeq, entriesRead uint64, readValid bool) (uint16, uint64, error) {
+	sub := GNew{Group: group, LastMs: lastMs, LastSeq: lastSeq, EntriesRead: entriesRead, ReadValid: readValid}
+	if createdStream {
+		return l.emitOps(key, CollNew{Type: CollStream}, GroupDelta{Sub: sub})
+	}
+	return l.emitOps(key, GroupDelta{Sub: sub})
+}
+
+// StreamGroupSetID implements the shard seam: the resulting cursor and
+// lag basis after XGROUP SETID's optional-argument merge.
+func (l *WriteLog) StreamGroupSetID(key, group []byte, lastMs, lastSeq, entriesRead uint64, readValid bool) (uint16, uint64, error) {
+	return l.emitOps(key, GroupDelta{Sub: GSetID{Group: group, LastMs: lastMs, LastSeq: lastSeq, EntriesRead: entriesRead, ReadValid: readValid}})
+}
+
+// StreamGroupDrop implements the shard seam: XGROUP DESTROY of a group
+// that existed; the group's consumers and PEL leave with it.
+func (l *WriteLog) StreamGroupDrop(key, group []byte) (uint16, uint64, error) {
+	return l.emitOps(key, GroupDelta{Sub: GDrop{Group: group}})
+}
+
+// StreamConsumerNew implements the shard seam: XGROUP CREATECONSUMER
+// when it created one, seen at seenMs with no activity yet.
+func (l *WriteLog) StreamConsumerNew(key, group, consumer []byte, seenMs int64) (uint16, uint64, error) {
+	return l.emitOps(key, GroupDelta{Sub: GConsumerNew{Group: group, Consumer: consumer, SeenMs: seenMs}})
+}
+
+// StreamConsumerDel implements the shard seam: XGROUP DELCONSUMER of a
+// consumer that existed; replay drains its pending entries by owner, so
+// no id list rides the frame.
+func (l *WriteLog) StreamConsumerDel(key, group, consumer []byte) (uint16, uint64, error) {
+	return l.emitOps(key, GroupDelta{Sub: GConsumerDel{Group: group, Consumer: consumer}})
+}
+
+// StreamAck implements the shard seam: the ids that actually left the
+// group's PEL, XACK's acknowledgments and the claim-path removals of
+// deleted entries alike.
+func (l *WriteLog) StreamAck(key, group []byte, ms, seqs []uint64) (uint16, uint64, error) {
+	return l.emitOps(key, GroupDelta{Sub: GAck{Group: group, IDMs: ms, IDSeq: seqs}})
+}
+
+// StreamDeliver implements the shard seam: an XREADGROUP new-message
+// delivery, cursor advanced to the last id listed, PEL entries inserted
+// at timeMs unless the read was NOACK.
+func (l *WriteLog) StreamDeliver(key, group, consumer []byte, noAck bool, timeMs int64, ms, seqs []uint64) (uint16, uint64, error) {
+	return l.emitOps(key, GroupDelta{Sub: GDeliver{Group: group, Consumer: consumer, NoAck: noAck, TimeMs: timeMs, IDMs: ms, IDSeq: seqs}})
+}
+
+// StreamClaim implements the shard seam: resulting PEL entry state per
+// id as XCLAIM, XAUTOCLAIM, or XNACK left it, owner and delivery time
+// and delivery count all post-decision. Unowned is the XNACK shape.
+func (l *WriteLog) StreamClaim(key, group, consumer []byte, unowned bool, ms, seqs []uint64, times []int64, counts []uint16) (uint16, uint64, error) {
+	return l.emitOps(key, GroupDelta{Sub: GClaim{Group: group, Consumer: consumer, Unowned: unowned, IDMs: ms, IDSeq: seqs, TimeMs: times, Counts: counts}})
+}
+
 // NotifyCommitted implements the shard seam: fn runs once the group's
 // committed watermark covers seq (Watermarks.Notify, inline when it
 // already does). Registering also raises barrier demand, the doc 04

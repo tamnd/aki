@@ -38,6 +38,10 @@ const (
 	OpCollDrop  = 0x06
 	OpTxn       = 0x07
 	OpNoop      = 0x08
+	// OpGroupDelta is the consumer-group vocabulary (groupframe.go): its
+	// own kind rather than colldelta sub-kinds because the fold routes it
+	// to doc 08's group and PEL chunk, not to the entry chunks.
+	OpGroupDelta = 0x09
 )
 
 // Txn marker frame flags (doc 04 section 2): bit 0 opens a run, bit 1
@@ -66,7 +70,7 @@ const (
 // lrem and lins fill the interior-surgery gap the same way, since LREM
 // and LINSERT resolve positions no push or pop sub-op can express;
 // xdel, xtrim, and xsetid complete the stream entry surface, the
-// consumer-group vocabulary is its own later slice per doc 08).
+// consumer-group vocabulary lives under its own kind in groupframe.go).
 const (
 	SubHSet    = 0x01
 	SubHDel    = 0x02
@@ -88,7 +92,7 @@ const (
 	SubXSetID  = 0x12
 )
 
-// Op is one doc 04 op: exactly one of the eight kinds.
+// Op is one doc 04 op: exactly one of the nine kinds.
 type Op interface {
 	opKind() uint8
 	opFlags() uint8
@@ -857,6 +861,11 @@ func DecodeOp(f WALFrame) (Op, error) {
 		if op, err = parseCollDelta(p); err != nil {
 			return nil, err
 		}
+	case OpGroupDelta:
+		var err error
+		if op, err = parseGroupDelta(p); err != nil {
+			return nil, err
+		}
 	case OpCollNew:
 		if len(p) < 1 {
 			return nil, fmt.Errorf("obs1: a collnew payload is empty")
@@ -882,7 +891,7 @@ func DecodeOp(f WALFrame) (Op, error) {
 		op = Noop{Pad: append([]byte(nil), p...)}
 	default:
 		// Unknown kinds are rejected, not skipped: this build reads
-		// fversion 1, where exactly eight kinds exist.
+		// fversion 1, where exactly nine kinds exist.
 		return nil, fmt.Errorf("obs1: op kind 0x%02x is not a doc 04 kind", f.Kind)
 	}
 	again, err := EncodeOp(f.Slot, f.Seq, f.Key, op)
