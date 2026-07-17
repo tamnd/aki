@@ -65,6 +65,13 @@ type Server struct {
 	zrpairs []zbuildPair
 	zlexbuf []byte
 
+	// Geo search scratch: the cover walk's matches copy here (walk
+	// bytes alias run reads and die as the cells advance) before the
+	// sort, trim, and reply or store. zrpairs doubles as the store
+	// form's build pair scratch.
+	geoArena []byte
+	geoHits  []geoHit
+
 	// Blocking pop machinery, zpopcmd.go: waiters sleep on zbcond
 	// (over mu), every dispatch broadcasts on its way out, and zbwait
 	// holds each key's FIFO ticket queue so the longest-blocked
@@ -1043,6 +1050,26 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.zintercardCmd(ctx, reply, args)
 	case "ZSCAN":
 		return s.zscanCmd(ctx, reply, args)
+	case "GEOADD":
+		return s.geoaddCmd(ctx, reply, args)
+	case "GEOPOS":
+		return s.geoposCmd(ctx, reply, args)
+	case "GEODIST":
+		return s.geodistCmd(ctx, reply, args)
+	case "GEOHASH":
+		return s.geohashCmd(ctx, reply, args)
+	case "GEOSEARCH":
+		return s.geosearchCmd(ctx, reply, args, false)
+	case "GEOSEARCHSTORE":
+		return s.geosearchCmd(ctx, reply, args, true)
+	case "GEORADIUS":
+		return s.georadiusCmd(ctx, reply, args, cmd, false, false)
+	case "GEORADIUS_RO":
+		return s.georadiusCmd(ctx, reply, args, cmd, false, true)
+	case "GEORADIUSBYMEMBER":
+		return s.georadiusCmd(ctx, reply, args, cmd, true, false)
+	case "GEORADIUSBYMEMBER_RO":
+		return s.georadiusCmd(ctx, reply, args, cmd, true, true)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":
