@@ -76,6 +76,13 @@ type Store struct {
 	// and never touches this. Nil on any store without a record log.
 	rlogErr error
 
+	// rlogScratch renders an int cell to its decimal text for an inline record row
+	// (recordseam.go), reused across commits so the durable path holds no per-key
+	// allocation. An embedded string aliases the arena directly and never touches
+	// it; only the int band, whose bytes are an 8-byte cell not the value text,
+	// materializes here. Owner goroutine only, valid until the next recordRow.
+	rlogScratch []byte
+
 	// spillLedger records where each provisional word from the current batch was
 	// written (spillledger.go): one entry per staged run, the value-area offset
 	// vs of the record's run pointer and the run's stage index. resolveSpill
