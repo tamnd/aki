@@ -92,6 +92,16 @@ func (r *Runtime) resolveConnCaps(c Config) {
 	}
 }
 
+// SetFoldTap registers fn on every shard's store as the staged-drain fold
+// tap (store.SetFoldTap): the obs1 segment folder's feed. Fixed before
+// Start under the same rule as SetWriteLog; each store calls fn on its own
+// owner goroutine, so fn synchronizes internally.
+func (r *Runtime) SetFoldTap(fn func(frames []byte)) {
+	for _, w := range r.workers {
+		w.st.SetFoldTap(fn)
+	}
+}
+
 // ConnOpened records that a driver has begun serving a connection, and
 // ConnClosed pairs with it when the connection is torn down. They maintain the
 // live count that drives the connSpinHighWater park-immediately switch; every

@@ -47,6 +47,11 @@ type Store struct {
 	// consults it, and only a second sighting promotes the frame back.
 	door *coldDoor
 
+	// foldTap, when set, hears every staged drain buffer before its pwrite
+	// (foldwalk.go): the obs1 segment folder's window onto the bytes leaving
+	// RAM. Fixed before serving, called on the owner goroutine.
+	foldTap func(frames []byte)
+
 	// coldHand is the whole-record migrator's clock position (migrate.go), the
 	// directory index its bounded pass resumes from. Separate from demoteHand:
 	// the residency hand moves separated value runs to the log, this hand moves
