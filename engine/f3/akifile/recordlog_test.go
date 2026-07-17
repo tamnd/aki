@@ -473,3 +473,77 @@ func TestReadRecordAtDetectsTorn(t *testing.T) {
 		t.Fatalf("torn point read err = %v, want ErrChecksum", err)
 	}
 }
+
+// TestCompactRecordsRehomesLiveSet copies a live subset of records into one fresh
+// log segment and confirms the new addresses read back the same rows, the reclaim
+// primitive the store's log compaction drives. It stages a batch, drops the middle
+// record from the live set the way a superseded key would be dropped, compacts the
+// survivors, and checks each new address decodes to its original row at a fresh
+// location, an inline row's bytes carried across with it.
+func TestCompactRecordsRehomesLiveSet(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	w := NewRecordLogWriter(f, 6)
+
+	rows := []RecordRow{
+		sampleRow("live-0", 0xa1),
+		sampleRow("dead-1", 0xb2),
+		inlineRow("live-2", "inline-bytes"),
+		sampleRow("live-3", 1<<63|0xc3),
+	}
+	for _, r := range rows {
+		w.Stage(r)
+	}
+	addrs, err := w.Flush(1)
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	// The store decides liveness from its index; here the middle record is the dead
+	// one, so the live set is the other three in index order.
+	live := []uint64{addrs[0], addrs[2], addrs[3]}
+	want := []RecordRow{rows[0], rows[2], rows[3]}
+
+	before := f.Cursor()
+	newAddrs, err := f.CompactRecords(6, 2, live)
+	if err != nil {
+		t.Fatalf("compact records: %v", err)
+	}
+	if f.Cursor() == before {
+		t.Fatalf("compaction wrote no segment")
+	}
+	if len(newAddrs) != len(live) {
+		t.Fatalf("got %d new addresses, want %d", len(newAddrs), len(live))
+	}
+	for i, addr := range newAddrs {
+		if addr == live[i] {
+			t.Fatalf("record %d not re-homed: address unchanged at %d", i, addr)
+		}
+		got, err := f.ReadRecordAt(addr)
+		if err != nil {
+			t.Fatalf("read re-homed record %d at %d: %v", i, addr, err)
+		}
+		if !rowsEqual(got, want[i]) {
+			t.Fatalf("re-homed record %d = %+v, want %+v", i, got, want[i])
+		}
+	}
+}
+
+// TestCompactRecordsEmptyWritesNothing confirms an empty live set writes no segment
+// and returns no addresses, so a compaction with nothing left to keep is a clean
+// no-op rather than an empty segment on the tail.
+func TestCompactRecordsEmptyWritesNothing(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	before := f.Cursor()
+	addrs, err := f.CompactRecords(0, 1, nil)
+	if err != nil {
+		t.Fatalf("compact empty: %v", err)
+	}
+	if addrs != nil {
+		t.Fatalf("empty compaction returned %v, want nil", addrs)
+	}
+	if f.Cursor() != before {
+		t.Fatalf("empty compaction advanced cursor from %d to %d", before, f.Cursor())
+	}
+}
