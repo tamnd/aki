@@ -360,11 +360,13 @@ func (s *Store) Del(key []byte, now int64) bool {
 		s.deleteAt(h, slot, inOverflow)
 		s.dropColdEntry()
 		s.count--
+		s.logTombstone(key)
 		return true
 	}
 	s.deleteAt(h, slot, inOverflow)
 	s.dropRecord(addr)
 	s.count--
+	s.logTombstone(key)
 	return true
 }
 
