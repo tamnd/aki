@@ -71,6 +71,24 @@ func Has(cx *shard.Ctx, key []byte) bool {
 	return l != nil
 }
 
+// Delete removes key when it holds a list on this shard and reports whether it
+// did: the list arm of the unified single-key DEL. It builds no registry when
+// none exists, so a DEL over a key of another type touches nothing here. Cold
+// chunks a demoted list left behind are not reclaimed yet, the same deferral
+// every collection carries until the cold-reclamation slice threads DEL.
+func Delete(cx *shard.Ctx, key []byte) bool {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return false
+	}
+	g := v.(*reg)
+	if g.m[string(key)] == nil {
+		return false
+	}
+	g.drop(key)
+	return true
+}
+
 // lookup finds the list for key. wrong is true when the key instead holds a
 // value in the string store, which every list command answers with WRONGTYPE.
 // Cross-type collisions with the set and zset registries are not resolved in

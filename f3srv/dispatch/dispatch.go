@@ -148,8 +148,9 @@ func init() {
 	table["LCS"].cross = str.LcsCross
 	// TYPE spans every keyspace f3 keeps (the string store and all five
 	// collection registries), so its handler lives here where every type
-	// package is in reach. Single-key EXISTS and DEL still span only set plus
-	// string below, owed to the fan-threading slice.
+	// package is in reach. Single-key EXISTS and DEL below share that reach;
+	// only the multi-key EXISTS and DEL fan forms still span set plus string,
+	// owed to the fan-threading slice.
 	register("TYPE", typeCmd, 1, 1, true)
 
 	// The tier-one multi-key commands: a single key keeps the point path,
@@ -160,8 +161,8 @@ func init() {
 	del := registerShard(str.DelShard)
 	exists := registerShard(str.ExistsShard)
 	register("EXISTS", existsCmd, 1, -1, true)
-	register("DEL", set.Del, 1, -1, true)
-	register("UNLINK", set.Del, 1, -1, true)
+	register("DEL", delCmd, 1, -1, true)
+	register("UNLINK", delCmd, 1, -1, true)
 	// The read-only expiry queries and PERSIST span every keyspace, so their
 	// handlers live here alongside TYPE and EXISTS: a collection key reads as
 	// live with no deadline (-1) rather than the missing-key -2 the set-only
@@ -1105,6 +1106,39 @@ func pexpiretimeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // collection key stays owed, since there is nowhere to store the deadline yet.
 func persistCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if cx.St.Persist(args[0], cx.NowMs) {
+		r.Int(1)
+		return
+	}
+	r.Int(0)
+}
+
+// delCmd answers the single-key DEL and UNLINK point path, spanning every
+// keyspace f3 keeps rather than only the string store and the set registry. A
+// key lives in exactly one keyspace, so at most one arm removes it; the reply is
+// 1 when any did and 0 otherwise. Reclamation is owner-local and immediate, so
+// UNLINK shares the path. The multi-key form still fans through the string-only
+// sub-handler, so a collection key stays invisible to DEL over two or more keys
+// until the fan slice threads the registries; this closes only the single-key
+// gap, where a lone hash, list, zset, or stream key used to answer 0 and stay.
+func delCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	key := args[0]
+	removed := cx.St.Del(key, cx.NowMs)
+	if set.Delete(cx, key) {
+		removed = true
+	}
+	if zset.Delete(cx, key) {
+		removed = true
+	}
+	if hash.Delete(cx, key) {
+		removed = true
+	}
+	if list.Delete(cx, key) {
+		removed = true
+	}
+	if stream.Delete(cx, key) {
+		removed = true
+	}
+	if removed {
 		r.Int(1)
 		return
 	}

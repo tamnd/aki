@@ -152,6 +152,51 @@ func Has(cx *shard.Ctx, key []byte) bool {
 	return s != nil
 }
 
+// Delete removes key when it holds a stream on this shard and reports whether it
+// did: the stream arm of the unified single-key DEL. Unlike an emptied stream,
+// which the registry keeps in place (XLEN reads 0), a deleted key leaves nothing
+// behind, so this is the one path that drops a stream from the map. A stream
+// keeps no drop counterpart, so this reconciles the running total and, if a
+// tombstone left the stream on the gc worklist, takes it off, so the maintainer
+// never gcs a detached stream and adds its bytes back into the total. Parked
+// XREAD waiters live in a separate per-key list untouched here, so a later XADD
+// recreates the stream and serves them, as in Redis. Cold blocks a demoted
+// stream left behind are not reclaimed yet, the same deferral every collection
+// carries until the cold-reclamation slice threads DEL. Owner goroutine only.
+func Delete(cx *shard.Ctx, key []byte) bool {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return false
+	}
+	g := v.(*reg)
+	s := g.m[string(key)]
+	if s == nil {
+		return false
+	}
+	if s.gcDirty {
+		g.undirty(s)
+	}
+	if g.acctOn {
+		g.resident -= s.acct
+	}
+	delete(g.m, string(key))
+	return true
+}
+
+// undirty takes a stream off the gc worklist, swapping the tail into its slot
+// since the worklist order carries no meaning. It is used only by Delete, so a
+// stream removed from the registry never reaches the maintainer.
+func (g *reg) undirty(s *stream) {
+	for i, d := range g.dirty {
+		if d == s {
+			g.dirty[i] = g.dirty[len(g.dirty)-1]
+			g.dirty = g.dirty[:len(g.dirty)-1]
+			break
+		}
+	}
+	s.gcDirty = false
+}
+
 // lookup finds the stream for key. present is nil when no stream exists; wrong is
 // true when the key instead holds a string value, which every stream command
 // answers with WRONGTYPE. Cross-type collisions with the other collection
