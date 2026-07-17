@@ -22,6 +22,7 @@ type MetaSlot struct {
 	RecordCount    uint64
 	LastCkptUnix   uint64
 	CleanShutdown  uint8
+	MetaKVOff      uint64
 }
 
 // Marshal encodes the slot and stamps its checksum over bytes 0..120 under the
@@ -45,6 +46,7 @@ func (m *MetaSlot) Marshal(kind uint32) ([]byte, error) {
 	le.PutUint64(b[88:], m.RecordCount)
 	le.PutUint64(b[96:], m.LastCkptUnix)
 	b[104] = m.CleanShutdown
+	le.PutUint64(b[105:], m.MetaKVOff)
 	sum, ok := checksum(kind, b[0:120])
 	if !ok {
 		return nil, ErrChecksumKind
@@ -83,6 +85,7 @@ func ParseMetaSlot(b []byte, kind uint32) (*MetaSlot, error) {
 		RecordCount:    le.Uint64(b[88:]),
 		LastCkptUnix:   le.Uint64(b[96:]),
 		CleanShutdown:  b[104],
+		MetaKVOff:      le.Uint64(b[105:]),
 	}, nil
 }
 

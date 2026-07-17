@@ -23,6 +23,7 @@ func sampleMeta(commitSeq uint64) *MetaSlot {
 		RecordCount:    4096,
 		LastCkptUnix:   1_700_000_123,
 		CleanShutdown:  1,
+		MetaKVOff:      32768,
 	}
 }
 
