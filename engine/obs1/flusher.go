@@ -221,6 +221,58 @@ func (fl *Flusher) AppendStrSet(group uint16, epoch uint32, slot uint16, seq uin
 	return nil
 }
 
+// AppendRun encodes a whole frame run into group's buffer atomically:
+// every frame or none, admitted as one unit against the cap, appended
+// under one hold of the lock. The swap takes the same lock, so a run can
+// never split across WAL objects and a txn-bracketed run stays contiguous
+// in the group's section of one object, the doc 04 section 2 contiguity
+// rule. Seqs must be strictly increasing across the run, the caller's job
+// (the write log draws them consecutively).
+func (fl *Flusher) AppendRun(group uint16, epoch uint32, frames []WALFrame) error {
+	if len(frames) == 0 {
+		return fmt.Errorf("obs1: an op run needs at least one frame")
+	}
+	total := 0
+	for i := range frames {
+		total += walFrameFixed + len(frames[i].Key) + len(frames[i].Payload)
+		if i > 0 && frames[i].Seq <= frames[i-1].Seq {
+			return fmt.Errorf("obs1: run seq %d after %d, must be strictly increasing", frames[i].Seq, frames[i-1].Seq)
+		}
+	}
+	fl.mu.Lock()
+	defer fl.mu.Unlock()
+	g, err := fl.admitLocked(group, epoch, frames[0].Seq, total)
+	if err != nil {
+		return err
+	}
+	mark := len(g.frames)
+	fb := g.frames
+	for i := range frames {
+		if fb, err = appendWALFrame(fb, frames[i]); err != nil {
+			// All or nothing: drop what the run wrote so a half-encoded
+			// run never reaches a WAL object.
+			g.frames = g.frames[:mark]
+			return err
+		}
+	}
+	g.frames = fb
+	if g.nframes == 0 {
+		g.epoch = epoch
+		g.firstSeq = frames[0].Seq
+	}
+	g.nframes += uint32(len(frames))
+	last := frames[len(frames)-1].Seq
+	g.lastSeq = last
+	g.lastEver = last
+	g.haveEver = true
+	if fl.dirtyBytes == 0 {
+		fl.firstAppend = time.Now()
+	}
+	fl.dirtyBytes += total
+	fl.wake()
+	return nil
+}
+
 func (fl *Flusher) admitLocked(group uint16, epoch uint32, seq uint64, flen int) (*groupBuf, error) {
 	if fl.failed {
 		return nil, fl.failErr
