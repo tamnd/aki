@@ -342,6 +342,16 @@ func (r *SegStatsRebuilder) TotalDeadBytes() uint64 {
 	return n
 }
 
+// TotalLiveBytes sums the live-byte counts across the table, the denominator the
+// compaction trigger reads a reclaim ratio against without a scan.
+func (r *SegStatsRebuilder) TotalLiveBytes() uint64 {
+	var n uint64
+	for _, e := range r.entries {
+		n += e.LiveBytes
+	}
+	return n
+}
+
 // RebuildShardSegStats reconstructs one shard's dead-byte accounting from its
 // seg-stats checkpoint chain, the same walk RebuildShardIndex runs for the index. The
 // SRT names the shard's newest seg-stats segment (segstats_off); that segment is a
@@ -677,6 +687,47 @@ func (r *Recovery) CrossCheck() []SRTRowDrift {
 		})
 	}
 	return drift
+}
+
+// ShardBytes is one shard's live-and-dead accounting reconstructed at open.
+type ShardBytes struct {
+	LiveBytes uint64 // bytes still referenced by a live index entry
+	DeadBytes uint64 // bytes superseded, the compaction trigger's fuel
+}
+
+// DeadByteAudit is the durable dead-byte accounting a reopen reconstructs from the
+// checkpointed seg_stats, per shard and file-wide (spec 2064/f3/07 section 6, "Dead-byte
+// accounting that survives restart").
+type DeadByteAudit struct {
+	PerShard  []ShardBytes // indexed by shard; nil for a shard with no seg_stats checkpoint
+	TotalLive uint64
+	TotalDead uint64
+}
+
+// DeadByteAudit rolls the checkpointed seg_stats up into the file's live-and-dead totals,
+// the O10 gap's close (spec 2064/f3/07 section 6). f1 kept these counters only in memory, so
+// a restart zeroed them and the store under-triggered compaction until organic churn
+// rediscovered the garbage; f3 checkpoints them, so a reopen reads the dead weight straight
+// back and seeds the compaction trigger with the garbage the previous run left behind.
+//
+// A recovery with no seg_stats (a fresh file or a scan fallback) audits to a zero total over
+// a nil PerShard, the honest reading that nothing has been accounted yet. A shard that never
+// checkpointed contributes a nil PerShard entry and zero bytes.
+func (r *Recovery) DeadByteAudit() DeadByteAudit {
+	if r.SegStats == nil {
+		return DeadByteAudit{}
+	}
+	audit := DeadByteAudit{PerShard: make([]ShardBytes, len(r.SegStats))}
+	for i, ss := range r.SegStats {
+		if ss == nil {
+			continue
+		}
+		live, dead := ss.TotalLiveBytes(), ss.TotalDeadBytes()
+		audit.PerShard[i] = ShardBytes{LiveBytes: live, DeadBytes: dead}
+		audit.TotalLive += live
+		audit.TotalDead += dead
+	}
+	return audit
 }
 
 // ReadExtentTable reads the coarse extent map the live meta root points at (spec
