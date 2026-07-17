@@ -1054,3 +1054,217 @@ func TestZRemRangeTornTail(t *testing.T) {
 		}
 	}
 }
+
+// TestZAlgebraStoreTornTail is the ZRANGESTORE torn-tail model on the
+// algebra path: the WAL cuts after every frame of a union, inter, and
+// diff store cadence, and the destination must be all-or-nothing at
+// every prefix, exactly one completed store's image or nothing, with
+// the two families agreeing on whichever image survived. The cadence
+// walks the dest across inline, paged under the shrunk caps, back to
+// inline over the paged plane, and deleted by an empty intersection.
+func TestZAlgebraStoreTornTail(t *testing.T) {
+	restore := sqlo1.SetZFenceCapsForTest(2, 4, 2, 6)
+	defer restore()
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "torn.aki")
+	db, err := sqlo1b.CreateStore(path, bWalSeg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := newTieredOverB(t, db, 8192, 0, 1)
+	z, err := sqlo1.NewZSet(tr, sqlo1.HashConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := []byte("dst")
+	flush := func() {
+		t.Helper()
+		if err := tr.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Two sources: small members for the inline dest rungs, fat ones
+	// so the union store pages the dest fence under the shrunk caps.
+	small := func(i int) string { return fmt.Sprintf("s%02d", i) }
+	fat := func(i int) string {
+		return fmt.Sprintf("f%03d:%s", i, strings.Repeat("y", 680))
+	}
+	universe := []string{}
+	for i := range 12 {
+		if _, _, _, _, err := z.ZAdd(ctx, []byte("srcS"), []byte(small(i)), float64(i), sqlo1.ZAddFlags{}); err != nil {
+			t.Fatal(err)
+		}
+		universe = append(universe, small(i))
+	}
+	flush()
+	for i := range 40 {
+		if _, _, _, _, err := z.ZAdd(ctx, []byte("srcF"), []byte(fat(i)), float64(i%5), sqlo1.ZAddFlags{}); err != nil {
+			t.Fatal(err)
+		}
+		universe = append(universe, fat(i))
+	}
+	flush()
+
+	snapshot := func(zz *sqlo1.ZSet) map[string]float64 {
+		t.Helper()
+		img := map[string]float64{}
+		for _, m := range universe {
+			sc, ok, err := zz.MemScoreForTest(ctx, dst, []byte(m))
+			if err != nil {
+				t.Fatalf("memScore %s: %v", m, err)
+			}
+			if ok {
+				img[m] = sc
+			}
+		}
+		return img
+	}
+	images := []map[string]float64{{}}
+	store := func(op string, run func() (int64, error), wantN int64) {
+		t.Helper()
+		n, err := run()
+		if err != nil || n != wantN {
+			t.Fatalf("%s = (%d, %v), want %d", op, n, err, wantN)
+		}
+		flush()
+		images = append(images, snapshot(z))
+	}
+	keysSS := [][]byte{[]byte("srcS"), []byte("srcS")}
+	keysSF := [][]byte{[]byte("srcS"), []byte("srcF")}
+	store("ZInterStore(srcS, srcS)", func() (int64, error) {
+		return z.ZInterStore(ctx, dst, keysSS, nil, 0)
+	}, 12) // inline dest, self-intersection doubles scores
+	store("ZUnionStore(srcS, srcF)", func() (int64, error) {
+		return z.ZUnionStore(ctx, dst, keysSF, nil, 0)
+	}, 52) // paged dest
+	if paged, err := z.FencePagedForTest(ctx, dst); err != nil || !paged {
+		t.Fatalf("union store did not page the dest fence (paged %v, err %v)", paged, err)
+	}
+	store("ZDiffStore(srcS, srcF)", func() (int64, error) {
+		return z.ZDiffStore(ctx, dst, keysSF)
+	}, 12) // back to inline over the paged plane
+	store("ZInterStore(srcS, srcF)", func() (int64, error) {
+		return z.ZInterStore(ctx, dst, keysSF, nil, 0)
+	}, 0) // empty intersection deletes
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	df, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cap tornCapture
+	rec, err := sqlo1b.Recover(df, sqlo1.WALPath(path), bWalSeg, &cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Super.WALTrimSeq != 0 {
+		t.Fatalf("scenario checkpointed (trim %d)", rec.Super.WALTrimSeq)
+	}
+	dbid := rec.Super.WALDBID()
+	rec.WAL.Close()
+	df.Close()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cap.frames) < 50 {
+		t.Fatalf("scenario emitted only %d frames, too thin", len(cap.frames))
+	}
+
+	sameImage := func(a, b map[string]float64) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for m, sc := range a {
+			if got, ok := b[m]; !ok || got != sc {
+				return false
+			}
+		}
+		return true
+	}
+
+	for n := 0; n <= len(cap.frames); n++ {
+		cut := filepath.Join(dir, "cut.aki")
+		if err := os.WriteFile(cut, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		os.Remove(sqlo1.WALPath(cut))
+		w, err := sqlo1.OpenWAL(sqlo1.WALPath(cut), dbid, bWalSeg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, fr := range cap.frames[:n] {
+			if _, err := w.Append(fr.shard, fr.op, fr.oflags, fr.pay); err != nil {
+				t.Fatalf("cut %d: %v", n, err)
+			}
+		}
+		if err := w.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db2, err := sqlo1b.OpenStore(cut, bWalSeg)
+		if err != nil {
+			t.Fatalf("cut %d: recovery failed: %v", n, err)
+		}
+		tr2 := newTieredOverB(t, db2, 8192, 0, 1)
+		z2, err := sqlo1.NewZSet(tr2, sqlo1.HashConfig{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		visible := snapshot(z2)
+		found := false
+		for _, img := range images {
+			if sameImage(visible, img) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("cut %d: dest holds %d members matching no completed store image", n, len(visible))
+		}
+		card, err := z2.ZCard(ctx, dst)
+		if err != nil {
+			t.Fatalf("cut %d: ZCard: %v", n, err)
+		}
+		if int(card) != len(visible) {
+			t.Fatalf("cut %d: ZCARD %d but %d members reachable", n, card, len(visible))
+		}
+		if enc, ok, err := z2.Encoding(ctx, dst); err != nil {
+			t.Fatalf("cut %d: Encoding: %v", n, err)
+		} else if ok && enc == "skiplist" {
+			walked := map[string]bool{}
+			werr := z2.RunWalkForTest(ctx, dst, func(s uint64, m []byte) {
+				sc, held := visible[string(m)]
+				if !held {
+					t.Fatalf("cut %d: run walk emitted %q, unreachable on the member side", n, m)
+				}
+				if sqlo1.ZScoreSortableForTest(sc) != s {
+					t.Fatalf("cut %d: run walk scores %q at %#x, member side holds %g", n, m, s, sc)
+				}
+				if walked[string(m)] {
+					t.Fatalf("cut %d: run walk emitted %q twice", n, m)
+				}
+				walked[string(m)] = true
+			})
+			if werr != nil {
+				t.Fatalf("cut %d: run walk: %v", n, werr)
+			}
+			if len(walked) != len(visible) {
+				t.Fatalf("cut %d: run walk holds %d members, member side %d", n, len(walked), len(visible))
+			}
+		}
+		if n == len(cap.frames) && len(visible) != 0 {
+			t.Fatalf("full tail: dest holds %d members, the last store deleted it", len(visible))
+		}
+		if err := db2.Close(); err != nil {
+			t.Fatalf("cut %d: close: %v", n, err)
+		}
+	}
+}

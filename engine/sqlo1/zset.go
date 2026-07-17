@@ -58,6 +58,26 @@ type ZSet struct {
 	// then emits, reused across commands.
 	zparena []byte
 	zppairs []zbuildPair
+
+	// Algebra scratch, zalgebra.go: the aux ladder pool and loaded
+	// sources, the fold-order and rest views, the walk window (members,
+	// fhs, aggregating scores) with its probe routing, the union
+	// cursors, and the result pairs the callers sort and reply or
+	// bulk-build from.
+	zalg       []*Hash
+	zasrcs     []zalgSrc
+	zaorder    []*zalgSrc
+	zarest     []*zalgSrc
+	zwarena    []byte
+	zwmem      [][]byte
+	zwfh       []uint64
+	zwsc       []float64
+	zagrpSeg   []uint64
+	zagrpStart []int
+	zahit      []bool
+	zacurs     []zalgCursor
+	zaarena    []byte
+	zapairs    []zbuildPair
 }
 
 // NewZSet builds the zset layer over t.

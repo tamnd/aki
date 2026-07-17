@@ -1027,6 +1027,20 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.zremrangeCmd(ctx, reply, args, cmd, zrangeByScore)
 	case "ZREMRANGEBYLEX":
 		return s.zremrangeCmd(ctx, reply, args, cmd, zrangeByLex)
+	case "ZUNION":
+		return s.zsetopCmd(ctx, reply, args, cmd, false, false)
+	case "ZINTER":
+		return s.zsetopCmd(ctx, reply, args, cmd, true, false)
+	case "ZUNIONSTORE":
+		return s.zsetopCmd(ctx, reply, args, cmd, false, true)
+	case "ZINTERSTORE":
+		return s.zsetopCmd(ctx, reply, args, cmd, true, true)
+	case "ZDIFF":
+		return s.zdiffCmd(ctx, reply, args, cmd, false)
+	case "ZDIFFSTORE":
+		return s.zdiffCmd(ctx, reply, args, cmd, true)
+	case "ZINTERCARD":
+		return s.zintercardCmd(ctx, reply, args)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":
