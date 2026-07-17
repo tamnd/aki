@@ -51,30 +51,3 @@ func MSetShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	r.FanOK()
 }
-
-// DelShard answers a DEL or UNLINK sub-command: the partial is this shard's
-// deleted-key count. UNLINK shares the handler because reclamation is already
-// owner-local and immediate here; there is no background free to hand off to.
-func DelShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	var n int64
-	for _, key := range args {
-		if cx.St.Del(key, cx.NowMs) {
-			n++
-		}
-	}
-	r.FanCount(n)
-}
-
-// ExistsShard answers an EXISTS sub-command: the partial counts every key
-// argument that exists, duplicates included, which is the Redis EXISTS
-// contract. Duplicate keys hash to the same shard, so per-shard counting
-// composes exactly.
-func ExistsShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	var n int64
-	for _, key := range args {
-		if cx.St.Exists(key, cx.NowMs) {
-			n++
-		}
-	}
-	r.FanCount(n)
-}

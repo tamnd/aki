@@ -5,8 +5,8 @@ import "testing"
 // TestExistsSingleKeyAllKeyspaces checks the single-key EXISTS point path counts
 // a key in any keyspace f3 keeps, not only the string store and the set
 // registry. Before the keyspace-unification fix a lone hash, list, zset, or
-// stream key answered 0. The multi-key fan form still spans string plus set
-// only, so this covers just the single-key path.
+// stream key answered 0. The multi-key fan form spans the same keyspaces;
+// TestMultiKeyExistsDelAllKeyspaces covers that path.
 func TestExistsSingleKeyAllKeyspaces(t *testing.T) {
 	_, nc, br := startServer(t)
 
