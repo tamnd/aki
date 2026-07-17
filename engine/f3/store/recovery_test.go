@@ -2,7 +2,9 @@ package store
 
 import (
 	"bytes"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/tamnd/aki/engine/f3/akifile"
@@ -193,6 +195,128 @@ func TestReplayIsShardScoped(t *testing.T) {
 	}
 	if _, ok := r2.GetString([]byte("one"), 0, nil); ok {
 		t.Fatal("shard 2 replayed shard 1's key")
+	}
+}
+
+// TestSharedWriterRecoveryRoundTrip is the end-to-end capstone for the group-commit
+// seam: two shard stores share one .aki and one group-commit writer, and each runs
+// real SetString commands from its own owner goroutine at the same time, so every
+// record cut goes through the one writer that serializes the single-writer file
+// rather than the direct path the earlier shard-scoped test took. It then drops both
+// stores and the writer, reopens the file into fresh empty stores, and replays each
+// shard's log, asserting every key the first run committed reads back at its shard.
+// Run under -race this proves the writer produces a correct, recoverable durable log
+// under concurrent multi-shard commit, which the direct-cut recovery tests cannot
+// reach because they each own the file alone.
+func TestSharedWriterRecoveryRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sharedrec.aki")
+	const shardA, shardB = 1, 2
+	const per = 200
+
+	openStore := func(f *akifile.File, shard uint16, gw *akifile.GroupWriter) *Store {
+		s, err := Open(Options{
+			ArenaBytes:     4 << 20,
+			SegBytes:       1 << 20,
+			AkiValueLog:    f,
+			Shard:          shard,
+			AkiGroupWriter: gw,
+		})
+		if err != nil {
+			t.Fatalf("open shard %d: %v", shard, err)
+		}
+		return s
+	}
+
+	// First run: both shards commit through the one writer concurrently. A ring
+	// smaller than the per-shard command count forces the submitWait backpressure
+	// spin, so this exercises a full writer ring too.
+	f, err := akifile.Create(path, akifile.CreateOptions{
+		ShardCount:   4,
+		SepThreshold: 64,
+		Sync:         akifile.SyncNo,
+	})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	gw := akifile.NewGroupWriter(f, 4, 16)
+
+	keyA := func(i int) []byte { return []byte(fmt.Sprintf("a-key-%04d", i)) }
+	keyB := func(i int) []byte { return []byte(fmt.Sprintf("b-key-%04d", i)) }
+	valA := func(i int) []byte { return []byte(fmt.Sprintf("a-val-%04d", i)) }
+	valB := func(i int) []byte { return []byte(fmt.Sprintf("b-val-%04d", i)) }
+
+	sa := openStore(f, shardA, gw)
+	sb := openStore(f, shardB, gw)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var setErr [2]error
+	go func() {
+		defer wg.Done()
+		for i := 0; i < per; i++ {
+			if err := sa.SetString(keyA(i), valA(i), 0, 0, false); err != nil {
+				setErr[0] = err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < per; i++ {
+			if err := sb.SetString(keyB(i), valB(i), 0, 0, false); err != nil {
+				setErr[1] = err
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	if setErr[0] != nil || setErr[1] != nil {
+		t.Fatalf("concurrent sets: shardA=%v shardB=%v", setErr[0], setErr[1])
+	}
+
+	// The writer must quiesce before the file closes, then the borrowed handle
+	// closes once, after both stores let go of it.
+	gw.Stop()
+	if err := sa.Close(); err != nil {
+		t.Fatalf("close shard A: %v", err)
+	}
+	if err := sb.Close(); err != nil {
+		t.Fatalf("close shard B: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	// Second run: reopen and rebuild each shard from the log the writer laid down.
+	// Recovery does not log, so the fresh stores need no writer.
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	ra := openStore(f2, shardA, nil)
+	rb := openStore(f2, shardB, nil)
+	t.Cleanup(func() { _ = ra.Close(); _ = rb.Close(); _ = f2.Close() })
+	if err := ra.ReplayRecords(0); err != nil {
+		t.Fatalf("replay shard A: %v", err)
+	}
+	if err := rb.ReplayRecords(0); err != nil {
+		t.Fatalf("replay shard B: %v", err)
+	}
+
+	// Every key each shard committed reads back at its own value, and neither shard
+	// recovered the other's keys.
+	for i := 0; i < per; i++ {
+		if got, ok := ra.GetString(keyA(i), 0, nil); !ok || !bytes.Equal(got, valA(i)) {
+			t.Fatalf("shard A key %d = (%q, %v), want (%q, true)", i, got, ok, valA(i))
+		}
+		if got, ok := rb.GetString(keyB(i), 0, nil); !ok || !bytes.Equal(got, valB(i)) {
+			t.Fatalf("shard B key %d = (%q, %v), want (%q, true)", i, got, ok, valB(i))
+		}
+	}
+	if _, ok := ra.GetString(keyB(0), 0, nil); ok {
+		t.Fatal("shard A recovered a shard B key")
+	}
+	if _, ok := rb.GetString(keyA(0), 0, nil); ok {
+		t.Fatal("shard B recovered a shard A key")
 	}
 }
 
