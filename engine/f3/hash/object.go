@@ -10,13 +10,20 @@ import (
 // the native band reports hashtable, which is what the differential test checks
 // against Redis. A key this package does not own falls through to the list
 // handler, which reports the list bands and then delegates to the set handler for
-// the set bands and the string store, so the one OBJECT verb answers for every
-// type in the dispatch chain (hash then list then set then string).
+// the set bands, the zset band, and the string store, so the one OBJECT verb
+// answers for every type in the dispatch chain (hash then list then set then zset
+// then string).
+// The hash probe reaches the registry through regs.Load, not registry(), so a
+// read-only OBJECT for a key this shard holds under another type builds no hash
+// registry. hash.Object is the chain's fallthrough for every non-stream key, so
+// the creating form would have allocated a registry on nearly every OBJECT.
 func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if eqFold(args[0], "ENCODING") && len(args) == 2 {
-		if h := registry(cx).m[string(args[1])]; h != nil {
-			r.Bulk([]byte(h.encName()))
-			return
+		if v, ok := regs.Load(cx.St); ok {
+			if h := v.(*reg).m[string(args[1])]; h != nil {
+				r.Bulk([]byte(h.encName()))
+				return
+			}
 		}
 	}
 	list.Object(cx, args, r)

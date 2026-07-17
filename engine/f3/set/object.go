@@ -3,6 +3,7 @@ package set
 import (
 	"github.com/tamnd/aki/engine/f3/shard"
 	"github.com/tamnd/aki/engine/f3/store"
+	"github.com/tamnd/aki/engine/f3/zset"
 )
 
 // Object answers OBJECT ENCODING key (spec 2064/f3/11 section 3): the storage
@@ -19,8 +20,21 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	key := args[1]
-	if s := registry(cx).m[string(key)]; s != nil {
-		r.Bulk([]byte(s.enc.String()))
+	// Probe cx.Coll directly rather than through registry(), which would build
+	// an empty set registry on a shard that never ran a set command; a read-only
+	// OBJECT must leave no residency state.
+	if cx.Coll != nil {
+		if s := cx.Coll.(*reg).m[string(key)]; s != nil {
+			r.Bulk([]byte(s.enc.String()))
+			return
+		}
+	}
+	// Not a set. Consult the zset band next, the last collection type in the
+	// OBJECT chain (stream, hash, list, set, zset), before the string fallback.
+	// The probe builds no zset registry when none exists, so this read-only
+	// OBJECT still leaves no residency state on a shard that ran no zset command.
+	if name, ok := zset.Encoding(cx, key); ok {
+		r.Bulk([]byte(name))
 		return
 	}
 	// Not a set. Fall back to the string store's encoding so OBJECT ENCODING
