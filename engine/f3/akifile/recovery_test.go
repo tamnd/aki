@@ -577,6 +577,75 @@ func TestRecoverWiresAuxiliaryTables(t *testing.T) {
 	}
 }
 
+// TestDeadByteAuditRollsUpSegStats reopens a file whose shards checkpointed their
+// accounting and rolls the seg_stats up into per-shard and file-wide live-and-dead totals,
+// the durable garbage a reopened compaction trigger reads back instead of rediscovering.
+func TestDeadByteAuditRollsUpSegStats(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	ss0 := appendSegStats(t, f, SegStatsHeader{FullOrDelta: SegStatsFull, CkptLogPos: 5}, []SegStatsEntry{
+		{SegOff: 0x1000, LiveBytes: 900, DeadBytes: 100},
+		{SegOff: 0x2000, LiveBytes: 700, DeadBytes: 300},
+	})
+	ss1 := appendSegStats(t, f, SegStatsHeader{FullOrDelta: SegStatsFull, CkptLogPos: 6}, []SegStatsEntry{
+		{SegOff: 0x5000, LiveBytes: 500, DeadBytes: 500},
+	})
+	fileSize := f.Cursor()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	rows[0] = SRTRow{SegstatsOff: ss0, CkptLogPos: 5}
+	rows[1] = SRTRow{SegstatsOff: ss1, CkptLogPos: 6}
+	// shards 2.. never checkpointed their accounting: zero rows.
+	srtOff := writeSRTAt(t, dev, prefix, fileSize, &SRT{Gen: 1, Rows: rows})
+
+	m := &MetaSlot{
+		CommitSeq: 3, FileSize: fileSize,
+		SRTOff: srtOff, SRTLen: uint32(SRTHeaderLen + len(rows)*SRTRowSize), SRTShardCount: prefix.ShardCount,
+	}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	audit := rec.DeadByteAudit()
+	if audit.TotalLive != 900+700+500 || audit.TotalDead != 100+300+500 {
+		t.Fatalf("totals = live %d / dead %d, want 2100/900", audit.TotalLive, audit.TotalDead)
+	}
+	if len(audit.PerShard) != int(prefix.ShardCount) {
+		t.Fatalf("per-shard sized %d, want %d", len(audit.PerShard), prefix.ShardCount)
+	}
+	if audit.PerShard[0] != (ShardBytes{LiveBytes: 1600, DeadBytes: 400}) {
+		t.Fatalf("shard 0 = %+v, want live 1600 dead 400", audit.PerShard[0])
+	}
+	if audit.PerShard[1] != (ShardBytes{LiveBytes: 500, DeadBytes: 500}) {
+		t.Fatalf("shard 1 = %+v, want live 500 dead 500", audit.PerShard[1])
+	}
+	// An uncheckpointed shard contributes nothing.
+	if audit.PerShard[2] != (ShardBytes{}) {
+		t.Fatalf("uncheckpointed shard 2 = %+v, want zero", audit.PerShard[2])
+	}
+}
+
+// TestDeadByteAuditFreshFileIsZero confirms a file with no seg_stats audits to a zero total
+// over a nil breakdown: nothing has been accounted, the honest reading for a fresh open.
+func TestDeadByteAuditFreshFileIsZero(t *testing.T) {
+	dev := &memDevice{}
+	newTestFile(t, dev, SyncNo, nil)
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	audit := rec.DeadByteAudit()
+	if audit.PerShard != nil || audit.TotalLive != 0 || audit.TotalDead != 0 {
+		t.Fatalf("fresh audit = %+v, want zero over nil", audit)
+	}
+}
+
 // TestRecoverWiresGlobalRoots checks that Recover surfaces the file-global TTL index,
 // free map, and meta_kv the live meta slot points at, so a reopening writer resumes
 // allocation, the expiry pass has its reclaim list, and the file's config and provenance
