@@ -323,6 +323,88 @@ func Setnx(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Int(1)
 }
 
+// Getex answers GETEX key [EX s|PX ms|EXAT s|PXAT ms|PERSIST]: return the value
+// like GET and, when an option is given, set or clear the key's deadline in the
+// same step. No option leaves the TTL untouched, PERSIST clears it, and an
+// expiry option sets it. Like GET it serves only the string keyspace, so a
+// value another type owns reads as absent, not WRONGTYPE. The option is parsed
+// and its deadline computed before the key is touched, so a bad expiry errors
+// without having read or changed anything. The value is copied into the reply
+// buffer before SetExpire may rebuild the record to add a slot, so the returned
+// bytes survive the rewrite, the same copy-then-write order GETSET relies on.
+func Getex(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	key := args[0]
+	unit := unitNone
+	var timeArg int64
+	persist := false
+	for i := 1; i < len(args); i++ {
+		opt := args[i]
+		switch {
+		case eqFold(opt, "PERSIST"):
+			if unit != unitNone || persist {
+				r.Err("ERR syntax error")
+				return
+			}
+			persist = true
+		case eqFold(opt, "EX"), eqFold(opt, "PX"), eqFold(opt, "EXAT"), eqFold(opt, "PXAT"):
+			if unit != unitNone || persist || i+1 >= len(args) {
+				r.Err("ERR syntax error")
+				return
+			}
+			n, ok := store.ParseInt(args[i+1])
+			if !ok {
+				r.Err("ERR value is not an integer or out of range")
+				return
+			}
+			i++
+			timeArg = n
+			switch {
+			case eqFold(opt, "EX"):
+				unit = unitEXsec
+			case eqFold(opt, "PX"):
+				unit = unitPXms
+			case eqFold(opt, "EXAT"):
+				unit = unitEXat
+			default:
+				unit = unitPXat
+			}
+		default:
+			r.Err("ERR syntax error")
+			return
+		}
+	}
+
+	var atMs int64
+	if unit != unitNone {
+		var ok bool
+		if atMs, ok = deadline(cx.NowMs, unit, timeArg); !ok {
+			r.Err("ERR invalid expire time in 'getex' command")
+			return
+		}
+	}
+
+	val, ok := cx.St.GetString(key, cx.NowMs, cx.Val)
+	if !ok {
+		r.Null()
+		return
+	}
+	cx.Val = val
+	switch {
+	case persist:
+		// Clearing never rebuilds the record, so it cannot fail.
+		_, _ = cx.St.SetExpire(key, nil, 0, cx.NowMs)
+	case unit != unitNone:
+		if _, err := cx.St.SetExpire(key, val, atMs, cx.NowMs); err != nil {
+			if cx.ParkFull(err) {
+				return
+			}
+			r.Err(storeErr(err))
+			return
+		}
+	}
+	r.Bulk(val)
+}
+
 // Type answers TYPE key. Only string records exist in this slice, so the
 // answer is "string" or "none".
 func Type(cx *shard.Ctx, args [][]byte, r shard.Reply) {
