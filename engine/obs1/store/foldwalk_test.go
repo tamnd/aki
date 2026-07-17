@@ -91,6 +91,51 @@ func TestFoldBuildersRoundTrip(t *testing.T) {
 	}
 }
 
+// TestTombstoneFrames pins the delete claim's shape: a tombstone frame
+// walks with the Tombstone mark, an empty value region, and its own kind,
+// a run chunk packed from tombstones carries the mark too, and ordinary
+// record frames never do.
+func TestTombstoneFrames(t *testing.T) {
+	frame := AppendTombstoneFrame(nil, []byte("gone"))
+	var got []FoldFrame
+	if err := WalkStagedFrames(frame, func(f FoldFrame) error {
+		got = append(got, f)
+		return nil
+	}); err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("walked %d frames, want 1", len(got))
+	}
+	f := got[0]
+	if !f.Tombstone || f.Chunk || f.Pointer || f.Kind != KindTombstone ||
+		f.Count != 1 || string(f.Key) != "gone" || len(f.Payload) != 0 {
+		t.Fatalf("tombstone frame misread: %+v", f)
+	}
+
+	chunk := AppendRunChunk(nil, KindTombstone|ChunkKindBit, 0, 1, []byte("gone"), []byte("fingerpr"), frame)
+	var outer FoldFrame
+	if err := WalkStagedFrames(chunk, func(f FoldFrame) error {
+		outer = f
+		return nil
+	}); err != nil {
+		t.Fatalf("chunk walk: %v", err)
+	}
+	if !outer.Tombstone || !outer.Chunk || outer.Kind != KindTombstone|ChunkKindBit {
+		t.Fatalf("tombstone run chunk misread: %+v", outer)
+	}
+
+	rec := AppendRecordFrame(nil, kindString, 0, 1, []byte("k"), []byte("v"))
+	if err := WalkStagedFrames(rec, func(f FoldFrame) error {
+		if f.Tombstone {
+			t.Fatalf("record frame classified as tombstone: %+v", f)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("record walk: %v", err)
+	}
+}
+
 // TestFoldTapSeesStagedFrames pins the tap's contract on a real store: it
 // fires once per staged drain, before the pwrite, with exactly the staged
 // bytes, and every record the drain will flip appears in the walk. The

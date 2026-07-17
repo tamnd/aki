@@ -13,6 +13,14 @@ package store
 // cold-region chunks parse alike.
 const ChunkKindBit = frameChunk
 
+// KindTombstone is the segment-plane delete marker's kind (doc 06 section
+// 1.3). It never appears in a live record or a staged drain: the folder
+// fabricates tombstone frames for committed deletes, and giving them their
+// own kind rather than a record flag makes them sort into their own run
+// chunks, the doc's tombstone chunk entries. Top of the sub-ChunkKindBit
+// range so future collection kinds never collide with it.
+const KindTombstone = 0x7F
+
 // FoldFrame is one staged frame as the folder sees it. Key, Disc, Payload,
 // and Frame alias the drain buffer and stay valid only until the drain
 // completes; a consumer that outlives the call copies out, exactly as the
@@ -34,6 +42,11 @@ type FoldFrame struct {
 	// into the local value log, not the value bytes; its bytes are not in
 	// the frame, so a fold routes it separately or skips it.
 	Pointer bool
+
+	// Tombstone marks a delete claim: a KindTombstone record frame, or a
+	// run chunk packed from them. A higher-SegSeq tombstone shadows every
+	// lower copy of its key (doc 06 section 1.3).
+	Tombstone bool
 
 	Key []byte
 
@@ -62,7 +75,8 @@ func WalkStagedFrames(buf []byte, fn func(FoldFrame) error) error {
 			}
 			out = FoldFrame{
 				Kind: f.kind, Flags: f.flags, Chunk: true, Count: f.count,
-				Disc: f.disc, Key: f.key, Frame: buf[:adv], Payload: f.payload,
+				Tombstone: f.kind&^byte(frameChunk) == KindTombstone,
+				Disc:      f.disc, Key: f.key, Frame: buf[:adv], Payload: f.payload,
 			}
 			n = adv
 		} else {
@@ -72,8 +86,9 @@ func WalkStagedFrames(buf []byte, fn func(FoldFrame) error) error {
 			}
 			out = FoldFrame{
 				Kind: f.kind, Flags: f.flags, Count: 1,
-				Pointer: f.flags&(flagSep|flagChunked) != 0,
-				Key:     f.key, Frame: buf[:adv], Payload: f.value,
+				Pointer:   f.flags&(flagSep|flagChunked) != 0,
+				Tombstone: f.kind == KindTombstone,
+				Key:       f.key, Frame: buf[:adv], Payload: f.value,
 			}
 			n = adv
 		}
@@ -106,4 +121,11 @@ func AppendRecordFrame(dst []byte, kind, flags byte, vlen uint32, key, value []b
 // first key fingerprint, and payload the concatenated record frames.
 func AppendRunChunk(dst []byte, kind, flags byte, count uint16, key, disc, payload []byte) []byte {
 	return appendChunkFrame(dst, kind, flags, count, key, disc, payload)
+}
+
+// AppendTombstoneFrame writes one delete claim for key: a KindTombstone
+// record frame with an empty value region. The folder emits one per
+// committed delete (doc 06 section 1.3).
+func AppendTombstoneFrame(dst []byte, key []byte) []byte {
+	return appendColdFrame(dst, KindTombstone, 0, 0, key, nil)
 }
