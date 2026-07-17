@@ -313,6 +313,26 @@ func (fl *Flusher) noteAppendedLocked(g *groupBuf, epoch uint32, seq uint64, fle
 	fl.wake()
 }
 
+// lastEmitted snapshots every group's highest emitted frame seq under
+// the buffer lock, the marks a commit barrier must cover before it can
+// claim that everything appended ahead of this call is durable. The
+// lock is the same one every append takes, so the snapshot sits at a
+// definite point in the emission order. Groups that never buffered a
+// frame have nothing to cover and do not appear; lastEver survives
+// swaps, so a group whose frames are all in flight or committed still
+// reports its mark.
+func (fl *Flusher) lastEmitted() (groups []uint16, seqs []uint64) {
+	fl.mu.Lock()
+	defer fl.mu.Unlock()
+	for gid, g := range fl.groups {
+		if g.haveEver {
+			groups = append(groups, gid)
+			seqs = append(seqs, g.lastEver)
+		}
+	}
+	return groups, seqs
+}
+
 // Barrier asks for the current buffer to go out now, subject to the
 // floor since the last swap. One-shot: cleared by the swap it causes.
 // With nothing buffered it is a no-op, there is nothing the caller

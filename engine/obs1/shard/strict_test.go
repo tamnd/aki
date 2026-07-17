@@ -2,6 +2,7 @@ package shard
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tamnd/aki/engine/obs1/store"
@@ -152,6 +153,32 @@ func (f *fakeLog) StreamSetID(key []byte, lastMs, lastSeq, entriesAdded, maxDelM
 
 func (f *fakeLog) NotifyCommitted(group uint16, seq uint64, fn func()) {
 	f.pending = append(f.pending, fakeNotify{group: group, seq: seq, fn: fn})
+}
+
+// NotifyAllCommitted mirrors the real barrier over the fake's counters:
+// with nothing emitted it fires inline, otherwise it registers one
+// pending entry per emitted group at that group's last seq and fn runs
+// when the switchboard has fired them all.
+func (f *fakeLog) NotifyAllCommitted(fn func()) {
+	var marks []fakeNotify
+	for g, n := range f.next {
+		if n > 0 {
+			marks = append(marks, fakeNotify{group: g, seq: n})
+		}
+	}
+	if len(marks) == 0 {
+		fn()
+		return
+	}
+	left := new(atomic.Int32)
+	left.Store(int32(len(marks)))
+	for _, m := range marks {
+		f.pending = append(f.pending, fakeNotify{group: m.group, seq: m.seq, fn: func() {
+			if left.Add(-1) == 0 {
+				fn()
+			}
+		}})
+	}
 }
 
 // newStrictRuntime builds a single-shard runtime with the fake log wired

@@ -327,3 +327,74 @@ func TestWriteLogClosedIsFatal(t *testing.T) {
 		t.Fatalf("wal_fatal_errors = %d, want 1", rows["wal_fatal_errors"])
 	}
 }
+
+// TestWriteLogNotifyAllCommitted walks the all-groups barrier through its
+// three shapes: an empty log fires inline, a multi-group snapshot parks and
+// raises its own flush demand, and a covered snapshot fires inline again.
+func TestWriteLogNotifyAllCommitted(t *testing.T) {
+	const node = uint64(0xD7)
+	store := sim.New(sim.Config{})
+	rig := newLogRig(t, store, node)
+	rig.grant(t, node, 1, 0, 1)
+	wl := newTestLog(t, rig, node, obs1.WriteLogConfig{})
+	wl.SetGroup(0, 1, 1)
+	wl.SetGroup(1, 1, 1)
+
+	// Nothing was ever emitted: there is nothing to cover.
+	fired := false
+	wl.NotifyAllCommitted(func() { fired = true })
+	if !fired {
+		t.Fatal("empty-log barrier did not fire inline")
+	}
+
+	// Two groups emitted, none flushed: FlushAge is an hour, so the only
+	// flush pressure is the barrier's own demand. The callback captures
+	// both watermarks at fire time to prove the snapshot really covered
+	// both groups, not just the one that flushed first.
+	if _, _, err := wl.StrSet([]byte("alpha"), []byte("v1"), 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := wl.StrSet([]byte("bravo"), []byte("v2"), 0, false); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan [2]uint64, 1)
+	wl.NotifyAllCommitted(func() {
+		done <- [2]uint64{wl.Marks().Committed(0), wl.Marks().Committed(1)}
+	})
+	select {
+	case got := <-done:
+		if got[0] != 1 || got[1] != 1 {
+			t.Fatalf("committed at fire = %v, want both at 1", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("multi-group barrier never fired")
+	}
+	if rows := durabilityRows(t, wl); rows["wal_barrier_flushes"] == 0 {
+		t.Fatal("the barrier raised no flush demand")
+	}
+
+	// The same snapshot is now covered: inline again.
+	fired = false
+	wl.NotifyAllCommitted(func() { fired = true })
+	if !fired {
+		t.Fatal("covered barrier did not fire inline")
+	}
+
+	// One fresh frame on one group takes the single-group path.
+	if _, _, err := wl.StrSet([]byte("alpha"), []byte("v3"), 0, false); err != nil {
+		t.Fatal(err)
+	}
+	one := make(chan uint64, 1)
+	wl.NotifyAllCommitted(func() { one <- wl.Marks().Committed(0) })
+	select {
+	case got := <-one:
+		if got != 2 {
+			t.Fatalf("committed at fire = %d, want 2", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("single-group barrier never fired")
+	}
+	if err := wl.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

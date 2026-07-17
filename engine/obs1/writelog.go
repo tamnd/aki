@@ -663,6 +663,40 @@ func (l *WriteLog) NotifyCommitted(group uint16, seq uint64, fn func()) {
 	l.fl.Barrier()
 }
 
+// NotifyAllCommitted implements the shard seam: fn runs once chain
+// commits cover every frame any group had emitted when the call was
+// made, the doc 04 section 3.3 chain commit barrier WAITAOF parks on.
+// The snapshot is taken under the flusher's buffer lock, the same lock
+// every emission takes, so it sits at a definite point in the emission
+// order; a log that has emitted nothing, or whose whole snapshot is
+// already covered, fires fn before the call returns on the caller's
+// goroutine. Registering raises barrier demand like NotifyCommitted,
+// and a fenced group's frames never fold live, so fn then never fires,
+// the same silence a strict ack shows.
+func (l *WriteLog) NotifyAllCommitted(fn func()) {
+	groups, seqs := l.fl.lastEmitted()
+	if len(groups) == 0 {
+		fn()
+		return
+	}
+	if len(groups) == 1 {
+		l.NotifyCommitted(groups[0], seqs[0], fn)
+		return
+	}
+	// The strict.go countdown shape: each mark's callback fires exactly
+	// once, the last covering commit runs fn.
+	left := new(atomic.Int32)
+	left.Store(int32(len(groups)))
+	for i := range groups {
+		l.marks.Notify(groups[i], seqs[i], func() {
+			if left.Add(-1) == 0 {
+				fn()
+			}
+		})
+	}
+	l.fl.Barrier()
+}
+
 // epochMissing is the write-before-grant bug row: dispatch only routes
 // commands for groups this node owns, so an emission against a group
 // with no epoch supplied means the wiring lied. Panics in a dev build,

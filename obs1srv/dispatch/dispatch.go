@@ -53,6 +53,12 @@ type entry struct {
 	// connection barrier after enqueuing it; wired in the slice-8 blocking PR.
 	blocks bool
 
+	// waitaof marks WAITAOF (spec 2064/obs1 doc 04 section 3.3): the three
+	// arguments parse reader-side in Redis's order, then the command
+	// scatters a barrier fan through DoWaitAOF with fanOp as the per-shard
+	// no-op sub-command; see dispatchWaitAOF.
+	waitaof bool
+
 	// cross is the tier-two cross-shard route (spec 2064/f3/03 section 6.7):
 	// a command whose keys land on different shards leaves the point path and
 	// runs cross under an intent transaction holding every key. Co-located
@@ -179,6 +185,25 @@ func init() {
 	// bulk string; the flip itself happens reader-side in dispatchDurability.
 	register("AKI.DURABILITY", durability, 0, 1, false)
 	table["AKI.DURABILITY"].durability = true
+
+	// WAIT numreplicas timeout and WAITAOF numlocal numreplicas timeout
+	// (spec 2064/obs1 doc 04 section 3.3) are the durability barriers. WAIT
+	// maps to the hot-standby seam, which has zero standbys this generation
+	// (O6b wires the real one): an ask at or under zero answers the achieved
+	// count of 0 in place, and a positive ask can never be met, so it parks
+	// on the owner's timer for the full timeout and answers 0, Redis
+	// semantics verbatim, a zero timeout parking forever. WAITAOF rides a
+	// barrier fan so its commit snapshot covers even writes pipelined ahead
+	// of it: each shard's no-op sub-command runs behind everything this
+	// connection enqueued earlier, per-shard FIFO, and the gathered merge
+	// parks the reply on the write log's commit barrier (shard waitaof.go).
+	// Both arm the reader barrier like BLPOP: Redis blocks the whole client,
+	// so a command pipelined behind an unresolved wait must not run.
+	register("WAIT", waitCmd, 2, 2, false)
+	table["WAIT"].blocks = true
+	register("WAITAOF", nil, 3, 3, false)
+	table["WAITAOF"].waitaof = true
+	table["WAITAOF"].fanOp = registerShard(waitaofSub)
 
 	// FLUSHALL scatters a reset intent to every shard; each owner rebuilds
 	// its store empty and the gather answers +OK only after every shard has
@@ -701,6 +726,9 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 	}
 	if e.durability {
 		return dispatchDurability(c, e, args)
+	}
+	if e.waitaof {
+		return dispatchWaitAOF(c, e, args)
 	}
 	if e.fan != 0 && (e.fanOnly || n > 1) {
 		return dispatchFan(c, e, args)

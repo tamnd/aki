@@ -205,6 +205,16 @@ type WriteLog interface {
 	// so its fn never fires; the owner learns of the fence through the
 	// lease machinery and fails the connection, not through this seam.
 	NotifyCommitted(group uint16, seq uint64, fn func())
+
+	// NotifyAllCommitted runs fn once chain commits cover every frame
+	// emitted to any group before the call, the doc 04 section 3.3
+	// chain commit barrier WAITAOF numlocal=1 maps to. A log with
+	// nothing emitted, or nothing uncovered, fires fn before the call
+	// returns on the caller's goroutine; otherwise fn runs on the fold
+	// goroutine, so it must not block (Conn.CompleteBlocked is safe
+	// from either). Like NotifyCommitted it raises barrier demand, and
+	// a fenced group's frames never fold live, so fn then never fires.
+	NotifyAllCommitted(fn func())
 }
 
 // WALMark names one emitted frame, the completion target a strict ack

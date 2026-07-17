@@ -43,6 +43,13 @@ const (
 	// transaction's loopback node at the same sequence, once the barrier work
 	// has run.
 	FanTxn
+
+	// FanWaitAOF gathers WAITAOF's empty per-shard partials. The subs carry
+	// no payload; their arrival is the point, proof every shard has executed
+	// and emitted everything this connection enqueued before the WAITAOF,
+	// per-shard FIFO. The merge then snapshots the write log's commit
+	// barrier and parks the reply on the covering commits (waitaof.go).
+	FanWaitAOF
 )
 
 // maxFanKeys caps the keys one sub-command carries, so a sub-command's
@@ -77,6 +84,11 @@ type fanCmd struct {
 	// enqueue and immutable afterwards, so the owner-side read is ordered by
 	// the hop queue's publish.
 	txn *Txn
+
+	// waitaof is the FanWaitAOF coordinator's validated argument set,
+	// carried from the reader to the merge, which hands it to holdWaitAOF
+	// when the last partial lands.
+	waitaof *waitAOFSpec
 }
 
 // DoFan enqueues one tier-one multi-key command: keys are the routed keys in
@@ -269,6 +281,15 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 		// transaction's loopback node, so there is nothing to emit here.
 		// No tier-two arm emits WAL frames today; when one does, its marks
 		// must ride the loopback reply, not this coordinator.
+		return 0
+	}
+	if fc.kind == FanWaitAOF {
+		// Every shard has drained this connection's earlier commands, so
+		// the commit snapshot taken now covers even writes pipelined ahead
+		// of the WAITAOF. The reply parks on that coverage (or comes back
+		// through the same loopback inline when already covered) and the
+		// sequence stays unemitted, the holdFan rule.
+		c.holdWaitAOF(seq, fc.waitaof)
 		return 0
 	}
 	fc.out = fc.out[:0]
