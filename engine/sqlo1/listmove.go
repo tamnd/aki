@@ -39,9 +39,21 @@ func (l *List) Move(ctx context.Context, src, dst []byte, srcLeft, dstLeft bool)
 	// Copy the moving element out while the src view is live, and
 	// collect the pop side of the flush guard from the same state: the
 	// records the pop coalesces into are the src root and, noded, the
-	// edge node it rewrites or drops.
+	// edge node it rewrites or drops, plus the edge page a paged fence
+	// rewrites in place.
 	dirty := l.t.ht.dirtyKey(src)
 	if st == listNodedState {
+		if l.nodeRoot.paged {
+			pj := 0
+			if !srcLeft {
+				pj = len(l.nodeRoot.pidx) - 1
+			}
+			if err := l.loadPage(ctx, pj); err != nil {
+				return nil, false, err
+			}
+			putHashFenceKey(l.kbuf[:], l.nodeRoot.rooth, l.nodeRoot.pidx[pj].segid)
+			dirty = dirty || l.t.ht.dirtyKey(l.kbuf[:])
+		}
 		ei := 0
 		if !srcLeft {
 			ei = len(l.fence) - 1
@@ -80,6 +92,17 @@ func (l *List) Move(ctx context.Context, src, dst []byte, srcLeft, dstLeft bool)
 	}
 	dirty = dirty || l.t.ht.dirtyKey(dst)
 	if dstSt == listNodedState {
+		if l.nodeRoot.paged {
+			pj := 0
+			if !dstLeft {
+				pj = len(l.nodeRoot.pidx) - 1
+			}
+			if err := l.loadPage(ctx, pj); err != nil {
+				return nil, false, err
+			}
+			putHashFenceKey(l.kbuf[:], l.nodeRoot.rooth, l.nodeRoot.pidx[pj].segid)
+			dirty = dirty || l.t.ht.dirtyKey(l.kbuf[:])
+		}
 		ei := 0
 		if !dstLeft {
 			ei = len(l.fence) - 1

@@ -91,7 +91,10 @@ func (l *List) Index(ctx context.Context, key []byte, idx int64) ([]byte, bool, 
 	if !ok {
 		return nil, false, nil
 	}
-	ni, off := l.fenceSeek(i)
+	ni, off, err := l.fenceSeekAt(ctx, i)
+	if err != nil {
+		return nil, false, err
+	}
 	node, err := l.readNode(ctx, l.fence[ni].segid)
 	if err != nil {
 		return nil, false, err
@@ -123,7 +126,10 @@ func (l *List) Set(ctx context.Context, key []byte, idx int64, elem []byte) erro
 		if !ok {
 			return errListIndexRange
 		}
-		ni, off := l.fenceSeek(i)
+		ni, off, err := l.fenceSeekAt(ctx, i)
+		if err != nil {
+			return err
+		}
 		node, err := l.readNode(ctx, l.fence[ni].segid)
 		if err != nil {
 			return err
@@ -203,50 +209,63 @@ func (l *List) Range(ctx context.Context, key []byte, start, stop int64, begin f
 	}
 
 	// Noded: seek the start node, prefix-sum on to the last node the
-	// window touches, then walk that window in prefetched rounds. Each
-	// round's emits drain before the next round's IO recycles them,
-	// which is what keeps the RAM bound at one round.
-	ni, off := l.fenceSeek(start)
-	nj := ni
-	for acc := int64(l.fence[ni].count) - int64(off); acc < int64(n); nj++ {
-		acc += int64(l.fence[nj+1].count)
+	// current fence view contributes, then walk that span in
+	// prefetched rounds; a paged fence steps to the next page when the
+	// view runs out. Each round's emits drain before the next round's
+	// IO recycles them, which is what keeps the RAM bound at one
+	// round.
+	ni, off, err := l.fenceSeekAt(ctx, start)
+	if err != nil {
+		return err
 	}
 	remaining := n
-	for base := ni; base <= nj && remaining > 0; base += listRangeBatchNodes {
-		w := min(listRangeBatchNodes, nj+1-base)
-		l.mgKeyBuf = grow(l.mgKeyBuf, w*SubkeySize)
-		l.mgKeys = l.mgKeys[:0]
-		for j := range w {
-			k := l.mgKeyBuf[j*SubkeySize : (j+1)*SubkeySize]
-			putHashSegKey(k, l.nodeRoot.rooth, l.fence[base+j].segid)
-			l.mgKeys = append(l.mgKeys, k)
+	for remaining > 0 {
+		nj := ni
+		for acc := int64(l.fence[ni].count) - int64(off); acc < int64(remaining) && nj+1 < len(l.fence); nj++ {
+			acc += int64(l.fence[nj+1].count)
 		}
-		l.mgVals, l.mgRoots, l.mgExps, err = l.t.LookupBatch(ctx, l.mgKeys, l.mgVals, l.mgRoots, l.mgExps)
-		if err != nil {
-			return err
-		}
-		for j := 0; j < w && remaining > 0; j++ {
-			if l.mgVals[j] == nil {
-				return fmt.Errorf("sqlo1: list node %d of rooth %#x is missing", l.fence[base+j].segid, l.nodeRoot.rooth)
+		for base := ni; base <= nj && remaining > 0; base += listRangeBatchNodes {
+			w := min(listRangeBatchNodes, nj+1-base)
+			l.mgKeyBuf = grow(l.mgKeyBuf, w*SubkeySize)
+			l.mgKeys = l.mgKeys[:0]
+			for j := range w {
+				k := l.mgKeyBuf[j*SubkeySize : (j+1)*SubkeySize]
+				putHashSegKey(k, l.nodeRoot.rooth, l.fence[base+j].segid)
+				l.mgKeys = append(l.mgKeys, k)
 			}
-			node, err := decodeListNode(l.mgVals[j])
+			l.mgVals, l.mgRoots, l.mgExps, err = l.t.LookupBatch(ctx, l.mgKeys, l.mgVals, l.mgRoots, l.mgExps)
 			if err != nil {
 				return err
 			}
-			it := listElemIter{p: node.elems}
-			if base+j == ni {
-				for range off {
-					it.next()
+			for j := 0; j < w && remaining > 0; j++ {
+				if l.mgVals[j] == nil {
+					return fmt.Errorf("sqlo1: list node %d of rooth %#x is missing", l.fence[base+j].segid, l.nodeRoot.rooth)
+				}
+				node, err := decodeListNode(l.mgVals[j])
+				if err != nil {
+					return err
+				}
+				it := listElemIter{p: node.elems}
+				if base+j == ni {
+					for range off {
+						it.next()
+					}
+				}
+				for {
+					e, ok := it.next()
+					if !ok || remaining == 0 {
+						break
+					}
+					emit(e)
+					remaining--
 				}
 			}
-			for {
-				e, ok := it.next()
-				if !ok || remaining == 0 {
-					break
-				}
-				emit(e)
-				remaining--
+		}
+		if remaining > 0 {
+			if err := l.loadPage(ctx, l.pi+1); err != nil {
+				return err
 			}
+			ni, off = 0, 0
 		}
 	}
 	return nil

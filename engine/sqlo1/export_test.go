@@ -72,3 +72,24 @@ func SetZFenceCapsForTest(flat, leaf, upper, root int) (restore func()) {
 	zFenceMaxRuns, zFenceLeafMax, zFenceUpperMax, zFenceRootMax = flat, leaf, upper, root
 	return func() { zFenceMaxRuns, zFenceLeafMax, zFenceUpperMax, zFenceRootMax = of, ol, ou, or }
 }
+
+// ListFencePagedForTest reports whether key's fence has crossed to the
+// paged representation, so the paged torn-tail matrix can prove its
+// scenario really drives the pages before it starts cutting.
+func (l *List) ListFencePagedForTest(ctx context.Context, key []byte) (bool, error) {
+	st, _, _, err := l.stateOf(ctx, key)
+	if err != nil || st != listNodedState {
+		return false, err
+	}
+	return l.nodeRoot.paged, nil
+}
+
+// SetListFenceCapsForTest shrinks the list fence fanouts so the paged
+// ladder (transition, page spill, page split, third-level error) is
+// reachable in test-sized lists. Callers restore via the returned
+// func.
+func SetListFenceCapsForTest(flat, page, idx int) (restore func()) {
+	of, op, oi := listFenceMaxNodes, listFencePageMax, listFencePageIdxMax
+	listFenceMaxNodes, listFencePageMax, listFencePageIdxMax = flat, page, idx
+	return func() { listFenceMaxNodes, listFencePageMax, listFencePageIdxMax = of, op, oi }
+}
