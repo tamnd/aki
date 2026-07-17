@@ -1021,6 +1021,12 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.bzmpopCmd(ctx, reply, args)
 	case "ZRANDMEMBER":
 		return s.zrandCmd(ctx, reply, args)
+	case "ZREMRANGEBYRANK":
+		return s.zremrangeCmd(ctx, reply, args, cmd, zrangeByIndex)
+	case "ZREMRANGEBYSCORE":
+		return s.zremrangeCmd(ctx, reply, args, cmd, zrangeByScore)
+	case "ZREMRANGEBYLEX":
+		return s.zremrangeCmd(ctx, reply, args, cmd, zrangeByLex)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":
