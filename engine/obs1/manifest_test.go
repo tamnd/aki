@@ -12,9 +12,10 @@ func sampleManifest() Manifest {
 		Epoch:   7,
 		ManSeq:  3,
 		FoldPos: ChainPos{DD: 1, Seq: 900},
+		FoldSeq: 8_800,
 		Segs: []ManifestSeg{
-			{SegSeq: 10, Level: 0, TTLClass: 0, Size: 4096, NRecords: 53, RawBytes: 1300},
-			{SegSeq: 12, Level: 1, TTLClass: 2, Size: 1 << 20, NRecords: 4000, RawBytes: 900_000, MinExpMS: 5_000, MaxExpMS: 9_000, DeadFrac: 250},
+			{SegSeq: 10, Level: 0, TTLClass: 0, Size: 4096, NRecords: 53, RawBytes: 1300, FooterOff: 3900, FooterLen: 180},
+			{SegSeq: 12, Level: 1, TTLClass: 2, Size: 1 << 20, NRecords: 4000, RawBytes: 900_000, MinExpMS: 5_000, MaxExpMS: 9_000, DeadFrac: 250, FooterOff: 1<<20 - 600, FooterLen: 584},
 		},
 	}
 }
@@ -73,7 +74,7 @@ func TestManifestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.Writer != 9 || got.Group != want.Group || got.Epoch != want.Epoch || got.ManSeq != want.ManSeq || got.FoldPos != want.FoldPos {
+	if h.Writer != 9 || got.Group != want.Group || got.Epoch != want.Epoch || got.ManSeq != want.ManSeq || got.FoldPos != want.FoldPos || got.FoldSeq != want.FoldSeq {
 		t.Fatalf("parsed %+v header %+v", got, h)
 	}
 	if len(got.Segs) != 2 || got.Segs[0] != want.Segs[0] || got.Segs[1] != want.Segs[1] {
@@ -115,6 +116,8 @@ func TestManifestWriterRejects(t *testing.T) {
 		"ttl class n with zero min": seg(func(s *ManifestSeg) { s.MinExpMS = 0 }),
 		"ttl bounds inverted":       seg(func(s *ManifestSeg) { s.MinExpMS = 9_001 }),
 		"deadfrac past per-mille":   seg(func(s *ManifestSeg) { s.DeadFrac = 1001 }),
+		"footer past size":          seg(func(s *ManifestSeg) { s.FooterOff = s.Size - 100 }),
+		"sized row without footer":  seg(func(s *ManifestSeg) { s.FooterLen = 0 }),
 	}
 	over := sampleManifest()
 	over.FoldPos.Seq = chainSeqMax + 1
@@ -145,6 +148,7 @@ func TestManifestParseRejects(t *testing.T) {
 	}
 	flip("group byte", HeaderSize)
 	flip("fold pos byte", HeaderSize+14)
+	flip("fold seq byte", HeaderSize+22)
 	flip("seg row byte", HeaderSize+manFixed+2)
 	flip("crc byte", len(good)-1)
 
@@ -178,7 +182,7 @@ func TestManifestParseRejects(t *testing.T) {
 
 	// Valid crc, nsegs disagreeing with the payload length.
 	counted := append([]byte(nil), good...)
-	binary.LittleEndian.PutUint32(counted[HeaderSize+22:], 3)
+	binary.LittleEndian.PutUint32(counted[HeaderSize+30:], 3)
 	reCRC(counted)
 	if _, _, err := ParseManifest(counted); err == nil {
 		t.Error("nsegs vs payload length mismatch accepted")
