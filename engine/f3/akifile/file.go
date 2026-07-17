@@ -253,6 +253,12 @@ func (f *File) Prefix() *Prefix { return f.prefix }
 // how SyncEverySec and SyncNo make an explicit durability barrier.
 func (f *File) Sync() error { return f.doSync() }
 
+// Recover runs the open sequence against this file's device and returns the
+// structural recovery: the live root, each shard's rebuilt index roots, and the
+// offset the tail replay resumes from. It is Recover(dev) on the file's own device,
+// so a caller holding an open File does not thread the device through by hand.
+func (f *File) Recover() (*Recovery, error) { return Recover(f.dev) }
+
 // Close flushes any un-synced tail and closes the underlying device.
 func (f *File) Close() error {
 	if err := f.doSync(); err != nil {

@@ -189,7 +189,7 @@ func TestWriteIndexCheckpointPersistsDumpAndRow(t *testing.T) {
 	}
 
 	// The row points at a real index_ckpt segment for this shard.
-	h, payload, err := f.ReadSegmentAt(row.IndexCkptOff - akifile.SegHeaderLen)
+	h, payload, err := f.ReadSegmentAt(row.IndexCkptOff)
 	if err != nil {
 		t.Fatalf("read checkpoint segment: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestPersistedCheckpointDrivesRecovery(t *testing.T) {
 
 	// Read the dump straight from the segment the row names, the way a committed
 	// root's IndexCkptOff will point recovery at it.
-	_, payload, err := f2.ReadSegmentAt(row.IndexCkptOff - akifile.SegHeaderLen)
+	_, payload, err := f2.ReadSegmentAt(row.IndexCkptOff)
 	if err != nil {
 		t.Fatalf("read persisted checkpoint: %v", err)
 	}
@@ -307,6 +307,121 @@ func TestPersistedCheckpointDrivesRecovery(t *testing.T) {
 		if !ok || string(got) != want {
 			t.Fatalf("key %q read back (%q, %v), want (%q, true)", key, got, ok, want)
 		}
+	}
+}
+
+// TestCommitCheckpointRecoversEveryShard is the file-global commit end to end: two
+// shards each persist a checkpoint, one writes a tail record past it, and the rows
+// commit as one root in a single meta flip. A restart then recovers from the live
+// root alone: Recover reads the SRT and the tail offset, and each shard rebuilds its
+// index from the checkpoint the root names plus the tail, with no row handed in by
+// the test. It proves a plain reopen finds every shard's checkpoint through the one
+// committed root.
+func TestCommitCheckpointRecoversEveryShard(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "commit.aki")
+	openShard := func(f *akifile.File, shard uint16) *Store {
+		s, err := Open(Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20, AkiValueLog: f, Shard: shard})
+		if err != nil {
+			t.Fatalf("open shard %d: %v", shard, err)
+		}
+		return s
+	}
+
+	f, err := akifile.Create(path, akifile.CreateOptions{ShardCount: 4, SepThreshold: 64, Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	s0 := openShard(f, 0)
+	s1 := openShard(f, 1)
+
+	// Both shards write, then each persists its checkpoint.
+	if err := s0.SetString([]byte("a"), []byte("a1"), 0, 0, false); err != nil {
+		t.Fatalf("s0 set a: %v", err)
+	}
+	if err := s0.SetString([]byte("b"), []byte("b1"), 0, 0, false); err != nil {
+		t.Fatalf("s0 set b: %v", err)
+	}
+	if err := s1.SetString([]byte("x"), []byte("x1"), 0, 0, false); err != nil {
+		t.Fatalf("s1 set x: %v", err)
+	}
+	if err := s1.SetString([]byte("y"), []byte("y1"), 0, 0, false); err != nil {
+		t.Fatalf("s1 set y: %v", err)
+	}
+	row0, err := s0.WriteIndexCheckpoint()
+	if err != nil {
+		t.Fatalf("s0 write checkpoint: %v", err)
+	}
+	row1, err := s1.WriteIndexCheckpoint()
+	if err != nil {
+		t.Fatalf("s1 write checkpoint: %v", err)
+	}
+	// A tail record on shard 0 past its checkpoint, to prove the tail replay runs on
+	// top of the recovered dump.
+	if err := s0.SetString([]byte("a"), []byte("a2"), 0, 0, false); err != nil {
+		t.Fatalf("s0 overwrite a: %v", err)
+	}
+
+	// Gather the rows into one SRT and commit the root. The file has four shards, so
+	// the root carries a row per shard: the two idle shards take a zero row.
+	rows := make([]akifile.SRTRow, 4)
+	rows[0] = row0
+	rows[1] = row1
+	stats := akifile.CheckpointStats{RecordCount: row0.LiveRecords + row1.LiveRecords}
+	if err := CommitCheckpoint(f, rows, stats); err != nil {
+		t.Fatalf("commit checkpoint: %v", err)
+	}
+	if err := s0.Close(); err != nil {
+		t.Fatalf("close s0: %v", err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("close s1: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	// Restart: read the committed root and recover each shard from it alone.
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	t.Cleanup(func() { _ = f2.Close() })
+	rec, err := f2.Recover()
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if rec.SRT == nil || len(rec.SRT.Rows) != 4 {
+		t.Fatalf("recovered SRT rows = %v, want 4", rec.SRT)
+	}
+	if rec.SRT.Rows[0].LiveRecords != 2 || rec.SRT.Rows[1].LiveRecords != 2 {
+		t.Fatalf("recovered live counts = %d, %d, want 2, 2", rec.SRT.Rows[0].LiveRecords, rec.SRT.Rows[1].LiveRecords)
+	}
+
+	// Each shard rebuilds from the checkpoint the root names plus the shared tail.
+	want := []map[string]string{
+		0: {"a": "a2", "b": "b1"},
+		1: {"x": "x1", "y": "y1"},
+	}
+	for shard := uint16(0); shard < 2; shard++ {
+		r := openShard(f2, shard)
+		row := rec.SRT.Rows[shard]
+		_, payload, err := f2.ReadSegmentAt(row.IndexCkptOff)
+		if err != nil {
+			t.Fatalf("shard %d read checkpoint: %v", shard, err)
+		}
+		if err := r.ReplayFromCheckpoint(payload, 0); err != nil {
+			t.Fatalf("shard %d replay from checkpoint: %v", shard, err)
+		}
+		if err := r.ReplayTail(rec.TailFrom, 0); err != nil {
+			t.Fatalf("shard %d replay tail: %v", shard, err)
+		}
+		for key, val := range want[shard] {
+			got, ok := r.GetString([]byte(key), 0, nil)
+			if !ok || string(got) != val {
+				t.Fatalf("shard %d key %q read back (%q, %v), want (%q, true)", shard, key, got, ok, val)
+			}
+		}
+		_ = r.Close()
 	}
 }
 

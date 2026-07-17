@@ -116,17 +116,18 @@ func (l *akiRlog) walkShardFrom(from uint64, visit func(addr uint64, row akifile
 func (l *akiRlog) cursor() uint64 { return l.f.Cursor() }
 
 // writeCheckpoint appends payload as this shard's index checkpoint segment and
-// returns the absolute offset of the payload bytes, the IndexCkptOff an SRT row
-// records so recovery reads the dump straight from the live root. The segment is
-// KindIndexCkpt, not KindLog, so a tail replay skips it: it rides the append tail
-// only to be pointed at, never walked as a record. It appends but does not commit,
-// the meta flip that names the segment live is the coordinator's.
+// returns the absolute offset of the segment header, the IndexCkptOff an SRT row
+// records: recovery walks the checkpoint chain by reading the segment header there
+// (RebuildShardIndex), so the row names the header start, not the payload. The
+// segment is KindIndexCkpt, not KindLog, so a tail replay skips it: it rides the
+// append tail only to be pointed at, never walked as a record. It appends but does
+// not commit, the meta flip that names the segment live is the coordinator's.
 func (l *akiRlog) writeCheckpoint(payload []byte) (uint64, error) {
 	offs, err := l.f.AppendGroup([]akifile.Pending{{Shard: l.shard, Kind: akifile.KindIndexCkpt, Payload: payload}})
 	if err != nil {
 		return 0, err
 	}
-	return offs[0] + akifile.SegHeaderLen, nil
+	return offs[0], nil
 }
 
 // readAt decodes a published record from its absolute frame address, the deref the
