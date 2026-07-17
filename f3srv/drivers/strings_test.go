@@ -64,6 +64,45 @@ func TestStringPointSurface(t *testing.T) {
 	expect(t, br, ":20\r\n")
 }
 
+// TestGetdel walks GETDEL: it returns the value and removes the key in one
+// step, reads a missing or already-taken key as nil, and reaches only the
+// string keyspace, the same as GET.
+func TestGetdel(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// Present key: the value comes back and the key is gone after.
+	send(t, nc, "SET", "k", "hello")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "GETDEL", "k")
+	expect(t, br, "$5\r\nhello\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$-1\r\n")
+	send(t, nc, "EXISTS", "k")
+	expect(t, br, ":0\r\n")
+
+	// A second GETDEL and a GETDEL of a never-set key both read as nil.
+	send(t, nc, "GETDEL", "k")
+	expect(t, br, "$-1\r\n")
+	send(t, nc, "GETDEL", "missing")
+	expect(t, br, "$-1\r\n")
+
+	// An int-cell value round-trips byte-identical through GETDEL.
+	send(t, nc, "SET", "n", "-42")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "GETDEL", "n")
+	expect(t, br, "$3\r\n-42\r\n")
+	send(t, nc, "EXISTS", "n")
+	expect(t, br, ":0\r\n")
+
+	// A live TTL key still returns its value and is then gone.
+	send(t, nc, "SET", "t", "vv", "EX", "100")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "GETDEL", "t")
+	expect(t, br, "$2\r\nvv\r\n")
+	send(t, nc, "GET", "t")
+	expect(t, br, "$-1\r\n")
+}
+
 // TestSetOptions exercises the NX/XX/GET/KEEPTTL/expiry option matrix against
 // the Redis answers.
 func TestSetOptions(t *testing.T) {
