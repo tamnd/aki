@@ -128,6 +128,7 @@ func init() {
 	register("TIME", timeCmd, 0, 0, false)
 	register("SELECT", selectDB, 1, 1, false)
 	register("LOLWUT", lolwut, 0, -1, false)
+	register("RESET", reset, 0, 0, false)
 
 	// The string point surface. SET's tail is option soup, so the handler
 	// validates it.
@@ -964,4 +965,14 @@ func timeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // never errors on LOLWUT's tail.
 func lolwut(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Bulk([]byte("aki\n"))
+}
+
+// reset answers RESET: return the connection to its initial state and reply
+// +RESET. Redis resets the selected database, any MULTI, WATCH, subscriptions,
+// MONITOR, reply mode, and authentication. f3 offers a single database (SELECT
+// only accepts 0), speaks RESP2 with no HELLO, and carries none of that
+// per-connection state, so there is nothing to unwind: the honest reset for this
+// feature set is the +RESET acknowledgement itself.
+func reset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	r.Status("RESET")
 }
