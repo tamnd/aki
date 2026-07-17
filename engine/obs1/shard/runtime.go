@@ -40,6 +40,12 @@ type Runtime struct {
 	// before Start under the same fixed-before-Start rule as netInfo.
 	walInfo func([]byte) []byte
 
+	// wlog is the durability seam SetWriteLog wired, nil on a volatile
+	// runtime; the same value every worker Ctx holds as Log, kept here so
+	// connection-side code (Conn.WriteLogged) can ask whether the node has a
+	// pipeline at all. Fixed before Start.
+	wlog WriteLog
+
 	// live counts connections currently being served across every driver. The
 	// connection writers read it in idleOnce to decide whether to spin before
 	// they park (see connSpinHighWater): past the high-water the box is

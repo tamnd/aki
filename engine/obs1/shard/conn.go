@@ -71,6 +71,14 @@ type Conn struct {
 	// cross-goroutine load CanEnqueue makes. Reader side.
 	blockAt atomic.Uint32
 
+	// strictAck holds the connection's ack mode (doc 04 section 3.2): set,
+	// each write's reply parks until the chain commit covering its frames;
+	// clear (the default), the buffer append is the ack. Written by the
+	// reader when it dispatches AKI.DURABILITY (writelog.go SetStrictAck),
+	// read by owner goroutines when a write emits (Ctx.noteMark), hence
+	// atomic.
+	strictAck atomic.Bool
+
 	// published is the reader's issued-sequence watermark at its last publish:
 	// the value of seq the last time a node went onto a shard queue. Some
 	// commands below it may still sit in other shards' pending nodes at that

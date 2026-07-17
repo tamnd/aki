@@ -94,6 +94,15 @@ type Ctx struct {
 	// optimization. A fresh call runs at 0; single-key writes never set it. Owner
 	// goroutine only.
 	resume int
+
+	// marks accumulates the WAL frames the running command emitted, only when
+	// its connection asked for strict acks (writelog.go noteMark): one entry
+	// per touched group carrying the group's highest seq. The worker reads it
+	// after each handler returns and parks the reply on the marks' commit
+	// (strict.go), then truncates it for the next command; on a relaxed
+	// connection or a volatile runtime it stays empty and costs one length
+	// load per command. Owner goroutine only.
+	marks []WALMark
 }
 
 // ParkFull declares a write cannot allocate right now and parks it for retry

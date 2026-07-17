@@ -23,7 +23,7 @@ func logCounter(cx *shard.Ctx, key []byte, n int64, r shard.Reply) bool {
 	}
 	var nb [20]byte
 	out := strconv.AppendInt(nb[:0], n, 10)
-	if err := cx.Log.StrSet(key, out, cx.St.ExpireAt(key, cx.NowMs), true); err != nil {
+	if err := cx.LogStrSet(key, out, cx.St.ExpireAt(key, cx.NowMs), true); err != nil {
 		r.Err(err.Error())
 		return false
 	}
@@ -67,7 +67,7 @@ func logReadBack(cx *shard.Ctx, key []byte, r shard.Reply) bool {
 		v = buf[:filled]
 		cx.Val = v
 	}
-	if err := cx.Log.StrSet(key, v, cx.St.ExpireAt(key, cx.NowMs), false); err != nil {
+	if err := cx.LogStrSet(key, v, cx.St.ExpireAt(key, cx.NowMs), false); err != nil {
 		r.Err(err.Error())
 		return false
 	}
