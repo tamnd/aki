@@ -1,7 +1,6 @@
 package obs1_test
 
 import (
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -93,11 +92,16 @@ func TestFlusherAppendRun(t *testing.T) {
 	}
 }
 
-// TestFlusherAppendRunCapUnit proves cap admission treats the run as one
-// unit: a run whose total tops the cap is refused whole even though each
-// frame alone would fit, and the buffer stays usable.
-func TestFlusherAppendRunCapUnit(t *testing.T) {
-	store := sim.New(sim.Config{})
+// TestFlusherAppendRunOverCap proves an over-cap run is accepted whole:
+// refusing or splitting it would break the run's atomicity or the
+// per-group seq order, so the buffer takes it and the lag flag rises for
+// the shard gate instead. The slow PUT keeps the flag observably up.
+func TestFlusherAppendRunOverCap(t *testing.T) {
+	store := sim.New(sim.Config{
+		Latency: sim.LatencyModel{
+			Put: sim.Dist{P50: 200 * time.Millisecond, P99: 400 * time.Millisecond},
+		},
+	})
 	snk := newChanSink()
 	fl, err := obs1.NewFlusher(obs1.FlusherConfig{
 		Store: store, Sink: snk, Prefix: "p", Node: 12,
@@ -113,10 +117,17 @@ func TestFlusherAppendRunCapUnit(t *testing.T) {
 	for i := range run {
 		run[i] = opFrame(t, 0, uint64(i+1), "k", obs1.StrSet{Value: val})
 	}
-	if err := fl.AppendRun(1, 1, run); !errors.Is(err, obs1.ErrWALFull) {
-		t.Fatalf("over-cap run gave %v, want ErrWALFull", err)
+	if err := fl.AppendRun(1, 1, run); err != nil {
+		t.Fatalf("over-cap run: %v", err)
 	}
-	if err := fl.AppendRun(1, 1, run[:2]); err != nil {
-		t.Fatalf("in-cap run after refusal: %v", err)
+	if !fl.Lagged() {
+		t.Fatal("lag flag down right after an over-cap run")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for fl.Lagged() {
+		if time.Now().After(deadline) {
+			t.Fatal("lag flag never cleared")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
