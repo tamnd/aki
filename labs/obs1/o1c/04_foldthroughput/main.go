@@ -212,7 +212,11 @@ func main() {
 	quick := flag.Bool("quick", false, "small cells, smoke only")
 	flag.Parse()
 
-	valSizes := []int{16, 200, 2048}
+	// The store separates values over 1 KiB into the vlog by construction,
+	// and separated records never enter the cold-stage path (the scored run
+	// proved it: 2 KiB cells dry-loop while NeedsColdDrain stays true), so
+	// the stage cells stay inside the embedded band.
+	valSizes := []int{16, 200, 1000}
 	passSizes := []int{1 << 20, 4 << 20, 8 << 20, 16 << 20}
 	cfg := stageCfg{targetBytes: 160 << 20, arenaBytes: 512 << 20, capBytes: 128 << 20, marginBytes: 48 << 20}
 	buildSegs := 4

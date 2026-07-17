@@ -24,6 +24,13 @@ Smoke exposure: the -quick run exposed the (200 B, 8 MiB) stage cell and both bu
 5. Build rate: 900 to 1400 MiB/s per core at 200 B records (smoke-calibrated), 3000 to 4500 at 2 KiB. Composed with the #1097 zstd-1 compress rates, one I/O-pool core sustains at least 400 MiB/s of build-plus-compress at 200 B, comfortably above any single-node design ingest.
 6. Dry passes stay near zero: the hand's heat-clearing revolution does not starve a pressured store.
 
+## Amendment (filed after the first scored attempt, before the rerun)
+
+The first scored run refuted the 2 KiB stage cells structurally, not numerically: the store separates values over 1 KiB into the vlog by construction, separated records never enter the cold-stage path, and the cells dry-looped 10000 hand revolutions while NeedsColdDrain stayed true.
+That is a finding, not a harness bug: fold's stage machinery covers the embedded band only, separated and chunked values reach segments by their own route (their bytes already live off-arena), and the fold slice has to account for both populations; the shard worker survives the same shape today by returning on an empty drain and paying one fruitless hand revolution per tick.
+The stage sweep therefore replaces 2 KiB with 1000 B, the embedded ceiling, and prediction 1's 2 KiB band transfers as: 1000 B stall rate 2000 to 5000 MiB/s, 8 MiB stall p50 1.6 to 4 ms, owner tax at 100 MiB/s at most 5%.
+The build cells keep 2 KiB records, since the encoder does not care where the store kept the bytes.
+
 ## Run
 
     ./run.sh            # full sweep, writes foldthroughput.csv
