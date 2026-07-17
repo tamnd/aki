@@ -1,7 +1,6 @@
 package obs1_test
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -106,7 +105,16 @@ func TestLeaseGateRenewsOnCommit(t *testing.T) {
 	rig := newLogRig(t, store, node)
 	rig.grant(t, node, 1, 0, 1)
 	gate := obs1.NewLeaseGate(time.Hour, time.Minute)
-	wl := newTestLog(t, rig, node, obs1.WriteLogConfig{Gate: gate})
+	// The committer fires OnAppended before OnCommitted, so this channel is
+	// the happens-after edge the assertions wait on; the watermark wake
+	// alone is not, because it rides the fold inside Append itself.
+	committed := make(chan struct{}, 1)
+	wl := newTestLog(t, rig, node, obs1.WriteLogConfig{Gate: gate, OnCommitted: func(uint64, obs1.ChainPos) {
+		select {
+		case committed <- struct{}{}:
+		default:
+		}
+	}})
 	defer func() {
 		if err := wl.Close(); err != nil {
 			t.Errorf("close: %v", err)
@@ -132,10 +140,10 @@ func TestLeaseGateRenewsOnCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	wl.Barrier()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := wl.Marks().Wait(ctx, 0, 1); err != nil {
-		t.Fatalf("Wait group 0: %v", err)
+	select {
+	case <-committed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no commit within 10s")
 	}
 	if gate.Renewals() <= before {
 		t.Fatal("the commit did not move the renewal count")
