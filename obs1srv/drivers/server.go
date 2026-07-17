@@ -358,6 +358,7 @@ func Listen(o Options) (*Server, error) {
 		go func() { _ = http.Serve(pln, mux) }()
 	}
 	s.rt.Use(dispatch.Handlers())
+	s.rt.UseWriteOps(dispatch.WriteOps())
 	s.rt.UseDemoter(dispatch.Demoter())
 	if o.WriteLog != nil {
 		s.rt.SetWriteLog(o.WriteLog)
