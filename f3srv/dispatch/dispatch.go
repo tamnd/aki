@@ -173,6 +173,12 @@ func init() {
 	register("EXISTS", existsCmd, 1, -1, true)
 	register("DEL", delCmd, 1, -1, true)
 	register("UNLINK", delCmd, 1, -1, true)
+	// TOUCH counts how many of its keys exist, spanning every keyspace exactly as
+	// EXISTS does, so it shares the same point handler and fan sub-handler. Its
+	// only extra contract is refreshing each key's access time for the eviction
+	// clock; that bump is a no-op here until the LTM access-tracking slice wires
+	// it, and it is not observable in the reply, so the count is the whole answer.
+	register("TOUCH", existsCmd, 1, -1, true)
 	// The read-only expiry queries and PERSIST span every keyspace, so their
 	// handlers live here alongside TYPE and EXISTS: a collection key reads as
 	// live with no deadline (-1) rather than the missing-key -2 the set-only
@@ -191,6 +197,7 @@ func init() {
 	register("MGET", nil, 1, -1, true)
 	register("MSET", nil, 2, -1, true)
 	registerFan("EXISTS", shard.FanCount, exists, false, false)
+	registerFan("TOUCH", shard.FanCount, exists, false, false)
 	registerFan("DEL", shard.FanCount, del, false, false)
 	registerFan("UNLINK", shard.FanCount, del, false, false)
 	registerFan("MGET", shard.FanMGet, mget, false, true)
