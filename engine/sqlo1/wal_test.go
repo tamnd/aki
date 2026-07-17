@@ -277,3 +277,70 @@ func TestWalRingRecycles(t *testing.T) {
 		t.Fatalf("recycled ring resumed at %d, want 43", seq)
 	}
 }
+
+// A recycled segment keeps its previous-life chain on disk until it is
+// actually overwritten, and that remnant can carry lower seqs than
+// every live segment while the frames that once connected it to the
+// tail are gone. Reopen must anchor on the chain ending at the highest
+// seq, not the lowest firstSeq, or the whole live tail is discarded as
+// a previous life. Found by the xcatchup 10M build losing 439K acked
+// entries across a clean close.
+func TestWalStaleRemnantReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "remnant.aki-wal")
+	segSize := int64(1 << 12)
+	w, err := openWAL(path, testDBID, segSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("r"), 300) // flen 328, 12 per segment
+
+	write := func(n int) {
+		t.Helper()
+		for range n {
+			if _, err := w.Append(0, walOpPut, 0, payload); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// Four segments, then two recycle rounds: seg0 hosts 49..60, gets
+	// trimmed, and is overwritten by 73..84. That destroys the frames
+	// connecting the stale seg2+seg3 remnant (25..48) to the live
+	// chain (61..84), which is exactly the ring state a long build
+	// leaves behind.
+	write(48)
+	w.SetTrim(24)
+	write(12) // recycles seg0: 49..60
+	w.SetTrim(60)
+	write(12) // recycles seg1: 61..72
+	write(12) // recycles seg0 again: 73..84
+	w.Close()
+
+	w, err = openWAL(path, testDBID, segSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if w.LastSeq() != 84 {
+		t.Fatalf("reopen resumed at %d, want 84: the stale remnant won the chain", w.LastSeq())
+	}
+	w.SetTrim(60)
+	got := replayAll(t, w)
+	if len(got) != 24 || got[0].Seq != 61 || got[len(got)-1].Seq != 84 {
+		t.Fatalf("replay: %d frames, first %d, last %d; want 24 frames 61..84",
+			len(got), got[0].Seq, got[len(got)-1].Seq)
+	}
+
+	// The disconnected remnant segments were recycled on open: further
+	// writes reuse them instead of growing the file.
+	write(12)
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size() != 4*segSize {
+		t.Fatalf("file %d bytes after post-reopen writes, want 4 segments still", st.Size())
+	}
+}

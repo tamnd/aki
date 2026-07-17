@@ -133,23 +133,48 @@ func openWAL(path string, dbID uint64, segSize int64) (*wal, error) {
 		f.Close()
 		return nil, err
 	}
-	// The tail segment is the live one with the highest firstSeq; the
-	// chain must reach it through every live segment in seq order, and
-	// anything that does not connect is a previous life to recycle.
-	order := w.liveOrder()
-	last := uint64(0)
-	w.cur = 0
-	for _, i := range order {
-		if last != 0 && w.segs[i].firstSeq != last+1 {
-			w.segs[i] = walSeg{off: w.segs[i].off}
-			continue
+	// The live chain is the one ending at the highest seq. A recycled
+	// segment keeps its whole previous-life chain on disk until it is
+	// actually reused, and that remnant can carry a lower firstSeq than
+	// every live segment, so anchoring at the lowest firstSeq would
+	// adopt the remnant and discard the real tail as a previous life.
+	// Walking backward from the highest lastSeq keeps every segment
+	// that connects into the tail, subsumed predecessors included, and
+	// recycles the rest.
+	tail := -1
+	for i := range w.segs {
+		if w.segs[i].firstSeq != 0 && (tail < 0 || w.segs[i].lastSeq > w.segs[tail].lastSeq) {
+			tail = i
 		}
-		last = w.segs[i].lastSeq
-		w.cur = i
 	}
-	if last != 0 {
-		w.nextSeq = last + 1
+	w.cur = 0
+	if tail < 0 {
+		return w, nil
 	}
+	inChain := make([]bool, len(w.segs))
+	inChain[tail] = true
+	for head := tail; ; {
+		next := -1
+		for i := range w.segs {
+			if !inChain[i] && w.segs[i].firstSeq != 0 &&
+				w.segs[i].lastSeq+1 == w.segs[head].firstSeq {
+				next = i
+				break
+			}
+		}
+		if next < 0 {
+			break
+		}
+		inChain[next] = true
+		head = next
+	}
+	for i := range w.segs {
+		if w.segs[i].firstSeq != 0 && !inChain[i] {
+			w.segs[i] = walSeg{off: w.segs[i].off}
+		}
+	}
+	w.cur = tail
+	w.nextSeq = w.segs[tail].lastSeq + 1
 	return w, nil
 }
 
@@ -367,8 +392,9 @@ func (w *wal) Replay(fn func(walFrame) error) error {
 	order := w.liveOrder()
 	after := uint64(0)
 	for _, i := range order {
-		if w.segs[i].lastSeq != 0 && w.segs[i].lastSeq <= w.trimSeq && after == 0 {
-			// Wholly subsumed segments still anchor the seq chain.
+		if w.segs[i].lastSeq != 0 && w.segs[i].lastSeq <= w.trimSeq {
+			// Wholly subsumed segments anchor the seq chain without a
+			// rescan; open already verified their frames.
 			after = w.segs[i].lastSeq
 			continue
 		}
