@@ -95,6 +95,80 @@ func TestWriteBarrierRefusesInconsistent(t *testing.T) {
 	}
 }
 
+// TestCommitSnapshotRootRoundTrips cuts a barrier, commits the SRT as that barrier's
+// snapshot root, and recovers the file: the live root reads back flagged as a snapshot
+// naming the same watermark, so the copy path finds the cut through the meta chain without
+// scanning the log.
+func TestCommitSnapshotRootRoundTrips(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	if _, err := f.AppendGroup([]Pending{{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("data")}}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	_, wbar, err := f.WriteBarrier(nil)
+	if err != nil {
+		t.Fatalf("write barrier: %v", err)
+	}
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	if err := f.CommitSnapshotRoot(&SRT{Gen: 5, Rows: rows}, nil, CheckpointStats{Clean: true}, CheckpointGlobals{}, wbar); err != nil {
+		t.Fatalf("commit snapshot root: %v", err)
+	}
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if rec.SRT == nil || !rec.SRT.IsSnapshotRoot() {
+		t.Fatalf("recovered root not flagged as a snapshot: %+v", rec.SRT)
+	}
+	if rec.SRT.SnapWbar != wbar {
+		t.Fatalf("snapshot watermark = %d, want %d", rec.SRT.SnapWbar, wbar)
+	}
+}
+
+// TestCommitSnapshotRootRejectsZeroWatermark refuses a snapshot commit at watermark zero,
+// which a reader could not tell from an ordinary root, and leaves the stream untouched so
+// the previous live root stays in force.
+func TestCommitSnapshotRootRejectsZeroWatermark(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	seqBefore, curBefore := f.GlobalSeq(), f.Cursor()
+	rows := make([]SRTRow, prefix.ShardCount)
+	if err := f.CommitSnapshotRoot(&SRT{Gen: 1, Rows: rows}, nil, CheckpointStats{}, CheckpointGlobals{}, 0); err != ErrSnapshotWatermark {
+		t.Fatalf("err = %v, want ErrSnapshotWatermark", err)
+	}
+	if f.GlobalSeq() != seqBefore || f.Cursor() != curBefore {
+		t.Fatalf("refused commit still advanced the stream: seq %d->%d cursor %d->%d",
+			seqBefore, f.GlobalSeq(), curBefore, f.Cursor())
+	}
+}
+
+// TestCommitSnapshotRootIsOrdinaryCheckpoint confirms a checkpoint committed the plain way
+// stays an ordinary root: no snapshot flag, zero watermark, so only CommitSnapshotRoot ever
+// marks a cut.
+func TestCommitSnapshotRootIsOrdinaryCheckpoint(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	if err := f.Checkpoint(&SRT{Gen: 2, Rows: rows}, nil, CheckpointStats{Clean: true}); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if rec.SRT == nil || rec.SRT.IsSnapshotRoot() || rec.SRT.SnapWbar != 0 {
+		t.Fatalf("ordinary checkpoint reads as a snapshot root: %+v", rec.SRT)
+	}
+}
+
 // TestWriteBarrierEmptyShards cuts a barrier over no shards: a valid watermark-only cut
 // that reads back with an empty shard list.
 func TestWriteBarrierEmptyShards(t *testing.T) {
