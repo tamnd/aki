@@ -49,9 +49,15 @@ func Xclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	con.seenTime = cx.NowMs
 
 	claimed := make([]streamID, 0, len(ids))
+	var dropMs, dropSeqs []uint64
 	for _, id := range ids {
-		if res := grp.claimOne(s, id, con, cx.NowMs, minIdle, opts); res.claimed {
+		res := grp.claimOne(s, id, con, cx.NowMs, minIdle, opts)
+		switch {
+		case res.claimed:
 			claimed = append(claimed, res.id)
+		case res.deleted:
+			dropMs = append(dropMs, res.id.ms)
+			dropSeqs = append(dropSeqs, res.id.seq)
 		}
 	}
 	// Taking at least one entry is an active operation for the target consumer, so it
@@ -64,8 +70,39 @@ func Xclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// A claim can create the target consumer and, under FORCE, add a pending slab for
 	// a not-yet-pending entry; reconcile the footprint into the running sum.
 	g.note(s)
+	if err := logClaim(cx, grp, key, name, conName, claimed, dropMs, dropSeqs); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	cx.Aux = frameClaim(cx.Aux[:0], s, claimed, opts.justid)
 	r.Raw(cx.Aux)
+}
+
+// logClaim frames a claim path's effect: the claimed ids with the delivery time
+// and count the option soup resolved to, read back from the pending slabs the
+// claim just rewrote so the frame always carries post-decision state, plus the
+// ids the path dropped for pointing at removed log entries. Nothing claimed and
+// nothing dropped frames nothing.
+func logClaim(cx *shard.Ctx, grp *streamGroup, key, name, conName []byte, claimed []streamID, dropMs, dropSeqs []uint64) error {
+	if len(claimed) == 0 && len(dropMs) == 0 {
+		return nil
+	}
+	var ms, seqs []uint64
+	var times []int64
+	var counts []uint16
+	if len(claimed) > 0 {
+		ms = make([]uint64, len(claimed))
+		seqs = make([]uint64, len(claimed))
+		times = make([]int64, len(claimed))
+		counts = make([]uint16, len(claimed))
+		for i, id := range claimed {
+			ms[i], seqs[i] = id.ms, id.seq
+			if pe, ok := grp.pel.find(id); ok {
+				times[i], counts[i] = pe.deliveryTime, pe.deliveryCount
+			}
+		}
+	}
+	return cx.LogStreamClaim(key, name, conName, false, ms, seqs, times, counts, dropMs, dropSeqs)
 }
 
 // parseClaim reads the id list and the option tail of an XCLAIM (or the option

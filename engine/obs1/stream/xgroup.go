@@ -99,6 +99,10 @@ func xgroupCreate(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// A new group upgrades an inline stream to native and adds the group cell, so the
 	// footprint moves; reconcile it into the running sum at the boundary.
 	g.note(s)
+	if err := cx.LogStreamGroupNew(key, created, name, start.ms, start.seq, read, valid); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	r.Status("OK")
 }
 
@@ -127,6 +131,10 @@ func xgroupSetID(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	grp.lastDeliveredID = start
 	grp.entriesRead = read
 	grp.readValid = valid
+	if err := cx.LogStreamGroupSetID(key, name, start.ms, start.seq, read, valid); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	r.Status("OK")
 }
 
@@ -153,6 +161,10 @@ func xgroupDestroy(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// Dropping the group frees its consumer cells and pending ledger, so the
 	// footprint falls; reconcile the drop into the running sum.
 	g.note(s)
+	if err := cx.LogStreamGroupDrop(key, name); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	r.Int(1)
 }
 
@@ -168,6 +180,10 @@ func xgroupCreateConsumer(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	if grp.createConsumer(con, cx.NowMs) {
 		g.note(s)
+		if err := cx.LogStreamConsumerNew(key, name, con, cx.NowMs); err != nil {
+			r.Err(err.Error())
+			return
+		}
 		r.Int(1)
 		return
 	}
@@ -184,10 +200,20 @@ func xgroupDelConsumer(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if !ok {
 		return
 	}
+	// A zero return is ambiguous between a missing consumer and one that held
+	// nothing, and removing an empty consumer still frees its cell, so check
+	// existence before the removal to gate the frame.
+	existed := grp.consumer(con) != nil
 	n := grp.delConsumer(con)
 	// A consumer removal frees its cell and reassigns its pending entries; reconcile
 	// the footprint change into the running sum.
 	g.note(s)
+	if existed {
+		if err := cx.LogStreamConsumerDel(key, name, con); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
 	r.Int(n)
 }
 

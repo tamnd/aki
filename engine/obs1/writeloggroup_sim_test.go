@@ -50,42 +50,47 @@ func TestWriteLogGroupEmission(t *testing.T) {
 	if _, seq, err := wl.StreamAck(alpha, grp, []uint64{10}, []uint64{0}); err != nil || seq != 7 {
 		t.Fatalf("StreamAck mark = (%d, %v), want seq 7", seq, err)
 	}
-	// XCLAIM moving the survivor: one gclaim, seq 8.
-	if _, seq, err := wl.StreamClaim(alpha, grp, []byte("c2"), false, []uint64{10}, []uint64{1}, []int64{1700000000004}, []uint16{2}); err != nil || seq != 8 {
-		t.Fatalf("StreamClaim mark = (%d, %v), want seq 8", seq, err)
+	// XCLAIM moving the survivor and dropping an id whose log entry is
+	// gone: gclaim then gack as one run, seqs 8 and 9, the mark is the
+	// last.
+	if _, seq, err := wl.StreamClaim(alpha, grp, []byte("c2"), false, []uint64{10}, []uint64{1}, []int64{1700000000004}, []uint16{2}, []uint64{9}, []uint64{5}); err != nil || seq != 9 {
+		t.Fatalf("StreamClaim mark = (%d, %v), want seq 9", seq, err)
 	}
-	// XNACK back to unowned: one gclaim with the unowned flag, seq 9.
-	if _, seq, err := wl.StreamClaim(alpha, grp, nil, true, []uint64{10}, []uint64{1}, []int64{0}, []uint16{2}); err != nil || seq != 9 {
-		t.Fatalf("unowned StreamClaim mark = (%d, %v), want seq 9", seq, err)
+	// XNACK back to unowned: one gclaim with the unowned flag, seq 10.
+	if _, seq, err := wl.StreamClaim(alpha, grp, nil, true, []uint64{10}, []uint64{1}, []int64{0}, []uint16{2}, nil, nil); err != nil || seq != 10 {
+		t.Fatalf("unowned StreamClaim mark = (%d, %v), want seq 10", seq, err)
 	}
-	// DELCONSUMER: one gconsumerdel, seq 10.
-	if _, seq, err := wl.StreamConsumerDel(alpha, grp, con); err != nil || seq != 10 {
-		t.Fatalf("StreamConsumerDel mark = (%d, %v), want seq 10", seq, err)
+	// DELCONSUMER: one gconsumerdel, seq 11.
+	if _, seq, err := wl.StreamConsumerDel(alpha, grp, con); err != nil || seq != 11 {
+		t.Fatalf("StreamConsumerDel mark = (%d, %v), want seq 11", seq, err)
 	}
-	// DESTROY that returned 1: one gdrop, seq 11.
-	if _, seq, err := wl.StreamGroupDrop(alpha, grp); err != nil || seq != 11 {
-		t.Fatalf("StreamGroupDrop mark = (%d, %v), want seq 11", seq, err)
+	// DESTROY that returned 1: one gdrop, seq 12.
+	if _, seq, err := wl.StreamGroupDrop(alpha, grp); err != nil || seq != 12 {
+		t.Fatalf("StreamGroupDrop mark = (%d, %v), want seq 12", seq, err)
 	}
 
 	// Refused emissions are the encode bug row and burn no seq: the next
-	// emission still takes seq 12.
+	// emission still takes seq 13.
 	if _, _, err := wl.StreamAck(alpha, grp, nil, nil); err == nil || err.Error() != "ERR internal: wal encode" {
 		t.Fatalf("empty StreamAck gave %v", err)
 	}
 	if _, _, err := wl.StreamDeliver(alpha, grp, con, false, 1, []uint64{1, 2}, []uint64{0}); err == nil || err.Error() != "ERR internal: wal encode" {
 		t.Fatalf("mismatched StreamDeliver gave %v", err)
 	}
-	if _, _, err := wl.StreamClaim(alpha, grp, con, true, []uint64{1}, []uint64{0}, []int64{5}, []uint16{1}); err == nil || err.Error() != "ERR internal: wal encode" {
+	if _, _, err := wl.StreamClaim(alpha, grp, con, true, []uint64{1}, []uint64{0}, []int64{5}, []uint16{1}, nil, nil); err == nil || err.Error() != "ERR internal: wal encode" {
 		t.Fatalf("unowned StreamClaim naming a consumer gave %v", err)
 	}
-	if _, seq, err := wl.StreamGroupDrop(alpha, []byte("g2")); err != nil || seq != 12 {
-		t.Fatalf("StreamGroupDrop after refusals = (%d, %v), want seq 12", seq, err)
+	if _, _, err := wl.StreamClaim(alpha, grp, con, false, nil, nil, nil, nil, nil, nil); err == nil || err.Error() != "ERR internal: wal encode" {
+		t.Fatalf("both-halves-empty StreamClaim gave %v", err)
+	}
+	if _, seq, err := wl.StreamGroupDrop(alpha, []byte("g2")); err != nil || seq != 13 {
+		t.Fatalf("StreamGroupDrop after refusals = (%d, %v), want seq 13", seq, err)
 	}
 
 	wl.Barrier()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := wl.Marks().Wait(ctx, 0, 12); err != nil {
+	if err := wl.Marks().Wait(ctx, 0, 13); err != nil {
 		t.Fatalf("Wait group 0: %v", err)
 	}
 
@@ -94,8 +99,8 @@ func TestWriteLogGroupEmission(t *testing.T) {
 		t.Fatalf("sections = %+v, want group 0 alone", secs)
 	}
 	g0 := secs[0].Frames
-	if len(g0) != 12 {
-		t.Fatalf("frame count = %d, want 12", len(g0))
+	if len(g0) != 13 {
+		t.Fatalf("frame count = %d, want 13", len(g0))
 	}
 	ops := make([]obs1.Op, len(g0))
 	for i, f := range g0 {
@@ -138,23 +143,26 @@ func TestWriteLogGroupEmission(t *testing.T) {
 	if string(gc.Consumer) != "c2" || gc.Unowned || gc.TimeMs[0] != 1700000000004 || gc.Counts[0] != 2 {
 		t.Fatalf("frame 8 = %+v", gc)
 	}
-	gc = ops[8].(obs1.GroupDelta).Sub.(obs1.GClaim)
+	if ga := ops[8].(obs1.GroupDelta).Sub.(obs1.GAck); len(ga.IDMs) != 1 || ga.IDMs[0] != 9 || ga.IDSeq[0] != 5 {
+		t.Fatalf("frame 9 = %+v, want the claim path's dropped id as a gack", ga)
+	}
+	gc = ops[9].(obs1.GroupDelta).Sub.(obs1.GClaim)
 	if !gc.Unowned || len(gc.Consumer) != 0 || gc.IDSeq[0] != 1 || gc.Counts[0] != 2 {
-		t.Fatalf("frame 9 = %+v", gc)
+		t.Fatalf("frame 10 = %+v", gc)
 	}
-	if cd := ops[9].(obs1.GroupDelta).Sub.(obs1.GConsumerDel); string(cd.Group) != "g1" || string(cd.Consumer) != "c1" {
-		t.Fatalf("frame 10 = %+v", cd)
+	if cd := ops[10].(obs1.GroupDelta).Sub.(obs1.GConsumerDel); string(cd.Group) != "g1" || string(cd.Consumer) != "c1" {
+		t.Fatalf("frame 11 = %+v", cd)
 	}
-	if dr := ops[10].(obs1.GroupDelta).Sub.(obs1.GDrop); string(dr.Group) != "g1" {
-		t.Fatalf("frame 11 = %+v", dr)
-	}
-	if dr := ops[11].(obs1.GroupDelta).Sub.(obs1.GDrop); string(dr.Group) != "g2" {
+	if dr := ops[11].(obs1.GroupDelta).Sub.(obs1.GDrop); string(dr.Group) != "g1" {
 		t.Fatalf("frame 12 = %+v", dr)
+	}
+	if dr := ops[12].(obs1.GroupDelta).Sub.(obs1.GDrop); string(dr.Group) != "g2" {
+		t.Fatalf("frame 13 = %+v", dr)
 	}
 
 	rows := durabilityRows(t, wl)
-	if rows["wal_encode_errors"] != 3 {
-		t.Fatalf("wal_encode_errors = %d, want the three refused emissions", rows["wal_encode_errors"])
+	if rows["wal_encode_errors"] != 4 {
+		t.Fatalf("wal_encode_errors = %d, want the four refused emissions", rows["wal_encode_errors"])
 	}
 	if err := wl.Close(); err != nil {
 		t.Fatal(err)

@@ -194,6 +194,55 @@ type WriteLog interface {
 	// leads.
 	StreamSetID(key []byte, lastMs, lastSeq, entriesAdded, maxDelMs, maxDelSeq uint64) (group uint16, seq uint64, err error)
 
+	// StreamGroupNew records a consumer-group create as one gnew of the
+	// cursor and lag basis the create resolved to, led by a stream collnew
+	// in the same run when MKSTREAM created the key. Group frames ride
+	// their own kind under the stream key (doc 04 section 2): the fold
+	// routes them to the group/PEL chunk kind, not the entry chunks.
+	StreamGroupNew(key []byte, createdStream bool, group []byte, lastMs, lastSeq, entriesRead uint64, readValid bool) (grp uint16, seq uint64, err error)
+
+	// StreamGroupSetID records XGROUP SETID's resulting cursor and lag
+	// basis, the optional ENTRIESREAD merge already done.
+	StreamGroupSetID(key, group []byte, lastMs, lastSeq, entriesRead uint64, readValid bool) (grp uint16, seq uint64, err error)
+
+	// StreamGroupDrop records an XGROUP DESTROY that returned 1; the
+	// caller gates the miss.
+	StreamGroupDrop(key, group []byte) (grp uint16, seq uint64, err error)
+
+	// StreamConsumerNew records an XGROUP CREATECONSUMER that returned 1,
+	// with the seen time the owner stamped. Implicit creations frame
+	// nothing: a delivery or claim frame names its consumer and replay
+	// ensures it. Pure seen-time bumps on an existing consumer frame
+	// nothing either, the documented advisory drift.
+	StreamConsumerNew(key, group, consumer []byte, seenMs int64) (grp uint16, seq uint64, err error)
+
+	// StreamConsumerDel records an XGROUP DELCONSUMER of a consumer that
+	// existed; replay drains the consumer's pending entries by owner, so
+	// no id list rides.
+	StreamConsumerDel(key, group, consumer []byte) (grp uint16, seq uint64, err error)
+
+	// StreamAck records ids that actually left the pending list, ms
+	// paralleling seqs: XACK's hits, and the entries a claim path deleted
+	// for pointing at trimmed stream ids.
+	StreamAck(key, group []byte, ms, seqs []uint64) (grp uint16, seq uint64, err error)
+
+	// StreamDeliver records an XREADGROUP new-message delivery: the
+	// cursor advances to the last id, the lag basis grows by the count,
+	// and each id enters the consumer's pending list at count 1 unless
+	// noAck. timeMs is the delivery time the owner stamped; replay
+	// ensures the consumer exists.
+	StreamDeliver(key, group, consumer []byte, noAck bool, timeMs int64, ms, seqs []uint64) (grp uint16, seq uint64, err error)
+
+	// StreamClaim records ownership moves post-decision: each id's
+	// resulting delivery time and count as the claim left them, the
+	// XCLAIM option soup already resolved. unowned, which requires an
+	// empty consumer, returns the ids to no owner, the XNACK shape.
+	// dropMs and dropSeqs carry entries the claim path removed for
+	// pointing at trimmed stream ids; they ride an ack behind the claim
+	// in the same atomic run, which is how XAUTOCLAIM lands, its scan
+	// cursor reply-only. Either half may be empty, not both.
+	StreamClaim(key, group, consumer []byte, unowned bool, ms, seqs []uint64, times []int64, counts []uint16, dropMs, dropSeqs []uint64) (grp uint16, seq uint64, err error)
+
 	// NotifyCommitted runs fn once a chain commit covering the marked
 	// frame has landed and folded live (doc 04 section 3.2): it registers
 	// on the committed watermark and raises barrier demand, so a pending
@@ -591,6 +640,135 @@ func (cx *Ctx) LogStreamSetID(key []byte, lastMs, lastSeq, entriesAdded, maxDelM
 		return err
 	}
 	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogStreamGroupNew emits a consumer-group create's effect frames when a
+// log is wired, and is free when none is. See WriteLog.StreamGroupNew for
+// the contract.
+func (cx *Ctx) LogStreamGroupNew(key []byte, createdStream bool, group []byte, lastMs, lastSeq, entriesRead uint64, readValid bool) error {
+	if cx.Log == nil {
+		return nil
+	}
+	g, seq, err := cx.Log.StreamGroupNew(key, createdStream, group, lastMs, lastSeq, entriesRead, readValid)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(g, seq)
+	return nil
+}
+
+// LogStreamGroupSetID emits XGROUP SETID's effect frame when a log is
+// wired, and is free when none is. See WriteLog.StreamGroupSetID for the
+// contract.
+func (cx *Ctx) LogStreamGroupSetID(key, group []byte, lastMs, lastSeq, entriesRead uint64, readValid bool) error {
+	if cx.Log == nil {
+		return nil
+	}
+	g, seq, err := cx.Log.StreamGroupSetID(key, group, lastMs, lastSeq, entriesRead, readValid)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(g, seq)
+	return nil
+}
+
+// LogStreamGroupDrop emits XGROUP DESTROY's effect frame when a log is
+// wired, and is free when none is. See WriteLog.StreamGroupDrop for the
+// contract.
+func (cx *Ctx) LogStreamGroupDrop(key, group []byte) error {
+	if cx.Log == nil {
+		return nil
+	}
+	g, seq, err := cx.Log.StreamGroupDrop(key, group)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(g, seq)
+	return nil
+}
+
+// LogStreamConsumerNew emits a consumer creation's effect frame when a
+// log is wired, and is free when none is. See WriteLog.StreamConsumerNew
+// for the contract.
+func (cx *Ctx) LogStreamConsumerNew(key, group, consumer []byte, seenMs int64) error {
+	if cx.Log == nil {
+		return nil
+	}
+	g, seq, err := cx.Log.StreamConsumerNew(key, group, consumer, seenMs)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(g, seq)
+	return nil
+}
+
+// LogStreamConsumerDel emits XGROUP DELCONSUMER's effect frame when a
+// log is wired, and is free when none is. See WriteLog.StreamConsumerDel
+// for the contract.
+func (cx *Ctx) LogStreamConsumerDel(key, group, consumer []byte) error {
+	if cx.Log == nil {
+		return nil
+	}
+	g, seq, err := cx.Log.StreamConsumerDel(key, group, consumer)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(g, seq)
+	return nil
+}
+
+// LogStreamAck emits an acknowledgment's effect frame when a log is
+// wired, and is free when none is. See WriteLog.StreamAck for the
+// contract.
+func (cx *Ctx) LogStreamAck(key, group []byte, ms, seqs []uint64) error {
+	if cx.Log == nil {
+		return nil
+	}
+	g, seq, err := cx.Log.StreamAck(key, group, ms, seqs)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(g, seq)
+	return nil
+}
+
+// LogStreamDeliver emits a delivery's effect frame when a log is wired,
+// and is free when none is. See WriteLog.StreamDeliver for the contract.
+func (cx *Ctx) LogStreamDeliver(key, group, consumer []byte, noAck bool, timeMs int64, ms, seqs []uint64) error {
+	_, err := cx.LogStreamDeliverServe(key, group, consumer, noAck, timeMs, ms, seqs)
+	return err
+}
+
+// LogStreamDeliverServe is LogStreamDeliver returning the marks the
+// delivery drew, for a parked XREADGROUP served at wake time: the serve
+// runs on the waking writer's execution, so a strict waiter's reply must
+// wait for the delivery frame through CompleteServed, the
+// LogListPopServe rule.
+func (cx *Ctx) LogStreamDeliverServe(key, group, consumer []byte, noAck bool, timeMs int64, ms, seqs []uint64) ([]WALMark, error) {
+	if cx.Log == nil {
+		return nil, nil
+	}
+	g, seq, err := cx.Log.StreamDeliver(key, group, consumer, noAck, timeMs, ms, seqs)
+	if err != nil {
+		return nil, err
+	}
+	cx.noteMark(g, seq)
+	return []WALMark{{Group: g, Seq: seq}}, nil
+}
+
+// LogStreamClaim emits an ownership move's effect frame when a log is
+// wired, and is free when none is. See WriteLog.StreamClaim for the
+// contract.
+func (cx *Ctx) LogStreamClaim(key, group, consumer []byte, unowned bool, ms, seqs []uint64, times []int64, counts []uint16, dropMs, dropSeqs []uint64) error {
+	if cx.Log == nil {
+		return nil
+	}
+	g, seq, err := cx.Log.StreamClaim(key, group, consumer, unowned, ms, seqs, times, counts, dropMs, dropSeqs)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(g, seq)
 	return nil
 }
 

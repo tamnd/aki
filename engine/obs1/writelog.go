@@ -713,9 +713,22 @@ func (l *WriteLog) StreamDeliver(key, group, consumer []byte, noAck bool, timeMs
 
 // StreamClaim implements the shard seam: resulting PEL entry state per
 // id as XCLAIM, XAUTOCLAIM, or XNACK left it, owner and delivery time
-// and delivery count all post-decision. Unowned is the XNACK shape.
-func (l *WriteLog) StreamClaim(key, group, consumer []byte, unowned bool, ms, seqs []uint64, times []int64, counts []uint16) (uint16, uint64, error) {
-	return l.emitOps(key, GroupDelta{Sub: GClaim{Group: group, Consumer: consumer, Unowned: unowned, IDMs: ms, IDSeq: seqs, TimeMs: times, Counts: counts}})
+// and delivery count all post-decision. Unowned is the XNACK shape. The
+// claim paths also drop PEL entries whose log entries are gone; those
+// ids ride a gack behind the gclaim in the same atomic run since they
+// are one command's effect. Either half may be empty, not both.
+func (l *WriteLog) StreamClaim(key, group, consumer []byte, unowned bool, ms, seqs []uint64, times []int64, counts []uint16, dropMs, dropSeqs []uint64) (uint16, uint64, error) {
+	if len(ms) == 0 && len(dropMs) == 0 {
+		return 0, 0, l.classify(fmt.Errorf("obs1: a stream claim emission needs claimed or dropped ids"))
+	}
+	ops := make([]Op, 0, 2)
+	if len(ms) > 0 {
+		ops = append(ops, GroupDelta{Sub: GClaim{Group: group, Consumer: consumer, Unowned: unowned, IDMs: ms, IDSeq: seqs, TimeMs: times, Counts: counts}})
+	}
+	if len(dropMs) > 0 {
+		ops = append(ops, GroupDelta{Sub: GAck{Group: group, IDMs: dropMs, IDSeq: dropSeqs}})
+	}
+	return l.emitOps(key, ops...)
 }
 
 // NotifyCommitted implements the shard seam: fn runs once the group's

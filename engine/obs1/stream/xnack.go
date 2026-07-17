@@ -66,14 +66,32 @@ func Xnack(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 
 	var nacked int64
+	var nackMs, nackSeqs []uint64
+	var times []int64
+	var counts []uint16
 	for _, id := range ids {
 		if grp.nack(s, id, mode, retry, hasRetry, force) {
 			nacked++
+			nackMs = append(nackMs, id.ms)
+			nackSeqs = append(nackSeqs, id.seq)
+			var t int64
+			var c uint16
+			if pe, ok := grp.pel.find(id); ok {
+				t, c = pe.deliveryTime, pe.deliveryCount
+			}
+			times = append(times, t)
+			counts = append(counts, c)
 		}
 	}
 	// A FORCE nack can add a pending slab for a not-yet-pending entry; reconcile the
 	// footprint into the running sum.
 	g.note(s)
+	if nacked > 0 {
+		if err := cx.LogStreamClaim(key, name, nil, true, nackMs, nackSeqs, times, counts, nil, nil); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
 	r.Int(nacked)
 }
 

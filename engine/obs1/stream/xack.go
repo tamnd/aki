@@ -43,14 +43,23 @@ func Xack(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 
 	var acked int64
+	var ackMs, ackSeqs []uint64
 	for _, id := range parsed {
 		if grp.ackOne(id) {
 			acked++
+			ackMs = append(ackMs, id.ms)
+			ackSeqs = append(ackSeqs, id.seq)
 		}
 	}
 	// Retiring pending entries shrinks the group's ledger tree; reconcile the
 	// footprint into the running sum at the boundary.
 	g.note(s)
+	if acked > 0 {
+		if err := cx.LogStreamAck(key, name, ackMs, ackSeqs); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
 	r.Int(acked)
 }
 
