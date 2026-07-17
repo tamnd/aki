@@ -196,6 +196,116 @@ func TestReplayIsShardScoped(t *testing.T) {
 	}
 }
 
+// TestReplayFromCheckpointRebuildsIndex closes the producer to consumer loop: a
+// first run writes a mix, overwrites one key and deletes another, builds a full
+// index checkpoint, and drops the store; a fresh store over the same file loads
+// that checkpoint and reads every live key back at its newest value, with the
+// deleted key gone. It proves recovery can rebuild the index from a checkpoint dump
+// alone, without walking the whole log.
+func TestReplayFromCheckpointRebuildsIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ckptreplay.aki")
+
+	openStore := func(f *akifile.File) *Store {
+		s, err := Open(Options{
+			ArenaBytes:       4 << 20,
+			SegBytes:         1 << 20,
+			AkiValueLog:      f,
+			Shard:            1,
+			ResidentCapBytes: 64,
+		})
+		if err != nil {
+			t.Fatalf("open aki store: %v", err)
+		}
+		return s
+	}
+
+	big := make([]byte, strInlineMax+64)
+	for i := range big {
+		big[i] = byte('a' + i%26)
+	}
+
+	// First run: write the mix, overwrite one key, delete another, then dump a
+	// checkpoint before dropping the store so only durable bytes carry forward.
+	f, err := akifile.Create(path, akifile.CreateOptions{
+		ShardCount:   4,
+		SepThreshold: 64,
+		Sync:         akifile.SyncNo,
+	})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	s := openStore(f)
+	if err := s.SetString([]byte("greet"), []byte("hi"), 0, 0, false); err != nil {
+		t.Fatalf("set greet: %v", err)
+	}
+	if err := s.SetString([]byte("wide"), big, 0, 0, false); err != nil {
+		t.Fatalf("set wide: %v", err)
+	}
+	if err := s.SetString([]byte("gone"), []byte("x"), 0, 0, false); err != nil {
+		t.Fatalf("set gone: %v", err)
+	}
+	if err := s.SetString([]byte("greet"), []byte("hello"), 0, 0, false); err != nil {
+		t.Fatalf("overwrite greet: %v", err)
+	}
+	if !s.Del([]byte("gone"), 0) {
+		t.Fatal("del gone reported absent for a live key")
+	}
+
+	payload, _, err := s.BuildIndexCheckpoint(nil)
+	if err != nil {
+		t.Fatalf("build checkpoint: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	// Second run: reopen the file into a fresh store and rebuild from the dump.
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	s2 := openStore(f2)
+	t.Cleanup(func() { _ = s2.Close(); _ = f2.Close() })
+
+	if err := s2.ReplayFromCheckpoint(payload, 0); err != nil {
+		t.Fatalf("replay from checkpoint: %v", err)
+	}
+
+	wantVal := map[string][]byte{
+		"greet": []byte("hello"),
+		"wide":  big,
+	}
+	for key, want := range wantVal {
+		got, ok := s2.GetString([]byte(key), 0, nil)
+		if !ok {
+			t.Fatalf("key %q absent after checkpoint replay", key)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("key %q read back %q, want %q", key, got, want)
+		}
+	}
+	if _, ok := s2.GetString([]byte("gone"), 0, nil); ok {
+		t.Fatal("deleted key gone came back after checkpoint replay")
+	}
+}
+
+// TestReplayFromCheckpointNoHandleIsNoop confirms a store with no record log takes
+// a nil-safe no-op path, so the volatile-only configuration never touches the
+// checkpoint loader.
+func TestReplayFromCheckpointNoHandleIsNoop(t *testing.T) {
+	s, err := Open(Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("open plain store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.ReplayFromCheckpoint(nil, 0); err != nil {
+		t.Fatalf("checkpoint replay on a store with no record log: %v", err)
+	}
+}
+
 // TestReplayNoHandleIsNoop confirms a store with no record log replays nothing and
 // reports no error, so the volatile-only configuration pays nothing for recovery.
 func TestReplayNoHandleIsNoop(t *testing.T) {
