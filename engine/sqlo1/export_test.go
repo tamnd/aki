@@ -1,6 +1,9 @@
 package sqlo1
 
-import "context"
+import (
+	"context"
+	"math"
+)
 
 // Test-only handles. The WAL and the recovery entry are package-internal
 // API used by the server loop, but the Track A recovery-order test has to
@@ -93,3 +96,41 @@ func SetListFenceCapsForTest(flat, page, idx int) (restore func()) {
 	listFenceMaxNodes, listFencePageMax, listFencePageIdxMax = flat, page, idx
 	return func() { listFenceMaxNodes, listFencePageMax, listFencePageIdxMax = of, op, oi }
 }
+
+// StreamFencePagedForTest reports whether key's fence has crossed to
+// the paged representation, so the paged torn-tail matrix can prove
+// its scenario really drives the pages before it starts cutting.
+func (x *Stream) StreamFencePagedForTest(ctx context.Context, key []byte) (bool, error) {
+	exists, _, err := x.stateOf(ctx, key)
+	if err != nil || !exists {
+		return false, err
+	}
+	return x.root.paged, nil
+}
+
+// SetStreamFenceCapsForTest shrinks the stream fence fanouts so the
+// paged ladder (transition, tail page growth, fresh page, third-level
+// error) is reachable in test-sized streams. Callers restore via the
+// returned func.
+func SetStreamFenceCapsForTest(flat, page, idx int) (restore func()) {
+	of, op, oi := streamFenceMaxRuns, streamFencePageMax, streamFencePageIdxMax
+	streamFenceMaxRuns, streamFencePageMax, streamFencePageIdxMax = flat, page, idx
+	return func() { streamFenceMaxRuns, streamFencePageMax, streamFencePageIdxMax = of, op, oi }
+}
+
+// The stream crash matrix lives in the external test package, and
+// streamID is package-internal, so these doors drive explicit-ID adds
+// and full-range walks with plain integers on the seam.
+func (x *Stream) AddExplicitForTest(ctx context.Context, key []byte, ms, seq uint64, fv [][]byte) error {
+	_, _, err := x.Add(ctx, key, xidExplicit, streamID{ms: ms, seq: seq}, 0, false, fv)
+	return err
+}
+
+func (x *Stream) RangeAllForTest(ctx context.Context, key []byte, emit func(ms, seq uint64, fv [][]byte)) error {
+	full := streamID{ms: math.MaxUint64, seq: math.MaxUint64}
+	return x.Range(ctx, key, streamID{}, full, -1, false, func(int) {}, func(id streamID, fv [][]byte) {
+		emit(id.ms, id.seq, fv)
+	})
+}
+
+var ErrStreamFenceThirdLevelForTest = errStreamFenceThirdLevel

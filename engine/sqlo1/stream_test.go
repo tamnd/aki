@@ -81,7 +81,7 @@ func (r *streamRig) check(key string) {
 	if err != nil || !ok || !isRoot {
 		r.t.Fatalf("LookupEntry(%q) = root=%v ok=%v err=%v", key, isRoot, ok, err)
 	}
-	sr, err := decodeStreamRoot(v, nil)
+	sr, err := decodeStreamRoot(v, nil, nil)
 	if err != nil {
 		r.t.Fatalf("decode stream root %q: %v", key, err)
 	}
@@ -89,10 +89,37 @@ func (r *streamRig) check(key string) {
 		r.t.Fatalf("root last = %v, model last = %v", sr.last, r.model[len(r.model)-1].id)
 	}
 	var kbuf [SubkeySize]byte
+	fence := sr.fence
+	if sr.paged {
+		// Rebuild the flat view from the pages, auditing the two-level
+		// invariants on the way: each page decodes, sums to its index
+		// count, and starts at its index base. The run loop below then
+		// audits the stitched fence exactly like the flat shape, which
+		// also proves ID order across page boundaries.
+		fence = nil
+		for pi, pe := range sr.pidx {
+			putHashFenceKey(kbuf[:], sr.rooth, pe.segid)
+			pv, ok, err := r.tr.Get(ctx, kbuf[:])
+			if err != nil || !ok {
+				r.t.Fatalf("fence page %d (pageid %d) read: ok=%v err=%v", pi, pe.segid, ok, err)
+			}
+			ents, sum, err := decodeStreamFencePage(pv, sr.nextSegid, nil)
+			if err != nil {
+				r.t.Fatalf("fence page %d decode: %v", pi, err)
+			}
+			if sum != uint64(pe.count) {
+				r.t.Fatalf("fence page %d sums to %d, index says %d", pi, sum, pe.count)
+			}
+			if ents[0].base != pe.base {
+				r.t.Fatalf("fence page %d starts at %v, index says %v", pi, ents[0].base, pe.base)
+			}
+			fence = append(fence, ents...)
+		}
+	}
 	total := uint64(0)
 	prev := streamID{}
 	mi := 0
-	for fi, fe := range sr.fence {
+	for fi, fe := range fence {
 		putHashSegKey(kbuf[:], sr.rooth, fe.segid)
 		rv, ok, err := r.tr.Get(ctx, kbuf[:])
 		if err != nil || !ok {
@@ -341,34 +368,6 @@ func TestStreamNoMkStream(t *testing.T) {
 		t.Fatalf("NOMKSTREAM on live = ok=%v err=%v", ok, err)
 	}
 	r.model = append(r.model, streamModelEnt{id: id, fv: [][]byte{[]byte("g"), []byte("w")}})
-	r.check("s")
-}
-
-// TestStreamFenceFullRefusal caps the flat fence at three runs and
-// drives fat entries into the wall: the refusing add is side-effect
-// free and the stream keeps serving.
-func TestStreamFenceFullRefusal(t *testing.T) {
-	old := streamFenceMaxRuns
-	streamFenceMaxRuns = 3
-	defer func() { streamFenceMaxRuns = old }()
-
-	r := newStreamRig(t)
-	fat := strings.Repeat("x", 5000)
-	for range 3 {
-		r.nowMs++
-		r.add("s", xidAuto, streamID{}, "blob", fat)
-	}
-	_, _, err := r.x.Add(context.Background(), []byte("s"), xidAuto, streamID{}, r.nowMs, false, [][]byte{[]byte("blob"), []byte(fat)})
-	if !errors.Is(err, errStreamFenceFull) {
-		t.Fatalf("fence-full err = %v", err)
-	}
-	r.check("s")
-	// A small entry refuses too: the fat tail run is past the byte
-	// cap, so any append would cut, and the cut has nowhere to go.
-	_, _, err = r.x.Add(context.Background(), []byte("s"), xidAuto, streamID{}, r.nowMs, false, [][]byte{[]byte("f"), []byte("v")})
-	if !errors.Is(err, errStreamFenceFull) {
-		t.Fatalf("small add fence-full err = %v", err)
-	}
 	r.check("s")
 }
 

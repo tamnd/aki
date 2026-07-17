@@ -58,15 +58,22 @@ type Stream struct {
 	leaseNext uint64
 	leaseEnd  uint64
 
-	// root is the decoded root of the key the current op holds; its
-	// fence lives in the fence scratch, copied out on decode so it
-	// survives the run reads the op does next.
-	root  streamRoot
-	fence []streamFenceEnt
+	// root is the decoded root of the key the current op holds. Flat,
+	// its fence lives in the fence scratch, copied out on decode so it
+	// survives the run reads the op does next; paged, the page index
+	// lands in pidxBuf the same way and fence holds the one loaded
+	// page, pi naming its index slot (-1 none), reset every stateOf.
+	root    streamRoot
+	fence   []streamFenceEnt
+	pidxBuf []streamFenceEnt
+	pi      int
 
-	// kbuf holds the subkey of the run being read or written; shared
-	// because the seam doors copy key bytes before returning.
-	kbuf [SubkeySize]byte
+	// kbuf holds the subkey of the run being read or written and pkbuf
+	// the page record key; shared because the seam doors copy key bytes
+	// before returning. pageBuf stages a page payload.
+	kbuf    [SubkeySize]byte
+	pkbuf   [SubkeySize]byte
+	pageBuf []byte
 
 	// rootBuf stages a rebuilt root payload and runBuf a rebuilt or
 	// amended run; both safe to fill from spans aliasing a read because
@@ -155,11 +162,17 @@ func (x *Stream) stateOf(ctx context.Context, key []byte) (exists bool, expMs in
 	if tag != TagStream {
 		return false, 0, ErrWrongType
 	}
-	x.root, err = decodeStreamRoot(v, x.fence[:0])
+	x.root, err = decodeStreamRoot(v, x.fence[:0], x.pidxBuf[:0])
 	if err != nil {
 		return false, 0, err
 	}
-	x.fence = x.root.fence
+	x.pi = -1
+	if x.root.paged {
+		x.pidxBuf = x.root.pidx
+		x.fence = x.fence[:0]
+	} else {
+		x.fence = x.root.fence
+	}
 	return true, expMs, nil
 }
 
@@ -187,7 +200,9 @@ func (x *Stream) writeRun(ctx context.Context, segid uint64, payload []byte) err
 // writeNodeRoot's reasoning: the reconcilers do not know this sub, so a
 // W2 delta claim would be a silent no-op.
 func (x *Stream) writeRoot(ctx context.Context, key []byte) error {
-	x.root.fence = x.fence
+	if !x.root.paged {
+		x.root.fence = x.fence
+	}
 	x.rootBuf = appendStreamRoot(x.rootBuf[:0], &x.root)
 	return x.t.Set(ctx, key, x.rootBuf, TagStream|TagRoot)
 }
@@ -284,13 +299,18 @@ func (x *Stream) create(ctx context.Context, key []byte, id streamID, fv [][]byt
 	return x.writeRoot(ctx, key)
 }
 
-// appendCut starts a fresh tail run holding just the new entry. The
-// refusal happens before any write, so it is side-effect free.
+// appendCut starts a fresh tail run holding just the new entry, on
+// whichever fence rung the root is on. A flat fence past its cap
+// transitions to pages, and any refusal happens before the first write,
+// so it is side-effect free.
 func (x *Stream) appendCut(ctx context.Context, key []byte, id streamID, fv [][]byte, expMs int64) error {
-	if len(x.fence) >= streamFenceMaxRuns {
-		return errStreamFenceFull
-	}
 	r := &x.root
+	if r.paged {
+		return x.appendCutPaged(ctx, key, id, fv, expMs)
+	}
+	if len(x.fence) >= streamFenceMaxRuns {
+		return x.appendCutTransition(ctx, key, id, fv, expMs)
+	}
 	x.ents = append(x.ents[:0], streamEntry{id: id, fv: fv})
 	x.runBuf = appendStreamRun(x.runBuf[:0], x.ents)
 	segid := r.nextSegid
@@ -299,6 +319,92 @@ func (x *Stream) appendCut(ctx context.Context, key []byte, id streamID, fv [][]
 	}
 	x.fence = append(x.fence, streamFenceEnt{base: id, segid: segid, count: 1})
 	r.nextSegid++
+	r.count++
+	r.added++
+	r.last = id
+	if err := x.writeRoot(ctx, key); err != nil {
+		return err
+	}
+	return x.restamp(ctx, key, expMs)
+}
+
+// appendCutTransition is the flat cap's cut: the fresh run and the
+// whole fence, grown by its entry, move into fresh pages, flushed
+// before the root that flips the paged bit; a crash prefix reads the
+// old flat root and the run and pages are orphans. The capacity check
+// runs before any write.
+func (x *Stream) appendCutTransition(ctx context.Context, key []byte, id streamID, fv [][]byte, expMs int64) error {
+	r := &x.root
+	if streamPageChunks(len(x.fence)+1) > streamFencePageIdxMax {
+		return errStreamFenceThirdLevel
+	}
+	x.ents = append(x.ents[:0], streamEntry{id: id, fv: fv})
+	x.runBuf = appendStreamRun(x.runBuf[:0], x.ents)
+	segid := r.nextSegid
+	if err := x.writeRun(ctx, segid, x.runBuf); err != nil {
+		return err
+	}
+	r.nextSegid++
+	ents := append(x.fence, streamFenceEnt{base: id, segid: segid, count: 1})
+	if err := x.pageStreamFence(ctx, ents); err != nil {
+		return err
+	}
+	x.fence = x.fence[:0]
+	if err := x.t.Flush(ctx); err != nil {
+		return err
+	}
+	r.count++
+	r.added++
+	r.last = id
+	if err := x.writeRoot(ctx, key); err != nil {
+		return err
+	}
+	return x.restamp(ctx, key, expMs)
+}
+
+// appendCutPaged cuts a fresh run under a paged fence: the tail page
+// grows in place while it has room (the page rewrite rides the root's
+// batch), and a full tail page hands the entry to a fresh page, flushed
+// before the root whose index gains it. A full page index is the
+// ladder's end, refused before any write.
+func (x *Stream) appendCutPaged(ctx context.Context, key []byte, id streamID, fv [][]byte, expMs int64) error {
+	r := &x.root
+	room := false
+	if len(r.pidx) > 0 {
+		if err := x.loadPage(ctx, len(r.pidx)-1); err != nil {
+			return err
+		}
+		room = len(x.fence) < streamFencePageMax
+	}
+	if !room && len(r.pidx) >= streamFencePageIdxMax {
+		return errStreamFenceThirdLevel
+	}
+	x.ents = append(x.ents[:0], streamEntry{id: id, fv: fv})
+	x.runBuf = appendStreamRun(x.runBuf[:0], x.ents)
+	segid := r.nextSegid
+	if err := x.writeRun(ctx, segid, x.runBuf); err != nil {
+		return err
+	}
+	r.nextSegid++
+	fe := streamFenceEnt{base: id, segid: segid, count: 1}
+	if room {
+		x.fence = append(x.fence, fe)
+		if err := x.writeFencePage(ctx); err != nil {
+			return err
+		}
+	} else {
+		x.fence = append(x.fence[:0], fe)
+		pe, err := x.writeFreshPage(ctx, x.fence)
+		if err != nil {
+			return err
+		}
+		x.pi = -1
+		if err := x.t.Flush(ctx); err != nil {
+			return err
+		}
+		r.pidx = append(r.pidx, pe)
+		x.pidxBuf = r.pidx
+	}
 	r.count++
 	r.added++
 	r.last = id
@@ -318,7 +424,16 @@ func (x *Stream) appendCut(ctx context.Context, key []byte, id streamID, fv [][]
 // name or a tomb bitmap re-encodes the run whole instead.
 func (x *Stream) append(ctx context.Context, key []byte, id streamID, fv [][]byte, expMs int64) error {
 	r := &x.root
-	if len(x.fence) == 0 {
+	if r.paged {
+		if len(r.pidx) == 0 {
+			// A fully trimmed paged stream: the next entry starts a
+			// fresh page.
+			return x.appendCut(ctx, key, id, fv, expMs)
+		}
+		if err := x.loadPage(ctx, len(r.pidx)-1); err != nil {
+			return err
+		}
+	} else if len(x.fence) == 0 {
 		// A fully trimmed stream: the next entry starts a fresh fence.
 		return x.appendCut(ctx, key, id, fv, expMs)
 	}
@@ -411,6 +526,14 @@ func (x *Stream) append(ctx context.Context, key []byte, id streamID, fv [][]byt
 		return err
 	}
 	te.count++
+	if r.paged {
+		// The tail page rewrite carries the amended count and rides the
+		// root's batch, so the count and its root are never separated by
+		// a flush.
+		if err := x.writeFencePage(ctx); err != nil {
+			return err
+		}
+	}
 	r.count++
 	r.added++
 	r.last = id
@@ -430,26 +553,10 @@ func (x *Stream) Len(ctx context.Context, key []byte) (int64, error) {
 }
 
 // fenceSeek finds the interval of fence indexes whose runs can hold IDs
-// in [start, end]: lo is the last run whose base is at or below start
-// (clamped to 0), hi the last whose base is at or below end. ok is
-// false when no run can overlap.
+// in [start, end] on the fence in scratch, flat or one loaded page; the
+// stream's last generated ID is the upper wall either way.
 func (x *Stream) fenceSeek(start, end streamID) (lo, hi int, ok bool) {
-	if len(x.fence) == 0 || end.less(x.fence[0].base) || x.root.last.less(start) {
-		return 0, 0, false
-	}
-	hi = len(x.fence) - 1
-	for i := 1; i < len(x.fence); i++ {
-		if end.less(x.fence[i].base) {
-			hi = i - 1
-			break
-		}
-	}
-	for i := hi; i >= 0; i-- {
-		if !start.less(x.fence[i].base) {
-			return i, hi, true
-		}
-	}
-	return 0, hi, true
+	return streamFenceSeekIn(x.fence, x.root.last, start, end)
 }
 
 // errStreamWalkDone is the early-exit sentinel of a bounded run walk.
@@ -495,29 +602,15 @@ func (x *Stream) Range(ctx context.Context, key []byte, start, end streamID, cou
 		begin(0)
 		return nil
 	}
+	if x.root.paged {
+		return x.rangePaged(ctx, start, end, count, rev, begin, emit)
+	}
 	lo, hi, ok := x.fenceSeek(start, end)
 	if !ok {
 		begin(0)
 		return nil
 	}
-
-	// The exact count first: interior runs answer from their fence
-	// counts, and only the boundary runs decode. The boundary reads
-	// warm the hot tier for the emit pass behind them.
-	total := int64(0)
-	if lo == hi {
-		total, err = x.countRunIn(ctx, x.fence[lo].segid, start, end)
-	} else {
-		for i := lo + 1; i < hi; i++ {
-			total += int64(x.fence[i].count)
-		}
-		var c int64
-		if c, err = x.countRunIn(ctx, x.fence[lo].segid, start, end); err == nil {
-			total += c
-			c, err = x.countRunIn(ctx, x.fence[hi].segid, start, end)
-			total += c
-		}
-	}
+	total, err := x.countWindow(ctx, lo, hi, start, end)
 	if err != nil {
 		return err
 	}
@@ -529,9 +622,144 @@ func (x *Stream) Range(ctx context.Context, key []byte, start, end streamID, cou
 		return nil
 	}
 	if rev {
-		return x.emitRev(ctx, lo, hi, start, end, total, emit)
+		_, err = x.emitRev(ctx, lo, hi, start, end, total, emit)
+	} else {
+		_, err = x.emitFwd(ctx, lo, hi, start, end, total, emit)
 	}
-	return x.emitFwd(ctx, lo, hi, start, end, total, emit)
+	return err
+}
+
+// countWindow counts live entries in [start, end] across fence indexes
+// lo..hi of the fence in scratch: interior runs answer from their fence
+// counts, and only the boundary runs decode. The boundary reads warm
+// the hot tier for the emit pass behind them.
+func (x *Stream) countWindow(ctx context.Context, lo, hi int, start, end streamID) (int64, error) {
+	if lo == hi {
+		return x.countRunIn(ctx, x.fence[lo].segid, start, end)
+	}
+	total := int64(0)
+	for i := lo + 1; i < hi; i++ {
+		total += int64(x.fence[i].count)
+	}
+	c, err := x.countRunIn(ctx, x.fence[lo].segid, start, end)
+	if err != nil {
+		return 0, err
+	}
+	total += c
+	c, err = x.countRunIn(ctx, x.fence[hi].segid, start, end)
+	if err != nil {
+		return 0, err
+	}
+	return total + c, nil
+}
+
+// rangePaged is Range over a paged fence: the same two-pass exact-count
+// walk one level up. The page index seeks the boundary pages, interior
+// pages answer whole from their index counts, and inside a boundary
+// page only its own boundary runs decode; the argument is the fence
+// invariant twice, since every ID under page p sits below page p+1's
+// base. The count pass loads at most two pages and the emit pass walks
+// them again through the one-page cache, so a cross-page range pays one
+// extra page read over the flat shape.
+func (x *Stream) rangePaged(ctx context.Context, start, end streamID, count int64, rev bool, begin func(n int), emit func(id streamID, fv [][]byte)) error {
+	r := &x.root
+	plo, phi, ok := streamFenceSeekIn(r.pidx, r.last, start, end)
+	if !ok {
+		begin(0)
+		return nil
+	}
+	total := int64(0)
+	if plo == phi {
+		if err := x.loadPage(ctx, plo); err != nil {
+			return err
+		}
+		lo, hi, ok := x.fenceSeek(start, end)
+		if !ok {
+			begin(0)
+			return nil
+		}
+		var err error
+		if total, err = x.countWindow(ctx, lo, hi, start, end); err != nil {
+			return err
+		}
+	} else {
+		// Boundary pages decode their one boundary run; every other run
+		// they hold sits whole inside the window (a lo-page run past the
+		// seek has base above start, and all of page plo sits below page
+		// plo+1's base, which is at most end; mirrored on phi).
+		if err := x.loadPage(ctx, plo); err != nil {
+			return err
+		}
+		llo := max(streamSeekLE(x.fence, start), 0)
+		c, err := x.countRunIn(ctx, x.fence[llo].segid, start, end)
+		if err != nil {
+			return err
+		}
+		total += c
+		for i := llo + 1; i < len(x.fence); i++ {
+			total += int64(x.fence[i].count)
+		}
+		for p := plo + 1; p < phi; p++ {
+			total += int64(r.pidx[p].count)
+		}
+		if err := x.loadPage(ctx, phi); err != nil {
+			return err
+		}
+		lhi := streamSeekLE(x.fence, end)
+		for i := range lhi {
+			total += int64(x.fence[i].count)
+		}
+		if c, err = x.countRunIn(ctx, x.fence[lhi].segid, start, end); err != nil {
+			return err
+		}
+		total += c
+	}
+	if count > 0 && total > count {
+		total = count
+	}
+	begin(int(total))
+	if total == 0 {
+		return nil
+	}
+	remaining := total
+	if rev {
+		for p := phi; p >= plo && remaining > 0; p-- {
+			if err := x.loadPage(ctx, p); err != nil {
+				return err
+			}
+			jlo, jhi := x.pageWindow(p, plo, phi, start, end)
+			var err error
+			if remaining, err = x.emitRev(ctx, jlo, jhi, start, end, remaining, emit); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for p := plo; p <= phi && remaining > 0; p++ {
+		if err := x.loadPage(ctx, p); err != nil {
+			return err
+		}
+		jlo, jhi := x.pageWindow(p, plo, phi, start, end)
+		var err error
+		if remaining, err = x.emitFwd(ctx, jlo, jhi, start, end, remaining, emit); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pageWindow bounds the run window of loaded page p in a paged range
+// over pages plo..phi: interior pages walk whole, boundary pages seek
+// their own boundary run.
+func (x *Stream) pageWindow(p, plo, phi int, start, end streamID) (jlo, jhi int) {
+	jhi = len(x.fence) - 1
+	if p == plo {
+		jlo = max(streamSeekLE(x.fence, start), 0)
+	}
+	if p == phi {
+		jhi = streamSeekLE(x.fence, end)
+	}
+	return jlo, jhi
 }
 
 // prefetchRuns reads runs [base, base+w) of the fence in one IO round;
@@ -550,17 +778,17 @@ func (x *Stream) prefetchRuns(ctx context.Context, base, w int) error {
 }
 
 // emitFwd walks runs lo..hi forward in prefetched rounds, emitting live
-// entries inside the bounds until total are out.
-func (x *Stream) emitFwd(ctx context.Context, lo, hi int, start, end streamID, total int64, emit func(id streamID, fv [][]byte)) error {
-	remaining := total
+// entries inside the bounds until remaining are out, and reports what is
+// left so a paged range can carry it to the next page.
+func (x *Stream) emitFwd(ctx context.Context, lo, hi int, start, end streamID, remaining int64, emit func(id streamID, fv [][]byte)) (int64, error) {
 	for base := lo; base <= hi && remaining > 0; base += streamRangeBatchRuns {
 		w := min(streamRangeBatchRuns, hi+1-base)
 		if err := x.prefetchRuns(ctx, base, w); err != nil {
-			return err
+			return 0, err
 		}
 		for j := 0; j < w && remaining > 0; j++ {
 			if x.mgVals[j] == nil {
-				return fmt.Errorf("sqlo1: stream run %d of rooth %#x is missing", x.fence[base+j].segid, x.root.rooth)
+				return 0, fmt.Errorf("sqlo1: stream run %d of rooth %#x is missing", x.fence[base+j].segid, x.root.rooth)
 			}
 			_, err := walkStreamRun(x.mgVals[j], func(i int, e streamEntry) error {
 				if remaining == 0 || end.less(e.id) {
@@ -573,28 +801,27 @@ func (x *Stream) emitFwd(ctx context.Context, lo, hi int, start, end streamID, t
 				return nil
 			})
 			if err != nil && !errors.Is(err, errStreamWalkDone) {
-				return err
+				return 0, err
 			}
 		}
 	}
-	return nil
+	return remaining, nil
 }
 
-// emitRev walks runs hi..lo backward in prefetched rounds. Entries
-// inside a run buffer through the fv pool (bytes alias the round's
-// read, which outlives the buffering) and replay in reverse before the
-// next run decodes.
-func (x *Stream) emitRev(ctx context.Context, lo, hi int, start, end streamID, total int64, emit func(id streamID, fv [][]byte)) error {
-	remaining := total
+// emitRev walks runs hi..lo backward in prefetched rounds, reporting
+// what is left like emitFwd. Entries inside a run buffer through the fv
+// pool (bytes alias the round's read, which outlives the buffering) and
+// replay in reverse before the next run decodes.
+func (x *Stream) emitRev(ctx context.Context, lo, hi int, start, end streamID, remaining int64, emit func(id streamID, fv [][]byte)) (int64, error) {
 	for top := hi; top >= lo && remaining > 0; top -= streamRangeBatchRuns {
 		base := max(lo, top-streamRangeBatchRuns+1)
 		w := top - base + 1
 		if err := x.prefetchRuns(ctx, base, w); err != nil {
-			return err
+			return 0, err
 		}
 		for j := w - 1; j >= 0 && remaining > 0; j-- {
 			if x.mgVals[j] == nil {
-				return fmt.Errorf("sqlo1: stream run %d of rooth %#x is missing", x.fence[base+j].segid, x.root.rooth)
+				return 0, fmt.Errorf("sqlo1: stream run %d of rooth %#x is missing", x.fence[base+j].segid, x.root.rooth)
 			}
 			x.ents, x.fvPool, x.fvOffs = x.ents[:0], x.fvPool[:0], x.fvOffs[:0]
 			_, err := walkStreamRun(x.mgVals[j], func(i int, e streamEntry) error {
@@ -609,7 +836,7 @@ func (x *Stream) emitRev(ctx context.Context, lo, hi int, start, end streamID, t
 				return nil
 			})
 			if err != nil && !errors.Is(err, errStreamWalkDone) {
-				return err
+				return 0, err
 			}
 			x.fvOffs = append(x.fvOffs, len(x.fvPool))
 			for i := len(x.ents) - 1; i >= 0 && remaining > 0; i-- {
@@ -618,5 +845,5 @@ func (x *Stream) emitRev(ctx context.Context, lo, hi int, start, end streamID, t
 			}
 		}
 	}
-	return nil
+	return remaining, nil
 }
