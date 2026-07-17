@@ -58,6 +58,13 @@ const (
 	// shards weighted by count, so every key in the whole keyspace is equally
 	// likely. An all-empty keyspace draws a null bulk.
 	FanRandom
+
+	// FanScan concatenates each shard's matched keys the same way FanKeys does,
+	// but wraps the gathered keys in SCAN's two-element reply: a next-cursor
+	// bulk then the key array. The cursor is always "0" because f3's SCAN walks
+	// the whole keyspace in one page, the same single-page answer HSCAN gives
+	// for its listpack band, so a client's cursor loop makes exactly one pass.
+	FanScan
 )
 
 // maxFanKeys caps the keys one sub-command carries, so a sub-command's
@@ -285,7 +292,10 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 		for k := 0; k+8 <= len(part) && k/8 < len(fc.stats); k += 8 {
 			fc.stats[k/8] += binary.LittleEndian.Uint64(part[k:])
 		}
-	case FanKeys:
+	case FanKeys, FanScan:
+		// Both gather a run of length-prefixed keys into one key list; only the
+		// final reply shape differs (a flat array for KEYS, the cursor envelope
+		// for SCAN).
 		for len(part) >= 4 {
 			n := binary.LittleEndian.Uint32(part)
 			part = part[4:]
@@ -340,6 +350,15 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 	case FanStats:
 		fc.out = c.rt.renderStats(fc.out, fc.stats)
 	case FanKeys:
+		fc.out = resp.AppendArrayHeader(fc.out, len(fc.vals))
+		for _, v := range fc.vals {
+			fc.out = resp.AppendBulk(fc.out, v)
+		}
+	case FanScan:
+		// SCAN's reply is a two-element array: the next cursor then the key page.
+		// The whole keyspace fits one page, so the cursor is the terminal "0".
+		fc.out = resp.AppendArrayHeader(fc.out, 2)
+		fc.out = resp.AppendBulk(fc.out, []byte("0"))
 		fc.out = resp.AppendArrayHeader(fc.out, len(fc.vals))
 		for _, v := range fc.vals {
 			fc.out = resp.AppendBulk(fc.out, v)
