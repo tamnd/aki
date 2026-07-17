@@ -335,7 +335,6 @@ type chunkRef struct {
 // the stream finishes, fails, or aborts.
 type ChunkStream struct {
 	s     *Store
-	l     *vlog
 	refs  []chunkRef
 	total int64
 	k     int
@@ -368,7 +367,11 @@ func (cs *ChunkStream) Next(dst []byte) (int, error) {
 	if r.word == 0 {
 		clear(dst[:clen])
 	} else if r.word&inLogBit != 0 {
-		if err := cs.l.readFill(r.word&runAddrMask, dst[:clen]); err != nil {
+		// Through the store's read seam, so a chunk that spilled to the shared
+		// .aki value region resolves there just as an arena chunk resolves in
+		// the arena. cs.s is live until Release, and the stream pins the arena
+		// and gates compaction, so the seam's routing is stable for the read.
+		if err := cs.s.logReadFill(r.word&runAddrMask, dst[:clen]); err != nil {
 			return 0, err
 		}
 	} else {
@@ -402,7 +405,7 @@ func (s *Store) GetStream(key []byte, now int64, dst []byte) ([]byte, *ChunkStre
 func (s *Store) chunkStreamAt(addr uint64) *ChunkStream {
 	word, n, _ := s.readPtr(s.valueStart(addr))
 	dirOff := word & runAddrMask
-	cs := &ChunkStream{s: s, l: s.vlog, total: int64(s.vlen(addr)), refs: make([]chunkRef, n)}
+	cs := &ChunkStream{s: s, total: int64(s.vlen(addr)), refs: make([]chunkRef, n)}
 	s.openStreams++
 	for k := uint32(0); k < n; k++ {
 		w, l, _ := s.readPtr(dirOff + uint64(k)*ptrSize)
