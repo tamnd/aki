@@ -224,3 +224,48 @@ func TestExpireZsetKey(t *testing.T) {
 	send(t, nc, "TTL", "z")
 	expect(t, br, ":-2\r\n")
 }
+
+// TestExpireHashKey drives the key-level EXPIRE family over a hash key end to end,
+// the same shape as the set and zset cases. The key-level deadline is distinct from
+// a per-field HEXPIRE TTL: EXPIRE sets the whole-key deadline, PERSIST clears it,
+// and a past instant drops the whole hash.
+func TestExpireHashKey(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	send(t, nc, "HSET", "h", "f", "1", "g", "2")
+	expect(t, br, ":2\r\n")
+	send(t, nc, "TTL", "h")
+	expect(t, br, ":-1\r\n")
+
+	// EXPIRE installs a key deadline TTL then reports; the fields survive it.
+	send(t, nc, "EXPIRE", "h", "100")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "h")
+	expect(t, br, ":100\r\n")
+	send(t, nc, "HLEN", "h")
+	expect(t, br, ":2\r\n")
+
+	// GT only raises the deadline; a lower one is refused, a higher one takes.
+	send(t, nc, "EXPIRE", "h", "50", "GT")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "EXPIRE", "h", "300", "GT")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "h")
+	expect(t, br, ":300\r\n")
+
+	// PERSIST clears the key deadline, then XX (needs a TTL) refuses.
+	send(t, nc, "PERSIST", "h")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "h")
+	expect(t, br, ":-1\r\n")
+	send(t, nc, "EXPIRE", "h", "100", "XX")
+	expect(t, br, ":0\r\n")
+
+	// A past instant deletes the whole hash and still returns 1.
+	send(t, nc, "PEXPIREAT", "h", "1000")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "EXISTS", "h")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "TTL", "h")
+	expect(t, br, ":-2\r\n")
+}

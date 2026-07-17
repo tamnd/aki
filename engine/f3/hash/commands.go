@@ -255,15 +255,13 @@ func Hdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // never stays empty; the caller notes it into the resident total before returning.
 func getOrCreate(cx *shard.Ctx, key []byte) (g *reg, h *hash, wrong bool) {
 	g = registry(cx)
-	if h = g.m[string(key)]; h != nil {
-		// Reap fired fields first, the same lazy expiry lookup runs (reg.go). A hash
-		// reaped empty is dropped and recreated fresh below, so a write onto a hash
-		// whose fields all expired starts a new listpack, not a lingering listpackex.
-		h.reap(uint64(cx.NowMs))
-		if h.card() > 0 {
-			return g, h, false
-		}
-		g.drop(key)
+	// The live funnel drops a hash whose key-level deadline has passed or whose
+	// fields have all expired, so a write onto an expired key builds a fresh hash
+	// below (a new listpack with no key TTL and no lingering listpackex), never
+	// resurrects the stale one. This is the create-path hazard the rollout plan
+	// calls out, closed by the same funnel every read routes through.
+	if h = g.live(cx, key); h != nil {
+		return g, h, false
 	}
 	if cx.St.Exists(key, cx.NowMs) {
 		return g, nil, true

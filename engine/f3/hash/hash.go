@@ -80,6 +80,15 @@ type hash struct {
 	// It is meaningful only when the store runs a cold tier; a store with no cold
 	// region never accounts and leaves it zero.
 	acct uint64
+
+	// expireAt is the whole key's absolute deadline in unix ms, 0 for a hash with
+	// no key-level TTL (spec 2064/f3/16 section 2). This is the key-level EXPIRE
+	// deadline, distinct from and outer to the per-field TTL above (nextExp): when
+	// it fires the whole hash is dropped, fields and all. It lives inline in the
+	// header, not in a side "expires" dict, to hold the memory bar, and is not
+	// counted in residentBytes (a fixed per-hash field, like acct). The live funnel
+	// drops the hash once cx.NowMs reaches this deadline, before any field reap.
+	expireAt int64
 }
 
 // residentBytes estimates the hash's resident-byte footprint, the figure the

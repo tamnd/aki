@@ -207,7 +207,16 @@ func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
 	if !ok {
 		return true
 	}
-	for k := range v.(*reg).m {
+	now := cx.NowMs
+	for k, h := range v.(*reg).m {
+		// Skip a hash whose key-level deadline has passed so KEYS and SCAN never
+		// surface a key EXISTS would report absent. The skip is read-only (no drop) to
+		// match the string store's expiry-aware walk, which reaps nothing during a
+		// scan. A hash emptied only by field expiry is a separate pre-existing case the
+		// field-TTL slice left to the next command that lands on the key.
+		if h.expireAt != 0 && h.expireAt <= now {
+			continue
+		}
 		if !fn([]byte(k)) {
 			return false
 		}
@@ -221,22 +230,42 @@ func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
 // registries are not resolved in this slice, the same deferral those slices carry
 // until keyspace unification threads every type through one holder.
 func (g *reg) lookup(cx *shard.Ctx, key []byte) (h *hash, wrong bool) {
-	if h = g.m[string(key)]; h != nil {
-		// Lazy field-TTL expiry: reap fired fields before the command sees the hash,
-		// so every read and write operates on a hash free of expired fields (spec
-		// 2064/f3/10 section 6.1). A hash whose last field just expired is deleted,
-		// the same way Redis drops a hash the moment it empties.
-		h.reap(uint64(cx.NowMs))
-		if h.card() == 0 {
-			g.drop(key)
-			return nil, false
-		}
+	if h = g.live(cx, key); h != nil {
 		return h, false
 	}
 	if cx.St.Exists(key, cx.NowMs) {
 		return nil, true
 	}
 	return nil, false
+}
+
+// live returns the hash at key, or nil when none exists or the hash has lazily
+// expired. It resolves two nested expiries in order: first the whole key's
+// key-level deadline (h.expireAt, spec 2064/f3/16 section 2), which drops the hash
+// entire and skips the field reap; then the per-field TTLs (h.reap, spec
+// 2064/f3/10 section 6.1), which delete fired fields and drop a hash the reap
+// empties. Either way an expired hash is dropped here and treated as absent, so it
+// is dead to this command and every later one in the epoch. This is the one funnel
+// every read, mutate, create, and probe path routes through.
+func (g *reg) live(cx *shard.Ctx, key []byte) *hash {
+	h := g.m[string(key)]
+	if h == nil {
+		return nil
+	}
+	if h.expireAt != 0 && h.expireAt <= cx.NowMs {
+		g.drop(key)
+		return nil
+	}
+	// Lazy field-TTL expiry: reap fired fields before the command sees the hash, so
+	// every read and write operates on a hash free of expired fields. A hash whose
+	// last field just expired is deleted, the same way Redis drops a hash the moment
+	// it empties.
+	h.reap(uint64(cx.NowMs))
+	if h.card() == 0 {
+		g.drop(key)
+		return nil
+	}
+	return h
 }
 
 // drop removes an emptied hash from the registry: Redis deletes a hash the moment

@@ -1121,10 +1121,10 @@ func keyDeadline(cx *shard.Ctx, key []byte) (state int, at int64) {
 		}
 		return 0, at
 	}
-	// A set and a zset each carry their own inline deadline now, so ask them
-	// directly; at==0 means a live key with no TTL. The other collection types have
-	// no key-level deadline yet, so a key present in one of them is live with no
-	// expiry.
+	// A set, a zset, and a hash each carry their own inline key-level deadline now,
+	// so ask them directly; at==0 means a live key with no TTL. The other collection
+	// types have no key-level deadline yet, so a key present in one of them is live
+	// with no expiry.
 	if at, ok := set.Deadline(cx, key); ok {
 		if at == 0 {
 			return -1, 0
@@ -1137,8 +1137,13 @@ func keyDeadline(cx *shard.Ctx, key []byte) (state int, at int64) {
 		}
 		return 0, at
 	}
-	if hash.Has(cx, key) ||
-		list.Has(cx, key) ||
+	if at, ok := hash.Deadline(cx, key); ok {
+		if at == 0 {
+			return -1, 0
+		}
+		return 0, at
+	}
+	if list.Has(cx, key) ||
 		stream.Has(cx, key) {
 		return -1, 0
 	}
@@ -1192,13 +1197,15 @@ func pexpiretimeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 }
 
 // persistCmd answers PERSIST key: remove the key's deadline, replying 1 when one
-// was removed and 0 otherwise. The string store, the set keyspace, and the zset
-// keyspace all carry key-level deadlines now, so each is asked in turn; the other
+// was removed and 0 otherwise. The string store and the set, zset, and hash
+// keyspaces all carry key-level deadlines now, so each is asked in turn; the other
 // collection types have none to remove and reach no branch, reading a correct 0,
-// the same answer an absent key gives. Their write side of EXPIRE stays owed until
-// they gain an inline deadline (rollout plan M-expiry-generic-key-ttl-plan.md).
+// the same answer an absent key gives. hash.Persist clears only the key-level
+// deadline, not the per-field HEXPIRE TTLs (those are HPERSIST's job). The
+// remaining types' write side of EXPIRE stays owed until they gain an inline
+// deadline (rollout plan M-expiry-generic-key-ttl-plan.md).
 func persistCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	if cx.St.Persist(args[0], cx.NowMs) || set.Persist(cx, args[0]) || zset.Persist(cx, args[0]) {
+	if cx.St.Persist(args[0], cx.NowMs) || set.Persist(cx, args[0]) || zset.Persist(cx, args[0]) || hash.Persist(cx, args[0]) {
 		r.Int(1)
 		return
 	}
@@ -1206,15 +1213,13 @@ func persistCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 }
 
 // pendingExpireKind reports the type name of a collection key that cannot carry a
-// key-level TTL yet, or "" when the key is absent, a string, a set, or a zset. Set
-// and zset are omitted because they now have an inline deadline and are routed
-// before this probe; the remaining three collection types stay owed until their
-// own deadline slice (rollout plan M-expiry-generic-key-ttl-plan.md). It builds no
-// registry.
+// key-level TTL yet, or "" when the key is absent, a string, a set, a zset, or a
+// hash. Set, zset, and hash are omitted because they now have an inline deadline
+// and are routed before this probe; the remaining two collection types stay owed
+// until their own deadline slice (rollout plan M-expiry-generic-key-ttl-plan.md).
+// It builds no registry.
 func pendingExpireKind(cx *shard.Ctx, key []byte) string {
 	switch {
-	case hash.Has(cx, key):
-		return "hash"
 	case list.Has(cx, key):
 		return "list"
 	case stream.Has(cx, key):
@@ -1238,6 +1243,10 @@ func expireRoute(cx *shard.Ctx, args [][]byte, r shard.Reply, verb string) {
 	}
 	if zset.Has(cx, key) {
 		zset.Expire(cx, args, r, verb)
+		return
+	}
+	if hash.Has(cx, key) {
+		hash.Expire(cx, args, r, verb)
 		return
 	}
 	if kind := pendingExpireKind(cx, key); kind != "" {
