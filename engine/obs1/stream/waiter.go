@@ -232,13 +232,15 @@ func serveWaiters(cx *shard.Ctx, g *reg, key []byte) {
 			conn.CompleteBlocked(seq, rep)
 			continue
 		}
-		rep, served := frameGroupPark(cx, g, nd.req)
+		rep, marks, served := frameGroupPark(cx, g, nd.req)
 		if !served {
 			continue // the entries went to an earlier consumer; stay parked
 		}
 		conn, seq := nd.conn, nd.seq
 		g.unlinkAll(cx, i)
-		conn.CompleteBlocked(seq, rep)
+		// The delivery ran on the waking writer's Ctx, so the reply completes under
+		// the waiter's own ack mode against the marks the delivery emitted.
+		cx.CompleteServed(conn, seq, rep, marks)
 	}
 }
 

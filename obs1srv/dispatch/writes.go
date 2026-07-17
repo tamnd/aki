@@ -16,8 +16,8 @@ package dispatch
 //     emit read-back frames (#1023).
 //   - GEORADIUS and GEORADIUSBYMEMBER are writes for their STORE clauses,
 //     the same classification that gives them _RO variants.
-//   - XREADGROUP and the PEL verbs are writes: group state mutates even
-//     though their frames arrive with the consumer-group durability slice.
+//   - XREADGROUP and the PEL verbs are writes: group state mutates and
+//     frames through the groupdelta vocabulary.
 //   - FLUSHALL and FLUSHDB are writes; their fan sub-command inherits the
 //     bit, as do the MSET and DEL sub-commands.
 var writeVerbs = []string{

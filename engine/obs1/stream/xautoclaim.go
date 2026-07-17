@@ -68,6 +68,15 @@ func Xautoclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// The pass reassigns pending slabs to the target consumer and prunes deleted
 	// entries; reconcile the footprint into the running sum.
 	g.note(s)
+	dropMs := make([]uint64, len(res.deleted))
+	dropSeqs := make([]uint64, len(res.deleted))
+	for i, id := range res.deleted {
+		dropMs[i], dropSeqs[i] = id.ms, id.seq
+	}
+	if err := logClaim(cx, grp, key, name, conName, res.claimed, dropMs, dropSeqs); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	cx.Aux = frameAutoClaim(cx.Aux[:0], s, res, justid)
 	r.Raw(cx.Aux)
 }

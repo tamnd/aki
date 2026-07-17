@@ -53,13 +53,19 @@ func Xreadgroup(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		// only on an actual `>` fetch, inside deliverNew.
 		con.seenTime = cx.NowMs
 		if isGreaterToken(ids[j]) {
-			if entries := grp.deliverNew(s, con, opts.count, opts.noack, cx.NowMs); len(entries) > 0 {
-				results = append(results, groupResult{key: keys[j], entries: entries})
-			}
+			entries := grp.deliverNew(s, con, opts.count, opts.noack, cx.NowMs)
 			// A `>` delivery records the entries in the group PEL (unless NOACK) and may
 			// have created the consumer, both of which grow the stream's footprint;
 			// reconcile it into the running sum.
 			g.note(s)
+			if len(entries) > 0 {
+				results = append(results, groupResult{key: keys[j], entries: entries})
+				ms, seqs := deliveredIDs(entries)
+				if err := cx.LogStreamDeliver(keys[j], grpName, conName, opts.noack, cx.NowMs, ms, seqs); err != nil {
+					r.Err(err.Error())
+					return
+				}
+			}
 			continue
 		}
 		start, ok := parseStreamID(ids[j])
@@ -114,13 +120,17 @@ func parkGroupRead(cx *shard.Ctx, g *reg, grpName, conName []byte, keys [][]byte
 
 // frameGroupPark re-runs a parked XREADGROUP `>` on wake: for each named stream it
 // delivers the entries now above the group's live cursor to the parked consumer,
-// recording them in the PEL unless NOACK, and frames the [key, entries] reply. It
-// returns served false when no stream produced entries, which happens when an
-// earlier consumer on the same group already took the appended entry and advanced
-// the cursor, so the caller leaves this waiter parked. A stream whose key or group
-// vanished while parked (XGROUP DESTROY) contributes nothing rather than erroring,
-// so such a waiter simply waits for the next delivery or its timeout.
-func frameGroupPark(cx *shard.Ctx, g *reg, req *xreadWait) (reply []byte, served bool) {
+// recording them in the PEL unless NOACK, frames the [key, entries] reply, and
+// emits each stream's gdeliver, whose frame orders behind the waking XADD's because
+// the XADD handler emits before it serves. It returns served false when no stream
+// produced entries, which happens when an earlier consumer on the same group
+// already took the appended entry and advanced the cursor, so the caller leaves
+// this waiter parked. A stream whose key or group vanished while parked (XGROUP
+// DESTROY) contributes nothing rather than erroring, so such a waiter simply waits
+// for the next delivery or its timeout. A refused emission turns the reply into
+// that error, delivered under whatever marks earlier streams emitted so a strict
+// waiter never hears it early.
+func frameGroupPark(cx *shard.Ctx, g *reg, req *xreadWait) (reply []byte, marks []shard.WALMark, served bool) {
 	gw := req.grp
 	results := make([]groupResult, 0, len(req.keys))
 	for j := range req.keys {
@@ -134,17 +144,36 @@ func frameGroupPark(cx *shard.Ctx, g *reg, req *xreadWait) (reply []byte, served
 		}
 		con := grp.ensureConsumer(gw.con, cx.NowMs)
 		con.seenTime = cx.NowMs
-		if entries := grp.deliverNew(s, con, req.count, gw.noack, cx.NowMs); len(entries) > 0 {
-			results = append(results, groupResult{key: req.keys[j], entries: entries})
-		}
+		entries := grp.deliverNew(s, con, req.count, gw.noack, cx.NowMs)
 		// A wake delivers into the PEL just as the inline path does; reconcile the
 		// stream's footprint into the running sum on the owner goroutine that runs it.
 		g.note(s)
+		if len(entries) == 0 {
+			continue
+		}
+		results = append(results, groupResult{key: req.keys[j], entries: entries})
+		ms, seqs := deliveredIDs(entries)
+		mk, lerr := cx.LogStreamDeliverServe(req.keys[j], gw.group, gw.con, gw.noack, cx.NowMs, ms, seqs)
+		if lerr != nil {
+			return resp.AppendError(nil, lerr.Error()), marks, true
+		}
+		marks = append(marks, mk...)
 	}
 	if len(results) == 0 {
-		return nil, false
+		return nil, nil, false
 	}
-	return frameGroupResults(nil, results), true
+	return frameGroupResults(nil, results), marks, true
+}
+
+// deliveredIDs splits a delivery's entry list into the parallel ms and seq slices
+// a gdeliver frame carries.
+func deliveredIDs(entries []deliveredEntry) (ms, seqs []uint64) {
+	ms = make([]uint64, len(entries))
+	seqs = make([]uint64, len(entries))
+	for i := range entries {
+		ms[i], seqs[i] = entries[i].id.ms, entries[i].id.seq
+	}
+	return ms, seqs
 }
 
 // deliveredEntry is one entry an XREADGROUP reply carries: its ID and, when the
