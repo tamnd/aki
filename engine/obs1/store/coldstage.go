@@ -203,6 +203,13 @@ func (s *Store) stageDrain(buf []byte, want uint64) *coldDrain {
 	for i := range d.flips {
 		d.flips[i].coldOff += base
 	}
+	// The fold tap sees the staged bytes exactly once, after the pass is
+	// final and before the pwrite: the folder snapshots them here, on the
+	// owner goroutine, so its eligibility mark covers every mutation the
+	// frames reflect (foldwalk.go).
+	if s.foldTap != nil {
+		s.foldTap(d.buf)
+	}
 	return d
 }
 
