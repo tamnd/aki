@@ -49,6 +49,15 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		created = true
 	}
 
+	// A pair frames when it added or rescored the member, at the score it
+	// now holds; a flag miss or a same-score write contributes nothing, so
+	// an all-miss ZADD emits no frames. Members alias the arguments, which
+	// outlive the synchronous emission.
+	logging := cx.Log != nil
+	var (
+		logScores  []float64
+		logMembers [][]byte
+	)
 	var added, changed int64
 	for p := 0; p < npairs; p++ {
 		member := rest[2*p+1]
@@ -66,6 +75,10 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		if gotChanged {
 			changed++
 		}
+		if logging && (gotAdded || gotChanged) {
+			logScores = append(logScores, newScore)
+			logMembers = append(logMembers, member)
+		}
 		if fl.incr {
 			// INCR carries exactly one pair; reply the new score or nil.
 			if created && z.card() == 0 {
@@ -76,6 +89,12 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 					g.m[string(key)] = z
 				}
 				g.note(z)
+			}
+			if len(logMembers) > 0 {
+				if err := cx.LogZSetAdd(key, created, logScores, logMembers); err != nil {
+					r.Err(err.Error())
+					return
+				}
 			}
 			if !applied {
 				r.Null()
@@ -96,6 +115,12 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			g.m[string(key)] = z
 		}
 		g.note(z)
+	}
+	if len(logMembers) > 0 {
+		if err := cx.LogZSetAdd(key, created, logScores, logMembers); err != nil {
+			r.Err(err.Error())
+			return
+		}
 	}
 	if fl.ch {
 		r.Int(added + changed)
@@ -167,7 +192,7 @@ func Zincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		z = newZset()
 		created = true
 	}
-	_, _, newScore, _, nan := z.update(member, delta, flags{incr: true})
+	gotAdded, gotChanged, newScore, _, nan := z.update(member, delta, flags{incr: true})
 	if nan {
 		r.Err("ERR resulting score is not a number (NaN)")
 		return
@@ -176,6 +201,14 @@ func Zincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		g.m[string(key)] = z
 	}
 	g.note(z)
+	// A zero increment on an existing member neither adds nor rescores, so
+	// it frames nothing.
+	if gotAdded || gotChanged {
+		if err := cx.LogZSetAdd(key, created, []float64{newScore}, [][]byte{member}); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
 	var sc [40]byte
 	r.Bulk(resp.FormatScore(sc[:0], newScore))
 }
@@ -258,18 +291,29 @@ func Zrem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Int(0)
 		return
 	}
-	var removed int64
-	for _, m := range args[1:] {
+	// Compact the members that actually left over the argument tail in
+	// place, so the emission frames exactly those (the set Srem shape).
+	memb := args[1:]
+	removed := 0
+	for _, m := range memb {
 		if z.rem(m) {
+			memb[removed] = m
 			removed++
 		}
 	}
-	if z.card() == 0 {
+	dropped := z.card() == 0
+	if dropped {
 		g.drop(args[0])
 	} else if removed > 0 {
 		g.note(z)
 	}
-	r.Int(removed)
+	if removed > 0 {
+		if err := cx.LogZSetRem(args[0], memb[:removed], dropped); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
+	r.Int(int64(removed))
 }
 
 // Zrank answers ZRANK key member [WITHSCORE]: the 0-based rank, or nil when the

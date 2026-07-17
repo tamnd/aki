@@ -227,15 +227,26 @@ flagsLoop:
 	}
 
 	zf := flags{nx: fl.nx, xx: fl.xx, ch: fl.ch}
+	// GEOADD is a ZADD in geohash scores, and it frames as one: each
+	// applied triple contributes its member at the encoded score.
+	logging := cx.Log != nil
+	var (
+		logScores  []float64
+		logMembers [][]byte
+	)
 	var added, changed int64
 	for t := 0; t < ntriples; t++ {
 		member := rest[3*t+2]
-		gotAdded, gotChanged, _, _, _ := z.update(member, scores[t], zf)
+		gotAdded, gotChanged, newScore, _, _ := z.update(member, scores[t], zf)
 		if gotAdded {
 			added++
 		}
 		if gotChanged {
 			changed++
+		}
+		if logging && (gotAdded || gotChanged) {
+			logScores = append(logScores, newScore)
+			logMembers = append(logMembers, member)
 		}
 	}
 
@@ -248,6 +259,12 @@ flagsLoop:
 			g.m[string(key)] = z
 		}
 		g.note(z)
+	}
+	if len(logMembers) > 0 {
+		if err := cx.LogZSetAdd(key, created, logScores, logMembers); err != nil {
+			r.Err(err.Error())
+			return
+		}
 	}
 	if fl.ch {
 		r.Int(added + changed)

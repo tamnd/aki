@@ -218,7 +218,12 @@ func runRadius(cx *shard.Ctx, args [][]byte, r shard.Reply, byMember, ro bool) {
 	}
 	hits = geoOrderCut(hits, opts.geoSearchOpts)
 	pairs := geoStorePairs(hits, opts.geoSearchOpts, sh.toMeters)
-	r.Int(int64(place(cx, g, opts.storeKey, buildDest(pairs))))
+	n, err := place(cx, g, opts.storeKey, buildDest(pairs))
+	if err != nil {
+		r.Err(err.Error())
+		return
+	}
+	r.Int(int64(n))
 }
 
 // Georadius answers GEORADIUS key lon lat radius unit [WITHCOORD] [WITHDIST]
@@ -310,10 +315,16 @@ func radiusCross(t *shard.Txn, args [][]byte, byMember bool) []byte {
 	if errMsg != "" {
 		return resp.AppendError(nil, errMsg)
 	}
-	var n int
+	var (
+		n      int
+		logErr error
+	)
 	t.Do(dest, func(cx *shard.Ctx) {
-		n = place(cx, registry(cx), dest, buildDest(pairs))
+		n, logErr = place(cx, registry(cx), dest, buildDest(pairs))
 	})
+	if logErr != nil {
+		return resp.AppendError(nil, logErr.Error())
+	}
 	return resp.AppendInt(nil, int64(n))
 }
 

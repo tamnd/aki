@@ -57,17 +57,34 @@ func zpopImpl(cx *shard.Ctx, args [][]byte, r shard.Reply, min bool) {
 	if npop > z.card() {
 		npop = z.card()
 	}
+	// The pop hands out members aliasing storage it is tearing down, so
+	// the emission copies each one, gated on a wired log.
+	logging := cx.Log != nil
+	var popped [][]byte
+	if logging {
+		popped = make([][]byte, 0, npop)
+	}
 	out := resp.AppendArrayHeader(cx.Aux[:0], npop*2)
 	var sc [40]byte
 	z.pop(min, count, func(m []byte, s float64) {
 		out = resp.AppendBulk(out, m)
 		out = resp.AppendBulk(out, resp.FormatScore(sc[:0], s))
+		if logging {
+			popped = append(popped, append([]byte(nil), m...))
+		}
 	})
 	cx.Aux = out
-	if z.card() == 0 {
+	dropped := z.card() == 0
+	if dropped {
 		g.drop(args[0])
 	} else {
 		g.note(z)
+	}
+	if len(popped) > 0 {
+		if err := cx.LogZSetRem(args[0], popped, dropped); err != nil {
+			r.Err(err.Error())
+			return
+		}
 	}
 	r.Raw(out)
 }
@@ -135,6 +152,12 @@ func Zmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		if npop > z.card() {
 			npop = z.card()
 		}
+		// Same emission shape as zpopImpl: copied members, one zrem.
+		logging := cx.Log != nil
+		var popped [][]byte
+		if logging {
+			popped = make([][]byte, 0, npop)
+		}
 		out := resp.AppendArrayHeader(cx.Aux[:0], 2)
 		out = resp.AppendBulk(out, key)
 		out = resp.AppendArrayHeader(out, npop)
@@ -143,12 +166,22 @@ func Zmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			out = resp.AppendArrayHeader(out, 2)
 			out = resp.AppendBulk(out, m)
 			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], s))
+			if logging {
+				popped = append(popped, append([]byte(nil), m...))
+			}
 		})
 		cx.Aux = out
-		if z.card() == 0 {
+		dropped := z.card() == 0
+		if dropped {
 			g.drop(key)
 		} else {
 			g.note(z)
+		}
+		if len(popped) > 0 {
+			if err := cx.LogZSetRem(key, popped, dropped); err != nil {
+				r.Err(err.Error())
+				return
+			}
 		}
 		r.Raw(out)
 		return
