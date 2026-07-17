@@ -53,6 +53,11 @@ type ZSet struct {
 	// Bulk build scratch, zstore.go: the STORE-family builder's arenas
 	// and fences, reused across commands.
 	zbld zBuilder
+
+	// Pop scratch, zpop.go: the collected window a pop removes and
+	// then emits, reused across commands.
+	zparena []byte
+	zppairs []zbuildPair
 }
 
 // NewZSet builds the zset layer over t.
