@@ -835,6 +835,22 @@ func (l *WriteLog) SetFlushAge(d time.Duration) { l.fl.SetFlushAge(d) }
 // barriers park on.
 func (l *WriteLog) Marks() *Watermarks { return l.marks }
 
+// GroupMark returns the group's lease epoch and the last WAL seq emitted
+// on it, zero when nothing has been emitted since SetGroup. This is the
+// fold-eligibility snapshot (doc 06 section 1.2): emission and cold
+// staging share the group owner's goroutine, so a record staged now
+// reflects every mutation through the returned seq, and a segment built
+// from the stage publishes once the committed watermark covers it. Call it
+// only from the owning shard's goroutine; wlGroup state is single-writer
+// and unsynchronized.
+func (l *WriteLog) GroupMark(group uint16) (epoch uint32, last uint64) {
+	g := &l.groups[group]
+	if g.next == 0 {
+		return g.epoch, 0
+	}
+	return g.epoch, g.next - 1
+}
+
 // Err reports the pipeline's first fatal error, flusher first.
 func (l *WriteLog) Err() error {
 	if err := l.fl.Err(); err != nil {
