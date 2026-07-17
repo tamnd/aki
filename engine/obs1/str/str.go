@@ -223,6 +223,16 @@ func Set(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(storeErr(err))
 		return
 	}
+	// The effect frame records the deadline the key now rides under: the
+	// computed one, or the carried one when KEEPTTL kept it (doc 04 section 2).
+	frameAt := atMs
+	if flags&setKeepTTL != 0 {
+		frameAt = cx.St.ExpireAt(key, cx.NowMs)
+	}
+	if err := cx.LogStrSet(key, val, frameAt, false); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	if flags&setGet != 0 {
 		if haveOld {
 			r.Bulk(oldVal)
@@ -255,6 +265,10 @@ func Exists(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // read would give.
 func Del(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if cx.St.Del(args[0], cx.NowMs) {
+		if err := cx.LogKeyDel(args[0]); err != nil {
+			r.Err(err.Error())
+			return
+		}
 		r.Int(1)
 		return
 	}

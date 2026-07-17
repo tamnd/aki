@@ -33,6 +33,9 @@ func incrBy(cx *shard.Ctx, key []byte, delta int64, r shard.Reply) {
 		r.Err(incrErr(err))
 		return
 	}
+	if !logCounter(cx, key, n, r) {
+		return
+	}
 	r.Int(n)
 }
 
@@ -108,6 +111,14 @@ func IncrByFloat(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(storeErr(err))
 		return
 	}
+	// A float result is not int-shaped, so the frame skips the counter
+	// ladder bit; the deadline rode through the keepTTL write above.
+	if cx.Log != nil {
+		if err := cx.Log.StrSet(key, out, cx.St.ExpireAt(key, cx.NowMs), false); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
 	r.Bulk(out)
 }
 
@@ -121,6 +132,9 @@ func Append(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			return
 		}
 		r.Err(storeErr(err))
+		return
+	}
+	if !logReadBack(cx, args[0], r) {
 		return
 	}
 	r.Int(n)
@@ -155,6 +169,9 @@ func SetRange(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			return
 		}
 		r.Err(storeErr(err))
+		return
+	}
+	if !logReadBack(cx, args[0], r) {
 		return
 	}
 	r.Int(n)

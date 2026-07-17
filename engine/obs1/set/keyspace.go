@@ -48,6 +48,10 @@ func Del(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		removed = true
 	}
 	if removed {
+		if err := cx.LogKeyDel(key); err != nil {
+			r.Err(err.Error())
+			return
+		}
 		r.Int(1)
 		return
 	}

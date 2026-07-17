@@ -48,6 +48,13 @@ func MSetShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			r.FanErrString(storeErr(err))
 			return
 		}
+		// One effect frame per pair, emitted as each pair commits: the
+		// resume cursor already guarantees a retried park never re-applies
+		// (or re-logs) the committed prefix.
+		if err := cx.LogStrSet(args[i], args[i+1], 0, false); err != nil {
+			r.FanErrString(err.Error())
+			return
+		}
 	}
 	r.FanOK()
 }
@@ -59,6 +66,10 @@ func DelShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	var n int64
 	for _, key := range args {
 		if cx.St.Del(key, cx.NowMs) {
+			if err := cx.LogKeyDel(key); err != nil {
+				r.FanErrString(err.Error())
+				return
+			}
 			n++
 		}
 	}
