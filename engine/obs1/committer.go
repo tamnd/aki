@@ -202,6 +202,14 @@ type Watermarks struct {
 	mu      sync.Mutex
 	seq     map[uint16]uint64
 	changed map[uint16]chan struct{}
+	notify  map[uint16][]wmNotify
+}
+
+// wmNotify is one registered callback: fn runs once the group's
+// watermark reaches seq.
+type wmNotify struct {
+	seq uint64
+	fn  func()
 }
 
 // NewWatermarks starts every group at zero.
@@ -209,14 +217,19 @@ func NewWatermarks() *Watermarks {
 	return &Watermarks{
 		seq:     make(map[uint16]uint64),
 		changed: make(map[uint16]chan struct{}),
+		notify:  make(map[uint16][]wmNotify),
 	}
 }
 
 // ApplyVerdict advances the live sections' groups to their LastSeq and
 // wakes their waiters. Matches the LeaseFold.OnCommit signature.
+// Callbacks whose seq the advance covered run here on the fold's
+// goroutine, outside the lock, in registration order per group; a
+// strict ack's callback is a lock-free queue push (Conn.CompleteBlocked),
+// so the fold pays a bounded, non-blocking step per waiter.
 func (w *Watermarks) ApplyVerdict(v CommitVerdict) error {
+	var due []func()
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	for i, s := range v.Commit.Sections {
 		if !v.Live[i] || s.LastSeq <= w.seq[s.Group] {
 			continue
@@ -226,8 +239,48 @@ func (w *Watermarks) ApplyVerdict(v CommitVerdict) error {
 			close(ch)
 			delete(w.changed, s.Group)
 		}
+		if list := w.notify[s.Group]; len(list) != 0 {
+			kept := list[:0]
+			for _, n := range list {
+				if n.seq <= s.LastSeq {
+					due = append(due, n.fn)
+				} else {
+					kept = append(kept, n)
+				}
+			}
+			for j := len(kept); j < len(list); j++ {
+				list[j] = wmNotify{}
+			}
+			if len(kept) == 0 {
+				delete(w.notify, s.Group)
+			} else {
+				w.notify[s.Group] = kept
+			}
+		}
+	}
+	w.mu.Unlock()
+	for _, fn := range due {
+		fn()
 	}
 	return nil
+}
+
+// Notify registers fn to run once the group's watermark reaches seq,
+// the callback face of Wait for callers that must not block (a strict
+// ack parked on an owner reply slot). Already-covered marks fire fn
+// before Notify returns, on the caller's goroutine; otherwise fn runs
+// from the ApplyVerdict that covers it. Registrations survive until
+// covered; a mark under a fenced epoch never commits live, so its
+// callback never fires, the same silence Wait shows as a stall.
+func (w *Watermarks) Notify(group uint16, seq uint64, fn func()) {
+	w.mu.Lock()
+	if w.seq[group] >= seq {
+		w.mu.Unlock()
+		fn()
+		return
+	}
+	w.notify[group] = append(w.notify[group], wmNotify{seq: seq, fn: fn})
+	w.mu.Unlock()
 }
 
 // Committed reports a group's committed watermark, zero if nothing

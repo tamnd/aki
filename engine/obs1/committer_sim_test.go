@@ -332,3 +332,73 @@ func TestWatermarksWait(t *testing.T) {
 		t.Fatalf("untouched group reads %d", got)
 	}
 }
+
+// TestWatermarksNotify covers the callback face Wait's blocking form
+// cannot serve: an already-covered mark fires before Notify returns, a
+// pending one fires from the covering ApplyVerdict and not from a dead
+// section or a short advance, and callbacks past the advance stay
+// registered.
+func TestWatermarksNotify(t *testing.T) {
+	w := obs1.NewWatermarks()
+	verdict := func(group uint16, seq uint64, live bool) obs1.CommitVerdict {
+		return obs1.CommitVerdict{
+			Commit: obs1.CommitRecord{Sections: []obs1.CommitSection{{
+				Group: group, Epoch: 1, NFrames: 1, FirstSeq: seq, LastSeq: seq,
+			}}},
+			Live: []bool{live},
+		}
+	}
+	fired := make(chan int, 8)
+	w.Notify(1, 2, func() { fired <- 2 })
+	w.Notify(1, 5, func() { fired <- 5 })
+	select {
+	case n := <-fired:
+		t.Fatalf("callback %d fired before any commit", n)
+	default:
+	}
+	if err := w.ApplyVerdict(verdict(1, 3, false)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case n := <-fired:
+		t.Fatalf("callback %d fired on a dead section", n)
+	default:
+	}
+	if err := w.ApplyVerdict(verdict(1, 3, true)); err != nil {
+		t.Fatal(err)
+	}
+	if n := <-fired; n != 2 {
+		t.Fatalf("first firing = %d, want the covered mark 2", n)
+	}
+	select {
+	case n := <-fired:
+		t.Fatalf("callback %d fired at watermark 3", n)
+	default:
+	}
+	// Already covered: fires on the caller's goroutine before Notify
+	// returns, no verdict needed.
+	inline := false
+	w.Notify(1, 3, func() { inline = true })
+	if !inline {
+		t.Fatal("already-covered Notify did not fire inline")
+	}
+	if err := w.ApplyVerdict(verdict(1, 7, true)); err != nil {
+		t.Fatal(err)
+	}
+	if n := <-fired; n != 5 {
+		t.Fatalf("second firing = %d, want the surviving mark 5", n)
+	}
+	// A different group's registration is untouched by all of the above.
+	w.Notify(2, 1, func() { fired <- 100 })
+	select {
+	case n := <-fired:
+		t.Fatalf("callback %d fired for an untouched group", n)
+	default:
+	}
+	if err := w.ApplyVerdict(verdict(2, 1, true)); err != nil {
+		t.Fatal(err)
+	}
+	if n := <-fired; n != 100 {
+		t.Fatalf("group 2 firing = %d", n)
+	}
+}
