@@ -47,3 +47,28 @@ func (z *ZSet) RunWalkForTest(ctx context.Context, key []byte, emit func(sortabl
 }
 
 var ZScoreSortableForTest = zScoreSortable
+
+// FencePagedForTest reports whether key's score fence has crossed to
+// the paged representation, so the paged torn-tail matrix can prove
+// its scenario really drives the pages before it starts cutting.
+func (z *ZSet) FencePagedForTest(ctx context.Context, key []byte) (bool, error) {
+	st, _, _, err := z.h.stateOf(ctx, key)
+	if err != nil || st != hashSegState {
+		return false, err
+	}
+	if err := z.zloadTail(); err != nil {
+		return false, err
+	}
+	return z.zpaged, nil
+}
+
+// SetZFenceCapsForTest shrinks the score fence fanouts so the paged
+// ladder (transition, leaf split, upper split, third-level error) is
+// reachable in test-sized zsets. The transition builds one leaf from
+// the whole flat fence plus the splitting run, so flat+1 must fit
+// leaf. Callers restore via the returned func.
+func SetZFenceCapsForTest(flat, leaf, upper, root int) (restore func()) {
+	of, ol, ou, or := zFenceMaxRuns, zFenceLeafMax, zFenceUpperMax, zFenceRootMax
+	zFenceMaxRuns, zFenceLeafMax, zFenceUpperMax, zFenceRootMax = flat, leaf, upper, root
+	return func() { zFenceMaxRuns, zFenceLeafMax, zFenceUpperMax, zFenceRootMax = of, ol, ou, or }
+}
