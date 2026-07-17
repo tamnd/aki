@@ -30,6 +30,18 @@ if [ -n "$ext" ]; then
 	exit 1
 fi
 
+# W-I4 (doc 04 section 11): the diskless write path never touches a file.
+# The engine root package must not import os, os/exec, syscall, or
+# io/ioutil directly; the section 8 NVMe hint lives outside this package.
+# Direct imports only, since the stdlib reaches os transitively.
+disk=$(go list -f '{{join .Imports "\n"}}' ./engine/obs1 |
+	grep -Ex 'os|os/exec|syscall|io/ioutil' || true)
+if [ -n "$disk" ]; then
+	echo "engine/obs1 must stay off the disk APIs (W-I4):"
+	echo "$disk"
+	exit 1
+fi
+
 dirs=$(find engine/obs1 obs1srv cmd/obs1srv labs/obs1 -type d -name internal)
 if [ -n "$dirs" ]; then
 	echo "internal/ directories are not allowed in the obs1 trees:"
