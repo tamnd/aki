@@ -289,3 +289,54 @@ func TestWalkRecordsPropagatesVisitError(t *testing.T) {
 		t.Fatalf("visit called %d times, want 1 before the stop", seen)
 	}
 }
+
+// TestReadRecordAtResolvesFlushAddress reads each record back at the absolute
+// address Flush returned, the random-access deref a checkpoint's record_addr
+// takes. Every field must survive the round trip through the file.
+func TestReadRecordAtResolvesFlushAddress(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	w := NewRecordLogWriter(f, 2)
+
+	rows := []RecordRow{
+		sampleRow("point-a", 1<<63|11),
+		{Flags: RecFlagTombstone, Key: []byte("point-b")},
+		sampleRow("a-noticeably-longer-key", 0xcafef00d),
+	}
+	for _, r := range rows {
+		w.Stage(r)
+	}
+	addrs, err := w.Flush(4)
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	for i, addr := range addrs {
+		got, err := f.ReadRecordAt(addr)
+		if err != nil {
+			t.Fatalf("read record %d at %d: %v", i, addr, err)
+		}
+		if !rowsEqual(got, rows[i]) {
+			t.Fatalf("record %d = %+v, want %+v", i, got, rows[i])
+		}
+	}
+}
+
+// TestReadRecordAtDetectsTorn corrupts a record body in the file and confirms a
+// point read fails ErrChecksum rather than returning a rotted row.
+func TestReadRecordAtDetectsTorn(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	w := NewRecordLogWriter(f, 0)
+
+	w.Stage(sampleRow("victim", 5))
+	addrs, err := w.Flush(1)
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	// Flip a byte inside the record body in the backing store. The address points
+	// at the varint, so the body starts one byte in for this small frame.
+	dev.buf[addrs[0]+2] ^= 0xff
+	if _, err := f.ReadRecordAt(addrs[0]); err != ErrChecksum {
+		t.Fatalf("torn point read err = %v, want ErrChecksum", err)
+	}
+}
