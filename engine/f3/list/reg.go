@@ -82,7 +82,7 @@ func Delete(cx *shard.Ctx, key []byte) bool {
 		return false
 	}
 	g := v.(*reg)
-	if g.m[string(key)] == nil {
+	if g.live(cx, key) == nil {
 		return false
 	}
 	g.drop(key)
@@ -127,7 +127,14 @@ func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
 	if !ok {
 		return true
 	}
-	for k := range v.(*reg).m {
+	now := cx.NowMs
+	for k, l := range v.(*reg).m {
+		// Skip a list whose key-level deadline has passed so KEYS and SCAN never
+		// surface a key EXISTS would report absent. The skip is read-only (no drop) to
+		// match the string store's expiry-aware walk, which reaps nothing during a scan.
+		if l.expireAt != 0 && l.expireAt <= now {
+			continue
+		}
 		if !fn([]byte(k)) {
 			return false
 		}
@@ -141,13 +148,31 @@ func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
 // this slice, the same deferral the set and zset slices carry until keyspace
 // unification threads every type through one holder.
 func (g *reg) lookup(cx *shard.Ctx, key []byte) (l *list, wrong bool) {
-	if l = g.m[string(key)]; l != nil {
+	if l = g.live(cx, key); l != nil {
 		return l, false
 	}
 	if cx.St.Exists(key, cx.NowMs) {
 		return nil, true
 	}
 	return nil, false
+}
+
+// live returns the list at key, or nil when none exists or the list's key-level
+// deadline has passed (spec 2064/f3/16 section 2). An expired list is dropped here
+// and treated as absent, so it is dead to this command and every later one in the
+// epoch, the lazy-expiry half of the TTL contract. Unlike the hash there is no
+// per-field TTL to reap, so this is the plain deadline check the set and zset carry.
+// This is the one funnel every read, mutate, create, and probe path routes through.
+func (g *reg) live(cx *shard.Ctx, key []byte) *list {
+	l := g.m[string(key)]
+	if l == nil {
+		return nil
+	}
+	if l.expireAt != 0 && l.expireAt <= cx.NowMs {
+		g.drop(key)
+		return nil
+	}
+	return l
 }
 
 // note reconciles l's footprint into the running resident total: it posts the

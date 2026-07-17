@@ -444,7 +444,7 @@ func Lpos(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if eqFold(args[0], "ENCODING") && len(args) == 2 {
 		if v, ok := regs.Load(cx.St); ok {
-			if l := v.(*reg).m[string(args[1])]; l != nil {
+			if l := v.(*reg).live(cx, args[1]); l != nil {
 				r.Bulk([]byte(l.encoding().String()))
 				return
 			}
