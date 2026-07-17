@@ -112,6 +112,12 @@ func PfMerge(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err("ERR " + err.Error())
 		return
 	}
+	// The merged dense sketch is in hand, so the effect frame takes it
+	// directly; the keepttl write preserved any deadline, read beside it.
+	if err := cx.LogStrSet(args[0], out, cx.St.ExpireAt(args[0], cx.NowMs), false); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	r.Status("OK")
 }
 
@@ -151,12 +157,21 @@ func PfMergeCross(t *shard.Txn, args [][]byte) []byte {
 		}
 	}
 	out := denseFromScratch(acc)
-	var werr error
+	var werr, lerr error
 	t.Do(dest, func(cx *shard.Ctx) {
 		werr = cx.St.SetString(dest, out, cx.NowMs, 0, true)
+		if werr == nil {
+			// The install is the one mutation, framed on the destination's
+			// owner inside the hop; the closure runs with no current command,
+			// so the emission is relaxed-only under the transaction.
+			lerr = cx.LogStrSet(dest, out, cx.St.ExpireAt(dest, cx.NowMs), false)
+		}
 	})
 	if werr != nil {
 		return resp.AppendError(nil, "ERR "+werr.Error())
+	}
+	if lerr != nil {
+		return resp.AppendError(nil, lerr.Error())
 	}
 	return resp.AppendStatus(nil, "OK")
 }
