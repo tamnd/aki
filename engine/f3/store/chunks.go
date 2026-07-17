@@ -162,7 +162,7 @@ func (s *Store) readChunked(addr uint64, dst []byte) ([]byte, bool) {
 		if w == 0 {
 			clear(dst[pos : pos+clen])
 		} else if w&inLogBit != 0 {
-			if err := s.vlog.readFill(w&runAddrMask, dst[pos:pos+clen]); err != nil {
+			if err := s.logReadFill(w&runAddrMask, dst[pos:pos+clen]); err != nil {
 				return dst[:0], false
 			}
 		} else {
@@ -245,7 +245,7 @@ func (s *Store) updateChunked(addr uint64, offset int, val []byte, oldLen, newLe
 				// bytes are zero, and there is no run to read or drop.
 				clear(dst[:oldClen])
 			} else if cw&inLogBit != 0 {
-				if err := s.vlog.readFill(cw&runAddrMask, dst[:oldClen]); err != nil {
+				if err := s.logReadFill(cw&runAddrMask, dst[:oldClen]); err != nil {
 					return err
 				}
 			} else {

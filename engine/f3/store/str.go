@@ -247,7 +247,7 @@ func (s *Store) readSep(addr uint64, dst []byte) ([]byte, bool) {
 	vs := s.valueStart(addr)
 	word, vlen, _ := s.readPtr(vs)
 	if word&inLogBit != 0 {
-		v, err := s.vlog.readInto(word&runAddrMask, int(vlen), dst)
+		v, err := s.logReadInto(word&runAddrMask, int(vlen), dst)
 		if err != nil {
 			return dst[:0], false
 		}
@@ -625,7 +625,7 @@ func (s *Store) materialize(addr uint64, scratch []byte) ([]byte, error) {
 	if f&flagSep != 0 {
 		word, vlen, _ := s.readPtr(vs)
 		if word&inLogBit != 0 {
-			v, err := s.vlog.readInto(word&runAddrMask, int(vlen), s.vbuf)
+			v, err := s.logReadInto(word&runAddrMask, int(vlen), s.vbuf)
 			s.vbuf = v[:cap(v)][:0]
 			if err != nil {
 				return nil, err

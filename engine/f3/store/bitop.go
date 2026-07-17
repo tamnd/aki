@@ -215,7 +215,7 @@ func (s *Store) fillRange(addr uint64, length, off int64, dst []byte) {
 		word, _, _ := s.readPtr(vs)
 		base := word & runAddrMask
 		if word&inLogBit != 0 {
-			_ = s.vlog.readFill(base+uint64(off), dst[:m])
+			_ = s.logReadFill(base+uint64(off), dst[:m])
 		} else {
 			copy(dst[:m], s.arena.buf[base+uint64(off):])
 		}
@@ -249,7 +249,7 @@ func (s *Store) copyChunkAligned(vs uint64, off int64, dst []byte) {
 		m = int(l)
 	}
 	if w&inLogBit != 0 {
-		_ = s.vlog.readFill(w&runAddrMask, dst[:m])
+		_ = s.logReadFill(w&runAddrMask, dst[:m])
 	} else {
 		run := w & runAddrMask
 		copy(dst[:m], s.arena.buf[run:run+uint64(m)])

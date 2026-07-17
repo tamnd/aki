@@ -93,7 +93,7 @@ func (s *Store) eachByteRange(addr uint64, lo, hi int64, fn func(base int64, seg
 				seg = s.zeros(ln)
 			case w&inLogBit != 0:
 				buf := s.stage()[:ln]
-				if err := s.vlog.readFill((w&runAddrMask)+uint64(off), buf); err != nil {
+				if err := s.logReadFill((w&runAddrMask)+uint64(off), buf); err != nil {
 					return
 				}
 				seg = buf
@@ -117,7 +117,7 @@ func (s *Store) eachByteRange(addr uint64, lo, hi int64, fn func(base int64, seg
 		word, _, _ := s.readPtr(vs)
 		if word&inLogBit != 0 {
 			buf := s.stage()[:hi-lo+1]
-			if err := s.vlog.readFill((word&runAddrMask)+uint64(lo), buf); err != nil {
+			if err := s.logReadFill((word&runAddrMask)+uint64(lo), buf); err != nil {
 				return
 			}
 			fn(lo, buf)
