@@ -299,6 +299,13 @@ func (r *Runtime) UseDemoter(fn func(*Ctx) int) {
 // Shards reports the shard count.
 func (r *Runtime) Shards() int { return len(r.workers) }
 
+// BootStore returns shard i's store for boot-time replay: recovery
+// applies committed WAL frames into the stores after Open and before
+// Start, when no worker goroutine exists and the caller is the only
+// writer. Once Start has run the stores belong to their owners and this
+// accessor must not be used.
+func (r *Runtime) BootStore(i int) *store.Store { return r.workers[i].st }
+
 // ShardOf routes a key to its owner: hash slot to contiguous slot group
 // to group id mod S (slot.go). This is the slot-honest route the f3
 // wyhash comment promised; keys sharing a hash tag share a slot, so they

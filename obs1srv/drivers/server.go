@@ -200,6 +200,13 @@ type Options struct {
 	// call it, paced, so the folder cuts early under pressure (doc 06
 	// section 1.4).
 	FoldKick func()
+	// Boot, when set, runs after the runtime is built and wired but
+	// before any worker starts: the boot recovery seam. BootDurability
+	// goes here, replaying the committed WAL tail into the shard stores
+	// and wiring the durability pipeline onto the runtime directly, which
+	// is why it can coexist with the nil defaults of WriteLog, WALInfo,
+	// FoldTap, FoldProgress, and FoldKick above. An error aborts Listen.
+	Boot func(rt *shard.Runtime) error
 	// OutBufLimitBytes is the hard cap on one connection's pending reply
 	// bytes buffered driver-side (the client-output-buffer-limit lineage,
 	// doc 08 section 3.5): a client whose unread backlog passes it is
@@ -405,6 +412,16 @@ func Listen(o Options) (*Server, error) {
 	}
 	if o.FoldKick != nil {
 		s.rt.SetFoldKick(o.FoldKick)
+	}
+	if o.Boot != nil {
+		if err := o.Boot(rt); err != nil {
+			_ = ln.Close()
+			if s.pprofLn != nil {
+				_ = s.pprofLn.Close()
+			}
+			rt.Stop()
+			return nil, err
+		}
 	}
 	s.rt.Start()
 	return s, nil
