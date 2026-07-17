@@ -313,9 +313,11 @@ func (b *setBuilder) cut(ctx context.Context) error {
 // of any type needs (the bump rides the commit's drain batch, the
 // same-batch contract), and reports existence and the current expiry
 // so the caller can drop it, because a STORE destination is a fresh
-// object and Redis clears the TTL.
-func (s *Set) destPrep(ctx context.Context, dest []byte) (exists bool, expMs int64, err error) {
-	v, root, expMs, ok, err := s.h.t.LookupEntry(ctx, dest)
+// object and Redis clears the TTL. On Hash because every STORE
+// family (set algebra, ZRANGESTORE, the zset algebra to come) lands
+// through the same door.
+func (h *Hash) destPrep(ctx context.Context, dest []byte) (exists bool, expMs int64, err error) {
+	v, root, expMs, ok, err := h.t.LookupEntry(ctx, dest)
 	if err != nil || !ok {
 		return false, 0, err
 	}
@@ -331,20 +333,60 @@ func (s *Set) destPrep(ctx context.Context, dest []byte) (exists bool, expMs int
 		if err != nil {
 			return false, 0, err
 		}
-		s.h.t.Bump(dest, rooth, rootgen+1)
+		h.t.Bump(dest, rooth, rootgen+1)
 	}
 	return true, expMs, nil
 }
 
 // storeEmpty is the empty-result door: the destination is deleted
 // whatever it held, Redis's rule for every STORE variant.
-func (s *Set) storeEmpty(ctx context.Context, dest []byte) (int64, error) {
-	exists, _, err := s.destPrep(ctx, dest)
+func (h *Hash) storeEmpty(ctx context.Context, dest []byte) (int64, error) {
+	exists, _, err := h.destPrep(ctx, dest)
 	if err != nil || !exists {
 		return 0, err
 	}
-	_, err = s.h.t.Del(ctx, dest)
+	_, err = h.t.Del(ctx, dest)
 	return 0, err
+}
+
+// commitFence installs a one-pass-built member fence into the seg
+// root, paging it when it outgrew the flat cap: full pages except the
+// last, the index entry carrying each page's first lo (page 0 covers
+// from 0 like a flat fence's first entry). Shared by every bulk
+// build.
+func (h *Hash) commitFence(ctx context.Context, fence []hashFenceEnt) error {
+	r := &h.segRoot
+	if len(fence) > hashFenceMaxSegs {
+		h.pidx = h.pidx[:0]
+		for base := 0; base < len(fence); base += hashFencePageMax {
+			n := min(hashFencePageMax, len(fence)-base)
+			page := fence[base : base+n]
+			pageid := r.nextSegid
+			r.nextSegid++
+			h.pageBuf = appendHashFencePage(h.pageBuf[:0], page)
+			putHashFenceKey(h.kbuf2[:], r.rooth, pageid)
+			if err := h.t.SetGen(ctx, h.kbuf2[:], h.pageBuf, h.tag|TagFence, r.rootgen); err != nil {
+				return err
+			}
+			h.pidx = append(h.pidx, hashPageEnt{
+				lo:     page[0].lo,
+				pageid: pageid,
+				weight: hashPageWeight(page),
+			})
+		}
+		if len(h.pidx) > hashFencePageIdxMax {
+			return errHashFenceThirdLevel
+		}
+		r.paged = true
+		r.pidx = h.pidx
+		r.pi = -1
+		r.fence = nil
+		return nil
+	}
+	r.paged = false
+	r.pidx = nil
+	r.fence = fence
+	return nil
 }
 
 // storeCommit finishes the build and lands it on dest. Inline results
@@ -354,79 +396,48 @@ func (s *Set) storeEmpty(ctx context.Context, dest []byte) (int64, error) {
 // the commit point.
 func (s *Set) storeCommit(ctx context.Context, dest []byte, b *setBuilder) (int64, error) {
 	if b.count == 0 {
-		return s.storeEmpty(ctx, dest)
+		return s.h.storeEmpty(ctx, dest)
 	}
 	if b.inline {
 		putHashInlineHdr(b.rootBuf, s.h.subInline, int(b.count), 0, b.allInt)
-		exists, expMs, err := s.destPrep(ctx, dest)
+		exists, expMs, err := s.h.destPrep(ctx, dest)
 		if err != nil {
 			return 0, err
 		}
 		if err := s.h.t.Set(ctx, dest, b.rootBuf, s.h.tag|TagRoot); err != nil {
 			return 0, err
 		}
-		return b.count, s.clearDestExp(ctx, dest, exists, expMs)
+		return b.count, s.h.clearDestExp(ctx, dest, exists, expMs)
 	}
 	if len(b.pend) > 0 {
 		if err := b.cut(ctx); err != nil {
 			return 0, err
 		}
 	}
-	r := &s.h.segRoot
-	if len(b.fence) > hashFenceMaxSegs {
-		// One-pass paging: full pages except the last, the index entry
-		// carrying each page's first lo (page 0 covers from 0 like a
-		// flat fence's first entry).
-		s.h.pidx = s.h.pidx[:0]
-		for base := 0; base < len(b.fence); base += hashFencePageMax {
-			n := min(hashFencePageMax, len(b.fence)-base)
-			page := b.fence[base : base+n]
-			pageid := r.nextSegid
-			r.nextSegid++
-			s.h.pageBuf = appendHashFencePage(s.h.pageBuf[:0], page)
-			putHashFenceKey(s.h.kbuf2[:], r.rooth, pageid)
-			if err := s.h.t.SetGen(ctx, s.h.kbuf2[:], s.h.pageBuf, s.h.tag|TagFence, r.rootgen); err != nil {
-				return 0, err
-			}
-			s.h.pidx = append(s.h.pidx, hashPageEnt{
-				lo:     page[0].lo,
-				pageid: pageid,
-				weight: hashPageWeight(page),
-			})
-		}
-		if len(s.h.pidx) > hashFencePageIdxMax {
-			return 0, errHashFenceThirdLevel
-		}
-		r.paged = true
-		r.pidx = s.h.pidx
-		r.pi = -1
-		r.fence = nil
-	} else {
-		r.paged = false
-		r.pidx = nil
-		r.fence = b.fence
+	if err := s.h.commitFence(ctx, b.fence); err != nil {
+		return 0, err
 	}
-	r.count = uint64(b.count)
+	s.h.segRoot.count = uint64(b.count)
 	if err := s.h.t.Flush(ctx); err != nil {
 		return 0, err
 	}
-	exists, expMs, err := s.destPrep(ctx, dest)
+	exists, expMs, err := s.h.destPrep(ctx, dest)
 	if err != nil {
 		return 0, err
 	}
 	if err := s.h.writeSegRoot(ctx, dest, false); err != nil {
 		return 0, err
 	}
-	return b.count, s.clearDestExp(ctx, dest, exists, expMs)
+	return b.count, s.h.clearDestExp(ctx, dest, exists, expMs)
 }
 
 // clearDestExp drops the expiry an overwritten destination carried; a
 // hot header would otherwise preserve it across the commit write.
-func (s *Set) clearDestExp(ctx context.Context, dest []byte, exists bool, expMs int64) error {
+func (h *Hash) clearDestExp(ctx context.Context, dest []byte, exists bool, expMs int64) error {
 	if !exists || expMs == 0 {
 		return nil
 	}
-	_, err := s.h.t.ExpireAt(ctx, dest, 0)
+	_, err := h.t.ExpireAt(ctx, dest, 0)
 	return err
 }
 
@@ -441,7 +452,7 @@ func (s *Set) SInterStore(ctx context.Context, dest []byte, keys [][]byte) (int6
 		return 0, err
 	}
 	if absent {
-		return s.storeEmpty(ctx, dest)
+		return s.h.storeEmpty(ctx, dest)
 	}
 	d := 0
 	for i := 1; i < len(srcs); i++ {
