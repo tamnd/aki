@@ -120,17 +120,17 @@ func TestWriteLogEndToEnd(t *testing.T) {
 
 	// Three frames on group 0, one on group 1: the seq streams are
 	// per group, allocated by the emissions themselves.
-	if err := wl.StrSet([]byte("alpha"), []byte("v1"), 0, false); err != nil {
-		t.Fatal(err)
+	if g, seq, err := wl.StrSet([]byte("alpha"), []byte("v1"), 0, false); err != nil || g != 0 || seq != 1 {
+		t.Fatalf("StrSet v1 mark = (%d, %d, %v), want group 0 seq 1", g, seq, err)
 	}
-	if err := wl.StrSet([]byte("alpha"), []byte("7"), 12345, true); err != nil {
-		t.Fatal(err)
+	if g, seq, err := wl.StrSet([]byte("alpha"), []byte("7"), 12345, true); err != nil || g != 0 || seq != 2 {
+		t.Fatalf("StrSet 7 mark = (%d, %d, %v), want group 0 seq 2", g, seq, err)
 	}
-	if err := wl.KeyDel([]byte("alpha")); err != nil {
-		t.Fatal(err)
+	if g, seq, err := wl.KeyDel([]byte("alpha")); err != nil || g != 0 || seq != 3 {
+		t.Fatalf("KeyDel mark = (%d, %d, %v), want group 0 seq 3", g, seq, err)
 	}
-	if err := wl.StrSet([]byte("bravo"), []byte("v2"), 0, false); err != nil {
-		t.Fatal(err)
+	if g, seq, err := wl.StrSet([]byte("bravo"), []byte("v2"), 0, false); err != nil || g != 1 || seq != 1 {
+		t.Fatalf("StrSet v2 mark = (%d, %d, %v), want group 1 seq 1", g, seq, err)
 	}
 	wl.Barrier()
 
@@ -257,10 +257,10 @@ func TestWriteLogEpochMissing(t *testing.T) {
 
 	// No SetGroup: dispatch should never route here, so the emission
 	// fails the command without touching the flusher.
-	if err := wl.StrSet([]byte("alpha"), []byte("v"), 0, false); err == nil || err.Error() != "ERR internal: wal epoch" {
+	if _, _, err := wl.StrSet([]byte("alpha"), []byte("v"), 0, false); err == nil || err.Error() != "ERR internal: wal epoch" {
 		t.Fatalf("StrSet before SetGroup gave %v", err)
 	}
-	if err := wl.KeyDel([]byte("alpha")); err == nil || err.Error() != "ERR internal: wal epoch" {
+	if _, _, err := wl.KeyDel([]byte("alpha")); err == nil || err.Error() != "ERR internal: wal epoch" {
 		t.Fatalf("KeyDel before SetGroup gave %v", err)
 	}
 	rows := durabilityRows(t, wl)
@@ -285,11 +285,11 @@ func TestWriteLogStallBurnsNoSeq(t *testing.T) {
 	// A frame past the cap fails with the stall text (parking arrives
 	// with slice 7) and must not consume the group's next seq.
 	big := strings.Repeat("x", 256)
-	if err := wl.StrSet([]byte("alpha"), []byte(big), 0, false); err == nil || err.Error() != "ERR store: flush stalled" {
+	if _, _, err := wl.StrSet([]byte("alpha"), []byte(big), 0, false); err == nil || err.Error() != "ERR store: flush stalled" {
 		t.Fatalf("over-cap StrSet gave %v", err)
 	}
-	if err := wl.StrSet([]byte("alpha"), []byte("v"), 0, false); err != nil {
-		t.Fatal(err)
+	if g, seq, err := wl.StrSet([]byte("alpha"), []byte("v"), 0, false); err != nil || g != 0 || seq != 1 {
+		t.Fatalf("post-stall StrSet mark = (%d, %d, %v), want group 0 seq 1: the stalled append burned no seq", g, seq, err)
 	}
 	wl.Barrier()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -320,7 +320,7 @@ func TestWriteLogClosedIsFatal(t *testing.T) {
 	if err := wl.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := wl.StrSet([]byte("alpha"), []byte("v"), 0, false); err == nil || err.Error() != "ERR store: flush stalled" {
+	if _, _, err := wl.StrSet([]byte("alpha"), []byte("v"), 0, false); err == nil || err.Error() != "ERR store: flush stalled" {
 		t.Fatalf("StrSet after Close gave %v", err)
 	}
 	if rows := durabilityRows(t, wl); rows["wal_fatal_errors"] != 1 {

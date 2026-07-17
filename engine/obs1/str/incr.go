@@ -113,11 +113,9 @@ func IncrByFloat(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	// A float result is not int-shaped, so the frame skips the counter
 	// ladder bit; the deadline rode through the keepTTL write above.
-	if cx.Log != nil {
-		if err := cx.Log.StrSet(key, out, cx.St.ExpireAt(key, cx.NowMs), false); err != nil {
-			r.Err(err.Error())
-			return
-		}
+	if err := cx.LogStrSet(key, out, cx.St.ExpireAt(key, cx.NowMs), false); err != nil {
+		r.Err(err.Error())
+		return
 	}
 	r.Bulk(out)
 }

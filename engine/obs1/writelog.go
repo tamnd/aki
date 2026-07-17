@@ -156,13 +156,14 @@ func (l *WriteLog) SetGroup(group uint16, epoch uint32, next uint64) {
 }
 
 // StrSet implements the shard seam: the resulting value of a string
-// write as one strset frame on the owner's group buffer. Nil return is
-// the relaxed ack point.
-func (l *WriteLog) StrSet(key, value []byte, expireAtMs int64, counter bool) error {
+// write as one strset frame on the owner's group buffer. A nil error is
+// the relaxed ack point, and the returned mark names the frame for a
+// strict ack to park on.
+func (l *WriteLog) StrSet(key, value []byte, expireAtMs int64, counter bool) (uint16, uint64, error) {
 	slot, group := l.mapKey(key)
 	g := &l.groups[group]
 	if g.epoch == 0 {
-		return l.epochMissing(group)
+		return 0, 0, l.epochMissing(group)
 	}
 	var ladder uint8
 	if counter {
@@ -170,19 +171,20 @@ func (l *WriteLog) StrSet(key, value []byte, expireAtMs int64, counter bool) err
 	}
 	err := l.fl.AppendStrSet(group, g.epoch, slot, g.next, key, value, uint64(expireAtMs), ladder)
 	if err != nil {
-		return l.classify(err)
+		return 0, 0, l.classify(err)
 	}
+	seq := g.next
 	g.next++
-	return nil
+	return group, seq, nil
 }
 
 // KeyDel implements the shard seam: one keydel frame for a removal of
 // any type.
-func (l *WriteLog) KeyDel(key []byte) error {
+func (l *WriteLog) KeyDel(key []byte) (uint16, uint64, error) {
 	slot, group := l.mapKey(key)
 	g := &l.groups[group]
 	if g.epoch == 0 {
-		return l.epochMissing(group)
+		return 0, 0, l.epochMissing(group)
 	}
 	err := l.fl.AppendOp(group, g.epoch, WALFrame{
 		Kind: OpKeyDel,
@@ -191,10 +193,23 @@ func (l *WriteLog) KeyDel(key []byte) error {
 		Key:  key,
 	})
 	if err != nil {
-		return l.classify(err)
+		return 0, 0, l.classify(err)
 	}
+	seq := g.next
 	g.next++
-	return nil
+	return group, seq, nil
+}
+
+// NotifyCommitted implements the shard seam: fn runs once the group's
+// committed watermark covers seq (Watermarks.Notify, inline when it
+// already does). Registering also raises barrier demand, the doc 04
+// section 3.2 rule that a pending strict ack lowers the effective flush
+// age to the barrier floor; the barrier is floor-gated and a no-op when
+// nothing is buffered, so a mark whose covering flush already left costs
+// nothing extra.
+func (l *WriteLog) NotifyCommitted(group uint16, seq uint64, fn func()) {
+	l.marks.Notify(group, seq, fn)
+	l.fl.Barrier()
 }
 
 // epochMissing is the write-before-grant bug row: dispatch only routes

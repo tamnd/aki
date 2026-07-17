@@ -299,3 +299,106 @@ func TestDurabilityRelaxedAck(t *testing.T) {
 		t.Fatalf("Wait after release: %v", err)
 	}
 }
+
+// TestDurabilityStrictAckCoversCommit proves the strict contract's
+// positive half with no gating: once the reply is on the wire, the
+// group's committed watermark covers the write's frame. The harness runs
+// with a one-hour flush age, so the reply arriving at all also proves the
+// pending strict ack demanded the barrier flush; without that demand the
+// SET would sit in the buffer for the hour and the test would time out.
+func TestDurabilityStrictAckCoversCommit(t *testing.T) {
+	wl, _, nc, r, _ := startLoggedServer(t, false)
+
+	send(t, nc, "AKI.DURABILITY", "strict")
+	expect(t, r, "+OK\r\n")
+	send(t, nc, "SET", "k", "v")
+	expect(t, r, "+OK\r\n")
+	_, g := clusterMapKey([]byte("k"))
+	if got := wl.Marks().Committed(g); got < 1 {
+		t.Fatalf("Committed = %d at strict ack time, the ack must cover the commit", got)
+	}
+	// The keydel frame rides the same contract.
+	send(t, nc, "DEL", "k")
+	expect(t, r, ":1\r\n")
+	if got := wl.Marks().Committed(g); got < 2 {
+		t.Fatalf("Committed = %d after the strict DEL ack", got)
+	}
+	// A write that emits nothing has nothing to wait for, strict or not.
+	send(t, nc, "DEL", "nosuch")
+	expect(t, r, ":0\r\n")
+}
+
+// TestDurabilityStrictHoldsPipeline gates the chain and proves the
+// negative half over the socket: the strict write executes (a second
+// connection reads its value) but its reply and everything pipelined
+// behind it stay unanswered until the commit lands, then arrive in order.
+func TestDurabilityStrictHoldsPipeline(t *testing.T) {
+	wl, _, nc, r, release := startLoggedServer(t, true)
+
+	send(t, nc, "AKI.DURABILITY")
+	expectBulk(t, r, []byte("relaxed"))
+	send(t, nc, "AKI.DURABILITY", "strict")
+	expect(t, r, "+OK\r\n")
+	send(t, nc, "AKI.DURABILITY")
+	expectBulk(t, r, []byte("strict"))
+
+	send(t, nc, "SET", "k", "v")
+	send(t, nc, "GET", "k")
+
+	// A second, relaxed connection watches from outside the held pipeline:
+	// the strict ack's barrier demand flushes the frame (the age trigger is
+	// an hour away), and the write is in RAM already, only its output waits.
+	nc2, err := net.Dial("tcp", nc.RemoteAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc2.Close()
+	r2 := br(nc2)
+	deadline := time.Now().Add(10 * time.Second)
+	for readInfo(t, nc2, r2)["wal_barrier_flushes"] == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no barrier flush while a strict ack was pending")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	send(t, nc2, "GET", "k")
+	expectBulk(t, r2, []byte("v"))
+	if _, g := clusterMapKey([]byte("k")); wl.Marks().Committed(g) != 0 {
+		t.Fatal("the gated chain committed")
+	}
+	if err := nc.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Peek(1); err == nil {
+		t.Fatal("a strict reply arrived with the chain gated")
+	}
+	if err := nc.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+
+	release()
+	expect(t, r, "+OK\r\n")
+	expectBulk(t, r, []byte("v"))
+}
+
+// TestDurabilityVolatileNode proves the toggle's guard rails on a server
+// with no pipeline: strict is refused (a strict write would hang, not be
+// stricter), relaxed is accepted, and the argument grammar answers in
+// band.
+func TestDurabilityVolatileNode(t *testing.T) {
+	_, nc, r := startServer(t)
+
+	send(t, nc, "AKI.DURABILITY")
+	expectBulk(t, r, []byte("relaxed"))
+	send(t, nc, "AKI.DURABILITY", "STRICT")
+	expect(t, r, "-ERR DURABILITY STRICT is not available on a volatile node\r\n")
+	send(t, nc, "AKI.DURABILITY", "RELAXED")
+	expect(t, r, "+OK\r\n")
+	send(t, nc, "AKI.DURABILITY", "bogus")
+	expect(t, r, "-ERR DURABILITY mode must be STRICT or RELAXED\r\n")
+	send(t, nc, "AKI.DURABILITY", "strict", "extra")
+	expect(t, r, "-ERR wrong number of arguments for 'aki.durability' command\r\n")
+	// The refused connection keeps serving, relaxed.
+	send(t, nc, "SET", "k", "v")
+	expect(t, r, "+OK\r\n")
+}
