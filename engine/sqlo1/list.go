@@ -26,8 +26,10 @@ const (
 
 	// The inline rung's thresholds, doc 07 section 1: a list stays
 	// inline while the whole encoded root payload fits listInlineMax
-	// and the element count fits listInlineMaxCount, the same figures
-	// Redis uses for its listpack-to-quicklist conversion.
+	// and the element count fits listInlineMaxCount, the caps the
+	// other inline collections use. Redis's boundary differs in kind:
+	// its default list-max-listpack-size -2 is a pure 8 KiB byte cap
+	// with no entry-count wall (see testdata/compat/README.md).
 	listInlineMax      = 2048
 	listInlineMaxCount = 128
 )
