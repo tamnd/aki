@@ -66,6 +66,37 @@ type WriteLog interface {
 	// gate, so fields lists only the fields whose deadline changed.
 	HashExpire(key []byte, atMs int64, fields [][]byte) (group uint16, seq uint64, err error)
 
+	// SetAdd records applied set-member writes as one colldelta sadd,
+	// preceded by a collnew when the write created the set.
+	// Post-decision: members lists only what actually joined, so a
+	// duplicate-only SADD frames nothing (the caller gates).
+	SetAdd(key []byte, created bool, members [][]byte) (group uint16, seq uint64, err error)
+
+	// SetRem records removed set members as one colldelta srem, followed
+	// by a colldrop when the removal emptied the set. SPOP lands here as
+	// the srem it is, its drawn members recorded post-decision.
+	SetRem(key []byte, members [][]byte, dropped bool) (group uint16, seq uint64, err error)
+
+	// SetStore records a STORE form's wholesale replacement of its
+	// destination as one atomic run: a keydel when the string store held
+	// the key, then for a non-empty result a collnew (replaying as
+	// reset-to-empty over a set the destination already held) and the
+	// result members as one sadd, or for an empty result a colldrop when
+	// a set was there to drop. The caller gates the no-effect case, an
+	// empty result over an absent destination.
+	SetStore(key []byte, delString, hadSet bool, members [][]byte) (group uint16, seq uint64, err error)
+
+	// SetMove records SMOVE's two-key effect: a collnew plus sadd side
+	// on dst, an srem plus colldrop side on src. Both sides ride one
+	// atomic run when the keys share a group, in which case srcSeq is 0
+	// and the dst mark covers the run; otherwise the destination run
+	// buffers first, then the source run, so a tail cut between them
+	// duplicates the member rather than losing it, the disclosed
+	// cross-group non-atomicity. A zero seq means that side buffered
+	// nothing; a non-zero dstSeq rides even an errored call so the
+	// caller marks what did land.
+	SetMove(src, dst, member []byte, srcDropped, dstCreated bool) (dstGroup uint16, dstSeq uint64, srcGroup uint16, srcSeq uint64, err error)
+
 	// NotifyCommitted runs fn once a chain commit covering the marked
 	// frame has landed and folded live (doc 04 section 3.2): it registers
 	// on the committed watermark and raises barrier demand, so a pending
@@ -156,6 +187,68 @@ func (cx *Ctx) LogHashExpire(key []byte, atMs int64, fields [][]byte) error {
 	}
 	cx.noteMark(group, seq)
 	return nil
+}
+
+// LogSetAdd emits a set write's effect frames when a log is wired, and
+// is free when none is. See WriteLog.SetAdd for the contract.
+func (cx *Ctx) LogSetAdd(key []byte, created bool, members [][]byte) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.SetAdd(key, created, members)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogSetRem emits a set removal's effect frames when a log is wired, and
+// is free when none is. See WriteLog.SetRem for the contract.
+func (cx *Ctx) LogSetRem(key []byte, members [][]byte, dropped bool) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.SetRem(key, members, dropped)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogSetStore emits a STORE form's destination replacement when a log is
+// wired, and is free when none is. See WriteLog.SetStore for the
+// contract.
+func (cx *Ctx) LogSetStore(key []byte, delString, hadSet bool, members [][]byte) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.SetStore(key, delString, hadSet, members)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogSetMove emits SMOVE's two-key effect when a log is wired, and is
+// free when none is. Marks land per side that buffered, even on an
+// error, keeping the uniform rule that no reply on a strict connection
+// races the frames emitted behind it. See WriteLog.SetMove for the
+// contract.
+func (cx *Ctx) LogSetMove(src, dst, member []byte, srcDropped, dstCreated bool) error {
+	if cx.Log == nil {
+		return nil
+	}
+	dg, ds, sg, ss, err := cx.Log.SetMove(src, dst, member, srcDropped, dstCreated)
+	if ds != 0 {
+		cx.noteMark(dg, ds)
+	}
+	if ss != 0 {
+		cx.noteMark(sg, ss)
+	}
+	return err
 }
 
 // LogStrReadBack frames a write whose resulting string lives only in the
