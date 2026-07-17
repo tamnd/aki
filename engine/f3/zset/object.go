@@ -16,7 +16,7 @@ func Encoding(cx *shard.Ctx, key []byte) (string, bool) {
 	if cx.ZColl == nil {
 		return "", false
 	}
-	if z := cx.ZColl.(*reg).m[string(key)]; z != nil {
+	if z := cx.ZColl.(*reg).live(cx, key); z != nil {
 		return z.enc.String(), true
 	}
 	return "", false

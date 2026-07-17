@@ -38,7 +38,10 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 
 	g := registry(cx)
-	z := g.m[string(key)]
+	// The create funnel: a lazily-expired zset is dropped and treated as absent, so
+	// a fresh ZADD builds a new zset that carries no stale TTL, never resurrects the
+	// expired one (the create-path hazard the rollout plan calls out).
+	z := g.live(cx, key)
 	created := false
 	if z == nil {
 		if cx.St.Exists(key, cx.NowMs) {
@@ -157,7 +160,9 @@ func Zincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	key := args[0]
 	member := args[2]
 	g := registry(cx)
-	z := g.m[string(key)]
+	// See Zadd: the create funnel drops an expired zset so ZINCRBY builds a fresh
+	// one with no stale TTL.
+	z := g.live(cx, key)
 	created := false
 	if z == nil {
 		if cx.St.Exists(key, cx.NowMs) {

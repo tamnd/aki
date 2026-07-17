@@ -111,7 +111,7 @@ func Delete(cx *shard.Ctx, key []byte) bool {
 		return false
 	}
 	g := cx.ZColl.(*reg)
-	if g.m[string(key)] == nil {
+	if g.live(cx, key) == nil {
 		return false
 	}
 	g.drop(key)
@@ -150,7 +150,14 @@ func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
 	if cx.ZColl == nil {
 		return true
 	}
-	for k := range cx.ZColl.(*reg).m {
+	now := cx.NowMs
+	for k, z := range cx.ZColl.(*reg).m {
+		// Skip a lazily-expired zset so KEYS and SCAN never surface a key EXISTS
+		// would report absent. The skip is read-only (no drop) to match the string
+		// store's expiry-aware walk, which reaps nothing during a scan.
+		if z.expireAt != 0 && z.expireAt <= now {
+			continue
+		}
 		if !fn([]byte(k)) {
 			return false
 		}
@@ -158,11 +165,30 @@ func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
 	return true
 }
 
-// lookup finds the zset for key. present is false when no zset exists; wrong is
-// true when the key instead holds a value in the string store, which every zset
-// command answers with WRONGTYPE.
+// live returns the zset at key, or nil when none exists or the zset has lazily
+// expired. A zset whose deadline has passed is dropped here and treated as absent,
+// so an expired zset is dead to this command and every later one in the epoch
+// (spec 2064/f3/16 section 2). This is the one funnel every read, mutate, create,
+// and probe path routes through, so the expiry check lives in exactly one place.
+// The deadline compare is a single field load against cx.NowMs, predicted away
+// for the common zset that carries no TTL.
+func (g *reg) live(cx *shard.Ctx, key []byte) *zset {
+	z := g.m[string(key)]
+	if z == nil {
+		return nil
+	}
+	if z.expireAt != 0 && z.expireAt <= cx.NowMs {
+		g.drop(key)
+		return nil
+	}
+	return z
+}
+
+// lookup finds the zset for key. present is false when no zset exists or it has
+// lazily expired; wrong is true when the key instead holds a value in the string
+// store, which every zset command answers with WRONGTYPE.
 func (g *reg) lookup(cx *shard.Ctx, key []byte) (z *zset, wrong bool) {
-	if z = g.m[string(key)]; z != nil {
+	if z = g.live(cx, key); z != nil {
 		return z, false
 	}
 	if cx.St.Exists(key, cx.NowMs) {
