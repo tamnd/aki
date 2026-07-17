@@ -120,3 +120,20 @@ func Pexpiretime(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	r.Int(at)
 }
+
+// Persist answers PERSIST key: remove the key's deadline, replying 1 when one
+// was removed and 0 for a missing key, a key with no deadline, or a set. A set
+// carries no key-level TTL, so there is never one to remove and the answer is a
+// correct 0, not the owed gap the write side of EXPIRE would hit. Its reach is
+// set plus string like TTL and TYPE.
+func Persist(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	if registry(cx).m[string(args[0])] != nil {
+		r.Int(0)
+		return
+	}
+	if cx.St.Persist(args[0], cx.NowMs) {
+		r.Int(1)
+		return
+	}
+	r.Int(0)
+}

@@ -315,6 +315,23 @@ func (s *Store) SetExpire(key, val []byte, at, now int64) (bool, error) {
 	return true, nil
 }
 
+// Persist removes key's deadline and reports whether there was one to remove.
+// A missing key, a key with no deadline, and a cold record (which carries no
+// slot) all report false. A record keeps its slot for life, so removal writes
+// zero into it; a non-zero deadline implies the slot is present, so the write
+// is safe without re-checking the flag.
+func (s *Store) Persist(key []byte, now int64) bool {
+	slot, addr, _ := s.findLive(Hash(key), key, now)
+	if addr == 0 || slotCold(*slot) {
+		return false
+	}
+	if s.expireAt(addr) == 0 {
+		return false
+	}
+	s.setExpireAt(addr, 0)
+	return true
+}
+
 // StrLen reports the value's byte length (an int cell's digit count) and
 // presence.
 func (s *Store) StrLen(key []byte, now int64) (int64, bool) {
