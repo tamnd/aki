@@ -200,6 +200,88 @@ func (l *WriteLog) KeyDel(key []byte) (uint16, uint64, error) {
 	return group, seq, nil
 }
 
+// emitOps encodes ops as key's next frames and appends them: one AppendOp
+// for a single frame, one AppendRun otherwise, so a multi-effect command's
+// frames never split across WAL objects. Within one object replay applies
+// frames in seq order and a tail cut removes the object whole, so a
+// single-command run needs no txn markers; doc 04 section 2 mandates them
+// for MULTI/EXEC bodies only. The returned mark is the last frame's, which
+// covers the run under the per-group monotone watermark. The group's seq
+// counter advances only after the append succeeds, so a refused emission
+// leaves no gap.
+func (l *WriteLog) emitOps(key []byte, ops ...Op) (uint16, uint64, error) {
+	slot, group := l.mapKey(key)
+	g := &l.groups[group]
+	if g.epoch == 0 {
+		return 0, 0, l.epochMissing(group)
+	}
+	if len(ops) == 1 {
+		f, err := EncodeOp(slot, g.next, key, ops[0])
+		if err != nil {
+			return 0, 0, l.classify(err)
+		}
+		if err := l.fl.AppendOp(group, g.epoch, f); err != nil {
+			return 0, 0, l.classify(err)
+		}
+		seq := g.next
+		g.next++
+		return group, seq, nil
+	}
+	frames := make([]WALFrame, len(ops))
+	for i, op := range ops {
+		f, err := EncodeOp(slot, g.next+uint64(i), key, op)
+		if err != nil {
+			return 0, 0, l.classify(err)
+		}
+		frames[i] = f
+	}
+	if err := l.fl.AppendRun(group, g.epoch, frames); err != nil {
+		return 0, 0, l.classify(err)
+	}
+	seq := g.next + uint64(len(ops)-1)
+	g.next += uint64(len(ops))
+	return group, seq, nil
+}
+
+// HashSet implements the shard seam: the written pairs as one colldelta
+// hset, with a collnew ahead of it when the write created the hash and an
+// hexpire behind it when a TTL-preserving verb kept a deadline the hset
+// replay rule would clear. The collnew carries no hint bytes yet; doc 08
+// owns that vocabulary and the encoding-hint slice fills them in.
+func (l *WriteLog) HashSet(key []byte, created bool, fieldsValues [][]byte, keepAtMs int64) (uint16, uint64, error) {
+	if len(fieldsValues) == 0 || len(fieldsValues)%2 != 0 {
+		return 0, 0, l.classify(fmt.Errorf("obs1: a hash set emission needs field-value pairs, got %d items", len(fieldsValues)))
+	}
+	pairs := make([]FieldValue, len(fieldsValues)/2)
+	for i := range pairs {
+		pairs[i] = FieldValue{Field: fieldsValues[2*i], Value: fieldsValues[2*i+1]}
+	}
+	ops := make([]Op, 0, 3)
+	if created {
+		ops = append(ops, CollNew{Type: CollHash})
+	}
+	ops = append(ops, CollDelta{Sub: HSet{Pairs: pairs}})
+	if keepAtMs != 0 {
+		ops = append(ops, CollDelta{Sub: HExpire{AtMs: uint64(keepAtMs), Fields: fieldsValues[:1]}})
+	}
+	return l.emitOps(key, ops...)
+}
+
+// HashDel implements the shard seam: the removed fields as one colldelta
+// hdel, with a colldrop behind it when the removal emptied the hash.
+func (l *WriteLog) HashDel(key []byte, fields [][]byte, dropped bool) (uint16, uint64, error) {
+	if dropped {
+		return l.emitOps(key, CollDelta{Sub: HDel{Fields: fields}}, CollDrop{})
+	}
+	return l.emitOps(key, CollDelta{Sub: HDel{Fields: fields}})
+}
+
+// HashExpire implements the shard seam: one colldelta hexpire carrying the
+// absolute deadline the named fields now ride, 0 clearing it.
+func (l *WriteLog) HashExpire(key []byte, atMs int64, fields [][]byte) (uint16, uint64, error) {
+	return l.emitOps(key, CollDelta{Sub: HExpire{AtMs: uint64(atMs), Fields: fields}})
+}
+
 // NotifyCommitted implements the shard seam: fn runs once the group's
 // committed watermark covers seq (Watermarks.Notify, inline when it
 // already does). Registering also raises barrier demand, the doc 04

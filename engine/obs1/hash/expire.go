@@ -91,12 +91,21 @@ func expireGeneric(cx *shard.Ctx, args [][]byte, r shard.Reply, cmd string, unit
 	}
 
 	now := uint64(cx.NowMs)
+	// Compact the fields whose deadline actually changed over the parsed field
+	// slice in place (forward-safe): the frame carries post-decision effects,
+	// so refused conditions and absent fields stay out of it.
+	changed := fields[:0]
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(fields))
 	for _, f := range fields {
-		out = resp.AppendInt(out, applyExpiry(h, f, at, cond, now))
+		st := applyExpiry(h, f, at, cond, now)
+		out = resp.AppendInt(out, st)
+		if st == 1 || st == 2 {
+			changed = append(changed, f)
+		}
 	}
 	cx.Aux = out
-	if h.card() == 0 {
+	dropped := h.card() == 0
+	if dropped {
 		// The last field expired on the spot (a set-to-the-past); Redis drops the
 		// hash the moment it empties.
 		g.drop(args[0])
@@ -105,6 +114,21 @@ func expireGeneric(cx *shard.Ctx, args [][]byte, r shard.Reply, cmd string, unit
 		// hash to its wider listpackex blob; either way the footprint may have moved,
 		// so reconcile the surviving hash.
 		g.note(h)
+	}
+	if len(changed) > 0 {
+		// The deadline is uniform per command, so every changed field took the
+		// same applyExpiry branch: at or before now deleted them all (frames as
+		// an hdel, the set-to-the-past rule), past now set them all.
+		var err error
+		if at <= int64(now) {
+			err = cx.LogHashDel(args[0], changed, dropped)
+		} else {
+			err = cx.LogHashExpire(args[0], at, changed)
+		}
+		if err != nil {
+			r.Err(err.Error())
+			return
+		}
 	}
 	r.Raw(out)
 }
@@ -244,11 +268,25 @@ func Hpersist(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Raw(appendCodes(cx.Aux[:0], fields, -2))
 		return
 	}
+	// Same in-place compaction as expireGeneric: only fields that held a
+	// deadline frame, and a repeated field clears on first touch so it lists
+	// once.
+	changed := fields[:0]
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(fields))
 	for _, f := range fields {
-		out = resp.AppendInt(out, persistField(h, f))
+		st := persistField(h, f)
+		out = resp.AppendInt(out, st)
+		if st == 1 {
+			changed = append(changed, f)
+		}
 	}
 	cx.Aux = out
+	if len(changed) > 0 {
+		if err := cx.LogHashExpire(args[0], 0, changed); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
 	r.Raw(out)
 }
 

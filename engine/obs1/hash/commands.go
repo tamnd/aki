@@ -23,7 +23,7 @@ func Hset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err("ERR wrong number of arguments for 'hset' command")
 		return
 	}
-	g, h, wrong := getOrCreate(cx, args[0])
+	g, h, created, wrong := getOrCreate(cx, args[0])
 	if wrong {
 		r.Err(wrongType)
 		return
@@ -40,6 +40,12 @@ func Hset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 	}
 	g.note(h)
+	// The pair tail is the effect verbatim: HSET writes every pair, and replaying
+	// the hset frame clears overwritten deadlines exactly as the loop above did.
+	if err := cx.LogHashSet(args[0], created, args[1:], 0); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	r.Int(added)
 }
 
@@ -50,7 +56,7 @@ func Hmset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err("ERR wrong number of arguments for 'hmset' command")
 		return
 	}
-	g, h, wrong := getOrCreate(cx, args[0])
+	g, h, created, wrong := getOrCreate(cx, args[0])
 	if wrong {
 		r.Err(wrongType)
 		return
@@ -62,6 +68,10 @@ func Hmset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 	}
 	g.note(h)
+	if err := cx.LogHashSet(args[0], created, args[1:], 0); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	r.Status("OK")
 }
 
@@ -71,13 +81,18 @@ func Hsetnx(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// A refused HSETNX means the field already exists, which can only happen on a
 	// hash that already held fields, so getOrCreate never leaves a stray empty
 	// hash behind here: a freshly created hash is empty and always accepts the set.
-	g, h, wrong := getOrCreate(cx, args[0])
+	g, h, created, wrong := getOrCreate(cx, args[0])
 	if wrong {
 		r.Err(wrongType)
 		return
 	}
 	if h.setNX(args[1], args[2]) {
 		g.note(h)
+		// Post-decision: a refused HSETNX changed nothing and frames nothing.
+		if err := cx.LogHashSet(args[0], created, args[1:3], 0); err != nil {
+			r.Err(err.Error())
+			return
+		}
 		r.Int(1)
 		return
 	}
@@ -191,26 +206,41 @@ func Hdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Int(0)
 		return
 	}
-	var removed int64
-	for _, f := range args[1:] {
+	// Compact the fields that actually left over the argument tail in place
+	// (forward-safe, each kept element sits at or before where it came from):
+	// the hdel frame carries post-decision effects, only what was removed.
+	flds := args[1:]
+	removed := 0
+	for _, f := range flds {
 		if h.del(f) {
+			flds[removed] = f
 			removed++
 		}
 	}
-	if h.card() == 0 {
+	dropped := h.card() == 0
+	if dropped {
 		g.drop(args[0])
 	} else {
 		g.note(h)
 	}
-	r.Int(removed)
+	if removed > 0 {
+		if err := cx.LogHashDel(args[0], flds[:removed], dropped); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
+	r.Int(int64(removed))
 }
 
 // getOrCreate returns the hash for key, creating an empty one when the key is
-// absent, and the registry the caller reconciles the footprint into. wrong is true
-// when the string store owns the key, which the caller answers with WRONGTYPE.
-// Callers only reach it on a write that adds at least one field, so a created hash
-// never stays empty; the caller notes it into the resident total before returning.
-func getOrCreate(cx *shard.Ctx, key []byte) (g *reg, h *hash, wrong bool) {
+// absent, and the registry the caller reconciles the footprint into. created is
+// true when the hash is fresh, the fact the caller's emission turns into a collnew
+// frame; a hash reaped empty here counts as created too, since the drop-recreate
+// below is a real keyspace transition the log must carry. wrong is true when the
+// string store owns the key, which the caller answers with WRONGTYPE. Callers only
+// reach it on a write that adds at least one field, so a created hash never stays
+// empty; the caller notes it into the resident total before returning.
+func getOrCreate(cx *shard.Ctx, key []byte) (g *reg, h *hash, created, wrong bool) {
 	g = registry(cx)
 	if h = g.m[string(key)]; h != nil {
 		// Reap fired fields first, the same lazy expiry lookup runs (reg.go). A hash
@@ -218,14 +248,14 @@ func getOrCreate(cx *shard.Ctx, key []byte) (g *reg, h *hash, wrong bool) {
 		// whose fields all expired starts a new listpack, not a lingering listpackex.
 		h.reap(uint64(cx.NowMs))
 		if h.card() > 0 {
-			return g, h, false
+			return g, h, false, false
 		}
 		g.drop(key)
 	}
 	if cx.St.Exists(key, cx.NowMs) {
-		return g, nil, true
+		return g, nil, false, true
 	}
 	h = newHash()
 	g.m[string(key)] = h
-	return g, h, false
+	return g, h, true, false
 }

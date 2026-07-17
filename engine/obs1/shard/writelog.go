@@ -41,6 +41,31 @@ type WriteLog interface {
 	// KeyDel records a key removal of any type.
 	KeyDel(key []byte) (group uint16, seq uint64, err error)
 
+	// HashSet records applied hash-field writes as one colldelta hset of
+	// the written pairs, preceded by a collnew when the write created the
+	// hash. fieldsValues alternates field then value and carries
+	// post-decision effects: HSETNX emits only a set that happened, the
+	// hash INCR verbs emit the resulting rendering. keepAtMs, non-zero,
+	// appends an hexpire restoring the first field's deadline, the
+	// TTL-preserving verbs' counter to the hset replay rule that an
+	// overwritten field's deadline clears (the HSET behavior); only a
+	// single-pair write may carry it. A multi-frame emission returns its
+	// last frame's seq, which covers the whole run under the per-group
+	// monotone watermark.
+	HashSet(key []byte, created bool, fieldsValues [][]byte, keepAtMs int64) (group uint16, seq uint64, err error)
+
+	// HashDel records removed hash fields as one colldelta hdel, followed
+	// by a colldrop when the removal emptied the hash. Post-decision:
+	// fields lists only what actually left, and the HEXPIRE family's
+	// set-to-the-past deletions land here too.
+	HashDel(key []byte, fields [][]byte, dropped bool) (group uint16, seq uint64, err error)
+
+	// HashExpire records a field-deadline change as one colldelta hexpire:
+	// atMs is the absolute deadline the named fields now ride, 0 clears
+	// (HPERSIST). Post-decision: the owner already applied the NX/XX/GT/LT
+	// gate, so fields lists only the fields whose deadline changed.
+	HashExpire(key []byte, atMs int64, fields [][]byte) (group uint16, seq uint64, err error)
+
 	// NotifyCommitted runs fn once a chain commit covering the marked
 	// frame has landed and folded live (doc 04 section 3.2): it registers
 	// on the committed watermark and raises barrier demand, so a pending
@@ -83,6 +108,49 @@ func (cx *Ctx) LogKeyDel(key []byte) error {
 		return nil
 	}
 	group, seq, err := cx.Log.KeyDel(key)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogHashSet emits a hash write's effect frames when a log is wired, and
+// is free when none is. See WriteLog.HashSet for the contract.
+func (cx *Ctx) LogHashSet(key []byte, created bool, fieldsValues [][]byte, keepAtMs int64) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.HashSet(key, created, fieldsValues, keepAtMs)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogHashDel emits a hash removal's effect frames when a log is wired,
+// and is free when none is. See WriteLog.HashDel for the contract.
+func (cx *Ctx) LogHashDel(key []byte, fields [][]byte, dropped bool) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.HashDel(key, fields, dropped)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogHashExpire emits a field-deadline change's effect frame when a log
+// is wired, and is free when none is. See WriteLog.HashExpire for the
+// contract.
+func (cx *Ctx) LogHashExpire(key []byte, atMs int64, fields [][]byte) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.HashExpire(key, atMs, fields)
 	if err != nil {
 		return err
 	}
