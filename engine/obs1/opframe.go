@@ -62,7 +62,9 @@ const (
 )
 
 // Colldelta sub-kinds (doc 04 section 2's named set; hexpire filled the
-// hash-field-expiry gap the table left open, #1023's next-slice item).
+// hash-field-expiry gap the table left open, #1023's next-slice item;
+// lrem and lins fill the interior-surgery gap the same way, since LREM
+// and LINSERT resolve positions no push or pop sub-op can express).
 const (
 	SubHSet    = 0x01
 	SubHDel    = 0x02
@@ -77,6 +79,8 @@ const (
 	SubLSet    = 0x0B
 	SubXAdd    = 0x0C
 	SubHExpire = 0x0D
+	SubLRem    = 0x0E
+	SubLIns    = 0x0F
 )
 
 // Op is one doc 04 op: exactly one of the eight kinds.
@@ -204,7 +208,7 @@ func (Noop) opFlags() uint8 { return 0 }
 
 func (o Noop) appendPayload(b []byte) ([]byte, error) { return append(b, o.Pad...), nil }
 
-// CollSub is one colldelta sub-op: exactly one of the thirteen doc 04
+// CollSub is one colldelta sub-op: exactly one of the fifteen doc 04
 // sub-kinds.
 type CollSub interface {
 	subKind() uint8
@@ -291,6 +295,24 @@ type XAdd struct {
 	Pairs []FieldValue
 }
 
+// LRem removes the elements at Indices, positions in the pre-removal
+// list, strictly ascending; LREM's post-decision form. The owner's scan
+// already resolved which occurrences leave, so replay is positional
+// surgery with no value comparison, the shape the doc 08 overlay's
+// interior tombstones apply directly (a value-match replay would have to
+// scan cold chunks for the element bytes).
+type LRem struct {
+	Indices []uint32
+}
+
+// LIns inserts Value so it lands at Index in the resulting list;
+// LINSERT's post-decision form, the pivot search already resolved to a
+// non-negative position, so replay never re-compares the pivot.
+type LIns struct {
+	Index int64
+	Value []byte
+}
+
 // HExpire sets the named hash fields' expiry to the absolute deadline
 // AtMs, or clears it when AtMs is 0 (HPERSIST), the same zero the expire
 // kind uses. Post-decision like everything else: the owner already
@@ -316,6 +338,8 @@ func (RPop) subKind() uint8    { return SubRPop }
 func (LSet) subKind() uint8    { return SubLSet }
 func (XAdd) subKind() uint8    { return SubXAdd }
 func (HExpire) subKind() uint8 { return SubHExpire }
+func (LRem) subKind() uint8    { return SubLRem }
+func (LIns) subKind() uint8    { return SubLIns }
 
 func (o HSet) appendBody(b []byte) ([]byte, error)  { return appendPairList(b, o.Pairs) }
 func (o HDel) appendBody(b []byte) ([]byte, error)  { return appendByteList(b, o.Fields) }
@@ -371,6 +395,28 @@ func (o XAdd) appendBody(b []byte) ([]byte, error) {
 func (o HExpire) appendBody(b []byte) ([]byte, error) {
 	b = binary.LittleEndian.AppendUint64(b, o.AtMs)
 	return appendByteList(b, o.Fields)
+}
+
+func (o LRem) appendBody(b []byte) ([]byte, error) {
+	if len(o.Indices) == 0 {
+		return nil, fmt.Errorf("obs1: an lrem sub-op records no effects")
+	}
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(o.Indices)))
+	for i, idx := range o.Indices {
+		if i > 0 && idx <= o.Indices[i-1] {
+			return nil, fmt.Errorf("obs1: lrem indices must be strictly ascending")
+		}
+		b = binary.LittleEndian.AppendUint32(b, idx)
+	}
+	return b, nil
+}
+
+func (o LIns) appendBody(b []byte) ([]byte, error) {
+	if o.Index < 0 {
+		return nil, fmt.Errorf("obs1: an lins index is a resolved position, never negative")
+	}
+	b = binary.LittleEndian.AppendUint64(b, uint64(o.Index))
+	return append(b, o.Value...), nil
 }
 
 // appendItem writes one u32-length-prefixed item.
@@ -604,9 +650,37 @@ func parseCollDelta(p []byte) (Op, error) {
 			AtMs:   binary.LittleEndian.Uint64(body),
 			Fields: items,
 		}}, nil
+	case SubLRem:
+		n, b, err := parseCount(body, 4)
+		if err != nil {
+			return nil, err
+		}
+		if len(b) != 4*n {
+			return nil, fmt.Errorf("obs1: lrem index list is %d bytes, want %d", len(b), 4*n)
+		}
+		indices := make([]uint32, n)
+		for i := range indices {
+			indices[i] = binary.LittleEndian.Uint32(b[4*i:])
+			if i > 0 && indices[i] <= indices[i-1] {
+				return nil, fmt.Errorf("obs1: lrem indices must be strictly ascending")
+			}
+		}
+		return CollDelta{Sub: LRem{Indices: indices}}, nil
+	case SubLIns:
+		if len(body) < 8 {
+			return nil, fmt.Errorf("obs1: lins body is %d bytes, want at least 8", len(body))
+		}
+		idx := int64(binary.LittleEndian.Uint64(body))
+		if idx < 0 {
+			return nil, fmt.Errorf("obs1: an lins index is a resolved position, never negative")
+		}
+		return CollDelta{Sub: LIns{
+			Index: idx,
+			Value: append([]byte(nil), body[8:]...),
+		}}, nil
 	}
 	// Unknown sub-kinds are rejected, not skipped: replay dispatches on
-	// them, and a fourteenth arrives with an fversion bump.
+	// them, and a sixteenth arrives with an fversion bump.
 	return nil, fmt.Errorf("obs1: colldelta sub-kind 0x%02x is not a doc 04 sub-kind", sub)
 }
 
