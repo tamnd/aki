@@ -757,3 +757,41 @@ func FindBarrier(dev Device, prefix *Prefix, from, size, wbar uint64) (BarrierHe
 	}
 	return hdr, shards, at, nil
 }
+
+// ReplayToBarrier replays a point-in-time snapshot: it hands visit every data segment
+// whose global_seq is at or below the barrier at wbar, the exact record set the image
+// materializes (spec 2064/f3/07 section 5, test T7). A restore is recovery with a stop
+// line at Wbar: inclusion is a single integer comparison because the one writer assigns
+// global_seq in a total order that matches file order, so the cut is every segment up
+// to the barrier and nothing past it.
+//
+// It first locates and validates the barrier with FindBarrier, so an absent cut is
+// ErrNoBarrier and a forged or torn one ErrBarrier before a single record is replayed.
+// It then walks the stream with ReplayTail, which CRC-checks every segment and stops at
+// the durable tail, skipping the barrier segment itself (the cut line is not a data
+// record) and stopping the moment a segment's seq passes Wbar. The barrier header and
+// per-shard tails are returned so a restore can bound each shard and cross-check its
+// replay. A visit that returns an error stops the replay and propagates, so a consumer
+// that cannot apply a committed record fails the restore rather than dropping data.
+func ReplayToBarrier(dev Device, prefix *Prefix, from, size, wbar uint64, visit func(off uint64, h *SegHeader, payload []byte) error) (BarrierHeader, []BarrierShard, error) {
+	hdr, shards, _, err := FindBarrier(dev, prefix, from, size, wbar)
+	if err != nil {
+		return BarrierHeader{}, nil, err
+	}
+	_, err = ReplayTail(dev, prefix, from, size, func(off uint64, h *SegHeader, payload []byte) error {
+		if h.GlobalSeq > wbar {
+			return errStopScan // past the cut; every later segment is too
+		}
+		if h.Kind == KindBarrier {
+			return nil // the cut line is metadata, not a record the image replays
+		}
+		if visit != nil {
+			return visit(off, h, payload)
+		}
+		return nil
+	})
+	if err != nil && err != errStopScan {
+		return BarrierHeader{}, nil, err
+	}
+	return hdr, shards, nil
+}
