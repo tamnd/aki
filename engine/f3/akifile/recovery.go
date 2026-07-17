@@ -629,6 +629,56 @@ func Recover(dev Device) (*Recovery, error) {
 	return rec, nil
 }
 
+// SRTRowDrift reports an SRT row whose recorded accounting disagrees with the
+// checkpoint chain the row points at (spec 2064/f3/07 section 6, open-sequence step
+// 10). A checkpoint dump and the SRT row committed with it are stamped in the same
+// meta flip, so the row's live_records must equal the entries the checkpoint chain
+// rebuilds and its shard_seq_high must equal the chain's; a gap means a stale or torn
+// root, not a live inconsistency.
+type SRTRowDrift struct {
+	Shard          int    // shard whose row disagrees with its checkpoint
+	RowLiveRecords uint64 // live_records the SRT row claims
+	CkptEntries    uint64 // entries the checkpoint chain actually rebuilt
+	RowSeqHigh     uint64 // shard_seq_high the SRT row claims
+	CkptSeqHigh    uint64 // seq_high the checkpoint chain actually reflects
+}
+
+// CrossCheck reconciles every SRT row against the checkpoint it names, the akifile
+// half of open-sequence step 10 (spec 2064/f3/07 section 6). It compares each row's
+// live_records to the rebuilt index's entry count and its shard_seq_high to the
+// checkpoint chain's, returning one SRTRowDrift per shard that disagrees.
+//
+// It never fails and never aborts: a drift is a report, not a verdict. The checkpoint
+// payload CRCs already vouched for the bytes, and the tail replay the store runs above
+// this layer is the final authority, so recovery logs a gross mismatch and serves. A
+// recovery with no SRT (a fresh file or a scan fallback) has nothing to reconcile and
+// returns nil, as does a shard that never checkpointed (a zero row over an empty index).
+func (r *Recovery) CrossCheck() []SRTRowDrift {
+	if r.SRT == nil {
+		return nil
+	}
+	var drift []SRTRowDrift
+	for i := range r.SRT.Rows {
+		idx := r.Indexes[i]
+		if idx == nil {
+			continue
+		}
+		row := &r.SRT.Rows[i]
+		entries := uint64(idx.Len())
+		if entries == row.LiveRecords && idx.SeqHigh == row.ShardSeqHigh {
+			continue
+		}
+		drift = append(drift, SRTRowDrift{
+			Shard:          i,
+			RowLiveRecords: row.LiveRecords,
+			CkptEntries:    entries,
+			RowSeqHigh:     row.ShardSeqHigh,
+			CkptSeqHigh:    idx.SeqHigh,
+		})
+	}
+	return drift
+}
+
 // ReadExtentTable reads the coarse extent map the live meta root points at (spec
 // 2064/f3/07 section 3). The map records the file's regions (the header page, the
 // append space, free runs) so a tool or a fresh open sees the file's shape without
