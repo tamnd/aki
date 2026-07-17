@@ -304,6 +304,25 @@ func Getset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Null()
 }
 
+// Setnx answers SETNX key value: write value only when the key is absent,
+// replying 1 on the write and 0 when a value is already there. It checks the
+// string keyspace the same way SET NX does. Superseded by SET ... NX but still
+// part of the surface.
+func Setnx(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	if cx.St.Exists(args[0], cx.NowMs) {
+		r.Int(0)
+		return
+	}
+	if err := cx.St.SetString(args[0], args[1], cx.NowMs, 0, false); err != nil {
+		if cx.ParkFull(err) {
+			return
+		}
+		r.Err(storeErr(err))
+		return
+	}
+	r.Int(1)
+}
+
 // Type answers TYPE key. Only string records exist in this slice, so the
 // answer is "string" or "none".
 func Type(cx *shard.Ctx, args [][]byte, r shard.Reply) {
