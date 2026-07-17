@@ -28,6 +28,9 @@ func TestInspectFreshFile(t *testing.T) {
 	if rep.TTL != nil || rep.TTLErr != nil || rep.FreeMap != nil || rep.FreeMapErr != nil {
 		t.Fatalf("fresh globals = ttl %v/%v free %v/%v, want all nil", rep.TTL, rep.TTLErr, rep.FreeMap, rep.FreeMapErr)
 	}
+	if rep.MetaKV != nil || rep.MetaKVErr != nil {
+		t.Fatalf("fresh meta kv = %v/%v, want nil", rep.MetaKV, rep.MetaKVErr)
+	}
 	if rep.Segments.Total != 0 || rep.Segments.DurableTail != PageSize {
 		t.Fatalf("segments = %+v, want empty with tail at the header page", rep.Segments)
 	}
@@ -196,7 +199,7 @@ func TestWriteReportCleanFile(t *testing.T) {
 		"format: aki store v3.0", "checksum crc32c",
 		"meta slot A", "meta slot B", "(live)",
 		"shard root table: none", "extent map: none",
-		"ttl index: none", "free map: none", "findings: none",
+		"ttl index: none", "free map: none", "meta kv: none", "findings: none",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("report missing %q in:\n%s", want, out)
@@ -250,6 +253,10 @@ func TestInspectReportsGlobals(t *testing.T) {
 		{StartOff: 0x10000, Length: 0x2000},
 		{StartOff: 0x20000, Length: 0x1000, Flags: FreeMapPending},
 	})
+	kvOff := appendMetaKV(t, f, []MetaKVPair{
+		{Key: []byte("import.source"), Value: []byte("RDB v12")},
+		{Key: []byte("config.maxmemory"), Value: []byte("512mb")},
+	})
 	ttl := encodeTTLIndex([]TTLClass{
 		{Class: 1, ExpiryUpperUnix: 1000, Segments: []uint64{0x1000, 0x2000}},
 		{Class: 2, ExpiryUpperUnix: 2000, Segments: []uint64{0x3000}},
@@ -262,6 +269,7 @@ func TestInspectReportsGlobals(t *testing.T) {
 	m := &MetaSlot{
 		CommitSeq: 1, FileSize: ttlOff + uint64(len(ttl)), CleanShutdown: 1,
 		FreeMapOff:  fmOff,
+		MetaKVOff:   kvOff,
 		TTLIndexOff: ttlOff, TTLIndexLen: uint32(len(ttl)),
 	}
 	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
@@ -277,6 +285,9 @@ func TestInspectReportsGlobals(t *testing.T) {
 	if len(rep.FreeMap) != 2 || rep.FreeMapErr != nil {
 		t.Fatalf("free map = %v/%v, want 2 runs", rep.FreeMap, rep.FreeMapErr)
 	}
+	if len(rep.MetaKV) != 2 || rep.MetaKVErr != nil {
+		t.Fatalf("meta kv = %v/%v, want 2 pairs", rep.MetaKV, rep.MetaKVErr)
+	}
 	if fs := rep.Findings(); len(fs) != 0 {
 		t.Fatalf("findings = %v, want none on intact globals", fs)
 	}
@@ -284,10 +295,42 @@ func TestInspectReportsGlobals(t *testing.T) {
 	var buf bytes.Buffer
 	WriteReport(&buf, rep)
 	out := buf.String()
-	for _, want := range []string{"ttl index: 2 classes", "free map: 2 runs, 8192 free, 4096 pending"} {
+	for _, want := range []string{
+		"ttl index: 2 classes", "free map: 2 runs, 8192 free, 4096 pending",
+		"meta kv: 2 pairs", "import.source = RDB v12", "config.maxmemory = 512mb",
+	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("report missing %q in:\n%s", want, out)
 		}
+	}
+}
+
+// TestFindingsTornMetaKV flags a meta_kv the live slot names but that does not read:
+// a misdirected provenance root surfaces as a finding, not a hard failure.
+func TestFindingsTornMetaKV(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	// Point the meta-kv root at a log segment: a misdirected root reads as ErrMagic.
+	offs, err := f.AppendGroup([]Pending{{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("not a meta kv")}})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	m := &MetaSlot{CommitSeq: 1, FileSize: f.Cursor(), CleanShutdown: 1, MetaKVOff: offs[0]}
+	writeMeta(t, dev, prefix, prefix.MetaSlotAOff, m)
+	writeMeta(t, dev, prefix, prefix.MetaSlotBOff, m)
+
+	rep, err := Inspect(dev)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if rep.MetaKVErr != ErrMagic {
+		t.Fatalf("meta kv err = %v, want ErrMagic", rep.MetaKVErr)
+	}
+	fs := rep.Findings()
+	if len(fs) != 1 || !strings.Contains(fs[0], "meta kv did not read") {
+		t.Fatalf("findings = %v, want one for the torn meta kv", fs)
 	}
 }
 
