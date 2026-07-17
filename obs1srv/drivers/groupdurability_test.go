@@ -298,7 +298,9 @@ func TestGroupDurabilityStrictAck(t *testing.T) {
 	// The relaxed reader sees the group while the strict creator's output
 	// waits on the gated chain. The creator's reply is held, so nothing
 	// orders nc2 behind the create; on a slow box nc2's command can reach
-	// the shard first and land in the NOGROUP window, so retry through it.
+	// the shard before the create applies and the window has two reply
+	// shapes, key-not-yet (the XGROUP key error) before group-not-yet
+	// (NOGROUP), so retry through both.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		send(t, nc2, "XGROUP", "CREATECONSUMER", "gk", "g", "c")
@@ -309,7 +311,9 @@ func TestGroupDurabilityStrictAck(t *testing.T) {
 		if line == ":1\r\n" {
 			break
 		}
-		if !strings.HasPrefix(line, "-NOGROUP") || time.Now().After(deadline) {
+		inWindow := strings.HasPrefix(line, "-NOGROUP") ||
+			strings.HasPrefix(line, "-ERR The XGROUP subcommand requires the key to exist")
+		if !inWindow || time.Now().After(deadline) {
 			t.Fatalf("createconsumer reply = %q", line)
 		}
 		time.Sleep(time.Millisecond)
