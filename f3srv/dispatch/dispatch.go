@@ -5,8 +5,10 @@
 package dispatch
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math/rand/v2"
+	"sort"
 	"strconv"
 
 	"github.com/tamnd/aki/engine/f3/derived"
@@ -180,6 +182,12 @@ func init() {
 	register("EXPIRETIME", expiretimeCmd, 1, 1, true)
 	register("PEXPIRETIME", pexpiretimeCmd, 1, 1, true)
 	register("PERSIST", persistCmd, 1, 1, true)
+	// SORT and its read-only twin span list, set, and zset, so they live here
+	// with the other cross-type keyspace verbs. Only the plain numeric/ALPHA and
+	// BY-nosort rows are wired; the fan-wave BY-pattern/GET/STORE rows are their
+	// own deferred slices (spec 2064/f3/17 section 12).
+	register("SORT", sortCmd, 1, -1, true)
+	register("SORT_RO", sortRoCmd, 1, -1, true)
 	register("MGET", nil, 1, -1, true)
 	register("MSET", nil, 2, -1, true)
 	registerFan("EXISTS", shard.FanCount, exists, false, false)
@@ -1162,6 +1170,189 @@ func persistCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	r.Int(0)
+}
+
+const sortWrongType = "WRONGTYPE Operation against a key holding the wrong kind of value"
+
+// sortCmd answers SORT key [LIMIT off count] [ASC|DESC] [ALPHA] [BY nosort] over
+// a list, set, or sorted set, the plain numeric-or-ALPHA row of spec 2064/f3/17
+// section 12. The source is materialized into the one sanctioned sort buffer on
+// its owner, sorted, then LIMIT-windowed. It spans every collection type the way
+// TYPE and EXISTS do, which is why it lives here. sortRoCmd is the read-only twin.
+//
+// The fan-wave rows are deferred to their own slices per the spec's split: a BY
+// pattern with a '*' dereferences keys on arbitrary owners, GET projects through
+// pattern keys, and STORE writes a list to a destination owner; each rides the
+// F17 fan the plain row does not need. They report a clear not-yet error rather
+// than silently ignoring the option. BY with no '*' is the nosort case and is
+// honored here (the source streams in stored order, sorting skipped).
+func sortCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	sortRun(cx, args, r, false)
+}
+
+// sortRoCmd answers SORT_RO, the read-only twin that exists for replica routing.
+// It shares the plain-sort core; STORE is not part of its grammar, so a STORE
+// token is a syntax error rather than the not-yet error SORT gives.
+func sortRoCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	sortRun(cx, args, r, true)
+}
+
+func sortRun(cx *shard.Ctx, args [][]byte, r shard.Reply, ro bool) {
+	key := args[0]
+	var (
+		desc   bool
+		alpha  bool
+		nosort bool
+		hasLim bool
+		off    int
+		count  int
+	)
+	for i := 1; i < len(args); {
+		switch {
+		case tokenIs(args[i], "ASC"):
+			desc = false
+			i++
+		case tokenIs(args[i], "DESC"):
+			desc = true
+			i++
+		case tokenIs(args[i], "ALPHA"):
+			alpha = true
+			i++
+		case tokenIs(args[i], "LIMIT"):
+			if i+2 >= len(args) {
+				r.Err("ERR syntax error")
+				return
+			}
+			o, err1 := strconv.Atoi(string(args[i+1]))
+			c, err2 := strconv.Atoi(string(args[i+2]))
+			if err1 != nil || err2 != nil {
+				r.Err("ERR value is not an integer or out of range")
+				return
+			}
+			hasLim, off, count = true, o, c
+			i += 3
+		case tokenIs(args[i], "BY"):
+			if i+1 >= len(args) {
+				r.Err("ERR syntax error")
+				return
+			}
+			// A BY pattern with no '*' cannot name a key, so Redis reads it as the
+			// nosort signal: return the source in stored order. A pattern with '*'
+			// dereferences arbitrary keys and rides the deferred fan-wave slice.
+			if hasStar(args[i+1]) {
+				r.Err("ERR SORT BY with a key pattern is not yet supported")
+				return
+			}
+			nosort = true
+			i += 2
+		case tokenIs(args[i], "GET"):
+			r.Err("ERR SORT GET is not yet supported")
+			return
+		case tokenIs(args[i], "STORE"):
+			if ro {
+				r.Err("ERR syntax error")
+				return
+			}
+			r.Err("ERR SORT STORE is not yet supported")
+			return
+		default:
+			r.Err("ERR syntax error")
+			return
+		}
+	}
+
+	var elems [][]byte
+	switch {
+	case list.Has(cx, key):
+		elems = list.SortElements(cx, key)
+	case set.Has(cx, key):
+		elems = set.SortElements(cx, key)
+	case zset.Has(cx, key):
+		elems = zset.SortElements(cx, key)
+	case cx.St.Exists(key, cx.NowMs), hash.Has(cx, key), stream.Has(cx, key):
+		r.Err(sortWrongType)
+		return
+	}
+
+	if !nosort && len(elems) > 1 {
+		if alpha {
+			sort.SliceStable(elems, func(i, j int) bool {
+				return bytesLess(elems[i], elems[j], desc)
+			})
+		} else {
+			scores := make([]float64, len(elems))
+			for i, e := range elems {
+				f, err := strconv.ParseFloat(string(e), 64)
+				if err != nil {
+					r.Err("ERR One or more scores can't be converted into double")
+					return
+				}
+				scores[i] = f
+			}
+			idx := make([]int, len(elems))
+			for i := range idx {
+				idx[i] = i
+			}
+			sort.SliceStable(idx, func(a, b int) bool {
+				if desc {
+					return scores[idx[a]] > scores[idx[b]]
+				}
+				return scores[idx[a]] < scores[idx[b]]
+			})
+			sorted := make([][]byte, len(elems))
+			for i, j := range idx {
+				sorted[i] = elems[j]
+			}
+			elems = sorted
+		}
+	}
+
+	if hasLim {
+		n := len(elems)
+		start := off
+		if start < 0 {
+			start = 0
+		}
+		if start > n {
+			start = n
+		}
+		end := n
+		if count >= 0 {
+			end = start + count
+			if end > n {
+				end = n
+			}
+		}
+		elems = elems[start:end]
+	}
+
+	out := resp.AppendArrayHeader(cx.Aux[:0], len(elems))
+	for _, e := range elems {
+		out = resp.AppendBulk(out, e)
+	}
+	cx.Aux = out
+	r.Raw(out)
+}
+
+// hasStar reports whether a SORT BY/GET pattern contains the '*' substitution
+// mark. A pattern without it names no key, the nosort (BY) or constant (GET) case.
+func hasStar(p []byte) bool {
+	for _, c := range p {
+		if c == '*' {
+			return true
+		}
+	}
+	return false
+}
+
+// bytesLess orders two elements lexicographically for ALPHA sort, reversed when
+// desc is set.
+func bytesLess(a, b []byte, desc bool) bool {
+	c := bytes.Compare(a, b)
+	if desc {
+		return c > 0
+	}
+	return c < 0
 }
 
 // delCmd answers the single-key DEL and UNLINK point path, spanning every
