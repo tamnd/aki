@@ -672,6 +672,14 @@ func (w *worker) executeCmd(b *hopBatch, i int) {
 	w.cx.curConn = b.conn // completion target for a Park; owner-local, per command
 	w.cx.curSeq = c.seq
 	h(&w.cx, argv, r)
+	// Strict acks: a write that emitted WAL frames on a strict connection holds
+	// its reply until the covering chain commit (strict.go). Marks only
+	// accumulate on a strict connection with a log wired, so every other path
+	// pays one length load here.
+	if len(w.cx.marks) != 0 {
+		w.strictHold(b, i)
+		w.cx.marks = w.cx.marks[:0]
+	}
 	// Block-not-drop: a write handler that could not allocate set parkFull through
 	// ParkFull instead of writing a reply. One bool load, zero cost when unset; on
 	// the normal path it registers the command on the full-waiter FIFO, and the
