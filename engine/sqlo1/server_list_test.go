@@ -574,7 +574,7 @@ func TestServerListScan(t *testing.T) {
 
 	// The option errors, word for word.
 	send("LPOS", "l", "b", "RANK", "0")
-	expect(t, r, "-ERR RANK can't be zero. Use 1 to start searching from the first matching element in the head, or a negative rank to start searching backward from the tail.\r\n")
+	expect(t, r, "-ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list\r\n")
 	send("LPOS", "l", "b", "COUNT", "-1")
 	expect(t, r, "-ERR COUNT can't be negative\r\n")
 	send("LPOS", "l", "b", "MAXLEN", "-1")

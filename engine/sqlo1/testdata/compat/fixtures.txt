@@ -837,3 +837,178 @@ C ["GEODIST", "geo:str", "a", "b"] -> "-WRONGTYPE Operation against a key holdin
 C ["GEOHASH", "geo:str", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
 C ["GEOSEARCH", "geo:str", "FROMLONLAT", "1", "1", "BYRADIUS", "1", "km"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
 C ["GEORADIUS", "geo:str", "1", "1", "1", "km"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+S LIST
+C ["RPUSH", "l:k", "a", "b", "c"] -> ":3"
+C ["LPUSH", "l:k", "x", "y"] -> ":5"
+C ["LRANGE", "l:k", "0", "-1"] -> ["$y", "$x", "$a", "$b", "$c"]
+C ["LLEN", "l:k"] -> ":5"
+C ["TYPE", "l:k"] -> "+list"
+C ["OBJECT", "ENCODING", "l:k"] -> "$listpack"
+C ["LPUSHX", "l:k", "z"] -> ":6"
+C ["RPUSHX", "l:k", "w"] -> ":7"
+C ["LRANGE", "l:k", "0", "-1"] -> ["$z", "$y", "$x", "$a", "$b", "$c", "$w"]
+C ["LPUSHX", "l:missing", "v"] -> ":0"
+C ["RPUSHX", "l:missing", "v"] -> ":0"
+C ["TYPE", "l:missing"] -> "+none"
+C ["LLEN", "l:missing"] -> ":0"
+C ["RPUSH", "l:k"] -> "-ERR wrong number of arguments for 'rpush' command"
+C ["LPUSH"] -> "-ERR wrong number of arguments for 'lpush' command"
+C ["LPOP", "l:k"] -> "$z"
+C ["RPOP", "l:k"] -> "$w"
+C ["LPOP", "l:k", "2"] -> ["$y", "$x"]
+C ["RPOP", "l:k", "0"] -> []
+C ["RPOP", "l:k", "10"] -> ["$c", "$b", "$a"]
+C ["TYPE", "l:k"] -> "+none"
+C ["LPOP", "l:missing"] -> "$-1"
+C ["RPOP", "l:missing"] -> "$-1"
+C ["LPOP", "l:missing", "3"] -> "*-1"
+C ["LPOP", "l:missing", "-1"] -> "-ERR value is out of range, must be positive"
+C ["RPOP", "l:missing", "x"] -> "-ERR value is out of range, must be positive"
+C ["RPUSH", "l:p", "e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9"] -> ":10"
+C ["LINDEX", "l:p", "0"] -> "$e0"
+C ["LINDEX", "l:p", "5"] -> "$e5"
+C ["LINDEX", "l:p", "-1"] -> "$e9"
+C ["LINDEX", "l:p", "-10"] -> "$e0"
+C ["LINDEX", "l:p", "10"] -> "$-1"
+C ["LINDEX", "l:p", "-11"] -> "$-1"
+C ["LINDEX", "l:missing", "0"] -> "$-1"
+C ["LINDEX", "l:p", "x"] -> "-ERR value is not an integer or out of range"
+C ["LSET", "l:p", "0", "E0"] -> "+OK"
+C ["LSET", "l:p", "-1", "E9"] -> "+OK"
+C ["LSET", "l:p", "4", "mid"] -> "+OK"
+C ["LRANGE", "l:p", "0", "-1"] -> ["$E0", "$e1", "$e2", "$e3", "$mid", "$e5", "$e6", "$e7", "$e8", "$E9"]
+C ["LSET", "l:p", "10", "v"] -> "-ERR index out of range"
+C ["LSET", "l:missing", "0", "v"] -> "-ERR no such key"
+C ["LRANGE", "l:p", "2", "5"] -> ["$e2", "$e3", "$mid", "$e5"]
+C ["LRANGE", "l:p", "-3", "-1"] -> ["$e7", "$e8", "$E9"]
+C ["LRANGE", "l:p", "-100", "100"] -> ["$E0", "$e1", "$e2", "$e3", "$mid", "$e5", "$e6", "$e7", "$e8", "$E9"]
+C ["LRANGE", "l:p", "5", "2"] -> []
+C ["LRANGE", "l:p", "3", "3"] -> ["$e3"]
+C ["LRANGE", "l:p", "-1", "-3"] -> []
+C ["LRANGE", "l:missing", "0", "-1"] -> []
+C ["RPUSH", "l:t", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9"] -> ":10"
+C ["LTRIM", "l:t", "2", "-3"] -> "+OK"
+C ["LRANGE", "l:t", "0", "-1"] -> ["$t2", "$t3", "$t4", "$t5", "$t6", "$t7"]
+C ["LTRIM", "l:t", "0", "-1"] -> "+OK"
+C ["LLEN", "l:t"] -> ":6"
+C ["LTRIM", "l:t", "5", "1"] -> "+OK"
+C ["TYPE", "l:t"] -> "+none"
+C ["LTRIM", "l:missing", "0", "-1"] -> "+OK"
+C ["LTRIM", "l:p", "x", "1"] -> "-ERR value is not an integer or out of range"
+C ["RPUSH", "l:s", "a", "b", "c", "b", "a"] -> ":5"
+C ["LINSERT", "l:s", "BEFORE", "b", "B1"] -> ":6"
+C ["LINSERT", "l:s", "AFTER", "c", "C1"] -> ":7"
+C ["LRANGE", "l:s", "0", "-1"] -> ["$a", "$B1", "$b", "$c", "$C1", "$b", "$a"]
+C ["LINSERT", "l:s", "before", "a", "A1"] -> ":8"
+C ["LRANGE", "l:s", "0", "-1"] -> ["$A1", "$a", "$B1", "$b", "$c", "$C1", "$b", "$a"]
+C ["LINSERT", "l:s", "BEFORE", "ghost", "x"] -> ":-1"
+C ["LINSERT", "l:missing", "BEFORE", "a", "x"] -> ":0"
+C ["LINSERT", "l:s", "SIDEWAYS", "a", "x"] -> "-ERR syntax error"
+C ["LLEN", "l:s"] -> ":8"
+C ["RPUSH", "l:r", "d", "z", "d", "z", "d", "z", "d"] -> ":7"
+C ["LREM", "l:r", "2", "d"] -> ":2"
+C ["LRANGE", "l:r", "0", "-1"] -> ["$z", "$z", "$d", "$z", "$d"]
+C ["LREM", "l:r", "-1", "z"] -> ":1"
+C ["LRANGE", "l:r", "0", "-1"] -> ["$z", "$z", "$d", "$d"]
+C ["LREM", "l:r", "0", "z"] -> ":2"
+C ["LRANGE", "l:r", "0", "-1"] -> ["$d", "$d"]
+C ["LREM", "l:r", "5", "ghost"] -> ":0"
+C ["LREM", "l:missing", "0", "x"] -> ":0"
+C ["LREM", "l:r", "0", "d"] -> ":2"
+C ["TYPE", "l:r"] -> "+none"
+C ["LREM", "l:s", "x", "a"] -> "-ERR value is not an integer or out of range"
+C ["RPUSH", "l:q", "a", "b", "c", "a", "b", "c", "a"] -> ":7"
+C ["LPOS", "l:q", "a"] -> ":0"
+C ["LPOS", "l:q", "a", "RANK", "2"] -> ":3"
+C ["LPOS", "l:q", "a", "RANK", "-1"] -> ":6"
+C ["LPOS", "l:q", "a", "COUNT", "2"] -> [":0", ":3"]
+C ["LPOS", "l:q", "a", "COUNT", "0"] -> [":0", ":3", ":6"]
+C ["LPOS", "l:q", "a", "RANK", "-1", "COUNT", "0"] -> [":6", ":3", ":0"]
+C ["LPOS", "l:q", "c", "MAXLEN", "2"] -> "$-1"
+C ["LPOS", "l:q", "c", "MAXLEN", "3"] -> ":2"
+C ["LPOS", "l:q", "ghost"] -> "$-1"
+C ["LPOS", "l:q", "ghost", "COUNT", "2"] -> []
+C ["LPOS", "l:missing", "a"] -> "$-1"
+C ["LPOS", "l:missing", "a", "COUNT", "1"] -> []
+C ["LPOS", "l:q", "a", "RANK", "0"] -> "-ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list"
+C ["LPOS", "l:q", "a", "COUNT", "-1"] -> "-ERR COUNT can't be negative"
+C ["LPOS", "l:q", "a", "MAXLEN", "-1"] -> "-ERR MAXLEN can't be negative"
+C ["LPOS", "l:q", "a", "BOGUS", "1"] -> "-ERR syntax error"
+C ["RPUSH", "l:mv", "one", "two", "three"] -> ":3"
+C ["LMOVE", "l:mv", "l:mvd", "LEFT", "RIGHT"] -> "$one"
+C ["LMOVE", "l:mv", "l:mvd", "RIGHT", "LEFT"] -> "$three"
+C ["LRANGE", "l:mv", "0", "-1"] -> ["$two"]
+C ["LRANGE", "l:mvd", "0", "-1"] -> ["$three", "$one"]
+C ["LMOVE", "l:mvd", "l:mvd", "LEFT", "RIGHT"] -> "$three"
+C ["LRANGE", "l:mvd", "0", "-1"] -> ["$one", "$three"]
+C ["LMOVE", "l:mvd", "l:mvd", "LEFT", "LEFT"] -> "$one"
+C ["LRANGE", "l:mvd", "0", "-1"] -> ["$one", "$three"]
+C ["LMOVE", "l:missing", "l:mvd", "LEFT", "LEFT"] -> "$-1"
+C ["LMOVE", "l:mvd", "l:mv2", "UP", "LEFT"] -> "-ERR syntax error"
+C ["RPOPLPUSH", "l:mvd", "l:mv2"] -> "$three"
+C ["LRANGE", "l:mv2", "0", "-1"] -> ["$three"]
+C ["RPOPLPUSH", "l:missing", "l:mv2"] -> "$-1"
+C ["RPUSH", "l:single", "solo"] -> ":1"
+C ["LMOVE", "l:single", "l:mvd", "LEFT", "RIGHT"] -> "$solo"
+C ["TYPE", "l:single"] -> "+none"
+C ["RPUSH", "l:m1", "a", "b", "c"] -> ":3"
+C ["LMPOP", "2", "l:missing", "l:m1", "LEFT"] -> ["$l:m1", ["$a"]]
+C ["LMPOP", "1", "l:m1", "RIGHT", "COUNT", "5"] -> ["$l:m1", ["$c", "$b"]]
+C ["TYPE", "l:m1"] -> "+none"
+C ["LMPOP", "1", "l:missing", "LEFT"] -> "*-1"
+C ["LMPOP", "0", "LEFT"] -> "-ERR wrong number of arguments for 'lmpop' command"
+C ["LMPOP", "1", "l:missing", "BOGUS"] -> "-ERR syntax error"
+C ["LMPOP", "x", "l:missing", "LEFT"] -> "-ERR numkeys should be greater than 0"
+C ["LMPOP", "1", "l:missing", "LEFT", "COUNT", "0"] -> "-ERR count should be greater than 0"
+C ["LMPOP", "2", "l:missing", "LEFT"] -> "-ERR syntax error"
+C ["RPUSH", "l:b", "a", "b", "c", "d", "e", "f"] -> ":6"
+C ["BLPOP", "l:b", "0"] -> ["$l:b", "$a"]
+C ["BRPOP", "l:missing", "l:b", "0.1"] -> ["$l:b", "$f"]
+C ["BLMPOP", "0", "1", "l:b", "LEFT"] -> ["$l:b", ["$b"]]
+C ["BLMOVE", "l:b", "l:bd", "LEFT", "RIGHT", "0"] -> "$c"
+C ["BRPOPLPUSH", "l:b", "l:bd", "0.1"] -> "$e"
+C ["LRANGE", "l:bd", "0", "-1"] -> ["$e", "$c"]
+C ["LRANGE", "l:b", "0", "-1"] -> ["$d"]
+C ["BLPOP", "l:b", "-1"] -> "-ERR timeout is negative"
+C ["BLPOP", "l:b", "notanum"] -> "-ERR timeout is not a float or out of range"
+C ["BLMOVE", "l:b", "l:bd", "LEFT", "RIGHT", "-1"] -> "-ERR timeout is negative"
+C ["BLMPOP", "0", "0", "LEFT"] -> "-ERR wrong number of arguments for 'blmpop' command"
+C ["RPUSH", "l:l128", "s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014", "s015", "s016", "s017", "s018", "s019", "s020", "s021", "s022", "s023", "s024", "s025", "s026", "s027", "s028", "s029", "s030", "s031", "s032", "s033", "s034", "s035", "s036", "s037", "s038", "s039", "s040", "s041", "s042", "s043", "s044", "s045", "s046", "s047", "s048", "s049", "s050", "s051", "s052", "s053", "s054", "s055", "s056", "s057", "s058", "s059", "s060", "s061", "s062", "s063", "s064", "s065", "s066", "s067", "s068", "s069", "s070", "s071", "s072", "s073", "s074", "s075", "s076", "s077", "s078", "s079", "s080", "s081", "s082", "s083", "s084", "s085", "s086", "s087", "s088", "s089", "s090", "s091", "s092", "s093", "s094", "s095", "s096", "s097", "s098", "s099", "s100", "s101", "s102", "s103", "s104", "s105", "s106", "s107", "s108", "s109", "s110", "s111", "s112", "s113", "s114", "s115", "s116", "s117", "s118", "s119", "s120", "s121", "s122", "s123", "s124", "s125", "s126", "s127"] -> ":128"
+C ["OBJECT", "ENCODING", "l:l128"] -> "$listpack"
+C ["LLEN", "l:l128"] -> ":128"
+C ["RPUSH", "l:big", "v000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v001xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v002xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v003xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v004xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v005xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v006xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v007xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v008xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v009xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v010xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v011xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v012xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v013xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v014xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v015xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v016xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v017xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v018xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v019xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v020xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v021xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v022xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v023xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v024xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v025xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v026xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v027xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v028xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v029xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v030xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v031xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v032xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v033xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v034xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v035xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v036xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v037xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v038xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v039xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v040xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v041xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v042xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v043xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v044xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v045xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v046xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v047xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v048xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v049xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v050xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v051xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v052xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v053xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v054xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v055xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v056xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v057xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v058xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v059xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v060xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v061xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v062xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v063xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v064xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v065xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v066xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v067xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v068xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v069xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v070xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v071xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v072xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v073xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v074xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v075xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v076xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v077xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v078xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v079xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v080xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v081xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v082xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v083xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v084xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v085xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v086xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v087xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v088xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v089xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v090xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v091xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v092xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v093xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v094xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v095xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v096xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v097xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v098xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v099xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v100xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v101xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v102xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v103xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v104xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v105xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v106xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v107xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v108xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v109xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v110xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v111xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v112xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v113xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v114xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v115xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v116xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v117xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v118xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v119xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v120xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v121xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v122xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v123xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v124xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v125xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v126xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v127xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v128xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v129xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v130xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v131xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v132xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v133xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v134xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v135xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v136xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v137xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v138xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v139xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v140xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v141xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v142xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v143xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v144xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v145xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v146xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v147xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v148xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v149xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v150xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v151xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v152xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v153xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v154xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v155xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v156xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v157xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v158xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v159xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v160xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v161xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v162xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v163xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v164xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v165xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v166xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v167xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v168xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v169xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v170xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v171xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v172xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v173xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v174xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v175xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v176xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v177xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v178xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v179xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v180xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v181xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v182xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v183xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v184xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v185xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v186xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v187xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v188xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v189xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v190xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v191xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v192xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v193xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v194xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v195xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v196xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v197xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v198xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v199xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v200xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v201xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v202xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v203xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v204xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v205xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v206xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v207xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v208xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v209xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v210xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v211xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v212xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v213xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v214xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v215xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v216xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v217xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v218xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v219xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v220xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v221xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v222xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v223xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v224xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v225xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v226xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v227xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v228xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v229xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v230xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v231xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v232xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v233xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v234xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v235xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v236xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v237xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v238xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v239xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v240xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v241xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v242xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v243xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v244xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v245xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v246xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v247xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v248xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v249xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v250xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v251xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v252xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v253xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v254xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v255xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v256xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v257xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v258xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v259xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v260xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v261xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v262xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v263xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v264xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v265xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v266xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v267xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v268xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v269xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v270xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v271xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v272xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v273xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v274xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v275xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v276xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v277xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v278xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v279xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v280xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v281xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v282xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v283xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v284xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v285xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v286xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v287xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v288xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v289xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v290xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v291xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v292xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v293xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v294xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v295xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v296xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v297xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v298xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "v299xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"] -> ":300"
+C ["OBJECT", "ENCODING", "l:big"] -> "$quicklist"
+C ["LLEN", "l:big"] -> ":300"
+C ["LRANGE", "l:big", "0", "4"] -> ["$v000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v001xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v002xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v003xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v004xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]
+C ["LRANGE", "l:big", "-5", "-1"] -> ["$v295xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v296xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v297xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v298xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v299xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]
+C ["LRANGE", "l:big", "120", "135"] -> ["$v120xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v121xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v122xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v123xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v124xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v125xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v126xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v127xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v128xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v129xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v130xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v131xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v132xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v133xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v134xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v135xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]
+C ["LINDEX", "l:big", "129"] -> "$v129xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+C ["LINDEX", "l:big", "-130"] -> "$v170xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+C ["LSET", "l:big", "200", "SWAP"] -> "+OK"
+C ["LINDEX", "l:big", "200"] -> "$SWAP"
+C ["LPOS", "l:big", "v250xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "RANK", "-1"] -> ":250"
+C ["LREM", "l:big", "0", "v250xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"] -> ":1"
+C ["LLEN", "l:big"] -> ":299"
+C ["LTRIM", "l:big", "10", "-11"] -> "+OK"
+C ["LLEN", "l:big"] -> ":279"
+C ["LRANGE", "l:big", "0", "2"] -> ["$v010xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v011xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v012xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]
+C ["LRANGE", "l:big", "-3", "-1"] -> ["$v287xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v288xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$v289xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]
+C ["SET", "l:str", "v"] -> "+OK"
+C ["LPUSH", "l:str", "x"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["RPUSHX", "l:str", "x"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["LPOP", "l:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["RPOP", "l:str", "2"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["LLEN", "l:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["LINDEX", "l:str", "0"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["LSET", "l:str", "0", "v"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["LRANGE", "l:str", "0", "-1"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["LTRIM", "l:str", "0", "-1"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["LINSERT", "l:str", "BEFORE", "a", "b"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["LREM", "l:str", "0", "a"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["LPOS", "l:str", "a"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["LMOVE", "l:str", "l:d", "LEFT", "LEFT"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["RPUSH", "l:src", "keepme"] -> ":1"
+C ["LMOVE", "l:src", "l:str", "LEFT", "LEFT"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["LRANGE", "l:src", "0", "-1"] -> ["$keepme"]
+C ["LMPOP", "2", "l:str", "l:src", "LEFT"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["BLPOP", "l:str", "0"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"

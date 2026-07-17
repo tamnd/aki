@@ -262,7 +262,7 @@ func (s *Server) lposCmd(ctx context.Context, reply []byte, args [][]byte) []byt
 				return AppendError(reply, "ERR value is not an integer or out of range")
 			}
 			if v == 0 {
-				return AppendError(reply, "ERR RANK can't be zero. Use 1 to start searching from the first matching element in the head, or a negative rank to start searching backward from the tail.")
+				return AppendError(reply, "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list")
 			}
 			rank = v
 		case strings.EqualFold(string(args[i]), "COUNT"):

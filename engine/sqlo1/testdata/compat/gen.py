@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate fixtures.txt: the compat sections, every STRING, BITMAP,
-HLL, HASH, SET, ZSET, and GEO manifest row from spec doc 12 exercised
-against a real redis-server and recorded reply by reply. The Go test replays the
+HLL, HASH, SET, ZSET, GEO, and LIST manifest row from spec doc 12
+exercised against a real redis-server and recorded reply by reply. The Go test replays the
 file through the sqlo1 dispatch path, so each fixture line is one
 diffed manifest row: same args, same wire reply, error texts included.
 
@@ -1139,6 +1139,236 @@ def main():
     c("GEOHASH", "geo:str", "m")
     c("GEOSEARCH", "geo:str", "FROMLONLAT", "1", "1", "BYRADIUS", "1", "km")
     c("GEORADIUS", "geo:str", "1", "1", "1", "km")
+
+    # ---------------------------------------------------------------
+    section("LIST")
+    # Lists are ordered on both sides at every tier, so multi-element
+    # replies pin byte for byte throughout, like zsets. The encoding
+    # boundary differs: redis 8.8's default list-max-listpack-size -2
+    # is a pure byte cap of 8 KiB with no entry-count wall, while
+    # sqlo1 goes noded past 128 entries or 2 KiB inline. The fixture
+    # crosses through the byte wall both sides share (a wide push
+    # over 8 KiB) and does not assert encoding between 129 entries
+    # and 8 KiB, where the representations genuinely diverge.
+
+    # Deque surface: push counts, LPUSH reversal, the X-variants that
+    # refuse to create.
+    c("RPUSH", "l:k", "a", "b", "c")
+    c("LPUSH", "l:k", "x", "y")
+    c("LRANGE", "l:k", "0", "-1")
+    c("LLEN", "l:k")
+    c("TYPE", "l:k")
+    c("OBJECT", "ENCODING", "l:k")
+    c("LPUSHX", "l:k", "z")
+    c("RPUSHX", "l:k", "w")
+    c("LRANGE", "l:k", "0", "-1")
+    c("LPUSHX", "l:missing", "v")
+    c("RPUSHX", "l:missing", "v")
+    c("TYPE", "l:missing")
+    c("LLEN", "l:missing")
+    c("RPUSH", "l:k")
+    c("LPUSH")
+
+    # Pops: plain, counted, count 0, overpop to key death, both miss
+    # shapes (nil bulk plain, null array counted), the count doors.
+    c("LPOP", "l:k")
+    c("RPOP", "l:k")
+    c("LPOP", "l:k", "2")
+    c("RPOP", "l:k", "0")
+    c("RPOP", "l:k", "10")
+    c("TYPE", "l:k")
+    c("LPOP", "l:missing")
+    c("RPOP", "l:missing")
+    c("LPOP", "l:missing", "3")
+    c("LPOP", "l:missing", "-1")
+    c("RPOP", "l:missing", "x")
+
+    # Positional surface: LINDEX both signs and both out-of-range
+    # walls, LSET in place, LRANGE's window grammar.
+    c("RPUSH", "l:p", "e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9")
+    c("LINDEX", "l:p", "0")
+    c("LINDEX", "l:p", "5")
+    c("LINDEX", "l:p", "-1")
+    c("LINDEX", "l:p", "-10")
+    c("LINDEX", "l:p", "10")
+    c("LINDEX", "l:p", "-11")
+    c("LINDEX", "l:missing", "0")
+    c("LINDEX", "l:p", "x")
+    c("LSET", "l:p", "0", "E0")
+    c("LSET", "l:p", "-1", "E9")
+    c("LSET", "l:p", "4", "mid")
+    c("LRANGE", "l:p", "0", "-1")
+    c("LSET", "l:p", "10", "v")
+    c("LSET", "l:missing", "0", "v")
+    c("LRANGE", "l:p", "2", "5")
+    c("LRANGE", "l:p", "-3", "-1")
+    c("LRANGE", "l:p", "-100", "100")
+    c("LRANGE", "l:p", "5", "2")
+    c("LRANGE", "l:p", "3", "3")
+    c("LRANGE", "l:p", "-1", "-3")
+    c("LRANGE", "l:missing", "0", "-1")
+
+    # LTRIM: interior window, identity, empty window kills the key,
+    # missing key is OK.
+    c("RPUSH", "l:t", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9")
+    c("LTRIM", "l:t", "2", "-3")
+    c("LRANGE", "l:t", "0", "-1")
+    c("LTRIM", "l:t", "0", "-1")
+    c("LLEN", "l:t")
+    c("LTRIM", "l:t", "5", "1")
+    c("TYPE", "l:t")
+    c("LTRIM", "l:missing", "0", "-1")
+    c("LTRIM", "l:p", "x", "1")
+
+    # LINSERT: both sides of the first pivot hit, the
+    # case-insensitive token, the three miss shapes.
+    c("RPUSH", "l:s", "a", "b", "c", "b", "a")
+    c("LINSERT", "l:s", "BEFORE", "b", "B1")
+    c("LINSERT", "l:s", "AFTER", "c", "C1")
+    c("LRANGE", "l:s", "0", "-1")
+    c("LINSERT", "l:s", "before", "a", "A1")
+    c("LRANGE", "l:s", "0", "-1")
+    c("LINSERT", "l:s", "BEFORE", "ghost", "x")
+    c("LINSERT", "l:missing", "BEFORE", "a", "x")
+    c("LINSERT", "l:s", "SIDEWAYS", "a", "x")
+    c("LLEN", "l:s")
+
+    # LREM: the count grammar forward, backward, and remove-all,
+    # misses stay read-only, removing everything kills the key.
+    c("RPUSH", "l:r", "d", "z", "d", "z", "d", "z", "d")
+    c("LREM", "l:r", "2", "d")
+    c("LRANGE", "l:r", "0", "-1")
+    c("LREM", "l:r", "-1", "z")
+    c("LRANGE", "l:r", "0", "-1")
+    c("LREM", "l:r", "0", "z")
+    c("LRANGE", "l:r", "0", "-1")
+    c("LREM", "l:r", "5", "ghost")
+    c("LREM", "l:missing", "0", "x")
+    c("LREM", "l:r", "0", "d")
+    c("TYPE", "l:r")
+    c("LREM", "l:s", "x", "a")
+
+    # LPOS: the RANK/COUNT/MAXLEN grammar and its option errors.
+    c("RPUSH", "l:q", "a", "b", "c", "a", "b", "c", "a")
+    c("LPOS", "l:q", "a")
+    c("LPOS", "l:q", "a", "RANK", "2")
+    c("LPOS", "l:q", "a", "RANK", "-1")
+    c("LPOS", "l:q", "a", "COUNT", "2")
+    c("LPOS", "l:q", "a", "COUNT", "0")
+    c("LPOS", "l:q", "a", "RANK", "-1", "COUNT", "0")
+    c("LPOS", "l:q", "c", "MAXLEN", "2")
+    c("LPOS", "l:q", "c", "MAXLEN", "3")
+    c("LPOS", "l:q", "ghost")
+    c("LPOS", "l:q", "ghost", "COUNT", "2")
+    c("LPOS", "l:missing", "a")
+    c("LPOS", "l:missing", "a", "COUNT", "1")
+    c("LPOS", "l:q", "a", "RANK", "0")
+    c("LPOS", "l:q", "a", "COUNT", "-1")
+    c("LPOS", "l:q", "a", "MAXLEN", "-1")
+    c("LPOS", "l:q", "a", "BOGUS", "1")
+
+    # LMOVE and RPOPLPUSH: all four end pairs, the same-key rotation,
+    # the same-end identity, a single-element move killing its
+    # source, and the direction door.
+    c("RPUSH", "l:mv", "one", "two", "three")
+    c("LMOVE", "l:mv", "l:mvd", "LEFT", "RIGHT")
+    c("LMOVE", "l:mv", "l:mvd", "RIGHT", "LEFT")
+    c("LRANGE", "l:mv", "0", "-1")
+    c("LRANGE", "l:mvd", "0", "-1")
+    c("LMOVE", "l:mvd", "l:mvd", "LEFT", "RIGHT")
+    c("LRANGE", "l:mvd", "0", "-1")
+    c("LMOVE", "l:mvd", "l:mvd", "LEFT", "LEFT")
+    c("LRANGE", "l:mvd", "0", "-1")
+    c("LMOVE", "l:missing", "l:mvd", "LEFT", "LEFT")
+    c("LMOVE", "l:mvd", "l:mv2", "UP", "LEFT")
+    c("RPOPLPUSH", "l:mvd", "l:mv2")
+    c("LRANGE", "l:mv2", "0", "-1")
+    c("RPOPLPUSH", "l:missing", "l:mv2")
+    c("RPUSH", "l:single", "solo")
+    c("LMOVE", "l:single", "l:mvd", "LEFT", "RIGHT")
+    c("TYPE", "l:single")
+
+    # LMPOP: first non-empty key wins, COUNT and overpop, key death,
+    # the numkeys and direction doors.
+    c("RPUSH", "l:m1", "a", "b", "c")
+    c("LMPOP", "2", "l:missing", "l:m1", "LEFT")
+    c("LMPOP", "1", "l:m1", "RIGHT", "COUNT", "5")
+    c("TYPE", "l:m1")
+    c("LMPOP", "1", "l:missing", "LEFT")
+    c("LMPOP", "0", "LEFT")
+    c("LMPOP", "1", "l:missing", "BOGUS")
+    c("LMPOP", "x", "l:missing", "LEFT")
+    c("LMPOP", "1", "l:missing", "LEFT", "COUNT", "0")
+    c("LMPOP", "2", "l:missing", "LEFT")
+
+    # The blocking forms on immediate service only, plus the timeout
+    # doors that answer before blocking.
+    c("RPUSH", "l:b", "a", "b", "c", "d", "e", "f")
+    c("BLPOP", "l:b", "0")
+    c("BRPOP", "l:missing", "l:b", "0.1")
+    c("BLMPOP", "0", "1", "l:b", "LEFT")
+    c("BLMOVE", "l:b", "l:bd", "LEFT", "RIGHT", "0")
+    c("BRPOPLPUSH", "l:b", "l:bd", "0.1")
+    c("LRANGE", "l:bd", "0", "-1")
+    c("LRANGE", "l:b", "0", "-1")
+    c("BLPOP", "l:b", "-1")
+    c("BLPOP", "l:b", "notanum")
+    c("BLMOVE", "l:b", "l:bd", "LEFT", "RIGHT", "-1")
+    c("BLMPOP", "0", "0", "LEFT")
+
+    # The encoding walls both sides share: 128 small entries stay
+    # listpack, and a 300-element push of 40 B values (12 KiB, past
+    # redis's byte cap and sqlo1's count cap) is quicklist. The noded
+    # tier answers the same windows the inline tier did, LSET, LREM,
+    # and LTRIM included.
+    l128 = []
+    for i in range(128):
+        l128 += ["s%03d" % i]
+    c("RPUSH", "l:l128", *l128)
+    c("OBJECT", "ENCODING", "l:l128")
+    c("LLEN", "l:l128")
+    big = []
+    for i in range(300):
+        big += [("v%03d" % i).ljust(40, "x")]
+    c("RPUSH", "l:big", *big)
+    c("OBJECT", "ENCODING", "l:big")
+    c("LLEN", "l:big")
+    c("LRANGE", "l:big", "0", "4")
+    c("LRANGE", "l:big", "-5", "-1")
+    c("LRANGE", "l:big", "120", "135")
+    c("LINDEX", "l:big", "129")
+    c("LINDEX", "l:big", "-130")
+    c("LSET", "l:big", "200", "SWAP")
+    c("LINDEX", "l:big", "200")
+    c("LPOS", "l:big", ("v250").ljust(40, "x"), "RANK", "-1")
+    c("LREM", "l:big", "0", ("v250").ljust(40, "x"))
+    c("LLEN", "l:big")
+    c("LTRIM", "l:big", "10", "-11")
+    c("LLEN", "l:big")
+    c("LRANGE", "l:big", "0", "2")
+    c("LRANGE", "l:big", "-3", "-1")
+
+    # Type walls: every list command against a string key, and a
+    # wrong-typed move destination leaving the source untouched.
+    c("SET", "l:str", "v")
+    c("LPUSH", "l:str", "x")
+    c("RPUSHX", "l:str", "x")
+    c("LPOP", "l:str")
+    c("RPOP", "l:str", "2")
+    c("LLEN", "l:str")
+    c("LINDEX", "l:str", "0")
+    c("LSET", "l:str", "0", "v")
+    c("LRANGE", "l:str", "0", "-1")
+    c("LTRIM", "l:str", "0", "-1")
+    c("LINSERT", "l:str", "BEFORE", "a", "b")
+    c("LREM", "l:str", "0", "a")
+    c("LPOS", "l:str", "a")
+    c("LMOVE", "l:str", "l:d", "LEFT", "LEFT")
+    c("RPUSH", "l:src", "keepme")
+    c("LMOVE", "l:src", "l:str", "LEFT", "LEFT")
+    c("LRANGE", "l:src", "0", "-1")
+    c("LMPOP", "2", "l:str", "l:src", "LEFT")
+    c("BLPOP", "l:str", "0")
 
     print("\n".join(lines))
 
