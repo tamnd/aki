@@ -705,6 +705,36 @@ func ReadFreeMap(dev Device, prefix *Prefix, meta *MetaSlot) ([]FreeExtent, erro
 	return FreeExtents(payload, fh)
 }
 
+// ReadMetaKV reads the meta_kv root the live meta slot points at (spec 2064/f3/07
+// sections 3 and 6), the file's config and provenance map: the checksum kind it was
+// written under, the shard geometry, the tool and version that created it, whatever an
+// import stamped. Like the free map it has no length in the meta slot: MetaKVOff names
+// a whole meta_kv segment, so the reader walks its header for the payload length and
+// reads it self-describingly, which also buys it the segment's payload CRC so a torn map
+// is caught as ErrChecksum rather than read as bad provenance.
+//
+// A segment at the pointer that is not a meta_kv is a misdirected or corrupt root,
+// returned as ErrMagic. A file with no meta_kv (a fresh file, or a scan fallback with no
+// trusted root) returns a nil slice and no error: the meta is nil or its MetaKVOff is
+// zero.
+func ReadMetaKV(dev Device, prefix *Prefix, meta *MetaSlot) ([]MetaKVPair, error) {
+	if meta == nil || meta.MetaKVOff == 0 {
+		return nil, nil
+	}
+	h, payload, err := readSegmentAt(dev, prefix.ChecksumKind, meta.MetaKVOff)
+	if err != nil {
+		return nil, err
+	}
+	if h.Kind != KindMetaKV {
+		return nil, ErrMagic
+	}
+	mh, err := ParseMetaKVHeader(payload)
+	if err != nil {
+		return nil, err
+	}
+	return MetaKVPairs(payload, mh)
+}
+
 // errStopScan halts a ReplayTail walk early once a scan has found what it wants. It
 // is not a recovery failure: FindBarrier returns it from its visit to stop at the
 // matched barrier and unwraps it back to success.
