@@ -139,6 +139,80 @@ func TestCheckpointRoundTrips(t *testing.T) {
 	}
 }
 
+// TestCheckpointGlobalsRoundTrip writes the two file-global roots to free space, stamps
+// their offsets into the commit, and recovers the file: the TTL index and free map read
+// back off the one live root alongside the SRT, the round trip a hand-built meta slot
+// only stood in for until now.
+func TestCheckpointGlobalsRoundTrip(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	// The allocator's free map lands as a self-describing segment; the meta slot names
+	// its header offset.
+	fmOff := appendFreeMap(t, f, []FreeExtent{
+		{StartOff: 0x10000, Length: 0x4000},
+		{StartOff: 0x20000, Length: 0x1000, Flags: FreeMapPending},
+	})
+	// Active expiry's TTL index rides the grid like the SRT; the meta slot names its
+	// payload offset and length for a bare read.
+	ttlBytes := encodeTTLIndex([]TTLClass{
+		{Class: 1, ExpiryUpperUnix: 1000, Segments: []uint64{0x1000, 0x2000}},
+		{Class: 2, ExpiryUpperUnix: 2000, Segments: []uint64{0x3000}},
+	})
+	ttlOffs, err := f.AppendGroup([]Pending{{Shard: ShardOwnerless, Kind: KindTTLIndex, Payload: ttlBytes}})
+	if err != nil {
+		t.Fatalf("append ttl index: %v", err)
+	}
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	globals := CheckpointGlobals{
+		TTLIndexOff: ttlOffs[0] + SegHeaderLen,
+		TTLIndexLen: uint32(len(ttlBytes)),
+		FreeMapOff:  fmOff,
+	}
+	if err := f.CheckpointWithGlobals(&SRT{Gen: 4, Rows: rows}, nil, CheckpointStats{Clean: true}, globals); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	rec, err := Recover(dev)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if len(rec.TTLClasses) != 2 {
+		t.Fatalf("recovered ttl = %+v, want 2 classes", rec.TTLClasses)
+	}
+	if len(rec.FreeMap) != 2 {
+		t.Fatalf("recovered free map = %+v, want 2 runs", rec.FreeMap)
+	}
+	free, pending := FreeMapTotals(rec.FreeMap)
+	if free != 0x4000 || pending != 0x1000 {
+		t.Fatalf("free map totals = free %d / pending %d, want %d/%d", free, pending, 0x4000, 0x1000)
+	}
+}
+
+// TestCheckpointLeavesGlobalsUnstamped confirms a plain Checkpoint names no global
+// roots: a file with no TTL index or free map commits with both pointers zero, so a
+// reader reports neither.
+func TestCheckpointLeavesGlobalsUnstamped(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	prefix := f.Prefix()
+
+	rows := make([]SRTRow, prefix.ShardCount)
+	if err := f.Checkpoint(&SRT{Gen: 1, Rows: rows}, nil, CheckpointStats{Clean: true}); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	st, err := ReadOpenState(dev)
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	if st.Meta.TTLIndexOff != 0 || st.Meta.TTLIndexLen != 0 || st.Meta.FreeMapOff != 0 {
+		t.Fatalf("globals = ttl %#x/%d free %#x, want all zero", st.Meta.TTLIndexOff, st.Meta.TTLIndexLen, st.Meta.FreeMapOff)
+	}
+}
+
 // TestCheckpointRootsRideTheGrid confirms the roots land as segments a grid walk
 // counts and skips: the shard root table and extent map are owner-less segments,
 // so the durable tail sits past them, not on them.
