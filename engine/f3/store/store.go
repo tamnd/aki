@@ -51,6 +51,14 @@ type Store struct {
 	// stages through it until the writeRun flip routes the spill onto it.
 	akispill *akiSpill
 
+	// akicold re-homes the cold tier onto the same .aki (akicold.go): the cold
+	// counterpart of akivlog, wrapping the shared File's cold-chunk region for
+	// this shard. Constructed alongside akivlog when Options carries the handle
+	// and equally inert: nothing demotes through it until the migrator flip
+	// routes the cold path onto it. It holds no provisional bookkeeping because a
+	// cold demote is already a batch whose offsets the cut returns at once.
+	akicold *akiCold
+
 	// spillLedger records where each provisional word from the current batch was
 	// written (spillledger.go): one entry per staged run, the value-area offset
 	// vs of the record's run pointer and the run's stage index. resolveSpill
@@ -249,6 +257,7 @@ func Open(o Options) (*Store, error) {
 		// spill path is flipped onto it.
 		s.akivlog = newAkiVlog(o.AkiValueLog, o.Shard)
 		s.akispill = newAkiSpill(s.akivlog)
+		s.akicold = newAkiCold(o.AkiValueLog, o.Shard)
 	}
 	return s, nil
 }
