@@ -1,6 +1,10 @@
 package store
 
-import "github.com/tamnd/aki/engine/f3/akifile"
+import (
+	"runtime"
+
+	"github.com/tamnd/aki/engine/f3/akifile"
+)
 
 // akiRlog is the store-side record log: the first store adapter that persists a
 // record row, not just its separated value. Today the store logs value bytes
@@ -30,6 +34,13 @@ type akiRlog struct {
 	f     *akifile.File
 	shard uint16
 
+	// gw is the shared group-commit writer when this store shares its .aki with
+	// other shards: only one goroutine may call the file's AppendGroup, so a
+	// shard-shared file seals its batch and submits it here instead of cutting the
+	// segment itself. It is nil for a single-writer store (a test or a one-shard
+	// runtime) whose flush may call AppendGroup directly.
+	gw *akifile.GroupWriter
+
 	// seq stamps each cut log segment, advanced once per non-empty flush the way
 	// the scratch log advanced its flushed tail.
 	seq uint64
@@ -44,9 +55,12 @@ type akiRlog struct {
 	dead  uint64
 }
 
-// newAkiRlog builds a record log for shard backed by f's group-commit writer.
-func newAkiRlog(f *akifile.File, shard uint16) *akiRlog {
-	return &akiRlog{w: akifile.NewRecordLogWriter(f, shard), f: f, shard: shard}
+// newAkiRlog builds a record log for shard over f. When gw is non-nil the shard
+// shares f with other shards and every cut goes through the one writer that owns
+// AppendGroup; a nil gw is a single-writer store whose flush cuts the segment
+// itself.
+func newAkiRlog(f *akifile.File, shard uint16, gw *akifile.GroupWriter) *akiRlog {
+	return &akiRlog{w: akifile.NewRecordLogWriter(f, shard), f: f, shard: shard, gw: gw}
 }
 
 // stage frames row into the pending batch and returns its index in stage order,
@@ -70,18 +84,58 @@ func (l *akiRlog) readStaged(idx int) (akifile.RecordRow, error) { return l.w.Re
 // sequence untouched, so shard_seq advances only on a real cut. The flushed record
 // bytes join the total the moment they land; the byte figure is the pending
 // payload measured before the cut resets it.
+//
+// The cut takes one of two paths by whether this shard shares its file. A
+// single-writer store (gw nil) calls Flush, which owns AppendGroup itself. A
+// shard-shared store seals its batch and submits it to the one group-commit writer
+// that owns AppendGroup, then waits for the writer to lay the segment down and hand
+// back the resolved addresses. Either way the addresses are absolute before flush
+// returns, so the caller publishes the same way regardless of path.
 func (l *akiRlog) flush() ([]uint64, error) {
 	if l.w.Staged() == 0 {
 		return nil, nil
 	}
 	bytes := uint64(l.w.PendingBytes())
 	l.seq++
-	addrs, err := l.w.Flush(l.seq)
+	var addrs []uint64
+	var err error
+	if l.gw == nil {
+		addrs, err = l.w.Flush(l.seq)
+	} else {
+		payload, frames := l.w.Seal()
+		addrs, err = l.submitWait(payload, frames)
+	}
 	if err != nil {
 		return nil, err
 	}
 	l.total += bytes
 	return addrs, nil
+}
+
+// rlogResult carries the group writer's completion back to the flushing owner: the
+// resolved per-record addresses and the group's commit error, one or the other.
+type rlogResult struct {
+	addrs []uint64
+	err   error
+}
+
+// submitWait hands the sealed batch to the shared group-commit writer and blocks the
+// owner until the writer commits the group and posts the addresses back. The wait is
+// the ack barrier the command already pays: the writer resolves an address only after
+// the group's fsync, so a flush that returns has bytes a crash survives, the
+// publish-after-durable edge (doc 07 section 8, step 6 before step 7). A full ring
+// returns a false Submit, so the owner spins with a scheduler yield until the writer
+// drains a slot rather than blocking on a channel the writer never selects on; this
+// is the single-writer backpressure the falsifier keys on, surfaced as the owner's
+// own stall rather than a dropped record.
+func (l *akiRlog) submitWait(payload []byte, frames []akifile.RecordFrame) ([]uint64, error) {
+	ch := make(chan rlogResult, 1)
+	done := func(addrs []uint64, err error) { ch <- rlogResult{addrs, err} }
+	for !l.gw.Submit(l.shard, l.seq, payload, frames, done) {
+		runtime.Gosched()
+	}
+	r := <-ch
+	return r.addrs, r.err
 }
 
 // seqHigh reports the highest segment sequence this shard has cut, the cross-check

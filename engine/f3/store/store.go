@@ -227,6 +227,14 @@ type Options struct {
 	// through it.
 	AkiValueLog *akifile.File
 	Shard       uint16
+
+	// AkiGroupWriter, when set alongside AkiValueLog, is the one group-commit
+	// writer that owns the shared file's AppendGroup. Every shard sharing the file
+	// routes its record-log cuts through it so no two shards race the append
+	// cursor. Leave it nil for a single-writer store (a test or a one-shard file):
+	// the record log then cuts its segment directly. It has no effect without
+	// AkiValueLog.
+	AkiGroupWriter *akifile.GroupWriter
 }
 
 // New builds a store whose arena holds arenaBytes, tiled into segments of
@@ -289,7 +297,7 @@ func Open(o Options) (*Store, error) {
 		s.akivlog = newAkiVlog(o.AkiValueLog, o.Shard)
 		s.akispill = newAkiSpill(s.akivlog)
 		s.akicold = newAkiCold(o.AkiValueLog, o.Shard)
-		s.akirlog = newAkiRlog(o.AkiValueLog, o.Shard)
+		s.akirlog = newAkiRlog(o.AkiValueLog, o.Shard, o.AkiGroupWriter)
 		// The .aki value region is a spill target like the scratch log, so a
 		// resident cap gates admission to it the same way: past the cap a
 		// separated or chunked value's bytes go to the shared region instead of
