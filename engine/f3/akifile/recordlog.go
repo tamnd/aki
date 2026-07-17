@@ -6,7 +6,11 @@ import "encoding/binary"
 // segment payload is a run of framed records, each `uvarint body_len, body,
 // crc32c(body)`, and the body is the persisted form of one store record: the
 // fields recovery's replay reads to set or clear an index entry (section 6 step
-// 7). Until this codec, the store persisted only value bytes and cold frames;
+// 7). The body is the fixed header, then the value-or-pointer doc 07 section 6
+// frames: an inline row (RecFlagInline) carries its value bytes so a small
+// arena-resident string survives a crash the volatile word could not, and a
+// pointer row carries none because its word already names the durable value log.
+// Until this codec, the store persisted only value bytes and cold frames;
 // the index, the record rows, and the per-shard sequence lived in memory and
 // rebuilt from nothing because there was nothing to rebuild from. This is the
 // first byte of the record log itself.
@@ -26,9 +30,11 @@ import "encoding/binary"
 // writer below, which cuts the segment. The store-side adapter that stages a
 // command's record row here is a later slice.
 
-// recRowHdr is the fixed header before a record's key: flags u32, value_word
-// u64, value_len u32, expire_at u64. The key follows and its length is the
-// frame body length minus this header.
+// recRowHdr is the fixed header before a record's variable tail: flags u32,
+// value_word u64, value_len u32, expire_at u64. The tail is the value bytes
+// (only when RecFlagInline is set, value_len of them) followed by the key, so
+// the key length is the frame body length minus this header and any inline
+// value.
 const recRowHdr = 24
 
 // RecordRow is the decoded form of one persisted record. The value word is the
@@ -38,11 +44,20 @@ const recRowHdr = 24
 // for it inline). expire_at is the inline TTL, zero for none. A delete is a
 // tombstone row, RecFlagTombstone set, so replay clears the index entry the
 // same way it sets one.
+//
+// Value carries the record's bytes when RecFlagInline is set, the value-or-pointer
+// choice doc 07 section 6 frames: a small embedded string lives in the arena, so
+// its word is a volatile arena offset a crash invalidates, and the only durable
+// copy of its bytes is the one the frame carries here. A separated or chunked
+// record leaves Value nil and its word is a durable value-log pointer replay
+// derefs instead. value_len is the inline length, so a walk slices Value without a
+// second length field.
 type RecordRow struct {
 	Flags     uint32
 	ValueWord uint64
 	ValueLen  uint32
 	ExpireAt  uint64
+	Value     []byte // inline value bytes when RecFlagInline; aliases the payload
 	Key       []byte // aliases the payload it was parsed from
 }
 
@@ -50,6 +65,12 @@ type RecordRow struct {
 // DEL or an expiry replays as an index clear. Bit zero of the row flags; the
 // higher bits are reserved for the store's band and tier tags.
 const RecFlagTombstone uint32 = 1 << 0
+
+// RecFlagInline marks a row whose value bytes ride the frame, value_len of them
+// between the header and the key, because the record's word is a volatile arena
+// offset no crash survives. Replay reinserts those bytes rather than dereferencing
+// the word. Bit one of the row flags.
+const RecFlagInline uint32 = 1 << 1
 
 // RecordFrame locates one framed record inside a `log` payload: the frame start
 // where the varint length sits and where a walk anchors, the body start where a
@@ -65,14 +86,24 @@ type RecordFrame struct {
 }
 
 // AppendRecordFrame frames row onto a `log` payload: the uvarint body length,
-// the fixed header, the key, then the CRC32C of the body. It returns the grown
-// payload and the frame's location; the caller builds the absolute address by
-// adding the segment's payload base to FrameOff. Consecutive appends are
-// contiguous, so one payload packs many records and the next frame begins where
-// this one ends.
+// the fixed header, the inline value bytes when RecFlagInline is set, the key,
+// then the CRC32C of the body. It returns the grown payload and the frame's
+// location; the caller builds the absolute address by adding the segment's
+// payload base to FrameOff. Consecutive appends are contiguous, so one payload
+// packs many records and the next frame begins where this one ends.
+//
+// An inline row writes value_len value bytes between the header and the key, so
+// the value's durable copy rides the frame; a pointer row writes no value bytes
+// and its word is the durable locator. The header's value_len is authoritative
+// for the inline slice, so the caller must set it to len(Value) on an inline row.
 func AppendRecordFrame(dst []byte, row RecordRow) ([]byte, RecordFrame) {
 	frameOff := uint64(len(dst))
-	bodyLen := recRowHdr + len(row.Key)
+	inline := row.Flags&RecFlagInline != 0
+	valLen := 0
+	if inline {
+		valLen = len(row.Value)
+	}
+	bodyLen := recRowHdr + valLen + len(row.Key)
 	var hdr [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(hdr[:], uint64(bodyLen))
 	dst = append(dst, hdr[:n]...)
@@ -83,6 +114,9 @@ func AppendRecordFrame(dst []byte, row RecordRow) ([]byte, RecordFrame) {
 	le.PutUint32(fixed[12:16], row.ValueLen)
 	le.PutUint64(fixed[16:24], row.ExpireAt)
 	dst = append(dst, fixed[:]...)
+	if inline {
+		dst = append(dst, row.Value...)
+	}
 	dst = append(dst, row.Key...)
 	body := dst[bodyOff : bodyOff+uint64(bodyLen)]
 	crc := crc32c(body)
@@ -97,21 +131,33 @@ func AppendRecordFrame(dst []byte, row RecordRow) ([]byte, RecordFrame) {
 	}
 }
 
-// ParseRecordBody decodes a record body: the fixed header then the key, which is
-// the remaining bytes. It does not verify a CRC; the frame walk and the point
-// read own that, exactly where they read the trailing CRC bytes. The returned
-// Key aliases body.
+// ParseRecordBody decodes a record body: the fixed header, then the inline value
+// bytes when RecFlagInline is set (value_len of them), then the key as the
+// remaining bytes. It does not verify a CRC; the frame walk and the point read
+// own that, exactly where they read the trailing CRC bytes. The returned Value
+// and Key alias body. A value_len that outruns the body is a torn or corrupt
+// frame, returned as ErrLength.
 func ParseRecordBody(body []byte) (RecordRow, error) {
 	if len(body) < recRowHdr {
 		return RecordRow{}, ErrShort
 	}
-	return RecordRow{
+	row := RecordRow{
 		Flags:     le.Uint32(body[0:4]),
 		ValueWord: le.Uint64(body[4:12]),
 		ValueLen:  le.Uint32(body[12:16]),
 		ExpireAt:  le.Uint64(body[16:24]),
-		Key:       body[recRowHdr:],
-	}, nil
+	}
+	tail := body[recRowHdr:]
+	if row.Flags&RecFlagInline != 0 {
+		if uint64(row.ValueLen) > uint64(len(tail)) {
+			return RecordRow{}, ErrLength
+		}
+		row.Value = tail[:row.ValueLen]
+		row.Key = tail[row.ValueLen:]
+	} else {
+		row.Key = tail
+	}
+	return row, nil
 }
 
 // NextRecordFrame parses the frame at off in a `log` payload for the recovery

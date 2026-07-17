@@ -87,8 +87,11 @@ func (f *File) ReadRecordAt(addr uint64) (RecordRow, error) {
 	if err != nil {
 		return RecordRow{}, err
 	}
-	// The body buffer is this call's own, but the key aliases it; hand back a copy
-	// so the caller may hold the row past the buffer.
+	// The body buffer is this call's own, but the key and any inline value alias
+	// it; hand back copies so the caller may hold the row past the buffer.
 	row.Key = append([]byte(nil), row.Key...)
+	if row.Value != nil {
+		row.Value = append([]byte(nil), row.Value...)
+	}
 	return row, nil
 }

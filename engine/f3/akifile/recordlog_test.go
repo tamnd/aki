@@ -20,7 +20,19 @@ func sampleRow(key string, word uint64) RecordRow {
 
 func rowsEqual(a, b RecordRow) bool {
 	return a.Flags == b.Flags && a.ValueWord == b.ValueWord && a.ValueLen == b.ValueLen &&
-		a.ExpireAt == b.ExpireAt && bytes.Equal(a.Key, b.Key)
+		a.ExpireAt == b.ExpireAt && bytes.Equal(a.Value, b.Value) && bytes.Equal(a.Key, b.Key)
+}
+
+// inlineRow builds a row carrying its value bytes inline, the small-string form a
+// crash can only recover from the frame. value_len must equal len(value), the
+// contract AppendRecordFrame relies on.
+func inlineRow(key, value string) RecordRow {
+	return RecordRow{
+		Flags:    RecFlagInline,
+		ValueLen: uint32(len(value)),
+		Value:    []byte(value),
+		Key:      []byte(key),
+	}
 }
 
 // TestRecordFrameRoundTrip frames a row and reads it back both ways: ParseRecordBody
@@ -68,6 +80,82 @@ func TestRecordFrameRoundTrip(t *testing.T) {
 	}
 	if cur != uint64(len(payload)) {
 		t.Fatalf("walk ended at %d, want payload end %d", cur, len(payload))
+	}
+}
+
+// TestRecordFrameInlineValueRoundTrip frames rows that carry their value bytes
+// inline, mixed with a pointer row, and reads them back three ways: the body-span
+// decode, the linear walk, and the file point read. The inline bytes and the key
+// must both survive, and a pointer row in the same batch must still parse with a
+// nil value, so the flag alone decides whether bytes follow.
+func TestRecordFrameInlineValueRoundTrip(t *testing.T) {
+	rows := []RecordRow{
+		inlineRow("small", "hello world"),
+		inlineRow("empty-val", ""),                   // an inline zero-length value is legal
+		sampleRow("pointer", 1<<63|7),                // a pointer row, no inline bytes
+		inlineRow("k", "a value with the key after"), // value longer than the key
+		{Flags: RecFlagInline | RecFlagTombstone, ValueLen: 2, Value: []byte("xy"), Key: []byte("both")},
+	}
+	var payload []byte
+	frames := make([]RecordFrame, len(rows))
+	for i, r := range rows {
+		payload, frames[i] = AppendRecordFrame(payload, r)
+	}
+
+	for i, fr := range frames {
+		body := payload[fr.BodyOff : fr.BodyOff+uint64(fr.BodyLen)]
+		got, err := ParseRecordBody(body)
+		if err != nil {
+			t.Fatalf("parse body %d: %v", i, err)
+		}
+		if !rowsEqual(got, rows[i]) {
+			t.Fatalf("body %d = %+v, want %+v", i, got, rows[i])
+		}
+	}
+
+	cur := uint64(0)
+	for i := range rows {
+		_, got, next, err := NextRecordFrame(payload, cur)
+		if err != nil {
+			t.Fatalf("next frame %d: %v", i, err)
+		}
+		if !rowsEqual(got, rows[i]) {
+			t.Fatalf("walk %d = %+v, want %+v", i, got, rows[i])
+		}
+		cur = next
+	}
+
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	w := NewRecordLogWriter(f, 1)
+	for _, r := range rows {
+		w.Stage(r)
+	}
+	addrs, err := w.Flush(1)
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	for i, addr := range addrs {
+		got, err := f.ReadRecordAt(addr)
+		if err != nil {
+			t.Fatalf("read record %d: %v", i, err)
+		}
+		if !rowsEqual(got, rows[i]) {
+			t.Fatalf("point read %d = %+v, want %+v", i, got, rows[i])
+		}
+	}
+}
+
+// TestParseRecordBodyRejectsInlineOverrun sets RecFlagInline with a value_len past
+// the body and confirms the parse refuses it as ErrLength rather than slicing out
+// of range, the torn-frame guard on the inline path.
+func TestParseRecordBodyRejectsInlineOverrun(t *testing.T) {
+	// A well-formed inline frame, then rewrite its value_len to outrun the body.
+	payload, fr := AppendRecordFrame(nil, inlineRow("k", "v"))
+	body := payload[fr.BodyOff : fr.BodyOff+uint64(fr.BodyLen)]
+	le.PutUint32(body[12:16], 1<<20) // value_len far past the body
+	if _, err := ParseRecordBody(body); err != ErrLength {
+		t.Fatalf("inline overrun err = %v, want ErrLength", err)
 	}
 }
 
