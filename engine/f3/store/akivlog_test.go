@@ -196,6 +196,13 @@ func TestOpenWiresAkiValueLog(t *testing.T) {
 	if s.akivlog.shard != 2 {
 		t.Fatalf("adapter shard = %d, want 2", s.akivlog.shard)
 	}
+	// The spill accumulator is built over the same adapter, ready for the flip.
+	if s.akispill == nil {
+		t.Fatal("Open with AkiValueLog left the spill accumulator nil")
+	}
+	if s.akispill.v != s.akivlog {
+		t.Fatal("spill accumulator wraps a different adapter than akivlog")
+	}
 	// The wired adapter drives a real cut against the shared file.
 	s.akivlog.stage([]byte("wired"))
 	ptrs, err := s.akivlog.flush()
@@ -221,5 +228,8 @@ func TestOpenWiresAkiValueLog(t *testing.T) {
 	}
 	if plain.akivlog != nil {
 		t.Fatal("plain Open built an akivlog adapter")
+	}
+	if plain.akispill != nil {
+		t.Fatal("plain Open built a spill accumulator")
 	}
 }
