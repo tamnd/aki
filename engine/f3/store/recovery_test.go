@@ -121,6 +121,81 @@ func TestReplayRebuildsIndex(t *testing.T) {
 	}
 }
 
+// TestReplayIsShardScoped confirms a store replays only its own shard's records:
+// two shards write distinct keys into the one shared file, then a fresh store on
+// each shard replays and sees its own key but not the other shard's, so a
+// multi-shard file recovers into disjoint per-shard indexes.
+func TestReplayIsShardScoped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shards.aki")
+	f, err := akifile.Create(path, akifile.CreateOptions{
+		ShardCount:   4,
+		SepThreshold: 64,
+		Sync:         akifile.SyncNo,
+	})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	openShard := func(f *akifile.File, shard uint16) *Store {
+		s, err := Open(Options{
+			ArenaBytes:  4 << 20,
+			SegBytes:    1 << 20,
+			AkiValueLog: f,
+			Shard:       shard,
+		})
+		if err != nil {
+			t.Fatalf("open shard %d: %v", shard, err)
+		}
+		return s
+	}
+
+	// Two shards share the one file; each logs a key the other never sees.
+	s1 := openShard(f, 1)
+	s2 := openShard(f, 2)
+	if err := s1.SetString([]byte("one"), []byte("from-1"), 0, 0, false); err != nil {
+		t.Fatalf("shard 1 set: %v", err)
+	}
+	if err := s2.SetString([]byte("two"), []byte("from-2"), 0, 0, false); err != nil {
+		t.Fatalf("shard 2 set: %v", err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("close shard 1: %v", err)
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatalf("close shard 2: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	r1 := openShard(f2, 1)
+	r2 := openShard(f2, 2)
+	t.Cleanup(func() { _ = r1.Close(); _ = r2.Close(); _ = f2.Close() })
+	if err := r1.ReplayRecords(0); err != nil {
+		t.Fatalf("replay shard 1: %v", err)
+	}
+	if err := r2.ReplayRecords(0); err != nil {
+		t.Fatalf("replay shard 2: %v", err)
+	}
+
+	// Each rebuilt shard holds its own key and not the other's.
+	if got, ok := r1.GetString([]byte("one"), 0, nil); !ok || string(got) != "from-1" {
+		t.Fatalf("shard 1 read one = (%q, %v), want (from-1, true)", got, ok)
+	}
+	if _, ok := r1.GetString([]byte("two"), 0, nil); ok {
+		t.Fatal("shard 1 replayed shard 2's key")
+	}
+	if got, ok := r2.GetString([]byte("two"), 0, nil); !ok || string(got) != "from-2" {
+		t.Fatalf("shard 2 read two = (%q, %v), want (from-2, true)", got, ok)
+	}
+	if _, ok := r2.GetString([]byte("one"), 0, nil); ok {
+		t.Fatal("shard 2 replayed shard 1's key")
+	}
+}
+
 // TestReplayNoHandleIsNoop confirms a store with no record log replays nothing and
 // reports no error, so the volatile-only configuration pays nothing for recovery.
 func TestReplayNoHandleIsNoop(t *testing.T) {

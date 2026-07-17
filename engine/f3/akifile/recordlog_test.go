@@ -320,6 +320,51 @@ func TestWalkRecordsSkipsOtherKinds(t *testing.T) {
 	}
 }
 
+// TestWalkShardRecordsFiltersByShard interleaves two shards' record batches in the
+// one append space and confirms a shard-scoped walk visits only its own shard's
+// records, the filter a per-shard recovery replays under.
+func TestWalkShardRecordsFiltersByShard(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	w1 := NewRecordLogWriter(f, 1)
+	w2 := NewRecordLogWriter(f, 2)
+
+	// Shard 1, then shard 2, then shard 1 again, so the two shards' segments are
+	// interleaved in append order and neither is a contiguous run.
+	w1.Stage(sampleRow("one-a", 1))
+	if _, err := w1.Flush(1); err != nil {
+		t.Fatalf("flush shard 1 first: %v", err)
+	}
+	w2.Stage(sampleRow("two-a", 1))
+	if _, err := w2.Flush(1); err != nil {
+		t.Fatalf("flush shard 2: %v", err)
+	}
+	w1.Stage(sampleRow("one-b", 2))
+	if _, err := w1.Flush(2); err != nil {
+		t.Fatalf("flush shard 1 second: %v", err)
+	}
+
+	var got1, got2 []string
+	if err := f.WalkShardRecords(1, PageSize, func(_ uint64, row RecordRow) error {
+		got1 = append(got1, string(row.Key))
+		return nil
+	}); err != nil {
+		t.Fatalf("walk shard 1: %v", err)
+	}
+	if err := f.WalkShardRecords(2, PageSize, func(_ uint64, row RecordRow) error {
+		got2 = append(got2, string(row.Key))
+		return nil
+	}); err != nil {
+		t.Fatalf("walk shard 2: %v", err)
+	}
+	if len(got1) != 2 || got1[0] != "one-a" || got1[1] != "one-b" {
+		t.Fatalf("shard 1 walk = %v, want [one-a one-b]", got1)
+	}
+	if len(got2) != 1 || got2[0] != "two-a" {
+		t.Fatalf("shard 2 walk = %v, want [two-a]", got2)
+	}
+}
+
 // TestWalkRecordsRespectsFrom starts the walk past the first batch and confirms
 // only the records at or after `from` are visited, the checkpoint-bounded replay
 // recovery runs.

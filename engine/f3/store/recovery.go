@@ -25,9 +25,11 @@ import (
 // logTombstone enforces, so the walk does not double the log or mis-count its dead
 // bytes.
 
-// ReplayRecords rebuilds this store's index by walking the shared .aki record log
+// ReplayRecords rebuilds this store's index by walking this shard's record log
 // from the start of the append space and reapplying every framed record in append
-// order. An inline row's value bytes ride the frame, so replay reinserts them
+// order. The append space interleaves every shard's segments, so the walk skips
+// the other shards and replays only the records this store's shard cut. An inline
+// row's value bytes ride the frame, so replay reinserts them
 // directly; a separated row's bytes live in the durable value log, so replay derefs
 // its word and reads them back; a tombstone clears its key. now is the wall clock
 // the reapplied writes stamp their lazy-expiry checks against, the same value a
@@ -46,7 +48,7 @@ func (s *Store) ReplayRecords(now int64) error {
 	defer func() { s.replaying = false }()
 
 	var vbuf []byte
-	return s.akirlog.f.WalkRecords(akifile.PageSize, func(addr uint64, row akifile.RecordRow) error {
+	return s.akirlog.walkShard(func(addr uint64, row akifile.RecordRow) error {
 		switch {
 		case row.Flags&akifile.RecFlagTombstone != 0:
 			s.Del(row.Key, now)
