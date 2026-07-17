@@ -749,10 +749,12 @@ func TestReplayNeutralPageFrames(t *testing.T) {
 
 // The rollback discipline (doc 09 section 3): a zset root claims
 // RollbackRef, never elides, frames a rootkey mapping ahead of
-// itself, and at replay the plane's put frames past its last root
-// frame drop whole while deletes still apply. Handcrafted plane
-// images again; the end-to-end matrix over the real zset operators
-// lands with the dual-side mutation slice.
+// itself, and at replay every plane frame past its last root frame
+// drops whole, puts and deletes alike, because the drain queue's
+// deferred-root refile can float a delete a batch ahead of its
+// commanding root. Handcrafted plane images here; the end-to-end
+// matrix over the real zset operators rides the dual-side mutation
+// slice.
 
 // zRoot builds a segmented zset root payload: the doc 06 header under
 // the doc 09 sub byte. RollbackRef reads only the sub byte and the
@@ -869,39 +871,79 @@ func TestReplayRollsBackZsetPutsPastRoot(t *testing.T) {
 	}
 }
 
-func TestZsetDeletePastRootApplies(t *testing.T) {
-	// Run deaths ride behind the root frame that stopped referencing
-	// them (root first, then the record), so a delete past the last
-	// root frame always had its commanding root land and must apply.
+func TestZsetDeletePastRootDrops(t *testing.T) {
+	// A record delete past the last root frame can belong to the torn
+	// command: the deferred-root refile keeps the root at the queue
+	// tail, so a co-command delete can drain a batch ahead of it.
+	// Applying such a delete would dangle a reference the durable
+	// root still holds, so rollback settle drops deletes of every
+	// plane record kind alongside the puts.
 	r := newStoreRig(t)
 	const rooth = 0xb7b7
-	seg := w3SegKey(t, rooth, 1)
-	run2 := zRunKey(t, rooth, 2)
+	seg2 := w3SegKey(t, rooth, 2)
+	run3 := zRunKey(t, rooth, 3)
+	pkey := sqlo1.Subkey{Rooth: rooth, Kind: sqlo1.SubkindFence, Segid: 9}.Encode()
+	r.apply(t,
+		segOp(w3SegKey(t, rooth, 1), w3Seg(10, 0)),
+		segOp(seg2, w3Seg(4, 0)),
+		segOp(run3, []byte("run3-live")),
+		sqlo1.Op{Rec: sqlo1.Record{Key: pkey, Value: []byte("page-v1"), Fence: true, Gen: 1}},
+		rootOp("z", zRoot(rooth, 10, 1, 2), false),
+	)
+	// The torn command's deletes drain ahead of its root frame and
+	// the crash takes the root's batch: a member segment merge, a
+	// score run death, and a fence page death, none of which may
+	// apply.
+	r.apply(t, delOp(string(seg2)), delOp(string(run3)), delOp(string(pkey)))
+	r.reopen(t)
+	for _, k := range [][]byte{seg2, run3, pkey} {
+		rec, err := r.s.lookup(k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec == nil {
+			t.Fatalf("the un-rooted delete of %x applied", k)
+		}
+	}
+	if got := r.rootCount(t, "z"); got != 10 {
+		t.Fatalf("root count %d, want 10", got)
+	}
+	// Repeat recoveries settle the same way.
+	r.reopen(t)
+	rec, err := r.s.lookup(run3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec == nil || !bytes.Equal(rec.Value, []byte("run3-live")) {
+		t.Fatal("second recovery dropped the rooted run")
+	}
+}
+
+func TestZsetDeleteBeforeRootApplies(t *testing.T) {
+	// The mirror door: a delete at or before the plane's last root
+	// frame is committed work and survives the settle untouched.
+	r := newStoreRig(t)
+	const rooth = 0xb8b8
 	run3 := zRunKey(t, rooth, 3)
 	r.apply(t,
-		segOp(seg, w3Seg(10, 0)),
-		segOp(run2, []byte("run2-v1")),
+		segOp(w3SegKey(t, rooth, 1), w3Seg(10, 0)),
 		segOp(run3, []byte("run3-dying")),
 		rootOp("z", zRoot(rooth, 10, 1), false),
 	)
-	r.apply(t, delOp(string(run3)))
+	r.apply(t,
+		delOp(string(run3)),
+		rootOp("z", zRoot(rooth, 9, 1), false),
+	)
 	r.reopen(t)
 	dead, err := r.s.lookup(run3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if dead != nil {
-		t.Fatal("the acknowledged run delete was dropped")
+		t.Fatal("the rooted run delete was dropped")
 	}
-	rec, err := r.s.lookup(run2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rec == nil || !bytes.Equal(rec.Value, []byte("run2-v1")) {
-		t.Fatal("the fenced run did not survive the delete's replay")
-	}
-	if got := r.rootCount(t, "z"); got != 10 {
-		t.Fatalf("root count %d, want 10", got)
+	if got := r.rootCount(t, "z"); got != 9 {
+		t.Fatalf("root count %d, want the second root's 9", got)
 	}
 }
 

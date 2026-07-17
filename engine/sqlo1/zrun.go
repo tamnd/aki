@@ -310,17 +310,28 @@ func (z *ZSet) zrunRoute(ctx context.Context, s uint64, member []byte) (int, err
 }
 
 // zrunAdd inserts (score, member) into the score side, reporting
-// whether the pair was absent. Slice 4's ZADD pairs this with the
-// member write in one frame group; alone it maintains only the score
-// family.
+// whether the pair was absent: zrunAddSeg behind its own state read,
+// the standalone shape the score-side tests drive.
 func (z *ZSet) zrunAdd(ctx context.Context, key []byte, score float64, member []byte) (bool, error) {
 	expMs, err := z.zscoreState(ctx, key)
 	if err != nil {
 		return false, err
 	}
+	created, err := z.zrunAddSeg(ctx, key, zScoreSortable(score), member)
+	if err != nil {
+		return false, err
+	}
+	return created, z.h.restamp(ctx, key, expMs)
+}
+
+// zrunAddSeg inserts a sortable (score, member) pair with the root
+// and fence already loaded (stateOf plus zscoreState, or the dual
+// command's in-memory state). ZAdd pairs it with the member write in
+// one frame group under the deferred root; standalone it maintains
+// only the score family.
+func (z *ZSet) zrunAddSeg(ctx context.Context, key []byte, s uint64, member []byte) (bool, error) {
 	h := z.h
 	r := &h.segRoot
-	s := zScoreSortable(score)
 
 	if len(z.zfence) == 0 {
 		if r.nextSegid > hashFenceSegidMax {
@@ -338,10 +349,7 @@ func (z *ZSet) zrunAdd(ctx context.Context, key []byte, score float64, member []
 		}
 		r.nextSegid++
 		z.zfence = append(z.zfence[:0], zFenceEnt{segid: segid, count: 1})
-		if err := z.writeZRoot(ctx, key); err != nil {
-			return false, err
-		}
-		return true, h.restamp(ctx, key, expMs)
+		return true, z.writeZRoot(ctx, key)
 	}
 
 	ri, err := z.zrunRoute(ctx, s, member)
@@ -378,19 +386,13 @@ func (z *ZSet) zrunAdd(ctx context.Context, key []byte, score float64, member []
 	}
 
 	if len(z.zrbuf) > zRunMax && n >= 2 {
-		if err := z.zrunSplit(ctx, key, ri, n); err != nil {
-			return false, err
-		}
-		return true, h.restamp(ctx, key, expMs)
+		return true, z.zrunSplit(ctx, key, ri, n)
 	}
 	if err := z.writeRun(ctx, e.segid, z.zrbuf); err != nil {
 		return false, err
 	}
 	e.count++
-	if err := z.writeZRoot(ctx, key); err != nil {
-		return false, err
-	}
-	return true, h.restamp(ctx, key, expMs)
+	return true, z.writeZRoot(ctx, key)
 }
 
 // zrunSplit cuts the oversize post-insert image in z.zrbuf at its
@@ -453,10 +455,19 @@ func (z *ZSet) zrunDel(ctx context.Context, key []byte, score float64, member []
 	if err != nil {
 		return false, err
 	}
+	found, err := z.zrunDelSeg(ctx, key, zScoreSortable(score), member)
+	if err != nil || !found {
+		return false, err
+	}
+	return true, z.h.restamp(ctx, key, expMs)
+}
+
+// zrunDelSeg removes a sortable (score, member) pair with the root
+// and fence already loaded, zrunAddSeg's mirror.
+func (z *ZSet) zrunDelSeg(ctx context.Context, key []byte, s uint64, member []byte) (bool, error) {
 	if len(z.zfence) == 0 {
 		return false, nil
 	}
-	s := zScoreSortable(score)
 	ri, err := z.zrunRoute(ctx, s, member)
 	if err != nil {
 		return false, err
@@ -490,10 +501,7 @@ func (z *ZSet) zrunDel(ctx context.Context, key []byte, score float64, member []
 	if n == 0 {
 		if ri == 0 {
 			e.count = 0
-			if err := z.writeZRoot(ctx, key); err != nil {
-				return false, err
-			}
-			return true, z.h.restamp(ctx, key, expMs)
+			return true, z.writeZRoot(ctx, key)
 		}
 		deadSegid := e.segid
 		z.zfence = append(f[:ri], f[ri+1:]...)
@@ -504,24 +512,18 @@ func (z *ZSet) zrunDel(ctx context.Context, key []byte, score float64, member []
 		if _, err := z.h.t.Del(ctx, z.zkbuf[:]); err != nil {
 			return false, err
 		}
-		return true, z.h.restamp(ctx, key, expMs)
+		return true, nil
 	}
 
 	merged, err := z.tryMergeRun(ctx, key, ri, n)
-	if err != nil {
-		return false, err
-	}
-	if merged {
-		return true, z.h.restamp(ctx, key, expMs)
+	if err != nil || merged {
+		return merged, err
 	}
 	if err := z.writeRun(ctx, e.segid, z.zrbuf); err != nil {
 		return false, err
 	}
 	e.count--
-	if err := z.writeZRoot(ctx, key); err != nil {
-		return false, err
-	}
-	return true, z.h.restamp(ctx, key, expMs)
+	return true, z.writeZRoot(ctx, key)
 }
 
 // tryMergeRun folds the shrunken run at ri (post-image in z.zrbuf, n

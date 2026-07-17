@@ -50,6 +50,11 @@ type HotTable struct {
 	dirtyHead  int
 	dirtyN     int
 	dirtyBytes int
+	// pinSlot is the one queue entry drains must skip while a dual
+	// command is mid-flight (pinRoot below); one pin at a time is the
+	// shard discipline, single owner, one command in flight.
+	pinSlot uint32
+	pinOK   bool
 	// intShadow holds the parsed int64 behind headers flagged
 	// tagIntShadow, keyed by slot: doc 05's integer fast path pays its
 	// 8 bytes only on keys that have actually seen INCR-family ops, so
@@ -120,15 +125,27 @@ func (t *HotTable) pushDirty(s uint32) {
 // with the mark cleared instead of popping, so it hands out after
 // everything queued before this moment; the loop terminates because
 // each pass either returns or clears one deferral mark, and nothing
-// sets marks while the drain scheduler runs (single-owner). The caller
-// must check the slot is still dirty: an entry goes stale when its
-// slot was drained directly or freed and reused, and a stale entry is
-// a skip, never an error.
+// sets marks while the drain scheduler runs (single-owner). The pinned
+// slot re-files with its flags intact and never hands out; when it is
+// the only entry left the pop reports empty. Termination holds because
+// between two pin sightings some other entry pops, and every non-pin
+// pop either returns or clears one deferral mark. The caller must
+// check the slot is still dirty: an entry goes stale when its slot was
+// drained directly or freed and reused, and a stale entry is a skip,
+// never an error.
 func (t *HotTable) popDirty() (uint32, bool) {
 	for t.dirtyN > 0 {
 		s := t.dirty[t.dirtyHead]
 		t.dirtyHead = (t.dirtyHead + 1) % len(t.dirty)
 		t.dirtyN--
+		if t.pinOK && s == t.pinSlot {
+			only := t.dirtyN == 0
+			t.pushDirty(s)
+			if only {
+				return 0, false
+			}
+			continue
+		}
 		hd := &t.hdrs[s]
 		if hd.queued&queuedDefer != 0 {
 			hd.queued = queuedBit
@@ -248,6 +265,28 @@ func (t *HotTable) probeEntry(key []byte) (val []byte, tag uint8, expMs int64, h
 func (t *HotTable) dirtyKey(key []byte) bool {
 	s, ok := t.lookup(maphash.Bytes(t.seed, key), key)
 	return ok && t.hdrs[s].state == stateDirty
+}
+
+// pinRoot holds key's dirty-queue entry out of drain hands until
+// unpinRoot. A dual command's mid-flight flushes (segment and run
+// splits) drain the queue while the command's root write is still
+// deferred, and the queue may hold the previous command's root image;
+// the deferral re-file would land that stale root behind the torn
+// command's fresh segment images in the same batch, and a root frame
+// is the plane's replay commit point, so it would absolve exactly the
+// partial images the rollback discipline exists to drop. Pinned, the
+// root stays queued but out of every batch the command emits, and the
+// command's closing root write re-files the fresh image for the next
+// cycle. Only a dirty slot pins; a clean root has no image to leak.
+func (t *HotTable) pinRoot(key []byte) {
+	s, ok := t.lookup(maphash.Bytes(t.seed, key), key)
+	if ok && t.hdrs[s].state == stateDirty {
+		t.pinSlot, t.pinOK = s, true
+	}
+}
+
+func (t *HotTable) unpinRoot() {
+	t.pinOK = false
 }
 
 // setExpireMs stamps the exact expiry on key's header, split into the

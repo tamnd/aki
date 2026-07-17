@@ -26,6 +26,7 @@ type Server struct {
 	s  *Str
 	h  *Hash
 	se *Set
+	z  *ZSet
 
 	mu sync.Mutex // serializes command execution against the runtime
 
@@ -50,6 +51,11 @@ type Server struct {
 
 	// ttlBuf holds one HEXPIRE-family command's per-field codes.
 	ttlBuf []int64
+
+	// zscores holds one ZADD command's parsed scores: all of them
+	// parse before any write, so a bad float later in the list cannot
+	// leave a half-applied command.
+	zscores []float64
 }
 
 // splitPairs fills mkeys and mvals from an even-length key-value
@@ -83,7 +89,11 @@ func NewServer(st Store) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	srv.t, srv.s, srv.h, srv.se = t, str, hash, set
+	zset, err := NewZSet(t, HashConfig{})
+	if err != nil {
+		return nil, err
+	}
+	srv.t, srv.s, srv.h, srv.se, srv.z = t, str, hash, set, zset
 	return srv, nil
 }
 
@@ -880,6 +890,37 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.setStoreCmd(ctx, reply, args, cmd, s.se.SUnionStore)
 	case "SDIFFSTORE":
 		return s.setStoreCmd(ctx, reply, args, cmd, s.se.SDiffStore)
+	case "ZADD":
+		return s.zaddCmd(ctx, reply, args)
+	case "ZINCRBY":
+		if len(args) != 4 {
+			return arityErr(reply, cmd)
+		}
+		incr, err := strconv.ParseFloat(string(args[2]), 64)
+		if err != nil || math.IsNaN(incr) {
+			return AppendError(reply, "ERR value is not a valid float")
+		}
+		v, err := s.z.ZIncrBy(ctx, args[1], incr, args[3])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		var sb [32]byte
+		return AppendBulk(reply, appendScore(sb[:0], v))
+	case "ZREM":
+		if len(args) < 3 {
+			return arityErr(reply, cmd)
+		}
+		n := int64(0)
+		for _, m := range args[2:] {
+			removed, err := s.z.ZRem(ctx, args[1], m)
+			if err != nil {
+				return storeErr(reply, err)
+			}
+			if removed {
+				n++
+			}
+		}
+		return AppendInt(reply, n)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":
@@ -903,6 +944,8 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 				return AppendSimple(reply, "hash")
 			case TagSet:
 				return AppendSimple(reply, "set")
+			case TagZset:
+				return AppendSimple(reply, "zset")
 			}
 		}
 		return AppendSimple(reply, "string")
@@ -934,6 +977,15 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 					return AppendBulk(reply, []byte(enc))
 				case TagSet:
 					enc, ok, err := s.se.Encoding(ctx, args[2])
+					if err != nil {
+						return storeErr(reply, err)
+					}
+					if !ok {
+						return AppendNullBulk(reply)
+					}
+					return AppendBulk(reply, []byte(enc))
+				case TagZset:
+					enc, ok, err := s.z.Encoding(ctx, args[2])
 					if err != nil {
 						return storeErr(reply, err)
 					}
@@ -1016,6 +1068,100 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		}
 	}
 	return AppendError(reply, fmt.Sprintf("ERR unknown command '%s'", args[0]))
+}
+
+// appendScore formats a zset score the way Redis replies one,
+// d2string's shape: integral values inside the int64 span print as
+// integers, everything else as the shortest round-trip float, and the
+// infinities as inf and -inf. The sortable codec folds -0 into +0, so
+// a stored score never prints the negative zero.
+func appendScore(dst []byte, f float64) []byte {
+	switch {
+	case math.IsInf(f, 1):
+		return append(dst, "inf"...)
+	case math.IsInf(f, -1):
+		return append(dst, "-inf"...)
+	case f == math.Trunc(f) && f >= -9.223372036854776e18 && f < 9.223372036854776e18:
+		return strconv.AppendInt(dst, int64(f), 10)
+	}
+	return strconv.AppendFloat(dst, f, 'g', -1, 64)
+}
+
+// zaddCmd is ZADD with the full option surface: NX, XX, GT, LT, CH,
+// INCR. CH swaps the reply from members created to members touched;
+// INCR turns the one allowed pair into ZINCRBY with a nil reply when
+// a condition flag vetoes the write.
+func (s *Server) zaddCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 4 {
+		return arityErr(reply, "ZADD")
+	}
+	var f ZAddFlags
+	ch := false
+	i := 2
+flags:
+	for ; i < len(args); i++ {
+		switch strings.ToUpper(string(args[i])) {
+		case "NX":
+			f.NX = true
+		case "XX":
+			f.XX = true
+		case "GT":
+			f.GT = true
+		case "LT":
+			f.LT = true
+		case "CH":
+			ch = true
+		case "INCR":
+			f.Incr = true
+		default:
+			break flags
+		}
+	}
+	if f.NX && f.XX {
+		return AppendError(reply, "ERR XX and NX options at the same time are not compatible")
+	}
+	if (f.GT && f.NX) || (f.LT && f.NX) || (f.GT && f.LT) {
+		return AppendError(reply, "ERR GT, LT, and/or NX options at the same time are not compatible")
+	}
+	pairs := args[i:]
+	if len(pairs) == 0 || len(pairs)%2 != 0 {
+		return syntaxErr(reply)
+	}
+	if f.Incr && len(pairs) != 2 {
+		return AppendError(reply, "ERR INCR option supports a single increment-element pair")
+	}
+	s.zscores = s.zscores[:0]
+	for j := 0; j < len(pairs); j += 2 {
+		v, err := strconv.ParseFloat(string(pairs[j]), 64)
+		if err != nil || math.IsNaN(v) {
+			return AppendError(reply, "ERR value is not a valid float")
+		}
+		s.zscores = append(s.zscores, v)
+	}
+	added, touched := int64(0), int64(0)
+	for j := 0; j < len(pairs); j += 2 {
+		a, c, out, outOK, err := s.z.ZAdd(ctx, args[1], pairs[j+1], s.zscores[j/2], f)
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if f.Incr {
+			if !outOK {
+				return AppendNullBulk(reply)
+			}
+			var sb [32]byte
+			return AppendBulk(reply, appendScore(sb[:0], out))
+		}
+		if a {
+			added++
+			touched++
+		} else if c {
+			touched++
+		}
+	}
+	if ch {
+		return AppendInt(reply, touched)
+	}
+	return AppendInt(reply, added)
 }
 
 // setCmd is SET with the full option surface: NX, XX, GET, KEEPTTL,
