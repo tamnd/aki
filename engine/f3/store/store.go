@@ -83,6 +83,13 @@ type Store struct {
 	// materializes here. Owner goroutine only, valid until the next recordRow.
 	rlogScratch []byte
 
+	// collScratch frames a collection effect payload for the record log
+	// (collectionseam.go), reused across LogCollectionOp calls so the durable
+	// collection path holds no per-mutation allocation. Stage copies the framed
+	// bytes into its own buffer the instant it returns, so the scratch is free to
+	// reframe the next effect. Owner goroutine only.
+	collScratch []byte
+
 	// replaying suppresses the record log while recovery reapplies the log to
 	// rebuild the index (recovery.go): a replayed SET or DEL must not re-log the
 	// row it is reading back, which would double the log and mis-count its dead
