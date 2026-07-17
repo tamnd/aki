@@ -21,7 +21,7 @@ import (
 func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if eqFold(args[0], "ENCODING") && len(args) == 2 {
 		if v, ok := regs.Load(cx.St); ok {
-			if _, exists := v.(*reg).m[string(args[1])]; exists {
+			if v.(*reg).live(cx, args[1]) != nil {
 				r.Bulk([]byte("stream"))
 				return
 			}

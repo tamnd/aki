@@ -169,9 +169,26 @@ func Delete(cx *shard.Ctx, key []byte) bool {
 		return false
 	}
 	g := v.(*reg)
+	if g.live(cx, key) == nil {
+		return false
+	}
+	g.drop(key)
+	return true
+}
+
+// drop removes key's stream from the registry, the shared removal DEL and the
+// key-level TTL both take. Unlike the other collections a stream has no
+// empties-drop-me rule (an emptied stream is kept, XLEN reads 0), so this is
+// reached only by an explicit DEL or an expired deadline, never by a command that
+// merely drained the last entry. It takes a tombstoned stream off the gc worklist
+// so the maintainer never gcs a detached stream and adds its bytes back, and
+// reconciles the running resident total. Cold blocks a demoted stream left behind
+// are not reclaimed yet, the same deferral every collection carries until the
+// cold-reclamation slice threads DEL. Owner goroutine only.
+func (g *reg) drop(key []byte) {
 	s := g.m[string(key)]
 	if s == nil {
-		return false
+		return
 	}
 	if s.gcDirty {
 		g.undirty(s)
@@ -180,7 +197,24 @@ func Delete(cx *shard.Ctx, key []byte) bool {
 		g.resident -= s.acct
 	}
 	delete(g.m, string(key))
-	return true
+}
+
+// live returns the stream at key, or nil when none exists or the stream's
+// key-level deadline has passed (spec 2064/f3/16 section 2). An expired stream is
+// dropped here and treated as absent, so it is dead to this command and every later
+// one in the epoch, the lazy-expiry half of the TTL contract. An emptied stream
+// with no deadline is kept, matching Redis; only a fired deadline drops it. This is
+// the one funnel every read, mutate, create, and probe path routes through.
+func (g *reg) live(cx *shard.Ctx, key []byte) *stream {
+	s := g.m[string(key)]
+	if s == nil {
+		return nil
+	}
+	if s.expireAt != 0 && s.expireAt <= cx.NowMs {
+		g.drop(key)
+		return nil
+	}
+	return s
 }
 
 // Flush drops every stream on this shard, the stream arm of FLUSHALL and
@@ -226,7 +260,14 @@ func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
 	if !ok {
 		return true
 	}
-	for k := range v.(*reg).m {
+	now := cx.NowMs
+	for k, s := range v.(*reg).m {
+		// Skip a stream whose key-level deadline has passed so KEYS and SCAN never
+		// surface a key EXISTS would report absent. The skip is read-only (no drop) to
+		// match the string store's expiry-aware walk, which reaps nothing during a scan.
+		if s.expireAt != 0 && s.expireAt <= now {
+			continue
+		}
 		if !fn([]byte(k)) {
 			return false
 		}
@@ -255,7 +296,7 @@ func (g *reg) undirty(s *stream) {
 // until keyspace unification. An emptied stream (all entries XDEL'd) is kept, not
 // dropped: Redis leaves an empty stream in place (invariant that XLEN can read 0).
 func (g *reg) lookup(cx *shard.Ctx, key []byte) (s *stream, wrong bool) {
-	if s = g.m[string(key)]; s != nil {
+	if s = g.live(cx, key); s != nil {
 		return s, false
 	}
 	if cx.St.Exists(key, cx.NowMs) {

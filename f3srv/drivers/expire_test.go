@@ -115,9 +115,9 @@ func TestExpireFlags(t *testing.T) {
 	expect(t, br, "-ERR NX and XX, GT or LT options at the same time are not compatible\r\n")
 }
 
-// TestExpireErrorsAndCollection checks the argument errors and the honest
-// not-yet answer for a collection type that cannot carry a key TTL yet.
-func TestExpireErrorsAndCollection(t *testing.T) {
+// TestExpireErrors checks the argument errors EXPIRE rejects before it ever
+// consults a key's type: a non-integer time and an unknown option flag.
+func TestExpireErrors(t *testing.T) {
 	_, nc, br := startServer(t)
 
 	send(t, nc, "SET", "k", "v")
@@ -126,16 +126,6 @@ func TestExpireErrorsAndCollection(t *testing.T) {
 	expect(t, br, "-ERR value is not an integer or out of range\r\n")
 	send(t, nc, "EXPIRE", "k", "100", "BOGUS")
 	expect(t, br, "-ERR Unsupported option BOGUS\r\n")
-
-	// A stream key is present but cannot hold a TTL yet: an honest not-yet error,
-	// never a 0 that would falsely mean the key is absent. Set, zset, hash, and list
-	// keys are supported now, so the interim error is tested against the stream, the
-	// one type that still is not.
-	// An explicit id keeps the XADD reply deterministic so the bulk reads cleanly.
-	send(t, nc, "XADD", "st", "1-1", "f", "v")
-	expectBulk(t, br, []byte("1-1"))
-	send(t, nc, "EXPIRE", "st", "100")
-	expect(t, br, "-ERR EXPIRE on a stream key is not supported yet\r\n")
 }
 
 // TestExpireSetKey drives the EXPIRE family over a set key end to end: the
@@ -314,5 +304,51 @@ func TestExpireListKey(t *testing.T) {
 	send(t, nc, "EXISTS", "l")
 	expect(t, br, ":0\r\n")
 	send(t, nc, "TTL", "l")
+	expect(t, br, ":-2\r\n")
+}
+
+// TestExpireStreamKey drives the EXPIRE family over a stream key end to end, the
+// same shape as the other collection cases and the last type to gain a key TTL: the
+// inline deadline reads back through TTL, PERSIST clears it, the flags gate the same
+// way strings do, and a past instant deletes the stream. An explicit XADD id keeps
+// the bulk reply deterministic.
+func TestExpireStreamKey(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	send(t, nc, "XADD", "st", "1-1", "f", "v")
+	expectBulk(t, br, []byte("1-1"))
+	send(t, nc, "TTL", "st")
+	expect(t, br, ":-1\r\n")
+
+	// EXPIRE installs a deadline TTL then reports; the entries survive it.
+	send(t, nc, "EXPIRE", "st", "100")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "st")
+	expect(t, br, ":100\r\n")
+	send(t, nc, "XLEN", "st")
+	expect(t, br, ":1\r\n")
+
+	// GT only raises the deadline; a lower one is refused, a higher one takes.
+	send(t, nc, "EXPIRE", "st", "50", "GT")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "EXPIRE", "st", "300", "GT")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "st")
+	expect(t, br, ":300\r\n")
+
+	// PERSIST clears the deadline, then XX (needs a TTL) refuses.
+	send(t, nc, "PERSIST", "st")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "st")
+	expect(t, br, ":-1\r\n")
+	send(t, nc, "EXPIRE", "st", "100", "XX")
+	expect(t, br, ":0\r\n")
+
+	// A past instant deletes the stream and still returns 1.
+	send(t, nc, "PEXPIREAT", "st", "1000")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "EXISTS", "st")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "TTL", "st")
 	expect(t, br, ":-2\r\n")
 }
