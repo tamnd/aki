@@ -141,7 +141,7 @@ func TestSmoveOracle(t *testing.T) {
 			}
 
 			wantReply, wantSrc, wantDst := smoveOracle(c.srcKey, c.dstKey, srcMembers, dstMembers, c.member)
-			moved, wrong := smove(g, cx, []byte(c.srcKey), []byte(c.dstKey), []byte(c.member))
+			moved, wrong, _ := smove(g, cx, []byte(c.srcKey), []byte(c.dstKey), []byte(c.member))
 			if wrong {
 				t.Fatalf("unexpected WRONGTYPE")
 			}
@@ -166,7 +166,7 @@ func TestSmoveOracle(t *testing.T) {
 func TestSmoveLastMemberDeletesSrc(t *testing.T) {
 	cx, g := newCtx(t)
 	g.m["s"] = setFrom([]string{"only"})
-	moved, wrong := smove(g, cx, []byte("s"), []byte("d"), []byte("only"))
+	moved, wrong, _ := smove(g, cx, []byte("s"), []byte("d"), []byte("only"))
 	if wrong || !moved {
 		t.Fatalf("moved=%v wrong=%v, want moved with no WRONGTYPE", moved, wrong)
 	}
@@ -194,7 +194,7 @@ func TestSmoveCreatesDst(t *testing.T) {
 		t.Run(c.member, func(t *testing.T) {
 			cx, g := newCtx(t)
 			g.m["s"] = setFrom([]string{c.member, "other"})
-			moved, wrong := smove(g, cx, []byte("s"), []byte("d"), []byte(c.member))
+			moved, wrong, _ := smove(g, cx, []byte("s"), []byte("d"), []byte(c.member))
 			if wrong || !moved {
 				t.Fatalf("moved=%v wrong=%v", moved, wrong)
 			}
@@ -222,7 +222,7 @@ func TestSmoveDstBandConversion(t *testing.T) {
 		if g.m["d"].enc != encIntset {
 			t.Fatalf("seed dst enc %s, want intset", g.m["d"].enc)
 		}
-		moved, _ := smove(g, cx, []byte("s"), []byte("d"), []byte("str"))
+		moved, _, _ := smove(g, cx, []byte("s"), []byte("d"), []byte("str"))
 		if !moved {
 			t.Fatal("expected move")
 		}
@@ -235,7 +235,7 @@ func TestSmoveDstBandConversion(t *testing.T) {
 		big := gen("v", 0, 1, maxListpackValue+8)[0] // one member past the listpack value cap
 		g.m["s"] = setFrom([]string{big, "keep"})
 		g.m["d"] = setFrom([]string{"a", "b"}) // listpack
-		moved, _ := smove(g, cx, []byte("s"), []byte("d"), []byte(big))
+		moved, _, _ := smove(g, cx, []byte("s"), []byte("d"), []byte(big))
 		if !moved {
 			t.Fatal("expected move")
 		}
@@ -267,7 +267,7 @@ func TestSmoveWrongType(t *testing.T) {
 			t.Fatalf("seed string: %v", err)
 		}
 		g.m["d"] = setFrom([]string{"1"})
-		_, wrong := smove(g, cx, []byte("s"), []byte("d"), []byte("x"))
+		_, wrong, _ := smove(g, cx, []byte("s"), []byte("d"), []byte("x"))
 		if !wrong {
 			t.Fatal("expected WRONGTYPE for a string source")
 		}
@@ -279,7 +279,7 @@ func TestSmoveWrongType(t *testing.T) {
 		}
 		// Source is absent and the member could never be there, but Redis validates
 		// the destination type up front and errors regardless.
-		_, wrong := smove(g, cx, []byte("s"), []byte("d"), []byte("x"))
+		_, wrong, _ := smove(g, cx, []byte("s"), []byte("d"), []byte("x"))
 		if !wrong {
 			t.Fatal("expected WRONGTYPE for a string destination even with a missing source")
 		}
@@ -293,7 +293,7 @@ func TestSmoveWrongType(t *testing.T) {
 		if err := cx.St.Set([]byte("d"), []byte("astring")); err != nil {
 			t.Fatalf("seed string: %v", err)
 		}
-		_, wrong := smove(g, cx, []byte("s"), []byte("d"), []byte("absent"))
+		_, wrong, _ := smove(g, cx, []byte("s"), []byte("d"), []byte("absent"))
 		if !wrong {
 			t.Fatal("expected WRONGTYPE for a string destination")
 		}
@@ -317,7 +317,7 @@ func TestSmoveAtomicInvariant(t *testing.T) {
 
 	src, dst := "a", "b"
 	for i := 0; i < 500; i++ {
-		moved, wrong := smove(g, cx, []byte(src), []byte(dst), []byte(shuttle))
+		moved, wrong, _ := smove(g, cx, []byte(src), []byte(dst), []byte(shuttle))
 		if wrong || !moved {
 			t.Fatalf("move %d: moved=%v wrong=%v", i, moved, wrong)
 		}
@@ -345,13 +345,13 @@ func TestSmoveSameKeyNoChange(t *testing.T) {
 	before := intGen(0, 10)
 	g.m["k"] = setFrom(before)
 
-	moved, wrong := smove(g, cx, []byte("k"), []byte("k"), []byte("5"))
+	moved, wrong, _ := smove(g, cx, []byte("k"), []byte("k"), []byte("5"))
 	if wrong || !moved {
 		t.Fatalf("present member: moved=%v wrong=%v, want 1", moved, wrong)
 	}
 	eqStrings(t, "unchanged after present same-key move", memberList(g.m["k"]), sortedCopy(before))
 
-	moved, _ = smove(g, cx, []byte("k"), []byte("k"), []byte("999"))
+	moved, _, _ = smove(g, cx, []byte("k"), []byte("k"), []byte("999"))
 	if moved {
 		t.Fatal("absent member same-key move should reply 0")
 	}
@@ -380,7 +380,7 @@ func TestSmovePartitioned(t *testing.T) {
 
 	member := "s0"
 	before := src.card()
-	moved, wrong := smove(g, cx, []byte("s"), []byte("d"), []byte(member))
+	moved, wrong, _ := smove(g, cx, []byte("s"), []byte("d"), []byte(member))
 	if wrong || !moved {
 		t.Fatalf("moved=%v wrong=%v", moved, wrong)
 	}

@@ -122,27 +122,55 @@ func bandFor(ht *htable, allInt bool, maxLen, n int) *set {
 // when the destination is also a source the swap below is the first and only
 // time the destination pointer moves, and the source was read in full before it
 // did. Nothing is cloned to guard the aliasing.
-func place(cx *shard.Ctx, g *reg, key []byte, result *set) int {
+//
+// place also frames the STORE for the write log: a keydel for a deleted string
+// shadow, then either a collnew plus the whole result as one sadd (replay
+// treats collnew on an existing collection as reset-to-empty, doc 04) or a
+// colldrop when an empty result deletes a live set. A STORE that found the
+// destination absent and produced nothing frames nothing.
+func place(cx *shard.Ctx, g *reg, key []byte, result *set) (int, error) {
+	hadSet := g.m[string(key)] != nil
 	// Drop whatever the key holds in the string store first, so a new set never
 	// shadows a stale string and no old TTL survives (the destination is a new
 	// object, Redis discards the old expiry). A set-typed destination is replaced
 	// through the registry write below; the string Del is a no-op for it.
-	cx.St.Del(key, cx.NowMs)
+	delString := cx.St.Del(key, cx.NowMs)
 	if result == nil {
 		g.drop(key)
-		return 0
+		if !hadSet && !delString {
+			return 0, nil
+		}
+		return 0, cx.LogSetStore(key, delString, hadSet, nil)
 	}
 	// A destination that already held a set is replaced wholesale: take its bytes
 	// out of the running total before the swap, then post the freshly built
 	// result's own footprint (drop unaccounts the old set, note accounts the new).
 	// Guarded on acctOn so the swap stays a plain overwrite when the cold tier is
 	// off, the L9 zero-delta path.
-	if g.acctOn && g.m[string(key)] != nil {
+	if g.acctOn && hadSet {
 		g.drop(key)
 	}
 	g.m[string(key)] = result
 	g.note(result)
-	return result.card()
+	if cx.Log != nil {
+		// each hands out slices that alias internal storage or render scratch,
+		// valid only per call, so the result members are copied into one arena
+		// sized by a first pass; the exact capacity means the appends never
+		// reallocate under the earlier slices.
+		n, total := 0, 0
+		result.each(func(m []byte) { n++; total += len(m) })
+		members := make([][]byte, 0, n)
+		arena := make([]byte, 0, total)
+		result.each(func(m []byte) {
+			off := len(arena)
+			arena = append(arena, m...)
+			members = append(members, arena[off:len(arena):len(arena)])
+		})
+		if err := cx.LogSetStore(key, delString, hadSet, members); err != nil {
+			return 0, err
+		}
+	}
+	return result.card(), nil
 }
 
 // Sinterstore answers SINTERSTORE destination key [key ...]: intersect the
@@ -160,7 +188,12 @@ func Sinterstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// Presize from the smallest source: the intersection cannot exceed it
 	// (setmergecollect, doc 11 section 6.4).
 	result := storeResult(minCard(sets), func(emit func(m []byte)) { sinter(cx, sets, emit) })
-	r.Int(int64(place(cx, g, args[0], result)))
+	n, err := place(cx, g, args[0], result)
+	if err != nil {
+		r.Err(err.Error())
+		return
+	}
+	r.Int(int64(n))
 }
 
 // Sunionstore answers SUNIONSTORE destination key [key ...]: union the sources
@@ -175,7 +208,12 @@ func Sunionstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	result := storeResult(totalCard(sets), func(emit func(m []byte)) { unionInto(sets, emit) })
-	r.Int(int64(place(cx, g, args[0], result)))
+	n, err := place(cx, g, args[0], result)
+	if err != nil {
+		r.Err(err.Error())
+		return
+	}
+	r.Int(int64(n))
 }
 
 // Sdiffstore answers SDIFFSTORE destination key [key ...]: the members of the
@@ -191,7 +229,12 @@ func Sdiffstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	// The diff cannot exceed the first source, which drives the walk.
 	result := storeResult(firstCard(sets), func(emit func(m []byte)) { sdiff(cx, sets, emit) })
-	r.Int(int64(place(cx, g, args[0], result)))
+	n, err := place(cx, g, args[0], result)
+	if err != nil {
+		r.Err(err.Error())
+		return
+	}
+	r.Int(int64(n))
 }
 
 // unionInto streams every member of every source into emit, duplicates and all:

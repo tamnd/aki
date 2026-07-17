@@ -129,7 +129,11 @@ func applyStore(t *testing.T, cx *shard.Ctx, g *reg, op string, dest string, src
 	case "diff":
 		result = storeResult(firstCard(sets), func(e func([]byte)) { sdiff(nil, sets, e) })
 	}
-	return place(cx, g, []byte(dest), result)
+	n, err := place(cx, g, []byte(dest), result)
+	if err != nil {
+		t.Fatalf("%s: place: %v", op, err)
+	}
+	return n
 }
 
 // TestStoreAliasing drives every aliasing shape the checklist names: the

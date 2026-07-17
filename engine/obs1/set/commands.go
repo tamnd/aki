@@ -20,7 +20,8 @@ func Sadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
 	key := args[0]
 	s := g.m[string(key)]
-	if s == nil {
+	created := s == nil
+	if created {
 		if cx.St.Exists(key, cx.NowMs) {
 			r.Err(wrongType)
 			return
@@ -28,14 +29,25 @@ func Sadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		s = newSet(args[1])
 		g.m[string(key)] = s
 	}
-	var added int64
-	for _, m := range args[1:] {
+	// Compact the members that actually joined over the argument tail in
+	// place (forward-safe): the sadd frame carries post-decision effects,
+	// only what was added, so a duplicate-only SADD frames nothing.
+	memb := args[1:]
+	added := 0
+	for _, m := range memb {
 		if s.add(m) {
+			memb[added] = m
 			added++
 		}
 	}
 	g.note(s)
-	r.Int(added)
+	if added > 0 {
+		if err := cx.LogSetAdd(key, created, memb[:added]); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
+	r.Int(int64(added))
 }
 
 // Srem answers SREM key member [member ...]: remove each, reply the count
@@ -51,18 +63,29 @@ func Srem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Int(0)
 		return
 	}
-	var removed int64
-	for _, m := range args[1:] {
+	// Compact the members that actually left in place, the same
+	// post-decision rule SADD keeps: the srem frame lists only removals.
+	memb := args[1:]
+	removed := 0
+	for _, m := range memb {
 		if s.rem(m) {
+			memb[removed] = m
 			removed++
 		}
 	}
-	if s.card() == 0 {
+	dropped := s.card() == 0
+	if dropped {
 		g.drop(args[0])
 	} else {
 		g.note(s)
 	}
-	r.Int(removed)
+	if removed > 0 {
+		if err := cx.LogSetRem(args[0], memb[:removed], dropped); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
+	r.Int(int64(removed))
 }
 
 // Sismember answers SISMEMBER key member: 1 when present, 0 otherwise.
@@ -171,10 +194,17 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 		var sc [64]byte
 		m := s.popOne(g, sc[:])
-		if s.card() == 0 {
+		dropped := s.card() == 0
+		if dropped {
 			g.drop(key)
 		} else {
 			g.note(s)
+		}
+		// SPOP frames as the srem it is (doc 04 section 2, no spop
+		// sub-kind): the drawn member is the post-decision effect.
+		if err := cx.LogSetRem(key, [][]byte{m}, dropped); err != nil {
+			r.Err(err.Error())
+			return
 		}
 		r.Bulk(m)
 		return
@@ -193,24 +223,42 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		popped = s.card()
 	}
 	out := resp.AppendArrayHeader(cx.Aux[:0], popped)
+	// The drawn members are collected as copies for the srem frame when a
+	// log is wired: the draw hands out scratch-backed slices that do not
+	// survive the next draw.
+	var drawn [][]byte
+	logging := cx.Log != nil
+	emit := func(m []byte) {
+		out = resp.AppendBulk(out, m)
+		if logging {
+			drawn = append(drawn, append([]byte(nil), m...))
+		}
+	}
 	if popped < s.card() && s.fanDraws(cx, popped) {
 		// The escalated aggregate (drawfan.go): indices drawn serially on the
 		// owner, the resolve fanned to donated workers, removal back on the
 		// owner. Exact uniform without replacement either way (F15).
-		popFan(cx, g, s, popped, func(m []byte) { out = resp.AppendBulk(out, m) })
+		popFan(cx, g, s, popped, emit)
 	} else {
 		var sc [64]byte
 		for i := 0; i < popped; i++ {
-			out = resp.AppendBulk(out, s.popOne(g, sc[:]))
+			emit(s.popOne(g, sc[:]))
 		}
 	}
 	cx.Aux = out
-	r.Raw(out)
-	if s.card() == 0 {
+	dropped := s.card() == 0
+	if dropped {
 		g.drop(key)
 	} else {
 		g.note(s)
 	}
+	if logging {
+		if err := cx.LogSetRem(key, drawn, dropped); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
+	r.Raw(out)
 }
 
 // Srandmember answers SRANDMEMBER key [count]: draw members without removing

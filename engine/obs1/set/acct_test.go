@@ -194,7 +194,7 @@ func TestResidentAccountingMovePath(t *testing.T) {
 	addKey(g, "dst", "x")
 	wantExact(t, g)
 
-	moved, wrong := smove(g, cx, []byte("src"), []byte("dst"), []byte("a"))
+	moved, wrong, _ := smove(g, cx, []byte("src"), []byte("dst"), []byte("a"))
 	if !moved || wrong {
 		t.Fatalf("smove a: moved=%v wrong=%v", moved, wrong)
 	}
@@ -203,7 +203,7 @@ func TestResidentAccountingMovePath(t *testing.T) {
 	// Move the last two members out of src: the final one empties and drops it, so
 	// only dst's bytes remain and the total still matches the walk.
 	for _, m := range []string{"b", "c"} {
-		if moved, _ := smove(g, cx, []byte("src"), []byte("dst"), []byte(m)); !moved {
+		if moved, _, _ := smove(g, cx, []byte("src"), []byte("dst"), []byte(m)); !moved {
 			t.Fatalf("smove %s did not move", m)
 		}
 	}

@@ -31,37 +31,50 @@ import (
 // state where member is in neither set. That is the same guarantee the intent
 // barrier buys across shards, provided here for free by single ownership (F1).
 
+// moveFx records what a move actually mutated, which is what the log frames:
+// the same-key case replies 1 without touching anything (srcChanged false, no
+// frames), and moving onto a destination that already held the member changes
+// only the source (dstChanged false, an srem-only emission).
+type moveFx struct {
+	srcChanged bool // member left the source
+	srcDropped bool // the source emptied and was deleted
+	dstCreated bool // the destination was created for this insert
+	dstChanged bool // member joined the destination
+}
+
 // smove runs the SMOVE core on the local registry. moved is true when member left
 // source for destination (reply 1) and false when member was not in source (reply
 // 0). wrong reports a WRONGTYPE on either key. Both types are checked before any
 // mutation, so a wrong-typed pair never leaves a half-done move, matching Redis's
 // up-front type check on both keys.
-func smove(g *reg, cx *shard.Ctx, srcKey, dstKey, member []byte) (moved, wrong bool) {
+func smove(g *reg, cx *shard.Ctx, srcKey, dstKey, member []byte) (moved, wrong bool, fx moveFx) {
 	src, w := g.lookup(cx, srcKey)
 	if w {
-		return false, true
+		return false, true, fx
 	}
 	dst, w := g.lookup(cx, dstKey)
 	if w {
-		return false, true
+		return false, true, fx
 	}
 	// Source and destination are the same key: nothing moves, and the reply is
 	// membership alone (doc 11 section 9.2, "moving onto an existing dst member is
 	// a remove-only", degenerate to a no-op when the two keys are one). This also
 	// covers the both-missing case, which replies 0.
 	if string(srcKey) == string(dstKey) {
-		return src != nil && src.has(member), false
+		return src != nil && src.has(member), false, fx
 	}
 	// A missing source, or a member not in source, is a no-op that replies 0. The
 	// remove happens here so the reply and the mutation share one probe.
 	if src == nil || !src.rem(member) {
-		return false, false
+		return false, false, fx
 	}
+	fx.srcChanged = true
 	// The last member left source: Redis deletes an emptied set (doc 11 section
 	// 9.2). Dropping it before the destination insert keeps the invariant that the
 	// registry never holds an empty set.
 	if src.card() == 0 {
 		g.drop(srcKey)
+		fx.srcDropped = true
 	} else {
 		g.note(src)
 	}
@@ -72,10 +85,11 @@ func smove(g *reg, cx *shard.Ctx, srcKey, dstKey, member []byte) (moved, wrong b
 	if dst == nil {
 		dst = newSet(member)
 		g.m[string(dstKey)] = dst
+		fx.dstCreated = true
 	}
-	dst.add(member)
+	fx.dstChanged = dst.add(member)
 	g.note(dst)
-	return true, false
+	return true, false, fx
 }
 
 // Smove answers SMOVE source destination member: move member from source to
@@ -83,10 +97,26 @@ func smove(g *reg, cx *shard.Ctx, srcKey, dstKey, member []byte) (moved, wrong b
 // holding a string on either side answers WRONGTYPE before anything is written.
 func Smove(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
-	moved, wrong := smove(g, cx, args[0], args[1], args[2])
+	moved, wrong, fx := smove(g, cx, args[0], args[1], args[2])
 	if wrong {
 		r.Err(wrongType)
 		return
+	}
+	// The co-located move frames as one atomic run when both sides changed;
+	// a destination that already held the member frames srem-only. The
+	// same-key reply and the not-in-source reply mutated nothing and frame
+	// nothing.
+	if fx.srcChanged {
+		var err error
+		if fx.dstChanged {
+			err = cx.LogSetMove(args[0], args[1], args[2], fx.srcDropped, fx.dstCreated)
+		} else {
+			err = cx.LogSetRem(args[0], [][]byte{args[2]}, fx.srcDropped)
+		}
+		if err != nil {
+			r.Err(err.Error())
+			return
+		}
 	}
 	if moved {
 		r.Int(1)

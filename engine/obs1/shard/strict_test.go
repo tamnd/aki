@@ -68,6 +68,27 @@ func (f *fakeLog) HashExpire(key []byte, atMs int64, fields [][]byte) (uint16, u
 	return f.emit(key)
 }
 
+func (f *fakeLog) SetAdd(key []byte, created bool, members [][]byte) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) SetRem(key []byte, members [][]byte, dropped bool) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) SetStore(key []byte, delString, hadSet bool, members [][]byte) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
+func (f *fakeLog) SetMove(src, dst, member []byte, srcDropped, dstCreated bool) (uint16, uint64, uint16, uint64, error) {
+	dg, ds, err := f.emit(dst)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	sg, ss, err := f.emit(src)
+	return dg, ds, sg, ss, err
+}
+
 func (f *fakeLog) NotifyCommitted(group uint16, seq uint64, fn func()) {
 	f.pending = append(f.pending, fakeNotify{group: group, seq: seq, fn: fn})
 }

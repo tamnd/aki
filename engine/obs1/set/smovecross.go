@@ -25,6 +25,7 @@ import (
 // check; the same-key case cannot reach here.
 func SmoveCross(t *shard.Txn, src, dst, member []byte) []byte {
 	var srcWrong, dstWrong, present, moved bool
+	var logErr error
 	t.Do(src, func(cx *shard.Ctx) {
 		s, w := registry(cx).lookup(cx, src)
 		srcWrong = w
@@ -40,29 +41,46 @@ func SmoveCross(t *shard.Txn, src, dst, member []byte) []byte {
 		// Insert at the destination first: the transient member-in-both state
 		// is invisible under the barrier, and doing the insert inside the
 		// type-check hop saves the fourth hop the naive plan pays.
-		if d == nil {
+		created := d == nil
+		if created {
 			d = newSet(member)
 			g.m[string(dst)] = d
 		}
-		d.add(member)
+		changed := d.add(member)
 		g.note(d)
 		moved = true
+		// Each hop frames its own side, destination first, the same order the
+		// seam's cross-group SetMove keeps so a tail cut duplicates the member
+		// rather than losing it. A destination that already held the member
+		// changed nothing and frames nothing. Tier-two hops emit relaxed-only
+		// (the intent Ctx carries no conn), so the frames never gate the reply.
+		if changed {
+			if err := cx.LogSetAdd(dst, created, [][]byte{member}); err != nil {
+				logErr = err
+			}
+		}
 	})
 	if moved {
 		t.Do(src, func(cx *shard.Ctx) {
 			g := registry(cx)
 			s, _ := g.lookup(cx, src)
 			s.rem(member)
-			if s.card() == 0 {
+			dropped := s.card() == 0
+			if dropped {
 				g.drop(src)
 			} else {
 				g.note(s)
+			}
+			if err := cx.LogSetRem(src, [][]byte{member}, dropped); err != nil {
+				logErr = err
 			}
 		})
 	}
 	switch {
 	case srcWrong || dstWrong:
 		return resp.AppendError(nil, wrongType)
+	case logErr != nil:
+		return resp.AppendError(nil, logErr.Error())
 	case moved:
 		return resp.AppendInt(nil, 1)
 	default:
