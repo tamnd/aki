@@ -74,6 +74,17 @@ func (s *Store) logRecord(off uint64) error {
 	return err
 }
 
+// logRecordSticky re-logs the record at off for a mutation whose command answers
+// with a boolean, not an error, so a failed cut cannot return: Persist removing a
+// deadline is the case. The fault lands in rlogErr for the ack-barrier path, the
+// same channel logTombstone uses. A path that can return an error calls logRecord
+// directly and surfaces it synchronously instead.
+func (s *Store) logRecordSticky(off uint64) {
+	if err := s.logRecord(off); err != nil && s.rlogErr == nil {
+		s.rlogErr = err
+	}
+}
+
 // logTombstone durably appends a clear record for key, so a replay that meets it
 // removes the entry instead of resurrecting the deleted value: without it the log
 // records every SET but no delete, and replay lands on a key the client dropped. A

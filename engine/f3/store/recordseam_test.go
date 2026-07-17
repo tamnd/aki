@@ -213,6 +213,59 @@ func TestDelAbsentLogsNothing(t *testing.T) {
 	}
 }
 
+// TestSetExpireInPlaceLogsRecord confirms changing a slotted record's deadline
+// re-logs the record with the new expiry, so an EXPIRE survives a crash rather
+// than replaying to the old deadline the original SET carried.
+func TestSetExpireInPlaceLogsRecord(t *testing.T) {
+	s, f := newRecordSeamStore(t)
+
+	key, val := []byte("ttl"), []byte("v")
+	const first = int64(1_700_000_000_000)
+	const second = int64(1_800_000_000_000)
+	if err := s.SetString(key, val, 0, first, false); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	ok, err := s.SetExpire(key, val, second, 1)
+	if err != nil {
+		t.Fatalf("set expire: %v", err)
+	}
+	if !ok {
+		t.Fatal("set expire reported absent for a live key")
+	}
+	rows := walkSeam(t, f)
+	if len(rows) != 2 {
+		t.Fatalf("got %d logged rows, want 2 (the set then the re-expire)", len(rows))
+	}
+	if rows[1].ExpireAt != uint64(second) {
+		t.Fatalf("re-expire row expiry = %d, want %d", rows[1].ExpireAt, second)
+	}
+}
+
+// TestPersistLogsRecord confirms removing a deadline re-logs the record with a
+// zero expiry, so a PERSIST survives a crash rather than replaying to the deadline
+// the SET carried.
+func TestPersistLogsRecord(t *testing.T) {
+	s, f := newRecordSeamStore(t)
+
+	key := []byte("keep")
+	if err := s.SetString(key, []byte("v"), 0, 1_700_000_000_000, false); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if !s.Persist(key, 1) {
+		t.Fatal("persist reported no deadline for a key that had one")
+	}
+	rows := walkSeam(t, f)
+	if len(rows) != 2 {
+		t.Fatalf("got %d logged rows, want 2 (the set then the persist)", len(rows))
+	}
+	if rows[1].ExpireAt != 0 {
+		t.Fatalf("persist row expiry = %d, want 0", rows[1].ExpireAt)
+	}
+	if err := s.TakeRecordLogErr(); err != nil {
+		t.Fatalf("durability fault after a clean persist: %v", err)
+	}
+}
+
 // TestSetStringNoHandleLogsNothing confirms the default volatile store never
 // touches a record log, so the durable path adds nothing when it is off.
 func TestSetStringNoHandleLogsNothing(t *testing.T) {
