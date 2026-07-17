@@ -514,3 +514,142 @@ func TestServerListTrim(t *testing.T) {
 	send("LTRIM", "str", "0", "1")
 	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
 }
+
+// TestServerListScan is the wire grammar for LINSERT, LREM, and LPOS:
+// both directions, rank skips, COUNT and MAXLEN shapes, the option
+// errors word for word, and the doors.
+func TestServerListScan(t *testing.T) {
+	c, r := startServer(t)
+	send := func(args ...string) {
+		t.Helper()
+		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send("RPUSH", "l", "a", "b", "c", "b", "a", "b")
+	expect(t, r, ":6\r\n")
+
+	// LPOS: first match, rank skips, both directions, COUNT, MAXLEN.
+	send("LPOS", "l", "b")
+	expect(t, r, ":1\r\n")
+	send("LPOS", "l", "b", "RANK", "2")
+	expect(t, r, ":3\r\n")
+	send("LPOS", "l", "b", "RANK", "-1")
+	expect(t, r, ":5\r\n")
+	send("LPOS", "l", "b", "COUNT", "0")
+	expect(t, r, "*3\r\n:1\r\n:3\r\n:5\r\n")
+	send("LPOS", "l", "b", "RANK", "-1", "COUNT", "2")
+	expect(t, r, "*2\r\n:5\r\n:3\r\n")
+	send("LPOS", "l", "a", "MAXLEN", "1")
+	expect(t, r, ":0\r\n")
+	send("LPOS", "l", "b", "MAXLEN", "1")
+	expect(t, r, "$-1\r\n")
+	send("LPOS", "l", "nope")
+	expect(t, r, "$-1\r\n")
+	send("LPOS", "l", "nope", "COUNT", "0")
+	expect(t, r, "*0\r\n")
+	send("LPOS", "missing", "x")
+	expect(t, r, "$-1\r\n")
+	send("LPOS", "missing", "x", "COUNT", "2")
+	expect(t, r, "*0\r\n")
+
+	// The option errors, word for word.
+	send("LPOS", "l", "b", "RANK", "0")
+	expect(t, r, "-ERR RANK can't be zero. Use 1 to start searching from the first matching element in the head, or a negative rank to start searching backward from the tail.\r\n")
+	send("LPOS", "l", "b", "COUNT", "-1")
+	expect(t, r, "-ERR COUNT can't be negative\r\n")
+	send("LPOS", "l", "b", "MAXLEN", "-1")
+	expect(t, r, "-ERR MAXLEN can't be negative\r\n")
+	send("LPOS", "l", "b", "RANK", "x")
+	expect(t, r, "-ERR value is not an integer or out of range\r\n")
+	send("LPOS", "l", "b", "BOGUS", "1")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("LPOS", "l", "b", "RANK")
+	expect(t, r, "-ERR syntax error\r\n")
+
+	// LINSERT: before, after, missing pivot, missing key.
+	send("LINSERT", "l", "BEFORE", "c", "x")
+	expect(t, r, ":7\r\n")
+	send("LINSERT", "l", "after", "c", "y")
+	expect(t, r, ":8\r\n")
+	send("LRANGE", "l", "0", "-1")
+	expect(t, r, respArr("a", "b", "x", "c", "y", "b", "a", "b"))
+	send("LINSERT", "l", "BEFORE", "nope", "z")
+	expect(t, r, ":-1\r\n")
+	send("LINSERT", "missing", "BEFORE", "a", "b")
+	expect(t, r, ":0\r\n")
+	send("LINSERT", "l", "SIDEWAYS", "a", "b")
+	expect(t, r, "-ERR syntax error\r\n")
+
+	// LREM: head-directed, tail-directed, all, and a miss.
+	send("LREM", "l", "1", "b")
+	expect(t, r, ":1\r\n")
+	send("LRANGE", "l", "0", "-1")
+	expect(t, r, respArr("a", "x", "c", "y", "b", "a", "b"))
+	send("LREM", "l", "-1", "b")
+	expect(t, r, ":1\r\n")
+	send("LRANGE", "l", "0", "-1")
+	expect(t, r, respArr("a", "x", "c", "y", "b", "a"))
+	send("LREM", "l", "0", "a")
+	expect(t, r, ":2\r\n")
+	send("LRANGE", "l", "0", "-1")
+	expect(t, r, respArr("x", "c", "y", "b"))
+	send("LREM", "l", "3", "nope")
+	expect(t, r, ":0\r\n")
+	send("LREM", "missing", "0", "a")
+	expect(t, r, ":0\r\n")
+
+	// Removing the last element deletes the key.
+	send("LREM", "l", "0", "x")
+	expect(t, r, ":1\r\n")
+	send("LREM", "l", "0", "c")
+	expect(t, r, ":1\r\n")
+	send("LREM", "l", "0", "y")
+	expect(t, r, ":1\r\n")
+	send("LREM", "l", "0", "b")
+	expect(t, r, ":1\r\n")
+	send("TYPE", "l")
+	expect(t, r, "+none\r\n")
+
+	// A noded list scans the same grammar across node boundaries.
+	const n = 300
+	elems := make([]string, n)
+	for i := range elems {
+		elems[i] = fmt.Sprintf("v%02d", i%7)
+	}
+	send(append([]string{"RPUSH", "big"}, elems...)...)
+	expect(t, r, fmt.Sprintf(":%d\r\n", n))
+	send("OBJECT", "ENCODING", "big")
+	expect(t, r, "$9\r\nquicklist\r\n")
+	send("LPOS", "big", "v03", "RANK", "-1")
+	expect(t, r, ":297\r\n")
+	send("LPOS", "big", "v03", "COUNT", "3")
+	expect(t, r, "*3\r\n:3\r\n:10\r\n:17\r\n")
+	send("LINSERT", "big", "AFTER", "v06", "mark")
+	expect(t, r, ":301\r\n")
+	send("LRANGE", "big", "5", "8")
+	expect(t, r, respArr("v05", "v06", "mark", "v00"))
+	send("LREM", "big", "0", "v01")
+	expect(t, r, ":43\r\n")
+	send("LLEN", "big")
+	expect(t, r, ":258\r\n")
+
+	// The doors: arity and wrong type.
+	send("LREM", "big", "0")
+	expect(t, r, "-ERR wrong number of arguments for 'lrem' command\r\n")
+	send("LINSERT", "big", "BEFORE", "p")
+	expect(t, r, "-ERR wrong number of arguments for 'linsert' command\r\n")
+	send("LPOS", "big")
+	expect(t, r, "-ERR wrong number of arguments for 'lpos' command\r\n")
+	send("SET", "str", "v")
+	expect(t, r, "+OK\r\n")
+	for _, cmd := range [][]string{
+		{"LPOS", "str", "a"},
+		{"LINSERT", "str", "BEFORE", "a", "b"},
+		{"LREM", "str", "0", "a"},
+	} {
+		send(cmd...)
+		expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	}
+}

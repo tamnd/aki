@@ -7,7 +7,11 @@ package sqlo1
 // broadcasts the blocking condition on its way out, so the waiters
 // re-check after any command that could have fed their keys.
 
-import "context"
+import (
+	"context"
+	"math"
+	"strings"
+)
 
 // lpushCmd is the four push forms. Elements land one at a time in
 // argument order, so a multi-element left push reads back reversed,
@@ -198,6 +202,117 @@ func (s *Server) ltrimCmd(ctx context.Context, reply []byte, args [][]byte) []by
 		return storeErr(reply, err)
 	}
 	return AppendSimple(reply, "OK")
+}
+
+// linsertCmd is LINSERT key BEFORE|AFTER pivot element: the new
+// length, -1 when the pivot is missing, 0 when the key is.
+func (s *Server) linsertCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) != 5 {
+		return arityErr(reply, "LINSERT")
+	}
+	var before bool
+	switch {
+	case strings.EqualFold(string(args[2]), "BEFORE"):
+		before = true
+	case strings.EqualFold(string(args[2]), "AFTER"):
+	default:
+		return AppendError(reply, "ERR syntax error")
+	}
+	n, err := s.l.Insert(ctx, args[1], before, args[3], args[4])
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	return AppendInt(reply, n)
+}
+
+// lremCmd is LREM key count element: the number removed, with the
+// count's sign picking the scan direction and zero meaning all.
+func (s *Server) lremCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) != 4 {
+		return arityErr(reply, "LREM")
+	}
+	c, ok := parseCanonicalInt(args[2])
+	if !ok {
+		return AppendError(reply, "ERR value is not an integer or out of range")
+	}
+	n, err := s.l.Rem(ctx, args[1], c, args[3])
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	return AppendInt(reply, n)
+}
+
+// lposCmd is LPOS key element [RANK rank] [COUNT num] [MAXLEN len]:
+// without COUNT the first surviving match's index or the nil bulk,
+// with COUNT an array of up to num indexes (0 meaning all).
+func (s *Server) lposCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 3 {
+		return arityErr(reply, "LPOS")
+	}
+	rank, num, maxlen := int64(1), int64(1), int64(0)
+	hasCount := false
+	for i := 3; i < len(args); i += 2 {
+		if i+1 >= len(args) {
+			return AppendError(reply, "ERR syntax error")
+		}
+		v, ok := parseCanonicalInt(args[i+1])
+		switch {
+		case strings.EqualFold(string(args[i]), "RANK"):
+			if !ok {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			if v == 0 {
+				return AppendError(reply, "ERR RANK can't be zero. Use 1 to start searching from the first matching element in the head, or a negative rank to start searching backward from the tail.")
+			}
+			rank = v
+		case strings.EqualFold(string(args[i]), "COUNT"):
+			if !ok {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			if v < 0 {
+				return AppendError(reply, "ERR COUNT can't be negative")
+			}
+			hasCount = true
+			num = v
+			if v == 0 {
+				num = math.MaxInt64
+			}
+		case strings.EqualFold(string(args[i]), "MAXLEN"):
+			if !ok {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			if v < 0 {
+				return AppendError(reply, "ERR MAXLEN can't be negative")
+			}
+			maxlen = v
+		default:
+			return AppendError(reply, "ERR syntax error")
+		}
+	}
+	if !hasCount {
+		found, idx := false, int64(0)
+		err := s.l.Pos(ctx, args[1], args[2], rank, 1, maxlen, func(i int64) {
+			found, idx = true, i
+		})
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if !found {
+			return AppendNullBulk(reply)
+		}
+		return AppendInt(reply, idx)
+	}
+	var idxs []int64
+	if err := s.l.Pos(ctx, args[1], args[2], rank, num, maxlen, func(i int64) {
+		idxs = append(idxs, i)
+	}); err != nil {
+		return storeErr(reply, err)
+	}
+	reply = AppendArray(reply, len(idxs))
+	for _, i := range idxs {
+		reply = AppendInt(reply, i)
+	}
+	return reply
 }
 
 // blmpopCmd is BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT
