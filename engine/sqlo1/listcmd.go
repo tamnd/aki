@@ -315,6 +315,92 @@ func (s *Server) lposCmd(ctx context.Context, reply []byte, args [][]byte) []byt
 	return reply
 }
 
+// parseLR maps a LEFT or RIGHT token to its left flag; ok is false on
+// any other token.
+func parseLR(arg []byte) (left, ok bool) {
+	switch {
+	case strings.EqualFold(string(arg), "LEFT"):
+		return true, true
+	case strings.EqualFold(string(arg), "RIGHT"):
+		return false, true
+	}
+	return false, false
+}
+
+// lmoveCmd is LMOVE source destination LEFT|RIGHT LEFT|RIGHT: the
+// moved element, or the nil bulk when source is missing.
+func (s *Server) lmoveCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) != 5 {
+		return arityErr(reply, "LMOVE")
+	}
+	srcLeft, ok1 := parseLR(args[3])
+	dstLeft, ok2 := parseLR(args[4])
+	if !ok1 || !ok2 {
+		return AppendError(reply, "ERR syntax error")
+	}
+	return s.lmoveReply(ctx, reply, args[1], args[2], srcLeft, dstLeft)
+}
+
+// rpoplpushCmd is RPOPLPUSH source destination, LMOVE's fixed
+// right-to-left ancestor.
+func (s *Server) rpoplpushCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) != 3 {
+		return arityErr(reply, "RPOPLPUSH")
+	}
+	return s.lmoveReply(ctx, reply, args[1], args[2], false, true)
+}
+
+// lmoveReply runs one move and shapes the shared reply.
+func (s *Server) lmoveReply(ctx context.Context, reply, src, dst []byte, srcLeft, dstLeft bool) []byte {
+	e, ok, err := s.l.Move(ctx, src, dst, srcLeft, dstLeft)
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	if !ok {
+		return AppendNullBulk(reply)
+	}
+	return AppendBulk(reply, e)
+}
+
+// blmoveCmd is BLMOVE source destination LEFT|RIGHT LEFT|RIGHT
+// timeout, and brpoplpushCmd is BRPOPLPUSH source destination timeout:
+// the move behind the blocking loop, waiting on source alone, with the
+// nil bulk at the deadline (the target forms' timeout reply, not the
+// pops' null array).
+func (s *Server) blmoveCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) != 6 {
+		return arityErr(reply, "BLMOVE")
+	}
+	srcLeft, ok1 := parseLR(args[3])
+	dstLeft, ok2 := parseLR(args[4])
+	if !ok1 || !ok2 {
+		return AppendError(reply, "ERR syntax error")
+	}
+	return s.blmoveBlock(ctx, reply, args[1], args[2], srcLeft, dstLeft, args[5])
+}
+
+func (s *Server) brpoplpushCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) != 4 {
+		return arityErr(reply, "BRPOPLPUSH")
+	}
+	return s.blmoveBlock(ctx, reply, args[1], args[2], false, true, args[3])
+}
+
+// blmoveBlock parses the timeout and runs the blocking move loop.
+func (s *Server) blmoveBlock(ctx context.Context, reply, src, dst []byte, srcLeft, dstLeft bool, timeoutArg []byte) []byte {
+	timeout, errMsg := parseZTimeout(timeoutArg)
+	if errMsg != "" {
+		return AppendError(reply, errMsg)
+	}
+	return s.zblock(reply, [][]byte{src}, timeout, AppendNullBulk, func(reply, key []byte) ([]byte, bool, error) {
+		e, ok, err := s.l.Move(ctx, key, dst, srcLeft, dstLeft)
+		if err != nil || !ok {
+			return reply, false, err
+		}
+		return AppendBulk(reply, e), true, nil
+	})
+}
+
 // blmpopCmd is BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT
 // count]: LMPOP's reply behind the blocking loop.
 func (s *Server) blmpopCmd(ctx context.Context, reply []byte, args [][]byte) []byte {

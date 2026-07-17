@@ -273,6 +273,24 @@ func TestServerBListBlocking(t *testing.T) {
 	send(pusher, "SET", "turnstr", "v")
 	expect(t, pr, "+OK\r\n")
 	expect(t, r4, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+
+	// BRPOPLPUSH wakes on a push to its source and lands the element on
+	// the destination; the served waiter's own push then wakes a BLMOVE
+	// chained off that destination.
+	w5, r5 := dial()
+	w6, r6 := dial()
+	send(w5, "BRPOPLPUSH", "chain1", "chain2", "5")
+	time.Sleep(100 * time.Millisecond)
+	send(w6, "BLMOVE", "chain2", "chain3", "LEFT", "RIGHT", "5")
+	time.Sleep(100 * time.Millisecond)
+	send(pusher, "RPUSH", "chain1", "link")
+	expect(t, pr, ":1\r\n")
+	expect(t, r5, "$4\r\nlink\r\n")
+	expect(t, r6, "$4\r\nlink\r\n")
+	send(pusher, "LRANGE", "chain3", "0", "-1")
+	expect(t, pr, respArr("link"))
+	send(pusher, "TYPE", "chain2")
+	expect(t, pr, "+none\r\n")
 }
 
 // TestServerListPositionalSurface is the inline-tier wire surface for
@@ -652,4 +670,114 @@ func TestServerListScan(t *testing.T) {
 		send(cmd...)
 		expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
 	}
+}
+
+// TestServerListMove is the LMOVE and RPOPLPUSH wire surface: the four
+// direction pairs, the alias, same-key rotation, the nil bulk for a
+// missing source, the option and arity doors, and the type doors with
+// the untouched side checked. The blocking forms answer their
+// present-data and timeout shapes here; the wake path rides
+// TestServerBListBlocking.
+func TestServerListMove(t *testing.T) {
+	c, r := startServer(t)
+	send := func(args ...string) {
+		t.Helper()
+		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send("RPUSH", "src", "a", "b", "c")
+	expect(t, r, ":3\r\n")
+	send("RPUSH", "dsl", "x")
+	expect(t, r, ":1\r\n")
+
+	// The four direction pairs move exactly one element each.
+	send("LMOVE", "src", "dsl", "LEFT", "RIGHT")
+	expect(t, r, "$1\r\na\r\n")
+	send("LMOVE", "src", "dsl", "RIGHT", "LEFT")
+	expect(t, r, "$1\r\nc\r\n")
+	send("LRANGE", "dsl", "0", "-1")
+	expect(t, r, respArr("c", "x", "a"))
+	send("lmove", "src", "dsl", "left", "left")
+	expect(t, r, "$1\r\nb\r\n")
+	send("TYPE", "src")
+	expect(t, r, "+none\r\n")
+	send("LMOVE", "src", "dsl", "LEFT", "LEFT")
+	expect(t, r, "$-1\r\n")
+	send("LRANGE", "dsl", "0", "-1")
+	expect(t, r, respArr("b", "c", "x", "a"))
+
+	// RPOPLPUSH is the fixed right-to-left form.
+	send("RPOPLPUSH", "dsl", "side")
+	expect(t, r, "$1\r\na\r\n")
+	send("RPOPLPUSH", "nokey", "side")
+	expect(t, r, "$-1\r\n")
+	send("LRANGE", "side", "0", "-1")
+	expect(t, r, respArr("a"))
+
+	// Same-key rotation: opposite ends rotate, the same end answers
+	// without moving anything.
+	send("RPUSH", "rot", "1", "2", "3")
+	expect(t, r, ":3\r\n")
+	send("LMOVE", "rot", "rot", "LEFT", "RIGHT")
+	expect(t, r, "$1\r\n1\r\n")
+	send("LRANGE", "rot", "0", "-1")
+	expect(t, r, respArr("2", "3", "1"))
+	send("LMOVE", "rot", "rot", "RIGHT", "LEFT")
+	expect(t, r, "$1\r\n1\r\n")
+	send("LMOVE", "rot", "rot", "RIGHT", "RIGHT")
+	expect(t, r, "$1\r\n3\r\n")
+	send("LRANGE", "rot", "0", "-1")
+	expect(t, r, respArr("1", "2", "3"))
+
+	// The doors: direction tokens, arity, timeouts, wrong types.
+	send("LMOVE", "rot", "dsl", "SIDEWAYS", "LEFT")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("LMOVE", "rot", "dsl", "LEFT", "UP")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("LMOVE", "rot", "dsl", "LEFT")
+	expect(t, r, "-ERR wrong number of arguments for 'lmove' command\r\n")
+	send("RPOPLPUSH", "rot")
+	expect(t, r, "-ERR wrong number of arguments for 'rpoplpush' command\r\n")
+	send("BLMOVE", "rot", "dsl", "LEFT", "LEFT", "x")
+	expect(t, r, "-ERR timeout is not a float or out of range\r\n")
+	send("BLMOVE", "rot", "dsl", "MID", "LEFT", "0")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("BRPOPLPUSH", "rot", "dsl", "-1")
+	expect(t, r, "-ERR timeout is negative\r\n")
+	send("SET", "str", "v")
+	expect(t, r, "+OK\r\n")
+	send("LMOVE", "str", "dsl", "LEFT", "LEFT")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	send("LMOVE", "dsl", "str", "LEFT", "LEFT")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	send("LRANGE", "dsl", "0", "-1")
+	expect(t, r, respArr("b", "c", "x"))
+
+	// Blocking forms with data present serve immediately; empty waits
+	// lapse to the nil bulk, the target forms' timeout reply.
+	send("BLMOVE", "dsl", "side", "RIGHT", "LEFT", "0")
+	expect(t, r, "$1\r\nx\r\n")
+	send("BRPOPLPUSH", "side", "dsl", "0")
+	expect(t, r, "$1\r\na\r\n")
+	send("BLMOVE", "nokey", "side", "LEFT", "LEFT", "0.05")
+	expect(t, r, "$-1\r\n")
+	send("BRPOPLPUSH", "nokey", "side", "0.05")
+	expect(t, r, "$-1\r\n")
+
+	// A noded source hands its edge across in O(1) nodes.
+	big := make([]string, 0, 301)
+	big = append(big, "RPUSH", "big")
+	for i := range 299 {
+		big = append(big, fmt.Sprintf("v%03d", i))
+	}
+	send(big...)
+	expect(t, r, ":299\r\n")
+	send("LMOVE", "big", "small", "RIGHT", "LEFT")
+	expect(t, r, "$4\r\nv298\r\n")
+	send("LLEN", "big")
+	expect(t, r, ":298\r\n")
+	send("LRANGE", "small", "0", "-1")
+	expect(t, r, respArr("v298"))
 }

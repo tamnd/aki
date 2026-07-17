@@ -1098,6 +1098,14 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.blpopCmd(ctx, reply, args, cmd, false)
 	case "BLMPOP":
 		return s.blmpopCmd(ctx, reply, args)
+	case "LMOVE":
+		return s.lmoveCmd(ctx, reply, args)
+	case "RPOPLPUSH":
+		return s.rpoplpushCmd(ctx, reply, args)
+	case "BLMOVE":
+		return s.blmoveCmd(ctx, reply, args)
+	case "BRPOPLPUSH":
+		return s.brpoplpushCmd(ctx, reply, args)
 	case "LLEN":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)

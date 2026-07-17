@@ -184,6 +184,10 @@ type List struct {
 	valBuf []byte
 	valOff [][2]int
 	vals   [][]byte
+
+	// moveBuf carries Move's element across the pop and push that
+	// recycle every read view and the pop reply buffers.
+	moveBuf []byte
 }
 
 // NewList builds the list layer over t. The store must carry the
