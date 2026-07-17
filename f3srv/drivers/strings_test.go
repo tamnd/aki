@@ -155,6 +155,53 @@ func TestSetnx(t *testing.T) {
 	expect(t, br, "$5\r\nthree\r\n")
 }
 
+// TestGenericExpiryRead walks the read-only expiry queries TTL, PTTL,
+// EXPIRETIME, and PEXPIRETIME across the three states each reports: a missing
+// key answers -2, a key with no deadline answers -1, and a key with a deadline
+// answers its remaining or absolute time.
+func TestGenericExpiryRead(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// Missing key is -2 for every query.
+	for _, q := range []string{"TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME"} {
+		send(t, nc, q, "missing")
+		expect(t, br, ":-2\r\n")
+	}
+
+	// A key with no deadline is -1 for every query.
+	send(t, nc, "SET", "k", "v")
+	expect(t, br, "+OK\r\n")
+	for _, q := range []string{"TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME"} {
+		send(t, nc, q, "k")
+		expect(t, br, ":-1\r\n")
+	}
+
+	// A set key exists but carries no key-level deadline, so it too is -1.
+	if _, err := nc.Write([]byte(cmd("SADD", "s", "m"))); err != nil {
+		t.Fatal(err)
+	}
+	expect(t, br, ":1\r\n")
+	send(t, nc, "TTL", "s")
+	expect(t, br, ":-1\r\n")
+
+	// A key with a 100s deadline reports remaining time within a second of it,
+	// and the absolute queries agree: EXPIRETIME is PEXPIRETIME floored to
+	// seconds off the one fixed deadline.
+	send(t, nc, "SET", "e", "v", "EX", "100")
+	expect(t, br, "+OK\r\n")
+	if ttl := readInt(t, nc, br, "TTL", "e"); ttl < 96 || ttl > 100 {
+		t.Fatalf("TTL = %d, want within (96,100]", ttl)
+	}
+	if pttl := readInt(t, nc, br, "PTTL", "e"); pttl < 95001 || pttl > 100000 {
+		t.Fatalf("PTTL = %d, want within (95000,100000]", pttl)
+	}
+	pexp := readInt(t, nc, br, "PEXPIRETIME", "e")
+	exp := readInt(t, nc, br, "EXPIRETIME", "e")
+	if pexp <= 0 || exp != pexp/1000 {
+		t.Fatalf("EXPIRETIME %d and PEXPIRETIME %d disagree", exp, pexp)
+	}
+}
+
 // TestSetOptions exercises the NX/XX/GET/KEEPTTL/expiry option matrix against
 // the Redis answers.
 func TestSetOptions(t *testing.T) {

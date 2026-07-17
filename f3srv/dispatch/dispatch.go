@@ -146,6 +146,12 @@ func init() {
 	register("EXISTS", set.Exists, 1, -1, true)
 	register("DEL", set.Del, 1, -1, true)
 	register("UNLINK", set.Del, 1, -1, true)
+	// The read-only expiry queries span the same set-plus-string keyspace as
+	// TYPE and single-key EXISTS, so the set package owns them too.
+	register("TTL", set.Ttl, 1, 1, true)
+	register("PTTL", set.Pttl, 1, 1, true)
+	register("EXPIRETIME", set.Expiretime, 1, 1, true)
+	register("PEXPIRETIME", set.Pexpiretime, 1, 1, true)
 	register("MGET", nil, 1, -1, true)
 	register("MSET", nil, 2, -1, true)
 	registerFan("EXISTS", shard.FanCount, exists, false, false)
