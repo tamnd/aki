@@ -2,6 +2,7 @@ package akifile
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -230,6 +231,157 @@ func TestCompactValuesFailsClosedOnTornSource(t *testing.T) {
 	dev.buf[ptrs[1].ValueOff+1] ^= 0xff
 	if _, err := f.CompactValues(0, 2, ptrs); err != ErrChecksum {
 		t.Fatalf("compact of a torn source = %v, want ErrChecksum", err)
+	}
+}
+
+// TestWalkValuesEnumeratesEveryFrame appends two value_log batches and confirms
+// the walk yields every value in file order, each pointer resolving to its bytes:
+// the candidate set the store's compaction maps against its index.
+func TestWalkValuesEnumeratesEveryFrame(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	first := [][]byte{[]byte("a"), bytes.Repeat([]byte("z"), 3000), []byte("bb")}
+	second := [][]byte{[]byte("ccc"), []byte("d")}
+	if _, err := f.AppendValues(0, 1, first); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+	if _, err := f.AppendValues(0, 2, second); err != nil {
+		t.Fatalf("second append: %v", err)
+	}
+
+	want := append(append([][]byte{}, first...), second...)
+	var got [][]byte
+	err := f.WalkValues(PageSize, func(p ValuePointer) error {
+		v, err := f.ReadValueAt(p, nil)
+		if err != nil {
+			return err
+		}
+		got = append(got, append([]byte{}, v...))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("walked %d values, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Fatalf("value %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestWalkValuesSkipsOtherKinds interleaves a log segment between two value
+// batches and confirms the walk descends into value_log segments only, so the
+// log payload never reaches the frame parser.
+func TestWalkValuesSkipsOtherKinds(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	if _, err := f.AppendValues(0, 1, [][]byte{[]byte("before")}); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+	if _, err := f.AppendGroup([]Pending{{Shard: 0, Kind: KindLog, ShardSeq: 2, Payload: []byte("not a value frame")}}); err != nil {
+		t.Fatalf("log append: %v", err)
+	}
+	if _, err := f.AppendValues(0, 3, [][]byte{[]byte("after")}); err != nil {
+		t.Fatalf("second append: %v", err)
+	}
+
+	var got []string
+	if err := f.WalkValues(PageSize, func(p ValuePointer) error {
+		v, err := f.ReadValueAt(p, nil)
+		if err != nil {
+			return err
+		}
+		got = append(got, string(v))
+		return nil
+	}); err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(got) != 2 || got[0] != "before" || got[1] != "after" {
+		t.Fatalf("walked %v, want [before after]", got)
+	}
+}
+
+// TestWalkValuesRespectsFrom starts the walk past the first segment and confirms
+// only the later batch's values are visited: the store resumes a partial scan
+// from a known offset without rewalking what it already accounted.
+func TestWalkValuesRespectsFrom(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	if _, err := f.AppendValues(0, 1, [][]byte{[]byte("early")}); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+	from := f.Cursor()
+	if _, err := f.AppendValues(0, 2, [][]byte{[]byte("late")}); err != nil {
+		t.Fatalf("second append: %v", err)
+	}
+
+	var got []string
+	if err := f.WalkValues(from, func(p ValuePointer) error {
+		v, err := f.ReadValueAt(p, nil)
+		if err != nil {
+			return err
+		}
+		got = append(got, string(v))
+		return nil
+	}); err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(got) != 1 || got[0] != "late" {
+		t.Fatalf("walked %v, want [late]", got)
+	}
+}
+
+// TestWalkValuesPropagatesVisitError confirms a visit error stops the walk and
+// surfaces unchanged, so a caller can abort the scan on the first live-set
+// decision it cannot make.
+func TestWalkValuesPropagatesVisitError(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+
+	if _, err := f.AppendValues(0, 1, [][]byte{[]byte("a"), []byte("b"), []byte("c")}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	stop := errors.New("stop")
+	seen := 0
+	err := f.WalkValues(PageSize, func(ValuePointer) error {
+		seen++
+		if seen == 2 {
+			return stop
+		}
+		return nil
+	})
+	if err != stop {
+		t.Fatalf("walk err = %v, want stop", err)
+	}
+	if seen != 2 {
+		t.Fatalf("visited %d values before the stop, want 2", seen)
+	}
+}
+
+// TestWalkValuesEmptyRegionVisitsNothing walks a file with no value_log segments
+// and confirms the walk completes without a visit.
+func TestWalkValuesEmptyRegionVisitsNothing(t *testing.T) {
+	dev := &memDevice{}
+	f := newTestFile(t, dev, SyncNo, nil)
+	if _, err := f.AppendGroup([]Pending{{Shard: 0, Kind: KindLog, ShardSeq: 1, Payload: []byte("log only")}}); err != nil {
+		t.Fatalf("log append: %v", err)
+	}
+	visited := false
+	if err := f.WalkValues(PageSize, func(ValuePointer) error {
+		visited = true
+		return nil
+	}); err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if visited {
+		t.Fatalf("walk visited a value in a file with no value_log segments")
 	}
 }
 

@@ -115,6 +115,45 @@ func (f *File) CompactValues(shard uint16, shardSeq uint64, live []ValuePointer)
 	return ptrs, nil
 }
 
+// WalkValues walks every value_log segment in the append space from `from` up to
+// the durable tail and calls visit for each framed value with an absolute
+// ValuePointer, the enumerate side of the value-log re-home's compaction. The
+// store maps each pointer's offset onto its index to decide which values a
+// segment still has live, then hands the live subset back to CompactValues; this
+// is how it builds that subset without holding a per-value directory of its own.
+//
+// It reuses ScanSegments' tail walk, so it stops exactly where recovery would
+// resume, and it only descends into value_log segments, skipping the log,
+// checkpoint, and cold segments interleaved in the same append space. The payload
+// a segment hands back is the exact framed run (no padding), so the frame walk
+// consumes it end to end. A torn frame stops the walk with an error, the same
+// durable cut a recovering reader takes; a visit that returns an error stops it
+// too and the error propagates.
+func (f *File) WalkValues(from uint64, visit func(ValuePointer) error) error {
+	_, err := ReplayTail(f.dev, f.prefix, from, f.cursor, func(off uint64, h *SegHeader, payload []byte) error {
+		if h.Kind != KindValueLog {
+			return nil
+		}
+		base := off + SegHeaderLen
+		for cur := uint64(0); cur < uint64(len(payload)); {
+			fr, _, next, err := NextValueFrame(payload, cur)
+			if err != nil {
+				return err
+			}
+			if err := visit(ValuePointer{
+				ValueOff: base + fr.ValueOff,
+				ValueLen: fr.ValueLen,
+				ValueCRC: fr.CRC,
+			}); err != nil {
+				return err
+			}
+			cur = next
+		}
+		return nil
+	})
+	return err
+}
+
 // ReadValueFrameAt reads a value the caller located by only its offset and length,
 // verifying the torn-blob guard off the frame's own trailing CRC32C instead of a
 // stored one. It reads value_len bytes plus the four CRC bytes the frame trails
