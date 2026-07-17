@@ -264,6 +264,115 @@ func persistField(h *hash, f []byte) int64 {
 	return 1
 }
 
+// getexMode is what HGETEX does to each field's TTL alongside the read.
+type getexMode uint8
+
+const (
+	getexNone    getexMode = iota // no option: read only, leave every TTL as is
+	getexPersist                  // PERSIST: clear each read field's TTL
+	getexSet                      // EX/PX/EXAT/PXAT: set each read field's TTL to at
+)
+
+// Hgetex answers HGETEX key [EX s | PX ms | EXAT ts | PXAT tms | PERSIST] FIELDS n
+// field...: return each field's value, nil when it is absent, and reset or clear
+// its TTL in the same step. Values are read into the reply before any TTL change,
+// so a set-to-the-past that deletes a field still answers the value it held. No
+// option leaves every field's TTL untouched, the plain HMGET read (spec 2064/f3/10
+// section 7.4).
+func Hgetex(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	at, mode, rest, oerr := parseGetexOption("hgetex", args[1:], cx.NowMs)
+	if oerr != "" {
+		r.Err(oerr)
+		return
+	}
+	fields, _, ferr := parseFieldsClause("hgetex", rest, false)
+	if ferr != "" {
+		r.Err(ferr)
+		return
+	}
+	g := registry(cx)
+	h, wrong := g.lookup(cx, args[0])
+	if wrong {
+		r.Err(wrongType)
+		return
+	}
+	out := resp.AppendArrayHeader(cx.Aux[:0], len(fields))
+	if h == nil {
+		for range fields {
+			out = resp.AppendNull(out)
+		}
+		cx.Aux = out
+		r.Raw(out)
+		return
+	}
+	now := uint64(cx.NowMs)
+	for _, f := range fields {
+		if v, ok := h.get(f); ok {
+			out = resp.AppendBulk(out, v)
+		} else {
+			out = resp.AppendNull(out)
+		}
+	}
+	cx.Aux = out
+	switch mode {
+	case getexSet:
+		for _, f := range fields {
+			applyExpiry(h, f, at, condNone, now)
+		}
+	case getexPersist:
+		for _, f := range fields {
+			persistField(h, f)
+		}
+	}
+	// A read-only HGETEX changes no footprint, but a TTL set may have flipped the
+	// hash to its listpackex blob or deleted a set-to-the-past field, so reconcile
+	// whenever an option ran.
+	if mode != getexNone {
+		if h.card() == 0 {
+			g.drop(args[0])
+		} else {
+			g.note(h)
+		}
+	}
+	r.Raw(out)
+}
+
+// parseGetexOption reads HGETEX's optional leading TTL directive and returns the
+// resulting absolute-ms expiry (for getexSet), the mode, the remaining tail that
+// begins the FIELDS clause, or a Redis error string. An absent or unrecognized
+// leading token is no option: the tail is returned whole for the FIELDS parser to
+// judge, so a bogus token surfaces as its unknown-argument error, not here.
+func parseGetexOption(cmd string, rest [][]byte, now int64) (int64, getexMode, [][]byte, string) {
+	if len(rest) == 0 {
+		return 0, getexNone, rest, ""
+	}
+	if eqFold(rest[0], "PERSIST") {
+		return 0, getexPersist, rest[1:], ""
+	}
+	var unitMs int64
+	var absolute bool
+	switch {
+	case eqFold(rest[0], "EX"):
+		unitMs, absolute = 1000, false
+	case eqFold(rest[0], "PX"):
+		unitMs, absolute = 1, false
+	case eqFold(rest[0], "EXAT"):
+		unitMs, absolute = 1000, true
+	case eqFold(rest[0], "PXAT"):
+		unitMs, absolute = 1, true
+	default:
+		return 0, getexNone, rest, ""
+	}
+	if len(rest) < 2 {
+		return 0, getexNone, nil, "ERR wrong number of arguments for '" + cmd + "' command"
+	}
+	at, aerr := parseExpiry(cmd, rest[1], now, unitMs, absolute)
+	if aerr != "" {
+		return 0, getexNone, nil, aerr
+	}
+	return at, getexSet, rest[2:], ""
+}
+
 // parseExpiry reads a setter's time argument and returns the resulting absolute
 // unix-ms expiry, or a Redis error string. A negative argument is refused up front
 // (the must-be-non-negative error, all four setters), and a result past the 2^46-1
