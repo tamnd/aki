@@ -198,6 +198,14 @@ func (w *worker) applyIntentOp(o *intentOp) {
 		w.unlockIntent(o.in)
 		close(o.done)
 	case opRun:
+		// The closure runs between commands, but curConn still names the
+		// previous command's connection: an emission inside it would mark
+		// against that stranger, and the connection's next command would
+		// merge marks it never emitted and hold on them. Clear the pair so
+		// tier-two emissions register nothing (relaxed-only, the FanTxn
+		// interim noted in doc 04 section 3.2).
+		w.cx.curConn = nil
+		w.cx.curSeq = 0
 		o.fn(&w.cx)
 		close(o.done)
 	case opRelease:
@@ -206,6 +214,8 @@ func (w *worker) applyIntentOp(o *intentOp) {
 			close(o.done)
 		}
 	case opAsync:
+		w.cx.curConn = nil // same stale-mark hazard as opRun
+		w.cx.curSeq = 0
 		o.fn(&w.cx)
 	}
 }

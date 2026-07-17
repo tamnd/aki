@@ -1,5 +1,7 @@
 package shard
 
+import "errors"
+
 // The durability seam (spec 2064/obs1 doc 04 sections 1 and 3.1). A write
 // handler applies to RAM through the store as before, then emits the op's
 // post-decision effect frame through the Ctx log, then writes its reply.
@@ -86,6 +88,48 @@ func (cx *Ctx) LogKeyDel(key []byte) error {
 	}
 	cx.noteMark(group, seq)
 	return nil
+}
+
+// LogStrReadBack frames a write whose resulting string lives only in the
+// store (APPEND, SETRANGE, SETBIT, BITFIELD, BITOP, the HLL surface): the
+// whole value is read back, chunked values assembled through the stream
+// the giant band serves reads with, and the deadline that rode through the
+// write is read beside it. Free when no log is wired. An absent key frames
+// nothing: the caller's write just landed, so absence only means the write
+// itself removed the key, and the caller emits the keydel. A non-nil
+// error's text is the wire reply, the LogStrSet contract.
+func (cx *Ctx) LogStrReadBack(key []byte) error {
+	if cx.Log == nil {
+		return nil
+	}
+	v, cs, ok := cx.St.GetStream(key, cx.NowMs, cx.Val)
+	cx.Val = v
+	if !ok {
+		return nil
+	}
+	if cs != nil {
+		total := int(cs.Total())
+		if cap(cx.Val) < total {
+			cx.Val = make([]byte, total)
+		}
+		buf := cx.Val[:total]
+		filled := 0
+		for filled < total {
+			n, err := cs.Next(buf[filled:])
+			if err != nil || n == 0 {
+				cs.Release()
+				if err != nil {
+					return errors.New("ERR " + err.Error())
+				}
+				break
+			}
+			filled += n
+		}
+		cs.Release()
+		v = buf[:filled]
+		cx.Val = v
+	}
+	return cx.LogStrSet(key, v, cx.St.ExpireAt(key, cx.NowMs), false)
 }
 
 // noteMark records an emitted frame on the running command when its

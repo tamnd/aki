@@ -132,7 +132,8 @@ func Append(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(storeErr(err))
 		return
 	}
-	if !logReadBack(cx, args[0], r) {
+	if err := cx.LogStrReadBack(args[0]); err != nil {
+		r.Err(err.Error())
 		return
 	}
 	r.Int(n)
@@ -169,7 +170,8 @@ func SetRange(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(storeErr(err))
 		return
 	}
-	if !logReadBack(cx, args[0], r) {
+	if err := cx.LogStrReadBack(args[0]); err != nil {
+		r.Err(err.Error())
 		return
 	}
 	r.Int(n)
