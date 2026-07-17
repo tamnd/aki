@@ -183,6 +183,23 @@ func (s *Server) lrangeCmd(ctx context.Context, reply []byte, args [][]byte) []b
 	return reply
 }
 
+// ltrimCmd is LTRIM key start stop: always OK, a missing key
+// included, and an empty window deletes the key.
+func (s *Server) ltrimCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) != 4 {
+		return arityErr(reply, "LTRIM")
+	}
+	start, ok1 := parseCanonicalInt(args[2])
+	stop, ok2 := parseCanonicalInt(args[3])
+	if !ok1 || !ok2 {
+		return AppendError(reply, "ERR value is not an integer or out of range")
+	}
+	if err := s.l.Trim(ctx, args[1], start, stop); err != nil {
+		return storeErr(reply, err)
+	}
+	return AppendSimple(reply, "OK")
+}
+
 // blmpopCmd is BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT
 // count]: LMPOP's reply behind the blocking loop.
 func (s *Server) blmpopCmd(ctx context.Context, reply []byte, args [][]byte) []byte {

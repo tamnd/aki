@@ -445,3 +445,72 @@ func TestServerListPositionalNoded(t *testing.T) {
 	send("LLEN", "up")
 	expect(t, r, ":3\r\n")
 }
+
+// TestServerListTrim is LTRIM over the wire: the clamp grammar on both
+// tiers, the always-OK contract, the empty-window key delete, and the
+// doors.
+func TestServerListTrim(t *testing.T) {
+	c, r := startServer(t)
+	send := func(args ...string) {
+		t.Helper()
+		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send("RPUSH", "l", "a", "b", "c", "d", "e")
+	expect(t, r, ":5\r\n")
+	send("LTRIM", "l", "1", "-2")
+	expect(t, r, "+OK\r\n")
+	send("LRANGE", "l", "0", "-1")
+	expect(t, r, respArr("b", "c", "d"))
+	send("LTRIM", "l", "-100", "100")
+	expect(t, r, "+OK\r\n")
+	send("LLEN", "l")
+	expect(t, r, ":3\r\n")
+
+	// The empty window deletes the key; a missing key is still OK.
+	send("LTRIM", "l", "5", "1")
+	expect(t, r, "+OK\r\n")
+	send("TYPE", "l")
+	expect(t, r, "+none\r\n")
+	send("LTRIM", "l", "0", "-1")
+	expect(t, r, "+OK\r\n")
+
+	// A noded list trims across node boundaries and stays exact.
+	const n = 3000
+	elems := make([]string, n)
+	for i := range elems {
+		elems[i] = fmt.Sprintf("e%04d", i)
+	}
+	send(append([]string{"RPUSH", "big"}, elems...)...)
+	expect(t, r, fmt.Sprintf(":%d\r\n", n))
+	send("LTRIM", "big", "1000", "1004")
+	expect(t, r, "+OK\r\n")
+	send("LRANGE", "big", "0", "-1")
+	expect(t, r, respArr("e1000", "e1001", "e1002", "e1003", "e1004"))
+	send("LLEN", "big")
+	expect(t, r, ":5\r\n")
+
+	// The capped-feed shape: push then trim to the cap, every op.
+	send("DEL", "feed")
+	expect(t, r, ":0\r\n")
+	for i := range 10 {
+		send("LPUSH", "feed", fmt.Sprintf("f%d", i))
+		expect(t, r, fmt.Sprintf(":%d\r\n", min(i+1, 5)))
+		send("LTRIM", "feed", "0", "3")
+		expect(t, r, "+OK\r\n")
+	}
+	send("LRANGE", "feed", "0", "-1")
+	expect(t, r, respArr("f9", "f8", "f7", "f6"))
+
+	// The doors: parse, arity, wrong type.
+	send("LTRIM", "big", "x", "1")
+	expect(t, r, "-ERR value is not an integer or out of range\r\n")
+	send("LTRIM", "big", "0")
+	expect(t, r, "-ERR wrong number of arguments for 'ltrim' command\r\n")
+	send("SET", "str", "v")
+	expect(t, r, "+OK\r\n")
+	send("LTRIM", "str", "0", "1")
+	expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+}
