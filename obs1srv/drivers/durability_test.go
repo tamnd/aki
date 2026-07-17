@@ -469,6 +469,173 @@ func TestDurabilityStrictFanHoldsPipeline(t *testing.T) {
 	expectBulk(t, r, []byte("1"))
 }
 
+// TestDurabilityBitAndHLLFrames drives the bit-op and HLL write surface
+// over the socket and checks the flushed frames carry post-decision
+// effects: the whole value after SETBIT and a writing BITFIELD, the
+// destination's resulting bytes after BITOP on both the point and the
+// cross-shard route, a keydel when an all-empty source set removed the
+// destination, and the sketch bytes behind PFADD, the PFCOUNT cache
+// write-back, and PFMERGE. Key sets are chosen so the tagged BITOP and
+// PFMERGE stay co-located (the point path) while xd/cs and pfd/hll1 span
+// the two shards (the cross path); the frame contract is the same on both.
+func TestDurabilityBitAndHLLFrames(t *testing.T) {
+	wl, store, nc, r, _ := startLoggedServer(t, false)
+	const node = uint64(0xE1)
+
+	seqs := map[uint16]uint64{}
+	emit := func(key string) {
+		_, g := clusterMapKey([]byte(key))
+		seqs[g]++
+	}
+
+	send(t, nc, "SETBIT", "bm", "7", "1")
+	expect(t, r, ":0\r\n")
+	emit("bm")
+	send(t, nc, "BITFIELD", "bf", "SET", "u8", "0", "255")
+	expect(t, r, "*1\r\n:0\r\n")
+	emit("bf")
+	// A GET-only BITFIELD mutates nothing and frames nothing.
+	send(t, nc, "BITFIELD", "bf", "GET", "u8", "0")
+	expect(t, r, "*1\r\n:255\r\n")
+
+	// Point BITOP: the hash tag holds every operand on one shard.
+	send(t, nc, "SET", "{t}s1", "abc")
+	expect(t, r, "+OK\r\n")
+	emit("{t}s1")
+	send(t, nc, "SET", "{t}s2", "abd")
+	expect(t, r, "+OK\r\n")
+	emit("{t}s2")
+	send(t, nc, "BITOP", "XOR", "{t}d", "{t}s1", "{t}s2")
+	expect(t, r, ":3\r\n")
+	emit("{t}d")
+	// Point BITOP whose all-empty sources delete an existing destination.
+	send(t, nc, "SET", "{e}d", "v")
+	expect(t, r, "+OK\r\n")
+	emit("{e}d")
+	send(t, nc, "BITOP", "AND", "{e}d", "{e}1", "{e}2")
+	expect(t, r, ":0\r\n")
+	emit("{e}d")
+	// No destination and no sources: no effect, no frame.
+	send(t, nc, "BITOP", "AND", "nd", "n1", "n2")
+	expect(t, r, ":0\r\n")
+
+	// Cross BITOP: xd sits on the other shard from cs0, so the operand set
+	// spans shards and rides the intent transaction.
+	send(t, nc, "SET", "cs0", "ab")
+	expect(t, r, "+OK\r\n")
+	emit("cs0")
+	send(t, nc, "SET", "cs4", "a")
+	expect(t, r, "+OK\r\n")
+	emit("cs4")
+	send(t, nc, "BITOP", "OR", "xd", "cs0", "cs4")
+	expect(t, r, ":2\r\n")
+	emit("xd")
+	// Cross BITOP with every source missing deletes the destination.
+	send(t, nc, "BITOP", "AND", "xd", "cs1", "cs2")
+	expect(t, r, ":0\r\n")
+	emit("xd")
+
+	send(t, nc, "PFADD", "hll1", "x", "y", "z")
+	expect(t, r, ":1\r\n")
+	emit("hll1")
+	// The first PFCOUNT recomputes and writes the cache back, a framed
+	// write; the second hits the cache and frames nothing.
+	send(t, nc, "PFCOUNT", "hll1")
+	expect(t, r, ":3\r\n")
+	emit("hll1")
+	send(t, nc, "PFCOUNT", "hll1")
+	expect(t, r, ":3\r\n")
+
+	// Co-located PFMERGE under a hash tag, then a cross one: pfd is on the
+	// other shard from hll1.
+	send(t, nc, "PFADD", "{h}1", "a", "b")
+	expect(t, r, ":1\r\n")
+	emit("{h}1")
+	send(t, nc, "PFMERGE", "{h}d", "{h}1")
+	expect(t, r, "+OK\r\n")
+	emit("{h}d")
+	send(t, nc, "PFMERGE", "pfd", "hll1")
+	expect(t, r, "+OK\r\n")
+	emit("pfd")
+
+	wl.Barrier()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for g, last := range seqs {
+		if err := wl.Marks().Wait(ctx, g, last); err != nil {
+			t.Fatalf("Wait group %d seq %d: %v", g, last, err)
+		}
+	}
+
+	byKey := map[string][]obs1.Op{}
+	for _, f := range walFrames(t, store, node) {
+		op, err := obs1.DecodeOp(f)
+		if err != nil {
+			t.Fatalf("DecodeOp seq %d: %v", f.Seq, err)
+		}
+		byKey[string(f.Key)] = append(byKey[string(f.Key)], op)
+	}
+
+	total := 0
+	for _, ops := range byKey {
+		total += len(ops)
+	}
+	if total != 16 {
+		t.Fatalf("%d frames flushed, want 16: %v", total, byKey)
+	}
+	if ss := byKey["bm"][0].(obs1.StrSet); string(ss.Value) != "\x01" || ss.Ladder != 0 || ss.ExpiryMS != 0 {
+		t.Fatalf("SETBIT frame = %+v, want the whole one-byte value", ss)
+	}
+	if ops := byKey["bf"]; len(ops) != 1 {
+		t.Fatalf("bf ops = %v, want the writing BITFIELD's frame alone", ops)
+	} else if ss := ops[0].(obs1.StrSet); string(ss.Value) != "\xff" {
+		t.Fatalf("BITFIELD frame = %+v", ss)
+	}
+	if ss := byKey["{t}d"][0].(obs1.StrSet); string(ss.Value) != "\x00\x00\x07" {
+		t.Fatalf("point BITOP frame = %+v, want the XOR bytes", ss)
+	}
+	if ops := byKey["{e}d"]; len(ops) != 2 {
+		t.Fatalf("{e}d ops = %v", ops)
+	} else if _, ok := ops[1].(obs1.KeyDel); !ok {
+		t.Fatalf("empty-result BITOP frame = %+v, want a keydel", ops[1])
+	}
+	if _, ok := byKey["nd"]; ok {
+		t.Fatal("a no-effect BITOP flushed a frame")
+	}
+	if ops := byKey["xd"]; len(ops) != 2 {
+		t.Fatalf("xd ops = %v", ops)
+	} else {
+		if ss := ops[0].(obs1.StrSet); string(ss.Value) != "ab" {
+			t.Fatalf("cross BITOP frame = %+v, want the OR bytes", ss)
+		}
+		if _, ok := ops[1].(obs1.KeyDel); !ok {
+			t.Fatalf("cross empty-result BITOP frame = %+v, want a keydel", ops[1])
+		}
+	}
+	if ops := byKey["hll1"]; len(ops) != 2 {
+		t.Fatalf("hll1 ops = %v, want PFADD then the cache write-back", ops)
+	} else {
+		first := ops[0].(obs1.StrSet)
+		second := ops[1].(obs1.StrSet)
+		if len(first.Value) < 16 || string(first.Value[:4]) != "HYLL" {
+			t.Fatalf("PFADD frame = %+v, want the sketch bytes", first)
+		}
+		if len(second.Value) != len(first.Value) || string(second.Value[:4]) != "HYLL" {
+			t.Fatalf("PFCOUNT write-back frame = %+v", second)
+		}
+	}
+	for _, dest := range []string{"{h}d", "pfd"} {
+		ops := byKey[dest]
+		if len(ops) != 1 {
+			t.Fatalf("%s ops = %v", dest, ops)
+		}
+		ss := ops[0].(obs1.StrSet)
+		if string(ss.Value[:4]) != "HYLL" || len(ss.Value) != 12304 {
+			t.Fatalf("PFMERGE frame for %s = %d bytes, want the dense sketch", dest, len(ss.Value))
+		}
+	}
+}
+
 // TestDurabilityVolatileNode proves the toggle's guard rails on a server
 // with no pipeline: strict is refused (a strict write would hang, not be
 // stricter), relaxed is accepted, and the argument grammar answers in

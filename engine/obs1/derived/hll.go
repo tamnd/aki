@@ -151,6 +151,13 @@ func PfAdd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			r.Err("ERR " + err.Error())
 			return
 		}
+		// The whole sketch is in hand, so the effect frame takes it directly
+		// instead of paying the read-back; the deadline that rode through the
+		// keepttl write is read beside it.
+		if err := cx.LogStrSet(key, blob, cx.St.ExpireAt(key, cx.NowMs), false); err != nil {
+			r.Err(err.Error())
+			return
+		}
 		r.Int(1)
 		return
 	}
@@ -207,6 +214,13 @@ func PfCount(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	writeCache(blob, card)
 	if err := cx.St.SetString(args[0], blob, cx.NowMs, 0, true); err != nil {
 		r.Err("ERR " + err.Error())
+		return
+	}
+	// The cache write-back makes this PFCOUNT a write, so it frames like one:
+	// an unframed header byte would leave replayed state a byte off RAM, and
+	// the crash suite compares state hashes exactly.
+	if err := cx.LogStrSet(args[0], blob, cx.St.ExpireAt(args[0], cx.NowMs), false); err != nil {
+		r.Err(err.Error())
 		return
 	}
 	r.Int(int64(card))

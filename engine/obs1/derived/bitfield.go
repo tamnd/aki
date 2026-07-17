@@ -153,6 +153,7 @@ func bitField(cx *shard.Ctx, args [][]byte, r shard.Reply, ro bool) {
 		}
 	}
 
+	wrote := false
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(ops))
 	for _, op := range ops {
 		switch op.kind {
@@ -166,6 +167,7 @@ func bitField(cx *shard.Ctx, args [][]byte, r shard.Reply, ro bool) {
 				break
 			}
 			writeField(cx, key, op, newVal)
+			wrote = true
 			out = resp.AppendInt(out, old)
 		case bfIncrby:
 			cur := readField(cx, key, op)
@@ -175,10 +177,21 @@ func bitField(cx *shard.Ctx, args [][]byte, r shard.Reply, ro bool) {
 				break
 			}
 			writeField(cx, key, op, newVal)
+			wrote = true
 			out = resp.AppendInt(out, newVal)
 		}
 	}
 	cx.Aux = out
+	// One frame for the whole command once any sub-op landed a write (the
+	// value the store now holds carries every sub-op's effect); a GET-only
+	// or all-FAIL run mutates nothing and frames nothing. The read-back runs
+	// through cx.Val, so the reply building in cx.Aux is untouched.
+	if wrote {
+		if err := cx.LogStrReadBack(key); err != nil {
+			r.Err(err.Error())
+			return
+		}
+	}
 	r.Raw(out)
 }
 

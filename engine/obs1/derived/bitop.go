@@ -36,6 +36,13 @@ func BitOp(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(errBitopNot)
 		return
 	}
+	// The store deletes the destination itself when every source is empty,
+	// so its prior liveness is captured up front to frame that removal; the
+	// probe only runs with a log wired.
+	existed := false
+	if cx.Log != nil {
+		_, existed = cx.St.StrLen(args[1], cx.NowMs)
+	}
 	n, err := cx.St.BitOp(op, args[1], args[2:], cx.NowMs)
 	if err != nil {
 		if err == store.ErrTooBig {
@@ -43,6 +50,15 @@ func BitOp(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			return
 		}
 		r.Err("ERR " + err.Error())
+		return
+	}
+	if n > 0 {
+		err = cx.LogStrReadBack(args[1])
+	} else if existed {
+		err = cx.LogKeyDel(args[1])
+	}
+	if err != nil {
+		r.Err(err.Error())
 		return
 	}
 	r.Int(n)
@@ -87,9 +103,20 @@ func BitOpCross(t *shard.Txn, args [][]byte) []byte {
 		}
 	}
 	// All sources empty: the result is empty, so the destination is deleted and
-	// the reply is 0, the same rule the string type follows.
+	// the reply is 0, the same rule the string type follows. The keydel frames
+	// only when the delete removed something; the emission runs inside the hop
+	// on the destination's owner, which is relaxed-only under the transaction
+	// (the closure runs with no current command, so no strict mark can attach).
 	if maxlen == 0 {
-		t.Do(dest, func(cx *shard.Ctx) { cx.St.Del(dest, cx.NowMs) })
+		var lerr error
+		t.Do(dest, func(cx *shard.Ctx) {
+			if cx.St.Del(dest, cx.NowMs) {
+				lerr = cx.LogKeyDel(dest)
+			}
+		})
+		if lerr != nil {
+			return resp.AppendError(nil, lerr.Error())
+		}
 		return resp.AppendInt(nil, 0)
 	}
 
@@ -164,6 +191,12 @@ func BitOpCross(t *shard.Txn, args [][]byte) []byte {
 				}
 			})
 			if writeErr != nil {
+				// The destination may be partially written (or freshly
+				// deleted with nothing landed yet); frame whatever the store
+				// now holds so replay matches RAM even on the error path.
+				if lerr := logCrossDest(t, dest); lerr != nil {
+					return resp.AppendError(nil, lerr.Error())
+				}
 				if writeErr == store.ErrTooBig {
 					return resp.AppendError(nil, errBitopTooLong)
 				}
@@ -171,7 +204,30 @@ func BitOpCross(t *shard.Txn, args [][]byte) []byte {
 			}
 		}
 	}
+	if err := logCrossDest(t, dest); err != nil {
+		return resp.AppendError(nil, err.Error())
+	}
 	return resp.AppendInt(nil, maxlen)
+}
+
+// logCrossDest frames the destination's state after a cross-shard bit-op
+// pass, on the destination's owner: the whole resulting value read back when
+// the key is live, a keydel when it is not (the error path can leave a fresh
+// destination deleted before any chunk landed; a keydel replaying over an
+// already absent key is an idempotent no-op). Free when no log is wired.
+func logCrossDest(t *shard.Txn, dest []byte) error {
+	var err error
+	t.Do(dest, func(cx *shard.Ctx) {
+		if cx.Log == nil {
+			return
+		}
+		if _, live := cx.St.StrLen(dest, cx.NowMs); live {
+			err = cx.LogStrReadBack(dest)
+		} else {
+			err = cx.LogKeyDel(dest)
+		}
+	})
+	return err
 }
 
 // srcGroup names the sources that share one shard: the coordinator reads them

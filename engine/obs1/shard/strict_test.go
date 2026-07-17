@@ -457,6 +457,53 @@ func TestStrictFanStallHoldsCommittedPrefix(t *testing.T) {
 	}
 }
 
+// TestIntentClosureEmissionRegistersNoMark proves the curConn hygiene in
+// applyIntentOp: a tier-two owner closure runs between commands, where
+// curConn still names the previous command's connection, so an emission
+// inside it must register no mark. Without the clear, the strict GET below
+// would merge a mark it never emitted and hold on a commit forever.
+func TestIntentClosureEmissionRegistersNoMark(t *testing.T) {
+	rt, fl, emitOp := newStrictRuntime()
+	w := rt.workers[0]
+	c := rt.NewConn()
+	c.SetStrictAck(true)
+
+	if err := c.Do(emitOp, true, args("a")); err != nil {
+		t.Fatal(err)
+	}
+	if got := drainAll(c, w); len(got) != 0 {
+		t.Fatalf("strict write answered before commit: %q", got)
+	}
+	if len(fl.pending) != 1 {
+		t.Fatalf("registered %d commit callbacks, want 1", len(fl.pending))
+	}
+	fl.pending[0].fn()
+	c.DrainReplies(func([]byte) {})
+
+	// The worker's curConn still names the strict connection. Run an
+	// emitting owner closure, the shape a cross-shard command's t.Do hop
+	// or a PostOwner side-hop takes.
+	rt.PostOwner(0, func(cx *Ctx) {
+		if err := cx.LogStrSet([]byte("b"), []byte("v"), 0, false); err != nil {
+			t.Errorf("closure emission failed: %v", err)
+		}
+	})
+	if w.advanceIntents() != 1 {
+		t.Fatal("owner closure did not run")
+	}
+
+	if err := c.Do(opGet, true, args("a")); err != nil {
+		t.Fatal(err)
+	}
+	got := drainAll(c, w)
+	if len(got) != 1 || string(got[0]) != "$1\r\nv\r\n" {
+		t.Fatalf("GET after closure emission = %q, want an immediate answer", got)
+	}
+	if len(fl.pending) != 1 {
+		t.Fatalf("callbacks = %d, want the strict write's alone", len(fl.pending))
+	}
+}
+
 // TestStrictEmissionErrorAnswersNow proves a failed emission on a strict
 // connection replies immediately: no frame was buffered, so there is
 // nothing to wait for and the error takes the slot.

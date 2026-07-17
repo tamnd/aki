@@ -85,6 +85,12 @@ func pfDebugGetReg(cx *shard.Ctx, key, blob []byte, r shard.Reply) {
 			r.Err("ERR " + err.Error())
 			return
 		}
+		// The forced promotion is a write, so it frames like one; the dense
+		// bytes are in hand.
+		if err := cx.LogStrSet(key, dense, cx.St.ExpireAt(key, cx.NowMs), false); err != nil {
+			r.Err(err.Error())
+			return
+		}
 		blob = dense
 	}
 	regs := make([]byte, hllRegisters)
@@ -148,6 +154,10 @@ func pfDebugToDense(cx *shard.Ctx, key, blob []byte, r shard.Reply) {
 		}
 		if err := cx.St.SetString(key, dense, cx.NowMs, 0, true); err != nil {
 			r.Err("ERR " + err.Error())
+			return
+		}
+		if err := cx.LogStrSet(key, dense, cx.St.ExpireAt(key, cx.NowMs), false); err != nil {
+			r.Err(err.Error())
 			return
 		}
 	}

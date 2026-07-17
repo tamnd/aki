@@ -45,6 +45,13 @@ func SetBit(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err("ERR " + err.Error())
 		return
 	}
+	// The frame carries the whole resulting value (post-decision effects,
+	// doc 04 section 2), the same read-back APPEND and SETRANGE pay; the
+	// write grew the key to cover the offset, so the key is always live here.
+	if err := cx.LogStrReadBack(args[0]); err != nil {
+		r.Err(err.Error())
+		return
+	}
 	r.Int(int64(old))
 }
 
