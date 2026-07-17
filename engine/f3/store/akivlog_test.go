@@ -139,3 +139,55 @@ func TestAkiVlogSeparatesFlushes(t *testing.T) {
 		}
 	}
 }
+
+// TestOpenWiresAkiValueLog opens a store with an .aki handle and confirms the
+// adapter is constructed for the given shard and usable, while an ordinary Open
+// leaves it nil so the scratch path is untouched.
+func TestOpenWiresAkiValueLog(t *testing.T) {
+	f, err := akifile.Create(filepath.Join(t.TempDir(), "shared.aki"), akifile.CreateOptions{
+		ShardCount:   4,
+		SepThreshold: 64,
+		Sync:         akifile.SyncNo,
+	})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	s, err := Open(Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20, AkiValueLog: f, Shard: 2})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if s.akivlog == nil {
+		t.Fatal("Open with AkiValueLog left the adapter nil")
+	}
+	if s.akivlog.shard != 2 {
+		t.Fatalf("adapter shard = %d, want 2", s.akivlog.shard)
+	}
+	// The wired adapter drives a real cut against the shared file.
+	s.akivlog.stage([]byte("wired"))
+	ptrs, err := s.akivlog.flush()
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	got, err := s.akivlog.readAt(ptrs[0].ValueOff, int(ptrs[0].ValueLen), nil)
+	if err != nil || string(got) != "wired" {
+		t.Fatalf("read back = %q/%v", got, err)
+	}
+	// Close is store-narrow: it must not close the borrowed .aki handle, which
+	// the shard runtime still owns.
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := f.AppendValues(2, 99, [][]byte{[]byte("still-open")}); err != nil {
+		t.Fatalf("shared file unusable after store Close: %v", err)
+	}
+
+	plain, err := Open(Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("plain open: %v", err)
+	}
+	if plain.akivlog != nil {
+		t.Fatal("plain Open built an akivlog adapter")
+	}
+}
