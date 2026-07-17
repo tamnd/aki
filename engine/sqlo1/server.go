@@ -64,6 +64,14 @@ type Server struct {
 	zrarena []byte
 	zrpairs []zbuildPair
 	zlexbuf []byte
+
+	// Blocking pop machinery, zpopcmd.go: waiters sleep on zbcond
+	// (over mu), every dispatch broadcasts on its way out, and zbwait
+	// holds each key's FIFO ticket queue so the longest-blocked
+	// client is served first. zbnext mints the tickets.
+	zbcond *sync.Cond
+	zbnext uint64
+	zbwait map[string][]uint64
 }
 
 // splitPairs fills mkeys and mvals from an even-length key-value
@@ -81,6 +89,8 @@ func (s *Server) splitPairs(pairs [][]byte) {
 // durable rooth leases.
 func NewServer(st Store) (*Server, error) {
 	srv := &Server{now: func() int64 { return time.Now().UnixMilli() }}
+	srv.zbcond = sync.NewCond(&srv.mu)
+	srv.zbwait = map[string][]uint64{}
 	t := NewTiered(st, TieredConfig{
 		Budget: ComputeBudget(serverMemCap, 1),
 		NowMs:  func() int64 { return srv.now() },
@@ -187,6 +197,10 @@ func (s *Server) handleConn(c net.Conn) {
 func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Any command may have produced the data a blocked pop waits on,
+	// so every dispatch wakes the waiters on its way out. The deferred
+	// broadcast runs before the unlock (LIFO), which sync.Cond allows.
+	defer s.zbcond.Broadcast()
 
 	// Re-stamping the exact clock per command is what makes lazy expiry
 	// millisecond-exact at command time (doc 11 E-I1); every expiry this
@@ -993,6 +1007,20 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.zlexcountCmd(ctx, reply, args)
 	case "ZRANGESTORE":
 		return s.zrangestoreCmd(ctx, reply, args)
+	case "ZPOPMIN":
+		return s.zpopCmd(ctx, reply, args, cmd, false)
+	case "ZPOPMAX":
+		return s.zpopCmd(ctx, reply, args, cmd, true)
+	case "ZMPOP":
+		return s.zmpopCmd(ctx, reply, args)
+	case "BZPOPMIN":
+		return s.bzpopCmd(ctx, reply, args, cmd, false)
+	case "BZPOPMAX":
+		return s.bzpopCmd(ctx, reply, args, cmd, true)
+	case "BZMPOP":
+		return s.bzmpopCmd(ctx, reply, args)
+	case "ZRANDMEMBER":
+		return s.zrandCmd(ctx, reply, args)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":

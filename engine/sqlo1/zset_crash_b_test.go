@@ -584,3 +584,239 @@ func TestZSetPagedTornTailMatrix(t *testing.T) {
 		}
 	})
 }
+
+// TestZPopTornTail cuts the WAL after every frame of a pop cadence
+// and demands each pop be all-or-nothing: at every prefix the board
+// holds exactly one of the command-boundary images, never a state
+// with some of a pop's removals applied and others not, with the two
+// families agreeing on whichever image survived. The shrunk caps and
+// fat members push the multi-delete groups through run deaths and the
+// paged fence ladder, and the cadence covers inline pops, paged pops
+// from both ends, a draining pop that retires the plane behind a
+// genbump, and a rebirth.
+func TestZPopTornTail(t *testing.T) {
+	restore := sqlo1.SetZFenceCapsForTest(2, 4, 2, 6)
+	defer restore()
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "torn.aki")
+	db, err := sqlo1b.CreateStore(path, bWalSeg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := newTieredOverB(t, db, 8192, 0, 1)
+	z, err := sqlo1.NewZSet(tr, sqlo1.HashConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := []byte("popboard")
+	flush := func() {
+		t.Helper()
+		if err := tr.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fat := func(i int) string {
+		return fmt.Sprintf("f%03d:%s", i, strings.Repeat("z", 680))
+	}
+
+	universe := []string{}
+	snapshot := func(zz *sqlo1.ZSet) map[string]float64 {
+		t.Helper()
+		img := map[string]float64{}
+		for _, m := range universe {
+			sc, ok, err := zz.MemScoreForTest(ctx, key, []byte(m))
+			if err != nil {
+				t.Fatalf("memScore %s: %v", m, err)
+			}
+			if ok {
+				img[m] = sc
+			}
+		}
+		return img
+	}
+
+	// Every command is its own commit point, so the legal recovered
+	// states are exactly the command-boundary images.
+	var images []map[string]float64
+	images = append(images, map[string]float64{})
+	zadd := func(m string, sc float64) {
+		t.Helper()
+		if _, _, _, _, err := z.ZAdd(ctx, key, []byte(m), sc, sqlo1.ZAddFlags{}); err != nil {
+			t.Fatal(err)
+		}
+		universe = append(universe, m)
+		images = append(images, snapshot(z))
+	}
+	pop := func(count int64, maxSide bool, wantN int) {
+		t.Helper()
+		n := 0
+		err := z.ZPopCount(ctx, key, count, maxSide, func(int64) {}, func(float64, []byte) { n++ })
+		if err != nil {
+			t.Fatalf("ZPopCount(%d, max=%v): %v", count, maxSide, err)
+		}
+		if n != wantN {
+			t.Fatalf("ZPopCount(%d, max=%v) popped %d, want %d", count, maxSide, n, wantN)
+		}
+		images = append(images, snapshot(z))
+	}
+
+	// Phase 1: inline board, inline pops from both ends, inline death.
+	for i := range 5 {
+		zadd(fmt.Sprintf("s%02d", i), float64(i))
+	}
+	flush()
+	pop(2, false, 2)
+	pop(1, true, 1)
+	flush()
+	pop(5, false, 2)
+	flush()
+
+	// Phase 2: fat rebirth through the paged transition, then pops
+	// whose delete groups sweep whole runs and fence pages.
+	for i := range 36 {
+		zadd(fat(i), float64(i%5))
+	}
+	flush()
+	if paged, err := z.FencePagedForTest(ctx, key); err != nil || !paged {
+		t.Fatalf("fat board never paged the fence (paged %v, err %v)", paged, err)
+	}
+	pop(3, false, 3)
+	pop(4, true, 4)
+	flush()
+	pop(6, false, 6)
+	pop(5, true, 5)
+	flush()
+
+	// Phase 3: the draining pop retires the plane behind a genbump.
+	pop(50, true, 18)
+	flush()
+
+	// Phase 4: rebirth, then death again, so stale records from both
+	// lives sit in the tail.
+	for i := range 4 {
+		zadd(fmt.Sprintf("r%02d", i), float64(i)+0.5)
+	}
+	flush()
+	pop(10, false, 4)
+	flush()
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	df, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cap tornCapture
+	rec, err := sqlo1b.Recover(df, sqlo1.WALPath(path), bWalSeg, &cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Super.WALTrimSeq != 0 {
+		t.Fatalf("scenario checkpointed (trim %d)", rec.Super.WALTrimSeq)
+	}
+	dbid := rec.Super.WALDBID()
+	rec.WAL.Close()
+	df.Close()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cap.frames) < 60 {
+		t.Fatalf("scenario emitted only %d frames, too thin", len(cap.frames))
+	}
+
+	sameImage := func(a, b map[string]float64) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for m, sc := range a {
+			if got, ok := b[m]; !ok || got != sc {
+				return false
+			}
+		}
+		return true
+	}
+
+	for n := 0; n <= len(cap.frames); n++ {
+		cut := filepath.Join(dir, "cut.aki")
+		if err := os.WriteFile(cut, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		os.Remove(sqlo1.WALPath(cut))
+		w, err := sqlo1.OpenWAL(sqlo1.WALPath(cut), dbid, bWalSeg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, fr := range cap.frames[:n] {
+			if _, err := w.Append(fr.shard, fr.op, fr.oflags, fr.pay); err != nil {
+				t.Fatalf("cut %d: %v", n, err)
+			}
+		}
+		if err := w.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db2, err := sqlo1b.OpenStore(cut, bWalSeg)
+		if err != nil {
+			t.Fatalf("cut %d: recovery failed: %v", n, err)
+		}
+		tr2 := newTieredOverB(t, db2, 8192, 0, 1)
+		z2, err := sqlo1.NewZSet(tr2, sqlo1.HashConfig{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		visible := snapshot(z2)
+		found := false
+		for _, img := range images {
+			if sameImage(visible, img) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("cut %d: board holds %d members matching no command boundary (a torn pop)", n, len(visible))
+		}
+		card, err := z2.ZCard(ctx, key)
+		if err != nil {
+			t.Fatalf("cut %d: ZCard: %v", n, err)
+		}
+		if int(card) != len(visible) {
+			t.Fatalf("cut %d: ZCARD %d but %d members reachable", n, card, len(visible))
+		}
+		if enc, ok, err := z2.Encoding(ctx, key); err != nil {
+			t.Fatalf("cut %d: Encoding: %v", n, err)
+		} else if ok && enc == "skiplist" {
+			walked := map[string]bool{}
+			werr := z2.RunWalkForTest(ctx, key, func(s uint64, m []byte) {
+				sc, held := visible[string(m)]
+				if !held {
+					t.Fatalf("cut %d: run walk emitted %q, unreachable on the member side", n, m)
+				}
+				if sqlo1.ZScoreSortableForTest(sc) != s {
+					t.Fatalf("cut %d: run walk scores %q at %#x, member side holds %g", n, m, s, sc)
+				}
+				if walked[string(m)] {
+					t.Fatalf("cut %d: run walk emitted %q twice", n, m)
+				}
+				walked[string(m)] = true
+			})
+			if werr != nil {
+				t.Fatalf("cut %d: run walk: %v", n, werr)
+			}
+			if len(walked) != len(visible) {
+				t.Fatalf("cut %d: run walk holds %d members, member side %d", n, len(walked), len(visible))
+			}
+		}
+		if n == len(cap.frames) && len(visible) != 0 {
+			t.Fatalf("full tail: board holds %d members, the last pop drained it", len(visible))
+		}
+		if err := db2.Close(); err != nil {
+			t.Fatalf("cut %d: close: %v", n, err)
+		}
+	}
+}
