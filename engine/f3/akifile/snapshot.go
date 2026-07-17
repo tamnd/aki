@@ -35,3 +35,24 @@ func (f *File) WriteBarrier(shards []BarrierShard) (off, wbar uint64, err error)
 	}
 	return offs[0], wbar, nil
 }
+
+// CommitSnapshotRoot installs the SRT as the root of the point-in-time snapshot cut at
+// wbar (spec 2064/f3/07 section 5, protocol step 3). Once each shard has cut a checkpoint
+// covering the barrier and the caller has assembled those roots into srt, this stamps the
+// snapshot flag and the watermark into the table and commits it through the ordinary
+// checkpoint meta flip. The live meta -> SRT chain then names the cut, so the copy path
+// reads Wbar from the SRT header without scanning the log, and the 128-byte meta slot is
+// left untouched.
+//
+// A snapshot root must name a real watermark: wbar zero is the ordinary-table sentinel a
+// reader uses to tell a plain root from a snapshot root, so CommitSnapshotRoot refuses a
+// zero wbar with ErrSnapshotWatermark. Every genuine cut takes the next global_seq, which
+// is at least one, so a real snapshot always passes.
+func (f *File) CommitSnapshotRoot(srt *SRT, extents []Extent, stats CheckpointStats, globals CheckpointGlobals, wbar uint64) error {
+	if wbar == 0 {
+		return ErrSnapshotWatermark
+	}
+	srt.Flags |= SRTSnapshotRoot
+	srt.SnapWbar = wbar
+	return f.CheckpointWithGlobals(srt, extents, stats, globals)
+}

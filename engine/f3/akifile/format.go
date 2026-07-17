@@ -118,6 +118,11 @@ var (
 	// the requested watermark: the snapshot was never written, or the file was
 	// truncated before it.
 	ErrNoBarrier = errors.New("akifile: no barrier at watermark")
+	// ErrSnapshotWatermark is a snapshot-root commit with a zero watermark. Wbar zero is
+	// the ordinary-table sentinel, so a root flagged as a snapshot at watermark zero could
+	// not be told from an ordinary root; CommitSnapshotRoot refuses it rather than commit a
+	// root a restore could not recognize as a cut.
+	ErrSnapshotWatermark = errors.New("akifile: zero snapshot watermark")
 )
 
 var (
