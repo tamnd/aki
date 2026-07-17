@@ -240,27 +240,6 @@ func Strlen(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Int(n)
 }
 
-// Exists answers single-key EXISTS; the multi-key form fans out through
-// ExistsShard.
-func Exists(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	if cx.St.Exists(args[0], cx.NowMs) {
-		r.Int(1)
-		return
-	}
-	r.Int(0)
-}
-
-// Del answers single-key DEL and UNLINK; the multi-key forms fan out through
-// DelShard. Deleting an expired record reports 0, the lazy expiry answer any
-// read would give.
-func Del(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	if cx.St.Del(args[0], cx.NowMs) {
-		r.Int(1)
-		return
-	}
-	r.Int(0)
-}
-
 // Getdel answers GETDEL key: return the value and delete the key in one step,
 // or nil when the key is absent (or expired, which a read reaps). The read
 // copies the value into the reply buffer before the delete frees the record, so

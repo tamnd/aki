@@ -148,9 +148,9 @@ func init() {
 	table["LCS"].cross = str.LcsCross
 	// TYPE spans every keyspace f3 keeps (the string store and all five
 	// collection registries), so its handler lives here where every type
-	// package is in reach. Single-key EXISTS and DEL below share that reach;
-	// only the multi-key EXISTS and DEL fan forms still span set plus string,
-	// owed to the fan-threading slice.
+	// package is in reach. Single-key EXISTS and DEL below share that reach,
+	// and their multi-key fan forms (delShardAll, existsShardAll) span every
+	// keyspace too, for the same reason: the fan sub-handlers live here.
 	register("TYPE", typeCmd, 1, 1, true)
 
 	// The tier-one multi-key commands: a single key keeps the point path,
@@ -158,8 +158,8 @@ func init() {
 	// sub-command handlers are shard-only ops with no verb.
 	mget := registerShard(str.MGetShard)
 	mset := registerShard(str.MSetShard)
-	del := registerShard(str.DelShard)
-	exists := registerShard(str.ExistsShard)
+	del := registerShard(delShardAll)
+	exists := registerShard(existsShardAll)
 	register("EXISTS", existsCmd, 1, -1, true)
 	register("DEL", delCmd, 1, -1, true)
 	register("UNLINK", delCmd, 1, -1, true)
@@ -1011,10 +1011,9 @@ func typeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 
 // existsCmd answers the single-key EXISTS point path, spanning every keyspace
 // f3 keeps rather than only the string store and the set registry. A key present
-// in any one keyspace counts as 1. The multi-key form still fans through the
-// string-only sub-handler, so a hash, list, zset, or stream key stays invisible
-// to EXISTS over two or more keys until the fan slice threads the registries;
-// this closes only the single-key gap, the one that shares TYPE's shape.
+// in any one keyspace counts as 1. The multi-key form fans through
+// existsShardAll, which spans the same keyspaces, so EXISTS answers alike whether
+// it takes one key or many.
 func existsCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	key := args[0]
 	if cx.St.Exists(key, cx.NowMs) ||
@@ -1116,10 +1115,8 @@ func persistCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // keyspace f3 keeps rather than only the string store and the set registry. A
 // key lives in exactly one keyspace, so at most one arm removes it; the reply is
 // 1 when any did and 0 otherwise. Reclamation is owner-local and immediate, so
-// UNLINK shares the path. The multi-key form still fans through the string-only
-// sub-handler, so a collection key stays invisible to DEL over two or more keys
-// until the fan slice threads the registries; this closes only the single-key
-// gap, where a lone hash, list, zset, or stream key used to answer 0 and stay.
+// UNLINK shares the path. The multi-key form fans through delShardAll, which
+// spans the same keyspaces, so DEL removes alike whether it takes one key or many.
 func delCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	key := args[0]
 	removed := cx.St.Del(key, cx.NowMs)
@@ -1143,4 +1140,61 @@ func delCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	r.Int(0)
+}
+
+// existsShardAll answers an EXISTS sub-command over every keyspace, the fan
+// counterpart of existsCmd: it counts each key argument that lives in the string
+// store or any collection registry, duplicates included, which is the Redis
+// EXISTS contract. It lives here rather than in str for the same reason the
+// point handlers do, so every type package is in reach; it supersedes the
+// string-only str.ExistsShard the earlier slice fanned, which left a hash, list,
+// zset, or stream key invisible to a two-or-more-key EXISTS. Duplicate keys hash
+// to one shard, so per-shard counting composes exactly.
+func existsShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	var n int64
+	for _, key := range args {
+		if cx.St.Exists(key, cx.NowMs) ||
+			set.Has(cx, key) ||
+			zset.Has(cx, key) ||
+			hash.Has(cx, key) ||
+			list.Has(cx, key) ||
+			stream.Has(cx, key) {
+			n++
+		}
+	}
+	r.FanCount(n)
+}
+
+// delShardAll answers a DEL or UNLINK sub-command over every keyspace, the fan
+// counterpart of delCmd: for each key it removes the key from whichever keyspace
+// holds it and counts the ones that were present. A key lives in exactly one
+// keyspace, so at most one arm removes any key. It supersedes the string-only
+// str.DelShard the earlier slice fanned, which left a collection key in place on
+// a two-or-more-key DEL. UNLINK shares the handler because reclamation is already
+// owner-local and immediate. Cold chunks a demoted collection left behind are not
+// reclaimed yet, the same deferral the point path carries.
+func delShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	var n int64
+	for _, key := range args {
+		removed := cx.St.Del(key, cx.NowMs)
+		if set.Delete(cx, key) {
+			removed = true
+		}
+		if zset.Delete(cx, key) {
+			removed = true
+		}
+		if hash.Delete(cx, key) {
+			removed = true
+		}
+		if list.Delete(cx, key) {
+			removed = true
+		}
+		if stream.Delete(cx, key) {
+			removed = true
+		}
+		if removed {
+			n++
+		}
+	}
+	r.FanCount(n)
 }
