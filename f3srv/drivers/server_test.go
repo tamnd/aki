@@ -240,6 +240,23 @@ func readBulk(t *testing.T, br *bufio.Reader) string {
 	return string(buf[:blen])
 }
 
+// TestReset checks RESET acknowledges with +RESET and rejects an argument tail
+// for arity, the two observable contracts on a server that carries no resettable
+// per-connection state.
+func TestReset(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	if _, err := nc.Write([]byte("*1\r\n$5\r\nRESET\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	expect(t, br, "+RESET\r\n")
+
+	if _, err := nc.Write([]byte("*2\r\n$5\r\nRESET\r\n$1\r\nx\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	expect(t, br, "-ERR wrong number of arguments for 'reset' command\r\n")
+}
+
 // TestSmokePipeline sends one write with several commands and expects the
 // replies back in request order.
 func TestSmokePipeline(t *testing.T) {
