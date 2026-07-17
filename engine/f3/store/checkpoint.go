@@ -83,6 +83,47 @@ func (s *Store) BuildIndexCheckpoint(dst []byte) ([]byte, akifile.CkptHeader, er
 	return dst, hdr, nil
 }
 
+// WriteIndexCheckpoint builds this shard's index checkpoint, appends it to the file
+// as an index_ckpt segment, and returns the SRT row a file-global commit stamps for
+// this shard. It is the persist half of the checkpoint commit: it lays the dump down
+// in free space and hands back the row naming it, but it does not flip the meta slot.
+// The flip is the coordinator's, which gathers every shard's row into one SRT and
+// commits once, because the one meta slot names all shards' roots together and a
+// per-shard flip would strand the others.
+//
+// The row names the dump the recovery fast path reads (IndexCkptOff and IndexCkptLen)
+// and the tail the recovery replays after it (FirstTailSeg, the append offset the
+// instant the checkpoint was taken, so every record cut later falls in the tail). It
+// also carries the log position and shard sequence the dump is consistent up to and
+// the live record count. On a store with no record log there is nothing durable to
+// checkpoint, so it returns a zero row.
+func (s *Store) WriteIndexCheckpoint() (akifile.SRTRow, error) {
+	if s.akirlog == nil {
+		return akifile.SRTRow{}, nil
+	}
+	// Capture the tail start before the append: the checkpoint covers every record
+	// logged so far, and the append that follows only lays down the dump segment,
+	// which a tail replay skips as a non-log kind, so records cut after this offset
+	// are exactly the tail past the dump.
+	tailFrom := s.akirlog.cursor()
+	payload, hdr, err := s.BuildIndexCheckpoint(nil)
+	if err != nil {
+		return akifile.SRTRow{}, err
+	}
+	off, err := s.akirlog.writeCheckpoint(payload)
+	if err != nil {
+		return akifile.SRTRow{}, err
+	}
+	return akifile.SRTRow{
+		IndexCkptOff: off,
+		IndexCkptLen: uint64(len(payload)),
+		CkptLogPos:   hdr.CkptLogPos,
+		ShardSeqHigh: hdr.SeqHigh,
+		FirstTailSeg: tailFrom,
+		LiveRecords:  hdr.EntryCount,
+	}, nil
+}
+
 // pow2ceil is the smallest power of two at least n, the bucket-count rounding a
 // checkpoint header carries. It is defined here rather than inlined so the loader
 // side can share the same rounding when it lands.
