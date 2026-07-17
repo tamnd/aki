@@ -1121,10 +1121,9 @@ func keyDeadline(cx *shard.Ctx, key []byte) (state int, at int64) {
 		}
 		return 0, at
 	}
-	// A set, a zset, a hash, and a list each carry their own inline key-level
-	// deadline now, so ask them directly; at==0 means a live key with no TTL. The
-	// remaining collection type has no key-level deadline yet, so a key present in it
-	// is live with no expiry.
+	// Every collection type now carries its own inline key-level deadline, so ask
+	// each directly; at==0 means a live key with no TTL. A key absent from all of
+	// them and from the store falls through to -2.
 	if at, ok := set.Deadline(cx, key); ok {
 		if at == 0 {
 			return -1, 0
@@ -1149,8 +1148,11 @@ func keyDeadline(cx *shard.Ctx, key []byte) (state int, at int64) {
 		}
 		return 0, at
 	}
-	if stream.Has(cx, key) {
-		return -1, 0
+	if at, ok := stream.Deadline(cx, key); ok {
+		if at == 0 {
+			return -1, 0
+		}
+		return 0, at
 	}
 	return -2, 0
 }
@@ -1202,41 +1204,24 @@ func pexpiretimeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 }
 
 // persistCmd answers PERSIST key: remove the key's deadline, replying 1 when one
-// was removed and 0 otherwise. The string store and the set, zset, hash, and list
-// keyspaces all carry key-level deadlines now, so each is asked in turn; the
-// remaining collection type has none to remove and reaches no branch, reading a
-// correct 0, the same answer an absent key gives. hash.Persist clears only the
-// key-level deadline, not the per-field HEXPIRE TTLs (those are HPERSIST's job). The
-// remaining type's write side of EXPIRE stays owed until it gains an inline
-// deadline (rollout plan M-expiry-generic-key-ttl-plan.md).
+// was removed and 0 otherwise. Every keyspace now carries a key-level deadline, so
+// each is asked in turn; an absent key reaches no branch and reads a correct 0.
+// hash.Persist clears only the key-level deadline, not the per-field HEXPIRE TTLs
+// (those are HPERSIST's job).
 func persistCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	if cx.St.Persist(args[0], cx.NowMs) || set.Persist(cx, args[0]) || zset.Persist(cx, args[0]) || hash.Persist(cx, args[0]) || list.Persist(cx, args[0]) {
+	if cx.St.Persist(args[0], cx.NowMs) || set.Persist(cx, args[0]) || zset.Persist(cx, args[0]) || hash.Persist(cx, args[0]) || list.Persist(cx, args[0]) || stream.Persist(cx, args[0]) {
 		r.Int(1)
 		return
 	}
 	r.Int(0)
 }
 
-// pendingExpireKind reports the type name of a collection key that cannot carry a
-// key-level TTL yet, or "" when the key is absent, a string, a set, a zset, a hash,
-// or a list. Set, zset, hash, and list are omitted because they now have an inline
-// deadline and are routed before this probe; only the stream stays owed until its
-// own deadline slice (rollout plan M-expiry-generic-key-ttl-plan.md). It builds no
-// registry.
-func pendingExpireKind(cx *shard.Ctx, key []byte) string {
-	if stream.Has(cx, key) {
-		return "stream"
-	}
-	return ""
-}
-
-// expireRoute answers an EXPIRE-family command across every keyspace. A set or
-// string key sets its inline deadline through its own backend. The other four
-// collection types cannot carry a key-level TTL yet, so rather than lie with the
-// 0 that means "no such key", they answer an honest not-yet error that names the
-// type, the same discipline the deferred SORT rows use. That error path shrinks
-// by one type per expiry slice until it is empty and this router collapses into
-// plain keyed dispatch (rollout plan M-expiry-generic-key-ttl-plan.md).
+// expireRoute answers an EXPIRE-family command across every keyspace. Each
+// collection type now sets its own inline deadline through its backend, and a
+// string key falls to str.Expire; the interim not-yet error the earlier expiry
+// slices carried is gone now that the stream, the last type, has a deadline. This
+// is the plain keyed dispatch the rollout plan converged on
+// (M-expiry-generic-key-ttl-plan.md).
 func expireRoute(cx *shard.Ctx, args [][]byte, r shard.Reply, verb string) {
 	key := args[0]
 	if set.Has(cx, key) {
@@ -1255,8 +1240,8 @@ func expireRoute(cx *shard.Ctx, args [][]byte, r shard.Reply, verb string) {
 		list.Expire(cx, args, r, verb)
 		return
 	}
-	if kind := pendingExpireKind(cx, key); kind != "" {
-		r.Err("ERR " + verb + " on a " + kind + " key is not supported yet")
+	if stream.Has(cx, key) {
+		stream.Expire(cx, args, r, verb)
 		return
 	}
 	str.Expire(cx, args, r, verb)
