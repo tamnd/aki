@@ -256,7 +256,7 @@ func TestFlusherInOrderDelivery(t *testing.T) {
 	}
 }
 
-func TestFlusherCapBlocksNotDrops(t *testing.T) {
+func TestFlusherCapFlagsNotRefuses(t *testing.T) {
 	store := sim.New(sim.Config{
 		Seed: 7,
 		Latency: sim.LatencyModel{
@@ -272,38 +272,36 @@ func TestFlusherCapBlocksNotDrops(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fl.Close()
+	if fl.Lagged() {
+		t.Fatal("fresh flusher reports lag")
+	}
+	// Push well past the cap against slow PUTs: every append is accepted,
+	// because the cap is the parking threshold the shard gate reads, not
+	// an admission bound, and the lag flag rises once buffered plus
+	// in-flight bytes top it.
 	val := make([]byte, 100)
 	seq := uint64(0)
-	sawFull := false
-	for range 10000 {
+	for range 40 {
 		seq++
-		err := fl.AppendOp(1, 1, opFrame(t, 0, seq, "k", obs1.StrSet{Value: val}))
-		if errors.Is(err, obs1.ErrWALFull) {
-			sawFull = true
-			break
-		}
-		if err != nil {
+		if err := fl.AppendOp(1, 1, opFrame(t, 0, seq, "k", obs1.StrSet{Value: val})); err != nil {
 			t.Fatalf("append %d: %v", seq, err)
 		}
 	}
-	if !sawFull {
-		t.Fatal("never hit ErrWALFull with slow PUTs and a 2KiB cap")
+	if !fl.Lagged() {
+		t.Fatal("lag flag still down with double the cap buffered")
 	}
-	waitCall(t, snk)
+	// The pipeline drains the backlog on its own; the flag drops at a PUT
+	// completion and the flush counter shows the progress the stall window
+	// checks.
 	deadline := time.Now().Add(10 * time.Second)
-	for {
-		seq++
-		err := fl.AppendOp(1, 1, opFrame(t, 0, seq, "k", obs1.StrSet{Value: val}))
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, obs1.ErrWALFull) {
-			t.Fatalf("append while draining: %v", err)
-		}
+	for fl.Lagged() {
 		if time.Now().After(deadline) {
-			t.Fatal("cap never released after deliveries resumed")
+			t.Fatal("lag flag never cleared after deliveries resumed")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+	if fl.FlushCount() == 0 {
+		t.Fatal("flush count still zero after the lag cleared")
 	}
 }
 

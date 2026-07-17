@@ -207,6 +207,21 @@ func (r *Runtime) Use(handlers []Handler) {
 	}
 }
 
+// UseWriteOps registers the op-indexed write bits the flushlag gate reads
+// (worker.go executeCmd): true at index b when op b's handler mutates the
+// store and emits WAL frames, so it must not run while the WAL buffer is
+// over cap. Fan sub-commands carry their verb's bit. Fixed before Start
+// like Use; a runtime that never wires it (or serves volatile) leaves the
+// gate a dead bounds check.
+func (r *Runtime) UseWriteOps(writes []bool) {
+	if r.started {
+		panic("shard: UseWriteOps after Start")
+	}
+	for _, w := range r.workers {
+		w.writeOps = writes
+	}
+}
+
 // UseDemoter registers the collection-demotion hook every worker's demote loop
 // calls at a boundary under memory pressure (spec 2064/f3/06 section 6). The
 // server layer, which imports the collection packages the shard cannot, passes

@@ -215,6 +215,20 @@ type WriteLog interface {
 	// from either). Like NotifyCommitted it raises barrier demand, and
 	// a fenced group's frames never fold live, so fn then never fires.
 	NotifyAllCommitted(fn func())
+
+	// FlushLagged is the backpressure gate (doc 04 section 6): true when
+	// the WAL buffer plus in-flight PUT bytes sit over the cap. The
+	// worker reads it before running a write handler and parks the write
+	// on the flushlag reason instead of executing, so the buffer never
+	// grows past the cap by more than the handlers already in flight
+	// when the flag rose. One atomic load, owner hot path.
+	FlushLagged() bool
+
+	// FlushCount counts successfully completed WAL flushes, the flushlag
+	// progress signal: the stall window advances only while this holds
+	// still, so a parked write outlasts any number of slow flushes and
+	// stalls out only when flushing has genuinely stopped.
+	FlushCount() uint64
 }
 
 // WALMark names one emitted frame, the completion target a strict ack

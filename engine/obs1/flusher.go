@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,12 +42,6 @@ const (
 	walRetryBase = 20 * time.Millisecond
 	walRetryCap  = time.Second
 )
-
-// ErrWALFull is the block-not-drop admission sentinel: buffered plus
-// in-flight bytes reached the cap (4x flush size by default), so the
-// caller parks the client on the flushlag reason instead of buffering
-// without bound. Nothing is ever dropped.
-var ErrWALFull = errors.New("obs1: WAL buffer at capacity")
 
 // ErrFlusherClosed rejects appends after Close started.
 var ErrFlusherClosed = errors.New("obs1: flusher closed")
@@ -135,6 +130,19 @@ type Flusher struct {
 	deliverC  chan putResult
 	doneC     chan struct{}
 	closeOnce sync.Once
+
+	// lag is the cap flag the shard gate reads before running a write
+	// handler (backpressure, doc 04 section 6): buffered plus in-flight
+	// bytes sit over CapBytes. The cap is a parking threshold, not an
+	// admission bound. Append always accepts, because by emission time
+	// the write already mutated RAM and holding its encoded frames aside
+	// while later emissions pass would break the per-group seq order;
+	// the gate stops the next write handler before it runs instead, so
+	// the overshoot past the cap is bounded by the handlers already past
+	// the gate when the flag rose. flushes counts successful WAL PUTs,
+	// the flushlag progress signal for the stall window.
+	lag     atomic.Bool
+	flushes atomic.Uint64
 }
 
 // NewFlusher starts a flusher. The sink runs on its own goroutine and
@@ -189,7 +197,7 @@ func (fl *Flusher) AppendOp(group uint16, epoch uint32, f WALFrame) error {
 	flen := walFrameFixed + len(f.Key) + len(f.Payload)
 	fl.mu.Lock()
 	defer fl.mu.Unlock()
-	g, err := fl.admitLocked(group, epoch, f.Seq, flen)
+	g, err := fl.admitLocked(group, epoch, f.Seq)
 	if err != nil {
 		return err
 	}
@@ -208,7 +216,7 @@ func (fl *Flusher) AppendStrSet(group uint16, epoch uint32, slot uint16, seq uin
 	flen := walFrameFixed + len(key) + len(value) + 9
 	fl.mu.Lock()
 	defer fl.mu.Unlock()
-	g, err := fl.admitLocked(group, epoch, seq, flen)
+	g, err := fl.admitLocked(group, epoch, seq)
 	if err != nil {
 		return err
 	}
@@ -222,8 +230,8 @@ func (fl *Flusher) AppendStrSet(group uint16, epoch uint32, slot uint16, seq uin
 }
 
 // AppendRun encodes a whole frame run into group's buffer atomically:
-// every frame or none, admitted as one unit against the cap, appended
-// under one hold of the lock. The swap takes the same lock, so a run can
+// every frame or none, appended under one hold of the lock. The swap
+// takes the same lock, so a run can
 // never split across WAL objects and a txn-bracketed run stays contiguous
 // in the group's section of one object, the doc 04 section 2 contiguity
 // rule. Seqs must be strictly increasing across the run, the caller's job
@@ -241,7 +249,7 @@ func (fl *Flusher) AppendRun(group uint16, epoch uint32, frames []WALFrame) erro
 	}
 	fl.mu.Lock()
 	defer fl.mu.Unlock()
-	g, err := fl.admitLocked(group, epoch, frames[0].Seq, total)
+	g, err := fl.admitLocked(group, epoch, frames[0].Seq)
 	if err != nil {
 		return err
 	}
@@ -269,19 +277,17 @@ func (fl *Flusher) AppendRun(group uint16, epoch uint32, frames []WALFrame) erro
 		fl.firstAppend = time.Now()
 	}
 	fl.dirtyBytes += total
+	fl.recalcLagLocked()
 	fl.wake()
 	return nil
 }
 
-func (fl *Flusher) admitLocked(group uint16, epoch uint32, seq uint64, flen int) (*groupBuf, error) {
+func (fl *Flusher) admitLocked(group uint16, epoch uint32, seq uint64) (*groupBuf, error) {
 	if fl.failed {
 		return nil, fl.failErr
 	}
 	if fl.stopping {
 		return nil, ErrFlusherClosed
-	}
-	if fl.dirtyBytes+fl.pendingBytes+flen > fl.cfg.CapBytes {
-		return nil, ErrWALFull
 	}
 	g := fl.groups[group]
 	if g == nil {
@@ -310,8 +316,29 @@ func (fl *Flusher) noteAppendedLocked(g *groupBuf, epoch uint32, seq uint64, fle
 		fl.firstAppend = time.Now()
 	}
 	fl.dirtyBytes += flen
+	fl.recalcLagLocked()
 	fl.wake()
 }
+
+// recalcLagLocked refreshes the cap flag wherever the byte accounting
+// moves: appends raise dirtyBytes, a swap shifts dirty to pending with
+// the sum unchanged, and a PUT completion drops pendingBytes. A failed
+// flusher clears the flag so a gated write runs its handler and takes
+// the fatal-stall reply from the append instead of parking on a lag
+// that can never drain.
+func (fl *Flusher) recalcLagLocked() {
+	fl.lag.Store(!fl.failed && fl.dirtyBytes+fl.pendingBytes > fl.cfg.CapBytes)
+}
+
+// Lagged reports the cap flag: buffered plus in-flight bytes over
+// CapBytes (see the field comment for why this parks the next write at
+// the shard gate rather than refusing the append).
+func (fl *Flusher) Lagged() bool { return fl.lag.Load() }
+
+// FlushCount counts successfully completed WAL PUTs, the flushlag
+// progress signal: a parked write is making progress exactly when this
+// advances.
+func (fl *Flusher) FlushCount() uint64 { return fl.flushes.Load() }
 
 // lastEmitted snapshots every group's highest emitted frame seq under
 // the buffer lock, the marks a commit barrier must cover before it can
@@ -408,6 +435,7 @@ func (fl *Flusher) failLocked(err error) {
 	}
 	fl.failed = true
 	fl.failErr = err
+	fl.recalcLagLocked()
 	fl.cancel()
 }
 
@@ -593,7 +621,9 @@ func (fl *Flusher) finishPut(r putResult, completed map[uint64]putResult, nextDe
 	if !failed {
 		fl.stats.BytesFlushed += uint64(r.size)
 		completed[r.walSeq] = r
+		fl.flushes.Add(1)
 	}
+	fl.recalcLagLocked()
 	fl.mu.Unlock()
 	if failed {
 		return nextDeliver

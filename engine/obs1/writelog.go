@@ -52,10 +52,10 @@ type wlGroup struct {
 }
 
 // The client replies the emission errors map to. errFlushStalled is the
-// f3 stall text (doc 04 section 6); until slice 7 raises the flushlag
-// park a buffer at capacity fails the write with it instead of parking,
-// disclosed in the slice notes. errWALEncode is the doc 04 section 10
-// bug row: the owner never acks what it could not frame.
+// f3 stall text (doc 04 section 6), the reply a flushlag-parked write
+// takes when the stall window closes and the reply a fatal pipeline
+// error maps to. errWALEncode is the doc 04 section 10 bug row: the
+// owner never acks what it could not frame.
 var (
 	errFlushStalled = errors.New("ERR store: flush stalled")
 	errWALEncode    = errors.New("ERR internal: wal encode")
@@ -710,16 +710,16 @@ func (l *WriteLog) epochMissing(group uint16) error {
 }
 
 // classify maps a flusher append error to its client reply per the doc
-// 04 section 10 taxonomy: the cap is the stall row (parking arrives
-// with slice 7), a closed or failed flusher is fatal and reads as a
-// stall to the client, and anything else is the encode bug row, which
-// panics in a dev build (-tags obs1dev) and fails just the command in
-// release.
+// 04 section 10 taxonomy: a closed or failed flusher is fatal and reads
+// as a stall to the client, and anything else is the encode bug row,
+// which panics in a dev build (-tags obs1dev) and fails just the
+// command in release. The cap no longer produces an append error at
+// all: the shard gate parks the write on the flushlag reason before its
+// handler runs (FlushLagged), so the stallErrs counter behind the
+// wal_stall_errors row only moves if a future path reintroduces a
+// cap-side refusal; the row stays rendered for schema stability.
 func (l *WriteLog) classify(err error) error {
 	switch {
-	case errors.Is(err, ErrWALFull):
-		l.stallErrs.Add(1)
-		return errFlushStalled
 	case errors.Is(err, ErrFlusherClosed), l.fl.Err() != nil:
 		l.fatalErrs.Add(1)
 		return errFlushStalled
@@ -735,6 +735,17 @@ func (l *WriteLog) classify(err error) error {
 // Barrier demands a flush now (floor-gated); strict acks and WAITAOF
 // (slices 5 and 6) raise it, and tests use it to drain deterministically.
 func (l *WriteLog) Barrier() { l.fl.Barrier() }
+
+// FlushLagged mirrors the flusher's cap flag for the shard gate: the
+// WAL buffer plus in-flight PUT bytes sit over the cap, so the next
+// write handler parks on the flushlag reason instead of running
+// (doc 04 section 6). One atomic load.
+func (l *WriteLog) FlushLagged() bool { return l.fl.Lagged() }
+
+// FlushCount counts successful WAL PUTs, the flushlag progress signal
+// the stall window checks: a parked write is making progress exactly
+// when this advances.
+func (l *WriteLog) FlushCount() uint64 { return l.fl.FlushCount() }
 
 // SetFlushAge retunes the age trigger live, the thrift profile knob
 // passed through to the flusher.

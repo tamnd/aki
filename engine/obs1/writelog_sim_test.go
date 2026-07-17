@@ -272,7 +272,7 @@ func TestWriteLogEpochMissing(t *testing.T) {
 	}
 }
 
-func TestWriteLogStallBurnsNoSeq(t *testing.T) {
+func TestWriteLogFlushLag(t *testing.T) {
 	const node = uint64(0xD4)
 	store := sim.New(sim.Config{})
 	rig := newLogRig(t, store, node)
@@ -282,28 +282,48 @@ func TestWriteLogStallBurnsNoSeq(t *testing.T) {
 	})
 	wl.SetGroup(0, 1, 1)
 
-	// A frame past the cap fails with the stall text (parking arrives
-	// with slice 7) and must not consume the group's next seq.
+	// A frame past the cap is accepted and takes its seq like any other
+	// (the write already mutated RAM by emission time); the lag flag rises
+	// for the shard gate instead of an error, and no taxonomy counter
+	// moves because nothing failed. FlushSize is 1MiB and the age trigger
+	// an hour, so nothing flushes behind the check's back.
+	if wl.FlushLagged() {
+		t.Fatal("fresh log reports lag")
+	}
 	big := strings.Repeat("x", 256)
-	if _, _, err := wl.StrSet([]byte("alpha"), []byte(big), 0, false); err == nil || err.Error() != "ERR store: flush stalled" {
-		t.Fatalf("over-cap StrSet gave %v", err)
+	if g, seq, err := wl.StrSet([]byte("alpha"), []byte(big), 0, false); err != nil || g != 0 || seq != 1 {
+		t.Fatalf("over-cap StrSet = (%d, %d, %v), want group 0 seq 1 accepted", g, seq, err)
 	}
-	if g, seq, err := wl.StrSet([]byte("alpha"), []byte("v"), 0, false); err != nil || g != 0 || seq != 1 {
-		t.Fatalf("post-stall StrSet mark = (%d, %d, %v), want group 0 seq 1: the stalled append burned no seq", g, seq, err)
+	if !wl.FlushLagged() {
+		t.Fatal("lag flag down with the buffer over cap")
 	}
+	if wl.FlushCount() != 0 {
+		t.Fatal("flush count moved before any flush")
+	}
+	if g, seq, err := wl.StrSet([]byte("alpha"), []byte("v"), 0, false); err != nil || g != 0 || seq != 2 {
+		t.Fatalf("lagged StrSet = (%d, %d, %v), want group 0 seq 2 accepted", g, seq, err)
+	}
+	// A barrier drains the buffer; the flag drops at the PUT completion
+	// and the flush counter is the progress the stall window checks.
 	wl.Barrier()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := wl.Marks().Wait(ctx, 0, 1); err != nil {
+	if err := wl.Marks().Wait(ctx, 0, 2); err != nil {
 		t.Fatal(err)
 	}
+	if wl.FlushLagged() {
+		t.Fatal("lag flag still up after the barrier drained the buffer")
+	}
+	if wl.FlushCount() == 0 {
+		t.Fatal("flush count still zero after a completed flush")
+	}
 	secs := walObject(t, store, node, 1)
-	if len(secs) != 1 || len(secs[0].Frames) != 1 || secs[0].Frames[0].Seq != 1 {
-		t.Fatalf("sections = %+v, want the surviving frame at seq 1", secs)
+	if len(secs) != 1 || len(secs[0].Frames) != 2 {
+		t.Fatalf("sections = %+v, want both frames in the one object", secs)
 	}
 	rows := durabilityRows(t, wl)
-	if rows["wal_stall_errors"] != 1 {
-		t.Fatalf("wal_stall_errors = %d, want 1", rows["wal_stall_errors"])
+	if rows["wal_stall_errors"] != 0 {
+		t.Fatalf("wal_stall_errors = %d, want 0: the cap is not an error anymore", rows["wal_stall_errors"])
 	}
 	if err := wl.Close(); err != nil {
 		t.Fatal(err)

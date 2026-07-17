@@ -32,6 +32,8 @@ type fakeLog struct {
 	next    map[uint16]uint64
 	pending []fakeNotify
 	err     error
+	lagged  atomic.Bool
+	flushes atomic.Uint64
 }
 
 func newFakeLog() *fakeLog {
@@ -39,6 +41,12 @@ func newFakeLog() *fakeLog {
 }
 
 func (f *fakeLog) group(key []byte) uint16 { return uint16(key[0]) % 4 }
+
+// The backpressure seam: tests flip lagged to park writes at the gate and
+// bump flushes to signal progress, atomics because the owner goroutine
+// reads them while the test goroutine drives.
+func (f *fakeLog) FlushLagged() bool  { return f.lagged.Load() }
+func (f *fakeLog) FlushCount() uint64 { return f.flushes.Load() }
 
 func (f *fakeLog) emit(key []byte) (uint16, uint64, error) {
 	if f.err != nil {
