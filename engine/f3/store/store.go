@@ -59,6 +59,14 @@ type Store struct {
 	// cold demote is already a batch whose offsets the cut returns at once.
 	akicold *akiCold
 
+	// akirlog persists the record row itself onto the shared .aki (akirlog.go):
+	// the record-log counterpart of akivlog, which logs only a separated value.
+	// Constructed alongside akivlog when Options carries the handle and equally
+	// inert: nothing stages a command's record through it until the two-phase
+	// durable publish flip routes the log path onto it. It carries the record
+	// region's dead-byte accounting a checkpoint persists across restart.
+	akirlog *akiRlog
+
 	// spillLedger records where each provisional word from the current batch was
 	// written (spillledger.go): one entry per staged run, the value-area offset
 	// vs of the record's run pointer and the run's stage index. resolveSpill
@@ -258,6 +266,7 @@ func Open(o Options) (*Store, error) {
 		s.akivlog = newAkiVlog(o.AkiValueLog, o.Shard)
 		s.akispill = newAkiSpill(s.akivlog)
 		s.akicold = newAkiCold(o.AkiValueLog, o.Shard)
+		s.akirlog = newAkiRlog(o.AkiValueLog, o.Shard)
 		// The .aki value region is a spill target like the scratch log, so a
 		// resident cap gates admission to it the same way: past the cap a
 		// separated or chunked value's bytes go to the shared region instead of
