@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate fixtures.txt: the compat sections, every STRING, BITMAP,
-HLL, HASH, and SET manifest row from spec doc 12 exercised against a
-real redis-server and recorded reply by reply. The Go test replays the
+HLL, HASH, SET, ZSET, and GEO manifest row from spec doc 12 exercised
+against a real redis-server and recorded reply by reply. The Go test replays the
 file through the sqlo1 dispatch path, so each fixture line is one
 diffed manifest row: same args, same wire reply, error texts included.
 
@@ -699,6 +699,446 @@ def main():
     c("SINTER", "st:str", "st:k")
     c("SINTERSTORE", "st:d2", "st:str", "st:k")
     c("GET", "st:k")
+
+    # ---------------------------------------------------------------
+    section("ZSET")
+    # zsets are ordered by (score, member) on both sides at every
+    # tier, so multi-member replies pin byte for byte throughout, the
+    # big difference from the SET section. Random draws stay
+    # deterministic-rows-only, and cursor order is pinned only where
+    # both sides walk a sorted small tier.
+
+    # Point surface: create/update counts, CH, the flag table, INCR.
+    c("ZADD", "z:k", "1", "a")
+    c("ZADD", "z:k", "2", "b", "3", "c")
+    c("ZADD", "z:k", "5", "a")
+    c("ZADD", "z:k", "CH", "6", "a", "4", "d")
+    c("ZADD", "z:k", "NX", "9", "a", "1", "e")
+    c("ZSCORE", "z:k", "a")
+    c("ZADD", "z:k", "XX", "2", "a", "7", "nope")
+    c("ZSCORE", "z:k", "a")
+    c("ZSCORE", "z:k", "nope")
+    c("ZSCORE", "z:missing", "a")
+    c("ZADD", "z:k", "GT", "1", "a")
+    c("ZSCORE", "z:k", "a")
+    c("ZADD", "z:k", "GT", "8", "a")
+    c("ZADD", "z:k", "LT", "9", "a")
+    c("ZADD", "z:k", "LT", "3", "a")
+    c("ZSCORE", "z:k", "a")
+    c("ZADD", "z:k", "INCR", "2", "a")
+    c("ZADD", "z:k", "NX", "INCR", "1", "a")
+    c("ZADD", "z:k", "XX", "INCR", "0.5", "a")
+    c("ZADD", "z:k", "GT", "INCR", "-5", "a")
+    c("ZADD", "z:missing", "XX", "INCR", "1", "m")
+
+    # Grammar and flag conflicts.
+    c("ZADD", "z:k")
+    c("ZADD", "z:k", "1")
+    c("ZADD", "z:k", "1", "a", "2")
+    c("ZADD", "z:k", "NX", "XX", "1", "a")
+    c("ZADD", "z:k", "GT", "NX", "1", "a")
+    c("ZADD", "z:k", "GT", "LT", "1", "a")
+    c("ZADD", "z:k", "INCR", "1", "a", "2", "b")
+    c("ZADD", "z:k", "notanum", "a")
+    c("ZADD", "z:k", "nan", "a")
+
+    c("ZMSCORE", "z:k", "a", "nope", "b")
+    c("ZMSCORE", "z:missing", "a")
+    c("ZMSCORE", "z:k")
+    c("ZCARD", "z:k")
+    c("ZCARD", "z:missing")
+
+    c("ZINCRBY", "z:k", "1.5", "b")
+    c("ZINCRBY", "z:k", "-10", "fresh")
+    c("ZINCRBY", "z:k", "notanum", "b")
+    c("ZINCRBY", "z:missing2", "3", "m")
+    c("TYPE", "z:missing2")
+    c("DEL", "z:missing2")
+    c("ZREM", "z:k", "fresh", "nope")
+    c("ZREM", "z:missing", "a")
+    c("ZREM", "z:k")
+
+    # Removing the last member kills the key.
+    c("ZADD", "z:d", "1", "x")
+    c("ZREM", "z:d", "x")
+    c("ZCARD", "z:d")
+    c("TYPE", "z:d")
+
+    # Score printing: integral doubles trim, -0 canonicalizes to 0,
+    # infinities round-trip, inf minus inf is the NaN door.
+    c("ZADD", "z:f", "3.0", "i", "2.5", "h", "-0", "z", "inf", "p", "-inf", "n")
+    c("ZSCORE", "z:f", "i")
+    c("ZSCORE", "z:f", "z")
+    c("ZSCORE", "z:f", "p")
+    c("ZSCORE", "z:f", "n")
+    c("ZINCRBY", "z:f", "+inf", "n")
+    c("ZADD", "z:f", "INCR", "-inf", "p")
+    c("ZRANGE", "z:f", "0", "-1", "WITHSCORES")
+
+    # Rank math, the WITHSCORE forms included.
+    c("ZRANK", "z:f", "n")
+    c("ZRANK", "z:f", "p")
+    c("ZRANK", "z:f", "nope")
+    c("ZRANK", "z:missing", "m")
+    c("ZREVRANK", "z:f", "n")
+    c("ZREVRANK", "z:f", "p")
+    c("ZRANK", "z:f", "h", "WITHSCORE")
+    c("ZRANK", "z:f", "nope", "WITHSCORE")
+    c("ZRANK", "z:missing", "m", "WITHSCORE")
+    c("ZREVRANK", "z:f", "i", "WITHSCORE")
+    c("ZRANK", "z:f", "h", "BOGUS")
+
+    # The range family: index, score, and lex forms with REV and
+    # LIMIT, plus the door table.
+    c("ZADD", "z:r", "1", "a", "2", "b", "2", "c", "3", "d", "4", "e")
+    c("ZRANGE", "z:r", "0", "-1")
+    c("ZRANGE", "z:r", "1", "3", "WITHSCORES")
+    c("ZRANGE", "z:r", "-2", "-1")
+    c("ZRANGE", "z:r", "3", "1")
+    c("ZRANGE", "z:r", "10", "20")
+    c("ZRANGE", "z:r", "0", "-1", "REV")
+    c("ZRANGE", "z:r", "1", "2", "REV", "WITHSCORES")
+    c("ZRANGE", "z:missing", "0", "-1")
+    c("ZRANGE", "z:r", "2", "3", "BYSCORE")
+    c("ZRANGE", "z:r", "(2", "+inf", "BYSCORE")
+    c("ZRANGE", "z:r", "-inf", "(3", "BYSCORE", "WITHSCORES")
+    c("ZRANGE", "z:r", "-inf", "+inf", "BYSCORE", "LIMIT", "1", "2")
+    c("ZRANGE", "z:r", "-inf", "+inf", "BYSCORE", "LIMIT", "1", "-1")
+    c("ZRANGE", "z:r", "+inf", "-inf", "BYSCORE", "REV", "LIMIT", "0", "3")
+    c("ZRANGE", "z:r", "3", "1", "BYSCORE")
+    c("ZRANGE", "z:r", "notanum", "3", "BYSCORE")
+    c("ZADD", "z:lex", "0", "a", "0", "b", "0", "c", "0", "d")
+    c("ZRANGE", "z:lex", "-", "+", "BYLEX")
+    c("ZRANGE", "z:lex", "[b", "(d", "BYLEX")
+    c("ZRANGE", "z:lex", "(a", "[c", "BYLEX")
+    c("ZRANGE", "z:lex", "+", "-", "BYLEX", "REV")
+    c("ZRANGE", "z:lex", "-", "+", "BYLEX", "LIMIT", "1", "2")
+    c("ZRANGE", "z:lex", "b", "d", "BYLEX")
+    c("ZRANGE", "z:lex", "-", "+", "BYLEX", "WITHSCORES")
+    c("ZRANGE", "z:r", "0", "-1", "LIMIT", "0", "1")
+    c("ZRANGE", "z:r", "0", "-1", "BOGUS")
+    c("ZRANGEBYSCORE", "z:r", "2", "3")
+    c("ZRANGEBYSCORE", "z:r", "(1", "+inf", "WITHSCORES", "LIMIT", "0", "2")
+    c("ZREVRANGEBYSCORE", "z:r", "3", "(1")
+    c("ZREVRANGEBYSCORE", "z:r", "+inf", "-inf", "LIMIT", "1", "2", "WITHSCORES")
+    c("ZRANGEBYLEX", "z:lex", "[a", "(c")
+    c("ZREVRANGEBYLEX", "z:lex", "[c", "-")
+    c("ZREVRANGE", "z:r", "0", "2", "WITHSCORES")
+    c("ZCOUNT", "z:r", "2", "3")
+    c("ZCOUNT", "z:r", "(2", "+inf")
+    c("ZCOUNT", "z:r", "-inf", "+inf")
+    c("ZCOUNT", "z:missing", "0", "10")
+    c("ZCOUNT", "z:r", "x", "3")
+    c("ZLEXCOUNT", "z:lex", "-", "+")
+    c("ZLEXCOUNT", "z:lex", "[b", "(d")
+    c("ZLEXCOUNT", "z:lex", "b", "+")
+
+    # ZRANGESTORE, the empty-result delete included.
+    c("ZRANGESTORE", "z:dst", "z:r", "0", "2")
+    c("ZRANGE", "z:dst", "0", "-1", "WITHSCORES")
+    c("ZRANGESTORE", "z:dst", "z:r", "(4", "+inf", "BYSCORE")
+    c("TYPE", "z:dst")
+    c("ZRANGESTORE", "z:dst2", "z:r", "+inf", "-inf", "BYSCORE", "REV", "LIMIT", "0", "2")
+    c("ZRANGE", "z:dst2", "0", "-1")
+    c("ZRANGESTORE", "z:dst2", "z:missing", "0", "-1")
+    c("TYPE", "z:dst2")
+
+    # Pops, the blocking forms on immediate service only.
+    c("ZADD", "z:p", "1", "a", "2", "b", "3", "c", "4", "d")
+    c("ZPOPMIN", "z:p")
+    c("ZPOPMAX", "z:p")
+    c("ZPOPMIN", "z:p", "2")
+    c("ZPOPMIN", "z:p", "0")
+    c("ZPOPMIN", "z:p", "5")
+    c("TYPE", "z:p")
+    c("ZPOPMIN", "z:missing")
+    c("ZPOPMAX", "z:missing", "3")
+    c("ZPOPMIN", "z:k", "-1")
+    c("ZPOPMIN", "z:k", "x")
+    c("ZADD", "z:p2", "1", "a", "2", "b")
+    c("ZMPOP", "2", "z:missing", "z:p2", "MIN")
+    c("ZMPOP", "1", "z:p2", "MAX", "COUNT", "5")
+    c("TYPE", "z:p2")
+    c("ZMPOP", "1", "z:missing", "MIN")
+    c("ZMPOP", "0", "MIN")
+    c("ZMPOP", "1", "z:k", "BOGUS")
+    c("ZMPOP", "x", "z:k", "MIN")
+    c("ZMPOP", "1", "z:k", "MIN", "COUNT", "0")
+    c("ZADD", "z:b", "1", "a", "2", "b", "3", "c")
+    c("BZPOPMIN", "z:b", "0")
+    c("BZPOPMAX", "z:missing", "z:b", "0.1")
+    c("BZMPOP", "0", "1", "z:b", "MIN")
+    c("TYPE", "z:b")
+    c("BZPOPMIN", "z:k", "-1")
+    c("BZPOPMIN", "z:k", "notanum")
+    c("BZMPOP", "0", "0", "MIN")
+
+    # ZRANDMEMBER, deterministic rows only: misses, count 0, and a
+    # one-member zset where every draw is forced.
+    c("ZRANDMEMBER", "z:missing")
+    c("ZRANDMEMBER", "z:missing", "3")
+    c("ZADD", "z:one", "7", "solo")
+    c("ZRANDMEMBER", "z:one")
+    c("ZRANDMEMBER", "z:one", "5")
+    c("ZRANDMEMBER", "z:one", "-3")
+    c("ZRANDMEMBER", "z:one", "0")
+    c("ZRANDMEMBER", "z:one", "2", "WITHSCORES")
+    c("ZRANDMEMBER", "z:one", "-2", "WITHSCORES")
+    c("ZRANDMEMBER", "z:one", "x")
+
+    # The ZREMRANGE family, whole-window key death included.
+    c("ZADD", "z:rr", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e")
+    c("ZREMRANGEBYRANK", "z:rr", "0", "1")
+    c("ZRANGE", "z:rr", "0", "-1")
+    c("ZREMRANGEBYSCORE", "z:rr", "(3", "+inf")
+    c("ZRANGE", "z:rr", "0", "-1", "WITHSCORES")
+    c("ZREMRANGEBYRANK", "z:rr", "0", "-1")
+    c("TYPE", "z:rr")
+    c("ZREMRANGEBYRANK", "z:missing", "0", "-1")
+    c("ZREMRANGEBYSCORE", "z:missing", "-inf", "+inf")
+    c("ZREMRANGEBYSCORE", "z:k", "x", "1")
+    c("ZADD", "z:rl", "0", "a", "0", "b", "0", "c")
+    c("ZREMRANGEBYLEX", "z:rl", "[a", "(c")
+    c("ZRANGE", "z:rl", "0", "-1")
+    c("ZREMRANGEBYLEX", "z:rl", "x", "+")
+
+    # Algebra: WITHSCORES pins the aggregation, sets join at score 1.
+    c("ZADD", "z:a1", "1", "a", "2", "b", "3", "c")
+    c("ZADD", "z:a2", "10", "b", "20", "c", "30", "d")
+    c("ZUNION", "2", "z:a1", "z:a2")
+    c("ZUNION", "2", "z:a1", "z:a2", "WITHSCORES")
+    c("ZUNION", "2", "z:a1", "z:missing", "WITHSCORES")
+    c("ZUNION", "2", "z:a1", "z:a2", "WEIGHTS", "2", "0.5", "WITHSCORES")
+    c("ZUNION", "2", "z:a1", "z:a2", "AGGREGATE", "MIN", "WITHSCORES")
+    c("ZUNION", "2", "z:a1", "z:a2", "AGGREGATE", "MAX", "WITHSCORES")
+    c("ZINTER", "2", "z:a1", "z:a2", "WITHSCORES")
+    c("ZINTER", "2", "z:a1", "z:missing")
+    c("ZDIFF", "2", "z:a1", "z:a2", "WITHSCORES")
+    c("ZDIFF", "2", "z:a1", "z:missing", "WITHSCORES")
+    c("ZDIFF", "1", "z:a1")
+    c("SADD", "z:s1", "a", "x")
+    c("ZUNION", "2", "z:a1", "z:s1", "WITHSCORES")
+    c("ZINTER", "2", "z:a1", "z:s1", "WITHSCORES")
+    c("ZUNION", "0")
+    c("ZUNION", "2", "z:a1")
+    c("ZUNION", "x", "z:a1")
+    c("ZUNION", "1", "z:a1", "WEIGHTS", "1", "2")
+    c("ZUNION", "1", "z:a1", "WEIGHTS", "x")
+    c("ZUNION", "1", "z:a1", "AGGREGATE", "BOGUS")
+    c("ZINTERCARD", "2", "z:a1", "z:a2")
+    c("ZINTERCARD", "2", "z:a1", "z:a2", "LIMIT", "1")
+    c("ZINTERCARD", "2", "z:a1", "z:a2", "LIMIT", "0")
+    c("ZINTERCARD", "2", "z:a1", "z:a2", "LIMIT", "-1")
+    c("ZINTERCARD", "0", "z:a1")
+
+    # The STORE forms, dest overwrite rules included.
+    c("ZUNIONSTORE", "z:du", "2", "z:a1", "z:a2")
+    c("ZRANGE", "z:du", "0", "-1", "WITHSCORES")
+    c("ZUNIONSTORE", "z:du", "2", "z:a1", "z:a2", "WEIGHTS", "0", "1")
+    c("ZRANGE", "z:du", "0", "-1", "WITHSCORES")
+    c("ZINTERSTORE", "z:di", "2", "z:a1", "z:a2", "AGGREGATE", "MIN")
+    c("ZRANGE", "z:di", "0", "-1", "WITHSCORES")
+    c("ZDIFFSTORE", "z:dd", "2", "z:a1", "z:a2")
+    c("ZRANGE", "z:dd", "0", "-1", "WITHSCORES")
+    c("ZINTERSTORE", "z:di", "2", "z:a1", "z:missing")
+    c("TYPE", "z:di")
+    c("ZADD", "z:ttl", "1", "x")
+    c("EXPIRE", "z:ttl", "600")
+    c("ZUNIONSTORE", "z:ttl", "1", "z:a1")
+    c("TTL", "z:ttl")
+    c("SET", "z:sdest", "v")
+    c("ZUNIONSTORE", "z:sdest", "1", "z:a1")
+    c("TYPE", "z:sdest")
+
+    # ZSCAN: any cursor answers everything on the small tier, and
+    # both sides walk it score-sorted, so the multi-member row pins.
+    c("ZADD", "z:sc", "1", "only")
+    c("ZSCAN", "z:sc", "0")
+    c("ZSCAN", "z:sc", "0", "MATCH", "z*")
+    c("ZSCAN", "z:sc", "0", "MATCH", "on*")
+    c("ZSCAN", "z:sc", "0", "COUNT", "100")
+    c("ZSCAN", "z:sc", "42")
+    c("ZSCAN", "z:missing", "0")
+    c("ZSCAN", "z:sc", "0", "NOVALUES")
+    c("ZSCAN", "z:r", "0")
+
+    # The encoding boundary: both sides leave listpack past 128
+    # members, the one count threshold the families share, and the
+    # order contract makes every reply pin across the crossing.
+    c("OBJECT", "ENCODING", "z:r")
+    big = ["ZADD", "z:big"]
+    for i in range(129):
+        big += [str(i), "m%03d" % i]
+    c(*big)
+    c("OBJECT", "ENCODING", "z:big")
+    c("ZCARD", "z:big")
+    c("ZRANGE", "z:big", "0", "4", "WITHSCORES")
+    c("ZRANGE", "z:big", "-3", "-1")
+    c("ZRANK", "z:big", "m064")
+    c("ZSCORE", "z:big", "m128")
+    c("ZRANGEBYSCORE", "z:big", "126", "+inf")
+    # The member-size wall: members over 64 B leave redis's listpack,
+    # and 30 of them blow sqlo1's inline byte cap.
+    wide = ["ZADD", "z:wide"]
+    for i in range(30):
+        wide += [str(i), ("w%03d" % i) + "x" * 97]
+    c(*wide)
+    c("OBJECT", "ENCODING", "z:wide")
+    c("ZRANGE", "z:wide", "0", "1")
+
+    # Type walls both ways.
+    c("SET", "z:str", "v")
+    c("ZADD", "z:str", "1", "m")
+    c("ZSCORE", "z:str", "m")
+    c("ZMSCORE", "z:str", "m")
+    c("ZCARD", "z:str")
+    c("ZINCRBY", "z:str", "1", "m")
+    c("ZREM", "z:str", "m")
+    c("ZRANK", "z:str", "m")
+    c("ZRANGE", "z:str", "0", "-1")
+    c("ZCOUNT", "z:str", "0", "1")
+    c("ZPOPMIN", "z:str")
+    c("ZRANDMEMBER", "z:str")
+    c("ZSCAN", "z:str", "0")
+    c("ZREMRANGEBYRANK", "z:str", "0", "-1")
+    c("ZUNION", "2", "z:a1", "z:str")
+    c("ZUNIONSTORE", "z:dt", "2", "z:a1", "z:str")
+    c("ZRANGESTORE", "z:dt", "z:str", "0", "-1")
+    c("GET", "z:a1")
+
+    # ---------------------------------------------------------------
+    section("GEO")
+    # Geo rides the zset planes: scores are the 52-bit interleaved
+    # geohash (Z-I6), so ZSCORE readbacks pin the codec across the
+    # family boundary and the STORE forms read back exactly. Search
+    # rows always carry a sort or land in a dest zset, since unsorted
+    # emission order is the cell walk's, engine-defined on both
+    # sides. STOREDIST scores stay unread: full-precision distances
+    # carry the libm's last ulp (see the README).
+
+    c("GEOADD", "geo:s", "13.361389", "38.115556", "Palermo")
+    c("GEOADD", "geo:s", "15.087269", "37.502669", "Catania", "13.583333", "37.316667", "Agrigento")
+    c("ZSCORE", "geo:s", "Palermo")
+    c("ZSCORE", "geo:s", "Catania")
+    c("ZCARD", "geo:s")
+    c("TYPE", "geo:s")
+    c("OBJECT", "ENCODING", "geo:s")
+
+    # Flags: NX never moves, CH counts moves, XX moves back.
+    c("GEOADD", "geo:s", "NX", "13.5", "38.2", "Palermo")
+    c("GEOPOS", "geo:s", "Palermo")
+    c("GEOADD", "geo:s", "CH", "13.5", "38.2", "Palermo")
+    c("ZSCORE", "geo:s", "Palermo")
+    c("GEOADD", "geo:s", "XX", "CH", "13.361389", "38.115556", "Palermo")
+    c("GEOADD", "geo:s", "XX", "1", "1", "Fresh")
+    c("ZCARD", "geo:s")
+
+    # Grammar and validation: every triple validates before any
+    # write.
+    c("GEOADD", "geo:s")
+    c("GEOADD", "geo:s", "13.36")
+    c("GEOADD", "geo:s", "13.36", "38.11")
+    c("GEOADD", "geo:s", "NX", "XX", "1", "1", "m")
+    c("GEOADD", "geo:s", "181", "0", "m")
+    c("GEOADD", "geo:s", "0", "86", "m")
+    c("GEOADD", "geo:s", "x", "0", "m")
+    c("GEOADD", "geo:s", "1", "1", "ok1", "999", "0", "bad")
+    c("ZSCORE", "geo:s", "ok1")
+
+    c("GEOPOS", "geo:s", "Palermo", "ghost", "Catania")
+    c("GEOPOS", "geo:missing", "m")
+    c("GEOPOS", "geo:s")
+
+    c("GEODIST", "geo:s", "Palermo", "Catania")
+    c("GEODIST", "geo:s", "Palermo", "Catania", "km")
+    c("GEODIST", "geo:s", "Palermo", "Catania", "ft")
+    c("GEODIST", "geo:s", "Palermo", "Catania", "mi")
+    c("GEODIST", "geo:s", "Palermo", "Palermo")
+    c("GEODIST", "geo:s", "Palermo", "ghost")
+    c("GEODIST", "geo:missing", "a", "b")
+    c("GEODIST", "geo:s", "Palermo", "Catania", "yd")
+    c("GEODIST", "geo:s", "Palermo")
+
+    c("GEOHASH", "geo:s", "Palermo", "ghost", "Catania")
+    c("GEOHASH", "geo:missing", "m")
+    c("GEOHASH", "geo:s")
+
+    # GEOSEARCH: shapes, reply decorations, COUNT, and FROMMEMBER.
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC", "WITHCOORD", "WITHDIST", "WITHHASH")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "DESC", "WITHDIST")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "2", "ASC")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "10", "ANY", "ASC")
+    c("GEOSEARCH", "geo:s", "FROMMEMBER", "Palermo", "BYRADIUS", "200", "km", "ASC", "WITHDIST")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYBOX", "400", "400", "km", "ASC", "WITHDIST")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "m", "ASC")
+    c("GEOSEARCH", "geo:missing", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC")
+
+    # The antimeridian wrap: searches crossing lon 180 return
+    # far-side members.
+    c("GEOADD", "geo:mer", "179.9", "0", "east", "-179.95", "0.05", "west")
+    c("GEOSEARCH", "geo:mer", "FROMLONLAT", "179.9", "0", "BYRADIUS", "50", "km", "ASC", "WITHDIST")
+    c("GEOSEARCH", "geo:mer", "FROMLONLAT", "-179.95", "0.1", "BYBOX", "60", "60", "km", "ASC", "WITHDIST")
+
+    # The door table, probed in token order.
+    c("GEOSEARCH", "geo:s")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "-1", "km")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "x", "km")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "yd")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYBOX", "10", "-5", "km")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "0")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "x")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ANY")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37")
+    c("GEOSEARCH", "geo:s", "BYRADIUS", "1", "km")
+    c("GEOSEARCH", "geo:s", "FROMMEMBER", "ghost", "BYRADIUS", "1", "km")
+    c("GEOSEARCH", "geo:missing", "FROMMEMBER", "ghost", "BYRADIUS", "1", "km")
+    c("GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC", "DESC", "WITHDIST")
+
+    # GEOSEARCHSTORE: bits store exactly, dests are score-ordered
+    # zsets so no-sort forms still pin, empty results delete.
+    c("GEOSEARCHSTORE", "geo:dst", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC")
+    c("ZRANGE", "geo:dst", "0", "-1", "WITHSCORES")
+    c("GEOSEARCHSTORE", "geo:dst", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "m")
+    c("TYPE", "geo:dst")
+    c("GEOSEARCHSTORE", "geo:dd", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "2", "ASC", "STOREDIST")
+    c("ZCARD", "geo:dd")
+    c("ZRANGE", "geo:dd", "0", "-1")
+    c("GEOSEARCHSTORE", "geo:dd", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "WITHDIST")
+    c("SET", "geo:sdest", "v")
+    c("GEOSEARCHSTORE", "geo:sdest", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km")
+    c("TYPE", "geo:sdest")
+
+    # The GEORADIUS compat forms, STORE arms and the _RO walls.
+    c("GEORADIUS", "geo:s", "15", "37", "200", "km", "ASC", "WITHDIST")
+    c("GEORADIUS", "geo:s", "15", "37", "200", "km", "COUNT", "1", "ASC", "WITHCOORD", "WITHHASH")
+    c("GEORADIUS_RO", "geo:s", "15", "37", "200", "km", "ASC")
+    c("GEORADIUS", "geo:s", "15", "37", "200", "km", "STORE", "geo:rs")
+    c("ZRANGE", "geo:rs", "0", "-1", "WITHSCORES")
+    c("GEORADIUS", "geo:s", "15", "37", "200", "km", "STOREDIST", "geo:rd")
+    c("ZCARD", "geo:rd")
+    c("ZRANGE", "geo:rd", "0", "-1")
+    c("GEORADIUS", "geo:s", "15", "37", "200", "km", "STORE", "geo:x", "STOREDIST", "geo:y")
+    c("TYPE", "geo:x")
+    c("TYPE", "geo:y")
+    c("GEORADIUS", "geo:s", "15", "37", "200", "km", "WITHDIST", "STORE", "geo:x2")
+    c("GEORADIUS_RO", "geo:s", "15", "37", "200", "km", "STORE", "geo:x3")
+    c("GEORADIUS", "geo:s", "15", "37")
+    c("GEORADIUSBYMEMBER", "geo:s", "Palermo", "250", "km", "ASC", "WITHDIST")
+    c("GEORADIUSBYMEMBER", "geo:s", "ghost", "1", "km")
+    c("GEORADIUSBYMEMBER_RO", "geo:s", "Palermo", "250", "km", "ASC")
+    c("GEORADIUSBYMEMBER_RO", "geo:s", "Palermo", "250", "km", "STOREDIST", "geo:x4")
+    c("GEORADIUSBYMEMBER", "geo:s")
+
+    # Type walls.
+    c("SET", "geo:str", "v")
+    c("GEOADD", "geo:str", "1", "1", "m")
+    c("GEOPOS", "geo:str", "m")
+    c("GEODIST", "geo:str", "a", "b")
+    c("GEOHASH", "geo:str", "m")
+    c("GEOSEARCH", "geo:str", "FROMLONLAT", "1", "1", "BYRADIUS", "1", "km")
+    c("GEORADIUS", "geo:str", "1", "1", "1", "km")
 
     print("\n".join(lines))
 
