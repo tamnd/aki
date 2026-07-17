@@ -48,6 +48,34 @@ func (f *File) WalkRecords(from uint64, visit func(addr uint64, row RecordRow) e
 	return err
 }
 
+// WalkShardRecords is WalkRecords narrowed to one shard: it walks the append
+// space from `from` up to the durable tail but descends only into `log` segments
+// the given shard cut, so a per-shard recovery reapplies its own records and not
+// another shard's. The record log interleaves every shard's segments in the one
+// append space, and a segment header carries its owning shard, so the filter is a
+// header field compare before the frame walk. The row's Key aliases the segment
+// payload for the duration of the visit call, the same as WalkRecords.
+func (f *File) WalkShardRecords(shard uint16, from uint64, visit func(addr uint64, row RecordRow) error) error {
+	_, err := ReplayTail(f.dev, f.prefix, from, f.cursor, func(off uint64, h *SegHeader, payload []byte) error {
+		if h.Kind != KindLog || h.Shard != shard {
+			return nil
+		}
+		base := off + SegHeaderLen
+		for cur := uint64(0); cur < uint64(len(payload)); {
+			fr, row, next, err := NextRecordFrame(payload, cur)
+			if err != nil {
+				return err
+			}
+			if err := visit(base+fr.FrameOff, row); err != nil {
+				return err
+			}
+			cur = next
+		}
+		return nil
+	})
+	return err
+}
+
 // ReadRecordAt decodes the record at an absolute frame address, the random-access
 // counterpart to WalkRecords' sequential walk. A checkpoint entry keeps a record's
 // address (section 5's record_addr), and a recovery cross-check or a verify pass

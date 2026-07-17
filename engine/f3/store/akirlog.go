@@ -84,6 +84,14 @@ func (l *akiRlog) flush() ([]uint64, error) {
 	return addrs, nil
 }
 
+// walkShard replays this shard's record log from the start of the append space,
+// calling visit for each framed record this shard cut in append order. It skips
+// every other shard's segments, so a per-shard recovery reapplies only its own
+// records. The row's Key aliases the segment payload for the visit's duration.
+func (l *akiRlog) walkShard(visit func(addr uint64, row akifile.RecordRow) error) error {
+	return l.f.WalkShardRecords(l.shard, akifile.PageSize, visit)
+}
+
 // readAt decodes a published record from its absolute frame address, the deref the
 // index entry and a checkpoint's record_addr take, verifying the frame's own
 // trailing CRC so a torn or superseded record fails closed rather than returning
