@@ -270,6 +270,23 @@ func (s *Store) Exists(key []byte, now int64) bool {
 	return addr != 0
 }
 
+// Deadline reports key's absolute unix-ms expiry and whether the key is live.
+// A live key with no TTL reports (0, true); an absent or lazily reaped key
+// reports (0, false). It reads under the same lazy-expiry rule as any touch, so
+// a key already past its deadline reads as absent. A cold record carries no TTL
+// this slice (the migrator demotes only TTL-free records), so a cold hit is a
+// live key with no deadline.
+func (s *Store) Deadline(key []byte, now int64) (int64, bool) {
+	slot, addr, _ := s.findLive(Hash(key), key, now)
+	if addr == 0 {
+		return 0, false
+	}
+	if slotCold(*slot) {
+		return 0, true
+	}
+	return s.expireAt(addr), true
+}
+
 // StrLen reports the value's byte length (an int cell's digit count) and
 // presence.
 func (s *Store) StrLen(key []byte, now int64) (int64, bool) {

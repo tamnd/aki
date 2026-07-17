@@ -53,3 +53,70 @@ func Del(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	r.Int(0)
 }
+
+// keyDeadline resolves a key's absolute unix-ms expiry the way TTL and its
+// siblings all need it: (-2, _) for an absent key, (-1, _) for a live key with
+// no deadline, and (0, ms) for a live key that expires at ms. A set carries no
+// key-level TTL this slice, so a set key reads as live-without-a-deadline; the
+// string store answers for a string value. Its reach is set plus string, the
+// same as TYPE and EXISTS, and misses the other collection registries until the
+// keyspace-unification slice, owed not designed.
+func keyDeadline(cx *shard.Ctx, key []byte) (state int, at int64) {
+	if registry(cx).m[string(key)] != nil {
+		return -1, 0
+	}
+	at, ok := cx.St.Deadline(key, cx.NowMs)
+	if !ok {
+		return -2, 0
+	}
+	if at == 0 {
+		return -1, 0
+	}
+	return 0, at
+}
+
+// Ttl answers TTL key: the remaining lifetime in whole seconds, -2 for a
+// missing key, -1 for a key with no deadline. Seconds round to nearest, Redis's
+// (ttl+500)/1000.
+func Ttl(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	state, at := keyDeadline(cx, args[0])
+	if state != 0 {
+		r.Int(int64(state))
+		return
+	}
+	r.Int((at - cx.NowMs + 500) / 1000)
+}
+
+// Pttl answers PTTL key: the remaining lifetime in milliseconds, with the same
+// -2 and -1 sentinels as TTL.
+func Pttl(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	state, at := keyDeadline(cx, args[0])
+	if state != 0 {
+		r.Int(int64(state))
+		return
+	}
+	r.Int(at - cx.NowMs)
+}
+
+// Expiretime answers EXPIRETIME key: the absolute unix time in seconds at which
+// the key expires, with the same -2 and -1 sentinels. Seconds floor the ms
+// deadline, Redis's expire/1000.
+func Expiretime(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	state, at := keyDeadline(cx, args[0])
+	if state != 0 {
+		r.Int(int64(state))
+		return
+	}
+	r.Int(at / 1000)
+}
+
+// Pexpiretime answers PEXPIRETIME key: the absolute unix time in milliseconds
+// at which the key expires, with the same -2 and -1 sentinels.
+func Pexpiretime(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	state, at := keyDeadline(cx, args[0])
+	if state != 0 {
+		r.Int(int64(state))
+		return
+	}
+	r.Int(at)
+}
