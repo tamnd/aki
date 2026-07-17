@@ -229,3 +229,15 @@ func (s *Store) LogBytes() (total, dead uint64) {
 	}
 	return s.vlog.tail, s.vlog.dead
 }
+
+// RecordLogBytes reports the record log's total flushed bytes and the dead subset a
+// supersession, a delete, or an expiry unlinked. It is the accounting a clean-shutdown
+// checkpoint persists into the file's global stats so a reopen seeds compaction from
+// the record region's dead figure without rescanning it (the O10 gap, doc 07 section
+// 6). Zero on a store with no record log.
+func (s *Store) RecordLogBytes() (total, dead uint64) {
+	if s.akirlog == nil {
+		return 0, 0
+	}
+	return s.akirlog.logBytes()
+}

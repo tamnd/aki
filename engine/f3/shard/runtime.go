@@ -339,41 +339,82 @@ func (r *Runtime) Start() {
 	}
 }
 
-// Stop halts every worker after it drains what its queue already holds, and
-// waits for the goroutines to exit.
+// Stop halts every worker after it drains what its queue already holds, waits for
+// the goroutines to exit, and releases the durable resources Open acquired. The
+// worker shutdown runs only for a started runtime, but the release always runs:
+// Open stands up the shared writer goroutine and the file eagerly, so an
+// Open-without-Start still has to hand them back or they leak.
 func (r *Runtime) Stop() {
-	if !r.started {
-		return
+	if r.started {
+		r.started = false
+		for _, w := range r.workers {
+			w.stop.Store(true)
+		}
+		for _, w := range r.workers {
+			w.wk.wake()
+		}
+		for _, w := range r.workers {
+			<-w.done
+		}
+		// The owners are gone, so no more drains can be submitted: shut each shard's
+		// I/O worker down (a no-op on a shard that never drained). This joins before
+		// the store close so an in-flight pwrite finishes against a live file.
+		for _, w := range r.workers {
+			w.io.stop()
+		}
 	}
-	r.started = false
-	for _, w := range r.workers {
-		w.stop.Store(true)
-	}
-	for _, w := range r.workers {
-		w.wk.wake()
-	}
-	for _, w := range r.workers {
-		<-w.done
-	}
-	// The owners are gone, so no more drains can be submitted: shut each shard's
-	// I/O worker down (a no-op on a shard that never drained). This joins before
-	// the store close so an in-flight pwrite finishes against a live file.
-	for _, w := range r.workers {
-		w.io.stop()
-	}
-	// The workers are gone; releasing the value logs here is single-owner by
-	// exhaustion.
-	for _, w := range r.workers {
-		_ = w.st.Close()
-	}
-	// On the shared-.aki path the runtime owns the one writer and the one file. The
-	// owners have quiesced, so no Submit can race the drain: join the writer (it
-	// commits whatever was queued one last time), then close the file it wrote to.
-	// The stores borrowed the handle, so their Close above left it open for this.
+	// On the shared-.aki path the runtime owns the one writer and the one file. Join
+	// the writer first, before any store closes: the owners have quiesced so no Submit
+	// can race the drain, and the join commits whatever was queued one last time. Once
+	// it returns this goroutine alone touches the file's single-writer append cursor,
+	// which the clean-shutdown checkpoint below appends against directly.
 	if r.gw != nil {
 		r.gw.Stop()
+	}
+	// With the writer joined and the stores still live, take a clean-shutdown
+	// checkpoint so the next open recovers through the bounded checkpoint-plus-tail
+	// path instead of walking every record ever logged. Best-effort: every record is
+	// already durable, so a checkpoint error just sends the next open down the full
+	// walk, which rebuilds the same index.
+	if r.aki != nil {
+		_ = r.checkpointOnStop(uint64(time.Now().Unix()))
+	}
+	// Release each store's own value log. On the shared path this closes only the
+	// store's scratch, not the borrowed file, which the runtime closes last.
+	for _, w := range r.workers {
+		if w != nil {
+			_ = w.st.Close()
+		}
 	}
 	if r.aki != nil {
 		_ = r.aki.Close()
 	}
+}
+
+// checkpointOnStop writes a clean-shutdown index checkpoint for every shard and
+// commits them as the file's live root in one meta flip. It runs only on the
+// shared-.aki path and only after the group writer has joined, so its direct
+// checkpoint appends never race the writer for the file's single-writer append
+// cursor. Each shard's row names the dump the recovery fast path reads and the tail
+// it replays after; the aggregated stats seed a reopen's compaction with the record
+// region's live and dead bytes without a rescan. A returned error is not fatal to the
+// shutdown: the records are durable regardless, so a missing checkpoint only sends the
+// next open down the full-log walk.
+func (r *Runtime) checkpointOnStop(nowUnix uint64) error {
+	rows := make([]akifile.SRTRow, len(r.workers))
+	var stats akifile.CheckpointStats
+	for i, w := range r.workers {
+		row, err := w.st.WriteIndexCheckpoint()
+		if err != nil {
+			return err
+		}
+		rows[i] = row
+		total, dead := w.st.RecordLogBytes()
+		stats.LiveBytes += total - dead
+		stats.DeadBytes += dead
+		stats.RecordCount += row.LiveRecords
+	}
+	stats.LastCkptUnix = nowUnix
+	stats.Clean = true
+	return store.CommitCheckpoint(r.aki, rows, stats)
 }
