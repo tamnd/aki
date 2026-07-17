@@ -73,6 +73,57 @@ func TestFlushAllEmptiesEveryBand(t *testing.T) {
 	}
 }
 
+// TestFlushAllClearsEveryKeyspace checks FLUSHALL empties the collection
+// registries, not only the string store: before the fix the store reset alone,
+// so a set, zset, hash, list, or stream key survived a flush. It stands up one
+// key of every type, flushes, and checks each key is gone across EXISTS and
+// TYPE, then writes a fresh key of each type to confirm the flushed registries
+// still serve.
+func TestFlushAllClearsEveryKeyspace(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	send(t, nc, "SET", "s", "v")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "SADD", "st", "m")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "ZADD", "zs", "1", "m")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "HSET", "h", "f", "v")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "RPUSH", "l", "e")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "XADD", "str", "*", "f", "v")
+	if id := readBulk(t, br); len(id) == 0 {
+		t.Fatalf("XADD id = %q, want an entry id", id)
+	}
+
+	send(t, nc, "FLUSHALL")
+	expect(t, br, "+OK\r\n")
+
+	keys := []string{"s", "st", "zs", "h", "l", "str"}
+	if n := readInt(t, nc, br, append([]string{"EXISTS"}, keys...)...); n != 0 {
+		t.Fatalf("EXISTS over all types after FLUSHALL = %d, want 0", n)
+	}
+	for _, key := range keys {
+		send(t, nc, "TYPE", key)
+		expect(t, br, "+none\r\n")
+	}
+
+	// The flushed registries still serve: a fresh key of every type writes and
+	// reads back.
+	send(t, nc, "SADD", "st", "m")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "RPUSH", "l", "e")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "XADD", "str", "*", "f", "v")
+	if id := readBulk(t, br); len(id) == 0 {
+		t.Fatalf("XADD after flush = %q", id)
+	}
+	if n := readInt(t, nc, br, "EXISTS", "st", "l", "str"); n != 3 {
+		t.Fatalf("EXISTS after post-flush writes = %d, want 3", n)
+	}
+}
+
 // TestFlushDBAliasAndTokens checks FLUSHDB flushes the single keyspace and
 // the option tail: ASYNC and SYNC in any case are accepted (both run sync),
 // anything else is a syntax error, and a longer tail is an arity error.

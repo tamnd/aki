@@ -118,6 +118,19 @@ func Delete(cx *shard.Ctx, key []byte) bool {
 	return true
 }
 
+// Flush drops every zset on this shard, the zset arm of FLUSHALL and FLUSHDB. It
+// clears the map and zeroes the resident-byte total, so a flush leaves the
+// registry empty and weighing nothing, matching the store the flush just reset.
+// It builds no registry when none exists.
+func Flush(cx *shard.Ctx) {
+	if cx.ZColl == nil {
+		return
+	}
+	g := cx.ZColl.(*reg)
+	g.m = make(map[string]*zset)
+	g.resident = 0
+}
+
 // lookup finds the zset for key. present is false when no zset exists; wrong is
 // true when the key instead holds a value in the string store, which every zset
 // command answers with WRONGTYPE.

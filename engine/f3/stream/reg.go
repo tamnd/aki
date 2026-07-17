@@ -183,6 +183,25 @@ func Delete(cx *shard.Ctx, key []byte) bool {
 	return true
 }
 
+// Flush drops every stream on this shard, the stream arm of FLUSHALL and
+// FLUSHDB. It clears the map, empties the gc worklist, and zeroes the
+// resident-byte total, so a flush leaves the registry empty and weighing
+// nothing, matching the store the flush just reset. The blocking-XREAD waiters
+// are kept: FLUSHALL does not unblock a parked client (Redis leaves blocked
+// clients blocked), so a later XADD to the key recreates the stream and serves
+// them. The registry object itself stays, so its registered gc maintainer needs
+// no re-registration. It builds no registry when none exists on this shard.
+func Flush(cx *shard.Ctx) {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return
+	}
+	g := v.(*reg)
+	g.m = make(map[string]*stream)
+	g.dirty = g.dirty[:0]
+	g.resident = 0
+}
+
 // undirty takes a stream off the gc worklist, swapping the tail into its slot
 // since the worklist order carries no meaning. It is used only by Delete, so a
 // stream removed from the registry never reaches the maintainer.

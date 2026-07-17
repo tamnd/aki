@@ -201,7 +201,7 @@ func init() {
 	// and SYNC tokens are both accepted and both run synchronously for now:
 	// the reset is a segment rewind plus a truncate, quick enough that a
 	// background reclaim buys nothing yet.
-	flush := registerShard(str.FlushShard)
+	flush := registerShard(flushShardAll)
 	register("FLUSHALL", nil, 0, 1, false)
 	register("FLUSHDB", nil, 0, 1, false)
 	registerFan("FLUSHALL", shard.FanOK, flush, false, true)
@@ -1197,4 +1197,25 @@ func delShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 	}
 	r.FanCount(n)
+}
+
+// flushShardAll answers a FLUSHALL or FLUSHDB sub-command over every keyspace: it
+// resets the shard's string store and then clears each collection registry, so a
+// flush empties every type f3 keeps rather than only the string store. Before
+// this the sub-handler reset the store alone, so a set, zset, hash, list, or
+// stream key survived a flush and DBSIZE and the resident totals stayed wrong. It
+// lives here for the same reason the other fan handlers do, where every type
+// package is in reach. The reply is the FanOK empty partial; the gather answers
+// +OK only once every shard has flushed, so a command pipelined after the flush
+// always sees the empty keyspace. Parked blocking-pop and blocking-XREAD clients
+// are left blocked, as in Redis, since the list and stream arms keep their waiter
+// lists.
+func flushShardAll(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	cx.St.Reset()
+	set.Flush(cx)
+	zset.Flush(cx)
+	hash.Flush(cx)
+	list.Flush(cx)
+	stream.Flush(cx)
+	r.FanOK()
 }

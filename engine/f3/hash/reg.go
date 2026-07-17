@@ -171,6 +171,20 @@ func Delete(cx *shard.Ctx, key []byte) bool {
 	return true
 }
 
+// Flush drops every hash on this shard, the hash arm of FLUSHALL and FLUSHDB. It
+// clears the map and zeroes the resident-byte total, so a flush leaves the
+// registry empty and weighing nothing, matching the store the flush just reset.
+// It builds no registry when none exists on this shard.
+func Flush(cx *shard.Ctx) {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return
+	}
+	g := v.(*reg)
+	g.m = make(map[string]*hash)
+	g.resident = 0
+}
+
 // lookup finds the hash for key. present is nil when no hash exists; wrong is true
 // when the key instead holds a value in the string store, which every hash command
 // answers with WRONGTYPE. Cross-type collisions with the set, zset, and list
