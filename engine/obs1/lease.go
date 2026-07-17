@@ -447,3 +447,26 @@ func (g *LeaseGuard) Suspended(group uint16, now time.Time) bool {
 	}
 	return !now.Before(d.Add(-g.skew))
 }
+
+// Horizon reports the earliest moment any tracked group suspends: the
+// minimum believed deadline minus the skew bound. Before it, no tracked
+// group is suspended, which is the whole-guard fast path the serving gate
+// caches, and it is also the latest instant a heartbeat must land by, the
+// scheduling input the heartbeat loop reads. False when the guard tracks
+// nothing, in which case every group is suspended by definition.
+func (g *LeaseGuard) Horizon() (time.Time, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var h time.Time
+	ok := false
+	for _, d := range g.deadline {
+		if !ok || d.Before(h) {
+			h = d
+			ok = true
+		}
+	}
+	if !ok {
+		return time.Time{}, false
+	}
+	return h.Add(-g.skew), true
+}
