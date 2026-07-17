@@ -31,9 +31,9 @@ func compatWire(v any) string {
 
 // TestCompatRedisParity replays testdata/compat/fixtures.txt,
 // generated against a real redis-server 8.8.0 by
-// testdata/compat/gen.py: the STRING, BITMAP, HLL, HASH, and SET
-// manifest rows from spec doc 12, one live-captured reply per line,
-// diffed against the dispatch path byte for byte.
+// testdata/compat/gen.py: the STRING, BITMAP, HLL, HASH, SET, ZSET,
+// and GEO manifest rows from spec doc 12, one live-captured reply
+// per line, diffed against the dispatch path byte for byte.
 func TestCompatRedisParity(t *testing.T) {
 	f, err := os.Open("testdata/compat/fixtures.txt")
 	if err != nil {
@@ -83,7 +83,7 @@ func TestCompatRedisParity(t *testing.T) {
 	if err := sc.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if n < 400 {
+	if n < 800 {
 		t.Fatalf("replayed only %d commands, fixture looks truncated", n)
 	}
 }

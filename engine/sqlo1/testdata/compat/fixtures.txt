@@ -482,3 +482,358 @@ C ["SMOVE", "st:k", "st:str", "a"] -> "-WRONGTYPE Operation against a key holdin
 C ["SINTER", "st:str", "st:k"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
 C ["SINTERSTORE", "st:d2", "st:str", "st:k"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
 C ["GET", "st:k"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+S ZSET
+C ["ZADD", "z:k", "1", "a"] -> ":1"
+C ["ZADD", "z:k", "2", "b", "3", "c"] -> ":2"
+C ["ZADD", "z:k", "5", "a"] -> ":0"
+C ["ZADD", "z:k", "CH", "6", "a", "4", "d"] -> ":2"
+C ["ZADD", "z:k", "NX", "9", "a", "1", "e"] -> ":1"
+C ["ZSCORE", "z:k", "a"] -> "$6"
+C ["ZADD", "z:k", "XX", "2", "a", "7", "nope"] -> ":0"
+C ["ZSCORE", "z:k", "a"] -> "$2"
+C ["ZSCORE", "z:k", "nope"] -> "$-1"
+C ["ZSCORE", "z:missing", "a"] -> "$-1"
+C ["ZADD", "z:k", "GT", "1", "a"] -> ":0"
+C ["ZSCORE", "z:k", "a"] -> "$2"
+C ["ZADD", "z:k", "GT", "8", "a"] -> ":0"
+C ["ZADD", "z:k", "LT", "9", "a"] -> ":0"
+C ["ZADD", "z:k", "LT", "3", "a"] -> ":0"
+C ["ZSCORE", "z:k", "a"] -> "$3"
+C ["ZADD", "z:k", "INCR", "2", "a"] -> "$5"
+C ["ZADD", "z:k", "NX", "INCR", "1", "a"] -> "$-1"
+C ["ZADD", "z:k", "XX", "INCR", "0.5", "a"] -> "$5.5"
+C ["ZADD", "z:k", "GT", "INCR", "-5", "a"] -> "$-1"
+C ["ZADD", "z:missing", "XX", "INCR", "1", "m"] -> "$-1"
+C ["ZADD", "z:k"] -> "-ERR wrong number of arguments for 'zadd' command"
+C ["ZADD", "z:k", "1"] -> "-ERR wrong number of arguments for 'zadd' command"
+C ["ZADD", "z:k", "1", "a", "2"] -> "-ERR syntax error"
+C ["ZADD", "z:k", "NX", "XX", "1", "a"] -> "-ERR XX and NX options at the same time are not compatible"
+C ["ZADD", "z:k", "GT", "NX", "1", "a"] -> "-ERR GT, LT, and/or NX options at the same time are not compatible"
+C ["ZADD", "z:k", "GT", "LT", "1", "a"] -> "-ERR GT, LT, and/or NX options at the same time are not compatible"
+C ["ZADD", "z:k", "INCR", "1", "a", "2", "b"] -> "-ERR INCR option supports a single increment-element pair"
+C ["ZADD", "z:k", "notanum", "a"] -> "-ERR value is not a valid float"
+C ["ZADD", "z:k", "nan", "a"] -> "-ERR value is not a valid float"
+C ["ZMSCORE", "z:k", "a", "nope", "b"] -> ["$5.5", "$-1", "$2"]
+C ["ZMSCORE", "z:missing", "a"] -> ["$-1"]
+C ["ZMSCORE", "z:k"] -> "-ERR wrong number of arguments for 'zmscore' command"
+C ["ZCARD", "z:k"] -> ":5"
+C ["ZCARD", "z:missing"] -> ":0"
+C ["ZINCRBY", "z:k", "1.5", "b"] -> "$3.5"
+C ["ZINCRBY", "z:k", "-10", "fresh"] -> "$-10"
+C ["ZINCRBY", "z:k", "notanum", "b"] -> "-ERR value is not a valid float"
+C ["ZINCRBY", "z:missing2", "3", "m"] -> "$3"
+C ["TYPE", "z:missing2"] -> "+zset"
+C ["DEL", "z:missing2"] -> ":1"
+C ["ZREM", "z:k", "fresh", "nope"] -> ":1"
+C ["ZREM", "z:missing", "a"] -> ":0"
+C ["ZREM", "z:k"] -> "-ERR wrong number of arguments for 'zrem' command"
+C ["ZADD", "z:d", "1", "x"] -> ":1"
+C ["ZREM", "z:d", "x"] -> ":1"
+C ["ZCARD", "z:d"] -> ":0"
+C ["TYPE", "z:d"] -> "+none"
+C ["ZADD", "z:f", "3.0", "i", "2.5", "h", "-0", "z", "inf", "p", "-inf", "n"] -> ":5"
+C ["ZSCORE", "z:f", "i"] -> "$3"
+C ["ZSCORE", "z:f", "z"] -> "$0"
+C ["ZSCORE", "z:f", "p"] -> "$inf"
+C ["ZSCORE", "z:f", "n"] -> "$-inf"
+C ["ZINCRBY", "z:f", "+inf", "n"] -> "-ERR resulting score is not a number (NaN)"
+C ["ZADD", "z:f", "INCR", "-inf", "p"] -> "-ERR resulting score is not a number (NaN)"
+C ["ZRANGE", "z:f", "0", "-1", "WITHSCORES"] -> ["$n", "$-inf", "$z", "$0", "$h", "$2.5", "$i", "$3", "$p", "$inf"]
+C ["ZRANK", "z:f", "n"] -> ":0"
+C ["ZRANK", "z:f", "p"] -> ":4"
+C ["ZRANK", "z:f", "nope"] -> "$-1"
+C ["ZRANK", "z:missing", "m"] -> "$-1"
+C ["ZREVRANK", "z:f", "n"] -> ":4"
+C ["ZREVRANK", "z:f", "p"] -> ":0"
+C ["ZRANK", "z:f", "h", "WITHSCORE"] -> [":2", "$2.5"]
+C ["ZRANK", "z:f", "nope", "WITHSCORE"] -> "*-1"
+C ["ZRANK", "z:missing", "m", "WITHSCORE"] -> "*-1"
+C ["ZREVRANK", "z:f", "i", "WITHSCORE"] -> [":1", "$3"]
+C ["ZRANK", "z:f", "h", "BOGUS"] -> "-ERR syntax error"
+C ["ZADD", "z:r", "1", "a", "2", "b", "2", "c", "3", "d", "4", "e"] -> ":5"
+C ["ZRANGE", "z:r", "0", "-1"] -> ["$a", "$b", "$c", "$d", "$e"]
+C ["ZRANGE", "z:r", "1", "3", "WITHSCORES"] -> ["$b", "$2", "$c", "$2", "$d", "$3"]
+C ["ZRANGE", "z:r", "-2", "-1"] -> ["$d", "$e"]
+C ["ZRANGE", "z:r", "3", "1"] -> []
+C ["ZRANGE", "z:r", "10", "20"] -> []
+C ["ZRANGE", "z:r", "0", "-1", "REV"] -> ["$e", "$d", "$c", "$b", "$a"]
+C ["ZRANGE", "z:r", "1", "2", "REV", "WITHSCORES"] -> ["$d", "$3", "$c", "$2"]
+C ["ZRANGE", "z:missing", "0", "-1"] -> []
+C ["ZRANGE", "z:r", "2", "3", "BYSCORE"] -> ["$b", "$c", "$d"]
+C ["ZRANGE", "z:r", "(2", "+inf", "BYSCORE"] -> ["$d", "$e"]
+C ["ZRANGE", "z:r", "-inf", "(3", "BYSCORE", "WITHSCORES"] -> ["$a", "$1", "$b", "$2", "$c", "$2"]
+C ["ZRANGE", "z:r", "-inf", "+inf", "BYSCORE", "LIMIT", "1", "2"] -> ["$b", "$c"]
+C ["ZRANGE", "z:r", "-inf", "+inf", "BYSCORE", "LIMIT", "1", "-1"] -> ["$b", "$c", "$d", "$e"]
+C ["ZRANGE", "z:r", "+inf", "-inf", "BYSCORE", "REV", "LIMIT", "0", "3"] -> ["$e", "$d", "$c"]
+C ["ZRANGE", "z:r", "3", "1", "BYSCORE"] -> []
+C ["ZRANGE", "z:r", "notanum", "3", "BYSCORE"] -> "-ERR min or max is not a float"
+C ["ZADD", "z:lex", "0", "a", "0", "b", "0", "c", "0", "d"] -> ":4"
+C ["ZRANGE", "z:lex", "-", "+", "BYLEX"] -> ["$a", "$b", "$c", "$d"]
+C ["ZRANGE", "z:lex", "[b", "(d", "BYLEX"] -> ["$b", "$c"]
+C ["ZRANGE", "z:lex", "(a", "[c", "BYLEX"] -> ["$b", "$c"]
+C ["ZRANGE", "z:lex", "+", "-", "BYLEX", "REV"] -> ["$d", "$c", "$b", "$a"]
+C ["ZRANGE", "z:lex", "-", "+", "BYLEX", "LIMIT", "1", "2"] -> ["$b", "$c"]
+C ["ZRANGE", "z:lex", "b", "d", "BYLEX"] -> "-ERR min or max not valid string range item"
+C ["ZRANGE", "z:lex", "-", "+", "BYLEX", "WITHSCORES"] -> "-ERR syntax error, WITHSCORES not supported in combination with BYLEX"
+C ["ZRANGE", "z:r", "0", "-1", "LIMIT", "0", "1"] -> "-ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"
+C ["ZRANGE", "z:r", "0", "-1", "BOGUS"] -> "-ERR syntax error"
+C ["ZRANGEBYSCORE", "z:r", "2", "3"] -> ["$b", "$c", "$d"]
+C ["ZRANGEBYSCORE", "z:r", "(1", "+inf", "WITHSCORES", "LIMIT", "0", "2"] -> ["$b", "$2", "$c", "$2"]
+C ["ZREVRANGEBYSCORE", "z:r", "3", "(1"] -> ["$d", "$c", "$b"]
+C ["ZREVRANGEBYSCORE", "z:r", "+inf", "-inf", "LIMIT", "1", "2", "WITHSCORES"] -> ["$d", "$3", "$c", "$2"]
+C ["ZRANGEBYLEX", "z:lex", "[a", "(c"] -> ["$a", "$b"]
+C ["ZREVRANGEBYLEX", "z:lex", "[c", "-"] -> ["$c", "$b", "$a"]
+C ["ZREVRANGE", "z:r", "0", "2", "WITHSCORES"] -> ["$e", "$4", "$d", "$3", "$c", "$2"]
+C ["ZCOUNT", "z:r", "2", "3"] -> ":3"
+C ["ZCOUNT", "z:r", "(2", "+inf"] -> ":2"
+C ["ZCOUNT", "z:r", "-inf", "+inf"] -> ":5"
+C ["ZCOUNT", "z:missing", "0", "10"] -> ":0"
+C ["ZCOUNT", "z:r", "x", "3"] -> "-ERR min or max is not a float"
+C ["ZLEXCOUNT", "z:lex", "-", "+"] -> ":4"
+C ["ZLEXCOUNT", "z:lex", "[b", "(d"] -> ":2"
+C ["ZLEXCOUNT", "z:lex", "b", "+"] -> "-ERR min or max not valid string range item"
+C ["ZRANGESTORE", "z:dst", "z:r", "0", "2"] -> ":3"
+C ["ZRANGE", "z:dst", "0", "-1", "WITHSCORES"] -> ["$a", "$1", "$b", "$2", "$c", "$2"]
+C ["ZRANGESTORE", "z:dst", "z:r", "(4", "+inf", "BYSCORE"] -> ":0"
+C ["TYPE", "z:dst"] -> "+none"
+C ["ZRANGESTORE", "z:dst2", "z:r", "+inf", "-inf", "BYSCORE", "REV", "LIMIT", "0", "2"] -> ":2"
+C ["ZRANGE", "z:dst2", "0", "-1"] -> ["$d", "$e"]
+C ["ZRANGESTORE", "z:dst2", "z:missing", "0", "-1"] -> ":0"
+C ["TYPE", "z:dst2"] -> "+none"
+C ["ZADD", "z:p", "1", "a", "2", "b", "3", "c", "4", "d"] -> ":4"
+C ["ZPOPMIN", "z:p"] -> ["$a", "$1"]
+C ["ZPOPMAX", "z:p"] -> ["$d", "$4"]
+C ["ZPOPMIN", "z:p", "2"] -> ["$b", "$2", "$c", "$3"]
+C ["ZPOPMIN", "z:p", "0"] -> []
+C ["ZPOPMIN", "z:p", "5"] -> []
+C ["TYPE", "z:p"] -> "+none"
+C ["ZPOPMIN", "z:missing"] -> []
+C ["ZPOPMAX", "z:missing", "3"] -> []
+C ["ZPOPMIN", "z:k", "-1"] -> "-ERR value is out of range, must be positive"
+C ["ZPOPMIN", "z:k", "x"] -> "-ERR value is out of range, must be positive"
+C ["ZADD", "z:p2", "1", "a", "2", "b"] -> ":2"
+C ["ZMPOP", "2", "z:missing", "z:p2", "MIN"] -> ["$z:p2", [["$a", "$1"]]]
+C ["ZMPOP", "1", "z:p2", "MAX", "COUNT", "5"] -> ["$z:p2", [["$b", "$2"]]]
+C ["TYPE", "z:p2"] -> "+none"
+C ["ZMPOP", "1", "z:missing", "MIN"] -> "*-1"
+C ["ZMPOP", "0", "MIN"] -> "-ERR wrong number of arguments for 'zmpop' command"
+C ["ZMPOP", "1", "z:k", "BOGUS"] -> "-ERR syntax error"
+C ["ZMPOP", "x", "z:k", "MIN"] -> "-ERR numkeys should be greater than 0"
+C ["ZMPOP", "1", "z:k", "MIN", "COUNT", "0"] -> "-ERR count should be greater than 0"
+C ["ZADD", "z:b", "1", "a", "2", "b", "3", "c"] -> ":3"
+C ["BZPOPMIN", "z:b", "0"] -> ["$z:b", "$a", "$1"]
+C ["BZPOPMAX", "z:missing", "z:b", "0.1"] -> ["$z:b", "$c", "$3"]
+C ["BZMPOP", "0", "1", "z:b", "MIN"] -> ["$z:b", [["$b", "$2"]]]
+C ["TYPE", "z:b"] -> "+none"
+C ["BZPOPMIN", "z:k", "-1"] -> "-ERR timeout is negative"
+C ["BZPOPMIN", "z:k", "notanum"] -> "-ERR timeout is not a float or out of range"
+C ["BZMPOP", "0", "0", "MIN"] -> "-ERR wrong number of arguments for 'bzmpop' command"
+C ["ZRANDMEMBER", "z:missing"] -> "$-1"
+C ["ZRANDMEMBER", "z:missing", "3"] -> []
+C ["ZADD", "z:one", "7", "solo"] -> ":1"
+C ["ZRANDMEMBER", "z:one"] -> "$solo"
+C ["ZRANDMEMBER", "z:one", "5"] -> ["$solo"]
+C ["ZRANDMEMBER", "z:one", "-3"] -> ["$solo", "$solo", "$solo"]
+C ["ZRANDMEMBER", "z:one", "0"] -> []
+C ["ZRANDMEMBER", "z:one", "2", "WITHSCORES"] -> ["$solo", "$7"]
+C ["ZRANDMEMBER", "z:one", "-2", "WITHSCORES"] -> ["$solo", "$7", "$solo", "$7"]
+C ["ZRANDMEMBER", "z:one", "x"] -> "-ERR value is not an integer or out of range"
+C ["ZADD", "z:rr", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e"] -> ":5"
+C ["ZREMRANGEBYRANK", "z:rr", "0", "1"] -> ":2"
+C ["ZRANGE", "z:rr", "0", "-1"] -> ["$c", "$d", "$e"]
+C ["ZREMRANGEBYSCORE", "z:rr", "(3", "+inf"] -> ":2"
+C ["ZRANGE", "z:rr", "0", "-1", "WITHSCORES"] -> ["$c", "$3"]
+C ["ZREMRANGEBYRANK", "z:rr", "0", "-1"] -> ":1"
+C ["TYPE", "z:rr"] -> "+none"
+C ["ZREMRANGEBYRANK", "z:missing", "0", "-1"] -> ":0"
+C ["ZREMRANGEBYSCORE", "z:missing", "-inf", "+inf"] -> ":0"
+C ["ZREMRANGEBYSCORE", "z:k", "x", "1"] -> "-ERR min or max is not a float"
+C ["ZADD", "z:rl", "0", "a", "0", "b", "0", "c"] -> ":3"
+C ["ZREMRANGEBYLEX", "z:rl", "[a", "(c"] -> ":2"
+C ["ZRANGE", "z:rl", "0", "-1"] -> ["$c"]
+C ["ZREMRANGEBYLEX", "z:rl", "x", "+"] -> "-ERR min or max not valid string range item"
+C ["ZADD", "z:a1", "1", "a", "2", "b", "3", "c"] -> ":3"
+C ["ZADD", "z:a2", "10", "b", "20", "c", "30", "d"] -> ":3"
+C ["ZUNION", "2", "z:a1", "z:a2"] -> ["$a", "$b", "$c", "$d"]
+C ["ZUNION", "2", "z:a1", "z:a2", "WITHSCORES"] -> ["$a", "$1", "$b", "$12", "$c", "$23", "$d", "$30"]
+C ["ZUNION", "2", "z:a1", "z:missing", "WITHSCORES"] -> ["$a", "$1", "$b", "$2", "$c", "$3"]
+C ["ZUNION", "2", "z:a1", "z:a2", "WEIGHTS", "2", "0.5", "WITHSCORES"] -> ["$a", "$2", "$b", "$9", "$d", "$15", "$c", "$16"]
+C ["ZUNION", "2", "z:a1", "z:a2", "AGGREGATE", "MIN", "WITHSCORES"] -> ["$a", "$1", "$b", "$2", "$c", "$3", "$d", "$30"]
+C ["ZUNION", "2", "z:a1", "z:a2", "AGGREGATE", "MAX", "WITHSCORES"] -> ["$a", "$1", "$b", "$10", "$c", "$20", "$d", "$30"]
+C ["ZINTER", "2", "z:a1", "z:a2", "WITHSCORES"] -> ["$b", "$12", "$c", "$23"]
+C ["ZINTER", "2", "z:a1", "z:missing"] -> []
+C ["ZDIFF", "2", "z:a1", "z:a2", "WITHSCORES"] -> ["$a", "$1"]
+C ["ZDIFF", "2", "z:a1", "z:missing", "WITHSCORES"] -> ["$a", "$1", "$b", "$2", "$c", "$3"]
+C ["ZDIFF", "1", "z:a1"] -> ["$a", "$b", "$c"]
+C ["SADD", "z:s1", "a", "x"] -> ":2"
+C ["ZUNION", "2", "z:a1", "z:s1", "WITHSCORES"] -> ["$x", "$1", "$a", "$2", "$b", "$2", "$c", "$3"]
+C ["ZINTER", "2", "z:a1", "z:s1", "WITHSCORES"] -> ["$a", "$2"]
+C ["ZUNION", "0"] -> "-ERR wrong number of arguments for 'zunion' command"
+C ["ZUNION", "2", "z:a1"] -> "-ERR syntax error"
+C ["ZUNION", "x", "z:a1"] -> "-ERR value is not an integer or out of range"
+C ["ZUNION", "1", "z:a1", "WEIGHTS", "1", "2"] -> "-ERR syntax error"
+C ["ZUNION", "1", "z:a1", "WEIGHTS", "x"] -> "-ERR weight value is not a float"
+C ["ZUNION", "1", "z:a1", "AGGREGATE", "BOGUS"] -> "-ERR syntax error"
+C ["ZINTERCARD", "2", "z:a1", "z:a2"] -> ":2"
+C ["ZINTERCARD", "2", "z:a1", "z:a2", "LIMIT", "1"] -> ":1"
+C ["ZINTERCARD", "2", "z:a1", "z:a2", "LIMIT", "0"] -> ":2"
+C ["ZINTERCARD", "2", "z:a1", "z:a2", "LIMIT", "-1"] -> "-ERR LIMIT can't be negative"
+C ["ZINTERCARD", "0", "z:a1"] -> "-ERR at least 1 input key is needed for 'zintercard' command"
+C ["ZUNIONSTORE", "z:du", "2", "z:a1", "z:a2"] -> ":4"
+C ["ZRANGE", "z:du", "0", "-1", "WITHSCORES"] -> ["$a", "$1", "$b", "$12", "$c", "$23", "$d", "$30"]
+C ["ZUNIONSTORE", "z:du", "2", "z:a1", "z:a2", "WEIGHTS", "0", "1"] -> ":4"
+C ["ZRANGE", "z:du", "0", "-1", "WITHSCORES"] -> ["$a", "$0", "$b", "$10", "$c", "$20", "$d", "$30"]
+C ["ZINTERSTORE", "z:di", "2", "z:a1", "z:a2", "AGGREGATE", "MIN"] -> ":2"
+C ["ZRANGE", "z:di", "0", "-1", "WITHSCORES"] -> ["$b", "$2", "$c", "$3"]
+C ["ZDIFFSTORE", "z:dd", "2", "z:a1", "z:a2"] -> ":1"
+C ["ZRANGE", "z:dd", "0", "-1", "WITHSCORES"] -> ["$a", "$1"]
+C ["ZINTERSTORE", "z:di", "2", "z:a1", "z:missing"] -> ":0"
+C ["TYPE", "z:di"] -> "+none"
+C ["ZADD", "z:ttl", "1", "x"] -> ":1"
+C ["EXPIRE", "z:ttl", "600"] -> ":1"
+C ["ZUNIONSTORE", "z:ttl", "1", "z:a1"] -> ":3"
+C ["TTL", "z:ttl"] -> ":-1"
+C ["SET", "z:sdest", "v"] -> "+OK"
+C ["ZUNIONSTORE", "z:sdest", "1", "z:a1"] -> ":3"
+C ["TYPE", "z:sdest"] -> "+zset"
+C ["ZADD", "z:sc", "1", "only"] -> ":1"
+C ["ZSCAN", "z:sc", "0"] -> ["$0", ["$only", "$1"]]
+C ["ZSCAN", "z:sc", "0", "MATCH", "z*"] -> ["$0", []]
+C ["ZSCAN", "z:sc", "0", "MATCH", "on*"] -> ["$0", ["$only", "$1"]]
+C ["ZSCAN", "z:sc", "0", "COUNT", "100"] -> ["$0", ["$only", "$1"]]
+C ["ZSCAN", "z:sc", "42"] -> ["$0", ["$only", "$1"]]
+C ["ZSCAN", "z:missing", "0"] -> ["$0", []]
+C ["ZSCAN", "z:sc", "0", "NOVALUES"] -> "-ERR NOVALUES option can only be used in HSCAN"
+C ["ZSCAN", "z:r", "0"] -> ["$0", ["$a", "$1", "$b", "$2", "$c", "$2", "$d", "$3", "$e", "$4"]]
+C ["OBJECT", "ENCODING", "z:r"] -> "$listpack"
+C ["ZADD", "z:big", "0", "m000", "1", "m001", "2", "m002", "3", "m003", "4", "m004", "5", "m005", "6", "m006", "7", "m007", "8", "m008", "9", "m009", "10", "m010", "11", "m011", "12", "m012", "13", "m013", "14", "m014", "15", "m015", "16", "m016", "17", "m017", "18", "m018", "19", "m019", "20", "m020", "21", "m021", "22", "m022", "23", "m023", "24", "m024", "25", "m025", "26", "m026", "27", "m027", "28", "m028", "29", "m029", "30", "m030", "31", "m031", "32", "m032", "33", "m033", "34", "m034", "35", "m035", "36", "m036", "37", "m037", "38", "m038", "39", "m039", "40", "m040", "41", "m041", "42", "m042", "43", "m043", "44", "m044", "45", "m045", "46", "m046", "47", "m047", "48", "m048", "49", "m049", "50", "m050", "51", "m051", "52", "m052", "53", "m053", "54", "m054", "55", "m055", "56", "m056", "57", "m057", "58", "m058", "59", "m059", "60", "m060", "61", "m061", "62", "m062", "63", "m063", "64", "m064", "65", "m065", "66", "m066", "67", "m067", "68", "m068", "69", "m069", "70", "m070", "71", "m071", "72", "m072", "73", "m073", "74", "m074", "75", "m075", "76", "m076", "77", "m077", "78", "m078", "79", "m079", "80", "m080", "81", "m081", "82", "m082", "83", "m083", "84", "m084", "85", "m085", "86", "m086", "87", "m087", "88", "m088", "89", "m089", "90", "m090", "91", "m091", "92", "m092", "93", "m093", "94", "m094", "95", "m095", "96", "m096", "97", "m097", "98", "m098", "99", "m099", "100", "m100", "101", "m101", "102", "m102", "103", "m103", "104", "m104", "105", "m105", "106", "m106", "107", "m107", "108", "m108", "109", "m109", "110", "m110", "111", "m111", "112", "m112", "113", "m113", "114", "m114", "115", "m115", "116", "m116", "117", "m117", "118", "m118", "119", "m119", "120", "m120", "121", "m121", "122", "m122", "123", "m123", "124", "m124", "125", "m125", "126", "m126", "127", "m127", "128", "m128"] -> ":129"
+C ["OBJECT", "ENCODING", "z:big"] -> "$skiplist"
+C ["ZCARD", "z:big"] -> ":129"
+C ["ZRANGE", "z:big", "0", "4", "WITHSCORES"] -> ["$m000", "$0", "$m001", "$1", "$m002", "$2", "$m003", "$3", "$m004", "$4"]
+C ["ZRANGE", "z:big", "-3", "-1"] -> ["$m126", "$m127", "$m128"]
+C ["ZRANK", "z:big", "m064"] -> ":64"
+C ["ZSCORE", "z:big", "m128"] -> "$128"
+C ["ZRANGEBYSCORE", "z:big", "126", "+inf"] -> ["$m126", "$m127", "$m128"]
+C ["ZADD", "z:wide", "0", "w000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "1", "w001xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "2", "w002xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "3", "w003xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "4", "w004xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "5", "w005xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "6", "w006xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "7", "w007xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "8", "w008xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "9", "w009xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "10", "w010xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "11", "w011xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "12", "w012xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "13", "w013xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "14", "w014xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "15", "w015xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "16", "w016xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "17", "w017xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "18", "w018xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "19", "w019xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "20", "w020xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "21", "w021xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "22", "w022xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "23", "w023xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "24", "w024xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "25", "w025xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "26", "w026xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "27", "w027xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "28", "w028xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "29", "w029xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"] -> ":30"
+C ["OBJECT", "ENCODING", "z:wide"] -> "$skiplist"
+C ["ZRANGE", "z:wide", "0", "1"] -> ["$w000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "$w001xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]
+C ["SET", "z:str", "v"] -> "+OK"
+C ["ZADD", "z:str", "1", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZSCORE", "z:str", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZMSCORE", "z:str", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZCARD", "z:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZINCRBY", "z:str", "1", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZREM", "z:str", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZRANK", "z:str", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZRANGE", "z:str", "0", "-1"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZCOUNT", "z:str", "0", "1"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZPOPMIN", "z:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZRANDMEMBER", "z:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZSCAN", "z:str", "0"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZREMRANGEBYRANK", "z:str", "0", "-1"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZUNION", "2", "z:a1", "z:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZUNIONSTORE", "z:dt", "2", "z:a1", "z:str"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["ZRANGESTORE", "z:dt", "z:str", "0", "-1"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["GET", "z:a1"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+S GEO
+C ["GEOADD", "geo:s", "13.361389", "38.115556", "Palermo"] -> ":1"
+C ["GEOADD", "geo:s", "15.087269", "37.502669", "Catania", "13.583333", "37.316667", "Agrigento"] -> ":2"
+C ["ZSCORE", "geo:s", "Palermo"] -> "$3479099956230698"
+C ["ZSCORE", "geo:s", "Catania"] -> "$3479447370796909"
+C ["ZCARD", "geo:s"] -> ":3"
+C ["TYPE", "geo:s"] -> "+zset"
+C ["OBJECT", "ENCODING", "geo:s"] -> "$listpack"
+C ["GEOADD", "geo:s", "NX", "13.5", "38.2", "Palermo"] -> ":0"
+C ["GEOPOS", "geo:s", "Palermo"] -> [["$13.361389338970184", "$38.1155563954963"]]
+C ["GEOADD", "geo:s", "CH", "13.5", "38.2", "Palermo"] -> ":1"
+C ["ZSCORE", "geo:s", "Palermo"] -> "$3479101704338477"
+C ["GEOADD", "geo:s", "XX", "CH", "13.361389", "38.115556", "Palermo"] -> ":1"
+C ["GEOADD", "geo:s", "XX", "1", "1", "Fresh"] -> ":0"
+C ["ZCARD", "geo:s"] -> ":3"
+C ["GEOADD", "geo:s"] -> "-ERR wrong number of arguments for 'geoadd' command"
+C ["GEOADD", "geo:s", "13.36"] -> "-ERR wrong number of arguments for 'geoadd' command"
+C ["GEOADD", "geo:s", "13.36", "38.11"] -> "-ERR wrong number of arguments for 'geoadd' command"
+C ["GEOADD", "geo:s", "NX", "XX", "1", "1", "m"] -> "-ERR syntax error"
+C ["GEOADD", "geo:s", "181", "0", "m"] -> "-ERR invalid longitude,latitude pair 181.000000,0.000000"
+C ["GEOADD", "geo:s", "0", "86", "m"] -> "-ERR invalid longitude,latitude pair 0.000000,86.000000"
+C ["GEOADD", "geo:s", "x", "0", "m"] -> "-ERR value is not a valid float"
+C ["GEOADD", "geo:s", "1", "1", "ok1", "999", "0", "bad"] -> "-ERR invalid longitude,latitude pair 999.000000,0.000000"
+C ["ZSCORE", "geo:s", "ok1"] -> "$-1"
+C ["GEOPOS", "geo:s", "Palermo", "ghost", "Catania"] -> [["$13.361389338970184", "$38.1155563954963"], "*-1", ["$15.087267458438873", "$37.50266842333162"]]
+C ["GEOPOS", "geo:missing", "m"] -> ["*-1"]
+C ["GEOPOS", "geo:s"] -> []
+C ["GEODIST", "geo:s", "Palermo", "Catania"] -> "$166274.1516"
+C ["GEODIST", "geo:s", "Palermo", "Catania", "km"] -> "$166.2742"
+C ["GEODIST", "geo:s", "Palermo", "Catania", "ft"] -> "$545518.8700"
+C ["GEODIST", "geo:s", "Palermo", "Catania", "mi"] -> "$103.3182"
+C ["GEODIST", "geo:s", "Palermo", "Palermo"] -> "$0.0000"
+C ["GEODIST", "geo:s", "Palermo", "ghost"] -> "$-1"
+C ["GEODIST", "geo:missing", "a", "b"] -> "$-1"
+C ["GEODIST", "geo:s", "Palermo", "Catania", "yd"] -> "-ERR unsupported unit provided. please use M, KM, FT, MI"
+C ["GEODIST", "geo:s", "Palermo"] -> "-ERR wrong number of arguments for 'geodist' command"
+C ["GEOHASH", "geo:s", "Palermo", "ghost", "Catania"] -> ["$sqc8b49rny0", "$-1", "$sqdtr74hyu0"]
+C ["GEOHASH", "geo:missing", "m"] -> ["$-1"]
+C ["GEOHASH", "geo:s"] -> []
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC"] -> ["$Catania", "$Agrigento", "$Palermo"]
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC", "WITHCOORD", "WITHDIST", "WITHHASH"] -> [["$Catania", "$56.4413", ":3479447370796909", ["$15.087267458438873", "$37.50266842333162"]], ["$Agrigento", "$130.4235", ":3479030013248308", ["$13.583331406116486", "$37.316668049938166"]], ["$Palermo", "$190.4424", ":3479099956230698", ["$13.361389338970184", "$38.1155563954963"]]]
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "DESC", "WITHDIST"] -> [["$Palermo", "$190.4424"], ["$Agrigento", "$130.4235"], ["$Catania", "$56.4413"]]
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "2", "ASC"] -> ["$Catania", "$Agrigento"]
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "10", "ANY", "ASC"] -> ["$Catania", "$Agrigento", "$Palermo"]
+C ["GEOSEARCH", "geo:s", "FROMMEMBER", "Palermo", "BYRADIUS", "200", "km", "ASC", "WITHDIST"] -> [["$Palermo", "$0.0000"], ["$Agrigento", "$90.9778"], ["$Catania", "$166.2742"]]
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYBOX", "400", "400", "km", "ASC", "WITHDIST"] -> [["$Catania", "$56.4413"], ["$Agrigento", "$130.4235"], ["$Palermo", "$190.4424"]]
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "m", "ASC"] -> []
+C ["GEOSEARCH", "geo:missing", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC"] -> []
+C ["GEOADD", "geo:mer", "179.9", "0", "east", "-179.95", "0.05", "west"] -> ":2"
+C ["GEOSEARCH", "geo:mer", "FROMLONLAT", "179.9", "0", "BYRADIUS", "50", "km", "ASC", "WITHDIST"] -> [["$east", "$0.0002"], ["$west", "$17.5864"]]
+C ["GEOSEARCH", "geo:mer", "FROMLONLAT", "-179.95", "0.1", "BYBOX", "60", "60", "km", "ASC", "WITHDIST"] -> [["$west", "$5.5612"], ["$east", "$20.0516"]]
+C ["GEOSEARCH", "geo:s"] -> "-ERR wrong number of arguments for 'geosearch' command"
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "-1", "km"] -> "-ERR radius cannot be negative"
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "x", "km"] -> "-ERR need numeric radius"
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "yd"] -> "-ERR unsupported unit provided. please use M, KM, FT, MI"
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYBOX", "10", "-5", "km"] -> "-ERR height or width cannot be negative"
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "0"] -> "-ERR COUNT must be > 0"
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "x"] -> "-ERR value is not an integer or out of range"
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ANY"] -> "-ERR the ANY argument requires COUNT argument"
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "FROMMEMBER", "Palermo", "BYRADIUS", "1", "km"] -> "-ERR syntax error"
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37"] -> "-ERR wrong number of arguments for 'geosearch' command"
+C ["GEOSEARCH", "geo:s", "BYRADIUS", "1", "km"] -> "-ERR wrong number of arguments for 'geosearch' command"
+C ["GEOSEARCH", "geo:s", "FROMMEMBER", "ghost", "BYRADIUS", "1", "km"] -> "-ERR could not decode requested zset member"
+C ["GEOSEARCH", "geo:missing", "FROMMEMBER", "ghost", "BYRADIUS", "1", "km"] -> []
+C ["GEOSEARCH", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC", "DESC", "WITHDIST"] -> [["$Palermo", "$190.4424"], ["$Agrigento", "$130.4235"], ["$Catania", "$56.4413"]]
+C ["GEOSEARCHSTORE", "geo:dst", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC"] -> ":3"
+C ["ZRANGE", "geo:dst", "0", "-1", "WITHSCORES"] -> ["$Agrigento", "$3479030013248308", "$Palermo", "$3479099956230698", "$Catania", "$3479447370796909"]
+C ["GEOSEARCHSTORE", "geo:dst", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "m"] -> ":0"
+C ["TYPE", "geo:dst"] -> "+none"
+C ["GEOSEARCHSTORE", "geo:dd", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "2", "ASC", "STOREDIST"] -> ":2"
+C ["ZCARD", "geo:dd"] -> ":2"
+C ["ZRANGE", "geo:dd", "0", "-1"] -> ["$Catania", "$Agrigento"]
+C ["GEOSEARCHSTORE", "geo:dd", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "WITHDIST"] -> "-ERR GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and WITHCOORD options"
+C ["SET", "geo:sdest", "v"] -> "+OK"
+C ["GEOSEARCHSTORE", "geo:sdest", "geo:s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"] -> ":3"
+C ["TYPE", "geo:sdest"] -> "+zset"
+C ["GEORADIUS", "geo:s", "15", "37", "200", "km", "ASC", "WITHDIST"] -> [["$Catania", "$56.4413"], ["$Agrigento", "$130.4235"], ["$Palermo", "$190.4424"]]
+C ["GEORADIUS", "geo:s", "15", "37", "200", "km", "COUNT", "1", "ASC", "WITHCOORD", "WITHHASH"] -> [["$Catania", ":3479447370796909", ["$15.087267458438873", "$37.50266842333162"]]]
+C ["GEORADIUS_RO", "geo:s", "15", "37", "200", "km", "ASC"] -> ["$Catania", "$Agrigento", "$Palermo"]
+C ["GEORADIUS", "geo:s", "15", "37", "200", "km", "STORE", "geo:rs"] -> ":3"
+C ["ZRANGE", "geo:rs", "0", "-1", "WITHSCORES"] -> ["$Agrigento", "$3479030013248308", "$Palermo", "$3479099956230698", "$Catania", "$3479447370796909"]
+C ["GEORADIUS", "geo:s", "15", "37", "200", "km", "STOREDIST", "geo:rd"] -> ":3"
+C ["ZCARD", "geo:rd"] -> ":3"
+C ["ZRANGE", "geo:rd", "0", "-1"] -> ["$Catania", "$Agrigento", "$Palermo"]
+C ["GEORADIUS", "geo:s", "15", "37", "200", "km", "STORE", "geo:x", "STOREDIST", "geo:y"] -> ":3"
+C ["TYPE", "geo:x"] -> "+none"
+C ["TYPE", "geo:y"] -> "+zset"
+C ["GEORADIUS", "geo:s", "15", "37", "200", "km", "WITHDIST", "STORE", "geo:x2"] -> "-ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORD options"
+C ["GEORADIUS_RO", "geo:s", "15", "37", "200", "km", "STORE", "geo:x3"] -> "-ERR syntax error"
+C ["GEORADIUS", "geo:s", "15", "37"] -> "-ERR wrong number of arguments for 'georadius' command"
+C ["GEORADIUSBYMEMBER", "geo:s", "Palermo", "250", "km", "ASC", "WITHDIST"] -> [["$Palermo", "$0.0000"], ["$Agrigento", "$90.9778"], ["$Catania", "$166.2742"]]
+C ["GEORADIUSBYMEMBER", "geo:s", "ghost", "1", "km"] -> "-ERR could not decode requested zset member"
+C ["GEORADIUSBYMEMBER_RO", "geo:s", "Palermo", "250", "km", "ASC"] -> ["$Palermo", "$Agrigento", "$Catania"]
+C ["GEORADIUSBYMEMBER_RO", "geo:s", "Palermo", "250", "km", "STOREDIST", "geo:x4"] -> "-ERR syntax error"
+C ["GEORADIUSBYMEMBER", "geo:s"] -> "-ERR wrong number of arguments for 'georadiusbymember' command"
+C ["SET", "geo:str", "v"] -> "+OK"
+C ["GEOADD", "geo:str", "1", "1", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["GEOPOS", "geo:str", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["GEODIST", "geo:str", "a", "b"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["GEOHASH", "geo:str", "m"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["GEOSEARCH", "geo:str", "FROMLONLAT", "1", "1", "BYRADIUS", "1", "km"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
+C ["GEORADIUS", "geo:str", "1", "1", "1", "km"] -> "-WRONGTYPE Operation against a key holding the wrong kind of value"
