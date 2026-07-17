@@ -29,8 +29,23 @@ For each speculative size S in {16, 32, 64, 128, 256, 512 KiB}: hit rate P(F <= 
 
 ## Results
 
-Pending the scored run.
+Full sweep in footerread.csv (36 cells, 8 segments each, 288 real segments through the encoder and footer decoder).
+Footer size is essentially deterministic per shape: within every cell the max sits within about 2 KiB of the median, so hit rates are step functions of S, and 8 segments per cell was plenty.
+
+Chunk-bloom F at 64 MiB payload: 200 B x 128 rpc 119.6 KiB, 200 B x 512 39.5 KiB, 200 B x 2048 10.1 KiB, 2 KiB x 128 15.9 KiB, 2 KiB x 512 4.0 KiB, 2 KiB x 2048 1.1 KiB.
+At 128 MiB the small-chunk corner grows to 239 KiB (200 B x 128) and 79 KiB (200 B x 512); everything else stays under 32 KiB.
+Member-bloom F at 200 B records: 106 to 132 KiB at 16 MiB, 421 to 526 KiB at 64 MiB, 840 to 1052 KiB at 128 MiB; at 2 KiB records 42 to 56 KiB at 64 MiB and 83 to 111 KiB at 128 MiB.
+
+S = 64 KiB hits 100% on every 64 MiB chunk-bloom cell except 200 B x 128 rpc; S = 128 KiB hits 100% on every 64 MiB chunk-bloom cell and misses only the 128 MiB small-chunk corner.
+Open latency: 46.3 to 47.8 ms p50 and 208 to 233 ms p99 on hit (2 GETs), 73.6 to 75.3 ms p50 and 272 to 287 ms p99 on miss (3 GETs); $0.80 vs $1.20 per million opens.
+
+Scoring: predictions 1, 2, 4, 5, and 6 HIT (the chunk-arm bands, the 64 KiB claim splitting exactly on the three predicted cells, both latency bands, the dollars, and the verdict shape).
+Prediction 3 MIXED: direction and the unreachability of the 64 MiB member-bloom cells held, but the 128 rpc cells broke the bands high (526 KiB at 64 MiB against a 480 ceiling, 1052 at 128 MiB against 950, and 106 at 16 MiB just under the 110 floor) because the chunk entries stack on top of the bloom more than the estimate carried.
 
 ## Verdict
 
-Pending the scored run.
+The tail read merges with the footer read: default speculative tail S = 128 KiB, which covers every 64 MiB chunk-bloom shape with at most 128 KiB of free-in-dollars waste and turns the cold open into 2 sequential GETs (about 47 ms p50) instead of 3 (about 75 ms).
+The doc's 64 KiB above-95% claim holds only for the doc-typical shape (64 MiB, a few hundred records per chunk and up); 128 KiB is the honest constant across the grid.
+The footer bloom stays over chunk keys; a member-key bloom at 200 B records is 420 KiB and up at the 64 MiB target and cannot ride any sane tail read, so member existence belongs to the keymap (doc 05 section 2.1), not the footer.
+Member blooms only fit the footer when records are large (2 KiB records stay under 56 KiB at 64 MiB), which is a shape-conditional the default should not depend on.
+Since footer size is deterministic per built segment, the fold knows it exactly at publish time: carrying footer_off (8 bytes) in the manifest segment entry makes the common open 2 exact GETs with zero speculation risk, and the S = 128 KiB speculative read becomes the fallback for manifest-less discovery (takeover and recovery walking objects directly).
