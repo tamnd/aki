@@ -51,6 +51,14 @@ type Store struct {
 	// stages through it until the writeRun flip routes the spill onto it.
 	akispill *akiSpill
 
+	// spillLedger records where each provisional word from the current batch was
+	// written (spillledger.go): one entry per staged run, the value-area offset
+	// vs of the record's run pointer and the run's stage index. resolveSpill
+	// walks it at the group boundary to patch each pointer from its provisional
+	// word to the absolute inLogBit|offset the cut assigns. Empty and unused
+	// until the writeRun flip stages through akispill.
+	spillLedger []spillPatch
+
 	// The cold tier (doc 06 sections 2 and 7, cold.go): nil without a cold
 	// region. cold is the per-shard append log of whole-record cold frames the
 	// migrator demotes out of the arena; coldRecs is the live cold-record
@@ -342,6 +350,7 @@ func (s *Store) Reset() {
 	s.count = 0
 	s.bands = [4]uint64{}
 	s.logRuns = 0
+	s.spillLedger = s.spillLedger[:0]
 	s.chunkBytes = 0
 	s.coldRecs = 0
 	s.coldHand = 0
