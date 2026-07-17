@@ -431,7 +431,7 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 			if hasSlot {
 				s.setExpireAt(addr, at)
 			}
-			return nil
+			return s.logRecord(addr)
 		}
 		if f&(flagSep|flagChunked) == 0 && need <= s.vcapBytes(addr) && (at == 0 || hasSlot) {
 			vs := s.valueStart(addr)
@@ -448,7 +448,7 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 			if hasSlot {
 				s.setExpireAt(addr, at)
 			}
-			return nil
+			return s.logRecord(addr)
 		}
 	}
 
@@ -496,7 +496,7 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 	}
 	s.setVlen(off, uint32(len(val)))
 	s.publish(h, slot, addr, off)
-	return nil
+	return s.logRecord(off)
 }
 
 // replaceSepRun places val as a separated record's new run and releases the
