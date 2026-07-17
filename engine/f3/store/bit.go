@@ -80,7 +80,7 @@ func (s *Store) byteAt(addr uint64, i int64) byte {
 		word, _, _ := s.readPtr(vs)
 		if word&inLogBit != 0 {
 			var one [1]byte
-			if err := s.vlog.readFill((word&runAddrMask)+uint64(i), one[:]); err != nil {
+			if err := s.logReadFill((word&runAddrMask)+uint64(i), one[:]); err != nil {
 				return 0
 			}
 			return one[0]
@@ -171,7 +171,7 @@ func (s *Store) chunkByteAt(vs uint64, i int64) byte {
 	}
 	if w&inLogBit != 0 {
 		var one [1]byte
-		if err := s.vlog.readFill((w&runAddrMask)+j, one[:]); err != nil {
+		if err := s.logReadFill((w&runAddrMask)+j, one[:]); err != nil {
 			return 0
 		}
 		return one[0]

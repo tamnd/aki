@@ -105,7 +105,7 @@ func (s *Store) readValueRef(addr uint64) ([]byte, bool) {
 	if f&flagSep != 0 {
 		word, vlen, _ := s.readPtr(vs)
 		if word&inLogBit != 0 {
-			v, err := s.vlog.readInto(word&runAddrMask, int(vlen), s.vbuf)
+			v, err := s.logReadInto(word&runAddrMask, int(vlen), s.vbuf)
 			s.vbuf = v[:cap(v)][:0]
 			if err != nil {
 				return nil, false
