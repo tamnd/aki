@@ -94,8 +94,11 @@ func startLoggedServer(t *testing.T, gated bool) (*obs1.WriteLog, *sim.Sim, net.
 	}
 	t.Cleanup(func() {
 		nc.Close()
-		srv.Close()
+		// Open the gate before closing the server: a failed gated test can
+		// leave a strict reply parked on the chain commit, and Close waits
+		// for the connection goroutines that hold it.
 		release()
+		srv.Close()
 		if err := wl.Close(); err != nil {
 			t.Errorf("write log close: %v", err)
 		}
