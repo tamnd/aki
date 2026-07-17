@@ -1041,6 +1041,8 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.zdiffCmd(ctx, reply, args, cmd, true)
 	case "ZINTERCARD":
 		return s.zintercardCmd(ctx, reply, args)
+	case "ZSCAN":
+		return s.zscanCmd(ctx, reply, args)
 	case "HPERSIST":
 		return s.hpersistCmd(ctx, reply, args)
 	case "TYPE":
@@ -1711,6 +1713,66 @@ func (s *Server) sscanCmd(ctx context.Context, reply []byte, args [][]byte) []by
 		}
 		s.scanBuf = AppendBulk(s.scanBuf, m)
 		elems++
+	})
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	var cbuf [20]byte
+	reply = AppendArray(reply, 2)
+	reply = AppendBulk(reply, strconv.AppendUint(cbuf[:0], next, 10))
+	reply = AppendArray(reply, elems)
+	return append(reply, s.scanBuf...)
+}
+
+// zscanCmd is ZSCAN key cursor [MATCH pattern] [COUNT count], the
+// shared scan grammar over the zset member family: options repeat
+// with last-wins, COUNT below one is a syntax error, anything unknown
+// is too, and NOVALUES parses here only to be rejected with HSCAN's
+// ownership text (probed on Redis 8.8.0, SSCAN's door verbatim).
+// Every emitted member is followed by its score through the shared
+// formatter; MATCH filters members only.
+func (s *Server) zscanCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 3 {
+		return arityErr(reply, "ZSCAN")
+	}
+	cursor, err := strconv.ParseUint(string(args[2]), 10, 64)
+	if err != nil {
+		return AppendError(reply, "ERR invalid cursor")
+	}
+	count := int64(10)
+	var match []byte
+	hasMatch := false
+	for i := 3; i < len(args); i++ {
+		switch {
+		case strings.EqualFold(string(args[i]), "COUNT") && i+1 < len(args):
+			n, ok := parseCanonicalInt(args[i+1])
+			if !ok {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			if n < 1 {
+				return syntaxErr(reply)
+			}
+			count = n
+			i++
+		case strings.EqualFold(string(args[i]), "MATCH") && i+1 < len(args):
+			match, hasMatch = args[i+1], true
+			i++
+		case strings.EqualFold(string(args[i]), "NOVALUES"):
+			return AppendError(reply, "ERR NOVALUES option can only be used in HSCAN")
+		default:
+			return syntaxErr(reply)
+		}
+	}
+	s.scanBuf = s.scanBuf[:0]
+	elems := 0
+	var sb [32]byte
+	next, err := s.z.ZScan(ctx, args[1], cursor, count, func(m []byte, sc float64) {
+		if hasMatch && !globMatch(match, m) {
+			return
+		}
+		s.scanBuf = AppendBulk(s.scanBuf, m)
+		s.scanBuf = AppendBulk(s.scanBuf, appendScore(sb[:0], sc))
+		elems += 2
 	})
 	if err != nil {
 		return storeErr(reply, err)
