@@ -157,6 +157,8 @@ func sniffRoot(v []byte) (tag uint8, planeless bool, err error) {
 		return TagSet, false, nil
 	case sub == zsetSubSeg:
 		return TagZset, false, nil
+	case sub == streamSub:
+		return TagStream, false, nil
 	case sub&0xF0 == inlineSubBase:
 		t := sub & 0x0F
 		if t >= TagString && t <= TagStream {

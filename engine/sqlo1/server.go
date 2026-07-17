@@ -28,6 +28,7 @@ type Server struct {
 	se *Set
 	z  *ZSet
 	l  *List
+	x  *Stream
 
 	mu sync.Mutex // serializes command execution against the runtime
 
@@ -123,8 +124,12 @@ func NewServer(st Store) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	stream, err := NewStream(t, StreamConfig{})
+	if err != nil {
+		return nil, err
+	}
 	srv.t, srv.s, srv.h, srv.se, srv.z = t, str, hash, set, zset
-	srv.l = list
+	srv.l, srv.x = list, stream
 	return srv, nil
 }
 
@@ -1129,6 +1134,21 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.lremCmd(ctx, reply, args)
 	case "LPOS":
 		return s.lposCmd(ctx, reply, args)
+	case "XADD":
+		return s.xaddCmd(ctx, reply, args, now)
+	case "XLEN":
+		if len(args) != 2 {
+			return arityErr(reply, cmd)
+		}
+		n, err := s.x.Len(ctx, args[1])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, n)
+	case "XRANGE":
+		return s.xrangeCmd(ctx, reply, args, false)
+	case "XREVRANGE":
+		return s.xrangeCmd(ctx, reply, args, true)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
@@ -1154,6 +1174,8 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 				return AppendSimple(reply, "zset")
 			case TagList:
 				return AppendSimple(reply, "list")
+			case TagStream:
+				return AppendSimple(reply, "stream")
 			}
 		}
 		return AppendSimple(reply, "string")
@@ -1210,6 +1232,9 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 						return AppendNullBulk(reply)
 					}
 					return AppendBulk(reply, []byte(enc))
+				case TagStream:
+					// Streams have one encoding at every size.
+					return AppendBulk(reply, []byte("stream"))
 				}
 			}
 			enc, ok, err := s.s.Encoding(ctx, args[2])

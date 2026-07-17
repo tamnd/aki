@@ -170,35 +170,10 @@ func appendStreamRun(dst []byte, entries []streamEntry) []byte {
 	prev := base
 	for i := range entries {
 		e := &entries[i]
-		var dms, dseq uint64
-		if i > 0 {
-			if !prev.less(e.id) {
-				panic("sqlo1: stream run IDs not strictly increasing")
-			}
-			dms = e.id.ms - prev.ms
-			if dms == 0 {
-				dseq = e.id.seq - prev.seq
-			} else {
-				// A new millisecond carries its seq absolute; bursts
-				// inside one are the delta-to-2-bytes case.
-				dseq = e.id.seq
-			}
+		if i > 0 && !prev.less(e.id) {
+			panic("sqlo1: stream run IDs not strictly increasing")
 		}
-		dst = binary.AppendUvarint(dst, dms)
-		dst = binary.AppendUvarint(dst, dseq)
-		dst = binary.AppendUvarint(dst, uint64(len(e.fv)/2))
-		for f := 0; f < len(e.fv); f += 2 {
-			name, val := e.fv[f], e.fv[f+1]
-			if r := streamNameRef(table, name); r >= 0 {
-				dst = append(dst, uint8(r))
-			} else {
-				dst = append(dst, streamNameInline)
-				dst = binary.AppendUvarint(dst, uint64(len(name)))
-				dst = append(dst, name...)
-			}
-			dst = binary.AppendUvarint(dst, uint64(len(val)))
-			dst = append(dst, val...)
-		}
+		dst = appendStreamRunEntry(dst, table, prev, e.id, e.fv)
 		prev = e.id
 	}
 
@@ -210,6 +185,47 @@ func appendStreamRun(dst []byte, entries []streamEntry) []byte {
 			}
 		}
 		dst = append(dst, bm...)
+	}
+	return dst
+}
+
+// appendStreamRunEntry encodes one entry onto dst against prev, the
+// run's previous ID, resolving names through the run's table. prev
+// equal to id marks the first entry, which encodes zero deltas against
+// the base by definition. The tail amendment in stream.go appends
+// through this too, so the incremental and from-scratch encodes share
+// one source of encoding truth.
+func appendStreamRunEntry(dst []byte, table [][]byte, prev, id streamID, fv [][]byte) []byte {
+	var dms, dseq uint64
+	switch {
+	case id == prev:
+		// The first entry.
+	case prev.less(id):
+		dms = id.ms - prev.ms
+		if dms == 0 {
+			dseq = id.seq - prev.seq
+		} else {
+			// A new millisecond carries its seq absolute; bursts
+			// inside one are the delta-to-2-bytes case.
+			dseq = id.seq
+		}
+	default:
+		panic("sqlo1: stream run IDs not strictly increasing")
+	}
+	dst = binary.AppendUvarint(dst, dms)
+	dst = binary.AppendUvarint(dst, dseq)
+	dst = binary.AppendUvarint(dst, uint64(len(fv)/2))
+	for f := 0; f < len(fv); f += 2 {
+		name, val := fv[f], fv[f+1]
+		if r := streamNameRef(table, name); r >= 0 {
+			dst = append(dst, uint8(r))
+		} else {
+			dst = append(dst, streamNameInline)
+			dst = binary.AppendUvarint(dst, uint64(len(name)))
+			dst = append(dst, name...)
+		}
+		dst = binary.AppendUvarint(dst, uint64(len(val)))
+		dst = append(dst, val...)
 	}
 	return dst
 }
