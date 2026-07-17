@@ -396,6 +396,75 @@ func (l *WriteLog) SetMove(src, dst, member []byte, srcDropped, dstCreated bool)
 	return dg, ds, sg, ss, nil
 }
 
+// zaddEntries pairs the seam's parallel score and member slices into the
+// op's entry list; the split exists because the shard package cannot
+// import this one, so the seam speaks universe types.
+func zaddEntries(scores []float64, members [][]byte) ([]ScoreMember, error) {
+	if len(scores) == 0 || len(scores) != len(members) {
+		return nil, fmt.Errorf("obs1: a zset emission needs parallel scores and members, got %d and %d", len(scores), len(members))
+	}
+	entries := make([]ScoreMember, len(members))
+	for i := range entries {
+		entries[i] = ScoreMember{Score: scores[i], Member: members[i]}
+	}
+	return entries, nil
+}
+
+// ZSetAdd implements the shard seam: the applied scored upserts as one
+// colldelta zadd, with a collnew ahead of it when the write created the
+// sorted set. scores parallels members; each pair is post-decision, the
+// score the member now holds. The collnew carries no hint bytes yet; doc
+// 08 owns that vocabulary and the encoding-hint slice fills them in.
+func (l *WriteLog) ZSetAdd(key []byte, created bool, scores []float64, members [][]byte) (uint16, uint64, error) {
+	entries, err := zaddEntries(scores, members)
+	if err != nil {
+		return 0, 0, l.classify(err)
+	}
+	if created {
+		return l.emitOps(key, CollNew{Type: CollZSet}, CollDelta{Sub: ZAdd{Entries: entries}})
+	}
+	return l.emitOps(key, CollDelta{Sub: ZAdd{Entries: entries}})
+}
+
+// ZSetRem implements the shard seam: the removed members as one colldelta
+// zrem, with a colldrop behind it when the removal emptied the sorted
+// set. The pop family and the ZREMRANGEBY* verbs land here as the zrems
+// they are (doc 04 section 2, no pop sub-kind), members post-decision.
+func (l *WriteLog) ZSetRem(key []byte, members [][]byte, dropped bool) (uint16, uint64, error) {
+	if dropped {
+		return l.emitOps(key, CollDelta{Sub: ZRem{Members: members}}, CollDrop{})
+	}
+	return l.emitOps(key, CollDelta{Sub: ZRem{Members: members}})
+}
+
+// ZSetStore implements the shard seam: a STORE form's wholesale
+// replacement of its destination, one atomic run, the sorted-set twin of
+// SetStore. A keydel leads when the string store held the key; a
+// non-empty result follows as collnew plus the pairs as one zadd, the
+// collnew replaying as reset-to-empty over a sorted set the destination
+// already held; an empty result instead trails a colldrop when there was
+// a sorted set to drop. The caller gates the no-effect case, so an empty
+// op list here is the encode bug row.
+func (l *WriteLog) ZSetStore(key []byte, delString, hadZSet bool, scores []float64, members [][]byte) (uint16, uint64, error) {
+	ops := make([]Op, 0, 3)
+	if delString {
+		ops = append(ops, KeyDel{})
+	}
+	if len(members) > 0 {
+		entries, err := zaddEntries(scores, members)
+		if err != nil {
+			return 0, 0, l.classify(err)
+		}
+		ops = append(ops, CollNew{Type: CollZSet}, CollDelta{Sub: ZAdd{Entries: entries}})
+	} else if hadZSet {
+		ops = append(ops, CollDrop{})
+	}
+	if len(ops) == 0 {
+		return 0, 0, l.classify(fmt.Errorf("obs1: a zset store emission with nothing to frame"))
+	}
+	return l.emitOps(key, ops...)
+}
+
 // NotifyCommitted implements the shard seam: fn runs once the group's
 // committed watermark covers seq (Watermarks.Notify, inline when it
 // already does). Registering also raises barrier demand, the doc 04
