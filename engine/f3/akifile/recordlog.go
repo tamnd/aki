@@ -80,6 +80,33 @@ const RecFlagInline uint32 = 1 << 1
 // neither this nor RecFlagInline: its word is a lone value-log run.
 const RecFlagChunked uint32 = 1 << 2
 
+// RecFlagCollectionOp marks a row whose payload is one collection mutation, the
+// effect-log frame a set, list, hash, zset, or stream cuts per mutating command
+// (spec 2064/f3/M8-collection-durability-plan). The key is the collection key and
+// the payload rides the frame's value slot, an opaque collection op the store's
+// codec frames (collectionlog.go): a kind byte, an op byte, and the sub-key and
+// sub-value the op carries. akifile leaves the payload opaque the way it leaves a
+// value word opaque; the flag is here so a walk and a checkpoint tell a collection
+// frame from a string record without decoding it. Bit three of the row flags.
+const RecFlagCollectionOp uint32 = 1 << 3
+
+// RecFlagCollectionSnap marks a row whose payload is a whole-collection snapshot,
+// the base a reopen rebuilds a collection from before it replays the effect tail
+// past it. The key is the collection key and the payload rides the value slot: a
+// kind byte, a key-level header, and the element run the type's cold encoder
+// frames. A snapshot supersedes every collection-op frame for its key that
+// precedes it, the way a string record supersedes an older one, so replay resets
+// the key at a snapshot and applies only the later ops. Bit four of the row flags.
+const RecFlagCollectionSnap uint32 = 1 << 4
+
+// framePayload reports whether a row carries payload bytes between the header and
+// the key, value_len of them: an inline string value (RecFlagInline), or a
+// collection op or snapshot payload. A pointer row, separated or chunked, carries
+// none because its word is the durable locator.
+func framePayload(flags uint32) bool {
+	return flags&(RecFlagInline|RecFlagCollectionOp|RecFlagCollectionSnap) != 0
+}
+
 // RecordFrame locates one framed record inside a `log` payload: the frame start
 // where the varint length sits and where a walk anchors, the body start where a
 // point read decodes from, the body length, and the body CRC. Offsets are
@@ -106,7 +133,7 @@ type RecordFrame struct {
 // for the inline slice, so the caller must set it to len(Value) on an inline row.
 func AppendRecordFrame(dst []byte, row RecordRow) ([]byte, RecordFrame) {
 	frameOff := uint64(len(dst))
-	inline := row.Flags&RecFlagInline != 0
+	inline := framePayload(row.Flags)
 	valLen := 0
 	if inline {
 		valLen = len(row.Value)
@@ -156,7 +183,7 @@ func ParseRecordBody(body []byte) (RecordRow, error) {
 		ExpireAt:  le.Uint64(body[16:24]),
 	}
 	tail := body[recRowHdr:]
-	if row.Flags&RecFlagInline != 0 {
+	if framePayload(row.Flags) {
 		if uint64(row.ValueLen) > uint64(len(tail)) {
 			return RecordRow{}, ErrLength
 		}
