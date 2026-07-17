@@ -209,6 +209,13 @@ func AppendNullBulk(b []byte) []byte {
 	return append(b, '$', '-', '1', '\r', '\n')
 }
 
+// AppendNullArray appends the RESP2 null array reply, *-1\r\n: the
+// nil-answer shape of the commands whose present answer is an array
+// (ZRANK WITHSCORE).
+func AppendNullArray(b []byte) []byte {
+	return append(b, '*', '-', '1', '\r', '\n')
+}
+
 // AppendArray appends an array header for n following elements.
 func AppendArray(b []byte, n int) []byte {
 	b = append(b, '*')

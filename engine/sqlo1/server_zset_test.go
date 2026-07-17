@@ -150,3 +150,79 @@ func TestAppendScore(t *testing.T) {
 		}
 	}
 }
+
+func TestServerZRankSurface(t *testing.T) {
+	c, r := startServer(t)
+	send := func(args ...string) {
+		t.Helper()
+		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send("ZADD", "z", "1", "a", "2", "b", "3", "c")
+	expect(t, r, ":3\r\n")
+	send("ZCARD", "z")
+	expect(t, r, ":3\r\n")
+	send("ZCARD", "nokey")
+	expect(t, r, ":0\r\n")
+	send("ZCARD", "z", "extra")
+	expect(t, r, "-ERR wrong number of arguments for 'zcard' command\r\n")
+
+	send("ZSCORE", "z", "b")
+	expect(t, r, "$1\r\n2\r\n")
+	send("ZSCORE", "z", "nope")
+	expect(t, r, "$-1\r\n")
+	send("ZSCORE", "nokey", "a")
+	expect(t, r, "$-1\r\n")
+	send("ZSCORE", "z")
+	expect(t, r, "-ERR wrong number of arguments for 'zscore' command\r\n")
+	send("ZMSCORE", "z", "a", "nope", "c")
+	expect(t, r, "*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n3\r\n")
+	send("ZMSCORE", "nokey", "a")
+	expect(t, r, "*1\r\n$-1\r\n")
+	send("ZMSCORE", "z")
+	expect(t, r, "-ERR wrong number of arguments for 'zmscore' command\r\n")
+
+	// The rank pair and the WITHSCORE shape, nil shape included: null
+	// bulk plain, null array with the option.
+	send("ZRANK", "z", "a")
+	expect(t, r, ":0\r\n")
+	send("ZRANK", "z", "c")
+	expect(t, r, ":2\r\n")
+	send("ZREVRANK", "z", "a")
+	expect(t, r, ":2\r\n")
+	send("ZREVRANK", "z", "c")
+	expect(t, r, ":0\r\n")
+	send("ZRANK", "z", "nope")
+	expect(t, r, "$-1\r\n")
+	send("ZRANK", "nokey", "a")
+	expect(t, r, "$-1\r\n")
+	send("ZRANK", "z", "c", "WITHSCORE")
+	expect(t, r, "*2\r\n:2\r\n$1\r\n3\r\n")
+	send("ZREVRANK", "z", "c", "withscore")
+	expect(t, r, "*2\r\n:0\r\n$1\r\n3\r\n")
+	send("ZRANK", "z", "nope", "WITHSCORE")
+	expect(t, r, "*-1\r\n")
+	send("ZREVRANK", "nokey", "a", "WITHSCORE")
+	expect(t, r, "*-1\r\n")
+	send("ZRANK", "z", "c", "BOGUS")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("ZRANK", "z", "c", "WITHSCORE", "extra")
+	expect(t, r, "-ERR syntax error\r\n")
+	send("ZRANK", "z")
+	expect(t, r, "-ERR wrong number of arguments for 'zrank' command\r\n")
+
+	send("SET", "str", "v")
+	expect(t, r, "+OK\r\n")
+	for _, cmd := range [][]string{
+		{"ZSCORE", "str", "a"},
+		{"ZMSCORE", "str", "a"},
+		{"ZCARD", "str"},
+		{"ZRANK", "str", "a"},
+		{"ZREVRANK", "str", "a", "WITHSCORE"},
+	} {
+		send(cmd...)
+		expect(t, r, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	}
+}
