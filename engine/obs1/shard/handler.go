@@ -37,6 +37,14 @@ type Ctx struct {
 	// shared holder the keyspace-unification slice introduces.
 	Coll any
 
+	// Log is the durability seam (writelog.go, doc 04 section 3.1): a write
+	// handler emits its post-decision effect frame here after the store
+	// mutation and before its reply, so the reply is the relaxed ack. Nil on
+	// a volatile runtime (f3 parity) and on a bare test Ctx; the LogStrSet
+	// and LogKeyDel helpers make that case one nil check. Fixed before Start
+	// through Runtime.SetWriteLog, read only on the owner goroutine.
+	Log WriteLog
+
 	// ZColl is the same owner-local slot for the zset type (spec 2064/f3/12
 	// M2): the zset registry hangs here so a zset command and a set command on
 	// the same shard do not fight over Coll. It is the temporary parallel field

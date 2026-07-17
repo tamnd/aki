@@ -34,6 +34,12 @@ type Runtime struct {
 	// INFO gather, which the fixed-before-Start rule makes safe.
 	netInfo func([]byte) []byte
 
+	// walInfo, when set, appends the durability "# Durability" lines to the
+	// INFO stats text (doc 04 section 10): the flusher, committer, and
+	// emission counters the taxonomy names. Registered through SetWALInfo
+	// before Start under the same fixed-before-Start rule as netInfo.
+	walInfo func([]byte) []byte
+
 	// live counts connections currently being served across every driver. The
 	// connection writers read it in idleOnce to decide whether to spin before
 	// they park (see connSpinHighWater): past the high-water the box is
