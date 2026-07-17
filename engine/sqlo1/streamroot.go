@@ -23,7 +23,7 @@ const (
 	// Root layout:
 	//
 	//	u8   sub          // streamSub
-	//	u8   xflags       // reserved zero; bit0 will mark a paged fence
+	//	u8   xflags       // bit0 fence-paged
 	//	u16  reserved
 	//	u32  rootgen
 	//	u64  rooth        // shared planed prefix, offset 8
@@ -41,20 +41,51 @@ const (
 	// base. Counts are live counts, so range math and XLEN never decode
 	// interior runs, and the decode cross-checks their sum against the
 	// root count, the same exactness the list fence states.
+	//
+	// A paged root holds the page index in the entry area instead of
+	// the fence: each entry names a fence page record (subkey kind 3
+	// under the same plane, pageids minted from next_segid like runs),
+	// its base is the base ID of the page's first run, and its count is
+	// the page's live entry total, so an ID seek prefix-checks two
+	// levels, root then page, and a range decodes only boundary runs in
+	// boundary pages.
 	streamRootHdrLen  = 80
 	streamFenceEntLen = 28
+
+	// streamPageHdrLen is the fence page payload header: u16 n, u16
+	// reserved, then n fence entries in ID order.
+	streamPageHdrLen = 4
+
+	// streamXflagFencePaged marks a paged fence, the one-way second
+	// rung of the fence ladder; a paged root never goes back to flat.
+	streamXflagFencePaged = 1 << 0
 )
 
-// streamFenceMaxRuns bounds the flat fence to the same root budget the
-// other collections use. A var, not a const, so tests reach the refusal
-// below without building thousands of entries.
-var streamFenceMaxRuns = (listInlineMax - streamRootHdrLen) / streamFenceEntLen
+// The fence fanouts. Vars, not consts, so the paged ladder (the flat
+// cap, page growth, the third-level refusal) is reachable in test-sized
+// streams; nothing outside tests writes them.
+var (
+	// streamFenceMaxRuns bounds the flat fence to the same root budget
+	// the other collections use; a cut past it pages the fence.
+	streamFenceMaxRuns = (listInlineMax - streamRootHdrLen) / streamFenceEntLen
 
-// errStreamFenceFull is this slice's honest edge: fence paging (kind 3
-// pages, the doc 10 two-level structure) is a later T6 slice, and until
-// it lands an XADD that needs a run past the flat cap refuses
+	// streamFencePageMax is the page fanout: 4 + 143*28 = 4008 bytes,
+	// so a full page rides one drain frame comfortably, the list page's
+	// sizing rule at the stream entry width.
+	streamFencePageMax = 143
+
+	// streamFencePageIdxMax bounds the root's page index. The xcatchup
+	// marquee needs ~550 pages at 10^7 small entries, so 4096 leaves an
+	// order of magnitude of headroom while capping the worst root at
+	// ~112 KiB, framed once per drain window by coalescing.
+	streamFencePageIdxMax = 4096
+)
+
+// errStreamFenceThirdLevel is the ladder's end: a stream whose page
+// index cannot take another page, ~75M small entries at production
+// fanouts, feed depths trim owns in practice. A refused XADD is
 // side-effect free.
-var errStreamFenceFull = errors.New("sqlo1: stream fence is full; fence paging has not landed yet")
+var errStreamFenceThirdLevel = errors.New("sqlo1: stream fence page index is full")
 
 // streamFenceEnt is one fence slot: the run's base ID, its segid, the
 // advisory meta (reserved zero for now), and its live entry count.
@@ -65,9 +96,12 @@ type streamFenceEnt struct {
 	count uint32
 }
 
-// streamRoot is the decoded stream root. The fence is copied out of the
-// read on decode, so it survives the run reads an op does next.
+// streamRoot is the decoded stream root. The fence (flat) or the page
+// index (paged) is copied out of the read on decode, so it survives the
+// run and page reads an op does next. Exactly one of fence and pidx is
+// populated, by the paged bit.
 type streamRoot struct {
+	paged      bool
 	rootgen    uint32
 	rooth      uint64
 	count      uint64
@@ -77,25 +111,13 @@ type streamRoot struct {
 	nextSegid  uint64
 	groupCount uint32
 	fence      []streamFenceEnt
+	pidx       []streamFenceEnt
 }
 
-// appendStreamRoot encodes r onto dst.
-func appendStreamRoot(dst []byte, r *streamRoot) []byte {
-	var h [streamRootHdrLen]byte
-	h[0] = streamSub
-	binary.LittleEndian.PutUint32(h[4:], r.rootgen)
-	binary.LittleEndian.PutUint64(h[8:], r.rooth)
-	binary.LittleEndian.PutUint64(h[16:], r.count)
-	binary.LittleEndian.PutUint64(h[24:], r.added)
-	binary.LittleEndian.PutUint64(h[32:], r.last.ms)
-	binary.LittleEndian.PutUint64(h[40:], r.last.seq)
-	binary.LittleEndian.PutUint64(h[48:], r.maxDel.ms)
-	binary.LittleEndian.PutUint64(h[56:], r.maxDel.seq)
-	binary.LittleEndian.PutUint64(h[64:], r.nextSegid)
-	binary.LittleEndian.PutUint32(h[72:], r.groupCount)
-	binary.LittleEndian.PutUint32(h[76:], uint32(len(r.fence)))
-	dst = append(dst, h[:]...)
-	for _, e := range r.fence {
+// appendStreamFenceEnts encodes an entry array, the shared shape of the
+// flat fence, the page index, and the page payload body.
+func appendStreamFenceEnts(dst []byte, ents []streamFenceEnt) []byte {
+	for _, e := range ents {
 		var b [streamFenceEntLen]byte
 		binary.LittleEndian.PutUint64(b[0:], e.base.ms)
 		binary.LittleEndian.PutUint64(b[8:], e.base.seq)
@@ -106,23 +128,86 @@ func appendStreamRoot(dst []byte, r *streamRoot) []byte {
 	return dst
 }
 
-// decodeStreamRoot validates everything and copies the fence into the
-// caller's scratch, so the returned root does not alias v and stays
-// valid across the run reads that follow.
-func decodeStreamRoot(v []byte, fence []streamFenceEnt) (streamRoot, error) {
+// appendStreamRoot encodes r onto dst.
+func appendStreamRoot(dst []byte, r *streamRoot) []byte {
+	ents := r.fence
+	xflags := uint8(0)
+	if r.paged {
+		ents = r.pidx
+		xflags = streamXflagFencePaged
+	}
+	var h [streamRootHdrLen]byte
+	h[0] = streamSub
+	h[1] = xflags
+	binary.LittleEndian.PutUint32(h[4:], r.rootgen)
+	binary.LittleEndian.PutUint64(h[8:], r.rooth)
+	binary.LittleEndian.PutUint64(h[16:], r.count)
+	binary.LittleEndian.PutUint64(h[24:], r.added)
+	binary.LittleEndian.PutUint64(h[32:], r.last.ms)
+	binary.LittleEndian.PutUint64(h[40:], r.last.seq)
+	binary.LittleEndian.PutUint64(h[48:], r.maxDel.ms)
+	binary.LittleEndian.PutUint64(h[56:], r.maxDel.seq)
+	binary.LittleEndian.PutUint64(h[64:], r.nextSegid)
+	binary.LittleEndian.PutUint32(h[72:], r.groupCount)
+	binary.LittleEndian.PutUint32(h[76:], uint32(len(ents)))
+	dst = append(dst, h[:]...)
+	return appendStreamFenceEnts(dst, ents)
+}
+
+// decodeStreamFenceEnts walks n encoded entries, validating each (a
+// nonzero base, strict ID order, segid below nextSegid, a live count),
+// and appends them onto ents. what names the array in errors. The
+// running count sum comes back for the caller's cross-check.
+func decodeStreamFenceEnts(p []byte, n int, nextSegid uint64, what string, ents []streamFenceEnt) ([]streamFenceEnt, uint64, error) {
+	sum := uint64(0)
+	prev := streamID{}
+	for i := range n {
+		x := binary.LittleEndian.Uint64(p[16:])
+		e := streamFenceEnt{
+			base:  streamID{ms: binary.LittleEndian.Uint64(p[0:]), seq: binary.LittleEndian.Uint64(p[8:])},
+			segid: x & (1<<48 - 1),
+			meta:  uint16(x >> 48),
+			count: binary.LittleEndian.Uint32(p[24:]),
+		}
+		if e.base == (streamID{}) {
+			return nil, 0, fmt.Errorf("sqlo1: stream %s entry %d has the zero base ID", what, i)
+		}
+		if i > 0 && !prev.less(e.base) {
+			return nil, 0, fmt.Errorf("sqlo1: stream %s entry %d has base out of ID order", what, i)
+		}
+		if e.segid >= nextSegid {
+			return nil, 0, fmt.Errorf("sqlo1: stream %s entry %d has segid %d at or past next_segid %d", what, i, e.segid, nextSegid)
+		}
+		if e.count == 0 {
+			return nil, 0, fmt.Errorf("sqlo1: stream %s entry %d has count 0; emptied runs and pages drop whole", what, i)
+		}
+		sum += uint64(e.count)
+		prev = e.base
+		ents = append(ents, e)
+		p = p[streamFenceEntLen:]
+	}
+	return ents, sum, nil
+}
+
+// decodeStreamRoot validates everything and copies the entry array into
+// the caller's scratch (fence flat, pidx paged), so the returned root
+// does not alias v and stays valid across the run and page reads that
+// follow.
+func decodeStreamRoot(v []byte, fence, pidx []streamFenceEnt) (streamRoot, error) {
 	if len(v) < streamRootHdrLen {
 		return streamRoot{}, fmt.Errorf("sqlo1: stream root of %d bytes has no header", len(v))
 	}
 	if v[0] != streamSub {
 		return streamRoot{}, fmt.Errorf("sqlo1: stream root has sub %d", v[0])
 	}
-	if v[1] != 0 {
+	if v[1]&^uint8(streamXflagFencePaged) != 0 {
 		return streamRoot{}, fmt.Errorf("sqlo1: stream root has unknown xflags %#x", v[1])
 	}
 	if v[2] != 0 || v[3] != 0 {
 		return streamRoot{}, errors.New("sqlo1: stream root has nonzero reserved bytes")
 	}
 	r := streamRoot{
+		paged:      v[1]&streamXflagFencePaged != 0,
 		rootgen:    binary.LittleEndian.Uint32(v[4:]),
 		rooth:      binary.LittleEndian.Uint64(v[8:]),
 		count:      binary.LittleEndian.Uint64(v[16:]),
@@ -139,46 +224,64 @@ func decodeStreamRoot(v []byte, fence []streamFenceEnt) (streamRoot, error) {
 		return streamRoot{}, fmt.Errorf("sqlo1: stream root count %d exceeds entries added %d", r.count, r.added)
 	}
 	n := int(binary.LittleEndian.Uint32(v[76:]))
-	if n > streamFenceMaxRuns {
-		return streamRoot{}, fmt.Errorf("sqlo1: stream root fence count %d out of range", n)
+	bound, what := streamFenceMaxRuns, "fence"
+	if r.paged {
+		bound, what = streamFencePageIdxMax, "page index"
+	}
+	if n > bound {
+		return streamRoot{}, fmt.Errorf("sqlo1: stream root %s count %d out of range", what, n)
 	}
 	if len(v) != streamRootHdrLen+n*streamFenceEntLen {
-		return streamRoot{}, fmt.Errorf("sqlo1: stream root of %d bytes does not fit %d fence entries", len(v), n)
+		return streamRoot{}, fmt.Errorf("sqlo1: stream root of %d bytes does not fit %d %s entries", len(v), n, what)
 	}
-	sum := uint64(0)
-	p := v[streamRootHdrLen:]
-	prev := streamID{}
-	for i := range n {
-		x := binary.LittleEndian.Uint64(p[16:])
-		e := streamFenceEnt{
-			base:  streamID{ms: binary.LittleEndian.Uint64(p[0:]), seq: binary.LittleEndian.Uint64(p[8:])},
-			segid: x & (1<<48 - 1),
-			meta:  uint16(x >> 48),
-			count: binary.LittleEndian.Uint32(p[24:]),
-		}
-		if e.base == (streamID{}) {
-			return streamRoot{}, fmt.Errorf("sqlo1: stream fence entry %d has the zero base ID", i)
-		}
-		if i > 0 && !prev.less(e.base) {
-			return streamRoot{}, fmt.Errorf("sqlo1: stream fence entry %d has base out of ID order", i)
-		}
-		if e.segid >= r.nextSegid {
-			return streamRoot{}, fmt.Errorf("sqlo1: stream fence entry %d has segid %d at or past next_segid %d", i, e.segid, r.nextSegid)
-		}
-		if e.count == 0 {
-			return streamRoot{}, fmt.Errorf("sqlo1: stream fence entry %d has count 0; emptied runs drop whole", i)
-		}
-		sum += uint64(e.count)
-		prev = e.base
-		fence = append(fence, e)
-		p = p[streamFenceEntLen:]
+	dst := fence
+	if r.paged {
+		dst = pidx
+	}
+	ents, sum, err := decodeStreamFenceEnts(v[streamRootHdrLen:], n, r.nextSegid, what, dst)
+	if err != nil {
+		return streamRoot{}, err
 	}
 	if sum != r.count {
-		return streamRoot{}, fmt.Errorf("sqlo1: stream fence counts sum to %d, root count says %d", sum, r.count)
+		return streamRoot{}, fmt.Errorf("sqlo1: stream %s counts sum to %d, root count says %d", what, sum, r.count)
 	}
-	if n > 0 && r.last.less(prev) {
+	if n > 0 && r.last.less(ents[len(ents)-1].base) {
 		return streamRoot{}, errors.New("sqlo1: stream root last ID is below the tail run's base")
 	}
-	r.fence = fence
+	if r.paged {
+		r.pidx = ents
+	} else {
+		r.fence = ents
+	}
 	return r, nil
+}
+
+// appendStreamFencePage encodes a fence page payload: u16 n, u16
+// reserved, then the entries.
+func appendStreamFencePage(dst []byte, ents []streamFenceEnt) []byte {
+	var h [streamPageHdrLen]byte
+	binary.LittleEndian.PutUint16(h[:], uint16(len(ents)))
+	dst = append(dst, h[:]...)
+	return appendStreamFenceEnts(dst, ents)
+}
+
+// decodeStreamFencePage validates a page payload and copies its entries
+// into the caller's scratch. The caller cross-checks the returned sum
+// and the first entry's base against the parent index entry, the
+// two-level invariant.
+func decodeStreamFencePage(v []byte, nextSegid uint64, ents []streamFenceEnt) ([]streamFenceEnt, uint64, error) {
+	if len(v) < streamPageHdrLen {
+		return nil, 0, fmt.Errorf("sqlo1: stream fence page of %d bytes has no header", len(v))
+	}
+	n := int(binary.LittleEndian.Uint16(v))
+	if n == 0 || n > streamFencePageMax {
+		return nil, 0, fmt.Errorf("sqlo1: stream fence page count %d out of range", n)
+	}
+	if binary.LittleEndian.Uint16(v[2:]) != 0 {
+		return nil, 0, errors.New("sqlo1: stream fence page has nonzero reserved bytes")
+	}
+	if len(v) != streamPageHdrLen+n*streamFenceEntLen {
+		return nil, 0, fmt.Errorf("sqlo1: stream fence page of %d bytes does not fit %d entries", len(v), n)
+	}
+	return decodeStreamFenceEnts(v[streamPageHdrLen:], n, nextSegid, "fence page", ents)
 }
