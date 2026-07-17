@@ -47,6 +47,8 @@ func opCorpus(t testing.TB) []struct {
 		{"rpop", key, CollDelta{Sub: RPop{Count: 1}}},
 		{"lset", key, CollDelta{Sub: LSet{Index: -1, Value: []byte("v")}}},
 		{"xadd", key, CollDelta{Sub: XAdd{IDMs: 1700000000000, IDSeq: 3, Pairs: []FieldValue{{[]byte("f"), []byte("v")}}}}},
+		{"hexpire", key, CollDelta{Sub: HExpire{AtMs: 1700000000000, Fields: [][]byte{[]byte("f1"), []byte("f2")}}}},
+		{"hpersist", key, CollDelta{Sub: HExpire{AtMs: 0, Fields: [][]byte{[]byte("f1")}}}},
 	}
 }
 
@@ -104,7 +106,7 @@ func TestOpDecodeTyped(t *testing.T) {
 			t.Fatalf("%s: %v", c.name, err)
 		}
 		switch c.name {
-		case "strset", "expire", "collnew", "txn-begin", "txn-end", "hdel", "zrem", "lpop", "rpop", "xadd":
+		case "strset", "expire", "collnew", "txn-begin", "txn-end", "hdel", "zrem", "lpop", "rpop", "xadd", "hexpire", "hpersist":
 			if !reflect.DeepEqual(op, c.op) {
 				t.Fatalf("%s: decoded %#v, want %#v", c.name, op, c.op)
 			}
@@ -194,7 +196,7 @@ func TestOpStructuralRejects(t *testing.T) {
 			t.Fatalf("op kind 0x%02x decoded", kind)
 		}
 	}
-	for _, sub := range []uint8{0x00, 0x0D, 0xFF} {
+	for _, sub := range []uint8{0x00, 0x0E, 0xFF} {
 		if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: []byte{sub, 1, 0, 0, 0}}); err == nil {
 			t.Fatalf("colldelta sub-kind 0x%02x decoded", sub)
 		}
@@ -237,6 +239,15 @@ func TestOpSizeRejects(t *testing.T) {
 	}
 	if _, err := EncodeOp(0, 1, key, CollDelta{Sub: LPop{}}); err == nil {
 		t.Fatal("lpop of zero encoded")
+	}
+	if _, err := EncodeOp(0, 1, key, CollDelta{Sub: HExpire{AtMs: 5}}); err == nil {
+		t.Fatal("hexpire with no fields encoded")
+	}
+	if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: append([]byte{SubHExpire}, make([]byte, 12)...)}); err == nil {
+		t.Fatal("hexpire with zero field count decoded")
+	}
+	if _, err := DecodeOp(WALFrame{Kind: OpCollDelta, Seq: 1, Key: key, Payload: append([]byte{SubHExpire}, make([]byte, 7)...)}); err == nil {
+		t.Fatal("hexpire truncated at its deadline decoded")
 	}
 	if _, err := EncodeOp(0, 1, key, CollDelta{Sub: ZAdd{Entries: []ScoreMember{{Score: math.NaN()}}}}); err == nil {
 		t.Fatal("NaN score encoded")

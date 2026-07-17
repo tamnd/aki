@@ -61,20 +61,22 @@ const (
 	CollStream = 0x05
 )
 
-// Colldelta sub-kinds (doc 04 section 2's named set).
+// Colldelta sub-kinds (doc 04 section 2's named set; hexpire filled the
+// hash-field-expiry gap the table left open, #1023's next-slice item).
 const (
-	SubHSet  = 0x01
-	SubHDel  = 0x02
-	SubSAdd  = 0x03
-	SubSRem  = 0x04
-	SubZAdd  = 0x05
-	SubZRem  = 0x06
-	SubLPush = 0x07
-	SubRPush = 0x08
-	SubLPop  = 0x09
-	SubRPop  = 0x0A
-	SubLSet  = 0x0B
-	SubXAdd  = 0x0C
+	SubHSet    = 0x01
+	SubHDel    = 0x02
+	SubSAdd    = 0x03
+	SubSRem    = 0x04
+	SubZAdd    = 0x05
+	SubZRem    = 0x06
+	SubLPush   = 0x07
+	SubRPush   = 0x08
+	SubLPop    = 0x09
+	SubRPop    = 0x0A
+	SubLSet    = 0x0B
+	SubXAdd    = 0x0C
+	SubHExpire = 0x0D
 )
 
 // Op is one doc 04 op: exactly one of the eight kinds.
@@ -202,7 +204,7 @@ func (Noop) opFlags() uint8 { return 0 }
 
 func (o Noop) appendPayload(b []byte) ([]byte, error) { return append(b, o.Pad...), nil }
 
-// CollSub is one colldelta sub-op: exactly one of the twelve doc 04
+// CollSub is one colldelta sub-op: exactly one of the thirteen doc 04
 // sub-kinds.
 type CollSub interface {
 	subKind() uint8
@@ -289,18 +291,31 @@ type XAdd struct {
 	Pairs []FieldValue
 }
 
-func (HSet) subKind() uint8  { return SubHSet }
-func (HDel) subKind() uint8  { return SubHDel }
-func (SAdd) subKind() uint8  { return SubSAdd }
-func (SRem) subKind() uint8  { return SubSRem }
-func (ZAdd) subKind() uint8  { return SubZAdd }
-func (ZRem) subKind() uint8  { return SubZRem }
-func (LPush) subKind() uint8 { return SubLPush }
-func (RPush) subKind() uint8 { return SubRPush }
-func (LPop) subKind() uint8  { return SubLPop }
-func (RPop) subKind() uint8  { return SubRPop }
-func (LSet) subKind() uint8  { return SubLSet }
-func (XAdd) subKind() uint8  { return SubXAdd }
+// HExpire sets the named hash fields' expiry to the absolute deadline
+// AtMs, or clears it when AtMs is 0 (HPERSIST), the same zero the expire
+// kind uses. Post-decision like everything else: the owner already
+// applied its NX/XX/GT/LT gate and unit conversion, and a set-to-the-past
+// that deleted fields rides an hdel instead. It also restores a deadline
+// a TTL-preserving write kept (HINCRBY on a field with one), because the
+// hset replay rule clears an overwritten field's TTL, the HSET behavior.
+type HExpire struct {
+	AtMs   uint64
+	Fields [][]byte
+}
+
+func (HSet) subKind() uint8    { return SubHSet }
+func (HDel) subKind() uint8    { return SubHDel }
+func (SAdd) subKind() uint8    { return SubSAdd }
+func (SRem) subKind() uint8    { return SubSRem }
+func (ZAdd) subKind() uint8    { return SubZAdd }
+func (ZRem) subKind() uint8    { return SubZRem }
+func (LPush) subKind() uint8   { return SubLPush }
+func (RPush) subKind() uint8   { return SubRPush }
+func (LPop) subKind() uint8    { return SubLPop }
+func (RPop) subKind() uint8    { return SubRPop }
+func (LSet) subKind() uint8    { return SubLSet }
+func (XAdd) subKind() uint8    { return SubXAdd }
+func (HExpire) subKind() uint8 { return SubHExpire }
 
 func (o HSet) appendBody(b []byte) ([]byte, error)  { return appendPairList(b, o.Pairs) }
 func (o HDel) appendBody(b []byte) ([]byte, error)  { return appendByteList(b, o.Fields) }
@@ -351,6 +366,11 @@ func (o XAdd) appendBody(b []byte) ([]byte, error) {
 	b = binary.LittleEndian.AppendUint64(b, o.IDMs)
 	b = binary.LittleEndian.AppendUint64(b, o.IDSeq)
 	return appendPairList(b, o.Pairs)
+}
+
+func (o HExpire) appendBody(b []byte) ([]byte, error) {
+	b = binary.LittleEndian.AppendUint64(b, o.AtMs)
+	return appendByteList(b, o.Fields)
 }
 
 // appendItem writes one u32-length-prefixed item.
@@ -572,9 +592,21 @@ func parseCollDelta(p []byte) (Op, error) {
 			IDSeq: binary.LittleEndian.Uint64(body[8:16]),
 			Pairs: pairs,
 		}}, nil
+	case SubHExpire:
+		if len(body) < 8 {
+			return nil, fmt.Errorf("obs1: hexpire body is %d bytes, want at least 8", len(body))
+		}
+		items, err := parseByteList(body[8:])
+		if err != nil {
+			return nil, err
+		}
+		return CollDelta{Sub: HExpire{
+			AtMs:   binary.LittleEndian.Uint64(body),
+			Fields: items,
+		}}, nil
 	}
 	// Unknown sub-kinds are rejected, not skipped: replay dispatches on
-	// them, and a thirteenth arrives with an fversion bump.
+	// them, and a fourteenth arrives with an fversion bump.
 	return nil, fmt.Errorf("obs1: colldelta sub-kind 0x%02x is not a doc 04 sub-kind", sub)
 }
 
