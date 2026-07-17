@@ -52,6 +52,14 @@ const bpStallWindow = 64
 // inside that window resets it.
 const bpFlushPollMs = 50
 
+// bpLeasePollMs paces the lease half the same way and for the same reason: a
+// renewal rides a chain append, which takes milliseconds, so counting raw
+// retry passes would cross the window before a single append could land. 64
+// checks at this pace give the handoff-park cap doc 07 names, over three
+// seconds of genuine renewal silence, before a lease-parked write takes the
+// CLUSTERDOWN reply; a renewal inside the window resets it.
+const bpLeasePollMs = 50
+
 // fullWaiter is one write parked on a full arena: its batch node and the command
 // slot within it. The pair is enough to re-run the command against a reclaimed
 // arena (executeCmd rebuilds the argument views from the node) and to write the
@@ -151,6 +159,9 @@ func (w *worker) retryFull() {
 	if len(w.fullWaiters) == 0 {
 		w.bpStall = 0
 		w.bpFlushStall = 0
+		w.bpFlushCheckMs = 0
+		w.bpLeaseStall = 0
+		w.bpLeaseCheckMs = 0
 		return
 	}
 	w.stallCheck()
@@ -182,14 +193,26 @@ func (w *worker) retryFull() {
 // resolved it. The counter is paced by bpFlushPollMs (see the constant) and
 // crossing the window means flushing has genuinely stopped, the bucket
 // refusing PUTs past the retry backoff, so every flushlag waiter takes the
-// flush-stalled reply. A reason with no waiters gets its counter reset so a
-// later park starts a fresh window. Owner goroutine only.
+// flush-stalled reply.
+//
+// For lease waiters progress is a renewal (LeaseView.Renewals moved), which
+// is a successful chain append of the holder's own, and demotion resolves the
+// waiter through the retry itself: the gate re-runs each pass and a demoted
+// group writes the MOVED redirect instead of re-parking, so the window here
+// only covers the genuinely unleased case. The counter is paced by
+// bpLeasePollMs and crossing the window is the doc 07 handoff-park cap: the
+// slot's group is not served and no renewal is landing, so every lease waiter
+// takes the CLUSTERDOWN reply. A reason with no waiters gets its counter
+// reset so a later park starts a fresh window. Owner goroutine only.
 func (w *worker) stallCheck() {
-	var resident, flushlag bool
+	var resident, flushlag, lease bool
 	for i := range w.fullWaiters {
-		if w.fullWaiters[i].reason == ParkFlushlag {
+		switch w.fullWaiters[i].reason {
+		case ParkFlushlag:
 			flushlag = true
-		} else {
+		case ParkLease:
+			lease = true
+		default:
 			resident = true
 		}
 	}
@@ -205,6 +228,13 @@ func (w *worker) stallCheck() {
 			w.bpStall = 0
 		}
 	}
+	w.stallCheckFlush(flushlag)
+	w.stallCheckLease(lease)
+}
+
+// stallCheckFlush advances the flushlag window, the paced half stallCheck
+// split out when the lease window joined it. Owner goroutine only.
+func (w *worker) stallCheckFlush(flushlag bool) {
 	if !flushlag {
 		w.bpFlushStall = 0
 		w.bpFlushCheckMs = 0
@@ -227,6 +257,34 @@ func (w *worker) stallCheck() {
 	}
 }
 
+// stallCheckLease advances the lease window, same shape as the flushlag one
+// with the renewal count as its progress signal. The stall reply is the
+// doc 07 line for a slot whose group is unleased past the handoff-park cap;
+// the Reply.Err framing adds the leading dash, so the string carries none.
+// Owner goroutine only.
+func (w *worker) stallCheckLease(lease bool) {
+	if !lease {
+		w.bpLeaseStall = 0
+		w.bpLeaseCheckMs = 0
+		return
+	}
+	if rn := w.leases.Renewals(); rn != w.bpLeaseSeen {
+		w.bpLeaseSeen = rn
+		w.bpLeaseStall = 0
+		w.bpLeaseCheckMs = w.cx.NowMs
+		return
+	}
+	if w.cx.NowMs-w.bpLeaseCheckMs < bpLeasePollMs {
+		return
+	}
+	w.bpLeaseCheckMs = w.cx.NowMs
+	w.bpLeaseStall++
+	if w.bpLeaseStall >= bpStallWindow {
+		w.stallOutReason(ParkLease, "CLUSTERDOWN Hash slot not served")
+		w.bpLeaseStall = 0
+	}
+}
+
 // stallOutReason surfaces msg to every parked write waiting under reason and
 // releases their batches, the terminal answer when that reason's progress has
 // genuinely stopped; waiters parked under any other reason stay in the FIFO
@@ -236,11 +294,13 @@ func (w *worker) stallCheck() {
 // class a client already handles as a refusal, now carrying why the migrator
 // could not free room (a full cold device, a cold I/O error, a stream pinning
 // migration, no tier, or an exhausted arena). For flushlag it is the doc 04
-// section 6 flush-stalled string. It never acknowledges a write and then
-// drops it: a parked write ends in exactly one of a real reply after its
-// reason's progress resumes or this reply after a genuine stall. The lease
-// resolution (the doc 07 MOVED redirect, not an error) lands with the slice
-// that first raises that reason. Owner goroutine only.
+// section 6 flush-stalled string; for lease it is the doc 07 CLUSTERDOWN
+// line, and only for the unleased case: a demotion never reaches here because
+// the retrying gate resolves the waiter with the MOVED redirect instead of
+// re-parking it. It never acknowledges a write and then drops it: a parked
+// write ends in exactly one of a real reply after its reason's progress
+// resumes, the redirect after a demotion, or this reply after a genuine
+// stall. Owner goroutine only.
 func (w *worker) stallOutReason(reason ParkReason, msg string) {
 	kept := w.fullWaiters[:0]
 	for _, fw := range w.fullWaiters {

@@ -3,6 +3,7 @@ package obs1
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 )
 
@@ -34,6 +35,12 @@ type CommitterConfig struct {
 	// landed, in WAL-seq order, with the chain position that carries
 	// it. This is the fold-accounting seam; doc 06 plugs in here.
 	OnCommitted func(walSeq uint64, pos ChainPos)
+
+	// OnAppended, when set, hears the distinct groups of every batch whose
+	// append landed, once per batch. This is the lease-renewal seam (doc 02
+	// section 3.5): a successful append of the node's own is exactly what
+	// extends its believed deadlines, so the LeaseGate plugs in here.
+	OnAppended func(groups []uint16)
 }
 
 // Committer is the FlushSink that puts flushed WAL objects onto the
@@ -184,6 +191,19 @@ func (c *Committer) run() {
 		c.stats.Batches++
 		c.stats.Records += uint64(len(batch))
 		c.mu.Unlock()
+		if c.cfg.OnAppended != nil {
+			// Distinct groups across the batch's sections; batches are a
+			// handful of records, so the linear dedup beats a map.
+			var groups []uint16
+			for _, r := range batch {
+				for _, s := range r.(CommitRecord).Sections {
+					if !slices.Contains(groups, s.Group) {
+						groups = append(groups, s.Group)
+					}
+				}
+			}
+			c.cfg.OnAppended(groups)
+		}
 		if c.cfg.OnCommitted != nil {
 			for _, r := range batch {
 				c.cfg.OnCommitted(r.(CommitRecord).WALSeq, pos)

@@ -92,6 +92,12 @@ type WriteLogConfig struct {
 	// OnCommitted, when set, hears every committed WAL seq in order, the
 	// doc 06 fold-accounting seam passed through to the committer.
 	OnCommitted func(walSeq uint64, pos ChainPos)
+
+	// Gate, when set, is the node's lease gate: the committer's append hook
+	// renews the groups each landed batch carried, so a serving gate's
+	// deadlines extend exactly when the doc 02 section 3.5 progress rule
+	// says they may. Nil on a single-node pipeline.
+	Gate *LeaseGate
 }
 
 // NewWriteLog builds and starts the pipeline: committer over the chain,
@@ -112,11 +118,15 @@ func NewWriteLog(cfg WriteLogConfig) (*WriteLog, error) {
 	}
 	marks := NewWatermarks()
 	cfg.Fold.OnCommit = marks.ApplyVerdict
-	cm, err := NewCommitter(CommitterConfig{
+	ccfg := CommitterConfig{
 		Chain:       cfg.Chain,
 		Node:        cfg.Node,
 		OnCommitted: cfg.OnCommitted,
-	})
+	}
+	if cfg.Gate != nil {
+		ccfg.OnAppended = cfg.Gate.OnAppended
+	}
+	cm, err := NewCommitter(ccfg)
 	if err != nil {
 		cfg.Fold.OnCommit = nil
 		return nil, err

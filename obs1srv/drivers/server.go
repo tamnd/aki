@@ -168,6 +168,14 @@ type Options struct {
 	// is the relaxed ack point. Nil keeps the runtime volatile, byte-for-byte
 	// the f3 behavior.
 	WriteLog shard.WriteLog
+	// LeaseView, when set, is the serving gate over the node's lease belief
+	// (doc 02 section 3.5): write handlers for a suspended group park under
+	// the lease reason and a demoted group's writes take the doc 07 MOVED
+	// redirect, checked before every write handler runs. Normally the
+	// engine's LeaseGate, renewed by the write log's committer through
+	// WriteLogConfig.Gate. Nil keeps the runtime ungated, the single-node
+	// shape where no other node can take a group away.
+	LeaseView shard.LeaseView
 	// WALInfo, when set, extends INFO with the node-level durability rows
 	// (the # Durability section). The flusher and committer are node
 	// singletons, so their counters ride this hook instead of the per-shard
@@ -362,6 +370,9 @@ func Listen(o Options) (*Server, error) {
 	s.rt.UseDemoter(dispatch.Demoter())
 	if o.WriteLog != nil {
 		s.rt.SetWriteLog(o.WriteLog)
+	}
+	if o.LeaseView != nil {
+		s.rt.UseLeaseView(o.LeaseView)
 	}
 	if o.WALInfo != nil {
 		s.rt.SetWALInfo(o.WALInfo)
