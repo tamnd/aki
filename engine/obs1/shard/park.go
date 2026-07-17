@@ -22,16 +22,17 @@ package shard
 //     happens before the handler and the retry runs it for the first time
 //     once the lag clears (worker.go, backpressure.go).
 //   - lease: the group self-suspended (doc 02 section 3.5). Progress signal:
-//     a successful chain append under the same epoch, or demotion, in which
-//     case parked writers fail over with the doc 07 MOVED redirect rather
-//     than an error. Registered here, raised by nothing until the lease guard
-//     is wired into serving.
+//     a successful chain append under the same epoch (LeaseView.Renewals), or
+//     demotion, in which case parked writers fail over with the doc 07 MOVED
+//     redirect rather than an error. Raised by the executeCmd lease gate
+//     ahead of the flushlag check, because fencing outranks capacity; stall
+//     reply after the handoff-park cap: "CLUSTERDOWN Hash slot not served"
+//     (worker.go leaseGate, backpressure.go stallCheckLease).
 //
-// Registration means the names exist, every park and stall-out is counted
-// under its reason, and the per-reason counters render in INFO through the
-// stats schema (stats.go); the lease rows sit at zero until the lease guard
-// is wired into serving, and the park-storm lab reads the split without a
-// schema change.
+// Every park and stall-out is counted under its reason, and the per-reason
+// counters render in INFO through the stats schema (stats.go); a runtime with
+// no lease view wired (a single-node driver) leaves the lease rows at zero,
+// and the park-storm lab reads the split without a schema change.
 
 // ParkReason names why a write parked (doc 04 section 6).
 type ParkReason uint8
@@ -43,7 +44,8 @@ const (
 	// ParkFlushlag is the WAL-buffer-over-cap park, raised by the executeCmd
 	// gate before a write handler runs.
 	ParkFlushlag
-	// ParkLease is the self-suspended-group park; registered, not yet raised.
+	// ParkLease is the self-suspended-group park, raised by the executeCmd
+	// lease gate before a write handler runs.
 	ParkLease
 	numParkReasons
 )

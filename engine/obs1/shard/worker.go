@@ -2,6 +2,7 @@ package shard
 
 import (
 	"runtime"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -150,6 +151,19 @@ type worker struct {
 	bpFlushStall   int
 	bpFlushSeen    uint64
 	bpFlushCheckMs int64
+
+	// The lease half (lease.go, backpressure.go). leases is the view
+	// UseLeaseView installed, nil on a single-node runtime, read with plain
+	// loads like handlers; the executeCmd gate consults it before the
+	// flushlag check. bpLeaseSeen snapshots the view's renewal count between
+	// checks and bpLeaseStall counts fruitless ones, paced by bpLeaseCheckMs
+	// for the same reason the flushlag counter is: a renewal rides a chain
+	// append, which takes milliseconds, while idle retry passes spin at
+	// Gosched speed. Owner goroutine only.
+	leases         LeaseView
+	bpLeaseStall   int
+	bpLeaseSeen    uint64
+	bpLeaseCheckMs int64
 }
 
 func newWorker(id int, st *store.Store) *worker {
@@ -693,19 +707,27 @@ func (w *worker) executeCmd(b *hopBatch, i int) {
 	w.argv = argv
 	w.cx.curConn = b.conn // completion target for a Park; owner-local, per command
 	w.cx.curSeq = c.seq
-	// The flushlag gate (backpressure.go, doc 04 section 6): a write handler
-	// must not run while the WAL buffer sits over its cap, because by the time
+	// The pre-handler write gates (backpressure.go, doc 04 section 6): a
+	// write handler must not run while its ack could lie, because by the time
 	// it emits, the mutation has already happened and can neither be re-run
-	// (INCR is not idempotent) nor held aside (per-group seq order). So the
-	// gate parks the command before its handler, on the same full-waiter FIFO
-	// the resident park uses, and the retry runs the handler for the first
-	// time only once the lag clears. Reads and a volatile runtime never take
-	// the branch: one bounds check and a bool load, then an atomic load only
-	// for a write with a log wired.
-	if int(c.op) < len(w.writeOps) && w.writeOps[c.op] && w.cx.Log != nil && w.cx.Log.FlushLagged() {
+	// (INCR is not idempotent) nor held aside (per-group seq order). The
+	// lease gate runs first: a suspended group's ack could race a takeover
+	// (doc 02 section 3.5), which is a fencing question and outranks the
+	// flushlag capacity question; a demoted group's write is not ours to run
+	// at all and takes the MOVED redirect inside leaseGate. Then the flushlag
+	// gate parks a write while the WAL buffer sits over its cap. Both park on
+	// the same full-waiter FIFO and the retry runs the handler for the first
+	// time only once its gate clears. Reads and a volatile single-node
+	// runtime never take either branch: one bounds check and a bool load,
+	// then a nil check and one atomic load per wired gate.
+	isWrite := int(c.op) < len(w.writeOps) && w.writeOps[c.op]
+	switch {
+	case isWrite && w.leases != nil && w.leases.Gated(w.cx.NowMs) && w.leaseGate(b, i, c, r):
+		// Consumed: the redirect is in the slot or the park reason is set.
+	case isWrite && w.cx.Log != nil && w.cx.Log.FlushLagged():
 		w.cx.parkFull = true
 		w.cx.parkReason = ParkFlushlag
-	} else {
+	default:
 		h(&w.cx, argv, r)
 	}
 	// Block-not-drop first: a write handler that could not allocate set parkFull
@@ -743,6 +765,55 @@ func (w *worker) executeCmd(b *hopBatch, i int) {
 		}
 		w.cx.marks = w.cx.marks[:0]
 	}
+}
+
+// leaseGate resolves a gated write against the lease view, called only
+// behind the Gated fast path: a demoted group takes the doc 07 MOVED
+// redirect naming the taker, a suspended group parks under ParkLease, and a
+// group that is neither lets the handler run. Reports whether it consumed
+// the command (redirect written or park reason set). The slot hash runs only
+// here, so an ungated write never pays it; a gated one recomputes per retry
+// pass, degraded-mode cost dwarfed by the wait itself, and the recompute is
+// what lets a parked write resolve to MOVED when its group demotes mid-wait.
+// Owner goroutine only.
+func (w *worker) leaseGate(b *hopBatch, i int, c *hopCmd, r Reply) bool {
+	if !c.keyed {
+		// A keyless write (a FLUSHALL fan sub) touches every group at once,
+		// so it parks while any group is suspended and never redirects: no
+		// single endpoint owns it.
+		if w.leases.AnySuspended(w.cx.NowMs) {
+			w.cx.parkFull = true
+			w.cx.parkReason = ParkLease
+			return true
+		}
+		return false
+	}
+	g := w.rt.groups
+	if g < 1 {
+		g = DefaultSlotGroups
+	}
+	slot := HashSlot(b.arg(i, 0))
+	group := uint16(groupOfSlot(slot, g))
+	if ep, ok := w.leases.Demoted(group); ok {
+		// The doc 07 section 2 redirect: parked writers fail over with it,
+		// not an error, and a fan sub-command returns it as a partial the
+		// gather folds, exactly like a stall-out (stallOutReason). Any marks
+		// a prior pass committed still attach after this returns, so the
+		// redirect holds behind its committed prefix on a strict connection.
+		msg := "MOVED " + strconv.Itoa(slot) + " " + ep
+		if b.fan(i) != nil {
+			r.FanErrString(msg)
+		} else {
+			r.Err(msg)
+		}
+		return true
+	}
+	if w.leases.Suspended(group, w.cx.NowMs) {
+		w.cx.parkFull = true
+		w.cx.parkReason = ParkLease
+		return true
+	}
+	return false
 }
 
 // idle is the spin-then-park protocol (doc 03 section 9.1): store spinning,

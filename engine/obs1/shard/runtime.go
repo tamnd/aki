@@ -222,6 +222,20 @@ func (r *Runtime) UseWriteOps(writes []bool) {
 	}
 }
 
+// UseLeaseView registers the lease view the executeCmd gate reads before a
+// write handler runs (lease.go, doc 02 section 3.5): a suspended group's
+// writes park under ParkLease and a demoted group's writes take the doc 07
+// MOVED redirect. Fixed before Start like Use; a runtime that never wires it
+// (a single-node driver) leaves the gate a nil check and every write flows.
+func (r *Runtime) UseLeaseView(v LeaseView) {
+	if r.started {
+		panic("shard: UseLeaseView after Start")
+	}
+	for _, w := range r.workers {
+		w.leases = v
+	}
+}
+
 // UseDemoter registers the collection-demotion hook every worker's demote loop
 // calls at a boundary under memory pressure (spec 2064/f3/06 section 6). The
 // server layer, which imports the collection packages the shard cannot, passes
