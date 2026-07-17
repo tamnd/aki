@@ -129,6 +129,32 @@ func TestGetset(t *testing.T) {
 	expect(t, br, "$1\r\n7\r\n")
 }
 
+// TestSetnx walks SETNX: it writes and replies 1 only when the key is absent,
+// and replies 0 without touching the value once one is present.
+func TestSetnx(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// First write takes, reports 1.
+	send(t, nc, "SETNX", "k", "one")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$3\r\none\r\n")
+
+	// Second is refused, reports 0, leaves the value.
+	send(t, nc, "SETNX", "k", "two")
+	expect(t, br, ":0\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$3\r\none\r\n")
+
+	// After a delete the key is writable again.
+	send(t, nc, "DEL", "k")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "SETNX", "k", "three")
+	expect(t, br, ":1\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$5\r\nthree\r\n")
+}
+
 // TestSetOptions exercises the NX/XX/GET/KEEPTTL/expiry option matrix against
 // the Redis answers.
 func TestSetOptions(t *testing.T) {
