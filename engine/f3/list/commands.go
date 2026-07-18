@@ -461,6 +461,20 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	set.Object(cx, args, r)
 }
 
+// MemoryUsage reports the approximate resident bytes the list at key charges and
+// whether a list lives there, the MEMORY USAGE contribution for a list key. It is
+// the per-collection footprint the demote loop weighs, reached through regs.Load
+// so a read-only probe builds no list registry on a shard that never ran a list
+// command.
+func MemoryUsage(cx *shard.Ctx, key []byte) (uint64, bool) {
+	if v, ok := regs.Load(cx.St); ok {
+		if l := v.(*reg).live(cx, key); l != nil {
+			return l.residentBytes(), true
+		}
+	}
+	return 0, false
+}
+
 // --- helpers --------------------------------------------------------------
 
 // normIndex folds a signed index into [0, n); a still-out-of-range result is

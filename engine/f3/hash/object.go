@@ -29,6 +29,20 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	list.Object(cx, args, r)
 }
 
+// MemoryUsage reports the approximate resident bytes the hash at key charges and
+// whether a hash lives there, the MEMORY USAGE contribution for a hash key. It is
+// the per-collection footprint the demote loop weighs, reached through regs.Load
+// so a read-only probe builds no hash registry on a shard that never ran a hash
+// command.
+func MemoryUsage(cx *shard.Ctx, key []byte) (uint64, bool) {
+	if v, ok := regs.Load(cx.St); ok {
+		if h := v.(*reg).live(cx, key); h != nil {
+			return h.residentBytes(), true
+		}
+	}
+	return 0, false
+}
+
 // eqFold is a case-insensitive ASCII compare of b against the uppercase word s,
 // the subcommand token check without allocating a lowercase copy.
 func eqFold(b []byte, s string) bool {
