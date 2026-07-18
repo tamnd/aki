@@ -46,11 +46,12 @@ import (
 // immediately served a blocked waiter, can leave the effect log reflecting one side of
 // the move and not the other, the same bounded gap the deferred set STORE forms carry.
 //
-// Key TTL follows the set and hash model: the snapshot header carries the key deadline,
-// but a between-checkpoint EXPIRE and the active and lazy reaps stay outside the durable
-// list until the shared key-expire effect lands (the deferred follow-on every collection
-// type shares), so a crash before the next checkpoint loses a TTL set after the last
-// snapshot, never an element.
+// Key TTL is durable: the snapshot header carries the key deadline as of the checkpoint,
+// and a between-checkpoint EXPIRE or PERSIST cuts its own listOpExpire effect, so a crash
+// after the last snapshot keeps the deadline the live run set. The lazy reap needs no
+// effect of its own: it drops a key whose deadline has passed, and a replay reconstructs
+// the same passed deadline, so the rebuilt key falls out on its first touch exactly as it
+// did live.
 
 const (
 	// listOpPushFront records that a value was prepended to the list at key, the
@@ -82,6 +83,14 @@ const (
 	// listOpDeleteKey records that the whole list at key was dropped, the effect a DEL
 	// cuts so a replay clears the key instead of resurrecting its elements.
 	listOpDeleteKey uint8 = 9
+	// listOpExpire records the list's key deadline after an EXPIRE-family command or a
+	// PERSIST: SubValue is the deadline in unix milliseconds, eight bytes little-endian,
+	// 0 when the key was persisted. It carries no SubKey, since the frame key names the
+	// list. A replay installs the deadline the live run set, so a volatile list a crash
+	// caught between checkpoints keeps its TTL. An EXPIRE to a past instant deletes the
+	// key on the spot and cuts a key-delete instead, so this op always carries a future
+	// or cleared deadline.
+	listOpExpire uint8 = 10
 )
 
 // logPush cuts a push effect for value entering the list at key, at the front for an
@@ -176,10 +185,24 @@ func logDeleteKey(cx *shard.Ctx, key []byte) {
 	cx.St.LogCollectionOp(key, akifile.CollKindList, listOpDeleteKey, nil, nil)
 }
 
+// logExpire cuts a key-deadline effect for the list at key: the new deadline in unix
+// milliseconds, or 0 for a PERSIST that cleared it. It is called after the deadline is
+// stored, so a replay reaches the same deadline the live run set. The EXPIRE-to-a-past-
+// instant case deletes the key and logs a key-delete instead, never this.
+func logExpire(cx *shard.Ctx, key []byte, at int64) {
+	if cx.St == nil {
+		return
+	}
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], uint64(at))
+	cx.St.LogCollectionOp(key, akifile.CollKindList, listOpExpire, nil, b[:])
+}
+
 // snapHeaderLen is the fixed list snapshot header: the key deadline in unix milliseconds
 // (0 when the list carries no key TTL), little-endian. The header is the per-key state
 // the ordered element run does not carry, so a snapshot restores a volatile list's key
-// TTL where the effect log, which logs element deltas only, cannot yet.
+// TTL as of the checkpoint; a between-checkpoint EXPIRE or PERSIST also cuts its own
+// listOpExpire effect so the deadline is durable between checkpoints.
 const snapHeaderLen = 8
 
 // Snapshot writes a whole-list snapshot frame for every live list on this shard, the
@@ -285,13 +308,13 @@ func applyListSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
 // applyListOp re-drives one list effect onto the registry, in the append order the walk
 // hands them: a push creates the list on its first element and appends to the named end,
 // a pop drops the named end and the key on the last element, LSET overwrites a position,
-// LTRIM keeps a window, LREM removes matches, LINSERT places a value at a pivot, and a
-// key-delete clears the whole list. It goes through the low-level band-selecting ops, so
-// an element that breaches the inline budget promotes to the native band exactly as it did
-// live. It reports ErrLength on a torn op payload (a short LSET or LTRIM header), the
-// fail-closed cut recovery wants; a structurally valid op that no longer applies (a pop or
-// LSET on an absent or too-short list) is a defensive no-op, since a deterministic replay
-// never produces one.
+// LTRIM keeps a window, LREM removes matches, LINSERT places a value at a pivot, a
+// key-delete clears the whole list, and a key-expire sets the deadline. It goes through
+// the low-level band-selecting ops, so an element that breaches the inline budget promotes
+// to the native band exactly as it did live. It reports ErrLength on a torn op payload (a
+// short LSET or LTRIM header, or a short expire deadline), the fail-closed cut recovery
+// wants; a structurally valid op that no longer applies (a pop or LSET on an absent or
+// too-short list) is a defensive no-op, since a deterministic replay never produces one.
 func applyListOp(g *reg, key []byte, op akifile.CollOpRow) error {
 	switch op.Op {
 	case listOpPushFront:
@@ -369,6 +392,13 @@ func applyListOp(g *reg, key []byte, op akifile.CollOpRow) error {
 		g.note(l)
 	case listOpDeleteKey:
 		g.drop(key)
+	case listOpExpire:
+		if len(op.SubValue) < 8 {
+			return akifile.ErrLength
+		}
+		if l := g.m[string(key)]; l != nil {
+			l.expireAt = int64(binary.LittleEndian.Uint64(op.SubValue))
+		}
 	}
 	return nil
 }

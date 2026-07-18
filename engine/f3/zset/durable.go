@@ -16,8 +16,9 @@ import (
 // those frames on reopen, the same shape the set and hash verticals took.
 //
 // The vocabulary is the minimum a zset replay needs: an add names the member and the
-// score it now holds, a remove names the member that left, and a key-delete clears the
-// whole zset. An add is logged on both a new member and a score move, since both change
+// score it now holds, a remove names the member that left, a key-delete clears the
+// whole zset, and a key-expire effect names the deadline an EXPIRE or PERSIST set. An
+// add is logged on both a new member and a score move, since both change
 // the value a replay must reproduce; the derived writers (ZINCRBY, ZADD INCR) log the
 // resolved score the mutation settled on, never the delta, which falls out naturally
 // because the effect is cut after update returns the new score. The pop and range verbs
@@ -45,13 +46,13 @@ import (
 // documents). A rebuild starts every zset as a listpack and re-promotes it on the same
 // cap the live run hit, so a -0.0 member in a native-band zset re-materializes as +0.0,
 // the same collapse a fresh listpack ZADD applies. This is the zset analog of the
-// deferred TTL edges the set and hash verticals carry, and is left as one coherent
-// follow-on with the key-expire effect slice.
+// deferred TTL edges the set and hash verticals carry, and is left as its own coherent
+// follow-on (the native-band signed-zero fidelity, orthogonal to the key deadline).
 //
-// Key TTL (a between-checkpoint EXPIRE over a zset) stays outside the durable zset until
-// a key-expire effect lands, the shared deferral every collection carries: the snapshot
-// header restores a zset's key TTL as of the last checkpoint, so a crash before the next
-// checkpoint loses only a TTL set after it, never a member.
+// Key TTL is durable: a between-checkpoint EXPIRE or PERSIST over a zset cuts its own
+// zsetOpExpire effect, and the snapshot header restores a zset's key TTL as of the last
+// checkpoint, so a crash after the last snapshot keeps the deadline the live run set
+// rather than reverting to the snapshot's.
 
 const (
 	// zsetOpAdd records that member now holds a score at key, re-driven on recovery
@@ -64,6 +65,14 @@ const (
 	// zsetOpDeleteKey records that the whole zset at key was dropped, the effect a
 	// DEL cuts so a replay clears the key instead of resurrecting its members.
 	zsetOpDeleteKey uint8 = 3
+	// zsetOpExpire records the zset's key deadline after an EXPIRE-family command or a
+	// PERSIST: SubValue is the deadline in unix milliseconds, eight bytes little-endian,
+	// 0 when the key was persisted. It carries no SubKey, since the frame key names the
+	// zset. A replay installs the deadline the live run set, so a volatile zset a crash
+	// caught between checkpoints keeps its TTL. An EXPIRE to a past instant deletes the
+	// key on the spot and cuts a key-delete instead, so this op always carries a future
+	// or cleared deadline.
+	zsetOpExpire uint8 = 4
 )
 
 // logAdd cuts an add effect for member taking score at key. It is called after update
@@ -91,6 +100,18 @@ func logRemove(cx *shard.Ctx, key, member []byte) {
 func logDeleteKey(cx *shard.Ctx, key []byte) {
 	if cx.St != nil {
 		cx.St.LogCollectionOp(key, akifile.CollKindZset, zsetOpDeleteKey, nil, nil)
+	}
+}
+
+// logExpire cuts a key-deadline effect for the zset at key: the new deadline in unix
+// milliseconds, or 0 for a PERSIST that cleared it. It is called after the deadline is
+// stored, so a replay reaches the same deadline the live run set. The EXPIRE-to-a-past-
+// instant case deletes the key and logs a key-delete instead, never this.
+func logExpire(cx *shard.Ctx, key []byte, at int64) {
+	if cx.St != nil {
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(at))
+		cx.St.LogCollectionOp(key, akifile.CollKindZset, zsetOpExpire, nil, b[:])
 	}
 }
 
@@ -129,8 +150,9 @@ func (z *zset) eachInRankWindow(lo, hiExcl int, fn func(m []byte)) {
 
 // snapHeaderLen is the fixed zset snapshot header: the key deadline in unix milliseconds
 // (0 when the zset carries no key TTL), little-endian. The header is the per-key state
-// the element run does not carry, so a snapshot restores a volatile zset's key TTL where
-// the effect log, which logs member deltas only, cannot yet.
+// the element run does not carry, so a snapshot restores a volatile zset's key TTL as of
+// the checkpoint; a between-checkpoint EXPIRE or PERSIST also cuts its own zsetOpExpire
+// effect so the deadline is durable between checkpoints.
 const snapHeaderLen = 8
 
 // Snapshot writes a whole-zset snapshot frame for every live zset on this shard, the
@@ -268,9 +290,10 @@ func applyZsetSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
 
 // applyZsetOp re-drives one zset effect onto the registry: an add creates the zset on its
 // first member and writes the score, a remove drops the member and the key on the last
-// one, and a key-delete clears the whole zset. It is the effect arm the recovery walk
-// drives. It goes through z.update, so a member that breaches a listpack cap promotes to
-// the native band exactly as it did live. A torn add score reports ErrLength.
+// one, a key-delete clears the whole zset, and a key-expire sets the deadline. It is the
+// effect arm the recovery walk drives. It goes through z.update, so a member that breaches
+// a listpack cap promotes to the native band exactly as it did live. A torn add score or a
+// torn expire payload reports ErrLength.
 func applyZsetOp(g *reg, key []byte, op akifile.CollOpRow) error {
 	switch op.Op {
 	case zsetOpAdd:
@@ -298,6 +321,13 @@ func applyZsetOp(g *reg, key []byte, op akifile.CollOpRow) error {
 		}
 	case zsetOpDeleteKey:
 		g.drop(key)
+	case zsetOpExpire:
+		if len(op.SubValue) < 8 {
+			return akifile.ErrLength
+		}
+		if z := g.m[string(key)]; z != nil {
+			z.expireAt = int64(binary.LittleEndian.Uint64(op.SubValue))
+		}
 	}
 	return nil
 }

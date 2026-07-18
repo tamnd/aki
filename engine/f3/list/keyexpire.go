@@ -32,10 +32,16 @@ func (b *listBackend) Present() (curAt int64, present bool) {
 	return b.l.expireAt, true
 }
 
-func (b *listBackend) Delete() { b.g.drop(b.key) }
+func (b *listBackend) Delete() {
+	// An EXPIRE to a past instant deletes the key on the spot; log the key-delete so a
+	// replay drops it instead of resurrecting the elements from an earlier effect.
+	logDeleteKey(b.cx, b.key)
+	b.g.drop(b.key)
+}
 
 func (b *listBackend) Store(at int64) bool {
 	b.l.expireAt = at
+	logExpire(b.cx, b.key, at)
 	return true
 }
 
@@ -79,5 +85,8 @@ func Persist(cx *shard.Ctx, key []byte) bool {
 		return false
 	}
 	l.expireAt = 0
+	// Log the cleared deadline so a replay persists the list instead of restoring the
+	// TTL a prior effect or snapshot carried.
+	logExpire(cx, key, 0)
 	return true
 }

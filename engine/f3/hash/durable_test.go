@@ -204,6 +204,113 @@ func TestHashEffectLogEmptiedKeyStaysGone(t *testing.T) {
 	}
 }
 
+// hexpireD mirrors hashBackend.Store for a future instant: set the live hash's deadline
+// and cut the expire effect that carries it, the store arm of an EXPIRE to a future
+// instant a unit test cannot drive through the reply-writing Expire.
+func hexpireD(cx *shard.Ctx, g *reg, key string, at int64) {
+	k := []byte(key)
+	h := g.live(cx, k)
+	if h == nil {
+		return
+	}
+	h.expireAt = at
+	logExpire(cx, k, at)
+}
+
+// hexpirePastD mirrors hashBackend.Delete: an EXPIRE to a past instant drops the key on
+// the spot and logs the key-delete so replay does not resurrect the fields.
+func hexpirePastD(cx *shard.Ctx, g *reg, key string) {
+	k := []byte(key)
+	logDeleteKey(cx, k)
+	g.drop(k)
+}
+
+// TestHashKeyExpireRecovers is the hash arm of the key-expire round trip: a deadline set
+// or cleared after the snapshot must survive a reopen on the effect tail alone. It covers
+// EXPIRE to a future instant, PERSIST of a snapshot-carried deadline, and EXPIRE to a past
+// instant, mirroring the set vertical's TestSetKeyExpireRecovers.
+func TestHashKeyExpireRecovers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hashkeyexpire.aki")
+	openStore := func(f *akifile.File) *store.Store {
+		s, err := store.Open(store.Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20, AkiValueLog: f, Shard: 1})
+		if err != nil {
+			t.Fatalf("open aki store: %v", err)
+		}
+		return s
+	}
+
+	f, err := akifile.Create(path, akifile.CreateOptions{ShardCount: 4, Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	s := openStore(f)
+	cx := &shard.Ctx{St: s, NowMs: 1}
+	g := registry(cx)
+
+	hsetD(cx, g, "future", "a", "1")
+	hsetD(cx, g, "persist", "b", "2")
+	hsetD(cx, g, "past", "c", "3")
+	const carried = int64(5_000_000)
+	g.m["persist"].expireAt = carried
+
+	Snapshot(cx)
+
+	const future = int64(9_000_000)
+	hexpireD(cx, g, "future", future)
+	if !Persist(cx, []byte("persist")) {
+		t.Fatal("persist of a hash with a deadline reported none removed")
+	}
+	hexpirePastD(cx, g, "past")
+
+	wantFuture := fieldsOf(g.m["future"])
+	wantPersist := fieldsOf(g.m["persist"])
+	if g.m["future"].expireAt != future {
+		t.Fatalf("first-run future TTL = %d, want %d", g.m["future"].expireAt, future)
+	}
+	if g.m["persist"].expireAt != 0 {
+		t.Fatalf("first-run persist TTL = %d, want 0", g.m["persist"].expireAt)
+	}
+	if _, ok := g.m["past"]; ok {
+		t.Fatal("past should be gone in the first run")
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	s2 := openStore(f2)
+	t.Cleanup(func() { _ = s2.Close(); _ = f2.Close() })
+	cx2 := &shard.Ctx{St: s2, NowMs: 1}
+
+	if err := Recover(cx2); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	g2 := registry(cx2)
+
+	if got := fieldsOf(g2.m["future"]); !reflect.DeepEqual(got, wantFuture) {
+		t.Fatalf("future fields after recovery = %v, want %v", got, wantFuture)
+	}
+	if got := g2.m["future"].expireAt; got != future {
+		t.Fatalf("future TTL after recovery = %d, want %d (post-snapshot expire effect must survive)", got, future)
+	}
+	if got := fieldsOf(g2.m["persist"]); !reflect.DeepEqual(got, wantPersist) {
+		t.Fatalf("persist fields after recovery = %v, want %v", got, wantPersist)
+	}
+	if got := g2.m["persist"].expireAt; got != 0 {
+		t.Fatalf("persist TTL after recovery = %d, want 0 (post-snapshot PERSIST effect must survive)", got)
+	}
+	if _, ok := g2.m["past"]; ok {
+		t.Fatal("past came back after recovery, the expire-past delete effect was lost")
+	}
+}
+
 // TestHashSnapshotRecovers is the slice-3 round trip across a checkpoint boundary (the
 // hash arm of spec 2064/f3/M8-collection-durability-plan slice 3): build hashes with
 // effects, fold them to snapshot frames the way the checkpoint dumper does, then mutate

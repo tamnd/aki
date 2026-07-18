@@ -30,10 +30,16 @@ func (b *zsetBackend) Present() (curAt int64, present bool) {
 	return b.z.expireAt, true
 }
 
-func (b *zsetBackend) Delete() { b.g.drop(b.key) }
+func (b *zsetBackend) Delete() {
+	// An EXPIRE to a past instant deletes the key on the spot; log the key-delete so a
+	// replay drops it instead of resurrecting the members from an earlier effect.
+	logDeleteKey(b.cx, b.key)
+	b.g.drop(b.key)
+}
 
 func (b *zsetBackend) Store(at int64) bool {
 	b.z.expireAt = at
+	logExpire(b.cx, b.key, at)
 	return true
 }
 
@@ -74,5 +80,8 @@ func Persist(cx *shard.Ctx, key []byte) bool {
 		return false
 	}
 	z.expireAt = 0
+	// Log the cleared deadline so a replay persists the zset instead of restoring the
+	// TTL a prior effect or snapshot carried.
+	logExpire(cx, key, 0)
 	return true
 }

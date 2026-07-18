@@ -248,6 +248,96 @@ func TestListEffectLogRecovers(t *testing.T) {
 // after it, so the recovered state is the composition, and a key TTL taken at snapshot
 // time survives. It also proves a snapshot-restored key an effect empties is dropped and
 // the pre-snapshot effects do not leak past the snapshot reset.
+// lexpireD mirrors listBackend.Store for a future instant: set the live list's deadline
+// and cut the expire effect that carries it, the store arm of an EXPIRE to a future
+// instant a unit test cannot drive through the reply-writing Expire.
+func lexpireD(cx *shard.Ctx, g *reg, key string, at int64) {
+	k := []byte(key)
+	l := g.live(cx, k)
+	if l == nil {
+		return
+	}
+	l.expireAt = at
+	logExpire(cx, k, at)
+}
+
+// lexpirePastD mirrors listBackend.Delete: an EXPIRE to a past instant drops the key on
+// the spot and logs the key-delete so replay does not resurrect the elements.
+func lexpirePastD(cx *shard.Ctx, g *reg, key string) {
+	k := []byte(key)
+	logDeleteKey(cx, k)
+	g.drop(k)
+}
+
+// TestListKeyExpireRecovers is the list arm of the key-expire round trip: a deadline set
+// or cleared after the snapshot must survive a reopen on the effect tail alone. It covers
+// EXPIRE to a future instant, PERSIST of a snapshot-carried deadline, and EXPIRE to a past
+// instant, mirroring the set vertical's TestSetKeyExpireRecovers.
+func TestListKeyExpireRecovers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "listkeyexpire.aki")
+	f, s := listDurStore(t, path, true)
+	cx := &shard.Ctx{St: s, NowMs: 1}
+	g := registry(cx)
+
+	pushD(cx, g, "future", false, "a", "b")
+	pushD(cx, g, "persist", false, "c", "d")
+	pushD(cx, g, "past", false, "e", "f")
+	const carried = int64(5_000_000)
+	g.m["persist"].expireAt = carried
+
+	Snapshot(cx)
+
+	const future = int64(9_000_000)
+	lexpireD(cx, g, "future", future)
+	if !Persist(cx, []byte("persist")) {
+		t.Fatal("persist of a list with a deadline reported none removed")
+	}
+	lexpirePastD(cx, g, "past")
+
+	wantFuture := elements(g.m["future"])
+	wantPersist := elements(g.m["persist"])
+	if g.m["future"].expireAt != future {
+		t.Fatalf("first-run future TTL = %d, want %d", g.m["future"].expireAt, future)
+	}
+	if g.m["persist"].expireAt != 0 {
+		t.Fatalf("first-run persist TTL = %d, want 0", g.m["persist"].expireAt)
+	}
+	if _, ok := g.m["past"]; ok {
+		t.Fatal("past should be gone in the first run")
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	f2, s2 := listDurStore(t, path, false)
+	t.Cleanup(func() { _ = s2.Close(); _ = f2.Close() })
+	cx2 := &shard.Ctx{St: s2, NowMs: 1}
+	if err := Recover(cx2); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	g2 := registry(cx2)
+
+	if got := elements(g2.m["future"]); !reflect.DeepEqual(got, wantFuture) {
+		t.Fatalf("future elements after recovery = %v, want %v", got, wantFuture)
+	}
+	if got := g2.m["future"].expireAt; got != future {
+		t.Fatalf("future TTL after recovery = %d, want %d (post-snapshot expire effect must survive)", got, future)
+	}
+	if got := elements(g2.m["persist"]); !reflect.DeepEqual(got, wantPersist) {
+		t.Fatalf("persist elements after recovery = %v, want %v", got, wantPersist)
+	}
+	if got := g2.m["persist"].expireAt; got != 0 {
+		t.Fatalf("persist TTL after recovery = %d, want 0 (post-snapshot PERSIST effect must survive)", got)
+	}
+	if _, ok := g2.m["past"]; ok {
+		t.Fatal("past came back after recovery, the expire-past delete effect was lost")
+	}
+}
+
 func TestListSnapshotRecovers(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "listsnap.aki")
 	f, s := listDurStore(t, path, true)

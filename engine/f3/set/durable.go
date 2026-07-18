@@ -14,15 +14,15 @@ import (
 // (collectionseam.go) and rebuilds the registry from those frames on reopen.
 //
 // The vocabulary is the minimum a set replay needs: an add names the member that
-// joined, a remove names the member that left, and a key-delete clears the whole
-// set. An emptied set needs no explicit delete effect, because replaying its
-// removes empties it and Recover drops a set that reaches zero cardinality, the
-// same last-member-leaves rule the live command follows. The non-deterministic and
-// derived commands (SPOP, and later SMOVE and the STORE forms) log the resolved
-// member the mutation settled on, never the draw or the source verb, which falls
-// out naturally because the effect is cut after the mutation resolves. Every log
-// helper is a no-op on a store with no .aki handle, so the pure in-memory path is
-// unchanged.
+// joined, a remove names the member that left, a key-delete clears the whole set,
+// and a key-expire effect names the deadline an EXPIRE or PERSIST set. An emptied
+// set needs no explicit delete effect, because replaying its removes empties it and
+// Recover drops a set that reaches zero cardinality, the same last-member-leaves
+// rule the live command follows. The non-deterministic and derived commands (SPOP,
+// and later SMOVE and the STORE forms) log the resolved member the mutation settled
+// on, never the draw or the source verb, which falls out naturally because the
+// effect is cut after the mutation resolves. Every log helper is a no-op on a store
+// with no .aki handle, so the pure in-memory path is unchanged.
 //
 // Slice 3 adds the snapshot half. A long-lived set accretes an unbounded effect tail
 // between checkpoints, so the checkpoint folds each live set to one whole-set
@@ -43,6 +43,14 @@ const (
 	// setOpDeleteKey records that the whole set at key was dropped, the effect a
 	// DEL cuts so a replay clears the key instead of resurrecting its members.
 	setOpDeleteKey uint8 = 3
+	// setOpExpire records the set's key deadline after an EXPIRE-family command or a
+	// PERSIST: SubValue is the deadline in unix milliseconds, eight bytes little-
+	// endian, 0 when the key was persisted. It carries no SubKey, since the frame key
+	// names the set. A replay installs the deadline the live run set, so a volatile set
+	// a crash caught between checkpoints keeps its TTL instead of reverting to the last
+	// snapshot's. An EXPIRE to a past instant deletes the key on the spot and cuts a
+	// key-delete instead, so this op always carries a future or cleared deadline.
+	setOpExpire uint8 = 4
 )
 
 // logAdd cuts an add effect for member joining the set at key. It is called only
@@ -71,13 +79,25 @@ func logDeleteKey(cx *shard.Ctx, key []byte) {
 	}
 }
 
+// logExpire cuts a key-deadline effect for the set at key: the new deadline in unix
+// milliseconds, or 0 for a PERSIST that cleared it. It is called after the deadline
+// is stored, so a replay reaches the same deadline the live run set. The EXPIRE-to-a-
+// past-instant case deletes the key and logs a key-delete instead, never this.
+func logExpire(cx *shard.Ctx, key []byte, at int64) {
+	if cx.St != nil {
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(at))
+		cx.St.LogCollectionOp(key, akifile.CollKindSet, setOpExpire, nil, b[:])
+	}
+}
+
 // snapHeaderLen is the fixed set snapshot header: the key deadline in unix
 // milliseconds (0 when the set carries no TTL), little-endian. The header is the
 // per-key state the element run does not carry, so a snapshot restores a volatile
-// set's TTL where the effect log, which logs member deltas only, cannot yet. A
-// between-checkpoint EXPIRE stays outside the durable set until a key-expire effect
-// lands (a deferred follow-on), so a crash before the next checkpoint loses only a
-// TTL set after the last snapshot, never a member.
+// set's TTL as of the checkpoint. A between-checkpoint EXPIRE or PERSIST also cuts
+// its own setOpExpire effect, so a volatile set a crash caught after the last
+// snapshot keeps the deadline the live run set instead of reverting to the
+// snapshot's, closing the gap the member-delta effects left.
 const snapHeaderLen = 8
 
 // Snapshot writes a whole-set snapshot frame for every live set on this shard, the
@@ -142,8 +162,7 @@ func Recover(cx *shard.Ctx) error {
 			return applySetSnapshot(g, key, snap)
 		},
 		func(key []byte, op akifile.CollOpRow) error {
-			applySetOp(g, key, op)
-			return nil
+			return applySetOp(g, key, op)
 		})
 }
 
@@ -176,9 +195,11 @@ func applySetSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
 
 // applySetOp re-drives one set effect onto the registry: an add creates the set on
 // its first member and adds, a remove drops the member and the key on the last one,
-// and a key-delete clears the whole set. It is the effect arm both a live replay and
-// the recovery walk share.
-func applySetOp(g *reg, key []byte, op akifile.CollOpRow) {
+// a key-delete clears the whole set, and a key-expire sets the deadline. It is the
+// effect arm both a live replay and the recovery walk share. It reports ErrLength on
+// a torn expire payload, the fail-closed cut recovery wants; an expire on an absent
+// key is a defensive no-op, since a deterministic replay never produces one.
+func applySetOp(g *reg, key []byte, op akifile.CollOpRow) error {
 	switch op.Op {
 	case setOpAdd:
 		s := g.m[string(key)]
@@ -191,7 +212,7 @@ func applySetOp(g *reg, key []byte, op akifile.CollOpRow) {
 	case setOpRemove:
 		s := g.m[string(key)]
 		if s == nil {
-			return
+			return nil
 		}
 		s.rem(op.SubKey)
 		if s.card() == 0 {
@@ -201,7 +222,15 @@ func applySetOp(g *reg, key []byte, op akifile.CollOpRow) {
 		}
 	case setOpDeleteKey:
 		g.drop(key)
+	case setOpExpire:
+		if len(op.SubValue) < 8 {
+			return akifile.ErrLength
+		}
+		if s := g.m[string(key)]; s != nil {
+			s.expireAt = int64(binary.LittleEndian.Uint64(op.SubValue))
+		}
 	}
+	return nil
 }
 
 // eachEntry walks a length-prefixed member run forward, calling fn for each member,

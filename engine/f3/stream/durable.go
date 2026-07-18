@@ -22,7 +22,8 @@ import (
 // so a replay reproduces the exact live set regardless of how the rebuilt stream happens
 // to pack its blocks, which an approximate whole-block trim would otherwise make
 // layout-dependent; an XSETID names the new counters; a key-delete clears the whole
-// stream. Recover re-drives the effects in the order they were cut, over the low-level
+// stream; and a key-expire effect names the deadline an EXPIRE or PERSIST set. Recover
+// re-drives the effects in the order they were cut, over the low-level
 // stream methods (appendEntry, delete, trim), so the same op sequence reconstructs the
 // exact stream. Each helper is a no-op on a store with no .aki handle, so the pure
 // in-memory path is byte-unchanged.
@@ -49,11 +50,11 @@ import (
 // no groups, so a group-bearing stream loses its delivery state across a crash before that
 // follow-on lands, the same bounded gap the deferred set and list arcs carry.
 //
-// Key TTL follows the set, hash, and list model: the snapshot header carries the key
-// deadline, but a between-checkpoint EXPIRE and the active and lazy reaps stay outside the
-// durable stream until the shared key-expire effect lands (the deferred follow-on every
-// collection type shares), so a crash before the next checkpoint loses a TTL set after the
-// last snapshot, never an entry.
+// Key TTL is durable: the snapshot header carries the key deadline as of the checkpoint,
+// and a between-checkpoint EXPIRE or PERSIST cuts its own streamOpExpire effect, so a
+// crash after the last snapshot keeps the deadline the live run set. The lazy reap needs
+// no effect of its own: a replay reconstructs the same passed deadline, so the rebuilt key
+// falls out on its first touch exactly as it did live.
 
 const (
 	// streamOpAdd records an XADD: an entry with a fixed ID entered the stream at key.
@@ -77,6 +78,14 @@ const (
 	// streamOpDeleteKey records that the whole stream at key was dropped, the effect a
 	// DEL cuts so a replay clears the key instead of resurrecting its entries.
 	streamOpDeleteKey uint8 = 5
+	// streamOpExpire records the stream's key deadline after an EXPIRE-family command or a
+	// PERSIST: SubValue is the deadline in unix milliseconds, eight bytes little-endian,
+	// 0 when the key was persisted. It carries no SubKey, since the frame key names the
+	// stream. A replay installs the deadline the live run set, so a volatile stream a crash
+	// caught between checkpoints keeps its TTL. An EXPIRE to a past instant deletes the key
+	// on the spot and cuts a key-delete instead, so this op always carries a future or
+	// cleared deadline.
+	streamOpExpire uint8 = 6
 )
 
 // logAdd cuts an XADD effect for the entry the command just appended: the assigned ID and
@@ -145,6 +154,19 @@ func logDeleteKey(cx *shard.Ctx, key []byte) {
 		return
 	}
 	cx.St.LogCollectionOp(key, akifile.CollKindStream, streamOpDeleteKey, nil, nil)
+}
+
+// logExpire cuts a key-deadline effect for the stream at key: the new deadline in unix
+// milliseconds, or 0 for a PERSIST that cleared it. It is called after the deadline is
+// stored, so a replay reaches the same deadline the live run set. The EXPIRE-to-a-past-
+// instant case deletes the key and logs a key-delete instead, never this.
+func logExpire(cx *shard.Ctx, key []byte, at int64) {
+	if cx.St == nil {
+		return
+	}
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], uint64(at))
+	cx.St.LogCollectionOp(key, akifile.CollKindStream, streamOpExpire, nil, b[:])
 }
 
 // snapHeaderLen is the fixed stream snapshot header: lastID (16 bytes big-endian) then
@@ -265,9 +287,10 @@ func applyStreamSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
 // tombstones an ID, a trim drops every entry below a boundary ID, an XSETID grafts the
 // counters, and a key-delete clears the whole stream. It goes through the low-level stream
 // methods, so an entry that breaches an inline cap upgrades to the native band exactly as
-// it did live. It reports ErrLength on a torn op payload, the fail-closed cut recovery
-// wants; a structurally valid op that no longer applies (a delete or trim on an absent
-// stream) is a defensive no-op, since a deterministic replay never produces one.
+// it did live. A key-expire sets the deadline. It reports ErrLength on a torn op payload,
+// the fail-closed cut recovery wants; a structurally valid op that no longer applies (a
+// delete, trim, or expire on an absent stream) is a defensive no-op, since a deterministic
+// replay never produces one.
 func applyStreamOp(g *reg, key []byte, op akifile.CollOpRow) error {
 	switch op.Op {
 	case streamOpAdd:
@@ -315,6 +338,13 @@ func applyStreamOp(g *reg, key []byte, op akifile.CollOpRow) error {
 		g.note(s)
 	case streamOpDeleteKey:
 		g.drop(key)
+	case streamOpExpire:
+		if len(op.SubValue) < 8 {
+			return akifile.ErrLength
+		}
+		if s := g.m[string(key)]; s != nil {
+			s.expireAt = int64(binary.LittleEndian.Uint64(op.SubValue))
+		}
 	}
 	return nil
 }
