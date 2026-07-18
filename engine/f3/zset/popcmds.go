@@ -60,6 +60,7 @@ func zpopImpl(cx *shard.Ctx, args [][]byte, r shard.Reply, min bool) {
 	out := resp.AppendArrayHeader(cx.Aux[:0], npop*2)
 	var sc [40]byte
 	z.pop(min, count, func(m []byte, s float64) {
+		logRemove(cx, args[0], m)
 		out = resp.AppendBulk(out, m)
 		out = resp.AppendBulk(out, resp.FormatScore(sc[:0], s))
 	})
@@ -140,6 +141,7 @@ func Zmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		out = resp.AppendArrayHeader(out, npop)
 		var sc [40]byte
 		z.pop(min, count, func(m []byte, s float64) {
+			logRemove(cx, key, m)
 			out = resp.AppendArrayHeader(out, 2)
 			out = resp.AppendBulk(out, m)
 			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], s))
