@@ -21,7 +21,6 @@ import (
 	"github.com/tamnd/aki/engine/obs1"
 	"github.com/tamnd/aki/engine/obs1/replay"
 	"github.com/tamnd/aki/engine/obs1/shard"
-	"github.com/tamnd/aki/engine/obs1/store"
 )
 
 // ClusterMapKey is the production key route: cluster hash slot to slot
@@ -91,8 +90,8 @@ func BootDurability(ctx context.Context, cfg BootConfig, rt *shard.Runtime) (*Bo
 		}
 	}
 
-	ap := replay.New(replay.Config{Store: func(key []byte) *store.Store {
-		return rt.BootStore(rt.ShardOf(key))
+	ap := replay.New(replay.Config{Ctx: func(key []byte) *shard.Ctx {
+		return rt.BootCtx(rt.ShardOf(key))
 	}})
 	r, err := obs1.Recover(ctx, obs1.RecoverConfig{
 		Store: cfg.Store, Prefix: cfg.Prefix, Fallback: cfg.Fallback,
