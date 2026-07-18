@@ -21,3 +21,17 @@ func Encoding(cx *shard.Ctx, key []byte) (string, bool) {
 	}
 	return "", false
 }
+
+// MemoryUsage reports the approximate resident bytes the zset at key charges and
+// whether a zset lives there, the MEMORY USAGE contribution for a zset key. It is
+// the per-collection footprint the demote loop weighs, and it builds no registry
+// when none exists, the same non-creating discipline as Encoding.
+func MemoryUsage(cx *shard.Ctx, key []byte) (uint64, bool) {
+	if cx.ZColl == nil {
+		return 0, false
+	}
+	if z := cx.ZColl.(*reg).live(cx, key); z != nil {
+		return z.residentBytes(), true
+	}
+	return 0, false
+}

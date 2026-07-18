@@ -30,6 +30,20 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	hash.Object(cx, args, r)
 }
 
+// MemoryUsage reports the approximate resident bytes the stream at key charges
+// and whether a stream lives there, the MEMORY USAGE contribution for a stream
+// key. It is the per-collection footprint the demote loop weighs, reached through
+// regs.Load so a read-only probe builds no stream registry on a shard that never
+// ran a stream command.
+func MemoryUsage(cx *shard.Ctx, key []byte) (uint64, bool) {
+	if v, ok := regs.Load(cx.St); ok {
+		if s := v.(*reg).live(cx, key); s != nil {
+			return s.residentBytes(), true
+		}
+	}
+	return 0, false
+}
+
 // eqFold is a case-insensitive ASCII compare of b against the uppercase word s,
 // the subcommand token check without allocating a lowercase copy.
 func eqFold(b []byte, s string) bool {

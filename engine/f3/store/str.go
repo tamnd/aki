@@ -347,6 +347,28 @@ func (s *Store) StrLen(key []byte, now int64) (int64, bool) {
 	return int64(s.vlen(addr)), true
 }
 
+// MemoryUsage reports the approximate resident bytes a string key charges and
+// its presence, the MEMORY USAGE answer for a string. A resident record charges
+// exactly what recBytes cancels on delete: the header, the expiry slot when set,
+// the aligned key, and the reserved value capacity. A cold-tier record keeps its
+// header and key in the arena but holds the value in the cold region, so the cold
+// value length stands in for the value bytes there. Presence follows the same
+// lazy-expiry rule as StrLen, so an expired key reports (0, false).
+func (s *Store) MemoryUsage(key []byte, now int64) (uint64, bool) {
+	slot, addr, _ := s.findLive(Hash(key), key, now)
+	if addr == 0 {
+		return 0, false
+	}
+	if slotCold(*slot) {
+		n := hdrSize + align8(s.klen(addr)) + uint64(s.coldVlen(addr))
+		if s.arena.buf[addr+offFlags]&flagHasTTL != 0 {
+			n += 8
+		}
+		return n, true
+	}
+	return s.recBytes(addr), true
+}
+
 // Del removes key under the lazy-expiry rule: deleting an already expired
 // record reports false, the same answer the client would get from any read.
 func (s *Store) Del(key []byte, now int64) bool {

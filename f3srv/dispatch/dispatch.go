@@ -720,6 +720,13 @@ func init() {
 	// layer, since f3 shares no allocations between keys.
 	register("OBJECT", objectCmd, 1, -1, false)
 	table["OBJECT"].keyAt = 1
+
+	// MEMORY USAGE key routes on the key after its subcommand token, the same
+	// keyAt=1 shape as OBJECT, so it reaches the owning shard. The other MEMORY
+	// subcommands (STATS, DOCTOR, HELP) carry no key and round-robin, landing on
+	// the unknown-subcommand error until a later slice wires them.
+	register("MEMORY", memoryCmd, 1, -1, false)
+	table["MEMORY"].keyAt = 1
 }
 
 // Handlers returns the op-indexed handler vector for Runtime.Use.
@@ -1157,6 +1164,64 @@ func objectRefcount(cx *shard.Ctx, key []byte, r shard.Reply) {
 		return
 	}
 	r.Err("ERR no such key")
+}
+
+// memoryCmd answers the MEMORY introspection verb. USAGE reports an approximate
+// resident byte size for one key across every keyspace, an integer for a present
+// key and a null for a missing one, matching Redis. The SAMPLES option Redis uses
+// to bound nested-element sampling for aggregate types is accepted and ignored,
+// since each type's footprint is already an O(1) figure. STATS and DOCTOR are the
+// unknown-subcommand error until a later slice wires them.
+func memoryCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	if tokenIs(args[0], "USAGE") {
+		switch {
+		case len(args) == 2:
+		case len(args) == 4 && tokenIs(args[2], "SAMPLES"):
+			if _, err := strconv.Atoi(string(args[3])); err != nil {
+				r.Err("ERR value is not an integer or out of range")
+				return
+			}
+		default:
+			r.Err("ERR wrong number of arguments for 'memory|usage' command")
+			return
+		}
+		memoryUsage(cx, args[1], r)
+		return
+	}
+	r.Err("ERR Unknown MEMORY subcommand or wrong number of arguments. Try MEMORY HELP.")
+}
+
+// memoryUsage answers MEMORY USAGE key: the string store first, then each
+// collection keyspace in the OBJECT chain order, so the one key that exists
+// anywhere reports its footprint and a key present nowhere is the null Redis
+// returns. Each probe is read-only and non-creating, honouring the key deadline
+// so a lazily-expired key reads as absent.
+func memoryUsage(cx *shard.Ctx, key []byte, r shard.Reply) {
+	if n, ok := cx.St.MemoryUsage(key, cx.NowMs); ok {
+		r.Int(int64(n))
+		return
+	}
+	if n, ok := set.MemoryUsage(cx, key); ok {
+		r.Int(int64(n))
+		return
+	}
+	if n, ok := zset.MemoryUsage(cx, key); ok {
+		r.Int(int64(n))
+		return
+	}
+	if n, ok := hash.MemoryUsage(cx, key); ok {
+		r.Int(int64(n))
+		return
+	}
+	if n, ok := list.MemoryUsage(cx, key); ok {
+		r.Int(int64(n))
+		return
+	}
+	if n, ok := stream.MemoryUsage(cx, key); ok {
+		r.Int(int64(n))
+		return
+	}
+	r.Null()
 }
 
 // keyDeadline resolves a key's absolute unix-ms expiry across every keyspace,

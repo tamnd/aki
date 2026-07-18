@@ -64,3 +64,16 @@ func stringEncoding(v []byte) string {
 	}
 	return "raw"
 }
+
+// MemoryUsage reports the approximate resident bytes the set at key charges and
+// whether a set lives there, the MEMORY USAGE contribution for a set key. It is
+// the same per-collection footprint the demote loop weighs, and it builds no
+// registry when none exists, the read-only discipline every probe keeps.
+func MemoryUsage(cx *shard.Ctx, key []byte) (uint64, bool) {
+	if g, ok := cx.Coll.(*reg); ok {
+		if s := g.live(cx, key); s != nil {
+			return s.residentBytes(), true
+		}
+	}
+	return 0, false
+}
