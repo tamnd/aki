@@ -64,6 +64,7 @@ func pushCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front, create bool) {
 		} else {
 			l.pushBack(v)
 		}
+		logPush(cx, key, v, front)
 	}
 	// The reply is the length after the push, before any blocked client is
 	// served: Redis signals the key ready and returns the pushed length, then
@@ -111,6 +112,7 @@ func popCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 			return
 		}
 		v := popOne(l, front)
+		logPop(cx, key, front)
 		if l.length() == 0 {
 			g.drop(key)
 		} else {
@@ -136,6 +138,7 @@ func popCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 	out := resp.AppendArrayHeader(cx.Aux[:0], popped)
 	for i := 0; i < popped; i++ {
 		out = resp.AppendBulk(out, popOne(l, front))
+		logPop(cx, key, front)
 	}
 	cx.Aux = out
 	r.Raw(out)
@@ -218,6 +221,7 @@ func Lset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	l.setAt(i, args[2])
+	logSet(cx, args[0], i, args[2])
 	// LSET can never empty a list, so the key always survives; note its new
 	// footprint (an element rewrite can grow or shrink the packed bytes).
 	g.note(l)
@@ -275,10 +279,10 @@ func Ltrim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	lo, hi, ok := clampRange(int(start), int(stop), l.length())
 	if !ok {
-		l.trim(1, 0) // empty range, clears the list
-	} else {
-		l.trim(lo, hi)
+		lo, hi = 1, 0 // empty range, clears the list
 	}
+	l.trim(lo, hi)
+	logTrim(cx, key, lo, hi)
 	if l.length() == 0 {
 		g.drop(key)
 	} else {
@@ -307,6 +311,9 @@ func Lrem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	removed := l.remove(int(count), args[2])
+	if removed > 0 {
+		logRem(cx, key, int(count), args[2])
+	}
 	if l.length() == 0 {
 		g.drop(key)
 	} else if removed > 0 {
@@ -343,6 +350,7 @@ func Linsert(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Int(-1)
 		return
 	}
+	logInsert(cx, args[0], args[2], args[3], before)
 	// LINSERT never empties a list; on a successful insert (pivot found) the key
 	// survives with a grown footprint. A pivot-absent insert returned above without
 	// mutating, so it posts no delta.
