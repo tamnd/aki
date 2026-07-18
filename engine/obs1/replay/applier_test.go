@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/tamnd/aki/engine/obs1"
+	"github.com/tamnd/aki/engine/obs1/hash"
 	"github.com/tamnd/aki/engine/obs1/replay"
 	"github.com/tamnd/aki/engine/obs1/set"
 	"github.com/tamnd/aki/engine/obs1/shard"
@@ -291,19 +292,114 @@ func TestApplierSetCorruptionIsLoud(t *testing.T) {
 	}
 }
 
+// TestApplierHashPlane replays the emitter shapes writelog.go frames for
+// hashes: collnew plus hset on create, an overwriting hset, hdel, the
+// hdel plus colldrop pair, and the hexpire deadline set, clear, and the
+// restore that rides behind a TTL-preserving verb's hset.
+func TestApplierHashPlane(t *testing.T) {
+	a, cx := newApplier(t)
+
+	fv := func(ss ...string) []obs1.FieldValue {
+		out := make([]obs1.FieldValue, len(ss)/2)
+		for i := range out {
+			out[i] = obs1.FieldValue{Field: []byte(ss[2*i]), Value: []byte(ss[2*i+1])}
+		}
+		return out
+	}
+	fl := func(ss ...string) [][]byte {
+		out := make([][]byte, len(ss))
+		for i, s := range ss {
+			out[i] = []byte(s)
+		}
+		return out
+	}
+	apply(t, a, 0, frame(t, 1, "h", obs1.CollNew{Type: obs1.CollHash}))
+	apply(t, a, 0, frame(t, 2, "h", obs1.CollDelta{Sub: obs1.HSet{Pairs: fv("f1", "v1", "f2", "v2")}}))
+	apply(t, a, 0, frame(t, 3, "h", obs1.CollDelta{Sub: obs1.HExpire{AtMs: 7_000_000_000_000, Fields: fl("f1")}}))
+	apply(t, a, 0, frame(t, 4, "h", obs1.CollDelta{Sub: obs1.HSet{Pairs: fv("f1", "v1b")}}))
+	apply(t, a, 0, frame(t, 5, "h", obs1.CollDelta{Sub: obs1.HExpire{AtMs: 8_000_000_000_000, Fields: fl("f1")}}))
+	apply(t, a, 0, frame(t, 6, "h", obs1.CollDelta{Sub: obs1.HExpire{AtMs: 0, Fields: fl("f1")}}))
+	apply(t, a, 0, frame(t, 7, "h", obs1.CollDelta{Sub: obs1.HDel{Fields: fl("f2")}}))
+	if err := hash.ReplayHDel(cx, []byte("h"), fl("f1")); err != nil {
+		t.Fatalf("f1 should survive the replay: %v", err)
+	}
+	if err := hash.ReplayHDel(cx, []byte("h"), fl("f2")); err == nil {
+		t.Fatalf("f2 survived its hdel")
+	}
+
+	apply(t, a, 0, frame(t, 8, "hd", obs1.CollNew{Type: obs1.CollHash}))
+	apply(t, a, 0, frame(t, 9, "hd", obs1.CollDelta{Sub: obs1.HSet{Pairs: fv("x", "1")}}))
+	apply(t, a, 0, frame(t, 10, "hd", obs1.CollDelta{Sub: obs1.HDel{Fields: fl("x")}}))
+	apply(t, a, 0, frame(t, 11, "hd", obs1.CollDrop{}))
+	if hash.ReplayDrop(cx, []byte("hd")) {
+		t.Fatalf("hd survived its colldrop")
+	}
+	if err := a.Finish(); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if got := a.Stats(); got.HSets != 3 || got.HDels != 2 || got.HExpires != 3 || got.CollNews != 2 || got.CollDrops != 1 {
+		t.Fatalf("stats %+v, want the hash plane counts", got)
+	}
+}
+
+// TestApplierHashCorruptionIsLoud drives the divergences the hash plane
+// must refuse: deltas on a missing hash, an hdel of an absent field, and
+// an hexpire naming a field that is not there.
+func TestApplierHashCorruptionIsLoud(t *testing.T) {
+	pairs := []obs1.FieldValue{{Field: []byte("f"), Value: []byte("v")}}
+	one := [][]byte{[]byte("f")}
+	cases := []struct {
+		name string
+		ops  []obs1.Op
+		want string
+	}{
+		{"hset on missing hash", []obs1.Op{obs1.CollDelta{Sub: obs1.HSet{Pairs: pairs}}}, "no hash exists"},
+		{"hdel on missing hash", []obs1.Op{obs1.CollDelta{Sub: obs1.HDel{Fields: one}}}, "no hash exists"},
+		{"hexpire on missing hash", []obs1.Op{obs1.CollDelta{Sub: obs1.HExpire{AtMs: 5, Fields: one}}}, "no hash exists"},
+		{"absent field hdel", []obs1.Op{
+			obs1.CollNew{Type: obs1.CollHash},
+			obs1.CollDelta{Sub: obs1.HSet{Pairs: pairs}},
+			obs1.CollDelta{Sub: obs1.HDel{Fields: [][]byte{[]byte("ghost")}}},
+		}, "is not in hash"},
+		{"absent field hexpire", []obs1.Op{
+			obs1.CollNew{Type: obs1.CollHash},
+			obs1.CollDelta{Sub: obs1.HSet{Pairs: pairs}},
+			obs1.CollDelta{Sub: obs1.HExpire{AtMs: 5, Fields: [][]byte{[]byte("ghost")}}},
+		}, "is not in hash"},
+		{"collnew hash consumed by srem", []obs1.Op{
+			obs1.CollNew{Type: obs1.CollHash},
+			obs1.CollDelta{Sub: obs1.SRem{Members: one}},
+		}, "followed by sub-op"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _ := newApplier(t)
+			var err error
+			for i, op := range tc.ops {
+				if err = a.Apply(0, frame(t, uint64(i+1), "c", op)); err != nil {
+					break
+				}
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
 // TestApplierRefusesUnwiredKinds keeps the loud refusal for the planes
 // that have not landed: the other collection types and the consumer
 // group vocabulary.
 func TestApplierRefusesUnwiredKinds(t *testing.T) {
 	a, _ := newApplier(t)
-	if err := a.Apply(0, frame(t, 1, "h", obs1.CollNew{Type: obs1.CollHash})); err == nil ||
+	if err := a.Apply(0, frame(t, 1, "z", obs1.CollNew{Type: obs1.CollZSet})); err == nil ||
 		!strings.Contains(err.Error(), "not wired for replay yet") {
-		t.Fatalf("collnew hash: %v", err)
+		t.Fatalf("collnew zset: %v", err)
 	}
-	pairs := []obs1.FieldValue{{Field: []byte("f"), Value: []byte("v")}}
-	if err := a.Apply(0, frame(t, 2, "h", obs1.CollDelta{Sub: obs1.HSet{Pairs: pairs}})); err == nil ||
+	entries := []obs1.ScoreMember{{Score: 1, Member: []byte("m")}}
+	if err := a.Apply(0, frame(t, 2, "z", obs1.CollDelta{Sub: obs1.ZAdd{Entries: entries}})); err == nil ||
 		!strings.Contains(err.Error(), "not wired for replay yet") {
-		t.Fatalf("colldelta hset: %v", err)
+		t.Fatalf("colldelta zadd: %v", err)
 	}
 	gd := obs1.GroupDelta{Sub: obs1.GNew{Group: []byte("g")}}
 	if err := a.Apply(0, frame(t, 3, "st", gd)); err == nil || !strings.Contains(err.Error(), "not wired yet") {
