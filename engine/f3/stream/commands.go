@@ -75,6 +75,9 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if newKey {
 		g.m[string(args[0])] = s
 	}
+	// Cut the add effect after the entry is in the stream, so a replay re-drives the
+	// append with the same ID and reproduces the exact entry.
+	logAdd(cx, args[0], id, fields)
 	if trimSet {
 		removed := s.trim(trim)
 		// Exact trim tombstones the boundary block's overshoot in place, leaving a
@@ -83,6 +86,11 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		// exact case, so the maintainer visits it.
 		if removed > 0 && !trim.approx && s.kind == bandNative {
 			g.markDirty(s)
+		}
+		// Record the trim as the exact boundary it reached, so a replay drops the same
+		// entries whatever blocks the rebuilt stream packs.
+		if removed > 0 {
+			logTrimBoundary(cx, args[0], s)
 		}
 	}
 	// The appended entry is a read event for any client blocked on this key: its
@@ -132,6 +140,11 @@ func Xtrim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// approximate trim reclaims whole blocks and leaves nothing to collect.
 	if removed > 0 && !sp.approx && s.kind == bandNative {
 		g.markDirty(s)
+	}
+	// Record the trim as the exact boundary it reached, so a replay drops the same
+	// entries whatever blocks the rebuilt stream packs.
+	if removed > 0 {
+		logTrimBoundary(cx, args[0], s)
 	}
 	g.note(s)
 	r.Int(int64(removed))
@@ -191,6 +204,9 @@ func Xdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	for _, id := range ids {
 		if s.delete(id) {
 			n++
+			// Cut a delete effect per ID actually tombstoned, so the effect tail carries no
+			// no-op deletes and a replay tombstones the same entries.
+			logDel(cx, args[0], id)
 		}
 	}
 	// A tombstone in a native sealed block accrues dead bytes the gc pass reclaims;
@@ -246,6 +262,9 @@ func Xsetid(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if maxDeleted.set {
 		s.maxDeletedID = maxDeleted.id
 	}
+	// Record the grafted counters, so a replay reaches the same lastID, add count, and
+	// max-deleted ID.
+	logSetID(cx, args[0], s)
 	r.Status("OK")
 }
 

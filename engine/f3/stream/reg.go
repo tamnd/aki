@@ -172,6 +172,7 @@ func Delete(cx *shard.Ctx, key []byte) bool {
 	if g.live(cx, key) == nil {
 		return false
 	}
+	logDeleteKey(cx, key)
 	g.drop(key)
 	return true
 }
