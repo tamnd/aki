@@ -15,8 +15,10 @@ import (
 // reopen, the same shape the set vertical took.
 //
 // The vocabulary is the minimum a hash replay needs: a set names the field and the
-// value it now holds, a field-delete names the field that left, and a key-delete
-// clears the whole hash. A set is logged on both a new field and an overwrite, since
+// value it now holds, a field-delete names the field that left, a key-delete clears
+// the whole hash, and a key-expire effect names the deadline an EXPIRE or PERSIST set
+// (the whole-key deadline, distinct from the per-field HEXPIRE TTLs still deferred
+// below). A set is logged on both a new field and an overwrite, since
 // both change the value a replay must reproduce; HSETNX logs only when it actually
 // sets. The derived writers (HINCRBY, HINCRBYFLOAT) log the resolved value the
 // mutation settled on, never the delta, which falls out naturally because the effect
@@ -56,6 +58,15 @@ const (
 	// hashOpDeleteKey records that the whole hash at key was dropped, the effect a
 	// DEL cuts so a replay clears the key instead of resurrecting its fields.
 	hashOpDeleteKey uint8 = 3
+	// hashOpExpire records the hash's key deadline after an EXPIRE-family command or a
+	// PERSIST: SubValue is the deadline in unix milliseconds, eight bytes little-endian,
+	// 0 when the key was persisted. It carries no SubKey, since the frame key names the
+	// hash, and it is the whole-key deadline, not a per-field HEXPIRE TTL. A replay
+	// installs the deadline the live run set, so a volatile hash a crash caught between
+	// checkpoints keeps its TTL. An EXPIRE to a past instant deletes the key on the spot
+	// and cuts a key-delete instead, so this op always carries a future or cleared
+	// deadline.
+	hashOpExpire uint8 = 4
 )
 
 // logSet cuts a set effect for field taking value at key. It is called after the
@@ -84,12 +95,27 @@ func logDeleteKey(cx *shard.Ctx, key []byte) {
 	}
 }
 
+// logExpire cuts a key-deadline effect for the hash at key: the new whole-key deadline
+// in unix milliseconds, or 0 for a PERSIST that cleared it. It is called after the
+// deadline is stored, so a replay reaches the same deadline the live run set. The
+// EXPIRE-to-a-past-instant case deletes the key and logs a key-delete instead, never
+// this.
+func logExpire(cx *shard.Ctx, key []byte, at int64) {
+	if cx.St != nil {
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(at))
+		cx.St.LogCollectionOp(key, akifile.CollKindHash, hashOpExpire, nil, b[:])
+	}
+}
+
 // snapHeaderLen is the fixed hash snapshot header: the key deadline in unix
 // milliseconds (0 when the hash carries no key TTL), little-endian. The header is the
 // per-key state the element run does not carry, so a snapshot restores a volatile
-// hash's key TTL where the effect log, which logs field deltas only, cannot yet. The
-// per-field TTLs are not in the header this slice (the deferred field-TTL follow-on),
-// so a snapshot restores field values and the key TTL, not field deadlines.
+// hash's key TTL as of the checkpoint, and a between-checkpoint EXPIRE or PERSIST also
+// cuts its own hashOpExpire effect so the whole-key deadline is durable between
+// checkpoints. The per-field TTLs are not in the header this slice (the deferred
+// field-TTL follow-on), so a snapshot restores field values and the key TTL, not
+// field deadlines.
 const snapHeaderLen = 8
 
 // Snapshot writes a whole-hash snapshot frame for every live hash on this shard, the
@@ -168,8 +194,7 @@ func Recover(cx *shard.Ctx) error {
 			return applyHashSnapshot(g, key, snap)
 		},
 		func(key []byte, op akifile.CollOpRow) error {
-			applyHashOp(g, key, op)
-			return nil
+			return applyHashOp(g, key, op)
 		})
 }
 
@@ -230,10 +255,12 @@ func eachPair(run []byte, fn func(field, value []byte)) bool {
 
 // applyHashOp re-drives one hash effect onto the registry: a set creates the hash on
 // its first field and writes the pair, a field-delete drops the field and the key on
-// the last one, and a key-delete clears the whole hash. It is the effect arm the
-// recovery walk drives. It goes through hash.set and hash.del, so a field that
-// breaches an inline threshold promotes to the native band exactly as it did live.
-func applyHashOp(g *reg, key []byte, op akifile.CollOpRow) {
+// the last one, a key-delete clears the whole hash, and a key-expire sets the whole-key
+// deadline. It is the effect arm the recovery walk drives. It goes through hash.set and
+// hash.del, so a field that breaches an inline threshold promotes to the native band
+// exactly as it did live. It reports ErrLength on a torn expire payload, the fail-closed
+// cut recovery wants; an expire on an absent key is a defensive no-op.
+func applyHashOp(g *reg, key []byte, op akifile.CollOpRow) error {
 	switch op.Op {
 	case hashOpSet:
 		h := g.m[string(key)]
@@ -246,7 +273,7 @@ func applyHashOp(g *reg, key []byte, op akifile.CollOpRow) {
 	case hashOpDelField:
 		h := g.m[string(key)]
 		if h == nil {
-			return
+			return nil
 		}
 		h.del(op.SubKey)
 		if h.card() == 0 {
@@ -256,5 +283,13 @@ func applyHashOp(g *reg, key []byte, op akifile.CollOpRow) {
 		}
 	case hashOpDeleteKey:
 		g.drop(key)
+	case hashOpExpire:
+		if len(op.SubValue) < 8 {
+			return akifile.ErrLength
+		}
+		if h := g.m[string(key)]; h != nil {
+			h.expireAt = int64(binary.LittleEndian.Uint64(op.SubValue))
+		}
 	}
+	return nil
 }

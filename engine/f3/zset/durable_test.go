@@ -280,6 +280,97 @@ func TestZsetSnapshotOnlyRecovers(t *testing.T) {
 	}
 }
 
+// zexpireD mirrors zsetBackend.Store for a future instant: set the live zset's deadline
+// and cut the expire effect that carries it, the store arm of an EXPIRE to a future
+// instant a unit test cannot drive through the reply-writing Expire.
+func zexpireD(cx *shard.Ctx, g *reg, key string, at int64) {
+	k := []byte(key)
+	z := g.live(cx, k)
+	if z == nil {
+		return
+	}
+	z.expireAt = at
+	logExpire(cx, k, at)
+}
+
+// zexpirePastD mirrors zsetBackend.Delete: an EXPIRE to a past instant drops the key on
+// the spot and logs the key-delete so replay does not resurrect the members.
+func zexpirePastD(cx *shard.Ctx, g *reg, key string) {
+	k := []byte(key)
+	logDeleteKey(cx, k)
+	g.drop(k)
+}
+
+// TestZsetKeyExpireRecovers is the zset arm of the key-expire round trip: a deadline set
+// or cleared after the snapshot must survive a reopen on the effect tail alone. It covers
+// EXPIRE to a future instant, PERSIST of a snapshot-carried deadline, and EXPIRE to a past
+// instant, mirroring the set vertical's TestSetKeyExpireRecovers.
+func TestZsetKeyExpireRecovers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "zsetkeyexpire.aki")
+
+	f, s := zsetDurStore(t, path, true)
+	cx := &shard.Ctx{St: s, NowMs: 1}
+	g := registry(cx)
+
+	zaddD(cx, g, "future", pair{"a", 1}, pair{"b", 2})
+	zaddD(cx, g, "persist", pair{"c", 3}, pair{"d", 4})
+	zaddD(cx, g, "past", pair{"e", 5}, pair{"f", 6})
+	const carried = int64(5_000_000)
+	g.m["persist"].expireAt = carried
+
+	Snapshot(cx)
+
+	const future = int64(9_000_000)
+	zexpireD(cx, g, "future", future)
+	if !Persist(cx, []byte("persist")) {
+		t.Fatal("persist of a zset with a deadline reported none removed")
+	}
+	zexpirePastD(cx, g, "past")
+
+	wantFuture := membersScores(g.m["future"])
+	wantPersist := membersScores(g.m["persist"])
+	if g.m["future"].expireAt != future {
+		t.Fatalf("first-run future TTL = %d, want %d", g.m["future"].expireAt, future)
+	}
+	if g.m["persist"].expireAt != 0 {
+		t.Fatalf("first-run persist TTL = %d, want 0", g.m["persist"].expireAt)
+	}
+	if _, ok := g.m["past"]; ok {
+		t.Fatal("past should be gone in the first run")
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	f2, s2 := zsetDurStore(t, path, false)
+	t.Cleanup(func() { _ = s2.Close(); _ = f2.Close() })
+	cx2 := &shard.Ctx{St: s2, NowMs: 1}
+	if err := Recover(cx2); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	g2 := registry(cx2)
+
+	if got := membersScores(g2.m["future"]); !reflect.DeepEqual(got, wantFuture) {
+		t.Fatalf("future members after recovery = %v, want %v", got, wantFuture)
+	}
+	if got := g2.m["future"].expireAt; got != future {
+		t.Fatalf("future TTL after recovery = %d, want %d (post-snapshot expire effect must survive)", got, future)
+	}
+	if got := membersScores(g2.m["persist"]); !reflect.DeepEqual(got, wantPersist) {
+		t.Fatalf("persist members after recovery = %v, want %v", got, wantPersist)
+	}
+	if got := g2.m["persist"].expireAt; got != 0 {
+		t.Fatalf("persist TTL after recovery = %d, want 0 (post-snapshot PERSIST effect must survive)", got)
+	}
+	if _, ok := g2.m["past"]; ok {
+		t.Fatal("past came back after recovery, the expire-past delete effect was lost")
+	}
+}
+
 func TestZsetSnapshotThenEffectTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "zsettail.aki")
 

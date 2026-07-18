@@ -34,10 +34,16 @@ func (b *hashBackend) Present() (curAt int64, present bool) {
 	return b.h.expireAt, true
 }
 
-func (b *hashBackend) Delete() { b.g.drop(b.key) }
+func (b *hashBackend) Delete() {
+	// An EXPIRE to a past instant deletes the key on the spot; log the key-delete so a
+	// replay drops it instead of resurrecting the fields from an earlier effect.
+	logDeleteKey(b.cx, b.key)
+	b.g.drop(b.key)
+}
 
 func (b *hashBackend) Store(at int64) bool {
 	b.h.expireAt = at
+	logExpire(b.cx, b.key, at)
 	return true
 }
 
@@ -82,5 +88,8 @@ func Persist(cx *shard.Ctx, key []byte) bool {
 		return false
 	}
 	h.expireAt = 0
+	// Log the cleared key deadline so a replay persists the hash instead of restoring
+	// the TTL a prior effect or snapshot carried.
+	logExpire(cx, key, 0)
 	return true
 }

@@ -81,6 +81,28 @@ func spopD(cx *shard.Ctx, g *reg, key string) []byte {
 	return out
 }
 
+// sexpireD mirrors setBackend.Store for a future instant: set the live set's deadline
+// and cut the expire effect that carries it. Expire itself runs through expire.Apply and
+// writes a reply a unit test cannot build, so this driver stands in for the store arm of
+// an EXPIRE to a future instant.
+func sexpireD(cx *shard.Ctx, g *reg, key string, at int64) {
+	k := []byte(key)
+	s := g.live(cx, k)
+	if s == nil {
+		return
+	}
+	s.expireAt = at
+	logExpire(cx, k, at)
+}
+
+// sexpirePastD mirrors setBackend.Delete: an EXPIRE to a past instant drops the key on
+// the spot and logs the key-delete so replay does not resurrect the members.
+func sexpirePastD(cx *shard.Ctx, g *reg, key string) {
+	k := []byte(key)
+	logDeleteKey(cx, k)
+	g.drop(k)
+}
+
 func TestSetEffectLogRecovers(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "setdur.aki")
 	create := func() *akifile.File {
@@ -299,6 +321,100 @@ func TestSetSnapshotOnlyRecovers(t *testing.T) {
 	}
 	if got := members(registry(cx2).m["s"]); !reflect.DeepEqual(got, want) {
 		t.Fatalf("set after snapshot-only recovery = %v, want %v", got, want)
+	}
+}
+
+// TestSetKeyExpireRecovers is the key-expire effect round trip (spec 2064/f3 M8 shared
+// key-expire slice): a deadline set or cleared AFTER the snapshot must survive a reopen on
+// the effect tail alone, not just a deadline the snapshot header captured. It covers three
+// tails cut past a checkpoint: EXPIRE to a future instant (a fresh deadline where the
+// snapshot had none), PERSIST (a snapshot-carried deadline cleared to none), and EXPIRE to
+// a past instant (an immediate delete that must not resurrect the set on replay).
+func TestSetKeyExpireRecovers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "setkeyexpire.aki")
+	create := func() *akifile.File {
+		f, err := akifile.Create(path, akifile.CreateOptions{ShardCount: 4, Sync: akifile.SyncNo})
+		if err != nil {
+			t.Fatalf("create aki: %v", err)
+		}
+		return f
+	}
+	openStore := func(f *akifile.File) *store.Store {
+		s, err := store.Open(store.Options{ArenaBytes: 4 << 20, SegBytes: 1 << 20, AkiValueLog: f, Shard: 1})
+		if err != nil {
+			t.Fatalf("open aki store: %v", err)
+		}
+		return s
+	}
+
+	f := create()
+	s := openStore(f)
+	cx := &shard.Ctx{St: s, NowMs: 1}
+	g := registry(cx)
+
+	saddD(cx, g, "future", "a", "b")
+	saddD(cx, g, "persist", "c", "d")
+	saddD(cx, g, "past", "e", "f")
+	const carried = int64(5_000_000) // far past NowMs, so the snapshot captures a live TTL
+	g.m["persist"].expireAt = carried
+
+	Snapshot(cx) // fold every live set, carrying persist's deadline into its header
+
+	// Tails cut after the snapshot: future gains a deadline, persist drops the one its
+	// snapshot header carried, and past expires on the spot.
+	const future = int64(9_000_000)
+	sexpireD(cx, g, "future", future)
+	if !Persist(cx, []byte("persist")) {
+		t.Fatal("persist of a set with a deadline reported none removed")
+	}
+	sexpirePastD(cx, g, "past")
+
+	wantFuture := members(g.m["future"])
+	wantPersist := members(g.m["persist"])
+	if g.m["future"].expireAt != future {
+		t.Fatalf("first-run future TTL = %d, want %d", g.m["future"].expireAt, future)
+	}
+	if g.m["persist"].expireAt != 0 {
+		t.Fatalf("first-run persist TTL = %d, want 0", g.m["persist"].expireAt)
+	}
+	if _, ok := g.m["past"]; ok {
+		t.Fatal("past should be gone in the first run")
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	s2 := openStore(f2)
+	t.Cleanup(func() { _ = s2.Close(); _ = f2.Close() })
+	cx2 := &shard.Ctx{St: s2, NowMs: 1}
+
+	if err := Recover(cx2); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	g2 := registry(cx2)
+
+	if got := members(g2.m["future"]); !reflect.DeepEqual(got, wantFuture) {
+		t.Fatalf("future members after recovery = %v, want %v", got, wantFuture)
+	}
+	if got := g2.m["future"].expireAt; got != future {
+		t.Fatalf("future TTL after recovery = %d, want %d (post-snapshot expire effect must survive)", got, future)
+	}
+	if got := members(g2.m["persist"]); !reflect.DeepEqual(got, wantPersist) {
+		t.Fatalf("persist members after recovery = %v, want %v", got, wantPersist)
+	}
+	if got := g2.m["persist"].expireAt; got != 0 {
+		t.Fatalf("persist TTL after recovery = %d, want 0 (post-snapshot PERSIST effect must survive)", got)
+	}
+	if _, ok := g2.m["past"]; ok {
+		t.Fatal("past came back after recovery, the expire-past delete effect was lost")
 	}
 }
 
