@@ -1,6 +1,7 @@
 package set
 
 import (
+	"encoding/binary"
 	"sort"
 	"strconv"
 
@@ -66,14 +67,21 @@ type set struct {
 	// live (reg.go), so it is absent to every command in the same epoch.
 	expireAt int64
 
-	// intset-class: sorted ascending, unique.
-	ints []int64
-
-	// listpack-class: packed entries, each [len:uint8][tag:uint8][bytes]. len
-	// is at most maxListpackValue so it fits one byte; tag is the member's
-	// first byte (0 when empty) for the scan's fast reject. n counts entries so
-	// card never rescans.
-	blob []byte
+	// data holds the live inline representation, one of two mutually exclusive
+	// shapes named by enc. The two share this one slice header so the set struct
+	// carries a single representation field, not one per shape (the per-collection
+	// memory-bar slim, spec 2064/f3/11 section 3): unioning the old ints []int64
+	// and blob []byte drops the struct across a Go size class, 32 bytes off every
+	// set whatever its shape.
+	//
+	//   - intset-class: members packed as sorted, unique little-endian int64
+	//     lanes, eight bytes each. Count is len(data)/8; the lane helpers below
+	//     answer binary search and the shift-insert the way the []int64 did.
+	//   - listpack-class: packed entries, each [len:uint8][tag:uint8][bytes]. len
+	//     is at most maxListpackValue so it fits one byte; tag is the member's
+	//     first byte (0 when empty) for the scan's fast reject. n counts entries
+	//     so card never rescans.
+	data []byte
 	n    int
 
 	// hashtable-class: the native member table (member.go). Built by the
@@ -113,9 +121,9 @@ func (s *set) residentBytes() uint64 {
 	var n uint64
 	switch s.enc {
 	case encIntset:
-		n = uint64(cap(s.ints)) * 8
+		n = uint64(cap(s.data))
 	case encListpack:
-		n = uint64(cap(s.blob))
+		n = uint64(cap(s.data))
 	case encPartitioned:
 		n = s.part.residentBytes()
 	default:
@@ -139,11 +147,22 @@ func newSet(first []byte) *set {
 	return &set{enc: encListpack}
 }
 
+// intLaneWidth is the byte width of one packed intset member.
+const intLaneWidth = 8
+
+// intsetLen is the intset member count, derived from the packed slice.
+func (s *set) intsetLen() int { return len(s.data) / intLaneWidth }
+
+// intLaneAt reads the int64 member in lane i of a packed intset slice.
+func intLaneAt(b []byte, i int) int64 {
+	return int64(binary.LittleEndian.Uint64(b[i*intLaneWidth:]))
+}
+
 // card is the member count.
 func (s *set) card() int {
 	switch s.enc {
 	case encIntset:
-		return len(s.ints)
+		return s.intsetLen()
 	case encListpack:
 		return s.n
 	case encPartitioned:
@@ -175,8 +194,9 @@ func (s *set) has(m []byte) bool {
 }
 
 func (s *set) intsetHas(v int64) bool {
-	i := sort.Search(len(s.ints), func(i int) bool { return s.ints[i] >= v })
-	return i < len(s.ints) && s.ints[i] == v
+	n := s.intsetLen()
+	i := sort.Search(n, func(i int) bool { return intLaneAt(s.data, i) >= v })
+	return i < n && intLaneAt(s.data, i) == v
 }
 
 // listpackIndex returns the byte offset of m's entry, or -1 when absent. The
@@ -187,7 +207,7 @@ func (s *set) listpackIndex(m []byte) int {
 	if len(m) > 0 {
 		tag = m[0]
 	}
-	b := s.blob
+	b := s.data
 	for i := 0; i < len(b); {
 		n := int(b[i])
 		start := i + 2
@@ -239,26 +259,29 @@ func (s *set) addIntset(m []byte) bool {
 		// A non-integer forces the intset out of its class. It goes to listpack
 		// when the result still fits both listpack caps, else straight to the
 		// table, exactly Redis's setTypeMaybeConvert branch.
-		if len(s.ints)+1 <= maxListpackEntries && len(m) <= maxListpackValue {
+		if s.intsetLen()+1 <= maxListpackEntries && len(m) <= maxListpackValue {
 			s.intsetToListpack()
 			return s.addListpack(m)
 		}
 		s.intsetToHashtable()
 		return s.ht.add(m)
 	}
-	i := sort.Search(len(s.ints), func(i int) bool { return s.ints[i] >= v })
-	if i < len(s.ints) && s.ints[i] == v {
+	n := s.intsetLen()
+	i := sort.Search(n, func(i int) bool { return intLaneAt(s.data, i) >= v })
+	if i < n && intLaneAt(s.data, i) == v {
 		return false
 	}
-	if len(s.ints)+1 > maxIntsetEntries {
+	if n+1 > maxIntsetEntries {
 		// The intset cap (512) is far above the listpack entry cap (128), so a
 		// breach here always lands in the table; there is no listpack step.
 		s.intsetToHashtable()
 		return s.ht.add(m)
 	}
-	s.ints = append(s.ints, 0)
-	copy(s.ints[i+1:], s.ints[i:])
-	s.ints[i] = v
+	// Insert the lane at i: grow by one lane, shift the tail right by eight bytes
+	// (copy is memmove, so the overlap is safe), then write v into the hole.
+	s.data = append(s.data, 0, 0, 0, 0, 0, 0, 0, 0)
+	copy(s.data[(i+1)*intLaneWidth:], s.data[i*intLaneWidth:])
+	binary.LittleEndian.PutUint64(s.data[i*intLaneWidth:], uint64(v))
 	return true
 }
 
@@ -281,8 +304,8 @@ func (s *set) appendListpack(m []byte) {
 	if len(m) > 0 {
 		tag = m[0]
 	}
-	s.blob = append(s.blob, byte(len(m)), tag)
-	s.blob = append(s.blob, m...)
+	s.data = append(s.data, byte(len(m)), tag)
+	s.data = append(s.data, m...)
 	s.n++
 }
 
@@ -296,19 +319,20 @@ func (s *set) rem(m []byte) bool {
 		if !ok {
 			return false
 		}
-		i := sort.Search(len(s.ints), func(i int) bool { return s.ints[i] >= v })
-		if i >= len(s.ints) || s.ints[i] != v {
+		n := s.intsetLen()
+		i := sort.Search(n, func(i int) bool { return intLaneAt(s.data, i) >= v })
+		if i >= n || intLaneAt(s.data, i) != v {
 			return false
 		}
-		s.ints = append(s.ints[:i], s.ints[i+1:]...)
+		s.data = append(s.data[:i*intLaneWidth], s.data[(i+1)*intLaneWidth:]...)
 		return true
 	case encListpack:
 		i := s.listpackIndex(m)
 		if i < 0 {
 			return false
 		}
-		end := i + 2 + int(s.blob[i])
-		s.blob = append(s.blob[:i], s.blob[end:]...)
+		end := i + 2 + int(s.data[i])
+		s.data = append(s.data[:i], s.data[end:]...)
 		s.n--
 		return true
 	case encPartitioned:
@@ -326,11 +350,11 @@ func (s *set) each(fn func(m []byte)) {
 	switch s.enc {
 	case encIntset:
 		var sc [20]byte
-		for _, v := range s.ints {
-			fn(strconv.AppendInt(sc[:0], v, 10))
+		for i, n := 0, s.intsetLen(); i < n; i++ {
+			fn(strconv.AppendInt(sc[:0], intLaneAt(s.data, i), 10))
 		}
 	case encListpack:
-		b := s.blob
+		b := s.data
 		for i := 0; i < len(b); {
 			n := int(b[i])
 			start := i + 2
@@ -352,13 +376,13 @@ func (s *set) eachUntil(fn func(m []byte) bool) {
 	switch s.enc {
 	case encIntset:
 		var sc [20]byte
-		for _, v := range s.ints {
-			if !fn(strconv.AppendInt(sc[:0], v, 10)) {
+		for i, n := 0, s.intsetLen(); i < n; i++ {
+			if !fn(strconv.AppendInt(sc[:0], intLaneAt(s.data, i), 10)) {
 				return
 			}
 		}
 	case encListpack:
-		b := s.blob
+		b := s.data
 		for i := 0; i < len(b); {
 			n := int(b[i])
 			start := i + 2
@@ -381,9 +405,9 @@ func (s *set) eachUntil(fn func(m []byte) bool) {
 func (s *set) at(i int, sc []byte) []byte {
 	switch s.enc {
 	case encIntset:
-		return strconv.AppendInt(sc[:0], s.ints[i], 10)
+		return strconv.AppendInt(sc[:0], intLaneAt(s.data, i), 10)
 	case encListpack:
-		b := s.blob
+		b := s.data
 		pos := 0
 		for k := 0; k < i; k++ {
 			pos += 2 + int(b[pos])
@@ -398,33 +422,38 @@ func (s *set) at(i int, sc []byte) []byte {
 }
 
 func (s *set) intsetToListpack() {
+	// Take the packed lanes off data before the listpack appends land back on the
+	// same field: nil it first so appendListpack grows a fresh slice rather than
+	// overwriting the source it is still reading.
 	var sc [20]byte
-	ints := s.ints
-	s.ints = nil
+	old := s.data
+	n := len(old) / intLaneWidth
+	s.data = nil
 	s.enc = encListpack
-	for _, v := range ints {
-		s.appendListpack(strconv.AppendInt(sc[:0], v, 10))
+	for i := 0; i < n; i++ {
+		s.appendListpack(strconv.AppendInt(sc[:0], intLaneAt(old, i), 10))
 	}
 }
 
 func (s *set) intsetToHashtable() {
-	ints := s.ints
-	s.ht = newHashtable(len(ints) + 1)
+	old := s.data
+	n := len(old) / intLaneWidth
+	s.ht = newHashtable(n + 1)
 	var sc [20]byte
-	for _, v := range ints {
-		s.ht.add(strconv.AppendInt(sc[:0], v, 10))
+	for i := 0; i < n; i++ {
+		s.ht.add(strconv.AppendInt(sc[:0], intLaneAt(old, i), 10))
 	}
-	s.ints = nil
+	s.data = nil
 	s.enc = encHashtable
 }
 
 func (s *set) listpackToHashtable() {
-	// Read the blob before pointing enc at the new table: each() dispatches on
+	// Read the data before pointing enc at the new table: each() dispatches on
 	// enc, so the walk must finish against the listpack it is draining.
 	ht := newHashtable(s.n + 1)
 	s.each(func(m []byte) { ht.add(m) })
 	s.ht = ht
-	s.blob = nil
+	s.data = nil
 	s.n = 0
 	s.enc = encHashtable
 }
