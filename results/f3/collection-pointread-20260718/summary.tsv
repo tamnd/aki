@@ -1,0 +1,4 @@
+type	read_op	aki_ops_s	redis_ops_s	valkey_ops_s	aki_vs_redis	aki_vs_valkey	aki_vmhwm_kb	redis_vmhwm_kb	valkey_vmhwm_kb
+set	SISMEMBER	10768428	3686070	2995881	2.92	3.59	410052	92988	91972
+hash	HGET	9565566	3685504	2994759	2.60	3.19	388304	92800	92216
+zset	ZSCORE	9569378	3685504	2995507	2.60	3.19	374612	89964	93020
