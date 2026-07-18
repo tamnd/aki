@@ -100,6 +100,12 @@ type hopBatch struct {
 	// retryFull does the same when a reclaimed arena completes the last parked
 	// write. Owner-goroutine only.
 	deferN int
+
+	// oob marks an out-of-band node: DrainReplies emits its replies immediately,
+	// in the order they were written, without consulting the reorder cursor,
+	// because an unsolicited message (a pub/sub delivery) has no reserved
+	// sequence on the target connection. Set by DeliverOOB and cleared on reset.
+	oob bool
 }
 
 func newBatch(dataCap, repCap int) *hopBatch {
@@ -136,6 +142,7 @@ func (b *hopBatch) reset() {
 	b.n = 0
 	b.sn = 0
 	b.deferN = 0
+	b.oob = false
 	b.data = b.data[:0]
 	b.rep = b.rep[:0]
 	// A node that carried a giant chunked-band command must not pin its grown
