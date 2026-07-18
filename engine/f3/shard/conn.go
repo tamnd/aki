@@ -517,6 +517,18 @@ func (c *Conn) DrainReplies(emit func([]byte)) int {
 			}
 			return n
 		}
+		if b.oob {
+			// An out-of-band node (DeliverOOB): its replies belong to no pipeline
+			// sequence, so they go straight to the wire in write order without
+			// touching c.next or the reorder ring. One flag load per drained node,
+			// off the point-op path, keeps this out of the reorder machinery.
+			for i := 0; i < int(b.n); i++ {
+				emit(b.reply(i))
+				n++
+			}
+			c.recycle(b)
+			continue
+		}
 		for i := 0; i < int(b.n); i++ {
 			if b.blocked(i) {
 				// Parked (Reply.Park): no reply now, and c.next must NOT advance past this
@@ -618,6 +630,55 @@ func (c *Conn) drainParked(emit func([]byte)) int {
 func (c *Conn) CompleteBlocked(seq uint32, rep []byte) {
 	b := c.take()
 	b.add(opBlockDone, seq, false, nil)
+	r := Reply{b: b, i: 0}
+	r.Raw(rep)
+	if c.out.push(b) {
+		c.wk.wake()
+	}
+}
+
+// InlineReply enqueues a reply the network layer produced on the reader
+// goroutine at the next pipeline sequence, so a command answered without a shard
+// hop (the pub/sub family, doc 17 section 13) keeps its place in reply order: a
+// PING pipelined ahead of a SUBSCRIBE still answers PONG before the subscribe
+// confirmation. The node carries the finished bytes and rides the outbound queue
+// and reorder ring exactly like an owner reply, which is also what makes it safe
+// under the pair shape, where emitting straight from the reader would race the
+// writer goroutine. It advances published itself so a pure pub/sub pass, which
+// flushes no shard node, still trips Owes and drains on the single shape. Reader
+// side only, like Do.
+func (c *Conn) InlineReply(rep []byte) error {
+	if c.seq-c.emitted.Load() >= uint32(len(c.ring)) {
+		if err := c.throttle(); err != nil {
+			return err
+		}
+	}
+	seq := c.seq
+	c.seq++
+	b := c.take()
+	b.add(opBlockDone, seq, false, nil)
+	r := Reply{b: b, i: 0}
+	r.Raw(rep)
+	c.published.Store(c.seq)
+	if c.out.push(b) {
+		c.wk.wake()
+	}
+	return nil
+}
+
+// DeliverOOB pushes an unsolicited reply onto this connection's wire from any
+// goroutine: a pub/sub message a publisher's network thread fans out to a
+// subscriber. It reuses the CompleteBlocked seam (outbound MPSC push plus a wake,
+// both foreign-goroutine safe) but marks the node out-of-band, since a delivered
+// message has no reserved pipeline sequence here; DrainReplies emits it at once.
+// Delivery to an idle subscriber needs a writer that is not the reader (the pair
+// shape or the reactor), because the single shape's one goroutine sits in Read
+// with nobody on the waker; that is the push-mode driver requirement doc 08
+// carries.
+func (c *Conn) DeliverOOB(rep []byte) {
+	b := c.take()
+	b.oob = true
+	b.add(opBlockDone, 0, false, nil)
 	r := Reply{b: b, i: 0}
 	r.Raw(rep)
 	if c.out.push(b) {

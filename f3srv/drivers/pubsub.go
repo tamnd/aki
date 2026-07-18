@@ -1,0 +1,422 @@
+package drivers
+
+import (
+	"sync"
+
+	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/f3srv/resp"
+)
+
+// pubsubRegistry is the network-layer channel directory (spec 2064/f3/17 section
+// 13): a channel name maps to the set of connections subscribed to it. Channels
+// are not keys; they have no owner shard, no size band, and no LTM story, and the
+// shard workers never see them, so a PUBLISH storm and a GET contend on nothing.
+// One mutex guards the map because PUBLISH runs on one connection's reader
+// goroutine while SUBSCRIBE on another's mutates the same map, unlike the
+// per-connection waiter set the blocking path uses, which a single owner
+// serializes. This slice keeps the exact-channel registry; the pattern registry
+// and the shard-channel registry are separate maps a later slice adds.
+type pubsubRegistry struct {
+	mu       sync.Mutex
+	channels map[string]map[*connState]struct{}
+}
+
+func newPubsubRegistry() *pubsubRegistry {
+	return &pubsubRegistry{channels: make(map[string]map[*connState]struct{})}
+}
+
+// subscribe records cs as a subscriber of channel and returns the connection's
+// total subscription count. A duplicate subscribe to a channel the connection
+// already holds re-confirms without double-adding, matching redis. cs.subs is
+// reader-owned so it moves outside the lock; only the shared reverse index takes
+// the mutex.
+func (r *pubsubRegistry) subscribe(cs *connState, channel string) int {
+	if cs.subs == nil {
+		cs.subs = make(map[string]struct{})
+	}
+	if _, dup := cs.subs[channel]; !dup {
+		cs.subs[channel] = struct{}{}
+		r.mu.Lock()
+		subs := r.channels[channel]
+		if subs == nil {
+			subs = make(map[*connState]struct{})
+			r.channels[channel] = subs
+		}
+		subs[cs] = struct{}{}
+		r.mu.Unlock()
+	}
+	return len(cs.subs)
+}
+
+// unsubscribe drops cs from channel and returns the remaining subscription
+// count. An unsubscribe from a channel the connection does not hold is a no-op
+// that still reports the current count, matching redis.
+func (r *pubsubRegistry) unsubscribe(cs *connState, channel string) int {
+	if _, ok := cs.subs[channel]; ok {
+		delete(cs.subs, channel)
+		r.mu.Lock()
+		r.dropLocked(channel, cs)
+		r.mu.Unlock()
+	}
+	return len(cs.subs)
+}
+
+// dropLocked removes cs from channel's subscriber set and forgets an emptied
+// channel. The caller holds the mutex.
+func (r *pubsubRegistry) dropLocked(channel string, cs *connState) {
+	subs := r.channels[channel]
+	if subs == nil {
+		return
+	}
+	delete(subs, cs)
+	if len(subs) == 0 {
+		delete(r.channels, channel)
+	}
+}
+
+// publish fans a message out to every subscriber of channel and returns the
+// number of connections it reached. The subscriber set is snapshotted under the
+// lock and the deliveries run outside it, so a slow wake never stalls a
+// concurrent SUBSCRIBE and the registry mutex never nests under a connection
+// waker. The message wire form is built once and every subscriber copies the
+// same bytes into its own node; the reactor's vectored write shares the one
+// buffer instead, the PUBLISH gate row's refinement (doc 17 section 13).
+func (r *pubsubRegistry) publish(channel string, message []byte) int {
+	r.mu.Lock()
+	subs := r.channels[channel]
+	if len(subs) == 0 {
+		r.mu.Unlock()
+		return 0
+	}
+	targets := make([]*shard.Conn, 0, len(subs))
+	for cs := range subs {
+		targets = append(targets, cs.sc)
+	}
+	r.mu.Unlock()
+
+	wire := appendMessage(nil, channel, message)
+	for _, sc := range targets {
+		sc.DeliverOOB(wire)
+	}
+	return len(targets)
+}
+
+// channelList returns the channels with at least one subscriber, filtered by the
+// optional glob pattern. A nil pattern returns every active channel.
+func (r *pubsubRegistry) channelList(pattern []byte) []string {
+	r.mu.Lock()
+	out := make([]string, 0, len(r.channels))
+	for ch := range r.channels {
+		if pattern == nil || globMatch(pattern, []byte(ch)) {
+			out = append(out, ch)
+		}
+	}
+	r.mu.Unlock()
+	return out
+}
+
+// numSub returns the subscriber count of one channel, zero for an unknown one.
+func (r *pubsubRegistry) numSub(channel string) int {
+	r.mu.Lock()
+	n := len(r.channels[channel])
+	r.mu.Unlock()
+	return n
+}
+
+// removeConn drops a departing connection from every channel it held. It runs
+// from the connection teardown (unregister), after both connection goroutines
+// have joined, so cs.subs is this goroutine's alone; the reverse index still
+// takes the mutex against live publishers.
+func (r *pubsubRegistry) removeConn(cs *connState) {
+	if cs.subs == nil {
+		return
+	}
+	r.mu.Lock()
+	for channel := range cs.subs {
+		r.dropLocked(channel, cs)
+	}
+	r.mu.Unlock()
+	cs.subs = nil
+}
+
+// pubsubIntercept handles the pub/sub command family in the network layer,
+// before dispatch.Dispatch, so it never enters the shard hop. It returns true
+// when it owned the command (a pub/sub verb, or a command refused because the
+// connection is in subscribe mode) and false to let the normal dispatch run.
+// The confirmations it writes are solicited replies, so they go through
+// InlineReply and keep their pipeline order; a wire failure there tears the
+// connection down, surfaced as a false from the caller's boundary.
+func (s *Server) pubsubIntercept(c *shard.Conn, cs *connState, args [][]byte) bool {
+	switch {
+	case eqFold(args[0], "SUBSCRIBE"):
+		s.doSubscribe(c, cs, args)
+		return true
+	case eqFold(args[0], "UNSUBSCRIBE"):
+		s.doUnsubscribe(c, cs, args)
+		return true
+	case eqFold(args[0], "PUBLISH"):
+		s.doPublish(c, args)
+		return true
+	case eqFold(args[0], "PUBSUB"):
+		s.doPubsub(c, args)
+		return true
+	}
+	// Not a pub/sub verb. In subscribe mode a RESP2 connection may only run the
+	// subscribe family plus PING/QUIT/RESET; anything else is refused in order.
+	// PING is allowed and falls through to the shard hop, which answers it
+	// normally. QUIT and RESET are not registered in f3, so they fall through to
+	// the unknown-command answer they already give, a pre-existing gap.
+	if cs.inSubscribeMode() && !subscribeModeAllowed(args[0]) {
+		_ = c.InlineReply(resp.AppendError(nil,
+			"ERR Can't execute '"+lowerVerb(args[0])+"': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"))
+		return true
+	}
+	return false
+}
+
+// subscribeModeAllowed reports whether a non-pub/sub command may run while the
+// connection is in subscribe mode. The pattern and shard subscribe verbs are on
+// the list so they are admitted once their slices land; today they fall through
+// to the unknown-command answer.
+func subscribeModeAllowed(verb []byte) bool {
+	switch {
+	case eqFold(verb, "PING"), eqFold(verb, "QUIT"), eqFold(verb, "RESET"),
+		eqFold(verb, "PSUBSCRIBE"), eqFold(verb, "PUNSUBSCRIBE"),
+		eqFold(verb, "SSUBSCRIBE"), eqFold(verb, "SUNSUBSCRIBE"):
+		return true
+	}
+	return false
+}
+
+// doSubscribe subscribes the connection to each named channel and confirms each
+// in order. Arity is at least one channel.
+func (s *Server) doSubscribe(c *shard.Conn, cs *connState, args [][]byte) {
+	if len(args) < 2 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'subscribe' command"))
+		return
+	}
+	for _, ch := range args[1:] {
+		n := s.pubsub.subscribe(cs, string(ch))
+		_ = c.InlineReply(appendSubConfirm(nil, "subscribe", ch, n))
+	}
+}
+
+// doUnsubscribe drops the named channels, or every held channel when none are
+// named, confirming each in order. Unsubscribing from all on a connection that
+// holds none answers one confirmation with a nil channel and count zero, the
+// redis shape.
+func (s *Server) doUnsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
+	if len(args) >= 2 {
+		for _, ch := range args[1:] {
+			n := s.pubsub.unsubscribe(cs, string(ch))
+			_ = c.InlineReply(appendSubConfirm(nil, "unsubscribe", ch, n))
+		}
+		return
+	}
+	if len(cs.subs) == 0 {
+		_ = c.InlineReply(appendUnsubNil(nil))
+		return
+	}
+	held := make([]string, 0, len(cs.subs))
+	for ch := range cs.subs {
+		held = append(held, ch)
+	}
+	for _, ch := range held {
+		n := s.pubsub.unsubscribe(cs, ch)
+		_ = c.InlineReply(appendSubConfirm(nil, "unsubscribe", []byte(ch), n))
+	}
+}
+
+// doPublish delivers the message to the channel's subscribers and answers the
+// receiver count. Arity is exactly a channel and a message.
+func (s *Server) doPublish(c *shard.Conn, args [][]byte) {
+	if len(args) != 3 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'publish' command"))
+		return
+	}
+	n := s.pubsub.publish(string(args[1]), args[2])
+	_ = c.InlineReply(resp.AppendInt(nil, int64(n)))
+}
+
+// doPubsub answers the introspection subcommands. CHANNELS lists active channels
+// under an optional pattern, NUMSUB reports subscriber counts for named
+// channels, and NUMPAT reports the pattern count, zero until the pattern slice.
+func (s *Server) doPubsub(c *shard.Conn, args [][]byte) {
+	if len(args) < 2 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'pubsub' command"))
+		return
+	}
+	switch {
+	case eqFold(args[1], "CHANNELS"):
+		var pattern []byte
+		if len(args) >= 3 {
+			pattern = args[2]
+		}
+		chans := s.pubsub.channelList(pattern)
+		out := resp.AppendArrayHeader(nil, len(chans))
+		for _, ch := range chans {
+			out = resp.AppendBulk(out, []byte(ch))
+		}
+		_ = c.InlineReply(out)
+	case eqFold(args[1], "NUMSUB"):
+		names := args[2:]
+		out := resp.AppendArrayHeader(nil, len(names)*2)
+		for _, ch := range names {
+			out = resp.AppendBulk(out, ch)
+			out = resp.AppendInt(out, int64(s.pubsub.numSub(string(ch))))
+		}
+		_ = c.InlineReply(out)
+	case eqFold(args[1], "NUMPAT"):
+		_ = c.InlineReply(resp.AppendInt(nil, 0))
+	default:
+		_ = c.InlineReply(resp.AppendError(nil, "ERR Unknown PUBSUB subcommand or wrong number of arguments"))
+	}
+}
+
+// appendMessage builds the unsolicited message push: a three-element array of
+// "message", the channel, and the payload.
+func appendMessage(dst []byte, channel string, message []byte) []byte {
+	dst = resp.AppendArrayHeader(dst, 3)
+	dst = resp.AppendBulk(dst, []byte("message"))
+	dst = resp.AppendBulk(dst, []byte(channel))
+	dst = resp.AppendBulk(dst, message)
+	return dst
+}
+
+// appendSubConfirm builds a subscribe or unsubscribe confirmation: the kind, the
+// channel, and the connection's running subscription count.
+func appendSubConfirm(dst []byte, kind string, channel []byte, count int) []byte {
+	dst = resp.AppendArrayHeader(dst, 3)
+	dst = resp.AppendBulk(dst, []byte(kind))
+	dst = resp.AppendBulk(dst, channel)
+	dst = resp.AppendInt(dst, int64(count))
+	return dst
+}
+
+// appendUnsubNil builds the UNSUBSCRIBE-from-nothing confirmation: "unsubscribe",
+// a nil channel, and count zero.
+func appendUnsubNil(dst []byte) []byte {
+	dst = resp.AppendArrayHeader(dst, 3)
+	dst = resp.AppendBulk(dst, []byte("unsubscribe"))
+	dst = resp.AppendNull(dst)
+	dst = resp.AppendInt(dst, 0)
+	return dst
+}
+
+// eqFold reports whether an argument token equals an ASCII command word, case
+// insensitively, without allocating. It is the drivers-package twin of the
+// dispatch table's tokenIs.
+func eqFold(arg []byte, word string) bool {
+	if len(arg) != len(word) {
+		return false
+	}
+	for i := 0; i < len(arg); i++ {
+		ch := arg[i]
+		if ch >= 'a' && ch <= 'z' {
+			ch -= 'a' - 'A'
+		}
+		if ch != word[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// lowerVerb renders a command token in lower case for an error message, the form
+// redis prints the offending verb in.
+func lowerVerb(arg []byte) string {
+	b := make([]byte, len(arg))
+	for i, ch := range arg {
+		if ch >= 'A' && ch <= 'Z' {
+			ch += 'a' - 'A'
+		}
+		b[i] = ch
+	}
+	return string(b)
+}
+
+// globMatch reports whether str matches the glob pattern, the same operators
+// redis's stringmatchlen implements and SCAN's MATCH uses (set/scan.go): * any
+// run, ? one byte, [...] a class with ranges and a leading ^ negation, and \
+// escaping the next byte. Byte-oriented and case sensitive. Kept local to the
+// network layer the way each keyspace keeps its own copy.
+func globMatch(pattern, str []byte) bool {
+	p, sIdx := 0, 0
+	for p < len(pattern) {
+		switch pattern[p] {
+		case '*':
+			for p+1 < len(pattern) && pattern[p+1] == '*' {
+				p++
+			}
+			if p+1 == len(pattern) {
+				return true
+			}
+			for i := sIdx; i <= len(str); i++ {
+				if globMatch(pattern[p+1:], str[i:]) {
+					return true
+				}
+			}
+			return false
+		case '?':
+			if sIdx == len(str) {
+				return false
+			}
+			sIdx++
+			p++
+		case '[':
+			if sIdx == len(str) {
+				return false
+			}
+			p++
+			neg := false
+			if p < len(pattern) && pattern[p] == '^' {
+				neg = true
+				p++
+			}
+			match := false
+			for p < len(pattern) && pattern[p] != ']' {
+				if pattern[p] == '\\' && p+1 < len(pattern) {
+					p++
+					if pattern[p] == str[sIdx] {
+						match = true
+					}
+				} else if p+2 < len(pattern) && pattern[p+1] == '-' && pattern[p+2] != ']' {
+					lo, hi := pattern[p], pattern[p+2]
+					if lo > hi {
+						lo, hi = hi, lo
+					}
+					if str[sIdx] >= lo && str[sIdx] <= hi {
+						match = true
+					}
+					p += 2
+				} else if pattern[p] == str[sIdx] {
+					match = true
+				}
+				p++
+			}
+			if p < len(pattern) {
+				p++ // consume ']'
+			}
+			if match == neg {
+				return false
+			}
+			sIdx++
+		case '\\':
+			if p+1 < len(pattern) {
+				p++
+			}
+			if sIdx == len(str) || pattern[p] != str[sIdx] {
+				return false
+			}
+			sIdx++
+			p++
+		default:
+			if sIdx == len(str) || pattern[p] != str[sIdx] {
+				return false
+			}
+			sIdx++
+			p++
+		}
+	}
+	return sIdx == len(str)
+}

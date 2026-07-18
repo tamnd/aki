@@ -227,6 +227,12 @@ type Server struct {
 	netMu   sync.Mutex
 	netLive map[*connState]struct{}
 	netDone NetStats
+
+	// pubsub is the network-layer channel registry (doc 08, doc 17 section 13):
+	// pub/sub lives here, not in the shard workers, so a PUBLISH storm never
+	// slows a GET. Built at Listen, walked by publishers and mutated by
+	// subscribers under its own mutex.
+	pubsub *pubsubRegistry
 }
 
 // Flushes reports the total writer socket flushes since start, the lab and
@@ -304,6 +310,7 @@ func Listen(o Options) (*Server, error) {
 		shape:      o.ConnShape,
 		driver:     NetGoroutine,
 		netLive:    make(map[*connState]struct{}),
+		pubsub:     newPubsubRegistry(),
 	}
 	switch o.NetDriver {
 	case NetReactor:
@@ -670,6 +677,13 @@ func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary fu
 						continue
 					}
 					cmds++
+					// Pub/sub is answered here, in the network layer, and never
+					// reaches the shard hop (doc 17 section 13). The intercept owns
+					// the command when it returns true, including a command refused
+					// because the connection is in subscribe mode.
+					if s.pubsubIntercept(c, cs, args) {
+						continue
+					}
 					if derr := dispatch.Dispatch(c, args); derr != nil {
 						return
 					}

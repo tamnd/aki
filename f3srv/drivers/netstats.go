@@ -36,7 +36,20 @@ type connState struct {
 	commands eventCounter // reader: commands handed to dispatch
 	writes   eventCounter // writer: socket Write calls under the reply buffer
 	sc       *shard.Conn
+
+	// subs is the set of exact channels this connection is subscribed to, the
+	// per-connection half of the pub/sub registry (pubsub.go). It is nil until
+	// the first SUBSCRIBE and touched only by this connection's reader goroutine,
+	// so its own access needs no lock; the registry's reverse index is what the
+	// shared mutex guards. A non-empty set means the connection is in subscribe
+	// mode, which restricts the commands it may run.
+	subs map[string]struct{}
 }
+
+// inSubscribeMode reports whether the connection holds any subscription, so the
+// RESP2 subscribe-context command restriction applies (doc 17 section 13). Later
+// slices fold pattern and shard subscriptions into the same test.
+func (cs *connState) inSubscribeMode() bool { return len(cs.subs) > 0 }
 
 // countedWriter counts the writer goroutine's socket writes: it sits between
 // the reply bufio.Writer and the connection, so every buffer flush, mid-fill
@@ -155,6 +168,9 @@ func (s *Server) register(cs *connState) {
 // The caller must have joined both connection goroutines first, so the loads
 // see the final values.
 func (s *Server) unregister(cs *connState) {
+	// Drop the connection from every channel it subscribed to before folding its
+	// counters; the pub/sub registry has its own mutex, taken outside netMu.
+	s.pubsub.removeConn(cs)
 	s.netMu.Lock()
 	delete(s.netLive, cs)
 	s.netDone.addConn(cs)
