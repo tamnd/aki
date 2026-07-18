@@ -1163,16 +1163,63 @@ const sharedRefcount = 2147483647
 // objectCmd answers the OBJECT introspection verb. ENCODING routes down the
 // per-type chain (stream then hash then list then set then zset then string) that
 // reports each key's storage band. REFCOUNT is answered here across every
-// keyspace, since f3 shares no allocation between keys. IDLETIME and FREQ still
-// fall to the chain's unknown-subcommand error: both need per-key access metadata
-// (an LRU clock or an LFU counter) that no registry keeps yet, so answering them
-// would mean inventing a number rather than reading one.
+// keyspace, since f3 shares no allocation between keys. FREQ is answered here too:
+// Redis reports a key's LFU access counter only under an LFU maxmemory-policy and
+// rejects the verb otherwise, and f3 runs no LFU policy (it exposes no
+// maxmemory-policy and keeps no per-key access counter, the memory bar wants no
+// per-key clock), so a present key always takes that rejection and a missing key
+// is the null bulk Redis returns. IDLETIME still falls to the chain's
+// unknown-subcommand error: its present-key answer is seconds since last access,
+// which needs the per-key LRU clock f3 deliberately does not keep (store/resid.go
+// tracks residency with a single SIEVE bit, no per-record clock field), so
+// answering it would mean inventing a number rather than reading one.
 func objectCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if tokenIs(args[0], "REFCOUNT") && len(args) == 2 {
 		objectRefcount(cx, args[1], r)
 		return
 	}
+	if tokenIs(args[0], "FREQ") && len(args) == 2 {
+		objectFreq(cx, args[1], r)
+		return
+	}
 	stream.Object(cx, args, r)
+}
+
+// lfuNotSelected is the error Redis returns for OBJECT FREQ when the running
+// maxmemory-policy is not one of the LFU policies, byte-for-byte the redis 8.8.0
+// message (verified live). For f3 it is always the answer for a present key: no
+// maxmemory-policy is exposed to switch into an LFU mode, so access frequency is
+// never tracked.
+const lfuNotSelected = "ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust."
+
+// objectFreq answers OBJECT FREQ key. A key present in any keyspace reports the
+// LFU-not-selected error, since f3 runs no LFU policy; a key present nowhere is
+// the null bulk Redis returns for OBJECT FREQ on a missing key, distinct from the
+// "no such key" error REFCOUNT gives. The probes honour the key deadline, so a
+// lazily-expired key reads as missing.
+func objectFreq(cx *shard.Ctx, key []byte, r shard.Reply) {
+	if keyExistsAnywhere(cx, key) {
+		r.Err(lfuNotSelected)
+		return
+	}
+	r.Null()
+}
+
+// keyExistsAnywhere reports whether a live key sits in any keyspace, the string
+// store first and then each collection registry in the OBJECT chain order. Each
+// probe is read-only, non-creating, and honours the key deadline, so a
+// lazily-expired key reads as absent and a read-only OBJECT leaves no registry or
+// residency state behind.
+func keyExistsAnywhere(cx *shard.Ctx, key []byte) bool {
+	if v, ok := cx.St.GetString(key, cx.NowMs, cx.Val); ok {
+		cx.Val = v
+		return true
+	}
+	return set.Has(cx, key) ||
+		zset.Has(cx, key) ||
+		hash.Has(cx, key) ||
+		list.Has(cx, key) ||
+		stream.Has(cx, key)
 }
 
 // objectRefcount answers OBJECT REFCOUNT key. A present key of any type has a
