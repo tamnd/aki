@@ -63,6 +63,13 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			r.Err("ERR resulting score is not a number (NaN)")
 			return
 		}
+		// Log the resolved score whenever a value was written, a new member or a
+		// moved score, covering the plain and INCR forms alike before the INCR
+		// early-return below. An idempotent re-add or a flag-suppressed pair writes
+		// nothing and logs nothing.
+		if gotAdded || gotChanged {
+			logAdd(cx, key, member, newScore)
+		}
 		if gotAdded {
 			added++
 		}
@@ -172,10 +179,13 @@ func Zincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		z = newZset()
 		created = true
 	}
-	_, _, newScore, _, nan := z.update(member, delta, flags{incr: true})
+	gotAdded, gotChanged, newScore, _, nan := z.update(member, delta, flags{incr: true})
 	if nan {
 		r.Err("ERR resulting score is not a number (NaN)")
 		return
+	}
+	if gotAdded || gotChanged {
+		logAdd(cx, key, member, newScore)
 	}
 	if created {
 		g.m[string(key)] = z
@@ -267,6 +277,7 @@ func Zrem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	for _, m := range args[1:] {
 		if z.rem(m) {
 			removed++
+			logRemove(cx, args[0], m)
 		}
 	}
 	if z.card() == 0 {
