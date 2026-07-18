@@ -306,6 +306,13 @@ func (r *Runtime) Shards() int { return len(r.workers) }
 // accessor must not be used.
 func (r *Runtime) BootStore(i int) *store.Store { return r.workers[i].st }
 
+// BootCtx returns shard i's handler context under the same pre-Start
+// contract as BootStore: collection replay needs the worker's real Ctx,
+// not a bare one, because the set and zset registries hang off Ctx.Coll
+// and Ctx.ZColl and a registry built anywhere else would be invisible to
+// the worker that serves the keys after Start.
+func (r *Runtime) BootCtx(i int) *Ctx { return &r.workers[i].cx }
+
 // ShardOf routes a key to its owner: hash slot to contiguous slot group
 // to group id mod S (slot.go). This is the slot-honest route the f3
 // wyhash comment promised; keys sharing a hash tag share a slot, so they
