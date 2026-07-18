@@ -123,3 +123,80 @@ func (s *Store) WalkCollection(
 		return nil
 	})
 }
+
+// CollLiveFrames computes which of this shard's collection frames for one kind a
+// compaction must keep, and how many dead bytes it would reclaim, the collection half
+// of the liveness-from-index rule the record-region compaction driver consumes. A
+// frame is live when it is the last snapshot of its key or an effect cut after that
+// snapshot; an effect a later snapshot of the same key supersedes is dead, exactly as
+// a string record a later write supersedes is dead. A key with no snapshot keeps all
+// its effects, since without a base the effect tail is the only record of it. The
+// live addresses come back in append order, the order CompactRecords re-homes them,
+// so a rewrite preserves the replay order recovery depends on. It is a no-op on a
+// store with no record log.
+//
+// This is the box-free core of set compaction (spec 2064/f3/M8-collection-durability-
+// plan slice 4), and the per-type compaction slices reuse it unchanged since only the
+// kind byte differs. The physical reclaim that consumes the live set, CompactRecords
+// under the epoch guard plus the free-map-aware walk that stops replaying the freed
+// span, is the box-gated integration the milestone's online-compaction item owns, the
+// same split slice 3 took between the snapshot core and its runtime trigger.
+func (s *Store) CollLiveFrames(kind akifile.CollKind) (live []uint64, dead uint64, err error) {
+	if s.akirlog == nil {
+		return nil, 0, nil
+	}
+	type cframe struct {
+		addr uint64
+		key  string
+		size uint64
+	}
+	var frames []cframe
+	lastSnap := make(map[string]int) // index into frames of a key's most recent snapshot
+	var scratch []byte
+	walkErr := s.akirlog.walkShard(func(addr uint64, rec akifile.RecordRow) error {
+		isSnap := rec.Flags&akifile.RecFlagCollectionSnap != 0
+		isOp := rec.Flags&akifile.RecFlagCollectionOp != 0
+		if !isSnap && !isOp {
+			return nil
+		}
+		var k akifile.CollKind
+		if isSnap {
+			row, e := akifile.ParseCollSnap(rec.Value)
+			if e != nil {
+				return e
+			}
+			k = row.Kind
+		} else {
+			row, e := akifile.ParseCollOp(rec.Value)
+			if e != nil {
+				return e
+			}
+			k = row.Kind
+		}
+		if k != kind {
+			return nil
+		}
+		// The frame's exact on-disk footprint, re-encoded through the real record
+		// framer so the dead figure the trigger reads matches the bytes a reclaim
+		// frees. ValueLen equals len(Value) on a collection frame, so the re-encode
+		// reproduces the original byte-for-byte.
+		scratch, _ = akifile.AppendRecordFrame(scratch[:0], rec)
+		i := len(frames)
+		frames = append(frames, cframe{addr: addr, key: string(rec.Key), size: uint64(len(scratch))})
+		if isSnap {
+			lastSnap[string(rec.Key)] = i
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, 0, walkErr
+	}
+	for i, fr := range frames {
+		if sp, ok := lastSnap[fr.key]; ok && i < sp {
+			dead += fr.size
+			continue
+		}
+		live = append(live, fr.addr)
+	}
+	return live, dead, nil
+}
