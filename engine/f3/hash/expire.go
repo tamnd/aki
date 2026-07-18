@@ -93,7 +93,17 @@ func expireGeneric(cx *shard.Ctx, args [][]byte, r shard.Reply, cmd string, unit
 	now := uint64(cx.NowMs)
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(fields))
 	for _, f := range fields {
-		out = resp.AppendInt(out, applyExpiry(h, f, at, cond, now))
+		code := applyExpiry(h, f, at, cond, now)
+		out = resp.AppendInt(out, code)
+		// Make the resolved change durable: a set records the field deadline, a set-to-the-
+		// past that deleted the field records the field-delete, and a refused or absent field
+		// changed nothing so records nothing.
+		switch code {
+		case 1:
+			logFieldExpire(cx, args[0], f, at)
+		case 2:
+			logDelField(cx, args[0], f)
+		}
 	}
 	cx.Aux = out
 	if h.card() == 0 {
@@ -246,7 +256,13 @@ func Hpersist(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(fields))
 	for _, f := range fields {
-		out = resp.AppendInt(out, persistField(h, f))
+		code := persistField(h, f)
+		out = resp.AppendInt(out, code)
+		// A field whose TTL was actually cleared records a zero-deadline field-expire, so a
+		// replay drops the deadline instead of restoring it from an earlier effect.
+		if code == 1 {
+			logFieldExpire(cx, args[0], f, 0)
+		}
 	}
 	cx.Aux = out
 	r.Raw(out)
@@ -317,11 +333,18 @@ func Hgetex(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	switch mode {
 	case getexSet:
 		for _, f := range fields {
-			applyExpiry(h, f, at, condNone, now)
+			switch applyExpiry(h, f, at, condNone, now) {
+			case 1:
+				logFieldExpire(cx, args[0], f, at)
+			case 2:
+				logDelField(cx, args[0], f)
+			}
 		}
 	case getexPersist:
 		for _, f := range fields {
-			persistField(h, f)
+			if persistField(h, f) == 1 {
+				logFieldExpire(cx, args[0], f, 0)
+			}
 		}
 	}
 	// A read-only HGETEX changes no footprint, but a TTL set may have flipped the

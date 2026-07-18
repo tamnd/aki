@@ -37,15 +37,19 @@ import (
 // shutdown only, the string model one level down.
 //
 // Field TTL (the HEXPIRE, HPERSIST, and HGETEX family, and the lazy reap they drive)
-// is deferred as one coherent follow-on, the hash analog of the set vertical's
-// deferred key-expire effect. This slice logs field values and field deletes, not
-// field deadlines, and the snapshot header carries the key TTL but not the per-field
-// TTLs yet, so a crash before the next checkpoint loses a field TTL set after the last
-// snapshot, and an HEXPIRE that deleted a field on the spot (a set-to-the-past) can
-// leave that field to reappear on an effect-only replay. The snapshot reaps fired
-// fields before it folds a hash, so it never durably resurrects a lazily-expired
-// field; the field-TTL effect slice makes the between-checkpoint deadline durable and
-// closes the rest.
+// is durable through the same effect-plus-snapshot shape one level down to the field.
+// A setter that installs a field deadline cuts a field-expire effect naming the field
+// and its deadline, an HPERSIST or an HGETEX PERSIST cuts one carrying a zero deadline,
+// and a set-to-the-past that deletes a field on the spot cuts the existing field-delete
+// effect, so a between-checkpoint field TTL is not lost. The snapshot header carries a
+// field-TTL section after the key deadline: the fields that hold a TTL and their
+// deadlines, so a checkpoint captures the per-field state the element run (field values
+// only) does not. The lazy reap itself cuts no effect, the same reasoning the key-expire
+// slice uses: a replay reconstructs each field's deadline from the effect or the
+// snapshot and the first access on the recovered hash reaps a fired field exactly as the
+// live run did, so the reap needs no durable record of its own. The snapshot still reaps
+// fired fields before folding a hash, so it never durably resurrects an already-expired
+// field.
 
 const (
 	// hashOpSet records that field now holds a value at key, re-driven on recovery
@@ -67,6 +71,14 @@ const (
 	// and cuts a key-delete instead, so this op always carries a future or cleared
 	// deadline.
 	hashOpExpire uint8 = 4
+	// hashOpFieldExpire records one field's per-field HEXPIRE deadline: SubKey is the
+	// field, SubValue the deadline in unix milliseconds, eight bytes little-endian, 0 for
+	// an HPERSIST or an HGETEX PERSIST that cleared it. A replay installs the deadline on
+	// the field the earlier hashOpSet created, so the field's next-expire hint matches the
+	// live run and the recovered hash reaps the field on its first access exactly as the
+	// live one did. An HEXPIRE to a past instant deletes the field on the spot and cuts a
+	// hashOpDelField instead, so this op always carries a future or cleared deadline.
+	hashOpFieldExpire uint8 = 5
 )
 
 // logSet cuts a set effect for field taking value at key. It is called after the
@@ -108,14 +120,25 @@ func logExpire(cx *shard.Ctx, key []byte, at int64) {
 	}
 }
 
-// snapHeaderLen is the fixed hash snapshot header: the key deadline in unix
-// milliseconds (0 when the hash carries no key TTL), little-endian. The header is the
-// per-key state the element run does not carry, so a snapshot restores a volatile
-// hash's key TTL as of the checkpoint, and a between-checkpoint EXPIRE or PERSIST also
-// cuts its own hashOpExpire effect so the whole-key deadline is durable between
-// checkpoints. The per-field TTLs are not in the header this slice (the deferred
-// field-TTL follow-on), so a snapshot restores field values and the key TTL, not
-// field deadlines.
+// logFieldExpire cuts a field-deadline effect for field at key: the new deadline in
+// unix milliseconds, or 0 for a persist that cleared it. It is called after the deadline
+// is stored, so a replay reaches the same field TTL the live run set. The set-to-a-past-
+// instant case deletes the field and cuts a field-delete instead, never this.
+func logFieldExpire(cx *shard.Ctx, key, field []byte, at int64) {
+	if cx.St != nil {
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(at))
+		cx.St.LogCollectionOp(key, akifile.CollKindHash, hashOpFieldExpire, field, b[:])
+	}
+}
+
+// snapHeaderLen is the fixed prefix of the hash snapshot header: the key deadline in
+// unix milliseconds (0 when the hash carries no key TTL), little-endian. A field-TTL
+// section follows this prefix (buildHashSnapshot), so the header is the per-key and
+// per-field TTL state the element run (field values only) does not carry. A snapshot
+// restores a volatile hash's key TTL and its per-field deadlines as of the checkpoint,
+// and a between-checkpoint EXPIRE, PERSIST, HEXPIRE, or HPERSIST also cuts its own effect
+// so both deadlines are durable between checkpoints.
 const snapHeaderLen = 8
 
 // Snapshot writes a whole-hash snapshot frame for every live hash on this shard, the
@@ -166,10 +189,64 @@ func Snapshot(cx *shard.Ctx) {
 func buildHashSnapshot(h *hash) (header, elementRun []byte) {
 	header = make([]byte, snapHeaderLen)
 	binary.LittleEndian.PutUint64(header, uint64(h.expireAt))
+	// Field-TTL section: the count of fields carrying a TTL followed by each such field
+	// and its deadline. Only fields with a live TTL are listed, so a hash with none (the
+	// common case) writes a single zero-count byte. It is built alongside the element run
+	// in one walk, reading each field's deadline through fieldExp, which spans both bands.
+	var ttls []byte
+	var n uint64
 	h.each(func(field, value []byte) {
 		elementRun = appendEntry(elementRun, field, value)
+		if exp := h.fieldExp(field); exp != 0 {
+			ttls = appendFieldTTL(ttls, field, exp)
+			n++
+		}
 	})
+	header = binary.AppendUvarint(header, n)
+	header = append(header, ttls...)
 	return header, elementRun
+}
+
+// appendFieldTTL appends one field-deadline pair to a snapshot's field-TTL section: the
+// length-prefixed field name and its absolute unix-ms deadline, eight bytes little-endian.
+func appendFieldTTL(dst, field []byte, at uint64) []byte {
+	dst = binary.AppendUvarint(dst, uint64(len(field)))
+	dst = append(dst, field...)
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], at)
+	return append(dst, b[:]...)
+}
+
+// restoreFieldTTLs decodes the field-TTL section that follows the fixed header prefix and
+// installs each deadline on the field the element run already rebuilt. A pre-field-TTL
+// snapshot has no section (header is exactly the prefix), which decodes as no field TTLs.
+// It reports false on a torn section, the fail-closed cut recovery wants. A deadline for a
+// field the run did not restore is a defensive no-op (setFieldExp reports absent).
+func restoreFieldTTLs(h *hash, section []byte) bool {
+	if len(section) == 0 {
+		return true
+	}
+	n, w := binary.Uvarint(section)
+	if w <= 0 {
+		return false
+	}
+	p := section[w:]
+	for i := uint64(0); i < n; i++ {
+		fl, w := binary.Uvarint(p)
+		if w <= 0 || uint64(len(p)-w) < fl {
+			return false
+		}
+		p = p[w:]
+		field := p[:fl]
+		p = p[fl:]
+		if len(p) < 8 {
+			return false
+		}
+		at := binary.LittleEndian.Uint64(p)
+		p = p[8:]
+		h.setFieldExp(field, at)
+	}
+	return true
 }
 
 // Recover rebuilds this shard's hashes from the record log's hash frames, re-driving
@@ -221,6 +298,9 @@ func applyHashSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
 	}
 	if len(snap.Header) >= snapHeaderLen {
 		h.expireAt = int64(binary.LittleEndian.Uint64(snap.Header))
+		if !restoreFieldTTLs(h, snap.Header[snapHeaderLen:]) {
+			return akifile.ErrLength
+		}
 	}
 	g.note(h)
 	return nil
@@ -255,11 +335,12 @@ func eachPair(run []byte, fn func(field, value []byte)) bool {
 
 // applyHashOp re-drives one hash effect onto the registry: a set creates the hash on
 // its first field and writes the pair, a field-delete drops the field and the key on
-// the last one, a key-delete clears the whole hash, and a key-expire sets the whole-key
-// deadline. It is the effect arm the recovery walk drives. It goes through hash.set and
-// hash.del, so a field that breaches an inline threshold promotes to the native band
-// exactly as it did live. It reports ErrLength on a torn expire payload, the fail-closed
-// cut recovery wants; an expire on an absent key is a defensive no-op.
+// the last one, a key-delete clears the whole hash, a key-expire sets the whole-key
+// deadline, and a field-expire sets or clears one field's TTL. It is the effect arm the
+// recovery walk drives. It goes through hash.set and hash.del, so a field that breaches
+// an inline threshold promotes to the native band exactly as it did live. It reports
+// ErrLength on a torn expire or field-expire payload, the fail-closed cut recovery wants;
+// an expire on an absent key or field is a defensive no-op.
 func applyHashOp(g *reg, key []byte, op akifile.CollOpRow) error {
 	switch op.Op {
 	case hashOpSet:
@@ -290,6 +371,21 @@ func applyHashOp(g *reg, key []byte, op akifile.CollOpRow) error {
 		if h := g.m[string(key)]; h != nil {
 			h.expireAt = int64(binary.LittleEndian.Uint64(op.SubValue))
 		}
+	case hashOpFieldExpire:
+		if len(op.SubValue) < 8 {
+			return akifile.ErrLength
+		}
+		h := g.m[string(key)]
+		if h == nil {
+			return nil
+		}
+		at := binary.LittleEndian.Uint64(op.SubValue)
+		if at == 0 {
+			h.clearFieldExp(op.SubKey)
+		} else {
+			h.setFieldExp(op.SubKey, at)
+		}
+		g.note(h)
 	}
 	return nil
 }
