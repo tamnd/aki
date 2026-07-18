@@ -59,6 +59,76 @@ var statNames = [NumStats]string{
 	StatVolatileKeys:       "volatile_keys",
 }
 
+// memDoctorFloor is the used-memory figure MEMORY DOCTOR needs to see before it
+// will render a health verdict, matching the 5MB floor redis's own doctor uses:
+// below it the dataset is too small for any ratio to be meaningful, so the
+// honest answer is that there is nothing to diagnose.
+const memDoctorFloor = 5 << 20
+
+// renderMemStats formats the summed counters as MEMORY STATS' flat field-value
+// array (spec 2064/f3/18): a RESP array of alternating name bulk and integer,
+// the shape redis-cli folds into a map. f3 reports the figures it accounts for
+// honestly and omits the allocator-internal fields (fragmentation ratios, peak
+// and startup allocation, per-db overhead) it does not model, rather than
+// inventing numbers a client would read as real. keys.count is the whole-
+// keyspace live count, total.allocated the shards' allocator-held bytes (the
+// used_memory INFO reports), dataset.bytes the live record charge, and the
+// index and value-log figures the f3 memory bar divides against.
+func (r *Runtime) renderMemStats(dst []byte, stats []uint64) []byte {
+	get := func(i int) uint64 {
+		if i < len(stats) {
+			return stats[i]
+		}
+		return 0
+	}
+	keys := get(StatKeys)
+	total := get(StatUsedMemory)
+	var perKey uint64
+	if keys != 0 {
+		perKey = total / keys
+	}
+	fields := []struct {
+		name string
+		v    uint64
+	}{
+		{"keys.count", keys},
+		{"total.allocated", total},
+		{"dataset.bytes", get(StatArenaLive)},
+		{"index.bytes", get(StatIndexBytes)},
+		{"vlog.bytes", get(StatVlogBytes)},
+		{"keys.bytes-per-key", perKey},
+	}
+	dst = resp.AppendArrayHeader(dst, len(fields)*2)
+	for _, f := range fields {
+		dst = resp.AppendBulk(dst, []byte(f.name))
+		dst = resp.AppendInt(dst, int64(f.v))
+	}
+	return dst
+}
+
+// renderMemDoctor folds the aggregate used-memory figure into MEMORY DOCTOR's
+// bulk verdict. Below the doctor floor the dataset is too small to diagnose, the
+// answer redis gives an idle instance; above it f3 reports no issue, since the
+// allocator-ratio faults redis's doctor looks for (fragmentation, peak-to-current
+// drift, RSS overhead) come from a general-purpose allocator the arena does not
+// have. The wording tracks redis so a client that prints the doctor line reads a
+// familiar verdict.
+func (r *Runtime) renderMemDoctor(dst []byte, stats []uint64) []byte {
+	get := func(i int) uint64 {
+		if i < len(stats) {
+			return stats[i]
+		}
+		return 0
+	}
+	var msg string
+	if get(StatUsedMemory) < memDoctorFloor {
+		msg = "Hi Sam, this instance is empty or is using very little memory, my issues detector can't be used in these conditions. Please, leave this server alone, I can't help you, and go away."
+	} else {
+		msg = "Sam, I can't find any memory issue in your instance. I can only account for what occurs on this base."
+	}
+	return resp.AppendBulk(dst, []byte(msg))
+}
+
 // appendStat writes one name:value INFO line.
 func appendStat(text []byte, name string, v uint64) []byte {
 	text = append(text, name...)

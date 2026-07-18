@@ -65,6 +65,16 @@ const (
 	// the whole keyspace in one page, the same single-page answer HSCAN gives
 	// for its listpack band, so a client's cursor loop makes exactly one pass.
 	FanScan
+
+	// FanMemStats sums the same fixed-width per-shard counter blob FanStats
+	// gathers, but renders MEMORY STATS' flat field-value array instead of the
+	// INFO text: MEMORY STATS. The per-shard op is the INFO blob producer, so
+	// only the final reply shape differs.
+	FanMemStats
+
+	// FanMemDoctor sums the same counter blob and renders MEMORY DOCTOR's bulk
+	// verdict string, a health line folded from the aggregate used-memory figure.
+	FanMemDoctor
 )
 
 // maxFanKeys caps the keys one sub-command carries, so a sub-command's
@@ -285,7 +295,9 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 			fc.vals[p] = append(fc.vals[p][:0], part[:n]...)
 			part = part[n:]
 		}
-	case FanStats:
+	case FanStats, FanMemStats, FanMemDoctor:
+		// All three gather the same fixed-width counter blob and sum it
+		// position-wise; only the final reply shape differs.
 		if fc.stats == nil {
 			fc.stats = make([]uint64, len(part)/8)
 		}
@@ -349,6 +361,10 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 		}
 	case FanStats:
 		fc.out = c.rt.renderStats(fc.out, fc.stats)
+	case FanMemStats:
+		fc.out = c.rt.renderMemStats(fc.out, fc.stats)
+	case FanMemDoctor:
+		fc.out = c.rt.renderMemDoctor(fc.out, fc.stats)
 	case FanKeys:
 		fc.out = resp.AppendArrayHeader(fc.out, len(fc.vals))
 		for _, v := range fc.vals {
