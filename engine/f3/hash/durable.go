@@ -1,6 +1,8 @@
 package hash
 
 import (
+	"encoding/binary"
+
 	"github.com/tamnd/aki/engine/f3/akifile"
 	"github.com/tamnd/aki/engine/f3/shard"
 )
@@ -24,16 +26,24 @@ import (
 // command follows. Every log helper is a no-op on a store with no .aki handle, so the
 // pure in-memory path is unchanged.
 //
+// The snapshot half (the hash arm of slice 3) folds each live hash to one whole-hash
+// snapshot frame at the checkpoint (Snapshot): the field-value pairs packed with the
+// same encoder the cold chunk uses (appendEntry), under a small header carrying the
+// key TTL. A reopen rebuilds each hash from its last snapshot and replays only the
+// effect tail cut after it, the same bounded checkpoint-plus-tail path the string
+// index recovery and the set vertical take. The cadence is snapshot-at-checkpoint-and-
+// shutdown only, the string model one level down.
+//
 // Field TTL (the HEXPIRE, HPERSIST, and HGETEX family, and the lazy reap they drive)
 // is deferred as one coherent follow-on, the hash analog of the set vertical's
 // deferred key-expire effect. This slice logs field values and field deletes, not
-// field deadlines, so a crash before the next checkpoint loses a field TTL set after
-// the last snapshot, and an HEXPIRE that deleted a field on the spot (a set-to-the-
-// past) can leave that field to reappear on an effect-only replay. The snapshot slice
-// captures the live TTL state at each checkpoint and the field-TTL effect slice makes
-// the between-checkpoint deadline durable; together they close the gap. The snapshot
-// half itself (buildHashSnapshot and the checkpoint dumper) is the sibling slice this
-// one clears the path for, so Recover carries a no-op snapshot arm until it lands.
+// field deadlines, and the snapshot header carries the key TTL but not the per-field
+// TTLs yet, so a crash before the next checkpoint loses a field TTL set after the last
+// snapshot, and an HEXPIRE that deleted a field on the spot (a set-to-the-past) can
+// leave that field to reappear on an effect-only replay. The snapshot reaps fired
+// fields before it folds a hash, so it never durably resurrects a lazily-expired
+// field; the field-TTL effect slice makes the between-checkpoint deadline durable and
+// closes the rest.
 
 const (
 	// hashOpSet records that field now holds a value at key, re-driven on recovery
@@ -74,17 +84,80 @@ func logDeleteKey(cx *shard.Ctx, key []byte) {
 	}
 }
 
+// snapHeaderLen is the fixed hash snapshot header: the key deadline in unix
+// milliseconds (0 when the hash carries no key TTL), little-endian. The header is the
+// per-key state the element run does not carry, so a snapshot restores a volatile
+// hash's key TTL where the effect log, which logs field deltas only, cannot yet. The
+// per-field TTLs are not in the header this slice (the deferred field-TTL follow-on),
+// so a snapshot restores field values and the key TTL, not field deadlines.
+const snapHeaderLen = 8
+
+// Snapshot writes a whole-hash snapshot frame for every live hash on this shard, the
+// hash arm of the checkpoint dumper (and the clean-shutdown flush). A reopen rebuilds
+// each hash from its snapshot then replays only the effect tail cut after it, so the
+// tail a recovery must re-drive stays bounded to one checkpoint interval. It reaches
+// the registry through the shared regs map keyed by the store, so a shard that ran no
+// hash command snapshots nothing. It reaps fired fields before folding a hash, so a
+// snapshot never durably resurrects a lazily-expired field, and skips a hash the key
+// deadline or the reap has emptied. It is a no-op on a store with no record log and on
+// a shard that has built no hash registry.
+func Snapshot(cx *shard.Ctx) {
+	if cx.St == nil {
+		return
+	}
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return
+	}
+	g := v.(*reg)
+	now := uint64(cx.NowMs)
+	for k, h := range g.m {
+		// Skip a hash the key deadline already fired: a snapshot of it would durably
+		// resurrect a key EXISTS reports absent, so let the next access drop it. The
+		// skip is read-only, matching the scan walks.
+		if h.expireAt != 0 && h.expireAt <= int64(now) {
+			continue
+		}
+		// Reap fired fields so the fold captures the live set, not a field whose TTL
+		// has passed. Gated by the next-expire hint, so a hash with no field TTL pays
+		// one comparison.
+		h.reap(now)
+		if h.card() == 0 {
+			continue
+		}
+		header, run := buildHashSnapshot(h)
+		cx.St.LogCollectionSnap([]byte(k), akifile.CollKindHash, header, run)
+	}
+}
+
+// buildHashSnapshot renders a live hash to a snapshot payload: the header carries the
+// key TTL and the element run packs every field-value pair with the same length-
+// prefixed encoder the cold chunk uses (appendEntry), so recovery decodes the run with
+// the reader the cold path already trusts. It reads the whole hash through each, which
+// spans both bands and preads any demoted value back, so a snapshot of a partly-cold
+// hash is complete. It allocates fresh slices, a checkpoint-time cost off the steady
+// mutation path.
+func buildHashSnapshot(h *hash) (header, elementRun []byte) {
+	header = make([]byte, snapHeaderLen)
+	binary.LittleEndian.PutUint64(header, uint64(h.expireAt))
+	h.each(func(field, value []byte) {
+		elementRun = appendEntry(elementRun, field, value)
+	})
+	return header, elementRun
+}
+
 // Recover rebuilds this shard's hashes from the record log's hash frames, re-driving
-// each effect in append order onto a fresh registry. It is the hash arm of an .aki
+// each frame in append order onto a fresh registry. It is the hash arm of an .aki
 // reopen, the sibling of set.Recover: after the store's string index recovery, the
-// runtime calls Recover so a restart restores the hashes a crash would otherwise
-// lose. It applies effects through the low-level band-selecting mutators (hash.set,
-// hash.del), not the logging command wrappers, so the rebuild re-logs nothing and the
-// band a field lands in matches the live run's. A hash that reaches zero cardinality
-// is dropped, matching the live last-field-leaves rule, and a key-delete effect drops
-// the whole hash. The snapshot arm is a no-op until the snapshot slice lands, so a
-// slice-2 log holds only effects and Recover replays them from an empty registry. It
-// is a no-op on a store with no record log.
+// runtime calls Recover so a restart restores the hashes a crash would otherwise lose.
+// A snapshot frame resets its key to the snapshotted fields and key TTL, and every
+// effect frame after it applies on top, so a hash rebuilds from its last snapshot plus
+// its effect tail, the bounded path the string index recovery takes. It applies
+// through the low-level band-selecting mutators (hash.set, hash.del), not the logging
+// command wrappers, so the rebuild re-logs nothing and the band a field lands in
+// matches the live run's. A hash that reaches zero cardinality is dropped, matching
+// the live last-field-leaves rule, and a key-delete effect drops the whole hash. It is
+// a no-op on a store with no record log.
 func Recover(cx *shard.Ctx) error {
 	if cx.St == nil {
 		return nil
@@ -92,15 +165,67 @@ func Recover(cx *shard.Ctx) error {
 	g := registry(cx)
 	return cx.St.WalkCollection(akifile.CollKindHash,
 		func(key []byte, snap akifile.CollSnapRow) error {
-			// Hash snapshots arrive in the next slice; a slice-2 effect log never
-			// contains one, so the walk skips it here and the snapshot slice replaces
-			// this arm with a real applyHashSnapshot.
-			return nil
+			return applyHashSnapshot(g, key, snap)
 		},
 		func(key []byte, op akifile.CollOpRow) error {
 			applyHashOp(g, key, op)
 			return nil
 		})
+}
+
+// applyHashSnapshot resets key to the snapshot's fields and key TTL, superseding every
+// effect frame for key that preceded it. It drops any state the earlier tail built,
+// rebuilds the hash from the field-value run through the same band-selecting set funnel
+// a live run and an effect replay use, and restores the key TTL from the header. An
+// empty element run leaves the key dropped, since the registry keeps no empty hash. A
+// torn run reports ErrLength, the fail-closed cut a recovering reader wants.
+func applyHashSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
+	g.drop(key)
+	var h *hash
+	if !eachPair(snap.ElementRun, func(field, value []byte) {
+		if h == nil {
+			h = newHash()
+			g.m[string(key)] = h
+		}
+		h.set(field, value)
+	}) {
+		return akifile.ErrLength
+	}
+	if h == nil {
+		return nil
+	}
+	if len(snap.Header) >= snapHeaderLen {
+		h.expireAt = int64(binary.LittleEndian.Uint64(snap.Header))
+	}
+	g.note(h)
+	return nil
+}
+
+// eachPair walks a length-prefixed field-value run forward, calling fn for each pair,
+// the O(n) reader the snapshot rebuild uses over the same wire form appendEntry writes
+// (chunkEntry is the positional O(idx) sibling the cold read path uses). It reports
+// false on a torn run, which recovery treats as a corrupt frame. The slices fn
+// receives alias the run and are valid only for the call.
+func eachPair(run []byte, fn func(field, value []byte)) bool {
+	p := run
+	for len(p) > 0 {
+		fl, w := binary.Uvarint(p)
+		if w <= 0 || uint64(len(p)-w) < fl {
+			return false
+		}
+		p = p[w:]
+		field := p[:fl]
+		p = p[fl:]
+		vl, w := binary.Uvarint(p)
+		if w <= 0 || uint64(len(p)-w) < vl {
+			return false
+		}
+		p = p[w:]
+		value := p[:vl]
+		p = p[vl:]
+		fn(field, value)
+	}
+	return true
 }
 
 // applyHashOp re-drives one hash effect onto the registry: a set creates the hash on
