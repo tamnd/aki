@@ -87,6 +87,13 @@ type entry struct {
 	// a key set spanning shards is refused for now rather than silently read from
 	// one owner.
 	streamKeyAt func(args [][]byte) int
+
+	// subFan routes a verb whose keyless subcommands aggregate across every
+	// shard while its keyed subcommands stay on the point path (MEMORY: USAGE
+	// keys on args[1], STATS and DOCTOR fan-all). It returns the fan kind and
+	// true for a subcommand that scatters keyless, or ok=false to leave the
+	// command on the point route. fanOp carries the per-shard sub-command op.
+	subFan func(args [][]byte) (shard.FanKind, bool)
 }
 
 // maxVerb bounds the uppercase scratch for verb lookup; no Redis verb comes
@@ -722,11 +729,32 @@ func init() {
 	table["OBJECT"].keyAt = 1
 
 	// MEMORY USAGE key routes on the key after its subcommand token, the same
-	// keyAt=1 shape as OBJECT, so it reaches the owning shard. The other MEMORY
-	// subcommands (STATS, DOCTOR, HELP) carry no key and round-robin, landing on
-	// the unknown-subcommand error until a later slice wires them.
+	// keyAt=1 shape as OBJECT, so it reaches the owning shard. STATS and DOCTOR
+	// carry no key and aggregate across every shard: subFan sends them through
+	// the keyless fan with the INFO counter blob as the per-shard partial, and
+	// the gather renders each one's reply. HELP and any other subcommand fall to
+	// the point path and the unknown-subcommand error.
 	register("MEMORY", memoryCmd, 1, -1, false)
 	table["MEMORY"].keyAt = 1
+	table["MEMORY"].fanOp = registerShard(infoShardAll)
+	table["MEMORY"].subFan = memorySubFan
+}
+
+// memorySubFan routes the keyless MEMORY subcommands. STATS and DOCTOR scatter
+// to every shard and fold the per-shard counter blob into their own reply; every
+// other form (USAGE with its key, HELP, an unknown token) returns ok=false and
+// stays on the point path.
+func memorySubFan(args [][]byte) (shard.FanKind, bool) {
+	if len(args) != 2 {
+		return 0, false
+	}
+	switch {
+	case tokenIs(args[1], "STATS"):
+		return shard.FanMemStats, true
+	case tokenIs(args[1], "DOCTOR"):
+		return shard.FanMemDoctor, true
+	}
+	return 0, false
 }
 
 // Handlers returns the op-indexed handler vector for Runtime.Use.
@@ -801,6 +829,15 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 	}
 	if e.streamKeyAt != nil {
 		return dispatchStreamRead(c, e, args)
+	}
+	if e.subFan != nil {
+		if kind, ok := e.subFan(args); ok {
+			err := c.DoFanAll(e.fanOp, kind)
+			if err == shard.ErrTooBig {
+				return oops(c, "ERR command too large")
+			}
+			return err
+		}
 	}
 	if e.keyAt > 0 && n > e.keyAt {
 		// A verb whose routing key is not its first argument (OBJECT) goes to
