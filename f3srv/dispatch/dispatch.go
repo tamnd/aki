@@ -16,6 +16,7 @@ import (
 	"github.com/tamnd/aki/engine/f3/list"
 	"github.com/tamnd/aki/engine/f3/set"
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/engine/f3/store"
 	"github.com/tamnd/aki/engine/f3/str"
 	"github.com/tamnd/aki/engine/f3/stream"
 	"github.com/tamnd/aki/engine/f3/zset"
@@ -711,12 +712,13 @@ func init() {
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
 	// keyless here; the keyAt route in Dispatch sends it to the owning shard
-	// when a key is present, and OBJECT HELP with no key round-robins. It routes
-	// through the stream handler, which reports the stream encoding and then
-	// delegates every non-stream key down the chain to the hash handler, then
-	// list, then set, then the string store, so one OBJECT verb answers for every
-	// type.
-	register("OBJECT", stream.Object, 1, -1, false)
+	// when a key is present, and OBJECT HELP with no key round-robins. ENCODING
+	// routes through the stream handler, which reports the stream encoding and
+	// then delegates every non-stream key down the chain to the hash handler,
+	// then list, then set, then the string store, so one OBJECT verb answers for
+	// every type. REFCOUNT is answered generically across every keyspace at this
+	// layer, since f3 shares no allocations between keys.
+	register("OBJECT", objectCmd, 1, -1, false)
 	table["OBJECT"].keyAt = 1
 }
 
@@ -1105,6 +1107,56 @@ func existsCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	r.Int(0)
+}
+
+// sharedRefcount is the reference count Redis reports for its interned small
+// integer objects (0 through 9999), OBJ_SHARED_REFCOUNT in the server, which is
+// INT_MAX. f3 keeps no shared object table, but a string holding a canonical
+// integer in that range still reports this sentinel so OBJECT REFCOUNT matches
+// Redis byte for byte on the values it would have shared.
+const sharedRefcount = 2147483647
+
+// objectCmd answers the OBJECT introspection verb. ENCODING routes down the
+// per-type chain (stream then hash then list then set then zset then string) that
+// reports each key's storage band. REFCOUNT is answered here across every
+// keyspace, since f3 shares no allocation between keys. IDLETIME and FREQ still
+// fall to the chain's unknown-subcommand error: both need per-key access metadata
+// (an LRU clock or an LFU counter) that no registry keeps yet, so answering them
+// would mean inventing a number rather than reading one.
+func objectCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	if tokenIs(args[0], "REFCOUNT") && len(args) == 2 {
+		objectRefcount(cx, args[1], r)
+		return
+	}
+	stream.Object(cx, args, r)
+}
+
+// objectRefcount answers OBJECT REFCOUNT key. A present key of any type has a
+// single reference, with one exception that keeps parity with Redis: a string
+// holding a canonical integer in the shared range 0..9999 reports the shared
+// refcount sentinel Redis uses for its interned small integers. A key present in
+// no keyspace is the "ERR no such key" Redis returns, which is distinct from the
+// null bulk OBJECT ENCODING gives a missing key. The string probe and each Has
+// funnel honour the key deadline, so a lazily-expired key reads as no such key.
+func objectRefcount(cx *shard.Ctx, key []byte, r shard.Reply) {
+	if v, ok := cx.St.GetString(key, cx.NowMs, cx.Val); ok {
+		cx.Val = v
+		if n, isInt := store.ParseInt(v); isInt && n >= 0 && n < 10000 {
+			r.Int(sharedRefcount)
+			return
+		}
+		r.Int(1)
+		return
+	}
+	if set.Has(cx, key) ||
+		zset.Has(cx, key) ||
+		hash.Has(cx, key) ||
+		list.Has(cx, key) ||
+		stream.Has(cx, key) {
+		r.Int(1)
+		return
+	}
+	r.Err("ERR no such key")
 }
 
 // keyDeadline resolves a key's absolute unix-ms expiry across every keyspace,
