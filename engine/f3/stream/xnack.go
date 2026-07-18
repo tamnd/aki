@@ -69,6 +69,13 @@ func Xnack(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	for _, id := range ids {
 		if grp.nack(s, id, mode, retry, hasRetry, force) {
 			nacked++
+			// A nack disowns the slab (or FORCE-creates an unowned one) and rewrites its
+			// count; cut the resolved slab so a replay reaches the same NACK-zone state.
+			if cx.St != nil {
+				if pe, ok := grp.pel.find(id); ok {
+					logPelSet(cx, key, name, pe)
+				}
+			}
 		}
 	}
 	// A FORCE nack can add a pending slab for a not-yet-pending entry; reconcile the

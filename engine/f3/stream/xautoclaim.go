@@ -56,6 +56,7 @@ func Xautoclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(nogroupGeneric(key, name))
 		return
 	}
+	newCon := grp.consumer(conName) == nil
 	con := grp.ensureConsumer(conName, cx.NowMs)
 	con.seenTime = cx.NowMs
 
@@ -66,8 +67,13 @@ func Xautoclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		con.activeTime = cx.NowMs
 	}
 	// The pass reassigns pending slabs to the target consumer and prunes deleted
-	// entries; reconcile the footprint into the running sum.
+	// entries; reconcile the footprint into the running sum, then cut the reassigned
+	// slabs and the drops so a replay reproduces the pass.
 	g.note(s)
+	logClaimResults(cx, key, name, grp, con, res.claimed, newCon)
+	for _, id := range res.deleted {
+		logPelDel(cx, key, name, id)
+	}
 	cx.Aux = frameAutoClaim(cx.Aux[:0], s, res, justid)
 	r.Raw(cx.Aux)
 }
