@@ -1,0 +1,4 @@
+server	SET_Mops	GET_Mops	VmHWM_MiB
+reactor_repcap512	9.114	9.112	190
+redis_io6	3.365	4.260	200
+valkey_io4	2.778	3.759	132
