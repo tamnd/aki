@@ -12,6 +12,7 @@ import (
 
 	"github.com/tamnd/aki/engine/obs1"
 	"github.com/tamnd/aki/engine/obs1/replay"
+	"github.com/tamnd/aki/engine/obs1/shard"
 	"github.com/tamnd/aki/engine/obs1/sim"
 	"github.com/tamnd/aki/engine/obs1/store"
 )
@@ -56,7 +57,8 @@ func TestRecoverAppliesIntoStore(t *testing.T) {
 
 	st := store.New(16<<20, 1<<20)
 	t.Cleanup(func() { _ = st.Close() })
-	ap := replay.New(replay.Config{Store: func([]byte) *store.Store { return st }})
+	cx := &shard.Ctx{St: st}
+	ap := replay.New(replay.Config{Ctx: func([]byte) *shard.Ctx { return cx }})
 	r, err := obs1.Recover(ctx, obs1.RecoverConfig{
 		Store: bucket, Prefix: "p", DD: 0, Node: 0xB7, Incarnation: 1,
 		Apply: ap.Apply,

@@ -118,3 +118,63 @@ func TestBootServesAcrossRestart(t *testing.T) {
 	expect(t, r3, ":3\r\n")
 	commitAndStop(t, b3, srv3, nc3)
 }
+
+// TestBootServesSetsAcrossRestart drives the set plane through the boot
+// seam: creates, removals, an emptying SMOVE over one hash tag so both
+// sides ride one keyed run, and a DEL over a set key, all served back by
+// the next incarnation from the replayed registries.
+func TestBootServesSetsAcrossRestart(t *testing.T) {
+	bucket := sim.New(sim.Config{})
+
+	b1, srv1, nc1, r1 := bootServer(t, bucket, 1)
+	send(t, nc1, "SADD", "s1", "a", "b", "c")
+	expect(t, r1, ":3\r\n")
+	send(t, nc1, "SREM", "s1", "b")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "SADD", "nums", "1", "2", "3")
+	expect(t, r1, ":3\r\n")
+	send(t, nc1, "SADD", "gone", "x")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "DEL", "gone")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "SADD", "{t}src", "m")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "SADD", "{t}dst", "z")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "SMOVE", "{t}src", "{t}dst", "m")
+	expect(t, r1, ":1\r\n")
+	commitAndStop(t, b1, srv1, nc1)
+
+	b2, srv2, nc2, r2 := bootServer(t, bucket, 2)
+	if b2.Replay.SAdds == 0 || b2.Replay.SRems == 0 || b2.Replay.CollDrops == 0 {
+		t.Fatalf("reboot replay stats %+v, want set plane counts", b2.Replay)
+	}
+	send(t, nc2, "SISMEMBER", "s1", "a")
+	expect(t, r2, ":1\r\n")
+	send(t, nc2, "SISMEMBER", "s1", "b")
+	expect(t, r2, ":0\r\n")
+	send(t, nc2, "SCARD", "s1")
+	expect(t, r2, ":2\r\n")
+	send(t, nc2, "SCARD", "nums")
+	expect(t, r2, ":3\r\n")
+	send(t, nc2, "SISMEMBER", "nums", "2")
+	expect(t, r2, ":1\r\n")
+	send(t, nc2, "SCARD", "gone")
+	expect(t, r2, ":0\r\n")
+	send(t, nc2, "SCARD", "{t}src")
+	expect(t, r2, ":0\r\n")
+	send(t, nc2, "SISMEMBER", "{t}dst", "m")
+	expect(t, r2, ":1\r\n")
+	send(t, nc2, "SCARD", "{t}dst")
+	expect(t, r2, ":2\r\n")
+	send(t, nc2, "SADD", "s1", "d")
+	expect(t, r2, ":1\r\n")
+	commitAndStop(t, b2, srv2, nc2)
+
+	b3, srv3, nc3, r3 := bootServer(t, bucket, 3)
+	send(t, nc3, "SCARD", "s1")
+	expect(t, r3, ":3\r\n")
+	send(t, nc3, "SISMEMBER", "s1", "d")
+	expect(t, r3, ":1\r\n")
+	commitAndStop(t, b3, srv3, nc3)
+}

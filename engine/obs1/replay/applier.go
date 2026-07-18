@@ -13,29 +13,36 @@
 // Sequencing is recovery's job, not this package's: Apply trusts the seq
 // gating recover.go already enforced and applies frames in arrival
 // order. Boot replay is single-threaded, before any shard goroutine
-// starts, so store calls are plain single-owner calls.
+// starts, so store and registry calls are plain single-owner calls under
+// the BootCtx contract.
 //
-// This slice covers the string plane (strset, keydel, expire, txn,
-// noop); the collection kinds land with the collection registries'
-// applier and are refused loudly until then, never skipped.
+// Collection frames apply through each type package's exported Replay
+// functions with plain arguments, so the registries' shapes stay
+// private. The set plane is wired; the remaining collection kinds are
+// refused loudly until their planes land, never skipped.
 package replay
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 
 	"github.com/tamnd/aki/engine/obs1"
-	"github.com/tamnd/aki/engine/obs1/store"
+	"github.com/tamnd/aki/engine/obs1/set"
+	"github.com/tamnd/aki/engine/obs1/shard"
 )
 
 // Config wires an Applier.
 type Config struct {
-	// Store routes a key to the store that owns it, the server's
-	// key-to-shard mapping evaluated at boot; a single-store test
-	// returns its one store unconditionally. Keys inside one txn run
-	// always share a group and so a store, since a run rides one commit
-	// section and a section is one group's frames.
-	Store func(key []byte) *store.Store
+	// Ctx routes a key to the shard context that owns it, the server's
+	// key-to-shard mapping evaluated at boot over Runtime.BootCtx; a
+	// single-shard test returns its one Ctx unconditionally. The string
+	// plane writes Ctx(key).St and the collection planes hand the Ctx to
+	// the type registries, so replayed state lands exactly where the
+	// owner goroutine will look for it after Start. Keys inside one txn
+	// run always share a group and so a shard, since a run rides one
+	// commit section and a section is one group's frames.
+	Ctx func(key []byte) *shard.Ctx
 }
 
 // Stats counts what an Applier did, the recovery report's store half.
@@ -43,10 +50,14 @@ type Stats struct {
 	Frames    uint64 // every frame accepted, markers and noops included
 	StrSets   uint64
 	Dels      uint64
-	DelMisses uint64 // keydels naming an absent key, the idempotent case
+	DelMisses uint64 // keydels naming a key absent everywhere, the idempotent case
 	Expires   uint64
 	Noops     uint64
 	TxnRuns   uint64 // closed runs, however many frames each carried
+	CollNews  uint64
+	CollDrops uint64
+	SAdds     uint64
+	SRems     uint64
 }
 
 // pending is one buffered frame inside an open txn run. The key and
@@ -58,17 +69,28 @@ type pending struct {
 	op  obs1.Op
 }
 
-// Applier applies decoded ops to the store, buffering txn runs so a run
-// lands atomically or not at all.
+// fresh is a collnew waiting for the colldelta that populates it: the
+// emitters always frame the pair adjacently in one run, so the very next
+// applied frame in the group must be that delta, on the same key, with a
+// sub-op of the collnew's type. The key aliases the section buffer under
+// the same contract as pending.
+type fresh struct {
+	key []byte
+	typ uint8
+}
+
+// Applier applies decoded ops to the store and registries, buffering txn
+// runs so a run lands atomically or not at all.
 type Applier struct {
 	cfg   Config
 	open  map[uint16][]pending
+	news  map[uint16]fresh
 	stats Stats
 }
 
 // New builds an Applier over cfg.
 func New(cfg Config) *Applier {
-	return &Applier{cfg: cfg, open: make(map[uint16][]pending)}
+	return &Applier{cfg: cfg, open: make(map[uint16][]pending), news: make(map[uint16]fresh)}
 }
 
 // Stats returns the running counts.
@@ -84,6 +106,9 @@ func (a *Applier) Apply(group uint16, f obs1.WALFrame) error {
 		return err
 	}
 	if t, ok := op.(obs1.Txn); ok {
+		if n, dangling := a.news[group]; dangling {
+			return fmt.Errorf("obs1 replay: group %d hits a txn marker while collnew %q awaits its delta", group, n.key)
+		}
 		if t.Begin {
 			if _, dup := a.open[group]; dup {
 				return fmt.Errorf("obs1 replay: group %d opens a txn run inside an open run", group)
@@ -96,7 +121,7 @@ func (a *Applier) Apply(group uint16, f obs1.WALFrame) error {
 			}
 			delete(a.open, group)
 			for _, p := range run {
-				if err := a.applyOne(p.key, p.op); err != nil {
+				if err := a.applyOne(group, p.key, p.op); err != nil {
 					return err
 				}
 			}
@@ -111,7 +136,7 @@ func (a *Applier) Apply(group uint16, f obs1.WALFrame) error {
 		return nil
 	}
 	a.stats.Frames++
-	return a.applyOne(f.Key, op)
+	return a.applyOne(group, f.Key, op)
 }
 
 // Finish checks the terminal state after the last frame. A run still
@@ -119,10 +144,14 @@ func (a *Applier) Apply(group uint16, f obs1.WALFrame) error {
 // (a run rides one section, contiguous, and recovery replays only
 // committed sections), so it is a corruption signal here, not the doc 04
 // tail-cut case; that cut happens before commit and replays as nothing
-// upstream of this package.
+// upstream of this package. A collnew still waiting for its delta is the
+// same class of signal, since the emitters frame the pair together.
 func (a *Applier) Finish() error {
 	for g, run := range a.open {
 		return fmt.Errorf("obs1 replay: group %d ends with an open txn run of %d frames", g, len(run))
+	}
+	for g, n := range a.news {
+		return fmt.Errorf("obs1 replay: group %d ends with collnew %q awaiting its delta", g, n.key)
 	}
 	return nil
 }
@@ -136,27 +165,41 @@ func deadline(ms uint64) (int64, error) {
 	return int64(ms), nil
 }
 
-func (a *Applier) applyOne(key []byte, op obs1.Op) error {
+func (a *Applier) applyOne(group uint16, key []byte, op obs1.Op) error {
 	if _, ok := op.(obs1.Noop); ok {
 		a.stats.Noops++
 		return nil
 	}
-	st := a.cfg.Store(key)
+	cx := a.cfg.Ctx(key)
+	if n, ok := a.news[group]; ok {
+		delete(a.news, group)
+		d, isDelta := op.(obs1.CollDelta)
+		if !isDelta || !bytes.Equal(key, n.key) {
+			return fmt.Errorf("obs1 replay: collnew %q in group %d is not followed by its delta", n.key, group)
+		}
+		return a.applyDelta(cx, key, d, true, n.typ)
+	}
 	switch o := op.(type) {
 	case obs1.StrSet:
 		at, err := deadline(o.ExpiryMS)
 		if err != nil {
 			return err
 		}
-		if err := st.SetString(key, o.Value, 0, at, false); err != nil {
+		if err := cx.St.SetString(key, o.Value, 0, at, false); err != nil {
 			return fmt.Errorf("obs1 replay: strset %q: %w", key, err)
 		}
 		a.stats.StrSets++
 	case obs1.KeyDel:
-		// A keydel may name an already absent key (doc 04: BITOP's
-		// all-empty-source form frames one), so a miss is the idempotent
-		// no-op, unlike every other keyed kind.
-		if st.Del(key, 0) {
+		// A keydel removes a key of any type, so it probes both
+		// keyspaces: the string store and every wired registry. It may
+		// name a key absent everywhere (doc 04: BITOP's all-empty-source
+		// form frames one), so a full miss is the idempotent no-op,
+		// unlike every other keyed kind.
+		hit := cx.St.Del(key, 0)
+		if set.ReplayDrop(cx, key) {
+			hit = true
+		}
+		if hit {
 			a.stats.Dels++
 		} else {
 			a.stats.DelMisses++
@@ -171,20 +214,75 @@ func (a *Applier) applyOne(key []byte, op obs1.Op) error {
 		// band selection rebuilds the record with one when needed. An
 		// expire frame is post-decision, so its key existed when the
 		// owner framed it; a miss here is divergence.
-		v, ok := st.GetString(key, 0, nil)
+		v, ok := cx.St.GetString(key, 0, nil)
 		if !ok {
 			return fmt.Errorf("obs1 replay: expire names absent key %q, the store and the frame stream diverged", key)
 		}
-		if err := st.SetString(key, v, 0, at, false); err != nil {
+		if err := cx.St.SetString(key, v, 0, at, false); err != nil {
 			return fmt.Errorf("obs1 replay: expire %q: %w", key, err)
 		}
 		a.stats.Expires++
-	case obs1.CollDelta, obs1.CollNew, obs1.CollDrop, obs1.GroupDelta:
+	case obs1.CollNew:
+		// The hint bytes are doc 08's encoding hints, opaque here and
+		// empty from every current emitter; application waits for the
+		// paired delta, which carries the members that decide the shape.
+		if o.Type != obs1.CollSet {
+			return fmt.Errorf("obs1 replay: collnew type 0x%02x is not wired for replay yet", o.Type)
+		}
+		a.news[group] = fresh{key: key, typ: o.Type}
+		a.stats.CollNews++
+	case obs1.CollDelta:
+		return a.applyDelta(cx, key, o, false, 0)
+	case obs1.CollDrop:
+		// Typed drop, so a miss is corruption, unlike keydel's probe.
+		if !set.ReplayDrop(cx, key) {
+			return fmt.Errorf("obs1 replay: colldrop names key %q but no collection exists", key)
+		}
+		a.stats.CollDrops++
+	case obs1.GroupDelta:
 		return fmt.Errorf("obs1 replay: op kind 0x%02x is a collection op, collection replay is not wired yet", opKind(op))
 	default:
 		return fmt.Errorf("obs1 replay: op %T has no applier", op)
 	}
 	return nil
+}
+
+// applyDelta dispatches one colldelta sub-op. create is true when a
+// collnew led this frame, and typ is that collnew's collection type,
+// which the sub-op must match: a collnew whose delta belongs to another
+// type means the frame stream is corrupt.
+func (a *Applier) applyDelta(cx *shard.Ctx, key []byte, d obs1.CollDelta, create bool, typ uint8) error {
+	if create {
+		want, wired := deltaType(d.Sub)
+		if !wired || want != typ {
+			return fmt.Errorf("obs1 replay: collnew type 0x%02x on %q is followed by sub-op %T", typ, key, d.Sub)
+		}
+	}
+	switch s := d.Sub.(type) {
+	case obs1.SAdd:
+		if err := set.ReplayAdd(cx, key, s.Members, create); err != nil {
+			return err
+		}
+		a.stats.SAdds++
+	case obs1.SRem:
+		if err := set.ReplayRem(cx, key, s.Members); err != nil {
+			return err
+		}
+		a.stats.SRems++
+	default:
+		return fmt.Errorf("obs1 replay: colldelta sub-op %T is not wired for replay yet", d.Sub)
+	}
+	return nil
+}
+
+// deltaType maps a wired sub-op to the collection type its collnew must
+// carry; wired is false for the sub-ops whose planes have not landed.
+func deltaType(sub obs1.CollSub) (typ uint8, wired bool) {
+	switch sub.(type) {
+	case obs1.SAdd, obs1.SRem:
+		return obs1.CollSet, true
+	}
+	return 0, false
 }
 
 // opKind names an op's wire kind for error text without re-encoding.
