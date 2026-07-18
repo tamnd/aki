@@ -40,15 +40,13 @@ import (
 // same checkpoint-plus-tail path the string index recovery and the other collection
 // verticals take. The cadence is snapshot-at-checkpoint-and-shutdown only.
 //
-// Deferred as one coherent follow-on, the stream analog of the set vertical's deferred
-// SMOVE and STORE forms: the consumer-group and PEL surface (the group table on each
-// stream and its pending-entries ledger, written by XGROUP, XREADGROUP, XACK, XCLAIM,
-// XAUTOCLAIM, and XNACK). This slice logs the entry-level command surface (XADD, XDEL,
-// XTRIM, XSETID, and DEL) and defers the group and delivery arc, which threads its own
-// ledger vocabulary and rides the snapshot header's group and PEL section the second
-// stream slice adds. A stream recovered here comes back with its entries and counters but
-// no groups, so a group-bearing stream loses its delivery state across a crash before that
-// follow-on lands, the same bounded gap the deferred set and list arcs carry.
+// The consumer-group and PEL surface (the group table on each stream and its pending-entries
+// ledger, written by XGROUP, XREADGROUP, XACK, XCLAIM, XAUTOCLAIM, and XNACK) is the second
+// stream slice, its own ledger vocabulary and a snapshot header group and PEL section, in
+// durablegroup.go. This file logs the entry-level command surface (XADD, XDEL, XTRIM, XSETID,
+// and DEL); the group arm dispatches from applyStreamOp's default case and rides the header
+// section buildStreamSnapshot appends after the fixed counters, so a group-bearing stream
+// comes back with its cursors, consumers, and pending list intact.
 //
 // Key TTL is durable: the snapshot header carries the key deadline as of the checkpoint,
 // and a between-checkpoint EXPIRE or PERSIST cuts its own streamOpExpire effect, so a
@@ -222,6 +220,9 @@ func buildStreamSnapshot(s *stream) (header, elementRun []byte) {
 	putID16(header[16:32], s.maxDeletedID)
 	binary.LittleEndian.PutUint64(header[32:40], s.entriesAdded)
 	binary.LittleEndian.PutUint64(header[40:48], uint64(s.expireAt))
+	// The consumer-group section (durablegroup.go) follows the fixed counters in the
+	// header, so the element run stays a pure entry run the entry walk reads unchanged.
+	header = appendGroupSection(header, s)
 	entries := s.collectRange(bound{id: minID}, bound{id: maxID}, false, -1)
 	for i := range entries {
 		elementRun = appendEntryFrame(elementRun, entries[i].id, entries[i].fields)
@@ -277,6 +278,11 @@ func applyStreamSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
 	s.maxDeletedID = readID16(snap.Header[16:32])
 	s.entriesAdded = binary.LittleEndian.Uint64(snap.Header[32:40])
 	s.expireAt = int64(binary.LittleEndian.Uint64(snap.Header[40:48]))
+	// Rebuild the consumer groups the snapshot folded in after the fixed counters
+	// (durablegroup.go); a stream snapshotted before the section existed carries none.
+	if !restoreGroupSection(s, snap.Header[snapHeaderLen:]) {
+		return akifile.ErrLength
+	}
 	g.m[string(key)] = s
 	g.note(s)
 	return nil
@@ -345,6 +351,10 @@ func applyStreamOp(g *reg, key []byte, op akifile.CollOpRow) error {
 		if s := g.m[string(key)]; s != nil {
 			s.expireAt = int64(binary.LittleEndian.Uint64(op.SubValue))
 		}
+	default:
+		// The group and PEL effect arm (durablegroup.go): group-set, group-destroy,
+		// consumer-set, consumer-del, pel-set, and pel-del dispatch there.
+		return applyGroupOp(g, key, op)
 	}
 	return nil
 }

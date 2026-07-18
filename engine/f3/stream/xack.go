@@ -46,6 +46,8 @@ func Xack(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	for _, id := range parsed {
 		if grp.ackOne(id) {
 			acked++
+			// Cut the retirement so a replay acks the same pending entry.
+			logPelDel(cx, key, name, id)
 		}
 	}
 	// Retiring pending entries shrinks the group's ledger tree; reconcile the

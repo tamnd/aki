@@ -47,19 +47,22 @@ func Xreadgroup(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			r.Err(nogroupRead(keys[j], grpName))
 			return
 		}
+		newCon := grp.consumer(conName) == nil
 		con := grp.ensureConsumer(conName, cx.NowMs)
 		// Naming a consumer in a read stamps its seen clock whether or not the read
 		// delivers, the basis XINFO CONSUMERS idle reports; the active clock advances
 		// only on an actual `>` fetch, inside deliverNew.
 		con.seenTime = cx.NowMs
 		if isGreaterToken(ids[j]) {
-			if entries := grp.deliverNew(s, con, opts.count, opts.noack, cx.NowMs); len(entries) > 0 {
+			entries := grp.deliverNew(s, con, opts.count, opts.noack, cx.NowMs)
+			if len(entries) > 0 {
 				results = append(results, groupResult{key: keys[j], entries: entries})
 			}
 			// A `>` delivery records the entries in the group PEL (unless NOACK) and may
 			// have created the consumer, both of which grow the stream's footprint;
-			// reconcile it into the running sum.
+			// reconcile it into the running sum, then cut the delivery's effects.
 			g.note(s)
+			logGroupDelivery(cx, keys[j], grpName, grp, con, entries, opts.noack, newCon)
 			continue
 		}
 		start, ok := parseStreamID(ids[j])
@@ -132,14 +135,18 @@ func frameGroupPark(cx *shard.Ctx, g *reg, req *xreadWait) (reply []byte, served
 		if grp == nil {
 			continue
 		}
+		newCon := grp.consumer(gw.con) == nil
 		con := grp.ensureConsumer(gw.con, cx.NowMs)
 		con.seenTime = cx.NowMs
-		if entries := grp.deliverNew(s, con, req.count, gw.noack, cx.NowMs); len(entries) > 0 {
+		entries := grp.deliverNew(s, con, req.count, gw.noack, cx.NowMs)
+		if len(entries) > 0 {
 			results = append(results, groupResult{key: req.keys[j], entries: entries})
 		}
 		// A wake delivers into the PEL just as the inline path does; reconcile the
-		// stream's footprint into the running sum on the owner goroutine that runs it.
+		// stream's footprint into the running sum on the owner goroutine that runs it,
+		// then cut the same delivery effects the inline path cuts.
 		g.note(s)
+		logGroupDelivery(cx, req.keys[j], gw.group, grp, con, entries, gw.noack, newCon)
 	}
 	if len(results) == 0 {
 		return nil, false

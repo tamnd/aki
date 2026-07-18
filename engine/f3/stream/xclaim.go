@@ -45,13 +45,20 @@ func Xclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(nogroupGeneric(key, name))
 		return
 	}
+	newCon := grp.consumer(conName) == nil
 	con := grp.ensureConsumer(conName, cx.NowMs)
 	con.seenTime = cx.NowMs
 
 	claimed := make([]streamID, 0, len(ids))
 	for _, id := range ids {
-		if res := grp.claimOne(s, id, con, cx.NowMs, minIdle, opts); res.claimed {
+		res := grp.claimOne(s, id, con, cx.NowMs, minIdle, opts)
+		switch {
+		case res.claimed:
 			claimed = append(claimed, res.id)
+		case res.deleted:
+			// A pending entry whose log entry an XDEL removed is dropped from the PEL, not
+			// claimed; cut the drop so a replay retires it too.
+			logPelDel(cx, key, name, res.id)
 		}
 	}
 	// Taking at least one entry is an active operation for the target consumer, so it
@@ -62,8 +69,10 @@ func Xclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 
 	// A claim can create the target consumer and, under FORCE, add a pending slab for
-	// a not-yet-pending entry; reconcile the footprint into the running sum.
+	// a not-yet-pending entry; reconcile the footprint into the running sum, then cut the
+	// reassigned slabs so a replay reproduces the ownership transfer.
 	g.note(s)
+	logClaimResults(cx, key, name, grp, con, claimed, newCon)
 	cx.Aux = frameClaim(cx.Aux[:0], s, claimed, opts.justid)
 	r.Raw(cx.Aux)
 }
