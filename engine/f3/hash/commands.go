@@ -38,6 +38,9 @@ func Hset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			// a TTL, and O(1) on a hash that never set one.
 			h.clearFieldExp(args[i])
 		}
+		// Log every pair, new or overwritten: a replay must reproduce the value the
+		// field now holds either way.
+		logSet(cx, args[0], args[i], args[i+1])
 	}
 	g.note(h)
 	r.Int(added)
@@ -60,6 +63,7 @@ func Hmset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			// HMSET clears an overwritten field's TTL, the same as HSET.
 			h.clearFieldExp(args[i])
 		}
+		logSet(cx, args[0], args[i], args[i+1])
 	}
 	g.note(h)
 	r.Status("OK")
@@ -77,6 +81,7 @@ func Hsetnx(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	if h.setNX(args[1], args[2]) {
+		logSet(cx, args[0], args[1], args[2])
 		g.note(h)
 		r.Int(1)
 		return
@@ -160,6 +165,7 @@ func Hgetdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		if v, ok := h.get(f); ok {
 			out = resp.AppendBulk(out, v)
 			h.del(f)
+			logDelField(cx, args[0], f)
 		} else {
 			out = resp.AppendNull(out)
 		}
@@ -238,6 +244,7 @@ func Hdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	for _, f := range args[1:] {
 		if h.del(f) {
 			removed++
+			logDelField(cx, args[0], f)
 		}
 	}
 	if h.card() == 0 {
