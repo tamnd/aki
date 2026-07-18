@@ -55,7 +55,9 @@ func Hincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		_, h, _ = getOrCreate(cx, args[0])
 	}
 	var nb [20]byte
-	h.set(args[1], strconv.AppendInt(nb[:0], sum, 10))
+	nv := strconv.AppendInt(nb[:0], sum, 10)
+	h.set(args[1], nv)
+	logSet(cx, args[0], args[1], nv)
 	g.note(h)
 	r.Int(sum)
 }
@@ -108,6 +110,7 @@ func Hincrbyfloat(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		_, h, _ = getOrCreate(cx, args[0])
 	}
 	h.set(args[1], out)
+	logSet(cx, args[0], args[1], out)
 	g.note(h)
 	r.Bulk(out)
 }
