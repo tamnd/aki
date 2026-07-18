@@ -1,6 +1,7 @@
 package set
 
 import (
+	"encoding/binary"
 	"slices"
 
 	"github.com/tamnd/aki/engine/f3/shard"
@@ -94,12 +95,16 @@ func storeResult(hint int, drive func(emit func(m []byte))) *set {
 func bandFor(ht *htable, allInt bool, maxLen, n int) *set {
 	switch {
 	case allInt && n <= maxIntsetEntries:
-		s := &set{enc: encIntset, ints: make([]int64, 0, n)}
+		vals := make([]int64, 0, n)
 		ht.each(func(m []byte) {
 			v, _ := store.ParseInt(m) // allInt guarantees ok
-			s.ints = append(s.ints, v)
+			vals = append(vals, v)
 		})
-		slices.Sort(s.ints) // intset is sorted ascending; the members are already distinct
+		slices.Sort(vals) // intset is sorted ascending; the members are already distinct
+		s := &set{enc: encIntset, data: make([]byte, 0, n*intLaneWidth)}
+		for _, v := range vals {
+			s.data = binary.LittleEndian.AppendUint64(s.data, uint64(v))
+		}
 		return s
 	case n <= maxListpackEntries && maxLen <= maxListpackValue:
 		s := &set{enc: encListpack}
