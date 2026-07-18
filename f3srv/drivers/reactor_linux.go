@@ -90,16 +90,30 @@ type reactorBackend struct {
 	once  sync.Once
 }
 
-// defaultNetLoops is the frozen lab 19 answer to doc 08 section 4.2's
-// loop-count contradiction: neither M = shards nor M = cores minus shards.
-// The knee on the gate box's 8-cpu server mask sits at 3 loops for shard
-// counts 3, 4, and 5 alike (GET 64B P16/512: 2.05/6.14/6.65/6.65/4.70/3.47
-// Mops at loops 1/2/3/4/6/8, with SET and p99 breaking the 3-vs-4 tie
-// toward 3), so the loop count follows the core budget alone: the 2/5
-// network share of the doc 03 section 2.2 split, the complement of
-// shard.DefaultShards' 3/5.
+// defaultNetLoops is the loop count doc 08 section 4.2's contradiction resolves
+// to: half the cores. Lab 19 first froze the 2/5 network share off the 8-cpu
+// mask, but that was the pre-M10 surface; the batched owner-to-loop wakes and
+// buffer leasing that landed in the M10 pull-forward flattened the
+// oversubscription penalty a loop past the knee used to pay, and re-sweeping the
+// current surface moves the knee up. It now sits at GOMAXPROCS/2 at both core
+// counts measured on the gate box (labs/f3/m0/26_loop_knee, dual-generator
+// SET/GET 64B P16 c256x2):
+//
+//	8 cpu, 4 shards:  loops 3/4/5 -> 4.79/6.84/6.84 Mops (knee 4, plateau past)
+//	14 cpu, 8 shards: loops 5/6/7 -> 7.10/8.55/9.12 Mops (knee 7; 5 misses 2x GET)
+//
+// The 2/5 default undershot both (5 loops at GOMAXPROCS 14 held GET to 7.1 Mops,
+// 1.67x redis, short of the 2x gate); GOMAXPROCS/2 clears 2x on SET and GET
+// against both rivals while the reactor keeps its lean peak (about 195 MiB at
+// 512 conns against goroutine's 286 MiB). Half the cores oversubscribes the
+// shard/loop split by one thread, which the current surface absorbs because the
+// P16 point-op gate is loop-bound, not shard-bound: the owners park while the
+// loops saturate, so a loop is worth more than the shard core it borrows. This
+// only steers the opt-in event-loop drivers; the default goroutine driver
+// ignores it. A workload that is shard-bound rather than loop-bound wants the
+// core back and can dial the split with -net-loops.
 func defaultNetLoops() int {
-	n := runtime.GOMAXPROCS(0) * 2 / 5
+	n := runtime.GOMAXPROCS(0) / 2
 	if n < 1 {
 		n = 1
 	}

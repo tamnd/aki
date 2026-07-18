@@ -116,15 +116,15 @@ func TestReactorCloseFDLifecycle(t *testing.T) {
 	}
 }
 
-// TestDefaultNetLoops pins the lab 19 freeze: the reactor's loop count
-// defaults to the 2/5 network share of the core split, never the shard
-// count, and never below one.
+// TestDefaultNetLoops pins the re-swept loop count (labs/f3/m0/26_loop_knee):
+// the reactor's loop count defaults to half the cores, the knee measured at
+// both 8 and 14 cpu on the current surface, never below one.
 func TestDefaultNetLoops(t *testing.T) {
-	want := runtime.GOMAXPROCS(0) * 2 / 5
+	want := runtime.GOMAXPROCS(0) / 2
 	if want < 1 {
 		want = 1
 	}
 	if got := defaultNetLoops(); got != want {
-		t.Fatalf("defaultNetLoops() = %d, want %d (GOMAXPROCS*2/5 floored, min 1)", got, want)
+		t.Fatalf("defaultNetLoops() = %d, want %d (GOMAXPROCS/2 floored, min 1)", got, want)
 	}
 }

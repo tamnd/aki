@@ -154,13 +154,14 @@ type Options struct {
 	// for.
 	NetDriver string
 	// NetLoops is the event-loop count for the reactor and uring drivers;
-	// non-positive takes the
-	// network share of the doc 03 core split, GOMAXPROCS*2/5 floored (min 1),
-	// the complement of shard.DefaultShards' 3/5. Lab 19
-	// (labs/f3/m0/19_loop_count) froze this: on the gate box's 8-cpu server
-	// mask the knee sits at 3 loops for every shard count tried (3, 4, 5),
-	// so the loop count follows the core budget, not the shard count, and
-	// both readings of doc 08 section 4.2 lose their tie to shards.
+	// non-positive takes defaultNetLoops, GOMAXPROCS/2 floored (min 1). Lab 19
+	// first froze the 2/5 network share off the pre-M10 8-cpu mask, but a
+	// re-sweep of the current surface (labs/f3/m0/26_loop_knee) moves the knee
+	// up to half the cores at both 8 and 14 cpu: the M10 batched wakes and
+	// buffer leasing flattened the oversubscription a loop past the knee used
+	// to pay, and the P16 point-op gate is loop-bound, so a loop outearns the
+	// shard core it borrows. The 2/5 default held the reactor to 1.67x redis
+	// GET (short of the 2x gate); half the cores clears 2x on both ops.
 	NetLoops int
 	// OutBufLimitBytes is the hard cap on one connection's pending reply
 	// bytes buffered driver-side (the client-output-buffer-limit lineage,
