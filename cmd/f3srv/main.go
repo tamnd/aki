@@ -40,6 +40,8 @@ func main() {
 		"per-connection reply writer buffer KiB; 0 takes the 64KiB default. One pipeline round of replies should fit or the writer flushes mid-drain (labs/f3/m0/24_conn_buffers)")
 	batchDataCap := flag.Int("batch-data-cap", 0,
 		"per-hop-node starting data-buffer bytes; 0 takes the tuning.go default. It grows on demand for a bigger command, so a smaller start only trims the steady small-value path (labs/f3/m0/25_conn_caps)")
+	repCap := flag.Int("rep-cap", 0,
+		"per-hop-node starting reply-buffer bytes; 0 takes the tuning.go default (batchDataCap+64*batchCap). It grows on demand for a bigger reply, so a smaller start only trims the steady write-heavy path (labs/f3/m0/27_rep_headroom cut 15MiB off the c512 SET cell at rep-cap 1024)")
 	replyRing := flag.Int("reply-ring", 0,
 		"per-connection reply reorder window in commands; 0 takes the tuning.go default. It must cover the pipeline depth or the reader throttles (labs/f3/m0/25_conn_caps)")
 	freeListCap := flag.Int("free-list-cap", 0,
@@ -63,6 +65,7 @@ func main() {
 		ReadBufBytes:     *readBufKiB << 10,
 		ReplyBufBytes:    *replyBufKiB << 10,
 		BatchDataCap:     *batchDataCap,
+		RepCap:           *repCap,
 		ReplyRing:        *replyRing,
 		FreeListCap:      *freeListCap,
 	})

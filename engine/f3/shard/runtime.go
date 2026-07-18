@@ -90,6 +90,9 @@ func (r *Runtime) resolveConnCaps(c Config) {
 		r.batchDataCap = c.BatchDataCap
 	}
 	r.repCap = r.batchDataCap + 64*batchCap
+	if c.RepCap > 0 {
+		r.repCap = c.RepCap
+	}
 	r.replyRing = replyRing
 	if c.ReplyRing > 0 {
 		r.replyRing = c.ReplyRing
@@ -162,15 +165,20 @@ type Config struct {
 	// where thread residency measurably pays.
 	PinWorkers bool
 
-	// BatchDataCap, ReplyRing, and FreeListCap override the per-connection
-	// hop-transport sizes (tuning.go batchDataCap, replyRing, freeListCap); each
-	// non-positive field takes its tuning.go default. They are the M0 memory-bar
-	// lever swept by labs/f3/m0/25_conn_caps: at high fan-out the pooled hopBatch
-	// buffers and the reorder ring dominate resident footprint. BatchDataCap
-	// starts a node's data buffer (its reply buffer tracks it), and it grows on
-	// demand for a larger command, so a smaller start only trims the steady
-	// small-value path.
+	// BatchDataCap, RepCap, ReplyRing, and FreeListCap override the
+	// per-connection hop-transport sizes (tuning.go batchDataCap, its reply
+	// headroom, replyRing, freeListCap); each non-positive field takes its
+	// tuning.go default. They are the M0 memory-bar lever swept by
+	// labs/f3/m0/25_conn_caps and 27_rep_headroom: at high fan-out the pooled
+	// hopBatch buffers and the reorder ring dominate resident footprint.
+	// BatchDataCap starts a node's data buffer, and it grows on demand for a
+	// larger command, so a smaller start only trims the steady small-value path.
+	// RepCap starts a node's reply buffer independently; it also grows on
+	// demand, so a write-heavy load (SET replies are +OK) never pays the
+	// batchDataCap+64*batchCap default headroom, and a reply-heavy node grows
+	// once and keeps the buffer (up to keepNodeBytes) with no steady cost.
 	BatchDataCap int
+	RepCap       int
 	ReplyRing    int
 	FreeListCap  int
 }

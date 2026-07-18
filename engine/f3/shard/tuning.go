@@ -53,7 +53,11 @@ const (
 	// steady path never grows it (every point reply plus an echoed payload fits
 	// with headroom), and it tracks batchDataCap so a swept data cap keeps its
 	// matched reply headroom. resolveConnCaps derives it (Runtime.repCap) rather
-	// than a standalone const, since Config.BatchDataCap can move the base.
+	// than a standalone const, since Config.BatchDataCap can move the base, and
+	// Config.RepCap overrides it outright: the buffer grows on demand, so a
+	// write-heavy load (SET replies are +OK) never needs the 64*batchCap
+	// headroom, and lab 27 measured 15 MiB off the c512 SET cell at RepCap 1024
+	// with no throughput cost (a reply-heavy node grows once and keeps it).
 
 	// spinWindow is how long an idle connection writer burns plain loads on
 	// its outbound queue before it parks (doc 03 section 9.2, provisional

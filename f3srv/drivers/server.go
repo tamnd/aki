@@ -119,14 +119,18 @@ type Options struct {
 	// memory-bar cell) and lets large-command connections grow as before.
 	// Lab 24 (labs/f3/m0/24_conn_buffers) sweeps it against the gate shapes.
 	ReadBufBytes int
-	// BatchDataCap, ReplyRing, and FreeListCap override the per-connection
-	// hop-transport sizes (shard.Config fields of the same name); non-positive
-	// takes the tuning.go default. They are the M0 memory-bar lever swept by
-	// labs/f3/m0/25_conn_caps: at high fan-out the pooled hopBatch buffers and
-	// the reply reorder ring dominate resident footprint. BatchDataCap grows on
-	// demand for a larger command, so a smaller start only trims the steady
-	// small-value path.
+	// BatchDataCap, RepCap, ReplyRing, and FreeListCap override the
+	// per-connection hop-transport sizes (shard.Config fields of the same name);
+	// non-positive takes the tuning.go default. They are the M0 memory-bar lever
+	// swept by labs/f3/m0/25_conn_caps and 27_rep_headroom: at high fan-out the
+	// pooled hopBatch buffers and the reply reorder ring dominate resident
+	// footprint. BatchDataCap and RepCap both grow on demand for a larger command
+	// or reply, so a smaller start only trims the steady small-value path; RepCap
+	// in particular lets a write-heavy load skip the batchDataCap+64*batchCap
+	// default reply headroom (labs/f3/m0/27 measured 15 MiB off the c512 SET cell
+	// at no throughput cost).
 	BatchDataCap int
+	RepCap       int
 	ReplyRing    int
 	FreeListCap  int
 	// FlushEveryDrain restores the pre-boundary flush discipline: the writer
@@ -288,6 +292,7 @@ func Listen(o Options) (*Server, error) {
 		ResidentCapBytes: o.ResidentCapBytes,
 		PinWorkers:       o.PinWorkers,
 		BatchDataCap:     o.BatchDataCap,
+		RepCap:           o.RepCap,
 		ReplyRing:        o.ReplyRing,
 		FreeListCap:      o.FreeListCap,
 	})
