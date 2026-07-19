@@ -43,6 +43,11 @@ func TestKeyspaceNotifyDelBothChannels(t *testing.T) {
 
 	send(t, pubNc, "SET", "foo", "bar")
 	expect(t, pubBr, "+OK\r\n")
+	// SET now fires its own set keyspace event on the pattern channel; consume it
+	// before the DEL so the ordered stream lines up on del.
+	if k, pat, ch, msg := readPMessage(t, subBr); k != "pmessage" || pat != "__keyspace@0__:*" || ch != "__keyspace@0__:foo" || msg != "set" {
+		t.Fatalf("keyspace set push = %q %q %q %q, want pmessage __keyspace@0__:* __keyspace@0__:foo set", k, pat, ch, msg)
+	}
 	send(t, pubNc, "DEL", "foo")
 	if n := readIntFrom(t, pubBr); n != 1 {
 		t.Fatalf("DEL foo = %d, want 1", n)

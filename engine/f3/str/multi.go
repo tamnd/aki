@@ -48,6 +48,10 @@ func MSetShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			r.FanErrString(storeErr(err))
 			return
 		}
+		// Every MSET pair fires its own set event, redis's per-key notification
+		// (MSET has no command-level event). A committed pair fired before a later
+		// pair parks, and the resume starts past it, so no pair fires twice.
+		cx.NotifyKeyspaceEvent(shard.NotifyString, "set", args[i])
 	}
 	r.FanOK()
 }

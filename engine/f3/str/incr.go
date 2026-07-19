@@ -24,7 +24,10 @@ func incrErr(err error) string {
 	return storeErr(err)
 }
 
-func incrBy(cx *shard.Ctx, key []byte, delta int64, r shard.Reply) {
+// incrBy runs the INCR/DECR family write and fires event on success. Redis
+// names the event by the command, not the sign: INCR and INCRBY fire incrby,
+// DECR and DECRBY fire decrby, so the caller passes the name.
+func incrBy(cx *shard.Ctx, key []byte, delta int64, event string, r shard.Reply) {
 	n, err := cx.St.IncrBy(key, delta, cx.NowMs)
 	if err != nil {
 		if cx.ParkFull(err) {
@@ -33,17 +36,18 @@ func incrBy(cx *shard.Ctx, key []byte, delta int64, r shard.Reply) {
 		r.Err(incrErr(err))
 		return
 	}
+	cx.NotifyKeyspaceEvent(shard.NotifyString, event, key)
 	r.Int(n)
 }
 
 // Incr answers INCR key.
 func Incr(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	incrBy(cx, args[0], 1, r)
+	incrBy(cx, args[0], 1, "incrby", r)
 }
 
 // Decr answers DECR key.
 func Decr(cx *shard.Ctx, args [][]byte, r shard.Reply) {
-	incrBy(cx, args[0], -1, r)
+	incrBy(cx, args[0], -1, "decrby", r)
 }
 
 // IncrByCmd answers INCRBY key delta.
@@ -53,7 +57,7 @@ func IncrByCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err("ERR value is not an integer or out of range")
 		return
 	}
-	incrBy(cx, args[0], n, r)
+	incrBy(cx, args[0], n, "incrby", r)
 }
 
 // DecrByCmd answers DECRBY key delta. Negating MinInt64 has no int64 answer,
@@ -68,7 +72,7 @@ func DecrByCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err("ERR decrement would overflow")
 		return
 	}
-	incrBy(cx, args[0], -n, r)
+	incrBy(cx, args[0], -n, "decrby", r)
 }
 
 // IncrByFloat answers INCRBYFLOAT key delta: add a float to a string key,
@@ -108,6 +112,7 @@ func IncrByFloat(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(storeErr(err))
 		return
 	}
+	cx.NotifyKeyspaceEvent(shard.NotifyString, "incrbyfloat", key)
 	// RESP3 renders the new value as a double (redis 8.8 addReplyHumanLongDouble),
 	// reusing the digits just computed rather than reformatting; RESP2 keeps the
 	// bulk string. DoubleBytes wraps out with the ',' framing under HELLO 3 only.
@@ -126,6 +131,7 @@ func Append(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(storeErr(err))
 		return
 	}
+	cx.NotifyKeyspaceEvent(shard.NotifyString, "append", args[0])
 	r.Int(n)
 }
 
@@ -160,6 +166,7 @@ func SetRange(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(storeErr(err))
 		return
 	}
+	cx.NotifyKeyspaceEvent(shard.NotifyString, "setrange", args[0])
 	r.Int(n)
 }
 

@@ -223,6 +223,10 @@ func Set(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(storeErr(err))
 		return
 	}
+	// The write landed: SET fires set whatever the EX/PX/KEEPTTL trimmings, the
+	// same single event redis's setGenericCommand fires (the expiry rides inside
+	// the set, no separate expire event).
+	cx.NotifyKeyspaceEvent(shard.NotifyString, "set", key)
 	if flags&setGet != 0 {
 		if haveOld {
 			r.Bulk(oldVal)
@@ -255,6 +259,8 @@ func Getdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	cx.Val = val
 	cx.St.Del(args[0], cx.NowMs)
+	// GETDEL removed the key: redis fires the generic del, not a string event.
+	cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
 	r.Bulk(val)
 }
 
@@ -276,6 +282,8 @@ func Getset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(storeErr(err))
 		return
 	}
+	// GETSET is a plain set for notification purposes, the event redis fires.
+	cx.NotifyKeyspaceEvent(shard.NotifyString, "set", args[0])
 	if had {
 		r.Bulk(old)
 		return
@@ -299,6 +307,7 @@ func Setnx(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(storeErr(err))
 		return
 	}
+	cx.NotifyKeyspaceEvent(shard.NotifyString, "set", args[0])
 	r.Int(1)
 }
 
@@ -325,6 +334,9 @@ func setex(cx *shard.Ctx, args [][]byte, r shard.Reply, unit int, name string) {
 		r.Err(storeErr(err))
 		return
 	}
+	// SETEX/PSETEX are a set with a mandatory expiry: one set event, the expiry
+	// rides inside it, matching redis.
+	cx.NotifyKeyspaceEvent(shard.NotifyString, "set", args[0])
 	r.Status("OK")
 }
 
@@ -408,8 +420,15 @@ func Getex(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	cx.Val = val
 	switch {
 	case persist:
-		// Clearing never rebuilds the record, so it cannot fail.
+		// Clearing never rebuilds the record, so it cannot fail. Redis fires
+		// persist only when a deadline was actually removed, so guard on there
+		// having been one. Deadline's bool is liveness, not TTL presence: a live
+		// key with no TTL reports (0, true), so the guard is a non-zero deadline.
+		at, live := cx.St.Deadline(key, cx.NowMs)
 		_, _ = cx.St.SetExpire(key, nil, 0, cx.NowMs)
+		if live && at != 0 {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "persist", key)
+		}
 	case unit != unitNone:
 		if _, err := cx.St.SetExpire(key, val, atMs, cx.NowMs); err != nil {
 			if cx.ParkFull(err) {
@@ -418,6 +437,9 @@ func Getex(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			r.Err(storeErr(err))
 			return
 		}
+		// GETEX with an expiry option installs a deadline: the generic expire
+		// event, the same one EXPIRE fires.
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "expire", key)
 	}
 	r.Bulk(val)
 }
