@@ -174,14 +174,18 @@ func Apply(cx *shard.Ctx, args [][]byte, r shard.Reply, verb string, be Backend)
 		return
 	}
 
-	// A deadline at or before now deletes the key and still reports success.
+	// A deadline at or before now deletes the key and still reports success. Redis
+	// fires del here, not expire: the key is gone, not scheduled.
 	if at <= cx.NowMs {
 		be.Delete()
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
 		r.Int(1)
 		return
 	}
 	if !be.Store(at) {
 		return
 	}
+	// A deadline was installed: the generic expire event carries the key.
+	cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "expire", args[0])
 	r.Int(1)
 }
