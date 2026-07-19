@@ -62,8 +62,10 @@ func blockpop(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 			continue
 		}
 		elem := popOne(l, front)
+		cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(front), key)
 		if l.length() == 0 {
 			g.drop(key)
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 		} else {
 			g.note(l)
 		}

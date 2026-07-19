@@ -51,8 +51,12 @@ func lmpop(g *reg, cx *shard.Ctx, dst []byte, keys [][]byte, front bool, count i
 		for i := 0; i < npop; i++ {
 			out = resp.AppendBulk(out, popOne(l, front))
 		}
+		// LMPOP fires one pop event on the served key, named by the requested end,
+		// then del if it drained the key, matching redis.
+		cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(front), key)
 		if l.length() == 0 {
 			g.drop(key)
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 		} else {
 			g.note(l)
 		}

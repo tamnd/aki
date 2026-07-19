@@ -75,6 +75,7 @@ func moveCrossOnce(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) (rep []
 			g.install(cx, dst, d)
 		}
 		pushEnd(d, elem, dstLeft)
+		cx.NotifyKeyspaceEvent(shard.NotifyList, pushEvent(dstLeft), dst)
 		serveWaiters(cx, g, dst, d)
 		// A serve that consumed the moved element leaves the destination empty, so
 		// drop it, matching the co-located lmove (lmove.go) so EXISTS/TYPE/OBJECT
@@ -82,6 +83,7 @@ func moveCrossOnce(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) (rep []
 		// parked on dst live in the separate waiter set and stay for a future push.
 		if d.length() == 0 {
 			g.drop(dst)
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", dst)
 		} else {
 			g.note(d)
 		}
@@ -93,8 +95,10 @@ func moveCrossOnce(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) (rep []
 		g := registry(cx)
 		s, _ := g.lookup(cx, src)
 		popEnd(s, srcLeft)
+		cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(srcLeft), src)
 		if s.length() == 0 {
 			g.drop(src)
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", src)
 		} else {
 			g.note(s)
 		}
@@ -215,6 +219,9 @@ func runMoveCross(rt *shard.Runtime, src, dst []byte, head uint32, srcLeft, dstL
 			g.install(cx, dst, d)
 		}
 		pushEnd(d, elem, dstLeft)
+		// The push fires its event on the destination owner, the same push event the
+		// co-located move fires; the source pop event fires in its own hop below.
+		cx.NotifyKeyspaceEvent(shard.NotifyList, pushEvent(dstLeft), dst)
 		serveWaiters(cx, g, dst, d)
 		// A serve that consumed the moved element leaves the destination empty, so
 		// drop it, matching the co-located lmove (lmove.go) so EXISTS/TYPE/OBJECT
@@ -222,6 +229,7 @@ func runMoveCross(rt *shard.Runtime, src, dst []byte, head uint32, srcLeft, dstL
 		// parked on dst live in the separate waiter set and stay for a future push.
 		if d.length() == 0 {
 			g.drop(dst)
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", dst)
 		} else {
 			g.note(d)
 		}
@@ -238,8 +246,13 @@ func runMoveCross(rt *shard.Runtime, src, dst []byte, head uint32, srcLeft, dstL
 		} else {
 			s, _ := g.lookup(cx, src)
 			popEnd(s, srcLeft)
+			// The source pop fires its event on the source owner; del follows if the
+			// pop drained it, the same pair the co-located and non-blocking cross moves
+			// fire.
+			cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(srcLeft), src)
 			if s.length() == 0 {
 				g.drop(src)
+				cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", src)
 			}
 			g.unlinkAll(cx, head)
 			rep = resp.AppendBulk(nil, elem)
@@ -253,6 +266,7 @@ func runMoveCross(rt *shard.Runtime, src, dst []byte, head uint32, srcLeft, dstL
 			serveWaiters(cx, g, src, s)
 			if s.length() == 0 {
 				g.drop(src)
+				cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", src)
 			} else {
 				g.note(s)
 			}

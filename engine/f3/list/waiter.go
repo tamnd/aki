@@ -269,6 +269,7 @@ func serveWaiters(cx *shard.Ctx, g *reg, key []byte, l *list) {
 		serveKey(cx, g, []byte(k), l2)
 		if l2.length() == 0 {
 			g.drop([]byte(k))
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", []byte(k))
 		} else {
 			g.note(l2)
 		}
@@ -311,6 +312,10 @@ func serveKey(cx *shard.Ctx, g *reg, key []byte, l *list) {
 			seq := nd.seq
 			bc := nd.claim
 			rep := appendReply(nil, key, popOne(l, nd.front))
+			// Serving a parked BLPOP/BRPOP fires the pop event on the drained key, the
+			// same event an immediate pop fires; the caller's drop posts del if it
+			// empties.
+			cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(nd.front), key)
 			g.unlinkAll(cx, i)
 			if bc != nil {
 				bc.fireCancels(cx, cx.ShardID())
@@ -335,6 +340,8 @@ func serveKey(cx *shard.Ctx, g *reg, key []byte, l *list) {
 			for j := 0; j < npop; j++ {
 				rep = resp.AppendBulk(rep, popOne(l, front))
 			}
+			// One pop event for the served BLMPOP, named by its end.
+			cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(front), key)
 			g.unlinkAll(cx, i)
 			if bc != nil {
 				bc.fireCancels(cx, cx.ShardID())
@@ -419,6 +426,11 @@ func serveMove(cx *shard.Ctx, g *reg, key []byte, l *list, i uint32, nd *waitNod
 		dst = d
 	}
 	elem := cloneBytes(popOne(l, front))
+	// The served move fires the same pair as an immediate LMOVE: the pop event on
+	// the source end, the push event on the destination end. A self-move fires both
+	// on the one key.
+	cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(front), key)
+	cx.NotifyKeyspaceEvent(shard.NotifyList, pushEvent(dstLeft), []byte(dstKey))
 	if self {
 		pushEnd(l, elem, dstLeft)
 	} else {

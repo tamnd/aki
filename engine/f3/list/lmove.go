@@ -84,6 +84,10 @@ func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) 
 	// onto it and never drop the key, since the list still holds the element.
 	if string(srcKey) == string(dstKey) {
 		pushEnd(src, v, dstLeft)
+		// A rotation still fires both halves on the one key, the pop then the push,
+		// matching redis's LMOVE key key notifications.
+		cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(srcLeft), srcKey)
+		cx.NotifyKeyspaceEvent(shard.NotifyList, pushEvent(dstLeft), dstKey)
 		// One list object rotated in place: it survives with the same element count
 		// but a possibly changed byte layout, so note its footprint.
 		g.note(src)
@@ -96,6 +100,11 @@ func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) 
 		g.install(cx, dstKey, dst)
 	}
 	pushEnd(dst, v, dstLeft)
+	// The move fires the pop event on the source and the push event on the
+	// destination, each named by its end, the same pair redis fires for LMOVE. The
+	// source del (if it emptied) follows below after the destination is reconciled.
+	cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(srcLeft), srcKey)
+	cx.NotifyKeyspaceEvent(shard.NotifyList, pushEvent(dstLeft), dstKey)
 	// The push made the destination non-empty, so a BLPOP/BLMPOP/BLMOVE-source
 	// client blocked on it is now servable: signal it before the source drop, the
 	// same ready-signal Redis raises on an LMOVE destination. This is what turns a
@@ -114,6 +123,7 @@ func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) 
 	// with the pushed element.
 	if dst.length() == 0 {
 		g.drop(dstKey)
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", dstKey)
 	} else {
 		g.note(dst)
 	}
@@ -122,6 +132,7 @@ func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) 
 	// case above already returned, so this never drops a key just pushed onto.
 	if src.length() == 0 {
 		g.drop(srcKey)
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", srcKey)
 	} else {
 		g.note(src)
 	}

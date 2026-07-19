@@ -26,6 +26,23 @@ const (
 	errMaxlenNeg  = "ERR MAXLEN can't be negative"
 )
 
+// pushEvent and popEvent name a list keyspace event by the end it touched: the
+// front is the l-side (lpush/lpop), the back the r-side (rpush/rpop). LMOVE and
+// the blocking movers reuse them to name their two halves.
+func pushEvent(front bool) string {
+	if front {
+		return "lpush"
+	}
+	return "rpush"
+}
+
+func popEvent(front bool) string {
+	if front {
+		return "lpop"
+	}
+	return "rpop"
+}
+
 // Lpush answers LPUSH key element [element ...]: prepend each element in turn,
 // creating the key when absent, and reply the new length.
 func Lpush(cx *shard.Ctx, args [][]byte, r shard.Reply) { pushCmd(cx, args, r, true, true) }
@@ -66,6 +83,10 @@ func pushCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front, create bool) {
 		}
 		logPush(cx, key, v, front)
 	}
+	// The push landed, so it fires its event by side (lpush from the front, rpush
+	// from the back), the same single event redis fires per push command. A waiter
+	// drain below may then empty and delete the key, which posts its own del after.
+	cx.NotifyKeyspaceEvent(shard.NotifyList, pushEvent(front), key)
 	// The reply is the length after the push, before any blocked client is
 	// served: Redis signals the key ready and returns the pushed length, then
 	// serves waiters as a separate step, so LPUSH into a key with a BLPOP waiter
@@ -80,6 +101,7 @@ func pushCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front, create bool) {
 	// one, so the resident total stays exact.
 	if l.length() == 0 {
 		g.drop(key)
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 	} else {
 		g.note(l)
 	}
@@ -113,8 +135,10 @@ func popCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 		}
 		v := popOne(l, front)
 		logPop(cx, key, front)
+		cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(front), key)
 		if l.length() == 0 {
 			g.drop(key)
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 		} else {
 			g.note(l)
 		}
@@ -142,8 +166,17 @@ func popCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 	}
 	cx.Aux = out
 	r.Raw(out)
+	// The count form fires one pop event for the command when it removed anything,
+	// not one per element, matching redis. A count of zero pops nothing and stays
+	// silent.
+	if popped > 0 {
+		cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(front), key)
+	}
 	if l.length() == 0 {
 		g.drop(key)
+		if popped > 0 {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
+		}
 	} else {
 		g.note(l)
 	}
@@ -222,6 +255,7 @@ func Lset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	l.setAt(i, args[2])
 	logSet(cx, args[0], i, args[2])
+	cx.NotifyKeyspaceEvent(shard.NotifyList, "lset", args[0])
 	// LSET can never empty a list, so the key always survives; note its new
 	// footprint (an element rewrite can grow or shrink the packed bytes).
 	g.note(l)
@@ -283,8 +317,10 @@ func Ltrim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	l.trim(lo, hi)
 	logTrim(cx, key, lo, hi)
+	cx.NotifyKeyspaceEvent(shard.NotifyList, "ltrim", key)
 	if l.length() == 0 {
 		g.drop(key)
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 	} else {
 		g.note(l)
 	}
@@ -313,9 +349,13 @@ func Lrem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	removed := l.remove(int(count), args[2])
 	if removed > 0 {
 		logRem(cx, key, int(count), args[2])
+		cx.NotifyKeyspaceEvent(shard.NotifyList, "lrem", key)
 	}
 	if l.length() == 0 {
 		g.drop(key)
+		if removed > 0 {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
+		}
 	} else if removed > 0 {
 		g.note(l)
 	}
@@ -351,6 +391,7 @@ func Linsert(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	logInsert(cx, args[0], args[2], args[3], before)
+	cx.NotifyKeyspaceEvent(shard.NotifyList, "linsert", args[0])
 	// LINSERT never empties a list; on a successful insert (pivot found) the key
 	// survives with a grown footprint. A pivot-absent insert returned above without
 	// mutating, so it posts no delta.

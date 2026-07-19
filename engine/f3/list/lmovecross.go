@@ -91,6 +91,9 @@ func LmoveCross(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) []byte {
 				g.install(cx, dst, d)
 			}
 			pushEnd(d, elem, dstLeft)
+			// The push fires its event on the destination owner, the same push event
+			// the co-located move fires; the source pop event fires in its own hop.
+			cx.NotifyKeyspaceEvent(shard.NotifyList, pushEvent(dstLeft), dst)
 			// Wake any client blocked on the destination, exactly as the co-located
 			// lmove distinct-key branch (lmove.go) and the blocking cross move
 			// (blockmovecross.go) do. This runs on the dst owner under the barrier, so
@@ -109,6 +112,7 @@ func LmoveCross(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) []byte {
 			// in the separate waiter set and stay for a future push.
 			if d.length() == 0 {
 				g.drop(dst)
+				cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", dst)
 			} else {
 				g.note(d)
 			}
@@ -125,8 +129,12 @@ func LmoveCross(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) []byte {
 			// exactly as the co-located lmove deletes it (Redis deletes an emptied
 			// list).
 			popEnd(s, srcLeft)
+			// The source pop fires its event on the source owner; del follows if the
+			// pop drained it, matching the co-located move.
+			cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(srcLeft), src)
 			if s.length() == 0 {
 				g.drop(src)
+				cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", src)
 			} else {
 				g.note(s)
 			}
