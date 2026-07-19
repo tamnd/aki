@@ -1,0 +1,3 @@
+metric,aki_kb,redis_kb,valkey_kb,aki/redis,aki/valkey
+VmHWM_peak,43160,6202872,6202364,0.0070,0.0070
+delta_written,32280,6194008,6193952,,
