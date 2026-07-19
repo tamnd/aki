@@ -525,13 +525,35 @@ func init() {
 	// ZPOPMAX, and ZRANDMEMBER key on the first argument the same way ZADD does.
 	// ZMPOP leads with numkeys, so its routing key is the argument after it
 	// (keyAt=1), the same post-count route SINTERCARD uses; it reads every listed
-	// key from that shard's registry, the co-located-operand convention. The
-	// blocking forms BZPOPMIN/BZPOPMAX/BZMPOP are deferred to the F17 intent slice.
+	// key from that shard's registry, the co-located-operand convention.
 	register("ZPOPMIN", zset.Zpopmin, 1, 2, true)
 	register("ZPOPMAX", zset.Zpopmax, 1, 2, true)
 	register("ZRANDMEMBER", zset.Zrandmember, 1, 3, true)
 	register("ZMPOP", zset.Zmpop, 3, -1, false)
 	table["ZMPOP"].keyAt = 1
+
+	// BZPOPMIN/BZPOPMAX key [key ...] timeout (spec 2064/f3/12 section 6.7) are the
+	// blocking sorted-set pops. When a listed key already holds a non-empty zset
+	// they serve at once like ZPOPMIN/ZPOPMAX on the first non-empty key; otherwise
+	// they park the connection on every key and a later ZADD/ZINCRBY on the key (or
+	// a firing timeout) delivers the reply. blocks arms the reader barrier after
+	// enqueue so a command pipelined behind an unresolved BZPOPMIN does not reply out
+	// of order. They route on the first key (keyAt=0) and read the co-located key
+	// set from that owner, the same convention ZMPOP keeps; a cross-shard wait is a
+	// later slice, as it was for BLPOP.
+	register("BZPOPMIN", zset.Bzpopmin, 2, -1, true)
+	table["BZPOPMIN"].blocks = true
+	register("BZPOPMAX", zset.Bzpopmax, 2, -1, true)
+	table["BZPOPMAX"].blocks = true
+
+	// BZMPOP timeout numkeys key [key ...] <MIN|MAX> [COUNT count] (spec 2064/f3/12
+	// section 6.7) is the blocking ZMPOP. It leads with a timeout then a numkeys
+	// count, so its routing key is two arguments in (keyAt=2), the same post-count
+	// route BLMPOP uses; it reads the co-located key set from that owner and blocks
+	// on the first non-empty one. blocks arms the reader barrier on the DoAt path.
+	register("BZMPOP", zset.Bzmpop, 4, -1, false)
+	table["BZMPOP"].keyAt = 2
+	table["BZMPOP"].blocks = true
 
 	// The multi-key algebra surface (spec 2064/f3/12 section 6.12). The read
 	// forms ZUNION, ZINTER, ZDIFF, and ZINTERCARD lead with numkeys, so they route
