@@ -280,7 +280,7 @@ func (s *Server) doClientList(c *shard.Conn, cs *connState, args [][]byte) {
 			if eqFold(wantType, "MASTER") || eqFold(wantType, "REPLICA") || eqFold(wantType, "SLAVE") {
 				continue
 			}
-			if (other.subCount.Load()+other.psubCount.Load() > 0) != eqFold(wantType, "PUBSUB") {
+			if (other.subCount.Load()+other.psubCount.Load()+other.ssubCount.Load() > 0) != eqFold(wantType, "PUBSUB") {
 				continue
 			}
 		}
@@ -427,7 +427,7 @@ func appendClientLine(dst []byte, cs *connState, cmd string) []byte {
 	kvn("db", 0)
 	kvn("sub", cs.subCount.Load())
 	kvn("psub", cs.psubCount.Load())
-	kvn("ssub", 0)
+	kvn("ssub", cs.ssubCount.Load())
 	kvn("multi", -1)
 	kvn("watch", 0)
 	kvn("qbuf", 0)

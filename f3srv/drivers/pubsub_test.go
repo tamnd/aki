@@ -243,6 +243,109 @@ func TestPubsubChannelAndPattern(t *testing.T) {
 	}
 }
 
+// TestPubsubShardChannel drives the shard-channel path: one connection
+// SSUBSCRIBEs a shard channel, another SPUBLISHes to it, and an smessage arrives
+// unsolicited. It checks the ssubscribe/sunsubscribe confirmations, the delivered
+// smessage, the receiver count, PUBSUB SHARDCHANNELS/SHARDNUMSUB, and that a
+// regular PUBLISH to the same name does not reach a shard subscriber (the two are
+// separate namespaces).
+func TestPubsubShardChannel(t *testing.T) {
+	srv := startPubsubServer(t)
+	subNc, subBr := dialPubsub(t, srv)
+	pubNc, pubBr := dialPubsub(t, srv)
+
+	// Subscribe to two shard channels: the confirmation count is the shard count
+	// alone, and it names the channel.
+	send(t, subNc, "SSUBSCRIBE", "orders", "fills")
+	if k, ch, n := readSubConfirm(t, subBr); k != "ssubscribe" || ch != "orders" || n != 1 {
+		t.Fatalf("first sconfirm = %q %q %d, want ssubscribe orders 1", k, ch, n)
+	}
+	if k, ch, n := readSubConfirm(t, subBr); k != "ssubscribe" || ch != "fills" || n != 2 {
+		t.Fatalf("second sconfirm = %q %q %d, want ssubscribe fills 2", k, ch, n)
+	}
+
+	// SHARDCHANNELS lists the live shard channels; SHARDNUMSUB reports their counts.
+	send(t, pubNc, "PUBSUB", "SHARDCHANNELS")
+	got := map[string]bool{}
+	readArrayHeader(t, pubBr, 2)
+	got[readBulkFrom(t, pubBr)] = true
+	got[readBulkFrom(t, pubBr)] = true
+	if !got["orders"] || !got["fills"] {
+		t.Fatalf("SHARDCHANNELS = %v, want orders and fills", got)
+	}
+	send(t, pubNc, "PUBSUB", "SHARDNUMSUB", "orders", "weather")
+	readArrayHeader(t, pubBr, 4)
+	if ch := readBulkFrom(t, pubBr); ch != "orders" {
+		t.Fatalf("SHARDNUMSUB channel = %q, want orders", ch)
+	}
+	if n := readIntFrom(t, pubBr); n != 1 {
+		t.Fatalf("SHARDNUMSUB orders = %d, want 1", n)
+	}
+	if ch := readBulkFrom(t, pubBr); ch != "weather" {
+		t.Fatalf("SHARDNUMSUB channel = %q, want weather", ch)
+	}
+	if n := readIntFrom(t, pubBr); n != 0 {
+		t.Fatalf("SHARDNUMSUB weather = %d, want 0", n)
+	}
+
+	// SPUBLISH to a subscribed shard channel: the publisher gets the receiver count
+	// and the subscriber gets an smessage push.
+	send(t, pubNc, "SPUBLISH", "orders", "buy")
+	if n := readIntFrom(t, pubBr); n != 1 {
+		t.Fatalf("SPUBLISH receivers = %d, want 1", n)
+	}
+	if k, ch, msg := readMessage(t, subBr); k != "smessage" || ch != "orders" || msg != "buy" {
+		t.Fatalf("delivered = %q %q %q, want smessage orders buy", k, ch, msg)
+	}
+
+	// A regular PUBLISH to the same name is a different namespace and reaches no
+	// shard subscriber.
+	send(t, pubNc, "PUBLISH", "orders", "sell")
+	if n := readIntFrom(t, pubBr); n != 0 {
+		t.Fatalf("PUBLISH to shard-channel name = %d, want 0 (separate namespace)", n)
+	}
+
+	// Sunsubscribe from one shard channel: the confirmation reports the remaining
+	// count, and a later SPUBLISH there reaches nobody.
+	send(t, subNc, "SUNSUBSCRIBE", "orders")
+	if k, ch, n := readSubConfirm(t, subBr); k != "sunsubscribe" || ch != "orders" || n != 1 {
+		t.Fatalf("sunsubscribe confirm = %q %q %d, want sunsubscribe orders 1", k, ch, n)
+	}
+	send(t, pubNc, "SPUBLISH", "orders", "again")
+	if n := readIntFrom(t, pubBr); n != 0 {
+		t.Fatalf("SPUBLISH after sunsubscribe = %d, want 0", n)
+	}
+}
+
+// TestPubsubShardUnsubscribeAll covers the bare SUNSUBSCRIBE that drops every held
+// shard channel, and the nil-channel confirmation a connection holding none
+// answers.
+func TestPubsubShardUnsubscribeAll(t *testing.T) {
+	srv := startPubsubServer(t)
+	subNc, subBr := dialPubsub(t, srv)
+
+	send(t, subNc, "SSUBSCRIBE", "a", "b", "c")
+	for i := 1; i <= 3; i++ {
+		readSubConfirm(t, subBr)
+	}
+
+	// A bare SUNSUBSCRIBE drops all three, one confirmation each, ending at zero.
+	send(t, subNc, "SUNSUBSCRIBE")
+	last := int64(-1)
+	for i := 0; i < 3; i++ {
+		_, _, n := readSubConfirm(t, subBr)
+		last = n
+	}
+	if last != 0 {
+		t.Fatalf("final sunsubscribe count = %d, want 0", last)
+	}
+
+	// A second bare SUNSUBSCRIBE on a connection holding nothing answers one
+	// confirmation with a nil channel and count zero.
+	send(t, subNc, "SUNSUBSCRIBE")
+	expect(t, subBr, "*3\r\n$12\r\nsunsubscribe\r\n$-1\r\n:0\r\n")
+}
+
 // readPMessage reads a delivered pattern message push: "pmessage", the pattern,
 // the channel, the payload, all bulks.
 func readPMessage(t *testing.T, br *bufio.Reader) (kind, pattern, channel, payload string) {
