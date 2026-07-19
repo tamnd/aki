@@ -390,28 +390,39 @@ type partMembersStream struct {
 func (m *partMembersStream) Next(dst []byte) (int, error) {
 	n := 0
 	for n < len(dst) {
-		if m.off >= len(m.buf) {
-			switch {
-			case !m.started:
-				m.buf = resp.AppendArrayHeader(m.buf[:0], m.total)
-				m.started = true
-				m.off = 0
-			case m.pi < len(m.parts):
-				if m.idx >= len(m.ords[m.pi]) {
-					m.pi++
-					m.idx = 0
-					continue
-				}
-				m.buf = resp.AppendBulk(m.buf[:0], m.parts[m.pi].memberByOrd(m.ords[m.pi][m.idx]))
-				m.idx++
-				m.off = 0
-			default:
-				return n, nil // every element framed and copied
-			}
+		// Drain the straddle buffer first: a member wider than the space left in
+		// the previous chunk is carried here and resumed a chunk at a time.
+		if m.off < len(m.buf) {
+			c := copy(dst[n:], m.buf[m.off:])
+			m.off += c
+			n += c
+			continue
 		}
-		c := copy(dst[n:], m.buf[m.off:])
-		m.off += c
-		n += c
+		switch {
+		case !m.started:
+			m.buf = resp.AppendArrayHeader(m.buf[:0], m.total)
+			m.started = true
+			m.off = 0
+		case m.pi < len(m.parts):
+			if m.idx >= len(m.ords[m.pi]) {
+				m.pi++
+				m.idx = 0
+				continue
+			}
+			mb := m.parts[m.pi].memberByOrd(m.ords[m.pi][m.idx])
+			m.idx++
+			// Fast path: frame the member straight onto the wire when its whole
+			// frame fits in dst, skipping the copy through buf; only a straddler
+			// uses the scratch path. Same elision as smembers.go.
+			if bulkFrameLen(len(mb)) <= int64(len(dst)-n) {
+				n = len(resp.AppendBulk(dst[:n], mb))
+				continue
+			}
+			m.buf = resp.AppendBulk(m.buf[:0], mb)
+			m.off = 0
+		default:
+			return n, nil // every element framed and copied
+		}
 	}
 	return n, nil
 }

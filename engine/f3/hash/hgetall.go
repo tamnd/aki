@@ -67,28 +67,41 @@ func (e *enumStream) locate(elem int) (ord uint32, value bool) {
 func (e *enumStream) Next(dst []byte) (int, error) {
 	n := 0
 	for n < len(dst) {
-		if e.off >= len(e.buf) {
-			switch {
-			case !e.started:
-				e.buf = resp.AppendArrayHeader(e.buf[:0], e.total)
-				e.started = true
-				e.off = 0
-			case e.elem < e.total:
-				ord, value := e.locate(e.elem)
-				b := e.ft.fieldByOrd(ord)
-				if value {
-					b = e.ft.valueByOrd(ord)
-				}
-				e.buf = resp.AppendBulk(e.buf[:0], b)
-				e.elem++
-				e.off = 0
-			default:
-				return n, nil // every element framed and copied
-			}
+		// Drain the straddle buffer first: an element wider than the space left
+		// in the previous chunk is carried here and resumed a chunk at a time.
+		if e.off < len(e.buf) {
+			c := copy(dst[n:], e.buf[e.off:])
+			e.off += c
+			n += c
+			continue
 		}
-		c := copy(dst[n:], e.buf[e.off:])
-		e.off += c
-		n += c
+		switch {
+		case !e.started:
+			e.buf = resp.AppendArrayHeader(e.buf[:0], e.total)
+			e.started = true
+			e.off = 0
+		case e.elem < e.total:
+			ord, value := e.locate(e.elem)
+			b := e.ft.fieldByOrd(ord)
+			if value {
+				b = e.ft.valueByOrd(ord)
+			}
+			e.elem++
+			// Fast path: when the whole bulk frame fits in the space left in dst,
+			// frame it straight onto the wire, skipping the copy through buf. The
+			// fit check guarantees dst's capacity, so slices.Grow inside AppendBulk
+			// reuses dst's backing and writes in place. Only an element crossing the
+			// chunk boundary falls to the straddle path below. Same lever as
+			// set/smembers.go, which flipped the 10k SMEMBERS gate cell.
+			if bulkFrameLen(len(b)) <= int64(len(dst)-n) {
+				n = len(resp.AppendBulk(dst[:n], b))
+				continue
+			}
+			e.buf = resp.AppendBulk(e.buf[:0], b)
+			e.off = 0
+		default:
+			return n, nil // every element framed and copied
+		}
 	}
 	return n, nil
 }
