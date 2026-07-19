@@ -58,6 +58,14 @@ func (e encoding) String() string {
 type set struct {
 	enc encoding
 
+	// clock is the per-key access clock OBJECT IDLETIME reads back: the batch
+	// second-resolution time (store.LRUClock) stamped on every read and write the
+	// way Redis stamps robj.lru, folded to sixteen bits. It rides the alignment
+	// padding after enc, so a set carries a real idle clock at zero added bytes,
+	// the same free-header trick the string cell uses (store record offKindBits).
+	// It wraps every ~18.2h, the fidelity price of spending no bytes.
+	clock uint16
+
 	// expireAt is the key's deadline in unix milliseconds, 0 when the set has no
 	// TTL (spec 2064/f3/16 section 2). It lives inline in the per-key header rather
 	// than in a side expires dict, so a volatile set costs one int64, not a second

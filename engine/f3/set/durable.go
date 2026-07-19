@@ -159,10 +159,10 @@ func Recover(cx *shard.Ctx) error {
 	g := registry(cx)
 	return cx.St.WalkCollection(akifile.CollKindSet,
 		func(key []byte, snap akifile.CollSnapRow) error {
-			return applySetSnapshot(g, key, snap)
+			return applySetSnapshot(cx, g, key, snap)
 		},
 		func(key []byte, op akifile.CollOpRow) error {
-			return applySetOp(g, key, op)
+			return applySetOp(cx, g, key, op)
 		})
 }
 
@@ -171,13 +171,13 @@ func Recover(cx *shard.Ctx) error {
 // rebuilds the set from the element run through the same band-selecting add funnel a
 // live run and an effect replay use, and restores the key TTL from the header. An
 // empty element run leaves the key dropped, since the registry keeps no empty set.
-func applySetSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
+func applySetSnapshot(cx *shard.Ctx, g *reg, key []byte, snap akifile.CollSnapRow) error {
 	g.drop(key)
 	var s *set
 	if !eachEntry(snap.ElementRun, func(m []byte) {
 		if s == nil {
 			s = newSet(m)
-			g.m[string(key)] = s
+			g.install(cx, key, s)
 		}
 		s.add(m)
 	}) {
@@ -199,13 +199,13 @@ func applySetSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
 // effect arm both a live replay and the recovery walk share. It reports ErrLength on
 // a torn expire payload, the fail-closed cut recovery wants; an expire on an absent
 // key is a defensive no-op, since a deterministic replay never produces one.
-func applySetOp(g *reg, key []byte, op akifile.CollOpRow) error {
+func applySetOp(cx *shard.Ctx, g *reg, key []byte, op akifile.CollOpRow) error {
 	switch op.Op {
 	case setOpAdd:
 		s := g.m[string(key)]
 		if s == nil {
 			s = newSet(op.SubKey)
-			g.m[string(key)] = s
+			g.install(cx, key, s)
 		}
 		s.add(op.SubKey)
 		g.note(s)

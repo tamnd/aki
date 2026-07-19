@@ -24,7 +24,7 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// an empty set registry on a shard that never ran a set command; a read-only
 	// OBJECT must leave no residency state.
 	if cx.Coll != nil {
-		if s := cx.Coll.(*reg).live(cx, key); s != nil {
+		if s := cx.Coll.(*reg).peek(cx, key); s != nil {
 			r.Bulk([]byte(s.enc.String()))
 			return
 		}
@@ -71,7 +71,7 @@ func stringEncoding(v []byte) string {
 // registry when none exists, the read-only discipline every probe keeps.
 func MemoryUsage(cx *shard.Ctx, key []byte) (uint64, bool) {
 	if g, ok := cx.Coll.(*reg); ok {
-		if s := g.live(cx, key); s != nil {
+		if s := g.peek(cx, key); s != nil {
 			return s.residentBytes(), true
 		}
 	}

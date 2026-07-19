@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/engine/f3/store"
 )
 
 // The zset type keeps its per-key structures in an owner-local registry hung off
@@ -97,8 +98,7 @@ func Has(cx *shard.Ctx, key []byte) bool {
 	if cx.ZColl == nil {
 		return false
 	}
-	z, _ := cx.ZColl.(*reg).lookup(cx, key)
-	return z != nil
+	return cx.ZColl.(*reg).peek(cx, key) != nil
 }
 
 // Delete removes key when it holds a zset on this shard and reports whether it
@@ -193,6 +193,22 @@ func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
 // The deadline compare is a single field load against cx.NowMs, predicted away
 // for the common zset that carries no TTL.
 func (g *reg) live(cx *shard.Ctx, key []byte) *zset {
+	z := g.peek(cx, key)
+	if z != nil {
+		// Record the access the way Redis stamps robj.lru on every lookup: live is
+		// the read, mutate, and create funnel, so one stamp here clocks every real
+		// command. The read-only probes (peek) skip it, so OBJECT IDLETIME, OBJECT
+		// ENCODING, MEMORY USAGE, EXISTS, and TYPE are NOTOUCH, matching Redis.
+		z.clock = store.LRUClock(cx.NowMs)
+	}
+	return z
+}
+
+// peek returns the live zset at key without recording an access, the NOTOUCH
+// resolve the read-only introspection and presence probes use so a query does
+// not reset the key's idle clock. It still reaps a lazily-expired zset, since an
+// expired zset is absent to a probe just as it is to a command.
+func (g *reg) peek(cx *shard.Ctx, key []byte) *zset {
 	z := g.m[string(key)]
 	if z == nil {
 		return nil
@@ -202,6 +218,40 @@ func (g *reg) live(cx *shard.Ctx, key []byte) *zset {
 		return nil
 	}
 	return z
+}
+
+// install puts a freshly built zset under key and stamps its access clock, so a
+// brand-new key reads idle zero and then accrues idle from creation the way Redis
+// stamps robj.lru in createObject. Every path that first places a zset in the map
+// (ZADD, ZINCRBY, GEOADD, the *STORE result, WAL replay) routes through here, so no
+// create path leaves the clock at zero, which the idle read would otherwise
+// misreport as a near-full wrap of idle time. It does not touch the resident total;
+// the caller's note posts the new zset's footprint.
+func (g *reg) install(cx *shard.Ctx, key []byte, z *zset) {
+	z.clock = store.LRUClock(cx.NowMs)
+	g.m[string(key)] = z
+}
+
+// IdleSeconds reports seconds since the zset at key was last accessed by a
+// command, the zset arm of OBJECT IDLETIME, read back from the per-key access
+// clock without touching it (NOTOUCH). ok is false when no zset lives at key, so
+// the dispatcher can fall through to the other keyspaces.
+func (g *reg) IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
+	z := g.peek(cx, key)
+	if z == nil {
+		return 0, false
+	}
+	return store.IdleSecondsFrom(z.clock, cx.NowMs), true
+}
+
+// IdleSeconds is the package entry the dispatcher calls for OBJECT IDLETIME on a
+// zset key. It builds no registry when none exists, the read-only discipline
+// every probe keeps.
+func IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
+	if g, ok := cx.ZColl.(*reg); ok {
+		return g.IdleSeconds(cx, key)
+	}
+	return 0, false
 }
 
 // lookup finds the zset for key. present is false when no zset exists or it has

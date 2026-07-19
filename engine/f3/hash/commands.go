@@ -274,6 +274,6 @@ func getOrCreate(cx *shard.Ctx, key []byte) (g *reg, h *hash, wrong bool) {
 		return g, nil, true
 	}
 	h = newHash()
-	g.m[string(key)] = h
+	g.install(cx, key, h)
 	return g, h, false
 }

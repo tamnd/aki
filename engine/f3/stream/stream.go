@@ -36,7 +36,17 @@ const (
 )
 
 type stream struct {
-	kind         band
+	kind band
+
+	// clock is the per-key access clock OBJECT IDLETIME reads back: the batch
+	// second-resolution time (store.LRUClock) stamped on every read and write the
+	// way Redis stamps robj.lru, folded to sixteen bits. It rides the alignment
+	// padding after kind (a uint8 band), before the 8-aligned lastID, so a stream
+	// carries a real idle clock at zero added bytes, the same free-header trick the
+	// string cell uses (store record offKindBits). It wraps every ~18.2h, the
+	// fidelity price of spending no bytes.
+	clock uint16
+
 	lastID       streamID // greatest ID ever assigned, never lowered by XDEL
 	maxDeletedID streamID // greatest tombstoned ID (section 6.5)
 	entriesAdded uint64   // lifetime XADD count, never lowered

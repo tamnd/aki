@@ -145,7 +145,7 @@ func place(cx *shard.Ctx, g *reg, key []byte, result *set) int {
 	if g.acctOn && g.m[string(key)] != nil {
 		g.drop(key)
 	}
-	g.m[string(key)] = result
+	g.install(cx, key, result)
 	g.note(result)
 	return result.card()
 }

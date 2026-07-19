@@ -248,10 +248,10 @@ func Recover(cx *shard.Ctx) error {
 	g := registry(cx)
 	return cx.St.WalkCollection(akifile.CollKindStream,
 		func(key []byte, snap akifile.CollSnapRow) error {
-			return applyStreamSnapshot(g, key, snap)
+			return applyStreamSnapshot(cx, g, key, snap)
 		},
 		func(key []byte, op akifile.CollOpRow) error {
-			return applyStreamOp(g, key, op)
+			return applyStreamOp(cx, g, key, op)
 		})
 }
 
@@ -263,7 +263,7 @@ func Recover(cx *shard.Ctx) error {
 // appendEntry remade it. Unlike the other collections an emptied stream is kept, so an
 // empty element run still leaves the key present with its counters. A torn header or run
 // reports ErrLength, the fail-closed cut a recovering reader wants.
-func applyStreamSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
+func applyStreamSnapshot(cx *shard.Ctx, g *reg, key []byte, snap akifile.CollSnapRow) error {
 	g.drop(key)
 	if len(snap.Header) < snapHeaderLen {
 		return akifile.ErrLength
@@ -283,7 +283,7 @@ func applyStreamSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
 	if !restoreGroupSection(s, snap.Header[snapHeaderLen:]) {
 		return akifile.ErrLength
 	}
-	g.m[string(key)] = s
+	g.install(cx, key, s)
 	g.note(s)
 	return nil
 }
@@ -297,7 +297,7 @@ func applyStreamSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
 // the fail-closed cut recovery wants; a structurally valid op that no longer applies (a
 // delete, trim, or expire on an absent stream) is a defensive no-op, since a deterministic
 // replay never produces one.
-func applyStreamOp(g *reg, key []byte, op akifile.CollOpRow) error {
+func applyStreamOp(cx *shard.Ctx, g *reg, key []byte, op akifile.CollOpRow) error {
 	switch op.Op {
 	case streamOpAdd:
 		if len(op.SubKey) < 16 {
@@ -307,7 +307,7 @@ func applyStreamOp(g *reg, key []byte, op akifile.CollOpRow) error {
 		if !ok {
 			return akifile.ErrLength
 		}
-		s := getOrCreateStream(g, key)
+		s := getOrCreateStream(cx, g, key)
 		s.appendEntry(readID16(op.SubKey), fields)
 		g.note(s)
 	case streamOpDel:
@@ -354,18 +354,18 @@ func applyStreamOp(g *reg, key []byte, op akifile.CollOpRow) error {
 	default:
 		// The group and PEL effect arm (durablegroup.go): group-set, group-destroy,
 		// consumer-set, consumer-del, pel-set, and pel-del dispatch there.
-		return applyGroupOp(g, key, op)
+		return applyGroupOp(cx, g, key, op)
 	}
 	return nil
 }
 
 // getOrCreateStream returns the stream at key, building an empty one and registering it on
 // first touch, the create-on-first-add shape a live XADD and an effect replay share.
-func getOrCreateStream(g *reg, key []byte) *stream {
+func getOrCreateStream(cx *shard.Ctx, g *reg, key []byte) *stream {
 	s := g.m[string(key)]
 	if s == nil {
 		s = newStream()
-		g.m[string(key)] = s
+		g.install(cx, key, s)
 	}
 	return s
 }

@@ -88,7 +88,7 @@ func LmoveCross(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) []byte {
 			// list is always born listpack and only the byte budget moves it native.
 			if d == nil {
 				d = newList()
-				g.m[string(dst)] = d
+				g.install(cx, dst, d)
 			}
 			pushEnd(d, elem, dstLeft)
 			// Wake any client blocked on the destination, exactly as the co-located

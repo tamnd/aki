@@ -1191,29 +1191,47 @@ func objectCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 
 // objectIdleTime answers OBJECT IDLETIME key: seconds since the key was last
 // accessed. A string reads the per-key access clock stamped in its record header
-// (store.IdleSeconds), stamped on every read and write, so the answer resets to
-// zero on the next GET or SET the way Redis resets robj.lru. A present collection
-// reports zero for now: collection types carry no access clock this slice, and
-// zero is the recently-accessed answer rather than an invented age (the follow-on
-// slice adds a real clock in the struct padding each collection already carries).
-// A key present nowhere is the null bulk Redis returns for OBJECT IDLETIME on a
-// missing key, verified against redis 8.8.0 and distinct from the "no such key"
-// error REFCOUNT gives. The probes honour the key deadline, so a lazily-expired
-// key reads as missing.
+// (store.IdleSeconds); a collection reads the matching clock stamped in the
+// struct padding each type carries (set.IdleSeconds and friends). Both stamp on
+// every read and write, so the answer resets to zero on the next command the way
+// Redis resets robj.lru, and both stay NOTOUCH here so the query itself is not an
+// access. A key present nowhere is the null bulk Redis returns for OBJECT IDLETIME
+// on a missing key, verified against redis 8.8.0 and distinct from the "no such
+// key" error REFCOUNT gives. The probes honour the key deadline, so a
+// lazily-expired key reads as missing.
 func objectIdleTime(cx *shard.Ctx, key []byte, r shard.Reply) {
 	if idle, ok := cx.St.IdleSeconds(key, cx.NowMs); ok {
 		r.Int(idle)
 		return
 	}
-	if set.Has(cx, key) ||
-		zset.Has(cx, key) ||
-		hash.Has(cx, key) ||
-		list.Has(cx, key) ||
-		stream.Has(cx, key) {
-		r.Int(0)
+	if idle, ok := collectionIdleSeconds(cx, key); ok {
+		r.Int(idle)
 		return
 	}
 	r.Null()
+}
+
+// collectionIdleSeconds walks the collection keyspaces in the OBJECT chain order
+// and returns the idle seconds of whichever type holds key, read NOTOUCH from that
+// type's per-key access clock. ok is false when no collection holds key, so the
+// caller falls through to the null bulk.
+func collectionIdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
+	if idle, ok := set.IdleSeconds(cx, key); ok {
+		return idle, true
+	}
+	if idle, ok := zset.IdleSeconds(cx, key); ok {
+		return idle, true
+	}
+	if idle, ok := hash.IdleSeconds(cx, key); ok {
+		return idle, true
+	}
+	if idle, ok := list.IdleSeconds(cx, key); ok {
+		return idle, true
+	}
+	if idle, ok := stream.IdleSeconds(cx, key); ok {
+		return idle, true
+	}
+	return 0, false
 }
 
 // lfuNotSelected is the error Redis returns for OBJECT FREQ when the running

@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/engine/f3/store"
 )
 
 // The set type keeps its per-key structures in an owner-local registry hung off
@@ -100,8 +101,7 @@ func Has(cx *shard.Ctx, key []byte) bool {
 	if cx.Coll == nil {
 		return false
 	}
-	s, _ := cx.Coll.(*reg).lookup(cx, key)
-	return s != nil
+	return cx.Coll.(*reg).peek(cx, key) != nil
 }
 
 // Delete removes key when it holds a set on this shard and reports whether it
@@ -197,6 +197,22 @@ func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
 // The deadline compare is a single field load against cx.NowMs, predicted away
 // for the common set that carries no TTL.
 func (g *reg) live(cx *shard.Ctx, key []byte) *set {
+	s := g.peek(cx, key)
+	if s != nil {
+		// Record the access the way Redis stamps robj.lru on every lookup: live is
+		// the read, mutate, and create funnel, so one stamp here clocks every real
+		// command. The read-only probes (peek) skip it, so OBJECT IDLETIME, OBJECT
+		// ENCODING, MEMORY USAGE, EXISTS, and TYPE are NOTOUCH, matching Redis.
+		s.clock = store.LRUClock(cx.NowMs)
+	}
+	return s
+}
+
+// peek returns the live set at key without recording an access, the NOTOUCH
+// resolve the read-only introspection and presence probes use so a query does
+// not reset the key's idle clock. It still reaps a lazily-expired set, since an
+// expired set is absent to a probe just as it is to a command.
+func (g *reg) peek(cx *shard.Ctx, key []byte) *set {
 	s := g.m[string(key)]
 	if s == nil {
 		return nil
@@ -206,6 +222,40 @@ func (g *reg) live(cx *shard.Ctx, key []byte) *set {
 		return nil
 	}
 	return s
+}
+
+// install puts a freshly built set under key and stamps its access clock, so a
+// brand-new key reads idle zero and then accrues idle from creation the way Redis
+// stamps robj.lru in createObject. Every path that first places a set in the map
+// (SADD, the *STORE result, SMOVE's destination, WAL replay) routes through here,
+// so no create path leaves the clock at zero, which the idle read would otherwise
+// misreport as a near-full wrap of idle time. It does not touch the resident
+// total; the caller's note posts the new set's footprint.
+func (g *reg) install(cx *shard.Ctx, key []byte, s *set) {
+	s.clock = store.LRUClock(cx.NowMs)
+	g.m[string(key)] = s
+}
+
+// IdleSeconds reports seconds since the set at key was last accessed by a
+// command, the set arm of OBJECT IDLETIME, read back from the per-key access
+// clock without touching it (NOTOUCH). ok is false when no set lives at key, so
+// the dispatcher can fall through to the other keyspaces.
+func (g *reg) IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
+	s := g.peek(cx, key)
+	if s == nil {
+		return 0, false
+	}
+	return store.IdleSecondsFrom(s.clock, cx.NowMs), true
+}
+
+// IdleSeconds is the package entry the dispatcher calls for OBJECT IDLETIME on a
+// set key. It builds no registry when none exists, the read-only discipline
+// every probe keeps.
+func IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
+	if g, ok := cx.Coll.(*reg); ok {
+		return g.IdleSeconds(cx, key)
+	}
+	return 0, false
 }
 
 // lookup finds the set for key. present is false when no set exists or it has

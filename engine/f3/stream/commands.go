@@ -73,7 +73,7 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	fields := parseFields(args[i:])
 	s.appendEntry(id, fields)
 	if newKey {
-		g.m[string(args[0])] = s
+		g.install(cx, args[0], s)
 	}
 	// Cut the add effect after the entry is in the stream, so a replay re-drives the
 	// append with the same ID and reproduces the exact entry.

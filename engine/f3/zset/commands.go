@@ -83,7 +83,7 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 				g.drop(key)
 			} else {
 				if created {
-					g.m[string(key)] = z
+					g.install(cx, key, z)
 				}
 				g.note(z)
 			}
@@ -103,7 +103,7 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 	} else {
 		if created {
-			g.m[string(key)] = z
+			g.install(cx, key, z)
 		}
 		g.note(z)
 	}
@@ -188,7 +188,7 @@ func Zincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		logAdd(cx, key, member, newScore)
 	}
 	if created {
-		g.m[string(key)] = z
+		g.install(cx, key, z)
 	}
 	g.note(z)
 	var sc [40]byte

@@ -424,7 +424,7 @@ func serveMove(cx *shard.Ctx, g *reg, key []byte, l *list, i uint32, nd *waitNod
 	} else {
 		if dst == nil {
 			dst = newList()
-			g.m[dstKey] = dst
+			g.install(cx, []byte(dstKey), dst)
 		}
 		pushEnd(dst, elem, dstLeft)
 		g.ready = append(g.ready, dstKey)

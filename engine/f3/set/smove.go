@@ -71,7 +71,7 @@ func smove(g *reg, cx *shard.Ctx, srcKey, dstKey, member []byte) (moved, wrong b
 	// that breaches the destination's band cap converts it upward in place.
 	if dst == nil {
 		dst = newSet(member)
-		g.m[string(dstKey)] = dst
+		g.install(cx, dstKey, dst)
 	}
 	dst.add(member)
 	g.note(dst)

@@ -94,7 +94,7 @@ func xgroupCreate(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	s.addGroup(name, newGroup(start, read, valid))
 	if created {
-		g.m[string(key)] = s
+		g.install(cx, key, s)
 	}
 	// A new group upgrades an inline stream to native and adds the group cell, so the
 	// footprint moves; reconcile it into the running sum at the boundary.

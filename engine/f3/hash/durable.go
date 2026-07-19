@@ -268,10 +268,10 @@ func Recover(cx *shard.Ctx) error {
 	g := registry(cx)
 	return cx.St.WalkCollection(akifile.CollKindHash,
 		func(key []byte, snap akifile.CollSnapRow) error {
-			return applyHashSnapshot(g, key, snap)
+			return applyHashSnapshot(cx, g, key, snap)
 		},
 		func(key []byte, op akifile.CollOpRow) error {
-			return applyHashOp(g, key, op)
+			return applyHashOp(cx, g, key, op)
 		})
 }
 
@@ -281,13 +281,13 @@ func Recover(cx *shard.Ctx) error {
 // a live run and an effect replay use, and restores the key TTL from the header. An
 // empty element run leaves the key dropped, since the registry keeps no empty hash. A
 // torn run reports ErrLength, the fail-closed cut a recovering reader wants.
-func applyHashSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
+func applyHashSnapshot(cx *shard.Ctx, g *reg, key []byte, snap akifile.CollSnapRow) error {
 	g.drop(key)
 	var h *hash
 	if !eachPair(snap.ElementRun, func(field, value []byte) {
 		if h == nil {
 			h = newHash()
-			g.m[string(key)] = h
+			g.install(cx, key, h)
 		}
 		h.set(field, value)
 	}) {
@@ -341,13 +341,13 @@ func eachPair(run []byte, fn func(field, value []byte)) bool {
 // an inline threshold promotes to the native band exactly as it did live. It reports
 // ErrLength on a torn expire or field-expire payload, the fail-closed cut recovery wants;
 // an expire on an absent key or field is a defensive no-op.
-func applyHashOp(g *reg, key []byte, op akifile.CollOpRow) error {
+func applyHashOp(cx *shard.Ctx, g *reg, key []byte, op akifile.CollOpRow) error {
 	switch op.Op {
 	case hashOpSet:
 		h := g.m[string(key)]
 		if h == nil {
 			h = newHash()
-			g.m[string(key)] = h
+			g.install(cx, key, h)
 		}
 		h.set(op.SubKey, op.SubValue)
 		g.note(h)

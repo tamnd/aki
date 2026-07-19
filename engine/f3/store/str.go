@@ -121,6 +121,19 @@ func (s *Store) setExpireAt(off uint64, at int64) {
 // spending record bytes the memory bar holds against rivals on a string cell.
 func lruClock(nowMs int64) uint16 { return uint16(nowMs / 1000) }
 
+// LRUClock exposes the per-key access clock so the collection types can stamp
+// the same second-resolution clock in their own per-key headers (the alignment
+// padding their structs already carry), one clock definition for every keyspace.
+// A collection idle then reads on the same ~18.2h wrap schedule as a string idle.
+func LRUClock(nowMs int64) uint16 { return lruClock(nowMs) }
+
+// IdleSecondsFrom is the OBJECT IDLETIME arithmetic for a clock a collection
+// stamped: seconds between now and the stamp, folded through the sixteen-bit wrap
+// the clock lives in.
+func IdleSecondsFrom(clock uint16, nowMs int64) int64 {
+	return int64((lruClock(nowMs) - clock) & 0xffff)
+}
+
 // stampClock marks the string record at off accessed now, the read-and-write
 // touch Redis makes to robj.lru on every lookup. It writes the header's spare
 // offKindBits word, the same 16-byte header line the touching command already
