@@ -147,6 +147,9 @@ func init() {
 	register("SELECT", selectDB, 1, 1, false)
 	register("LOLWUT", lolwut, 0, -1, false)
 	register("RESET", reset, 0, 0, false)
+	// COMMAND introspects the table itself (see command.go); redis-cli calls it
+	// on connect. The subcommand and its tail are validated in the handler.
+	register("COMMAND", commandCmd, 0, -1, false)
 
 	// The string point surface. SET's tail is option soup, so the handler
 	// validates it.
