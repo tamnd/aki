@@ -102,6 +102,7 @@ func xgroupCreate(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// Cut the group's cursor so a replay rebuilds it, creating the stream under it when
 	// MKSTREAM made an empty one with no entry effect of its own to carry it.
 	logGroupSet(cx, key, name, s.group(name))
+	cx.NotifyKeyspaceEvent(shard.NotifyStream, "xgroup-create", key)
 	r.Status("OK")
 }
 
@@ -132,6 +133,7 @@ func xgroupSetID(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	grp.readValid = valid
 	// The cursor moved; cut the group's new position so a replay repositions it.
 	logGroupSet(cx, key, name, grp)
+	cx.NotifyKeyspaceEvent(shard.NotifyStream, "xgroup-setid", key)
 	r.Status("OK")
 }
 
@@ -161,6 +163,7 @@ func xgroupDestroy(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// Cut the destroy so a replay drops the group instead of rebuilding it from the
 	// effects that preceded it.
 	logGroupDestroy(cx, key, name)
+	cx.NotifyKeyspaceEvent(shard.NotifyStream, "xgroup-destroy", key)
 	r.Int(1)
 }
 
@@ -179,6 +182,7 @@ func xgroupCreateConsumer(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		// Pin the new consumer's ordinal so a later pending slab's owner resolves to it
 		// on replay.
 		logConsumerSet(cx, key, name, grp.consumer(con))
+		cx.NotifyKeyspaceEvent(shard.NotifyStream, "xgroup-createconsumer", key)
 		r.Int(1)
 		return
 	}
@@ -202,6 +206,7 @@ func xgroupDelConsumer(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// Cut the removal so a replay runs the same delConsumer, draining the consumer's
 	// pending entries from the rebuilt PEL without a per-entry delete of its own.
 	logConsumerDel(cx, key, name, con)
+	cx.NotifyKeyspaceEvent(shard.NotifyStream, "xgroup-delconsumer", key)
 	r.Int(n)
 }
 
