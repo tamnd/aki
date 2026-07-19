@@ -168,6 +168,9 @@ func init() {
 	register("FAILOVER", failoverCmd, 0, -1, false)
 	register("LATENCY", latencyCmd, 1, -1, false)
 	register("SLOWLOG", slowlogCmd, 1, -1, false)
+	// ACL describes f3's single built-in superuser (see acl.go); f3 runs no
+	// authentication. The subcommand at args[0] is validated in the handler.
+	register("ACL", aclCmd, 1, -1, false)
 
 	// The string point surface. SET's tail is option soup, so the handler
 	// validates it.
