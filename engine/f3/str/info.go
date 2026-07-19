@@ -58,5 +58,6 @@ func WriteInfoBlob(cx *shard.Ctx, extraKeys, extraVolatile uint64, r shard.Reply
 	put(shard.StatBackpressureStalls, cx.BackpressureStalls())
 	put(shard.StatVolatileKeys, st.VolatileKeys()+extraVolatile)
 	put(shard.StatExpiredKeys, cx.ExpiredKeys())
+	put(shard.StatEvictedKeys, cx.EvictedKeys())
 	r.Raw(b[:])
 }

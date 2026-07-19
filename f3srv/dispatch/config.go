@@ -1,9 +1,11 @@
 package dispatch
 
 import (
+	"strconv"
 	"sync"
 
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/engine/f3/store"
 	"github.com/tamnd/aki/f3srv/resp"
 )
 
@@ -14,16 +16,19 @@ import (
 // holds a small table of the parameters a client actually queries, each seeded
 // with the value that describes how f3 already behaves.
 //
-// The honest edge: these values are cosmetic today. GET reflects the seed or
-// whatever a later SET stored, but SET does not change engine behavior yet.
-// maxmemory does not drive eviction and save does not drive snapshotting,
-// because the eviction budgets (M9) and the .aki snapshot timer (M8) are their
-// own arcs. CONFIG lets a client negotiate and read back its settings without
-// erroring; the day those arcs land they read their live value from this same
-// store. Parameters f3 has no analog for, chiefly the encoding thresholds, are
-// deliberately absent rather than exposed as knobs that do nothing: f3's
-// encodings are adaptive and not client-tunable, so a GET for them matches
-// Redis's answer for an unknown parameter, the empty result.
+// The live edge and the cosmetic edge. The three maxmemory parameters are live:
+// SET validates them (a byte quantity, one of the ten policy names, a positive
+// sample count) and pushes the result into the evictor's atomics (evictcycle.go),
+// so a client that sets maxmemory and a policy gets real eviction against the
+// shard's budget share. The rest stay cosmetic: GET reflects the seed or whatever
+// a later SET stored, but save does not yet drive snapshotting (the .aki timer is
+// M8's arc) and appendonly does not switch persistence modes. CONFIG lets a
+// client negotiate and read back those settings without erroring; the day their
+// arcs land they read their live value from this same store. Parameters f3 has no
+// analog for, chiefly the encoding thresholds, are deliberately absent rather than
+// exposed as knobs that do nothing: f3's encodings are adaptive and not client-
+// tunable, so a GET for them matches Redis's answer for an unknown parameter, the
+// empty result.
 
 var (
 	configMu sync.RWMutex
@@ -113,10 +118,13 @@ func configGet(cx *shard.Ctx, patterns [][]byte, r shard.Reply) {
 }
 
 // configSet answers CONFIG SET param value [param value ...]. It validates every
-// pair before applying any, so an unknown parameter in the tail leaves the store
-// untouched, the atomic contract Redis holds. The value is stored verbatim; f3
-// does not normalize memory suffixes because the value is cosmetic until the
-// eviction and persistence arcs read it.
+// pair before applying any, so an unknown parameter or a malformed eviction value
+// in the tail leaves the store untouched, the atomic contract Redis holds. The
+// three maxmemory parameters are validated and normalized (a byte quantity to its
+// decimal byte count, a policy name to its canonical spelling, a sample count to a
+// positive integer) so a later GET reads them back the way redis does, and the
+// normalized value is pushed into the evictor's atomics under the same lock. Every
+// other parameter is still stored verbatim, cosmetic until its own arc reads it.
 func configSet(pairs [][]byte, r shard.Reply) {
 	if len(pairs) == 0 || len(pairs)%2 != 0 {
 		r.Err("ERR wrong number of arguments for 'config|set' command")
@@ -124,15 +132,58 @@ func configSet(pairs [][]byte, r shard.Reply) {
 	}
 	configMu.Lock()
 	defer configMu.Unlock()
+	// Validate and normalize every pair first; norm[i/2] holds the value to store.
+	norm := make([]string, len(pairs)/2)
 	for i := 0; i < len(pairs); i += 2 {
 		name := lowerASCII(pairs[i])
 		if _, ok := configVals[name]; !ok {
 			r.Err("ERR Unknown option or number of arguments for CONFIG SET - '" + name + "'")
 			return
 		}
+		value := string(pairs[i+1])
+		switch name {
+		case "maxmemory":
+			bytes, ok := parseMemoryBytes(value)
+			if !ok {
+				r.Err("ERR CONFIG SET failed (possibly related to argument 'maxmemory') - argument couldn't be parsed into an integer")
+				return
+			}
+			value = strconv.FormatUint(bytes, 10)
+		case "maxmemory-policy":
+			code, ok := store.ParsePolicy(value)
+			if !ok {
+				r.Err("ERR CONFIG SET failed (possibly related to argument 'maxmemory-policy') - argument(s) must be one of the following: volatile-lru, volatile-lfu, volatile-random, volatile-ttl, volatile-lrm, allkeys-lru, allkeys-lfu, allkeys-random, allkeys-lrm, noeviction")
+				return
+			}
+			value = store.PolicyName(code)
+		case "maxmemory-samples":
+			n, err := strconv.ParseUint(value, 10, 64)
+			if err != nil || n < 1 {
+				r.Err("ERR CONFIG SET failed (possibly related to argument 'maxmemory-samples') - argument must be a positive integer")
+				return
+			}
+			value = strconv.FormatUint(n, 10)
+		}
+		norm[i/2] = value
 	}
+	// Apply: store the normalized value and, for the eviction parameters, push it
+	// into the atomics the evictor reads on the owner. The values re-parse cleanly
+	// because validation already normalized them.
 	for i := 0; i < len(pairs); i += 2 {
-		configVals[lowerASCII(pairs[i])] = string(pairs[i+1])
+		name := lowerASCII(pairs[i])
+		value := norm[i/2]
+		configVals[name] = value
+		switch name {
+		case "maxmemory":
+			b, _ := parseMemoryBytes(value)
+			evMaxMemory.Store(b)
+		case "maxmemory-policy":
+			code, _ := store.ParsePolicy(value)
+			evPolicy.Store(uint32(code))
+		case "maxmemory-samples":
+			n, _ := strconv.ParseUint(value, 10, 64)
+			evSamples.Store(int64(n))
+		}
 	}
 	r.Status("OK")
 }

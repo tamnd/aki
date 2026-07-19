@@ -384,6 +384,7 @@ func Listen(o Options) (*Server, error) {
 	}
 	s.rt.Use(dispatch.Handlers())
 	s.rt.UseDemoter(dispatch.Demoter())
+	s.rt.UseEvictor(dispatch.Evictor())
 	s.rt.Start()
 	return s, nil
 }
