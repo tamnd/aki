@@ -132,6 +132,13 @@ type worker struct {
 	bpStall     int
 	bpWaits     uint64
 	bpStalls    uint64
+
+	// expiredKeys is the cumulative count of keys this shard's active-expiry cycle
+	// has reaped (expirecycle.go), the figure INFO sums across shards as
+	// expired_keys. lastExpireMs is the wall-clock instant of the last sweep, the
+	// cadence gate that keeps a rapidly draining shard from sweeping every boundary.
+	expiredKeys  uint64
+	lastExpireMs int64
 }
 
 func newWorker(id int, st *store.Store) *worker {
@@ -241,6 +248,7 @@ func (w *worker) run() {
 			}
 			w.maybeCompact()
 			w.runMaintainer()
+			w.runActiveExpire()
 			if len(w.fullWaiters) > 0 && !w.st.ColdDraining() {
 				// Writes are parked but no drain is in flight or pending, so no
 				// completion would wake the worker to retry them. Try a backpressure

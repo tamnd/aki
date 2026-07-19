@@ -32,6 +32,7 @@ const (
 	StatBackpressureWaits
 	StatBackpressureStalls
 	StatVolatileKeys
+	StatExpiredKeys
 	NumStats
 )
 
@@ -57,6 +58,7 @@ var statNames = [NumStats]string{
 	StatBackpressureWaits:  "backpressure_waits",
 	StatBackpressureStalls: "backpressure_stalls",
 	StatVolatileKeys:       "volatile_keys",
+	StatExpiredKeys:        "expired_keys",
 }
 
 // memDoctorFloor is the used-memory figure MEMORY DOCTOR needs to see before it
@@ -174,7 +176,7 @@ func (r *Runtime) renderStats(dst []byte, stats []uint64) []byte {
 	// header always shows, matching redis; the db0 line shows only when the db
 	// holds keys, so a fresh server renders the header with no db line, as redis
 	// does. avg_ttl stays 0 (redis reports the active-cycle running estimate,
-	// which f3's lazy-only expiry does not sample yet) and subexpiry 0 (the
+	// which f3's active cycle reaps against but does not sample) and subexpiry 0 (the
 	// per-field HEXPIRE census is owed to a later slice); both are honest zeros a
 	// redis client parses without complaint.
 	text = append(text, "\r\n# Keyspace\r\n"...)
