@@ -189,7 +189,7 @@ func place(cx *shard.Ctx, g *reg, key []byte, result *zset) int {
 		g.drop(key)
 	}
 	g.install(cx, key, result)
-	g.note(result)
+	g.grewNote(cx, key, result)
 	return result.card()
 }
 

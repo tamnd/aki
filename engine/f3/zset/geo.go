@@ -249,7 +249,7 @@ flagsLoop:
 		if created {
 			g.install(cx, key, z)
 		}
-		g.note(z)
+		g.grewNote(cx, key, z)
 	}
 	if fl.ch {
 		r.Int(added + changed)

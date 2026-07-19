@@ -48,6 +48,14 @@ type reg struct {
 	// figure would drive nothing, so the registry keeps none and note is one bool
 	// load, holding the L9 zero-delta contract for a store with no resident cap.
 	acctOn bool
+
+	// waiters is the per-key FIFO of connections blocked on BZPOPMIN/BZPOPMAX/BZMPOP
+	// (waiter.go), nil until the first block on this shard so a registry that never
+	// blocks carries none. wpool is the shared node slab those FIFOs address by
+	// index. A zset-growing command consults waiters through grewNote, one map-length
+	// load on the common path with nobody blocked.
+	waiters map[string]*waitList
+	wpool   waitPool
 }
 
 // zsetSeed hands each shard's registry a distinct PCG stream. The counter is
