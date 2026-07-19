@@ -200,6 +200,20 @@ func (r *Runtime) UsePublisher(fn func(channel string, message []byte)) {
 // key's __keyspace@0__ channel if K is on and the key on the event's __keyevent@0__
 // channel if E is on. Owner goroutine only; the publish is out-of-band-safe.
 func (cx *Ctx) NotifyKeyspaceEvent(class uint32, event string, key []byte) {
+	if cx.w == nil {
+		return
+	}
+	cx.w.publishKeyspaceEvent(class, event, key)
+}
+
+// publishKeyspaceEvent is the worker-level emit core NotifyKeyspaceEvent delegates
+// to, split out so a caller without a Ctx (the string store's lazy and active
+// expiry reap, which sits a layer below shard and reaches the worker through the
+// expired-key sink) shares the exact same gating and channel formatting. It gates
+// on the live mask first, so a disabled server (the default) returns after one
+// atomic load, and on the publisher hook, so a runtime with no pub/sub returns at
+// once. Owner goroutine only; the publish is out-of-band-safe.
+func (w *worker) publishKeyspaceEvent(class uint32, event string, key []byte) {
 	flags := notifyFlags.Load()
 	if flags&class == 0 {
 		return
@@ -207,7 +221,7 @@ func (cx *Ctx) NotifyKeyspaceEvent(class uint32, event string, key []byte) {
 	if flags&(NotifyKeyspace|NotifyKeyevent) == 0 {
 		return
 	}
-	if cx.w == nil || cx.w.publisher == nil {
+	if w == nil || w.publisher == nil {
 		return
 	}
 	if flags&NotifyKeyspace != 0 {
@@ -215,15 +229,25 @@ func (cx *Ctx) NotifyKeyspaceEvent(class uint32, event string, key []byte) {
 		ch := make([]byte, 0, len(keyspacePrefix)+len(key))
 		ch = append(ch, keyspacePrefix...)
 		ch = append(ch, key...)
-		cx.w.publisher(string(ch), []byte(event))
+		w.publisher(string(ch), []byte(event))
 	}
 	if flags&NotifyKeyevent != 0 {
 		// __keyevent@0__:<event> carries the key.
 		ch := make([]byte, 0, len(keyeventPrefix)+len(event))
 		ch = append(ch, keyeventPrefix...)
 		ch = append(ch, event...)
-		cx.w.publisher(ch2s(ch), append([]byte(nil), key...))
+		w.publisher(ch2s(ch), append([]byte(nil), key...))
 	}
+}
+
+// emitExpired is the string store's expired-key sink: the store reaps a key whose
+// deadline has passed, on a lazy touch or in the active cycle, and calls this to
+// publish the expired event for it. It is wired in newWorker to this shard's own
+// worker, so the store, which cannot import shard's Ctx, still routes through the
+// one gating-and-formatting path every keyspace notification shares. Owner
+// goroutine only, the same context the reap runs in.
+func (w *worker) emitExpired(key []byte) {
+	w.publishKeyspaceEvent(NotifyExpired, "expired", key)
 }
 
 // The single-db channel prefixes. f3 runs one logical db, so the db index is

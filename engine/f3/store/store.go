@@ -28,6 +28,15 @@ type Store struct {
 	idx   index
 	count int64
 
+	// expiredSink is the keyspace-notification hook the shard wires so a lazily or
+	// actively reaped string key publishes the expired event. The store sits below
+	// shard's Ctx and cannot format the notification itself, so it calls this plain
+	// sink at each expiry reap; it is nil on a store with no shard around it (the
+	// unit tests) and on a server with pub/sub disabled the sink itself returns after
+	// one atomic load. Only ever invoked for a key the reap actually drops, so it
+	// never touches the common read path.
+	expiredSink func(key []byte)
+
 	// The value-log half (doc 09 section 8): nil without a log. residentCap
 	// is the resident byte budget; past it a separated or chunked value's
 	// bytes spill to the log.

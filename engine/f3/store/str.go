@@ -182,6 +182,12 @@ func (s *Store) findLive(h uint64, key []byte, now int64) (slot *uint64, addr ui
 	// the caller serves it through the frame or brings it up.
 	if addr != 0 && now != 0 && !slotCold(*slot) {
 		if at := s.expireAt(addr); at != 0 && at <= now {
+			// Publish the expired event before the drop reclaims the record's key. The
+			// sink gates on the notify mask, so a lazy touch that finds a key expired
+			// pays only one atomic load when notifications are off.
+			if s.expiredSink != nil {
+				s.expiredSink(s.keyAt(addr))
+			}
 			s.deleteAt(h, slot, inOverflow)
 			s.dropRecord(addr)
 			s.count--
