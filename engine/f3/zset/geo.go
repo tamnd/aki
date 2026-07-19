@@ -270,6 +270,7 @@ func Geopos(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	members := args[1:]
+	resp3 := r.Resp3()
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(members))
 	var cb [48]byte
 	for _, m := range members {
@@ -284,8 +285,8 @@ func Geopos(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 		lon, lat := geoDecode(uint64(s))
 		out = resp.AppendArrayHeader(out, 2)
-		out = resp.AppendBulk(out, strconv.AppendFloat(cb[:0], lon, 'g', 17, 64))
-		out = resp.AppendBulk(out, strconv.AppendFloat(cb[:0], lat, 'g', 17, 64))
+		out = appendGeoDouble(out, strconv.AppendFloat(cb[:0], lon, 'g', 17, 64), resp3)
+		out = appendGeoDouble(out, strconv.AppendFloat(cb[:0], lat, 'g', 17, 64), resp3)
 	}
 	cx.Aux = out
 	r.Raw(out)
@@ -328,7 +329,21 @@ func Geodist(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	lon2, lat2 := geoDecode(uint64(s2))
 	d := geoDistM(lon1, lat1, lon2, lat2) / toMeters
 	var db [32]byte
-	r.Bulk(strconv.AppendFloat(db[:0], d, 'f', 4, 64))
+	// The distance keeps its four-decimal formatting under both protocols, framed
+	// as a RESP2 bulk or a RESP3 double, the addReplyDoubleDistance path.
+	r.DoubleBytes(strconv.AppendFloat(db[:0], d, 'f', 4, 64))
+}
+
+// appendGeoDouble appends a formatted GEO coordinate or distance in the
+// negotiated protocol: a RESP3 double (,digits) when resp3 is set, or a RESP2
+// bulk string of the same digits. GEO values keep their own strconv formatting
+// (17-significant-figure coordinates, four-decimal distances), so this reuses the
+// caller's digits rather than reformatting, the addReplyHumanLongDouble path.
+func appendGeoDouble(out, digits []byte, resp3 bool) []byte {
+	if resp3 {
+		return resp.AppendDoubleBytes(out, digits)
+	}
+	return resp.AppendBulk(out, digits)
 }
 
 // Geohash answers GEOHASH key member [member ...]: an array sized to the

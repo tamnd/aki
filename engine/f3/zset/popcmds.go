@@ -27,6 +27,7 @@ func Zpopmax(cx *shard.Ctx, args [][]byte, r shard.Reply) { zpopImpl(cx, args, r
 
 func zpopImpl(cx *shard.Ctx, args [][]byte, r shard.Reply, min bool) {
 	count := 1
+	countGiven := false
 	if len(args) == 2 {
 		c, ok := parseIndex(args[1])
 		if !ok {
@@ -38,6 +39,7 @@ func zpopImpl(cx *shard.Ctx, args [][]byte, r shard.Reply, min bool) {
 			return
 		}
 		count = c
+		countGiven = true
 	} else if len(args) != 1 {
 		r.Err("ERR syntax error")
 		return
@@ -57,12 +59,24 @@ func zpopImpl(cx *shard.Ctx, args [][]byte, r shard.Reply, min bool) {
 	if npop > z.card() {
 		npop = z.card()
 	}
-	out := resp.AppendArrayHeader(cx.Aux[:0], npop*2)
+	// RESP3 nests each [member, score] pair only for the counted form; the no-count
+	// form and every RESP2 reply stay a flat alternating array. The score itself is
+	// a RESP3 double or a RESP2 bulk under both forms.
+	resp3 := r.Resp3()
+	nested := countGiven && resp3
+	header := npop * 2
+	if nested {
+		header = npop
+	}
+	out := resp.AppendArrayHeader(cx.Aux[:0], header)
 	var sc [40]byte
 	z.pop(min, count, func(m []byte, s float64) {
 		logRemove(cx, args[0], m)
+		if nested {
+			out = resp.AppendArrayHeader(out, 2)
+		}
 		out = resp.AppendBulk(out, m)
-		out = resp.AppendBulk(out, resp.FormatScore(sc[:0], s))
+		out = appendScore(out, s, resp3, sc[:])
 	})
 	cx.Aux = out
 	if z.card() == 0 {
@@ -139,12 +153,13 @@ func Zmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		out := resp.AppendArrayHeader(cx.Aux[:0], 2)
 		out = resp.AppendBulk(out, key)
 		out = resp.AppendArrayHeader(out, npop)
+		resp3 := r.Resp3()
 		var sc [40]byte
 		z.pop(min, count, func(m []byte, s float64) {
 			logRemove(cx, key, m)
 			out = resp.AppendArrayHeader(out, 2)
 			out = resp.AppendBulk(out, m)
-			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], s))
+			out = appendScore(out, s, resp3, sc[:])
 		})
 		cx.Aux = out
 		if z.card() == 0 {

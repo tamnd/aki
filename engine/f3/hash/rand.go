@@ -50,7 +50,15 @@ func Hrandfield(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 
+	// WITHVALUES flattens each field/value into two elements under RESP2; RESP3
+	// nests each as a 2-element [field, value] pair, so the outer count stays the
+	// field count. Both values are bulk strings, so only the framing changes here.
+	resp3 := r.Resp3()
+	nested := withValues && resp3
 	emit := func(out, f, v []byte) []byte {
+		if nested {
+			out = resp.AppendArrayHeader(out, 2)
+		}
 		out = resp.AppendBulk(out, f)
 		if withValues {
 			out = resp.AppendBulk(out, v)
@@ -61,7 +69,7 @@ func Hrandfield(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if count < 0 {
 		// With replacement: exactly -count draws, repeats allowed.
 		want := int(-count)
-		out := resp.AppendArrayHeader(cx.Aux[:0], perElem(want, withValues))
+		out := resp.AppendArrayHeader(cx.Aux[:0], perElem(want, withValues, nested))
 		h.randWithReplacement(g, want, func(f, v []byte) { out = emit(out, f, v) })
 		cx.Aux = out
 		r.Raw(out)
@@ -73,16 +81,17 @@ func Hrandfield(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if want > h.card() {
 		want = h.card()
 	}
-	out := resp.AppendArrayHeader(cx.Aux[:0], perElem(want, withValues))
+	out := resp.AppendArrayHeader(cx.Aux[:0], perElem(want, withValues, nested))
 	h.randDistinct(g, want, func(f, v []byte) { out = emit(out, f, v) })
 	cx.Aux = out
 	r.Raw(out)
 }
 
-// perElem is the array element count for n fields, doubled when each carries its
-// value.
-func perElem(n int, withValues bool) int {
-	if withValues {
+// perElem is the array element count for n fields: n when each field is one
+// element (no values, or RESP3's nested [field, value] pairs), n*2 when RESP2
+// flattens each field and value into two top-level elements.
+func perElem(n int, withValues, nested bool) int {
+	if withValues && !nested {
 		return n * 2
 	}
 	return n

@@ -225,17 +225,24 @@ func Zmscore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	members := args[1:]
+	resp3 := r.Resp3()
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(members))
 	var sc [40]byte
+	appendNull := func(out []byte) []byte {
+		if resp3 {
+			return resp.AppendNull3(out)
+		}
+		return resp.AppendNull(out)
+	}
 	for _, m := range members {
 		if z == nil {
-			out = resp.AppendNull(out)
+			out = appendNull(out)
 			continue
 		}
 		if s, ok := z.score(m); ok {
-			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], s))
+			out = appendScore(out, s, resp3, sc[:])
 		} else {
-			out = resp.AppendNull(out)
+			out = appendNull(out)
 		}
 	}
 	cx.Aux = out

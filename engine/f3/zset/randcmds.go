@@ -51,11 +51,19 @@ func Zrandmember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 
+	// WITHSCORES flattens each member/score into two elements under RESP2; RESP3
+	// nests each as a 2-element pair, so the outer count stays the member count and
+	// the score rides as a native double.
+	resp3 := r.Resp3()
+	nested := withScores && resp3
 	var sc [40]byte
 	emit := func(out []byte, m []byte, bits uint64) []byte {
+		if nested {
+			out = resp.AppendArrayHeader(out, 2)
+		}
 		out = resp.AppendBulk(out, m)
 		if withScores {
-			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(bits)))
+			out = appendScore(out, math.Float64frombits(bits), resp3, sc[:])
 		}
 		return out
 	}
@@ -63,7 +71,7 @@ func Zrandmember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if count < 0 {
 		// With replacement: exactly -count draws, repeats allowed.
 		want := -count
-		out := resp.AppendArrayHeader(cx.Aux[:0], perElem(want, withScores))
+		out := resp.AppendArrayHeader(cx.Aux[:0], perElem(want, withScores, nested))
 		z.randWithReplacement(g, want, func(m []byte, bits uint64) { out = emit(out, m, bits) })
 		cx.Aux = out
 		r.Raw(out)
@@ -75,16 +83,17 @@ func Zrandmember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if want > z.card() {
 		want = z.card()
 	}
-	out := resp.AppendArrayHeader(cx.Aux[:0], perElem(want, withScores))
+	out := resp.AppendArrayHeader(cx.Aux[:0], perElem(want, withScores, nested))
 	z.randDistinct(g, want, func(m []byte, bits uint64) { out = emit(out, m, bits) })
 	cx.Aux = out
 	r.Raw(out)
 }
 
-// perElem is the array element count for n members, doubled when each carries a
-// score.
-func perElem(n int, withScores bool) int {
-	if withScores {
+// perElem is the array element count for n members: n when each member is one
+// element (no scores, or RESP3's nested [member, score] pairs), n*2 when RESP2
+// flattens each member and score into two top-level elements.
+func perElem(n int, withScores, nested bool) int {
+	if withScores && !nested {
 		return n * 2
 	}
 	return n

@@ -259,6 +259,10 @@ func serveWaiters(cx *shard.Ctx, g *reg, key []byte, z *zset) {
 		conn := nd.conn
 		seq := nd.seq
 		min := nd.min
+		// The reply carries the parked client's negotiated protocol, not the
+		// serving writer's: a BZPOPMIN issued over RESP3 gets its score as a double
+		// even when a RESP2 client's ZADD is what serves it.
+		resp3 := conn.Resp3()
 		switch nd.kind {
 		case kindPop:
 			var rep []byte
@@ -267,7 +271,7 @@ func serveWaiters(cx *shard.Ctx, g *reg, key []byte, z *zset) {
 				rep = resp.AppendArrayHeader(nil, 3)
 				rep = resp.AppendBulk(rep, key)
 				rep = resp.AppendBulk(rep, m)
-				rep = resp.AppendBulk(rep, resp.FormatScore(sc[:0], s))
+				rep = appendScore(rep, s, resp3, sc[:])
 			})
 			g.unlinkAll(cx, i)
 			conn.CompleteBlocked(seq, rep)
@@ -283,7 +287,7 @@ func serveWaiters(cx *shard.Ctx, g *reg, key []byte, z *zset) {
 				logRemove(cx, key, m)
 				rep = resp.AppendArrayHeader(rep, 2)
 				rep = resp.AppendBulk(rep, m)
-				rep = resp.AppendBulk(rep, resp.FormatScore(sc[:0], s))
+				rep = appendScore(rep, s, resp3, sc[:])
 			})
 			g.unlinkAll(cx, i)
 			conn.CompleteBlocked(seq, rep)

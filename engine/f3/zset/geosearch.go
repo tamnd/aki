@@ -598,6 +598,11 @@ func geoReply(cx *shard.Ctx, r shard.Reply, hits []geoHit, opts geoSearchOpts, t
 	hits = geoOrderCut(hits, opts)
 
 	withAny := opts.withCord || opts.withDist || opts.withHash
+	// The distance and the coordinate pair ride as native doubles under RESP3 and
+	// as bulk strings under RESP2, keeping their own strconv digits (four-decimal
+	// distance, 17-significant-figure coordinates) either way. The raw hash stays
+	// an integer under both.
+	resp3 := r.Resp3()
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(hits))
 	var nb [40]byte
 	for _, h := range hits {
@@ -618,15 +623,15 @@ func geoReply(cx *shard.Ctx, r shard.Reply, hits []geoHit, opts geoSearchOpts, t
 		out = resp.AppendArrayHeader(out, n)
 		out = resp.AppendBulk(out, h.member)
 		if opts.withDist {
-			out = resp.AppendBulk(out, strconv.AppendFloat(nb[:0], h.distM/toMeters, 'f', 4, 64))
+			out = appendGeoDouble(out, strconv.AppendFloat(nb[:0], h.distM/toMeters, 'f', 4, 64), resp3)
 		}
 		if opts.withHash {
 			out = resp.AppendInt(out, int64(h.score))
 		}
 		if opts.withCord {
 			out = resp.AppendArrayHeader(out, 2)
-			out = resp.AppendBulk(out, strconv.AppendFloat(nb[:0], h.lon, 'g', 17, 64))
-			out = resp.AppendBulk(out, strconv.AppendFloat(nb[:0], h.lat, 'g', 17, 64))
+			out = appendGeoDouble(out, strconv.AppendFloat(nb[:0], h.lon, 'g', 17, 64), resp3)
+			out = appendGeoDouble(out, strconv.AppendFloat(nb[:0], h.lat, 'g', 17, 64), resp3)
 		}
 	}
 	cx.Aux = out
