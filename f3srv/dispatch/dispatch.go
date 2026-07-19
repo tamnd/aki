@@ -172,6 +172,10 @@ func init() {
 	register("FAILOVER", failoverCmd, 0, -1, false)
 	register("LATENCY", latencyCmd, 1, -1, false)
 	register("SLOWLOG", slowlogCmd, 1, -1, false)
+	// DEBUG answers the test-harness subcommands (see debug.go). SLEEP is caught
+	// in the network intercept on the default driver; this registration serves the
+	// keyless stubs and the reactor's SLEEP path.
+	register("DEBUG", debugCmd, 1, -1, false)
 	// The cluster and replication stubs (see cluster.go): f3 is one standalone
 	// node, so these answer the truthful standalone topology and refuse anything
 	// that implies a cluster or a replica f3 does not have.
