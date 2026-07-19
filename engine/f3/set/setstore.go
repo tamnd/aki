@@ -127,7 +127,11 @@ func bandFor(ht *htable, allInt bool, maxLen, n int) *set {
 // when the destination is also a source the swap below is the first and only
 // time the destination pointer moves, and the source was read in full before it
 // did. Nothing is cloned to guard the aliasing.
-func place(cx *shard.Ctx, g *reg, key []byte, result *set) int {
+func place(cx *shard.Ctx, g *reg, key []byte, result *set, event string) int {
+	// Whether the destination held anything before this store, of any type, decides
+	// whether an empty result fires del (redis fires del only when dbDelete actually
+	// removed a key). Captured before the string Del below clears it.
+	existed := g.m[string(key)] != nil || cx.St.Exists(key, cx.NowMs)
 	// Drop whatever the key holds in the string store first, so a new set never
 	// shadows a stale string and no old TTL survives (the destination is a new
 	// object, Redis discards the old expiry). A set-typed destination is replaced
@@ -135,6 +139,9 @@ func place(cx *shard.Ctx, g *reg, key []byte, result *set) int {
 	cx.St.Del(key, cx.NowMs)
 	if result == nil {
 		g.drop(key)
+		if existed {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
+		}
 		return 0
 	}
 	// A destination that already held a set is replaced wholesale: take its bytes
@@ -147,6 +154,7 @@ func place(cx *shard.Ctx, g *reg, key []byte, result *set) int {
 	}
 	g.install(cx, key, result)
 	g.note(result)
+	cx.NotifyKeyspaceEvent(shard.NotifySet, event, key)
 	return result.card()
 }
 
@@ -165,7 +173,7 @@ func Sinterstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// Presize from the smallest source: the intersection cannot exceed it
 	// (setmergecollect, doc 11 section 6.4).
 	result := storeResult(minCard(sets), func(emit func(m []byte)) { sinter(cx, sets, emit) })
-	r.Int(int64(place(cx, g, args[0], result)))
+	r.Int(int64(place(cx, g, args[0], result, "sinterstore")))
 }
 
 // Sunionstore answers SUNIONSTORE destination key [key ...]: union the sources
@@ -180,7 +188,7 @@ func Sunionstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	result := storeResult(totalCard(sets), func(emit func(m []byte)) { unionInto(sets, emit) })
-	r.Int(int64(place(cx, g, args[0], result)))
+	r.Int(int64(place(cx, g, args[0], result, "sunionstore")))
 }
 
 // Sdiffstore answers SDIFFSTORE destination key [key ...]: the members of the
@@ -196,7 +204,7 @@ func Sdiffstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	// The diff cannot exceed the first source, which drives the walk.
 	result := storeResult(firstCard(sets), func(emit func(m []byte)) { sdiff(cx, sets, emit) })
-	r.Int(int64(place(cx, g, args[0], result)))
+	r.Int(int64(place(cx, g, args[0], result, "sdiffstore")))
 }
 
 // unionInto streams every member of every source into emit, duplicates and all:

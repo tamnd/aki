@@ -57,11 +57,15 @@ func smove(g *reg, cx *shard.Ctx, srcKey, dstKey, member []byte) (moved, wrong b
 	if src == nil || !src.rem(member) {
 		return false, false
 	}
+	// Redis fires srem on the source for the removed member, then del if that
+	// emptied it. The event names match SREM, not a dedicated smove event.
+	cx.NotifyKeyspaceEvent(shard.NotifySet, "srem", srcKey)
 	// The last member left source: Redis deletes an emptied set (doc 11 section
 	// 9.2). Dropping it before the destination insert keeps the invariant that the
 	// registry never holds an empty set.
 	if src.card() == 0 {
 		g.drop(srcKey)
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", srcKey)
 	} else {
 		g.note(src)
 	}
@@ -73,7 +77,11 @@ func smove(g *reg, cx *shard.Ctx, srcKey, dstKey, member []byte) (moved, wrong b
 		dst = newSet(member)
 		g.install(cx, dstKey, dst)
 	}
-	dst.add(member)
+	// sadd fires on the destination only when the member is newly present, matching
+	// redis's setTypeAdd-returned-1 guard (a member already in dst is a silent no-op).
+	if dst.add(member) {
+		cx.NotifyKeyspaceEvent(shard.NotifySet, "sadd", dstKey)
+	}
 	g.note(dst)
 	return true, false
 }

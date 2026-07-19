@@ -44,7 +44,9 @@ func SmoveCross(t *shard.Txn, src, dst, member []byte) []byte {
 			d = newSet(member)
 			g.install(cx, dst, d)
 		}
-		d.add(member)
+		if d.add(member) {
+			cx.NotifyKeyspaceEvent(shard.NotifySet, "sadd", dst)
+		}
 		g.note(d)
 		moved = true
 	})
@@ -53,8 +55,10 @@ func SmoveCross(t *shard.Txn, src, dst, member []byte) []byte {
 			g := registry(cx)
 			s, _ := g.lookup(cx, src)
 			s.rem(member)
+			cx.NotifyKeyspaceEvent(shard.NotifySet, "srem", src)
 			if s.card() == 0 {
 				g.drop(src)
+				cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", src)
 			} else {
 				g.note(s)
 			}
