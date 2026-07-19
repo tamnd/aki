@@ -235,7 +235,7 @@ func TestResidentAccountingStorePath(t *testing.T) {
 	union := storeResult(totalCard([]*set{g.m["a"], g.m["b"]}), func(e func([]byte)) {
 		unionInto([]*set{g.m["a"], g.m["b"]}, e)
 	})
-	place(cx, g, []byte("dest"), union)
+	place(cx, g, []byte("dest"), union, "sunionstore")
 	wantExact(t, g)
 	if _, ok := g.m["dest"]; !ok {
 		t.Fatal("union result not installed at dest")
@@ -246,14 +246,14 @@ func TestResidentAccountingStorePath(t *testing.T) {
 	inter := storeResult(minCard([]*set{g.m["a"], g.m["b"]}), func(e func([]byte)) {
 		sinter(cx, []*set{g.m["a"], g.m["b"]}, e)
 	})
-	place(cx, g, []byte("dest"), inter)
+	place(cx, g, []byte("dest"), inter, "sinterstore")
 	wantExact(t, g)
 
 	// An empty result deletes dest: its bytes leave the total.
 	empty := storeResult(minCard([]*set{setFrom([]string{"9"}), setFrom([]string{"8"})}), func(e func([]byte)) {
 		sinter(cx, []*set{setFrom([]string{"9"}), setFrom([]string{"8"})}, e)
 	})
-	place(cx, g, []byte("dest"), empty)
+	place(cx, g, []byte("dest"), empty, "sinterstore")
 	if _, ok := g.m["dest"]; ok {
 		t.Fatal("empty store result left dest present")
 	}

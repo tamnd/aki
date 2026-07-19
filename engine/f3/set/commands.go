@@ -36,6 +36,9 @@ func Sadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 	}
 	g.note(s)
+	if added > 0 {
+		cx.NotifyKeyspaceEvent(shard.NotifySet, "sadd", key)
+	}
 	r.Int(added)
 }
 
@@ -60,9 +63,16 @@ func Srem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 	}
 	if s.card() == 0 {
+		if removed > 0 {
+			cx.NotifyKeyspaceEvent(shard.NotifySet, "srem", args[0])
+		}
 		g.drop(args[0])
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
 	} else {
 		g.note(s)
+		if removed > 0 {
+			cx.NotifyKeyspaceEvent(shard.NotifySet, "srem", args[0])
+		}
 	}
 	r.Int(removed)
 }
@@ -187,8 +197,10 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		var sc [64]byte
 		m := s.popOne(g, sc[:])
 		logRemove(cx, key, m)
+		cx.NotifyKeyspaceEvent(shard.NotifySet, "spop", key)
 		if s.card() == 0 {
 			g.drop(key)
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 		} else {
 			g.note(s)
 		}
@@ -227,8 +239,10 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	cx.Aux = out
 	r.Raw(out)
+	cx.NotifyKeyspaceEvent(shard.NotifySet, "spop", key)
 	if s.card() == 0 {
 		g.drop(key)
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 	} else {
 		g.note(s)
 	}

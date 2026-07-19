@@ -471,13 +471,24 @@ func init() {
 	table["SINTERCARD"].crossKeys = set.SintercardKeys
 	// The STORE forms (spec 2064/f3/11 section 7) write the result to the
 	// destination and read the sources, so they key on the destination (args[0])
-	// for routing, the same first-argument route SADD uses; the sources are read
-	// from the destination shard's registry, the co-located-operand constraint
-	// the read-side algebra already documents (algebra_commands.go). Minimum two
-	// arguments: a destination and at least one source key.
+	// for routing, the same first-argument route SADD uses. Co-located keys run
+	// the whole compute-and-store on that owner (the free single-shard case);
+	// keys that span shards take the F17 intent path, where setstorecross.go
+	// clones the remote sources under the barrier and writes on the destination's
+	// owner, the write-side twin of the read algebra's gather (gathercross.go).
+	// crossKeys is the full tail (destination plus every source), so the
+	// co-location check spans all of them and a single-source co-located store
+	// never reaches the cross path. Minimum two arguments: a destination and at
+	// least one source key.
 	register("SINTERSTORE", set.Sinterstore, 2, -1, true)
+	table["SINTERSTORE"].cross = set.SinterstoreCross
+	table["SINTERSTORE"].crossKeys = allKeys
 	register("SUNIONSTORE", set.Sunionstore, 2, -1, true)
+	table["SUNIONSTORE"].cross = set.SunionstoreCross
+	table["SUNIONSTORE"].crossKeys = allKeys
 	register("SDIFFSTORE", set.Sdiffstore, 2, -1, true)
+	table["SDIFFSTORE"].cross = set.SdiffstoreCross
+	table["SDIFFSTORE"].crossKeys = allKeys
 	// SMOVE (spec 2064/f3/11 section 9.2) is a tier-two two-key write. When
 	// source and destination are co-located it routes on the source (args[0],
 	// the first-argument route SADD uses) and runs the whole move on that

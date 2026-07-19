@@ -27,6 +27,10 @@ const (
 	gcSdiff
 	gcSintercard
 	gcScard
+	gcSmembers
+	gcSinterstore
+	gcSunionstore
+	gcSdiffstore
 	gcStrSet
 )
 
@@ -38,6 +42,10 @@ func gatherHandlers() []shard.Handler {
 	h[gcSdiff] = Sdiff
 	h[gcSintercard] = Sintercard
 	h[gcScard] = Scard
+	h[gcSmembers] = Smembers
+	h[gcSinterstore] = Sinterstore
+	h[gcSunionstore] = Sunionstore
+	h[gcSdiffstore] = Sdiffstore
 	// gcStrSet plants a string at the key, the WRONGTYPE seed.
 	h[gcStrSet] = func(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		_ = cx.St.Set(args[0], args[1])

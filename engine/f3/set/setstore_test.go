@@ -121,15 +121,19 @@ func applyStore(t *testing.T, cx *shard.Ctx, g *reg, op string, dest string, src
 		t.Fatalf("%s: unexpected WRONGTYPE", op)
 	}
 	var result *set
+	var event string
 	switch op {
 	case "inter":
 		result = storeResult(minCard(sets), func(e func([]byte)) { sinter(nil, sets, e) })
+		event = "sinterstore"
 	case "union":
 		result = storeResult(totalCard(sets), func(e func([]byte)) { unionInto(sets, e) })
+		event = "sunionstore"
 	case "diff":
 		result = storeResult(firstCard(sets), func(e func([]byte)) { sdiff(nil, sets, e) })
+		event = "sdiffstore"
 	}
-	return place(cx, g, []byte(dest), result)
+	return place(cx, g, []byte(dest), result, event)
 }
 
 // TestStoreAliasing drives every aliasing shape the checklist names: the
