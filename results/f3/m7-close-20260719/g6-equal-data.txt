@@ -1,0 +1,7 @@
+  aki     dbsize=1000000  sample_hits=5/5 peakVmHWM=362316 kB (354 MiB)
+  redis   dbsize=1000000  sample_hits=5/5 peakVmHWM=2128132 kB (2078 MiB)
+  valkey  dbsize=1000000  sample_hits=5/5 peakVmHWM=1320984 kB (1290 MiB)
+
+PEAK RATIO: aki/redis=0.170x  aki/valkey=0.274x  (memory pitch: lower is better, ideal <=0.5x)
+COVERAGE: aki=1000000 redis=1000000 valkey=1000000 (of 1000000; equal coverage, memory is the differentiator)
+G6DONE
