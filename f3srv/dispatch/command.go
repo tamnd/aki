@@ -24,8 +24,11 @@ import (
 // command's spec; COUNT, INFO, DOCS, and GETKEYS take the sub-token at args[0].
 func commandCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if len(args) == 0 {
-		out := resp.AppendArrayHeader(cx.Aux[:0], len(table))
+		out := resp.AppendArrayHeader(cx.Aux[:0], visibleCount())
 		for _, e := range table {
+			if e.hidden {
+				continue
+			}
 			out = appendCommandSpec(out, e)
 		}
 		cx.Aux = out
@@ -34,7 +37,7 @@ func commandCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	switch upperVerb(args[0]) {
 	case "COUNT":
-		r.Int(int64(len(table)))
+		r.Int(int64(visibleCount()))
 	case "INFO":
 		commandInfo(cx, args[1:], r)
 	case "DOCS":
@@ -51,8 +54,11 @@ func commandCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // command, matching Redis, which treats a bare INFO as the full listing.
 func commandInfo(cx *shard.Ctx, names [][]byte, r shard.Reply) {
 	if len(names) == 0 {
-		out := resp.AppendArrayHeader(cx.Aux[:0], len(table))
+		out := resp.AppendArrayHeader(cx.Aux[:0], visibleCount())
 		for _, e := range table {
+			if e.hidden {
+				continue
+			}
 			out = appendCommandSpec(out, e)
 		}
 		cx.Aux = out
@@ -61,14 +67,28 @@ func commandInfo(cx *shard.Ctx, names [][]byte, r shard.Reply) {
 	}
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(names))
 	for _, name := range names {
-		if e := table[upperVerb(name)]; e != nil {
+		if e := table[upperVerb(name)]; e != nil && !e.hidden {
 			out = appendCommandSpec(out, e)
 		} else {
+			// An unknown name, or a verb hidden from the probe (F18), reads as a
+			// null array in its slot.
 			out = resp.AppendNullArray(out)
 		}
 	}
 	cx.Aux = out
 	r.Raw(out)
+}
+
+// visibleCount is the number of commands the COMMAND probe advertises: the table
+// minus the verbs hidden from it (the deferred scripting family, decision F18).
+func visibleCount() int {
+	n := 0
+	for _, e := range table {
+		if !e.hidden {
+			n++
+		}
+	}
+	return n
 }
 
 // commandDocs answers COMMAND DOCS [name ...]. Redis returns a map of command to

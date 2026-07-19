@@ -164,6 +164,38 @@ func TestCommandInfoSpecs(t *testing.T) {
 	assertSpec(t, specOf(reply, "mset"), "mset", -3, 1, -1, 2)
 }
 
+// TestCommandHidesScripting checks the deferred scripting verbs stay out of the
+// COMMAND probe (decision F18): they are absent from the full listing and answer
+// a null slot when asked for by name, so a probing client reads them as
+// unavailable rather than finding them and assuming they run.
+func TestCommandHidesScripting(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	all := sendCmd(t, br, nc, "COMMAND")
+	for _, hidden := range []string{"eval", "evalsha", "fcall", "function", "script"} {
+		if specOf(all, hidden) != nil {
+			t.Fatalf("COMMAND listing includes hidden verb %q", hidden)
+		}
+	}
+
+	reply, ok := sendCmd(t, br, nc, "COMMAND", "INFO", "EVAL", "GET").([]any)
+	if !ok || len(reply) != 2 {
+		t.Fatalf("COMMAND INFO EVAL GET = %v, want two slots", reply)
+	}
+	if reply[0] != nil {
+		t.Fatalf("EVAL slot = %v, want null (hidden)", reply[0])
+	}
+	// A visible verb in the same call still resolves.
+	if spec, _ := reply[1].([]any); specOf([]any{spec}, "get") == nil {
+		t.Fatalf("GET slot = %v, want its spec", reply[1])
+	}
+
+	// The verb still dispatches to its deferral error, it just does not advertise.
+	if _, ok := sendCmd(t, br, nc, "EVAL", "return 1", "0").(errorReply); !ok {
+		t.Fatalf("EVAL did not answer the scripting deferral error")
+	}
+}
+
 // TestCommandInfoUnknown checks a name the table does not hold answers with a
 // null array in its slot, not an error, matching Redis.
 func TestCommandInfoUnknown(t *testing.T) {

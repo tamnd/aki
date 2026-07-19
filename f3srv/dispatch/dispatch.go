@@ -45,6 +45,14 @@ type entry struct {
 	fanOnly bool // no point op; a single key still fans
 	fanArgs bool // keyless fan that still carries its argument tail (KEYS)
 
+	// hidden keeps a registered verb out of the COMMAND capability probe
+	// (command.go). The scripting verbs are registered so they answer one
+	// coherent deferral error at every arity, but decision F18 wants them
+	// unlisted so a probing client reads "unavailable" cheaply rather than
+	// finding them in COMMAND and assuming they run. The verb still dispatches
+	// and still errors; it just does not advertise.
+	hidden bool
+
 	// flushOpt marks the FLUSHALL/FLUSHDB tail: the one optional argument
 	// must be the ASYNC or SYNC token, anything else is a syntax error.
 	flushOpt bool
