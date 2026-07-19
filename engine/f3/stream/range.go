@@ -93,6 +93,49 @@ func (s *stream) collectForward(lo, hi bound, limit int) []rangeEntry {
 	return out
 }
 
+// eachForward walks the [lo, hi] window forward and calls visit for each live
+// in-window entry in ascending order, stopping after limit entries when limit is
+// positive. It seeks the opening block through the directory the same way
+// collectForward does, but it neither gathers a []rangeEntry nor clones the field
+// headers: visit consumes each entry's field views before the walk decodes the
+// next one, so nothing outlives the scratch reuse. This holds on the cold path
+// too, since the block's payload is read once and its views are consumed before
+// the next block's pread reuses the shared scratch, so a fused encode needs no
+// deep clone the way a cross-block gather does.
+func (s *stream) eachForward(lo, hi bound, limit int, visit func(id streamID, fields []field)) {
+	if len(s.blocks) == 0 || limit == 0 {
+		return
+	}
+	start := 0
+	if s.dir != nil {
+		start = s.floorBlock(lo.id)
+	}
+	var scratch []field
+	seen := 0
+	for i := start; i < len(s.blocks); i++ {
+		stop := false
+		s.walkBlock(s.blocks[i], scratch, func(id streamID, fields []field) bool {
+			if !aboveLo(id, lo) {
+				return true // still below the window, keep scanning
+			}
+			if !belowHi(id, hi) {
+				stop = true // past the window; entries only climb from here
+				return false
+			}
+			visit(id, fields)
+			seen++
+			if limit > 0 && seen >= limit {
+				stop = true
+				return false
+			}
+			return true
+		})
+		if stop {
+			break
+		}
+	}
+}
+
 func (s *stream) collectReverse(lo, hi bound, limit int) []rangeEntry {
 	start := len(s.blocks) - 1
 	if s.dir != nil {
@@ -253,6 +296,28 @@ func rangeReply(cx *shard.Ctx, args [][]byte, r shard.Reply, rev bool) {
 		r.Raw(out)
 		return
 	}
+	if !rev {
+		// Forward reads frame each entry straight into the reply during a single
+		// walk, no intermediate []rangeEntry slice and no per-entry field clone:
+		// the walk yields field views into the stable blob and the encode consumes
+		// them before the next entry's decode reuses the scratch, so the elision
+		// the whole-collection reads use (set/smembers.go, hash/hgetall.go) carries
+		// here too. The array header needs the count first, so the body is built at
+		// bodyStart and the header shifted in once the count is known, one memmove
+		// against the per-entry growslice + clone + memclr the two-phase gather paid
+		// (labs/f3/m5/07). Reverse still gathers a block to walk it backward, so it
+		// keeps the collect-then-encode path below.
+		bodyStart := len(out)
+		n := 0
+		s.eachForward(lo, hi, limit, func(id streamID, fields []field) {
+			out = appendEntryReply(out, id, fields)
+			n++
+		})
+		out = prependArrayHeader(out, bodyStart, n)
+		cx.Aux = out
+		r.Raw(out)
+		return
+	}
 	entries := s.collectRange(lo, hi, rev, limit)
 	out = resp.AppendArrayHeader(out, len(entries))
 	for i := range entries {
@@ -260,6 +325,20 @@ func rangeReply(cx *shard.Ctx, args [][]byte, r shard.Reply, rev bool) {
 	}
 	cx.Aux = out
 	r.Raw(out)
+}
+
+// prependArrayHeader inserts a RESP array header of count n in front of the body
+// bytes already written at buf[at:], shifting the body right by the header width.
+// One memmove, so a forward range read frames its entries in a single pass and
+// still emits the header-first RESP shape without a second materialization.
+func prependArrayHeader(buf []byte, at, n int) []byte {
+	var hb [24]byte
+	hdr := resp.AppendArrayHeader(hb[:0], n)
+	w := len(hdr)
+	buf = append(buf, hdr...)          // grow by w; the tail bytes are overwritten next
+	copy(buf[at+w:], buf[at:len(buf)-w]) // shift the body right (copy is memmove-safe)
+	copy(buf[at:], hdr)                  // write the header into the gap
+	return buf
 }
 
 // appendEntryReply writes one entry as the [id, [field value ...]] pair the
