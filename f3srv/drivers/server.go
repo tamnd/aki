@@ -238,6 +238,13 @@ type Server struct {
 	// slows a GET. Built at Listen, walked by publishers and mutated by
 	// subscribers under its own mutex.
 	pubsub *pubsubRegistry
+
+	// nextConnID hands each connection its CLIENT ID / HELLO id. A connection's
+	// identity is network-layer state (client.go), like pub/sub, so it lives
+	// here and not in the shard workers. register is the one place every driver
+	// admits a connection, so the id is stamped there. It starts at zero and the
+	// first connection gets 1, matching redis (no connection is id 0).
+	nextConnID atomic.Uint64
 }
 
 // Flushes reports the total writer socket flushes since start, the lab and
@@ -683,6 +690,13 @@ func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary fu
 						continue
 					}
 					cmds++
+					// CLIENT and HELLO are answered here, in the network layer,
+					// from per-connection identity state (client.go); they never
+					// reach the shard hop. This sits ahead of the pub/sub intercept
+					// so the handshake verbs run even in subscribe mode.
+					if s.clientHelloIntercept(c, cs, args) {
+						continue
+					}
 					// Pub/sub is answered here, in the network layer, and never
 					// reaches the shard hop (doc 17 section 13). The intercept owns
 					// the command when it returns true, including a command refused
