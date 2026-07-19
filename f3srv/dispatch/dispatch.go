@@ -252,6 +252,14 @@ func init() {
 	// own deferred slices (spec 2064/f3/17 section 12).
 	register("SORT", sortCmd, 1, -1, true)
 	register("SORT_RO", sortRoCmd, 1, -1, true)
+	// DUMP and RESTORE serialize one key and rebuild it (see dump.go). Both are
+	// single-key and single-shard, so they take the plain keyed point path the
+	// way GET does; they live here with the other cross-type keyspace verbs
+	// because DUMP probes every keyspace for the key and RESTORE routes the
+	// payload back into whichever type it named. RESTORE's tail is its ttl, the
+	// serialized value, and the option soup, so the handler validates it.
+	register("DUMP", dumpCmd, 1, 1, true)
+	register("RESTORE", restoreCmd, 3, -1, true)
 	register("MGET", nil, 1, -1, true)
 	register("MSET", nil, 2, -1, true)
 	registerFan("EXISTS", shard.FanCount, exists, false, false)
