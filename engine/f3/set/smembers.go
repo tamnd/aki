@@ -37,23 +37,37 @@ type membersStream struct {
 func (m *membersStream) Next(dst []byte) (int, error) {
 	n := 0
 	for n < len(dst) {
-		if m.off >= len(m.buf) {
-			switch {
-			case !m.started:
-				m.buf = resp.AppendArrayHeader(m.buf[:0], len(m.ords))
-				m.started = true
-				m.off = 0
-			case m.idx < len(m.ords):
-				m.buf = resp.AppendBulk(m.buf[:0], m.ht.memberByOrd(m.ords[m.idx]))
-				m.idx++
-				m.off = 0
-			default:
-				return n, nil // every element framed and copied
-			}
+		// Drain the straddle buffer first: an element wider than the space left
+		// in the previous chunk is carried here and resumed a chunk at a time.
+		if m.off < len(m.buf) {
+			c := copy(dst[n:], m.buf[m.off:])
+			m.off += c
+			n += c
+			continue
 		}
-		c := copy(dst[n:], m.buf[m.off:])
-		m.off += c
-		n += c
+		switch {
+		case !m.started:
+			m.buf = resp.AppendArrayHeader(m.buf[:0], len(m.ords))
+			m.started = true
+			m.off = 0
+		case m.idx < len(m.ords):
+			mb := m.ht.memberByOrd(m.ords[m.idx])
+			m.idx++
+			// Fast path: when the whole bulk frame fits in the space left in dst,
+			// frame it straight onto the wire, skipping the copy through buf. The
+			// fit check guarantees dst's capacity, so slices.Grow inside AppendBulk
+			// reuses dst's backing and writes in place, and the common member never
+			// pays a second copy. Only a member that crosses the chunk boundary
+			// falls to the straddle path below.
+			if bulkFrameLen(len(mb)) <= int64(len(dst)-n) {
+				n = len(resp.AppendBulk(dst[:n], mb))
+				continue
+			}
+			m.buf = resp.AppendBulk(m.buf[:0], mb)
+			m.off = 0
+		default:
+			return n, nil // every element framed and copied
+		}
 	}
 	return n, nil
 }
