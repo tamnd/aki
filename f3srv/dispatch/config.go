@@ -39,6 +39,7 @@ var (
 		"maxmemory",
 		"maxmemory-policy",
 		"maxmemory-samples",
+		"notify-keyspace-events",
 		"save",
 		"appendonly",
 		"appendfsync",
@@ -49,17 +50,18 @@ var (
 		"proto-max-bulk-len",
 	}
 	configVals = map[string]string{
-		"maxmemory":          "0",
-		"maxmemory-policy":   "noeviction",
-		"maxmemory-samples":  "5",
-		"save":               "",
-		"appendonly":         "no",
-		"appendfsync":        "everysec",
-		"databases":          "1",
-		"timeout":            "0",
-		"tcp-keepalive":      "300",
-		"maxclients":         "10000",
-		"proto-max-bulk-len": "536870912",
+		"maxmemory":              "0",
+		"maxmemory-policy":       "noeviction",
+		"maxmemory-samples":      "5",
+		"notify-keyspace-events": "",
+		"save":                   "",
+		"appendonly":             "no",
+		"appendfsync":            "everysec",
+		"databases":              "1",
+		"timeout":                "0",
+		"tcp-keepalive":          "300",
+		"maxclients":             "10000",
+		"proto-max-bulk-len":     "536870912",
 	}
 )
 
@@ -163,6 +165,13 @@ func configSet(pairs [][]byte, r shard.Reply) {
 				return
 			}
 			value = strconv.FormatUint(n, 10)
+		case "notify-keyspace-events":
+			flags, ok := shard.ParseNotifyFlags(value)
+			if !ok {
+				r.Err("ERR CONFIG SET failed (possibly related to argument 'notify-keyspace-events') - Invalid event class character. Some possible classes are: 'g$lshzxeKE'.")
+				return
+			}
+			value = shard.NotifyFlagsString(flags)
 		}
 		norm[i/2] = value
 	}
@@ -183,6 +192,9 @@ func configSet(pairs [][]byte, r shard.Reply) {
 		case "maxmemory-samples":
 			n, _ := strconv.ParseUint(value, 10, 64)
 			evSamples.Store(int64(n))
+		case "notify-keyspace-events":
+			flags, _ := shard.ParseNotifyFlags(value)
+			shard.SetNotifyFlags(flags)
 		}
 	}
 	r.Status("OK")

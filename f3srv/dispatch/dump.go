@@ -164,6 +164,7 @@ func restoreCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err("ERR Bad data format")
 		return
 	}
+	cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "restore", key)
 	r.Status("OK")
 }
 

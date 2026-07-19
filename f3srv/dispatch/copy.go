@@ -77,6 +77,7 @@ func copyCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err("ERR Bad data format")
 		return
 	}
+	cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "copy_to", dst)
 	r.Int(1)
 }
 

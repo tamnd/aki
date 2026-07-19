@@ -1622,6 +1622,7 @@ func pexpiretimeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // (those are HPERSIST's job).
 func persistCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if cx.St.Persist(args[0], cx.NowMs) || set.Persist(cx, args[0]) || zset.Persist(cx, args[0]) || hash.Persist(cx, args[0]) || list.Persist(cx, args[0]) || stream.Persist(cx, args[0]) {
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "persist", args[0])
 		r.Int(1)
 		return
 	}
@@ -1874,6 +1875,7 @@ func delCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		removed = true
 	}
 	if removed {
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 		r.Int(1)
 		return
 	}
