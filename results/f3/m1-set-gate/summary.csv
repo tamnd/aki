@@ -1,0 +1,4 @@
+row,workload,harness,aki,redis,valkey,vs_redis,vs_valkey,verdict
+G1,sismember,dual-gen,10770000,3690000,3000000,2.92,3.59,PASS
+G2,sadd,dual-gen,9132420,3366295,2905130,2.71,3.14,PASS
+G10-mem,sadd-1M-1member-vmhwm-kb,dual-gen,236612,91852,92292,2.58,2.56,MISS-structural
