@@ -14,22 +14,26 @@ import (
 // One mutex guards the map because PUBLISH runs on one connection's reader
 // goroutine while SUBSCRIBE on another's mutates the same map, unlike the
 // per-connection waiter set the blocking path uses, which a single owner
-// serializes. This slice keeps the exact-channel registry; the pattern registry
-// and the shard-channel registry are separate maps a later slice adds.
+// serializes. It keeps the exact-channel registry and the glob-pattern registry
+// (PSUBSCRIBE); the shard-channel registry is a separate map a later slice adds.
 type pubsubRegistry struct {
 	mu       sync.Mutex
 	channels map[string]map[*connState]struct{}
+	patterns map[string]map[*connState]struct{}
 }
 
 func newPubsubRegistry() *pubsubRegistry {
-	return &pubsubRegistry{channels: make(map[string]map[*connState]struct{})}
+	return &pubsubRegistry{
+		channels: make(map[string]map[*connState]struct{}),
+		patterns: make(map[string]map[*connState]struct{}),
+	}
 }
 
 // subscribe records cs as a subscriber of channel and returns the connection's
-// total subscription count. A duplicate subscribe to a channel the connection
-// already holds re-confirms without double-adding, matching redis. cs.subs is
-// reader-owned so it moves outside the lock; only the shared reverse index takes
-// the mutex.
+// total subscription count, channels plus patterns, the number redis's confirmation
+// carries. A duplicate subscribe to a channel the connection already holds
+// re-confirms without double-adding, matching redis. cs.subs is reader-owned so it
+// moves outside the lock; only the shared reverse index takes the mutex.
 func (r *pubsubRegistry) subscribe(cs *connState, channel string) int {
 	if cs.subs == nil {
 		cs.subs = make(map[string]struct{})
@@ -46,33 +50,71 @@ func (r *pubsubRegistry) subscribe(cs *connState, channel string) int {
 		r.mu.Unlock()
 		cs.subCount.Store(int64(len(cs.subs)))
 	}
-	return len(cs.subs)
+	return cs.subTotal()
 }
 
-// unsubscribe drops cs from channel and returns the remaining subscription
+// unsubscribe drops cs from channel and returns the remaining total subscription
 // count. An unsubscribe from a channel the connection does not hold is a no-op
 // that still reports the current count, matching redis.
 func (r *pubsubRegistry) unsubscribe(cs *connState, channel string) int {
 	if _, ok := cs.subs[channel]; ok {
 		delete(cs.subs, channel)
 		r.mu.Lock()
-		r.dropLocked(channel, cs)
+		r.dropLocked(r.channels, channel, cs)
 		r.mu.Unlock()
 		cs.subCount.Store(int64(len(cs.subs)))
 	}
-	return len(cs.subs)
+	return cs.subTotal()
 }
 
-// dropLocked removes cs from channel's subscriber set and forgets an emptied
-// channel. The caller holds the mutex.
-func (r *pubsubRegistry) dropLocked(channel string, cs *connState) {
-	subs := r.channels[channel]
+// psubscribe records cs as a subscriber of a glob pattern and returns the total
+// subscription count. The pattern registry mirrors the channel registry: a
+// pattern maps to the connections that PSUBSCRIBEd it, and PUBLISH fans a message
+// out to every pattern whose glob matches the published channel. A duplicate
+// re-confirms without double-adding.
+func (r *pubsubRegistry) psubscribe(cs *connState, pattern string) int {
+	if cs.psubs == nil {
+		cs.psubs = make(map[string]struct{})
+	}
+	if _, dup := cs.psubs[pattern]; !dup {
+		cs.psubs[pattern] = struct{}{}
+		r.mu.Lock()
+		subs := r.patterns[pattern]
+		if subs == nil {
+			subs = make(map[*connState]struct{})
+			r.patterns[pattern] = subs
+		}
+		subs[cs] = struct{}{}
+		r.mu.Unlock()
+		cs.psubCount.Store(int64(len(cs.psubs)))
+	}
+	return cs.subTotal()
+}
+
+// punsubscribe drops cs from a pattern and returns the remaining total count. A
+// punsubscribe from a pattern the connection does not hold is a no-op that still
+// reports the current count.
+func (r *pubsubRegistry) punsubscribe(cs *connState, pattern string) int {
+	if _, ok := cs.psubs[pattern]; ok {
+		delete(cs.psubs, pattern)
+		r.mu.Lock()
+		r.dropLocked(r.patterns, pattern, cs)
+		r.mu.Unlock()
+		cs.psubCount.Store(int64(len(cs.psubs)))
+	}
+	return cs.subTotal()
+}
+
+// dropLocked removes cs from one directory's subscriber set for a name (a channel
+// or a pattern) and forgets an emptied name. The caller holds the mutex.
+func (r *pubsubRegistry) dropLocked(dir map[string]map[*connState]struct{}, name string, cs *connState) {
+	subs := dir[name]
 	if subs == nil {
 		return
 	}
 	delete(subs, cs)
 	if len(subs) == 0 {
-		delete(r.channels, channel)
+		delete(dir, name)
 	}
 }
 
@@ -84,23 +126,48 @@ func (r *pubsubRegistry) dropLocked(channel string, cs *connState) {
 // same bytes into its own node; the reactor's vectored write shares the one
 // buffer instead, the PUBLISH gate row's refinement (doc 17 section 13).
 func (r *pubsubRegistry) publish(channel string, message []byte) int {
+	// Snapshot the exact-channel targets and the matched-pattern targets under one
+	// lock hold, then deliver outside it. Pattern matching runs the same glob the
+	// channel introspection uses, once per live pattern, so a publish to a channel
+	// with no pattern subscribers pays only a map walk. A connection subscribed both
+	// to the channel and to a matching pattern is delivered to twice, a message and
+	// a pmessage, and counted twice, matching redis.
 	r.mu.Lock()
-	subs := r.channels[channel]
-	if len(subs) == 0 {
-		r.mu.Unlock()
-		return 0
+	var chanTargets []*shard.Conn
+	if subs := r.channels[channel]; len(subs) > 0 {
+		chanTargets = make([]*shard.Conn, 0, len(subs))
+		for cs := range subs {
+			chanTargets = append(chanTargets, cs.sc)
+		}
 	}
-	targets := make([]*shard.Conn, 0, len(subs))
-	for cs := range subs {
-		targets = append(targets, cs.sc)
+	type patTarget struct {
+		sc      *shard.Conn
+		pattern string
+	}
+	var patTargets []patTarget
+	if len(r.patterns) > 0 {
+		ch := []byte(channel)
+		for pattern, subs := range r.patterns {
+			if !globMatch([]byte(pattern), ch) {
+				continue
+			}
+			for cs := range subs {
+				patTargets = append(patTargets, patTarget{sc: cs.sc, pattern: pattern})
+			}
+		}
 	}
 	r.mu.Unlock()
 
-	wire := appendMessage(nil, channel, message)
-	for _, sc := range targets {
-		sc.DeliverOOB(wire)
+	if len(chanTargets) > 0 {
+		wire := appendMessage(nil, channel, message)
+		for _, sc := range chanTargets {
+			sc.DeliverOOB(wire)
+		}
 	}
-	return len(targets)
+	for _, t := range patTargets {
+		t.sc.DeliverOOB(appendPMessage(nil, t.pattern, channel, message))
+	}
+	return len(chanTargets) + len(patTargets)
 }
 
 // channelList returns the channels with at least one subscriber, filtered by the
@@ -125,21 +192,35 @@ func (r *pubsubRegistry) numSub(channel string) int {
 	return n
 }
 
+// numPat returns the number of distinct patterns with at least one subscriber,
+// the PUBSUB NUMPAT figure.
+func (r *pubsubRegistry) numPat() int {
+	r.mu.Lock()
+	n := len(r.patterns)
+	r.mu.Unlock()
+	return n
+}
+
 // removeConn drops a departing connection from every channel it held. It runs
 // from the connection teardown (unregister), after both connection goroutines
 // have joined, so cs.subs is this goroutine's alone; the reverse index still
 // takes the mutex against live publishers.
 func (r *pubsubRegistry) removeConn(cs *connState) {
-	if cs.subs == nil {
+	if cs.subs == nil && cs.psubs == nil {
 		return
 	}
 	r.mu.Lock()
 	for channel := range cs.subs {
-		r.dropLocked(channel, cs)
+		r.dropLocked(r.channels, channel, cs)
+	}
+	for pattern := range cs.psubs {
+		r.dropLocked(r.patterns, pattern, cs)
 	}
 	r.mu.Unlock()
 	cs.subs = nil
+	cs.psubs = nil
 	cs.subCount.Store(0)
+	cs.psubCount.Store(0)
 }
 
 // pubsubIntercept handles the pub/sub command family in the network layer,
@@ -156,6 +237,12 @@ func (s *Server) pubsubIntercept(c *shard.Conn, cs *connState, args [][]byte) bo
 		return true
 	case eqFold(args[0], "UNSUBSCRIBE"):
 		s.doUnsubscribe(c, cs, args)
+		return true
+	case eqFold(args[0], "PSUBSCRIBE"):
+		s.doPsubscribe(c, cs, args)
+		return true
+	case eqFold(args[0], "PUNSUBSCRIBE"):
+		s.doPunsubscribe(c, cs, args)
 		return true
 	case eqFold(args[0], "PUBLISH"):
 		s.doPublish(c, args)
@@ -178,9 +265,10 @@ func (s *Server) pubsubIntercept(c *shard.Conn, cs *connState, args [][]byte) bo
 }
 
 // subscribeModeAllowed reports whether a non-pub/sub command may run while the
-// connection is in subscribe mode. The pattern and shard subscribe verbs are on
-// the list so they are admitted once their slices land; today they fall through
-// to the unknown-command answer.
+// connection is in subscribe mode. PSUBSCRIBE/PUNSUBSCRIBE are handled by the
+// intercept above (they never reach this test); the shard subscribe verbs
+// SSUBSCRIBE/SUNSUBSCRIBE are on the list so they are admitted once that slice
+// lands, until then falling through to the unknown-command answer.
 func subscribeModeAllowed(verb []byte) bool {
 	switch {
 	case eqFold(verb, "PING"), eqFold(verb, "QUIT"), eqFold(verb, "RESET"),
@@ -230,6 +318,45 @@ func (s *Server) doUnsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
 	}
 }
 
+// doPsubscribe subscribes the connection to each named glob pattern and confirms
+// each in order. Arity is at least one pattern.
+func (s *Server) doPsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
+	if len(args) < 2 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'psubscribe' command"))
+		return
+	}
+	for _, pat := range args[1:] {
+		n := s.pubsub.psubscribe(cs, string(pat))
+		_ = c.InlineReply(appendSubConfirm(nil, "psubscribe", pat, n))
+	}
+}
+
+// doPunsubscribe drops the named patterns, or every held pattern when none are
+// named, confirming each in order. Punsubscribing from all on a connection that
+// holds none answers one confirmation with a nil pattern and count zero, the
+// redis shape.
+func (s *Server) doPunsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
+	if len(args) >= 2 {
+		for _, pat := range args[1:] {
+			n := s.pubsub.punsubscribe(cs, string(pat))
+			_ = c.InlineReply(appendSubConfirm(nil, "punsubscribe", pat, n))
+		}
+		return
+	}
+	if len(cs.psubs) == 0 {
+		_ = c.InlineReply(appendPunsubNil(nil))
+		return
+	}
+	held := make([]string, 0, len(cs.psubs))
+	for pat := range cs.psubs {
+		held = append(held, pat)
+	}
+	for _, pat := range held {
+		n := s.pubsub.punsubscribe(cs, pat)
+		_ = c.InlineReply(appendSubConfirm(nil, "punsubscribe", []byte(pat), n))
+	}
+}
+
 // doPublish delivers the message to the channel's subscribers and answers the
 // receiver count. Arity is exactly a channel and a message.
 func (s *Server) doPublish(c *shard.Conn, args [][]byte) {
@@ -243,7 +370,7 @@ func (s *Server) doPublish(c *shard.Conn, args [][]byte) {
 
 // doPubsub answers the introspection subcommands. CHANNELS lists active channels
 // under an optional pattern, NUMSUB reports subscriber counts for named
-// channels, and NUMPAT reports the pattern count, zero until the pattern slice.
+// channels, and NUMPAT reports the number of distinct subscribed patterns.
 func (s *Server) doPubsub(c *shard.Conn, args [][]byte) {
 	if len(args) < 2 {
 		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'pubsub' command"))
@@ -270,7 +397,7 @@ func (s *Server) doPubsub(c *shard.Conn, args [][]byte) {
 		}
 		_ = c.InlineReply(out)
 	case eqFold(args[1], "NUMPAT"):
-		_ = c.InlineReply(resp.AppendInt(nil, 0))
+		_ = c.InlineReply(resp.AppendInt(nil, int64(s.pubsub.numPat())))
 	default:
 		_ = c.InlineReply(resp.AppendError(nil, "ERR Unknown PUBSUB subcommand or wrong number of arguments"))
 	}
@@ -281,6 +408,17 @@ func (s *Server) doPubsub(c *shard.Conn, args [][]byte) {
 func appendMessage(dst []byte, channel string, message []byte) []byte {
 	dst = resp.AppendArrayHeader(dst, 3)
 	dst = resp.AppendBulk(dst, []byte("message"))
+	dst = resp.AppendBulk(dst, []byte(channel))
+	dst = resp.AppendBulk(dst, message)
+	return dst
+}
+
+// appendPMessage builds the unsolicited pattern message push: a four-element
+// array of "pmessage", the pattern that matched, the channel, and the payload.
+func appendPMessage(dst []byte, pattern, channel string, message []byte) []byte {
+	dst = resp.AppendArrayHeader(dst, 4)
+	dst = resp.AppendBulk(dst, []byte("pmessage"))
+	dst = resp.AppendBulk(dst, []byte(pattern))
 	dst = resp.AppendBulk(dst, []byte(channel))
 	dst = resp.AppendBulk(dst, message)
 	return dst
@@ -301,6 +439,16 @@ func appendSubConfirm(dst []byte, kind string, channel []byte, count int) []byte
 func appendUnsubNil(dst []byte) []byte {
 	dst = resp.AppendArrayHeader(dst, 3)
 	dst = resp.AppendBulk(dst, []byte("unsubscribe"))
+	dst = resp.AppendNull(dst)
+	dst = resp.AppendInt(dst, 0)
+	return dst
+}
+
+// appendPunsubNil builds the PUNSUBSCRIBE-from-nothing confirmation:
+// "punsubscribe", a nil pattern, and count zero.
+func appendPunsubNil(dst []byte) []byte {
+	dst = resp.AppendArrayHeader(dst, 3)
+	dst = resp.AppendBulk(dst, []byte("punsubscribe"))
 	dst = resp.AppendNull(dst)
 	dst = resp.AppendInt(dst, 0)
 	return dst

@@ -46,13 +46,21 @@ type connState struct {
 	// mode, which restricts the commands it may run.
 	subs map[string]struct{}
 
-	// subCount mirrors len(subs) as a single-writer atomic so CLIENT LIST can read
-	// another connection's subscription count without touching its map. The owning
-	// reader goroutine restamps it after every subs mutation (pubsub.go); a
-	// cross-connection reader loads it. This is the eventCounter discipline applied
-	// to a size gauge: single writer, atomic only so the race detector sees a
-	// defined value.
-	subCount atomic.Int64
+	// psubs is the set of glob patterns this connection is subscribed to through
+	// PSUBSCRIBE, the pattern twin of subs. Reader-owned like subs, nil until the
+	// first PSUBSCRIBE. A connection is in subscribe mode when either set is
+	// non-empty.
+	psubs map[string]struct{}
+
+	// subCount mirrors len(subs) and psubCount mirrors len(psubs), both as
+	// single-writer atomics so CLIENT LIST can read another connection's channel
+	// and pattern subscription counts without touching its maps. The owning reader
+	// goroutine restamps them after every subs/psubs mutation (pubsub.go); a
+	// cross-connection reader loads them. This is the eventCounter discipline
+	// applied to a size gauge: single writer, atomic only so the race detector sees
+	// a defined value.
+	subCount  atomic.Int64
+	psubCount atomic.Int64
 
 	// id is this connection's CLIENT ID, stamped in register from the server's
 	// monotonic counter. It is network-layer identity (client.go), immutable after
@@ -112,7 +120,12 @@ func (cs *connState) loadName() []byte {
 // inSubscribeMode reports whether the connection holds any subscription, so the
 // RESP2 subscribe-context command restriction applies (doc 17 section 13). Later
 // slices fold pattern and shard subscriptions into the same test.
-func (cs *connState) inSubscribeMode() bool { return len(cs.subs) > 0 }
+func (cs *connState) inSubscribeMode() bool { return len(cs.subs) > 0 || len(cs.psubs) > 0 }
+
+// subTotal is the connection's total subscription count, channels plus patterns,
+// the number redis reports in every (P)SUBSCRIBE and (P)UNSUBSCRIBE confirmation.
+// Reader-owned, so it is read on the owning goroutine without a lock.
+func (cs *connState) subTotal() int { return len(cs.subs) + len(cs.psubs) }
 
 // countedWriter counts the writer goroutine's socket writes: it sits between
 // the reply bufio.Writer and the connection, so every buffer flush, mid-fill

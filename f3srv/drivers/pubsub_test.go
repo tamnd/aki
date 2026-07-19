@@ -163,6 +163,98 @@ func TestPubsubSubscribeModeRestriction(t *testing.T) {
 	expect(t, br, "+PONG\r\n")
 }
 
+// TestPubsubPattern drives the glob-pattern path: one connection PSUBSCRIBEs a
+// pattern, another publishes to a matching channel, and a pmessage carrying the
+// pattern arrives unsolicited. It checks the psubscribe/punsubscribe confirmations,
+// the delivered pmessage, the receiver count, PUBSUB NUMPAT, and that a publish to
+// a non-matching channel reaches nobody.
+func TestPubsubPattern(t *testing.T) {
+	srv := startPubsubServer(t)
+	subNc, subBr := dialPubsub(t, srv)
+	pubNc, pubBr := dialPubsub(t, srv)
+
+	send(t, subNc, "PSUBSCRIBE", "news.*")
+	if k, p, n := readSubConfirm(t, subBr); k != "psubscribe" || p != "news.*" || n != 1 {
+		t.Fatalf("psubscribe confirm = %q %q %d, want psubscribe news.* 1", k, p, n)
+	}
+
+	// NUMPAT reports the one live pattern.
+	send(t, pubNc, "PUBSUB", "NUMPAT")
+	if n := readIntFrom(t, pubBr); n != 1 {
+		t.Fatalf("PUBSUB NUMPAT = %d, want 1", n)
+	}
+
+	// A publish to a channel the pattern matches delivers a pmessage and counts one
+	// receiver.
+	send(t, pubNc, "PUBLISH", "news.tech", "hello")
+	if n := readIntFrom(t, pubBr); n != 1 {
+		t.Fatalf("PUBLISH receivers = %d, want 1", n)
+	}
+	if k, pat, ch, msg := readPMessage(t, subBr); k != "pmessage" || pat != "news.*" || ch != "news.tech" || msg != "hello" {
+		t.Fatalf("delivered = %q %q %q %q, want pmessage news.* news.tech hello", k, pat, ch, msg)
+	}
+
+	// A publish to a channel the pattern does not match reaches nobody.
+	send(t, pubNc, "PUBLISH", "sports.nba", "score")
+	if n := readIntFrom(t, pubBr); n != 0 {
+		t.Fatalf("PUBLISH to non-matching channel = %d, want 0", n)
+	}
+
+	// Punsubscribe drops the pattern; the confirmation ends at zero and NUMPAT falls.
+	send(t, subNc, "PUNSUBSCRIBE", "news.*")
+	if k, p, n := readSubConfirm(t, subBr); k != "punsubscribe" || p != "news.*" || n != 0 {
+		t.Fatalf("punsubscribe confirm = %q %q %d, want punsubscribe news.* 0", k, p, n)
+	}
+	send(t, pubNc, "PUBSUB", "NUMPAT")
+	if n := readIntFrom(t, pubBr); n != 0 {
+		t.Fatalf("PUBSUB NUMPAT after punsubscribe = %d, want 0", n)
+	}
+	send(t, pubNc, "PUBLISH", "news.tech", "again")
+	if n := readIntFrom(t, pubBr); n != 0 {
+		t.Fatalf("PUBLISH after punsubscribe = %d, want 0", n)
+	}
+}
+
+// TestPubsubChannelAndPattern checks a connection subscribed both to a channel and
+// to a matching pattern receives both a message and a pmessage for one publish, in
+// that order, and the publisher counts two receivers.
+func TestPubsubChannelAndPattern(t *testing.T) {
+	srv := startPubsubServer(t)
+	subNc, subBr := dialPubsub(t, srv)
+	pubNc, pubBr := dialPubsub(t, srv)
+
+	send(t, subNc, "SUBSCRIBE", "news.tech")
+	readSubConfirm(t, subBr)
+	send(t, subNc, "PSUBSCRIBE", "news.*")
+	if _, _, n := readSubConfirm(t, subBr); n != 2 {
+		t.Fatalf("psubscribe total count = %d, want 2", n)
+	}
+
+	send(t, pubNc, "PUBLISH", "news.tech", "hi")
+	if n := readIntFrom(t, pubBr); n != 2 {
+		t.Fatalf("PUBLISH receivers = %d, want 2", n)
+	}
+	// The exact-channel message is delivered before the pattern message.
+	if k, ch, msg := readMessage(t, subBr); k != "message" || ch != "news.tech" || msg != "hi" {
+		t.Fatalf("first push = %q %q %q, want message news.tech hi", k, ch, msg)
+	}
+	if k, pat, ch, msg := readPMessage(t, subBr); k != "pmessage" || pat != "news.*" || ch != "news.tech" || msg != "hi" {
+		t.Fatalf("second push = %q %q %q %q, want pmessage news.* news.tech hi", k, pat, ch, msg)
+	}
+}
+
+// readPMessage reads a delivered pattern message push: "pmessage", the pattern,
+// the channel, the payload, all bulks.
+func readPMessage(t *testing.T, br *bufio.Reader) (kind, pattern, channel, payload string) {
+	t.Helper()
+	readArrayHeader(t, br, 4)
+	kind = readBulkFrom(t, br)
+	pattern = readBulkFrom(t, br)
+	channel = readBulkFrom(t, br)
+	payload = readBulkFrom(t, br)
+	return kind, pattern, channel, payload
+}
+
 // readSubConfirm reads a subscribe or unsubscribe confirmation: a three-element
 // array of the kind bulk, the channel bulk, and the integer count.
 func readSubConfirm(t *testing.T, br *bufio.Reader) (kind, channel string, count int64) {
