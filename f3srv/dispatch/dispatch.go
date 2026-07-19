@@ -282,6 +282,11 @@ func init() {
 	register("COPY", copyCmd, 2, -1, true)
 	table["COPY"].cross = copyCross
 	table["COPY"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
+	// MOVE relocates a key to another numbered database (see move.go). f3 keeps one
+	// keyspace, so it has no destination and always declines with the honest
+	// database error rather than leaving MOVE an unknown-command hole. Keyed so the
+	// arity guard runs on the owner, single key, no cross path.
+	register("MOVE", moveCmd, 2, 2, true)
 	register("MGET", nil, 1, -1, true)
 	register("MSET", nil, 2, -1, true)
 	registerFan("EXISTS", shard.FanCount, exists, false, false)
