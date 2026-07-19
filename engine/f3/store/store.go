@@ -83,6 +83,13 @@ type Store struct {
 	// materializes here. Owner goroutine only, valid until the next recordRow.
 	rlogScratch []byte
 
+	// rlogChunkScratch renders a chunked value's durable directory for its record
+	// row (recordseam.go chunkDirRow), 12 bytes per chunk, reused across commits so
+	// the durable chunked path holds no per-commit allocation. Stage copies it into
+	// the frame the instant it returns. Owner goroutine only, valid until the next
+	// chunkDirRow.
+	rlogChunkScratch []byte
+
 	// collScratch frames a collection effect payload for the record log
 	// (collectionseam.go), reused across LogCollectionOp calls so the durable
 	// collection path holds no per-mutation allocation. Stage copies the framed

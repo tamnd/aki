@@ -31,10 +31,10 @@ import "encoding/binary"
 // command's record row here is a later slice.
 
 // recRowHdr is the fixed header before a record's variable tail: flags u32,
-// value_word u64, value_len u32, expire_at u64. The tail is the value bytes
-// (only when RecFlagInline is set, value_len of them) followed by the key, so
-// the key length is the frame body length minus this header and any inline
-// value.
+// value_word u64, value_len u32, expire_at u64. The tail is the payload bytes
+// (an inline value, value_len of them; or, for a chunked row, a uvarint-prefixed
+// directory) followed by the key, so the key length is the frame body length minus
+// this header and any payload.
 const recRowHdr = 24
 
 // RecordRow is the decoded form of one persisted record. The value word is the
@@ -72,12 +72,17 @@ const RecFlagTombstone uint32 = 1 << 0
 // the word. Bit one of the row flags.
 const RecFlagInline uint32 = 1 << 1
 
-// RecFlagChunked marks a row whose value is a multi-chunk run, so its word names
-// a chunk-extent table rather than a single value-log run a one-shot read
-// resolves. Replay follows the chunk directory to reassemble the value; a reader
-// that only handles single-run values refuses a chunked row rather than misreading
-// its word as a run offset. Bit two of the row flags. A separated value carries
-// neither this nor RecFlagInline: its word is a lone value-log run.
+// RecFlagChunked marks a row whose value is a multi-chunk run. Its frame carries
+// the durable chunk directory as a length-prefixed payload between the header and
+// the key (a uvarint byte length, then the directory bytes), because a chunked
+// value's live directory is an arena block a crash drops and the record's word is a
+// volatile arena offset. Replay reads the directory back and reassembles the value
+// from the durable chunk runs it names; a reader that only handles single-run values
+// refuses a chunked row rather than misreading its word as a run offset. The
+// header's value_len stays the value's total logical byte length, so the directory
+// payload length is carried by its own varint rather than value_len. Bit two of the
+// row flags. A separated value carries no payload and no chunk flag: its word is a
+// lone value-log run.
 const RecFlagChunked uint32 = 1 << 2
 
 // RecFlagCollectionOp marks a row whose payload is one collection mutation, the
@@ -134,11 +139,20 @@ type RecordFrame struct {
 func AppendRecordFrame(dst []byte, row RecordRow) ([]byte, RecordFrame) {
 	frameOff := uint64(len(dst))
 	inline := framePayload(row.Flags)
+	chunked := row.Flags&RecFlagChunked != 0
+	// A chunked row carries a directory payload of len(Value) bytes prefixed by its
+	// own uvarint length, since value_len holds the total logical length, not the
+	// payload length. An inline or collection row's payload length is value_len.
+	var plenBuf [binary.MaxVarintLen64]byte
+	plenN := 0
 	valLen := 0
-	if inline {
+	if chunked {
+		plenN = binary.PutUvarint(plenBuf[:], uint64(len(row.Value)))
+		valLen = len(row.Value)
+	} else if inline {
 		valLen = len(row.Value)
 	}
-	bodyLen := recRowHdr + valLen + len(row.Key)
+	bodyLen := recRowHdr + plenN + valLen + len(row.Key)
 	var hdr [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(hdr[:], uint64(bodyLen))
 	dst = append(dst, hdr[:n]...)
@@ -149,7 +163,10 @@ func AppendRecordFrame(dst []byte, row RecordRow) ([]byte, RecordFrame) {
 	le.PutUint32(fixed[12:16], row.ValueLen)
 	le.PutUint64(fixed[16:24], row.ExpireAt)
 	dst = append(dst, fixed[:]...)
-	if inline {
+	if chunked {
+		dst = append(dst, plenBuf[:plenN]...)
+		dst = append(dst, row.Value...)
+	} else if inline {
 		dst = append(dst, row.Value...)
 	}
 	dst = append(dst, row.Key...)
@@ -183,13 +200,24 @@ func ParseRecordBody(body []byte) (RecordRow, error) {
 		ExpireAt:  le.Uint64(body[16:24]),
 	}
 	tail := body[recRowHdr:]
-	if framePayload(row.Flags) {
+	switch {
+	case framePayload(row.Flags):
 		if uint64(row.ValueLen) > uint64(len(tail)) {
 			return RecordRow{}, ErrLength
 		}
 		row.Value = tail[:row.ValueLen]
 		row.Key = tail[row.ValueLen:]
-	} else {
+	case row.Flags&RecFlagChunked != 0:
+		// The directory payload is length-prefixed: a uvarint byte count, then the
+		// directory, then the key. A truncated prefix or a length past the tail is a
+		// torn frame.
+		plen, adv := binary.Uvarint(tail)
+		if adv <= 0 || plen > uint64(len(tail)-adv) {
+			return RecordRow{}, ErrLength
+		}
+		row.Value = tail[adv : adv+int(plen)]
+		row.Key = tail[adv+int(plen):]
+	default:
 		row.Key = tail
 	}
 	return row, nil
