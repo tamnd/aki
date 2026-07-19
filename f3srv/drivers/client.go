@@ -1,6 +1,9 @@
 package drivers
 
 import (
+	"strconv"
+	"time"
+
 	"github.com/tamnd/aki/engine/f3/shard"
 	"github.com/tamnd/aki/f3srv/resp"
 )
@@ -58,8 +61,34 @@ func (s *Server) connIntercept(c *shard.Conn, cs *connState, args [][]byte) bool
 	case eqFold(args[0], "RESET"):
 		s.doReset(c, cs, args)
 		return true
+	case eqFold(args[0], "DEBUG") && len(args) >= 2 && eqFold(args[1], "SLEEP"):
+		s.doDebugSleep(c, args)
+		return true
 	}
 	return false
+}
+
+// doDebugSleep answers DEBUG SLEEP seconds by blocking this connection for the
+// requested time and then acknowledging with +OK. Test harnesses use it to make
+// a command hang on purpose, so they can exercise client-side timeouts. It sleeps
+// the connection's reader goroutine, so only this one connection stalls, not a
+// shard worker or any other client; that is a narrower block than redis's whole-
+// server sleep and serves the harness use exactly, since the harness watches this
+// connection. Any other DEBUG subcommand falls through to the dispatch handler
+// (debug.go). On the reactor driver, which has no intercept, DEBUG SLEEP reaches
+// that dispatch handler instead and sleeps its shard worker.
+func (s *Server) doDebugSleep(c *shard.Conn, args [][]byte) {
+	if len(args) != 3 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'debug|sleep' command"))
+		return
+	}
+	secs, err := strconv.ParseFloat(string(args[2]), 64)
+	if err != nil || secs < 0 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR value is not a valid float"))
+		return
+	}
+	time.Sleep(time.Duration(secs * float64(time.Second)))
+	_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
 }
 
 // doQuit answers QUIT: acknowledge with +OK, then mark the connection for close.

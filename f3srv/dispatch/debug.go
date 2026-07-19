@@ -1,0 +1,53 @@
+package dispatch
+
+import (
+	"strconv"
+	"time"
+
+	"github.com/tamnd/aki/engine/f3/shard"
+)
+
+// The DEBUG surface (spec 2064/f3/17 section 15). DEBUG is a grab bag of test and
+// introspection subcommands; f3 answers the ones test harnesses depend on and
+// gives truthful stubs for the internals it has no equivalent of, rather than
+// erroring as an unknown command and failing a harness on an unrelated setup
+// step. The subcommand sits at args[0] here (register strips the verb).
+//
+// DEBUG SLEEP is answered in the network layer on the default driver (client.go,
+// doDebugSleep), where it blocks only the one connection. It also has a handler
+// here for the reactor driver, which has no network intercept: there it sleeps
+// the owning shard worker, a briefer block than redis's whole-server sleep. Both
+// paths parse the same seconds argument.
+//
+// DEBUG OBJECT is deferred to its own slice: a truthful line needs a per-type
+// encoding lookup and a serialized-length accounting that this milestone has not
+// built yet, and a half-true line is worse than an honest not-yet.
+func debugCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	switch upperVerb(args[0]) {
+	case "SLEEP":
+		// The reactor path (the default driver intercepts this before dispatch).
+		if len(args) != 2 {
+			r.Err("ERR wrong number of arguments for 'debug|sleep' command")
+			return
+		}
+		secs, err := strconv.ParseFloat(string(args[1]), 64)
+		if err != nil || secs < 0 {
+			r.Err("ERR value is not a valid float")
+			return
+		}
+		time.Sleep(time.Duration(secs * float64(time.Second)))
+		r.Status("OK")
+	case "JMAP", "SET-ACTIVE-EXPIRE", "QUICKLIST-PACKED-THRESHOLD",
+		"STRINGMATCH-LEN", "CHANGE-REPL-ID", "FLUSHALL", "DEBUG":
+		// Truthful stubs: these poke redis-internal machinery (the JVM-style
+		// object map, the active-expire cycle toggle, quicklist packing, a repl
+		// id rotation) that f3 either does not have or does not expose through a
+		// debug hook. A harness sets them for the side effect and only checks for
+		// the OK; f3 acknowledges without pretending to have changed state it does
+		// not keep. SET-ACTIVE-EXPIRE in particular is a no-op here: f3's expiry
+		// is lazy per doc 09 and there is no cycle to switch off.
+		r.Status("OK")
+	default:
+		r.Err("ERR DEBUG subcommand not supported")
+	}
+}
