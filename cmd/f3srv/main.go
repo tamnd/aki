@@ -20,6 +20,8 @@ func main() {
 	arenaMiB := flag.Int("arena-mib", 256, "arena MiB per shard")
 	vlogDir := flag.String("vlog-dir", "",
 		"directory for per-shard value logs; empty keeps values in memory")
+	akiPath := flag.String("aki", "",
+		"path to the shared durable .aki file (the M8 durable arc): every write commits through the group-commit writer and a restart rebuilds the whole keyspace, strings and all five collection types, from the file; empty keeps the server non-durable; mutually exclusive with -vlog-dir, -aki wins")
 	residentMiB := flag.Int("resident-cap-mib", 0,
 		"resident byte budget MiB per shard; past it, large values spill to the shard's value log (needs -vlog-dir; 0 means uncapped)")
 	pinWorkers := flag.Bool("pin-workers", false,
@@ -56,6 +58,7 @@ func main() {
 		Shards:           *shards,
 		ArenaBytes:       *arenaMiB << 20,
 		VlogDir:          *vlogDir,
+		AkiPath:          *akiPath,
 		ResidentCapBytes: uint64(*residentMiB) << 20,
 		PinWorkers:       *pinWorkers,
 		PprofAddr:        *pprofAddr,

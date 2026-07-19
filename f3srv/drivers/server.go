@@ -105,6 +105,13 @@ type Options struct {
 	// VlogDir, when set, gives every shard its own value-log file under this
 	// directory; empty keeps the stores memory-only.
 	VlogDir string
+	// AkiPath, when set, backs the whole server with the one shared durable .aki
+	// file at this path (the M8 durable arc): every write commits through the shared
+	// group-commit writer, and a restart rebuilds the entire keyspace, strings and
+	// all five collection types, from the file before the first command. Empty keeps
+	// the server non-durable (memory-only, or per-shard scratch vlog under VlogDir).
+	// Mutually exclusive with VlogDir; AkiPath wins.
+	AkiPath string
 	// ResidentCapBytes is each shard's resident byte budget when VlogDir is
 	// set; past it, separated and chunked value bytes spill to the shard's
 	// log. 0 means uncapped.
@@ -302,6 +309,8 @@ func Listen(o Options) (*Server, error) {
 		ArenaBytes:       o.ArenaBytes,
 		SegBytes:         o.SegBytes,
 		VlogDir:          o.VlogDir,
+		AkiPath:          o.AkiPath,
+		RecoverColl:      dispatch.Recoverer(),
 		ResidentCapBytes: o.ResidentCapBytes,
 		PinWorkers:       o.PinWorkers,
 		BatchDataCap:     o.BatchDataCap,

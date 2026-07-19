@@ -123,6 +123,83 @@ func TestReplayRebuildsIndex(t *testing.T) {
 	}
 }
 
+// TestReplaySkipsCollectionFrames pins the mixed-vertical recovery walk: a store
+// that carries both string records and collection effect frames in the one shared
+// record log must rebuild the string index without choking on the collection
+// frames, which have no string value band and belong to WalkCollection instead. It
+// is the regression for the arena-resident failure the first end-to-end restart
+// surfaced: before the skip, the string replay fed a RecFlagCollectionOp frame into
+// applyValueRow, which read its opaque effect payload as a value and failed closed.
+func TestReplaySkipsCollectionFrames(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mixed.aki")
+	f, err := akifile.Create(path, akifile.CreateOptions{
+		ShardCount:   4,
+		SepThreshold: 64,
+		Sync:         akifile.SyncNo,
+	})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	openStore := func(f *akifile.File) *Store {
+		s, err := Open(Options{
+			ArenaBytes:  4 << 20,
+			SegBytes:    1 << 20,
+			AkiValueLog: f,
+			Shard:       1,
+		})
+		if err != nil {
+			t.Fatalf("open aki store: %v", err)
+		}
+		return s
+	}
+
+	// First run: two string writes straddling a set effect and a set snapshot frame,
+	// so the string walk must step over collection frames both before and after a
+	// string record it must still recover.
+	s := openStore(f)
+	if err := s.SetString([]byte("before"), []byte("v1"), 0, 0, false); err != nil {
+		t.Fatalf("set before: %v", err)
+	}
+	s.LogCollectionOp([]byte("myset"), akifile.CollKindSet, 0, []byte("member"), nil)
+	s.LogCollectionSnap([]byte("myset"), akifile.CollKindSet, []byte("hdr"), []byte("run"))
+	if err := s.SetString([]byte("after"), []byte("v2"), 0, 0, false); err != nil {
+		t.Fatalf("set after: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	// Second run: replay the log into a fresh store. The collection frames are
+	// skipped and both string keys come back.
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	s2 := openStore(f2)
+	t.Cleanup(func() { _ = s2.Close(); _ = f2.Close() })
+
+	if err := s2.ReplayRecords(0); err != nil {
+		t.Fatalf("replay over collection frames: %v", err)
+	}
+	for key, want := range map[string]string{"before": "v1", "after": "v2"} {
+		got, ok := s2.GetString([]byte(key), 0, nil)
+		if !ok {
+			t.Fatalf("string key %q absent after mixed replay", key)
+		}
+		if string(got) != want {
+			t.Fatalf("string key %q read back %q, want %q", key, got, want)
+		}
+	}
+	// The collection key never entered the string index: it rebuilds through
+	// WalkCollection, not this walk, so a string GET must not resurrect it.
+	if _, ok := s2.GetString([]byte("myset"), 0, nil); ok {
+		t.Fatal("collection key myset leaked into the string index after replay")
+	}
+}
+
 // TestReplayIsShardScoped confirms a store replays only its own shard's records:
 // two shards write distinct keys into the one shared file, then a fresh store on
 // each shard replays and sees its own key but not the other shard's, so a

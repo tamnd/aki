@@ -38,6 +38,12 @@ func (s *Store) BuildIndexCheckpoint(dst []byte) ([]byte, akifile.CkptHeader, er
 	live := make(map[uint64]uint64)
 	if s.akirlog != nil {
 		err := s.akirlog.walkShard(func(addr uint64, row akifile.RecordRow) error {
+			// Collection frames share this log but belong to WalkCollection, not the
+			// string index dump: fold them out so the checkpoint never files an effect
+			// frame's address under a string key hash.
+			if row.Flags&(akifile.RecFlagCollectionOp|akifile.RecFlagCollectionSnap) != 0 {
+				return nil
+			}
 			h := Hash(row.Key)
 			if row.Flags&akifile.RecFlagTombstone != 0 {
 				delete(live, h)

@@ -153,6 +153,16 @@ type Config struct {
 	// without it the runtime keeps the scratch-vlog path unchanged.
 	AkiPath string
 
+	// RecoverColl replays every collection type's durable frames into its
+	// owner-local registry after the store's string index recovers, the seam the
+	// shard package cannot cross on its own (the set/zset/hash/stream/list Recover
+	// funcs live in packages that import shard). The server layer passes the fanned
+	// composite; a nil hook (string-only runtime, or an in-memory open) skips it and
+	// recovers strings alone. It runs once per shard during open, before Start, so
+	// the owner loop is not yet spinning and the walk installs into the registry with
+	// no synchronization. Without an .aki file there are no frames and it is a no-op.
+	RecoverColl func(*Ctx) error
+
 	// ResidentCapBytes is each shard's resident byte budget; past it a
 	// separated or chunked value's bytes spill to the shard's log. 0 means
 	// uncapped.
@@ -268,6 +278,18 @@ func (r *Runtime) openAkiStores(cfg Config) error {
 		r.workers[i] = newWorker(i, st)
 		r.workers[i].rt = r
 		r.workers[i].pin = cfg.PinWorkers
+		if rec != nil && cfg.RecoverColl != nil {
+			w := r.workers[i]
+			w.cx.NowMs = now
+			if err := cfg.RecoverColl(&w.cx); err != nil {
+				for j := 0; j <= i; j++ {
+					_ = r.workers[j].st.Close()
+				}
+				r.gw.Stop()
+				_ = f.Close()
+				return fmt.Errorf("shard: recover collections shard %d over %s: %w", i, cfg.AkiPath, err)
+			}
+		}
 	}
 	return nil
 }
