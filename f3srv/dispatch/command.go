@@ -43,7 +43,9 @@ func commandCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	case "DOCS":
 		commandDocs(cx, args[1:], r)
 	case "GETKEYS":
-		commandGetKeys(cx, args[1:], r)
+		commandGetKeys(cx, args[1:], r, false)
+	case "GETKEYSANDFLAGS":
+		commandGetKeys(cx, args[1:], r, true)
 	default:
 		r.Err("ERR Unknown COMMAND subcommand or wrong number of arguments")
 	}
@@ -103,8 +105,12 @@ func commandDocs(cx *shard.Ctx, names [][]byte, r shard.Reply) {
 // commandGetKeys answers COMMAND GETKEYS command [arg ...]: the keys the given
 // command would touch, extracted from its key spec. It errors the way Redis does
 // for an unknown command, a command that takes no keys, or a tail too short to
-// hold the key the spec points at.
-func commandGetKeys(cx *shard.Ctx, argv [][]byte, r shard.Reply) {
+// hold the key the spec points at. withFlags switches it to the GETKEYSANDFLAGS
+// shape, where each key is paired with its per-key access flags; f3 does not
+// model those flags, so it reports the empty flags array per key, the same choice
+// the COMMAND spec's flags field makes (appendCommandSpec). The pairing is still
+// the correct shape a caller walks, it just carries no flags to branch on.
+func commandGetKeys(cx *shard.Ctx, argv [][]byte, r shard.Reply, withFlags bool) {
 	if len(argv) == 0 {
 		r.Err("ERR Unknown command or wrong number of arguments")
 		return
@@ -134,7 +140,15 @@ func commandGetKeys(cx *shard.Ctx, argv [][]byte, r shard.Reply) {
 	n := (end-first)/step + 1
 	out := resp.AppendArrayHeader(cx.Aux[:0], n)
 	for p := first; p <= end; p += step {
-		out = resp.AppendBulk(out, argv[p])
+		if withFlags {
+			// Each element is a two-element array: the key, then its flags array
+			// (empty, since f3 models no per-key access flags).
+			out = resp.AppendArrayHeader(out, 2)
+			out = resp.AppendBulk(out, argv[p])
+			out = resp.AppendArrayHeader(out, 0)
+		} else {
+			out = resp.AppendBulk(out, argv[p])
+		}
 	}
 	cx.Aux = out
 	r.Raw(out)
