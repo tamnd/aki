@@ -1,0 +1,6 @@
+type,n,elems,aki_kb,redis_kb,valkey_kb,aki_over_redis,aki_over_valkey,verdict
+zset,100000,8,34420,19132,18620,1.80,1.85,structural
+list,100000,8,31056,18208,16944,1.71,1.83,structural
+hash,100000,8,33584,21972,20860,1.53,1.61,structural
+stream,100000,8,59820,450832,442324,0.13,0.14,pass
+zset_pre_codec,100000,8,40776,19296,18548,2.11,2.20,structural
