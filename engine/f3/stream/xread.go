@@ -84,7 +84,10 @@ func Xread(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 					out = appendEntryReply(out, e.id, e.fields)
 					n++
 				}
-			} else {
+			} else if after.cmp(s.lastID) < 0 {
+				// An after-ID already at or above the last-added ID has nothing live
+				// above it, so a polling read from "$"/the tail skips the seek and walk
+				// entirely, the same not-newer short-circuit readAfter makes.
 				lo := bound{id: after, excl: true}
 				hi := bound{id: streamID{ms: ^uint64(0), seq: ^uint64(0)}}
 				s.eachForward(lo, hi, opts.count, func(id streamID, fields []field) {
@@ -312,8 +315,15 @@ func readAfterID(s *stream, idArg []byte) (after streamID, ok bool) {
 
 // readAfter returns up to count live entries with IDs strictly above afterID,
 // oldest first (count -1 is unbounded). It is XRANGE over the open window
-// (afterID, +inf].
+// (afterID, +inf]. An after-ID at or above the stream's last-added ID has nothing
+// live above it, so the read returns immediately without seeking and walking the
+// tail block: this is the drained cursor a polling XREAD (from "$"/the last ID) or
+// a caught-up XREADGROUP consumer (its group cursor at lastID) hits on every read
+// that finds no new entry, the O(1) not-newer check Redis makes before it walks.
 func (s *stream) readAfter(afterID streamID, count int) []rangeEntry {
+	if afterID.cmp(s.lastID) >= 0 {
+		return nil
+	}
 	lo := bound{id: afterID, excl: true}
 	hi := bound{id: streamID{ms: ^uint64(0), seq: ^uint64(0)}}
 	return s.collectRange(lo, hi, false, count)
