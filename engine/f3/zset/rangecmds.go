@@ -175,11 +175,14 @@ func streamWindow(cx *shard.Ctx, r shard.Reply, z *zset, lo, hiExcl int, rev, ws
 		r.Raw(resp.AppendArrayHeader(cx.Aux[:0], 0))
 		return
 	}
+	resp3 := r.Resp3()
 	n := b - a + 1
-	if ws {
+	if ws && !resp3 {
+		// RESP2 flattens each member/score into two elements; RESP3 nests each
+		// as a 2-element pair, so the outer count stays the member count.
 		n *= 2
 	}
-	out := z.rangeByRankWindow(resp.AppendArrayHeader(cx.Aux[:0], n), a, b, rev, ws)
+	out := z.rangeByRankWindow(resp.AppendArrayHeader(cx.Aux[:0], n), a, b, rev, ws, resp3)
 	cx.Aux = out
 	r.Raw(out)
 }

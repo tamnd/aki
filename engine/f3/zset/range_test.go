@@ -41,7 +41,7 @@ func rangeStrings(t *testing.T, z *zset, start, stop int, rev, withScores bool) 
 	if empty {
 		return nil
 	}
-	return decodeBulks(t, z.rangeByIndex(nil, lo, hi, rev, withScores))
+	return decodeBulks(t, z.rangeByIndex(nil, lo, hi, rev, withScores, false))
 }
 
 // modelRange is the reference: the sorted model sliced by Redis index semantics,

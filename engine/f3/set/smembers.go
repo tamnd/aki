@@ -21,8 +21,9 @@ import (
 // and off is how much of it has already gone out, so an element wider than a
 // chunk straddles the boundary without materializing more than itself.
 type membersStream struct {
-	ht   *htable
-	ords []uint32
+	ht    *htable
+	ords  []uint32
+	resp3 bool // frame the header as a RESP3 set (~) not an array
 
 	idx     int    // next snapshot ordinal to frame
 	buf     []byte // the element currently being emitted (header, then bulks)
@@ -47,7 +48,13 @@ func (m *membersStream) Next(dst []byte) (int, error) {
 		}
 		switch {
 		case !m.started:
-			m.buf = resp.AppendArrayHeader(m.buf[:0], len(m.ords))
+			// A set header (~n) is byte-for-byte the array header (*n) but for the
+			// leading rune, same count and width, so only the type byte changes.
+			if m.resp3 {
+				m.buf = resp.AppendSetHeader(m.buf[:0], len(m.ords))
+			} else {
+				m.buf = resp.AppendArrayHeader(m.buf[:0], len(m.ords))
+			}
 			m.started = true
 			m.off = 0
 		case m.idx < len(m.ords):
@@ -92,14 +99,14 @@ func (h *htable) membersTotal() int64 {
 // pinMembersStream snapshots the live draw-vector ordinals, pins the table, and
 // returns the stream source. The snapshot is 4 bytes per member, the only copy
 // the enumeration makes; the member bytes themselves are never duplicated.
-func (h *htable) pinMembersStream() *membersStream {
+func (h *htable) pinMembersStream(resp3 bool) *membersStream {
 	n := h.vlen()
 	ords := make([]uint32, n)
 	for i := 0; i < n; i++ {
 		ords[i] = h.ordAt(i)
 	}
 	h.pinStream()
-	return &membersStream{ht: h, ords: ords}
+	return &membersStream{ht: h, ords: ords, resp3: resp3}
 }
 
 // decLen is the decimal digit count of a non-negative n, for sizing a RESP

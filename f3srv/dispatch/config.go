@@ -110,7 +110,12 @@ func configGet(cx *shard.Ctx, patterns [][]byte, r shard.Reply) {
 			}
 		}
 	}
-	out := resp.AppendArrayHeader(cx.Aux[:0], len(matched)*2)
+	var out []byte
+	if r.Resp3() {
+		out = resp.AppendMapHeader(cx.Aux[:0], len(matched))
+	} else {
+		out = resp.AppendArrayHeader(cx.Aux[:0], len(matched)*2)
+	}
 	for _, name := range matched {
 		out = resp.AppendBulk(out, []byte(name))
 		out = resp.AppendBulk(out, []byte(configVals[name]))

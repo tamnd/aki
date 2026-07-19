@@ -43,7 +43,7 @@ func benchSMembers(b *testing.B, n int) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		src := s.ht.pinMembersStream()
+		src := s.ht.pinMembersStream(false)
 		for {
 			k, err := src.Next(dst)
 			if err != nil {

@@ -108,7 +108,10 @@ func IncrByFloat(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(storeErr(err))
 		return
 	}
-	r.Bulk(out)
+	// RESP3 renders the new value as a double (redis 8.8 addReplyHumanLongDouble),
+	// reusing the digits just computed rather than reformatting; RESP2 keeps the
+	// bulk string. DoubleBytes wraps out with the ',' framing under HELLO 3 only.
+	r.DoubleBytes(out)
 }
 
 // Append answers APPEND key value: extend the string in place under the

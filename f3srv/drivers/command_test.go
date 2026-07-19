@@ -46,7 +46,8 @@ func readRESP(t *testing.T, br *bufio.Reader) any {
 			t.Fatalf("bulk payload: %v", err)
 		}
 		return string(buf[:n])
-	case '*':
+	case '*', '>':
+		// Array and RESP3 push both carry n following values.
 		n, err := strconv.Atoi(body)
 		if err != nil {
 			t.Fatalf("array length %q: %v", body, err)
@@ -59,6 +60,43 @@ func readRESP(t *testing.T, br *bufio.Reader) any {
 			out[i] = readRESP(t, br)
 		}
 		return out
+	case '~':
+		// RESP3 set: n following values, decoded like an array so a test can
+		// compare members without caring about the container byte.
+		n, err := strconv.Atoi(body)
+		if err != nil {
+			t.Fatalf("set length %q: %v", body, err)
+		}
+		out := make([]any, n)
+		for i := range out {
+			out[i] = readRESP(t, br)
+		}
+		return out
+	case '%':
+		// RESP3 map: n pairs. Flattened to a 2n []any so helloFields and the
+		// other pair walkers read it exactly like the RESP2 array form.
+		n, err := strconv.Atoi(body)
+		if err != nil {
+			t.Fatalf("map length %q: %v", body, err)
+		}
+		out := make([]any, 0, n*2)
+		for i := 0; i < n; i++ {
+			out = append(out, readRESP(t, br), readRESP(t, br))
+		}
+		return out
+	case ',':
+		// RESP3 double: the shortest-form digits, returned as the string so a
+		// test can assert the exact rendering.
+		return body
+	case '#':
+		// RESP3 boolean.
+		return body == "t"
+	case '_':
+		// RESP3 null.
+		return nil
+	case '(':
+		// RESP3 big number, returned as its decimal string.
+		return body
 	default:
 		t.Fatalf("unknown RESP prefix %q", line)
 		return nil

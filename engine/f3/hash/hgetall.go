@@ -36,9 +36,10 @@ const (
 // cursor: for HGETALL element 2k is field k and 2k+1 is value k, for HKEYS/HVALS
 // element k is the one half of pair k.
 type enumStream struct {
-	ft   *ftable
-	ords []uint32
-	mode enumMode
+	ft    *ftable
+	ords  []uint32
+	mode  enumMode
+	pairs bool // frame the header as a RESP3 map (HGETALL under RESP3) not an array
 
 	total   int    // element count: 2*len(ords) for pairs, len(ords) otherwise
 	elem    int    // next element to frame
@@ -77,7 +78,13 @@ func (e *enumStream) Next(dst []byte) (int, error) {
 		}
 		switch {
 		case !e.started:
-			e.buf = resp.AppendArrayHeader(e.buf[:0], e.total)
+			if e.pairs {
+				// A RESP3 map header counts pairs, half the flat element count; the
+				// 2*card elements that follow are byte-identical to the array form.
+				e.buf = resp.AppendMapHeader(e.buf[:0], e.total/2)
+			} else {
+				e.buf = resp.AppendArrayHeader(e.buf[:0], e.total)
+			}
 			e.started = true
 			e.off = 0
 		case e.elem < e.total:
@@ -115,13 +122,20 @@ func (e *enumStream) Release() { e.ft.unpinStream() }
 // the array header plus every element's bulk frame. The handler needs it to decide
 // whether the reply is worth streaming and to commit the wire to a length before
 // the first chunk goes out.
-func (f *ftable) enumTotal(mode enumMode) int64 {
+func (f *ftable) enumTotal(mode enumMode, asMap bool) int64 {
 	n := f.drawLen()
 	elems := n
 	if mode == enumPairs {
 		elems = 2 * n
 	}
-	tot := int64(arrayHeaderLen(elems))
+	// A RESP3 map header is %<pairs>, whose digit width can differ from the array
+	// header *<2*pairs>, so the committed byte total counts the header actually
+	// emitted (asMap counts n pairs, the array counts elems elements).
+	hdr := arrayHeaderLen(elems)
+	if asMap {
+		hdr = arrayHeaderLen(n)
+	}
+	tot := int64(hdr)
 	for i := 0; i < n; i++ {
 		ord := f.ordAt(i)
 		if mode != enumVals {
@@ -137,7 +151,7 @@ func (f *ftable) enumTotal(mode enumMode) int64 {
 // pinEnumStream snapshots the live draw-vector ordinals, pins the table, and
 // returns the stream source. The snapshot is 4 bytes per field, the only copy the
 // enumeration makes; the field and value bytes themselves are never duplicated.
-func (f *ftable) pinEnumStream(mode enumMode) *enumStream {
+func (f *ftable) pinEnumStream(mode enumMode, asMap bool) *enumStream {
 	n := f.drawLen()
 	ords := make([]uint32, n)
 	for i := 0; i < n; i++ {
@@ -148,7 +162,7 @@ func (f *ftable) pinEnumStream(mode enumMode) *enumStream {
 	if mode == enumPairs {
 		total = 2 * n
 	}
-	return &enumStream{ft: f, ords: ords, mode: mode, total: total}
+	return &enumStream{ft: f, ords: ords, mode: mode, pairs: asMap, total: total}
 }
 
 // decLen is the decimal digit count of a non-negative n, for sizing a RESP frame

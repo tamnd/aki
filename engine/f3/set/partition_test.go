@@ -563,7 +563,7 @@ func TestPartitionMembersStream(t *testing.T) {
 		t.Fatalf("enc = %s, want partitioned", s.enc)
 	}
 	total := s.part.membersTotal()
-	src := s.part.pinMembersStream()
+	src := s.part.pinMembersStream(false)
 	defer src.Release()
 
 	dst := make([]byte, 37) // deliberately not a frame multiple

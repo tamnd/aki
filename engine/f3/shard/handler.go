@@ -258,10 +258,71 @@ func (r Reply) Bulk(v []byte) {
 	r.span(off)
 }
 
-// Null writes the RESP2 null bulk.
+// Resp3 reports whether the originating connection negotiated RESP3, so a handler
+// (or a type-package reply builder it calls) can pick the RESP3 frame shape over
+// its RESP2 sibling. A batch with no connection (an internal replay path) reads
+// false, the RESP2 default.
+func (r Reply) Resp3() bool { return r.b.conn != nil && r.b.conn.Resp3() }
+
+// Null writes the null reply in the connection's protocol: the RESP2 null bulk
+// $-1, or the RESP3 null _ when the connection negotiated RESP3.
 func (r Reply) Null() {
 	off := len(r.b.rep)
-	r.b.rep = resp.AppendNull(r.b.rep)
+	if r.b.conn != nil && r.b.conn.Resp3() {
+		r.b.rep = resp.AppendNull3(r.b.rep)
+	} else {
+		r.b.rep = resp.AppendNull(r.b.rep)
+	}
+	r.span(off)
+}
+
+// Double writes a numeric reply in the connection's protocol: a RESP2 bulk string
+// of the redis-formatted score digits, or a RESP3 double (,digits) when the
+// connection negotiated RESP3. The digits are FormatScore's, so ZSCORE and the
+// withscores pairs carry the same value bytes under both protocols. This is the
+// addReplyDouble path (ZSCORE, ZINCRBY, ZADD INCR); INCRBYFLOAT keeps its own
+// long-double digits and reframes them through DoubleBytes instead.
+func (r Reply) Double(v float64) {
+	off := len(r.b.rep)
+	if r.b.conn != nil && r.b.conn.Resp3() {
+		r.b.rep = resp.AppendDouble(r.b.rep, v)
+	} else {
+		var sc [40]byte
+		r.b.rep = resp.AppendBulk(r.b.rep, resp.FormatScore(sc[:0], v))
+	}
+	r.span(off)
+}
+
+// DoubleBytes writes an already-formatted numeric reply, reusing the caller's
+// digits rather than reformatting: a RESP2 bulk string, or a RESP3 double
+// (,digits) under RESP3. INCRBYFLOAT and HINCRBYFLOAT compute their own digits and
+// reframe them here so the RESP3 form carries the identical bytes the RESP2 bulk
+// would, only the frame differing.
+func (r Reply) DoubleBytes(digits []byte) {
+	off := len(r.b.rep)
+	if r.b.conn != nil && r.b.conn.Resp3() {
+		r.b.rep = resp.AppendDoubleBytes(r.b.rep, digits)
+	} else {
+		r.b.rep = resp.AppendBulk(r.b.rep, digits)
+	}
+	r.span(off)
+}
+
+// Bool writes a predicate reply in the connection's protocol: a RESP2 integer
+// (:1/:0), or a RESP3 boolean (#t/#f) when the connection negotiated RESP3. It is
+// the addReplyBool path: SISMEMBER, the EXPIRE family, SETNX, HSETNX, PERSIST,
+// COPY, RENAMENX, and the SMISMEMBER elements.
+func (r Reply) Bool(v bool) {
+	off := len(r.b.rep)
+	if r.b.conn != nil && r.b.conn.Resp3() {
+		r.b.rep = resp.AppendBool(r.b.rep, v)
+	} else {
+		n := int64(0)
+		if v {
+			n = 1
+		}
+		r.b.rep = resp.AppendInt(r.b.rep, n)
+	}
 	r.span(off)
 }
 

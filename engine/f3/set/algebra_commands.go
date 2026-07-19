@@ -48,7 +48,7 @@ func emitArray(cx *shard.Ctx, r shard.Reply, drive func(emit func(m []byte))) {
 		n++
 	})
 	cx.Val = page
-	out := resp.AppendArrayHeader(cx.Aux[:0], n)
+	out := setHeader(cx.Aux[:0], n, r.Resp3())
 	out = append(out, page...)
 	cx.Aux = out
 	r.Raw(out)

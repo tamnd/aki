@@ -1,6 +1,8 @@
 package zset
 
 import (
+	"math"
+
 	"github.com/tamnd/aki/engine/f3/shard"
 	"github.com/tamnd/aki/f3srv/resp"
 )
@@ -156,14 +158,17 @@ func gatherZ(g *reg, cx *shard.Ctx, spec *algebraSpec) (ops []operand, wrong boo
 // emitScored streams the aggregated result into the shard scratch as a flat
 // multi-bulk reply, member then score when withScores, and hands it over whole.
 func emitScored(cx *shard.Ctx, r shard.Reply, pairs []scoredMember, withScores bool) {
+	resp3 := r.Resp3()
 	page := cx.Val[:0]
 	var sc [40]byte
 	n := 0
 	for _, p := range pairs {
-		page = resp.AppendBulk(page, p.member)
+		// RESP2 flattens member then score; RESP3 nests each WITHSCORES element
+		// as a 2-element [member, score-as-double] pair, so the outer count is
+		// the member count either way under RESP3.
+		page = appendRangeElem(page, p.member, math.Float64bits(p.score), withScores, resp3, sc[:])
 		n++
-		if withScores {
-			page = resp.AppendBulk(page, resp.FormatScore(sc[:0], p.score))
+		if withScores && !resp3 {
 			n++
 		}
 	}

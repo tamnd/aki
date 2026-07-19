@@ -91,8 +91,7 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 				r.Null()
 				return
 			}
-			var sc [40]byte
-			r.Bulk(resp.FormatScore(sc[:0], newScore))
+			r.Double(newScore)
 			return
 		}
 	}
@@ -191,13 +190,12 @@ func Zincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		g.install(cx, key, z)
 	}
 	g.grewNote(cx, key, z)
-	var sc [40]byte
-	r.Bulk(resp.FormatScore(sc[:0], newScore))
+	r.Double(newScore)
 }
 
-// Zscore answers ZSCORE key member: the member's score formatted as a bulk
-// string, nil when the member or key is absent. It never allocates on the
-// present path over an inline band.
+// Zscore answers ZSCORE key member: the member's score, a RESP2 bulk string of
+// the formatted digits or a RESP3 double, nil when the member or key is absent.
+// It never allocates on the present path over an inline band.
 func Zscore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
 	z, wrong := g.lookup(cx, args[0])
@@ -214,8 +212,7 @@ func Zscore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Null()
 		return
 	}
-	var sc [40]byte
-	r.Bulk(resp.FormatScore(sc[:0], s))
+	r.Double(s)
 }
 
 // Zmscore answers ZMSCORE key member [member ...]: an array of scores in
@@ -471,11 +468,14 @@ func zrangeByIndex(cx *shard.Ctx, args [][]byte, r shard.Reply, rev, withScores 
 		r.Raw(resp.AppendArrayHeader(cx.Aux[:0], 0))
 		return
 	}
+	resp3 := r.Resp3()
 	n := hi - lo + 1
-	if withScores {
+	if withScores && !resp3 {
+		// RESP2 flattens each member/score into two elements; RESP3 nests each
+		// as a 2-element pair, so the outer count stays the member count.
 		n *= 2
 	}
-	out := z.rangeByIndex(resp.AppendArrayHeader(cx.Aux[:0], n), lo, hi, rev, withScores)
+	out := z.rangeByIndex(resp.AppendArrayHeader(cx.Aux[:0], n), lo, hi, rev, withScores, resp3)
 	cx.Aux = out
 	r.Raw(out)
 }

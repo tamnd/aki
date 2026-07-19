@@ -199,14 +199,28 @@ func (r *pubsubRegistry) publish(channel string, message []byte) int {
 	}
 	r.mu.Unlock()
 
+	// The subscriber set can mix RESP2 and RESP3 connections, so each frame is
+	// built at most once per protocol and reused: the RESP2 wire is the *3 array,
+	// the RESP3 wire the >3 push, picked per subscriber from its negotiated
+	// version. A single-protocol fan-out (the common case) still builds one wire.
 	if len(chanTargets) > 0 {
-		wire := appendMessage(nil, channel, message)
+		var wire2, wire3 []byte
 		for _, sc := range chanTargets {
-			sc.DeliverOOB(wire)
+			if sc.Resp3() {
+				if wire3 == nil {
+					wire3 = appendMessage(nil, channel, message, true)
+				}
+				sc.DeliverOOB(wire3)
+			} else {
+				if wire2 == nil {
+					wire2 = appendMessage(nil, channel, message, false)
+				}
+				sc.DeliverOOB(wire2)
+			}
 		}
 	}
 	for _, t := range patTargets {
-		t.sc.DeliverOOB(appendPMessage(nil, t.pattern, channel, message))
+		t.sc.DeliverOOB(appendPMessage(nil, t.pattern, channel, message, t.sc.Resp3()))
 	}
 	return len(chanTargets) + len(patTargets)
 }
@@ -260,9 +274,19 @@ func (r *pubsubRegistry) spublish(channel string, message []byte) int {
 	r.mu.Unlock()
 
 	if len(targets) > 0 {
-		wire := appendSMessage(nil, channel, message)
+		var wire2, wire3 []byte
 		for _, sc := range targets {
-			sc.DeliverOOB(wire)
+			if sc.Resp3() {
+				if wire3 == nil {
+					wire3 = appendSMessage(nil, channel, message, true)
+				}
+				sc.DeliverOOB(wire3)
+			} else {
+				if wire2 == nil {
+					wire2 = appendSMessage(nil, channel, message, false)
+				}
+				sc.DeliverOOB(wire2)
+			}
 		}
 	}
 	return len(targets)
@@ -360,8 +384,10 @@ func (s *Server) pubsubIntercept(c *shard.Conn, cs *connState, args [][]byte) bo
 	// subscribe family plus PING/QUIT/RESET; anything else is refused in order.
 	// PING is allowed and falls through to the shard hop, which answers it
 	// normally. QUIT and RESET are not registered in f3, so they fall through to
-	// the unknown-command answer they already give, a pre-existing gap.
-	if cs.inSubscribeMode() && !subscribeModeAllowed(args[0]) {
+	// the unknown-command answer they already give, a pre-existing gap. A RESP3
+	// connection carries pushes out of band, so it stays fully usable for ordinary
+	// commands while subscribed and the restriction does not apply, matching redis.
+	if !c.Resp3() && cs.inSubscribeMode() && !subscribeModeAllowed(args[0]) {
 		_ = c.InlineReply(resp.AppendError(nil,
 			"ERR Can't execute '"+lowerVerb(args[0])+"': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"))
 		return true
@@ -392,7 +418,7 @@ func (s *Server) doSubscribe(c *shard.Conn, cs *connState, args [][]byte) {
 	}
 	for _, ch := range args[1:] {
 		n := s.pubsub.subscribe(cs, string(ch))
-		_ = c.InlineReply(appendSubConfirm(nil, "subscribe", ch, n))
+		_ = c.InlineReply(appendSubConfirm(nil, "subscribe", ch, n, c.Resp3()))
 	}
 }
 
@@ -404,12 +430,12 @@ func (s *Server) doUnsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
 	if len(args) >= 2 {
 		for _, ch := range args[1:] {
 			n := s.pubsub.unsubscribe(cs, string(ch))
-			_ = c.InlineReply(appendSubConfirm(nil, "unsubscribe", ch, n))
+			_ = c.InlineReply(appendSubConfirm(nil, "unsubscribe", ch, n, c.Resp3()))
 		}
 		return
 	}
 	if len(cs.subs) == 0 {
-		_ = c.InlineReply(appendUnsubNil(nil))
+		_ = c.InlineReply(appendUnsubNil(nil, c.Resp3()))
 		return
 	}
 	held := make([]string, 0, len(cs.subs))
@@ -418,7 +444,7 @@ func (s *Server) doUnsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
 	}
 	for _, ch := range held {
 		n := s.pubsub.unsubscribe(cs, ch)
-		_ = c.InlineReply(appendSubConfirm(nil, "unsubscribe", []byte(ch), n))
+		_ = c.InlineReply(appendSubConfirm(nil, "unsubscribe", []byte(ch), n, c.Resp3()))
 	}
 }
 
@@ -431,7 +457,7 @@ func (s *Server) doPsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
 	}
 	for _, pat := range args[1:] {
 		n := s.pubsub.psubscribe(cs, string(pat))
-		_ = c.InlineReply(appendSubConfirm(nil, "psubscribe", pat, n))
+		_ = c.InlineReply(appendSubConfirm(nil, "psubscribe", pat, n, c.Resp3()))
 	}
 }
 
@@ -443,12 +469,12 @@ func (s *Server) doPunsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
 	if len(args) >= 2 {
 		for _, pat := range args[1:] {
 			n := s.pubsub.punsubscribe(cs, string(pat))
-			_ = c.InlineReply(appendSubConfirm(nil, "punsubscribe", pat, n))
+			_ = c.InlineReply(appendSubConfirm(nil, "punsubscribe", pat, n, c.Resp3()))
 		}
 		return
 	}
 	if len(cs.psubs) == 0 {
-		_ = c.InlineReply(appendPunsubNil(nil))
+		_ = c.InlineReply(appendPunsubNil(nil, c.Resp3()))
 		return
 	}
 	held := make([]string, 0, len(cs.psubs))
@@ -457,7 +483,7 @@ func (s *Server) doPunsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
 	}
 	for _, pat := range held {
 		n := s.pubsub.punsubscribe(cs, pat)
-		_ = c.InlineReply(appendSubConfirm(nil, "punsubscribe", []byte(pat), n))
+		_ = c.InlineReply(appendSubConfirm(nil, "punsubscribe", []byte(pat), n, c.Resp3()))
 	}
 }
 
@@ -472,7 +498,7 @@ func (s *Server) doSsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
 	}
 	for _, ch := range args[1:] {
 		n := s.pubsub.ssubscribe(cs, string(ch))
-		_ = c.InlineReply(appendSubConfirm(nil, "ssubscribe", ch, n))
+		_ = c.InlineReply(appendSubConfirm(nil, "ssubscribe", ch, n, c.Resp3()))
 	}
 }
 
@@ -484,12 +510,12 @@ func (s *Server) doSunsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
 	if len(args) >= 2 {
 		for _, ch := range args[1:] {
 			n := s.pubsub.sunsubscribe(cs, string(ch))
-			_ = c.InlineReply(appendSubConfirm(nil, "sunsubscribe", ch, n))
+			_ = c.InlineReply(appendSubConfirm(nil, "sunsubscribe", ch, n, c.Resp3()))
 		}
 		return
 	}
 	if len(cs.ssubs) == 0 {
-		_ = c.InlineReply(appendSunsubNil(nil))
+		_ = c.InlineReply(appendSunsubNil(nil, c.Resp3()))
 		return
 	}
 	held := make([]string, 0, len(cs.ssubs))
@@ -498,7 +524,7 @@ func (s *Server) doSunsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
 	}
 	for _, ch := range held {
 		n := s.pubsub.sunsubscribe(cs, ch)
-		_ = c.InlineReply(appendSubConfirm(nil, "sunsubscribe", []byte(ch), n))
+		_ = c.InlineReply(appendSubConfirm(nil, "sunsubscribe", []byte(ch), n, c.Resp3()))
 	}
 }
 
@@ -578,10 +604,33 @@ func (s *Server) doPubsub(c *shard.Conn, args [][]byte) {
 	}
 }
 
-// appendMessage builds the unsolicited message push: a three-element array of
+// pubsubHeader writes the header of a pub/sub frame of n elements: a RESP3 push
+// header (>n) when the connection negotiated RESP3, else the RESP2 array header
+// (*n) the same n elements carry otherwise. Under RESP3 both the unsolicited
+// messages and the subscribe confirmations ride push frames so a subscribed
+// connection stays usable for ordinary command replies, matching redis's
+// addReplyPushLen call sites; under RESP2 they are indistinguishable arrays, the
+// pre-RESP3 shape.
+func pubsubHeader(dst []byte, n int, resp3 bool) []byte {
+	if resp3 {
+		return resp.AppendPushHeader(dst, n)
+	}
+	return resp.AppendArrayHeader(dst, n)
+}
+
+// pubsubNil writes the nil channel slot of a from-nothing confirmation: the
+// RESP3 null (_) under RESP3, else the RESP2 null bulk ($-1).
+func pubsubNil(dst []byte, resp3 bool) []byte {
+	if resp3 {
+		return resp.AppendNull3(dst)
+	}
+	return resp.AppendNull(dst)
+}
+
+// appendMessage builds the unsolicited message push: a three-element frame of
 // "message", the channel, and the payload.
-func appendMessage(dst []byte, channel string, message []byte) []byte {
-	dst = resp.AppendArrayHeader(dst, 3)
+func appendMessage(dst []byte, channel string, message []byte, resp3 bool) []byte {
+	dst = pubsubHeader(dst, 3, resp3)
 	dst = resp.AppendBulk(dst, []byte("message"))
 	dst = resp.AppendBulk(dst, []byte(channel))
 	dst = resp.AppendBulk(dst, message)
@@ -589,9 +638,9 @@ func appendMessage(dst []byte, channel string, message []byte) []byte {
 }
 
 // appendPMessage builds the unsolicited pattern message push: a four-element
-// array of "pmessage", the pattern that matched, the channel, and the payload.
-func appendPMessage(dst []byte, pattern, channel string, message []byte) []byte {
-	dst = resp.AppendArrayHeader(dst, 4)
+// frame of "pmessage", the pattern that matched, the channel, and the payload.
+func appendPMessage(dst []byte, pattern, channel string, message []byte, resp3 bool) []byte {
+	dst = pubsubHeader(dst, 4, resp3)
 	dst = resp.AppendBulk(dst, []byte("pmessage"))
 	dst = resp.AppendBulk(dst, []byte(pattern))
 	dst = resp.AppendBulk(dst, []byte(channel))
@@ -600,10 +649,10 @@ func appendPMessage(dst []byte, pattern, channel string, message []byte) []byte 
 }
 
 // appendSMessage builds the unsolicited shard message push: a three-element
-// array of "smessage", the shard channel, and the payload. It mirrors the
+// frame of "smessage", the shard channel, and the payload. It mirrors the
 // regular message push with the shard-specific kind.
-func appendSMessage(dst []byte, channel string, message []byte) []byte {
-	dst = resp.AppendArrayHeader(dst, 3)
+func appendSMessage(dst []byte, channel string, message []byte, resp3 bool) []byte {
+	dst = pubsubHeader(dst, 3, resp3)
 	dst = resp.AppendBulk(dst, []byte("smessage"))
 	dst = resp.AppendBulk(dst, []byte(channel))
 	dst = resp.AppendBulk(dst, message)
@@ -612,8 +661,8 @@ func appendSMessage(dst []byte, channel string, message []byte) []byte {
 
 // appendSubConfirm builds a subscribe or unsubscribe confirmation: the kind, the
 // channel, and the connection's running subscription count.
-func appendSubConfirm(dst []byte, kind string, channel []byte, count int) []byte {
-	dst = resp.AppendArrayHeader(dst, 3)
+func appendSubConfirm(dst []byte, kind string, channel []byte, count int, resp3 bool) []byte {
+	dst = pubsubHeader(dst, 3, resp3)
 	dst = resp.AppendBulk(dst, []byte(kind))
 	dst = resp.AppendBulk(dst, channel)
 	dst = resp.AppendInt(dst, int64(count))
@@ -622,30 +671,30 @@ func appendSubConfirm(dst []byte, kind string, channel []byte, count int) []byte
 
 // appendUnsubNil builds the UNSUBSCRIBE-from-nothing confirmation: "unsubscribe",
 // a nil channel, and count zero.
-func appendUnsubNil(dst []byte) []byte {
-	dst = resp.AppendArrayHeader(dst, 3)
+func appendUnsubNil(dst []byte, resp3 bool) []byte {
+	dst = pubsubHeader(dst, 3, resp3)
 	dst = resp.AppendBulk(dst, []byte("unsubscribe"))
-	dst = resp.AppendNull(dst)
+	dst = pubsubNil(dst, resp3)
 	dst = resp.AppendInt(dst, 0)
 	return dst
 }
 
 // appendPunsubNil builds the PUNSUBSCRIBE-from-nothing confirmation:
 // "punsubscribe", a nil pattern, and count zero.
-func appendPunsubNil(dst []byte) []byte {
-	dst = resp.AppendArrayHeader(dst, 3)
+func appendPunsubNil(dst []byte, resp3 bool) []byte {
+	dst = pubsubHeader(dst, 3, resp3)
 	dst = resp.AppendBulk(dst, []byte("punsubscribe"))
-	dst = resp.AppendNull(dst)
+	dst = pubsubNil(dst, resp3)
 	dst = resp.AppendInt(dst, 0)
 	return dst
 }
 
 // appendSunsubNil builds the SUNSUBSCRIBE-from-nothing confirmation:
 // "sunsubscribe", a nil channel, and count zero.
-func appendSunsubNil(dst []byte) []byte {
-	dst = resp.AppendArrayHeader(dst, 3)
+func appendSunsubNil(dst []byte, resp3 bool) []byte {
+	dst = pubsubHeader(dst, 3, resp3)
 	dst = resp.AppendBulk(dst, []byte("sunsubscribe"))
-	dst = resp.AppendNull(dst)
+	dst = pubsubNil(dst, resp3)
 	dst = resp.AppendInt(dst, 0)
 	return dst
 }
