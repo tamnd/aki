@@ -35,7 +35,10 @@ func Xreadgroup(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 
 	g := registry(cx)
-	results := make([]groupResult, 0, len(keys))
+	// Allocate the results slice only once a stream actually produces entries, so a
+	// drained `>` poll (the caught-up consumer that reads nil on every call) returns
+	// the null array without an allocation on its hot path.
+	var results []groupResult
 	for j := range keys {
 		s, wrong := g.lookup(cx, keys[j])
 		if wrong {
@@ -56,6 +59,9 @@ func Xreadgroup(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		if isGreaterToken(ids[j]) {
 			entries := grp.deliverNew(s, con, opts.count, opts.noack, cx.NowMs)
 			if len(entries) > 0 {
+				if results == nil {
+					results = make([]groupResult, 0, len(keys))
+				}
 				results = append(results, groupResult{key: keys[j], entries: entries})
 			}
 			// A `>` delivery records the entries in the group PEL (unless NOACK) and may
