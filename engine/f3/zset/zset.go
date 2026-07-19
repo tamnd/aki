@@ -2,7 +2,6 @@ package zset
 
 import (
 	"bytes"
-	"encoding/binary"
 	"math"
 
 	"github.com/tamnd/aki/engine/f3/store"
@@ -155,7 +154,7 @@ func (z *zset) listpackIndex(m []byte) int {
 		if b[i+1] == tag && n == len(m) && bytes.Equal(b[start:start+n], m) {
 			return i
 		}
-		i = start + n + 8
+		i = start + n + scoreWidthAt(b, start+n)
 	}
 	return -1
 }
@@ -427,12 +426,12 @@ func (z *zset) appendInlineSorted(m []byte, score float64) {
 		score = 0 // -0.0 collapses, matching Redis's listpack int encoding
 	}
 	off := len(z.blob)
-	entryLen := 2 + len(m) + 8
+	entryLen := 2 + len(m) + encScoreWidth(score)
 	z.blob = append(z.blob, make([]byte, entryLen)...)
 	z.blob[off] = byte(len(m))
 	z.blob[off+1] = tagOf(m)
 	copy(z.blob[off+2:], m)
-	binary.BigEndian.PutUint64(z.blob[off+2+len(m):], math.Float64bits(score))
+	putScore(z.blob[off+2+len(m):], score)
 	z.n++
 }
 
@@ -709,13 +708,13 @@ func (z *zset) listpackInsert(m []byte, score float64) {
 		score = 0 // -0.0 collapses, matching Redis's listpack int encoding
 	}
 	off := z.listpackSeek(m, score)
-	entryLen := 2 + len(m) + 8
+	entryLen := 2 + len(m) + encScoreWidth(score)
 	z.blob = append(z.blob, make([]byte, entryLen)...)
 	copy(z.blob[off+entryLen:], z.blob[off:])
 	z.blob[off] = byte(len(m))
 	z.blob[off+1] = tagOf(m)
 	copy(z.blob[off+2:], m)
-	binary.BigEndian.PutUint64(z.blob[off+2+len(m):], math.Float64bits(score))
+	putScore(z.blob[off+2+len(m):], score)
 	z.n++
 }
 
@@ -740,7 +739,8 @@ func (z *zset) listpackRemove(m []byte) bool {
 	if i < 0 {
 		return false
 	}
-	end := i + 2 + int(z.blob[i]) + 8
+	n := int(z.blob[i])
+	end := i + 2 + n + scoreWidthAt(z.blob, i+2+n)
 	z.blob = append(z.blob[:i], z.blob[end:]...)
 	z.n--
 	return true
@@ -770,8 +770,9 @@ func decodeEntry(b []byte, i int) (member []byte, score float64, next int) {
 	n := int(b[i])
 	start := i + 2
 	member = b[start : start+n]
-	score = math.Float64frombits(binary.BigEndian.Uint64(b[start+n:]))
-	next = start + n + 8
+	sc, w := readScore(b[start+n:])
+	score = sc
+	next = start + n + w
 	return
 }
 
