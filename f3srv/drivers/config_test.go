@@ -54,9 +54,11 @@ func TestConfigSetRoundTrips(t *testing.T) {
 	if got := sendCmd(t, br, nc, "CONFIG", "SET", "maxmemory", "100mb"); got != "OK" {
 		t.Fatalf("CONFIG SET maxmemory = %v, want OK", got)
 	}
+	// maxmemory is a live parameter now: SET normalizes the suffixed quantity to a
+	// decimal byte count, so GET reads it back as bytes the way redis does.
 	reply := sendCmd(t, br, nc, "CONFIG", "GET", "maxmemory").([]any)
-	if reply[1] != "100mb" {
-		t.Fatalf("after SET, maxmemory = %v, want 100mb", reply[1])
+	if reply[1] != "104857600" {
+		t.Fatalf("after SET maxmemory 100mb, GET = %v, want the byte count 104857600", reply[1])
 	}
 
 	// An unknown parameter in a multi-pair SET errors and leaves the known pair

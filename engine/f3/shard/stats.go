@@ -33,6 +33,7 @@ const (
 	StatBackpressureStalls
 	StatVolatileKeys
 	StatExpiredKeys
+	StatEvictedKeys
 	NumStats
 )
 
@@ -59,6 +60,7 @@ var statNames = [NumStats]string{
 	StatBackpressureStalls: "backpressure_stalls",
 	StatVolatileKeys:       "volatile_keys",
 	StatExpiredKeys:        "expired_keys",
+	StatEvictedKeys:        "evicted_keys",
 }
 
 // memDoctorFloor is the used-memory figure MEMORY DOCTOR needs to see before it

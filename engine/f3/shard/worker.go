@@ -75,6 +75,15 @@ type worker struct {
 	// behind this func the way the handlers table lives behind Use.
 	demoteColl func(*Ctx) int
 
+	// evictor is the maxmemory eviction hook Runtime.UseEvictor registered
+	// (evictcycle.go), nil on a runtime that wants no eviction. The boundary calls
+	// it through runEvict; the hook self-gates on the live maxmemory setting, so a
+	// store that never sets maxmemory pays one nil check plus the hook's leading
+	// load per boundary. The server layer owns the policy and the cross-keyspace
+	// victim walk behind it, the way demoteColl owns the demotion policy, because
+	// the shard cannot import the type packages.
+	evictor func(*Ctx) int
+
 	// cx is the worker's handler context, one per shard for its whole life:
 	// the store, the per-batch clock, and the value scratch whose grown
 	// capacity carries across commands so the steady path allocates nothing.
@@ -139,6 +148,12 @@ type worker struct {
 	// cadence gate that keeps a rapidly draining shard from sweeping every boundary.
 	expiredKeys  uint64
 	lastExpireMs int64
+
+	// evictedKeys is the cumulative count of keys this shard's maxmemory eviction
+	// passes have shed (evictcycle.go, runEvict), the figure INFO sums across shards
+	// as evicted_keys. Owner-goroutine single-writer counter, zero until the first
+	// eviction fires.
+	evictedKeys uint64
 }
 
 func newWorker(id int, st *store.Store) *worker {
@@ -215,6 +230,13 @@ func (w *worker) run() {
 			if w.demoteColl != nil {
 				w.demoteColl(&w.cx)
 			}
+			// Shed maxmemory eviction victims when the shard sits over its budget
+			// share (evictcycle.go). This is the boundary that matters under a
+			// sustained write burst: the queue never drains, so the idle branch
+			// below never fires, and a memory-bounded cache must evict here or grow
+			// past its budget. The hook self-gates on maxmemory, so a store that
+			// never sets it pays one nil check plus the hook's leading load.
+			w.runEvict()
 			w.drainCold()
 			// Park the segments this boundary's drains emptied on the epoch
 			// retire list before the compactor runs, so it leaves them alone
@@ -249,6 +271,10 @@ func (w *worker) run() {
 			w.maybeCompact()
 			w.runMaintainer()
 			w.runActiveExpire()
+			// The quiesced half of eviction: a shard that went over its budget and
+			// then fell idle sheds down here too, so a poll (DBSIZE, INFO) that wakes
+			// the shard brings it back under budget even with no writes arriving.
+			w.runEvict()
 			if len(w.fullWaiters) > 0 && !w.st.ColdDraining() {
 				// Writes are parked but no drain is in flight or pending, so no
 				// completion would wake the worker to retry them. Try a backpressure
