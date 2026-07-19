@@ -92,6 +92,7 @@ func expireGeneric(cx *shard.Ctx, args [][]byte, r shard.Reply, cmd string, unit
 
 	now := uint64(cx.NowMs)
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(fields))
+	var setAny, delAny bool
 	for _, f := range fields {
 		code := applyExpiry(h, f, at, cond, now)
 		out = resp.AppendInt(out, code)
@@ -101,15 +102,28 @@ func expireGeneric(cx *shard.Ctx, args [][]byte, r shard.Reply, cmd string, unit
 		switch code {
 		case 1:
 			logFieldExpire(cx, args[0], f, at)
+			setAny = true
 		case 2:
 			logDelField(cx, args[0], f)
+			delAny = true
 		}
 	}
 	cx.Aux = out
+	// One hexpire event per command when it set at least one field TTL, and an hdel
+	// when a set-to-the-past deleted a field synchronously, the same hdel HDEL fires.
+	if setAny {
+		cx.NotifyKeyspaceEvent(shard.NotifyHash, "hexpire", args[0])
+	}
+	if delAny {
+		cx.NotifyKeyspaceEvent(shard.NotifyHash, "hdel", args[0])
+	}
 	if h.card() == 0 {
 		// The last field expired on the spot (a set-to-the-past); Redis drops the
 		// hash the moment it empties.
 		g.drop(args[0])
+		if delAny {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
+		}
 	} else {
 		// A set-to-the-past deleted a field, or the first field TTL flipped an inline
 		// hash to its wider listpackex blob; either way the footprint may have moved,
@@ -255,6 +269,7 @@ func Hpersist(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(fields))
+	var clearedAny bool
 	for _, f := range fields {
 		code := persistField(h, f)
 		out = resp.AppendInt(out, code)
@@ -262,9 +277,14 @@ func Hpersist(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		// replay drops the deadline instead of restoring it from an earlier effect.
 		if code == 1 {
 			logFieldExpire(cx, args[0], f, 0)
+			clearedAny = true
 		}
 	}
 	cx.Aux = out
+	// One hpersist event per command when it cleared at least one field TTL.
+	if clearedAny {
+		cx.NotifyKeyspaceEvent(shard.NotifyHash, "hpersist", args[0])
+	}
 	r.Raw(out)
 }
 
@@ -330,22 +350,38 @@ func Hgetex(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 	}
 	cx.Aux = out
+	var setAny, delAny, clearedAny bool
 	switch mode {
 	case getexSet:
 		for _, f := range fields {
 			switch applyExpiry(h, f, at, condNone, now) {
 			case 1:
 				logFieldExpire(cx, args[0], f, at)
+				setAny = true
 			case 2:
 				logDelField(cx, args[0], f)
+				delAny = true
 			}
 		}
 	case getexPersist:
 		for _, f := range fields {
 			if persistField(h, f) == 1 {
 				logFieldExpire(cx, args[0], f, 0)
+				clearedAny = true
 			}
 		}
+	}
+	// HGETEX's TTL side-effect fires the same events its dedicated commands do: a
+	// set fires hexpire (with hdel for a set-to-the-past deletion), PERSIST fires
+	// hpersist.
+	if setAny {
+		cx.NotifyKeyspaceEvent(shard.NotifyHash, "hexpire", args[0])
+	}
+	if delAny {
+		cx.NotifyKeyspaceEvent(shard.NotifyHash, "hdel", args[0])
+	}
+	if clearedAny {
+		cx.NotifyKeyspaceEvent(shard.NotifyHash, "hpersist", args[0])
 	}
 	// A read-only HGETEX changes no footprint, but a TTL set may have flipped the
 	// hash to its listpackex blob or deleted a set-to-the-past field, so reconcile
@@ -353,6 +389,9 @@ func Hgetex(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if mode != getexNone {
 		if h.card() == 0 {
 			g.drop(args[0])
+			if delAny {
+				cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
+			}
 		} else {
 			g.note(h)
 		}

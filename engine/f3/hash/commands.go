@@ -43,6 +43,9 @@ func Hset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		logSet(cx, args[0], args[i], args[i+1])
 	}
 	g.note(h)
+	// One hset event per command, the redis shape (not one per field). A valid HSET
+	// always writes at least one pair, so it always fires.
+	cx.NotifyKeyspaceEvent(shard.NotifyHash, "hset", args[0])
 	r.Int(added)
 }
 
@@ -66,6 +69,8 @@ func Hmset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		logSet(cx, args[0], args[i], args[i+1])
 	}
 	g.note(h)
+	// HMSET fires the same hset event as HSET.
+	cx.NotifyKeyspaceEvent(shard.NotifyHash, "hset", args[0])
 	r.Status("OK")
 }
 
@@ -83,6 +88,7 @@ func Hsetnx(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if h.setNX(args[1], args[2]) {
 		logSet(cx, args[0], args[1], args[2])
 		g.note(h)
+		cx.NotifyKeyspaceEvent(shard.NotifyHash, "hset", args[0])
 		r.Int(1)
 		return
 	}
@@ -161,18 +167,28 @@ func Hgetdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Raw(out)
 		return
 	}
+	var deleted bool
 	for _, f := range fields {
 		if v, ok := h.get(f); ok {
 			out = resp.AppendBulk(out, v)
 			h.del(f)
 			logDelField(cx, args[0], f)
+			deleted = true
 		} else {
 			out = resp.AppendNull(out)
 		}
 	}
 	cx.Aux = out
+	// HGETDEL fires one hdel event when it removed at least one field, then the
+	// generic del if that emptied the hash, the same pair HDEL fires.
+	if deleted {
+		cx.NotifyKeyspaceEvent(shard.NotifyHash, "hdel", args[0])
+	}
 	if h.card() == 0 {
 		g.drop(args[0])
+		if deleted {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
+		}
 	} else {
 		g.note(h)
 	}
@@ -247,8 +263,16 @@ func Hdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			logDelField(cx, args[0], f)
 		}
 	}
+	// One hdel event per command when it removed at least one field, then the
+	// generic del if the last field left.
+	if removed > 0 {
+		cx.NotifyKeyspaceEvent(shard.NotifyHash, "hdel", args[0])
+	}
 	if h.card() == 0 {
 		g.drop(args[0])
+		if removed > 0 {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
+		}
 	} else {
 		g.note(h)
 	}
