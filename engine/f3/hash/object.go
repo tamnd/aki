@@ -29,6 +29,20 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	list.Object(cx, args, r)
 }
 
+// Encoding reports the OBJECT ENCODING name for the hash at key on this shard,
+// listpack, listpackex once a field has taken a TTL, or hashtable per its live
+// band, and whether a hash lives there at all. It is the value-returning form the
+// DEBUG OBJECT line needs, reached through regs.Load so a read-only probe builds no
+// hash registry on a shard that never ran a hash command.
+func Encoding(cx *shard.Ctx, key []byte) (string, bool) {
+	if v, ok := regs.Load(cx.St); ok {
+		if h := v.(*reg).peek(cx, key); h != nil {
+			return h.encName(), true
+		}
+	}
+	return "", false
+}
+
 // MemoryUsage reports the approximate resident bytes the hash at key charges and
 // whether a hash lives there, the MEMORY USAGE contribution for a hash key. It is
 // the per-collection footprint the demote loop weighs, reached through regs.Load
