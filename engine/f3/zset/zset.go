@@ -460,6 +460,43 @@ func (z *zset) rank(m []byte) (int, float64, bool) {
 	return idx, sc, true
 }
 
+// natAppendWindow frames the native-band rank window [lo, hi] straight into out
+// as RESP bulk strings, driving a callback-free rank cursor so the member append
+// stays inlined: no per-element closure, and no score read at all unless
+// withScores wants it (a plain ZRANGE otherwise pays a discarded leaf-score load
+// per element, the cost labs/f3/m2/08 measured). Scores print from the record's
+// raw bits, the sign-of-zero source of truth, matching the closure path exactly.
+// When rev the window is emitted high-to-low via the reverse cursor.
+func (n *nativeStore) natAppendWindow(out []byte, lo, hi int, rev, withScores bool) []byte {
+	n.maybeColocate(hi - lo + 1)
+	remaining := hi - lo + 1
+	var sc [40]byte
+	if rev {
+		cur := n.tree.SeekRankRev(uint64(hi))
+		for remaining > 0 && cur.Valid() {
+			r := &n.recs[cur.Ref()]
+			out = resp.AppendBulk(out, n.bytesOf(r))
+			if withScores {
+				out = resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(r.bits)))
+			}
+			remaining--
+			cur.Next()
+		}
+		return out
+	}
+	cur := n.tree.SeekRank(uint64(lo))
+	for remaining > 0 && cur.Valid() {
+		r := &n.recs[cur.Ref()]
+		out = resp.AppendBulk(out, n.bytesOf(r))
+		if withScores {
+			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(r.bits)))
+		}
+		remaining--
+		cur.Next()
+	}
+	return out
+}
+
 // rangeByIndex streams the members at ranks lo..hi inclusive (already clamped)
 // into out as RESP bulk strings, with each score appended when withScores, and
 // returns the grown buffer. When rev the window is emitted high-to-low, the
@@ -470,24 +507,22 @@ func (z *zset) rank(m []byte) (int, float64, bool) {
 // "0". out is the shard scratch, reused across commands, so a warm buffer grows
 // for none of the window's elements.
 func (z *zset) rangeByIndex(out []byte, lo, hi int, rev, withScores bool) []byte {
-	var sc [40]byte
-	emit := func(m []byte, bits uint64) {
-		out = resp.AppendBulk(out, m)
-		if withScores {
-			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(bits)))
-		}
-	}
 	if z.enc == encSkiplist {
 		if rev {
 			// The window indexes the reversed sequence; reversed index i is
 			// forward rank card-1-i, so [lo,hi] maps to the forward-rank window
 			// [card-1-hi, card-1-lo], walked high-to-low.
 			card := z.nat.card()
-			z.nat.walkRangeRev(card-1-hi, card-1-lo, emit)
-		} else {
-			z.nat.walkRange(lo, hi, emit)
+			return z.nat.natAppendWindow(out, card-1-hi, card-1-lo, true, withScores)
 		}
-		return out
+		return z.nat.natAppendWindow(out, lo, hi, false, withScores)
+	}
+	var sc [40]byte
+	emit := func(m []byte, bits uint64) {
+		out = resp.AppendBulk(out, m)
+		if withScores {
+			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(bits)))
+		}
 	}
 	ev := z.entries()
 	if rev {
@@ -642,20 +677,15 @@ func (z *zset) rangeByRankWindow(out []byte, a, hi int, rev, withScores bool) []
 	if hi < a {
 		return out
 	}
+	if z.enc == encSkiplist {
+		return z.nat.natAppendWindow(out, a, hi, rev, withScores)
+	}
 	var sc [40]byte
 	emit := func(m []byte, bits uint64) {
 		out = resp.AppendBulk(out, m)
 		if withScores {
 			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(bits)))
 		}
-	}
-	if z.enc == encSkiplist {
-		if rev {
-			z.nat.walkRangeRev(a, hi, emit)
-		} else {
-			z.nat.walkRange(a, hi, emit)
-		}
-		return out
 	}
 	ev := z.entries()
 	if rev {
