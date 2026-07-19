@@ -2,6 +2,7 @@ package drivers
 
 import (
 	"bufio"
+	"io"
 	"net"
 	"testing"
 )
@@ -168,6 +169,69 @@ func TestHelloAuthDeclined(t *testing.T) {
 	_, nc, br := startServer(t)
 	if _, ok := sendCmd(t, br, nc, "HELLO", "2", "AUTH", "default", "").(errorReply); !ok {
 		t.Fatalf("HELLO AUTH did not decline on a passwordless server")
+	}
+}
+
+// TestQuit checks QUIT acknowledges with +OK and then closes the connection, so
+// a following read reaches EOF.
+func TestQuit(t *testing.T) {
+	_, nc, br := startServer(t)
+	if got := sendCmd(t, br, nc, "QUIT"); got != "OK" {
+		t.Fatalf("QUIT = %v, want OK", got)
+	}
+	// The +OK landed; the server now closes, so the next read is EOF.
+	if _, err := br.ReadByte(); err != io.EOF {
+		t.Fatalf("read after QUIT = %v, want EOF", err)
+	}
+}
+
+// TestResetClearsName checks RESET replies +RESET and clears a CLIENT SETNAME
+// label, so a following GETNAME reads empty.
+func TestResetClearsName(t *testing.T) {
+	_, nc, br := startServer(t)
+	if got := sendCmd(t, br, nc, "CLIENT", "SETNAME", "before-reset"); got != "OK" {
+		t.Fatalf("CLIENT SETNAME = %v, want OK", got)
+	}
+	if got := sendCmd(t, br, nc, "RESET"); got != "RESET" {
+		t.Fatalf("RESET = %v, want RESET", got)
+	}
+	if got := sendCmd(t, br, nc, "CLIENT", "GETNAME"); got != "" {
+		t.Fatalf("GETNAME after RESET = %v, want empty", got)
+	}
+}
+
+// TestResetClearsSubscribeMode checks RESET takes the connection out of
+// subscribe mode: after SUBSCRIBE a plain GET is refused, and after RESET the
+// same GET runs.
+func TestResetClearsSubscribeMode(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	// SUBSCRIBE confirms with a three-element array; read and discard it.
+	if _, ok := sendCmd(t, br, nc, "SUBSCRIBE", "ch").([]any); !ok {
+		t.Fatalf("SUBSCRIBE did not confirm")
+	}
+	// In subscribe mode a plain GET is refused.
+	if _, ok := sendCmd(t, br, nc, "GET", "k").(errorReply); !ok {
+		t.Fatalf("GET in subscribe mode was not refused")
+	}
+	if got := sendCmd(t, br, nc, "RESET"); got != "RESET" {
+		t.Fatalf("RESET = %v, want RESET", got)
+	}
+	// Out of subscribe mode, GET runs and answers the null bulk for a missing key.
+	if got := sendCmd(t, br, nc, "GET", "k"); got != nil {
+		t.Fatalf("GET after RESET = %v, want null", got)
+	}
+}
+
+// TestAuthDeclined checks AUTH always declines on a passwordless server, in both
+// the one-argument and two-argument forms.
+func TestAuthDeclined(t *testing.T) {
+	_, nc, br := startServer(t)
+	if _, ok := sendCmd(t, br, nc, "AUTH", "secret").(errorReply); !ok {
+		t.Fatalf("AUTH password did not decline")
+	}
+	if _, ok := sendCmd(t, br, nc, "AUTH", "default", "secret").(errorReply); !ok {
+		t.Fatalf("AUTH username password did not decline")
 	}
 }
 

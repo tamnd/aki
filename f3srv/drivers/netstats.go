@@ -53,6 +53,11 @@ type connState struct {
 	// option and answers OK without storing it, matching the f1srv precedent.
 	id   uint64
 	name []byte
+
+	// quit is set when the connection ran QUIT: its +OK is queued, and the read
+	// loop returns after the boundary flush so the acknowledgement lands before
+	// the socket closes. Reader-owned like the fields above.
+	quit bool
 }
 
 // inSubscribeMode reports whether the connection holds any subscription, so the
