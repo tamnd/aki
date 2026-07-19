@@ -873,6 +873,39 @@ func Demoter() func(*shard.Ctx) int {
 	}
 }
 
+// Recoverer returns the collection-recovery hook for Runtime.RecoverColl, the
+// entry each shard runs once at open after its string index recovers, to replay
+// the set, zset, hash, list, and stream durable frames back into their owner-local
+// registries (spec 2064/f3/M8 collection durability). The shard package logs every
+// collection effect and snapshot to the shared .aki record log on the live path but
+// cannot replay them itself, since the five Recover funcs live in the type packages
+// that import shard; the server, which imports both, fans the composite here. Each
+// type's Recover walks only its own kind's frames and is a no-op on a store with no
+// record log, so the order is free and a memory-only or string-only runtime that
+// leaves the hook nil recovers strings alone. A frame that fails to decode stops the
+// walk fail-closed, so the composite returns the first type's error and the open
+// unwinds rather than serving a half-recovered shard.
+func Recoverer() func(*shard.Ctx) error {
+	return func(cx *shard.Ctx) error {
+		if err := set.Recover(cx); err != nil {
+			return err
+		}
+		if err := zset.Recover(cx); err != nil {
+			return err
+		}
+		if err := hash.Recover(cx); err != nil {
+			return err
+		}
+		if err := list.Recover(cx); err != nil {
+			return err
+		}
+		if err := stream.Recover(cx); err != nil {
+			return err
+		}
+		return nil
+	}
+}
+
 // Dispatch routes one parsed command: uppercase the verb into a stack
 // scratch, look it up, check arity, and enqueue on the connection. args are
 // parser views; Do copies them into the hop node before returning, so the

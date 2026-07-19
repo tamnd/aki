@@ -73,6 +73,13 @@ func (s *Store) replayFrom(fromOff uint64, now int64) error {
 
 	var vbuf []byte
 	return s.akirlog.walkShardFrom(fromOff, func(addr uint64, row akifile.RecordRow) error {
+		// Collection frames share this log but rebuild through WalkCollection, not the
+		// string index: the type-side Recover replays them into the per-shard registry.
+		// The string walk must skip them, else applyValueRow reads an opaque effect
+		// payload as a value and fails closed on its missing band.
+		if row.Flags&(akifile.RecFlagCollectionOp|akifile.RecFlagCollectionSnap) != 0 {
+			return nil
+		}
 		if row.Flags&akifile.RecFlagTombstone != 0 {
 			s.Del(row.Key, now)
 			return nil
