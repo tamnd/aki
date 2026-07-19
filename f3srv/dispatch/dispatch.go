@@ -214,6 +214,14 @@ func init() {
 	register("LCS", str.Lcs, 2, -1, true)
 	table["LCS"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 	table["LCS"].cross = str.LcsCross
+	// MSETNX writes its key/value pairs only when none of the keys already
+	// exist (in any keyspace), all-or-nothing (msetnx.go). Co-located keys run
+	// the whole probe-then-write on their shared owner; a split key set takes
+	// the F17 intent route, arming a write intent on every key so the probe and
+	// the writes are one atomic step. crossKeys is the even-position key set.
+	register("MSETNX", msetnxCmd, 2, -1, true)
+	table["MSETNX"].crossKeys = msetnxKeys
+	table["MSETNX"].cross = msetnxCross
 	// TYPE spans every keyspace f3 keeps (the string store and all five
 	// collection registries), so its handler lives here where every type
 	// package is in reach. Single-key EXISTS and DEL below share that reach,
