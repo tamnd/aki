@@ -168,9 +168,19 @@ func init() {
 	// The standalone-node admin surface (see admin.go): replication and health
 	// verbs that report f3's true single-node empty/zero state.
 	register("WAIT", waitCmd, 2, 2, false)
+	register("WAITAOF", waitaofCmd, 3, 3, false)
 	register("FAILOVER", failoverCmd, 0, -1, false)
 	register("LATENCY", latencyCmd, 1, -1, false)
 	register("SLOWLOG", slowlogCmd, 1, -1, false)
+	// The cluster and replication stubs (see cluster.go): f3 is one standalone
+	// node, so these answer the truthful standalone topology and refuse anything
+	// that implies a cluster or a replica f3 does not have.
+	register("CLUSTER", clusterCmd, 1, -1, false)
+	register("REPLICAOF", replicaofCmd, 2, 2, false)
+	register("SLAVEOF", replicaofCmd, 2, 2, false)
+	register("PSYNC", replUnsupportedCmd, 0, -1, false)
+	register("SYNC", replUnsupportedCmd, 0, -1, false)
+	register("REPLCONF", replUnsupportedCmd, 0, -1, false)
 	// ACL describes f3's single built-in superuser (see acl.go); f3 runs no
 	// authentication. The subcommand at args[0] is validated in the handler.
 	register("ACL", aclCmd, 1, -1, false)
