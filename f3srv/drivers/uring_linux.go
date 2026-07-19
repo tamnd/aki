@@ -474,7 +474,7 @@ func (l *uringLoop) adopt(fd int) {
 		fd:   fd,
 		sc:   l.b.s.rt.NewConn(),
 	}
-	rc.cs = &connState{sc: rc.sc}
+	rc.cs = &connState{sc: rc.sc, addr: fdAddr(fd, false), laddr: fdAddr(fd, true)}
 	// No buffers yet: rbuf is leased in ensureRecv (and pinned from then on
 	// by the armed recv), out here at the first emit, inflight by the
 	// queueSend swap. The nil check is the lease point; append on a leased

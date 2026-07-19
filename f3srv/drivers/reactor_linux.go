@@ -5,7 +5,9 @@ package drivers
 import (
 	"encoding/binary"
 	"net"
+	"net/netip"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -14,6 +16,34 @@ import (
 	"github.com/tamnd/aki/f3srv/dispatch"
 	"github.com/tamnd/aki/f3srv/resp"
 )
+
+// fdAddr renders the "ip:port" endpoint of an accepted socket fd, the remote
+// peer when local is false and the local end when true. The event-loop drivers
+// dup the fd out of the Go runtime and close the net.Conn on adoption, so they
+// read the endpoint straight from the fd here (getpeername/getsockname) instead
+// of from a net.Addr the goroutine driver still holds. An error, or an address
+// family the switch does not model, yields the empty string, the same neutral
+// CLIENT INFO answer connAddr gives a nil net.Addr. It runs once per connection
+// at adopt time, a cold path, so the two syscalls cost nothing on the wire.
+func fdAddr(fd int, local bool) string {
+	var sa syscall.Sockaddr
+	var err error
+	if local {
+		sa, err = syscall.Getsockname(fd)
+	} else {
+		sa, err = syscall.Getpeername(fd)
+	}
+	if err != nil {
+		return ""
+	}
+	switch a := sa.(type) {
+	case *syscall.SockaddrInet4:
+		return netip.AddrFrom4(a.Addr).String() + ":" + strconv.Itoa(a.Port)
+	case *syscall.SockaddrInet6:
+		return "[" + netip.AddrFrom16(a.Addr).String() + "]:" + strconv.Itoa(a.Port)
+	}
+	return ""
+}
 
 // The raw-epoll event-loop driver (doc 08 section 4.2), ported from the
 // quarantined f1srv/reactor_linux.go with the M10 pull-forward corrections.
@@ -515,7 +545,7 @@ func (l *reactorLoop) adopt(fd int) {
 		fd:   fd,
 		sc:   l.b.s.rt.NewConn(),
 	}
-	rc.cs = &connState{sc: rc.sc}
+	rc.cs = &connState{sc: rc.sc, addr: fdAddr(fd, false), laddr: fdAddr(fd, true)}
 	// No buffers yet: they are leased on first use (serviceRead for rbuf, the
 	// emit below for out) and returned when the connection parks clean, so an
 	// idle connection holds no buffers at all (doc 08 section 6.2). The nil

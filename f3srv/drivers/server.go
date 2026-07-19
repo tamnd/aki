@@ -476,7 +476,7 @@ func (s *Server) handle(nc net.Conn) {
 func (s *Server) handleSingle(nc net.Conn) {
 	defer func() { _ = nc.Close() }()
 	c := s.rt.NewConn()
-	cs := &connState{sc: c}
+	cs := &connState{sc: c, addr: connAddr(nc.RemoteAddr()), laddr: connAddr(nc.LocalAddr())}
 	s.register(cs)
 	// LIFO defers: close first, then fold the final counts. In-flight replies
 	// for a gone client are dropped by Close's contract, nobody drains them.
@@ -538,7 +538,7 @@ func (s *Server) handleSingle(nc net.Conn) {
 func (s *Server) handlePair(nc net.Conn) {
 	defer func() { _ = nc.Close() }()
 	c := s.rt.NewConn()
-	cs := &connState{sc: c}
+	cs := &connState{sc: c, addr: connAddr(nc.RemoteAddr()), laddr: connAddr(nc.LocalAddr())}
 	s.register(cs)
 	// LIFO defers put the fold after the writer join below, so it reads final
 	// counts: the reader is this goroutine and the writer is gone by then.

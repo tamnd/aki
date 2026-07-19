@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"io"
 	"net"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -232,6 +234,82 @@ func TestAuthDeclined(t *testing.T) {
 	}
 	if _, ok := sendCmd(t, br, nc, "AUTH", "default", "secret").(errorReply); !ok {
 		t.Fatalf("AUTH username password did not decline")
+	}
+}
+
+// clientInfoFields parses a CLIENT INFO bulk line ("k=v k=v ...") into a field
+// map so a test can assert on the fields without pinning the whole line.
+func clientInfoFields(t *testing.T, reply any) map[string]string {
+	t.Helper()
+	line, ok := reply.(string)
+	if !ok {
+		t.Fatalf("CLIENT INFO = %T, want a bulk string", reply)
+	}
+	m := map[string]string{}
+	for _, field := range strings.Fields(line) {
+		eq := strings.IndexByte(field, '=')
+		if eq < 0 {
+			t.Fatalf("CLIENT INFO field %q has no '='", field)
+		}
+		m[field[:eq]] = field[eq+1:]
+	}
+	return m
+}
+
+// TestClientInfo checks CLIENT INFO describes this connection: the id matches
+// CLIENT ID, the endpoints are real, the fixed standalone facts are present, and
+// the name and subscription count track the connection's state.
+func TestClientInfo(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	id, _ := sendCmd(t, br, nc, "CLIENT", "ID").(int64)
+	if got := sendCmd(t, br, nc, "CLIENT", "SETNAME", "inspector"); got != "OK" {
+		t.Fatalf("CLIENT SETNAME = %v, want OK", got)
+	}
+
+	m := clientInfoFields(t, sendCmd(t, br, nc, "CLIENT", "INFO"))
+	if m["id"] != strconv.FormatInt(id, 10) {
+		t.Fatalf("CLIENT INFO id = %q, want the connection id %d", m["id"], id)
+	}
+	if m["name"] != "inspector" {
+		t.Fatalf("CLIENT INFO name = %q, want inspector", m["name"])
+	}
+	if m["addr"] == "" || !strings.Contains(m["addr"], ":") {
+		t.Fatalf("CLIENT INFO addr = %q, want a real ip:port", m["addr"])
+	}
+	if m["laddr"] == "" || !strings.Contains(m["laddr"], ":") {
+		t.Fatalf("CLIENT INFO laddr = %q, want a real ip:port", m["laddr"])
+	}
+	for k, want := range map[string]string{
+		"db": "0", "resp": "2", "redir": "-1", "multi": "-1",
+		"sub": "0", "psub": "0", "cmd": "client|info", "user": "default",
+	} {
+		if m[k] != want {
+			t.Fatalf("CLIENT INFO %s = %q, want %q", k, m[k], want)
+		}
+	}
+	if _, ok := m["tot-cmds"]; !ok {
+		t.Fatalf("CLIENT INFO missing tot-cmds field")
+	}
+}
+
+// TestClientInfoTracksSubscribe checks the sub= count reflects a live
+// subscription, read from this connection's own reader-owned state.
+func TestClientInfoTracksSubscribe(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	if _, ok := sendCmd(t, br, nc, "SUBSCRIBE", "ch1", "ch2").([]any); !ok {
+		t.Fatalf("SUBSCRIBE did not confirm")
+	}
+	// SUBSCRIBE to two channels emits one confirmation per channel; the first rode
+	// back with the sendCmd read, drain the second before the next command.
+	readRESP(t, br)
+
+	// CLIENT INFO is allowed in subscribe mode (it is a connection verb), so the
+	// sub= field reads the two live subscriptions.
+	m := clientInfoFields(t, sendCmd(t, br, nc, "CLIENT", "INFO"))
+	if m["sub"] != "2" {
+		t.Fatalf("CLIENT INFO sub = %q, want 2", m["sub"])
 	}
 }
 

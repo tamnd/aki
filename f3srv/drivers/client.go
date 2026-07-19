@@ -1,6 +1,7 @@
 package drivers
 
 import (
+	"net"
 	"strconv"
 	"time"
 
@@ -198,6 +199,19 @@ func (s *Server) doClient(c *shard.Conn, cs *connState, args [][]byte) {
 		}
 		// No client tracking is configured, so there is no redirection target.
 		_ = c.InlineReply(resp.AppendInt(nil, -1))
+	case eqFold(sub, "INFO"):
+		if len(args) != 2 {
+			_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|info' command"))
+			return
+		}
+		// CLIENT INFO describes THIS connection: every field it reports is the
+		// connection's own network-layer identity, read on its own reader
+		// goroutine, so it needs no lock and races with nobody. The reply is one
+		// bulk string, the same shape redis 8.8 and valkey 9.1 return (CLIENT LIST
+		// is the multi-line form, a later slice once cross-connection reads are
+		// made safe).
+		line := appendClientLine(nil, cs, "client|info")
+		_ = c.InlineReply(resp.AppendBulk(nil, line))
 	default:
 		_ = c.InlineReply(resp.AppendError(nil, "ERR unknown subcommand '"+string(sub)+"'. Try CLIENT HELP."))
 	}
@@ -285,6 +299,87 @@ func (s *Server) doHello(c *shard.Conn, cs *connState, args [][]byte) {
 		}
 	}
 	_ = c.InlineReply(appendHelloMap(nil, cs.id))
+}
+
+// connAddr renders a net.Addr as the "ip:port" string CLIENT INFO reports, the
+// empty string when the address is nil (a listener that does not expose one).
+// A net.TCPAddr already stringifies to that shape, so this is String with a nil
+// guard; the event-loop drivers, which close the net.Conn on adoption, build the
+// same string from the accepted fd instead (fdAddr in the *_linux driver).
+func connAddr(a net.Addr) string {
+	if a == nil {
+		return ""
+	}
+	return a.String()
+}
+
+// appendClientLine renders one connection's CLIENT INFO / LIST line: the
+// space-separated key=value fields redis 8.8 and valkey 9.1 emit. f3 fills the
+// fields it models honestly (id, the endpoints, name, age, subscription count,
+// resp, and the command that asked) and reports the fields it keeps no state for
+// as their neutral value rather than forging a number: no per-connection fd is
+// tracked on the goroutine driver (fd=-1), f3 runs one database and no MULTI,
+// tracking, or ACL users (db=0, multi=-1, watch=0, redir=-1, resp=2,
+// user=default), and it keeps no query/output buffer byte gauges (the qbuf/obl/
+// mem family is 0). cmd is the "verb|sub" that produced the line. The reply is
+// this connection's own reader-owned state, so no lock is needed.
+func appendClientLine(dst []byte, cs *connState, cmd string) []byte {
+	kv := func(k, v string) {
+		dst = append(dst, k...)
+		dst = append(dst, '=')
+		dst = append(dst, v...)
+		dst = append(dst, ' ')
+	}
+	kvn := func(k string, n int64) {
+		dst = append(dst, k...)
+		dst = append(dst, '=')
+		dst = strconv.AppendInt(dst, n, 10)
+		dst = append(dst, ' ')
+	}
+	age := time.Now().Unix() - cs.connUnix
+	if age < 0 {
+		age = 0
+	}
+	kvn("id", int64(cs.id))
+	kv("addr", cs.addr)
+	kv("laddr", cs.laddr)
+	kvn("fd", -1)
+	kv("name", string(cs.name))
+	kvn("age", age)
+	kvn("idle", 0)
+	kv("flags", "N")
+	kvn("db", 0)
+	kvn("sub", int64(len(cs.subs)))
+	kvn("psub", 0)
+	kvn("ssub", 0)
+	kvn("multi", -1)
+	kvn("watch", 0)
+	kvn("qbuf", 0)
+	kvn("qbuf-free", 0)
+	kvn("argv-mem", 0)
+	kvn("multi-mem", 0)
+	kvn("tot-net-in", 0)
+	kvn("tot-net-out", 0)
+	kvn("rbs", 0)
+	kvn("rbp", 0)
+	kvn("obl", 0)
+	kvn("oll", 0)
+	kvn("omem", 0)
+	kvn("tot-mem", 0)
+	kv("events", "r")
+	kv("cmd", cmd)
+	kv("user", "default")
+	kvn("redir", -1)
+	kvn("resp", 2)
+	kv("lib-name", "")
+	kv("lib-ver", "")
+	kvn("tot-cmds", int64(cs.commands.load()))
+	// Every field appended a trailing space; drop the last so the line matches
+	// the redis shape (fields separated, none trailing).
+	if len(dst) > 0 && dst[len(dst)-1] == ' ' {
+		dst = dst[:len(dst)-1]
+	}
+	return dst
 }
 
 // isHelloOption reports whether a HELLO argument is one of the option keywords
