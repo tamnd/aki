@@ -241,6 +241,37 @@ func TestCommandGetKeys(t *testing.T) {
 	}
 }
 
+// TestCommandGetKeysAndFlags checks GETKEYSANDFLAGS returns the same keys as
+// GETKEYS, each paired with a flags array. f3 models no per-key flags, so every
+// flags array is empty, but the [key, flags] pairing is the shape a caller walks.
+func TestCommandGetKeysAndFlags(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	reply := sendCmd(t, br, nc, "COMMAND", "GETKEYSANDFLAGS", "SET", "foo", "bar")
+	arr, ok := reply.([]any)
+	if !ok || len(arr) != 1 {
+		t.Fatalf("GETKEYSANDFLAGS SET = %v, want one key pair", reply)
+	}
+	pair, ok := arr[0].([]any)
+	if !ok || len(pair) != 2 || pair[0] != "foo" {
+		t.Fatalf("GETKEYSANDFLAGS SET pair = %v, want [foo []]", arr[0])
+	}
+	if flags, ok := pair[1].([]any); !ok || len(flags) != 0 {
+		t.Fatalf("GETKEYSANDFLAGS SET flags = %v, want an empty array", pair[1])
+	}
+
+	// MSET yields two key pairs, the same keys GETKEYS gives.
+	m := sendCmd(t, br, nc, "COMMAND", "GETKEYSANDFLAGS", "MSET", "a", "1", "b", "2")
+	marr, ok := m.([]any)
+	if !ok || len(marr) != 2 {
+		t.Fatalf("GETKEYSANDFLAGS MSET = %v, want two key pairs", m)
+	}
+
+	if _, ok := sendCmd(t, br, nc, "COMMAND", "GETKEYSANDFLAGS", "PING").(errorReply); !ok {
+		t.Fatalf("GETKEYSANDFLAGS PING did not error")
+	}
+}
+
 // TestCommandBadSubcommand checks an unknown subcommand errors.
 func TestCommandBadSubcommand(t *testing.T) {
 	_, nc, br := startServer(t)
