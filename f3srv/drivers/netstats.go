@@ -4,6 +4,7 @@ import (
 	"io"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/tamnd/aki/engine/f3/shard"
 )
@@ -53,6 +54,17 @@ type connState struct {
 	// option and answers OK without storing it, matching the f1srv precedent.
 	id   uint64
 	name []byte
+
+	// addr and laddr are the connection's remote and local "ip:port" endpoints,
+	// the addr= and laddr= fields CLIENT INFO reports. They are stamped once when
+	// the connection is admitted (server.go from the net.Conn, the event-loop
+	// drivers from the accepted fd) and never change, so a cross-connection read
+	// (a later CLIENT LIST slice) needs no lock for them. connUnix is the connect
+	// time in unix seconds, the base CLIENT INFO subtracts from now for the age=
+	// field; also immutable after admission.
+	addr     string
+	laddr    string
+	connUnix int64
 
 	// quit is set when the connection ran QUIT: its +OK is queued, and the read
 	// loop returns after the boundary flush so the acknowledgement lands before
@@ -176,6 +188,10 @@ func (s *Server) register(cs *connState) {
 	// every driver hands out ids from the same monotonic sequence. redis numbers
 	// from 1, so the pre-increment counter's first value is 1.
 	cs.id = s.nextConnID.Add(1)
+	// Stamp the connect time for CLIENT INFO's age= field. Admission is a rare,
+	// cold path (one per connection), so the wall-clock read costs nothing on the
+	// command path.
+	cs.connUnix = time.Now().Unix()
 	s.netMu.Lock()
 	s.netLive[cs] = struct{}{}
 	s.netMu.Unlock()
