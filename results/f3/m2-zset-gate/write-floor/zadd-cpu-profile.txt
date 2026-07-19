@@ -1,0 +1,24 @@
+# f3srv CPU profile, ZADD hot path, 1M-key point-write, pipeline 16, 20s window
+# GamingPC gate box, reactor gate config, GOMAXPROCS=14, 2026-07-19.
+# go tool pprof -top -seconds 20 http://127.0.0.1:6060/debug/pprof/profile
+#
+# Duration: 20s, Total samples = 114.77s (573.85%)
+      flat  flat%   sum%        cum   cum%
+    45.16s 39.35% 39.35%     45.16s 39.35%  internal/runtime/syscall/linux.Syscall6      # networking IO (reactor-optimized)
+    10.68s  9.31% 48.65%     12.92s 11.26%  zset.(*zset).listpackIndex                   # inline member-existence scan
+     7.05s  6.14% 54.80%      7.05s  6.14%  memeqbody                                    # member byte compare (in listpackIndex)
+     5.08s  4.43% 59.22%      5.08s  4.43%  internal/runtime/maps.ctrlGroup.matchH2      # keyspace map probe
+     4.98s  4.34% 63.56%      4.98s  4.34%  runtime.futex
+     2.18s  1.90% 65.46%     13.59s 11.84%  runtime.mapaccess1_faststr                   # keyspace lookup (reg.peek)
+     1.45s  1.26% 69.80%     40.94s 35.67%  shard.(*worker).executeOne
+     0.80s   0.7% 79.08%     34.94s 30.44%  zset.Zadd                                    # whole ZADD (cum)
+     0.85s  0.74% 77.65%     13.36s 11.64%  zset.(*reg).peek                             # keyspace resolve (cum)
+     0.62s  0.54% 80.73%      2.71s  2.36%  zset.(*zset).listpackSeek                    # insert-position scan (fuse target)
+     0.40s  0.35% 83.26%      5.29s  4.61%  zset.(*zset).listpackInsert                  # sorted insert + memmove
+#
+# Breakdown of the ~60% non-syscall compute:
+#   keyspace lookup (reg.peek -> mapaccess1_faststr + matchH2):   ~12%
+#   listpack member existence scan (listpackIndex + memeqbody):   ~11%
+#   listpack insert-position scan (listpackSeek):                 ~2.4%  <- the only fusable pass
+#   listpack sorted insert (memmove):                             ~4.6%
+#   dispatch / parse / reply / reactor overhead:                  ~30%
