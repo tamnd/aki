@@ -79,12 +79,25 @@ func zpopImpl(cx *shard.Ctx, args [][]byte, r shard.Reply, min bool) {
 		out = appendScore(out, s, resp3, sc[:])
 	})
 	cx.Aux = out
+	// One event per command from the popped end, then the generic del if the pop
+	// emptied the key. A reached-here pop always removes at least one member.
+	cx.NotifyKeyspaceEvent(shard.NotifyZset, popEvent(min), args[0])
 	if z.card() == 0 {
 		g.drop(args[0])
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
 	} else {
 		g.note(z)
 	}
 	r.Raw(out)
+}
+
+// popEvent names the keyspace event for a pop from the low end (zpopmin) or the
+// high end (zpopmax), shared by ZPOPMIN/ZPOPMAX and ZMPOP.
+func popEvent(min bool) string {
+	if min {
+		return "zpopmin"
+	}
+	return "zpopmax"
 }
 
 // Zmpop answers ZMPOP numkeys key [key ...] <MIN|MAX> [COUNT count]: pop from the
@@ -162,8 +175,10 @@ func Zmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			out = appendScore(out, s, resp3, sc[:])
 		})
 		cx.Aux = out
+		cx.NotifyKeyspaceEvent(shard.NotifyZset, popEvent(min), key)
 		if z.card() == 0 {
 			g.drop(key)
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 		} else {
 			g.note(z)
 		}

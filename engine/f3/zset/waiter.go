@@ -274,6 +274,10 @@ func serveWaiters(cx *shard.Ctx, g *reg, key []byte, z *zset) {
 				rep = appendScore(rep, s, resp3, sc[:])
 			})
 			g.unlinkAll(cx, i)
+			// The deferred serve pops from the zset just like an immediate one, so it
+			// fires the same zpopmin/zpopmax from the served end. The generic del, if
+			// the drain empties the key, is grewNote's to fire once the loop ends.
+			cx.NotifyKeyspaceEvent(shard.NotifyZset, popEvent(min), key)
 			conn.CompleteBlocked(seq, rep)
 		default: // kindMpop
 			npop := nd.count
@@ -290,6 +294,7 @@ func serveWaiters(cx *shard.Ctx, g *reg, key []byte, z *zset) {
 				rep = appendScore(rep, s, resp3, sc[:])
 			})
 			g.unlinkAll(cx, i)
+			cx.NotifyKeyspaceEvent(shard.NotifyZset, popEvent(min), key)
 			conn.CompleteBlocked(seq, rep)
 		}
 	}

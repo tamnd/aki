@@ -71,8 +71,10 @@ func bzpop(cx *shard.Ctx, args [][]byte, r shard.Reply, min bool) {
 			out = resp.AppendBulk(out, m)
 			out = appendScore(out, s, resp3, sc[:])
 		})
+		cx.NotifyKeyspaceEvent(shard.NotifyZset, popEvent(min), key)
 		if z.card() == 0 {
 			g.drop(key)
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 		} else {
 			g.note(z)
 		}
@@ -181,8 +183,10 @@ func Bzmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			out = resp.AppendBulk(out, m)
 			out = appendScore(out, s, resp3, sc[:])
 		})
+		cx.NotifyKeyspaceEvent(shard.NotifyZset, popEvent(min), key)
 		if z.card() == 0 {
 			g.drop(key)
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 		} else {
 			g.note(z)
 		}
