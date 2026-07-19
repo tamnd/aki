@@ -260,6 +260,18 @@ func init() {
 	// serialized value, and the option soup, so the handler validates it.
 	register("DUMP", dumpCmd, 1, 1, true)
 	register("RESTORE", restoreCmd, 3, -1, true)
+	// RENAME and RENAMENX relocate a key of any type (see rename.go), the generic
+	// move DUMP and RESTORE make possible. A co-located pair routes on the source
+	// (keyAt default) and runs the whole move on that one owner; a pair spanning
+	// shards takes the tier-two intent route, the same co-located-first split SMOVE
+	// uses. crossKeys is the source-then-destination pair, so a same-key rename
+	// (which hashes co-located) never reaches the cross path.
+	register("RENAME", renameCmd, 2, 2, true)
+	table["RENAME"].cross = renameCross
+	table["RENAME"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
+	register("RENAMENX", renamenxCmd, 2, 2, true)
+	table["RENAMENX"].cross = renamenxCross
+	table["RENAMENX"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 	register("MGET", nil, 1, -1, true)
 	register("MSET", nil, 2, -1, true)
 	registerFan("EXISTS", shard.FanCount, exists, false, false)
