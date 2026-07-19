@@ -69,6 +69,15 @@ type Ctx struct {
 	parkFull bool
 	retrying bool
 
+	// execNoBlock declares the running command part of an EXEC body, where a
+	// blocking verb must not park: MULTI/EXEC runs every queued command to
+	// completion in one step, so BLPOP on an empty key answers the would-block
+	// reply (its null) at once instead of parking a waiter. The EXEC executor sets
+	// it around each captured step (exec.go) and a blocking handler reads it
+	// through ExecNoBlock right before it would park. Owner goroutine only, valid
+	// only for the duration of the captured call.
+	execNoBlock bool
+
 	// resume is the argument index a retried multi-key write picks up from
 	// (backpressure.go). A fan sub-command that parks part-way through its pairs
 	// records how far it committed through ParkFullAt; the worker seeds this before
@@ -135,6 +144,13 @@ func (cx *Ctx) BackpressureStalls() uint64 {
 	}
 	return cx.w.bpStalls
 }
+
+// ExecNoBlock reports whether the running command is a step of an EXEC body,
+// where a blocking verb must serve-or-answer-empty instead of parking. A blocking
+// handler reads it right before it would call Reply.Park; when it is set the
+// handler writes the would-block reply (its null) and returns. False on every
+// ordinary command and on a bare Ctx. Owner goroutine only.
+func (cx *Ctx) ExecNoBlock() bool { return cx.execNoBlock }
 
 // CurConn is the connection the running command belongs to, the completion
 // target a blocking command captures for its later CompleteBlocked. Owner

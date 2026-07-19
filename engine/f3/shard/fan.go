@@ -271,7 +271,29 @@ func (c *Conn) enqueueFan(sh int, op byte, argv [][]byte, fc *fanCmd) error {
 // reply, which is what keeps a fan-out ordered against the single-key traffic
 // around it.
 func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]byte)) int {
-	part := b.reply(i)
+	var pos []byte
+	if fc.kind == FanMGet {
+		cmd := &b.cmds[i]
+		pos = b.arg(i, int(cmd.argn)-1)
+	}
+	fc.fold(b.reply(i), pos)
+	fc.pending--
+	if fc.pending > 0 {
+		return 0
+	}
+	if fc.kind == FanTxn {
+		// The arms have all executed; the reply comes later on the
+		// transaction's loopback node, so there is nothing to emit here.
+		return 0
+	}
+	return c.deliver(seq, c.renderFan(fc), emit)
+}
+
+// fold accumulates one arriving partial into the coordinator, the per-kind decode
+// step mergeFan runs for every sub-command. pos is the FanMGet position argument
+// (nil for every other kind and for a keyless gather that carries no positions,
+// exec.go's RunFanAllCaptured). Single-consumer state, so the mutations are plain.
+func (fc *fanCmd) fold(part, pos []byte) {
 	switch fc.kind {
 	case FanCount:
 		if len(part) == 8 {
@@ -282,8 +304,6 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 			fc.errMsg = append([]byte(nil), part...)
 		}
 	case FanMGet:
-		cmd := &b.cmds[i]
-		pos := b.arg(i, int(cmd.argn)-1)
 		for k := 0; len(part) >= 4; k++ {
 			n := binary.LittleEndian.Uint32(part)
 			part = part[4:]
@@ -331,15 +351,12 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 			}
 		}
 	}
-	fc.pending--
-	if fc.pending > 0 {
-		return 0
-	}
-	if fc.kind == FanTxn {
-		// The arms have all executed; the reply comes later on the
-		// transaction's loopback node, so there is nothing to emit here.
-		return 0
-	}
+}
+
+// renderFan builds the coordinator's final RESP reply once every partial has
+// folded, the shape step mergeFan and exec.go's RunFanAllCaptured share. The bytes
+// live in fc.out, reused across calls.
+func (c *Conn) renderFan(fc *fanCmd) []byte {
 	fc.out = fc.out[:0]
 	switch fc.kind {
 	case FanCount:
@@ -388,7 +405,7 @@ func (c *Conn) mergeFan(fc *fanCmd, seq uint32, b *hopBatch, i int, emit func([]
 			fc.out = resp.AppendBulk(fc.out, fc.chosen)
 		}
 	}
-	return c.deliver(seq, fc.out, emit)
+	return fc.out
 }
 
 // fanNil is the absent-value length marker in an MGET partial.

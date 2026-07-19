@@ -942,6 +942,13 @@ func Recoverer() func(*shard.Ctx) error {
 // caller may reuse its read buffer immediately. The error return is fatal to
 // the connection; command-level failures answer in-band.
 func Dispatch(c *shard.Conn, args [][]byte) error {
+	// MULTI/EXEC and the rest of the transaction surface run on the reader
+	// goroutine ahead of any shard routing: while a MULTI is open every command is
+	// queued rather than dispatched, so this intercept sits at the very top and
+	// short-circuits when it owns the command (multi.go).
+	if handled, err := txnIntercept(c, args); handled {
+		return err
+	}
 	verb := args[0]
 	var vb [maxVerb]byte
 	if len(verb) > maxVerb {

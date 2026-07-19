@@ -129,7 +129,29 @@ type Conn struct {
 	// building a reply, so it is an atomic; the HELLO reply is published before any
 	// later command's batch, so an owner that reads it sees the negotiated version.
 	resp3 atomic.Bool
+
+	// tx is the connection's MULTI/EXEC transaction state, an opaque handle the
+	// dispatch layer owns (its concrete type is dispatch's txnState). It is nil
+	// until the connection issues MULTI or WATCH. It is read and written only on
+	// the reader goroutine, where the queue-then-EXEC lifecycle lives, so it is a
+	// plain field, not an atomic; the shard layer never inspects it and only
+	// carries the pointer so the per-connection queue survives across commands.
+	tx any
 }
+
+// TxState returns the connection's MULTI/EXEC transaction handle, or nil when the
+// connection is not queuing a transaction. The dispatch layer stashes its per-conn
+// queue here through SetTxState. Reader goroutine only.
+func (c *Conn) TxState() any { return c.tx }
+
+// SetTxState records the connection's MULTI/EXEC transaction handle, or clears it
+// with nil when EXEC/DISCARD/RESET finishes the transaction. Reader goroutine only.
+func (c *Conn) SetTxState(v any) { c.tx = v }
+
+// ShardOf reports the owner shard of key, the dispatch hash the EXEC route uses to
+// place a queued command's point op on the owner that holds its intent lock. It is
+// the connection-side twin of the runtime hash Do routes on. Reader goroutine only.
+func (c *Conn) ShardOf(key []byte) int { return c.rt.ShardOf(key) }
 
 // SetResp3 records the connection's negotiated protocol version, the switch
 // HELLO 2 and HELLO 3 throw. The reply writer reads it through Resp3.

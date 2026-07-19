@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/f3srv/dispatch"
 	"github.com/tamnd/aki/f3srv/resp"
 )
 
@@ -105,10 +106,11 @@ func (s *Server) doQuit(c *shard.Conn, cs *connState, args [][]byte) {
 }
 
 // doReset answers RESET: return the connection to a clean state and reply +RESET.
-// f3 offers one database (SELECT accepts only 0) and no MULTI or auth to unwind,
-// so the state RESET clears here is the pub/sub subscription set and the CLIENT
-// SETNAME label, the two pieces of per-connection state a session accumulates.
-// Dropping the subscriptions also takes the connection out of subscribe mode.
+// f3 offers one database (SELECT accepts only 0) and no auth to unwind, so the
+// state RESET clears here is any open MULTI transaction (dispatch.ResetTxn), the
+// pub/sub subscription set, and the CLIENT SETNAME label, the per-connection state
+// a session accumulates. Dropping the subscriptions also takes the connection out
+// of subscribe mode.
 // RESET takes no arguments, so a tail is the arity error redis gives, the same
 // answer the shard-hop handler gave before this intercept caught the verb.
 func (s *Server) doReset(c *shard.Conn, cs *connState, args [][]byte) {
@@ -119,6 +121,7 @@ func (s *Server) doReset(c *shard.Conn, cs *connState, args [][]byte) {
 	s.pubsub.removeConn(cs)
 	s.stopMonitor(cs)
 	cs.setName(nil)
+	dispatch.ResetTxn(c)
 	_ = c.InlineReply(resp.AppendStatus(nil, "RESET"))
 }
 

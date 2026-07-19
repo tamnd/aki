@@ -2,6 +2,7 @@ package list
 
 import (
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/f3srv/resp"
 )
 
 // BLMOVE, BRPOPLPUSH, and BLMPOP (spec 2064/f3/13 M3 slice 8), the blocking move
@@ -68,6 +69,12 @@ func blmoveDir(cx *shard.Ctx, src, dst []byte, srcLeft, dstLeft bool, timeoutArg
 		r.Bulk(moved)
 		return
 	}
+	if cx.ExecNoBlock() {
+		// Inside EXEC a blocking move never parks; it answers the would-block
+		// reply, the RESP2 null bulk BLMOVE/BRPOPLPUSH time out to.
+		r.Null()
+		return
+	}
 	spec := waitSpec{kind: kindMove, front: srcLeft, dstKey: string(dst), dstLeft: dstLeft}
 	head := parkWaiter(g, [][]byte{src}, spec, cx.CurConn(), cx.CurSeq())
 	var deadline int64
@@ -110,6 +117,12 @@ func Blmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if ok {
 		cx.Aux = out
 		r.Raw(out)
+		return
+	}
+	if cx.ExecNoBlock() {
+		// Inside EXEC a blocking pop never parks; it answers the would-block
+		// reply, the RESP2 null array BLMPOP times out to.
+		r.Raw(resp.AppendNullArray(nil))
 		return
 	}
 	spec := waitSpec{kind: kindMpop, front: front, count: count}

@@ -80,6 +80,13 @@ func bzpop(cx *shard.Ctx, args [][]byte, r shard.Reply, min bool) {
 		return
 	}
 
+	if cx.ExecNoBlock() {
+		// Inside EXEC a blocking pop never parks; it answers the would-block
+		// reply, the RESP2 null array BZPOPMIN/BZPOPMAX time out to.
+		r.Raw(resp.AppendNullArray(nil))
+		return
+	}
+
 	// Park on every key. A finite timeout arms one timer on the sibling-ring head;
 	// a zero timeout blocks forever and arms nothing.
 	head := parkWaiter(g, keys, waitSpec{kind: kindPop, min: min}, cx.CurConn(), cx.CurSeq())
@@ -179,6 +186,13 @@ func Bzmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 		cx.Aux = out
 		r.Raw(out)
+		return
+	}
+
+	if cx.ExecNoBlock() {
+		// Inside EXEC a blocking pop never parks; it answers the would-block
+		// reply, the RESP2 null array BZMPOP times out to.
+		r.Raw(resp.AppendNullArray(nil))
 		return
 	}
 
