@@ -1,0 +1,4 @@
+server	config	set_median	get_median	vmhwm_kb	set_vs_valkey	get_vs_valkey	vmhwm_vs_valkey
+reactor	GOGC=10 net-loops=0 shards=8	9122007	9116812	168948	3.28x	2.43x	1.28x
+redis	io-threads=6	3363818	4260418	184484	1.21x	1.13x	1.39x
+valkey	io-threads=4 do-reads	2778260	3758516	132372	1.00x	1.00x	1.00x
