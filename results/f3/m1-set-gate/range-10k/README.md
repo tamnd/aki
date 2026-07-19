@@ -8,10 +8,14 @@ These rows return real member payloads, so the server is the bottleneck and sing
 |---|---|---|---|---|---|---|---|
 | SSCAN | 931440 | 271688 | 372536 | 3.43x | 2.50x | 2.50x | PASS |
 | SRANDMEMBERCOUNT | 344868 | 45389 | 14135 | 7.60x | 24.40x | 7.60x | PASS |
-| SMEMBERS | 6990 | 3546 | 2276 | 1.97x | 3.07x | 1.97x | near-2x |
+| SMEMBERS (pre) | 6990 | 3546 | 2276 | 1.97x | 3.07x | 1.97x | near-2x |
+| SMEMBERS (post #1191) | 8349 | 3568 | 2360 | 2.34x | 3.54x | 2.34x | PASS |
 
 SSCAN and SRANDMEMBERCOUNT clear 2x.
-SMEMBERS lands at 1.97x against redis (3.07x against valkey): the known P1 full-range-reply dispatch-floor shared with LRANGE / HGETALL / ZRANGE (see aki task #17, "range-read deficit = P1 dispatch ceiling, not a collection lever"). It is a near-2x coverage-almost against one rival only, non-blocking, and closes with the P1 dispatch campaign rather than a set-specific change.
+SMEMBERS first landed at 1.97x against redis, a bandwidth-bound near-miss.
+The `smembers_m10000_p16_postelision.json` here is after PR #1191, the reply-stream copy elision (frame each member straight onto the wire chunk instead of scratch-then-copy).
+That lifted SMEMBERS to a median-of-3 2.29x redis / 3.56x valkey (reps 2.34 / 2.29 / 2.29, aki 8349 / 8422 / 8372 ops, +19% throughput), a clean PASS.
+The floor was the second per-member copy, not per-command dispatch as task #17 had framed it, so the same elision is a candidate lever for the LRANGE / HGETALL / ZRANGE range replies.
 
 ## SPOP is a harness artifact, not measured here
 
