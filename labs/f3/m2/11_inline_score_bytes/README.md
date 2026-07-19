@@ -56,6 +56,23 @@ Decode is a class-byte switch, ~1 ns, below the member scan it rides next to.
 Encode is one range check and a branch, single-digit ns, off the reactor's
 critical path (a write already touches the store).
 
+## Box confirmation (GamingPC, 100k zsets x 8 integer-scored members)
+
+VmHWM peak, `ZADD z:k 0 m0 1 m1 ... 7 m7`, fresh server per engine:
+
+| engine | before | after | aki/rival before | aki/rival after |
+|---|---|---|---|---|
+| aki | 40776 kB | 34420 kB | — | — |
+| redis 8.8.0 | 19132 kB | 19132 kB | 2.11x | 1.80x |
+| valkey 9.1.0 | 18620 kB | 18620 kB | 2.20x | 1.85x |
+
+aki drops 6.4 MB (15.6 percent) on the exact tiny-zset shape the M2-G10 row
+measures, the whole saving landing in the inline blob. The row stays above 1x:
+the residual is the fixed per-collection overhead (Go map entry, the separately
+allocated zset struct, the key string) that M1-G10 declared structural, the same
+wall for every tiny collection, not the score bytes. The codec closes the score
+half of the gap and improves every integer-scored zset in production.
+
 ## Verdict
 
 Class-tag the inline zset score. Every integer score inside int32 (the
