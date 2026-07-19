@@ -39,3 +39,29 @@ func TestMove(t *testing.T) {
 	send(t, nc, "MOVE", "gone", "0")
 	expect(t, br, "-ERR source and destination objects are the same\r\n")
 }
+
+// TestSwapdb checks the single-database SWAPDB: swapping database 0 with itself is a
+// confirmed no-op, any other index is out of range, and a non-integer is the value
+// error.
+func TestSwapdb(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	send(t, nc, "SET", "k", "v")
+	expect(t, br, "+OK\r\n")
+
+	// Database 0 with itself: a confirmed no-op, data intact.
+	send(t, nc, "SWAPDB", "0", "0")
+	expect(t, br, "+OK\r\n")
+	send(t, nc, "GET", "k")
+	expect(t, br, "$1\r\nv\r\n")
+
+	// Either index non-zero is out of range.
+	send(t, nc, "SWAPDB", "0", "1")
+	expect(t, br, "-ERR DB index is out of range\r\n")
+	send(t, nc, "SWAPDB", "2", "0")
+	expect(t, br, "-ERR DB index is out of range\r\n")
+
+	// Non-integer index.
+	send(t, nc, "SWAPDB", "x", "0")
+	expect(t, br, "-ERR value is not an integer or out of range\r\n")
+}
