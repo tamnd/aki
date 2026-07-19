@@ -41,8 +41,8 @@ func drainEnum(t *testing.T, src *enumStream, total int64) []byte {
 // every field once, and the byte width enumTotal promised.
 func TestEnumStreamPairs(t *testing.T) {
 	h := buildNative(pairsN(600))
-	total := h.ft.enumTotal(enumPairs)
-	src := h.ft.pinEnumStream(enumPairs)
+	total := h.ft.enumTotal(enumPairs, false)
+	src := h.ft.pinEnumStream(enumPairs, false)
 	defer src.Release()
 
 	arr := decodeReply(t, drainEnum(t, src, total)).([]any)
@@ -77,8 +77,8 @@ func TestEnumStreamKeysVals(t *testing.T) {
 		{enumKeys, "f"},
 		{enumVals, "v"},
 	} {
-		total := h.ft.enumTotal(tc.mode)
-		src := h.ft.pinEnumStream(tc.mode)
+		total := h.ft.enumTotal(tc.mode, false)
+		src := h.ft.pinEnumStream(tc.mode, false)
 		arr := decodeReply(t, drainEnum(t, src, total)).([]any)
 		src.Release()
 		if len(arr) != 400 {
@@ -106,8 +106,8 @@ func TestEnumStreamKeysVals(t *testing.T) {
 // not.
 func TestEnumStreamPinSurvivesChurn(t *testing.T) {
 	h := buildNative(pairsN(600))
-	total := h.ft.enumTotal(enumPairs)
-	src := h.ft.pinEnumStream(enumPairs) // snapshot: f0..f599
+	total := h.ft.enumTotal(enumPairs, false)
+	src := h.ft.pinEnumStream(enumPairs, false) // snapshot: f0..f599
 
 	// Churn hard while the stream is pinned: drop half the fields and add fresh
 	// ones. Deletes free ordinals and pile up dead bytes; inserts would normally
@@ -204,11 +204,11 @@ func TestEnumTotalMatchesFrame(t *testing.T) {
 	}
 	h := buildNative(pairs)
 	for _, mode := range []enumMode{enumPairs, enumKeys, enumVals} {
-		total := h.ft.enumTotal(mode)
+		total := h.ft.enumTotal(mode, false)
 		if mode == enumPairs && total <= store.ChunkSize {
 			t.Fatalf("HGETALL total %d did not clear the %d stream cutover", total, store.ChunkSize)
 		}
-		src := h.ft.pinEnumStream(mode)
+		src := h.ft.pinEnumStream(mode, false)
 		out := drainEnum(t, src, total)
 		src.Release()
 		if int64(len(out)) != total {

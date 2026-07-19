@@ -56,6 +56,7 @@ func (c *Conn) DoTxn(keys [][]byte, run func(t *Txn) []byte) error {
 		}
 	}
 	t := c.rt.newTxn(keys)
+	t.resp3 = c.Resp3()
 	fc := &fanCmd{kind: FanTxn, pending: int32(len(t.intents)), txn: t}
 	for _, in := range t.intents {
 		if err := c.enqueueFan(in.shard, OpTxnArm, [][]byte{[]byte(in.key)}, fc); err != nil {
@@ -98,6 +99,7 @@ func (c *Conn) DoBlockCross(keys [][]byte, run func(t *Txn, conn *Conn, seq uint
 		}
 	}
 	t := c.rt.newTxn(keys)
+	t.resp3 = c.Resp3()
 	fc := &fanCmd{kind: FanTxn, pending: int32(len(t.intents)), txn: t}
 	for _, in := range t.intents {
 		if err := c.enqueueFan(in.shard, OpTxnArm, [][]byte{[]byte(in.key)}, fc); err != nil {

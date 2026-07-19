@@ -64,10 +64,11 @@ func xinfoGroups(cx *shard.Ctx, key []byte, r shard.Reply) {
 	// unspecified iteration order, the way a client comparing runs expects.
 	names := groupNamesSorted(s)
 
+	resp3 := r.Resp3()
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(names))
 	for _, name := range names {
 		grp := s.groups[name]
-		out = resp.AppendArrayHeader(out, 12)
+		out = dictHeader(out, 6, resp3)
 		out = resp.AppendBulk(out, []byte("name"))
 		out = resp.AppendBulk(out, []byte(name))
 		out = resp.AppendBulk(out, []byte("consumers"))
@@ -106,10 +107,11 @@ func xinfoStream(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(errNoSuchKey)
 		return
 	}
+	resp3 := r.Resp3()
 	if full {
-		cx.Aux = appendStreamFull(cx.Aux[:0], s, count)
+		cx.Aux = appendStreamFull(cx.Aux[:0], s, count, resp3)
 	} else {
-		cx.Aux = appendStreamSummary(cx.Aux[:0], s)
+		cx.Aux = appendStreamSummary(cx.Aux[:0], s, resp3)
 	}
 	r.Raw(cx.Aux)
 }
@@ -146,7 +148,7 @@ func parseStreamInfoOpts(tail [][]byte) (full bool, count int, ok bool) {
 // last live entries (null when the stream is empty). The radix-tree-keys and -nodes
 // are derived from the live block count, monotone and plausible since nothing depends
 // on their exact values (section 6.4).
-func appendStreamSummary(dst []byte, s *stream) []byte {
+func appendStreamSummary(dst []byte, s *stream, resp3 bool) []byte {
 	first := s.collectRange(fullLo, fullHi, false, 1)
 	last := s.collectRange(fullLo, fullHi, true, 1)
 	var recorded streamID
@@ -154,7 +156,7 @@ func appendStreamSummary(dst []byte, s *stream) []byte {
 		recorded = first[0].id
 	}
 
-	dst = resp.AppendArrayHeader(dst, 20)
+	dst = dictHeader(dst, 10, resp3)
 	dst = appendStreamHeaderFields(dst, s, recorded)
 	dst = resp.AppendBulk(dst, []byte("groups"))
 	dst = resp.AppendInt(dst, int64(len(s.groups)))
@@ -170,14 +172,14 @@ func appendStreamSummary(dst []byte, s *stream) []byte {
 // sample of the group PEL, and each consumer with a COUNT-bounded sample of its own
 // pending entries. Groups and consumers are emitted in name order for a deterministic
 // reply.
-func appendStreamFull(dst []byte, s *stream, count int) []byte {
+func appendStreamFull(dst []byte, s *stream, count int, resp3 bool) []byte {
 	first := s.collectRange(fullLo, fullHi, false, 1)
 	var recorded streamID
 	if len(first) > 0 {
 		recorded = first[0].id
 	}
 
-	dst = resp.AppendArrayHeader(dst, 18)
+	dst = dictHeader(dst, 9, resp3)
 	dst = appendStreamHeaderFields(dst, s, recorded)
 
 	dst = resp.AppendBulk(dst, []byte("entries"))
@@ -191,7 +193,7 @@ func appendStreamFull(dst []byte, s *stream, count int) []byte {
 	names := groupNamesSorted(s)
 	dst = resp.AppendArrayHeader(dst, len(names))
 	for _, name := range names {
-		dst = appendGroupFull(dst, s.groups[name], name, s.entriesAdded, count)
+		dst = appendGroupFull(dst, s.groups[name], name, s.entriesAdded, count, resp3)
 	}
 	return dst
 }
@@ -221,8 +223,8 @@ func appendStreamHeaderFields(dst []byte, s *stream, recorded streamID) []byte {
 // appendGroupFull emits one group's FULL map: name, cursor, the lag basis, the two
 // PEL counts, a COUNT-bounded sample of the group PEL (each row id, owner-or-empty,
 // delivery time, delivery count), and the group's consumers.
-func appendGroupFull(dst []byte, grp *streamGroup, name string, entriesAdded uint64, count int) []byte {
-	dst = resp.AppendArrayHeader(dst, 16)
+func appendGroupFull(dst []byte, grp *streamGroup, name string, entriesAdded uint64, count int, resp3 bool) []byte {
+	dst = dictHeader(dst, 8, resp3)
 	dst = resp.AppendBulk(dst, []byte("name"))
 	dst = resp.AppendBulk(dst, []byte(name))
 	dst = resp.AppendBulk(dst, []byte("last-delivered-id"))
@@ -255,7 +257,7 @@ func appendGroupFull(dst []byte, grp *streamGroup, name string, entriesAdded uin
 	cons := consumersSorted(grp)
 	dst = resp.AppendArrayHeader(dst, len(cons))
 	for _, con := range cons {
-		dst = appendConsumerFull(dst, grp, con, count)
+		dst = appendConsumerFull(dst, grp, con, count, resp3)
 	}
 	return dst
 }
@@ -263,8 +265,8 @@ func appendGroupFull(dst []byte, grp *streamGroup, name string, entriesAdded uin
 // appendConsumerFull emits one consumer's FULL map: name, the two absolute clocks,
 // its pending count, and a COUNT-bounded sample of the entries it owns (each row id,
 // delivery time, delivery count).
-func appendConsumerFull(dst []byte, grp *streamGroup, con *streamConsumer, count int) []byte {
-	dst = resp.AppendArrayHeader(dst, 10)
+func appendConsumerFull(dst []byte, grp *streamGroup, con *streamConsumer, count int, resp3 bool) []byte {
+	dst = dictHeader(dst, 5, resp3)
 	dst = resp.AppendBulk(dst, []byte("name"))
 	dst = resp.AppendBulk(dst, con.name)
 	dst = resp.AppendBulk(dst, []byte("seen-time"))
@@ -305,6 +307,7 @@ func xinfoConsumers(cx *shard.Ctx, key, group []byte, r shard.Reply) {
 		return
 	}
 
+	resp3 := r.Resp3()
 	cons := consumersSorted(grp)
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(cons))
 	for _, con := range cons {
@@ -316,7 +319,7 @@ func xinfoConsumers(cx *shard.Ctx, key, group []byte, r shard.Reply) {
 		if con.activeTime != -1 {
 			inactive = cx.NowMs - con.activeTime
 		}
-		out = resp.AppendArrayHeader(out, 8)
+		out = dictHeader(out, 4, resp3)
 		out = resp.AppendBulk(out, []byte("name"))
 		out = resp.AppendBulk(out, con.name)
 		out = resp.AppendBulk(out, []byte("pending"))
@@ -383,6 +386,19 @@ func consumersSorted(grp *streamGroup) []*streamConsumer {
 // pending is the group's total pending-entry count, the maintained pelCount read
 // O(1) without a PEL walk.
 func (grp *streamGroup) pending() int { return int(grp.pelCount) }
+
+// dictHeader frames one XINFO field/value dict: a RESP3 map of pairs entries,
+// or the flat RESP2 array of 2*pairs elements XINFO emitted before RESP3. Only
+// the header byte and count differ; the field/value bodies that follow are
+// byte-identical, so the RESP2 wire stays exactly as it was until HELLO 3 flips
+// the flag. The nested stream entries and PEL rows keep their array framing on
+// both protocols, matching redis 8.8.
+func dictHeader(dst []byte, pairs int, resp3 bool) []byte {
+	if resp3 {
+		return resp.AppendMapHeader(dst, pairs)
+	}
+	return resp.AppendArrayHeader(dst, pairs*2)
+}
 
 // appendIDBulk appends id as a bulk string in Redis's "ms-seq" form.
 func appendIDBulk(dst []byte, id streamID) []byte {

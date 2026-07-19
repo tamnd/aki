@@ -188,7 +188,7 @@ func localRange(t *testing.T, z *zset, start, stop int, rev, ws bool) []string {
 	if empty {
 		return nil
 	}
-	return decodeBulks(t, z.rangeByIndex(nil, lo, hi, rev, ws))
+	return decodeBulks(t, z.rangeByIndex(nil, lo, hi, rev, ws, false))
 }
 
 // TestFlagMatrixAgainstRedis replays randomized ZADD flag combinations (NX, XX,

@@ -105,14 +105,19 @@ func algebraCross(t *shard.Txn, keys [][]byte, compute func(cx *shard.Ctx, sets 
 // crossArray renders a driver's emitted members as a flat multi-bulk reply in
 // a fresh buffer: the reply outlives the hop that builds it, so the shard
 // scratch the co-located emitArray uses is not available here.
-func crossArray(drive func(emit func(m []byte))) []byte {
+func crossArray(resp3 bool, drive func(emit func(m []byte))) []byte {
 	var page []byte
 	n := 0
 	drive(func(m []byte) {
 		page = resp.AppendBulk(page, m)
 		n++
 	})
-	out := resp.AppendArrayHeader(nil, n)
+	var out []byte
+	if resp3 {
+		out = resp.AppendSetHeader(nil, n)
+	} else {
+		out = resp.AppendArrayHeader(nil, n)
+	}
 	return append(out, page...)
 }
 
@@ -120,21 +125,21 @@ func crossArray(drive func(emit func(m []byte))) []byte {
 // argument tail.
 func SinterCross(t *shard.Txn, keys [][]byte) []byte {
 	return algebraCross(t, keys, func(cx *shard.Ctx, sets []*set) []byte {
-		return crossArray(func(emit func(m []byte)) { sinter(cx, sets, emit) })
+		return crossArray(t.Resp3(), func(emit func(m []byte)) { sinter(cx, sets, emit) })
 	})
 }
 
 // SunionCross answers SUNION over cross-shard operands.
 func SunionCross(t *shard.Txn, keys [][]byte) []byte {
 	return algebraCross(t, keys, func(cx *shard.Ctx, sets []*set) []byte {
-		return crossArray(func(emit func(m []byte)) { sunion(cx, sets, emit) })
+		return crossArray(t.Resp3(), func(emit func(m []byte)) { sunion(cx, sets, emit) })
 	})
 }
 
 // SdiffCross answers SDIFF over cross-shard operands.
 func SdiffCross(t *shard.Txn, keys [][]byte) []byte {
 	return algebraCross(t, keys, func(cx *shard.Ctx, sets []*set) []byte {
-		return crossArray(func(emit func(m []byte)) { sdiff(cx, sets, emit) })
+		return crossArray(t.Resp3(), func(emit func(m []byte)) { sdiff(cx, sets, emit) })
 	})
 }
 

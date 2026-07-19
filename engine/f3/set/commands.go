@@ -75,11 +75,7 @@ func Sismember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	if s != nil && s.has(args[1]) {
-		r.Int(1)
-		return
-	}
-	r.Int(0)
+	r.Bool(s != nil && s.has(args[1]))
 }
 
 // Smismember answers SMISMEMBER key member [member ...]: an array of 0/1 in
@@ -92,9 +88,13 @@ func Smismember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	members := args[1:]
+	resp3 := r.Resp3()
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(members))
 	for _, m := range members {
-		if s != nil && s.has(m) {
+		present := s != nil && s.has(m)
+		if resp3 {
+			out = resp.AppendBool(out, present)
+		} else if present {
 			out = resp.AppendInt(out, 1)
 		} else {
 			out = resp.AppendInt(out, 0)
@@ -131,28 +131,41 @@ func Smembers(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
+	resp3 := r.Resp3()
 	if s == nil {
-		r.Raw(resp.AppendArrayHeader(cx.Aux[:0], 0))
+		r.Raw(setHeader(cx.Aux[:0], 0, resp3))
 		return
 	}
 	switch s.enc {
 	case encHashtable:
 		if total := s.ht.membersTotal(); total > store.ChunkSize {
-			r.StreamRaw(total, s.ht.pinMembersStream())
+			r.StreamRaw(total, s.ht.pinMembersStream(resp3))
 			return
 		}
 	case encPartitioned:
 		// A partitioned set is always past the engagement threshold, so its reply
 		// is far wider than a chunk: stream it across every partition (partition.go).
 		if total := s.part.membersTotal(); total > store.ChunkSize {
-			r.StreamRaw(total, s.part.pinMembersStream())
+			r.StreamRaw(total, s.part.pinMembersStream(resp3))
 			return
 		}
 	}
-	out := resp.AppendArrayHeader(cx.Aux[:0], s.card())
+	out := setHeader(cx.Aux[:0], s.card(), resp3)
 	s.each(func(m []byte) { out = resp.AppendBulk(out, m) })
 	cx.Aux = out
 	r.Raw(out)
+}
+
+// setHeader frames a set-valued reply header: a RESP3 set (~n) when the connection
+// negotiated RESP3, else the RESP2 array (*n) the same n members follow. The member
+// bytes are identical and the count is the same, so only the leading type byte
+// differs. SMEMBERS, the set-algebra replies, and SPOP-with-count all frame through
+// it, matching redis's addReplySetLen call sites.
+func setHeader(dst []byte, n int, resp3 bool) []byte {
+	if resp3 {
+		return resp.AppendSetHeader(dst, n)
+	}
+	return resp.AppendArrayHeader(dst, n)
 }
 
 // Spop answers SPOP key [count]: draw and remove members uniformly. Without a
@@ -188,14 +201,14 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	if s == nil || count == 0 {
-		r.Raw(resp.AppendArrayHeader(cx.Aux[:0], 0))
+		r.Raw(setHeader(cx.Aux[:0], 0, r.Resp3()))
 		return
 	}
 	popped := int(count)
 	if popped > s.card() {
 		popped = s.card()
 	}
-	out := resp.AppendArrayHeader(cx.Aux[:0], popped)
+	out := setHeader(cx.Aux[:0], popped, r.Resp3())
 	if popped < s.card() && s.fanDraws(cx, popped) {
 		// The escalated aggregate (drawfan.go): indices drawn serially on the
 		// owner, the resolve fanned to donated workers, removal back on the

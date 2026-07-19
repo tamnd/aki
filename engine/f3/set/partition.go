@@ -377,6 +377,7 @@ type partMembersStream struct {
 	parts []*htable
 	ords  [][]uint32
 	total int
+	resp3 bool // frame the header as a RESP3 set (~) not an array
 
 	pi      int    // current partition
 	idx     int    // index within the current partition's snapshot
@@ -400,7 +401,11 @@ func (m *partMembersStream) Next(dst []byte) (int, error) {
 		}
 		switch {
 		case !m.started:
-			m.buf = resp.AppendArrayHeader(m.buf[:0], m.total)
+			if m.resp3 {
+				m.buf = resp.AppendSetHeader(m.buf[:0], m.total)
+			} else {
+				m.buf = resp.AppendArrayHeader(m.buf[:0], m.total)
+			}
 			m.started = true
 			m.off = 0
 		case m.pi < len(m.parts):
@@ -438,7 +443,7 @@ func (m *partMembersStream) Release() {
 // pinMembersStream snapshots every partition's live ordinals, pins every
 // sub-table, and returns the stream source. The snapshot is 4 bytes per member;
 // the member bytes themselves are never duplicated.
-func (pt *partitioned) pinMembersStream() *partMembersStream {
+func (pt *partitioned) pinMembersStream(resp3 bool) *partMembersStream {
 	ords := make([][]uint32, len(pt.parts))
 	total := 0
 	for i, h := range pt.parts {
@@ -451,5 +456,5 @@ func (pt *partitioned) pinMembersStream() *partMembersStream {
 		h.pinStream()
 		total += nn
 	}
-	return &partMembersStream{parts: pt.parts, ords: ords, total: total}
+	return &partMembersStream{parts: pt.parts, ords: ords, total: total, resp3: resp3}
 }

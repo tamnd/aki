@@ -152,16 +152,22 @@ func TestHelloTwoWithSetName(t *testing.T) {
 	}
 }
 
-// TestHelloThreeDeclined checks HELLO 3 answers NOPROTO rather than switching to
-// RESP3, which f3 does not speak yet.
-func TestHelloThreeDeclined(t *testing.T) {
+// TestHelloThreeAccepted checks HELLO 3 switches the connection to RESP3 and
+// answers the handshake as a RESP3 map with proto 3, and that a following
+// map-shaped reply (CONFIG GET) then arrives with the RESP3 map framing.
+func TestHelloThreeAccepted(t *testing.T) {
 	_, nc, br := startServer(t)
-	reply, ok := sendCmd(t, br, nc, "HELLO", "3").(errorReply)
-	if !ok {
-		t.Fatalf("HELLO 3 = %v, want a NOPROTO error", reply)
+	m := helloFields(t, sendCmd(t, br, nc, "HELLO", "3"))
+	if m["proto"] != int64(3) {
+		t.Fatalf("HELLO 3 proto = %v, want 3", m["proto"])
 	}
-	if len(reply) < 7 || string(reply[:7]) != "NOPROTO" {
-		t.Fatalf("HELLO 3 error = %q, want a NOPROTO prefix", string(reply))
+	if m["server"] != "aki" {
+		t.Fatalf("HELLO 3 server = %v, want aki", m["server"])
+	}
+	// A map reply now uses the RESP3 map framing; readRESP flattens it to pairs.
+	cfg := helloFields(t, sendCmd(t, br, nc, "CONFIG", "GET", "maxmemory"))
+	if cfg["maxmemory"] != "0" {
+		t.Fatalf("CONFIG GET maxmemory over RESP3 = %v, want 0", cfg["maxmemory"])
 	}
 }
 

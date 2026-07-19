@@ -466,7 +466,7 @@ func (z *zset) rank(m []byte) (int, float64, bool) {
 // per element, the cost labs/f3/m2/08 measured). Scores print from the record's
 // raw bits, the sign-of-zero source of truth, matching the closure path exactly.
 // When rev the window is emitted high-to-low via the reverse cursor.
-func (n *nativeStore) natAppendWindow(out []byte, lo, hi int, rev, withScores bool) []byte {
+func (n *nativeStore) natAppendWindow(out []byte, lo, hi int, rev, withScores, resp3 bool) []byte {
 	n.maybeColocate(hi - lo + 1)
 	remaining := hi - lo + 1
 	var sc [40]byte
@@ -474,10 +474,7 @@ func (n *nativeStore) natAppendWindow(out []byte, lo, hi int, rev, withScores bo
 		cur := n.tree.SeekRankRev(uint64(hi))
 		for remaining > 0 && cur.Valid() {
 			r := &n.recs[cur.Ref()]
-			out = resp.AppendBulk(out, n.bytesOf(r))
-			if withScores {
-				out = resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(r.bits)))
-			}
+			out = appendRangeElem(out, n.bytesOf(r), r.bits, withScores, resp3, sc[:])
 			remaining--
 			cur.Next()
 		}
@@ -486,14 +483,32 @@ func (n *nativeStore) natAppendWindow(out []byte, lo, hi int, rev, withScores bo
 	cur := n.tree.SeekRank(uint64(lo))
 	for remaining > 0 && cur.Valid() {
 		r := &n.recs[cur.Ref()]
-		out = resp.AppendBulk(out, n.bytesOf(r))
-		if withScores {
-			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(r.bits)))
-		}
+		out = appendRangeElem(out, n.bytesOf(r), r.bits, withScores, resp3, sc[:])
 		remaining--
 		cur.Next()
 	}
 	return out
+}
+
+// appendRangeElem writes one element of a range reply into out. Without scores
+// that is the bare member bulk on both protocols. With scores RESP2 keeps the
+// flat member-bulk-then-score-bulk pair Redis's RESP2 range emits, while RESP3
+// nests each as a 2-element array [member, score-as-double], the shape redis 8.8
+// sends WITHSCORES clients over RESP3. bits is the score's raw record bits so a
+// native -0.0 prints "-0" (the sign-of-zero source of truth) on either path; sc
+// is formatting scratch used only for the RESP2 score bulk. The RESP3 branch is
+// dormant until HELLO 3 flips the flag, so RESP2 stays byte-identical.
+func appendRangeElem(out, m []byte, bits uint64, withScores, resp3 bool, sc []byte) []byte {
+	if !withScores {
+		return resp.AppendBulk(out, m)
+	}
+	if resp3 {
+		out = resp.AppendArrayHeader(out, 2)
+		out = resp.AppendBulk(out, m)
+		return resp.AppendDouble(out, math.Float64frombits(bits))
+	}
+	out = resp.AppendBulk(out, m)
+	return resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(bits)))
 }
 
 // rangeByIndex streams the members at ranks lo..hi inclusive (already clamped)
@@ -505,23 +520,20 @@ func (n *nativeStore) natAppendWindow(out []byte, lo, hi int, rev, withScores bo
 // record's raw bits so a native -0.0 prints "-0" while the inline band prints
 // "0". out is the shard scratch, reused across commands, so a warm buffer grows
 // for none of the window's elements.
-func (z *zset) rangeByIndex(out []byte, lo, hi int, rev, withScores bool) []byte {
+func (z *zset) rangeByIndex(out []byte, lo, hi int, rev, withScores, resp3 bool) []byte {
 	if z.enc == encSkiplist {
 		if rev {
 			// The window indexes the reversed sequence; reversed index i is
 			// forward rank card-1-i, so [lo,hi] maps to the forward-rank window
 			// [card-1-hi, card-1-lo], walked high-to-low.
 			card := z.nat.card()
-			return z.nat.natAppendWindow(out, card-1-hi, card-1-lo, true, withScores)
+			return z.nat.natAppendWindow(out, card-1-hi, card-1-lo, true, withScores, resp3)
 		}
-		return z.nat.natAppendWindow(out, lo, hi, false, withScores)
+		return z.nat.natAppendWindow(out, lo, hi, false, withScores, resp3)
 	}
 	var sc [40]byte
 	emit := func(m []byte, bits uint64) {
-		out = resp.AppendBulk(out, m)
-		if withScores {
-			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(bits)))
-		}
+		out = appendRangeElem(out, m, bits, withScores, resp3, sc[:])
 	}
 	ev := z.entries()
 	if rev {
@@ -672,19 +684,16 @@ func cmpEntryKey(sA float64, mA []byte, sB float64, mB []byte) int {
 // a counted select and walks the leaf chain, the inline band slices its ordered
 // entries, and out is the shard scratch so a warm buffer grows for none of the
 // window's elements.
-func (z *zset) rangeByRankWindow(out []byte, a, hi int, rev, withScores bool) []byte {
+func (z *zset) rangeByRankWindow(out []byte, a, hi int, rev, withScores, resp3 bool) []byte {
 	if hi < a {
 		return out
 	}
 	if z.enc == encSkiplist {
-		return z.nat.natAppendWindow(out, a, hi, rev, withScores)
+		return z.nat.natAppendWindow(out, a, hi, rev, withScores, resp3)
 	}
 	var sc [40]byte
 	emit := func(m []byte, bits uint64) {
-		out = resp.AppendBulk(out, m)
-		if withScores {
-			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], math.Float64frombits(bits)))
-		}
+		out = appendRangeElem(out, m, bits, withScores, resp3, sc[:])
 	}
 	ev := z.entries()
 	if rev {

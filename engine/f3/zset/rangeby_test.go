@@ -130,7 +130,7 @@ func byScoreStrings(t *testing.T, z *zset, min, max scoreBound, rev, ws, limit b
 	if empty {
 		return nil
 	}
-	return decodeBulks(t, z.rangeByRankWindow(nil, a, b, rev, ws))
+	return decodeBulks(t, z.rangeByRankWindow(nil, a, b, rev, ws, false))
 }
 
 func byLexStrings(t *testing.T, z *zset, min, max lexBound, rev, limit bool, offset, count int) []string {
@@ -140,7 +140,7 @@ func byLexStrings(t *testing.T, z *zset, min, max lexBound, rev, limit bool, off
 	if empty {
 		return nil
 	}
-	return decodeBulks(t, z.rangeByRankWindow(nil, a, b, rev, false))
+	return decodeBulks(t, z.rangeByRankWindow(nil, a, b, rev, false, false))
 }
 
 func inScore(s float64, min, max scoreBound) bool {

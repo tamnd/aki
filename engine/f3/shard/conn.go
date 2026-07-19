@@ -120,7 +120,25 @@ type Conn struct {
 	// and instead drains replies itself through this emit. Set once before
 	// traffic; read by the reader side only.
 	inlineEmit func([]byte)
+
+	// resp3 is the connection's negotiated protocol version: false for RESP2 (the
+	// default every connection opens on), true once HELLO 3 switched it. The reply
+	// writer reads it through Reply.Resp3 to pick the RESP3 frame types (map, set,
+	// double, boolean, null, push) over their RESP2 shapes. Written by the network
+	// layer's HELLO handler on the reader side and read by an owner goroutine
+	// building a reply, so it is an atomic; the HELLO reply is published before any
+	// later command's batch, so an owner that reads it sees the negotiated version.
+	resp3 atomic.Bool
 }
+
+// SetResp3 records the connection's negotiated protocol version, the switch
+// HELLO 2 and HELLO 3 throw. The reply writer reads it through Resp3.
+func (c *Conn) SetResp3(v bool) { c.resp3.Store(v) }
+
+// Resp3 reports whether the connection negotiated RESP3. The reply writer calls
+// it to choose a frame type; a connection that never sent HELLO 3 reads false and
+// gets RESP2 shapes, the default.
+func (c *Conn) Resp3() bool { return c.resp3.Load() }
 
 // SetWriterNotify makes the writer-side wake target pluggable: a claimed wake
 // calls fn instead of sending the waker channel token. It exists for drivers

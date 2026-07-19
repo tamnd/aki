@@ -112,5 +112,7 @@ func Hincrbyfloat(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	h.set(args[1], out)
 	logSet(cx, args[0], args[1], out)
 	g.note(h)
-	r.Bulk(out)
+	// RESP3 renders the new value as a double (redis 8.8 addReplyHumanLongDouble),
+	// reusing the digits just formatted; RESP2 keeps the bulk string.
+	r.DoubleBytes(out)
 }

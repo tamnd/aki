@@ -63,7 +63,7 @@ func TestZeroAllocRangeNative(t *testing.T) {
 	buf := make([]byte, 0, 1<<20) // pre-grown reply scratch, reused each run
 	run := func(name string, rev, ws bool) {
 		checkZero(t, name, func() {
-			sinkBytes = z.rangeByIndex(buf[:0], 5_000, 5_099, rev, ws)
+			sinkBytes = z.rangeByIndex(buf[:0], 5_000, 5_099, rev, ws, false)
 		})
 	}
 	run("native range fwd", false, false)
@@ -86,7 +86,7 @@ func TestZeroAllocRangeByScoreNative(t *testing.T) {
 		checkZero(t, name, func() {
 			lo, hi := z.scoreWindow(min, max)
 			a, b, _ := applyLimit(lo, hi, rev, false, 0, 0)
-			sinkBytes = z.rangeByRankWindow(buf[:0], a, b, rev, ws)
+			sinkBytes = z.rangeByRankWindow(buf[:0], a, b, rev, ws, false)
 		})
 	}
 	run("byscore fwd", false, false)
@@ -106,7 +106,7 @@ func TestZeroAllocRangeByLexNative(t *testing.T) {
 		checkZero(t, name, func() {
 			lo, hi := z.lexWindow(min, max)
 			a, b, _ := applyLimit(lo, hi, rev, false, 0, 0)
-			sinkBytes = z.rangeByRankWindow(buf[:0], a, b, rev, false)
+			sinkBytes = z.rangeByRankWindow(buf[:0], a, b, rev, false, false)
 		})
 	}
 	run("bylex fwd", false)

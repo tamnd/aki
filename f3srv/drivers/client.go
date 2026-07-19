@@ -314,23 +314,24 @@ func (s *Server) clientOnOff(c *shard.Conn, args [][]byte, name string) {
 	_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
 }
 
-// doHello answers the HELLO handshake. Bare, or with protover 2, it confirms
-// RESP2 and returns the seven-pair handshake map (RESP2 renders a map as a flat
-// array). Protover 3 is declined with NOPROTO because f3 speaks RESP2 only, and
-// any other protover is the same NOPROTO redis gives. The AUTH and SETNAME
-// options after the protover are parsed: SETNAME labels the connection, AUTH is
-// declined because f3 sets no password (the honest redis answer for a
-// passwordless server).
+// doHello answers the HELLO handshake and negotiates the protocol version. Bare
+// HELLO reports the version in use; HELLO 2 switches the connection to RESP2 and
+// HELLO 3 to RESP3, both recorded on the connection so the reply writer picks the
+// frame types (SetResp3). Any other protover is the NOPROTO redis gives. The AUTH
+// and SETNAME options after the protover are parsed: SETNAME labels the
+// connection, AUTH is declined because f3 sets no password (the honest redis
+// answer for a passwordless server). The reply map is rendered in whatever
+// version the connection now holds, so a HELLO 3 handshake reply is itself a
+// RESP3 map.
 func (s *Server) doHello(c *shard.Conn, cs *connState, args [][]byte) {
 	i := 1
 	if len(args) > 1 && !isHelloOption(args[1]) {
-		// A protocol version is present. redis accepts 2 or 3; f3 accepts only 2.
+		// A protocol version is present. redis accepts 2 or 3, and so does f3.
 		switch {
 		case len(args[1]) == 1 && args[1][0] == '2':
-			// RESP2, the version f3 speaks.
+			c.SetResp3(false)
 		case len(args[1]) == 1 && args[1][0] == '3':
-			_ = c.InlineReply(resp.AppendError(nil, "NOPROTO unsupported protocol version"))
-			return
+			c.SetResp3(true)
 		default:
 			_ = c.InlineReply(resp.AppendError(nil, "NOPROTO unsupported protocol version"))
 			return
@@ -375,7 +376,7 @@ func (s *Server) doHello(c *shard.Conn, cs *connState, args [][]byte) {
 	if haveName {
 		cs.setName(setName)
 	}
-	_ = c.InlineReply(appendHelloMap(nil, cs.id))
+	_ = c.InlineReply(appendHelloMap(nil, cs.id, c.Resp3()))
 }
 
 // connAddr renders a net.Addr as the "ip:port" string CLIENT INFO reports, the
@@ -396,10 +397,11 @@ func connAddr(a net.Addr) string {
 // resp, and the command that asked) and reports the fields it keeps no state for
 // as their neutral value rather than forging a number: no per-connection fd is
 // tracked on the goroutine driver (fd=-1), f3 runs one database and no MULTI,
-// tracking, or ACL users (db=0, multi=-1, watch=0, redir=-1, resp=2,
-// user=default), and it keeps no query/output buffer byte gauges (the qbuf/obl/
-// mem family is 0). cmd is the "verb|sub" that produced the line. Every mutable
-// field it reads (name, sub count, tot-cmds) goes through an atomic, and the
+// tracking, or ACL users (db=0, multi=-1, watch=0, redir=-1, user=default), and
+// it keeps no query/output buffer byte gauges (the qbuf/obl/mem family is 0). The
+// resp field is live: it reads the connection's negotiated protocol version, 2 or
+// 3, the same value HELLO set. cmd is the "verb|sub" that produced the line.
+// Every mutable field it reads (name, sub count, tot-cmds) goes through an atomic, and the
 // endpoints and id are immutable after admission, so the same renderer serves
 // CLIENT INFO on the connection's own goroutine and CLIENT LIST reading every
 // connection from another goroutine, both race-free.
@@ -450,7 +452,7 @@ func appendClientLine(dst []byte, cs *connState, cmd string) []byte {
 	kv("cmd", cmd)
 	kv("user", "default")
 	kvn("redir", -1)
-	kvn("resp", 2)
+	kvn("resp", clientResp(cs))
 	kv("lib-name", "")
 	kv("lib-ver", "")
 	kvn("tot-cmds", int64(cs.commands.load()))
@@ -462,6 +464,15 @@ func appendClientLine(dst []byte, cs *connState, cmd string) []byte {
 	return dst
 }
 
+// clientResp reports the connection's negotiated protocol version as the integer
+// the CLIENT INFO resp= field carries: 3 when the connection ran HELLO 3, else 2.
+func clientResp(cs *connState) int64 {
+	if cs.sc != nil && cs.sc.Resp3() {
+		return 3
+	}
+	return 2
+}
+
 // isHelloOption reports whether a HELLO argument is one of the option keywords
 // rather than the protocol version, so a HELLO with no version (HELLO AUTH ...)
 // is parsed without mistaking AUTH for a protover.
@@ -469,18 +480,27 @@ func isHelloOption(arg []byte) bool {
 	return eqFold(arg, "AUTH") || eqFold(arg, "SETNAME")
 }
 
-// appendHelloMap renders the RESP2 HELLO reply: the seven-pair handshake map as
-// a flat array of fourteen elements. proto is 2 (f3 is RESP2-only), mode is
-// standalone (no cluster), role is master (no replication), and modules is the
-// empty array (none loaded). id is the connection's own CLIENT ID.
-func appendHelloMap(dst []byte, id uint64) []byte {
-	dst = resp.AppendArrayHeader(dst, 14)
+// appendHelloMap renders the HELLO handshake reply, the seven-pair map redis
+// answers: server, version, proto, id, mode standalone (no cluster), role master
+// (no replication), modules the empty array (none loaded). Under RESP2 the map is
+// a flat array of fourteen elements and proto reads 2; under RESP3 it is a real
+// map frame (%7) and proto reads 3. id is the connection's own CLIENT ID.
+func appendHelloMap(dst []byte, id uint64, resp3 bool) []byte {
+	if resp3 {
+		dst = resp.AppendMapHeader(dst, 7)
+	} else {
+		dst = resp.AppendArrayHeader(dst, 14)
+	}
+	proto := int64(2)
+	if resp3 {
+		proto = 3
+	}
 	dst = resp.AppendBulk(dst, []byte("server"))
 	dst = resp.AppendBulk(dst, []byte(helloServerName))
 	dst = resp.AppendBulk(dst, []byte("version"))
 	dst = resp.AppendBulk(dst, []byte(helloVersion))
 	dst = resp.AppendBulk(dst, []byte("proto"))
-	dst = resp.AppendInt(dst, 2)
+	dst = resp.AppendInt(dst, proto)
 	dst = resp.AppendBulk(dst, []byte("id"))
 	dst = resp.AppendInt(dst, int64(id))
 	dst = resp.AppendBulk(dst, []byte("mode"))

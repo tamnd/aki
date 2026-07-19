@@ -84,7 +84,7 @@ func TestMembersStreamMatchesSet(t *testing.T) {
 	if total <= store.ChunkSize {
 		t.Fatalf("total %d not over the stream cutover; pick a bigger set", total)
 	}
-	src := s.ht.pinMembersStream()
+	src := s.ht.pinMembersStream(false)
 	out := drainSource(src, total, 37)
 	src.Release()
 
@@ -118,7 +118,7 @@ func TestMembersStreamPinUnderChurn(t *testing.T) {
 	all := members16(2000)
 	s := buildHT(all)
 	total := s.ht.membersTotal()
-	src := s.ht.pinMembersStream()
+	src := s.ht.pinMembersStream(false)
 	if s.ht.streams != 1 {
 		t.Fatalf("open stream did not pin the table: streams = %d", s.ht.streams)
 	}
@@ -177,7 +177,7 @@ func TestMembersStreamBoundedBuffer(t *testing.T) {
 	if total <= store.ChunkSize {
 		t.Fatalf("total %d not over the cutover", total)
 	}
-	src := s.ht.pinMembersStream()
+	src := s.ht.pinMembersStream(false)
 	drainSource(src, total, 64)
 	src.Release()
 

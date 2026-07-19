@@ -408,7 +408,14 @@ type Txn struct {
 	intents []*intent
 	sig     chan struct{}
 	locked  bool
+	resp3   bool // originating connection negotiated RESP3 (set by DoTxn)
 }
+
+// Resp3 reports whether the connection that issued this transaction negotiated
+// RESP3, so a cross-shard reply builder assembling its bytes off the owner (where
+// no Reply is in scope) can pick the RESP3 frame shape. It is false on a bare
+// transaction built through Begin, the RESP2 default.
+func (t *Txn) Resp3() bool { return t.resp3 }
 
 // nextTicket hands out the next transaction ticket from the process-global
 // counter, the one deliberate F1 deviation off the single-key path (doc 03

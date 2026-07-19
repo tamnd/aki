@@ -36,6 +36,11 @@ func Hvals(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // answer WRONGTYPE or the empty array for the trivial cases, stream a wide native
 // reply, and otherwise build the reply in cx.Aux.
 func enumerate(cx *shard.Ctx, key []byte, r shard.Reply, mode enumMode) {
+	// HGETALL frames as a RESP3 map when the connection negotiated RESP3; HKEYS
+	// and HVALS stay arrays under both protocols (a bare key or value list is not a
+	// map), so only enumPairs takes the map shape. The elements are byte-identical
+	// either way, so asMap changes only the header type and its count.
+	asMap := mode == enumPairs && r.Resp3()
 	g := registry(cx)
 	h, wrong := g.lookup(cx, key)
 	if wrong {
@@ -43,16 +48,25 @@ func enumerate(cx *shard.Ctx, key []byte, r shard.Reply, mode enumMode) {
 		return
 	}
 	if h == nil {
-		r.Raw(resp.AppendArrayHeader(cx.Aux[:0], 0))
+		if asMap {
+			r.Raw(resp.AppendMapHeader(cx.Aux[:0], 0))
+		} else {
+			r.Raw(resp.AppendArrayHeader(cx.Aux[:0], 0))
+		}
 		return
 	}
 	if h.enc == encHashtable {
-		if total := h.ft.enumTotal(mode); total > store.ChunkSize {
-			r.StreamRaw(total, h.ft.pinEnumStream(mode))
+		if total := h.ft.enumTotal(mode, asMap); total > store.ChunkSize {
+			r.StreamRaw(total, h.ft.pinEnumStream(mode, asMap))
 			return
 		}
 	}
-	out := resp.AppendArrayHeader(cx.Aux[:0], enumElems(h.card(), mode))
+	out := cx.Aux[:0]
+	if asMap {
+		out = resp.AppendMapHeader(out, h.card())
+	} else {
+		out = resp.AppendArrayHeader(out, enumElems(h.card(), mode))
+	}
 	h.each(func(field, value []byte) {
 		if mode != enumVals {
 			out = resp.AppendBulk(out, field)

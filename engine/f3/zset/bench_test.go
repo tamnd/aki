@@ -187,7 +187,7 @@ func BenchmarkZRangeNative(b *testing.B) {
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					sinkBytes = z.rangeByIndex(buf[:0], lo, hi, rev, false)
+					sinkBytes = z.rangeByIndex(buf[:0], lo, hi, rev, false, false)
 				}
 			})
 		}
@@ -218,7 +218,7 @@ func BenchmarkZRangeByScoreNative(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					lo, hi := z.scoreWindow(min, max)
 					a, c, _ := applyLimit(lo, hi, rev, false, 0, 0)
-					sinkBytes = z.rangeByRankWindow(buf[:0], a, c, rev, false)
+					sinkBytes = z.rangeByRankWindow(buf[:0], a, c, rev, false, false)
 				}
 			})
 		}
@@ -257,7 +257,7 @@ func BenchmarkZRangeByLexNative(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				lo, hi := z.lexWindow(min, max)
 				a, c, _ := applyLimit(lo, hi, false, false, 0, 0)
-				sinkBytes = z.rangeByRankWindow(buf[:0], a, c, false, false)
+				sinkBytes = z.rangeByRankWindow(buf[:0], a, c, false, false, false)
 			}
 		})
 	}
