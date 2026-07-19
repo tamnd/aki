@@ -239,6 +239,12 @@ type Server struct {
 	// subscribers under its own mutex.
 	pubsub *pubsubRegistry
 
+	// monitors is the network-layer MONITOR set (monitor.go): the connections
+	// streaming the command feed, kept here for the same reason as pub/sub. Its
+	// atomic count gates the command path so a server with no monitor pays one
+	// relaxed load per command and never the mutex.
+	monitors *monitorRegistry
+
 	// nextConnID hands each connection its CLIENT ID / HELLO id. A connection's
 	// identity is network-layer state (client.go), like pub/sub, so it lives
 	// here and not in the shard workers. register is the one place every driver
@@ -324,6 +330,7 @@ func Listen(o Options) (*Server, error) {
 		driver:     NetGoroutine,
 		netLive:    make(map[*connState]struct{}),
 		pubsub:     newPubsubRegistry(),
+		monitors:   newMonitorRegistry(),
 	}
 	switch o.NetDriver {
 	case NetReactor:
@@ -690,6 +697,15 @@ func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary fu
 						continue
 					}
 					cmds++
+					// Feed the command to any MONITOR connections before it runs
+					// (monitor.go). The gate is a single relaxed atomic load, so a
+					// server with no monitor pays nothing here, and a connection's
+					// own commands are excluded so a monitor never echoes itself.
+					// The args views are still valid: the parser hands them out for
+					// this pass and the feed copies them into each monitor's node.
+					if s.monitors.active() && !cs.monitoring {
+						s.monitors.feed(time.Now(), 0, cs.addr, args)
+					}
 					// CLIENT, HELLO, QUIT, and RESET are answered here, in the
 					// network layer, from per-connection state (client.go); they
 					// never reach the shard hop. This sits ahead of the pub/sub
