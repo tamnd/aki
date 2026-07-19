@@ -281,6 +281,48 @@ func Recover(cx *shard.Ctx) error {
 // a live run and an effect replay use, and restores the key TTL from the header. An
 // empty element run leaves the key dropped, since the registry keeps no empty hash. A
 // torn run reports ErrLength, the fail-closed cut a recovering reader wants.
+// DumpKey renders the hash at key to a snapshot row for the DUMP command, the
+// single-key sibling of Snapshot. ok is false when key holds no live hash, so DUMP
+// answers the null bulk. The snapshot carries the hash's field TTLs (the M8 hash
+// field-TTL durability), so a DUMP/RESTORE round-trip preserves per-field
+// deadlines; the key deadline itself is driven by the RESTORE ttl argument.
+func DumpKey(cx *shard.Ctx, key []byte) (akifile.CollSnapRow, bool) {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return akifile.CollSnapRow{}, false
+	}
+	h := v.(*reg).peek(cx, key)
+	if h == nil {
+		return akifile.CollSnapRow{}, false
+	}
+	header, run := buildHashSnapshot(h)
+	return akifile.CollSnapRow{Kind: akifile.CollKindHash, Header: header, ElementRun: run}, true
+}
+
+// RestoreKey installs the hash at key from a DUMP snapshot row, stamps the key
+// deadline the RESTORE command parsed (0 for persistent), and re-logs the restored
+// hash through the durability seam so a crash keeps it. The caller has cleared any
+// prior key.
+func RestoreKey(cx *shard.Ctx, key []byte, row akifile.CollSnapRow, expireAt int64) error {
+	g := registry(cx)
+	if err := applyHashSnapshot(cx, g, key, row); err != nil {
+		return err
+	}
+	// Raw-map fetch, not lookup: the payload TTL applyHashSnapshot stamped may be
+	// past, and lookup would drop the key before we stamp the RESTORE deadline.
+	h := g.m[string(key)]
+	if h == nil {
+		return nil
+	}
+	h.expireAt = expireAt
+	if cx.St != nil {
+		header, run := buildHashSnapshot(h)
+		cx.St.LogCollectionSnap(key, akifile.CollKindHash, header, run)
+	}
+	g.note(h)
+	return nil
+}
+
 func applyHashSnapshot(cx *shard.Ctx, g *reg, key []byte, snap akifile.CollSnapRow) error {
 	g.drop(key)
 	var h *hash

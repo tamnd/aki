@@ -263,6 +263,50 @@ func Recover(cx *shard.Ctx) error {
 // appendEntry remade it. Unlike the other collections an emptied stream is kept, so an
 // empty element run still leaves the key present with its counters. A torn header or run
 // reports ErrLength, the fail-closed cut a recovering reader wants.
+// DumpKey renders the stream at key to a snapshot row for the DUMP command, the
+// single-key sibling of Snapshot. ok is false when key holds no live stream, so
+// DUMP answers the null bulk. The snapshot header carries the stream counters
+// (last-id, max-deleted-id, entries-added) and the whole consumer-group section,
+// so a DUMP/RESTORE round-trip preserves groups and PEL, not just the entries; the
+// key deadline is driven by the RESTORE ttl argument.
+func DumpKey(cx *shard.Ctx, key []byte) (akifile.CollSnapRow, bool) {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return akifile.CollSnapRow{}, false
+	}
+	s := v.(*reg).peek(cx, key)
+	if s == nil {
+		return akifile.CollSnapRow{}, false
+	}
+	header, run := buildStreamSnapshot(s)
+	return akifile.CollSnapRow{Kind: akifile.CollKindStream, Header: header, ElementRun: run}, true
+}
+
+// RestoreKey installs the stream at key from a DUMP snapshot row, stamps the key
+// deadline the RESTORE command parsed (0 for persistent), and re-logs the restored
+// stream through the durability seam so a crash keeps it. A stream keeps an emptied
+// key, so a RESTORE of a stream with no entries still installs the key with its
+// counters. The caller has cleared any prior key.
+func RestoreKey(cx *shard.Ctx, key []byte, row akifile.CollSnapRow, expireAt int64) error {
+	g := registry(cx)
+	if err := applyStreamSnapshot(cx, g, key, row); err != nil {
+		return err
+	}
+	// Raw-map fetch, not lookup: the payload TTL applyStreamSnapshot stamped may be
+	// past, and lookup would drop the key before we stamp the RESTORE deadline.
+	s := g.m[string(key)]
+	if s == nil {
+		return nil
+	}
+	s.expireAt = expireAt
+	if cx.St != nil {
+		header, run := buildStreamSnapshot(s)
+		cx.St.LogCollectionSnap(key, akifile.CollKindStream, header, run)
+	}
+	g.note(s)
+	return nil
+}
+
 func applyStreamSnapshot(cx *shard.Ctx, g *reg, key []byte, snap akifile.CollSnapRow) error {
 	g.drop(key)
 	if len(snap.Header) < snapHeaderLen {

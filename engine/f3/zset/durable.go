@@ -266,6 +266,48 @@ func Recover(cx *shard.Ctx) error {
 // and an effect replay use, and restores the key TTL from the header. An empty element
 // run leaves the key dropped, since the registry keeps no empty zset. A torn run reports
 // ErrLength, the fail-closed cut a recovering reader wants.
+// DumpKey renders the sorted set at key to a snapshot row for the DUMP command,
+// the single-key sibling of Snapshot. ok is false when key holds no live zset, so
+// DUMP answers the null bulk. The row round-trips through RestoreKey, which drives
+// the restored key's deadline from the RESTORE ttl argument rather than the
+// payload header.
+func DumpKey(cx *shard.Ctx, key []byte) (akifile.CollSnapRow, bool) {
+	if cx.ZColl == nil {
+		return akifile.CollSnapRow{}, false
+	}
+	g := cx.ZColl.(*reg)
+	z := g.peek(cx, key)
+	if z == nil {
+		return akifile.CollSnapRow{}, false
+	}
+	header, run := buildZsetSnapshot(z)
+	return akifile.CollSnapRow{Kind: akifile.CollKindZset, Header: header, ElementRun: run}, true
+}
+
+// RestoreKey installs the sorted set at key from a DUMP snapshot row, stamps the
+// key deadline the RESTORE command parsed (0 for persistent), and re-logs the
+// restored zset through the durability seam so a crash keeps it. The caller has
+// cleared any prior key.
+func RestoreKey(cx *shard.Ctx, key []byte, row akifile.CollSnapRow, expireAt int64) error {
+	g := registry(cx)
+	if err := applyZsetSnapshot(cx, g, key, row); err != nil {
+		return err
+	}
+	// Raw-map fetch, not lookup: the payload TTL applyZsetSnapshot stamped may be
+	// past, and lookup would drop the key before we stamp the RESTORE deadline.
+	z := g.m[string(key)]
+	if z == nil {
+		return nil
+	}
+	z.expireAt = expireAt
+	if cx.St != nil {
+		header, run := buildZsetSnapshot(z)
+		cx.St.LogCollectionSnap(key, akifile.CollKindZset, header, run)
+	}
+	g.note(z)
+	return nil
+}
+
 func applyZsetSnapshot(cx *shard.Ctx, g *reg, key []byte, snap akifile.CollSnapRow) error {
 	g.drop(key)
 	var z *zset

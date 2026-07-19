@@ -283,6 +283,48 @@ func Recover(cx *shard.Ctx) error {
 // and an effect replay use, and restores the key TTL from the header. An empty element run
 // leaves the key dropped, since the registry keeps no empty list. A torn run reports
 // ErrLength, the fail-closed cut a recovering reader wants.
+// DumpKey renders the list at key to a snapshot row for the DUMP command, the
+// single-key sibling of Snapshot. ok is false when key holds no live list, so DUMP
+// answers the null bulk. The element run preserves head-to-tail order, so a
+// RESTORE rebuilds the list in the same order; the key deadline is driven by the
+// RESTORE ttl argument.
+func DumpKey(cx *shard.Ctx, key []byte) (akifile.CollSnapRow, bool) {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return akifile.CollSnapRow{}, false
+	}
+	l := v.(*reg).peek(cx, key)
+	if l == nil {
+		return akifile.CollSnapRow{}, false
+	}
+	header, run := buildListSnapshot(l)
+	return akifile.CollSnapRow{Kind: akifile.CollKindList, Header: header, ElementRun: run}, true
+}
+
+// RestoreKey installs the list at key from a DUMP snapshot row, stamps the key
+// deadline the RESTORE command parsed (0 for persistent), and re-logs the restored
+// list through the durability seam so a crash keeps it. The caller has cleared any
+// prior key.
+func RestoreKey(cx *shard.Ctx, key []byte, row akifile.CollSnapRow, expireAt int64) error {
+	g := registry(cx)
+	if err := applyListSnapshot(g, cx, key, row); err != nil {
+		return err
+	}
+	// Raw-map fetch, not lookup: the payload TTL applyListSnapshot stamped may be
+	// past, and lookup would drop the key before we stamp the RESTORE deadline.
+	l := g.m[string(key)]
+	if l == nil {
+		return nil
+	}
+	l.expireAt = expireAt
+	if cx.St != nil {
+		header, run := buildListSnapshot(l)
+		cx.St.LogCollectionSnap(key, akifile.CollKindList, header, run)
+	}
+	g.note(l)
+	return nil
+}
+
 func applyListSnapshot(g *reg, cx *shard.Ctx, key []byte, snap akifile.CollSnapRow) error {
 	g.drop(key)
 	var l *list

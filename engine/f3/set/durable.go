@@ -233,6 +233,53 @@ func applySetOp(cx *shard.Ctx, g *reg, key []byte, op akifile.CollOpRow) error {
 	return nil
 }
 
+// DumpKey renders the set at key to a snapshot row for the DUMP command, the
+// single-key sibling of Snapshot. ok is false when key holds no live set (absent
+// or lazily expired), so DUMP answers the null bulk. The row's header carries the
+// set TTL; RESTORE drives the restored key's deadline from its own ttl argument
+// and ignores it, so the payload round-trips through the same snapshot encoder a
+// checkpoint uses without a DUMP-specific format.
+func DumpKey(cx *shard.Ctx, key []byte) (akifile.CollSnapRow, bool) {
+	if cx.Coll == nil {
+		return akifile.CollSnapRow{}, false
+	}
+	g := cx.Coll.(*reg)
+	s, _ := g.lookup(cx, key)
+	if s == nil {
+		return akifile.CollSnapRow{}, false
+	}
+	header, run := buildSetSnapshot(s)
+	return akifile.CollSnapRow{Kind: akifile.CollKindSet, Header: header, ElementRun: run}, true
+}
+
+// RestoreKey installs the set at key from a snapshot row a DUMP produced, the
+// single-key sibling of applySetSnapshot, and stamps the key deadline the RESTORE
+// command parsed (0 for a persistent key), overriding whatever TTL the payload
+// carried. It re-logs the restored set through the durability seam so a crash
+// after a RESTORE keeps the key, the durable effect a live command owes. The
+// caller has already cleared any prior key (the RESTORE existence check, plus the
+// REPLACE delete), so this installs onto a clean slot.
+func RestoreKey(cx *shard.Ctx, key []byte, row akifile.CollSnapRow, expireAt int64) error {
+	g := registry(cx)
+	if err := applySetSnapshot(cx, g, key, row); err != nil {
+		return err
+	}
+	// Fetch the just-installed set from the raw map, not lookup: applySetSnapshot
+	// stamped the payload's TTL, and if that deadline is already past, lookup would
+	// treat the key as expired and drop it before we can stamp the RESTORE deadline.
+	s := g.m[string(key)]
+	if s == nil {
+		return nil
+	}
+	s.expireAt = expireAt
+	if cx.St != nil {
+		header, run := buildSetSnapshot(s)
+		cx.St.LogCollectionSnap(key, akifile.CollKindSet, header, run)
+	}
+	g.note(s)
+	return nil
+}
+
 // eachEntry walks a length-prefixed member run forward, calling fn for each member,
 // the O(n) reader the snapshot rebuild uses over the same wire form appendEntry
 // writes (chunkEntry is the positional O(idx) sibling the cold read path uses). It
