@@ -767,6 +767,110 @@ func (t *Tree) WalkFromRankRev(start uint64, fn func(score uint64, ref uint32) b
 	}
 }
 
+// RankCursor walks a forward-rank window one entry at a time without a
+// per-element callback, so a range read drives the loop itself and the member
+// append stays inlined. It is the callback-free twin of WalkFromRank: the same
+// counted seek and leaf-chain walk, but the caller pulls each ref instead of
+// pushing through a closure, which deletes the two indirect calls per element
+// the closure path pays and lets the walk skip the score read entirely when the
+// caller does not want scores (labs/f3/m2/08 prices both). It aliases the tree's
+// leaf storage, so it stays valid only until the next write, the same
+// single-command lifetime the walk carried.
+type RankCursor struct {
+	t   *Tree
+	ord uint32 // current leaf (0 is a valid leaf ordinal, hence the ok flag)
+	off int    // entry offset within the current leaf
+	n   int    // live entries in the current leaf
+	ok  bool   // false once the window is exhausted
+}
+
+// SeekRank positions a forward cursor at rank start. A start at or past the end
+// yields an exhausted cursor (Valid reports false).
+func (t *Tree) SeekRank(start uint64) RankCursor {
+	if start >= t.entries {
+		return RankCursor{}
+	}
+	k := start
+	ord := t.descendToRank(&k)
+	return RankCursor{t: t, ord: ord, off: int(k), n: t.lNent(ord), ok: true}
+}
+
+// Valid reports whether the cursor still points at an entry.
+func (c *RankCursor) Valid() bool { return c.ok }
+
+// Ref returns the record ref at the cursor. The score lives on the record, so a
+// plain ZRANGE never reads the leaf's score array.
+func (c *RankCursor) Ref() uint32 { return c.t.lRef(c.ord, c.off) }
+
+// Next advances one entry, crossing to the next leaf at a boundary. A cross past
+// the last leaf exhausts the cursor. lNext is 0 at the tail; leaf ordinal 0 is
+// only ever the head, never a next target, so 0 unambiguously means end.
+func (c *RankCursor) Next() {
+	c.off++
+	if c.off < c.n {
+		return
+	}
+	nx := c.t.lNext(c.ord)
+	if nx == 0 {
+		c.ok = false
+		return
+	}
+	c.ord = nx
+	c.off = 0
+	c.n = c.t.lNent(nx)
+}
+
+// RevRankCursor walks a forward-rank window high-to-low, the ZRANGE REV and
+// ZREVRANGE order, the callback-free twin of WalkFromRankRev. Leaves are singly
+// linked (section 6.4), so a leaf runs its entries backward in place and the
+// crossing to the previous leaf re-descends by rank once per leaf boundary, the
+// same small ancestor re-seek the walk pays.
+type RevRankCursor struct {
+	t    *Tree
+	ord  uint32 // current leaf
+	off  int    // entry offset within the current leaf, walked down to 0
+	base uint64 // global rank of this leaf's entry 0
+	ok   bool   // false once the window is exhausted
+}
+
+// SeekRankRev positions a reverse cursor at rank start, walking down toward rank
+// 0. A start past the end clamps to the last entry.
+func (t *Tree) SeekRankRev(start uint64) RevRankCursor {
+	if t.entries == 0 {
+		return RevRankCursor{}
+	}
+	if start >= t.entries {
+		start = t.entries - 1
+	}
+	k := start
+	ord := t.descendToRank(&k)
+	return RevRankCursor{t: t, ord: ord, off: int(k), base: start - k, ok: true}
+}
+
+// Valid reports whether the cursor still points at an entry.
+func (c *RevRankCursor) Valid() bool { return c.ok }
+
+// Ref returns the record ref at the cursor.
+func (c *RevRankCursor) Ref() uint32 { return c.t.lRef(c.ord, c.off) }
+
+// Next steps one entry toward rank 0, re-descending to the previous leaf at a
+// boundary. A step below rank 0 exhausts the cursor.
+func (c *RevRankCursor) Next() {
+	c.off--
+	if c.off >= 0 {
+		return
+	}
+	if c.base == 0 {
+		c.ok = false
+		return
+	}
+	prev := c.base - 1 // global rank of the last entry in the previous leaf
+	k := prev
+	c.ord = c.t.descendToRank(&k)
+	c.off = int(k)
+	c.base = prev - k
+}
+
 // WalkFrom iterates from the first entry at or after (score, member) in order,
 // the seek a ZRANGEBYSCORE or ZRANGEBYLEX low bound rides, stopping early if fn
 // returns false.
