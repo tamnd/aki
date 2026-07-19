@@ -64,11 +64,12 @@ func bzpop(cx *shard.Ctx, args [][]byte, r shard.Reply, min bool) {
 		}
 		out := resp.AppendArrayHeader(cx.Aux[:0], 3)
 		out = resp.AppendBulk(out, key)
+		resp3 := r.Resp3()
 		var sc [40]byte
 		z.pop(min, 1, func(m []byte, s float64) {
 			logRemove(cx, key, m)
 			out = resp.AppendBulk(out, m)
-			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], s))
+			out = appendScore(out, s, resp3, sc[:])
 		})
 		if z.card() == 0 {
 			g.drop(key)
@@ -172,12 +173,13 @@ func Bzmpop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		out := resp.AppendArrayHeader(cx.Aux[:0], 2)
 		out = resp.AppendBulk(out, key)
 		out = resp.AppendArrayHeader(out, npop)
+		resp3 := r.Resp3()
 		var sc [40]byte
 		z.pop(min, count, func(m []byte, s float64) {
 			logRemove(cx, key, m)
 			out = resp.AppendArrayHeader(out, 2)
 			out = resp.AppendBulk(out, m)
-			out = resp.AppendBulk(out, resp.FormatScore(sc[:0], s))
+			out = appendScore(out, s, resp3, sc[:])
 		})
 		if z.card() == 0 {
 			g.drop(key)
