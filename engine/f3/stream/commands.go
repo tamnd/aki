@@ -78,6 +78,9 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// Cut the add effect after the entry is in the stream, so a replay re-drives the
 	// append with the same ID and reproduces the exact entry.
 	logAdd(cx, args[0], id, fields)
+	// A successful append always fires xadd; a trim clause that actually dropped
+	// entries fires a trailing xtrim, the same pair redis publishes for XADD.
+	cx.NotifyKeyspaceEvent(shard.NotifyStream, "xadd", args[0])
 	if trimSet {
 		removed := s.trim(trim)
 		// Exact trim tombstones the boundary block's overshoot in place, leaving a
@@ -91,6 +94,7 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		// entries whatever blocks the rebuilt stream packs.
 		if removed > 0 {
 			logTrimBoundary(cx, args[0], s)
+			cx.NotifyKeyspaceEvent(shard.NotifyStream, "xtrim", args[0])
 		}
 	}
 	// The appended entry is a read event for any client blocked on this key: its
@@ -145,6 +149,7 @@ func Xtrim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// entries whatever blocks the rebuilt stream packs.
 	if removed > 0 {
 		logTrimBoundary(cx, args[0], s)
+		cx.NotifyKeyspaceEvent(shard.NotifyStream, "xtrim", args[0])
 	}
 	g.note(s)
 	r.Int(int64(removed))
@@ -215,6 +220,9 @@ func Xdel(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if n > 0 && s.kind == bandNative {
 		g.markDirty(s)
 	}
+	if n > 0 {
+		cx.NotifyKeyspaceEvent(shard.NotifyStream, "xdel", args[0])
+	}
 	// A tombstone leaves the blob length unchanged, so the footprint holds until the
 	// gc pass reclaims the block; note keeps the running total exact at the boundary
 	// regardless, and picks up any auxiliary change the command made.
@@ -265,6 +273,7 @@ func Xsetid(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// Record the grafted counters, so a replay reaches the same lastID, add count, and
 	// max-deleted ID.
 	logSetID(cx, args[0], s)
+	cx.NotifyKeyspaceEvent(shard.NotifyStream, "xsetid", args[0])
 	r.Status("OK")
 }
 

@@ -73,6 +73,11 @@ func Xclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	// reassigned slabs so a replay reproduces the ownership transfer.
 	g.note(s)
 	logClaimResults(cx, key, name, grp, con, claimed, newCon)
+	// A claim that actually transferred ownership of at least one entry fires xclaim
+	// once, the same single event redis publishes per XCLAIM regardless of the count.
+	if len(claimed) > 0 {
+		cx.NotifyKeyspaceEvent(shard.NotifyStream, "xclaim", key)
+	}
 	cx.Aux = frameClaim(cx.Aux[:0], s, claimed, opts.justid)
 	r.Raw(cx.Aux)
 }

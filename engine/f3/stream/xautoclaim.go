@@ -74,6 +74,11 @@ func Xautoclaim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	for _, id := range res.deleted {
 		logPelDel(cx, key, name, id)
 	}
+	// A pass that transferred at least one entry fires xautoclaim once; a pass that
+	// only dropped deleted entries or found nothing does not, matching redis.
+	if len(res.claimed) > 0 {
+		cx.NotifyKeyspaceEvent(shard.NotifyStream, "xautoclaim", key)
+	}
 	cx.Aux = frameAutoClaim(cx.Aux[:0], s, res, justid)
 	r.Raw(cx.Aux)
 }
