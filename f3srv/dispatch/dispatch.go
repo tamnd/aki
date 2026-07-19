@@ -272,6 +272,16 @@ func init() {
 	register("RENAMENX", renamenxCmd, 2, 2, true)
 	table["RENAMENX"].cross = renamenxCross
 	table["RENAMENX"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
+	// COPY duplicates a key of any type without dropping the source (see copy.go),
+	// RENAME's non-destructive sibling over the same serialize primitive. It routes
+	// exactly as RENAME does: a co-located pair on the point path, a cross-shard pair
+	// on the tier-two intent route, minus the source drop. The DB and REPLACE options
+	// live in the tail, so minArgs is 2 and maxArgs is open; crossKeys is the
+	// source-then-destination pair, so a same-key copy (co-located) answers its error
+	// on the point path.
+	register("COPY", copyCmd, 2, -1, true)
+	table["COPY"].cross = copyCross
+	table["COPY"].crossKeys = func(a [][]byte) [][]byte { return a[:2] }
 	register("MGET", nil, 1, -1, true)
 	register("MSET", nil, 2, -1, true)
 	registerFan("EXISTS", shard.FanCount, exists, false, false)
