@@ -1,0 +1,10 @@
+  aki     dbsize=1000000  sampled_present=2000/2000 (100.0%) peakVmHWM=367632 kB (359 MiB)
+  redis   dbsize=176384   sampled_present=344/2000 (17.2%) peakVmHWM=384956 kB (376 MiB)
+  valkey  dbsize=278605   sampled_present=548/2000 (27.4%) peakVmHWM=373596 kB (365 MiB)
+
+EQUAL-CAP BUDGET: 354 MiB for all three (aki's equal-data peak)
+COVERAGE: aki=1000000 redis=176384 valkey=278605 (of 1000000)
+SAMPLED PRESENT /2000: aki=2000 redis=344 valkey=548
+COVERAGE RATIO: aki/redis=5.67x  aki/valkey=3.59x (higher is better: more keys kept at equal memory)
+PEAK: aki=367632 redis=384956 valkey=373596 kB
+G6CAPDONE
