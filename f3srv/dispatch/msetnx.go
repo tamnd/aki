@@ -69,6 +69,9 @@ func msetnxCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			r.Err(msetnxStoreErr(err))
 			return
 		}
+		// Each written pair fires its own set event, redis's per-key MSETNX
+		// notification. The resume starts past a committed pair, so none fires twice.
+		cx.NotifyKeyspaceEvent(shard.NotifyString, "set", args[i])
 	}
 	r.Int(1)
 }
@@ -106,7 +109,11 @@ func msetnxCross(t *shard.Txn, args [][]byte) []byte {
 		t.Do(key, func(cx *shard.Ctx) {
 			if err := cx.St.SetString(key, val, cx.NowMs, 0, false); err != nil {
 				writeErr = err
+				return
 			}
+			// Each written pair fires its own set event on its owner, the same
+			// per-key notification the co-located path fires.
+			cx.NotifyKeyspaceEvent(shard.NotifyString, "set", key)
 		})
 	}
 	if writeErr != nil {
