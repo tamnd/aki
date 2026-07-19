@@ -73,6 +73,13 @@ func blockpop(cx *shard.Ctx, args [][]byte, r shard.Reply, front bool) {
 		return
 	}
 
+	if cx.ExecNoBlock() {
+		// Inside EXEC a blocking pop never parks; it answers the would-block
+		// reply, the RESP2 null array BLPOP/BRPOP time out to.
+		r.Raw(resp.AppendNullArray(nil))
+		return
+	}
+
 	// Park on every key. A finite timeout arms one timer on the sibling-ring
 	// head; a zero timeout blocks forever and arms nothing.
 	head := parkWaiter(g, keys, waitSpec{kind: kindPop, front: front}, cx.CurConn(), cx.CurSeq())

@@ -65,6 +65,14 @@ func (c *Conn) DoTxn(keys [][]byte, run func(t *Txn) []byte) error {
 	}
 	seq := c.seq
 	c.seq++
+	if len(t.intents) == 0 {
+		// An empty transaction (an EXEC whose queue names no key) arms nothing,
+		// so no shard batch is pending and the reader's post-dispatch flush never
+		// advances the publish watermark to this sequence. Advance it here, the
+		// same store flushShard makes, so the writer knows to wait for the
+		// loopback reply finishTxn delivers.
+		c.published.Store(c.seq)
+	}
 	go func() {
 		t.Acquire()
 		rep := run(t)
@@ -108,6 +116,11 @@ func (c *Conn) DoBlockCross(keys [][]byte, run func(t *Txn, conn *Conn, seq uint
 	}
 	seq := c.seq
 	c.seq++
+	if len(t.intents) == 0 {
+		// See DoTxn: an empty key set arms nothing, so publish this sequence here
+		// rather than lean on the post-dispatch flush of a pending shard batch.
+		c.published.Store(c.seq)
+	}
 	go func() {
 		t.Acquire()
 		rep := run(t, c, seq)
