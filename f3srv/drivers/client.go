@@ -114,7 +114,7 @@ func (s *Server) doReset(c *shard.Conn, cs *connState, args [][]byte) {
 		return
 	}
 	s.pubsub.removeConn(cs)
-	cs.name = nil
+	cs.setName(nil)
 	_ = c.InlineReply(resp.AppendStatus(nil, "RESET"))
 }
 
@@ -133,10 +133,11 @@ func validClientName(name []byte) bool {
 
 // doClient handles the connection-identity subcommands of CLIENT: ID to learn
 // the connection number, SETNAME/GETNAME to label it, SETINFO to advertise the
-// client library, and the NO-EVICT/NO-TOUCH flag toggles. Subcommands f3 does
-// not model (KILL, LIST, PAUSE, TRACKING, ...) fall through to the
-// unknown-subcommand error, the same reply redis gives, rather than a misleading
-// OK. The reply is solicited, so it goes out through InlineReply in order.
+// client library, INFO/LIST to describe connections, and the NO-EVICT/NO-TOUCH
+// flag toggles. Subcommands f3 does not model (KILL, PAUSE, TRACKING, ...) fall
+// through to the unknown-subcommand error, the same reply redis gives, rather
+// than a misleading OK. The reply is solicited, so it goes out through
+// InlineReply in order.
 func (s *Server) doClient(c *shard.Conn, cs *connState, args [][]byte) {
 	if len(args) < 2 {
 		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client' command"))
@@ -157,7 +158,7 @@ func (s *Server) doClient(c *shard.Conn, cs *connState, args [][]byte) {
 		}
 		// An unnamed connection replies with the empty bulk, the shape redis 8.8
 		// and valkey 9.1 both return; a named one replies with the name.
-		_ = c.InlineReply(resp.AppendBulk(nil, cs.name))
+		_ = c.InlineReply(resp.AppendBulk(nil, cs.loadName()))
 	case eqFold(sub, "SETNAME"):
 		if len(args) != 3 {
 			_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|setname' command"))
@@ -167,13 +168,9 @@ func (s *Server) doClient(c *shard.Conn, cs *connState, args [][]byte) {
 			_ = c.InlineReply(resp.AppendError(nil, "ERR Client names cannot contain spaces, newlines or special characters."))
 			return
 		}
-		// Copy the name out of the parse buffer, which is reused for the next
-		// command; an empty name clears the label back to unnamed.
-		if len(args[2]) == 0 {
-			cs.name = nil
-		} else {
-			cs.name = append(cs.name[:0], args[2]...)
-		}
+		// setName copies the name out of the parse buffer (reused for the next
+		// command) and publishes it atomically; an empty name clears the label.
+		cs.setName(args[2])
 		_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
 	case eqFold(sub, "SETINFO"):
 		if len(args) != 4 {
@@ -212,9 +209,89 @@ func (s *Server) doClient(c *shard.Conn, cs *connState, args [][]byte) {
 		// made safe).
 		line := appendClientLine(nil, cs, "client|info")
 		_ = c.InlineReply(resp.AppendBulk(nil, line))
+	case eqFold(sub, "LIST"):
+		s.doClientList(c, cs, args)
 	default:
 		_ = c.InlineReply(resp.AppendError(nil, "ERR unknown subcommand '"+string(sub)+"'. Try CLIENT HELP."))
 	}
+}
+
+// doClientList answers CLIENT LIST: one appendClientLine per live connection,
+// newline-terminated, in a single bulk string, the multi-line form of CLIENT
+// INFO. It supports the two redis filters, TYPE and ID: TYPE normal keeps the
+// connections not in subscribe mode and TYPE pubsub keeps those that are, while
+// TYPE master/replica match nothing because f3 runs no replication; ID keeps the
+// listed connection ids. The live registry is snapshotted under netMu and the
+// lines are rendered outside it, so a long list never blocks admission, and every
+// field a line reads off another connection is either immutable or atomic, so the
+// walk is race-free. The cmd field is honest: this connection's own line shows
+// client|list, and the others show NULL because f3 keeps no per-connection
+// last-command record.
+func (s *Server) doClientList(c *shard.Conn, cs *connState, args [][]byte) {
+	var wantType []byte
+	var idFilter map[uint64]struct{}
+	for i := 2; i < len(args); {
+		switch {
+		case eqFold(args[i], "TYPE"):
+			if i+1 >= len(args) {
+				_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
+				return
+			}
+			wantType = args[i+1]
+			if !eqFold(wantType, "NORMAL") && !eqFold(wantType, "MASTER") &&
+				!eqFold(wantType, "REPLICA") && !eqFold(wantType, "SLAVE") &&
+				!eqFold(wantType, "PUBSUB") {
+				_ = c.InlineReply(resp.AppendError(nil, "ERR Unknown client type '"+string(wantType)+"'"))
+				return
+			}
+			i += 2
+		case eqFold(args[i], "ID"):
+			idFilter = make(map[uint64]struct{})
+			for i++; i < len(args); i++ {
+				n, err := strconv.ParseUint(string(args[i]), 10, 64)
+				if err != nil {
+					_ = c.InlineReply(resp.AppendError(nil, "ERR Invalid client ID"))
+					return
+				}
+				idFilter[n] = struct{}{}
+			}
+		default:
+			_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
+			return
+		}
+	}
+
+	s.netMu.Lock()
+	snap := make([]*connState, 0, len(s.netLive))
+	for other := range s.netLive {
+		snap = append(snap, other)
+	}
+	s.netMu.Unlock()
+
+	var out []byte
+	for _, other := range snap {
+		if idFilter != nil {
+			if _, ok := idFilter[other.id]; !ok {
+				continue
+			}
+		}
+		if wantType != nil {
+			// f3 has no replication, so the master and replica types match nothing.
+			if eqFold(wantType, "MASTER") || eqFold(wantType, "REPLICA") || eqFold(wantType, "SLAVE") {
+				continue
+			}
+			if (other.subCount.Load() > 0) != eqFold(wantType, "PUBSUB") {
+				continue
+			}
+		}
+		cmd := "NULL"
+		if other == cs {
+			cmd = "client|list"
+		}
+		out = appendClientLine(out, other, cmd)
+		out = append(out, '\n')
+	}
+	_ = c.InlineReply(resp.AppendBulk(nil, out))
 }
 
 // clientOnOff handles CLIENT NO-EVICT and NO-TOUCH, which take one ON or OFF
@@ -292,11 +369,7 @@ func (s *Server) doHello(c *shard.Conn, cs *connState, args [][]byte) {
 	// The handshake parsed clean; apply the SETNAME option before answering, the
 	// same order redis uses, so a client that reads its name back sees it set.
 	if haveName {
-		if len(setName) == 0 {
-			cs.name = nil
-		} else {
-			cs.name = append(cs.name[:0], setName...)
-		}
+		cs.setName(setName)
 	}
 	_ = c.InlineReply(appendHelloMap(nil, cs.id))
 }
@@ -321,8 +394,11 @@ func connAddr(a net.Addr) string {
 // tracked on the goroutine driver (fd=-1), f3 runs one database and no MULTI,
 // tracking, or ACL users (db=0, multi=-1, watch=0, redir=-1, resp=2,
 // user=default), and it keeps no query/output buffer byte gauges (the qbuf/obl/
-// mem family is 0). cmd is the "verb|sub" that produced the line. The reply is
-// this connection's own reader-owned state, so no lock is needed.
+// mem family is 0). cmd is the "verb|sub" that produced the line. Every mutable
+// field it reads (name, sub count, tot-cmds) goes through an atomic, and the
+// endpoints and id are immutable after admission, so the same renderer serves
+// CLIENT INFO on the connection's own goroutine and CLIENT LIST reading every
+// connection from another goroutine, both race-free.
 func appendClientLine(dst []byte, cs *connState, cmd string) []byte {
 	kv := func(k, v string) {
 		dst = append(dst, k...)
@@ -344,12 +420,12 @@ func appendClientLine(dst []byte, cs *connState, cmd string) []byte {
 	kv("addr", cs.addr)
 	kv("laddr", cs.laddr)
 	kvn("fd", -1)
-	kv("name", string(cs.name))
+	kv("name", string(cs.loadName()))
 	kvn("age", age)
 	kvn("idle", 0)
 	kv("flags", "N")
 	kvn("db", 0)
-	kvn("sub", int64(len(cs.subs)))
+	kvn("sub", cs.subCount.Load())
 	kvn("psub", 0)
 	kvn("ssub", 0)
 	kvn("multi", -1)

@@ -313,6 +313,109 @@ func TestClientInfoTracksSubscribe(t *testing.T) {
 	}
 }
 
+// clientListLines splits a CLIENT LIST bulk reply into its per-connection lines,
+// dropping the trailing empty split after the final newline.
+func clientListLines(t *testing.T, reply any) []map[string]string {
+	t.Helper()
+	blob, ok := reply.(string)
+	if !ok {
+		t.Fatalf("CLIENT LIST = %T, want a bulk string", reply)
+	}
+	var lines []map[string]string
+	for _, raw := range strings.Split(blob, "\n") {
+		if raw == "" {
+			continue
+		}
+		m := map[string]string{}
+		for _, field := range strings.Fields(raw) {
+			eq := strings.IndexByte(field, '=')
+			if eq < 0 {
+				t.Fatalf("CLIENT LIST field %q has no '='", field)
+			}
+			m[field[:eq]] = field[eq+1:]
+		}
+		lines = append(lines, m)
+	}
+	return lines
+}
+
+// lineByID finds the CLIENT LIST line with the given id= value.
+func lineByID(lines []map[string]string, id int64) map[string]string {
+	want := strconv.FormatInt(id, 10)
+	for _, m := range lines {
+		if m["id"] == want {
+			return m
+		}
+	}
+	return nil
+}
+
+// TestClientList checks CLIENT LIST returns one line per live connection, that a
+// second connection shows up, and that the requesting connection's line reports
+// cmd=client|list while the other reports cmd=NULL (f3 keeps no per-connection
+// last-command record).
+func TestClientList(t *testing.T) {
+	s, nc, br := startServer(t)
+	id1, _ := sendCmd(t, br, nc, "CLIENT", "ID").(int64)
+
+	nc2, br2 := dial(t, s)
+	id2, _ := sendCmd(t, br2, nc2, "CLIENT", "ID").(int64)
+
+	lines := clientListLines(t, sendCmd(t, br, nc, "CLIENT", "LIST"))
+	if len(lines) < 2 {
+		t.Fatalf("CLIENT LIST returned %d lines, want at least 2", len(lines))
+	}
+	self := lineByID(lines, id1)
+	other := lineByID(lines, id2)
+	if self == nil || other == nil {
+		t.Fatalf("CLIENT LIST missing a connection: self=%v other=%v", self, other)
+	}
+	if self["cmd"] != "client|list" {
+		t.Fatalf("requesting line cmd = %q, want client|list", self["cmd"])
+	}
+	if other["cmd"] != "NULL" {
+		t.Fatalf("other line cmd = %q, want NULL", other["cmd"])
+	}
+	if self["addr"] == "" || other["addr"] == "" {
+		t.Fatalf("CLIENT LIST line missing addr: self=%q other=%q", self["addr"], other["addr"])
+	}
+}
+
+// TestClientListFilters checks the ID and TYPE filters: ID narrows to the named
+// connections, TYPE pubsub keeps only subscribed connections, and TYPE master
+// (no replication in f3) returns nothing.
+func TestClientListFilters(t *testing.T) {
+	s, nc, br := startServer(t)
+	id1, _ := sendCmd(t, br, nc, "CLIENT", "ID").(int64)
+
+	nc2, br2 := dial(t, s)
+	id2, _ := sendCmd(t, br2, nc2, "CLIENT", "ID").(int64)
+	// Put the second connection into subscribe mode so the TYPE filter can split.
+	if _, ok := sendCmd(t, br2, nc2, "SUBSCRIBE", "room").([]any); !ok {
+		t.Fatalf("SUBSCRIBE did not confirm")
+	}
+
+	byID := clientListLines(t, sendCmd(t, br, nc, "CLIENT", "LIST", "ID", strconv.FormatInt(id2, 10)))
+	if len(byID) != 1 || byID[0]["id"] != strconv.FormatInt(id2, 10) {
+		t.Fatalf("CLIENT LIST ID %d = %v, want just that connection", id2, byID)
+	}
+
+	pubsub := clientListLines(t, sendCmd(t, br, nc, "CLIENT", "LIST", "TYPE", "pubsub"))
+	if len(pubsub) != 1 || pubsub[0]["id"] != strconv.FormatInt(id2, 10) {
+		t.Fatalf("CLIENT LIST TYPE pubsub = %v, want only the subscribed connection", pubsub)
+	}
+
+	normal := clientListLines(t, sendCmd(t, br, nc, "CLIENT", "LIST", "TYPE", "normal"))
+	if lineByID(normal, id1) == nil || lineByID(normal, id2) != nil {
+		t.Fatalf("CLIENT LIST TYPE normal = %v, want the unsubscribed connection only", normal)
+	}
+
+	master := clientListLines(t, sendCmd(t, br, nc, "CLIENT", "LIST", "TYPE", "master"))
+	if len(master) != 0 {
+		t.Fatalf("CLIENT LIST TYPE master = %v, want empty", master)
+	}
+}
+
 // helloFields turns a flat HELLO reply array into a field map for assertions.
 func helloFields(t *testing.T, reply any) map[string]any {
 	t.Helper()
