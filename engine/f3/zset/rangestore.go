@@ -205,7 +205,7 @@ func Zrangestore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(errMsg)
 		return
 	}
-	r.Int(int64(place(cx, g, args[0], buildDest(pairs))))
+	r.Int(int64(place(cx, g, args[0], buildDest(pairs), "zrangestore")))
 }
 
 // ZrangestoreCross is the F17 route for a destination and source on different
@@ -225,7 +225,7 @@ func ZrangestoreCross(t *shard.Txn, args [][]byte) []byte {
 	}
 	var n int
 	t.Do(dest, func(cx *shard.Ctx) {
-		n = place(cx, registry(cx), dest, buildDest(pairs))
+		n = place(cx, registry(cx), dest, buildDest(pairs), "zrangestore")
 	})
 	return resp.AppendInt(nil, int64(n))
 }

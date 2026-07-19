@@ -230,14 +230,17 @@ flagsLoop:
 
 	zf := flags{nx: fl.nx, xx: fl.xx, ch: fl.ch}
 	var added, changed int64
+	wrote := false
 	for t := 0; t < ntriples; t++ {
 		member := rest[3*t+2]
 		gotAdded, gotChanged, _, _, _ := z.update(member, scores[t], zf)
 		if gotAdded {
 			added++
+			wrote = true
 		}
 		if gotChanged {
 			changed++
+			wrote = true
 		}
 	}
 
@@ -250,6 +253,11 @@ flagsLoop:
 			g.install(cx, key, z)
 		}
 		g.grewNote(cx, key, z)
+		// GEOADD is a ZADD over an encoded score, so it fires the same zadd event
+		// when it added a member or moved a score.
+		if wrote {
+			cx.NotifyKeyspaceEvent(shard.NotifyZset, "zadd", key)
+		}
 	}
 	if fl.ch {
 		r.Int(added + changed)

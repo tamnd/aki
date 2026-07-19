@@ -218,7 +218,16 @@ func runRadius(cx *shard.Ctx, args [][]byte, r shard.Reply, byMember, ro bool) {
 	}
 	hits = geoOrderCut(hits, opts.geoSearchOpts)
 	pairs := geoStorePairs(hits, opts.geoSearchOpts, sh.toMeters)
-	r.Int(int64(place(cx, g, opts.storeKey, buildDest(pairs))))
+	r.Int(int64(place(cx, g, opts.storeKey, buildDest(pairs), radiusEvent(byMember))))
+}
+
+// radiusEvent names the keyspace event a GEORADIUS or GEORADIUSBYMEMBER STORE
+// fires on its destination, the redis command-named shape.
+func radiusEvent(byMember bool) string {
+	if byMember {
+		return "georadiusbymember"
+	}
+	return "georadius"
 }
 
 // Georadius answers GEORADIUS key lon lat radius unit [WITHCOORD] [WITHDIST]
@@ -312,7 +321,7 @@ func radiusCross(t *shard.Txn, args [][]byte, byMember bool) []byte {
 	}
 	var n int
 	t.Do(dest, func(cx *shard.Ctx) {
-		n = place(cx, registry(cx), dest, buildDest(pairs))
+		n = place(cx, registry(cx), dest, buildDest(pairs), radiusEvent(byMember))
 	})
 	return resp.AppendInt(nil, int64(n))
 }

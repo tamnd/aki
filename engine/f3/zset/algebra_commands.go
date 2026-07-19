@@ -184,10 +184,19 @@ func emitScored(cx *shard.Ctx, r shard.Reply, pairs []scoredMember, withScores b
 // An empty result (nil) deletes the destination. It returns the result
 // cardinality, the STORE reply. It runs after the result is fully built off the
 // sources, so an aliasing STORE (destination is also a source) needs no clone.
-func place(cx *shard.Ctx, g *reg, key []byte, result *zset) int {
+//
+// event is the zset keyspace event the store fires when it writes a non-empty
+// result (zunionstore, zrangestore, geosearchstore, ...). An empty result that
+// overwrote an existing destination fires the generic del instead, the redis
+// shape: a STORE and a delete are mutually exclusive on one command.
+func place(cx *shard.Ctx, g *reg, key []byte, result *zset, event string) int {
+	existed := g.m[string(key)] != nil || cx.St.Exists(key, cx.NowMs)
 	cx.St.Del(key, cx.NowMs)
 	if result == nil {
 		g.drop(key)
+		if existed {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
+		}
 		return 0
 	}
 	if g.acctOn && g.m[string(key)] != nil {
@@ -195,6 +204,7 @@ func place(cx *shard.Ctx, g *reg, key []byte, result *zset) int {
 	}
 	g.install(cx, key, result)
 	g.grewNote(cx, key, result)
+	cx.NotifyKeyspaceEvent(shard.NotifyZset, event, key)
 	return result.card()
 }
 
@@ -309,7 +319,7 @@ func Zunionstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	r.Int(int64(place(cx, g, args[0], buildDest(union(ops, spec.mode)))))
+	r.Int(int64(place(cx, g, args[0], buildDest(union(ops, spec.mode)), "zunionstore")))
 }
 
 // Zinterstore answers ZINTERSTORE destination numkeys key [key ...] [WEIGHTS ...]
@@ -327,7 +337,7 @@ func Zinterstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	r.Int(int64(place(cx, g, args[0], buildDest(intersect(ops, spec.mode)))))
+	r.Int(int64(place(cx, g, args[0], buildDest(intersect(ops, spec.mode)), "zinterstore")))
 }
 
 // Zdiffstore answers ZDIFFSTORE destination numkeys key [key ...]: the members
@@ -345,5 +355,5 @@ func Zdiffstore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Err(wrongType)
 		return
 	}
-	r.Int(int64(place(cx, g, args[0], buildDest(diff(ops)))))
+	r.Int(int64(place(cx, g, args[0], buildDest(diff(ops)), "zdiffstore")))
 }

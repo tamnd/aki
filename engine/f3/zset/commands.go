@@ -53,6 +53,7 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 
 	var added, changed int64
+	wrote := false
 	for p := 0; p < npairs; p++ {
 		member := rest[2*p+1]
 		gotAdded, gotChanged, newScore, applied, nan := z.update(member, scores[p], fl)
@@ -69,6 +70,7 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		// nothing and logs nothing.
 		if gotAdded || gotChanged {
 			logAdd(cx, key, member, newScore)
+			wrote = true
 		}
 		if gotAdded {
 			added++
@@ -86,6 +88,11 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 					g.install(cx, key, z)
 				}
 				g.grewNote(cx, key, z)
+				// ZADD INCR fires zadd when it wrote (added or moved a score); a
+				// flag-suppressed no-op writes nothing and fires nothing.
+				if applied {
+					cx.NotifyKeyspaceEvent(shard.NotifyZset, "zadd", key)
+				}
 			}
 			if !applied {
 				r.Null()
@@ -105,6 +112,11 @@ func Zadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			g.install(cx, key, z)
 		}
 		g.grewNote(cx, key, z)
+		// One zadd event per command when it added a member or moved a score;
+		// an all-idempotent or flag-suppressed ZADD writes nothing and is silent.
+		if wrote {
+			cx.NotifyKeyspaceEvent(shard.NotifyZset, "zadd", key)
+		}
 	}
 	if fl.ch {
 		r.Int(added + changed)
@@ -190,6 +202,8 @@ func Zincrby(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		g.install(cx, key, z)
 	}
 	g.grewNote(cx, key, z)
+	// ZINCRBY always writes (it never suppresses), so it always fires zincr.
+	cx.NotifyKeyspaceEvent(shard.NotifyZset, "zincr", key)
 	r.Double(newScore)
 }
 
@@ -284,8 +298,16 @@ func Zrem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			logRemove(cx, args[0], m)
 		}
 	}
+	// ZREM fires one zrem when it removed at least one member, then the generic
+	// del if that emptied the key.
+	if removed > 0 {
+		cx.NotifyKeyspaceEvent(shard.NotifyZset, "zrem", args[0])
+	}
 	if z.card() == 0 {
 		g.drop(args[0])
+		if removed > 0 {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
+		}
 	} else if removed > 0 {
 		g.note(z)
 	}

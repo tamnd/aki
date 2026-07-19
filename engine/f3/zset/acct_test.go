@@ -208,7 +208,7 @@ func TestResidentAccountingStorePath(t *testing.T) {
 	wantExact(t, g)
 
 	// A union-shaped result into a new key: accounted on placement.
-	place(cx, g, []byte("dest"), buildDest(scored("1", "2", "3", "4", "5", "6")))
+	place(cx, g, []byte("dest"), buildDest(scored("1", "2", "3", "4", "5", "6")), "zunionstore")
 	wantExact(t, g)
 	if _, ok := g.m["dest"]; !ok {
 		t.Fatal("store result not installed at dest")
@@ -216,11 +216,11 @@ func TestResidentAccountingStorePath(t *testing.T) {
 
 	// Overwriting dest: the replaced zset's bytes must leave the total before the
 	// new result's are posted, so the figure still equals the walk.
-	place(cx, g, []byte("dest"), buildDest(scored("3", "4")))
+	place(cx, g, []byte("dest"), buildDest(scored("3", "4")), "zunionstore")
 	wantExact(t, g)
 
 	// An empty result deletes dest: its bytes leave the total.
-	place(cx, g, []byte("dest"), buildDest(nil))
+	place(cx, g, []byte("dest"), buildDest(nil), "zunionstore")
 	if _, ok := g.m["dest"]; ok {
 		t.Fatal("empty store result left dest present")
 	}

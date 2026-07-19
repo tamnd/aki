@@ -40,8 +40,14 @@ func Zremrangebyrank(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	logRemoveWindow(cx, args[0], z, lo, hi+1)
 	removed := z.removeRange(lo, hi+1)
+	if removed > 0 {
+		cx.NotifyKeyspaceEvent(shard.NotifyZset, "zremrangebyrank", args[0])
+	}
 	if z.card() == 0 {
 		g.drop(args[0])
+		if removed > 0 {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
+		}
 	} else if removed > 0 {
 		g.note(z)
 	}
@@ -70,8 +76,14 @@ func Zremrangebyscore(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	lo, hiExcl := z.scoreWindow(min, max)
 	logRemoveWindow(cx, args[0], z, lo, hiExcl)
 	removed := z.removeRange(lo, hiExcl)
+	if removed > 0 {
+		cx.NotifyKeyspaceEvent(shard.NotifyZset, "zremrangebyscore", args[0])
+	}
 	if z.card() == 0 {
 		g.drop(args[0])
+		if removed > 0 {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
+		}
 	} else if removed > 0 {
 		g.note(z)
 	}
@@ -100,8 +112,14 @@ func Zremrangebylex(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	lo, hiExcl := z.lexWindow(min, max)
 	logRemoveWindow(cx, args[0], z, lo, hiExcl)
 	removed := z.removeRange(lo, hiExcl)
+	if removed > 0 {
+		cx.NotifyKeyspaceEvent(shard.NotifyZset, "zremrangebylex", args[0])
+	}
 	if z.card() == 0 {
 		g.drop(args[0])
+		if removed > 0 {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
+		}
 	} else if removed > 0 {
 		g.note(z)
 	}
