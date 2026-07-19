@@ -200,6 +200,76 @@ func TestReplaySkipsCollectionFrames(t *testing.T) {
 	}
 }
 
+// TestSeparatedValueDurableWithoutResidentCap pins the full-durability floor: an
+// .aki-backed store with no resident cap must still make a separated-band value
+// (past the inline max, under the chunk min) durable, because the record row for a
+// separated value carries only a run pointer and that pointer survives a crash only
+// when the run is log-resident. Before the durable-mode spill floor the value stayed
+// arena-resident and a restart met an arena-resident word it could not deref, failing
+// the whole open. Here the value spills to the shared value region on write and
+// replays back byte for byte.
+func TestSeparatedValueDurableWithoutResidentCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sep.aki")
+	f, err := akifile.Create(path, akifile.CreateOptions{
+		ShardCount: 4,
+		Sync:       akifile.SyncNo,
+	})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	openStore := func(f *akifile.File) *Store {
+		// No ResidentCapBytes: uncapped memory, the full-durability shape the -aki
+		// server runs, the exact config that used to lose separated values.
+		s, err := Open(Options{
+			ArenaBytes:  8 << 20,
+			SegBytes:    1 << 20,
+			AkiValueLog: f,
+			Shard:       1,
+		})
+		if err != nil {
+			t.Fatalf("open aki store: %v", err)
+		}
+		return s
+	}
+
+	mid := make([]byte, strInlineMax+512) // separated band: > inline max, < chunk min
+	for i := range mid {
+		mid[i] = byte('a' + i%26)
+	}
+
+	s := openStore(f)
+	if err := s.SetString([]byte("mid"), mid, 0, 0, false); err != nil {
+		t.Fatalf("set mid: %v", err)
+	}
+	// The run is durable, so its word is log-resident, not arena-resident.
+	if n := s.Stats().LogRuns; n == 0 {
+		t.Fatal("separated value stayed arena-resident under -aki: its record word is not durable")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	s2 := openStore(f2)
+	t.Cleanup(func() { _ = s2.Close(); _ = f2.Close() })
+	if err := s2.ReplayRecords(0); err != nil {
+		t.Fatalf("replay separated value: %v", err)
+	}
+	got, ok := s2.GetString([]byte("mid"), 0, nil)
+	if !ok {
+		t.Fatal("separated key absent after replay")
+	}
+	if !bytes.Equal(got, mid) {
+		t.Fatalf("separated value read back %d bytes, want %d", len(got), len(mid))
+	}
+}
+
 // TestReplayIsShardScoped confirms a store replays only its own shard's records:
 // two shards write distinct keys into the one shared file, then a fresh store on
 // each shard replays and sees its own key but not the other shard's, so a

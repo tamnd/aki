@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -101,5 +102,33 @@ func TestDurableRecoversAllTypesAcrossRestart(t *testing.T) {
 	// A key never written stays absent: recovery invents nothing.
 	if got := sendCmd(t, br2, nc2, "EXISTS", "ghost"); got != int64(0) {
 		t.Fatalf("EXISTS ghost after restart = %v, want 0", got)
+	}
+}
+
+// TestDurableRecoversSeparatedValue is the large-value half of the restart proof: a
+// value past the inline max (separated band) written through the socket must survive
+// a restart. The server runs uncapped, the full-durability shape, so before the
+// durable-mode spill floor the value stayed arena-resident and the reopen failed the
+// whole open on an arena-resident word it could not deref. Now the value spills to
+// the shared value region on write and reads back whole.
+func TestDurableRecoversSeparatedValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "durable.aki")
+	val := strings.Repeat("z", 4000) // 1024 < 4000 < 64KiB: one separated run
+
+	srv1, nc1, br1 := startDurableServer(t, path)
+	if got := sendCmd(t, br1, nc1, "SET", "big", val); got != "OK" {
+		t.Fatalf("SET big = %v, want OK", got)
+	}
+	nc1.Close()
+	srv1.Close()
+
+	srv2, nc2, br2 := startDurableServer(t, path)
+	defer func() { nc2.Close(); srv2.Close() }()
+	if got := sendCmd(t, br2, nc2, "GET", "big"); got != val {
+		gs, _ := got.(string)
+		t.Fatalf("GET big after restart = %d bytes, want %d", len(gs), len(val))
+	}
+	if got := sendCmd(t, br2, nc2, "STRLEN", "big"); got != int64(len(val)) {
+		t.Fatalf("STRLEN big after restart = %v, want %d", got, len(val))
 	}
 }
