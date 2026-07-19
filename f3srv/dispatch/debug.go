@@ -41,15 +41,27 @@ func debugCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		}
 		time.Sleep(time.Duration(secs * float64(time.Second)))
 		r.Status("OK")
-	case "JMAP", "SET-ACTIVE-EXPIRE", "QUICKLIST-PACKED-THRESHOLD",
+	case "SET-ACTIVE-EXPIRE":
+		// Toggle the active-expiry cycle (expirecycle.go) for the whole process,
+		// the real effect redis's knob carries: 0 pauses the background reap of
+		// untouched expired keys, 1 resumes it. Lazy expiry is untouched either
+		// way, so a key is still reaped on its next access; a test that wants a key
+		// to survive untouched until it reads it sets this to 0. A missing or
+		// unparseable argument leaves the state as is and still answers OK, the
+		// forgiving shape the harnesses that poke this expect.
+		if len(args) >= 2 {
+			if v, err := strconv.Atoi(string(args[1])); err == nil {
+				shard.SetActiveExpire(v != 0)
+			}
+		}
+		r.Status("OK")
+	case "JMAP", "QUICKLIST-PACKED-THRESHOLD",
 		"STRINGMATCH-LEN", "CHANGE-REPL-ID", "FLUSHALL", "DEBUG":
 		// Truthful stubs: these poke redis-internal machinery (the JVM-style
-		// object map, the active-expire cycle toggle, quicklist packing, a repl
-		// id rotation) that f3 either does not have or does not expose through a
-		// debug hook. A harness sets them for the side effect and only checks for
-		// the OK; f3 acknowledges without pretending to have changed state it does
-		// not keep. SET-ACTIVE-EXPIRE in particular is a no-op here: f3's expiry
-		// is lazy per doc 09 and there is no cycle to switch off.
+		// object map, quicklist packing, a repl id rotation) that f3 either does
+		// not have or does not expose through a debug hook. A harness sets them for
+		// the side effect and only checks for the OK; f3 acknowledges without
+		// pretending to have changed state it does not keep.
 		r.Status("OK")
 	default:
 		r.Err("ERR DEBUG subcommand not supported")
