@@ -44,6 +44,15 @@ type connState struct {
 	// shared mutex guards. A non-empty set means the connection is in subscribe
 	// mode, which restricts the commands it may run.
 	subs map[string]struct{}
+
+	// id is this connection's CLIENT ID, stamped in register from the server's
+	// monotonic counter. name is its CLIENT SETNAME label, nil until set. Both
+	// are network-layer identity (client.go), read and written only by this
+	// connection's reader goroutine, so they need no lock. The library tags a
+	// client advertises through CLIENT SETINFO are not retained: f3 validates the
+	// option and answers OK without storing it, matching the f1srv precedent.
+	id   uint64
+	name []byte
 }
 
 // inSubscribeMode reports whether the connection holds any subscription, so the
@@ -158,6 +167,10 @@ func (s *Server) NetStats() NetStats {
 // switch (shard.connSpinHighWater); every driver admits a connection through
 // here, so this is the one place the count needs to move on open.
 func (s *Server) register(cs *connState) {
+	// Stamp the connection's CLIENT ID here, the one admission choke point, so
+	// every driver hands out ids from the same monotonic sequence. redis numbers
+	// from 1, so the pre-increment counter's first value is 1.
+	cs.id = s.nextConnID.Add(1)
 	s.netMu.Lock()
 	s.netLive[cs] = struct{}{}
 	s.netMu.Unlock()
