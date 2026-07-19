@@ -461,6 +461,20 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	set.Object(cx, args, r)
 }
 
+// Encoding reports the OBJECT ENCODING name for the list at key on this shard,
+// listpack or quicklist per its live band, and whether a list lives there at all.
+// It is the value-returning form the DEBUG OBJECT line needs, reached through
+// regs.Load so a read-only probe builds no list registry on a shard that never ran
+// a list command.
+func Encoding(cx *shard.Ctx, key []byte) (string, bool) {
+	if v, ok := regs.Load(cx.St); ok {
+		if l := v.(*reg).peek(cx, key); l != nil {
+			return l.encoding().String(), true
+		}
+	}
+	return "", false
+}
+
 // MemoryUsage reports the approximate resident bytes the list at key charges and
 // whether a list lives there, the MEMORY USAGE contribution for a list key. It is
 // the per-collection footprint the demote loop weighs, reached through regs.Load

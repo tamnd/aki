@@ -19,11 +19,15 @@ import (
 // the owning shard worker, a briefer block than redis's whole-server sleep. Both
 // paths parse the same seconds argument.
 //
-// DEBUG OBJECT is deferred to its own slice: a truthful line needs a per-type
-// encoding lookup and a serialized-length accounting that this milestone has not
-// built yet, and a half-true line is worse than an honest not-yet.
+// DEBUG OBJECT builds its line in debugobject.go from the OBJECT ENCODING chain and
+// the DUMP serialize primitive; DEBUG routes on args[1] (keyAt=1 in Dispatch) so the
+// OBJECT subcommand reaches the key's owning shard, and the keyless subcommands
+// either fall through (no args[1]) or land on a hashed shard where their stub is
+// shard-agnostic.
 func debugCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	switch upperVerb(args[0]) {
+	case "OBJECT":
+		debugObject(cx, args, r)
 	case "SLEEP":
 		// The reactor path (the default driver intercepts this before dispatch).
 		if len(args) != 2 {

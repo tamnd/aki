@@ -176,6 +176,11 @@ func init() {
 	// in the network intercept on the default driver; this registration serves the
 	// keyless stubs and the reactor's SLEEP path.
 	register("DEBUG", debugCmd, 1, -1, false)
+	// DEBUG OBJECT key reads the value at args[1], so DEBUG routes on that key the
+	// same keyAt=1 way OBJECT does: it reaches the owning shard when a key follows
+	// the subcommand, and the keyless subcommands (SLEEP, the OK stubs) have no
+	// args[1] to route on or land on a hashed shard where the stub is shard-agnostic.
+	table["DEBUG"].keyAt = 1
 	// The cluster and replication stubs (see cluster.go): f3 is one standalone
 	// node, so these answer the truthful standalone topology and refuse anything
 	// that implies a cluster or a replica f3 does not have.

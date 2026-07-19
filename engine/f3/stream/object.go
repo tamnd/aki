@@ -30,6 +30,20 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	hash.Object(cx, args, r)
 }
 
+// Encoding reports the OBJECT ENCODING name for the stream at key on this shard,
+// always "stream" whichever band it is in, and whether a stream lives there at all.
+// It is the value-returning form the DEBUG OBJECT line needs, reached through
+// regs.Load so a read-only probe builds no stream registry on a shard that never
+// ran a stream command.
+func Encoding(cx *shard.Ctx, key []byte) (string, bool) {
+	if v, ok := regs.Load(cx.St); ok {
+		if v.(*reg).peek(cx, key) != nil {
+			return "stream", true
+		}
+	}
+	return "", false
+}
+
 // MemoryUsage reports the approximate resident bytes the stream at key charges
 // and whether a stream lives there, the MEMORY USAGE contribution for a stream
 // key. It is the per-collection footprint the demote loop weighs, reached through

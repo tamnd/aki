@@ -55,6 +55,20 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Bulk([]byte(stringEncoding(v)))
 }
 
+// Encoding reports the OBJECT ENCODING name for the set at key on this shard,
+// intset, listpack, or hashtable per its live band, and whether a set lives there
+// at all. It is the value-returning form the DEBUG OBJECT line needs, the same
+// non-creating peek the Reply-writing Object uses, so a shard that ran no set
+// command answers ("", false) and leaves no residency state behind.
+func Encoding(cx *shard.Ctx, key []byte) (string, bool) {
+	if cx.Coll != nil {
+		if s := cx.Coll.(*reg).peek(cx, key); s != nil {
+			return s.enc.String(), true
+		}
+	}
+	return "", false
+}
+
 func stringEncoding(v []byte) string {
 	if _, ok := store.ParseInt(v); ok {
 		return "int"
