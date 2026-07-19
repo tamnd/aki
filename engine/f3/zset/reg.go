@@ -222,6 +222,11 @@ func (g *reg) peek(cx *shard.Ctx, key []byte) *zset {
 		return nil
 	}
 	if z.expireAt != 0 && z.expireAt <= cx.NowMs {
+		// A lazily-expired zset publishes the expired event on its way out, the same
+		// notification the active cycle sends, so a subscriber learns of the drop
+		// whether a touch or the reaper found it. Gated on the notify mask, so it
+		// costs one atomic load only when a zset actually expires here.
+		cx.NotifyKeyspaceEvent(shard.NotifyExpired, "expired", key)
 		g.drop(key)
 		return nil
 	}

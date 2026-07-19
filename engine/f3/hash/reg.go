@@ -290,6 +290,10 @@ func (g *reg) peek(cx *shard.Ctx, key []byte) *hash {
 		return nil
 	}
 	if h.expireAt != 0 && h.expireAt <= cx.NowMs {
+		// A lazily-expired hash publishes the expired event on its way out, the same
+		// notification the active cycle sends. Gated on the notify mask, so it costs
+		// one atomic load only when a hash actually expires here.
+		cx.NotifyKeyspaceEvent(shard.NotifyExpired, "expired", key)
 		g.drop(key)
 		return nil
 	}

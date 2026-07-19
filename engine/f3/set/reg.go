@@ -218,6 +218,10 @@ func (g *reg) peek(cx *shard.Ctx, key []byte) *set {
 		return nil
 	}
 	if s.expireAt != 0 && s.expireAt <= cx.NowMs {
+		// A lazily-expired set publishes the expired event on its way out, the same
+		// notification the active cycle sends. Gated on the notify mask, so it costs
+		// one atomic load only when a set actually expires here.
+		cx.NotifyKeyspaceEvent(shard.NotifyExpired, "expired", key)
 		g.drop(key)
 		return nil
 	}

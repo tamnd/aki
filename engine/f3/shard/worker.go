@@ -169,6 +169,11 @@ func newWorker(id int, st *store.Store) *worker {
 	w := &worker{id: id, st: st, done: make(chan struct{})}
 	w.cx.St = st
 	w.cx.w = w
+	// Route the store's expired-key reap (lazy touch and active cycle) through this
+	// worker's keyspace-notification path. The store cannot import shard's Ctx, so it
+	// calls this plain sink; the closure reads w.publisher at emit time, so wiring it
+	// here before UsePublisher runs is safe.
+	st.SetExpiredSink(w.emitExpired)
 	w.argv = make([][]byte, 0, 16)
 	w.wakes = make([]*Conn, 0, drainPassCap)
 	w.keyQ = make(map[string]*keyList)

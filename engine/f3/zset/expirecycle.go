@@ -25,6 +25,9 @@ func ReapExpired(cx *shard.Ctx, nowMs int64, budget int) int {
 		}
 		seen++
 		if z.expireAt != 0 && z.expireAt <= nowMs {
+			// Publish the expired event for the reaped key, the same notification the
+			// lazy path sends on a touch. Gated on the notify mask.
+			cx.NotifyKeyspaceEvent(shard.NotifyExpired, "expired", []byte(k))
 			g.drop([]byte(k))
 			reaped++
 		}

@@ -3,6 +3,8 @@ package drivers
 import (
 	"testing"
 	"time"
+
+	"github.com/tamnd/aki/engine/f3/shard"
 )
 
 // TestDebugSleep checks DEBUG SLEEP blocks for about the requested time and then
@@ -31,6 +33,9 @@ func TestDebugSleepBadArg(t *testing.T) {
 // acknowledge with OK, so a harness setup step does not fail on them.
 func TestDebugStubsOK(t *testing.T) {
 	_, nc, br := startServer(t)
+	// SET-ACTIVE-EXPIRE 0 below flips a process-global toggle; restore it so this
+	// test does not silently disable the active-expiry cycle for later tests.
+	defer shard.SetActiveExpire(true)
 	cases := [][]string{
 		{"DEBUG", "JMAP"},
 		{"DEBUG", "SET-ACTIVE-EXPIRE", "0"},
