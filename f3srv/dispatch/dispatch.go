@@ -153,6 +153,10 @@ func init() {
 	register("ECHO", echo, 1, 1, false)
 	register("TIME", timeCmd, 0, 0, false)
 	register("SELECT", selectDB, 1, 1, false)
+	// SWAPDB swaps two numbered databases (see swapdb.go). f3 keeps one keyspace,
+	// so the only swap it can name is database 0 with itself, a confirmed no-op;
+	// any other index is out of range. Keyless, two index arguments.
+	register("SWAPDB", swapdbCmd, 2, 2, false)
 	register("LOLWUT", lolwut, 0, -1, false)
 	register("RESET", reset, 0, 0, false)
 	// AUTH always declines: f3 sets no password (see authCmd). One or two args,
