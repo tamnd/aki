@@ -207,7 +207,7 @@ func logClaimResults(cx *shard.Ctx, key, groupName []byte, grp *streamGroup, con
 // fail-closed cut recovery wants; a structurally valid op that no longer applies (a consumer
 // or pel op on an absent stream or group) is a defensive no-op, since a deterministic replay
 // never produces one.
-func applyGroupOp(g *reg, key []byte, op akifile.CollOpRow) error {
+func applyGroupOp(cx *shard.Ctx, g *reg, key []byte, op akifile.CollOpRow) error {
 	switch op.Op {
 	case streamOpGroupSet:
 		if len(op.SubValue) < 16+8+1 {
@@ -216,7 +216,7 @@ func applyGroupOp(g *reg, key []byte, op akifile.CollOpRow) error {
 		lastID := readID16(op.SubValue[0:16])
 		entriesRead := binary.LittleEndian.Uint64(op.SubValue[16:24])
 		valid := op.SubValue[24] != 0
-		applyGroupSet(g, key, op.SubKey, lastID, entriesRead, valid)
+		applyGroupSet(cx, g, key, op.SubKey, lastID, entriesRead, valid)
 	case streamOpGroupDestroy:
 		applyGroupDestroy(g, key, op.SubKey)
 	case streamOpConsumerSet:
@@ -251,8 +251,8 @@ func applyGroupOp(g *reg, key []byte, op akifile.CollOpRow) error {
 // applyGroupSet creates the named group on first sight, building the stream under it when a
 // MKSTREAM stream carried no entries, or grafts the cursor and lag basis onto an existing
 // group. It upgrades the stream to the native band the group table needs.
-func applyGroupSet(g *reg, key, name []byte, lastID streamID, entriesRead uint64, valid bool) {
-	s := getOrCreateStream(g, key)
+func applyGroupSet(cx *shard.Ctx, g *reg, key, name []byte, lastID streamID, entriesRead uint64, valid bool) {
+	s := getOrCreateStream(cx, g, key)
 	s.ensureNative()
 	grp := s.group(name)
 	if grp == nil {

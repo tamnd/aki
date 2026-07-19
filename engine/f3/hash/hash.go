@@ -47,6 +47,14 @@ func (e encoding) String() string {
 type hash struct {
 	enc encoding
 
+	// clock is the per-key access clock OBJECT IDLETIME reads back: the batch
+	// second-resolution time (store.LRUClock) stamped on every read and write the
+	// way Redis stamps robj.lru, folded to sixteen bits. It rides the alignment
+	// padding after enc, so a hash carries a real idle clock at zero added bytes,
+	// the same free-header trick the string cell uses (store record offKindBits).
+	// It wraps every ~18.2h, the fidelity price of spending no bytes.
+	clock uint16
+
 	// inline band: one packed blob, laid out as [count:uint16-le][flags:uint8]
 	// then count entries of [flen:uint8][field][vlen:uint8][value] (spec
 	// 2064/f3/10 section 4.1). Field names and values are both capped at 64 bytes

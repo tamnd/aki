@@ -253,10 +253,10 @@ func Recover(cx *shard.Ctx) error {
 	g := registry(cx)
 	return cx.St.WalkCollection(akifile.CollKindZset,
 		func(key []byte, snap akifile.CollSnapRow) error {
-			return applyZsetSnapshot(g, key, snap)
+			return applyZsetSnapshot(cx, g, key, snap)
 		},
 		func(key []byte, op akifile.CollOpRow) error {
-			return applyZsetOp(g, key, op)
+			return applyZsetOp(cx, g, key, op)
 		})
 }
 
@@ -266,13 +266,13 @@ func Recover(cx *shard.Ctx) error {
 // and an effect replay use, and restores the key TTL from the header. An empty element
 // run leaves the key dropped, since the registry keeps no empty zset. A torn run reports
 // ErrLength, the fail-closed cut a recovering reader wants.
-func applyZsetSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
+func applyZsetSnapshot(cx *shard.Ctx, g *reg, key []byte, snap akifile.CollSnapRow) error {
 	g.drop(key)
 	var z *zset
 	if !eachScoredEntry(snap.ElementRun, func(score float64, member []byte) {
 		if z == nil {
 			z = newZset()
-			g.m[string(key)] = z
+			g.install(cx, key, z)
 		}
 		z.update(member, score, flags{})
 	}) {
@@ -294,7 +294,7 @@ func applyZsetSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
 // effect arm the recovery walk drives. It goes through z.update, so a member that breaches
 // a listpack cap promotes to the native band exactly as it did live. A torn add score or a
 // torn expire payload reports ErrLength.
-func applyZsetOp(g *reg, key []byte, op akifile.CollOpRow) error {
+func applyZsetOp(cx *shard.Ctx, g *reg, key []byte, op akifile.CollOpRow) error {
 	switch op.Op {
 	case zsetOpAdd:
 		if len(op.SubValue) < 8 {
@@ -304,7 +304,7 @@ func applyZsetOp(g *reg, key []byte, op akifile.CollOpRow) error {
 		z := g.m[string(key)]
 		if z == nil {
 			z = newZset()
-			g.m[string(key)] = z
+			g.install(cx, key, z)
 		}
 		z.update(op.SubKey, score, flags{})
 		g.note(z)

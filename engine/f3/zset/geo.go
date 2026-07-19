@@ -247,7 +247,7 @@ flagsLoop:
 		}
 	} else {
 		if created {
-			g.m[string(key)] = z
+			g.install(cx, key, z)
 		}
 		g.note(z)
 	}

@@ -56,7 +56,7 @@ func pushCmd(cx *shard.Ctx, args [][]byte, r shard.Reply, front, create bool) {
 			return
 		}
 		l = newList()
-		g.m[string(key)] = l
+		g.install(cx, key, l)
 	}
 	for _, v := range args[1:] {
 		if front {
@@ -452,7 +452,7 @@ func Lpos(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if eqFold(args[0], "ENCODING") && len(args) == 2 {
 		if v, ok := regs.Load(cx.St); ok {
-			if l := v.(*reg).live(cx, args[1]); l != nil {
+			if l := v.(*reg).peek(cx, args[1]); l != nil {
 				r.Bulk([]byte(l.encoding().String()))
 				return
 			}
@@ -468,7 +468,7 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // command.
 func MemoryUsage(cx *shard.Ctx, key []byte) (uint64, bool) {
 	if v, ok := regs.Load(cx.St); ok {
-		if l := v.(*reg).live(cx, key); l != nil {
+		if l := v.(*reg).peek(cx, key); l != nil {
 			return l.residentBytes(), true
 		}
 	}

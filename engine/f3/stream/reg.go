@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/engine/f3/store"
 )
 
 // The stream type keeps its per-key objects in an owner-local registry, the same
@@ -148,8 +149,7 @@ func Has(cx *shard.Ctx, key []byte) bool {
 	if !ok {
 		return false
 	}
-	s, _ := v.(*reg).lookup(cx, key)
-	return s != nil
+	return v.(*reg).peek(cx, key) != nil
 }
 
 // Delete removes key when it holds a stream on this shard and reports whether it
@@ -200,13 +200,42 @@ func (g *reg) drop(key []byte) {
 	delete(g.m, string(key))
 }
 
+// install puts a freshly built stream under key and stamps its access clock, so a
+// brand-new key reads idle zero and then accrues idle from creation the way Redis
+// stamps robj.lru in createObject. Every path that first places a stream in the map
+// (XADD create, XGROUP CREATE MKSTREAM, WAL replay) routes through here, so no create
+// path leaves the clock at zero, which the idle read would otherwise misreport as a
+// near-full wrap of idle time. It does not touch the resident total; the caller's note
+// posts the new stream's footprint.
+func (g *reg) install(cx *shard.Ctx, key []byte, s *stream) {
+	s.clock = store.LRUClock(cx.NowMs)
+	g.m[string(key)] = s
+}
+
 // live returns the stream at key, or nil when none exists or the stream's
 // key-level deadline has passed (spec 2064/f3/16 section 2). An expired stream is
 // dropped here and treated as absent, so it is dead to this command and every later
 // one in the epoch, the lazy-expiry half of the TTL contract. An emptied stream
 // with no deadline is kept, matching Redis; only a fired deadline drops it. This is
-// the one funnel every read, mutate, create, and probe path routes through.
+// the one funnel every read, mutate, and create path routes through.
 func (g *reg) live(cx *shard.Ctx, key []byte) *stream {
+	s := g.peek(cx, key)
+	if s != nil {
+		// Record the access the way Redis stamps robj.lru on every lookup: live is
+		// the read, mutate, and create funnel, so one stamp here clocks every real
+		// command. The read-only probes (peek) skip it, so OBJECT IDLETIME, OBJECT
+		// ENCODING, MEMORY USAGE, EXISTS, and TYPE are NOTOUCH, matching Redis.
+		s.clock = store.LRUClock(cx.NowMs)
+	}
+	return s
+}
+
+// peek returns the live stream at key without recording an access, the NOTOUCH
+// resolve the read-only introspection and presence probes use so a query does
+// not reset the key's idle clock. It still reaps a stream whose key-level deadline
+// has passed, since an expired stream is absent to a probe just as it is to a
+// command.
+func (g *reg) peek(cx *shard.Ctx, key []byte) *stream {
 	s := g.m[string(key)]
 	if s == nil {
 		return nil
@@ -216,6 +245,29 @@ func (g *reg) live(cx *shard.Ctx, key []byte) *stream {
 		return nil
 	}
 	return s
+}
+
+// IdleSeconds reports seconds since the stream at key was last accessed by a
+// command, the stream arm of OBJECT IDLETIME, read back from the per-key access
+// clock without touching it (NOTOUCH). ok is false when no stream lives at key, so
+// the dispatcher can fall through to the other keyspaces.
+func (g *reg) IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
+	s := g.peek(cx, key)
+	if s == nil {
+		return 0, false
+	}
+	return store.IdleSecondsFrom(s.clock, cx.NowMs), true
+}
+
+// IdleSeconds is the package entry the dispatcher calls for OBJECT IDLETIME on a
+// stream key. It reaches the registry through regs.Load so it builds no registry
+// and registers no gc maintainer on a shard that never ran a stream command, the
+// read-only discipline every probe keeps.
+func IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
+	if v, ok := regs.Load(cx.St); ok {
+		return v.(*reg).IdleSeconds(cx, key)
+	}
+	return 0, false
 }
 
 // Flush drops every stream on this shard, the stream arm of FLUSHALL and

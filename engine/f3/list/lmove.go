@@ -93,7 +93,7 @@ func lmove(g *reg, cx *shard.Ctx, srcKey, dstKey []byte, srcLeft, dstLeft bool) 
 	// is always born listpack and only the byte budget moves it to the native band.
 	if dst == nil {
 		dst = newList()
-		g.m[string(dstKey)] = dst
+		g.install(cx, dstKey, dst)
 	}
 	pushEnd(dst, v, dstLeft)
 	// The push made the destination non-empty, so a BLPOP/BLMPOP/BLMOVE-source

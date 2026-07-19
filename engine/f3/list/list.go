@@ -75,6 +75,14 @@ type list struct {
 
 	everLarge bool
 
+	// clock is the per-key access clock OBJECT IDLETIME reads back: the batch
+	// second-resolution time (store.LRUClock) stamped on every read and write the
+	// way Redis stamps robj.lru, folded to sixteen bits. It rides the alignment
+	// padding after everLarge, so a list carries a real idle clock at zero added
+	// bytes, the same free-header trick the string cell uses (store record
+	// offKindBits). It wraps every ~18.2h, the fidelity price of spending no bytes.
+	clock uint16
+
 	// expireAt is the key-level TTL deadline in ms since the epoch, 0 when the list
 	// has no expiry (spec 2064/f3/16 section 2). It rides inline on the list rather
 	// than in a side "expires" dict the way Redis keeps one: a second dict would be a

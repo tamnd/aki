@@ -269,10 +269,10 @@ func Recover(cx *shard.Ctx) error {
 	g := registry(cx)
 	return cx.St.WalkCollection(akifile.CollKindList,
 		func(key []byte, snap akifile.CollSnapRow) error {
-			return applyListSnapshot(g, key, snap)
+			return applyListSnapshot(g, cx, key, snap)
 		},
 		func(key []byte, op akifile.CollOpRow) error {
-			return applyListOp(g, key, op)
+			return applyListOp(g, cx, key, op)
 		})
 }
 
@@ -283,13 +283,13 @@ func Recover(cx *shard.Ctx) error {
 // and an effect replay use, and restores the key TTL from the header. An empty element run
 // leaves the key dropped, since the registry keeps no empty list. A torn run reports
 // ErrLength, the fail-closed cut a recovering reader wants.
-func applyListSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
+func applyListSnapshot(g *reg, cx *shard.Ctx, key []byte, snap akifile.CollSnapRow) error {
 	g.drop(key)
 	var l *list
 	if !eachFrame(snap.ElementRun, func(v []byte) {
 		if l == nil {
 			l = newList()
-			g.m[string(key)] = l
+			g.install(cx, key, l)
 		}
 		l.pushBack(v)
 	}) {
@@ -315,14 +315,14 @@ func applyListSnapshot(g *reg, key []byte, snap akifile.CollSnapRow) error {
 // short LSET or LTRIM header, or a short expire deadline), the fail-closed cut recovery
 // wants; a structurally valid op that no longer applies (a pop or LSET on an absent or
 // too-short list) is a defensive no-op, since a deterministic replay never produces one.
-func applyListOp(g *reg, key []byte, op akifile.CollOpRow) error {
+func applyListOp(g *reg, cx *shard.Ctx, key []byte, op akifile.CollOpRow) error {
 	switch op.Op {
 	case listOpPushFront:
-		l := getOrCreate(g, key)
+		l := getOrCreate(g, cx, key)
 		l.pushFront(op.SubValue)
 		g.note(l)
 	case listOpPushBack:
-		l := getOrCreate(g, key)
+		l := getOrCreate(g, cx, key)
 		l.pushBack(op.SubValue)
 		g.note(l)
 	case listOpPopFront:
@@ -405,11 +405,11 @@ func applyListOp(g *reg, key []byte, op akifile.CollOpRow) error {
 
 // getOrCreate returns the list at key, building an empty one and registering it on first
 // touch, the create-on-first-push shape a live push and an effect replay share.
-func getOrCreate(g *reg, key []byte) *list {
+func getOrCreate(g *reg, cx *shard.Ctx, key []byte) *list {
 	l := g.m[string(key)]
 	if l == nil {
 		l = newList()
-		g.m[string(key)] = l
+		g.install(cx, key, l)
 	}
 	return l
 }

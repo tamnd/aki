@@ -26,7 +26,7 @@ func Sadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			return
 		}
 		s = newSet(args[1])
-		g.m[string(key)] = s
+		g.install(cx, key, s)
 	}
 	var added int64
 	for _, m := range args[1:] {

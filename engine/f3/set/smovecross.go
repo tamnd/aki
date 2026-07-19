@@ -42,7 +42,7 @@ func SmoveCross(t *shard.Txn, src, dst, member []byte) []byte {
 		// type-check hop saves the fourth hop the naive plan pays.
 		if d == nil {
 			d = newSet(member)
-			g.m[string(dst)] = d
+			g.install(cx, dst, d)
 		}
 		d.add(member)
 		g.note(d)

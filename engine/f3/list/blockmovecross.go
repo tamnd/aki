@@ -72,7 +72,7 @@ func moveCrossOnce(t *shard.Txn, src, dst []byte, srcLeft, dstLeft bool) (rep []
 		}
 		if d == nil {
 			d = newList()
-			g.m[string(dst)] = d
+			g.install(cx, dst, d)
 		}
 		pushEnd(d, elem, dstLeft)
 		serveWaiters(cx, g, dst, d)
@@ -212,7 +212,7 @@ func runMoveCross(rt *shard.Runtime, src, dst []byte, head uint32, srcLeft, dstL
 		}
 		if d == nil {
 			d = newList()
-			g.m[string(dst)] = d
+			g.install(cx, dst, d)
 		}
 		pushEnd(d, elem, dstLeft)
 		serveWaiters(cx, g, dst, d)

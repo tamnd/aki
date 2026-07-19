@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/engine/f3/store"
 )
 
 // The list type keeps its per-key structures in an owner-local registry: one map
@@ -67,8 +68,7 @@ func Has(cx *shard.Ctx, key []byte) bool {
 	if !ok {
 		return false
 	}
-	l, _ := v.(*reg).lookup(cx, key)
-	return l != nil
+	return v.(*reg).peek(cx, key) != nil
 }
 
 // Delete removes key when it holds a list on this shard and reports whether it
@@ -183,8 +183,24 @@ func (g *reg) lookup(cx *shard.Ctx, key []byte) (l *list, wrong bool) {
 // and treated as absent, so it is dead to this command and every later one in the
 // epoch, the lazy-expiry half of the TTL contract. Unlike the hash there is no
 // per-field TTL to reap, so this is the plain deadline check the set and zset carry.
-// This is the one funnel every read, mutate, create, and probe path routes through.
+// This is the one funnel every read, mutate, and create path routes through.
 func (g *reg) live(cx *shard.Ctx, key []byte) *list {
+	l := g.peek(cx, key)
+	if l != nil {
+		// Record the access the way Redis stamps robj.lru on every lookup: live is
+		// the read, mutate, and create funnel, so one stamp here clocks every real
+		// command. The read-only probes (peek) skip it, so OBJECT IDLETIME, OBJECT
+		// ENCODING, MEMORY USAGE, EXISTS, and TYPE are NOTOUCH, matching Redis.
+		l.clock = store.LRUClock(cx.NowMs)
+	}
+	return l
+}
+
+// peek returns the live list at key without recording an access, the NOTOUCH
+// resolve the read-only introspection and presence probes use so a query does
+// not reset the key's idle clock. It still reaps a lazily-expired list, since an
+// expired list is absent to a probe just as it is to a command.
+func (g *reg) peek(cx *shard.Ctx, key []byte) *list {
 	l := g.m[string(key)]
 	if l == nil {
 		return nil
@@ -194,6 +210,41 @@ func (g *reg) live(cx *shard.Ctx, key []byte) *list {
 		return nil
 	}
 	return l
+}
+
+// install puts a freshly built list under key and stamps its access clock, so a
+// brand-new key reads idle zero and then accrues idle from creation the way Redis
+// stamps robj.lru in createObject. Every path that first places a list in the map
+// (the push create path, an LMOVE/RPOPLPUSH destination, a blocking cross-move
+// destination, WAL replay) routes through here, so no create path leaves the clock
+// at zero, which the idle read would otherwise misreport as a near-full wrap of
+// idle time. It does not touch the resident total; the caller's note posts the new
+// list's footprint.
+func (g *reg) install(cx *shard.Ctx, key []byte, l *list) {
+	l.clock = store.LRUClock(cx.NowMs)
+	g.m[string(key)] = l
+}
+
+// IdleSeconds reports seconds since the list at key was last accessed by a
+// command, the list arm of OBJECT IDLETIME, read back from the per-key access
+// clock without touching it (NOTOUCH). ok is false when no list lives at key, so
+// the dispatcher can fall through to the other keyspaces.
+func (g *reg) IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
+	l := g.peek(cx, key)
+	if l == nil {
+		return 0, false
+	}
+	return store.IdleSecondsFrom(l.clock, cx.NowMs), true
+}
+
+// IdleSeconds is the package entry the dispatcher calls for OBJECT IDLETIME on a
+// list key. It reaches the registry through regs.Load so it builds none when no
+// list command has run on this shard, the read-only discipline every probe keeps.
+func IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
+	if v, ok := regs.Load(cx.St); ok {
+		return v.(*reg).IdleSeconds(cx, key)
+	}
+	return 0, false
 }
 
 // note reconciles l's footprint into the running resident total: it posts the

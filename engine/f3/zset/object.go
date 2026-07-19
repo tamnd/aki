@@ -16,7 +16,7 @@ func Encoding(cx *shard.Ctx, key []byte) (string, bool) {
 	if cx.ZColl == nil {
 		return "", false
 	}
-	if z := cx.ZColl.(*reg).live(cx, key); z != nil {
+	if z := cx.ZColl.(*reg).peek(cx, key); z != nil {
 		return z.enc.String(), true
 	}
 	return "", false
@@ -30,7 +30,7 @@ func MemoryUsage(cx *shard.Ctx, key []byte) (uint64, bool) {
 	if cx.ZColl == nil {
 		return 0, false
 	}
-	if z := cx.ZColl.(*reg).live(cx, key); z != nil {
+	if z := cx.ZColl.(*reg).peek(cx, key); z != nil {
 		return z.residentBytes(), true
 	}
 	return 0, false

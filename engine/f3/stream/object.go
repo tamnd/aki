@@ -21,7 +21,7 @@ import (
 func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if eqFold(args[0], "ENCODING") && len(args) == 2 {
 		if v, ok := regs.Load(cx.St); ok {
-			if v.(*reg).live(cx, args[1]) != nil {
+			if v.(*reg).peek(cx, args[1]) != nil {
 				r.Bulk([]byte("stream"))
 				return
 			}
@@ -37,7 +37,7 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // ran a stream command.
 func MemoryUsage(cx *shard.Ctx, key []byte) (uint64, bool) {
 	if v, ok := regs.Load(cx.St); ok {
-		if s := v.(*reg).live(cx, key); s != nil {
+		if s := v.(*reg).peek(cx, key); s != nil {
 			return s.residentBytes(), true
 		}
 	}

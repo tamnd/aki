@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/engine/f3/store"
 )
 
 // The hash type keeps its per-key structures in an owner-local registry: one map
@@ -138,16 +139,16 @@ func ResidentBytes(cx *shard.Ctx) uint64 {
 
 // Has reports whether key holds a hash on this shard, without building the
 // registry when none exists yet: the presence probe the unified TYPE consults
-// across the collection types. Like lookup it reaps expired fields first, so a
-// hash emptied by field expiry reads as absent. A string value or another
+// across the collection types. It resolves through peek (NOTOUCH), which reaps
+// expired fields first, so a hash emptied by field expiry reads as absent while
+// the probe leaves the key's idle clock alone. A string value or another
 // collection at key reads false, leaving the type to the caller's other probes.
 func Has(cx *shard.Ctx, key []byte) bool {
 	v, ok := regs.Load(cx.St)
 	if !ok {
 		return false
 	}
-	h, _ := v.(*reg).lookup(cx, key)
-	return h != nil
+	return v.(*reg).peek(cx, key) != nil
 }
 
 // Delete removes key when it holds a hash on this shard and reports whether it
@@ -262,14 +263,28 @@ func (g *reg) lookup(cx *shard.Ctx, key []byte) (h *hash, wrong bool) {
 }
 
 // live returns the hash at key, or nil when none exists or the hash has lazily
-// expired. It resolves two nested expiries in order: first the whole key's
-// key-level deadline (h.expireAt, spec 2064/f3/16 section 2), which drops the hash
-// entire and skips the field reap; then the per-field TTLs (h.reap, spec
-// 2064/f3/10 section 6.1), which delete fired fields and drop a hash the reap
-// empties. Either way an expired hash is dropped here and treated as absent, so it
-// is dead to this command and every later one in the epoch. This is the one funnel
-// every read, mutate, create, and probe path routes through.
+// expired, and records the access on the way. It is the one funnel every read,
+// mutate, and create path routes through, so one stamp here clocks every real
+// command the way Redis stamps robj.lru on every lookup. The read-only probes
+// (peek) skip the stamp, so OBJECT IDLETIME, OBJECT ENCODING, MEMORY USAGE,
+// EXISTS, and TYPE are NOTOUCH, matching Redis.
 func (g *reg) live(cx *shard.Ctx, key []byte) *hash {
+	h := g.peek(cx, key)
+	if h != nil {
+		h.clock = store.LRUClock(cx.NowMs)
+	}
+	return h
+}
+
+// peek returns the live hash at key without recording an access, the NOTOUCH
+// resolve the read-only introspection and presence probes use so a query does
+// not reset the key's idle clock. It still resolves the two nested expiries in
+// order: first the whole key's key-level deadline (h.expireAt, spec 2064/f3/16
+// section 2), which drops the hash entire and skips the field reap; then the
+// per-field TTLs (h.reap, spec 2064/f3/10 section 6.1), which delete fired fields
+// and drop a hash the reap empties. Either way an expired hash is dropped here and
+// treated as absent, so it is dead to a probe just as it is to a command.
+func (g *reg) peek(cx *shard.Ctx, key []byte) *hash {
 	h := g.m[string(key)]
 	if h == nil {
 		return nil
@@ -288,6 +303,41 @@ func (g *reg) live(cx *shard.Ctx, key []byte) *hash {
 		return nil
 	}
 	return h
+}
+
+// install puts a freshly built hash under key and stamps its key-level access
+// clock, so a brand-new key reads idle zero and then accrues idle from creation
+// the way Redis stamps robj.lru in createObject. Every path that first places a
+// hash in the map (the HSET-family create path, WAL replay) routes through here,
+// so no create path leaves the clock at zero, which the idle read would otherwise
+// misreport as a near-full wrap of idle time. It stamps only the whole-key access
+// clock, never a per-field TTL, and does not touch the resident total; the
+// caller's note posts the new hash's footprint.
+func (g *reg) install(cx *shard.Ctx, key []byte, h *hash) {
+	h.clock = store.LRUClock(cx.NowMs)
+	g.m[string(key)] = h
+}
+
+// IdleSeconds reports seconds since the hash at key was last accessed by a
+// command, the hash arm of OBJECT IDLETIME, read back from the per-key access
+// clock without touching it (NOTOUCH). ok is false when no hash lives at key, so
+// the dispatcher can fall through to the other keyspaces.
+func (g *reg) IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
+	h := g.peek(cx, key)
+	if h == nil {
+		return 0, false
+	}
+	return store.IdleSecondsFrom(h.clock, cx.NowMs), true
+}
+
+// IdleSeconds is the package entry the dispatcher calls for OBJECT IDLETIME on a
+// hash key. It reaches the registry through regs.Load so it builds none when no
+// hash command has run on this shard, the read-only discipline every probe keeps.
+func IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
+	if v, ok := regs.Load(cx.St); ok {
+		return v.(*reg).IdleSeconds(cx, key)
+	}
+	return 0, false
 }
 
 // drop removes an emptied hash from the registry: Redis deletes a hash the moment

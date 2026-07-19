@@ -4,6 +4,9 @@ import (
 	"encoding/binary"
 	"math/rand/v2"
 	"testing"
+
+	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/engine/f3/store"
 )
 
 // The native-band microbenchmarks (doc 11 section 2.4). SISMEMBER is the probe
@@ -102,6 +105,29 @@ var sinkBytes []byte
 
 func benchReg() *reg {
 	return &reg{m: map[string]*set{}, rng: *rand.NewPCG(0x9e3779b97f4a7c15, 0xbf58476d1ce4e5b9)}
+}
+
+// BenchmarkSetLive drives the live funnel every set read and write routes through,
+// the one that now stamps the per-key access clock OBJECT IDLETIME reads back. It
+// fills a registry with a million one-member sets and resolves a rotating key each
+// iteration, so the timed cost is the map lookup, the deadline check, and the clock
+// stamp: the number the collection-clock slice must not move on the collection hot
+// path (labs/f3/m9/02_collection_idle_clock).
+func BenchmarkSetLive(b *testing.B) {
+	const keys = 1 << 20
+	g := benchReg()
+	ks := members16(keys)
+	for _, k := range ks {
+		g.m[string(k)] = newSet(k)
+	}
+	cx := &shard.Ctx{St: store.New(16<<20, 0), NowMs: 1_000_000_000}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if g.live(cx, ks[i&(keys-1)]) == nil {
+			b.Fatal("miss")
+		}
+	}
 }
 
 func benchSRandMember(b *testing.B, n int) {

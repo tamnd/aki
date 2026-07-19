@@ -46,6 +46,14 @@ func (e encoding) String() string {
 type zset struct {
 	enc encoding
 
+	// clock is the per-key access clock OBJECT IDLETIME reads back: the batch
+	// second-resolution time (store.LRUClock) stamped on every read and write the
+	// way Redis stamps robj.lru, folded to sixteen bits. It rides the alignment
+	// padding after enc, so a zset carries a real idle clock at zero added bytes,
+	// the same free-header trick the string cell uses (store record offKindBits).
+	// It wraps every ~18.2h, the fidelity price of spending no bytes.
+	clock uint16
+
 	// listpack-class: packed entries in score-then-member order, each
 	// [len:uint8][tag:uint8][member bytes][score:8 big-endian float64 bits]. len
 	// is at most maxListpackValue so it fits one byte; tag is the member's first

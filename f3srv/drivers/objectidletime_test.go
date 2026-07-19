@@ -6,9 +6,10 @@ import "testing"
 // through the real dispatch verb. A missing key is the null bulk redis 8.8.0
 // returns (verified live: distinct from the "no such key" error REFCOUNT gives),
 // a just-touched string reads its per-key access clock at idle zero, and a
-// present collection reports zero for now (collections carry no access clock this
-// slice). The exact-second arithmetic is proved deterministically in the store's
-// idle_test; this test pins the wire shapes and dispatch routing.
+// present collection reads the matching clock in its struct padding, also idle
+// zero right after the write. The exact-second arithmetic is proved
+// deterministically in the store idle_test and the per-type packages; this test
+// pins the wire shapes and dispatch routing.
 func TestObjectIdleTimeEveryType(t *testing.T) {
 	_, nc, br := startServer(t)
 
@@ -34,7 +35,11 @@ func TestObjectIdleTimeEveryType(t *testing.T) {
 	send(t, nc, "OBJECT", "IDLETIME", "n")
 	expect(t, br, ":0\r\n")
 
-	// Every collection type reports zero for a present key this slice.
+	// Every collection type now carries a real per-key access clock in its struct
+	// padding, so a key idle zero right after the write that stamped it reads back
+	// zero here (the IDLETIME query is NOTOUCH, so it does not itself reset the
+	// clock). The deterministic idle arithmetic is proved in each type's package;
+	// this pins the wire shape and dispatch routing per type.
 	send(t, nc, "RPUSH", "l", "a", "b")
 	expect(t, br, ":2\r\n")
 	send(t, nc, "OBJECT", "IDLETIME", "l")
