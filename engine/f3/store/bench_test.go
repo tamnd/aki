@@ -74,6 +74,25 @@ func BenchmarkGet(b *testing.B) {
 	}
 }
 
+// BenchmarkGetView times the hot GET command path (GetView), the one that
+// stamps the per-key access clock OBJECT IDLETIME reads back. Unlike
+// BenchmarkGet's clockless wrapper it passes a real now, so every hit writes
+// the header's offKindBits word: this is the number the IDLETIME clock slice
+// must not move on the read cell (labs/f3/m9/01_idle_clock_stamp).
+func BenchmarkGetView(b *testing.B) {
+	s := filledStore(benchKeys, 64)
+	var kb [16]byte
+	const now = int64(1_000_000_000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := makeKey(kb[:], uint64(i)&(benchKeys-1))
+		if _, ok := s.GetView(k, now); !ok {
+			b.Fatal("miss")
+		}
+	}
+}
+
 // BenchmarkGetResident is BenchmarkGet on the LTM read path: separated
 // values under a resident cap with headroom, so every hit runs the
 // visited-bit mark (touchResident) that plain BenchmarkGet never reaches.
@@ -140,10 +159,10 @@ func BenchmarkArenaAppend(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		k := makeKey(kb[:], uint64(i))
-		off, err := s.allocString(k, align8(64), 0, 0)
+		off, err := s.allocString(k, align8(64), 0, 0, 0)
 		if err != nil {
 			s.arena.reset()
-			off, err = s.allocString(k, align8(64), 0, 0)
+			off, err = s.allocString(k, align8(64), 0, 0, 0)
 			if err != nil {
 				b.Fatal("alloc failed on a fresh arena")
 			}

@@ -1168,11 +1168,11 @@ const sharedRefcount = 2147483647
 // rejects the verb otherwise, and f3 runs no LFU policy (it exposes no
 // maxmemory-policy and keeps no per-key access counter, the memory bar wants no
 // per-key clock), so a present key always takes that rejection and a missing key
-// is the null bulk Redis returns. IDLETIME still falls to the chain's
-// unknown-subcommand error: its present-key answer is seconds since last access,
-// which needs the per-key LRU clock f3 deliberately does not keep (store/resid.go
-// tracks residency with a single SIEVE bit, no per-record clock field), so
-// answering it would mean inventing a number rather than reading one.
+// is the null bulk Redis returns. IDLETIME is answered here too: a string reads
+// the per-key access clock stamped in its record header's otherwise-free 16 bits
+// (store.IdleSeconds), a real number at zero added string bytes, while a present
+// collection reports zero pending its own clock slice and a missing key is the
+// null bulk Redis returns.
 func objectCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	if tokenIs(args[0], "REFCOUNT") && len(args) == 2 {
 		objectRefcount(cx, args[1], r)
@@ -1182,7 +1182,38 @@ func objectCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		objectFreq(cx, args[1], r)
 		return
 	}
+	if tokenIs(args[0], "IDLETIME") && len(args) == 2 {
+		objectIdleTime(cx, args[1], r)
+		return
+	}
 	stream.Object(cx, args, r)
+}
+
+// objectIdleTime answers OBJECT IDLETIME key: seconds since the key was last
+// accessed. A string reads the per-key access clock stamped in its record header
+// (store.IdleSeconds), stamped on every read and write, so the answer resets to
+// zero on the next GET or SET the way Redis resets robj.lru. A present collection
+// reports zero for now: collection types carry no access clock this slice, and
+// zero is the recently-accessed answer rather than an invented age (the follow-on
+// slice adds a real clock in the struct padding each collection already carries).
+// A key present nowhere is the null bulk Redis returns for OBJECT IDLETIME on a
+// missing key, verified against redis 8.8.0 and distinct from the "no such key"
+// error REFCOUNT gives. The probes honour the key deadline, so a lazily-expired
+// key reads as missing.
+func objectIdleTime(cx *shard.Ctx, key []byte, r shard.Reply) {
+	if idle, ok := cx.St.IdleSeconds(key, cx.NowMs); ok {
+		r.Int(idle)
+		return
+	}
+	if set.Has(cx, key) ||
+		zset.Has(cx, key) ||
+		hash.Has(cx, key) ||
+		list.Has(cx, key) ||
+		stream.Has(cx, key) {
+		r.Int(0)
+		return
+	}
+	r.Null()
 }
 
 // lfuNotSelected is the error Redis returns for OBJECT FREQ when the running

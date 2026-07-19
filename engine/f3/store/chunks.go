@@ -303,8 +303,8 @@ func (s *Store) updateChunked(addr uint64, offset int, val []byte, oldLen, newLe
 // allocChunked lays down a fresh chunked record over the logical patched
 // value, the create and band-transition twin of allocSep. The record is
 // unlinked again if the chunk build fails.
-func (s *Store) allocChunked(key, old []byte, offset int, val []byte, newLen int, flags byte, at int64) (uint64, error) {
-	off, err := s.allocString(key, ptrSize, flags|flagChunked, at)
+func (s *Store) allocChunked(key, old []byte, offset int, val []byte, newLen int, flags byte, at, now int64) (uint64, error) {
+	off, err := s.allocString(key, ptrSize, flags|flagChunked, at, now)
 	if err != nil {
 		return 0, err
 	}
