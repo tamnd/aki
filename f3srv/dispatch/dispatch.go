@@ -155,6 +155,9 @@ func init() {
 	register("SELECT", selectDB, 1, 1, false)
 	register("LOLWUT", lolwut, 0, -1, false)
 	register("RESET", reset, 0, 0, false)
+	// AUTH always declines: f3 sets no password (see authCmd). One or two args,
+	// AUTH password or AUTH username password.
+	register("AUTH", authCmd, 1, 2, false)
 	// COMMAND introspects the table itself (see command.go); redis-cli calls it
 	// on connect. The subcommand and its tail are validated in the handler.
 	register("COMMAND", commandCmd, 0, -1, false)
@@ -1120,14 +1123,28 @@ func lolwut(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Bulk([]byte("aki\n"))
 }
 
-// reset answers RESET: return the connection to its initial state and reply
-// +RESET. Redis resets the selected database, any MULTI, WATCH, subscriptions,
-// MONITOR, reply mode, and authentication. f3 offers a single database (SELECT
-// only accepts 0), speaks RESP2 with no HELLO, and carries none of that
-// per-connection state, so there is nothing to unwind: the honest reset for this
-// feature set is the +RESET acknowledgement itself.
+// reset answers RESET when it reaches the shard hop, the reactor driver's path.
+// On the default goroutine driver RESET is intercepted in the network layer
+// (client.go doReset), where it can clear the subscription set and the CLIENT
+// SETNAME label the connection accumulated. Here at the shard hop there is no
+// connection state in reach: f3 offers a single database (SELECT only accepts 0)
+// and no MULTI or auth to unwind, and the reactor never enters subscribe mode
+// (SUBSCRIBE is not intercepted there), so the honest reset is the +RESET
+// acknowledgement itself.
 func reset(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Status("RESET")
+}
+
+// authCmd answers AUTH. f3 configures no password and enforces no access
+// control, so AUTH can never succeed: it always answers the same error redis
+// gives a client that authenticates against a passwordless server. Both the one
+// argument form (AUTH password) and the two argument form (AUTH username
+// password) reach the same answer, since neither can match a credential that
+// does not exist. The message is byte matched to redis 8.8 because client
+// libraries parse it. This keyless handler mirrors HELLO's AUTH option, which
+// declines for the same reason in the network layer.
+func authCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+	r.Err("ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?")
 }
 
 // typeCmd answers TYPE key, spanning every keyspace f3 keeps: the string store

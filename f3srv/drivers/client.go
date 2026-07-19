@@ -5,21 +5,24 @@ import (
 	"github.com/tamnd/aki/f3srv/resp"
 )
 
-// The connection-identity surface (spec 2064/f3/11, the M11 command-closure
-// milestone): CLIENT and HELLO, the two verbs a client library runs the moment
-// it connects. Both answer from per-connection state (the id stamped in
-// register, the SETNAME label on connState), and that state lives in the network
-// layer, not the shard workers, the same split pub/sub uses. So they are
-// intercepted here before the shard hop, and their solicited replies go out
-// through InlineReply in pipeline order.
+// The connection-lifecycle surface (spec 2064/f3/11, the M11 command-closure
+// milestone): CLIENT, HELLO, QUIT, and RESET, the verbs a client runs to open,
+// label, reset, and close a connection. Each reads or clears per-connection
+// state (the id stamped in register, the SETNAME label, the subscription set),
+// and that state lives in the network layer, not the shard workers, the same
+// split pub/sub uses. So they are intercepted here before the shard hop, and
+// their solicited replies go out through InlineReply in pipeline order.
 //
 // This intercept is wired only into the goroutine driver's read loop, the
 // default production driver. The reactor driver has no network-layer intercept
-// (it dispatches straight to the shard hop), so on the reactor CLIENT and HELLO
-// fall through to the unknown-command answer, the same pre-existing gap pub/sub
-// has there. That is acceptable because the reactor is the opt-in perf driver a
-// benchmark harness selects, and redis-benchmark tolerates an unknown HELLO;
-// the default driver every real client meets answers both.
+// (it dispatches straight to the shard hop), so on the reactor these fall
+// through to the shard hop: CLIENT and HELLO reach the unknown-command answer
+// (the same pre-existing gap pub/sub has there), while RESET still reaches its
+// dispatch handler and QUIT the unknown-command answer. That is acceptable
+// because the reactor is the opt-in perf driver a benchmark harness selects, and
+// it never enters subscribe mode (SUBSCRIBE is not intercepted there either), so
+// RESET has no connection state to unwind; the default driver every real client
+// meets answers all four.
 //
 // HELLO declines protocol version 3. f3 speaks RESP2 only (RESP3 is deferred),
 // so HELLO 3 answers NOPROTO rather than switching the connection into a
@@ -36,12 +39,12 @@ const (
 	helloVersion    = "0.1.0"
 )
 
-// clientHelloIntercept answers CLIENT and HELLO in the network layer, before
-// dispatch.Dispatch, so neither enters the shard hop. It returns true when it
+// connIntercept answers CLIENT, HELLO, QUIT, and RESET in the network layer,
+// before dispatch.Dispatch, so none enter the shard hop. It returns true when it
 // owned the command and false to let the normal dispatch run. It sits ahead of
-// pubsubIntercept in the read loop, so a client may run CLIENT and HELLO even in
-// subscribe mode, which redis also allows for the handshake verbs.
-func (s *Server) clientHelloIntercept(c *shard.Conn, cs *connState, args [][]byte) bool {
+// pubsubIntercept in the read loop, so a client may run these even in subscribe
+// mode, which redis also allows for the handshake and lifecycle verbs.
+func (s *Server) connIntercept(c *shard.Conn, cs *connState, args [][]byte) bool {
 	switch {
 	case eqFold(args[0], "CLIENT"):
 		s.doClient(c, cs, args)
@@ -49,8 +52,40 @@ func (s *Server) clientHelloIntercept(c *shard.Conn, cs *connState, args [][]byt
 	case eqFold(args[0], "HELLO"):
 		s.doHello(c, cs, args)
 		return true
+	case eqFold(args[0], "QUIT"):
+		s.doQuit(c, cs, args)
+		return true
+	case eqFold(args[0], "RESET"):
+		s.doReset(c, cs, args)
+		return true
 	}
 	return false
+}
+
+// doQuit answers QUIT: acknowledge with +OK, then mark the connection for close.
+// The read loop returns after the next boundary flush, so the +OK reaches the
+// client before the socket shuts, the redis contract. QUIT takes no arguments;
+// redis ignores a tail, so any extra args are accepted.
+func (s *Server) doQuit(c *shard.Conn, cs *connState, args [][]byte) {
+	_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
+	cs.quit = true
+}
+
+// doReset answers RESET: return the connection to a clean state and reply +RESET.
+// f3 offers one database (SELECT accepts only 0) and no MULTI or auth to unwind,
+// so the state RESET clears here is the pub/sub subscription set and the CLIENT
+// SETNAME label, the two pieces of per-connection state a session accumulates.
+// Dropping the subscriptions also takes the connection out of subscribe mode.
+// RESET takes no arguments, so a tail is the arity error redis gives, the same
+// answer the shard-hop handler gave before this intercept caught the verb.
+func (s *Server) doReset(c *shard.Conn, cs *connState, args [][]byte) {
+	if len(args) != 1 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'reset' command"))
+		return
+	}
+	s.pubsub.removeConn(cs)
+	cs.name = nil
+	_ = c.InlineReply(resp.AppendStatus(nil, "RESET"))
 }
 
 // validClientName reports whether every byte of a proposed CLIENT SETNAME name

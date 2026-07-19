@@ -690,11 +690,17 @@ func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary fu
 						continue
 					}
 					cmds++
-					// CLIENT and HELLO are answered here, in the network layer,
-					// from per-connection identity state (client.go); they never
-					// reach the shard hop. This sits ahead of the pub/sub intercept
-					// so the handshake verbs run even in subscribe mode.
-					if s.clientHelloIntercept(c, cs, args) {
+					// CLIENT, HELLO, QUIT, and RESET are answered here, in the
+					// network layer, from per-connection state (client.go); they
+					// never reach the shard hop. This sits ahead of the pub/sub
+					// intercept so the lifecycle verbs run even in subscribe mode.
+					if s.connIntercept(c, cs, args) {
+						// QUIT queued its +OK and asked to close: stop parsing this
+						// pass so nothing pipelined behind QUIT runs, let the
+						// boundary flush the acknowledgement, then return below.
+						if cs.quit {
+							break
+						}
 						continue
 					}
 					// Pub/sub is answered here, in the network layer, and never
@@ -727,6 +733,10 @@ func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary fu
 					pos = 0
 				}
 				if !boundary() {
+					return
+				}
+				// QUIT's +OK has now flushed at the boundary; close the connection.
+				if cs.quit {
 					return
 				}
 				if !stoppedOnBlock {
