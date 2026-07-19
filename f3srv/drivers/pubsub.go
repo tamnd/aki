@@ -14,18 +14,23 @@ import (
 // One mutex guards the map because PUBLISH runs on one connection's reader
 // goroutine while SUBSCRIBE on another's mutates the same map, unlike the
 // per-connection waiter set the blocking path uses, which a single owner
-// serializes. It keeps the exact-channel registry and the glob-pattern registry
-// (PSUBSCRIBE); the shard-channel registry is a separate map a later slice adds.
+// serializes. It keeps the exact-channel registry, the glob-pattern registry
+// (PSUBSCRIBE), and the shard-channel registry (SSUBSCRIBE). The three are
+// independent namespaces: a message published to one never crosses to another.
+// f3 is a single node, so a shard channel is a plain channel in its own directory
+// rather than a slot-routed one, the standalone shape of the cluster surface.
 type pubsubRegistry struct {
-	mu       sync.Mutex
-	channels map[string]map[*connState]struct{}
-	patterns map[string]map[*connState]struct{}
+	mu            sync.Mutex
+	channels      map[string]map[*connState]struct{}
+	patterns      map[string]map[*connState]struct{}
+	shardChannels map[string]map[*connState]struct{}
 }
 
 func newPubsubRegistry() *pubsubRegistry {
 	return &pubsubRegistry{
-		channels: make(map[string]map[*connState]struct{}),
-		patterns: make(map[string]map[*connState]struct{}),
+		channels:      make(map[string]map[*connState]struct{}),
+		patterns:      make(map[string]map[*connState]struct{}),
+		shardChannels: make(map[string]map[*connState]struct{}),
 	}
 }
 
@@ -103,6 +108,42 @@ func (r *pubsubRegistry) punsubscribe(cs *connState, pattern string) int {
 		cs.psubCount.Store(int64(len(cs.psubs)))
 	}
 	return cs.subTotal()
+}
+
+// ssubscribe records cs as a subscriber of a shard channel and returns the shard
+// subscription count. Shard channels are a separate namespace from regular
+// channels and patterns, so the count is len(ssubs) alone, matching redis's
+// SSUBSCRIBE confirmation.
+func (r *pubsubRegistry) ssubscribe(cs *connState, channel string) int {
+	if cs.ssubs == nil {
+		cs.ssubs = make(map[string]struct{})
+	}
+	if _, dup := cs.ssubs[channel]; !dup {
+		cs.ssubs[channel] = struct{}{}
+		r.mu.Lock()
+		subs := r.shardChannels[channel]
+		if subs == nil {
+			subs = make(map[*connState]struct{})
+			r.shardChannels[channel] = subs
+		}
+		subs[cs] = struct{}{}
+		r.mu.Unlock()
+		cs.ssubCount.Store(int64(len(cs.ssubs)))
+	}
+	return len(cs.ssubs)
+}
+
+// sunsubscribe drops cs from a shard channel and returns the remaining shard
+// subscription count. A no-op still reports the current count.
+func (r *pubsubRegistry) sunsubscribe(cs *connState, channel string) int {
+	if _, ok := cs.ssubs[channel]; ok {
+		delete(cs.ssubs, channel)
+		r.mu.Lock()
+		r.dropLocked(r.shardChannels, channel, cs)
+		r.mu.Unlock()
+		cs.ssubCount.Store(int64(len(cs.ssubs)))
+	}
+	return len(cs.ssubs)
 }
 
 // dropLocked removes cs from one directory's subscriber set for a name (a channel
@@ -201,12 +242,62 @@ func (r *pubsubRegistry) numPat() int {
 	return n
 }
 
+// spublish fans a message out to every subscriber of a shard channel and returns
+// the number of connections it reached. Shard channels are an independent
+// namespace, so a regular PUBLISH never lands here and pattern subscribers are
+// not consulted; the push carries the "smessage" kind, not "message". The
+// snapshot-then-deliver shape matches publish so a slow wake never stalls a
+// concurrent SSUBSCRIBE.
+func (r *pubsubRegistry) spublish(channel string, message []byte) int {
+	r.mu.Lock()
+	var targets []*shard.Conn
+	if subs := r.shardChannels[channel]; len(subs) > 0 {
+		targets = make([]*shard.Conn, 0, len(subs))
+		for cs := range subs {
+			targets = append(targets, cs.sc)
+		}
+	}
+	r.mu.Unlock()
+
+	if len(targets) > 0 {
+		wire := appendSMessage(nil, channel, message)
+		for _, sc := range targets {
+			sc.DeliverOOB(wire)
+		}
+	}
+	return len(targets)
+}
+
+// shardChannelList returns the shard channels with at least one subscriber,
+// filtered by the optional glob pattern. A nil pattern returns every active
+// shard channel. It is the PUBSUB SHARDCHANNELS figure.
+func (r *pubsubRegistry) shardChannelList(pattern []byte) []string {
+	r.mu.Lock()
+	out := make([]string, 0, len(r.shardChannels))
+	for ch := range r.shardChannels {
+		if pattern == nil || globMatch(pattern, []byte(ch)) {
+			out = append(out, ch)
+		}
+	}
+	r.mu.Unlock()
+	return out
+}
+
+// shardNumSub returns the subscriber count of one shard channel, zero for an
+// unknown one, the PUBSUB SHARDNUMSUB figure.
+func (r *pubsubRegistry) shardNumSub(channel string) int {
+	r.mu.Lock()
+	n := len(r.shardChannels[channel])
+	r.mu.Unlock()
+	return n
+}
+
 // removeConn drops a departing connection from every channel it held. It runs
 // from the connection teardown (unregister), after both connection goroutines
 // have joined, so cs.subs is this goroutine's alone; the reverse index still
 // takes the mutex against live publishers.
 func (r *pubsubRegistry) removeConn(cs *connState) {
-	if cs.subs == nil && cs.psubs == nil {
+	if cs.subs == nil && cs.psubs == nil && cs.ssubs == nil {
 		return
 	}
 	r.mu.Lock()
@@ -216,11 +307,16 @@ func (r *pubsubRegistry) removeConn(cs *connState) {
 	for pattern := range cs.psubs {
 		r.dropLocked(r.patterns, pattern, cs)
 	}
+	for channel := range cs.ssubs {
+		r.dropLocked(r.shardChannels, channel, cs)
+	}
 	r.mu.Unlock()
 	cs.subs = nil
 	cs.psubs = nil
+	cs.ssubs = nil
 	cs.subCount.Store(0)
 	cs.psubCount.Store(0)
+	cs.ssubCount.Store(0)
 }
 
 // pubsubIntercept handles the pub/sub command family in the network layer,
@@ -244,8 +340,17 @@ func (s *Server) pubsubIntercept(c *shard.Conn, cs *connState, args [][]byte) bo
 	case eqFold(args[0], "PUNSUBSCRIBE"):
 		s.doPunsubscribe(c, cs, args)
 		return true
+	case eqFold(args[0], "SSUBSCRIBE"):
+		s.doSsubscribe(c, cs, args)
+		return true
+	case eqFold(args[0], "SUNSUBSCRIBE"):
+		s.doSunsubscribe(c, cs, args)
+		return true
 	case eqFold(args[0], "PUBLISH"):
 		s.doPublish(c, args)
+		return true
+	case eqFold(args[0], "SPUBLISH"):
+		s.doSpublish(c, args)
 		return true
 	case eqFold(args[0], "PUBSUB"):
 		s.doPubsub(c, args)
@@ -265,10 +370,9 @@ func (s *Server) pubsubIntercept(c *shard.Conn, cs *connState, args [][]byte) bo
 }
 
 // subscribeModeAllowed reports whether a non-pub/sub command may run while the
-// connection is in subscribe mode. PSUBSCRIBE/PUNSUBSCRIBE are handled by the
-// intercept above (they never reach this test); the shard subscribe verbs
-// SSUBSCRIBE/SUNSUBSCRIBE are on the list so they are admitted once that slice
-// lands, until then falling through to the unknown-command answer.
+// connection is in subscribe mode. The subscribe verbs (P/S variants) are all
+// handled by the intercept above and never reach this test; they stay on the
+// list as documentation of the allowed set.
 func subscribeModeAllowed(verb []byte) bool {
 	switch {
 	case eqFold(verb, "PING"), eqFold(verb, "QUIT"), eqFold(verb, "RESET"),
@@ -357,6 +461,47 @@ func (s *Server) doPunsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
 	}
 }
 
+// doSsubscribe subscribes the connection to each named shard channel and confirms
+// each in order. The confirmation count is the shard subscription count alone,
+// separate from the regular channel-plus-pattern total, matching redis. Arity is
+// at least one shard channel.
+func (s *Server) doSsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
+	if len(args) < 2 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'ssubscribe' command"))
+		return
+	}
+	for _, ch := range args[1:] {
+		n := s.pubsub.ssubscribe(cs, string(ch))
+		_ = c.InlineReply(appendSubConfirm(nil, "ssubscribe", ch, n))
+	}
+}
+
+// doSunsubscribe drops the named shard channels, or every held shard channel when
+// none are named, confirming each in order. Sunsubscribing from all on a
+// connection that holds none answers one confirmation with a nil channel and
+// count zero, the redis shape.
+func (s *Server) doSunsubscribe(c *shard.Conn, cs *connState, args [][]byte) {
+	if len(args) >= 2 {
+		for _, ch := range args[1:] {
+			n := s.pubsub.sunsubscribe(cs, string(ch))
+			_ = c.InlineReply(appendSubConfirm(nil, "sunsubscribe", ch, n))
+		}
+		return
+	}
+	if len(cs.ssubs) == 0 {
+		_ = c.InlineReply(appendSunsubNil(nil))
+		return
+	}
+	held := make([]string, 0, len(cs.ssubs))
+	for ch := range cs.ssubs {
+		held = append(held, ch)
+	}
+	for _, ch := range held {
+		n := s.pubsub.sunsubscribe(cs, ch)
+		_ = c.InlineReply(appendSubConfirm(nil, "sunsubscribe", []byte(ch), n))
+	}
+}
+
 // doPublish delivers the message to the channel's subscribers and answers the
 // receiver count. Arity is exactly a channel and a message.
 func (s *Server) doPublish(c *shard.Conn, args [][]byte) {
@@ -365,6 +510,17 @@ func (s *Server) doPublish(c *shard.Conn, args [][]byte) {
 		return
 	}
 	n := s.pubsub.publish(string(args[1]), args[2])
+	_ = c.InlineReply(resp.AppendInt(nil, int64(n)))
+}
+
+// doSpublish delivers the message to the shard channel's subscribers and answers
+// the receiver count. Arity is exactly a shard channel and a message.
+func (s *Server) doSpublish(c *shard.Conn, args [][]byte) {
+	if len(args) != 3 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'spublish' command"))
+		return
+	}
+	n := s.pubsub.spublish(string(args[1]), args[2])
 	_ = c.InlineReply(resp.AppendInt(nil, int64(n)))
 }
 
@@ -398,6 +554,25 @@ func (s *Server) doPubsub(c *shard.Conn, args [][]byte) {
 		_ = c.InlineReply(out)
 	case eqFold(args[1], "NUMPAT"):
 		_ = c.InlineReply(resp.AppendInt(nil, int64(s.pubsub.numPat())))
+	case eqFold(args[1], "SHARDCHANNELS"):
+		var pattern []byte
+		if len(args) >= 3 {
+			pattern = args[2]
+		}
+		chans := s.pubsub.shardChannelList(pattern)
+		out := resp.AppendArrayHeader(nil, len(chans))
+		for _, ch := range chans {
+			out = resp.AppendBulk(out, []byte(ch))
+		}
+		_ = c.InlineReply(out)
+	case eqFold(args[1], "SHARDNUMSUB"):
+		names := args[2:]
+		out := resp.AppendArrayHeader(nil, len(names)*2)
+		for _, ch := range names {
+			out = resp.AppendBulk(out, ch)
+			out = resp.AppendInt(out, int64(s.pubsub.shardNumSub(string(ch))))
+		}
+		_ = c.InlineReply(out)
 	default:
 		_ = c.InlineReply(resp.AppendError(nil, "ERR Unknown PUBSUB subcommand or wrong number of arguments"))
 	}
@@ -419,6 +594,17 @@ func appendPMessage(dst []byte, pattern, channel string, message []byte) []byte 
 	dst = resp.AppendArrayHeader(dst, 4)
 	dst = resp.AppendBulk(dst, []byte("pmessage"))
 	dst = resp.AppendBulk(dst, []byte(pattern))
+	dst = resp.AppendBulk(dst, []byte(channel))
+	dst = resp.AppendBulk(dst, message)
+	return dst
+}
+
+// appendSMessage builds the unsolicited shard message push: a three-element
+// array of "smessage", the shard channel, and the payload. It mirrors the
+// regular message push with the shard-specific kind.
+func appendSMessage(dst []byte, channel string, message []byte) []byte {
+	dst = resp.AppendArrayHeader(dst, 3)
+	dst = resp.AppendBulk(dst, []byte("smessage"))
 	dst = resp.AppendBulk(dst, []byte(channel))
 	dst = resp.AppendBulk(dst, message)
 	return dst
@@ -449,6 +635,16 @@ func appendUnsubNil(dst []byte) []byte {
 func appendPunsubNil(dst []byte) []byte {
 	dst = resp.AppendArrayHeader(dst, 3)
 	dst = resp.AppendBulk(dst, []byte("punsubscribe"))
+	dst = resp.AppendNull(dst)
+	dst = resp.AppendInt(dst, 0)
+	return dst
+}
+
+// appendSunsubNil builds the SUNSUBSCRIBE-from-nothing confirmation:
+// "sunsubscribe", a nil channel, and count zero.
+func appendSunsubNil(dst []byte) []byte {
+	dst = resp.AppendArrayHeader(dst, 3)
+	dst = resp.AppendBulk(dst, []byte("sunsubscribe"))
 	dst = resp.AppendNull(dst)
 	dst = resp.AppendInt(dst, 0)
 	return dst
