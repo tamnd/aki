@@ -41,6 +41,7 @@ func (s *Store) GetView(key []byte, now int64) ([]byte, bool) {
 		return s.coldViewRef(h, slot, addr)
 	}
 	s.touchSlot(slot)
+	s.stampClock(addr, now)
 	return s.readValueRef(addr)
 }
 
@@ -75,6 +76,7 @@ func (s *Store) GetViewStream(key []byte, now int64) ([]byte, *ChunkStream, bool
 		return v, nil, ok
 	}
 	s.touchSlot(slot)
+	s.stampClock(addr, now)
 	if s.recFlags(addr)&flagChunked != 0 {
 		return nil, s.chunkStreamAt(addr), true
 	}

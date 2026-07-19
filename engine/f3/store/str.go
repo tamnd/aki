@@ -111,6 +111,52 @@ func (s *Store) setExpireAt(off uint64, at int64) {
 	binary.LittleEndian.PutUint64(s.arena.buf[off+hdrSize:], uint64(at))
 }
 
+// lruClock derives the per-key access clock stamped in a string record's
+// otherwise-free offKindBits (record.go), the number OBJECT IDLETIME reads back.
+// It is the batch millisecond wall time in seconds, folded to sixteen bits, so a
+// stamp costs no extra time call: it rides the now the command layer already
+// threads (cx.NowMs). Sixteen bits at one-second resolution wrap every 65536s
+// (~18.2h): a key idle longer than that reports a wrapped, smaller idle, the
+// fidelity price of holding the clock in the header's spare 16 bits rather than
+// spending record bytes the memory bar holds against rivals on a string cell.
+func lruClock(nowMs int64) uint16 { return uint16(nowMs / 1000) }
+
+// stampClock marks the string record at off accessed now, the read-and-write
+// touch Redis makes to robj.lru on every lookup. It writes the header's spare
+// offKindBits word, the same 16-byte header line the touching command already
+// dirties, so it adds no cache line to a write and turns a read's header load
+// exclusive without extra bytes.
+func (s *Store) stampClock(off uint64, nowMs int64) {
+	binary.LittleEndian.PutUint16(s.arena.buf[off+offKindBits:], lruClock(nowMs))
+}
+
+// recClock reads the access clock stamped in the string record at off.
+func (s *Store) recClock(off uint64) uint16 {
+	return binary.LittleEndian.Uint16(s.arena.buf[off+offKindBits:])
+}
+
+// IdleSeconds reports seconds since the string at key was last read or written,
+// the OBJECT IDLETIME answer, read back from the per-key clock stamped in the
+// record header. It resolves the key without touching the clock (findLive does
+// not stamp), so the query itself is not an access, matching the NOTOUCH lookup
+// Redis makes for OBJECT. A cold-demoted key carries no clock in the cold band
+// (its 12-byte frame header has no clock word), so it reports 0: the access
+// clock lives in the arena residency band and resets when a record crosses to
+// cold, the documented seam of holding the clock in the arena header rather than
+// widening the durable cold frame. Presence is reported like the other point
+// reads, and a lazily-expired key reads as absent.
+func (s *Store) IdleSeconds(key []byte, now int64) (int64, bool) {
+	slot, addr, _ := s.findLive(Hash(key), key, now)
+	if addr == 0 {
+		return 0, false
+	}
+	if slotCold(*slot) {
+		return 0, true
+	}
+	idle := (lruClock(now) - s.recClock(addr)) & 0xffff
+	return int64(idle), true
+}
+
 // findLive is findEntry plus the doc 09 lazy-expiry rule: every read checks
 // the deadline before serving, and the owner deletes an expired record on
 // touch. now is the batch's cached clock; zero means no clock (the wrapper
@@ -158,8 +204,11 @@ func (s *Store) findResident(h uint64, key []byte, now int64) (slot *uint64, add
 // allocString lays down a fresh string record: header, expiry slot when the
 // flags carry one, key. The value area is the caller's to write, along with
 // vlen, before the record is published. Kind and flags are stored explicitly
-// because arena bytes are reused unscrubbed.
-func (s *Store) allocString(key []byte, vcapB uint64, flags byte, at int64) (uint64, error) {
+// because arena bytes are reused unscrubbed. now stamps the access clock a fresh
+// write starts at (a just-written key is idle zero); it is the caller's batch
+// clock, zero on the clockless internal paths, which start the clock at the
+// epoch and self-correct on the first read.
+func (s *Store) allocString(key []byte, vcapB uint64, flags byte, at, now int64) (uint64, error) {
 	need := uint64(hdrSize) + align8(uint64(len(key))) + vcapB
 	if flags&flagHasTTL != 0 {
 		need += 8
@@ -175,7 +224,7 @@ func (s *Store) allocString(key []byte, vcapB uint64, flags byte, at int64) (uin
 	binary.LittleEndian.PutUint16(buf[off+offVcap:], uint16(vcapB/8))
 	buf[off+offKind] = kindString
 	buf[off+offFlags] = flags
-	binary.LittleEndian.PutUint16(buf[off+offKindBits:], 0)
+	binary.LittleEndian.PutUint16(buf[off+offKindBits:], lruClock(now))
 	if flags&flagHasTTL != 0 {
 		s.setExpireAt(off, at)
 	}
@@ -456,6 +505,7 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 			if hasSlot {
 				s.setExpireAt(addr, at)
 			}
+			s.stampClock(addr, now)
 			return s.logRecord(addr)
 		}
 		if f&(flagSep|flagChunked) == 0 && need <= s.vcapBytes(addr) && (at == 0 || hasSlot) {
@@ -473,6 +523,7 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 			if hasSlot {
 				s.setExpireAt(addr, at)
 			}
+			s.stampClock(addr, now)
 			return s.logRecord(addr)
 		}
 	}
@@ -493,7 +544,7 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 	if at != 0 {
 		flags |= flagHasTTL
 	}
-	off, err := s.allocString(key, vcapB, flags, at)
+	off, err := s.allocString(key, vcapB, flags, at, now)
 	if err != nil {
 		return err
 	}
@@ -564,7 +615,7 @@ func (s *Store) IncrBy(key []byte, delta, now int64) (int64, error) {
 	h := Hash(key)
 	slot, addr, _ := s.findResident(h, key, now)
 	if addr == 0 {
-		off, err := s.allocString(key, 8, flagInt, 0)
+		off, err := s.allocString(key, 8, flagInt, 0, now)
 		if err != nil {
 			return 0, err
 		}
@@ -599,6 +650,7 @@ func (s *Store) IncrBy(key []byte, delta, now int64) (int64, error) {
 	s.noteFlip(f, nf)
 	s.setRecFlags(addr, nf)
 	s.setVlen(addr, decLen(n))
+	s.stampClock(addr, now)
 	return n, nil
 }
 
@@ -670,8 +722,8 @@ func (s *Store) materialize(addr uint64, scratch []byte) ([]byte, error) {
 // allocString, the run of a then b (b may be nil) through writeRun, then the
 // pointer in the value area. The record is unlinked again if the run fails,
 // so a caller sees either a complete record or nothing.
-func (s *Store) allocSep(key, a, b []byte, flags byte, at int64) (uint64, error) {
-	off, err := s.allocString(key, ptrSize, flags|flagSep, at)
+func (s *Store) allocSep(key, a, b []byte, flags byte, at, now int64) (uint64, error) {
+	off, err := s.allocString(key, ptrSize, flags|flagSep, at, now)
 	if err != nil {
 		return 0, err
 	}
@@ -733,7 +785,7 @@ func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 		// Create-on-miss is SET with the raw-sticky bit: zero headroom, the
 		// first growth buys the slack.
 		if len(add) >= strChunkMin {
-			off, err := s.allocChunked(key, nil, 0, add, len(add), flagRawSticky, 0)
+			off, err := s.allocChunked(key, nil, 0, add, len(add), flagRawSticky, 0, now)
 			if err != nil {
 				return 0, err
 			}
@@ -741,14 +793,14 @@ func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 			return int64(len(add)), nil
 		}
 		if len(add) > strInlineMax {
-			off, err := s.allocSep(key, add, nil, flagRawSticky, 0)
+			off, err := s.allocSep(key, add, nil, flagRawSticky, 0, now)
 			if err != nil {
 				return 0, err
 			}
 			s.publish(h, slot, 0, off)
 			return int64(len(add)), nil
 		}
-		off, err := s.allocString(key, align8(uint64(len(add))), flagRawSticky, 0)
+		off, err := s.allocString(key, align8(uint64(len(add))), flagRawSticky, 0, now)
 		if err != nil {
 			return 0, err
 		}
@@ -789,7 +841,7 @@ func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 		if at != 0 {
 			flags |= flagHasTTL
 		}
-		off, err := s.allocChunked(key, old, len(old), add, newLen, flags, at)
+		off, err := s.allocChunked(key, old, len(old), add, newLen, flags, at, now)
 		if err != nil {
 			return 0, err
 		}
@@ -809,6 +861,7 @@ func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 		s.noteFlip(f, nf)
 		s.setRecFlags(addr, nf)
 		s.setVlen(addr, uint32(newLen))
+		s.stampClock(addr, now)
 		return int64(newLen), nil
 	}
 	at := s.expireAt(addr)
@@ -819,14 +872,14 @@ func (s *Store) Append(key, add []byte, now int64) (int64, error) {
 	if newLen > strInlineMax {
 		// The growth crosses the embedded cap: the record leaves the band and
 		// republishes in separated form.
-		off, err := s.allocSep(key, old, add, flags, at)
+		off, err := s.allocSep(key, old, add, flags, at, now)
 		if err != nil {
 			return 0, err
 		}
 		s.publish(h, slot, addr, off)
 		return int64(newLen), nil
 	}
-	off, err := s.allocString(key, growCap(uint64(newLen), s.vcapBytes(addr)), flags, at)
+	off, err := s.allocString(key, growCap(uint64(newLen), s.vcapBytes(addr)), flags, at, now)
 	if err != nil {
 		return 0, err
 	}
@@ -860,7 +913,7 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 	buf := s.arena.buf
 	if addr == 0 {
 		if end >= strChunkMin {
-			off, err := s.allocChunked(key, nil, offset, val, end, flagRawSticky, 0)
+			off, err := s.allocChunked(key, nil, offset, val, end, flagRawSticky, 0, now)
 			if err != nil {
 				return 0, err
 			}
@@ -869,14 +922,14 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 		}
 		if end > strInlineMax {
 			nv := s.patchValue(nil, offset, val)
-			off, err := s.allocSep(key, nv, nil, flagRawSticky, 0)
+			off, err := s.allocSep(key, nv, nil, flagRawSticky, 0, now)
 			if err != nil {
 				return 0, err
 			}
 			s.publish(h, slot, 0, off)
 			return int64(end), nil
 		}
-		off, err := s.allocString(key, align8(uint64(end)), flagRawSticky, 0)
+		off, err := s.allocString(key, align8(uint64(end)), flagRawSticky, 0, now)
 		if err != nil {
 			return 0, err
 		}
@@ -919,7 +972,7 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 		if at != 0 {
 			flags |= flagHasTTL
 		}
-		off, err := s.allocChunked(key, old, offset, val, newLen, flags, at)
+		off, err := s.allocChunked(key, old, offset, val, newLen, flags, at, now)
 		if err != nil {
 			return 0, err
 		}
@@ -942,6 +995,7 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 		s.noteFlip(f, nf)
 		s.setRecFlags(addr, nf)
 		s.setVlen(addr, uint32(newLen))
+		s.stampClock(addr, now)
 		return int64(newLen), nil
 	}
 	at := s.expireAt(addr)
@@ -953,14 +1007,14 @@ func (s *Store) SetRange(key []byte, offset int, val []byte, now int64) (int64, 
 		// The write crosses the embedded cap: the record leaves the band and
 		// republishes in separated form over the patched bytes.
 		nv := s.patchValue(old, offset, val)
-		off, err := s.allocSep(key, nv, nil, flags, at)
+		off, err := s.allocSep(key, nv, nil, flags, at, now)
 		if err != nil {
 			return 0, err
 		}
 		s.publish(h, slot, addr, off)
 		return int64(newLen), nil
 	}
-	off, err := s.allocString(key, growCap(uint64(newLen), s.vcapBytes(addr)), flags, at)
+	off, err := s.allocString(key, growCap(uint64(newLen), s.vcapBytes(addr)), flags, at, now)
 	if err != nil {
 		return 0, err
 	}
