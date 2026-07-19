@@ -46,13 +46,19 @@ func Xread(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	keys, ids := rest[:nk], rest[nk:]
 
 	g := registry(cx)
-	// Collect every stream's entries first, so the outer array header can carry
-	// the count of non-empty streams; the field views stay valid because no
-	// mutation runs between the collection and the emit on this owner goroutine.
-	// afters holds each stream's resolved lower bound, kept for a possible park so
-	// a woken read repeats exactly this scan.
-	results := make([]readResult, 0, nk)
+	// Each stream frames its [key, entries] pair straight into the reply during a
+	// single forward walk, the fused build XRANGE uses (range.go): no intermediate
+	// []rangeEntry and no per-entry field clone, since appendEntryReply copies each
+	// entry's bytes before the next decode reuses the block scratch. The inner
+	// entry-array header and the outer non-empty-stream header both need their
+	// counts first, so each body is built at a remembered offset and its header
+	// shifted in with one memmove once the count is known. afters holds each
+	// stream's resolved lower bound, kept for a possible park so a woken read
+	// repeats exactly this scan.
 	afters := make([]streamID, nk)
+	out := cx.Aux[:0]
+	outerStart := len(out)
+	nStreams := 0
 	for j := 0; j < nk; j++ {
 		s, wrong := g.lookup(cx, keys[j])
 		if wrong {
@@ -65,18 +71,48 @@ func Xread(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			return
 		}
 		afters[j] = after
-		if entries := immediateRead(s, ids[j], after, opts.count); len(entries) > 0 {
-			results = append(results, readResult{key: keys[j], entries: entries})
+		pairStart := len(out)
+		out = resp.AppendArrayHeader(out, 2)
+		out = resp.AppendBulk(out, keys[j])
+		bodyStart := len(out)
+		n := 0
+		if s != nil {
+			if len(ids[j]) == 1 && ids[j][0] == '+' {
+				// The "+" form returns just the last live entry, and it walks a
+				// block backward, so it keeps the gather path (at most one entry).
+				for _, e := range s.lastEntry() {
+					out = appendEntryReply(out, e.id, e.fields)
+					n++
+				}
+			} else {
+				lo := bound{id: after, excl: true}
+				hi := bound{id: streamID{ms: ^uint64(0), seq: ^uint64(0)}}
+				s.eachForward(lo, hi, opts.count, func(id streamID, fields []field) {
+					out = appendEntryReply(out, id, fields)
+					n++
+				})
+			}
 		}
+		if n == 0 {
+			out = out[:pairStart] // omit a stream that produced nothing
+			continue
+		}
+		out = prependArrayHeader(out, bodyStart, n)
+		nStreams++
 	}
 
-	if len(results) == 0 && opts.block {
-		parkRead(cx, g, keys, afters, opts)
-		r.Park()
+	if nStreams == 0 {
+		if opts.block {
+			parkRead(cx, g, keys, afters, opts)
+			r.Park()
+			return
+		}
+		out = resp.AppendNullArray(out[:outerStart])
+		cx.Aux = out
+		r.Raw(out)
 		return
 	}
-
-	out := frameReadResults(cx.Aux[:0], results)
+	out = prependArrayHeader(out, outerStart, nStreams)
 	cx.Aux = out
 	r.Raw(out)
 }
@@ -272,20 +308,6 @@ func readAfterID(s *stream, idArg []byte) (after streamID, ok bool) {
 		return streamID{}, false
 	}
 	return id, true
-}
-
-// immediateRead gathers a stream's entries for the non-blocking answer. The "+"
-// form returns the single last live entry; every other form returns the live
-// entries above the resolved after-ID, capped by count. A missing stream yields
-// nothing.
-func immediateRead(s *stream, idArg []byte, after streamID, count int) []rangeEntry {
-	if s == nil {
-		return nil
-	}
-	if len(idArg) == 1 && idArg[0] == '+' {
-		return s.lastEntry()
-	}
-	return s.readAfter(after, count)
 }
 
 // readAfter returns up to count live entries with IDs strictly above afterID,
