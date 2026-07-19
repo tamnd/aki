@@ -150,6 +150,10 @@ func init() {
 	// COMMAND introspects the table itself (see command.go); redis-cli calls it
 	// on connect. The subcommand and its tail are validated in the handler.
 	register("COMMAND", commandCmd, 0, -1, false)
+	// CONFIG serves the server-parameter surface (see config.go); clients read
+	// it on connect. The subcommand at args[0] and its tail are validated in the
+	// handler.
+	register("CONFIG", configCmd, 1, -1, false)
 
 	// The string point surface. SET's tail is option soup, so the handler
 	// validates it.
