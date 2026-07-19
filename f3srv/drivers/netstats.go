@@ -46,14 +46,28 @@ type connState struct {
 	// mode, which restricts the commands it may run.
 	subs map[string]struct{}
 
+	// subCount mirrors len(subs) as a single-writer atomic so CLIENT LIST can read
+	// another connection's subscription count without touching its map. The owning
+	// reader goroutine restamps it after every subs mutation (pubsub.go); a
+	// cross-connection reader loads it. This is the eventCounter discipline applied
+	// to a size gauge: single writer, atomic only so the race detector sees a
+	// defined value.
+	subCount atomic.Int64
+
 	// id is this connection's CLIENT ID, stamped in register from the server's
-	// monotonic counter. name is its CLIENT SETNAME label, nil until set. Both
-	// are network-layer identity (client.go), read and written only by this
-	// connection's reader goroutine, so they need no lock. The library tags a
-	// client advertises through CLIENT SETINFO are not retained: f3 validates the
-	// option and answers OK without storing it, matching the f1srv precedent.
-	id   uint64
-	name []byte
+	// monotonic counter. It is network-layer identity (client.go), immutable after
+	// admission, so any goroutine may read it. The library tags a client advertises
+	// through CLIENT SETINFO are not retained: f3 validates the option and answers
+	// OK without storing it, matching the f1srv precedent.
+	id uint64
+
+	// name holds this connection's CLIENT SETNAME label, nil when unnamed. It is
+	// an atomic pointer, not a plain slice, so CLIENT LIST can read another
+	// connection's name without racing the owner's SETNAME. The owning reader
+	// goroutine publishes a fresh immutable copy on each change (setName); every
+	// reader loads through loadName. Writes are rare (SETNAME, HELLO SETNAME,
+	// RESET), so the per-write copy costs nothing on the command path.
+	name atomic.Pointer[[]byte]
 
 	// addr and laddr are the connection's remote and local "ip:port" endpoints,
 	// the addr= and laddr= fields CLIENT INFO reports. They are stamped once when
@@ -70,6 +84,29 @@ type connState struct {
 	// loop returns after the boundary flush so the acknowledgement lands before
 	// the socket closes. Reader-owned like the fields above.
 	quit bool
+}
+
+// setName publishes a new CLIENT SETNAME label. An empty name clears it back to
+// unnamed. The bytes are copied out of the caller's buffer (the parse buffer is
+// reused for the next command) into a fresh slice, then stored atomically, so a
+// concurrent CLIENT LIST reader on another goroutine never sees a half-written
+// name. Only the owning reader goroutine calls this.
+func (cs *connState) setName(name []byte) {
+	if len(name) == 0 {
+		cs.name.Store(nil)
+		return
+	}
+	cp := append([]byte(nil), name...)
+	cs.name.Store(&cp)
+}
+
+// loadName returns the connection's current CLIENT SETNAME label, nil when
+// unnamed. Safe from any goroutine: the stored slice is immutable once published.
+func (cs *connState) loadName() []byte {
+	if p := cs.name.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // inSubscribeMode reports whether the connection holds any subscription, so the

@@ -44,6 +44,7 @@ func (r *pubsubRegistry) subscribe(cs *connState, channel string) int {
 		}
 		subs[cs] = struct{}{}
 		r.mu.Unlock()
+		cs.subCount.Store(int64(len(cs.subs)))
 	}
 	return len(cs.subs)
 }
@@ -57,6 +58,7 @@ func (r *pubsubRegistry) unsubscribe(cs *connState, channel string) int {
 		r.mu.Lock()
 		r.dropLocked(channel, cs)
 		r.mu.Unlock()
+		cs.subCount.Store(int64(len(cs.subs)))
 	}
 	return len(cs.subs)
 }
@@ -137,6 +139,7 @@ func (r *pubsubRegistry) removeConn(cs *connState) {
 	}
 	r.mu.Unlock()
 	cs.subs = nil
+	cs.subCount.Store(0)
 }
 
 // pubsubIntercept handles the pub/sub command family in the network layer,
