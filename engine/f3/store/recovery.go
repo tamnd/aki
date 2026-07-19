@@ -189,7 +189,12 @@ func (s *Store) RecoverIndex(rec *akifile.Recovery, now int64) error {
 func (s *Store) applyValueRow(addr uint64, row akifile.RecordRow, now int64, vbuf []byte) ([]byte, error) {
 	switch {
 	case row.Flags&akifile.RecFlagChunked != 0:
-		return vbuf, fmt.Errorf("store: replay of chunked record at %#x is not supported yet", addr)
+		v, err := s.reassembleChunked(row.Value, int(row.ValueLen), vbuf)
+		if err != nil {
+			return vbuf, fmt.Errorf("store: replay of chunked record at %#x: %w", addr, err)
+		}
+		vbuf = v
+		return vbuf, s.SetString(row.Key, v, now, int64(row.ExpireAt), false)
 	case row.Flags&akifile.RecFlagInline != 0:
 		return vbuf, s.SetString(row.Key, row.Value, now, int64(row.ExpireAt), false)
 	default:

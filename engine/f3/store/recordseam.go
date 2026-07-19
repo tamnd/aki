@@ -56,20 +56,48 @@ func (s *Store) recordRow(off uint64) akifile.RecordRow {
 	if f&flagHasTTL != 0 {
 		row.ExpireAt = uint64(s.expireAt(off))
 	}
-	if f&(flagSep|flagChunked) != 0 {
+	if f&flagChunked != 0 {
+		// A chunked value's live directory is a volatile arena block, so the frame
+		// carries a durable copy: value_len is the total logical length and Value is
+		// the serialized directory of the chunks' durable run words, which replay
+		// follows to reassemble.
+		row.Flags |= akifile.RecFlagChunked
+		row.ValueLen = uint32(s.vlen(off))
+		row.Value = s.chunkDirRow(off)
+		return row
+	}
+	if f&flagSep != 0 {
 		row.ValueWord, _, _ = s.readPtr(vs)
 		row.ValueLen = uint32(s.vlen(off))
-		if f&flagChunked != 0 {
-			// A chunked value's word names a chunk-extent table, not a single run, so
-			// mark it for replay to reassemble rather than read as one offset.
-			row.Flags |= akifile.RecFlagChunked
-		}
 		return row
 	}
 	row.Flags |= akifile.RecFlagInline
 	row.Value = s.inlineValue(off, f, vs)
 	row.ValueLen = uint32(len(row.Value))
 	return row
+}
+
+// chunkDirRow serializes a chunked record's directory into the durable form the
+// record frame carries: for each chunk in value order, its 8-byte run word and its
+// 4-byte length, 12 bytes per chunk. The word is the durable value-log locator
+// (inLogBit set) the full-durability spill floor guarantees, or zero for an
+// all-zero hole chunk the value never wrote. It renders into rlogChunkScratch,
+// valid until the next chunkDirRow, which is exactly the window stage copies it into
+// the frame. Replay reads it back through reassembleChunked.
+func (s *Store) chunkDirRow(off uint64) []byte {
+	word, n, _ := s.readPtr(s.valueStart(off))
+	dirOff := word & runAddrMask
+	need := int(n) * 12
+	if cap(s.rlogChunkScratch) < need {
+		s.rlogChunkScratch = make([]byte, need)
+	}
+	buf := s.rlogChunkScratch[:need]
+	for k := uint32(0); k < n; k++ {
+		w, l, _ := s.readPtr(dirOff + uint64(k)*ptrSize)
+		binary.LittleEndian.PutUint64(buf[k*12:], w)
+		binary.LittleEndian.PutUint32(buf[k*12+8:], l)
+	}
+	return buf
 }
 
 // inlineValue returns the value bytes an inline record row carries. An embedded

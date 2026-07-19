@@ -1,6 +1,9 @@
 package store
 
-import "errors"
+import (
+	"encoding/binary"
+	"errors"
+)
 
 // errChunkRead is returned when a chunk's logged bytes cannot be read back
 // during a rewrite. The value's remaining chunks are intact; the write that
@@ -141,6 +144,44 @@ func (s *Store) dropChunks(addr uint64) {
 		}
 	}
 	s.arena.unlink(dirOff, uint64(dcap)*ptrSize)
+}
+
+// reassembleChunked rebuilds a chunked value during recovery from its durable
+// directory (chunkDirRow's form: 12 bytes per chunk, an 8-byte run word then a
+// 4-byte length) into dst, grown to total when needed. Each chunk's bytes come from
+// the durable value log the word names, or are zeros for a hole word (zero), the
+// mirror of readChunked's live walk over the arena directory. A word that is neither
+// a hole nor log-resident never had a durable copy and fails the replay closed, the
+// same fail-closed a torn frame takes. A directory whose lengths do not sum to total,
+// or that outruns dst, is a corrupt frame and fails too.
+func (s *Store) reassembleChunked(dir []byte, total int, dst []byte) ([]byte, error) {
+	if cap(dst) < total {
+		dst = make([]byte, total)
+	}
+	dst = dst[:total]
+	pos := 0
+	for off := 0; off+12 <= len(dir); off += 12 {
+		w := binary.LittleEndian.Uint64(dir[off:])
+		clen := int(binary.LittleEndian.Uint32(dir[off+8:]))
+		if clen < 0 || pos+clen > total {
+			return nil, errChunkRead
+		}
+		switch {
+		case w == 0:
+			clear(dst[pos : pos+clen])
+		case w&inLogBit != 0:
+			if err := s.logReadFill(w&runAddrMask, dst[pos:pos+clen]); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, errChunkRead
+		}
+		pos += clen
+	}
+	if pos != total {
+		return nil, errChunkRead
+	}
+	return dst, nil
 }
 
 // readChunked copies a chunked record's whole value into dst, chunk by chunk.

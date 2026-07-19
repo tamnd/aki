@@ -270,6 +270,74 @@ func TestSeparatedValueDurableWithoutResidentCap(t *testing.T) {
 	}
 }
 
+// TestChunkedValueDurableWithoutResidentCap pins the chunked-band floor: an
+// .aki-backed store with no resident cap must make a chunked value (past the chunk
+// min, so its bytes live as a directory of value-log runs) durable and replay it
+// byte for byte. A chunked record row carries the durable chunk directory (each
+// chunk's log-resident run word plus length), which recovery reassembles from the
+// value log. Before this the chunked branch failed the whole open closed, so one
+// large value bricked a durable restart. All chunk words spill under the durable
+// floor, so every directory entry is log-resident and derefable after a crash.
+func TestChunkedValueDurableWithoutResidentCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chunk.aki")
+	f, err := akifile.Create(path, akifile.CreateOptions{
+		ShardCount: 4,
+		Sync:       akifile.SyncNo,
+	})
+	if err != nil {
+		t.Fatalf("create aki: %v", err)
+	}
+	openStore := func(f *akifile.File) *Store {
+		s, err := Open(Options{
+			ArenaBytes:  8 << 20,
+			SegBytes:    1 << 20,
+			AkiValueLog: f,
+			Shard:       1,
+		})
+		if err != nil {
+			t.Fatalf("open aki store: %v", err)
+		}
+		return s
+	}
+
+	big := make([]byte, strChunkMin+strChunkSize+777) // chunked band: spans multiple chunks
+	for i := range big {
+		big[i] = byte('A' + i%26)
+	}
+
+	s := openStore(f)
+	if err := s.SetString([]byte("big"), big, 0, 0, false); err != nil {
+		t.Fatalf("set big: %v", err)
+	}
+	// Every chunk run is durable, so its directory word is log-resident.
+	if n := s.Stats().LogRuns; n == 0 {
+		t.Fatal("chunked value stayed arena-resident under -aki: its directory words are not durable")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	f2, err := akifile.Open(path, akifile.OpenOptions{Sync: akifile.SyncNo})
+	if err != nil {
+		t.Fatalf("reopen aki: %v", err)
+	}
+	s2 := openStore(f2)
+	t.Cleanup(func() { _ = s2.Close(); _ = f2.Close() })
+	if err := s2.ReplayRecords(0); err != nil {
+		t.Fatalf("replay chunked value: %v", err)
+	}
+	got, ok := s2.GetString([]byte("big"), 0, nil)
+	if !ok {
+		t.Fatal("chunked key absent after replay")
+	}
+	if !bytes.Equal(got, big) {
+		t.Fatalf("chunked value read back %d bytes, want %d", len(got), len(big))
+	}
+}
+
 // TestReplayIsShardScoped confirms a store replays only its own shard's records:
 // two shards write distinct keys into the one shared file, then a fresh store on
 // each shard replays and sees its own key but not the other shard's, so a

@@ -132,3 +132,31 @@ func TestDurableRecoversSeparatedValue(t *testing.T) {
 		t.Fatalf("STRLEN big after restart = %v, want %d", got, len(val))
 	}
 }
+
+// TestDurableRecoversChunkedValue is the multi-chunk half of the restart proof: a
+// value past the chunk min, so it lives as a directory of value-log runs, written
+// through the socket must survive a restart whole. Before the chunked recovery
+// branch one value this size failed the whole reopen closed, so a single large key
+// bricked a durable restart. Now the record row carries the durable chunk directory
+// and recovery reassembles the value from the value log.
+func TestDurableRecoversChunkedValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "durable.aki")
+	val := strings.Repeat("q", 200000) // > 64KiB: spans several chunks
+
+	srv1, nc1, br1 := startDurableServer(t, path)
+	if got := sendCmd(t, br1, nc1, "SET", "huge", val); got != "OK" {
+		t.Fatalf("SET huge = %v, want OK", got)
+	}
+	nc1.Close()
+	srv1.Close()
+
+	srv2, nc2, br2 := startDurableServer(t, path)
+	defer func() { nc2.Close(); srv2.Close() }()
+	if got := sendCmd(t, br2, nc2, "GET", "huge"); got != val {
+		gs, _ := got.(string)
+		t.Fatalf("GET huge after restart = %d bytes, want %d", len(gs), len(val))
+	}
+	if got := sendCmd(t, br2, nc2, "STRLEN", "huge"); got != int64(len(val)) {
+		t.Fatalf("STRLEN huge after restart = %v, want %d", got, len(val))
+	}
+}
