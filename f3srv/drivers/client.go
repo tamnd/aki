@@ -62,6 +62,9 @@ func (s *Server) connIntercept(c *shard.Conn, cs *connState, args [][]byte) bool
 	case eqFold(args[0], "RESET"):
 		s.doReset(c, cs, args)
 		return true
+	case eqFold(args[0], "MONITOR"):
+		s.doMonitor(c, cs, args)
+		return true
 	case eqFold(args[0], "DEBUG") && len(args) >= 2 && eqFold(args[1], "SLEEP"):
 		s.doDebugSleep(c, args)
 		return true
@@ -114,6 +117,7 @@ func (s *Server) doReset(c *shard.Conn, cs *connState, args [][]byte) {
 		return
 	}
 	s.pubsub.removeConn(cs)
+	s.stopMonitor(cs)
 	cs.setName(nil)
 	_ = c.InlineReply(resp.AppendStatus(nil, "RESET"))
 }

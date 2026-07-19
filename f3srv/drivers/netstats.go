@@ -95,6 +95,12 @@ type connState struct {
 	// loop returns after the boundary flush so the acknowledgement lands before
 	// the socket closes. Reader-owned like the fields above.
 	quit bool
+
+	// monitoring is set when the connection ran MONITOR: it has joined the
+	// monitor set (monitor.go) and its own commands are excluded from the feed,
+	// so a monitor never echoes itself. Reader-owned like quit, and gated on in
+	// the command path through the registry's atomic count, not this flag.
+	monitoring bool
 }
 
 // setName publishes a new CLIENT SETNAME label. An empty name clears it back to
@@ -262,6 +268,9 @@ func (s *Server) unregister(cs *connState) {
 	// Drop the connection from every channel it subscribed to before folding its
 	// counters; the pub/sub registry has its own mutex, taken outside netMu.
 	s.pubsub.removeConn(cs)
+	// Drop it from the monitor set too, on the same teardown path, so a departed
+	// monitor never lingers as a feed target.
+	s.monitors.remove(cs)
 	s.netMu.Lock()
 	delete(s.netLive, cs)
 	s.netDone.addConn(cs)
