@@ -154,6 +154,12 @@ func init() {
 	// it on connect. The subcommand at args[0] and its tail are validated in the
 	// handler.
 	register("CONFIG", configCmd, 1, -1, false)
+	// The standalone-node admin surface (see admin.go): replication and health
+	// verbs that report f3's true single-node empty/zero state.
+	register("WAIT", waitCmd, 2, 2, false)
+	register("FAILOVER", failoverCmd, 0, -1, false)
+	register("LATENCY", latencyCmd, 1, -1, false)
+	register("SLOWLOG", slowlogCmd, 1, -1, false)
 
 	// The string point surface. SET's tail is option soup, so the handler
 	// validates it.
