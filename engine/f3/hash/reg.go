@@ -300,8 +300,23 @@ func (g *reg) peek(cx *shard.Ctx, key []byte) *hash {
 	// Lazy field-TTL expiry: reap fired fields before the command sees the hash, so
 	// every read and write operates on a hash free of expired fields. A hash whose
 	// last field just expired is deleted, the same way Redis drops a hash the moment
-	// it empties.
-	h.reap(uint64(cx.NowMs))
+	// it empties. A reap that actually fired at least one field publishes the hexpired
+	// event, the field-TTL analog of the key-level expired above; the measure runs
+	// only when a field is due (h.nextExp gate), so a hash with nothing to reap, the
+	// common case, adds nothing to the funnel.
+	if h.nextExp != 0 && uint64(cx.NowMs) >= h.nextExp {
+		before := h.card()
+		h.reap(uint64(cx.NowMs))
+		if h.card() < before {
+			cx.NotifyKeyspaceEvent(shard.NotifyHash, "hexpired", key)
+		}
+		if h.card() == 0 {
+			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
+			g.drop(key)
+			return nil
+		}
+		return h
+	}
 	if h.card() == 0 {
 		g.drop(key)
 		return nil
