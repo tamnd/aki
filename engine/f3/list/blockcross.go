@@ -230,8 +230,10 @@ func blockPopCross(t *shard.Txn, conn *shard.Conn, seq uint32, keys [][]byte, ti
 				return
 			}
 			out = appendReply(nil, key, popOne(l, front))
+			cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(front), key)
 			if l.length() == 0 {
 				g.drop(key)
+				cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 			} else {
 				g.note(l)
 			}
@@ -300,8 +302,10 @@ func BlmpopCross(t *shard.Txn, conn *shard.Conn, seq uint32, a [][]byte) []byte 
 			for j := 0; j < npop; j++ {
 				out = resp.AppendBulk(out, popOne(l, front))
 			}
+			cx.NotifyKeyspaceEvent(shard.NotifyList, popEvent(front), key)
 			if l.length() == 0 {
 				g.drop(key)
+				cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 			} else {
 				g.note(l)
 			}
