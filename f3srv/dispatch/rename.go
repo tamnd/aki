@@ -51,6 +51,8 @@ func renameCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	restoreClear(cx, src)
+	cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "rename_from", src)
+	cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "rename_to", dst)
 	r.Status("OK")
 }
 
@@ -76,6 +78,8 @@ func renamenxCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		return
 	}
 	restoreClear(cx, src)
+	cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "rename_from", src)
+	cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "rename_to", dst)
 	r.Int(1)
 }
 

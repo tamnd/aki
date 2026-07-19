@@ -84,6 +84,15 @@ type worker struct {
 	// the shard cannot import the type packages.
 	evictor func(*Ctx) int
 
+	// publisher is the pub/sub publish hook Runtime.UsePublisher registered
+	// (notify.go), nil on a runtime with no pub/sub. NotifyKeyspaceEvent calls it
+	// to deliver a keyspace notification to subscribers; it self-gates on the live
+	// notify-keyspace-events mask first, so a server that never enables
+	// notifications pays one atomic load per candidate event and never reaches the
+	// hook. The server layer owns the registry the hook closes over, the way it
+	// owns the handlers table, because the shard cannot import the drivers layer.
+	publisher func(channel string, message []byte)
+
 	// cx is the worker's handler context, one per shard for its whole life:
 	// the store, the per-batch clock, and the value scratch whose grown
 	// capacity carries across commands so the steady path allocates nothing.

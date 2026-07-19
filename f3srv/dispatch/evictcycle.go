@@ -107,6 +107,11 @@ func Evictor() func(*shard.Ctx) int {
 			if !dropVictim(cx, ks, key) {
 				break
 			}
+			// A maxmemory eviction is a real removal a subscriber wants to learn
+			// about (the cache-invalidation case); publish the evicted event for the
+			// victim's key. Gated on the notify mask, so it costs one load when
+			// notifications are off.
+			cx.NotifyKeyspaceEvent(shard.NotifyEvicted, "evicted", key)
 			evicted++
 		}
 		return evicted

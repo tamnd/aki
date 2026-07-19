@@ -385,6 +385,10 @@ func Listen(o Options) (*Server, error) {
 	s.rt.Use(dispatch.Handlers())
 	s.rt.UseDemoter(dispatch.Demoter())
 	s.rt.UseEvictor(dispatch.Evictor())
+	// Keyspace notifications: a write on the owner publishes through this shard's
+	// own pub/sub registry, the same registry SUBSCRIBE/PUBLISH use. The publish
+	// path is safe from the owner goroutine (it delivers out-of-band).
+	s.rt.UsePublisher(func(channel string, message []byte) { s.pubsub.publish(channel, message) })
 	s.rt.Start()
 	return s, nil
 }
