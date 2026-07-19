@@ -78,7 +78,20 @@ func (s *Store) writePtr(vs uint64, word uint64, vlen, vcap uint32) {
 // the owner boundaries (ResidentOver fires on fill), so the cap still bounds
 // the touched pages, it just does not let garbage crowd out the working set.
 func (s *Store) spillNow(n uint64) bool {
-	return s.hasLog() && s.residentCap > 0 && s.arena.live()+n > s.residentCap
+	if !s.hasLog() {
+		return false
+	}
+	// Full-durability mode (an .aki record log is attached): a separated value's
+	// record row carries only a run pointer, and that pointer is durable only when
+	// the run is log-resident. With no resident cap the value would otherwise stay
+	// in the volatile arena, whose bytes a restart drops, so recovery would meet an
+	// arena-resident word it cannot deref and fail the whole open. Force every
+	// separated run to the durable value region so its word survives the crash. The
+	// LTM cap still governs how much stays resident above this floor.
+	if s.akirlog != nil {
+		return true
+	}
+	return s.residentCap > 0 && s.arena.live()+n > s.residentCap
 }
 
 // hasLog reports whether a spill target exists: the per-shard scratch value log
