@@ -252,6 +252,14 @@ type Server struct {
 	// relaxed load per command and never the mutex.
 	monitors *monitorRegistry
 
+	// tracking is the network-layer client-side-caching table (tracking.go):
+	// CLIENT TRACKING's recorded-key index and its write-path invalidation, kept
+	// here for the same reason as pub/sub. Its shard-layer arm count gates the
+	// write path so a server with no tracking client pays one relaxed load per
+	// write and never the mutex. Built at Listen and wired to the runtime through
+	// UseInvalidator so a write on any owner drives its invalidation.
+	tracking *trackingRegistry
+
 	// nextConnID hands each connection its CLIENT ID / HELLO id. A connection's
 	// identity is network-layer state (client.go), like pub/sub, so it lives
 	// here and not in the shard workers. register is the one place every driver
@@ -340,6 +348,7 @@ func Listen(o Options) (*Server, error) {
 		netLive:    make(map[*connState]struct{}),
 		pubsub:     newPubsubRegistry(),
 		monitors:   newMonitorRegistry(),
+		tracking:   newTrackingRegistry(),
 	}
 	switch o.NetDriver {
 	case NetReactor:
@@ -389,6 +398,11 @@ func Listen(o Options) (*Server, error) {
 	// own pub/sub registry, the same registry SUBSCRIBE/PUBLISH use. The publish
 	// path is safe from the owner goroutine (it delivers out-of-band).
 	s.rt.UsePublisher(func(channel string, message []byte) { s.pubsub.publish(channel, message) })
+	// Client-side caching: a write on the owner invalidates every connection that
+	// cached the touched key, delivered out-of-band the same way the publisher is.
+	// The hook self-gates on the shard-layer tracking-armed count, so a server with
+	// no tracking client never reaches this closure.
+	s.rt.UseInvalidator(func(key []byte) { s.tracking.invalidate(key) })
 	s.rt.Start()
 	return s, nil
 }
@@ -742,6 +756,15 @@ func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary fu
 					}
 					if derr := dispatch.Dispatch(c, args); derr != nil {
 						return
+					}
+					// Client-side caching: if this connection is tracking, record
+					// the keys a read-only cacheable command touched, so a later
+					// write to any of them pushes an invalidation. The gate is one
+					// nil-pointer check (tracking is reader-owned), so a connection
+					// that never enabled tracking pays nothing; a non-read command
+					// contributes no keys and record does nothing.
+					if cs.tracking != nil {
+						s.tracking.recordReadKeys(cs, args)
 					}
 				}
 				if cmds > 0 {

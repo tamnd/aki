@@ -93,6 +93,15 @@ type worker struct {
 	// owns the handlers table, because the shard cannot import the drivers layer.
 	publisher func(channel string, message []byte)
 
+	// invalidator is the client-side-caching invalidation hook
+	// Runtime.UseInvalidator registered (tracking.go), nil on a runtime with no
+	// CSC. It rides the same universal modified-key seam publishKeyspaceEvent owns:
+	// every write that emits a keyspace event also calls this with the touched key,
+	// but on its own gate (the trackingArmed atomic), because a client cache must be
+	// invalidated even when notify-keyspace-events is off. The server layer owns the
+	// tracking registry the hook closes over, the way it owns the pub/sub registry.
+	invalidator func(key []byte)
+
 	// cx is the worker's handler context, one per shard for its whole life:
 	// the store, the per-batch clock, and the value scratch whose grown
 	// capacity carries across commands so the steady path allocates nothing.

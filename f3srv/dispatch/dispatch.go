@@ -115,6 +115,17 @@ type entry struct {
 	// STORE. The register lowercasing mangles the underscore in "SORT_RO", so the
 	// route reads this flag rather than comparing the entry name.
 	sortRO bool
+
+	// cscRead marks a read-only, cacheable command whose keys client-side caching
+	// records for a tracking connection (spec 2064/f3/17, CLIENT TRACKING default
+	// mode). ReadKeys returns the command's keys only when this is set; a write, a
+	// keyless command, or a read this slice does not yet record returns nil, an
+	// honest partial that covers the point reads across every type and widens with
+	// the aggregate and scan reads in a follow-up. cscMultiKey is set on the two
+	// read commands whose keys are the whole tail (MGET, EXISTS/TOUCH); the rest
+	// carry one key at keyAt.
+	cscRead     bool
+	cscMultiKey bool
 }
 
 // maxVerb bounds the uppercase scratch for verb lookup; no Redis verb comes
@@ -882,6 +893,99 @@ func init() {
 	table["MEMORY"].keyAt = 1
 	table["MEMORY"].fanOp = registerShard(infoShardAll)
 	table["MEMORY"].subFan = memorySubFan
+
+	markCSCReads()
+}
+
+// markCSCReads flags the read-only, cacheable commands whose keys client-side
+// caching records for a tracking connection (spec 2064/f3/17, CLIENT TRACKING
+// default mode; see ReadKeys). It is a curated set rather than a general
+// read-only classification: f3 models no per-command read/write flag, so this
+// names the point reads across every type a client actually caches. The two
+// whole-tail reads (MGET, and the EXISTS/TOUCH existence probes) set cscMultiKey;
+// the rest carry one key at keyAt (0 for all of these). Aggregate reads that read
+// several keys under a numkeys count (SINTER, ZUNION, LCS) and the scan family are
+// a documented follow-up, so a client caching those keys is not yet invalidated on
+// their write, the same honest-partial discipline the keyspace-notification slice
+// took. A verb absent here returns nil from ReadKeys and is never recorded.
+func markCSCReads() {
+	single := []string{
+		// String reads.
+		"GET", "STRLEN", "GETRANGE", "SUBSTR", "GETBIT", "BITCOUNT", "BITPOS", "BITFIELD_RO",
+		// Generic key reads: type and the read-only expiry queries.
+		"TYPE", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME",
+		// Hash reads.
+		"HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS", "HSTRLEN", "HRANDFIELD",
+		// List reads.
+		"LLEN", "LINDEX", "LRANGE", "LPOS",
+		// Set reads.
+		"SCARD", "SISMEMBER", "SMISMEMBER", "SMEMBERS", "SRANDMEMBER",
+		// Sorted-set reads.
+		"ZSCORE", "ZMSCORE", "ZCARD", "ZRANK", "ZREVRANK", "ZRANGE", "ZREVRANGE",
+		"ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZREVRANGEBYLEX", "ZCOUNT", "ZLEXCOUNT",
+		// Stream reads.
+		"XLEN", "XRANGE", "XREVRANGE",
+		// Geo reads (a geo set is a sorted set; these never write).
+		"GEOPOS", "GEODIST", "GEOHASH",
+	}
+	for _, name := range single {
+		if e := table[name]; e != nil {
+			e.cscRead = true
+		}
+	}
+	// The whole-tail reads: every argument after the verb is a key.
+	for _, name := range []string{"MGET", "EXISTS", "TOUCH"} {
+		if e := table[name]; e != nil {
+			e.cscRead = true
+			e.cscMultiKey = true
+		}
+	}
+}
+
+// ReadKeys returns the keys a read-only, cacheable command touched, for
+// client-side caching (CLIENT TRACKING default mode): a tracking connection
+// records these so the first write to any of them pushes an invalidation. It
+// returns nil for a write, a keyless command, an unknown or malformed verb, or a
+// read this slice does not yet record (see markCSCReads for the covered set and
+// the honest-partial follow-up). It runs on the connection's reader goroutine
+// after the command is dispatched, gated by the caller on the connection's
+// tracking state, so it never touches the shard. The returned slices alias the
+// caller's argument views; the caller copies each key into the tracking table
+// before the parse buffer is reused.
+func ReadKeys(args [][]byte) [][]byte {
+	if len(args) == 0 {
+		return nil
+	}
+	verb := args[0]
+	if len(verb) > maxVerb {
+		return nil
+	}
+	var vb [maxVerb]byte
+	for i := 0; i < len(verb); i++ {
+		ch := verb[i]
+		if ch >= 'a' && ch <= 'z' {
+			ch -= 32
+		}
+		vb[i] = ch
+	}
+	e := table[string(vb[:len(verb)])]
+	if e == nil || !e.cscRead {
+		return nil
+	}
+	if e.cscMultiKey {
+		// MGET/EXISTS/TOUCH: every argument after the verb is a key.
+		if len(args) < 2 {
+			return nil
+		}
+		return args[1:]
+	}
+	// One key at keyAt (0 for every read in the curated set), the same index
+	// Dispatch routes the point path on.
+	idx := 1 + e.keyAt
+	if idx >= len(args) {
+		return nil
+	}
+	return args[idx : idx+1]
 }
 
 // memorySubFan routes the keyless MEMORY subcommands. STATS and DOCTOR scatter
