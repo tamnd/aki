@@ -766,6 +766,16 @@ func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary fu
 					if cs.tracking != nil {
 						s.tracking.recordReadKeys(cs, args)
 					}
+					// A flush empties every key, so every tracking connection's whole
+					// cache is stale at once. redis answers that with a single
+					// invalidate push carrying a null payload, one per flush command
+					// rather than one per key, to every tracking client (not only the
+					// issuer). This fires regardless of who ran the flush, so it sits
+					// outside the cs.tracking gate; the armed check keeps an unarmed
+					// server to the two verb compares.
+					if shard.TrackingArmed() && (eqFold(args[0], "FLUSHALL") || eqFold(args[0], "FLUSHDB")) {
+						s.tracking.invalidateAll()
+					}
 				}
 				if cmds > 0 {
 					// The pass's command count folds into one store, and a pass

@@ -46,11 +46,15 @@ type trackState struct {
 type trackingRegistry struct {
 	mu    sync.Mutex
 	keys  map[string]map[*connState]struct{}
+	conns map[*connState]struct{}
 	armed int
 }
 
 func newTrackingRegistry() *trackingRegistry {
-	return &trackingRegistry{keys: make(map[string]map[*connState]struct{})}
+	return &trackingRegistry{
+		keys:  make(map[string]map[*connState]struct{}),
+		conns: make(map[*connState]struct{}),
+	}
 }
 
 // arm turns tracking on for a connection: it stamps the connection's trackState
@@ -60,6 +64,7 @@ func newTrackingRegistry() *trackingRegistry {
 func (r *trackingRegistry) arm(cs *connState) {
 	cs.tracking = &trackState{recorded: make(map[string]struct{})}
 	r.mu.Lock()
+	r.conns[cs] = struct{}{}
 	r.armed++
 	shard.SetTrackingArmed(int64(r.armed))
 	r.mu.Unlock()
@@ -81,6 +86,7 @@ func (r *trackingRegistry) removeConn(cs *connState) {
 	for k := range ts.recorded {
 		r.dropLocked(k, cs)
 	}
+	delete(r.conns, cs)
 	r.armed--
 	shard.SetTrackingArmed(int64(r.armed))
 	r.mu.Unlock()
@@ -168,6 +174,42 @@ func (r *trackingRegistry) invalidate(key []byte) {
 	}
 }
 
+// invalidateAll is the flush-path hook: a FLUSHALL or FLUSHDB empties every key, so
+// every tracking connection's whole cache is stale at once. redis answers with a
+// single invalidate push whose payload is a null (rather than one push per cached
+// key), sent to every tracking client. It snapshots the connection set under the
+// mutex, clears the whole forward index and each connection's recorded set, then
+// delivers the one null push outside the lock. Runs on the reader goroutine of the
+// connection that issued the flush; DeliverOOB into another connection's buffer is
+// owner-safe, the same cross-connection delivery pub/sub does.
+func (r *trackingRegistry) invalidateAll() {
+	r.mu.Lock()
+	if len(r.conns) == 0 {
+		r.mu.Unlock()
+		return
+	}
+	targets := make([]*shard.Conn, 0, len(r.conns))
+	for cs := range r.conns {
+		targets = append(targets, cs.sc)
+		// The whole cache is gone; drop the recorded set so the next read re-arms.
+		cs.tracking.recorded = make(map[string]struct{})
+	}
+	// One flush clears the entire forward index.
+	r.keys = make(map[string]map[*connState]struct{})
+	r.mu.Unlock()
+
+	var wire []byte
+	for _, sc := range targets {
+		if !sc.Resp3() {
+			continue
+		}
+		if wire == nil {
+			wire = appendInvalidateNull(nil)
+		}
+		sc.DeliverOOB(wire)
+	}
+}
+
 // appendInvalidate builds the RESP3 client-side-caching invalidation push: a
 // two-element push of "invalidate" and a one-key array. redis carries an array so
 // one message can name several keys (a FLUSH sends a null instead); this slice
@@ -177,5 +219,15 @@ func appendInvalidate(dst []byte, key []byte) []byte {
 	dst = resp.AppendBulk(dst, []byte("invalidate"))
 	dst = resp.AppendArrayHeader(dst, 1)
 	dst = resp.AppendBulk(dst, key)
+	return dst
+}
+
+// appendInvalidateNull builds the flush invalidation push: the two-element
+// "invalidate" push with a RESP3 null payload in place of the key array, redis's
+// signal that every cached key is gone at once.
+func appendInvalidateNull(dst []byte) []byte {
+	dst = resp.AppendPushHeader(dst, 2)
+	dst = resp.AppendBulk(dst, []byte("invalidate"))
+	dst = resp.AppendNull3(dst)
 	return dst
 }
