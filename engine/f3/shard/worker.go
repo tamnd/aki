@@ -100,7 +100,10 @@ type worker struct {
 	// but on its own gate (the trackingArmed atomic), because a client cache must be
 	// invalidated even when notify-keyspace-events is off. The server layer owns the
 	// tracking registry the hook closes over, the way it owns the pub/sub registry.
-	invalidator func(key []byte)
+	// origin is the connection whose command drove the write (nil for a server-side
+	// event like an expiry reap), so the hook can honor a NOLOOP client that does not
+	// want an invalidation for its own writes.
+	invalidator func(key []byte, origin *Conn)
 
 	// cx is the worker's handler context, one per shard for its whole life:
 	// the store, the per-batch clock, and the value scratch whose grown

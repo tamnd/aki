@@ -48,7 +48,7 @@ func TrackingArmed() bool { return trackingArmed.Load() != 0 }
 // before Start like UsePublisher, so the owner reads it with no synchronization.
 // The hook delivers invalidation pushes through the connection out-of-band path,
 // which is safe from the owner goroutine, the same guarantee the publisher has.
-func (r *Runtime) UseInvalidator(fn func(key []byte)) {
+func (r *Runtime) UseInvalidator(fn func(key []byte, origin *Conn)) {
 	if r.started {
 		panic("shard: UseInvalidator after Start")
 	}

@@ -2,6 +2,7 @@ package drivers
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/tamnd/aki/engine/f3/shard"
 	"github.com/tamnd/aki/f3srv/dispatch"
@@ -41,6 +42,13 @@ type trackState struct {
 	// TRACKING ON and read on the connection's own reader goroutine, so no lock.
 	optin  bool
 	optout bool
+	// noloop suppresses the invalidation for a key this connection wrote itself: the
+	// client already knows its own write changed the value, so redis lets it opt out
+	// of the self-notification. Set on the connection's reader goroutine at CLIENT
+	// TRACKING ON but read on the writer's owner goroutine (the invalidate path
+	// matches the origin connection), so it is atomic to make that cross-goroutine
+	// read safe, unlike the reader-confined optin/optout.
+	noloop atomic.Bool
 	// caching is the transient CLIENT CACHING selector, governing the very next
 	// command only: cachingYes or cachingNo overrides the mode's default for that
 	// one command, then recordReadKeys clears it back to cachingNone. Reader-owned,
@@ -178,7 +186,7 @@ func (r *trackingRegistry) recordReadKeys(cs *connState, args [][]byte) {
 // set is snapshotted under the mutex and the deliveries run outside it, the pub/sub
 // discipline, so the registry mutex never nests under a connection waker. Runs on
 // the owner goroutine; DeliverOOB is owner-safe.
-func (r *trackingRegistry) invalidate(key []byte) {
+func (r *trackingRegistry) invalidate(key []byte, origin *shard.Conn) {
 	k := string(key)
 	r.mu.Lock()
 	b := r.keys[k]
@@ -188,7 +196,13 @@ func (r *trackingRegistry) invalidate(key []byte) {
 	}
 	targets := make([]*shard.Conn, 0, len(b))
 	for cs := range b {
-		targets = append(targets, cs.sc)
+		// NOLOOP: a client that wrote the key itself does not want the invalidation
+		// for its own write. The origin is the writing connection; a cached
+		// connection matching it that set noloop is dropped from delivery, but its
+		// cache entry is still forgotten so its next read re-arms like everyone's.
+		if cs.sc != origin || !cs.tracking.noloop.Load() {
+			targets = append(targets, cs.sc)
+		}
 		// Forget the key on each connection's reverse set too, so the next read
 		// re-records it: invalidation is once per caching cycle.
 		delete(cs.tracking.recorded, k)

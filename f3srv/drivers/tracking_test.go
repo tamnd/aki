@@ -314,6 +314,52 @@ func TestTrackingOptout(t *testing.T) {
 	}
 }
 
+// TestTrackingNoloop checks NOLOOP suppresses the invalidation for a key the
+// tracking connection wrote itself, while a write by a different connection to the
+// same cached key still pushes. A self-write still forgets the key (once per
+// caching cycle), so the tracking connection re-reads to re-arm before the foreign
+// write is expected to push.
+func TestTrackingNoloop(t *testing.T) {
+	srv := startPubsubServer(t)
+	tc, tbr := dialPubsub(t, srv)
+	wc, wbr := dialPubsub(t, srv)
+
+	if m := helloFields(t, sendCmd(t, tbr, tc, "HELLO", "3")); m["proto"] != int64(3) {
+		t.Fatalf("HELLO 3 proto = %v, want 3", m["proto"])
+	}
+	if r := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "NOLOOP"); r != "OK" {
+		t.Fatalf("CLIENT TRACKING ON NOLOOP = %v, want OK", r)
+	}
+
+	// TRACKINGINFO renders the noloop flag.
+	info := flattenPairs(t, sendCmd(t, tbr, tc, "CLIENT", "TRACKINGINFO"))
+	flags, ok := info["flags"].([]any)
+	if !ok || len(flags) != 2 || flags[0] != "on" || flags[1] != "noloop" {
+		t.Fatalf("TRACKINGINFO flags with NOLOOP = %v, want [on noloop]", info["flags"])
+	}
+
+	// Seed and read the key so it is cached, then write it on the tracking
+	// connection itself: NOLOOP suppresses the self-invalidation.
+	send(t, wc, "SET", "n", "1")
+	expect(t, wbr, "+OK\r\n")
+	sendCmd(t, tbr, tc, "GET", "n")
+	if r := sendCmd(t, tbr, tc, "SET", "n", "2"); r != "OK" {
+		t.Fatalf("self-write SET n = %v, want OK", r)
+	}
+	if r := sendCmd(t, tbr, tc, "PING"); r != "PONG" {
+		t.Fatalf("NOLOOP self-write then PING = %v, want PONG (no self-push)", r)
+	}
+
+	// Re-read to re-arm (the self-write still forgot the key), then a foreign write
+	// on another connection must push, since NOLOOP only exempts the writer itself.
+	sendCmd(t, tbr, tc, "GET", "n")
+	send(t, wc, "SET", "n", "3")
+	expect(t, wbr, "+OK\r\n")
+	if push, ok := readRESP(t, tbr).([]any); !ok || push[0] != "invalidate" {
+		t.Fatalf("NOLOOP foreign write push = %v, want invalidate", push)
+	}
+}
+
 // TestTrackingModeErrors checks the mode validation: OPTIN and OPTOUT together is an
 // error, CACHING outside a mode is an error, and CACHING with the wrong YES/NO for
 // the mode is an error. Also checks TRACKINGINFO renders the mode token.
