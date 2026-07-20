@@ -213,7 +213,7 @@ func (s *Server) doClient(c *shard.Conn, cs *connState, args [][]byte) {
 	case eqFold(sub, "TRACKINGINFO"):
 		s.doClientTrackingInfo(c, cs, args)
 	case eqFold(sub, "CACHING"):
-		s.doClientCaching(c, args)
+		s.doClientCaching(c, cs, args)
 	case eqFold(sub, "INFO"):
 		if len(args) != 2 {
 			_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|info' command"))
@@ -349,12 +349,35 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 		_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
 		return
 	}
-	// Any tail after ON/OFF names an option this slice does not implement yet.
-	if len(args) > 3 {
-		_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT TRACKING accepts only a bare ON or OFF in this build; REDIRECT, BCAST, PREFIX, OPTIN, OPTOUT, and NOLOOP are not yet supported"))
+	// Parse the option tail. This slice supports the two recording modes OPTIN and
+	// OPTOUT; REDIRECT, BCAST, PREFIX, and NOLOOP are later slices, refused with an
+	// honest not-yet error rather than a silent accept so a client cannot believe it
+	// configured a mode f3 does not run.
+	var optin, optout bool
+	for i := 3; i < len(args); i++ {
+		switch {
+		case eqFold(args[i], "OPTIN"):
+			optin = true
+		case eqFold(args[i], "OPTOUT"):
+			optout = true
+		case eqFold(args[i], "REDIRECT") || eqFold(args[i], "BCAST") ||
+			eqFold(args[i], "PREFIX") || eqFold(args[i], "NOLOOP"):
+			_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT TRACKING option '"+string(args[i])+"' is not supported yet; this build offers a bare ON/OFF with the OPTIN or OPTOUT mode"))
+			return
+		default:
+			_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
+			return
+		}
+	}
+	if optin && optout {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR You can't specify both OPTIN mode and OPTOUT mode"))
 		return
 	}
 	if eqFold(onoff, "OFF") {
+		if optin || optout {
+			_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
+			return
+		}
 		if cs.tracking != nil {
 			s.tracking.removeConn(cs)
 			cs.tracking = nil
@@ -371,6 +394,8 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 	if cs.tracking == nil {
 		s.tracking.arm(cs)
 	}
+	cs.tracking.optin = optin
+	cs.tracking.optout = optout
 	_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
 }
 
@@ -387,6 +412,20 @@ func (s *Server) doClientTrackingInfo(c *shard.Conn, cs *connState, args [][]byt
 		return
 	}
 	on := cs.tracking != nil
+	// The flags array renders redis's mode tokens: off when disabled, else on plus
+	// the optin/optout mode token when one is set.
+	var flags []string
+	if on {
+		flags = append(flags, "on")
+		if cs.tracking.optin {
+			flags = append(flags, "optin")
+		}
+		if cs.tracking.optout {
+			flags = append(flags, "optout")
+		}
+	} else {
+		flags = append(flags, "off")
+	}
 	var out []byte
 	if c.Resp3() {
 		out = resp.AppendMapHeader(nil, 3)
@@ -394,11 +433,9 @@ func (s *Server) doClientTrackingInfo(c *shard.Conn, cs *connState, args [][]byt
 		out = resp.AppendArrayHeader(nil, 6)
 	}
 	out = resp.AppendBulk(out, []byte("flags"))
-	out = resp.AppendArrayHeader(out, 1)
-	if on {
-		out = resp.AppendBulk(out, []byte("on"))
-	} else {
-		out = resp.AppendBulk(out, []byte("off"))
+	out = resp.AppendArrayHeader(out, len(flags))
+	for _, f := range flags {
+		out = resp.AppendBulk(out, []byte(f))
 	}
 	out = resp.AppendBulk(out, []byte("redirect"))
 	if on {
@@ -412,19 +449,41 @@ func (s *Server) doClientTrackingInfo(c *shard.Conn, cs *connState, args [][]byt
 }
 
 // doClientCaching answers CLIENT CACHING YES|NO, the per-command opt-in/opt-out
-// selector. It is meaningful only when tracking runs in OPTIN or OPTOUT mode, and
-// this slice runs neither, so it validates the YES/NO argument and then returns the
-// same error redis gives outside those modes rather than silently accepting.
-func (s *Server) doClientCaching(c *shard.Conn, args [][]byte) {
+// selector. It is meaningful only when tracking runs in OPTIN or OPTOUT mode: YES
+// belongs to OPTIN (cache the next command's reads), NO to OPTOUT (skip the next
+// command's reads). It refuses a connection that is not tracking or is in default
+// mode, and a YES/NO that does not match the connection's mode, the same errors
+// redis gives. On success it stamps the transient selector the next command's
+// recordReadKeys consumes.
+func (s *Server) doClientCaching(c *shard.Conn, cs *connState, args [][]byte) {
 	if len(args) != 3 {
 		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|caching' command"))
 		return
 	}
-	if !eqFold(args[2], "YES") && !eqFold(args[2], "NO") {
+	yes := eqFold(args[2], "YES")
+	no := eqFold(args[2], "NO")
+	if !yes && !no {
 		_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
 		return
 	}
-	_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled"))
+	if cs.tracking == nil || (!cs.tracking.optin && !cs.tracking.optout) {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled"))
+		return
+	}
+	if yes && !cs.tracking.optin {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT CACHING YES is only valid when tracking is enabled in OPTIN mode"))
+		return
+	}
+	if no && !cs.tracking.optout {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT CACHING NO is only valid when tracking is enabled in OPTOUT mode"))
+		return
+	}
+	if yes {
+		cs.tracking.caching = cachingYes
+	} else {
+		cs.tracking.caching = cachingNo
+	}
+	_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
 }
 
 // doHello answers the HELLO handshake and negotiates the protocol version. Bare
