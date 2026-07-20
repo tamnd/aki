@@ -350,19 +350,21 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 		return
 	}
 	// Parse the option tail. This slice supports the two recording modes OPTIN and
-	// OPTOUT; REDIRECT, BCAST, PREFIX, and NOLOOP are later slices, refused with an
-	// honest not-yet error rather than a silent accept so a client cannot believe it
-	// configured a mode f3 does not run.
-	var optin, optout bool
+	// OPTOUT plus NOLOOP; REDIRECT, BCAST, and PREFIX are later slices, refused with
+	// an honest not-yet error rather than a silent accept so a client cannot believe
+	// it configured a mode f3 does not run.
+	var optin, optout, noloop bool
 	for i := 3; i < len(args); i++ {
 		switch {
 		case eqFold(args[i], "OPTIN"):
 			optin = true
 		case eqFold(args[i], "OPTOUT"):
 			optout = true
+		case eqFold(args[i], "NOLOOP"):
+			noloop = true
 		case eqFold(args[i], "REDIRECT") || eqFold(args[i], "BCAST") ||
-			eqFold(args[i], "PREFIX") || eqFold(args[i], "NOLOOP"):
-			_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT TRACKING option '"+string(args[i])+"' is not supported yet; this build offers a bare ON/OFF with the OPTIN or OPTOUT mode"))
+			eqFold(args[i], "PREFIX"):
+			_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT TRACKING option '"+string(args[i])+"' is not supported yet; this build offers a bare ON/OFF with the OPTIN, OPTOUT, or NOLOOP option"))
 			return
 		default:
 			_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
@@ -374,7 +376,7 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 		return
 	}
 	if eqFold(onoff, "OFF") {
-		if optin || optout {
+		if optin || optout || noloop {
 			_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
 			return
 		}
@@ -396,6 +398,7 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 	}
 	cs.tracking.optin = optin
 	cs.tracking.optout = optout
+	cs.tracking.noloop.Store(noloop)
 	_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
 }
 
@@ -413,7 +416,7 @@ func (s *Server) doClientTrackingInfo(c *shard.Conn, cs *connState, args [][]byt
 	}
 	on := cs.tracking != nil
 	// The flags array renders redis's mode tokens: off when disabled, else on plus
-	// the optin/optout mode token when one is set.
+	// the optin/optout mode token when one is set and noloop when it is armed.
 	var flags []string
 	if on {
 		flags = append(flags, "on")
@@ -422,6 +425,9 @@ func (s *Server) doClientTrackingInfo(c *shard.Conn, cs *connState, args [][]byt
 		}
 		if cs.tracking.optout {
 			flags = append(flags, "optout")
+		}
+		if cs.tracking.noloop.Load() {
+			flags = append(flags, "noloop")
 		}
 	} else {
 		flags = append(flags, "off")

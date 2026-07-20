@@ -203,7 +203,9 @@ func (cx *Ctx) NotifyKeyspaceEvent(class uint32, event string, key []byte) {
 	if cx.w == nil {
 		return
 	}
-	cx.w.publishKeyspaceEvent(class, event, key)
+	// curConn is the connection whose command drove this write; pass it so a NOLOOP
+	// tracking client is not sent an invalidation for its own write.
+	cx.w.publishKeyspaceEvent(class, event, key, cx.curConn)
 }
 
 // publishKeyspaceEvent is the worker-level emit core NotifyKeyspaceEvent delegates
@@ -213,15 +215,16 @@ func (cx *Ctx) NotifyKeyspaceEvent(class uint32, event string, key []byte) {
 // on the live mask first, so a disabled server (the default) returns after one
 // atomic load, and on the publisher hook, so a runtime with no pub/sub returns at
 // once. Owner goroutine only; the publish is out-of-band-safe.
-func (w *worker) publishKeyspaceEvent(class uint32, event string, key []byte) {
+func (w *worker) publishKeyspaceEvent(class uint32, event string, key []byte, origin *Conn) {
 	// Client-side-caching invalidation rides this same universal modified-key seam
 	// but on its own gate, ahead of the notify mask: a cached key must be
 	// invalidated on every write even when notify-keyspace-events is off. The gate
 	// is one relaxed load, so a server with no tracking client pays nothing beyond
 	// it; the hook itself delivers the invalidation push out-of-band, owner-safe
-	// like the publisher below (tracking.go).
+	// like the publisher below (tracking.go). origin is the writing connection (nil
+	// for a server-side event) so the hook can skip a NOLOOP client's own write.
 	if trackingArmed.Load() != 0 && w != nil && w.invalidator != nil {
-		w.invalidator(key)
+		w.invalidator(key, origin)
 	}
 	flags := notifyFlags.Load()
 	if flags&class == 0 {
@@ -256,7 +259,10 @@ func (w *worker) publishKeyspaceEvent(class uint32, event string, key []byte) {
 // one gating-and-formatting path every keyspace notification shares. Owner
 // goroutine only, the same context the reap runs in.
 func (w *worker) emitExpired(key []byte) {
-	w.publishKeyspaceEvent(NotifyExpired, "expired", key)
+	// An expiry is a server-side event, driven by no client's command, so there is
+	// no origin connection to exempt: every tracking client that cached the key
+	// gets the invalidation.
+	w.publishKeyspaceEvent(NotifyExpired, "expired", key, nil)
 }
 
 // The single-db channel prefixes. f3 runs one logical db, so the db index is

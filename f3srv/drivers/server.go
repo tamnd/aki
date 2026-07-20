@@ -402,7 +402,7 @@ func Listen(o Options) (*Server, error) {
 	// cached the touched key, delivered out-of-band the same way the publisher is.
 	// The hook self-gates on the shard-layer tracking-armed count, so a server with
 	// no tracking client never reaches this closure.
-	s.rt.UseInvalidator(func(key []byte) { s.tracking.invalidate(key) })
+	s.rt.UseInvalidator(func(key []byte, origin *shard.Conn) { s.tracking.invalidate(key, origin) })
 	s.rt.Start()
 	return s, nil
 }
