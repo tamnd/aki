@@ -201,8 +201,19 @@ func (s *Server) doClient(c *shard.Conn, cs *connState, args [][]byte) {
 			_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|getredir' command"))
 			return
 		}
-		// No client tracking is configured, so there is no redirection target.
-		_ = c.InlineReply(resp.AppendInt(nil, -1))
+		// -1 when tracking is off; 0 when it is on with no redirection target,
+		// the only tracking shape this slice offers (REDIRECT is a later slice).
+		if cs.tracking != nil {
+			_ = c.InlineReply(resp.AppendInt(nil, 0))
+		} else {
+			_ = c.InlineReply(resp.AppendInt(nil, -1))
+		}
+	case eqFold(sub, "TRACKING"):
+		s.doClientTracking(c, cs, args)
+	case eqFold(sub, "TRACKINGINFO"):
+		s.doClientTrackingInfo(c, cs, args)
+	case eqFold(sub, "CACHING"):
+		s.doClientCaching(c, args)
 	case eqFold(sub, "INFO"):
 		if len(args) != 2 {
 			_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|info' command"))
@@ -315,6 +326,105 @@ func (s *Server) clientOnOff(c *shard.Conn, args [][]byte, name string) {
 		return
 	}
 	_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
+}
+
+// doClientTracking answers CLIENT TRACKING ON|OFF, the enable switch for client-
+// side caching (spec 2064/f3/17). ON arms this connection: every key it later reads
+// through a cacheable command is recorded, and the first write to such a key pushes
+// one RESP3 invalidate message (drivers/tracking.go). OFF disarms it and drops its
+// recorded keys. This slice offers only a bare ON or OFF: it requires RESP3 (the
+// honest redis answer when no REDIRECT client is given, since a RESP2 connection has
+// no way to carry an out-of-band push) and refuses REDIRECT, BCAST, PREFIX, OPTIN,
+// OPTOUT, and NOLOOP with a clear not-yet error rather than a silent accept, so a
+// client cannot believe it configured a mode f3 does not run. Re-running ON on an
+// already-tracking connection, or OFF on one that never tracked, is answered OK,
+// matching redis's idempotent switch.
+func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
+	if len(args) < 3 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|tracking' command"))
+		return
+	}
+	onoff := args[2]
+	if !eqFold(onoff, "ON") && !eqFold(onoff, "OFF") {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
+		return
+	}
+	// Any tail after ON/OFF names an option this slice does not implement yet.
+	if len(args) > 3 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT TRACKING accepts only a bare ON or OFF in this build; REDIRECT, BCAST, PREFIX, OPTIN, OPTOUT, and NOLOOP are not yet supported"))
+		return
+	}
+	if eqFold(onoff, "OFF") {
+		if cs.tracking != nil {
+			s.tracking.removeConn(cs)
+			cs.tracking = nil
+		}
+		_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
+		return
+	}
+	// ON: default-mode tracking rides RESP3 pushes, so a RESP2 connection with no
+	// redirection target cannot enable it, the redis contract.
+	if !c.Resp3() {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR Client tracking can be enabled only in RESP3 mode or when a redirection client is specified via the 'REDIRECT' option"))
+		return
+	}
+	if cs.tracking == nil {
+		s.tracking.arm(cs)
+	}
+	_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
+}
+
+// doClientTrackingInfo answers CLIENT TRACKINGINFO, the introspection command that
+// reports this connection's client-side-caching state. It returns the three fields
+// this slice models: flags (an array holding "on" or "off"), redirect (0 when
+// tracking is on with no redirect target, -1 when off), and prefixes (always the
+// empty array, since BCAST PREFIX is a later slice). Under RESP3 it is a real map
+// frame; under RESP2 the flat six-element array redis falls back to. It reads only
+// this connection's own state on its own reader goroutine, so it needs no lock.
+func (s *Server) doClientTrackingInfo(c *shard.Conn, cs *connState, args [][]byte) {
+	if len(args) != 2 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|trackinginfo' command"))
+		return
+	}
+	on := cs.tracking != nil
+	var out []byte
+	if c.Resp3() {
+		out = resp.AppendMapHeader(nil, 3)
+	} else {
+		out = resp.AppendArrayHeader(nil, 6)
+	}
+	out = resp.AppendBulk(out, []byte("flags"))
+	out = resp.AppendArrayHeader(out, 1)
+	if on {
+		out = resp.AppendBulk(out, []byte("on"))
+	} else {
+		out = resp.AppendBulk(out, []byte("off"))
+	}
+	out = resp.AppendBulk(out, []byte("redirect"))
+	if on {
+		out = resp.AppendInt(out, 0)
+	} else {
+		out = resp.AppendInt(out, -1)
+	}
+	out = resp.AppendBulk(out, []byte("prefixes"))
+	out = resp.AppendArrayHeader(out, 0)
+	_ = c.InlineReply(out)
+}
+
+// doClientCaching answers CLIENT CACHING YES|NO, the per-command opt-in/opt-out
+// selector. It is meaningful only when tracking runs in OPTIN or OPTOUT mode, and
+// this slice runs neither, so it validates the YES/NO argument and then returns the
+// same error redis gives outside those modes rather than silently accepting.
+func (s *Server) doClientCaching(c *shard.Conn, args [][]byte) {
+	if len(args) != 3 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|caching' command"))
+		return
+	}
+	if !eqFold(args[2], "YES") && !eqFold(args[2], "NO") {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
+		return
+	}
+	_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled"))
 }
 
 // doHello answers the HELLO handshake and negotiates the protocol version. Bare

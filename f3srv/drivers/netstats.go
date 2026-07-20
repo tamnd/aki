@@ -101,6 +101,15 @@ type connState struct {
 	// so a monitor never echoes itself. Reader-owned like quit, and gated on in
 	// the command path through the registry's atomic count, not this flag.
 	monitoring bool
+
+	// tracking is this connection's CLIENT TRACKING state (client-side caching),
+	// nil until TRACKING ON and back to nil after OFF (tracking.go). The pointer is
+	// reader-owned like the pub/sub sets: set and cleared on this connection's own
+	// reader goroutine, so the read-path nil check the command loop makes needs no
+	// lock. Its recorded-key set is shared with the tracking registry's forward
+	// index, so that map is touched only under the registry mutex. A non-nil
+	// pointer means the connection is caching and its reads are recorded.
+	tracking *trackState
 }
 
 // setName publishes a new CLIENT SETNAME label. An empty name clears it back to
@@ -271,6 +280,10 @@ func (s *Server) unregister(cs *connState) {
 	// Drop it from the monitor set too, on the same teardown path, so a departed
 	// monitor never lingers as a feed target.
 	s.monitors.remove(cs)
+	// Drop it from the client-side-caching table, so a write never pushes an
+	// invalidation to a gone connection and the armed count sheds it. A no-op when
+	// the connection never enabled tracking.
+	s.tracking.removeConn(cs)
 	s.netMu.Lock()
 	delete(s.netLive, cs)
 	s.netDone.addConn(cs)
