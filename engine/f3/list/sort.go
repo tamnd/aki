@@ -22,3 +22,23 @@ func SortElements(cx *shard.Ctx, key []byte) [][]byte {
 	l.each(func(e []byte) { out = append(out, append([]byte(nil), e...)) })
 	return out
 }
+
+// SortStore replaces key with a fresh list holding elems in order, the
+// destination write of SORT ... STORE (spec 2064/f3/17 section 12). The caller
+// has already cleared any prior value at key of every type (restoreClear) and
+// guarantees elems is non-empty, so this only builds: a new list, each element
+// appended to the back in order and logged for durability the way RPUSH logs a
+// created key, then the footprint noted into the resident total. It returns the
+// stored length. An empty result never reaches here; the SORT handler deletes the
+// destination instead, matching Redis, which keeps no empty list around.
+func SortStore(cx *shard.Ctx, key []byte, elems [][]byte) int {
+	g := registry(cx)
+	l := newList()
+	g.install(cx, key, l)
+	for _, v := range elems {
+		l.pushBack(v)
+		logPush(cx, key, v, false)
+	}
+	g.note(l)
+	return l.length()
+}

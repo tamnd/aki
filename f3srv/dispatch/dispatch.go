@@ -102,6 +102,19 @@ type entry struct {
 	// true for a subcommand that scatters keyless, or ok=false to leave the
 	// command on the point route. fanOp carries the per-shard sub-command op.
 	subFan func(args [][]byte) (shard.FanKind, bool)
+
+	// sortRoute marks SORT and SORT_RO, whose route is chosen from the option
+	// shape rather than the key set (spec 2064/f3/17 section 12): a plain sort
+	// stays on the point path where one owner materializes its collection, while a
+	// BY-pattern dereference, a GET projection, or a STORE runs on a coordinator
+	// goroutine so it can issue the read-only owner hops the data-dependent fan
+	// needs and hold the destination's intent. dispatchSort makes the split.
+	sortRoute bool
+
+	// sortRO marks the SORT_RO entry, whose grammar accepts BY/GET but rejects
+	// STORE. The register lowercasing mangles the underscore in "SORT_RO", so the
+	// route reads this flag rather than comparing the entry name.
+	sortRO bool
 }
 
 // maxVerb bounds the uppercase scratch for verb lookup; no Redis verb comes
@@ -265,10 +278,15 @@ func init() {
 	register("PEXPIREAT", pexpireatCmd, 2, -1, true)
 	// SORT and its read-only twin span list, set, and zset, so they live here
 	// with the other cross-type keyspace verbs. Only the plain numeric/ALPHA and
-	// BY-nosort rows are wired; the fan-wave BY-pattern/GET/STORE rows are their
-	// own deferred slices (spec 2064/f3/17 section 12).
+	// The plain numeric/ALPHA sort and the BY-nosort case take the point path; a
+	// BY-pattern dereference, a GET projection, or a STORE routes through the
+	// coordinator (dispatchSort), where the data-dependent fan reads its weight and
+	// projection keys across owners (spec 2064/f3/17 section 12).
 	register("SORT", sortCmd, 1, -1, true)
 	register("SORT_RO", sortRoCmd, 1, -1, true)
+	table["SORT"].sortRoute = true
+	table["SORT_RO"].sortRoute = true
+	table["SORT_RO"].sortRO = true
 	// DUMP and RESTORE serialize one key and rebuild it (see dump.go). Both are
 	// single-key and single-shard, so they take the plain keyed point path the
 	// way GET does; they live here with the other cross-type keyspace verbs
@@ -979,6 +997,9 @@ func Dispatch(c *shard.Conn, args [][]byte) error {
 	n := len(args) - 1
 	if n < e.minArgs || (e.maxArgs >= 0 && n > e.maxArgs) {
 		return oops(c, "ERR wrong number of arguments for '"+e.name+"' command")
+	}
+	if e.sortRoute {
+		return dispatchSort(c, e, args)
 	}
 	if e.fan != 0 && (e.fanOnly || n > 1) {
 		return dispatchFan(c, e, args)
@@ -1711,68 +1732,20 @@ func sortRoCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 }
 
 func sortRun(cx *shard.Ctx, args [][]byte, r shard.Reply, ro bool) {
-	key := args[0]
-	var (
-		desc   bool
-		alpha  bool
-		nosort bool
-		hasLim bool
-		off    int
-		count  int
-	)
-	for i := 1; i < len(args); {
-		switch {
-		case tokenIs(args[i], "ASC"):
-			desc = false
-			i++
-		case tokenIs(args[i], "DESC"):
-			desc = true
-			i++
-		case tokenIs(args[i], "ALPHA"):
-			alpha = true
-			i++
-		case tokenIs(args[i], "LIMIT"):
-			if i+2 >= len(args) {
-				r.Err("ERR syntax error")
-				return
-			}
-			o, err1 := strconv.Atoi(string(args[i+1]))
-			c, err2 := strconv.Atoi(string(args[i+2]))
-			if err1 != nil || err2 != nil {
-				r.Err("ERR value is not an integer or out of range")
-				return
-			}
-			hasLim, off, count = true, o, c
-			i += 3
-		case tokenIs(args[i], "BY"):
-			if i+1 >= len(args) {
-				r.Err("ERR syntax error")
-				return
-			}
-			// A BY pattern with no '*' cannot name a key, so Redis reads it as the
-			// nosort signal: return the source in stored order. A pattern with '*'
-			// dereferences arbitrary keys and rides the deferred fan-wave slice.
-			if hasStar(args[i+1]) {
-				r.Err("ERR SORT BY with a key pattern is not yet supported")
-				return
-			}
-			nosort = true
-			i += 2
-		case tokenIs(args[i], "GET"):
-			r.Err("ERR SORT GET is not yet supported")
-			return
-		case tokenIs(args[i], "STORE"):
-			if ro {
-				r.Err("ERR syntax error")
-				return
-			}
-			r.Err("ERR SORT STORE is not yet supported")
-			return
-		default:
-			r.Err("ERR syntax error")
-			return
-		}
+	o, errMsg := parseSortOpts(args[1:], ro)
+	if errMsg != "" {
+		r.Err(errMsg)
+		return
 	}
+	if o.fanning() || o.store != nil {
+		// dispatchSort routes every dereference, projection, and STORE to the
+		// coordinator, so the point path never sees one; a fan option reaching here
+		// is a routing bug, not a client error. Fail loud rather than silently drop
+		// the option.
+		r.Err("ERR syntax error")
+		return
+	}
+	key := args[0]
 
 	var elems [][]byte
 	switch {
@@ -1787,10 +1760,10 @@ func sortRun(cx *shard.Ctx, args [][]byte, r shard.Reply, ro bool) {
 		return
 	}
 
-	if !nosort && len(elems) > 1 {
-		if alpha {
+	if !o.nosort && len(elems) > 1 {
+		if o.alpha {
 			sort.SliceStable(elems, func(i, j int) bool {
-				return bytesLess(elems[i], elems[j], desc)
+				return bytesLess(elems[i], elems[j], o.desc)
 			})
 		} else {
 			scores := make([]float64, len(elems))
@@ -1807,7 +1780,7 @@ func sortRun(cx *shard.Ctx, args [][]byte, r shard.Reply, ro bool) {
 				idx[i] = i
 			}
 			sort.SliceStable(idx, func(a, b int) bool {
-				if desc {
+				if o.desc {
 					return scores[idx[a]] > scores[idx[b]]
 				}
 				return scores[idx[a]] < scores[idx[b]]
@@ -1820,24 +1793,8 @@ func sortRun(cx *shard.Ctx, args [][]byte, r shard.Reply, ro bool) {
 		}
 	}
 
-	if hasLim {
-		n := len(elems)
-		start := off
-		if start < 0 {
-			start = 0
-		}
-		if start > n {
-			start = n
-		}
-		end := n
-		if count >= 0 {
-			end = start + count
-			if end > n {
-				end = n
-			}
-		}
-		elems = elems[start:end]
-	}
+	start, end := sortLimit(o, len(elems))
+	elems = elems[start:end]
 
 	out := resp.AppendArrayHeader(cx.Aux[:0], len(elems))
 	for _, e := range elems {
