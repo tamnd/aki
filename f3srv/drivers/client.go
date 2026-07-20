@@ -1,6 +1,7 @@
 package drivers
 
 import (
+	"bytes"
 	"net"
 	"strconv"
 	"time"
@@ -329,16 +330,17 @@ func (s *Server) clientOnOff(c *shard.Conn, args [][]byte, name string) {
 }
 
 // doClientTracking answers CLIENT TRACKING ON|OFF, the enable switch for client-
-// side caching (spec 2064/f3/17). ON arms this connection: every key it later reads
-// through a cacheable command is recorded, and the first write to such a key pushes
-// one RESP3 invalidate message (drivers/tracking.go). OFF disarms it and drops its
-// recorded keys. This slice offers only a bare ON or OFF: it requires RESP3 (the
-// honest redis answer when no REDIRECT client is given, since a RESP2 connection has
-// no way to carry an out-of-band push) and refuses REDIRECT, BCAST, PREFIX, OPTIN,
-// OPTOUT, and NOLOOP with a clear not-yet error rather than a silent accept, so a
-// client cannot believe it configured a mode f3 does not run. Re-running ON on an
-// already-tracking connection, or OFF on one that never tracked, is answered OK,
-// matching redis's idempotent switch.
+// side caching (spec 2064/f3/17). ON arms this connection in one of two shapes.
+// Default mode (with the OPTIN/OPTOUT recording gates) records every key the
+// connection reads through a cacheable command and pushes one RESP3 invalidate on
+// the first write to such a key. BCAST mode registers a prefix set instead and
+// pushes an invalidate for every write to a key matching a prefix, statelessly. Both
+// honour NOLOOP (skip the invalidation for a key this connection wrote). OFF disarms
+// the connection and drops its registration. Tracking requires RESP3 (the honest
+// redis answer when no REDIRECT client is given, since a RESP2 connection cannot
+// carry an out-of-band push); REDIRECT is refused with a clear not-yet error rather
+// than a silent accept. Re-running ON on an already-tracking connection, or OFF on
+// one that never tracked, is answered OK, matching redis's idempotent switch.
 func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 	if len(args) < 3 {
 		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|tracking' command"))
@@ -350,10 +352,11 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 		return
 	}
 	// Parse the option tail. This slice supports the two recording modes OPTIN and
-	// OPTOUT plus NOLOOP; REDIRECT, BCAST, and PREFIX are later slices, refused with
-	// an honest not-yet error rather than a silent accept so a client cannot believe
-	// it configured a mode f3 does not run.
-	var optin, optout, noloop bool
+	// OPTOUT, NOLOOP, and BCAST with its PREFIX list; REDIRECT is a later slice,
+	// refused with an honest not-yet error rather than a silent accept so a client
+	// cannot believe it configured a mode f3 does not run.
+	var optin, optout, noloop, bcast bool
+	var prefixes [][]byte
 	for i := 3; i < len(args); i++ {
 		switch {
 		case eqFold(args[i], "OPTIN"):
@@ -362,9 +365,18 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 			optout = true
 		case eqFold(args[i], "NOLOOP"):
 			noloop = true
-		case eqFold(args[i], "REDIRECT") || eqFold(args[i], "BCAST") ||
-			eqFold(args[i], "PREFIX"):
-			_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT TRACKING option '"+string(args[i])+"' is not supported yet; this build offers a bare ON/OFF with the OPTIN, OPTOUT, or NOLOOP option"))
+		case eqFold(args[i], "BCAST"):
+			bcast = true
+		case eqFold(args[i], "PREFIX"):
+			// PREFIX takes one argument, the prefix string, and may repeat.
+			if i+1 >= len(args) {
+				_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
+				return
+			}
+			i++
+			prefixes = append(prefixes, args[i])
+		case eqFold(args[i], "REDIRECT"):
+			_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT TRACKING option 'REDIRECT' is not supported yet; this build offers ON/OFF with OPTIN, OPTOUT, NOLOOP, and BCAST with PREFIX"))
 			return
 		default:
 			_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
@@ -375,8 +387,23 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 		_ = c.InlineReply(resp.AppendError(nil, "ERR You can't specify both OPTIN mode and OPTOUT mode"))
 		return
 	}
+	if bcast && (optin || optout) {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR OPTIN and OPTOUT are not compatible with BCAST"))
+		return
+	}
+	if len(prefixes) > 0 && !bcast {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR PREFIX option requires BCAST mode to be enabled"))
+		return
+	}
+	// Prefixes for a single client must not overlap: if one is a prefix of another a
+	// key could match both and the client would get two invalidations for one write,
+	// so redis rejects the pair at registration.
+	if msg := checkPrefixOverlap(prefixes); msg != "" {
+		_ = c.InlineReply(resp.AppendError(nil, msg))
+		return
+	}
 	if eqFold(onoff, "OFF") {
-		if optin || optout || noloop {
+		if optin || optout || noloop || bcast || len(prefixes) > 0 {
 			_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
 			return
 		}
@@ -387,11 +414,29 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 		_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
 		return
 	}
-	// ON: default-mode tracking rides RESP3 pushes, so a RESP2 connection with no
-	// redirection target cannot enable it, the redis contract.
+	// ON: tracking rides RESP3 pushes, so a RESP2 connection with no redirection
+	// target cannot enable it, the redis contract.
 	if !c.Resp3() {
 		_ = c.InlineReply(resp.AppendError(nil, "ERR Client tracking can be enabled only in RESP3 mode or when a redirection client is specified via the 'REDIRECT' option"))
 		return
+	}
+	if bcast {
+		// BCAST is a distinct registration (a prefix set, no recorded-key table), so a
+		// connection crossing into or re-declaring it re-arms clean rather than layering
+		// onto stale default-mode state.
+		if cs.tracking != nil {
+			s.tracking.removeConn(cs)
+			cs.tracking = nil
+		}
+		s.tracking.armBcast(cs, prefixes)
+		cs.tracking.noloop.Store(noloop)
+		_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
+		return
+	}
+	// Default / OPTIN / OPTOUT. A connection leaving BCAST re-arms clean the other way.
+	if cs.tracking != nil && cs.tracking.bcast {
+		s.tracking.removeConn(cs)
+		cs.tracking = nil
 	}
 	if cs.tracking == nil {
 		s.tracking.arm(cs)
@@ -400,6 +445,22 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 	cs.tracking.optout = optout
 	cs.tracking.noloop.Store(noloop)
 	_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
+}
+
+// checkPrefixOverlap reports redis's prefix-overlap error when one registered
+// prefix is a prefix of another (the empty prefix overlaps every prefix), else the
+// empty string. Prefixes for a single client must not overlap so a key never
+// matches two of them and draws a doubled invalidation.
+func checkPrefixOverlap(prefixes [][]byte) string {
+	for i := 0; i < len(prefixes); i++ {
+		for j := i + 1; j < len(prefixes); j++ {
+			a, b := prefixes[i], prefixes[j]
+			if bytes.HasPrefix(a, b) || bytes.HasPrefix(b, a) {
+				return "ERR Prefix '" + string(a) + "' overlaps with an existing prefix '" + string(b) + "'. Prefixes for a single client must not overlap"
+			}
+		}
+	}
+	return ""
 }
 
 // doClientTrackingInfo answers CLIENT TRACKINGINFO, the introspection command that
@@ -416,10 +477,13 @@ func (s *Server) doClientTrackingInfo(c *shard.Conn, cs *connState, args [][]byt
 	}
 	on := cs.tracking != nil
 	// The flags array renders redis's mode tokens: off when disabled, else on plus
-	// the optin/optout mode token when one is set and noloop when it is armed.
+	// bcast, the optin/optout mode token when one is set, and noloop when it is armed.
 	var flags []string
 	if on {
 		flags = append(flags, "on")
+		if cs.tracking.bcast {
+			flags = append(flags, "bcast")
+		}
 		if cs.tracking.optin {
 			flags = append(flags, "optin")
 		}
@@ -450,7 +514,14 @@ func (s *Server) doClientTrackingInfo(c *shard.Conn, cs *connState, args [][]byt
 		out = resp.AppendInt(out, -1)
 	}
 	out = resp.AppendBulk(out, []byte("prefixes"))
-	out = resp.AppendArrayHeader(out, 0)
+	if on {
+		out = resp.AppendArrayHeader(out, len(cs.tracking.prefixes))
+		for _, p := range cs.tracking.prefixes {
+			out = resp.AppendBulk(out, p)
+		}
+	} else {
+		out = resp.AppendArrayHeader(out, 0)
+	}
 	_ = c.InlineReply(out)
 }
 

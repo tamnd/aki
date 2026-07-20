@@ -1,6 +1,7 @@
 package drivers
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -23,9 +24,10 @@ import (
 // discipline). The registry lives in the network layer beside pub/sub, gated by the
 // shard-layer trackingArmed count so an unarmed server pays one relaxed load per
 // write and never this mutex, the same shape the pub/sub and monitor registries
-// have. BCAST, OPTIN/OPTOUT, NOLOOP, and the RESP2 REDIRECT path are later slices;
-// TRACKING ON refuses everything but a bare ON/OFF here, and it requires RESP3 (the
-// honest redis answer when no redirection client is given).
+// have. OPTIN/OPTOUT, NOLOOP, and BCAST with its prefix table are all live; the
+// RESP2 REDIRECT path is the remaining slice, refused with an honest not-yet error.
+// TRACKING ON requires RESP3 (the honest redis answer when no redirection client is
+// given, since a RESP2 connection cannot carry an out-of-band push).
 
 // trackState is one connection's CLIENT TRACKING configuration, nil on a
 // connection that never enabled it. In this slice it holds only the recorded-key
@@ -49,6 +51,14 @@ type trackState struct {
 	// matches the origin connection), so it is atomic to make that cross-goroutine
 	// read safe, unlike the reader-confined optin/optout.
 	noloop atomic.Bool
+	// bcast marks a broadcast-mode connection: it keeps no recorded-key table and
+	// instead registers a prefix set in the registry's bcast slice, taking an
+	// invalidation for every write to a matching key rather than only for keys it
+	// read. prefixes is this connection's own copy of that set, kept here so
+	// TRACKINGINFO renders it on the reader goroutine without touching the registry.
+	// Both are set once at CLIENT TRACKING ON BCAST and reader-owned, like optin.
+	bcast    bool
+	prefixes [][]byte
 	// caching is the transient CLIENT CACHING selector, governing the very next
 	// command only: cachingYes or cachingNo overrides the mode's default for that
 	// one command, then recordReadKeys clears it back to cachingNone. Reader-owned,
@@ -73,7 +83,22 @@ type trackingRegistry struct {
 	mu    sync.Mutex
 	keys  map[string]map[*connState]struct{}
 	conns map[*connState]struct{}
+	// bcast is the broadcast-mode prefix table a write scans: each entry pairs a
+	// registered prefix with the connection that wants an invalidation for every key
+	// matching it. Unlike keys it is never drained on a write (broadcast fires every
+	// time, not once per caching cycle); a connection's entries are removed only when
+	// it disarms or disconnects. A connection with an empty prefix set holds one
+	// entry with the empty prefix, which matches every key.
+	bcast []bcastEntry
 	armed int
+}
+
+// bcastEntry is one (connection, prefix) registration in the broadcast prefix
+// table. The empty prefix matches every key, so a BCAST with no PREFIX is one entry
+// with prefix "".
+type bcastEntry struct {
+	cs     *connState
+	prefix string
 }
 
 func newTrackingRegistry() *trackingRegistry {
@@ -96,13 +121,41 @@ func (r *trackingRegistry) arm(cs *connState) {
 	r.mu.Unlock()
 }
 
+// armBcast turns on broadcast-mode tracking for a connection: it stamps a bcast
+// trackState carrying the connection's own prefix copy (for TRACKINGINFO) and
+// registers one prefix-table entry per prefix, or a single empty-prefix entry when
+// no PREFIX was given (which matches every key). Like arm it bumps the armed count
+// the shard-layer gate reads. The caller (CLIENT TRACKING ON BCAST) has already
+// disarmed any prior registration, so this always starts clean. Runs on the
+// connection's reader goroutine.
+func (r *trackingRegistry) armBcast(cs *connState, prefixes [][]byte) {
+	ts := &trackState{bcast: true}
+	for _, p := range prefixes {
+		ts.prefixes = append(ts.prefixes, append([]byte(nil), p...))
+	}
+	cs.tracking = ts
+	r.mu.Lock()
+	r.conns[cs] = struct{}{}
+	if len(prefixes) == 0 {
+		r.bcast = append(r.bcast, bcastEntry{cs: cs, prefix: ""})
+	} else {
+		for _, p := range prefixes {
+			r.bcast = append(r.bcast, bcastEntry{cs: cs, prefix: string(p)})
+		}
+	}
+	r.armed++
+	shard.SetTrackingArmed(int64(r.armed))
+	r.mu.Unlock()
+}
+
 // removeConn drops a connection from the tracking table: it walks the connection's
 // recorded-key set, removes it from each key's bucket, forgets an emptied bucket,
-// and decrements the armed count. It is a no-op on a connection that never tracked,
-// so both TRACKING OFF (which nils cs.tracking after) and the disconnect teardown
-// call it safely, and a disconnect after an explicit OFF finds nil and skips. Runs
-// under the mutex against live writers; the recorded set is this connection's, but
-// its entries are shared with the forward index, so the whole walk holds the lock.
+// drops any broadcast prefix entries it registered, and decrements the armed count.
+// It is a no-op on a connection that never tracked, so both TRACKING OFF (which nils
+// cs.tracking after) and the disconnect teardown call it safely, and a disconnect
+// after an explicit OFF finds nil and skips. Runs under the mutex against live
+// writers; the recorded set is this connection's, but its entries are shared with
+// the forward index, so the whole walk holds the lock.
 func (r *trackingRegistry) removeConn(cs *connState) {
 	ts := cs.tracking
 	if ts == nil {
@@ -112,10 +165,25 @@ func (r *trackingRegistry) removeConn(cs *connState) {
 	for k := range ts.recorded {
 		r.dropLocked(k, cs)
 	}
+	if ts.bcast {
+		r.bcast = dropBcastConn(r.bcast, cs)
+	}
 	delete(r.conns, cs)
 	r.armed--
 	shard.SetTrackingArmed(int64(r.armed))
 	r.mu.Unlock()
+}
+
+// dropBcastConn returns the prefix table with every entry belonging to cs removed,
+// compacted in place. The caller holds the mutex.
+func dropBcastConn(entries []bcastEntry, cs *connState) []bcastEntry {
+	out := entries[:0]
+	for _, e := range entries {
+		if e.cs != cs {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // dropLocked removes cs from one key's bucket and forgets the bucket when it
@@ -162,6 +230,11 @@ func (r *trackingRegistry) record(cs *connState, key []byte) {
 // command read anything.
 func (r *trackingRegistry) recordReadKeys(cs *connState, args [][]byte) {
 	ts := cs.tracking
+	// Broadcast mode keeps no recorded-key table (it fires on prefix match, not on a
+	// prior read), so there is nothing to record and no CACHING selector to consume.
+	if ts.bcast {
+		return
+	}
 	caching := ts.caching
 	ts.caching = cachingNone
 	switch {
@@ -189,27 +262,41 @@ func (r *trackingRegistry) recordReadKeys(cs *connState, args [][]byte) {
 func (r *trackingRegistry) invalidate(key []byte, origin *shard.Conn) {
 	k := string(key)
 	r.mu.Lock()
-	b := r.keys[k]
-	if b == nil {
-		r.mu.Unlock()
-		return
-	}
-	targets := make([]*shard.Conn, 0, len(b))
-	for cs := range b {
-		// NOLOOP: a client that wrote the key itself does not want the invalidation
-		// for its own write. The origin is the writing connection; a cached
-		// connection matching it that set noloop is dropped from delivery, but its
-		// cache entry is still forgotten so its next read re-arms like everyone's.
-		if cs.sc != origin || !cs.tracking.noloop.Load() {
-			targets = append(targets, cs.sc)
+	var targets []*shard.Conn
+	// Default mode: the recorded-key forward index. The bucket is drained on this
+	// write, so the next read re-arms it (once per caching cycle).
+	if b := r.keys[k]; b != nil {
+		for cs := range b {
+			// NOLOOP: a client that wrote the key itself does not want the invalidation
+			// for its own write. The origin is the writing connection; a cached
+			// connection matching it that set noloop is dropped from delivery, but its
+			// cache entry is still forgotten so its next read re-arms like everyone's.
+			if cs.sc != origin || !cs.tracking.noloop.Load() {
+				targets = append(targets, cs.sc)
+			}
+			// Forget the key on each connection's reverse set too, so the next read
+			// re-records it: invalidation is once per caching cycle.
+			delete(cs.tracking.recorded, k)
 		}
-		// Forget the key on each connection's reverse set too, so the next read
-		// re-records it: invalidation is once per caching cycle.
-		delete(cs.tracking.recorded, k)
+		delete(r.keys, k)
 	}
-	delete(r.keys, k)
+	// Broadcast mode: every registered prefix that this key starts with, its
+	// connection notified. Stateless, so nothing is drained; the same connection is
+	// notified again on the next matching write. Overlap is rejected at registration,
+	// so a connection matches at most one of its own prefixes and is added once.
+	for _, e := range r.bcast {
+		if !strings.HasPrefix(k, e.prefix) {
+			continue
+		}
+		if e.cs.sc != origin || !e.cs.tracking.noloop.Load() {
+			targets = append(targets, e.cs.sc)
+		}
+	}
 	r.mu.Unlock()
 
+	if len(targets) == 0 {
+		return
+	}
 	// One wire, reused across targets (DeliverOOB copies it into each connection's
 	// buffer). Every tracking connection is RESP3 in this slice (TRACKING ON
 	// refuses RESP2), so the RESP2 branch is a defensive skip, not a live path.
