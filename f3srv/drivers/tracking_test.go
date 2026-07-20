@@ -93,6 +93,51 @@ func TestTrackingOncePerCycle(t *testing.T) {
 	}
 }
 
+// TestTrackingFlushNullPush checks a FLUSHALL invalidates every tracking cache at
+// once with a single null-payload push, and does so even when a different
+// connection issued the flush.
+func TestTrackingFlushNullPush(t *testing.T) {
+	srv := startPubsubServer(t)
+	tc, tbr := dialPubsub(t, srv)
+	wc, wbr := dialPubsub(t, srv)
+
+	if m := helloFields(t, sendCmd(t, tbr, tc, "HELLO", "3")); m["proto"] != int64(3) {
+		t.Fatalf("HELLO 3 proto = %v, want 3", m["proto"])
+	}
+	sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON")
+
+	send(t, wc, "SET", "a", "1")
+	expect(t, wbr, "+OK\r\n")
+	send(t, wc, "SET", "b", "2")
+	expect(t, wbr, "+OK\r\n")
+	sendCmd(t, tbr, tc, "GET", "a")
+	sendCmd(t, tbr, tc, "GET", "b")
+
+	// A flush from the writer connection invalidates the tracking connection's whole
+	// cache with one null-payload push, not one per cached key.
+	send(t, wc, "FLUSHALL")
+	expect(t, wbr, "+OK\r\n")
+
+	push, ok := readRESP(t, tbr).([]any)
+	if !ok || len(push) != 2 {
+		t.Fatalf("flush push = %v, want a 2-element frame", push)
+	}
+	if push[0] != "invalidate" {
+		t.Fatalf("flush push[0] = %v, want invalidate", push[0])
+	}
+	if push[1] != nil {
+		t.Fatalf("flush push payload = %v, want a null", push[1])
+	}
+
+	// The cache was cleared, so a write to a now-forgotten key pushes nothing until
+	// it is read again.
+	send(t, wc, "SET", "a", "3")
+	expect(t, wbr, "+OK\r\n")
+	if r := sendCmd(t, tbr, tc, "PING"); r != "PONG" {
+		t.Fatalf("after flush, write to forgotten key = %v, want PONG (no stray push)", r)
+	}
+}
+
 // TestTrackingOffStopsPush checks CLIENT TRACKING OFF disarms the connection: a
 // write to a previously recorded key pushes nothing.
 func TestTrackingOffStopsPush(t *testing.T) {
