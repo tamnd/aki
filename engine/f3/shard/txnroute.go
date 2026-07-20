@@ -293,6 +293,25 @@ func (t *Txn) Shard(key []byte) int {
 	return t.rt.ShardOf(key)
 }
 
+// ReadShard runs fn read-only on shard's owner and blocks until it completes,
+// for a shard the transaction need NOT hold an intent on. It posts an opRun with
+// no intent, the same barrier-independent seam CallOwner uses, so the owner
+// drains it off its intent control queue without any lock. This is the SORT
+// BY/GET dereference hop: the pattern keys resolve to arbitrary owners the
+// command never named, and the spec sanctions the fan as a lock-free read wave
+// needing only a consistent epoch, never intent locks (2064/f3/17 section 12).
+// A consumer groups its pattern keys by Shard first, then issues one ReadShard
+// per owner reading every key that owner holds, so the wave is one hop per shard
+// rather than one per key. fn runs single-owner on the target shard, so it may
+// touch that shard's owner-only structures exactly like a handler. Coordinator
+// goroutine only (it blocks on the owner's reply); never an owner goroutine,
+// which would self-deadlock.
+func (t *Txn) ReadShard(shard int, fn func(*Ctx)) {
+	done := make(chan struct{})
+	t.rt.workers[shard].postIntent(&intentOp{kind: opRun, fn: fn, done: done})
+	<-done
+}
+
 // SameShard reports whether two keys route to the same shard, the dispatch
 // check that keeps a co-located tier-two command on its free single-shard
 // fast path (doc 03 section 6.1) and sends only the genuinely cross-shard

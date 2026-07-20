@@ -151,6 +151,35 @@ func Has(cx *shard.Ctx, key []byte) bool {
 	return v.(*reg).peek(cx, key) != nil
 }
 
+// Field returns a copy of the value of field in the hash at key, the hash-access
+// dereference SORT ... BY key->field and GET key->field perform (spec 2064/f3/17
+// section 12). ok is false when no hash lives at key, the key holds another type,
+// or the field is absent, all of which SORT reads as a missing weight or a nil
+// projection. The value is copied out of the owner-local field store, since the
+// dereference fan reads it on one owner and uses it on the coordinator after the
+// read hop returns; an empty field value copies to a non-nil empty slice so the
+// caller can tell present-empty from absent. It builds no registry when none
+// exists, so a deref against a shard holding no hashes touches nothing.
+func Field(cx *shard.Ctx, key, field []byte) ([]byte, bool) {
+	v, ok := regs.Load(cx.St)
+	if !ok {
+		return nil, false
+	}
+	h, wrong := v.(*reg).lookup(cx, key)
+	if wrong || h == nil {
+		return nil, false
+	}
+	val, ok := h.get(field)
+	if !ok {
+		return nil, false
+	}
+	out := append([]byte(nil), val...)
+	if out == nil {
+		out = []byte{}
+	}
+	return out, true
+}
+
 // Delete removes key when it holds a hash on this shard and reports whether it
 // did: the hash arm of the unified single-key DEL. It builds no registry when
 // none exists, so a DEL over a key of another type touches nothing here. lookup
