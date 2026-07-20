@@ -360,6 +360,128 @@ func TestTrackingNoloop(t *testing.T) {
 	}
 }
 
+// TestTrackingBcast checks broadcast mode: a PREFIX registration pushes an
+// invalidate for every write to a key under the prefix, with no prior read, and
+// fires on every such write (stateless, not once per caching cycle). A write to a
+// key outside the prefix pushes nothing.
+func TestTrackingBcast(t *testing.T) {
+	srv := startPubsubServer(t)
+	tc, tbr := dialPubsub(t, srv)
+	wc, wbr := dialPubsub(t, srv)
+
+	if m := helloFields(t, sendCmd(t, tbr, tc, "HELLO", "3")); m["proto"] != int64(3) {
+		t.Fatalf("HELLO 3 proto = %v, want 3", m["proto"])
+	}
+	if r := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "BCAST", "PREFIX", "user:"); r != "OK" {
+		t.Fatalf("CLIENT TRACKING ON BCAST PREFIX user: = %v, want OK", r)
+	}
+
+	// TRACKINGINFO renders the bcast flag and the registered prefix.
+	info := flattenPairs(t, sendCmd(t, tbr, tc, "CLIENT", "TRACKINGINFO"))
+	flags, ok := info["flags"].([]any)
+	if !ok || len(flags) != 2 || flags[0] != "on" || flags[1] != "bcast" {
+		t.Fatalf("TRACKINGINFO flags in BCAST = %v, want [on bcast]", info["flags"])
+	}
+	prefixes, ok := info["prefixes"].([]any)
+	if !ok || len(prefixes) != 1 || prefixes[0] != "user:" {
+		t.Fatalf("TRACKINGINFO prefixes = %v, want [user:]", info["prefixes"])
+	}
+
+	// A write to a key under the prefix pushes an invalidate naming the key, with no
+	// prior read by the tracking connection.
+	send(t, wc, "SET", "user:1", "a")
+	expect(t, wbr, "+OK\r\n")
+	push, ok := readRESP(t, tbr).([]any)
+	if !ok || len(push) != 2 || push[0] != "invalidate" {
+		t.Fatalf("bcast prefix write push = %v, want a 2-element invalidate", push)
+	}
+	if keys, ok := push[1].([]any); !ok || len(keys) != 1 || keys[0] != "user:1" {
+		t.Fatalf("bcast push keys = %v, want [user:1]", push[1])
+	}
+
+	// Broadcast is stateless: a second write to the same key, with no intervening
+	// read, pushes again.
+	send(t, wc, "SET", "user:1", "b")
+	expect(t, wbr, "+OK\r\n")
+	if push, ok := readRESP(t, tbr).([]any); !ok || push[0] != "invalidate" {
+		t.Fatalf("bcast second write push = %v, want invalidate (stateless)", push)
+	}
+
+	// A write to a key outside the prefix pushes nothing.
+	send(t, wc, "SET", "other:1", "c")
+	expect(t, wbr, "+OK\r\n")
+	if r := sendCmd(t, tbr, tc, "PING"); r != "PONG" {
+		t.Fatalf("bcast non-prefix write = %v, want PONG (no push)", r)
+	}
+}
+
+// TestTrackingBcastAllKeys checks BCAST with no PREFIX matches every key.
+func TestTrackingBcastAllKeys(t *testing.T) {
+	srv := startPubsubServer(t)
+	tc, tbr := dialPubsub(t, srv)
+	wc, wbr := dialPubsub(t, srv)
+
+	if m := helloFields(t, sendCmd(t, tbr, tc, "HELLO", "3")); m["proto"] != int64(3) {
+		t.Fatalf("HELLO 3 proto = %v, want 3", m["proto"])
+	}
+	sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "BCAST")
+
+	send(t, wc, "SET", "anything", "1")
+	expect(t, wbr, "+OK\r\n")
+	if push, ok := readRESP(t, tbr).([]any); !ok || push[0] != "invalidate" {
+		t.Fatalf("bcast-all write push = %v, want invalidate", push)
+	}
+}
+
+// TestTrackingBcastNoloop checks NOLOOP suppresses a broadcast connection's push for
+// a matching key it wrote itself, while another connection's write still pushes.
+func TestTrackingBcastNoloop(t *testing.T) {
+	srv := startPubsubServer(t)
+	tc, tbr := dialPubsub(t, srv)
+	wc, wbr := dialPubsub(t, srv)
+
+	if m := helloFields(t, sendCmd(t, tbr, tc, "HELLO", "3")); m["proto"] != int64(3) {
+		t.Fatalf("HELLO 3 proto = %v, want 3", m["proto"])
+	}
+	sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "BCAST", "NOLOOP", "PREFIX", "k:")
+
+	// The tracking connection writes a matching key itself: NOLOOP suppresses the push.
+	if r := sendCmd(t, tbr, tc, "SET", "k:1", "a"); r != "OK" {
+		t.Fatalf("bcast self-write = %v, want OK", r)
+	}
+	if r := sendCmd(t, tbr, tc, "PING"); r != "PONG" {
+		t.Fatalf("bcast NOLOOP self-write = %v, want PONG (no self-push)", r)
+	}
+
+	// A different connection's write to a matching key still pushes.
+	send(t, wc, "SET", "k:2", "b")
+	expect(t, wbr, "+OK\r\n")
+	if push, ok := readRESP(t, tbr).([]any); !ok || push[0] != "invalidate" {
+		t.Fatalf("bcast NOLOOP foreign write push = %v, want invalidate", push)
+	}
+}
+
+// TestTrackingBcastErrors checks BCAST validation: BCAST with OPTIN is an error,
+// PREFIX without BCAST is an error, and overlapping prefixes are an error.
+func TestTrackingBcastErrors(t *testing.T) {
+	srv := startPubsubServer(t)
+	tc, tbr := dialPubsub(t, srv)
+
+	if m := helloFields(t, sendCmd(t, tbr, tc, "HELLO", "3")); m["proto"] != int64(3) {
+		t.Fatalf("HELLO 3 proto = %v, want 3", m["proto"])
+	}
+
+	if _, ok := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "BCAST", "OPTIN").(errorReply); !ok {
+		t.Fatalf("TRACKING ON BCAST OPTIN should be an error")
+	}
+	if _, ok := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "PREFIX", "x").(errorReply); !ok {
+		t.Fatalf("TRACKING ON PREFIX without BCAST should be an error")
+	}
+	if _, ok := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "BCAST", "PREFIX", "foo", "PREFIX", "foobar").(errorReply); !ok {
+		t.Fatalf("TRACKING ON BCAST with overlapping prefixes should be an error")
+	}
+}
+
 // TestTrackingModeErrors checks the mode validation: OPTIN and OPTOUT together is an
 // error, CACHING outside a mode is an error, and CACHING with the wrong YES/NO for
 // the mode is an error. Also checks TRACKINGINFO renders the mode token.
