@@ -233,6 +233,117 @@ func TestTrackingCachingRejected(t *testing.T) {
 	}
 }
 
+// TestTrackingOptin checks OPTIN mode caches only the reads of a command preceded
+// by CLIENT CACHING YES: an unmarked read is not cached (a write pushes nothing),
+// and a CACHING YES-marked read is (a write pushes).
+func TestTrackingOptin(t *testing.T) {
+	srv := startPubsubServer(t)
+	tc, tbr := dialPubsub(t, srv)
+	wc, wbr := dialPubsub(t, srv)
+
+	if m := helloFields(t, sendCmd(t, tbr, tc, "HELLO", "3")); m["proto"] != int64(3) {
+		t.Fatalf("HELLO 3 proto = %v, want 3", m["proto"])
+	}
+	if r := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "OPTIN"); r != "OK" {
+		t.Fatalf("CLIENT TRACKING ON OPTIN = %v, want OK", r)
+	}
+
+	send(t, wc, "SET", "u", "1")
+	expect(t, wbr, "+OK\r\n")
+
+	// An unmarked read in OPTIN mode is not cached, so the write pushes nothing.
+	sendCmd(t, tbr, tc, "GET", "u")
+	send(t, wc, "SET", "u", "2")
+	expect(t, wbr, "+OK\r\n")
+	if r := sendCmd(t, tbr, tc, "PING"); r != "PONG" {
+		t.Fatalf("optin unmarked read then write = %v, want PONG (no push)", r)
+	}
+
+	// CACHING YES marks the next read, so it is cached and the write pushes.
+	if r := sendCmd(t, tbr, tc, "CLIENT", "CACHING", "YES"); r != "OK" {
+		t.Fatalf("CLIENT CACHING YES = %v, want OK", r)
+	}
+	sendCmd(t, tbr, tc, "GET", "u")
+	send(t, wc, "SET", "u", "3")
+	expect(t, wbr, "+OK\r\n")
+	if push, ok := readRESP(t, tbr).([]any); !ok || push[0] != "invalidate" {
+		t.Fatalf("optin marked read then write = %v, want invalidate", push)
+	}
+
+	// The mark governs one command only: a second read after it is not cached.
+	sendCmd(t, tbr, tc, "GET", "u")
+	send(t, wc, "SET", "u", "4")
+	expect(t, wbr, "+OK\r\n")
+	if r := sendCmd(t, tbr, tc, "PING"); r != "PONG" {
+		t.Fatalf("optin mark expired after one command = %v, want PONG (no push)", r)
+	}
+}
+
+// TestTrackingOptout checks OPTOUT mode caches every read except one preceded by
+// CLIENT CACHING NO.
+func TestTrackingOptout(t *testing.T) {
+	srv := startPubsubServer(t)
+	tc, tbr := dialPubsub(t, srv)
+	wc, wbr := dialPubsub(t, srv)
+
+	if m := helloFields(t, sendCmd(t, tbr, tc, "HELLO", "3")); m["proto"] != int64(3) {
+		t.Fatalf("HELLO 3 proto = %v, want 3", m["proto"])
+	}
+	sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "OPTOUT")
+
+	send(t, wc, "SET", "o", "1")
+	expect(t, wbr, "+OK\r\n")
+
+	// An unmarked read in OPTOUT mode is cached, so the write pushes.
+	sendCmd(t, tbr, tc, "GET", "o")
+	send(t, wc, "SET", "o", "2")
+	expect(t, wbr, "+OK\r\n")
+	if push, ok := readRESP(t, tbr).([]any); !ok || push[0] != "invalidate" {
+		t.Fatalf("optout unmarked read then write = %v, want invalidate", push)
+	}
+
+	// CACHING NO opts the next read out, so the write pushes nothing.
+	if r := sendCmd(t, tbr, tc, "CLIENT", "CACHING", "NO"); r != "OK" {
+		t.Fatalf("CLIENT CACHING NO = %v, want OK", r)
+	}
+	sendCmd(t, tbr, tc, "GET", "o")
+	send(t, wc, "SET", "o", "3")
+	expect(t, wbr, "+OK\r\n")
+	if r := sendCmd(t, tbr, tc, "PING"); r != "PONG" {
+		t.Fatalf("optout opted-out read then write = %v, want PONG (no push)", r)
+	}
+}
+
+// TestTrackingModeErrors checks the mode validation: OPTIN and OPTOUT together is an
+// error, CACHING outside a mode is an error, and CACHING with the wrong YES/NO for
+// the mode is an error. Also checks TRACKINGINFO renders the mode token.
+func TestTrackingModeErrors(t *testing.T) {
+	srv := startPubsubServer(t)
+	tc, tbr := dialPubsub(t, srv)
+
+	if m := helloFields(t, sendCmd(t, tbr, tc, "HELLO", "3")); m["proto"] != int64(3) {
+		t.Fatalf("HELLO 3 proto = %v, want 3", m["proto"])
+	}
+
+	if _, ok := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "OPTIN", "OPTOUT").(errorReply); !ok {
+		t.Fatalf("TRACKING ON OPTIN OPTOUT should be an error")
+	}
+	if _, ok := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "REDIRECT").(errorReply); !ok {
+		t.Fatalf("TRACKING ON REDIRECT should be a not-supported error")
+	}
+
+	// Enable OPTIN; a CACHING NO is then the wrong selector for the mode.
+	sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "OPTIN")
+	if _, ok := sendCmd(t, tbr, tc, "CLIENT", "CACHING", "NO").(errorReply); !ok {
+		t.Fatalf("CLIENT CACHING NO in OPTIN mode should be an error")
+	}
+	info := flattenPairs(t, sendCmd(t, tbr, tc, "CLIENT", "TRACKINGINFO"))
+	flags, ok := info["flags"].([]any)
+	if !ok || len(flags) != 2 || flags[0] != "on" || flags[1] != "optin" {
+		t.Fatalf("TRACKINGINFO flags in OPTIN = %v, want [on optin]", info["flags"])
+	}
+}
+
 // flattenPairs turns a flattened key/value reply (the shape readRESP gives a RESP3
 // map) into a name->value map for field lookups.
 func flattenPairs(t *testing.T, reply any) map[string]any {

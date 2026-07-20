@@ -34,7 +34,25 @@ import (
 // goroutine, and recorded is mutated only under the registry mutex.
 type trackState struct {
 	recorded map[string]struct{}
+	// optin and optout are the two non-default recording modes (mutually
+	// exclusive, both off in default mode). In optin mode a key is cached only when
+	// the command that read it was preceded by CLIENT CACHING YES; in optout mode
+	// every read is cached except after CLIENT CACHING NO. Set once at CLIENT
+	// TRACKING ON and read on the connection's own reader goroutine, so no lock.
+	optin  bool
+	optout bool
+	// caching is the transient CLIENT CACHING selector, governing the very next
+	// command only: cachingYes or cachingNo overrides the mode's default for that
+	// one command, then recordReadKeys clears it back to cachingNone. Reader-owned,
+	// like optin/optout.
+	caching int8
 }
+
+const (
+	cachingNone int8 = iota
+	cachingYes
+	cachingNo
+)
 
 // trackingRegistry is the network-layer client-side-caching table. keys is the
 // forward index a write consults: a key name maps to the set of connections that
@@ -128,7 +146,26 @@ func (r *trackingRegistry) record(cs *connState, key []byte) {
 // (dispatch.ReadKeys). It is the read-path seam the driver calls after a tracking
 // connection's command dispatches; a write, a keyless command, or a read outside
 // the curated set contributes no keys and this returns having done nothing.
+//
+// The connection's mode decides whether this command's reads are cached at all:
+// default caches every read, optin caches only after CLIENT CACHING YES, optout
+// caches every read except after CLIENT CACHING NO. The transient CACHING selector
+// governs one command, so it is consumed and cleared here whether or not the
+// command read anything.
 func (r *trackingRegistry) recordReadKeys(cs *connState, args [][]byte) {
+	ts := cs.tracking
+	caching := ts.caching
+	ts.caching = cachingNone
+	switch {
+	case ts.optin:
+		if caching != cachingYes {
+			return
+		}
+	case ts.optout:
+		if caching == cachingNo {
+			return
+		}
+	}
 	for _, key := range dispatch.ReadKeys(args) {
 		r.record(cs, key)
 	}
