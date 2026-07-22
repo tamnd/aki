@@ -5,6 +5,7 @@ import (
 
 	"github.com/tamnd/aki/engine/f3/akifile"
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/engine/f3/store"
 )
 
 // The set durability seam (spec 2064/f3/M8-collection-durability-plan, slices 2 and
@@ -108,21 +109,40 @@ const snapHeaderLen = 8
 // dirty-set filter is a deferred, purely additive refinement. It is a no-op on a
 // store with no record log and on a shard that has built no set registry.
 func Snapshot(cx *shard.Ctx) {
-	if cx.St == nil || cx.Coll == nil {
+	if cx.St == nil {
 		return
 	}
-	g := cx.Coll.(*reg)
 	now := cx.NowMs
-	for k, s := range g.m {
-		// Skip a lazily-expired set: a snapshot of it would durably resurrect a key
-		// EXISTS already reports absent, so let it fall out the way the live registry
-		// drops it on next access. The skip is read-only, matching the scan walks.
-		if s.expireAt != 0 && s.expireAt <= now {
-			continue
+	if cx.Coll != nil {
+		for k, s := range cx.Coll.(*reg).m {
+			// Skip a lazily-expired set: a snapshot of it would durably resurrect a key
+			// EXISTS already reports absent, so let it fall out the way the live registry
+			// drops it on next access. The skip is read-only, matching the scan walks.
+			if s.expireAt != 0 && s.expireAt <= now {
+				continue
+			}
+			header, run := buildSetSnapshot(s)
+			cx.St.LogCollectionSnap([]byte(k), akifile.CollKindSet, header, run)
 		}
-		header, run := buildSetSnapshot(s)
-		cx.St.LogCollectionSnap([]byte(k), akifile.CollKindSet, header, run)
 	}
+	// A tiny set homed inline in the arena lives in no g.m entry, so the checkpoint
+	// must fold it to a snapshot frame here too, or a reopen would truncate the
+	// effect tail at the checkpoint and lose it. RangeCollKind skips already-expired
+	// records (now non-zero), matching the g.m skip above; each surviving blob is
+	// materialized into a reused scratch set to render the same snapshot frame an
+	// escalated set writes. On recovery the frame rebuilds into g.m (arena-home on
+	// recovery is a later slice), which is footprint-equivalent for correctness.
+	var scratch set
+	cx.St.RangeCollKind(store.KindSet, now, func(key []byte) bool {
+		blob, _, bits, at, ok := cx.St.PeekCollBlob(key)
+		if !ok {
+			return true
+		}
+		loadInline(&scratch, blob, bits, at)
+		header, run := buildSetSnapshot(&scratch)
+		cx.St.LogCollectionSnap(key, akifile.CollKindSet, header, run)
+		return true
+	})
 }
 
 // buildSetSnapshot renders a live set to a snapshot payload: the header carries the
@@ -240,16 +260,22 @@ func applySetOp(cx *shard.Ctx, g *reg, key []byte, op akifile.CollOpRow) error {
 // and ignores it, so the payload round-trips through the same snapshot encoder a
 // checkpoint uses without a DUMP-specific format.
 func DumpKey(cx *shard.Ctx, key []byte) (akifile.CollSnapRow, bool) {
-	if cx.Coll == nil {
-		return akifile.CollSnapRow{}, false
+	if cx.Coll != nil {
+		if s := cx.Coll.(*reg).peek(cx, key); s != nil {
+			header, run := buildSetSnapshot(s)
+			return akifile.CollSnapRow{Kind: akifile.CollKindSet, Header: header, ElementRun: run}, true
+		}
 	}
-	g := cx.Coll.(*reg)
-	s, _ := g.lookup(cx, key)
-	if s == nil {
-		return akifile.CollSnapRow{}, false
+	// A tiny arena set is materialized into a throwaway set to render the same
+	// snapshot row an escalated set produces, so DUMP round-trips a tiny set through
+	// the one snapshot encoder.
+	if blob, bits, at, present := peekArenaSet(cx, key); present {
+		var scratch set
+		loadInline(&scratch, blob, bits, at)
+		header, run := buildSetSnapshot(&scratch)
+		return akifile.CollSnapRow{Kind: akifile.CollKindSet, Header: header, ElementRun: run}, true
 	}
-	header, run := buildSetSnapshot(s)
-	return akifile.CollSnapRow{Kind: akifile.CollKindSet, Header: header, ElementRun: run}, true
+	return akifile.CollSnapRow{}, false
 }
 
 // RestoreKey installs the set at key from a snapshot row a DUMP produced, the

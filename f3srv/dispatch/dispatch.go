@@ -1529,7 +1529,7 @@ func authCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 func typeCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	key := args[0]
 	switch {
-	case cx.St.Exists(key, cx.NowMs):
+	case cx.St.HasString(key, cx.NowMs):
 		r.Status("string")
 	case set.Has(cx, key):
 		r.Status("set")
@@ -1612,9 +1612,15 @@ func objectCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // key" error REFCOUNT gives. The probes honour the key deadline, so a
 // lazily-expired key reads as missing.
 func objectIdleTime(cx *shard.Ctx, key []byte, r shard.Reply) {
-	if idle, ok := cx.St.IdleSeconds(key, cx.NowMs); ok {
-		r.Int(idle)
-		return
+	// The string idle path reads the record header's access clock, but an arena-homed
+	// collection carries a record too whose bits word is its own inline clock, not a
+	// string LRU stamp. Gate the string read on HasString so a tiny set falls through
+	// to its collection idle rather than misreading the inline word.
+	if cx.St.HasString(key, cx.NowMs) {
+		if idle, ok := cx.St.IdleSeconds(key, cx.NowMs); ok {
+			r.Int(idle)
+			return
+		}
 	}
 	if idle, ok := collectionIdleSeconds(cx, key); ok {
 		r.Int(idle)
@@ -1742,9 +1748,15 @@ func memoryCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // returns. Each probe is read-only and non-creating, honouring the key deadline
 // so a lazily-expired key reads as absent.
 func memoryUsage(cx *shard.Ctx, key []byte, r shard.Reply) {
-	if n, ok := cx.St.MemoryUsage(key, cx.NowMs); ok {
-		r.Int(int64(n))
-		return
+	// The store answers for a string record; an arena-homed collection also has a
+	// record, but its footprint is the type-appropriate figure its own registry
+	// sizes (set.MemoryUsage and friends), not the raw store record bytes. Gate the
+	// store read on HasString so a tiny set falls through to its collection sizing.
+	if cx.St.HasString(key, cx.NowMs) {
+		if n, ok := cx.St.MemoryUsage(key, cx.NowMs); ok {
+			r.Int(int64(n))
+			return
+		}
 	}
 	if n, ok := set.MemoryUsage(cx, key); ok {
 		r.Int(int64(n))

@@ -3,6 +3,7 @@ package set
 import (
 	"github.com/tamnd/aki/engine/f3/expire"
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/engine/f3/store"
 )
 
 // Key-level TTL for set keys (spec 2064/f3/16 section 2, rollout plan
@@ -16,15 +17,18 @@ import (
 // set once on Present through the same live funnel every set command uses, so an
 // already-expired set is dropped and reported absent before any deadline is set.
 type setBackend struct {
-	g   *reg
-	cx  *shard.Ctx
-	key []byte
-	s   *set
+	g    *reg
+	cx   *shard.Ctx
+	key  []byte
+	s    *set
+	home int
 }
 
 func (b *setBackend) Present() (curAt int64, present bool) {
-	b.s = b.g.live(b.cx, b.key)
+	b.s, b.home = b.g.resolveTouch(b.cx, b.key)
 	if b.s == nil {
+		// homeString cannot reach here: the EXPIRE dispatch confirmed the set type
+		// with Has before routing to this backend, so an absent set is the only case.
 		return 0, false
 	}
 	return b.s.expireAt, true
@@ -34,11 +38,20 @@ func (b *setBackend) Delete() {
 	// An EXPIRE to a past instant deletes the key on the spot; log the key-delete so a
 	// replay drops it instead of resurrecting the members from an earlier effect.
 	logDeleteKey(b.cx, b.key)
-	b.g.drop(b.key)
+	switch b.home {
+	case homeReg:
+		b.g.drop(b.key)
+	case homeArena:
+		b.cx.St.DropCollBlob(b.key)
+	}
 }
 
 func (b *setBackend) Store(at int64) bool {
 	b.s.expireAt = at
+	// commit rewrites the arena record with the new deadline (or reconciles the
+	// g.m set's footprint), so a volatile arena set carries its TTL in the inline
+	// record, not a side table.
+	b.g.commit(b.cx, b.key, b.s, b.home)
 	logExpire(b.cx, b.key, at)
 	return true
 }
@@ -55,15 +68,15 @@ func Expire(cx *shard.Ctx, args [][]byte, r shard.Reply, verb string) {
 // the set arm of the unified TTL/PTTL/EXPIRETIME resolution; an expired set is
 // dropped by the live funnel and reported absent.
 func Deadline(cx *shard.Ctx, key []byte) (at int64, ok bool) {
-	if cx.Coll == nil {
-		return 0, false
+	if cx.Coll != nil {
+		if s := cx.Coll.(*reg).live(cx, key); s != nil {
+			return s.expireAt, true
+		}
 	}
-	g := cx.Coll.(*reg)
-	s := g.live(cx, key)
-	if s == nil {
-		return 0, false
+	if _, _, at, present := peekArenaSet(cx, key); present {
+		return at, true
 	}
-	return s.expireAt, true
+	return 0, false
 }
 
 // Persist removes a set key's deadline, reporting whether one was removed: the
@@ -71,17 +84,26 @@ func Deadline(cx *shard.Ctx, key []byte) (at int64, ok bool) {
 // key all report false, so PERSIST answers 0 for them. It builds no registry when
 // none exists.
 func Persist(cx *shard.Ctx, key []byte) bool {
-	if cx.Coll == nil {
+	if cx.Coll != nil {
+		if s := cx.Coll.(*reg).live(cx, key); s != nil {
+			if s.expireAt == 0 {
+				return false
+			}
+			s.expireAt = 0
+			// Log the cleared deadline so a replay persists the set instead of restoring
+			// the TTL a prior effect or snapshot carried.
+			logExpire(cx, key, 0)
+			return true
+		}
+	}
+	// A tiny arena set carries its deadline in the inline record: clearing it
+	// rewrites the record with expireAt 0 through PutCollBlob, the same in-place
+	// republish commit uses, so the set stays inline with no TTL.
+	blob, bits, at, present := peekArenaSet(cx, key)
+	if !present || at == 0 {
 		return false
 	}
-	g := cx.Coll.(*reg)
-	s := g.live(cx, key)
-	if s == nil || s.expireAt == 0 {
-		return false
-	}
-	s.expireAt = 0
-	// Log the cleared deadline so a replay persists the set instead of restoring the
-	// TTL a prior effect or snapshot carried.
+	_ = cx.St.PutCollBlob(key, store.KindSet, bits, blob, 0, cx.NowMs)
 	logExpire(cx, key, 0)
 	return true
 }

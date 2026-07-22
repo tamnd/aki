@@ -130,13 +130,19 @@ func bandFor(ht *htable, allInt bool, maxLen, n int) *set {
 func place(cx *shard.Ctx, g *reg, key []byte, result *set, event string) int {
 	// Whether the destination held anything before this store, of any type, decides
 	// whether an empty result fires del (redis fires del only when dbDelete actually
-	// removed a key). Captured before the string Del below clears it.
+	// removed a key). Captured before the clears below. cx.St.Exists already reports
+	// a tiny arena set present (a coll record is a live record), so it covers the
+	// arena home too.
 	existed := g.m[string(key)] != nil || cx.St.Exists(key, cx.NowMs)
 	// Drop whatever the key holds in the string store first, so a new set never
 	// shadows a stale string and no old TTL survives (the destination is a new
 	// object, Redis discards the old expiry). A set-typed destination is replaced
 	// through the registry write below; the string Del is a no-op for it.
 	cx.St.Del(key, cx.NowMs)
+	// A destination that held a tiny arena set leaves the arena: the STORE result is
+	// homed in the Go-heap registry (arena-homed STORE results are a later slice),
+	// so the arena record must go or the key would sit in both homes at once.
+	cx.St.DropCollBlob(key)
 	if result == nil {
 		g.drop(key)
 		if existed {

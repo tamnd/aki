@@ -28,7 +28,7 @@ import (
 func gather(g *reg, cx *shard.Ctx, keys [][]byte) (sets []*set, wrong bool) {
 	sets = make([]*set, len(keys))
 	for i, k := range keys {
-		s, w := g.lookup(cx, k)
+		s, w := g.operand(cx, k)
 		if w {
 			return nil, true
 		}

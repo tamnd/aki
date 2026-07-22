@@ -85,7 +85,11 @@ func (s *Store) Mem() MemLedger {
 	lt, ld := s.LogBytes()
 	cold := s.Cold()
 	return MemLedger{
-		Keys:            uint64(s.count),
+		// The string-only key count: an inline collection blob is counted by its own
+		// type registry (which the INFO handler folds in as extraKeys), so the store's
+		// keys stat must exclude the coll subset or every tiny collection is counted
+		// twice. This is the same count - collCount basis Len reports.
+		Keys:            uint64(s.count - s.collCount),
 		IndexBytes:      s.idx.bytes(),
 		ArenaLiveBytes:  s.arena.live(),
 		ArenaAllocBytes: s.arena.used(),

@@ -69,7 +69,7 @@ func algebraCross(t *shard.Txn, keys [][]byte, compute func(cx *shard.Ctx, sets 
 		t.Do(keys[i], func(cx *shard.Ctx) {
 			g := registry(cx)
 			for _, j := range idxs {
-				s, w := g.lookup(cx, keys[j])
+				s, w := g.operand(cx, keys[j])
 				if w {
 					wrong = true
 					return
@@ -86,7 +86,7 @@ func algebraCross(t *shard.Txn, keys [][]byte, compute func(cx *shard.Ctx, sets 
 				if t.Shard(keys[j]) != primary {
 					continue
 				}
-				s, w := g.lookup(cx, keys[j])
+				s, w := g.operand(cx, keys[j])
 				if w {
 					wrong = true
 					return

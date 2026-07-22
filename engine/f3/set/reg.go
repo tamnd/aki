@@ -36,6 +36,15 @@ type reg struct {
 	// draw so its rejection loop can skip repeats without a map.
 	pickScratch []int
 
+	// scratch is the single reusable set the single-key funnel materializes an
+	// arena-homed tiny set into (resolveTouch), so a command over a tiny set
+	// backed by an inline arena record (inline.go) loads, mutates, and commits it
+	// back with no per-command heap allocation. It is owner-local and valid only
+	// within one command: the next resolveTouch reloads it. Multi-key paths that
+	// must hold more than one operand at once (gather, smove) materialize into
+	// fresh sets instead, since they cannot share this one buffer.
+	scratch *set
+
 	// resident is the running sum of every live set's resident-byte footprint
 	// (set.residentBytes), the figure the shard reads to weigh a collection's RAM
 	// against the store's arena under memory pressure (spec 2064/f3/06 section 6).
@@ -67,9 +76,10 @@ func freshPCG() rand.PCG {
 func registry(cx *shard.Ctx) *reg {
 	if cx.Coll == nil {
 		cx.Coll = &reg{
-			m:      make(map[string]*set),
-			rng:    freshPCG(),
-			acctOn: cx.St != nil && cx.St.ColdConfigured(),
+			m:       make(map[string]*set),
+			rng:     freshPCG(),
+			acctOn:  cx.St != nil && cx.St.ColdConfigured(),
+			scratch: &set{},
 		}
 	}
 	return cx.Coll.(*reg)
@@ -98,10 +108,11 @@ func (g *reg) next(n int) int {
 // key is not a set, so Has reads false for those and leaves the type to the
 // caller's other probes.
 func Has(cx *shard.Ctx, key []byte) bool {
-	if cx.Coll == nil {
-		return false
+	if cx.Coll != nil && cx.Coll.(*reg).peek(cx, key) != nil {
+		return true
 	}
-	return cx.Coll.(*reg).peek(cx, key) != nil
+	_, _, _, present := peekArenaSet(cx, key)
+	return present
 }
 
 // Delete removes key when it holds a set on this shard and reports whether it
@@ -114,12 +125,17 @@ func Delete(cx *shard.Ctx, key []byte) bool {
 		return false
 	}
 	g := cx.Coll.(*reg)
-	if g.live(cx, key) == nil {
-		return false
+	if g.live(cx, key) != nil {
+		logDeleteKey(cx, key)
+		g.drop(key)
+		return true
 	}
-	logDeleteKey(cx, key)
-	g.drop(key)
-	return true
+	if _, _, _, present := peekArenaSet(cx, key); present {
+		logDeleteKey(cx, key)
+		cx.St.DropCollBlob(key)
+		return true
+	}
+	return false
 }
 
 // Flush drops every set on this shard, the set arm of FLUSHALL and FLUSHDB. It
@@ -140,10 +156,15 @@ func Flush(cx *shard.Ctx) {
 // dropped set leaves the map, so the map size is the live count; it reads zero
 // before any set command has built a registry on this shard.
 func Len(cx *shard.Ctx) int {
-	if cx.Coll == nil {
-		return 0
+	n := 0
+	if cx.Coll != nil {
+		n = len(cx.Coll.(*reg).m)
 	}
-	return len(cx.Coll.(*reg).m)
+	if cx.St != nil {
+		total, _ := cx.St.CountCollKind(store.KindSet)
+		n += int(total)
+	}
+	return n
 }
 
 // VolatileLen counts the sets on this shard carrying a key-level TTL, the set
@@ -162,6 +183,10 @@ func VolatileLen(cx *shard.Ctx) uint64 {
 			n++
 		}
 	}
+	if cx.St != nil {
+		_, withTTL := cx.St.CountCollKind(store.KindSet)
+		n += withTTL
+	}
 	return n
 }
 
@@ -171,18 +196,30 @@ func VolatileLen(cx *shard.Ctx) uint64 {
 // to stop, halting the outer walk for a bounded scan. The slice fn receives is
 // the map key's bytes, valid only for that call; fn copies what it keeps.
 func RangeKeys(cx *shard.Ctx, fn func(key []byte) bool) bool {
-	if cx.Coll == nil {
-		return true
-	}
 	now := cx.NowMs
-	for k, s := range cx.Coll.(*reg).m {
-		// Skip a lazily-expired set so KEYS and SCAN never surface a key EXISTS
-		// would report absent. The skip is read-only (no drop) to match the string
-		// store's expiry-aware walk, which reaps nothing during a scan.
-		if s.expireAt != 0 && s.expireAt <= now {
-			continue
+	if cx.Coll != nil {
+		for k, s := range cx.Coll.(*reg).m {
+			// Skip a lazily-expired set so KEYS and SCAN never surface a key EXISTS
+			// would report absent. The skip is read-only (no drop) to match the string
+			// store's expiry-aware walk, which reaps nothing during a scan.
+			if s.expireAt != 0 && s.expireAt <= now {
+				continue
+			}
+			if !fn([]byte(k)) {
+				return false
+			}
 		}
-		if !fn([]byte(k)) {
+	}
+	// The arena home: every tiny set inline in a store record, walked the same
+	// expiry-aware, read-only way (RangeCollKind skips a past-deadline record when
+	// now is non-zero and reaps nothing), so KEYS and SCAN union the two homes.
+	if cx.St != nil {
+		cont := true
+		cx.St.RangeCollKind(store.KindSet, now, func(key []byte) bool {
+			cont = fn(key)
+			return cont
+		})
+		if !cont {
 			return false
 		}
 	}
@@ -257,7 +294,14 @@ func (g *reg) IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
 // every probe keeps.
 func IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
 	if g, ok := cx.Coll.(*reg); ok {
-		return g.IdleSeconds(cx, key)
+		if v, present := g.IdleSeconds(cx, key); present {
+			return v, true
+		}
+	}
+	// The arena home: a tiny set's idle clock rides its record bits word, read back
+	// through inlineIdleSeconds without materializing the set (inline.go).
+	if _, bits, _, present := peekArenaSet(cx, key); present {
+		return inlineIdleSeconds(bits, cx.NowMs), true
 	}
 	return 0, false
 }
@@ -268,6 +312,180 @@ func IdleSeconds(cx *shard.Ctx, key []byte) (int64, bool) {
 func (g *reg) lookup(cx *shard.Ctx, key []byte) (s *set, wrong bool) {
 	if s = g.live(cx, key); s != nil {
 		return s, false
+	}
+	if cx.St.Exists(key, cx.NowMs) {
+		return nil, true
+	}
+	return nil, false
+}
+
+// A set key lives in exactly one of two homes (spec 2064/f3, keyspace-unification
+// arc). A tiny set (intset or listpack class) lives inline in one store arena
+// record via the CollBlob primitives (collblob.go), the memory-bar form that
+// spends no Go-heap header, no separate data slice, and no registry map entry on
+// it. A set that has escalated past the inline bands (hashtable or partitioned)
+// lives in the Go-heap registry map g.m, where its native table already outweighs
+// the map overhead. The invariant the whole routing layer keeps is that a key is
+// never in both homes at once: a create writes the arena, an escalation moves the
+// set out of the arena into g.m, and every read resolves the two homes in one
+// funnel so a command never sees a key twice or misses it.
+const (
+	homeAbsent = iota // no set at key (and no other-type value)
+	homeString        // key holds a string or another collection type: WRONGTYPE
+	homeReg           // an escalated set living in the Go-heap registry map g.m
+	homeArena         // a tiny set living inline in a store arena record
+)
+
+// peekArenaSet resolves the tiny arena-homed set at key, reaping and reporting
+// absent for a lazily-expired one exactly as the registry's peek does for a
+// g.m-homed set: it fires the expired keyspace event and drops the record so the
+// set is absent to this command and every later one in the epoch. present is
+// false for a missing key, a key that holds a string or another collection type,
+// or an expired set. The returned blob and bits alias the arena and are valid
+// only until the next store write that could republish the record.
+func peekArenaSet(cx *shard.Ctx, key []byte) (blob []byte, bits uint16, at int64, present bool) {
+	if cx.St == nil {
+		return nil, 0, 0, false
+	}
+	b, kind, bt, a, ok := cx.St.PeekCollBlob(key)
+	if !ok || kind != store.KindSet {
+		return nil, 0, 0, false
+	}
+	if a != 0 && a <= cx.NowMs {
+		cx.NotifyKeyspaceEvent(shard.NotifyExpired, "expired", key)
+		cx.St.DropCollBlob(key)
+		return nil, 0, 0, false
+	}
+	return b, bt, a, true
+}
+
+// resolveInto is the dual-home resolve every single-key command funnels through:
+// it returns the live set at key and which home it lives in, reaping a lazily-
+// expired set from either home first. An escalated set in g.m is returned in
+// place and clocked the way live does (homeReg). A tiny arena set is materialized
+// into dst, a copy the caller may mutate freely before commit writes it back
+// (homeArena); dst is the reusable scratch for the single-key funnel or a fresh
+// set for the multi-operand paths that cannot share one buffer. A key holding a
+// string or another collection type resolves homeString, which every set command
+// answers WRONGTYPE. A missing key resolves homeAbsent. The arena materialization
+// does not re-stamp the record's idle clock: a read leaves it NOTOUCH, and a
+// mutating command re-stamps it through commit, which rewrites the record anyway.
+func (g *reg) resolveInto(cx *shard.Ctx, key []byte, dst *set) (s *set, home int) {
+	if s = g.live(cx, key); s != nil {
+		return s, homeReg
+	}
+	if blob, bits, at, present := peekArenaSet(cx, key); present {
+		loadInline(dst, blob, bits, at)
+		return dst, homeArena
+	}
+	if cx.St.Exists(key, cx.NowMs) {
+		return nil, homeString
+	}
+	return nil, homeAbsent
+}
+
+// resolveTouch is the single-key funnel's resolve: it loads a tiny arena set into
+// the registry's reusable scratch, so the common single-key command over a tiny
+// set allocates nothing. The scratch is valid only until the next resolveTouch,
+// so a command reads and commits it within its own body.
+func (g *reg) resolveTouch(cx *shard.Ctx, key []byte) (s *set, home int) {
+	return g.resolveInto(cx, key, g.scratch)
+}
+
+// newSetInto resets dst to a fresh empty set whose first member chooses the band
+// (an integer first member opens an intset, matching newSet), the zero-alloc
+// create the arena funnel uses so a brand-new tiny set is built in the reusable
+// scratch rather than a heap allocation. commit then embeds it in the arena.
+func newSetInto(dst *set, first []byte) {
+	dst.clock = 0
+	dst.expireAt = 0
+	dst.ht = nil
+	dst.part = nil
+	dst.cold = nil
+	dst.acct = 0
+	dst.n = 0
+	dst.data = dst.data[:0]
+	if _, ok := store.ParseInt(first); ok {
+		dst.enc = encIntset
+	} else {
+		dst.enc = encListpack
+	}
+}
+
+// evacuate moves a set out of the reusable scratch into a fresh heap set, the
+// homeArena-to-homeReg transition an escalation triggers: a tiny set that grew
+// past the inline bands mid-command is no longer a single packed blob, so it
+// leaves the arena for the Go-heap registry. It is called only for an escalated
+// set (hashtable or partitioned), whose data slice is already nil and whose table
+// lives in ht/part, so the shallow struct copy hands those pointers to the new
+// set and the scratch is detached so its reuse never aliases the escaped set.
+func evacuate(s *set) *set {
+	ns := &set{}
+	*ns = *s
+	s.ht = nil
+	s.part = nil
+	s.cold = nil
+	s.data = nil
+	return ns
+}
+
+// commit writes a single-key command's resolved set back to its home after the
+// command mutated it. home is what resolveTouch returned (or homeArena for a set
+// freshly built with newSetInto). An emptied set is dropped from its home, since
+// the registry and the arena both keep the last-member-leaves rule. A set still
+// in the inline bands re-embeds in the arena; one that escalated mid-command
+// evacuates to g.m. An escalated set already in g.m (homeReg) is mutated in
+// place, so commit only reconciles its footprint. It stamps the arena record's
+// idle clock on the re-embed, the access this write records.
+func (g *reg) commit(cx *shard.Ctx, key []byte, s *set, home int) {
+	if s.card() == 0 {
+		switch home {
+		case homeReg:
+			g.drop(key)
+		case homeArena:
+			cx.St.DropCollBlob(key)
+		}
+		return
+	}
+	if home == homeReg {
+		g.note(s)
+		return
+	}
+	if inlineEligible(s) {
+		bits := packBits(s, inlineClock(cx.NowMs))
+		// A tiny set is far under collInlineMax, so PutCollBlob only errors on an
+		// arena that cannot grow, the same out-of-room condition the string SET path
+		// surfaces; the set funnel has no reply channel here, so the write is best
+		// effort, matching the in-memory paths that never fail.
+		_ = cx.St.PutCollBlob(key, store.KindSet, bits, s.data, s.expireAt, cx.NowMs)
+		return
+	}
+	// Escalated past the inline bands mid-command: leave the arena for the Go-heap
+	// registry. DropCollBlob is a no-op when the key was never in the arena (a
+	// freshly created set that escalated before its first commit), so a brand-new
+	// large set installs cleanly.
+	cx.St.DropCollBlob(key)
+	ns := evacuate(s)
+	g.install(cx, key, ns)
+	g.note(ns)
+}
+
+// operand resolves one set-algebra operand for the multi-key read paths (gather),
+// which hold every operand at once and so cannot share the single-key scratch: a
+// tiny arena set is materialized into a FRESH heap set, so operand two's load
+// never scribbles operand one's buffer. An escalated set in g.m is returned in
+// place (the drivers only read it). wrong is true when the key holds a string or
+// another collection type; a missing set resolves to a nil operand the drivers
+// read as empty. The materialized operand is read-only and never committed, so
+// the arena record is untouched.
+func (g *reg) operand(cx *shard.Ctx, key []byte) (s *set, wrong bool) {
+	if s = g.live(cx, key); s != nil {
+		return s, false
+	}
+	if blob, bits, at, present := peekArenaSet(cx, key); present {
+		ns := &set{}
+		loadInline(ns, blob, bits, at)
+		return ns, false
 	}
 	if cx.St.Exists(key, cx.NowMs) {
 		return nil, true

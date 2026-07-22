@@ -37,12 +37,16 @@ import (
 // mutation, so a wrong-typed pair never leaves a half-done move, matching Redis's
 // up-front type check on both keys.
 func smove(g *reg, cx *shard.Ctx, srcKey, dstKey, member []byte) (moved, wrong bool) {
-	src, w := g.lookup(cx, srcKey)
-	if w {
+	// Source and destination each resolve into their own buffer: SMOVE holds both
+	// at once, so a tiny arena set on either side must materialize into a set the
+	// other's load cannot scribble (the single-key scratch cannot serve two keys).
+	var srcBuf, dstBuf set
+	src, srcHome := g.resolveInto(cx, srcKey, &srcBuf)
+	if srcHome == homeString {
 		return false, true
 	}
-	dst, w := g.lookup(cx, dstKey)
-	if w {
+	dst, dstHome := g.resolveInto(cx, dstKey, &dstBuf)
+	if dstHome == homeString {
 		return false, true
 	}
 	// Source and destination are the same key: nothing moves, and the reply is
@@ -61,28 +65,29 @@ func smove(g *reg, cx *shard.Ctx, srcKey, dstKey, member []byte) (moved, wrong b
 	// emptied it. The event names match SREM, not a dedicated smove event.
 	cx.NotifyKeyspaceEvent(shard.NotifySet, "srem", srcKey)
 	// The last member left source: Redis deletes an emptied set (doc 11 section
-	// 9.2). Dropping it before the destination insert keeps the invariant that the
-	// registry never holds an empty set.
+	// 9.2). commit drops an emptied set from its home, keeping the invariant that
+	// neither home holds an empty set.
 	if src.card() == 0 {
-		g.drop(srcKey)
+		g.commit(cx, srcKey, src, srcHome)
 		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", srcKey)
 	} else {
-		g.note(src)
+		g.commit(cx, srcKey, src, srcHome)
 	}
 	// Create the destination on first insert, its band chosen from the member's
 	// shape exactly as SADD's create path does (an integer member opens an intset);
 	// the insert then follows the normal one-way ladder through add, so a member
-	// that breaches the destination's band cap converts it upward in place.
+	// that breaches the destination's band cap converts it upward, which commit
+	// evacuates from the arena to the Go-heap registry.
 	if dst == nil {
-		dst = newSet(member)
-		g.install(cx, dstKey, dst)
+		newSetInto(&dstBuf, member)
+		dst, dstHome = &dstBuf, homeArena
 	}
 	// sadd fires on the destination only when the member is newly present, matching
 	// redis's setTypeAdd-returned-1 guard (a member already in dst is a silent no-op).
 	if dst.add(member) {
 		cx.NotifyKeyspaceEvent(shard.NotifySet, "sadd", dstKey)
 	}
-	g.note(dst)
+	g.commit(cx, dstKey, dst, dstHome)
 	return true, false
 }
 

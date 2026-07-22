@@ -29,6 +29,12 @@ func Object(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			return
 		}
 	}
+	// A tiny set homed inline in the arena reports its encoding from the record
+	// bits word without materializing the set (inline.go): intset or listpack.
+	if _, bits, _, present := peekArenaSet(cx, key); present {
+		r.Bulk([]byte(encFromBits(bits).String()))
+		return
+	}
 	// Not a set. Consult the zset band next, the last collection type in the
 	// OBJECT chain (stream, hash, list, set, zset), before the string fallback.
 	// The probe builds no zset registry when none exists, so this read-only
@@ -66,6 +72,9 @@ func Encoding(cx *shard.Ctx, key []byte) (string, bool) {
 			return s.enc.String(), true
 		}
 	}
+	if _, bits, _, present := peekArenaSet(cx, key); present {
+		return encFromBits(bits).String(), true
+	}
 	return "", false
 }
 
@@ -88,6 +97,13 @@ func MemoryUsage(cx *shard.Ctx, key []byte) (uint64, bool) {
 		if s := g.peek(cx, key); s != nil {
 			return s.residentBytes(), true
 		}
+	}
+	// A tiny arena set is materialized into a throwaway set to size its blob, the
+	// same residentBytes figure the escalated home reports.
+	if blob, bits, at, present := peekArenaSet(cx, key); present {
+		var scratch set
+		loadInline(&scratch, blob, bits, at)
+		return scratch.residentBytes(), true
 	}
 	return 0, false
 }

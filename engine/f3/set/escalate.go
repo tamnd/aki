@@ -157,8 +157,12 @@ func (s *set) escalateDraws(workers int) bool {
 // cools keeps its layout until it is dropped (F4).
 func EscalateHotDraws(cx *shard.Ctx, key []byte, workers int) bool {
 	g := registry(cx)
-	s, wrong := g.lookup(cx, key)
-	if wrong || s == nil {
+	// Draw escalation targets only the partitioned band, which never lives inline in
+	// the arena (a tiny intset or listpack cannot be partitioned), so the escalated
+	// home g.m is the only place an escalatable set can be: g.live resolves it with
+	// no arena materialization, and a tiny arena set or a wrong-typed key reads absent.
+	s := g.live(cx, key)
+	if s == nil {
 		return false
 	}
 	return s.escalateDraws(workers)

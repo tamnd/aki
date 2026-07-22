@@ -26,41 +26,46 @@ import (
 func SmoveCross(t *shard.Txn, src, dst, member []byte) []byte {
 	var srcWrong, dstWrong, present, moved bool
 	t.Do(src, func(cx *shard.Ctx) {
-		s, w := registry(cx).lookup(cx, src)
+		s, w := registry(cx).operand(cx, src)
 		srcWrong = w
 		present = s != nil && s.has(member)
 	})
 	t.Do(dst, func(cx *shard.Ctx) {
 		g := registry(cx)
-		d, w := g.lookup(cx, dst)
-		dstWrong = w
-		if w || srcWrong || !present {
+		var dstBuf set
+		d, dstHome := g.resolveInto(cx, dst, &dstBuf)
+		dstWrong = dstHome == homeString
+		if dstWrong || srcWrong || !present {
 			return
 		}
 		// Insert at the destination first: the transient member-in-both state
 		// is invisible under the barrier, and doing the insert inside the
-		// type-check hop saves the fourth hop the naive plan pays.
+		// type-check hop saves the fourth hop the naive plan pays. A missing
+		// destination is created inline in the arena, its band chosen from the
+		// member's shape exactly as the co-located create does; commit re-embeds a
+		// tiny destination or evacuates an escalated one to g.m.
 		if d == nil {
-			d = newSet(member)
-			g.install(cx, dst, d)
+			newSetInto(&dstBuf, member)
+			d, dstHome = &dstBuf, homeArena
 		}
 		if d.add(member) {
 			cx.NotifyKeyspaceEvent(shard.NotifySet, "sadd", dst)
 		}
-		g.note(d)
+		g.commit(cx, dst, d, dstHome)
 		moved = true
 	})
 	if moved {
 		t.Do(src, func(cx *shard.Ctx) {
 			g := registry(cx)
-			s, _ := g.lookup(cx, src)
+			var srcBuf set
+			s, srcHome := g.resolveInto(cx, src, &srcBuf)
 			s.rem(member)
 			cx.NotifyKeyspaceEvent(shard.NotifySet, "srem", src)
 			if s.card() == 0 {
-				g.drop(src)
+				g.commit(cx, src, s, srcHome)
 				cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", src)
 			} else {
-				g.note(s)
+				g.commit(cx, src, s, srcHome)
 			}
 		})
 	}
