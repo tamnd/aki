@@ -4,6 +4,8 @@ import (
 	"sort"
 	"strconv"
 	"testing"
+
+	"github.com/tamnd/aki/engine/f3/shard"
 )
 
 // SMOVE (spec 2064/f3/11 section 9.2). The suite proves the reply and the two
@@ -24,6 +26,23 @@ func memberList(s *set) []string {
 	s.each(func(m []byte) { out = append(out, string(m)) })
 	sort.Strings(out)
 	return out
+}
+
+// membersAt resolves the set at key through the dual-home operand funnel and
+// returns its members sorted, nil for an absent key. A tiny set homes inline in
+// the arena, not g.m, so a test that reads membership must resolve both homes
+// rather than index g.m directly.
+func membersAt(cx *shard.Ctx, g *reg, key string) []string {
+	s, _ := g.operand(cx, []byte(key))
+	return memberList(s)
+}
+
+// setAt resolves the set at key through the dual-home operand funnel, nil for an
+// absent key: the band-inspecting sibling of membersAt for a test that checks the
+// resolved encoding of a set that may live in the arena.
+func setAt(cx *shard.Ctx, g *reg, key string) *set {
+	s, _ := g.operand(cx, []byte(key))
+	return s
 }
 
 // smoveOracle computes the expected reply and the source and destination member
@@ -152,9 +171,9 @@ func TestSmoveOracle(t *testing.T) {
 			if gotReply != wantReply {
 				t.Fatalf("reply %d, want %d", gotReply, wantReply)
 			}
-			eqStrings(t, "source members", memberList(g.m[c.srcKey]), wantSrc)
+			eqStrings(t, "source members", membersAt(cx, g, c.srcKey), wantSrc)
 			if c.srcKey != c.dstKey {
-				eqStrings(t, "destination members", memberList(g.m[c.dstKey]), wantDst)
+				eqStrings(t, "destination members", membersAt(cx, g, c.dstKey), wantDst)
 			}
 		})
 	}
@@ -176,7 +195,7 @@ func TestSmoveLastMemberDeletesSrc(t *testing.T) {
 	if cx.St.Exists([]byte("s"), cx.NowMs) {
 		t.Fatal("source still exists in the string store")
 	}
-	eqStrings(t, "destination", memberList(g.m["d"]), []string{"only"})
+	eqStrings(t, "destination", membersAt(cx, g, "d"), []string{"only"})
 }
 
 // TestSmoveCreatesDst checks a move into a missing destination creates it with the
@@ -198,7 +217,7 @@ func TestSmoveCreatesDst(t *testing.T) {
 			if wrong || !moved {
 				t.Fatalf("moved=%v wrong=%v", moved, wrong)
 			}
-			d := g.m["d"]
+			d := setAt(cx, g, "d")
 			if d == nil {
 				t.Fatal("destination not created")
 			}

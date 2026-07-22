@@ -268,11 +268,11 @@ func TestSmoveCrossAtomicity(t *testing.T) {
 					tx := rt.Begin([][]byte{[]byte(src), []byte(dst)})
 					tx.Acquire()
 					tx.Do([]byte(src), func(cx *shard.Ctx) {
-						s, _ := registry(cx).lookup(cx, []byte(src))
+						s, _ := registry(cx).operand(cx, []byte(src))
 						inSrc = s != nil && s.has([]byte(member))
 					})
 					tx.Do([]byte(dst), func(cx *shard.Ctx) {
-						s, _ := registry(cx).lookup(cx, []byte(dst))
+						s, _ := registry(cx).operand(cx, []byte(dst))
 						inDst = s != nil && s.has([]byte(member))
 					})
 					tx.Release()

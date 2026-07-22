@@ -345,10 +345,32 @@ func (s *Store) readSep(addr uint64, dst []byte) ([]byte, bool) {
 	return append(dst[:0], s.arena.buf[run:run+uint64(vlen)]...), true
 }
 
-// Exists reports whether key holds a live record.
+// Exists reports whether key holds a live record of any kind, a string or an
+// inline collection blob alike (the arena is one keyspace). The collection
+// routing layer relies on this kind-agnostic answer for its WRONGTYPE guard: a
+// key holding another type's record reads present here and the caller resolves
+// the type. A generic introspection that must distinguish a string from a
+// collection uses HasString instead.
 func (s *Store) Exists(key []byte, now int64) bool {
 	_, addr, _ := s.findLive(Hash(key), key, now)
 	return addr != 0
+}
+
+// HasString reports whether key holds a live string record specifically, false
+// for a key holding an inline collection blob (a tiny set, hash, and so on now
+// share the arena keyspace). It is the string-only existence probe the unified
+// TYPE, DBSIZE, and OBJECT introspection use where Exists would misreport a
+// collection record as a string. A cold record is a demoted string value, so it
+// reads as a string here.
+func (s *Store) HasString(key []byte, now int64) bool {
+	slot, addr, _ := s.findLive(Hash(key), key, now)
+	if addr == 0 {
+		return false
+	}
+	if slotCold(*slot) {
+		return true
+	}
+	return !isCollKind(s.arena.buf[addr+offKind])
 }
 
 // Deadline reports key's absolute unix-ms expiry and whether the key is live.

@@ -14,7 +14,7 @@ func SortElements(cx *shard.Ctx, key []byte) [][]byte {
 	if cx.Coll == nil {
 		return nil
 	}
-	s, _ := cx.Coll.(*reg).lookup(cx, key)
+	s, _ := cx.Coll.(*reg).operand(cx, key)
 	if s == nil {
 		return nil
 	}

@@ -19,14 +19,17 @@ import (
 func Sadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
 	key := args[0]
-	s := g.live(cx, key)
+	s, home := g.resolveTouch(cx, key)
+	if home == homeString {
+		r.Err(wrongType)
+		return
+	}
 	if s == nil {
-		if cx.St.Exists(key, cx.NowMs) {
-			r.Err(wrongType)
-			return
-		}
-		s = newSet(args[1])
-		g.install(cx, key, s)
+		// A brand-new set is built in the reusable scratch and homed in the arena on
+		// commit, the memory-bar create path: a tiny set costs one inline arena
+		// record, not a heap header plus a map entry (inline.go).
+		newSetInto(g.scratch, args[1])
+		s, home = g.scratch, homeArena
 	}
 	var added int64
 	for _, m := range args[1:] {
@@ -35,7 +38,7 @@ func Sadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			logAdd(cx, key, m)
 		}
 	}
-	g.note(s)
+	g.commit(cx, key, s, home)
 	if added > 0 {
 		cx.NotifyKeyspaceEvent(shard.NotifySet, "sadd", key)
 	}
@@ -46,8 +49,9 @@ func Sadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // removed, and delete the key when the last member leaves.
 func Srem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
-	s, wrong := g.lookup(cx, args[0])
-	if wrong {
+	key := args[0]
+	s, home := g.resolveTouch(cx, key)
+	if home == homeString {
 		r.Err(wrongType)
 		return
 	}
@@ -59,19 +63,19 @@ func Srem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	for _, m := range args[1:] {
 		if s.rem(m) {
 			removed++
-			logRemove(cx, args[0], m)
+			logRemove(cx, key, m)
 		}
 	}
 	if s.card() == 0 {
 		if removed > 0 {
-			cx.NotifyKeyspaceEvent(shard.NotifySet, "srem", args[0])
+			cx.NotifyKeyspaceEvent(shard.NotifySet, "srem", key)
 		}
-		g.drop(args[0])
-		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", args[0])
+		g.commit(cx, key, s, home)
+		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 	} else {
-		g.note(s)
+		g.commit(cx, key, s, home)
 		if removed > 0 {
-			cx.NotifyKeyspaceEvent(shard.NotifySet, "srem", args[0])
+			cx.NotifyKeyspaceEvent(shard.NotifySet, "srem", key)
 		}
 	}
 	r.Int(removed)
@@ -80,8 +84,8 @@ func Srem(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // Sismember answers SISMEMBER key member: 1 when present, 0 otherwise.
 func Sismember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
-	s, wrong := g.lookup(cx, args[0])
-	if wrong {
+	s, home := g.resolveTouch(cx, args[0])
+	if home == homeString {
 		r.Err(wrongType)
 		return
 	}
@@ -92,8 +96,8 @@ func Sismember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // argument order.
 func Smismember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
-	s, wrong := g.lookup(cx, args[0])
-	if wrong {
+	s, home := g.resolveTouch(cx, args[0])
+	if home == homeString {
 		r.Err(wrongType)
 		return
 	}
@@ -117,8 +121,8 @@ func Smismember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // Scard answers SCARD key: the member count, 0 when absent.
 func Scard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
-	s, wrong := g.lookup(cx, args[0])
-	if wrong {
+	s, home := g.resolveTouch(cx, args[0])
+	if home == homeString {
 		r.Err(wrongType)
 		return
 	}
@@ -136,8 +140,8 @@ func Scard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // buffer. The stream cutover is the same chunk width the string band streams at.
 func Smembers(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
-	s, wrong := g.lookup(cx, args[0])
-	if wrong {
+	s, home := g.resolveTouch(cx, args[0])
+	if home == homeString {
 		r.Err(wrongType)
 		return
 	}
@@ -184,8 +188,8 @@ func setHeader(dst []byte, n int, resp3 bool) []byte {
 func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
 	key := args[0]
-	s, wrong := g.lookup(cx, key)
-	if wrong {
+	s, home := g.resolveTouch(cx, key)
+	if home == homeString {
 		r.Err(wrongType)
 		return
 	}
@@ -199,10 +203,10 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		logRemove(cx, key, m)
 		cx.NotifyKeyspaceEvent(shard.NotifySet, "spop", key)
 		if s.card() == 0 {
-			g.drop(key)
+			g.commit(cx, key, s, home)
 			cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 		} else {
-			g.note(s)
+			g.commit(cx, key, s, home)
 		}
 		r.Bulk(m)
 		return
@@ -241,10 +245,10 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	r.Raw(out)
 	cx.NotifyKeyspaceEvent(shard.NotifySet, "spop", key)
 	if s.card() == 0 {
-		g.drop(key)
+		g.commit(cx, key, s, home)
 		cx.NotifyKeyspaceEvent(shard.NotifyGeneric, "del", key)
 	} else {
-		g.note(s)
+		g.commit(cx, key, s, home)
 	}
 }
 
@@ -254,8 +258,8 @@ func Spop(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 // -count members drawn with replacement (repeats allowed).
 func Srandmember(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	g := registry(cx)
-	s, wrong := g.lookup(cx, args[0])
-	if wrong {
+	s, home := g.resolveTouch(cx, args[0])
+	if home == homeString {
 		r.Err(wrongType)
 		return
 	}

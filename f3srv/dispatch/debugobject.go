@@ -101,8 +101,10 @@ func debugObject(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	payload, _ := dumpPayload(cx, key)
 	idle := int64(0)
-	if s, iok := cx.St.IdleSeconds(key, cx.NowMs); iok {
-		idle = s
+	if cx.St.HasString(key, cx.NowMs) {
+		if s, iok := cx.St.IdleSeconds(key, cx.NowMs); iok {
+			idle = s
+		}
 	} else if s, iok := collectionIdleSeconds(cx, key); iok {
 		idle = s
 	}

@@ -61,7 +61,7 @@ func storeCross(t *shard.Txn, args [][]byte, event string, hint func([]*set) int
 		t.Do(srcKeys[i], func(cx *shard.Ctx) {
 			g := registry(cx)
 			for _, j := range idxs {
-				s, w := g.lookup(cx, srcKeys[j])
+				s, w := g.operand(cx, srcKeys[j])
 				if w {
 					wrong = true
 					return
@@ -83,7 +83,7 @@ func storeCross(t *shard.Txn, args [][]byte, event string, hint func([]*set) int
 			if t.Shard(srcKeys[j]) != primary {
 				continue
 			}
-			s, w := g.lookup(cx, srcKeys[j])
+			s, w := g.operand(cx, srcKeys[j])
 			if w {
 				wrong = true
 				return

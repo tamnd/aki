@@ -60,8 +60,8 @@ func Sscan(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 
 	g := registry(cx)
-	s, wrong := g.lookup(cx, args[0])
-	if wrong {
+	s, home := g.resolveTouch(cx, args[0])
+	if home == homeString {
 		r.Err(wrongType)
 		return
 	}
