@@ -725,6 +725,18 @@ func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary fu
 						continue
 					}
 					cmds++
+					// CLIENT REPLY suppression: this command's reply is muted while
+					// the connection is in REPLY OFF, or for the single command after
+					// REPLY SKIP. The decision is captured here, at dispatch time, and
+					// stamped onto the command's hop so the writer drops the reply
+					// bytes; it must be captured now because a CLIENT REPLY ON later in
+					// the same pipelined batch would otherwise re-enable replies before
+					// the drain runs. The SKIP arming is consumed here so it covers
+					// exactly one command. On a connection that never runs CLIENT REPLY
+					// both flags stay false, so this is one branch and a cleared stamp.
+					silent := cs.replyOff || cs.replySkip
+					cs.replySkip = false
+					c.SetReplySilent(silent)
 					// Feed the command to any MONITOR connections before it runs
 					// (monitor.go). The gate is a single relaxed atomic load, so a
 					// server with no monitor pays nothing here, and a connection's

@@ -18,6 +18,16 @@ const OpError byte = 0xff
 // distinct byte from OpTxnArm keeps the two loopback paths separable.
 const opBlockDone byte = 0xfd
 
+// opInlineDone marks an InlineReply node: a reply the reader produced without a
+// shard hop (the CLIENT/HELLO/pub-sub family) that rides the outbound queue at a
+// fresh sequence. It shares opBlockDone's "finished bytes, no shard work" shape,
+// but a distinct byte lets the reply-suppression path in DrainReplies tell the
+// two apart: an InlineReply node carries its own silent stamp and sets the slot,
+// while a CompleteBlocked loopback (opBlockDone) must preserve the silent bit the
+// original blocked command already recorded for its sequence. The op is still
+// never interpreted for reply shape; only that one branch reads it.
+const opInlineDone byte = 0xfc
+
 // hopCmd is one routed command inside a batch node: the per-connection reply
 // sequence, the op, and the command's argument run inside the node's span
 // table. A keyed command's first argument is its key, which is what routing
@@ -26,8 +36,18 @@ type hopCmd struct {
 	seq   uint32
 	op    byte
 	keyed bool
-	argn  uint16
-	arg0  uint16
+	// silent marks a command whose reply must not reach the wire: the client ran
+	// CLIENT REPLY OFF or SKIP, so the owner still executes the command and writes
+	// its reply into the node (a write's side effects must happen, and the reorder
+	// cursor must still advance past the sequence), but the connection writer drops
+	// the bytes at emit time. The reader stamps it from the connection's silentNext
+	// flag right after add; it is published to the writer by the node's hop-queue
+	// handoff like every other per-command field. Default false: add zeroes it, so a
+	// connection that never touches CLIENT REPLY carries the flag unset and the
+	// writer never consults the drop path (Conn.everSilent gates it off entirely).
+	silent bool
+	argn   uint16
+	arg0   uint16
 }
 
 // span locates one argument inside the node's data buffer.
@@ -236,6 +256,10 @@ func (b *hopBatch) add(op byte, seq uint32, keyed bool, args [][]byte) bool {
 	c.seq = seq
 	c.op = op
 	c.keyed = keyed
+	// A recycled slot may carry a stale silent flag from its last command; clear
+	// it so only the reader's explicit stamp (enqueue/enqueueFan/InlineReply after
+	// a CLIENT REPLY OFF/SKIP) ever sets it.
+	c.silent = false
 	c.argn = uint16(len(args))
 	c.arg0 = b.sn
 	for _, a := range args {

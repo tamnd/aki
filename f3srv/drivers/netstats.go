@@ -109,6 +109,15 @@ type connState struct {
 	// at admission, immutable after, so a cross-connection reader needs no lock.
 	killConn func() error
 
+	// replyOff and replySkip carry CLIENT REPLY state. replyOff holds while the
+	// connection is in OFF mode: every command's reply is suppressed until CLIENT
+	// REPLY ON turns it back on. replySkip is armed by CLIENT REPLY SKIP for the
+	// single command that follows it, then consumed when that command dispatches.
+	// Both are reader-owned like quit: set on this connection's own goroutine in
+	// the read loop, read there to stamp each command's suppression.
+	replyOff  bool
+	replySkip bool
+
 	// monitoring is set when the connection ran MONITOR: it has joined the
 	// monitor set (monitor.go) and its own commands are excluded from the feed,
 	// so a monitor never echoes itself. Reader-owned like quit, and gated on in

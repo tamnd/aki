@@ -54,6 +54,13 @@ type Conn struct {
 	pending []*hopBatch // one open node per shard, nil when none
 	free    chan *hopBatch
 
+	// silentNext is the reader's CLIENT REPLY suppression flag for the next
+	// command it enqueues: the driver sets it through SetReplySilent before each
+	// dispatch, and enqueue/enqueueFan/InlineReply stamp it onto the command's
+	// hopCmd.silent so the writer drops the reply. Reader side only, a plain field
+	// restamped every command, so a stale value never leaks past one enqueue.
+	silentNext bool
+
 	// Writer-side state.
 	out     mpsc
 	wk      waker
@@ -61,6 +68,17 @@ type Conn struct {
 	ring    []parked
 	emitted atomic.Uint32 // writer's progress, read by the reader's throttle
 	closed  atomic.Bool
+
+	// silentRing records, per reorder slot, whether the reply at that sequence is
+	// suppressed (CLIENT REPLY OFF/SKIP). The writer sets slot seq%len when it
+	// processes the command's node in DrainReplies, and the emit wrapper reads
+	// slot c.next%len when a reply is about to go out, so a point, streamed, or
+	// fan reply all drop through the one check. Sized to the reorder ring and
+	// writer-owned. everSilent gates the whole path: it stays false until the
+	// connection first suppresses a reply, so a connection that never runs CLIENT
+	// REPLY pays nothing (no slot writes, no emit wrapper) on the reply hot path.
+	silentRing []bool
+	everSilent atomic.Bool
 
 	// blockAt arms the reader-side connection barrier: it holds one past the
 	// sequence of a blocking command the reader dispatched, or zero when none is
@@ -152,6 +170,22 @@ func (c *Conn) SetTxState(v any) { c.tx = v }
 // place a queued command's point op on the owner that holds its intent lock. It is
 // the connection-side twin of the runtime hash Do routes on. Reader goroutine only.
 func (c *Conn) ShardOf(key []byte) int { return c.rt.ShardOf(key) }
+
+// SetReplySilent arms (or clears) reply suppression for the next command the
+// reader enqueues: the driver's CLIENT REPLY handling calls it before each
+// dispatch with whether that command's reply must be dropped (CLIENT REPLY OFF,
+// or the one command after CLIENT REPLY SKIP). The flag rides the command's
+// hopCmd.silent to the writer, which drops the bytes at emit time while the
+// command still executes and the reorder cursor still advances. The first true
+// latches everSilent, which turns the writer's drop path on for the rest of the
+// connection's life; a connection that never suppresses keeps everSilent false
+// and the reply hot path unchanged. Reader side only.
+func (c *Conn) SetReplySilent(v bool) {
+	c.silentNext = v
+	if v {
+		c.everSilent.Store(true)
+	}
+}
 
 // SetResp3 records the connection's negotiated protocol version, the switch
 // HELLO 2 and HELLO 3 throw. The reply writer reads it through Resp3.
@@ -308,6 +342,13 @@ func (c *Conn) StreamAborted() bool {
 // that resumes the step. A failed stream flips Failed and clears the cursor;
 // the caller tears the connection down. Writer side only.
 func (c *Conn) StreamStep(emit func([]byte), budget int) {
+	if c.everSilent.Load() {
+		// The reorder cursor holds the stream's sequence for the whole reply, so
+		// the silent bit is constant across its chunks and trailer; the wrapper
+		// drops them all while consumeOne still drains the ring so the producer
+		// never stalls behind a suppressed reply.
+		emit = c.silentEmit(emit)
+	}
 	advanced := false
 	for st := c.cur; st != nil; st = c.cur {
 		if st.failed.Load() {
@@ -385,10 +426,11 @@ func (c *Conn) Owes() bool { return int32(c.published.Load()-c.next) > 0 }
 // NewConn builds a connection against the runtime.
 func (r *Runtime) NewConn() *Conn {
 	c := &Conn{
-		rt:      r,
-		pending: make([]*hopBatch, len(r.workers)),
-		free:    make(chan *hopBatch, r.freeListCap),
-		ring:    make([]parked, r.replyRing),
+		rt:         r,
+		pending:    make([]*hopBatch, len(r.workers)),
+		free:       make(chan *hopBatch, r.freeListCap),
+		ring:       make([]parked, r.replyRing),
+		silentRing: make([]bool, r.replyRing),
 	}
 	c.out.init()
 	c.wk.init()
@@ -452,6 +494,7 @@ func (c *Conn) enqueue(op byte, keyed bool, sh int, args [][]byte) error {
 			return ErrTooBig
 		}
 	}
+	b.cmds[b.n-1].silent = c.silentNext
 	c.seq++
 	return nil
 }
@@ -548,6 +591,17 @@ func (c *Conn) recycle(b *hopBatch) {
 // replies were emitted. Writer side only. Emitted bytes are valid only for
 // the duration of the emit call.
 func (c *Conn) DrainReplies(emit func([]byte)) int {
+	// Reply suppression (CLIENT REPLY OFF/SKIP) is gated on everSilent: until the
+	// connection first suppresses a reply the writer never wraps the emit or
+	// touches the silent ring, so the common connection pays nothing on the reply
+	// hot path. Once armed, wemit drops the reply at any sequence the silent ring
+	// marks, while the command still ran on its owner and the cursor still
+	// advances past it; the silentRing writes below record each sequence's bit.
+	wemit := emit
+	silent := c.everSilent.Load()
+	if silent {
+		wemit = c.silentEmit(emit)
+	}
 	n := 0
 	for {
 		b := c.out.pop()
@@ -561,7 +615,9 @@ func (c *Conn) DrainReplies(emit func([]byte)) int {
 			// An out-of-band node (DeliverOOB): its replies belong to no pipeline
 			// sequence, so they go straight to the wire in write order without
 			// touching c.next or the reorder ring. One flag load per drained node,
-			// off the point-op path, keeps this out of the reorder machinery.
+			// off the point-op path, keeps this out of the reorder machinery. An
+			// unsolicited push is never suppressed: a pub/sub message reaches a
+			// subscriber regardless of its CLIENT REPLY mode, so it uses raw emit.
 			for i := 0; i < int(b.n); i++ {
 				emit(b.reply(i))
 				n++
@@ -570,6 +626,25 @@ func (c *Conn) DrainReplies(emit func([]byte)) int {
 			continue
 		}
 		for i := 0; i < int(b.n); i++ {
+			if !silent && b.cmds[i].silent {
+				// everSilent latched after the top-of-drain load: the pair shape
+				// runs the writer on its own goroutine, so a node can carry a
+				// suppression bit this drain snapshotted as off. Any silent node
+				// forces the wrapper on for the rest of this drain; everSilent is
+				// monotonic so no earlier node in this drain was silent, and later
+				// drains see the latched flag directly.
+				silent = true
+				wemit = c.silentEmit(emit)
+			}
+			if silent && b.cmds[i].op != opBlockDone {
+				// Record this sequence's suppression before the reply is served,
+				// so the emit wrapper sees it whether the reply goes out in order
+				// now or parks and drains later. A CompleteBlocked loopback
+				// (opBlockDone) is skipped so it preserves the bit the original
+				// blocked command already recorded for the slot; every other node,
+				// including an opInlineDone reply, takes the ordinary set path.
+				c.silentRing[b.cmds[i].seq%uint32(len(c.silentRing))] = b.cmds[i].silent
+			}
 			if b.blocked(i) {
 				// Parked (Reply.Park): no reply now, and c.next must NOT advance past this
 				// sequence. Its reply arrives later on a CompleteBlocked loopback node;
@@ -577,16 +652,30 @@ func (c *Conn) DrainReplies(emit func([]byte)) int {
 				continue
 			}
 			if fc := b.fan(i); fc != nil {
-				n += c.mergeFan(fc, b.cmds[i].seq, b, i, emit)
+				n += c.mergeFan(fc, b.cmds[i].seq, b, i, wemit)
 				continue
 			}
 			if st := b.stream(i); st != nil {
-				n += c.deliverStream(b.cmds[i].seq, st, emit)
+				n += c.deliverStream(b.cmds[i].seq, st, wemit)
 				continue
 			}
-			n += c.deliver(b.cmds[i].seq, b.reply(i), emit)
+			n += c.deliver(b.cmds[i].seq, b.reply(i), wemit)
 		}
 		c.recycle(b)
+	}
+}
+
+// silentEmit wraps an emit so a reply whose sequence is marked in the silent
+// ring is dropped instead of written. It keys on c.next, the sequence the writer
+// is emitting at the moment of the call: a point reply, a streamed reply's every
+// chunk (the cursor holds the stream's sequence until its trailer), and a fan
+// reply all pass through it, so one check covers every reply shape. Writer side
+// only; used only once everSilent has latched.
+func (c *Conn) silentEmit(emit func([]byte)) func([]byte) {
+	return func(p []byte) {
+		if !c.silentRing[c.next%uint32(len(c.silentRing))] {
+			emit(p)
+		}
 	}
 }
 
@@ -696,7 +785,13 @@ func (c *Conn) InlineReply(rep []byte) error {
 	seq := c.seq
 	c.seq++
 	b := c.take()
-	b.add(opBlockDone, seq, false, nil)
+	b.add(opInlineDone, seq, false, nil)
+	// An inline reply is suppressed the same way a shard-hop reply is: CLIENT
+	// REPLY OFF drops a CLIENT ID or a pub/sub confirmation just like a GET. The
+	// stamp rides the node to the writer, which records it into the silent ring
+	// when it drains the node (opInlineDone takes the ordinary set path, unlike a
+	// CompleteBlocked loopback).
+	b.cmds[0].silent = c.silentNext
 	r := Reply{b: b, i: 0}
 	r.Raw(rep)
 	c.published.Store(c.seq)

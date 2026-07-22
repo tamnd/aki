@@ -229,6 +229,8 @@ func (s *Server) doClient(c *shard.Conn, cs *connState, args [][]byte) {
 		s.doClientList(c, cs, args)
 	case eqFold(sub, "KILL"):
 		s.doClientKill(c, cs, args)
+	case eqFold(sub, "REPLY"):
+		s.doClientReply(c, cs, args)
 	default:
 		_ = c.InlineReply(resp.AppendError(nil, "ERR unknown subcommand '"+string(sub)+"'. Try CLIENT HELP."))
 	}
@@ -493,6 +495,49 @@ func (s *Server) killConn(caller, target *connState) {
 	}
 	if target.killConn != nil {
 		_ = target.killConn()
+	}
+}
+
+// doClientReply answers CLIENT REPLY ON|OFF|SKIP, the per-connection switch that
+// mutes command replies (spec 2064/f3/11). ON is the default: every command
+// replies, and running ON while muted re-enables replies and acknowledges +OK.
+// OFF mutes every reply until the next ON, and produces no reply for itself.
+// SKIP mutes exactly the reply of the command that follows it, and produces no
+// reply for itself either.
+//
+// The suppression is stamped per command in the read loop (readLoop computes it
+// from these flags and calls shard.Conn.SetReplySilent before each dispatch), so
+// the shard still runs the command, its writes still take effect, and the reply
+// reorder cursor still advances; only the bytes are dropped at emit time. This
+// handler just moves the flags: OFF latches replyOff, SKIP arms replySkip for the
+// one following command, ON clears both. ON's own +OK must reach the wire even
+// when the connection was muted, so it un-silences this reply explicitly before
+// answering (the read loop set silentNext from the still-set replyOff).
+func (s *Server) doClientReply(c *shard.Conn, cs *connState, args [][]byte) {
+	if len(args) != 3 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|reply' command"))
+		return
+	}
+	switch {
+	case eqFold(args[2], "ON"):
+		cs.replyOff = false
+		cs.replySkip = false
+		// The read loop may have stamped this command silent off the still-set
+		// replyOff; ON is the one command that always answers, so clear it here.
+		c.SetReplySilent(false)
+		_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
+	case eqFold(args[2], "OFF"):
+		cs.replyOff = true
+		// No reply: OFF acknowledges nothing, it just mutes.
+	case eqFold(args[2], "SKIP"):
+		// Arm the next command's suppression. If the connection is already OFF,
+		// SKIP is a no-op the same way redis treats it: everything is muted
+		// anyway. No reply for SKIP itself.
+		if !cs.replyOff {
+			cs.replySkip = true
+		}
+	default:
+		_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
 	}
 }
 
