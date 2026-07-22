@@ -202,13 +202,10 @@ func (s *Server) doClient(c *shard.Conn, cs *connState, args [][]byte) {
 			_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|getredir' command"))
 			return
 		}
-		// -1 when tracking is off; 0 when it is on with no redirection target,
-		// the only tracking shape this slice offers (REDIRECT is a later slice).
-		if cs.tracking != nil {
-			_ = c.InlineReply(resp.AppendInt(nil, 0))
-		} else {
-			_ = c.InlineReply(resp.AppendInt(nil, -1))
-		}
+		// -1 when tracking is off; 0 when it is on with no redirection target; else
+		// the target client id set through CLIENT TRACKING ON REDIRECT.
+		id, _ := s.tracking.redirectState(cs)
+		_ = c.InlineReply(resp.AppendInt(nil, id))
 	case eqFold(sub, "TRACKING"):
 		s.doClientTracking(c, cs, args)
 	case eqFold(sub, "TRACKINGINFO"):
@@ -336,11 +333,12 @@ func (s *Server) clientOnOff(c *shard.Conn, args [][]byte, name string) {
 // the first write to such a key. BCAST mode registers a prefix set instead and
 // pushes an invalidate for every write to a key matching a prefix, statelessly. Both
 // honour NOLOOP (skip the invalidation for a key this connection wrote). OFF disarms
-// the connection and drops its registration. Tracking requires RESP3 (the honest
-// redis answer when no REDIRECT client is given, since a RESP2 connection cannot
-// carry an out-of-band push); REDIRECT is refused with a clear not-yet error rather
-// than a silent accept. Re-running ON on an already-tracking connection, or OFF on
-// one that never tracked, is answered OK, matching redis's idempotent switch.
+// the connection and drops its registration. Tracking requires RESP3 unless it names
+// a REDIRECT target, the second connection its invalidations are delivered to (as
+// pub/sub messages on __redis__:invalidate), which lets a RESP2 client cache. A
+// positive REDIRECT id must name a live connection; 0 is the explicit no-redirect.
+// Re-running ON on an already-tracking connection, or OFF on one that never tracked,
+// is answered OK, matching redis's idempotent switch.
 func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 	if len(args) < 3 {
 		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|tracking' command"))
@@ -355,7 +353,8 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 	// OPTOUT, NOLOOP, and BCAST with its PREFIX list; REDIRECT is a later slice,
 	// refused with an honest not-yet error rather than a silent accept so a client
 	// cannot believe it configured a mode f3 does not run.
-	var optin, optout, noloop, bcast bool
+	var optin, optout, noloop, bcast, hasRedirect bool
+	var redirectID uint64
 	var prefixes [][]byte
 	for i := 3; i < len(args); i++ {
 		switch {
@@ -376,8 +375,22 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 			i++
 			prefixes = append(prefixes, args[i])
 		case eqFold(args[i], "REDIRECT"):
-			_ = c.InlineReply(resp.AppendError(nil, "ERR CLIENT TRACKING option 'REDIRECT' is not supported yet; this build offers ON/OFF with OPTIN, OPTOUT, NOLOOP, and BCAST with PREFIX"))
-			return
+			// REDIRECT takes one argument, the target client id. 0 means "no redirect"
+			// (deliver to this connection directly); a positive id names the connection
+			// the invalidations are pushed to instead, the mechanism a RESP2 client uses
+			// to receive them on a second, subscribed connection.
+			if i+1 >= len(args) {
+				_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
+				return
+			}
+			i++
+			n, err := strconv.ParseInt(string(args[i]), 10, 64)
+			if err != nil || n < 0 {
+				_ = c.InlineReply(resp.AppendError(nil, "ERR Invalid client ID"))
+				return
+			}
+			hasRedirect = true
+			redirectID = uint64(n)
 		default:
 			_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
 			return
@@ -403,7 +416,7 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 		return
 	}
 	if eqFold(onoff, "OFF") {
-		if optin || optout || noloop || bcast || len(prefixes) > 0 {
+		if optin || optout || noloop || bcast || hasRedirect || len(prefixes) > 0 {
 			_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
 			return
 		}
@@ -414,11 +427,23 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 		_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
 		return
 	}
-	// ON: tracking rides RESP3 pushes, so a RESP2 connection with no redirection
-	// target cannot enable it, the redis contract.
-	if !c.Resp3() {
+	// ON: tracking rides RESP3 pushes, so a RESP2 connection cannot enable it unless it
+	// names a redirection target, in which case the invalidations go to that second
+	// connection (which carries them as pub/sub messages) and this one stays RESP2.
+	// REDIRECT 0 is the explicit "no redirect", so it does not lift the RESP3 rule.
+	if !c.Resp3() && redirectID == 0 {
 		_ = c.InlineReply(resp.AppendError(nil, "ERR Client tracking can be enabled only in RESP3 mode or when a redirection client is specified via the 'REDIRECT' option"))
 		return
+	}
+	// Resolve the redirection target: a positive id must name a live connection, else
+	// redis rejects the enable. id 0 (or no REDIRECT) leaves redir nil, direct delivery.
+	var redir *connState
+	if redirectID != 0 {
+		redir = s.connByID(redirectID)
+		if redir == nil {
+			_ = c.InlineReply(resp.AppendError(nil, "ERR The client ID you want redirect to does not exist"))
+			return
+		}
 	}
 	if bcast {
 		// BCAST is a distinct registration (a prefix set, no recorded-key table), so a
@@ -428,7 +453,7 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 			s.tracking.removeConn(cs)
 			cs.tracking = nil
 		}
-		s.tracking.armBcast(cs, prefixes)
+		s.tracking.armBcast(cs, prefixes, redir)
 		cs.tracking.noloop.Store(noloop)
 		_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
 		return
@@ -439,12 +464,33 @@ func (s *Server) doClientTracking(c *shard.Conn, cs *connState, args [][]byte) {
 		cs.tracking = nil
 	}
 	if cs.tracking == nil {
-		s.tracking.arm(cs)
+		s.tracking.arm(cs, redir)
+	} else {
+		// Already tracking default mode: a re-run of ON updates the redirect target in
+		// place (changing it, or clearing it with REDIRECT 0) without disarming.
+		s.tracking.setRedirect(cs, redir)
 	}
 	cs.tracking.optin = optin
 	cs.tracking.optout = optout
 	cs.tracking.noloop.Store(noloop)
 	_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
+}
+
+// connByID resolves a CLIENT ID to its live connection state, or nil when no live
+// connection carries that id (it disconnected, or the id was never issued). It scans
+// the live registry under netMu, the same snapshot CLIENT LIST walks; the scan is
+// linear but runs only on the cold CLIENT TRACKING REDIRECT path, never per command.
+// It takes netMu alone and calls nothing under it, so it never nests with the
+// tracking registry mutex the caller takes next.
+func (s *Server) connByID(id uint64) *connState {
+	s.netMu.Lock()
+	defer s.netMu.Unlock()
+	for other := range s.netLive {
+		if other.id == id {
+			return other
+		}
+	}
+	return nil
 }
 
 // checkPrefixOverlap reports redis's prefix-overlap error when one registered
@@ -465,19 +511,25 @@ func checkPrefixOverlap(prefixes [][]byte) string {
 
 // doClientTrackingInfo answers CLIENT TRACKINGINFO, the introspection command that
 // reports this connection's client-side-caching state. It returns the three fields
-// this slice models: flags (an array holding "on" or "off"), redirect (0 when
-// tracking is on with no redirect target, -1 when off), and prefixes (always the
-// empty array, since BCAST PREFIX is a later slice). Under RESP3 it is a real map
-// frame; under RESP2 the flat six-element array redis falls back to. It reads only
-// this connection's own state on its own reader goroutine, so it needs no lock.
+// redis models: flags (the mode tokens on/bcast/optin/optout/noloop/broken_redirect,
+// or off), redirect (the target client id, 0 when tracking on with no redirect, -1
+// when off), and prefixes (the BCAST prefix list). Under RESP3 it is a real map
+// frame; under RESP2 the flat six-element array redis falls back to. The redirect
+// fields are read under the tracking mutex (a foreign teardown can set broken); the
+// rest is this connection's own reader-owned state.
 func (s *Server) doClientTrackingInfo(c *shard.Conn, cs *connState, args [][]byte) {
 	if len(args) != 2 {
 		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|trackinginfo' command"))
 		return
 	}
 	on := cs.tracking != nil
+	// redirect is the target client id (0 when tracking on with no redirect, -1 when
+	// off); broken is set once a redirect target has disconnected. Both are read under
+	// the registry mutex since a foreign teardown writes the broken flag.
+	redirID, broken := s.tracking.redirectState(cs)
 	// The flags array renders redis's mode tokens: off when disabled, else on plus
-	// bcast, the optin/optout mode token when one is set, and noloop when it is armed.
+	// bcast, the optin/optout mode token when one is set, noloop when it is armed, and
+	// broken_redirect when the redirect target has gone away.
 	var flags []string
 	if on {
 		flags = append(flags, "on")
@@ -492,6 +544,9 @@ func (s *Server) doClientTrackingInfo(c *shard.Conn, cs *connState, args [][]byt
 		}
 		if cs.tracking.noloop.Load() {
 			flags = append(flags, "noloop")
+		}
+		if broken {
+			flags = append(flags, "broken_redirect")
 		}
 	} else {
 		flags = append(flags, "off")
@@ -508,11 +563,7 @@ func (s *Server) doClientTrackingInfo(c *shard.Conn, cs *connState, args [][]byt
 		out = resp.AppendBulk(out, []byte(f))
 	}
 	out = resp.AppendBulk(out, []byte("redirect"))
-	if on {
-		out = resp.AppendInt(out, 0)
-	} else {
-		out = resp.AppendInt(out, -1)
-	}
+	out = resp.AppendInt(out, redirID)
 	out = resp.AppendBulk(out, []byte("prefixes"))
 	if on {
 		out = resp.AppendArrayHeader(out, len(cs.tracking.prefixes))
