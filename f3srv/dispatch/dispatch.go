@@ -247,6 +247,10 @@ func init() {
 	register("SETEX", str.Setex, 3, 3, true)
 	register("PSETEX", str.Psetex, 3, 3, true)
 	register("STRLEN", str.Strlen, 1, 1, true)
+	// INCREX (Redis 8.8) increments a key by an integer or float with optional
+	// bounds and expiry, replying [new value, actual increment] (increx.go). A
+	// single-key write, so it keeps the point path routed on args[0].
+	register("INCREX", str.Increx, 1, -1, true)
 	// LCS reads two string keys. Co-located it runs on their shared owner; a
 	// split pair takes the F17 route, reading each value on its own owner.
 	register("LCS", str.Lcs, 2, -1, true)
