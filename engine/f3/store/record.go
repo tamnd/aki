@@ -58,6 +58,20 @@ const (
 	// valid record kind.
 	kindString = 0x01
 
+	// The collection kinds. A collection record embeds a whole small collection's
+	// packed bytes in the value area, the tiny-collection form the
+	// keyspace-unification arc folds the per-type Go-heap registries into: one
+	// arena record, no header struct, no separate data slice, no map entry, no
+	// GC-scanned object. The kind byte discriminates the packed shape; the packed
+	// bytes and the per-collection small fields carried in offKindBits are the
+	// owning type's to interpret. They occupy a contiguous range so isCollKind is
+	// a bounds test.
+	kindSet    = 0x02
+	kindHash   = 0x03
+	kindList   = 0x04
+	kindZSet   = 0x05
+	kindStream = 0x06
+
 	// maxKey and maxVal are the 64KiB field widths klen and the vcap word
 	// count can express. Keys keep this cap for good; values at and past
 	// 64KiB move to the chunked band in a later slice, and until it lands
