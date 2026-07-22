@@ -127,7 +127,7 @@ func TestResolveSpillTwoPartRun(t *testing.T) {
 func TestRecordSpillIgnoresNonProvisional(t *testing.T) {
 	s := newAkiSpillStore(t)
 
-	s.recordSpill(0, 4096)              // a plain arena offset
+	s.recordSpill(0, 4096)               // a plain arena offset
 	s.recordSpill(0, inLogBit|uint64(8)) // an already-published log word
 	if len(s.spillLedger) != 0 {
 		t.Fatalf("non-provisional words entered the ledger, len=%d", len(s.spillLedger))
