@@ -1,7 +1,9 @@
 package drivers
 
 import (
+	"strconv"
 	"testing"
+	"time"
 )
 
 // Client-side caching at the driver seam (spec 2064/f3/17; redis's CLIENT
@@ -510,6 +512,157 @@ func TestTrackingModeErrors(t *testing.T) {
 	if !ok || len(flags) != 2 || flags[0] != "on" || flags[1] != "optin" {
 		t.Fatalf("TRACKINGINFO flags in OPTIN = %v, want [on optin]", info["flags"])
 	}
+}
+
+// TestTrackingRedirect drives REDIRECT, the RESP2 client-side-caching mechanism: a
+// tracking connection points its invalidations at a second connection subscribed to
+// __redis__:invalidate. The tracking connection stays RESP2 (REDIRECT waives the
+// RESP3 requirement), records a key, and a foreign write delivers the invalidation to
+// the target as a pub/sub message frame on __redis__:invalidate carrying the key. A
+// FLUSHALL delivers the whole-cache-gone signal as a message with a null payload.
+func TestTrackingRedirect(t *testing.T) {
+	srv := startPubsubServer(t)
+	// The redirect target: a RESP2 connection subscribed to the invalidation channel.
+	// Its client id is read before it subscribes, since subscribe mode bars CLIENT.
+	target, tgtBr := dialPubsub(t, srv)
+	id, ok := sendCmd(t, tgtBr, target, "CLIENT", "ID").(int64)
+	if !ok {
+		t.Fatalf("CLIENT ID did not return an integer")
+	}
+	send(t, target, "SUBSCRIBE", invalidateChannel)
+	if k, ch, n := readSubConfirm(t, tgtBr); k != "subscribe" || ch != invalidateChannel || n != 1 {
+		t.Fatalf("subscribe confirm = %q %q %d, want subscribe %s 1", k, ch, n, invalidateChannel)
+	}
+
+	// The tracking connection stays RESP2: REDIRECT lets it cache without RESP3.
+	tc, tbr := dialPubsub(t, srv)
+	if r := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "REDIRECT", strconv.FormatInt(id, 10)); r != "OK" {
+		t.Fatalf("CLIENT TRACKING ON REDIRECT = %v, want OK", r)
+	}
+	// GETREDIR and TRACKINGINFO both report the target id.
+	if r := sendCmd(t, tbr, tc, "CLIENT", "GETREDIR"); r != id {
+		t.Fatalf("GETREDIR = %v, want %d", r, id)
+	}
+	info := flattenPairs(t, sendCmd(t, tbr, tc, "CLIENT", "TRACKINGINFO"))
+	if info["redirect"] != id {
+		t.Fatalf("TRACKINGINFO redirect = %v, want %d", info["redirect"], id)
+	}
+
+	// Seed and read a key so it is cached, then a foreign write invalidates it: the
+	// target (not the tracking connection) receives the message frame.
+	wc, wbr := dialPubsub(t, srv)
+	send(t, wc, "SET", "foo", "bar")
+	expect(t, wbr, "+OK\r\n")
+	if r := sendCmd(t, tbr, tc, "GET", "foo"); r != "bar" {
+		t.Fatalf("GET foo = %v, want bar", r)
+	}
+	send(t, wc, "SET", "foo", "baz")
+	expect(t, wbr, "+OK\r\n")
+
+	msg, ok := readRESP(t, tgtBr).([]any)
+	if !ok || len(msg) != 3 || msg[0] != "message" || msg[1] != invalidateChannel {
+		t.Fatalf("redirect delivery = %v, want a message on %s", msg, invalidateChannel)
+	}
+	if keys, ok := msg[2].([]any); !ok || len(keys) != 1 || keys[0] != "foo" {
+		t.Fatalf("redirect message payload = %v, want [foo]", msg[2])
+	}
+
+	// A FLUSHALL delivers the whole-cache-gone signal as a message with a null payload.
+	if r := sendCmd(t, tbr, tc, "GET", "foo"); r != "baz" {
+		t.Fatalf("re-read GET foo = %v, want baz", r)
+	}
+	send(t, wc, "FLUSHALL")
+	expect(t, wbr, "+OK\r\n")
+	msg, ok = readRESP(t, tgtBr).([]any)
+	if !ok || len(msg) != 3 || msg[0] != "message" || msg[1] != invalidateChannel {
+		t.Fatalf("flush redirect delivery = %v, want a message on %s", msg, invalidateChannel)
+	}
+	if msg[2] != nil {
+		t.Fatalf("flush redirect payload = %v, want a null", msg[2])
+	}
+}
+
+// TestTrackingRedirectRESP2Waiver checks a RESP2 connection may enable tracking when
+// it names a REDIRECT target (the RESP3 requirement is waived), and that REDIRECT 0
+// (the explicit no-redirect) does not waive it.
+func TestTrackingRedirectRESP2Waiver(t *testing.T) {
+	srv := startPubsubServer(t)
+	target, tgtBr := dialPubsub(t, srv)
+	id := sendCmd(t, tgtBr, target, "CLIENT", "ID").(int64)
+	send(t, target, "SUBSCRIBE", invalidateChannel)
+	readSubConfirm(t, tgtBr)
+
+	tc, tbr := dialPubsub(t, srv)
+	if r := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "REDIRECT", strconv.FormatInt(id, 10)); r != "OK" {
+		t.Fatalf("RESP2 TRACKING ON REDIRECT = %v, want OK", r)
+	}
+	// REDIRECT 0 is the explicit no-redirect, so a RESP2 connection still cannot enable.
+	rc, rbr := dialPubsub(t, srv)
+	if _, ok := sendCmd(t, rbr, rc, "CLIENT", "TRACKING", "ON", "REDIRECT", "0").(errorReply); !ok {
+		t.Fatalf("RESP2 TRACKING ON REDIRECT 0 should be an error (RESP3 not waived)")
+	}
+}
+
+// TestTrackingRedirectMissing checks REDIRECT to a client id that names no live
+// connection is refused, and an unparseable id is a syntax-level error.
+func TestTrackingRedirectMissing(t *testing.T) {
+	srv := startPubsubServer(t)
+	tc, tbr := dialPubsub(t, srv)
+
+	if _, ok := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "REDIRECT", "999999").(errorReply); !ok {
+		t.Fatalf("REDIRECT to a nonexistent client id should be an error")
+	}
+	if _, ok := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "REDIRECT", "notanumber").(errorReply); !ok {
+		t.Fatalf("REDIRECT with a non-numeric id should be an error")
+	}
+}
+
+// TestTrackingRedirectBroken checks that when a redirect target disconnects, the
+// tracking connection's redirection is marked broken: TRACKINGINFO reports the
+// broken_redirect flag while GETREDIR still names the (now-gone) target id.
+func TestTrackingRedirectBroken(t *testing.T) {
+	srv := startPubsubServer(t)
+	target, tgtBr := dialPubsub(t, srv)
+	id := sendCmd(t, tgtBr, target, "CLIENT", "ID").(int64)
+	send(t, target, "SUBSCRIBE", invalidateChannel)
+	readSubConfirm(t, tgtBr)
+
+	tc, tbr := dialPubsub(t, srv)
+	if r := sendCmd(t, tbr, tc, "CLIENT", "TRACKING", "ON", "REDIRECT", strconv.FormatInt(id, 10)); r != "OK" {
+		t.Fatalf("TRACKING ON REDIRECT = %v, want OK", r)
+	}
+
+	// Drop the target. The server's teardown marks every dependent's redirection
+	// broken; that runs on the target's reader goroutine, so poll until it lands.
+	target.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	var broke bool
+	for time.Now().Before(deadline) {
+		info := flattenPairs(t, sendCmd(t, tbr, tc, "CLIENT", "TRACKINGINFO"))
+		flags, _ := info["flags"].([]any)
+		if hasFlag(flags, "broken_redirect") {
+			broke = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !broke {
+		t.Fatalf("TRACKINGINFO never reported broken_redirect after target disconnect")
+	}
+	// The id is retained after the break, matching redis: GETREDIR still names it.
+	if r := sendCmd(t, tbr, tc, "CLIENT", "GETREDIR"); r != id {
+		t.Fatalf("GETREDIR after broken redirect = %v, want %d", r, id)
+	}
+}
+
+// hasFlag reports whether a TRACKINGINFO flags array contains the given token.
+func hasFlag(flags []any, want string) bool {
+	for _, f := range flags {
+		if f == want {
+			return true
+		}
+	}
+	return false
 }
 
 // flattenPairs turns a flattened key/value reply (the shape readRESP gives a RESP3
