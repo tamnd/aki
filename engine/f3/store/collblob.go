@@ -105,6 +105,33 @@ func (s *Store) PutCollBlob(key []byte, kind byte, bits uint16, blob []byte, at,
 	return nil
 }
 
+// DropCollBlob removes the inline collection record at key and reports whether
+// one was there to remove. It is the collection type's explicit delete, distinct
+// from store.Del in two ways the unified keyspace needs. First it cuts no string
+// tombstone: a collection's durability rides its own type effect log (the type
+// logs the delete there), so a string tombstone here would be a stray entry the
+// string recovery path replays for a key that never held a string. Second it
+// drops only a collection record, never a string: a string at key reads as no
+// collection to remove, so a mis-routed call cannot delete a string value out
+// from under its own keyspace. It reaps unconditionally (the caller resolved the
+// record live at this command boundary), so it takes no clock; the record's
+// coll-count charge is cleared by the shared dropRecord exit. A cold record
+// cannot hold an inline collection, so a cold slot at key reads as absent here.
+func (s *Store) DropCollBlob(key []byte) bool {
+	h := Hash(key)
+	slot, addr, inOverflow := s.findEntry(h, key)
+	if addr == 0 || slotCold(*slot) {
+		return false
+	}
+	if !isCollKind(s.arena.buf[addr+offKind]) {
+		return false
+	}
+	s.deleteAt(h, slot, inOverflow)
+	s.dropRecord(addr)
+	s.count--
+	return true
+}
+
 // GetCollBlob returns the packed blob, kind, and per-collection bits for key's
 // inline collection record, and whether one is present. The blob is a view into
 // the arena, stable until the next store write that could republish the record,
