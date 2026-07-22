@@ -421,6 +421,20 @@ func (r *Runtime) Stop() {
 	}
 }
 
+// SyncDurable forces a durability barrier on the shared .aki log so a command
+// like SAVE can make the dataset durable on request. The runtime opens the file
+// SyncEverySec, so a committed record is durable within a second on its own; this
+// flushes and fsyncs now instead of waiting out that window. It runs the fsync on
+// the group writer goroutine (Barrier), the only one allowed to touch the append
+// cursor, so a shard owner calling it never races the writer. It is a no-op on the
+// non-durable scratch path, where aki is nil and there is nothing to flush.
+func (r *Runtime) SyncDurable() error {
+	if r.aki == nil || r.gw == nil {
+		return nil
+	}
+	return r.gw.Barrier()
+}
+
 // checkpointOnStop writes a clean-shutdown index checkpoint for every shard and
 // commits them as the file's live root in one meta flip. It runs only on the
 // shared-.aki path and only after the group writer has joined, so its direct

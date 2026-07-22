@@ -207,6 +207,13 @@ func init() {
 	register("FAILOVER", failoverCmd, 0, -1, false)
 	register("LATENCY", latencyCmd, 1, -1, false)
 	register("SLOWLOG", slowlogCmd, 1, -1, false)
+	// The persistence surface (see persist.go): f3's durability is the continuous
+	// .aki append log, so SAVE/BGSAVE force its fsync barrier now and LASTSAVE
+	// reports the last-save clock. BGSAVE takes an optional SCHEDULE token.
+	register("SAVE", saveCmd, 0, 0, false)
+	register("BGSAVE", bgsaveCmd, 0, 1, false)
+	register("BGREWRITEAOF", bgrewriteaofCmd, 0, 0, false)
+	register("LASTSAVE", lastsaveCmd, 0, 0, false)
 	// DEBUG answers the test-harness subcommands (see debug.go). SLEEP is caught
 	// in the network intercept on the default driver; this registration serves the
 	// keyless stubs and the reactor's SLEEP path.

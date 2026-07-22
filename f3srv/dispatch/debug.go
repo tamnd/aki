@@ -55,6 +55,21 @@ func debugCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 			}
 		}
 		r.Status("OK")
+	case "RELOAD":
+		// DEBUG RELOAD saves the dataset and reloads it from disk. f3 keeps every
+		// write in the durable .aki log, so a reload would rebuild the identical
+		// state it replays on open; there is no volatile in-memory-only data to
+		// drop and re-read. It cannot tear the live workers down and re-run the open
+		// sequence in place, so it forces the durable barrier (the save half) and
+		// acks, the honest realization of "the dataset is on disk and would reload
+		// unchanged". The optional NOSAVE/NOFLUSH tokens redis accepts are ignored.
+		if rt := cx.Runtime(); rt != nil {
+			if err := rt.SyncDurable(); err != nil {
+				r.Err("ERR Error trying to save the DB: " + err.Error())
+				return
+			}
+		}
+		r.Status("OK")
 	case "JMAP", "QUICKLIST-PACKED-THRESHOLD",
 		"STRINGMATCH-LEN", "CHANGE-REPL-ID", "FLUSHALL", "DEBUG":
 		// Truthful stubs: these poke redis-internal machinery (the JVM-style

@@ -58,13 +58,14 @@ type sealed struct {
 // Stop, so a File no shard ever logs to keeps this at zero cost, not even a parked
 // goroutine.
 type GroupWriter struct {
-	f      *File
-	rings  []chan sealed
-	signal chan struct{}
-	quit   chan struct{}
-	done   chan struct{}
-	begin  sync.Once
-	up     bool // goroutine started; producer-set under begin, read at Stop after producers quiesce
+	f       *File
+	rings   []chan sealed
+	signal  chan struct{}
+	barrier chan chan error
+	quit    chan struct{}
+	done    chan struct{}
+	begin   sync.Once
+	up      bool // goroutine started; producer-set under begin, read at Stop after producers quiesce
 }
 
 // NewGroupWriter builds a group writer over f with one ring per shard, each buffered
@@ -84,11 +85,12 @@ func NewGroupWriter(f *File, shards, ring int) *GroupWriter {
 		rings[i] = make(chan sealed, ring)
 	}
 	return &GroupWriter{
-		f:      f,
-		rings:  rings,
-		signal: make(chan struct{}, 1),
-		quit:   make(chan struct{}),
-		done:   make(chan struct{}),
+		f:       f,
+		rings:   rings,
+		signal:  make(chan struct{}, 1),
+		barrier: make(chan chan error),
+		quit:    make(chan struct{}),
+		done:    make(chan struct{}),
 	}
 }
 
@@ -138,6 +140,16 @@ func (w *GroupWriter) run() {
 		}
 		select {
 		case <-w.signal:
+		case ack := <-w.barrier:
+			// A durability barrier (Barrier, backing SAVE): drain and commit
+			// everything queued, then force the file's fsync from this goroutine,
+			// the only one allowed to touch the append cursor, so the caller
+			// observes every accepted record durable without racing the writer.
+			group = w.drainAll(group[:0])
+			if len(group) > 0 {
+				w.commit(group)
+			}
+			ack <- w.f.Sync()
 		case <-w.quit:
 			group = w.drainAll(group[:0])
 			if len(group) > 0 {
@@ -198,6 +210,29 @@ func (w *GroupWriter) commit(group []sealed) {
 			addrs[j] = base + fr.FrameOff
 		}
 		b.done(addrs, nil)
+	}
+}
+
+// Barrier forces a durability barrier: the writer goroutine drains and commits
+// every queued batch, then fsyncs the file, and Barrier returns that fsync's
+// error. It is how an explicit SAVE makes the dataset durable on request under
+// the SyncEverySec policy the runtime opens with, where a plain commit only
+// fsyncs once a second. Barrier starts the writer goroutine the same lazy way
+// Submit does, so a SAVE that arrives before any write still forces a clean
+// fsync rather than racing an unsynchronized read of the started flag. It may be
+// called from any goroutine, including a shard owner: the fsync runs on the
+// writer, so it never races the append cursor.
+func (w *GroupWriter) Barrier() error {
+	w.begin.Do(func() {
+		w.up = true
+		go w.run()
+	})
+	ack := make(chan error, 1)
+	select {
+	case w.barrier <- ack:
+		return <-ack
+	case <-w.quit:
+		return nil
 	}
 }
 
