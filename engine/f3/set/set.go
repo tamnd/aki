@@ -350,6 +350,31 @@ func (s *set) rem(m []byte) bool {
 	}
 }
 
+// remAt removes the member at draw index i, the SPOP kernel's removal step. The
+// draw already resolved i, so on the walk bands (intset, listpack) this splices
+// at the known position instead of re-finding the member by value: rem(m) walks
+// to i a second time and pays a memcmp per step (listpack) or a ParseInt plus
+// binary search (intset), all of which the index makes redundant. The hashtable
+// and partitioned bands remove in O(1)/index-free by value, so they defer to
+// rem(m). m is the already-copied member, passed only for the fallback bands.
+// Byte-identical to rem(m) for the member the draw selected.
+func (s *set) remAt(i int, m []byte) {
+	switch s.enc {
+	case encIntset:
+		s.data = append(s.data[:i*intLaneWidth], s.data[(i+1)*intLaneWidth:]...)
+	case encListpack:
+		pos := 0
+		for k := 0; k < i; k++ {
+			pos += 2 + int(s.data[pos])
+		}
+		end := pos + 2 + int(s.data[pos])
+		s.data = append(s.data[:pos], s.data[end:]...)
+		s.n--
+	default:
+		s.rem(m)
+	}
+}
+
 // each calls fn for every member, in the encoding's natural order: intset
 // ascending, listpack insertion order, table arbitrary. The []byte handed to
 // fn aliases internal storage (or a scratch for integers) and is valid only

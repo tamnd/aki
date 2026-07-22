@@ -48,8 +48,9 @@ func (s *set) drawOne(g *reg, sc []byte) []byte {
 // popOne over a set is an exact uniform sample without replacement, because each
 // draw is uniform over the members still present.
 func (s *set) popOne(g *reg, sc []byte) []byte {
-	m := append(sc[:0], s.drawOne(g, sc)...)
-	s.rem(m)
+	i := s.drawIndex(g)
+	m := append(sc[:0], s.at(i, sc)...)
+	s.remAt(i, m)
 	return m
 }
 
