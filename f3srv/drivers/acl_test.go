@@ -83,6 +83,55 @@ func TestAclGetUser(t *testing.T) {
 	}
 }
 
+// isHex reports whether s is non-empty and made only of lowercase hex digits, the
+// alphabet ACL GENPASS draws from.
+func isHex(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// TestAclGenPass checks GENPASS emits a lowercase-hex secret of the right length:
+// 64 chars by default (256 bits), ceil(bits/4) for an explicit count, a fresh
+// value each call, and a clear error for an out-of-range bit count.
+func TestAclGenPass(t *testing.T) {
+	_, nc, br := startServer(t)
+
+	def, ok := sendCmd(t, br, nc, "ACL", "GENPASS").(string)
+	if !ok || len(def) != 64 || !isHex(def) {
+		t.Fatalf("ACL GENPASS = %q, want 64 hex chars", def)
+	}
+
+	// A second call yields a different secret; a fixed generator would repeat.
+	again, _ := sendCmd(t, br, nc, "ACL", "GENPASS").(string)
+	if again == def {
+		t.Fatalf("ACL GENPASS repeated %q, want a fresh value", def)
+	}
+
+	// ceil(bits/4) characters: 32 bits -> 8, 1 bit -> 1, 4095 bits -> 1024.
+	for _, tc := range []struct {
+		bits string
+		want int
+	}{{"32", 8}, {"1", 1}, {"5", 2}, {"4096", 1024}, {"4095", 1024}} {
+		got, ok := sendCmd(t, br, nc, "ACL", "GENPASS", tc.bits).(string)
+		if !ok || len(got) != tc.want || !isHex(got) {
+			t.Fatalf("ACL GENPASS %s = %q (len %d), want %d hex chars", tc.bits, got, len(got), tc.want)
+		}
+	}
+
+	for _, bad := range []string{"0", "-1", "4097", "abc"} {
+		if _, ok := sendCmd(t, br, nc, "ACL", "GENPASS", bad).(errorReply); !ok {
+			t.Fatalf("ACL GENPASS %s did not error", bad)
+		}
+	}
+}
+
 // TestAclUnsupported checks a mutating or unknown subcommand errors rather than
 // fabricating a success, since f3 has no user store.
 func TestAclUnsupported(t *testing.T) {

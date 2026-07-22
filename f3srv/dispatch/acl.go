@@ -1,7 +1,10 @@
 package dispatch
 
 import (
+	"crypto/rand"
+
 	"github.com/tamnd/aki/engine/f3/shard"
+	"github.com/tamnd/aki/engine/f3/store"
 	"github.com/tamnd/aki/f3srv/resp"
 )
 
@@ -59,6 +62,8 @@ func aclCmd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		aclCat(cx, args[1:], r)
 	case "GETUSER":
 		aclGetUser(cx, args[1:], r)
+	case "GENPASS":
+		aclGenPass(cx, args[1:], r)
 	default:
 		r.Err("ERR Unknown ACL subcommand or wrong number of arguments")
 	}
@@ -78,6 +83,64 @@ func aclCat(cx *shard.Ctx, rest [][]byte, r shard.Reply) {
 	}
 	cx.Aux = out
 	r.Raw(out)
+}
+
+// aclGenPassBits is the default password strength ACL GENPASS emits with no
+// argument, and aclGenPassMax the ceiling an explicit bit count may request, the
+// same 256-bit default and 4096-bit cap Redis enforces.
+const (
+	aclGenPassBits = 256
+	aclGenPassMax  = 4096
+)
+
+// aclGenPassErr is the exact wording Redis returns for an out-of-range or
+// non-integer GENPASS bit count.
+const aclGenPassErr = "ERR ACL GENPASS argument must be the number of bits for the output password, a positive number up to 4096 inclusive."
+
+// aclGenHex are the lowercase hex digits GENPASS draws each password character
+// from, four random bits per digit.
+const aclGenHex = "0123456789abcdef"
+
+// aclGenPass answers ACL GENPASS [bits]: a cryptographically random password of
+// bits bits, rendered as ceil(bits/4) lowercase hex characters. The default is
+// 256 bits (64 hex chars); an explicit count must be a positive integer up to
+// 4096. Redis draws the characters from a CSPRNG, which crypto/rand mirrors, so
+// the output is a fresh unpredictable secret every call.
+func aclGenPass(cx *shard.Ctx, rest [][]byte, r shard.Reply) {
+	bits := int64(aclGenPassBits)
+	if len(rest) > 1 {
+		r.Err("ERR wrong number of arguments for 'acl|genpass' command")
+		return
+	}
+	if len(rest) == 1 {
+		n, ok := store.ParseInt(rest[0])
+		if !ok {
+			// Redis parses the bit count with a nil message, so a non-integer falls
+			// through to the generic integer error, not the GENPASS-specific one.
+			r.Err("ERR value is not an integer or out of range")
+			return
+		}
+		if n <= 0 || n > aclGenPassMax {
+			r.Err(aclGenPassErr)
+			return
+		}
+		bits = n
+	}
+	// One hex character carries four bits, so a password of bits bits is
+	// ceil(bits/4) characters, matching Redis's (bits+3)/4.
+	chars := int((bits + 3) / 4)
+	// Draw one random byte per character and keep its low nibble; a byte is cheaper
+	// to reason about than packing two nibbles per byte and the cost is negligible
+	// against the network round trip.
+	buf := make([]byte, chars)
+	if _, err := rand.Read(buf); err != nil {
+		r.Err("ERR failed to generate password")
+		return
+	}
+	for i := range buf {
+		buf[i] = aclGenHex[buf[i]&0x0f]
+	}
+	r.Bulk(buf)
 }
 
 // aclGetUser answers ACL GETUSER name: the field map for the default superuser,
