@@ -260,6 +260,16 @@ func init() {
 	register("MSETNX", msetnxCmd, 2, -1, true)
 	table["MSETNX"].crossKeys = msetnxKeys
 	table["MSETNX"].cross = msetnxCross
+	// MSETEX (Redis 8.4) atomically sets numkeys key/value pairs with one shared
+	// expiry, guarded by an optional NX/XX on the whole set (msetex.go). It leads
+	// with numkeys, so its routing key is the first operand (keyAt=1), the same
+	// post-count route SINTERCARD and MSETNX-shaped fans take: a co-located key
+	// set runs the whole probe-then-write on that owner, a split set rides the
+	// F17 intent route. crossKeys parses numkeys to return the operand keys.
+	register("MSETEX", msetexCmd, 3, -1, false)
+	table["MSETEX"].keyAt = 1
+	table["MSETEX"].crossKeys = msetexKeys
+	table["MSETEX"].cross = msetexCross
 	// TYPE spans every keyspace f3 keeps (the string store and all five
 	// collection registries), so its handler lives here where every type
 	// package is in reach. Single-key EXISTS and DEL below share that reach,
@@ -972,7 +982,7 @@ func markWrites() {
 	writes := []string{
 		// String.
 		"SET", "SETNX", "SETEX", "PSETEX", "SETRANGE", "APPEND", "GETSET", "GETDEL", "GETEX",
-		"INCR", "INCRBY", "INCRBYFLOAT", "DECR", "DECRBY", "MSET", "MSETNX",
+		"INCR", "INCRBY", "INCRBYFLOAT", "DECR", "DECRBY", "MSET", "MSETNX", "MSETEX", "INCREX",
 		// Bitmap.
 		"SETBIT", "BITFIELD", "BITOP",
 		// Generic key.
