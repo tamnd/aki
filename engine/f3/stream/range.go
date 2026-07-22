@@ -335,7 +335,7 @@ func prependArrayHeader(buf []byte, at, n int) []byte {
 	var hb [24]byte
 	hdr := resp.AppendArrayHeader(hb[:0], n)
 	w := len(hdr)
-	buf = append(buf, hdr...)          // grow by w; the tail bytes are overwritten next
+	buf = append(buf, hdr...)            // grow by w; the tail bytes are overwritten next
 	copy(buf[at+w:], buf[at:len(buf)-w]) // shift the body right (copy is memmove-safe)
 	copy(buf[at:], hdr)                  // write the header into the gap
 	return buf
