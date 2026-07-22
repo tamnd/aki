@@ -116,6 +116,63 @@ func TestCollBlobTooBig(t *testing.T) {
 	}
 }
 
+// The exported kind bytes mirror the internal discriminants, so a collection
+// type names its kind through the public surface without minting its own literal.
+func TestExportedCollKinds(t *testing.T) {
+	pairs := []struct {
+		got  byte
+		want byte
+	}{
+		{KindSet, kindSet}, {KindHash, kindHash}, {KindList, kindList},
+		{KindZSet, kindZSet}, {KindStream, kindStream},
+	}
+	for _, p := range pairs {
+		if p.got != p.want {
+			t.Fatalf("exported kind = %#x, want %#x", p.got, p.want)
+		}
+	}
+}
+
+// DropCollBlob removes a collection record, cuts no string tombstone, and refuses
+// a string or missing key so a mis-routed call cannot delete a string value.
+func TestDropCollBlob(t *testing.T) {
+	s := newTestStore()
+	if err := s.PutCollBlob([]byte("set:a"), kindSet, 1, []byte("payload!!"), 0, 0); err != nil {
+		t.Fatalf("PutCollBlob: %v", err)
+	}
+	if err := s.SetString([]byte("str:a"), []byte("v"), 0, 0, false); err != nil {
+		t.Fatalf("SetString: %v", err)
+	}
+	// A string key is not a collection to drop.
+	if s.DropCollBlob([]byte("str:a")) {
+		t.Fatal("DropCollBlob removed a string record")
+	}
+	if !s.Exists([]byte("str:a"), 0) {
+		t.Fatal("DropCollBlob deleted the string value it refused to own")
+	}
+	// A missing key drops nothing.
+	if s.DropCollBlob([]byte("nope")) {
+		t.Fatal("DropCollBlob reported a missing key removed")
+	}
+	// The collection record drops, and the coll count clears through dropRecord.
+	if n, _ := s.CountCollKind(kindSet); n != 1 {
+		t.Fatalf("CountCollKind(set) = %d, want 1 before drop", n)
+	}
+	if !s.DropCollBlob([]byte("set:a")) {
+		t.Fatal("DropCollBlob did not remove the collection record")
+	}
+	if n, _ := s.CountCollKind(kindSet); n != 0 {
+		t.Fatalf("CountCollKind(set) = %d, want 0 after drop", n)
+	}
+	if _, _, _, ok := s.GetCollBlob([]byte("set:a"), 0); ok {
+		t.Fatal("collection record present after DropCollBlob")
+	}
+	// A second drop of the now-absent key reports false.
+	if s.DropCollBlob([]byte("set:a")) {
+		t.Fatal("DropCollBlob reported a re-drop as removed")
+	}
+}
+
 // PeekCollBlob returns the blob, kind, bits, and deadline without reaping an
 // expired record, so the routing layer can own the ordered expired event, and
 // without stamping the clock. It reads a live record and a past-deadline record

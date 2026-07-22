@@ -80,6 +80,20 @@ const (
 	maxVal = 0xffff
 )
 
+// The exported collection kind bytes a collection type names when it stores and
+// reads a tiny collection through the CollBlob primitives (PutCollBlob,
+// GetCollBlob, CollKind, RangeCollKind, CountCollKind). They mirror the internal
+// kind* discriminants so a type outside this package can pass the kind it owns
+// without the store guessing it, and without that package importing an
+// unexported constant or minting a colliding literal of its own.
+const (
+	KindSet    byte = kindSet
+	KindHash   byte = kindHash
+	KindList   byte = kindList
+	KindZSet   byte = kindZSet
+	KindStream byte = kindStream
+)
+
 func align8(n uint64) uint64 { return (n + 7) &^ 7 }
 
 // keyStart is the key's offset within the record: past the header, and past
