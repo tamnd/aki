@@ -898,6 +898,10 @@ func init() {
 	// [FORCE], keyed on args[0]: release pending entries back to the group as
 	// unowned, immediately-claimable NACKs without acking them.
 	register("XNACK", stream.Xnack, 6, -1, true)
+	// XDELEX key [KEEPREF|DELREF|ACKED] IDS numids id [id ...], keyed on args[0]:
+	// delete entries under a consumer-group reference policy, replying a per-id
+	// status array. Minimum tail is key IDS numids id.
+	register("XDELEX", stream.Xdelex, 4, -1, true)
 
 	// OBJECT routes by the key after its subcommand token (OBJECT ENCODING
 	// key), so it keys on args[1] of the argument tail, not args[0]. Marked
@@ -1007,7 +1011,7 @@ func markWrites() {
 		"ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE",
 		"BZPOPMIN", "BZPOPMAX", "BZMPOP",
 		// Stream.
-		"XADD", "XDEL", "XTRIM", "XSETID", "XGROUP", "XACK", "XNACK",
+		"XADD", "XDEL", "XDELEX", "XTRIM", "XSETID", "XGROUP", "XACK", "XNACK",
 		"XCLAIM", "XAUTOCLAIM", "XREADGROUP",
 		// Geo (a geo set is a sorted set; the STORE and non-RO forms write).
 		"GEOADD", "GEOSEARCHSTORE", "GEORADIUS", "GEORADIUSBYMEMBER",
