@@ -227,6 +227,8 @@ func (s *Server) doClient(c *shard.Conn, cs *connState, args [][]byte) {
 		_ = c.InlineReply(resp.AppendBulk(nil, line))
 	case eqFold(sub, "LIST"):
 		s.doClientList(c, cs, args)
+	case eqFold(sub, "KILL"):
+		s.doClientKill(c, cs, args)
 	default:
 		_ = c.InlineReply(resp.AppendError(nil, "ERR unknown subcommand '"+string(sub)+"'. Try CLIENT HELP."))
 	}
@@ -308,6 +310,190 @@ func (s *Server) doClientList(c *shard.Conn, cs *connState, args [][]byte) {
 		out = append(out, '\n')
 	}
 	_ = c.InlineReply(resp.AppendBulk(nil, out))
+}
+
+// doClientKill answers CLIENT KILL, which drops connections. It has two forms,
+// distinguished the way redis does, by argument count.
+//
+// Old form, CLIENT KILL <addr:port>: kill the one connection at that remote
+// endpoint. It replies +OK if a connection matched or "ERR No such client" if
+// none did.
+//
+// New form, CLIENT KILL <filter> <value> [<filter> <value> ...]: kill every
+// connection matching all the given filters and reply with the count. The
+// filters f3 models honestly are ID (client id), ADDR (remote endpoint), LADDR
+// (local endpoint), MAXAGE (age in seconds at least this large), TYPE, USER, and
+// SKIPME. TYPE normal keeps the connections not in subscribe mode and TYPE
+// pubsub keeps those in it; master, replica, and slave match nothing because f3
+// runs no replication. USER matches only the default user, since f3 is
+// passwordless, so USER default keeps every connection and any other name keeps
+// none. SKIPME yes (the default) spares the calling connection; SKIPME no lets
+// it be killed too.
+//
+// Killing another connection closes its socket through the killConn hook stamped
+// at admission: the target's blocking Read then returns an error and its own
+// read loop tears the connection down. Killing the caller instead sets its quit
+// flag, so the reply flushes before the socket closes (redis's
+// CLOSE_AFTER_REPLY). The live registry is snapshotted under netMu and the
+// closes happen outside it, so a kill never holds the admission lock across a
+// socket close. This runs on the goroutine drivers only, like the other
+// intercepted verbs; the event-loop drivers have no intercept, so CLIENT KILL
+// there falls to the unknown-subcommand error and never reaches a nil killConn.
+func (s *Server) doClientKill(c *shard.Conn, cs *connState, args [][]byte) {
+	if len(args) < 3 {
+		_ = c.InlineReply(resp.AppendError(nil, "ERR wrong number of arguments for 'client|kill' command"))
+		return
+	}
+
+	// Old form: a lone token is the address to kill.
+	if len(args) == 3 {
+		var target *connState
+		want := string(args[2])
+		s.netMu.Lock()
+		for other := range s.netLive {
+			if other.addr == want {
+				target = other
+				break
+			}
+		}
+		s.netMu.Unlock()
+		if target == nil {
+			_ = c.InlineReply(resp.AppendError(nil, "ERR No such client"))
+			return
+		}
+		s.killConn(cs, target)
+		_ = c.InlineReply(resp.AppendStatus(nil, "OK"))
+		return
+	}
+
+	// New form: filter/value pairs.
+	var (
+		haveID    bool
+		wantID    uint64
+		wantAddr  string
+		wantLaddr string
+		wantType  []byte
+		userOnly  bool // a USER filter naming a non-default user matches nothing
+		skipme    = true
+		haveMaxA  bool
+		maxAge    int64
+	)
+	for i := 2; i < len(args); i += 2 {
+		if i+1 >= len(args) {
+			_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
+			return
+		}
+		opt, val := args[i], args[i+1]
+		switch {
+		case eqFold(opt, "ID"):
+			n, err := strconv.ParseUint(string(val), 10, 64)
+			if err != nil {
+				_ = c.InlineReply(resp.AppendError(nil, "ERR client-id should be greater than 0"))
+				return
+			}
+			haveID, wantID = true, n
+		case eqFold(opt, "ADDR"):
+			wantAddr = string(val)
+		case eqFold(opt, "LADDR"):
+			wantLaddr = string(val)
+		case eqFold(opt, "TYPE"):
+			if !eqFold(val, "NORMAL") && !eqFold(val, "MASTER") &&
+				!eqFold(val, "REPLICA") && !eqFold(val, "SLAVE") &&
+				!eqFold(val, "PUBSUB") {
+				_ = c.InlineReply(resp.AppendError(nil, "ERR Unknown client type '"+string(val)+"'"))
+				return
+			}
+			wantType = val
+		case eqFold(opt, "USER"):
+			// f3 is passwordless, so every connection is the default user. Any
+			// other name matches nothing. eqFold folds the value to upper case, so
+			// the word it compares against must be upper case too.
+			userOnly = !eqFold(val, "DEFAULT")
+		case eqFold(opt, "SKIPME"):
+			switch {
+			case eqFold(val, "YES"):
+				skipme = true
+			case eqFold(val, "NO"):
+				skipme = false
+			default:
+				_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
+				return
+			}
+		case eqFold(opt, "MAXAGE"):
+			n, err := strconv.ParseInt(string(val), 10, 64)
+			if err != nil {
+				_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
+				return
+			}
+			haveMaxA, maxAge = true, n
+		default:
+			_ = c.InlineReply(resp.AppendError(nil, "ERR syntax error"))
+			return
+		}
+	}
+
+	now := time.Now().Unix()
+	s.netMu.Lock()
+	var targets []*connState
+	for other := range s.netLive {
+		if haveID && other.id != wantID {
+			continue
+		}
+		if wantAddr != "" && other.addr != wantAddr {
+			continue
+		}
+		if wantLaddr != "" && other.laddr != wantLaddr {
+			continue
+		}
+		if wantType != nil {
+			if eqFold(wantType, "MASTER") || eqFold(wantType, "REPLICA") || eqFold(wantType, "SLAVE") {
+				continue
+			}
+			isPubsub := other.subCount.Load()+other.psubCount.Load()+other.ssubCount.Load() > 0
+			if isPubsub != eqFold(wantType, "PUBSUB") {
+				continue
+			}
+		}
+		if userOnly {
+			continue
+		}
+		if haveMaxA {
+			age := now - other.connUnix
+			if age < 0 {
+				age = 0
+			}
+			if age < maxAge {
+				continue
+			}
+		}
+		if skipme && other == cs {
+			continue
+		}
+		targets = append(targets, other)
+	}
+	s.netMu.Unlock()
+
+	for _, t := range targets {
+		s.killConn(cs, t)
+	}
+	_ = c.InlineReply(resp.AppendInt(nil, int64(len(targets))))
+}
+
+// killConn drops target on behalf of caller. If the target is the calling
+// connection, it defers the close to the quit flag so the KILL reply flushes
+// first (CLOSE_AFTER_REPLY); otherwise it closes the target's socket, which ends
+// the target's blocking Read and lets its own read loop tear the connection
+// down. The killConn hook is nil on the event-loop drivers, but those have no
+// intercept so CLIENT KILL never runs there; the guard keeps a stray nil from
+// panicking regardless.
+func (s *Server) killConn(caller, target *connState) {
+	if target == caller {
+		caller.quit = true
+		return
+	}
+	if target.killConn != nil {
+		_ = target.killConn()
+	}
 }
 
 // clientOnOff handles CLIENT NO-EVICT and NO-TOUCH, which take one ON or OFF
