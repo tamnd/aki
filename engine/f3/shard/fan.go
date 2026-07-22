@@ -134,46 +134,50 @@ func (c *Conn) DoFan(op byte, kind FanKind, keys, vals [][]byte) error {
 		fc.present = make([]bool, len(keys))
 	}
 
-	// Build every sub-command first: one shard at a time, the shard's keys in
-	// argument order, chunked under the per-sub caps. Order within a shard is
-	// argument order, which is what per-shard sub-batches preserve through
-	// the hop. The count must be final before the first enqueue: a partial
+	// Route every key once into the reader's reused scratch, so a repeated
+	// MGET/MSET does not allocate a fresh order slice per command.
+	order := c.fanOrder[:0]
+	for _, k := range keys {
+		order = append(order, c.rt.ShardOf(k))
+	}
+	c.fanOrder = order
+
+	// The sub-command count must be final before the first enqueue: a partial
 	// can come back and merge while the scatter is still publishing, so the
-	// coordinator's countdown is set once here and touched only by the
-	// writer afterwards.
-	order := make([]int, len(keys))
-	for i, k := range keys {
-		order[i] = c.rt.ShardOf(k)
-	}
-	type fanSub struct {
-		sh   int
-		argv [][]byte
-	}
-	var subs []fanSub
-	for sh := 0; sh < shards; sh++ {
-		var argv [][]byte
-		var pos []byte
+	// coordinator's countdown is set once and touched only by the writer
+	// afterwards. Count the sub-commands in a cheap allocation-free pass that
+	// mirrors the chunking below (one shard at a time, argument order, chunked
+	// under the per-sub caps), then set pending before scattering.
+	fc.pending = int32(countFanSubs(keys, vals, order, shards, kind, c.rt.batchDataCap))
+
+	// Scatter: build and enqueue each sub-command out of the reader's reused
+	// argv and pos scratch. enqueueFan's b.add copies every argument's bytes
+	// into the node's span table, so both buffers are safe to reset and reuse
+	// the moment enqueueFan returns.
+	argv := c.fanArgv[:0]
+	pos := c.fanPos[:0]
+	for sh := range shards {
 		kn := 0
 		bytes := 0
-		flushSub := func() {
-			if kn == 0 {
-				return
-			}
-			if kind == FanMGet {
-				argv = append(argv, pos)
-			}
-			subs = append(subs, fanSub{sh: sh, argv: argv})
-			argv = nil
-			pos = nil
-			kn = 0
-			bytes = 0
-		}
 		for i := range keys {
 			if order[i] != sh {
 				continue
 			}
 			if kn > 0 && (kn >= maxFanKeys || bytes > c.rt.batchDataCap) {
-				flushSub()
+				// For an MGET fan the position blob rides as the sub's last
+				// argument; append it in this scope so a growth of the reused
+				// argv backing persists across sub-commands instead of
+				// reallocating every flush. enqueueFan copies the whole argv
+				// out synchronously, so it is reset for the next sub right after.
+				if kind == FanMGet {
+					argv = append(argv, pos)
+				}
+				if err := c.enqueueFan(sh, op, argv, fc); err != nil {
+					c.fanArgv, c.fanPos = argv[:0], pos[:0]
+					return err
+				}
+				argv, pos = argv[:0], pos[:0]
+				kn, bytes = 0, 0
 			}
 			argv = append(argv, keys[i])
 			bytes += len(keys[i])
@@ -187,16 +191,53 @@ func (c *Conn) DoFan(op byte, kind FanKind, keys, vals [][]byte) error {
 			}
 			kn++
 		}
-		flushSub()
-	}
-	fc.pending = int32(len(subs))
-	for _, sub := range subs {
-		if err := c.enqueueFan(sub.sh, op, sub.argv, fc); err != nil {
-			return err
+		if kn > 0 {
+			if kind == FanMGet {
+				argv = append(argv, pos)
+			}
+			if err := c.enqueueFan(sh, op, argv, fc); err != nil {
+				c.fanArgv, c.fanPos = argv[:0], pos[:0]
+				return err
+			}
+			argv, pos = argv[:0], pos[:0]
 		}
 	}
+	c.fanArgv, c.fanPos = argv, pos
 	c.seq++
 	return nil
+}
+
+// countFanSubs returns how many sub-commands DoFan's scatter will produce,
+// replaying the same shard grouping and per-sub cap chunking without building
+// or allocating anything, so the coordinator's pending countdown is final
+// before the first enqueue.
+func countFanSubs(keys, vals [][]byte, order []int, shards int, kind FanKind, dataCap int) int {
+	subs := 0
+	for sh := range shards {
+		kn := 0
+		bytes := 0
+		for i := range keys {
+			if order[i] != sh {
+				continue
+			}
+			if kn > 0 && (kn >= maxFanKeys || bytes > dataCap) {
+				subs++
+				kn, bytes = 0, 0
+			}
+			bytes += len(keys[i])
+			if vals != nil {
+				bytes += len(vals[i])
+			}
+			if kind == FanMGet {
+				bytes += 2
+			}
+			kn++
+		}
+		if kn > 0 {
+			subs++
+		}
+	}
+	return subs
 }
 
 // DoFanAll enqueues one keyless sub-command per shard, the S-way scatter the

@@ -54,6 +54,17 @@ type Conn struct {
 	pending []*hopBatch // one open node per shard, nil when none
 	free    chan *hopBatch
 
+	// Reader-side fan-out scatter scratch, reused across DoFan calls so a
+	// multi-key command (MGET/MSET) does not allocate its routing and
+	// sub-command buffers per command. fanOrder holds each key's owning shard,
+	// fanArgv and fanPos are the per-sub-command argument and MGET position
+	// buffers b.add copies out of on enqueue, so they are safe to reuse the
+	// moment enqueueFan returns. Reader goroutine only, like the rest of this
+	// block.
+	fanOrder []int
+	fanArgv  [][]byte
+	fanPos   []byte
+
 	// silentNext is the reader's CLIENT REPLY suppression flag for the next
 	// command it enqueues: the driver sets it through SetReplySilent before each
 	// dispatch, and enqueue/enqueueFan/InlineReply stamp it onto the command's
