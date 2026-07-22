@@ -266,6 +266,12 @@ type Server struct {
 	// admits a connection, so the id is stamped there. It starts at zero and the
 	// first connection gets 1, matching redis (no connection is id 0).
 	nextConnID atomic.Uint64
+
+	// pauses holds the CLIENT PAUSE deadline and mode (pause.go). The gate in
+	// readLoop consults it before a command reaches the shard, so a server that
+	// was never paused pays one relaxed atomic load per command. Value state, no
+	// init needed; the two atomics start zeroed (not paused, ALL mode).
+	pauses pauseState
 }
 
 // Flushes reports the total writer socket flushes since start, the lab and
@@ -765,6 +771,15 @@ func (s *Server) readLoop(nc net.Conn, c *shard.Conn, cs *connState, boundary fu
 					// because the connection is in subscribe mode.
 					if s.pubsubIntercept(c, cs, args) {
 						continue
+					}
+					// CLIENT PAUSE gate (pause.go): a command bound for a shard is
+					// held here while a pause is in force, on this connection's own
+					// reader goroutine so no shard worker is touched. The gate sits
+					// behind the intercepts above, so CLIENT UNPAUSE (and pub/sub)
+					// stay reachable while an ALL pause holds. A server that was
+					// never paused pays one relaxed atomic load per command.
+					if s.pauses.active() {
+						s.pauses.wait(args[0])
 					}
 					if derr := dispatch.Dispatch(c, args); derr != nil {
 						return

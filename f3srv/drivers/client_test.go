@@ -110,8 +110,8 @@ func TestClientFlagToggles(t *testing.T) {
 // answering a misleading OK.
 func TestClientBadSubcommand(t *testing.T) {
 	_, nc, br := startServer(t)
-	if _, ok := sendCmd(t, br, nc, "CLIENT", "PAUSE", "100").(errorReply); !ok {
-		t.Fatalf("CLIENT PAUSE did not error")
+	if _, ok := sendCmd(t, br, nc, "CLIENT", "NONESUCH").(errorReply); !ok {
+		t.Fatalf("CLIENT NONESUCH did not error")
 	}
 }
 

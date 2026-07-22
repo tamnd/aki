@@ -126,6 +126,13 @@ type entry struct {
 	// carry one key at keyAt.
 	cscRead     bool
 	cscMultiKey bool
+
+	// write marks a verb that can modify the dataset, the classifier CLIENT
+	// PAUSE WRITE needs (IsWrite). f3 otherwise carries no general read/write
+	// flag; this is the curated write set (markWrites), the counterpart to the
+	// curated cacheable reads. A pure read, a keyless admin verb, or a
+	// connection/replication command is absent here and reads false.
+	write bool
 }
 
 // maxVerb bounds the uppercase scratch for verb lookup; no Redis verb comes
@@ -895,6 +902,7 @@ func init() {
 	table["MEMORY"].subFan = memorySubFan
 
 	markCSCReads()
+	markWrites()
 }
 
 // markCSCReads flags the read-only, cacheable commands whose keys client-side
@@ -940,6 +948,76 @@ func markCSCReads() {
 			e.cscMultiKey = true
 		}
 	}
+}
+
+// markWrites flags every verb that can modify the dataset, the classifier
+// CLIENT PAUSE WRITE consults (IsWrite): under a WRITE-mode pause a write is
+// held while a read still flows. It is the curated counterpart to markCSCReads,
+// since f3 keeps no general read/write flag. The set follows redis's write
+// classification: a command that only sets or clears a TTL counts as a write
+// (EXPIRE, GETEX, HEXPIRE), a command that only reports one does not
+// (EXPIRETIME, TTL, HTTL). PFCOUNT stays a read (its cardinality cache is not a
+// dataset change a pause needs to hold) while PFADD/PFMERGE/PFDEBUG write.
+// Keyless admin, connection, and replication verbs are absent and read false;
+// they never reach the pause gate anyway, since it sits behind the network-layer
+// intercepts.
+func markWrites() {
+	writes := []string{
+		// String.
+		"SET", "SETNX", "SETEX", "PSETEX", "SETRANGE", "APPEND", "GETSET", "GETDEL", "GETEX",
+		"INCR", "INCRBY", "INCRBYFLOAT", "DECR", "DECRBY", "MSET", "MSETNX",
+		// Bitmap.
+		"SETBIT", "BITFIELD", "BITOP",
+		// Generic key.
+		"DEL", "UNLINK", "EXPIRE", "EXPIREAT", "PEXPIRE", "PEXPIREAT", "PERSIST",
+		"RENAME", "RENAMENX", "MOVE", "COPY", "RESTORE", "SORT", "FLUSHALL", "FLUSHDB", "SWAPDB",
+		// Hash.
+		"HSET", "HSETNX", "HMSET", "HDEL", "HGETDEL", "HGETEX", "HINCRBY", "HINCRBYFLOAT",
+		"HEXPIRE", "HEXPIREAT", "HPEXPIRE", "HPEXPIREAT", "HPERSIST",
+		// List.
+		"LPUSH", "LPUSHX", "RPUSH", "RPUSHX", "LPOP", "RPOP", "LSET", "LINSERT", "LREM",
+		"LTRIM", "LMOVE", "RPOPLPUSH", "LMPOP",
+		"BLPOP", "BRPOP", "BLMOVE", "BRPOPLPUSH", "BLMPOP",
+		// Set.
+		"SADD", "SREM", "SPOP", "SMOVE", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE",
+		// Sorted set.
+		"ZADD", "ZINCRBY", "ZREM", "ZPOPMIN", "ZPOPMAX", "ZMPOP", "ZRANGESTORE",
+		"ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX",
+		"ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE",
+		"BZPOPMIN", "BZPOPMAX", "BZMPOP",
+		// Stream.
+		"XADD", "XDEL", "XTRIM", "XSETID", "XGROUP", "XACK", "XNACK",
+		"XCLAIM", "XAUTOCLAIM", "XREADGROUP",
+		// Geo (a geo set is a sorted set; the STORE and non-RO forms write).
+		"GEOADD", "GEOSEARCHSTORE", "GEORADIUS", "GEORADIUSBYMEMBER",
+		// HyperLogLog.
+		"PFADD", "PFMERGE", "PFDEBUG",
+	}
+	for _, name := range writes {
+		if e := table[name]; e != nil {
+			e.write = true
+		}
+	}
+}
+
+// IsWrite reports whether a verb can modify the dataset, for CLIENT PAUSE WRITE
+// (see markWrites). It uppercases the verb the same way Dispatch does and reads
+// the curated flag; an unknown or overlong verb reads false, so a WRITE-mode
+// pause never holds a command it cannot classify.
+func IsWrite(verb []byte) bool {
+	if len(verb) == 0 || len(verb) > maxVerb {
+		return false
+	}
+	var vb [maxVerb]byte
+	for i := 0; i < len(verb); i++ {
+		ch := verb[i]
+		if ch >= 'a' && ch <= 'z' {
+			ch -= 32
+		}
+		vb[i] = ch
+	}
+	e := table[string(vb[:len(verb)])]
+	return e != nil && e.write
 }
 
 // ReadKeys returns the keys a read-only, cacheable command touched, for
