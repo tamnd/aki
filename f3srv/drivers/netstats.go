@@ -93,8 +93,21 @@ type connState struct {
 
 	// quit is set when the connection ran QUIT: its +OK is queued, and the read
 	// loop returns after the boundary flush so the acknowledgement lands before
-	// the socket closes. Reader-owned like the fields above.
+	// the socket closes. Reader-owned like the fields above. CLIENT KILL of the
+	// calling connection sets it too, so a self-kill closes only after its reply
+	// flushes, redis's CLOSE_AFTER_REPLY contract.
 	quit bool
+
+	// killConn closes this connection's underlying socket, the mechanism CLIENT
+	// KILL uses to drop another connection: closing the socket makes the target's
+	// blocking Read return an error, so its read loop returns and tears the
+	// connection down on its own goroutine. Only the goroutine drivers set it
+	// (from the accepted net.Conn at admission); the event-loop drivers leave it
+	// nil, matching their no-intercept gap, so CLIENT KILL there never reaches a
+	// nil hook. net.Conn.Close is safe to call from another goroutine and is
+	// idempotent, so a kill racing the owner's own teardown is harmless. Set once
+	// at admission, immutable after, so a cross-connection reader needs no lock.
+	killConn func() error
 
 	// monitoring is set when the connection ran MONITOR: it has joined the
 	// monitor set (monitor.go) and its own commands are excluded from the feed,

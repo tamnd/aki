@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // dial opens a second connection to an already-running test server, so a test
@@ -111,6 +112,89 @@ func TestClientBadSubcommand(t *testing.T) {
 	_, nc, br := startServer(t)
 	if _, ok := sendCmd(t, br, nc, "CLIENT", "PAUSE", "100").(errorReply); !ok {
 		t.Fatalf("CLIENT PAUSE did not error")
+	}
+}
+
+// killClosed reports that reading from a connection the server killed reaches
+// end of stream: it sets a short deadline so a failing test never hangs, then
+// expects a read error (a clean FIN surfaces as EOF, an abrupt close as a reset;
+// either proves the socket is down).
+func killClosed(t *testing.T, nc net.Conn, br *bufio.Reader) {
+	t.Helper()
+	_ = nc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := br.ReadByte(); err == nil {
+		t.Fatalf("read after CLIENT KILL succeeded, want the connection closed")
+	}
+}
+
+// TestClientKillByID checks the new form kills the named connection: the count
+// reply is 1 and the target's socket is closed.
+func TestClientKillByID(t *testing.T) {
+	s, nc, br := startServer(t)
+	nc2, br2 := dial(t, s)
+	id2, _ := sendCmd(t, br2, nc2, "CLIENT", "ID").(int64)
+
+	if n, ok := sendCmd(t, br, nc, "CLIENT", "KILL", "ID", strconv.FormatInt(id2, 10)).(int64); !ok || n != 1 {
+		t.Fatalf("CLIENT KILL ID %d = %v, want 1", id2, n)
+	}
+	killClosed(t, nc2, br2)
+}
+
+// TestClientKillByAddr checks the old form, CLIENT KILL <addr>, kills the
+// connection at that endpoint and answers +OK. The address is read from the
+// target's own CLIENT INFO so it matches exactly what the server stored.
+func TestClientKillByAddr(t *testing.T) {
+	s, nc, br := startServer(t)
+	nc2, br2 := dial(t, s)
+	addr := clientInfoFields(t, sendCmd(t, br2, nc2, "CLIENT", "INFO"))["addr"]
+
+	if got := sendCmd(t, br, nc, "CLIENT", "KILL", addr); got != "OK" {
+		t.Fatalf("CLIENT KILL %s = %v, want OK", addr, got)
+	}
+	killClosed(t, nc2, br2)
+}
+
+// TestClientKillNoSuchClient checks the old form errors when no connection has
+// the given address, rather than answering a misleading count.
+func TestClientKillNoSuchClient(t *testing.T) {
+	_, nc, br := startServer(t)
+	if _, ok := sendCmd(t, br, nc, "CLIENT", "KILL", "203.0.113.9:1").(errorReply); !ok {
+		t.Fatalf("CLIENT KILL of an absent address did not error")
+	}
+}
+
+// TestClientKillSkipme checks SKIPME: by default the caller is spared, so
+// killing TYPE normal drops the other connection but leaves the caller able to
+// run another command; SKIPME no lets the caller kill itself, and the count
+// reply flushes before its socket closes.
+func TestClientKillSkipme(t *testing.T) {
+	s, nc, br := startServer(t)
+	nc2, br2 := dial(t, s)
+	_, _ = sendCmd(t, br2, nc2, "CLIENT", "ID").(int64)
+
+	// Default SKIPME yes: the other normal connection dies, the caller survives.
+	if n, ok := sendCmd(t, br, nc, "CLIENT", "KILL", "TYPE", "normal").(int64); !ok || n != 1 {
+		t.Fatalf("CLIENT KILL TYPE normal = %v, want 1 (the other connection)", n)
+	}
+	killClosed(t, nc2, br2)
+	if _, ok := sendCmd(t, br, nc, "CLIENT", "ID").(int64); !ok {
+		t.Fatalf("caller was killed despite default SKIPME yes")
+	}
+
+	// SKIPME no: the caller kills itself; the :1 lands, then the socket closes.
+	id, _ := sendCmd(t, br, nc, "CLIENT", "ID").(int64)
+	if n, ok := sendCmd(t, br, nc, "CLIENT", "KILL", "ID", strconv.FormatInt(id, 10), "SKIPME", "no").(int64); !ok || n != 1 {
+		t.Fatalf("CLIENT KILL self SKIPME no = %v, want 1", n)
+	}
+	killClosed(t, nc, br)
+}
+
+// TestClientKillNoMatch checks a filter that matches nothing answers :0 rather
+// than erroring.
+func TestClientKillNoMatch(t *testing.T) {
+	_, nc, br := startServer(t)
+	if n, ok := sendCmd(t, br, nc, "CLIENT", "KILL", "ID", "999999").(int64); !ok || n != 0 {
+		t.Fatalf("CLIENT KILL of an unmatched id = %v, want 0", n)
 	}
 }
 
