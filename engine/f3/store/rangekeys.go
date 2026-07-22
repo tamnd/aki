@@ -69,6 +69,11 @@ func (s *Store) VolatileKeys() uint64 {
 				if w == 0 || slotCold(w) {
 					continue
 				}
+				// An inline collection's TTL is that type's expires figure, counted by
+				// CountCollKind's withTTL, so the string-store total skips it.
+				if isCollKind(s.arena.buf[(w&addrMask)+offKind]) {
+					continue
+				}
 				if s.expireAt(w&addrMask) != 0 {
 					n++
 				}
@@ -106,6 +111,12 @@ func (s *Store) rangeBucket(b *bucket, now int64, fn func(key []byte) bool) bool
 			key = k
 		} else {
 			addr := w & addrMask
+			// An inline collection record is another type's key, walked by that
+			// type's RangeCollKind, so the string-store walk skips it: KEYS and SCAN
+			// with no TYPE union the arms rather than double-listing a coll key here.
+			if isCollKind(s.arena.buf[addr+offKind]) {
+				continue
+			}
 			if now != 0 {
 				if at := s.expireAt(addr); at != 0 && at <= now {
 					continue
