@@ -231,6 +231,10 @@ func (s *Server) doClient(c *shard.Conn, cs *connState, args [][]byte) {
 		s.doClientKill(c, cs, args)
 	case eqFold(sub, "REPLY"):
 		s.doClientReply(c, cs, args)
+	case eqFold(sub, "PAUSE"):
+		s.doClientPause(c, args)
+	case eqFold(sub, "UNPAUSE"):
+		s.doClientUnpause(c, args)
 	default:
 		_ = c.InlineReply(resp.AppendError(nil, "ERR unknown subcommand '"+string(sub)+"'. Try CLIENT HELP."))
 	}
