@@ -260,6 +260,7 @@ func (c *Conn) enqueueFan(sh int, op byte, argv [][]byte, fc *fanCmd) error {
 			return ErrTooBig
 		}
 	}
+	b.cmds[b.n-1].silent = c.silentNext
 	b.setFan(int(b.n)-1, fc)
 	return nil
 }
