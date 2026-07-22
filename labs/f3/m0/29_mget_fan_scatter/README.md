@@ -59,9 +59,32 @@ much of MGET's 1.93x -> 2x gap the removed GC pressure buys. This lab proves the
 mechanism (zero-alloc, byte-identical scatter); the throughput verdict is the
 GamingPC M0-G10 run.
 
+## Box gate (GamingPC, reactor vs CF16-frozen rivals, dual gen, median of 3)
+
+MSET is redis-benchmark's builtin 10-key test; MGET is a 16-key custom command
+(`key:__rand_int__` x16) over a primed 1M keyspace. N=3M per generator, c256 P16.
+
+| row  | reactor | vs redis 8.8 | vs valkey 9.1 | gate (min) |
+|------|--------:|-------------:|--------------:|-----------:|
+| MSET |  958160 |        2.24x |         1.84x |      1.84x |
+| MGET |  665520 |        1.42x |         1.17x |      1.17x |
+
 ## Verdict
 
-Frozen after the box gate lands. The elision is unconditionally correct (proven
-byte-identical) and strictly reduces per-command allocation and CPU on every
-MGET/MSET, so it ships regardless of the exact box delta; the row checkbox flips
-only if the box shows >= 2x.
+The elision is unconditionally correct (proven byte-identical) and strictly
+reduces per-command allocation and CPU on every MGET/MSET, so it ships. On the
+box it clears 2x against redis on MSET (2.24x) but not against valkey (1.84x),
+and MGET stays coordination-bound (1.17x vs valkey).
+
+The residual is not allocation, it is fan-out coordination: a 16-key command
+scattered across a 1M keyspace touches on the order of eight shards, so one
+client command becomes ~eight internal hops (enqueue + wake + partial + gather +
+reorder), while the single-threaded rival amortizes one parse over sixteen dict
+lookups in-thread. Removing the per-command allocations does not remove the hops.
+
+Two named levers remain, neither a physics wall:
+- MSET is one step from the valkey bar (needs ~+9% on reactor). The FanOK reply
+  gather and per-shard enqueue are the next surfaces.
+- MGET wants co-located reads (reader reads owner shards without a hop, guarded
+  for the single-writer invariant) or hop-batching of many clients' sub-commands
+  to the same shard. That is a shard-dispatch arc, tracked separately.
