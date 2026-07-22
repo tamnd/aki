@@ -205,6 +205,13 @@ func (s *Store) dropValue(addr uint64) {
 // dropRecord is the one exit for a record leaving the index: band accounting,
 // outside value bytes, then the record's own arena charge.
 func (s *Store) dropRecord(addr uint64) {
+	// A leaving inline collection record leaves the coll subset too, the matching
+	// decrement for publish's increment. It is the single record exit (supersede,
+	// delete, lazy and active expiry, eviction all route here), so the count stays
+	// exact without a decrement at each of those call sites.
+	if isCollKind(s.arena.buf[addr+offKind]) {
+		s.collCount--
+	}
 	s.noteDrop(s.recFlags(addr))
 	s.dropValue(addr)
 	s.arena.unlink(addr, s.recBytes(addr))

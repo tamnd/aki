@@ -68,6 +68,14 @@ func (s *Store) PutCollBlob(key []byte, kind byte, bits uint16, blob []byte, at,
 		if f&(flagSep|flagChunked) == 0 && uint64(len(blob)) <= s.vcapBytes(addr) && (at == 0 || hasSlot) {
 			nf := f &^ (flagInt | flagRawSticky)
 			vs := s.valueStart(addr)
+			// The in-place path rewrites the record without touching the index, so it
+			// bypasses publish and dropRecord and owns its own coll accounting. A
+			// string record flipped to a collection joins the coll subset; a
+			// collection rewritten in place is already counted. kind is always a coll
+			// kind here, so no leave case exists.
+			if !isCollKind(s.arena.buf[addr+offKind]) {
+				s.collCount++
+			}
 			copy(s.arena.buf[vs:vs+uint64(len(blob))], blob)
 			s.arena.buf[addr+offKind] = kind
 			binary.LittleEndian.PutUint16(s.arena.buf[addr+offKindBits:], bits)

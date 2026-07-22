@@ -28,6 +28,18 @@ type Store struct {
 	idx   index
 	count int64
 
+	// collCount is how many of count's records are inline collection records (an
+	// arena-homed tiny set, hash, list, zset, or stream), not strings. The store
+	// is the string type's index, so Len and the KEYS/SCAN/DBSIZE walks report the
+	// string keyspace alone: each collection type owns its own count and iteration,
+	// and adds its keys back through CountCollKind and RangeCollKind so a unified
+	// keyspace is counted once. count stays the true record total the arena and the
+	// bands census carry; collCount is the coll subset subtracted at the string
+	// surface. It moves only where count does: up in publish when the published
+	// record is a coll kind, down in dropRecord when the dropped record was one, and
+	// up in PutCollBlob's in-place path when a string record is flipped to a coll.
+	collCount int64
+
 	// expiredSink is the keyspace-notification hook the shard wires so a lazily or
 	// actively reaped string key publishes the expired event. The store sits below
 	// shard's Ctx and cannot format the notification itself, so it calls this plain
@@ -352,8 +364,12 @@ func (s *Store) Close() error {
 	return err
 }
 
-// Len reports the number of live keys.
-func (s *Store) Len() int { return int(s.count) }
+// Len reports the number of live string keys, the store's own type surface. It
+// subtracts the inline collection records the arena also homes: those belong to
+// the set, hash, list, zset, and stream types, each of which counts and iterates
+// its own keys and adds them back through CountCollKind, so DBSIZE and the KEYS
+// walk count a unified-keyspace key exactly once.
+func (s *Store) Len() int { return int(s.count - s.collCount) }
 
 // Splits reports how many index segment splits have run, a ledger figure the
 // growth tests and INFO read.
@@ -430,6 +446,7 @@ func (s *Store) Reset() {
 	s.idx = newIndex()
 	s.arena.reset()
 	s.count = 0
+	s.collCount = 0
 	s.bands = [4]uint64{}
 	s.logRuns = 0
 	s.spillLedger = s.spillLedger[:0]

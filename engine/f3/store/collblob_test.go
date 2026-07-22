@@ -46,10 +46,9 @@ func TestCollBlobRoundTrip(t *testing.T) {
 		t.Fatalf("CollKind = (%#x, %v), want (%#x, true)", k, ok, kindSet)
 	}
 	// CollKind is the discriminant the routing slice gates string reads on: a
-	// plain string key reads as not-a-collection. The string read path itself
-	// is not rewired in this inert slice, so GetString still returns the raw
-	// embedded bytes; the dual-home WRONGTYPE handling lands with per-type
-	// routing.
+	// plain string key reads as not-a-collection. GetString is now string-arm-only
+	// (the string-arm seam), so a collection key reads as absent to it; the
+	// per-type WRONGTYPE reply is the routing slice's, layered over that absence.
 	if err := s.SetString([]byte("str:1"), []byte("plain"), 100, 0, false); err != nil {
 		t.Fatalf("SetString: %v", err)
 	}
@@ -83,8 +82,13 @@ func TestCollBlobRewrite(t *testing.T) {
 	if !ok || bits != 3 || !bytes.Equal(got, big) {
 		t.Fatalf("after republish: (%q, %d, %v)", got, bits, ok)
 	}
-	if s.Len() != 1 {
-		t.Fatalf("Len = %d, want 1 (one key across rewrites)", s.Len())
+	// Len is the string keyspace, which a collection key is not part of; the one
+	// hash key across the rewrites shows through the hash arm's CountCollKind.
+	if s.Len() != 0 {
+		t.Fatalf("Len = %d, want 0 (a collection key is not a string key)", s.Len())
+	}
+	if n, _ := s.CountCollKind(kindHash); n != 1 {
+		t.Fatalf("CountCollKind(hash) = %d, want 1 (one key across rewrites)", n)
 	}
 }
 

@@ -257,6 +257,14 @@ func (s *Store) allocString(key []byte, vcapB uint64, flags byte, at, now int64)
 func (s *Store) publish(h uint64, slot *uint64, oldAddr, off uint64) {
 	word := tagOf(h)<<tagShift | off
 	s.noteNew(s.recFlags(off))
+	// The published record joins the coll subset when it is an inline collection,
+	// on both the supersede and the insert branch: a coll replacing a coll keeps
+	// collCount level because dropRecord decrements the superseded one, and a coll
+	// replacing a string raises it by one. dropRecord owns the matching decrement
+	// for whatever leaves, so the two stay balanced across every record swap.
+	if isCollKind(s.arena.buf[off+offKind]) {
+		s.collCount++
+	}
 	if oldAddr != 0 {
 		*slot = word
 		s.dropRecord(oldAddr)
@@ -284,6 +292,11 @@ func (s *Store) GetString(key []byte, now int64, dst []byte) ([]byte, bool) {
 			return s.readValue(*slot&addrMask, dst)
 		}
 		return s.coldRead(addr, dst)
+	}
+	if isCollKind(s.arena.buf[addr+offKind]) {
+		// The key holds an inline collection, not a string: absent for a string
+		// read, the same answer a wrong-type GET gives before it reaches the value.
+		return dst[:0], false
 	}
 	s.touchSlot(slot)
 	return s.readValue(addr, dst)
@@ -411,6 +424,9 @@ func (s *Store) StrLen(key []byte, now int64) (int64, bool) {
 	if slotCold(*slot) {
 		return int64(s.coldVlen(addr)), true
 	}
+	if isCollKind(s.arena.buf[addr+offKind]) {
+		return 0, false
+	}
 	s.touchSlot(slot)
 	return int64(s.vlen(addr)), true
 }
@@ -527,7 +543,13 @@ func (s *Store) SetString(key, val []byte, now, expireAt int64, keepTTL bool) er
 			s.stampClock(addr, now)
 			return s.logRecord(addr)
 		}
-		if f&(flagSep|flagChunked) == 0 && need <= s.vcapBytes(addr) && (at == 0 || hasSlot) {
+		if f&(flagSep|flagChunked) == 0 && need <= s.vcapBytes(addr) && (at == 0 || hasSlot) &&
+			!isCollKind(s.arena.buf[addr+offKind]) {
+			// A collection record shares the embedded shape a string in-place rewrite
+			// wants, but flipping it in place would leave the coll kind byte and the
+			// coll count stale. A string over a collection republishes instead: the
+			// fresh record allocString stamps kindString, and publish drops the old
+			// record through dropRecord, which clears its coll-count charge.
 			vs := s.valueStart(addr)
 			nf := f &^ (flagInt | flagRawSticky)
 			if isInt {
