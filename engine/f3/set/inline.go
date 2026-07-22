@@ -27,6 +27,17 @@ package set
 // of the encoding masks rather than assuming the high bits are zero.
 const inlineEncMask uint16 = 0x0001
 
+// inlineClockMask is the width of the idle clock an inline set rides in the
+// fifteen bits above the encoding bit. A tiny set spends no header bytes on the
+// per-key access clock the string cell keeps (store.lruClock, a full sixteen
+// bits): the encoding bit claims bit 0, so the clock keeps the remaining
+// fifteen. At one-second resolution fifteen bits wrap every 32768s (~9.1h)
+// rather than the string clock's ~18.2h, the fidelity price of not spending a
+// record byte the memory bar holds against rivals. A set idle longer than the
+// wrap reports a smaller wrapped idle, the same seam OBJECT IDLETIME already
+// documents for the string clock.
+const inlineClockMask uint16 = 0x7fff
+
 // inlineEligible reports whether s is in a class the arena embeds inline: the
 // intset and listpack bands, the two blob-backed shapes. A set that has
 // escalated to the native table or the partitioned band (set.go) is no longer
@@ -49,6 +60,50 @@ func inlineBits(s *set) uint16 {
 // clock). It answers encIntset or encListpack, the only two the low bit spans.
 func encFromBits(bits uint16) encoding {
 	return encoding(bits & inlineEncMask)
+}
+
+// inlineClock derives the fifteen-bit access clock an inline set stamps, the
+// same second-resolution wall clock the string cell folds (store.LRUClock) but
+// masked to the fifteen bits the encoding bit leaves free. It rides the now the
+// command layer already threads (cx.NowMs), so a stamp costs no time call.
+func inlineClock(nowMs int64) uint16 {
+	return uint16(nowMs/1000) & inlineClockMask
+}
+
+// packBits composes the bits word an inline set commits to its record: the
+// encoding in the low bit, the fifteen-bit access clock above it. The caller
+// supplies the clock (inlineClock, or the fresh stamp a touch just took), so a
+// write that must re-stamp the clock and a load that must preserve it share one
+// packer. The caller owns inline eligibility; a non-inline encoding would not
+// round-trip.
+func packBits(s *set, clock uint16) uint16 {
+	return inlineBits(s) | (clock&inlineClockMask)<<1
+}
+
+// withClock replaces the clock in an existing bits word without disturbing the
+// encoding bit, the read-touch stamp the routing slice applies in place through
+// store.SetCollBits: a read is an access, so it re-stamps the clock, but it
+// reads the encoding out of the record rather than a materialized set, so it
+// masks the old clock off and ORs the fresh one in.
+func withClock(bits uint16, clock uint16) uint16 {
+	return (bits & inlineEncMask) | (clock&inlineClockMask)<<1
+}
+
+// clockFromBits recovers the fifteen-bit access clock an inline set stamped,
+// dropping the encoding bit below it. It is the stamp OBJECT IDLETIME reads back
+// through inlineIdleSeconds without materializing the set.
+func clockFromBits(bits uint16) uint16 {
+	return bits >> 1
+}
+
+// inlineIdleSeconds is the OBJECT IDLETIME arithmetic for an inline set, read
+// straight from its record bits word: seconds between now and the stamp, folded
+// through the fifteen-bit wrap the clock lives in. It matches
+// store.IdleSecondsFrom but over the narrower inline clock, so an inline set and
+// a string answer OBJECT IDLETIME on the same second scale, only on different
+// wrap horizons.
+func inlineIdleSeconds(bits uint16, nowMs int64) int64 {
+	return int64((inlineClock(nowMs) - clockFromBits(bits)) & inlineClockMask)
 }
 
 // loadInline reconstructs the set at dst from an arena record's carriers: the

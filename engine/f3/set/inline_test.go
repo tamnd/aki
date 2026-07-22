@@ -111,6 +111,58 @@ func TestCountListpackEntries(t *testing.T) {
 	}
 }
 
+// packBits carries both the encoding and the clock, and the two recover
+// independently: the encoding through encFromBits, the clock through
+// clockFromBits, across both bands and a clock that fills all fifteen bits.
+func TestPackBitsRoundTrip(t *testing.T) {
+	for _, src := range []*set{buildSet([]string{"1", "2", "3"}), buildSet([]string{"a", "b"})} {
+		for _, clock := range []uint16{0, 1, 0x1234, inlineClockMask} {
+			bits := packBits(src, clock)
+			if got := encFromBits(bits); got != src.enc {
+				t.Fatalf("encFromBits(packBits) = %v, want %v", got, src.enc)
+			}
+			if got := clockFromBits(bits); got != clock {
+				t.Fatalf("clockFromBits(packBits(clock=%#x)) = %#x", clock, got)
+			}
+		}
+	}
+}
+
+// withClock replaces the clock in a bits word and leaves the encoding bit
+// untouched, the in-place read-touch stamp.
+func TestWithClockPreservesEncoding(t *testing.T) {
+	for _, enc := range []encoding{encIntset, encListpack} {
+		bits := uint16(enc)&inlineEncMask | (0x0111 << 1)
+		got := withClock(bits, 0x7abc)
+		if encFromBits(got) != enc {
+			t.Fatalf("withClock dropped encoding %v", enc)
+		}
+		if clockFromBits(got) != 0x7abc&inlineClockMask {
+			t.Fatalf("withClock clock = %#x, want %#x", clockFromBits(got), 0x7abc&inlineClockMask)
+		}
+	}
+}
+
+// inlineIdleSeconds reads the seconds since the stamped clock straight from the
+// bits word, and folds through the fifteen-bit wrap for a stamp older than the
+// horizon.
+func TestInlineIdleSeconds(t *testing.T) {
+	base := int64(1_000_000_000_000) // a wall time in ms
+	stamp := inlineClock(base)
+	bits := (stamp & inlineClockMask) << 1 // clock only, encoding bit 0
+	if got := inlineIdleSeconds(bits, base); got != 0 {
+		t.Fatalf("idle at stamp time = %d, want 0", got)
+	}
+	if got := inlineIdleSeconds(bits, base+42_000); got != 42 {
+		t.Fatalf("idle after 42s = %d, want 42", got)
+	}
+	// A gap past the fifteen-bit wrap (~32768s) reports the wrapped remainder,
+	// the documented fidelity seam.
+	if got := inlineIdleSeconds(bits, base+int64(inlineClockMask+10)*1000); got != 9 {
+		t.Fatalf("idle past wrap = %d, want 9 (wrapped)", got)
+	}
+}
+
 // An escalated set (native table, past the listpack cap) is not inline
 // eligible: it is no longer a single packed blob.
 func TestInlineEligibleExcludesEscalated(t *testing.T) {
