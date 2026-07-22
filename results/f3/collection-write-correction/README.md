@@ -39,6 +39,24 @@ is a map entry plus a separately allocated struct plus the copied key, where a r
 pays one contiguous dict entry). Close path is the keyspace-unification arena-embed arc, the
 same lever that closes M1/M2/M4/M5 tiny-collection memory.
 
+## Mutate/pop rows (same under-load correction)
+
+The rows recorded as "genuine write-path deficits" in the earlier artifact-rows triage
+(SREM 0.85x, LPOP 0.97x, RPOPLPUSH artifact) were also under-load artifacts. At c512 P16
+warm-5s, 2M distinct keys:
+
+| workload | aki ops/s | redis ops/s | vs redis | vs valkey | gate |
+|----------|-----------|-------------|----------|-----------|------|
+| SREM      | 7,737,271  | 1,886,666 | 4.10x | 4.18x | PASS |
+| LPOP      | 10,074,957 | 2,067,879 | 4.87x | 5.19x | PASS |
+| RPOPLPUSH | 9,168,841  | 1,717,778 | 5.34x | 6.09x | PASS |
+| SPOP      | 2,214,247  | 1,110,860 | 1.92x (median of 1.88/1.96/1.88) | 3.09x | near-miss |
+
+SPOP is the one genuine remaining collection-mutate near-miss: aki holds 2.21M against its
+own 7.74M SREM on the identical 1-member sets, so the random-member-selection path carries a
+real ~3.5x per-op cost (RNG plus member pick over the set representation), not a harness
+artifact. Clears valkey 3.09x, sits at 1.92x redis. Named lever: cut the SPOP selection cost.
+
 ## Reproduce
 
 `/tmp/abx/mpoint.sh` (point-write 2M-key) and `/tmp/abx/mbest.sh` (bulk card-100k) on the box.
