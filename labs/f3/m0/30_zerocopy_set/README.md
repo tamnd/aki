@@ -63,3 +63,33 @@ lab IS the earned verdict for G5: the second copy is the reader/worker decouple
 that buys the 2.71x small-value headline, its removal is size-gated and marginal
 at 1 KiB and fights the memory bar, so the 1.83x sits on the copy-vs-decouple
 tradeoff, not a free optimization.
+
+## Box A/B (GamingPC, reactor, 8 shards, 50 conns, pipe 16, 8s) — settles it
+
+The size-gated engine change was built (`RBuf` borrow machinery in
+`engine/f3/shard/batch.go`, the reactor read-buffer handoff in
+`f3srv/drivers/reactor_linux.go`, armed by `-net-borrow-min`) and run
+aki-vs-aki, borrow off (`min=0`) against armed (`min=512`), same loadgen:
+
+| value  | off ops/s | armed ops/s | Δ thpt      | off VmHWM | armed VmHWM | Δ mem  |
+|--------|----------:|------------:|------------:|----------:|------------:|-------:|
+| 1 KiB  | 1,637,157 | 1,647,408   | +0.6% noise | 78.8 MB   | 94.8 MB     | +20%   |
+| 64 B   | 1,722,165 | 1,718,077   | -0.2% noise | 29.4 MB   | 28.9 MB     | ~0     |
+
+Both gate conditions fail. The 1 KiB lift is +0.6% (inside run-to-run noise),
+nowhere near the +9% the microbench's copy saving predicted, and peak memory
+regresses +20% (+16 MB) from the in-flight buffers the handoff pins. The
+prediction over-counted because the microbench isolated the copy; in the live
+reactor at pipeline depth 16 the per-op cost is dominated by the read syscall,
+dispatch, and the surviving net→arena copy, so eliding copy 1 of 2 moves the
+headline within noise while the pinned-buffer pool pushes the wrong way on the
+memory bar that already sits at 1.19x valkey peak.
+
+Verdict for G5, earned end to end: the SET second copy is the reader/worker
+decouple that buys the small-value headline; removing it is size-gated, marginal
+even where it applies, and costs peak memory, so 1 KiB SET at 1.83x is the
+copy-vs-decouple tradeoff at production pipeline depth, not a free win. The
+borrow machinery stays reverted from the engine (it shipped nothing to `main`);
+this lab is the record of why. A future zero-syscall driver (io_uring registered
+buffers) where the read copy itself disappears is the only regime that could
+revisit it, and it would elide both copies, not one.
