@@ -67,6 +67,9 @@ func (s *Server) connIntercept(c *shard.Conn, cs *connState, args [][]byte) bool
 	case eqFold(args[0], "MONITOR"):
 		s.doMonitor(c, cs, args)
 		return true
+	case eqFold(args[0], "SHUTDOWN"):
+		s.doShutdown(c, args)
+		return true
 	case eqFold(args[0], "DEBUG") && len(args) >= 2 && eqFold(args[1], "SLEEP"):
 		s.doDebugSleep(c, args)
 		return true

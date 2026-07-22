@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -272,6 +273,12 @@ type Server struct {
 	// was never paused pays one relaxed atomic load per command. Value state, no
 	// init needed; the two atomics start zeroed (not paused, ALL mode).
 	pauses pauseState
+
+	// exitFn terminates the process for a successful SHUTDOWN (shutdown.go). It
+	// is os.Exit in production; a test swaps in a recorder so the exit path runs
+	// without killing the test binary. Set once at construction, read on a
+	// connection's reader goroutine.
+	exitFn func(int)
 }
 
 // Flushes reports the total writer socket flushes since start, the lab and
@@ -355,6 +362,7 @@ func Listen(o Options) (*Server, error) {
 		pubsub:     newPubsubRegistry(),
 		monitors:   newMonitorRegistry(),
 		tracking:   newTrackingRegistry(),
+		exitFn:     os.Exit,
 	}
 	switch o.NetDriver {
 	case NetReactor:
