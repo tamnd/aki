@@ -141,3 +141,144 @@ func (s *Store) CollKind(key []byte, now int64) (byte, bool) {
 	}
 	return k, true
 }
+
+// PeekCollBlob returns the packed blob, kind, per-collection bits, and deadline
+// for key's inline collection record without reaping an expired one and without
+// stamping the access clock: the NOTOUCH, no-reap resolve the routing layer's
+// probe path needs. GetCollBlob reaps a past-deadline record silently inside the
+// index touch, which would rob the collection type of the chance to publish its
+// own ordered expired keyspace event; this returns the deadline instead and
+// leaves the record in place, so the caller decides expiry, fires the event, and
+// deletes (store.Delete, which skips the reap at now==0). A key holding a string
+// or a cold record reads as absent, the same answer a wrong-type read gives. The
+// blob is a view into the arena, valid until the next write that could republish
+// the record.
+func (s *Store) PeekCollBlob(key []byte) (blob []byte, kind byte, bits uint16, at int64, ok bool) {
+	slot, addr, _ := s.findEntry(Hash(key), key)
+	if addr == 0 || slotCold(*slot) {
+		return nil, 0, 0, 0, false
+	}
+	k := s.arena.buf[addr+offKind]
+	if !isCollKind(k) {
+		return nil, 0, 0, 0, false
+	}
+	vs := s.valueStart(addr)
+	blob = s.arena.buf[vs : vs+s.vlen(addr)]
+	bits = binary.LittleEndian.Uint16(s.arena.buf[addr+offKindBits:])
+	at = s.expireAt(addr)
+	return blob, k, bits, at, true
+}
+
+// SetCollBits overwrites the per-collection bits word of key's inline collection
+// record in place, without rewriting the blob or moving the record, and reports
+// whether an inline collection record was there to write. It is the read-touch
+// clock stamp mechanism: a collection's idle clock rides the high bits of this
+// word (the low bit is the encoding discriminant), so a read that must stamp the
+// clock reads the record, composes the new bits, and writes them back here with
+// no value copy and no reallocation, the same two-byte header poke stampClock
+// makes for a string. The caller supplies the whole word; the collection type
+// owns the bit layout. A string or cold record, or a missing key, writes nothing
+// and reports false. It does not reap an expired record, so a stamp on a
+// past-deadline record is a harmless no-op the caller has already ruled out.
+func (s *Store) SetCollBits(key []byte, bits uint16) bool {
+	slot, addr, _ := s.findEntry(Hash(key), key)
+	if addr == 0 || slotCold(*slot) {
+		return false
+	}
+	if !isCollKind(s.arena.buf[addr+offKind]) {
+		return false
+	}
+	binary.LittleEndian.PutUint16(s.arena.buf[addr+offKindBits:], bits)
+	return true
+}
+
+// RangeCollKind calls fn with every live key holding an inline collection record
+// of the given kind, the per-type arm of the unified KEYS and SCAN walk once a
+// collection lives in the arena rather than a Go-heap registry. It walks the
+// index directly the way RangeKeys does, skipping empty and cold slots and any
+// record of another kind, and skips a record whose deadline has passed when now
+// is non-zero, matching the lazy-expiry rule every read follows. It mutates
+// nothing: no visited bit, no reap, so it is perf-neutral and leaves the
+// residency clock untouched. fn returns false to stop the walk early. The key
+// slice fn receives aliases the arena and is valid only for that call.
+func (s *Store) RangeCollKind(kind byte, now int64, fn func(key []byte) bool) {
+	for _, seg := range s.idx.segs {
+		if seg == nil {
+			continue
+		}
+		for i := range seg.buckets {
+			if !s.rangeCollBucket(&seg.buckets[i], kind, now, fn) {
+				return
+			}
+		}
+		for i := range seg.overflow {
+			if !s.rangeCollBucket(&seg.overflow[i], kind, now, fn) {
+				return
+			}
+		}
+	}
+}
+
+// rangeCollBucket hands fn every live key in one bucket whose record is an inline
+// collection of kind. A cold slot cannot hold an inline collection (a tiny
+// collection never demotes), so it is skipped without a frame read.
+func (s *Store) rangeCollBucket(b *bucket, kind byte, now int64, fn func(key []byte) bool) bool {
+	for i := 0; i < slotsPerBucket; i++ {
+		w := b.slots[i]
+		if w == 0 || slotCold(w) {
+			continue
+		}
+		addr := w & addrMask
+		if s.arena.buf[addr+offKind] != kind {
+			continue
+		}
+		if now != 0 {
+			if at := s.expireAt(addr); at != 0 && at <= now {
+				continue
+			}
+		}
+		if !fn(s.keyAt(addr)) {
+			return false
+		}
+	}
+	return true
+}
+
+// CountCollKind returns how many inline collection records of the given kind the
+// store holds, and how many of those carry a deadline: the per-type arms of
+// DBSIZE (total) and INFO's Keyspace expires field (withTTL). One index walk
+// serves both. It counts a record whether or not its deadline has passed,
+// matching the map-size basis of the count the Go-heap registry kept (a
+// lazily-expired-but-unreaped key still shows until a keyed read drops it), so it
+// takes no clock. It mutates nothing and runs on the owner goroutine at a command
+// boundary, off every command's critical path.
+func (s *Store) CountCollKind(kind byte) (total, withTTL uint64) {
+	for _, seg := range s.idx.segs {
+		if seg == nil {
+			continue
+		}
+		count := func(b *bucket) {
+			for i := 0; i < slotsPerBucket; i++ {
+				w := b.slots[i]
+				if w == 0 || slotCold(w) {
+					continue
+				}
+				addr := w & addrMask
+				if s.arena.buf[addr+offKind] != kind {
+					continue
+				}
+				total++
+				if s.expireAt(addr) != 0 {
+					withTTL++
+				}
+			}
+		}
+		for i := range seg.buckets {
+			count(&seg.buckets[i])
+		}
+		for i := range seg.overflow {
+			count(&seg.overflow[i])
+		}
+	}
+	return total, withTTL
+}
