@@ -52,10 +52,25 @@ warm-5s, 2M distinct keys:
 | RPOPLPUSH | 9,168,841  | 1,717,778 | 5.34x | 6.09x | PASS |
 | SPOP      | 2,214,247  | 1,110,860 | 1.92x (median of 1.88/1.96/1.88) | 3.09x | near-miss |
 
-SPOP is the one genuine remaining collection-mutate near-miss: aki holds 2.21M against its
-own 7.74M SREM on the identical 1-member sets, so the random-member-selection path carries a
-real ~3.5x per-op cost (RNG plus member pick over the set representation), not a harness
-artifact. Clears valkey 3.09x, sits at 1.92x redis. Named lever: cut the SPOP selection cost.
+SPOP first read as a near-miss (1.92x redis) in launch mode, but that too was a harness
+artifact. The SPOP workload (aki-bench workload/set.go) hammers one shared key (`setProbeKey`)
+from all connections with an alternating SADD/SPOP loop, so it is a single-hot-key cell that
+concentrates on one shard. aki-bench's launch mode pins the server to cores 0-15, whose
+contention halves aki's hot-shard rate (the single-threaded rivals are unaffected). Measured
+in connect mode with all three engines pinned identically to cores 4-17, SPOP PASSES:
+
+| rep | aki ops/s | redis ops/s | valkey ops/s | vs redis | vs valkey |
+|-----|-----------|-------------|--------------|----------|-----------|
+| 1   | 4,038,078 | 1,600,589 | 1,273,264 | 2.52x | 3.17x |
+| 2   | 3,884,581 | 1,569,652 | 1,283,453 | 2.47x | 3.03x |
+| 3   | 3,864,345 | 1,569,401 | 1,272,583 | 2.46x | 3.04x |
+
+Median 2.47x redis / 3.04x valkey, PASS. Lesson twin to the write-floor: for the hot-single-key
+set cells, use connect mode with matched pinning, not aki-bench launch mode whose cpu-split
+depresses aki's hot shard. A separate, orthogonal efficiency win landed on the SPOP kernel
+(remove by drawn index instead of re-finding by value, engine/f3/set remAt, lab m1/14); it
+does not move this hot-key cell but cuts the removal cost 1.4x-2.85x on genuine multi-member
+sets.
 
 ## Reproduce
 
