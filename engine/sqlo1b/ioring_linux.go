@@ -294,8 +294,6 @@ type ringSlot struct {
 // call, which is the point (the amortization iopool approximates by
 // coalescing adjacent requests, the ring gets across arbitrary ones).
 // Completions post to the same mailbox contract as IOPool.
-// Registered buffers, O_DIRECT, and adaptive batch sizing land in the
-// next B5 slices behind this same surface.
 type IORing struct {
 	u          *uring
 	f          *os.File
@@ -311,6 +309,13 @@ type IORing struct {
 	regMem   []byte
 	regIdx   map[uintptr]uint16
 	fixedOps atomic.Uint64
+
+	// Submission telemetry: enters counts submit-side enter syscalls
+	// (the reaper's waits are not in it), entered counts the SQEs they
+	// carried, so entered/enters is the realized batch size the INFO
+	// surface reports in slice 4.
+	enters  atomic.Uint64
+	entered atomic.Uint64
 
 	sub   chan []IOReq
 	syncq chan uint64
@@ -450,14 +455,46 @@ func (r *IORing) abs(q *IOReq) int64 {
 	return int64(q.Ext)*int64(r.extentSize) + int64(q.Off)
 }
 
+// ringPend is the submitter's accumulation window: SQEs pushed but
+// not yet entered, with the slot ids and owner tags it needs to fail
+// the refused suffix if the kernel rejects part of a flush.
+type ringPend struct {
+	ids  []uint32
+	tags []uint64
+}
+
 // submitter owns the SQ. It validates like iopool (a bad request
 // fails its whole batch without touching the file), reserves in-flight
 // room against the CQ bound so the ring can never overflow, and
-// publishes each chunk with one enter.
+// accumulates SQEs across Submit batches, entering per ringFlushNow:
+// on the batch target (adaptive down under CQ pressure), on a full
+// SQ, or on the drain-window tick when the queue goes empty. Reaping
+// runs on its own goroutine, so a held batch never delays the
+// completions of what was already entered.
 func (r *IORing) submitter() {
 	fd := int32(r.f.Fd())
-	ids := make([]uint32, 0, r.u.sqEntries)
-	for reqs := range r.sub {
+	pend := ringPend{
+		ids:  make([]uint32, 0, r.u.sqEntries),
+		tags: make([]uint64, 0, r.u.sqEntries),
+	}
+	for {
+		var reqs []IOReq
+		var ok bool
+		if len(pend.ids) > 0 {
+			select {
+			case reqs, ok = <-r.sub:
+			default:
+				// Drain-window tick: nothing queued behind us, so
+				// holding the batch would only add latency.
+				r.flush(&pend)
+				reqs, ok = <-r.sub
+			}
+		} else {
+			reqs, ok = <-r.sub
+		}
+		if !ok {
+			break
+		}
 		if err := validateIOReqs(r.extentSize, reqs); err != nil {
 			for i := range reqs {
 				r.comp <- IOResult{Tag: reqs[i].Tag, Err: err}
@@ -465,9 +502,21 @@ func (r *IORing) submitter() {
 			continue
 		}
 		for start := 0; start < len(reqs); {
-			n := r.reserve(min(len(reqs)-start, int(r.u.sqEntries)))
+			room := int(r.u.sqEntries) - len(pend.ids)
+			if room == 0 {
+				r.flush(&pend)
+				room = int(r.u.sqEntries)
+			}
+			want := min(len(reqs)-start, room)
+			n, inflight := r.tryReserve(want)
+			if n == 0 {
+				// The CQ bound is met by in-flight work; anything we
+				// hold must enter before blocking, or its completions
+				// could never free the room we are waiting for.
+				r.flush(&pend)
+				n, inflight = r.reserve(want)
+			}
 			chunk := reqs[start : start+n]
-			ids = ids[:0]
 			for i := range chunk {
 				q := &chunk[i]
 				addr := uintptr(unsafe.Pointer(&q.Buf[0]))
@@ -490,7 +539,8 @@ func (r *IORing) submitter() {
 					bufIdx = 0
 				}
 				id := r.slot(q)
-				ids = append(ids, id)
+				pend.ids = append(pend.ids, id)
+				pend.tags = append(pend.tags, q.Tag)
 				r.u.push(ringSQE{
 					opcode:   op,
 					fd:       fd,
@@ -501,30 +551,13 @@ func (r *IORing) submitter() {
 					bufIndex: bufIdx,
 				})
 			}
-			r.u.publish()
-			consumed, err := r.u.enter(uint32(n), 0, 0)
-			if err != nil {
-				// The kernel took the first consumed SQEs (they will
-				// complete through the CQ) and refused the rest.
-				// Rewind the SQ tail over the refused entries, fail
-				// them, and release their reservations.
-				r.u.tail -= uint32(n - consumed)
-				r.u.publish()
-				r.mu.Lock()
-				for _, id := range ids[consumed:] {
-					r.slots[id] = ringSlot{}
-					r.free = append(r.free, id)
-				}
-				r.inflight -= n - consumed
-				r.cond.Signal()
-				r.mu.Unlock()
-				for i := consumed; i < n; i++ {
-					r.comp <- IOResult{Tag: chunk[i].Tag, Err: err}
-				}
+			if ringFlushNow(len(pend.ids), int(r.u.sqEntries), inflight, int(r.u.cqEntries), false) {
+				r.flush(&pend)
 			}
 			start += n
 		}
 	}
+	r.flush(&pend)
 	// Shutdown: the sentinel nop must be the only thing left in
 	// flight, because completions promise no order.
 	r.mu.Lock()
@@ -544,9 +577,60 @@ func (r *IORing) submitter() {
 	}
 }
 
-// reserve blocks until the request count fits under the CQ bound, so
-// a completion can never be dropped to overflow; it grants what fits.
-func (r *IORing) reserve(n int) int {
+// flush publishes and enters everything pending. On a partial refusal
+// the kernel took the first consumed SQEs (they will complete through
+// the CQ); the tail rewinds over the rest, which are failed to their
+// owners and their reservations released.
+func (r *IORing) flush(pend *ringPend) {
+	n := len(pend.ids)
+	if n == 0 {
+		return
+	}
+	r.u.publish()
+	r.enters.Add(1)
+	r.entered.Add(uint64(n))
+	consumed, err := r.u.enter(uint32(n), 0, 0)
+	if err != nil {
+		r.u.tail -= uint32(n - consumed)
+		r.u.publish()
+		r.mu.Lock()
+		for _, id := range pend.ids[consumed:] {
+			r.slots[id] = ringSlot{}
+			r.free = append(r.free, id)
+		}
+		r.inflight -= n - consumed
+		r.cond.Signal()
+		r.mu.Unlock()
+		for _, tag := range pend.tags[consumed:] {
+			r.comp <- IOResult{Tag: tag, Err: err}
+		}
+	}
+	pend.ids = pend.ids[:0]
+	pend.tags = pend.tags[:0]
+}
+
+// EnterStats reports submit-side enter syscalls and the SQEs they
+// carried; their ratio is the realized batch size.
+func (r *IORing) EnterStats() (enters, entered uint64) {
+	return r.enters.Load(), r.entered.Load()
+}
+
+// tryReserve grants what fits under the CQ bound right now, possibly
+// nothing, and reports in-flight after the grant for the batching
+// decision. The submitter must not block while it holds unsubmitted
+// SQEs, so the blocking form stays separate.
+func (r *IORing) tryReserve(n int) (int, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n = max(min(n, int(r.u.cqEntries)-r.inflight), 0)
+	r.inflight += n
+	return n, r.inflight
+}
+
+// reserve blocks until at least one request fits under the CQ bound,
+// so a completion can never be dropped to overflow; it grants what
+// fits and reports in-flight after the grant.
+func (r *IORing) reserve(n int) (int, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for r.inflight >= int(r.u.cqEntries) {
@@ -554,7 +638,7 @@ func (r *IORing) reserve(n int) int {
 	}
 	n = min(n, int(r.u.cqEntries)-r.inflight)
 	r.inflight += n
-	return n
+	return n, r.inflight
 }
 
 // slot files one reserved request into the in-flight table; reserve
