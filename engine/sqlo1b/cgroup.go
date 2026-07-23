@@ -34,10 +34,9 @@ import (
 // open compact group before the data-file sync (see store.go).
 
 // Encoding scheme ids (doc 03 section 7, doc 04 section 11).
-// Registered: SchemeRaw and the scalar cascade (cascade.go). The
-// zstd slice registers SchemeZstd; SchemeFSST plus SchemeZstdDict
-// live in the boxed stretch per the cascade (#1295) and zdict
-// (#1296) lab verdicts.
+// Registered: SchemeRaw, the scalar cascade (cascade.go), and plain
+// zstd (zstd.go). SchemeFSST plus SchemeZstdDict live in the boxed
+// stretch per the cascade (#1295) and zdict (#1296) lab verdicts.
 const (
 	SchemeRaw      uint8 = 0 // identity, the tag-0 passthrough
 	SchemeDict     uint8 = 1 // value dictionary
@@ -84,6 +83,11 @@ func cDecode(scheme, dictID uint8, comp []byte, ulen int) ([]byte, error) {
 			return nil, fmt.Errorf("sqlo1b: scheme %d frame decoded to %d bytes, ulen %d", scheme, len(out), ulen)
 		}
 		return out, nil
+	case SchemeZstd:
+		if dictID != 0 {
+			return nil, fmt.Errorf("sqlo1b: plain zstd frame names dictionary %d", dictID)
+		}
+		return zstdDecode(comp, ulen)
 	default:
 		return nil, fmt.Errorf("sqlo1b: group scheme %d not supported by this build", scheme)
 	}
