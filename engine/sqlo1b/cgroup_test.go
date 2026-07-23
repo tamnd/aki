@@ -243,8 +243,11 @@ func (r *storeRig) fillFrameExtent(t *testing.T) uint64 {
 	ext, _ := r.fillSealed(t, "f0-")
 	r.compactAll(t, ext)
 	first := r.s.cvlog.ext
+	// Packed groups hold an order of magnitude more constant records
+	// than the raw projection, so filling a compact extent takes many
+	// more source extents than it did before speculative fits.
 	for i := 1; r.s.cvlog.ext == first; i++ {
-		if i > 6 {
+		if i > 40 {
 			t.Fatalf("compact stream never rolled off extent %d", first)
 		}
 		ext, _ := r.fillSealed(t, fmt.Sprintf("f%d-", i))
@@ -276,13 +279,21 @@ func TestRecompactFrameExtent(t *testing.T) {
 	if len(inside) < 10 {
 		t.Fatalf("only %d live records inside the frame extent", len(inside))
 	}
+	// A packed frame extent holds thousands of records, so the
+	// overwrites go through wal-sized batches.
 	var ops []sqlo1.Op
 	for i, k := range inside {
 		if i%2 == 0 {
 			ops = append(ops, putOp(k, []byte("rewritten-2"), 0))
 		}
+		if len(ops) >= 32 {
+			r.apply(t, ops...)
+			ops = ops[:0]
+		}
 	}
-	r.apply(t, ops...)
+	if len(ops) > 0 {
+		r.apply(t, ops...)
+	}
 
 	// Quarantined raw extents from fillFrameExtent release first so
 	// the sweep below sees only settled states.
@@ -292,6 +303,16 @@ func TestRecompactFrameExtent(t *testing.T) {
 	cs := r.compactAll(t, first)
 	if cs.Relocated == 0 || cs.Superseded == 0 {
 		t.Fatalf("frame recompaction stats %+v", cs)
+	}
+	// Packing keeps the survivors' compact extent open far longer, so
+	// fill until it seals and the sweep below has frames to scan.
+	second := r.s.cvlog.ext
+	for i := 0; r.s.cvlog.ext == second; i++ {
+		if i > 40 {
+			t.Fatalf("survivor extent %d never sealed under more fills", second)
+		}
+		ext, _ := r.fillSealed(t, fmt.Sprintf("s%d-", i))
+		r.compactAll(t, ext)
 	}
 	r.verify(t)
 	if err := r.s.Checkpoint(); err != nil {

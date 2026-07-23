@@ -2374,6 +2374,23 @@ func (s *Store) appendCompact(enc []byte) (Pos, error) {
 	if len(enc) > BlobThreshold {
 		return s.appendBlobRec(enc)
 	}
+	var slot uint16
+	var err error
+	if s.cgb != nil && !s.cgb.Fits(len(enc)) {
+		// Past the raw projection, try packing: the group keeps
+		// accepting records while a compressed image still fits it.
+		if ps, ok, perr := s.cgb.AppendPacked(enc); perr != nil {
+			return 0, perr
+		} else if ok {
+			slot = ps
+			pos, err := NewPos(s.cgbExt, s.cgbGrp, slot)
+			if err != nil {
+				return 0, err
+			}
+			s.pending[pos] = enc
+			return pos, nil
+		}
+	}
 	if s.cgb == nil || !s.cgb.Fits(len(enc)) {
 		if err := s.closeCompactGroup(); err != nil {
 			return 0, err
@@ -2382,7 +2399,7 @@ func (s *Store) appendCompact(enc []byte) (Pos, error) {
 			return 0, err
 		}
 	}
-	slot, err := s.cgb.Append(enc)
+	slot, err = s.cgb.Append(enc)
 	if err != nil {
 		return 0, err
 	}
@@ -2457,6 +2474,9 @@ func (s *Store) writeCompactGroup(img []byte) error {
 	if _, err := s.f.WriteAt(img, off); err != nil {
 		return fmt.Errorf("sqlo1b: compact group %d/%d: %w", s.cgbExt, s.cgbGrp, err)
 	}
+	// A packed open group flushes non-raw images that later rewrites
+	// replace, so the frame cache must not keep serving the old one.
+	s.fc.DropGroup(s.cgbExt, s.cgbGrp)
 	s.dataBytes += uint64(len(img))
 	return nil
 }

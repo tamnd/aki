@@ -93,16 +93,22 @@ func cDecode(scheme, dictID uint8, comp []byte, ulen int) ([]byte, error) {
 	}
 }
 
-// CGroupBuilder buffers one compressed-frame group in RAM. Slice 1
-// always emits SchemeRaw; the sampled-selection slice will re-encode
-// the buffered payload at close time and fall back to raw below the
-// win floor.
+// CGroupBuilder buffers one compressed-frame group in RAM. Appends
+// past the raw projection go through AppendPacked, which certifies at
+// accept time that a compressed image fits the on-disk capacity, so
+// Seal can never overflow the group.
 type CGroupBuilder struct {
 	capacity int
-	buf      []byte
+	buf      []byte // header plus payload, grows past capacity when packing
 	used     int
 	slots    []uint16
 	scheme   uint8 // stamped by Seal, raw until then
+
+	// Certified packing state: once the payload outgrows the raw
+	// projection, pComp under pScheme is the proof it still fits.
+	packed  bool
+	pScheme uint8
+	pComp   []byte
 }
 
 // NewCGroupBuilder starts an empty frame group of the given on-disk
@@ -140,6 +146,73 @@ func (g *CGroupBuilder) Append(rec []byte) (uint16, error) {
 	return slot, nil
 }
 
+// AppendPacked appends past the raw projection, the disk win the
+// package comment names: the payload may outgrow the group's on-disk
+// capacity as long as a compressed image still fits it. Acceptance is
+// certified by construction, not estimated: the record is appended
+// tentatively, the selector runs over the grown payload, and the
+// record stays only if the winning image fits the capacity; otherwise
+// the append reverts and the group is full. The certified encoding is
+// kept, so Image and Seal reuse it instead of re-encoding, and a
+// packed group can never overflow its 4 KiB slot.
+func (g *CGroupBuilder) AppendPacked(rec []byte) (uint16, bool, error) {
+	if len(rec) == 0 {
+		return 0, false, fmt.Errorf("sqlo1b: empty record")
+	}
+	if len(g.slots) >= BlobSlot || g.used+len(rec) > cframeMaxUlen {
+		return 0, false, nil
+	}
+	need := CFrameHeader + g.used + len(rec)
+	if need > len(g.buf) {
+		grown := make([]byte, max(2*len(g.buf), need))
+		copy(grown, g.buf)
+		g.buf = grown
+	}
+	copy(g.buf[CFrameHeader+g.used:], rec)
+	payload := g.buf[CFrameHeader : CFrameHeader+g.used+len(rec)]
+	fits := func(comp []byte) bool {
+		return CFrameHeader+len(comp)+2*(len(g.slots)+1) <= g.capacity
+	}
+	// Certified scheme first: re-encoding just the current winner is
+	// the cheap steady-state trial, the full selector only runs when
+	// the winner stops fitting or on the first packed append.
+	scheme, comp := g.pScheme, []byte(nil)
+	if g.packed {
+		if scheme == SchemeZstd {
+			comp = zstdEncode(payload)
+		} else if c, err := cEncode(scheme, payload); err == nil {
+			comp = c
+		}
+	}
+	if comp == nil || !fits(comp) {
+		if scheme, comp = cSelect(payload); scheme == SchemeRaw || !fits(comp) {
+			return 0, false, nil
+		}
+	}
+	slot := uint16(len(g.slots))
+	g.slots = append(g.slots, uint16(g.used))
+	g.used += len(rec)
+	g.packed, g.pScheme, g.pComp = true, scheme, comp
+	return slot, true, nil
+}
+
+// packedImage assembles the certified frame at exactly the on-disk
+// capacity, the one shape a packed group can write.
+func (g *CGroupBuilder) packedImage() []byte {
+	out := make([]byte, g.capacity)
+	out[0] = g.pScheme
+	out[1] = 0
+	binary.LittleEndian.PutUint16(out[2:], uint16(len(g.slots)))
+	binary.LittleEndian.PutUint32(out[4:], uint32(g.used))
+	binary.LittleEndian.PutUint32(out[8:], uint32(len(g.pComp)))
+	copy(out[CFrameHeader:], g.pComp)
+	tstart := CFrameHeader + len(g.pComp)
+	for i, off := range g.slots {
+		binary.LittleEndian.PutUint16(out[tstart+2*i:], off)
+	}
+	return out
+}
+
 // Records reports how many records the frame holds.
 func (g *CGroupBuilder) Records() int { return len(g.slots) }
 
@@ -153,8 +226,13 @@ func (g *CGroupBuilder) Scheme() uint8 { return g.scheme }
 // are NOT tear-safe (see the package comment above), which the
 // compact stream tolerates and no other writer may. Open-group
 // flush-through always writes this raw image, because only the final
-// Seal may spend encode work and change the layout.
+// Seal may spend encode work and change the layout; a packed group is
+// the exception, since its payload no longer fits raw, so it writes
+// the encoding AppendPacked already certified and paid for.
 func (g *CGroupBuilder) Image() []byte {
+	if g.packed {
+		return g.packedImage()
+	}
 	g.buf[0] = SchemeRaw
 	g.buf[1] = 0
 	binary.LittleEndian.PutUint16(g.buf[2:], uint16(len(g.slots)))
@@ -164,8 +242,10 @@ func (g *CGroupBuilder) Image() []byte {
 	for i, off := range g.slots {
 		binary.LittleEndian.PutUint16(g.buf[tstart+2*i:], off)
 	}
-	clear(g.buf[tstart+2*len(g.slots):])
-	return g.buf
+	// Slice to capacity: a reverted AppendPacked may have grown the
+	// buffer past the on-disk group.
+	clear(g.buf[tstart+2*len(g.slots) : g.capacity])
+	return g.buf[:g.capacity]
 }
 
 // Seal ends the group through the sampled cascade (cascade.go): the
@@ -174,6 +254,10 @@ func (g *CGroupBuilder) Image() []byte {
 // grow afterwards; the compressed image fits by construction because
 // the raw projection fit and clen only shrinks.
 func (g *CGroupBuilder) Seal() []byte {
+	if g.packed {
+		g.scheme = g.pScheme
+		return g.packedImage()
+	}
 	scheme, comp := cSelect(g.buf[CFrameHeader : CFrameHeader+g.used])
 	if scheme == SchemeRaw {
 		return g.Image()
@@ -189,8 +273,8 @@ func (g *CGroupBuilder) Seal() []byte {
 	for i, off := range g.slots {
 		binary.LittleEndian.PutUint16(g.buf[tstart+2*i:], off)
 	}
-	clear(g.buf[tstart+2*len(g.slots):])
-	return g.buf
+	clear(g.buf[tstart+2*len(g.slots) : g.capacity])
+	return g.buf[:g.capacity]
 }
 
 // CGroupView reads one frame group image with its payload decoded.
