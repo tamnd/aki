@@ -31,4 +31,20 @@ The calibration also surfaced the mechanism: at design pace the 500 ms fold-age 
 
 ## Results
 
-Pending the scored run.
+Scored run, 2 GiB at 1000 B values, four groups, production flush and segment constants; foldkeep-paced.csv and foldkeep-unpaced.csv hold the full sample series.
+
+Paced arm at 100 MiB/s: max lag over 16 samples was 18369 frames, first-half max 18369 against second-half max 12225 for a trend ratio of 0.67, final settled lag zero in every group, 132 segments, zero pipeline errors.
+Unpaced contrast arm: lag climbs from 32k to 267k frames across the run, trend ratio 1.63, only 19 of an eventual 40 segments published when ingest ends.
+
+Scoring the six predictions:
+
+1. HIT. Trend ratio 0.67, well inside 1.5; the second half actually ran lower than the first as the publisher warmed up past its opening sawtooth.
+2. HIT. Max paced lag 18369 frames, inside the 24k cadence band; the size target's 66k-frame window never came close to governing.
+3. HIT. Final lag zero in every group after barrier plus flush plus quiesce.
+4. HIT. Both arms completed with zero build, walk, coverage, and row errors.
+5. HIT. 132 segments against the 120 to 160 band, confirming the fold-age flush governs the cut at design pace (about 15 MiB per segment, not 64).
+6. HIT. Unpaced ratio 1.63, the growth shape, with the publisher visibly saturated (19 of 40 segments at ingest end).
+
+The verdict for the row: at design ingest the replay floor tracks the committed watermark inside a cadence-bounded sawtooth of at most about 18k frames (roughly 18 MiB in the worst group) and settles exact at quiesce, so boot replay work is bounded by the fold-age window, not by runtime.
+The unpaced arm records the margin honestly: sim ingest with no network in the way does outrun the fold, so the floor guarantee is a rate-conditional one and the design rate sits comfortably inside it.
+One caveat carries over from #1275: FoldSeq over-claims resident records no segment holds, so the floor this lab measures is the manifest's claimed floor; the sound cursor plus WAL trimmer pair stays owed and replay tolerates the over-claim until then.
