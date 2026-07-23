@@ -350,3 +350,125 @@ func FuzzCascadeRoundTrip(f *testing.F) {
 		}
 	})
 }
+
+func TestCascadeSelect(t *testing.T) {
+	shapes := cascadeShapes(t)
+	// Each lab shape lands on its verdict scheme; incompressible
+	// values fall through the floor to raw.
+	for name, want := range map[string][]uint8{
+		"lowcard":   {SchemeDict, SchemeDictRLE},
+		"clustered": {SchemeDictRLE},
+		"counters":  {SchemeFor},
+		"words":     {SchemeFor},
+	} {
+		scheme, comp := cSelect(shapes[name])
+		ok := false
+		for _, w := range want {
+			ok = ok || scheme == w
+		}
+		if !ok {
+			t.Errorf("%s selected scheme %d, want one of %v", name, scheme, want)
+			continue
+		}
+		if 100*len(comp) > (100-cSelectFloor)*len(shapes[name]) {
+			t.Errorf("%s winner of %d bytes is under the floor on %d raw", name, len(comp), len(shapes[name]))
+		}
+		got, err := cDecode(scheme, 0, comp, len(shapes[name]))
+		if err != nil || !bytes.Equal(got, shapes[name]) {
+			t.Errorf("%s winner does not round trip: %v", name, err)
+		}
+	}
+	entropy := make([][]byte, 24)
+	for i := range entropy {
+		v := make([]byte, 96)
+		x := uint64(i)*0x9e3779b97f4a7c15 + 1
+		for j := range v {
+			x ^= x << 13
+			x ^= x >> 7
+			x ^= x << 17
+			v[j] = byte(x)
+		}
+		entropy[i] = v
+	}
+	if scheme, _ := cSelect(cascadePayload(t, entropy)); scheme != SchemeRaw {
+		t.Errorf("high-entropy payload selected scheme %d, want raw", scheme)
+	}
+	if scheme, _ := cSelect([]byte("not a record chain")); scheme != SchemeRaw {
+		t.Error("garbage payload must select raw")
+	}
+}
+
+func TestCGroupSealSelects(t *testing.T) {
+	g := NewCGroupBuilder(GroupSize)
+	var recs [][]byte
+	for i := 0; g.Fits(1000); i++ {
+		rec := &Record{RType: RecString, Key: fmt.Appendf(nil, "seal-%02d", i), Value: bytes.Repeat([]byte{'v'}, 950)}
+		b, err := rec.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := g.Append(b); err != nil {
+			t.Fatal(err)
+		}
+		recs = append(recs, b)
+		// The open group's flush-through image stays raw and parseable.
+		if v, err := ParseCGroup(g.Image()); err != nil || v.Scheme() != SchemeRaw {
+			t.Fatalf("open image: scheme %d, err %v", v.Scheme(), err)
+		}
+	}
+	img := g.Seal()
+	if g.Scheme() != SchemeDict && g.Scheme() != SchemeDictRLE {
+		t.Fatalf("sealed constant values as scheme %d", g.Scheme())
+	}
+	v, err := ParseCGroup(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Scheme() != g.Scheme() || v.Records() != len(recs) {
+		t.Fatalf("sealed image parses as scheme %d with %d records", v.Scheme(), v.Records())
+	}
+	if clen := int(binary.LittleEndian.Uint32(img[8:])); clen >= g.used {
+		t.Fatalf("sealed clen %d did not shrink %d payload bytes", clen, g.used)
+	}
+	for i, want := range recs {
+		got, err := v.Record(uint16(i))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("sealed record %d diverged: %v", i, err)
+		}
+	}
+}
+
+func TestCompactSelectionStats(t *testing.T) {
+	// Store-level: compacting constant-valued records books dictionary
+	// groups in the histogram and Stats, and the compressed extents
+	// survive verify, checkpoint, reopen, and scrub.
+	r := newStoreRig(t)
+	if st := r.s.Stats(); st.SchemeGroups != nil {
+		t.Fatal("scheme telemetry before any frame group closed")
+	}
+	first := r.fillFrameExtent(t)
+	if r.extFlagsOf(t, first)&EFlagCompressed == 0 {
+		t.Fatalf("frame extent %d misses the compressed flag", first)
+	}
+	sg := r.s.SchemeGroups()
+	if sg[SchemeDict]+sg[SchemeDictRLE] == 0 {
+		t.Fatalf("no dictionary groups selected: %v", sg)
+	}
+	st := r.s.Stats()
+	if st.SchemeGroups == nil || st.SchemeGroups[SchemeDict]+st.SchemeGroups[SchemeDictRLE] == 0 {
+		t.Fatalf("Stats does not carry the selection histogram: %v", st.SchemeGroups)
+	}
+	r.verify(t)
+	// The sealed frame extent holds dictionary-coded groups; scrub
+	// must decode them through the registry and stay clean.
+	sc := &Scrubber{File: r.s.f, ExtentSize: r.s.sb.ExtentSize, Grid: r.s.grid}
+	if rep := sc.Sweep(); !rep.Clean() || rep.Scanned == 0 {
+		t.Fatalf("scrub over selected groups (scanned %d): %+v", rep.Scanned, rep.Findings)
+	}
+	if err := r.s.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	r.verify(t)
+	r.reopen(t)
+	r.verify(t)
+}

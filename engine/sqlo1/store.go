@@ -89,6 +89,10 @@ type StoreStats struct {
 	Keys      int64 // live records
 	DiskBytes int64 // bytes on disk, 0 if the backend has no file yet
 	HighWater int64 // last applied DrainBatch.Seq
+	// SchemeGroups counts compressed frame groups written per encoding
+	// scheme since open, indexed by scheme id; nil when the backend has
+	// written none. The doc 04 cascade selection histogram INFO shows.
+	SchemeGroups []int64
 }
 
 // Store is the seam between the shared runtime and a backend (doc 02
