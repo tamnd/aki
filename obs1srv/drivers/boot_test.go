@@ -317,3 +317,61 @@ func TestBootServesZSetsAcrossRestart(t *testing.T) {
 	expect(t, r3, "$1\r\n4\r\n")
 	commitAndStop(t, b3, srv3, nc3)
 }
+
+// TestBootServesListsAcrossRestart drives the list plane through the
+// boot seam: sided pushes, the positional lset, lins, and lrem surgery,
+// decided-count pops, an LTRIM riding as its pop frames, an LMOVE over
+// one hash tag, and an emptying pop whose colldrop the next incarnation
+// replays, all served back from the replayed registries.
+func TestBootServesListsAcrossRestart(t *testing.T) {
+	bucket := sim.New(sim.Config{})
+
+	b1, srv1, nc1, r1 := bootServer(t, bucket, 1)
+	send(t, nc1, "RPUSH", "l", "a", "b", "c")
+	expect(t, r1, ":3\r\n")
+	send(t, nc1, "LPUSH", "l", "z")
+	expect(t, r1, ":4\r\n")
+	send(t, nc1, "LSET", "l", "1", "A")
+	expect(t, r1, "+OK\r\n")
+	send(t, nc1, "LINSERT", "l", "BEFORE", "b", "x")
+	expect(t, r1, ":5\r\n")
+	send(t, nc1, "LREM", "l", "1", "x")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "RPOP", "l")
+	expect(t, r1, "$1\r\nc\r\n")
+	send(t, nc1, "LTRIM", "l", "0", "1")
+	expect(t, r1, "+OK\r\n")
+	send(t, nc1, "LPUSH", "gone", "g")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "LPOP", "gone")
+	expect(t, r1, "$1\r\ng\r\n")
+	send(t, nc1, "RPUSH", "{t}src", "m1", "m2")
+	expect(t, r1, ":2\r\n")
+	send(t, nc1, "LMOVE", "{t}src", "{t}dst", "LEFT", "RIGHT")
+	expect(t, r1, "$2\r\nm1\r\n")
+	commitAndStop(t, b1, srv1, nc1)
+
+	b2, srv2, nc2, r2 := bootServer(t, bucket, 2)
+	if b2.Replay.LPushes == 0 || b2.Replay.RPushes == 0 || b2.Replay.LPops == 0 ||
+		b2.Replay.LSets == 0 || b2.Replay.LRems == 0 || b2.Replay.LInserts == 0 || b2.Replay.CollDrops == 0 {
+		t.Fatalf("reboot replay stats %+v, want list plane counts", b2.Replay)
+	}
+	send(t, nc2, "LRANGE", "l", "0", "-1")
+	expect(t, r2, "*2\r\n$1\r\nz\r\n$1\r\nA\r\n")
+	send(t, nc2, "LLEN", "gone")
+	expect(t, r2, ":0\r\n")
+	send(t, nc2, "LRANGE", "{t}src", "0", "-1")
+	expect(t, r2, "*1\r\n$2\r\nm2\r\n")
+	send(t, nc2, "LRANGE", "{t}dst", "0", "-1")
+	expect(t, r2, "*1\r\n$2\r\nm1\r\n")
+	send(t, nc2, "RPUSH", "l", "w")
+	expect(t, r2, ":3\r\n")
+	commitAndStop(t, b2, srv2, nc2)
+
+	b3, srv3, nc3, r3 := bootServer(t, bucket, 3)
+	send(t, nc3, "LLEN", "l")
+	expect(t, r3, ":3\r\n")
+	send(t, nc3, "LINDEX", "l", "2")
+	expect(t, r3, "$1\r\nw\r\n")
+	commitAndStop(t, b3, srv3, nc3)
+}
