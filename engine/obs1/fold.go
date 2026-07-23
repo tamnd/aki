@@ -79,6 +79,12 @@ type FoldConfig struct {
 	// keeps the pre-keymap behavior: no index, unfiltered tombstones.
 	Keymap func(group uint16) *Keymap
 
+	// Dir, when set, resolves a group's resident directory (doc 05
+	// section 2.3). The publish callback adds the segment's footer before
+	// the keymap placements apply, so the keymap never holds a locator
+	// the directory cannot resolve.
+	Dir func(group uint16) *Directory
+
 	// SegTargetBytes and ChunkTargetBytes override the cut thresholds,
 	// zero for the defaults. Tests shrink them.
 	SegTargetBytes   int
@@ -144,6 +150,7 @@ type FolderStats struct {
 	PlacesApplied     uint64 // record placements applied to the keymap at publish
 	PlacesKilled      uint64 // placements dropped because a delete landed after the cut
 	PlaceErrs         uint64 // placements the keymap refused, each one a loud bug
+	DirErrs           uint64 // directory adds refused at publish, each one a loud bug
 }
 
 // foldRec is one accumulated whole-record frame, copied out of the tap
@@ -721,6 +728,15 @@ func (f *Folder) finishPut(job *segJob, obj []byte, key string) {
 	f.stats.SegmentsPut++
 	f.mu.Unlock()
 	f.cfg.Marks.Notify(job.group, job.covered, func() {
+		if f.cfg.Dir != nil {
+			if dir := f.cfg.Dir(job.group); dir != nil {
+				if err := dir.Add(key, &footer); err != nil {
+					f.mu.Lock()
+					f.stats.DirErrs++
+					f.mu.Unlock()
+				}
+			}
+		}
 		f.mu.Lock()
 		entry.Places = f.applyPlacesLocked(job)
 		f.dropPendingLocked(job)

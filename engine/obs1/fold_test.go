@@ -1,6 +1,7 @@
 package obs1_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -682,5 +683,100 @@ func TestFolderDeleteKillsInFlightPlace(t *testing.T) {
 	st := fx.folder.Stats()
 	if st.PlacesKilled != 1 || st.PlacesApplied != 0 || st.Tombstones != 1 {
 		t.Fatalf("stats %+v", st)
+	}
+}
+
+// newFoldDirFixture is the keymap fixture with the group 3 directory
+// wired in as well, the directory slice's shape.
+func newFoldDirFixture(t *testing.T) (*foldFixture, *obs1.Keymap, *obs1.Directory) {
+	t.Helper()
+	fx := &foldFixture{sim: sim.New(sim.Config{Seed: 1}), marks: obs1.NewWatermarks()}
+	km := obs1.NewKeymap()
+	dir := obs1.NewDirectory()
+	f, err := obs1.NewFolder(obs1.FoldConfig{
+		Store:  fx.sim,
+		Prefix: "db/t",
+		Node:   0xA1,
+		MapKey: func(key []byte) (uint16, uint16) { return 9, 3 },
+		Mark:   func(group uint16) (uint32, uint64) { return 7, fx.last },
+		Marks:  fx.marks,
+		Keymap: func(group uint16) *obs1.Keymap { return km },
+		Dir:    func(group uint16) *obs1.Directory { return dir },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.folder = f
+	t.Cleanup(f.Close)
+	return fx, km, dir
+}
+
+// TestFolderDirectoryResolves closes the resident loop: a publish adds
+// the segment to the directory before the keymap placements apply, and a
+// keymap locator resolves to a block span whose ranged GET decodes to
+// the chunk frame holding the record.
+func TestFolderDirectoryResolves(t *testing.T) {
+	fx, km, dir := newFoldDirFixture(t)
+	ctx := context.Background()
+
+	fx.folder.Add(frames("k1", "v1", "k2", "v2"))
+	fx.folder.Flush()
+	waitFor(t, "publish", func() bool { return len(fx.folder.Ledger()) == 1 })
+	led := fx.folder.Ledger()[0]
+	if dir.Segments() != 1 {
+		t.Fatalf("directory holds %d segments", dir.Segments())
+	}
+	if st := fx.folder.Stats(); st.DirErrs != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+
+	for _, key := range []string{"k1", "k2"} {
+		loc, ok := km.Lookup(obs1.Fingerprint([]byte(key)))
+		if !ok {
+			t.Fatalf("%s not in keymap", key)
+		}
+		ref, ok := dir.Resolve(loc)
+		if !ok {
+			t.Fatalf("%s locator %+v does not resolve", key, loc)
+		}
+		if ref.ObjKey != led.Key {
+			t.Fatalf("%s resolves to %q, ledger says %q", key, ref.ObjKey, led.Key)
+		}
+		off, n := ref.Block.BlockSpan()
+		raw, _, err := fx.sim.GetRange(ctx, ref.ObjKey, off, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := obs1.ParseSegmentBlock(raw, ref.Block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if int(ref.OffInBlock)+4 > len(data) {
+			t.Fatalf("%s chunk offset %d past block", key, ref.OffInBlock)
+		}
+		total := binary.LittleEndian.Uint32(data[ref.OffInBlock:])
+		if int(ref.OffInBlock)+int(total) > len(data) {
+			t.Fatalf("%s chunk frame total %d runs past block", key, total)
+		}
+		frame := data[ref.OffInBlock : ref.OffInBlock+total]
+		if !bytes.Contains(frame, []byte(key)) {
+			t.Fatalf("%s not inside its resolved chunk frame", key)
+		}
+		if ref.ChunkKind != kindString|store.ChunkKindBit {
+			t.Fatalf("%s chunk kind 0x%02x", key, ref.ChunkKind)
+		}
+	}
+
+	// A killed placement never reaches the keymap, so nothing dangles;
+	// the tombstone segment still lands in the directory for its ledger
+	// row.
+	fx.folder.Delete([]byte("k1"))
+	fx.folder.Flush()
+	waitFor(t, "tombstone publish", func() bool { return len(fx.folder.Ledger()) == 2 })
+	if dir.Segments() != 2 {
+		t.Fatalf("directory holds %d segments after tombstone fold", dir.Segments())
+	}
+	if _, ok := km.Lookup(obs1.Fingerprint([]byte("k1"))); ok {
+		t.Fatal("deleted key still in keymap")
 	}
 }

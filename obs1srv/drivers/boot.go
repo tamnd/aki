@@ -66,6 +66,12 @@ type Booted struct {
 	// segments at takeover lands with the directory slice, so after a
 	// restart it covers keys folded since boot.
 	Keymaps []*obs1.Keymap
+	// Dirs is the per-group directory the folder fills on publish; the
+	// cold read path resolves keymap locators through it. Like the
+	// keymaps, takeover rebuild from the manifest lands with the next PR
+	// of the directory slice, so after a restart it covers segments
+	// folded since boot.
+	Dirs []*obs1.Directory
 }
 
 // Close drains and stops the pipeline: write log first so its final
@@ -155,14 +161,17 @@ func BootDurability(ctx context.Context, cfg BootConfig, rt *shard.Runtime) (*Bo
 		return nil, err
 	}
 	kms := make([]*obs1.Keymap, shard.DefaultSlotGroups)
+	dirs := make([]*obs1.Directory, shard.DefaultSlotGroups)
 	for g := range kms {
 		kms[g] = obs1.NewKeymap()
+		dirs[g] = obs1.NewDirectory()
 	}
 	folder, err := obs1.NewFolder(obs1.FoldConfig{
 		Store: cfg.Store, Prefix: cfg.Prefix, Node: cfg.Node,
 		MapKey: ClusterMapKey, Mark: wl.GroupMark, Marks: wl.Marks(),
 		OnPublish: pub.OnFolded, FoldAge: cfg.FoldAge, Seed: seeds,
 		Keymap: func(group uint16) *obs1.Keymap { return kms[group] },
+		Dir:    func(group uint16) *obs1.Directory { return dirs[group] },
 	})
 	if err != nil {
 		_ = wl.Close()
@@ -187,5 +196,5 @@ func BootDurability(ctx context.Context, cfg BootConfig, rt *shard.Runtime) (*Bo
 	rt.SetFoldProgress(func() uint64 { return pub.Stats().Published })
 	rt.SetFoldKick(folder.Flush)
 
-	return &Booted{WL: wl, Folder: folder, Pub: pub, Rec: r, Replay: ap.Stats(), Keymaps: kms}, nil
+	return &Booted{WL: wl, Folder: folder, Pub: pub, Rec: r, Replay: ap.Stats(), Keymaps: kms, Dirs: dirs}, nil
 }
