@@ -31,6 +31,13 @@ import (
 // reads it to dispatch a cold list chunk back into the list registry.
 const kindList byte = 0x03
 
+// listPosBias lifts the signed head virtual position into unsigned disc space so
+// the fold coordinate of a demoted run (the virtual position of its first
+// element, spec 2064/obs1 doc 08 section 6) stays ordered under head pushes
+// that drive headVirt negative. 1<<62 leaves headroom on both sides that no
+// real list exhausts.
+const listPosBias = uint64(1) << 62
+
 // listCold is a list's cold-tier state, built on the first demote and held on the
 // native band. st is the store the cold frames live in and scratch is the pread
 // buffer every cold read reuses, so a steady cold read allocates nothing. dir is
@@ -138,12 +145,21 @@ func (nt *native) demote(st *store.Store, key []byte) int {
 		off   uint64
 		disc  [8]byte
 		count int
+		virt  uint64 // biased virtual position of the run's first element, the fold coordinate
 	}
 	var runs []placed
 	var payload []byte
+	// prefix walks the dense element count ahead of the chunk under the sweep,
+	// including the head margin and any already-cold interior, so each shed
+	// chunk knows the virtual position its run starts at.
+	prefix := 0
+	for k := 0; k < demoteMargin; k++ {
+		prefix += nt.ring.at(k).count()
+	}
 	for i := demoteMargin; i < nt.ring.n-demoteMargin && len(runs) < demoteQuantum; i++ {
 		c := nt.ring.at(i)
 		if c.cold() {
+			prefix += c.count()
 			continue // already cold from an earlier quantum
 		}
 		payload = payload[:0]
@@ -158,10 +174,36 @@ func (nt *native) demote(st *store.Store, key []byte) int {
 		if !ok {
 			return 0 // broken region: abandon, every chunk stays resident
 		}
-		runs = append(runs, placed{ci: i, off: off, disc: disc, count: count})
+		virt := uint64(int64(listPosBias) + nt.headVirt + int64(prefix))
+		runs = append(runs, placed{ci: i, off: off, disc: disc, count: count, virt: virt})
+		prefix += count
 	}
 	if len(runs) == 0 {
 		return 0 // interior already cold from earlier quanta
+	}
+
+	// The fold projection (doc 08 section 6): the same runs re-framed as
+	// position runs for the bucket plane, valueless packed pairs under an
+	// 8-byte big-endian virtual-position disc, so the directory's disc64
+	// lift is the run's start position and per-run counts give the LRANGE
+	// and LINDEX prefix-sum math. Tap-only: the local tier keeps the bare
+	// uvarint form above as its single cold copy, and the ends never fold
+	// because only interior chunks reach this pass, which pins ends-stay-hot
+	// on the fold side by construction (lab #1321). Emitted before the
+	// commit loop while the resident blobs are still intact; a refused
+	// append already returned, so nothing folds for an abandoned run.
+	var pk store.ChunkPacker
+	var vdisc [8]byte
+	for _, r := range runs {
+		c := nt.ring.at(r.ci)
+		pk.Reset()
+		for p := c.lo; p < c.hi; p++ {
+			v, _ := c.frameAt(int(c.dir[p]))
+			pk.Add(v, nil, 0)
+		}
+		fpayload, fflags := pk.Finish()
+		binary.BigEndian.PutUint64(vdisc[:], r.virt)
+		st.EmitFoldChunk(kindList, fflags, uint16(r.count), key, vdisc[:], fpayload)
 	}
 
 	// Commit: one descriptor per shed chunk keyed by demote order, then flip each
