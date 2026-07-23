@@ -47,7 +47,8 @@ type CompactStats struct {
 	DeadSegments int
 	// Expired records were past due at compaction time; their index
 	// entries are removed, the doc 04 lazy-expiry backstop.
-	Expired int
+	Expired      int
+	ExpiredBytes int
 }
 
 // CompactExtent compacts one sealed vlog extent and quarantines it.
@@ -187,8 +188,11 @@ func (s *Store) compactExtent(ctx context.Context, ext uint64) (CompactStats, er
 		return fail(err)
 	}
 	delete(s.garbageExt, ext)
+	delete(s.nearExt, ext)
 	s.garbage -= min(s.garbage, deadBytes)
 	s.relocatedBytes += uint64(cs.RelocatedBytes)
+	s.expiredDrops += uint64(cs.Expired)
+	s.expiredBytes += uint64(cs.ExpiredBytes)
 	s.compactions++
 	return cs, nil
 }
@@ -213,6 +217,7 @@ func (s *Store) compactRecord(rec *Record, raw []byte, pos Pos, cs *CompactStats
 			return err
 		}
 		cs.Expired++
+		cs.ExpiredBytes += len(raw)
 		return nil
 	}
 	if rec.RType == RecSeg || rec.RType == RecFence {
@@ -294,6 +299,7 @@ func (s *Store) relocate(rec *Record, raw []byte) error {
 	if err != nil {
 		return err
 	}
+	s.noteNear(pos, rec)
 	h := KeyHash(rec.Key)
 	bucket := BucketOf(PlacementBits(h), s.level, s.split)
 	chain, err := s.mutableChain(bucket)
