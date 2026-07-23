@@ -10,6 +10,7 @@ package sqlo1
 import (
 	"context"
 	"strings"
+	"time"
 )
 
 const (
@@ -17,7 +18,6 @@ const (
 	errXreadgroupUnbalanced = "ERR Unbalanced 'xreadgroup' list of streams: for each stream key an ID or '>' must be specified."
 	errXreadgroupTimeout    = "ERR timeout is not an integer or out of range"
 	errXreadgroupNegTimeout = "ERR timeout is negative"
-	errXreadgroupBlock      = "ERR XREADGROUP BLOCK is not supported until the blocking slice"
 )
 
 // xreadgroupNoGroupErr is the NOGROUP text XREADGROUP shares between a
@@ -34,14 +34,16 @@ func meaninglessIDErr(reply []byte, tok byte) []byte {
 
 // xreadgroupCmd is XREADGROUP GROUP g c [COUNT n] [BLOCK ms] [NOACK]
 // STREAMS key... id.... Options scan in any order before STREAMS,
-// which claims the whole tail; BLOCK validates its integer and then
-// refuses until the blocking slice, the temporary-refusal precedent.
+// which claims the whole tail. Only an all-new read with nothing to
+// deliver blocks: a history ID always renders its row, so any history
+// stream in the list answers immediately, the pinned 8.8 shape.
 func (s *Server) xreadgroupCmd(ctx context.Context, reply []byte, args [][]byte, now int64) []byte {
 	if len(args) < 7 {
 		return arityErr(reply, "XREADGROUP")
 	}
 	var group, consumer []byte
 	haveGroup, haveBlock, noack := false, false, false
+	blockMs := int64(0)
 	count := int64(-1)
 	streamsAt := -1
 	for i := 1; i < len(args); {
@@ -70,7 +72,7 @@ func (s *Server) xreadgroupCmd(ctx context.Context, reply []byte, args [][]byte,
 			if n < 0 {
 				return AppendError(reply, errXreadgroupNegTimeout)
 			}
-			haveBlock = true
+			haveBlock, blockMs = true, n
 			i += 2
 		case strings.EqualFold(string(args[i]), "NOACK"):
 			noack = true
@@ -91,9 +93,6 @@ func (s *Server) xreadgroupCmd(ctx context.Context, reply []byte, args [][]byte,
 	rest := args[streamsAt:]
 	if len(rest) == 0 || len(rest)%2 != 0 {
 		return AppendError(reply, errXreadgroupUnbalanced)
-	}
-	if haveBlock {
-		return AppendError(reply, errXreadgroupBlock)
 	}
 	nk := len(rest) / 2
 	keys, idArgs := rest[:nk], rest[nk:]
@@ -169,11 +168,55 @@ func (s *Server) xreadgroupCmd(ctx context.Context, reply []byte, args [][]byte,
 		}
 		nrows++
 	}
-	if nrows == 0 {
+	if nrows > 0 {
+		reply = AppendArray(reply, nrows)
+		return append(reply, rows...)
+	}
+	if !haveBlock {
 		return AppendNullArray(reply)
 	}
-	reply = AppendArray(reply, nrows)
-	return append(reply, rows...)
+	// Nothing rendered means every stream was a > with nothing new, the
+	// only shape that blocks. Each wake re-checks the group, which can
+	// vanish mid-block, and stamps deliveries with a fresh clock.
+	return s.xblock(reply, keys, time.Duration(blockMs)*time.Millisecond, func(reply []byte, elig []int) ([]byte, bool, error) {
+		nowMs := s.t.Now()
+		var rows []byte
+		nrows := 0
+		for _, i := range elig {
+			if !news[i] {
+				continue
+			}
+			if err := s.x.ReadGroupCheck(ctx, keys[i], group); err != nil {
+				if err == errStreamNoGroup {
+					return xreadgroupNoGroupErr(reply, keys[i], group), true, nil
+				}
+				return reply, false, err
+			}
+			mark := len(rows)
+			rows = AppendArray(rows, 2)
+			rows = AppendBulk(rows, keys[i])
+			n := 0
+			err := s.x.ReadGroupNew(ctx, keys[i], group, consumer, count, noack, nowMs, func(k int) {
+				n = k
+				rows = AppendArray(rows, k)
+			}, func(id streamID, fv [][]byte) {
+				rows = appendStreamEntry(rows, id, fv)
+			})
+			if err != nil {
+				return reply, false, err
+			}
+			if n == 0 {
+				rows = rows[:mark]
+				continue
+			}
+			nrows++
+		}
+		if nrows == 0 {
+			return reply, false, nil
+		}
+		out := AppendArray(reply, nrows)
+		return append(out, rows...), true, nil
+	})
 }
 
 // xackCmd is XACK key group id...: the key's type check outranks the

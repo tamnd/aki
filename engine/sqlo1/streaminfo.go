@@ -124,6 +124,27 @@ func (x *Stream) topEntryID(ctx context.Context) (streamID, error) {
 	return top, err
 }
 
+// ReadPrep resolves one XREAD key in a single probe: existence with
+// the type check, the last generated ID that $ freezes to, and the
+// newest live entry's ID that + rewinds behind. hasEntry is false on
+// a missing or emptied stream, where + falls back to the generated
+// ID so only genuinely new entries can serve a blocked reader.
+func (x *Stream) ReadPrep(ctx context.Context, key []byte) (exists bool, lastGen, lastEntry streamID, hasEntry bool, err error) {
+	exists, _, err = x.stateOf(ctx, key)
+	if err != nil || !exists {
+		return exists, streamID{}, streamID{}, false, err
+	}
+	lastGen = x.root.last
+	if x.root.count == 0 {
+		return true, lastGen, streamID{}, false, nil
+	}
+	top, err := x.topEntryID(ctx)
+	if err != nil {
+		return true, lastGen, streamID{}, false, err
+	}
+	return true, lastGen, top, true, nil
+}
+
 // EntryPeek reads one boundary entry, the summary's first-entry and
 // last-entry fields and the recorded-first-entry-id beside them. found
 // is false on an empty stream; a missing key cannot reach here since

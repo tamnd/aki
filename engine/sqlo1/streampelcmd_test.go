@@ -37,8 +37,6 @@ func TestXreadgroupWire(t *testing.T) {
 			"-ERR timeout is not an integer or out of range\r\n"},
 		{[]string{"XREADGROUP", "GROUP", "grp", "c1", "BLOCK", "-1", "STREAMS", "s", ">"},
 			"-ERR timeout is negative\r\n"},
-		{[]string{"XREADGROUP", "GROUP", "grp", "c1", "BLOCK", "0", "STREAMS", "s", ">"},
-			"-ERR XREADGROUP BLOCK is not supported until the blocking slice\r\n"},
 		{[]string{"XREADGROUP", "GROUP", "grp", "c1", "STREAMS", "nk", ">"},
 			"-NOGROUP No such key 'nk' or consumer group 'grp' in XREADGROUP with GROUP option\r\n"},
 		// A bad ID on the first key wins over a missing later key.
