@@ -48,7 +48,7 @@ func TestCFrameRoundTrip(t *testing.T) {
 				t.Fatalf("view has %d records, want %d", v.Records(), len(recs))
 			}
 		}
-		img := g.Close()
+		img := g.Seal()
 		if len(img) != capacity {
 			t.Fatalf("image of %d bytes at capacity %d", len(img), capacity)
 		}
@@ -115,7 +115,7 @@ func TestCFrameParseRejections(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	good := bytes.Clone(g.Close())
+	good := bytes.Clone(g.Seal())
 	if _, err := ParseCGroup(good); err != nil {
 		t.Fatal(err)
 	}
@@ -215,8 +215,10 @@ func TestCompactWritesFrameExtents(t *testing.T) {
 	if moved == 0 {
 		t.Fatal("no index entry points into the compact extent")
 	}
-	if sg := r.s.SchemeGroups(); sg[SchemeRaw] == 0 {
-		t.Fatal("no raw frame groups booked in the scheme histogram")
+	// fillSealed writes constant values, so the sampled cascade picks
+	// the dictionary family for every closed group.
+	if sg := r.s.SchemeGroups(); sg[SchemeDict]+sg[SchemeDictRLE] == 0 {
+		t.Fatalf("no dictionary frame groups booked in the scheme histogram: %v", sg)
 	}
 	// Pre-checkpoint reads go through the flushed frame images.
 	r.verify(t)

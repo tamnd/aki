@@ -1959,11 +1959,21 @@ func (s *Store) Scan(ctx context.Context, cur sqlo1.Cursor, fn func(sqlo1.Record
 func (s *Store) Stats() sqlo1.StoreStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return sqlo1.StoreStats{
+	st := sqlo1.StoreStats{
 		Keys:      int64(s.entries),
 		DiskBytes: int64(s.sb.ExtentCount) * int64(s.sb.ExtentSize),
 		HighWater: s.hw,
 	}
+	for scheme, n := range s.schemeGroups {
+		if n == 0 {
+			continue
+		}
+		if st.SchemeGroups == nil {
+			st.SchemeGroups = make([]int64, NumSchemes)
+		}
+		st.SchemeGroups[scheme] = int64(n)
+	}
+	return st
 }
 
 // Checkpoint runs one doc 03 section 13 checkpoint. On success the
@@ -2403,7 +2413,7 @@ func (s *Store) closeCompactGroup() error {
 	if s.cgb == nil {
 		return nil
 	}
-	img := s.cgb.Close()
+	img := s.cgb.Seal()
 	if err := s.writeCompactGroup(img); err != nil {
 		return err
 	}

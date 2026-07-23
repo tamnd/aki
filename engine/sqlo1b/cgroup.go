@@ -98,6 +98,7 @@ type CGroupBuilder struct {
 	buf      []byte
 	used     int
 	slots    []uint16
+	scheme   uint8 // stamped by Seal, raw until then
 }
 
 // NewCGroupBuilder starts an empty frame group of the given on-disk
@@ -138,14 +139,17 @@ func (g *CGroupBuilder) Append(rec []byte) (uint16, error) {
 // Records reports how many records the frame holds.
 func (g *CGroupBuilder) Records() int { return len(g.slots) }
 
-// Scheme reports what Image will stamp; slice 1 is always raw.
-func (g *CGroupBuilder) Scheme() uint8 { return SchemeRaw }
+// Scheme reports the frame's scheme: raw while the group is open,
+// the sampled cascade's pick once Seal runs.
+func (g *CGroupBuilder) Scheme() uint8 { return g.scheme }
 
-// Image assembles the frame at exactly the group capacity: header,
-// payload, slot table, zero tail. Callers may keep appending and take
-// a fuller image later; in-place rewrites of earlier images are NOT
-// tear-safe (see the package comment above), which the compact stream
-// tolerates and no other writer may.
+// Image assembles the raw frame at exactly the group capacity:
+// header, payload, slot table, zero tail. Callers may keep appending
+// and take a fuller image later; in-place rewrites of earlier images
+// are NOT tear-safe (see the package comment above), which the
+// compact stream tolerates and no other writer may. Open-group
+// flush-through always writes this raw image, because only the final
+// Seal may spend encode work and change the layout.
 func (g *CGroupBuilder) Image() []byte {
 	g.buf[0] = SchemeRaw
 	g.buf[1] = 0
@@ -160,8 +164,30 @@ func (g *CGroupBuilder) Image() []byte {
 	return g.buf
 }
 
-// Close is Image at the moment the group ends.
-func (g *CGroupBuilder) Close() []byte { return g.Image() }
+// Seal ends the group through the sampled cascade (cascade.go): the
+// winning scheme's bytes replace the payload when they clear the 8
+// percent floor, otherwise the image stays raw. The group must not
+// grow afterwards; the compressed image fits by construction because
+// the raw projection fit and clen only shrinks.
+func (g *CGroupBuilder) Seal() []byte {
+	scheme, comp := cSelect(g.buf[CFrameHeader : CFrameHeader+g.used])
+	if scheme == SchemeRaw {
+		return g.Image()
+	}
+	g.scheme = scheme
+	g.buf[0] = scheme
+	g.buf[1] = 0
+	binary.LittleEndian.PutUint16(g.buf[2:], uint16(len(g.slots)))
+	binary.LittleEndian.PutUint32(g.buf[4:], uint32(g.used))
+	binary.LittleEndian.PutUint32(g.buf[8:], uint32(len(comp)))
+	copy(g.buf[CFrameHeader:], comp)
+	tstart := CFrameHeader + len(comp)
+	for i, off := range g.slots {
+		binary.LittleEndian.PutUint16(g.buf[tstart+2*i:], off)
+	}
+	clear(g.buf[tstart+2*len(g.slots):])
+	return g.buf
+}
 
 // CGroupView reads one frame group image with its payload decoded.
 type CGroupView struct {

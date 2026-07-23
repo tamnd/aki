@@ -93,7 +93,11 @@ func cEncode(scheme uint8, payload []byte) ([]byte, error) {
 	if len(sp.stems) == 0 {
 		return nil, errCascadeInapplicable
 	}
-	out := binary.AppendUvarint(make([]byte, 0, len(payload)), uint64(len(sp.stems)))
+	return cEncodeSplit(scheme, sp, len(payload))
+}
+
+func cEncodeSplit(scheme uint8, sp *cascadeSplit, ulen int) ([]byte, error) {
+	out := binary.AppendUvarint(make([]byte, 0, ulen), uint64(len(sp.stems)))
 	for i, stem := range sp.stems {
 		out = append(out, stem...)
 		out = append(out, sp.crcs[i]...)
@@ -108,6 +112,42 @@ func cEncode(scheme uint8, payload []byte) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("sqlo1b: no cascade encoder for scheme %d", scheme)
 	}
+}
+
+// cSelectFloor is the doc 03 section 7 minimum win: a group whose
+// best scheme saves less than 8 percent of its raw payload stores
+// raw, because decode cost must buy real bytes. The cascade lab
+// (#1295) found the floor non-binding on every real shape; it stays
+// as the degenerate backstop.
+const cSelectFloor = 8
+
+// cSelect runs the sampled cascade over one frame group's payload
+// and returns the winning scheme with its compressed bytes, or raw
+// with nil. The lab's sampling discipline (1 percent with a 40
+// absolute minimum) clamps to the whole group at the 4 KiB frame
+// granularity, so the sample here is every record: each candidate
+// scheme try-encodes the full payload and the smallest one above the
+// floor wins, ties to the lower id because dict is the cheapest
+// decode.
+func cSelect(payload []byte) (uint8, []byte) {
+	sp, err := splitCascade(payload)
+	if err != nil || len(sp.stems) == 0 {
+		return SchemeRaw, nil
+	}
+	scheme, best := SchemeRaw, []byte(nil)
+	for _, cand := range []uint8{SchemeDict, SchemeDictRLE, SchemeFor} {
+		comp, err := cEncodeSplit(cand, sp, len(payload))
+		if err != nil {
+			continue
+		}
+		if 100*len(comp) > (100-cSelectFloor)*len(payload) {
+			continue
+		}
+		if best == nil || len(comp) < len(best) {
+			scheme, best = cand, comp
+		}
+	}
+	return scheme, best
 }
 
 // cascadeDecode reconstructs the exact frame payload from a cascade
