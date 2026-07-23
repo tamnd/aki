@@ -219,6 +219,16 @@ func (x *Stream) AckForTest(ctx context.Context, key, group []byte, ids [][2]uin
 	return x.Ack(ctx, key, group, sids)
 }
 
+// DelForTest drives XDEL from the external crash package on the
+// plain-integer seam.
+func (x *Stream) DelForTest(ctx context.Context, key []byte, ids [][2]uint64) (int64, error) {
+	sids := make([]streamID, len(ids))
+	for i, p := range ids {
+		sids[i] = streamID{ms: p[0], seq: p[1]}
+	}
+	return x.Del(ctx, key, sids)
+}
+
 // ClaimForTest and AutoClaimForTest drive the pending-surface crash
 // phase from the external package on the plain-integer seam.
 func (x *Stream) ClaimForTest(ctx context.Context, key, group, consumer []byte, minIdle int64, ids [][2]uint64, force, justid bool, nowMs int64) (int, error) {

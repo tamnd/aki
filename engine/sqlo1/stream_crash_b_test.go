@@ -23,7 +23,12 @@ package sqlo1_test
 // shows the pre-delivery image or the whole delivery and never a
 // dangling fence slot, and acks, consumer deletions with pending
 // entries, and the drop of an emptied segment land whole the same way
-// (X-I5); every snapshot renders the full pending table.
+// (X-I5); every snapshot renders the full pending table. The XDEL
+// phase adds the arbitrary-deletion rows: tomb flips inside a run, a
+// run and a fence page emptied by deletes dropping whole, deletes of
+// still-pending entries leaving the PEL exact, a stream deleted to
+// empty, and a group destroy sweeping a live multi-segment PEL in the
+// same batch as its record compaction.
 
 import (
 	"context"
@@ -342,6 +347,32 @@ func TestStreamPagedTornTail(t *testing.T) {
 	mark()
 	flush()
 	claim("s", "gamma", "gc", 0, true, 912, 1, [2]uint64{15, 1})
+	flush()
+
+	// Phase 11: XDEL and the destroy sweep. Tomb flips ride one batch
+	// per call: deleting 13 and 14 on s3 leaves their PEL rows exact at
+	// every cut, deleting 14 and 15 on the paged s kills pending
+	// entries owned by beta and gamma without touching their PELs, s2
+	// deletes to empty and appends above its history, and the boot
+	// destroy drops its record and every PEL segment its fence held in
+	// the batch of the compaction, leaving beta and gamma as the live
+	// PELs of the final image.
+	xdel := func(key string, want int64, ids ...[2]uint64) {
+		t.Helper()
+		n, err := x.DelForTest(ctx, []byte(key), ids)
+		if err != nil || n != want {
+			t.Fatalf("Del(%q) = %d, %v, want %d", key, n, err, want)
+		}
+		mark()
+	}
+	xdel("s3", 2, [2]uint64{13, 1}, [2]uint64{14, 1})
+	flush()
+	xdel("s", 2, [2]uint64{14, 1}, [2]uint64{15, 1}, [2]uint64{14, 1})
+	flush()
+	xdel("s2", 2, [2]uint64{4, 1}, [2]uint64{10, 1})
+	add("s2", 11, "tiny")
+	flush()
+	gdestroy("s3", "boot", true)
 	flush()
 
 	if err := db.Close(); err != nil {

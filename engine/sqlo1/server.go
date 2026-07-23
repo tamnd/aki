@@ -1159,6 +1159,8 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return AppendInt(reply, n)
 	case "XTRIM":
 		return s.xtrimCmd(ctx, reply, args)
+	case "XDEL":
+		return s.xdelCmd(ctx, reply, args)
 	case "XSETID":
 		return s.xsetidCmd(ctx, reply, args)
 	case "XINFO":
