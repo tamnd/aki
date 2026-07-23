@@ -729,10 +729,10 @@ func (s *Server) xinfoStreamCmd(ctx context.Context, reply []byte, args [][]byte
 			return storeErr(reply[:mark], err)
 		}
 		reply = AppendBulk(reply, []byte("groups"))
-		err = s.x.GroupsInfo(ctx, args[2], func(n int) {
+		err = s.x.FullGroupsInfo(ctx, args[2], count, func(n int) {
 			reply = AppendArray(reply, n)
-		}, func(g *streamGroup, pending uint64, lag int64, lagOK bool) {
-			reply = appendXinfoFullGroup(reply, g, pending, lag, lagOK)
+		}, func(g *streamGroup, pending uint64, lag int64, lagOK bool, rows []streamPelRow, consRows [][]streamPelRow) {
+			reply = appendXinfoFullGroup(reply, g, pending, lag, lagOK, rows, consRows)
 		})
 		if err != nil {
 			return storeErr(reply[:mark], err)
@@ -760,10 +760,12 @@ func (s *Server) xinfoStreamCmd(ctx context.Context, reply []byte, args [][]byte
 }
 
 // appendXinfoFullGroup renders one XINFO STREAM FULL group row: eight
-// pairs with the PEL fields at their empty-slice shapes until the PEL
-// slice fills them, and the consumers nested in name order like the
-// top-level rows.
-func appendXinfoFullGroup(reply []byte, g *streamGroup, pending uint64, lag int64, lagOK bool) []byte {
+// pairs with the group's COUNT-bounded pending rows (id, consumer
+// name, delivery time, delivery count) and the consumers nested in
+// name order, each with its own pending rows minus the owner column,
+// the pinned 8.8 shapes. rows and consRows index consumers by their
+// stored order, so the name sort permutes an index, not g.cons.
+func appendXinfoFullGroup(reply []byte, g *streamGroup, pending uint64, lag int64, lagOK bool, rows []streamPelRow, consRows [][]streamPelRow) []byte {
 	reply = AppendArray(reply, 16)
 	reply = AppendBulk(reply, []byte("name"))
 	reply = AppendBulk(reply, g.name)
@@ -786,14 +788,25 @@ func appendXinfoFullGroup(reply []byte, g *streamGroup, pending uint64, lag int6
 	reply = AppendBulk(reply, []byte("nacked-count"))
 	reply = AppendInt(reply, 0)
 	reply = AppendBulk(reply, []byte("pending"))
-	reply = AppendArray(reply, 0)
+	reply = AppendArray(reply, len(rows))
+	for _, r := range rows {
+		reply = AppendArray(reply, 4)
+		reply = appendStreamIDBulk(reply, r.id)
+		reply = AppendBulk(reply, g.cons[r.cidx].name)
+		reply = AppendInt(reply, r.dtime)
+		reply = AppendInt(reply, int64(r.dcount))
+	}
 	reply = AppendBulk(reply, []byte("consumers"))
-	sort.Slice(g.cons, func(i, j int) bool {
-		return bytes.Compare(g.cons[i].name, g.cons[j].name) < 0
+	ord := make([]int, len(g.cons))
+	for i := range ord {
+		ord[i] = i
+	}
+	sort.Slice(ord, func(i, j int) bool {
+		return bytes.Compare(g.cons[ord[i]].name, g.cons[ord[j]].name) < 0
 	})
 	reply = AppendArray(reply, len(g.cons))
-	for i := range g.cons {
-		c := &g.cons[i]
+	for _, ci := range ord {
+		c := &g.cons[ci]
 		reply = AppendArray(reply, 10)
 		reply = AppendBulk(reply, []byte("name"))
 		reply = AppendBulk(reply, c.name)
@@ -804,7 +817,17 @@ func appendXinfoFullGroup(reply []byte, g *streamGroup, pending uint64, lag int6
 		reply = AppendBulk(reply, []byte("pel-count"))
 		reply = AppendInt(reply, int64(c.pel))
 		reply = AppendBulk(reply, []byte("pending"))
-		reply = AppendArray(reply, 0)
+		var cr []streamPelRow
+		if consRows != nil {
+			cr = consRows[ci]
+		}
+		reply = AppendArray(reply, len(cr))
+		for _, r := range cr {
+			reply = AppendArray(reply, 3)
+			reply = appendStreamIDBulk(reply, r.id)
+			reply = AppendInt(reply, r.dtime)
+			reply = AppendInt(reply, int64(r.dcount))
+		}
 	}
 	return reply
 }

@@ -191,3 +191,45 @@ func (x *Stream) GroupLinesForTest(ctx context.Context, key []byte) ([]string, e
 }
 
 var ErrStreamFenceThirdLevelForTest = errStreamFenceThirdLevel
+
+// SetStreamPelCapsForTest shrinks the PEL segment and fence caps so
+// segment cuts, multi-segment acks, and the inline fence refusal are
+// reachable in test-sized PELs. Callers restore via the returned func.
+func SetStreamPelCapsForTest(segBytes, segEnts, fenceMax int) (restore func()) {
+	ob, oe, of := streamPelSegMaxBytes, streamPelSegMaxEnts, streamPelFenceMax
+	streamPelSegMaxBytes, streamPelSegMaxEnts, streamPelFenceMax = segBytes, segEnts, fenceMax
+	return func() { streamPelSegMaxBytes, streamPelSegMaxEnts, streamPelFenceMax = ob, oe, of }
+}
+
+// The PEL crash phase drives XREADGROUP delivery and XACK from the
+// external package on the plain-integer seam, and PelLinesForTest
+// renders every group's pending rows through the real fence-and-
+// segment read path, so the matrix proves X-I5 exactness at every cut.
+func (x *Stream) ReadGroupNewForTest(ctx context.Context, key, group, consumer []byte, count int64, noack bool, nowMs int64) (int, error) {
+	n := 0
+	err := x.ReadGroupNew(ctx, key, group, consumer, count, noack, nowMs, func(k int) { n = k }, func(streamID, [][]byte) {})
+	return n, err
+}
+
+func (x *Stream) AckForTest(ctx context.Context, key, group []byte, ids [][2]uint64) (int64, error) {
+	sids := make([]streamID, len(ids))
+	for i, p := range ids {
+		sids[i] = streamID{ms: p[0], seq: p[1]}
+	}
+	return x.Ack(ctx, key, group, sids)
+}
+
+func (x *Stream) PelLinesForTest(ctx context.Context, key []byte) ([]string, error) {
+	var lines []string
+	err := x.FullGroupsInfo(ctx, key, -1, func(int) {}, func(g *streamGroup, pending uint64, lag int64, lagOK bool, rows []streamPelRow, consRows [][]streamPelRow) {
+		line := fmt.Appendf(nil, "pel group=%s n=%d", g.name, pending)
+		for _, r := range rows {
+			line = fmt.Appendf(line, " %d-%d@%s#%d/%d", r.id.ms, r.id.seq, g.cons[r.cidx].name, r.dcount, r.dtime)
+		}
+		lines = append(lines, string(line))
+	})
+	if err == errStreamNoKey {
+		return nil, nil
+	}
+	return lines, err
+}

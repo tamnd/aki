@@ -7,9 +7,8 @@ package sqlo1
 // groups, so lookup by name reads the ordinals in order (groups are
 // few) and DESTROY compacts by moving the last ordinal into the hole,
 // no allocator and no root format change. The record carries the
-// group's last delivered ID, its entries-read counter, and the
-// consumer table; the PEL fence field stays empty until the kind 5
-// slice.
+// group's last delivered ID, its entries-read counter, the consumer
+// table, and the PEL fence over its kind 5 segments (streampel.go).
 
 import (
 	"bytes"
@@ -35,7 +34,7 @@ var (
 
 // streamConsumer is one consumer row in a group record. activeMs is -1
 // until a delivery marks the consumer active; pel counts its pending
-// entries, zero until the PEL slice writes any.
+// entries.
 type streamConsumer struct {
 	name     []byte
 	seenMs   int64
@@ -45,13 +44,17 @@ type streamConsumer struct {
 
 // streamGroup is a decoded group record. read is the entries-read
 // counter, -1 unknown; it is clamped to entries-added at every store,
-// the Redis 8.8 behavior the lag math depends on. Decoded byte fields
-// alias the record read and die on the next Tiered call.
+// the Redis 8.8 behavior the lag math depends on. pelf is the PEL
+// fence over the group's kind 5 segments, ID-ordered like the run
+// fence. Decoded byte fields alias the record read and die on the next
+// Tiered call; copyGroupOwned (streampel.go) deep-copies a group an op
+// must hold across reads.
 type streamGroup struct {
 	name []byte
 	last streamID
 	read int64
 	cons []streamConsumer
+	pelf []streamPelFenceEnt
 }
 
 // Group record payload:
@@ -59,7 +62,7 @@ type streamGroup struct {
 //	u64 last_ms, last_seq
 //	u64 read_raw          // all-ones unknown, else <= MaxInt64
 //	u16 consumer_n
-//	u16 pel_fence_n       // reserved 0 until the kind 5 slice
+//	u16 pel_fence_n
 //	u32 name_len, name bytes
 //	consumer_n x {
 //		u32 name_len, name bytes
@@ -67,8 +70,12 @@ type streamGroup struct {
 //		u64 active_raw    // all-ones never, else <= MaxInt64
 //		u64 pel_count
 //	}
+//	pel_fence_n x { u64 ms, u64 seq, u64 pelsegid, u32 count }
 //
-// Canonical form: exact length, unique consumer names in stored order.
+// Canonical form: exact length, unique consumer names in stored order,
+// PEL fence bases strictly increasing with counts >= 1, and the fence
+// counts summing to the consumer pel counts, the group's pending
+// entries partitioned by segment and by consumer.
 const streamGroupHdrLen = 28
 
 // streamSubkindGroup is the stream plane's group record kind, doc 10's
@@ -83,6 +90,7 @@ func appendStreamGroup(dst []byte, g *streamGroup) []byte {
 	binary.LittleEndian.PutUint64(h[8:], g.last.seq)
 	binary.LittleEndian.PutUint64(h[16:], uint64(g.read))
 	binary.LittleEndian.PutUint16(h[24:], uint16(len(g.cons)))
+	binary.LittleEndian.PutUint16(h[26:], uint16(len(g.pelf)))
 	dst = append(dst, h[:]...)
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(g.name)))
 	dst = append(dst, g.name...)
@@ -93,6 +101,13 @@ func appendStreamGroup(dst []byte, g *streamGroup) []byte {
 		dst = binary.LittleEndian.AppendUint64(dst, uint64(c.seenMs))
 		dst = binary.LittleEndian.AppendUint64(dst, uint64(c.activeMs))
 		dst = binary.LittleEndian.AppendUint64(dst, c.pel)
+	}
+	for i := range g.pelf {
+		f := &g.pelf[i]
+		dst = binary.LittleEndian.AppendUint64(dst, f.base.ms)
+		dst = binary.LittleEndian.AppendUint64(dst, f.base.seq)
+		dst = binary.LittleEndian.AppendUint64(dst, f.segid)
+		dst = binary.LittleEndian.AppendUint32(dst, f.count)
 	}
 	return dst
 }
@@ -111,8 +126,9 @@ func decodeStreamGroupBytes(p []byte) (b, rest []byte, err error) {
 }
 
 // decodeStreamGroup validates v and decodes it, consumer rows landing
-// in the cons scratch. Name bytes alias v.
-func decodeStreamGroup(v []byte, cons []streamConsumer) (streamGroup, error) {
+// in the cons scratch and PEL fence entries in the pelf scratch. Name
+// bytes alias v.
+func decodeStreamGroup(v []byte, cons []streamConsumer, pelf []streamPelFenceEnt) (streamGroup, error) {
 	if len(v) < streamGroupHdrLen {
 		return streamGroup{}, fmt.Errorf("sqlo1: stream group record of %d bytes has no header", len(v))
 	}
@@ -124,9 +140,7 @@ func decodeStreamGroup(v []byte, cons []streamConsumer) (streamGroup, error) {
 		return streamGroup{}, fmt.Errorf("sqlo1: stream group record has entries-read raw %#x", uint64(g.read))
 	}
 	n := int(binary.LittleEndian.Uint16(v[24:]))
-	if pel := binary.LittleEndian.Uint16(v[26:]); pel != 0 {
-		return streamGroup{}, fmt.Errorf("sqlo1: stream group record has %d PEL fence entries before the PEL slice", pel)
-	}
+	fn := int(binary.LittleEndian.Uint16(v[26:]))
 	p := v[streamGroupHdrLen:]
 	var err error
 	if g.name, p, err = decodeStreamGroupBytes(p); err != nil {
@@ -154,10 +168,38 @@ func decodeStreamGroup(v []byte, cons []streamConsumer) (streamGroup, error) {
 		cons = append(cons, c)
 		p = p[24:]
 	}
+	var consPending uint64
+	for i := range cons {
+		consPending += cons[i].pel
+	}
+	var fencePending uint64
+	for i := range fn {
+		if len(p) < streamPelFenceEntLen {
+			return streamGroup{}, fmt.Errorf("sqlo1: stream group record truncates PEL fence entry %d", i)
+		}
+		f := streamPelFenceEnt{
+			base:  streamID{ms: binary.LittleEndian.Uint64(p[0:]), seq: binary.LittleEndian.Uint64(p[8:])},
+			segid: binary.LittleEndian.Uint64(p[16:]),
+			count: binary.LittleEndian.Uint32(p[24:]),
+		}
+		if f.count == 0 {
+			return streamGroup{}, fmt.Errorf("sqlo1: stream group record PEL fence entry %d is empty", i)
+		}
+		if len(pelf) > 0 && !pelf[len(pelf)-1].base.less(f.base) {
+			return streamGroup{}, fmt.Errorf("sqlo1: stream group record PEL fence out of order at %d", i)
+		}
+		fencePending += uint64(f.count)
+		pelf = append(pelf, f)
+		p = p[streamPelFenceEntLen:]
+	}
+	if fencePending != consPending {
+		return streamGroup{}, fmt.Errorf("sqlo1: stream group record PEL fence holds %d entries but consumers own %d", fencePending, consPending)
+	}
 	if len(p) != 0 {
 		return streamGroup{}, fmt.Errorf("sqlo1: stream group record has %d trailing bytes", len(p))
 	}
 	g.cons = cons
+	g.pelf = pelf
 	return g, nil
 }
 
@@ -209,7 +251,7 @@ func (x *Stream) findGroup(ctx context.Context, group []byte) (int, streamGroup,
 		if err != nil {
 			return -1, streamGroup{}, err
 		}
-		g, err := decodeStreamGroup(v, x.grpCons[:0])
+		g, err := decodeStreamGroup(v, x.grpCons[:0], x.grpFence[:0])
 		if err != nil {
 			return -1, streamGroup{}, err
 		}
@@ -340,7 +382,10 @@ func (x *Stream) GroupSetID(ctx context.Context, key, group []byte, idOK bool, i
 // GroupDestroy is XGROUP DESTROY: compact the ordinals by moving the
 // last record into the destroyed slot, then drop the vacated tail
 // after the root that stopped referencing it, all one batch. A missing
-// group is destroyed false, not an error.
+// group is destroyed false, not an error. The destroyed group's PEL
+// segments become orphans until the XDEL slice adds the destroy sweep
+// (milestone line for XDEL and DESTROY), the plane-retire cleanup
+// story in the meantime.
 func (x *Stream) GroupDestroy(ctx context.Context, key, group []byte) (bool, error) {
 	exists, expMs, err := x.stateOf(ctx, key)
 	if err != nil {
@@ -411,6 +456,9 @@ func (x *Stream) GroupCreateConsumer(ctx context.Context, key, group, consumer [
 
 // GroupDelConsumer is XGROUP DELCONSUMER, replying the deleted
 // consumer's pending count. A missing consumer is 0 with no write.
+// Redis discards the consumer's pending entries, so the PEL sweeps:
+// segment rewrites and the record ride one batch, the emptied
+// segments dropping after the record that stopped referencing them.
 func (x *Stream) GroupDelConsumer(ctx context.Context, key, group, consumer []byte) (int64, error) {
 	exists, _, err := x.stateOf(ctx, key)
 	if err != nil {
@@ -419,20 +467,32 @@ func (x *Stream) GroupDelConsumer(ctx context.Context, key, group, consumer []by
 	if !exists {
 		return 0, errXgroupNoKey
 	}
-	ord, g, err := x.findGroup(ctx, group)
+	ord, g0, err := x.findGroup(ctx, group)
 	if err != nil {
 		return 0, err
 	}
 	if ord < 0 {
 		return 0, errStreamNoGroup
 	}
-	for i := range g.cons {
-		if !bytes.Equal(g.cons[i].name, consumer) {
+	for i := range g0.cons {
+		if !bytes.Equal(g0.cons[i].name, consumer) {
 			continue
 		}
-		pending := int64(g.cons[i].pel)
+		pending := int64(g0.cons[i].pel)
+		g := x.copyGroupOwned(&g0)
+		if pending > 0 {
+			if err := x.pelSweepConsumer(ctx, &g, i); err != nil {
+				return 0, err
+			}
+		}
 		g.cons = append(g.cons[:i], g.cons[i+1:]...)
-		return pending, x.writeGroupRec(ctx, uint32(ord), &g)
+		if err := x.writeGroupRec(ctx, uint32(ord), &g); err != nil {
+			return 0, err
+		}
+		if pending > 0 {
+			return pending, x.pelDropPending(ctx)
+		}
+		return pending, nil
 	}
 	return 0, nil
 }
@@ -475,11 +535,11 @@ func (x *Stream) cgLag(g *streamGroup) (lag int64, lagOK bool) {
 	return 0, false
 }
 
-// GroupsInfo drives XINFO GROUPS and the FULL groups array: begin runs
-// once with the row count, then emit runs per group in name order,
-// Redis's rax iteration. The emitted record aliases its read and dies
-// when emit returns; pending sums the consumer PEL counts, all zero
-// until the PEL slice.
+// GroupsInfo drives XINFO GROUPS: begin runs once with the row count,
+// then emit runs per group in name order, Redis's rax iteration. The
+// emitted record aliases its read and dies when emit returns; pending
+// sums the consumer PEL counts. The FULL groups array reads through
+// FullGroupsInfo (streampel.go), which adds the pending rows.
 func (x *Stream) GroupsInfo(ctx context.Context, key []byte, begin func(n int), emit func(g *streamGroup, pending uint64, lag int64, lagOK bool)) error {
 	exists, _, err := x.stateOf(ctx, key)
 	if err != nil {
@@ -502,7 +562,7 @@ func (x *Stream) GroupsInfo(ctx context.Context, key []byte, begin func(n int), 
 		if err != nil {
 			return err
 		}
-		g, err := decodeStreamGroup(v, x.grpCons[:0])
+		g, err := decodeStreamGroup(v, x.grpCons[:0], x.grpFence[:0])
 		if err != nil {
 			return err
 		}
@@ -517,7 +577,7 @@ func (x *Stream) GroupsInfo(ctx context.Context, key []byte, begin func(n int), 
 		if err != nil {
 			return err
 		}
-		g, err := decodeStreamGroup(v, x.grpCons[:0])
+		g, err := decodeStreamGroup(v, x.grpCons[:0], x.grpFence[:0])
 		if err != nil {
 			return err
 		}

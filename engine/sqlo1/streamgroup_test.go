@@ -21,14 +21,23 @@ func TestStreamGroupCodec(t *testing.T) {
 			{name: []byte("bob"), seenMs: 2000, activeMs: -1, pel: 0},
 			{name: []byte(""), seenMs: 0, activeMs: 0, pel: 1},
 		},
+		// The fence must account for every consumer's pending entries,
+		// the decode invariant the PEL slice added.
+		pelf: []streamPelFenceEnt{
+			{base: streamID{ms: 1, seq: 1}, segid: 9, count: 4},
+			{base: streamID{ms: 5, seq: 0}, segid: 12, count: 2},
+		},
 	}
 	enc := appendStreamGroup(nil, &g)
-	dec, err := decodeStreamGroup(enc, nil)
+	dec, err := decodeStreamGroup(enc, nil, nil)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if string(dec.name) != "workers" || dec.last != g.last || dec.read != 42 || len(dec.cons) != 3 {
 		t.Fatalf("round trip lost fields: %+v", dec)
+	}
+	if len(dec.pelf) != 2 || dec.pelf[0] != g.pelf[0] || dec.pelf[1] != g.pelf[1] {
+		t.Fatalf("fence round trip: %+v", dec.pelf)
 	}
 	for i := range g.cons {
 		if string(dec.cons[i].name) != string(g.cons[i].name) ||
@@ -45,14 +54,14 @@ func TestStreamGroupCodec(t *testing.T) {
 	// A read of -1 is the unknown counter and stays legal.
 	g2 := streamGroup{name: []byte("g"), read: -1}
 	enc2 := appendStreamGroup(nil, &g2)
-	if dec2, err := decodeStreamGroup(enc2, nil); err != nil || dec2.read != -1 {
+	if dec2, err := decodeStreamGroup(enc2, nil, nil); err != nil || dec2.read != -1 {
 		t.Fatalf("read -1 round trip: read=%d err=%v", dec2.read, err)
 	}
 
 	mutate := func(name string, f func(v []byte) []byte) {
 		v := append([]byte(nil), enc...)
 		v = f(v)
-		if _, err := decodeStreamGroup(v, nil); err == nil {
+		if _, err := decodeStreamGroup(v, nil, nil); err == nil {
 			t.Fatalf("%s decoded clean", name)
 		}
 	}
@@ -81,6 +90,22 @@ func TestStreamGroupCodec(t *testing.T) {
 	})
 	mutate("active below -1", func(v []byte) []byte {
 		bad := streamGroup{name: []byte("g"), cons: []streamConsumer{{name: []byte("c"), activeMs: -2}}}
+		return appendStreamGroup(v[:0], &bad)
+	})
+	// The fence entry's count is its last 4 bytes, so the tail of the
+	// record mutates the second slot: a bumped count breaks the
+	// pending-sum invariant and a zeroed one is an empty slot.
+	mutate("fence sum over the consumers", func(v []byte) []byte { v[len(v)-4]++; return v })
+	mutate("empty fence slot", func(v []byte) []byte {
+		copy(v[len(v)-4:], []byte{0, 0, 0, 0})
+		return v
+	})
+	mutate("fence bases out of order", func(v []byte) []byte {
+		bad := g
+		bad.pelf = []streamPelFenceEnt{
+			{base: streamID{ms: 5, seq: 0}, segid: 9, count: 4},
+			{base: streamID{ms: 1, seq: 1}, segid: 12, count: 2},
+		}
 		return appendStreamGroup(v[:0], &bad)
 	})
 	mutate("duplicate consumer", func(v []byte) []byte {
