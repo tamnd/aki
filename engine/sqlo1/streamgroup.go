@@ -380,12 +380,12 @@ func (x *Stream) GroupSetID(ctx context.Context, key, group []byte, idOK bool, i
 }
 
 // GroupDestroy is XGROUP DESTROY: compact the ordinals by moving the
-// last record into the destroyed slot, then drop the vacated tail
-// after the root that stopped referencing it, all one batch. A missing
-// group is destroyed false, not an error. The destroyed group's PEL
-// segments become orphans until the XDEL slice adds the destroy sweep
-// (milestone line for XDEL and DESTROY), the plane-retire cleanup
-// story in the meantime.
+// last record into the destroyed slot, then drop the vacated tail and
+// every PEL segment the destroyed group's fence referenced, after the
+// record writes that stopped referencing them, all one batch. Segment
+// keys carry no group ordinal, so the compaction move never touches
+// the surviving groups' segments. A missing group is destroyed false,
+// not an error.
 func (x *Stream) GroupDestroy(ctx context.Context, key, group []byte) (bool, error) {
 	exists, expMs, err := x.stateOf(ctx, key)
 	if err != nil {
@@ -394,7 +394,7 @@ func (x *Stream) GroupDestroy(ctx context.Context, key, group []byte) (bool, err
 	if !exists {
 		return false, errXgroupNoKey
 	}
-	ord, _, err := x.findGroup(ctx, group)
+	ord, g, err := x.findGroup(ctx, group)
 	if err != nil {
 		return false, err
 	}
@@ -419,6 +419,11 @@ func (x *Stream) GroupDestroy(ctx context.Context, key, group []byte) (bool, err
 	}
 	if err := x.delGroupRec(ctx, lastOrd); err != nil {
 		return false, err
+	}
+	for i := range g.pelf {
+		if err := x.delPelSeg(ctx, g.pelf[i].segid); err != nil {
+			return false, err
+		}
 	}
 	return true, x.restamp(ctx, key, expMs)
 }

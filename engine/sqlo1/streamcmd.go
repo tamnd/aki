@@ -280,6 +280,36 @@ func (s *Server) xtrimCmd(ctx context.Context, reply []byte, args [][]byte) []by
 	return AppendInt(reply, removed)
 }
 
+// xdelCmd is XDEL key id [id ...], replying the number of live
+// entries tombstoned. The key check runs first, Redis's order: a
+// missing key answers 0 and a wrong type errors before any ID parses,
+// and one bad ID aborts the whole call with nothing deleted.
+func (s *Server) xdelCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 3 {
+		return arityErr(reply, "XDEL")
+	}
+	exists, err := s.x.AckPrecheck(ctx, args[1])
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	if !exists {
+		return AppendInt(reply, 0)
+	}
+	ids := make([]streamID, 0, len(args)-2)
+	for _, a := range args[2:] {
+		mode, id, ok := parseStreamXaddID(a)
+		if !ok || mode != xidExplicit {
+			return AppendError(reply, errInvalidStreamID)
+		}
+		ids = append(ids, id)
+	}
+	n, err := s.x.Del(ctx, args[1], ids)
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	return AppendInt(reply, n)
+}
+
 // The XSETID option texts and the shared XINFO error shapes, Redis
 // 8.8's exactly. The max-deleted check is part of the argument parse:
 // it outranks the missing key and WRONGTYPE alike.
