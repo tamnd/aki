@@ -26,8 +26,8 @@ const (
 	segBlockHdr      = 4 + 4 + 1 + 3 // rawlen, storedlen, comp, reserved
 	segFooterFixed   = 2 + 4 + 8 + 1 + 1 + 8 + 8 + 4
 	segBlockEntry    = 8 + 4 + 4 + 4
-	segChunkFixed    = 4 + 4 + 2 + 1 + 8 + 2 + 2 // everything but the key
-	segFooterTrailer = 4 + 8 + 8 + 4             // bloomlen, nrecords, rawbytes, fcrc
+	segChunkFixed    = 4 + 4 + 2 + 1 + 1 + 8 + 2 + 2 // everything but the key
+	segFooterTrailer = 4 + 8 + 8 + 4                 // bloomlen, nrecords, rawbytes, fcrc
 )
 
 // SegmentBlockEntry is one block index row: where the block sits in the
@@ -53,6 +53,7 @@ type SegmentChunkEntry struct {
 	OffInBlock uint32
 	Key        []byte
 	Kind       uint8
+	Flags      uint8 // the frame's flags byte: ChunkFlagRun, ChunkFlagTTLBitmap
 	FirstDisc  uint64
 	Count      uint16 // records in the chunk
 	LiveHint   uint16
@@ -89,6 +90,7 @@ type Segment struct {
 type SegmentChunk struct {
 	Key       []byte
 	Kind      uint8
+	Flags     uint8
 	FirstDisc uint64
 	Count     uint16
 	LiveHint  uint16
@@ -127,7 +129,7 @@ func BuildSegment(f SegmentFooter, chunks []SegmentChunk, memberKeys [][]byte, b
 		}
 		seg.Footer.Chunks = append(seg.Footer.Chunks, SegmentChunkEntry{
 			Block: uint32(len(seg.BlockData)), OffInBlock: uint32(len(cur)),
-			Key: c.Key, Kind: c.Kind, FirstDisc: c.FirstDisc,
+			Key: c.Key, Kind: c.Kind, Flags: c.Flags, FirstDisc: c.FirstDisc,
 			Count: c.Count, LiveHint: c.LiveHint,
 		})
 		cur = append(cur, c.Data...)
@@ -193,7 +195,7 @@ func AppendSegment(b []byte, writer uint64, seg *Segment) ([]byte, error) {
 		b = binary.LittleEndian.AppendUint32(b, c.OffInBlock)
 		b = binary.LittleEndian.AppendUint16(b, uint16(len(c.Key)))
 		b = append(b, c.Key...)
-		b = append(b, c.Kind)
+		b = append(b, c.Kind, c.Flags)
 		b = binary.LittleEndian.AppendUint64(b, c.FirstDisc)
 		b = binary.LittleEndian.AppendUint16(b, c.Count)
 		b = binary.LittleEndian.AppendUint16(b, c.LiveHint)
@@ -318,9 +320,10 @@ func ParseSegmentFooter(b []byte) (SegmentFooter, error) {
 		}
 		q := p + 10 + klen
 		c.Kind = body[q]
-		c.FirstDisc = binary.LittleEndian.Uint64(body[q+1 : q+9])
-		c.Count = binary.LittleEndian.Uint16(body[q+9 : q+11])
-		c.LiveHint = binary.LittleEndian.Uint16(body[q+11 : q+13])
+		c.Flags = body[q+1]
+		c.FirstDisc = binary.LittleEndian.Uint64(body[q+2 : q+10])
+		c.Count = binary.LittleEndian.Uint16(body[q+10 : q+12])
+		c.LiveHint = binary.LittleEndian.Uint16(body[q+12 : q+14])
 		f.Chunks[i] = c
 		p += segChunkFixed + klen
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"sort"
 
+	"github.com/tamnd/aki/engine/obs1"
 	"github.com/tamnd/aki/engine/obs1/shard"
 	"github.com/tamnd/aki/engine/obs1/store"
 	"github.com/tamnd/aki/engine/obs1/tier"
@@ -97,8 +98,8 @@ func (c *coldChunks) value(loc uint32) ([]byte, bool) {
 	if !ok {
 		return nil, false
 	}
-	_, val, ok := chunkEntry(ck.Payload, int(locEntry(loc)))
-	return val, ok
+	p, ok := store.PackedPairAt(ck.Payload, ck.Flags, ck.Count, int(locEntry(loc)))
+	return p.Value, ok
 }
 
 // pair resolves a cold record's locator to both its field and value bytes, the
@@ -114,15 +115,16 @@ func (c *coldChunks) pair(loc uint32) (field, value []byte, ok bool) {
 	if !ok {
 		return nil, nil, false
 	}
-	return chunkEntry(ck.Payload, int(locEntry(loc)))
+	p, ok := store.PackedPairAt(ck.Payload, ck.Flags, ck.Count, int(locEntry(loc)))
+	return p.Field, p.Value, ok
 }
 
 // markDirty flags the chunk owning the field at hash as needing a repack, the
 // resident record a cold delete leaves behind (the value bytes stay packed in the
 // frame until the promotion-and-repack pass reclaims them, spec 2064/f3/06 section
 // 6.5). It is a directory-only mark; the frame is untouched.
-func (c *coldChunks) markDirty(hash uint64) {
-	if idx, ok := c.dir.Floor(discOf(hash)); ok {
+func (c *coldChunks) markDirty(disc uint64) {
+	if idx, ok := c.dir.Floor(discOf(disc)); ok {
 		_, _, status := c.dir.At(idx)
 		c.dir.SetStatus(idx, status|tier.DescDirty)
 	}
@@ -140,54 +142,24 @@ func (c *coldChunks) residentBytes() uint64 {
 	return uint64(c.dir.Bytes()) + uint64(cap(c.offs))*8
 }
 
-// discOf renders a field hash as an eight-byte big-endian discriminator, so the
-// directory's byte-lexicographic order is the fields' hash order (the ordering
-// contract of tier/directory.go). A hash has no partitioned band, so one directory
-// spans the whole native table and the discs stay cleanly ordered.
-func discOf(hash uint64) []byte {
+// discOf renders a field's fold discriminator as eight big-endian bytes, so the
+// directory's byte-lexicographic order is the discriminators' numeric order (the
+// ordering contract of tier/directory.go, and the same big-endian rule the fold
+// plane's disc64 lifts). A hash has no partitioned band, so one directory spans
+// the whole native table and the discs stay cleanly ordered.
+func discOf(disc uint64) []byte {
 	var d [8]byte
-	binary.BigEndian.PutUint64(d[:], hash)
+	binary.BigEndian.PutUint64(d[:], disc)
 	return d[:]
 }
 
-// appendEntry packs one field-value pair into a chunk payload: an unsigned-varint
-// field length, the field bytes, an unsigned-varint value length, then the value
-// bytes. The field rides along for the M8 recovery walk and the promote re-seat;
-// the value is what a cold read returns. The entry index a locator carries is the
-// ordinal position of the pair in this stream, which chunkEntry walks to.
-func appendEntry(payload, field, value []byte) []byte {
-	payload = binary.AppendUvarint(payload, uint64(len(field)))
-	payload = append(payload, field...)
-	payload = binary.AppendUvarint(payload, uint64(len(value)))
-	return append(payload, value...)
-}
-
-// chunkEntry returns the field and value of the idx-th pair packed in payload, or
-// false when the payload is torn or shorter than idx+1 pairs. It walks the
-// length-prefixed stream; a chunk holds at most maxChunkEntry pairs, so the walk is
-// bounded.
-func chunkEntry(payload []byte, idx int) (field, value []byte, ok bool) {
-	p := payload
-	for i := 0; ; i++ {
-		fn, w := binary.Uvarint(p)
-		if w <= 0 || uint64(len(p)-w) < fn {
-			return nil, nil, false
-		}
-		p = p[w:]
-		f := p[:fn]
-		p = p[fn:]
-		vn, w := binary.Uvarint(p)
-		if w <= 0 || uint64(len(p)-w) < vn {
-			return nil, nil, false
-		}
-		p = p[w:]
-		v := p[:vn]
-		p = p[vn:]
-		if i == idx {
-			return f, v, true
-		}
-	}
-}
+// fieldDisc is the fold plane's shared coordinate for a field name
+// (obs1.Disc, the keymap and bloom h1): the demoter packs and keys its
+// cold directory in this order so the chunks it appends carry
+// discriminators a segment planner can floor against. The table's own
+// probe stays on store.Hash; only the cold tier speaks the fold
+// coordinate.
+func fieldDisc(field []byte) uint64 { return obs1.Disc(field) }
 
 // demote packs the hash at key into the cold region and returns the fields whose
 // values were shed. It is the directly-callable core the worker's demote loop drives
@@ -257,7 +229,7 @@ func (f *ftable) demote(st *store.Store, key []byte) int {
 		if e.band&tierCold != 0 {
 			continue // already cold from an earlier pass
 		}
-		ents = append(ents, entry{store.Hash(f.slab[e.foff : e.foff+uint32(e.flen)]), ord})
+		ents = append(ents, entry{fieldDisc(f.slab[e.foff : e.foff+uint32(e.flen)]), ord})
 	}
 	if len(ents) == 0 {
 		return 0
@@ -270,35 +242,45 @@ func (f *ftable) demote(st *store.Store, key []byte) int {
 	cc := f.cold
 
 	// Pack and append every chunk first, collecting the placements; only commit the
-	// directory and the retier once all appends succeed. firstHash is the
-	// discriminator of the chunk currently filling.
+	// directory and the retier once all appends succeed. firstDisc is the
+	// discriminator of the chunk currently filling. The pack runs through the
+	// shared codec (store.ChunkPacker) with each field's inline expiry, so a
+	// chunk with a TTL bearer leaves under ChunkFlagTTLBitmap and one with none
+	// packs byte-identical to the plain form, and the append goes through the
+	// fold seam: the same bytes the local directory keys reach the segment
+	// folder, which is what makes this hash readable cold on the object store.
 	type placed struct {
 		off  uint64
 		disc []byte
 		ords []uint32
 	}
 	var chunks []placed
-	var payload []byte
+	var pk store.ChunkPacker
 	var ords []uint32
-	var firstHash uint64
+	var firstDisc uint64
 	for i, e := range ents {
 		if len(cc.offs)+len(chunks)+1 > maxColdSlot {
 			break // offset-table ceiling: leave the rest resident for the next pass
 		}
 		if len(ords) == 0 {
-			firstHash = e.hash
+			firstDisc = e.hash
 		}
 		r := &f.ents[e.ord]
-		payload = appendEntry(payload, f.slab[r.foff:r.foff+uint32(r.flen)], f.slab[r.voff:r.voff+r.vlen])
+		var exp uint64
+		if f.exp != nil {
+			exp = f.exp[e.ord]
+		}
+		pk.Add(f.slab[r.foff:r.foff+uint32(r.flen)], f.slab[r.voff:r.voff+r.vlen], exp)
 		ords = append(ords, e.ord)
-		full := len(payload) >= chunkByteTarget || len(ords) >= maxChunkEntry
+		full := pk.Bytes() >= chunkByteTarget || pk.Count() >= maxChunkEntry
 		if full || i == len(ents)-1 {
-			off, ok := st.AppendChunk(kindHash, 0, uint16(len(ords)), key, discOf(firstHash), payload)
+			payload, flags := pk.Finish()
+			off, ok := st.AppendChunkFold(kindHash, flags, uint16(pk.Count()), key, discOf(firstDisc), payload)
 			if !ok {
 				return 0 // broken region: abandon, the table stays fully resident
 			}
-			chunks = append(chunks, placed{off: off, disc: discOf(firstHash), ords: append([]uint32(nil), ords...)})
-			payload = payload[:0]
+			chunks = append(chunks, placed{off: off, disc: discOf(firstDisc), ords: append([]uint32(nil), ords...)})
+			pk.Reset()
 			ords = ords[:0]
 		}
 	}
@@ -378,13 +360,13 @@ func (f *ftable) promote(ord uint32) {
 		if r.band&tierCold == 0 || locSlot(r.voff) != slot {
 			continue
 		}
-		_, val, ok := chunkEntry(ck.Payload, int(locEntry(r.voff)))
+		p, ok := store.PackedPairAt(ck.Payload, ck.Flags, ck.Count, int(locEntry(r.voff)))
 		if !ok {
 			continue
 		}
 		r.voff = uint32(len(f.slab))
-		f.slab = append(f.slab, val...)
-		r.vlen = uint32(len(val))
+		f.slab = append(f.slab, p.Value...)
+		r.vlen = uint32(len(p.Value))
 		r.band &^= tierCold
 	}
 	// Drop the chunk's directory descriptor; its offset-table slot becomes a tombstone

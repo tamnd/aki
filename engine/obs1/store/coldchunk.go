@@ -27,6 +27,7 @@ import "encoding/binary"
 // it.
 type Chunk struct {
 	Kind    byte
+	Flags   byte
 	Count   int
 	Disc    []byte
 	Payload []byte
@@ -81,8 +82,27 @@ func (s *Store) ReadChunk(off uint64, dst []byte) (Chunk, []byte, bool) {
 	}
 	return Chunk{
 		Kind:    f.kind &^ frameChunk,
+		Flags:   f.flags,
 		Count:   int(f.count),
 		Disc:    f.disc,
 		Payload: f.payload,
 	}, buf, true
+}
+
+// AppendChunkFold is AppendChunk for a demoter whose chunks fold: the
+// frame appends to the cold region exactly as AppendChunk does, and on
+// success the fold tap hears it, so the same bytes the local directory
+// keys reach the segment folder. Call it on the owner goroutine like the
+// staged drain, so the folder's eligibility mark covers the mutations the
+// chunk reflects. A demoter flips to this call only once its
+// discriminator is the fold plane's shared coordinate (Disc, big-endian
+// bytes); until then folded chunks would carry a coordinate no planner
+// can search, so the other types stay on AppendChunk until their slices
+// land.
+func (s *Store) AppendChunkFold(kind, flags byte, count uint16, key, disc, payload []byte) (uint64, bool) {
+	off, ok := s.AppendChunk(kind, flags, count, key, disc, payload)
+	if ok && s.foldTap != nil {
+		s.foldTap(s.frameBuf)
+	}
+	return off, ok
 }

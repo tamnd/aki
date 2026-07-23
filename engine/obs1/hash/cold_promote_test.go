@@ -3,7 +3,6 @@ package hash
 import (
 	"testing"
 
-	"github.com/tamnd/aki/engine/obs1/store"
 	"github.com/tamnd/aki/engine/obs1/tier"
 )
 
@@ -121,7 +120,7 @@ func TestHashColdDeleteMarksDirtyNotPromote(t *testing.T) {
 	var slot uint32
 	for _, ord := range f.vec {
 		field = string(f.fieldByOrd(ord))
-		hh = store.Hash(f.fieldByOrd(ord))
+		hh = fieldDisc(f.fieldByOrd(ord))
 		slot = locSlot(f.ents[ord].voff)
 		break
 	}
