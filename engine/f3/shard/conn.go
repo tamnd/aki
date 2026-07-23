@@ -576,25 +576,34 @@ func (c *Conn) flushShard(sh int) {
 	// rule against a still-earlier one).
 }
 
-// take pulls a node from the free list, or allocates when the list is dry;
-// the steady path recycles.
+// take pulls a node from the connection's own free list, falling through to the
+// runtime's shared overflow pool when the L1 is dry. The L1 hit returns a node
+// this connection recycled, so its conn field is already set; the pool path
+// (which may hand back a node another connection freed, or a fresh one) stamps
+// it. Under a pipelined burst the reader outruns the writer's recycle and the L1
+// runs empty, so the pool, not a per-command allocation, backs the overflow.
 func (c *Conn) take() *hopBatch {
 	select {
 	case b := <-c.free:
 		return b
 	default:
-		b := newBatch(c.rt.batchDataCap, c.rt.repCap)
-		b.conn = c
-		return b
 	}
+	b := c.rt.getBatch()
+	b.conn = c
+	return b
 }
 
+// recycle resets a node and returns it to the connection's L1 free list, or to
+// the runtime's shared pool when the L1 is full, so an overflow node is reused
+// rather than dropped to the collector.
 func (c *Conn) recycle(b *hopBatch) {
 	b.reset()
 	select {
 	case c.free <- b:
+		return
 	default:
 	}
+	c.rt.putBatch(b)
 }
 
 // DrainReplies pops every completed node currently queued, emits its replies
