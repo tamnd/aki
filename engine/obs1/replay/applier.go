@@ -47,6 +47,14 @@ type Config struct {
 	// run always share a group and so a shard, since a run rides one
 	// commit section and a section is one group's frames.
 	Ctx func(key []byte) *shard.Ctx
+
+	// KeyDel, when set, hears every keydel frame the replay applies,
+	// hit or miss. The boot wiring uses it to carry tail deletes into
+	// the rebuilt keymap: a delete above the fold cursor never folded,
+	// so the segment-rebuilt index still holds the dead placement and a
+	// cold read would resurrect the key without this feed. The key is a
+	// view into the frame buffer, valid only for the call.
+	KeyDel func(key []byte)
 }
 
 // Stats counts what an Applier did, the recovery report's store half.
@@ -248,6 +256,9 @@ func (a *Applier) applyOne(group uint16, key []byte, op obs1.Op) error {
 			a.stats.Dels++
 		} else {
 			a.stats.DelMisses++
+		}
+		if a.cfg.KeyDel != nil {
+			a.cfg.KeyDel(key)
 		}
 	case obs1.Expire:
 		at, err := deadline(o.ExpiryMS)
