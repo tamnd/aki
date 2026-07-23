@@ -210,6 +210,16 @@ type native struct {
 	scratch []byte    // reused repack buffer for interior surgery, so a chunk rewrite does not allocate per call
 	cold    *listCold // cold-tier state, nil until the first demote (cold.go)
 	coldN   int       // demoted chunks currently in the ring; only demote and promote move it, so residentBytes stays O(1) without a walk
+	// headVirt is the signed virtual position of the head element (spec
+	// 2064/obs1 doc 08 section 6): it moves down on a head push and up on a
+	// head pop or trim, so an element's virtual position (headVirt plus its
+	// dense index) is stable under the queue-shaped end churn. The fold
+	// coordinate of a demoted run is its first element's virtual position,
+	// biased into unsigned space, which keeps successive demote generations
+	// of a steady queue in one monotone coordinate. Interior surgery shifts
+	// dense indexes without moving headVirt; the affected chunks promote on
+	// touch and refold with fresh coordinates, the doc 08 refold rule.
+	headVirt int64
 }
 
 // chunkFootprint is the resident-byte cost of one standard chunk's backing
@@ -318,6 +328,7 @@ func (nt *native) pushFront(v []byte) {
 	c.bytesUsed += c.writeFrame(off, v)
 	c.lo--
 	c.dir[c.lo] = uint16(off)
+	nt.headVirt--
 	nt.count++
 	nt.bytes += len(v)
 	nt.dir.stale = true
@@ -341,6 +352,7 @@ func (nt *native) popFront() []byte {
 	if off+flen == c.bytesUsed {
 		c.bytesUsed = off
 	}
+	nt.headVirt++
 	nt.count--
 	nt.bytes -= len(v)
 	nt.dir.stale = true
@@ -817,6 +829,7 @@ func (nt *native) trim(start, stop int) {
 			nt.bytes -= len(val)
 		}
 	}
+	nt.headVirt += int64(start) // the head-side drops removed exactly start elements
 	nt.count = stop - start + 1
 	nt.dir.stale = true
 }

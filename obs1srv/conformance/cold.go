@@ -26,23 +26,34 @@ const (
 	ColdFields   = 600
 	ColdMembers  = 200
 	ColdZMembers = 200
+	ColdListLen  = 200
 )
 
 // ColdStringKey names the nth cold-arm string key, exported so the arm
 // can watch these exact keys reach the fold.
 func ColdStringKey(i int) string { return "cold:str:" + strconv.Itoa(i) }
 
-// ColdHashKey, ColdSetKey, and ColdZsetKey name the cold-arm collections.
+// ColdHashKey, ColdSetKey, ColdZsetKey, and ColdListKey name the cold-arm
+// collections.
 const (
 	ColdHashKey = "cold:hash"
 	ColdSetKey  = "cold:set"
 	ColdZsetKey = "cold:zset"
+	ColdListKey = "cold:list"
 )
 
 func coldField(i int) string   { return fmt.Sprintf("cf%03d", i) }
 func coldValue(i int) string   { return fmt.Sprintf("cw-%03d", i) }
 func coldMember(i int) string  { return fmt.Sprintf("cm%03d", i) }
 func coldZMember(i int) string { return fmt.Sprintf("zm%03d", i) }
+
+// coldElem pads each list element to roughly 100 bytes so ColdListLen of
+// them span several 4 KiB list chunks and the demote pass has a real
+// interior to shed; a 200-element list of short strings would fit one
+// chunk and never leave the ends-stay-hot margins.
+func coldElem(i int) string {
+	return fmt.Sprintf("le%03d-%094d", i, i)
+}
 
 // ColdBuild returns the write steps that stand the cold working set up.
 func ColdBuild() []Step {
@@ -74,6 +85,14 @@ func ColdBuild() []Step {
 			zadd = append(zadd, strconv.Itoa(i), coldZMember(i))
 		}
 		steps = append(steps, c(strconv.Itoa(batch), zadd...))
+	}
+	// RPUSH replies with the running length, so each batch expects its end.
+	for base := 0; base < ColdListLen; base += batch {
+		rpush := []string{"RPUSH", ColdListKey}
+		for i := base; i < base+batch; i++ {
+			rpush = append(rpush, coldElem(i))
+		}
+		steps = append(steps, c(strconv.Itoa(base+batch), rpush...))
 	}
 	return steps
 }
@@ -120,6 +139,21 @@ func ColdVerify() []Step {
 			"ZRANGE", ColdZsetKey, "10", "12"),
 		c("(nil)", "ZSCORE", ColdZsetKey, "zm-missing"),
 		c("(nil)", "ZRANK", ColdZsetKey, "zm-missing"),
+	)
+	// The list reads: the length, index points at both ends, the interior
+	// (where the demoted chunks live), negative indexes, one range window,
+	// and the misses.
+	steps = append(steps, c(strconv.Itoa(ColdListLen), "LLEN", ColdListKey))
+	for i := 0; i < ColdListLen; i += 10 {
+		steps = append(steps, c(coldElem(i), "LINDEX", ColdListKey, strconv.Itoa(i)))
+	}
+	steps = append(steps,
+		c(coldElem(ColdListLen-1), "LINDEX", ColdListKey, "-1"),
+		c(coldElem(ColdListLen-10), "LINDEX", ColdListKey, strconv.Itoa(-10)),
+		c("["+coldElem(90)+" "+coldElem(91)+" "+coldElem(92)+"]",
+			"LRANGE", ColdListKey, "90", "92"),
+		c("(nil)", "LINDEX", ColdListKey, strconv.Itoa(ColdListLen)),
+		c("0", "LLEN", "cold:list:missing"),
 	)
 	return steps
 }
