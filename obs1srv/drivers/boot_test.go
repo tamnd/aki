@@ -240,3 +240,80 @@ func TestBootServesHashesAcrossRestart(t *testing.T) {
 	expect(t, r3, ":2\r\n")
 	commitAndStop(t, b3, srv3, nc3)
 }
+
+// TestBootServesZSetsAcrossRestart drives the zset plane through the
+// boot seam: creates, a rescore, removals, a pop, a GEOADD riding the
+// same frames, a STORE form resetting a live destination over one hash
+// tag, and an emptying ZREM whose colldrop the next incarnation replays.
+// Single-key DEL does not see the zset registry yet (owed to the
+// keyspace-unification slice), so the keydel-over-zset path is proven at
+// the applier unit level instead.
+func TestBootServesZSetsAcrossRestart(t *testing.T) {
+	bucket := sim.New(sim.Config{})
+
+	b1, srv1, nc1, r1 := bootServer(t, bucket, 1)
+	send(t, nc1, "ZADD", "z", "1", "a", "2", "b", "3", "c")
+	expect(t, r1, ":3\r\n")
+	send(t, nc1, "ZADD", "z", "5.5", "a")
+	expect(t, r1, ":0\r\n")
+	send(t, nc1, "ZREM", "z", "b")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "ZINCRBY", "zc", "5", "m")
+	expect(t, r1, "$1\r\n5\r\n")
+	send(t, nc1, "ZINCRBY", "zc", "2", "m")
+	expect(t, r1, "$1\r\n7\r\n")
+	send(t, nc1, "ZADD", "zp", "1", "p1", "2", "p2")
+	expect(t, r1, ":2\r\n")
+	send(t, nc1, "ZPOPMIN", "zp")
+	expect(t, r1, "*2\r\n$2\r\np1\r\n$1\r\n1\r\n")
+	send(t, nc1, "GEOADD", "geo", "13.361389", "38.115556", "Palermo")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "ZADD", "gone", "1", "x")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "ZREM", "gone", "x")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "ZADD", "{t}src", "1", "m")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "ZADD", "{t}dst", "9", "old")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "ZUNIONSTORE", "{t}dst", "1", "{t}src")
+	expect(t, r1, ":1\r\n")
+	commitAndStop(t, b1, srv1, nc1)
+
+	b2, srv2, nc2, r2 := bootServer(t, bucket, 2)
+	if b2.Replay.ZAdds == 0 || b2.Replay.ZRems == 0 || b2.Replay.CollDrops == 0 {
+		t.Fatalf("reboot replay stats %+v, want zset plane counts", b2.Replay)
+	}
+	send(t, nc2, "ZSCORE", "z", "a")
+	expect(t, r2, "$3\r\n5.5\r\n")
+	send(t, nc2, "ZSCORE", "z", "b")
+	expect(t, r2, "$-1\r\n")
+	send(t, nc2, "ZCARD", "z")
+	expect(t, r2, ":2\r\n")
+	send(t, nc2, "ZSCORE", "zc", "m")
+	expect(t, r2, "$1\r\n7\r\n")
+	send(t, nc2, "ZCARD", "zp")
+	expect(t, r2, ":1\r\n")
+	send(t, nc2, "ZSCORE", "zp", "p2")
+	expect(t, r2, "$1\r\n2\r\n")
+	send(t, nc2, "ZCARD", "geo")
+	expect(t, r2, ":1\r\n")
+	send(t, nc2, "ZCARD", "gone")
+	expect(t, r2, ":0\r\n")
+	send(t, nc2, "ZSCORE", "{t}dst", "m")
+	expect(t, r2, "$1\r\n1\r\n")
+	send(t, nc2, "ZSCORE", "{t}dst", "old")
+	expect(t, r2, "$-1\r\n")
+	send(t, nc2, "ZCARD", "{t}dst")
+	expect(t, r2, ":1\r\n")
+	send(t, nc2, "ZADD", "z", "4", "d")
+	expect(t, r2, ":1\r\n")
+	commitAndStop(t, b2, srv2, nc2)
+
+	b3, srv3, nc3, r3 := bootServer(t, bucket, 3)
+	send(t, nc3, "ZCARD", "z")
+	expect(t, r3, ":3\r\n")
+	send(t, nc3, "ZSCORE", "z", "d")
+	expect(t, r3, "$1\r\n4\r\n")
+	commitAndStop(t, b3, srv3, nc3)
+}
