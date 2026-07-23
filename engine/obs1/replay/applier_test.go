@@ -6,6 +6,7 @@ import (
 
 	"github.com/tamnd/aki/engine/obs1"
 	"github.com/tamnd/aki/engine/obs1/hash"
+	"github.com/tamnd/aki/engine/obs1/list"
 	"github.com/tamnd/aki/engine/obs1/replay"
 	"github.com/tamnd/aki/engine/obs1/set"
 	"github.com/tamnd/aki/engine/obs1/shard"
@@ -503,18 +504,134 @@ func TestApplierZSetCorruptionIsLoud(t *testing.T) {
 	}
 }
 
+// TestApplierListPlane replays the emitter shapes writelog.go frames for
+// lists: collnew plus a sided push on create, more pushes both ways, the
+// positional lset, lrem, and lins surgery, decided-count pops, and the
+// pop plus colldrop pair when the last element leaves.
+func TestApplierListPlane(t *testing.T) {
+	a, cx := newApplier(t)
+
+	m := func(ss ...string) [][]byte {
+		out := make([][]byte, len(ss))
+		for i, s := range ss {
+			out[i] = []byte(s)
+		}
+		return out
+	}
+	// Build a, b, c, d then operate: RPUSH b c, LPUSH a, RPUSH d.
+	apply(t, a, 0, frame(t, 1, "l", obs1.CollNew{Type: obs1.CollList}))
+	apply(t, a, 0, frame(t, 2, "l", obs1.CollDelta{Sub: obs1.RPush{Values: m("b", "c")}}))
+	apply(t, a, 0, frame(t, 3, "l", obs1.CollDelta{Sub: obs1.LPush{Values: m("a")}}))
+	apply(t, a, 0, frame(t, 4, "l", obs1.CollDelta{Sub: obs1.RPush{Values: m("d")}}))
+	wantList(t, cx, "l", "a", "b", "c", "d")
+
+	// LSET index 1 -> B, LINSERT so x lands at index 2, LREM positions 0 and 3.
+	apply(t, a, 0, frame(t, 5, "l", obs1.CollDelta{Sub: obs1.LSet{Index: 1, Value: []byte("B")}}))
+	apply(t, a, 0, frame(t, 6, "l", obs1.CollDelta{Sub: obs1.LIns{Index: 2, Value: []byte("x")}}))
+	wantList(t, cx, "l", "a", "B", "x", "c", "d")
+	apply(t, a, 0, frame(t, 7, "l", obs1.CollDelta{Sub: obs1.LRem{Indices: []uint32{0, 3}}}))
+	wantList(t, cx, "l", "B", "x", "d")
+
+	// Pop one from each end, then the emptying pop rides its colldrop.
+	apply(t, a, 0, frame(t, 8, "l", obs1.CollDelta{Sub: obs1.LPop{Count: 1}}))
+	apply(t, a, 0, frame(t, 9, "l", obs1.CollDelta{Sub: obs1.RPop{Count: 1}}))
+	wantList(t, cx, "l", "x")
+	apply(t, a, 0, frame(t, 10, "l", obs1.CollDelta{Sub: obs1.LPop{Count: 1}}))
+	apply(t, a, 0, frame(t, 11, "l", obs1.CollDrop{}))
+	if list.ReplayDrop(cx, []byte("l")) {
+		t.Fatalf("l survived its colldrop")
+	}
+
+	apply(t, a, 0, frame(t, 12, "kd", obs1.CollNew{Type: obs1.CollList}))
+	apply(t, a, 0, frame(t, 13, "kd", obs1.CollDelta{Sub: obs1.LPush{Values: m("v")}}))
+	apply(t, a, 0, frame(t, 14, "kd", obs1.KeyDel{}))
+	if list.ReplayDrop(cx, []byte("kd")) {
+		t.Fatalf("the list survived its keydel")
+	}
+	if err := a.Finish(); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	got := a.Stats()
+	if got.LPushes != 2 || got.RPushes != 2 || got.LPops != 2 || got.RPops != 1 ||
+		got.LSets != 1 || got.LRems != 1 || got.LInserts != 1 || got.CollDrops != 1 || got.Dels != 1 {
+		t.Fatalf("stats %+v, want the list plane counts", got)
+	}
+}
+
+// wantList checks the replayed list's exact contents through a
+// zero-effect probe: an lset writing each element back at its own index
+// refuses only on divergence, and the length pin comes from an
+// out-of-range lset refusing. Kept test-local so the production surface
+// stays the replay entry points.
+func wantList(t *testing.T, cx *shard.Ctx, key string, elems ...string) {
+	t.Helper()
+	for i, e := range elems {
+		if err := list.ReplaySet(cx, []byte(key), int64(i), []byte(e)); err != nil {
+			t.Fatalf("list %q index %d: %v", key, i, err)
+		}
+	}
+	if err := list.ReplaySet(cx, []byte(key), int64(len(elems)), []byte("x")); err == nil {
+		t.Fatalf("list %q is longer than %d elements", key, len(elems))
+	}
+}
+
+// TestApplierListCorruptionIsLoud drives the divergences the list plane
+// must refuse: deltas on a missing list, a pop the list cannot cover, an
+// out-of-range lset and lins, and lrem positions out of range or out of
+// order.
+func TestApplierListCorruptionIsLoud(t *testing.T) {
+	one := [][]byte{[]byte("v")}
+	build := []obs1.Op{
+		obs1.CollNew{Type: obs1.CollList},
+		obs1.CollDelta{Sub: obs1.RPush{Values: [][]byte{[]byte("a"), []byte("b")}}},
+	}
+	cases := []struct {
+		name string
+		ops  []obs1.Op
+		want string
+	}{
+		{"push on missing list", []obs1.Op{obs1.CollDelta{Sub: obs1.LPush{Values: one}}}, "no list exists"},
+		{"pop on missing list", []obs1.Op{obs1.CollDelta{Sub: obs1.LPop{Count: 1}}}, "no list exists"},
+		{"oversized pop", append(build[:2:2], obs1.CollDelta{Sub: obs1.RPop{Count: 3}}), "pop of 3"},
+		{"lset out of range", append(build[:2:2], obs1.CollDelta{Sub: obs1.LSet{Index: 2, Value: one[0]}}), "outside list"},
+		{"lins out of range", append(build[:2:2], obs1.CollDelta{Sub: obs1.LIns{Index: 3, Value: one[0]}}), "outside list"},
+		// The encoder refuses out-of-order lrem indices before a frame
+		// exists, so only the out-of-range form can reach the applier.
+		{"lrem position out of range", append(build[:2:2], obs1.CollDelta{Sub: obs1.LRem{Indices: []uint32{2}}}), "is invalid"},
+		{"collnew list consumed by sadd", []obs1.Op{
+			obs1.CollNew{Type: obs1.CollList},
+			obs1.CollDelta{Sub: obs1.SAdd{Members: one}},
+		}, "followed by sub-op"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _ := newApplier(t)
+			var err error
+			for i, op := range tc.ops {
+				if err = a.Apply(0, frame(t, uint64(i+1), "c", op)); err != nil {
+					break
+				}
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
 // TestApplierRefusesUnwiredKinds keeps the loud refusal for the planes
-// that have not landed: the other collection types and the consumer
-// group vocabulary.
+// that have not landed: the stream type and the consumer group
+// vocabulary.
 func TestApplierRefusesUnwiredKinds(t *testing.T) {
 	a, _ := newApplier(t)
-	if err := a.Apply(0, frame(t, 1, "l", obs1.CollNew{Type: obs1.CollList})); err == nil ||
+	if err := a.Apply(0, frame(t, 1, "st", obs1.CollNew{Type: obs1.CollStream})); err == nil ||
 		!strings.Contains(err.Error(), "not wired for replay yet") {
-		t.Fatalf("collnew list: %v", err)
+		t.Fatalf("collnew stream: %v", err)
 	}
-	if err := a.Apply(0, frame(t, 2, "l", obs1.CollDelta{Sub: obs1.LPush{Values: [][]byte{[]byte("v")}}})); err == nil ||
+	xa := obs1.XAdd{IDMs: 1, IDSeq: 1, Pairs: []obs1.FieldValue{{Field: []byte("f"), Value: []byte("v")}}}
+	if err := a.Apply(0, frame(t, 2, "st", obs1.CollDelta{Sub: xa})); err == nil ||
 		!strings.Contains(err.Error(), "not wired for replay yet") {
-		t.Fatalf("colldelta lpush: %v", err)
+		t.Fatalf("colldelta xadd: %v", err)
 	}
 	gd := obs1.GroupDelta{Sub: obs1.GNew{Group: []byte("g")}}
 	if err := a.Apply(0, frame(t, 3, "st", gd)); err == nil || !strings.Contains(err.Error(), "not wired yet") {
