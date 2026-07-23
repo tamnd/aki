@@ -30,4 +30,18 @@ Smoke exposure: the -quick run at shrunken constants (1 MiB flush, 4 MiB segment
 
 ## Results
 
-Pending the scored run.
+Scored run, 1 GiB at production constants (8 MiB flush, 64 MiB segment, 4 groups, 1000 B values), reqgib.csv:
+
+    payload_bytes,puts,gets,free,total,req_per_gib,wal_flushes,chain_batches,seg_puts,man_published,put_retries
+    1073741838,302,0,0,302,302.0,131,131,20,20,0
+
+Scoring the five predictions:
+
+1. HIT. 302.0 requests per GiB, inside the 280 to 340 band and well inside gate CG1's 400.
+2. PARTIAL. WAL PUTs came in at 131 against the predicted 137, chain appends landed exactly equal to WAL flushes as the at-most bound allowed, and manifests matched the segment count exactly, but segment PUTs were 20 against the predicted 17: the fold flush cuts one tail segment per group, four of them, where the prediction priced one tail total.
+3. HIT. Zero GETs; the write path never touched the bucket for reads.
+4. HIT. Zero PUT retries on the clean sim.
+5. HIT. WAL PUTs 131 sit 2.3% over payload divided by flush size (128) and chain appends match them, both inside the 10% band; segments hit payload divided by segment size plus groups (16 plus 4 equals 20) exactly.
+
+The one miss is instructive rather than alarming: prediction 2 and prediction 5 disagreed on the tail-segment term and prediction 5's per-group arithmetic was the correct one.
+The doc 09 ledger's 300 estimate holds as written, and the group-count term only matters in the last partial segment per group, a constant that vanishes as ingest grows.
