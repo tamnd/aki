@@ -81,6 +81,14 @@ type Recovery struct {
 	Winning map[uint16]Manifest
 	Applied map[uint16]uint64
 
+	// floors carries each group's fold cursor during the WAL walk: a gap
+	// at or below it is checkpoint-trimmed history the segments cover, a
+	// gap above it is unrecoverable. Frames below it that are still
+	// present replay anyway, because the #1118 cursor is stamped from the
+	// group's last emitted seq at drain time and can cover resident
+	// records no segment holds.
+	floors map[uint16]uint64
+
 	// NextWALSeq is this node's open sequence: one past the last WAL
 	// object under our node id, committed or orphaned. A restarted
 	// flusher must start here (WriteLogConfig.StartSeq) because reusing
@@ -122,6 +130,7 @@ func Recover(ctx context.Context, cfg RecoverConfig) (*Recovery, error) {
 		Root: root, Ckpt: ckpt, Fold: fold,
 		Winning: make(map[uint16]Manifest),
 		Applied: make(map[uint16]uint64),
+		floors:  make(map[uint16]uint64),
 	}
 	var verdicts []CommitVerdict
 	fold.OnCommit = func(v CommitVerdict) error {
@@ -159,15 +168,21 @@ func Recover(ctx context.Context, cfg RecoverConfig) (*Recovery, error) {
 		}
 		if m, ok := SelectManifest(group, ms, fold); ok {
 			r.Winning[group] = m
-			r.Applied[group] = m.FoldSeq
+			r.floors[group] = m.FoldSeq
 		}
 	}
 
-	// The WAL tail, exactly once above each fold cursor. The gate is the
-	// doc 04 section 2 idempotence rule: at or below the cursor skips, a
-	// jump past cursor plus one is a gap in the committed stream, which
-	// means the trimmer violated the replay floor and the state is not
-	// recoverable from here.
+	// The committed stream, exactly once per group. The fold cursor is
+	// NOT a skip floor: the #1118 tap stamps it with the group's last
+	// emitted seq at drain time, which covers the records that drained
+	// but says nothing about records still resident in RAM, so skipping
+	// below it loses every resident record the migrator never picked
+	// (the cold serve restart test caught exactly that). Frames below the
+	// cursor therefore replay whenever they are still present; only their
+	// absence is tolerated, as checkpoint-trimmed history the segments
+	// cover. Above the cursor the doc 04 section 2 rule holds unchanged:
+	// at or below the applied seq skips, a jump past it is a gap in the
+	// committed stream and the state is not recoverable from here.
 	var maxOurs uint64
 	for _, v := range verdicts {
 		if v.Commit.WALNode == cfg.Node && v.Commit.WALSeq > maxOurs {
@@ -180,6 +195,14 @@ func Recover(ctx context.Context, cfg RecoverConfig) (*Recovery, error) {
 			if err := r.section(ctx, cfg, v.Commit, cs); err != nil {
 				return nil, err
 			}
+		}
+	}
+
+	// A group whose replay ended below its fold cursor continues its WAL
+	// seqs past the cursor anyway: the trimmed history consumed them.
+	for g, fl := range r.floors {
+		if r.Applied[g] < fl {
+			r.Applied[g] = fl
 		}
 	}
 
@@ -212,7 +235,12 @@ func (r *Recovery) section(ctx context.Context, cfg RecoverConfig, rec CommitRec
 		return nil
 	}
 	if cs.FirstSeq > cur+1 {
-		return fmt.Errorf("obs1: group %d section %d-%d after applied %d: the committed stream has a gap", cs.Group, cs.FirstSeq, cs.LastSeq, cur)
+		if cs.FirstSeq-1 > r.floors[cs.Group] {
+			return fmt.Errorf("obs1: group %d section %d-%d after applied %d: the committed stream has a gap", cs.Group, cs.FirstSeq, cs.LastSeq, cur)
+		}
+		// The missing prefix sits at or below the fold cursor: history a
+		// checkpoint trimmed out of the walk, covered by the segments.
+		cur = cs.FirstSeq - 1
 	}
 	e := WALIndexEntry{
 		Group: cs.Group, Epoch: cs.Epoch, Offset: cs.Offset,

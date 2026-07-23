@@ -70,8 +70,8 @@ func TestRecoverAppliesIntoStore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Group 0's pre-fold frames stayed with the manifest; the store holds
-	// exactly the live tail.
+	// The full stream replays, group 0's folded prefix included, and in
+	// seq order the store lands on exactly the live state.
 	for key, want := range map[string]string{
 		"alpha": "two", "bravo": "b1", "charlie": "c1", "delta": "d1",
 	} {
@@ -87,8 +87,8 @@ func TestRecoverAppliesIntoStore(t *testing.T) {
 	if stats.Frames != r.Stats.FramesApplied {
 		t.Fatalf("applier saw %d frames, recovery delivered %d", stats.Frames, r.Stats.FramesApplied)
 	}
-	want := replay.Stats{Frames: 4, StrSets: 4}
+	want := replay.Stats{Frames: 6, StrSets: 5, Dels: 1}
 	if stats != want {
-		t.Fatalf("stats %+v, want %+v: one live group 0 frame plus the three unfolded groups", stats, want)
+		t.Fatalf("stats %+v, want %+v: the full committed stream, group 0's folded prefix included", stats, want)
 	}
 }

@@ -70,6 +70,10 @@ type Booted struct {
 	Dirs []*obs1.Directory
 	// Resident sums the per-group rebuild stats.
 	Resident obs1.ResidentStats
+	// Cold is the node's async cold reader, the GET pool behind the
+	// runtime's cold plan; a GET that misses the hot store and hits the
+	// keymap serves through it.
+	Cold *obs1.ColdReader
 }
 
 // Close drains and stops the pipeline: write log first so its final
@@ -78,6 +82,9 @@ func (b *Booted) Close() error {
 	err := b.WL.Close()
 	b.Folder.Close()
 	b.Pub.Close()
+	if b.Cold != nil {
+		b.Cold.Close()
+	}
 	return err
 }
 
@@ -99,9 +106,19 @@ func BootDurability(ctx context.Context, cfg BootConfig, rt *shard.Runtime) (*Bo
 		}
 	}
 
-	ap := replay.New(replay.Config{Ctx: func(key []byte) *shard.Ctx {
-		return rt.BootCtx(rt.ShardOf(key))
-	}})
+	// Tail deletes never folded, so the segment-rebuilt keymap below
+	// still holds their placements; collect them here and retire them
+	// from the index after the rebuild, or a cold read resurrects the
+	// key. Copies, because the frame buffer recycles under the walk.
+	var delTail [][]byte
+	ap := replay.New(replay.Config{
+		Ctx: func(key []byte) *shard.Ctx {
+			return rt.BootCtx(rt.ShardOf(key))
+		},
+		KeyDel: func(key []byte) {
+			delTail = append(delTail, append([]byte(nil), key...))
+		},
+	})
 	r, err := obs1.Recover(ctx, obs1.RecoverConfig{
 		Store: cfg.Store, Prefix: cfg.Prefix, Fallback: cfg.Fallback,
 		DD: cfg.DD, Node: cfg.Node, Incarnation: cfg.Incarnation,
@@ -177,6 +194,10 @@ func BootDurability(ctx context.Context, cfg BootConfig, rt *shard.Runtime) (*Bo
 		resident.Tombstones += st.Tombstones
 		resident.Swept += st.Swept
 	}
+	for _, k := range delTail {
+		_, group := ClusterMapKey(k)
+		kms[group].Delete(obs1.Fingerprint(k))
+	}
 	folder, err := obs1.NewFolder(obs1.FoldConfig{
 		Store: cfg.Store, Prefix: cfg.Prefix, Node: cfg.Node,
 		MapKey: ClusterMapKey, Mark: wl.GroupMark, Marks: wl.Marks(),
@@ -201,11 +222,44 @@ func BootDurability(ctx context.Context, cfg BootConfig, rt *shard.Runtime) (*Bo
 		wl.SetGroup(g, epoch, r.Applied[g]+1)
 	}
 
+	cold, err := obs1.NewColdReader(obs1.ColdReadConfig{
+		Store: cfg.Store,
+		Dir:   func(group uint16) *obs1.Directory { return dirs[group] },
+	})
+	if err != nil {
+		_ = wl.Close()
+		folder.Close()
+		pub.Close()
+		return nil, err
+	}
+
 	rt.SetWriteLog(wl)
 	rt.SetWALInfo(wl.AppendInfo)
 	rt.SetFoldTap(folder.Add)
 	rt.SetFoldProgress(func() uint64 { return pub.Stats().Published })
 	rt.SetFoldKick(folder.Flush)
+	// The cold plan (shard coldget.go): consult the group's keymap
+	// synchronously so an absent key stays a zero-GET definitive miss, and
+	// launch a hit through the reader, folding the record shapes down to
+	// the shard's found-or-not view (a tombstone reads as absent). The
+	// reader copies the key at intake, so the handler's view of it never
+	// outlives the call.
+	rt.SetColdPlan(func(key []byte) (shard.ColdLaunch, bool) {
+		_, group := ClusterMapKey(key)
+		loc, ok := kms[group].Lookup(obs1.Fingerprint(key))
+		if !ok {
+			return nil, false
+		}
+		return func(done func(shard.ColdHit, error)) {
+			cold.Fetch(group, key, loc, func(rec obs1.ColdRecord, err error) {
+				var h shard.ColdHit
+				if err == nil && rec.Found && !rec.Tombstone {
+					h = shard.ColdHit{Found: true, Value: rec.Value}
+				}
+				done(h, err)
+			})
+		}, true
+	})
 
-	return &Booted{WL: wl, Folder: folder, Pub: pub, Rec: r, Replay: ap.Stats(), Keymaps: kms, Dirs: dirs, Resident: resident}, nil
+	return &Booted{WL: wl, Folder: folder, Pub: pub, Rec: r, Replay: ap.Stats(), Keymaps: kms, Dirs: dirs, Resident: resident, Cold: cold}, nil
 }
