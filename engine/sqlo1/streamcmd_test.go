@@ -71,7 +71,7 @@ func TestXaddWire(t *testing.T) {
 	if got := do("XADD", "s2", "BADOPT", "a", "b"); got != "-ERR Invalid stream ID specified as stream command argument\r\n" {
 		t.Fatal(got)
 	}
-	if got := do("XADD", "s2", "MAXLEN", "100", "*", "a", "b"); got != "-ERR XADD trim options are not implemented yet\r\n" {
+	if got := do("XADD", "strim", "MAXLEN", "100", "*", "a", "b"); got != "$8\r\n999000-0\r\n" {
 		t.Fatal(got)
 	}
 

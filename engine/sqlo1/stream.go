@@ -93,6 +93,10 @@ type Stream struct {
 	fvOffs []int
 	names  [][]byte
 
+	// deadPages queues emptied fence page records for the after-root
+	// deletes a paged trim owes, listtrim's discipline.
+	deadPages []uint64
+
 	// mgKeyBuf, mgKeys, mgVals, mgRoots, and mgExps carry one range
 	// walk's prefetch round, the list Range shape.
 	mgKeyBuf []byte
