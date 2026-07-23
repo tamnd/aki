@@ -198,7 +198,9 @@ func infoRow(info, name string) uint64 {
 		return 0
 	}
 	var v uint64
-	fmt.Sscanf(info[i+len(name)+1:], "%d", &v)
+	if _, err := fmt.Sscanf(info[i+len(name)+1:], "%d", &v); err != nil {
+		return 0
+	}
 	return v
 }
 
