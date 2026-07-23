@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"sort"
 
+	"github.com/tamnd/aki/engine/obs1"
 	"github.com/tamnd/aki/engine/obs1/shard"
 	"github.com/tamnd/aki/engine/obs1/store"
 	"github.com/tamnd/aki/engine/obs1/tier"
@@ -14,9 +15,10 @@ import (
 // whole-record migrator but a demotion pass that packs many members into one cold
 // chunk and keeps a resident directory over those chunks. Under memory pressure
 // the demote loop drives one quantum out of the native heap: the coldest sub-table
-// is walked in member-hash order, its members are packed into chunks appended to
-// the cold region (store.AppendChunk), a directory descriptor is added per chunk,
-// and every packed member's record is retiered in place, its slab bytes freed.
+// is walked in fold-discriminator order, its members are packed into chunks
+// appended to the cold region through the fold seam (store.AppendChunkFold), a
+// directory descriptor is added per chunk, and every packed member's record is
+// retiered in place, its slab bytes freed.
 //
 // The retier is the crux (doc 06 section 7.2). A demoted member's record STAYS in
 // the native table, tagged cold, so the draw vector, the vslots, and the table's
@@ -30,9 +32,10 @@ import (
 // This is the set half of the per-type form doc 06 section 6.5 shares across the
 // collection types: the store owns the region, the frame, and the frameChunk
 // recovery bit (store/coldchunk.go); the directory is type-agnostic (tier package);
-// and the set owns the discriminator (member hash) and the payload encoding
-// (length-prefixed members in hash order). The zset, list, hash, and stream forms
-// reuse all three, changing only the discriminator and the packed element shape.
+// and the set owns the discriminator (obs1.Disc of the member) and the payload
+// encoding (the shared packed-pair codec with every value empty, doc 08's
+// valueless hash reuse). The zset, list, and stream forms reuse all three,
+// changing only the discriminator and the packed element shape.
 
 // kindSet is the collection kind byte a set chunk carries, a plain kind below
 // frameChunk (store.AppendChunk sets the recovery bit itself). An M8 recovery walk
@@ -85,15 +88,22 @@ func (c *coldChunks) member(loc uint32) ([]byte, bool) {
 	if !ok {
 		return nil, false
 	}
-	return chunkEntry(ck.Payload, int(locEntry(loc)))
+	p, ok := store.PackedPairAt(ck.Payload, ck.Flags, int(ck.Count), int(locEntry(loc)))
+	if !ok {
+		return nil, false
+	}
+	return p.Field, true
 }
 
-// markDirty flags the chunk owning the member at hash as needing a repack, the
+// markDirty flags the chunk owning the member at disc as needing a repack, the
 // resident record a cold remove leaves behind (the member's bytes stay packed in
 // the frame until the promotion-and-repack pass reclaims them, spec 2064/f3/06
-// section 6.5). It is a directory-only mark; the frame is untouched.
-func (c *coldChunks) markDirty(hash uint64) {
-	if idx, ok := c.dir.Floor(discOf(hash)); ok {
+// section 6.5). It is a directory-only mark; the frame is untouched. On a
+// partitioned set whose partitions demoted separately the floor can land on a
+// neighbouring partition's chunk (their fold-coordinate ranges interleave), which
+// mis-aims the repack hint but never a read; the repack pass re-walks anyway.
+func (c *coldChunks) markDirty(disc uint64) {
+	if idx, ok := c.dir.Floor(discOf(disc)); ok {
 		_, _, status := c.dir.At(idx)
 		c.dir.SetStatus(idx, status|tier.DescDirty)
 	}
@@ -111,42 +121,24 @@ func (c *coldChunks) residentBytes() uint64 {
 	return uint64(c.dir.Bytes()) + uint64(cap(c.offs))*8
 }
 
-// discOf renders a member hash as an eight-byte big-endian discriminator, so the
-// directory's byte-lexicographic order is the members' hash order (the ordering
-// contract of tier/directory.go). The partitioned band routes on the top hash
-// bits, so a partition's members occupy a contiguous, disjoint discriminator range
-// and the set-wide directory stays cleanly ordered across partitions.
-func discOf(hash uint64) []byte {
+// discOf renders a member's fold discriminator as eight big-endian bytes, so
+// the directory's byte-lexicographic order is the members' fold-coordinate
+// order (the ordering contract of tier/directory.go), the same bytes the
+// chunk frame carries to the segment folder. The table probe and the
+// partitioned band's routing stay on store.Hash; only the cold tier speaks
+// the fold coordinate, so a partitioned set's per-partition demotes can
+// interleave their ranges in the set-wide directory (see markDirty).
+func discOf(disc uint64) []byte {
 	var d [8]byte
-	binary.BigEndian.PutUint64(d[:], hash)
+	binary.BigEndian.PutUint64(d[:], disc)
 	return d[:]
 }
 
-// appendEntry packs one member into a chunk payload: an unsigned-varint length
-// then the raw bytes. The entry index a locator carries is the ordinal position in
-// this stream, which chunkEntry walks to.
-func appendEntry(payload, m []byte) []byte {
-	payload = binary.AppendUvarint(payload, uint64(len(m)))
-	return append(payload, m...)
-}
-
-// chunkEntry returns the idx-th member packed in payload, or false when the
-// payload is torn or shorter than idx+1 entries. It walks the length-prefixed
-// stream; a chunk holds at most maxChunkEntry members, so the walk is bounded.
-func chunkEntry(payload []byte, idx int) ([]byte, bool) {
-	p := payload
-	for i := 0; ; i++ {
-		n, w := binary.Uvarint(p)
-		if w <= 0 || uint64(len(p)-w) < n {
-			return nil, false
-		}
-		p = p[w:]
-		if i == idx {
-			return p[:n], true
-		}
-		p = p[n:]
-	}
-}
+// memberDisc is the fold plane's shared coordinate for a member (doc 08:
+// sets discriminate on the member), the same u64 the keymap fingerprint and
+// the segment bloom use, which is what lets a folded set chunk be planned by
+// the same directory floor a hash field uses.
+func memberDisc(m []byte) uint64 { return obs1.Disc(m) }
 
 // demote packs one quantum of the set at key into the cold region and returns the
 // members demoted. It is the directly-callable core the worker's demote loop drives
@@ -208,7 +200,7 @@ func (h *htable) demote(cc *coldChunks, key []byte) int {
 		if r.band&tierCold != 0 {
 			continue // already cold from an earlier quantum
 		}
-		ents = append(ents, entry{store.Hash(h.slab[r.loc : r.loc+uint32(r.mlen)]), ord})
+		ents = append(ents, entry{memberDisc(h.slab[r.loc : r.loc+uint32(r.mlen)]), ord})
 	}
 	if len(ents) == 0 {
 		return 0
@@ -216,35 +208,40 @@ func (h *htable) demote(cc *coldChunks, key []byte) int {
 	sort.Slice(ents, func(i, j int) bool { return ents[i].hash < ents[j].hash })
 
 	// Pack and append every chunk first, collecting the placements; only commit the
-	// directory and the retier once all appends succeed. firstHash is the
-	// discriminator of the chunk currently filling.
+	// directory and the retier once all appends succeed. firstDisc is the
+	// discriminator of the chunk currently filling. Members pack through the
+	// shared codec valueless (doc 08's valueless hash reuse: an empty value and
+	// no expiry per entry), and the append goes through the fold seam, so the
+	// same bytes the local directory keys reach the segment folder and a folded
+	// set chunk decodes under the one packed-pair rule every planner reads.
 	type placed struct {
 		off  uint64
 		disc []byte
 		ords []uint32
 	}
 	var chunks []placed
-	var payload []byte
+	var pk store.ChunkPacker
 	var ords []uint32
-	var firstHash uint64
+	var firstDisc uint64
 	for i, e := range ents {
 		if len(chunks)+1 > maxColdSlot {
 			break // offset-table ceiling: leave the rest resident for the next quantum
 		}
 		if len(ords) == 0 {
-			firstHash = e.hash
+			firstDisc = e.hash
 		}
 		r := &h.recs[e.ord]
-		payload = appendEntry(payload, h.slab[r.loc:r.loc+uint32(r.mlen)])
+		pk.Add(h.slab[r.loc:r.loc+uint32(r.mlen)], nil, 0)
 		ords = append(ords, e.ord)
-		full := len(payload) >= chunkByteTarget || len(ords) >= maxChunkEntry
+		full := pk.Bytes() >= chunkByteTarget || pk.Count() >= maxChunkEntry
 		if full || i == len(ents)-1 {
-			off, ok := cc.st.AppendChunk(kindSet, 0, uint16(len(ords)), key, discOf(firstHash), payload)
+			payload, flags := pk.Finish()
+			off, ok := cc.st.AppendChunkFold(kindSet, flags, uint16(pk.Count()), key, discOf(firstDisc), payload)
 			if !ok {
 				return 0 // broken region: abandon, the table stays fully resident
 			}
-			chunks = append(chunks, placed{off: off, disc: discOf(firstHash), ords: append([]uint32(nil), ords...)})
-			payload = payload[:0]
+			chunks = append(chunks, placed{off: off, disc: discOf(firstDisc), ords: append([]uint32(nil), ords...)})
+			pk.Reset()
 			ords = ords[:0]
 		}
 	}
@@ -323,12 +320,12 @@ func (h *htable) promote(ord uint32) bool {
 		if rr.band&tierCold == 0 || int(locSlot(rr.loc)) != slot {
 			continue
 		}
-		m, ok := chunkEntry(ck.Payload, int(locEntry(rr.loc)))
+		p, ok := store.PackedPairAt(ck.Payload, ck.Flags, int(ck.Count), int(locEntry(rr.loc)))
 		if !ok {
 			continue // a torn entry stays cold; its read path still preads it
 		}
 		rr.loc = uint32(len(h.slab))
-		h.slab = append(h.slab, m...)
+		h.slab = append(h.slab, p.Field...)
 		rr.band &^= tierCold
 	}
 	cc.dir.Remove(idx)

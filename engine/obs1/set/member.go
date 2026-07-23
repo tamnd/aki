@@ -226,8 +226,9 @@ func (h *htable) rem(m []byte) bool {
 	if r.band&tierCold != 0 {
 		// A cold member's bytes live in a chunk, not the slab, so its removal owes
 		// nothing to slab dead accounting; it dirties the owning chunk instead, which
-		// the promotion-and-repack pass reconciles (spec 2064/f3/06 section 6.5).
-		h.cold.markDirty(hash)
+		// the promotion-and-repack pass reconciles (spec 2064/f3/06 section 6.5). The
+		// directory keys on the fold coordinate, not the table hash.
+		h.cold.markDirty(memberDisc(m))
 	} else {
 		h.dead += int(r.mlen)
 	}
