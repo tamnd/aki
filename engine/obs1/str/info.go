@@ -45,6 +45,8 @@ func InfoShard(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	put(shard.StatParkWaitsResident, cx.ParkWaits(shard.ParkResident))
 	put(shard.StatParkWaitsFlushlag, cx.ParkWaits(shard.ParkFlushlag))
 	put(shard.StatParkWaitsLease, cx.ParkWaits(shard.ParkLease))
+	put(shard.StatColdRecords, m.ColdRecords)
+	put(shard.StatColdBytes, m.ColdTotalBytes)
 	put(shard.StatParkStallsResident, cx.ParkStalls(shard.ParkResident))
 	put(shard.StatParkStallsFlushlag, cx.ParkStalls(shard.ParkFlushlag))
 	put(shard.StatParkStallsLease, cx.ParkStalls(shard.ParkLease))
