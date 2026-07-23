@@ -32,4 +32,14 @@ A -quick run at 65k elements executed during development, after the bands were d
 
 ## Results
 
-Pending.
+Scored at one million elements per corpus, typepoint.csv checked in.
+
+Every point cell landed exactly on the ledger: string GET, HGET, and SISMEMBER at 1.0000 GETs per op, 127.9 to 128.0 KiB per op, 100% found; the definitive miss at 0 GETs and 0 bytes.
+HGETALL cost exactly ceil(object bytes / 16 MiB): 7 requests over the 103.4 MiB hash object.
+The band said 6 because the corpus estimate ignored chunk frame bytes and block padding; the identity the ledger actually claims held exactly, and the absolute miss is the estimate's, not the model's.
+Directory share per element: 0.522 at 4 KiB chunks, 0.264 at 8, 0.133 at 16, 0.066 at 32, all inside their bands; the ledger's ~0.3 row holds from 8 KiB up and 4 KiB chunks break it, which the chunk-codec slice should carry as a floor argument.
+
+## Verdict
+
+PRED-OBS1-O2A-TYPEPOINT: HIT (the HGETALL absolute count read 7 against an estimated 6; the predicted ceil identity itself was exact).
+The doc 08 ledger stands for strings, hashes, and sets at the modeled layouts.

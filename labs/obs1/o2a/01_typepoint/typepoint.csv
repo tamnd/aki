@@ -1,0 +1,11 @@
+cell,ops,gets_per_op,kib_per_op,found_pct
+string_get,20000,1.0000,128.0,100.00
+hash_hget,20000,1.0000,128.0,100.00
+set_sismember,20000,1.0000,127.9,100.00
+definitive_miss,20000,0.0000,0.0,100.00
+hash_hgetall_elems=1048576,reqs=7,want_ceil=7,mib_down=103.4
+dirshare_chunk_kib,chunks,dir_b_per_elem
+4,22796,0.522
+8,11523,0.264
+16,5794,0.133
+32,2905,0.066
