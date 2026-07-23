@@ -133,4 +133,10 @@ func (x *Stream) RangeAllForTest(ctx context.Context, key []byte, emit func(ms, 
 	})
 }
 
+// TrimForTest drives Trim from the external crash package, taking the
+// MINID threshold as plain integers on the same seam.
+func (x *Stream) TrimForTest(ctx context.Context, key []byte, byID bool, maxlen int64, minidMs, minidSeq uint64, approx bool, limit int64) (int64, error) {
+	return x.Trim(ctx, key, byID, maxlen, streamID{ms: minidMs, seq: minidSeq}, approx, limit)
+}
+
 var ErrStreamFenceThirdLevelForTest = errStreamFenceThirdLevel

@@ -5,8 +5,11 @@ package sqlo1_test
 // boundary is a legal recovery image, and at every prefix the recovered
 // streams (full-range IDs and fields, XLEN agreeing) must match one
 // boundary exactly: a transition, a tail page rewrite, or a fresh page
-// spill must never surface half-done. Streams only grow this slice, so
-// there is no death phase; the trim slice brings the deletion rows.
+// spill must never surface half-done. The trim phase brings the
+// deletion rows: whole-run and whole-page drops, a boundary run
+// rewrite, and a trim to empty must all land atomically too, because
+// each rides one batch and the recovery tail truncation drops a torn
+// batch whole.
 
 import (
 	"context"
@@ -137,6 +140,25 @@ func TestStreamPagedTornTail(t *testing.T) {
 	add("s", 17, "small")
 	add("s", 18, "small")
 	add("s2", 3, "tiny")
+	flush()
+
+	// Phase 6: the death rows. An approximate trim drops whole runs and
+	// empties head pages, an exact MINID trim rewrites the boundary run
+	// in its page, and an exact trim to zero leaves s2 alive but empty,
+	// each in one batch the tail truncation can only take or drop whole.
+	trim := func(key string, byID bool, maxlen int64, minidMs uint64, approx bool) {
+		t.Helper()
+		if _, err := x.TrimForTest(ctx, []byte(key), byID, maxlen, minidMs, 0, approx, 0); err != nil {
+			t.Fatalf("Trim(%q): %v", key, err)
+		}
+		mark()
+	}
+	trim("s", false, 10, 0, true)
+	flush()
+	trim("s", true, 0, 13, false)
+	flush()
+	trim("s2", false, 0, 0, false)
+	add("s2", 4, "tiny")
 	flush()
 
 	if err := db.Close(); err != nil {

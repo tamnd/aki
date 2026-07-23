@@ -101,15 +101,98 @@ func appendStreamIDBulk(reply []byte, id streamID) []byte {
 	return AppendBulk(reply, p)
 }
 
+// The trim clause's wire texts, Redis 8.8's exactly, trailing periods
+// included.
+const (
+	errNotInteger      = "ERR value is not an integer or out of range"
+	errMaxlenNegative  = "ERR The MAXLEN argument must be >= 0."
+	errLimitNegative   = "ERR The LIMIT argument must be >= 0."
+	errLimitNeedsTilde = "ERR syntax error, LIMIT cannot be used without the special ~ option"
+	errTrimBothModes   = "ERR syntax error, MAXLEN and MINID options at the same time are not compatible"
+)
+
+// streamTrimSpec is one parsed trim clause, XADD's and XTRIM's shared
+// grammar: MAXLEN|MINID [=|~] threshold [LIMIT n].
+type streamTrimSpec struct {
+	present bool
+	byID    bool
+	approx  bool
+	maxlen  int64
+	minid   streamID
+	limit   int64 // resolved: 0 unlimited
+}
+
+// parseStreamTrimClause parses the clause starting at the strategy
+// token args[i], which the caller already matched. It reports the index
+// past the clause; short is true when the threshold ran off the end of
+// args (the caller's arity error) and msg carries any other failure's
+// wire text. Redis's parse quirks hold: a trailing ~ or = with nothing
+// after it reads as the threshold, and the LIMIT checks run in the
+// order missing-value, tilde, integer, sign.
+func parseStreamTrimClause(args [][]byte, i int, spec *streamTrimSpec) (next int, short bool, msg string) {
+	spec.present = true
+	spec.byID = strings.EqualFold(string(args[i]), "MINID")
+	spec.approx = false
+	i++
+	if i+1 < len(args) && len(args[i]) == 1 && (args[i][0] == '~' || args[i][0] == '=') {
+		spec.approx = args[i][0] == '~'
+		i++
+	}
+	if i >= len(args) {
+		return i, true, ""
+	}
+	if spec.byID {
+		mode, id, ok := parseStreamXaddID(args[i])
+		if !ok || mode != xidExplicit {
+			return i, false, errInvalidStreamID
+		}
+		spec.minid = id
+	} else {
+		n, ok := parseCanonicalInt(args[i])
+		if !ok {
+			return i, false, errNotInteger
+		}
+		if n < 0 {
+			return i, false, errMaxlenNegative
+		}
+		spec.maxlen = n
+	}
+	i++
+	spec.limit = 0
+	if spec.approx {
+		spec.limit = 100 * streamRunMaxEntries
+	}
+	if i < len(args) && strings.EqualFold(string(args[i]), "LIMIT") {
+		if i+1 >= len(args) {
+			return i, false, "ERR syntax error"
+		}
+		if !spec.approx {
+			return i, false, errLimitNeedsTilde
+		}
+		n, ok := parseCanonicalInt(args[i+1])
+		if !ok {
+			return i, false, errNotInteger
+		}
+		if n < 0 {
+			return i, false, errLimitNegative
+		}
+		spec.limit = n
+		i += 2
+	}
+	return i, false, ""
+}
+
 // xaddCmd is XADD: options, the ID grammar, then the pair list. An
 // unknown option token falls through to the ID parse and answers the
-// invalid ID error, Redis's observed shape.
+// invalid ID error, Redis's observed shape; NOMKSTREAM and the trim
+// clause come in either order.
 func (s *Server) xaddCmd(ctx context.Context, reply []byte, args [][]byte, now int64) []byte {
 	if len(args) < 5 {
 		return arityErr(reply, "XADD")
 	}
 	i := 2
 	noMk := false
+	var trim streamTrimSpec
 	for i < len(args) {
 		tok := string(args[i])
 		if strings.EqualFold(tok, "NOMKSTREAM") {
@@ -118,9 +201,19 @@ func (s *Server) xaddCmd(ctx context.Context, reply []byte, args [][]byte, now i
 			continue
 		}
 		if strings.EqualFold(tok, "MAXLEN") || strings.EqualFold(tok, "MINID") {
-			// The trim slice lands next; refusing beats silently
-			// keeping data the caller asked to drop.
-			return AppendError(reply, "ERR XADD trim options are not implemented yet")
+			if trim.present {
+				return AppendError(reply, errTrimBothModes)
+			}
+			var short bool
+			var msg string
+			i, short, msg = parseStreamTrimClause(args, i, &trim)
+			if short {
+				return arityErr(reply, "XADD")
+			}
+			if msg != "" {
+				return AppendError(reply, msg)
+			}
+			continue
 		}
 		break
 	}
@@ -142,7 +235,47 @@ func (s *Server) xaddCmd(ctx context.Context, reply []byte, args [][]byte, now i
 	if !added {
 		return AppendNullBulk(reply)
 	}
+	if trim.present {
+		// The trim is the append's second op, Redis's order: MAXLEN 0
+		// lands the entry and then empties the stream. R1 serializes
+		// the pair.
+		if _, err := s.x.Trim(ctx, args[1], trim.byID, trim.maxlen, trim.minid, trim.approx, trim.limit); err != nil {
+			return storeErr(reply, err)
+		}
+	}
 	return appendStreamIDBulk(reply, id)
+}
+
+// xtrimCmd is XTRIM, the trim clause against one key, replying the
+// number of live entries removed. Parse failures beat both the missing
+// key and WRONGTYPE, Redis's order, which the parse-then-call shape
+// gives for free.
+func (s *Server) xtrimCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 4 {
+		return arityErr(reply, "XTRIM")
+	}
+	if !strings.EqualFold(string(args[2]), "MAXLEN") && !strings.EqualFold(string(args[2]), "MINID") {
+		return syntaxErr(reply)
+	}
+	var spec streamTrimSpec
+	i, short, msg := parseStreamTrimClause(args, 2, &spec)
+	if short {
+		return arityErr(reply, "XTRIM")
+	}
+	if msg != "" {
+		return AppendError(reply, msg)
+	}
+	if i != len(args) {
+		if strings.EqualFold(string(args[i]), "MAXLEN") || strings.EqualFold(string(args[i]), "MINID") {
+			return AppendError(reply, errTrimBothModes)
+		}
+		return syntaxErr(reply)
+	}
+	removed, err := s.x.Trim(ctx, args[1], spec.byID, spec.maxlen, spec.minid, spec.approx, spec.limit)
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	return AppendInt(reply, removed)
 }
 
 // xrangeCmd is XRANGE and XREVRANGE, which takes its bounds reversed

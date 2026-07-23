@@ -1157,6 +1157,8 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return storeErr(reply, err)
 		}
 		return AppendInt(reply, n)
+	case "XTRIM":
+		return s.xtrimCmd(ctx, reply, args)
 	case "XRANGE":
 		return s.xrangeCmd(ctx, reply, args, false)
 	case "XREVRANGE":
