@@ -33,10 +33,11 @@ import (
 // now references, is closed operationally: Drain force-closes the
 // open compact group before the data-file sync (see store.go).
 
-// Encoding scheme ids (doc 03 section 7, doc 04 section 11). Slice 1
-// implements SchemeRaw only; later B4 slices register the rest, and
-// SchemeFSST plus SchemeZstdDict live in the boxed stretch per the
-// cascade (#1295) and zdict (#1296) lab verdicts.
+// Encoding scheme ids (doc 03 section 7, doc 04 section 11).
+// Registered: SchemeRaw and the scalar cascade (cascade.go). The
+// zstd slice registers SchemeZstd; SchemeFSST plus SchemeZstdDict
+// live in the boxed stretch per the cascade (#1295) and zdict
+// (#1296) lab verdicts.
 const (
 	SchemeRaw      uint8 = 0 // identity, the tag-0 passthrough
 	SchemeDict     uint8 = 1 // value dictionary
@@ -58,9 +59,9 @@ const CFrameHeader = 12
 const cframeMaxUlen = 1<<16 - 1
 
 // cDecode is the scheme registry's decode side: payload bytes to
-// uncompressed bytes of exactly ulen. Slice 1 registers only the
-// identity scheme; an unknown scheme fails loudly so a newer file
-// never half-reads on an older build.
+// uncompressed bytes of exactly ulen. Registered: identity and the
+// scalar cascade schemes (cascade.go); an unknown scheme fails
+// loudly so a newer file never half-reads on an older build.
 func cDecode(scheme, dictID uint8, comp []byte, ulen int) ([]byte, error) {
 	switch scheme {
 	case SchemeRaw:
@@ -71,6 +72,18 @@ func cDecode(scheme, dictID uint8, comp []byte, ulen int) ([]byte, error) {
 			return nil, fmt.Errorf("sqlo1b: raw frame has clen %d, ulen %d", len(comp), ulen)
 		}
 		return comp, nil
+	case SchemeDict, SchemeDictRLE, SchemeFor:
+		if dictID != 0 {
+			return nil, fmt.Errorf("sqlo1b: scheme %d frame names dictionary %d", scheme, dictID)
+		}
+		out, err := cascadeDecode(scheme, comp, ulen)
+		if err != nil {
+			return nil, err
+		}
+		if len(out) != ulen {
+			return nil, fmt.Errorf("sqlo1b: scheme %d frame decoded to %d bytes, ulen %d", scheme, len(out), ulen)
+		}
+		return out, nil
 	default:
 		return nil, fmt.Errorf("sqlo1b: group scheme %d not supported by this build", scheme)
 	}
