@@ -201,14 +201,20 @@ func (u *uring) push(s ringSQE) {
 	u.tail++
 }
 
-// enter publishes pushed SQEs and optionally waits for completions,
+// publish makes pushed SQEs visible to the kernel. Submitter-only,
+// like push and tail: the reaper waits through enter without ever
+// touching the SQ side.
+func (u *uring) publish() {
+	atomic.StoreUint32(u.sqTail, u.tail)
+}
+
+// enter submits published SQEs and optionally waits for completions,
 // reporting how many SQEs the kernel consumed. EINTR retries, and so
 // do EAGAIN and EBUSY: both mean kernel-side pressure that the
 // concurrently running reaper relieves, and the reservation bound
 // keeps them rare. The kernel consumes from its own head, so a retry
 // never resubmits what an interrupted call already took.
 func (u *uring) enter(toSubmit, minComplete, flags uint32) (int, error) {
-	atomic.StoreUint32(u.sqTail, u.tail)
 	consumed := 0
 	for {
 		n, _, errno := syscall.Syscall6(sysRingEnter, uintptr(u.fd),
@@ -251,6 +257,7 @@ func RingProbe() error {
 		}
 	}
 	u.push(ringSQE{opcode: ringOpNop, userData: 1})
+	u.publish()
 	if _, err := u.enter(1, 1, ringEnterGetEvents); err != nil {
 		return fmt.Errorf("%w: nop: %v", ErrRingUnsupported, err)
 	}
@@ -397,6 +404,7 @@ func (r *IORing) submitter() {
 					userData: uint64(id),
 				})
 			}
+			r.u.publish()
 			consumed, err := r.u.enter(uint32(n), 0, 0)
 			if err != nil {
 				// The kernel took the first consumed SQEs (they will
@@ -404,7 +412,7 @@ func (r *IORing) submitter() {
 				// Rewind the SQ tail over the refused entries, fail
 				// them, and release their reservations.
 				r.u.tail -= uint32(n - consumed)
-				atomic.StoreUint32(r.u.sqTail, r.u.tail)
+				r.u.publish()
 				r.mu.Lock()
 				for _, id := range ids[consumed:] {
 					r.slots[id] = ringSlot{}
@@ -429,11 +437,12 @@ func (r *IORing) submitter() {
 	r.mu.Unlock()
 	for {
 		r.u.push(ringSQE{opcode: ringOpNop, userData: ringCloseData})
+		r.u.publish()
 		if _, err := r.u.enter(1, 0, 0); err == nil {
 			return
 		}
 		r.u.tail--
-		atomic.StoreUint32(r.u.sqTail, r.u.tail)
+		r.u.publish()
 		runtime.Gosched()
 	}
 }

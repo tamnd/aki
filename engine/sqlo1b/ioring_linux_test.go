@@ -106,8 +106,9 @@ func TestRingSyncRoundTrip(t *testing.T) {
 
 func TestRingManyInflight(t *testing.T) {
 	// Far more requests than the ring depth: chunking, the CQ-bound
-	// reservation, and slot recycling all have to hold.
-	const ext = uint32(1 << 16)
+	// reservation, and slot recycling all have to hold. 512 groups
+	// over 4 extents needs 128 groups of room per extent.
+	const ext = uint32(1 << 19)
 	const n = 512
 	r, _, comp := ringT(t, ext, 4, n)
 
@@ -168,7 +169,7 @@ func TestRingValidation(t *testing.T) {
 }
 
 func TestRingCloseDrainsQueued(t *testing.T) {
-	const ext = uint32(1 << 16)
+	const ext = uint32(1 << 18) // 64 groups fit one extent
 	f, err := os.Create(filepath.Join(t.TempDir(), "ring.dat"))
 	if err != nil {
 		t.Fatalf("create: %v", err)
