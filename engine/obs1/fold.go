@@ -71,6 +71,14 @@ type FoldConfig struct {
 	// watermark covers it. Called off the owner; the manifest slice's seam.
 	OnPublish func(FoldedSegment)
 
+	// Keymap, when set, resolves a group's resident cold-key index. The
+	// folder maintains it under its own mutex: publish applies each
+	// surviving record placement, Delete drops the key at apply time, and
+	// serializing both under one lock is what closes the delete-versus-
+	// publish race on a key whose stale copy sits in a cut segment. Nil
+	// keeps the pre-keymap behavior: no index, unfiltered tombstones.
+	Keymap func(group uint16) *Keymap
+
 	// SegTargetBytes and ChunkTargetBytes override the cut thresholds,
 	// zero for the defaults. Tests shrink them.
 	SegTargetBytes   int
@@ -101,6 +109,20 @@ type FoldedSegment struct {
 	NRecords   uint64
 	RawBytes   uint64
 	CoveredSeq uint64
+	// Places lists every whole-record frame's chunk placement, the
+	// keymap's feed, minus placements killed by a delete that landed
+	// between the cut and the publish.
+	Places []KeyPlace
+}
+
+// KeyPlace is one record's landing spot inside its published segment:
+// the keymap maintenance unit (doc 05 section 2.1).
+type KeyPlace struct {
+	Key       []byte
+	Fp        uint64
+	Chunk     uint32
+	Kind      byte
+	Tombstone bool
 }
 
 // FolderStats counts the folder's work for tests and the INFO surface.
@@ -117,6 +139,11 @@ type FolderStats struct {
 	PutRetries     uint64
 	WalkErrs       uint64
 	BuildErrs      uint64
+
+	TombstonesSkipped uint64 // deletes of keys with no cold copy anywhere: no tombstone emitted
+	PlacesApplied     uint64 // record placements applied to the keymap at publish
+	PlacesKilled      uint64 // placements dropped because a delete landed after the cut
+	PlaceErrs         uint64 // placements the keymap refused, each one a loud bug
 }
 
 // foldRec is one accumulated whole-record frame, copied out of the tap
@@ -144,7 +171,12 @@ type foldGroup struct {
 	chIdx   map[string]int
 }
 
-// segJob is one cut segment on its way to the bucket.
+// segJob is one cut segment on its way to the bucket. keys is the
+// accumulator's retired index, kept as a membership set so a delete
+// landing after the cut can find the job; kills collects those deletes,
+// and the publish filters places by them under the folder's mutex.
+// places is written by buildSegment on the putter goroutine and read at
+// publish; kills is the only field two goroutines share.
 type segJob struct {
 	group   uint16
 	epoch   uint32
@@ -152,6 +184,9 @@ type segJob struct {
 	covered uint64
 	recs    []foldRec
 	chunks  []SegmentChunk
+	keys    map[string]int
+	kills   map[string]struct{}
+	places  []KeyPlace
 }
 
 // Folder packs staged cold frames into segments and PUTs them. Add runs
@@ -163,12 +198,13 @@ type Folder struct {
 	segTarget int
 	chTarget  int
 
-	mu     sync.Mutex
-	cond   *sync.Cond
-	groups map[uint16]*foldGroup
-	queue  []*segJob
-	ledger []FoldedSegment
-	stats  FolderStats
+	mu      sync.Mutex
+	cond    *sync.Cond
+	groups  map[uint16]*foldGroup
+	queue   []*segJob
+	pending []*segJob // cut but not yet published or abandoned: Delete's kill targets
+	ledger  []FoldedSegment
+	stats   FolderStats
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -317,16 +353,23 @@ func (f *Folder) age(g *foldGroup) {
 	g.since = time.Now()
 }
 
-// Delete accumulates one tombstone for a committed delete of key (doc 06
-// section 1.3). Call it on the owner goroutine right after the WriteLog
-// delete emission, the same contract as the tap: the mark taken here then
-// covers the delete's seq, and the segment carrying the tombstone publishes
-// only once the watermark commits it. Within the accumulating segment the
-// tombstone displaces any pending copy of the key and a later re-set
+// Delete handles a committed delete of key (doc 06 section 1.3). Call it
+// on the owner goroutine right after the WriteLog delete emission, the
+// same contract as the tap: the mark taken here then covers the delete's
+// seq, and a segment carrying the tombstone publishes only once the
+// watermark commits it.
+//
+// With a keymap configured, deletion is index-authoritative (doc 05
+// section 8): the entry drops here, at apply time, and a tombstone is
+// emitted only when a cold copy exists to shadow, meaning the key was in
+// the keymap or rides a cut segment still in flight; those in-flight
+// placements are killed so the publish cannot resurrect the key. A key
+// whose only copy is still in the live accumulator just drops out of it,
+// and a key with no cold presence at all skips the tombstone entirely,
+// the filter this method long promised. Within the accumulating segment
+// a tombstone displaces any pending copy of the key and a later re-set
 // displaces the tombstone; across segments a higher SegSeq claim shadows
-// every lower one. Emission is unfiltered until the keymap slice can tell
-// a never-folded key from a folded one; the extra tombstones shadow nothing
-// and rewrites drop them, so the cost is bytes, not correctness.
+// every lower one. Without a keymap, emission stays unfiltered.
 func (f *Folder) Delete(key []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -339,6 +382,31 @@ func (f *Folder) Delete(key []byte) {
 	g := f.groupFor(group, epoch, last)
 	k := append([]byte(nil), key...)
 	h1, _ := bloomHash(k)
+
+	cold := true
+	if f.cfg.Keymap != nil {
+		cold = false
+		if km := f.cfg.Keymap(group); km != nil && km.Delete(h1) {
+			cold = true
+		}
+		for _, job := range f.pending {
+			if job.group != group {
+				continue
+			}
+			if _, ok := job.keys[string(k)]; ok {
+				job.kills[string(k)] = struct{}{}
+				cold = true
+			}
+		}
+	}
+	if !cold {
+		if i, ok := g.recIdx[string(k)]; ok && g.recs[i].kind != store.KindTombstone {
+			f.dropRecLocked(g, i)
+		}
+		f.stats.TombstonesSkipped++
+		return
+	}
+
 	r := foldRec{
 		kind: store.KindTombstone, fp: h1, key: k,
 		frame: store.AppendTombstoneFrame(nil, k),
@@ -349,6 +417,23 @@ func (f *Folder) Delete(key []byte) {
 		f.cutLocked(group, g)
 	} else if g.since.IsZero() {
 		f.age(g)
+	}
+}
+
+// dropRecLocked removes the accumulator's record at index i, the delete
+// path for a key that never reached the bucket: nothing cold exists, so
+// nothing needs shadowing and the staged copy simply leaves.
+func (f *Folder) dropRecLocked(g *foldGroup, i int) {
+	g.bytes -= len(g.recs[i].frame)
+	delete(g.recIdx, string(g.recs[i].key))
+	last := len(g.recs) - 1
+	if i != last {
+		g.recs[i] = g.recs[last]
+		g.recIdx[string(g.recs[i].key)] = i
+	}
+	g.recs = g.recs[:last]
+	if len(g.recs) == 0 && len(g.chunks) == 0 {
+		g.since = time.Time{}
 	}
 }
 
@@ -399,10 +484,13 @@ func (f *Folder) cutLocked(group uint16, g *foldGroup) {
 	if len(g.recs) == 0 && len(g.chunks) == 0 {
 		return
 	}
-	f.queue = append(f.queue, &segJob{
+	job := &segJob{
 		group: group, epoch: g.epoch, covered: g.covered,
 		recs: g.recs, chunks: g.chunks,
-	})
+		keys: g.recIdx, kills: make(map[string]struct{}),
+	}
+	f.queue = append(f.queue, job)
+	f.pending = append(f.pending, job)
 	g.covered = 0
 	g.bytes = 0
 	g.since = time.Time{}
@@ -478,6 +566,9 @@ func (f *Folder) buildSegment(job *segJob) (*Segment, error) {
 	})
 	chunks := make([]SegmentChunk, 0, len(job.chunks)+1)
 	memberKeys := make([][]byte, 0, len(job.recs)+len(job.chunks))
+	// The PUT retry loop rebuilds; placements must not accumulate across
+	// attempts.
+	job.places = job.places[:0]
 	var payload []byte
 	var run []foldRec
 	cut := func() {
@@ -489,6 +580,12 @@ func (f *Folder) buildSegment(job *segJob) (*Segment, error) {
 		binary.LittleEndian.PutUint64(disc[:], first.fp)
 		data := store.AppendRunChunk(nil, first.kind|store.ChunkKindBit, 0,
 			uint16(len(run)), first.key, disc[:], payload)
+		for _, r := range run {
+			job.places = append(job.places, KeyPlace{
+				Key: r.key, Fp: r.fp, Chunk: uint32(len(chunks)),
+				Kind: r.kind, Tombstone: r.kind == store.KindTombstone,
+			})
+		}
 		chunks = append(chunks, SegmentChunk{
 			Key: first.key, Kind: first.kind | store.ChunkKindBit,
 			FirstDisc: first.fp, Count: uint16(len(run)), LiveHint: uint16(len(run)),
@@ -542,6 +639,7 @@ func (f *Folder) putSegment(job *segJob) {
 		if err != nil {
 			f.mu.Lock()
 			f.stats.BuildErrs++
+			f.dropPendingLocked(job)
 			f.mu.Unlock()
 			return
 		}
@@ -549,6 +647,7 @@ func (f *Folder) putSegment(job *segJob) {
 		if err != nil {
 			f.mu.Lock()
 			f.stats.BuildErrs++
+			f.dropPendingLocked(job)
 			f.mu.Unlock()
 			return
 		}
@@ -608,6 +707,7 @@ func (f *Folder) finishPut(job *segJob, obj []byte, key string) {
 		// Unreachable for bytes AppendSegment just built; count and drop.
 		f.mu.Lock()
 		f.stats.BuildErrs++
+		f.dropPendingLocked(job)
 		f.mu.Unlock()
 		return
 	}
@@ -622,6 +722,8 @@ func (f *Folder) finishPut(job *segJob, obj []byte, key string) {
 	f.mu.Unlock()
 	f.cfg.Marks.Notify(job.group, job.covered, func() {
 		f.mu.Lock()
+		entry.Places = f.applyPlacesLocked(job)
+		f.dropPendingLocked(job)
 		f.ledger = append(f.ledger, entry)
 		f.stats.Published++
 		cb := f.cfg.OnPublish
@@ -630,6 +732,55 @@ func (f *Folder) finishPut(job *segJob, obj []byte, key string) {
 			cb(entry)
 		}
 	})
+}
+
+// applyPlacesLocked filters the job's placements by its kill set and
+// applies the survivors to the group's keymap, all under the folder's
+// mutex so a racing Delete either killed the placement here or removes
+// the entry it just produced; there is no in-between. Tombstone
+// placements survive into the ledger row for the rebuild story but
+// never touch the live keymap: the apply-time delete already did.
+func (f *Folder) applyPlacesLocked(job *segJob) []KeyPlace {
+	if len(job.kills) == 0 && f.cfg.Keymap == nil {
+		return job.places
+	}
+	var km *Keymap
+	if f.cfg.Keymap != nil {
+		km = f.cfg.Keymap(job.group)
+	}
+	kept := job.places[:0]
+	for _, p := range job.places {
+		if _, dead := job.kills[string(p.Key)]; dead {
+			f.stats.PlacesKilled++
+			continue
+		}
+		kept = append(kept, p)
+		if km == nil || p.Tombstone {
+			continue
+		}
+		if job.seq > 1<<32-1 {
+			f.stats.PlaceErrs++
+			continue
+		}
+		l := KeyLoc{Seg: uint32(job.seq), Chunk: p.Chunk}
+		if err := km.Shadow(p.Fp, l, false); err != nil {
+			f.stats.PlaceErrs++
+			continue
+		}
+		f.stats.PlacesApplied++
+	}
+	return kept
+}
+
+// dropPendingLocked retires a job from the kill-target list, at publish
+// or on a build failure.
+func (f *Folder) dropPendingLocked(job *segJob) {
+	for i, j := range f.pending {
+		if j == job {
+			f.pending = append(f.pending[:i], f.pending[i+1:]...)
+			return
+		}
+	}
 }
 
 // disc64 lifts a chunk discriminator's leading bytes into the footer's

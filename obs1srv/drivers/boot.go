@@ -61,6 +61,11 @@ type Booted struct {
 	Pub    *obs1.ManifestPublisher
 	Rec    *obs1.Recovery
 	Replay replay.Stats
+	// Keymaps is the per-group regime A cold-key index the folder
+	// maintains; the cold read path consumes it. Rebuilding it from
+	// segments at takeover lands with the directory slice, so after a
+	// restart it covers keys folded since boot.
+	Keymaps []*obs1.Keymap
 }
 
 // Close drains and stops the pipeline: write log first so its final
@@ -149,10 +154,15 @@ func BootDurability(ctx context.Context, cfg BootConfig, rt *shard.Runtime) (*Bo
 		pub.Close()
 		return nil, err
 	}
+	kms := make([]*obs1.Keymap, shard.DefaultSlotGroups)
+	for g := range kms {
+		kms[g] = obs1.NewKeymap()
+	}
 	folder, err := obs1.NewFolder(obs1.FoldConfig{
 		Store: cfg.Store, Prefix: cfg.Prefix, Node: cfg.Node,
 		MapKey: ClusterMapKey, Mark: wl.GroupMark, Marks: wl.Marks(),
 		OnPublish: pub.OnFolded, FoldAge: cfg.FoldAge, Seed: seeds,
+		Keymap: func(group uint16) *obs1.Keymap { return kms[group] },
 	})
 	if err != nil {
 		_ = wl.Close()
@@ -177,5 +187,5 @@ func BootDurability(ctx context.Context, cfg BootConfig, rt *shard.Runtime) (*Bo
 	rt.SetFoldProgress(func() uint64 { return pub.Stats().Published })
 	rt.SetFoldKick(folder.Flush)
 
-	return &Booted{WL: wl, Folder: folder, Pub: pub, Rec: r, Replay: ap.Stats()}, nil
+	return &Booted{WL: wl, Folder: folder, Pub: pub, Rec: r, Replay: ap.Stats(), Keymaps: kms}, nil
 }

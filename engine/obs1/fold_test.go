@@ -281,8 +281,8 @@ func TestFolderDedupeRestaged(t *testing.T) {
 
 // TestFolderTombstoneInterleave pins the within-segment story of doc 06
 // section 1.3: a delete displaces the pending copy of its key, a re-set
-// displaces a pending tombstone, an unseen key's delete still emits (the
-// keymap slice adds the never-folded filter), the tombstones pack into
+// displaces a pending tombstone, an unseen key's delete still emits (no
+// keymap wired here, so emission stays unfiltered), the tombstones pack into
 // their own run chunk, and the segment publishes only once the watermark
 // covers the marks the deletes were taken under.
 func TestFolderTombstoneInterleave(t *testing.T) {
@@ -535,5 +535,152 @@ func TestFolderSeedContinuesSegSeq(t *testing.T) {
 	waitFor(t, "seeded cut to publish", func() bool { return len(f.Ledger()) == 1 })
 	if led := f.Ledger()[0]; led.SegSeq != 6 {
 		t.Fatalf("seeded segment took SegSeq %d, want 6, one past the manifest's highest row", led.SegSeq)
+	}
+}
+
+// newFoldKeymapFixture is the fold fixture with a single group 3 keymap
+// wired in, the maintenance slice's shape.
+func newFoldKeymapFixture(t *testing.T) (*foldFixture, *obs1.Keymap) {
+	t.Helper()
+	fx := &foldFixture{sim: sim.New(sim.Config{Seed: 1}), marks: obs1.NewWatermarks()}
+	km := obs1.NewKeymap()
+	f, err := obs1.NewFolder(obs1.FoldConfig{
+		Store:  fx.sim,
+		Prefix: "db/t",
+		Node:   0xA1,
+		MapKey: func(key []byte) (uint16, uint16) { return 9, 3 },
+		Mark:   func(group uint16) (uint32, uint64) { return 7, fx.last },
+		Marks:  fx.marks,
+		Keymap: func(group uint16) *obs1.Keymap { return km },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.folder = f
+	t.Cleanup(f.Close)
+	return fx, km
+}
+
+// TestFolderKeymapMaintains drives the fold, delete, re-fold cycle and
+// checks the keymap tracks it: a publish inserts each record's locator,
+// an apply-time delete drops the key, the tombstone segment leaves it
+// absent, and a re-fold points it at the newer segment.
+func TestFolderKeymapMaintains(t *testing.T) {
+	fx, km := newFoldKeymapFixture(t)
+	fp1, fp2 := obs1.Fingerprint([]byte("k1")), obs1.Fingerprint([]byte("k2"))
+
+	fx.folder.Add(frames("k1", "v1", "k2", "v2"))
+	fx.folder.Flush()
+	waitFor(t, "first publish", func() bool { return len(fx.folder.Ledger()) == 1 })
+	led := fx.folder.Ledger()[0]
+	if len(led.Places) != 2 {
+		t.Fatalf("places %+v", led.Places)
+	}
+	for _, fp := range []uint64{fp1, fp2} {
+		got, ok := km.Lookup(fp)
+		if !ok || got.Seg != uint32(led.SegSeq) {
+			t.Fatalf("fp %d got %+v ok=%v want seg %d", fp, got, ok, led.SegSeq)
+		}
+	}
+
+	fx.folder.Delete([]byte("k1"))
+	if _, ok := km.Lookup(fp1); ok {
+		t.Fatal("k1 still in the keymap after its apply-time delete")
+	}
+	if _, ok := km.Lookup(fp2); !ok {
+		t.Fatal("k2 vanished with k1's delete")
+	}
+	fx.folder.Flush()
+	waitFor(t, "tombstone publish", func() bool { return len(fx.folder.Ledger()) == 2 })
+	if _, ok := km.Lookup(fp1); ok {
+		t.Fatal("the tombstone's own publish resurrected k1")
+	}
+	tled := fx.folder.Ledger()[1]
+	if len(tled.Places) != 1 || !tled.Places[0].Tombstone {
+		t.Fatalf("tombstone segment places %+v", tled.Places)
+	}
+
+	fx.folder.Add(frames("k1", "v2"))
+	fx.folder.Flush()
+	waitFor(t, "re-fold publish", func() bool { return len(fx.folder.Ledger()) == 3 })
+	got, ok := km.Lookup(fp1)
+	if !ok || got.Seg != uint32(fx.folder.Ledger()[2].SegSeq) {
+		t.Fatalf("re-folded k1 got %+v ok=%v", got, ok)
+	}
+	st := fx.folder.Stats()
+	if st.PlacesApplied != 3 || st.PlacesKilled != 0 || st.PlaceErrs != 0 || st.Tombstones != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+// TestFolderTombstoneFilter pins the never-folded filter: a delete of a
+// key with no cold copy anywhere emits nothing, a delete of a key whose
+// only copy sits in the live accumulator just removes it, and a delete
+// of a folded key still emits its tombstone.
+func TestFolderTombstoneFilter(t *testing.T) {
+	fx, km := newFoldKeymapFixture(t)
+
+	fx.folder.Delete([]byte("never-seen"))
+	fx.folder.Add(frames("staged", "v"))
+	fx.folder.Delete([]byte("staged"))
+	fx.folder.Flush()
+	st := fx.folder.Stats()
+	if st.SegmentsCut != 0 {
+		t.Fatalf("empty accumulator cut a segment: %+v", st)
+	}
+	if st.Tombstones != 0 || st.TombstonesSkipped != 2 {
+		t.Fatalf("filter stats %+v", st)
+	}
+
+	fx.folder.Add(frames("folded", "v"))
+	fx.folder.Flush()
+	waitFor(t, "publish", func() bool { return len(fx.folder.Ledger()) == 1 })
+	fx.folder.Delete([]byte("folded"))
+	fx.folder.Flush()
+	waitFor(t, "tombstone publish", func() bool { return len(fx.folder.Ledger()) == 2 })
+	if _, ok := km.Lookup(obs1.Fingerprint([]byte("folded"))); ok {
+		t.Fatal("deleted folded key still resolves")
+	}
+	if st := fx.folder.Stats(); st.Tombstones != 1 || st.TombstonesSkipped != 2 {
+		t.Fatalf("post-fold stats %+v", st)
+	}
+}
+
+// TestFolderDeleteKillsInFlightPlace closes the delete-versus-publish
+// race: a key's segment is cut and PUT but the watermark holds its
+// publish; the delete lands in between; the publish must not resurrect
+// the key in the keymap, and the tombstone still reaches the bucket.
+func TestFolderDeleteKillsInFlightPlace(t *testing.T) {
+	fx, km := newFoldKeymapFixture(t)
+	fx.last = 7
+	fp := obs1.Fingerprint([]byte("k"))
+
+	fx.folder.Add(frames("k", "v"))
+	fx.folder.Flush()
+	waitFor(t, "put", func() bool { return fx.folder.Stats().SegmentsPut == 1 })
+	fx.folder.Delete([]byte("k"))
+
+	if err := fx.marks.ApplyVerdict(obs1.CommitVerdict{
+		Commit: obs1.CommitRecord{Sections: []obs1.CommitSection{{Group: 3, Epoch: 7, FirstSeq: 1, LastSeq: 7}}},
+		Live:   []bool{true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "gated publish", func() bool { return len(fx.folder.Ledger()) == 1 })
+	if _, ok := km.Lookup(fp); ok {
+		t.Fatal("the gated publish resurrected a deleted key")
+	}
+	if led := fx.folder.Ledger()[0]; len(led.Places) != 0 {
+		t.Fatalf("killed place survived into the ledger row: %+v", led.Places)
+	}
+
+	fx.folder.Flush()
+	waitFor(t, "tombstone publish", func() bool { return len(fx.folder.Ledger()) == 2 })
+	if _, ok := km.Lookup(fp); ok {
+		t.Fatal("keymap holds k after the tombstone publish")
+	}
+	st := fx.folder.Stats()
+	if st.PlacesKilled != 1 || st.PlacesApplied != 0 || st.Tombstones != 1 {
+		t.Fatalf("stats %+v", st)
 	}
 }
