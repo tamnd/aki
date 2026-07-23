@@ -116,10 +116,13 @@ func startFoldedServer(t *testing.T, residentCap uint64) *foldedServer {
 }
 
 // pollFor is waitFor's local twin: the cold pipeline runs on flush, fold,
-// and publish goroutines, so the assertions poll.
+// and publish goroutines, so the assertions poll. The deadline is sized
+// for a loaded two-core CI runner under the race detector, where the
+// fold-storm pipeline has been seen taking well past five seconds to
+// settle fully idle; a passing run never waits this long.
 func pollFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
