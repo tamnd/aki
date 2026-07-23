@@ -33,4 +33,15 @@ A -quick run at 10^5 hash and 10^6 set elements executed during development afte
 
 ## Results
 
-Pending.
+Scored on the M4 box, bigcollection.csv checked in.
+
+Flatness holds across the full five decades: 1.0000 GETs per op with 100% found at every cardinality from 10^3 hash to 10^8 set, bytes per op at exactly 128.0 KiB once the object clears 16 MiB, with the predicted clipping below (85.1 KiB at 10^3).
+Directory share at 16 KiB chunks: 0.144 at 10^3, 0.127 flat from 10^4 through 10^7, 0.031 for the 10^8 set, all inside their bands; cardinality never moves it.
+Scan requests sat exactly on the ceil identity at every row, up to 143 requests over the 2.2 GiB set object.
+The chunk sweep moved only the share, 0.500 / 0.253 / 0.127 / 0.064, halving per doubling as predicted, with GETs per op pinned at 1.0000 across the band.
+SINTER found exactly the million common members in 5 requests (the identity over both operands), merge window 341 KiB against the 384 KiB two-blocks-plus-discs cap, transport peak the two 16 MiB ranges the sim forces.
+
+## Verdict
+
+PRED-OBS1-O2A-BIGCOLL: HIT, all five bands.
+Cardinality is not a cost axis on the cold point path, the chunk target trades only directory RAM, and set algebra streams at the doc 08 working set.
