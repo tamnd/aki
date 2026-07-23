@@ -55,6 +55,18 @@ type streamGroup struct {
 	read int64
 	cons []streamConsumer
 	pelf []streamPelFenceEnt
+
+	// The paged-fence view (streampelpage.go). pelPaged marks a record
+	// whose fence rows live in kind 6 pages: pelIdx holds the page
+	// index rows (segid carries the pageid), and pelf stays empty until
+	// pelfLoad materializes the full fence into it, setting pelLoaded
+	// and keeping the pristine image in pelfOrig with the per-page row
+	// counts in pelPageN for the store-side diff.
+	pelPaged  bool
+	pelLoaded bool
+	pelIdx    []streamPelFenceEnt
+	pelfOrig  []streamPelFenceEnt
+	pelPageN  []int
 }
 
 // Group record payload:
@@ -76,6 +88,13 @@ type streamGroup struct {
 // PEL fence bases strictly increasing with counts >= 1, and the fence
 // counts summing to the consumer pel counts, the group's pending
 // entries partitioned by segment and by consumer.
+//
+// The top bit of pel_fence_n marks a paged fence: the trailing rows
+// are then the kind 6 page index in the same 28-byte shape, pelsegid
+// carrying the pageid and count the page's pending total, one row at
+// least, bases strictly increasing, counts >= 1 and summing to the
+// consumer pel counts (streampelpage.go). The fence caps stay under
+// 0x8000 so the flag bit never collides with a row count.
 const streamGroupHdrLen = 28
 
 // streamSubkindGroup is the stream plane's group record kind, doc 10's
@@ -90,7 +109,13 @@ func appendStreamGroup(dst []byte, g *streamGroup) []byte {
 	binary.LittleEndian.PutUint64(h[8:], g.last.seq)
 	binary.LittleEndian.PutUint64(h[16:], uint64(g.read))
 	binary.LittleEndian.PutUint16(h[24:], uint16(len(g.cons)))
-	binary.LittleEndian.PutUint16(h[26:], uint16(len(g.pelf)))
+	fence := g.pelf
+	if g.pelPaged {
+		fence = g.pelIdx
+		binary.LittleEndian.PutUint16(h[26:], 0x8000|uint16(len(g.pelIdx)))
+	} else {
+		binary.LittleEndian.PutUint16(h[26:], uint16(len(g.pelf)))
+	}
 	dst = append(dst, h[:]...)
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(g.name)))
 	dst = append(dst, g.name...)
@@ -102,8 +127,8 @@ func appendStreamGroup(dst []byte, g *streamGroup) []byte {
 		dst = binary.LittleEndian.AppendUint64(dst, uint64(c.activeMs))
 		dst = binary.LittleEndian.AppendUint64(dst, c.pel)
 	}
-	for i := range g.pelf {
-		f := &g.pelf[i]
+	for i := range fence {
+		f := &fence[i]
 		dst = binary.LittleEndian.AppendUint64(dst, f.base.ms)
 		dst = binary.LittleEndian.AppendUint64(dst, f.base.seq)
 		dst = binary.LittleEndian.AppendUint64(dst, f.segid)
@@ -140,7 +165,12 @@ func decodeStreamGroup(v []byte, cons []streamConsumer, pelf []streamPelFenceEnt
 		return streamGroup{}, fmt.Errorf("sqlo1: stream group record has entries-read raw %#x", uint64(g.read))
 	}
 	n := int(binary.LittleEndian.Uint16(v[24:]))
-	fn := int(binary.LittleEndian.Uint16(v[26:]))
+	fnRaw := binary.LittleEndian.Uint16(v[26:])
+	g.pelPaged = fnRaw&0x8000 != 0
+	fn := int(fnRaw &^ 0x8000)
+	if g.pelPaged && fn == 0 {
+		return streamGroup{}, errors.New("sqlo1: stream group record marks a paged PEL fence with no pages")
+	}
 	p := v[streamGroupHdrLen:]
 	var err error
 	if g.name, p, err = decodeStreamGroupBytes(p); err != nil {
@@ -199,7 +229,11 @@ func decodeStreamGroup(v []byte, cons []streamConsumer, pelf []streamPelFenceEnt
 		return streamGroup{}, fmt.Errorf("sqlo1: stream group record has %d trailing bytes", len(p))
 	}
 	g.cons = cons
-	g.pelf = pelf
+	if g.pelPaged {
+		g.pelIdx = pelf
+	} else {
+		g.pelf = pelf
+	}
 	return g, nil
 }
 
@@ -401,6 +435,11 @@ func (x *Stream) GroupDestroy(ctx context.Context, key, group []byte) (bool, err
 	if ord < 0 {
 		return false, nil
 	}
+	// A paged fence materializes first: the deletes below need every
+	// segid, and the pages themselves die with the group.
+	if err := x.pelfLoad(ctx, &g); err != nil {
+		return false, err
+	}
 	lastOrd := x.root.groupCount - 1
 	if uint32(ord) != lastOrd {
 		v, err := x.readGroupRec(ctx, lastOrd)
@@ -423,6 +462,13 @@ func (x *Stream) GroupDestroy(ctx context.Context, key, group []byte) (bool, err
 	for i := range g.pelf {
 		if err := x.delPelSeg(ctx, g.pelf[i].segid); err != nil {
 			return false, err
+		}
+	}
+	if g.pelPaged {
+		for i := range g.pelIdx {
+			if err := x.delPelPage(ctx, g.pelIdx[i].segid); err != nil {
+				return false, err
+			}
 		}
 	}
 	return true, x.restamp(ctx, key, expMs)

@@ -338,11 +338,13 @@ func TestStreamClaimForceMint(t *testing.T) {
 		t.Fatalf("after split fence = %d slots, %v", len(g.pelf), err)
 	}
 
-	// A two-slot fence at a two-entry cap: the next split has nowhere
-	// to put its second half and the refusal leaves the PEL untouched.
-	// A fresh rig, since the shared one models a single stream.
+	// A two-slot fence at a two-entry cap with single-row pages: the
+	// next split has nowhere to put its second half even paged, and
+	// the refusal leaves the PEL untouched. A fresh rig, since the
+	// shared one models a single stream.
 	restore := SetStreamPelCapsForTest(4096, 2, 2)
 	defer restore()
+	defer SetStreamPelPageMaxForTest(1)()
 	r2 := newStreamRig(t)
 	key2 := "k2"
 	for ms := uint64(1); ms <= 5; ms++ {

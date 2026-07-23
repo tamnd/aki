@@ -115,6 +115,21 @@ type Stream struct {
 	pelIDs   []streamID
 	pelDrops []uint64
 
+	// The PEL fence page scratch (streampelpage.go): pelPgKbuf and
+	// pelPgBuf stage kind 6 page IO, pelfBuf and pelfPrist back one
+	// materialized fence and its pristine image with pelfPageN the
+	// pristine chunking, pelPagePlan and pelIdxBuf carry one store
+	// pass, and pelPageDrops queues dead pages beside pelDrops.
+	pelPgKbuf    [SubkeySize]byte
+	pelPgBuf     []byte
+	pelfBuf      []streamPelFenceEnt
+	pelfPrist    []streamPelFenceEnt
+	pelfPageN    []int
+	pelPagePlan  []pelPagePlanEnt
+	pelIdxBuf    []streamPelFenceEnt
+	pelPageDrops []uint64
+	pelfFlip     bool
+
 	// mgKeyBuf, mgKeys, mgVals, mgRoots, and mgExps carry one range
 	// walk's prefetch round, the list Range shape.
 	mgKeyBuf []byte

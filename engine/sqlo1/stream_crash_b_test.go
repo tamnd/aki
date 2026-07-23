@@ -28,7 +28,14 @@ package sqlo1_test
 // run and a fence page emptied by deletes dropping whole, deletes of
 // still-pending entries leaving the PEL exact, a stream deleted to
 // empty, and a group destroy sweeping a live multi-segment PEL in the
-// same batch as its record compaction.
+// same batch as its record compaction. The last phase re-dials the
+// PEL caps small on a fresh key and walks the paged fence's whole
+// life: the inline-to-paged transition (fresh pages flush before the
+// record whose index rows cite them), an ack rewriting pages in
+// place, a FORCE claim splitting a segment under the pages, the flip
+// back inline dropping every page in the record's batch, a regrow,
+// and a destroy sweeping a live paged PEL, so every rung is a legal
+// cut boundary.
 
 import (
 	"context"
@@ -70,7 +77,7 @@ func TestStreamPagedTornTail(t *testing.T) {
 	// runs, two per page, four index slots) drive every paged rung with
 	// two-digit entry counts.
 	med := strings.Repeat("m", 1800)
-	keys := []string{"s", "s2", "s3"}
+	keys := []string{"s", "s2", "s3", "s4"}
 	snapshot := func(xx *sqlo1.Stream) map[string][]string {
 		t.Helper()
 		img := map[string][]string{}
@@ -373,6 +380,55 @@ func TestStreamPagedTornTail(t *testing.T) {
 	add("s2", 11, "tiny")
 	flush()
 	gdestroy("s3", "boot", true)
+	flush()
+
+	// Phase 12: the paged PEL fence. Re-dialed caps (two entries per
+	// segment, four index slots, two fence rows per page) put every
+	// paged rung within reach on a fresh key. Eight deliveries fill the
+	// inline fence exactly, the ninth segment pages it, an ack that
+	// kills a whole segment rewrites the pages in place, a FORCE claim
+	// on the acked ID splits a segment under the live pages, a bulk ack
+	// down to two slots flips the fence back inline and drops every
+	// page in the record's batch, a full catch-up delivery pages it
+	// again, and the destroy sweeps segments and pages together. Fresh
+	// pages flush before the record whose index rows cite them, so a
+	// cut inside any rung recovers to the previous boundary with at
+	// most orphaned rows nothing references.
+	restorePel := sqlo1.SetStreamPelCapsForTest(4096, 2, 4)
+	defer restorePel()
+	defer sqlo1.SetStreamPelPageMaxForTest(2)()
+	for ms := uint64(1); ms <= 12; ms++ {
+		add("s4", ms, "tiny")
+	}
+	flush()
+	gcreate("s4", "pg", 0, false, -1)
+	flush()
+	deliver("s4", "pg", "wA", 8, 920, 8)
+	flush()
+	deliver("s4", "pg", "wB", 2, 922, 2)
+	if paged, err := x.PelPagedForTest(ctx, []byte("s4"), []byte("pg")); err != nil || !paged {
+		t.Fatalf("s4 PEL did not page: %v, %v", paged, err)
+	}
+	flush()
+	ack("s4", "pg", 2, [2]uint64{3, 1}, [2]uint64{4, 1})
+	flush()
+	claim("s4", "pg", "wA", 0, true, 925, 1, [2]uint64{3, 1})
+	flush()
+	ack("s4", "pg", 6, [2]uint64{1, 1}, [2]uint64{2, 1}, [2]uint64{3, 1}, [2]uint64{5, 1}, [2]uint64{6, 1}, [2]uint64{7, 1})
+	if paged, err := x.PelPagedForTest(ctx, []byte("s4"), []byte("pg")); err != nil || paged {
+		t.Fatalf("s4 PEL did not flip back inline: %v, %v", paged, err)
+	}
+	flush()
+	for ms := uint64(13); ms <= 18; ms++ {
+		add("s4", ms, "tiny")
+	}
+	flush()
+	deliver("s4", "pg", "wA", -1, 930, 8)
+	if paged, err := x.PelPagedForTest(ctx, []byte("s4"), []byte("pg")); err != nil || !paged {
+		t.Fatalf("s4 PEL did not re-page: %v, %v", paged, err)
+	}
+	flush()
+	gdestroy("s4", "pg", true)
 	flush()
 
 	if err := db.Close(); err != nil {

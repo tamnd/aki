@@ -201,6 +201,35 @@ func SetStreamPelCapsForTest(segBytes, segEnts, fenceMax int) (restore func()) {
 	return func() { streamPelSegMaxBytes, streamPelSegMaxEnts, streamPelFenceMax = ob, oe, of }
 }
 
+// SetStreamPelPageMaxForTest shrinks the PEL fence page row cap so the
+// inline-to-paged transition, page splits, and the flip back inline
+// are reachable in test-sized PELs.
+func SetStreamPelPageMaxForTest(pageMax int) (restore func()) {
+	op := streamPelPageMax
+	streamPelPageMax = pageMax
+	return func() { streamPelPageMax = op }
+}
+
+// PelPagedForTest reports whether group's PEL fence lives in kind 6
+// pages, the crash matrix's transition and flip assertions.
+func (x *Stream) PelPagedForTest(ctx context.Context, key, group []byte) (bool, error) {
+	exists, _, err := x.stateOf(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, errStreamNoKey
+	}
+	ord, g, err := x.findGroup(ctx, group)
+	if err != nil {
+		return false, err
+	}
+	if ord < 0 {
+		return false, fmt.Errorf("sqlo1: no group %q", group)
+	}
+	return g.pelPaged, nil
+}
+
 // The PEL crash phase drives XREADGROUP delivery and XACK from the
 // external package on the plain-integer seam, and PelLinesForTest
 // renders every group's pending rows through the real fence-and-
