@@ -1,0 +1,28 @@
+n,cell,gets,mib_down,extra
+100000,catchup_readahead,1,7.72,expect 1
+100000,perblock_c10,10000,1252.42,span 100000
+100000,perblock_c100,1000,132.17,span 100000
+100000,perblock_c1000,100,20.06,span 100000
+100000,perblock_c8000,13,9.22,span 100000
+100000,xrange_k100,1,0.02,
+100000,xrange_k10000,1,0.78,
+100000,amp_ratio,,1.1398,
+1000000,catchup_readahead,5,77.30,expect 5
+1000000,perblock_c10,10000,1256.88,span 100000
+1000000,perblock_c100,1000,132.62,span 100000
+1000000,perblock_c1000,100,20.12,span 100000
+1000000,perblock_c8000,13,9.25,span 100000
+1000000,xrange_k100,1,0.02,
+1000000,xrange_k10000,1,0.78,
+1000000,amp_ratio,,1.1416,
+10000000,catchup_readahead,49,773.03,expect 49
+10000000,perblock_c10,10000,1256.88,span 100000
+10000000,perblock_c100,1000,132.62,span 100000
+10000000,perblock_c1000,100,20.12,span 100000
+10000000,perblock_c8000,13,9.25,span 100000
+10000000,xrange_k100,1,0.02,
+10000000,xrange_k10000,1,0.78,
+10000000,amp_ratio,,1.1417,
+1000000,pel_b_per_entry,,36.56,
+1000000,pel_vs_stream_ratio,,0.0457,
+1000000,pel_reclaim,1954,,residual 0
