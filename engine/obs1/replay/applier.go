@@ -18,9 +18,8 @@
 //
 // Collection frames apply through each type package's exported Replay
 // functions with plain arguments, so the registries' shapes stay
-// private. The set, hash, zset, list, and stream entry planes are
-// wired; the consumer-group vocabulary is refused loudly until it
-// lands, never skipped.
+// private. All planes are wired: set, hash, zset, list, stream
+// entries, and the consumer-group vocabulary.
 package replay
 
 import (
@@ -52,33 +51,41 @@ type Config struct {
 
 // Stats counts what an Applier did, the recovery report's store half.
 type Stats struct {
-	Frames    uint64 // every frame accepted, markers and noops included
-	StrSets   uint64
-	Dels      uint64
-	DelMisses uint64 // keydels naming a key absent everywhere, the idempotent case
-	Expires   uint64
-	Noops     uint64
-	TxnRuns   uint64 // closed runs, however many frames each carried
-	CollNews  uint64
-	CollDrops uint64
-	SAdds     uint64
-	SRems     uint64
-	HSets     uint64
-	HDels     uint64
-	HExpires  uint64
-	ZAdds     uint64
-	ZRems     uint64
-	LPushes   uint64
-	RPushes   uint64
-	LPops     uint64
-	RPops     uint64
-	LSets     uint64
-	LRems     uint64
-	LInserts  uint64
-	XAdds     uint64
-	XDels     uint64
-	XTrims    uint64
-	XSetIDs   uint64
+	Frames        uint64 // every frame accepted, markers and noops included
+	StrSets       uint64
+	Dels          uint64
+	DelMisses     uint64 // keydels naming a key absent everywhere, the idempotent case
+	Expires       uint64
+	Noops         uint64
+	TxnRuns       uint64 // closed runs, however many frames each carried
+	CollNews      uint64
+	CollDrops     uint64
+	SAdds         uint64
+	SRems         uint64
+	HSets         uint64
+	HDels         uint64
+	HExpires      uint64
+	ZAdds         uint64
+	ZRems         uint64
+	LPushes       uint64
+	RPushes       uint64
+	LPops         uint64
+	RPops         uint64
+	LSets         uint64
+	LRems         uint64
+	LInserts      uint64
+	XAdds         uint64
+	XDels         uint64
+	XTrims        uint64
+	XSetIDs       uint64
+	GNews         uint64
+	GSetIDs       uint64
+	GDrops        uint64
+	GConsumerNews uint64
+	GConsumerDels uint64
+	GAcks         uint64
+	GDelivers     uint64
+	GClaims       uint64
 }
 
 // pending is one buffered frame inside an open txn run. The key and
@@ -90,11 +97,12 @@ type pending struct {
 	op  obs1.Op
 }
 
-// fresh is a collnew waiting for the colldelta that populates it: the
+// fresh is a collnew waiting for the frame that populates it: the
 // emitters always frame the pair adjacently in one run, so the very next
-// applied frame in the group must be that delta, on the same key, with a
-// sub-op of the collnew's type. The key aliases the section buffer under
-// the same contract as pending.
+// applied frame in the group must be a colldelta on the same key with a
+// sub-op of the collnew's type, or, for a stream collnew, a groupdelta
+// whose sub-op is gnew, the XGROUP CREATE MKSTREAM form. The key aliases
+// the section buffer under the same contract as pending.
 type fresh struct {
 	key []byte
 	typ uint8
@@ -194,11 +202,15 @@ func (a *Applier) applyOne(group uint16, key []byte, op obs1.Op) error {
 	cx := a.cfg.Ctx(key)
 	if n, ok := a.news[group]; ok {
 		delete(a.news, group)
-		d, isDelta := op.(obs1.CollDelta)
-		if !isDelta || !bytes.Equal(key, n.key) {
-			return fmt.Errorf("obs1 replay: collnew %q in group %d is not followed by its delta", n.key, group)
+		if d, isDelta := op.(obs1.CollDelta); isDelta && bytes.Equal(key, n.key) {
+			return a.applyDelta(cx, key, d, true, n.typ)
 		}
-		return a.applyDelta(cx, key, d, true, n.typ)
+		if g, isGroup := op.(obs1.GroupDelta); isGroup && bytes.Equal(key, n.key) && n.typ == obs1.CollStream {
+			if _, isNew := g.Sub.(obs1.GNew); isNew {
+				return a.applyGroup(cx, key, g, true)
+			}
+		}
+		return fmt.Errorf("obs1 replay: collnew %q in group %d is not followed by its delta", n.key, group)
 	}
 	switch o := op.(type) {
 	case obs1.StrSet:
@@ -273,7 +285,7 @@ func (a *Applier) applyOne(group uint16, key []byte, op obs1.Op) error {
 		}
 		a.stats.CollDrops++
 	case obs1.GroupDelta:
-		return fmt.Errorf("obs1 replay: op kind 0x%02x is a consumer-group op, group replay is not wired yet", opKind(op))
+		return a.applyGroup(cx, key, o, false)
 	default:
 		return fmt.Errorf("obs1 replay: op %T has no applier", op)
 	}
@@ -389,6 +401,58 @@ func (a *Applier) applyDelta(cx *shard.Ctx, key []byte, d obs1.CollDelta, create
 	return nil
 }
 
+// applyGroup dispatches one groupdelta sub-op through the stream
+// package's group replay seams. create is true when a stream collnew led
+// this frame, the XGROUP CREATE MKSTREAM form, and only gnew accepts it;
+// the fresh-consumption gate upstream already enforced that pairing.
+func (a *Applier) applyGroup(cx *shard.Ctx, key []byte, d obs1.GroupDelta, create bool) error {
+	switch s := d.Sub.(type) {
+	case obs1.GNew:
+		if err := stream.ReplayGNew(cx, key, s.Group, s.LastMs, s.LastSeq, s.EntriesRead, s.ReadValid, create); err != nil {
+			return err
+		}
+		a.stats.GNews++
+	case obs1.GSetID:
+		if err := stream.ReplayGSetID(cx, key, s.Group, s.LastMs, s.LastSeq, s.EntriesRead, s.ReadValid); err != nil {
+			return err
+		}
+		a.stats.GSetIDs++
+	case obs1.GDrop:
+		if err := stream.ReplayGDrop(cx, key, s.Group); err != nil {
+			return err
+		}
+		a.stats.GDrops++
+	case obs1.GConsumerNew:
+		if err := stream.ReplayGConsumerNew(cx, key, s.Group, s.Consumer, s.SeenMs); err != nil {
+			return err
+		}
+		a.stats.GConsumerNews++
+	case obs1.GConsumerDel:
+		if err := stream.ReplayGConsumerDel(cx, key, s.Group, s.Consumer); err != nil {
+			return err
+		}
+		a.stats.GConsumerDels++
+	case obs1.GAck:
+		if err := stream.ReplayGAck(cx, key, s.Group, s.IDMs, s.IDSeq); err != nil {
+			return err
+		}
+		a.stats.GAcks++
+	case obs1.GDeliver:
+		if err := stream.ReplayGDeliver(cx, key, s.Group, s.Consumer, s.NoAck, s.TimeMs, s.IDMs, s.IDSeq); err != nil {
+			return err
+		}
+		a.stats.GDelivers++
+	case obs1.GClaim:
+		if err := stream.ReplayGClaim(cx, key, s.Group, s.Consumer, s.Unowned, s.IDMs, s.IDSeq, s.TimeMs, s.Counts); err != nil {
+			return err
+		}
+		a.stats.GClaims++
+	default:
+		return fmt.Errorf("obs1 replay: groupdelta sub-op %T has no applier", d.Sub)
+	}
+	return nil
+}
+
 // flattenPairs lays field-value pairs out as the flat alternation the
 // type seams speak, the same shape the emission side consumed.
 func flattenPairs(pairs []obs1.FieldValue) [][]byte {
@@ -427,29 +491,4 @@ func deltaType(sub obs1.CollSub) (typ uint8, wired bool) {
 		return obs1.CollStream, true
 	}
 	return 0, false
-}
-
-// opKind names an op's wire kind for error text without re-encoding.
-func opKind(op obs1.Op) uint8 {
-	switch op.(type) {
-	case obs1.StrSet:
-		return obs1.OpStrSet
-	case obs1.KeyDel:
-		return obs1.OpKeyDel
-	case obs1.Expire:
-		return obs1.OpExpire
-	case obs1.CollDelta:
-		return obs1.OpCollDelta
-	case obs1.CollNew:
-		return obs1.OpCollNew
-	case obs1.CollDrop:
-		return obs1.OpCollDrop
-	case obs1.Txn:
-		return obs1.OpTxn
-	case obs1.Noop:
-		return obs1.OpNoop
-	case obs1.GroupDelta:
-		return obs1.OpGroupDelta
-	}
-	return 0
 }

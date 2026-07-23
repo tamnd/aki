@@ -440,3 +440,89 @@ func TestBootServesStreamsAcrossRestart(t *testing.T) {
 	expect(t, r3, ":1\r\n")
 	commitAndStop(t, b3, srv3, nc3)
 }
+
+// TestBootServesGroupsAcrossRestart drives the consumer-group plane
+// through the boot seam: XGROUP CREATE both plain and MKSTREAM, an
+// XREADGROUP delivery, XACK, XCLAIM, consumer create and delete, SETID,
+// and DESTROY, with the PEL, cursors, and consumers served back by the
+// next incarnations over XPENDING and history reads.
+func TestBootServesGroupsAcrossRestart(t *testing.T) {
+	bucket := sim.New(sim.Config{})
+
+	b1, srv1, nc1, r1 := bootServer(t, bucket, 1)
+	// MKSTREAM frames a collnew consumed by the gnew itself.
+	send(t, nc1, "XGROUP", "CREATE", "k", "g", "0", "MKSTREAM")
+	expect(t, r1, "+OK\r\n")
+	send(t, nc1, "XADD", "k", "1-1", "a", "1")
+	expect(t, r1, "$3\r\n1-1\r\n")
+	send(t, nc1, "XADD", "k", "2-2", "b", "2")
+	expect(t, r1, "$3\r\n2-2\r\n")
+	send(t, nc1, "XREADGROUP", "GROUP", "g", "c1", "COUNT", "10", "STREAMS", "k", ">")
+	expect(t, r1, "*1\r\n*2\r\n$1\r\nk\r\n*2\r\n"+
+		"*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"+
+		"*2\r\n$3\r\n2-2\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n")
+	send(t, nc1, "XACK", "k", "g", "1-1")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "XGROUP", "CREATECONSUMER", "k", "g", "c2")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "XCLAIM", "k", "g", "c2", "0", "2-2")
+	expect(t, r1, "*1\r\n*2\r\n$3\r\n2-2\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n")
+	// A second group on the same stream, its cursor grafted by SETID.
+	send(t, nc1, "XGROUP", "CREATE", "k", "h", "1-1")
+	expect(t, r1, "+OK\r\n")
+	send(t, nc1, "XGROUP", "SETID", "k", "h", "0")
+	expect(t, r1, "+OK\r\n")
+	// A consumer that leaves, and a group that leaves.
+	send(t, nc1, "XGROUP", "CREATECONSUMER", "k", "g", "c3")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "XGROUP", "DELCONSUMER", "k", "g", "c3")
+	expect(t, r1, ":0\r\n")
+	send(t, nc1, "XGROUP", "CREATE", "k", "tmp", "0")
+	expect(t, r1, "+OK\r\n")
+	send(t, nc1, "XGROUP", "DESTROY", "k", "tmp")
+	expect(t, r1, ":1\r\n")
+	commitAndStop(t, b1, srv1, nc1)
+
+	b2, srv2, nc2, r2 := bootServer(t, bucket, 2)
+	if b2.Replay.GNews == 0 || b2.Replay.GDelivers == 0 || b2.Replay.GAcks == 0 ||
+		b2.Replay.GClaims == 0 || b2.Replay.GConsumerNews == 0 || b2.Replay.GConsumerDels == 0 ||
+		b2.Replay.GSetIDs == 0 || b2.Replay.GDrops == 0 {
+		t.Fatalf("reboot replay stats %+v, want group plane counts", b2.Replay)
+	}
+	// 2-2 is pending, owned by c2 after the claim; the ack removed 1-1.
+	send(t, nc2, "XPENDING", "k", "g")
+	expect(t, r2, "*4\r\n:1\r\n$3\r\n2-2\r\n$3\r\n2-2\r\n*1\r\n*2\r\n$2\r\nc2\r\n$1\r\n1\r\n")
+	// The delivery cursor survived at 2-2: a new entry is the only one
+	// a `>` read hands out.
+	send(t, nc2, "XADD", "k", "3-3", "c", "3")
+	expect(t, r2, "$3\r\n3-3\r\n")
+	send(t, nc2, "XREADGROUP", "GROUP", "g", "c1", "COUNT", "10", "STREAMS", "k", ">")
+	expect(t, r2, "*1\r\n*2\r\n$1\r\nk\r\n*1\r\n*2\r\n$3\r\n3-3\r\n*2\r\n$1\r\nc\r\n$1\r\n3\r\n")
+	// SETID's grafted cursor survived on h: a NOACK read replays the
+	// stream from the top without growing a PEL.
+	send(t, nc2, "XREADGROUP", "GROUP", "h", "w", "NOACK", "COUNT", "10", "STREAMS", "k", ">")
+	expect(t, r2, "*1\r\n*2\r\n$1\r\nk\r\n*3\r\n"+
+		"*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"+
+		"*2\r\n$3\r\n2-2\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n"+
+		"*2\r\n$3\r\n3-3\r\n*2\r\n$1\r\nc\r\n$1\r\n3\r\n")
+	send(t, nc2, "XPENDING", "k", "h")
+	expect(t, r2, "*4\r\n:0\r\n$-1\r\n$-1\r\n*-1\r\n")
+	// The destroyed group stayed destroyed.
+	send(t, nc2, "XREADGROUP", "GROUP", "tmp", "c", "STREAMS", "k", ">")
+	expect(t, r2, "-NOGROUP No such key 'k' or consumer group 'tmp' in XREADGROUP with GROUP option\r\n")
+	// Ack the claimed entry so the third incarnation sees only 3-3.
+	send(t, nc2, "XACK", "k", "g", "2-2")
+	expect(t, r2, ":1\r\n")
+	commitAndStop(t, b2, srv2, nc2)
+
+	b3, srv3, nc3, r3 := bootServer(t, bucket, 3)
+	// Only 3-3 pends, owned by c1 from the second incarnation's read.
+	send(t, nc3, "XPENDING", "k", "g")
+	expect(t, r3, "*4\r\n:1\r\n$3\r\n3-3\r\n$3\r\n3-3\r\n*1\r\n*2\r\n$2\r\nc1\r\n$1\r\n1\r\n")
+	// A history read serves c1's replayed PEL entry back with its data.
+	send(t, nc3, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "k", "0")
+	expect(t, r3, "*1\r\n*2\r\n$1\r\nk\r\n*1\r\n*2\r\n$3\r\n3-3\r\n*2\r\n$1\r\nc\r\n$1\r\n3\r\n")
+	send(t, nc3, "XPENDING", "k", "h")
+	expect(t, r3, "*4\r\n:0\r\n$-1\r\n$-1\r\n*-1\r\n")
+	commitAndStop(t, b3, srv3, nc3)
+}
