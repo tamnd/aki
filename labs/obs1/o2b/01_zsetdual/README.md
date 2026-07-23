@@ -42,8 +42,25 @@ Quick 5x10^4 passes executed during harness development and shaped the band widt
 
 ## Results
 
-Pending scored run.
+Scored run (zsetdual.csv), 2000 point ops per decade:
+
+| n | zscore GETs | zrank GETs | zrank_scan GETs | zrbs 0.1% | zrbs 5% | zrbs 25% | amp | dir B/elem | churn |
+|---|---|---|---|---|---|---|---|---|---|
+| 10^5 | 1.0000 | 1.0000 | 1 | 1.0000 | 2.0000 | 2.0000 | 2.0000 | 0.0920 | consistent |
+| 10^6 | 1.0000 | 1.0000 | 2 | 2.0000 | 2.0000 | 2.0000 | 2.0000 | 0.0920 | consistent |
+| 10^7 | 1.0000 | 1.0000 | 20 | 2.0000 | 2.0000 | 6.0000 | 2.0000 | 0.0920 | consistent |
+
+Every cell 100% found with every answer exact; point ops read one block at 126.7-128.0 KiB.
 
 ## Verdict
 
-Pending.
+Hit, with one band-edge miss on the counter-arm.
+
+Band 1 exact: amplification 2.0000 at every decade, the projection doubling and nothing else.
+Bands 2 and 3, the claim the 2x buys: ZSCORE and ZRANK both bill exactly 1.0000 GETs per op with every answer exact at every decade, rank flat in cardinality on resident prefix sums plus one boundary block.
+Band 4 edge: zrank_scan grows on the ceil identity as predicted (1, 2, then the 10^7 decade), but the 10^7 cell bills 20 GETs against the stated 17-19 because the arithmetic priced payload bytes only; frames flush just past the 16 KiB target, so seven chunks fit a 128 KiB block and the padding runs the object about 14% over payload.
+The miss lands on the arm the lab argues against, so it strengthens the conclusion, but the band was wrong and the padding term now has a measured size for the ledger prediction to carry.
+Band 5: ZRANGEBYSCORE sits on 1 + ceil(span bytes over 16 MiB) with exact counts everywhere, the sub-chunk span at 10^5 clipping to one GET and the 25% span at 10^7 reaching 6 inside the band.
+Bands 6 and 7: the resident rank surcharge is 0.0920 B per element flat across decades, and the churned one-pass rebuild leaves both projections carrying the identical multiset at every decade.
+
+The kill line did not fire: the dual-projection model holds, and the zset slices can bake it.
