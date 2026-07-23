@@ -57,7 +57,7 @@ func frames(kv ...string) []byte {
 	}
 	var buf []byte
 	for i := 0; i < len(kv); i += 2 {
-		buf = store.AppendRecordFrame(buf, kindString, 0, uint32(len(kv[i+1])), []byte(kv[i]), []byte(kv[i+1]))
+		buf = store.AppendRecordFrame(buf, kindString, 0, uint32(len(kv[i+1])), []byte(kv[i]), []byte(kv[i+1]), 0)
 	}
 	return buf
 }

@@ -142,7 +142,7 @@ func run(c cfg) (arm, error) {
 			return arm{}, err
 		}
 		if c.withFold {
-			frames = store.AppendRecordFrame(frames, 0x01, 0, uint32(len(val)), []byte(key), val)
+			frames = store.AppendRecordFrame(frames, 0x01, 0, uint32(len(val)), []byte(key), val, 0)
 			if len(frames) >= 1<<20 {
 				folder.Add(frames)
 				frames = frames[:0]

@@ -198,7 +198,7 @@ func run(c cfg) ([]sample, sample, error) {
 			_ = r.wl.Close()
 			return nil, sample{}, err
 		}
-		frames = store.AppendRecordFrame(frames, 0x01, 0, uint32(len(val)), []byte(key), val)
+		frames = store.AppendRecordFrame(frames, 0x01, 0, uint32(len(val)), []byte(key), val, 0)
 		if len(frames) >= 1<<20 {
 			r.folder.Add(frames)
 			frames = frames[:0]

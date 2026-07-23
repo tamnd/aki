@@ -81,7 +81,7 @@ func seedFoldedBucket(t *testing.T, bucket *sim.Sim, node uint64, kv map[string]
 	var buf []byte
 	nframes := uint32(0)
 	for k, v := range kv {
-		buf = store.AppendRecordFrame(buf, 0x01, 0, uint32(len(v)), []byte(k), []byte(v))
+		buf = store.AppendRecordFrame(buf, 0x01, 0, uint32(len(v)), []byte(k), []byte(v), 0)
 		nframes++
 	}
 	folder.Add(buf)

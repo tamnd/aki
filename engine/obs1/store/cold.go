@@ -43,7 +43,7 @@ func (s *Store) reserveColdNull() {
 	if s.cold == nil || s.cold.tail != 0 {
 		return
 	}
-	_, _ = s.cold.append(appendColdFrame(nil, 0, 0, 0, nil, nil))
+	_, _ = s.cold.append(appendColdFrame(nil, 0, 0, 0, nil, nil, 0))
 }
 
 // coldHeader preads a cold frame's fixed header at off and returns the frame's
@@ -91,6 +91,22 @@ func (s *Store) coldVlen(off uint64) uint32 {
 	return vlen
 }
 
+// coldExpireAt reads a cold record's absolute unix-ms deadline, 0 when the
+// frame carries none or cannot be read. The header pread tells whether the
+// trailing expiry word exists; only a TTL bearer pays the second pread for it,
+// so the common TTL-free cold hit costs one small pread here.
+func (s *Store) coldExpireAt(off uint64) int64 {
+	total, _, flags, _, err := s.coldHeader(off)
+	if err != nil || flags&flagHasTTL == 0 || total < coldHdr+coldExpSize {
+		return 0
+	}
+	var w [coldExpSize]byte
+	if _, err := s.cold.readInto(off+uint64(total)-coldExpSize, coldExpSize, w[:]); err != nil {
+		return 0
+	}
+	return int64(binary.LittleEndian.Uint64(w[:]))
+}
+
 // coldValue reads a cold frame's value into the frame scratch and returns it by
 // band: the int cell rendered to decimal text, or the embedded bytes verbatim.
 // The returned slice aliases the scratch and is valid until the next cold read.
@@ -103,6 +119,9 @@ func (s *Store) coldValue(off uint64) ([]byte, bool) {
 	}
 	vstart := off + coldHdr + uint64(klen)
 	vlenBytes := total - coldHdr - klen
+	if flags&flagHasTTL != 0 {
+		vlenBytes -= coldExpSize
+	}
 	buf, err := s.cold.readInto(vstart, vlenBytes, s.coldBuf)
 	s.coldBuf = buf[:cap(buf)][:0]
 	if err != nil {
@@ -127,17 +146,19 @@ func (s *Store) coldRead(off uint64, dst []byte) ([]byte, bool) {
 }
 
 // demotable reports whether the resident record at addr is one this slice's
-// migrator may move to the cold region: a plain string in the int or embedded
-// band, with no deadline and no outside value bytes. A separated or chunked
-// record's run would dangle once its segment frees, so those keep their arena
-// residency until their cold forms land; a record with a TTL has no expiry
-// field in the frame; a dead record is already leaving the index.
+// migrator may move to the cold region: a string in the int or embedded band
+// with no outside value bytes. A separated or chunked record's run would
+// dangle once its segment frees, so those keep their arena residency on this
+// synchronous path (the staged drain resolves them, stageable); a dead record
+// is already leaving the index. A deadline rides the frame's trailing expiry
+// word, so a TTL record demotes like any other and expires lazily on the cold
+// read path (findLive).
 func (s *Store) demotable(addr uint64) bool {
 	if s.arena.buf[addr+offKind] != kindString {
 		return false
 	}
 	f := s.recFlags(addr)
-	return f&(flagSep|flagChunked|flagHasTTL|flagDead) == 0
+	return f&(flagSep|flagChunked|flagDead) == 0
 }
 
 // stageable is demotable widened by the pointer bands for the staged drain
@@ -147,15 +168,14 @@ func (s *Store) demotable(addr uint64) bool {
 // phase 2 releases the run when the flip lands. This is the obs1 strings
 // cold form (spec 2064/obs1 doc 08 section 2): a big value must reach the
 // fold tap as whole bytes because the segment it packs into serves nodes
-// that cannot reach this shard's value log. A record with a TTL still
-// waits for the TTL projection slice, and a dead record is already
-// leaving the index.
+// that cannot reach this shard's value log. A record with a TTL stages
+// with its deadline in the frame's trailing expiry word (the TTL
+// projection slice), and a dead record is already leaving the index.
 func (s *Store) stageable(addr uint64) bool {
 	if s.arena.buf[addr+offKind] != kindString {
 		return false
 	}
-	f := s.recFlags(addr)
-	return f&(flagHasTTL|flagDead) == 0
+	return s.recFlags(addr)&flagDead == 0
 }
 
 // demoteAt moves the resident record the entry word w names into the cold
@@ -202,8 +222,14 @@ func (s *Store) bringUp(h uint64, slot *uint64, off uint64) uint64 {
 		return off
 	}
 	key := frame[coldHdr : coldHdr+klen]
-	value := frame[coldHdr+klen : total]
-	nf := flags & (flagInt | flagRawSticky)
+	vend := total
+	var exp uint64
+	if flags&flagHasTTL != 0 {
+		vend -= coldExpSize
+		exp = binary.LittleEndian.Uint64(frame[vend:])
+	}
+	value := frame[coldHdr+klen : vend]
+	nf := flags & (flagInt | flagRawSticky | flagHasTTL)
 	if nf&flagInt == 0 && len(value) > strInlineMax {
 		// A staged pointer-band record framed its resolved bytes
 		// (stageRecord), so the frame's value region can be far past the
@@ -211,14 +237,18 @@ func (s *Store) bringUp(h uint64, slot *uint64, off uint64) uint64 {
 		// band ladder and overflow the header's u16 vcap word, so the
 		// bring-up re-selects the band by size exactly as a fresh SET
 		// would: a run for the separated range, chunks past strChunkMin.
-		return s.bringUpPointer(h, slot, off, key, value, nf)
+		return s.bringUpPointer(h, slot, off, key, value, nf, exp)
 	}
 
 	var vcapB uint64 = 8
 	if nf&flagInt == 0 {
 		vcapB = align8(uint64(len(value)))
 	}
-	noff, ok := s.arenaAlloc(uint64(hdrSize) + align8(uint64(klen)) + vcapB)
+	need := uint64(hdrSize) + align8(uint64(klen)) + vcapB
+	if nf&flagHasTTL != 0 {
+		need += 8
+	}
+	noff, ok := s.arenaAlloc(need)
 	if !ok {
 		// The arena cannot take it back; leave the key cold. The read fallback
 		// still serves from the frame, and a write retries the bring-up at the
@@ -233,6 +263,9 @@ func (s *Store) bringUp(h uint64, slot *uint64, off uint64) uint64 {
 	buf[noff+offKind] = kindString
 	buf[noff+offFlags] = nf
 	binary.LittleEndian.PutUint16(buf[noff+offKindBits:], 0)
+	if nf&flagHasTTL != 0 {
+		s.setExpireAt(noff, int64(exp))
+	}
 	copy(buf[s.keyStart(noff):], key)
 	copy(buf[s.valueStart(noff):], value)
 
@@ -247,13 +280,17 @@ func (s *Store) bringUp(h uint64, slot *uint64, off uint64) uint64 {
 // the SET thresholds) with the frame's bytes placed as a fresh run or chunk
 // set. A placement failure leaves the key cold, the same fallback as an arena
 // that cannot take the record.
-func (s *Store) bringUpPointer(h uint64, slot *uint64, off uint64, key, value []byte, nf byte) uint64 {
+func (s *Store) bringUpPointer(h uint64, slot *uint64, off uint64, key, value []byte, nf byte, exp uint64) uint64 {
 	bf := nf | flagSep
 	if len(value) >= strChunkMin {
 		bf = nf | flagChunked
 	}
 	klen := len(key)
-	noff, ok := s.arenaAlloc(uint64(hdrSize) + align8(uint64(klen)) + ptrSize)
+	need := uint64(hdrSize) + align8(uint64(klen)) + ptrSize
+	if bf&flagHasTTL != 0 {
+		need += 8
+	}
+	noff, ok := s.arenaAlloc(need)
 	if !ok {
 		return off
 	}
@@ -265,6 +302,9 @@ func (s *Store) bringUpPointer(h uint64, slot *uint64, off uint64, key, value []
 	buf[noff+offKind] = kindString
 	buf[noff+offFlags] = bf
 	binary.LittleEndian.PutUint16(buf[noff+offKindBits:], 0)
+	if bf&flagHasTTL != 0 {
+		s.setExpireAt(noff, int64(exp))
+	}
 	copy(buf[s.keyStart(noff):], key)
 	if bf&flagChunked != 0 {
 		dirOff, n, err := s.writeChunked(nil, 0, value, len(value))

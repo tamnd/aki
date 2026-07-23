@@ -117,12 +117,23 @@ func (s *Store) setExpireAt(off uint64, at int64) {
 // paths), which skips the check.
 func (s *Store) findLive(h uint64, key []byte, now int64) (slot *uint64, addr uint64, inOverflow bool) {
 	slot, addr, inOverflow = s.findEntry(h, key)
-	// A cold entry carries no expiry (the migrator demotes only TTL-free
-	// records this slice) and its address is a cold-frame offset, so the arena
-	// expiry read is both unnecessary and wrong for it. addr is the cold offset;
-	// the caller serves it through the frame or brings it up.
-	if addr != 0 && now != 0 && !slotCold(*slot) {
-		if at := s.expireAt(addr); at != 0 && at <= now {
+	if addr != 0 && now != 0 {
+		var at int64
+		if slotCold(*slot) {
+			// addr is a cold-frame offset, so the deadline sits in the frame's
+			// trailing expiry word, not the arena. A fired cold record drops its
+			// index entry; the frame goes unreferenced, which is how cold bytes
+			// die (dropColdEntry).
+			at = s.coldExpireAt(addr)
+			if at != 0 && at <= now {
+				s.deleteAt(h, slot, inOverflow)
+				s.dropColdEntry()
+				s.count--
+				return nil, 0, false
+			}
+			return slot, addr, inOverflow
+		}
+		if at = s.expireAt(addr); at != 0 && at <= now {
 			s.deleteAt(h, slot, inOverflow)
 			s.dropRecord(addr)
 			s.count--
@@ -271,16 +282,18 @@ func (s *Store) Exists(key []byte, now int64) bool {
 }
 
 // ExpireAt reports key's absolute expiry deadline in unix ms, 0 when the key
-// is absent or carries none. A cold record always reads 0: the migrator
-// demotes only TTL-free records, so the answer is exact without a frame read.
-// The obs1 write log reads the deadline back after a TTL-preserving write
-// (INCR, APPEND, SETRANGE, SET KEEPTTL) so the effect frame records the
-// absolute deadline the key still rides under (spec 2064/obs1 doc 04
-// section 2).
+// is absent or carries none. A cold record reads its deadline from the frame's
+// trailing expiry word. The obs1 write log reads the deadline back after a
+// TTL-preserving write (INCR, APPEND, SETRANGE, SET KEEPTTL) so the effect
+// frame records the absolute deadline the key still rides under (spec
+// 2064/obs1 doc 04 section 2).
 func (s *Store) ExpireAt(key []byte, now int64) int64 {
 	slot, addr, _ := s.findLive(Hash(key), key, now)
-	if addr == 0 || slotCold(*slot) {
+	if addr == 0 {
 		return 0
+	}
+	if slotCold(*slot) {
+		return s.coldExpireAt(addr)
 	}
 	return s.expireAt(addr)
 }
