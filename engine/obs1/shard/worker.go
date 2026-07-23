@@ -175,6 +175,14 @@ type worker struct {
 	bpLeaseStall   int
 	bpLeaseSeen    uint64
 	bpLeaseCheckMs int64
+
+	// The cold read counters (coldget.go): commands parked on a cold fetch
+	// and the completion split into serves, demoted-group drops, and fetch
+	// failures. Owner goroutine only.
+	coldParks   uint64
+	coldServes  uint64
+	coldDropped uint64
+	coldErrs    uint64
 }
 
 func newWorker(id int, st *store.Store) *worker {
