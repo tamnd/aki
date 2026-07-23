@@ -33,9 +33,9 @@ const (
 	// 1.4): an accumulator past it closes its segment on the next tap.
 	foldSegTarget = 64 << 20
 
-	// foldChunkTarget is the run-chunk payload target, the middle of the
-	// doc 08 section 1 4-32KiB band.
-	foldChunkTarget = 16 << 10
+	// foldChunkTarget is the run-chunk payload target: the shared doc 08
+	// default the O2a labs measured (#1290, #1291).
+	foldChunkTarget = ChunkTargetDefault
 
 	// foldAgeDefault is the age trigger's bound (doc 06 section 1.4): an
 	// accumulator holding bytes older than this cuts on the next cadence
