@@ -253,6 +253,20 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return arityErr(reply, cmd)
 		}
 		return AppendBulk(reply, args[1])
+	case "INFO":
+		// One section for now, whatever section the client asked for.
+		// The io_backend line is the doc 13 provenance requirement: a
+		// gate run must know which backend ran, and the fallback is
+		// silent so this is the only place the fact surfaces.
+		ss := s.t.StoreStats()
+		ts := s.t.Stats()
+		backend := ss.IOBackend
+		if backend == "" {
+			backend = "none"
+		}
+		info := fmt.Sprintf("# sqlo1\r\nio_backend:%s\r\nkeys:%d\r\ndisk_bytes:%d\r\nhigh_water:%d\r\nhot_keys:%d\r\ndirty_bytes:%d\r\n",
+			backend, ss.Keys, ss.DiskBytes, ss.HighWater, ts.HotKeys, ts.DirtyBytes)
+		return AppendBulk(reply, []byte(info))
 	case "SET":
 		return s.setCmd(ctx, reply, args, now)
 	case "SETNX":

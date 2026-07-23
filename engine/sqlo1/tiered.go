@@ -479,6 +479,11 @@ func (t *Tiered) Flush(ctx context.Context) error {
 }
 
 // Stats snapshots the counters plus the tier's live shape.
+// StoreStats polls the cold store's own accounting, the INFO feed.
+func (t *Tiered) StoreStats() StoreStats {
+	return t.st.Stats()
+}
+
 func (t *Tiered) Stats() TieredStats {
 	s := t.stats
 	s.Evictions = t.ev.evictions

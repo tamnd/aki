@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // The store's seam onto the IO backend (doc 04 section 12, R-I4):
@@ -20,6 +21,20 @@ const storeIOWorkers = 4
 // storeIOComp sizes the completion mailbox; NewIOPool asks the caller
 // to cover its in-flight window so workers never stall posting.
 const storeIOComp = 64
+
+// storeRingDepth is the ring's SQ depth under the store. Provisional
+// like the worker count; the ringpool sweep prices it.
+const storeRingDepth = 64
+
+// ringSelfTestTimeout bounds the startup self-test read. A ring that
+// sets up but never completes is broken in a way teardown could hang
+// on, so the deadline abandons it instead of joining it.
+const ringSelfTestTimeout = 2 * time.Second
+
+// ForceIOPool pins the store to the iopool backend regardless of ring
+// support, the gate's arm switch for the B5 on/off delta note. Set it
+// before opening a store; sqlo1srv wires it to -io-backend.
+var ForceIOPool bool
 
 // IOBridge turns the asynchronous Backend contract into the
 // synchronous reads the store's lookup path wants: each Read takes a
