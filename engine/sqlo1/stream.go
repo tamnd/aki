@@ -97,6 +97,13 @@ type Stream struct {
 	// deletes a paged trim owes, listtrim's discipline.
 	deadPages []uint64
 
+	// gkbuf holds the group record subkey, grpBuf stages a group record
+	// payload, and grpCons carries one decoded consumer table; shared
+	// scratch on the run-buffer reasoning.
+	gkbuf   [SubkeySize]byte
+	grpBuf  []byte
+	grpCons []streamConsumer
+
 	// mgKeyBuf, mgKeys, mgVals, mgRoots, and mgExps carry one range
 	// walk's prefetch round, the list Range shape.
 	mgKeyBuf []byte

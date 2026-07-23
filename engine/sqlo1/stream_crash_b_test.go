@@ -12,7 +12,12 @@ package sqlo1_test
 // batch whole. Every snapshot also carries the root accounting line
 // (count, entries-added, last-generated-ID, max-deleted-ID), so the
 // counters are exact at every cut and the XSETID phase's root
-// rewrites are all-or-nothing like everything else.
+// rewrites are all-or-nothing like everything else. The group phase
+// adds the kind 4 rows: every snapshot renders the full group table,
+// so a fresh group's flush-before-root discipline, the record-only
+// SETID and consumer rewrites, a destroy's move-and-drop compaction,
+// and the MKSTREAM empty create all recover whole, and the last
+// delivered ID persists at every cut.
 
 import (
 	"context"
@@ -53,13 +58,20 @@ func TestStreamPagedTornTail(t *testing.T) {
 	// runs, two per page, four index slots) drive every paged rung with
 	// two-digit entry counts.
 	med := strings.Repeat("m", 1800)
-	keys := []string{"s", "s2"}
+	keys := []string{"s", "s2", "s3"}
 	snapshot := func(xx *sqlo1.Stream) map[string][]string {
 		t.Helper()
 		img := map[string][]string{}
 		for _, k := range keys {
+			line, ok, err := xx.StreamRootLineForTest(ctx, []byte(k))
+			if err != nil {
+				t.Fatalf("root line(%q): %v", k, err)
+			}
+			if !ok {
+				continue
+			}
 			var ents []string
-			err := xx.RangeAllForTest(ctx, []byte(k), func(ms, seq uint64, fv [][]byte) {
+			err = xx.RangeAllForTest(ctx, []byte(k), func(ms, seq uint64, fv [][]byte) {
 				parts := make([]string, len(fv))
 				for i, b := range fv {
 					parts[i] = string(b)
@@ -76,13 +88,11 @@ func TestStreamPagedTornTail(t *testing.T) {
 			if int(n) != len(ents) {
 				t.Fatalf("XLEN(%q) = %d but %d entries reachable", k, n, len(ents))
 			}
-			line, ok, err := xx.StreamRootLineForTest(ctx, []byte(k))
+			groups, err := xx.GroupLinesForTest(ctx, []byte(k))
 			if err != nil {
-				t.Fatalf("root line(%q): %v", k, err)
+				t.Fatalf("group lines(%q): %v", k, err)
 			}
-			if ok {
-				img[k] = append(ents, "root|"+line)
-			}
+			img[k] = append(append(ents, "root|"+line), groups...)
 		}
 		return img
 	}
@@ -182,6 +192,65 @@ func TestStreamPagedTornTail(t *testing.T) {
 	flush()
 	setid("s2", 9, false, 0, false, 0)
 	add("s2", 10, "tiny")
+	flush()
+
+	// Phase 8: group records. A fresh group flushes before the root
+	// that references it, the SETID and consumer rewrites are
+	// record-only single batches, a destroy moves the tail ordinal and
+	// drops the vacated record after the root, and the MKSTREAM create
+	// mints a count 0 stream the next add appends onto; the snapshot's
+	// group lines hold the last delivered IDs at every cut.
+	gcreate := func(key, group string, ms uint64, mkstream bool, read int64) {
+		t.Helper()
+		if err := x.GroupCreateForTest(ctx, []byte(key), []byte(group), ms, 0, mkstream, read); err != nil {
+			t.Fatalf("GroupCreate(%q, %q): %v", key, group, err)
+		}
+		mark()
+	}
+	gsetid := func(key, group string, ms uint64, read int64) {
+		t.Helper()
+		if err := x.GroupSetIDForTest(ctx, []byte(key), []byte(group), ms, 0, read); err != nil {
+			t.Fatalf("GroupSetID(%q, %q): %v", key, group, err)
+		}
+		mark()
+	}
+	gconsumer := func(key, group, consumer string) {
+		t.Helper()
+		created, err := x.GroupCreateConsumer(ctx, []byte(key), []byte(group), []byte(consumer), 777)
+		if err != nil || !created {
+			t.Fatalf("GroupCreateConsumer(%q, %q) = %v, %v", key, consumer, created, err)
+		}
+		mark()
+	}
+	gdestroy := func(key, group string, want bool) {
+		t.Helper()
+		destroyed, err := x.GroupDestroy(ctx, []byte(key), []byte(group))
+		if err != nil || destroyed != want {
+			t.Fatalf("GroupDestroy(%q, %q) = %v, %v", key, group, destroyed, err)
+		}
+		if destroyed {
+			mark()
+		}
+	}
+	gcreate("s", "alpha", 5, false, -1)
+	gcreate("s", "beta", 0, false, 3)
+	gconsumer("s", "alpha", "c1")
+	gconsumer("s", "alpha", "c2")
+	flush()
+	gsetid("s", "alpha", 600, -1)
+	if pending, err := x.GroupDelConsumer(ctx, []byte("s"), []byte("alpha"), []byte("c1")); err != nil || pending != 0 {
+		t.Fatalf("GroupDelConsumer = %d, %v", pending, err)
+	}
+	mark()
+	gcreate("s2", "solo", 1, false, -1)
+	flush()
+	gcreate("s3", "boot", 0, true, -1)
+	add("s3", 1, "tiny")
+	gcreate("s", "gamma", 7, false, -1)
+	gdestroy("s", "alpha", true)
+	flush()
+	gdestroy("s2", "solo", true)
+	gdestroy("s2", "solo", false)
 	flush()
 
 	if err := db.Close(); err != nil {
