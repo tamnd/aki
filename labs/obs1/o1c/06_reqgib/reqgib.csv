@@ -1,0 +1,2 @@
+payload_bytes,puts,gets,free,total,req_per_gib,wal_flushes,chain_batches,seg_puts,man_published,put_retries
+1073741838,302,0,0,302,302.0,131,131,20,20,0
