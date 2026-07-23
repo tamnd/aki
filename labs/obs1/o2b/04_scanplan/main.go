@@ -250,6 +250,19 @@ func admissionArm(ctx context.Context, s *sim.Sim, key string, c blockCache, exe
 	return float64(hits) / float64(points), after.GetRequests - before.GetRequests
 }
 
+// putScanObject builds and stores the deterministic scan object, letting
+// the local buffer release before the arms run.
+func putScanObject(ctx context.Context, s *sim.Sim, objBytes int64) uint32 {
+	obj := make([]byte, objBytes)
+	for i := range obj {
+		obj[i] = byte(i*31 + 7)
+	}
+	if _, err := s.Put(ctx, "seg/scan", obj); err != nil {
+		die("put: %v", err)
+	}
+	return crc32.ChecksumIEEE(obj)
+}
+
 type results struct {
 	scan  []cell
 	plans []cell
@@ -276,15 +289,7 @@ func run(objBytes int64, cacheSlots, hot, warmOps, scanBlocks int) (res results,
 	}()
 	ctx := context.Background()
 	s := sim.New(sim.Config{})
-	obj := make([]byte, objBytes)
-	for i := range obj {
-		obj[i] = byte(i*31 + 7)
-	}
-	wantCRC := crc32.ChecksumIEEE(obj)
-	if _, err := s.Put(ctx, "seg/scan", obj); err != nil {
-		die("put: %v", err)
-	}
-	obj = nil
+	wantCRC := putScanObject(ctx, s, objBytes)
 
 	for _, arm := range []struct {
 		name string

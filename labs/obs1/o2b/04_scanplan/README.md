@@ -42,8 +42,29 @@ The fan model is deterministic and scale-independent, so its full-size rows repe
 
 ## Results
 
-(scored run pending)
+```
+cell,gets,mib_or_sec,extra
+scan_perblock,4096,512.00,
+scan_coalesce8,64,512.00,
+scan_coalesce16,32,512.00,
+plan_1gib_8mib,128,,
+plan_1gib_16mib,64,,
+plan_10gib_16mib,640,,
+fan_1,,120.17,throughput 89 MB/s
+fan_2,,60.09,throughput 179 MB/s
+fan_4,,30.04,throughput 357 MB/s
+fan_8,,15.02,throughput 715 MB/s
+fan_16,,9.39,throughput 1144 MB/s
+fan_32,,8.99,throughput 1194 MB/s
+adm_s3fifo_exempt,12328,,point_hit 0.9128
+adm_s3fifo_admit,12363,,point_hit 0.9122
+adm_lru_admit,18697,,point_hit 0.8206
+```
 
 ## Verdict
 
-(pending)
+HIT on all three bands.
+The real 512 MiB scan billed exactly the plan in every arm, 4096 per-block GETs against 64 and 32 coalesced, all checksum-exact at exactly 512 MiB transferred, and the plan rows land the doc 05 examples exactly, 640 GETs for 10 GiB at 16 MiB.
+The fan curve confirms the default: 1 to 8 is exactly 8.0x, the 8 to 16 doubling is the first below 85 percent efficiency (1.60x), and 16 to 32 buys 1.04x against the NIC ceiling, so 8 is the last near-linear fan under the disclosed doc 01 fit.
+The exemption never loses: 0.9128 exempt vs 0.9122 admitting, a 0.06 point delta that shows the S3-FIFO doorkeeper is already scan-resistant by design (the residual damage is small-queue and ghost churn), while the naive LRU reference arm drops 9.2 points below the exempt arm and buys 1.52x its total GETs (1.77x on point misses alone), which is what the doorkeeper plus exemption is worth over admit-everything.
+The scan slice and the O3 cache milestone replace the lab-local fan model and cache with landed planes; the E-sim refit at O5 replaces the latency constants with measured distributions.

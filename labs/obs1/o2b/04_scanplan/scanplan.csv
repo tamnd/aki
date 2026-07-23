@@ -1,0 +1,16 @@
+cell,gets,mib_or_sec,extra
+scan_perblock,4096,512.00,
+scan_coalesce8,64,512.00,
+scan_coalesce16,32,512.00,
+plan_1gib_8mib,128,,
+plan_1gib_16mib,64,,
+plan_10gib_16mib,640,,
+fan_1,,120.17,throughput 89 MB/s
+fan_2,,60.09,throughput 179 MB/s
+fan_4,,30.04,throughput 357 MB/s
+fan_8,,15.02,throughput 715 MB/s
+fan_16,,9.39,throughput 1144 MB/s
+fan_32,,8.99,throughput 1194 MB/s
+adm_s3fifo_exempt,12328,,point_hit 0.9128
+adm_s3fifo_admit,12363,,point_hit 0.9122
+adm_lru_admit,18697,,point_hit 0.8206
