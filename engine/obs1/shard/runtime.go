@@ -27,6 +27,11 @@ type Runtime struct {
 	// deadlock-free.
 	txnTicket atomic.Uint64
 
+	// coldPlan is the object-tier cold read plan SetColdPlan wired, nil on a
+	// runtime with no cold tier (coldget.go). Fixed before Start like the
+	// other seams; owner goroutines read it with plain loads.
+	coldPlan ColdPlan
+
 	// netInfo, when set, appends the transport's "# Net" lines to the INFO
 	// stats text (doc 08 section 9.5). The server layer owns the transport
 	// counters and registers the renderer through SetNetInfo before Start;

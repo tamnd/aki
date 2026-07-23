@@ -49,6 +49,13 @@ func eqFold(b []byte, s string) bool {
 func Get(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	v, cs, ok := cx.St.GetViewStream(args[0], cx.NowMs)
 	if !ok {
+		// A hot miss falls through to the object tier: a keymap hit parks
+		// the command on an async fetch and the reply arrives through the
+		// CompleteBlocked loopback; a keymap miss is definitive with zero
+		// GETs and answers absent right here.
+		if cx.ColdGet(args[0], r) {
+			return
+		}
 		r.Null()
 		return
 	}
