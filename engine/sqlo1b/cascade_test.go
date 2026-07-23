@@ -390,8 +390,17 @@ func TestCascadeSelect(t *testing.T) {
 		}
 		entropy[i] = v
 	}
-	if scheme, _ := cSelect(cascadePayload(t, entropy)); scheme != SchemeRaw {
-		t.Errorf("high-entropy payload selected scheme %d, want raw", scheme)
+	// High-entropy values kill every lightweight scheme. The zstd
+	// fall-through may still clear the floor on the stems (headers and
+	// keys stay compressible), which the cascade lab accepted too; the
+	// winner just has to round trip.
+	ep := cascadePayload(t, entropy)
+	if scheme, comp := cSelect(ep); scheme != SchemeRaw {
+		if scheme != SchemeZstd {
+			t.Errorf("high-entropy payload selected scheme %d, want raw or zstd", scheme)
+		} else if got, err := cDecode(scheme, 0, comp, len(ep)); err != nil || !bytes.Equal(got, ep) {
+			t.Errorf("high-entropy zstd winner does not round trip: %v", err)
+		}
 	}
 	if scheme, _ := cSelect([]byte("not a record chain")); scheme != SchemeRaw {
 		t.Error("garbage payload must select raw")

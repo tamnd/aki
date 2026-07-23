@@ -125,10 +125,12 @@ const cSelectFloor = 8
 // and returns the winning scheme with its compressed bytes, or raw
 // with nil. The lab's sampling discipline (1 percent with a 40
 // absolute minimum) clamps to the whole group at the 4 KiB frame
-// granularity, so the sample here is every record: each candidate
+// granularity, so the sample here is every record: each cascade
 // scheme try-encodes the full payload and the smallest one above the
 // floor wins, ties to the lower id because dict is the cheapest
-// decode.
+// decode. Zstd is the lab's fall-through, tried only when every
+// lightweight scheme misses the floor, so shapes the cascade owns
+// never pay the zstd encode.
 func cSelect(payload []byte) (uint8, []byte) {
 	sp, err := splitCascade(payload)
 	if err != nil || len(sp.stems) == 0 {
@@ -145,6 +147,11 @@ func cSelect(payload []byte) (uint8, []byte) {
 		}
 		if best == nil || len(comp) < len(best) {
 			scheme, best = cand, comp
+		}
+	}
+	if scheme == SchemeRaw {
+		if comp := zstdEncode(payload); 100*len(comp) <= (100-cSelectFloor)*len(payload) {
+			return SchemeZstd, comp
 		}
 	}
 	return scheme, best
