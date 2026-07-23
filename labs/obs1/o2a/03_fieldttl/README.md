@@ -37,4 +37,17 @@ A -quick run at 10^5 fields executed during development after the bands were der
 
 ## Results
 
-Pending.
+Scored on the M4 box, fieldttl.csv checked in.
+
+Pay-only-if-used: column and bitmap at zero TTL use are byte-identical to the plain packing (0.000 B per element, the smoke test asserts the exact bytes); flag pays 1.058 B forever.
+The column poisons at sparse use: one bearer per thousand fields contaminates 17.9% of chunks for 1.453 B per element, one per hundred contaminates 86.7% for 7.730 B, and from 10% use it is the full 9.164 B no matter how few fields need it.
+Band miss, disclosed: the one-per-thousand cells landed just under their 20-24% and 1.5-1.9 B bands, which were anchored to the noisy 10^5 calibration (21.7% over ~590 chunks); the converged million-field value matches the 1-(1-f)^m contamination arithmetic directly, so the miss is the calibration sample, not the model, and the poisoning claim stands slightly softened.
+The bitmap tracks the floor: 0.000 at one permille, 0.068 at 1%, 1.030 at 10%, 4.620 at half, 9.164 at full use, meeting the column only when every field bears a TTL.
+The flag encoding is worst at low use and worst at full use (10.435 B).
+The point bill never moved: 1.0000 GETs per op, 100% found, at every fraction under every encoding.
+Burden: dead share by count exactly 25.0/50.0/90.0 at the three expiry fractions, live probes 1.0000 GETs at 100% found, expired probes 1.0000 GETs at 0% found, the rewrite reclaimed exactly the dead share (103.2 MiB down to 77.4/51.6/10.3), and scan requests sat on the ceil identity on both sides of the rewrite.
+
+## Verdict
+
+PRED-OBS1-O2A-FIELDTTL: HIT, with the column one-permille cells' low miss disclosed.
+The hashes slice bakes the bitmap-per-contaminated-chunk encoding: zero cost when HEXPIRE is unused, near-floor cost when sparse, and the lazy rule's whole price is the one GET the probe already pays, with rewrite reclaiming dead fields byte for byte.
