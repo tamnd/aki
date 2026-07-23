@@ -1179,6 +1179,12 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.xreadgroupCmd(ctx, reply, args, now)
 	case "XACK":
 		return s.xackCmd(ctx, reply, args)
+	case "XPENDING":
+		return s.xpendingCmd(ctx, reply, args, now)
+	case "XCLAIM":
+		return s.xclaimCmd(ctx, reply, args, now)
+	case "XAUTOCLAIM":
+		return s.xautoclaimCmd(ctx, reply, args, now)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)

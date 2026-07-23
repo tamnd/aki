@@ -219,6 +219,23 @@ func (x *Stream) AckForTest(ctx context.Context, key, group []byte, ids [][2]uin
 	return x.Ack(ctx, key, group, sids)
 }
 
+// ClaimForTest and AutoClaimForTest drive the pending-surface crash
+// phase from the external package on the plain-integer seam.
+func (x *Stream) ClaimForTest(ctx context.Context, key, group, consumer []byte, minIdle int64, ids [][2]uint64, force, justid bool, nowMs int64) (int, error) {
+	sids := make([]streamID, len(ids))
+	for i, p := range ids {
+		sids[i] = streamID{ms: p[0], seq: p[1]}
+	}
+	o := streamClaimOpts{retry: -1, force: force, justid: justid}
+	claimed, err := x.Claim(ctx, key, group, consumer, minIdle, sids, &o, nowMs)
+	return len(claimed), err
+}
+
+func (x *Stream) AutoClaimForTest(ctx context.Context, key, group, consumer []byte, minIdle int64, startMs, startSeq uint64, count int64, nowMs int64) (claimed, deleted int, err error) {
+	_, c, d, err := x.AutoClaim(ctx, key, group, consumer, minIdle, streamID{ms: startMs, seq: startSeq}, count, false, nowMs)
+	return len(c), len(d), err
+}
+
 func (x *Stream) PelLinesForTest(ctx context.Context, key []byte) ([]string, error) {
 	var lines []string
 	err := x.FullGroupsInfo(ctx, key, -1, func(int) {}, func(g *streamGroup, pending uint64, lag int64, lagOK bool, rows []streamPelRow, consRows [][]streamPelRow) {
