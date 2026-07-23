@@ -140,6 +140,24 @@ func (s *Store) demotable(addr uint64) bool {
 	return f&(flagSep|flagChunked|flagHasTTL|flagDead) == 0
 }
 
+// stageable is demotable widened by the pointer bands for the staged drain
+// (coldstage.go): the staging pass resolves a separated or chunked value's
+// outside bytes into the frame itself, so the dangling-run objection that
+// keeps those bands out of the synchronous demoter does not apply, and
+// phase 2 releases the run when the flip lands. This is the obs1 strings
+// cold form (spec 2064/obs1 doc 08 section 2): a big value must reach the
+// fold tap as whole bytes because the segment it packs into serves nodes
+// that cannot reach this shard's value log. A record with a TTL still
+// waits for the TTL projection slice, and a dead record is already
+// leaving the index.
+func (s *Store) stageable(addr uint64) bool {
+	if s.arena.buf[addr+offKind] != kindString {
+		return false
+	}
+	f := s.recFlags(addr)
+	return f&(flagHasTTL|flagDead) == 0
+}
+
 // demoteAt moves the resident record the entry word w names into the cold
 // region and rewrites the slot to a cold-tier entry in place. The frame carries
 // the whole record, so the arena bytes charge dead the moment the slot flips:
@@ -186,6 +204,15 @@ func (s *Store) bringUp(h uint64, slot *uint64, off uint64) uint64 {
 	key := frame[coldHdr : coldHdr+klen]
 	value := frame[coldHdr+klen : total]
 	nf := flags & (flagInt | flagRawSticky)
+	if nf&flagInt == 0 && len(value) > strInlineMax {
+		// A staged pointer-band record framed its resolved bytes
+		// (stageRecord), so the frame's value region can be far past the
+		// embedded ceiling. Rebuilding it embedded would both break the
+		// band ladder and overflow the header's u16 vcap word, so the
+		// bring-up re-selects the band by size exactly as a fresh SET
+		// would: a run for the separated range, chunks past strChunkMin.
+		return s.bringUpPointer(h, slot, off, key, value, nf)
+	}
 
 	var vcapB uint64 = 8
 	if nf&flagInt == 0 {
@@ -212,6 +239,52 @@ func (s *Store) bringUp(h uint64, slot *uint64, off uint64) uint64 {
 	*slot = tagOf(h)<<tagShift | noff
 	s.coldRecs--
 	s.noteNew(nf)
+	return noff
+}
+
+// bringUpPointer rebuilds a cold frame whose value outgrew the embedded band:
+// the record comes back as a pointer-band resident (separated or chunked by
+// the SET thresholds) with the frame's bytes placed as a fresh run or chunk
+// set. A placement failure leaves the key cold, the same fallback as an arena
+// that cannot take the record.
+func (s *Store) bringUpPointer(h uint64, slot *uint64, off uint64, key, value []byte, nf byte) uint64 {
+	bf := nf | flagSep
+	if len(value) >= strChunkMin {
+		bf = nf | flagChunked
+	}
+	klen := len(key)
+	noff, ok := s.arenaAlloc(uint64(hdrSize) + align8(uint64(klen)) + ptrSize)
+	if !ok {
+		return off
+	}
+	buf := s.arena.buf
+	binary.LittleEndian.PutUint32(buf[noff+offVer:], 0)
+	binary.LittleEndian.PutUint32(buf[noff+offVlen:], uint32(len(value)))
+	binary.LittleEndian.PutUint16(buf[noff+offKlen:], uint16(klen))
+	binary.LittleEndian.PutUint16(buf[noff+offVcap:], uint16(ptrSize/8))
+	buf[noff+offKind] = kindString
+	buf[noff+offFlags] = bf
+	binary.LittleEndian.PutUint16(buf[noff+offKindBits:], 0)
+	copy(buf[s.keyStart(noff):], key)
+	if bf&flagChunked != 0 {
+		dirOff, n, err := s.writeChunked(nil, 0, value, len(value))
+		if err != nil {
+			s.arena.unlink(noff, s.recBytes(noff))
+			return off
+		}
+		s.writePtr(s.valueStart(noff), dirOff, n, n)
+		s.chunkBytes += uint64(len(value))
+	} else {
+		word, vcap, err := s.writeRun(value, nil, 0)
+		if err != nil {
+			s.arena.unlink(noff, s.recBytes(noff))
+			return off
+		}
+		s.writePtr(s.valueStart(noff), word, uint32(len(value)), vcap)
+	}
+	*slot = tagOf(h)<<tagShift | noff
+	s.coldRecs--
+	s.noteNew(bf)
 	return noff
 }
 

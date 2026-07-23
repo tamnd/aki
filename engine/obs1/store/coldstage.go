@@ -261,27 +261,78 @@ func (s *Store) stageBucket(b *bucket, d *coldDrain, scanned, moved *uint64) {
 		}
 		*scanned++
 		addr := w & addrMask
-		if !s.demotable(addr) {
+		if !s.stageable(addr) {
 			continue
 		}
 		if slotVisited(w) {
 			b.slots[i] = clearHeat(w) // SIEVE second chance, mirrors migrateBucket
 			continue
 		}
+		if !s.stageRecord(d, addr) {
+			continue
+		}
 		*moved += s.recBytes(addr)
-		s.stageRecord(d, addr)
 	}
 }
 
+// stagedValue resolves a pointer-band record's value bytes for staging, with
+// no residency policy attached: the record is leaving the resident set, so a
+// doorkeeper mark or a promotion here would fight the drain that selected it.
+// An arena run returns as a direct view; a log run and a chunked value
+// assemble in the cold scratch, valid until the next cold-plane read.
+func (s *Store) stagedValue(addr uint64, f byte) ([]byte, bool) {
+	if f&flagChunked != 0 {
+		v, ok := s.readChunked(addr, s.coldBuf)
+		s.coldBuf = v[:cap(v)][:0]
+		return v, ok
+	}
+	word, vlen, _ := s.readPtr(s.valueStart(addr))
+	if word&inLogBit == 0 {
+		run := word & runAddrMask
+		return s.arena.buf[run : run+uint64(vlen)], true
+	}
+	v, err := s.vlog.readInto(word&runAddrMask, int(vlen), s.coldBuf)
+	s.coldBuf = v[:cap(v)][:0]
+	if err != nil {
+		return nil, false
+	}
+	s.logReads++
+	return v, true
+}
+
 // stageRecord frames the record at addr into the drain and records its flip
-// entry. The frame is written before the migrating mark is set, so it carries the
-// record's clean flags (the mark is an owner-side interlock, never part of the
-// durable frame). The flip captures the record's identity now (address and
-// version) so phase 2 can tell the staged record from anything a racing write put
-// in its place. The migrating counter rises here and falls in phase 2.
-func (s *Store) stageRecord(d *coldDrain, addr uint64) {
+// entry, reporting whether the record staged. The frame is written before the
+// migrating mark is set, so it carries the record's clean flags (the mark is
+// an owner-side interlock, never part of the durable frame). The flip captures
+// the record's identity now (address and version) so phase 2 can tell the
+// staged record from anything a racing write put in its place. The migrating
+// counter rises here and falls in phase 2.
+//
+// A pointer-band record stages its resolved value bytes, not its run pointer,
+// with flagSep and flagChunked cleared: the frame is then self-contained for
+// the cold region, the fold tap, and any future bring-up, and phase 2 owns
+// releasing the run the resolve copied out of. The resolved frame can dwarf
+// the soft ceiling's one-record slack, so it must fit the buffer's remaining
+// capacity; an empty buffer takes it regardless (growing once, the documented
+// pool contract), which is what guarantees a value of any size eventually
+// drains rather than parking forever behind a buffer it cannot share.
+func (s *Store) stageRecord(d *coldDrain, addr uint64) bool {
 	frameStart := len(d.buf)
-	d.buf = s.frameRecord(addr, d.buf)
+	flags := s.recFlags(addr)
+	if flags&(flagSep|flagChunked) != 0 {
+		need := coldHdr + int(s.klen(addr)) + int(s.vlen(addr))
+		if frameStart > 0 && frameStart+need > cap(d.buf) {
+			return false
+		}
+		v, ok := s.stagedValue(addr, flags)
+		if !ok {
+			return false
+		}
+		d.buf = appendColdFrame(d.buf, s.arena.buf[addr+offKind],
+			flags&^(flagSep|flagChunked), uint32(s.vlen(addr)), s.keyAt(addr), v)
+	} else {
+		d.buf = s.frameRecord(addr, d.buf)
+	}
 	d.flips = append(d.flips, coldFlip{
 		keyOff:  frameStart + coldHdr,
 		keyLen:  int(s.klen(addr)),
@@ -292,6 +343,7 @@ func (s *Store) stageRecord(d *coldDrain, addr uint64) {
 	})
 	s.setRecFlags(addr, s.recFlags(addr)|flagMigrating)
 	s.migrating++
+	return true
 }
 
 // CompleteColdDrain is phase 2: it resolves every staged record now that the
@@ -336,6 +388,11 @@ func (s *Store) CompleteColdDrain(d *coldDrain, ok bool) int {
 		*slot = (w &^ (addrMask | tierMask<<tierShift)) | tierCold<<tierShift | f.coldOff
 		s.noteDrop(s.recFlags(addr) &^ flagMigrating)
 		s.coldRecs++
+		// A pointer-band record staged its resolved bytes, so the frame owns
+		// the value now and the run or chunk set the record pointed at is
+		// released here, the same outside-bytes exit dropRecord takes. The
+		// self-contained bands own nothing outside and this no-ops.
+		s.dropValue(addr)
 		s.arena.unlink(addr, s.recBytes(addr))
 		// A flip that unlinked the last live record of its segment leaves the
 		// segment fully dead. Note it so the worker retires it through the epoch
