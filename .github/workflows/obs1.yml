@@ -143,11 +143,21 @@ jobs:
           check-latest: true
           cache: true
       - name: fuzz smoke
+        # A real finding writes a crasher under testdata/fuzz/<target>/,
+        # so a failure without one is the short-fuzztime coordinator
+        # flake under runner load (spurious "context deadline exceeded",
+        # seen on the #1281 lane) and gets one retry.
         run: |
           for target in FuzzParseHeader FuzzParseRoot FuzzParseWAL FuzzParseSegment \
                         FuzzParseManifest FuzzParseChainBatch FuzzParseCheckpoint FuzzParseAny \
                         FuzzDecodeOp; do
-            go test ./engine/obs1 -run='^$' -fuzz="^${target}\$" -fuzztime=8s
+            if ! go test ./engine/obs1 -run='^$' -fuzz="^${target}\$" -fuzztime=8s; then
+              if [ -n "$(ls engine/obs1/testdata/fuzz/${target}/ 2>/dev/null)" ]; then
+                echo "crasher recorded for ${target}"; exit 1
+              fi
+              echo "no crasher for ${target}, retrying the flaky run once"
+              go test ./engine/obs1 -run='^$' -fuzz="^${target}\$" -fuzztime=8s
+            fi
           done
 
   # The shared lint lane skips the obs1 paths (they would otherwise gate
