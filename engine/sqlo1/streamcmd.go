@@ -7,7 +7,9 @@ package sqlo1
 import (
 	"bytes"
 	"context"
+	"errors"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -333,6 +335,178 @@ func (s *Server) xsetidCmd(ctx context.Context, reply []byte, args [][]byte) []b
 	return AppendSimple(reply, "OK")
 }
 
+// The XGROUP wire texts, Redis 8.8's exactly.
+const (
+	errBusyGroupText  = "BUSYGROUP Consumer Group name already exists"
+	errEntriesReadNeg = "ERR value for ENTRIESREAD must be positive or -1"
+)
+
+// noGroupErr renders the NOGROUP text, which names the group and the
+// key, XGROUP's and XINFO CONSUMERS' shared shape.
+func noGroupErr(reply []byte, key, group []byte) []byte {
+	return AppendError(reply, "NOGROUP No such consumer group '"+string(group)+"' for key name '"+string(key)+"'")
+}
+
+// xgroupErr maps the group layer's sentinels onto their wire texts;
+// everything else routes through storeErr, which carries the no-key
+// text behind its ERR prefix.
+func xgroupErr(reply []byte, err error, key, group []byte) []byte {
+	switch {
+	case errors.Is(err, errStreamNoGroup):
+		return noGroupErr(reply, key, group)
+	case errors.Is(err, errStreamBusyGroup):
+		return AppendError(reply, errBusyGroupText)
+	case errors.Is(err, errStreamBadArgID):
+		return AppendError(reply, errInvalidStreamID)
+	}
+	return storeErr(reply, err)
+}
+
+// unknownXgroup is XGROUP's error for extra or misplaced arguments to
+// a known subcommand, echoing the subcommand token as typed.
+func unknownXgroup(reply []byte, tok []byte) []byte {
+	return AppendError(reply, "ERR unknown subcommand or wrong number of arguments for '"+string(tok)+"'. Try XGROUP HELP.")
+}
+
+// parseXgroupID parses the CREATE and SETID ID argument: $ or an
+// explicit ID, a bare ms reading as ms-0. idOK false defers the
+// invalid-ID error to the layer, since the key and group checks
+// outrank it, the pinned 8.8 order.
+func parseXgroupID(a []byte) (idOK bool, id streamID, dollar bool) {
+	if len(a) == 1 && a[0] == '$' {
+		return true, streamID{}, true
+	}
+	mode, id, ok := parseStreamXaddID(a)
+	return ok && mode == xidExplicit, id, false
+}
+
+// xgroupCmd dispatches XGROUP. The per-subcommand shape is one pinned
+// order: arity, then the option scan (whose value errors outrank
+// everything below), then the key checks inside the layer, then the ID
+// parse, then the group semantics.
+func (s *Server) xgroupCmd(ctx context.Context, reply []byte, args [][]byte, now int64) []byte {
+	sub := string(args[1])
+	switch {
+	case strings.EqualFold(sub, "CREATE"):
+		if len(args) < 5 {
+			return arityErr(reply, "XGROUP|CREATE")
+		}
+		mkstream := false
+		read := int64(-1)
+		for i := 5; i < len(args); {
+			switch {
+			case strings.EqualFold(string(args[i]), "MKSTREAM"):
+				mkstream = true
+				i++
+			case strings.EqualFold(string(args[i]), "ENTRIESREAD") && i+1 < len(args):
+				n, ok := parseCanonicalInt(args[i+1])
+				if !ok {
+					return AppendError(reply, errNotInteger)
+				}
+				if n < -1 {
+					return AppendError(reply, errEntriesReadNeg)
+				}
+				read = n
+				i += 2
+			default:
+				return unknownXgroup(reply, args[1])
+			}
+		}
+		idOK, id, dollar := parseXgroupID(args[4])
+		if err := s.x.GroupCreate(ctx, args[2], args[3], idOK, id, dollar, mkstream, read); err != nil {
+			return xgroupErr(reply, err, args[2], args[3])
+		}
+		return AppendSimple(reply, "OK")
+	case strings.EqualFold(sub, "SETID"):
+		if len(args) < 5 {
+			return arityErr(reply, "XGROUP|SETID")
+		}
+		read := int64(-1)
+		for i := 5; i < len(args); {
+			if strings.EqualFold(string(args[i]), "ENTRIESREAD") && i+1 < len(args) {
+				n, ok := parseCanonicalInt(args[i+1])
+				if !ok {
+					return AppendError(reply, errNotInteger)
+				}
+				if n < -1 {
+					return AppendError(reply, errEntriesReadNeg)
+				}
+				read = n
+				i += 2
+				continue
+			}
+			return unknownXgroup(reply, args[1])
+		}
+		idOK, id, dollar := parseXgroupID(args[4])
+		if err := s.x.GroupSetID(ctx, args[2], args[3], idOK, id, dollar, read); err != nil {
+			return xgroupErr(reply, err, args[2], args[3])
+		}
+		return AppendSimple(reply, "OK")
+	case strings.EqualFold(sub, "DESTROY"):
+		if len(args) != 4 {
+			return arityErr(reply, "XGROUP|DESTROY")
+		}
+		destroyed, err := s.x.GroupDestroy(ctx, args[2], args[3])
+		if err != nil {
+			return xgroupErr(reply, err, args[2], args[3])
+		}
+		if destroyed {
+			return AppendInt(reply, 1)
+		}
+		return AppendInt(reply, 0)
+	case strings.EqualFold(sub, "CREATECONSUMER"):
+		if len(args) != 5 {
+			return arityErr(reply, "XGROUP|CREATECONSUMER")
+		}
+		created, err := s.x.GroupCreateConsumer(ctx, args[2], args[3], args[4], now)
+		if err != nil {
+			return xgroupErr(reply, err, args[2], args[3])
+		}
+		if created {
+			return AppendInt(reply, 1)
+		}
+		return AppendInt(reply, 0)
+	case strings.EqualFold(sub, "DELCONSUMER"):
+		if len(args) != 5 {
+			return arityErr(reply, "XGROUP|DELCONSUMER")
+		}
+		pending, err := s.x.GroupDelConsumer(ctx, args[2], args[3], args[4])
+		if err != nil {
+			return xgroupErr(reply, err, args[2], args[3])
+		}
+		return AppendInt(reply, pending)
+	case strings.EqualFold(sub, "HELP"):
+		if len(args) != 2 {
+			return arityErr(reply, "XGROUP|HELP")
+		}
+		lines := []string{
+			"XGROUP <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+			"CREATE <key> <groupname> <id|$> [option]",
+			"    Create a new consumer group. Options are:",
+			"    * MKSTREAM",
+			"      Create the empty stream if it does not exist.",
+			"    * ENTRIESREAD entries_read",
+			"      Set the group's entries_read counter (internal use).",
+			"CREATECONSUMER <key> <groupname> <consumer>",
+			"    Create a new consumer in the specified group.",
+			"DELCONSUMER <key> <groupname> <consumer>",
+			"    Remove the specified consumer.",
+			"DESTROY <key> <groupname>",
+			"    Remove the specified group.",
+			"SETID <key> <groupname> <id|$> [ENTRIESREAD entries_read]",
+			"    Set the current group ID and entries_read counter.",
+			"HELP",
+			"    Print this help.",
+		}
+		reply = AppendArray(reply, len(lines))
+		for _, l := range lines {
+			reply = AppendSimple(reply, l)
+		}
+		return reply
+	}
+	return AppendError(reply, "ERR unknown subcommand '"+sub+"'. Try XGROUP HELP.")
+}
+
 // unknownXinfo is the shared XINFO error for a bad subcommand or a
 // malformed STREAM tail, echoing the offending token as typed.
 func unknownXinfo(reply []byte, tok []byte) []byte {
@@ -343,7 +517,7 @@ func unknownXinfo(reply []byte, tok []byte) []byte {
 // CONSUMERS key group, and HELP. Too few arguments for a known
 // subcommand is the container arity error; a malformed STREAM tail is
 // the shared unknown text, Redis's split.
-func (s *Server) xinfoCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+func (s *Server) xinfoCmd(ctx context.Context, reply []byte, args [][]byte, now int64) []byte {
 	sub := string(args[1])
 	switch {
 	case strings.EqualFold(sub, "STREAM"):
@@ -355,21 +529,69 @@ func (s *Server) xinfoCmd(ctx context.Context, reply []byte, args [][]byte) []by
 		if len(args) != 3 {
 			return arityErr(reply, "XINFO|GROUPS")
 		}
-		if _, err := s.x.Info(ctx, args[2]); err != nil {
-			return storeErr(reply, err)
+		mark := len(reply)
+		err := s.x.GroupsInfo(ctx, args[2], func(n int) {
+			reply = AppendArray(reply, n)
+		}, func(g *streamGroup, pending uint64, lag int64, lagOK bool) {
+			reply = AppendArray(reply, 12)
+			reply = AppendBulk(reply, []byte("name"))
+			reply = AppendBulk(reply, g.name)
+			reply = AppendBulk(reply, []byte("consumers"))
+			reply = AppendInt(reply, int64(len(g.cons)))
+			reply = AppendBulk(reply, []byte("pending"))
+			reply = AppendInt(reply, int64(pending))
+			reply = AppendBulk(reply, []byte("last-delivered-id"))
+			reply = appendStreamIDBulk(reply, g.last)
+			reply = AppendBulk(reply, []byte("entries-read"))
+			if g.read >= 0 {
+				reply = AppendInt(reply, g.read)
+			} else {
+				reply = AppendNullBulk(reply)
+			}
+			reply = AppendBulk(reply, []byte("lag"))
+			if lagOK {
+				reply = AppendInt(reply, lag)
+			} else {
+				reply = AppendNullBulk(reply)
+			}
+		})
+		if err != nil {
+			return storeErr(reply[:mark], err)
 		}
-		// No group records exist before the group slice; a stream
-		// without groups answers the empty array either way.
-		return AppendArray(reply, 0)
+		return reply
 	case strings.EqualFold(sub, "CONSUMERS"):
 		if len(args) != 4 {
 			return arityErr(reply, "XINFO|CONSUMERS")
 		}
-		if _, err := s.x.Info(ctx, args[2]); err != nil {
-			return storeErr(reply, err)
+		mark := len(reply)
+		err := s.x.ConsumersInfo(ctx, args[2], args[3], func(n int) {
+			reply = AppendArray(reply, n)
+		}, func(c *streamConsumer) {
+			reply = AppendArray(reply, 8)
+			reply = AppendBulk(reply, []byte("name"))
+			reply = AppendBulk(reply, c.name)
+			reply = AppendBulk(reply, []byte("pending"))
+			reply = AppendInt(reply, int64(c.pel))
+			reply = AppendBulk(reply, []byte("idle"))
+			reply = AppendInt(reply, now-c.seenMs)
+			reply = AppendBulk(reply, []byte("inactive"))
+			if c.activeMs < 0 {
+				reply = AppendInt(reply, -1)
+			} else {
+				reply = AppendInt(reply, now-c.activeMs)
+			}
+		})
+		if err != nil {
+			if errors.Is(err, errStreamNoGroup) {
+				return noGroupErr(reply[:mark], args[2], args[3])
+			}
+			return storeErr(reply[:mark], err)
 		}
-		return AppendError(reply, "NOGROUP No such consumer group '"+string(args[3])+"' for key name '"+string(args[2])+"'")
-	case strings.EqualFold(sub, "HELP") && len(args) == 2:
+		return reply
+	case strings.EqualFold(sub, "HELP"):
+		if len(args) != 2 {
+			return arityErr(reply, "XINFO|HELP")
+		}
 		lines := []string{
 			"XINFO <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
 			"CONSUMERS <key> <groupname>",
@@ -439,7 +661,7 @@ func appendStreamHeader(reply []byte, info streamInfo, recorded streamID) []byte
 // xinfoStreamCmd answers XINFO STREAM key [FULL [COUNT n]]: sixteen
 // pairs for the summary, fifteen for FULL with its COUNT-bounded entry
 // window (default 10, 0 unbounded, negatives folded to the default)
-// and the still-empty groups array.
+// and the groups array in name order.
 func (s *Server) xinfoStreamCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
 	full := false
 	count := int64(10)
@@ -507,7 +729,15 @@ func (s *Server) xinfoStreamCmd(ctx context.Context, reply []byte, args [][]byte
 			return storeErr(reply[:mark], err)
 		}
 		reply = AppendBulk(reply, []byte("groups"))
-		return AppendArray(reply, 0)
+		err = s.x.GroupsInfo(ctx, args[2], func(n int) {
+			reply = AppendArray(reply, n)
+		}, func(g *streamGroup, pending uint64, lag int64, lagOK bool) {
+			reply = appendXinfoFullGroup(reply, g, pending, lag, lagOK)
+		})
+		if err != nil {
+			return storeErr(reply[:mark], err)
+		}
+		return reply
 	}
 
 	reply = AppendArray(reply, 32)
@@ -525,6 +755,56 @@ func (s *Server) xinfoStreamCmd(ctx context.Context, reply []byte, args [][]byte
 		reply = append(reply, lastEnt...)
 	} else {
 		reply = AppendNullBulk(reply)
+	}
+	return reply
+}
+
+// appendXinfoFullGroup renders one XINFO STREAM FULL group row: eight
+// pairs with the PEL fields at their empty-slice shapes until the PEL
+// slice fills them, and the consumers nested in name order like the
+// top-level rows.
+func appendXinfoFullGroup(reply []byte, g *streamGroup, pending uint64, lag int64, lagOK bool) []byte {
+	reply = AppendArray(reply, 16)
+	reply = AppendBulk(reply, []byte("name"))
+	reply = AppendBulk(reply, g.name)
+	reply = AppendBulk(reply, []byte("last-delivered-id"))
+	reply = appendStreamIDBulk(reply, g.last)
+	reply = AppendBulk(reply, []byte("entries-read"))
+	if g.read >= 0 {
+		reply = AppendInt(reply, g.read)
+	} else {
+		reply = AppendNullBulk(reply)
+	}
+	reply = AppendBulk(reply, []byte("lag"))
+	if lagOK {
+		reply = AppendInt(reply, lag)
+	} else {
+		reply = AppendNullBulk(reply)
+	}
+	reply = AppendBulk(reply, []byte("pel-count"))
+	reply = AppendInt(reply, int64(pending))
+	reply = AppendBulk(reply, []byte("nacked-count"))
+	reply = AppendInt(reply, 0)
+	reply = AppendBulk(reply, []byte("pending"))
+	reply = AppendArray(reply, 0)
+	reply = AppendBulk(reply, []byte("consumers"))
+	sort.Slice(g.cons, func(i, j int) bool {
+		return bytes.Compare(g.cons[i].name, g.cons[j].name) < 0
+	})
+	reply = AppendArray(reply, len(g.cons))
+	for i := range g.cons {
+		c := &g.cons[i]
+		reply = AppendArray(reply, 10)
+		reply = AppendBulk(reply, []byte("name"))
+		reply = AppendBulk(reply, c.name)
+		reply = AppendBulk(reply, []byte("seen-time"))
+		reply = AppendInt(reply, c.seenMs)
+		reply = AppendBulk(reply, []byte("active-time"))
+		reply = AppendInt(reply, c.activeMs)
+		reply = AppendBulk(reply, []byte("pel-count"))
+		reply = AppendInt(reply, int64(c.pel))
+		reply = AppendBulk(reply, []byte("pending"))
+		reply = AppendArray(reply, 0)
 	}
 	return reply
 }

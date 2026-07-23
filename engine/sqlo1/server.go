@@ -1165,7 +1165,12 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		if len(args) < 2 {
 			return arityErr(reply, cmd)
 		}
-		return s.xinfoCmd(ctx, reply, args)
+		return s.xinfoCmd(ctx, reply, args, now)
+	case "XGROUP":
+		if len(args) < 2 {
+			return arityErr(reply, cmd)
+		}
+		return s.xgroupCmd(ctx, reply, args, now)
 	case "XRANGE":
 		return s.xrangeCmd(ctx, reply, args, false)
 	case "XREVRANGE":

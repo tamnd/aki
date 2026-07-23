@@ -161,4 +161,33 @@ func (x *Stream) StreamRootLineForTest(ctx context.Context, key []byte) (line st
 		info.count, info.added, info.last.ms, info.last.seq, info.maxDel.ms, info.maxDel.seq), true, nil
 }
 
+// The group crash phase drives XGROUP writes from the external
+// package; the ID-taking calls ride the same plain-integer seam, and
+// GroupLinesForTest renders the whole group table for the snapshot so
+// the matrix proves last-delivered-ID persistence at every cut.
+func (x *Stream) GroupCreateForTest(ctx context.Context, key, group []byte, ms, seq uint64, mkstream bool, read int64) error {
+	return x.GroupCreate(ctx, key, group, true, streamID{ms: ms, seq: seq}, false, mkstream, read)
+}
+
+func (x *Stream) GroupSetIDForTest(ctx context.Context, key, group []byte, ms, seq uint64, read int64) error {
+	return x.GroupSetID(ctx, key, group, true, streamID{ms: ms, seq: seq}, false, read)
+}
+
+func (x *Stream) GroupLinesForTest(ctx context.Context, key []byte) ([]string, error) {
+	var lines []string
+	err := x.GroupsInfo(ctx, key, func(int) {}, func(g *streamGroup, pending uint64, lag int64, lagOK bool) {
+		line := fmt.Appendf(nil, "group=%s last=%d-%d read=%d pending=%d lag=%d/%v",
+			g.name, g.last.ms, g.last.seq, g.read, pending, lag, lagOK)
+		for i := range g.cons {
+			c := &g.cons[i]
+			line = fmt.Appendf(line, " cons=%s seen=%d active=%d pel=%d", c.name, c.seenMs, c.activeMs, c.pel)
+		}
+		lines = append(lines, string(line))
+	})
+	if err == errStreamNoKey {
+		return nil, nil
+	}
+	return lines, err
+}
+
 var ErrStreamFenceThirdLevelForTest = errStreamFenceThirdLevel
