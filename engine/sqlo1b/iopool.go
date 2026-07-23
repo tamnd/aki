@@ -217,6 +217,11 @@ func (p *IOPool) serve(run []IOReq) {
 
 // validate rejects malformed requests before they touch the file.
 func (p *IOPool) validate(run []IOReq) error {
+	return validateIOReqs(p.extentSize, run)
+}
+
+// validateIOReqs is the request contract both backends enforce.
+func validateIOReqs(extentSize uint32, run []IOReq) error {
 	for i := range run {
 		r := &run[i]
 		if r.Op != OpRead && r.Op != OpWrite {
@@ -225,7 +230,7 @@ func (p *IOPool) validate(run []IOReq) error {
 		if len(r.Buf) == 0 {
 			return fmt.Errorf("sqlo1b: empty io buffer at ext %d off %d", r.Ext, r.Off)
 		}
-		if uint64(r.Off)+uint64(len(r.Buf)) > uint64(p.extentSize) {
+		if uint64(r.Off)+uint64(len(r.Buf)) > uint64(extentSize) {
 			return fmt.Errorf("sqlo1b: io at ext %d off %d len %d crosses the extent", r.Ext, r.Off, len(r.Buf))
 		}
 	}
