@@ -21,6 +21,15 @@ const ChunkKindBit = frameChunk
 // range so future collection kinds never collide with it.
 const KindTombstone = 0x7F
 
+// ChunkFlagRun marks a chunk frame the folder packed from whole-record
+// frames (a doc 08 section 2 run), as opposed to a demoter's packed
+// collection chunk: the payloads differ in kind (concatenated record
+// frames versus a collection blob) but nothing else in the frame says
+// which, and the takeover keymap rebuild feeds only runs. The chunk
+// flags byte is otherwise reserved for per-type variants, so this takes
+// the top bit; demoters must leave it clear.
+const ChunkFlagRun = 0x80
+
 // FoldFrame is one staged frame as the folder sees it. Key, Disc, Payload,
 // and Frame alias the drain buffer and stay valid only until the drain
 // completes; a consumer that outlives the call copies out, exactly as the
