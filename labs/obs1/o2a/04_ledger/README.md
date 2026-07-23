@@ -41,4 +41,30 @@ One full-corpus execution also ran pre-commit while tuning the ballast economics
 
 ## Results
 
-Pending the scored run.
+Scored run (ledger.csv), 2000 strings, 20000 hash fields, 20000 set members, folded after 66 pressure rounds:
+
+| cell | ops | GETs | GETs/op | KiB/op | found |
+|---|---|---|---|---|---|
+| string_get | 2000 | 2000 | 1.0000 | 2.7 | 100.0% |
+| string_miss | 100 | 0 | 0.0000 | 0.0 | 100.0% |
+| hget | 20000 | 20000 | 1.0000 | 102.2 | 100.0% |
+| hget_miss | 100 | 100 | 1.0000 | 108.0 | 100.0% |
+| sismember | 20000 | 20000 | 1.0000 | 93.0 | 100.0% |
+
+Keymap: 175265 live keys in 4194304 B, 23.93 B per key.
+Directory collection share: 29 chunks over 40000 elements, 0.1033 B per element.
+Cold reader: 42100 fetches, 42100 block GETs, 0 attached, 0 unresolved, 100 misses (the deliberate absent probes), 0 errors.
+
+## Verdict
+
+Hit, with two disclosed edges.
+
+Bands 1, 2, 4, and 6 hit exactly: every point cell is 1.0000 GETs per op at 100% found, the string miss answers at the keymap for zero requests, the field miss is one definitive GET, the keymap sits at 23.93 B per live key inside the 16-64 band, and the cold reader is clean.
+Band 3 missed low on string_get at 2.7 KiB per op: the strings are small and ride the staged drains, so they fold into small run blocks rather than filling a 128 KiB block, and one GET of one whole block is a few KiB, not tens.
+The band as written baked in a full-block assumption the corpus does not create; the ledger claim underneath, one GET of at most one block per point op, holds exactly.
+The collection cells (hget at 102.2, sismember at 93.0) land inside the band because their chunks pack full blocks.
+Band 5 missed by 3%: 0.1033 vs the at-or-under 0.10 line.
+The directory rounds 29 chunks up from the raw byte math and the corpus is small enough for that rounding to show; the ledger's ~0.3 row holds with 3x headroom, which is what the exit gate row asks.
+
+The kill line did not fire: no point cell above 1.0 GETs per op, none below 100% found.
+The landed plane serves the O2a ledger inside its stated envelope.
