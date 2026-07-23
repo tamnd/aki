@@ -72,6 +72,26 @@ func (fc *FrameCache) View(ext uint64, grp uint16, img []byte) (*CGroupView, err
 	return v, nil
 }
 
+// DropGroup evicts one group's cached view. writeCompactGroup calls
+// it on every rewrite of the open compact group, whose flush-through
+// images are non-raw once the group packs past the raw projection.
+func (fc *FrameCache) DropGroup(ext uint64, grp uint16) {
+	if fc == nil {
+		return
+	}
+	k := frameKey{ext, grp}
+	if _, ok := fc.views[k]; !ok {
+		return
+	}
+	delete(fc.views, k)
+	for i, o := range fc.order {
+		if o == k {
+			fc.order = append(fc.order[:i], fc.order[i+1:]...)
+			break
+		}
+	}
+}
+
 // DropExtent evicts every cached view of one extent. allocStream
 // calls it when a freed extent reactivates under a new stream.
 func (fc *FrameCache) DropExtent(ext uint64) {

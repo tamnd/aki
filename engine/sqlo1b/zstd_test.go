@@ -213,8 +213,10 @@ func TestRecompactReselects(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := r.s.cvlog.ext
+	// Speculative fits pack the mixed groups well past the raw
+	// projection, so the compact extent takes many more fills to roll.
 	for i := 1; r.s.cvlog.ext == first; i++ {
-		if i > 6 {
+		if i > 40 {
 			t.Fatalf("compact stream never rolled off extent %d", first)
 		}
 		if _, err := r.s.CompactExtent(context.Background(), fillMixed(fmt.Sprintf("b%d-", i))); err != nil {
@@ -260,6 +262,17 @@ func TestRecompactReselects(t *testing.T) {
 		t.Fatalf("json survivors did not reselect zstd: %v -> %v", sg1, sg2)
 	}
 	r.verify(t)
+	// Packing keeps the survivors' compact extent open far longer, so
+	// fill until it seals and the scrubber has zstd frames to decode.
+	second := r.s.cvlog.ext
+	for i := 0; r.s.cvlog.ext == second; i++ {
+		if i > 40 {
+			t.Fatalf("survivor extent %d never sealed under more fills", second)
+		}
+		if _, err := r.s.CompactExtent(context.Background(), fillMixed(fmt.Sprintf("c%d-", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
 	sc := &Scrubber{File: r.s.f, ExtentSize: r.s.sb.ExtentSize, Grid: r.s.grid}
 	if rep := sc.Sweep(); !rep.Clean() || rep.Scanned == 0 {
 		t.Fatalf("scrub after reselection (scanned %d): %+v", rep.Scanned, rep.Findings)
