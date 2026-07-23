@@ -30,6 +30,18 @@ const KindTombstone = 0x7F
 // the top bit; demoters must leave it clear.
 const ChunkFlagRun = 0x80
 
+// ChunkFlagTTLBitmap marks a collection chunk that leads its packed
+// blob with a field-TTL presence bitmap, ceil(count/8) bytes, one bit
+// per element in pack order, set on elements that carry an inline 8 B
+// expiry. The fieldttl lab (#1294) measured this encoding against a
+// whole expiry column and a per-element flag byte: it is the only one
+// that charges a TTL-free collection nothing (byte-identical packing)
+// while staying near the 8 B per bearer floor at sparse HEXPIRE use.
+// Chunks with no bearer leave the flag clear and pack plain, which is
+// the pay-only-if-used rule as a frame bit. The hashes slice writes
+// it; every walker must tolerate it.
+const ChunkFlagTTLBitmap = 0x40
+
 // FoldFrame is one staged frame as the folder sees it. Key, Disc, Payload,
 // and Frame alias the drain buffer and stay valid only until the drain
 // completes; a consumer that outlives the call copies out, exactly as the
