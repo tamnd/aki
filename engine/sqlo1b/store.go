@@ -192,6 +192,18 @@ type Store struct {
 	expCursor uint64
 	expSample [4]sqlo1.ExpiryClassStat
 
+	// nearExt is the doc 11 section 3.2 expired-fraction term: bytes
+	// of near-class records written per extent and the latest deadline
+	// among them, so an extent full of short-TTL data reads as debt
+	// the moment its content dies instead of waiting for overwrites.
+	// Advisory like garbageExt: reopen starts it empty, so the picker
+	// can only under-select after a reopen, never corrupt anything.
+	// expiredDrops and expiredBytes aggregate compaction's expired
+	// reaping for the WA telemetry.
+	nearExt      map[uint64]nearDebt
+	expiredDrops uint64
+	expiredBytes uint64
+
 	// ckptCrash threads a step failpoint into the Checkpointer.
 	ckptCrash func(step int) error
 
@@ -1350,6 +1362,7 @@ func (s *Store) ApplyBatch(ctx context.Context, b *sqlo1.DrainBatch) error {
 			s.broken = err
 			return err
 		}
+		s.noteNear(fr.pos, fr.rec)
 	}
 	for i := range frames {
 		fr := &frames[i]
@@ -1389,6 +1402,7 @@ func (s *Store) applyPut(rec *Record) error {
 	if err != nil {
 		return err
 	}
+	s.noteNear(pos, rec)
 	return s.indexPut(rec, pos)
 }
 
@@ -1818,6 +1832,47 @@ func (s *Store) noteGarbage(pos Pos, rec *Record) {
 		s.garbageExt = map[uint64]uint64{}
 	}
 	s.garbageExt[pos.Extent()] += n
+}
+
+// nearDebt is one extent's share of short-TTL data: how many encoded
+// bytes of near-class records landed there and the latest expiry
+// among them. Once now passes the deadline every byte in the account
+// is dead, which is when expiredCredit realizes it.
+type nearDebt struct {
+	bytes    uint64
+	deadline int64
+}
+
+// noteNear books a freshly placed record to its extent's near-class
+// account. Only near matters: mid and far records get their turn if
+// an overwrite, a relocation, or their own deadline moves them into
+// near later, and until then their extent has no realizable credit.
+func (s *Store) noteNear(pos Pos, rec *Record) {
+	if !rec.HasExpiry() || expClassFor(rec.ExpireMS, s.nowMS()) != ExpClassNear {
+		return
+	}
+	if s.nearExt == nil {
+		s.nearExt = map[uint64]nearDebt{}
+	}
+	nd := s.nearExt[pos.Extent()]
+	nd.bytes += uint64(rec.EncodedLen())
+	if int64(rec.ExpireMS) > nd.deadline {
+		nd.deadline = int64(rec.ExpireMS)
+	}
+	s.nearExt[pos.Extent()] = nd
+}
+
+// expiredCredit is the near account's realized garbage: zero until
+// the extent's latest near deadline passes, all of it after. Waiting
+// for the last deadline is deliberate; credit never fires while any
+// near record in the account is still alive, so the picker cannot be
+// tricked into relocating live short-TTL data early.
+func (s *Store) expiredCredit(ext uint64, now int64) uint64 {
+	nd, ok := s.nearExt[ext]
+	if !ok || nd.deadline == 0 || now < nd.deadline {
+		return 0
+	}
+	return nd.bytes
 }
 
 // ExtentGarbage reports one extent's advisory dead-byte estimate.
@@ -2734,6 +2789,9 @@ func (s *Store) allocStream(c *streamCursor) error {
 	// and the frame cache must not keep serving its decoded groups.
 	s.noteExtFlags(ext, c.eflags)
 	s.fc.DropExtent(ext)
+	// A reused extent must not inherit the previous tenant's
+	// expired-fraction credit either.
+	delete(s.nearExt, ext)
 	return nil
 }
 

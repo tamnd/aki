@@ -19,6 +19,7 @@ package sqlo1b
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 )
 
@@ -49,6 +50,11 @@ type DebtStats struct {
 	// the traffic.
 	RelocatedBytes uint64
 	Compactions    uint64
+	// ExpiredDrops and ExpiredBytes count records compaction reaped
+	// past their deadline instead of relocating, the T7 reap
+	// telemetry: reclaimed space that cost zero relocation writes.
+	ExpiredDrops uint64
+	ExpiredBytes uint64
 }
 
 // WA is the data-file write amplification the store measures on
@@ -74,9 +80,11 @@ func (s *Store) DebtStats() DebtStats {
 		IndexBytes:     s.indexBytes,
 		RelocatedBytes: s.relocatedBytes,
 		Compactions:    s.compactions,
+		ExpiredDrops:   s.expiredDrops,
+		ExpiredBytes:   s.expiredBytes,
 	}
 	need := s.debtThreshold()
-	for ext, g := range s.garbageExt {
+	for ext, g := range s.debtCandidates() {
 		if s.grid.State(ext) != StateSealed {
 			continue
 		}
@@ -86,6 +94,28 @@ func (s *Store) DebtStats() DebtStats {
 		}
 	}
 	return d
+}
+
+// debtCandidates merges booked garbage with the expired-fraction
+// credit (doc 11 section 3.2): an extent full of near-class records
+// counts as reclaimable the moment its latest deadline passes, so a
+// pure-TTL cache workload fires compaction without a single
+// overwrite. The credit is capped at payload capacity because
+// overwrite double-counting can push the advisory sum past what the
+// extent holds.
+func (s *Store) debtCandidates() map[uint64]uint64 {
+	cands := make(map[uint64]uint64, len(s.garbageExt)+len(s.nearExt))
+	maps.Copy(cands, s.garbageExt)
+	now := s.nowMS()
+	capacity := uint64(s.sb.ExtentSize) - ExtentHeaderSize
+	for ext := range s.nearExt {
+		c := s.expiredCredit(ext, now)
+		if c == 0 {
+			continue
+		}
+		cands[ext] = min(cands[ext]+c, capacity)
+	}
+	return cands
 }
 
 // debtThreshold is the booked garbage that makes a sealed extent a
@@ -124,7 +154,7 @@ func (s *Store) selectDebt() (uint64, bool, error) {
 	need := s.debtThreshold()
 	var best []uint64
 	var bestG uint64
-	for ext, g := range s.garbageExt {
+	for ext, g := range s.debtCandidates() {
 		if g < need || s.grid.State(ext) != StateSealed {
 			continue
 		}
