@@ -309,6 +309,41 @@ func TestStreamPagedTornTail(t *testing.T) {
 	deliver("s", "beta", "bc", 2, 900, 2)
 	flush()
 
+	// Phase 10: the pending surface. A claim moves the last surviving
+	// entry between consumers in one record batch, a refill spreads the
+	// PEL across segments at the 64-byte cap, a trim strands two
+	// pending rows so the autoclaim sweep rewrites segments, drops the
+	// emptied one, and drains the dead rows, and a FORCE claim on the
+	// empty gamma group mints its first fence slot with the
+	// fresh-segment flush discipline. The last image keeps live PELs
+	// on two keys.
+	claim := func(key, group, cons string, minIdle int64, force bool, now int64, want int, ids ...[2]uint64) {
+		t.Helper()
+		n, err := x.ClaimForTest(ctx, []byte(key), []byte(group), []byte(cons), minIdle, ids, force, false, now)
+		if err != nil || n != want {
+			t.Fatalf("Claim(%q, %q) = %d, %v, want %d", key, group, n, err, want)
+		}
+		mark()
+	}
+	claim("s", "beta", "bc2", 0, false, 905, 1, [2]uint64{13, 1})
+	flush()
+	for ms := uint64(11); ms <= 16; ms++ {
+		add("s3", ms, "tiny")
+	}
+	flush()
+	deliver("s3", "boot", "w1", -1, 908, 6)
+	flush()
+	trim("s3", true, 0, 12, false)
+	flush()
+	c, d, err := x.AutoClaimForTest(ctx, []byte("s3"), []byte("boot"), []byte("w4"), 0, 0, 0, 100, 910)
+	if err != nil || c != 5 || d != 1 {
+		t.Fatalf("AutoClaim(s3, boot) = %d/%d, %v, want 5 claimed 1 deleted", c, d, err)
+	}
+	mark()
+	flush()
+	claim("s", "gamma", "gc", 0, true, 912, 1, [2]uint64{15, 1})
+	flush()
+
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
