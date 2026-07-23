@@ -33,20 +33,22 @@ const (
 	ringEnterGetEvents = 1 << 0
 	ringFeatSingleMmap = 1 << 0
 
-	ringOpNop   = 0
-	ringOpRead  = 22
-	ringOpWrite = 23
+	ringOpNop        = 0
+	ringOpReadFixed  = 4
+	ringOpWriteFixed = 5
+	ringOpRead       = 22
+	ringOpWrite      = 23
 
-	ringRegisterProbe = 8
-	ringOpSupported   = 1 << 0
+	ringRegisterBuffers = 0
+	ringRegisterProbe   = 8
+	ringOpSupported     = 1 << 0
 
 	sqeSize = 64
 	cqeSize = 16
 )
 
 // ringSQE is struct io_uring_sqe for the ops this backend submits;
-// the tail 24 bytes cover buf_index and the union fields it never
-// sets.
+// the tail 22 bytes cover the union fields it never sets.
 type ringSQE struct {
 	opcode   uint8
 	flags    uint8
@@ -57,7 +59,8 @@ type ringSQE struct {
 	len      uint32
 	opflags  uint32
 	userData uint64
-	_        [24]byte
+	bufIndex uint16
+	_        [22]byte
 }
 
 // ringCQE is struct io_uring_cqe.
@@ -299,6 +302,16 @@ type IORing struct {
 	extentSize uint32
 	comp       chan<- IOResult
 
+	// The registered pool: one page-aligned anonymous mapping cut
+	// into GroupSize buffers the kernel holds pinned, so fixed-op
+	// requests skip the per-IO pin and the buffers satisfy O_DIRECT
+	// alignment for free. regIdx maps a buffer's base address to its
+	// registration index; built at setup, read-only after, so the
+	// submitter needs no lock for the lookup.
+	regMem   []byte
+	regIdx   map[uintptr]uint16
+	fixedOps atomic.Uint64
+
 	sub   chan []IOReq
 	syncq chan uint64
 	wg    sync.WaitGroup
@@ -313,11 +326,13 @@ type IORing struct {
 var _ Backend = (*IORing)(nil)
 
 // NewIORing sets up a ring of the given depth over f's descriptor and
-// starts the submitter, reaper, and sync goroutines. Completions post
-// to comp; the caller sizes it to its in-flight window and closes the
-// backend before dropping comp. On ErrRingUnsupported the caller
-// falls back to NewIOPool.
-func NewIORing(f *os.File, extentSize uint32, depth int, comp chan<- IOResult) (*IORing, error) {
+// starts the submitter, reaper, and sync goroutines. regBufs is the
+// registered-buffer pool size in GroupSize buffers, 0 for none; the
+// final constant comes from the ringpool lab on the gate box.
+// Completions post to comp; the caller sizes it to its in-flight
+// window and closes the backend before dropping comp. On
+// ErrRingUnsupported the caller falls back to NewIOPool.
+func NewIORing(f *os.File, extentSize uint32, depth, regBufs int, comp chan<- IOResult) (*IORing, error) {
 	if depth < 1 {
 		return nil, fmt.Errorf("sqlo1b: ring depth %d", depth)
 	}
@@ -335,6 +350,12 @@ func NewIORing(f *os.File, extentSize uint32, depth int, comp chan<- IOResult) (
 		slots:      make([]ringSlot, u.cqEntries),
 		free:       make([]uint32, 0, u.cqEntries),
 	}
+	if regBufs > 0 {
+		if err := r.register(regBufs); err != nil {
+			u.close()
+			return nil, err
+		}
+	}
 	for i := range uint32(u.cqEntries) {
 		r.free = append(r.free, i)
 	}
@@ -343,6 +364,62 @@ func NewIORing(f *os.File, extentSize uint32, depth int, comp chan<- IOResult) (
 	r.wg.Go(r.reaper)
 	r.wg.Go(r.syncer)
 	return r, nil
+}
+
+// register maps and pins the buffer pool. Failure wraps
+// ErrRingUnsupported: registration charges RLIMIT_MEMLOCK, and a box
+// that refuses it (ENOMEM) or forbids it (EPERM) runs the fallback
+// exactly like a box with no ring at all. The fixed read and write
+// ops predate this backend's kernel floor, so a successful
+// registration means they work.
+func (r *IORing) register(regBufs int) error {
+	mem, err := syscall.Mmap(-1, 0, regBufs*GroupSize,
+		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_ANON|syscall.MAP_PRIVATE)
+	if err != nil {
+		return fmt.Errorf("sqlo1b: registered pool mmap: %v", err)
+	}
+	iov := make([]syscall.Iovec, regBufs)
+	for i := range iov {
+		iov[i].Base = &mem[i*GroupSize]
+		iov[i].SetLen(GroupSize)
+	}
+	if _, _, errno := syscall.Syscall6(sysRingRegister, uintptr(r.u.fd),
+		ringRegisterBuffers, uintptr(unsafe.Pointer(&iov[0])), uintptr(regBufs), 0, 0); errno != 0 {
+		syscall.Munmap(mem)
+		return fmt.Errorf("%w: register %d buffers: %v", ErrRingUnsupported, regBufs, errno)
+	}
+	r.regMem = mem
+	r.regIdx = make(map[uintptr]uint16, regBufs)
+	for i := range regBufs {
+		r.regIdx[uintptr(unsafe.Pointer(&mem[i*GroupSize]))] = uint16(i)
+	}
+	return nil
+}
+
+// RegBufs is the registered pool size in buffers.
+func (r *IORing) RegBufs() int { return len(r.regIdx) }
+
+// RegBuf is the i-th registered buffer, GroupSize bytes and
+// GroupSize-aligned (the pool is page-backed), so it satisfies
+// O_DIRECT's alignment demands as-is. A request whose Buf starts at a
+// pool buffer's base rides the fixed opcodes; any other buffer,
+// including a sub-slice past the base, takes the plain path.
+func (r *IORing) RegBuf(i int) []byte {
+	return r.regMem[i*GroupSize : (i+1)*GroupSize : (i+1)*GroupSize]
+}
+
+// OpenDirect opens the data file with O_DIRECT for the ring backend's
+// own-caching mode. Every IO against it must keep offset, length, and
+// buffer address block-aligned; registered pool buffers and
+// group-aligned requests satisfy that by construction. Callers treat
+// failure like ErrRingUnsupported: not every filesystem honors
+// O_DIRECT (tmpfs refuses it), and the buffered path is the fallback.
+func OpenDirect(name string) (*os.File, error) {
+	f, err := os.OpenFile(name, os.O_RDWR|syscall.O_DIRECT, 0)
+	if err != nil {
+		return nil, fmt.Errorf("%w: O_DIRECT open: %v", ErrRingUnsupported, err)
+	}
+	return f, nil
 }
 
 // Submit enqueues a batch; the submitter goroutine turns it into
@@ -362,7 +439,11 @@ func (r *IORing) Close() {
 	close(r.sub)
 	close(r.syncq)
 	r.wg.Wait()
-	r.u.close()
+	r.u.close() // closing the ring fd also unregisters the pool
+	if r.regMem != nil {
+		syscall.Munmap(r.regMem)
+		r.regMem = nil
+	}
 }
 
 func (r *IORing) abs(q *IOReq) int64 {
@@ -389,9 +470,24 @@ func (r *IORing) submitter() {
 			ids = ids[:0]
 			for i := range chunk {
 				q := &chunk[i]
-				op := uint8(ringOpRead)
-				if q.Op == OpWrite {
+				addr := uintptr(unsafe.Pointer(&q.Buf[0]))
+				bufIdx, fixed := r.regIdx[addr]
+				fixed = fixed && len(q.Buf) <= GroupSize
+				var op uint8
+				switch {
+				case q.Op == OpRead && fixed:
+					op = ringOpReadFixed
+				case q.Op == OpRead:
+					op = ringOpRead
+				case fixed:
+					op = ringOpWriteFixed
+				default:
 					op = ringOpWrite
+				}
+				if fixed {
+					r.fixedOps.Add(1)
+				} else {
+					bufIdx = 0
 				}
 				id := r.slot(q)
 				ids = append(ids, id)
@@ -399,9 +495,10 @@ func (r *IORing) submitter() {
 					opcode:   op,
 					fd:       fd,
 					off:      uint64(r.abs(q)),
-					addr:     uint64(uintptr(unsafe.Pointer(&q.Buf[0]))),
+					addr:     uint64(addr),
 					len:      uint32(len(q.Buf)),
 					userData: uint64(id),
+					bufIndex: bufIdx,
 				})
 			}
 			r.u.publish()

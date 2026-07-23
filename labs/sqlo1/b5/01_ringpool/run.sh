@@ -4,7 +4,7 @@ set -e
 cd "$(dirname "$0")"
 go build -o /tmp/ringpool .
 
-echo "backend,workload,depth,batch,n,secs,ops_s,mb_s,p50_us,p99_us"
+echo "backend,workload,depth,batch,regbuf,direct,n,secs,ops_s,mb_s,p50_us,p99_us"
 
 backends="iopool"
 if /tmp/ringpool -backend ring -probe 2>/dev/null; then
@@ -23,3 +23,19 @@ for backend in $backends; do
     done
   done
 done
+
+# Registered-buffer and O_DIRECT arms, ring only. Heap vs pool prices
+# the fixed opcodes; -direct reruns the read shape cold. O_DIRECT can
+# be refused by the filesystem (tmpfs), so that arm tolerates exit 3.
+case "$backends" in *ring*)
+  for batch in 4 16 64; do
+    for regbuf in 0 128; do
+      /tmp/ringpool -backend ring -workload coldread -depth 8 -batch $batch -regbuf $regbuf -n 20000
+      /tmp/ringpool -backend ring -workload drain -depth 8 -batch $batch -regbuf $regbuf -n 16384
+    done
+    /tmp/ringpool -backend ring -workload coldread -depth 8 -batch $batch -regbuf 128 -direct -n 20000 \
+      || echo "O_DIRECT arm skipped (batch $batch)" >&2
+    /tmp/ringpool -backend ring -workload drain -depth 8 -batch $batch -regbuf 128 -direct -n 16384 \
+      || echo "O_DIRECT drain arm skipped (batch $batch)" >&2
+  done
+;; esac
