@@ -144,7 +144,10 @@ func TestFolderTTLProjection(t *testing.T) {
 	for i := range keys {
 		keys[i] = string(rune('a' + i))
 		vals[i] = "value-0"
-		exps[i] = base + 2*hour + uint64(i)*hour // 2h..11h out, min first
+		// Mid-window deadlines, 2.5h..11.5h out with the min first: an exact
+		// hour multiple flips class the millisecond the fold clock passes
+		// base, so every deadline sits half an hour inside its window.
+		exps[i] = base + 2*hour + hour/2 + uint64(i)*hour
 	}
 	minExp, maxExp := exps[0], exps[9]
 	fx.folder.Add(ttlFrames(keys, vals, exps))
@@ -269,7 +272,11 @@ func TestManifestRowCarriesTTLClass(t *testing.T) {
 	base := uint64(time.Now().UnixMilli())
 	const hour = uint64(3_600_000)
 
-	fx.folder.Add(ttlFrames([]string{"k"}, []string{"v"}, []uint64{base + 5*hour}))
+	// Aim at the middle of the class window: an expiry at exactly base+5h
+	// flips to class 5 the millisecond the folder's clock passes base, so
+	// the half-hour offset keeps the class stable however late the fold runs.
+	exp := base + 5*hour + hour/2
+	fx.folder.Add(ttlFrames([]string{"k"}, []string{"v"}, []uint64{exp}))
 	fx.folder.Flush()
 	waitFor(t, "manifest", func() bool { return len(fx.manifests()) == 1 })
 
@@ -278,7 +285,7 @@ func TestManifestRowCarriesTTLClass(t *testing.T) {
 		t.Fatalf("manifest carries %d segments, want 1", len(m.Segs))
 	}
 	row := m.Segs[0]
-	if row.TTLClass != 6 || row.MinExpMS != base+5*hour || row.MaxExpMS != base+5*hour {
-		t.Fatalf("manifest row class %d bounds %d..%d, want 6 at %d", row.TTLClass, row.MinExpMS, row.MaxExpMS, base+5*hour)
+	if row.TTLClass != 6 || row.MinExpMS != exp || row.MaxExpMS != exp {
+		t.Fatalf("manifest row class %d bounds %d..%d, want 6 at %d", row.TTLClass, row.MinExpMS, row.MaxExpMS, exp)
 	}
 }
