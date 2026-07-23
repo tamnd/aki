@@ -71,10 +71,10 @@ func boot(dir string) (*lab, error) {
 		return nil, err
 	}
 	l.srv = srv
-	go srv.Serve()
+	go func() { _ = srv.Serve() }()
 	nc, err := net.Dial("tcp", srv.Addr().String())
 	if err != nil {
-		srv.Close()
+		_ = srv.Close()
 		return nil, err
 	}
 	l.nc = nc
@@ -83,9 +83,9 @@ func boot(dir string) (*lab, error) {
 }
 
 func (l *lab) close() {
-	l.nc.Close()
-	l.srv.Close()
-	l.b.Close()
+	_ = l.nc.Close()
+	_ = l.srv.Close()
+	_ = l.b.Close()
 }
 
 func (l *lab) do(args ...string) string {
@@ -319,7 +319,7 @@ func run(c cfg) (res results, err error) {
 	if derr != nil {
 		return res, derr
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	l, berr := boot(dir)
 	if berr != nil {
 		return res, berr
