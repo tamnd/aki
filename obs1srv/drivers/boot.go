@@ -61,17 +61,15 @@ type Booted struct {
 	Pub    *obs1.ManifestPublisher
 	Rec    *obs1.Recovery
 	Replay replay.Stats
-	// Keymaps is the per-group regime A cold-key index the folder
-	// maintains; the cold read path consumes it. Rebuilding it from
-	// segments at takeover lands with the directory slice, so after a
-	// restart it covers keys folded since boot.
+	// Keymaps is the per-group regime A cold-key index: rebuilt from the
+	// winning manifests' segments at boot, then maintained by the folder
+	// on every publish. The cold read path consumes it.
 	Keymaps []*obs1.Keymap
-	// Dirs is the per-group directory the folder fills on publish; the
-	// cold read path resolves keymap locators through it. Like the
-	// keymaps, takeover rebuild from the manifest lands with the next PR
-	// of the directory slice, so after a restart it covers segments
-	// folded since boot.
+	// Dirs is the per-group directory, rebuilt and maintained the same
+	// way; the cold read path resolves keymap locators through it.
 	Dirs []*obs1.Directory
+	// Resident sums the per-group rebuild stats.
+	Resident obs1.ResidentStats
 }
 
 // Close drains and stops the pipeline: write log first so its final
@@ -166,6 +164,19 @@ func BootDurability(ctx context.Context, cfg BootConfig, rt *shard.Runtime) (*Bo
 		kms[g] = obs1.NewKeymap()
 		dirs[g] = obs1.NewDirectory()
 	}
+	var resident obs1.ResidentStats
+	for _, m := range r.Winning {
+		st, rerr := obs1.RebuildResident(ctx, cfg.Store, cfg.Prefix, m, dirs[m.Group], kms[m.Group])
+		if rerr != nil {
+			_ = wl.Close()
+			pub.Close()
+			return nil, rerr
+		}
+		resident.Segments += st.Segments
+		resident.Records += st.Records
+		resident.Tombstones += st.Tombstones
+		resident.Swept += st.Swept
+	}
 	folder, err := obs1.NewFolder(obs1.FoldConfig{
 		Store: cfg.Store, Prefix: cfg.Prefix, Node: cfg.Node,
 		MapKey: ClusterMapKey, Mark: wl.GroupMark, Marks: wl.Marks(),
@@ -196,5 +207,5 @@ func BootDurability(ctx context.Context, cfg BootConfig, rt *shard.Runtime) (*Bo
 	rt.SetFoldProgress(func() uint64 { return pub.Stats().Published })
 	rt.SetFoldKick(folder.Flush)
 
-	return &Booted{WL: wl, Folder: folder, Pub: pub, Rec: r, Replay: ap.Stats(), Keymaps: kms, Dirs: dirs}, nil
+	return &Booted{WL: wl, Folder: folder, Pub: pub, Rec: r, Replay: ap.Stats(), Keymaps: kms, Dirs: dirs, Resident: resident}, nil
 }
