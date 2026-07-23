@@ -2,7 +2,6 @@ package hash
 
 import (
 	"fmt"
-	"sort"
 	"testing"
 	"unsafe"
 
@@ -13,11 +12,11 @@ import (
 // The hash cold read plumbing (spec 2064/f3/06 sections 6 and 7). A demote sheds a
 // field's value to a cold chunk and leaves its field bytes and lengths resident, so
 // the probe, HEXISTS, HKEYS, and HSTRLEN stay zero preads and only the value read
-// preads. These tests hand-demote a native table, the D2 pass in miniature, and
-// hold every read path to the pre-demote answer across the cold boundary, plus the
-// resident-byte drop the shed values earn. The demote pass itself and the write
-// paths' promote-first cold safety land in the following slices; here every write
-// happens before the demote, so no resident mutator meets a cold record.
+// preads. These tests run the real demote pass over a native table and hold every
+// read path to the pre-demote answer across the cold boundary, plus the
+// resident-byte drop the shed values earn. Every write here happens before the
+// demote, so no resident mutator meets a cold record; the write paths'
+// promote-first cold safety has its own tests.
 
 // fentrySizeStable pins the record cell width the accounting term counts: adding the
 // band byte must not have grown the twenty-byte cell (it lands in the padding after
@@ -28,75 +27,16 @@ func TestFentrySizeStable(t *testing.T) {
 	}
 }
 
-// handDemote sheds every resident value in f to the cold region by hand, the D2
-// demote pass in miniature: it packs each field-value pair in field-hash order into
-// chunks, retiers each record's voff to a chunk locator with the cold band, and
-// rebuilds the slab to hold only the still-resident field bytes. It installs the
-// shared cold state and returns the number of chunks it wrote.
+// handDemote runs the real demote pass over f, shedding every resident value to
+// the cold region, and returns the number of chunks it wrote. The name survives
+// from when this file packed chunks by hand; the pass it rehearsed landed, so the
+// tests drive it directly now.
 func handDemote(t *testing.T, st *store.Store, key string, f *ftable) int {
 	t.Helper()
-	f.cold = &coldChunks{st: st}
-
-	type ent struct {
-		hash uint64
-		ord  uint32
+	if n := f.demote(st, []byte(key)); n == 0 {
+		t.Fatal("demote shed nothing")
 	}
-	var ents []ent
-	for _, ord := range f.vec {
-		e := &f.ents[ord]
-		if e.band&tierCold != 0 {
-			continue
-		}
-		ents = append(ents, ent{store.Hash(f.slab[e.foff : e.foff+uint32(e.flen)]), ord})
-	}
-	sort.Slice(ents, func(i, j int) bool { return ents[i].hash < ents[j].hash })
-
-	var payload []byte
-	var ords []uint32
-	var firstHash uint64
-	chunks := 0
-	flush := func() {
-		off, ok := st.AppendChunk(kindHash, 0, uint16(len(ords)), []byte(key), discOf(firstHash), payload)
-		if !ok {
-			t.Fatal("AppendChunk refused")
-		}
-		slot := uint32(len(f.cold.offs))
-		f.cold.offs = append(f.cold.offs, off)
-		f.cold.dir.Insert(discOf(firstHash), uint32(len(ords)), off)
-		for j, ord := range ords {
-			f.ents[ord].band |= tierCold
-			f.ents[ord].voff = packLoc(slot, uint32(j))
-		}
-		payload = payload[:0]
-		ords = ords[:0]
-		chunks++
-	}
-	for i, e := range ents {
-		if len(ords) == 0 {
-			firstHash = e.hash
-		}
-		r := &f.ents[e.ord]
-		field := f.slab[r.foff : r.foff+uint32(r.flen)]
-		value := f.slab[r.voff : r.voff+r.vlen]
-		payload = appendEntry(payload, field, value)
-		ords = append(ords, e.ord)
-		if len(payload) >= chunkByteTarget || len(ords) >= maxChunkEntry || i == len(ents)-1 {
-			flush()
-		}
-	}
-
-	// Rebuild the slab keeping only the resident field bytes; every value is now cold,
-	// so its slab bytes are gone and voff carries a locator, not an offset.
-	newslab := make([]byte, 0)
-	for _, ord := range f.vec {
-		e := &f.ents[ord]
-		field := f.slab[e.foff : e.foff+uint32(e.flen)]
-		e.foff = uint32(len(newslab))
-		newslab = append(newslab, field...)
-	}
-	f.slab = newslab
-	f.dead = 0
-	return chunks
+	return len(f.cold.offs)
 }
 
 // coldNative builds a native hash of n fields each with a value w bytes wide,
@@ -195,14 +135,16 @@ func TestColdResidentBytesDrops(t *testing.T) {
 // TestColdEntryTornReportsMiss covers the torn-frame guard: a value read whose
 // packed payload is truncated reports a miss rather than returning garbage.
 func TestColdEntryTornReportsMiss(t *testing.T) {
-	full := appendEntry(nil, []byte("field"), []byte("value"))
-	if _, _, ok := chunkEntry(full, 0); !ok {
+	var pk store.ChunkPacker
+	pk.Add([]byte("field"), []byte("value"), 0)
+	payload, flags := pk.Finish()
+	if _, ok := store.PackedPairAt(payload, flags, 1, 0); !ok {
 		t.Fatal("a well-formed entry did not decode")
 	}
-	if _, _, ok := chunkEntry(full[:len(full)-1], 0); ok {
+	if _, ok := store.PackedPairAt(payload[:len(payload)-1], flags, 1, 0); ok {
 		t.Fatal("a truncated value decoded")
 	}
-	if _, _, ok := chunkEntry(full, 1); ok {
+	if _, ok := store.PackedPairAt(payload, flags, 1, 1); ok {
 		t.Fatal("an out-of-range entry index decoded")
 	}
 }
@@ -234,8 +176,9 @@ func TestColdPairAndMarkDirty(t *testing.T) {
 		}
 	}
 
-	// markDirty on a field's hash flags exactly the owning chunk's descriptor.
-	hh := store.Hash(f.fieldByOrd(f.vec[0]))
+	// markDirty on a field's fold discriminator flags exactly the owning chunk's
+	// descriptor.
+	hh := fieldDisc(f.fieldByOrd(f.vec[0]))
 	f.cold.markDirty(hh)
 	idx, ok := f.cold.dir.Floor(discOf(hh))
 	if !ok {

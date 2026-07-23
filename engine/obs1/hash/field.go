@@ -293,7 +293,7 @@ func (f *ftable) removeOrd(ord uint32) {
 		// repack, and the owning chunk is flagged dirty to drive it (spec 2064/f3/06
 		// section 7.4). Deleting a cold field must not promote its chunk.
 		f.dead += int(e.flen)
-		f.cold.markDirty(store.Hash(f.slab[e.foff : e.foff+uint32(e.flen)]))
+		f.cold.markDirty(fieldDisc(f.slab[e.foff : e.foff+uint32(e.flen)]))
 	} else {
 		f.dead += int(e.flen) + int(e.vlen)
 	}
