@@ -25,12 +25,16 @@ import (
 
 // DirRef is a resolved locator: the object to GET, the block's index row
 // (BlockSpan gives the exact byte range), and where the chunk frame
-// starts in the decompressed block.
+// starts in the decompressed block. A collection plan additionally
+// carries the chunk's packed count and first discriminator, the RAM
+// facts rank arithmetic runs prefix sums over (doc 08 section 5).
 type DirRef struct {
 	ObjKey     string
 	Block      SegmentBlockEntry
 	OffInBlock uint32
 	ChunkKind  uint8
+	Count      uint16
+	FirstDisc  uint64
 }
 
 // dirChunk is the resident cut of one SegmentChunkEntry: placement plus
@@ -144,6 +148,8 @@ func (d *Directory) Resolve(l KeyLoc) (DirRef, bool) {
 		Block:      s.blocks[c.block],
 		OffInBlock: c.off,
 		ChunkKind:  c.kind,
+		Count:      c.count,
+		FirstDisc:  c.firstDisc,
 	}, true
 }
 
@@ -201,6 +207,8 @@ func (d *Directory) ResolveFieldKind(l KeyLoc, fp uint64, disc uint64, kind uint
 		Block:      s.blocks[c.block],
 		OffInBlock: c.off,
 		ChunkKind:  c.kind,
+		Count:      c.count,
+		FirstDisc:  c.firstDisc,
 	}, true
 }
 
@@ -210,6 +218,15 @@ func (d *Directory) ResolveFieldKind(l KeyLoc, fp uint64, disc uint64, kind uint
 // one ranged GET, which is what makes the request bill the doc 08 ceil
 // identity rather than a GET per chunk.
 func (d *Directory) CollChunks(l KeyLoc, fp uint64) []DirRef {
+	return d.CollChunksKind(l, fp, 0)
+}
+
+// CollChunksKind is CollChunks restricted to one chunk kind, the
+// projection plan a dual-projection collection's ordered reads run over:
+// a zset range read plans only the score runs, whose discriminators
+// share one coordinate space, so the prefix sums over their counts are
+// rank math (doc 08 section 5). Kind zero means any.
+func (d *Directory) CollChunksKind(l KeyLoc, fp uint64, kind uint8) []DirRef {
 	if l.Tier != 0 {
 		return nil
 	}
@@ -219,28 +236,25 @@ func (d *Directory) CollChunks(l KeyLoc, fp uint64) []DirRef {
 	if !ok {
 		return nil
 	}
-	type ord struct {
-		disc uint64
-		ref  DirRef
-	}
-	var out []ord
+	var refs []DirRef
 	for i := range s.chunks {
 		c := &s.chunks[i]
-		if !d.collChunk(c, fp, 0) {
+		if !d.collChunk(c, fp, kind) {
 			continue
 		}
-		out = append(out, ord{disc: c.firstDisc, ref: DirRef{
+		refs = append(refs, DirRef{
 			ObjKey:     s.objKey,
 			Block:      s.blocks[c.block],
 			OffInBlock: c.off,
 			ChunkKind:  c.kind,
-		}})
+			Count:      c.count,
+			FirstDisc:  c.firstDisc,
+		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].disc < out[j].disc })
-	refs := make([]DirRef, len(out))
-	for i := range out {
-		refs[i] = out[i].ref
-	}
+	// Stable on ties: a score-uniform zset's lex runs all lift the same
+	// leading score key, and the footer preserves emission order, which is
+	// the lex order the demoter packed.
+	sort.SliceStable(refs, func(i, j int) bool { return refs[i].FirstDisc < refs[j].FirstDisc })
 	return refs
 }
 
