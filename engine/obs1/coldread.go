@@ -77,11 +77,16 @@ type coldFlightKey struct {
 	off uint64
 }
 
-// coldIntent is one waiter on a flight.
+// coldIntent is one waiter on a flight: a whole-record read completing
+// through done, or a collection field read (field set, fdone set)
+// completing through the packed-pair extractor with the intent's clock.
 type coldIntent struct {
-	key  []byte
-	ref  DirRef
-	done func(ColdRecord, error)
+	key   []byte
+	ref   DirRef
+	done  func(ColdRecord, error)
+	field []byte
+	nowMs int64
+	fdone func(ColdField, error)
 }
 
 // coldFlight is one in-flight block GET and everyone waiting on it.
@@ -158,6 +163,48 @@ func (c *ColdReader) Fetch(group uint16, key []byte, loc KeyLoc, done func(ColdR
 	go c.fly(fk, fl)
 }
 
+// FetchField registers one collection field read (doc 08 section 3): the
+// keymap locator names the collection's newest segment, ResolveField
+// floors the field's discriminator to its owning chunk, and the flight
+// table coalesces it with every other intent on that chunk's block, which
+// is what makes an HMGET spanning one chunk bill a single GET. done runs
+// exactly once, on a fetch goroutine, with the extracted field or the
+// error; a fired inline expiry at nowMs reads as absent.
+func (c *ColdReader) FetchField(group uint16, key []byte, loc KeyLoc, field []byte, nowMs int64, done func(ColdField, error)) {
+	fp := Fingerprint(key)
+	ref, ok := c.cfg.Dir(group).ResolveField(loc, fp, Disc(field))
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		done(ColdField{}, fmt.Errorf("obs1: cold reader is closed"))
+		return
+	}
+	c.stats.Fetches++
+	if !ok {
+		c.stats.Unresolved++
+		c.mu.Unlock()
+		done(ColdField{}, ErrColdUnresolved)
+		return
+	}
+	fk := coldFlightKey{obj: ref.ObjKey, off: ref.Block.Offset}
+	in := coldIntent{
+		key: append([]byte(nil), key...), ref: ref,
+		field: append([]byte(nil), field...), nowMs: nowMs, fdone: done,
+	}
+	if fl, live := c.flights[fk]; live {
+		fl.waiters = append(fl.waiters, in)
+		c.stats.Attached++
+		c.mu.Unlock()
+		return
+	}
+	fl := &coldFlight{ref: ref, waiters: []coldIntent{in}}
+	c.flights[fk] = fl
+	c.stats.BlockGETs++
+	c.wg.Add(1)
+	c.mu.Unlock()
+	go c.fly(fk, fl)
+}
+
 // fly executes one flight: cap, GET, decode, settle every waiter.
 func (c *ColdReader) fly(fk coldFlightKey, fl *coldFlight) {
 	defer c.wg.Done()
@@ -191,7 +238,21 @@ func (c *ColdReader) settle(fk coldFlightKey, data []byte, err error) {
 	c.mu.Unlock()
 	for _, in := range fl.waiters {
 		if err != nil {
-			in.done(ColdRecord{}, err)
+			if in.fdone != nil {
+				in.fdone(ColdField{}, err)
+			} else {
+				in.done(ColdRecord{}, err)
+			}
+			continue
+		}
+		if in.fdone != nil {
+			cf, xerr := ExtractColdField(data, in.ref.OffInBlock, in.field, in.nowMs)
+			if xerr != nil {
+				c.count(func(s *ColdReadStats) { s.Errs++ })
+			} else if !cf.Found {
+				c.count(func(s *ColdReadStats) { s.Misses++ })
+			}
+			in.fdone(cf, xerr)
 			continue
 		}
 		rec, xerr := extractColdRecord(data, in.ref.OffInBlock, in.key)
