@@ -735,12 +735,128 @@ func TestApplierStreamCorruptionIsLoud(t *testing.T) {
 	}
 }
 
-// TestApplierRefusesUnwiredKinds keeps the loud refusal for the one
-// vocabulary that has not landed: the consumer group sub-ops.
-func TestApplierRefusesUnwiredKinds(t *testing.T) {
-	a, _ := newApplier(t)
-	gd := obs1.GroupDelta{Sub: obs1.GNew{Group: []byte("g")}}
-	if err := a.Apply(0, frame(t, 1, "st", gd)); err == nil || !strings.Contains(err.Error(), "not wired yet") {
-		t.Fatalf("groupdelta: %v", err)
+// TestApplierGroupPlane replays the emitter shapes writelog.go frames
+// for consumer groups: gnew plain and behind a collnew (the MKSTREAM
+// form), gdeliver with and without noack, gack, the unowned and owned
+// gclaim shapes, consumer creation and deletion, gsetid, and gdrop.
+// State pins ride the entry points' own strictness refusals, so the
+// probes never mutate; the socket test proves contents over RESP.
+func TestApplierGroupPlane(t *testing.T) {
+	a, cx := newApplier(t)
+
+	kv := []obs1.FieldValue{{Field: []byte("f"), Value: []byte("v")}}
+	g, key := []byte("g1"), []byte("st")
+	notPending := func(ms, seq uint64) {
+		t.Helper()
+		err := stream.ReplayGAck(cx, key, g, []uint64{ms}, []uint64{seq})
+		if err == nil || !strings.Contains(err.Error(), "not pending") {
+			t.Fatalf("id %d-%d pending pin: %v", ms, seq, err)
+		}
+	}
+
+	apply(t, a, 0, frame(t, 1, "st", obs1.CollNew{Type: obs1.CollStream}))
+	apply(t, a, 0, frame(t, 2, "st", obs1.CollDelta{Sub: obs1.XAdd{IDMs: 1, IDSeq: 1, Pairs: kv}}))
+	apply(t, a, 0, frame(t, 3, "st", obs1.CollDelta{Sub: obs1.XAdd{IDMs: 2, IDSeq: 2, Pairs: kv}}))
+	apply(t, a, 0, frame(t, 4, "st", obs1.GroupDelta{Sub: obs1.GNew{Group: g, ReadValid: true}}))
+
+	// Deliver both entries to c1 at the framed time, then ack the first.
+	apply(t, a, 0, frame(t, 5, "st", obs1.GroupDelta{Sub: obs1.GDeliver{Group: g, Consumer: []byte("c1"), TimeMs: 100, IDMs: []uint64{1, 2}, IDSeq: []uint64{1, 2}}}))
+	apply(t, a, 0, frame(t, 6, "st", obs1.GroupDelta{Sub: obs1.GAck{Group: g, IDMs: []uint64{1}, IDSeq: []uint64{1}}}))
+	notPending(1, 1)
+
+	// XNACK disowns 2-2, then an owned claim hands it to c2, and deleting
+	// c2 drains its pending entries by owner.
+	apply(t, a, 0, frame(t, 7, "st", obs1.GroupDelta{Sub: obs1.GClaim{Group: g, Unowned: true, IDMs: []uint64{2}, IDSeq: []uint64{2}, TimeMs: []int64{150}, Counts: []uint16{2}}}))
+	apply(t, a, 0, frame(t, 8, "st", obs1.GroupDelta{Sub: obs1.GClaim{Group: g, Consumer: []byte("c2"), IDMs: []uint64{2}, IDSeq: []uint64{2}, TimeMs: []int64{200}, Counts: []uint16{3}}}))
+	apply(t, a, 0, frame(t, 9, "st", obs1.GroupDelta{Sub: obs1.GConsumerNew{Group: g, Consumer: []byte("c3"), SeenMs: 50}}))
+	apply(t, a, 0, frame(t, 10, "st", obs1.GroupDelta{Sub: obs1.GConsumerDel{Group: g, Consumer: []byte("c2")}}))
+	notPending(2, 2)
+
+	// GSetID grafts the cursor, then a NOACK delivery above it advances
+	// without touching the PEL.
+	apply(t, a, 0, frame(t, 11, "st", obs1.GroupDelta{Sub: obs1.GSetID{Group: g, LastMs: 9, LastSeq: 9, EntriesRead: 42}}))
+	apply(t, a, 0, frame(t, 12, "st", obs1.CollDelta{Sub: obs1.XAdd{IDMs: 10, IDSeq: 0, Pairs: kv}}))
+	apply(t, a, 0, frame(t, 13, "st", obs1.GroupDelta{Sub: obs1.GDeliver{Group: g, Consumer: []byte("c1"), NoAck: true, TimeMs: 300, IDMs: []uint64{10}, IDSeq: []uint64{0}}}))
+	notPending(10, 0)
+
+	apply(t, a, 0, frame(t, 14, "st", obs1.GroupDelta{Sub: obs1.GDrop{Group: g}}))
+	if err := stream.ReplayGDrop(cx, key, g); err == nil || !strings.Contains(err.Error(), "absent from stream") {
+		t.Fatalf("g1 survived its gdrop: %v", err)
+	}
+
+	// The MKSTREAM form: a stream collnew consumed by the gnew itself,
+	// rebuilding the key empty with the group grafted on.
+	apply(t, a, 0, frame(t, 15, "mk", obs1.CollNew{Type: obs1.CollStream}))
+	apply(t, a, 0, frame(t, 16, "mk", obs1.GroupDelta{Sub: obs1.GNew{Group: []byte("g2"), LastMs: 5, LastSeq: 5, EntriesRead: 7, ReadValid: true}}))
+	wantStream(t, cx, "mk", 0, 0, 0)
+	if err := stream.ReplayGNew(cx, []byte("mk"), []byte("g2"), 0, 0, 0, false, false); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("g2 existence pin: %v", err)
+	}
+
+	if err := a.Finish(); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	got := a.Stats()
+	if got.GNews != 2 || got.GSetIDs != 1 || got.GDrops != 1 || got.GConsumerNews != 1 ||
+		got.GConsumerDels != 1 || got.GAcks != 1 || got.GDelivers != 2 || got.GClaims != 2 ||
+		got.CollNews != 2 || got.XAdds != 3 {
+		t.Fatalf("stats %+v, want the group plane counts", got)
+	}
+}
+
+// TestApplierGroupCorruptionIsLoud drives the divergences the group
+// plane must refuse: group ops on a missing stream or group, a
+// duplicate gnew or createconsumer, a delconsumer of an absent
+// consumer, a gack the PEL cannot cover, a gdeliver that fails to
+// advance the cursor, and collnew pairings that do not match.
+func TestApplierGroupCorruptionIsLoud(t *testing.T) {
+	kv := []obs1.FieldValue{{Field: []byte("f"), Value: []byte("v")}}
+	g := []byte("g")
+	base := func() []obs1.Op {
+		return []obs1.Op{
+			obs1.CollNew{Type: obs1.CollStream},
+			obs1.CollDelta{Sub: obs1.XAdd{IDMs: 1, IDSeq: 1, Pairs: kv}},
+			obs1.GroupDelta{Sub: obs1.GNew{Group: g, ReadValid: true}},
+		}
+	}
+	deliver := obs1.GroupDelta{Sub: obs1.GDeliver{Group: g, Consumer: []byte("c"), TimeMs: 100, IDMs: []uint64{1}, IDSeq: []uint64{1}}}
+	cases := []struct {
+		name string
+		ops  []obs1.Op
+		want string
+	}{
+		{"gnew on missing stream", []obs1.Op{obs1.GroupDelta{Sub: obs1.GNew{Group: g}}}, "no stream exists"},
+		{"gsetid on missing group", append(base()[:2:2], obs1.GroupDelta{Sub: obs1.GSetID{Group: g}}), "absent from stream"},
+		{"duplicate gnew", append(base(), obs1.GroupDelta{Sub: obs1.GNew{Group: g}}), "already exists"},
+		{"duplicate createconsumer", append(base(),
+			obs1.GroupDelta{Sub: obs1.GConsumerNew{Group: g, Consumer: []byte("c"), SeenMs: 5}},
+			obs1.GroupDelta{Sub: obs1.GConsumerNew{Group: g, Consumer: []byte("c"), SeenMs: 6}},
+		), "already exists in group"},
+		{"delconsumer of absent consumer", append(base(), obs1.GroupDelta{Sub: obs1.GConsumerDel{Group: g, Consumer: []byte("ghost")}}), "absent from group"},
+		{"gack with no pending entries", append(base(), obs1.GroupDelta{Sub: obs1.GAck{Group: g, IDMs: []uint64{1}, IDSeq: []uint64{1}}}), "no pending entries"},
+		{"gack of a not-pending id", append(base(), deliver, obs1.GroupDelta{Sub: obs1.GAck{Group: g, IDMs: []uint64{9}, IDSeq: []uint64{9}}}), "is not pending"},
+		{"gdeliver behind the cursor", append(base(), deliver, deliver), "does not advance the cursor"},
+		{"collnew stream consumed by gsetid", []obs1.Op{
+			obs1.CollNew{Type: obs1.CollStream},
+			obs1.GroupDelta{Sub: obs1.GSetID{Group: g}},
+		}, "not followed by its delta"},
+		{"collnew set consumed by gnew", []obs1.Op{
+			obs1.CollNew{Type: obs1.CollSet},
+			obs1.GroupDelta{Sub: obs1.GNew{Group: g}},
+		}, "not followed by its delta"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _ := newApplier(t)
+			var err error
+			for i, op := range tc.ops {
+				if err = a.Apply(0, frame(t, uint64(i+1), "c", op)); err != nil {
+					break
+				}
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error containing %q, got %v", tc.want, err)
+			}
+		})
 	}
 }
