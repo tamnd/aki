@@ -7,8 +7,9 @@ package sqlo1b
 // or deleted and its bytes are garbage. Live segment records get one
 // more probe, root liveness, so segments stranded by a GENBUMP die
 // here instead of costing a per-segment delete. Survivors re-append
-// to the open vlog stream and their index entries re-point; the
-// emptied extent quarantines and the next checkpoint releases it.
+// to the compaction output stream (gen-C extents, compressed frame
+// groups) and their index entries re-point; the emptied extent
+// quarantines and the next checkpoint releases it.
 //
 // Memory stays bounded by construction: one input group image is read
 // at a time and survivors alias those images in the pending map until
@@ -109,6 +110,38 @@ func (s *Store) compactExtent(ctx context.Context, ext uint64) (CompactStats, er
 				return fail(err)
 			}
 			grp += uint16(BlobRunGroups(grp, len(raw)))
+		}
+	} else if hdr.EFlags&EFlagCompressed != 0 {
+		// A gen-C extent from an earlier compaction: frame groups.
+		// Frame slot offsets bound every record exactly (the last one
+		// ends at ulen), so no trim is needed before relocation.
+		fg := fileGroups{s.f, s.sb.ExtentSize}
+		for grp := uint16(0); grp < hdr.GroupCount; grp++ {
+			img, err := fg.ReadGroup(ext, grp)
+			if err != nil {
+				return fail(err)
+			}
+			view, err := ParseCGroup(img)
+			if err != nil {
+				return fail(err)
+			}
+			for slot := range uint16(view.Records()) {
+				raw, err := view.Record(slot)
+				if err != nil {
+					return fail(err)
+				}
+				rec, err := DecodeRecord(raw)
+				if err != nil {
+					return fail(err)
+				}
+				pos, err := NewPos(ext, grp, slot)
+				if err != nil {
+					return fail(err)
+				}
+				if err := s.compactRecord(rec, raw, pos, &cs, &deadBytes); err != nil {
+					return fail(err)
+				}
+			}
 		}
 	} else {
 		fg := fileGroups{s.f, s.sb.ExtentSize}
@@ -252,10 +285,12 @@ func (s *Store) dropEntry(key []byte) error {
 	return nil
 }
 
-// relocate appends a live record's bytes to the open vlog stream and
-// re-points its index entry. The bytes move verbatim, no re-encode.
+// relocate appends a live record's bytes to the compaction output
+// stream and re-points its index entry. The bytes move verbatim, no
+// re-encode; the output extents carry EFlagCompressed and hold frame
+// groups (raw scheme in slice 1, the sampled selector later).
 func (s *Store) relocate(rec *Record, raw []byte) error {
-	pos, err := s.appendVlog(raw)
+	pos, err := s.appendCompact(raw)
 	if err != nil {
 		return err
 	}

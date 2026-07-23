@@ -54,12 +54,15 @@ const (
 
 // Grid stream discriminators. The store is single-shard, so the
 // grid's shard argument is free to split the vlog kind into a record
-// stream and a blob stream with independent active extents. The
-// split is RAM-only: extent headers keep shard 0 and streams are
-// rebuilt from scratch on open.
+// stream, a blob stream, and a compaction output stream with
+// independent active extents. The split is RAM-only: extent headers
+// keep shard 0 and streams are rebuilt from scratch on open; the
+// compact stream's extents alone carry EFlagCompressed, which IS
+// durable in their headers and drives read dispatch.
 const (
-	recStream  uint16 = 0
-	blobStream uint16 = 1
+	recStream     uint16 = 0
+	blobStream    uint16 = 1
+	compactStream uint16 = 2
 )
 
 // streamCursor tracks one append stream's active extent: where the
@@ -130,11 +133,12 @@ type Store struct {
 	dirty   map[uint64][]*Chunk
 	pending map[Pos][]byte
 
-	vlog streamCursor
-	blob streamCursor
-	idx  streamCursor
-	dirp streamCursor
-	am   streamCursor
+	vlog  streamCursor
+	blob  streamCursor
+	cvlog streamCursor
+	idx   streamCursor
+	dirp  streamCursor
+	am    streamCursor
 
 	// blobSlab mirrors the active blob extent so PlaceBlob can lay
 	// out runs before the bytes hit the file.
@@ -144,6 +148,26 @@ type Store struct {
 	gb    *GroupBuilder
 	gbExt uint64
 	gbGrp uint16
+
+	// Open compaction output group builder (frame format, cgroup.go),
+	// only non-nil while relocations are in flight between a
+	// compaction and the next checkpoint's Drain, which force-closes
+	// it because frame images are not tear-safe under rewrite.
+	cgb    *CGroupBuilder
+	cgbExt uint64
+	cgbGrp uint16
+
+	// extFlags is the lazy extent-eflags cache behind read dispatch:
+	// whether a position's extent holds raw slotted groups or
+	// compressed frames. Filled from the 64-byte header on first
+	// touch and overwritten by allocStream when an extent is reused,
+	// so a freed-and-reallocated extent cannot serve stale flags.
+	extFlags map[uint64]uint8
+
+	// schemeGroups counts compressed-frame groups written per scheme,
+	// advisory runtime telemetry like garbageExt; the selection slice
+	// grows this into the doc 04 selection histogram.
+	schemeGroups [NumSchemes]uint64
 
 	// pendingDir carries the FlushIndex root to Snapshot.
 	pendingDir FullPtr
@@ -218,7 +242,7 @@ func CreateStoreOn(f StoreFile, walPath string, walSegSize int64) (*Store, error
 		ckptPolicy: DefaultCheckpointPolicy(),
 	}
 	s.initCursors()
-	s.rd = &IndexReader{Dir: s.dir, Groups: fileGroups{s.f, s.sb.ExtentSize}, Blob: s.readBlobPos}
+	s.rd = &IndexReader{Dir: s.dir, Groups: fileGroups{s.f, s.sb.ExtentSize}, Blob: s.readBlobPos, Compressed: s.extCompressed}
 	return s, nil
 }
 
@@ -347,13 +371,14 @@ func restoreStore(f StoreFile, rec *Recovery) (*Store, error) {
 	if err := f.Truncate(int64(sb.ExtentCount) * int64(sb.ExtentSize)); err != nil {
 		return nil, err
 	}
-	s.rd = &IndexReader{Dir: s.dir, Groups: fileGroups{s.f, s.sb.ExtentSize}, Blob: s.readBlobPos}
+	s.rd = &IndexReader{Dir: s.dir, Groups: fileGroups{s.f, s.sb.ExtentSize}, Blob: s.readBlobPos, Compressed: s.extCompressed}
 	return s, nil
 }
 
 func (s *Store) initCursors() {
 	s.vlog = streamCursor{kind: KindVlog, stream: recStream}
 	s.blob = streamCursor{kind: KindVlog, stream: blobStream, eflags: EFlagBlob}
+	s.cvlog = streamCursor{kind: KindVlog, stream: compactStream, eflags: EFlagCompressed}
 	s.idx = streamCursor{kind: KindIndex}
 	s.dirp = streamCursor{kind: KindDirectory}
 	s.am = streamCursor{kind: KindAllocmap}
@@ -1473,6 +1498,9 @@ func (s *Store) finishApply() error {
 	if err := s.flushBatchGroup(); err != nil {
 		return err
 	}
+	if err := s.flushCompactGroup(); err != nil {
+		return err
+	}
 	clear(s.pending)
 	return nil
 }
@@ -1694,19 +1722,64 @@ func (s *Store) resolveAt(pos Pos) (*Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	view, err := ParseGroup(img)
+	comp, err := s.extCompressed(pos.Extent())
 	if err != nil {
 		return nil, err
 	}
-	raw, err := view.Record(pos.Slot())
-	if err != nil {
-		return nil, err
+	var raw []byte
+	if comp {
+		view, err := ParseCGroup(img)
+		if err != nil {
+			return nil, err
+		}
+		raw, err = view.Record(pos.Slot())
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		view, err := ParseGroup(img)
+		if err != nil {
+			return nil, err
+		}
+		raw, err = view.Record(pos.Slot())
+		if err != nil {
+			return nil, err
+		}
 	}
 	return DecodeRecord(raw)
 }
 
 func (s *Store) readBlobPos(pos Pos) (*Record, error) {
 	return ReadBlob(s.f, s.sb.ExtentSize, pos)
+}
+
+// extCompressed reports whether an extent holds compressed frame
+// groups, from the eflags cache or one 64-byte header read on first
+// touch. allocStream overwrites the cache entry whenever an extent
+// activates, so reuse of a freed extent cannot serve the old
+// stream's flags. Zero steady-state IO: every referenced extent is
+// touched once per open.
+func (s *Store) extCompressed(ext uint64) (bool, error) {
+	if fl, ok := s.extFlags[ext]; ok {
+		return fl&EFlagCompressed != 0, nil
+	}
+	hb := make([]byte, ExtentHeaderSize)
+	if _, err := s.f.ReadAt(hb, int64(ext)*int64(s.sb.ExtentSize)); err != nil {
+		return false, fmt.Errorf("sqlo1b: extent %d header: %w", ext, err)
+	}
+	hdr, err := DecodeExtentHeader(hb)
+	if err != nil {
+		return false, err
+	}
+	s.noteExtFlags(ext, hdr.EFlags)
+	return hdr.EFlags&EFlagCompressed != 0, nil
+}
+
+func (s *Store) noteExtFlags(ext uint64, eflags uint8) {
+	if s.extFlags == nil {
+		s.extFlags = map[uint64]uint8{}
+	}
+	s.extFlags[ext] = eflags
 }
 
 // mutableChain returns the bucket's chain from the dirty map, pulling
@@ -1917,8 +1990,16 @@ func (s *Store) Checkpoint() error {
 }
 
 // Drain is checkpoint step 2. Batches already wrote their groups
-// (write-through), so making them durable is one data-file sync.
+// (write-through), so making them durable is one data-file sync. The
+// open compaction output group force-closes first: its frame image is
+// not tear-safe under rewrite, and after this checkpoint commits the
+// index durably references its positions, so it must never be
+// rewritten again (the raw vlog group may stay open because settled
+// records rewrite identically at identical offsets).
 func (s *Store) Drain(t uint64) error {
+	if err := s.closeCompactGroup(); err != nil {
+		return err
+	}
 	return s.f.Sync()
 }
 
@@ -2264,6 +2345,109 @@ func (s *Store) writeVlogGroup(img []byte) error {
 	return nil
 }
 
+// appendCompact routes one relocated record to the compaction output
+// stream's frame groups, the appendVlog mirror for gen-C extents.
+// Byte-addressed records stay on the raw blob stream: blob runs are
+// already one record per run and gain nothing from framing.
+func (s *Store) appendCompact(enc []byte) (Pos, error) {
+	if len(enc) > BlobThreshold {
+		return s.appendBlobRec(enc)
+	}
+	if s.cgb == nil || !s.cgb.Fits(len(enc)) {
+		if err := s.closeCompactGroup(); err != nil {
+			return 0, err
+		}
+		if err := s.openCompactGroup(); err != nil {
+			return 0, err
+		}
+	}
+	slot, err := s.cgb.Append(enc)
+	if err != nil {
+		return 0, err
+	}
+	pos, err := NewPos(s.cgbExt, s.cgbGrp, slot)
+	if err != nil {
+		return 0, err
+	}
+	s.pending[pos] = enc
+	return pos, nil
+}
+
+// openCompactGroup starts the next compaction output group. Like the
+// batch group it carries across compactions, write-through at each
+// finishApply; unlike it, Drain force-closes it at checkpoint (see
+// Drain).
+func (s *Store) openCompactGroup() error {
+	if !s.cvlog.active {
+		if err := s.allocStream(&s.cvlog); err != nil {
+			return err
+		}
+	} else if s.cvlog.next >= s.groupsPerExtent() {
+		if err := s.rollStream(&s.cvlog, nil); err != nil {
+			return err
+		}
+	}
+	capacity := GroupSize
+	if s.cvlog.next == 0 {
+		capacity = Group0Payload
+	}
+	s.cgb = NewCGroupBuilder(capacity)
+	s.cgbExt, s.cgbGrp = s.cvlog.ext, s.cvlog.next
+	return nil
+}
+
+// closeCompactGroup writes the open frame group's final image and
+// ends it, advancing the stream accounting and the per-scheme
+// telemetry. Nil builder is a no-op so Drain can call it blindly.
+func (s *Store) closeCompactGroup() error {
+	if s.cgb == nil {
+		return nil
+	}
+	img := s.cgb.Close()
+	if err := s.writeCompactGroup(img); err != nil {
+		return err
+	}
+	s.cvlog.next++
+	s.cvlog.groups++
+	s.cvlog.payload += uint32(len(img))
+	s.schemeGroups[s.cgb.Scheme()]++
+	s.cgb = nil
+	return nil
+}
+
+// flushCompactGroup writes the open frame group's current image in
+// place without ending it, making its pending positions readable off
+// the file. The rewrite is not tear-safe, which is fine only here:
+// until the next checkpoint's Drain closes the group, no durable
+// index references its positions, so a torn image is unreferenced
+// garbage after recovery.
+func (s *Store) flushCompactGroup() error {
+	if s.cgb == nil {
+		return nil
+	}
+	return s.writeCompactGroup(s.cgb.Image())
+}
+
+func (s *Store) writeCompactGroup(img []byte) error {
+	off := int64(s.cgbExt)*int64(s.sb.ExtentSize) + int64(s.cgbGrp)*GroupSize
+	if s.cgbGrp == 0 {
+		off += ExtentHeaderSize
+	}
+	if _, err := s.f.WriteAt(img, off); err != nil {
+		return fmt.Errorf("sqlo1b: compact group %d/%d: %w", s.cgbExt, s.cgbGrp, err)
+	}
+	s.dataBytes += uint64(len(img))
+	return nil
+}
+
+// SchemeGroups reports how many compressed frame groups this store
+// wrote per scheme since open, advisory runtime telemetry.
+func (s *Store) SchemeGroups() [NumSchemes]uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.schemeGroups
+}
+
 // appendBlobRec places one byte-addressed record in the blob stream,
 // writing through immediately so ReadBlob works before the batch
 // ends. One extent is the v0 size ceiling per record.
@@ -2333,6 +2517,9 @@ func (s *Store) allocStream(c *streamCursor) error {
 	if _, err := s.f.WriteAt(hdr.Encode(), int64(ext)*int64(s.sb.ExtentSize)); err != nil {
 		return fmt.Errorf("sqlo1b: extent %d header: %w", ext, err)
 	}
+	// Refresh the read-dispatch cache: a freed extent reused by a
+	// different stream must not keep serving the old stream's flags.
+	s.noteExtFlags(ext, c.eflags)
 	return nil
 }
 
