@@ -52,7 +52,7 @@ const (
 	maxChunkEntry   = 1 << coldEntryBits // 4096 members per chunk, the entry-index ceiling
 	coldEntryMask   = maxChunkEntry - 1
 	maxColdSlot     = 1 << (32 - coldEntryBits) // offset-table ceiling, ~1M chunks per set
-	chunkByteTarget = 4096                      // pack until the payload reaches this, then flush
+	chunkByteTarget = obs1.ChunkTargetDefault   // the doc 08 baked target (#1299), was the f3 port's 4096
 )
 
 func packLoc(slot, entry uint32) uint32 { return slot<<coldEntryBits | entry }

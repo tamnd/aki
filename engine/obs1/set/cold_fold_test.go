@@ -100,7 +100,7 @@ func checkSetFrames(t *testing.T, frames []tappedChunk, got map[string]bool) {
 
 func TestSetDemoteFramesCrossFoldTap(t *testing.T) {
 	cx, g := coldCtx(t)
-	members := gen("m", 0, 1000, 12)
+	members := gen("m", 0, 1000, 40)
 	addKey(g, "k", members...)
 
 	tapped := tapChunks(t, cx.St)

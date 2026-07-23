@@ -56,7 +56,7 @@ func coldNative(n, w int) *hash {
 // enumeration walks every pair, and a stranger still misses.
 func TestColdValueReadsAreTransparent(t *testing.T) {
 	cx, _ := coldCtx(t)
-	h := coldNative(200, 40)
+	h := coldNative(200, 200)
 
 	// Snapshot the pre-demote answers.
 	want := map[string]string{}

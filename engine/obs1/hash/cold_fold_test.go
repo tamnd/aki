@@ -56,7 +56,7 @@ func tapChunks(t *testing.T, st *store.Store) *[]tappedChunk {
 
 func TestDemoteFramesCrossFoldTap(t *testing.T) {
 	cx, _ := coldCtx(t)
-	h := coldNative(200, 40)
+	h := coldNative(200, 200)
 	want := map[string]string{}
 	h.each(func(f, v []byte) { want[string(f)] = string(v) })
 
@@ -127,7 +127,7 @@ func TestDemoteFramesCrossFoldTap(t *testing.T) {
 // expiry rides the frame byte-exact while its neighbours stay at zero.
 func TestDemoteTTLBitmapOnBearerChunks(t *testing.T) {
 	cx, _ := coldCtx(t)
-	h := coldNative(200, 40)
+	h := coldNative(200, 200)
 	wantExp := map[string]uint64{}
 	i := 0
 	h.each(func(f, v []byte) {
