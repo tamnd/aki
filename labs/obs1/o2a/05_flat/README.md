@@ -41,4 +41,28 @@ Quick 10^3 to 10^5 passes with the latency model off executed during harness dev
 
 ## Results
 
-Pending the scored run.
+Scored run (flat.csv), 1000 serial fetches per decade:
+
+| kind | n | chunks | obj MiB | GETs/op | KiB/op | found | resolve us | p50 ms | p99 ms | dir B/elem |
+|---|---|---|---|---|---|---|---|---|---|---|
+| hash | 10^3 | 5 | 0.1 | 1.0000 | 75.3 | 100% | 0.1 | 22.2 | 141.2 | 0.2570 |
+| hash | 10^4 | 47 | 0.7 | 1.0000 | 108.8 | 100% | 0.3 | 20.6 | 129.3 | 0.1721 |
+| hash | 10^5 | 470 | 7.4 | 1.0000 | 112.4 | 100% | 0.6 | 22.0 | 133.8 | 0.1646 |
+| hash | 10^6 | 4695 | 73.8 | 1.0000 | 112.3 | 100% | 6.4 | 22.4 | 150.5 | 0.1637 |
+| hash | 10^7 | 46949 | 737.5 | 1.0000 | 112.3 | 100% | 56.0 | 21.7 | 156.5 | 0.1637 |
+| set | 10^8 | 79303 | 1245.2 | 1.0000 | 112.2 | 100% | 94.2 | 21.3 | 137.4 | 0.0276 |
+
+p99 max over min ratio: 1.21.
+Cold reader: 6000 fetches, 6000 block GETs, 0 attached, 0 unresolved, 0 misses, 0 errors.
+
+## Verdict
+
+Hit, with one marginal byte-band edge.
+
+Band 1 exact: 1.0000 GETs per fetch at 100% found at every decade.
+Bands 2 and 3, the flatness claim itself: p50 sits at 20.6-22.6 ms across five orders of magnitude of cardinality, within 13% of the envelope's 20 ms, and the p99 ratio is 1.21 against the 1.6 line with the 10^8 decade's 137.4 ms nowhere near the slowest.
+Band 4: the resolver walk grows linearly in chunk count as predicted (0.1 us at 5 chunks to 94.2 us at 79303) and tops out two and a half orders under the GET p50, far inside the 2 ms line; the linear scan is affordable at 10^8, though it is the number a doc 06 rewrite of ResolveField would watch.
+Band 5 edge: the 10^4 decade reads 108.8 KiB per fetch, 1% under the stated 110 KiB floor, because chunk-boundary block closes leave slightly shorter blocks in a 47-chunk object; every larger decade sits at 112.2-112.4 KiB inside the band and the 10^3 decade clips to its 0.1 MiB object as predicted.
+Band 6: cold reader clean everywhere, and the directory's share falls to 0.0276 B per element at 10^8, under the 0.05 line.
+
+The kill line did not fire: cold field latency does not rise with cardinality on the landed plane, at any decade, in either quantile.
