@@ -115,7 +115,7 @@ func (s *Store) compactExtent(ctx context.Context, ext uint64) (CompactStats, er
 		// A gen-C extent from an earlier compaction: frame groups.
 		// Frame slot offsets bound every record exactly (the last one
 		// ends at ulen), so no trim is needed before relocation.
-		fg := fileGroups{s.f, s.sb.ExtentSize}
+		fg := backendGroups{s.io, PrioBG}
 		for grp := uint16(0); grp < hdr.GroupCount; grp++ {
 			img, err := fg.ReadGroup(ext, grp)
 			if err != nil {
@@ -144,7 +144,7 @@ func (s *Store) compactExtent(ctx context.Context, ext uint64) (CompactStats, er
 			}
 		}
 	} else {
-		fg := fileGroups{s.f, s.sb.ExtentSize}
+		fg := backendGroups{s.io, PrioBG}
 		for grp := uint16(0); grp < hdr.GroupCount; grp++ {
 			img, err := fg.ReadGroup(ext, grp)
 			if err != nil {

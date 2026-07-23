@@ -91,6 +91,7 @@ type Store struct {
 	grid    *Grid
 	dir     *Directory
 	rd      *IndexReader
+	io      *IOBridge
 	closeFn func() error
 
 	// Linear hash state, committed as hash_epoch at checkpoint.
@@ -248,8 +249,18 @@ func CreateStoreOn(f StoreFile, walPath string, walSegSize int64) (*Store, error
 	}
 	s.initCursors()
 	s.fc = NewFrameCache()
-	s.rd = &IndexReader{Dir: s.dir, Groups: fileGroups{s.f, s.sb.ExtentSize}, Blob: s.readBlobPos, Compressed: s.extCompressed, Frames: s.fc}
+	s.startIO()
+	s.rd = &IndexReader{Dir: s.dir, Groups: backendGroups{s.io, PrioFG}, Blob: s.readBlobPos, Compressed: s.extCompressed, Frames: s.fc}
 	return s, nil
+}
+
+// startIO stands up the IO backend under the store: an iopool over
+// the data file with the bridge on top. Runs after the superblock is
+// settled because the pool needs the extent size, and before the
+// IndexReader because live group reads ride it.
+func (s *Store) startIO() {
+	comp := make(chan IOResult, storeIOComp)
+	s.io = NewIOBridge(NewIOPool(s.f, s.sb.ExtentSize, storeIOWorkers, comp), comp)
 }
 
 // OpenStore opens an existing store, running recovery: pick the
@@ -378,7 +389,8 @@ func restoreStore(f StoreFile, rec *Recovery) (*Store, error) {
 		return nil, err
 	}
 	s.fc = NewFrameCache()
-	s.rd = &IndexReader{Dir: s.dir, Groups: fileGroups{s.f, s.sb.ExtentSize}, Blob: s.readBlobPos, Compressed: s.extCompressed, Frames: s.fc}
+	s.startIO()
+	s.rd = &IndexReader{Dir: s.dir, Groups: backendGroups{s.io, PrioFG}, Blob: s.readBlobPos, Compressed: s.extCompressed, Frames: s.fc}
 	return s, nil
 }
 
@@ -956,6 +968,10 @@ func (s *Store) Close() error {
 	err := s.wal.Flush()
 	if cerr := s.wal.Close(); err == nil {
 		err = cerr
+	}
+	// The bridge stops before the file closes underneath its workers.
+	if s.io != nil {
+		s.io.Close()
 	}
 	if s.closeFn != nil {
 		if cerr := s.closeFn(); err == nil {
@@ -1725,7 +1741,7 @@ func (s *Store) resolveAt(pos Pos) (*Record, error) {
 	if pos.IsBlob() {
 		return ReadBlob(s.f, s.sb.ExtentSize, pos)
 	}
-	img, err := fileGroups{s.f, s.sb.ExtentSize}.ReadGroup(pos.Extent(), pos.Group())
+	img, err := backendGroups{s.io, PrioFG}.ReadGroup(pos.Extent(), pos.Group())
 	if err != nil {
 		return nil, err
 	}
@@ -1863,7 +1879,7 @@ func (s *Store) chunkImageAt(pos Pos) ([]byte, error) {
 	if pos.Slot() >= chunksPerGroup {
 		return nil, fmt.Errorf("sqlo1b: chunk position %s has no slot %d", pos, pos.Slot())
 	}
-	img, err := fileGroups{s.f, s.sb.ExtentSize}.ReadGroup(pos.Extent(), pos.Group())
+	img, err := backendGroups{s.io, PrioFG}.ReadGroup(pos.Extent(), pos.Group())
 	if err != nil {
 		return nil, err
 	}
@@ -2668,7 +2684,9 @@ func (s *Store) writeGroupImage(ext uint64, grp uint16, img []byte) error {
 
 // fileGroups serves group images straight off the data file. Group 0
 // is the short payload behind the extent header; the rest are whole
-// 4 KiB groups.
+// 4 KiB groups. Only recovery-time readers use it now; once the store
+// is up, group reads go through backendGroups so the backend seam
+// sees them (R-I4).
 type fileGroups struct {
 	r  io.ReaderAt
 	es uint32
