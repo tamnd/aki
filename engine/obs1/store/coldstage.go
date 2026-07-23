@@ -321,6 +321,9 @@ func (s *Store) stageRecord(d *coldDrain, addr uint64) bool {
 	flags := s.recFlags(addr)
 	if flags&(flagSep|flagChunked) != 0 {
 		need := coldHdr + int(s.klen(addr)) + int(s.vlen(addr))
+		if flags&flagHasTTL != 0 {
+			need += coldExpSize
+		}
 		if frameStart > 0 && frameStart+need > cap(d.buf) {
 			return false
 		}
@@ -329,7 +332,7 @@ func (s *Store) stageRecord(d *coldDrain, addr uint64) bool {
 			return false
 		}
 		d.buf = appendColdFrame(d.buf, s.arena.buf[addr+offKind],
-			flags&^(flagSep|flagChunked), uint32(s.vlen(addr)), s.keyAt(addr), v)
+			flags&^(flagSep|flagChunked), uint32(s.vlen(addr)), s.keyAt(addr), v, uint64(s.expireAt(addr)))
 	} else {
 		d.buf = s.frameRecord(addr, d.buf)
 	}

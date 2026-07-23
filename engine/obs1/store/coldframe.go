@@ -26,7 +26,15 @@ import (
 // record's logical value length (or an int's digit count) for reply presizing;
 // the value-region length is total - coldHdr - klen, which the pointer bands make
 // distinct from vlen.
+//
+// A record with a deadline (flagHasTTL) carries its absolute unix-ms expiry as
+// a trailing 8-byte LE word after the value. The tail placement keeps the key
+// at coldHdr, so every offset the index and the flip bookkeeping derive from
+// the header survives, and only the value-region arithmetic subtracts the word.
 const coldHdr = 12 // u32 total + u8 kind + u8 flags + u16 klen + u32 vlen
+
+// coldExpSize is the trailing expiry word's width on a flagHasTTL frame.
+const coldExpSize = 8
 
 // errColdShort marks a frame whose total runs past the buffer that holds it: a
 // torn tail on recovery, or a corrupt length on a linear walk.
@@ -41,15 +49,22 @@ type coldFrame struct {
 	vlen  uint32
 	key   []byte
 	value []byte
+	exp   uint64 // absolute unix-ms deadline, 0 unless flags carry flagHasTTL
 }
 
 // appendColdFrame writes one cold frame onto dst and returns the extended slice.
 // value is the record's raw value region; the caller decides what that is per
 // band (frameRecord does the band selection). Field widths match the resident
 // header, so a record the store already admitted cannot overflow klen or vlen,
-// and total is bounded by the same header caps plus the frame prefix.
-func appendColdFrame(dst []byte, kind, flags byte, vlen uint32, key, value []byte) []byte {
+// and total is bounded by the same header caps plus the frame prefix. exp is
+// written as the trailing expiry word only when flags carry flagHasTTL and is
+// ignored otherwise, so a TTL-free frame stays byte-identical to before the
+// projection slice.
+func appendColdFrame(dst []byte, kind, flags byte, vlen uint32, key, value []byte, exp uint64) []byte {
 	total := coldHdr + len(key) + len(value)
+	if flags&flagHasTTL != 0 {
+		total += coldExpSize
+	}
 	var h [coldHdr]byte
 	binary.LittleEndian.PutUint32(h[0:], uint32(total))
 	h[4] = kind
@@ -59,6 +74,9 @@ func appendColdFrame(dst []byte, kind, flags byte, vlen uint32, key, value []byt
 	dst = append(dst, h[:]...)
 	dst = append(dst, key...)
 	dst = append(dst, value...)
+	if flags&flagHasTTL != 0 {
+		dst = binary.LittleEndian.AppendUint64(dst, exp)
+	}
 	return dst
 }
 
@@ -75,7 +93,16 @@ func decodeColdFrame(buf []byte) (coldFrame, int, error) {
 		return coldFrame{}, 0, errColdShort
 	}
 	klen := int(binary.LittleEndian.Uint16(buf[6:]))
-	if coldHdr+klen > total {
+	vend := total
+	var exp uint64
+	if buf[5]&flagHasTTL != 0 {
+		vend = total - coldExpSize
+		if coldHdr+klen > vend {
+			return coldFrame{}, 0, errColdShort
+		}
+		exp = binary.LittleEndian.Uint64(buf[vend:])
+	}
+	if coldHdr+klen > vend {
 		return coldFrame{}, 0, errColdShort
 	}
 	f := coldFrame{
@@ -83,7 +110,8 @@ func decodeColdFrame(buf []byte) (coldFrame, int, error) {
 		flags: buf[5],
 		vlen:  binary.LittleEndian.Uint32(buf[8:]),
 		key:   buf[coldHdr : coldHdr+klen],
-		value: buf[coldHdr+klen : total],
+		value: buf[coldHdr+klen : vend],
+		exp:   exp,
 	}
 	return f, total, nil
 }
@@ -108,10 +136,10 @@ func (s *Store) valueRegion(off uint64) []byte {
 // frameRecord appends the record at off as one whole-record cold frame onto dst
 // and returns the extended slice. This is the point-data path; a chunked
 // collection demotes through the chunk frame variant (doc 06 section 6.2), not
-// through here. The header fields and the value region are framed verbatim, so
-// the migrator's phase-2 flip can rebuild the resident record from the frame
-// alone.
+// through here. The header fields, the value region, and the expiry slot are
+// framed verbatim, so the migrator's phase-2 flip can rebuild the resident
+// record from the frame alone.
 func (s *Store) frameRecord(off uint64, dst []byte) []byte {
 	kind := s.arena.buf[off+offKind]
-	return appendColdFrame(dst, kind, s.recFlags(off), uint32(s.vlen(off)), s.keyAt(off), s.valueRegion(off))
+	return appendColdFrame(dst, kind, s.recFlags(off), uint32(s.vlen(off)), s.keyAt(off), s.valueRegion(off), uint64(s.expireAt(off)))
 }

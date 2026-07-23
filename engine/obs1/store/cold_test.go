@@ -183,10 +183,10 @@ func TestColdDel(t *testing.T) {
 	assertCensus(t, s)
 }
 
-// TestColdDemoteSkipsIneligible checks the demotable gate: a key with a TTL and
-// a separated-band value keep their arena residency because their frame has no
-// place for the deadline and their run would dangle. Only the plain int and
-// embedded keys move.
+// TestColdDemoteSkipsIneligible checks the demotable gate: a separated-band
+// value keeps its arena residency because its run would dangle, while a TTL
+// key demotes with its deadline in the frame's trailing expiry word and the
+// plain key demotes as always.
 func TestColdDemoteSkipsIneligible(t *testing.T) {
 	s := coldStore(t)
 	if err := s.Set([]byte("plain"), []byte("x")); err != nil {
@@ -202,17 +202,20 @@ func TestColdDemoteSkipsIneligible(t *testing.T) {
 	if err := s.Set([]byte("sep"), big); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.DemoteCold(); got != 1 {
-		t.Fatalf("DemoteCold moved %d, want 1 (only the plain key is eligible)", got)
+	if got := s.DemoteCold(); got != 2 {
+		t.Fatalf("DemoteCold moved %d, want 2 (the plain and TTL keys)", got)
 	}
-	if s.slotIsCold([]byte("ttl")) {
-		t.Fatal("a TTL key was demoted")
+	if !s.slotIsCold([]byte("ttl")) {
+		t.Fatal("the TTL key was not demoted")
 	}
 	if s.slotIsCold([]byte("sep")) {
 		t.Fatal("a separated key was demoted")
 	}
 	if !s.slotIsCold([]byte("plain")) {
 		t.Fatal("the plain key was not demoted")
+	}
+	if v, ok := s.GetString([]byte("ttl"), 2, nil); !ok || string(v) != "y" {
+		t.Fatalf("cold TTL key before its deadline read %q %v, want y", v, ok)
 	}
 	assertCensus(t, s)
 }

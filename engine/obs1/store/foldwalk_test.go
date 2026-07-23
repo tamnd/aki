@@ -11,11 +11,11 @@ import (
 // keys on.
 func TestWalkStagedFrames(t *testing.T) {
 	var buf []byte
-	buf = appendColdFrame(buf, kindString, 0, 5, []byte("emb"), []byte("hello"))
+	buf = appendColdFrame(buf, kindString, 0, 5, []byte("emb"), []byte("hello"), 0)
 	cell := []byte{1, 2, 3, 4, 5, 6, 7, 8}
-	buf = appendColdFrame(buf, kindString, flagInt, 3, []byte("int"), cell)
+	buf = appendColdFrame(buf, kindString, flagInt, 3, []byte("int"), cell, 0)
 	ptr := bytes.Repeat([]byte{0xAB}, ptrSize)
-	buf = appendColdFrame(buf, kindString, flagSep, 4096, []byte("sep"), ptr)
+	buf = appendColdFrame(buf, kindString, flagSep, 4096, []byte("sep"), ptr, 0)
 	buf = appendChunkFrame(buf, 0x03|frameChunk, 0, 7, []byte("coll"), []byte("disc8bYt"), []byte("packed-blob"))
 
 	var got []FoldFrame
@@ -50,7 +50,7 @@ func TestWalkStagedFrames(t *testing.T) {
 // TestWalkStagedFramesTorn truncates a frame mid-body: the walk must stop
 // with the codec's error rather than misparse.
 func TestWalkStagedFramesTorn(t *testing.T) {
-	buf := appendColdFrame(nil, kindString, 0, 5, []byte("key"), []byte("value"))
+	buf := appendColdFrame(nil, kindString, 0, 5, []byte("key"), []byte("value"), 0)
 	if err := WalkStagedFrames(buf[:len(buf)-2], func(FoldFrame) error { return nil }); err == nil {
 		t.Fatal("torn record frame walked clean")
 	}
@@ -65,8 +65,8 @@ func TestWalkStagedFramesTorn(t *testing.T) {
 // the same two-level walk the folder's tests and the read path use.
 func TestFoldBuildersRoundTrip(t *testing.T) {
 	var payload []byte
-	payload = AppendRecordFrame(payload, kindString, 0, 1, []byte("a"), []byte("1"))
-	payload = AppendRecordFrame(payload, kindString, 0, 2, []byte("b"), []byte("22"))
+	payload = AppendRecordFrame(payload, kindString, 0, 1, []byte("a"), []byte("1"), 0)
+	payload = AppendRecordFrame(payload, kindString, 0, 2, []byte("b"), []byte("22"), 0)
 	chunk := AppendRunChunk(nil, kindString|ChunkKindBit, 0, 2, []byte("a"), []byte("fingerpr"), payload)
 
 	var outer []FoldFrame
@@ -125,7 +125,7 @@ func TestTombstoneFrames(t *testing.T) {
 		t.Fatalf("tombstone run chunk misread: %+v", outer)
 	}
 
-	rec := AppendRecordFrame(nil, kindString, 0, 1, []byte("k"), []byte("v"))
+	rec := AppendRecordFrame(nil, kindString, 0, 1, []byte("k"), []byte("v"), 0)
 	if err := WalkStagedFrames(rec, func(f FoldFrame) error {
 		if f.Tombstone {
 			t.Fatalf("record frame classified as tombstone: %+v", f)

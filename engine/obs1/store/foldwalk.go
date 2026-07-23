@@ -69,6 +69,11 @@ type FoldFrame struct {
 	// lower copy of its key (doc 06 section 1.3).
 	Tombstone bool
 
+	// Exp is a whole record's absolute unix-ms deadline, 0 when the record
+	// carries none and always 0 on a chunk (a chunk's bearers keep their
+	// deadlines inline in the packed blob, ChunkFlagTTLBitmap).
+	Exp uint64
+
 	Key []byte
 
 	// Frame is the whole self-delimiting frame, leading total included,
@@ -109,6 +114,7 @@ func WalkStagedFrames(buf []byte, fn func(FoldFrame) error) error {
 				Kind: f.kind, Flags: f.flags, Count: 1,
 				Pointer:   f.flags&(flagSep|flagChunked) != 0,
 				Tombstone: f.kind == KindTombstone,
+				Exp:       f.exp,
 				Key:       f.key, Frame: buf[:adv], Payload: f.value,
 			}
 			n = adv
@@ -130,9 +136,14 @@ func (s *Store) SetFoldTap(fn func(frames []byte)) { s.foldTap = fn }
 
 // AppendRecordFrame writes one whole-record cold frame onto dst, the
 // folder-side counterpart of the migrator's framing: run-chunk payloads
-// and fold tests build frames byte-identical to staged ones.
-func AppendRecordFrame(dst []byte, kind, flags byte, vlen uint32, key, value []byte) []byte {
-	return appendColdFrame(dst, kind, flags, vlen, key, value)
+// and fold tests build frames byte-identical to staged ones. A nonzero exp
+// is the record's absolute unix-ms deadline; it sets the TTL flag and
+// writes the trailing expiry word, so callers never spell the flag bit.
+func AppendRecordFrame(dst []byte, kind, flags byte, vlen uint32, key, value []byte, exp uint64) []byte {
+	if exp != 0 {
+		flags |= flagHasTTL
+	}
+	return appendColdFrame(dst, kind, flags, vlen, key, value, exp)
 }
 
 // AppendRunChunk writes one packed chunk frame onto dst, the same codec
@@ -148,5 +159,5 @@ func AppendRunChunk(dst []byte, kind, flags byte, count uint16, key, disc, paylo
 // record frame with an empty value region. The folder emits one per
 // committed delete (doc 06 section 1.3).
 func AppendTombstoneFrame(dst []byte, key []byte) []byte {
-	return appendColdFrame(dst, KindTombstone, 0, 0, key, nil)
+	return appendColdFrame(dst, KindTombstone, 0, 0, key, nil, 0)
 }

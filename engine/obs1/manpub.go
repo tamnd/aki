@@ -144,10 +144,8 @@ func (p *ManifestPublisher) OnFolded(seg FoldedSegment) {
 	g.epoch = seg.Epoch
 	g.segs = append(g.segs, ManifestSeg{
 		SegSeq: seg.SegSeq, Level: 0,
-		// Cold frames carry no expiry word yet, so level-0 rows are TTL
-		// class 0 with zero bounds (doc 03 section 5.1, recorded gap).
-		TTLClass: 0,
-		Size:     uint64(seg.Size), NRecords: seg.NRecords, RawBytes: seg.RawBytes,
+		TTLClass: seg.TTLClass, MinExpMS: seg.MinExpMS, MaxExpMS: seg.MaxExpMS,
+		Size: uint64(seg.Size), NRecords: seg.NRecords, RawBytes: seg.RawBytes,
 		FooterOff: seg.FooterOff, FooterLen: seg.FooterLen,
 	})
 	if seg.CoveredSeq > g.foldSeq {

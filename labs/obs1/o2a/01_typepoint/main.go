@@ -248,7 +248,7 @@ func main() {
 		selems[i] = elem{disc: fp(f), blob: packSet(f)}
 		k := fmt.Appendf(nil, "str:%09d", i)
 		strs[i] = k
-		strElems[i] = elem{disc: fp(k), blob: store.AppendRecordFrame(nil, 0x01, 0, uint32(len(value)), k, value)}
+		strElems[i] = elem{disc: fp(k), blob: store.AppendRecordFrame(nil, 0x01, 0, uint32(len(value)), k, value, 0)}
 	}
 	hobj, hdir := build([]byte("h"), 0x0B, helems, ct)
 	sobj, sdir := build([]byte("s"), 0x0C, selems, ct)
