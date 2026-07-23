@@ -50,8 +50,22 @@ The 200k scored run had not been executed when the bands above were set.
 
 ## Results
 
-(scored run pending)
+```
+phase,ops,bucket_gets
+backlog_build,200000,0
+steady,4000,0
+drain,200000,0
+backlog_cold_bytes,10694640,
+segments_folded,2464,
+cold_fetches,0,
+cold_errs_unresolved,0,
+```
 
 ## Verdict
 
-(pending)
+HIT on all four bands.
+Every phase took exactly zero bucket GETs: the 200k build, the 4000 steady end ops under live fold pressure, and the full 200k-pop drain, which also came back byte-exact in FIFO order with EXISTS 0 at the end.
+Cold bytes after the build were 10,694,640, inside the 9.0 to 13.6 MB band (86 percent of the 12.4 MB payload demoted, the rest held by the resident cap and the per-end hot margin).
+The fold pipeline was live throughout (2464 segments folded, above the 1000 floor) and the cold reader finished with zero fetches and zero errors, so nothing on the bucket side moved at all.
+The ends-stay-hot contract holds as landed: interior-only demotion, pop-promote through the cold interior, exact FIFO, no bucket traffic.
+PRED-OBS1-O2B-QUEUE proper re-gates on the fold plane once the list slice lands emission.
