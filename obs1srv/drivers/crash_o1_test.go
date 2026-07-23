@@ -27,21 +27,21 @@ import (
 	"github.com/tamnd/aki/engine/obs1/sim"
 )
 
-// crashFaults scripts the two kill mechanisms: manDown blocks the
-// manifest CAS so folds strand orphan segments, chainDown blocks the
-// chain append so flushed WAL objects never commit, and frozen models
-// the process kill itself by refusing every write to the bucket while
-// the incarnation tears down.
+// crashFaults scripts the two outages: manDown blocks the manifest CAS
+// so folds strand orphan segments, and chainDown blocks the chain
+// append so flushed WAL objects never commit. The kill itself is a
+// teardown with the outage still armed: what the next boot sees is the
+// bucket state the outage froze, and any request teardown still lands
+// on a healthy surface is one the dying process could have landed too.
+// A blanket write freeze is deliberately not the model, because the
+// flusher retries transient PUT errors forever by design and a freeze
+// wedges its drain instead of killing it.
 type crashFaults struct {
 	manDown   atomic.Bool
 	chainDown atomic.Bool
-	frozen    atomic.Bool
 }
 
 func (f *crashFaults) fn(op sim.Op, key string) *sim.Fault {
-	if f.frozen.Load() && op != sim.OpGet {
-		return &sim.Fault{Err: errors.New("sim: bucket frozen at the kill point")}
-	}
 	if f.manDown.Load() && op == sim.OpPutIfAbsent && strings.Contains(key, "/man/") {
 		return &sim.Fault{Err: errors.New("sim: scripted manifest outage")}
 	}
@@ -51,14 +51,14 @@ func (f *crashFaults) fn(op sim.Op, key string) *sim.Fault {
 	return nil
 }
 
-// abandon is the kill: no barrier, no clean handshake, the bucket stops
-// taking writes and the incarnation is torn down with errors tolerated.
-func abandon(f *crashFaults, b *Booted, srv *Server, nc net.Conn) {
-	f.frozen.Store(true)
+// die is the kill: no barrier, no clean handshake, the incarnation is
+// torn down with errors tolerated while the scripted outage stays
+// armed. The caller disarms the outage only after the teardown, so
+// nothing slips through the dark surface on the way down.
+func die(b *Booted, srv *Server, nc net.Conn) {
 	nc.Close()
 	srv.Close()
 	_ = b.Close()
-	f.frozen.Store(false)
 }
 
 // getMaybe reads one GET reply that is allowed to be null: the tail of a
@@ -196,7 +196,7 @@ func TestCrashMidManifest(t *testing.T) {
 	if len(orphans) == 0 {
 		t.Fatal("the outage window folded no segments to strand")
 	}
-	abandon(&faults, b1, srv1, nc1)
+	die(b1, srv1, nc1)
 	faults.manDown.Store(false)
 
 	// The orphans are durably in the bucket, in slots no manifest names.
@@ -288,7 +288,7 @@ func TestCrashChainOutageUnderFoldLoad(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	abandon(&faults, b1, srv1, nc1)
+	die(b1, srv1, nc1)
 	faults.chainDown.Store(false)
 
 	// The next boot: fold state rebuilt, the committed prefix exact, and
