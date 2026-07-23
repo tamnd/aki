@@ -370,3 +370,83 @@ func TestRingCloseDrainsQueued(t *testing.T) {
 		t.Fatal("sync completion lost across Close")
 	}
 }
+
+// Three deterministic batching shapes: the counters expose how many
+// submit-side enters carried how many SQEs, and each shape below has
+// exactly one legal outcome regardless of completion timing.
+
+// A single Submit above the batch target enters exactly once: the
+// amortization the ring exists for.
+func TestRingBatchAmortize(t *testing.T) {
+	const ext = uint32(1 << 16)
+	const n = 24
+	r, _, comp := ringT(t, ext, 32, n)
+	reqs := make([]IOReq, n)
+	for i := range reqs {
+		reqs[i] = IOReq{
+			Op:  OpRead,
+			Ext: uint64(i / (int(ext) / GroupSize)),
+			Off: uint32(i%(int(ext)/GroupSize)) * GroupSize,
+			Buf: make([]byte, GroupSize),
+			Tag: uint64(i),
+		}
+	}
+	r.Submit(reqs)
+	for tag, err := range collectRing(t, comp, n) {
+		if err != nil {
+			t.Fatalf("read tag %d: %v", tag, err)
+		}
+	}
+	if enters, entered := r.EnterStats(); enters != 1 || entered != n {
+		t.Fatalf("EnterStats = %d enters, %d entered; want 1, %d", enters, entered, n)
+	}
+}
+
+// A batch below every threshold still leaves on the drain-window
+// tick, in one enter, because nothing was queued behind it.
+func TestRingBatchDrainTick(t *testing.T) {
+	const n = 4
+	r, _, comp := ringT(t, 1<<16, 32, n)
+	reqs := make([]IOReq, n)
+	for i := range reqs {
+		reqs[i] = IOReq{Op: OpRead, Ext: 0, Off: uint32(i) * GroupSize, Buf: make([]byte, GroupSize), Tag: uint64(i)}
+	}
+	r.Submit(reqs)
+	for tag, err := range collectRing(t, comp, n) {
+		if err != nil {
+			t.Fatalf("read tag %d: %v", tag, err)
+		}
+	}
+	if enters, entered := r.EnterStats(); enters != 1 || entered != n {
+		t.Fatalf("EnterStats = %d enters, %d entered; want 1, %d", enters, entered, n)
+	}
+}
+
+// A Submit wider than the SQ splits into exactly two enters: the
+// first flush fires on the full SQ, the remainder leaves either on
+// the pressure-lowered target or the drain tick, but never as more
+// than one enter.
+func TestRingBatchFullSQThenRemainder(t *testing.T) {
+	const ext = uint32(1 << 16)
+	const n = 40
+	r, _, comp := ringT(t, ext, 32, n)
+	reqs := make([]IOReq, n)
+	for i := range reqs {
+		reqs[i] = IOReq{
+			Op:  OpRead,
+			Ext: uint64(i / (int(ext) / GroupSize)),
+			Off: uint32(i%(int(ext)/GroupSize)) * GroupSize,
+			Buf: make([]byte, GroupSize),
+			Tag: uint64(i),
+		}
+	}
+	r.Submit(reqs)
+	for tag, err := range collectRing(t, comp, n) {
+		if err != nil {
+			t.Fatalf("read tag %d: %v", tag, err)
+		}
+	}
+	if enters, entered := r.EnterStats(); enters != 2 || entered != n {
+		t.Fatalf("EnterStats = %d enters, %d entered; want 2, %d", enters, entered, n)
+	}
+}

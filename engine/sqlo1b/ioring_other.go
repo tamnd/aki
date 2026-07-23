@@ -14,11 +14,12 @@ func RingProbe() error { return ErrRingUnsupported }
 // can mention it without build tags, but NewIORing never returns one.
 type IORing struct{}
 
-func (*IORing) Submit([]IOReq)    {}
-func (*IORing) Sync(uint64)       {}
-func (*IORing) Close()            {}
-func (*IORing) RegBufs() int      { return 0 }
-func (*IORing) RegBuf(int) []byte { return nil }
+func (*IORing) Submit([]IOReq)               {}
+func (*IORing) Sync(uint64)                  {}
+func (*IORing) Close()                       {}
+func (*IORing) RegBufs() int                 { return 0 }
+func (*IORing) RegBuf(int) []byte            { return nil }
+func (*IORing) EnterStats() (uint64, uint64) { return 0, 0 }
 
 // NewIORing reports ErrRingUnsupported: io_uring is Linux-only.
 func NewIORing(*os.File, uint32, int, int, chan<- IOResult) (*IORing, error) {
