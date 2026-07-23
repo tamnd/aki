@@ -157,18 +157,14 @@ func TestRecoverColdBoot(t *testing.T) {
 			t.Fatalf("group %d applied %d, emitted through %d", grp, r.Applied[grp], want)
 		}
 	}
-	// Group 0 replays only the frame above the fold cursor; the other
-	// groups replay everything.
-	if len(applied[0]) != 1 || applied[0][0] != delSeq+1 {
-		t.Fatalf("group 0 replayed %v, want exactly seq %d", applied[0], delSeq+1)
-	}
-	for grp := uint16(1); grp < 4; grp++ {
+	// Every group replays its full committed stream, group 0's folded
+	// prefix included: the fold cursor tolerates absent history but never
+	// skips frames that are still present, because the cursor can cover
+	// resident records no segment holds.
+	for grp := uint16(0); grp < 4; grp++ {
 		if len(applied[grp]) != int(cursor[grp]) {
 			t.Fatalf("group %d replayed %v, want %d frames", grp, applied[grp], cursor[grp])
 		}
-	}
-	if r.Stats.SectionsSkipped == 0 || r.Stats.FramesSkipped == 0 {
-		t.Fatalf("stats %+v, want the round 1 section skipped whole and the delete skipped in the straddle", r.Stats)
 	}
 	if r.NextWALSeq != 4 {
 		t.Fatalf("next WAL seq %d, want 4: two committed objects then the orphan", r.NextWALSeq)
