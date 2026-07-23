@@ -106,3 +106,22 @@ func (s *Store) AppendChunkFold(kind, flags byte, count uint16, key, disc, paylo
 	}
 	return off, ok
 }
+
+// EmitFoldChunk frames one packed chunk and hands it to the fold tap
+// without a local append: the folder ingests a frame byte-identical to an
+// AppendChunkFold frame, but the local region keeps no copy and no offset
+// exists. This is the dual-projection seam (spec 2064/obs1 doc 08 section
+// 5): the zset demoter's member-hash projection exists only on the fold
+// plane, where a planner floors point reads by the member coordinate,
+// while the local tier answers the same reads through its resident hash
+// probe and keeps a single score-ordered copy. Call it on the owner
+// goroutine like the staged drain. It reports false when no tap is wired,
+// which an emitter reads as folding off, not an error.
+func (s *Store) EmitFoldChunk(kind, flags byte, count uint16, key, disc, payload []byte) bool {
+	if s.foldTap == nil {
+		return false
+	}
+	s.frameBuf = appendChunkFrame(s.frameBuf[:0], kind|frameChunk, flags, count, key, disc, payload)
+	s.foldTap(s.frameBuf)
+	return true
+}
