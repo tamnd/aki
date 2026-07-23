@@ -105,6 +105,22 @@ type StoreStats struct {
 	// layer (MemStore, sqlo1a). INFO surfaces it because a gate run
 	// must know which backend ran (doc 13).
 	IOBackend string
+	// ExpiryClasses is the last bounded index sample by 2-bit expiry
+	// class (doc 11 section 1), indexed none/near/mid/far. It is an
+	// estimate from a sampling pass, not global accounting: zero until
+	// the backend has sampled, and stale between passes by design.
+	ExpiryClasses [4]ExpiryClassStat
+}
+
+// ExpiryClassStat is one expiry class's share of a bounded index
+// sample. Entries counts chunk entries seen in the class; Probed and
+// Expired count the due-plausible entries whose records were checked
+// exactly, so Expired over Probed is the class's expired-fraction
+// estimate. Classes the sampler skips (none, far) keep Probed zero.
+type ExpiryClassStat struct {
+	Entries int64
+	Probed  int64
+	Expired int64
 }
 
 // Store is the seam between the shared runtime and a backend (doc 02

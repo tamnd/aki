@@ -307,7 +307,7 @@ func (s *Store) relocate(rec *Record, raw []byte) error {
 	if !found {
 		return fmt.Errorf("sqlo1b: compaction entry for %x vanished mid-relocation", rec.Key)
 	}
-	meta, err := entryMetaFor(rec, h, chain[ci].WindowBase())
+	meta, err := s.entryMetaFor(rec, h, chain[ci].WindowBase())
 	if err != nil {
 		return err
 	}
