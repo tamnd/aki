@@ -14,9 +14,8 @@ The coldread shape issues batches of random group reads against a filled file an
 The drain shape writes groups sequentially with an fsync barrier at every extent boundary, the checkpoint rhythm the store's drain path pays.
 Every request is stamped with its batch's submit time, so a batch that queues on its own tail pays for it in p99.
 
-Two limits, both deliberate.
-Reads are page-cache warm, so the read rows price the submission path (syscalls, wakeups, copies), not device latency; the O_DIRECT arm arrives with slice 2 and the gate box reruns the sweep cold.
-The registered-buffer axis also joins at slice 2, once the ring can register a pool.
+Reads are page-cache warm unless -direct is set, so warm read rows price the submission path (syscalls, wakeups, copies), not device latency; the gate box reruns the sweep with -direct for the cold shape.
+The slice-2 axes: -regbuf N switches the ring arm's batch slots to the registered pool so READ_FIXED and WRITE_FIXED carry the IO, and -direct reopens the file O_DIRECT (ring only, requires -regbuf since the pool is the aligned memory; tmpfs refuses it, so run.sh tolerates that arm exiting 3).
 
 ## Run
 
@@ -27,7 +26,7 @@ Depth sweeps 2 to 32, batch sweeps 1 to 128, both shapes, both backends.
 
 ## CSV
 
-backend, workload, depth, batch, n, secs, ops_s, mb_s, p50_us, p99_us.
+backend, workload, depth, batch, regbuf, direct, n, secs, ops_s, mb_s, p50_us, p99_us.
 
 ## Verdict (provisional, server3 kernel 6.8, 2026-07-24)
 

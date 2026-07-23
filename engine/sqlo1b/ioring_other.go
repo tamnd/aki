@@ -14,11 +14,19 @@ func RingProbe() error { return ErrRingUnsupported }
 // can mention it without build tags, but NewIORing never returns one.
 type IORing struct{}
 
-func (*IORing) Submit([]IOReq) {}
-func (*IORing) Sync(uint64)    {}
-func (*IORing) Close()         {}
+func (*IORing) Submit([]IOReq)    {}
+func (*IORing) Sync(uint64)       {}
+func (*IORing) Close()            {}
+func (*IORing) RegBufs() int      { return 0 }
+func (*IORing) RegBuf(int) []byte { return nil }
 
 // NewIORing reports ErrRingUnsupported: io_uring is Linux-only.
-func NewIORing(*os.File, uint32, int, chan<- IOResult) (*IORing, error) {
+func NewIORing(*os.File, uint32, int, int, chan<- IOResult) (*IORing, error) {
+	return nil, ErrRingUnsupported
+}
+
+// OpenDirect reports ErrRingUnsupported: the own-caching O_DIRECT
+// mode belongs to the ring backend and is Linux-only with it.
+func OpenDirect(string) (*os.File, error) {
 	return nil, ErrRingUnsupported
 }

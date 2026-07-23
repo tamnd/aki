@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"unsafe"
 )
 
 // The ring tests skip, not fail, where io_uring is denied (Docker's
@@ -28,7 +29,7 @@ func ringT(t *testing.T, extentSize uint32, depth, compCap int) (*IORing, *os.Fi
 		t.Fatalf("truncate: %v", err)
 	}
 	comp := make(chan IOResult, compCap)
-	r, err := NewIORing(f, extentSize, depth, comp)
+	r, err := NewIORing(f, extentSize, depth, 0, comp)
 	if err != nil {
 		t.Fatalf("NewIORing: %v", err)
 	}
@@ -153,6 +154,171 @@ func TestRingManyInflight(t *testing.T) {
 	}
 }
 
+// ringRegT is ringT with a registered pool, skipping where the box
+// refuses registration (RLIMIT_MEMLOCK) like it skips where it
+// refuses the ring.
+func ringRegT(t *testing.T, extentSize uint32, depth, regBufs, compCap int) (*IORing, chan IOResult) {
+	t.Helper()
+	if err := RingProbe(); err != nil {
+		if errors.Is(err, ErrRingUnsupported) {
+			t.Skipf("io_uring unavailable here: %v", err)
+		}
+		t.Fatalf("RingProbe: %v", err)
+	}
+	f, err := os.Create(filepath.Join(t.TempDir(), "ring.dat"))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := f.Truncate(4 * int64(extentSize)); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	comp := make(chan IOResult, compCap)
+	r, err := NewIORing(f, extentSize, depth, regBufs, comp)
+	if err != nil {
+		f.Close()
+		if errors.Is(err, ErrRingUnsupported) {
+			t.Skipf("buffer registration unavailable here: %v", err)
+		}
+		t.Fatalf("NewIORing: %v", err)
+	}
+	t.Cleanup(func() { r.Close(); f.Close() })
+	return r, comp
+}
+
+func TestRingRegisteredRoundTrip(t *testing.T) {
+	const ext = uint32(1 << 16)
+	const half = 4
+	r, comp := ringRegT(t, ext, 8, 2*half, 16)
+	if r.RegBufs() != 2*half {
+		t.Fatalf("RegBufs = %d, want %d", r.RegBufs(), 2*half)
+	}
+
+	// Writes from the pool's first half, reads into the second, both
+	// on the fixed opcodes end to end.
+	writes := make([]IOReq, half)
+	for i := range writes {
+		buf := r.RegBuf(i)
+		for j := range buf {
+			buf[j] = byte(i*37 + 1)
+		}
+		writes[i] = IOReq{Op: OpWrite, Ext: uint64(i % 2), Off: uint32(i/2) * GroupSize, Buf: buf, Tag: uint64(i)}
+	}
+	r.Submit(writes)
+	for tag, err := range collectRing(t, comp, half) {
+		if err != nil {
+			t.Fatalf("write tag %d: %v", tag, err)
+		}
+	}
+	reads := make([]IOReq, half)
+	for i := range reads {
+		reads[i] = IOReq{Op: OpRead, Ext: uint64(i % 2), Off: uint32(i/2) * GroupSize, Buf: r.RegBuf(half + i), Tag: uint64(100 + i)}
+	}
+	r.Submit(reads)
+	for tag, err := range collectRing(t, comp, half) {
+		if err != nil {
+			t.Fatalf("read tag %d: %v", tag, err)
+		}
+	}
+	for i := range reads {
+		if !bytes.Equal(r.RegBuf(half+i), r.RegBuf(i)) {
+			t.Fatalf("registered read %d came back wrong", i)
+		}
+	}
+	if got := r.fixedOps.Load(); got != 2*half {
+		t.Fatalf("fixedOps = %d, want %d (every op should have ridden the fixed path)", got, 2*half)
+	}
+}
+
+func TestRingMixedFixedAndPlain(t *testing.T) {
+	const ext = uint32(1 << 16)
+	r, comp := ringRegT(t, ext, 8, 2, 8)
+	pool := r.RegBuf(0)
+	for j := range pool {
+		pool[j] = 0xEE
+	}
+	heap := bytes.Repeat([]byte{0xDD}, GroupSize)
+	r.Submit([]IOReq{
+		{Op: OpWrite, Ext: 0, Off: 0, Buf: pool, Tag: 1},
+		{Op: OpWrite, Ext: 0, Off: GroupSize, Buf: heap, Tag: 2},
+	})
+	for tag, err := range collectRing(t, comp, 2) {
+		if err != nil {
+			t.Fatalf("write tag %d: %v", tag, err)
+		}
+	}
+	back := make([]byte, 2*GroupSize)
+	r.Submit([]IOReq{{Op: OpRead, Ext: 0, Off: 0, Buf: back, Tag: 3}})
+	if res := <-comp; res.Err != nil {
+		t.Fatalf("read back: %v", res.Err)
+	}
+	if back[0] != 0xEE || back[GroupSize] != 0xDD {
+		t.Fatalf("mixed batch landed wrong: %#x %#x", back[0], back[GroupSize])
+	}
+	if got := r.fixedOps.Load(); got != 1 {
+		t.Fatalf("fixedOps = %d, want 1 (pool write fixed, heap write and oversized read plain)", got)
+	}
+}
+
+func TestRingRegBufAlignment(t *testing.T) {
+	r, _ := ringRegT(t, 1<<16, 4, 4, 4)
+	for i := range r.RegBufs() {
+		buf := r.RegBuf(i)
+		if len(buf) != GroupSize {
+			t.Fatalf("RegBuf(%d) len %d", i, len(buf))
+		}
+		if addr := uintptr(unsafe.Pointer(&buf[0])); addr%GroupSize != 0 {
+			t.Fatalf("RegBuf(%d) at %#x not %d-aligned for O_DIRECT", i, addr, GroupSize)
+		}
+	}
+}
+
+func TestRingODirect(t *testing.T) {
+	const ext = uint32(1 << 16)
+	if err := RingProbe(); err != nil {
+		t.Skipf("io_uring unavailable here: %v", err)
+	}
+	name := filepath.Join(t.TempDir(), "direct.dat")
+	plain, err := os.Create(name)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := plain.Truncate(int64(ext)); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	plain.Close()
+	f, err := OpenDirect(name)
+	if err != nil {
+		// tmpfs and some filesystems refuse O_DIRECT; that is the
+		// documented fallback condition, not a failure.
+		t.Skipf("O_DIRECT unavailable here: %v", err)
+	}
+	defer f.Close()
+	comp := make(chan IOResult, 4)
+	r, err := NewIORing(f, ext, 4, 2, comp)
+	if err != nil {
+		if errors.Is(err, ErrRingUnsupported) {
+			t.Skipf("ring with registration unavailable here: %v", err)
+		}
+		t.Fatalf("NewIORing: %v", err)
+	}
+	defer r.Close()
+	out := r.RegBuf(0)
+	for j := range out {
+		out[j] = 0x5A
+	}
+	r.Submit([]IOReq{{Op: OpWrite, Ext: 0, Off: 0, Buf: out, Tag: 1}})
+	if res := <-comp; res.Err != nil {
+		t.Fatalf("O_DIRECT write: %v", res.Err)
+	}
+	r.Submit([]IOReq{{Op: OpRead, Ext: 0, Off: 0, Buf: r.RegBuf(1), Tag: 2}})
+	if res := <-comp; res.Err != nil {
+		t.Fatalf("O_DIRECT read: %v", res.Err)
+	}
+	if !bytes.Equal(r.RegBuf(1), out) {
+		t.Fatal("O_DIRECT round trip came back wrong")
+	}
+}
+
 func TestRingValidation(t *testing.T) {
 	const ext = uint32(1 << 16)
 	r, _, comp := ringT(t, ext, 8, 16)
@@ -183,7 +349,7 @@ func TestRingCloseDrainsQueued(t *testing.T) {
 	}
 	const n = 64
 	comp := make(chan IOResult, n+1)
-	r, err := NewIORing(f, ext, 8, comp)
+	r, err := NewIORing(f, ext, 8, 0, comp)
 	if err != nil {
 		t.Fatalf("NewIORing: %v", err)
 	}
