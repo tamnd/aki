@@ -3,7 +3,9 @@ package zset
 import (
 	"encoding/binary"
 	"math"
+	"sort"
 
+	"github.com/tamnd/aki/engine/obs1"
 	"github.com/tamnd/aki/engine/obs1/store"
 	"github.com/tamnd/aki/engine/obs1/tier"
 )
@@ -21,24 +23,38 @@ import (
 //
 //   - The score is a resident record field (natRecord.bits), so cold demotion frees
 //     only the member slab bytes, never the score, and ZSCORE and ZRANK of a cold
-//     member stay resident zero-pread answers. The cold payload is member bytes
-//     only, the same length-prefixed encoding the set packs.
+//     member stay resident zero-pread answers. The score still travels in the
+//     chunk payload (the shared packed-pair codec, member for the field and the
+//     raw score bits for the value), because the folded copy of the chunk must be
+//     self-describing to a planner on another node (spec 2064/obs1 doc 08
+//     section 5); locally it is redundant with the resident record and never read.
 //   - The discriminator is score order, not hash order: a zset's logical order is
 //     score then member, so a cold chunk covers a contiguous score band. The
 //     discriminator is the sortable score key (codec.go scoreKey) as eight
 //     big-endian bytes followed by the member bytes, so the directory's
 //     byte-lexicographic order equals the zset's (score, member) order with no
-//     per-type comparator.
+//     per-type comparator. The fold plane lifts the leading eight bytes into the
+//     segment footer's FirstDisc, which is exactly the score key, so a folded
+//     score run is planned by score with no second coordinate.
 //
-// This file is the store-side encoding and the directory-backed reader; the demote
-// pass, the record retier, and the read-path wiring land in the following slices
-// (plan PRs D2, E), and the trigger composition in F.
+// The fold plane gets a second projection the local tier does not keep (doc 08
+// section 5): member-hash chunks, the same pairs re-sorted by the members' fold
+// coordinate (obs1.Disc), emitted through the tap only, so a folded ZSCORE floors
+// by member exactly as a hash field read does while the local tier answers member
+// reads through its resident hash probe. See demote for the emission.
 
-// kindZset is the collection kind byte a zset chunk carries, a plain kind below
-// frameChunk (store.AppendChunk sets the recovery bit itself), distinct from the
-// set's kindSet so an M8 recovery walk dispatches a cold chunk to the right
-// registry.
+// kindZset is the member-projection collection kind byte a folded zset member
+// chunk carries, a plain kind below frameChunk (store.AppendChunk sets the
+// recovery bit itself), distinct from the set's kindSet so a recovery walk or a
+// planner dispatches a cold chunk to the right registry and projection.
 const kindZset byte = 0x02
+
+// kindZsetScore is the score-run projection's kind byte (doc 08 section 5:
+// the projections are distinguished by chunk kind). The local cold region
+// holds only score runs; the fold plane holds both kinds under the one
+// collection key, and a planner filters by kind so a member floor never
+// lands on a score run.
+const kindZsetScore byte = 0x06
 
 // The chunk locator packs a cold record's loc within the low 31 bits: the high
 // coldSlotBits index the zset's offset table (which chunk) and the low
@@ -68,8 +84,10 @@ const (
 	// chunkByteTarget is the payload fill the demote pass packs a chunk to before
 	// flushing, so a chunk amortizes its frame header and directory slot over many
 	// members. A member that would overshoot still lands (the check is post-append),
-	// so the target is a floor on the fill, not a hard cap on the frame.
-	chunkByteTarget = 4096
+	// so the target is a floor on the fill, not a hard cap on the frame. The doc 08
+	// baked target (#1299), the same figure the set demoter packs to; the f3 port's
+	// 4096 retired with the dual-projection slice.
+	chunkByteTarget = obs1.ChunkTargetDefault
 )
 
 func packLoc(slot, entry uint32) uint32 { return slot<<coldEntryBits | entry }
@@ -103,7 +121,11 @@ func (c *coldChunks) member(loc uint32) ([]byte, bool) {
 	if !ok {
 		return nil, false
 	}
-	return chunkEntry(ck.Payload, int(locEntry(loc)))
+	p, ok := store.PackedPairAt(ck.Payload, ck.Flags, ck.Count, int(locEntry(loc)))
+	if !ok {
+		return nil, false
+	}
+	return p.Field, true
 }
 
 // markDirty flags the chunk owning disc as needing a repack, the resident record a
@@ -141,31 +163,17 @@ func discOf(scoreKey uint64, member []byte) []byte {
 	return d
 }
 
-// appendEntry packs one member into a chunk payload: an unsigned-varint length then
-// the raw bytes. The entry index a locator carries is the ordinal position in this
-// stream, which chunkEntry walks to. The score is not packed; it stays resident in
-// the member's record.
-func appendEntry(payload, m []byte) []byte {
-	payload = binary.AppendUvarint(payload, uint64(len(m)))
-	return append(payload, m...)
-}
-
-// chunkEntry returns the idx-th member packed in payload, or false when the payload
-// is torn or shorter than idx+1 entries. It walks the length-prefixed stream; a
-// chunk holds at most maxChunkEntry members, so the walk is bounded.
-func chunkEntry(payload []byte, idx int) ([]byte, bool) {
-	p := payload
-	for i := 0; ; i++ {
-		n, w := binary.Uvarint(p)
-		if w <= 0 || uint64(len(p)-w) < n {
-			return nil, false
-		}
-		p = p[w:]
-		if i == idx {
-			return p[:n], true
-		}
-		p = p[n:]
-	}
+// scoreBytes renders a member's raw IEEE-754 score bits as the packed pair's
+// eight-byte big-endian value. The raw bits, not the sortable key: the value only
+// has to decode exactly on a fold-plane read (a folded -0.0 keeps its sign, the
+// same bits the resident record carries), while the order a score run packs in
+// comes from the tree walk and the chunk discriminator, which use the sortable
+// key. The entry index a locator carries is the ordinal position in the packed
+// stream, which PackedPairAt walks to.
+func scoreBytes(bits uint64) []byte {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], bits)
+	return b[:]
 }
 
 // demote packs the coldest resident members of the native band into cold chunks,
@@ -180,6 +188,15 @@ func chunkEntry(payload []byte, idx int) ([]byte, bool) {
 // leaves the band fully resident (the orphan frames the append-only region holds are
 // dead space the compactor reclaims), so demotion degrades to a no-op rather than a
 // torn band. It returns the number of members demoted.
+//
+// The fold plane hears both projections (doc 08 section 5). The score runs go
+// through the fold seam as they append, and once every append has succeeded the
+// same pairs re-sort by the members' fold coordinate and emit as member-hash
+// chunks through the tap alone: no local copy, no offset, because the local tier
+// answers member reads through the resident hash probe. A refused append returns
+// before the member emission, so a fold never carries a member projection whose
+// score runs it refused; score runs already tapped for an abandoned quantum are
+// shadowed by the overlay exactly like any stale fold copy (T-I2).
 func (n *nativeStore) demote(st *store.Store, key []byte, quantum int) int {
 	if quantum <= 0 {
 		return 0
@@ -209,18 +226,20 @@ func (n *nativeStore) demote(st *store.Store, key []byte, quantum int) int {
 		return 0
 	}
 
-	// Pack and append every chunk first, collecting the placements; commit the
+	// Pack and append every score run first, collecting the placements; commit the
 	// directory and the retier only after all appends succeed. The first member of a
 	// chunk supplies the discriminator, the score key plus member bytes, so the
-	// directory orders the chunks by (score, member). discOf and appendEntry both copy
+	// directory orders the chunks by (score, member). discOf and the packer both copy
 	// their input, so the placements stay valid after the retier rewrites loc below.
+	// The pairs pack (member, raw score bits) through the shared codec, so the frame
+	// the fold seam taps is self-describing to a fold-plane reader.
 	type placed struct {
 		off  uint64
 		disc []byte
 		ords []uint32
 	}
 	var chunks []placed
-	var payload []byte
+	var pk store.ChunkPacker
 	var ords []uint32
 	var disc []byte
 	for i, e := range ents {
@@ -232,17 +251,50 @@ func (n *nativeStore) demote(st *store.Store, key []byte, quantum int) int {
 		if len(ords) == 0 {
 			disc = discOf(scoreKey(math.Float64frombits(e.bits)), m)
 		}
-		payload = appendEntry(payload, m)
+		pk.Add(m, scoreBytes(e.bits), 0)
 		ords = append(ords, e.ord)
-		full := len(payload) >= chunkByteTarget || len(ords) >= maxChunkEntry
+		full := pk.Bytes() >= chunkByteTarget || pk.Count() >= maxChunkEntry
 		if full || i == len(ents)-1 {
-			off, ok := cc.st.AppendChunk(kindZset, 0, uint16(len(ords)), key, disc, payload)
+			payload, flags := pk.Finish()
+			off, ok := cc.st.AppendChunkFold(kindZsetScore, flags, uint16(pk.Count()), key, disc, payload)
 			if !ok {
 				return 0 // broken region: abandon, the band stays fully resident
 			}
 			chunks = append(chunks, placed{off: off, disc: disc, ords: append([]uint32(nil), ords...)})
-			payload = payload[:0]
+			pk.Reset()
 			ords = ords[:0]
+		}
+	}
+
+	// The member projection: every packed pair again, sorted by the members' fold
+	// coordinate, emitted to the segment folder only. The slab is still intact here
+	// (the retier below only rewrites loc), so the member bytes read straight out of
+	// it, and EmitFoldChunk gates itself on a wired tap, so a store without a fold
+	// plane pays nothing.
+	type memberEnt struct {
+		ord uint32
+		d   uint64
+	}
+	var mem []memberEnt
+	for _, c := range chunks {
+		for _, ord := range c.ords {
+			r := &n.recs[ord]
+			mem = append(mem, memberEnt{ord: ord, d: obs1.Disc(n.slab[r.loc : r.loc+r.mlen])})
+		}
+	}
+	sort.Slice(mem, func(i, j int) bool { return mem[i].d < mem[j].d })
+	pk.Reset()
+	var mdisc [8]byte
+	for i, e := range mem {
+		r := &n.recs[e.ord]
+		if pk.Count() == 0 {
+			binary.BigEndian.PutUint64(mdisc[:], e.d)
+		}
+		pk.Add(n.slab[r.loc:r.loc+r.mlen], scoreBytes(r.bits), 0)
+		if pk.Bytes() >= chunkByteTarget || pk.Count() >= maxChunkEntry || i == len(mem)-1 {
+			payload, flags := pk.Finish()
+			cc.st.EmitFoldChunk(kindZset, flags, uint16(pk.Count()), key, mdisc[:], payload)
+			pk.Reset()
 		}
 	}
 
@@ -337,12 +389,12 @@ func (n *nativeStore) promote(ord uint32) bool {
 		if rr.loc&tierCold == 0 || int(locSlot(rr.loc)) != slot {
 			return true
 		}
-		mm, ok := chunkEntry(ck.Payload, int(locEntry(rr.loc)))
+		p, ok := store.PackedPairAt(ck.Payload, ck.Flags, ck.Count, int(locEntry(rr.loc)))
 		if !ok {
 			return true // a torn entry stays cold; its read path still preads it
 		}
 		rr.loc = uint32(len(n.slab))
-		n.slab = append(n.slab, mm...)
+		n.slab = append(n.slab, p.Field...)
 		return true
 	})
 	cc.dir.Remove(idx)

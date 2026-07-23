@@ -82,8 +82,8 @@ const coldSlotBits = 31 - coldEntryBits
 
 // TestChunkReadback packs a run of members into cold chunks the way the demote
 // pass will, then reads each back through its locator. It proves the store-side
-// encoding (appendEntry, AppendChunk) and the reader (member, chunkEntry, the
-// offset table) agree on the packed layout end to end.
+// encoding (the packed-pair codec, AppendChunk) and the reader (member,
+// PackedPairAt, the offset table) agree on the packed layout end to end.
 func TestChunkReadback(t *testing.T) {
 	st := coldStore(t)
 	c := &coldChunks{st: st}
@@ -110,12 +110,13 @@ func TestChunkReadback(t *testing.T) {
 		if end > len(ents) {
 			end = len(ents)
 		}
-		var payload []byte
+		var pk store.ChunkPacker
 		for j := start; j < end; j++ {
-			payload = appendEntry(payload, ents[j].member)
+			pk.Add(ents[j].member, scoreBytes(ents[j].score), 0)
 		}
+		payload, flags := pk.Finish()
 		disc := discOf(ents[start].score, ents[start].member)
-		off, ok := c.st.AppendChunk(kindZset, 0, uint16(end-start), key, disc, payload)
+		off, ok := c.st.AppendChunk(kindZsetScore, flags, uint16(end-start), key, disc, payload)
 		if !ok {
 			t.Fatalf("AppendChunk chunk starting at %d failed", start)
 		}
@@ -187,21 +188,22 @@ func TestDiscOrder(t *testing.T) {
 	}
 }
 
-// TestChunkEntryTorn proves the walker rejects a truncated payload rather than
-// reading past it: a length prefix that claims more bytes than remain is a clean
-// false, which a cold read reports as a miss.
+// TestChunkEntryTorn proves the packed-pair walker rejects a truncated payload
+// rather than reading past it: a truncated tail is a clean false, which a cold
+// read reports as a miss.
 func TestChunkEntryTorn(t *testing.T) {
-	good := appendEntry(nil, []byte("hello"))
-	if m, ok := chunkEntry(good, 0); !ok || string(m) != "hello" {
-		t.Fatalf("chunkEntry(good,0) = %q,%v", m, ok)
+	var pk store.ChunkPacker
+	pk.Add([]byte("hello"), scoreBytes(7), 0)
+	payload, flags := pk.Finish()
+	if p, ok := store.PackedPairAt(payload, flags, 1, 0); !ok || string(p.Field) != "hello" {
+		t.Fatalf("PackedPairAt(good,0) = %q,%v", p.Field, ok)
 	}
-	if _, ok := chunkEntry(good, 1); ok {
-		t.Fatal("chunkEntry past the last entry should miss")
+	if _, ok := store.PackedPairAt(payload, flags, 1, 1); ok {
+		t.Fatal("PackedPairAt past the last entry should miss")
 	}
-	// A length prefix of 5 with only 2 bytes behind it is torn.
-	torn := append([]byte{5}, 'h', 'i')
-	if _, ok := chunkEntry(torn, 0); ok {
-		t.Fatal("chunkEntry on a torn payload should miss")
+	// Cutting bytes off the tail while claiming the same count is torn.
+	if _, ok := store.PackedPairAt(payload[:len(payload)-3], flags, 1, 0); ok {
+		t.Fatal("PackedPairAt on a torn payload should miss")
 	}
 }
 
@@ -217,7 +219,10 @@ func TestColdResidentAndDirty(t *testing.T) {
 
 	key := []byte("z")
 	disc := discOf(3, []byte("m"))
-	off, ok := c.st.AppendChunk(kindZset, 0, 1, key, disc, appendEntry(nil, []byte("m")))
+	var pk store.ChunkPacker
+	pk.Add([]byte("m"), scoreBytes(3), 0)
+	payload, flags := pk.Finish()
+	off, ok := c.st.AppendChunk(kindZsetScore, flags, 1, key, disc, payload)
 	if !ok {
 		t.Fatal("AppendChunk failed")
 	}
