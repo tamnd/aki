@@ -186,6 +186,12 @@ type Store struct {
 	// nowMS is the expiry clock, injectable in tests.
 	nowMS func() int64
 
+	// Expiry sampling state (doc 11 section 3.3 substrate): expCursor
+	// is the next bucket a SampleExpiry pass starts from, expSample the
+	// last pass's per-class tallies, copied out by Stats.
+	expCursor uint64
+	expSample [4]sqlo1.ExpiryClassStat
+
 	// ckptCrash threads a step failpoint into the Checkpointer.
 	ckptCrash func(step int) error
 
@@ -1400,7 +1406,7 @@ func (s *Store) indexPut(rec *Record, pos Pos) error {
 		return err
 	}
 	if found {
-		meta, err := entryMetaFor(rec, h, chain[ci].WindowBase())
+		meta, err := s.entryMetaFor(rec, h, chain[ci].WindowBase())
 		if err != nil {
 			return err
 		}
@@ -1438,7 +1444,7 @@ func (s *Store) insertNew(bucket uint64, chain []*Chunk, fp uint16, rec *Record,
 		s.dirty[bucket] = chain
 		last = nc
 	}
-	meta, err := entryMetaFor(rec, h, last.WindowBase())
+	meta, err := s.entryMetaFor(rec, h, last.WindowBase())
 	if err != nil {
 		return err
 	}
@@ -1489,7 +1495,7 @@ func (s *Store) applyGenbump(key []byte, newgen uint32) error {
 		return err
 	}
 	if found {
-		meta, err := entryMetaFor(rec, h, chain[ci].WindowBase())
+		meta, err := s.entryMetaFor(rec, h, chain[ci].WindowBase())
 		if err != nil {
 			return err
 		}
@@ -1537,7 +1543,7 @@ func (s *Store) applyLease(mark uint64) error {
 		return err
 	}
 	if found {
-		meta, err := entryMetaFor(rec, h, chain[ci].WindowBase())
+		meta, err := s.entryMetaFor(rec, h, chain[ci].WindowBase())
 		if err != nil {
 			return err
 		}
@@ -1728,13 +1734,40 @@ func (s *Store) rootLive(rooth uint64, rootgen uint32) (bool, error) {
 	return rootgen >= g, nil
 }
 
+// Expiry class horizons (doc 11 section 1): near covers cache-style
+// TTLs so an extent full of them reads as reclaimable within a
+// compaction cadence, far means nothing due for days so the sampling
+// reaper can skip the chunk. Provisional until the reaper lab bakes
+// them (T7).
+const (
+	expNearHorizonMS = 4 * 60 * 60 * 1000      // 4 hours
+	expMidHorizonMS  = 3 * 24 * 60 * 60 * 1000 // 3 days
+)
+
+// expClassFor buckets an absolute expiry against now. Already-expired
+// lands in near: it is the most due a record can be.
+func expClassFor(expireMS uint64, nowMS int64) uint8 {
+	d := int64(expireMS) - nowMS
+	switch {
+	case d <= expNearHorizonMS:
+		return ExpClassNear
+	case d <= expMidHorizonMS:
+		return ExpClassMid
+	default:
+		return ExpClassFar
+	}
+}
+
 // entryMetaFor packs the chunk entry meta for a record landing in a
-// chain with the given window base. Every expiring record sits in
-// the near class for now; the WATT slice assigns real classes.
-func entryMetaFor(rec *Record, h uint64, base uint8) (uint16, error) {
+// chain with the given window base. The class is assigned against the
+// clock at write time, so overwrites and compaction relocations
+// refresh it as the deadline approaches; a stale far class only ever
+// errs toward the reaper skipping a chunk, never toward visibility
+// (lazy expiry is the correctness layer).
+func (s *Store) entryMetaFor(rec *Record, h uint64, base uint8) (uint16, error) {
 	cls := uint8(ExpClassNone)
 	if rec.HasExpiry() {
-		cls = ExpClassNear
+		cls = expClassFor(rec.ExpireMS, s.nowMS())
 	}
 	m, err := MakeEntryMeta(rec.RType, cls, rec.RType == RecRoot)
 	if err != nil {
@@ -2036,6 +2069,64 @@ func (s *Store) Scan(ctx context.Context, cur sqlo1.Cursor, fn func(sqlo1.Record
 	return nil, nil
 }
 
+// SampleExpiry runs one bounded pass over the cold index, tallying
+// chunk entries by expiry class and probing the due-plausible classes
+// (near, mid) for exact expiry; none and far entries are counted from
+// meta alone, which is the doc 11 section 3.3 skip that keeps the
+// pass cheap on non-volatile keyspaces. The pass covers at most
+// maxChunks chunks, resumes from where the last one stopped, and
+// replaces the estimate Stats reports. It changes nothing: reaping
+// belongs to compaction and the sampling reaper slice.
+func (s *Store) SampleExpiry(maxChunks int) ([4]sqlo1.ExpiryClassStat, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broken != nil {
+		return [4]sqlo1.ExpiryClassStat{}, s.broken
+	}
+	var out [4]sqlo1.ExpiryClassStat
+	now := s.nowMS()
+	n := NumBuckets(s.level, s.split)
+	if s.expCursor >= n {
+		s.expCursor = 0
+	}
+	budget := maxChunks
+	for range n {
+		if budget <= 0 {
+			break
+		}
+		bkt := s.expCursor
+		s.expCursor = (s.expCursor + 1) % n
+		chain, ok := s.dirty[bkt]
+		if !ok {
+			var err error
+			if chain, err = s.coldChain(bkt); err != nil {
+				return out, err
+			}
+		}
+		for _, c := range chain {
+			budget--
+			for i := range c.Count() {
+				_, meta, vptr := c.EntryAt(i)
+				cls := MetaExpiryClass(meta)
+				out[cls].Entries++
+				if cls != ExpClassNear && cls != ExpClassMid {
+					continue
+				}
+				rec, err := s.resolveAt(Pos(vptr))
+				if err != nil {
+					return out, err
+				}
+				out[cls].Probed++
+				if rec.HasExpiry() && int64(rec.ExpireMS) <= now {
+					out[cls].Expired++
+				}
+			}
+		}
+	}
+	s.expSample = out
+	return out, nil
+}
+
 // Stats reports the store's own accounting. Keys counts index
 // entries, so expired-but-unreaped records and generation records are
 // included until a delete or compaction removes them. Get, BatchGet,
@@ -2063,6 +2154,7 @@ func (s *Store) Stats() sqlo1.StoreStats {
 	st.FrameDecodes = int64(fs.Decodes)
 	st.FrameDecodeBytes = int64(fs.DecodeBytes)
 	st.FrameHits = int64(fs.Hits)
+	st.ExpiryClasses = s.expSample
 	return st
 }
 
