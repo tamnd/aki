@@ -18,8 +18,9 @@
 //
 // Collection frames apply through each type package's exported Replay
 // functions with plain arguments, so the registries' shapes stay
-// private. The set and hash planes are wired; the remaining collection
-// kinds are refused loudly until their planes land, never skipped.
+// private. The set, hash, and zset planes are wired; the remaining
+// collection kinds are refused loudly until their planes land, never
+// skipped.
 package replay
 
 import (
@@ -31,6 +32,7 @@ import (
 	"github.com/tamnd/aki/engine/obs1/hash"
 	"github.com/tamnd/aki/engine/obs1/set"
 	"github.com/tamnd/aki/engine/obs1/shard"
+	"github.com/tamnd/aki/engine/obs1/zset"
 )
 
 // Config wires an Applier.
@@ -62,6 +64,8 @@ type Stats struct {
 	HSets     uint64
 	HDels     uint64
 	HExpires  uint64
+	ZAdds     uint64
+	ZRems     uint64
 }
 
 // pending is one buffered frame inside an open txn run. The key and
@@ -206,6 +210,9 @@ func (a *Applier) applyOne(group uint16, key []byte, op obs1.Op) error {
 		if hash.ReplayDrop(cx, key) {
 			hit = true
 		}
+		if zset.ReplayDrop(cx, key) {
+			hit = true
+		}
 		if hit {
 			a.stats.Dels++
 		} else {
@@ -233,7 +240,7 @@ func (a *Applier) applyOne(group uint16, key []byte, op obs1.Op) error {
 		// The hint bytes are doc 08's encoding hints, opaque here and
 		// empty from every current emitter; application waits for the
 		// paired delta, which carries the members that decide the shape.
-		if o.Type != obs1.CollSet && o.Type != obs1.CollHash {
+		if o.Type != obs1.CollSet && o.Type != obs1.CollHash && o.Type != obs1.CollZSet {
 			return fmt.Errorf("obs1 replay: collnew type 0x%02x is not wired for replay yet", o.Type)
 		}
 		a.news[group] = fresh{key: key, typ: o.Type}
@@ -242,7 +249,7 @@ func (a *Applier) applyOne(group uint16, key []byte, op obs1.Op) error {
 		return a.applyDelta(cx, key, o, false, 0)
 	case obs1.CollDrop:
 		// Typed drop, so a miss is corruption, unlike keydel's probe.
-		if !set.ReplayDrop(cx, key) && !hash.ReplayDrop(cx, key) {
+		if !set.ReplayDrop(cx, key) && !hash.ReplayDrop(cx, key) && !zset.ReplayDrop(cx, key) {
 			return fmt.Errorf("obs1 replay: colldrop names key %q but no collection exists", key)
 		}
 		a.stats.CollDrops++
@@ -291,6 +298,17 @@ func (a *Applier) applyDelta(cx *shard.Ctx, key []byte, d obs1.CollDelta, create
 			return err
 		}
 		a.stats.HExpires++
+	case obs1.ZAdd:
+		scores, members := splitEntries(s.Entries)
+		if err := zset.ReplayZAdd(cx, key, scores, members, create); err != nil {
+			return err
+		}
+		a.stats.ZAdds++
+	case obs1.ZRem:
+		if err := zset.ReplayZRem(cx, key, s.Members); err != nil {
+			return err
+		}
+		a.stats.ZRems++
 	default:
 		return fmt.Errorf("obs1 replay: colldelta sub-op %T is not wired for replay yet", d.Sub)
 	}
@@ -307,6 +325,18 @@ func flattenPairs(pairs []obs1.FieldValue) [][]byte {
 	return out
 }
 
+// splitEntries lays scored pairs out as the parallel slices the zset
+// seam speaks, the same shape the emission side consumed.
+func splitEntries(entries []obs1.ScoreMember) ([]float64, [][]byte) {
+	scores := make([]float64, len(entries))
+	members := make([][]byte, len(entries))
+	for i, e := range entries {
+		scores[i] = e.Score
+		members[i] = e.Member
+	}
+	return scores, members
+}
+
 // deltaType maps a wired sub-op to the collection type its collnew must
 // carry; wired is false for the sub-ops whose planes have not landed.
 func deltaType(sub obs1.CollSub) (typ uint8, wired bool) {
@@ -315,6 +345,8 @@ func deltaType(sub obs1.CollSub) (typ uint8, wired bool) {
 		return obs1.CollSet, true
 	case obs1.HSet, obs1.HDel, obs1.HExpire:
 		return obs1.CollHash, true
+	case obs1.ZAdd, obs1.ZRem:
+		return obs1.CollZSet, true
 	}
 	return 0, false
 }

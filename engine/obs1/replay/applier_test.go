@@ -10,6 +10,7 @@ import (
 	"github.com/tamnd/aki/engine/obs1/set"
 	"github.com/tamnd/aki/engine/obs1/shard"
 	"github.com/tamnd/aki/engine/obs1/store"
+	"github.com/tamnd/aki/engine/obs1/zset"
 )
 
 func newApplier(t *testing.T) (*replay.Applier, *shard.Ctx) {
@@ -387,19 +388,133 @@ func TestApplierHashCorruptionIsLoud(t *testing.T) {
 	}
 }
 
+// TestApplierZSetPlane replays the emitter shapes writelog.go frames for
+// sorted sets: collnew plus zadd on create, a rescoring zadd on an
+// existing sorted set, zrem, and the zrem plus colldrop pair when the
+// last member leaves, with a STORE-shape reset over the live key.
+func TestApplierZSetPlane(t *testing.T) {
+	a, cx := newApplier(t)
+
+	sm := func(pairs ...any) []obs1.ScoreMember {
+		out := make([]obs1.ScoreMember, len(pairs)/2)
+		for i := range out {
+			out[i] = obs1.ScoreMember{Score: pairs[2*i].(float64), Member: []byte(pairs[2*i+1].(string))}
+		}
+		return out
+	}
+	m := func(ss ...string) [][]byte {
+		out := make([][]byte, len(ss))
+		for i, s := range ss {
+			out[i] = []byte(s)
+		}
+		return out
+	}
+	apply(t, a, 0, frame(t, 1, "z", obs1.CollNew{Type: obs1.CollZSet}))
+	apply(t, a, 0, frame(t, 2, "z", obs1.CollDelta{Sub: obs1.ZAdd{Entries: sm(1.0, "a", 2.0, "b")}}))
+	apply(t, a, 0, frame(t, 3, "z", obs1.CollDelta{Sub: obs1.ZAdd{Entries: sm(5.5, "a", 3.0, "c")}}))
+	apply(t, a, 0, frame(t, 4, "z", obs1.CollDelta{Sub: obs1.ZRem{Members: m("b")}}))
+	if !zsetHolds(cx, "z", "a", 5.5) {
+		t.Fatalf("a does not hold the rescored 5.5")
+	}
+	if !zsetHolds(cx, "z", "c", 3.0) {
+		t.Fatalf("c does not hold 3.0")
+	}
+	if err := zset.ReplayZRem(cx, []byte("z"), m("b")); err == nil {
+		t.Fatalf("b survived its zrem")
+	}
+
+	// STORE shape: a collnew over the live key resets it wholesale.
+	apply(t, a, 0, frame(t, 5, "z", obs1.CollNew{Type: obs1.CollZSet}))
+	apply(t, a, 0, frame(t, 6, "z", obs1.CollDelta{Sub: obs1.ZAdd{Entries: sm(9.0, "only")}}))
+	if err := zset.ReplayZRem(cx, []byte("z"), m("a")); err == nil {
+		t.Fatalf("a survived the reset-to-empty collnew")
+	}
+
+	apply(t, a, 0, frame(t, 7, "z", obs1.CollDelta{Sub: obs1.ZRem{Members: m("only")}}))
+	apply(t, a, 0, frame(t, 8, "z", obs1.CollDrop{}))
+	if zset.ReplayDrop(cx, []byte("z")) {
+		t.Fatalf("z survived its colldrop")
+	}
+
+	apply(t, a, 0, frame(t, 9, "kd", obs1.CollNew{Type: obs1.CollZSet}))
+	apply(t, a, 0, frame(t, 10, "kd", obs1.CollDelta{Sub: obs1.ZAdd{Entries: sm(1.0, "m")}}))
+	apply(t, a, 0, frame(t, 11, "kd", obs1.KeyDel{}))
+	if zset.ReplayDrop(cx, []byte("kd")) {
+		t.Fatalf("the sorted set survived its keydel")
+	}
+	if err := a.Finish(); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if got := a.Stats(); got.ZAdds != 4 || got.ZRems != 2 || got.CollNews != 3 || got.CollDrops != 1 || got.Dels != 1 {
+		t.Fatalf("stats %+v, want the zset plane counts", got)
+	}
+}
+
+// zsetHolds probes a replayed score by upserting the member at that
+// score and reading the strictness refusal: a no-effect upsert is the
+// one way ReplayZAdd errors on a live pair, so the refusal proves the
+// member already holds the score. Kept test-local so the production
+// surface stays the three entry points.
+func zsetHolds(cx *shard.Ctx, key, member string, score float64) bool {
+	err := zset.ReplayZAdd(cx, []byte(key), []float64{score}, [][]byte{[]byte(member)}, false)
+	return err != nil && strings.Contains(err.Error(), "already holds its score")
+}
+
+// TestApplierZSetCorruptionIsLoud drives the divergences the zset plane
+// must refuse: deltas on a missing sorted set, a pair framed as upserted
+// that changes nothing, and a zrem of an absent member.
+func TestApplierZSetCorruptionIsLoud(t *testing.T) {
+	one := []obs1.ScoreMember{{Score: 1, Member: []byte("m")}}
+	cases := []struct {
+		name string
+		ops  []obs1.Op
+		want string
+	}{
+		{"zadd on missing zset", []obs1.Op{obs1.CollDelta{Sub: obs1.ZAdd{Entries: one}}}, "no sorted set exists"},
+		{"zrem on missing zset", []obs1.Op{obs1.CollDelta{Sub: obs1.ZRem{Members: [][]byte{[]byte("m")}}}}, "no sorted set exists"},
+		{"no-effect upsert", []obs1.Op{
+			obs1.CollNew{Type: obs1.CollZSet},
+			obs1.CollDelta{Sub: obs1.ZAdd{Entries: one}},
+			obs1.CollDelta{Sub: obs1.ZAdd{Entries: one}},
+		}, "already holds its score"},
+		{"absent remove", []obs1.Op{
+			obs1.CollNew{Type: obs1.CollZSet},
+			obs1.CollDelta{Sub: obs1.ZAdd{Entries: one}},
+			obs1.CollDelta{Sub: obs1.ZRem{Members: [][]byte{[]byte("ghost")}}},
+		}, "is not in sorted set"},
+		{"collnew zset consumed by sadd", []obs1.Op{
+			obs1.CollNew{Type: obs1.CollZSet},
+			obs1.CollDelta{Sub: obs1.SAdd{Members: [][]byte{[]byte("m")}}},
+		}, "followed by sub-op"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _ := newApplier(t)
+			var err error
+			for i, op := range tc.ops {
+				if err = a.Apply(0, frame(t, uint64(i+1), "c", op)); err != nil {
+					break
+				}
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
 // TestApplierRefusesUnwiredKinds keeps the loud refusal for the planes
 // that have not landed: the other collection types and the consumer
 // group vocabulary.
 func TestApplierRefusesUnwiredKinds(t *testing.T) {
 	a, _ := newApplier(t)
-	if err := a.Apply(0, frame(t, 1, "z", obs1.CollNew{Type: obs1.CollZSet})); err == nil ||
+	if err := a.Apply(0, frame(t, 1, "l", obs1.CollNew{Type: obs1.CollList})); err == nil ||
 		!strings.Contains(err.Error(), "not wired for replay yet") {
-		t.Fatalf("collnew zset: %v", err)
+		t.Fatalf("collnew list: %v", err)
 	}
-	entries := []obs1.ScoreMember{{Score: 1, Member: []byte("m")}}
-	if err := a.Apply(0, frame(t, 2, "z", obs1.CollDelta{Sub: obs1.ZAdd{Entries: entries}})); err == nil ||
+	if err := a.Apply(0, frame(t, 2, "l", obs1.CollDelta{Sub: obs1.LPush{Values: [][]byte{[]byte("v")}}})); err == nil ||
 		!strings.Contains(err.Error(), "not wired for replay yet") {
-		t.Fatalf("colldelta zadd: %v", err)
+		t.Fatalf("colldelta lpush: %v", err)
 	}
 	gd := obs1.GroupDelta{Sub: obs1.GNew{Group: []byte("g")}}
 	if err := a.Apply(0, frame(t, 3, "st", gd)); err == nil || !strings.Contains(err.Error(), "not wired yet") {
