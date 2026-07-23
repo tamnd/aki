@@ -9,14 +9,18 @@
 // moment its watermark gate opens, before the keymap placements apply,
 // so the keymap never points at a segment the directory cannot resolve.
 // Takeover rebuilds it from the manifest with one ranged footer GET per
-// segment. Chunk keys are not retained: the keymap locates whole-record
-// run chunks by position alone, and nothing produces collection chunks
-// yet, so the per-chunk key column waits for the demoters that need it.
+// segment. Chunk key bytes are not retained: the keymap locates
+// whole-record run chunks by position alone, and a collection chunk
+// keeps only its key's u64 fingerprint, which is all the field planner
+// needs to gather one collection's chunks inside a segment.
 package obs1
 
 import (
 	"fmt"
+	"sort"
 	"sync"
+
+	"github.com/tamnd/aki/engine/obs1/store"
 )
 
 // DirRef is a resolved locator: the object to GET, the block's index row
@@ -30,15 +34,24 @@ type DirRef struct {
 }
 
 // dirChunk is the resident cut of one SegmentChunkEntry: placement plus
-// the run facts scan planning and rewrite selection read. 24 bytes.
+// the run facts scan planning and rewrite selection read, and for a
+// collection chunk the key's fingerprint, which is what lets the field
+// planner gather one collection's chunks without retaining key bytes
+// (the doc 05 cost rule: the directory stays per-chunk, and a u64 is the
+// per-chunk price of collection planning).
 type dirChunk struct {
 	block     uint32
 	off       uint32
 	firstDisc uint64
+	fp        uint64 // bloomHash h1 of the chunk key; collection chunks only
 	kind      uint8
+	flags     uint8
 	count     uint16
 	liveHint  uint16
 }
+
+// dirChunkCost is the accounting charge per resident chunk entry.
+const dirChunkCost = 32
 
 // dirSeg is one live segment: its object key, block index, and chunk
 // index.
@@ -92,7 +105,11 @@ func (d *Directory) Add(objKey string, f *SegmentFooter) error {
 		}
 		s.chunks[i] = dirChunk{
 			block: c.Block, off: c.OffInBlock, firstDisc: c.FirstDisc,
-			kind: c.Kind, count: c.Count, liveHint: c.LiveHint,
+			kind: c.Kind, flags: c.Flags, count: c.Count, liveHint: c.LiveHint,
+		}
+		if c.Kind&store.ChunkKindBit != 0 && c.Flags&store.ChunkFlagRun == 0 {
+			h1, _ := bloomHash(c.Key)
+			s.chunks[i].fp = h1
 		}
 	}
 	seg := uint32(f.SegSeq)
@@ -103,7 +120,7 @@ func (d *Directory) Add(objKey string, f *SegmentFooter) error {
 	}
 	d.segs[seg] = s
 	d.nchnk += len(s.chunks)
-	d.bytes += dirSegOverhead + len(s.objKey) + len(s.blocks)*segBlockEntry + len(s.chunks)*24
+	d.bytes += dirSegOverhead + len(s.objKey) + len(s.blocks)*segBlockEntry + len(s.chunks)*dirChunkCost
 	return nil
 }
 
@@ -130,6 +147,100 @@ func (d *Directory) Resolve(l KeyLoc) (DirRef, bool) {
 	}, true
 }
 
+// ResolveField plans a point read into a cold collection (doc 08 section
+// 3): within the segment the keymap locator pins, it finds the chunk of
+// the collection fp that owns disc, the greatest first discriminator at
+// or below it among the collection's chunks, falling back to the first
+// chunk when disc precedes them all (the field can only be an overlay
+// add then, and the fetched chunk answers absent, which the resident
+// state usually already knew). The locator's own chunk index only names
+// the segment; the floor here picks the chunk, so a placement is valid
+// pointing at any chunk of the collection.
+func (d *Directory) ResolveField(l KeyLoc, fp uint64, disc uint64) (DirRef, bool) {
+	if l.Tier != 0 {
+		return DirRef{}, false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	s, ok := d.segs[l.Seg]
+	if !ok {
+		return DirRef{}, false
+	}
+	best, first := -1, -1
+	for i := range s.chunks {
+		c := &s.chunks[i]
+		if !d.collChunk(c, fp) {
+			continue
+		}
+		if first < 0 || c.firstDisc < s.chunks[first].firstDisc {
+			first = i
+		}
+		if c.firstDisc <= disc && (best < 0 || c.firstDisc >= s.chunks[best].firstDisc) {
+			best = i
+		}
+	}
+	if best < 0 {
+		best = first
+	}
+	if best < 0 {
+		return DirRef{}, false
+	}
+	c := s.chunks[best]
+	return DirRef{
+		ObjKey:     s.objKey,
+		Block:      s.blocks[c.block],
+		OffInBlock: c.off,
+		ChunkKind:  c.kind,
+	}, true
+}
+
+// CollChunks plans a whole-collection read (HGETALL and the scan family):
+// every chunk of the collection fp inside the locator's segment, in
+// discriminator order. The caller coalesces refs that share a block into
+// one ranged GET, which is what makes the request bill the doc 08 ceil
+// identity rather than a GET per chunk.
+func (d *Directory) CollChunks(l KeyLoc, fp uint64) []DirRef {
+	if l.Tier != 0 {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	s, ok := d.segs[l.Seg]
+	if !ok {
+		return nil
+	}
+	type ord struct {
+		disc uint64
+		ref  DirRef
+	}
+	var out []ord
+	for i := range s.chunks {
+		c := &s.chunks[i]
+		if !d.collChunk(c, fp) {
+			continue
+		}
+		out = append(out, ord{disc: c.firstDisc, ref: DirRef{
+			ObjKey:     s.objKey,
+			Block:      s.blocks[c.block],
+			OffInBlock: c.off,
+			ChunkKind:  c.kind,
+		}})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].disc < out[j].disc })
+	refs := make([]DirRef, len(out))
+	for i := range out {
+		refs[i] = out[i].ref
+	}
+	return refs
+}
+
+// collChunk reports whether c is a collection chunk of the fingerprint:
+// a packed chunk that is not a folder run, keyed by the collection whose
+// fingerprint the keymap and the planner share.
+func (d *Directory) collChunk(c *dirChunk, fp uint64) bool {
+	return c.kind&store.ChunkKindBit != 0 && c.flags&store.ChunkFlagRun == 0 && c.fp == fp
+}
+
 // Drop removes a segment, the GC seam: a segment leaves the directory
 // when compaction retires it from the manifest. Reports whether the
 // segment was live.
@@ -142,7 +253,7 @@ func (d *Directory) Drop(seg uint32) bool {
 	}
 	delete(d.segs, seg)
 	d.nchnk -= len(s.chunks)
-	d.bytes -= dirSegOverhead + len(s.objKey) + len(s.blocks)*segBlockEntry + len(s.chunks)*24
+	d.bytes -= dirSegOverhead + len(s.objKey) + len(s.blocks)*segBlockEntry + len(s.chunks)*dirChunkCost
 	return true
 }
 

@@ -327,7 +327,7 @@ func (f *Folder) Add(frames []byte) {
 			id := string([]byte{fr.Kind}) + string(fr.Key) + "\x00" + string(fr.Disc)
 			data := append([]byte(nil), fr.Frame...)
 			c := SegmentChunk{
-				Key: append([]byte(nil), fr.Key...), Kind: fr.Kind,
+				Key: append([]byte(nil), fr.Key...), Kind: fr.Kind, Flags: fr.Flags,
 				FirstDisc: disc64(fr.Disc), Count: fr.Count, LiveHint: fr.Count,
 				Data: data,
 			}
@@ -593,7 +593,7 @@ func (f *Folder) buildSegment(job *segJob) (*Segment, error) {
 		}
 		first := run[0]
 		var disc [8]byte
-		binary.LittleEndian.PutUint64(disc[:], first.fp)
+		binary.BigEndian.PutUint64(disc[:], first.fp)
 		data := store.AppendRunChunk(nil, first.kind|store.ChunkKindBit, store.ChunkFlagRun,
 			uint16(len(run)), first.key, disc[:], payload)
 		for _, r := range run {
@@ -603,7 +603,7 @@ func (f *Folder) buildSegment(job *segJob) (*Segment, error) {
 			})
 		}
 		chunks = append(chunks, SegmentChunk{
-			Key: first.key, Kind: first.kind | store.ChunkKindBit,
+			Key: first.key, Kind: first.kind | store.ChunkKindBit, Flags: store.ChunkFlagRun,
 			FirstDisc: first.fp, Count: uint16(len(run)), LiveHint: uint16(len(run)),
 			Data: data,
 		})
@@ -621,6 +621,24 @@ func (f *Folder) buildSegment(job *segJob) (*Segment, error) {
 	cut()
 	for i := range job.chunks {
 		memberKeys = append(memberKeys, job.chunks[i].Key)
+	}
+	// One placement per collection key (doc 08 section 3): the keymap entry
+	// pins the newest segment holding the collection, and the field planner
+	// floors by discriminator over that segment's chunk index, so the chunk
+	// the placement names only has to belong to the collection, not own any
+	// particular field.
+	collAt := len(chunks)
+	placed := make(map[string]bool, len(job.chunks))
+	for i := range job.chunks {
+		c := &job.chunks[i]
+		if placed[string(c.Key)] {
+			continue
+		}
+		placed[string(c.Key)] = true
+		h1, _ := bloomHash(c.Key)
+		job.places = append(job.places, KeyPlace{
+			Key: c.Key, Fp: h1, Chunk: uint32(collAt + i), Kind: c.Kind,
+		})
 	}
 	chunks = append(chunks, job.chunks...)
 	footer := SegmentFooter{
@@ -809,11 +827,16 @@ func (f *Folder) dropPendingLocked(job *segJob) {
 }
 
 // disc64 lifts a chunk discriminator's leading bytes into the footer's
-// u64 FirstDisc, little-endian, zero-padded when shorter.
+// u64 FirstDisc, big-endian and zero-padded when shorter: disc bytes are
+// big-endian u64 everywhere on the fold plane (the run chunks the cut
+// writes and the collection chunks the demoters frame), so byte-
+// lexicographic order over disc bytes and numeric order over FirstDisc
+// agree, which is the same contract the tier directory's Floor holds the
+// demoters to.
 func disc64(disc []byte) uint64 {
 	var b [8]byte
 	copy(b[:], disc)
-	return binary.LittleEndian.Uint64(b[:])
+	return binary.BigEndian.Uint64(b[:])
 }
 
 // segKey names a segment object (doc 03 section 1): per-group prefixes so

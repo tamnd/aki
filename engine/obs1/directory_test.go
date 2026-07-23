@@ -107,7 +107,7 @@ func TestDirectoryDropAndBytes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	per := dirSegOverhead + len("db/t/seg/g003/x") + 2*segBlockEntry + 2*24
+	per := dirSegOverhead + len("db/t/seg/g003/x") + 2*segBlockEntry + 2*dirChunkCost
 	if d.Bytes() != 3*per {
 		t.Fatalf("bytes %d want %d", d.Bytes(), 3*per)
 	}
