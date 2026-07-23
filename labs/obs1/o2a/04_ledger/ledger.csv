@@ -1,0 +1,10 @@
+# folded after 66 pressure rounds
+cell,ops,gets,gets_per_op,kib_per_op,found_pct
+string_get,2000,2000,1.0000,2.7,100.0
+string_miss,100,0,0.0000,0.0,100.0
+hget,20000,20000,1.0000,102.2,100.0
+hget_miss,100,100,1.0000,108.0,100.0
+sismember,20000,20000,1.0000,93.0,100.0
+keymap_bytes_per_key,175265,4194304,23.93,,
+dir_coll_share_b_per_elem,40000,29,0.1033,,
+# cold stats: {Fetches:42100 BlockGETs:42100 Attached:0 Unresolved:0 Misses:100 Errs:0}
