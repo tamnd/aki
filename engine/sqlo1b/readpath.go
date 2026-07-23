@@ -77,12 +77,17 @@ type ReadStats struct {
 // IndexReader resolves keys through the cold index. Blob is the
 // escape for byte-addressed records: the store wires it to ReadBlob
 // with its file handle; a reader that never meets blob positions can
-// leave it nil.
+// leave it nil. Compressed reports whether an extent holds
+// compressed frame groups (cgroup.go) instead of raw slotted groups;
+// the store wires it to its extent-eflags cache, and nil reads
+// everything as raw, which keeps readers over uncompressed fixtures
+// working.
 type IndexReader struct {
-	Dir    DirSource
-	Groups GroupSource
-	Blob   func(Pos) (*Record, error)
-	Stats  ReadStats
+	Dir        DirSource
+	Groups     GroupSource
+	Blob       func(Pos) (*Record, error)
+	Compressed func(extent uint64) (bool, error)
+	Stats      ReadStats
 }
 
 // readChunk fetches the group holding a chunk and carves out the
@@ -142,13 +147,31 @@ func (r *IndexReader) resolveRecord(pos Pos) (*Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	view, err := ParseGroup(grp)
-	if err != nil {
-		return nil, err
+	var comp bool
+	if r.Compressed != nil {
+		if comp, err = r.Compressed(pos.Extent()); err != nil {
+			return nil, err
+		}
 	}
-	raw, err := view.Record(pos.Slot())
-	if err != nil {
-		return nil, err
+	var raw []byte
+	if comp {
+		view, err := ParseCGroup(grp)
+		if err != nil {
+			return nil, err
+		}
+		raw, err = view.Record(pos.Slot())
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		view, err := ParseGroup(grp)
+		if err != nil {
+			return nil, err
+		}
+		raw, err = view.Record(pos.Slot())
+		if err != nil {
+			return nil, err
+		}
 	}
 	return DecodeRecord(raw)
 }

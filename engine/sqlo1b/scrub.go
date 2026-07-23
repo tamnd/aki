@@ -105,6 +105,16 @@ func (s *Scrubber) scrubExtent(ext uint64, buf []byte) error {
 		if hi > uint64(len(buf)) {
 			return fmt.Errorf("sqlo1b: extent %d group_count %d past the extent", ext, h.GroupCount)
 		}
+		if h.EFlags&EFlagCompressed != 0 {
+			// Compressed extents carry frame groups; ParseCGroup
+			// validates the header bounds, the scheme, and the slot
+			// offsets, so a scheme this build cannot decode is a
+			// finding, not a silent skip.
+			if _, err := ParseCGroup(buf[lo:hi]); err != nil {
+				return fmt.Errorf("sqlo1b: extent %d group %d: %w", ext, g, err)
+			}
+			continue
+		}
 		if _, err := ParseGroup(buf[lo:hi]); err != nil {
 			return fmt.Errorf("sqlo1b: extent %d group %d: %w", ext, g, err)
 		}
