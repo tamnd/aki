@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -78,7 +79,36 @@ type Runtime struct {
 	repCap       int
 	replyRing    int
 	freeListCap  int
+
+	// batchPool is the runtime-wide overflow reservoir for hop-transport nodes,
+	// shared by every connection behind its own small free list. The per-conn
+	// free channel (freeListCap) is a contention-free L1 cache sized for the
+	// steady same-goroutine recycle-then-take; under a high-fan-out pipelined
+	// burst the connection reader outruns the writer's recycle and the L1 runs
+	// dry, so take falls through to this pool and recycle returns the overflow
+	// here instead of allocating a fresh ~6KiB node per command and dropping it
+	// on a full L1. That churn was the whole tiny-collection VmHWM overage
+	// (labs/f3/m0/26: shard.newBatch was 98% of alloc_space under c512 P16); the
+	// pool bounds retained nodes to actual concurrency and GC drains it, so it
+	// caps the burst-transient peak without the retained cost a larger per-conn
+	// L1 would carry across 512 connections. New is set in resolveConnCaps once
+	// the node caps are known.
+	batchPool sync.Pool
 }
+
+// getBatch returns a hop-transport node from the shared overflow pool, or a
+// freshly sized one when the pool is empty. The caller (Conn.take) stamps the
+// originating connection before use.
+func (r *Runtime) getBatch() *hopBatch {
+	if v := r.batchPool.Get(); v != nil {
+		return v.(*hopBatch)
+	}
+	return newBatch(r.batchDataCap, r.repCap)
+}
+
+// putBatch returns a reset node to the shared overflow pool. The caller
+// (Conn.recycle) has already reset it.
+func (r *Runtime) putBatch(b *hopBatch) { r.batchPool.Put(b) }
 
 // resolveConnCaps fills the per-connection hop-transport sizes from the Config
 // overrides, taking the tuning.go default for every field left non-positive.
@@ -101,6 +131,8 @@ func (r *Runtime) resolveConnCaps(c Config) {
 	if c.FreeListCap > 0 {
 		r.freeListCap = c.FreeListCap
 	}
+	dataCap, repCap := r.batchDataCap, r.repCap
+	r.batchPool.New = func() any { return newBatch(dataCap, repCap) }
 }
 
 // ConnOpened records that a driver has begun serving a connection, and
