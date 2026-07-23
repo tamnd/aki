@@ -334,6 +334,38 @@ func TestRingValidation(t *testing.T) {
 	}
 }
 
+// TestRingSyncStaysOffRing is the doc 04 durability assertion on a
+// live ring: a burst of Sync calls completes correctly while the
+// submit-side counters stay flat, so no fsync entered ring
+// submission, and a real write afterwards moves them, so the flat
+// reading is a live measurement and not stale telemetry.
+func TestRingSyncStaysOffRing(t *testing.T) {
+	const ext = uint32(1 << 16)
+	r, _, comp := ringT(t, ext, 8, 64)
+
+	e0, n0 := r.EnterStats()
+	const syncs = 32
+	for i := range syncs {
+		r.Sync(uint64(100 + i))
+	}
+	for tag, err := range collectRing(t, comp, syncs) {
+		if err != nil {
+			t.Fatalf("sync tag %d: %v", tag, err)
+		}
+	}
+	if e1, n1 := r.EnterStats(); e1 != e0 || n1 != n0 {
+		t.Fatalf("sync burst moved ring submission: enters %d -> %d, sqes %d -> %d", e0, e1, n0, n1)
+	}
+
+	r.Submit([]IOReq{{Op: OpWrite, Ext: 0, Off: 0, Buf: make([]byte, 512), Tag: 500}})
+	if res := <-comp; res.Tag != 500 || res.Err != nil {
+		t.Fatalf("write after syncs: %+v", res)
+	}
+	if e2, n2 := r.EnterStats(); e2 == e0 || n2 == n0 {
+		t.Fatalf("write did not move the counters (enters %d, sqes %d), the flat sync reading proves nothing", e2, n2)
+	}
+}
+
 func TestRingCloseDrainsQueued(t *testing.T) {
 	const ext = uint32(1 << 18) // 64 groups fit one extent
 	f, err := os.Create(filepath.Join(t.TempDir(), "ring.dat"))
