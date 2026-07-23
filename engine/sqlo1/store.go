@@ -93,6 +93,13 @@ type StoreStats struct {
 	// scheme since open, indexed by scheme id; nil when the backend has
 	// written none. The doc 04 cascade selection histogram INFO shows.
 	SchemeGroups []int64
+	// Decode-cost counters for the compressed read path: frame
+	// payloads decoded, uncompressed bytes those decodes produced, and
+	// reads served from an already-decoded frame. All zero on backends
+	// without compressed groups.
+	FrameDecodes     int64
+	FrameDecodeBytes int64
+	FrameHits        int64
 }
 
 // Store is the seam between the shared runtime and a backend (doc 02

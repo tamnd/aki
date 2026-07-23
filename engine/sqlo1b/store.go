@@ -164,6 +164,11 @@ type Store struct {
 	// so a freed-and-reallocated extent cannot serve stale flags.
 	extFlags map[uint64]uint8
 
+	// fc memoizes decoded frame payloads across point reads, shared
+	// with the IndexReader; allocStream drops an extent's entries on
+	// reuse, next to the extFlags refresh.
+	fc *FrameCache
+
 	// schemeGroups counts compressed-frame groups written per scheme,
 	// advisory runtime telemetry like garbageExt; the selection slice
 	// grows this into the doc 04 selection histogram.
@@ -242,7 +247,8 @@ func CreateStoreOn(f StoreFile, walPath string, walSegSize int64) (*Store, error
 		ckptPolicy: DefaultCheckpointPolicy(),
 	}
 	s.initCursors()
-	s.rd = &IndexReader{Dir: s.dir, Groups: fileGroups{s.f, s.sb.ExtentSize}, Blob: s.readBlobPos, Compressed: s.extCompressed}
+	s.fc = NewFrameCache()
+	s.rd = &IndexReader{Dir: s.dir, Groups: fileGroups{s.f, s.sb.ExtentSize}, Blob: s.readBlobPos, Compressed: s.extCompressed, Frames: s.fc}
 	return s, nil
 }
 
@@ -371,7 +377,8 @@ func restoreStore(f StoreFile, rec *Recovery) (*Store, error) {
 	if err := f.Truncate(int64(sb.ExtentCount) * int64(sb.ExtentSize)); err != nil {
 		return nil, err
 	}
-	s.rd = &IndexReader{Dir: s.dir, Groups: fileGroups{s.f, s.sb.ExtentSize}, Blob: s.readBlobPos, Compressed: s.extCompressed}
+	s.fc = NewFrameCache()
+	s.rd = &IndexReader{Dir: s.dir, Groups: fileGroups{s.f, s.sb.ExtentSize}, Blob: s.readBlobPos, Compressed: s.extCompressed, Frames: s.fc}
 	return s, nil
 }
 
@@ -1728,7 +1735,7 @@ func (s *Store) resolveAt(pos Pos) (*Record, error) {
 	}
 	var raw []byte
 	if comp {
-		view, err := ParseCGroup(img)
+		view, err := s.fc.View(pos.Extent(), pos.Group(), img)
 		if err != nil {
 			return nil, err
 		}
@@ -1973,6 +1980,10 @@ func (s *Store) Stats() sqlo1.StoreStats {
 		}
 		st.SchemeGroups[scheme] = int64(n)
 	}
+	fs := s.fc.Stats()
+	st.FrameDecodes = int64(fs.Decodes)
+	st.FrameDecodeBytes = int64(fs.DecodeBytes)
+	st.FrameHits = int64(fs.Hits)
 	return st
 }
 
@@ -2527,9 +2538,11 @@ func (s *Store) allocStream(c *streamCursor) error {
 	if _, err := s.f.WriteAt(hdr.Encode(), int64(ext)*int64(s.sb.ExtentSize)); err != nil {
 		return fmt.Errorf("sqlo1b: extent %d header: %w", ext, err)
 	}
-	// Refresh the read-dispatch cache: a freed extent reused by a
-	// different stream must not keep serving the old stream's flags.
+	// Refresh the read-dispatch caches: a freed extent reused by a
+	// different stream must not keep serving the old stream's flags,
+	// and the frame cache must not keep serving its decoded groups.
 	s.noteExtFlags(ext, c.eflags)
+	s.fc.DropExtent(ext)
 	return nil
 }
 
