@@ -26,7 +26,7 @@ func residentOf(g *reg, key string) uint64 { return g.m[key].residentBytes() }
 func TestSetDemoteNativePacksAndReadsBack(t *testing.T) {
 	cx, g := coldCtx(t)
 
-	members := gen("m", 0, 1000, 12)
+	members := gen("m", 0, 1000, 40)
 	addKey(g, "k", members...)
 	if enc := g.m["k"].enc; enc != encHashtable {
 		t.Fatalf("1000-member set enc %v, want hashtable", enc)
@@ -202,7 +202,7 @@ func TestSetColdReadsAreTransparent(t *testing.T) {
 func TestSetPromoteOnConfirmingAdd(t *testing.T) {
 	cx, g := coldCtx(t)
 
-	members := gen("m", 0, 1000, 12)
+	members := gen("m", 0, 1000, 40)
 	addKey(g, "k", members...)
 	if n := g.demote(cx, []byte("k")); n != len(members) {
 		t.Fatalf("demoted %d members, want %d", n, len(members))

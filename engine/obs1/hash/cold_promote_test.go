@@ -20,7 +20,7 @@ import (
 // descriptor is dropped.
 func TestHashPromoteOnOverwrite(t *testing.T) {
 	cx, _ := coldCtx(t)
-	h := coldNative(200, 40)
+	h := coldNative(200, 200)
 	want := map[string]string{}
 	h.each(func(f, v []byte) { want[string(f)] = string(v) })
 
@@ -108,7 +108,7 @@ func TestHashPromoteReconcilesResident(t *testing.T) {
 // repack, and the field's cold neighbours stay cold and readable.
 func TestHashColdDeleteMarksDirtyNotPromote(t *testing.T) {
 	cx, _ := coldCtx(t)
-	h := coldNative(200, 40)
+	h := coldNative(200, 200)
 	if chunks := handDemote(t, cx.St, "k", h.ft); chunks < 2 {
 		t.Fatalf("demote wrote %d chunks, want >= 2", chunks)
 	}
