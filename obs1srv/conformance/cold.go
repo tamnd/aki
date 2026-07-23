@@ -10,36 +10,39 @@ import (
 // collections are a handful of elements and sit in their inline bands,
 // which never demote, so the cold arm builds its own subset for the O2a
 // types: strings small enough to stay embedded (separated values spill to
-// the value log at write time, which is not a drain), and a hash and a set
-// past the listpack thresholds so the native bands exist and the demoters
-// have something to shed. The verify steps are the deterministic reads:
+// the value log at write time, which is not a drain), and a hash, a set,
+// and a zset past the listpack thresholds so the native bands exist and the
+// demoters have something to shed. The verify steps are the deterministic reads:
 // points, existence both ways, and counts; order-carrying fans (HGETALL,
 // SMEMBERS) stay with the fingerprint helpers, which sort.
 
 // Cold-arm cardinalities. The inline ceilings differ per type: the hash
 // converts to its native band past 512 entries (hash-max-listpack-entries)
-// and the set past 128 (set-max-listpack-entries), so 600 fields and 200
-// members clear both with room; 40 strings give the drain a spread of keys
-// without swamping the poll.
+// and the set and zset past 128 (their listpack entry ceilings), so 600
+// fields and 200 members clear all three with room; 40 strings give the
+// drain a spread of keys without swamping the poll.
 const (
-	ColdStrings = 40
-	ColdFields  = 600
-	ColdMembers = 200
+	ColdStrings  = 40
+	ColdFields   = 600
+	ColdMembers  = 200
+	ColdZMembers = 200
 )
 
 // ColdStringKey names the nth cold-arm string key, exported so the arm
 // can watch these exact keys reach the fold.
 func ColdStringKey(i int) string { return "cold:str:" + strconv.Itoa(i) }
 
-// ColdHashKey and ColdSetKey name the cold-arm collections.
+// ColdHashKey, ColdSetKey, and ColdZsetKey name the cold-arm collections.
 const (
 	ColdHashKey = "cold:hash"
 	ColdSetKey  = "cold:set"
+	ColdZsetKey = "cold:zset"
 )
 
-func coldField(i int) string  { return fmt.Sprintf("cf%03d", i) }
-func coldValue(i int) string  { return fmt.Sprintf("cw-%03d", i) }
-func coldMember(i int) string { return fmt.Sprintf("cm%03d", i) }
+func coldField(i int) string   { return fmt.Sprintf("cf%03d", i) }
+func coldValue(i int) string   { return fmt.Sprintf("cw-%03d", i) }
+func coldMember(i int) string  { return fmt.Sprintf("cm%03d", i) }
+func coldZMember(i int) string { return fmt.Sprintf("zm%03d", i) }
 
 // ColdBuild returns the write steps that stand the cold working set up.
 func ColdBuild() []Step {
@@ -62,6 +65,15 @@ func ColdBuild() []Step {
 			sadd = append(sadd, coldMember(i))
 		}
 		steps = append(steps, c(strconv.Itoa(batch), sadd...))
+	}
+	// Integer scores equal to the member index, so the score order is the
+	// member-name order and every ZSCORE expectation formats plain.
+	for base := 0; base < ColdZMembers; base += batch {
+		zadd := []string{"ZADD", ColdZsetKey}
+		for i := base; i < base+batch; i++ {
+			zadd = append(zadd, strconv.Itoa(i), coldZMember(i))
+		}
+		steps = append(steps, c(strconv.Itoa(batch), zadd...))
 	}
 	return steps
 }
@@ -94,5 +106,20 @@ func ColdVerify() []Step {
 		steps = append(steps, c("1", "SISMEMBER", ColdSetKey, coldMember(i)))
 	}
 	steps = append(steps, c("0", "SISMEMBER", ColdSetKey, "cm-missing"))
+	// The zset reads: every score point, rank spots at both ends and the
+	// middle, one range window, and the misses.
+	steps = append(steps, c(strconv.Itoa(ColdZMembers), "ZCARD", ColdZsetKey))
+	for i := 0; i < ColdZMembers; i++ {
+		steps = append(steps, c(strconv.Itoa(i), "ZSCORE", ColdZsetKey, coldZMember(i)))
+	}
+	steps = append(steps,
+		c("0", "ZRANK", ColdZsetKey, coldZMember(0)),
+		c(strconv.Itoa(ColdZMembers/2), "ZRANK", ColdZsetKey, coldZMember(ColdZMembers/2)),
+		c(strconv.Itoa(ColdZMembers-1), "ZRANK", ColdZsetKey, coldZMember(ColdZMembers-1)),
+		c("["+coldZMember(10)+" "+coldZMember(11)+" "+coldZMember(12)+"]",
+			"ZRANGE", ColdZsetKey, "10", "12"),
+		c("(nil)", "ZSCORE", ColdZsetKey, "zm-missing"),
+		c("(nil)", "ZRANK", ColdZsetKey, "zm-missing"),
+	)
 	return steps
 }

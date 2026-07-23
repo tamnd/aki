@@ -171,8 +171,18 @@ func (c *ColdReader) Fetch(group uint16, key []byte, loc KeyLoc, done func(ColdR
 // exactly once, on a fetch goroutine, with the extracted field or the
 // error; a fired inline expiry at nowMs reads as absent.
 func (c *ColdReader) FetchField(group uint16, key []byte, loc KeyLoc, field []byte, nowMs int64, done func(ColdField, error)) {
+	c.FetchFieldKind(group, key, loc, field, 0, nowMs, done)
+}
+
+// FetchFieldKind is FetchField restricted to one chunk kind, the
+// dual-projection point read (doc 08 section 5): a zset ZSCORE floors by
+// the member coordinate among the collection's member chunks only, so the
+// score runs sharing its collection key never catch the floor. Kind zero
+// means any, which is what FetchField passes for the single-projection
+// types.
+func (c *ColdReader) FetchFieldKind(group uint16, key []byte, loc KeyLoc, field []byte, kind uint8, nowMs int64, done func(ColdField, error)) {
 	fp := Fingerprint(key)
-	ref, ok := c.cfg.Dir(group).ResolveField(loc, fp, Disc(field))
+	ref, ok := c.cfg.Dir(group).ResolveFieldKind(loc, fp, Disc(field), kind)
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()

@@ -157,6 +157,16 @@ func (d *Directory) Resolve(l KeyLoc) (DirRef, bool) {
 // the segment; the floor here picks the chunk, so a placement is valid
 // pointing at any chunk of the collection.
 func (d *Directory) ResolveField(l KeyLoc, fp uint64, disc uint64) (DirRef, bool) {
+	return d.ResolveFieldKind(l, fp, disc, 0)
+}
+
+// ResolveFieldKind is ResolveField restricted to one chunk kind, the
+// dual-projection point plan (doc 08 section 5): a zset keeps member
+// chunks and score runs under one collection key, distinguished by kind
+// and carrying discriminators from different coordinate spaces, so a
+// floor that mixed them could land a member read on a score run. Kind
+// zero means any, which is the single-projection types' call.
+func (d *Directory) ResolveFieldKind(l KeyLoc, fp uint64, disc uint64, kind uint8) (DirRef, bool) {
 	if l.Tier != 0 {
 		return DirRef{}, false
 	}
@@ -169,7 +179,7 @@ func (d *Directory) ResolveField(l KeyLoc, fp uint64, disc uint64) (DirRef, bool
 	best, first := -1, -1
 	for i := range s.chunks {
 		c := &s.chunks[i]
-		if !d.collChunk(c, fp) {
+		if !d.collChunk(c, fp, kind) {
 			continue
 		}
 		if first < 0 || c.firstDisc < s.chunks[first].firstDisc {
@@ -216,7 +226,7 @@ func (d *Directory) CollChunks(l KeyLoc, fp uint64) []DirRef {
 	var out []ord
 	for i := range s.chunks {
 		c := &s.chunks[i]
-		if !d.collChunk(c, fp) {
+		if !d.collChunk(c, fp, 0) {
 			continue
 		}
 		out = append(out, ord{disc: c.firstDisc, ref: DirRef{
@@ -236,8 +246,12 @@ func (d *Directory) CollChunks(l KeyLoc, fp uint64) []DirRef {
 
 // collChunk reports whether c is a collection chunk of the fingerprint:
 // a packed chunk that is not a folder run, keyed by the collection whose
-// fingerprint the keymap and the planner share.
-func (d *Directory) collChunk(c *dirChunk, fp uint64) bool {
+// fingerprint the keymap and the planner share. A nonzero kind restricts
+// the match to one projection of a dual-projection collection.
+func (d *Directory) collChunk(c *dirChunk, fp uint64, kind uint8) bool {
+	if kind != 0 && c.kind != kind {
+		return false
+	}
 	return c.kind&store.ChunkKindBit != 0 && c.flags&store.ChunkFlagRun == 0 && c.fp == fp
 }
 

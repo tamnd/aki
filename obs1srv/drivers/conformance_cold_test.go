@@ -3,7 +3,7 @@ package drivers
 // The cold arm of the conformance suite (doc 10, suite conformance: the
 // corpus "against cold state through the full read path"; O2a's
 // conformance-cold row). The hot corpus builds its state, the cold-arm
-// subset stands up strings, a hash, and a set past the inline bands,
+// subset stands up strings, a hash, a set, and a zset past the inline bands,
 // resident pressure demotes and stage-drains the working set, a fold
 // publishes it between build and verify, and the same reads must answer
 // identically off the cold tiers. A restart tail reboots from the bucket
@@ -52,6 +52,7 @@ func spinDemote(t *testing.T, rc *conformance.Conn) {
 	for i := 0; i < 50; i++ {
 		doStep(t, rc, []string{"EXISTS", conformance.ColdHashKey})
 		doStep(t, rc, []string{"EXISTS", conformance.ColdSetKey})
+		doStep(t, rc, []string{"EXISTS", conformance.ColdZsetKey})
 	}
 }
 
@@ -89,7 +90,7 @@ func TestConformanceCold(t *testing.T) {
 	// The keys whose fold placement the pressure loop waits for: the two
 	// collections demote through their quantum triggers, the strings ride
 	// the migrator's staged drains.
-	want := []string{conformance.ColdHashKey, conformance.ColdSetKey}
+	want := []string{conformance.ColdHashKey, conformance.ColdSetKey, conformance.ColdZsetKey}
 	for i := 0; i < conformance.ColdStrings; i++ {
 		want = append(want, conformance.ColdStringKey(i))
 	}

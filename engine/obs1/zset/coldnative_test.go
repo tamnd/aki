@@ -24,16 +24,21 @@ import (
 // routes the member's byte reads through the cold pread.
 func handDemote(t *testing.T, n *nativeStore, cc *coldChunks, key []byte, members [][]byte) {
 	t.Helper()
-	var payload []byte
+	var pk store.ChunkPacker
 	for _, m := range members {
-		payload = appendEntry(payload, m)
+		ord, ok := n.tbl.Find(store.Hash(m), m, n)
+		if !ok {
+			t.Fatalf("handDemote: member %q absent", m)
+		}
+		pk.Add(m, scoreBytes(n.recs[ord].bits), 0)
 	}
+	payload, flags := pk.Finish()
 	ord0, ok := n.tbl.Find(store.Hash(members[0]), members[0], n)
 	if !ok {
 		t.Fatalf("handDemote: first member %q absent", members[0])
 	}
 	disc := discOf(scoreKey(math.Float64frombits(n.recs[ord0].bits)), members[0])
-	off, ok := cc.st.AppendChunk(kindZset, 0, uint16(len(members)), key, disc, payload)
+	off, ok := cc.st.AppendChunk(kindZsetScore, flags, uint16(len(members)), key, disc, payload)
 	if !ok {
 		t.Fatal("handDemote: AppendChunk failed")
 	}

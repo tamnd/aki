@@ -25,7 +25,7 @@ func TestNativeColdPromoteBringsChunkResident(t *testing.T) {
 	// Wide members so the pack spans more than one chunk, which proves the Floor
 	// lands on the promoted member's own chunk and leaves the others cold.
 	n := newNativeStore(500)
-	raw := gen(0, 500, 24)
+	raw := gen(0, 500, 96)
 	members := make([][]byte, len(raw))
 	for i, m := range raw {
 		members[i] = []byte(m)
