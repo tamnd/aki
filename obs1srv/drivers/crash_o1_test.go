@@ -290,6 +290,9 @@ func TestCrashMidManifest(t *testing.T) {
 	if st := b3.Cold.Stats(); st.Errs != 0 || st.Unresolved != 0 || st.Misses != 0 {
 		t.Fatalf("cold reader stats after the orphan boot: %+v", st)
 	}
+	// W-I3 at this point: the bucket the crash left behind replays to one
+	// state hash however the walk is cut, orphans invisible throughout.
+	assertReplayIdempotent(t, bucket)
 }
 
 // TestCrashChainOutageUnderFoldLoad re-runs the O1b post-PUT-pre-commit
@@ -346,4 +349,7 @@ func TestCrashChainOutageUnderFoldLoad(t *testing.T) {
 		survived++
 	}
 	t.Logf("chain outage tail: %d of %d relaxed-ack keys survived", survived, tail)
+	// W-I3 at this point: the committed prefix replays to one state hash
+	// however the walk is cut, the unnamed WAL tail invisible throughout.
+	assertReplayIdempotent(t, bucket)
 }
