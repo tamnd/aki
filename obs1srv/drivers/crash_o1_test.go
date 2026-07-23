@@ -103,6 +103,38 @@ func setRange(t *testing.T, nc net.Conn, r *bufio.Reader, prefix string, from, t
 	}
 }
 
+// setRangeLossy writes prefix:from..to-1 like setRange but tolerates
+// error replies: once a scripted outage surfaces as a pipeline error the
+// write path refuses further writes, and on a fast-failing schedule that
+// refusal lands mid-range. A refused SET is the "nothing" arm of the
+// all-or-nothing contract the crash tests assert after reboot. Returns
+// how many SETs were acknowledged.
+func setRangeLossy(t *testing.T, nc net.Conn, r *bufio.Reader, prefix string, from, to int) int {
+	t.Helper()
+	const batch = 500
+	acked := 0
+	for base := from; base < to; base += batch {
+		end := min(base+batch, to)
+		for i := base; i < end; i++ {
+			send(t, nc, "SET", prefix+strconv.Itoa(i), "v-"+strconv.Itoa(i))
+		}
+		for i := base; i < end; i++ {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				t.Fatalf("SET %s%d reply: %v", prefix, i, err)
+			}
+			switch {
+			case line == "+OK\r\n":
+				acked++
+			case strings.HasPrefix(line, "-"):
+			default:
+				t.Fatalf("SET %s%d: unexpected reply %q", prefix, i, line)
+			}
+		}
+	}
+	return acked
+}
+
 // sweepRange asserts prefix:from..to-1 all answer their exact values.
 func sweepRange(t *testing.T, nc net.Conn, r *bufio.Reader, prefix string, from, to int) {
 	t.Helper()
@@ -279,7 +311,8 @@ func TestCrashChainOutageUnderFoldLoad(t *testing.T) {
 	// pile up without a commit, then the pipeline error surfaces and the
 	// process dies with folds still cutting underneath.
 	faults.chainDown.Store(true)
-	setRange(t, nc1, r1, "q:", 0, tail)
+	acked := setRangeLossy(t, nc1, r1, "q:", 0, tail)
+	t.Logf("chain outage tail: %d of %d SETs acknowledged before refusal", acked, tail)
 	b1.WL.Barrier()
 	deadline := time.Now().Add(10 * time.Second)
 	for b1.WL.Err() == nil {
