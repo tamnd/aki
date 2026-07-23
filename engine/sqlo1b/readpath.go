@@ -81,12 +81,15 @@ type ReadStats struct {
 // compressed frame groups (cgroup.go) instead of raw slotted groups;
 // the store wires it to its extent-eflags cache, and nil reads
 // everything as raw, which keeps readers over uncompressed fixtures
-// working.
+// working. Frames, when set, memoizes decoded frame payloads across
+// point reads (framecache.go); nil decodes every compressed group
+// fresh.
 type IndexReader struct {
 	Dir        DirSource
 	Groups     GroupSource
 	Blob       func(Pos) (*Record, error)
 	Compressed func(extent uint64) (bool, error)
+	Frames     *FrameCache
 	Stats      ReadStats
 }
 
@@ -155,7 +158,7 @@ func (r *IndexReader) resolveRecord(pos Pos) (*Record, error) {
 	}
 	var raw []byte
 	if comp {
-		view, err := ParseCGroup(grp)
+		view, err := r.Frames.View(pos.Extent(), pos.Group(), grp)
 		if err != nil {
 			return nil, err
 		}
