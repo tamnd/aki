@@ -1,11 +1,39 @@
-package main
+// Package conformance holds the per-command hot corpus shared by the
+// binary-level suite in cmd/obs1srv and the fold and restart arms in
+// obs1srv/drivers (spec 2064/obs1 doc 10, suite conformance). One
+// connection replays the corpus in order, so later steps may lean on
+// earlier state. Every registered verb appears at least once (the
+// binary suite enforces it against dispatch.Commands), happy path plus
+// the shared error shapes. Keys are unique per family and spread over
+// slots, so the fan, point, and cross-slot routes all serve.
+package conformance
 
-// hotCorpus is the per-command hot corpus: one connection replays it in
-// order, so later steps may lean on earlier state. Every registered verb
-// appears at least once (TestConformanceHot enforces it), happy path
-// plus the shared error shapes. Keys are unique per family and spread
-// over slots, so the fan, point, and cross-slot routes all serve.
-var hotCorpus = []step{
+// Step is one corpus entry: a command and its rendered expected reply.
+// A Want beginning with "~" is a substring match, for replies that
+// carry counters or version-shaped text (INFO, XINFO). DurableWant,
+// when set, replaces Want on a durability-booted node: the corpus was
+// written against the volatile binary, and the durability family
+// answers differently when a write log is actually underneath.
+type Step struct {
+	Cmd         []string
+	Want        string
+	DurableWant string
+}
+
+// c is shorthand for a corpus step.
+func c(want string, cmd ...string) Step { return Step{Cmd: cmd, Want: want} }
+
+// d is a corpus step whose reply differs on a durable node.
+func d(want, durableWant string, cmd ...string) Step {
+	return Step{Cmd: cmd, Want: want, DurableWant: durableWant}
+}
+
+// Hot is the corpus. WipeTail is how many steps at the end wipe the
+// keyspace and prove it empties; arms that fingerprint the final state
+// replay Hot[:len(Hot)-WipeTail] instead.
+const WipeTail = 3
+
+var Hot = []Step{
 	// Connection basics.
 	c("PONG", "PING"),
 	c("hello", "PING", "hello"),
@@ -232,15 +260,15 @@ var hotCorpus = []step{
 	// chain to wait on.
 	c("relaxed", "AKI.DURABILITY"),
 	c("OK", "AKI.DURABILITY", "RELAXED"),
-	c("ERR DURABILITY STRICT is not available on a volatile node", "AKI.DURABILITY", "STRICT"),
+	d("ERR DURABILITY STRICT is not available on a volatile node", "OK", "AKI.DURABILITY", "STRICT"),
 
 	// The barriers on a volatile node: WAIT's ask of nothing answers the
 	// achieved 0 in place, WAITAOF's ask of nothing answers the honest
 	// [0, 0], and a numlocal ask is refused in Redis's words. Positive
 	// asks park, so the corpus stays on the immediate shapes.
 	c("0", "WAIT", "0", "0"),
-	c("[0 0]", "WAITAOF", "0", "0", "0"),
-	c("ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.", "WAITAOF", "1", "0", "0"),
+	d("[0 0]", "[0 0]|[1 0]", "WAITAOF", "0", "0", "0"),
+	d("ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.", "[1 0]", "WAITAOF", "1", "0", "0"),
 
 	// The shared error shapes, one of each.
 	c("ERR unknown command 'NOPE'", "NOPE"),

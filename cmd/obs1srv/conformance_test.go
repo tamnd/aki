@@ -10,7 +10,6 @@ package main
 
 import (
 	"bufio"
-	"fmt"
 	"net"
 	"os/exec"
 	"regexp"
@@ -19,141 +18,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tamnd/aki/obs1srv/conformance"
 	"github.com/tamnd/aki/obs1srv/dispatch"
 )
 
-// step is one corpus entry: a command and its rendered expected reply. A
-// want beginning with "~" is a substring match, for replies that carry
-// counters or version-shaped text (INFO, XINFO).
-type step struct {
-	cmd  []string
-	want string
-}
-
-// c is shorthand for a corpus step.
-func c(want string, cmd ...string) step { return step{cmd: cmd, want: want} }
-
-// render flattens one decoded reply into the corpus's comparable form:
-// status and bulk as their text, integers as digits, nil as (nil), arrays
-// bracketed and space-joined. Bulk "3" and integer 3 render alike on
-// purpose; reply-type exactness is the package suites' job.
-func render(v any) string {
-	switch x := v.(type) {
-	case nil:
-		return "(nil)"
-	case string:
-		return x
-	case int64:
-		return fmt.Sprintf("%d", x)
-	case []any:
-		parts := make([]string, len(x))
-		for i := range x {
-			parts[i] = render(x[i])
-		}
-		return "[" + strings.Join(parts, " ") + "]"
-	}
-	return fmt.Sprintf("%v", v)
-}
-
-// respConn is a minimal RESP2 client for the corpus: array-of-bulk out,
-// recursive reply in.
-type respConn struct {
-	c net.Conn
-	r *bufio.Reader
-}
-
-func dialResp(t *testing.T, addr string) *respConn {
+// doStep runs one corpus command, failing the test on transport errors.
+func doStep(t *testing.T, rc *conformance.Conn, cmd []string) string {
 	t.Helper()
-	nc, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	v, err := rc.Do(cmd)
 	if err != nil {
-		t.Fatalf("dial %s: %v", addr, err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = nc.Close() })
-	return &respConn{c: nc, r: bufio.NewReader(nc)}
-}
-
-func (rc *respConn) do(t *testing.T, args []string) any {
-	t.Helper()
-	var b strings.Builder
-	fmt.Fprintf(&b, "*%d\r\n", len(args))
-	for _, a := range args {
-		fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(a), a)
-	}
-	_ = rc.c.SetDeadline(time.Now().Add(10 * time.Second))
-	if _, err := rc.c.Write([]byte(b.String())); err != nil {
-		t.Fatalf("write %v: %v", args, err)
-	}
-	v, err := rc.read()
-	if err != nil {
-		t.Fatalf("read reply to %v: %v", args, err)
-	}
-	return v
-}
-
-func (rc *respConn) read() (any, error) {
-	line, err := rc.r.ReadString('\n')
-	if err != nil {
-		return nil, err
-	}
-	line = strings.TrimRight(line, "\r\n")
-	if line == "" {
-		return nil, fmt.Errorf("empty reply line")
-	}
-	body := line[1:]
-	switch line[0] {
-	case '+', '-':
-		return body, nil
-	case ':':
-		var n int64
-		if _, err := fmt.Sscanf(body, "%d", &n); err != nil {
-			return nil, fmt.Errorf("bad integer %q", body)
-		}
-		return n, nil
-	case '$':
-		var n int
-		if _, err := fmt.Sscanf(body, "%d", &n); err != nil {
-			return nil, fmt.Errorf("bad bulk length %q", body)
-		}
-		if n < 0 {
-			return nil, nil
-		}
-		buf := make([]byte, n+2)
-		if _, err := ioReadFull(rc.r, buf); err != nil {
-			return nil, err
-		}
-		return string(buf[:n]), nil
-	case '*':
-		var n int
-		if _, err := fmt.Sscanf(body, "%d", &n); err != nil {
-			return nil, fmt.Errorf("bad array length %q", body)
-		}
-		if n < 0 {
-			return nil, nil
-		}
-		out := make([]any, n)
-		for i := range out {
-			v, err := rc.read()
-			if err != nil {
-				return nil, err
-			}
-			out[i] = v
-		}
-		return out, nil
-	}
-	return nil, fmt.Errorf("unknown reply type %q", line)
-}
-
-// ioReadFull avoids importing io for one call.
-func ioReadFull(r *bufio.Reader, buf []byte) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := r.Read(buf[total:])
-		total += n
-		if err != nil {
-			return total, err
-		}
-	}
-	return total, nil
+	return conformance.Render(v)
 }
 
 // buildServer compiles the real binary once per test run.
@@ -215,18 +91,18 @@ func TestConformanceHot(t *testing.T) {
 	for _, d := range drivers {
 		t.Run(d, func(t *testing.T) {
 			addr := startServer(t, bin, d)
-			rc := dialResp(t, addr)
+			nc, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				t.Fatalf("dial %s: %v", addr, err)
+			}
+			t.Cleanup(func() { _ = nc.Close() })
+			rc := conformance.NewConn(nc)
 			seen := map[string]bool{}
-			for i, s := range hotCorpus {
-				got := render(rc.do(t, s.cmd))
-				if strings.HasPrefix(s.want, "~") {
-					if !strings.Contains(got, s.want[1:]) {
-						t.Fatalf("step %d %v: got %q, want it to contain %q", i, s.cmd, got, s.want[1:])
-					}
-				} else if got != s.want {
-					t.Fatalf("step %d %v: got %q, want %q", i, s.cmd, got, s.want)
+			for i, s := range conformance.Hot {
+				if msg := conformance.Check(s, doStep(t, rc, s.Cmd)); msg != "" {
+					t.Fatalf("step %d %s", i, msg)
 				}
-				seen[strings.ToUpper(s.cmd[0])] = true
+				seen[strings.ToUpper(s.Cmd[0])] = true
 			}
 			var missing []string
 			for _, name := range dispatch.Commands() {
