@@ -100,9 +100,20 @@ type Stream struct {
 	// gkbuf holds the group record subkey, grpBuf stages a group record
 	// payload, and grpCons carries one decoded consumer table; shared
 	// scratch on the run-buffer reasoning.
-	gkbuf   [SubkeySize]byte
-	grpBuf  []byte
-	grpCons []streamConsumer
+	gkbuf    [SubkeySize]byte
+	grpBuf   []byte
+	grpCons  []streamConsumer
+	grpFence []streamPelFenceEnt
+
+	// The PEL scratch: pelKbuf holds a kind 5 segment subkey, pelBuf
+	// stages a segment payload, pelEnts one decoded segment, pelIDs
+	// the IDs an XREADGROUP round delivered or collected, and pelDrops
+	// the emptied segids an ACK or sweep owes after its record write.
+	pelKbuf  [SubkeySize]byte
+	pelBuf   []byte
+	pelEnts  []streamPelEnt
+	pelIDs   []streamID
+	pelDrops []uint64
 
 	// mgKeyBuf, mgKeys, mgVals, mgRoots, and mgExps carry one range
 	// walk's prefetch round, the list Range shape.

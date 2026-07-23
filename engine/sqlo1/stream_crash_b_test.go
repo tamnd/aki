@@ -17,7 +17,13 @@ package sqlo1_test
 // so a fresh group's flush-before-root discipline, the record-only
 // SETID and consumer rewrites, a destroy's move-and-drop compaction,
 // and the MKSTREAM empty create all recover whole, and the last
-// delivered ID persists at every cut.
+// delivered ID persists at every cut. The PEL phase adds the kind 5
+// rows at dialed segment caps: deliveries that cut fresh segments
+// flush them before the record that references them, so a torn prefix
+// shows the pre-delivery image or the whole delivery and never a
+// dangling fence slot, and acks, consumer deletions with pending
+// entries, and the drop of an emptied segment land whole the same way
+// (X-I5); every snapshot renders the full pending table.
 
 import (
 	"context"
@@ -34,6 +40,7 @@ import (
 
 func TestStreamPagedTornTail(t *testing.T) {
 	defer sqlo1.SetStreamFenceCapsForTest(3, 2, 4)()
+	defer sqlo1.SetStreamPelCapsForTest(64, 1024, 100)()
 	ctx := context.Background()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "torn.aki")
@@ -92,7 +99,11 @@ func TestStreamPagedTornTail(t *testing.T) {
 			if err != nil {
 				t.Fatalf("group lines(%q): %v", k, err)
 			}
-			img[k] = append(append(ents, "root|"+line), groups...)
+			pels, err := xx.PelLinesForTest(ctx, []byte(k))
+			if err != nil {
+				t.Fatalf("pel lines(%q): %v", k, err)
+			}
+			img[k] = append(append(append(ents, "root|"+line), groups...), pels...)
 		}
 		return img
 	}
@@ -251,6 +262,51 @@ func TestStreamPagedTornTail(t *testing.T) {
 	flush()
 	gdestroy("s2", "solo", true)
 	gdestroy("s2", "solo", false)
+	flush()
+
+	// Phase 9: PEL segments. At the 64-byte cap a four-entry delivery
+	// cuts two segments, so the flush-before-record discipline is live:
+	// a cut inside the delivery recovers to the pre-delivery image with
+	// at most orphaned segments no fence references. The acks rewrite a
+	// segment and drop an emptied one in the record's batch, the
+	// consumer deletion sweeps its pending entries the same way, and
+	// the final delivery on the paged stream leaves a live PEL in the
+	// last image.
+	deliver := func(key, group, cons string, count int64, now int64, want int) {
+		t.Helper()
+		n, err := x.ReadGroupNewForTest(ctx, []byte(key), []byte(group), []byte(cons), count, false, now)
+		if err != nil || n != want {
+			t.Fatalf("ReadGroupNew(%q, %q, %q) = %d, %v, want %d", key, group, cons, n, err, want)
+		}
+		mark()
+	}
+	ack := func(key, group string, want int64, ids ...[2]uint64) {
+		t.Helper()
+		n, err := x.AckForTest(ctx, []byte(key), []byte(group), ids)
+		if err != nil || n != want {
+			t.Fatalf("Ack(%q, %q) = %d, %v, want %d", key, group, n, err, want)
+		}
+		mark()
+	}
+	for ms := uint64(2); ms <= 10; ms++ {
+		add("s3", ms, "tiny")
+	}
+	flush()
+	deliver("s3", "boot", "w1", 4, 888, 4)
+	flush()
+	deliver("s3", "boot", "w2", 3, 890, 3)
+	ack("s3", "boot", 2, [2]uint64{2, 1}, [2]uint64{4, 1})
+	flush()
+	deliver("s3", "boot", "w1", -1, 892, 3)
+	flush()
+	if pending, err := x.GroupDelConsumer(ctx, []byte("s3"), []byte("boot"), []byte("w2")); err != nil || pending != 3 {
+		t.Fatalf("GroupDelConsumer(w2) = %d, %v", pending, err)
+	}
+	mark()
+	flush()
+	ack("s3", "boot", 5, [2]uint64{1, 1}, [2]uint64{3, 1}, [2]uint64{8, 1}, [2]uint64{9, 1}, [2]uint64{10, 1})
+	flush()
+	deliver("s", "beta", "bc", 2, 900, 2)
 	flush()
 
 	if err := db.Close(); err != nil {

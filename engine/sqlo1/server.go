@@ -1175,6 +1175,10 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.xrangeCmd(ctx, reply, args, false)
 	case "XREVRANGE":
 		return s.xrangeCmd(ctx, reply, args, true)
+	case "XREADGROUP":
+		return s.xreadgroupCmd(ctx, reply, args, now)
+	case "XACK":
+		return s.xackCmd(ctx, reply, args)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
