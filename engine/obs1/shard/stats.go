@@ -37,6 +37,8 @@ const (
 	StatParkStallsResident
 	StatParkStallsFlushlag
 	StatParkStallsLease
+	StatColdRecords
+	StatColdBytes
 	NumStats
 )
 
@@ -71,6 +73,14 @@ var statNames = [NumStats]string{
 	StatParkStallsResident: "backpressure_stalls_resident",
 	StatParkStallsFlushlag: "backpressure_stalls_flushlag",
 	StatParkStallsLease:    "backpressure_stalls_lease",
+
+	// The cold-tier census: records and region bytes the demoters have shed
+	// out of resident RAM. The collection demote passes write here and no
+	// resident counter sees them (the ring slabs sit outside the arena), so
+	// these two rows are the doc 09 section 8 evidence that a working set
+	// outgrew RAM through the collection path, what the queue-end lab reads.
+	StatColdRecords: "cold_records",
+	StatColdBytes:   "cold_region_bytes",
 }
 
 // appendStat writes one name:value INFO line.
