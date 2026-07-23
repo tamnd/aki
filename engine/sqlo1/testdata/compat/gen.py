@@ -1370,6 +1370,248 @@ def main():
     c("LMPOP", "2", "l:str", "l:src", "LEFT")
     c("BLPOP", "l:str", "0")
 
+    # ---------------------------------------------------------------
+    section("STREAM")
+    # Streams pin on explicit IDs only: an auto ID carries the wall
+    # clock and can never replay. Replies that carry wall-clock or
+    # geometry fields stay out too and live in the wire tests
+    # instead: XINFO STREAM renders the radix-tree fields (sqlo1
+    # reports its own run geometry there), XINFO CONSUMERS and XINFO
+    # STREAM FULL carry idle and delivery times, and the XPENDING
+    # extended form renders per-entry idle ms. XTRIM's ~ variant cuts
+    # at node boundaries whose geometry is engine-defined, so only
+    # exact trims pin; the ~ grammar doors still do.
+
+    # XADD: explicit IDs, bare ms as ms-0, ms-* sequence fill, the
+    # ordering refusals, the 0-0 floor, NOMKSTREAM, arity and field
+    # pairing doors.
+    c("XADD", "x:k", "1-1", "f", "v")
+    c("XADD", "x:k", "1-2", "a", "1", "b", "2")
+    c("XADD", "x:k", "2", "f", "v")
+    c("XADD", "x:k", "2-*", "f", "v")
+    c("XADD", "x:k", "1-5", "f", "v")
+    c("XADD", "x:k", "2-0", "f", "v")
+    c("XADD", "x:k", "0-0", "f", "v")
+    c("XADD", "x:floor", "0-1", "f", "v")
+    c("XADD", "x:k", "notanid", "f", "v")
+    c("XADD", "x:k", "3-1", "f")
+    c("XADD", "x:k")
+    c("XADD", "x:missing", "NOMKSTREAM", "1-1", "f", "v")
+    c("TYPE", "x:missing")
+    c("XADD", "x:k", "NOMKSTREAM", "3-1", "f", "v")
+    c("XLEN", "x:k")
+    c("TYPE", "x:k")
+    c("OBJECT", "ENCODING", "x:k")
+    c("XLEN", "x:missing")
+    c("XLEN")
+
+    # XRANGE and XREVRANGE: full window, explicit and bare-ms bounds,
+    # exclusive bounds, COUNT, the empty window, the miss, and the
+    # bound grammar doors.
+    for xid in ["1-1", "2-1", "2-2", "3-1", "4-1", "5-1"]:
+        c("XADD", "x:r", xid, "i", xid)
+    c("XRANGE", "x:r", "-", "+")
+    c("XRANGE", "x:r", "-", "+", "COUNT", "2")
+    c("XRANGE", "x:r", "2-1", "4-1")
+    c("XRANGE", "x:r", "2", "4")
+    c("XRANGE", "x:r", "(2-1", "(5-1")
+    c("XRANGE", "x:r", "(2", "+")
+    c("XRANGE", "x:r", "3-1", "3-1")
+    c("XRANGE", "x:r", "+", "-")
+    c("XRANGE", "x:missing", "-", "+")
+    c("XREVRANGE", "x:r", "+", "-")
+    c("XREVRANGE", "x:r", "+", "-", "COUNT", "2")
+    c("XREVRANGE", "x:r", "4-1", "2-1")
+    c("XREVRANGE", "x:r", "(5-1", "(2-1")
+    c("XREVRANGE", "x:r", "-", "+")
+    c("XREVRANGE", "x:missing", "+", "-")
+    c("XRANGE", "x:r", "notanid", "+")
+    c("XRANGE", "x:r", "(-", "+")
+    c("XRANGE", "x:r", "-", "+", "COUNT", "x")
+    c("XRANGE", "x:r", "-")
+
+    # Trims: exact MAXLEN and MINID through XTRIM and the XADD arms,
+    # trim to empty keeps the key, the LIMIT-needs-~ door and the
+    # option grammar.
+    for i in range(1, 11):
+        c("XADD", "x:t", "%d-1" % i, "f", "v")
+    c("XTRIM", "x:t", "MAXLEN", "7")
+    c("XLEN", "x:t")
+    c("XRANGE", "x:t", "-", "+", "COUNT", "1")
+    c("XTRIM", "x:t", "MINID", "6")
+    c("XRANGE", "x:t", "-", "+", "COUNT", "1")
+    c("XTRIM", "x:t", "MINID", "8-1")
+    c("XTRIM", "x:t", "MAXLEN", "100")
+    c("XTRIM", "x:t", "MAXLEN", "0")
+    c("XLEN", "x:t")
+    c("TYPE", "x:t")
+    c("XADD", "x:t2", "MAXLEN", "3", "5-1", "f", "v")
+    c("XADD", "x:t2", "MAXLEN", "3", "6-1", "f", "v")
+    c("XADD", "x:t2", "MAXLEN", "3", "7-1", "f", "v")
+    c("XADD", "x:t2", "MAXLEN", "3", "8-1", "f", "v")
+    c("XLEN", "x:t2")
+    c("XRANGE", "x:t2", "-", "+", "COUNT", "1")
+    c("XADD", "x:t2", "MINID", "7", "9-1", "f", "v")
+    c("XRANGE", "x:t2", "-", "+", "COUNT", "1")
+    c("XTRIM", "x:missing", "MAXLEN", "5")
+    c("XTRIM", "x:t", "MAXLEN", "notanum")
+    c("XTRIM", "x:t", "MINID", "notanid")
+    c("XTRIM", "x:t", "MAXLEN", "5", "LIMIT", "10")
+    c("XTRIM", "x:t", "BOGUS", "5")
+    c("XTRIM", "x:t")
+
+    # XSETID: forward and equal moves, the smaller-than-top refusal,
+    # the missing-key refusal, the option arms, and generation
+    # resuming above the moved ID.
+    c("XADD", "x:sid", "3-3", "f", "v")
+    c("XSETID", "x:sid", "5-5")
+    c("XADD", "x:sid", "5-5", "f", "v")
+    c("XADD", "x:sid", "5-6", "f", "v")
+    c("XSETID", "x:sid", "2-2")
+    c("XSETID", "x:sid", "9-9", "ENTRIESADDED", "42", "MAXDELETEDID", "4-4")
+    c("XSETID", "x:missing", "1-1")
+    c("XSETID", "x:sid", "notanid")
+    c("XSETID", "x:sid")
+
+    # XDEL: the key check precedes the ID parse, one bad ID aborts
+    # the call, duplicates count once, a bare ms misses, and a stream
+    # deleted to empty keeps its key and its last generated ID.
+    for xid in ["1-1", "2-2", "3-3"]:
+        c("XADD", "x:d", xid, "f", "v")
+    c("XDEL", "x:missing", "notanid")
+    c("XDEL", "x:d", "notanid")
+    c("XDEL", "x:d", "1-1", "notanid")
+    c("XLEN", "x:d")
+    c("XDEL", "x:d", "1-1", "1-1", "9-9")
+    c("XLEN", "x:d")
+    c("XDEL", "x:d", "2")
+    c("XDEL", "x:d", "3-3", "2-2")
+    c("XLEN", "x:d")
+    c("TYPE", "x:d")
+    c("XADD", "x:d", "3-3", "f", "v")
+    c("XADD", "x:d", "3-4", "f", "v")
+    c("XDEL", "x:d")
+
+    # Groups: create with and without MKSTREAM, BUSYGROUP, SETID,
+    # consumer create and delete, destroy, and the subcommand doors.
+    c("XADD", "x:g", "1-1", "f", "a")
+    c("XADD", "x:g", "2-1", "f", "b")
+    c("XADD", "x:g", "3-1", "f", "c")
+    c("XADD", "x:g", "4-1", "f", "d")
+    c("XGROUP", "CREATE", "x:g", "grp", "0")
+    c("XGROUP", "CREATE", "x:g", "grp", "0")
+    c("XGROUP", "CREATE", "x:missing", "grp", "0")
+    c("XGROUP", "CREATE", "x:mk", "grp", "$", "MKSTREAM")
+    c("TYPE", "x:mk")
+    c("XLEN", "x:mk")
+    c("XGROUP", "CREATECONSUMER", "x:g", "grp", "c1")
+    c("XGROUP", "CREATECONSUMER", "x:g", "grp", "c1")
+    c("XGROUP", "CREATECONSUMER", "x:g", "nogrp", "c1")
+    c("XGROUP", "DELCONSUMER", "x:g", "grp", "c1")
+    c("XGROUP", "DELCONSUMER", "x:g", "grp", "ghost")
+    c("XGROUP", "SETID", "x:g", "grp", "2-1")
+    c("XGROUP", "SETID", "x:g", "grp", "0")
+    c("XGROUP", "SETID", "x:g", "nogrp", "0")
+    c("XGROUP", "DESTROY", "x:mk", "grp")
+    c("XGROUP", "DESTROY", "x:mk", "grp")
+    c("XGROUP", "BOGUS", "x:g", "grp")
+    c("XGROUP", "CREATE", "x:g", "grp2", "notanid")
+
+    # Delivery and acks: > against history, COUNT, NOACK, the
+    # XPENDING summary form, ack idempotence, and the NOGROUP walls.
+    c("XREADGROUP", "GROUP", "grp", "c1", "COUNT", "2", "STREAMS", "x:g", ">")
+    c("XREADGROUP", "GROUP", "grp", "c2", "STREAMS", "x:g", ">")
+    c("XREADGROUP", "GROUP", "grp", "c1", "STREAMS", "x:g", ">")
+    c("XPENDING", "x:g", "grp")
+    c("XREADGROUP", "GROUP", "grp", "c1", "STREAMS", "x:g", "0")
+    c("XREADGROUP", "GROUP", "grp", "c1", "COUNT", "1", "STREAMS", "x:g", "3-1")
+    c("XACK", "x:g", "grp", "1-1")
+    c("XACK", "x:g", "grp", "1-1")
+    c("XACK", "x:g", "grp", "9-9")
+    c("XACK", "x:g", "grp", "2-1", "3-1")
+    c("XPENDING", "x:g", "grp")
+    c("XACK", "x:g", "nogrp", "1-1")
+    c("XACK", "x:missing", "grp", "1-1")
+    c("XADD", "x:g", "5-1", "f", "e")
+    c("XREADGROUP", "GROUP", "grp", "c3", "NOACK", "STREAMS", "x:g", ">")
+    c("XPENDING", "x:g", "grp")
+    c("XREADGROUP", "GROUP", "grp", "c3", "STREAMS", "x:g", ">")
+    c("XREADGROUP", "GROUP", "nogrp", "c1", "STREAMS", "x:g", ">")
+    c("XREADGROUP", "GROUP", "grp", "c1", "STREAMS", "x:g", "$")
+    c("XREADGROUP", "GROUP", "grp", "c1", "STREAMS", "x:g", "x:g", ">")
+    c("XREADGROUP", "STREAMS", "x:g", ">")
+    c("XREADGROUP", "GROUP", "grp", "c1")
+
+    # Claims: XCLAIM entry and JUSTID forms at idle 0, the silent
+    # skip of unknown IDs, FORCE minting, XAUTOCLAIM's cursor walk
+    # and its deleted-entry drain, and the numeric doors.
+    c("XPENDING", "x:g", "grp")
+    c("XCLAIM", "x:g", "grp", "c9", "0", "4-1")
+    c("XCLAIM", "x:g", "grp", "c9", "0", "4-1", "JUSTID")
+    c("XCLAIM", "x:g", "grp", "c9", "0", "9-9")
+    c("XCLAIM", "x:g", "grp", "c9", "0", "2-1", "FORCE", "JUSTID")
+    c("XPENDING", "x:g", "grp")
+    c("XCLAIM", "x:g", "nogrp", "c9", "0", "4-1")
+    c("XCLAIM", "x:missing", "grp", "c9", "0", "4-1")
+    c("XCLAIM", "x:g", "grp", "c9", "notanum", "4-1")
+    c("XCLAIM", "x:g", "grp", "c9", "0", "notanid")
+    c("XAUTOCLAIM", "x:g", "grp", "ac", "0", "0")
+    c("XAUTOCLAIM", "x:g", "grp", "ac", "0", "0", "COUNT", "1", "JUSTID")
+    c("XAUTOCLAIM", "x:g", "grp", "ac", "0", "5-0")
+    c("XDEL", "x:g", "2-1")
+    c("XAUTOCLAIM", "x:g", "grp", "ac2", "0", "0")
+    c("XPENDING", "x:g", "grp")
+    c("XAUTOCLAIM", "x:g", "nogrp", "ac", "0", "0")
+    c("XAUTOCLAIM", "x:g", "grp", "ac", "0", "0", "COUNT", "0")
+    c("XAUTOCLAIM", "x:g", "grp", "ac", "notanum", "0")
+    c("XAUTOCLAIM", "x:g", "grp", "ac", "0", "notanid")
+    c("XAUTOCLAIM", "x:g", "grp", "ac", "0")
+
+    # XINFO GROUPS carries only counts, IDs, and lag, so it pins;
+    # destroy sweeps the group and its pending state.
+    c("XINFO", "GROUPS", "x:g")
+    c("XINFO", "GROUPS", "x:missing")
+    c("XGROUP", "DESTROY", "x:g", "grp")
+    c("XINFO", "GROUPS", "x:g")
+    c("XGROUP", "CREATE", "x:g", "grp", "0")
+    c("XPENDING", "x:g", "grp")
+    c("XGROUP", "DESTROY", "x:g", "grp")
+
+    # XREAD: non-blocking reads, multi-stream with a miss, the frozen
+    # $ answering nothing new, the + newest-entry form, immediate
+    # service under BLOCK, and the grammar doors.
+    c("XREAD", "COUNT", "2", "STREAMS", "x:r", "0")
+    c("XREAD", "STREAMS", "x:r", "3-1")
+    c("XREAD", "STREAMS", "x:r", "x:k", "0", "0")
+    c("XREAD", "STREAMS", "x:r", "x:missing", "0", "0")
+    c("XREAD", "STREAMS", "x:missing", "0")
+    c("XREAD", "STREAMS", "x:r", "$")
+    c("XREAD", "STREAMS", "x:r", "+")
+    c("XREAD", "BLOCK", "0", "STREAMS", "x:r", "0")
+    c("XREAD", "BLOCK", "notanum", "STREAMS", "x:r", "0")
+    c("XREAD", "BLOCK", "-1", "STREAMS", "x:r", "0")
+    c("XREAD", "STREAMS", "x:r", "x:k", "0")
+    c("XREAD", "STREAMS")
+    c("XREAD", "COUNT", "x", "STREAMS", "x:r", "0")
+
+    # Type walls: every stream command against a string key.
+    c("SET", "x:str", "v")
+    c("XADD", "x:str", "1-1", "f", "v")
+    c("XLEN", "x:str")
+    c("XRANGE", "x:str", "-", "+")
+    c("XREVRANGE", "x:str", "+", "-")
+    c("XTRIM", "x:str", "MAXLEN", "5")
+    c("XSETID", "x:str", "1-1")
+    c("XDEL", "x:str", "1-1")
+    c("XGROUP", "CREATE", "x:str", "g", "0")
+    c("XREADGROUP", "GROUP", "g", "c", "STREAMS", "x:str", ">")
+    c("XACK", "x:str", "g", "1-1")
+    c("XPENDING", "x:str", "g")
+    c("XCLAIM", "x:str", "g", "c", "0", "1-1")
+    c("XAUTOCLAIM", "x:str", "g", "c", "0", "0")
+    c("XINFO", "GROUPS", "x:str")
+    c("XREAD", "STREAMS", "x:str", "0")
+
     print("\n".join(lines))
 
 
