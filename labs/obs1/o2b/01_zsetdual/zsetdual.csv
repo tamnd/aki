@@ -1,0 +1,28 @@
+n,cell,ops,gets_per_op,kib_per_op,extra
+100000,zscore,2000,1.0000,126.7,100.0 found%
+100000,zrank,2000,1.0000,126.8,100.0 found%
+100000,zrank_scan,3,1.0000,3231.9,100.0 found%
+100000,zrangebyscore_0.001,5,1.0000,128.0,100.0 found%
+100000,zrangebyscore_0.05,5,2.0000,272.0,100.0 found%
+100000,zrangebyscore_0.25,5,2.0000,928.1,100.0 found%
+100000,dual_amp_ratio,,2.0000,,
+100000,dir_b_per_elem_dual,,0.0920,,
+100000,churn_consistent,,,,true
+1000000,zscore,2000,1.0000,127.9,100.0 found%
+1000000,zrank,2000,1.0000,127.9,100.0 found%
+1000000,zrank_scan,3,2.0000,32350.7,100.0 found%
+1000000,zrangebyscore_0.001,5,2.0000,160.1,100.0 found%
+1000000,zrangebyscore_0.05,5,2.0000,1743.9,100.0 found%
+1000000,zrangebyscore_0.25,5,2.0000,8208.0,100.0 found%
+1000000,dual_amp_ratio,,2.0000,,
+1000000,dir_b_per_elem_dual,,0.0920,,
+1000000,churn_consistent,,,,true
+10000000,zscore,2000,1.0000,128.0,100.0 found%
+10000000,zrank,2000,1.0000,128.0,100.0 found%
+10000000,zrank_scan,3,20.0000,323633.9,100.0 found%
+10000000,zrangebyscore_0.001,5,2.0000,448.1,100.0 found%
+10000000,zrangebyscore_0.05,5,2.0000,16304.1,100.0 found%
+10000000,zrangebyscore_0.25,5,6.0000,81040.0,100.0 found%
+10000000,dual_amp_ratio,,2.0000,,
+10000000,dir_b_per_elem_dual,,0.0920,,
+10000000,churn_consistent,,,,true
