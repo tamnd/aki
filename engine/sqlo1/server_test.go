@@ -198,6 +198,30 @@ func TestServerExpirySemantics(t *testing.T) {
 	}
 }
 
+// TestServerInfo checks the INFO surface: a bulk reply carrying the
+// backend record and the store counters. MemStore has no IO layer, so
+// the backend line reads none; a gate run over sqlo1b sees ioring or
+// iopool here.
+func TestServerInfo(t *testing.T) {
+	do, _ := dispatchServer(t)
+
+	do("SET", "k", "v")
+	got := do("INFO")
+	if !strings.HasPrefix(got, "$") {
+		t.Fatalf("INFO reply = %q, want a bulk string", got)
+	}
+	for _, want := range []string{"# sqlo1\r\n", "io_backend:none\r\n", "keys:", "disk_bytes:", "high_water:", "hot_keys:", "dirty_bytes:"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("INFO reply %q missing %q", got, want)
+		}
+	}
+	// A section argument is accepted and answered with the same one
+	// section, like a Redis build that lacks the section.
+	if got := do("INFO", "server"); !strings.Contains(got, "io_backend:none\r\n") {
+		t.Fatalf("INFO with a section = %q, want the sqlo1 section", got)
+	}
+}
+
 // TestServerSetOptions covers the SET option surface: NX, XX, GET,
 // KEEPTTL, and the four expiry forms.
 func TestServerSetOptions(t *testing.T) {

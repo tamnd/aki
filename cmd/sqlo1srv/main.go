@@ -29,7 +29,17 @@ func main() {
 	store := flag.String("store", "mem", "store backend: mem or file")
 	path := flag.String("path", "", "data file for -store file; the WAL sidecar sits next to it")
 	maxBytes := flag.Int64("max-bytes", 0, "data file budget in bytes for -store file; 0 is unbounded and disables the free-extent pressure rung")
+	ioBackend := flag.String("io-backend", "auto", "cold-read IO backend for -store file: auto (ring where supported, iopool otherwise) or iopool; INFO reports which one is live")
 	flag.Parse()
+
+	switch *ioBackend {
+	case "auto":
+	case "iopool":
+		sqlo1b.ForceIOPool = true
+	default:
+		fmt.Fprintf(os.Stderr, "sqlo1srv: unknown io backend %q\n", *ioBackend)
+		os.Exit(2)
+	}
 
 	var st sqlo1.Store
 	var db *sqlo1b.Store

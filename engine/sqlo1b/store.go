@@ -94,6 +94,11 @@ type Store struct {
 	io      *IOBridge
 	closeFn func() error
 
+	// ioBackend names the live IO backend ("ioring" or "iopool"),
+	// settled once by startIO and surfaced through Stats because a
+	// gate run must know which backend ran (doc 13).
+	ioBackend string
+
 	// Linear hash state, committed as hash_epoch at checkpoint.
 	level   uint8
 	split   uint64
@@ -254,13 +259,70 @@ func CreateStoreOn(f StoreFile, walPath string, walSegSize int64) (*Store, error
 	return s, nil
 }
 
-// startIO stands up the IO backend under the store: an iopool over
-// the data file with the bridge on top. Runs after the superblock is
-// settled because the pool needs the extent size, and before the
-// IndexReader because live group reads ride it.
+// startIO stands up the IO backend under the store, ring first with
+// the pool as the silent fallback (doc 04 section 12): a ring that
+// cannot set up or fails its self-test means iopool, never an error
+// the caller has to route, and Stats records which backend is live
+// because a gate run must know which one ran (doc 13). Runs after the
+// superblock is settled because both backends need the extent size,
+// and before the IndexReader because live group reads ride it.
 func (s *Store) startIO() {
 	comp := make(chan IOResult, storeIOComp)
+	if r := s.tryRing(comp); r != nil {
+		s.io = NewIOBridge(r, comp)
+		s.ioBackend = "ioring"
+		return
+	}
+	// Fresh mailbox: an abandoned ring may still post a stale
+	// completion to the old one.
+	comp = make(chan IOResult, storeIOComp)
 	s.io = NewIOBridge(NewIOPool(s.f, s.sb.ExtentSize, storeIOWorkers, comp), comp)
+	s.ioBackend = "iopool"
+}
+
+// tryRing stands the ring up over the data file and self-tests it
+// before the store trusts it: one group read through the ring,
+// compared byte for byte against a plain pread of the same range. Any
+// refusal (not Linux, kernel too old, seccomp denying the syscalls,
+// registration refused) or a wrong answer returns nil and the caller
+// runs the pool. The self-test rides the production ring instance
+// with the bridge router not yet started, so the completion is
+// consumed here and the ring hands over clean.
+func (s *Store) tryRing(comp chan IOResult) *IORing {
+	if ForceIOPool {
+		return nil
+	}
+	osf, ok := s.f.(*os.File)
+	if !ok {
+		// A wrapped file (the crash harness FaultFile) has no fd the
+		// ring could submit against.
+		return nil
+	}
+	r, err := NewIORing(osf, s.sb.ExtentSize, storeRingDepth, 0, comp)
+	if err != nil {
+		return nil
+	}
+	want := make([]byte, GroupSize)
+	if _, err := osf.ReadAt(want, 0); err != nil {
+		r.Close()
+		return nil
+	}
+	got := make([]byte, GroupSize)
+	const selfTestTag = ^uint64(0)
+	r.Submit([]IOReq{{Op: OpRead, Prio: PrioFG, Ext: 0, Off: 0, Buf: got, Tag: selfTestTag}})
+	select {
+	case res := <-comp:
+		if res.Err != nil || res.Tag != selfTestTag || !bytes.Equal(want, got) {
+			r.Close()
+			return nil
+		}
+	case <-time.After(ringSelfTestTimeout):
+		// Deliberately not closed: teardown joins the reaper, which
+		// may be stuck on the same completion that never came. A
+		// one-time leak on a pathological box beats a hung startup.
+		return nil
+	}
+	return r
 }
 
 // OpenStore opens an existing store, running recovery: pick the
@@ -1986,6 +2048,7 @@ func (s *Store) Stats() sqlo1.StoreStats {
 		Keys:      int64(s.entries),
 		DiskBytes: int64(s.sb.ExtentCount) * int64(s.sb.ExtentSize),
 		HighWater: s.hw,
+		IOBackend: s.ioBackend,
 	}
 	for scheme, n := range s.schemeGroups {
 		if n == 0 {

@@ -100,6 +100,11 @@ type StoreStats struct {
 	FrameDecodes     int64
 	FrameDecodeBytes int64
 	FrameHits        int64
+	// IOBackend names the backend serving cold reads ("ioring" or
+	// "iopool"), empty on stores without the doc 04 section 12 IO
+	// layer (MemStore, sqlo1a). INFO surfaces it because a gate run
+	// must know which backend ran (doc 13).
+	IOBackend string
 }
 
 // Store is the seam between the shared runtime and a backend (doc 02
