@@ -585,7 +585,7 @@ func (f *Folder) buildSegment(job *segJob) (*Segment, error) {
 		first := run[0]
 		var disc [8]byte
 		binary.LittleEndian.PutUint64(disc[:], first.fp)
-		data := store.AppendRunChunk(nil, first.kind|store.ChunkKindBit, 0,
+		data := store.AppendRunChunk(nil, first.kind|store.ChunkKindBit, store.ChunkFlagRun,
 			uint16(len(run)), first.key, disc[:], payload)
 		for _, r := range run {
 			job.places = append(job.places, KeyPlace{
