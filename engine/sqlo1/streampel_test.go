@@ -467,11 +467,13 @@ func TestStreamPelHistoryOracle(t *testing.T) {
 	r.check(key)
 }
 
-// TestStreamPelFenceRefusal proves the two temporary refusals are
-// side-effect free: the inline fence cap and the u8 consumer index
-// both refuse the delivery before any state moves.
+// TestStreamPelFenceRefusal proves the two refusals are side-effect
+// free: the fence page index cap and the u8 consumer index both refuse
+// the delivery before any state moves. Single-row pages make the index
+// bind at the same two-slot point the inline cap used to.
 func TestStreamPelFenceRefusal(t *testing.T) {
 	defer SetStreamPelCapsForTest(4096, 2, 2)()
+	defer SetStreamPelPageMaxForTest(1)()
 	r := newStreamRig(t)
 	ctx := context.Background()
 	key := "k"

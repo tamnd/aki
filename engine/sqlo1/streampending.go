@@ -73,6 +73,9 @@ func (x *Stream) PendingSummary(ctx context.Context, key, group []byte) (total u
 	if total == 0 {
 		return 0, streamID{}, streamID{}, nil, nil
 	}
+	if err := x.pelfLoad(ctx, &g); err != nil {
+		return 0, streamID{}, streamID{}, nil, err
+	}
 	minID = g.pelf[0].base
 	last, err := x.readPelSeg(ctx, g.pelf[len(g.pelf)-1].segid)
 	if err != nil {
@@ -202,8 +205,12 @@ func pelSegEncodedLen(ents []streamPelEnt) int {
 // for deletion after the record write, an oversized one (a FORCE
 // insert past the caps) splits with the second half on a fresh segid,
 // and the rest rewrite in place. Fresh segments flush before the
-// caller's record write; rootDirty reports minted segids. The fence
-// full check runs before any write, so a refusal is side-effect free.
+// caller's record write, and the in-place rewrites (a split's shrunk
+// head among them) hold until after that flush so they ride the
+// record's batch: a cut at the flush boundary must recover the old
+// fence over unchanged segments, fresh orphans aside. rootDirty
+// reports minted segids. The fence full check runs before any write,
+// so a refusal is side-effect free.
 func (x *Stream) pelEditFinalize(ctx context.Context, g *streamGroup, cache map[int]*pelSegEdit) (rootDirty bool, err error) {
 	x.pelDrops = x.pelDrops[:0]
 	idxs := make([]int, 0, len(cache))
@@ -217,8 +224,19 @@ func (x *Stream) pelEditFinalize(ctx context.Context, g *streamGroup, cache map[
 			splits++
 		}
 	}
-	if len(g.pelf)+splits > streamPelFenceMax {
-		return false, errStreamPelFenceFull
+	// Capacity runs before any write on a conservative bound the exact
+	// page plan can only come under: a paged fence adds at most one
+	// index slot per split, and an inline fence either stays under the
+	// cap or transitions into ceil(rows/pageMax) pages.
+	proj := len(g.pelf) + splits
+	if g.pelPaged {
+		if len(g.pelIdx)+splits > streamPelFenceMax {
+			return false, errStreamPelFenceFull
+		}
+	} else if proj > streamPelFenceMax {
+		if (proj+streamPelPageMax-1)/streamPelPageMax > streamPelFenceMax {
+			return false, errStreamPelFenceFull
+		}
 	}
 	sort.Ints(idxs)
 	// Splits mint segids and shift fence slots, so they rewrite the
@@ -226,6 +244,11 @@ func (x *Stream) pelEditFinalize(ctx context.Context, g *streamGroup, cache map[
 	// second half or a first-ever mint) flushes before the caller
 	// writes the record, so a crash prefix leaves only orphans.
 	fresh := false
+	type pelInPlace struct {
+		segid uint64
+		ents  []streamPelEnt
+	}
+	var inPlace []pelInPlace
 	for k := len(idxs) - 1; k >= 0; k-- {
 		fi := idxs[k]
 		e := cache[fi]
@@ -252,17 +275,14 @@ func (x *Stream) pelEditFinalize(ctx context.Context, g *streamGroup, cache map[
 		if e.fresh {
 			rootDirty = true
 			fresh = true
-		}
-		if err := x.writePelSeg(ctx, g.pelf[fi].segid, e.ents); err != nil {
-			return false, err
+			if err := x.writePelSeg(ctx, g.pelf[fi].segid, e.ents); err != nil {
+				return false, err
+			}
+		} else {
+			inPlace = append(inPlace, pelInPlace{segid: g.pelf[fi].segid, ents: e.ents})
 		}
 		g.pelf[fi].base = e.ents[0].id
 		g.pelf[fi].count = uint32(len(e.ents))
-	}
-	if fresh {
-		if err := x.t.Flush(ctx); err != nil {
-			return false, err
-		}
 	}
 	live := g.pelf[:0]
 	for i := range g.pelf {
@@ -271,6 +291,36 @@ func (x *Stream) pelEditFinalize(ctx context.Context, g *streamGroup, cache map[
 		}
 	}
 	g.pelf = live
+	// The page plan runs over the compacted fence; fresh pages join the
+	// fresh segments under one flush, in-place page rewrites ride the
+	// caller's record batch in pelfAmend after it.
+	planned, err := x.pelfPlan(g)
+	if err != nil {
+		return false, err
+	}
+	if planned {
+		pageDirty, err := x.pelfFresh(ctx, g)
+		if err != nil {
+			return false, err
+		}
+		rootDirty = rootDirty || pageDirty
+		fresh = fresh || pageDirty
+	}
+	if fresh {
+		if err := x.t.Flush(ctx); err != nil {
+			return false, err
+		}
+	}
+	for i := range inPlace {
+		if err := x.writePelSeg(ctx, inPlace[i].segid, inPlace[i].ents); err != nil {
+			return false, err
+		}
+	}
+	if planned {
+		if err := x.pelfAmend(ctx, g); err != nil {
+			return false, err
+		}
+	}
 	return rootDirty, nil
 }
 
@@ -307,6 +357,9 @@ func (x *Stream) Claim(ctx context.Context, key, group, consumer []byte, minIdle
 		return nil, errStreamNoGroup
 	}
 	g := x.copyGroupOwned(&g0)
+	if err := x.pelfLoad(ctx, &g); err != nil {
+		return nil, err
+	}
 	ci, err := groupConsumer(&g, consumer, nowMs)
 	if err != nil {
 		return nil, err
@@ -459,6 +512,9 @@ func (x *Stream) AutoClaim(ctx context.Context, key, group, consumer []byte, min
 		return zero, nil, nil, errStreamNoGroup
 	}
 	g := x.copyGroupOwned(&g0)
+	if err := x.pelfLoad(ctx, &g); err != nil {
+		return zero, nil, nil, err
+	}
 	ci, err := groupConsumer(&g, consumer, nowMs)
 	if err != nil {
 		return zero, nil, nil, err

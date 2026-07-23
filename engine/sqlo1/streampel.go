@@ -9,9 +9,9 @@ package sqlo1
 // segment flushes before the record that references it and everything
 // else rides one atomic batch (X-I5). The xpel lab (#1270) bakes the
 // caps: segments cut at 4096 encoded bytes with a 1024-entry backstop
-// that never binds at that byte cap, and the fence stays inline in the
-// record until the paging follow-up, refusing deliveries past the
-// inline budget the way the flat run fence refused before kind 3.
+// that never binds at that byte cap, and the fence goes inline then
+// paged (streampelpage.go) once it outgrows the record budget, the
+// kind 3 ladder at the group record.
 
 import (
 	"bytes"
@@ -58,10 +58,12 @@ var (
 	streamPelFenceMax = (listInlineMax - streamGroupHdrLen) / streamPelFenceEntLen
 )
 
-// errStreamPelFenceFull is the inline fence's temporary refusal, the
-// 70-run flat fence precedent: a refused delivery is side-effect free
-// and the fence paging slice lifts the cap.
-var errStreamPelFenceFull = errors.New("sqlo1: stream group PEL fence is full until the paging slice")
+// errStreamPelFenceFull is the paged fence's page index refusal, the
+// kind 3 third-level precedent: a refused delivery or claim is
+// side-effect free, and at the production caps the index holds 72
+// pages of 146 fence rows, about 2.6 million pending entries per
+// group before it binds.
+var errStreamPelFenceFull = errors.New("sqlo1: stream group PEL fence page index is full")
 
 // errStreamPelConsumerCap refuses a delivery for a consumer past the
 // PEL's u8 index, 256 consumers per group with pending entries.
@@ -261,6 +263,17 @@ func (x *Stream) copyGroupOwned(g *streamGroup) streamGroup {
 	if len(g.pelf) > 0 {
 		out.pelf = append([]streamPelFenceEnt(nil), g.pelf...)
 	}
+	out.pelPaged = g.pelPaged
+	out.pelLoaded = g.pelLoaded
+	if len(g.pelIdx) > 0 {
+		out.pelIdx = append([]streamPelFenceEnt(nil), g.pelIdx...)
+	}
+	if len(g.pelfOrig) > 0 {
+		out.pelfOrig = append([]streamPelFenceEnt(nil), g.pelfOrig...)
+	}
+	if len(g.pelPageN) > 0 {
+		out.pelPageN = append([]int(nil), g.pelPageN...)
+	}
 	return out
 }
 
@@ -298,6 +311,9 @@ func groupConsumer(g *streamGroup, consumer []byte, nowMs int64) (int, error) {
 func (x *Stream) pelDeliver(ctx context.Context, g *streamGroup, ids []streamID, cidx int, nowMs int64) (rootDirty bool, err error) {
 	if cidx > math.MaxUint8 {
 		return false, errStreamPelConsumerCap
+	}
+	if err := x.pelfLoad(ctx, g); err != nil {
+		return false, err
 	}
 	// Plan the segment layout first: the amended tail, then fresh
 	// cuts, sized by the encoded-byte and entry caps.
@@ -344,12 +360,30 @@ func (x *Stream) pelDeliver(ctx context.Context, g *streamGroup, ids []streamID,
 			fresh++
 		}
 	}
-	if len(g.pelf)+fresh > streamPelFenceMax {
-		return false, errStreamPelFenceFull
+	// Apply the fence edits in memory before any write: the amended
+	// tail's new count and the fresh slots with their segids still
+	// unminted, so the page plan can refuse side-effect free. The
+	// group is the caller's owned copy, discarded on error.
+	ti := -1
+	if len(plan) > 0 && !plan[0].fresh {
+		ti = len(g.pelf) - 1
+		g.pelf[ti].count = uint32(len(plan[0].ents))
 	}
-	// Fresh segments land and flush first, so a crash prefix without
-	// the record leaves only orphans; the amended tail rides the
-	// record's batch.
+	slot := len(g.pelf)
+	for i := range plan {
+		if plan[i].fresh {
+			g.pelf = append(g.pelf, streamPelFenceEnt{base: plan[i].ents[0].id, count: uint32(len(plan[i].ents))})
+		}
+	}
+	planned, err := x.pelfPlan(g)
+	if err != nil {
+		return false, err
+	}
+	// Fresh segments land first (the fence rows and page rows carry
+	// their segids), then the fresh pages, one flush covering both, so
+	// a crash prefix without the record leaves only orphans; the
+	// amended tail and the in-place page rewrites ride the record's
+	// batch after the barrier.
 	for i := range plan {
 		if !plan[i].fresh {
 			continue
@@ -357,22 +391,34 @@ func (x *Stream) pelDeliver(ctx context.Context, g *streamGroup, ids []streamID,
 		segid := x.root.nextSegid
 		x.root.nextSegid++
 		rootDirty = true
+		g.pelf[slot].segid = segid
+		slot++
 		if err := x.writePelSeg(ctx, segid, plan[i].ents); err != nil {
 			return false, err
 		}
-		g.pelf = append(g.pelf, streamPelFenceEnt{base: plan[i].ents[0].id, segid: segid, count: uint32(len(plan[i].ents))})
 	}
-	if fresh > 0 {
+	pageDirty := false
+	if planned {
+		pageDirty, err = x.pelfFresh(ctx, g)
+		if err != nil {
+			return false, err
+		}
+		rootDirty = rootDirty || pageDirty
+	}
+	if fresh > 0 || pageDirty {
 		if err := x.t.Flush(ctx); err != nil {
 			return false, err
 		}
 	}
-	if len(plan) > 0 && !plan[0].fresh {
-		ti := len(g.pelf) - 1 - fresh
+	if ti >= 0 {
 		if err := x.writePelSeg(ctx, g.pelf[ti].segid, plan[0].ents); err != nil {
 			return false, err
 		}
-		g.pelf[ti].count = uint32(len(plan[0].ents))
+	}
+	if planned {
+		if err := x.pelfAmend(ctx, g); err != nil {
+			return false, err
+		}
 	}
 	return rootDirty, nil
 }
@@ -383,6 +429,9 @@ func (x *Stream) pelDeliver(ctx context.Context, g *streamGroup, ids []streamID,
 // pel counters; the dropped segids land in x.pelDrops for the caller
 // to delete after its record write, same batch.
 func (x *Stream) pelRemove(ctx context.Context, g *streamGroup, ids []streamID, removed []int) (int64, error) {
+	if err := x.pelfLoad(ctx, g); err != nil {
+		return 0, err
+	}
 	x.pelDrops = x.pelDrops[:0]
 	bySeg := map[int][]streamID{}
 	for _, id := range ids {
@@ -443,17 +492,44 @@ func (x *Stream) pelRemove(ctx context.Context, g *streamGroup, ids []streamID, 
 		}
 	}
 	g.pelf = live
+	if total > 0 {
+		if err := x.pelfShrink(ctx, g); err != nil {
+			return 0, err
+		}
+	}
 	return total, nil
 }
 
-// pelDropPending deletes the segments pelRemove emptied, after the
-// record write that stopped referencing them, one batch.
+// pelfShrink runs the page store for a path that can only shrink the
+// fence, so a mint (which would demand a root write and a flush the
+// shrink paths do not have) is a writer bug.
+func (x *Stream) pelfShrink(ctx context.Context, g *streamGroup) error {
+	rootDirty, err := x.pelfStore(ctx, g)
+	if err != nil {
+		return err
+	}
+	if rootDirty {
+		return fmt.Errorf("sqlo1: stream PEL fence page mint on a shrink path")
+	}
+	return nil
+}
+
+// pelDropPending deletes the segments pelRemove emptied and the fence
+// pages the page plan replaced or flipped away, after the record write
+// that stopped referencing them, one batch.
 func (x *Stream) pelDropPending(ctx context.Context) error {
 	for _, segid := range x.pelDrops {
 		if err := x.delPelSeg(ctx, segid); err != nil {
 			return err
 		}
 	}
+	x.pelDrops = x.pelDrops[:0]
+	for _, pageid := range x.pelPageDrops {
+		if err := x.delPelPage(ctx, pageid); err != nil {
+			return err
+		}
+	}
+	x.pelPageDrops = x.pelPageDrops[:0]
 	return nil
 }
 
@@ -461,6 +537,9 @@ func (x *Stream) pelDropPending(ctx context.Context) error {
 // after, handing entries in ID order until fn returns false. fn sees a
 // value copy; the walk stops early on false.
 func (x *Stream) pelCollect(ctx context.Context, g *streamGroup, after streamID, fn func(e streamPelEnt) bool) error {
+	if err := x.pelfLoad(ctx, g); err != nil {
+		return err
+	}
 	start := max(pelFenceSeek(g.pelf, after), 0)
 	for fi := start; fi < len(g.pelf); fi++ {
 		ents, err := x.readPelSeg(ctx, g.pelf[fi].segid)
@@ -483,6 +562,9 @@ func (x *Stream) pelCollect(ctx context.Context, g *streamGroup, after streamID,
 // form's re-delivery bookkeeping. ids are pending and ID-sorted (they
 // came off a pelCollect walk).
 func (x *Stream) pelBump(ctx context.Context, g *streamGroup, ids []streamID, nowMs int64) error {
+	if err := x.pelfLoad(ctx, g); err != nil {
+		return err
+	}
 	for lo := 0; lo < len(ids); {
 		fi := pelFenceSeek(g.pelf, ids[lo])
 		hi := lo + 1
@@ -511,7 +593,11 @@ func (x *Stream) pelBump(ctx context.Context, g *streamGroup, ids []streamID, no
 // reindexes the owners above it, XGROUP DELCONSUMER's discard-pending
 // rule. The dropped segids land in x.pelDrops like pelRemove's.
 func (x *Stream) pelSweepConsumer(ctx context.Context, g *streamGroup, ci int) error {
+	if err := x.pelfLoad(ctx, g); err != nil {
+		return err
+	}
 	x.pelDrops = x.pelDrops[:0]
+	swept := false
 	for fi := 0; fi < len(g.pelf); fi++ {
 		ents, err := x.readPelSeg(ctx, g.pelf[fi].segid)
 		if err != nil {
@@ -533,6 +619,7 @@ func (x *Stream) pelSweepConsumer(ctx context.Context, g *streamGroup, ci int) e
 		if !touched {
 			continue
 		}
+		swept = true
 		if len(kept) == 0 {
 			g.pelf[fi].count = 0
 			x.pelDrops = append(x.pelDrops, g.pelf[fi].segid)
@@ -551,6 +638,11 @@ func (x *Stream) pelSweepConsumer(ctx context.Context, g *streamGroup, ci int) e
 		}
 	}
 	g.pelf = live
+	if swept {
+		if err := x.pelfShrink(ctx, g); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
