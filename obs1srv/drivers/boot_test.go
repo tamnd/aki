@@ -178,3 +178,65 @@ func TestBootServesSetsAcrossRestart(t *testing.T) {
 	expect(t, r3, ":1\r\n")
 	commitAndStop(t, b3, srv3, nc3)
 }
+
+// TestBootServesHashesAcrossRestart drives the hash plane through the
+// boot seam: creates, an overwrite, deletes, a field deadline set and
+// persisted, the TTL restore HINCRBY emits behind its hset, and a
+// DEL-emptied hash, all served back by the next incarnation.
+func TestBootServesHashesAcrossRestart(t *testing.T) {
+	bucket := sim.New(sim.Config{})
+
+	b1, srv1, nc1, r1 := bootServer(t, bucket, 1)
+	send(t, nc1, "HSET", "h", "f1", "v1", "f2", "v2")
+	expect(t, r1, ":2\r\n")
+	send(t, nc1, "HDEL", "h", "f2")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "HEXPIREAT", "h", "7000000000", "FIELDS", "1", "f1")
+	expect(t, r1, "*1\r\n:1\r\n")
+	send(t, nc1, "HINCRBY", "hc", "a", "5")
+	expect(t, r1, ":5\r\n")
+	send(t, nc1, "HEXPIREAT", "hc", "7000000000", "FIELDS", "1", "a")
+	expect(t, r1, "*1\r\n:1\r\n")
+	send(t, nc1, "HINCRBY", "hc", "a", "2")
+	expect(t, r1, ":7\r\n")
+	send(t, nc1, "HSET", "hp", "p", "v")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "HEXPIREAT", "hp", "7000000000", "FIELDS", "1", "p")
+	expect(t, r1, "*1\r\n:1\r\n")
+	send(t, nc1, "HPERSIST", "hp", "FIELDS", "1", "p")
+	expect(t, r1, "*1\r\n:1\r\n")
+	send(t, nc1, "HSET", "hd", "x", "1")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "HDEL", "hd", "x")
+	expect(t, r1, ":1\r\n")
+	commitAndStop(t, b1, srv1, nc1)
+
+	b2, srv2, nc2, r2 := bootServer(t, bucket, 2)
+	if b2.Replay.HSets == 0 || b2.Replay.HDels == 0 || b2.Replay.HExpires == 0 {
+		t.Fatalf("reboot replay stats %+v, want hash plane counts", b2.Replay)
+	}
+	send(t, nc2, "HGET", "h", "f1")
+	expect(t, r2, "$2\r\nv1\r\n")
+	send(t, nc2, "HGET", "h", "f2")
+	expect(t, r2, "$-1\r\n")
+	send(t, nc2, "HEXPIRETIME", "h", "FIELDS", "1", "f1")
+	expect(t, r2, "*1\r\n:7000000000\r\n")
+	send(t, nc2, "HGET", "hc", "a")
+	expect(t, r2, "$1\r\n7\r\n")
+	send(t, nc2, "HEXPIRETIME", "hc", "FIELDS", "1", "a")
+	expect(t, r2, "*1\r\n:7000000000\r\n")
+	send(t, nc2, "HEXPIRETIME", "hp", "FIELDS", "1", "p")
+	expect(t, r2, "*1\r\n:-1\r\n")
+	send(t, nc2, "HLEN", "hd")
+	expect(t, r2, ":0\r\n")
+	send(t, nc2, "HSET", "h", "f3", "v3")
+	expect(t, r2, ":1\r\n")
+	commitAndStop(t, b2, srv2, nc2)
+
+	b3, srv3, nc3, r3 := bootServer(t, bucket, 3)
+	send(t, nc3, "HGET", "h", "f3")
+	expect(t, r3, "$2\r\nv3\r\n")
+	send(t, nc3, "HLEN", "h")
+	expect(t, r3, ":2\r\n")
+	commitAndStop(t, b3, srv3, nc3)
+}

@@ -18,8 +18,8 @@
 //
 // Collection frames apply through each type package's exported Replay
 // functions with plain arguments, so the registries' shapes stay
-// private. The set plane is wired; the remaining collection kinds are
-// refused loudly until their planes land, never skipped.
+// private. The set and hash planes are wired; the remaining collection
+// kinds are refused loudly until their planes land, never skipped.
 package replay
 
 import (
@@ -28,6 +28,7 @@ import (
 	"math"
 
 	"github.com/tamnd/aki/engine/obs1"
+	"github.com/tamnd/aki/engine/obs1/hash"
 	"github.com/tamnd/aki/engine/obs1/set"
 	"github.com/tamnd/aki/engine/obs1/shard"
 )
@@ -58,6 +59,9 @@ type Stats struct {
 	CollDrops uint64
 	SAdds     uint64
 	SRems     uint64
+	HSets     uint64
+	HDels     uint64
+	HExpires  uint64
 }
 
 // pending is one buffered frame inside an open txn run. The key and
@@ -199,6 +203,9 @@ func (a *Applier) applyOne(group uint16, key []byte, op obs1.Op) error {
 		if set.ReplayDrop(cx, key) {
 			hit = true
 		}
+		if hash.ReplayDrop(cx, key) {
+			hit = true
+		}
 		if hit {
 			a.stats.Dels++
 		} else {
@@ -226,7 +233,7 @@ func (a *Applier) applyOne(group uint16, key []byte, op obs1.Op) error {
 		// The hint bytes are doc 08's encoding hints, opaque here and
 		// empty from every current emitter; application waits for the
 		// paired delta, which carries the members that decide the shape.
-		if o.Type != obs1.CollSet {
+		if o.Type != obs1.CollSet && o.Type != obs1.CollHash {
 			return fmt.Errorf("obs1 replay: collnew type 0x%02x is not wired for replay yet", o.Type)
 		}
 		a.news[group] = fresh{key: key, typ: o.Type}
@@ -235,7 +242,7 @@ func (a *Applier) applyOne(group uint16, key []byte, op obs1.Op) error {
 		return a.applyDelta(cx, key, o, false, 0)
 	case obs1.CollDrop:
 		// Typed drop, so a miss is corruption, unlike keydel's probe.
-		if !set.ReplayDrop(cx, key) {
+		if !set.ReplayDrop(cx, key) && !hash.ReplayDrop(cx, key) {
 			return fmt.Errorf("obs1 replay: colldrop names key %q but no collection exists", key)
 		}
 		a.stats.CollDrops++
@@ -269,10 +276,35 @@ func (a *Applier) applyDelta(cx *shard.Ctx, key []byte, d obs1.CollDelta, create
 			return err
 		}
 		a.stats.SRems++
+	case obs1.HSet:
+		if err := hash.ReplayHSet(cx, key, flattenPairs(s.Pairs), create); err != nil {
+			return err
+		}
+		a.stats.HSets++
+	case obs1.HDel:
+		if err := hash.ReplayHDel(cx, key, s.Fields); err != nil {
+			return err
+		}
+		a.stats.HDels++
+	case obs1.HExpire:
+		if err := hash.ReplayHExpire(cx, key, s.AtMs, s.Fields); err != nil {
+			return err
+		}
+		a.stats.HExpires++
 	default:
 		return fmt.Errorf("obs1 replay: colldelta sub-op %T is not wired for replay yet", d.Sub)
 	}
 	return nil
+}
+
+// flattenPairs lays field-value pairs out as the flat alternation the
+// type seams speak, the same shape the emission side consumed.
+func flattenPairs(pairs []obs1.FieldValue) [][]byte {
+	out := make([][]byte, 0, 2*len(pairs))
+	for _, p := range pairs {
+		out = append(out, p.Field, p.Value)
+	}
+	return out
 }
 
 // deltaType maps a wired sub-op to the collection type its collnew must
@@ -281,6 +313,8 @@ func deltaType(sub obs1.CollSub) (typ uint8, wired bool) {
 	switch sub.(type) {
 	case obs1.SAdd, obs1.SRem:
 		return obs1.CollSet, true
+	case obs1.HSet, obs1.HDel, obs1.HExpire:
+		return obs1.CollHash, true
 	}
 	return 0, false
 }
