@@ -55,6 +55,15 @@ type FoldConfig struct {
 	Prefix string
 	Node   uint64
 
+	// Incarnation salts the segment write tag. The folder seeds SegSeq
+	// from the winning manifests, not from the bucket, so a crash between
+	// a segment PUT and its manifest CAS leaves an orphan in a slot the
+	// next incarnation will retry into; without the salt the orphan
+	// carries the same node and batch tag and Recheck reads as ours,
+	// adopting a foreign object's bytes under our placements. With it the
+	// occupant reads as other and the slot advances.
+	Incarnation uint32
+
 	// MapKey maps a key to its hash slot and group, the dispatcher's route.
 	MapKey func(key []byte) (slot uint16, group uint16)
 
@@ -661,7 +670,7 @@ func (f *Folder) putSegment(job *segJob) {
 		key := segKey(f.cfg.Prefix, job.group, job.seq)
 		tag := WriteTag{
 			Writer: fmt.Sprintf("%016x", f.cfg.Node),
-			Batch:  fmt.Sprintf("seg-%03d-%s", job.group, seq16(job.seq)),
+			Batch:  fmt.Sprintf("seg-%03d-%s-%08x", job.group, seq16(job.seq), f.cfg.Incarnation),
 		}
 		_, perr := f.cfg.Store.PutIfAbsent(f.ctx, key, obj, tag)
 		if perr == nil {
