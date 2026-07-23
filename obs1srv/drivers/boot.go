@@ -200,7 +200,8 @@ func BootDurability(ctx context.Context, cfg BootConfig, rt *shard.Runtime) (*Bo
 	}
 	folder, err := obs1.NewFolder(obs1.FoldConfig{
 		Store: cfg.Store, Prefix: cfg.Prefix, Node: cfg.Node,
-		MapKey: ClusterMapKey, Mark: wl.GroupMark, Marks: wl.Marks(),
+		Incarnation: cfg.Incarnation,
+		MapKey:      ClusterMapKey, Mark: wl.GroupMark, Marks: wl.Marks(),
 		OnPublish: pub.OnFolded, FoldAge: cfg.FoldAge, Seed: seeds,
 		Keymap: func(group uint16) *obs1.Keymap { return kms[group] },
 		Dir:    func(group uint16) *obs1.Directory { return dirs[group] },
