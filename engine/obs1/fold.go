@@ -124,6 +124,12 @@ type FoldedSegment struct {
 	NRecords   uint64
 	RawBytes   uint64
 	CoveredSeq uint64
+	// TTLClass and the expiry bounds ride from the segment footer into the
+	// manifest row (doc 03 section 5.1): nonzero class only when the whole
+	// segment can retire at MaxExpMS.
+	TTLClass uint8
+	MinExpMS uint64
+	MaxExpMS uint64
 	// Places lists every whole-record frame's chunk placement, the
 	// keymap's feed, minus placements killed by a delete that landed
 	// between the cut and the publish.
@@ -164,10 +170,12 @@ type FolderStats struct {
 
 // foldRec is one accumulated whole-record frame, copied out of the tap
 // buffer. fp is the key fingerprint (the bloom's first hash), the run
-// order doc 08 section 2 packs by.
+// order doc 08 section 2 packs by. exp is the record's absolute unix-ms
+// deadline, 0 when it carries none, feeding the run chunk's expiry bounds.
 type foldRec struct {
 	kind  byte
 	fp    uint64
+	exp   uint64
 	key   []byte
 	frame []byte
 }
@@ -331,6 +339,23 @@ func (f *Folder) Add(frames []byte) {
 				FirstDisc: disc64(fr.Disc), Count: fr.Count, LiveHint: fr.Count,
 				Data: data,
 			}
+			if fr.Flags&store.ChunkFlagTTLBitmap != 0 {
+				// A demoter chunk with expiry bearers: read their deadlines out
+				// of the packed blob once, at intake, the pay-only-if-used side
+				// of the #1294 bitmap. TTL-free chunks skip the walk entirely.
+				store.WalkPackedPairs(fr.Payload, fr.Flags, int(fr.Count), func(_ int, p store.PackedPair) bool {
+					if p.Exp != 0 {
+						if c.Bearers == 0 || p.Exp < c.MinExpMS {
+							c.MinExpMS = p.Exp
+						}
+						if p.Exp > c.MaxExpMS {
+							c.MaxExpMS = p.Exp
+						}
+						c.Bearers++
+					}
+					return true
+				})
+			}
 			if i, ok := g.chIdx[id]; ok {
 				g.bytes += len(data) - len(g.chunks[i].Data)
 				g.chunks[i] = c
@@ -345,7 +370,7 @@ func (f *Folder) Add(frames []byte) {
 		}
 		key := append([]byte(nil), fr.Key...)
 		h1, _ := bloomHash(key)
-		r := foldRec{kind: fr.Kind, fp: h1, key: key, frame: append([]byte(nil), fr.Frame...)}
+		r := foldRec{kind: fr.Kind, fp: h1, exp: fr.Exp, key: key, frame: append([]byte(nil), fr.Frame...)}
 		if f.putRec(g, r) {
 			f.stats.Records++
 		}
@@ -596,17 +621,27 @@ func (f *Folder) buildSegment(job *segJob) (*Segment, error) {
 		binary.BigEndian.PutUint64(disc[:], first.fp)
 		data := store.AppendRunChunk(nil, first.kind|store.ChunkKindBit, store.ChunkFlagRun,
 			uint16(len(run)), first.key, disc[:], payload)
+		c := SegmentChunk{
+			Key: first.key, Kind: first.kind | store.ChunkKindBit, Flags: store.ChunkFlagRun,
+			FirstDisc: first.fp, Count: uint16(len(run)), LiveHint: uint16(len(run)),
+			Data: data,
+		}
 		for _, r := range run {
 			job.places = append(job.places, KeyPlace{
 				Key: r.key, Fp: r.fp, Chunk: uint32(len(chunks)),
 				Kind: r.kind, Tombstone: r.kind == store.KindTombstone,
 			})
+			if r.exp != 0 {
+				if c.Bearers == 0 || r.exp < c.MinExpMS {
+					c.MinExpMS = r.exp
+				}
+				if r.exp > c.MaxExpMS {
+					c.MaxExpMS = r.exp
+				}
+				c.Bearers++
+			}
 		}
-		chunks = append(chunks, SegmentChunk{
-			Key: first.key, Kind: first.kind | store.ChunkKindBit, Flags: store.ChunkFlagRun,
-			FirstDisc: first.fp, Count: uint16(len(run)), LiveHint: uint16(len(run)),
-			Data: data,
-		})
+		chunks = append(chunks, c)
 		payload, run = nil, nil
 	}
 	for i := range job.recs {
@@ -643,10 +678,33 @@ func (f *Folder) buildSegment(job *segJob) (*Segment, error) {
 	chunks = append(chunks, job.chunks...)
 	footer := SegmentFooter{
 		Group: job.group, Epoch: job.epoch, SegSeq: job.seq, Level: 0,
-		// Cold frames carry no expiry word, so level-0 segments are TTL
-		// class 0 until the fold route carries deadlines (doc 03 section
-		// 5.1, recorded gap).
-		TTLClass: 0,
+	}
+	// A segment earns a TTL class only when every record in every chunk
+	// bears a deadline, so the whole object can retire at MaxExpMS; one
+	// deathless record keeps the class at 0 while the chunk bounds still
+	// publish for planners. The doc 03 one-class-per-segment sort (cutting
+	// separate segments per class) stays with the doc 06 rewrite, which
+	// re-sorts chunks globally anyway; until then a fold's mixed deadlines
+	// simply widen the bounds.
+	allBearers := true
+	for i := range chunks {
+		c := &chunks[i]
+		if c.Bearers != c.Count {
+			allBearers = false
+			continue
+		}
+		if footer.MinExpMS == 0 || c.MinExpMS < footer.MinExpMS {
+			footer.MinExpMS = c.MinExpMS
+		}
+		if c.MaxExpMS > footer.MaxExpMS {
+			footer.MaxExpMS = c.MaxExpMS
+		}
+	}
+	if allBearers {
+		footer.TTLClass = TTLClassOf(footer.MaxExpMS, uint64(time.Now().UnixMilli()))
+	}
+	if footer.TTLClass == 0 {
+		footer.MinExpMS, footer.MaxExpMS = 0, 0
 	}
 	return BuildSegment(footer, chunks, memberKeys, 0)
 }
@@ -749,6 +807,7 @@ func (f *Folder) finishPut(job *segJob, obj []byte, key string) {
 		Group: job.group, Epoch: job.epoch, SegSeq: job.seq, Key: key,
 		Size: int64(len(obj)), FooterOff: footerOff, FooterLen: footerLen,
 		NRecords: footer.NRecords, RawBytes: footer.RawBytes, CoveredSeq: job.covered,
+		TTLClass: footer.TTLClass, MinExpMS: footer.MinExpMS, MaxExpMS: footer.MaxExpMS,
 	}
 	f.mu.Lock()
 	f.groups[job.group].seq = job.seq + 1

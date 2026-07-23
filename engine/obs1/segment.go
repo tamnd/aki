@@ -26,8 +26,8 @@ const (
 	segBlockHdr      = 4 + 4 + 1 + 3 // rawlen, storedlen, comp, reserved
 	segFooterFixed   = 2 + 4 + 8 + 1 + 1 + 8 + 8 + 4
 	segBlockEntry    = 8 + 4 + 4 + 4
-	segChunkFixed    = 4 + 4 + 2 + 1 + 1 + 8 + 2 + 2 // everything but the key
-	segFooterTrailer = 4 + 8 + 8 + 4                 // bloomlen, nrecords, rawbytes, fcrc
+	segChunkFixed    = 4 + 4 + 2 + 1 + 1 + 8 + 2 + 2 + 8 + 8 // everything but the key
+	segFooterTrailer = 4 + 8 + 8 + 4                         // bloomlen, nrecords, rawbytes, fcrc
 )
 
 // SegmentBlockEntry is one block index row: where the block sits in the
@@ -57,6 +57,15 @@ type SegmentChunkEntry struct {
 	FirstDisc  uint64
 	Count      uint16 // records in the chunk
 	LiveHint   uint16
+
+	// MinExpMS and MaxExpMS bound the deadlines the chunk's expiry
+	// bearers carry, absolute unix ms; both zero when no record in the
+	// chunk carries one. The bounds are an optimization, never authority
+	// (doc 03 section 5.1): every record keeps its deadline inline, and
+	// readers check it, so a planner may use the bounds to skip or retire
+	// but correctness never leans on them.
+	MinExpMS uint64
+	MaxExpMS uint64
 }
 
 // SegmentFooter is everything a reader learns from the footer alone.
@@ -95,6 +104,16 @@ type SegmentChunk struct {
 	Count     uint16
 	LiveHint  uint16
 	Data      []byte
+
+	// MinExpMS and MaxExpMS are the chunk's expiry bounds and Bearers the
+	// count of records carrying a deadline, all zero on a TTL-free chunk.
+	// The builder copies the bounds into the index entry; Bearers stays
+	// builder-side, feeding the segment's class decision (a class is
+	// assigned only when every record in every chunk bears a deadline, so
+	// the whole object can die at MaxExpMS).
+	MinExpMS uint64
+	MaxExpMS uint64
+	Bearers  uint16
 }
 
 // BuildSegment packs chunks into blocks greedily: a chunk that does not
@@ -131,6 +150,7 @@ func BuildSegment(f SegmentFooter, chunks []SegmentChunk, memberKeys [][]byte, b
 			Block: uint32(len(seg.BlockData)), OffInBlock: uint32(len(cur)),
 			Key: c.Key, Kind: c.Kind, Flags: c.Flags, FirstDisc: c.FirstDisc,
 			Count: c.Count, LiveHint: c.LiveHint,
+			MinExpMS: c.MinExpMS, MaxExpMS: c.MaxExpMS,
 		})
 		cur = append(cur, c.Data...)
 		if len(cur) >= blockSize {
@@ -199,6 +219,8 @@ func AppendSegment(b []byte, writer uint64, seg *Segment) ([]byte, error) {
 		b = binary.LittleEndian.AppendUint64(b, c.FirstDisc)
 		b = binary.LittleEndian.AppendUint16(b, c.Count)
 		b = binary.LittleEndian.AppendUint16(b, c.LiveHint)
+		b = binary.LittleEndian.AppendUint64(b, c.MinExpMS)
+		b = binary.LittleEndian.AppendUint64(b, c.MaxExpMS)
 	}
 	b = append(b, f.Bloom...)
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(f.Bloom)))
@@ -207,6 +229,31 @@ func AppendSegment(b []byte, writer uint64, seg *Segment) ([]byte, error) {
 	footerLen := uint64(len(b)-start) - footerOff
 	b = binary.LittleEndian.AppendUint32(b, crc32c(b[start+int(footerOff):]))
 	return appendTail(b, footerOff, uint32(footerLen)+4), nil
+}
+
+// TTLClassOf maps a segment's latest deadline onto the doc 03 section 5.1
+// retirement class relative to the folder's clock at build time: classes 1
+// through 24 are the next 24 hourly windows, 25 and up count daily windows
+// past the first day, capped at 255; a deadline already due lands in class 1
+// so the reaper visits it first. Zero maxExpMS means no class. The class is
+// an optimization, never authority: every record carries its deadline inline
+// and readers check it, so a stale class only delays or hastens a retirement
+// scan, never an answer.
+func TTLClassOf(maxExpMS, nowMS uint64) uint8 {
+	if maxExpMS == 0 {
+		return 0
+	}
+	if maxExpMS <= nowMS {
+		return 1
+	}
+	if hours := (maxExpMS - nowMS) / 3_600_000; hours < 24 {
+		return uint8(hours) + 1
+	}
+	days := (maxExpMS - nowMS) / 86_400_000
+	if days > 255-24 {
+		return 255
+	}
+	return uint8(24 + days)
 }
 
 // validateSegmentShape holds the facts both the encoder and the
@@ -239,6 +286,13 @@ func validateSegmentShape(f *SegmentFooter, blockData [][]byte) error {
 		}
 		if c.Count == 0 {
 			return fmt.Errorf("obs1: chunk %d holds no records", i)
+		}
+		if c.MinExpMS == 0 {
+			if c.MaxExpMS != 0 {
+				return fmt.Errorf("obs1: chunk %d has a max expiry bound but no min", i)
+			}
+		} else if c.MinExpMS > c.MaxExpMS {
+			return fmt.Errorf("obs1: chunk %d expiry bounds %d..%d run backward", i, c.MinExpMS, c.MaxExpMS)
 		}
 		if int(c.Block) >= len(blockData) {
 			return fmt.Errorf("obs1: chunk %d points at block %d of %d", i, c.Block, len(blockData))
@@ -324,6 +378,8 @@ func ParseSegmentFooter(b []byte) (SegmentFooter, error) {
 		c.FirstDisc = binary.LittleEndian.Uint64(body[q+2 : q+10])
 		c.Count = binary.LittleEndian.Uint16(body[q+10 : q+12])
 		c.LiveHint = binary.LittleEndian.Uint16(body[q+12 : q+14])
+		c.MinExpMS = binary.LittleEndian.Uint64(body[q+14 : q+22])
+		c.MaxExpMS = binary.LittleEndian.Uint64(body[q+22 : q+30])
 		f.Chunks[i] = c
 		p += segChunkFixed + klen
 	}
