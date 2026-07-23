@@ -9,7 +9,10 @@ package sqlo1_test
 // deletion rows: whole-run and whole-page drops, a boundary run
 // rewrite, and a trim to empty must all land atomically too, because
 // each rides one batch and the recovery tail truncation drops a torn
-// batch whole.
+// batch whole. Every snapshot also carries the root accounting line
+// (count, entries-added, last-generated-ID, max-deleted-ID), so the
+// counters are exact at every cut and the XSETID phase's root
+// rewrites are all-or-nothing like everything else.
 
 import (
 	"context"
@@ -73,8 +76,12 @@ func TestStreamPagedTornTail(t *testing.T) {
 			if int(n) != len(ents) {
 				t.Fatalf("XLEN(%q) = %d but %d entries reachable", k, n, len(ents))
 			}
-			if len(ents) > 0 {
-				img[k] = ents
+			line, ok, err := xx.StreamRootLineForTest(ctx, []byte(k))
+			if err != nil {
+				t.Fatalf("root line(%q): %v", k, err)
+			}
+			if ok {
+				img[k] = append(ents, "root|"+line)
 			}
 		}
 		return img
@@ -159,6 +166,22 @@ func TestStreamPagedTornTail(t *testing.T) {
 	flush()
 	trim("s2", false, 0, 0, false)
 	add("s2", 4, "tiny")
+	flush()
+
+	// Phase 7: XSETID rewrites the root accounting in place, one batch
+	// per call, and an append on the moved last ID proves generation
+	// resumes above it.
+	setid := func(key string, ms uint64, setAdded bool, added uint64, setMaxDel bool, mdMs uint64) {
+		t.Helper()
+		if err := x.SetIDForTest(ctx, []byte(key), ms, 0, setAdded, added, setMaxDel, mdMs, 0); err != nil {
+			t.Fatalf("SetID(%q): %v", key, err)
+		}
+		mark()
+	}
+	setid("s", 500, true, 40, true, 12)
+	flush()
+	setid("s2", 9, false, 0, false, 0)
+	add("s2", 10, "tiny")
 	flush()
 
 	if err := db.Close(); err != nil {

@@ -2,6 +2,7 @@ package sqlo1
 
 import (
 	"context"
+	"fmt"
 	"math"
 )
 
@@ -137,6 +138,27 @@ func (x *Stream) RangeAllForTest(ctx context.Context, key []byte, emit func(ms, 
 // MINID threshold as plain integers on the same seam.
 func (x *Stream) TrimForTest(ctx context.Context, key []byte, byID bool, maxlen int64, minidMs, minidSeq uint64, approx bool, limit int64) (int64, error) {
 	return x.Trim(ctx, key, byID, maxlen, streamID{ms: minidMs, seq: minidSeq}, approx, limit)
+}
+
+// SetIDForTest drives SetID from the external crash package, taking
+// both IDs as plain integers on the same seam.
+func (x *Stream) SetIDForTest(ctx context.Context, key []byte, ms, seq uint64, setAdded bool, added uint64, setMaxDel bool, mdMs, mdSeq uint64) error {
+	return x.SetID(ctx, key, streamID{ms: ms, seq: seq}, setAdded, added, setMaxDel, streamID{ms: mdMs, seq: mdSeq})
+}
+
+// StreamRootLineForTest renders key's root accounting fields for the
+// crash snapshot, with ok false when the key is absent, so the torn
+// tail matrix proves the counters land with their commands.
+func (x *Stream) StreamRootLineForTest(ctx context.Context, key []byte) (line string, ok bool, err error) {
+	info, err := x.Info(ctx, key)
+	if err == errStreamNoKey {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return fmt.Sprintf("count=%d added=%d last=%d-%d maxdel=%d-%d",
+		info.count, info.added, info.last.ms, info.last.seq, info.maxDel.ms, info.maxDel.seq), true, nil
 }
 
 var ErrStreamFenceThirdLevelForTest = errStreamFenceThirdLevel
