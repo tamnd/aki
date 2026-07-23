@@ -1,6 +1,7 @@
 package replay_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/tamnd/aki/engine/obs1/set"
 	"github.com/tamnd/aki/engine/obs1/shard"
 	"github.com/tamnd/aki/engine/obs1/store"
+	"github.com/tamnd/aki/engine/obs1/stream"
 	"github.com/tamnd/aki/engine/obs1/zset"
 )
 
@@ -619,22 +621,126 @@ func TestApplierListCorruptionIsLoud(t *testing.T) {
 	}
 }
 
-// TestApplierRefusesUnwiredKinds keeps the loud refusal for the planes
-// that have not landed: the stream type and the consumer group
-// vocabulary.
+// TestApplierStreamPlane replays the emitter shapes writelog.go frames
+// for stream entries: collnew plus an xadd on create, more xadds at
+// owner-assigned ids, the xadd plus xtrim run the trim clause frames,
+// a standalone xtrim, an xdel of removed ids, and xsetid's
+// unconditional assignment.
+func TestApplierStreamPlane(t *testing.T) {
+	a, cx := newApplier(t)
+
+	kv := func(ss ...string) []obs1.FieldValue {
+		out := make([]obs1.FieldValue, len(ss)/2)
+		for i := range out {
+			out[i] = obs1.FieldValue{Field: []byte(ss[2*i]), Value: []byte(ss[2*i+1])}
+		}
+		return out
+	}
+	apply(t, a, 0, frame(t, 1, "st", obs1.CollNew{Type: obs1.CollStream}))
+	apply(t, a, 0, frame(t, 2, "st", obs1.CollDelta{Sub: obs1.XAdd{IDMs: 1, IDSeq: 1, Pairs: kv("f1", "v1")}}))
+	apply(t, a, 0, frame(t, 3, "st", obs1.CollDelta{Sub: obs1.XAdd{IDMs: 1, IDSeq: 2, Pairs: kv("f2", "v2")}}))
+	apply(t, a, 0, frame(t, 4, "st", obs1.CollDelta{Sub: obs1.XAdd{IDMs: 2, IDSeq: 1, Pairs: kv("a", "1", "b", "2")}}))
+	wantStream(t, cx, "st", 3, 2, 1)
+
+	// XADD with a trim clause frames the entry then the trim, one run.
+	apply(t, a, 0, frame(t, 5, "st", obs1.CollDelta{Sub: obs1.XAdd{IDMs: 3, IDSeq: 0, Pairs: kv("f4", "v4")}}))
+	apply(t, a, 0, frame(t, 6, "st", obs1.CollDelta{Sub: obs1.XTrim{Count: 1}}))
+	wantStream(t, cx, "st", 3, 3, 0)
+
+	// XDEL of 1-2, then a standalone XTRIM dropping the next-oldest 2-1.
+	apply(t, a, 0, frame(t, 7, "st", obs1.CollDelta{Sub: obs1.XDel{IDMs: []uint64{1}, IDSeq: []uint64{2}}}))
+	apply(t, a, 0, frame(t, 8, "st", obs1.CollDelta{Sub: obs1.XTrim{Count: 1}}))
+	wantStream(t, cx, "st", 1, 3, 0)
+
+	// XSETID assigns all three values; a later xadd lands above the new last id.
+	apply(t, a, 0, frame(t, 9, "st", obs1.CollDelta{Sub: obs1.XSetID{LastMs: 10, LastSeq: 5, EntriesAdded: 9, MaxDelMs: 3, MaxDelSeq: 0}}))
+	wantStream(t, cx, "st", 1, 10, 5)
+	apply(t, a, 0, frame(t, 10, "st", obs1.CollDelta{Sub: obs1.XAdd{IDMs: 11, IDSeq: 0, Pairs: kv("f5", "v5")}}))
+	wantStream(t, cx, "st", 2, 11, 0)
+
+	// An emptied stream persists: no colldrop arm exists, only keydel removes one.
+	apply(t, a, 0, frame(t, 11, "kd", obs1.CollNew{Type: obs1.CollStream}))
+	apply(t, a, 0, frame(t, 12, "kd", obs1.CollDelta{Sub: obs1.XAdd{IDMs: 1, IDSeq: 1, Pairs: kv("f", "v")}}))
+	apply(t, a, 0, frame(t, 13, "kd", obs1.KeyDel{}))
+	if stream.ReplayDrop(cx, []byte("kd")) {
+		t.Fatalf("the stream survived its keydel")
+	}
+	if err := a.Finish(); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	got := a.Stats()
+	if got.XAdds != 6 || got.XDels != 1 || got.XTrims != 2 || got.XSetIDs != 1 ||
+		got.CollNews != 2 || got.Dels != 1 {
+		t.Fatalf("stats %+v, want the stream plane counts", got)
+	}
+}
+
+// wantStream pins the replayed stream's live length and last id through
+// non-mutating strictness refusals: an oversized xtrim names the live
+// count it cannot cover, and an xadd at id 0-0 names the last id it
+// fails to exceed. Kept test-local so the production surface stays the
+// replay entry points; the socket test proves entry contents by XRANGE.
+func wantStream(t *testing.T, cx *shard.Ctx, key string, length uint64, lastMs, lastSeq uint64) {
+	t.Helper()
+	err := stream.ReplayXTrim(cx, []byte(key), 1<<62)
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("of %d live entries", length)) {
+		t.Fatalf("stream %q length pin: %v, want %d live entries", key, err, length)
+	}
+	probe := [][]byte{[]byte("f"), []byte("v")}
+	err = stream.ReplayXAdd(cx, []byte(key), 0, 0, probe, false)
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("last id %d-%d", lastMs, lastSeq)) {
+		t.Fatalf("stream %q last id pin: %v, want %d-%d", key, err, lastMs, lastSeq)
+	}
+}
+
+// TestApplierStreamCorruptionIsLoud drives the divergences the stream
+// plane must refuse: deltas on a missing stream, an xadd at or below
+// the last id, an xdel of an id that is not live, and a trim count the
+// stream cannot cover.
+func TestApplierStreamCorruptionIsLoud(t *testing.T) {
+	one := []obs1.FieldValue{{Field: []byte("f"), Value: []byte("v")}}
+	build := []obs1.Op{
+		obs1.CollNew{Type: obs1.CollStream},
+		obs1.CollDelta{Sub: obs1.XAdd{IDMs: 5, IDSeq: 5, Pairs: one}},
+	}
+	cases := []struct {
+		name string
+		ops  []obs1.Op
+		want string
+	}{
+		{"xadd on missing stream", []obs1.Op{obs1.CollDelta{Sub: obs1.XAdd{IDMs: 1, IDSeq: 1, Pairs: one}}}, "no stream exists"},
+		{"xdel on missing stream", []obs1.Op{obs1.CollDelta{Sub: obs1.XDel{IDMs: []uint64{1}, IDSeq: []uint64{1}}}}, "no stream exists"},
+		{"xsetid on missing stream", []obs1.Op{obs1.CollDelta{Sub: obs1.XSetID{LastMs: 1}}}, "no stream exists"},
+		{"xadd below last id", append(build[:2:2], obs1.CollDelta{Sub: obs1.XAdd{IDMs: 5, IDSeq: 5, Pairs: one}}), "does not exceed last id"},
+		{"xdel of a dead id", append(build[:2:2], obs1.CollDelta{Sub: obs1.XDel{IDMs: []uint64{9}, IDSeq: []uint64{9}}}), "is not live"},
+		{"oversized xtrim", append(build[:2:2], obs1.CollDelta{Sub: obs1.XTrim{Count: 5}}), "xtrim of 5"},
+		{"collnew stream consumed by sadd", []obs1.Op{
+			obs1.CollNew{Type: obs1.CollStream},
+			obs1.CollDelta{Sub: obs1.SAdd{Members: [][]byte{[]byte("m")}}},
+		}, "followed by sub-op"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _ := newApplier(t)
+			var err error
+			for i, op := range tc.ops {
+				if err = a.Apply(0, frame(t, uint64(i+1), "c", op)); err != nil {
+					break
+				}
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// TestApplierRefusesUnwiredKinds keeps the loud refusal for the one
+// vocabulary that has not landed: the consumer group sub-ops.
 func TestApplierRefusesUnwiredKinds(t *testing.T) {
 	a, _ := newApplier(t)
-	if err := a.Apply(0, frame(t, 1, "st", obs1.CollNew{Type: obs1.CollStream})); err == nil ||
-		!strings.Contains(err.Error(), "not wired for replay yet") {
-		t.Fatalf("collnew stream: %v", err)
-	}
-	xa := obs1.XAdd{IDMs: 1, IDSeq: 1, Pairs: []obs1.FieldValue{{Field: []byte("f"), Value: []byte("v")}}}
-	if err := a.Apply(0, frame(t, 2, "st", obs1.CollDelta{Sub: xa})); err == nil ||
-		!strings.Contains(err.Error(), "not wired for replay yet") {
-		t.Fatalf("colldelta xadd: %v", err)
-	}
 	gd := obs1.GroupDelta{Sub: obs1.GNew{Group: []byte("g")}}
-	if err := a.Apply(0, frame(t, 3, "st", gd)); err == nil || !strings.Contains(err.Error(), "not wired yet") {
+	if err := a.Apply(0, frame(t, 1, "st", gd)); err == nil || !strings.Contains(err.Error(), "not wired yet") {
 		t.Fatalf("groupdelta: %v", err)
 	}
 }

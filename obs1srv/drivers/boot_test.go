@@ -375,3 +375,68 @@ func TestBootServesListsAcrossRestart(t *testing.T) {
 	expect(t, r3, "$1\r\nw\r\n")
 	commitAndStop(t, b3, srv3, nc3)
 }
+
+// TestBootServesStreamsAcrossRestart drives the stream entry plane
+// through the boot seam: explicit and partial-auto ids, XADD's trim
+// clause, XDEL, a standalone XTRIM, and XSETID's grafted last id, all
+// served back from the replayed registries. The emptied stream proves
+// the no-colldrop rule: it persists across the restart and its last id
+// never moves back, so a replayed XADD at the old id still refuses.
+func TestBootServesStreamsAcrossRestart(t *testing.T) {
+	bucket := sim.New(sim.Config{})
+	smaller := "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"
+
+	b1, srv1, nc1, r1 := bootServer(t, bucket, 1)
+	send(t, nc1, "XADD", "s", "1-1", "f1", "v1")
+	expect(t, r1, "$3\r\n1-1\r\n")
+	send(t, nc1, "XADD", "s", "1-2", "f2", "v2")
+	expect(t, r1, "$3\r\n1-2\r\n")
+	// The partial form fixes ms and auto-generates seq off lastID, never
+	// the clock, so the reply is deterministic and replays literally.
+	send(t, nc1, "XADD", "s", "5-*", "f3", "v3")
+	expect(t, r1, "$3\r\n5-0\r\n")
+	send(t, nc1, "XADD", "s", "MAXLEN", "3", "6-1", "f4", "v4")
+	expect(t, r1, "$3\r\n6-1\r\n")
+	send(t, nc1, "XDEL", "s", "1-2")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "XTRIM", "s", "MAXLEN", "1")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "XSETID", "s", "10-5", "ENTRIESADDED", "9", "MAXDELETEDID", "3-3")
+	expect(t, r1, "+OK\r\n")
+	send(t, nc1, "XADD", "gone", "1-1", "f", "v")
+	expect(t, r1, "$3\r\n1-1\r\n")
+	send(t, nc1, "XDEL", "gone", "1-1")
+	expect(t, r1, ":1\r\n")
+	commitAndStop(t, b1, srv1, nc1)
+
+	b2, srv2, nc2, r2 := bootServer(t, bucket, 2)
+	if b2.Replay.XAdds == 0 || b2.Replay.XDels == 0 || b2.Replay.XTrims == 0 || b2.Replay.XSetIDs == 0 {
+		t.Fatalf("reboot replay stats %+v, want stream plane counts", b2.Replay)
+	}
+	send(t, nc2, "XLEN", "s")
+	expect(t, r2, ":1\r\n")
+	send(t, nc2, "XRANGE", "s", "-", "+")
+	expect(t, r2, "*1\r\n*2\r\n$3\r\n6-1\r\n*2\r\n$2\r\nf4\r\n$2\r\nv4\r\n")
+	// XSETID's grafted last id survived: an id at it refuses, one above lands.
+	send(t, nc2, "XADD", "s", "10-5", "f", "v")
+	expect(t, r2, smaller)
+	send(t, nc2, "XADD", "s", "10-6", "f5", "v5")
+	expect(t, r2, "$4\r\n10-6\r\n")
+	// The emptied stream persisted with its last id intact.
+	send(t, nc2, "XLEN", "gone")
+	expect(t, r2, ":0\r\n")
+	send(t, nc2, "XADD", "gone", "1-1", "f", "v")
+	expect(t, r2, smaller)
+	send(t, nc2, "XADD", "gone", "2-0", "g", "w")
+	expect(t, r2, "$3\r\n2-0\r\n")
+	commitAndStop(t, b2, srv2, nc2)
+
+	b3, srv3, nc3, r3 := bootServer(t, bucket, 3)
+	send(t, nc3, "XLEN", "s")
+	expect(t, r3, ":2\r\n")
+	send(t, nc3, "XRANGE", "s", "10-6", "10-6")
+	expect(t, r3, "*1\r\n*2\r\n$4\r\n10-6\r\n*2\r\n$2\r\nf5\r\n$2\r\nv5\r\n")
+	send(t, nc3, "XLEN", "gone")
+	expect(t, r3, ":1\r\n")
+	commitAndStop(t, b3, srv3, nc3)
+}
