@@ -35,4 +35,18 @@ It taught two things now baked into the method and the bands: WAL object packing
 
 ## Results
 
-Pending.
+Scored run on the M4 box, 512 MiB per arm, foldload.csv checked in.
+
+Paced pairs, the claim carriers, at both value sizes: both arms achieved 100.0 MiB/s, flush counts 72/72 (200 B) and 65/66 (1000 B), flushed bytes equal or 374 B apart, overhead 27.0 B per op identical in every row, mean object 7.96 to 8.09 MiB.
+Every paced band hit and the kill line was never approached.
+
+Saturated pairs as context: fold-off medians 452 ns/op (200 B) and 825 ns/op (1000 B), fold-on 1257 and 2230, a 2.7 to 2.8x in-process ratio squarely in the predicted 1.5x to 3x band and still the wrong K1 denominator; the #1111 paced owner tax numbers remain the real cost.
+Mean object size stayed within 10% of the 8 MiB target in every arm including the coldest (8.6 MiB).
+
+One band missed and is disclosed: the plus or minus 1 flush tolerance held in every paced pair but not in saturated mode, where the process-cold first arm packed 67 objects against its partner's 72 and the 1000 B reps drifted 2 apart.
+Flushed bytes stayed within the 2 KiB framing tolerance in every pair regardless, so the stream content is unmoved; under saturation the packing boundary timing just wanders more than one object.
+
+## Verdict
+
+PRED-OBS1-O1C-FOLDLOAD: HIT, with the saturated flush-count band miss disclosed above.
+The fold pipeline does not perturb the WAL flush cadence or the frame overhead at design rate, and it does not cost the ingest loop its pace.
