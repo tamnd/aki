@@ -68,7 +68,7 @@ func TestDirectoryAddRefuses(t *testing.T) {
 		want string
 	}{
 		{"seq zero", dirFooter(0, SegmentChunkEntry{Block: 0}), "SegSeq 0"},
-		{"seq wide", dirFooter(1 << 32, SegmentChunkEntry{Block: 0}), "32 bits"},
+		{"seq wide", dirFooter(1<<32, SegmentChunkEntry{Block: 0}), "32 bits"},
 		{"no chunks", dirFooter(4), "0 chunks"},
 		{"chunk past blocks", dirFooter(5, SegmentChunkEntry{Block: 2}), "points at block"},
 	}
