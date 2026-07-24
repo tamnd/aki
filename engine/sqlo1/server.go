@@ -1321,6 +1321,10 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		return s.xclaimCmd(ctx, reply, args, now)
 	case "XAUTOCLAIM":
 		return s.xautoclaimCmd(ctx, reply, args, now)
+	case "SCAN":
+		return s.scanCmd(ctx, reply, args)
+	case "KEYS":
+		return s.keysCmd(ctx, reply, args)
 	case "TYPE":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
@@ -2105,6 +2109,124 @@ func (s *Server) sscanCmd(ctx context.Context, reply []byte, args [][]byte) []by
 	var cbuf [20]byte
 	reply = AppendArray(reply, 2)
 	reply = AppendBulk(reply, strconv.AppendUint(cbuf[:0], next, 10))
+	reply = AppendArray(reply, elems)
+	return append(reply, s.scanBuf...)
+}
+
+// scanTypeTag maps a SCAN TYPE argument to its type tag. An unknown
+// name is not an error: per Redis the filter simply matches nothing,
+// so the caller gets the miss flag instead.
+func scanTypeTag(name []byte) (uint8, bool) {
+	switch {
+	case strings.EqualFold(string(name), "string"):
+		return TagString, true
+	case strings.EqualFold(string(name), "hash"):
+		return TagHash, true
+	case strings.EqualFold(string(name), "list"):
+		return TagList, true
+	case strings.EqualFold(string(name), "set"):
+		return TagSet, true
+	case strings.EqualFold(string(name), "zset"):
+		return TagZset, true
+	case strings.EqualFold(string(name), "stream"):
+		return TagStream, true
+	}
+	return 0, false
+}
+
+// scanCmd is SCAN cursor [MATCH pattern] [COUNT count] [TYPE type],
+// the shared scan grammar over the whole keyspace: options repeat
+// with last-wins, COUNT below one is a syntax error, anything unknown
+// is too. One call is one ScanStep, so COUNT bounds the work of the
+// step the way the collection scans bound their walks; the emitted
+// keys stage in scanBuf because MATCH and TYPE decide the element
+// count only after the walk.
+func (s *Server) scanCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) < 2 {
+		return arityErr(reply, "SCAN")
+	}
+	cursor, err := strconv.ParseUint(string(args[1]), 10, 64)
+	if err != nil {
+		return AppendError(reply, "ERR invalid cursor")
+	}
+	count := int64(10)
+	var match []byte
+	hasMatch := false
+	typeTag := uint8(0)
+	typeMiss := false
+	for i := 2; i < len(args); i++ {
+		switch {
+		case strings.EqualFold(string(args[i]), "COUNT") && i+1 < len(args):
+			n, ok := parseCanonicalInt(args[i+1])
+			if !ok {
+				return AppendError(reply, "ERR value is not an integer or out of range")
+			}
+			if n < 1 {
+				return syntaxErr(reply)
+			}
+			count = n
+			i++
+		case strings.EqualFold(string(args[i]), "MATCH") && i+1 < len(args):
+			match, hasMatch = args[i+1], true
+			i++
+		case strings.EqualFold(string(args[i]), "TYPE") && i+1 < len(args):
+			var known bool
+			typeTag, known = scanTypeTag(args[i+1])
+			typeMiss = !known
+			i++
+		default:
+			return syntaxErr(reply)
+		}
+	}
+	s.scanBuf = s.scanBuf[:0]
+	elems := 0
+	next, err := s.t.ScanStep(ctx, cursor, int(count), func(key []byte, tag uint8) {
+		if typeMiss || (typeTag != 0 && tag != typeTag) {
+			return
+		}
+		if hasMatch && !globMatch(match, key) {
+			return
+		}
+		s.scanBuf = AppendBulk(s.scanBuf, key)
+		elems++
+	})
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	var cbuf [20]byte
+	reply = AppendArray(reply, 2)
+	reply = AppendBulk(reply, strconv.AppendUint(cbuf[:0], next, 10))
+	reply = AppendArray(reply, elems)
+	return append(reply, s.scanBuf...)
+}
+
+// keysCmd is KEYS pattern: the documented-antisocial full walk, the
+// SCAN machinery driven to completion in one command. The stream is
+// bounded only by the keyspace, which is exactly what doc 12 says
+// about it.
+func (s *Server) keysCmd(ctx context.Context, reply []byte, args [][]byte) []byte {
+	if len(args) != 2 {
+		return arityErr(reply, "KEYS")
+	}
+	s.scanBuf = s.scanBuf[:0]
+	elems := 0
+	cursor := uint64(0)
+	for {
+		next, err := s.t.ScanStep(ctx, cursor, 4096, func(key []byte, tag uint8) {
+			if !globMatch(args[1], key) {
+				return
+			}
+			s.scanBuf = AppendBulk(s.scanBuf, key)
+			elems++
+		})
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
 	reply = AppendArray(reply, elems)
 	return append(reply, s.scanBuf...)
 }

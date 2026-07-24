@@ -156,6 +156,62 @@ func (s *MemStore) Scan(ctx context.Context, cur Cursor, fn func(Record) bool) (
 	return nil, nil
 }
 
+// scanHash orders MemStore's keyspace walk. FNV-1a keeps the
+// placeholder dependency-free; any fixed hash works, since the cursor
+// contract only needs an order that mutations cannot shift other
+// keys around in, which rules out the sorted-index cursor and rules
+// in any per-key hash. The top bit drops off because KeyScanner
+// cursors live in 63 bits.
+func scanHash(key string) uint64 {
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= 1099511628211
+	}
+	return h >> 1
+}
+
+// ScanKeys implements the KeyScanner capability over hash order: the
+// cursor is the smallest key hash the walk has not covered, so a key
+// present for the whole scan is delivered exactly once no matter what
+// gets inserted or deleted between steps. The walk-unit rule holds at
+// hash granularity: equal-hash keys never split across calls, so the
+// plus-one resume cannot skip a collision partner.
+func (s *MemStore) ScanKeys(ctx context.Context, cursor uint64, budget int, fn func(Record)) (uint64, error) {
+	s.mu.Lock()
+	type hashedKey struct {
+		h uint64
+		k string
+	}
+	ahead := make([]hashedKey, 0, len(s.recs))
+	for k := range s.recs {
+		if h := scanHash(k); h >= cursor {
+			ahead = append(ahead, hashedKey{h, k})
+		}
+	}
+	sort.Slice(ahead, func(i, j int) bool {
+		if ahead[i].h != ahead[j].h {
+			return ahead[i].h < ahead[j].h
+		}
+		return ahead[i].k < ahead[j].k
+	})
+	var next uint64
+	out := make([]Record, 0, min(len(ahead), budget))
+	for i, hk := range ahead {
+		if len(out) >= budget && hk.h != ahead[i-1].h {
+			next = hk.h
+			break
+		}
+		out = append(out, s.recs[hk.k])
+	}
+	s.mu.Unlock()
+
+	for _, r := range out {
+		fn(r)
+	}
+	return next, nil
+}
+
 // MintLease implements the Minter capability at MemStore's durability
 // level, which is none: the mark is as volatile as every record it
 // holds, so "durable before return" is honored trivially.
