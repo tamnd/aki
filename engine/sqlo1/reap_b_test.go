@@ -26,7 +26,17 @@ func TestReapStepOverB(t *testing.T) {
 	}
 	defer db.Close()
 
-	tr := newTieredOverB(t, db, 256, -1, 31)
+	// A frozen engine clock keeps the drain from reap-cancelling the
+	// pre-expired records on the way out (slice 4): this test needs
+	// them to land cold as values so the store-side reaper is what
+	// finds and tombstones them. The store keeps its real clock, which
+	// is the one ReapScan's expiry checks read.
+	tr := sqlo1.NewTiered(db, sqlo1.TieredConfig{
+		Budget:   sqlo1.Budget{Entries: 256, Arenas: 64 << 20},
+		PromoteP: -1,
+		Seed:     31,
+		NowMs:    func() int64 { return 1 },
+	})
 	s, err := sqlo1.NewStr(tr, sqlo1.StrConfig{RopeMin: 64, Log2Chunk: 6})
 	if err != nil {
 		t.Fatal(err)

@@ -67,10 +67,16 @@ type TieredStats struct {
 	// Reaped counts keys the sampling reaper tombstoned; ReapSkips
 	// counts candidates it passed up, either because the hot tier held
 	// a newer copy or because there was no room for the tombstone.
-	Reaped     int64
-	ReapSkips  int64
-	HotKeys    int
-	DirtyBytes int
+	Reaped    int64
+	ReapSkips int64
+	// ReapCancels counts dirty puts that expired in the queue and
+	// drained as tombstones instead of value bytes; VolDefers counts
+	// the queue laps volatile-near records sat out to get there (doc
+	// 11 section 6, the die-in-RAM path).
+	ReapCancels int64
+	VolDefers   int64
+	HotKeys     int
+	DirtyBytes  int
 }
 
 // Tiered is the shard runtime composite, doc 04 sections 4 through 8 wired
@@ -494,6 +500,8 @@ func (t *Tiered) Stats() TieredStats {
 	s.Evictions = t.ev.evictions
 	s.EvictedBytes = t.ev.evictedBytes
 	s.ChunkVacates = t.ht.vacates
+	s.ReapCancels = t.dr.cancels
+	s.VolDefers = t.dr.volDefers
 	s.HotKeys = t.ht.Len()
 	s.DirtyBytes = t.ht.dirtyBytes
 	return s

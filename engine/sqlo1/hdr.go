@@ -111,7 +111,13 @@ const TagFence uint8 = 1 << 4
 // root from draining in a batch before segments a later command wrote
 // under it (the root's image summarizes them, so landing it first
 // would let an eviction expose an overcounting on-disk root).
+// queuedVolMask holds the volatile deferral lap count, doc 11 section
+// 6: how many queue laps this dirty record has sat out waiting to die
+// in RAM. The drainer caps it at maxVolDefers; a fresh transition into
+// dirty resets it (enqueueDirty writes the whole byte).
 const (
-	queuedBit   uint8 = 1 << 0
-	queuedDefer uint8 = 1 << 1
+	queuedBit     uint8 = 1 << 0
+	queuedDefer   uint8 = 1 << 1
+	queuedVolStep uint8 = 1 << 2
+	queuedVolMask uint8 = 3 << 2
 )
