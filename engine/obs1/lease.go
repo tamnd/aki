@@ -55,6 +55,7 @@ type FoldStats struct {
 	ReleasesRejected uint64 // wrong epoch, wrong writer, or already released
 	SectionsDead     uint64 // commit sections that failed the fence
 	MembersStale     uint64 // member records that lost the incarnation guard
+	CommitsIncStale  uint64 // commits from an incarnation the member table outgrew
 }
 
 type groupLease struct {
@@ -151,7 +152,7 @@ func (f *LeaseFold) ApplyChain(pos ChainPos, h Header, batch ChainBatch) error {
 		return fmt.Errorf("obs1: lease fold expected seq %d, got %d", f.next, pos.Seq)
 	}
 	for _, r := range batch.Records {
-		if err := f.applyRecord(pos, h.Writer, r); err != nil {
+		if err := f.applyRecord(pos, h.Writer, batch.Incarnation, r); err != nil {
 			return err
 		}
 	}
@@ -159,7 +160,7 @@ func (f *LeaseFold) ApplyChain(pos ChainPos, h Header, batch ChainBatch) error {
 	return nil
 }
 
-func (f *LeaseFold) applyRecord(pos ChainPos, writer uint64, r ChainRecord) error {
+func (f *LeaseFold) applyRecord(pos ChainPos, writer uint64, inc uint32, r ChainRecord) error {
 	switch rec := r.(type) {
 	case GrantRecord:
 		f.applyGrant(pos, rec)
@@ -168,7 +169,7 @@ func (f *LeaseFold) applyRecord(pos ChainPos, writer uint64, r ChainRecord) erro
 	case HeartbeatRecord:
 		f.renewHeld(pos, writer)
 	case CommitRecord:
-		if err := f.applyCommit(pos, writer, rec); err != nil {
+		if err := f.applyCommit(pos, writer, inc, rec); err != nil {
 			return err
 		}
 	case MemberRecord:
@@ -221,11 +222,25 @@ func (f *LeaseFold) applyRelease(pos ChainPos, writer uint64, rec ReleaseRecord)
 // applyCommit fences each section (C-I3) and then renews the writer's
 // leases: doc 02 section 3.1 makes renewal implicit in every commit and
 // heartbeat.
-func (f *LeaseFold) applyCommit(pos ChainPos, writer uint64, rec CommitRecord) error {
+//
+// The incarnation half is doc 02 section 4.5: a commit whose batch
+// incarnation does not match the member table's row for the writer at
+// this position is a pre-crash in-flight PUT of an old process, and its
+// sections are epoch-stale no matter what the lease table says, because
+// the lease may legitimately still name the node inside its TTL. A
+// writer with no member row skips the check: the single-node boot paths
+// before O3a never join, and the guard exists to age out old
+// incarnations of a known member, not to demand membership.
+func (f *LeaseFold) applyCommit(pos ChainPos, writer uint64, inc uint32, rec CommitRecord) error {
+	incOK := true
+	if mem, ok := f.members[writer]; ok && mem.Incarnation != inc {
+		incOK = false
+		f.Stats.CommitsIncStale++
+	}
 	live := make([]bool, len(rec.Sections))
 	for i, s := range rec.Sections {
 		g := f.groups[s.Group]
-		ok := g != nil && !g.released && g.epoch == s.Epoch && g.node == writer
+		ok := incOK && g != nil && !g.released && g.epoch == s.Epoch && g.node == writer
 		live[i] = ok
 		if !ok {
 			f.Stats.SectionsDead++

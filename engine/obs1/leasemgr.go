@@ -136,6 +136,44 @@ func (m *LeaseManager) grantLocked(ctx context.Context, group uint16) (bool, err
 	return false, nil
 }
 
+// Rejoin is the doc 02 section 4.5 warm restart: a new incarnation of
+// the same node id announces itself with a fresh member row, then adopts
+// every lease the fold still shows as ours at its existing epoch, no new
+// grant and no epoch move, because a restart inside the TTL never lost
+// the lease. The caller has already booted the chain from the latest
+// checkpoint and followed to the tail, so the fold is current; nothing
+// from RAM or the cache dir is trusted here, the adoption reads only the
+// fold. The member row's incarnation must match what the appender stamps
+// on every batch, or the fence in applyCommit would fold our own
+// post-rejoin commits dead.
+func (m *LeaseManager) Rejoin(ctx context.Context, mem Member) error {
+	if mem.Node != m.self {
+		return fmt.Errorf("obs1: rejoin for node %d on node %d's manager", mem.Node, m.self)
+	}
+	if mem.Incarnation != m.ap.Incarnation() {
+		return fmt.Errorf("obs1: rejoin incarnation %d does not match the appender's %d", mem.Incarnation, m.ap.Incarnation())
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t := m.now()
+	if _, err := m.ap.Append(ctx, []ChainRecord{MemberRecord{Op: MemberJoin, Member: mem}}); err != nil {
+		return err
+	}
+	m.lastAppend = t
+	m.reconcileLocked(t)
+	for _, l := range m.fold.Leases() {
+		if l.Node != m.self {
+			continue
+		}
+		if _, ok := m.held[l.Group]; ok {
+			continue
+		}
+		m.held[l.Group] = l.Epoch
+		m.gate.Regrant(l.Group, t)
+	}
+	return nil
+}
+
 // Release voluntarily frees a group: the gate stops serving it first,
 // then the release record lands under our epoch. If the append fails the
 // group stays ours on the chain but suspended at the gate, the safe side;
