@@ -37,3 +37,34 @@ The bands above come from the doc 01 envelope arithmetic and the estate op count
 ## Run
 
     ./run.sh
+
+## Results
+
+One scored run, full estate (boot.csv), every op-count and StateSum assertion green:
+
+| term | arm | p50 ms | worst ms | GETs |
+|---|---|---|---|---|
+| chain boot | distance 0 | 85 | 217 | 4 |
+| chain boot | distance 16 | 532 | 558 | 20 |
+| chain boot | distance 64 | 2015 | 2354 | 68 |
+| chain boot | distance 256 | 7937 | 7937 | 260 |
+| manifests | 1 | 39 | 55 | 2 |
+| manifests | 4 | 121 | 197 | 5 |
+| manifests | 16 | 469 | 523 | 17 |
+| composed boot | 32 groups, fan 8, distance 16 | 1424 | 1868 | 244 |
+
+Band scoring:
+
+1. HIT: zero-distance boot at exactly 4 GETs, p50 85ms against the 300ms bar.
+2. HIT: replay linear at 27.9 to 30.7ms per trailing chain object across the three distances, every arm at exactly distance plus 4 GETs; distance 64 at 2015ms under 3s, distance 256 at 7937ms past the 5s takeover bar.
+3. HIT: the cadence constant stands as filed, checkpoints at least every 64 chain objects with the lease manager targeting well under.
+4. HIT: discovery linear at exactly count plus 1 GETs, 16 manifests at 469ms under 1s, a compacted group at 2 GETs.
+5. HIT: composed 32-group boot at exactly 244 GETs and p50 1424ms, under the filed 3s and well under the 5s takeover bar.
+6. HIT: StateSum agreement on all 21 boots, rebuilt stats exact on all 160 group rebuilds, WAL frames exact.
+
+## Verdict
+
+HIT on all six bands, the kill line untouched.
+Boot cost is the estate you own: a fixed 4-GET floor near 85ms, then one GET and roughly 30ms per trailing chain object, per manifest, per segment, and per WAL-tail object, with groups fanning independently.
+The cadence the fleet slices bake: checkpoints at least every 64 chain objects, and since a heartbeating 16-node fleet appends multiple batches per second, the record-and-seconds cadence of doc 02 must be checked against object count, not just records; a 60s lull at 16 nodes heartbeating each second is nearly a thousand objects, so the lease manager checkpoints on object count first.
+Manifest chains want the same treatment: discovery is a GET per manifest, so the folder's manifest rewrite keeps the walk short and a compacted group boots its discovery at the 2-GET floor.

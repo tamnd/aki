@@ -1,0 +1,9 @@
+build,objects=162,wall_s=2.4
+chain_boot,distance=0,reps=5,p50_ms=85,worst_ms=217,gets_per_boot=4
+chain_boot,distance=16,reps=5,p50_ms=532,worst_ms=558,gets_per_boot=20
+chain_boot,distance=64,reps=4,p50_ms=2015,worst_ms=2354,gets_per_boot=68
+chain_boot,distance=256,reps=2,p50_ms=7937,worst_ms=7937,gets_per_boot=260
+manifests,count=1,reps=5,p50_ms=39,worst_ms=55,gets=2
+manifests,count=4,reps=5,p50_ms=121,worst_ms=197,gets=5
+manifests,count=16,reps=5,p50_ms=469,worst_ms=523,gets=17
+composed_boot,groups=32,fan=8,distance=16,reps=5,p50_ms=1424,worst_ms=1868,gets_per_boot=244
