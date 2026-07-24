@@ -38,6 +38,9 @@ const (
 	opDel
 	opSet
 	opGet
+	opGetex
+	opSetex
+	opPsetex
 	opSadd
 	opHset
 	opZadd
@@ -62,6 +65,9 @@ func harnessHandlers() []shard.Handler {
 	h[opDel] = Del
 	h[opSet] = str.Set
 	h[opGet] = str.Get
+	h[opGetex] = Getex
+	h[opSetex] = str.Setex
+	h[opPsetex] = str.Psetex
 	h[opSadd] = set.Sadd
 	h[opHset] = hash.Hset
 	h[opZadd] = zset.Zadd
@@ -294,6 +300,59 @@ func TestGuardReapsFiredCollection(t *testing.T) {
 	seed(t, c, "zset", "z")
 	wantInt(t, do(t, c, opTTL, "z"), -1)
 	wantStatus(t, do(t, c, opType, "z"), "zset")
+}
+
+func wantBulk(t *testing.T, got, v string) {
+	t.Helper()
+	want := "$" + strconv.Itoa(len(v)) + "\r\n" + v + "\r\n"
+	if got != want {
+		t.Fatalf("reply %q, want %q", got, want)
+	}
+}
+
+func TestSetexPsetexGetex(t *testing.T) {
+	c := newHarness(t).NewConn()
+	at := strconv.FormatInt(farFutureSec, 10)
+
+	wantStatus(t, do(t, c, opSetex, "sx", "100", "v1"), "OK")
+	if ttl := intReply(t, do(t, c, opTTL, "sx")); ttl <= 0 || ttl > 100 {
+		t.Fatalf("TTL %d after SETEX 100", ttl)
+	}
+	wantStatus(t, do(t, c, opPsetex, "sx", "100000", "v2"), "OK")
+	if pttl := intReply(t, do(t, c, opPttl, "sx")); pttl <= 0 || pttl > 100000 {
+		t.Fatalf("PTTL %d after PSETEX 100000", pttl)
+	}
+
+	wantBulk(t, do(t, c, opGetex, "sx", "PERSIST"), "v2")
+	wantInt(t, do(t, c, opTTL, "sx"), -1)
+	wantBulk(t, do(t, c, opGetex, "sx", "EXAT", at), "v2")
+	wantInt(t, do(t, c, opExpiretime, "sx"), farFutureSec)
+	// The bare form reads without touching the deadline.
+	wantBulk(t, do(t, c, opGetex, "sx"), "v2")
+	wantInt(t, do(t, c, opExpiretime, "sx"), farFutureSec)
+	if got := do(t, c, opGetex, "nosx"); got != "$-1\r\n" {
+		t.Fatalf("GETEX on a missing key answered %q", got)
+	}
+	// A stamp already due answers the value, then the key is gone.
+	wantBulk(t, do(t, c, opGetex, "sx", "PXAT", "1"), "v2")
+	wantInt(t, do(t, c, opExists, "sx"), 0)
+	wantInt(t, do(t, c, opTTL, "sx"), -2)
+
+	wantErrHas(t, do(t, c, opSetex, "sx", "0", "v"), "invalid expire time in 'setex'")
+	wantErrHas(t, do(t, c, opPsetex, "sx", "-1", "v"), "invalid expire time in 'psetex'")
+	wantStatus(t, do(t, c, opSet, "sx", "v3"), "OK")
+	wantErrHas(t, do(t, c, opGetex, "sx", "EX", "0"), "invalid expire time in 'getex'")
+	wantErrHas(t, do(t, c, opGetex, "sx", "EX", "1", "PERSIST"), "syntax error")
+	wantErrHas(t, do(t, c, opGetex, "sx", "EX", "1", "PX", "2"), "syntax error")
+	wantErrHas(t, do(t, c, opGetex, "sx", "EX"), "syntax error")
+	wantErrHas(t, do(t, c, opGetex, "sx", "BOGUS"), "syntax error")
+
+	// On a dual-half key GETEX lands the deadline on both halves, the
+	// same convergence rule its expire frame implies on replay.
+	wantInt(t, do(t, c, opSadd, "gboth", "m"), 1)
+	wantStatus(t, do(t, c, opSet, "gboth", "v"), "OK")
+	wantBulk(t, do(t, c, opGetex, "gboth", "EXAT", at), "v")
+	wantInt(t, do(t, c, opExpiretime, "gboth"), farFutureSec)
 }
 
 func TestExpireCoversBothKeyspaceHalves(t *testing.T) {

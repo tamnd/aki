@@ -153,12 +153,17 @@ func TestBootServesExpiresAcrossRestart(t *testing.T) {
 	expect(t, r1, ":1\r\n")
 	send(t, nc1, "EXISTS", "l")
 	expect(t, r1, ":0\r\n")
+	send(t, nc1, "SETEX", "sx", "100", "v1")
+	expect(t, r1, "+OK\r\n")
+	send(t, nc1, "GETEX", "sx", "EXAT", farSec)
+	expect(t, r1, "$2\r\nv1\r\n")
 	commitAndStop(t, b1, srv1, nc1)
 
 	b2, srv2, nc2, r2 := bootServer(t, bucket, 2)
-	// Four expire frames: the three EXPIREATs plus PERSIST's expire-0.
-	if b2.Replay.Expires != 4 {
-		t.Fatalf("reboot replay stats %+v, want 4 expires", b2.Replay)
+	// Five expire frames: the three EXPIREATs, PERSIST's expire-0, and
+	// GETEX's EXAT; SETEX rides a set frame carrying its deadline instead.
+	if b2.Replay.Expires != 5 {
+		t.Fatalf("reboot replay stats %+v, want 5 expires", b2.Replay)
 	}
 	send(t, nc2, "EXPIRETIME", "str")
 	expect(t, r2, ":"+farSec+"\r\n")
@@ -174,6 +179,10 @@ func TestBootServesExpiresAcrossRestart(t *testing.T) {
 	expect(t, r2, ":0\r\n")
 	send(t, nc2, "TYPE", "l")
 	expect(t, r2, "+none\r\n")
+	send(t, nc2, "GETEX", "sx")
+	expect(t, r2, "$2\r\nv1\r\n")
+	send(t, nc2, "EXPIRETIME", "sx")
+	expect(t, r2, ":"+farSec+"\r\n")
 	commitAndStop(t, b2, srv2, nc2)
 }
 
