@@ -40,3 +40,48 @@ The bands above come from the doc 01 envelope arithmetic and the milestone bars,
 ## Run
 
     ./run.sh
+
+## Results
+
+One scored run, full size (handoff.csv): 440 objects built, 40 handoff reps, rebuild reps of 3, every correctness assertion green.
+
+Warm window (release + observe + grant + replay), zero segment GETs by the sim's own counters:
+
+| depth | p50 ms | p99 ms |
+|---|---|---|
+| 0 | 144.7 | 465.3 |
+| 1 | 175.1 | 568.2 |
+| 4 | 280.5 | 532.5 |
+
+Terms: release p50 30.2ms, observe 57.8, grant 47.8, replay 21.5 at depth 1.
+Warm phase billed exactly 9 GETs and 2 PUTs per rep, none of them size-dependent.
+
+Rebuild sweep, ms per segment in parentheses:
+
+| segments | serial p50 | fan 8 | fan 32 |
+|---|---|---|---|
+| 8 | 271 (33.8) | 54 | 90 |
+| 32 | 965 (30.1) | 217 | 146 |
+| 128 | 4348 (34.0) | 896 | 620 |
+| 256 | 8123 (31.7) | 1148 | 476 |
+
+Replay sweep p50: 29.3ms at depth 1, 120.3 at 4, 488.9 at 16.
+Composed cold takeover at 256 segments: serial 8342ms, fan 8 1366ms, fan 32 695ms against the 5000ms bar.
+
+Band scoring:
+
+1. HIT: warm graceful window p50 144.7ms at depth 0 and 175.1ms at depth 1 against the 300ms bar, p99 465.3 and 568.2ms against 1.5s.
+2. HIT: the op-count invariant held as a hard assertion, exactly 2 chain PUTs, 4 chain GETs, and the depth's WAL GETs per rep, zero segment GETs, no size-dependent term.
+3. HIT: replay medians 29.3, 120.3, and 488.9ms track depth 1, 4, and 16 near-proportionally, depth 16 under the 700ms band.
+4. HIT: serial rebuild at 30.1 to 34.0ms per segment at every count, and 256 segments serial takes 8.1s, past even the 5s takeover bar.
+5. HIT: fan 8 at 256 segments is 7.1x over serial and lands at 1148ms, under 1.5s.
+6. HIT: composed cold takeover at 256 segments is 1366ms with fan 8, under the 5s bar, and 8342ms serial, over it.
+7. HIT: both folds agreed on holder and epoch after all 40 handoffs, rebuilt stats identical across all twelve arm-count pairs, replay walked exactly the built frame counts.
+
+Two edges worth recording: the depth-4 sensitivity row's p50 came out at 280.5ms, grazing the graceful bar from below, which is why the slice must keep the holder's seal-and-publish ahead of the release so graceful replay stays at depth 0 or 1; and fan 32 lost to fan 8 at 8 segments (90 vs 54ms), straggler draws over too few objects, so the fan constant should not exceed the segment count.
+
+## Verdict
+
+HIT on all seven bands, the kill line untouched.
+The handoff slice bakes what the lab priced: the taker pre-warms manifest, directory, and keymap before the release lands so the graceful window is chain ops plus a shallow WAL tail and nothing that scales with data, and crash takeover fetches segments behind a fan of 8 or the 5s bar is unreachable past roughly 150 segments.
+The sim carries no bandwidth term; at the doc 01 fit's 100 MB/s lane, real 4 MiB segments add roughly 40ms per segment serial or 40ms over fan lanes per segment fetched, which moves the serial arm further past the bar and leaves the fan-8 arm at roughly 2.4s for 256 segments, still under it, to be refit on live infra at O5.
