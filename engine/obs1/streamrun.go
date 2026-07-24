@@ -175,6 +175,11 @@ func StreamRunIter(refs []DirRef, start int, fetch func(DirRef) ([]byte, error),
 			}
 			ref := refs[i]
 			i++
+			if ref.Count == 0 {
+				// A trim's manifest drop: the run's whole ID range is gone, so
+				// the plan skips it without a fetch (doc 08 section 7).
+				continue
+			}
 			if data == nil || ref.ObjKey != lastObj || ref.Block.Offset != lastOff {
 				if prefetch != nil {
 					for j := i; j < len(refs); j++ {

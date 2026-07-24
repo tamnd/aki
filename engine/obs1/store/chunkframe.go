@@ -108,3 +108,14 @@ func decodeChunkFrame(buf []byte) (chunkFrame, int, error) {
 	}
 	return f, total, nil
 }
+
+// ChunkFramePayloadLen reads the payload length the chunk frame at the
+// front of data records, or -1 when data is too short to hold the header.
+// The segment builder uses it to hold a zero-count chunk, a trim's
+// manifest drop marker, to its payload-free shape.
+func ChunkFramePayloadLen(data []byte) int {
+	if len(data) < chunkHdr {
+		return -1
+	}
+	return int(binary.LittleEndian.Uint32(data[8:]))
+}
