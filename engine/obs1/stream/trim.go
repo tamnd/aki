@@ -107,12 +107,14 @@ func parseTrim(args [][]byte) (sp trimSpec, next int, errMsg string) {
 }
 
 // trim applies the spec and returns the number of entries removed, dispatching on
-// the band. A nil or empty stream is handled by the caller.
-func (s *stream) trim(sp trimSpec) int {
+// the band. key names the stream for the whole-block drops' fold-plane manifest
+// notices; the inline band never has a cold form and ignores it. A nil or empty
+// stream is handled by the caller.
+func (s *stream) trim(key []byte, sp trimSpec) int {
 	if s.kind == bandInline {
 		return s.trimInline(sp)
 	}
-	return s.trimNative(sp)
+	return s.trimNative(key, sp)
 }
 
 // wants reports whether id sits below the trim threshold, the predicate the
@@ -122,7 +124,7 @@ func (sp trimSpec) below(id streamID) bool { return id.cmp(sp.minid) < 0 }
 // trimNative drops whole front blocks, then, in exact mode, tombstones the
 // overshoot in the boundary block. It never drops the tail block (a stream keeps
 // at least one block, empty or not), so a walk always has a block to land in.
-func (s *stream) trimNative(sp trimSpec) int {
+func (s *stream) trimNative(key []byte, sp trimSpec) int {
 	removed := 0
 
 	// Whole-block front drops. A block is droppable when removing it entirely
@@ -156,7 +158,7 @@ func (s *stream) trimNative(sp trimSpec) int {
 			// descriptor (a no-op when resident), leaving the cold frame an orphan the
 			// compactor reclaims. resBlob already lost its bytes at demote, so the
 			// subtraction below is zero for a cold block and its length otherwise.
-			s.forgetCold(db)
+			s.forgetCold(key, db)
 			s.resBlob -= uint64(len(db.blob))
 		}
 		// A fresh slice so the abandoned front slots do not pin their blocks or

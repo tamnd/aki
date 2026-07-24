@@ -237,7 +237,7 @@ func TestResidentAccountingTrimDropsBlocks(t *testing.T) {
 
 	// An approximate MAXLEN trim drops whole front blocks (never a partial rewrite), so
 	// the freed blob bytes leave the running total at the command boundary.
-	removed := s.trim(trimSpec{kind: trimMaxlen, approx: true, maxlen: 128})
+	removed := s.trim([]byte("k"), trimSpec{kind: trimMaxlen, approx: true, maxlen: 128})
 	g.note(s)
 	if removed == 0 {
 		t.Fatal("approximate trim to 128 dropped nothing from a 400-entry stream")

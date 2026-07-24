@@ -17,6 +17,8 @@ package obs1
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/tamnd/aki/engine/obs1/store"
 )
 
 // SegmentBlockSize is the default uncompressed block size.
@@ -139,8 +141,12 @@ func BuildSegment(f SegmentFooter, chunks []SegmentChunk, memberKeys [][]byte, b
 		if len(c.Key) > 0xFFFF {
 			return nil, fmt.Errorf("obs1: chunk %d key is %d bytes, the format caps keys at 65535", i, len(c.Key))
 		}
-		if c.Count == 0 {
-			return nil, fmt.Errorf("obs1: chunk %d holds no records", i)
+		if c.Count == 0 && store.ChunkFramePayloadLen(c.Data) != 0 {
+			// A zero-count chunk is legal only as a trim's manifest drop
+			// (doc 08 section 7): payload-free, it replaces a folded run by
+			// its disc and records the range as deliberately empty. A zero
+			// count over real payload bytes is corruption, not a drop.
+			return nil, fmt.Errorf("obs1: chunk %d counts no records but carries payload", i)
 		}
 		if len(cur) > 0 && len(cur)+len(c.Data) > blockSize {
 			seg.BlockData = append(seg.BlockData, cur)
@@ -284,9 +290,9 @@ func validateSegmentShape(f *SegmentFooter, blockData [][]byte) error {
 		if len(c.Key) > 0xFFFF {
 			return fmt.Errorf("obs1: chunk %d key is %d bytes, the format caps keys at 65535", i, len(c.Key))
 		}
-		if c.Count == 0 {
-			return fmt.Errorf("obs1: chunk %d holds no records", i)
-		}
+		// A zero count is the trim's manifest drop marker (doc 08 section
+		// 7), a deliberately empty range the planners skip, so the footer
+		// admits it; the build side holds it to a payload-free frame.
 		if c.MinExpMS == 0 {
 			if c.MaxExpMS != 0 {
 				return fmt.Errorf("obs1: chunk %d has a max expiry bound but no min", i)

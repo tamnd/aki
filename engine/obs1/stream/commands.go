@@ -77,7 +77,7 @@ func Xadd(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 	}
 	var removed int
 	if trimSet {
-		removed = s.trim(trim)
+		removed = s.trim(args[0], trim)
 		// Exact trim tombstones the boundary block's overshoot in place, leaving a
 		// partially-dead sealed block for the gc pass; approximate trim only drops
 		// whole front blocks, already reclaimed. Mark the stream dirty only in the
@@ -138,7 +138,7 @@ func Xtrim(cx *shard.Ctx, args [][]byte, r shard.Reply) {
 		r.Int(0)
 		return
 	}
-	removed := s.trim(sp)
+	removed := s.trim(args[0], sp)
 	// Exact trim leaves a partially-dead boundary block for the gc pass (see Xadd);
 	// approximate trim reclaims whole blocks and leaves nothing to collect.
 	if removed > 0 && !sp.approx && s.kind == bandNative {
