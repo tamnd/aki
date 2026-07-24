@@ -252,7 +252,7 @@ func TestRecoverFromCheckpoint(t *testing.T) {
 	// root; any node may do this, lease or not.
 	const observer = uint64(0xC1)
 	fold2 := obs1.NewLeaseFold()
-	ck, err := obs1.NewCheckpointer(fold2, observer, 3*time.Second, 0, 0, time.Now)
+	ck, err := obs1.NewCheckpointer(fold2, observer, 3*time.Second, 0, 0, 0, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
