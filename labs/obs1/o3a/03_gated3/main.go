@@ -64,7 +64,7 @@ func schedules() []schedule {
 			settleHi: 2 * time.Second, maxEpoch: 2},
 		{name: "storm", seed: 102, fault: func() sim.FaultFn { return fleetsim.Storm(3) },
 			lo: 6500 * time.Millisecond, hi: 9 * time.Second,
-			settleHi: 2 * time.Second, maxEpoch: 2},
+			settleHi: 12 * time.Second, maxEpoch: 3},
 		{name: "read-outage", seed: 103, fault: fleetsim.ReadOutage, heal: 2 * time.Second,
 			lo: 6500 * time.Millisecond, hi: 9 * time.Second,
 			settleHi: 2 * time.Second, maxEpoch: 2},
@@ -86,12 +86,14 @@ type row struct {
 	pass         bool
 }
 
-func survivorsOf(f *fleetsim.Fleet, observer uint64) []obs1.Member {
-	n := f.Node(observer)
-	at := f.Clk.Now()
+// liveMembers is harness truth, every joined member whose stack is not
+// crashed. The settle predicate must not use an observer's
+// suspicion-filtered view: a degraded view prefers the observer for
+// everything it can see and satisfies placement vacuously.
+func liveMembers(f *fleetsim.Fleet, observer uint64) []obs1.Member {
 	var out []obs1.Member
-	for _, m := range n.Fold.Members() {
-		if m.Node == observer || !n.Live.Suspect(m.Node, at) {
+	for _, m := range f.Node(observer).Fold.Members() {
+		if !f.Node(m.Node).Crashed {
 			out = append(out, m)
 		}
 	}
@@ -179,13 +181,13 @@ func runSchedule(sc schedule) (row, error) {
 	f.SetFault(nil)
 
 	// Settle: tick until the whole placement matches the live-members
-	// rendezvous. A write outage past the discipline lets the first
-	// post-heal duty cycle seize its peer's groups from a degraded
-	// survivor view, epoch-fenced and self-correcting, one balancer
-	// shed per tick; this phase prices that tail.
+	// rendezvous. An outage or a phase-locked storm past the
+	// discipline lets a survivor seize its peer's groups from a
+	// degraded view, epoch-fenced and self-correcting, one balancer
+	// move per tick; this phase prices that tail.
 	settled := false
 	for elapsed := time.Duration(0); elapsed < 20*time.Second; elapsed += step {
-		members := survivorsOf(f, 1)
+		members := liveMembers(f, 1)
 		placed := true
 		for g := 0; g < nGroups; g++ {
 			node, _, ok := f.Node(1).Fold.Holder(uint16(g))

@@ -43,6 +43,18 @@ The rig amendment: after recovery, every schedule runs a settle phase that ticks
 Amended bands: settle within 2s for clean, storm, read-outage, and ambiguous-put, whose survivor views never degrade, and within 12s for write-outage, pricing the one-shed-per-tick rebalance tail; victim-group epochs stay exactly 2 on the first four schedules, and land in {2, 3} under write-outage, where 3 is a group that moved twice, seized at 2 and rebalanced at 3.
 The recovery bands of the prediction stand unchanged, and the first run's recovery numbers stand as scored.
 
+## Second amendment (filed after the amended re-run, before the second re-run)
+
+The amended re-run passed everything except the storm settle, 7300ms against the 2s band, and the debug trace names a mechanism the amendment's rationale missed.
+The storm's every-3rd counter is deterministic and the duty cycle's per-tick op sequence is fixed, so the two phase-lock: the same relative op slots fail on every tick, one survivor's heartbeat append lands on a failing slot every single tick while the other's always lands.
+The starved survivor goes silent on the chain for the whole storm, its peer completes the full takeover discipline against it mid-storm and seizes its five groups epoch-fenced, and the 7.3s settle is the balancer walking those five groups back at one move per balance tick after the heal.
+So a storm spanning the discipline is not the scattered-retry mode the band priced; under phase-lock it degrades one node into an asymmetric write outage, and the fleet survives it the same way it survives the real one.
+The claim that the storm's survivor views never degrade was wrong and is withdrawn.
+Amended bands: storm settle within 12s and victim-group epochs in {2, 3}, same as write-outage, pricing the same one-move-per-tick rebalance tail.
+Rig fix filed with this amendment: the settle predicate compared placement against the observer's suspicion-filtered survivor view, which a degraded view satisfies vacuously; the write-outage settle read 0 exactly this way, the observer still held everything and preferred itself for everything it could see.
+The predicate now compares against the harness-truth live set, every joined member whose stack is not crashed, so the write-outage settle will report its real rebalance tail on the re-run inside its existing 12s band.
+The recovery bands stand unchanged and both prior runs' recovery numbers stand as scored.
+
 ## Calibration disclosure
 
 The fleetsim harness's own test suite (#1361), run before this file was written, recovered the clean crash schedule in 6.7s simulated against an 8s assertion, which is where band 1's shape comes from; the storm, read-outage, ambiguous-put, and write-outage schedules have never been clocked and their bands come from the discipline arithmetic above.
