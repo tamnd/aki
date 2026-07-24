@@ -74,6 +74,13 @@ type hash struct {
 	// M9, so a fired field survives until the next command lands on its key.
 	nextExp uint64
 
+	// expireAt is the key-level TTL (spec 2064/obs1 doc 08 section 8): the
+	// root's absolute unix-ms deadline, 0 for none. Distinct from the field
+	// TTLs above; fields never move it. It lives on the root so it dies with
+	// the root; the shard rootExp map is only a hint index over it. Owner
+	// goroutine only, via rootttl.go.
+	expireAt int64
+
 	// acct is the hash's footprint as last posted to the registry running sum, so
 	// note can post only the delta since the last mutation and the total stays the
 	// exact walked sum without rewalking the registry (spec 2064/f3/06 section 6).

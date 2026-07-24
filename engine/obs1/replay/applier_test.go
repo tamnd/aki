@@ -244,6 +244,34 @@ func TestApplierKeyDelSpansKeyspaces(t *testing.T) {
 	}
 }
 
+// TestApplierExpireLandsOnCollectionRoot proves an expire frame on a
+// collection key restores the root deadline and the shard hint index,
+// and an expire-to-0 clears both, the persist half.
+func TestApplierExpireLandsOnCollectionRoot(t *testing.T) {
+	a, cx := newApplier(t)
+
+	apply(t, a, 0, frame(t, 1, "s", obs1.CollNew{Type: obs1.CollSet}))
+	apply(t, a, 0, frame(t, 2, "s", obs1.CollDelta{Sub: obs1.SAdd{Members: [][]byte{[]byte("m")}}}))
+	apply(t, a, 0, frame(t, 3, "s", obs1.Expire{ExpiryMS: 7_000_000_000_000}))
+	if at, ok := set.Deadline(cx, []byte("s")); !ok || at != 7_000_000_000_000 {
+		t.Fatalf("root deadline (%d, %v), want (7000000000000, true)", at, ok)
+	}
+	if at := cx.RootDeadline([]byte("s")); at != 7_000_000_000_000 {
+		t.Fatalf("hint index %d, want 7000000000000", at)
+	}
+
+	apply(t, a, 0, frame(t, 4, "s", obs1.Expire{ExpiryMS: 0}))
+	if at, ok := set.Deadline(cx, []byte("s")); !ok || at != 0 {
+		t.Fatalf("root deadline (%d, %v) after persist, want (0, true)", at, ok)
+	}
+	if at := cx.RootDeadline([]byte("s")); at != 0 {
+		t.Fatalf("hint index %d after persist, want 0", at)
+	}
+	if got := a.Stats(); got.Expires != 2 {
+		t.Fatalf("stats %+v, want 2 expires", got)
+	}
+}
+
 // TestApplierSetCorruptionIsLoud drives each divergence the set plane
 // must refuse: a delta on a missing set, a member framed as added that
 // is already present, one framed as removed that is absent, a colldrop

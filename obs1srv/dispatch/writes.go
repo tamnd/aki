@@ -22,6 +22,7 @@ package dispatch
 //     bit, as do the MSET and DEL sub-commands.
 var writeVerbs = []string{
 	"SET", "DEL", "UNLINK", "MSET", "FLUSHALL", "FLUSHDB",
+	"EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST",
 	"INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT",
 	"APPEND", "SETRANGE", "SETBIT", "BITFIELD", "BITOP",
 	"PFADD", "PFCOUNT", "PFMERGE", "PFDEBUG",

@@ -123,6 +123,60 @@ func TestBootServesAcrossRestart(t *testing.T) {
 // seam: creates, removals, an emptying SMOVE over one hash tag so both
 // sides ride one keyed run, and a DEL over a set key, all served back by
 // the next incarnation from the replayed registries.
+// TestBootServesExpiresAcrossRestart proves the key-level TTL surface
+// frames and replays: a string and a collection deadline both survive
+// the reboot, PERSIST's clear survives too, and a fired-on-arrival
+// deadline frames the keydel it is. Deadlines are far future (year
+// 2191) or strictly past, so nothing here races the clock.
+func TestBootServesExpiresAcrossRestart(t *testing.T) {
+	bucket := sim.New(sim.Config{})
+	const farSec = "7000000000"
+
+	b1, srv1, nc1, r1 := bootServer(t, bucket, 1)
+	send(t, nc1, "SET", "str", "v")
+	expect(t, r1, "+OK\r\n")
+	send(t, nc1, "EXPIREAT", "str", farSec)
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "SADD", "s", "m1", "m2")
+	expect(t, r1, ":2\r\n")
+	send(t, nc1, "EXPIREAT", "s", farSec)
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "HSET", "h", "f", "v")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "EXPIREAT", "h", farSec)
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "PERSIST", "h")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "RPUSH", "l", "e")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "PEXPIREAT", "l", "1")
+	expect(t, r1, ":1\r\n")
+	send(t, nc1, "EXISTS", "l")
+	expect(t, r1, ":0\r\n")
+	commitAndStop(t, b1, srv1, nc1)
+
+	b2, srv2, nc2, r2 := bootServer(t, bucket, 2)
+	// Four expire frames: the three EXPIREATs plus PERSIST's expire-0.
+	if b2.Replay.Expires != 4 {
+		t.Fatalf("reboot replay stats %+v, want 4 expires", b2.Replay)
+	}
+	send(t, nc2, "EXPIRETIME", "str")
+	expect(t, r2, ":"+farSec+"\r\n")
+	send(t, nc2, "EXPIRETIME", "s")
+	expect(t, r2, ":"+farSec+"\r\n")
+	send(t, nc2, "SMEMBERS", "s")
+	expect(t, r2, "*2\r\n$2\r\nm1\r\n$2\r\nm2\r\n")
+	send(t, nc2, "TTL", "h")
+	expect(t, r2, ":-1\r\n")
+	send(t, nc2, "TYPE", "h")
+	expect(t, r2, "+hash\r\n")
+	send(t, nc2, "EXISTS", "l")
+	expect(t, r2, ":0\r\n")
+	send(t, nc2, "TYPE", "l")
+	expect(t, r2, "+none\r\n")
+	commitAndStop(t, b2, srv2, nc2)
+}
+
 func TestBootServesSetsAcrossRestart(t *testing.T) {
 	bucket := sim.New(sim.Config{})
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/tamnd/aki/engine/obs1/derived"
 	"github.com/tamnd/aki/engine/obs1/hash"
+	"github.com/tamnd/aki/engine/obs1/keyspace"
 	"github.com/tamnd/aki/engine/obs1/list"
 	"github.com/tamnd/aki/engine/obs1/set"
 	"github.com/tamnd/aki/engine/obs1/shard"
@@ -100,7 +101,12 @@ var (
 )
 
 // register wires one verb. Called from init only; the table is immutable
-// afterwards, which is what lets Dispatch read it without a lock.
+// afterwards, which is what lets Dispatch read it without a lock. A keyed
+// point handler runs behind the lazy-expiry guard (keyspace.Reap): the
+// closure reads the routing key through the entry so a later keyAt
+// adjustment carries into the guard, and the guard's one hint-map lookup
+// is the whole cost on a keyspace with no collection TTLs. The fan and
+// cross routes miss the guard, the owed gap keyspace unification closes.
 func register(name string, h shard.Handler, minArgs, maxArgs int, keyed bool) {
 	lower := make([]byte, len(name))
 	for i := 0; i < len(name); i++ {
@@ -114,6 +120,18 @@ func register(name string, h shard.Handler, minArgs, maxArgs int, keyed bool) {
 		keyed:   keyed,
 	}
 	table[name] = e
+	if keyed && h != nil {
+		orig := h
+		h = func(cx *shard.Ctx, args [][]byte, r shard.Reply) {
+			if e.keyAt < len(args) {
+				if err := keyspace.Reap(cx, args[e.keyAt]); err != nil {
+					r.Err(err.Error())
+					return
+				}
+			}
+			orig(cx, args, r)
+		}
+	}
 	handlers = append(handlers, h)
 }
 
@@ -143,10 +161,20 @@ func init() {
 	register("SET", str.Set, 2, -1, true)
 	register("GET", str.Get, 1, 1, true)
 	register("STRLEN", str.Strlen, 1, 1, true)
-	// TYPE spans the string store and the set registry, so the set package
-	// owns its point handler; the same holds for the single-key EXISTS and DEL
-	// paths registered below.
-	register("TYPE", set.Type, 1, 1, true)
+	// TYPE spans the string store and every collection registry, so the
+	// keyspace package owns its point handler; the same holds for the
+	// single-key EXISTS and DEL paths registered below and the key-level
+	// TTL family.
+	register("TYPE", keyspace.Type, 1, 1, true)
+	register("EXPIRE", keyspace.Expire, 2, -1, true)
+	register("PEXPIRE", keyspace.PExpire, 2, -1, true)
+	register("EXPIREAT", keyspace.ExpireAt, 2, -1, true)
+	register("PEXPIREAT", keyspace.PExpireAt, 2, -1, true)
+	register("TTL", keyspace.TTL, 1, 1, true)
+	register("PTTL", keyspace.PTTL, 1, 1, true)
+	register("EXPIRETIME", keyspace.ExpireTime, 1, 1, true)
+	register("PEXPIRETIME", keyspace.PExpireTime, 1, 1, true)
+	register("PERSIST", keyspace.Persist, 1, 1, true)
 
 	// The tier-one multi-key commands: a single key keeps the point path,
 	// more keys scatter through the fan-out; MGET and MSET always fan. The
@@ -155,9 +183,9 @@ func init() {
 	mset := registerShard(str.MSetShard)
 	del := registerShard(str.DelShard)
 	exists := registerShard(str.ExistsShard)
-	register("EXISTS", set.Exists, 1, -1, true)
-	register("DEL", set.Del, 1, -1, true)
-	register("UNLINK", set.Del, 1, -1, true)
+	register("EXISTS", keyspace.Exists, 1, -1, true)
+	register("DEL", keyspace.Del, 1, -1, true)
+	register("UNLINK", keyspace.Del, 1, -1, true)
 	register("MGET", nil, 1, -1, true)
 	register("MSET", nil, 2, -1, true)
 	registerFan("EXISTS", shard.FanCount, exists, false, false)

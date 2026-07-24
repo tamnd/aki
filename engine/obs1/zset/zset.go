@@ -68,6 +68,12 @@ type zset struct {
 	// and never converted back (F4).
 	nat *nativeStore
 
+	// expireAt is the key-level TTL (spec 2064/obs1 doc 08 section 8): the
+	// root's absolute unix-ms deadline, 0 for none. It lives on the root so
+	// it dies with the root; the shard rootExp map is only a hint index over
+	// it. Owner goroutine only, via rootttl.go.
+	expireAt int64
+
 	// acct is the footprint this zset last posted into the registry's running
 	// total (reg.note), so a mutating command can post only the delta since the
 	// last note instead of rewalking the total. Meaningful only when the registry

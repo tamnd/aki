@@ -76,6 +76,12 @@ type set struct {
 	// enc is encPartitioned; a set never converts back out of the band (F4).
 	part *partitioned
 
+	// expireAt is the key-level TTL (spec 2064/obs1 doc 08 section 8): the
+	// root's absolute unix-ms deadline, 0 for none. It lives on the root so
+	// it dies with the root; the shard rootExp map is only a hint index over
+	// it. Owner goroutine only, via rootttl.go.
+	expireAt int64
+
 	// acct is this set's resident-byte footprint as last posted to the registry
 	// running total (reg.go, spec 2064/f3/06 section 6). The registry keeps
 	// sum(acct) over its live sets so the shard reads a collection's resident cost

@@ -298,6 +298,40 @@ func (s *Store) ExpireAt(key []byte, now int64) int64 {
 	return s.expireAt(addr)
 }
 
+// SetExpire sets key's absolute deadline in unix ms, or clears it when at
+// is 0 (PERSIST), reporting whether the key exists. A record that already
+// carries an expiry slot takes the new deadline in place, including a 0
+// that reads back as no deadline; a record without a slot cannot grow one,
+// so a first EXPIRE rewrites it through SetString, which also covers the
+// cold bands (the rewrite promotes). The error is SetString's allocation
+// failure on that rewrite path, ErrFull under pressure, and the key is
+// untouched when it fires.
+func (s *Store) SetExpire(key []byte, at, now int64) (bool, error) {
+	slot, addr, _ := s.findLive(Hash(key), key, now)
+	if addr == 0 {
+		return false, nil
+	}
+	if !slotCold(*slot) {
+		if s.recFlags(addr)&flagHasTTL != 0 {
+			s.setExpireAt(addr, at)
+			return true, nil
+		}
+		if at == 0 {
+			return true, nil
+		}
+	} else if at == 0 && s.coldExpireAt(addr) == 0 {
+		return true, nil
+	}
+	v, ok := s.GetString(key, now, nil)
+	if !ok {
+		return false, nil
+	}
+	if err := s.SetString(key, v, now, at, false); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // StrLen reports the value's byte length (an int cell's digit count) and
 // presence.
 func (s *Store) StrLen(key []byte, now int64) (int64, bool) {
