@@ -179,6 +179,62 @@ func TestProbeBatchTouch(t *testing.T) {
 	}
 }
 
+// TestTypeTagPromotedRoot pins the promoted-root hole: maybePromote
+// flattens every root header to TagString|TagRoot because the seam's
+// Record carries no type tag, so TYPE and SCAN must sniff the root
+// payload instead of trusting the header nibble.
+func TestTypeTagPromotedRoot(t *testing.T) {
+	ctx := context.Background()
+	tr, _, _ := keyspaceRig(t)
+	hsh, err := NewHash(tr, HashConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the cold hash until the promotion coin lands it hot.
+	promoted := false
+	for i := 0; i < 256; i++ {
+		if _, _, err := hsh.HGet(ctx, []byte("coldhash"), []byte("f")); err != nil {
+			t.Fatal(err)
+		}
+		if _, hot := tr.ht.peek([]byte("coldhash")); hot {
+			promoted = true
+			break
+		}
+	}
+	if !promoted {
+		t.Fatal("coldhash never promoted; bump the read loop")
+	}
+
+	tag, ok, err := tr.TypeTag(ctx, []byte("coldhash"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || tag != TagHash {
+		t.Fatalf("promoted hash root TypeTag = (%d, %v), want (%d, true)", tag, ok, TagHash)
+	}
+
+	// SCAN's hot paths share the sniff: the promoted root must come
+	// out tagged hash, not string, whichever phase emits it.
+	got := map[string]uint8{}
+	cursor := uint64(0)
+	for {
+		next, err := tr.ScanStep(ctx, cursor, 64, func(key []byte, tag uint8) {
+			got[string(key)] = tag
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+	if got["coldhash"] != TagHash {
+		t.Fatalf("SCAN tag for promoted root = %d, want %d", got["coldhash"], TagHash)
+	}
+}
+
 // TestTypeTagTiers pins TYPE's tag source per tier state: the hot
 // header answers directly, a cold root sniffs, a cold plain record is
 // a string, and dead keys in every form answer none.

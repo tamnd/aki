@@ -274,6 +274,19 @@ func (t *HotTable) probeEntry(key []byte) (val []byte, tag uint8, expMs int64, h
 	return t.vals.data(hd.valRef), hd.typeTag, expMsOf(hd), true, true
 }
 
+// liveTag is hd's true type nibble. A promoted root header carries
+// TagString regardless of the real type, because maybePromote has
+// only the seam's Record to go by and that carries no type tag, so
+// any root answers from its payload sub byte instead of trusting the
+// nibble. Callers must have checked the header is live (valRef set).
+func (t *HotTable) liveTag(hd *hdr) (uint8, error) {
+	if hd.typeTag&TagRoot == 0 {
+		return hd.typeTag & 0x0F, nil
+	}
+	tag, _, err := sniffRoot(t.vals.data(hd.valRef))
+	return tag, err
+}
+
 // has reports raw residency in any state (live, dirty, tombstone,
 // expired), without touching read stamps. The reaper uses it to yield
 // to the hot copy: whatever the table holds under key is newer than

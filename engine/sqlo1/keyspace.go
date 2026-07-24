@@ -69,15 +69,20 @@ func typeName(tag uint8) string {
 }
 
 // TypeTag answers TYPE: the key's type tag (TagString..TagStream)
-// without stamps or promotion. The hot header carries the tag
-// directly; a cold plain record is a string, a cold root sniffs.
+// without stamps or promotion. A non-root hot header carries the tag
+// directly; roots sniff their payload on either tier, because a
+// promoted root's header nibble is flattened to TagString.
 func (t *Tiered) TypeTag(ctx context.Context, key []byte) (uint8, bool, error) {
 	t.ht.SetNow(t.nowMs())
 	if hd, ok := t.ht.peek(key); ok {
 		if hd.valRef == 0 || t.ht.expired(hd) {
 			return 0, false, nil
 		}
-		return hd.typeTag & 0x0F, true, nil
+		tag, err := t.ht.liveTag(hd)
+		if err != nil {
+			return 0, false, err
+		}
+		return tag, true, nil
 	}
 	t.missKeys = append(t.missKeys[:0], key)
 	t.stats.BatchReads++

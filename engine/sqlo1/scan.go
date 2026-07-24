@@ -58,7 +58,7 @@ const scanHotBit = uint64(1) << 63
 // walk never touches read stamps: a scan must not disturb the clocks
 // eviction ranks by. It returns the next slot and whether the shadow
 // is exhausted; the caller reads slots examined off next minus from.
-func (t *HotTable) scanShadow(from uint32, budget int, fn func(key []byte, tag uint8)) (next uint32, done bool) {
+func (t *HotTable) scanShadow(from uint32, budget int, fn func(key []byte, tag uint8)) (next uint32, done bool, err error) {
 	s := from
 	for ; s < uint32(len(t.hdrs)) && budget > 0; s++ {
 		budget--
@@ -69,9 +69,13 @@ func (t *HotTable) scanShadow(from uint32, budget int, fn func(key []byte, tag u
 		if hd.gen != 0 || hd.typeTag&TagFence != 0 || t.expired(hd) {
 			continue
 		}
-		fn(t.keys.data(hd.keyRef), hd.typeTag&0x0F)
+		tag, err := t.liveTag(hd)
+		if err != nil {
+			return s, false, err
+		}
+		fn(t.keys.data(hd.keyRef), tag)
 	}
-	return s, s >= uint32(len(t.hdrs))
+	return s, s >= uint32(len(t.hdrs)), nil
 }
 
 // peek resolves key to its header without touching read stamps, the
@@ -111,7 +115,10 @@ func (t *Tiered) ScanStep(ctx context.Context, cursor uint64, budget int, emit f
 	t.ht.SetNow(t.nowMs())
 	if cursor == 0 || cursor&scanHotBit != 0 {
 		from := uint32(cursor &^ scanHotBit)
-		next, done := t.ht.scanShadow(from, budget, emit)
+		next, done, err := t.ht.scanShadow(from, budget, emit)
+		if err != nil {
+			return 0, err
+		}
 		if !done {
 			return scanHotBit | uint64(next), nil
 		}
@@ -134,7 +141,12 @@ func (t *Tiered) ScanStep(ctx context.Context, cursor uint64, budget int, emit f
 			if hd.valRef == 0 || t.ht.expired(hd) {
 				return
 			}
-			emit(rec.Key, hd.typeTag&0x0F)
+			tag, err := t.ht.liveTag(hd)
+			if err != nil {
+				sniffErr = err
+				return
+			}
+			emit(rec.Key, tag)
 			return
 		}
 		tag := TagString
