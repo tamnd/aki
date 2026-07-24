@@ -263,6 +263,15 @@ func (t *HotTable) probeEntry(key []byte) (val []byte, tag uint8, expMs int64, h
 	return t.vals.data(hd.valRef), hd.typeTag, expMsOf(hd), true, true
 }
 
+// has reports raw residency in any state (live, dirty, tombstone,
+// expired), without touching read stamps. The reaper uses it to yield
+// to the hot copy: whatever the table holds under key is newer than
+// the index record a scan found.
+func (t *HotTable) has(key []byte) bool {
+	_, ok := t.lookup(maphash.Bytes(t.seed, key), key)
+	return ok
+}
+
 // dirtyKey reports whether key currently sits dirty in the table, so
 // the type layer can see when a root still holds a drain-queue
 // position from an earlier write.

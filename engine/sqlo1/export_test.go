@@ -29,6 +29,17 @@ func (t *Tiered) SetExpireForTest(key []byte, atMs int64) {
 	t.ht.setExpireMs(key, atMs)
 }
 
+// RootIDForTest decodes a planed root payload's identity, so the
+// reaper integration test can probe the store's RootLive after a reap
+// pass carried the genbump down.
+func (s *Str) RootIDForTest(v []byte) (rooth uint64, rootgen uint32, err error) {
+	m, err := s.rootMeta(v, 0)
+	if err != nil {
+		return 0, 0, err
+	}
+	return m.root.rooth, m.root.rootgen, nil
+}
+
 // EvictAllForTest drops every resident header, forcing the next reads
 // through the cold path.
 func (t *Tiered) EvictAllForTest() {

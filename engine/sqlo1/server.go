@@ -32,6 +32,11 @@ type Server struct {
 
 	mu sync.Mutex // serializes command execution against the runtime
 
+	// reapOn arms the doc 11 sampling reaper; Serve then drives one
+	// time-boxed pass every reapTick between commands. Off by default
+	// until the gate box confirms the lab verdict.
+	reapOn bool
+
 	// now is the clock, swappable by tests that exercise expiry.
 	now func() int64 // wall milliseconds
 
@@ -133,6 +138,10 @@ func NewServer(st Store) (*Server, error) {
 	return srv, nil
 }
 
+// EnableReaper arms the sampling reaper before Serve; it has no
+// effect on a store without the ExpiryReaper capability.
+func (s *Server) EnableReaper() { s.reapOn = true }
+
 // Serve accepts connections until the listener closes. A once-a-second
 // tick runs the runtime's timer maintenance (drain quanta, checkpoint,
 // compaction steps) between commands; a tick error is not fatal here
@@ -154,6 +163,24 @@ func (s *Server) Serve(l net.Listener) error {
 			}
 		}
 	}()
+	if s.reapOn {
+		go func() {
+			tk := time.NewTicker(reapTick)
+			defer tk.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-tk.C:
+					s.mu.Lock()
+					// Like Tick, a pass error is not fatal here: the
+					// same store error surfaces on the next command.
+					s.s.ReapStep(context.Background())
+					s.mu.Unlock()
+				}
+			}
+		}()
+	}
 	for {
 		c, err := l.Accept()
 		if err != nil {

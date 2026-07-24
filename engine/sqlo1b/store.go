@@ -2182,6 +2182,84 @@ func (s *Store) SampleExpiry(maxChunks int) ([4]sqlo1.ExpiryClassStat, error) {
 	return out, nil
 }
 
+// ReapScan is the sampling reaper's store half (doc 11 section 3.3):
+// one pass shaped like SampleExpiry that also collects the expired
+// user records it probes, for the tiered layer to tombstone. The pass
+// is TIME-boxed rather than chunk-counted, the reaper lab's verdict
+// (labs/sqlo1/t7/01_reaper): per-entry probe cost dominates and
+// varies 20x with keyspace composition, so only a time box holds a
+// duty target, and the walk stops after the bucket that crosses it,
+// bounding the stall a queued command sees at the box plus one chain
+// overshoot. Every call visits at least one bucket, so laps make
+// progress under any box. Only string and root records become
+// candidates: segment, fence, and meta records are not addressable
+// keys, and a reaped root's plane dies by the genbump the type layer
+// books beside the tombstone. Key and value bytes are copied out
+// because candidates outlive the pass's read buffers.
+func (s *Store) ReapScan(box time.Duration, maxKeys int) ([]sqlo1.ReapCandidate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broken != nil {
+		return nil, s.broken
+	}
+	var cands []sqlo1.ReapCandidate
+	var out [4]sqlo1.ExpiryClassStat
+	now := s.nowMS()
+	start := time.Now()
+	n := NumBuckets(s.level, s.split)
+	if s.expCursor >= n {
+		s.expCursor = 0
+	}
+	for visited := range n {
+		if visited > 0 && (len(cands) >= maxKeys || time.Since(start) >= box) {
+			break
+		}
+		bkt := s.expCursor
+		s.expCursor = (s.expCursor + 1) % n
+		chain, ok := s.dirty[bkt]
+		if !ok {
+			var err error
+			if chain, err = s.coldChain(bkt); err != nil {
+				return cands, err
+			}
+		}
+		for _, c := range chain {
+			for i := range c.Count() {
+				_, meta, vptr := c.EntryAt(i)
+				cls := MetaExpiryClass(meta)
+				out[cls].Entries++
+				if cls != ExpClassNear && cls != ExpClassMid {
+					continue
+				}
+				rec, err := s.resolveAt(Pos(vptr))
+				if err != nil {
+					return cands, err
+				}
+				out[cls].Probed++
+				if !rec.HasExpiry() || int64(rec.ExpireMS) > now {
+					continue
+				}
+				out[cls].Expired++
+				if rec.RType != RecString && rec.RType != RecRoot || len(cands) >= maxKeys {
+					continue
+				}
+				cand := sqlo1.ReapCandidate{
+					Key:  append([]byte(nil), rec.Key...),
+					Root: rec.RType == RecRoot,
+				}
+				if cand.Root {
+					cand.Value = append([]byte(nil), rec.Value...)
+				}
+				cands = append(cands, cand)
+			}
+		}
+	}
+	// A reap pass is also a sample pass, so it refreshes the estimate
+	// the same way SampleExpiry does.
+	s.expSample = out
+	return cands, nil
+}
+
 // Stats reports the store's own accounting. Keys counts index
 // entries, so expired-but-unreaped records and generation records are
 // included until a delete or compaction removes them. Get, BatchGet,
