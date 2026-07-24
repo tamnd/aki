@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/tamnd/aki/engine/sqlo1"
 )
@@ -106,6 +107,105 @@ func TestExpiredCreditFiresCompaction(t *testing.T) {
 		delete(r.sh, k)
 	}
 	r.verify(t)
+}
+
+// TestReapScanCandidates pins what a reap pass hands the runtime: the
+// expired string and root records, keys and root payloads copied, and
+// nothing else. Live keys probe without becoming candidates, no-expiry
+// keys are never probed, and an expired segment subkey stays out of
+// the list because planes die by rootgen, not by tombstone. The pass
+// also refreshes the cached class sample, since it walked the same
+// entries a SampleExpiry pass would have.
+func TestReapScanCandidates(t *testing.T) {
+	r := newStoreRig(t)
+	r.apply(t,
+		putOp("dead1", []byte("v1"), r.now+1000),
+		putOp("dead2", []byte("v2"), r.now+1000),
+		putOp("alive", []byte("v3"), r.now+60_000),
+		putOp("stays", []byte("v4"), 0),
+	)
+	rootVal := bytes.Repeat([]byte{0xab}, 40)
+	r.apply(t, sqlo1.Op{Rec: sqlo1.Record{Key: []byte("deadroot"), Value: rootVal, ExpireMs: r.now + 1000, Root: true}})
+	sk, err := sqlo1.NewSubkey(77, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.apply(t, sqlo1.Op{Rec: sqlo1.Record{Key: sk.Encode(), Value: []byte("seg"), ExpireMs: r.now + 1000, Gen: 3}})
+
+	r.now += 2000
+	cands, err := r.s.ReapScan(time.Second, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]sqlo1.ReapCandidate{}
+	for _, c := range cands {
+		got[string(c.Key)] = c
+	}
+	if len(got) != 3 {
+		t.Fatalf("reap pass found %d candidates %v, want 3", len(got), got)
+	}
+	for _, k := range []string{"dead1", "dead2"} {
+		c, ok := got[k]
+		if !ok || c.Root || c.Value != nil {
+			t.Fatalf("candidate %s = %+v, want a plain no-payload entry", k, c)
+		}
+	}
+	c, ok := got["deadroot"]
+	if !ok || !c.Root || !bytes.Equal(c.Value, rootVal) {
+		t.Fatalf("root candidate %+v, want Root with the payload copied", c)
+	}
+
+	sm := r.s.expSample
+	if sm[ExpClassNear].Expired != 4 {
+		t.Fatalf("refreshed sample counts %d expired near entries, want 4", sm[ExpClassNear].Expired)
+	}
+	if sm[ExpClassNone].Probed != 0 {
+		t.Fatalf("reap pass probed %d no-expiry entries", sm[ExpClassNone].Probed)
+	}
+
+	// The candidate cap holds even when more keys are due.
+	r.s.expCursor = 0
+	capped, err := r.s.ReapScan(time.Second, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capped) != 2 {
+		t.Fatalf("capped pass returned %d candidates, want 2", len(capped))
+	}
+	r.verify(t)
+}
+
+// TestReapScanProgress pins the lap guarantee under the tightest box:
+// a zero time budget still visits one bucket per call, so bucket-count
+// calls cover every expired key exactly once around the ring and the
+// cursor wraps instead of running off the table.
+func TestReapScanProgress(t *testing.T) {
+	r := newStoreRig(t)
+	const n = 300
+	for i := range n {
+		r.apply(t, putOp(fmt.Sprintf("d%04d", i), []byte("v"), r.now+1000))
+	}
+	r.now += 2000
+	buckets := NumBuckets(r.s.level, r.s.split)
+	seen := map[string]bool{}
+	for range buckets {
+		cands, err := r.s.ReapScan(0, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range cands {
+			if seen[string(c.Key)] {
+				t.Fatalf("key %s reported twice inside one lap", c.Key)
+			}
+			seen[string(c.Key)] = true
+		}
+	}
+	if len(seen) != n {
+		t.Fatalf("one lap of zero-box passes saw %d of %d expired keys", len(seen), n)
+	}
+	if r.s.expCursor >= NumBuckets(r.s.level, r.s.split) {
+		t.Fatalf("cursor %d past bucket count", r.s.expCursor)
+	}
 }
 
 // TestNearCreditScope pins what the credit does not cover: mid and

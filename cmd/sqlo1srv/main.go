@@ -30,6 +30,7 @@ func main() {
 	path := flag.String("path", "", "data file for -store file; the WAL sidecar sits next to it")
 	maxBytes := flag.Int64("max-bytes", 0, "data file budget in bytes for -store file; 0 is unbounded and disables the free-extent pressure rung")
 	ioBackend := flag.String("io-backend", "auto", "cold-read IO backend for -store file: auto (ring where supported, iopool otherwise) or iopool; INFO reports which one is live")
+	reap := flag.Bool("reap", false, "arm the sampling reaper (-store file only); off by default until the gate verdict lands")
 	flag.Parse()
 
 	switch *ioBackend {
@@ -80,6 +81,9 @@ func main() {
 	srv, err := sqlo1.NewServer(st)
 	if err != nil {
 		log.Fatalf("sqlo1srv: %v", err)
+	}
+	if *reap {
+		srv.EnableReaper()
 	}
 
 	// Clean shutdown on SIGINT or SIGTERM: close the listener so Serve

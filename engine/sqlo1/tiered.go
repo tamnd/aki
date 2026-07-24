@@ -64,8 +64,13 @@ type TieredStats struct {
 	// seen. A steadily climbing count means the budget is too tight for
 	// the workload's value-size drift.
 	ChunkVacates int64
-	HotKeys      int
-	DirtyBytes   int
+	// Reaped counts keys the sampling reaper tombstoned; ReapSkips
+	// counts candidates it passed up, either because the hot tier held
+	// a newer copy or because there was no room for the tombstone.
+	Reaped     int64
+	ReapSkips  int64
+	HotKeys    int
+	DirtyBytes int
 }
 
 // Tiered is the shard runtime composite, doc 04 sections 4 through 8 wired
