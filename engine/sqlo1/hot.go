@@ -156,7 +156,10 @@ func (t *HotTable) popDirty() (uint32, bool) {
 			t.pushDirty(s)
 			continue
 		}
-		hd.queued = 0
+		// Only the queue-membership bits clear: the volatile deferral
+		// lap count survives the pop, so the drainer can cap laps
+		// across cycles. A fresh transition into dirty resets it.
+		hd.queued &^= queuedBit | queuedDefer
 		return s, true
 	}
 	return 0, false
