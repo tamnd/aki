@@ -2143,6 +2143,56 @@ func (s *Store) Scan(ctx context.Context, cur sqlo1.Cursor, fn func(sqlo1.Record
 	return nil, nil
 }
 
+// ScanKeys implements the sqlo1.KeyScanner capability: the same
+// forward bucket walk as Scan, paused only on bucket boundaries once
+// budget entries were examined, so a small SCAN COUNT always makes
+// progress instead of replaying one bucket's head forever. The cursor
+// is the next bucket number and the split-stability argument is
+// Scan's: linear hashing only ever moves keys to higher-numbered
+// buckets, so a key present for the whole walk is delivered even
+// across splits. Records go out unfiltered except for the meta row;
+// key-class filtering, the caller's clock, and hot-tier suppression
+// all belong to the tier above.
+func (s *Store) ScanKeys(ctx context.Context, cursor uint64, budget int, fn func(sqlo1.Record)) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broken != nil {
+		return 0, s.broken
+	}
+	now := s.nowMS()
+	visited := 0
+	for bkt := cursor; bkt < NumBuckets(s.level, s.split); bkt++ {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if visited >= budget {
+			return bkt, nil
+		}
+		chain, ok := s.dirty[bkt]
+		if !ok {
+			var err error
+			if chain, err = s.coldChain(bkt); err != nil {
+				return 0, err
+			}
+		}
+		for _, c := range chain {
+			for i := range c.Count() {
+				_, _, vptr := c.EntryAt(i)
+				rec, err := s.resolveAt(Pos(vptr))
+				if err != nil {
+					return 0, err
+				}
+				visited++
+				if rec.RType == RecMeta || (rec.HasExpiry() && int64(rec.ExpireMS) <= now) {
+					continue
+				}
+				fn(seamOut(rec))
+			}
+		}
+	}
+	return 0, nil
+}
+
 // SampleExpiry runs one bounded pass over the cold index, tallying
 // chunk entries by expiry class and probing the due-plausible classes
 // (near, mid) for exact expiry; none and far entries are counted from
