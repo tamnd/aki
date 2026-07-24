@@ -73,6 +73,10 @@ func (f *fakeLog) HashDel(key []byte, fields [][]byte, dropped bool) (uint16, ui
 	return f.emit(key)
 }
 
+func (f *fakeLog) Expire(key []byte, atMs int64) (uint16, uint64, error) {
+	return f.emit(key)
+}
+
 func (f *fakeLog) HashExpire(key []byte, atMs int64, fields [][]byte) (uint16, uint64, error) {
 	return f.emit(key)
 }

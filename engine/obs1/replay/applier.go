@@ -265,17 +265,31 @@ func (a *Applier) applyOne(group uint16, key []byte, op obs1.Op) error {
 		if err != nil {
 			return err
 		}
-		// Read-modify-write through the normal set path: a record without
-		// a TTL slot cannot take a deadline in place, and SetString's
-		// band selection rebuilds the record with one when needed. An
-		// expire frame is post-decision, so its key existed when the
-		// owner framed it; a miss here is divergence.
-		v, ok := cx.St.GetString(key, 0, nil)
-		if !ok {
-			return fmt.Errorf("obs1 replay: expire names absent key %q, the store and the frame stream diverged", key)
+		// A string takes the deadline through the normal set path: a
+		// record without a TTL slot cannot take one in place, and
+		// SetString's band selection rebuilds the record with one when
+		// needed. Otherwise the frame names a collection root, so the
+		// deadline lands on whichever type holds the key, plus the shard
+		// hint index the lazy-expiry guard consults. An expire frame is
+		// post-decision, so its key existed when the owner framed it; a
+		// full miss is divergence.
+		// Both halves take it, matching the serve-time command on a key
+		// the two keyspaces both hold.
+		hit := false
+		if v, ok := cx.St.GetString(key, 0, nil); ok {
+			if err := cx.St.SetString(key, v, 0, at, false); err != nil {
+				return fmt.Errorf("obs1 replay: expire %q: %w", key, err)
+			}
+			hit = true
 		}
-		if err := cx.St.SetString(key, v, 0, at, false); err != nil {
-			return fmt.Errorf("obs1 replay: expire %q: %w", key, err)
+		if set.SetDeadline(cx, key, at) || hash.SetDeadline(cx, key, at) ||
+			zset.SetDeadline(cx, key, at) || list.SetDeadline(cx, key, at) ||
+			stream.SetDeadline(cx, key, at) {
+			cx.SetRootDeadline(key, at)
+			hit = true
+		}
+		if !hit {
+			return fmt.Errorf("obs1 replay: expire names absent key %q, the store and the frame stream diverged", key)
 		}
 		a.stats.Expires++
 	case obs1.CollNew:

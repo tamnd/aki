@@ -245,6 +245,12 @@ func (l *WriteLog) KeyDel(key []byte) (uint16, uint64, error) {
 	return group, seq, nil
 }
 
+// Expire implements the shard seam: one expire frame carrying the
+// absolute deadline the key now rides, 0 for persist, any type.
+func (l *WriteLog) Expire(key []byte, atMs int64) (uint16, uint64, error) {
+	return l.emitOps(key, Expire{ExpiryMS: uint64(atMs)})
+}
+
 // SetKeyDelFeed registers fn to hear every successful keydel emission,
 // normally Folder.Delete. Fixed after construction and before any owner
 // serves writes, the SetGroup publication rule.

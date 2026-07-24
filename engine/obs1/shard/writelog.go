@@ -44,6 +44,13 @@ type WriteLog interface {
 	// KeyDel records a key removal of any type.
 	KeyDel(key []byte) (group uint16, seq uint64, err error)
 
+	// Expire records a key-level deadline change on a key of any type:
+	// atMs is the absolute unix-ms deadline the key now rides, 0 clears
+	// (PERSIST). Post-decision: the owner already applied the NX/XX/GT/LT
+	// gate and the fired-deadline delete emits a keydel instead, so this
+	// frames only a deadline that actually settled on a live key.
+	Expire(key []byte, atMs int64) (group uint16, seq uint64, err error)
+
 	// HashSet records applied hash-field writes as one colldelta hset of
 	// the written pairs, preceded by a collnew when the write created the
 	// hash. fieldsValues alternates field then value and carries
@@ -309,6 +316,20 @@ func (cx *Ctx) LogKeyDel(key []byte) error {
 		return nil
 	}
 	group, seq, err := cx.Log.KeyDel(key)
+	if err != nil {
+		return err
+	}
+	cx.noteMark(group, seq)
+	return nil
+}
+
+// LogExpire emits an expire effect frame when a log is wired, and is
+// free when none is. See WriteLog.Expire for the contract.
+func (cx *Ctx) LogExpire(key []byte, atMs int64) error {
+	if cx.Log == nil {
+		return nil
+	}
+	group, seq, err := cx.Log.Expire(key, atMs)
 	if err != nil {
 		return err
 	}
