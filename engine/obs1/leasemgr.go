@@ -6,10 +6,10 @@
 //
 // Safety never lives here. The fold fences epochs and every folder agrees
 // (doc 02 section 3.3); the manager only keeps the node's belief and the
-// serving gate in step with what the chain already decided. Acquisition
-// covers freeness case (a), a released or never-granted group; case (b),
-// takeover of a stale holder, needs the full-TTL observation discipline
-// and lands with the crash-takeover slice.
+// serving gate in step with what the chain already decided. Acquire
+// covers freeness case (a), a released or never-granted group; Takeover
+// is case (b), a stale holder, and its full-TTL observation discipline
+// lives in the TakeoverJudge the poll consults before calling it.
 package obs1
 
 import (
@@ -84,15 +84,43 @@ func (m *LeaseManager) Acquire(ctx context.Context, group uint16) (bool, error) 
 	if _, ok := m.held[group]; ok {
 		return true, nil
 	}
-	t := m.now()
 	if node, epoch, ok := m.fold.Holder(group); ok {
 		if node != m.self {
 			return false, nil
 		}
 		m.held[group] = epoch
-		m.gate.Regrant(group, t)
+		m.gate.Regrant(group, m.now())
 		return true, nil
 	}
+	return m.grantLocked(ctx, group)
+}
+
+// Takeover appends the freeness case (b) grant for a group whose holder
+// went stale, naming ourselves at the fold's next epoch. Unlike Acquire
+// it proceeds while the fold still shows a foreign holder: the caller
+// vouches for the discipline through TakeoverJudge.Eligible, and an
+// undisciplined call is still safe, just ruder than doc 02 section 3.4
+// promises, because the fold fences the old epoch either way. Two takers
+// race on the chain CAS; the loser's grant folds rejected and it answers
+// false with nothing held.
+func (m *LeaseManager) Takeover(ctx context.Context, group uint16) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.held[group]; ok {
+		return true, nil
+	}
+	if node, epoch, ok := m.fold.Holder(group); ok && node == m.self {
+		m.held[group] = epoch
+		m.gate.Regrant(group, m.now())
+		return true, nil
+	}
+	return m.grantLocked(ctx, group)
+}
+
+// grantLocked appends a grant at the fold's next epoch and lets the
+// fold's verdict after the append's catch-up decide whether we won.
+func (m *LeaseManager) grantLocked(ctx context.Context, group uint16) (bool, error) {
+	t := m.now()
 	epoch := m.fold.NextEpoch(group)
 	rec := GrantRecord{Group: group, Node: m.self, Epoch: epoch}
 	if _, err := m.ap.Append(ctx, []ChainRecord{rec}); err != nil {
