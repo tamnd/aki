@@ -107,6 +107,17 @@ func (r *Runtime) SetFoldTap(fn func(frames []byte)) {
 	}
 }
 
+// SetFoldTapCtx is SetFoldTap handing fn the draining shard's owner Ctx
+// alongside the buffer, so the tap can read owner-local state for the
+// keys it carries: the fold's TTL projection resolves collection root
+// deadlines through it. The Ctx is only valid for the duration of the
+// call, on the owner goroutine making it.
+func (r *Runtime) SetFoldTapCtx(fn func(cx *Ctx, frames []byte)) {
+	for _, w := range r.workers {
+		w.st.SetFoldTap(func(frames []byte) { fn(&w.cx, frames) })
+	}
+}
+
 // SetFoldProgress registers fn as the resident stall window's fold-cursor
 // signal (doc 04 section 6): a parked write's window resets while the value
 // advances, because a moving fold cursor means eviction is being handed the

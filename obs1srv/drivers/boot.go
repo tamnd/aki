@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/tamnd/aki/engine/obs1"
+	"github.com/tamnd/aki/engine/obs1/keyspace"
 	"github.com/tamnd/aki/engine/obs1/replay"
 	"github.com/tamnd/aki/engine/obs1/shard"
 )
@@ -236,7 +237,12 @@ func BootDurability(ctx context.Context, cfg BootConfig, rt *shard.Runtime) (*Bo
 
 	rt.SetWriteLog(wl)
 	rt.SetWALInfo(wl.AppendInfo)
-	rt.SetFoldTap(folder.Add)
+	// The tap resolves collection root deadlines on the draining owner, so
+	// a root-TTL'd collection's chunks fold with expiry bounds and the
+	// segment can earn a TTL class (doc 03 section 5.1).
+	rt.SetFoldTapCtx(func(cx *shard.Ctx, frames []byte) {
+		folder.AddFrom(frames, func(key []byte) int64 { return keyspace.RootDeadline(cx, key) })
+	})
 	rt.SetFoldProgress(func() uint64 { return pub.Stats().Published })
 	rt.SetFoldKick(folder.Flush)
 	// The cold plan (shard coldget.go): consult the group's keymap

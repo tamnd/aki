@@ -68,6 +68,16 @@ func dropColl(cx *shard.Ctx, key []byte) bool {
 		stream.ReplayDrop(cx, key)
 }
 
+// RootDeadline answers key's authoritative collection root deadline in
+// unix-ms, 0 when no registry holds the key or its root carries none.
+// It reads the root's own field, never the hint index, so a stale hint
+// cannot leak a deadline; the fold's TTL projection rides it on the
+// owner goroutine at drain time.
+func RootDeadline(cx *shard.Ctx, key []byte) int64 {
+	at, _ := collDeadline(cx, key)
+	return at
+}
+
 // Reap is the lazy-expiry guard: dispatch runs it on a keyed command's
 // routing key before the handler. The hint map answers the common case
 // (no deadline, or one still ahead) in one lookup; a fired hint is

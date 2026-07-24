@@ -314,7 +314,16 @@ func (f *Folder) cadence(age time.Duration) {
 // frames are skipped and counted; their bytes live in the local value log
 // and fold by their own route in a later slice (#1111). The buffer is the
 // store's and recycles after the drain, so everything kept is copied here.
-func (f *Folder) Add(frames []byte) {
+func (f *Folder) Add(frames []byte) { f.AddFrom(frames, nil) }
+
+// AddFrom is Add with a root-deadline resolver: rootExp answers a
+// collection key's root deadline in unix-ms, 0 for none, read on the
+// owner goroutine feeding the tap so it can consult owner-local state.
+// A root deadline kills the whole collection at once, so a chunk under
+// one carries it into the expiry bounds even when no entry-level TTL
+// bitmap rode along; without the resolver a root-TTL'd collection folds
+// as deathless and its segments never earn a TTL class.
+func (f *Folder) AddFrom(frames []byte, rootExp func(key []byte) int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	touched := make(map[uint16]*foldGroup)
@@ -355,6 +364,23 @@ func (f *Folder) Add(frames []byte) {
 					}
 					return true
 				})
+			}
+			if rootExp != nil && fr.Count > 0 {
+				if at := rootExp(fr.Key); at > 0 {
+					// The root deadline kills the whole collection, so every
+					// entry bears one: an entry the bitmap left deathless dies
+					// exactly at the root, and an entry deadline never outlives
+					// it, so the max only stays where the bitmap put it when
+					// every entry already dies before the root.
+					rootMS := uint64(at)
+					if c.Bearers != c.Count || c.MaxExpMS > rootMS {
+						c.MaxExpMS = rootMS
+					}
+					if c.Bearers == 0 || rootMS < c.MinExpMS {
+						c.MinExpMS = rootMS
+					}
+					c.Bearers = c.Count
+				}
 			}
 			if i, ok := g.chIdx[id]; ok {
 				g.bytes += len(data) - len(g.chunks[i].Data)
@@ -689,6 +715,12 @@ func (f *Folder) buildSegment(job *segJob) (*Segment, error) {
 	allBearers := true
 	for i := range chunks {
 		c := &chunks[i]
+		if c.Count == 0 {
+			// A zero-count trim marker holds nothing to expire: it neither
+			// blocks the class nor contributes bounds, else its zero MinExpMS
+			// would hollow out the segment's floor.
+			continue
+		}
 		if c.Bearers != c.Count {
 			allBearers = false
 			continue
