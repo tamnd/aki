@@ -64,6 +64,12 @@ func NewChainAppender(s Store, prefix string, dd uint8, writer uint64, incarnati
 	}, nil
 }
 
+// Incarnation reports what this appender stamps on every batch, the
+// half the doc 02 section 4.5 fence compares against the member table.
+func (a *ChainAppender) Incarnation() uint32 {
+	return a.incarnation
+}
+
 // Tail is the last position applied.
 func (a *ChainAppender) Tail() ChainPos {
 	a.mu.Lock()
