@@ -37,6 +37,14 @@ type Server struct {
 	// until the gate box confirms the lab verdict.
 	reapOn bool
 
+	// hardEvict arms destructive eviction, doc 11 section 5: when the
+	// store's free-extent gauge reads positive, the maintenance tick
+	// deletes policy-ranked victims through the command path until the
+	// pressure relaxes. Off by default; without it no policy destroys
+	// data (E-I6). hardEvicted counts the victims for INFO.
+	hardEvict   bool
+	hardEvicted int64
+
 	// now is the clock, swappable by tests that exercise expiry.
 	now func() int64 // wall milliseconds
 
@@ -142,6 +150,44 @@ func NewServer(st Store) (*Server, error) {
 // effect on a store without the ExpiryReaper capability.
 func (s *Server) EnableReaper() { s.reapOn = true }
 
+// SetPolicy swaps the maxmemory-policy tiering flavor; safe against a
+// live server because it takes the dispatch lock.
+func (s *Server) SetPolicy(p EvictPolicy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.t.SetPolicy(p)
+}
+
+// EnableHardEvict arms destructive eviction before Serve. The disk cap
+// itself is the store's byte budget (SetMaxBytes); this only flips the
+// response to its pressure from write shedding to policy deletes.
+func (s *Server) EnableHardEvict() { s.hardEvict = true }
+
+// hardEvictBatch bounds one maintenance tick's destructive deletes, so
+// an armed server never disappears into a delete storm between
+// commands; the next tick continues while the gauge stays positive.
+const hardEvictBatch = 64
+
+// hardEvictStep deletes up to hardEvictBatch policy-ranked victims
+// when the free-extent gauge reads positive. Deletes go through the
+// command-path Del so collection roots retire their planes; freed
+// extents come back through compaction, which the same positive gauge
+// already promotes to foreground.
+func (s *Server) hardEvictStep(ctx context.Context) {
+	if !s.hardEvict || s.t.DiskPressure().Extent <= 0 {
+		return
+	}
+	for _, k := range s.t.HardEvictVictims(hardEvictBatch) {
+		dead, err := s.s.Del(ctx, k)
+		if err != nil {
+			return // the same store error surfaces on the next command
+		}
+		if dead {
+			s.hardEvicted++
+		}
+	}
+}
+
 // Serve accepts connections until the listener closes. A once-a-second
 // tick runs the runtime's timer maintenance (drain quanta, checkpoint,
 // compaction steps) between commands; a tick error is not fatal here
@@ -159,6 +205,7 @@ func (s *Server) Serve(l net.Listener) error {
 			case <-tk.C:
 				s.mu.Lock()
 				s.t.Tick(context.Background())
+				s.hardEvictStep(context.Background())
 				s.mu.Unlock()
 			}
 		}
@@ -280,6 +327,46 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return arityErr(reply, cmd)
 		}
 		return AppendBulk(reply, args[1])
+	case "CONFIG":
+		// The doc 11 section 5 promise is that client configs keep
+		// working, so the policy knob answers here; everything else is
+		// out of scope until a compat row demands it. maxmemory reads
+		// as 0 because writes never fail on memory, only on disk-full
+		// backpressure.
+		if len(args) < 3 {
+			return arityErr(reply, cmd)
+		}
+		switch strings.ToUpper(string(args[1])) {
+		case "GET":
+			if len(args) != 3 {
+				return arityErr(reply, cmd)
+			}
+			switch string(args[2]) {
+			case "maxmemory-policy":
+				reply = AppendArray(reply, 2)
+				reply = AppendBulk(reply, args[2])
+				return AppendBulk(reply, []byte(s.t.Policy().String()))
+			case "maxmemory":
+				reply = AppendArray(reply, 2)
+				reply = AppendBulk(reply, args[2])
+				return AppendBulk(reply, []byte("0"))
+			}
+			return AppendArray(reply, 0)
+		case "SET":
+			if len(args) != 4 {
+				return arityErr(reply, cmd)
+			}
+			if string(args[2]) != "maxmemory-policy" {
+				return AppendError(reply, fmt.Sprintf("ERR Unknown option or number of arguments for CONFIG SET - '%s'", args[2]))
+			}
+			p, ok := ParseEvictPolicy(string(args[3]))
+			if !ok {
+				return AppendError(reply, "ERR CONFIG SET failed - argument must be a valid maxmemory-policy")
+			}
+			s.t.SetPolicy(p)
+			return AppendSimple(reply, "OK")
+		}
+		return AppendError(reply, "ERR unknown subcommand or wrong number of arguments for 'CONFIG'")
 	case "INFO":
 		// One section for now, whatever section the client asked for.
 		// The io_backend line is the doc 13 provenance requirement: a
@@ -291,8 +378,8 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		if backend == "" {
 			backend = "none"
 		}
-		info := fmt.Sprintf("# sqlo1\r\nio_backend:%s\r\nkeys:%d\r\ndisk_bytes:%d\r\nhigh_water:%d\r\nhot_keys:%d\r\ndirty_bytes:%d\r\n",
-			backend, ss.Keys, ss.DiskBytes, ss.HighWater, ts.HotKeys, ts.DirtyBytes)
+		info := fmt.Sprintf("# sqlo1\r\nio_backend:%s\r\nkeys:%d\r\ndisk_bytes:%d\r\nhigh_water:%d\r\nhot_keys:%d\r\ndirty_bytes:%d\r\nmaxmemory_policy:%s\r\nhard_evicted:%d\r\n",
+			backend, ss.Keys, ss.DiskBytes, ss.HighWater, ts.HotKeys, ts.DirtyBytes, s.t.Policy(), s.hardEvicted)
 		return AppendBulk(reply, []byte(info))
 	case "SET":
 		return s.setCmd(ctx, reply, args, now)

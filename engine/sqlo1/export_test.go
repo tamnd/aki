@@ -50,6 +50,23 @@ func (t *Tiered) EvictAllForTest() {
 	}
 }
 
+// HardEvictStepForTest runs one hard-evict maintenance step under the
+// dispatch lock, so the sqlo1b integration test does not have to wait
+// on the server's ticker.
+func (s *Server) HardEvictStepForTest(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hardEvictStep(ctx)
+}
+
+// HardEvictedForTest reports the destructive-eviction victim count the
+// INFO line is fed from.
+func (s *Server) HardEvictedForTest() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hardEvicted
+}
+
 // MemScoreForTest and RunWalkForTest hand the zset's two families to
 // the Z-I4 torn-tail matrix, which lives in the external test package
 // and cross-checks them against each other at every cut.
