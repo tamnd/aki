@@ -378,8 +378,12 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		if backend == "" {
 			backend = "none"
 		}
-		info := fmt.Sprintf("# sqlo1\r\nio_backend:%s\r\nkeys:%d\r\ndisk_bytes:%d\r\nhigh_water:%d\r\nhot_keys:%d\r\ndirty_bytes:%d\r\nmaxmemory_policy:%s\r\nhard_evicted:%d\r\n",
-			backend, ss.Keys, ss.DiskBytes, ss.HighWater, ts.HotKeys, ts.DirtyBytes, s.t.Policy(), s.hardEvicted)
+		// expired_keys sums the three death paths a TTL key can take:
+		// reaper tombstones, reap-cancels caught in the drain queue,
+		// and compaction drops the store books itself (doc 11 sec 4).
+		expired := ts.Reaped + ts.ReapCancels + ss.ExpiredKeyDrops
+		info := fmt.Sprintf("# sqlo1\r\nio_backend:%s\r\nkeys:%d\r\ndisk_bytes:%d\r\nhigh_water:%d\r\nhot_keys:%d\r\ndirty_bytes:%d\r\nmaxmemory_policy:%s\r\nhard_evicted:%d\r\nexpired_keys:%d\r\nevicted_keys:%d\r\n",
+			backend, ss.Keys, ss.DiskBytes, ss.HighWater, ts.HotKeys, ts.DirtyBytes, s.t.Policy(), s.hardEvicted, expired, s.hardEvicted)
 		return AppendBulk(reply, []byte(info))
 	case "SET":
 		return s.setCmd(ctx, reply, args, now)
@@ -1430,36 +1434,9 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			}
 		}
 		return AppendInt(reply, n)
-	case "EXPIRE":
-		if len(args) != 3 {
-			return arityErr(reply, cmd)
-		}
-		sec, err := strconv.ParseInt(string(args[2]), 10, 64)
-		if err != nil {
-			return AppendError(reply, "ERR value is not an integer or out of range")
-		}
-		exists, _, err := s.s.Entry(ctx, args[1])
-		if err != nil {
-			return storeErr(reply, err)
-		}
-		if !exists {
-			return AppendInt(reply, 0)
-		}
-		if sec <= 0 {
-			if _, err := s.s.Del(ctx, args[1]); err != nil {
-				return storeErr(reply, err)
-			}
-			return AppendInt(reply, 1)
-		}
-		at, ok := expireFrom(now, sec, 1000)
-		if !ok {
-			return invalidExpire(reply, cmd)
-		}
-		if _, err := s.s.ExpireAt(ctx, args[1], at); err != nil {
-			return storeErr(reply, err)
-		}
-		return AppendInt(reply, 1)
-	case "TTL":
+	case "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT":
+		return s.expireCmd(ctx, reply, args, cmd, now)
+	case "TTL", "PTTL":
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
 		}
@@ -1472,12 +1449,129 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return AppendInt(reply, -2)
 		case expMs == 0:
 			return AppendInt(reply, -1)
+		case cmd == "PTTL":
+			return AppendInt(reply, expMs-now)
 		default:
 			// Round up, so a key with 1ms left still reports 1.
 			return AppendInt(reply, (expMs-now+999)/1000)
 		}
+	case "EXPIRETIME", "PEXPIRETIME":
+		if len(args) != 2 {
+			return arityErr(reply, cmd)
+		}
+		exists, expMs, err := s.s.Entry(ctx, args[1])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		switch {
+		case !exists:
+			return AppendInt(reply, -2)
+		case expMs == 0:
+			return AppendInt(reply, -1)
+		case cmd == "PEXPIRETIME":
+			return AppendInt(reply, expMs)
+		default:
+			return AppendInt(reply, expMs/1000)
+		}
+	case "PERSIST":
+		if len(args) != 2 {
+			return arityErr(reply, cmd)
+		}
+		exists, expMs, err := s.s.Entry(ctx, args[1])
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if !exists || expMs == 0 {
+			return AppendInt(reply, 0)
+		}
+		if _, err := s.s.ExpireAt(ctx, args[1], 0); err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, 1)
+	case "DBSIZE":
+		if len(args) != 1 {
+			return arityErr(reply, cmd)
+		}
+		return AppendInt(reply, s.t.KeyCount())
 	}
 	return AppendError(reply, fmt.Sprintf("ERR unknown command '%s'", args[0]))
+}
+
+// expireCmd is the shared EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT body:
+// parse the deadline in the command's unit and base, gate it through
+// the NX/XX/GT/LT options against the key's current expiry, and then
+// either delete (a past deadline) or set the wall-time expiry. The
+// no-TTL state reads as infinite for GT and LT, Redis's expireGeneric
+// rule, so GT never fires on a persistent key and LT always does.
+func (s *Server) expireCmd(ctx context.Context, reply []byte, args [][]byte, cmd string, now int64) []byte {
+	if len(args) < 3 {
+		return arityErr(reply, cmd)
+	}
+	n, err := strconv.ParseInt(string(args[2]), 10, 64)
+	if err != nil {
+		return AppendError(reply, "ERR value is not an integer or out of range")
+	}
+	var nx, xx, gt, lt bool
+	for _, a := range args[3:] {
+		switch strings.ToUpper(string(a)) {
+		case "NX":
+			nx = true
+		case "XX":
+			xx = true
+		case "GT":
+			gt = true
+		case "LT":
+			lt = true
+		default:
+			return AppendError(reply, fmt.Sprintf("ERR Unsupported option %s", a))
+		}
+	}
+	if gt && lt {
+		return AppendError(reply, "ERR GT and LT options at the same time are not compatible")
+	}
+	if nx && (xx || gt || lt) {
+		return AppendError(reply, "ERR NX and XX, GT or LT options at the same time are not compatible")
+	}
+	base, unit := now, int64(1000)
+	switch cmd {
+	case "PEXPIRE":
+		unit = 1
+	case "EXPIREAT":
+		base = 0
+	case "PEXPIREAT":
+		base, unit = 0, 1
+	}
+	at, ok := expireFrom(base, n, unit)
+	if !ok {
+		return invalidExpire(reply, cmd)
+	}
+	exists, cur, err := s.s.Entry(ctx, args[1])
+	if err != nil {
+		return storeErr(reply, err)
+	}
+	if !exists {
+		return AppendInt(reply, 0)
+	}
+	switch {
+	case nx && cur != 0:
+		return AppendInt(reply, 0)
+	case xx && cur == 0:
+		return AppendInt(reply, 0)
+	case gt && (cur == 0 || at <= cur):
+		return AppendInt(reply, 0)
+	case lt && cur != 0 && at >= cur:
+		return AppendInt(reply, 0)
+	}
+	if at <= now {
+		if _, err := s.s.Del(ctx, args[1]); err != nil {
+			return storeErr(reply, err)
+		}
+		return AppendInt(reply, 1)
+	}
+	if _, err := s.s.ExpireAt(ctx, args[1], at); err != nil {
+		return storeErr(reply, err)
+	}
+	return AppendInt(reply, 1)
 }
 
 // appendScore formats a zset score the way Redis replies one,

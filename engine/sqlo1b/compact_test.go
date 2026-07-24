@@ -182,6 +182,11 @@ func TestCompactDropsDeadSegmentsAndExpired(t *testing.T) {
 	if cs.Superseded != 0 {
 		t.Fatalf("compact stats %+v counted superseded records with no overwrites", cs)
 	}
+	// The expired records were plain keys, so every drop books into the
+	// store's expired-key counter; the dead segments book none.
+	if got := r.s.Stats().ExpiredKeyDrops; got != int64(want["exp"]) {
+		t.Fatalf("ExpiredKeyDrops = %d, want %d", got, want["exp"])
+	}
 
 	// Dropped entries leave the shadow so verify's Keys equation and
 	// the guaranteed-miss check see the same store the index does.

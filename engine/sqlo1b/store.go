@@ -106,6 +106,18 @@ type Store struct {
 	garbage uint64
 	hw      int64
 
+	// keyEntries counts the index entries that name addressable keys
+	// (RecString and RecRoot): the DBSIZE feed, doc 11 section 4.
+	// Plane records, meta records, and generation records live in the
+	// same index but are not keys, which is why entries alone cannot
+	// answer DBSIZE. Expired-but-unreaped keys stay counted until
+	// their tombstone lands, matching Redis's reap-time decrement.
+	keyEntries uint64
+	// expiredKeyDrops counts key-class records compaction dropped for
+	// being expired: deaths the reaper never saw, the store's share of
+	// the INFO expired counter. Runtime telemetry, not persisted.
+	expiredKeyDrops uint64
+
 	// garbageExt is the per-extent side of the garbage counter, the
 	// compaction debt feed (doc 03 section 9). It is advisory runtime
 	// state: reopen starts it empty and supersessions rebuild it, so
@@ -434,6 +446,7 @@ func restoreStore(f StoreFile, rec *Recovery) (*Store, error) {
 		level:      level,
 		split:      split,
 		entries:    sb.RecordCount,
+		keyEntries: sb.KeyRecordCount,
 		garbage:    sb.GarbageBytes,
 		hw:         sb.HighWater,
 		dirty:      map[uint64][]*Chunk{},
@@ -1466,6 +1479,9 @@ func (s *Store) insertNew(bucket uint64, chain []*Chunk, fp uint16, rec *Record,
 		return err
 	}
 	s.entries++
+	if keyRType(rec.RType) {
+		s.keyEntries++
+	}
 	for ShouldSplit(s.entries, NumBuckets(s.level, s.split)) {
 		if err := s.splitOne(); err != nil {
 			return err
@@ -1591,6 +1607,9 @@ func (s *Store) applyDel(key []byte) error {
 		return err
 	}
 	s.entries--
+	if keyRType(old.RType) {
+		s.keyEntries--
+	}
 	s.noteGarbage(oldPos, old)
 	return nil
 }
@@ -2269,7 +2288,9 @@ func (s *Store) Stats() sqlo1.StoreStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := sqlo1.StoreStats{
-		Keys:      int64(s.entries),
+		Keys:            int64(s.entries),
+		KeyEntries:      int64(s.keyEntries),
+		ExpiredKeyDrops: int64(s.expiredKeyDrops),
 		DiskBytes: int64(s.sb.ExtentCount) * int64(s.sb.ExtentSize),
 		HighWater: s.hw,
 		IOBackend: s.ioBackend,
@@ -2480,11 +2501,12 @@ func (s *Store) Snapshot(t uint64) (Roots, error) {
 		return Roots{}, err
 	}
 	return Roots{
-		Dir:          s.pendingDir,
-		Allocmap:     MakeFullPtr(rp, rootImg),
-		RecordCount:  s.entries,
-		GarbageBytes: s.garbage,
-		HighWater:    s.hw,
+		Dir:            s.pendingDir,
+		Allocmap:       MakeFullPtr(rp, rootImg),
+		RecordCount:    s.entries,
+		KeyRecordCount: s.keyEntries,
+		GarbageBytes:   s.garbage,
+		HighWater:      s.hw,
 	}, nil
 }
 

@@ -27,6 +27,14 @@ const (
 	RecMeta   uint8 = 6 // reserved for format-internal records
 )
 
+// keyRType reports whether a record type names an addressable key
+// (a plain value or a collection root). Segments, fences, tombstones,
+// and meta records share the index but are not keys, and the DBSIZE
+// counter must not see them.
+func keyRType(rtype uint8) bool {
+	return rtype == RecString || rtype == RecRoot
+}
+
 // rflags bits (doc 03 section 6.1). Reserved bits must be zero.
 const (
 	RFlagExpiry  uint8 = 1 << 0 // expire_ms field present

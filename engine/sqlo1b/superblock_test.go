@@ -28,9 +28,10 @@ func fixture(seq uint64) *Superblock {
 		AllocmapRoot: FullPtr{Pos: 0x3333, Sum: 0x4444},
 		DictRoot:     FullPtr{Pos: 0x5555, Sum: 0x6666},
 		StatsRoot:    FullPtr{Pos: 0x7777, Sum: 0x8888},
-		RecordCount:  123456,
-		GarbageBytes: 654321,
-		HighWater:    987654,
+		RecordCount:    123456,
+		GarbageBytes:   654321,
+		HighWater:      987654,
+		KeyRecordCount: 424242,
 	}
 	for i := range sb.DBID {
 		sb.DBID[i] = byte(i + 1)
@@ -74,7 +75,10 @@ func TestEncodeOffsets(t *testing.T) {
 	if got := int64(binary.LittleEndian.Uint64(b[160:])); got != 987654 {
 		t.Fatalf("high_water at 160 = %d", got)
 	}
-	for i := 168; i < 4080; i++ {
+	if got := binary.LittleEndian.Uint64(b[168:]); got != 424242 {
+		t.Fatalf("key_record_count at 168 = %d", got)
+	}
+	for i := 176; i < 4080; i++ {
 		if b[i] != 0 {
 			t.Fatalf("reserved byte %d not zero", i)
 		}
@@ -111,7 +115,8 @@ var superFields = []struct {
 	{"record_count", 144, 8},
 	{"garbage_bytes", 152, 8},
 	{"high_water", 160, 8},
-	{"reserved", 168, 3912},
+	{"key_record_count", 168, 8},
+	{"reserved", 176, 3904},
 	{"commit_seq_echo", 4080, 8},
 	{"checksum", 4088, 8},
 }

@@ -68,6 +68,11 @@ type Superblock struct {
 	RecordCount  uint64
 	GarbageBytes uint64
 	HighWater    int64
+	// KeyRecordCount is RecordCount restricted to addressable keys
+	// (RecString and RecRoot), the DBSIZE feed. Advisory like
+	// RecordCount; a pre-field file decodes it as zero and rebuilds
+	// through WAL replay and normal writes.
+	KeyRecordCount uint64
 }
 
 // NewSuperblock returns the creation-time root: seq 1, v0 geometry,
@@ -129,6 +134,7 @@ func (sb *Superblock) Encode() []byte {
 	binary.LittleEndian.PutUint64(b[144:], sb.RecordCount)
 	binary.LittleEndian.PutUint64(b[152:], sb.GarbageBytes)
 	binary.LittleEndian.PutUint64(b[160:], uint64(sb.HighWater))
+	binary.LittleEndian.PutUint64(b[168:], sb.KeyRecordCount)
 	binary.LittleEndian.PutUint64(b[4080:], sb.Seq)
 	binary.LittleEndian.PutUint64(b[4088:], xxhash.Sum64(b[:4088]))
 	return b
@@ -168,6 +174,7 @@ func DecodeSuperblock(b []byte) (*Superblock, error) {
 		GarbageBytes: binary.LittleEndian.Uint64(b[152:]),
 		HighWater:    int64(binary.LittleEndian.Uint64(b[160:])),
 	}
+	sb.KeyRecordCount = binary.LittleEndian.Uint64(b[168:])
 	if sb.Version != FormatVersion {
 		return nil, fmt.Errorf("sqlo1b: format version %d, this build reads %d", sb.Version, FormatVersion)
 	}
