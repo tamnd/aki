@@ -93,6 +93,12 @@ type stream struct {
 	// runs a cold tier; a store with no cold region never accounts and leaves it zero.
 	acct uint64
 
+	// expireAt is the key-level TTL (spec 2064/obs1 doc 08 section 8): the
+	// root's absolute unix-ms deadline, 0 for none. It lives on the root so
+	// it dies with the root; the shard rootExp map is only a hint index over
+	// it. Owner goroutine only, via rootttl.go.
+	expireAt int64
+
 	// cold is the stream's cold-tier state (cold.go, M7), nil until a demote pass first
 	// sheds a front block. Once built it holds the store handle, the demote-sequence
 	// directory, and the shared pread scratch; a demote flips front blocks to the cold

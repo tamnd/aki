@@ -95,6 +95,14 @@ type Ctx struct {
 	// goroutine only.
 	resume int
 
+	// rootExp is the collection root-deadline hint index (rootttl.go): a
+	// fast map the keyspace expiry guard consults before the authoritative
+	// deadline on each type's root struct. Entries can outlive their roots;
+	// the guard validates and clears stale ones. Lazily built on the first
+	// SetRootDeadline, so a keyspace with no collection TTLs pays one nil
+	// check. Owner goroutine only.
+	rootExp map[string]int64
+
 	// marks accumulates the WAL frames the running command emitted, only when
 	// its connection asked for strict acks (writelog.go noteMark): one entry
 	// per touched group carrying the group's highest seq. The worker reads it
