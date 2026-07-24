@@ -40,6 +40,17 @@ Bands: the e2e window (Handoff through TakeGroup return) hits the same bars, p50
 Op invariant, hard-asserted: exactly 3 GETs (observe pair plus one ranged WAL section) and 3 PUTs (WAL, handoff batch, grant) per rep on the clock, zero segment GETs, nothing size-dependent; folds agree on holder and epoch after every rep, epochs monotone, and every rep replays exactly its flushed frame count.
 Kill line: either bar missed or any op-invariant breach means the slice's sequence adds cost the primitives did not price, and the slice does not merge until the term that grew is named.
 
+## Crash-takeover e2e (PRED-OBS1-O3A-TAKEOVER, filed with the crash-takeover slice, before its scored run)
+
+The cold-takeover row above composed the bar from term medians; the slice landed the real case (b) machinery (TakeoverJudge discipline, LeaseManager.Takeover, cold TakeGroup with the fan-8 prewarm), so this phase scores the milestone prediction on the real sequence.
+Each rep the holder flushes a depth-4 WAL tail with real commits and goes silent; the taker runs the discipline on a policy clock (chain-observed staleness of TTL plus skew, then the full-TTL watch, 6600ms simulated the way production waits it out); then the mechanics run on the wall clock: the silence probe, the Takeover grant, and the cold TakeGroup rebuilding keymap and directory behind the fan of 8 over the full 256-segment set plus the ranged replay of the retained tail.
+The 5000ms bar (lease TTL 3000ms plus 2s) prices the mechanics, the primitive run's convention: the discipline is deliberate policy waiting, reported beside the window, not inside it.
+Bands: mechanics p50 under 5000ms and p99 under the same bar with room; the term arithmetic (probe 29, grant 48, fan-8 rebuild 1148, depth-4 replay 120) predicts a p50 near 1350ms.
+Op invariant, hard-asserted: on the clock exactly 1 silence-probe GET, 256 segment GETs, 4 ranged WAL section GETs, and 1 grant PUT per rep; off the clock exactly the depth's WAL PUTs and commit appends, the pre-crash follow, the checkpoint, and the wake follow; the retained window trims to zero every rep.
+Correctness bands: every rep the grant lands at epoch plus one with both folds agreeing after the wake, the woken holder demotes with nothing held, the rebuild stats equal the full segment set, and the replay walks exactly the depth's frames to the flush's last seq.
+Manifest disclosure: the manifest hands TakeGroup the fixed segment set with the fold cursor at the rep's floor; the frames below the floor live in the retained tail rather than the segments, which TakeGroup does not and should not verify, the same trust the boot path places in a published manifest.
+Kill line: mechanics p50 or p99 at or over 5000ms, any op-invariant breach, or any fold or stat divergence means the takeover sequence costs what the primitives did not price, and the slice does not merge until the grown term is named.
+
 ## Calibration disclosure
 
 A quick smoke (4 and 8 segments, 6 reps, 256 records per segment) ran during development before this file was committed and confirmed the mechanics: op invariant green, stats identical across arms, folds agreeing, windows in the hundreds of milliseconds with wide small-n medians.
@@ -95,6 +106,15 @@ The e2e window came out at p50 213.5ms and p99 703.3ms against the 300ms and 1.5
 The op invariant held as a hard assertion: exactly 3 GETs and 3 PUTs on the clock per rep, zero segment GETs, one checkpoint PUT plus the three catch-up GETs off the clock, and the checkpoint trimmed the retained window to zero every rep.
 Folds agreed on holder and epoch after all 40 reps with epochs monotone, and every rep replayed exactly its 128 flushed frames to the flush's last seq.
 PRED-OBS1-O3A-HANDOFF re-scored HIT on the real machinery; the kill line stays untouched.
+
+## Crash-takeover e2e result (scored with the crash-takeover slice)
+
+One scored full run after the slice landed (handoff.csv), 20 reps of the real sequence at 256 segments and depth 4, every assertion green.
+The mechanics came out at p50 1412.3ms and p99 2369.0ms against the 5000ms bar, right where the term arithmetic put it, with the fan-8 rebuild carrying almost the whole window and the p99 tail coming from straggler segment draws across the fan lanes.
+The bill held as a hard assertion: exactly 261 GETs (the silence probe, 256 segments, 4 ranged WAL sections) and 1 grant PUT on the clock per rep, the off-clock flush, follow, checkpoint, and wake ops exact, and the retained window trimmed to zero every rep.
+Every grant landed at epoch plus one with both folds agreeing after the wake, every woken holder demoted holding nothing, every rebuild matched the full segment set, and every replay walked its 512 frames to the flush's last seq.
+The policy wait beside the window is 6600ms simulated: chain-observed staleness at TTL plus skew, then the taker's full-TTL watch.
+PRED-OBS1-O3A-TAKEOVER scored HIT on the real machinery; the kill line stays untouched.
 
 ## Verdict
 

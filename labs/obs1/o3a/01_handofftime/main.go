@@ -520,7 +520,10 @@ func run(c cfg) error {
 			fmt.Printf("cold_takeover,n=%d,fan=%d,composed_p50_ms=%.0f\n", n, fan, ms(cold))
 		}
 	}
-	return runE2E(c)
+	if err := runE2E(c); err != nil {
+		return err
+	}
+	return runTakeoverE2E(c)
 }
 
 // e2eNode is one node's real coordination stack: fold, gate, tail
@@ -555,7 +558,7 @@ func newE2ENode(s obs1.Store, self uint64) (*e2eNode, error) {
 
 // e2eFlush is the rep's final flush: one real WAL object under the
 // holder's namespace, its commit record returned for the release batch.
-func e2eFlush(ctx context.Context, s obs1.Store, node, walSeq uint64, epoch uint32, firstSeq uint64) (obs1.CommitRecord, uint64, error) {
+func e2eFlush(ctx context.Context, s obs1.Store, prefix string, node, walSeq uint64, epoch uint32, firstSeq uint64) (obs1.CommitRecord, uint64, error) {
 	frames := make([]obs1.WALFrame, walFrames)
 	for i := range frames {
 		p := make([]byte, walPayload)
@@ -572,7 +575,7 @@ func e2eFlush(ctx context.Context, s obs1.Store, node, walSeq uint64, epoch uint
 	if err != nil {
 		return obs1.CommitRecord{}, 0, err
 	}
-	key := fmt.Sprintf("e2e/wal/%016x/%016d", node, walSeq)
+	key := fmt.Sprintf("%s/wal/%016x/%016d", prefix, node, walSeq)
 	if _, err := s.Put(ctx, key, body); err != nil {
 		return obs1.CommitRecord{}, 0, err
 	}
@@ -634,7 +637,7 @@ func runE2E(c cfg) error {
 		t := time.Now()
 		err := holder.mgr.Handoff(ctx, group, func(ctx context.Context) ([]obs1.ChainRecord, error) {
 			walSeqs[holderID]++
-			rec, last, err := e2eFlush(ctx, s, holderID, walSeqs[holderID], uint32(r+1), floor+1)
+			rec, last, err := e2eFlush(ctx, s, "e2e", holderID, walSeqs[holderID], uint32(r+1), floor+1)
 			if err != nil {
 				return nil, err
 			}
@@ -702,6 +705,240 @@ func runE2E(c cfg) error {
 	p50, p99 := quantiles(windows)
 	fmt.Printf("e2e_window,reps=%d,p50_ms=%.1f,p99_ms=%.1f,on_clock_gets=3,on_clock_puts=3,segment_gets=0\n",
 		len(windows), ms(p50), ms(p99))
+	return nil
+}
+
+// labClock is the policy clock the takeover phase advances by hand: the
+// discipline (chain-observed staleness plus the taker's full-TTL watch)
+// is wall-clock waiting in production and simulated here, while the
+// mechanics are timed on the real clock against the sim's latency draws.
+type labClock struct{ t time.Time }
+
+func (c *labClock) now() time.Time          { return c.t }
+func (c *labClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+func newLabClock(base time.Time) *labClock  { return &labClock{t: base} }
+
+// ctoNode is the crash-taker composition: liveness in the apply chain
+// and a takeover judge over it.
+type ctoNode struct {
+	fold  *obs1.LeaseFold
+	gate  *obs1.LeaseGate
+	win   *obs1.TailWindow
+	live  *obs1.Liveness
+	ap    *obs1.ChainAppender
+	mgr   *obs1.LeaseManager
+	judge *obs1.TakeoverJudge
+}
+
+func newCtoNode(s obs1.Store, self uint64, clk *labClock) (*ctoNode, error) {
+	fold := obs1.NewLeaseFold()
+	gate := obs1.NewLeaseGate(0, 0)
+	win, err := obs1.NewTailWindow(fold, fold)
+	if err != nil {
+		return nil, err
+	}
+	live, err := obs1.NewLiveness(win, obs1.DefaultLeaseTTL, obs1.DefaultSkewBound, clk.now)
+	if err != nil {
+		return nil, err
+	}
+	ap, err := obs1.NewChainAppender(s, "cto", 0, self, 1, obs1.ChainPos{}, live)
+	if err != nil {
+		return nil, err
+	}
+	mgr, err := obs1.NewLeaseManager(obs1.LeaseManagerConfig{
+		Self: self, Appender: ap, Fold: fold, Gate: gate, Now: clk.now,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &ctoNode{fold, gate, win, live, ap, mgr, obs1.NewTakeoverJudge(fold, live, 0)}, nil
+}
+
+// runTakeoverE2E scores PRED-OBS1-O3A-TAKEOVER on the real machinery:
+// each rep the holder flushes a depth-4 WAL tail with commits and goes
+// silent, the taker runs the case (b) discipline on the policy clock,
+// and the mechanics are timed on the wall clock: the silence probe, the
+// Takeover grant, and the cold TakeGroup, fan-8 prewarm over the full
+// segment set plus the ranged replay of the retained tail.
+func runTakeoverE2E(c cfg) error {
+	ctx := context.Background()
+	s := sim.New(sim.Config{Seed: 20260726, Latency: sim.S3Standard})
+	n := c.segSweep[len(c.segSweep)-1]
+	const depth = 4
+	reps := c.warmReps / 2
+
+	// Build phase, not scored: the crashed holder's published segments.
+	t0 := time.Now()
+	type putJob struct {
+		key  string
+		body []byte
+	}
+	jobs := make([]putJob, 0, n)
+	for seq := 1; seq <= n; seq++ {
+		body, err := buildSegment(uint64(seq), c.recsPerSeg)
+		if err != nil {
+			return fmt.Errorf("cto build segment %d: %w", seq, err)
+		}
+		jobs = append(jobs, putJob{segObjKey("cto", uint64(seq)), body})
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, 16)
+	jobCh := make(chan putJob)
+	for w := 0; w < 16; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for j := range jobCh {
+				if _, err := s.Put(ctx, j.key, j.body); err != nil {
+					errs[w] = err
+				}
+			}
+		}(w)
+	}
+	for _, j := range jobs {
+		jobCh <- j
+	}
+	close(jobCh)
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	fmt.Printf("cto_build,segments=%d,wall_s=%.1f\n", n, time.Since(t0).Seconds())
+
+	clk := newLabClock(time.Now())
+	a, err := newCtoNode(s, 1, clk)
+	if err != nil {
+		return err
+	}
+	b, err := newCtoNode(s, 2, clk)
+	if err != nil {
+		return err
+	}
+	if _, err := a.ap.Append(ctx, []obs1.ChainRecord{
+		obs1.MemberRecord{Op: obs1.MemberJoin, Member: obs1.Member{Node: 1, Incarnation: 1, Weight: 100}},
+		obs1.MemberRecord{Op: obs1.MemberJoin, Member: obs1.Member{Node: 2, Incarnation: 1, Weight: 100}},
+	}); err != nil {
+		return err
+	}
+	if won, err := a.mgr.Acquire(ctx, group); err != nil || !won {
+		return fmt.Errorf("cto seed acquire: %v %v", won, err)
+	}
+	if err := b.ap.Follow(ctx); err != nil {
+		return err
+	}
+
+	nodes := map[uint64]*ctoNode{1: a, 2: b}
+	windows := make([]time.Duration, 0, reps)
+	holderID, takerID := uint64(1), uint64(2)
+	walSeqs := map[uint64]uint64{1: 0, 2: 0}
+	lastSeq := uint64(0)
+	usageBefore := s.Usage()
+	for r := 0; r < reps; r++ {
+		holder, taker := nodes[holderID], nodes[takerID]
+		floor := lastSeq
+		epoch := uint32(r + 1)
+
+		// Off the clock: the holder's last flushes land, the taker's
+		// routine poll sees them, then the holder crashes.
+		for d := 0; d < depth; d++ {
+			walSeqs[holderID]++
+			rec, last, err := e2eFlush(ctx, s, "cto", holderID, walSeqs[holderID], epoch, lastSeq+1)
+			if err != nil {
+				return fmt.Errorf("cto rep %d flush %d: %w", r, d, err)
+			}
+			lastSeq = last
+			if _, err := holder.ap.Append(ctx, []obs1.ChainRecord{rec}); err != nil {
+				return fmt.Errorf("cto rep %d commit %d: %w", r, d, err)
+			}
+		}
+		if err := taker.ap.Follow(ctx); err != nil {
+			return fmt.Errorf("cto rep %d pre-crash follow: %w", r, err)
+		}
+
+		// Policy time: chain-observed staleness, then the full-TTL watch.
+		clk.advance(obs1.DefaultLeaseTTL + obs1.DefaultSkewBound + 100*time.Millisecond)
+		if taker.judge.Eligible(group, clk.now()) {
+			return fmt.Errorf("cto rep %d eligible at first staleness, the watch is broken", r)
+		}
+		clk.advance(obs1.DefaultLeaseTTL)
+		if !taker.judge.Eligible(group, clk.now()) {
+			return fmt.Errorf("cto rep %d not eligible after the full discipline", r)
+		}
+
+		// On the clock: silence probe, grant, cold rebuild plus replay.
+		km, dir := obs1.NewKeymap(), obs1.NewDirectory()
+		m := obs1.Manifest{Group: group, FoldSeq: floor}
+		for seq := 1; seq <= n; seq++ {
+			m.Segs = append(m.Segs, obs1.ManifestSeg{SegSeq: uint64(seq)})
+		}
+		t := time.Now()
+		if err := taker.ap.Follow(ctx); err != nil {
+			return fmt.Errorf("cto rep %d probe: %w", r, err)
+		}
+		won, err := taker.mgr.Takeover(ctx, group)
+		if err != nil || !won {
+			return fmt.Errorf("cto rep %d takeover: %v %v", r, won, err)
+		}
+		st, err := obs1.TakeGroup(ctx, obs1.TakeConfig{
+			Store: s, Prefix: "cto", Group: group, Window: taker.win,
+			Manifest: m, HasManifest: true, Dir: dir, Km: km,
+		})
+		if err != nil {
+			return fmt.Errorf("cto rep %d take: %w", r, err)
+		}
+		windows = append(windows, time.Since(t))
+
+		if st.FramesApplied != uint64(depth*walFrames) || st.Applied != lastSeq {
+			return fmt.Errorf("cto rep %d replayed %d frames to %d, want %d to %d", r, st.FramesApplied, st.Applied, depth*walFrames, lastSeq)
+		}
+		if st.Resident.Segments != n || st.Resident.Records != n*c.recsPerSeg || st.Resident.Tombstones != 0 {
+			return fmt.Errorf("cto rep %d rebuilt %+v, want %d segments %d records", r, st.Resident, n, n*c.recsPerSeg)
+		}
+		// Off the clock: checkpoint trims the window, the crashed node
+		// wakes, catches up, and demotes.
+		if _, err := taker.ap.Append(ctx, []obs1.ChainRecord{obs1.CheckpointRecord{Pos: taker.fold.Applied()}}); err != nil {
+			return fmt.Errorf("cto rep %d checkpoint: %w", r, err)
+		}
+		if got := taker.win.Retained(); got != 0 {
+			return fmt.Errorf("cto rep %d window retains %d after the checkpoint", r, got)
+		}
+		if err := holder.ap.Follow(ctx); err != nil {
+			return fmt.Errorf("cto rep %d wake: %w", r, err)
+		}
+		holder.mgr.Reconcile()
+		if held := holder.mgr.Held(); len(held) != 0 {
+			return fmt.Errorf("cto rep %d woken holder still holds %v", r, held)
+		}
+		wantEpoch := uint32(r + 2)
+		for id, nd := range nodes {
+			node, e, ok := nd.fold.Holder(group)
+			if !ok || node != takerID || e != wantEpoch {
+				return fmt.Errorf("cto rep %d node %d sees holder %d epoch %d ok %v, want %d at %d", r, id, node, e, ok, takerID, wantEpoch)
+			}
+		}
+		holderID, takerID = takerID, holderID
+	}
+	usageAfter := s.Usage()
+
+	// The bill per rep, hard-asserted: on the clock 1 silence probe, n
+	// segment GETs, depth ranged WAL section GETs, and the one grant PUT;
+	// off the clock the depth WAL PUTs and commit appends, the taker's
+	// pre-crash follow (depth batches plus the probe), the checkpoint
+	// PUT, and the wake follow (grant and checkpoint batches plus the
+	// probe). Nothing else, and nothing that scales past the segment set.
+	gets := usageAfter.GetRequests - usageBefore.GetRequests
+	puts := usageAfter.PutRequests - usageBefore.PutRequests
+	wantGets := int64(reps * (1 + n + depth + (depth + 1) + 3))
+	wantPuts := int64(reps * (1 + depth + depth + 1))
+	if gets != wantGets || puts != wantPuts {
+		return fmt.Errorf("cto billed %d GETs %d PUTs, want %d and %d: an unpriced op leaked into the sequence", gets, puts, wantGets, wantPuts)
+	}
+	p50, p99 := quantiles(windows)
+	policy := obs1.DefaultLeaseTTL*2 + obs1.DefaultSkewBound + 100*time.Millisecond
+	fmt.Printf("cto_window,n=%d,fan=%d,depth=%d,reps=%d,p50_ms=%.1f,p99_ms=%.1f,on_clock_gets=%d,on_clock_puts=1,policy_wait_ms=%.0f\n",
+		n, obs1.DefaultHandoffFan, depth, len(windows), ms(p50), ms(p99), 1+n+depth, ms(policy))
 	return nil
 }
 
