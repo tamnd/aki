@@ -33,6 +33,26 @@ fencetorture.csv, all arms:
 Zero violations everywhere, including the live MinIO arms where the CAS races are real HTTP.
 The torture has teeth in every row: at 8 nodes and 16 groups nearly three quarters of committed sections die at the fence, exactly what a fleet of nodes acting on stale beliefs should produce.
 
+## Fleet-scale re-run (O3a exit gate, filed before the run)
+
+The O3a exit gate re-runs this lab at fleet scale, 16 nodes and 32 groups, the K2 checkpoint's fleet size, with the lab code unchanged.
+Arms: sim at 0, 15, and 40 percent ambiguous PUTs, 20 schedules of 300 steps each, and a live MinIO arm with real HTTP CAS races.
+Expectation, filed before the run: zero violations on every arm and teeth in every row, the same pass condition the original arms held; the fence argument is scale-free by construction, since every folder consumes the same chain, so a violation at 16 nodes that 8 nodes never showed would mean a fold or appender bug the fleet slices introduced, and the gate row stays open until it is named and fixed.
+
+### Results
+
+fencetorture-fleet.csv, all arms:
+
+| store | schedules | steps | nodes | groups | faults | grants ok/rej | sections live/dead | crashes | violations |
+|-------|-----------|-------|-------|--------|--------|---------------|--------------------|---------|------------|
+| sim | 20 | 300 | 16 | 32 | 0% | 1093/414 | 30/370 | 40 | 0 |
+| sim | 20 | 300 | 16 | 32 | 15% | 1098/412 | 31/384 | 40 | 0 |
+| sim | 20 | 300 | 16 | 32 | 40% | 1107/424 | 24/368 | 40 | 0 |
+| minio | 3 | 200 | 16 | 32 | real races | 119/62 | 3/45 | 6 | 0 |
+
+Zero violations on every arm, and the teeth sharpen with scale exactly as the argument predicts: at 16 nodes and 32 groups over 92 percent of committed sections die at the fence, against roughly three quarters at 8 nodes, because more nodes acting on stale beliefs means more zombies for the fold to kill identically everywhere.
+The expectation held as filed and the lab code is unchanged from the O0b run.
+
 ## Verdict
 
 C-I2 and C-I3 hold under everything this lab can throw: independent folders agree bit for bit across three consumption paths, live folds built by mixed Append and Follow match cold replays, checkpoint primes land on the same tables, and every zombie commit dies identically everywhere.
