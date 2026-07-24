@@ -520,6 +520,188 @@ func run(c cfg) error {
 			fmt.Printf("cold_takeover,n=%d,fan=%d,composed_p50_ms=%.0f\n", n, fan, ms(cold))
 		}
 	}
+	return runE2E(c)
+}
+
+// e2eNode is one node's real coordination stack: fold, gate, tail
+// window, appender, manager.
+type e2eNode struct {
+	fold *obs1.LeaseFold
+	gate *obs1.LeaseGate
+	win  *obs1.TailWindow
+	ap   *obs1.ChainAppender
+	mgr  *obs1.LeaseManager
+}
+
+func newE2ENode(s obs1.Store, self uint64) (*e2eNode, error) {
+	fold := obs1.NewLeaseFold()
+	gate := obs1.NewLeaseGate(0, 0)
+	win, err := obs1.NewTailWindow(fold, fold)
+	if err != nil {
+		return nil, err
+	}
+	ap, err := obs1.NewChainAppender(s, "e2e", 0, self, 1, obs1.ChainPos{}, win)
+	if err != nil {
+		return nil, err
+	}
+	mgr, err := obs1.NewLeaseManager(obs1.LeaseManagerConfig{
+		Self: self, Appender: ap, Fold: fold, Gate: gate,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &e2eNode{fold, gate, win, ap, mgr}, nil
+}
+
+// e2eFlush is the rep's final flush: one real WAL object under the
+// holder's namespace, its commit record returned for the release batch.
+func e2eFlush(ctx context.Context, s obs1.Store, node, walSeq uint64, epoch uint32, firstSeq uint64) (obs1.CommitRecord, uint64, error) {
+	frames := make([]obs1.WALFrame, walFrames)
+	for i := range frames {
+		p := make([]byte, walPayload)
+		for j := range p {
+			p[j] = byte('a' + (int(walSeq)+i+j)%26)
+		}
+		frames[i] = obs1.WALFrame{
+			Kind: kindString, Slot: 100, Seq: firstSeq + uint64(i),
+			Key:     []byte(fmt.Sprintf("ek%06d-%04d", walSeq, i)),
+			Payload: p,
+		}
+	}
+	body, err := obs1.AppendWAL(nil, node, []obs1.WALSection{{Group: group, Epoch: epoch, Frames: frames}})
+	if err != nil {
+		return obs1.CommitRecord{}, 0, err
+	}
+	key := fmt.Sprintf("e2e/wal/%016x/%016d", node, walSeq)
+	if _, err := s.Put(ctx, key, body); err != nil {
+		return obs1.CommitRecord{}, 0, err
+	}
+	off, flen, err := obs1.ParseTail(body[len(body)-obs1.TailSize:])
+	if err != nil {
+		return obs1.CommitRecord{}, 0, err
+	}
+	entries, err := obs1.ParseWALFooter(body[off : off+uint64(flen)])
+	if err != nil {
+		return obs1.CommitRecord{}, 0, err
+	}
+	rec := obs1.CommitRecord{WALNode: node, WALSeq: walSeq, WALSize: uint64(len(body))}
+	for _, e := range entries {
+		rec.Sections = append(rec.Sections, e.CommitSection())
+	}
+	return rec, frames[len(frames)-1].Seq, nil
+}
+
+// runE2E re-scores PRED-OBS1-O3A-HANDOFF on the slice's real sequence:
+// Handoff (final flush's commit and the release in one batch) through
+// Follow, Reconcile, Acquire, and TakeGroup on the taker, warm taker,
+// depth 1 by construction with a checkpoint after each rep keeping the
+// retained window at exactly the rep's own flush.
+func runE2E(c cfg) error {
+	ctx := context.Background()
+	s := sim.New(sim.Config{Seed: 20260725, Latency: sim.S3Standard})
+
+	a, err := newE2ENode(s, 1)
+	if err != nil {
+		return err
+	}
+	b, err := newE2ENode(s, 2)
+	if err != nil {
+		return err
+	}
+	if _, err := a.ap.Append(ctx, []obs1.ChainRecord{
+		obs1.MemberRecord{Op: obs1.MemberJoin, Member: obs1.Member{Node: 1, Incarnation: 1, Weight: 100}},
+		obs1.MemberRecord{Op: obs1.MemberJoin, Member: obs1.Member{Node: 2, Incarnation: 1, Weight: 100}},
+	}); err != nil {
+		return err
+	}
+	if won, err := a.mgr.Acquire(ctx, group); err != nil || !won {
+		return fmt.Errorf("e2e seed acquire: %v %v", won, err)
+	}
+	if err := b.ap.Follow(ctx); err != nil {
+		return err
+	}
+	b.mgr.Reconcile()
+
+	nodes := map[uint64]*e2eNode{1: a, 2: b}
+	windows := make([]time.Duration, 0, c.warmReps)
+	holderID, takerID := uint64(1), uint64(2)
+	walSeqs := map[uint64]uint64{1: 0, 2: 0}
+	lastSeq := uint64(0)
+	usageBefore := s.Usage()
+	for r := 0; r < c.warmReps; r++ {
+		holder, taker := nodes[holderID], nodes[takerID]
+		floor := lastSeq
+		t := time.Now()
+		err := holder.mgr.Handoff(ctx, group, func(ctx context.Context) ([]obs1.ChainRecord, error) {
+			walSeqs[holderID]++
+			rec, last, err := e2eFlush(ctx, s, holderID, walSeqs[holderID], uint32(r+1), floor+1)
+			if err != nil {
+				return nil, err
+			}
+			lastSeq = last
+			return []obs1.ChainRecord{rec}, nil
+		})
+		if err != nil {
+			return fmt.Errorf("e2e rep %d handoff: %w", r, err)
+		}
+		if err := taker.ap.Follow(ctx); err != nil {
+			return fmt.Errorf("e2e rep %d observe: %w", r, err)
+		}
+		taker.mgr.Reconcile()
+		if won, err := taker.mgr.Acquire(ctx, group); err != nil || !won {
+			return fmt.Errorf("e2e rep %d take: %v %v", r, won, err)
+		}
+		st, err := obs1.TakeGroup(ctx, obs1.TakeConfig{
+			Store: s, Prefix: "e2e", Group: group, Window: taker.win,
+			Manifest: obs1.Manifest{Group: group, FoldSeq: floor}, HasManifest: true, Warm: true,
+		})
+		if err != nil {
+			return fmt.Errorf("e2e rep %d replay: %w", r, err)
+		}
+		windows = append(windows, time.Since(t))
+		if st.FramesApplied != walFrames || st.Applied != lastSeq {
+			return fmt.Errorf("e2e rep %d replayed %d frames to %d, want %d to %d", r, st.FramesApplied, st.Applied, walFrames, lastSeq)
+		}
+		wantEpoch := uint32(r + 2)
+		for id, n := range nodes {
+			if id == holderID {
+				continue
+			}
+			node, e, ok := n.fold.Holder(group)
+			if !ok || node != takerID || e != wantEpoch {
+				return fmt.Errorf("e2e rep %d node %d fold says holder %d epoch %d ok %v, want %d at %d", r, id, node, e, ok, takerID, wantEpoch)
+			}
+		}
+		// Off the clock: the new holder checkpoints, which trims its
+		// retained window to nothing, and the old holder catches up.
+		if _, err := taker.ap.Append(ctx, []obs1.ChainRecord{obs1.CheckpointRecord{Pos: taker.fold.Applied()}}); err != nil {
+			return fmt.Errorf("e2e rep %d checkpoint: %w", r, err)
+		}
+		if got := taker.win.Retained(); got != 0 {
+			return fmt.Errorf("e2e rep %d window retains %d sections after the checkpoint, want 0", r, got)
+		}
+		if err := holder.ap.Follow(ctx); err != nil {
+			return fmt.Errorf("e2e rep %d catch-up: %w", r, err)
+		}
+		holder.mgr.Reconcile()
+		holderID, takerID = takerID, holderID
+	}
+	usageAfter := s.Usage()
+
+	// The on-clock bill per rep: the WAL PUT, the handoff batch, and the
+	// grant; the observe pair and the one ranged section GET. Off-clock
+	// the checkpoint appends one PUT and the catch-up reads the taker's
+	// two objects plus the 404 probe.
+	gets := usageAfter.GetRequests - usageBefore.GetRequests
+	puts := usageAfter.PutRequests - usageBefore.PutRequests
+	wantGets := int64(c.warmReps * (2 + 1 + 3))
+	wantPuts := int64(c.warmReps * (3 + 1))
+	if gets != wantGets || puts != wantPuts {
+		return fmt.Errorf("e2e billed %d GETs %d PUTs, want %d and %d: a size-dependent op leaked into the sequence", gets, puts, wantGets, wantPuts)
+	}
+	p50, p99 := quantiles(windows)
+	fmt.Printf("e2e_window,reps=%d,p50_ms=%.1f,p99_ms=%.1f,on_clock_gets=3,on_clock_puts=3,segment_gets=0\n",
+		len(windows), ms(p50), ms(p99))
 	return nil
 }
 

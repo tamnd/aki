@@ -32,6 +32,14 @@ Warm-window quantiles at a given rep count share their chain terms across the de
 
 Kill line: a warm graceful window p50 at or over 300ms or p99 at or over 1.5s, any size-dependent op inside the window, fan 8 under 3x at 256 segments, or any stat or fold divergence means the pre-warm-plus-fan plan the handoff slice intends to bake is wrong, and the slice does not start until the design is rethought.
 
+## End-to-end re-score (filed with the graceful-handoff slice, before its scored run)
+
+The primitive-level run above priced the window as four hand-rolled terms; the slice landed the real machinery (LeaseManager.Handoff batching the final flush's commit with the release, TailWindow retention, TakeGroup replay from the fold cursor), so the e2e phase re-scores the same prediction on the real sequence: holder Handoff with a real WAL PUT and commit record, taker Follow, Reconcile, Acquire, and TakeGroup, warm taker, back and forth for the rep count.
+The taker stays at replay depth 1 by construction (the seal-and-publish-before-release discipline), enforced in the lab by a checkpoint record after each rep, which also exercises the window trim.
+Bands: the e2e window (Handoff through TakeGroup return) hits the same bars, p50 under 300ms and p99 under 1.5s; the term arithmetic above (release 30, observe 58, grant 48, replay 22, plus one WAL PUT near 30) predicts a p50 near 200ms.
+Op invariant, hard-asserted: exactly 3 GETs (observe pair plus one ranged WAL section) and 3 PUTs (WAL, handoff batch, grant) per rep on the clock, zero segment GETs, nothing size-dependent; folds agree on holder and epoch after every rep, epochs monotone, and every rep replays exactly its flushed frame count.
+Kill line: either bar missed or any op-invariant breach means the slice's sequence adds cost the primitives did not price, and the slice does not merge until the term that grew is named.
+
 ## Calibration disclosure
 
 A quick smoke (4 and 8 segments, 6 reps, 256 records per segment) ran during development before this file was committed and confirmed the mechanics: op invariant green, stats identical across arms, folds agreeing, windows in the hundreds of milliseconds with wide small-n medians.
