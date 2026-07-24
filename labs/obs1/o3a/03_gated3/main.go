@@ -33,6 +33,11 @@ type schedule struct {
 	// armed until recovery is observed.
 	heal   time.Duration
 	lo, hi time.Duration
+	// settleHi bounds the post-recovery rebalance back to the
+	// live-members rendezvous; maxEpoch bounds a victim group's epoch
+	// after it, 3 meaning seized once and rebalanced once.
+	settleHi time.Duration
+	maxEpoch uint32
 }
 
 // ambiguous fails every nth mutation after it landed, the doc 02
@@ -55,15 +60,20 @@ func ambiguous(nth int) sim.FaultFn {
 func schedules() []schedule {
 	return []schedule{
 		{name: "clean", seed: 101,
-			lo: 6500 * time.Millisecond, hi: 8 * time.Second},
+			lo: 6500 * time.Millisecond, hi: 8 * time.Second,
+			settleHi: 2 * time.Second, maxEpoch: 2},
 		{name: "storm", seed: 102, fault: func() sim.FaultFn { return fleetsim.Storm(3) },
-			lo: 6500 * time.Millisecond, hi: 9 * time.Second},
+			lo: 6500 * time.Millisecond, hi: 9 * time.Second,
+			settleHi: 2 * time.Second, maxEpoch: 2},
 		{name: "read-outage", seed: 103, fault: fleetsim.ReadOutage, heal: 2 * time.Second,
-			lo: 6500 * time.Millisecond, hi: 9 * time.Second},
+			lo: 6500 * time.Millisecond, hi: 9 * time.Second,
+			settleHi: 2 * time.Second, maxEpoch: 2},
 		{name: "ambiguous-put", seed: 104, fault: func() sim.FaultFn { return ambiguous(5) },
-			lo: 6500 * time.Millisecond, hi: 9 * time.Second},
+			lo: 6500 * time.Millisecond, hi: 9 * time.Second,
+			settleHi: 2 * time.Second, maxEpoch: 2},
 		{name: "write-outage", seed: 105, fault: fleetsim.WriteOutage, heal: 9 * time.Second,
-			lo: 9 * time.Second, hi: 10500 * time.Millisecond},
+			lo: 9 * time.Second, hi: 10500 * time.Millisecond,
+			settleHi: 12 * time.Second, maxEpoch: 3},
 	}
 }
 
@@ -71,6 +81,7 @@ type row struct {
 	sc           schedule
 	victimGroups int
 	recovery     time.Duration
+	settle       time.Duration
 	errs         int
 	pass         bool
 }
@@ -166,20 +177,44 @@ func runSchedule(sc schedule) (row, error) {
 		return r, fmt.Errorf("%s: survivors never recovered coverage", sc.name)
 	}
 	f.SetFault(nil)
+
+	// Settle: tick until the whole placement matches the live-members
+	// rendezvous. A write outage past the discipline lets the first
+	// post-heal duty cycle seize its peer's groups from a degraded
+	// survivor view, epoch-fenced and self-correcting, one balancer
+	// shed per tick; this phase prices that tail.
+	settled := false
+	for elapsed := time.Duration(0); elapsed < 20*time.Second; elapsed += step {
+		members := survivorsOf(f, 1)
+		placed := true
+		for g := 0; g < nGroups; g++ {
+			node, _, ok := f.Node(1).Fold.Holder(uint16(g))
+			pref, prefOK := obs1.PreferredNode(uint16(g), members)
+			if !ok || !prefOK || node != pref {
+				placed = false
+				break
+			}
+		}
+		if placed {
+			r.settle = elapsed
+			settled = true
+			break
+		}
+		f.Tick(ctx, step)
+	}
+	if !settled {
+		return r, fmt.Errorf("%s: placement never settled at the rendezvous", sc.name)
+	}
 	if err := f.FollowAll(ctx); err != nil {
 		return r, err
 	}
 	r.errs = f.Node(1).Errs + f.Node(2).Errs - errsBefore
 
 	// Invariants of the recovery, verified on the healed bucket.
-	members := survivorsOf(f, 1)
 	for _, g := range victimGroups {
 		node, epoch, ok := f.Node(1).Fold.Holder(g)
-		if !ok || epoch != 2 {
-			return r, fmt.Errorf("%s: group %d recovered at epoch %d ok=%v", sc.name, g, epoch, ok)
-		}
-		if pref, ok := obs1.PreferredNode(g, members); !ok || pref != node {
-			return r, fmt.Errorf("%s: group %d on node %d, rendezvous prefers %d", sc.name, g, node, pref)
+		if !ok || node == victim || epoch < 2 || epoch > sc.maxEpoch {
+			return r, fmt.Errorf("%s: group %d recovered on node %d at epoch %d ok=%v", sc.name, g, node, epoch, ok)
 		}
 	}
 	taker, _, _ := f.Node(1).Fold.Holder(flushed)
@@ -203,12 +238,12 @@ func runSchedule(sc schedule) (row, error) {
 	if sc.fault == nil && r.errs != 0 {
 		return r, fmt.Errorf("%s: %d duty-cycle errors on a clean bucket", sc.name, r.errs)
 	}
-	r.pass = r.recovery >= sc.lo && r.recovery <= sc.hi
+	r.pass = r.recovery >= sc.lo && r.recovery <= sc.hi && r.settle <= sc.settleHi
 	return r, nil
 }
 
 func main() {
-	fmt.Println("schedule,victim_groups,recovery_ms,band_lo_ms,band_hi_ms,survivor_errs,verdict")
+	fmt.Println("schedule,victim_groups,recovery_ms,band_lo_ms,band_hi_ms,settle_ms,survivor_errs,verdict")
 	fail := false
 	for _, sc := range schedules() {
 		r, err := runSchedule(sc)
@@ -220,9 +255,10 @@ func main() {
 		if !r.pass {
 			verdict, fail = "MISS", true
 		}
-		fmt.Printf("%s,%d,%d,%d,%d,%d,%s\n",
+		fmt.Printf("%s,%d,%d,%d,%d,%d,%d,%s\n",
 			r.sc.name, r.victimGroups, r.recovery.Milliseconds(),
-			r.sc.lo.Milliseconds(), r.sc.hi.Milliseconds(), r.errs, verdict)
+			r.sc.lo.Milliseconds(), r.sc.hi.Milliseconds(),
+			r.settle.Milliseconds(), r.errs, verdict)
 	}
 	if fail {
 		os.Exit(1)

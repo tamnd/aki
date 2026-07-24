@@ -1,0 +1,5 @@
+schedule,victim_groups,recovery_ms,band_lo_ms,band_hi_ms,survivor_errs,verdict
+clean,2,6700,6500,8000,0,PASS
+storm,2,6900,6500,9000,79,PASS
+read-outage,2,6700,6500,9000,52,PASS
+ambiguous-put,2,6700,6500,9000,3,PASS

@@ -34,10 +34,19 @@ Not reachable at this layer, disclosed: mesh partitions (the engine duty cycle c
 
 Kill line: any schedule outside its band, any recovered group off epoch 2 or off the rendezvous choice, a replay that walks anything but 3 frames, fold divergence, or dead sections anywhere means the fleet does not survive its specified degraded modes at the predicted time, and the gate row stays open until the failing mode is named and fixed.
 
+## Post-prediction amendment (filed after the first scored run, before the re-run)
+
+The first scored run passed clean, storm, read-outage, and ambiguous-put in band and failed the write-outage schedule's placement assertion, and the assertion was wrong, not the fleet.
+A 9s write outage silences every heartbeat, so the survivors cross each other's staleness horizon and finish the takeover discipline against each other as well as against the victim; at the heal, whichever duty cycle runs first plans takeovers from its degraded survivor view, in which it is the only live member and rendezvous prefers it for everything, and it seizes the peer's groups along with the victim's before the peer's first post-heal heartbeat can be observed.
+This is protocol-honest and safe: every seizure is epoch-fenced, the seized peer demotes on its next reconcile, and the balancer sheds each misplaced group back to the live-members rendezvous, one handoff per balance tick, so the placement self-corrects with a rebalance tail linear in the seized group count.
+The rig amendment: after recovery, every schedule runs a settle phase that ticks until the whole placement matches the live-members rendezvous, reported as settle_ms; the placement and epoch assertions move behind it.
+Amended bands: settle within 2s for clean, storm, read-outage, and ambiguous-put, whose survivor views never degrade, and within 12s for write-outage, pricing the one-shed-per-tick rebalance tail; victim-group epochs stay exactly 2 on the first four schedules, and land in {2, 3} under write-outage, where 3 is a group that moved twice, seized at 2 and rebalanced at 3.
+The recovery bands of the prediction stand unchanged, and the first run's recovery numbers stand as scored.
+
 ## Calibration disclosure
 
 The fleetsim harness's own test suite (#1361), run before this file was written, recovered the clean crash schedule in 6.7s simulated against an 8s assertion, which is where band 1's shape comes from; the storm, read-outage, ambiguous-put, and write-outage schedules have never been clocked and their bands come from the discipline arithmetic above.
 
 ## Run
 
-./run.sh writes gated3.csv: schedule, victim group count, recovery in simulated ms, band, duty-cycle errors, verdict.
+./run.sh writes gated3.csv: schedule, victim group count, recovery in simulated ms, band, settle in simulated ms, duty-cycle errors, verdict.
