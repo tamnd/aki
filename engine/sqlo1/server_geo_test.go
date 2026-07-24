@@ -1,7 +1,12 @@
 package sqlo1
 
 import (
+	"bufio"
+	"io"
+	"math"
 	"net"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -17,6 +22,38 @@ func geoSend(t *testing.T, c net.Conn) func(args ...string) {
 		if _, err := c.Write([]byte(respCmd(args...))); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// expectBulkNear reads a bulk reply and compares it as a float
+// within a few ulps instead of byte for byte. The STOREDIST scores
+// are full-precision haversine outputs, and math.Sin's last ulp
+// differs between arm64 and amd64 builds (the compiler contracts the
+// kernel's polynomial on arm64), so those exact bytes cannot be
+// pinned across platforms.
+func expectBulkNear(t *testing.T, r *bufio.Reader, want float64) {
+	t.Helper()
+	header, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading bulk header (want %v): %v", want, err)
+	}
+	if !strings.HasPrefix(header, "$") {
+		t.Fatalf("reply header = %q, want a bulk of about %v", header, want)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(header[1:]))
+	if err != nil || n < 0 {
+		t.Fatalf("bulk header = %q, want a length", header)
+	}
+	body := make([]byte, n+2)
+	if _, err := io.ReadFull(r, body); err != nil {
+		t.Fatalf("reading bulk body (want %v): %v", want, err)
+	}
+	got, err := strconv.ParseFloat(string(body[:n]), 64)
+	if err != nil {
+		t.Fatalf("bulk %q is not a float: %v", body[:n], err)
+	}
+	if diff := math.Abs(got - want); diff > 4*math.Abs(want)*0x1p-52 {
+		t.Fatalf("bulk float = %v, want within a few ulps of %v", got, want)
 	}
 }
 
@@ -279,17 +316,16 @@ func TestServerGeoStore(t *testing.T) {
 
 	// The stored distances are full precision in the search's unit.
 	// The last ulp is the libm's, not the algorithm's: sin, cos, and
-	// asin are not correctly rounded and Go's kernels differ from a
-	// given platform's libm there, so these bytes pin our own
-	// deterministic value (live Redis on this box printed
-	// 56.4412578701582 and 190.44242984775784, agreeing to 14
-	// significant digits).
+	// asin are not correctly rounded, their kernels differ between
+	// our arm64 and amd64 builds and from a given platform's libm, so
+	// the comparison is a few ulps around the value live Redis on
+	// this box printed (56.4412578701582 and 190.44242984775784).
 	send("GEOSEARCHSTORE", "dst", "sic", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC", "STOREDIST")
 	expect(t, r, ":2\r\n")
 	send("ZSCORE", "dst", "Catania")
-	expect(t, r, "$18\r\n56.441257870158246\r\n")
+	expectBulkNear(t, r, 56.4412578701582)
 	send("ZSCORE", "dst", "Palermo")
-	expect(t, r, "$18\r\n190.44242984775798\r\n")
+	expectBulkNear(t, r, 190.44242984775784)
 
 	send("GEOSEARCHSTORE", "dst2", "sic", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km")
 	expect(t, r, ":2\r\n")
@@ -366,7 +402,7 @@ func TestServerGeoRadius(t *testing.T) {
 	send("ZCARD", "k1")
 	expect(t, r, ":0\r\n")
 	send("ZSCORE", "k2", "Catania")
-	expect(t, r, "$18\r\n56.441257870158246\r\n")
+	expectBulkNear(t, r, 56.4412578701582)
 
 	send("GEORADIUS", "sic", "15", "37", "200", "km", "STORE", "k3", "WITHDIST")
 	expect(t, r, "-ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORD options\r\n")
