@@ -107,6 +107,15 @@ The op invariant held as a hard assertion: exactly 3 GETs and 3 PUTs on the cloc
 Folds agreed on holder and epoch after all 40 reps with epochs monotone, and every rep replayed exactly its 128 flushed frames to the flush's last seq.
 PRED-OBS1-O3A-HANDOFF re-scored HIT on the real machinery; the kill line stays untouched.
 
+## Crash-takeover e2e result (scored with the crash-takeover slice)
+
+One scored full run after the slice landed (handoff.csv), 20 reps of the real sequence at 256 segments and depth 4, every assertion green.
+The mechanics came out at p50 1412.3ms and p99 2369.0ms against the 5000ms bar, right where the term arithmetic put it, with the fan-8 rebuild carrying almost the whole window and the p99 tail coming from straggler segment draws across the fan lanes.
+The bill held as a hard assertion: exactly 261 GETs (the silence probe, 256 segments, 4 ranged WAL sections) and 1 grant PUT on the clock per rep, the off-clock flush, follow, checkpoint, and wake ops exact, and the retained window trimmed to zero every rep.
+Every grant landed at epoch plus one with both folds agreeing after the wake, every woken holder demoted holding nothing, every rebuild matched the full segment set, and every replay walked its 512 frames to the flush's last seq.
+The policy wait beside the window is 6600ms simulated: chain-observed staleness at TTL plus skew, then the taker's full-TTL watch.
+PRED-OBS1-O3A-TAKEOVER scored HIT on the real machinery; the kill line stays untouched.
+
 ## Verdict
 
 HIT on all seven bands, the kill line untouched.
