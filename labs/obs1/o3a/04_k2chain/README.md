@@ -33,3 +33,22 @@ Kill line: this prediction's bands score the model, but the K2 decision follows 
 ## Run
 
     ./run.sh    # writes k2chain.csv
+
+## Results (scored run, 2026-07-24)
+
+| age | flush rate min/max (target) | appends/s | rec/batch | append p50/p99/max ms | lag p50/p99/max ms |
+|-----|------------------------------|-----------|-----------|------------------------|---------------------|
+| 50ms | 10.2 / 14.1 (20) | 24.9 | 8.0 | 47 / 5238 / 7446 | 928 / 7199 / 10376 |
+| 250ms | 3.6 / 3.9 (4) | 21.8 | 2.8 | 266 / 4488 / 11838 | 936 / 6238 / 16582 |
+| 1000ms | 1.0 / 1.0 (1) | 15.6 | 1.0 | 589 / 2272 / 3067 | 655 / 2360 / 3067 |
+
+## Verdict
+
+K2 fires: log domains pull forward from deferred into O4.
+
+Band 1 HIT: the chain sustains every arm at the O0b lab's capacity, 24.9 appends per second at defaults with 8 records per batch, dense everywhere, no failures.
+Band 2 MISS on the defaults arm, and that miss is the K2 trigger itself: per-node realized flush rate is 10.2 to 14.1 against the 20 per second age-trigger rate, because the committer's queue fills behind slow contended appends, delivery blocks, and the flusher's swap loop stalls behind its own pipeline, the block-not-drop chain doing exactly what it promises at a load the chain cannot drain.
+Band 3 split: defaults lag p50 928ms and p99 7.2s inside their bands, the 1000ms arm's p50 655ms above the predicted 300ms because even 16 offered appends per second against 16 racing nodes prices every append at a contended race, not a solo round trip.
+Band 4, the decision: worst appends cross the 3500ms staleness horizon at defaults (7.4s) and at thrift (11.8s), and even the under-capacity 1000ms arm's worst append (3.07s) exceeds the 2500ms gate belief window.
+A 16-node fleet on one chain misses its flush cadence at the shipped defaults and cannot keep its lease renewals reliably inside the discipline at any swept cadence, which is doc 11's K2 condition met in both halves; per the criterion the answer is log domains, not backoff tuning.
+The prediction called the decision and the mechanism; the band 2 arithmetic was wrong about where backpressure first bites, and the honest reading is that the cadence miss arrives through the delivery path before the append tail even matters.

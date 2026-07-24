@@ -1,0 +1,4 @@
+age_ms,nodes,flush_rate_min,flush_rate_max,appends_per_s,records_per_batch,append_p50_ms,append_p99_ms,append_max_ms,lag_p50_ms,lag_p99_ms,lag_max_ms
+50,16,10.2,14.1,24.9,8.0,47,5238,7446,928,7199,10376
+250,16,3.6,3.9,21.8,2.8,266,4488,11838,936,6238,16582
+1000,16,1.0,1.0,15.6,1.0,589,2272,3067,655,2360,3067
