@@ -22,11 +22,12 @@ import (
 // fields and 200 members clear all three with room; 40 strings give the
 // drain a spread of keys without swamping the poll.
 const (
-	ColdStrings  = 40
-	ColdFields   = 600
-	ColdMembers  = 200
-	ColdZMembers = 200
-	ColdListLen  = 200
+	ColdStrings   = 40
+	ColdFields    = 600
+	ColdMembers   = 200
+	ColdZMembers  = 200
+	ColdListLen   = 200
+	ColdStreamLen = 200
 )
 
 // ColdStringKey names the nth cold-arm string key, exported so the arm
@@ -36,10 +37,11 @@ func ColdStringKey(i int) string { return "cold:str:" + strconv.Itoa(i) }
 // ColdHashKey, ColdSetKey, ColdZsetKey, and ColdListKey name the cold-arm
 // collections.
 const (
-	ColdHashKey = "cold:hash"
-	ColdSetKey  = "cold:set"
-	ColdZsetKey = "cold:zset"
-	ColdListKey = "cold:list"
+	ColdHashKey   = "cold:hash"
+	ColdSetKey    = "cold:set"
+	ColdZsetKey   = "cold:zset"
+	ColdListKey   = "cold:list"
+	ColdStreamKey = "cold:stream"
 )
 
 func coldField(i int) string   { return fmt.Sprintf("cf%03d", i) }
@@ -53,6 +55,20 @@ func coldZMember(i int) string { return fmt.Sprintf("zm%03d", i) }
 // chunk and never leave the ends-stay-hot margins.
 func coldElem(i int) string {
 	return fmt.Sprintf("le%03d-%094d", i, i)
+}
+
+// coldStreamID is the nth entry's explicit ID, ms climbing from 1 so
+// every expectation formats plain and the entries land in ID order.
+func coldStreamID(i int) string {
+	return strconv.Itoa(i+1) + "-1"
+}
+
+// coldSVal pads each stream entry's value to roughly 100 bytes so
+// ColdStreamLen entries seal several 4 KiB blocks and the demote pass
+// has sealed front blocks past the resident tail margin to shed; short
+// values would leave the whole log inside two blocks and nothing cold.
+func coldSVal(i int) string {
+	return fmt.Sprintf("sv%03d-%092d", i, i)
 }
 
 // ColdBuild returns the write steps that stand the cold working set up.
@@ -93,6 +109,10 @@ func ColdBuild() []Step {
 			rpush = append(rpush, coldElem(i))
 		}
 		steps = append(steps, c(strconv.Itoa(base+batch), rpush...))
+	}
+	// XADD replies with the entry ID, one entry per step.
+	for i := 0; i < ColdStreamLen; i++ {
+		steps = append(steps, c(coldStreamID(i), "XADD", ColdStreamKey, coldStreamID(i), "f", coldSVal(i)))
 	}
 	return steps
 }
@@ -154,6 +174,24 @@ func ColdVerify() []Step {
 			"LRANGE", ColdListKey, "90", "92"),
 		c("(nil)", "LINDEX", ColdListKey, strconv.Itoa(ColdListLen)),
 		c("0", "LLEN", "cold:list:missing"),
+	)
+	// The stream reads: the length, ID point reads through the interior
+	// (where the demoted blocks live), a range window, both open bounds,
+	// and the misses.
+	steps = append(steps, c(strconv.Itoa(ColdStreamLen), "XLEN", ColdStreamKey))
+	entry := func(i int) string {
+		return "[" + coldStreamID(i) + " [f " + coldSVal(i) + "]]"
+	}
+	for i := 0; i < ColdStreamLen; i += 10 {
+		steps = append(steps, c("["+entry(i)+"]", "XRANGE", ColdStreamKey, coldStreamID(i), coldStreamID(i)))
+	}
+	steps = append(steps,
+		c("["+entry(90)+" "+entry(91)+" "+entry(92)+"]",
+			"XRANGE", ColdStreamKey, coldStreamID(90), coldStreamID(92)),
+		c("["+entry(0)+"]", "XRANGE", ColdStreamKey, "-", "+", "COUNT", "1"),
+		c("["+entry(ColdStreamLen-1)+"]", "XREVRANGE", ColdStreamKey, "+", "-", "COUNT", "1"),
+		c("[]", "XRANGE", ColdStreamKey, "9999-0", "9999-9"),
+		c("0", "XLEN", "cold:stream:missing"),
 	)
 	return steps
 }
