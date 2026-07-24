@@ -13,7 +13,7 @@ import (
 // touched only by the shard goroutine, so it holds no lock. The string store
 // and this registry are separate keyspaces for now; the WRONGTYPE guard below
 // keeps a set command off a key the string store owns, and the keyspace
-// commands set.Type, set.Exists, and set.Del span both. Full cross-type
+// package's TYPE, EXISTS, and DEL span both. Full cross-type
 // unification (a SET overwriting a set, multi-key DEL over sets) lands with the
 // keyspace slice; this slice keeps the set surface self-consistent and refuses
 // the cross-type collisions it cannot yet resolve.
