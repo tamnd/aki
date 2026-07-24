@@ -104,10 +104,16 @@ func geoDecode(bits uint64) (lon, lat float64) {
 	ilon := geoCompressEven(bits >> 1)
 	latScale := geoLatMax - geoLatMin
 	lonScale := geoLonMax - geoLonMin
-	latMinC := geoLatMin + (float64(ilat)*1.0/float64(uint64(1)<<geoStep))*latScale
-	latMaxC := geoLatMin + (float64(ilat+1)*1.0/float64(uint64(1)<<geoStep))*latScale
-	lonMinC := geoLonMin + (float64(ilon)*1.0/float64(uint64(1)<<geoStep))*lonScale
-	lonMaxC := geoLonMin + (float64(ilon+1)*1.0/float64(uint64(1)<<geoStep))*lonScale
+	// Explicit FMA: Redis builds with -ffp-contract=fast, so its
+	// decode fuses the scale multiply into the add, and the pinned
+	// midpoints (the Z-I6 bit-parity contract) are the fused values.
+	// Go only contracts on some arches (arm64 yes, amd64 no), so
+	// spelling the fusion out is what makes both builds land on the
+	// Redis bytes.
+	latMinC := math.FMA(float64(ilat)*1.0/float64(uint64(1)<<geoStep), latScale, geoLatMin)
+	latMaxC := math.FMA(float64(ilat+1)*1.0/float64(uint64(1)<<geoStep), latScale, geoLatMin)
+	lonMinC := math.FMA(float64(ilon)*1.0/float64(uint64(1)<<geoStep), lonScale, geoLonMin)
+	lonMaxC := math.FMA(float64(ilon+1)*1.0/float64(uint64(1)<<geoStep), lonScale, geoLonMin)
 	return (lonMinC + lonMaxC) / 2, (latMinC + latMaxC) / 2
 }
 
