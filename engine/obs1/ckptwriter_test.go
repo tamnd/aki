@@ -22,7 +22,7 @@ func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 // appender's applier on the shared store.
 func ckptNode(t *testing.T, s obs1.Store, prefix string, id uint64, maxRecords int, maxAge time.Duration, clk *fakeClock) (*obs1.ChainAppender, *obs1.Checkpointer) {
 	t.Helper()
-	c, err := obs1.NewCheckpointer(obs1.NewLeaseFold(), id, 0, maxRecords, maxAge, clk.now)
+	c, err := obs1.NewCheckpointer(obs1.NewLeaseFold(), id, 0, maxRecords, maxRecords, maxAge, clk.now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +373,7 @@ func TestBootPrimeFollow(t *testing.T) {
 	}
 	mustAppendTo(t, a7, commit(7, 1, 1)) // tail past the checkpoint
 
-	cb, err := obs1.NewCheckpointer(obs1.NewLeaseFold(), 9, 0, 4, time.Hour, clk.now)
+	cb, err := obs1.NewCheckpointer(obs1.NewLeaseFold(), 9, 0, 4, 4096, time.Hour, clk.now)
 	if err != nil {
 		t.Fatal(err)
 	}

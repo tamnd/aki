@@ -19,9 +19,14 @@ import (
 	"time"
 )
 
-// Checkpoint cadence defaults (doc 02 section 2.5); both are lab knobs.
+// Checkpoint cadence defaults. Records and age are doc 02 section 2.5;
+// the object bound is the boot-time lab's constant (#1351): a booting
+// node pays one GET and roughly 30ms per trailing chain OBJECT, and a
+// heartbeating fleet appends multiple objects per second, so the cadence
+// that actually bounds boot time counts objects, not records or seconds.
 const (
 	DefaultCheckpointRecords = 4096
+	DefaultCheckpointObjects = 64
 	DefaultCheckpointEvery   = 60 * time.Second
 )
 
@@ -44,9 +49,11 @@ type Checkpointer struct {
 	now  func() time.Time
 
 	maxRecords int
+	maxObjects int
 	maxAge     time.Duration
 
 	records int
+	objects int
 	sinceMS time.Time // local time the cadence last reset
 	due     bool
 
@@ -57,11 +64,11 @@ type Checkpointer struct {
 	stamps map[uint16]time.Time // local arrival of each group's last renewal
 }
 
-// NewCheckpointer wraps fold for the node self. Zero maxRecords, maxAge,
-// or ttl take the doc 02 defaults. Groups already held at construction
-// (a fold primed from a checkpoint) are stamped now: this observer first
-// saw them alive at boot.
-func NewCheckpointer(fold *LeaseFold, self uint64, ttl time.Duration, maxRecords int, maxAge time.Duration, now func() time.Time) (*Checkpointer, error) {
+// NewCheckpointer wraps fold for the node self. Zero maxRecords,
+// maxObjects, maxAge, or ttl take the defaults above. Groups already held
+// at construction (a fold primed from a checkpoint) are stamped now: this
+// observer first saw them alive at boot.
+func NewCheckpointer(fold *LeaseFold, self uint64, ttl time.Duration, maxRecords, maxObjects int, maxAge time.Duration, now func() time.Time) (*Checkpointer, error) {
 	if fold == nil || now == nil {
 		return nil, fmt.Errorf("obs1: checkpointer needs a fold and a clock")
 	}
@@ -74,12 +81,15 @@ func NewCheckpointer(fold *LeaseFold, self uint64, ttl time.Duration, maxRecords
 	if maxRecords <= 0 {
 		maxRecords = DefaultCheckpointRecords
 	}
+	if maxObjects <= 0 {
+		maxObjects = DefaultCheckpointObjects
+	}
 	if maxAge <= 0 {
 		maxAge = DefaultCheckpointEvery
 	}
 	c := &Checkpointer{
 		fold: fold, self: self, ttl: ttl, now: now,
-		maxRecords: maxRecords, maxAge: maxAge,
+		maxRecords: maxRecords, maxObjects: maxObjects, maxAge: maxAge,
 		sinceMS: now(), stamps: make(map[uint16]time.Time),
 	}
 	if primed := fold.Applied(); primed.Seq > 0 {
@@ -137,6 +147,7 @@ func (c *Checkpointer) ApplyChain(pos ChainPos, h Header, batch ChainBatch) erro
 		}
 	}
 	reset := false
+	c.objects++
 	for _, r := range batch.Records {
 		c.records++
 		if ck, ok := r.(CheckpointRecord); ok && ck.Pos.Seq > c.newest.Seq {
@@ -146,11 +157,12 @@ func (c *Checkpointer) ApplyChain(pos ChainPos, h Header, batch ChainBatch) erro
 	}
 	if reset {
 		c.records = 0
+		c.objects = 0
 		c.sinceMS = t
 		c.due = false
 		return nil
 	}
-	if c.records >= c.maxRecords || t.Sub(c.sinceMS) >= c.maxAge {
+	if c.records >= c.maxRecords || c.objects >= c.maxObjects || t.Sub(c.sinceMS) >= c.maxAge {
 		if h.Writer == c.self {
 			c.due = true
 		}

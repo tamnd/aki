@@ -203,7 +203,7 @@ func run(c cfg) error {
 		return err
 	}
 	builder := obs1.NewLeaseFold()
-	ckpter, err := obs1.NewCheckpointer(builder, 1, 3*time.Second, 4096, time.Minute, time.Now)
+	ckpter, err := obs1.NewCheckpointer(builder, 1, 3*time.Second, 4096, 4096, time.Minute, time.Now)
 	if err != nil {
 		return err
 	}
