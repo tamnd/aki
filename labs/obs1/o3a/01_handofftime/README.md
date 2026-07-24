@@ -88,6 +88,14 @@ Band scoring:
 
 Two edges worth recording: the depth-4 sensitivity row's p50 came out at 280.5ms, grazing the graceful bar from below, which is why the slice must keep the holder's seal-and-publish ahead of the release so graceful replay stays at depth 0 or 1; and fan 32 lost to fan 8 at 8 segments (90 vs 54ms), straggler draws over too few objects, so the fan constant should not exceed the segment count.
 
+## End-to-end result (scored with the graceful-handoff slice)
+
+One scored full run after the slice landed (handoff.csv), 40 reps of the real sequence, every assertion green.
+The e2e window came out at p50 213.5ms and p99 703.3ms against the 300ms and 1.5s bars, right where the term arithmetic put it, and slightly wider at p99 than the primitive run because the real window carries the WAL PUT and the replay's ranged GET in one tail.
+The op invariant held as a hard assertion: exactly 3 GETs and 3 PUTs on the clock per rep, zero segment GETs, one checkpoint PUT plus the three catch-up GETs off the clock, and the checkpoint trimmed the retained window to zero every rep.
+Folds agreed on holder and epoch after all 40 reps with epochs monotone, and every rep replayed exactly its 128 flushed frames to the flush's last seq.
+PRED-OBS1-O3A-HANDOFF re-scored HIT on the real machinery; the kill line stays untouched.
+
 ## Verdict
 
 HIT on all seven bands, the kill line untouched.
