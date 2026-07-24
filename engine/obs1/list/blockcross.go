@@ -219,6 +219,7 @@ func blockPopCross(t *shard.Txn, conn *shard.Conn, seq uint32, keys [][]byte, ti
 	for _, key := range keys {
 		var out []byte
 		var wrong, have bool
+		var lerr error
 		t.Do(key, func(cx *shard.Ctx) {
 			g := registry(cx)
 			l, w := g.lookup(cx, key)
@@ -230,15 +231,20 @@ func blockPopCross(t *shard.Txn, conn *shard.Conn, seq uint32, keys [][]byte, ti
 				return
 			}
 			out = appendReply(nil, key, popOne(l, front))
-			if l.length() == 0 {
+			dropped := l.length() == 0
+			if dropped {
 				g.drop(key)
 			} else {
 				g.note(l)
 			}
+			lerr = cx.LogListPop(key, front, 1, dropped)
 			have = true
 		})
 		if wrong {
 			return resp.AppendError(nil, wrongType)
+		}
+		if lerr != nil {
+			return resp.AppendError(nil, lerr.Error())
 		}
 		if have {
 			return out
@@ -280,6 +286,7 @@ func BlmpopCross(t *shard.Txn, conn *shard.Conn, seq uint32, a [][]byte) []byte 
 	for _, key := range keys {
 		var out []byte
 		var wrong, have bool
+		var lerr error
 		t.Do(key, func(cx *shard.Ctx) {
 			g := registry(cx)
 			l, w := g.lookup(cx, key)
@@ -300,15 +307,20 @@ func BlmpopCross(t *shard.Txn, conn *shard.Conn, seq uint32, a [][]byte) []byte 
 			for j := 0; j < npop; j++ {
 				out = resp.AppendBulk(out, popOne(l, front))
 			}
-			if l.length() == 0 {
+			dropped := l.length() == 0
+			if dropped {
 				g.drop(key)
 			} else {
 				g.note(l)
 			}
+			lerr = cx.LogListPop(key, front, npop, dropped)
 			have = true
 		})
 		if wrong {
 			return resp.AppendError(nil, wrongType)
+		}
+		if lerr != nil {
+			return resp.AppendError(nil, lerr.Error())
 		}
 		if have {
 			return out
