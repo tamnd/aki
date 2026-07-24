@@ -175,6 +175,11 @@ func init() {
 	register("EXPIRETIME", keyspace.ExpireTime, 1, 1, true)
 	register("PEXPIRETIME", keyspace.PExpireTime, 1, 1, true)
 	register("PERSIST", keyspace.Persist, 1, 1, true)
+	// GETEX frames the same both-halves expire op EXPIRE does, so the
+	// keyspace package owns it; SETEX and PSETEX are pure string writes.
+	register("GETEX", keyspace.Getex, 1, -1, true)
+	register("SETEX", str.Setex, 3, 3, true)
+	register("PSETEX", str.Psetex, 3, 3, true)
 
 	// The tier-one multi-key commands: a single key keeps the point path,
 	// more keys scatter through the fan-out; MGET and MSET always fan. The

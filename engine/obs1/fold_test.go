@@ -228,6 +228,69 @@ func TestFolderWatermarkGate(t *testing.T) {
 	}
 }
 
+// TestFolderRootDeadlineProjectsBounds pins the fold TTL projection: a
+// collection chunk whose key carries a root deadline folds with every
+// entry a bearer and the root in its bounds, so a segment of only
+// deadline-bearing state earns a TTL class, while one deathless chunk in
+// the mix keeps the class at 0. The resolver is AddFrom's parameter, the
+// seam boot wires to the owner's root deadlines at drain time.
+func TestFolderRootDeadlineProjectsBounds(t *testing.T) {
+	rootMS := uint64(time.Now().Add(time.Hour).UnixMilli())
+	recExp := rootMS + 3_600_000
+	resolve := func(key []byte) int64 {
+		if string(key) == "coll" {
+			return int64(rootMS)
+		}
+		return 0
+	}
+
+	fx := newFoldFixture(t, 0)
+	buf := store.AppendRecordFrame(nil, kindString, 0, 1, []byte("k0"), []byte("v"), recExp)
+	buf = store.AppendRunChunk(buf, 0x03|store.ChunkKindBit, 0, 7, []byte("coll"), []byte("disc8bYt"), []byte("packed-blob"))
+	fx.folder.AddFrom(buf, resolve)
+	fx.folder.Flush()
+	waitFor(t, "publish", func() bool { return len(fx.folder.Ledger()) == 1 })
+	led := fx.folder.Ledger()[0]
+	if led.TTLClass == 0 || led.MinExpMS != rootMS || led.MaxExpMS != recExp {
+		t.Fatalf("ledger row class %d bounds %d..%d, want a class with bounds %d..%d",
+			led.TTLClass, led.MinExpMS, led.MaxExpMS, rootMS, recExp)
+	}
+
+	buf = store.AppendRunChunk(nil, 0x03|store.ChunkKindBit, 0, 7, []byte("coll"), []byte("disc8bYt"), []byte("packed-blob"))
+	buf = store.AppendRunChunk(buf, 0x03|store.ChunkKindBit, 0, 3, []byte("free"), []byte("disc8bYt"), []byte("no-deadline"))
+	fx.folder.AddFrom(buf, resolve)
+	fx.folder.Flush()
+	waitFor(t, "second publish", func() bool { return len(fx.folder.Ledger()) == 2 })
+	led = fx.folder.Ledger()[1]
+	if led.TTLClass != 0 || led.MinExpMS != 0 || led.MaxExpMS != 0 {
+		t.Fatalf("mixed segment class %d bounds %d..%d, want class 0 and no bounds",
+			led.TTLClass, led.MinExpMS, led.MaxExpMS)
+	}
+}
+
+// TestFolderTrimMarkerNeutralInBounds pins the zero-count rule: a trim
+// marker holds nothing to expire, so it neither blocks the TTL class nor
+// hollows the segment floor with its zero MinExpMS. Before the guard the
+// marker's zero folded into the footer as the min, which the segment
+// builder rejects, so this segment never published.
+func TestFolderTrimMarkerNeutralInBounds(t *testing.T) {
+	fx := newFoldFixture(t, 0)
+	exp := uint64(time.Now().Add(time.Hour).UnixMilli())
+	buf := store.AppendRecordFrame(nil, kindString, 0, 1, []byte("k0"), []byte("v"), exp)
+	buf = store.AppendRunChunk(buf, 0x03|store.ChunkKindBit, 0, 0, []byte("gone"), []byte("disc8bYt"), nil)
+	fx.folder.Add(buf)
+	fx.folder.Flush()
+	waitFor(t, "publish", func() bool { return len(fx.folder.Ledger()) == 1 })
+	led := fx.folder.Ledger()[0]
+	if led.TTLClass == 0 || led.MinExpMS != exp || led.MaxExpMS != exp {
+		t.Fatalf("ledger row class %d bounds %d..%d, want a class with bounds %d..%d",
+			led.TTLClass, led.MinExpMS, led.MaxExpMS, exp, exp)
+	}
+	if errs := fx.folder.Stats().BuildErrs; errs != 0 {
+		t.Fatalf("segment build refused %d times", errs)
+	}
+}
+
 // TestFolderSegSeqCollision pins the CAS-create policy: a seq slot held by
 // another writer (a prior incarnation's segment) advances the folder past
 // it rather than fencing it out, and the next cut keeps counting from

@@ -91,6 +91,20 @@ var Hot = []Step{
 	c("1", "PEXPIREAT", "exp", "1"),
 	c("0", "EXISTS", "exp"),
 	c("-2", "TTL", "exp"),
+	c("OK", "SETEX", "sx", "100", "v1"),
+	c("OK", "PSETEX", "sx", "100000", "v2"),
+	c("v2", "GETEX", "sx", "PERSIST"),
+	c("-1", "TTL", "sx"),
+	c("v2", "GETEX", "sx", "EXAT", "33177600000"),
+	c("33177600000", "EXPIRETIME", "sx"),
+	c("v2", "GETEX", "sx"),
+	c("(nil)", "GETEX", "nosx"),
+	c("v2", "GETEX", "sx", "PXAT", "1"),
+	c("0", "EXISTS", "sx"),
+	// A far-future deadline that stays put, so the fold and restart arms
+	// carry a TTL-bearing string through their fingerprints.
+	c("OK", "SET", "expkeep", "v", "PXAT", "33177600000000"),
+	c("33177600000000", "PEXPIRETIME", "expkeep"),
 
 	// Bits.
 	c("0", "SETBIT", "bits", "7", "1"),
@@ -173,7 +187,12 @@ var Hot = []Step{
 	c("[bl3 four]", "BLPOP", "nolist", "bl3", "0"),
 
 	// Set, with single-member sets where the reply order would
-	// otherwise be theirs to choose.
+	// otherwise be theirs to choose. sttl keeps a far-future root
+	// deadline to its last breath, so the fold and restart arms carry a
+	// TTL-bearing collection through their fingerprints.
+	c("1", "SADD", "sttl", "m"),
+	c("1", "EXPIREAT", "sttl", "33177600000"),
+	c("33177600000", "EXPIRETIME", "sttl"),
 	c("2", "SADD", "s", "m1", "m2"),
 	c("2", "SCARD", "s"),
 	c("1", "SISMEMBER", "s", "m1"),
