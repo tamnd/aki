@@ -62,3 +62,18 @@ The fleetsim harness's own test suite (#1361), run before this file was written,
 ## Run
 
 ./run.sh writes gated3.csv: schedule, victim group count, recovery in simulated ms, band, settle in simulated ms, duty-cycle errors, verdict.
+
+## Result (scored run after the second amendment, 2026-07-24)
+
+| schedule | recovery_ms | band | settle_ms | errs | verdict |
+|---|---|---|---|---|---|
+| clean | 6700 | [6500, 8000] | 0 | 0 | PASS |
+| storm | 6900 | [6500, 9000] | 7300 | 79 | PASS |
+| read-outage | 6700 | [6500, 9000] | 0 | 52 | PASS |
+| ambiguous-put | 6700 | [6500, 9000] | 0 | 3 | PASS |
+| write-outage | 9100 | [9000, 10500] | 9100 | 519 | PASS |
+
+All five schedules in band with every invariant green: recovered holders at the live-members rendezvous, victim-group epochs inside each schedule's bound, the 3-frame replay exact from the taker's window, survivor folds agreeing by StateSum, zero dead sections, zero errors on the clean bucket.
+Recovery numbers are unchanged across all three runs, which is what the deterministic harness promises.
+The write-outage settle went from a vacuous 0 to a real 9100ms under the true-live predicate, inside the 12s band the first amendment set for it, confirming the predicate hole was real and the band arithmetic was right.
+Score against PRED-OBS1-O3A-GATED3: bands 1 through 5 HIT as filed, band 6 HIT as amended, with two post-prediction amendments on the settle surface both filed and committed before their re-runs and both recorded above.
