@@ -36,6 +36,9 @@ type TieredConfig struct {
 	// coarse tick the stamps and expiry checks use is NowMs>>10, advanced
 	// by Tick.
 	NowMs func() int64
+	// Policy is the maxmemory-policy tiering flavor, doc 11 section 5.
+	// The zero value is noeviction, the WATT-lite default.
+	Policy EvictPolicy
 }
 
 // TieredStats counts what the read path did; INFO wiring arrives with the
@@ -121,6 +124,7 @@ func NewTiered(st Store, cfg TieredConfig) *Tiered {
 	ht := NewBudgetedHotTable(cfg.Budget)
 	dr := newDrainer(ht, st)
 	ev := newEvictor(ht, cfg.Seed)
+	ev.policy = cfg.Policy
 	// A store that feels disk-side pressure exposes Maintainer and the
 	// ladder's WAL and free-extent rungs come alive; MemStore does not,
 	// and those rungs read zero.
@@ -487,6 +491,33 @@ func (t *Tiered) Flush(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// SetPolicy swaps the eviction ranking flavor. Like every other Tiered
+// entry point it is single-owner: the server calls it under its
+// dispatch lock, so the evictor never sees a torn policy.
+func (t *Tiered) SetPolicy(p EvictPolicy) { t.ev.policy = p }
+
+// Policy reports the active eviction ranking flavor.
+func (t *Tiered) Policy() EvictPolicy { return t.ev.policy }
+
+// DiskPressure snapshots the store's gauges; all-zero when the store
+// has no Maintainer (MemStore) or no byte cap. The server's hard-evict
+// pass keys off the free-extent rung rather than the file size, since
+// the data file never shrinks and deletes free extents for reuse.
+func (t *Tiered) DiskPressure() Pressure {
+	if t.lad.mt == nil {
+		return Pressure{}
+	}
+	return t.lad.mt.Pressure()
+}
+
+// HardEvictVictims samples up to n keys ranked for destructive
+// eviction under the active policy, worst first, copied out. Plane
+// records are never candidates; the caller deletes through the
+// command path so collection roots retire their planes properly.
+func (t *Tiered) HardEvictVictims(n int) [][]byte {
+	return t.ev.victims(n)
 }
 
 // Stats snapshots the counters plus the tier's live shape.
