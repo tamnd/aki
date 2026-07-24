@@ -1425,6 +1425,24 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return AppendBulk(reply, []byte(enc))
 		}
 		return AppendError(reply, "ERR unknown subcommand or wrong number of arguments for 'OBJECT'")
+	case "RENAME", "RENAMENX":
+		if len(args) != 3 {
+			return arityErr(reply, cmd)
+		}
+		existed, done, err := s.s.Rename(ctx, args[1], args[2], cmd == "RENAMENX")
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		if !existed {
+			return AppendError(reply, "ERR no such key")
+		}
+		if cmd == "RENAMENX" {
+			if done {
+				return AppendInt(reply, 1)
+			}
+			return AppendInt(reply, 0)
+		}
+		return AppendSimple(reply, "OK")
 	case "DEL", "UNLINK":
 		// UNLINK is DEL here, doc 12: deferral is native, retirement
 		// already rides drain and compaction.

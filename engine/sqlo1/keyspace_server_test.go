@@ -144,3 +144,84 @@ func TestServerTypeTiers(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// TestServerRename pins the wire surface of RENAME and RENAMENX: the
+// no-such-key error, OK and the integer answers, the same-key edge,
+// cross-tier moves, TTL travel, and the arity doors.
+func TestServerRename(t *testing.T) {
+	s, do := scanServerRig(t)
+	ctx := context.Background()
+
+	if got := do("RENAME", "nosuch", "b"); got != "-ERR no such key\r\n" {
+		t.Fatalf("RENAME missing src = %q", got)
+	}
+	if got := do("RENAMENX", "nosuch", "b"); got != "-ERR no such key\r\n" {
+		t.Fatalf("RENAMENX missing src = %q", got)
+	}
+
+	if do("SET", "a", "v1") != "+OK\r\n" {
+		t.Fatal("SET")
+	}
+	if got := do("RENAME", "a", "b"); got != "+OK\r\n" {
+		t.Fatalf("RENAME = %q", got)
+	}
+	if got := do("GET", "b"); got != "$2\r\nv1\r\n" {
+		t.Fatalf("GET b = %q", got)
+	}
+	if got := do("EXISTS", "a"); got != ":0\r\n" {
+		t.Fatal("src survived")
+	}
+
+	// Same key both ways.
+	if got := do("RENAME", "b", "b"); got != "+OK\r\n" {
+		t.Fatalf("same-key RENAME = %q", got)
+	}
+	if got := do("RENAMENX", "b", "b"); got != ":0\r\n" {
+		t.Fatalf("same-key RENAMENX = %q", got)
+	}
+
+	// NX refusal and success.
+	if do("SET", "c", "v2") != "+OK\r\n" {
+		t.Fatal("SET")
+	}
+	if got := do("RENAMENX", "c", "b"); got != ":0\r\n" {
+		t.Fatalf("RENAMENX onto live dst = %q", got)
+	}
+	if got := do("RENAMENX", "c", "d"); got != ":1\r\n" {
+		t.Fatalf("RENAMENX onto free name = %q", got)
+	}
+
+	// A cold collection moves and keeps its type; the TTL travels.
+	if do("HSET", "coldh", "f", "v") != ":1\r\n" {
+		t.Fatal("HSET")
+	}
+	if do("EXPIRE", "coldh", "100") != ":1\r\n" {
+		t.Fatal("EXPIRE")
+	}
+	if err := s.t.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.t.EvictAllForTest()
+	if got := do("RENAME", "coldh", "warmh"); got != "+OK\r\n" {
+		t.Fatalf("RENAME cold collection = %q", got)
+	}
+	if got := do("TYPE", "warmh"); got != "+hash\r\n" {
+		t.Fatalf("TYPE after cold rename = %q", got)
+	}
+	if got := do("HGET", "warmh", "f"); got != "$1\r\nv\r\n" {
+		t.Fatalf("HGET after cold rename = %q", got)
+	}
+	if got := do("TTL", "warmh"); got != ":100\r\n" {
+		t.Fatalf("TTL after rename = %q", got)
+	}
+	if got := do("TYPE", "coldh"); got != "+none\r\n" {
+		t.Fatalf("src type after rename = %q", got)
+	}
+
+	if got := do("RENAME", "b"); got != "-ERR wrong number of arguments for 'rename' command\r\n" {
+		t.Fatal(got)
+	}
+	if got := do("RENAMENX", "b"); got != "-ERR wrong number of arguments for 'renamenx' command\r\n" {
+		t.Fatal(got)
+	}
+}
