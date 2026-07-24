@@ -54,11 +54,16 @@ const bpFlushPollMs = 50
 
 // bpLeasePollMs paces the lease half the same way and for the same reason: a
 // renewal rides a chain append, which takes milliseconds, so counting raw
-// retry passes would cross the window before a single append could land. 64
-// checks at this pace give the handoff-park cap doc 07 names, over three
-// seconds of genuine renewal silence, before a lease-parked write takes the
+// retry passes would cross the window before a single append could land.
+// The lease window has its own length because doc 02 section 4.3 names its
+// bound: bpLeaseStallWindow checks at this pace are the handoff-park cap,
+// 5000ms of genuine renewal silence before a lease-parked write takes the
 // CLUSTERDOWN reply; a renewal inside the window resets it.
 const bpLeasePollMs = 50
+
+// bpLeaseStallWindow is the doc 02 section 4.3 handoff-park cap in poll
+// units: 100 checks at bpLeasePollMs is the 5000ms default.
+const bpLeaseStallWindow = 100
 
 // bpFoldKickPollMs paces the fold pressure trigger (doc 06 section 1.4): while
 // resident writes are parked the worker kicks the folder to cut what it holds,
@@ -299,7 +304,7 @@ func (w *worker) stallCheckLease(lease bool) {
 	}
 	w.bpLeaseCheckMs = w.cx.NowMs
 	w.bpLeaseStall++
-	if w.bpLeaseStall >= bpStallWindow {
+	if w.bpLeaseStall >= bpLeaseStallWindow {
 		w.stallOutReason(ParkLease, "CLUSTERDOWN Hash slot not served")
 		w.bpLeaseStall = 0
 	}

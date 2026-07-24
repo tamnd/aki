@@ -267,8 +267,8 @@ func TestLeaseStallPacedAndReset(t *testing.T) {
 	}
 	passes := 0
 	for len(w.fullWaiters) > 0 {
-		if passes > bpStallWindow+4 {
-			t.Fatalf("still parked after %d backdated checks, window is %d", passes, bpStallWindow)
+		if passes > bpLeaseStallWindow+4 {
+			t.Fatalf("still parked after %d backdated checks, window is %d", passes, bpLeaseStallWindow)
 		}
 		w.bpLeaseCheckMs -= bpLeasePollMs + 1
 		w.retryFull()
