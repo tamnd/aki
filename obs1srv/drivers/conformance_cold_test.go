@@ -54,6 +54,7 @@ func spinDemote(t *testing.T, rc *conformance.Conn) {
 		doStep(t, rc, []string{"EXISTS", conformance.ColdSetKey})
 		doStep(t, rc, []string{"EXISTS", conformance.ColdZsetKey})
 		doStep(t, rc, []string{"EXISTS", conformance.ColdListKey})
+		doStep(t, rc, []string{"EXISTS", conformance.ColdStreamKey})
 	}
 }
 
@@ -91,7 +92,7 @@ func TestConformanceCold(t *testing.T) {
 	// The keys whose fold placement the pressure loop waits for: the two
 	// collections demote through their quantum triggers, the strings ride
 	// the migrator's staged drains.
-	want := []string{conformance.ColdHashKey, conformance.ColdSetKey, conformance.ColdZsetKey, conformance.ColdListKey}
+	want := []string{conformance.ColdHashKey, conformance.ColdSetKey, conformance.ColdZsetKey, conformance.ColdListKey, conformance.ColdStreamKey}
 	for i := 0; i < conformance.ColdStrings; i++ {
 		want = append(want, conformance.ColdStringKey(i))
 	}

@@ -51,6 +51,32 @@ func coldCollChunk(data []byte, off uint32) (store.FoldFrame, error) {
 	return outer, nil
 }
 
+// ColdChunkFrame parses the chunk frame at off inside a decoded block
+// and returns it whole, disc included. It is the run-plane entry for
+// payloads that are not packed pairs (the stream's wire-form blocks,
+// doc 08 section 7), where the reader needs the frame's own full disc
+// and decodes the payload with its own walker.
+func ColdChunkFrame(data []byte, off uint32) (store.FoldFrame, error) {
+	if int(off)+4 > len(data) {
+		return store.FoldFrame{}, fmt.Errorf("obs1: chunk offset %d past the block", off)
+	}
+	total := binary.LittleEndian.Uint32(data[off:])
+	if total < 4 || int(off)+int(total) > len(data) {
+		return store.FoldFrame{}, fmt.Errorf("obs1: chunk frame total %d runs past the block", total)
+	}
+	var outer store.FoldFrame
+	if err := store.WalkStagedFrames(data[off:off+total], func(f store.FoldFrame) error {
+		outer = f
+		return nil
+	}); err != nil {
+		return store.FoldFrame{}, err
+	}
+	if !outer.Chunk {
+		return store.FoldFrame{}, fmt.Errorf("obs1: run read points at a non-chunk frame (kind 0x%02x)", outer.Kind)
+	}
+	return outer, nil
+}
+
 // ExtractColdField finds field inside the collection chunk at off,
 // applying the lazy expiry rule at nowMs. A missing field is Found
 // false with a nil error: the planner floored to this chunk by

@@ -142,7 +142,14 @@ func (s *stream) demote(st *store.Store, key []byte) int {
 			continue // already cold from an earlier quantum, or an empty handle
 		}
 		disc := discID(b.first)
-		off, ok := st.AppendChunk(kindStream, 0, uint16(b.count), key, disc[:], b.blob)
+		// The fold seam (spec 2064/obs1 doc 08 section 7): the blob is already
+		// the dense immutable ID-range run the fold plane wants, so the demote
+		// append doubles as the fold emission with no repack. The 16-byte
+		// (ms, seq) disc leads with the ms word, which is exactly what the
+		// directory's disc64 lift takes as the run coordinate; count carries
+		// every packed frame, tombstones included, since the walker needs the
+		// frame count and skips the dead ones itself.
+		off, ok := st.AppendChunkFold(kindStream, 0, uint16(b.count), key, disc[:], b.blob)
 		if !ok {
 			return 0 // broken region: abandon, every block stays resident
 		}
