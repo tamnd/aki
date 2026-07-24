@@ -63,6 +63,35 @@ var Hot = []Step{
 	c("1", "DEL", "ma"),
 	c("1", "UNLINK", "mb"),
 
+	// Key-level TTL family. Deadlines are absolute far-future stamps so
+	// every read is exact; the relative forms only answer their set
+	// verdicts or the -1/-2 sentinels, never a counting-down remainder.
+	c("0", "EXPIRE", "noexp", "100"),
+	c("0", "PEXPIRE", "noexp", "100000"),
+	c("-2", "TTL", "noexp"),
+	c("-2", "PTTL", "noexp"),
+	c("-2", "EXPIRETIME", "noexp"),
+	c("-2", "PEXPIRETIME", "noexp"),
+	c("0", "PERSIST", "noexp"),
+	c("OK", "SET", "exp", "v"),
+	c("-1", "TTL", "exp"),
+	c("-1", "PTTL", "exp"),
+	c("1", "EXPIRE", "exp", "100"),
+	c("1", "PEXPIRE", "exp", "100000"),
+	c("1", "EXPIREAT", "exp", "33177600000"),
+	c("33177600000", "EXPIRETIME", "exp"),
+	c("33177600000000", "PEXPIRETIME", "exp"),
+	c("0", "EXPIREAT", "exp", "33177600001", "NX"),
+	c("0", "EXPIREAT", "exp", "33177600000", "GT"),
+	c("1", "EXPIREAT", "exp", "33177600001", "GT"),
+	c("1", "PEXPIREAT", "exp", "33177600000000", "LT"),
+	c("1", "PERSIST", "exp"),
+	c("0", "PERSIST", "exp"),
+	c("-1", "TTL", "exp"),
+	c("1", "PEXPIREAT", "exp", "1"),
+	c("0", "EXISTS", "exp"),
+	c("-2", "TTL", "exp"),
+
 	// Bits.
 	c("0", "SETBIT", "bits", "7", "1"),
 	c("1", "GETBIT", "bits", "7"),
@@ -138,6 +167,10 @@ var Hot = []Step{
 	c("three", "BLMOVE", "bl", "bl2", "LEFT", "RIGHT", "0"),
 	c("three", "BRPOPLPUSH", "bl2", "bl3", "0"),
 	c("[bl3 [three]]", "BLMPOP", "0", "2", "nolist", "bl3", "LEFT"),
+	// The same empty-key-first pair through BLPOP's cross-shard
+	// immediate serve, so its pop framing is under the restart arm too.
+	c("1", "RPUSH", "bl3", "four"),
+	c("[bl3 four]", "BLPOP", "nolist", "bl3", "0"),
 
 	// Set, with single-member sets where the reply order would
 	// otherwise be theirs to choose.
