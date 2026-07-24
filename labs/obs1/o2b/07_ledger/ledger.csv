@@ -1,0 +1,12 @@
+# folded after 22 pressure rounds; prep walks billed 3 GETs (disclosed)
+cell,ops,gets,gets_per_op,kib_per_op,found_pct
+zscore,2000,2000,1.0000,120.4,100.0
+zscore_miss,100,100,1.0000,120.4,100.0
+zrank_boundary,2000,2000,1.0000,120.4,100.0
+zrangebyscore,20,20,1.0000,120.4,100.0
+lindex,2000,2000,1.0000,48.8,100.0
+xrange_window,20,20,1.0000,55.1,100.0
+share_zset_dual,8,3616,0.0708,,
+share_list,24,3072,0.2500,,
+share_stream,24,3072,0.2500,,
+# cold stats: {Fetches:2100 BlockGETs:2100 Attached:0 Unresolved:0 Misses:100 Errs:0}

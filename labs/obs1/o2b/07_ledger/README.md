@@ -42,8 +42,32 @@ The bands above are the table's own values, not tuned to that smoke; the scored 
 
 ## Results
 
-Pending the scored run.
+One scored run, full size, folded after 22 pressure rounds, prep walks billed 3 GETs (ledger.csv):
+
+| cell | ops | GETs | GETs/op | correct |
+|---|---|---|---|---|
+| zscore | 2000 | 2000 | 1.0000 | 100% |
+| zscore_miss | 100 | 100 | 1.0000 | 100% definitive |
+| zrank_boundary | 2000 | 2000 | 1.0000 | 100% |
+| zrangebyscore | 20 | 20 | 1.0000 | 100% |
+| lindex | 2000 | 2000 | 1.0000 | 100% |
+| xrange_window | 20 | 20 | 1.0000 | 100% |
+
+Resident shares over the folded projections: zset dual 0.0708 B per element (8 chunks over 3616 folded members), list 0.2500 (24 over 3072), stream 0.2500 (24 over 3072).
+Cold reader: 2100 fetches, 2100 block GETs, 100 misses (the miss cell), 0 unresolved, 0 errors.
+
+Band scoring:
+
+1. HIT: zscore at exactly 1.0000 GETs per op, all 2000 scores bit-exact against the build arithmetic.
+2. HIT: zrank boundary at exactly 1.0000 GETs per op, all 2000 plan-relative ranks exact, inside the table's 0-to-1 row.
+3. HIT: zrangebyscore at exactly 1.0000 GETs per span, under the 1-plus-ceil bound, every span exactly its elements; one disclosure, the spans came out near 90 elements rather than the filed ~500 because only 3616 members folded under this run's demotion pattern, which changes neither the bound nor the expected value since both are span-size-independent below 16 MiB.
+4. HIT: lindex at exactly 1.0000 GETs per op, all 2000 values byte-exact against the built list.
+5. HIT: xrange at exactly 1.0000 GETs per window, under the 1.5 band, every window exactly its 100 arithmetic IDs and values; no window happened to cross a block boundary.
+6. HIT: member misses at exactly 1.0000 GETs per op, all 100 strangers definitively absent.
+7. HIT: shares 0.0708, 0.2500, and 0.2500 against the table's 0.6, 0.3, and 0.3.
 
 ## Verdict
 
-Pending the scored run.
+HIT on all seven bands, the kill line untouched.
+The doc 08 section 9 rows for zset, list, and stream describe the landed engine: every point cell bills exactly one block GET with exact answers, spans and windows plan to the coalesced minimum, member misses are definitive at one block, and the resident surcharge sits at a quarter to a tenth of the table's allowance.
+With the O2a lab's string, hash, and set cells, every row of the per-type ledger that claims a number is now measured on the landed plane.
