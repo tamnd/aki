@@ -67,6 +67,10 @@ type Server struct {
 	// ttlBuf holds one HEXPIRE-family command's per-field codes.
 	ttlBuf []int64
 
+	// probeHits holds one EXISTS/TOUCH/DEL command's per-key existence
+	// answers from ProbeBatch.
+	probeHits []bool
+
 	// zscores holds one ZADD command's parsed scores: all of them
 	// parse before any write, so a bad float later in the list cannot
 	// leave a half-applied command.
@@ -1329,32 +1333,30 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		if len(args) != 2 {
 			return arityErr(reply, cmd)
 		}
-		v, root, _, ok, err := s.t.LookupEntry(ctx, args[1])
+		tag, ok, err := s.t.TypeTag(ctx, args[1])
 		if err != nil {
 			return storeErr(reply, err)
 		}
 		if !ok {
 			return AppendSimple(reply, "none")
 		}
-		if root {
-			tag, _, err := sniffRoot(v)
-			if err != nil {
-				return storeErr(reply, err)
-			}
-			switch tag {
-			case TagHash:
-				return AppendSimple(reply, "hash")
-			case TagSet:
-				return AppendSimple(reply, "set")
-			case TagZset:
-				return AppendSimple(reply, "zset")
-			case TagList:
-				return AppendSimple(reply, "list")
-			case TagStream:
-				return AppendSimple(reply, "stream")
+		return AppendSimple(reply, typeName(tag))
+	case "EXISTS", "TOUCH":
+		if len(args) < 2 {
+			return arityErr(reply, cmd)
+		}
+		hits, err := s.t.ProbeBatch(ctx, args[1:], cmd == "TOUCH", s.probeHits)
+		s.probeHits = hits
+		if err != nil {
+			return storeErr(reply, err)
+		}
+		n := int64(0)
+		for _, hit := range hits {
+			if hit {
+				n++
 			}
 		}
-		return AppendSimple(reply, "string")
+		return AppendInt(reply, n)
 	case "OBJECT":
 		if len(args) == 3 && strings.EqualFold(string(args[1]), "ENCODING") {
 			v, root, _, ok, err := s.t.LookupEntry(ctx, args[2])
@@ -1423,12 +1425,25 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 			return AppendBulk(reply, []byte(enc))
 		}
 		return AppendError(reply, "ERR unknown subcommand or wrong number of arguments for 'OBJECT'")
-	case "DEL":
+	case "DEL", "UNLINK":
+		// UNLINK is DEL here, doc 12: deferral is native, retirement
+		// already rides drain and compaction.
 		if len(args) < 2 {
 			return arityErr(reply, cmd)
 		}
+		// One batched probe prefilters the misses so a variadic DEL
+		// pays a single cold BatchGet instead of one lookup per absent
+		// key; hits still go through Del for the retire semantics.
+		hits, err := s.t.ProbeBatch(ctx, args[1:], false, s.probeHits)
+		s.probeHits = hits
+		if err != nil {
+			return storeErr(reply, err)
+		}
 		n := int64(0)
-		for _, k := range args[1:] {
+		for i, k := range args[1:] {
+			if !hits[i] {
+				continue
+			}
 			dead, err := s.s.Del(ctx, k)
 			if err != nil {
 				return storeErr(reply, err)
