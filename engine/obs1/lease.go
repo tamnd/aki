@@ -280,6 +280,16 @@ func (f *LeaseFold) Holder(group uint16) (node uint64, epoch uint32, ok bool) {
 	return g.node, g.epoch, true
 }
 
+// NextEpoch is the epoch a fresh grant for the group must carry: current
+// plus one whether the group is held or released, since a release keeps
+// the epoch, and 1 for a group the chain never granted.
+func (f *LeaseFold) NextEpoch(group uint16) uint32 {
+	if g := f.groups[group]; g != nil {
+		return g.epoch + 1
+	}
+	return 1
+}
+
 // LastRenewal is the chain position of the group's last grant, release,
 // commit, or heartbeat by its holder. This is the chain-observed renewal
 // doc 02 section 3.2 case (b) reasons about; turning it into a staleness
