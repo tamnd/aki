@@ -2,7 +2,9 @@ package stream
 
 import (
 	"encoding/binary"
+	"sort"
 
+	"github.com/tamnd/aki/engine/obs1"
 	"github.com/tamnd/aki/engine/obs1/store"
 	"github.com/tamnd/aki/engine/obs1/tier"
 )
@@ -30,6 +32,15 @@ import (
 // (store.AppendChunk sets the recovery bit itself). An M8 recovery walk reads it to
 // dispatch a cold stream block back into the stream registry at its firstID.
 const kindStream byte = 0x05
+
+// kindStreamPel is the pending-entries projection's kind byte (spec
+// 2064/obs1 doc 08 section 7): a group's PEL folds as its own chunk kind
+// under the stream's collection key, so XPENDING and XAUTOCLAIM can plan
+// PEL chunks like any range without touching the entry runs. The disc is
+// 24 bytes, the group's tag (obs1.Disc of the name) then the covered
+// block's 16-byte first ID, so the disc64 lift groups a plan by group
+// tag and the emission order keeps each group's chunks in ID order.
+const kindStreamPel byte = 0x07
 
 const (
 	// demoteTailMargin is how many of the newest blocks the demote pass keeps
@@ -172,7 +183,70 @@ func (s *stream) demote(st *store.Store, key []byte) int {
 		b.blob = nil
 		b.coldOff = r.off
 	}
+
+	// The PEL projection (doc 08 section 7): each shed block also folds the
+	// pending entries its ID range covers, per group, as a kindStreamPel
+	// chunk under the stream key. The local PEL stays fully resident (it is
+	// small relative to the stream and hot while used), so this is a
+	// fold-plane projection only, the list demote's pattern: acks and claims
+	// that land after the fold are overlay deltas the reader merges. One
+	// chunk per (group, block) keeps the disc stable, so a promote-and-
+	// redemote cycle replaces its chunk rather than stacking stale copies.
+	if len(s.groups) > 0 {
+		names := make([]string, 0, len(s.groups))
+		for name, grp := range s.groups {
+			if grp.pel != nil && grp.pelCount > 0 {
+				names = append(names, name)
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			grp := s.groups[name]
+			tag := obs1.Disc([]byte(name))
+			for _, r := range runs {
+				b := s.blocks[r.i]
+				emitPelChunk(st, key, tag, grp, b.first, b.last)
+			}
+		}
+	}
 	return len(runs)
+}
+
+// emitPelChunk folds the group's pending entries inside [first, last]
+// through the fold tap as one kindStreamPel chunk. Each packed pair is
+// the entry's 16-byte big-endian ID as the field and the delivery facts
+// as the value: 8-byte big-endian last delivery ms, 2-byte big-endian
+// delivery count, then the owning consumer's name (empty during a FORCE
+// claim's ownerless moment). A range with nothing pending emits nothing.
+func emitPelChunk(st *store.Store, key []byte, tag uint64, grp *streamGroup, first, last streamID) {
+	var pk store.ChunkPacker
+	var idb [16]byte
+	grp.pel.walkFrom(first, func(e *pelEntry) bool {
+		if e.id.cmp(last) > 0 {
+			return false
+		}
+		binary.BigEndian.PutUint64(idb[0:], e.id.ms)
+		binary.BigEndian.PutUint64(idb[8:], e.id.seq)
+		val := make([]byte, 10, 26)
+		binary.BigEndian.PutUint64(val[0:], uint64(e.deliveryTime))
+		binary.BigEndian.PutUint16(val[8:], e.deliveryCount)
+		if e.consumerOrd != noOwner {
+			if c := grp.consumerByOrd[e.consumerOrd]; c != nil {
+				val = append(val, c.name...)
+			}
+		}
+		pk.Add(idb[:], val, 0)
+		return true
+	})
+	if pk.Count() == 0 {
+		return
+	}
+	payload, flags := pk.Finish()
+	var disc [24]byte
+	binary.BigEndian.PutUint64(disc[0:], tag)
+	binary.BigEndian.PutUint64(disc[8:], first.ms)
+	binary.BigEndian.PutUint64(disc[16:], first.seq)
+	st.EmitFoldChunk(kindStreamPel, flags, uint16(pk.Count()), key, disc[:], payload)
 }
 
 // promote brings the cold block at log index i back resident: it preads the packed
@@ -219,9 +293,17 @@ func (s *stream) promoteIfCold(i int) {
 // becomes an orphan the compactor reclaims (section 6.6, the dead-space rule), so this
 // preads nothing: the block keeps its firstID header resident, enough to find and drop
 // the descriptor. A resident block holds no descriptor and is a no-op.
-func (s *stream) forgetCold(b *block) {
+//
+// The fold plane hears the drop as a zero-count chunk under the block's own disc
+// (doc 08 section 7, the whole-chunk manifest drop): the folder replaces the ID-range
+// run by its (kind, key, disc) identity, so the newest segment's manifest records the
+// trimmed range as empty and a planner skips it without a GET, which is what makes
+// MAXLEN retention on a cold stream nearly free.
+func (s *stream) forgetCold(key []byte, b *block) {
 	if !b.cold() {
 		return
 	}
 	s.cold.dropDescriptor(b.first, b.coldOff)
+	disc := discID(b.first)
+	s.cold.st.EmitFoldChunk(kindStream, 0, 0, key, disc[:], nil)
 }

@@ -90,7 +90,7 @@ func ReplayXTrim(cx *shard.Ctx, key []byte, count uint64) error {
 	if count == 0 || count > s.length {
 		return fmt.Errorf("stream replay: xtrim of %d from stream %q of %d live entries", count, key, s.length)
 	}
-	removed := s.trim(trimSpec{kind: trimMaxlen, maxlen: s.length - count})
+	removed := s.trim(key, trimSpec{kind: trimMaxlen, maxlen: s.length - count})
 	if uint64(removed) != count {
 		return fmt.Errorf("stream replay: xtrim on %q removed %d of the %d framed", key, removed, count)
 	}

@@ -71,7 +71,7 @@ func TestExactTrimPromotesColdBoundary(t *testing.T) {
 
 	// MINID 300 drops the two whole front blocks (ms 1..256), then tombstones ms 257..299
 	// in the third block, which is cold, so the boundary path promotes it.
-	removed := s.trim(trimSpec{kind: trimMinid, minid: streamID{ms: 300}})
+	removed := s.trim([]byte("k"), trimSpec{kind: trimMinid, minid: streamID{ms: 300}})
 	g.note(s)
 
 	const dropped = 256 // two full front blocks
@@ -111,7 +111,7 @@ func TestApproxTrimDropsColdFrontByHandle(t *testing.T) {
 
 	// Approximate MINID 300 drops the two whole front blocks (ms 1..256) and stops; the
 	// boundary block (ms 257..384) keeps its ms 257..299 overshoot and stays cold.
-	removed := s.trim(trimSpec{kind: trimMinid, approx: true, minid: streamID{ms: 300}})
+	removed := s.trim([]byte("k"), trimSpec{kind: trimMinid, approx: true, minid: streamID{ms: 300}})
 	g.note(s)
 
 	const dropped = 256
