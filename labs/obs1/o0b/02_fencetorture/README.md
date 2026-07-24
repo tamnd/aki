@@ -45,6 +45,13 @@ fencetorture-fleet.csv, all arms:
 
 | store | schedules | steps | nodes | groups | faults | grants ok/rej | sections live/dead | crashes | violations |
 |-------|-----------|-------|-------|--------|--------|---------------|--------------------|---------|------------|
+| sim | 20 | 300 | 16 | 32 | 0% | 1093/414 | 30/370 | 40 | 0 |
+| sim | 20 | 300 | 16 | 32 | 15% | 1098/412 | 31/384 | 40 | 0 |
+| sim | 20 | 300 | 16 | 32 | 40% | 1107/424 | 24/368 | 40 | 0 |
+| minio | 3 | 200 | 16 | 32 | real races | 119/62 | 3/45 | 6 | 0 |
+
+Zero violations on every arm, and the teeth sharpen with scale exactly as the argument predicts: at 16 nodes and 32 groups over 92 percent of committed sections die at the fence, against roughly three quarters at 8 nodes, because more nodes acting on stale beliefs means more zombies for the fold to kill identically everywhere.
+The expectation held as filed and the lab code is unchanged from the O0b run.
 
 ## Verdict
 
