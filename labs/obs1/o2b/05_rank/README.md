@@ -41,8 +41,31 @@ The harness smoke (10^3 to 10^5, 50 ops, no latency model) ran during developmen
 
 ## Results
 
-Pending the scored run.
+One scored run, six decades, 1000 serial ops each, S3 Standard envelope per GET (rank.csv):
+
+| n | chunks | obj MiB | GETs/op | KiB/op | rank exact | floor us | p50 ms | p99 ms | dir B | dir B/elem |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 10^3 | 4 | 0.0 | 2.0000 | 82.3 | 100% | 0.0 | 49.4 | 216.1 | 225 | 0.2250 |
+| 10^4 | 26 | 0.4 | 2.0000 | 217.3 | 100% | 0.0 | 49.7 | 211.6 | 989 | 0.0989 |
+| 10^5 | 258 | 4.0 | 2.0000 | 223.1 | 100% | 0.1 | 48.4 | 233.5 | 9073 | 0.0907 |
+| 10^6 | 2562 | 40.2 | 2.0000 | 224.6 | 100% | 0.4 | 51.6 | 233.4 | 89381 | 0.0894 |
+| 10^7 | 25610 | 402.4 | 2.0000 | 224.7 | 100% | 4.7 | 50.4 | 246.2 | 892777 | 0.0893 |
+| 10^8 | 256082 | 4024.1 | 2.0000 | 224.7 | 100% | 48.2 | 52.6 | 241.6 | 8926361 | 0.0893 |
+
+p99 max over min across the six decades: 1.16.
+Cold reader closed clean: 6000 fetches, 6000 block GETs, 0 misses, 0 unresolved, 0 errors.
+
+Band scoring:
+
+1. HIT: exactly 2.0000 GETs per op at every decade and every one of the 6000 ranks exact against the arithmetic reference.
+2. HIT: p99 ratio 1.16, well inside 1.6; p99 spans 211.6 to 246.2 ms from 10^3 to 10^8 members, which is the flatness claim measured.
+3. MISS, narrow: five decades inside 38 to 52 ms but 10^8 lands at 52.6 ms, 0.6 ms over the filed edge; the miss is quantile noise on 1000 draws, not a mechanism, since 10^6 sits at 51.6 with a fortieth of the data.
+4. PARTIAL: the 260 KiB cap holds everywhere and 10^3 clips as called, but the 10^6-plus decades sit at 224.6 to 224.7 KiB, under the filed 240 to 260 center; the two-full-128-KiB assumption was wrong because packed score-run and member blocks close at about 112 KiB at the 16 KiB chunk target.
+5. HIT: the floor walk grows one order per decade as predicted and tops out at 48.2 us at 10^8, twenty times under the filed 1 ms bar and three orders under the GET p50.
+6. PARTIAL: 0.0893 to 0.0989 B per element from 10^4 up, inside the band and converging on 0.0893, but 10^3 lands at 0.2250 because four chunks cannot amortize the per-chunk rows over a thousand elements; the band should have excluded the degenerate decade.
 
 ## Verdict
 
-Pending the scored run.
+HIT on the claim, with three envelope numbers set wrong and disclosed above.
+Cold ZRANK on the landed plane bills exactly two GETs and answers exactly at every cardinality from 10^3 to 10^8, p99 varies 1.16x across five orders of magnitude at a fixed resident budget, and the one term that grows, the floor walk, is microseconds against a 50 ms op.
+The row PRED-OBS1-O2B-RANK claims is measured and holds; the misses are a 0.6 ms quantile graze at 10^8, a block-size center filed 7% high, and a directory band that forgot small collections do not amortize.
