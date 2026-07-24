@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate fixtures.txt: the compat sections, every STRING, BITMAP,
-HLL, HASH, SET, ZSET, GEO, and LIST manifest row from spec doc 12
-exercised against a real redis-server and recorded reply by reply. The Go test replays the
+HLL, HASH, SET, ZSET, GEO, LIST, STREAM, and EXPIRY manifest row from
+spec doc 12 exercised against a real redis-server and recorded reply by reply. The Go test replays the
 file through the sqlo1 dispatch path, so each fixture line is one
 diffed manifest row: same args, same wire reply, error texts included.
 
@@ -1611,6 +1611,158 @@ def main():
     c("XAUTOCLAIM", "x:str", "g", "c", "0", "0")
     c("XINFO", "GROUPS", "x:str")
     c("XREAD", "STREAMS", "x:str", "0")
+
+    # ---------------------------------------------------------------
+    section("EXPIRY")
+
+    # The replay server runs on a frozen clock (epoch second 1000), so
+    # absolute stamps here are either tiny, past on both sides, or far
+    # future for both: above the 2026 wall clock and below sqlo1's
+    # 42-bit header horizon in May 2109 (see the README divergence).
+    # Relative rows only read back through whole-second TTL, which is
+    # stable within the second on the live server and exact on the
+    # frozen one.
+
+    # The whole read family: missing key, then a fresh persistent key.
+    c("TTL", "e:missing")
+    c("PTTL", "e:missing")
+    c("EXPIRETIME", "e:missing")
+    c("PEXPIRETIME", "e:missing")
+    c("PERSIST", "e:missing")
+    c("SET", "e:k", "v")
+    c("TTL", "e:k")
+    c("PTTL", "e:k")
+    c("EXPIRETIME", "e:k")
+    c("PEXPIRETIME", "e:k")
+
+    # The set family answers 0 on a missing key without minting it.
+    c("EXPIRE", "e:nokey", "100")
+    c("PEXPIRE", "e:nokey", "100000")
+    c("EXPIREAT", "e:nokey", "4000000000")
+    c("PEXPIREAT", "e:nokey", "4000000000000")
+    c("GET", "e:nokey")
+
+    # Relative sets read back through TTL in the same second, and the
+    # fractional row pins the round-to-nearest reply: 200ms of extra
+    # life does not reach the next second.
+    c("EXPIRE", "e:k", "100")
+    c("TTL", "e:k")
+    c("PEXPIRE", "e:k", "200000")
+    c("TTL", "e:k")
+    c("PEXPIRE", "e:k", "100200")
+    c("TTL", "e:k")
+
+    # Absolute stamps read back exactly, seconds truncating from ms.
+    c("EXPIREAT", "e:k", "4000000000")
+    c("EXPIRETIME", "e:k")
+    c("PEXPIRETIME", "e:k")
+    c("PEXPIREAT", "e:k", "4000000000500")
+    c("PEXPIRETIME", "e:k")
+    c("EXPIRETIME", "e:k")
+
+    # The condition table over absolute stamps: a persistent key reads
+    # as infinite, so XX and GT refuse it and LT and NX take it.
+    c("SET", "e:c", "v")
+    c("EXPIREAT", "e:c", "4000000000", "XX")
+    c("EXPIREAT", "e:c", "4000000000", "GT")
+    c("EXPIREAT", "e:c", "4000000000", "LT")
+    c("EXPIRETIME", "e:c")
+    c("EXPIREAT", "e:c", "3000000000", "NX")
+    c("EXPIREAT", "e:c", "3000000000", "GT")
+    c("EXPIRETIME", "e:c")
+    c("EXPIREAT", "e:c", "3000000000", "LT")
+    c("EXPIRETIME", "e:c")
+    c("EXPIREAT", "e:c", "3500000000", "GT")
+    c("EXPIRETIME", "e:c")
+    c("EXPIREAT", "e:c", "3500000000", "GT")
+    c("EXPIREAT", "e:c", "3500000000", "LT")
+    c("EXPIREAT", "e:c", "3600000000", "XX")
+    c("EXPIRETIME", "e:c")
+    c("PERSIST", "e:c")
+    c("EXPIREAT", "e:c", "3800000000", "NX")
+    c("EXPIRETIME", "e:c")
+    # A repeated flag is the same gate twice, not a syntax error, and
+    # the ms form gates against the same stamp cross-unit.
+    c("EXPIREAT", "e:c", "3900000000", "GT", "GT")
+    c("EXPIRETIME", "e:c")
+    c("PEXPIREAT", "e:c", "3900000000500", "GT")
+    c("PEXPIRETIME", "e:c")
+    c("EXPIRETIME", "e:c")
+    # A relative EXPIRE under an XX GT pair loses to the far stamp.
+    c("EXPIRE", "e:c", "100", "XX", "GT")
+    c("PEXPIRETIME", "e:c")
+
+    # The flag doors.
+    c("EXPIRE", "e:c", "100", "NX", "XX")
+    c("EXPIRE", "e:c", "100", "NX", "GT")
+    c("EXPIRE", "e:c", "100", "NX", "LT")
+    c("EXPIRE", "e:c", "100", "GT", "LT")
+    c("EXPIRE", "e:c", "100", "LT", "GT")
+    c("EXPIRE", "e:c", "100", "BOGUS")
+    c("EXPIRE", "e:c", "notanum")
+    c("EXPIRE", "e:c")
+    c("EXPIRE")
+    c("TTL")
+    c("TTL", "e:c", "extra")
+    c("PERSIST")
+    c("EXPIRETIME")
+
+    # The overflow doors: not-an-integer past int64, and invalid
+    # expire when the unit multiply or the now-add overflows.
+    c("EXPIRE", "e:c", "99999999999999999999")
+    c("EXPIRE", "e:c", "9999999999999999")
+    c("PEXPIRE", "e:c", "9223372036854775807")
+    c("EXPIREAT", "e:c", "9223372036854775807")
+    c("PEXPIREAT", "e:c", "-9223372036854775808")
+
+    # A past deadline deletes and answers 1, in every unit shape.
+    c("SET", "e:d1", "v")
+    c("EXPIREAT", "e:d1", "1")
+    c("GET", "e:d1")
+    c("TTL", "e:d1")
+    c("SET", "e:d2", "v")
+    c("PEXPIRE", "e:d2", "-1")
+    c("GET", "e:d2")
+    c("SET", "e:d3", "v")
+    c("EXPIRE", "e:d3", "0")
+    c("GET", "e:d3")
+    c("SET", "e:d4", "v")
+    c("PEXPIREAT", "e:d4", "1")
+    c("GET", "e:d4")
+    # The gates run before the delete, so a refused past deadline
+    # leaves the key alone and LT still fires on a persistent key.
+    c("SET", "e:d5", "v")
+    c("EXPIRE", "e:d5", "-5", "XX")
+    c("GET", "e:d5")
+    c("EXPIRE", "e:d5", "-5", "GT")
+    c("GET", "e:d5")
+    c("EXPIRE", "e:d5", "-5", "LT")
+    c("GET", "e:d5")
+
+    # PERSIST walks 0 without TTL, 1 dropping one, 0 again.
+    c("SET", "e:p", "v")
+    c("PERSIST", "e:p")
+    c("EXPIRE", "e:p", "100")
+    c("TTL", "e:p")
+    c("PERSIST", "e:p")
+    c("TTL", "e:p")
+    c("PERSIST", "e:p")
+
+    # Expiry is type-blind: collections take the same surface.
+    c("RPUSH", "e:l", "a")
+    c("EXPIRE", "e:l", "100")
+    c("TTL", "e:l")
+    c("HSET", "e:h", "f", "v")
+    c("PEXPIREAT", "e:h", "4000000000000")
+    c("PEXPIRETIME", "e:h")
+    c("PERSIST", "e:h")
+    c("PEXPIRETIME", "e:h")
+
+    # DBSIZE over the whole fixture keyspace: the count only matches
+    # if every key-death row above agreed, so this is the cross-check
+    # that both sides ended the run with the same keys.
+    c("DBSIZE")
+    c("DBSIZE", "extra")
 
     print("\n".join(lines))
 

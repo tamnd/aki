@@ -1452,8 +1452,9 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		case cmd == "PTTL":
 			return AppendInt(reply, expMs-now)
 		default:
-			// Round up, so a key with 1ms left still reports 1.
-			return AppendInt(reply, (expMs-now+999)/1000)
+			// Redis rounds to the nearest second (expire.c), so a key
+			// with 400ms left reports 0 while it still exists.
+			return AppendInt(reply, (expMs-now+500)/1000)
 		}
 	case "EXPIRETIME", "PEXPIRETIME":
 		if len(args) != 2 {
@@ -1471,7 +1472,9 @@ func (s *Server) dispatch(reply []byte, args [][]byte) []byte {
 		case cmd == "PEXPIRETIME":
 			return AppendInt(reply, expMs)
 		default:
-			return AppendInt(reply, expMs/1000)
+			// Redis rounds the ms stamp to the nearest second here
+			// too, so a stamp at x.5s reads back as x+1.
+			return AppendInt(reply, (expMs+500)/1000)
 		}
 	case "PERSIST":
 		if len(args) != 2 {
