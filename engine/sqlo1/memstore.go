@@ -18,6 +18,17 @@ type MemStore struct {
 	gens      map[uint64]uint32
 	highWater int64
 	mintMark  uint64
+	// keyRecs counts recs entries that name addressable keys (gen 0,
+	// not a fence): the StoreStats.KeyEntries feed, mirroring the
+	// key-class counter the real backend keeps.
+	keyRecs int64
+}
+
+// keyClassRec reports whether a seam record names an addressable key.
+// Segments and fences carry their plane's generation, roots and plain
+// values cross the seam with gen 0.
+func keyClassRec(rec *Record) bool {
+	return rec.Gen == 0 && !rec.Fence
 }
 
 var _ Minter = (*MemStore)(nil)
@@ -80,6 +91,9 @@ func (s *MemStore) ApplyBatch(ctx context.Context, b *DrainBatch) error {
 	}
 	for _, op := range b.Ops {
 		if op.Del {
+			if old, ok := s.recs[string(op.Rec.Key)]; ok && keyClassRec(&old) {
+				s.keyRecs--
+			}
 			delete(s.recs, string(op.Rec.Key))
 			continue
 		}
@@ -89,6 +103,12 @@ func (s *MemStore) ApplyBatch(ctx context.Context, b *DrainBatch) error {
 		rec := op.Rec
 		rec.Key = append([]byte(nil), op.Rec.Key...)
 		rec.Value = append([]byte(nil), op.Rec.Value...)
+		if old, ok := s.recs[string(rec.Key)]; ok && keyClassRec(&old) {
+			s.keyRecs--
+		}
+		if keyClassRec(&rec) {
+			s.keyRecs++
+		}
 		s.recs[string(rec.Key)] = rec
 	}
 	for _, bp := range b.Bumps {
@@ -154,5 +174,5 @@ func (s *MemStore) MintLease(ctx context.Context, n uint64) (uint64, error) {
 func (s *MemStore) Stats() StoreStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return StoreStats{Keys: int64(len(s.recs)), HighWater: s.highWater}
+	return StoreStats{Keys: int64(len(s.recs)), KeyEntries: s.keyRecs, HighWater: s.highWater}
 }

@@ -31,6 +31,7 @@ import (
 type Roots struct {
 	Dir, Allocmap, Dict, Stats FullPtr
 	RecordCount, GarbageBytes  uint64
+	KeyRecordCount             uint64
 	HighWater                  int64
 }
 
@@ -121,6 +122,7 @@ func (c *Checkpointer) Run(cur *Superblock, src CheckpointSource) (*Superblock, 
 	next.DictRoot = roots.Dict
 	next.StatsRoot = roots.Stats
 	next.RecordCount = roots.RecordCount
+	next.KeyRecordCount = roots.KeyRecordCount
 	next.GarbageBytes = roots.GarbageBytes
 	next.HighWater = roots.HighWater
 	if err := CommitSuperblock(c.File, &next); err != nil {

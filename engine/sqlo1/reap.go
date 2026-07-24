@@ -117,11 +117,11 @@ func (s *Str) ReapStep(ctx context.Context) (int, error) {
 // an optimization and a refused slot just means the key waits for a
 // later lap.
 func (t *Tiered) reapTombstone(ctx context.Context, key []byte) (bool, error) {
-	if t.ht.delCold(key) {
+	if t.ht.delCold(key, true) {
 		return true, nil
 	}
 	if err := t.makeRoomFor(ctx, len(key)); err != nil {
 		return false, err
 	}
-	return t.ht.delCold(key), nil
+	return t.ht.delCold(key, true), nil
 }

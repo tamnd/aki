@@ -218,6 +218,12 @@ func (s *Store) compactRecord(rec *Record, raw []byte, pos Pos, cs *CompactStats
 		}
 		cs.Expired++
 		cs.ExpiredBytes += len(raw)
+		if keyRType(rec.RType) {
+			// A key died by expiry here, not through a reaper
+			// tombstone, so the INFO expired counter learns it from
+			// the store side (doc 11 section 4).
+			s.expiredKeyDrops++
+		}
 		return nil
 	}
 	if rec.RType == RecSeg || rec.RType == RecFence {
@@ -276,7 +282,7 @@ func (s *Store) dropEntry(key []byte) error {
 	if err != nil {
 		return err
 	}
-	ci, ei, _, _, found, err := s.findInChain(chain, Fingerprint(h), key)
+	ci, ei, old, _, found, err := s.findInChain(chain, Fingerprint(h), key)
 	if err != nil {
 		return err
 	}
@@ -287,6 +293,9 @@ func (s *Store) dropEntry(key []byte) error {
 		return err
 	}
 	s.entries--
+	if keyRType(old.RType) {
+		s.keyEntries--
+	}
 	return nil
 }
 

@@ -89,6 +89,17 @@ type StoreStats struct {
 	Keys      int64 // live records
 	DiskBytes int64 // bytes on disk, 0 if the backend has no file yet
 	HighWater int64 // last applied DrainBatch.Seq
+	// KeyEntries counts the records that name addressable keys (plain
+	// values and collection roots), the doc 11 section 4 DBSIZE feed.
+	// Plane and meta records are excluded; expired-but-unreaped keys
+	// stay counted until their tombstone applies, Redis's reap-time
+	// decrement.
+	KeyEntries int64
+	// ExpiredKeyDrops counts key-class records the backend dropped for
+	// being expired without a reaper tombstone (compaction reaping),
+	// the store's share of the INFO expired counter. Zero on backends
+	// that never drop.
+	ExpiredKeyDrops int64
 	// SchemeGroups counts compressed frame groups written per encoding
 	// scheme since open, indexed by scheme id; nil when the backend has
 	// written none. The doc 04 cascade selection histogram INFO shows.

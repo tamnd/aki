@@ -39,6 +39,14 @@ type HotTable struct {
 	tick  uint32
 	nowMs int64
 	live  int
+	// keyDelta is the hot tier's correction to the store's key count,
+	// the doc 11 section 4 DBSIZE feed: +1 for each live key the store
+	// is not known to hold yet (fresh writes, vptr 0), -1 for each
+	// pending tombstone over a key the store does hold (vptr nonzero).
+	// Maintained by keyDeltaOf brackets at every header transition. A
+	// blind overwrite of a cold key counts +1 until its drain replaces
+	// the cold record, the one sanctioned over-count window.
+	keyDelta int64
 	// The write-behind queue: slot indices in first-dirtied order, a
 	// ring preallocated to capacity. The header's queued flag keeps
 	// entries unique, so re-dirtying a dirty key never re-enqueues it
@@ -343,6 +351,13 @@ func splitExpMs(atMs int64) (lo uint32, rem uint16) {
 	if atMs <= 0 {
 		return 0, 0
 	}
+	// The header holds 42 bits of wall milliseconds, which reaches May
+	// 2109. A later deadline clamps to that horizon instead of wrapping
+	// into the past and deleting the key.
+	const maxHdrExpMs = int64(1)<<42 - 1
+	if atMs > maxHdrExpMs {
+		atMs = maxHdrExpMs
+	}
 	return uint32(uint64(atMs) >> 10), uint16(atMs & 1023)
 }
 
@@ -364,6 +379,7 @@ func (t *HotTable) PutGen(key, val []byte, tag uint8, gen uint32) bool {
 	h := maphash.Bytes(t.seed, key)
 	if s, ok := t.lookup(h, key); ok {
 		hd := &t.hdrs[s]
+		before := keyDeltaOf(hd)
 		// Delta describes the whole dirty window, not just this write:
 		// the drained frame coalesces every write since the last drain,
 		// so the flag survives only onto a window that has been delta
@@ -416,6 +432,7 @@ func (t *HotTable) PutGen(key, val []byte, tag uint8, gen uint32) bool {
 		hd.state = stateDirty
 		hd.typeTag = tag
 		hd.gen = gen
+		t.keyDelta += keyDeltaOf(hd) - before
 		t.touchWrite(hd)
 		t.enqueueDirty(s)
 		return true
@@ -437,6 +454,7 @@ func (t *HotTable) PutGen(key, val []byte, tag uint8, gen uint32) bool {
 		hd.lastRead = g.lastRead
 		hd.lastWrite = g.lastWrite
 	}
+	t.keyDelta += keyDeltaOf(hd)
 	t.touchWrite(hd)
 	t.live++
 	t.dirtyBytes += len(key) + len(val)
@@ -548,8 +566,11 @@ func (t *HotTable) promote(key, val []byte, tag uint8, gen uint32, expMs int64) 
 // other write. The caller has already established cold existence; a key
 // the table does hold is its own Del's business, and delCold refuses it.
 // Any surviving ghost is dropped: the deleted life's history must not
-// warm a future reinsert.
-func (t *HotTable) delCold(key []byte) bool {
+// warm a future reinsert. keyClass says the cold record names an
+// addressable key (not a plane record): the tombstone then carries
+// vptr 1, "the store holds this key", and counts -1 in keyDelta until
+// the deletion drains.
+func (t *HotTable) delCold(key []byte, keyClass bool) bool {
 	if len(key) > maxKlen {
 		return false
 	}
@@ -563,12 +584,33 @@ func (t *HotTable) delCold(key []byte) bool {
 	}
 	hd := &t.hdrs[s]
 	hd.state = stateDirty
+	if keyClass {
+		hd.vptr = 1
+	}
+	t.keyDelta += keyDeltaOf(hd)
 	t.ghosts.take(h)
 	t.touchWrite(hd)
 	t.dirtyBytes += len(key)
 	t.enqueueDirty(s)
 	t.fileIndex(h, s)
 	return true
+}
+
+// keyDeltaOf is hd's contribution to keyDelta. Plane records (segments,
+// fences) are not keys; a live header only counts while the store is
+// not known to hold the key (vptr 0), and a tombstone only counts,
+// negatively, while it still shadows a cold record the store holds.
+func keyDeltaOf(hd *hdr) int64 {
+	if hd.gen != 0 || hd.typeTag&TagFence != 0 {
+		return 0
+	}
+	switch {
+	case hd.valRef != 0 && hd.vptr == 0:
+		return 1
+	case hd.valRef == 0 && hd.vptr != 0:
+		return -1
+	}
+	return 0
 }
 
 // Del writes a dirty tombstone: the key vanishes from reads immediately,
@@ -583,6 +625,7 @@ func (t *HotTable) Del(key []byte) bool {
 	if hd.valRef == 0 {
 		return false
 	}
+	before := keyDeltaOf(hd)
 	if hd.state == stateDirty {
 		t.dirtyBytes -= len(t.vals.data(hd.valRef))
 	} else {
@@ -593,6 +636,7 @@ func (t *HotTable) Del(key []byte) bool {
 	hd.valRef = 0
 	hd.expireLo, hd.expireRem = 0, 0
 	hd.state = stateDirty
+	t.keyDelta += keyDeltaOf(hd) - before
 	t.touchWrite(hd)
 	t.enqueueDirty(s)
 	t.live--
@@ -616,8 +660,10 @@ func (t *HotTable) drained(s uint32, vptr uint64) bool {
 		return true
 	}
 	t.dirtyBytes -= int(hd.klen) + len(t.vals.data(hd.valRef))
+	before := keyDeltaOf(hd)
 	hd.state = stateResident
 	hd.vptr = vptr
+	t.keyDelta += keyDeltaOf(hd) - before
 	// Delta is a dirty-window property and the drain just consumed the
 	// window; a resident header must not carry it into the next one
 	// (setExpireMs re-dirties without reassigning the tag, and an
@@ -787,6 +833,7 @@ func (t *HotTable) vacateValChunk() bool {
 // index, promoting a dup when the primary occupant goes.
 func (t *HotTable) removeSlot(h uint64, s uint32) {
 	hd := &t.hdrs[s]
+	t.keyDelta -= keyDeltaOf(hd)
 	t.dropShadow(s)
 	t.keys.release(hd.keyRef)
 	if hd.valRef != 0 {

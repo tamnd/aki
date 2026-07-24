@@ -454,15 +454,16 @@ func (t *Tiered) Del(ctx context.Context, key []byte) (bool, error) {
 	if recs[0].Key == nil || t.expiredRec(recs[0]) {
 		return false, nil
 	}
-	if !t.ht.delCold(key) {
+	keyClass := recs[0].Gen == 0 && !recs[0].Fence
+	if !t.ht.delCold(key, keyClass) {
 		if err := t.makeRoomFor(ctx, len(key)); err != nil {
 			return false, err
 		}
-		if !t.ht.delCold(key) {
+		if !t.ht.delCold(key, keyClass) {
 			if err := t.lad.vacateFor(ctx, key, nil, true); err != nil {
 				return false, err
 			}
-			if !t.ht.delCold(key) {
+			if !t.ht.delCold(key, keyClass) {
 				return false, errHotFull
 			}
 		}
@@ -522,6 +523,16 @@ func (t *Tiered) HardEvictVictims(n int) [][]byte {
 
 // Stats snapshots the counters plus the tier's live shape.
 // StoreStats polls the cold store's own accounting, the INFO feed.
+// KeyCount answers DBSIZE, doc 11 section 4: the store's key-class
+// entry count corrected by the hot tier's delta (fresh keys the store
+// has not seen, minus pending tombstones over keys it holds). Exact
+// except for two sanctioned windows: an expired-but-unreaped key stays
+// counted until its tombstone applies (Redis's reap-time decrement),
+// and a blind overwrite of a cold key counts twice until its drain.
+func (t *Tiered) KeyCount() int64 {
+	return t.st.Stats().KeyEntries + t.ht.keyDelta
+}
+
 func (t *Tiered) StoreStats() StoreStats {
 	return t.st.Stats()
 }
